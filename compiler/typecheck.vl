@@ -170,7 +170,8 @@ import {
 // One struct per type KIND, prefixed field names so `is` discriminates the union
 // (the AST's convention). A nested type is always an `i32` index into `T.tys`.
 
-// A primitive: `primName` is one of "i32" | "f64" | "boolean" | "string" | "void".
+// A primitive: `primName` is one of "i32" | "i64" | "f32" | "f64" | "boolean" |
+// "string" | "void" | "null" | "never".
 export type TyPrim = { primName: string }
 // The error/unknown type — produced on a type failure so checking continues
 // without cascading (akin to TS `Never`/`Unknown`); assignable to/from anything.
@@ -835,8 +836,6 @@ function mkNegTy(inner: i32) {
   addTy(t)
 }
 
-// Intern the well-known primitives and the global scope. Call once before
-// checking.
 // ── return-type inference state (module globals, reset by initChecker) ────────
 // An un-annotated function's hoisted return type is the PENDING sentinel `-2`
 // until its body is checked. `fnDeclIx` maps a top-level function name to its
@@ -1207,6 +1206,8 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
   0
 }
 
+// Reset all checker module state, then intern the well-known primitives and the
+// global scope. Call once before checking.
 export function initChecker() {
   redunReset()
   cbExpNode = []
@@ -2738,7 +2739,7 @@ function tErrCoded(msg: string, at: i32, code: string) {
 
 // ── small numeric / string helpers (no union narrowing) ──────────────────────
 
-// Is type-arena index `ix` a numeric primitive (i32 or f64)?
+// Is type-arena index `ix` the `string` primitive?
 function isStringTy(ix: i32) {
   if ix < 0 { return false }
   const t = T.tys[ix]
@@ -2746,6 +2747,9 @@ function isStringTy(ix: i32) {
   false
 }
 
+// Is type-arena index `ix` a numeric primitive (i32/i64/f32/f64)? A `TyErr` or
+// `TyVar` placeholder also counts, so a checking failure or unresolved hole
+// doesn't cascade a spurious "not a number" error.
 function isNumeric(ix: i32) {
   if ix < 0 { return false }
   const t = T.tys[ix]
@@ -2855,10 +2859,6 @@ function isFloatLitExpr(ix: i32) {
   false
 }
 
-// Literal-aware assignability for a numeric binding/argument/return: the normal
-// `assignable` lattice, PLUS the float-literal→f32 exception (`isFloatLitExpr`). Used
-// where the SOURCE EXPRESSION node is in hand (so the literal can be recognized);
-// type-only sites keep using `assignable`.
 // The least upper bound used by `??` (host: `flatten(Union(nonNull(l), r))`):
 // mutually-assignable types collapse to the wider; otherwise a two-member union.
 function joinTys(a: i32, b: i32) {
@@ -2991,6 +2991,10 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
   false
 }
 
+// Literal-aware assignability for a numeric binding/argument/return: the normal
+// `assignable` lattice, PLUS the float-literal→f32 exception (`isFloatLitExpr`). Used
+// where the SOURCE EXPRESSION node is in hand (so the literal can be recognized);
+// type-only sites keep using `assignable`.
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // (A GENERIC function value meeting a CONCRETE function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case — `genericFnAssignable` — so it governs nested positions like an
@@ -5275,14 +5279,6 @@ function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
   -1
 }
 
-// A call expression: array-method builtins (`xs.push`), string-method builtins
-// (`.slice`/`.indexOf`/`.includes`/`.charCodeAt`), the `print`/`fromCodePoint`
-// builtins, then the generic function-call path (arity + per-arg assignability).
-// UFCS `self`-method dispatch (host parser: `o.f(args)` → `f(o, args)` for a
-// free function whose first parameter accepts the receiver). Returns the
-// call's type, or -1 when no matching function exists (the caller reports its
-// own "no method"/"no field" error). Mirrors the general call path's pending-
-// return demand-inference; generic (TyVar) self-functions are not dispatched.
 // The declared parameter NAMES of the top-level function `name` (via its
 // `FuncDecl` in `fnDeclIx`), or an empty list when no declaration is known (an
 // undeclared name, or a closure-valued binding — `TyFunc` carries no parameter
@@ -5510,6 +5506,14 @@ function guardFactOf(exprIx: i32, paramNames: string[]) {
   -1
 }
 
+// A call expression: array-method builtins (`xs.push`), string-method builtins
+// (`.slice`/`.indexOf`/`.includes`/`.charCodeAt`), the `print`/`fromCodePoint`
+// builtins, then the generic function-call path (arity + per-arg assignability).
+// UFCS `self`-method dispatch (host parser: `o.f(args)` → `f(o, args)` for a
+// free function whose first parameter accepts the receiver). Returns the
+// call's type, or -1 when no matching function exists (the caller reports its
+// own "no method"/"no field" error). Mirrors the general call path's pending-
+// return demand-inference; generic (TyVar) self-functions are not dispatched.
 function checkCallNode(n: Call, ix: i32) {
   // Array method call `xs.push(e)`: when the callee is a member access whose
   // receiver is an array, type it as a builtin (NOT a struct field). Only fires for
@@ -7841,6 +7845,8 @@ function checkNodeReal(ix: i32) {
     // ── while ─────────────────────────────────────────────────────────────────
   } else if n is WhileStmt {
     return checkWhileStmtNode(n, ix)
+    // Accepted unconditionally: valid only inside a loop, but loop-nesting is
+    // not tracked yet (a misplaced `break`/`continue` is a parser concern).
   } else if n is BreakStmt {
     return TY_VOID
   } else if n is ContinueStmt {
@@ -9667,7 +9673,7 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
   }
   return lt
 }
-// ── call ──────────────────────────────────────────────────────────────────
+// ── let declaration ────────────────────────────────────────────────────────
 
 // Extracted from `checkNodeReal`'s `LetDecl` arm (C3: thin the dispatcher).
 function checkLetDeclNode(n: LetDecl, ix: i32) {
@@ -9896,7 +9902,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   if n.letInit < 0 { daAdd(n.letName) }
   return TY_VOID
 }
-// ── function declaration ─────────────────────────────────────────────────────
+// ── match ──────────────────────────────────────────────────────────────────
 
 // Extracted from `checkNodeReal`'s `MatchExpr` arm (C3: thin the dispatcher).
 function checkMatchExprNode(n: MatchExpr, ix: i32) {
@@ -10209,7 +10215,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   }
   return TY_VOID
 }
-// ── return ────────────────────────────────────────────────────────────────
+// ── unary ──────────────────────────────────────────────────────────────────
 
 // Extracted from `checkNodeReal`'s `Unary` arm (C3: thin the dispatcher).
 function checkUnaryNode(n: Unary, ix: i32) {
@@ -10243,7 +10249,7 @@ function checkUnaryNode(n: Unary, ix: i32) {
   }
   return arg
 }
-// ── binary ────────────────────────────────────────────────────────────────
+// ── member `o.field` ───────────────────────────────────────────────────────
 
 // Extracted from `checkNodeReal`'s `Member` arm (C3: thin the dispatcher).
 function checkMemberNode(n: Member, ix: i32) {
@@ -10558,10 +10564,7 @@ function checkWhileStmtNode(n: WhileStmt, ix: i32) {
   daRestore(daLoopEntry)
   return TY_VOID
 }
-// ── break / continue ────────────────────────────────────────────────────────
-// Valid only inside a loop, but loop-nesting is not tracked yet, so they are
-// accepted unconditionally (a misplaced `break`/`continue` is a parser concern).
-
+// ── for range ──────────────────────────────────────────────────────────────
 // Extracted from `checkNodeReal`'s `ForRange` arm (C3: thin the dispatcher).
 function checkForRangeNode(n: ForRange, ix: i32) {
   const frFrom = checkNode(n.frFrom)
@@ -10641,7 +10644,7 @@ function checkForInNode(n: ForIn, ix: i32) {
   popScope()
   return TY_VOID
 }
-// ── if / else ─────────────────────────────────────────────────────────────
+// ── return ─────────────────────────────────────────────────────────────────
 
 // Extracted from `checkNodeReal`'s `RetStmt` arm (C3: thin the dispatcher).
 function checkRetStmtNode(n: RetStmt, ix: i32) {
@@ -10723,4 +10726,3 @@ function checkBlockNode(n: Block, ix: i32) {
   blockTailTy = tailTy
   return TY_VOID
 }
-// ── program ───────────────────────────────────────────────────────────────
