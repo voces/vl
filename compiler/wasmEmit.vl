@@ -437,6 +437,7 @@ import {
   mvSlotOfValNameFind,
   nameIsRefArray,
   narrowVariantFor,
+  narrowedRefArrayOf,
   narrowedValueAtomOf,
   nliNameOf,
   nulScalarListBuildKind,
@@ -447,6 +448,8 @@ import {
   pendingLitUnion,
   pushPostGuardNarrow,
   refArrElemName,
+  refArrSlotTag,
+  refArrTagOf,
   refListSlotOfExpr,
   refPushScratchBaseFor,
   restoreNarrow,
@@ -481,6 +484,7 @@ import {
   tyAnnRefListKind,
   tyAnnRefListSlot,
   unionEqAtomOf,
+  unionHasRefArrayArmSlot,
   unionMemberSetOf,
   unionNameOfExpr,
   unionNameOfIdent,
@@ -1308,7 +1312,15 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
     if valueAtomKind(isAtom) < 0 {
       if nameIsLitUnionType(isAtom) { isAtom = "string" }
     }
-    if valueAtomKind(isAtom) >= 0 {
+    // The box tag the tested atom claims: a value atom's globally-stable `scalarTagOf`, OR a
+    // REF-ELEMENT array arm's `refArrTagOf` (`x is S[]`, `x is (() => f64)[]`). Both discriminate
+    // by the SAME box field-0 tag compare, so the receiver forms below (ident / union field /
+    // optional chain / any union expr) are shared. `armTag < 0` (not a value atom, not an interned
+    // ref-array arm) falls through to the struct-variant / literal paths.
+    let armTag = -1
+    if valueAtomKind(isAtom) >= 0 { armTag = scalarTagOf(isAtom) }
+    else if nameIsRefArray(isAtom) { armTag = refArrTagOf(isAtom) }
+    if armTag >= 0 {
       // A union-typed IDENT receiver pushes its RAW box slot directly — even
       // when an outer arm has already narrowed it to a single atom (the last
       // `else if x is boolean` of an exhaustive chain), where the narrowed
@@ -1318,7 +1330,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
         if unionNameOfIdent(vrecv.identName, fnIx) != "" {
           if emitUnionBoxPush(body, vrecv.identName, fnIx) < 0 { return -1 }
           fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-          fbI32Const(scalarTagOf(isAtom))
+          fbI32Const(armTag)
           fbI32Bin(70)            // 0x46 i32.eq
           return 0
         }
@@ -1336,7 +1348,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
           }
           fbStructGet(sHeapIdx[msi], mfi) // the field's box
           fbStructGet(uBoxIdx, 0)         // field 0: tag
-          fbI32Const(scalarTagOf(isAtom))
+          fbI32Const(armTag)
           fbI32Bin(70)                    // 0x46 i32.eq
           return 0
         }
@@ -1358,7 +1370,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
               if emitOptChainValue(body, vrecv.omObj, fnIx) < 0 { return -1 }
               fbStructGet(sHeapIdx[oisSi], oisFi) // the field's box
               fbStructGet(uBoxIdx, 0)             // field 0: tag
-              fbI32Const(scalarTagOf(isAtom))
+              fbI32Const(armTag)
               fbI32Bin(70)                        // 0x46 i32.eq
               fbEnd()
               ctrlLeave()
@@ -1370,7 +1382,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
       if exprUnion(ndv.isObj, fnIx) {
         if emitExpr(body, ndv.isObj, fnIx) < 0 { return -1 }
         fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-        fbI32Const(scalarTagOf(isAtom))
+        fbI32Const(armTag)
         fbI32Bin(70)            // 0x46 i32.eq
         return 0
       }
@@ -1695,6 +1707,27 @@ function emitValueUnionUnboxRead(
   0
 }
 
+// Recover the reflist WRAPPER ref a union binding narrowed to a REF-ELEMENT array arm holds
+// (`if x is S[]` then `x[i]` / `x.length`): push the box, read its `anyref` value (field 1),
+// `ref.cast` it to the arm's reflist wrapper heap. The ref-array analogue of
+// `emitValueUnionUnboxRead`'s list-wrapper cast — the result is a `(ref $rlWrap)` the normal
+// indexing / `.length` machinery consumes (it stored there in `emitUnionCoerce`'s ref-array box).
+function emitRefArrayUnionUnboxRead(
+  body: i32[],
+  name: string,
+  atom: string,
+  fnIx: i32,
+) {
+  if emitUnionBoxPush(body, name, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
+  const slot = rlSlotByName(refArrElemName(atom))
+  if slot < 0 {
+    return emitFail("emitProgram: narrowed ref-array arm has no reflist slot")
+  }
+  fbRefCast(rlWrapIdx[slot]) // 0xfb 0x16 <reflist wrapper> — the payload IS the wrapper ref
+  0
+}
+
 // Lower the expression at `exprIx` COERCED into the boxed union `unionName`'s
 // representation (the host's `coerceToUnion` at a flow boundary — a binding init,
 // an assignment, an argument, a return). Pass-through when the value already IS
@@ -1745,6 +1778,21 @@ export function emitUnionCoerce(
     return emitFail(
       "emitProgram: a map value is not a supported union member — use a struct member instead",
     )
+  }
+  // A REF-ELEMENT array carrier (`S[]`, `(() => f64)[]`, `(C | D)[]`) flowing into a union with a
+  // matching ref-array arm: the reflist WRAPPER ref rides the box anyref directly (like a scalar-
+  // list wrapper), tagged by its interned slot (`refArrSlotTag`). Checked BEFORE the value-atom
+  // gate below — such a union may have NO value atom (`S[] | {w:i32}`), so that gate would bail and
+  // emit the RAW wrapper ref where a `(ref $uBox)` is expected (the pre-fix invalid-wasm). The slot
+  // match guards against a ref-array whose element is not actually an arm (a checker-impossible case).
+  if unionName != "" && exprRefArray(exprIx, fnIx) {
+    const raSlot = refListSlotOfExpr(exprIx, fnIx)
+    if unionHasRefArrayArmSlot(unionName, raSlot) {
+      fbI32Const(refArrSlotTag(raSlot))
+      if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+      fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
+      return 0
+    }
   }
   if unionName == "" || !unionHasValueAtom(unionName) {
     return emitExpr(body, exprIx, fnIx)
@@ -9595,6 +9643,15 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
   if vAtom != "" {
     if unionNameOfIdent(e.identName, fnIx) != "" {
       return emitValueUnionUnboxRead(body, e.identName, vAtom, fnIx)
+    }
+  }
+  // A union binding narrowed to a REF-ELEMENT array arm reads UNBOXED to the reflist WRAPPER
+  // (`if x is S[] { x[i] }`): push the box, recover the anyref payload, `ref.cast` to the arm's
+  // wrapper — the ref-array analogue of the scalar unbox above, so indexing / `.length` see the list.
+  const raNm = narrowedRefArrayOf(e.identName)
+  if raNm != "" {
+    if unionNameOfIdent(e.identName, fnIx) != "" {
+      return emitRefArrayUnionUnboxRead(body, e.identName, raNm, fnIx)
     }
   }
   // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).

@@ -298,6 +298,7 @@ import {
   listOpKindOfBin,
   mapShapeOfExpr,
   markLoopVarSlot,
+  markRefArrayArms,
   markValueUnionAtoms,
   mfCallbackFe,
   mfRecordDst,
@@ -993,7 +994,11 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
             "nulreflist",
             nulRefArrayInnerSlotOfLet(stmts[i], fnIx),
           )
-        } else if letIsRefArray(stmts[i], fnIx) {
+        } else if letIsRefArray(stmts[i], fnIx) && !letIsUnion(stmts[i], fnIx) {
+          // The `!letIsUnion` gate mirrors the scalar-list branches above: a UNION-annotated local
+          // whose INIT is a ref array (`const p: S[] | i64 = xs`) is a union-BOX local (kind 4), NOT
+          // a reflist local — the init coerces into the box. Without the gate the ref-array INIT
+          // wins the reflist valtype and the boxed init store is invalid wasm.
           slot = addLocalName(
             s.letName,
             "reflist",
@@ -2102,6 +2107,12 @@ export function collectA(_stmts: i32[]) {
   let umk = 0
   while umk < unMemberSet.length {
     markValueUnionAtoms(unMemberSet[umk])
+    // A REF-ARRAY union arm (`S[] | {w:i32}`) lost its interned reflist slot to the resets
+    // above (the reflist tables were just cleared) — re-intern it here, the ref-array twin of
+    // the value-atom re-mark, so its wrapper/backing/element heaps are re-allocated. This is
+    // the AUTHORITATIVE ref-array-arm interning: `collectU`'s registration-time call is wiped
+    // by these same resets, so the box payload's wrapper heap comes from here.
+    markRefArrayArms(unMemberSet[umk])
     umk = umk + 1
   }
   let i = 0
@@ -2322,7 +2333,13 @@ export function collectA(_stmts: i32[]) {
         // (collected when `monomorphize` re-runs this pass); the original is
         // replaced by its first instance and never emitted, so nothing is
         // forced or validated here.
-      } else if nameIsArray(nd.tyName) {
+      } else if nameIsArray(nd.tyName) && !isUName(nd.tyName) {
+        // The `!isUName` guard: a UNION whose LAST arm is an array (`S[] | T[]`, `i64 | S[]`)
+        // has a name ENDING in `]`, so `nameIsArray` matches it — but it is a union BOX, not a
+        // plain array. Its ref-array arms are interned by `markRefArrayArms` (the union path),
+        // so skip the array validation/forcing here (which would reject the union name as a
+        // non-i32 array). An array-FIRST union (`S[] | i64`) ends in a non-`]` char and already
+        // fell through harmlessly; this extends the same treatment to the array-last spelling.
         if checkArrName(nd.tyName) < 0 { return -1 }
         // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
         lUsed = true
@@ -3009,6 +3026,11 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // A MIXED union's scalar members box exactly like a value union's — intern their
   // per-rep value boxes (a no-op for an all-struct union: no value atoms).
   markValueUnionAtoms(name)
+  // A REF-ARRAY arm (`S[] | {w:i32}`) interns its element shape (so `structIndexByName` sees an
+  // inline `{a:f32}[]` element) and its reflist slot — the ref-array twin of the value-atom
+  // marking. `collectA` re-interns the reflist slot after its resets; this early call ensures
+  // the element STRUCT is in `sNames` before heap assignment. (No-op with no ref-array arm.)
+  markRefArrayArms(name)
   0
 }
 
@@ -3247,6 +3269,9 @@ export function collectU(stmts: i32[]) {
       // A MIXED union's scalar members intern their per-rep value boxes (no-op for an
       // all-struct union).
       markValueUnionAtoms(udSet)
+      // A REF-ARRAY arm of a NAMED union (`type U = S[] | i64`) interns its element shape +
+      // reflist slot, the same as the inline path — so the two spellings register identically.
+      markRefArrayArms(udSet)
     }
     i = i + 1
   }

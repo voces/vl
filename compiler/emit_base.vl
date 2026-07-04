@@ -1331,18 +1331,21 @@ export function isStructAtom(stmts: i32[], a: string) {
   false
 }
 // True if `name` is a VARIANT-BOX union this emitter interns: two+ non-null members,
-// every member a struct variant OR a value-atom (`i32`/`string`/…), with AT LEAST ONE
-// struct. Covers the all-struct union (`A | B`, `A | B | null`) AND the MIXED struct +
-// scalar union (`A | i32`, `A | B | i32 | f64 | boolean | string | null`) — both ride
-// the `uBoxIdx` `{tag, value}` box, structs as variant-struct payloads, scalars as
-// value-box payloads, tag-discriminated. A PURE value union (`i32 | string`) has no
-// struct, so it is handled earlier by `isValueUnionName`; a single struct + `null`
-// (`A | null`) has one non-null member, so it stays the kind-9 niche nullable ref.
+// every member a struct variant OR a value-atom (`i32`/`string`/…) OR a REF-ELEMENT array
+// (`S[]`, `(() => f64)[]`, `(C | D)[]`), with AT LEAST ONE struct OR ref-array. Covers the
+// all-struct union (`A | B`, `A | B | null`), the MIXED struct + scalar union (`A | i32`,
+// `A | B | i32 | f64 | boolean | string | null`), AND unions with a ref-array member
+// (`S[] | {w:i32}`, `(() => f64)[] | i64`) — all ride the `uBoxIdx` `{tag, value}` box:
+// structs as variant-struct payloads, scalars as value-box payloads, ref-arrays as the
+// reflist WRAPPER ref on the anyref, tag-discriminated. A PURE value union (`i32 | string`)
+// has no struct/ref-array, so it is handled earlier by `isValueUnionName`; a single struct +
+// `null` (`A | null`) has one non-null member, so it stays the kind-9 niche nullable ref.
 export function isVariantBoxUnion(stmts: i32[], name: string) {
   if unionMemberCount(name) < 2 { return false }
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
   let structAtoms = 0
+  let refArrAtoms = 0
   let nonNull = 0
   let j = 0
   while j < atoms.length {
@@ -1350,14 +1353,25 @@ export function isVariantBoxUnion(stmts: i32[], name: string) {
       nonNull = nonNull + 1
       if isStructAtom(stmts, atoms[j]) {
         structAtoms = structAtoms + 1
-      } else if valueAtomKind(atoms[j]) < 0 {
-        // Neither a struct variant nor a value-atom — not a union shape we box.
+      } else if valueAtomKind(atoms[j]) >= 0 {
+        // A value atom (scalar / string / scalar-element list [kinds 7-10] / closure) — it
+        // boxes into a shared value box or rides the anyref, tagged via `scalarTagOf`. Checked
+        // BEFORE the array test so a scalar-element list (`i32[]`, `string[]`) keeps its
+        // value-atom rep instead of being mis-taken for a ref-element array.
+      } else if nameIsArray(atoms[j]) {
+        // A REF-ELEMENT array arm (`S[]`, `(() => f64)[]`, `(C | D)[]`): not a scalar-element
+        // list (those are value atoms, handled above), so it boxes as its reflist WRAPPER ref
+        // riding the box anyref, tagged via `refArrTagOf`. (A map-array arm is rejected earlier
+        // by `registerInlineUnion`'s map guard, so a `nameIsArray` here is a ref-element array.)
+        refArrAtoms = refArrAtoms + 1
+      } else {
+        // Neither a struct variant, a value-atom, nor a ref-element array — not a boxable shape.
         return false
       }
     }
     j = j + 1
   }
-  structAtoms >= 1 && nonNull >= 2
+  (structAtoms >= 1 || refArrAtoms >= 1) && nonNull >= 2
 }
 // The synthetic type-name string of the annotation node at `tyIx` (a `TypeRef`), or
 // "" if `tyIx` is unset / not a type name. Lets the inline-union scan read a param /
