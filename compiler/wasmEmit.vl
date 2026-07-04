@@ -8208,6 +8208,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   let retI64 = false
   let retNulBool = false
   let retNulString = false
+  let retNulClosure = false
   let retNulList = false
   let retNulSLKind: VKind | null = null
   let retLitUnion = false
@@ -8246,9 +8247,13 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
       }
     }
     // A literal-union return reads as a union NAME but is an i32 ATOM — exclude it from the value-union
-    // box return (`emitUnionBoxArg` would `struct.new` the member).
+    // box return (`emitUnionBoxArg` would `struct.new` the member). A nullable-closure return
+    // (`((i32) => i32) | null`) also reads as a two-member union NAME, but it is the closure NICHE
+    // (`ref.null $cloStruct`), not a value box — route it through `retNulClosure` (below), not here.
     if retUnionFlag(fn.fnRet) == 1 {
-      if !nodeTyIsLitUnionAlias(fn.fnRet) { retUNm = tyNameOf(fn.fnRet) }
+      if !nodeTyIsLitUnionAlias(fn.fnRet) && nulCloFlag(fn.fnRet) != 1 {
+        retUNm = tyNameOf(fn.fnRet)
+      }
     }
     if fn.fnRet < 0 {
       const im = inferRetNameOf(fn.fnName)
@@ -8266,6 +8271,10 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if retVi >= 0 { pendingVariantIdx = -1 }
     if tyIsNulBool(fn.fnRet) { retNulBool = true }
     if retNulStringFlag(fn.fnRet) == 1 { retNulString = true }
+    // A nullable-closure return (`((i32) => i32) | null`, kind 19): a `return null` lowers
+    // as `ref.null $cloStruct` (the niche), a function value passes through as the fat
+    // pointer widened to the nullable storage — the return analogue of the kind-22 field.
+    if nulCloFlag(fn.fnRet) == 1 { retNulClosure = true }
     if retNulListFlag(fn.fnRet) == 1 { retNulList = true }
     retNulSLKind = nulScalarListKindOfNode(fn.fnRet)
     if nodeTyIsLitUnionAlias(fn.fnRet) { retLitUnion = true }
@@ -8312,6 +8321,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     const retCtx = expCtxHere()
     if retNulBool { retCtx.nulBool = true }
     if retNulString { retCtx.nulString = true }
+    if retNulClosure { retCtx.nulClosure = true }
     if retNulList { retCtx.nulList = true }
     // A DISTINCT-backing nullable scalar list return: a `return [x]` builds the leaf list
     // (`listKind`, which subtypes the nullable result), a `return null` is `ref.null $wrapper`.
@@ -8363,6 +8373,12 @@ export function emitNullForRet(_body: i32[], fnIx: i32) {
   if retNulListFlag(r) == 1 {
     wU8(208) // 0xd0 ref.null
     wSLEB(lTypeIdx)
+    return 0
+  }
+  // A nullable-closure return (`((i32) => i32) | null`): the niche `ref.null $cloStruct`.
+  if nulCloFlag(r) == 1 {
+    wU8(208) // 0xd0 ref.null
+    wSLEB(cloStructIdx)
     return 0
   }
   // Value-union box (annotated `i32 | null`, or an inferred return widened to it): the
