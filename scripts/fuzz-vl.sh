@@ -4,14 +4,18 @@
 # each through `vl run`, and asserts the output matches the case's own `// @log` directive. NO Deno —
 # the native host compiles + runs; the generator + the oracle (the buried literal) are pure VL.
 #
-# USAGE: scripts/fuzz-vl.sh [--seed N] [--count M] [--depth D] [--keep DIR] [--baseline FILE] [--quiet]
+# USAGE: scripts/fuzz-vl.sh [--seed N] [--count M] [--depth D] [--keep DIR] [--baseline FILE]
+#                           [--shapes-out FILE] [--quiet]
 #   A mismatch / compile-fail / trap is a finding, printed with the failing case + the --seed to repro.
 #   Classes: REJECT (parse/type/emit error — the fail-loudly long tail), INVALID-WASM (emitted bytes
 #   fail validation — a soundness hole), TRAP (runtime error), MISMATCH (silent wrong result).
 #   --keep DIR      copy every failing case (+ its error) into DIR for triage.
-#   --baseline FILE only NEW failures count: a failure whose `// @shape` line appears in FILE is
-#                   known (reported in the summary, exit 0). This is the CI mode — a bounded seed
-#                   set with the known-failure shapes pinned; a regression = a new shape failing.
+#   --baseline FILE suppress KNOWN clean rejects: a REJECT whose `// @shape` line appears in FILE is
+#                   a documented unsupported shape, not a finding (exit 0). The baseline holds ONLY
+#                   rejects — a soundness class (INVALID-WASM/TRAP/MISMATCH) is ALWAYS a finding and
+#                   can never be masked by the baseline. A NEW reject shape is a coverage regression.
+#                   (The exact bidirectional check — incl. STALE baseline entries — is rep-fuzz-check.sh.)
+#   --shapes-out F  append one `CLASS<TAB>SHAPE` line per failure to F (consumed by rep-fuzz-check.sh).
 #   --quiet         suppress the per-class case dumps (shape lines + summary only).
 # Requires a fresh seed: bash scripts/refresh-compiler.sh
 set -uo pipefail
@@ -24,6 +28,7 @@ COUNT=200
 DEPTH=4
 KEEP=""
 BASELINE=""
+SHAPES_OUT=""
 QUIET=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,6 +37,7 @@ while [ $# -gt 0 ]; do
     --depth) DEPTH="$2"; shift 2 ;;
     --keep) KEEP="$2"; shift 2 ;;
     --baseline) BASELINE="$2"; shift 2 ;;
+    --shapes-out) SHAPES_OUT="$2"; shift 2 ;;  # append `CLASS<TAB>SHAPE` per failure (for rep-fuzz-check.sh)
     --quiet) QUIET=1; shift ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
@@ -77,8 +83,14 @@ for f in "$WORK"/case_*.vl; do
   fi
   [ -n "$why" ] || continue
 
-  # a baselined shape is a KNOWN failure, not a finding
-  if [ -n "$BASELINE" ] && grep -qxF "$shape" "$BASELINE" 2>/dev/null; then
+  # Record every failure (with its class) for the exact bidirectional check in
+  # rep-fuzz-check.sh — written BEFORE baseline suppression so the record is complete.
+  [ -n "$SHAPES_OUT" ] && printf '%s\t%s\n' "$why" "$shape" >> "$SHAPES_OUT"
+
+  # Only a clean REJECT (fail-loud, unsupported shape) may be baselined as a KNOWN
+  # non-issue. A soundness class (INVALID-WASM / TRAP / MISMATCH) is ALWAYS a finding
+  # — it can never be masked by the baseline, so a real bug can never hide there.
+  if [ "$why" = "REJECT" ] && [ -n "$BASELINE" ] && grep -qxF "$shape" "$BASELINE" 2>/dev/null; then
     known=$((known + 1))
     continue
   fi
