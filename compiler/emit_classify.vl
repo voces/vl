@@ -5720,41 +5720,86 @@ export function structIndexOfTypeName(name: string) {
 // collapsed `.map` callback return the checker rendered structurally) — the variant
 // analogue of `structIndexOfTypeName`. -1 if no variant matches. A NAME that is already a
 // variant alias resolves directly. Field-name parsing mirrors `structIndexOfTypeName`.
+// Parse a canonical inline SHAPE name `{a:T,b:U}` into PARALLEL field-name / field-type
+// string lists (appended to `outNames` / `outTypes`). Depth-aware over `{}` `[]` AND `()`
+// so a nested struct / list / closure field type is captured whole (a closure type carries
+// its own `,` between params and `:`-free `=>`). Spaces are stripped so both the canonical
+// (`tyToEmitName`) and spaced (`tyToStr`) renders parse the same. A non-`{…}` name appends
+// nothing. Shared by the variant / struct field-set resolvers so a field-NAME match can be
+// tightened with a field-TYPE (`nameFieldCode`) check — two shapes sharing field names but
+// differing in a field's TYPE (`{a:i32,f:i64,z:f64}` vs a union arm
+// `{a:boolean,f:()=>{…},z:i32}`) no longer collide onto the wrong slot.
+function shapeFieldParse(name: string, outNames: string[], outTypes: string[]) {
+  if name.length >= 2 && name[0] == '{' && name[1] != '[' {
+    let curN = ""
+    let curT = ""
+    let depth = 0
+    let collecting = true // true: reading the field NAME; false: reading its TYPE
+    let i = 1
+    while i < name.length - 1 {
+      const c = name[i]
+      if c == '{' || c == '[' || c == '(' {
+        depth = depth + 1
+        if !collecting { curT = curT + fromCodePoint(c) }
+      } else if c == '}' || c == ']' || c == ')' {
+        depth = depth - 1
+        if !collecting { curT = curT + fromCodePoint(c) }
+      } else if depth == 0 && c == ':' && collecting {
+        collecting = false
+      } else if depth == 0 && c == ',' {
+        outNames.push(curN)
+        outTypes.push(curT)
+        curN = ""
+        curT = ""
+        collecting = true
+      } else if c != ' ' {
+        if collecting {
+          curN = curN + fromCodePoint(c)
+        } else {
+          curT = curT + fromCodePoint(c)
+        }
+      }
+      i = i + 1
+    }
+    outNames.push(curN)
+    outTypes.push(curT)
+  }
+}
+
+// True if a shape field TYPE-string `t` (from `shapeFieldParse`) is compatible with the
+// emitter field CODE `code` — i.e. NOT a proven mismatch. A definitive mismatch (both codes
+// known and unequal, e.g. i64 `23` vs closure `14`) is the field-name-collision signal.
+// When the type-string cannot be classified (`nameFieldCode` -1, e.g. an inline nested
+// struct `{…}`) the check stays LENIENT (true), preserving the legacy name-only match for
+// shapes the code layer can't render — never a false REJECT of a real twin.
+function shapeFieldTypeCompat(t: string, code: i32): boolean {
+  const want = nameFieldCode(t)
+  if want < 0 || code < 0 { return true }
+  want == code
+}
+
 function variantIndexOfTypeName(name: string) {
   const direct = variantIndexOf(name)
   if direct >= 0 { return direct }
   if name.length >= 2 && name[0] == '{' && name[1] != '[' {
     const fnames: string[] = []
-    let cur = ""
-    let depth = 0
-    let collecting = true
-    let i = 1
-    while i < name.length - 1 {
-      const c = name[i]
-      if c == '{' || c == '[' {
-        depth = depth + 1
-      } else if c == '}' || c == ']' {
-        depth = depth - 1
-      } else if depth == 0 && c == ':' {
-        if collecting {
-          fnames.push(cur)
-          cur = ""
-          collecting = false
-        }
-      } else if depth == 0 && c == ',' {
-        collecting = true
-      } else if depth == 0 && collecting && c != ' ' {
-        cur = cur + fromCodePoint(c)
-      }
-      i = i + 1
-    }
+    const ftypes: string[] = []
+    shapeFieldParse(name, fnames, ftypes)
     let vi = 0
     while vi < uVariants.length {
       if uFieldCount[vi] == fnames.length {
         let ok = true
         let k = 0
         while k < fnames.length {
-          if variantFieldIndex(vi, fnames[k]) < 0 { ok = false }
+          const fj = variantFieldIndex(vi, fnames[k])
+          if fj < 0 {
+            ok = false
+          } else if !shapeFieldTypeCompat(ftypes[k], variantFieldTypeAt(vi, fj)) {
+            // A shared field NAME but a mismatched field TYPE — a distinct shape that
+            // merely collides on names (a closure returning `{a:i32,f:i64,z:f64}` is NOT
+            // the union arm `{a:boolean,f:()=>…,z:i32}`). Not this variant.
+            ok = false
+          }
           k = k + 1
         }
         if ok { return vi }
