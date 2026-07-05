@@ -498,6 +498,7 @@ import {
   unionMemberSetOf,
   unionNameOfExpr,
   unionNameOfIdent,
+  variantFieldElemName,
   variantFieldIndex,
   variantFieldRefSlot,
   variantFieldTypeAt,
@@ -1254,6 +1255,16 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
       const rcNC = emitExpr(body, valIx, fnIx)
       pendingNulClosure = svNC
       if rcNC < 0 { return -1 }
+    } else if vcode == 16 {
+      // A VALUE-UNION variant field (`{f: boolean | i64}` as an arm of `{f:…} | i64`):
+      // the field stores the shared union BOX, so coerce a raw scalar/string/null value
+      // into that box with its atom tag — the exact treatment the plain struct-literal
+      // path (`emitObj`) gives a code-16 field. Without it the raw value was `struct.new`'d
+      // straight into the box slot (an i32 where a `(ref $box)` is required — invalid wasm,
+      // the nested struct-field-union construction hole).
+      if emitUnionCoerce(body, variantFieldElemName(vi, fj), valIx, fnIx) < 0 {
+        return -1
+      }
     } else {
       if emitExpr(body, valIx, fnIx) < 0 { return -1 }
     }
@@ -1351,6 +1362,19 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
       // member-path narrowing's runtime test.
       if vrecv is Member {
         if memberUnionFieldName(unwrapParen(ndv.isObj), fnIx) != "" {
+          // The receiver is itself a NARROWED union arm (`v.f`, `v` narrowed to a
+          // variant carrying the value-union field): the field box rides the variant
+          // tables, so read it through the narrowed-member path (which yields the box —
+          // `v.f` is not yet narrowed inside its own guard) then compare the box tag.
+          if memIsNarrowed(unwrapParen(ndv.isObj)) {
+            if emitNarrowedMem(body, unwrapParen(ndv.isObj), fnIx) < 0 {
+              return -1
+            }
+            fbStructGet(uBoxIdx, 0) // field 0: tag
+            fbI32Const(armTag)
+            fbI32Bin(70)            // 0x46 i32.eq
+            return 0
+          }
           const msi = structIndexOfExpr(vrecv.memObj, fnIx)
           const mfi = sFieldIndex(msi, vrecv.memProp)
           if emitExpr(body, vrecv.memObj, fnIx) < 0 { return -1 }
@@ -1538,6 +1562,36 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32) {
     fbStructGet(uBoxIdx, 1)        // 0xfb 0x02 <box ht> field 1: value (anyref)
     fbRefCast(uVarIdx + vi)        // 0xfb 0x16 <variant struct> ref.cast (non-null)
     fbStructGet(uVarIdx + vi, idx) // 0xfb 0x02 <variant struct ht> <field index>
+    // A VALUE-UNION variant field (code 16) whose OWN member path is narrowed to one
+    // scalar atom (`if v.f is i64 { … v.f … }`, v itself narrowed to this variant): the
+    // `struct.get` above yields the field's inner union BOX, so unbox it to the narrowed
+    // atom's rep — the same recovery the plain struct-field union read applies. Without it
+    // the raw box flowed where the atom (an i64/…) was expected (invalid wasm — the nested
+    // struct-field-union READ hole). An un-narrowed read yields the box unchanged.
+    if variantFieldTypeAt(vi, idx) == 16 {
+      const mAtom = narrowVariantFor(memberPathKeyOf(memIx))
+      const mk = valueAtomKind(mAtom)
+      if mk >= 0 && mk != 6 {
+        fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+        if mAtom == "string" {
+          if !aUsed {
+            return emitFail(
+              "emitProgram: narrowed string union field read but array type not collected",
+            )
+          }
+          fbRefCast(aTypeIdx) // the payload IS the string array ref
+        } else {
+          const mvb = vbHeapIdxOfAtom(mAtom)
+          if mvb < 0 {
+            return emitFail(
+              "emitProgram: narrowed union field atom has no value box",
+            )
+          }
+          fbRefCast(mvb)
+          fbStructGet(mvb, 0) // the scalar payload
+        }
+      }
+    }
     return 0
   }
   emitFail("emitProgram: expected a field access")
@@ -1797,7 +1851,17 @@ export function emitUnionCoerce(
   // `emitExpr`'s `uDeclared` variant path; only a SCALAR value is value-boxed below.
   // This is what lets a MIXED union (`A | i32`) coerce either kind of member: an object
   // arm boxes as a variant struct, a scalar arm as a value box.
-  if bare is ObjLit { return emitExpr(body, exprIx, fnIx) }
+  if bare is ObjLit {
+    // When the literal matches a union VARIANT, box it as that variant DIRECTLY rather than
+    // routing through `emitExpr` — whose `structIndexOfObj` re-inference a field-name
+    // COLLISION with an enclosing struct (an inner `{f:string}` arm boxed into a field of an
+    // outer `{f: …}` struct) mis-resolves to the outer struct, emitting invalid wasm (the
+    // nested struct-of-struct-union field hole). `objVariantName` is the SAME resolution
+    // `emitObjLitNode`'s own union-box fallback uses, so this only reorders it ahead of the
+    // struct-index guess; a literal matching no variant keeps `emitExpr`.
+    if objVariantName(bareIx) != "" { return emitUnionBox(body, bareIx, fnIx) }
+    return emitExpr(body, exprIx, fnIx)
+  }
   if exprStruct(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
   // A MAP carrier (`{[string]: string}`, `{[string]: i32}`) flowing into a union with a matching
   // map arm: the map STRUCT ref rides the box anyref directly (like a reflist wrapper), tagged by
