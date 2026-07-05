@@ -2202,6 +2202,20 @@ function structIndexByValName(name: string) {
 // the two cannot drift: when the gate enumerated the value types independently it lacked the
 // scalar/atom/closure/union arms, and an annotated map return fell through to an i32 result
 // valtype over a ref-returning body — invalid wasm at the return seam.
+// True if the inner-value chain `v` of a NESTED map (`mvValKindOfName`'s `nameIsMap` arm)
+// bottoms out in a ref LIST whose element is itself a MAP or a NULLABLE — the two element
+// shapes the map read/store/coerce op sites resolve one level too shallow when the list is
+// reached through >= 2 map levels (a list-of-STRUCT / list-of-scalar reads fine; the SAME
+// list works as a DIRECT map value). Descends map nesting; stops at the first list.
+function mapValNestedListUnsupported(v: string): boolean {
+  if nameIsMap(v) { return mapValNestedListUnsupported(mapValNameOf(v)) }
+  if nameIsArray(v) {
+    const e = refArrElemName(v)
+    return nameIsMap(e) || unionHasAtom(e, "null")
+  }
+  false
+}
+
 export function mvValKindOfName(valName: string): i32 {
   if valName == "i32" || valName == "boolean" { return -1 }
   // A literal-union ATOM value (`{[string]: K0}`, `K0 = "aa" | "bb"`): each value IS the
@@ -2216,6 +2230,27 @@ export function mvValKindOfName(valName: string): i32 {
   // members + `null`, or `boolean` + `null`) would else claim it and BOX the values into a
   // union box (the store coerced a raw i32 niche into a `(ref $box)` cell — invalid wasm).
   if nameIsNulLitUnion(valName) || nameIsNulBool(valName) { return -1 }
+  // A NULLABLE union value carrying a ref-COMPOSITE member (`{f: …} | null` struct,
+  // `{[string]: …} | null` map, `(…) => … | null` closure, `T[] | null` list, or a wider union
+  // like `{f: K0[]} | string | null`). A pure scalar/string nullable value-union
+  // (`i32 | null`, `i64 | string | null`) boxes fine — the shared value box has a null tag — and
+  // the nullable-atom NICHE forms (`K0 | null` / `boolean | null`) rep as a plain i32 and are
+  // handled above. But a struct / map member (`valueAtomKind < 0`) or a list / closure member
+  // (`valueAtomKind >= 7`) has no scalar box: the map store/read seams then mis-type the
+  // `(ref null)` vals element against the box `(ref $box)` — INVALID wasm on construct, a
+  // bare-box `.f` / call on read. A proper nullable ref-VALUE map rep (a `(ref null <elem>)` vals
+  // list carrying `null` directly, with `??` preserving a stored null) is a larger change; until
+  // it lands, reject only the ref-member nullables, loudly at every op site, never invalid wasm.
+  if unionHasAtom(valName, "null") {
+    const nulAtoms: string[] = []
+    splitUnionAtoms(valName, nulAtoms)
+    let na = 0
+    while na < nulAtoms.length {
+      const nvk = valueAtomKind(nulAtoms[na])
+      if nvk < 0 || nvk >= 7 { return -3 }
+      na = na + 1
+    }
+  }
   let kind = -1
   if valName == "string" {
     kind = 3
@@ -2234,6 +2269,17 @@ export function mvValKindOfName(valName: string): i32 {
     // A NESTED map (`{[string]: {[string]: V}}`): the value is an INNER map struct ref,
     // stored in a ref list whose element kind is 3 (a map element → the inner map struct).
     // Reuses the SAME ref-value spine as a struct-valued map; only the element heap differs.
+    //
+    // EXCEPT a nested map whose inner-value chain bottoms out in a ref LIST whose element is
+    // itself a MAP or a NULLABLE (`{[string]: {[string]: {[string]: f32}[]}}` — a list of
+    // inner maps read two map levels deep; `{[string]: {[string]: (i64 | null)[]}}` — a list
+    // of nullable-i64). The vals intern side (`ensureRefElem`) IS recursive, but the map
+    // store/read/coerce OP SITES resolve the element one level shallow, so the deep read casts
+    // to the wrong element heap — a runtime TRAP (out-of-bounds cast) or invalid wasm. (A
+    // nested list-of-STRUCT / list-of-scalar — `{[string]: {[string]: S[]}}` — reads fine; and
+    // the SAME list-of-map / list-of-nullable works as a DIRECT map value, one level shallower.)
+    // Reject loudly until the op sites migrate to the recursive resolver.
+    if mapValNestedListUnsupported(mapValNameOf(valName)) { return -3 }
     kind = 6
   } else if (
     nameIsI32Array(valName) ||
@@ -2266,6 +2312,16 @@ export function mvValKindOfName(valName: string): i32 {
     // (`ref $cloStructIdx`), stored in a ref list whose element kind is 5 (the closure) — the
     // SAME rep an `((i32) => i32)[]` array uses. A read yields a closure local; the call
     // resolves its sig from the value annotation.
+    //
+    // EXCEPT a closure whose RESULT is a literal-union atom (`(i32) => K0`): the map read
+    // recovers the call's result type as `string` (K0's underlying atom text) rather than the
+    // i32 atom id, so `print(m[k](x))` walks a raw i32 as a string ref — invalid wasm. (A
+    // closure → string / i64 / boolean / struct map value is fine; only the litunion result
+    // mis-recovers, and the SAME closure works standalone / in an array.) Reject loudly until
+    // the map closure-value call recovers the atom result.
+    let ri = annArrowAt(valName) + 2
+    while ri < valName.length && valName[ri] == ' ' { ri = ri + 1 }
+    if nameIsLitUnionType(valName.slice(ri, valName.length)) { return -3 }
     kind = 14
   } else {
     if structIndexByValName(valName) >= 0 { kind = 1 }
