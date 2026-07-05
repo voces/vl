@@ -120,6 +120,7 @@ import {
   objFieldVal,
   parenUnionArrElemName,
   parentLetOf,
+  peelGroupParens,
   removeAtomFrom,
   retArrFlag,
   retF32ArrFlag,
@@ -11813,6 +11814,12 @@ export function identFnTypeAnnName(name: string, fnIx: i32) {
               const itn = nodeTyName(d.letInit)
               if annArrowAt(itn) >= 0 { return itn }
             }
+            // A COPY of another closure binding (`const t0 = p` where `p: ((i32) => string) | null`
+            // — the intermediate the nullable-read pattern `const t0 = p; if t0 != null { t0(1) }`
+            // introduces). The init is a bare Ident, so its checked type is authoritative (unlike a
+            // lambda, whose inferred return can disagree with the lowering). Return that type NAME —
+            // a plain closure OR a nullable closure (`cloNameSigKey` peels the latter) — so the
+            // narrowed call classifies its result instead of defaulting to i32 (invalid wasm).
             // A `??`-DEFAULTED closure binding (`const t0 = v["k"] ?? d` over a `{[string]: (i32) =>
             // i32 | null}` map): the coalesce has NO single lifted fe (a runtime pick between the
             // map value and the default), so `identClosureFe` can't see it — recover the function
@@ -11845,6 +11852,44 @@ export function identFnTypeAnnName(name: string, fnIx: i32) {
 // function-typed PARAM (its annotation / monomorphized pin), a function-typed LOCAL/GLOBAL
 // annotation, or — for an INFERRED binding — the underlying function's own sig. "" → the
 // all-i32 arity fallback applies (an unresolved or non-value-ABI signature, incl. void).
+// The `$fnsig` key of a function-type NAME that may be a plain closure (`(i32) => string`, a
+// top-level arrow) OR a NULLABLE closure (`((i32) => string) | null`, kind 19 — its arrow nested
+// one paren-depth down, invisible to `annArrowAt`). For the nullable form, peel `| null` + the
+// grouping parens to the bare closure first. "" when neither resolves — the call keeps its all-i32
+// arity fallback. Recovers the result token so a narrowed nullable-closure CALL classifies its
+// result correctly (print routing / numeric coercion) instead of the pre-fix i32 default.
+function cloNameSigKey(nm: string) {
+  if annArrowAt(nm) >= 0 { return annSigKey(nm) }
+  if nameIsNulClosure(nm) {
+    const clo = peelGroupParens(nullablePartOf(nm))
+    if annArrowAt(clo) >= 0 { return annSigKey(clo) }
+  }
+  ""
+}
+
+// The SOURCE binding name of an inferred COPY `const name = <Ident>` in scope of `fnIx` (`const
+// t0 = p` → `"p"`), or "" when `name` is not such a copy. Lets a closure-VALUE call resolve its
+// sig through the intermediate binding the nullable/closure read pattern introduces (`const t0 =
+// p; if t0 != null { t0(1) }`) — the checker records no type on a plain Ident init node, so the
+// callee sig is recovered by chasing the copy to its source (a param / annotated binding).
+function identCopySource(name: string, fnIx: i32) {
+  if fnIx < 0 { return "" }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const li = parentLetOf(fn.fnBody, name)
+    if li >= 0 {
+      const d = P.nodes[li]
+      if d is LetDecl {
+        if d.letType < 0 && d.letInit >= 0 {
+          const ini = P.nodes[d.letInit]
+          if ini is Ident { return ini.identName }
+        }
+      }
+    }
+  }
+  ""
+}
+
 function calleeCloSigKey(name: string, fnIx: i32) {
   // A union binding narrowed to a bare-closure arm (`if x is () => i64 { x() }`): the arm's
   // function-type name interns the SAME `$fnsig` an annotated closure would — so the `call_ref`
@@ -11858,7 +11903,7 @@ function calleeCloSigKey(name: string, fnIx: i32) {
   if pk != "" { return pk }
   const an = identFnTypeAnnName(name, fnIx)
   if an != "" {
-    const ak = annSigKey(an)
+    const ak = cloNameSigKey(an)
     if ak != "" { return ak }
   }
   const fe = identClosureFe(name, fnIx)
@@ -11866,6 +11911,10 @@ function calleeCloSigKey(name: string, fnIx: i32) {
   // resolves its `>v` sig — interned above for void function values. A value-eligible
   // (i32/f64) binding takes the same key `fnSigKeyOf` would give.
   if fe >= 0 { return cloSigKeyExt(fe) }
+  // An inferred COPY of another closure binding (`const t0 = p`): chase the source so a call
+  // through the intermediate binding classifies its result (nullable-closure read pattern).
+  const src = identCopySource(name, fnIx)
+  if src != "" && src != name { return calleeCloSigKey(src, fnIx) }
   ""
 }
 
@@ -12040,9 +12089,13 @@ function paramCloSigKey(fnIx: i32, name: string) {
                 if nm[0] == '=' && nm[1] == '>' {
                   return nm.slice(2, nm.length)
                 }
-                // A SOURCE function-type annotation `(params)=>ret`: derive its sig key,
-                // so a non-i32 (e.g. f64) signature casts to the right functype.
-                if strContains(nm, "=>") { return annSigKey(nm) }
+                // A NULLABLE-closure param (`((i32) => string) | null`, kind 19) OR a SOURCE
+                // function-type annotation `(params)=>ret`: derive its sig key so a non-i32 (e.g.
+                // f64) signature casts to the right functype, and — for a nullable closure whose
+                // arrow is nested one paren-depth down — the RESULT classifiers (`calleeReturns*`,
+                // print routing) recover the closure's result token instead of defaulting to i32
+                // (the pre-fix invalid-wasm: a narrowed `p(1)` string result printed as i32).
+                if strContains(nm, "=>") { return cloNameSigKey(nm) }
               }
             }
           }
