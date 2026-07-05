@@ -3053,6 +3053,15 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // alias) → a self-gated no-op. Map values nest (`{[string]: (C|S)[]}` → `(C|S)[]` → `C|S`).
   const pun = parenUnionArrElemName(name)
   if pun != "" { return registerInlineUnion(stmts, pun) }
+  // A NULLABLE ref array (`(f64 | {w: i32})[] | null`, `(K0[] | {w: i32})[] | null`): the `| null` niche
+  // itself is owned by the nulreflist machinery, but its INNER element union still needs registration
+  // (the shared value box + per-rep / variant reps). `isValueUnionName` is false here (the non-null arm is
+  // a ref array, not a scalar atom) and `parenUnionArrElemName` / `nameIsArray` both miss it (the name ends
+  // in `null`, not `]`), so without this the element union box is never interned and the reflist element
+  // mis-lowers (the raw arm value stores into a ref slot — INVALID-WASM). Strip the `| null` and recurse on
+  // the non-null ref-array name, which then hits the `pun` recursion above for its element union.
+  const rnp = nullablePartOf(name)
+  if rnp != "" && nameIsRefArray(rnp) { return registerInlineUnion(stmts, rnp) }
   // A NESTED array of an inline union (`(C|D)[][]`, `(C|D)[][][]`): `parenUnionArrElemName` only
   // matches a SINGLE-bracket `(…)[]`, so strip the OUTER `[]` and recurse on the element list,
   // reaching the inner union at any depth — the registration dual of the recursive ref-array
@@ -3060,6 +3069,18 @@ function registerInlineUnion(stmts: i32[], name: string) {
   if nameIsArray(name) {
     const inner = name.slice(0, name.length - 2)
     if nameIsArray(inner) { return registerInlineUnion(stmts, inner) }
+    // A 1D ARRAY-OF-INLINE-SHAPE element (`{a: f64, f: K0 | {w: i32}, z: string}[]` — a struct FIELD
+    // that is an array of a struct carrying a value-union FIELD): stripping one `[]` yields a SINGLE
+    // inline shape, NOT an array, so the `nameIsArray(inner)` recursion above stops and the element
+    // shape's field union (`K0 | {w: i32}`) is never registered. Its field then codes -1 in
+    // `internInlineShape` (`nameFieldCode` returns -1 for an unregistered heterogeneous union), so the
+    // inner struct FAILS TO INTERN — and the reflist element resolves to the OUTER struct (all three
+    // shapes share field names a/f/z), storing the wrong reps: INVALID-WASM. Recurse on the single-shape
+    // element so `registerShapeFieldUnions` (the `nameIsSingleShape` path below) reaches its field union
+    // and registers it — after which the inner struct interns distinctly and the element resolves to it.
+    // `internShapeDeep` already peels a single `[]` for SHAPE interning; this is the union-REGISTRATION
+    // twin it lacks.
+    if nameIsSingleShape(inner) { return registerInlineUnion(stmts, inner) }
   }
   // A bare MAP annotation with a union VALUE (`{[string]: C | S}`) registers that inner value union;
   // the `matoms.length < 2` guard restricts this to a bare map (one top-level atom) so a map-
