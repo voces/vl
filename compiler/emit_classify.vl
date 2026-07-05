@@ -9,7 +9,11 @@
 import {
   T,
   TyArray,
+  TyFunc,
+  TyMap,
+  TyObj,
   TyPrim,
+  TyUnion,
   anyLitUnionUsed,
   inferRetNameByNode,
   inferRetNameOf,
@@ -5720,41 +5724,88 @@ export function structIndexOfTypeName(name: string) {
 // collapsed `.map` callback return the checker rendered structurally) — the variant
 // analogue of `structIndexOfTypeName`. -1 if no variant matches. A NAME that is already a
 // variant alias resolves directly. Field-name parsing mirrors `structIndexOfTypeName`.
+// Parse a canonical inline SHAPE name `{a:T,b:U}` into PARALLEL field-name / field-type
+// string lists (appended to `outNames` / `outTypes`). Depth-aware over `{}` `[]` AND `()`
+// so a nested struct / list / closure field type is captured whole (a closure type carries
+// its own `,` between params and `:`-free `=>`). Spaces are stripped so both the canonical
+// (`tyToEmitName`) and spaced (`tyToStr`) renders parse the same. A non-`{…}` name appends
+// nothing. Shared by the variant / struct field-set resolvers so a field-NAME match can be
+// tightened with a field-TYPE (`nameFieldCode`) check — two shapes sharing field names but
+// differing in a field's TYPE (`{a:i32,f:i64,z:f64}` vs a union arm
+// `{a:boolean,f:()=>{…},z:i32}`) no longer collide onto the wrong slot.
+function shapeFieldParse(name: string, outNames: string[], outTypes: string[]) {
+  if name.length >= 2 && name[0] == '{' && name[1] != '[' {
+    let curN = ""
+    let curT = ""
+    let depth = 0
+    let collecting = true // true: reading the field NAME; false: reading its TYPE
+    let i = 1
+    while i < name.length - 1 {
+      const c = name[i]
+      if c == '{' || c == '[' || c == '(' {
+        depth = depth + 1
+        if !collecting { curT = curT + fromCodePoint(c) }
+      } else if c == '}' || c == ']' || c == ')' {
+        depth = depth - 1
+        if !collecting { curT = curT + fromCodePoint(c) }
+      } else if depth == 0 && c == ':' && collecting {
+        collecting = false
+      } else if depth == 0 && c == ',' {
+        outNames.push(curN)
+        outTypes.push(curT)
+        curN = ""
+        curT = ""
+        collecting = true
+      } else if c != ' ' {
+        if collecting {
+          curN = curN + fromCodePoint(c)
+        } else {
+          curT = curT + fromCodePoint(c)
+        }
+      }
+      i = i + 1
+    }
+    outNames.push(curN)
+    outTypes.push(curT)
+  }
+}
+
+// True if a shape field TYPE-string `t` (from `shapeFieldParse`) is compatible with the
+// emitter field CODE `code` — i.e. NOT a proven mismatch. A definitive mismatch (both codes
+// known and unequal, e.g. i64 `23` vs closure `14`) is the field-name-collision signal.
+// When the type-string cannot be classified (`nameFieldCode` -1, e.g. an inline nested
+// struct `{…}`) the check stays LENIENT (true), preserving the legacy name-only match for
+// shapes the code layer can't render — never a false REJECT of a real twin.
+function shapeFieldTypeCompat(t: string, code: i32): boolean {
+  const want = nameFieldCode(t)
+  if want < 0 || code < 0 { return true }
+  want == code
+}
+
 function variantIndexOfTypeName(name: string) {
   const direct = variantIndexOf(name)
   if direct >= 0 { return direct }
   if name.length >= 2 && name[0] == '{' && name[1] != '[' {
     const fnames: string[] = []
-    let cur = ""
-    let depth = 0
-    let collecting = true
-    let i = 1
-    while i < name.length - 1 {
-      const c = name[i]
-      if c == '{' || c == '[' {
-        depth = depth + 1
-      } else if c == '}' || c == ']' {
-        depth = depth - 1
-      } else if depth == 0 && c == ':' {
-        if collecting {
-          fnames.push(cur)
-          cur = ""
-          collecting = false
-        }
-      } else if depth == 0 && c == ',' {
-        collecting = true
-      } else if depth == 0 && collecting && c != ' ' {
-        cur = cur + fromCodePoint(c)
-      }
-      i = i + 1
-    }
+    const ftypes: string[] = []
+    shapeFieldParse(name, fnames, ftypes)
     let vi = 0
     while vi < uVariants.length {
       if uFieldCount[vi] == fnames.length {
         let ok = true
         let k = 0
         while k < fnames.length {
-          if variantFieldIndex(vi, fnames[k]) < 0 { ok = false }
+          const fj = variantFieldIndex(vi, fnames[k])
+          if fj < 0 {
+            ok = false
+          } else if (
+            !shapeFieldTypeCompat(ftypes[k], variantFieldTypeAt(vi, fj))
+          ) {
+            // A shared field NAME but a mismatched field TYPE — a distinct shape that
+            // merely collides on names (a closure returning `{a:i32,f:i64,z:f64}` is NOT
+            // the union arm `{a:boolean,f:()=>…,z:i32}`). Not this variant.
+            ok = false
+          }
           k = k + 1
         }
         if ok { return vi }
@@ -12016,6 +12067,69 @@ function sigKeyRetKind(k: string): VKind | null {
   // `repSigTokOfKind` the encoders read). An encoder arm can no longer exist
   // without its decoder twin.
   repKindOfSigTok(c)
+}
+
+// True when a closure value CALL's DECLARED result is a value UNION but the resolved
+// closure `$fnsig` reps its result as a NON-union — a single concrete member (a plain
+// struct / scalar, not the shared `{tag, value}` box). This is the deferred VALUE-UNION-
+// with-a-COMPOSITE-member closure-RESULT family (the typecheck.vl C2/C3 note): the union
+// box READ does not yet compose through a closure result, so the lambda's body self-infers
+// its single concrete arm (`(q0) => ({w:77})` reps a bare `{w:i32}`) while the checker types
+// the call as the whole union `f32 | {w:i32}`. The narrow that consumes it (`t0 is f32`)
+// then mis-reads the plain struct rep as the box — INVALID WASM (a dead-but-invalid narrowed
+// arm printing a `(ref)` via `__print_f32__`). The value-call emitter REJECTS on this so the
+// hole is a clean loud REJECT, never silent invalid wasm. A SUPPORTED value-union closure
+// result (the lambda adopted the union, its `$fnsig` result keys `>u`) returns false — as
+// does every non-union result. Mirrors the binding-position loud reject.
+export function cloCallUnionResultUnrepresentable(
+  callIx: i32,
+  fnIx: i32,
+): boolean {
+  // CASE A (nullable-closure-union RESULT, `() => (() => i32 | boolean) | null`): the resolved
+  // sig claims a value-union BOX result (`>u`) but NO value union is declared in the program —
+  // the box only arose inside an UN-CONSTRUCTED nested closure-result type, so `uBoxIdx` is
+  // never minted and `fbValtype("union")` would emit `(ref 0)` (the string/array type): invalid
+  // wasm at the inner call's `struct.get` tag read. The box read through this closure-result
+  // nesting is the deferred #875 family (a plain-binding nullable-closure-union already rejects
+  // cleanly); reject here too so the closure-RESULT position never leaks invalid wasm.
+  const ckeyA = cloCallSigKey(callIx, fnIx)
+  if ckeyA != "" {
+    const rkA = sigKeyRetKind(ckeyA)
+    if rkA != null && rkA == "union" && !uDeclared { return true }
+  }
+  const ty = nodeTyIxOf(callIx)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  if t.uMembers.length < 2 { return false }
+  // A "boxing" value union: at least one SCALAR (`TyPrim` — i32/f64/f32/i64/boolean/string)
+  // member AND at least one COMPOSITE (object/array/map/closure) member. Their reps differ,
+  // so the union needs the shared `{tag, value}` box — the case a closure result does not yet
+  // compose. A pure-scalar value union (`i64 | boolean`) OR a pure litunion (`TyLit` members)
+  // is REP-uniform and already lowers (its sig keys `>u` / `>i`); a struct/variant union
+  // (`Cat | Dog`, no scalar member) reps via the variant tag. Only the heterogeneous
+  // scalar+composite mix is the deferred hole, so gate on it precisely.
+  let hasScalar = false
+  let hasComposite = false
+  let i = 0
+  while i < t.uMembers.length {
+    const mt = T.tys[t.uMembers[i]]
+    if mt is TyPrim { hasScalar = true }
+    else if mt is TyObj { hasComposite = true }
+    else if mt is TyArray { hasComposite = true }
+    else if mt is TyMap { hasComposite = true }
+    else if mt is TyFunc { hasComposite = true }
+    i = i + 1
+  }
+  if !hasScalar || !hasComposite { return false }
+  // Rep-consistent only when the resolved closure `$fnsig` result IS the union box (`>u`).
+  // No sig, an unparseable result, or a concrete-member result token (`>s…`, a scalar) means
+  // the box read has nothing to recover — the deferred hole. Reject.
+  const ckey = cloCallSigKey(callIx, fnIx)
+  if ckey == "" { return true }
+  const rk = sigKeyRetKind(ckey)
+  if rk == null { return true }
+  rk != "union"
 }
 
 // The ref-list SLOT of a `>r<slot>;` result key (the digits between `r` and `;`), or -1 when the
