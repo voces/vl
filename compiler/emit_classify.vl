@@ -9,7 +9,11 @@
 import {
   T,
   TyArray,
+  TyFunc,
+  TyMap,
+  TyObj,
   TyPrim,
+  TyUnion,
   anyLitUnionUsed,
   inferRetNameByNode,
   inferRetNameOf,
@@ -12061,6 +12065,60 @@ function sigKeyRetKind(k: string): VKind | null {
   // `repSigTokOfKind` the encoders read). An encoder arm can no longer exist
   // without its decoder twin.
   repKindOfSigTok(c)
+}
+
+// True when a closure value CALL's DECLARED result is a value UNION but the resolved
+// closure `$fnsig` reps its result as a NON-union — a single concrete member (a plain
+// struct / scalar, not the shared `{tag, value}` box). This is the deferred VALUE-UNION-
+// with-a-COMPOSITE-member closure-RESULT family (the typecheck.vl C2/C3 note): the union
+// box READ does not yet compose through a closure result, so the lambda's body self-infers
+// its single concrete arm (`(q0) => ({w:77})` reps a bare `{w:i32}`) while the checker types
+// the call as the whole union `f32 | {w:i32}`. The narrow that consumes it (`t0 is f32`)
+// then mis-reads the plain struct rep as the box — INVALID WASM (a dead-but-invalid narrowed
+// arm printing a `(ref)` via `__print_f32__`). The value-call emitter REJECTS on this so the
+// hole is a clean loud REJECT, never silent invalid wasm. A SUPPORTED value-union closure
+// result (the lambda adopted the union, its `$fnsig` result keys `>u`) returns false — as
+// does every non-union result. Mirrors the binding-position loud reject.
+export function cloCallUnionResultUnrepresentable(callIx: i32, fnIx: i32): boolean {
+  const ty = nodeTyIxOf(callIx)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  if t.uMembers.length < 2 { return false }
+  // A "boxing" value union: at least one SCALAR (`TyPrim` — i32/f64/f32/i64/boolean/string)
+  // member AND at least one COMPOSITE (object/array/map/closure) member. Their reps differ,
+  // so the union needs the shared `{tag, value}` box — the case a closure result does not yet
+  // compose. A pure-scalar value union (`i64 | boolean`) OR a pure litunion (`TyLit` members)
+  // is REP-uniform and already lowers (its sig keys `>u` / `>i`); a struct/variant union
+  // (`Cat | Dog`, no scalar member) reps via the variant tag. Only the heterogeneous
+  // scalar+composite mix is the deferred hole, so gate on it precisely.
+  let hasScalar = false
+  let hasComposite = false
+  let i = 0
+  while i < t.uMembers.length {
+    const mt = T.tys[t.uMembers[i]]
+    if mt is TyPrim {
+      hasScalar = true
+    } else if mt is TyObj {
+      hasComposite = true
+    } else if mt is TyArray {
+      hasComposite = true
+    } else if mt is TyMap {
+      hasComposite = true
+    } else if mt is TyFunc {
+      hasComposite = true
+    }
+    i = i + 1
+  }
+  if !hasScalar || !hasComposite { return false }
+  // Rep-consistent only when the resolved closure `$fnsig` result IS the union box (`>u`).
+  // No sig, an unparseable result, or a concrete-member result token (`>s…`, a scalar) means
+  // the box read has nothing to recover — the deferred hole. Reject.
+  const ckey = cloCallSigKey(callIx, fnIx)
+  if ckey == "" { return true }
+  const rk = sigKeyRetKind(ckey)
+  if rk == null { return true }
+  rk != "union"
 }
 
 // The ref-list SLOT of a `>r<slot>;` result key (the digits between `r` and `;`), or -1 when the
