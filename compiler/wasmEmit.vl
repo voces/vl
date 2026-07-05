@@ -371,6 +371,7 @@ import {
   exprNulScalarListKind,
   exprNulStrArray,
   exprNullableList,
+  exprNullableMap,
   exprNullableRefArray,
   exprNullableString,
   exprNullableStruct,
@@ -428,6 +429,7 @@ import {
   listIdxWrapSlot,
   listOpKindOfBin,
   localIndexOf,
+  mapAnnShape,
   mapIsSetExpr,
   mapShapeOfExpr,
   mapSlotTag,
@@ -451,6 +453,7 @@ import {
   narrowedRefArrayOf,
   narrowedValueAtomOf,
   nliNameOf,
+  nulMapShapeOf,
   nulScalarListBuildKind,
   nulScalarListKindOfNode,
   objVariantName,
@@ -464,6 +467,7 @@ import {
   refListSlotOfExpr,
   refPushScratchBaseFor,
   restoreNarrow,
+  retNulMapFlag,
   retNulRefArrFlag,
   retNulRefFlag,
   retNulRefIndex,
@@ -3409,6 +3413,13 @@ function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // mapRef store. The KEY expr may contain an inner map op (`m[n[k] ?? "d"]`),
   // which clobbers `cmSlot` — re-pin it before the probe.
   if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
+  // A NULLABLE map receiver (`{[string]: V} | null`, kind `nulmap`) is a `(ref null $mapStruct)` —
+  // recover its non-null ref before the `(ref $mapStruct)` mapRef store (the checker proved every
+  // narrowed map op guarded, so the cast never traps). The map twin of the nulstruct field-read
+  // `ref.as_non_null` (`emitMemberNode`).
+  if exprNullableMap(recvIx, fnIx) {
+    wU8(212) // 0xd4 ref.as_non_null
+  }
   cmSlot = mshape
   setMapRef(body) // mapRef (the shared mono slot, or this mv frame's)
   // The KEY is always a STRING ref — shield it from an ambient atom context (an
@@ -8376,6 +8387,11 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   let retNulList = false
   let retNulRefArr = false
   let retNulRefArrHeap = -1
+  // A NULLABLE map return (`{[string]: V} | null`, kind `nulmap`): a `return m` passes the map ref
+  // (which subtypes the nullable result), a `return null` is `ref.null $mapStruct`. `retNulMapShape`
+  // is the map SHAPE (for the null heap + a `return Map()`).
+  let retNulMap = false
+  let retNulMapShape = -1
   let retNulSLKind: VKind | null = null
   let retLitUnion = false
   let retNulLitUnion = false
@@ -8452,6 +8468,10 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
         retNulRefArrHeap = rlWrapIdx[rlsRet]
       }
     }
+    if retNulMapFlag(fn.fnRet) == 1 {
+      retNulMap = true
+      retNulMapShape = mapAnnShape(fn.fnRet)
+    }
     retNulSLKind = nulScalarListKindOfNode(fn.fnRet)
     if nodeTyIsLitUnionAlias(fn.fnRet) { retLitUnion = true }
     // A `K | null` NICHE return: a `return null` lowers as the i32 sentinel `-1`, a `return "a"`
@@ -8502,6 +8522,13 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if retNulRefArr && retNulRefArrHeap >= 0 {
       retCtx.nulRefHeap = retNulRefArrHeap
     }
+    // A nulmap return: a `return null` is `ref.null $mapStruct` (`nulRefHeap`), a `return Map()`
+    // builds THIS map's struct (`mapSlot`). A `return m` (a map variable) self-identifies and
+    // subtypes the nullable result.
+    if retNulMap {
+      retCtx.nulRefHeap = mapTypeIdxOf(retNulMapShape)
+      retCtx.mapSlot = retNulMapShape
+    }
     // A DISTINCT-backing nullable scalar list return: a `return [x]` builds the leaf list
     // (`listKind`, which subtypes the nullable result), a `return null` is `ref.null $wrapper`.
     if retNulSLKind != null {
@@ -8548,6 +8575,11 @@ export function emitNullForRet(_body: i32[], fnIx: i32) {
       wSLEB(sHeapIdx[rsi])
       return 0
     }
+  }
+  if retNulMapFlag(r) == 1 {
+    wU8(208) // 0xd0 ref.null — the nullable map struct
+    wSLEB(mapTypeIdxOf(mapAnnShape(r)))
+    return 0
   }
   if retNulListFlag(r) == 1 {
     wU8(208) // 0xd0 ref.null
@@ -8759,6 +8791,15 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // A map-typed binding seeds the map SHAPE so a `Map()` initializer constructs
   // THIS binding's map struct (mono, or the annotation's ref-valued mv slot).
   if letIsMap(stmtIx, fnIx) { pendingMapSlot = letMapShapeOf(stmtIx, fnIx) }
+  // A NULLABLE map binding (`let m: {[string]: V} | null = …`, slot kind `nulmap`): a `Map()` init
+  // builds THIS map's struct (`pendingMapSlot` = the shape), and a bare `null` init lowers as
+  // `ref.null $mapStruct` (`pendingNulRefHeap` = the map heap type, the generic ref-null seed). The
+  // map twin of the kind-9 nulstruct seed above.
+  if localIsRef[slot] == "nulmap" {
+    const nmShape = nulMapShapeOf(stmtIx, fnIx)
+    pendingMapSlot = nmShape
+    pendingNulRefHeap = mapTypeIdxOf(nmShape)
+  }
   // Numeric WIDENING at the binding boundary: an `: f64` / `: f32` / `: i64` slot
   // coerces a narrower init value (the lattice convert is inserted by the `emitExprAs*`
   // helpers — i32/i64/f32→f64, i32→f32, i32→i64). A float/integer literal re-encodes in
@@ -9977,8 +10018,12 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
           gck0 != "f64" &&
           gck0 != "f32" &&
           gck0 != "nullist" &&
-          gck0 != "nulclosure"
+          gck0 != "nulclosure" &&
+          gck0 != "nulmap"
         ) {
+          // A NULLABLE-map cell (kind `nulmap`) legitimately holds null — its reads stay nullable
+          // (the `!= null` check reads raw; the narrowed map op recovers non-null at the receiver,
+          // `emitMapPrep`). Excluded from the eager recover, like the nulstruct/nullist cells.
           wU8(212) // 0xd4 ref.as_non_null
         }
       }
@@ -10525,6 +10570,19 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
         }
         return 0
       }
+      // `t == null` / `t != null` over a NULLABLE map (`{[string]: V} | null`, kind `nulmap`): the
+      // `(ref null $mapStruct)` niche — the same `ref.is_null` lowering as the nullable struct. The
+      // ident emits RAW (a plain `local.get` — `emitExpr` never recovers a nulmap ident to non-null;
+      // the `ref.as_non_null` recover lives only at map-OP receiver sites), so `ref.is_null` sees the
+      // genuine nullable ref. Checked before `exprMap` (a nulmap ident IS a map) could route it away.
+      if exprNullableMap(nref, fnIx) {
+        if emitExpr(body, nref, fnIx) < 0 { return -1 }
+        wU8(209) // 0xd1 ref.is_null
+        if e.binOp == "!=" {
+          fbI32Eqz() // invert: non-null
+        }
+        return 0
+      }
       // `c == null` / `c != null` over a NULLABLE function value (`fn | null`, kind 19):
       // the same `ref.is_null` lowering as the nullable struct.
       if exprNulClosure(nref, fnIx) {
@@ -10764,6 +10822,13 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           vtKindOfParam(cParams[i]) == "nulstruct"
         ) {
           pendingStructIdx = paramStructIdxOf(cParams[i])
+        }
+        // A NULLABLE map param position (`{[string]: V} | null`, kind `nulmap`): a `null` argument
+        // lowers as `ref.null $mapStruct` (the generic ref-null seed over THIS map's heap type). A
+        // map-value argument is a variable that self-identifies its shape (`exprMap`), so it ignores
+        // the seed. Mirrors the nulstruct `pendingStructIdx` seed above.
+        if vtKindOfParam(cParams[i]) == "nulmap" {
+          pendingNulRefHeap = mapTypeIdxOf(paramStructIdxOf(cParams[i]))
         }
         if vtKindOfParam(cParams[i]) == "struct" { cParamStruct = true }
         if vtKindOfParam(cParams[i]) == "variant" {
