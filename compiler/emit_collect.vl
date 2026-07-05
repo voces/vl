@@ -475,6 +475,18 @@ function peelWrapType(arm: string) {
   t
 }
 
+// True if function-result type NAME `r` ROUND-TRIPS through the nested-closure value-call
+// ABI — i.e. a value call on a closure returning `r` recovers it correctly. Only a plain
+// numeric/boolean SCALAR does: it is the closure `call_ref`'s literal result valtype, read
+// straight off the stack. A COMPOSITE result (struct / union / litunion / map / string /
+// nullable) is a box/atom/ref whose recovery through a CHAINED closure call is a separate,
+// unfinished slice — its nested lambda body mis-lowers (an inner litunion arm keeps its
+// string rep where the `>i` atom is expected; a union box traps on the narrow). Excluding
+// them keeps those shapes a CLEAN REJECT (no interned sig) instead of INVALID-WASM / TRAP.
+function cloResultIsPlainScalar(r: string) {
+  r == "i32" || r == "boolean" || r == "f64" || r == "f32" || r == "i64"
+}
+
 // Intern every closure `$fnsig` reachable through the RESULT chain of function-type name
 // `tn` — a closure whose result is ITSELF a closure (`()=>((i32)=>f32)`), to any nesting
 // depth (`()=>(()=>(i32)=>boolean)`). The concrete-lambda loop keys the OUTER sig as a
@@ -489,6 +501,13 @@ function peelWrapType(arm: string) {
 // `emitSynthCloSig` builds its functype purely from the key. Idempotent via
 // `cloSigPosOfKey` — dedups against a concrete closure of the same shape. The closure dual
 // of the nullable-closure-result block above, generalized to the whole result spine.
+//
+// BOUNDED to results that ROUND-TRIP through a value call: a level's key is interned only
+// when its RESULT is a nested closure (the shared fat-pointer, always valid) or a plain
+// numeric/boolean SCALAR (`cloResultIsPlainScalar`). A composite result (struct / union /
+// litunion / map / string) is deliberately left un-interned so the value call stays a clean
+// REJECT — synthesizing its sig would let a mis-lowering nested body reach INVALID-WASM /
+// TRAP (the recovery of a boxed/atom result through a CHAINED closure call is a later slice).
 function internCloResultChain(tn: string) {
   if tn == "" { return 0 }
   let cur = peelWrapType(tn)
@@ -497,14 +516,20 @@ function internCloResultChain(tn: string) {
     guard = guard + 1
     const a = annArrowAt(cur)
     if a < 0 { return 0 }
-    const k = unionArmSigKey(cur)
-    if k != "" {
-      if cloSigPosOfKey(k) < 0 {
-        cloSigKeys.push(k)
-        cloSigRepFn.push(-1)
+    const ret = peelWrapType(cur.slice(a + 2, cur.length))
+    const retIsClosure = annArrowAt(ret) >= 0
+    if retIsClosure || cloResultIsPlainScalar(ret) {
+      const k = unionArmSigKey(cur)
+      if k != "" {
+        if cloSigPosOfKey(k) < 0 {
+          cloSigKeys.push(k)
+          cloSigRepFn.push(-1)
+        }
       }
     }
-    cur = peelWrapType(cur.slice(a + 2, cur.length))
+    // Descend only THROUGH a nested-closure result — a scalar/composite result ends the spine.
+    if !retIsClosure { return 0 }
+    cur = ret
   }
   0
 }
