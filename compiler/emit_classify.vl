@@ -7413,6 +7413,38 @@ export function internShapeDeep(nm: string) {
   }
   const np = nullablePartOf(nm)
   if np != "" { return internShapeDeep(np) }
+  // A MIXED / composite UNION (`{f:i64}[] | f64`, `{[string]: K}[] | string`, `{f:i64}[] | {w:i32}`):
+  // the all-scalar case was handled by the `isValueUnionName` branch above, so a top-level `|` here
+  // means at least one arm is a COMPOSITE. Intern an arm whose CORE (trailing `[]`s peeled) is an
+  // INLINE STRUCT / MAP shape (`{f:i64}[]`, `{[string]:V}[]`, a bare `{w:i32}`) NOW — during
+  // `collectAnnShapes`, BEFORE the literal that carries it is seen by `collectAnonShapes` (which would
+  // otherwise name the same shape `#anonN`, leaving the union-arm's name-based `refArrElemName` /
+  // `unionHasRefArrayArmSlot` lookup unable to find the reflist slot the literal interns — a silent
+  // fall-through to scalar-boxing, invalid wasm). Gated on a PAREN-FREE name: `splitUnionAtoms` splits
+  // `|` on brace/bracket depth only (NOT parens), so a `(...)`-grouped arm (`(i32|null)[] | null`, a
+  // closure-array union) MIS-splits — and those arms already have a working rep via the array/paren
+  // descent below. Restricting to `{`-CORE arms of a paren-free union both avoids that mis-split and
+  // leaves the grouped reps untouched. A single-arm (non-union) name splits to one atom and skips this.
+  if !strContains(nm, "(") {
+    const uArms: string[] = []
+    splitUnionAtoms(nm, uArms)
+    if uArms.length > 1 {
+      let uai = 0
+      while uai < uArms.length {
+        let uCore = uArms[uai]
+        while (
+          uCore.length > 2 &&
+          uCore[uCore.length - 2] == '[' &&
+          uCore[uCore.length - 1] == ']'
+        ) {
+          uCore = uCore.slice(0, uCore.length - 2)
+        }
+        if uCore.length >= 1 && uCore[0] == '{' { internShapeDeep(uArms[uai]) }
+        uai = uai + 1
+      }
+      return 0
+    }
+  }
   if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
     return internShapeDeep(nm.slice(0, nm.length - 2))
   }
