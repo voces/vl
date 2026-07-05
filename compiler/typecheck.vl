@@ -1126,6 +1126,21 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
           // slot (it would else code the float literal's default f64).
           recNodes.push(fv)
           recTys.push(dty)
+        } else if assignable(sty, dty) && !assignable(dty, sty) {
+          // The field WIDENS by BOXING — a bare scalar/struct arm into a UNION or NULLABLE
+          // field (`{f: false}` against `{f: boolean | {w: i32}}`, `{f: 99}` against
+          // `{f: i64 | string}`). Adopt when the literal value re-encodes at the wider field
+          // type (`assignableExpr`, field-wise) — the object dual of the value-union return
+          // arm. Record the field type so the emitter boxes the field slot and coerces the
+          // ObjLit value into the box, exactly as the annotated `: {f: boolean | {w: i32}}`
+          // named-function return already lowers. `synthRetAnnots` pins the lambda's `fnRet`
+          // to the whole struct shape (`nameIsStructWithUnionField`), so its `$fnsig` result
+          // is the union-field struct — without which the value call mis-recovered the plain
+          // struct (MISMATCH / INVALID-WASM at the boxed field read).
+          if fv < 0 { return false }
+          if !assignableExpr(fv, sty, dty) { return false }
+          recNodes.push(fv)
+          recTys.push(dty)
         } else {
           // A non-widening field must match exactly (mutual assignability) — a shape
           // difference beyond numeric widening is not an adoption, it is a mismatch.
@@ -7084,6 +7099,17 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // ELEMENT-VALUE-UNION LIST result (`() => (i64|boolean)[]`): a lambda whose body array
+        // literal is assignable to the expected value-union-box list adopts it, so `emitReturnValue`
+        // boxes each element (`[7]`) through the SAME element-kind-2 rep the annotated
+        // `(i64|boolean)[]` return / named-function-value form already lowers soundly (`synthRetAnnots`
+        // pins `fnRet`). The value-union sibling of the element-nullable arm above.
+        if inferred != expRet && elemValueUnionListRetName(expRet) != "" {
+          const evTail = lambdaBodyTail(n.fnBody)
+          if evTail >= 0 && assignableExpr(evTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
       }
     }
     // PERMISSIVE FALL-THROUGH (totality): an un-annotated function that can fall off the
@@ -7195,13 +7221,22 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // through a VARIABLE (`(n) => { const x: i64 = …; return x }`) — which the emitter's
       // expression-based fallback misses — emits invalid wasm.
       const anm = tyToStr(inferred)
+      // A STRUCT-with-BOXED-FIELD contextual return (`{f: boolean | {w: i32}}`, `{f: i64 |
+      // string}` — a struct whose field is a union/nullable) the checker adopted at the lambda
+      // boundary (`objRetWidenAdopt`'s boxing-widen arm). Recorded under the CANONICAL emit name
+      // (`tyToEmitName`, spaceless — the `sNames` / `structIndexByName` key), NOT the spaced
+      // `tyToStr` render, so `synthRetAnnots`'s pin + `internShapeDeep`'s inline-shape intern
+      // resolve. Takes precedence over `recordable` (which would else record the spaced `anm`,
+      // an un-interned key). Empty unless the inferred struct genuinely carries a boxed field.
+      const sfbNm = structFieldBoxRetName(inferred)
       // A single STRUCT-shape (`{meow: i32}`) inferred return is recorded too — a lambda
       // that COLLAPSES to one union variant (`(a) => if a is Cat { a } else { catShape }`)
       // types as that variant's shape; the emitter resolves it to the concrete variant
       // (`variantIndexOfTypeName`) so a `.map` result is the variant ref list, not the box.
-      const recordable = isClassifiableRetName(anm) ||
+      const recordable = sfbNm == "" &&
+        (isClassifiableRetName(anm) ||
         isObjShapeName(anm) ||
-        isScalarListRetName(anm)
+        isScalarListRetName(anm))
       // A UNION inferred/contextual return (`i32 | string`, `Cat | Dog`) — export its emitter-format
       // name (value-union or struct-union) under the same node sentinel, mirroring the named-function
       // A20 loop. This is the CONTEXTUAL return the checker proved for the lambda at ITS boundary
@@ -7209,7 +7244,8 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // POSITION-INDEPENDENTLY (`synthRetAnnots`), instead of re-deriving it per boundary.
       let unm = ""
       if !recordable {
-        unm = valueUnionRetName(inferred)
+        unm = sfbNm
+        if unm == "" { unm = valueUnionRetName(inferred) }
         if unm == "" { unm = structUnionRetName(inferred, gRootStmts) }
         // A NULLABLE-ref contextual return (`P | null`, `string | null`) — recorded under the same
         // node sentinel so `synthRetAnnots` pins a nullable-returning closure value position-
@@ -7224,6 +7260,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // the value-union-box list, whose `[null]` element seeding `emitReturnValue` already
         // performs for the annotated form.
         if unm == "" { unm = nulElemListRetName(inferred) }
+        // An ELEMENT-VALUE-UNION list contextual return (`() => (i64|boolean)[]`, adopted just
+        // above) — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the
+        // value-union-box list, whose element boxing `emitReturnValue` already performs.
+        if unm == "" { unm = elemValueUnionListRetName(inferred) }
         // A MAP-MEMBER-UNION contextual return (`() => {[string]:f32} | {w:i32}`, adopted just above)
         // — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the map-union box
         // (#865/#868), whose arm boxing `emitReturnValue` already performs for the annotated form.
@@ -7955,6 +7995,49 @@ function collectRetAtoms(er: i32, out: string[]) {
   0
 }
 
+// The CANONICAL emitter NAME (`{f:boolean|{w:i32}}`, `{f:i64|string}`) for an inferred return
+// `er` IF it is a bare STRUCT whose every field is emit-nameable AND at least one field is a
+// UNION or NULLABLE (a boxed / niche field slot), else "". A struct whose composite field a
+// closure result BODY literal built from bare-scalar/struct literals does NOT naturally box —
+// the lambda self-infers the plain field shape — so the value call mis-recovered the boxed field
+// (a MISMATCH: `t0(1).f is boolean` read the wrong tag; or INVALID-WASM: an i64 field read where
+// an i32 was stored). `synthRetAnnots` pins the lambda's `fnRet` to this canonical name so its
+// `$fnsig` result is the union-FIELD struct and `emitReturnValue` boxes the body ObjLit, exactly
+// as the annotated `: {f: …}` named-function form lowers. Canonical (`tyToEmitName`), spaceless —
+// the `structIndexByName` / `internShapeDeep` key (`tyToStr`'s spaced render would not resolve).
+// The struct-field dual of `valueUnionRetName` / `mapUnionRetName`.
+function structFieldBoxRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if !(t is TyObj) { return "" }
+  let hasBox = false
+  let i = 0
+  while i < t.objFieldTypes.length {
+    const ft = T.tys[t.objFieldTypes[i]]
+    if ft is TyUnion {
+      // Every member must be a SCALAR / string-literal / OBJECT (a boxable value or struct-mixed
+      // union — `i64 | string`, `boolean | {w: i32}`). A CLOSURE / MAP / LIST / nullable member is
+      // NOT lowerable as a boxed struct-field slot (`((i32) => K0) | f64`, `{[string]: V} | X`) — the
+      // annotated form itself rejects those, so pinning would turn a working shape into a NEW loud
+      // reject. Decline the whole struct then (its unlowerable shape stays a clean reject, unchanged).
+      let m = 0
+      while m < ft.uMembers.length {
+        const mt = T.tys[ft.uMembers[m]]
+        if !(mt is TyPrim) && !(mt is TyLit) && !(mt is TyObj) { return "" }
+        m = m + 1
+      }
+      hasBox = true
+    } else if ft is TyNullable {
+      // A nullable struct FIELD (`{f: S | null}`) is a niche, not the value-union box this pin
+      // routes through — decline (conservative; it stays a clean reject, never invalid wasm).
+      return ""
+    }
+    i = i + 1
+  }
+  if !hasBox { return "" }
+  tyToEmitName(er)
+}
+
 // The emitter-format union NAME (`i32|string`, `i32|null`) for an inferred return type
 // `er` IF it is a VALUE union the emitter can box (the `uBoxIdx` rep: ≥2 non-null value
 // atoms, or one numeric scalar + null — `isValueUnionName`, the same gate the annotated
@@ -8118,6 +8201,23 @@ function nulElemListRetName(er: i32) {
         return "(" + inner + "|null)[]"
       }
     }
+  }
+  ""
+}
+
+// The emitter-format NAME of an inferred ELEMENT-VALUE-UNION list return `er` — `(i64|boolean)[]`,
+// `(i64|string)[]`, `(i32|f64)[]`: a `TyArray` whose element is a VALUE union the emitter boxes
+// (`isValueUnionName`). Its elements are the value-union `{tag, payload}` boxes (element kind 2, the
+// SAME rep the annotated `(i64|boolean)[]` return / named-function-value form lowers), so the emitter
+// pins a lambda to it (`synthRetAnnots`) and routes through that existing sound path. `tyToEmitName`
+// renders the parens-wrapped, space-free name `(i64|boolean)[]` matching `parenUnionArrElemName`. The
+// value-union sibling of `nulElemListRetName` (which owns the `(scalar|null)[]` niche). "" otherwise.
+function elemValueUnionListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    const en = tyToEmitName(t.aElem)
+    if en != "" && isValueUnionName(en) { return tyToEmitName(er) }
   }
   ""
 }
