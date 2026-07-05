@@ -21,6 +21,7 @@ import {
   nodeArrayElemIsLitUnion,
   nodeArrayElemName,
   nodeTyIsLitUnionAlias,
+  nodeTyName,
   splitUnionAtoms,
 } from "./typecheck"
 import {
@@ -423,12 +424,89 @@ export function collectFns(stmts: i32[]) {
     liftFnsInExpr(startStmts[si], -1)
     si = si + 1
   }
+  // A lambda lifted from a GLOBAL initializer / start statement (the two loops just above)
+  // is pushed WITHOUT its own body being descended — `liftFnsInExpr` lifts a bare `FuncDecl`
+  // and returns, leaving the body-descent to the worklist, which already finished at the old
+  // `fnStmts.length`. So a nested lambda inside a top-level `const g = () => (() => …)` (a
+  // closure whose result is itself a closure) was never lifted, and its inner literal reached
+  // emit unlifted (`function literal not lifted`). Resume the worklist from where it stopped
+  // (`wi` still holds that index) to descend exactly the newly-lifted functions — order-
+  // preserving (already-descended entries keep their `fnStmts` slot, so every existing
+  // program's function indices are unchanged; only nested-of-global/start lambdas are appended).
+  while wi < fnStmts.length {
+    const gfn = P.nodes[fnStmts[wi]]
+    if gfn is FuncDecl { liftFnsInExpr(gfn.fnBody, wi) }
+    wi = wi + 1
+  }
   // The `$fnsig` signature collection happens LATER (`collectCloSigs`, after
   // `computeRetInference`): a signature key reads each function's param AND return
   // kinds, and an un-annotated callback's return kind is only known once inference ran.
   cloSigKeys = []
   cloSigRepFn = []
   fnStmts.length
+}
+
+// Trim ASCII whitespace and peel ONE fully-wrapping `(...)` pair from a type name — the
+// form a closure RESULT arrives in (`((i32) => f32)` groups the arrow one paren-depth
+// down). Shares the exact normalization `unionArmSigKey` applies before keying, so the
+// peeled string re-enters the result walk (`internCloResultChain`) as a bare `(p)=>r`.
+function peelWrapType(arm: string) {
+  let lo = 0
+  let hi = arm.length
+  while lo < hi && (arm[lo] == ' ' || arm[lo] == '\t') { lo = lo + 1 }
+  while hi > lo && (arm[hi - 1] == ' ' || arm[hi - 1] == '\t') { hi = hi - 1 }
+  let t = arm.slice(lo, hi)
+  if t.length >= 2 && t[0] == '(' {
+    let depth = 0
+    let ci = 0
+    let wraps = true
+    while ci < t.length {
+      const cch = t[ci]
+      if cch == '(' {
+        depth = depth + 1
+      } else if cch == ')' {
+        depth = depth - 1
+        if depth == 0 && ci < t.length - 1 { wraps = false }
+      }
+      ci = ci + 1
+    }
+    if wraps { t = t.slice(1, t.length - 1) }
+  }
+  t
+}
+
+// Intern every closure `$fnsig` reachable through the RESULT chain of function-type name
+// `tn` — a closure whose result is ITSELF a closure (`()=>((i32)=>f32)`), to any nesting
+// depth (`()=>(()=>(i32)=>boolean)`). The concrete-lambda loop keys the OUTER sig as a
+// collapsed `>c` (the shared fat-pointer, `repSigTokOfKind("closure")`) but never mints
+// the INNER closure's own sig — the collector interns from concrete lifted lambdas, and a
+// lambda RETURNING a closure has no lifted lambda of the RESULT type (or one whose
+// self-inferred result kind — e.g. an f64 literal — disagrees with the annotated f32). So
+// a value call on the RESULT (`g()(1)`, whose key the emitter re-derives from the CHECKER
+// type via `nodeTyName`→`annSigKey`) finds no interned signature and rejects loudly. Walk
+// the result chain and intern each result closure's key (`unionArmSigKey`, the SAME
+// normalize+`annSigKey` the call site uses, so the keys byte-match) with the -1 synth rep;
+// `emitSynthCloSig` builds its functype purely from the key. Idempotent via
+// `cloSigPosOfKey` — dedups against a concrete closure of the same shape. The closure dual
+// of the nullable-closure-result block above, generalized to the whole result spine.
+function internCloResultChain(tn: string) {
+  if tn == "" { return 0 }
+  let cur = peelWrapType(tn)
+  let guard = 0
+  while guard < 64 {
+    guard = guard + 1
+    const a = annArrowAt(cur)
+    if a < 0 { return 0 }
+    const k = unionArmSigKey(cur)
+    if k != "" {
+      if cloSigPosOfKey(k) < 0 {
+        cloSigKeys.push(k)
+        cloSigRepFn.push(-1)
+      }
+    }
+    cur = peelWrapType(cur.slice(a + 2, cur.length))
+  }
+  0
 }
 
 // Collect the distinct `$fnsig` env-leading functypes — one per distinct eligible
@@ -480,6 +558,16 @@ export function collectCloSigs() {
           }
         }
       }
+    }
+    // CLOSURE-RETURNING-CLOSURE result (`() => ((i32) => f32)`, `(i32) => (() => i64)`): a
+    // lifted lambda whose result is ITSELF a closure keys its OWN sig as the collapsed `>c`
+    // (via `cloSigKeyExt`) but the INNER closure's sig is never minted from a concrete lambda
+    // — so a value call on the returned closure (`g()(1)`) has no interned signature. Walk the
+    // result chain off the lambda's CHECKER type (`nodeTyName`, the same source the call site
+    // reads) and synthesize each result closure's `$fnsig` from its key (rep -1). Recurses
+    // through arbitrary nesting; idempotent via `cloSigPosOfKey`.
+    if cloRetValKind(fe) == "closure" {
+      internCloResultChain(nodeTyName(fnStmts[fe]))
     }
     fe = fe + 1
   }
