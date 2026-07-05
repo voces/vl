@@ -10779,7 +10779,9 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       if callee.memProp == "pop" {
         if exprRefArray(callee.memObj, fnIx) {
           const slot = refListSlotOfExpr(callee.memObj, fnIx)
-          if slot >= 0 { return rlElemKindTbl[slot] == 3 }
+          if slot >= 0 && slot < rlElemKindTbl.length {
+            return rlElemKindTbl[slot] == 3
+          }
         }
       }
     }
@@ -10819,7 +10821,14 @@ export function exprMap(exprIx: i32, fnIx: i32) {
   if e is Index {
     if exprRefArray(e.idxArr, fnIx) {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      if slot >= 0 { return rlElemKindTbl[slot] == 3 }
+      // `refListSlotOfExpr` falls back to slot 0 for an UN-INTERNED element name (the ref-list
+      // tables can be empty when the only ref-array-shaped type is never interned — e.g. a
+      // nullable array-of-map field of a union arm). Bound-check before the read, the idiom the
+      // sibling ref-list classifiers already use — else `rlElemKindTbl[0]` on an empty table is a
+      // compiler-internal OOB trap. (Same guard added to the `.pop()` twin above.)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        return rlElemKindTbl[slot] == 3
+      }
     }
     const mri = mapReadMvSlot(exprIx, fnIx)
     if mri >= 0 {
@@ -11288,12 +11297,25 @@ export function exprString(exprIx: i32, fnIx: i32) {
       if fnRetString(callee.identName) { return true }
       // A string-returning function VALUE (a binding / `(i32) => string` param callee,
       // invisible to `fnRetString`): its resolved `>S` sig.
-      return calleeReturnsString(callee.identName, fnIx)
+      if calleeReturnsString(callee.identName, fnIx) { return true }
     }
     // A string-returning FIELD-closure call (`o.label(3)` over a `(i32) => string` field).
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
       if ffe >= 0 { return fRetStr[ffe] == 1 }
+    }
+    // A closure-VALUE call whose callee sig the per-NAME resolvers above cannot key — a local
+    // whose closure type was inferred from a Member/Index init (`const t0 = v[0].f`, a
+    // nullable-closure struct field narrowed non-null). `calleeCloSigKey` (per name) lacks the
+    // `nodeTyName` fallback the actual `call_ref` lowering (`cloCallSigKey`, per call node) uses,
+    // so the two disagreed: the call emitted a `() => string` `call_ref` (a string ref) while this
+    // classifier said i32 → `print` dispatched `__print_i32__` on a string (invalid wasm). Resolve
+    // the call node's sig the SAME way the emitter does so print/coerce dispatch agrees — but only
+    // when the checker ALSO typed the result a plain `string` (kind 3). A string-LITERAL-union result
+    // (`(i32) => K0`, `K0 = "a" | "b"`) keys `>S` too yet reps as the i32 ATOM, so the sig alone would
+    // mis-claim it a string (a `(ref $type)` vs i32 mismatch); the node-type gate excludes it.
+    if tyKindOf(nodeTyIxOf(exprIx)) == 3 {
+      if sigKeyRetKind(cloCallSigKey(exprIx, fnIx)) == "str" { return true }
     }
     return false
   }
