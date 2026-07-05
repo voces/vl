@@ -8634,6 +8634,13 @@ export function nodeTyArrayElemRepName(ix: i32) {
         }
       }
       if tyIsLitUnion(e) { return "i32" }
+      // A `(K | null)[]` element — the litunion atom NICHE — shares the i32 backing (member ids ≥ 0,
+      // spare `-1` = null), so its list reps as an i32 list, exactly like the non-null `K[]` above.
+      // Both the ADOPTED `TyNullable`-inner form and the INFERRED `"a" | null` expanded-union form
+      // classify (`tyIsNullableLitUnion`). Only the `null → -1` element coercion + the sentinel read
+      // differ. Without this the element rep fell through to "" and the list defaulted to a string ref
+      // list, mismatching the i32 construct/read.
+      if tyIsNullableLitUnion(e) { return "i32" }
     }
   }
   ""
@@ -9151,6 +9158,50 @@ export function nodeArrayElemIsNulStr(ix: i32) {
   false
 }
 
+// True if node `ix` has a recorded ARRAY type whose ELEMENT is `K | null` (a `(K | null)[]` — a
+// literal union made nullable). The emitter seeds `pendingLitUnion` (member literals lower as their
+// interned ids) AND `pendingNulLitUnion` (a `null` element lowers as the sentinel `-1`) for such a
+// literal's elements — the atom-niche analogue of `nodeArrayElemIsNulBool`. Mirrors that probe with
+// `tyIsLitUnion` on the nullable's inner instead of a `boolean` primitive test.
+export function nodeArrayElemIsNulLitUnion(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray { return tyIsNullableLitUnion(t.aElem) }
+  false
+}
+// True if type `ty` is a NULLABLE literal union — either the two-part form `K | null` (a `TyNullable`
+// whose inner is a litunion) OR the expanded member form `"a" | "b" | null` (a `TyUnion` with a null
+// member and every OTHER member a quoted string literal). Matches `nameIsNulLitUnion`'s dual handling
+// at the name level: a `(K | null)[]` literal's ADOPTED annotation gives the `TyNullable` form, while
+// its INFERRED element type (`["a", null]` → the union of the elements' types) gives the expanded
+// `TyUnion` form — both must classify as the atom niche so the literal takes the i32-list path.
+export function tyIsNullableLitUnion(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return tyIsLitUnion(t.nInner) }
+  if t is TyUnion {
+    if t.uMembers.length < 2 { return false }
+    let sawNull = false
+    let sawLit = false
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyPrim {
+        if m.primName != "null" { return false }
+        sawNull = true
+      } else if m is TyLit {
+        if m.litKind != "str" { return false }
+        sawLit = true
+      } else {
+        return false
+      }
+      i = i + 1
+    }
+    return sawNull && sawLit
+  }
+  false
+}
 // The emitter's per-node query: node `ix` has a recorded literal-union type.
 export function nodeTyIsLitUnion(ix: i32) {
   const r = tyIsLitUnion(nodeTyIxOf(ix))

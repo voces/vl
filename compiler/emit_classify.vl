@@ -22,6 +22,7 @@ import {
   isValueUnionName,
   nameIsLitUnionType,
   nodeArrayElemIsLitUnion,
+  nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
   nodeArrayElemName,
   nodeNulStructInnerName,
@@ -114,6 +115,7 @@ import {
   nameIsNulClosure,
   nameIsNulI32List,
   nameIsNulLitUnion,
+  nameIsNulLitUnionList,
   nameIsNulStrList,
   nameIsNulString,
   nameIsString,
@@ -5990,6 +5992,14 @@ export function letNulBool(letIx: i32, fnIx: i32) {
 export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[unwrapParen(exprIx)]
+  // A `(K | null)[]` element READ `p[i]` — the niche i32 (a member id or the `-1` null sentinel).
+  // Recovered from the array's element type so an inferred `const t = p[i]` and a direct `p[i] !=
+  // null` narrow against `-1` rather than emitting a bare null. Scoped to an Index whose receiver is
+  // the litunion-niche list (NOT the broad node-type probe, which `exprIsLitAtom` consumes and would
+  // over-widen the construction path).
+  if e is Index {
+    if nodeArrayElemIsNulLitUnion(e.idxArr) { return true }
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -6192,6 +6202,11 @@ export function tyAnnRefListKind(tyIx: i32) {
       // (which self-infers as `null[]`) builds the i32 wrapper and seeds `pendingNulBool`
       // for its elements. Checked before the scalar-array arms (it is an i32 list).
       if nameIsNulBoolList(lt.tyName) { return 8 }
+      // A `(K | null)[]` annotation (kind 9): an i32-backed atom list whose elements carry the
+      // litunion sentinel niche (`null → -1`, a member literal → its id). Threads so an all-`null`
+      // `[null]` (which self-infers as `null[]`) builds the i32 wrapper and seeds `pendingNulLitUnion`
+      // + `pendingLitUnion` for its elements. Checked before the scalar-array arms (it is an i32 list).
+      if nameIsNulLitUnionList(lt.tyName) { return 9 }
       // An `f64[]` annotation: an empty `[]` builds the f64-list wrapper (kind 4).
       if nameIsF64Array(lt.tyName) { return 4 }
       // An `i64[]` annotation: an empty `[]` builds the i64-list wrapper (kind 6).
@@ -7240,6 +7255,12 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
     // same recorded type). Without this, the literal claims the string-list slot/collect/
     // build while every consumer reads the atom rep — invalid wasm at the first use.
     if nodeArrayElemIsLitUnion(arrIx) { return false }
+    // A `(K | null)[]` literal (`["a", null]`) is likewise the i32 atom-niche list, NOT a string list:
+    // its member elements lower as atom ids and a `null` as the `-1` sentinel. Its INFERRED element
+    // type is the expanded `"a" | null` union (a null member + str-lit members), which
+    // `nodeArrayElemIsNulLitUnion` recognizes — without this exclusion a string-FIRST literal claims
+    // the string-list slot/collect while every consumer reads the atom rep (invalid wasm).
+    if nodeArrayElemIsNulLitUnion(arrIx) { return false }
     return exprString(a.arrElems[0], fnIx)
   }
   false
@@ -10615,6 +10636,11 @@ export function letIsStringArray(letIx: i32, fnIx: i32) {
         if nameIsStringArray(lt.tyName) { return true }
         // A REF-array annotation (a union-element list) is authoritative — see `letIsF64Array`.
         if nameIsRefArray(lt.tyName) { return false }
+        // A `(K | null)[]` annotation is the i32 atom-niche list, authoritative over a string-FIRST
+        // init literal (`["a", null]`): its member elements are atom ids, not string refs. Without
+        // this the init's `exprStringArray` claimed the string-list slot while the construct/read
+        // used the i32 rep (invalid wasm). Mirrors the `nameIsRefArray` authority above.
+        if nameIsNulLitUnionList(lt.tyName) { return false }
       }
     }
     if exprStringArray(d.letInit, fnIx) { return true }
