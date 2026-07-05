@@ -4,6 +4,7 @@ import {
   nameIsLitUnionType,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulBool,
+  nodeArrayElemIsNulStr,
   nodeLitUnionMemberTexts,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
@@ -368,6 +369,7 @@ import {
   exprNulClosure,
   exprNulLitUnion,
   exprNulScalarListKind,
+  exprNulStrArray,
   exprNullableList,
   exprNullableRefArray,
   exprNullableString,
@@ -2931,6 +2933,11 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       if elems.length > NEW_FIXED_MAX {
         dstStr = arrLitChunkStart("str", 0, mkArrIdx, elems.length)
       }
+      // A `(string | null)[]` literal shares the string backing, but a `null` element lowers as
+      // `ref.null $aTypeIdx` (a real string element rides its `array.new_fixed` string untouched) —
+      // seed `pendingNulString` for the element emits (the string niche analogue of `pendingNulBool`).
+      const savedArrNS = pendingNulString
+      if nodeArrayElemIsNulStr(arrIx) { pendingNulString = true }
       let i = 0
       while i < elems.length {
         if emitExpr(body, elems[i], fnIx) < 0 { return -1 }
@@ -2939,6 +2946,7 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
           coffStr = arrLitChunkFlush(dstStr, mkArrIdx, coffStr, i, elems.length)
         }
       }
+      pendingNulString = savedArrNS
       if dstStr >= 0 {
         fbLocalGet(dstStr)
         wU8(212) // 0xd4 ref.as_non_null — the chunk-built string-ref backing
@@ -4657,6 +4665,22 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       // name-based test that conflated a nullable niche with a value-union box.
       if rlElemNullable[rslot] == 1 { return 0 }
       wU8(212) // 0xd4 ref.as_non_null (recover the non-null element)
+      return 0
+    }
+    // A `(string | null)[]` `xs[i]` → the SAME string backing, but the element legitimately holds
+    // `null` (it is a `(ref null $aTypeIdx)`), so the read STAYS nullable — NO `ref.as_non_null`. The
+    // bound value is a `nulstr` the caller narrows with `!= null` (`nodeTyIsNulString` classifies it).
+    // Checked BEFORE `exprStringArray` (whose non-null recovery would trap on a null element).
+    if exprNulStrArray(nd.idxArr, fnIx) {
+      if !slUsed {
+        return emitFail(
+          "emitProgram: string index access but string list type not collected",
+        )
+      }
+      if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+      if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
+      emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
+      fbArrayGet(mkArrIdx) // 0xfb 0x0b <string backing> — kept `(ref null $aTypeIdx)` (nullable)
       return 0
     }
     // A STRING list `xs[i]` → unwrap to its `(ref null $aTypeIdx)` string backing,
