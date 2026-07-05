@@ -460,6 +460,7 @@ import {
   refListSlotOfExpr,
   refPushScratchBaseFor,
   restoreNarrow,
+  retNulRefArrFlag,
   retNulRefFlag,
   retNulRefIndex,
   retStructIndex,
@@ -8238,6 +8239,8 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   let retNulString = false
   let retNulClosure = false
   let retNulList = false
+  let retNulRefArr = false
+  let retNulRefArrHeap = -1
   let retNulSLKind: VKind | null = null
   let retLitUnion = false
   let retNulLitUnion = false
@@ -8304,6 +8307,16 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     // pointer widened to the nullable storage — the return analogue of the kind-22 field.
     if nulCloFlag(fn.fnRet) == 1 { retNulClosure = true }
     if retNulListFlag(fn.fnRet) == 1 { retNulList = true }
+    // A nullable ref-array return (`<ref-array> | null`, kind 18): a `return [x]` builds the ref
+    // list (which subtypes the nullable wrapper), a `return null` is `ref.null $wrapper` — seed the
+    // inner wrapper heap so the bare-`null` return path types it.
+    if retNulRefArrFlag(fn.fnRet) == 1 {
+      retNulRefArr = true
+      const rlsRet = tyAnnRefListSlot(fn.fnRet)
+      if rlsRet >= 0 && rlsRet < rlWrapIdx.length {
+        retNulRefArrHeap = rlWrapIdx[rlsRet]
+      }
+    }
     retNulSLKind = nulScalarListKindOfNode(fn.fnRet)
     if nodeTyIsLitUnionAlias(fn.fnRet) { retLitUnion = true }
     // A `K | null` NICHE return: a `return null` lowers as the i32 sentinel `-1`, a `return "a"`
@@ -8351,6 +8364,9 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if retNulString { retCtx.nulString = true }
     if retNulClosure { retCtx.nulClosure = true }
     if retNulList { retCtx.nulList = true }
+    if retNulRefArr && retNulRefArrHeap >= 0 {
+      retCtx.nulRefHeap = retNulRefArrHeap
+    }
     // A DISTINCT-backing nullable scalar list return: a `return [x]` builds the leaf list
     // (`listKind`, which subtypes the nullable result), a `return null` is `ref.null $wrapper`.
     if retNulSLKind != null {
@@ -8402,6 +8418,16 @@ export function emitNullForRet(_body: i32[], fnIx: i32) {
     wU8(208) // 0xd0 ref.null
     wSLEB(lTypeIdx)
     return 0
+  }
+  // A nullable ref-array return (`<ref-array> | null`, kind 18): the niche `ref.null $wrapper` over
+  // the inner ref-list element wrapper (`tyAnnRefListSlot` strips the `| null` to resolve the slot).
+  if retNulRefArrFlag(r) == 1 {
+    const rls = tyAnnRefListSlot(r)
+    if rls >= 0 && rls < rlWrapIdx.length {
+      wU8(208) // 0xd0 ref.null
+      wSLEB(rlWrapIdx[rls])
+      return 0
+    }
   }
   // A nullable-closure return (`((i32) => i32) | null`): the niche `ref.null $cloStruct`.
   if nulCloFlag(r) == 1 {
@@ -10566,6 +10592,10 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     let cParamNulClosure = false
     // An `i32[] | null` param position (kind 15): a `null` argument is `ref.null $lTypeIdx`.
     let cParamNulList = false
+    // A `<ref-array> | null` param position (kind 18): a list-value argument builds the ref list
+    // (subtypes the nullable wrapper), a `null` argument is `ref.null $wrapper` (`cParamNulRefArrHeap`).
+    let cParamNulRefArr = false
+    let cParamNulRefArrHeap = -1
     // A literal-union param position: a member-literal argument lowers as its interned i32 id.
     let cParamLitUnion = false
     let cParamNulLitUnion = false
@@ -10581,6 +10611,13 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           if retNulStringFlag(cpnb.parType) == 1 { cParamNulString = true }
           if nulCloFlag(cpnb.parType) == 1 { cParamNulClosure = true }
           if retNulListFlag(cpnb.parType) == 1 { cParamNulList = true }
+          if retNulRefArrFlag(cpnb.parType) == 1 {
+            cParamNulRefArr = true
+            const cpRls = tyAnnRefListSlot(cpnb.parType)
+            if cpRls >= 0 && cpRls < rlWrapIdx.length {
+              cParamNulRefArrHeap = rlWrapIdx[cpRls]
+            }
+          }
           if nodeTyIsLitUnionAlias(cpnb.parType) { cParamLitUnion = true }
           // A `K | null` NICHE param: a member-literal arg (`f("a")`) lowers as its atom id
           // (`pendingLitUnion`), a `null` arg as the i32 sentinel `-1` (`pendingNulLitUnion`).
@@ -10671,6 +10708,9 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
         if cParamNulString { argCtx.nulString = true }
         if cParamNulClosure { argCtx.nulClosure = true }
         if cParamNulList { argCtx.nulList = true }
+        if cParamNulRefArr && cParamNulRefArrHeap >= 0 {
+          argCtx.nulRefHeap = cParamNulRefArrHeap
+        }
         if cParamLitUnion { argCtx.litUnion = 1 }
         if cParamNulLitUnion {
           argCtx.litUnion = 1
