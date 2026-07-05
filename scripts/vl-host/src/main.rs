@@ -194,7 +194,19 @@ fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>,
                     ))
                 })?;
                 if let Ok(bytes) = m.serialize() {
-                    let _ = std::fs::write(&sidecar, bytes);
+                    // Atomic publish: write a unique temp then rename() into place.
+                    // Parallel `vl` processes race otherwise — `fs::write` truncates-
+                    // then-writes, and a concurrent `deserialize_file` MMAPS this file,
+                    // so a torn read is UB (an intermittent hang/crash — surfaced as
+                    // lint-self.sh's per-file `vl fmt` fan-out stalling in CI). rename(2)
+                    // is atomic on POSIX: a reader sees either the whole old or whole new
+                    // file, and an existing mmap keeps the old inode. Best-effort still.
+                    let tmp = format!("{sidecar}.{}.tmp", std::process::id());
+                    if std::fs::write(&tmp, &bytes).is_ok() {
+                        if std::fs::rename(&tmp, &sidecar).is_err() {
+                            let _ = std::fs::remove_file(&tmp);
+                        }
+                    }
                 }
                 Ok(m)
             };
