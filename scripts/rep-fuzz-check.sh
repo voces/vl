@@ -63,7 +63,11 @@ if [ -n "$stale" ]; then
 fi
 
 cur_n=$(wc -l < "$WORK/cur.txt" | tr -d ' ')
-unsound_n=$(grep -cvP '^REJECT\t' "$WORK/cur.txt" 2>/dev/null || echo 0)
+# `grep -c` prints the count AND exits 1 when it's 0, so `|| echo 0` would append a
+# SECOND "0" (breaking the `$((…))` below the moment unsound hits 0 — the goal state).
+# Take the first line only, defaulting to 0.
+unsound_n=$( { grep -cvP '^REJECT\t' "$WORK/cur.txt" 2>/dev/null || true; } | head -1 )
+unsound_n=${unsound_n:-0}
 if [ "$rc" -eq 0 ]; then
   echo "rep-fuzz-check: exact ✅  ($cur_n baselined failures — $unsound_n unsound, $((cur_n - unsound_n)) reject; 0 new, 0 stale)"
 else
