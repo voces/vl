@@ -1141,6 +1141,18 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
           if !assignableExpr(fv, sty, dty) { return false }
           recNodes.push(fv)
           recTys.push(dty)
+        } else if tyIsLitUnion(dty) {
+          // LITUNION field (`f: "8"` against `f: K0 = "xz" | "8"`): the body value is a bare
+          // string literal that is a MEMBER of the expected literal-union. It infers the
+          // softened `string`, but re-encodes as the litunion's i32 ATOM — the field dual of
+          // the scalar litunion-return arm (`(i32) => K = (x) => "b"`). Adopt when the value is
+          // a member literal; record the litunion field type so `anonFieldCode` interns the
+          // atom slot (it would else code the string). The named-function VALUE spelling of the
+          // same struct-with-litunion-field return already lowers to this rep.
+          if fv < 0 { return false }
+          if !assignableExpr(fv, sty, dty) { return false }
+          recNodes.push(fv)
+          recTys.push(dty)
         } else {
           // A non-widening field must match exactly (mutual assignability) — a shape
           // difference beyond numeric widening is not an adoption, it is a mismatch.
@@ -3033,6 +3045,32 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
   false
 }
 
+// Whether a struct type is SOUND to box into a value union via a WIDENING struct
+// literal (`{f: 97.5}` into `{f: f32} | {w: i32}` — the checker adopts the arm,
+// the emitter boxes the plain struct into the union rep). Restricted to structs
+// whose every field is a primitive scalar / string / boolean, or a nested plain
+// struct: the emitter boxes exactly those into a union today. A field that is
+// itself a LITUNION (or any other composite needing its own boxed rep) has no
+// such union-boxed rep yet — adopting it would emit INVALID wasm — so those arms
+// stay a loud reject (the emit-rep work is the sibling agents' territory).
+function unionArmBoxSafe(tyIx: i32) {
+  const t = T.tys[tyIx]
+  if !(t is TyObj) { return false }
+  const ftys = t.objFieldTypes
+  let i = 0
+  while i < ftys.length {
+    const ft = T.tys[ftys[i]]
+    if ft is TyPrim {
+      // scalar / string / boolean field — boxes cleanly
+    } else if ft is TyObj {
+      if !unionArmBoxSafe(ftys[i]) { return false }
+    } else {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
 // Literal-aware assignability for a numeric binding/argument/return: the normal
 // `assignable` lattice, PLUS the float-literal→f32 exception (`isFloatLitExpr`). Used
 // where the SOURCE EXPRESSION node is in hand (so the literal can be recognized);
@@ -3112,6 +3150,30 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
             i = i + 1
           }
           return ok
+        }
+        // A struct literal flowing into a UNION adopts the FIRST struct arm it adapts
+        // into field-wise (`{f: 97.5}` into `{f: f32} | {w: i32}`, `{a: 3.5, f: "x", …}`
+        // into `{a: f32, f: K, …} | string`). The emitter already boxes a struct literal
+        // into a union slot at a direct binding (the i32-field spelling lowers today); this
+        // is the checker seam that lets a WIDENING field (a float-literal `f32`, a litunion
+        // member) reach that same rep. Record the concrete arm on the literal node so the
+        // shape interner / field encoder sees the arm's field types, not the inferred ones.
+        if d is TyUnion {
+          const members = d.uMembers
+          let mi = 0
+          while mi < members.length {
+            const mt = T.tys[members[mi]]
+            if mt is TyObj && unionArmBoxSafe(members[mi]) {
+              if assignableExpr(srcExpr, srcTy, members[mi]) {
+                if !inferQuiet {
+                  while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+                  nodeTyIx[srcExpr] = members[mi]
+                }
+                return true
+              }
+            }
+            mi = mi + 1
+          }
         }
       }
     }
@@ -7110,6 +7172,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // (A SCALAR-ELEMENT LIST result — `(i32) => f32[] = (q0) => [97.5]` — is NOT adopted
+        // here: the checker would accept it, but the emitter's list-type collection does not yet
+        // register the f32[] list a `synthRetAnnots`-pinned lambda return introduces, so the
+        // call-result index (`v(1)[0]`) hits "list type not collected". Adopting would only move
+        // a clean checker reject to an internal emit reject — it stays a loud checker reject until
+        // the list-collection seam lands (sibling emit-rep territory).)
       }
     }
     // PERMISSIVE FALL-THROUGH (totality): an un-annotated function that can fall off the
