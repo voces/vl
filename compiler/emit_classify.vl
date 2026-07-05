@@ -1029,7 +1029,12 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is Paren { return exprNullableRefArray(e.parInner, fnIx) }
-  if e is Ident { return declaredKind(e.identName) == "nulreflist" }
+  if e is Ident {
+    if declaredKind(e.identName) == "nulreflist" { return true }
+    // A nulreflist PARAM (`p: i32[][] | null`) — its `!= null` narrow reads the `(ref null $wrapper)`
+    // niche exactly like the local. (#877 wired the param signature but left this body-side arm.)
+    return paramNulRefArray(fnIx, e.identName)
+  }
   // A `recv.f` read of a NULLABLE ref-list FIELD (`f: S[] | null`, code 28) yields a nullable ref array.
   if e is Member { return memberFieldCode(exprIx, fnIx) == 28 }
   if e is Index {
@@ -1038,6 +1043,15 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
       if slot >= 0 && slot < rlElemNullable.length {
         if rlElemKindTbl[slot] == 9 && rlElemNullable[slot] == 1 { return true }
       }
+    }
+  }
+  // A call to a function whose ANNOTATED return is `<ref-array> | null` yields a nullable ref array, so an
+  // un-annotated `const t = mk(…)` infers kind 18 and narrows with `if t != null`. Mirrors the nullable-i32
+  // -list call inference in `exprNullableList` above.
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      if fnRetNulRefArrayName(callee.identName) != "" { return true }
     }
   }
   false
@@ -1053,6 +1067,12 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
   if e is Ident {
     const sl = declaredSlotOf(e.identName)
     if sl >= 0 { return localStructIdx[sl] }
+    // A nulreflist PARAM has no local slot — resolve its inner ref-list slot from the annotation
+    // (`refArrElemName` of the `| null`-stripped ref-array name), so `p[i]` and `const t = p` agree.
+    if paramNulRefArray(fnIx, e.identName) {
+      const npS = nullablePartOf(tyNameOf(paramTypeNode(fnIx, e.identName)))
+      if npS != "" { return rlSlotByName(refArrElemName(npS)) }
+    }
     return -1
   }
   // A code-28 nullable ref-list field member: its element ref-list slot (the field's element name).
@@ -1066,6 +1086,14 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
     const slot = refListSlotOfExpr(e.idxArr, fnIx)
     if slot >= 0 && slot < rlElemName.length {
       return rlSlotByName(refArrElemName(rlElemName[slot]))
+    }
+  }
+  // A nulreflist-returning CALL (`const t = mk()`): its inner ref-list slot is the return's inner element.
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      const rn = fnRetNulRefArrayName(callee.identName)
+      if rn != "" { return rlSlotByName(rn) }
     }
   }
   -1
@@ -10024,6 +10052,14 @@ function paramRefArray(fnIx: i32, name: string) {
   nameIsRefArray(tyNameOf(pt))
 }
 
+// True if the parameter `name` of function `fnIx` is a NULLABLE ref-array type (`<ref-array> | null`,
+// kind 18 — e.g. `i32[][] | null`, `S[] | null`). The param analogue of `paramRefArray`: `retNulRefArrFlag`
+// (already `| null`-aware) recognizes the annotation. Lets `exprNullableRefArray` / `exprRefArray` classify
+// a nulreflist PARAM (its `!= null` narrow + narrowed indexing), which #877 wired only for a LOCAL.
+function paramNulRefArray(fnIx: i32, name: string) {
+  retNulRefArrFlag(paramTypeNode(fnIx, name)) == 1
+}
+
 // True if the already-collected declared local `name` is a ref-list ref (code `5`).
 function declaredRefArray(name: string) { declaredKind(name) == "reflist" }
 
@@ -10063,6 +10099,9 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
     // A kind-18 NULLABLE ref-array local is a ref array too (narrowed `if t != null`) — so indexing /
     // `.length` reuse the ref-array machinery; the index emit recovers non-null for the niche receiver.
     if declaredKind(e.identName) == "nulreflist" { return true }
+    // A nulreflist PARAM narrowed non-null is a ref array too — index / `.length` reuse the
+    // ref-array machinery (the index emit recovers non-null for the niche receiver).
+    if paramNulRefArray(fnIx, e.identName) { return true }
     if paramRefArray(fnIx, e.identName) { return true }
     if declaredRefArray(e.identName) { return true }
     return globalIsRefArray(e.identName)
@@ -10123,6 +10162,23 @@ function fnRetRefArrayName(name: string) {
   fRetRArrElem[i]
 }
 
+// The INNER ref-list element type-NAME a function `name` returns when its return is a NULLABLE ref array
+// (`i32[][] | null` → the inner `i32[]`), else "". Reads the return-type node directly (`fRetRArrElem`
+// records only the NON-null ref-array element), so a consumer `const t = mk()` infers the kind-18 niche
+// and its `!= null` narrow + narrowed indexing resolve the inner ref-list slot.
+function fnRetNulRefArrayName(name: string) {
+  const i = fnIndexOf(name)
+  if i < 0 { return "" }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 {
+      const np = nullablePartOf(tyNameOf(fn.fnRet))
+      if np != "" && nameIsRefArray(np) { return refArrElemName(np) }
+    }
+  }
+  ""
+}
+
 // The ref-list ELEMENT type-NAME of the declared local `name` (recorded in
 // `localStructIdx` as its table SLOT for code-5 locals), or "".
 function declaredRefArrayName(name: string) {
@@ -10167,6 +10223,9 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     if callee is Ident {
       const fn = fnRetRefArrayName(callee.identName)
       if fn != "" { return fn }
+      // A nulreflist-returning function (`mk: () => i32[][] | null`): the INNER ref-list element name.
+      const nfn = fnRetNulRefArrayName(callee.identName)
+      if nfn != "" { return nfn }
       // A closure-VALUE callee returning a ref list (`mk: () => S[]`): its element name is the
       // `rlElemName` of the `>r<slot>;` result slot parsed off the callee's resolved `$fnsig`.
       const rs = sigKeyRetSlot(calleeCloSigKey(callee.identName, fnIx))
@@ -10204,6 +10263,13 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
         const is18 = localStructIdx[sl18]
         if is18 >= 0 && is18 < rlElemName.length { return rlElemName[is18] }
       }
+    }
+    // A nulreflist PARAM (`p: i32[][] | null`) — its inner ref-list element name is the ref-array's
+    // element (`refArrElemName` of the `| null`-stripped annotation), so `refListSlotOfExpr` resolves
+    // the inner wrapper the narrowed `p[i]` read casts to (the param analogue of the local block above).
+    if paramNulRefArray(fnIx, e.identName) {
+      const np18 = nullablePartOf(tyNameOf(paramTypeNode(fnIx, e.identName)))
+      if np18 != "" { return refArrElemName(np18) }
     }
     const pn = paramRefArrayName(fnIx, e.identName)
     if pn != "" { return pn }
