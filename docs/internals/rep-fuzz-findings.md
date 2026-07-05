@@ -9,13 +9,22 @@ So do several depth-2 shapes (`{f:{f:i32}}`, `{f:i32}[]`, `i32[][]` standalone).
 specific DEEPER COMBINATIONS — the nuanced boundaries a hand-written corpus misses. ~19/400 cases at
 depth 4 fail, in these families (example signature → error):
 
-## ✅ MILESTONE (2026-07-03): zero unsound outputs at the CI seeds
-**Every soundness class — INVALID-WASM, TRAP, MISMATCH — is now 0** at the pinned seeds
-(101/202/303, depths 2/3/4). The residual is **33 shapes, ALL fail-loud REJECT**: the compiler
-refuses each with a clear emit/type diagnostic — never silently-wrong bytes, never invalid wasm.
-The rep-fuzzer's original purpose (surface silent miscompiles from rep composition) is discharged;
-what remains is a coverage backlog of unsupported-but-cleanly-rejected shapes, pinned in the
-baseline.
+## Coverage matters: the seed set IS the test surface (2026-07-04)
+An earlier milestone drove the **three pinned seeds** (101/202/303, depth ≤4) to zero unsound
+outputs across a long point-fix campaign (44 shapes → 0 on those seeds; the ref-typed-union-arm
+trilogy #863/#865/#867, ref-value maps #868, nullable-niche #869, array-of-union #870, the
+closure-result value-call ABI #874/#875, etc. — all pinned as `tests/cases/` regressions and worth
+keeping). But three seeds massively UNDER-SAMPLE the composition space. Broadening to **16 seeds at
+depth 3–5** immediately surfaced **71 genuine soundness holes** (67 INVALID-WASM, 3 TRAP, 1
+MISMATCH) plus ~358 clean rejects — deeper/wider nestings the pinned seeds never generated
+(`{[string]: i32} | boolean`, `(i32) => i64 | {w: i32}`, `((i32) => {f: boolean | {w: i32}}) | boolean`
+→ silent wrong result, …). These are systematic composition gaps, not 71 independent bugs.
+
+**Process (now):** the broad seed set is the CI net; every currently-failing (class, shape) is
+committed to `scripts/rep-fuzz-baseline.txt` as a class-tagged known issue. CI enforces NO
+REGRESSION (no new/worse failure, no stale entry). We burn the 71 soundness holes (then the rejects)
+down family-by-family, graduating each with a pinned regression test. When the baseline empties, the
+fuzzer is at true zero over the WIDE net — a much stronger guarantee than the three-seed zero was.
 
 The soundness holes below were driven to zero across these waves: structural heap-type dedup
 (#833/#834/#835), value-union box read (#855), map-as-closure-return heap-type identity (#860),
