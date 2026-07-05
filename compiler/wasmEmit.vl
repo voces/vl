@@ -6,6 +6,7 @@ import {
   nodeArrayElemIsNulBool,
   nodeLitUnionMemberTexts,
   nodeTyIsLitUnionAlias,
+  nodeTyIsMap,
   nodeTyIsNulLitUnion,
   nodeTyIsNullableStruct,
   nodeTyMapValIsLitUnion,
@@ -1902,6 +1903,16 @@ export function emitUnionCoerce(
       fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
       return 0
     }
+    // A ref-element array carrier whose interned slot matches NO ref-array arm of the union —
+    // e.g. a nested int-array literal `[[50183]]` (inferred `i32[][]`, element slot `i32[]`) flowing
+    // into an `i64[][] | …` arm (element slot `i64[]`): the leaf scalar would have to WIDEN, which the
+    // nested-list constructor cannot thread here. Falling through would mis-box the wrapper ref through
+    // the scalar value-atom ladder below (`struct.new` a scalar box on a ref → "expected i32, found
+    // (ref $type)", invalid wasm). A ref array can only ride the box as a wrapper ref, so with no arm to
+    // carry it there is no sound rep — fail loudly rather than emit the bad box.
+    return emitFail(
+      "emitProgram: array value does not match any array member of the union (leaf-scalar widening across a nested array is unsupported)",
+    )
   }
   // An ARRAY LITERAL whose ELEMENT is a MAP (`[m]`, `m: {[string]: V}`) flowing into a union with an
   // array-of-map arm (`{[string]: V}[] | scalar`): the arm's reflist element is the map TYPE, but a
@@ -3115,6 +3126,17 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
         if exprStruct(elems[i], fnIx) {
           return emitFail(
             "emitProgram: struct array elements are not supported",
+          )
+        }
+        // A MAP-typed element reaching the i32-list fallback (no ref-list/map-array kind was
+        // threaded — e.g. `(q) => ([h0])`, a closure body returning `{[string]:f32}[]` whose
+        // inferred result rep collapsed to the i32 list): the map STRUCT ref would be stored as
+        // an i32 element (`array.new_fixed $aTypeIdx` with a ref operand → "expected i32, found
+        // (ref $type)", invalid wasm). A map array can only build through the ref-list path with a
+        // threaded map-element kind; with none here there is no sound rep — fail loudly.
+        if exprMap(elems[i], fnIx) || nodeTyIsMap(elems[i]) {
+          return emitFail(
+            "emitProgram: map array elements are not supported in this position",
           )
         }
       }
