@@ -7,7 +7,10 @@
 // i32 path cover it); the value is composition DEPTH × the rep MATRIX the hand-written corpus lacks.
 //
 // The matrix generated over:
-//   leaves      — i32 · i64 (full 64-bit range) · f64 · string · f32 · boolean · literal-union atom
+//   leaves      — i32 · i64 (full 64-bit range) · f64 · string · f32 · boolean · literal-union atom.
+//                 With `--values` (RICHVALUES, opt-in) each numeric leaf also spans 0 · negatives ·
+//                 min/max boundary magnitudes · non-half fractions, and strings span empty ·
+//                 escaped-quote/backslash · multibyte — the value edges the round-trip corpus lacks.
 //   containers  — struct {f:T} · list T[] · nullable T|null · multi-field struct {a,f,z} (mixed-rep
 //                 decoy siblings) · map {[string]:T} (read via `?? <same-shape dummy>`) · union
 //                 T | decoy (read via `is`, sometimes CARRYING the decoy) · closure ()=>T / (i32)=>T
@@ -24,6 +27,13 @@
 let SEED = 1
 let COUNT = 200
 let MAXDEPTH = 4
+// Opt-in value dimension (fuzz-vl.sh `--values`). OFF (the default, and the pinned-CI net) draws
+// EXACTLY the master random stream, so the generated batch is byte-identical and the rep-fuzz
+// baseline needs zero churn. ON widens leaf VALUES (0 · negatives · i32/i64 min·max · wide i64 ·
+// non-half floats · empty/escaped/multibyte strings) AND aligns the map-value allowNul (see
+// genSlot) — a survey/cron mode: it deliberately relocates the sample onto pre-existing rep holes,
+// so it is report-only, never a pinned-seed gate (unsound findings there are un-baselineable).
+let RICHVALUES = 0
 
 // per-case emission state
 let ALIASES = "" // literal-union `type K<n> = …` declarations for the current case
@@ -127,15 +137,138 @@ function genWord(): string {
   return s
 }
 
+// ── value payloads ──────────────────────────────────────────────────────────────────────────
+// Leaf values span the edges the round-trip corpus never exercised: 0, negatives, i32/i64 min·max
+// boundaries, wide i64 magnitudes, non-half fractions, and empty/escaped/multibyte strings. Each
+// payload's `expected` is its EXACT VL print form (verified against the host): floats drop a
+// trailing `.0` and keep other fractions, a negative whole-number float keeps its sign
+// (`-4.0` -> `-4`), and strings print raw (escapes/quotes decoded, UTF-8 passed through).
+
+// A signed i32 decimal: zero, the i32 min/max boundaries, or a signed 1-6 digit magnitude.
+function genI32Val(): string {
+  const c = rr(0, 9)
+  if c == 0 { return "0" }
+  if c == 1 { return "-2147483648" }
+  if c == 2 { return "2147483647" }
+  if c <= 5 { return "-" + genDigits(rr(1, 6)) }
+  return genDigits(rr(1, 6))
+}
+
+// A signed i64 decimal: zero, the i64 min/max boundaries, or a signed 1-18 digit magnitude (the
+// wide range the i32-overlapping low end never reached).
+function genI64Val(): string {
+  const c = rr(0, 9)
+  if c == 0 { return "0" }
+  if c == 1 { return "-9223372036854775808" }
+  if c == 2 { return "9223372036854775807" }
+  if c <= 5 { return "-" + genDigits(rr(1, 18)) }
+  return genDigits(rr(1, 18))
+}
+
+// A binary-exact fraction (representable in both f32 and f64), so the printed form is exact.
+function genFrac(): string {
+  const c = rr(0, 5)
+  if c == 0 { return "0" }
+  if c == 1 { return "5" }
+  if c == 2 { return "25" }
+  if c == 3 { return "75" }
+  if c == 4 { return "125" }
+  return "625"
+}
+
+// The whole part of a float: sometimes 0, else a 1..maxDigits positive run.
+function genWholeF(maxDigits: i32): string {
+  if rr(0, 4) == 0 { return "0" }
+  return genDigits(rr(1, maxDigits))
+}
+
+// A float leaf (leaf 2 = f64, leaf 4 = f32). Builds the source literal and its exact printed form:
+// frac "0" prints "<sign><whole>" (VL drops the trailing .0); a nonzero frac prints in full.
+// Negative zero is avoided (no sign when the value is 0), so the print form stays canonical.
+function floatLeaf(leaf: i32, maxDigits: i32): Slot {
+  const whole = genWholeF(maxDigits)
+  const frac = genFrac()
+  let sign = ""
+  if rr(0, 3) == 0 {
+    if whole != "0" || frac != "0" { sign = "-" }
+  }
+  const payload = sign + whole + "." + frac
+  let expected = sign + whole
+  if frac != "0" { expected = payload }
+  const s = slot(0, leaf, payload, expected, null)
+  if leaf == 2 { s.dummy = "14.5" } else { s.dummy = "15.5" }
+  return s
+}
+
+// A string leaf with edge contents: empty, an embedded escaped quote / backslash, a multibyte
+// codepoint (é / CJK / emoji), or the plain word. `payload` is the SOURCE literal (quoted, with
+// `\"` / `\\` escapes); `expected` is the DECODED print form. All forms are single-line so the
+// `// @log` oracle stays exact (a newline/tab would split the directive).
+function genStrLeaf(): Slot {
+  const dm = ch(34) + "zdmy" + ch(34)
+  const c = rr(0, 9)
+  if c == 0 {
+    const s = slot(0, 3, ch(34) + ch(34), "", null)
+    s.dummy = dm
+    return s
+  }
+  if c == 1 {
+    const w1 = genWord()
+    const w2 = genWord()
+    const src = ch(34) + w1 + ch(92) + ch(34) + w2 + ch(34)
+    const s = slot(0, 3, src, w1 + ch(34) + w2, null)
+    s.dummy = dm
+    return s
+  }
+  if c == 2 {
+    const w1 = genWord()
+    const w2 = genWord()
+    const src = ch(34) + w1 + ch(92) + ch(92) + w2 + ch(34)
+    const s = slot(0, 3, src, w1 + ch(92) + w2, null)
+    s.dummy = dm
+    return s
+  }
+  if c == 3 {
+    const w1 = genWord()
+    const w2 = genWord()
+    let cp = 233
+    const pk = rr(0, 2)
+    if pk == 1 { cp = 20320 }
+    if pk == 2 { cp = 128640 }
+    const mb = ch(cp)
+    const s = slot(0, 3, ch(34) + w1 + mb + w2 + ch(34), w1 + mb + w2, null)
+    s.dummy = dm
+    return s
+  }
+  const w = genWord()
+  const s = slot(0, 3, ch(34) + w + ch(34), w, null)
+  s.dummy = dm
+  return s
+}
+
 function genLeaf(): Slot {
   const k = rr(0, 6)
+  // The `if RICHVALUES == 1` guards draw NO random of their own — the OFF path below each is the
+  // verbatim master leaf, so the default stream is byte-identical (see the RICHVALUES header note).
   if k == 0 {
+    if RICHVALUES == 1 {
+      const v = genI32Val()
+      const s = slot(0, 0, v, v, null)
+      s.dummy = "12121"
+      return s
+    }
     const d = genDigits(rr(1, 6))
     const s = slot(0, 0, d, d, null)
     s.dummy = "12121"
     return s
   }
   if k == 1 {
+    if RICHVALUES == 1 {
+      const v = genI64Val()
+      const s = slot(0, 1, v, v, null)
+      s.dummy = "13131313131"
+      return s
+    }
     // up to 18 digits — exercises the full i64 range, not just the i32-overlapping low end
     const d = genDigits(rr(1, 18))
     const s = slot(0, 1, d, d, null)
@@ -143,6 +276,7 @@ function genLeaf(): Slot {
     return s
   }
   if k == 2 {
+    if RICHVALUES == 1 { return floatLeaf(2, 5) }
     const d = genDigits(rr(1, 5))
     let sl = slot(0, 2, d + ".0", d, null)
     if rr(0, 1) == 0 { sl = slot(0, 2, d + ".5", d + ".5", null) }
@@ -150,12 +284,14 @@ function genLeaf(): Slot {
     return sl
   }
   if k == 3 {
+    if RICHVALUES == 1 { return genStrLeaf() }
     const w = genWord()
     const s = slot(0, 3, ch(34) + w + ch(34), w, null)
     s.dummy = ch(34) + "zdmy" + ch(34)
     return s
   }
   if k == 4 {
+    if RICHVALUES == 1 { return floatLeaf(4, 4) }
     // halves are exactly representable in f32, so the printed form is exact
     const d = genDigits(rr(1, 4))
     let sl = slot(0, 4, d + ".0", d, null)
@@ -320,9 +456,19 @@ function genSlot(depth: i32, allowNul: i32, allowUni: i32): Slot {
     s.arg = rr(0, 1)
     return s
   }
-  // struct{f} · list · map
+  if k == 5 {
+    // map VALUE: no nullable directly under a map (allowNul = 0, per this function's header) — a
+    // stored null is indistinguishable from a miss through the `??` read, which would produce a
+    // false MISMATCH the day nullable map values graduate. Only on the rich-values path: on the
+    // default byte-stable path the historical allowNul = 1 is retained so the pinned stream (and
+    // the `genSlot(depth - 1, 1, 1)` draw it shares with struct/list) is unchanged.
+    let nul = 1
+    if RICHVALUES == 1 { nul = 0 }
+    const c = genSlot(depth - 1, nul, 1)
+    return slot(5, 0, "", c.expected, c)
+  }
+  // struct{f} · list
   const c = genSlot(depth - 1, 1, 1)
-  if k == 5 { return slot(5, 0, "", c.expected, c) }
   return slot(k, 0, "", c.expected, c)
 }
 
