@@ -109,8 +109,13 @@ ABORT (process-fatal, like Rust's `abort()`), not an exception mechanism, and
 vs try/catch over the now-standardized wasm exception-handling proposal
 (`exnref`), and how any of them composes with the future async/await (B12)
 and streams — deserves its own deep-dive BEFORE std grows fallible APIs
-(`std:fs`, parsing). Chartered as `docs/error-handling-design.md` (ROADMAP
-Next); until it lands, std surfaces only total functions + `__trap__` aborts,
+(`std:fs`, parsing). Now DRAFTED (pending owner review) in
+`docs/error-handling-design.md`: errors-as-values via unions (`T | null` /
+`T | E` with a structural `IoError` alias), no catchable throw in v1, `exnref`
+reserved for a possible async era, Go multi-value returns ruled out, union-`as`
+propagation chartered as follow-up, and fallible std sequenced after the R3b/R7
+rep family. That doc also proposes `panic(msg)` subsuming `__trap__` (OD2).
+Until it lands, std surfaces only total functions + `__trap__`/`panic` aborts,
 so nothing here pre-commits the answer.
 
 `print` STAYS a builtin through Phase 2 (the §LS.3 migration to a `std:fmt`
