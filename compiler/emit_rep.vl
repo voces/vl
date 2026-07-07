@@ -67,6 +67,7 @@ import {
   cUserTypes,
   nodeTyIsUnionAlias,
   nodeTyIxOf,
+  resolveAnnot,
   tyIsLitUnion,
   tyIsValueUnionBox,
   tyIxIsUnionAliasDecl,
@@ -338,21 +339,37 @@ export function repSlotOfTy(ty: i32): i32 {
 
 // ── Structural heap-type dedup (roadmap Next#1, the slot layer) ───────────────
 // The canonical structural key for struct slot `si`, or "" when `si` does not
-// participate in dedup. Only a DECLARED struct (a `cUserTypes` arena index whose
-// type is a `TyObj`) participates — inline / generic-application shapes already
-// dedup at intern time (`annShapeIndexOf`), so no live duplicate reaches the heap
-// layer through them. The key is `repCanonKey` on the checker's memoized arena
-// index: two structurally-identical declarations (including recursive twins
-// `type L1={n:L1|null}` / `type L2={n:L2|null}`, canonicalized by the de Bruijn
-// back-edge) render the SAME key; distinct structures never collide.
+// participate in dedup. A DECLARED struct (a `cUserTypes` arena index whose type
+// is a `TyObj`) keys on its memoized arena index; an INLINE-SHAPE slot (interned
+// under its annotation spelling, `{v:i32}`) resolves that spelling through the
+// checker's name grammar (`resolveAnnot`) to the same key vocabulary. (Shape
+// slots MOSTLY dedup at intern time — `annShapeIndexOf` — but a FIELD shape
+// interned by `collectNestedFieldShapes` lands BEFORE the declared structs, so a
+// declared twin still minted a duplicate heap type: `type A={v:i32}` flowing
+// into a `{inner:{v:i32}}` field was invalid wasm. Keying shape slots here
+// collapses that duplicate.) The key is `repCanonKey`: two structurally-identical
+// slots (including recursive twins `type L1={n:L1|null}` / `type L2={n:L2|null}`,
+// canonicalized by the de Bruijn back-edge) render the SAME key; distinct
+// structures never collide. Any other slot (an anonymous-literal `#anon` shape,
+// an unresolvable spelling) stays "" — never merged.
 //
 // A14 FORWARD-COMPAT SEAM: a future nominal/opaque type OPTS OUT of dedup by
 // making its `repCanonKey` unique (injecting its nominal identity into the key at
 // the `repCanonKeyGo` construction point above) — its slot then matches no twin
 // and keeps a private heap type. Nothing here needs to change for that.
+const repNoTyparams: string[] = []
+
 function slotCanonKey(si: i32): string {
   if si < 0 || si >= sNames.length { return "" }
-  const di = cUserTypes[sNames[si]] ?? -1
+  const nm = sNames[si]
+  let di = cUserTypes[nm] ?? -1
+  if di < 0 {
+    // The inline-shape fallback: only a bare `{...}` spelling (not a map `{[`)
+    // resolves; the checker memoizes shape resolution, so this stays cheap.
+    if nm.length < 2 { return "" }
+    if nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' { return "" }
+    di = resolveAnnot(nm, repNoTyparams)
+  }
   if di < 0 { return "" }
   const t = T.tys[di]
   if !(t is TyObj) { return "" }
@@ -375,6 +392,20 @@ function structFieldCodesEq(a: i32, b: i32): i32 {
     i = i + 1
   }
   1
+}
+
+// True when struct slots `a` and `b` share ONE WasmGC heap type under the
+// canonical structural key + the field-code layout guard — the `sTwin`
+// equivalence, queryable PAIRWISE (independent of `buildStructTwins` having
+// run). The ref-list layer's canonical slot fallback (`rlSlotByName`) uses it
+// to decide whether two element spellings back the same heap type.
+export function repStructSlotsTwin(a: i32, b: i32): i32 {
+  if a == b { return 1 }
+  if a < 0 || b < 0 { return 0 }
+  const ka = slotCanonKey(a)
+  if ka == "" { return 0 }
+  if ka != slotCanonKey(b) { return 0 }
+  structFieldCodesEq(a, b)
 }
 
 // Populate `sTwin` (parallel to `sNames`): `sTwin[i]` is the representative struct
