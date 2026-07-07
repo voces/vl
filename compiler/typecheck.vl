@@ -1202,6 +1202,72 @@ function unionFuncArmForArity(u: TyUnion, arity: i32) {
   }
   -1
 }
+// True if the union OBJECT arm `tyIx` can be BOTH boxed into the union's `{tag, value}` rep AND
+// have its narrowed fields read back with valid wasm — the safety gate for seeding a struct literal
+// into this arm. A field that is a scalar / string (`TyPrim`), a nested struct (`TyObj`, recursively
+// safe), or a closure (`TyFunc`) has a sound variant-struct rep: construction boxes it, and a
+// narrowed read of it either lowers (`v.a`, `v.f.g`) or FAILS LOUD (`v.f(1)` on a closure field is a
+// clean "callee is not a function name" reject) — never invalid wasm. A field that is an ARRAY,
+// a union, or a nullable has NO sound narrowed-read rep yet (`v.f[0](1)` over a reflist-of-closures
+// field emits a type-mismatched read — INVALID WASM), so an arm carrying one is NOT seed-safe:
+// leaving it unseeded keeps the un-annotated field lambda a clean "cannot infer" reject instead of
+// letting the checker accept a shape the emitter mis-lowers. (A stricter sibling of `unionArmBoxSafe`,
+// which the widening-adoption path uses — that one also excludes closures; this one admits them
+// because a closure FIELD boxes + reads soundly, only its narrowed CALL is a loud gap.)
+function unionArmSeedSafe(tyIx: i32) {
+  const t = T.tys[tyIx]
+  if !(t is TyObj) { return false }
+  const ftys = t.objFieldTypes
+  let i = 0
+  while i < ftys.length {
+    const ft = T.tys[ftys[i]]
+    if ft is TyPrim {
+      // scalar / string / boolean field — boxes + reads cleanly
+    } else if ft is TyFunc {
+      // a closure field — boxes into the variant struct; a narrowed call is a loud reject
+    } else if ft is TyObj {
+      if !unionArmSeedSafe(ftys[i]) { return false }
+    } else {
+      return false // array / union / nullable field — no sound narrowed-read rep yet
+    }
+    i = i + 1
+  }
+  true
+}
+// The union member index of `u`'s OBJECT arm whose shape covers the object literal `objIx` (every
+// literal field name is a field of the arm) AND whose fields are seed-safe (`unionArmSeedSafe`), or
+// -1. The object dual of `unionFuncArmForArity`: lets `seedExpected` descend a struct LITERAL flowing
+// into a union (`{f: (i32) => i32, …} | boolean`) into its matching struct arm, so a bare field lambda
+// (`f: (q) => …`) infers its params from that arm's field types instead of failing "cannot infer a
+// type for parameter". Seeding only supplies the contextual param types — the whole literal is still
+// gated by the normal assignability check against the union, so a mis-matched arm cannot be silently
+// accepted; the seed-safety gate additionally keeps a shape the emitter cannot yet lower (an array /
+// union / nullable field) a clean reject rather than an INVALID-WASM acceptance. FIRST match wins.
+function unionObjArmForLit(u: TyUnion, objIx: i32) {
+  const on = P.nodes[objIx]
+  if on is ObjLit {
+    const members = u.uMembers
+    let i = 0
+    while i < members.length {
+      const m = members[i]
+      const mt = T.tys[m]
+      if mt is TyObj && unionArmSeedSafe(m) {
+        let ok = true
+        let j = 0
+        while j < on.objFields.length {
+          const fnode = P.nodes[on.objFields[j]]
+          if fnode is FieldInit {
+            if objFieldType(mt, fnode.fiName) < 0 { ok = false }
+          }
+          j = j + 1
+        }
+        if ok { return m }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
 function seedExpected(exprIx: i32, expectedTy: i32) {
   if exprIx < 0 || expectedTy < 0 { return 0 }
   let u = exprIx
@@ -1255,6 +1321,15 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
         }
         i = i + 1
       }
+    } else if et is TyUnion {
+      // A struct LITERAL flowing into a union (`{f: (i32) => i32, …} | boolean`): descend into the
+      // matching struct ARM so a bare field lambda infers its params from that arm's field types
+      // (the object dual of the closure-arm seeding above). Without this an un-annotated field
+      // lambda has no contextual seed and fails "cannot infer a type for parameter". Re-entering
+      // with the arm's `TyObj` reuses the field-recursion branch; assignability still gates the
+      // whole literal against the union, so a wrong arm cannot be silently adopted.
+      const arm = unionObjArmForLit(et, u)
+      if arm >= 0 { seedExpected(u, arm) }
     }
   }
   0
