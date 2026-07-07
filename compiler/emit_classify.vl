@@ -942,6 +942,18 @@ function paramNulRef(fnIx: i32, name: string) {
   retNulRefFlag(paramTypeNode(fnIx, name)) == 1
 }
 
+// True if the parameter `name` of function `fnIx` is a NULLABLE map (`{[string]: V} | null`,
+// kind `nulmap`). The map twin of `paramNulRef`/`paramNulRefArray`.
+export function paramNulMap(fnIx: i32, name: string) {
+  retNulMapFlag(paramTypeNode(fnIx, name)) == 1
+}
+// True if the global `name` is a NULLABLE map.
+function globalIsNulMap(name: string) {
+  const li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsNulMap(li, -1)
+}
+
 // True if the function `name` returns a nullable struct (`fRetNul`).
 function fnRetNulRef(name: string) {
   const i = fnIndexOf(name)
@@ -5443,6 +5455,7 @@ export function fnRetNullBearing(fnIx: i32) {
   if retNulStringFlag(r) == 1 { return true }
   if retNulRefFlag(r) == 1 { return true }
   if retNulListFlag(r) == 1 { return true }
+  if retNulMapFlag(r) == 1 { return true }
   if retUnionFlag(r) == 1 { return unionHasAtom(tyNameOf(r), "null") }
   if r < 0 {
     const im = inferRetNameOf(fn.fnName)
@@ -6376,6 +6389,11 @@ export function vtKindOfType(tyIx: i32): VKind {
   // before the struct/object arms (an inline `{[…]:…}` is not a field-struct shape). Its
   // `fbValtype` arg is the map shape slot (mono i32 ⇒ -1, via `paramStructIdxOf`/`retStructIndex`).
   if retMapFlag(tyIx) == 1 { return "map" }
+  // A NULLABLE string-keyed map (`{[string]: V} | null`) — the `(ref null $mapStruct)` niche
+  // (`"nulmap"`), the map twin of `nulstruct`. AFTER `retMapFlag` (a bare map is never nullable);
+  // disjoint from it anyway (a `| null` map name is a `nameIsMapMemberUnion`, which `retMapFlag`
+  // excludes). Its shape arg is `mapAnnShape` (now `| null`-aware), resolving THIS map's `$mapStruct`.
+  if retNulMapFlag(tyIx) == 1 { return "nulmap" }
   if retNulRefFlag(tyIx) == 1 { return "nulstruct" }
   if retNulStringFlag(tyIx) == 1 { return "nulstr" }
   if retNulListFlag(tyIx) == 1 { return "nullist" }
@@ -6429,6 +6447,36 @@ export function retMapFlag(tyIx: i32) {
   0
 }
 
+// The BARE (non-null) inner map name of a `{[string]: V} | null` type-name — the `nullablePartOf`
+// (which peels an EXACT `X | null`), when that part is a bare map. "" for anything that is not a
+// nullable map (a plain map, a genuine map-member union `{[..]}|X`, a 3-way `{[..]}|X|null`). The
+// single chokepoint every `nulmap` classifier strips through, so `mapValNameOf`/`mvValKindOfName`/
+// `mapAnnShape` see the inner `{[string]: V}` (never the garbled `boolean}|null` a raw `mapValNameOf`
+// of the `| null` name would slice).
+export function nulMapInnerName(name: string) {
+  const np = nullablePartOf(name)
+  if np != "" && nameIsMap(np) && !nameIsMapMemberUnion(np) { return np }
+  ""
+}
+// `1` if the type-annotation node at `tyIx` is a NULLABLE string-keyed map (`{[string]: V} | null`),
+// else `0`. The map analogue of `retNulRefFlag`/`retNulRefArrFlag`: a `(ref null $mapStruct)` niche —
+// null is `ref.null $mapStruct`, a non-null map value subtypes it (the `struct → nulstruct` relation
+// hoisted to the map struct). Gated to the SAME supported value kinds as the non-null `retMapFlag`
+// (`mvValKindOfName(mapValNameOf(inner)) != -3`), so a nullable map over an unrepresentable value type
+// keeps failing loudly rather than mis-riding this niche. Feeds the `"nulmap"` arm of `vtKindOfType`.
+export function retNulMapFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      const inner = nulMapInnerName(ty.tyName)
+      if inner != "" {
+        if mvValKindOfName(mapValNameOf(inner)) != -3 { return 1 }
+      }
+    }
+  }
+  0
+}
+
 // The map SHAPE (`fbValtype`/`mapTypeIdxOf` second arg) of a string-keyed map type annotation:
 // -1 for the mono i32/boolean map (rides the shared `$mapStruct`), or the value type's interned
 // mv slot for a `string`-valued map. A non-map / un-interned value type yields -1 (the mono
@@ -6439,8 +6487,13 @@ export function mapAnnShape(tyIx: i32) {
   if tyIx >= 0 {
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
-      if nameIsMap(ty.tyName) {
-        const vn = mapValNameOf(ty.tyName)
+      // A NULLABLE map annotation (`{[string]: V} | null`) resolves its shape from the BARE inner
+      // map — its `(ref null $mapStruct)` cell selects the SAME `$mapStruct` its non-null twin does.
+      let mn = ty.tyName
+      const nim = nulMapInnerName(mn)
+      if nim != "" { mn = nim }
+      if nameIsMap(mn) {
+        const vn = mapValNameOf(mn)
         if vn == "i32" || vn == "boolean" { return -1 }
         let i = 0
         while i < mvValName.length {
@@ -6539,6 +6592,9 @@ export function paramStructIdxOf(paramIx: i32) {
     // value type's mv slot for a `string`-valued map), so the param valtype selects THIS map's
     // `$mapStruct`.
     if retMapFlag(p.parType) == 1 { return mapAnnShape(p.parType) }
+    // A NULLABLE map param (`{[string]: V} | null`, kind `nulmap`) — the SAME map SHAPE selects its
+    // `(ref null $mapStruct)` cell's heap type (`mapAnnShape` is `| null`-aware).
+    if retNulMapFlag(p.parType) == 1 { return mapAnnShape(p.parType) }
     // A concrete-VARIANT param (kind 8) — its `fbValtype` slot is the VARIANT index
     // (`uVarIdx + vi`), which `retStructIndex` (standalone structs) misses.
     if retVariantFlag(p.parType) == 1 {
@@ -6659,6 +6715,9 @@ export function globalCellKind(letIx: i32): VKind {
       // list arms (whose init fallback would else claim a bare list value as a non-null cell).
       const gNulSL = nulScalarListKindOfNode(d.letType)
       if gNulSL != null { return gNulSL }
+      // A NULLABLE map global cell (`let g: {[string]: V} | null = …`, kind `nulmap`) — BEFORE
+      // `letIsMap` (a nullable annotation/init must not collapse to the non-null `"map"` cell).
+      if letIsNulMap(letIx, -1) { return "nulmap" }
       if letIsMap(letIx, -1) { return "map" }
       // A UNION-annotated global cell is the box ref (kind 4), exactly as `buildLocals`
       // classifies a union local — BEFORE the struct/string/scalar-list cases (a `string |
@@ -10920,6 +10979,37 @@ export function letIsF64Array(letIx: i32, fnIx: i32) {
 
 // True if the already-collected declared local `name` is a map ref (code `6`).
 function declaredMap(name: string) { declaredKind(name) == "map" }
+function declaredNulMap(name: string) { declaredKind(name) == "nulmap" }
+
+// True if evaluating the expression at `exprIx` yields a NULLABLE MAP ref (`{[string]: V} | null`,
+// kind `nulmap`) — a nulmap-annotated param / local / global reference, or a nulmap-returning call.
+// The map analogue of `exprNullableStruct` / `exprNullableRefArray`: the `!= null` narrow reads the
+// `(ref null $mapStruct)` niche, and the narrowed map ops recover it non-null at the receiver.
+export function exprNullableMap(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[exprIx]
+  if e is Paren { return exprNullableMap(e.parInner, fnIx) }
+  if e is Ident {
+    if paramNulMap(fnIx, e.identName) { return true }
+    if declaredNulMap(e.identName) { return true }
+    return globalIsNulMap(e.identName)
+  }
+  // A call whose ANNOTATED return is `{[string]: V} | null` yields a nullable map, so an
+  // un-annotated `const t = mk(…)` infers kind `nulmap` and narrows with `if t != null`.
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      const target = fnIndexOf(callee.identName)
+      if target >= 0 {
+        const fn = P.nodes[fnStmts[target]]
+        if fn is FuncDecl {
+          if fn.fnRet >= 0 { return retNulMapFlag(fn.fnRet) == 1 }
+        }
+      }
+    }
+  }
+  false
+}
 
 // True if evaluating the expression at `exprIx` yields a string-keyed map: the
 // `Map()` constructor call, a map param/local reference, or a parenthesized map
@@ -10963,7 +11053,12 @@ export function exprMap(exprIx: i32, fnIx: i32) {
     if narrowedMapOf(e.identName) != "" { return true }
     if paramMap(fnIx, e.identName) { return true }
     if declaredMap(e.identName) { return true }
-    return globalIsMap(e.identName)
+    if globalIsMap(e.identName) { return true }
+    // A NULLABLE map binding (`{[string]: V} | null`, kind `nulmap`) IS a map ref in the narrowed
+    // (`!= null`) branch — the checker proved the map op guarded. The map-op receiver recovers it
+    // non-null (`ref.as_non_null` in `emitMapPrep`); its shape resolves through `mapShapeOfExpr`
+    // (the nulmap arms below). Checked here so `t["k"]` / `t["k"] ?? d` route to the map lowering.
+    return exprNullableMap(exprIx, fnIx)
   }
   // A MAP-typed struct field read (`node.children`, code 19) yields a Map ref —
   // map member/index ops on it route to the existing map lowering.
@@ -11218,6 +11313,34 @@ export function letIsMap(letIx: i32, fnIx: i32) {
   false
 }
 
+// True if the `LetDecl` at `letIx` declares a NULLABLE map local (`{[string]: V} | null`,
+// kind `nulmap`): its annotation is a nullable map, OR its initializer produces one (a
+// nulmap param/local passthrough, or a nulmap-returning call). Checked BEFORE `letIsMap` in
+// the collect ladder so a nullable init does not collapse to the non-null kind `"map"`.
+export function letIsNulMap(letIx: i32, fnIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      if retNulMapFlag(d.letType) == 1 { return true }
+    }
+    return exprNullableMap(d.letInit, fnIx)
+  }
+  false
+}
+// The map SHAPE code of a nulmap-typed `LetDecl` (the same vocabulary as `letMapShapeOf`:
+// `-2` Set, mv slot >= 0, `-1` mono, `-3` unsupported). Annotation-first (the `| null`-aware
+// `mapAnnShape`), else the nulmap initializer's shape.
+export function nulMapShapeOf(letIx: i32, fnIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      if retNulMapFlag(d.letType) == 1 { return mapAnnShape(d.letType) }
+    }
+    return mapShapeOfExpr(d.letInit, fnIx)
+  }
+  -1
+}
+
 // The map SHAPE code of a map-typed `LetDecl`: `-2` a Set, an mv SLOT (>= 0) for a
 // ref-valued map (from the annotation's value type-name), `-1` the mono i32 map,
 // `-3` an unsupported value type (op sites fail loudly). Annotation-first, else the
@@ -11285,9 +11408,21 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     // map's mv slot) — so the body's map ops resolve the param's VALUE type, not the mono i32
     // assumption a bare `-1` would force.
     if paramMap(fnIx, e.identName) { return paramMapShape(fnIx, e.identName) }
+    // A NULLABLE map binding narrowed non-null — its shape is the `| null`-stripped map value type,
+    // resolved from the local slot (`declaredNulMap`) or the param annotation (`paramNulMap`), so the
+    // narrowed `t["k"]` reads THIS map's value rep (not the mono i32 assumption).
+    if declaredNulMap(e.identName) {
+      const nslot = declaredSlotOf(e.identName)
+      if nslot >= 0 { return localStructIdx[nslot] }
+      return -1
+    }
+    if paramNulMap(fnIx, e.identName) {
+      return paramMapShape(fnIx, e.identName)
+    }
     const gl = globalLetOf(e.identName)
     if gl >= 0 {
       if letIsMap(gl, -1) { return letMapShapeOf(gl, -1) }
+      if letIsNulMap(gl, -1) { return nulMapShapeOf(gl, -1) }
     }
   }
   // A MAP-typed struct field read (`node.children`, code 19): the shape is the

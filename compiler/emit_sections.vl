@@ -162,6 +162,7 @@ import {
   pendingMapSlot,
   pendingNulBool,
   pendingNulClosure,
+  pendingNulRefHeap,
   pendingNulString,
   pendingStructIdx,
   reExpName,
@@ -224,6 +225,7 @@ import {
   fbUnreachable,
   fbValtype,
   fbValtypeNullable,
+  mapTypeIdxOf,
   wBytes,
   wName,
   wSLEB,
@@ -279,6 +281,7 @@ import {
   mapRetExprShape,
   markLoopVarSlot,
   mvSlotOfValNameFind,
+  nulMapShapeOf,
   nulScalarListBuildKind,
   paramStructIdxOf,
   pendingLitUnion,
@@ -288,6 +291,7 @@ import {
   resetLitAtoms,
   restoreNarrow,
   retMapFlag,
+  retNulMapFlag,
   retNulRefArrFlag,
   retNulRefFlag,
   retRefArrFlag,
@@ -463,6 +467,12 @@ function checkParams(fnIx: i32) {
             // boundary. The body's map ops resolve the param via `exprMap`/`paramMap`/
             // `mapShapeOfExpr` (which now reads the param annotation's shape). A struct/f64/i64-
             // valued map is NOT yet supported (`retMapFlag` returns 0) → rejected below.
+          } else if retNulMapFlag(p.parType) == 1 {
+            // accepted — a NULLABLE map param (`{[string]: V} | null`, kind `nulmap`): a
+            // `(ref null $mapStruct)` cell that is null or the map. The `!= null` narrow (`ref.is_null`)
+            // and the narrowed map ops (`t["k"]` / `t["k"] ?? d`) recover the non-null map ref
+            // (`ref.as_non_null`) at the receiver — the checker proved every such read guarded. The
+            // shape (`paramStructIdxOf` → `mapAnnShape`) selects THIS map's `$mapStruct`.
           } else if nodeTyIsLitUnionAlias(p.parType) {
             // accepted — a literal-union param is an i32-backed interned atom (kind 0).
           } else if nodeTyIsNulLitUnion(p.parType) {
@@ -1011,6 +1021,13 @@ function emitStartFnCode(out: i32[]) {
             // local-`let` seeding) so `Map()` builds THIS global's map struct.
             if gck == "map" {
               pendingMapSlot = letMapShapeOf(globalStmts[gi], -1)
+            }
+            // A NULLABLE map global's start-fn init: seed the map SHAPE (`Map()` builds it) and
+            // the null heap (a bare `null` init lowers as `ref.null $mapStruct`).
+            if gck == "nulmap" {
+              const gnmShape = nulMapShapeOf(globalStmts[gi], -1)
+              pendingMapSlot = gnmShape
+              pendingNulRefHeap = mapTypeIdxOf(gnmShape)
             }
             // A struct / nullable-struct cell seeds the struct context so a bare
             // `null` init lowers as `ref.null $S` and a literal builds THIS
@@ -2745,6 +2762,9 @@ function emitTypeSection(
         // A string-keyed MAP return's slot is the map SHAPE (mono ⇒ -1, or the value type's mv
         // slot for a `string`-valued map), so the result valtype selects THIS map's `$mapStruct`.
         if retMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
+        // A NULLABLE map return (`{[string]: V} | null`, kind `nulmap`) — the SAME map SHAPE selects
+        // its `(ref null $mapStruct)` result valtype (`mapAnnShape` is `| null`-aware).
+        if retNulMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
         // A `: Cat` concrete-variant return is kind 8 — its `fbValtype` slot is the VARIANT
         // index (`uVarIdx + vi`), which `retStructIndex` (standalone structs only) misses.
         if retVariantFlag(fn.fnRet) == 1 {
@@ -3012,6 +3032,9 @@ function emitGlobalSection() {
           // A map cell (kind 6) passes its map SHAPE (mv slot / -1 mono / -2 set)
           // so the cell valtype + ref.null zero select THIS map's struct type.
           if ck == "map" { cs = letMapShapeOf(globalStmts[gi], -1) }
+          // A NULLABLE map cell (kind `nulmap`) passes the SAME map SHAPE — its `(ref null
+          // $mapStruct)` valtype + `ref.null` zero select THIS map's struct type.
+          if ck == "nulmap" { cs = nulMapShapeOf(globalStmts[gi], -1) }
           fbValtypeNullable(ck, cs) // nullable valtype
           wU8(1)                    // 0x01 mutable
           if ck == "i32" {
@@ -3060,6 +3083,14 @@ function emitGlobalSection() {
           if gck == "map" {
             gcs = letMapShapeOf(globalStmts[gi], -1)
             pendingMapSlot = gcs
+          }
+          // A NULLABLE map cell (kind `nulmap`): the map SHAPE picks the struct type; a bare `null`
+          // init lowers as `ref.null $mapStruct` (`pendingNulRefHeap`), a `Map()` init builds it
+          // (`pendingMapSlot`). Both are valid WasmGC constexprs.
+          if gck == "nulmap" {
+            gcs = nulMapShapeOf(globalStmts[gi], -1)
+            pendingMapSlot = gcs
+            pendingNulRefHeap = mapTypeIdxOf(gcs)
           }
           fbValtype(gck, gcs) // valtype
           wU8(1)              // 0x01 mutable
