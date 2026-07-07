@@ -13,7 +13,10 @@
 //                 escaped-quote/backslash · multibyte — the value edges the round-trip corpus lacks.
 //   containers  — struct {f:T} · list T[] · nullable T|null · multi-field struct {a,f,z} (mixed-rep
 //                 decoy siblings) · map {[string]:T} (read via `?? <same-shape dummy>`) · union
-//                 T | decoy (read via `is`, sometimes CARRYING the decoy) · closure ()=>T / (i32)=>T
+//                 T | decoy (read via `is`, sometimes CARRYING the decoy) · closure ()=>T / (i32)=>T.
+//                 With `--branching` (BRANCHING, opt-in) the single-spine tree also branches:
+//                 multi-element arrays/maps, structs with two RECURSIVE decoy fields, arity-3
+//                 unions, and multi-param closures — recursed under a total NODE budget.
 //   positions   — local binding · function param · function return · global binding
 //   variants    — READ (round-trip) + CONSTRUCT-ONLY (build, never read: catches construct-side
 //                 soundness holes the read path would mask by rejecting cleanly first)
@@ -34,6 +37,18 @@ let MAXDEPTH = 4
 // genSlot) — a survey/cron mode: it deliberately relocates the sample onto pre-existing rep holes,
 // so it is report-only, never a pinned-seed gate (unsound findings there are un-baselineable).
 let RICHVALUES = 0
+// Opt-in branching-TREE shapes (fuzz-vl.sh `--branching`). OFF (the default, and the pinned-CI
+// net) draws EXACTLY the master stream — every new draw below is guarded by `if BRANCHING == 1`
+// AND placed after the existing draws, and `&&` short-circuits, so the OFF batch is byte-identical
+// and the rep-fuzz baseline needs zero churn. ON generalizes the single-spine tree: multi-element
+// arrays/maps, structs with two RECURSIVE composite decoy fields, arity-3 unions, multi-param
+// closures — recursed under a TOTAL NODE BUDGET (not just depth). Like RICHVALUES it relocates the
+// sample onto pre-existing rep holes, so it is a report-only survey, never a pinned-seed gate.
+let BRANCHING = 0
+// Total-node budget for the current program (branching only). NODEBUDGET caps how many genSlot
+// nodes a program's extra branches may spend; NODESUSED counts them. Set per program in go().
+let NODEBUDGET = 0
+let NODESUSED = 0
 
 // per-case emission state
 let ALIASES = "" // literal-union `type K<n> = …` declarations for the current case
@@ -74,6 +89,12 @@ type Slot = {
   d2ty: string,
   d2v: string,
   arg: i32, // kind 7: 0 → `() => T`, 1 → `(i32) => T`
+  // ── BRANCHING (opt-in tree shapes; all default to the single-spine values above) ──
+  kids: Slot[], // kind 4: 2 RECURSIVE composite decoy fields [a, z] (empty → the d1/d2 leaf pool)
+  nRep: i32, // kind 2/5: element/entry count for a multi-element array / multi-entry map (0/1 → one)
+  uni2: string, // kind 6: a 3rd non-admitting decoy arm type (arity-3 union; "" → arity-2)
+  uni2v: string, // kind 6: a literal of the 3rd arm (unused by the oracle; kept for symmetry)
+  nArg: i32, // kind 7: i32 param arity when > 1 (`(i32, i32) => T`); 0 → use `arg`
 }
 
 function slot(
@@ -100,6 +121,11 @@ function slot(
     d2ty: "",
     d2v: "",
     arg: 0,
+    kids: [],
+    nRep: 0,
+    uni2: "",
+    uni2v: "",
+    nArg: 0,
   }
 }
 
@@ -376,6 +402,41 @@ function pickAlt(s: Slot, c: Slot) {
   }
 }
 
+// BRANCHING: a THIRD union arm (arity-3), a fixed non-admitting decoy distinct from both the
+// carrier type and the first decoy `altTy`. Same admissibility discipline as pickAlt (a numeric/
+// atom carrier cannot share a member that would admit its literal), so the `is <carrier>` oracle
+// stays sound; the 3rd arm is only ever a type widening — never constructed.
+function pickAlt2(s: Slot, c: Slot) {
+  const childTy = emitTy(c)
+  let numericLeaf = 0
+  let atomLeaf = 0
+  if c.kind == 0 {
+    if c.leaf == 0 || c.leaf == 1 || c.leaf == 2 || c.leaf == 4 {
+      numericLeaf = 1
+    }
+    if c.leaf == 6 { atomLeaf = 1 }
+  }
+  while s.uni2 == "" || s.uni2 == childTy || s.uni2 == s.altTy {
+    const k = rr(0, 3)
+    if k == 0 && numericLeaf == 0 {
+      s.uni2 = "i64"
+      s.uni2v = "5000000088"
+    }
+    if k == 1 && numericLeaf == 0 {
+      s.uni2 = "f64"
+      s.uni2v = "8.75"
+    }
+    if k == 2 && atomLeaf == 0 {
+      s.uni2 = "string"
+      s.uni2v = ch(34) + "other2" + ch(34)
+    }
+    if k == 3 {
+      s.uni2 = "{q: i64}"
+      s.uni2v = "{q: 88}"
+    }
+  }
+}
+
 // A decoy sibling field for the multi-field struct — mixed reps so the payload field's offset and
 // valtype sit next to unlike neighbors.
 function pickDecoyField(which: i32, s: Slot) {
@@ -415,6 +476,7 @@ function pickDecoyField(which: i32, s: Slot) {
 // indistinguishable from a miss through the `??` read), and under a union (no `is (T|null)`).
 // `allowUni` is 0 directly under a union (a flattened `a|b|alt` has no `is (a|b)` narrow).
 function genSlot(depth: i32, allowNul: i32, allowUni: i32): Slot {
+  NODESUSED = NODESUSED + 1 // total-node counter (branching budget); draws no random
   if depth <= 0 { return genLeaf() }
   // bias toward leaves so trees stay small
   if rr(0, 9) <= 2 { return genLeaf() }
@@ -436,6 +498,9 @@ function genSlot(depth: i32, allowNul: i32, allowUni: i32): Slot {
     const c = genSlot(depth - 1, 0, 0)
     const s = slot(6, 0, "", c.expected, c)
     pickAlt(s, c)
+    // BRANCHING: ~1/2 of unions gain a 3rd non-admitting arm (arity-3). Guarded + short-circuit,
+    // so the OFF path draws nothing here and the carriesAlt draw below is byte-stable.
+    if BRANCHING == 1 && rr(0, 1) == 0 { pickAlt2(s, c) }
     // ~1/4 of union slots carry the DECOY — the `is <carrier>` read fails and prints OTHER.
     if rr(0, 3) == 0 {
       s.carriesAlt = 1
@@ -448,12 +513,21 @@ function genSlot(depth: i32, allowNul: i32, allowUni: i32): Slot {
     const s = slot(4, 0, "", c.expected, c)
     pickDecoyField(1, s)
     pickDecoyField(2, s)
+    // BRANCHING: promote BOTH leaf-pool decoy fields to RECURSIVE composites (budget-gated) — the
+    // "struct with two recursive composite fields" shape the single-spine tree never builds.
+    if BRANCHING == 1 && NODESUSED < NODEBUDGET && rr(0, 1) == 0 {
+      const ak = genSlot(depth - 1, 1, 1)
+      const zk = genSlot(depth - 1, 1, 1)
+      s.kids = [ak, zk]
+    }
     return s
   }
   if k == 7 {
     const c = genSlot(depth - 1, 1, 1)
     const s = slot(7, 0, "", c.expected, c)
     s.arg = rr(0, 1)
+    // BRANCHING: ~1/2 of closures take multiple i32 params (`(i32, i32[, i32]) => T`).
+    if BRANCHING == 1 && rr(0, 1) == 0 { s.nArg = rr(2, 3) }
     return s
   }
   if k == 5 {
@@ -465,11 +539,17 @@ function genSlot(depth: i32, allowNul: i32, allowUni: i32): Slot {
     let nul = 1
     if RICHVALUES == 1 { nul = 0 }
     const c = genSlot(depth - 1, nul, 1)
-    return slot(5, 0, "", c.expected, c)
+    const s = slot(5, 0, "", c.expected, c)
+    // BRANCHING: extra map ENTRIES (carrier stays at "k"; siblings are same-typed dummies).
+    if BRANCHING == 1 && rr(0, 1) == 0 { s.nRep = rr(2, 4) }
+    return s
   }
   // struct{f} · list
   const c = genSlot(depth - 1, 1, 1)
-  return slot(k, 0, "", c.expected, c)
+  const s = slot(k, 0, "", c.expected, c)
+  // BRANCHING: multi-element ARRAY (k == 2 only; carrier stays at [0], siblings are dummies).
+  if BRANCHING == 1 && k == 2 && rr(0, 1) == 0 { s.nRep = rr(2, 4) }
+  return s
 }
 
 function leafTy(l: i32): string {
@@ -505,14 +585,33 @@ function emitTy(s: Slot): string {
   if s.kind == 2 { return elemTy(c) + "[]" }
   if s.kind == 3 { return memberTy(c) + " | null" }
   if s.kind == 4 {
-    return "{a: " + s.d1ty + ", f: " + emitTy(c) + ", z: " + s.d2ty + "}"
+    let aty = s.d1ty
+    let zty = s.d2ty
+    if s.kids.length == 2 {
+      aty = emitTy(s.kids[0])
+      zty = emitTy(s.kids[1])
+    }
+    return "{a: " + aty + ", f: " + emitTy(c) + ", z: " + zty + "}"
   }
   if s.kind == 5 { return "{[string]: " + emitTy(c) + "}" }
-  if s.kind == 6 { return memberTy(c) + " | " + s.altTy }
+  if s.kind == 6 {
+    let u = memberTy(c) + " | " + s.altTy
+    if s.uni2 != "" { u = u + " | " + s.uni2 }
+    return u
+  }
   // closure: a nullable/union child is the RETURN type (`() => T | null` parses as returning
   // nullable); only a closure child needs parens
   let ret = emitTy(c)
   if c.kind == 7 { ret = "(" + ret + ")" }
+  if s.nArg >= 2 {
+    let params = "i32"
+    let j = 1
+    while j < s.nArg {
+      params = params + ", i32"
+      j = j + 1
+    }
+    return "(" + params + ") => " + ret
+  }
   if s.arg == 1 { return "(i32) => " + ret }
   return "() => " + ret
 }
@@ -539,8 +638,30 @@ function emitCtor(s: Slot, dum: i32): Built {
   }
   const b = emitCtor(c, dum)
   if s.kind == 1 { return { pre: b.pre, expr: "{f: " + b.expr + "}" } }
-  if s.kind == 2 { return { pre: b.pre, expr: "[" + b.expr + "]" } }
+  if s.kind == 2 {
+    if s.nRep >= 2 {
+      // multi-element array: carrier at [0], then nRep-1 same-typed dummy twins (never read)
+      const d = emitCtor(c, 1)
+      let elems = b.expr
+      let j = 1
+      while j < s.nRep {
+        elems = elems + ", " + d.expr
+        j = j + 1
+      }
+      return { pre: b.pre + d.pre, expr: "[" + elems + "]" }
+    }
+    return { pre: b.pre, expr: "[" + b.expr + "]" }
+  }
   if s.kind == 4 {
+    if s.kids.length == 2 {
+      // recursive composite decoy fields — hoist their (possibly map) pre-statements too
+      const ba = emitCtor(s.kids[0], dum)
+      const bz = emitCtor(s.kids[1], dum)
+      return {
+        pre: b.pre + ba.pre + bz.pre,
+        expr: "{a: " + ba.expr + ", f: " + b.expr + ", z: " + bz.expr + "}",
+      }
+    }
     return {
       pre: b.pre,
       expr: "{a: " + s.d1v + ", f: " + b.expr + ", z: " + s.d2v + "}",
@@ -549,7 +670,7 @@ function emitCtor(s: Slot, dum: i32): Built {
   if s.kind == 5 {
     const h = "h" + itoa(GSYM)
     GSYM = GSYM + 1
-    const pre = b.pre +
+    let pre = b.pre +
       "const " +
       h +
       ": " +
@@ -563,12 +684,41 @@ function emitCtor(s: Slot, dum: i32): Built {
       "] = " +
       b.expr +
       "\n"
+    if s.nRep >= 2 {
+      // extra entries under distinct keys, same-typed dummies (never read)
+      const d = emitCtor(c, 1)
+      pre = pre + d.pre
+      let j = 1
+      while j < s.nRep {
+        pre = pre +
+          h +
+          "[" +
+          ch(34) +
+          "k" +
+          itoa(j) +
+          ch(34) +
+          "] = " +
+          d.expr +
+          "\n"
+        j = j + 1
+      }
+    }
     return { pre: pre, expr: h }
   }
   if s.kind == 7 {
     // the child's pre-statements hoist OUT of the lambda (the lambda captures the temps)
     let head = "() => ("
-    if s.arg == 1 {
+    if s.nArg >= 2 {
+      let params = ""
+      let j = 0
+      while j < s.nArg {
+        if j > 0 { params = params + ", " }
+        params = params + "q" + itoa(GSYM)
+        GSYM = GSYM + 1
+        j = j + 1
+      }
+      head = "(" + params + ") => ("
+    } else if s.arg == 1 {
       const q = "q" + itoa(GSYM)
       GSYM = GSYM + 1
       head = "(" + q + ") => ("
@@ -602,6 +752,15 @@ function emitRead(acc: string, s: Slot, tmp: i32): string {
   if s.kind == 1 || s.kind == 4 { return emitRead(acc + ".f", c, tmp) }
   if s.kind == 2 { return emitRead(acc + "[0]", c, tmp) }
   if s.kind == 7 {
+    if s.nArg >= 2 {
+      let args = "1"
+      let j = 1
+      while j < s.nArg {
+        args = args + ", 1"
+        j = j + 1
+      }
+      return emitRead(acc + "(" + args + ")", c, tmp)
+    }
     if s.arg == 1 { return emitRead(acc + "(1)", c, tmp) }
     return emitRead(acc + "()", c, tmp)
   }
@@ -751,7 +910,12 @@ function go() {
     ALIASES = ""
     LUC = 0
     GSYM = 0
-    const s = genSlot(rr(1, MAXDEPTH), 1, 1)
+    const d = rr(1, MAXDEPTH)
+    // Total-node budget for this program's branches (branching only; unused when BRANCHING == 0,
+    // and drawing no random keeps the OFF stream byte-stable). Scales with the drawn depth.
+    NODESUSED = 0
+    NODEBUDGET = d * 4 + 6
+    const s = genSlot(d, 1, 1)
     const ty = emitTy(s)
     const b = emitCtor(s, 0)
     // a global has no statement slot for map hoists — fall back to the return position

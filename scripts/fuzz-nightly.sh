@@ -21,6 +21,12 @@
 #   --depths LIST   space-separated depths, cycled across seeds round-robin (default "4 5 6")
 #   --baseline FILE known-issue baseline (default scripts/rep-fuzz-baseline.txt)
 #   --out-dir DIR   where per-seed shapes/keep artifacts land (default a fresh mktemp dir, printed)
+#   --branching     generate BRANCHING-tree shapes (fuzz-vl.sh --branching): multi-element
+#                   arrays/maps, structs with two recursive fields, arity-3 unions, multi-param
+#                   closures. A frontier the pinned net never samples — pair with --experimental.
+#   --experimental  report-only: classify + print non-baselined unsound findings but ALWAYS exit 0
+#                   (never fail the job). For a survey leg still surfacing many holes (e.g.
+#                   --branching), so the frontier is measured and artifacted without gating.
 # Requires a fresh seed: bash scripts/refresh-compiler.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -30,6 +36,8 @@ COUNT=200
 DEPTHS="4 5 6"
 BASELINE="scripts/rep-fuzz-baseline.txt"
 OUT_DIR=""
+BRANCHING=""
+EXPERIMENTAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --seeds) SEEDS_N="$2"; shift 2 ;;
@@ -37,9 +45,13 @@ while [ $# -gt 0 ]; do
     --depths) DEPTHS="$2"; shift 2 ;;
     --baseline) BASELINE="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
+    --branching) BRANCHING="--branching"; shift ;;
+    --experimental) EXPERIMENTAL=1; shift ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
+MODE="pinned-grammar"
+[ -z "$BRANCHING" ] || MODE="branching-tree (experimental)"
 
 [ -n "$OUT_DIR" ] || OUT_DIR="$(mktemp -d)"
 mkdir -p "$OUT_DIR"
@@ -60,6 +72,7 @@ while [ "$i" -lt "$SEEDS_N" ]; do
   i=$((i + 1))
 done
 
+echo "fuzz-nightly: mode=$MODE"
 echo "fuzz-nightly: seeds = ${seeds[*]}"
 echo "fuzz-nightly: count=$COUNT depths=$DEPTHS baseline=$BASELINE"
 for s in "${seeds[@]}"; do
@@ -69,7 +82,8 @@ done
 for s in "${seeds[@]}"; do
   d="${seed_depth[$s]}"
   echo; echo "-- running seed $s (depth $d) --"
-  ./scripts/fuzz-vl.sh --seed "$s" --count "$COUNT" --depth "$d" \
+  # shellcheck disable=SC2086  # $BRANCHING is a single flag token or empty
+  ./scripts/fuzz-vl.sh --seed "$s" --count "$COUNT" --depth "$d" $BRANCHING \
     --baseline "$BASELINE" --shapes-out "$OUT_DIR/seed_$s.tsv" --keep "$OUT_DIR/keep_$s" --quiet
 done
 
@@ -91,12 +105,14 @@ family_summary() {
 }
 
 {
-  echo "### fuzz-nightly summary"
+  echo "### fuzz-nightly summary ($MODE)"
   echo
   echo "seeds: ${seeds[*]} (count=$COUNT, depths=$DEPTHS)"
   echo
   if [ -n "$unsound_new" ]; then
-    echo "**UNSOUND — $(printf '%s\n' "$unsound_new" | grep -c .) non-baselined finding(s) (INVALID-WASM/TRAP/MISMATCH). Job FAILS.**"
+    verdict="Job FAILS."
+    [ "$EXPERIMENTAL" -eq 0 ] || verdict="Report-only (experimental) — job does NOT fail."
+    echo "**UNSOUND — $(printf '%s\n' "$unsound_new" | grep -c .) non-baselined finding(s) (INVALID-WASM/TRAP/MISMATCH). $verdict**"
   else
     echo "No non-baselined unsound (INVALID-WASM/TRAP/MISMATCH) findings."
   fi
@@ -120,8 +136,10 @@ if [ -z "$unsound_new" ]; then
   exit 0
 fi
 
+verb="FAILED"
+[ "$EXPERIMENTAL" -eq 0 ] || verb="report-only (experimental, exit 0)"
 echo
-echo "fuzz-nightly: FAILED — non-baselined unsound finding(s):"
+echo "fuzz-nightly: $verb — non-baselined unsound finding(s):"
 echo
 while IFS=$'\t' read -r class shape; do
   [ -n "$class" ] || continue
@@ -132,10 +150,13 @@ while IFS=$'\t' read -r class shape; do
     [ -f "$f" ] || continue
     if grep -qxF "$(printf '%s\t%s' "$class" "$shape")" "$f"; then
       d="${seed_depth[$s]}"
-      echo "    repro: scripts/fuzz-vl.sh --seed $s --count $COUNT --depth $d"
+      echo "    repro: scripts/fuzz-vl.sh --seed $s --count $COUNT --depth $d $BRANCHING"
       echo "    failing case + error kept at: $OUT_DIR/keep_$s/"
     fi
   done
 done <<< "$unsound_new"
 
+# Experimental legs (e.g. --branching) surface the frontier for measurement, not as a gate: report
+# and exit 0. The pinned-grammar leg still fails loudly on any fresh unsound hole.
+[ "$EXPERIMENTAL" -eq 0 ] || exit 0
 exit 1
