@@ -195,11 +195,10 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 *Allocation = WasmGC; binaryen stays (it doesn't block self-hosting). → `DECISIONS.md`.*
 
 - 🟡 **B2. Numeric codegen.** Hex/octal/binary literals + digit separators: SHIPPED (see
-  `tests/cases/literals/`). Self-host i64/f64/f32 scalars, `f64[]` arrays, and the
-  lossless-only implicit-widening matrix: SHIPPED (#290–#298; see `CHANGELOG.md`). REMAINING:
-  **explicit value casting/coercion between numeric types** — now load-bearing, since the
-  lossless-only rule (#298) leaves the lossy edges (`i32→f32`, `i64→f64`, narrowings,
-  float→int) with NO syntax at all; **arbitrary-precision `BigInt` and a `Decimal<Backing,
+  `tests/cases/literals/`). Self-host i64/f64/f32 scalars, `f64[]` arrays, the
+  lossless-only implicit-widening matrix, and explicit `x as T` numeric casts (every
+  direction — the lossy widenings, narrowings and trapping float→int; see `CHANGELOG.md`):
+  SHIPPED (#290–#298). REMAINING: **arbitrary-precision `BigInt` and a `Decimal<Backing,
   Scale>` family** as future `std`-library generic types (not primitives). Prereq: const
   generics (A10).
 - 🟡 **B5. Objects.** REMAINING: methods via `self`+UFCS (B14); typed literals in object values
