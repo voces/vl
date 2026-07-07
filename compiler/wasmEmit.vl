@@ -18,6 +18,7 @@ import {
 } from "./typecheck"
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
   BoolLit,
@@ -69,6 +70,7 @@ import {
 } from "./ast"
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
   BoolLit,
@@ -283,6 +285,8 @@ import {
   fbEnd,
   fbF32Const,
   fbF32ConvertI32S,
+  fbF32ConvertI64S,
+  fbF32DemoteF64,
   fbF64Const,
   fbF64ConvertI32S,
   fbF64ConvertI64S,
@@ -294,8 +298,13 @@ import {
   fbI32Eqz,
   fbI32Load,
   fbI32Store,
+  fbI32TruncF32S,
+  fbI32TruncF64S,
+  fbI32WrapI64,
   fbI64Const,
   fbI64ExtendI32S,
+  fbI64TruncF32S,
+  fbI64TruncF64S,
   fbIf,
   fbLocalGet,
   fbLocalSet,
@@ -1028,6 +1037,7 @@ function nameUsedAsValueIn(name: string, ix: i32) {
     return nameUsedAsValueIn(name, n.idxIndex)
   }
   if n is IsExpr { return nameUsedAsValueIn(name, n.isObj) }
+  if n is AsExpr { return nameUsedAsValueIn(name, n.asObj) }
   if n is ArrayLit {
     const es = n.arrElems
     let i3 = 0
@@ -5918,6 +5928,7 @@ export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
   if e is Ident { return emitIdentNode(body, e, exprIx, fnIx) }
   if e is Paren { return emitExpr(body, e.parInner, fnIx) }
   if e is Unary { return emitUnaryNode(body, e, exprIx, fnIx) }
+  if e is AsExpr { return emitAsCast(body, e, exprIx, fnIx) }
   if e is Call { return emitCallNode(body, e, exprIx, fnIx) }
   if e is IsExpr { return emitIs(body, exprIx, fnIx) }
   if e is NullLit { return emitNullLitNode(body, e, exprIx, fnIx) }
@@ -6369,6 +6380,79 @@ export function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
   // Non-literal i32: evaluate, then convert to f32.
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   fbF32ConvertI32S()
+  0
+}
+
+// Emit an explicit `x as T` numeric cast (B2). The operand is first lowered in its
+// OWN source rep — reusing the `emitExprAs*` widening helpers, which handle the
+// as-is fast path and literal re-encoding — then the single wasm conversion opcode
+// for the (source → target) pair is appended. WIDENINGS and the same-rep no-op are
+// exactly what the existing helpers already emit, so those directions delegate
+// wholesale; the directions the implicit-widening path never needs (i64→i32 wrap,
+// f64→f32 demote, i64→f32, and the trapping float→int truncations) append the new
+// opcodes. The float→int forms are the TRAPPING `trunc` family: a NaN or an
+// out-of-range operand aborts at runtime — deliberate (VL's "traps are for bugs").
+// Source rep is classified f32-BEFORE-f64 because `exprIsF64` over-claims an f32
+// literal (see `emitExprAsF64`). By construction of `checkCastNode`, `asTy` is one
+// of i32/i64/f32/f64, so the four target arms below are exhaustive.
+function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
+  const obj = e.asObj
+  const tgt = e.asTy
+  // Target f64: every source (i32/f32/i64/f64, incl. literals) is a widening or a
+  // no-op the f64 helper already lowers correctly.
+  if tgt == "f64" { return emitExprAsF64(body, obj, fnIx) }
+  // Classify the source rep (f32 first — see the comment above).
+  let src = "i32"
+  if exprIsF32(obj, fnIx) { src = "f32" }
+  else if exprIsI64(obj, fnIx) { src = "i64" }
+  else if exprIsF64(obj, fnIx) { src = "f64" }
+  if tgt == "i64" {
+    // i32→i64 widening (and i64→i64 no-op) via the existing helper.
+    if src == "i32" || src == "i64" { return emitExprAsI64(body, obj, fnIx) }
+    // float→i64: TRAPPING truncation toward zero.
+    if src == "f32" {
+      if emitExprAsF32(body, obj, fnIx) < 0 { return -1 }
+      fbI64TruncF32S()
+      return 0
+    }
+    if emitExprAsF64(body, obj, fnIx) < 0 {
+      return -1 // f64 → i64
+    }
+    fbI64TruncF64S()
+    return 0
+  }
+  if tgt == "f32" {
+    // i32→f32 (and f32→f32 no-op) via the existing helper (handles literals).
+    if src == "i32" || src == "f32" { return emitExprAsF32(body, obj, fnIx) }
+    if src == "i64" {
+      if emitExprAsI64(body, obj, fnIx) < 0 { return -1 }
+      fbF32ConvertI64S()
+      return 0
+    }
+    if emitExprAsF64(body, obj, fnIx) < 0 {
+      return -1 // f64 → f32 demote
+    }
+    fbF32DemoteF64()
+    return 0
+  }
+  // tgt == "i32".
+  if src == "i32" {
+    return emitExpr(body, obj, fnIx) // no-op
+  }
+  if src == "i64" {
+    if emitExprAsI64(body, obj, fnIx) < 0 { return -1 }
+    fbI32WrapI64()
+    return 0
+  }
+  if src == "f32" {
+    if emitExprAsF32(body, obj, fnIx) < 0 { return -1 }
+    fbI32TruncF32S()
+    return 0
+  }
+  if emitExprAsF64(body, obj, fnIx) < 0 {
+    return -1 // f64 → i32 trunc
+  }
+  fbI32TruncF64S()
   0
 }
 

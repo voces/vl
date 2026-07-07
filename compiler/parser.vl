@@ -45,6 +45,7 @@ import { mkMatch } from "./ast"
 import { BinExpr, Ident, P, Tok, mkDeclNameTok } from "./ast"
 import {
   mkArrayLit,
+  mkAsExpr,
   mkBinary,
   mkBlock,
   mkBool,
@@ -901,7 +902,24 @@ function parseUnary() {
     advance()
     return mkUnary("~", parseUnary(), p0)
   }
-  const node = parsePostfix()
+  let node = parsePostfix()
+  // `x as T` — an explicit numeric CAST (B2). `as` is a CONTEXTUAL keyword: it
+  // stays a plain `IDENT` token (so it remains usable as an identifier and
+  // `import { a as b }` — matched by text — is untouched), special ONLY here,
+  // directly after a postfix operand on the same line. It occupies the same
+  // precedence slot as the `is` guard below: looser than the POSTFIX operators
+  // (`.`/`()`/`[]`, already consumed by `parsePostfix`) but tighter than every
+  // BINARY operator, so `a + b as f64` is `a + (b as f64)`. A PREFIX unary (`-`,
+  // `~`) recurses through `parseUnary`, so it binds looser than `as` (`-b as i64`
+  // is `-(b as i64)`) — the reverse of Rust, but unobservable for numeric casts
+  // (negation / bitwise-not commute with wrap / trunc / demote). CHAINABLE
+  // (`x as i64 as f64`). A newline before `as` ends the statement (no
+  // `skipNewlines` here), so a following `as = 1` reassignment of the soft-keyword
+  // identifier is unaffected.
+  while peekKind() == "IDENT" && peekTok().text == "as" {
+    advance() // `as`
+    node = mkAsExpr(node, parseAsType(), p0)
+  }
   const pk = peekKind()
   // `x is T` / `x !is T` — the RHS is a TYPE, not an expression (host: `parseType`
   // after the `is`), so `x is {x: i32}`, `x is A | B` and `x is null` all parse.
@@ -930,6 +948,15 @@ function parseIsType() {
   }
   parseTypeName()
 }
+
+// The TARGET type of an `x as T` cast, as a synthetic NAME string. A single type
+// ATOM (`parseTypeAtom`), NOT a full `parseTypeName`: a top-level union `|` or
+// intersection `&` must stay a binary OPERATOR after the cast (so `a as i32 | b`
+// is `(a as i32) | b`, honouring `as`'s tighter-than-binary precedence). The
+// checker rejects any non-numeric-scalar atom with "`as` supports numeric
+// conversions only", so an unusual target (`x as string`, `x as i32[]`) still
+// parses here and errors cleanly at the type tier.
+function parseAsType() { parseTypeAtom() }
 
 // Precedence climbing from `minPrec`, seeded by an already-parsed `left`. A
 // binary expression anchors at its LEFT operand's start offset (`leftPos`, the

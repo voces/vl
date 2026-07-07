@@ -49,6 +49,7 @@
 import { f32LitOverflows, f64LitOverflows } from "./emit_bignum"
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
   BoolLit,
@@ -99,6 +100,7 @@ import {
 } from "./ast"
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
   BoolLit,
@@ -8043,6 +8045,9 @@ function checkNodeReal(ix: i32) {
     return ty
   } else if n is Paren {
     return checkNode(n.parInner)
+    // ── explicit numeric cast `x as T` ──────────────────────────────────────────
+  } else if n is AsExpr {
+    return checkCastNode(n, ix)
     // ── unary ─────────────────────────────────────────────────────────────────
   } else if n is Unary {
     return checkUnaryNode(n, ix)
@@ -10460,8 +10465,10 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
             tyToStr(initTy) +
               " doesn't fit in " +
               tyToStr(annot) +
-              " — the conversion is lossy and must be made explicit " +
-              "(narrowing truncates the value)",
+              " — the conversion is lossy and must be made explicit with `as` " +
+              "(write `x as " +
+              tyToStr(annot) +
+              "`)",
             ix,
           )
         } else {
@@ -10883,6 +10890,39 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   }
   return TY_VOID
 }
+// ── explicit numeric cast `x as T` ──────────────────────────────────────────
+
+// `x as T` (B2) is an explicit, CHECKED numeric conversion. Unlike the implicit
+// lossless-widening rule (`numWidensName`, which permits only i32→i64, i32→f64,
+// f32→f64), `as` permits EVERY numeric-scalar direction: those widenings PLUS the
+// lossy widenings (i64→f64, i32→f32, i64→f32), the narrowings (i64→i32 wrap,
+// f64→f32 demote) and int↔float conversions — that explicitness is the whole
+// point. The float→int forms trap at runtime on NaN / out-of-range (see emit).
+// `as` is numeric-only for now: a non-numeric operand OR target is a type error.
+// The cast expression's type is exactly `T`.
+function checkCastNode(n: AsExpr, ix: i32) {
+  const arg = checkNode(n.asObj)
+  const target = nameToTyAt(n.asTy, ix)
+  if target < 0 {
+    tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
+    return TY_ERR
+  }
+  // The TARGET must be a concrete numeric scalar (strict — `primNameOf` skips
+  // arrays/objects/unions/type-vars). The OPERAND uses the tolerant `isNumeric`
+  // (true for `TyErr`), so an already-errored operand does not pile on a second
+  // diagnostic here.
+  const tn = primNameOf(target)
+  const targetIsScalar = tn == "i32" ||
+    tn == "i64" ||
+    tn == "f32" ||
+    tn == "f64"
+  if !isNumeric(arg) || !targetIsScalar {
+    tErr("`as` supports numeric conversions only", ix)
+    return TY_ERR
+  }
+  target
+}
+
 // ── unary ──────────────────────────────────────────────────────────────────
 
 // Extracted from `checkNodeReal`'s `Unary` arm (C3: thin the dispatcher).
