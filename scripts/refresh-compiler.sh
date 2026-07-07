@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# FAST seed refresh — rebuild `build/vl-compiler.wasm` from the CURRENT
-# compiler/*.vl source by SELF-COMPILING with the existing healthy seed (~3s).
+# Seed refresh — rebuild `build/vl-compiler.wasm` from the CURRENT
+# compiler/*.vl source by SELF-COMPILING with the existing healthy seed (~40s).
 # The native-fixpoint gate (stage3 == stage4) proves the refreshed seed is a
 # faithful fixed point, so it is a drop-in for every consumer (`vl … --compiler`,
 # the native test suites, native-fixpoint.sh).
