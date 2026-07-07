@@ -14,12 +14,29 @@
 # So known issues are committed and burned down over time; the invariant is that we never
 # ADD a failure or silently worsen one. When the baseline empties, the fuzzer is at true zero.
 #
+# SOUNDNESS IS NEVER BASELINEABLE: only REJECT (a loud parse/type/emit refusal) may ever appear
+# in the baseline. INVALID-WASM / TRAP / MISMATCH are miscompiles — silently pinning one as
+# "known" would suppress a real bug from CI with no objection. This is enforced below, not just
+# documented: a baseline line tagged with an unsound class fails the check immediately.
+#
 # Regenerate after a fix (or a scripts/fuzzgen.vl change): this script prints the exact
 # NEW/STALE deltas to apply. Requires a fresh seed: bash scripts/refresh-compiler.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BASELINE="${BASELINE:-scripts/rep-fuzz-baseline.txt}"
+
+# Soundness ratchet: reject any baselined line whose class isn't REJECT, before spending any
+# time on the fuzz run itself. See the header note above.
+unsound_baseline="$(grep -P '^(INVALID-WASM|TRAP|MISMATCH)\t' "$BASELINE" 2>/dev/null || true)"
+if [ -n "$unsound_baseline" ]; then
+  echo "✗ unsound classes (INVALID-WASM/TRAP/MISMATCH) are never baselineable — fix the miscompile or convert it to a loud REJECT:"
+  echo "$unsound_baseline" | sed 's/^/    ! /'
+  echo
+  echo "rep-fuzz-check: FAILED — $BASELINE contains a non-REJECT class; see message above."
+  exit 1
+fi
+
 # seed count depth — the broad net. Must match the header note in the baseline file.
 SEEDS=(
   "101 150 3" "202 150 4" "303 150 4"
