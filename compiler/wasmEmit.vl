@@ -516,6 +516,7 @@ import {
   unionMemberSetOf,
   unionNameOfExpr,
   unionNameOfIdent,
+  unionRefArrayArmSlotForElem,
   variantFieldElemName,
   variantFieldIndex,
   variantFieldRefSlot,
@@ -1845,6 +1846,85 @@ function emitMapUnionUnboxRead(
 // value union OR a struct union with a `null` member); a raw scalar/string boxes
 // as its atom's tag + payload. A struct union's object literal falls through to
 // the normal lowering (`emitUnionBox` boxes it via the `uDeclared` path).
+// Route a list LITERAL flowing into a union whose matching arm is a UNION-BOX-ELEMENT
+// ref-array (`(i32 | string)[] | {w: i32}`, `N[] | {w: i32}` over `type N = i32 | string`,
+// `(C | D)[] | {w: i32}`) through that ARM's build: thread `pendingListKind = 2` + the arm's
+// reflist slot so `emitArr` boxes each element into the union box (the same threading an
+// annotated `let x: (i32|string)[] = [...]` binding does), then tag the wrapper with the
+// arm's slot tag. Needed because the literal's OWN classification is a SCALAR list
+// (`["a"]` → `string[]`) or a concrete struct list (`[{a:1}]` → `C[]`) — neither interns
+// the arm's slot, so `emitUnionCoerce`'s slot-match path misses and the literal either
+// mis-boxed through the value-atom ladder (tag `string[]`, every `is` against the arm
+// silently FALSE — a live miscompile) or emitted a RAW wrapper into the box-typed slot
+// (invalid wasm). The union's OWN value-atom list arm still wins (`i32[] | (i32|string)[]`
+// boxes `[1]` as the exact `i32[]` atom — the ladder's job), guarded by `unionHasAtom`.
+// Returns 1 = handled (boxed + tagged), 0 = not applicable (caller continues), -1 = error.
+function emitUnionListLitViaRefArm(
+  body: i32[],
+  unionName: string,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  if unionName == "" { return 0 }
+  const bare = P.nodes[unwrapParen(exprIx)]
+  if bare is ArrayLit {
+    // Classify the FIRST element's member ATOM (the arm-choice key; each element still
+    // coerces independently inside the build). An element this static probe cannot name
+    // (a nested list / map) bails to the caller's existing paths.
+    let elemAtom = ""
+    if bare.arrElems.length >= 1 {
+      const e0 = bare.arrElems[0]
+      if exprArray(e0, fnIx) || exprRefArray(e0, fnIx) || exprMap(e0, fnIx) {
+        return 0
+      }
+      if exprString(e0, fnIx) {
+        elemAtom = "string"
+      } else if exprIsBool(e0, fnIx) {
+        elemAtom = "boolean"
+      } else if exprIsF64(e0, fnIx) {
+        elemAtom = "f64"
+      } else if exprIsI64(e0, fnIx) {
+        elemAtom = "i64"
+      } else {
+        const e0b = P.nodes[unwrapParen(e0)]
+        if e0b is ObjLit {
+          elemAtom = objVariantName(unwrapParen(e0))
+          if elemAtom == "" { return 0 }
+        } else {
+          elemAtom = "i32" // the ladder's own integer default
+        }
+      }
+      // The union's own value-atom LIST arm is the exact match — let the ladder box it.
+      if unionHasAtom(unionName, elemAtom + "[]") { return 0 }
+    } else {
+      // An EMPTY `[]`: only route when NO value-atom list arm could claim it.
+      if (
+        unionHasAtom(unionName, "i32[]") ||
+        unionHasAtom(unionName, "boolean[]") ||
+        unionHasAtom(unionName, "string[]") ||
+        unionHasAtom(unionName, "f64[]") ||
+        unionHasAtom(unionName, "i64[]")
+      ) {
+        return 0
+      }
+    }
+    const armSlot = unionRefArrayArmSlotForElem(unionName, elemAtom)
+    if armSlot < 0 { return 0 }
+    fbI32Const(refArrSlotTag(armSlot))
+    const savedK = pendingListKind
+    const savedS = pendingListSlot
+    pendingListKind = 2
+    pendingListSlot = armSlot
+    const rc = emitExpr(body, exprIx, fnIx)
+    pendingListKind = savedK
+    pendingListSlot = savedS
+    if rc < 0 { return -1 }
+    fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
+    return 1
+  }
+  0
+}
+
 export function emitUnionCoerce(
   body: i32[],
   unionNameIn: string,
@@ -1928,6 +2008,12 @@ export function emitUnionCoerce(
       fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
       return 0
     }
+    // A ref-array LITERAL whose own slot mismatches (`[{a:1}]` self-classifies as the
+    // concrete `C[]` while the arm is `(C | D)[]`): route it through the union-box-element
+    // arm's build if one admits its element.
+    const viaArm = emitUnionListLitViaRefArm(body, unionName, exprIx, fnIx)
+    if viaArm < 0 { return -1 }
+    if viaArm == 1 { return 0 }
     // A ref-element array carrier whose interned slot matches NO ref-array arm of the union —
     // e.g. a nested int-array literal `[[50183]]` (inferred `i32[][]`, element slot `i32[]`) flowing
     // into an `i64[][] | …` arm (element slot `i64[]`): the leaf scalar would have to WIDEN, which the
@@ -1969,6 +2055,15 @@ export function emitUnionCoerce(
       return 0
     }
   }
+  // A SCALAR-element list literal (`["a"]`, `[1]` — invisible to `exprRefArray`) whose union
+  // arm is a union-box-element ref-array (`(i32 | string)[] | {w: i32}`): route it through the
+  // arm's build + tag. Checked BEFORE the value-atom gate/ladder below — the gate would emit
+  // the RAW wrapper into the box slot (invalid wasm) and the ladder would tag the box with the
+  // scalar-list atom (`string[]`) instead of the arm's slot tag, so every `is` against the arm
+  // was silently FALSE (the live-miscompile half of this family).
+  const viaListArm = emitUnionListLitViaRefArm(body, unionName, exprIx, fnIx)
+  if viaListArm < 0 { return -1 }
+  if viaListArm == 1 { return 0 }
   if unionName == "" || !unionHasValueAtom(unionName) {
     return emitExpr(body, exprIx, fnIx)
   }

@@ -9719,37 +9719,31 @@ export function isInferLetNulBool(letIx: i32) {
 // empty-ref-array-literal return path.
 export function splitUnionAtoms(name: string, out: string[]) {
   let cur = ""
-  // `depth` (braces/brackets only) drives `|` splitting — unchanged legacy behavior. `pdepth`
-  // ALSO counts parens, so a TOP-LEVEL `=>` (a function type whose return follows) is detected:
-  // `(i32) => i32 | string` is ONE function-type member (the `|` binds to the RETURN), whereas
-  // `((i32) => i32) | string` splits (the arrow is nested, the `|` at the top level). Without
-  // this a closure-returning-union name split into a bogus `(i32) => i32` + `string` union.
-  let depth = 0
+  // `pdepth` counts ALL groupers — braces, brackets, AND parens — and gates BOTH the `|`
+  // splitting and the top-level-`=>` detection. Paren-aware splitting keeps a paren-GROUPED
+  // arm whole: `(i32 | string)[] | {w: i32}` splits to `(i32 | string)[]` + `{w: i32}` (the
+  // legacy brace/bracket-only depth mis-split it into the garbage atoms `(i32` + `string)[]`,
+  // so the WHOLE union mis-classified — the binding silently dropped its union rep and every
+  // `is` against the list arm const-folded FALSE, a live miscompile). A paren-grouped closure
+  // member (`((i32) => A | B) | f64`) needs no special casing anymore: its return's `|` sits
+  // at `pdepth >= 1`. Quoted litunion members are skipped verbatim (`inStr`) so a grouper or
+  // `|` INSIDE a string-literal atom (`"(a" | "b"`) neither splits nor derails the depth.
   let pdepth = 0
-  // The paren depth of the nearest enclosing PARENTHESIZED-closure group whose return we are
-  // scanning (0 = not inside one). A closure member spelled `(… => …)` — the ONLY way a
-  // top-level `=>` lands inside parens — is a SINGLE atom, so a `|` in its return
-  // (`((i32) => A | B) | f64`, `((i32) => {f}[] | {w}) | f64`) must NOT split. Scoped to
-  // closures so a paren-grouped NON-closure element union (`(i32 | string)[]`, `(f64 | {w})[]`)
-  // keeps its legacy brace-only splitting — a separate rep family, untouched here.
-  let cloParen = 0
+  let inStr = false
   let i = 0
   while i < name.length {
     const c = name[i]
-    if c == '{' || c == '[' {
-      depth = depth + 1
+    if inStr {
+      if c == '"' { inStr = false }
+      cur = cur + fromCodePoint(c)
+    } else if c == '"' {
+      inStr = true
+      cur = cur + fromCodePoint(c)
+    } else if c == '{' || c == '[' || c == '(' {
       pdepth = pdepth + 1
       cur = cur + fromCodePoint(c)
-    } else if c == '}' || c == ']' {
-      depth = depth - 1
+    } else if c == '}' || c == ']' || c == ')' {
       pdepth = pdepth - 1
-      cur = cur + fromCodePoint(c)
-    } else if c == '(' {
-      pdepth = pdepth + 1
-      cur = cur + fromCodePoint(c)
-    } else if c == ')' {
-      pdepth = pdepth - 1
-      if cloParen != 0 && pdepth < cloParen { cloParen = 0 }
       cur = cur + fromCodePoint(c)
     } else if (c == '=' && i + 1 < name.length && name[i + 1] == '>') {
       if pdepth == 0 {
@@ -9758,16 +9752,9 @@ export function splitUnionAtoms(name: string, out: string[]) {
         cur = cur + name.slice(i, name.length)
         i = name.length
       } else {
-        // A closure arrow nested inside groupers. Mark its group ONLY when the enclosing nesting
-        // is PARENS alone (`depth == 0`) — a paren-grouped closure UNION MEMBER `(… => …)` whose
-        // return `|` would otherwise look top-level. A closure inside braces/brackets (a struct
-        // field / map value / list element, `depth > 0`) already has its return `|` suppressed by
-        // the `depth == 0` split guard, so it must NOT arm `cloParen` (that would swallow the
-        // real top-level `|` after the brace closes — `{[string]: (i32) => boolean} | f64`).
-        if cloParen == 0 && depth == 0 { cloParen = pdepth }
         cur = cur + fromCodePoint(c)
       }
-    } else if depth == 0 && cloParen == 0 && c == '|' {
+    } else if pdepth == 0 && c == '|' {
       out.push(cur)
       cur = ""
     } else {
@@ -9783,33 +9770,28 @@ export function splitUnionAtoms(name: string, out: string[]) {
 // bare name). Counts separators without materializing the atom strings.
 export function unionMemberCount(name: string) {
   let n = 1
-  let depth = 0
+  // All-grouper depth + quoted-atom skipping, the counting dual of `splitUnionAtoms`
+  // (paren-aware, so a paren-GROUPED arm's inner `|` is not a separator).
   let pdepth = 0
-  // Nearest enclosing parenthesized-closure group (0 = none) — the dual of `splitUnionAtoms`'s
-  // `cloParen`, so a `|` inside a closure member's return is not counted as a separator.
-  let cloParen = 0
+  let inStr = false
   let i = 0
   while i < name.length {
     const c = name[i]
-    if c == '{' || c == '[' {
-      depth = depth + 1; pdepth = pdepth + 1
-    } else if c == '}' || c == ']' {
-      depth = depth - 1; pdepth = pdepth - 1
-    } else if c == '(' {
+    if inStr {
+      if c == '"' { inStr = false }
+    } else if c == '"' {
+      inStr = true
+    } else if c == '{' || c == '[' || c == '(' {
       pdepth = pdepth + 1
-    } else if c == ')' {
+    } else if c == '}' || c == ']' || c == ')' {
       pdepth = pdepth - 1
-      if cloParen != 0 && pdepth < cloParen { cloParen = 0 }
     } else if (c == '=' && i + 1 < name.length && name[i + 1] == '>') {
       if pdepth == 0 {
         // A top-level `=>` — the rest is the function RETURN (one member); stop counting so
         // `(i32) => i32 | string` is ONE function type, not a 2-member union.
         return n
       }
-      // A PAREN-grouped closure member (`depth == 0`) — mark its group so its return `|` is not
-      // a separator. A brace/bracket-nested closure (`depth > 0`) needs no marking.
-      if cloParen == 0 && depth == 0 { cloParen = pdepth }
-    } else if depth == 0 && cloParen == 0 && c == '|' {
+    } else if pdepth == 0 && c == '|' {
       n = n + 1
     }
     i = i + 1
