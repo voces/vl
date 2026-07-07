@@ -90,16 +90,21 @@ different aliases (`ParseError = { at: i32, msg: string }`), and a function that
 can fail two ways returns `T | IoError | ParseError` — a plain union, each arm
 `is`-narrowed.
 
-### `panic(msg)` — the blessed trap-with-message
+### `__trap__(msg)` — the trap grows a reason (no new name)
 
 std-design.md OD2 asks whether to keep the bare `__trap__()` or grow a richer
-primitive. This doc resolves it: bless **`panic(msg: string): never`** as the
-trap surface, subsuming `__trap__`. It lowers to the same `unreachable`, but the
-message is emitted to the host boundary first (like `__log_string__` then
-`unreachable`), so a bug aborts with a *reason a human can read* instead of a
-bare trap. `__trap__` stays as the raw intrinsic floor; `panic` is the std-level
-name programs and `std:test` use. This keeps "traps are for bugs" ergonomic:
-asserting an invariant reads `if !ok { panic("unreachable: registry desynced") }`.
+primitive. Owner ruling (2026-07): **extend the existing intrinsic** with an
+optional message — `__trap__("unreachable: registry desynced")` — rather than
+bless a new `panic` identifier or a keyword. VL deliberately has **no intrinsic
+functions outside the `__dunder__` convention**; `panic` would have been the
+first bare intrinsic name, and a keyword is heavier machinery (reserved word,
+parser production) than an abort path warrants. `__trap__(msg)` lowers as
+message-to-host-boundary (like `__log_string__`) then the same `unreachable`,
+so a bug aborts with a *reason a human can read*; bare `__trap__()` is
+unchanged. The dunder spelling doubles as a signal: traps are for bugs, so the
+call *should* look like the raw floor of the language, not an ergonomic API.
+If a friendlier spelling is ever wanted, it can be a plain std wrapper decided
+separately — nothing here forecloses it.
 
 ## Examples
 
@@ -251,7 +256,7 @@ early-return sugar every one of these languages provides (`?`/`try`).
 rep family the Phase-2 rep rewrite is still burning down (R3b / R7). So:
 
 1. **Now:** this doc lands as the decided direction. std stays total (D1):
-   `std:fmt`/`std:array`/`std:test` never return `T | E`; failures `panic`.
+   `std:fmt`/`std:array`/`std:test` never return `T | E`; failures trap.
 2. **After R3b/R7 land** (the struct-in-union rep family is solid): fallible std
    APIs become buildable. `std:fs`/`std:io` ship `T | IoError` surfaces. This is
    an *implementation-order* constraint, not a paper blocker — std-design.md's
@@ -260,7 +265,7 @@ rep family the Phase-2 rep rewrite is still burning down (R3b / R7). So:
 3. **Follow-up (charter below):** the `?` propagation operator, once real
    chains prove the ladder boilerplate.
 
-`panic(msg)` can land independently of the rep work (it is a message + the
+`__trap__(msg)` can land independently of the rep work (it is a message + the
 existing `__trap__`), and resolves OD2 whenever convenient.
 
 ### Chartered follow-up: union-`as` propagation
@@ -327,7 +332,7 @@ the operand decides.
   arm; a miss is a bug" form, usable in `main`/top-level where there is no caller
   to propagate to. Possibly a bare `x!` shorthand for the `T | null` case
   (`x!` ≡ `x as! (T where the null arm is dropped)`). *Open:* is `as!` worth it
-  over an explicit `if !(x is T) { panic(...) }`?
+  over an explicit `if !(x is T) { __trap__(...) }`?
 - **(b) User-defined cast functions — `as(self: A): B`.** A UFCS-style operator
   overload: defining `as(self: string): i32 | ParseError` makes `s as i32`
   resolve to it. The composition is the payoff: a user cast returning
@@ -351,8 +356,10 @@ the operand decides.
 - **O3 — error shape.** `IoError = { code: i32, msg: string }` as a named
   *structural* alias (convention-with-a-name), vs any other shape. Is `code`
   (raw WASI errno) + `msg` the right two fields, or add a `kind` tag?
-- **O4 — `panic(msg)`.** Adopt as the blessed trap-with-message subsuming
-  `__trap__` (resolves std-design.md OD2)?
+- **O4 — trap-with-message.** ~~Adopt `panic(msg)`?~~ **Ruled (2026-07):
+  extend `__trap__` with an optional message instead — no new intrinsic name
+  (VL keeps intrinsics dunder-only, on purpose), no keyword. Resolves
+  std-design.md OD2.**
 - **O5 — union-`as` propagation charter.** Accept union-`as` (`x as T` narrows or
   early-returns the remainder) as the chartered propagation mechanism under the
   unified `as` principle (numeric casts convert-and-trap, do not propagate) —

@@ -114,8 +114,8 @@ and streams — deserves its own deep-dive BEFORE std grows fallible APIs
 `T | E` with a structural `IoError` alias), no catchable throw in v1, `exnref`
 reserved for a possible async era, Go multi-value returns ruled out, union-`as`
 propagation chartered as follow-up, and fallible std sequenced after the R3b/R7
-rep family. That doc also proposes `panic(msg)` subsuming `__trap__` (OD2).
-Until it lands, std surfaces only total functions + `__trap__`/`panic` aborts,
+rep family. That doc also resolves OD2: `__trap__` grows an optional message\n(`__trap__(msg)`); no new `panic` name (intrinsics stay dunder-only).
+Until it lands, std surfaces only total functions + `__trap__` aborts,
 so nothing here pre-commits the answer.
 
 `print` STAYS a builtin through Phase 2 (the §LS.3 migration to a `std:fmt`
@@ -333,8 +333,10 @@ Dependencies: 0 and 1 independent; 2 independent of 3; 3 needs 1; 4 needs
 
 - **OD1 — release packaging**: ship `std/` beside the binary vs `include_str!`
   into the Rust host at release build. (Dev tree unaffected either way.)
-- **OD2 — `__trap__` now** vs waiting for a richer `panic(msg)`. Recommended:
-  add `__trap__` now; `panic` subsumes it later.
+- **OD2 — `__trap__` now** vs waiting for a richer `panic(msg)`. RESOLVED
+  (error-handling-design.md, 2026-07): `__trap__` stays and grows an optional
+  message arg (`__trap__(msg)`); no separate `panic` name — intrinsics stay
+  dunder-only.
 - **OD3 — failure mode**: record-print-trap (one failure per TEST, jest
   semantics) is chosen; a collect-all-expectations mode is a v2 runner policy.
 - **OD4 — LSP go-to-def into std**: workspace-`std/`-only navigation for v1.

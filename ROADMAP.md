@@ -108,12 +108,12 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   growth stops; conversion waits for the TS-tier teardown).
 - ⬜ **Error-handling design** — DRAFTED, pending owner review: `docs/error-handling-design.md`
   (errors-as-values via unions — `T | null` for absence, `T | E` with a structural `IoError`
-  alias for reasoned failure, traps/`panic(msg)` for bugs; no catchable throw in v1, `exnref`
+  alias for reasoned failure, traps (`__trap__(msg)`) for bugs; no catchable throw in v1, `exnref`
   reserved for a possible async era, Go-style multi-value returns ruled out; union-`as`
   propagation (`x as T` narrows-or-early-returns the remainder, under a unified `as`
   principle) chartered as follow-up; fallible std sequenced after the R3b/R7 rep family). Settles the
   failure story BEFORE std grows fallible APIs (`std:fs`, parsing). Until it lands, std ships
-  only total functions + `__trap__`/`panic` aborts (std-design D1). Seven open questions (O1–O7)
+  only total functions + `__trap__` aborts (std-design D1). Seven open questions (O1–O7)
   flagged for the maintainer.
 - **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
   the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does
