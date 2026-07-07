@@ -92,6 +92,12 @@ can fail two ways returns `T | IoError | ParseError` — a plain union, each arm
 
 ### `__trap__(msg)` — the trap grows a reason (no new name)
 
+**Status: LANDED (2026-07).** `__trap__("reason")` compiles: the message rides
+the print-of-string path (`__print_char__` … `__print_str_flush__`) to the host
+boundary, then the same `unreachable`. Bare `__trap__()` is byte-identical to
+before. `std:test` still uses the bare form — threading messages through it is a
+follow-up.
+
 std-design.md OD2 asks whether to keep the bare `__trap__()` or grow a richer
 primitive. Owner ruling (2026-07): **extend the existing intrinsic** with an
 optional message — `__trap__("unreachable: registry desynced")` — rather than

@@ -336,7 +336,8 @@ Dependencies: 0 and 1 independent; 2 independent of 3; 3 needs 1; 4 needs
 - **OD2 — `__trap__` now** vs waiting for a richer `panic(msg)`. RESOLVED
   (error-handling-design.md, 2026-07): `__trap__` stays and grows an optional
   message arg (`__trap__(msg)`); no separate `panic` name — intrinsics stay
-  dunder-only.
+  dunder-only. LANDED 2026-07: `__trap__("reason")` prints the message through
+  the print-of-string path, then `unreachable`; bare `__trap__()` unchanged.
 - **OD3 — failure mode**: record-print-trap (one failure per TEST, jest
   semantics) is chosen; a collect-all-expectations mode is a v2 runner policy.
 - **OD4 — LSP go-to-def into std**: workspace-`std/`-only navigation for v1.
