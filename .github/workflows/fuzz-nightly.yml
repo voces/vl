@@ -1,0 +1,134 @@
+# Nightly randomized-seed rep-composition fuzz sweep (Phase 0 item 3,
+# docs/internals/codebase-audit-2026-07.md): scripts/rep-fuzz-check.sh (the `ci-native` gate) only
+# ever samples the same 16 FROZEN seeds — proven three times now to under-cover the shape space
+# (fresh seeds find unsound output at roughly 1 per ~200 programs even after the pinned net is
+# clean). This workflow runs scripts/fuzz-nightly.sh against a FRESH batch of random seeds every
+# night, so coverage grows over time instead of staying pinned to the same net forever.
+#
+# Host + seed build mirrors the `ci-native` job in ci.yml (same steps, same cache keys) so this
+# workflow benefits from the same warm caches and never drifts from how the native toolchain is
+# normally built.
+#
+# Outcome:
+#   - any non-baselined INVALID-WASM / TRAP / MISMATCH -> job FAILS, prints the shape + the exact
+#     `scripts/fuzz-vl.sh --seed S --count C --depth D` repro, uploads the --keep dirs (failing
+#     .vl cases + .err files) as an artifact.
+#   - non-baselined REJECT only (or nothing new)       -> job SUCCEEDS, report-only: a shape-family
+#     summary lands in the job summary; artifacts are still uploaded for inspection.
+#
+# The chosen seeds are printed early in the log (scripts/fuzz-nightly.sh), so any run — nightly or
+# a workflow_dispatch — is reproducible from the log alone.
+
+name: fuzz-nightly
+
+on:
+  schedule:
+    # 09:17 UTC — off-peak for both US and EU working hours; minute offset away from :00 to dodge
+    # the top-of-hour GitHub Actions cron pile-up.
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Number of fresh random seeds to sample"
+        required: false
+        default: "10"
+      count:
+        description: "Programs generated per seed"
+        required: false
+        default: "200"
+      depths:
+        description: "Space-separated depths, cycled round-robin across seeds"
+        required: false
+        default: "4 5 6"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # deno serves only scripts/refresh-compiler.sh's own tooling needs (none directly here) —
+      # kept for parity with ci-native's seed-refresh path, which assumes deno is on PATH for
+      # scripts/fetch-seed.sh's cold-cache fallback tooling.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Cache Deno modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            deno-${{ runner.os }}-
+
+      # Mirrors ci.yml's ci-native job: rustc version in the cache key so a toolchain bump is a
+      # clean miss (rebuild once, resave) instead of a stale-restore/never-resave trap.
+      - name: Rustc version (cargo cache key)
+        id: rustc
+        run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo + vl-host target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            scripts/vl-host/target
+          key: cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock') }}-${{ hashFiles('scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock') }}-
+            cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-
+            cargo-${{ runner.os }}-
+
+      - name: Cache vl-host binary
+        id: vlbin
+        uses: actions/cache@v4
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: vl-bin-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}
+
+      - name: Build vl-host (native tool)
+        if: steps.vlbin.outputs.cache-hit != 'true'
+        run: cargo build --release
+        working-directory: scripts/vl-host
+
+      - name: Cache seed compiler wasm
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.cwasm
+          key: vl-seedpair-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
+          restore-keys: |
+            vl-seedpair-${{ runner.os }}-
+
+      - name: Refresh seed + native fixpoint (self-reproduction ladder)
+        run: ./scripts/refresh-compiler.sh --prove-fixpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Nightly fuzz sweep (fresh random seeds)
+        id: fuzz
+        run: |
+          ./scripts/fuzz-nightly.sh \
+            --seeds "${{ inputs.seeds || '10' }}" \
+            --count "${{ inputs.count || '200' }}" \
+            --depths "${{ inputs.depths || '4 5 6' }}" \
+            --baseline scripts/rep-fuzz-baseline.txt \
+            --out-dir /tmp/fuzz-nightly-out
+
+      - name: Upload fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-nightly-findings
+          path: |
+            /tmp/fuzz-nightly-out/seed_*.tsv
+            /tmp/fuzz-nightly-out/keep_*/
+            /tmp/fuzz-nightly-out/summary.md
+          if-no-files-found: ignore
+          retention-days: 14
