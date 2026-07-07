@@ -2303,6 +2303,16 @@ export function mvValKindOfName(valName: string): i32 {
       if nvk < 0 || nvk >= 7 { return -3 }
       na = na + 1
     }
+    // A nullable value name that is NOT a boxing value union — after the niche and
+    // ref-member arms above, exactly the `string | null` NICHE (one string member +
+    // null; `isValueUnionName` deliberately excludes it, so NO shared value box is
+    // ever minted for it). The union arm below would still claim it as kind 2 and
+    // every box site then referenced the unminted box type (index 0 — invalid wasm
+    // on any store). Its honest rep is a nullable string slot with `??` preserving
+    // a stored null — not expressible on the kind-3 string-map path (whose fused
+    // `?? d` read `ref.as_non_null`s a hit, TRAPPING on a stored null). Reject
+    // loudly until the recursive-rep map value lands.
+    if !isValueUnionName(valName) { return -3 }
   }
   let kind = -1
   if valName == "string" {
@@ -2318,10 +2328,13 @@ export function mvValKindOfName(valName: string): i32 {
   } else if valName == "f32" {
     // An f32-valued map: the scalar f32 list (`$fl32TypeIdx`/`$fa32TypeIdx`); valStash f32.
     kind = 13
-  } else if nameIsMap(valName) {
+  } else if nameIsMap(valName) && !nameIsMapMemberUnion(valName) {
     // A NESTED map (`{[string]: {[string]: V}}`): the value is an INNER map struct ref,
     // stored in a ref list whose element kind is 3 (a map element → the inner map struct).
     // Reuses the SAME ref-value spine as a struct-valued map; only the element heap differs.
+    // The member-union guard keeps a map-FIRST union value (`{[string]: i32} | f64` — a name
+    // `nameIsMap` matches but which is a union BOX, not a nested map) out of this arm, so it
+    // reaches the union arm below (where a map MEMBER is rejected loudly — see there).
     //
     // EXCEPT a nested map whose inner-value chain bottoms out in a ref LIST whose element is
     // itself a MAP or a NULLABLE (`{[string]: {[string]: {[string]: f32}[]}}` — a list of
@@ -2359,6 +2372,21 @@ export function mvValKindOfName(valName: string): i32 {
     // value, only the element heap + the store-coerce / read-classify differ. Covers a VALUE
     // union (`{[string]: i32 | string}`), a STRUCT / heterogeneous union (`{[string]: C | S}`),
     // and a union ALIAS (`type Shape = C | S`; `unionMemberSetOf` expands it before the count).
+    //
+    // EXCEPT a union with a MAP member (`{[string]: {[string]: i32} | f64}`): a map arm boxes
+    // fine in BINDING position (`markMapUnionArms` + `mapSlotTag`), but the map-VALUE store /
+    // read seams (`emitMapSetV` / `emitMapGetOr` / the push-val path) coerce THIS value through
+    // `emitUnionBoxArg`, which has no map-member arm — the raw value (the scalar arm's f64, the
+    // map arm's struct ref) is written UNBOXED into the `(ref null $uBox)` vals element:
+    // invalid wasm on every store. Reject loudly until the union-box coerce seams resolve map
+    // members at the map-value position (Phase 2's recursive rep).
+    const mapArmAtoms: string[] = []
+    splitUnionAtoms(unionMemberSetOf(valName), mapArmAtoms)
+    let maa = 0
+    while maa < mapArmAtoms.length {
+      if nameIsMap(mapArmAtoms[maa]) { return -3 }
+      maa = maa + 1
+    }
     kind = 2
   } else if annArrowAt(valName) >= 0 {
     // A FUNCTION-valued map (`{[string]: (i32) => i32}`): each value is a closure fat-pointer
@@ -7638,6 +7666,68 @@ export function nameFieldCode(t: string) {
 // `structIndexOfObj`, and `S|null` returns/params resolve their base shape.
 // Idempotent per field-name set; a module with no inline object annotation interns
 // nothing (byte-identical goldens).
+// Split union name `nm` on TOP-LEVEL `|`, tracking ALL grouper depth — braces, brackets, AND
+// parens (plus string-literal atoms, so a quoted litunion member never splits) — appending the
+// arms to `out`. The paren-aware sibling of `splitUnionAtoms` (whose brace/bracket-only depth
+// mis-splits a `(...)`-grouped arm): used ONLY by `internShapeDeep`'s union-arm interning, where
+// a grouped arm must stay whole (`(i32|null)[] | null` → `(i32|null)[]` + `null`; a struct arm
+// with a grouped element list `{f: (boolean|string)[]} | f64` splits at its real top seam). A
+// TOP-LEVEL `=>` absorbs the rest of the name into the current arm, exactly like
+// `splitUnionAtoms`: `(i32) => i32 | {w: i32}` is ONE function-type atom whose `|` binds to the
+// RETURN (splitting it interned a bogus `{w: i32}` struct arm — a shape-order side effect that
+// regressed the pinned net). A name with no top-level `|` appends one arm.
+function splitUnionArmsAllDepth(nm: string, out: string[]) {
+  let depth = 0
+  let inStr = false
+  let start = 0
+  let i = 0
+  while i < nm.length {
+    const c = nm[i]
+    if inStr {
+      if c == '"' { inStr = false }
+    } else if c == '"' {
+      inStr = true
+    } else if c == '{' || c == '[' || c == '(' {
+      depth = depth + 1
+    } else if c == '}' || c == ']' || c == ')' {
+      depth = depth - 1
+    } else if (
+      c == '=' &&
+      depth == 0 &&
+      i + 1 < nm.length &&
+      nm[i + 1] == '>'
+    ) {
+      // Top-level function arrow: the remainder (its return, `|`s included) is this arm's.
+      break
+    } else if (c == '|' && depth == 0) {
+      out.push(nm.slice(start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out.push(nm.slice(start, nm.length))
+  0
+}
+
+// Intern each union arm whose CORE (trailing `[]`s peeled) is an INLINE `{…}` shape (a struct or
+// map arm) via `internShapeDeep` — the shared body of the paren-free and paren-carrying splits.
+function internShapeArms(arms: string[]) {
+  let uai = 0
+  while uai < arms.length {
+    let uCore = arms[uai]
+    while (
+      uCore.length > 2 &&
+      uCore[uCore.length - 2] == '[' &&
+      uCore[uCore.length - 1] == ']'
+    ) {
+      uCore = uCore.slice(0, uCore.length - 2)
+    }
+    if uCore.length >= 1 && uCore[0] == '{' { internShapeDeep(arms[uai]) }
+    uai = uai + 1
+  }
+  0
+}
+
 // Recursively peel the COMPOSITION wrappers off a type name — grouping parens, a trailing `| null`, and
 // trailing `[]` suffixes, in any order and to any depth — interning the inline-shape STRUCT reached at the
 // bottom (`internInlineShape` then recurses into the shape's own fields). Reaches a shape however deeply it
@@ -7664,30 +7754,27 @@ export function internShapeDeep(nm: string) {
   // `collectAnnShapes`, BEFORE the literal that carries it is seen by `collectAnonShapes` (which would
   // otherwise name the same shape `#anonN`, leaving the union-arm's name-based `refArrElemName` /
   // `unionHasRefArrayArmSlot` lookup unable to find the reflist slot the literal interns — a silent
-  // fall-through to scalar-boxing, invalid wasm). Gated on a PAREN-FREE name: `splitUnionAtoms` splits
-  // `|` on brace/bracket depth only (NOT parens), so a `(...)`-grouped arm (`(i32|null)[] | null`, a
-  // closure-array union) MIS-splits — and those arms already have a working rep via the array/paren
-  // descent below. Restricting to `{`-CORE arms of a paren-free union both avoids that mis-split and
-  // leaves the grouped reps untouched. A single-arm (non-union) name splits to one atom and skips this.
+  // fall-through to scalar-boxing, invalid wasm). A PAREN-FREE name splits via `splitUnionAtoms`
+  // (its legacy brace/bracket-depth behavior, kept byte-identical) and RETURNS — the descent below
+  // is for non-union names. A PAREN-CARRYING name (`{f: (boolean | string)[]} | f64` — a struct arm
+  // whose FIELD groups a union element) previously skipped arm interning entirely (`splitUnionAtoms`
+  // is paren-blind, so a `(...)`-grouped arm mis-splits): its `{`-cored arm then interned only
+  // LAZILY at emit, AFTER `collectA`'s type-index assignment, so the arm's ref-list FIELD element
+  // (`boolean|string`) had no interned slot and `pushFieldStorage` read `rlWrapIdx` out of bounds —
+  // a compiler CRASH (empty table) or a wrong wrapper. Split those on ALL-grouper depth (parens
+  // included, so grouped arms stay whole), intern the `{`-cored arms, then FALL THROUGH to the
+  // legacy paren descent (closure unions etc. keep their existing path).
   if !strContains(nm, "(") {
     const uArms: string[] = []
     splitUnionAtoms(nm, uArms)
     if uArms.length > 1 {
-      let uai = 0
-      while uai < uArms.length {
-        let uCore = uArms[uai]
-        while (
-          uCore.length > 2 &&
-          uCore[uCore.length - 2] == '[' &&
-          uCore[uCore.length - 1] == ']'
-        ) {
-          uCore = uCore.slice(0, uCore.length - 2)
-        }
-        if uCore.length >= 1 && uCore[0] == '{' { internShapeDeep(uArms[uai]) }
-        uai = uai + 1
-      }
+      internShapeArms(uArms)
       return 0
     }
+  } else {
+    const pArms: string[] = []
+    splitUnionArmsAllDepth(nm, pArms)
+    if pArms.length > 1 { internShapeArms(pArms) }
   }
   if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
     return internShapeDeep(nm.slice(0, nm.length - 2))
@@ -8592,6 +8679,51 @@ export function unionMapArmIdent(exprIx: i32, fnIx: i32) {
   if e is Ident {
     const un = unionNameOfIdent(e.identName, fnIx)
     if un != "" { return unionHasMapArm(un) }
+  }
+  false
+}
+
+// True if `exprIx` is a MEMBER read (`t[i].f`) whose object indexes an IDENT declared as a
+// union with a REF-ARRAY arm whose ELEMENT struct's field `.f` is a MAP (code 19) — the
+// struct-field-map receiver shape (`t[i].f[k] ?? d` after an `is S[]` narrow) the frame
+// pre-pass must reserve the map scratch for. Narrowing-blind, like `unionMapArmIdent`: the
+// `is`-narrow that makes `t[i]` a struct is not active in the pre-pass, so `exprMap`'s
+// `memFieldTypeCode` resolution misses the receiver and the map read then clobbered the i32
+// scratch slots with map refs — invalid wasm. (An over-reservation is a harmless spare.)
+export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Member {
+    const obj = P.nodes[unwrapParen(e.memObj)]
+    if obj is Index {
+      const arr = P.nodes[unwrapParen(obj.idxArr)]
+      if arr is Ident {
+        const un = unionNameOfIdent(arr.identName, fnIx)
+        if un != "" {
+          let nm = unionMemberSetOf(un)
+          if nm == "" { nm = un }
+          const atoms: string[] = []
+          splitUnionAtoms(nm, atoms)
+          let i = 0
+          while i < atoms.length {
+            const a = atoms[i]
+            if nameIsRefArray(a) {
+              // The arm's element struct: `refArrElemName` for a nominal element, the raw
+              // `[]`-stripped text for an inline shape it cannot see (the interner's key).
+              let en = refArrElemName(a)
+              if en == "" && a.length > 2 { en = a.slice(0, a.length - 2) }
+              const si = structIndexByName(en)
+              if si >= 0 {
+                const fi = sFieldIndex(si, e.memProp)
+                if fi >= 0 {
+                  if sFieldTypeAt(si, fi) == 19 { return true }
+                }
+              }
+            }
+            i = i + 1
+          }
+        }
+      }
+    }
   }
   false
 }
@@ -9860,7 +9992,13 @@ export function narrowedMapOf(name: string) {
   const v = narrowVariantFor(name)
   if v == "" { return "" }
   if valueAtomKind(v) >= 0 { return "" }
-  if nameIsMap(v) { return v }
+  // A narrow can land on a member SET, not a single arm: `t != null` over a map-member
+  // union (`{[string]: V} | string | null`) narrows to `{[string]: V}|string` — a name
+  // that STARTS with `{[` (so `nameIsMap` matches) but is still a union BOX, not a bare
+  // map. Without the member-union guard a rebind under that narrow (`const t1 = t0`)
+  // classified as a MONO map local and every read of it emitted the wrong rep — invalid
+  // wasm (the same guard every `paramMap` / `retMapFlag` / `nameFieldCode` site carries).
+  if nameIsMap(v) && !nameIsMapMemberUnion(v) { return v }
   ""
 }
 
@@ -11157,6 +11295,9 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
     // not active in this frame pre-pass, so `exprMap` misses it — spot the union-with-map-arm ident
     // directly so the map scratch frame is reserved (an unused reservation is a harmless spare).
     if unionMapArmIdent(e.idxArr, fnIx) { return true }
+    // A MAP-FIELD read through a union's ref-array arm (`t[i].f[k]` after an `is S[]` narrow):
+    // likewise invisible to `exprMap` here — spot the member shape from the declared union.
+    if unionListElemMapFieldMember(e.idxArr, fnIx) { return true }
     if exprHasMapOp(e.idxArr, fnIx) { return true }
     return exprHasMapOp(e.idxIndex, fnIx)
   }
@@ -11167,6 +11308,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
       if lhs is Index {
         if exprMap(lhs.idxArr, fnIx) { return true }
         if unionMapArmIdent(lhs.idxArr, fnIx) { return true }
+        if unionListElemMapFieldMember(lhs.idxArr, fnIx) { return true }
       }
       if lhs is Call {
         const lcallee = P.nodes[lhs.callFn]
@@ -11183,6 +11325,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
       if target is Index {
         if exprMap(target.idxArr, fnIx) { return true }
         if unionMapArmIdent(target.idxArr, fnIx) { return true }
+        if unionListElemMapFieldMember(target.idxArr, fnIx) { return true }
       }
     }
     if exprHasMapOp(e.binLeft, fnIx) { return true }
@@ -11414,6 +11557,11 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     // map VALUE type (mono/atom ⇒ -1, else the value name's mv slot). Mirrors the `exprMap` fallback and
     // `structIndexOfExpr`'s `nodeTyName` struct fallback, so `v()[k] ?? d` picks the right value rep.
     if nodeTyIsMap(exprIx) {
+      // An ATOM-valued map (`{[string]: K0}`) is the MONO i32 map, but its RENDERED value
+      // name collapses to `string` (`tyToEmitName` widens each member literal) — which the
+      // slot resolver would treat as a slot-less STRING-valued map and reject loudly. Gate
+      // on the checker's recorded litunion first (the atom map has no slot by design).
+      if nodeTyMapValIsLitUnion(exprIx) { return -1 }
       return mvSlotOfMapValNameOrMono(nodeTyMapValName(exprIx))
     }
     return -1
@@ -11500,10 +11648,12 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
   -2
 }
 
-// The mv slot whose map value type-name is `iv`, or `-1` for a mono / atom value
-// (`i32` / `boolean` / literal-union atom — never interned, rides `$mStructIdx`). A
-// non-failing find (unlike `mvSlotOfValNameFind`, which fails loudly on the mono miss)
-// for the composition read resolvers.
+// The mv slot whose map value type-name is `iv`, `-1` for a mono / atom value
+// (`i32` / `boolean` / literal-union atom — never interned, rides `$mStructIdx`), or
+// `-3` for a TYPED value whose slot was never interned (unsupported — op sites fail
+// loudly, never the silent mono fallback). A mono-tolerant find (unlike
+// `mvSlotOfValNameFind`, which fails loudly on the mono miss) for the composition
+// read resolvers.
 export function mvSlotOfMapValNameOrMono(iv: string): i32 {
   if mvValKindOfName(iv) == -1 { return -1 }
   let i = 0
@@ -11511,7 +11661,11 @@ export function mvSlotOfMapValNameOrMono(iv: string): i32 {
     if mvValName[i] == iv { return i }
     i = i + 1
   }
-  -1
+  // A TYPED value name (kind != -1) with NO interned slot: the map was reached through a
+  // seam whose collect pass missed it. Returning the mono `-1` here silently lowered the
+  // read/store as the i32 map — the value rep then mismatched (invalid wasm). `-3`
+  // (unsupported) keeps the op sites' loud-reject contract instead.
+  -3
 }
 
 // ── string-typedness of expressions ──────────────────────────────────────────
