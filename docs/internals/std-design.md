@@ -57,7 +57,7 @@ the CLI disagree.
 **The seed/fixpoint flow std must not break.** The seed is assembled by
 concatenating `compiler/*.vl` + the driver with import lines range-blanked
 (refresh-compiler.sh, native-fixpoint.sh);
-`refresh-compiler.sh` gives a ~3s edit→seed loop.
+`refresh-compiler.sh` gives a ~40s edit→seed loop.
 
 **Generic exports are a known hole in BOTH module pipelines.** The native
 rename pass skips any declaration with `<` in its name ("exporting generics is

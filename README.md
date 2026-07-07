@@ -26,7 +26,7 @@ cargo build --release --manifest-path scripts/vl-host/Cargo.toml
 # 2. Get a compiler seed into build/vl-compiler.wasm
 scripts/fetch-seed.sh           # download the published compiler seed
 #   …or, from a source checkout with an existing seed:
-scripts/refresh-compiler.sh     # self-compile compiler/*.vl with the seed (~3s)
+scripts/refresh-compiler.sh     # self-compile compiler/*.vl with the seed (~40s)
 
 # 3. Run a program
 echo 'print(6 * 7)' > hello.vl

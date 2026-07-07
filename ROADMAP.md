@@ -20,8 +20,8 @@ Status: 🟡 partial · ⬜ not started.
 **Repo layout:** `compiler/` — the self-hosted compiler (`*.vl` — lexer/parser/typecheck/wasmEmit,
 built to the wasm seed; the only `.ts` left are the `coreTypes`/`diagnostics` type leaves) ·
 `scripts/vl-host/` — the native Rust `vl` host · `lsp/` — the VS Code extension + LSP server (drives
-the seed) · `grammar/` — the `.g4` spec (reference
-only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs/` ·
+the seed) · no `grammar/` — the old `.g4` spec is gone; the hand-written parser + the `tests/`
+corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 `reference/` — retired ts-interpreter. Tracks are **independent** unless a dependency is called out.
 
 > **Maintaining this file.** The roadmap is *forward-looking* — what to do next, why, dependencies,
@@ -304,11 +304,12 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 - ⬜ **B20. Loops as expressions + `break <value>`.** Lift `for`/`while` into expression position;
   a loop evaluates to its `break` value or `null`. Three layers: grammar → types (mirror the
   `returnTypes` mechanism) → codegen (`__brk` block gets a result type).
-- ⬜ **B21. `match` construct.** A `match` expression with **exhaustiveness-by-default**: a missing
-  arm is a hard error (à la Rust/Swift), not a silent fall-through. The proper language home for
-  enforced exhaustiveness on union/literal discrimination — complements the if-chain coverage check
-  (A-exhaust) with structured syntax and compiler-enforced completeness. Design: arms match on type
-  or literal; each arm is an expression; the `match` evaluates to the arm's type (union of arms).
+- ⬜ **B21. `match` over tagged unions (payload binding).** Phase 1 (literal-union `match`,
+  exhaustiveness-by-default — a missing arm is a hard error, à la Rust/Swift) has shipped
+  (→ `CHANGELOG.md`; `tests/cases/match/*`). REMAINING: arms that discriminate on a tagged union's
+  TYPE (not just a string-literal member) and bind the matched arm's payload/fields — extending
+  compiler-enforced completeness from literal discrimination to structural/tagged-union
+  discrimination, complementing the if-chain coverage check (A-exhaust).
 - 🟡 **B-debug. Source maps + trap diagnostics follow-ups.** REMAINING: (1) **full source-mapped
   stack traces** — map every wasm frame in the trap's stack → VL `function (file:L:C)`, not just
   the top frame; (2) **value-rich panic messages** — a host `panic(msg)` abort path that formats
@@ -338,7 +339,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 (`-O` via wasm-opt) / `vl check` (parse+typecheck only) / `vl run` (incl. `.wasm` passthrough) /
 `vl fmt` (`-w`/`--check`, AST-driven via `format.vl` — the sole formatter; the TS `format.ts` is
 retired), brains in `build/vl-compiler.wasm`. Iteration: `scripts/refresh-compiler.sh` refreshes the
-seed from current `compiler/*.vl` in ~3s.*
+seed from current `compiler/*.vl` in ~40s.*
 
 - 🟡 **C5. Distribution (public release).** The shipped artifact is now the NATIVE `vl` host with
   the seed embedded (`--features embed-seed`; `release.yml` builds all 5 targets, `build-binary.sh`

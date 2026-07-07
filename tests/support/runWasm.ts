@@ -4,8 +4,8 @@
 // self-hosted seed, never the TS compiler) needs only to RUN the emitted module
 // and capture `print`/`log` output, plus surface a trap as a typed error for
 // `@trap` cases. This lifts exactly that — the host-import ABI + trap mapping —
-// out of `compiler/compile.ts` so the corpus oracle carries no dependency on the
-// TS compiler front end (which the kill-TS work is deleting). It is a faithful
+// out of the old `compiler/compile.ts` so the corpus oracle carries no dependency
+// on the TS compiler front end (which the kill-TS work deleted). It is a faithful
 // copy of `compile.ts`'s `runWasm`/`VLRuntimeError`/`mapTrap`, minus the source-map
 // path: the corpus passes no source map (it asserts trap REASONS, not positions —
 // `@trap` position directives are skipped via `isTrapPosition`), so the VLQ /

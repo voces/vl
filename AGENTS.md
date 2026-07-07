@@ -6,16 +6,23 @@ working in this repo.
 
 ## Pipeline & layout
 
-`source → hand-written lexer/parser → typed AST (compiler/ast.ts) → typecheck.ts (type algebra) →
-toWasm.ts (binaryen WasmGC codegen) → wasm`. The headless entry point is `compile(source)` in
-`compiler/compile.ts`.
+`source → compiler/lexer.vl → compiler/parser.vl (hand-written AST, compiler/ast.vl) →
+compiler/typecheck.vl (type algebra) → compiler/wasmEmit.vl + emit_*.vl (WasmGC codegen) → wasm`.
+The self-hosted compiler (`compiler/*.vl`) is itself compiled to a wasm *seed*
+(`build/vl-compiler.wasm`); a thin native Rust host (`scripts/vl-host`, over wasmtime) embeds that
+seed and drives it through a source-in/bytes-out ABI (`compiler/driver.vl`, re-exported under bare
+names by `compiler/entry.vl`) — every `vl run`/`build`/`check`/`fmt` invocation shells through this
+host.
 
-- `compiler/` — the language core (compile, the parser, toAST, typecheck, toWasm, defaultScope).
-- `lsp/` — VS Code extension + LSP server over the core (`lsp/src/server.ts`).
+- `compiler/` — the self-hosted compiler (`*.vl`: lexer, parser, ast, typecheck, wasmEmit/emit_*,
+  lint, format, driver, entry, cli). The only `.ts` left are the dependency-free type leaves
+  `coreTypes.ts`/`diagnostics.ts`, imported by the LSP + browser playground.
+- `scripts/vl-host/` — the native Rust host that embeds the wasm seed and exposes the `vl` CLI.
+- `lsp/` — VS Code extension + LSP server over the seed (`lsp/src/server.ts`).
 - `tests/` — the `.vl` corpus (`tests/cases/**`) + the runner (`tests/run.ts`).
 - `docs/`, `reference/` (retired ts-interpreter, excluded from lint/test).
 
-The parser is **hand-written** (`compiler/lexer.ts` + `compiler/parser.ts`) — no antlr, no grammar
+The parser is **hand-written** (`compiler/lexer.vl` + `compiler/parser.vl`) — no antlr, no grammar
 file; the lexer/parser are the grammar.
 
 ## Commands

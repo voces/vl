@@ -5,7 +5,7 @@
 // second compiler to compare against; the directives are the spec. `runWasm`
 // (the V8 instantiate + print capture) is harness plumbing — it lives in the
 // compiler-free `tests/support/runWasm.ts` so this oracle carries no dependency
-// on `compiler/compile.ts` (kill-TS is deleting the TS front end).
+// on the TS front end (which kill-TS deleted, `compiler/compile.ts` included).
 //
 // Seed loading follows `lsp/src/wasmChecker.ts`: `WebAssembly.Module`/
 // `Instance` over the seed with an EMPTY import object, then the driver
