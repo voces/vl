@@ -106,11 +106,15 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   chartered follow-ups: compiler-injected call sites, generic `expect<T>` + structural diffs,
   power-`assert` rewriting. New behavioral tests switch to `*.test.vl` at v1 (directive-corpus
   growth stops; conversion waits for the TS-tier teardown).
-- ⬜ **Error-handling design** (`docs/error-handling-design.md`, to write) — the language's
-  failure story BEFORE std grows fallible APIs (`std:fs`, parsing): Go-style error returns (VL
-  unions already express `T | Error`) vs Rust `Result`+`?` vs try/catch over the standardized
-  wasm exception-handling proposal (`exnref`); how the choice composes with async/await (B12) and
-  streams. Until it lands, std ships only total functions + `__trap__` aborts (std-design D1).
+- ⬜ **Error-handling design** — DRAFTED, pending owner review: `docs/error-handling-design.md`
+  (errors-as-values via unions — `T | null` for absence, `T | E` with a structural `IoError`
+  alias for reasoned failure, traps (`__trap__(msg)`) for bugs; no catchable throw in v1, `exnref`
+  reserved for a possible async era, Go-style multi-value returns ruled out; union-`as`
+  propagation (`x as T` narrows-or-early-returns the remainder, under a unified `as`
+  principle) chartered as follow-up; fallible std sequenced after the R3b/R7 rep family). Settles the
+  failure story BEFORE std grows fallible APIs (`std:fs`, parsing). Until it lands, std ships
+  only total functions + `__trap__` aborts (std-design D1). Seven open questions (O1–O7)
+  flagged for the maintainer.
 - **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
   the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does
   not exist yet; design + land it (both compilers).
