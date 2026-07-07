@@ -81,7 +81,6 @@ import {
   TypeRef,
   Unary,
   WhileStmt,
-  i32ToStr,
   mkTypeRef,
 } from "./ast"
 import { numLexFitsI32, numLexIs2Pow31 } from "./emit_bignum"
@@ -297,7 +296,13 @@ import {
   vbI64Used,
 } from "./emit_state"
 import { emitFail } from "./emit_bytes"
-import { repKindOfSigTok, repOfNode, repSigTokOfKind } from "./emit_rep"
+import {
+  repKindOfSigTok,
+  repOfNode,
+  repSigSlotTokOfKind,
+  repSigTokHasSlot,
+  repSigTokOfKind,
+} from "./emit_rep"
 
 // The `$fnsig` PARAM-spine token for the parameter at `paramIx` — one token per distinct
 // param VALTYPE, so two functions share a `$fnsig` exactly when their param valtypes
@@ -315,7 +320,7 @@ function cloParamTok(paramIx: i32) {
   // variant index / ref-list slot), so two sigs share a `$fnsig` exactly when
   // the param SHAPES match, not just the kind.
   if k == "struct" || k == "variant" || k == "reflist" {
-    return repSigTokOfKind(k) + i32ToStr(paramStructIdxOf(paramIx)) + ";"
+    return repSigSlotTokOfKind(k, paramStructIdxOf(paramIx))
   }
   // Param-position ABI gate: the nullable-REF kinds (struct|null, string|null —
   // and via the empty table entries i32[]|null, closure|null) still mis-lower as
@@ -361,48 +366,48 @@ export function fnSigKeyOf(fe: i32) {
       pi = pi + 1
     }
     const r = cloRetKindOf(fe)
-    if r == 0 { return key + ">" + repSigTokOfKind("i32") }
-    if r == 11 { return key + ">" + repSigTokOfKind("f64") }
+    if r == "i32" { return key + ">" + repSigTokOfKind("i32") }
+    if r == "f64" { return key + ">" + repSigTokOfKind("f64") }
     return ""
   }
   ""
 }
 
-// The VALUE-ABI return kind of lifted function `fe` for `$fnsig` purposes: `0`
-// (i32/boolean), `11` (f64), or `-1` (void / closure-returning / any other kind).
+// The VALUE-ABI return kind of lifted function `fe` for `$fnsig` purposes: `"i32"`
+// (i32/boolean), `"f64"`, or `null` (void / closure-returning / any other kind).
 // Annotated returns read the annotation; un-annotated ones ride the stored return
 // kind, plus a registry-INDEPENDENT f64 tail check (`tailIsF64NoLocal` — the
 // general `exprIsF64` consults the per-function locals registry, whose contents
 // depend on WHICH function is currently being emitted, so the key must not use it).
-export function cloRetKindOf(fe: i32) {
-  if fe < 0 || fe >= fnStmts.length { return -1 }
-  if fe >= fRetVoid.length { return -1 }
+export function cloRetKindOf(fe: i32): VKind | null {
+  if fe < 0 || fe >= fnStmts.length { return null }
+  if fe >= fRetVoid.length { return null }
   const fn = P.nodes[fnStmts[fe]]
   if fn is FuncDecl {
-    if fRetVoid[fe] == 1 { return -1 }
-    if fnReturnsClosure(fe) { return -1 }
+    if fRetVoid[fe] == 1 { return null }
+    if fnReturnsClosure(fe) { return null }
     if fn.fnRet >= 0 {
       const k = vtKindOfType(fn.fnRet)
-      if k == "i32" { return 0 }
-      if k == "f64" { return 11 }
-      return -1
+      if k == "i32" { return "i32" }
+      if k == "f64" { return "f64" }
+      return null
     }
     // Un-annotated: any inferred ref/i64/f32 kind is out of the value ABI; an f64
-    // tail is kind 11; everything else (i32 / boolean) rides the i32 result. The
+    // tail is `"f64"`; everything else (i32 / boolean) rides the i32 result. The
     // `"nulstr"` niche deliberately falls through with `"i32"` — the historical flag
     // ladder here never consulted `fRetNulStr`, so it kept riding the i32 result.
     const irk = fRetKind[fe]
-    if irk == "f64" { return 11 }
-    if irk != "i32" && irk != "nulstr" { return -1 }
-    if tailIsF64NoLocal(fnRetExprOf(fnStmts[fe]), fnStmts[fe]) { return 11 }
-    return 0
+    if irk == "f64" { return "f64" }
+    if irk != "i32" && irk != "nulstr" { return null }
+    if tailIsF64NoLocal(fnRetExprOf(fnStmts[fe]), fnStmts[fe]) { return "f64" }
+    return "i32"
   }
-  -1
+  null
 }
 
 // Whether the lifted callback at `fe` returns a STRING — its annotation (`: string`) or the
-// inferred `"str"` kind. `cloRetKindOf` folds string into -1 (it is outside the i32/f64 value
-// ABI), so `.map`/`.filter` consult this separately to pick the string-list result kind.
+// inferred `"str"` kind. `cloRetKindOf` folds string into `null` (it is outside the i32/f64
+// value ABI), so `.map`/`.filter` consult this separately to pick the string-list result kind.
 export function cloRetIsString(fe: i32) {
   if fe < 0 || fe >= fnStmts.length { return false }
   const fn = P.nodes[fnStmts[fe]]
@@ -630,23 +635,21 @@ function cloRetKeySuffix(fe: i32) {
   // its struct index, a concrete-VARIANT result by its variant index — so two
   // callbacks share a sig iff they return the SAME shape.
   if k == "struct" || k == "nulstruct" || k == "variant" {
-    return ">" + repSigTokOfKind(k) + i32ToStr(cloRetValSlot(fe)) + ";"
+    return ">" + repSigSlotTokOfKind(k, cloRetValSlot(fe))
   }
   // A MAP result carries its map SHAPE slot (`cloRetValSlot` → the mv slot; mono = -1), so
   // two map-returning closures share a `$fnsig` exactly when their value types match, and the
   // `$fnsig` result `(ref $mapStruct)` selects THIS map's struct — the heap type the returned
   // map value and the closure's env field both carry. Makes a map-returning closure
   // representable (a non-empty key) instead of tripping the soundness floor.
-  if k == "map" {
-    return ">" + repSigTokOfKind(k) + i32ToStr(cloRetValSlot(fe)) + ";"
-  }
+  if k == "map" { return ">" + repSigSlotTokOfKind(k, cloRetValSlot(fe)) }
   // A REF-LIST result (`S[]` / `((i32) => i32)[]` / a union list): the `$fnsig`
   // result is the ref-list WRAPPER ref (slot = `cloRetValSlot`), recovered
   // non-null at the value-call site like every other ref result — the result
   // dual of the `r<idx>;` PARAM token. No resolved slot → no sig.
   if k == "reflist" {
     const rs = cloRetValSlot(fe)
-    if rs >= 0 { return ">" + repSigTokOfKind(k) + i32ToStr(rs) + ";" }
+    if rs >= 0 { return ">" + repSigSlotTokOfKind(k, rs) }
     return ""
   }
   // Every slot-free kind reads the shared canonical token table (emit_rep):
@@ -886,10 +889,10 @@ export function fnSigIdxForArity(ar: i32) {
   let key = ""
   let i = 0
   while i < ar {
-    key = key + "i"
+    key = key + repSigTokOfKind("i32")
     i = i + 1
   }
-  const p = cloSigPosOfKey(key + ">i")
+  const p = cloSigPosOfKey(key + ">" + repSigTokOfKind("i32"))
   if p < 0 { return -1 }
   cloSigBase + p
 }
@@ -4592,7 +4595,7 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
     // A FIELD-closure call `t.op(x)` whose field function returns f64.
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return cloRetKindOf(ffe) == 11 }
+      if ffe >= 0 { return cloRetKindOf(ffe) == "f64" }
     }
     return false
   }
@@ -4744,24 +4747,25 @@ export function cloArrSlotRetName(slot: i32) {
   return inner.slice(at + 2, inner.length)
 }
 
-// The SCALAR-coercion kind of parameter `idx` read from a `$fnsig` KEY's param-token spine: `10`
-// (i64, token `I`), `11` (f64, `d`), `13` (f32, `f`), or `-1` (i32 / a ref kind — no coercion). The
-// tokens are `cloParamTok`'s: single-char scalars, or `s<idx>;` / `V<idx>;` / `r<idx>;` ref tokens
-// terminated by `;`. Lets a value CALL widen an i32-literal argument into an i64 / f32 / f64
-// parameter, exactly as a direct call does — without it the `call_ref` pushes an i32 and traps.
-export function sigParamCoerceKind(key: string, idx: i32) {
+// The wide-SCALAR coercion kind of parameter `idx` read from a `$fnsig` KEY's param-token
+// spine: `"i64"` / `"f64"` / `"f32"`, or `null` (i32 / a ref kind — no coercion). Each
+// token decodes through the ONE char→kind table (`repKindOfSigTok`); a slot-carrying ref
+// token (`s<idx>;` / `V<idx>;` / `r<idx>;`) skips its `;`-terminated digits via the
+// table's own slot predicate (`repSigTokHasSlot`). Lets a value CALL widen an i32-literal
+// argument into an i64 / f32 / f64 parameter, exactly as a direct call does — without it
+// the `call_ref` pushes an i32 and traps.
+export function sigParamCoerceKind(key: string, idx: i32): VKind | null {
   let i = 0
   let p = 0
   while i < key.length {
     const c = key[i]
-    if c == '>' { return -1 }
+    if c == '>' { return null }
+    const k = repKindOfSigTok(c)
     if p == idx {
-      if c == 'I' { return 10 }
-      if c == 'd' { return 11 }
-      if c == 'f' { return 13 }
-      return -1
+      if k == "i64" || k == "f64" || k == "f32" { return k }
+      return null
     }
-    if c == 's' || c == 'V' || c == 'r' {
+    if repSigTokHasSlot(k) {
       while i < key.length && key[i] != ';' { i = i + 1 }
       i = i + 1
     } else {
@@ -4769,7 +4773,7 @@ export function sigParamCoerceKind(key: string, idx: i32) {
     }
     p = p + 1
   }
-  -1
+  null
 }
 
 // The callee's interned `$fnsig` KEY for a value call (`f(x)`, `(o.field)(x)`, `fs[i](x)`), or "" —
@@ -4923,32 +4927,6 @@ function mfResKindFromSigRet(k: VKind | null): MfKind | null {
   if k == "str" { return "str" }
   if k == "struct" { return "ref" }
   null
-}
-
-// The struct-TABLE index in a closure sig key's `>s<idx>;` result token (a struct-returning callback),
-// or -1. The struct dual of `sigKeyRetSlot` (which parses the `>r<slot>;` ref-list token).
-function sigKeyRetStructIdx(k: string) {
-  const n = k.length
-  let gt = -1
-  let i = 0
-  while i < n {
-    if k[i] == '>' { gt = i }
-    i = i + 1
-  }
-  if gt < 0 || gt + 2 >= n { return -1 }
-  if k[gt + 1] != 's' { return -1 }
-  let j = gt + 2
-  let acc = 0
-  let saw = false
-  while j < n && k[j] != ';' {
-    const d = k[j]
-    if d < '0' || d > '9' { return -1 }
-    acc = acc * 10 + (d - '0')
-    saw = true
-    j = j + 1
-  }
-  if !saw { return -1 }
-  acc
 }
 
 // If the `if` condition at `condIx` is `n is Variant` over a bare union identifier
@@ -10520,9 +10498,13 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
       const nfn = fnRetNulRefArrayName(callee.identName)
       if nfn != "" { return nfn }
       // A closure-VALUE callee returning a ref list (`mk: () => S[]`): its element name is the
-      // `rlElemName` of the `>r<slot>;` result slot parsed off the callee's resolved `$fnsig`.
-      const rs = sigKeyRetSlot(calleeCloSigKey(callee.identName, fnIx))
-      if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
+      // `rlElemName` of the `>r<slot>;` result slot parsed off the callee's resolved `$fnsig`
+      // (kind-gated on `"reflist"` — the shared slot reader parses ANY slot-carrying result).
+      const ck = calleeCloSigKey(callee.identName, fnIx)
+      if sigKeyRetKind(ck) == "reflist" {
+        const rs = sigKeyRetSlot(ck)
+        if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
+      }
       return ""
     }
     // A ref-valued `m.values()` yields a ref list whose element is the map's VALUE — read
@@ -12103,10 +12085,10 @@ function annParamKind(t: string) {
   if nameIsI64Array(t) { return repSigTokOfKind("i64list") }
   if nameIsF32Array(t) { return repSigTokOfKind("f32list") }
   const si = structIndexByName(t)
-  if si >= 0 { return repSigTokOfKind("struct") + i32ToStr(si) + ";" }
+  if si >= 0 { return repSigSlotTokOfKind("struct", si) }
   // A concrete-variant name (`Cat`), keyed by the variant index (matches `cloParamTok`).
   const vti = variantIndexOf(t)
-  if vti >= 0 { return repSigTokOfKind("variant") + i32ToStr(vti) + ";" }
+  if vti >= 0 { return repSigSlotTokOfKind("variant", vti) }
   // A ref-LIST param (`S[]`, `(C|D)[]`, a closure / nested list) — the recursive dual of
   // `annRetKind`'s ref-list result and `cloParamTok`'s ref-list param. BEFORE the arrow
   // case so a closure-ELEMENT array's nested `=>` is not misread as a single closure. The
@@ -12114,7 +12096,7 @@ function annParamKind(t: string) {
   // AST producer uses.
   if nameIsRefArray(t) {
     const rs = rlSlotByName(refArrElemName(t))
-    if rs >= 0 { return repSigTokOfKind("reflist") + i32ToStr(rs) + ";" }
+    if rs >= 0 { return repSigSlotTokOfKind("reflist", rs) }
   }
   // A FUNCTION-type param (`(i32) => i32`) is the shared closure fat-pointer, matching
   // `cloParamTok`. Without this a higher-order closure param (a callback that itself takes
@@ -12127,7 +12109,7 @@ function annParamKind(t: string) {
   // BOTH a nominal name (above, via `structIndexByName`) and an inline shape (by field-set match), to
   // the SAME struct index the AST producer's `cloParamTok` keys — so the two sig producers agree.
   const sti = structIndexOfTypeName(t)
-  if sti >= 0 { return repSigTokOfKind("struct") + i32ToStr(sti) + ";" }
+  if sti >= 0 { return repSigSlotTokOfKind("struct", sti) }
   ""
 }
 
@@ -12167,7 +12149,7 @@ function annRetKind(t: string) {
   // producers' keys byte-match (else the value-call `ref.cast` to this `$fnsig` traps).
   if nameIsRefArray(t) {
     const rs = rlSlotByName(refArrElemName(t))
-    if rs >= 0 { return ">" + repSigTokOfKind("reflist") + i32ToStr(rs) + ";" }
+    if rs >= 0 { return ">" + repSigSlotTokOfKind("reflist", rs) }
   }
   // A MAP return — `{[string]: V}`, matching `cloRetKeySuffix`'s map result token so the AST
   // and annotation sig producers agree (a value call's `ref.cast` to this `$fnsig` must
@@ -12181,9 +12163,7 @@ function annRetKind(t: string) {
   // value call keyed `>m` while the closure interned `>u` — a "no interned signature" reject.
   if nameIsMap(t) && !nameIsMapMemberUnion(t) {
     return ">" +
-      repSigTokOfKind("map") +
-      i32ToStr(mvSlotOfMapValNameOrMono(mapValNameOf(t))) +
-      ";"
+      repSigSlotTokOfKind("map", mvSlotOfMapValNameOrMono(mapValNameOf(t)))
   }
   // A CLOSURE return — a function-type result (`(i32) => ((i32) => i32)`), matching
   // `cloRetKeySuffix`'s closure-result token so the AST and annotation sig producers agree
@@ -12212,7 +12192,7 @@ function annRetKind(t: string) {
   // inline shape (`{x: i32}` — the `cloCallSigKey` `nodeTyName` fallback's form) resolves by field-set
   // to the same index the AST producer's `cloRetValSlot` keys, as well as a nominal `P`.
   const si = structIndexOfTypeName(t)
-  if si >= 0 { return ">" + repSigTokOfKind("struct") + i32ToStr(si) + ";" }
+  if si >= 0 { return ">" + repSigSlotTokOfKind("struct", si) }
   // A UNION / NULLABLE return — `string | null`, `S | null`, a 2+-member union → the box
   // (matching `cloRetKeySuffix` for the underlying function). An `i32 | null` boxed niche
   // and any other shape stay "" (un-resolvable here). A union ALIAS (`type Sh = C | S`) is
@@ -12234,9 +12214,7 @@ function annRetKind(t: string) {
     if hasNull && nonNull.length == 1 {
       if nonNull[0] == "string" { return ">" + repSigTokOfKind("nulstr") }
       const msi = structIndexOfTypeName(nonNull[0])
-      if msi >= 0 {
-        return ">" + repSigTokOfKind("nulstruct") + i32ToStr(msi) + ";"
-      }
+      if msi >= 0 { return ">" + repSigSlotTokOfKind("nulstruct", msi) }
       // A NULLABLE-CLOSURE result (`((i32) => K0) | null`, kind 19): the shared closure
       // fat-pointer made nullable (`(ref null $cloStruct)`, slot-free). Matches
       // `cloRetKeySuffix`'s `>C` (via `cloRetValKind` → "nulclosure"), so the value call's
@@ -12475,74 +12453,65 @@ function calleeCloSigKey(name: string, fnIx: i32) {
 }
 
 // True if the function-VALUE callee `name` (in scope of `fnIx`) returns f64 — its resolved
-// `$fnsig` key ends in `>d`. Drives the closure-call RESULT classification (print routing,
-// numeric-context coercion), the value-call analogue of `fRetF64` for a named function.
+// `$fnsig` key's result kind is `"f64"`. Drives the closure-call RESULT classification
+// (print routing, numeric-context coercion), the value-call analogue of `fRetF64` for a
+// named function.
 function calleeReturnsF64(name: string, fnIx: i32) {
-  const k = calleeCloSigKey(name, fnIx)
-  const n = k.length
-  if n < 2 { return false }
-  k[n - 2] == '>' && k[n - 1] == 'd'
+  calleeRetKind(name, fnIx) == "f64"
 }
 
 // True if the function-VALUE callee `name` (in scope of `fnIx`) returns void — its
-// resolved `$fnsig` key ends in `>v`. A void closure call leaves NOTHING on the stack, so
+// resolved `$fnsig` key carries the `>v` void marker (`sigKeyRetIsVoid`, NOT the `null`
+// an unresolved key also decodes to). A void closure call leaves NOTHING on the stack, so
 // its statement form must NOT `drop` (the value-call analogue of `fRetVoid` for a named
 // function — which `fnIndexOf` can't see for a param / binding closure value).
 export function calleeReturnsVoid(name: string, fnIx: i32) {
-  const k = calleeCloSigKey(name, fnIx)
-  const n = k.length
-  if n < 2 { return false }
-  k[n - 2] == '>' && k[n - 1] == 'v'
+  sigKeyRetIsVoid(calleeCloSigKey(name, fnIx))
 }
 
 // True if the function-VALUE callee `name` (in scope of `fnIx`) returns a string — its
-// resolved `$fnsig` key ends in `>S`. The value-call analogue of `fnRetString` for a named
-// function — drives the closure-call RESULT's string typing (binding cell, print routing).
+// resolved `$fnsig` key's result kind is `"str"`. The value-call analogue of
+// `fnRetString` for a named function — drives the closure-call RESULT's string typing
+// (binding cell, print routing).
 function calleeReturnsString(name: string, fnIx: i32) {
-  const k = calleeCloSigKey(name, fnIx)
-  const n = k.length
-  if n < 2 { return false }
-  k[n - 2] == '>' && k[n - 1] == 'S'
+  calleeRetKind(name, fnIx) == "str"
 }
 
 // True if the function-VALUE callee `name` (in scope of `fnIx`) returns i64 — its resolved
-// `$fnsig` key ends in `>I`. The value-call analogue of `fRetI64` for a named function —
-// drives the closure-call RESULT's i64 typing (print routing, numeric-context coercion).
+// `$fnsig` key's result kind is `"i64"`. The value-call analogue of `fRetI64` for a named
+// function — drives the closure-call RESULT's i64 typing (print routing, numeric-context
+// coercion).
 function calleeReturnsI64(name: string, fnIx: i32) {
-  const k = calleeCloSigKey(name, fnIx)
-  const n = k.length
-  if n < 2 { return false }
-  k[n - 2] == '>' && k[n - 1] == 'I'
+  calleeRetKind(name, fnIx) == "i64"
 }
 
 // The struct-table INDEX a function-VALUE callee `name` (in scope of `fnIx`) returns, or
-// -1. Its resolved `$fnsig` key ends in the struct-ref return marker `>sN;` (a `S` struct)
-// or `>nN;` (an `S | null` nullable struct) — params never contain `>`, so the last `>`
-// begins the return. The value-call analogue of `fnRetStructIndex` — drives the closure-
+// -1. Its resolved `$fnsig` key's result kind is `"struct"` (`>sN;`) or `"nulstruct"`
+// (`>nN;`); the slot digits parse through the shared result-slot reader
+// (`sigKeyRetSlot`). The value-call analogue of `fnRetStructIndex` — drives the closure-
 // call RESULT's struct typing (`p.x` over `const p = f(5)`, struct or nullable-struct).
 function calleeReturnsStructIdx(name: string, fnIx: i32) {
   const k = calleeCloSigKey(name, fnIx)
+  const rk = sigKeyRetKind(k)
+  if rk == "struct" || rk == "nulstruct" { return sigKeyRetSlot(k) }
+  -1
+}
+
+// The position of a `$fnsig` key's RESULT token char — just past the LAST `>` (params
+// never contain one, so the last `>` begins the result spine) — or -1 for an empty /
+// result-less key. The ONE last-`>` scan: every result-side reader (`sigKeyRetKind` /
+// `sigKeyRetIsVoid` / `sigKeyRetSlot`) decodes through it instead of re-scanning the
+// key string per site.
+function sigKeyRetTokIx(k: string) {
   const n = k.length
-  if n < 4 { return -1 }
-  if k[n - 1] != ';' { return -1 }
-  let i = 0
   let gt = -1
+  let i = 0
   while i < n {
     if k[i] == '>' { gt = i }
     i = i + 1
   }
-  if gt < 0 || gt + 2 >= n { return -1 }
-  if k[gt + 1] != 's' && k[gt + 1] != 'n' { return -1 }
-  let j = gt + 2
-  let num = 0
-  let any = false
-  while j < n && k[j] >= '0' && k[j] <= '9' {
-    num = num * 10 + (k[j] - '0')
-    any = true
-    j = j + 1
-  }
-  if !any || j != n - 1 { return -1 }
-  num
+  if gt < 0 || gt + 1 >= n { return -1 }
+  gt + 1
 }
 
 // The `cloRetValKind`-style RESULT kind of a function-VALUE callee `name` (in scope of
@@ -12552,18 +12521,12 @@ function calleeReturnsStructIdx(name: string, fnIx: i32) {
 // the per-kind closure-call RESULT classifiers.
 // The RESULT value-KIND encoded in a closure `$fnsig` key (the atom after the final `>`),
 // or `null` when the key is empty / malformed. Shared by the Ident-callee path
-// (`calleeRetKind`) and the indexed-element path (`cloArrCallRetKind`).
-function sigKeyRetKind(k: string): VKind | null {
-  const n = k.length
-  if n < 2 { return null }
-  let i = 0
-  let gt = -1
-  while i < n {
-    if k[i] == '>' { gt = i }
-    i = i + 1
-  }
-  if gt < 0 || gt + 1 >= n { return null }
-  const c = k[gt + 1]
+// (`calleeRetKind`), the indexed-element path (`cloArrCallRetKind`), and — for a
+// monomorphized closure-pinned param (`"=>i>d"`) — the instance-return pin (emit_mono).
+export function sigKeyRetKind(k: string): VKind | null {
+  const ti = sigKeyRetTokIx(k)
+  if ti < 0 { return null }
+  const c = k[ti]
   // Void is the ABSENCE of a result kind, not a member of the token
   // vocabulary — tested before the shared table.
   if c == 'v' { return null }
@@ -12572,6 +12535,14 @@ function sigKeyRetKind(k: string): VKind | null {
   // `repSigTokOfKind` the encoders read). An encoder arm can no longer exist
   // without its decoder twin.
   repKindOfSigTok(c)
+}
+
+// True when a `$fnsig` key's result token is the literal void marker (`…>v`) —
+// distinguishable from an EMPTY/unresolved key, which `sigKeyRetKind` folds into the
+// same `null` a void result yields.
+function sigKeyRetIsVoid(k: string) {
+  const ti = sigKeyRetTokIx(k)
+  ti >= 0 && k[ti] == 'v'
 }
 
 // True when a closure value CALL's DECLARED result is a value UNION but the resolved
@@ -12637,23 +12608,19 @@ export function cloCallUnionResultUnrepresentable(
   rk != "union"
 }
 
-// The ref-list SLOT of a `>r<slot>;` result key (the digits between `r` and `;`), or -1 when the
-// key's result is not a ref list. Lets a closure-VALUE call result (`mk()` with `mk: () => S[]`)
-// recover its element ref-list slot for an index/`.length`/for-in directly off the callee's sig.
+// The interned SLOT of a slot-carrying result token (`>s3;`, `>n1;`, `>V0;`, `>r2;`,
+// `>m0;`) — the `;`-terminated decimal after the token char — or -1 when the key's
+// result kind carries no slot (`repSigTokHasSlot`, the encode side's own predicate) or
+// the digits are malformed. The ONE result-slot digit parser; callers gate on
+// `sigKeyRetKind` for WHICH table the slot indexes (struct / variant / ref-list / map).
 function sigKeyRetSlot(k: string) {
-  const n = k.length
-  let gt = -1
-  let i = 0
-  while i < n {
-    if k[i] == '>' { gt = i }
-    i = i + 1
-  }
-  if gt < 0 || gt + 2 >= n { return -1 }
-  if k[gt + 1] != 'r' { return -1 }
-  let j = gt + 2
+  const ti = sigKeyRetTokIx(k)
+  if ti < 0 { return -1 }
+  if !repSigTokHasSlot(repKindOfSigTok(k[ti])) { return -1 }
+  let j = ti + 1
   let acc = 0
   let saw = false
-  while j < n && k[j] != ';' {
+  while j < k.length && k[j] != ';' {
     const d = k[j]
     if d < '0' || d > '9' { return -1 }
     acc = acc * 10 + (d - '0')
@@ -12927,8 +12894,8 @@ export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
         if cloRetValKind(fe) == "i64" { return "i64" }
         if cloRetValKind(fe) == "f32" { return "f32" }
         const rk2 = cloRetKindOf(fe)
-        if rk2 == 0 { return "i32" }
-        if rk2 == 11 { return "f64" }
+        if rk2 == "i32" { return "i32" }
+        if rk2 == "f64" { return "f64" }
       }
       return null
     }
@@ -12967,8 +12934,8 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32) {
         // (`P[]`) is the `.map` result — the closure-value dual of the lifted-fe branch above.
         if fe < 0 {
           const ck = mfCallbackCloKey(c.callArgs[0], fnIx)
-          if ck != "" {
-            const csi = sigKeyRetStructIdx(ck)
+          if ck != "" && sigKeyRetKind(ck) == "struct" {
+            const csi = sigKeyRetSlot(ck)
             if csi >= 0 && csi < sNames.length {
               return rlSlotByName(sNames[csi])
             }

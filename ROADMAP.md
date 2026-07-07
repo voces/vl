@@ -70,13 +70,15 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   3. 🟡 **`repOf(type) → descriptor` unification (the "rewrite") — strangler, in progress.**
      Foundation SHIPPED (→ `CHANGELOG.md`): `emit_rep.vl`'s `RepDesc` derived table-driven from the
      `Ty` arena (cycle-safe: kind arms recurse ≤1 wrapper level; generation-stamped visited marks),
-     with the print-import scan exact, `vtKindOfType` delegated, `$fnsig` tokens on one vocabulary,
-     and the `fRet*` fold COMPLETE (every per-family flag table folded into the stored
-     `fRetKind: VKind[]`; `inferredRetKindCore` is a plain read — → `CHANGELOG.md`).
-     REMAINING migration order: (a) move `sigKeyRetKind`
-     consumers off raw codes onto `VKind`, then delete `repLegacyCodeOfKind`; (b) `annSigKey`/
-     `fnSigKeyOf` onto the token table; (c) widen `repOfTy` coverage (typed-value maps,
-     litunion/union-element arrays); (d) the SLOT layer — STRUCT table DONE (structural
+     with the print-import scan exact, `vtKindOfType` delegated, the `$fnsig` seam COMPLETE
+     (one token vocabulary; keys mint AND decode only through it — `repSigSlotTokOfKind`/
+     `repSigTokHasSlot` on the encode side, the single `sigKeyRet*` result decoder on the
+     consume side; `repLegacyCodeOfKind` and every per-site digit/char parse deleted —
+     → `CHANGELOG.md`), and the `fRet*` fold COMPLETE (every per-family flag table folded
+     into the stored `fRetKind: VKind[]`; `inferredRetKindCore` is a plain read —
+     → `CHANGELOG.md`).
+     REMAINING migration order: (a) widen `repOfTy` coverage (typed-value maps,
+     litunion/union-element arrays); (b) the SLOT layer — STRUCT table DONE (structural
      heap-type dedup: `repCanonKey` → `sTwin` → shared `sHeapIdx`, fixing the structural-twin
      invalid-wasm bug `takeA(b)` where `A`/`B` are structurally-identical declared types; see
      `DECISIONS.md`). REMAINING: the REF-LIST table (`rlSlotByName` — a `B[]` still interns a
