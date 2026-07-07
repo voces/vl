@@ -5,7 +5,12 @@
 # the native host compiles + runs; the generator + the oracle (the buried literal) are pure VL.
 #
 # USAGE: scripts/fuzz-vl.sh [--seed N] [--count M] [--depth D] [--keep DIR] [--baseline FILE]
-#                           [--shapes-out FILE] [--quiet]
+#                           [--shapes-out FILE] [--quiet] [--values]
+#   --values        opt-in value dimension: widen leaf VALUES (0/negatives/min·max/wide-i64/non-half
+#                   floats/empty·escaped·multibyte strings) + align the map-value allowNul. A survey
+#                   mode — it relocates the sample onto pre-existing rep holes, so it is report-only
+#                   and NOT part of the pinned net (rep-fuzz-check.sh runs the default byte-stable
+#                   stream). OFF by default so the generated batch is byte-identical to master.
 #   A mismatch / compile-fail / trap is a finding, printed with the failing case + the --seed to repro.
 #   Classes: REJECT (parse/type/emit error — the fail-loudly long tail), INVALID-WASM (emitted bytes
 #   fail validation — a soundness hole), TRAP (runtime error), MISMATCH (silent wrong result).
@@ -30,6 +35,7 @@ KEEP=""
 BASELINE=""
 SHAPES_OUT=""
 QUIET=0
+VALUES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --seed) SEED="$2"; shift 2 ;;
@@ -39,6 +45,7 @@ while [ $# -gt 0 ]; do
     --baseline) BASELINE="$2"; shift 2 ;;
     --shapes-out) SHAPES_OUT="$2"; shift 2 ;;  # append `CLASS<TAB>SHAPE` per failure (for rep-fuzz-check.sh)
     --quiet) QUIET=1; shift ;;
+    --values) VALUES=1; shift ;;  # opt-in value dimension (report-only survey; see header)
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
@@ -51,6 +58,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 # Inject seed + count into a copy of the generator, then run it to emit the batch.
 sed -e "s/^let SEED = .*/let SEED = $SEED/" -e "s/^let COUNT = .*/let COUNT = $COUNT/" -e "s/^let MAXDEPTH = .*/let MAXDEPTH = $DEPTH/" \
+  -e "s/^let RICHVALUES = .*/let RICHVALUES = $VALUES/" \
   scripts/fuzzgen.vl > "$WORK/gen.vl"
 if ! "$VL" run "$WORK/gen.vl" --compiler "$SEED_WASM" > "$WORK/batch.txt" 2>"$WORK/generr.txt"; then
   echo "GENERATOR FAILED to run:"; cat "$WORK/generr.txt"; exit 2
