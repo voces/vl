@@ -113,7 +113,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   propagation (`x as T` narrows-or-early-returns the remainder, under a unified `as`
   principle) chartered as follow-up; fallible std sequenced after the R3b/R7 rep family). Settles the
   failure story BEFORE std grows fallible APIs (`std:fs`, parsing). Until it lands, std ships
-  only total functions + `__trap__`/`panic` aborts (std-design D1). Six open questions (O1–O6)
+  only total functions + `__trap__`/`panic` aborts (std-design D1). Seven open questions (O1–O7)
   flagged for the maintainer.
 - **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
   the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does

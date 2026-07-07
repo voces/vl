@@ -28,7 +28,7 @@ The good news: VL already has the machinery. Value unions, `is`-narrowing, `??`,
 *itself* is written this way — `typecheck.vl` accumulates errors on `T.diags`
 rather than throwing, because "VL has no exceptions" (typecheck.vl ~:229). The
 question is not *what to build* but *what convention to bless* on top of what
-exists, and what small sugar (`?`) to add later.
+exists, and what small sugar (union-`as` propagation, §Chartered) to add later.
 
 ## Principles
 
