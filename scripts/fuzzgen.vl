@@ -45,6 +45,20 @@ let RICHVALUES = 0
 // closures — recursed under a TOTAL NODE BUDGET (not just depth). Like RICHVALUES it relocates the
 // sample onto pre-existing rep holes, so it is a report-only survey, never a pinned-seed gate.
 let BRANCHING = 0
+// Opt-in ORACLE WIDENING / multi-observation (fuzz-vl.sh `--multiobs`). OFF (the default, and the
+// pinned-CI net) reads back EXACTLY one value per program — the buried carrier — so the generated
+// batch is byte-identical to master (every extra read below is gated by `if MULTIOBS == 1` /
+// `mo == 1` and draws no random on the OFF path). ON also reads + asserts the observable DECOY
+// values the single-carrier oracle leaves dark: struct decoy siblings (a/z), the union DECOY arm
+// (a second binding narrowed via `is`), and — composing with --branching — the map's second entry.
+// Each extra expectation is EXACT (the fixed decoy-pool print forms / recursive-kid carriers), and
+// emitted as an additional `// @log` line (the runner asserts the full multi-line output). Like
+// RICHVALUES/BRANCHING it WIDENS what the pinned seeds observe, so it surfaces un-baselineable
+// findings on pre-existing rep holes — a report-only survey, never a pinned-seed gate.
+let MULTIOBS = 0
+// Gensym for MULTIOBS-injected read temps (union alt bindings `u<n>`, map-2nd-entry `m<n>`). Only
+// advanced on the `mo == 1` path, so the OFF stream + name space are unchanged. Reset per program.
+let MOSYM = 0
 // Total-node budget for the current program (branching only). NODEBUDGET caps how many genSlot
 // nodes a program's extra branches may spend; NODESUSED counts them. Set per program in go().
 let NODEBUDGET = 0
@@ -82,12 +96,17 @@ type Slot = {
   carriesAlt: i32,
   tyname: string, // leaf 6: the alias name of the literal union
   dummy: string, // leaf: a same-typed literal DIFFERENT from payload (the map `??` default)
+  dexp: string, // leaf: the PRINTED form of `dummy` (quotes stripped) — the map-2nd-entry oracle
   altTy: string, // kind 6: the decoy member type
   altVal: string, // kind 6: a literal of the decoy type
+  altExp: string, // kind 6: the PRINTED form the decoy arm reads back as (MULTIOBS union oracle)
+  altComposite: i32, // kind 6: 1 if altTy is `{w: i32}` (read the alt via `.w`, not directly)
   d1ty: string, // kind 4: decoy sibling field types/values
   d1v: string,
+  d1exp: string, // kind 4: PRINTED form of d1v (MULTIOBS struct-sibling oracle)
   d2ty: string,
   d2v: string,
+  d2exp: string, // kind 4: PRINTED form of d2v
   arg: i32, // kind 7: 0 → `() => T`, 1 → `(i32) => T`
   // ── BRANCHING (opt-in tree shapes; all default to the single-spine values above) ──
   kids: Slot[], // kind 4: 2 RECURSIVE composite decoy fields [a, z] (empty → the d1/d2 leaf pool)
@@ -114,12 +133,17 @@ function slot(
     carriesAlt: 0,
     tyname: "",
     dummy: "",
+    dexp: "",
     altTy: "",
     altVal: "",
+    altExp: "",
+    altComposite: 0,
     d1ty: "",
     d1v: "",
+    d1exp: "",
     d2ty: "",
     d2v: "",
+    d2exp: "",
     arg: 0,
     kids: [],
     nRep: 0,
@@ -222,7 +246,13 @@ function floatLeaf(leaf: i32, maxDigits: i32): Slot {
   let expected = sign + whole
   if frac != "0" { expected = payload }
   const s = slot(0, leaf, payload, expected, null)
-  if leaf == 2 { s.dummy = "14.5" } else { s.dummy = "15.5" }
+  if leaf == 2 {
+    s.dummy = "14.5"
+    s.dexp = "14.5"
+  } else {
+    s.dummy = "15.5"
+    s.dexp = "15.5"
+  }
   return s
 }
 
@@ -236,6 +266,7 @@ function genStrLeaf(): Slot {
   if c == 0 {
     const s = slot(0, 3, ch(34) + ch(34), "", null)
     s.dummy = dm
+    s.dexp = "zdmy"
     return s
   }
   if c == 1 {
@@ -244,6 +275,7 @@ function genStrLeaf(): Slot {
     const src = ch(34) + w1 + ch(92) + ch(34) + w2 + ch(34)
     const s = slot(0, 3, src, w1 + ch(34) + w2, null)
     s.dummy = dm
+    s.dexp = "zdmy"
     return s
   }
   if c == 2 {
@@ -252,6 +284,7 @@ function genStrLeaf(): Slot {
     const src = ch(34) + w1 + ch(92) + ch(92) + w2 + ch(34)
     const s = slot(0, 3, src, w1 + ch(92) + w2, null)
     s.dummy = dm
+    s.dexp = "zdmy"
     return s
   }
   if c == 3 {
@@ -264,11 +297,13 @@ function genStrLeaf(): Slot {
     const mb = ch(cp)
     const s = slot(0, 3, ch(34) + w1 + mb + w2 + ch(34), w1 + mb + w2, null)
     s.dummy = dm
+    s.dexp = "zdmy"
     return s
   }
   const w = genWord()
   const s = slot(0, 3, ch(34) + w + ch(34), w, null)
   s.dummy = dm
+  s.dexp = "zdmy"
   return s
 }
 
@@ -281,11 +316,13 @@ function genLeaf(): Slot {
       const v = genI32Val()
       const s = slot(0, 0, v, v, null)
       s.dummy = "12121"
+      s.dexp = "12121"
       return s
     }
     const d = genDigits(rr(1, 6))
     const s = slot(0, 0, d, d, null)
     s.dummy = "12121"
+    s.dexp = "12121"
     return s
   }
   if k == 1 {
@@ -293,12 +330,14 @@ function genLeaf(): Slot {
       const v = genI64Val()
       const s = slot(0, 1, v, v, null)
       s.dummy = "13131313131"
+      s.dexp = "13131313131"
       return s
     }
     // up to 18 digits — exercises the full i64 range, not just the i32-overlapping low end
     const d = genDigits(rr(1, 18))
     const s = slot(0, 1, d, d, null)
     s.dummy = "13131313131"
+    s.dexp = "13131313131"
     return s
   }
   if k == 2 {
@@ -307,6 +346,7 @@ function genLeaf(): Slot {
     let sl = slot(0, 2, d + ".0", d, null)
     if rr(0, 1) == 0 { sl = slot(0, 2, d + ".5", d + ".5", null) }
     sl.dummy = "14.5"
+    sl.dexp = "14.5"
     return sl
   }
   if k == 3 {
@@ -314,6 +354,7 @@ function genLeaf(): Slot {
     const w = genWord()
     const s = slot(0, 3, ch(34) + w + ch(34), w, null)
     s.dummy = ch(34) + "zdmy" + ch(34)
+    s.dexp = "zdmy"
     return s
   }
   if k == 4 {
@@ -323,13 +364,20 @@ function genLeaf(): Slot {
     let sl = slot(0, 4, d + ".0", d, null)
     if rr(0, 1) == 0 { sl = slot(0, 4, d + ".5", d + ".5", null) }
     sl.dummy = "15.5"
+    sl.dexp = "15.5"
     return sl
   }
   if k == 5 {
     let p = "true"
     if rr(0, 1) == 0 { p = "false" }
     const s = slot(0, 5, p, p, null)
-    if p == "true" { s.dummy = "false" } else { s.dummy = "true" }
+    if p == "true" {
+      s.dummy = "false"
+      s.dexp = "false"
+    } else {
+      s.dummy = "true"
+      s.dexp = "true"
+    }
     return s
   }
   // literal-union atom: a fresh named alias of 2-3 distinct members; payload is one member
@@ -351,8 +399,10 @@ function genLeaf(): Slot {
   s.tyname = name
   if pick == w1 {
     s.dummy = ch(34) + w2 + ch(34)
+    s.dexp = w2
   } else {
     s.dummy = ch(34) + w1 + ch(34)
+    s.dexp = w1
   }
   return s
 }
@@ -375,29 +425,43 @@ function pickAlt(s: Slot, c: Slot) {
   }
   while s.altTy == "" || s.altTy == childTy {
     const k = rr(0, 5)
+    // altExp = the alt arm's PRINTED read-back form (MULTIOBS oracle); altComposite marks the
+    // `{w: i32}` arm, whose value is read via `.w` (not printed directly).
     if k == 0 && numericLeaf == 0 {
       s.altTy = "i32"
       s.altVal = "77"
+      s.altExp = "77"
+      s.altComposite = 0
     }
     if k == 1 && numericLeaf == 0 {
       s.altTy = "i64"
       s.altVal = "5000000077"
+      s.altExp = "5000000077"
+      s.altComposite = 0
     }
     if k == 2 && numericLeaf == 0 {
       s.altTy = "f64"
       s.altVal = "9.25"
+      s.altExp = "9.25"
+      s.altComposite = 0
     }
     if k == 3 && atomLeaf == 0 {
       s.altTy = "string"
       s.altVal = ch(34) + "other" + ch(34)
+      s.altExp = "other"
+      s.altComposite = 0
     }
     if k == 4 {
       s.altTy = "boolean"
       s.altVal = "false"
+      s.altExp = "false"
+      s.altComposite = 0
     }
     if k == 5 {
       s.altTy = "{w: i32}"
       s.altVal = "{w: 77}"
+      s.altExp = "77"
+      s.altComposite = 1
     }
   }
 }
@@ -443,32 +507,40 @@ function pickDecoyField(which: i32, s: Slot) {
   const k = rr(0, 5)
   let ty = "i32"
   let v = "11"
+  let exp = "11" // PRINTED form of v (MULTIOBS sibling oracle) — differs from v only for `string`
   if k == 1 {
     ty = "f64"
     v = "2.5"
+    exp = "2.5"
   }
   if k == 2 {
     ty = "string"
     v = ch(34) + "dx" + ch(34)
+    exp = "dx"
   }
   if k == 3 {
     ty = "boolean"
     v = "true"
+    exp = "true"
   }
   if k == 4 {
     ty = "i64"
     v = "6000000000"
+    exp = "6000000000"
   }
   if k == 5 {
     ty = "f32"
     v = "3.5"
+    exp = "3.5"
   }
   if which == 1 {
     s.d1ty = ty
     s.d1v = v
+    s.d1exp = exp
   } else {
     s.d2ty = ty
     s.d2v = v
+    s.d2exp = exp
   }
 }
 
@@ -743,14 +815,84 @@ function guardCond(cond: string): string {
   return cond
 }
 
+// The PRINTED read-back value of a dummy twin (emitCtor dum=1): the dummy build carries no null and
+// no union decoy, so it always follows the carrier spine to the deepest leaf's `dexp`. Mirrors what
+// `emitRead(.., mo=0)` prints over a dummy value — the MULTIOBS map-second-entry oracle.
+function dummyExp(s: Slot): string {
+  if s.kind == 0 { return s.dexp }
+  const c = s.child
+  if c == null { return "-1" }
+  return dummyExp(c)
+}
+
+// The MULTIOBS `// @log` header: one `// @log <line>\n` per value the widened read prints, in the
+// EXACT runtime order emitRead(.., mo=1) emits them (carrier subtree first, then this node's decoy
+// observations). Twin of emitRead — the two must stay in lockstep (a drift shows instantly as a
+// MISMATCH under --multiobs, and never touches the byte-stable OFF path).
+function moLogLines(s: Slot): string {
+  if s.kind == 0 { return "// @log " + s.expected + "\n" }
+  const c = s.child
+  if c == null { return "// @log -1\n" }
+  if s.kind == 1 || s.kind == 2 || s.kind == 7 { return moLogLines(c) }
+  if s.kind == 3 {
+    if s.isNull == 1 { return "// @log NULL\n" }
+    return moLogLines(c)
+  }
+  if s.kind == 4 {
+    let r = moLogLines(c)
+    if s.kids.length == 2 {
+      r = r +
+        "// @log " +
+        s.kids[0].expected +
+        "\n" +
+        "// @log " +
+        s.kids[1].expected +
+        "\n"
+    } else {
+      r = r + "// @log " + s.d1exp + "\n" + "// @log " + s.d2exp + "\n"
+    }
+    return r
+  }
+  if s.kind == 5 {
+    let r = moLogLines(c)
+    if s.nRep >= 2 { r = r + "// @log " + dummyExp(c) + "\n" }
+    return r
+  }
+  // kind 6 union: the primary read prints the carrier subtree (or OTHER when it carries the decoy),
+  // then the alt second binding prints the decoy arm's read-back value.
+  let r = "// @log OTHER\n"
+  if s.carriesAlt == 0 { r = moLogLines(c) }
+  return r + "// @log " + s.altExp + "\n"
+}
+
 // Statements reading the payload reachable from `acc` and printing it. A nullable / union / map hop
-// binds a fresh temp (`t<n>`) to narrow on; struct/list/closure stay direct accessors.
-function emitRead(acc: string, s: Slot, tmp: i32): string {
+// binds a fresh temp (`t<n>`) to narrow on; struct/list/closure stay direct accessors. `mo` = 1
+// (MULTIOBS, root read only) additionally reads the observable DECOY values (struct siblings a/z,
+// the union decoy arm, the map second entry) — every extra read is gated on `mo`, so `mo` = 0 is
+// byte-identical to the historical single-carrier read (the pinned net + all decoy sub-reads).
+function emitRead(acc: string, s: Slot, tmp: i32, mo: i32): string {
   if s.kind == 0 { return "print(" + acc + ")\n" }
   const c = s.child
   if c == null { return "print(-1)\n" }
-  if s.kind == 1 || s.kind == 4 { return emitRead(acc + ".f", c, tmp) }
-  if s.kind == 2 { return emitRead(acc + "[0]", c, tmp) }
+  if s.kind == 1 { return emitRead(acc + ".f", c, tmp, mo) }
+  if s.kind == 4 {
+    let r = emitRead(acc + ".f", c, tmp, mo)
+    if mo == 1 {
+      if s.kids.length == 2 {
+        const b1 = 200 + MOSYM * 20
+        MOSYM = MOSYM + 1
+        const b2 = 200 + MOSYM * 20
+        MOSYM = MOSYM + 1
+        r = r +
+          emitRead(acc + ".a", s.kids[0], b1, 0) +
+          emitRead(acc + ".z", s.kids[1], b2, 0)
+      } else {
+        r = r + "print(" + acc + ".a)\n" + "print(" + acc + ".z)\n"
+      }
+    }
+    return r
+  }
+  if s.kind == 2 { return emitRead(acc + "[0]", c, tmp, mo) }
   if s.kind == 7 {
     if s.nArg >= 2 {
       let args = "1"
@@ -759,16 +901,16 @@ function emitRead(acc: string, s: Slot, tmp: i32): string {
         args = args + ", 1"
         j = j + 1
       }
-      return emitRead(acc + "(" + args + ")", c, tmp)
+      return emitRead(acc + "(" + args + ")", c, tmp, mo)
     }
-    if s.arg == 1 { return emitRead(acc + "(1)", c, tmp) }
-    return emitRead(acc + "()", c, tmp)
+    if s.arg == 1 { return emitRead(acc + "(1)", c, tmp, mo) }
+    return emitRead(acc + "()", c, tmp, mo)
   }
   const t = "t" + itoa(tmp)
   if s.kind == 5 {
     // read through `?? <same-shape dummy>`: the key is present, so the dummy must never win
     const d = emitCtor(c, 1)
-    return d.pre +
+    let r = d.pre +
       "const " +
       t +
       " = " +
@@ -780,10 +922,33 @@ function emitRead(acc: string, s: Slot, tmp: i32): string {
       "] ?? " +
       d.expr +
       "\n" +
-      emitRead(t, c, tmp + 1)
+      emitRead(t, c, tmp + 1, mo)
+    // MULTIOBS: also read the map's SECOND entry (present only under --branching, nRep >= 2). Its
+    // value is the same-typed dummy twin, so the oracle is dummyExp(c). Read in mo=0 (single line).
+    if mo == 1 && s.nRep >= 2 {
+      const d2 = emitCtor(c, 1)
+      const mnm = "m" + itoa(MOSYM)
+      const base = 300 + MOSYM * 20
+      MOSYM = MOSYM + 1
+      r = r +
+        d2.pre +
+        "const " +
+        mnm +
+        " = " +
+        acc +
+        "[" +
+        ch(34) +
+        "k1" +
+        ch(34) +
+        "] ?? " +
+        d2.expr +
+        "\n" +
+        emitRead(mnm, c, base, 0)
+    }
+    return r
   }
   if s.kind == 6 {
-    return "const " +
+    let r = "const " +
       t +
       " = " +
       acc +
@@ -791,12 +956,39 @@ function emitRead(acc: string, s: Slot, tmp: i32): string {
       "if " +
       guardCond(t + " is " + emitTy(c)) +
       " {\n" +
-      emitRead(t, c, tmp + 1) +
+      emitRead(t, c, tmp + 1, mo) +
       "} else {\nprint(" +
       ch(34) +
       "OTHER" +
       ch(34) +
       ")\n}\n"
+    // MULTIOBS: observe the DECOY arm too. A fresh binding of the full union type carrying the alt
+    // value, narrowed via `is <altTy>` (always true — altVal IS altTy) and read back. This exercises
+    // the non-carrier arm's boxing + narrowing the single-carrier oracle never touches.
+    if mo == 1 {
+      const u = "u" + itoa(MOSYM)
+      MOSYM = MOSYM + 1
+      let ar = "print(" + u + ")\n"
+      if s.altComposite == 1 { ar = "print(" + u + ".w)\n" }
+      r = r +
+        "const " +
+        u +
+        ": " +
+        emitTy(s) +
+        " = " +
+        s.altVal +
+        "\n" +
+        "if " +
+        guardCond(u + " is " + s.altTy) +
+        " {\n" +
+        ar +
+        "} else {\nprint(" +
+        ch(34) +
+        "UOTHER" +
+        ch(34) +
+        ")\n}\n"
+    }
+    return r
   }
   return "const " +
     t +
@@ -806,7 +998,7 @@ function emitRead(acc: string, s: Slot, tmp: i32): string {
     "if " +
     guardCond(t + " != null") +
     " {\n" +
-    emitRead(t, c, tmp + 1) +
+    emitRead(t, c, tmp + 1, mo) +
     "} else {\nprint(" +
     ch(34) +
     "NULL" +
@@ -817,12 +1009,12 @@ function emitRead(acc: string, s: Slot, tmp: i32): string {
 // Assemble one program placing the value at `pos` (0 local · 1 param · 2 return · 3 global) and
 // running `body` against it. `readBody` is "" for the construct-only variant (print(0) instead).
 function assemble(pos: i32, ty: string, b: Built, s: Slot): string {
-  const read = emitRead("v", s, 0)
+  const read = emitRead("v", s, 0, MULTIOBS)
   if pos == 1 {
     return "function useIt(p: " +
       ty +
       ") {\n" +
-      emitRead("p", s, 0) +
+      emitRead("p", s, 0, MULTIOBS) +
       "}\n" +
       "function go() {\n" +
       b.pre +
@@ -851,7 +1043,7 @@ function assemble(pos: i32, ty: string, b: Built, s: Slot): string {
       b.expr +
       "\n" +
       "function go() {\n" +
-      emitRead("g", s, 0) +
+      emitRead("g", s, 0, MULTIOBS) +
       "}\ngo()\n"
   }
   return "function go() {\n" +
@@ -910,6 +1102,7 @@ function go() {
     ALIASES = ""
     LUC = 0
     GSYM = 0
+    MOSYM = 0
     const d = rr(1, MAXDEPTH)
     // Total-node budget for this program's branches (branching only; unused when BRANCHING == 0,
     // and drawing no random keeps the OFF stream byte-stable). Scales with the drawn depth.
@@ -922,10 +1115,14 @@ function go() {
     let pos = rr(0, 3)
     if pos == 3 && b.pre != "" { pos = 2 }
     const shape = "// @shape p" + itoa(pos)
-    // The READ case: build + read-back (the round-trip oracle).
-    const prog = "// @run\n// @log " +
-      s.expected +
-      "\n" +
+    // The READ case: build + read-back (the round-trip oracle). OFF asserts the single carrier value;
+    // MULTIOBS asserts the carrier PLUS every observable decoy, one `// @log` line each (moLogLines
+    // stays lockstep with emitRead's mo=1 print order). moLogLines draws no random, so this leaves
+    // the OFF stream — and every downstream case — byte-identical.
+    let logHdr = "// @log " + s.expected + "\n"
+    if MULTIOBS == 1 { logHdr = moLogLines(s) }
+    const prog = "// @run\n" +
+      logHdr +
       shape +
       "r " +
       ty +

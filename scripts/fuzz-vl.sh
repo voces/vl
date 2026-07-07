@@ -14,6 +14,10 @@
 #   --branching     opt-in branching-TREE shapes: multi-element arrays/maps, structs with two
 #                   recursive composite fields, arity-3 unions, multi-param closures (total-node
 #                   budgeted). Same survey/report-only contract as --values; OFF → byte-identical.
+#   --multiobs      opt-in ORACLE WIDENING (multi-observation): after the buried carrier, also read
+#                   + assert the observable DECOY values (struct siblings a/z, the union decoy arm,
+#                   and — composing with --branching — the map's second entry), one extra `// @log`
+#                   line each. Same survey/report-only contract as --values; OFF → byte-identical.
 #   A mismatch / compile-fail / trap is a finding, printed with the failing case + the --seed to repro.
 #   Classes: REJECT (parse/type/emit error — the fail-loudly long tail), INVALID-WASM (emitted bytes
 #   fail validation — a soundness hole), TRAP (runtime error), MISMATCH (silent wrong result).
@@ -40,6 +44,7 @@ SHAPES_OUT=""
 QUIET=0
 VALUES=0
 BRANCHING=0
+MULTIOBS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --seed) SEED="$2"; shift 2 ;;
@@ -51,6 +56,7 @@ while [ $# -gt 0 ]; do
     --quiet) QUIET=1; shift ;;
     --values) VALUES=1; shift ;;  # opt-in value dimension (report-only survey; see header)
     --branching) BRANCHING=1; shift ;;  # opt-in branching-tree shapes (report-only survey; see header)
+    --multiobs) MULTIOBS=1; shift ;;  # opt-in oracle widening / multi-observation (report-only survey)
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
@@ -65,6 +71,7 @@ trap 'rm -rf "$WORK"' EXIT
 sed -e "s/^let SEED = .*/let SEED = $SEED/" -e "s/^let COUNT = .*/let COUNT = $COUNT/" -e "s/^let MAXDEPTH = .*/let MAXDEPTH = $DEPTH/" \
   -e "s/^let RICHVALUES = .*/let RICHVALUES = $VALUES/" \
   -e "s/^let BRANCHING = .*/let BRANCHING = $BRANCHING/" \
+  -e "s/^let MULTIOBS = .*/let MULTIOBS = $MULTIOBS/" \
   scripts/fuzzgen.vl > "$WORK/gen.vl"
 if ! "$VL" run "$WORK/gen.vl" --compiler "$SEED_WASM" > "$WORK/batch.txt" 2>"$WORK/generr.txt"; then
   echo "GENERATOR FAILED to run:"; cat "$WORK/generr.txt"; exit 2

@@ -24,6 +24,10 @@
 #   --branching     generate BRANCHING-tree shapes (fuzz-vl.sh --branching): multi-element
 #                   arrays/maps, structs with two recursive fields, arity-3 unions, multi-param
 #                   closures. A frontier the pinned net never samples — pair with --experimental.
+#   --multiobs      widen the ORACLE (fuzz-vl.sh --multiobs): also read + assert decoy siblings, the
+#                   union decoy arm, and (with --branching) the map's second entry. Surfaces
+#                   miscompiles the single-carrier oracle masks — pair with --experimental. Composes
+#                   with --branching.
 #   --experimental  report-only: classify + print non-baselined unsound findings but ALWAYS exit 0
 #                   (never fail the job). For a survey leg still surfacing many holes (e.g.
 #                   --branching), so the frontier is measured and artifacted without gating.
@@ -37,6 +41,7 @@ DEPTHS="4 5 6"
 BASELINE="scripts/rep-fuzz-baseline.txt"
 OUT_DIR=""
 BRANCHING=""
+MULTIOBS=""
 EXPERIMENTAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -46,12 +51,17 @@ while [ $# -gt 0 ]; do
     --baseline) BASELINE="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --branching) BRANCHING="--branching"; shift ;;
+    --multiobs) MULTIOBS="--multiobs"; shift ;;
     --experimental) EXPERIMENTAL=1; shift ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
+# EXTRA = the generalization flags passed through to fuzz-vl.sh (branching shapes and/or the widened
+# oracle); both compose. Word-split intentionally at the fuzz-vl.sh call (each is a bare flag token).
+EXTRA="$BRANCHING $MULTIOBS"
 MODE="pinned-grammar"
 [ -z "$BRANCHING" ] || MODE="branching-tree (experimental)"
+[ -z "$MULTIOBS" ] || MODE="$MODE + multi-observation (experimental)"
 
 [ -n "$OUT_DIR" ] || OUT_DIR="$(mktemp -d)"
 mkdir -p "$OUT_DIR"
@@ -82,8 +92,8 @@ done
 for s in "${seeds[@]}"; do
   d="${seed_depth[$s]}"
   echo; echo "-- running seed $s (depth $d) --"
-  # shellcheck disable=SC2086  # $BRANCHING is a single flag token or empty
-  ./scripts/fuzz-vl.sh --seed "$s" --count "$COUNT" --depth "$d" $BRANCHING \
+  # shellcheck disable=SC2086  # $EXTRA is bare flag tokens (--branching/--multiobs) or empty
+  ./scripts/fuzz-vl.sh --seed "$s" --count "$COUNT" --depth "$d" $EXTRA \
     --baseline "$BASELINE" --shapes-out "$OUT_DIR/seed_$s.tsv" --keep "$OUT_DIR/keep_$s" --quiet
 done
 
@@ -150,7 +160,7 @@ while IFS=$'\t' read -r class shape; do
     [ -f "$f" ] || continue
     if grep -qxF "$(printf '%s\t%s' "$class" "$shape")" "$f"; then
       d="${seed_depth[$s]}"
-      echo "    repro: scripts/fuzz-vl.sh --seed $s --count $COUNT --depth $d $BRANCHING"
+      echo "    repro: scripts/fuzz-vl.sh --seed $s --count $COUNT --depth $d $EXTRA"
       echo "    failing case + error kept at: $OUT_DIR/keep_$s/"
     fi
   done
