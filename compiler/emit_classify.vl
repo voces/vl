@@ -192,16 +192,8 @@ import {
   ctrlDepth,
   fRetBool,
   fRetKind,
-  fRetListKind,
-  fRetMap,
-  fRetNul,
-  fRetNulStr,
   fRetRArrElem,
-  fRetRef,
-  fRetScalar,
-  fRetStr,
   fRetStructIdx,
-  fRetUni,
   fRetVoid,
   fa32Used,
   fa64Used,
@@ -378,8 +370,8 @@ export function fnSigKeyOf(fe: i32) {
 
 // The VALUE-ABI return kind of lifted function `fe` for `$fnsig` purposes: `0`
 // (i32/boolean), `11` (f64), or `-1` (void / closure-returning / any other kind).
-// Annotated returns read the annotation; un-annotated ones ride the inferred fRet*
-// tables, plus a registry-INDEPENDENT f64 tail check (`tailIsF64NoLocal` — the
+// Annotated returns read the annotation; un-annotated ones ride the stored return
+// kind, plus a registry-INDEPENDENT f64 tail check (`tailIsF64NoLocal` — the
 // general `exprIsF64` consults the per-function locals registry, whose contents
 // depend on WHICH function is currently being emitted, so the key must not use it).
 export function cloRetKindOf(fe: i32) {
@@ -396,15 +388,12 @@ export function cloRetKindOf(fe: i32) {
       return -1
     }
     // Un-annotated: any inferred ref/i64/f32 kind is out of the value ABI; an f64
-    // tail is kind 11; everything else (i32 / boolean) rides the i32 result.
-    if fRetStr[fe] == 1 { return -1 }
-    if fRetListKind[fe] != 0 { return -1 }
-    if fRetUni[fe] == 1 { return -1 }
-    if fRetRef[fe] == 1 { return -1 }
-    if fRetNul[fe] == 1 { return -1 }
-    if fRetMap[fe] == 1 { return -1 }
-    if fRetScalar[fe] == "i64" || fRetScalar[fe] == "f32" { return -1 }
-    if fRetScalar[fe] == "f64" { return 11 }
+    // tail is kind 11; everything else (i32 / boolean) rides the i32 result. The
+    // `"nulstr"` niche deliberately falls through with `"i32"` — the historical flag
+    // ladder here never consulted `fRetNulStr`, so it kept riding the i32 result.
+    const irk = fRetKind[fe]
+    if irk == "f64" { return 11 }
+    if irk != "i32" && irk != "nulstr" { return -1 }
     if tailIsF64NoLocal(fnRetExprOf(fnStmts[fe]), fnStmts[fe]) { return 11 }
     return 0
   }
@@ -412,14 +401,14 @@ export function cloRetKindOf(fe: i32) {
 }
 
 // Whether the lifted callback at `fe` returns a STRING — its annotation (`: string`) or the
-// inferred `fRetStr`. `cloRetKindOf` folds string into -1 (it is outside the i32/f64 value
+// inferred `"str"` kind. `cloRetKindOf` folds string into -1 (it is outside the i32/f64 value
 // ABI), so `.map`/`.filter` consult this separately to pick the string-list result kind.
 export function cloRetIsString(fe: i32) {
   if fe < 0 || fe >= fnStmts.length { return false }
   const fn = P.nodes[fnStmts[fe]]
   if fn is FuncDecl {
     if fn.fnRet >= 0 { return nameIsString(tyNameOf(fn.fnRet)) }
-    if fe < fRetStr.length { return fRetStr[fe] == 1 }
+    if fe < fRetKind.length { return fRetKind[fe] == "str" }
   }
   false
 }
@@ -452,7 +441,7 @@ function tailIsF64NoLocal(ix: i32, fnArenaIx: i32) {
     if callee is Ident {
       const t = fnIndexOf(callee.identName)
       if t >= 0 {
-        if t < fRetScalar.length { return fRetScalar[t] == "f64" }
+        if t < fRetKind.length { return fRetKind[t] == "f64" }
       }
     }
     return false
@@ -472,56 +461,90 @@ export function fieldValueFeOf(valIx: i32) {
   -1
 }
 
-// The override chain from an UN-ANNOTATED function's inferred `fRet*` tables to its RESULT
-// valtype kind — the one place a new inferred-return kind is added. Shared by the named-function
-// functype-result emission and `cloRetValKind` (the closure result), so the two can no longer
-// drift (the f32/f64/i64 inferred-return holes were each one of these two sites missing a kind the
-// other had). LAST-MATCH wins, preserving the original override chains EXACTLY — the flags are NOT
-// all mutually exclusive (a struct-UNION return sets both `fRetUni` and `fRetRef`, and the later
-// `fRetRef` must win → kind 1). 0 (i32) when nothing matched. The closure- and variant-collapse
-// cases (kinds 14 / 8) and the `tailIsF64NoLocal` backup are layered by the callers — they are not
-// driven by these flags. Consulted only by `refreshFRetKind`'s snapshot below — every other reader
-// wants `inferredRetKindCore`, the flat table lookup.
-function retKindChainOf(ti: i32): VKind {
-  let k: VKind = "i32"
-  if fRetStr[ti] == 1 { k = "str" }
-  if fRetListKind[ti] == 2 { k = "list" }
-  if fRetUni[ti] == 1 { k = "union" }
-  if fRetRef[ti] == 1 { k = "struct" }
-  if fRetNul[ti] == 1 { k = "nulstruct" }
-  if fRetListKind[ti] == 5 { k = "reflist" }
-  if fRetListKind[ti] == 7 { k = "strlist" }
-  if fRetListKind[ti] == 12 { k = "f64list" }
-  if fRetListKind[ti] == 20 { k = "i64list" }
-  if fRetListKind[ti] == 21 { k = "f32list" }
-  if fRetMap[ti] == 1 { k = "map" }
-  if fRetNulStr[ti] == 1 { k = "nulstr" }
-  if fRetScalar[ti] != "i32" { k = fRetScalar[ti] }
-  k
-}
-
-// Snapshot `retKindChainOf` into `fRetKind` for every function — called once
-// `computeRetInference`'s fixed point converges (the `fRet*` flags the chain
-// reads never change again before any reader consults the snapshot). The
-// repOf fold's stored-`VKind`-slot pattern (`fRetScalar`, #824) applied to
-// `inferredRetKindCore` itself: the chain now runs ONCE per function instead
-// of once per CALL, and every call site becomes a flat lookup.
-export function refreshFRetKind() {
-  let ti = 0
-  while ti < fnStmts.length {
-    fRetKind[ti] = retKindChainOf(ti)
-    ti = ti + 1
-  }
+// The historical override-chain PRIORITY of a stored return kind — the position its
+// per-family flag held in the deleted `retKindChainOf` ladder (LAST-MATCH won, so a
+// higher position overrode a lower one; a struct-UNION return set both the union and
+// struct flags, and the later struct arm won). `criSetRetKind` lands a write only when
+// it outranks the current kind, so the eager per-fact writes resolve to EXACTLY the
+// kind the old post-fixpoint chain snapshot computed. The wide scalars share the top
+// tier: they were the chain's final override, and are mutually exclusive with each
+// other by the `"i32"`-guarded write sites.
+function retKindPri(k: VKind) {
+  if k == "str" { return 1 }
+  if k == "list" { return 2 }
+  if k == "union" { return 3 }
+  if k == "struct" { return 4 }
+  if k == "nulstruct" { return 5 }
+  if k == "reflist" { return 6 }
+  if k == "strlist" { return 7 }
+  if k == "f64list" { return 8 }
+  if k == "i64list" { return 9 }
+  if k == "f32list" { return 10 }
+  if k == "map" { return 11 }
+  if k == "nulstr" { return 12 }
+  if k == "i64" { return 13 }
+  if k == "f64" { return 13 }
+  if k == "f32" { return 13 }
   0
 }
 
-// The RESULT valtype KIND of an UN-ANNOTATED function's return, inferred by
-// `computeRetInference` and snapshotted into `fRetKind` (`refreshFRetKind`).
+// True if `k` is one of the LIST return kinds (the old `fRetListKind != 0`) — the
+// shared not-yet-a-list guard of `criClassify`'s list arms.
+function retKindIsList(k: VKind) {
+  k == "list" ||
+    k == "reflist" ||
+    k == "strlist" ||
+    k == "f64list" ||
+    k == "i64list" ||
+    k == "f32list"
+}
+
+// Store an inferred return-kind FACT for function `i`: the write lands only when it
+// outranks the current kind in the historical override-chain priority (`retKindPri`),
+// marking the `computeRetInference` fixed point dirty. True exactly when the write
+// landed — the struct/nulstruct arms gate their `fRetStructIdx` payload on it.
+function criSetRetKind(i: i32, k: VKind) {
+  if retKindPri(k) > retKindPri(fRetKind[i]) {
+    fRetKind[i] = k
+    criChanged = true
+    return true
+  }
+  false
+}
+
+// The stored return kind of an ANNOTATED return-type node `tyIx` — the annotation
+// flag producers applied in the historical `retKindChainOf` order (LAST-MATCH wins),
+// so `buildFnMap`'s seed byte-matches what the old per-flag tables resolved to. An
+// i64/f32 LIST annotation never flagged here (those codes were only ever inferred —
+// an annotated `i64[]` return rides the typed-IR path), so the producer set is
+// deliberately unchanged. A union-VARIANT annotation (`: Cat`) stays `"i32"` with its
+// variant index in `fRetStructIdx`, exactly as the flag tables left it.
+export function retAnnKindChain(tyIx: i32): VKind {
+  let k: VKind = "i32"
+  if retStrFlag(tyIx) == 1 { k = "str" }
+  const lk = retListKindFlag(tyIx)
+  if lk == 2 { k = "list" }
+  if retUnionFlag(tyIx) == 1 { k = "union" }
+  if retTRFlag(tyIx) == 1 { k = "struct" }
+  if retNulRefFlag(tyIx) == 1 { k = "nulstruct" }
+  if lk == 5 { k = "reflist" }
+  if lk == 7 { k = "strlist" }
+  if lk == 12 { k = "f64list" }
+  if retMapFlag(tyIx) == 1 { k = "map" }
+  if retNulStringFlag(tyIx) == 1 { k = "nulstr" }
+  if retI64Flag(tyIx) == 1 { k = "i64" }
+  if retF64Flag(tyIx) == 1 { k = "f64" }
+  if retF32Flag(tyIx) == 1 { k = "f32" }
+  k
+}
+
+// The RESULT valtype KIND of a function's return — the stored `fRetKind` slot
+// (seeded by `buildFnMap`, refined by `computeRetInference`'s eager writes).
 export function inferredRetKindCore(ti: i32): VKind { fRetKind[ti] }
 
 // The RESULT valtype KIND of lifted function `fe`'s `$fnsig` functype — the same kind the
 // function's OWN functype emits, read from an annotation (`vtKindOfType`) or the inferred
-// `fRet*` tables, so the closure functype byte-matches the callee. -1 for void (0 results)
+// stored return kind, so the closure functype byte-matches the callee. -1 for void (0 results)
 // and for the kinds still outside the value-call ABI (a ref-list / closure return — `5` /
 // `14` are minted by their own paths, not here). The slot (struct index for kinds 1 / 9)
 // comes from `cloRetValSlot`.
@@ -538,8 +561,8 @@ export function cloRetValKind(fe: i32): VKind | null {
     if fnReturnsClosure(fe) { return "closure" }
     // A callback that COLLAPSES to one concrete variant (`(a) => if a is Cat { a } else {
     // catShape }`) — the checker types it as that variant, so the `$fnsig` result is the
-    // variant struct (kind 8), NOT the union box. Checked BEFORE `fRetUni`, which the
-    // emitter's syntactic inference also sets for the narrowed receiver arm.
+    // variant struct (kind 8), NOT the union box. Checked BEFORE the `"union"` kind, which
+    // the emitter's syntactic inference also stores for the narrowed receiver arm.
     if cbRetVariantIdx(fe) >= 0 { return "variant" }
     // The shared inferred-return-kind mapping (the SAME one the named-function functype result
     // uses) — so a scalar/list/ref kind added there is reflected here too. The closure-specific
@@ -578,18 +601,19 @@ export function cloRetValSlot(fe: i32) {
     // A collapsed-to-one-variant inferred result (kind 8) — the variant index.
     const cvi = cbRetVariantIdx(fe)
     if cvi >= 0 { return cvi }
-    if fRetRef[fe] == 1 { return fRetStructIdx[fe] }
-    if fRetNul[fe] == 1 { return fRetStructIdx[fe] }
+    const srk = fRetKind[fe]
+    if srk == "struct" { return fRetStructIdx[fe] }
+    if srk == "nulstruct" { return fRetStructIdx[fe] }
     // An INFERRED map return (`() => (h)` over a captured/local map) — the map SHAPE from the
     // return expression (`mapRetExprShape`, capture-aware), so the `$fnsig` result matches the
     // returned map value's typed `$mapStruct`.
-    if fRetMap[fe] == 1 {
+    if srk == "map" {
       const mrx = fnRetExprOf(fnStmts[fe])
       if mrx >= 0 { return mapRetExprShape(mrx, fnStmts[fe]) }
     }
     // An inferred ref-list return (`() => [{…}]` / `() => [(x) => …]`, kind 5) — its element
     // NAME (`fRetRArrElem`, set by the return-classify scan) resolves the ref-list slot.
-    if fRetListKind[fe] == 5 { return rlSlotByName(fRetRArrElem[fe]) }
+    if srk == "reflist" { return rlSlotByName(fRetRArrElem[fe]) }
   }
   -1
 }
@@ -957,11 +981,11 @@ function globalIsNulMap(name: string) {
   letIsNulMap(li, -1)
 }
 
-// True if the function `name` returns a nullable struct (`fRetNul`).
+// True if the function `name` returns a nullable struct (`"nulstruct"`).
 function fnRetNulRef(name: string) {
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetNul[i] == 1
+  fRetKind[i] == "nulstruct"
 }
 
 // True if the `LetDecl` at `letIx` declares a nullable-struct local: its annotation
@@ -1227,7 +1251,7 @@ function globalIsNulString(name: string) {
 function fnRetNulString(name: string) {
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetNulStr[i] == 1
+  fRetKind[i] == "nulstr"
 }
 
 export function letIsNulString(letIx: i32, fnIx: i32) {
@@ -1265,7 +1289,7 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
     // A `string | null`-returning FIELD-closure call.
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return fRetNulStr[ffe] == 1 }
+      if ffe >= 0 { return fRetKind[ffe] == "nulstr" }
     }
     // FALLBACK (scoped to a CALL): a `string | null`-returning closure value call whose callee the
     // cases above miss — an INDEXED closure-array element (`arr[i](x)`). The cheap NO-RENDER
@@ -1336,7 +1360,7 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     // An `S | null`-returning FIELD-closure call.
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 && fRetNul[ffe] == 1 { return true }
+      if ffe >= 0 && fRetKind[ffe] == "nulstruct" { return true }
     }
     // `xs.pop()` / `xs.get(i)` over a STRUCT-element ref list yield `S | null` (the
     // host's nullable list reads — `pop` of an empty list / OOB `get` is null).
@@ -1541,41 +1565,36 @@ export function criClassify(rx0: i32, i: i32) {
   if rxe is BinExpr {
     if rxe.binOp == "=" { rx = rxe.binRight }
   }
-  if fRetStr[i] == 0 && exprString(rx, fnStmts[i]) {
-    fRetStr[i] = 1
-    criChanged = true
+  if fRetKind[i] != "str" && exprString(rx, fnStmts[i]) {
+    criSetRetKind(i, "str")
   }
-  if fRetListKind[i] == 0 && exprRefArray(rx, fnStmts[i]) {
-    fRetListKind[i] = 5
+  if !retKindIsList(fRetKind[i]) && exprRefArray(rx, fnStmts[i]) {
     // Record the element type-NAME so the inferred functype result can resolve its ref-list
     // slot (`rlSlotByName`) — the annotated path fills `fRetRArrElem` from the annotation, but
     // an un-annotated `return ps` / `return ps.filter(…)` must read it off the return expr.
-    if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
-      fRetRArrElem[i] = refListElemNameOfExpr(rx, fnStmts[i])
+    if criSetRetKind(i, "reflist") {
+      if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+        fRetRArrElem[i] = refListElemNameOfExpr(rx, fnStmts[i])
+      }
     }
-    criChanged = true
   }
-  if fRetListKind[i] == 0 && exprStringArray(rx, fnStmts[i]) {
-    fRetListKind[i] = 7
-    criChanged = true
+  if !retKindIsList(fRetKind[i]) && exprStringArray(rx, fnStmts[i]) {
+    criSetRetKind(i, "strlist")
   }
-  if fRetListKind[i] == 0 && exprF64Array(rx, fnStmts[i]) {
-    fRetListKind[i] = 12
-    criChanged = true
+  if !retKindIsList(fRetKind[i]) && exprF64Array(rx, fnStmts[i]) {
+    criSetRetKind(i, "f64list")
   }
-  // The i64/f32 siblings of the f64-list arm above (codes 20 / 21, wrappers `il64TypeIdx`
-  // / `fl32TypeIdx`). Checked BEFORE the generic `exprArray` arm below, which would
-  // otherwise claim an i64/f32-magnitude return as a plain i32 list (kind 2) — the
+  // The i64/f32 siblings of the f64-list arm above (wrappers `il64TypeIdx` /
+  // `fl32TypeIdx`). Checked BEFORE the generic `exprArray` arm below, which would
+  // otherwise claim an i64/f32-magnitude return as a plain i32 list — the
   // functype result would declare the i32-list wrapper over a body building the wide list.
-  if fRetListKind[i] == 0 && exprI64Array(rx, fnStmts[i]) {
-    fRetListKind[i] = 20
-    criChanged = true
+  if !retKindIsList(fRetKind[i]) && exprI64Array(rx, fnStmts[i]) {
+    criSetRetKind(i, "i64list")
   }
-  if fRetListKind[i] == 0 && exprF32Array(rx, fnStmts[i]) {
-    fRetListKind[i] = 21
-    criChanged = true
+  if !retKindIsList(fRetKind[i]) && exprF32Array(rx, fnStmts[i]) {
+    criSetRetKind(i, "f32list")
   }
-  if fRetMap[i] == 0 {
+  if fRetKind[i] != "map" {
     // `exprMap` classifies a returned map PARAM (reads `parType` directly) and a `Map()`/
     // map-returning-call. A returned map LOCAL needs `retIsMapLocalAnnot` — its kind isn't
     // collected during this GLOBAL return pass, so read its `{[string]: i32}` annotation.
@@ -1584,49 +1603,55 @@ export function criClassify(rx0: i32, i: i32) {
       retIsMapLocalAnnot(rx, fnStmts[i]) ||
       retCapturedMapShape(fnStmts[i], rx) != -3
     ) {
-      fRetMap[i] = 1
-      criChanged = true
+      criSetRetKind(i, "map")
     }
   }
-  // The `== 0` guard subsumes the old `fRetArr==0 && fRetF64Arr==0`: `exprArray`'s array-
+  // The not-a-list guard subsumes the old `fRetArr==0 && fRetF64Arr==0`: `exprArray`'s array-
   // literal case is `!arrLitIsRef`, and an f64 element is NOT a ref, so `exprArray` also
-  // claims an f64 literal (`[1.5, 2.5]`). The f64-list code was set just above, leaving
-  // `fRetListKind != 0`, so this skips it — no separate i32/f64 mis-classification.
-  if fRetListKind[i] == 0 && exprArray(rx, fnStmts[i]) {
-    fRetListKind[i] = 2
-    criChanged = true
+  // claims an f64 literal (`[1.5, 2.5]`). The f64-list kind was set just above, so this
+  // skips it — no separate i32/f64 mis-classification.
+  if !retKindIsList(fRetKind[i]) && exprArray(rx, fnStmts[i]) {
+    criSetRetKind(i, "list")
   }
-  if fRetUni[i] == 0 && exprUnion(rx, fnStmts[i]) {
-    fRetUni[i] = 1
+  if fRetKind[i] != "union" && exprUnion(rx, fnStmts[i]) {
     // A union return SUBSUMES a per-arm struct classification: a value-if join (`if c {
     // catVal } else { dogVal }`) has one arm a union-VARIANT object literal (which
     // `exprStruct` would also claim as a plain struct return) and another the union. If the
-    // struct arm was classified FIRST it set `fRetRef` while `fRetUni` was still 0 (the
-    // `fRetRef` guard only blocks the reverse order). Clear it so the union wins — else the
-    // inferred-result valtype declares a struct ref over a body that yields the union box.
-    // Lambda-gated: only the lambda value-if path (above) sets both, and a named function's
-    // classification must stay byte-identical.
-    if criFnIsAnonLambda(i) { fRetRef[i] = 0 }
-    criChanged = true
-  }
-  if fRetNul[i] == 0 && fRetUni[i] == 0 && exprNullableStruct(rx, fnStmts[i]) {
-    fRetNul[i] = 1
-    fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
-    criChanged = true
+    // struct arm was classified FIRST it stored `"struct"` while the union was still unseen
+    // (the struct arm's guard only blocks the reverse order) — and struct OUTRANKS union in
+    // the chain, so a plain `criSetRetKind` would refuse. Overwrite so the union wins — else
+    // the inferred-result valtype declares a struct ref over a body that yields the union
+    // box. Lambda-gated: only the lambda value-if path (above) hits this order, and a named
+    // function's classification must stay byte-identical.
+    if fRetKind[i] == "struct" && criFnIsAnonLambda(i) {
+      fRetKind[i] = "union"
+      criChanged = true
+    } else {
+      criSetRetKind(i, "union")
+    }
   }
   if (
-    fRetRef[i] == 0 &&
-    fRetNul[i] == 0 &&
-    fRetUni[i] == 0 &&
+    fRetKind[i] != "nulstruct" &&
+    fRetKind[i] != "union" &&
+    exprNullableStruct(rx, fnStmts[i])
+  ) {
+    if criSetRetKind(i, "nulstruct") {
+      fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+    }
+  }
+  if (
+    fRetKind[i] != "struct" &&
+    fRetKind[i] != "nulstruct" &&
+    fRetKind[i] != "union" &&
     exprStruct(rx, fnStmts[i])
   ) {
-    // GUARD `fRetUni == 0`: an INFERRED struct-union return (`Cat | Dog`) sets `fRetUni`
+    // GUARD `!= "union"`: an INFERRED struct-union return (`Cat | Dog`) stores `"union"`
     // in the A20 name pass, but each of its returns is a SINGLE object literal that
     // `exprStruct` would (wrongly) also classify as a plain struct return — the union
-    // flag dominates, so don't also set `fRetRef`/`fRetStructIdx` (a conflicting rep).
-    fRetRef[i] = 1
-    fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
-    criChanged = true
+    // kind dominates, so don't claim `"struct"`/`fRetStructIdx` (a conflicting rep).
+    if criSetRetKind(i, "struct") {
+      fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+    }
   }
   // A returned LOCAL `let` of a REF kind (`const c: Ctx = {…}; return c`,
   // `const xs = [[1,2]]; return xs`): during this GLOBAL pass the function's
@@ -1639,26 +1664,26 @@ export function criClassify(rx0: i32, i: i32) {
   // inferred-return name (the A20 pass) already covers them.
   const rll = criRetLocalLet(rx, i)
   if rll >= 0 {
-    if fRetListKind[i] == 0 && letIsRefArray(rll, fnStmts[i]) {
-      fRetListKind[i] = 5
-      if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
-        fRetRArrElem[i] = letRefListElemName(rll, fnStmts[i])
+    if !retKindIsList(fRetKind[i]) && letIsRefArray(rll, fnStmts[i]) {
+      if criSetRetKind(i, "reflist") {
+        if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+          fRetRArrElem[i] = letRefListElemName(rll, fnStmts[i])
+        }
       }
-      criChanged = true
     }
     if (
-      fRetRef[i] == 0 &&
-      fRetNul[i] == 0 &&
-      fRetUni[i] == 0 &&
-      fRetListKind[i] == 0 &&
+      fRetKind[i] != "struct" &&
+      fRetKind[i] != "nulstruct" &&
+      fRetKind[i] != "union" &&
+      !retKindIsList(fRetKind[i]) &&
       letIsStruct(rll, fnStmts[i])
     ) {
       // `structIndexOfLet` prefers the ANNOTATION's struct over the literal's
       // first field-shape match, so `const c: Ctx = {…}` returns Ctx even when
       // another declared struct shares its field names.
-      fRetRef[i] = 1
-      fRetStructIdx[i] = structIndexOfLet(rll, fnStmts[i])
-      criChanged = true
+      if criSetRetKind(i, "struct") {
+        fRetStructIdx[i] = structIndexOfLet(rll, fnStmts[i])
+      }
     }
   }
   if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
@@ -1674,31 +1699,15 @@ export function criClassify(rx0: i32, i: i32) {
   // coalesce reads as its unboxed atom (`exprIsF64`/`exprIsI64`) but its result REP is the union
   // box, classified separately — so exclude it, and skip when another return flag already claimed
   // the function.
-  let scalarOk = fRetStr[i] == 0 &&
-    fRetListKind[i] == 0 &&
-    fRetMap[i] == 0 &&
-    fRetUni[i] == 0 &&
-    fRetNul[i] == 0 &&
-    fRetNulStr[i] == 0 &&
-    fRetRef[i] == 0 &&
-    fRetBool[i] == 0
+  let scalarOk = fRetKind[i] == "i32" && fRetBool[i] == 0
   const rxn = P.nodes[rx]
   if rxn is BinExpr {
     if rxn.binOp == "??" { scalarOk = false }
   }
   if scalarOk {
-    if fRetScalar[i] == "i32" && exprIsF64(rx, fnStmts[i]) {
-      fRetScalar[i] = "f64"
-      criChanged = true
-    }
-    if fRetScalar[i] == "i32" && exprIsF32(rx, fnStmts[i]) {
-      fRetScalar[i] = "f32"
-      criChanged = true
-    }
-    if fRetScalar[i] == "i32" && exprIsI64(rx, fnStmts[i]) {
-      fRetScalar[i] = "i64"
-      criChanged = true
-    }
+    if exprIsF64(rx, fnStmts[i]) { criSetRetKind(i, "f64") }
+    else if exprIsF32(rx, fnStmts[i]) { criSetRetKind(i, "f32") }
+    else if exprIsI64(rx, fnStmts[i]) { criSetRetKind(i, "i64") }
   }
   0
 }
@@ -4320,14 +4329,14 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOf(callee.identName)
-      if target >= 0 { return fRetScalar[target] == "i64" }
+      if target >= 0 { return fRetKind[target] == "i64" }
       // An i64-returning function VALUE (a binding / `(…) => i64` param callee).
       return calleeReturnsI64(callee.identName, fnIx)
     }
     // An i64-returning FIELD-closure call (`o.f(x)` over an `(…) => i64` field).
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return fRetScalar[ffe] == "i64" }
+      if ffe >= 0 { return fRetKind[ffe] == "i64" }
     }
     return false
   }
@@ -4439,7 +4448,7 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOf(callee.identName)
-      if target >= 0 { return fRetScalar[target] == "f32" }
+      if target >= 0 { return fRetKind[target] == "f32" }
     }
     return false
   }
@@ -4569,7 +4578,7 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOf(callee.identName)
-      if target >= 0 { return fRetScalar[target] == "f64" }
+      if target >= 0 { return fRetKind[target] == "f64" }
       // A function-VALUE (closure) callee returning f64 — its result routes as f64.
       return calleeReturnsF64(callee.identName, fnIx)
     }
@@ -6195,7 +6204,7 @@ export function retNulRefIndex(tyIx: i32) {
 }
 
 // `1` if the type-annotation node at `tyIx` names the struct, else `0` (i32 / none).
-// Used for functype param/result valtypes and the `fRetRef` table. Returning the
+// Used for functype param/result valtypes and the `"struct"` return kind. Returning the
 // flag (not pushing bytes) keeps each call free of a `0→1` local reassignment, which
 // pins a `let x = 0` to the literal `0` type and fails to typecheck.
 export function retTRFlag(tyIx: i32) {
@@ -6336,8 +6345,8 @@ export function retNulRefArrFlag(tyIx: i32) {
 
 // The folded LIST-rep code of a function RETURN annotation `tyIx`: `2` i32-list, `5`
 // ref-list, `7` string-list, `12` f64-list, or `0` (not a list). The four `nameIs*Array`
-// predicates are mutually exclusive by name, so the priority order is immaterial. Drives
-// the single `fRetListKind` table (was `retArrFlag`/`retRefArrFlag`/`retStrArrFlag`/
+// predicates are mutually exclusive by name, so the priority order is immaterial. Feeds
+// the list arms of `retAnnKindChain` (was `retArrFlag`/`retRefArrFlag`/`retStrArrFlag`/
 // `retF64ArrFlag` into four parallel boolean tables).
 export function retListKindFlag(tyIx: i32) {
   if retArrFlag(tyIx) == 1 { return 2 }
@@ -8946,11 +8955,11 @@ export function variantFieldIndex(vi: i32, field: string) {
 }
 
 // True if the function `name` declares the struct as its return type (flat lookup
-// over the `fRetRef` flags `buildFnMap` recorded — no arena rescan).
+// over the stored kind `buildFnMap` recorded — no arena rescan).
 function fnRetStruct(name: string) {
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetRef[i] == 1
+  fRetKind[i] == "struct"
 }
 
 // True if the parameter `name` of function `fnIx` is the struct type.
@@ -9005,7 +9014,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
       ) {
         const cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
         if cfe >= 0 {
-          if fRetRef[cfe] == 1 { return true }
+          if fRetKind[cfe] == "struct" { return true }
         }
       }
     }
@@ -9452,7 +9461,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
       ) {
         const cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
         if cfe >= 0 {
-          if fRetRef[cfe] == 1 || fRetNul[cfe] == 1 {
+          if fRetKind[cfe] == "struct" || fRetKind[cfe] == "nulstruct" {
             return fRetStructIdx[cfe]
           }
         }
@@ -9565,7 +9574,7 @@ export function structIndexOfLet(letIx: i32, fnIx: i32) {
 function fnRetUnion(name: string) {
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetUni[i] == 1
+  fRetKind[i] == "union"
 }
 
 // True if the parameter `name` of function `fnIx` is the union type.
@@ -9597,7 +9606,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // A union-returning FIELD-closure call.
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return fRetUni[ffe] == 1 }
+      if ffe >= 0 { return fRetKind[ffe] == "union" }
     }
     return nodeTyIsUnion(exprIx)
   }
@@ -10126,7 +10135,7 @@ export function objVariantName(objIx: i32) {
 function fnRetArray(name: string) {
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetListKind[i] == 2
+  fRetKind[i] == "list"
 }
 
 // True if the already-collected declared local `name` is an i32-array ref (code `2`).
@@ -10282,7 +10291,7 @@ export function letIsArray(letIx: i32, fnIx: i32) {
 function fnRetRefArray(name: string) {
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetListKind[i] == 5
+  fRetKind[i] == "reflist"
 }
 
 // True if the parameter `name` of function `fnIx` is a ref-array type.
@@ -10684,12 +10693,12 @@ function nestedRefListElemIs(idxArr: i32, fnIx: i32, elemKind: i32) {
 function declaredStringArray(name: string) { declaredKind(name) == "strlist" }
 
 // True if function `name` declares (or, un-annotated, infers) a `string[]` return type
-// (`fRetListKind` == 7). Mirrors `fnRetArray`/`fnRetRefArray` — lets a `string[]`-returning call
+// (`"strlist"`). Mirrors `fnRetArray`/`fnRetRefArray` — lets a `string[]`-returning call
 // classify so an untyped `let x = snap()` picks the string-list local kind (code `7`).
 function fnRetStringArray(name: string) {
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetListKind[i] == 7
+  fRetKind[i] == "strlist"
 }
 
 // True if function `name` declares (or, un-annotated, infers) an `f64[]` return — the f64
@@ -10698,16 +10707,16 @@ function fnRetStringArray(name: string) {
 function fnRetF64Array(name: string) {
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetListKind[i] == 12
+  fRetKind[i] == "f64list"
 }
 
 // True if function `name` returns a string-keyed mono map (`{[string]: i32}`, annotated or
-// inferred — `fRetMap`). Lets `exprMap`/`mapShapeOfExpr` classify a call to it, so
+// inferred — `"map"`). Lets `exprMap`/`mapShapeOfExpr` classify a call to it, so
 // `const r = mk()` (or `mk()[k]`) routes through the map lowering.
 function fnRetMap(name: string) {
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetMap[i] == 1
+  fRetKind[i] == "map"
 }
 
 // True if evaluating the expression at `exprIx` yields a string list: a string-element
@@ -10951,7 +10960,7 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
     if cloArrCallRetKind(exprIx, fnIx) == "f64list" { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      // A NAMED function returning `f64[]` (annotated or inferred, `fRetListKind` == 12).
+      // A NAMED function returning `f64[]` (annotated or inferred, `"f64list"`).
       if fnRetF64Array(callee.identName) { return true }
       // A closure-VALUE call (`g(x)` with `g: (i32) => f64[]`) whose resolved sig
       // result is the f64 list (`>D`).
@@ -10985,7 +10994,7 @@ function globalIsF32Array(name: string) {
 function fnRetF32Array(name: string) {
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetListKind[i] == 21
+  fRetKind[i] == "f32list"
 }
 
 export function letIsF32Array(letIx: i32, fnIx: i32) {
@@ -11708,7 +11717,7 @@ function fnRetString(name: string) {
   if name == "toString" { return true }
   const i = fnIndexOf(name)
   if i < 0 { return false }
-  fRetStr[i] == 1
+  fRetKind[i] == "str"
 }
 
 // True if the parameter `name` of function `fnIx` is `string`-typed.
@@ -11799,7 +11808,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // A string-returning FIELD-closure call (`o.label(3)` over a `(i32) => string` field).
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return fRetStr[ffe] == 1 }
+      if ffe >= 0 { return fRetKind[ffe] == "str" }
     }
     // A closure-VALUE call whose callee sig the per-NAME resolvers above cannot key — a local
     // whose closure type was inferred from a Member/Index init (`const t0 = v[0].f`, a

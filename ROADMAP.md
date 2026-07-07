@@ -72,11 +72,12 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      Foundation SHIPPED (→ `CHANGELOG.md`): `emit_rep.vl`'s `RepDesc` derived table-driven from the
      `Ty` arena (cycle-safe: kind arms recurse ≤1 wrapper level; generation-stamped visited marks),
      with the print-import scan exact, `vtKindOfType` delegated, `$fnsig` tokens on one vocabulary,
-     and the first `fRet*` fold. REMAINING migration order: (a) fold the remaining ~16 `fRet*`
-     tables to stored `VKind` (makes `inferredRetKindCore` a read); (b) move `sigKeyRetKind`
-     consumers off raw codes onto `VKind`, then delete `repLegacyCodeOfKind`; (c) `annSigKey`/
-     `fnSigKeyOf` onto the token table; (d) widen `repOfTy` coverage (typed-value maps,
-     litunion/union-element arrays); (e) the SLOT layer — STRUCT table DONE (structural
+     and the `fRet*` fold COMPLETE (every per-family flag table folded into the stored
+     `fRetKind: VKind[]`; `inferredRetKindCore` is a plain read — → `CHANGELOG.md`).
+     REMAINING migration order: (a) move `sigKeyRetKind`
+     consumers off raw codes onto `VKind`, then delete `repLegacyCodeOfKind`; (b) `annSigKey`/
+     `fnSigKeyOf` onto the token table; (c) widen `repOfTy` coverage (typed-value maps,
+     litunion/union-element arrays); (d) the SLOT layer — STRUCT table DONE (structural
      heap-type dedup: `repCanonKey` → `sTwin` → shared `sHeapIdx`, fixing the structural-twin
      invalid-wasm bug `takeA(b)` where `A`/`B` are structurally-identical declared types; see
      `DECISIONS.md`). REMAINING: the REF-LIST table (`rlSlotByName` — a `B[]` still interns a
