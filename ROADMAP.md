@@ -262,6 +262,15 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   closures + function-valued struct fields shipped (#310); `.map`/`.filter` EMIT is the next slice
   (see Next). REMAINING (host): **untyped** lambdas (a stored closure has one signature — needs
   pinning-by-use or boxing).
+- ⬜ **B15a. Optional params + default values.** Wanted (owner, 2026-07); neither parses today
+  (`p?: T` and `p: T = e` are both parse errors — verified). Design intent: **defaults subsume
+  optionals** — VL has real `null` unions, so `p?: T` is sugar for `p: T | null = null`; one
+  mechanism, two spellings. v1 = **direct-call-site sugar only**: the callee keeps full arity and
+  the checker/emitter fill omitted trailing args with the default expression at each direct call;
+  function VALUES keep the full signature (the `$fnsig` closure ABI is untouched — do NOT multiply
+  rep signatures; that seam is mid-rewrite). Sequencing: after the rep Phase-2 `$fnsig` interning
+  wave, since both touch call classification. Intrinsics don't wait on this — `__trap__(msg?)`
+  (error-handling-design.md) is bespoke checker arity, like existing builtins.
 - ⬜ **B16. Redeclaration / overloading.** Current: same-scope redeclaration errors; nested shadowing
   allowed (uniquified in codegen). Future: ad-hoc overloading? Default "no" → `DECISIONS.md`.
 - 🟡 **B17. Diagnostics + lint.** BUILD OUT — the lint rule backlog (a few at a time). Shipped (see
