@@ -7672,7 +7672,10 @@ export function nameFieldCode(t: string) {
 // mis-splits a `(...)`-grouped arm): used ONLY by `internShapeDeep`'s union-arm interning, where
 // a grouped arm must stay whole (`(i32|null)[] | null` → `(i32|null)[]` + `null`; a struct arm
 // with a grouped element list `{f: (boolean|string)[]} | f64` splits at its real top seam). A
-// name with no top-level `|` appends one arm.
+// TOP-LEVEL `=>` absorbs the rest of the name into the current arm, exactly like
+// `splitUnionAtoms`: `(i32) => i32 | {w: i32}` is ONE function-type atom whose `|` binds to the
+// RETURN (splitting it interned a bogus `{w: i32}` struct arm — a shape-order side effect that
+// regressed the pinned net). A name with no top-level `|` appends one arm.
 function splitUnionArmsAllDepth(nm: string, out: string[]) {
   let depth = 0
   let inStr = false
@@ -7688,7 +7691,15 @@ function splitUnionArmsAllDepth(nm: string, out: string[]) {
       depth = depth + 1
     } else if c == '}' || c == ']' || c == ')' {
       depth = depth - 1
-    } else if c == '|' && depth == 0 {
+    } else if (
+      c == '=' &&
+      depth == 0 &&
+      i + 1 < nm.length &&
+      nm[i + 1] == '>'
+    ) {
+      // Top-level function arrow: the remainder (its return, `|`s included) is this arm's.
+      break
+    } else if (c == '|' && depth == 0) {
       out.push(nm.slice(start, i))
       start = i + 1
     }
@@ -11546,6 +11557,11 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     // map VALUE type (mono/atom ⇒ -1, else the value name's mv slot). Mirrors the `exprMap` fallback and
     // `structIndexOfExpr`'s `nodeTyName` struct fallback, so `v()[k] ?? d` picks the right value rep.
     if nodeTyIsMap(exprIx) {
+      // An ATOM-valued map (`{[string]: K0}`) is the MONO i32 map, but its RENDERED value
+      // name collapses to `string` (`tyToEmitName` widens each member literal) — which the
+      // slot resolver would treat as a slot-less STRING-valued map and reject loudly. Gate
+      // on the checker's recorded litunion first (the atom map has no slot by design).
+      if nodeTyMapValIsLitUnion(exprIx) { return -1 }
       return mvSlotOfMapValNameOrMono(nodeTyMapValName(exprIx))
     }
     return -1
