@@ -63,8 +63,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      soundness): **(a) ref-VALUE map-union arms** (`{[string]: S} | X`, `{[string]: () => T} | X`,
      `{[string]: A|B} | X`) — a #860-style heap-type-identity hazard, deferred from #865 as a loud
      reject (`error-map-member-refvalue.vl`); needs the map-value heap type to dedup across the box
-     seam before the guard can lift; **(b) array of a UNION element** (`(C | D)[]`) — `splitUnionAtoms`
-     needs paren-depth tracking (module-wide, real fixpoint risk); never unsound; **(c)** the map
+     seam before the guard can lift; **(c)** the map
      READER path through the value-call ABI (construct-and-return is fixed, #860); **(d)** niche
      nullable-scalar lists `(boolean|null)[]`/`(f64|null)[]` (clean rejects, no box rep) + the
      lambda-param i64-context deferral tail. Keep graduating baseline shapes as fixes land.
