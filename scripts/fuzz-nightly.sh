@@ -28,6 +28,11 @@
 #                   union decoy arm, and (with --branching) the map's second entry. Surfaces
 #                   miscompiles the single-carrier oracle masks — pair with --experimental. Composes
 #                   with --branching.
+#   --declared      DECLARED-TYPES dimension (fuzz-vl.sh --declared): hoist struct-flavored shapes to
+#                   `type Tn = {...}` declarations — declared spelling, structural twins, and the
+#                   mixed declared/inline seam (PR #911's dup-heap shapes). A frontier the inline-only
+#                   pinned net never samples — pair with --experimental. Composes with --branching/
+#                   --multiobs.
 #   --experimental  report-only: classify + print non-baselined unsound findings but ALWAYS exit 0
 #                   (never fail the job). For a survey leg still surfacing many holes (e.g.
 #                   --branching), so the frontier is measured and artifacted without gating.
@@ -42,6 +47,7 @@ BASELINE="scripts/rep-fuzz-baseline.txt"
 OUT_DIR=""
 BRANCHING=""
 MULTIOBS=""
+DECLARED=""
 EXPERIMENTAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,16 +58,19 @@ while [ $# -gt 0 ]; do
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --branching) BRANCHING="--branching"; shift ;;
     --multiobs) MULTIOBS="--multiobs"; shift ;;
+    --declared) DECLARED="--declared"; shift ;;
     --experimental) EXPERIMENTAL=1; shift ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
-# EXTRA = the generalization flags passed through to fuzz-vl.sh (branching shapes and/or the widened
-# oracle); both compose. Word-split intentionally at the fuzz-vl.sh call (each is a bare flag token).
-EXTRA="$BRANCHING $MULTIOBS"
+# EXTRA = the generalization flags passed through to fuzz-vl.sh (branching shapes, the widened
+# oracle, and/or the declared-types dimension); all compose. Word-split intentionally at the
+# fuzz-vl.sh call (each is a bare flag token).
+EXTRA="$BRANCHING $MULTIOBS $DECLARED"
 MODE="pinned-grammar"
 [ -z "$BRANCHING" ] || MODE="branching-tree (experimental)"
 [ -z "$MULTIOBS" ] || MODE="$MODE + multi-observation (experimental)"
+[ -z "$DECLARED" ] || MODE="$MODE + declared-types (experimental)"
 
 [ -n "$OUT_DIR" ] || OUT_DIR="$(mktemp -d)"
 mkdir -p "$OUT_DIR"

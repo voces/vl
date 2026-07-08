@@ -56,6 +56,28 @@ let BRANCHING = 0
 // RICHVALUES/BRANCHING it WIDENS what the pinned seeds observe, so it surfaces un-baselineable
 // findings on pre-existing rep holes — a report-only survey, never a pinned-seed gate.
 let MULTIOBS = 0
+// Opt-in DECLARED-TYPES dimension (fuzz-vl.sh `--declared`). OFF (the default, and the pinned-CI
+// net) draws EXACTLY the master stream — the whole declared block below is guarded by
+// `if DECLTYPES == 1` and placed AFTER every master draw for the case (pos included), and `&&`
+// short-circuits, so the OFF batch is byte-identical and the rep-fuzz baseline needs zero churn.
+// ON: for a case whose near-root type is struct-flavored (a struct, a struct[], or a struct|null),
+// the struct is optionally HOISTED to a `type Tn = {...}` declaration and the annotation spells it
+// by NAME — surfacing the declared-vs-inline heap-type seam the inline-only vocabulary leaves dark
+// (PR #911 pinned two live INVALID-WASM/REJECT miscompiles there that no inline shape could reach).
+// Four variants (see the block in go()): a single-site declared annotation, structural TWINS
+// (`type A`/`type B` identical, value made as A flows into a B param), and the MIXED seam (a
+// declared value into an inline-shape param, or an inline value into a declared param). The VALUE
+// stays a structural literal throughout (VL never names a type at a struct literal), so the seam is
+// entirely which SPELLING each annotation carries. The `@shape` line encodes declaredness with a
+// stable `decl:`/`twin:`/`mix:` marker on the affected node (never the minted `Tn`, which would leak
+// a counter), and the `@log` oracle is unchanged (reads are field/index accessors, name-agnostic).
+// Like RICHVALUES/BRANCHING/MULTIOBS this relocates the sample onto a pre-existing seam — a
+// report-only survey, never a pinned-seed gate.
+let DECLTYPES = 0
+// Per-case buffer of `type Tn = {...}` declarations (DECLTYPES only) + the `Tn` gensym counter.
+// Emitted right after ALIASES (before the functions), like the literal-union aliases. Reset per case.
+let DECLS = ""
+let TSYM = 0
 // Gensym for MULTIOBS-injected read temps (union alt bindings `u<n>`, map-2nd-entry `m<n>`). Only
 // advanced on the `mo == 1` path, so the OFF stream + name space are unchanged. Reset per program.
 let MOSYM = 0
@@ -114,6 +136,12 @@ type Slot = {
   uni2: string, // kind 6: a 3rd non-admitting decoy arm type (arity-3 union; "" → arity-2)
   uni2v: string, // kind 6: a literal of the 3rd arm (unused by the oracle; kept for symmetry)
   nArg: i32, // kind 7: i32 param arity when > 1 (`(i32, i32) => T`); 0 → use `arg`
+  // ── DECLTYPES (opt-in declared-types dimension; "" default → the inline spelling everywhere) ──
+  // When non-empty on a struct node (kind 1/4), emitTy emits THIS text instead of the node's inline
+  // `{...}` body — a declared type name (`T0`) for code emission, or a marker (`decl:{...}`) for the
+  // stable `@shape` signature. Set only on the DECLTYPES == 1 path (see the block in go()); always ""
+  // otherwise, so the guard in emitTy is inert and the OFF stream is byte-identical.
+  declName: string,
 }
 
 function slot(
@@ -150,6 +178,7 @@ function slot(
     uni2: "",
     uni2v: "",
     nArg: 0,
+    declName: "",
   }
 }
 
@@ -647,6 +676,10 @@ function memberTy(c: Slot): string {
 }
 
 function emitTy(s: Slot): string {
+  // DECLTYPES: a struct node hoisted to a declaration emits its NAME (or, for the @shape line, a
+  // `<marker>:{...}` token) instead of its inline body. Always "" off the declared path, so this
+  // guard is inert and every other knob's stream is unchanged.
+  if s.declName != "" { return s.declName }
   if s.kind == 0 {
     if s.leaf == 6 { return s.tyname }
     return leafTy(s.leaf)
@@ -1006,6 +1039,67 @@ function emitRead(acc: string, s: Slot, tmp: i32, mo: i32): string {
     ")\n}\n"
 }
 
+// ── DECLTYPES helpers (only ever reached on the DECLTYPES == 1 path) ──────────────────────────
+// The INLINE `{...}` body of a struct node (kind 1/4), bypassing its own declName (children still
+// go through emitTy, so a nested declared type — never minted here, only P is — would still name).
+// Mirrors emitTy's kind-1/kind-4 arms exactly; this is what a `type Tn = <body>` declaration binds.
+function structBody(s: Slot): string {
+  const c = s.child
+  if c == null { return "{f: i32}" }
+  if s.kind == 1 { return "{f: " + emitTy(c) + "}" }
+  let aty = s.d1ty
+  let zty = s.d2ty
+  if s.kids.length == 2 {
+    aty = emitTy(s.kids[0])
+    zty = emitTy(s.kids[1])
+  }
+  return "{a: " + aty + ", f: " + emitTy(c) + ", z: " + zty + "}"
+}
+
+// The near-root struct node eligible to be hoisted to a declaration: the root struct, the element
+// of a root struct[], or the member of a root struct|null. Kept near-root (under at most one
+// list/nullable wrapper, never a union/map/closure) so the value literal is structurally admissible
+// to any spelling and every read is a name-agnostic accessor — the `@log` oracle is untouched.
+function principalStruct(s: Slot): Slot | null {
+  if s.kind == 1 || s.kind == 4 { return s }
+  const c = s.child
+  if c == null { return null }
+  if s.kind == 2 || s.kind == 3 {
+    if c.kind == 1 || c.kind == 4 { return c }
+  }
+  return null
+}
+
+// The overall type string with the principal node `p` spelled as `spell` (a `Tn` name, a
+// `<marker>:{...}` shape token, or "" for its natural inline body). Mutates + restores p.declName,
+// so the tree is left exactly as found (b/emitCtor never read declName anyway).
+function tyWith(s: Slot, p: Slot, spell: string): string {
+  const save = p.declName
+  p.declName = spell
+  const r = emitTy(s)
+  p.declName = save
+  return r
+}
+
+// The TWIN / MIXED-seam assembly: build the value under the `srcTy` spelling, then flow it into a
+// helper whose param is the `dstTy` spelling (a structural twin `type B`, or the inline shape) and
+// read it back there. This is the `sumB(bs: B[])`-given-`A[]` seam (#911) generalized over the
+// whole struct-flavored grammar. `mo` (MULTIOBS) composes — the read inside the helper widens too.
+function assembleTwin(s: Slot, srcTy: string, dstTy: string, b: Built): string {
+  return "function useTwin(p: " +
+    dstTy +
+    ") {\n" +
+    emitRead("p", s, 0, MULTIOBS) +
+    "}\n" +
+    "function go() {\n" +
+    b.pre +
+    "const w: " +
+    srcTy +
+    " = " +
+    b.expr +
+    "\nuseTwin(w)\n}\ngo()\n"
+}
+
 // Assemble one program placing the value at `pos` (0 local · 1 param · 2 return · 3 global) and
 // running `body` against it. `readBody` is "" for the construct-only variant (print(0) instead).
 function assemble(pos: i32, ty: string, b: Built, s: Slot): string {
@@ -1103,6 +1197,8 @@ function go() {
     LUC = 0
     GSYM = 0
     MOSYM = 0
+    DECLS = ""
+    TSYM = 0
     const d = rr(1, MAXDEPTH)
     // Total-node budget for this program's branches (branching only; unused when BRANCHING == 0,
     // and drawing no random keeps the OFF stream byte-stable). Scales with the drawn depth.
@@ -1121,14 +1217,70 @@ function go() {
     // the OFF stream — and every downstream case — byte-identical.
     let logHdr = "// @log " + s.expected + "\n"
     if MULTIOBS == 1 { logHdr = moLogLines(s) }
+    // ── DECLTYPES (opt-in). shapeTy = the stable `@shape` type (declared → `<marker>:{...}` inline,
+    // never the minted `Tn`); readBody = the read-case body ("" → the master assemble()); ctorAnnTy
+    // = the construct-only annotation. OFF: the block is skipped (no draws), so all three keep their
+    // inline defaults and the emitted bytes are identical to master.
+    let shapeTy = ty
+    let readBody = ""
+    let ctorAnnTy = ty
+    if DECLTYPES == 1 {
+      const P = principalStruct(s)
+      if P != null {
+        const body = structBody(P)
+        const variant = rr(0, 3)
+        if variant == 0 {
+          // DECL: a single declared annotation (`type T0 = body`), value stays a literal. Runs at
+          // whatever `pos` was drawn (a nested/near-root struct field named in an inline outer shape).
+          const t0 = "T" + itoa(TSYM)
+          TSYM = TSYM + 1
+          DECLS = "type " + t0 + " = " + body + "\n"
+          shapeTy = tyWith(s, P, "decl:" + body)
+          ctorAnnTy = tyWith(s, P, t0)
+          readBody = assemble(pos, ctorAnnTy, b, s)
+        } else if variant == 1 {
+          // TWIN: two structurally-identical declarations; value made as A flows into a B param.
+          const ta = "T" + itoa(TSYM)
+          TSYM = TSYM + 1
+          const tb = "T" + itoa(TSYM)
+          TSYM = TSYM + 1
+          DECLS = "type " + ta + " = " + body + "\ntype " + tb + " = " + body + "\n"
+          shapeTy = tyWith(s, P, "twin:" + body)
+          const srcTy = tyWith(s, P, ta)
+          ctorAnnTy = srcTy
+          readBody = assembleTwin(s, srcTy, tyWith(s, P, tb), b)
+        } else if variant == 2 {
+          // MIX (declared → inline): a declared value flows into an INLINE-shape param (the #911
+          // inline-shape ref-list param seam — an `A` value given a `{v:i32}`-spelled slot).
+          const ta = "T" + itoa(TSYM)
+          TSYM = TSYM + 1
+          DECLS = "type " + ta + " = " + body + "\n"
+          shapeTy = tyWith(s, P, "mix:" + body)
+          const srcTy = tyWith(s, P, ta)
+          ctorAnnTy = srcTy
+          readBody = assembleTwin(s, srcTy, tyWith(s, P, ""), b)
+        } else {
+          // MIX (inline → declared): an inline-shape value flows into a DECLARED-twin param (the
+          // reverse seam — the inline shape's minted heap type vs the declared twin's).
+          const ta = "T" + itoa(TSYM)
+          TSYM = TSYM + 1
+          DECLS = "type " + ta + " = " + body + "\n"
+          shapeTy = tyWith(s, P, "mix:" + body)
+          ctorAnnTy = tyWith(s, P, "")
+          readBody = assembleTwin(s, ctorAnnTy, tyWith(s, P, ta), b)
+        }
+      }
+    }
+    if readBody == "" { readBody = assemble(pos, ty, b, s) }
     const prog = "// @run\n" +
       logHdr +
       shape +
       "r " +
-      ty +
+      shapeTy +
       "\n" +
       ALIASES +
-      assemble(pos, ty, b, s)
+      DECLS +
+      readBody
     print("===CASE " + itoa(i) + "===")
     print(prog)
     // The CONSTRUCT-ONLY case: build the SAME value but never read it. Catches a construct-side
@@ -1137,10 +1289,11 @@ function go() {
     const cprog = "// @run\n// @log 0\n" +
       shape +
       "c " +
-      ty +
+      shapeTy +
       "\n" +
       ALIASES +
-      assembleConstruct(pos, ty, b)
+      DECLS +
+      assembleConstruct(pos, ctorAnnTy, b)
     print("===CASE " + itoa(i) + "c===")
     print(cprog)
     i = i + 1
