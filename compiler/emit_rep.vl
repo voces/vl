@@ -969,13 +969,19 @@ export function repNodeScalarMask(ix: i32) {
 // `repCanonKey`'s de Bruijn render — a documented, sound under-merge: never a
 // false share, only a missed one).
 //
-// LIFETIME. Generation-stamped on the same axes as the flat layer's memos
-// (#917): `tyMutEpoch` (in-place arena mutation re-keys everything),
-// `cUserTypesVer` (which arena index a spelling resolves to), `sNames.length`
-// (slot claims). Any bump drops the whole tree — conservative, like the key
-// memo. A returned node index is therefore valid only until the next checker /
-// intern mutation: consume it immediately (the differential harness does), or
-// re-query. Building is LAZY — nothing pays for the tree until it asks.
+// LIFETIME. Generation-stamped on the CHECKER axes of the flat layer's memos
+// (#917): `tyMutEpoch` (in-place arena mutation re-keys everything) and
+// `cUserTypesVer` (which arena index a spelling resolves to). Any bump drops
+// the whole tree — conservative, like the key memo. `sNames.length` (slot
+// claims) is deliberately NOT an axis: the AUTHORITY projections (kind / null
+// discipline / list-element — what `repOfTy` reads on the normal compile
+// path) never consult `rtSlot`, and slot interning happens constantly during
+// emit, so stamping on it would rebuild the tree once per interned slot. The
+// only `rtSlot` consumer is the armed shadow harness, and `repShadowSweep`
+// forces a full drop first, so its slot assertions always run over a tree
+// built against the FINAL slot table. A returned node index is valid only
+// until the next checker mutation: consume it immediately, or re-query.
+// Building is LAZY — nothing pays for the tree until it asks.
 let rtKind: string[] = [] // node kind — see the grammar above
 let rtDisc: i32[] = [] // kind-specific: nul discipline (rdNul's 1/2/3/4) ·
 // struct 1 = union-VARIANT member · closure 1 = declared-void result
@@ -994,7 +1000,6 @@ let rtWalkGen: i32[] = [] // per-node visit stamps (`repTreeUnsupReason`)
 let rtWalkN = 0
 let rtEpoch = -1
 let rtUserVer = -1
-let rtSlotsLen = -1
 
 // Invalidate the tree (the `repReset` hook): the next `rtSync` rebuilds.
 function repTreeDrop() {
@@ -1003,13 +1008,7 @@ function repTreeDrop() {
 }
 
 function rtSync() {
-  if (
-    rtEpoch == tyMutEpoch &&
-    rtUserVer == cUserTypesVer &&
-    rtSlotsLen == sNames.length
-  ) {
-    return 0
-  }
+  if (rtEpoch == tyMutEpoch && rtUserVer == cUserTypesVer) { return 0 }
   rtKind = []
   rtDisc = []
   rtChild = []
@@ -1024,7 +1023,6 @@ function rtSync() {
   rtWalkGen = []
   rtEpoch = tyMutEpoch
   rtUserVer = cUserTypesVer
-  rtSlotsLen = sNames.length
   0
 }
 
@@ -1576,6 +1574,12 @@ let repShadowReasonIx: {[string]: i32} = Map()
 // so an instance that compiles more than one program reports the last sweep.
 export function repShadowSweep() {
   if !repShadowOn { return 0 }
+  // Force a FRESH tree: the normal-compile tree deliberately survives slot
+  // interning (`sNames` growth is not an invalidation axis — see LIFETIME),
+  // so nodes built mid-emit may carry slot claims from before the table
+  // finished. The sweep's slot assertions must run over a tree built against
+  // the FINAL table; everything else re-derives identically.
+  repTreeDrop()
   repShadowMsgs = []
   repShadowSeen = Map()
   repShadowTys = 0
