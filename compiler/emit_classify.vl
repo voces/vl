@@ -281,6 +281,7 @@ import {
   uFieldNames,
   uFieldStart,
   uFieldTypes,
+  uVarTwin,
   uVariants,
   unMemberSet,
   unNames,
@@ -6639,7 +6640,7 @@ export function paramStructIdxOf(paramIx: i32) {
     // `(ref null $mapStruct)` cell's heap type (`mapAnnShape` is `| null`-aware).
     if retNulMapFlag(p.parType) == 1 { return mapAnnShape(p.parType) }
     // A concrete-VARIANT param (kind 8) — its `fbValtype` slot is the VARIANT index
-    // (`uVarIdx + vi`), which `retStructIndex` (standalone structs) misses.
+    // (`uVarHeap[vi]`), which `retStructIndex` (standalone structs) misses.
     if retVariantFlag(p.parType) == 1 {
       const ptv = P.nodes[p.parType]
       if ptv is TypeRef { return variantIndexOf(ptv.tyName) }
@@ -8624,6 +8625,92 @@ export function variantFieldElemName(vi: i32, fi: i32) {
   uFieldElemName[uFieldStart[vi] + fi]
 }
 
+// ── Canonical layout twins, VARIANT slot layer (roadmap repOf, slot layer) ────
+// Two union-variant slots share ONE variant-struct WasmGC heap type under the
+// struct template's two-layer discipline: the canonical structural key of the
+// variant's TYPE (its name — a declared alias or an inline `{…}` shape —
+// resolved through the checker, `repNameCanonKey`), then a layout guard over
+// the emitted field storage (`variantFieldLayoutEq`): per-field CODE equality
+// plus, for the codes whose storage references another interned heap type, twin
+// equivalence of the referenced layer — a ref-list field (5) via
+// `rlSlotsLayoutTwin`, a nested-struct field (15) via `repStructSlotsTwin`, a
+// map field (19) via the canonical map-value representative. Fixed-storage
+// codes (scalars, string, the shared union box / closure / scalar-list
+// wrappers) need only the code. The SAME variant name declared into two unions
+// (`type U = Cat | Dog` / `type V = Cat | Bird` both pushing `Cat`) is the
+// degenerate twin (equal keys, equal fields); structural twins (`Cat`/`Kot`, a
+// declared name vs its inline `{…}` spelling) dedup the same way.
+
+// The per-field storage layout guard (the `structFieldCodesEq` analogue).
+function variantFieldLayoutEq(a: i32, b: i32): i32 {
+  if uFieldCount[a] != uFieldCount[b] { return 0 }
+  let fi = 0
+  while fi < uFieldCount[a] {
+    const ca = uFieldTypes[uFieldStart[a] + fi]
+    if ca != uFieldTypes[uFieldStart[b] + fi] { return 0 }
+    if ca == 5 {
+      if (
+        rlSlotsLayoutTwin(variantFieldRefSlot(a, fi), variantFieldRefSlot(b, fi)) == 0
+      ) {
+        return 0
+      }
+    } else if ca == 15 {
+      if (
+        repStructSlotsTwin(
+          structIndexByName(uFieldElemName[uFieldStart[a] + fi]),
+          structIndexByName(uFieldElemName[uFieldStart[b] + fi]),
+        ) == 0
+      ) {
+        return 0
+      }
+    } else if ca == 19 {
+      const ma = mvSlotOfMapValNameOrMono(uFieldElemName[uFieldStart[a] + fi])
+      const mb = mvSlotOfMapValNameOrMono(uFieldElemName[uFieldStart[b] + fi])
+      let mOk = false
+      if ma == -1 && mb == -1 { mOk = true }
+      if ma >= 0 && mb >= 0 {
+        if mvCanonRepOf(ma) == mvCanonRepOf(mb) { mOk = true }
+      }
+      if !mOk { return 0 }
+    }
+    fi = fi + 1
+  }
+  1
+}
+
+// Populate `uVarTwin` (parallel to `uVariants`): `uVarTwin[i]` is the smallest
+// earlier layout twin, or `i` itself when `i` is the first of its layout. Keys
+// are computed ONCE up front (`buildStructTwins` discipline — the compiler's own
+// unions carry hundreds of variants, so a per-pair key recomputation is the
+// audit's hot-path anti-pattern); a non-participating slot ("" key — an
+// unresolvable spelling) is always its own representative. Called from
+// `mAssignTypeIndices` before the variant heap indices allocate.
+export function buildVariantTwins() {
+  const keys: string[] = []
+  let i = 0
+  while i < uVariants.length {
+    keys.push(repNameCanonKey(uVariants[i]))
+    i = i + 1
+  }
+  uVarTwin = []
+  i = 0
+  while i < uVariants.length {
+    let rep = i
+    if keys[i] != "" {
+      let j = 0
+      while j < i {
+        if keys[j] == keys[i] && variantFieldLayoutEq(j, i) == 1 {
+          rep = j
+          j = i // stop at the first (smallest) twin
+        }
+        j = j + 1
+      }
+    }
+    uVarTwin.push(rep)
+    i = i + 1
+  }
+}
+
 // The structural signature of variant `vi` — its field names joined with `,` (a
 // stable per-shape key). Two variants with the same field-name set share a sig (and
 // so, under structural typing, are the same variant — `docs/unions.md`); the slice's
@@ -9114,8 +9201,8 @@ function unionOfVariant(vi: i32) {
   -1
 }
 
-// The position of variant struct `name` in `uVariants` (its heap-type is `uVarIdx +
-// pos`), or -1 if `name` is not a variant of the declared union.
+// The position of variant struct `name` in `uVariants` (its heap-type is
+// `uVarHeap[pos]`), or -1 if `name` is not a variant of the declared union.
 export function variantIndexOf(name: string) {
   let i = 0
   while i < uVariants.length {
@@ -9358,8 +9445,8 @@ export function letIsStruct(letIx: i32, fnIx: i32) {
 }
 
 // True if the `LetDecl` at `letIx` binds a CONCRETE union-VARIANT value (`const c: Cat =
-// …` where `Cat` is a variant of the declared union) — a kind-8 local `(ref $(uVarIdx +
-// vi))`, distinct from the union box (kind 4) and a standalone struct (kind 1). Annotation
+// …` where `Cat` is a variant of the declared union) — a kind-8 local `(ref
+// $(uVarHeap[vi]))`, distinct from the union box (kind 4) and a standalone struct (kind 1). Annotation
 // first, else the init's variant value (a variant param/local read). Checked AFTER the
 // struct/union local cases so only an explicit variant annotation / variant-valued init
 // reaches here.
@@ -9436,8 +9523,8 @@ function paramStructIndex(fnIx: i32, name: string) {
 
 // The union-variant table index of the param `name` of function `fnIx` (when its
 // annotation names a VARIANT struct of the declared union, e.g. `o: TyObj`), or -1.
-// A variant-struct param's value IS the concrete variant struct ref `(ref $(uVarIdx +
-// vi))` — already narrowed/unboxed by the caller — so a field read on it reads the
+// A variant-struct param's value IS the concrete variant struct ref `(ref
+// $(uVarHeap[vi]))` — already narrowed/unboxed by the caller — so a field read on it reads the
 // variant struct directly (no box unwrap), the gap-#2 boundary.
 function paramVariantIndex(fnIx: i32, name: string) {
   variantIndexOf(tyNameOf(paramTypeNode(fnIx, name)))
