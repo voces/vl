@@ -110,12 +110,20 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      (`objVariantName` / `shapeFieldTypeCompat`) are map-VALUE-rep tightened so twin
      name-set arms with different map values never collide. Baseline 273 → 255 (18
      graduations, 4 pinned tests).
+     Stage B WAVE 2 slice 2 SHIPPED (→ `CHANGELOG.md`): the R1 map-in-list-in-union seam
+     (`{[string]: V}[] | X` constructed from `[h]` map-binding literals) — the array
+     literal routes through the ARM's build (`unionRefArrayArmSlotForMapElem` picks the
+     arm by canonical value rep, the arm's reflist slot threads the build, the wrapper
+     tags with the arm's slot tag) and the frame pre-pass reserves the map scratch
+     narrowing-blind for the `t[i][k]` read shape. Baseline 255 → 249 (6 graduations,
+     1 pinned test).
      STAGE B remaining charter (consumer migration, family-by-family, each PR gated by
      fixpoint + corpus + rep-fuzz + the shadow sweep): (b2, REMAINING TAIL) typed-value
-     maps in composition (R1) through `Map(val)` trees — map-in-list-in-union
-     (`{[string]: V}[] | X`), map-through-closure-result in union arms, and the
-     still-loud nested/nullable-value policy set (each stays rejected until its rep is
-     genuinely minted); (b3) 2-D arrays
+     maps in composition (R1) through `Map(val)` trees — map-through-closure-result in
+     union arms, map-member-union / nested-struct union-variant FIELDS (the
+     "only iN/boolean/string/array union-variant fields" bucket), and the still-loud
+     nested/nullable-value policy set (each stays rejected until its rep is genuinely
+     minted); (b3) 2-D arrays
      (R4 — `List(List(_))` dissolves the special backing) + nullable-list-in-field /
      struct-through-list (R5/R6, compositional once consumers read the tree); (b4) closure
      composite results via sig keys interned from `Closure(params, result)` nodes (R2);
