@@ -316,6 +316,11 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   - Cross-cutting: thread `severity` through all remaining error variants; consistent message style.
 - ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
   position and emit it.
+- ⬜ **B-chore-maprmw-fuse. Re-fuse the `repSlotKeyN` RMW in `emit_rep.vl`** (one-liner). #918
+  fixed the fused missing-key map RMW but the split-form spelling at the `repSlotKeyN` build must
+  stay ONE seed generation (the published seed's lowering predates the fix — bootstrap ordering).
+  Once a seed containing #918 publishes, swap the split temp back to
+  `repSlotKeyN[k] = (repSlotKeyN[k] ?? 0) + 1` (comment marks the site).
 - 🐛 **B-bug. `while` as the tail statement of a void function crashes binaryen's Vacuum pass.**
   A `while` loop in *tail position* of a `void`-returning function body aborts inside binaryen
   optimization. Workaround: don't end a void function on a bare `while`. Fix: investigate the
