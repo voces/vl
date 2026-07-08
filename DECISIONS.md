@@ -144,6 +144,20 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   union-arm narrow machinery it would newly enter still mis-lowers an inferred
   closure-call binding's read (roadmap repOf item (d)). (structural slot dedup,
   ref-list canonical layer)
+  The MAP-VALUE table joins the same discipline. A map-value slot's 7-field map
+  struct varies ONLY in its vals-list wrapper, so slots whose VALUE types are
+  layout twins share one `mvMapTypeIdx` (`mvTwin` — `repMapValSlotsTwin`: the
+  canonical value key via `repNameCanonKey`, guarded per value KIND by the layer
+  that owns the rep — `repStructSlotsTwin` for struct values, `rlSlotsLayoutTwin`
+  for list/nested-map values, kind identity for the singleton scalar/string/box/
+  closure vals lists). The vals ref-list's map-element sig keys on the canonical
+  mv representative (`mvCanonRepOf`), so a twin propagates through nested maps
+  and lists of maps; and the union-box tag (`mapSlotTag`) + arm-slot guard
+  (`unionHasMapArmSlot`) canonicalize through the SAME representative — keying
+  the tag on the nominal slot would make a twin-spelled `is {[string]: {v:i32}}`
+  silently miss its `{[string]: A}` carrier once the heaps merged, so tag
+  identity and heap identity move together. (structural slot dedup, map-value
+  layer)
 - **The shape-INTERN table keys on field CODES (layout), not `repCanonKey`
   (structure); the two are deliberately separate layers.** `annShapeIndexOf` is a
   LAYOUT table — two structurally-identical checker types can lower to DIFFERENT
