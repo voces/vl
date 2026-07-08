@@ -8199,6 +8199,44 @@ function structFieldBoxRetName(er: i32) {
   tyToEmitName(er)
 }
 
+// True when every LEAF atom of the (possibly nested) union/nullable type `er` renders
+// to a SHORT name `valueAtomKind` could admit — a prim/literal/type-var leaf, or a
+// prim-element list (`i32[]`). A composite leaf (struct, map, closure, negation,
+// nested list) always renders to a `-1`-kind atom, so the whole union declines and the
+// render was wasted — and for a RECURSIVE struct the waste is CATASTROPHIC: `tyToStr`
+// expands `{child: S | null, kids: S[]}` DOUBLY per depth level (≈4–6 K chars at the
+// depth-8 cap), and `splitUnionAtoms`'s per-atom accumulation walks that name again —
+// re-run per narrowing consult of one `const p = f()` binding of type `S | null`, this
+// took ~14 s of compile for a 30-line program (#912's fuzzgen: 66 s vs master's 4.5 s).
+// The gate decides structurally, BEFORE `collectRetAtoms` renders anything. (The same
+// pre-gate shape as `nodeUnionName`'s allValue scan — the third recurrence of the
+// render-before-checking quadratic class; see also #494.)
+function retAtomsCheap(er: i32) {
+  if er < 0 { return true }
+  const t = T.tys[er]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if !retAtomsCheap(t.uMembers[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  if t is TyNullable { return retAtomsCheap(t.nInner) }
+  if t is TyPrim { return true }
+  if t is TyLit { return true }
+  if t is TyVar { return true }
+  if t is TyErr { return true }
+  if t is TyArray {
+    // Only a prim-element list renders short AND can classify (`i32[]`, `string[]`);
+    // a composite-element list (`S[]`, `i32[][]`) renders big and always declines.
+    if t.aElem < 0 { return true }
+    const et = T.tys[t.aElem]
+    return et is TyPrim
+  }
+  false
+}
+
 // The emitter-format union NAME (`i32|string`, `i32|null`) for an inferred return type
 // `er` IF it is a VALUE union the emitter can box (the `uBoxIdx` rep: ≥2 non-null value
 // atoms, or one numeric scalar + null — `isValueUnionName`, the same gate the annotated
@@ -8207,6 +8245,10 @@ function structFieldBoxRetName(er: i32) {
 // valtype), and `emitUnionCoerce` at the return site — exactly the annotated path.
 function valueUnionRetName(er: i32) {
   if er < 0 { return "" }
+  // Decline a union with any composite leaf WITHOUT rendering it (`retAtomsCheap`) —
+  // `isValueUnionName` would reject its atom anyway, and the render of a recursive
+  // struct leaf is exponential in the `tyToStr` depth cap.
+  if !retAtomsCheap(er) { return "" }
   const atoms: string[] = []
   collectRetAtoms(er, atoms)
   let nm = ""
@@ -9718,7 +9760,13 @@ export function isInferLetNulBool(letIx: i32) {
 // (vs returning a fresh `string[]`) keeps this off the self-host emitter's
 // empty-ref-array-literal return path.
 export function splitUnionAtoms(name: string, out: string[]) {
-  let cur = ""
+  // Atoms are VERBATIM substrings of `name` between top-level `|` separators, so each
+  // is one `slice` from the last separator (`start`) — never a per-code-point
+  // accumulation, whose repeated copy-on-concat walked the whole atom AGAIN per char:
+  // O(len²) per call, ~14 s of compile for one 30-line program over a recursive
+  // struct's ~5 K-char render (the third recurrence of the per-code-point-concat
+  // quadratic class — see `retAtomsCheap`, which now also gates that render away).
+  //
   // `pdepth` counts ALL groupers — braces, brackets, AND parens — and gates BOTH the `|`
   // splitting and the top-level-`=>` detection. Paren-aware splitting keeps a paren-GROUPED
   // arm whole: `(i32 | string)[] | {w: i32}` splits to `(i32 | string)[]` + `{w: i32}` (the
@@ -9728,6 +9776,7 @@ export function splitUnionAtoms(name: string, out: string[]) {
   // member (`((i32) => A | B) | f64`) needs no special casing anymore: its return's `|` sits
   // at `pdepth >= 1`. Quoted litunion members are skipped verbatim (`inStr`) so a grouper or
   // `|` INSIDE a string-literal atom (`"(a" | "b"`) neither splits nor derails the depth.
+  let start = 0
   let pdepth = 0
   let inStr = false
   let i = 0
@@ -9735,34 +9784,26 @@ export function splitUnionAtoms(name: string, out: string[]) {
     const c = name[i]
     if inStr {
       if c == '"' { inStr = false }
-      cur = cur + fromCodePoint(c)
     } else if c == '"' {
       inStr = true
-      cur = cur + fromCodePoint(c)
     } else if c == '{' || c == '[' || c == '(' {
       pdepth = pdepth + 1
-      cur = cur + fromCodePoint(c)
     } else if c == '}' || c == ']' || c == ')' {
       pdepth = pdepth - 1
-      cur = cur + fromCodePoint(c)
     } else if (c == '=' && i + 1 < name.length && name[i + 1] == '>') {
       if pdepth == 0 {
         // A top-level function arrow: the whole name is a single function-type member — absorb
-        // the return verbatim (a `|` inside it belongs to the return union, split separately).
-        cur = cur + name.slice(i, name.length)
+        // the return verbatim (a `|` inside it belongs to the return union, split separately),
+        // i.e. stop scanning; the final push below takes everything from `start`.
         i = name.length
-      } else {
-        cur = cur + fromCodePoint(c)
       }
     } else if pdepth == 0 && c == '|' {
-      out.push(cur)
-      cur = ""
-    } else {
-      cur = cur + fromCodePoint(c)
+      out.push(name.slice(start, i))
+      start = i + 1
     }
     i = i + 1
   }
-  out.push(cur)
+  out.push(name.slice(start, name.length))
   0
 }
 
