@@ -5153,7 +5153,23 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
           }
         }
       }
-      return false
+      // A MIXED union — struct arm(s) alongside the tested VALUE atom (`{f: i32} |
+      // i32`) — is NOT a value union, so the Ident arm above skipped it. Fall
+      // THROUGH to the struct-union complement below: the guard was false, so
+      // subtracting the tested atom leaves the struct arm(s), and the else-arm's
+      // `v.f` reads through the same narrowed-member downcast the positive arm
+      // uses. (The #923-observed hole: the checker's subtract-narrow answered the
+      // struct, but the emitter never registered the negative arm — a GLOBAL
+      // receiver's `v.f` then read the box RAW, invalid wasm; a local rejected
+      // loudly. Both spellings now narrow.) Anything else keeps the reject.
+      let elseMixed = false
+      if recv is Ident {
+        const mxun = unionNameOfIdent(recv.identName, fnIx)
+        if mxun != "" {
+          if !isValueUnionName(mxun) { elseMixed = true }
+        }
+      }
+      if !elseMixed { return false }
     }
     // STRUCT-union complement (host flow narrowing): the guard was FALSE, so the
     // tested VARIANT is stripped from the receiver's current set. When one member
@@ -10682,6 +10698,23 @@ function memFieldTypeCode(memIx: i32, fnIx: i32) {
 }
 
 // expression. An index read / `.length` yields an i32, so neither counts.
+// True when the ident `name`, read inside frame `fnIx`, is SHADOWED by a binding of
+// the frame itself — a declared param of `fnIx`, or a collected declared local (the
+// per-function `localNames` registry; at module scope the registry holds the start
+// function's loop vars / block-nested lets). The `expr*Array` GLOBAL fallbacks must
+// not resolve `name` through a module global when such an inner binding exists:
+// scope resolution picks the inner binding whatever its kind, so the global's kind
+// is not this read's kind. (The #922 shadow hole: a param/local list named like a
+// GLOBAL list of a DIFFERENT element kind routed `.push` through the global's
+// classification — the push frame's typed locals then mismatched the receiver's
+// actual wrapper ref, invalid wasm.) Each classifier checks its OWN param/declared
+// kind BEFORE its global fallback, so gating only the fallback preserves every
+// same-kind answer and only turns the cross-kind global claim off.
+function identShadowedByFrame(fnIx: i32, name: string) {
+  if paramIndexOf(fnIx, name) >= 0 { return true }
+  declaredSlotOf(name) >= 0
+}
+
 export function exprArray(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   if tyKindOf(nodeTyIxOf(exprIx)) == 2 {
@@ -10722,13 +10755,17 @@ export function exprArray(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramArray(fnIx, e.identName) { return true }
     if declaredArray(e.identName) { return true }
-    if globalIsArray(e.identName) { return true }
+    if globalIsArray(e.identName) {
+      if !identShadowedByFrame(fnIx, e.identName) { return true }
+    }
     // A NULLABLE i32-list binding (`i32[] | null`, kind 15) participates in the
     // list machinery — narrowing is type-level, so every list op classifies the
     // read as a list; the op's read site inserts the `ref.as_non_null` recover.
     if paramNulList(fnIx, e.identName) { return true }
     if declaredNulList(e.identName) { return true }
-    if globalIsNulList(e.identName) { return true }
+    if globalIsNulList(e.identName) {
+      if !identShadowedByFrame(fnIx, e.identName) { return true }
+    }
     // A CAPTURED i32-list read (`store[k]` inside a closure capturing `store`).
     return capturedKindOf(fnIx, e.identName) == "list"
   }
@@ -10857,6 +10894,7 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
     if paramNulRefArray(fnIx, e.identName) { return true }
     if paramRefArray(fnIx, e.identName) { return true }
     if declaredRefArray(e.identName) { return true }
+    if identShadowedByFrame(fnIx, e.identName) { return false }
     return globalIsRefArray(e.identName)
   }
   // A field read `p.items` whose struct field is a `T[]`/`N[]` (code `5`) yields the ref
@@ -11270,7 +11308,9 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramStringArray(fnIx, e.identName) { return true }
     if declaredStringArray(e.identName) { return true }
-    if globalIsStringArray(e.identName) { return true }
+    if globalIsStringArray(e.identName) {
+      if !identShadowedByFrame(fnIx, e.identName) { return true }
+    }
     // A CAPTURED string-list read (incl. a boxed captured-mutated `string` local). Kind 7.
     return capturedKindOf(fnIx, e.identName) == "strlist"
   }
@@ -11446,7 +11486,9 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramF64Array(fnIx, e.identName) { return true }
     if declaredF64Array(e.identName) { return true }
-    if globalIsF64Array(e.identName) { return true }
+    if globalIsF64Array(e.identName) {
+      if !identShadowedByFrame(fnIx, e.identName) { return true }
+    }
     // A CAPTURED f64-list read (`xs[i]` inside a closure capturing `xs` — incl. a boxed
     // captured-mutated `f64` local, lowered to a length-1 `f64[]`). Kind 12 = f64 list.
     return capturedKindOf(fnIx, e.identName) == "f64list"
@@ -11531,7 +11573,9 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramF32Array(fnIx, e.identName) { return true }
     if declaredF32Array(e.identName) { return true }
-    if globalIsF32Array(e.identName) { return true }
+    if globalIsF32Array(e.identName) {
+      if !identShadowedByFrame(fnIx, e.identName) { return true }
+    }
     // A CAPTURED f32-list read (incl. a boxed captured-mutated `f32` local). Kind 21 = f32 list.
     return capturedKindOf(fnIx, e.identName) == "f32list"
   }
@@ -11618,7 +11662,9 @@ export function exprI64Array(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramI64Array(fnIx, e.identName) { return true }
     if declaredI64Array(e.identName) { return true }
-    if globalIsI64Array(e.identName) { return true }
+    if globalIsI64Array(e.identName) {
+      if !identShadowedByFrame(fnIx, e.identName) { return true }
+    }
     // A CAPTURED i64-list read (incl. a boxed captured-mutated `i64` local). Kind 20 = i64 list.
     return capturedKindOf(fnIx, e.identName) == "i64list"
   }
@@ -11660,6 +11706,13 @@ export function letIsF64Array(letIx: i32, fnIx: i32) {
         // the float-literal init must not claim the binding as a scalar f64 list (kind 12)
         // when the slot is a kind-2 ref list — the literal's elements box instead.
         if nameIsRefArray(lt.tyName) { return false }
+        // An `f32[]` annotation is authoritative too: its float-literal init reads as
+        // `exprF64Array`, so without this guard a GLOBAL `const a: f32[] = [1.5]` claims
+        // BOTH kinds — the ordered ladders (`buildLocals`, `globalCellKind`) pick f32
+        // first, but `exprF64Array`'s Ident arm consults `globalIsF64Array` directly and
+        // the double claim routed `.push` through the f64 frame against the f32 cell
+        // (invalid wasm). The annotation names the kind; the init must not override it.
+        if nameIsF32Array(lt.tyName) { return false }
       }
     }
     return exprF64Array(d.letInit, fnIx)
