@@ -4762,6 +4762,28 @@ function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
   0
 }
 
+// The indexed-STORE value stash slot for list kind `kind` (`slot` = the
+// ref-list table slot for kind "ref", else 0) — a `liBack == 2` entry of the
+// same lazy list frame `listIdxWrapSlot` grows, typed as the element VALUE
+// (i32 / i64 / f64 / f32, the nullable string ref, or the slot's nullable
+// element ref). The stored value parks here across `emitListIdxGuard` so the
+// backing + len resolve AFTER the value's user code ran; no user code runs
+// between the stash write and the `array.set`, so sharing the slot per
+// (kind, slot) is clobber-safe.
+function listIdxValSlot(kind: MfKind, slot: i32) {
+  let k = 0
+  while k < liKinds.length {
+    if liKinds[k] == kind && liSlots[k] == slot && liBack[k] == 2 {
+      return listIdxScratchBase + 1 + k
+    }
+    k = k + 1
+  }
+  liKinds.push(kind)
+  liSlots.push(slot)
+  liBack.push(2)
+  listIdxScratchBase + liKinds.length
+}
+
 function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
   const nd = P.nodes[idxIx]
   if nd is Index {
@@ -7187,12 +7209,18 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           )
         }
       }
+      // Source order — receiver, index, VALUE — with the wrapper + index parked
+      // ON THE OPERAND STACK while the value's user code runs (nested ops only
+      // touch locals, so they cannot clobber them; the #918 map-SET pattern).
+      // The guard stages the wrapper and resolves the BACKING + len only AFTER
+      // the value: an RHS that pushes onto the target list reallocates the
+      // backing, and the old resolve-early lowering stored into the STALE
+      // pre-reallocation array (a silent lost write) and guarded against the
+      // stale len (a grow-into-bounds store trapped). The value parks in a
+      // typed `liBack == 2` stash across the guard — no user code runs between
+      // its write and the `array.set`, so the shared slot is clobber-safe.
       if emitExpr(body, target.idxArr, fnIx) < 0 { return -1 }
       if emitExpr(body, target.idxIndex, fnIx) < 0 { return -1 }
-      // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
-      // [backing, safeIndex]; the value then evaluates ABOVE them, so a nested
-      // index op inside the RHS is free to reuse the guard frame.
-      emitListIdxGuard(listIdxWrapSlot(idxKind, idxSlot), lTy)
       pendingStructIdx = storeStructIdx
       if storeUnionNm != "" {
         if emitUnionBoxArg(body, storeUnionNm, a.binRight, fnIx) < 0 {
@@ -7233,7 +7261,13 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
       }
       pendingStructIdx = -1
-      fbArraySet(aTy) // 0xfb 0x0e <backing array type index>
+      const storeValSlot = listIdxValSlot(idxKind, idxSlot)
+      fbLocalSet(storeValSlot) // 0x21 — park the value under the guard operands
+      // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
+      // [backing, safeIndex] resolved AFTER the value ran.
+      emitListIdxGuard(listIdxWrapSlot(idxKind, idxSlot), lTy)
+      fbLocalGet(storeValSlot) // 0x20 — the parked value
+      fbArraySet(aTy)          // 0xfb 0x0e <backing array type index>
       return 0
     }
     if target is Member {
