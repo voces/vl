@@ -46,6 +46,7 @@ import {
   TypeDecl,
   TypeRef,
   WhileStmt,
+  i32ToStr,
 } from "./ast"
 
 // Unsigned LEB128: 7 bits per byte, low-to-high, high bit set while more remain.
@@ -1447,19 +1448,69 @@ export function peelGroupParens(nameIn: string) {
 // equality is grouping-paren-insensitive (`peelGroupParens`), so `is () => i64` strips the
 // `(() => i64)` member `splitUnionAtoms` produced — otherwise the closure arm survives the
 // complement and the else-branch reads the raw box where its remaining scalar arm is expected.
-export function removeAtomFrom(set: string, removed: string) {
+// PURE-FUNCTION MEMO: the narrowing passes call this millions of times per
+// self-compile (~25% of compile time — every `if`-chain scan re-derives the
+// same else-branch complements), over a SMALL set of distinct `(set, removed)`
+// pairs. The result depends on nothing but the two strings, so the memo needs
+// no invalidation — it persists across programs. The DOMINANT caller removes
+// `"null"` (the else-branch of an `is null` test), so that case keys on `set`
+// alone (`raftNullKeys` — no key-string concat on the hot path); every other
+// `removed` rides the generic pair key, which length-prefixes `set`
+// (`<len>:<set><removed>`) so no separator collision can conflate two pairs.
+// Values live in a side pool (`raftVals`) because "" is a VALID result (the
+// last atom removed) — the `{[string]: i32}` index maps keep a real miss
+// (`?? -1`) distinguishable.
+const raftNullKeys: {[string]: i32} = Map()
+const raftKeys: {[string]: i32} = Map()
+const raftVals: string[] = []
+
+function removeAtomFromGo(set: string, removed: string) {
   const atoms: string[] = []
   splitUnionAtoms(set, atoms)
   const rmv = peelGroupParens(removed)
+  // Atoms are VERBATIM contiguous slices of `set` separated by single `|`s
+  // (see `splitUnionAtoms`), so joining KEPT atoms with `|` equals slicing the
+  // kept RUNS out of `set` directly — one slice per run of consecutive
+  // survivors (≤2 in the common one-atom removal) instead of two concats per
+  // atom, the same slice-over-per-atom-concat pattern as the splitter itself.
   let out = ""
+  let runStart = -1 // char index where the current kept run begins, -1 = none
+  let pos = 0 // char index of the current atom's start within `set`
   let i = 0
   while i < atoms.length {
     if peelGroupParens(atoms[i]) != rmv {
+      if runStart < 0 { runStart = pos }
+    } else if runStart >= 0 {
+      // The run ends BEFORE this removed atom's separator (`pos - 1`).
       if out != "" { out = out + "|" }
-      out = out + atoms[i]
+      out = out + set.slice(runStart, pos - 1)
+      runStart = -1
     }
+    pos = pos + atoms[i].length + 1
     i = i + 1
   }
+  if runStart >= 0 {
+    if out != "" { out = out + "|" }
+    out = out + set.slice(runStart, set.length)
+  }
+  out
+}
+
+export function removeAtomFrom(set: string, removed: string) {
+  if removed == "null" {
+    const hit = raftNullKeys[set] ?? -1
+    if hit >= 0 { return raftVals[hit] }
+    const out = removeAtomFromGo(set, removed)
+    raftNullKeys[set] = raftVals.length
+    raftVals.push(out)
+    return out
+  }
+  const mk = i32ToStr(set.length) + ":" + set + removed
+  const hit = raftKeys[mk] ?? -1
+  if hit >= 0 { return raftVals[hit] }
+  const out = removeAtomFromGo(set, removed)
+  raftKeys[mk] = raftVals.length
+  raftVals.push(out)
   out
 }
 // True if `name` is declared by a top-level struct `type X = {…}` (`TypeDecl`). Used
