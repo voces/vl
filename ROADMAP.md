@@ -91,11 +91,22 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      `$VL_REP_SHADOW` differential harness (tree vs flat on every `rdCovered` fact; corpus +
      self-compile + 16 pinned fuzz seeds + a branching/declared/multiobs survey sweep with
      ZERO disagreements) and the per-compile coverage report (the Stage B burn-down buckets).
-     STAGE B charter (consumer migration, family-by-family, each PR gated by fixpoint +
-     corpus + rep-fuzz + the shadow sweep): (b1) litunion alias PROVENANCE on the arena node
-     — kills the `litunion:noalias` policy gap (a wrapper's re-minted alias copy is
-     indistinguishable from an inline union by index today) and the three flat-path
-     irregularities the harness surfaced (see PR #920 report); (b2) typed-value maps in
+     Stage B WAVE 1 SHIPPED (→ `CHANGELOG.md`): (b1) litunion alias PROVENANCE on the
+     arena (mint-site stamps + `tyLitUnionAliasIx`; the alias-copy half of the
+     `litunion:noalias` bucket is real atoms now — the residue is inferred literal-JOIN
+     unions, context-dependent by design, correctly policy nodes), the three #920
+     flat-path irregularities reconciled (arity-aware variant-member registration; the
+     bare-array litunion arm provenance-widened to match the nullable twin; the inline
+     positional asymmetry documented as the canon pass's intended policy), and the FIRST
+     consumer migration: `repOfTy` is tree-PRIMARY (kind/nul/list-elem are the tree's
+     projections wherever the flat arms claim coverage; flat still owns coverage + the
+     nominal slot, and shadows the tree under `$VL_REP_SHADOW` — the Stage A direction
+     inverted). KNOWN HAZARD surfaced by the migration: the LIST twin of the #918
+     eval-order family — `a[i] = f()` where `f` pushes onto `a` stores into the stale
+     pre-reallocation backing (compiler source uses the split form; the codegen fix is
+     a follow-up like #918 was for maps).
+     STAGE B remaining charter (consumer migration, family-by-family, each PR gated by
+     fixpoint + corpus + rep-fuzz + the shadow sweep): (b2) typed-value maps in
      composition (R1, the dominant reject family) through `Map(val)` trees; (b3) 2-D arrays
      (R4 — `List(List(_))` dissolves the special backing) + nullable-list-in-field /
      struct-through-list (R5/R6, compositional once consumers read the tree); (b4) closure

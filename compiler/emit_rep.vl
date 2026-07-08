@@ -71,8 +71,8 @@ import {
   resolveAnnot,
   tyIsLitUnion,
   tyIsValueUnionBox,
-  tyIxIsUnionAliasDecl,
   tyIxIsVariantMember,
+  tyLitUnionAliasIx,
   tyMutEpoch,
 } from "./typecheck"
 
@@ -550,13 +550,43 @@ export function buildStructTwins() {
   }
 }
 
-// ── The derivation: one table-driven arm per `Ty` variant ────────────────────
+// ── The descriptor: tree-PRIMARY over the flat arms (Stage B wave 1) ─────────
+// The recursive Rep tree is AUTHORITATIVE at this seam: wherever the flat
+// arms claim coverage, the returned kind / null discipline / list-element
+// vocabulary are the TREE's projections (`repTreeVKind` / `repTreeNulOf` /
+// `repTreeListElemName` — certified byte-equivalent to the flat answers by
+// the Stage A `$VL_REP_SHADOW` sweeps), and the `$fnsig` token follows the
+// kind through the one token table. The flat derivation still decides two
+// things the tree deliberately does not own yet:
+//   · COVERAGE — a shape the flat alphabet cannot name keeps rejecting
+//     through the legacy path even where the tree knows more (`rdCovered ==
+//     0` stays 0; widening compositions is wave b2+, family by family);
+//   · the nominal SLOT (`rdSlot`) — the tree's hash-cons may surface a TWIN
+//     slot (same layout, different index), never guaranteed byte-identity.
+// The flat facts remain as the debug-mode CROSS-CHECK: under `$VL_REP_SHADOW`
+// the post-emit sweep (`repShadowCheckTy`) asserts the FLAT answer against
+// the tree's — the Stage A direction inverted, the flat path now shadowing
+// the authority. Where the tree has no flat spelling at a flat-covered type
+// (`repTreeVKind` = null — proven empty by the sweeps) the flat answer
+// stands, a defensive fallback rather than a policy.
+export function repOfTy(ty: i32): RepDesc {
+  const d = repOfTyFlat(ty)
+  if d.rdCovered == 0 { return d }
+  const tix = repTreeOfTy(ty)
+  const tk = repTreeVKind(tix)
+  if tk == null { return d }
+  const td = repMk(tk, repTreeNulOf(tix), repTreeListElemName(tix))
+  td.rdSlot = d.rdSlot
+  td
+}
+
+// ── The flat derivation: one table-driven arm per `Ty` variant ───────────────
 // INVARIANT: every covered arm must decide the rep EXACTLY as the emitter's
 // annotation-name classifier ladder (`vtKindOfType`'s arm order) does for the
 // same type — the migration gates (fixpoint + corpus byte-compare) hold each
 // arm to that. The ladder's priority order is inherent here: a `Ty` is exactly
 // one variant, so no arm can shadow another.
-export function repOfTy(ty: i32): RepDesc {
+function repOfTyFlat(ty: i32): RepDesc {
   if ty < 0 { return repUncovered() }
   const t = T.tys[ty]
   if t is TyPrim { return repOfPrim(t.primName) }
@@ -575,12 +605,14 @@ export function repOfTy(ty: i32): RepDesc {
   }
   if t is TyUnion {
     // A homogeneous string-literal union: a DECLARED alias (`type K = "a"|"b"`)
-    // reps as the interned i32 atom; an INLINE one is name-softened to `string`
-    // by the canon pass, and its rep questions route through the name ladder —
-    // uncovered here (the atom-vs-string split is the alias-ness, which is
-    // checker metadata, not structure).
+    // — or a checker-minted COPY of one, recognized through the b1 alias
+    // PROVENANCE (`tyLitUnionAliasIx`; narrowing/join/subtraction re-mint the
+    // alias at a fresh index) — reps as the interned i32 atom. An INLINE one
+    // is name-softened to `string` by the canon pass, and its rep questions
+    // route through the name ladder — uncovered here (the atom-vs-string
+    // split is the alias-ness, which is checker metadata, not structure).
     if tyIsLitUnion(ty) {
-      if tyIxIsUnionAliasDecl(ty) { return repMk("i32", 0, "") }
+      if tyLitUnionAliasIx(ty) >= 0 { return repMk("i32", 0, "") }
       return repUncovered()
     }
     // A single-member object union is the canonicalized `{a} & {b}` struct
@@ -707,12 +739,17 @@ function repOfArray(elem: i32): RepDesc {
   // is also a ref-list element; the slot layer resolves which).
   if et is TyObj { return repMk("reflist", 0, "struct") }
   if et is TyUnion {
-    // `K[]` over a DECLARED litunion alias — atom-id elements share the i32
-    // list. An inline litunion element rides the name ladder (canon-softening,
-    // as at the standalone position); union-BOX-element lists keep their
-    // still-irregular legacy seams.
+    // `K[]` over a DECLARED litunion alias — or a provenanced COPY of one
+    // (b1) — atom-id elements share the i32 list. This arm and the nullable
+    // twin (`repOfNullable`'s list arm) now agree on every ALIAS-DERIVED
+    // element index (the #920 positional asymmetry was really about copies:
+    // the nullable wrapper always re-minted its element). An INLINE litunion
+    // element rides the name ladder — deliberately position-decided by the
+    // canon pass (softened to `string[]` bare, preserved as atoms under
+    // `| null`), so no index-level answer exists for it; union-BOX-element
+    // lists keep their still-irregular legacy seams.
     if tyIsLitUnion(elem) {
-      if tyIxIsUnionAliasDecl(elem) { return repMk("list", 0, "i32") }
+      if tyLitUnionAliasIx(elem) >= 0 { return repMk("list", 0, "i32") }
       return repUncovered()
     }
     return repUncovered()
@@ -932,13 +969,19 @@ export function repNodeScalarMask(ix: i32) {
 // `repCanonKey`'s de Bruijn render — a documented, sound under-merge: never a
 // false share, only a missed one).
 //
-// LIFETIME. Generation-stamped on the same axes as the flat layer's memos
-// (#917): `tyMutEpoch` (in-place arena mutation re-keys everything),
-// `cUserTypesVer` (which arena index a spelling resolves to), `sNames.length`
-// (slot claims). Any bump drops the whole tree — conservative, like the key
-// memo. A returned node index is therefore valid only until the next checker /
-// intern mutation: consume it immediately (the differential harness does), or
-// re-query. Building is LAZY — nothing pays for the tree until it asks.
+// LIFETIME. Generation-stamped on the CHECKER axes of the flat layer's memos
+// (#917): `tyMutEpoch` (in-place arena mutation re-keys everything) and
+// `cUserTypesVer` (which arena index a spelling resolves to). Any bump drops
+// the whole tree — conservative, like the key memo. `sNames.length` (slot
+// claims) is deliberately NOT an axis: the AUTHORITY projections (kind / null
+// discipline / list-element — what `repOfTy` reads on the normal compile
+// path) never consult `rtSlot`, and slot interning happens constantly during
+// emit, so stamping on it would rebuild the tree once per interned slot. The
+// only `rtSlot` consumer is the armed shadow harness, and `repShadowSweep`
+// forces a full drop first, so its slot assertions always run over a tree
+// built against the FINAL slot table. A returned node index is valid only
+// until the next checker mutation: consume it immediately, or re-query.
+// Building is LAZY — nothing pays for the tree until it asks.
 let rtKind: string[] = [] // node kind — see the grammar above
 let rtDisc: i32[] = [] // kind-specific: nul discipline (rdNul's 1/2/3/4) ·
 // struct 1 = union-VARIANT member · closure 1 = declared-void result
@@ -957,7 +1000,6 @@ let rtWalkGen: i32[] = [] // per-node visit stamps (`repTreeUnsupReason`)
 let rtWalkN = 0
 let rtEpoch = -1
 let rtUserVer = -1
-let rtSlotsLen = -1
 
 // Invalidate the tree (the `repReset` hook): the next `rtSync` rebuilds.
 function repTreeDrop() {
@@ -966,13 +1008,7 @@ function repTreeDrop() {
 }
 
 function rtSync() {
-  if (
-    rtEpoch == tyMutEpoch &&
-    rtUserVer == cUserTypesVer &&
-    rtSlotsLen == sNames.length
-  ) {
-    return 0
-  }
+  if (rtEpoch == tyMutEpoch && rtUserVer == cUserTypesVer) { return 0 }
   rtKind = []
   rtDisc = []
   rtChild = []
@@ -987,7 +1023,6 @@ function rtSync() {
   rtWalkGen = []
   rtEpoch = tyMutEpoch
   rtUserVer = cUserTypesVer
-  rtSlotsLen = sNames.length
   0
 }
 
@@ -1111,7 +1146,13 @@ function rtGo(ty: i32): i32 {
     if t.aElem < 0 { return rtLeafOf("unsup", 0, "list:hole", ty) }
     const ix = rtAlloc("list", ty)
     rtByTyPut(ty, ix)
-    rtChild[ix] = rtGo(t.aElem)
+    // Split form, REQUIRED: `rtChild[ix] = rtGo(…)` captures the list backing
+    // BEFORE the call, and the recursion's own `rtAlloc` pushes can REALLOCATE
+    // it — the store then lands in the stale backing and the node keeps
+    // child -1 (the #918 eval-order family, list flavor; surfaced when Stage B
+    // moved tree builds onto the mid-emit path).
+    const elem = rtGo(t.aElem)
+    rtChild[ix] = elem
     rtKidCount[ix] = 0
     return rtComplete(ix, ty)
   }
@@ -1191,26 +1232,26 @@ function rtOfObjAs(memoTy: i32, objTy: i32, disc: i32, fieldTys: i32[]): i32 {
 
 function rtOfUnion(ty: i32, members: i32[]): i32 {
   if tyIsLitUnion(ty) {
-    // Alias-ness as explicit input: a DECLARED litunion alias is the interned
-    // i32 atom. A litunion at a NON-alias arena index is genuinely ambiguous
-    // TODAY: either a re-minted COPY of a declared alias (a wrapper's inner —
-    // atom-backed; the shadow harness caught `VKind | null` minting one) or
-    // an inline/inferred union (canon-softened to `string`), and the index
-    // test cannot tell them apart. An explicit policy gap until the checker
-    // carries alias provenance on the arena node (a Stage B decision).
-    if tyIxIsUnionAliasDecl(ty) { return rtLeafOf("atom", 0, "", ty) }
+    // Alias-ness as explicit input (b1): a DECLARED litunion alias — or a
+    // checker-minted COPY of one, now index-visible through the alias
+    // PROVENANCE the mint sites record (`tyLitUnionAliasIx`) — is the
+    // interned i32 atom. What remains at a provenance-less index is a
+    // GENUINELY inline litunion (`: "a" | "b"` spelled directly), whose flat
+    // lowering is position-decided by the canon pass (softened to `string`
+    // bare, preserved as atoms under `| null` / at list elements) — no single
+    // compositional denotation exists for it, so it stays the explicit policy
+    // node; the flat projections carry its positional truths.
+    if tyLitUnionAliasIx(ty) >= 0 { return rtLeafOf("atom", 0, "", ty) }
     return rtLeafOf("unsup", 0, "litunion:noalias", ty)
   }
   if members.length == 1 {
     const m = T.tys[members[0]]
     if m is TyObj {
       // The canonicalized `{a} & {b}` struct alias — a PLAIN struct, never a
-      // variant: the union-decl registration pushes even a single-variant
-      // decl's member into `cVariantMemberTyIxs` (arity-blind), but the
-      // emitter lowers a one-member union as the struct itself, so
-      // variant-ness is stripped here (disc 0). NOTE the member's OWN index
-      // still classifies "variant" through the flat TyObj arm — a latent flat
-      // inconsistency the shadow harness surfaced; reported, not fixed here.
+      // variant: the emitter lowers a one-member union as the struct itself
+      // (disc 0). The member's OWN index agrees since the variant-member
+      // registration went arity-aware (the #920 irregularity (a) fix): a
+      // single-member decl no longer marks its member a variant.
       return rtOfObjAs(ty, members[0], 0, m.objFieldTypes)
     }
     return rtLeafOf("unsup", 0, "union:single-nonobj", ty)
@@ -1254,12 +1295,13 @@ function rtNulDiscOf(inner: i32): i32 {
   if it is TyObj { return 1 }
   if it is TyUnion {
     // ANY litunion inner takes the atom sentinel — deliberately NOT gated on
-    // the alias index, mirroring the flat arm: a nullable wrapper re-mints
-    // its inner as a fresh arena COPY of the declared alias (the index test
-    // misses it), while a genuinely-inline `("a"|"b") | null` never survives
-    // canon as a litunion here. The INNER node may still be the explicit
-    // `litunion:noalias` policy node (see `rtOfUnion`): the discipline is
-    // decided even where the member vocabulary is the open question.
+    // alias identity, mirroring the flat arm AND the canon pass: an
+    // alias-derived inner is atom-backed (usually a provenanced COPY now —
+    // b1), and a genuinely-inline `"a" | "b" | null` is PRESERVED as atoms
+    // too (`nulLitUnionPreserve` — the nullable position is atom for both
+    // forms). The INNER node may still be the explicit `litunion:noalias`
+    // policy node (see `rtOfUnion`): the discipline is decided even where
+    // the member vocabulary is the open question.
     if tyIsLitUnion(inner) { return 3 }
     if tyIsValueUnionBox(inner) { return 4 }
     if it.uMembers.length == 1 {
@@ -1281,7 +1323,10 @@ function rtOfNullable(ty: i32, inner: i32): i32 {
   const ix = rtAlloc("nul", ty)
   rtByTyPut(ty, ix)
   rtDisc[ix] = disc
-  rtChild[ix] = rtGo(inner)
+  // Split form, REQUIRED — see the `rtGo` list arm: the recursion can
+  // reallocate `rtChild`'s backing under a fused store.
+  const innerIx = rtGo(inner)
+  rtChild[ix] = innerIx
   rtKidCount[ix] = 0
   rtComplete(ix, ty)
 }
@@ -1299,12 +1344,16 @@ function rtOfMap(ty: i32, mKey: i32, mVal: i32, mSet: i32): i32 {
   if mSet != 1 && mVal < 0 { return rtLeafOf("unsup", 0, "map:val-hole", ty) }
   const ix = rtAlloc("map", ty)
   rtByTyPut(ty, ix)
+  // Split form, REQUIRED — see the `rtGo` list arm: the value recursion (and
+  // even a leaf intern) can reallocate `rtChild`'s backing under a fused store.
+  let valIx = -1
   if mSet == 1 {
     // A Set is internally a boolean-valued map — the mono value rep.
-    rtChild[ix] = rtLeafOf("bool", 0, "", -1)
+    valIx = rtLeafOf("bool", 0, "", -1)
   } else {
-    rtChild[ix] = rtGo(mVal)
+    valIx = rtGo(mVal)
   }
+  rtChild[ix] = valIx
   rtKidCount[ix] = 0
   rtComplete(ix, ty)
 }
@@ -1408,11 +1457,11 @@ function rtNulVKind(ix: i32): VKind | null {
     const ek = rtKind[elem]
     if ek == "i32" || ek == "bool" || ek == "atom" { return "nullist" }
     // The flat nullable arm covers ANY litunion element as atom-backed
-    // (`K[] | null` re-mints its elem as an alias COPY; the pinned
-    // litunion-nullable-list.vl also runs an INLINE one as atoms) — mirror
-    // that here even where the tree keeps the elem an explicit policy node.
-    // NOTE the flat BARE-array arm gates the same elem on alias-ness and
-    // answers uncovered — a flat-path irregularity, reported not fixed.
+    // (the pinned litunion-nullable-list.vl runs an INLINE one as atoms) —
+    // mirror that here even where the tree keeps the elem an explicit policy
+    // node. Alias-DERIVED elements are real atom nodes since b1 (provenance),
+    // and the flat bare-array arm now agrees on them; only the genuinely-
+    // inline element remains position-decided (see `rtOfUnion`).
     if ek == "unsup" {
       if rtReason[elem] == "litunion:noalias" { return "nullist" }
     }
@@ -1486,18 +1535,20 @@ export function repTreeUnsupReason(root: i32): string {
   ""
 }
 
-// ── The differential SHADOW harness (the Stage A gate) ───────────────────────
-// A debug-only sweep asserting the tree agrees with the flat descriptor on
-// every fact BOTH can express, wherever the flat side claims coverage
+// ── The differential SHADOW harness ──────────────────────────────────────────
+// A debug-only sweep asserting the FLAT arms agree with the tree on every
+// fact BOTH can express, wherever the flat side claims coverage
 // (`rdCovered == 1`): top kind, null discipline, list-element vocabulary,
 // `$fnsig` token, and struct-slot identity (up to the shipped
 // `repStructSlotsTwin` equivalence — a hash-cons merge may surface a TWIN
-// slot, never a different layout). A disagreement means one side is wrong: the
-// flat path is the battle-tested one, so it is either a bug in the tree (fix
-// it) or a latent flat-path inconsistency (report it — the flat path stays
-// frozen in Stage A). The sweep also tallies the COVERAGE report — how much of
-// the post-mono arena gets a fully-real tree, and which policy gaps
-// (`repTreeUnsupReason` buckets) block the rest: Stage B's burn-down list.
+// slot, never a different layout). Since Stage B wave 1 the tree is the
+// AUTHORITY at the `repOfTy` seam and the flat arms are the shadow (Stage A
+// ran the same comparison in the other direction, flat authoritative, to
+// zero disagreements first); a disagreement still means one side is wrong —
+// triage against the emitted behavior. The sweep also tallies the COVERAGE
+// report — how much of the post-mono arena gets a fully-real tree, and which
+// policy gaps (`repTreeUnsupReason` buckets) block the rest: the Stage B
+// burn-down list.
 //
 // OFF by default. The host arms it (`setRepShadow`, the `setEmitNames`
 // pattern) when `$VL_REP_SHADOW` is set and reads the report back through the
@@ -1523,6 +1574,12 @@ let repShadowReasonIx: {[string]: i32} = Map()
 // so an instance that compiles more than one program reports the last sweep.
 export function repShadowSweep() {
   if !repShadowOn { return 0 }
+  // Force a FRESH tree: the normal-compile tree deliberately survives slot
+  // interning (`sNames` growth is not an invalidation axis — see LIFETIME),
+  // so nodes built mid-emit may carry slot claims from before the table
+  // finished. The sweep's slot assertions must run over a tree built against
+  // the FINAL table; everything else re-derives identically.
+  repTreeDrop()
   repShadowMsgs = []
   repShadowSeen = Map()
   repShadowTys = 0
@@ -1578,7 +1635,11 @@ function repShadowCheckTy(ty: i32) {
   } else {
     repShadowBumpReason(reason)
   }
-  const d = repOfTy(ty)
+  // The FLAT derivation, asserted against the tree (Stage B wave 1 inverted
+  // the direction: `repOfTy` now RETURNS the tree's facts wherever the flat
+  // side claims coverage, so the flat arms are the shadow here — comparing
+  // `repOfTy` itself would be a tautology).
+  const d = repOfTyFlat(ty)
   if d.rdCovered == 0 { return 0 }
   const tk = repTreeVKind(tix)
   if tk != d.rdKind {
