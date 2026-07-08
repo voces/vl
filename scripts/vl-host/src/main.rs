@@ -442,8 +442,91 @@ fn compile_vl(
     entry: &str,
     emit_names: bool,
 ) -> Result<Vec<u8>> {
+    // `$VL_PROFILE_GUEST=<out.json>`: run this compile under a SAMPLING guest
+    // profiler and write a Firefox-profiler JSON, for function-level attribution
+    // of time spent INSIDE the compiler wasm. Diagnostics-only path.
+    if let Ok(out) = std::env::var("VL_PROFILE_GUEST") {
+        if let CompilerSource::Path(p) = compiler {
+            return compile_vl_guest_profiled(p, &out, source, source_path, entry, emit_names);
+        }
+    }
     let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
     compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names)
+}
+
+/// The `$VL_PROFILE_GUEST` path: like `compile_vl`, but on its own engine with
+/// EPOCH INTERRUPTION enabled — a timer thread bumps the epoch every ~1ms and the
+/// deadline callback takes a `GuestProfiler` stack sample, so the profile names
+/// where the compiler spends its time (build the seed with `--names` for legible
+/// frames). Deliberately bypasses the `.cwasm` sidecar: epoch-instrumented code
+/// has a different Engine config, and caching it would poison the sidecar every
+/// normal run then re-heals.
+fn compile_vl_guest_profiled(
+    compiler_path: &str,
+    out_path: &str,
+    source: &str,
+    source_path: &str,
+    entry: &str,
+    emit_names: bool,
+) -> Result<Vec<u8>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    const INTERVAL: Duration = Duration::from_millis(1);
+
+    let mut cfg = Config::new();
+    cfg.wasm_gc(true);
+    cfg.wasm_function_references(true);
+    cfg.collector(Collector::Null);
+    cfg.gc_heap_reservation(8 << 30);
+    cfg.epoch_interruption(true);
+    let engine = Engine::new(&cfg)?;
+    let module = Module::from_file(&engine, compiler_path)
+        .map_err(|e| e.context(format!("loading compiler module `{compiler_path}`")))?;
+    let mut store = Store::new(&engine, ());
+
+    let profiler = Arc::new(Mutex::new(Some(GuestProfiler::new(
+        &engine,
+        "vl-compiler",
+        INTERVAL,
+        vec![("vl-compiler".to_string(), module.clone())],
+    )?)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let timer = {
+        let stop = stop.clone();
+        let weak = engine.weak();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(INTERVAL);
+                match weak.upgrade() {
+                    Some(engine) => engine.increment_epoch(),
+                    None => break,
+                }
+            }
+        })
+    };
+    // Deadline + callback must be armed BEFORE instantiation: with epoch
+    // interruption enabled the store's default deadline is 0 and the default
+    // behavior is TRAP, so the module's start function would die immediately.
+    store.set_epoch_deadline(1);
+    let prof = profiler.clone();
+    store.epoch_deadline_callback(move |cx| {
+        if let Some(p) = prof.lock().unwrap().as_mut() {
+            p.sample(&cx, INTERVAL);
+        }
+        Ok(UpdateDeadline::Continue(1))
+    });
+    let inst = Linker::new(&engine).instantiate(&mut store, &module)?;
+
+    let result = compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names);
+    stop.store(true, Ordering::Relaxed);
+    let _ = timer.join();
+    if let Some(p) = profiler.lock().unwrap().take() {
+        let f = std::fs::File::create(out_path)
+            .map_err(|e| Error::from(e).context(format!("creating guest profile `{out_path}`")))?;
+        p.finish(std::io::BufWriter::new(f))?;
+        eprintln!("[profile] guest profile written to {out_path} (load in https://profiler.firefox.com)");
+    }
+    result
 }
 
 /// The per-invocation body of `compile_vl`, over an already-instantiated compiler:
