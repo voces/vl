@@ -254,6 +254,70 @@ fn read_utf8(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// One string-INPUT channel into the compiler module (`src`, `modKey`, `modSrc`,
+/// `cliResult`, …): the required per-code-point `<name>Push(cp)` export, plus two
+/// optional BATCHED variants probed from the instance — the same graceful-ABI-
+/// fallback idiom as `render_diags` and the module fetch loop. A seed exporting
+/// them gets the batched path; every current seed falls back to per-code-point
+/// pushes, byte-identical in behavior and cost.
+///
+/// Batched ABI (compiler-side follow-up — no seed exports these yet):
+///   `<name>Reserve(n: i32) -> i32` — capacity hint: about to append n more code
+///       points (lets the buffer preallocate once instead of growing per push).
+///   `ioMem` (exported linear memory) + `<name>Load(count: i32) -> i32` — append
+///       the `count` UTF-32LE code points the host wrote at ioMem[0..4*count).
+struct StrIn {
+    push: TypedFunc<i32, i32>,
+    reserve: Option<TypedFunc<i32, i32>>,
+    bulk: Option<(Memory, TypedFunc<i32, i32>)>,
+}
+
+impl StrIn {
+    /// Errors only when the required `<name>Push` export is missing/mistyped, so
+    /// callers gate on it exactly as they gated on `get_typed_func` before.
+    fn probe(store: &mut Store<()>, inst: &Instance, name: &str) -> Result<Self> {
+        let push = inst.get_typed_func::<i32, i32>(&mut *store, &format!("{name}Push"))?;
+        let reserve = inst
+            .get_typed_func::<i32, i32>(&mut *store, &format!("{name}Reserve"))
+            .ok();
+        let bulk = inst
+            .get_memory(&mut *store, "ioMem")
+            .zip(inst.get_typed_func::<i32, i32>(&mut *store, &format!("{name}Load")).ok());
+        Ok(StrIn { push, reserve, bulk })
+    }
+
+    /// Send one whole string: reserve hint (when offered), then memory-staged
+    /// chunks (when offered), else one `Push` call per code point.
+    fn send(&self, store: &mut Store<()>, s: &str) -> Result<()> {
+        if self.reserve.is_some() || self.bulk.is_some() {
+            let n = s.chars().count();
+            if let Some(reserve) = &self.reserve {
+                reserve.call(&mut *store, n as i32)?;
+            }
+            if let Some((mem, load)) = &self.bulk {
+                let cap = mem.data_size(&mut *store) / 4;
+                if cap > 0 {
+                    let mut chars = s.chars().peekable();
+                    let mut bytes: Vec<u8> = Vec::with_capacity(cap.min(n) * 4);
+                    while chars.peek().is_some() {
+                        bytes.clear();
+                        for ch in chars.by_ref().take(cap) {
+                            bytes.extend_from_slice(&(ch as u32).to_le_bytes());
+                        }
+                        mem.write(&mut *store, 0, &bytes)?;
+                        load.call(&mut *store, (bytes.len() / 4) as i32)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        for ch in s.chars() {
+            self.push.call(&mut *store, ch as i32)?;
+        }
+        Ok(())
+    }
+}
+
 /// Stage `source` (as `source_path`) into a freshly-loaded compiler instance: run
 /// the module fetch loop when it has imports, then `srcReset` + `srcPush`. Leaves
 /// the instance ready for a `checkSrc` / `compileSrc` / `lintSrc` call. Used by
@@ -261,7 +325,7 @@ fn read_utf8(path: &std::path::Path) -> Option<String> {
 /// command-queue pump.
 fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_path: &str) -> Result<()> {
     let src_reset = inst.get_typed_func::<(), i32>(&mut *store, "srcReset")?;
-    let src_push = inst.get_typed_func::<i32, i32>(&mut *store, "srcPush")?;
+    let src_in = StrIn::probe(store, inst, "src")?;
 
     // Multi-file module resolution (H3): when the source has a line-leading
     // `import {` (the host CLI's cheap textual gate — an import-free file keeps
@@ -292,10 +356,10 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
     // per-code-point boundary would only double the staging cost.
     let mut staged_via_modules = false;
     if has_imports {
-        if let (Ok(mod_reset), Ok(key_push), Ok(msrc_push), Ok(commit), Ok(pend_n), Ok(pend_len), Ok(pend_at)) = (
+        if let (Ok(mod_reset), Ok(key_in), Ok(msrc_in), Ok(commit), Ok(pend_n), Ok(pend_len), Ok(pend_at)) = (
             inst.get_typed_func::<(), i32>(&mut *store, "modReset"),
-            inst.get_typed_func::<i32, i32>(&mut *store, "modKeyPush"),
-            inst.get_typed_func::<i32, i32>(&mut *store, "modSrcPush"),
+            StrIn::probe(&mut *store, inst, "modKey"),
+            StrIn::probe(&mut *store, inst, "modSrc"),
             inst.get_typed_func::<i32, i32>(&mut *store, "modCommit"),
             inst.get_typed_func::<(), i32>(&mut *store, "modPendingCount"),
             inst.get_typed_func::<i32, i32>(&mut *store, "modPendingLen"),
@@ -303,13 +367,9 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
         ) {
             let commit_module =
                 |store: &mut Store<()>, key: &str, src: Option<&str>| -> Result<()> {
-                    for ch in key.chars() {
-                        key_push.call(&mut *store, ch as i32)?;
-                    }
+                    key_in.send(store, key)?;
                     if let Some(s) = src {
-                        for ch in s.chars() {
-                            msrc_push.call(&mut *store, ch as i32)?;
-                        }
+                        msrc_in.send(store, s)?;
                     }
                     commit.call(&mut *store, if src.is_some() { 1 } else { 0 })?;
                     Ok(())
@@ -354,9 +414,7 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
 
     if !staged_via_modules {
         src_reset.call(&mut *store, ())?;
-        for ch in source.chars() {
-            src_push.call(&mut *store, ch as i32)?;
-        }
+        src_in.send(store, source)?;
     }
     Ok(())
 }
@@ -856,7 +914,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
     let path_at = inst.get_typed_func::<i32, i32>(&mut store, "cliCmdPathAt")?;
     let data_len = inst.get_typed_func::<(), i32>(&mut store, "cliCmdDataLen")?;
     let data_at = inst.get_typed_func::<i32, i32>(&mut store, "cliCmdDataAt")?;
-    let result_push = inst.get_typed_func::<i32, i32>(&mut store, "cliResultPush")?;
+    let result_in = StrIn::probe(&mut store, &inst, "cliResult")?;
     let file_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?;
     let dir_name_push = inst.get_typed_func::<i32, i32>(&mut store, "cliDirNamePush")?;
     let dir_entry_push = inst.get_typed_func::<i32, i32>(&mut store, "cliDirEntryPush")?;
@@ -906,9 +964,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 };
                 match data {
                     Some(s) => {
-                        for ch in s.chars() {
-                            result_push.call(&mut store, ch as i32)?;
-                        }
+                        result_in.send(&mut store, &s)?;
                         file_commit.call(&mut store, 1)?;
                     }
                     None => {
@@ -929,9 +985,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 use std::io::Read;
                 let mut s = String::new();
                 std::io::stdin().read_to_string(&mut s).ok();
-                for ch in s.chars() {
-                    result_push.call(&mut store, ch as i32)?;
-                }
+                result_in.send(&mut store, &s)?;
                 file_commit.call(&mut store, 1)?;
             }
             CMD_PRINT_OUT => {
