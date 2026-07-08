@@ -101,10 +101,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      consumer migration: `repOfTy` is tree-PRIMARY (kind/nul/list-elem are the tree's
      projections wherever the flat arms claim coverage; flat still owns coverage + the
      nominal slot, and shadows the tree under `$VL_REP_SHADOW` — the Stage A direction
-     inverted). KNOWN HAZARD surfaced by the migration: the LIST twin of the #918
-     eval-order family — `a[i] = f()` where `f` pushes onto `a` stores into the stale
-     pre-reallocation backing (compiler source uses the split form; the codegen fix is
-     a follow-up like #918 was for maps).
+     inverted).
      STAGE B remaining charter (consumer migration, family-by-family, each PR gated by
      fixpoint + corpus + rep-fuzz + the shadow sweep): (b2) typed-value maps in
      composition (R1, the dominant reject family) through `Map(val)` trees; (b3) 2-D arrays
@@ -346,11 +343,13 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   - Cross-cutting: thread `severity` through all remaining error variants; consistent message style.
 - ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
   position and emit it.
-- ⬜ **B-chore-maprmw-fuse. Re-fuse the `repSlotKeyN` RMW in `emit_rep.vl`** (one-liner). #918
-  fixed the fused missing-key map RMW but the split-form spelling at the `repSlotKeyN` build must
-  stay ONE seed generation (the published seed's lowering predates the fix — bootstrap ordering).
-  Once a seed containing #918 publishes, swap the split temp back to
-  `repSlotKeyN[k] = (repSlotKeyN[k] ?? 0) + 1` (comment marks the site).
+- ⬜ **B-chore-liststore-fuse. Re-fuse the three split-form list stores in `emit_rep.vl`**
+  (one-liner). The indexed-store eval-order fix (the #918 family's LIST twin — `a[i] = f()`
+  where `f` reallocates `a`'s backing) landed, but #921's split-form workarounds at the tree
+  builders (`rtGo`'s array arm, `rtOfNullable`, `rtOfMap` — comment-marked) must stay ONE seed
+  generation: the published seed's store lowering predates the fix (bootstrap ordering, the
+  #918 precedent). Once a seed containing the fix publishes, swap each split temp back to the
+  fused `rtChild[ix] = …` store.
 - 🐛 **B-bug. `while` as the tail statement of a void function crashes binaryen's Vacuum pass.**
   A `while` loop in *tail position* of a `void`-returning function body aborts inside binaryen
   optimization. Workaround: don't end a void function on a bare `while`. Fix: investigate the
