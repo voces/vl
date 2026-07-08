@@ -800,6 +800,9 @@ export function repReset() {
   repSlotCacheEpoch = -1
   repSlotCacheUserVer = -1
   repSlotCacheLen = -1
+  // The recursive rep TREE (below) is arena-index-keyed too — force its next
+  // `rtSync` to rebuild from scratch.
+  repTreeDrop()
   0
 }
 
@@ -886,4 +889,457 @@ export function repNodeScalarMask(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return -1 }
   repTyScalarMask(ty)
+}
+
+// ── The RECURSIVE rep tree (rep-rewrite Stage A — audit Part II / Phase 2) ───
+// `repTreeOfTy` is the TOTAL, compositional successor of the flat descriptor
+// above. Where `RepDesc` classifies at most one wrapper deep and answers
+// `rdCovered == 0` for every composition it cannot name, the tree gives EVERY
+// post-mono type a full denotation:
+//
+//   Rep ::= Scalar(i32|i64|f32|f64) | Str | Atom | Struct(fields) | List(elem)
+//         | Map(val) | Box(members) | Closure(params, result)
+//         | Nullable(inner, discipline) | Unsupported(reason)
+//
+// — never a silent fallthrough: a shape whose ABI policy does not exist yet is
+// an EXPLICIT `unsup` node carrying a stable reason-code (the Stage B burn-down
+// unit; see the code list at `rtGo`). Checker METADATA the arena structure
+// alone cannot express — litunion alias-ness (atom vs canon-softened string),
+// union-variant membership — enters as explicit inputs, exactly as the flat
+// arms consult it.
+//
+// SHAPE. The tree is an index-linked ARENA (parallel arrays + i32 links — the
+// `Ty` arena's own pattern; VL has no self-referential aliases). Nodes are
+// HASH-CONSED: a node completes by looking up its structural key (kind +
+// discriminator + child node INDICES + field names) in `rtIntern`, so two
+// types with an identical layout tree share ONE node index — tree identity is
+// layout identity. The key is built from already-interned CHILD indices (not a
+// recursive string render), which keeps interning O(size), and it reuses the
+// flat layer's canonical vocabulary where nominal identity matters: `rtSlot`
+// is claimed through `repSlotOfTy`, and slot agreement across a hash-cons
+// merge is exactly the shipped `repStructSlotsTwin` equivalence.
+//
+// CYCLES. Recursive structural types are real arena cycles, so construction
+// memoizes by `Ty` index (`rtByTy`) and stamps the memo BEFORE recursing into
+// children: re-entering an in-progress type returns its already-allocated node
+// index, producing a real index CYCLE in the tree (again the arena pattern).
+// A cycle participant's completion key contains its own (or an in-progress
+// descendant's) index, so it can never falsely merge with an earlier node; two
+// ISOMORPHIC cyclic types therefore keep distinct nodes in Stage A (unlike
+// `repCanonKey`'s de Bruijn render — a documented, sound under-merge: never a
+// false share, only a missed one).
+//
+// LIFETIME. Generation-stamped on the same axes as the flat layer's memos
+// (#917): `tyMutEpoch` (in-place arena mutation re-keys everything),
+// `cUserTypesVer` (which arena index a spelling resolves to), `sNames.length`
+// (slot claims). Any bump drops the whole tree — conservative, like the key
+// memo. A returned node index is therefore valid only until the next checker /
+// intern mutation: consume it immediately (the differential harness does), or
+// re-query. Building is LAZY — nothing pays for the tree until it asks.
+let rtKind: string[] = [] // node kind — see the grammar above
+let rtDisc: i32[] = [] // kind-specific: nul discipline (rdNul's 1/2/3/4) ·
+// struct 1 = union-VARIANT member · closure 1 = declared-void result
+let rtChild: i32[] = [] // list elem / map val / nul inner; else -1
+let rtSlot: i32[] = [] // struct: the interned struct-table slot, else -1
+let rtTy: i32[] = [] // the arena index that BUILT the node — provenance for
+// debugging only, never identity (a hash-cons merge keeps the first builder's)
+let rtReason: string[] = [] // unsup: the policy reason-code, else ""
+let rtKidStart: i32[] = [] // struct fields / box members / closure params+ret,
+let rtKidCount: i32[] = [] // a [start,count) block in `rtKids`; -1 = the node
+// is still under construction (the cycle re-entry marker)
+let rtKids: i32[] = []
+let rtByTy: i32[] = [] // Ty index → node index (-1 unfilled); the cycle breaker
+let rtIntern: {[string]: i32} = Map() // structural key → node (hash-cons)
+let rtWalkGen: i32[] = [] // per-node visit stamps (`repTreeUnsupReason`)
+let rtWalkN = 0
+let rtEpoch = -1
+let rtUserVer = -1
+let rtSlotsLen = -1
+
+// Invalidate the tree (the `repReset` hook): the next `rtSync` rebuilds.
+function repTreeDrop() {
+  rtEpoch = -1
+  0
+}
+
+function rtSync() {
+  if (
+    rtEpoch == tyMutEpoch &&
+    rtUserVer == cUserTypesVer &&
+    rtSlotsLen == sNames.length
+  ) {
+    return 0
+  }
+  rtKind = []
+  rtDisc = []
+  rtChild = []
+  rtSlot = []
+  rtTy = []
+  rtReason = []
+  rtKidStart = []
+  rtKidCount = []
+  rtKids = []
+  rtByTy = []
+  rtIntern = Map()
+  rtWalkGen = []
+  rtEpoch = tyMutEpoch
+  rtUserVer = cUserTypesVer
+  rtSlotsLen = sNames.length
+  0
+}
+
+function rtAlloc(kind: string, ty: i32): i32 {
+  const ix = rtKind.length
+  rtKind.push(kind)
+  rtDisc.push(0)
+  rtChild.push(-1)
+  rtSlot.push(-1)
+  rtTy.push(ty)
+  rtReason.push("")
+  rtKidStart.push(0)
+  rtKidCount.push(-1)
+  ix
+}
+
+function rtByTyPut(ty: i32, ix: i32) {
+  while rtByTy.length <= ty { rtByTy.push(-1) }
+  rtByTy[ty] = ix
+  0
+}
+
+// A LEAF node (no children): interned by key directly — no throwaway
+// allocation on a hit. The key grammar is shared with `rtInternKeyOf` (a leaf
+// is the empty-suffix case), so a leaf and a composite can never collide.
+function rtLeafOf(kind: string, disc: i32, reason: string, ty: i32): i32 {
+  const key = kind + "|" + i32ToStr(disc) + "|" + reason + "|"
+  const hit = rtIntern[key] ?? -1
+  if hit >= 0 {
+    if ty >= 0 { rtByTyPut(ty, hit) }
+    return hit
+  }
+  const ix = rtAlloc(kind, ty)
+  rtDisc[ix] = disc
+  rtReason[ix] = reason
+  rtKidCount[ix] = 0
+  rtIntern[key] = ix
+  if ty >= 0 { rtByTyPut(ty, ix) }
+  ix
+}
+
+// The structural (hash-cons) key of a COMPLETED node: kind + discriminator +
+// reason + the child/kid node indices + (structs) the field names — child
+// IDENTITY, not a recursive render, so equal keys mean equal layout trees.
+// Field names ride along because the struct twin equivalence requires them
+// (`repCanonKey` keys `{a:i32}` apart from `{b:i32}`).
+function rtInternKeyOf(ix: i32): string {
+  let s = rtKind[ix] + "|" + i32ToStr(rtDisc[ix]) + "|" + rtReason[ix] + "|"
+  if rtChild[ix] >= 0 { s = s + "c" + i32ToStr(rtChild[ix]) + ";" }
+  let k = 0
+  while k < rtKidCount[ix] {
+    s = s + i32ToStr(rtKids[rtKidStart[ix] + k]) + ","
+    k = k + 1
+  }
+  if rtKind[ix] == "struct" {
+    const t = T.tys[rtTy[ix]]
+    if t is TyObj {
+      let fi = 0
+      while fi < t.objFieldNames.length {
+        s = s + t.objFieldNames[fi] + ":"
+        fi = fi + 1
+      }
+    }
+  }
+  s
+}
+
+function rtSetKids(ix: i32, kids: i32[]) {
+  rtKidStart[ix] = rtKids.length
+  let i = 0
+  while i < kids.length {
+    rtKids.push(kids[i])
+    i = i + 1
+  }
+  rtKidCount[ix] = kids.length
+  0
+}
+
+// Complete node `ix` (children filled): consult the hash-cons table. An
+// existing structurally-identical node WINS — `ix` is orphaned (a small,
+// bounded arena leak: at most one per distinct Ty per generation) and the Ty
+// memo is redirected, folding nominal slot knowledge into the survivor. A
+// cycle participant cannot reach here with a colliding key (its key contains
+// its own index — see the CYCLES note above), so redirecting is always safe:
+// nothing references the orphan.
+function rtComplete(ix: i32, ty: i32): i32 {
+  const key = rtInternKeyOf(ix)
+  const hit = rtIntern[key] ?? -1
+  if hit >= 0 && hit != ix {
+    if rtSlot[hit] < 0 && rtSlot[ix] >= 0 { rtSlot[hit] = rtSlot[ix] }
+    if ty >= 0 { rtByTyPut(ty, hit) }
+    return hit
+  }
+  rtIntern[key] = ix
+  ix
+}
+
+// The one TOTAL constructor: the rep tree of arena type `ty`. Always returns a
+// node; a shape without a settled lowering policy returns an `unsup` node
+// whose reason-code is one of the STABLE set (the coverage buckets):
+//   hole · prim:<name> · union:single-nonobj · union:unclassified · nul:hole ·
+//   nul:unclassified · list:hole · map:key · map:val-hole · neg ·
+//   leaf:unnarrowable
+export function repTreeOfTy(ty: i32): i32 {
+  rtSync()
+  rtGo(ty)
+}
+
+function rtGo(ty: i32): i32 {
+  if ty < 0 { return rtLeafOf("unsup", 0, "hole", -1) }
+  if ty < rtByTy.length {
+    if rtByTy[ty] >= 0 { return rtByTy[ty] }
+  }
+  const t = T.tys[ty]
+  if t is TyPrim { return rtOfPrim(t.primName, ty) }
+  if t is TyFunc { return rtOfFunc(ty, t.fnParamTypes, t.fnRet) }
+  if t is TyObj { return rtOfObj(ty, t.objFieldTypes) }
+  if t is TyUnion { return rtOfUnion(ty, t.uMembers) }
+  if t is TyNullable { return rtOfNullable(ty, t.nInner) }
+  if t is TyArray {
+    if t.aElem < 0 { return rtLeafOf("unsup", 0, "list:hole", ty) }
+    const ix = rtAlloc("list", ty)
+    rtByTyPut(ty, ix)
+    rtChild[ix] = rtGo(t.aElem)
+    rtKidCount[ix] = 0
+    return rtComplete(ix, ty)
+  }
+  if t is TyMap { return rtOfMap(ty, t.mKey, t.mVal, t.mSet) }
+  if t is TyNeg { return rtLeafOf("unsup", 0, "neg", ty) }
+  // TyVar / TyLit / TyErr — a generic instantiates, a literal widens, an error
+  // never reaches emit; none has a standalone rep of its own.
+  rtLeafOf("unsup", 0, "leaf:unnarrowable", ty)
+}
+
+function rtOfPrim(pn: string, ty: i32): i32 {
+  // boolean shares the i32 scalar; `void` follows the flat ladder (the
+  // void-ness of a RESULT is a separate axis — `rtDisc` on the closure node).
+  if pn == "i32" || pn == "boolean" { return rtLeafOf("i32", 0, "", ty) }
+  if pn == "i64" { return rtLeafOf("i64", 0, "", ty) }
+  if pn == "f64" { return rtLeafOf("f64", 0, "", ty) }
+  if pn == "f32" { return rtLeafOf("f32", 0, "", ty) }
+  if pn == "string" { return rtLeafOf("str", 0, "", ty) }
+  if pn == "void" { return rtLeafOf("i32", 0, "", ty) }
+  // `null` (and any future prim) — no standalone rep policy.
+  rtLeafOf("unsup", 0, "prim:" + pn, ty)
+}
+
+function rtOfFunc(ty: i32, paramTys: i32[], retTy: i32): i32 {
+  const ix = rtAlloc("closure", ty)
+  rtByTyPut(ty, ix)
+  if retTy >= 0 {
+    const rt = T.tys[retTy]
+    if rt is TyPrim {
+      if rt.primName == "void" { rtDisc[ix] = 1 }
+    }
+  }
+  const kids: i32[] = []
+  let i = 0
+  while i < paramTys.length {
+    kids.push(rtGo(paramTys[i]))
+    i = i + 1
+  }
+  // The RESULT rides as the last kid (void-ness is `rtDisc`, see above).
+  kids.push(rtGo(retTy))
+  rtSetKids(ix, kids)
+  rtComplete(ix, ty)
+}
+
+function rtOfObj(ty: i32, fieldTys: i32[]): i32 {
+  const ix = rtAlloc("struct", ty)
+  rtByTyPut(ty, ix)
+  // Checker metadata in: a union-VARIANT member's slot vocabulary is the
+  // variant index, not the struct table — the discriminator keeps the two
+  // apart through hash-consing.
+  if tyIxIsVariantMember(ty) { rtDisc[ix] = 1 }
+  rtSlot[ix] = repSlotOfTy(ty)
+  const kids: i32[] = []
+  let fi = 0
+  while fi < fieldTys.length {
+    kids.push(rtGo(fieldTys[fi]))
+    fi = fi + 1
+  }
+  rtSetKids(ix, kids)
+  rtComplete(ix, ty)
+}
+
+function rtOfUnion(ty: i32, members: i32[]): i32 {
+  if tyIsLitUnion(ty) {
+    // Alias-ness as explicit input: a DECLARED litunion alias is the interned
+    // i32 atom; an INLINE one is canon-softened to `string` (the flat arm
+    // leaves the inline case to the name ladder — the tree states the policy).
+    if tyIxIsUnionAliasDecl(ty) { return rtLeafOf("atom", 0, "", ty) }
+    return rtLeafOf("str", 0, "", ty)
+  }
+  if members.length == 1 {
+    const m = T.tys[members[0]]
+    if m is TyObj {
+      // The canonicalized `{a} & {b}` struct alias — the member IS the rep.
+      // Terminates on `U → obj → U` cycles because the member's own alloc
+      // stamps `rtByTy` before its fields recurse back here.
+      const mix = rtGo(members[0])
+      rtByTyPut(ty, mix)
+      return mix
+    }
+    return rtLeafOf("unsup", 0, "union:single-nonobj", ty)
+  }
+  if tyIsValueUnionBox(ty) {
+    const ix = rtAlloc("box", ty)
+    rtByTyPut(ty, ix)
+    const kids: i32[] = []
+    let mi = 0
+    while mi < members.length {
+      kids.push(rtGo(members[mi]))
+      mi = mi + 1
+    }
+    rtSetKids(ix, kids)
+    return rtComplete(ix, ty)
+  }
+  // Numeric literal unions (`0 | 1`) canon-collapse to their base scalar and
+  // never classify here; anything else is a policy gap, stated loudly.
+  rtLeafOf("unsup", 0, "union:unclassified", ty)
+}
+
+// The nullable DISCIPLINE for inner type `inner` — `rdNul`'s vocabulary
+// (1 nullable ref niche · 2 i32 sentinel 2 · 3 atom sentinel -1 · 4 boxed),
+// or 0 when no discipline exists (the nullable is a policy gap).
+function rtNulDiscOf(inner: i32): i32 {
+  const it = T.tys[inner]
+  if it is TyPrim {
+    if it.primName == "string" { return 1 }
+    if it.primName == "boolean" { return 2 }
+    if (
+      it.primName == "i32" ||
+      it.primName == "i64" ||
+      it.primName == "f64" ||
+      it.primName == "f32"
+    ) {
+      return 4
+    }
+    return 0
+  }
+  if it is TyFunc { return 1 }
+  if it is TyObj { return 1 }
+  if it is TyUnion {
+    if tyIsLitUnion(inner) {
+      if tyIxIsUnionAliasDecl(inner) { return 3 }
+      // Inline litunion — canon-softened to string, the `nulstr` niche.
+      return 1
+    }
+    if tyIsValueUnionBox(inner) { return 4 }
+    if it.uMembers.length == 1 {
+      const m = T.tys[it.uMembers[0]]
+      if m is TyObj { return 1 }
+    }
+    return 0
+  }
+  if it is TyArray { return 1 }
+  if it is TyMap { return 1 }
+  // Nullable-of-nullable, negation, unnarrowable leaves — no discipline.
+  0
+}
+
+function rtOfNullable(ty: i32, inner: i32): i32 {
+  if inner < 0 { return rtLeafOf("unsup", 0, "nul:hole", ty) }
+  const disc = rtNulDiscOf(inner)
+  if disc == 0 { return rtLeafOf("unsup", 0, "nul:unclassified", ty) }
+  const ix = rtAlloc("nul", ty)
+  rtByTyPut(ty, ix)
+  rtDisc[ix] = disc
+  rtChild[ix] = rtGo(inner)
+  rtKidCount[ix] = 0
+  rtComplete(ix, ty)
+}
+
+function rtOfMap(ty: i32, mKey: i32, mVal: i32, mSet: i32): i32 {
+  let keyOk = 0
+  if mKey >= 0 {
+    const kt = T.tys[mKey]
+    if kt is TyPrim {
+      if kt.primName == "string" { keyOk = 1 }
+    }
+  }
+  // Only string-keyed maps have a rep (the grammar's `Map(val)`).
+  if keyOk == 0 { return rtLeafOf("unsup", 0, "map:key", ty) }
+  if mSet != 1 && mVal < 0 { return rtLeafOf("unsup", 0, "map:val-hole", ty) }
+  const ix = rtAlloc("map", ty)
+  rtByTyPut(ty, ix)
+  if mSet == 1 {
+    // A Set is internally a boolean-valued map — the mono value rep.
+    rtChild[ix] = rtLeafOf("i32", 0, "", -1)
+  } else {
+    rtChild[ix] = rtGo(mVal)
+  }
+  rtKidCount[ix] = 0
+  rtComplete(ix, ty)
+}
+
+// ── Tree accessors + flat projections ────────────────────────────────────────
+// Read-only structure accessors (the arena arrays stay private so every
+// consumer goes through one vocabulary).
+export function repTreeKindOf(ix: i32): string {
+  if ix < 0 { return "" }
+  rtKind[ix]
+}
+
+export function repTreeChildOf(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  rtChild[ix]
+}
+
+export function repTreeKidCountOf(ix: i32): i32 {
+  if ix < 0 { return 0 }
+  if rtKidCount[ix] < 0 { return 0 }
+  rtKidCount[ix]
+}
+
+export function repTreeKidAt(ix: i32, k: i32): i32 {
+  rtKids[rtKidStart[ix] + k]
+}
+
+export function repTreeSlotOf(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  rtSlot[ix]
+}
+
+export function repTreeReasonOf(ix: i32): string {
+  if ix < 0 { return "" }
+  rtReason[ix]
+}
+
+// Whether `root`'s tree contains an `unsup` node anywhere — and WHICH policy
+// gap, as the first reason-code reached (breadth-order, deterministic). "" =
+// the whole tree is real: this is the totality metric the coverage report
+// buckets. Cycle-safe via a generation stamp per node (the `repTyScalarMask`
+// pattern; the stamps live with the arena arrays above).
+export function repTreeUnsupReason(root: i32): string {
+  if root < 0 { return "hole" }
+  rtWalkN = rtWalkN + 1
+  while rtWalkGen.length < rtKind.length { rtWalkGen.push(0) }
+  const work: i32[] = []
+  work.push(root)
+  let wp = 0
+  while wp < work.length {
+    const ix = work[wp]
+    wp = wp + 1
+    if ix >= 0 && rtWalkGen[ix] != rtWalkN {
+      rtWalkGen[ix] = rtWalkN
+      if rtKind[ix] == "unsup" { return rtReason[ix] }
+      if rtChild[ix] >= 0 { work.push(rtChild[ix]) }
+      let k = 0
+      while k < rtKidCount[ix] {
+        work.push(rtKids[rtKidStart[ix] + k])
+        k = k + 1
+      }
+    }
+  }
+  ""
 }
