@@ -164,6 +164,18 @@ fn resolve_compiler(explicit: Option<String>) -> CompilerSource {
 /// is unsafe because a corrupt/forged artifact is UB — we only ever load a sidecar
 /// this same binary wrote next to the module it was derived from.
 fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>, Instance)> {
+    let module = load_compiler_module(engine, source)?;
+    let mut store = Store::new(engine, ());
+    let linker = Linker::new(engine);
+    let inst = linker.instantiate(&mut store, &module)?;
+    Ok((store, inst))
+}
+
+/// The module-loading half of `load_compiler` (the `.cwasm` sidecar dance), split
+/// out so `vl run --batch` can load + Cranelift-cache the compiler ONCE and then
+/// instantiate it freshly per case (a fresh Store per case keeps cases isolated;
+/// the Module — the expensive half — is engine-level and shareable).
+fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Module> {
     let module = match source {
         // Embedded seed (a `--features embed-seed` release binary): compile from the
         // baked-in bytes each run. No `.cwasm` sidecar — there's no path to key it on;
@@ -220,10 +232,7 @@ fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>,
             }
         }
     };
-    let mut store = Store::new(engine, ());
-    let linker = Linker::new(engine);
-    let inst = linker.instantiate(&mut store, &module)?;
-    Ok((store, inst))
+    Ok(module)
 }
 
 /// Read a file as UTF-8, distinguishing "missing/unreadable" from "present but
@@ -245,6 +254,70 @@ fn read_utf8(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// One string-INPUT channel into the compiler module (`src`, `modKey`, `modSrc`,
+/// `cliResult`, …): the required per-code-point `<name>Push(cp)` export, plus two
+/// optional BATCHED variants probed from the instance — the same graceful-ABI-
+/// fallback idiom as `render_diags` and the module fetch loop. A seed exporting
+/// them gets the batched path; every current seed falls back to per-code-point
+/// pushes, byte-identical in behavior and cost.
+///
+/// Batched ABI (compiler-side follow-up — no seed exports these yet):
+///   `<name>Reserve(n: i32) -> i32` — capacity hint: about to append n more code
+///       points (lets the buffer preallocate once instead of growing per push).
+///   `ioMem` (exported linear memory) + `<name>Load(count: i32) -> i32` — append
+///       the `count` UTF-32LE code points the host wrote at ioMem[0..4*count).
+struct StrIn {
+    push: TypedFunc<i32, i32>,
+    reserve: Option<TypedFunc<i32, i32>>,
+    bulk: Option<(Memory, TypedFunc<i32, i32>)>,
+}
+
+impl StrIn {
+    /// Errors only when the required `<name>Push` export is missing/mistyped, so
+    /// callers gate on it exactly as they gated on `get_typed_func` before.
+    fn probe(store: &mut Store<()>, inst: &Instance, name: &str) -> Result<Self> {
+        let push = inst.get_typed_func::<i32, i32>(&mut *store, &format!("{name}Push"))?;
+        let reserve = inst
+            .get_typed_func::<i32, i32>(&mut *store, &format!("{name}Reserve"))
+            .ok();
+        let bulk = inst
+            .get_memory(&mut *store, "ioMem")
+            .zip(inst.get_typed_func::<i32, i32>(&mut *store, &format!("{name}Load")).ok());
+        Ok(StrIn { push, reserve, bulk })
+    }
+
+    /// Send one whole string: reserve hint (when offered), then memory-staged
+    /// chunks (when offered), else one `Push` call per code point.
+    fn send(&self, store: &mut Store<()>, s: &str) -> Result<()> {
+        if self.reserve.is_some() || self.bulk.is_some() {
+            let n = s.chars().count();
+            if let Some(reserve) = &self.reserve {
+                reserve.call(&mut *store, n as i32)?;
+            }
+            if let Some((mem, load)) = &self.bulk {
+                let cap = mem.data_size(&mut *store) / 4;
+                if cap > 0 {
+                    let mut chars = s.chars().peekable();
+                    let mut bytes: Vec<u8> = Vec::with_capacity(cap.min(n) * 4);
+                    while chars.peek().is_some() {
+                        bytes.clear();
+                        for ch in chars.by_ref().take(cap) {
+                            bytes.extend_from_slice(&(ch as u32).to_le_bytes());
+                        }
+                        mem.write(&mut *store, 0, &bytes)?;
+                        load.call(&mut *store, (bytes.len() / 4) as i32)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        for ch in s.chars() {
+            self.push.call(&mut *store, ch as i32)?;
+        }
+        Ok(())
+    }
+}
+
 /// Stage `source` (as `source_path`) into a freshly-loaded compiler instance: run
 /// the module fetch loop when it has imports, then `srcReset` + `srcPush`. Leaves
 /// the instance ready for a `checkSrc` / `compileSrc` / `lintSrc` call. Used by
@@ -252,7 +325,7 @@ fn read_utf8(path: &std::path::Path) -> Option<String> {
 /// command-queue pump.
 fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_path: &str) -> Result<()> {
     let src_reset = inst.get_typed_func::<(), i32>(&mut *store, "srcReset")?;
-    let src_push = inst.get_typed_func::<i32, i32>(&mut *store, "srcPush")?;
+    let src_in = StrIn::probe(store, inst, "src")?;
 
     // Multi-file module resolution (H3): when the source has a line-leading
     // `import {` (the host CLI's cheap textual gate — an import-free file keeps
@@ -283,10 +356,10 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
     // per-code-point boundary would only double the staging cost.
     let mut staged_via_modules = false;
     if has_imports {
-        if let (Ok(mod_reset), Ok(key_push), Ok(msrc_push), Ok(commit), Ok(pend_n), Ok(pend_len), Ok(pend_at)) = (
+        if let (Ok(mod_reset), Ok(key_in), Ok(msrc_in), Ok(commit), Ok(pend_n), Ok(pend_len), Ok(pend_at)) = (
             inst.get_typed_func::<(), i32>(&mut *store, "modReset"),
-            inst.get_typed_func::<i32, i32>(&mut *store, "modKeyPush"),
-            inst.get_typed_func::<i32, i32>(&mut *store, "modSrcPush"),
+            StrIn::probe(&mut *store, inst, "modKey"),
+            StrIn::probe(&mut *store, inst, "modSrc"),
             inst.get_typed_func::<i32, i32>(&mut *store, "modCommit"),
             inst.get_typed_func::<(), i32>(&mut *store, "modPendingCount"),
             inst.get_typed_func::<i32, i32>(&mut *store, "modPendingLen"),
@@ -294,13 +367,9 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
         ) {
             let commit_module =
                 |store: &mut Store<()>, key: &str, src: Option<&str>| -> Result<()> {
-                    for ch in key.chars() {
-                        key_push.call(&mut *store, ch as i32)?;
-                    }
+                    key_in.send(store, key)?;
                     if let Some(s) = src {
-                        for ch in s.chars() {
-                            msrc_push.call(&mut *store, ch as i32)?;
-                        }
+                        msrc_in.send(store, s)?;
                     }
                     commit.call(&mut *store, if src.is_some() { 1 } else { 0 })?;
                     Ok(())
@@ -345,11 +414,24 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
 
     if !staged_via_modules {
         src_reset.call(&mut *store, ())?;
-        for ch in source.chars() {
-            src_push.call(&mut *store, ch as i32)?;
-        }
+        src_in.send(store, source)?;
     }
     Ok(())
+}
+
+/// Coarse phase timer, active only when `$VL_PROFILE` is set. Prints
+/// `[profile] <label>: <ms>` to stderr so the self-compile pipeline can be
+/// attributed (load/deserialize vs staging vs compile vs readback) without perf.
+macro_rules! phase {
+    ($label:expr, $body:expr) => {{
+        let profiling = std::env::var_os("VL_PROFILE").is_some();
+        let t0 = profiling.then(std::time::Instant::now);
+        let r = $body;
+        if let Some(t0) = t0 {
+            eprintln!("[profile] {}: {} ms", $label, t0.elapsed().as_millis());
+        }
+        r
+    }};
 }
 
 fn compile_vl(
@@ -360,7 +442,106 @@ fn compile_vl(
     entry: &str,
     emit_names: bool,
 ) -> Result<Vec<u8>> {
-    let (mut store, inst) = load_compiler(engine, compiler)?;
+    // `$VL_PROFILE_GUEST=<out.json>`: run this compile under a SAMPLING guest
+    // profiler and write a Firefox-profiler JSON, for function-level attribution
+    // of time spent INSIDE the compiler wasm. Diagnostics-only path.
+    if let Ok(out) = std::env::var("VL_PROFILE_GUEST") {
+        if let CompilerSource::Path(p) = compiler {
+            return compile_vl_guest_profiled(p, &out, source, source_path, entry, emit_names);
+        }
+    }
+    let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
+    compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names)
+}
+
+/// The `$VL_PROFILE_GUEST` path: like `compile_vl`, but on its own engine with
+/// EPOCH INTERRUPTION enabled — a timer thread bumps the epoch every ~1ms and the
+/// deadline callback takes a `GuestProfiler` stack sample, so the profile names
+/// where the compiler spends its time (build the seed with `--names` for legible
+/// frames). Deliberately bypasses the `.cwasm` sidecar: epoch-instrumented code
+/// has a different Engine config, and caching it would poison the sidecar every
+/// normal run then re-heals.
+fn compile_vl_guest_profiled(
+    compiler_path: &str,
+    out_path: &str,
+    source: &str,
+    source_path: &str,
+    entry: &str,
+    emit_names: bool,
+) -> Result<Vec<u8>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    const INTERVAL: Duration = Duration::from_millis(1);
+
+    let mut cfg = Config::new();
+    cfg.wasm_gc(true);
+    cfg.wasm_function_references(true);
+    cfg.collector(Collector::Null);
+    cfg.gc_heap_reservation(8 << 30);
+    cfg.epoch_interruption(true);
+    let engine = Engine::new(&cfg)?;
+    let module = Module::from_file(&engine, compiler_path)
+        .map_err(|e| e.context(format!("loading compiler module `{compiler_path}`")))?;
+    let mut store = Store::new(&engine, ());
+
+    let profiler = Arc::new(Mutex::new(Some(GuestProfiler::new(
+        &engine,
+        "vl-compiler",
+        INTERVAL,
+        vec![("vl-compiler".to_string(), module.clone())],
+    )?)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let timer = {
+        let stop = stop.clone();
+        let weak = engine.weak();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(INTERVAL);
+                match weak.upgrade() {
+                    Some(engine) => engine.increment_epoch(),
+                    None => break,
+                }
+            }
+        })
+    };
+    // Deadline + callback must be armed BEFORE instantiation: with epoch
+    // interruption enabled the store's default deadline is 0 and the default
+    // behavior is TRAP, so the module's start function would die immediately.
+    store.set_epoch_deadline(1);
+    let prof = profiler.clone();
+    store.epoch_deadline_callback(move |cx| {
+        if let Some(p) = prof.lock().unwrap().as_mut() {
+            p.sample(&cx, INTERVAL);
+        }
+        Ok(UpdateDeadline::Continue(1))
+    });
+    let inst = Linker::new(&engine).instantiate(&mut store, &module)?;
+
+    let result = compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names);
+    stop.store(true, Ordering::Relaxed);
+    let _ = timer.join();
+    if let Some(p) = profiler.lock().unwrap().take() {
+        let f = std::fs::File::create(out_path)
+            .map_err(|e| Error::from(e).context(format!("creating guest profile `{out_path}`")))?;
+        p.finish(std::io::BufWriter::new(f))?;
+        eprintln!("[profile] guest profile written to {out_path} (load in https://profiler.firefox.com)");
+    }
+    result
+}
+
+/// The per-invocation body of `compile_vl`, over an already-instantiated compiler:
+/// stage the source, call `entry`, read the emitted bytes back (or the compiler's
+/// diagnostics as the error). `vl run --batch` instantiates the compiler once per
+/// case (cheap) from a once-loaded Module (expensive) and calls this directly.
+fn compile_vl_instance(
+    store: &mut Store<()>,
+    inst: &Instance,
+    source: &str,
+    source_path: &str,
+    entry: &str,
+    emit_names: bool,
+) -> Result<Vec<u8>> {
+    let mut store = store;
 
     let compile = inst.get_typed_func::<(), i32>(&mut store, entry)?;
     let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
@@ -376,22 +557,25 @@ fn compile_vl(
         }
     }
 
-    stage_program(&mut store, &inst, source, source_path)?;
-    let rc = compile.call(&mut store, ())?;
+    phase!("stage_program", stage_program(store, inst, source, source_path))?;
+    let rc = phase!("compile.call", compile.call(&mut store, ()))?;
     if rc != 0 {
         let stage = match rc {
             1 => "parse",
             2 => "type",
             _ => "emit",
         };
-        let diags = render_diags(&inst, &mut store, source_path)?;
+        let diags = render_diags(inst, store, source_path)?;
         bail!("{stage} error\n{}", diags.trim_end());
     }
-    let n = rlen.call(&mut store, ())?;
-    let mut bytes = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        bytes.push(rat.call(&mut store, i)? as u8);
-    }
+    let bytes = phase!("readback", {
+        let n = rlen.call(&mut store, ())?;
+        let mut bytes = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            bytes.push(rat.call(&mut store, i)? as u8);
+        }
+        Ok::<_, Error>(bytes)
+    })?;
     Ok(bytes)
 }
 
@@ -399,41 +583,160 @@ fn compile_vl(
 /// (top-level statements run via the wasm start function). Print output streams to
 /// stdout as it arrives.
 fn run_program(engine: &Engine, bytes: &[u8]) -> Result<()> {
+    run_program_with(engine, bytes, |line| println!("{line}"))
+}
+
+/// `run_program` with the print destination injected: every print import emits one
+/// LINE through `sink`. The default (`run_program`) streams lines to stdout as they
+/// arrive, byte-identical to before; `vl run --batch` captures them into a per-case
+/// buffer instead (many programs, one process, separated outputs).
+fn run_program_with(
+    engine: &Engine,
+    bytes: &[u8],
+    sink: impl Fn(&str) + Send + Sync + Clone + 'static,
+) -> Result<()> {
     let module = Module::new(engine, bytes)?;
     let chars: Arc<Mutex<Vec<u32>>> = Arc::default();
     let mut store = Store::new(engine, ());
     let mut linker = Linker::new(engine);
 
-    linker.func_wrap("imports", "__print_i32__", |v: i32| println!("{v}"))?;
-    linker.func_wrap("imports", "__print_i64__", |v: i64| println!("{v}"))?;
+    let s = sink.clone();
+    linker.func_wrap("imports", "__print_i32__", move |v: i32| s(&v.to_string()))?;
+    let s = sink.clone();
+    linker.func_wrap("imports", "__print_i64__", move |v: i64| s(&v.to_string()))?;
     // f64: Rust's `{}` Display matches JS `String(v)` for the corpus values (whole
     // numbers print without a trailing `.0`, e.g. 4.0 → "4"), mirroring the host's
     // `__print_f64__` (`String(v)`) so emitted output matches `@log`. (Slice 3.)
-    linker.func_wrap("imports", "__print_f64__", |v: f64| println!("{v}"))?;
+    let s = sink.clone();
+    linker.func_wrap("imports", "__print_f64__", move |v: f64| s(&v.to_string()))?;
     // f32: widen to f64 before Display so the printed decimal matches JS `String(v)`
     // (where a wasm f32 arrives as a JS number, i.e. its exact f64 value), mirroring the
     // host's `__print_f32__` (`String(v)`). Whole f32 values print without `.0` (e.g.
     // 6.5→"6.5", 10.0→"10"). (Slice 5.)
-    linker.func_wrap("imports", "__print_f32__", |v: f32| {
-        println!("{}", v as f64)
+    let s = sink.clone();
+    linker.func_wrap("imports", "__print_f32__", move |v: f32| {
+        s(&(v as f64).to_string())
     })?;
-    linker.func_wrap("imports", "__print_bool__", |v: i32| {
-        println!("{}", if v != 0 { "true" } else { "false" })
+    let s = sink.clone();
+    linker.func_wrap("imports", "__print_bool__", move |v: i32| {
+        s(if v != 0 { "true" } else { "false" })
     })?;
     let c = chars.clone();
     linker.func_wrap("imports", "__print_char__", move |code: i32| {
         c.lock().unwrap().push(code as u32);
     })?;
     let c = chars.clone();
+    let s = sink.clone();
     linker.func_wrap("imports", "__print_str_flush__", move || {
         let mut buf = c.lock().unwrap();
         let line: String = buf.iter().filter_map(|&cp| char::from_u32(cp)).collect();
         buf.clear();
-        println!("{line}");
+        s(&line);
     })?;
 
     // Instantiation runs the start function — the VL program's top level.
     let _instance = linker.instantiate(&mut store, &module)?;
+    Ok(())
+}
+
+/// `vl run --batch --out-dir DIR <file.vl>... [--compiler seed]` — run MANY
+/// programs in ONE process. The per-invocation fixed costs a `vl run` pays —
+/// process spawn, two engine builds, deserializing + relocating the multi-MB
+/// compiler `.cwasm` — are paid ONCE here, and each case only pays its own
+/// (cheap) instantiate + compile + run. This is the fuzz loop's shape: the CI
+/// rep-fuzz job runs hundreds of generated cases per seed, and the fixed costs
+/// dominated each of them.
+///
+/// Cases stay ISOLATED: a fresh Store (its own GC heap) per case for both the
+/// compiler instance and the program, so no state leaks between cases — only
+/// the immutable engine-level Modules are shared.
+///
+/// Per input `<name>`, writes into DIR:
+///   <name>.out — the program's print output (always written, even on failure)
+///   <name>.err — the same rendered error a failing `vl run` prints to stderr
+///                (compiler diagnostics / invalid-wasm / trap), only on failure
+/// The process exit code is 0 unless the batch itself cannot run (bad flags,
+/// unwritable DIR) — per-case failure is signalled by `<name>.err` existing, so
+/// one bad case never aborts the rest of the batch.
+fn run_batch(args: &[String]) -> Result<()> {
+    let mut compiler: Option<String> = None;
+    let mut out_dir: Option<String> = None;
+    let mut files: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--compiler" => {
+                compiler = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--out-dir" => {
+                out_dir = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--batch" => {}
+            a if !a.starts_with('-') => files.push(a.to_string()),
+            other => bail!("vl run --batch: unknown flag `{other}`"),
+        }
+        i += 1;
+    }
+    let Some(out_dir) = out_dir else {
+        bail!("usage: vl run --batch --out-dir <dir> <file.vl>...")
+    };
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| Error::from(e).context(format!("creating --out-dir `{out_dir}`")))?;
+    let compiler = resolve_compiler(compiler);
+
+    let compile_engine = gc_engine(Collector::Null)?;
+    let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
+    let module = load_compiler_module(&compile_engine, &compiler)?;
+    // Pre-link once; `instantiate_pre` re-checks nothing per case.
+    let pre = Linker::new(&compile_engine).instantiate_pre(&module)?;
+
+    for f in &files {
+        let name = std::path::Path::new(f)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| f.clone());
+        let captured: Arc<Mutex<String>> = Arc::default();
+        let sink = {
+            let buf = captured.clone();
+            move |line: &str| {
+                let mut b = buf.lock().unwrap();
+                b.push_str(line);
+                b.push('\n');
+            }
+        };
+        // Same pipeline as a single `vl run <file>`: prebuilt wasm runs directly,
+        // source compiles through the seed (names on, like `compile_and_run`).
+        let result = (|| -> Result<()> {
+            let raw = std::fs::read(f)
+                .map_err(|e| Error::from(e).context(format!("reading `{f}`")))?;
+            let bytes = if raw.starts_with(b"\0asm") {
+                raw
+            } else {
+                let source = String::from_utf8(raw).map_err(|e| {
+                    Error::from(e)
+                        .context(format!("`{f}` is neither UTF-8 VL source nor a wasm module"))
+                })?;
+                let mut store = Store::new(&compile_engine, ());
+                let inst = pre.instantiate(&mut store)?;
+                compile_vl_instance(&mut store, &inst, &source, f, "compileSrc", true)?
+            };
+            run_program_with(&run_engine, &bytes, sink.clone())
+        })();
+        std::fs::write(format!("{out_dir}/{name}.out"), captured.lock().unwrap().as_bytes())?;
+        let err_path = format!("{out_dir}/{name}.err");
+        match result {
+            // Clear a stale `.err` so a reused DIR can't misclassify a pass.
+            Ok(()) => {
+                let _ = std::fs::remove_file(&err_path);
+            }
+            // `{e:?}` renders the same context chain a failing `vl run` prints via
+            // `Error: {e:?}` on stderr, so downstream classification (grep for
+            // "parse error" / "failed to parse WebAssembly" / trap text) is stable.
+            Err(e) => std::fs::write(&err_path, format!("{e:?}\n"))?,
+        }
+    }
     Ok(())
 }
 
@@ -547,6 +850,10 @@ fn compile_and_run(
 /// shape (no file with `-e`/stdin) is dispatched before the positional parsing.
 fn run_cmd(args: &[String]) -> Result<()> {
     use std::io::{IsTerminal, Read};
+    // `--batch` is its own arg shape (many files, --out-dir) — dispatch first.
+    if args.iter().any(|a| a == "--batch") {
+        return run_batch(args);
+    }
     let mut compiler: Option<String> = None;
     let mut inline: Option<String> = None;
     let mut file: Option<String> = None;
@@ -690,7 +997,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
     let path_at = inst.get_typed_func::<i32, i32>(&mut store, "cliCmdPathAt")?;
     let data_len = inst.get_typed_func::<(), i32>(&mut store, "cliCmdDataLen")?;
     let data_at = inst.get_typed_func::<i32, i32>(&mut store, "cliCmdDataAt")?;
-    let result_push = inst.get_typed_func::<i32, i32>(&mut store, "cliResultPush")?;
+    let result_in = StrIn::probe(&mut store, &inst, "cliResult")?;
     let file_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?;
     let dir_name_push = inst.get_typed_func::<i32, i32>(&mut store, "cliDirNamePush")?;
     let dir_entry_push = inst.get_typed_func::<i32, i32>(&mut store, "cliDirEntryPush")?;
@@ -740,9 +1047,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 };
                 match data {
                     Some(s) => {
-                        for ch in s.chars() {
-                            result_push.call(&mut store, ch as i32)?;
-                        }
+                        result_in.send(&mut store, &s)?;
                         file_commit.call(&mut store, 1)?;
                     }
                     None => {
@@ -763,9 +1068,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 use std::io::Read;
                 let mut s = String::new();
                 std::io::stdin().read_to_string(&mut s).ok();
-                for ch in s.chars() {
-                    result_push.call(&mut store, ch as i32)?;
-                }
+                result_in.send(&mut store, &s)?;
                 file_commit.call(&mut store, 1)?;
             }
             CMD_PRINT_OUT => {
