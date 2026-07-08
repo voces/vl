@@ -78,12 +78,17 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      into the stored `fRetKind: VKind[]`; `inferredRetKindCore` is a plain read —
      → `CHANGELOG.md`).
      REMAINING migration order: (a) widen `repOfTy` coverage (typed-value maps,
-     litunion/union-element arrays); (b) the SLOT layer — STRUCT table DONE (structural
-     heap-type dedup: `repCanonKey` → `sTwin` → shared `sHeapIdx`, fixing the structural-twin
-     invalid-wasm bug `takeA(b)` where `A`/`B` are structurally-identical declared types; see
-     `DECISIONS.md`). REMAINING: the REF-LIST table (`rlSlotByName` — a `B[]` still interns a
-     distinct list-wrapper heap type from `A[]`, so `sumA(bs: B[])` given an `A[]` mismatches;
-     extend the same `repCanonKey`-keyed dedup to the ref-list wrapper/backing slots).
+     litunion/union-element arrays); (b) the SLOT layer — STRUCT + REF-LIST tables DONE
+     (structural heap-type dedup: `repCanonKey` → `sTwin` → shared `sHeapIdx`, extended
+     through the ref-list wrapper/backing slots and the inline-shape spelling bridge — see
+     `DECISIONS.md` + `CHANGELOG.md`); REMAINING: the map-VALUE table (`mvValName`) and the
+     variant table; (c) memoize `repCanonKey`/`repSlotOfTy` with the generation-stamped
+     pattern of `repTyScalarMask` (the 2026-07 audit's hot-path flag: `repSlotOfTy` linear-scans
+     `sNames` recomputing `repCanonKey` per query); (d) the closure-value-call union-result
+     narrow: a `t is T[]` arm over a binding INFERRED from a closure-value call mis-lowers the
+     narrowed read (the `unionNameOfIdent` gate misses, the raw box leaks — invalid wasm
+     nominal, a TRAP annotated; pre-existing, fuzz-shielded by the declared-twin gate on the
+     shape bridge).
 - ✅ **Kill the TS host. DONE — the TWO COMPILERS are now one.** The TS compiler core
   (`compiler/*.ts` front end + `cli.ts` + the `checker-parity-sweep.ts` oracle) is DELETED; the
   self-hosted `compiler/*.vl` (the wasm seed) is the sole compiler. Got here in stages:
