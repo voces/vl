@@ -102,9 +102,20 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      projections wherever the flat arms claim coverage; flat still owns coverage + the
      nominal slot, and shadows the tree under `$VL_REP_SHADOW` — the Stage A direction
      inverted).
+     Stage B WAVE 2 slice 1 SHIPPED (→ `CHANGELOG.md`): the R1 map-valued-FIELD seams —
+     mono-ness at `mvSlotOfValNameFind` decided by the interner's own classifier (atom /
+     niche map fields ride the mono map), the shape-text variant seam records + interns
+     code-19 field value slots (map-in-union-arm lowers), the narrowed-member map
+     receiver resolves through the variant field tables, and the field-set matchers
+     (`objVariantName` / `shapeFieldTypeCompat`) are map-VALUE-rep tightened so twin
+     name-set arms with different map values never collide. Baseline 273 → 255 (18
+     graduations, 4 pinned tests).
      STAGE B remaining charter (consumer migration, family-by-family, each PR gated by
-     fixpoint + corpus + rep-fuzz + the shadow sweep): (b2) typed-value maps in
-     composition (R1, the dominant reject family) through `Map(val)` trees; (b3) 2-D arrays
+     fixpoint + corpus + rep-fuzz + the shadow sweep): (b2, REMAINING TAIL) typed-value
+     maps in composition (R1) through `Map(val)` trees — map-in-list-in-union
+     (`{[string]: V}[] | X`), map-through-closure-result in union arms, and the
+     still-loud nested/nullable-value policy set (each stays rejected until its rep is
+     genuinely minted); (b3) 2-D arrays
      (R4 — `List(List(_))` dissolves the special backing) + nullable-list-in-field /
      struct-through-list (R5/R6, compositional once consumers read the tree); (b4) closure
      composite results via sig keys interned from `Closure(params, result)` nodes (R2);
