@@ -158,6 +158,25 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   silently miss its `{[string]: A}` carrier once the heaps merged, so tag
   identity and heap identity move together. (structural slot dedup, map-value
   layer)
+  VARIANT structs complete the slot layers, deduping by the same two layers
+  (`buildVariantTwins` → `uVarTwin`/`uVarHeap`: the canonical variant key via
+  `repNameCanonKey` + a per-field storage guard whose ref-bearing field codes
+  delegate to their layer's twin equivalence — ref-list fields to
+  `rlSlotsLayoutTwin`, nested-struct fields to `repStructSlotsTwin`, map fields
+  to the canonical mv representative); the arithmetic `uVarIdx + vi` heap
+  identity is retired for the table (`uVarIdx` deleted). Twin keys are computed
+  ONCE per slot (`buildStructTwins` discipline) — the compiler's own unions
+  carry hundreds of variants, so a per-pair key recomputation is the audit's
+  hot-path anti-pattern. This closed a REAL trap: a `Cat` boxed into
+  `Kot | Bird` (a structural-twin arm) already PASSED the tag compare
+  (`variantSig` keys on field names, so twins share a tag by construction) but
+  the narrowed read's cast targeted the twin's distinct heap type — with one
+  shared heap type, tag and cast agree. The SAME variant name declared in two
+  unions (each push minted its own heap type) is the degenerate twin and now
+  emits once. The variant⇄struct-TABLE seam (a declared struct twin in a
+  variant-arm position) stays nominal — chartered as repOf item (e), wanting
+  the #911 declared-twin gate at the variant resolvers. (structural slot dedup,
+  variant layer)
 - **The shape-INTERN table keys on field CODES (layout), not `repCanonKey`
   (structure); the two are deliberately separate layers.** `annShapeIndexOf` is a
   LAYOUT table — two structurally-identical checker types can lower to DIFFERENT

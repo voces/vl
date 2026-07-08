@@ -78,22 +78,26 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      → `CHANGELOG.md`), and the `fRet*` fold COMPLETE (every per-family flag table folded
      into the stored `fRetKind: VKind[]`; `inferredRetKindCore` is a plain read —
      → `CHANGELOG.md`).
+     The SLOT layer (item (b)) is COMPLETE — structural heap-type dedup by canonical layout
+     across ALL FOUR name-keyed tables: STRUCT (`repCanonKey` → `sTwin` → shared `sHeapIdx`),
+     REF-LIST (`rlTwin` + the inline-shape spelling bridge), MAP-VALUE (`mvTwin` + the
+     canonical tag/arm seam `mvCanonRepOf`), and VARIANT (`buildVariantTwins` →
+     `uVarTwin`/`uVarHeap`, retiring the arithmetic `uVarIdx + vi` heap identity) — see
+     `DECISIONS.md` + `CHANGELOG.md`.
      REMAINING migration order: (a) widen `repOfTy` coverage (typed-value maps,
-     litunion/union-element arrays); (b) the SLOT layer — STRUCT + REF-LIST + MAP-VALUE
-     tables DONE (structural heap-type dedup: `repCanonKey` → `sTwin` → shared `sHeapIdx`,
-     extended through the ref-list wrapper/backing slots, the inline-shape spelling bridge,
-     and the map-value table `mvTwin` + the canonical tag/arm seam `mvCanonRepOf` — see
-     `DECISIONS.md` + `CHANGELOG.md`); REMAINING: the variant table
-     (`uVariants` heap identity is still the arithmetic `uVarIdx + vi` — one heap type per
-     PUSH, so the same variant declared in two unions emits twice and a structural-twin arm
-     TRAPS at the narrowed read); (c) memoize `repCanonKey`/`repSlotOfTy` with the
+     litunion/union-element arrays); (c) memoize `repCanonKey`/`repSlotOfTy` with the
      generation-stamped pattern of `repTyScalarMask` (the 2026-07 audit's hot-path flag:
      `repSlotOfTy` linear-scans `sNames` recomputing `repCanonKey` per query; `mvCanonRepOf`
-     recomputes `repNameCanonKey` per call the same way); (d) the closure-value-call union-result
-     narrow: a `t is T[]` arm over a binding INFERRED from a closure-value call mis-lowers the
-     narrowed read (the `unionNameOfIdent` gate misses, the raw box leaks — invalid wasm
-     nominal, a TRAP annotated; pre-existing, fuzz-shielded by the declared-twin gate on the
-     shape bridge).
+     recomputes `repNameCanonKey` per call the same way); (d) the closure-value-call
+     union-result narrow: a `t is T[]` arm over a binding INFERRED from a closure-value call
+     mis-lowers the narrowed read (the `unionNameOfIdent` gate misses, the raw box leaks —
+     invalid wasm nominal, a TRAP annotated; pre-existing, fuzz-shielded by the declared-twin
+     gate on the shape bridge); (e) the variant⇄struct-table seam: a DECLARED struct twin
+     flowing into a variant-arm position (`pickU(k: Kot)` where `U = Cat | Dog`, `Kot`≅`Cat`)
+     still fails validation — the box/`is` resolution is nominal (`variantIndexOf`) and
+     `uVarHeap`/`sHeapIdx` do not dedup across the two tables — and an inline-shape union arm
+     (`type U = {m:i32} | Dog`) rejects a declared-name `is` spelling (`u is Cat`); both are
+     loud, and the fix wants the #911 declared-twin-gated bridge at the variant resolvers.
 - ✅ **Kill the TS host. DONE — the TWO COMPILERS are now one.** The TS compiler core
   (`compiler/*.ts` front end + `cli.ts` + the `checker-parity-sweep.ts` oracle) is DELETED; the
   self-hosted `compiler/*.vl` (the wasm seed) is the sole compiler. Got here in stages:
