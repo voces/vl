@@ -1,0 +1,48 @@
+// @run
+// @log 1
+// @log 42
+// @log 8
+// @log 2
+// @log true
+// @log 2
+// B-bug-maprmw regression: the FUSED map read-modify-write `m[k] = (m[k] ?? d) + 1`
+// on a MISSING key. The old lowering evaluated the RHS inside the append arm AFTER
+// `index[slot] = count+1` + the key push, so the RHS's probe of the same key HIT the
+// half-inserted entry and read `vals.backing[count]` — an OOB trap on a fresh map,
+// or (once the backing had grown past `count`) a silent default-0 that also skipped
+// the `?? d` default. The fix evaluates receiver, key, and VALUE before the probe
+// touches anything. The split form (`const t = m[k] ?? 0; m[k] = t + 1`) always worked.
+
+// The 3-line charter repro: missing key on a FRESH map (trapped: OOB array access).
+const m: {[string]: i32} = Map()
+m["k"] = (m["k"] ?? 0) + 1
+print(m["k"] ?? -1) // 1
+
+// PRESENT key: the overwrite arm (always worked — pinned so it stays that way).
+const p: {[string]: i32} = Map()
+p["k"] = 41
+p["k"] = (p["k"] ?? 0) + 1
+print(p["k"] ?? -1) // 42
+
+// Missing key on a map whose vals backing already GREW (cap > count): the old
+// lowering silently produced `0 + 1` here — the RHS hit the half-inserted entry,
+// read the grown backing's default 0, and never applied the `?? 7` default.
+const g: {[string]: i32} = Map()
+g["a"] = 1
+g["k"] = (g["k"] ?? 7) + 1
+print(g["k"] ?? -1) // 8
+print(g.length)     // 2 — the append still inserted exactly one new entry
+
+// Boolean-valued mono map (trapped).
+const b: {[string]: boolean} = Map()
+b["k"] = !(b["k"] ?? false)
+print(b["k"] ?? false) // true
+
+// A LOCAL map inside a function (trapped) — fused twice: append then overwrite.
+function twice() {
+  const f: {[string]: i32} = Map()
+  f["k"] = (f["k"] ?? 0) + 1
+  f["k"] = (f["k"] ?? 0) + 1
+  f["k"] ?? -1
+}
+print(twice()) // 2

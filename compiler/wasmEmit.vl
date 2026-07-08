@@ -3319,7 +3319,7 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
 // A map is the 5-field `MAP = { keys, vals, index, count, size }` (see the map-table
 // section above for the full representation). Operations HASH the key (FNV-1a) into
 // `index` and LINEAR-PROBE to a free-or-matching slot — NO O(n) scan. A function that
-// touches a map reserves a 14-slot scratch frame (`mapScratchBase` + 0..13):
+// touches a map reserves a 15-slot scratch frame (`mapScratchBase` + 0..14):
 //   +0  mapRef : (ref $mStructIdx)  — the map value
 //   +1  keyRef : (ref $aTypeIdx)    — the target key string
 //   +2  curRef : (ref $aTypeIdx)    — spare (the probed-key compare lives in the
@@ -3336,6 +3336,8 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
 //   +12 liveBk : (ref $aTypeIdx)    — grown `live` backing (keys-grow lockstep)
 //   +13 hashBk : (ref $aTypeIdx)    — grown `hashes` backing (keys-grow lockstep);
 //                                     compact new hashes backing
+//   +14 valSet : i32                — a mono SET's stashed value (evaluated BEFORE
+//                                     the probe; RESERVED — nothing else writes it)
 // `emitMapProbe` leaves `slot` = the probe slot and `entry` = index[slot]; reused by
 // set / get / `??` / `.has` / `delete`. `emitMapResize` rehashes at load factor 1/2;
 // `emitMapDelete` tombstones + amortized-`emitMapCompact`s.
@@ -3524,11 +3526,16 @@ function emitMapNew(_body: i32[]) {
   0
 }
 
-// Load the map receiver + key into the scratch frame (slots 0/1) and run the PROBE,
-// leaving `slot` (slot 3) = the probe slot and `entry` (slot 5) = `index[slot]`
-// (0 = miss; else entry-position + 1). `recvIx`/`keyIx` are arena indices; `recvIx`
-// must be a map-typed expression and `keyIx` a string.
-function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
+// Resolve the receiver's map SHAPE and emit the RECEIVER + KEY exprs, leaving
+// BOTH values on the OPERAND STACK ([mapRef, keyRef], keyRef on top) with
+// `cmSlot` pinned to the shape. They stay OFF the scratch locals on purpose: an
+// inner map op nested in the KEY expr (`b[a["x"] ?? "d"]` with `a` and `b`
+// same-shaped) — or, for a SET, in the VALUE expr evaluated between the key and
+// the stores — runs its own probe through the SAME shared scratch frame, and a
+// value parked in `mapRef`/`keyRef` would be silently clobbered (wrong-map
+// probes / lost writes). Values on the wasm operand stack are immune: nested
+// ops only touch locals. The caller pops key (slot 1) then mapRef.
+function emitMapRecvKey(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   if !mUsed {
     return emitFail("emitProgram: map op but map type not collected")
   }
@@ -3548,9 +3555,7 @@ function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
     )
   }
   // The receiver expr is emitted OUTSIDE the context (it is map-op-free by
-  // construction — an Ident/global/constructor), then the context pins the typed
-  // mapRef store. The KEY expr may contain an inner map op (`m[n[k] ?? "d"]`),
-  // which clobbers `cmSlot` — re-pin it before the probe.
+  // construction — an Ident/global/constructor).
   if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
   // A NULLABLE map receiver (`{[string]: V} | null`, kind `nulmap`) is a `(ref null $mapStruct)` —
   // recover its non-null ref before the `(ref $mapStruct)` mapRef store (the checker proved every
@@ -3559,18 +3564,28 @@ function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   if exprNullableMap(recvIx, fnIx) {
     wU8(212) // 0xd4 ref.as_non_null
   }
-  cmSlot = mshape
-  setMapRef(body) // mapRef (the shared mono slot, or this mv frame's)
   // The KEY is always a STRING ref — shield it from an ambient atom context (an
   // atom-typed binding init `const x: K = m["k"] ?? "a"` seeds `pendingLitUnion`
   // around the whole init, which would lower the key literal as an i32 atom id).
+  // An inner map op in the key expr also clobbers `cmSlot` — pin it AFTER.
   const savedKeyLU = pendingLitUnion
   pendingLitUnion = 0
   const kr = emitExpr(body, keyIx, fnIx)
   pendingLitUnion = savedKeyLU
   if kr < 0 { return -1 }
   cmSlot = mshape
+  0
+}
+
+// Load the map receiver + key into the scratch frame (slots 0/1) and run the PROBE,
+// leaving `slot` (slot 3) = the probe slot and `entry` (slot 5) = `index[slot]`
+// (0 = miss; else entry-position + 1). `recvIx`/`keyIx` are arena indices; `recvIx`
+// must be a map-typed expression and `keyIx` a string.
+function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
+  if emitMapRecvKey(body, recvIx, keyIx, fnIx) < 0 { return -1 }
+  // Pop the stacked pair into the frame only now — user code is done running.
   setMapScr(body, 1) // keyRef
+  setMapRef(body)    // mapRef (the shared mono slot, or this mv frame's)
   emitMapProbe(body)
 }
 
@@ -4240,18 +4255,110 @@ function emitMapDelete(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   0
 }
 
+// Emit a map SET's VALUE expr in the map's value REP — the scalar (f64/i64/f32)
+// coercion, union boxing, list-kind / ref-list-slot / struct-index hints, and the
+// atom-id context an overwrite or append needs. ONE evaluation, shared by both
+// arms of `emitMapSetV` (which stashes the result before the probe). Leaves the
+// value on the stack; `cmSlot` may be clobbered by inner map ops — callers re-pin.
+function emitMapSetValExpr(
+  body: i32[],
+  valIx: i32,
+  fnIx: i32,
+  mslot: i32,
+  atomVal: boolean,
+) {
+  const svk = mvScalarValKind(mslot)
+  if svk != null {
+    // A SCALAR-valued map (f64/i64): emit the value coerced to the element rep.
+    return emitScalarValue(body, valIx, fnIx, svk)
+  }
+  if mslot >= 0 && mvValKind[mslot] == 2 {
+    // A UNION-valued map: box the stored value into the shared union box (a concrete
+    // VARIANT value boxes via `emitUnionBoxArg`, like a call arg / return).
+    return emitUnionBoxArg(body, mvValName[mslot], valIx, fnIx)
+  }
+  // Seed a non-i32 scalar-LIST value's inner list kind (as the `?? default` read
+  // does) so a stored `m[k] = [1,2,3]` builds the i64/f64/string list wrapper, not
+  // the default i32-list that would mismatch the typed element slot.
+  const svCtx = expCtxHere()
+  const lvk = mvListValKind(mslot)
+  if lvk == "strlist" {
+    svCtx.listKind = 3
+  } else if lvk == "f64list" {
+    svCtx.listKind = 4
+  } else if lvk == "i64list" {
+    svCtx.listKind = 6
+  } else if lvk == "f32list" {
+    svCtx.listKind = 7
+  } else if mslot >= 0 && nameIsRefArray(mvValName[mslot]) {
+    // A REF-list value (`S[]` / `(C|D)[]` / a nested `S[][]` / a closure list): seed the value's
+    // ref-list slot (keyed by its element name) so the value literal builds as that list — its
+    // inner elements recurse through the literal build. Mirrors the array-binding ref-list seed.
+    svCtx.listKind = 5
+    svCtx.listSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
+  }
+  // An atom-valued mono map's member-literal value lowers as its interned atom id.
+  if atomVal { svCtx.litUnion = 1 }
+  // A STRUCT-valued map (`{[string]: {f:…}}`): force the value struct's OWN index so the
+  // literal `{f:…}` builds the map's declared value struct, not a field-name-set twin.
+  // Without this a program with two same-field-name-set inline struct map values (`{f:f32}`
+  // and `{f:{[string]:i64}}`) resolves the store literal via `structIndexOfObj` to whichever
+  // struct interned FIRST — a wrong-layout `struct.new` (invalid wasm). `emitObj` consumes it.
+  if mslot >= 0 && mvValKind[mslot] == 1 {
+    svCtx.structIdx = mvValStructIdx[mslot]
+  }
+  emitExprExpect(body, valIx, fnIx, svCtx)
+}
+
+// `local.set` / `local.get` of the SET value stash: the mv slot's typed valStash,
+// or the mono frame's dedicated `valSet` slot 14. Slot 14 is RESERVED for this —
+// no probe / push / grow / resize machinery touches it, so the stashed value
+// survives everything between its write (right after the value expr) and the
+// overwrite/append store. (Slot 3 — the pushVal stash — is also the probe slot,
+// so it cannot hold a value ACROSS the probe.)
+function setMapSetValStash(body: i32[], mslot: i32) {
+  if mslot >= 0 {
+    fbLocalSet(fnMvValStashLocal(mslot))
+    return 0
+  }
+  setMapScr(body, 14)
+  0
+}
+function pushMapSetValStash(body: i32[], mslot: i32) {
+  if mslot >= 0 {
+    fbLocalGet(fnMvValStashLocal(mslot))
+    return 0
+  }
+  pushMapScr(body, 14)
+  0
+}
+
 // Lower a map SET `m[k] = v` onto `body`: probe; on a HIT (`entry != 0`) overwrite
 // `vals.backing[entry-1] = v`, else APPEND a new entry — link the index slot, push the
 // key + value onto the ordered entry lists, bump `count`/`size`, and resize the index
 // if the load factor crossed 1/2. The append reuses the inline list-grow push over the
 // keys (string-ref) and vals (i32) lists. Run from `emitAssign` (a statement).
 //
+// EVALUATION ORDER (B-bug-maprmw): receiver, key, VALUE — all BEFORE the probe and
+// before ANY of them lands in a scratch local (recv + key ride the operand stack —
+// `emitMapRecvKey` — and the value is stashed in a slot no map machinery reuses).
+// This is what makes the fused read-modify-write `m[k] = (m[k] ?? 0) + 1` sound on a
+// MISSING key: the RHS's probe of the same key runs against the UNTOUCHED map. The
+// old lowering evaluated the value inside the append arm AFTER `index[slot] =
+// count+1` + the key push, so the RHS's probe HIT a half-inserted entry and read
+// `vals.backing[count]` — out of bounds (or a silent default-0 once the backing had
+// grown). Stack/stash-riding also fixes the CLOBBER family: a same-shaped map op
+// nested in the key or value expr runs its probe through the SAME shared scratch
+// frame, so a receiver/key parked in `mapRef`/`keyRef` across user code came back
+// wrong (`b[a["x"] ?? "d"]` probed `a`, and `m[k] = (n[x] ?? 0) + 1` appended into
+// `n`). A call in the value expr that mutates the map is also ordered correctly
+// now: it completes before the probe, so the write lands post-mutation.
+//
 // Ordering matters: `index[slot] = count+1` is written BEFORE the two pushes, because
 // `emitMapPushKey`/`emitMapPushVal` clobber the probe slot (slot 3) and cap (slot 4).
 // `m[k] = v` / `m.set(k, v)`. The Set form `s.add(k)` reuses this exact lowering with
 // `valConst1 = true`: the stored value is the constant boolean `1` (true) instead of an
-// evaluated value expression (and `valIx` is ignored). EXISTING callers pass
-// `valConst1 = false` so their emitted bytes stay byte-identical.
+// evaluated value expression (and `valIx` is ignored).
 function emitMapSetV(
   body: i32[],
   recvIx: i32,
@@ -4269,7 +4376,7 @@ function emitMapSetV(
   // list ref into an i32 array is invalid wasm) — fail loudly. A ref-valued map
   // (mv slot) stores string/struct values through its own typed vals list. (A
   // constant-true Set value is always a valid i32 boolean.) The shape is resolved
-  // here only for the GATE; `emitMapPrep` re-resolves it into the op context.
+  // here only for the GATE; `emitMapRecvKey` re-resolves it into the op context.
   if valConst1 == false && !atomVal {
     if mapShapeOfExpr(recvIx, fnIx) < 0 {
       if (
@@ -4283,66 +4390,32 @@ function emitMapSetV(
       }
     }
   }
-  if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
+  // Receiver + key onto the operand stack; `cmSlot` pinned to the shape.
+  if emitMapRecvKey(body, recvIx, keyIx, fnIx) < 0 { return -1 }
   const mslot = cmSlot
+  // VALUE next — evaluated ONCE, while the map is still untouched and recv/key are
+  // still stack-parked — then stashed. Only probe/store machinery runs after this.
+  if valConst1 {
+    fbI32Const(1) // Set value: constant boolean true
+  } else {
+    if emitMapSetValExpr(body, valIx, fnIx, mslot, atomVal) < 0 { return -1 }
+  }
+  if setMapSetValStash(body, mslot) < 0 { return -1 }
+  cmSlot = mslot      // re-pin: inner map ops in the value expr clobber it
+  setMapScr(body, 1)  // keyRef (popped off the stack)
+  setMapRef(body)     // mapRef
+  emitMapProbe(body)
   pushMapScr(body, 5) // entry
   fbIf(64)            // if (entry != 0 → overwrite), void
-  // OVERWRITE: vals.backing[entry-1] = v
+  // OVERWRITE: vals.backing[entry-1] = stash
   pushMapVals(body)
   fbStructGet(cmValsWrap(), 0) // struct.get (vals backing), field 0: backing
   pushMapScr(body, 5)          // entry
   fbI32Const(1)
   fbI32Bin(107)                // i32.sub (entry - 1)
-  const svk = mvScalarValKind(mslot)
-  if valConst1 {
-    fbI32Const(1) // Set value: constant boolean true
-  } else if svk != null {
-    // A SCALAR-valued map (f64/i64): emit the value coerced to the element rep.
-    if emitScalarValue(body, valIx, fnIx, svk) < 0 { return -1 }
-    cmSlot = mslot
-  } else if mslot >= 0 && mvValKind[mslot] == 2 {
-    // A UNION-valued map: box the overwrite value into the shared union box (a concrete
-    // VARIANT value boxes via `emitUnionBoxArg`, like a call arg / return).
-    if emitUnionBoxArg(body, mvValName[mslot], valIx, fnIx) < 0 { return -1 }
-    cmSlot = mslot
-  } else {
-    // Seed a non-i32 scalar-LIST value's inner list kind (as the append path / `?? default`
-    // read do) so an overwrite `m[k] = [1,2,3]` builds the i64/f64/string list wrapper, not
-    // the default i32-list that would mismatch the typed element slot.
-    const ovCtx = expCtxHere()
-    const lvk = mvListValKind(mslot)
-    if lvk == "strlist" {
-      ovCtx.listKind = 3
-    } else if lvk == "f64list" {
-      ovCtx.listKind = 4
-    } else if lvk == "i64list" {
-      ovCtx.listKind = 6
-    } else if lvk == "f32list" {
-      ovCtx.listKind = 7
-    } else if mslot >= 0 && nameIsRefArray(mvValName[mslot]) {
-      // A REF-list value (`S[]` / `(C|D)[]` / a nested `S[][]` / a closure list): seed the value's
-      // ref-list slot (keyed by its element name) so the value literal builds as that list — its
-      // inner elements recurse through the literal build. Mirrors the array-binding ref-list seed.
-      ovCtx.listKind = 5
-      ovCtx.listSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
-    }
-    // An atom-valued mono map's member-literal value lowers as its interned atom id.
-    if atomVal { ovCtx.litUnion = 1 }
-    // A STRUCT-valued map (`{[string]: {f:…}}`): force the value struct's OWN index so the
-    // literal `{f:…}` builds the map's declared value struct, not a field-name-set twin.
-    // Without this a program with two same-field-name-set inline struct map values (`{f:f32}`
-    // and `{f:{[string]:i64}}`) resolves the store literal via `structIndexOfObj` to whichever
-    // struct interned FIRST — a wrong-layout `struct.new` (invalid wasm). `emitObj` consumes it.
-    if mslot >= 0 && mvValKind[mslot] == 1 {
-      ovCtx.structIdx = mvValStructIdx[mslot]
-    }
-    if emitExprExpect(body, valIx, fnIx, ovCtx) < 0 {
-      return -1 // value
-    }
-    cmSlot = mslot
-  }
-  fbArraySet(cmValsBack()) // array.set
-  fbElse()                 // else
+  pushMapSetValStash(body, mslot)
+  fbArraySet(cmValsBack())     // array.set
+  fbElse()                     // else
   // APPEND. index[slot] = count + 1  (the new entry's position + 1).
   pushMapIndex(body)
   pushMapScr(body, 3)  // slot
@@ -4350,13 +4423,9 @@ function emitMapSetV(
   fbI32Const(1)
   fbI32Bin(106)        // i32.add (count + 1)
   fbArraySet(aTypeIdx) // array.set
-  // keys.push(keyRef) ; vals.push(v)  (clobbers slots 3/4 — already linked above).
+  // keys.push(keyRef) ; vals.push(stash)  (clobbers slots 3/4 — already linked above).
   if emitMapPushKey(body) < 0 { return -1 }
-  // The append path re-emits the value — same atom-context seeding as the overwrite.
-  if atomVal { pendingLitUnion = 1 }
-  const pvr = emitMapPushValV(body, valIx, fnIx, valConst1)
-  if atomVal { pendingLitUnion = 0 }
-  if pvr < 0 { return -1 }
+  if emitMapPushVal(body) < 0 { return -1 }
   // count = count + 1
   pushMapRef(body)          // mapRef (struct.set receiver)
   pushMapCount(body)
@@ -4374,9 +4443,8 @@ function emitMapSetV(
   0
 }
 
-// Thin BYTE-IDENTICAL wrappers preserving the original arities — existing callers of
-// `emitMapSet` / `emitMapPushVal` emit exactly the same bytes (the non-constant value
-// path). The `s.add(k)` Set form calls the `*V` variants with `valConst1 = true`.
+// Thin wrapper preserving the original arity: the non-constant-value map set. The
+// `s.add(k)` Set form calls `emitMapSetV` with `valConst1 = true`.
 function emitMapSet(
   body: i32[],
   recvIx: i32,
@@ -4504,65 +4572,11 @@ function emitMapPushKey(body: i32[]) {
   0
 }
 
-function emitMapPushValV(
-  body: i32[],
-  valIx: i32,
-  fnIx: i32,
-  valConst1: boolean,
-) {
-  // newVal first — the mono i32 stash (slot 3, free after the scan/keys push), or
-  // the mv slot's TYPED valStash (an i32 local cannot hold a ref value). The value
-  // expr may contain an inner map op, so re-pin the context after it.
+// Append the STASHED set value onto `M.vals` (inline list-grow push). The value was
+// evaluated + stashed by `emitMapSetV` BEFORE the probe (see there) — this only
+// grows the vals list and stores the stash, so no user code runs inside the append.
+function emitMapPushVal(body: i32[]) {
   const mslot = cmSlot
-  const svk = mvScalarValKind(mslot)
-  if valConst1 {
-    fbI32Const(1) // Set value: constant boolean true
-  } else if svk != null {
-    // A SCALAR-valued map (f64/i64): emit the appended value in the element rep.
-    if emitScalarValue(body, valIx, fnIx, svk) < 0 { return -1 }
-    cmSlot = mslot
-  } else if mslot >= 0 && mvValKind[mslot] == 2 {
-    // A UNION-valued map: box the appended value into the shared union box before storing (a
-    // concrete VARIANT value boxes via `emitUnionBoxArg`, like a call arg / return).
-    if emitUnionBoxArg(body, mvValName[mslot], valIx, fnIx) < 0 { return -1 }
-    cmSlot = mslot
-  } else {
-    // A non-i32 scalar-LIST value (`{[string]: i64[]}` / `f64[]` / `string[]`): seed the
-    // inner list kind so a bare `[1,2,3]` / empty `[]` literal builds the value's list
-    // wrapper, not the default i32-list (whose `(ref $lTypeIdx)` mismatches the typed `(ref
-    // null <wrapper>)` element slot) — mirrors the `?? default` READ seeding. Bare integers
-    // default to i32, so an i64-list in particular needs this; f64/string self-identify by
-    // literal, but seeding is harmless and fixes their empty-`[]` store too.
-    const pvCtx = expCtxHere()
-    const lvk = mvListValKind(mslot)
-    if lvk == "strlist" {
-      pvCtx.listKind = 3
-    } else if lvk == "f64list" {
-      pvCtx.listKind = 4
-    } else if lvk == "i64list" {
-      pvCtx.listKind = 6
-    } else if lvk == "f32list" {
-      pvCtx.listKind = 7
-    } else if mslot >= 0 && nameIsRefArray(mvValName[mslot]) {
-      // A REF-list value (`S[]` / `(C|D)[]` / nested `S[][]` / closure list): seed the value's
-      // ref-list slot so the value literal builds as that list (inner elements recurse).
-      pvCtx.listKind = 5
-      pvCtx.listSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
-    }
-    // A STRUCT-valued map: force the value struct's index so the appended literal builds the
-    // map's declared value struct, not a field-name-set twin (the overwrite path's twin — see
-    // there). `emitObj` consumes the hint.
-    if mslot >= 0 && mvValKind[mslot] == 1 {
-      pvCtx.structIdx = mvValStructIdx[mslot]
-    }
-    if emitExprExpect(body, valIx, fnIx, pvCtx) < 0 { return -1 }
-    cmSlot = mslot
-  }
-  if mslot >= 0 {
-    fbLocalSet(fnMvValStashLocal(mslot))
-  } else {
-    setMapScr(body, 3)
-  }
   // if vals.len == vals.cap { grow }
   pushMapValsLen(body)
   pushMapValsCap(body)
@@ -4599,14 +4613,10 @@ function emitMapPushValV(
   pushMapScr(body, 4)
   fbStructSet(cmValsWrap(), 2) // struct.set field 2: cap
   fbEnd()                      // end (grow if)
-  // vals.backing[vals.len] = newVal
+  // vals.backing[vals.len] = the stashed value
   pushMapValsBacking(body)
   pushMapValsLen(body)
-  if mslot >= 0 {
-    fbLocalGet(fnMvValStashLocal(mslot)) // newVal (typed ref)
-  } else {
-    pushMapScr(body, 3) // newVal
-  }
+  pushMapSetValStash(body, mslot)
   fbArraySet(cmValsBack()) // array.set
   // vals.len = vals.len + 1
   pushMapVals(body)
