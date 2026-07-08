@@ -517,6 +517,7 @@ import {
   unionNameOfExpr,
   unionNameOfIdent,
   unionRefArrayArmSlotForElem,
+  unionRefArrayArmSlotForMapElem,
   variantFieldElemName,
   variantFieldIndex,
   variantFieldRefSlot,
@@ -2028,12 +2029,33 @@ export function emitUnionCoerce(
   // An ARRAY LITERAL whose ELEMENT is a MAP (`[m]`, `m: {[string]: V}`) flowing into a union with an
   // array-of-map arm (`{[string]: V}[] | scalar`): the arm's reflist element is the map TYPE, but a
   // map-valued literal element is invisible to `exprRefArray` / `arrLitElemName` (they resolve an
-  // inline-STRUCT element — now wired via `internShapeDeep`'s union-arm descent — but not a map Ident),
-  // so the ref-array arm path above is skipped and the value-atom ladder below would store the reflist
-  // WRAPPER ref into a scalar value box — INVALID WASM. Fail LOUDLY here (a clean reject over a silent
-  // mis-box); threading the map element name → reflist slot at the literal is a follow-up.
+  // inline-STRUCT element — wired via `internShapeDeep`'s union-arm descent — but not a map Ident),
+  // so the ref-array arm path above is skipped. Route it through the ARM's build: the element's map
+  // SHAPE (`mapShapeOfExpr` — mono -1 or a typed mv slot) picks the arm whose element map has the
+  // SAME canonical value rep (`unionRefArrayArmSlotForMapElem`), then the literal builds with the
+  // arm's reflist slot threaded (the same `pendingListKind = 1` an annotated `{[string]: V}[]`
+  // binding uses) and the wrapper is tagged with the arm's slot tag. A literal whose element shape
+  // matches NO arm keeps the loud reject — falling through would store the reflist WRAPPER ref into
+  // a scalar value box (invalid wasm).
   if unionName != "" && bare is ArrayLit {
     if bare.arrElems.length >= 1 && exprMap(bare.arrElems[0], fnIx) {
+      const mapArmSlot = unionRefArrayArmSlotForMapElem(
+        unionName,
+        mapShapeOfExpr(bare.arrElems[0], fnIx),
+      )
+      if mapArmSlot >= 0 {
+        fbI32Const(refArrSlotTag(mapArmSlot))
+        const savedMK = pendingListKind
+        const savedMS = pendingListSlot
+        pendingListKind = 1
+        pendingListSlot = mapArmSlot
+        const mrc = emitExpr(body, exprIx, fnIx)
+        pendingListKind = savedMK
+        pendingListSlot = savedMS
+        if mrc < 0 { return -1 }
+        fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
+        return 0
+      }
       return emitFail(
         "emitProgram: a union arm that is an array-of-map is not yet supported — use a named element type",
       )

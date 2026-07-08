@@ -9249,6 +9249,77 @@ export function unionRefArrayArmSlotForElem(name: string, elemAtom: string) {
   -1
 }
 
+// The interned reflist SLOT of an ARRAY-OF-MAP arm of the union member-set `name`
+// (`{[string]: i64}[] | f64`) whose element MAP's value rep matches the literal
+// element's map shape `mvShape` (canonical rep — `mvCanonRepOf`; mono matches mono),
+// or -1 when no arm matches. `emitUnionCoerce` routes an array literal whose elements
+// are MAP exprs (`[h0]` — invisible to `exprRefArray`, so the ref-array carrier path
+// misses) into the arm's build + tag through this; an unmatched literal keeps the
+// loud reject.
+export function unionRefArrayArmSlotForMapElem(name: string, mvShape: i32) {
+  if mvShape < -1 { return -1 }
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
+      const en = refArrElemName(a)
+      if nameIsMap(en) && !nameIsMapMemberUnion(en) {
+        const slot = rlSlotByName(en)
+        if slot >= 0 && slot < rlElemKindTbl.length && rlElemKindTbl[slot] == 3 {
+          const armMv = mvSlotOfMapValNameOrMono(mapValNameOf(en))
+          if armMv == -1 && mvShape == -1 { return slot }
+          if armMv >= 0 && mvShape >= 0 {
+            if mvCanonRepOf(armMv) == mvCanonRepOf(mvShape) { return slot }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// True if the union member-set `name` has an ARRAY-OF-MAP arm (`{[string]: V}[]`).
+// The frame pre-pass consults this (via `unionMapArrayElemIndex`) to reserve the map
+// scratch for a `t[i][k]` read on a union binding narrowed to its map-array arm — the
+// narrowing is not active in that pass, so the map op must be spotted from the
+// binding's DECLARED union (the map-array twin of `unionHasMapArm`).
+export function unionHasMapArrayArm(name: string) {
+  let nm = unionMemberSetOf(name)
+  if nm == "" { nm = name }
+  const atoms: string[] = []
+  splitUnionAtoms(nm, atoms)
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    if a != "null" && nameIsArray(a) {
+      const en = refArrElemName(a)
+      if nameIsMap(en) && !nameIsMapMemberUnion(en) { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True if `exprIx` is an INDEX read (`t[i]`) whose array indexes an IDENT declared as
+// a union with an ARRAY-OF-MAP arm — the receiver shape (`t[i][k]` / `t[i][k] ?? d` /
+// `t[i].has(k)` after an `is {[string]: V}[]` narrow) the frame pre-pass reserves the
+// map scratch for. Narrowing-blind, like `unionMapArmIdent`. (An over-reservation is a
+// harmless spare local, never invalid wasm.)
+export function unionMapArrayElemIndex(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Index {
+    const arr = P.nodes[unwrapParen(e.idxArr)]
+    if arr is Ident {
+      const un = unionNameOfIdent(arr.identName, fnIx)
+      if un != "" { return unionHasMapArrayArm(un) }
+    }
+  }
+  false
+}
+
 // The inferred `T|null` union name of the null-init `LetDecl` at `letIx`, or "".
 export function nliNameOf(letIx: i32) {
   let i = 0
@@ -11759,6 +11830,9 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
     // A MAP-FIELD read through a union's STRUCT arm (`t.f[k]` after an `is {f:{[string]:V}}`
     // narrow): likewise invisible — spot it from the declared union's arm field tables.
     if unionStructArmMapFieldMember(e.idxArr, fnIx) { return true }
+    // A map read through a union's ARRAY-OF-MAP arm (`t[i][k]` after an `is {[string]:V}[]`
+    // narrow): likewise invisible — spot the index shape from the declared union.
+    if unionMapArrayElemIndex(e.idxArr, fnIx) { return true }
     if exprHasMapOp(e.idxArr, fnIx) { return true }
     return exprHasMapOp(e.idxIndex, fnIx)
   }
@@ -11771,6 +11845,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
         if unionMapArmIdent(lhs.idxArr, fnIx) { return true }
         if unionListElemMapFieldMember(lhs.idxArr, fnIx) { return true }
         if unionStructArmMapFieldMember(lhs.idxArr, fnIx) { return true }
+        if unionMapArrayElemIndex(lhs.idxArr, fnIx) { return true }
       }
       if lhs is Call {
         const lcallee = P.nodes[lhs.callFn]
@@ -11789,6 +11864,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
         if unionMapArmIdent(target.idxArr, fnIx) { return true }
         if unionListElemMapFieldMember(target.idxArr, fnIx) { return true }
         if unionStructArmMapFieldMember(target.idxArr, fnIx) { return true }
+        if unionMapArrayElemIndex(target.idxArr, fnIx) { return true }
       }
     }
     if exprHasMapOp(e.binLeft, fnIx) { return true }
@@ -11803,6 +11879,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
       if callee.memProp == "has" {
         if exprMap(callee.memObj, fnIx) { return true }
         if unionMapArmIdent(callee.memObj, fnIx) { return true }
+        if unionMapArrayElemIndex(callee.memObj, fnIx) { return true }
       }
       if callee.memProp == "delete" {
         if exprMap(callee.memObj, fnIx) { return true }
