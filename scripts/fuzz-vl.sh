@@ -83,7 +83,12 @@ fi
 # the directives stay in the case file too, this just replaces two `sed` spawns
 # per case with zero (measurable at hundreds of cases × 16 CI seeds).
 awk -v dir="$WORK" '
-  /^===CASE/ { n++; file = sprintf("%s/case_%05d.vl", dir, n); next }
+  # close() per case: mawk caps simultaneously open files, and each case now
+  # holds up to three (.vl/.log/.shape) — without this a big --count would die.
+  /^===CASE/ {
+    if (file) { close(file); close(file ".log"); close(file ".shape") }
+    n++; file = sprintf("%s/case_%05d.vl", dir, n); next
+  }
   n > 0 {
     print > file
     if (sub(/^\/\/ @log /, ""))        print > (file ".log")
