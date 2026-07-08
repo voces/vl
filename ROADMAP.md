@@ -84,8 +84,27 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      canonical tag/arm seam `mvCanonRepOf`), and VARIANT (`buildVariantTwins` →
      `uVarTwin`/`uVarHeap`, retiring the arithmetic `uVarIdx + vi` heap identity) — see
      `DECISIONS.md` + `CHANGELOG.md`.
-     REMAINING migration order: (a) widen `repOfTy` coverage (typed-value maps,
-     litunion/union-element arrays); (d) the closure-value-call
+     Rep-rewrite Stage A SHIPPED (audit Part III Phase 2 items 3–4, the foundation; →
+     `CHANGELOG.md`): the RECURSIVE `Rep` tree — `repTreeOfTy`, TOTAL over the post-mono
+     arena (every type gets a tree or an explicit `unsup(reason)` policy node; hash-consed
+     index-linked arena, cycle-safe, generation-stamped like #917's memos) — plus the
+     `$VL_REP_SHADOW` differential harness (tree vs flat on every `rdCovered` fact; corpus +
+     self-compile + 16 pinned fuzz seeds + a branching/declared/multiobs survey sweep with
+     ZERO disagreements) and the per-compile coverage report (the Stage B burn-down buckets).
+     STAGE B charter (consumer migration, family-by-family, each PR gated by fixpoint +
+     corpus + rep-fuzz + the shadow sweep): (b1) litunion alias PROVENANCE on the arena node
+     — kills the `litunion:noalias` policy gap (a wrapper's re-minted alias copy is
+     indistinguishable from an inline union by index today) and the three flat-path
+     irregularities the harness surfaced (see PR #920 report); (b2) typed-value maps in
+     composition (R1, the dominant reject family) through `Map(val)` trees; (b3) 2-D arrays
+     (R4 — `List(List(_))` dissolves the special backing) + nullable-list-in-field /
+     struct-through-list (R5/R6, compositional once consumers read the tree); (b4) closure
+     composite results via sig keys interned from `Closure(params, result)` nodes (R2);
+     (b5) value-union composite members (R3b/R7 — the genuine ABI-policy cluster); then
+     migrate `vtKindOfType`/the valtype ladders onto `repTreeVKind` and delete the flat
+     `RepDesc` when its last consumer moves.
+     REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,
+     litunion/union-element arrays — subsumed by Stage B above); (d) the closure-value-call
      union-result narrow: a `t is T[]` arm over a binding INFERRED from a closure-value call
      mis-lowers the narrowed read (the `unionNameOfIdent` gate misses, the raw box leaks —
      invalid wasm nominal, a TRAP annotated; pre-existing, fuzz-shielded by the declared-twin

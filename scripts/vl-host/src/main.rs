@@ -557,6 +557,19 @@ fn compile_vl_instance(
         }
     }
 
+    // Rep-tree differential mode ($VL_REP_SHADOW): arm the guest's shadow
+    // harness (same missing-export tolerance as `setEmitNames` — older
+    // compiler modules just no-op) and read its disagreement + coverage
+    // report back to stderr after the compile. Debug-only: the baseline
+    // gates run with the variable unset, where the harness costs the guest
+    // one boolean test and prints nothing.
+    let rep_shadow = std::env::var_os("VL_REP_SHADOW").is_some();
+    if rep_shadow {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setRepShadow") {
+            set.call(&mut store, 1)?;
+        }
+    }
+
     phase!("stage_program", stage_program(store, inst, source, source_path))?;
     let rc = phase!("compile.call", compile.call(&mut store, ()))?;
     if rc != 0 {
@@ -576,7 +589,56 @@ fn compile_vl_instance(
         }
         Ok::<_, Error>(bytes)
     })?;
+    if rep_shadow {
+        report_rep_shadow(inst, &mut store, source_path)?;
+    }
     Ok(bytes)
+}
+
+/// Stream the guest's rep-shadow report ($VL_REP_SHADOW mode) to stderr: one
+/// greppable `rep-shadow[path]` line per coverage tally / unsupported-reason
+/// bucket / flat-vs-tree disagreement (the `render_diags` accessor pattern —
+/// strings cross the no-import boundary one code point at a time). Tolerates a
+/// compiler module without the exports (a pre-harness seed): silent no-op.
+fn report_rep_shadow(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<()> {
+    let read_str = |store: &mut Store<()>,
+                    len_of: &TypedFunc<i32, i32>,
+                    at: &TypedFunc<(i32, i32), i32>,
+                    i: i32|
+     -> Result<String> {
+        let len = len_of.call(&mut *store, i)?;
+        let mut s = String::with_capacity(len as usize);
+        for j in 0..len {
+            if let Some(c) = char::from_u32(at.call(&mut *store, (i, j))? as u32) {
+                s.push(c);
+            }
+        }
+        Ok(s)
+    };
+    if let (Ok(stat), Ok(rcount), Ok(rlen), Ok(rat), Ok(rn), Ok(mcount), Ok(mlen), Ok(mat)) = (
+        inst.get_typed_func::<i32, i32>(&mut *store, "repShadowStat"),
+        inst.get_typed_func::<(), i32>(&mut *store, "repShadowReasonCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "repShadowReasonLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "repShadowReasonAt"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "repShadowReasonN"),
+        inst.get_typed_func::<(), i32>(&mut *store, "repShadowCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "repShadowMsgLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "repShadowMsgAt"),
+    ) {
+        let total = stat.call(&mut *store, 0)?;
+        let real = stat.call(&mut *store, 1)?;
+        eprintln!("rep-shadow[{path}]: types={total} real={real}");
+        for i in 0..rcount.call(&mut *store, ())? {
+            let name = read_str(&mut *store, &rlen, &rat, i)?;
+            let n = rn.call(&mut *store, i)?;
+            eprintln!("rep-shadow[{path}]: unsup {name} x{n}");
+        }
+        for i in 0..mcount.call(&mut *store, ())? {
+            let msg = read_str(&mut *store, &mlen, &mat, i)?;
+            eprintln!("rep-shadow[{path}]: DISAGREE {msg}");
+        }
+    }
+    Ok(())
 }
 
 /// Instantiate an emitted VL program with the host print-import family and run it
