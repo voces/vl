@@ -152,6 +152,7 @@ import {
   mfSrcSlots,
   mkArrIdx,
   mkListIdx,
+  mvTwin,
   mvValName,
   narrowNames,
   narrowTop,
@@ -187,6 +188,7 @@ import {
   uFieldCount,
   uFieldElemName,
   uFieldStart,
+  uVarTwin,
   uVariants,
   vbF32Used,
   vbF64Used,
@@ -1738,7 +1740,7 @@ function emitModule(_stmts: i32[]) {
   // i32-list wrapper, each ref-list (backing, wrapper) pair, the string-list
   // (backing, wrapper), the map struct, and finally the functypes. Every index is
   // minted by the centralized `mIntern*` counter inside `mAssignTypeIndices`, which
-  // assigns the module-global index state (`sHeapIdx`/`uVarIdx`/`uBoxIdx`/`aTypeIdx`/
+  // assigns the module-global index state (`sHeapIdx`/`uVarHeap`/`uBoxIdx`/`aTypeIdx`/
   // `lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`raTypeIdx`/`rlTypeIdx`/`mkArrIdx`/`mkListIdx`/
   // `mStructIdx`) in that order and returns the functype base index (`typeOffset` —
   // where the first functype lands). All types are emitted inside ONE recursion
@@ -2378,6 +2380,13 @@ function emitTypeSection(
     // 6e 00` (verified against `toWasm.ts`'s `unionStruct`).
     let vi = 0
     while vi < uVariants.length {
+      // A variant layout twin (`uVarTwin[vi] < vi`) shares an earlier slot's heap
+      // type — already emitted, so skip it (lock-step with the `mAssignTypeIndices`
+      // allocation, which reused that earlier index).
+      if uVarTwin[vi] < vi {
+        vi = vi + 1
+        continue
+      }
       wU8(95) // 0x5f struct
       const cnt = uFieldCount[vi]
       wULEB(cnt)
@@ -2674,13 +2683,20 @@ function emitTypeSection(
       fe = fe + 1
     }
   }
-  // The ref-valued map structs (one per mv slot), in `mvMapTypeIdx` mint order —
-  // the SAME 7-field shape as the mono map struct, with `vals` referencing this
-  // slot's ref-list wrapper (the string-list pair for string values, the element's
-  // `rlWrapIdx` for struct values). Keys/live/index/count/size/hashes are identical
-  // across all map structs, so the shared probe/rehash/compact bytes apply as-is.
+  // The ref-valued map structs (one per DISTINCT value layout), in `mvMapTypeIdx`
+  // mint order — the SAME 7-field shape as the mono map struct, with `vals`
+  // referencing this slot's ref-list wrapper (the string-list pair for string
+  // values, the element's `rlWrapIdx` for struct values). Keys/live/index/count/
+  // size/hashes are identical across all map structs, so the shared probe/rehash/
+  // compact bytes apply as-is. A layout twin (`mvTwin[mvs] < mvs`) shares an
+  // earlier slot's heap type — already emitted, so skip it (lock-step with the
+  // `mAssignTypeIndices` allocation, which reused that earlier index).
   let mvs = 0
   while mvs < mvValName.length {
+    if mvTwin[mvs] < mvs {
+      mvs = mvs + 1
+      continue
+    }
     wU8(95)  // 0x5f struct (ref-valued map)
     wU8(7)   // 7 fields (host-aligned open-addressing hash map)
     wU8(100) // field 0 keys: 0x64 (ref $mkListIdx) — non-null
@@ -2776,7 +2792,7 @@ function emitTypeSection(
         // its `(ref null $mapStruct)` result valtype (`mapAnnShape` is `| null`-aware).
         if retNulMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
         // A `: Cat` concrete-variant return is kind 8 — its `fbValtype` slot is the VARIANT
-        // index (`uVarIdx + vi`), which `retStructIndex` (standalone structs only) misses.
+        // index (`uVarHeap[vi]`), which `retStructIndex` (standalone structs only) misses.
         if retVariantFlag(fn.fnRet) == 1 {
           retSlot = variantIndexOf(tyNameOf(fn.fnRet))
         }

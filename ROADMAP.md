@@ -59,11 +59,12 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      miscompiles), and the check is now EXACT/bidirectional (`scripts/rep-fuzz-check.sh`: soundness
      never baselineable, new rejects + stale entries both fail). Details + wave history in
      `docs/internals/rep-fuzz-findings.md`. Baseline down to 25 shapes after union-with-array (#863)
-     and union-with-map, scalar/string/mono values (#865) shipped. REMAINING (coverage, not
-     soundness): **(a) ref-VALUE map-union arms** (`{[string]: S} | X`, `{[string]: () => T} | X`,
-     `{[string]: A|B} | X`) — a #860-style heap-type-identity hazard, deferred from #865 as a loud
-     reject (`error-map-member-refvalue.vl`); needs the map-value heap type to dedup across the box
-     seam before the guard can lift; **(c)** the map
+     and union-with-map, scalar/string/mono values (#865) shipped. (The former item (a) —
+     ref-VALUE map-union arms — LIFTED in #868: the box/tag/read seams already keyed ONE mv slot
+     per arm atom, so no heap-identity hazard remained; this list was stale. The map-value heap
+     type additionally dedups across the box seam by canonical layout now — repOf slot layer
+     below — so a TWIN-spelled map arm boxes/`is`-tests as one type.) REMAINING (coverage, not
+     soundness): **(c)** the map
      READER path through the value-call ABI (construct-and-return is fixed, #860); **(d)** niche
      nullable-scalar lists `(boolean|null)[]`/`(f64|null)[]` (clean rejects, no box rep) + the
      lambda-param i64-context deferral tail. Keep graduating baseline shapes as fixes land.
@@ -77,18 +78,26 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      → `CHANGELOG.md`), and the `fRet*` fold COMPLETE (every per-family flag table folded
      into the stored `fRetKind: VKind[]`; `inferredRetKindCore` is a plain read —
      → `CHANGELOG.md`).
+     The SLOT layer (item (b)) is COMPLETE — structural heap-type dedup by canonical layout
+     across ALL FOUR name-keyed tables: STRUCT (`repCanonKey` → `sTwin` → shared `sHeapIdx`),
+     REF-LIST (`rlTwin` + the inline-shape spelling bridge), MAP-VALUE (`mvTwin` + the
+     canonical tag/arm seam `mvCanonRepOf`), and VARIANT (`buildVariantTwins` →
+     `uVarTwin`/`uVarHeap`, retiring the arithmetic `uVarIdx + vi` heap identity) — see
+     `DECISIONS.md` + `CHANGELOG.md`.
      REMAINING migration order: (a) widen `repOfTy` coverage (typed-value maps,
-     litunion/union-element arrays); (b) the SLOT layer — STRUCT + REF-LIST tables DONE
-     (structural heap-type dedup: `repCanonKey` → `sTwin` → shared `sHeapIdx`, extended
-     through the ref-list wrapper/backing slots and the inline-shape spelling bridge — see
-     `DECISIONS.md` + `CHANGELOG.md`); REMAINING: the map-VALUE table (`mvValName`) and the
-     variant table; (c) memoize `repCanonKey`/`repSlotOfTy` with the generation-stamped
-     pattern of `repTyScalarMask` (the 2026-07 audit's hot-path flag: `repSlotOfTy` linear-scans
-     `sNames` recomputing `repCanonKey` per query); (d) the closure-value-call union-result
-     narrow: a `t is T[]` arm over a binding INFERRED from a closure-value call mis-lowers the
-     narrowed read (the `unionNameOfIdent` gate misses, the raw box leaks — invalid wasm
-     nominal, a TRAP annotated; pre-existing, fuzz-shielded by the declared-twin gate on the
-     shape bridge).
+     litunion/union-element arrays); (c) memoize `repCanonKey`/`repSlotOfTy` with the
+     generation-stamped pattern of `repTyScalarMask` (the 2026-07 audit's hot-path flag:
+     `repSlotOfTy` linear-scans `sNames` recomputing `repCanonKey` per query; `mvCanonRepOf`
+     recomputes `repNameCanonKey` per call the same way); (d) the closure-value-call
+     union-result narrow: a `t is T[]` arm over a binding INFERRED from a closure-value call
+     mis-lowers the narrowed read (the `unionNameOfIdent` gate misses, the raw box leaks —
+     invalid wasm nominal, a TRAP annotated; pre-existing, fuzz-shielded by the declared-twin
+     gate on the shape bridge); (e) the variant⇄struct-table seam: a DECLARED struct twin
+     flowing into a variant-arm position (`pickU(k: Kot)` where `U = Cat | Dog`, `Kot`≅`Cat`)
+     still fails validation — the box/`is` resolution is nominal (`variantIndexOf`) and
+     `uVarHeap`/`sHeapIdx` do not dedup across the two tables — and an inline-shape union arm
+     (`type U = {m:i32} | Dog`) rejects a declared-name `is` spelling (`u is Cat`); both are
+     loud, and the fix wants the #911 declared-twin-gated bridge at the variant resolvers.
 - ✅ **Kill the TS host. DONE — the TWO COMPILERS are now one.** The TS compiler core
   (`compiler/*.ts` front end + `cli.ts` + the `checker-parity-sweep.ts` oracle) is DELETED; the
   self-hosted `compiler/*.vl` (the wasm seed) is the sole compiler. Got here in stages:

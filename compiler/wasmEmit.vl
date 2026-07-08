@@ -264,7 +264,7 @@ import {
   uFieldNames,
   uFieldStart,
   uTags,
-  uVarIdx,
+  uVarHeap,
 } from "./emit_state"
 import {
   emitFail,
@@ -1207,7 +1207,7 @@ function emitCaptureRead(_body: i32[], name: string, fnIx: i32) {
 
 // Lower the VARIANT-PAYLOAD struct for an object literal `{ f: v, … }` matching union
 // variant `vi`: push each field value in the variant's DECLARATION field order, then
-// `struct.new $<uVarIdx + vi>`. (No box yet — `emitUnionBox` wraps this.)
+// `struct.new $<uVarHeap[vi]>`. (No box yet — `emitUnionBox` wraps this.)
 function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
   const start = uFieldStart[vi]
   const cnt = uFieldCount[vi]
@@ -1298,7 +1298,7 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
     pendingListKind = 0
     fj = fj + 1
   }
-  fbStructNew(uVarIdx + vi) // 0xfb 0x00 <variant struct heap-type index>
+  fbStructNew(uVarHeap[vi]) // 0xfb 0x00 <variant struct heap-type index>
   0
 }
 
@@ -1587,8 +1587,8 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32) {
     }
     if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1)        // 0xfb 0x02 <box ht> field 1: value (anyref)
-    fbRefCast(uVarIdx + vi)        // 0xfb 0x16 <variant struct> ref.cast (non-null)
-    fbStructGet(uVarIdx + vi, idx) // 0xfb 0x02 <variant struct ht> <field index>
+    fbRefCast(uVarHeap[vi])        // 0xfb 0x16 <variant struct> ref.cast (non-null)
+    fbStructGet(uVarHeap[vi], idx) // 0xfb 0x02 <variant struct ht> <field index>
     // A VALUE-UNION variant field (code 16) whose OWN member path is narrowed to one
     // scalar atom (`if v.f is i64 { … v.f … }`, v itself narrowed to this variant): the
     // `struct.get` above yields the field's inner union BOX, so unbox it to the narrowed
@@ -2256,8 +2256,8 @@ function emitUnionIfArm(
   emitFail("emitProgram: union if-expression arm is not a block")
 }
 
-// Coerce the expression at `exprIx` to the CONCRETE variant `vi`'s rep `(ref $(uVarIdx +
-// vi))`. The collapse boundary: a `.map` callback typed as one variant whose arms are a
+// Coerce the expression at `exprIx` to the CONCRETE variant `vi`'s rep `(ref
+// $(uVarHeap[vi]))`. The collapse boundary: a `.map` callback typed as one variant whose arms are a
 // MIX of reps — an object LITERAL (build the bare variant), a NARROWED union value (`a`
 // after `a is Cat`, still a box at the wasm level → unbox: `struct.get $box 1` + `ref.cast`
 // to the variant), an already-bare variant (pass through), or a value-`if` join (recurse).
@@ -2273,7 +2273,7 @@ function emitVariantCoerce(body: i32[], vi: i32, exprIx: i32, fnIx: i32) {
   if exprUnion(exprIx, fnIx) {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(uVarIdx + vi) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+    fbRefCast(uVarHeap[vi]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
     return 0
   }
   emitExpr(body, exprIx, fnIx)
@@ -2290,7 +2290,7 @@ function emitVariantIfValue(body: i32[], vi: i32, ifIx: i32, fnIx: i32) {
     }
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     wU8(4)                   // 0x04 if
-    fbValtype("variant", vi) // result blocktype: the variant struct `(ref $(uVarIdx + vi))`
+    fbValtype("variant", vi) // result blocktype: the variant struct `(ref $(uVarHeap[vi]))`
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rcT = emitVariantIfArm(body, vi, s.ifThen, fnIx)
@@ -2598,7 +2598,7 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
   // A field read on a VARIANT-typed param `o.field` (`o: TyObj`) reads the variant
   // struct directly — the param already IS the unboxed variant ref, so there is NO box
   // unwrap / cast (gap #2). Evaluate the receiver (`local.get o`), then `struct.get
-  // $<uVarIdx + vi> <fieldIdx>`.
+  // $<uVarHeap[vi]> <fieldIdx>`.
   const m0 = P.nodes[memIx]
   if m0 is Member {
     const pvi = exprVariantIndex(m0.memObj, fnIx)
@@ -2608,7 +2608,7 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
         return emitFail("emitProgram: unknown variant field in field access")
       }
       if emitExpr(body, m0.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(uVarIdx + pvi, pvfi) // 0xfb 0x02 <variant struct ht> <field index>
+      fbStructGet(uVarHeap[pvi], pvfi) // 0xfb 0x02 <variant struct ht> <field index>
       return 0
     }
   }
@@ -2661,16 +2661,16 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
               fbIf(127)               // if (result i32)
               if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
               fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-              fbRefCast(uVarIdx + shVis[si2])
-              fbStructGet(uVarIdx + shVis[si2], shFis[si2])
+              fbRefCast(uVarHeap[shVis[si2]])
+              fbStructGet(uVarHeap[shVis[si2]], shFis[si2])
               fbElse()
               si2 = si2 + 1
             }
             const shLast = shAtoms.length - 1
             if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
             fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-            fbRefCast(uVarIdx + shVis[shLast])
-            fbStructGet(uVarIdx + shVis[shLast], shFis[shLast])
+            fbRefCast(uVarHeap[shVis[shLast]])
+            fbStructGet(uVarHeap[shVis[shLast]], shFis[shLast])
             let se = 0
             while se < shAtoms.length - 1 {
               fbEnd()
@@ -7249,9 +7249,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           }
           if emitExpr(body, nm.memObj, fnIx) < 0 { return -1 }
           fbStructGet(uBoxIdx, 1)  // box field 1: value (anyref)
-          fbRefCast(uVarIdx + nvi) // ref.cast to the variant struct
+          fbRefCast(uVarHeap[nvi]) // ref.cast to the variant struct
           if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
-          fbStructSet(uVarIdx + nvi, nfi)
+          fbStructSet(uVarHeap[nvi], nfi)
           return 0
         }
       }
@@ -7269,7 +7269,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           }
           if emitExpr(body, m1.memObj, fnIx) < 0 { return -1 }
           if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
-          fbStructSet(uVarIdx + pwvi, pwfi)
+          fbStructSet(uVarHeap[pwvi], pwfi)
           return 0
         }
       }
@@ -10522,7 +10522,7 @@ function emitNullLitNode(_body: i32[], _e: NullLit, _exprIx: i32, _fnIx: i32) {
 // Extracted from `emitExpr`'s `ObjLit` arm (C3: thin the dispatcher).
 function emitObjLitNode(body: i32[], _e: ObjLit, exprIx: i32, fnIx: i32) {
   // A CONTEXT that expects a CONCRETE variant (`const c: Cat = { … }`, a `Cat[]`
-  // element) constructs the BARE variant struct `(ref $(uVarIdx + vi))` — NOT a union
+  // element) constructs the BARE variant struct `(ref $(uVarHeap[vi]))` — NOT a union
   // box. `pendingVariantIdx` is the variant; consume it so a nested literal doesn't
   // inherit the hint.
   if pendingVariantIdx >= 0 {
@@ -11176,7 +11176,7 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
       if cVi >= 0 {
         if exprUnion(args[i], fnIx) {
           fbStructGet(uBoxIdx, 1)  // 0xfb 0x02 <box ht> field 1: value (anyref)
-          fbRefCast(uVarIdx + cVi) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+          fbRefCast(uVarHeap[cVi]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
         }
       }
       pendingStructIdx = -1

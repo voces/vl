@@ -281,6 +281,7 @@ import {
   uFieldNames,
   uFieldStart,
   uFieldTypes,
+  uVarTwin,
   uVariants,
   unMemberSet,
   unNames,
@@ -298,6 +299,7 @@ import {
 import { emitFail } from "./emit_bytes"
 import {
   repKindOfSigTok,
+  repNameCanonKey,
   repOfNode,
   repSigSlotTokOfKind,
   repSigTokHasSlot,
@@ -6638,7 +6640,7 @@ export function paramStructIdxOf(paramIx: i32) {
     // `(ref null $mapStruct)` cell's heap type (`mapAnnShape` is `| null`-aware).
     if retNulMapFlag(p.parType) == 1 { return mapAnnShape(p.parType) }
     // A concrete-VARIANT param (kind 8) — its `fbValtype` slot is the VARIANT index
-    // (`uVarIdx + vi`), which `retStructIndex` (standalone structs) misses.
+    // (`uVarHeap[vi]`), which `retStructIndex` (standalone structs) misses.
     if retVariantFlag(p.parType) == 1 {
       const ptv = P.nodes[p.parType]
       if ptv is TypeRef { return variantIndexOf(ptv.tyName) }
@@ -7566,6 +7568,122 @@ export function rlSlotByName(name: string) {
     j = j + 1
   }
   -1
+}
+
+// ── Canonical layout twins, MAP-VALUE slot layer (roadmap repOf, slot layer) ──
+// The struct table dedups by canonical key + field codes (`sTwin`), the ref-list
+// table by resolved element heap (`rlTwin`). The map-VALUE table (`mvValName`)
+// is the next name-keyed layer: each slot mints its own 7-field map struct
+// (`mvMapTypeIdx`) whose ONLY varying field is the vals-list wrapper, so two
+// slots whose VALUE types are layout twins emit byte-identical map structs —
+// which, inside the single rec group, are still DISTINCT heap types unless they
+// share one index (a `{[string]: B}` passed where a `{[string]: A}` twin is
+// expected was invalid wasm). `repMapValSlotsTwin` is the pairwise equivalence,
+// TIMING-INDEPENDENT (no heap index is consulted, so it is queryable before
+// `mAssignTypeIndices` assigns anything): the struct template's two-layer
+// discipline, with the structural key resolved through the checker
+// (`repNameCanonKey`) and the layout guard delegated per value KIND to the
+// layer that owns the rep.
+
+// True when ref-list slots `a` and `b` resolve the SAME element heap type — the
+// pairwise LAYOUT-twin equivalence over the ref-list table, mirroring the
+// `rlSig` arms of `mAssignTypeIndices` from checker-level data only (each arm
+// below must stay at least as strict as its `rlSig` twin, so a claimed twin
+// always resolves equal (backing, wrapper) pairs there):
+//   · singleton element heaps — the union box (2), the i32-list wrapper (4),
+//     the closure fat-pointer (5), the string/f64/i64/f32 inner-list wrappers
+//     (6/7/8/10) — kind equality IS heap equality;
+//   · a struct-LIST element (9, `S[][]`) twins iff the inner lists do;
+//   · a MAP element (3) twins iff both are the shared mono map or their value
+//     slots are `repMapValSlotsTwin` (the mutual recursion bottoms out — every
+//     step descends into a strictly shorter element spelling);
+//   · a struct / nullable-struct element twins per `repStructSlotsTwin` with
+//     matching `| null` niche parity (stricter than heap identity — the
+//     `rlSlotByName` discipline: a niche-nullable element's read stays
+//     nullable, so parity is part of slot equivalence, not just heap identity);
+//   · a variant element only twins with ITSELF (the variant table is the next
+//     name-keyed layer; until it dedups, distinct indices are distinct heaps).
+export function rlSlotsLayoutTwin(a: i32, b: i32): i32 {
+  if a == b { return 1 }
+  if a < 0 || b < 0 { return 0 }
+  const ka = rlElemKindTbl[a]
+  if ka != rlElemKindTbl[b] { return 0 }
+  if (
+    ka == 2 ||
+    ka == 4 ||
+    ka == 5 ||
+    ka == 6 ||
+    ka == 7 ||
+    ka == 8 ||
+    ka == 10
+  ) {
+    return 1
+  }
+  if ka == 9 {
+    return rlSlotsLayoutTwin(
+      rlSlotByName(refArrElemName(rlElemName[a])),
+      rlSlotByName(refArrElemName(rlElemName[b])),
+    )
+  }
+  if ka == 3 {
+    const ma = mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[a]))
+    const mb = mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[b]))
+    if ma == -1 && mb == -1 { return 1 }
+    if ma < 0 || mb < 0 { return 0 }
+    return repMapValSlotsTwin(ma, mb)
+  }
+  const na = rlElemName[a]
+  const nb = rlElemName[b]
+  const nna = nullablePartOf(na)
+  const nnb = nullablePartOf(nb)
+  let parity = false
+  if nna == "" && nnb == "" { parity = true }
+  if nna != "" && nnb != "" { parity = true }
+  if !parity { return 0 }
+  const sa = structIdxOfElemName(na)
+  const sb = structIdxOfElemName(nb)
+  if sa >= 0 && sb >= 0 { return repStructSlotsTwin(sa, sb) }
+  0
+}
+
+// True when map-value slots `a` and `b` share ONE map-struct WasmGC heap type:
+// the canonical structural key of the VALUE type (through the checker) plus the
+// per-kind layout guard. Scalar/string values (3/10/11/13) ride fixed singleton
+// vals lists; a union-box value (2) rides the ONE shared `uBoxIdx` box; a
+// closure value (14) the ONE `cloStructIdx` fat pointer — for those the kind +
+// canonical key decide. A struct value (1) guards with `repStructSlotsTwin`, a
+// ref-list / nested-map value (6) with `rlSlotsLayoutTwin` over the vals slots.
+export function repMapValSlotsTwin(a: i32, b: i32): i32 {
+  if a == b { return 1 }
+  if a < 0 || b < 0 { return 0 }
+  const k = mvValKind[a]
+  if k != mvValKind[b] { return 0 }
+  const ka = repNameCanonKey(mvValName[a])
+  if ka == "" { return 0 }
+  if ka != repNameCanonKey(mvValName[b]) { return 0 }
+  if k == 3 || k == 10 || k == 11 || k == 13 { return 1 }
+  if k == 2 || k == 14 { return 1 }
+  if k == 1 { return repStructSlotsTwin(mvValStructIdx[a], mvValStructIdx[b]) }
+  if k == 6 { return rlSlotsLayoutTwin(mvRlSlot[a], mvRlSlot[b]) }
+  0
+}
+
+// The canonical REPRESENTATIVE map-value slot for `slot`: the smallest slot that
+// is a `repMapValSlotsTwin` layout twin (the equivalence is transitive — key
+// equality composes, and every guard layer is itself a canonical-key + layout
+// equivalence — so first-twin picks one stable representative per class). The
+// heap mint (`mAssignTypeIndices`), the union-box tag (`mapSlotTag`), and the
+// arm-slot guard (`unionHasMapArmSlot`) all canonicalize through this ONE
+// chokepoint, so a twin-spelled map arm boxes, tags, and casts as its
+// representative. A negative slot (mono `-1` / unsupported `-3`) passes through.
+export function mvCanonRepOf(slot: i32): i32 {
+  if slot < 0 { return slot }
+  let t = 0
+  while t < slot {
+    if repMapValSlotsTwin(t, slot) == 1 { return t }
+    t = t + 1
+  }
+  slot
 }
 
 // The struct field-type CODE for an ANONYMOUS-shape field, from its literal VALUE
@@ -8507,6 +8625,97 @@ export function variantFieldElemName(vi: i32, fi: i32) {
   uFieldElemName[uFieldStart[vi] + fi]
 }
 
+// ── Canonical layout twins, VARIANT slot layer (roadmap repOf, slot layer) ────
+// Two union-variant slots share ONE variant-struct WasmGC heap type under the
+// struct template's two-layer discipline: the canonical structural key of the
+// variant's TYPE (its name — a declared alias or an inline `{…}` shape —
+// resolved through the checker, `repNameCanonKey`), then a layout guard over
+// the emitted field storage (`variantFieldLayoutEq`): per-field CODE equality
+// plus, for the codes whose storage references another interned heap type, twin
+// equivalence of the referenced layer — a ref-list field (5) via
+// `rlSlotsLayoutTwin`, a nested-struct field (15) via `repStructSlotsTwin`, a
+// map field (19) via the canonical map-value representative. Fixed-storage
+// codes (scalars, string, the shared union box / closure / scalar-list
+// wrappers) need only the code. The SAME variant name declared into two unions
+// (`type U = Cat | Dog` / `type V = Cat | Bird` both pushing `Cat`) is the
+// degenerate twin (equal keys, equal fields); structural twins (`Cat`/`Kot`, a
+// declared name vs its inline `{…}` spelling) dedup the same way.
+
+// The per-field storage layout guard (the `structFieldCodesEq` analogue).
+function variantFieldLayoutEq(a: i32, b: i32): i32 {
+  if uFieldCount[a] != uFieldCount[b] { return 0 }
+  let fi = 0
+  while fi < uFieldCount[a] {
+    const ca = uFieldTypes[uFieldStart[a] + fi]
+    if ca != uFieldTypes[uFieldStart[b] + fi] { return 0 }
+    if ca == 5 {
+      if (
+        rlSlotsLayoutTwin(
+          variantFieldRefSlot(a, fi),
+          variantFieldRefSlot(b, fi),
+        ) ==
+        0
+      ) {
+        return 0
+      }
+    } else if ca == 15 {
+      if (
+        repStructSlotsTwin(
+          structIndexByName(uFieldElemName[uFieldStart[a] + fi]),
+          structIndexByName(uFieldElemName[uFieldStart[b] + fi]),
+        ) ==
+        0
+      ) {
+        return 0
+      }
+    } else if ca == 19 {
+      const ma = mvSlotOfMapValNameOrMono(uFieldElemName[uFieldStart[a] + fi])
+      const mb = mvSlotOfMapValNameOrMono(uFieldElemName[uFieldStart[b] + fi])
+      let mOk = false
+      if ma == -1 && mb == -1 { mOk = true }
+      if ma >= 0 && mb >= 0 {
+        if mvCanonRepOf(ma) == mvCanonRepOf(mb) { mOk = true }
+      }
+      if !mOk { return 0 }
+    }
+    fi = fi + 1
+  }
+  1
+}
+
+// Populate `uVarTwin` (parallel to `uVariants`): `uVarTwin[i]` is the smallest
+// earlier layout twin, or `i` itself when `i` is the first of its layout. Keys
+// are computed ONCE up front (`buildStructTwins` discipline — the compiler's own
+// unions carry hundreds of variants, so a per-pair key recomputation is the
+// audit's hot-path anti-pattern); a non-participating slot ("" key — an
+// unresolvable spelling) is always its own representative. Called from
+// `mAssignTypeIndices` before the variant heap indices allocate.
+export function buildVariantTwins() {
+  const keys: string[] = []
+  let i = 0
+  while i < uVariants.length {
+    keys.push(repNameCanonKey(uVariants[i]))
+    i = i + 1
+  }
+  uVarTwin = []
+  i = 0
+  while i < uVariants.length {
+    let rep = i
+    if keys[i] != "" {
+      let j = 0
+      while j < i {
+        if keys[j] == keys[i] && variantFieldLayoutEq(j, i) == 1 {
+          rep = j
+          j = i // stop at the first (smallest) twin
+        }
+        j = j + 1
+      }
+    }
+    uVarTwin.push(rep)
+    i = i + 1
+  }
+}
+
 // The structural signature of variant `vi` — its field names joined with `,` (a
 // stable per-shape key). Two variants with the same field-name set share a sig (and
 // so, under structural typing, are the same variant — `docs/unions.md`); the slice's
@@ -8559,7 +8768,15 @@ export function refArrTagOf(atom: string) {
 // shift (folded into `15 = 12 + 3`) maps the mono `-1` slot to the first odd offset (`+13`), typed
 // value slots to `+15`, `+17`, … A distinct map VALUE type interns a distinct mv slot
 // (`mvShapeOfValName`), so it gets a distinct, deterministic, sub-union-stable tag.
-export function mapSlotTag(slot: i32) { uVariants.length + 15 + slot * 2 }
+// The slot canonicalizes through `mvCanonRepOf` first: layout-TWIN value spellings
+// (`{[string]: A}` boxed, `is {[string]: {v: i32}}` tested) share one map-struct heap
+// type (`mAssignTypeIndices`), so they must share ONE tag — keying the tag on the
+// nominal slot would make the `is` compare miss its own twin-spelled value.
+export function mapSlotTag(slot: i32) {
+  let s = slot
+  if s >= 0 { s = mvCanonRepOf(s) }
+  uVariants.length + 15 + s * 2
+}
 
 // The tag of a map union ARM by its type NAME (`{[string]: string}`, `{[string]: i32}`), keyed on
 // its map VALUE's interned mv slot (`-1` for a mono/atom value). Non-failing: an un-interned value
@@ -8701,6 +8918,8 @@ export function markMapUnionArms(name: string) {
 // guard `emitUnionCoerce` uses to confirm a map carrier actually matches an arm before boxing it
 // with that arm's `mapSlotTag`. A map expr whose value-slot matches no arm falls through (a
 // checker-impossible case) rather than mis-tag. The map twin of `unionHasRefArrayArmSlot`.
+// Arm and carrier compare CANONICALLY (`mvCanonRepOf`): a twin-spelled carrier (a
+// `{[string]: B}` boxed into a `{[string]: {v: i32}} | X`) matches the arm it lowers as.
 export function unionHasMapArmSlot(name: string, slot: i32) {
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
@@ -8708,7 +8927,12 @@ export function unionHasMapArmSlot(name: string, slot: i32) {
   while i < atoms.length {
     const a = atoms[i]
     if a != "null" && nameIsMap(a) {
-      if mvSlotOfMapValNameOrMono(mapValNameOf(a)) == slot { return true }
+      if (
+        mvCanonRepOf(mvSlotOfMapValNameOrMono(mapValNameOf(a))) ==
+        mvCanonRepOf(slot)
+      ) {
+        return true
+      }
     }
     i = i + 1
   }
@@ -8982,8 +9206,8 @@ function unionOfVariant(vi: i32) {
   -1
 }
 
-// The position of variant struct `name` in `uVariants` (its heap-type is `uVarIdx +
-// pos`), or -1 if `name` is not a variant of the declared union.
+// The position of variant struct `name` in `uVariants` (its heap-type is
+// `uVarHeap[pos]`), or -1 if `name` is not a variant of the declared union.
 export function variantIndexOf(name: string) {
   let i = 0
   while i < uVariants.length {
@@ -9226,8 +9450,8 @@ export function letIsStruct(letIx: i32, fnIx: i32) {
 }
 
 // True if the `LetDecl` at `letIx` binds a CONCRETE union-VARIANT value (`const c: Cat =
-// …` where `Cat` is a variant of the declared union) — a kind-8 local `(ref $(uVarIdx +
-// vi))`, distinct from the union box (kind 4) and a standalone struct (kind 1). Annotation
+// …` where `Cat` is a variant of the declared union) — a kind-8 local `(ref
+// $(uVarHeap[vi]))`, distinct from the union box (kind 4) and a standalone struct (kind 1). Annotation
 // first, else the init's variant value (a variant param/local read). Checked AFTER the
 // struct/union local cases so only an explicit variant annotation / variant-valued init
 // reaches here.
@@ -9304,8 +9528,8 @@ function paramStructIndex(fnIx: i32, name: string) {
 
 // The union-variant table index of the param `name` of function `fnIx` (when its
 // annotation names a VARIANT struct of the declared union, e.g. `o: TyObj`), or -1.
-// A variant-struct param's value IS the concrete variant struct ref `(ref $(uVarIdx +
-// vi))` — already narrowed/unboxed by the caller — so a field read on it reads the
+// A variant-struct param's value IS the concrete variant struct ref `(ref
+// $(uVarHeap[vi]))` — already narrowed/unboxed by the caller — so a field read on it reads the
 // variant struct directly (no box unwrap), the gap-#2 boundary.
 function paramVariantIndex(fnIx: i32, name: string) {
   variantIndexOf(tyNameOf(paramTypeNode(fnIx, name)))
