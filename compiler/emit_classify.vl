@@ -298,6 +298,7 @@ import {
 import { emitFail } from "./emit_bytes"
 import {
   repKindOfSigTok,
+  repNameCanonKey,
   repOfNode,
   repSigSlotTokOfKind,
   repSigTokHasSlot,
@@ -7568,6 +7569,122 @@ export function rlSlotByName(name: string) {
   -1
 }
 
+// ── Canonical layout twins, MAP-VALUE slot layer (roadmap repOf, slot layer) ──
+// The struct table dedups by canonical key + field codes (`sTwin`), the ref-list
+// table by resolved element heap (`rlTwin`). The map-VALUE table (`mvValName`)
+// is the next name-keyed layer: each slot mints its own 7-field map struct
+// (`mvMapTypeIdx`) whose ONLY varying field is the vals-list wrapper, so two
+// slots whose VALUE types are layout twins emit byte-identical map structs —
+// which, inside the single rec group, are still DISTINCT heap types unless they
+// share one index (a `{[string]: B}` passed where a `{[string]: A}` twin is
+// expected was invalid wasm). `repMapValSlotsTwin` is the pairwise equivalence,
+// TIMING-INDEPENDENT (no heap index is consulted, so it is queryable before
+// `mAssignTypeIndices` assigns anything): the struct template's two-layer
+// discipline, with the structural key resolved through the checker
+// (`repNameCanonKey`) and the layout guard delegated per value KIND to the
+// layer that owns the rep.
+
+// True when ref-list slots `a` and `b` resolve the SAME element heap type — the
+// pairwise LAYOUT-twin equivalence over the ref-list table, mirroring the
+// `rlSig` arms of `mAssignTypeIndices` from checker-level data only (each arm
+// below must stay at least as strict as its `rlSig` twin, so a claimed twin
+// always resolves equal (backing, wrapper) pairs there):
+//   · singleton element heaps — the union box (2), the i32-list wrapper (4),
+//     the closure fat-pointer (5), the string/f64/i64/f32 inner-list wrappers
+//     (6/7/8/10) — kind equality IS heap equality;
+//   · a struct-LIST element (9, `S[][]`) twins iff the inner lists do;
+//   · a MAP element (3) twins iff both are the shared mono map or their value
+//     slots are `repMapValSlotsTwin` (the mutual recursion bottoms out — every
+//     step descends into a strictly shorter element spelling);
+//   · a struct / nullable-struct element twins per `repStructSlotsTwin` with
+//     matching `| null` niche parity (stricter than heap identity — the
+//     `rlSlotByName` discipline: a niche-nullable element's read stays
+//     nullable, so parity is part of slot equivalence, not just heap identity);
+//   · a variant element only twins with ITSELF (the variant table is the next
+//     name-keyed layer; until it dedups, distinct indices are distinct heaps).
+export function rlSlotsLayoutTwin(a: i32, b: i32): i32 {
+  if a == b { return 1 }
+  if a < 0 || b < 0 { return 0 }
+  const ka = rlElemKindTbl[a]
+  if ka != rlElemKindTbl[b] { return 0 }
+  if (
+    ka == 2 ||
+    ka == 4 ||
+    ka == 5 ||
+    ka == 6 ||
+    ka == 7 ||
+    ka == 8 ||
+    ka == 10
+  ) {
+    return 1
+  }
+  if ka == 9 {
+    return rlSlotsLayoutTwin(
+      rlSlotByName(refArrElemName(rlElemName[a])),
+      rlSlotByName(refArrElemName(rlElemName[b])),
+    )
+  }
+  if ka == 3 {
+    const ma = mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[a]))
+    const mb = mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[b]))
+    if ma == -1 && mb == -1 { return 1 }
+    if ma < 0 || mb < 0 { return 0 }
+    return repMapValSlotsTwin(ma, mb)
+  }
+  const na = rlElemName[a]
+  const nb = rlElemName[b]
+  const nna = nullablePartOf(na)
+  const nnb = nullablePartOf(nb)
+  let parity = false
+  if nna == "" && nnb == "" { parity = true }
+  if nna != "" && nnb != "" { parity = true }
+  if !parity { return 0 }
+  const sa = structIdxOfElemName(na)
+  const sb = structIdxOfElemName(nb)
+  if sa >= 0 && sb >= 0 { return repStructSlotsTwin(sa, sb) }
+  0
+}
+
+// True when map-value slots `a` and `b` share ONE map-struct WasmGC heap type:
+// the canonical structural key of the VALUE type (through the checker) plus the
+// per-kind layout guard. Scalar/string values (3/10/11/13) ride fixed singleton
+// vals lists; a union-box value (2) rides the ONE shared `uBoxIdx` box; a
+// closure value (14) the ONE `cloStructIdx` fat pointer — for those the kind +
+// canonical key decide. A struct value (1) guards with `repStructSlotsTwin`, a
+// ref-list / nested-map value (6) with `rlSlotsLayoutTwin` over the vals slots.
+export function repMapValSlotsTwin(a: i32, b: i32): i32 {
+  if a == b { return 1 }
+  if a < 0 || b < 0 { return 0 }
+  const k = mvValKind[a]
+  if k != mvValKind[b] { return 0 }
+  const ka = repNameCanonKey(mvValName[a])
+  if ka == "" { return 0 }
+  if ka != repNameCanonKey(mvValName[b]) { return 0 }
+  if k == 3 || k == 10 || k == 11 || k == 13 { return 1 }
+  if k == 2 || k == 14 { return 1 }
+  if k == 1 { return repStructSlotsTwin(mvValStructIdx[a], mvValStructIdx[b]) }
+  if k == 6 { return rlSlotsLayoutTwin(mvRlSlot[a], mvRlSlot[b]) }
+  0
+}
+
+// The canonical REPRESENTATIVE map-value slot for `slot`: the smallest slot that
+// is a `repMapValSlotsTwin` layout twin (the equivalence is transitive — key
+// equality composes, and every guard layer is itself a canonical-key + layout
+// equivalence — so first-twin picks one stable representative per class). The
+// heap mint (`mAssignTypeIndices`), the union-box tag (`mapSlotTag`), and the
+// arm-slot guard (`unionHasMapArmSlot`) all canonicalize through this ONE
+// chokepoint, so a twin-spelled map arm boxes, tags, and casts as its
+// representative. A negative slot (mono `-1` / unsupported `-3`) passes through.
+export function mvCanonRepOf(slot: i32): i32 {
+  if slot < 0 { return slot }
+  let t = 0
+  while t < slot {
+    if repMapValSlotsTwin(t, slot) == 1 { return t }
+    t = t + 1
+  }
+  slot
+}
+
 // The struct field-type CODE for an ANONYMOUS-shape field, from its literal VALUE
 // (an anonymous literal has no `type` annotation to read): a number/boolean is i32
 // (`0`), a string literal is a string ref (`3`), a function VALUE is a closure
@@ -8559,7 +8676,15 @@ export function refArrTagOf(atom: string) {
 // shift (folded into `15 = 12 + 3`) maps the mono `-1` slot to the first odd offset (`+13`), typed
 // value slots to `+15`, `+17`, … A distinct map VALUE type interns a distinct mv slot
 // (`mvShapeOfValName`), so it gets a distinct, deterministic, sub-union-stable tag.
-export function mapSlotTag(slot: i32) { uVariants.length + 15 + slot * 2 }
+// The slot canonicalizes through `mvCanonRepOf` first: layout-TWIN value spellings
+// (`{[string]: A}` boxed, `is {[string]: {v: i32}}` tested) share one map-struct heap
+// type (`mAssignTypeIndices`), so they must share ONE tag — keying the tag on the
+// nominal slot would make the `is` compare miss its own twin-spelled value.
+export function mapSlotTag(slot: i32) {
+  let s = slot
+  if s >= 0 { s = mvCanonRepOf(s) }
+  uVariants.length + 15 + s * 2
+}
 
 // The tag of a map union ARM by its type NAME (`{[string]: string}`, `{[string]: i32}`), keyed on
 // its map VALUE's interned mv slot (`-1` for a mono/atom value). Non-failing: an un-interned value
@@ -8701,6 +8826,8 @@ export function markMapUnionArms(name: string) {
 // guard `emitUnionCoerce` uses to confirm a map carrier actually matches an arm before boxing it
 // with that arm's `mapSlotTag`. A map expr whose value-slot matches no arm falls through (a
 // checker-impossible case) rather than mis-tag. The map twin of `unionHasRefArrayArmSlot`.
+// Arm and carrier compare CANONICALLY (`mvCanonRepOf`): a twin-spelled carrier (a
+// `{[string]: B}` boxed into a `{[string]: {v: i32}} | X`) matches the arm it lowers as.
 export function unionHasMapArmSlot(name: string, slot: i32) {
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
@@ -8708,7 +8835,12 @@ export function unionHasMapArmSlot(name: string, slot: i32) {
   while i < atoms.length {
     const a = atoms[i]
     if a != "null" && nameIsMap(a) {
-      if mvSlotOfMapValNameOrMono(mapValNameOf(a)) == slot { return true }
+      if (
+        mvCanonRepOf(mvSlotOfMapValNameOrMono(mapValNameOf(a))) ==
+        mvCanonRepOf(slot)
+      ) {
+        return true
+      }
     }
     i = i + 1
   }

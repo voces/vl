@@ -158,6 +158,7 @@ import {
   mkListIdx,
   mvMapTypeIdx,
   mvRlSlot,
+  mvTwin,
   mvValKind,
   mvValName,
   mvValStructIdx,
@@ -301,6 +302,7 @@ import {
   mfResultKindOf,
   mfResultSlotOf,
   monoUnwrapParens,
+  mvCanonRepOf,
   mvShapeOfValName,
   nameFieldCode,
   nameIsNulRefList,
@@ -1972,7 +1974,20 @@ export function mAssignTypeIndices(_n: i32) {
     } else if rsk == 9 {
       const inner = rlSlotByName(refArrElemName(rlElemName[rss]))
       if inner >= 0 { sig = "9:" + i32ToStr(rlTwin[inner]) }
-    } else if rsk != 3 {
+    } else if rsk == 3 {
+      // A MAP element. A MONO map element resolves the shared `mStructIdxPre` (every
+      // such slot has the same element heap); a TYPED-value map element resolves its
+      // value slot's `mvMapTypeIdx` (the second pass below) — which the mv mint further
+      // down shares across `repMapValSlotsTwin` layout twins, so the twin decision is
+      // knowable HERE from the CANONICAL value slot (`mvCanonRepOf`, timing-independent):
+      // equal reps ⟹ equal map struct ⟹ equal element heap ⟹ byte-identical pairs.
+      const mmv = mvSlotByValNameOr(mapValNameOf(rlElemName[rss]))
+      if mmv < 0 {
+        sig = "3:m"
+      } else {
+        sig = "3:" + i32ToStr(mvCanonRepOf(mmv))
+      }
+    } else {
       // Struct / nullable-struct / variant element — the `else` heap resolution
       // below. `structIdxOfElemName` strips the `| null` niche and resolves
       // nominal-then-structural, so an INLINE-SHAPE element spelling
@@ -2176,12 +2191,37 @@ export function mAssignTypeIndices(_n: i32) {
     cloStructIdx = mNextType
     cloSigBase = mNextType + 1
   }
-  // The ref-valued map structs (one 7-field map struct per mv slot), interned LAST
-  // among the heap types so no existing index shifts; zero types when no ref-valued
-  // map exists.
+  // The ref-valued map structs (one 7-field map struct per DISTINCT value layout),
+  // interned LAST among the heap types so no existing index shifts; zero types when
+  // no ref-valued map exists. Map-value slot dedup (roadmap repOf, slot layer — the
+  // `sTwin`/`rlTwin` analogue): the 7-field map struct's ONLY varying field is the
+  // vals-list wrapper, so two slots whose VALUE types are layout twins
+  // (`repMapValSlotsTwin`: canonical value key + per-kind layout guard, resolved via
+  // `mvCanonRepOf`) emit byte-identical structs and MUST share one heap index — a
+  // `{[string]: B}` passed where its twin `{[string]: A}` (or the inline
+  // `{[string]: {v: i32}}` spelling) is expected was invalid wasm. The type-section
+  // emit skips twins in lock-step. The vals-wrapper interlock check makes a
+  // predicate/`rlSig` drift LOUD (a claimed twin whose vals lists resolved different
+  // wrappers would alias two different layouts under one index — a compiler bug,
+  // never emitted silently).
+  mvTwin = []
   let mvi = 0
   while mvi < mvValName.length {
-    mvMapTypeIdx[mvi] = mAllocType()
+    const mvRep = mvCanonRepOf(mvi)
+    mvTwin.push(mvRep)
+    if mvRep < mvi {
+      const k6 = mvValKind[mvi]
+      if k6 == 1 || k6 == 2 || k6 == 6 || k6 == 14 {
+        if rlWrapIdx[mvRlSlot[mvi]] != rlWrapIdx[mvRlSlot[mvRep]] {
+          return emitFail(
+            "emitProgram: map-value layout twins resolved different vals wrappers",
+          )
+        }
+      }
+      mvMapTypeIdx[mvi] = mvMapTypeIdx[mvRep]
+    } else {
+      mvMapTypeIdx[mvi] = mAllocType()
+    }
     mvi = mvi + 1
   }
   // Second pass for the TYPED-value map ref-list elements (kind 3, deferred above): now
@@ -2244,6 +2284,7 @@ export function collectA(_stmts: i32[]) {
   mvValStructIdx = []
   mvRlSlot = []
   mvMapTypeIdx = []
+  mvTwin = []
   // Re-mark the list-type flags the REGISTERED value unions force: `collectU` set them at
   // registration (`markValueUnionAtoms`) but the resets above cleared them, and a union
   // annotation (`f64[] | boolean`) is none of the bare-name forms the walk below recognizes

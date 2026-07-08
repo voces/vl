@@ -59,11 +59,12 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      miscompiles), and the check is now EXACT/bidirectional (`scripts/rep-fuzz-check.sh`: soundness
      never baselineable, new rejects + stale entries both fail). Details + wave history in
      `docs/internals/rep-fuzz-findings.md`. Baseline down to 25 shapes after union-with-array (#863)
-     and union-with-map, scalar/string/mono values (#865) shipped. REMAINING (coverage, not
-     soundness): **(a) ref-VALUE map-union arms** (`{[string]: S} | X`, `{[string]: () => T} | X`,
-     `{[string]: A|B} | X`) — a #860-style heap-type-identity hazard, deferred from #865 as a loud
-     reject (`error-map-member-refvalue.vl`); needs the map-value heap type to dedup across the box
-     seam before the guard can lift; **(c)** the map
+     and union-with-map, scalar/string/mono values (#865) shipped. (The former item (a) —
+     ref-VALUE map-union arms — LIFTED in #868: the box/tag/read seams already keyed ONE mv slot
+     per arm atom, so no heap-identity hazard remained; this list was stale. The map-value heap
+     type additionally dedups across the box seam by canonical layout now — repOf slot layer
+     below — so a TWIN-spelled map arm boxes/`is`-tests as one type.) REMAINING (coverage, not
+     soundness): **(c)** the map
      READER path through the value-call ABI (construct-and-return is fixed, #860); **(d)** niche
      nullable-scalar lists `(boolean|null)[]`/`(f64|null)[]` (clean rejects, no box rep) + the
      lambda-param i64-context deferral tail. Keep graduating baseline shapes as fixes land.
@@ -78,13 +79,17 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      into the stored `fRetKind: VKind[]`; `inferredRetKindCore` is a plain read —
      → `CHANGELOG.md`).
      REMAINING migration order: (a) widen `repOfTy` coverage (typed-value maps,
-     litunion/union-element arrays); (b) the SLOT layer — STRUCT + REF-LIST tables DONE
-     (structural heap-type dedup: `repCanonKey` → `sTwin` → shared `sHeapIdx`, extended
-     through the ref-list wrapper/backing slots and the inline-shape spelling bridge — see
-     `DECISIONS.md` + `CHANGELOG.md`); REMAINING: the map-VALUE table (`mvValName`) and the
-     variant table; (c) memoize `repCanonKey`/`repSlotOfTy` with the generation-stamped
-     pattern of `repTyScalarMask` (the 2026-07 audit's hot-path flag: `repSlotOfTy` linear-scans
-     `sNames` recomputing `repCanonKey` per query); (d) the closure-value-call union-result
+     litunion/union-element arrays); (b) the SLOT layer — STRUCT + REF-LIST + MAP-VALUE
+     tables DONE (structural heap-type dedup: `repCanonKey` → `sTwin` → shared `sHeapIdx`,
+     extended through the ref-list wrapper/backing slots, the inline-shape spelling bridge,
+     and the map-value table `mvTwin` + the canonical tag/arm seam `mvCanonRepOf` — see
+     `DECISIONS.md` + `CHANGELOG.md`); REMAINING: the variant table
+     (`uVariants` heap identity is still the arithmetic `uVarIdx + vi` — one heap type per
+     PUSH, so the same variant declared in two unions emits twice and a structural-twin arm
+     TRAPS at the narrowed read); (c) memoize `repCanonKey`/`repSlotOfTy` with the
+     generation-stamped pattern of `repTyScalarMask` (the 2026-07 audit's hot-path flag:
+     `repSlotOfTy` linear-scans `sNames` recomputing `repCanonKey` per query; `mvCanonRepOf`
+     recomputes `repNameCanonKey` per call the same way); (d) the closure-value-call union-result
      narrow: a `t is T[]` arm over a binding INFERRED from a closure-value call mis-lowers the
      narrowed read (the `unionNameOfIdent` gate misses, the raw box leaks — invalid wasm
      nominal, a TRAP annotated; pre-existing, fuzz-shielded by the declared-twin gate on the
