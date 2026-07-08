@@ -65,6 +65,7 @@ import {
   TyPrim,
   TyUnion,
   cUserTypes,
+  cUserTypesVer,
   nodeTyIsUnionAlias,
   nodeTyIxOf,
   resolveAnnot,
@@ -72,6 +73,7 @@ import {
   tyIsValueUnionBox,
   tyIxIsUnionAliasDecl,
   tyIxIsVariantMember,
+  tyMutEpoch,
 } from "./typecheck"
 
 // ── The descriptor ────────────────────────────────────────────────────────────
@@ -236,6 +238,31 @@ function repMk(kind: VKind, nul: i32, elem: string): RepDesc {
 // slot resolver only consults DECLARED-struct keys, where these do not arise.
 const repKeyStack: i32[] = []
 
+// ── The repCanonKey memo (generation-stamped) ────────────────────────────────
+// The full recursive string build above made `repCanonKey` the hottest compile
+// path (~47% of a self-compile: every `repSlotOfTy` query re-rendered every
+// declared struct's key). The memo is per arena index ("" = unfilled — every
+// real key is non-empty: a prim name, a bracketed shape, or `@N`/`!`), stamped
+// with the checker's `tyMutEpoch`; ANY in-place arena mutation (see the bump
+// inventory at `tyMutEpoch`) advances that epoch and the whole memo drops —
+// conservative, since one pinned hole can change every key that reaches it.
+// Consulted and written at TOP-LEVEL calls only (`repKeyStack` empty): an
+// INTERIOR key fragment is context-dependent — a de Bruijn back-edge `#k` in it
+// counts stack distance into the ENCLOSING walk — so only a root's key is a
+// self-contained string that can be reused verbatim. Interior recursion inside
+// one computation stays fresh, so a computed key is byte-identical to the
+// unmemoized render.
+let repKeyMemo: string[] = []
+let repKeyMemoEpoch = -1
+
+function repKeyMemoSync() {
+  if repKeyMemoEpoch != tyMutEpoch {
+    repKeyMemo = []
+    repKeyMemoEpoch = tyMutEpoch
+  }
+  0
+}
+
 export function repCanonKey(ty: i32): string {
   if ty < 0 { return "!" }
   let si = repKeyStack.length - 1
@@ -243,9 +270,22 @@ export function repCanonKey(ty: i32): string {
     if repKeyStack[si] == ty { return "#" + i32ToStr(repKeyStack.length - si) }
     si = si - 1
   }
+  const top = repKeyStack.length == 0
+  if top {
+    repKeyMemoSync()
+    if ty < repKeyMemo.length {
+      if repKeyMemo[ty] != "" { return repKeyMemo[ty] }
+    }
+  }
   repKeyStack.push(ty)
   const s = repCanonKeyGo(ty)
   repKeyStack.pop()
+  if top {
+    // `repCanonKeyGo` only READS the arena (no checker re-entry), so the epoch
+    // synced above still holds — the write cannot stamp a stale key.
+    while repKeyMemo.length <= ty { repKeyMemo.push("") }
+    repKeyMemo[ty] = s
+  }
   s
 }
 
@@ -311,29 +351,81 @@ function repCanonKeyGo(ty: i32): string {
 //     structural twins is left to the nominal path — never collapsed).
 // Only DECLARED-struct slots (`cUserTypes[name] >= 0`) participate; inline-shape
 // slots stay -1 in this layer. Cycle-safe via `repCanonKey`.
-export function repSlotOfTy(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if !(t is TyObj) { return -1 }
-  const key = repCanonKey(ty)
-  let found = -1
-  let n = 0
+// The resolver's scan, CACHED (generation-stamped like the key memo above —
+// the scan was the hot half of the ~47%: every query re-walked ALL of `sNames`
+// re-rendering each declared key). One build pass over the declared-struct
+// slots produces
+//   · `repSlotByDecl[di]` — the FIRST slot whose `cUserTypes` arena index is
+//     `di` (the loop's nominal early-return, exact-match-wins order preserved:
+//     the scan only early-returned on the QUERIED index, which structural
+//     matches never preempt);
+//   · `repSlotKeySi[key]` / `repSlotKeyN[key]` — A matching slot per canonical
+//     key + the match COUNT (the unique-twin gate needs `n == 1`, and with
+//     exactly one match the recorded slot IS the scan's `found`).
+// Rebuilt whenever anything the scan reads can have changed: an arena mutation
+// (`tyMutEpoch` — keys), a `cUserTypes` write (`cUserTypesVer` — which arena
+// index a name resolves to, incl. `resolveAnnot` memoizing a NEW spelling
+// mid-emit), or `sNames` growth (a slot interned mid-emit; `sNames` is
+// push-only within a program, and the cross-program `sNames = []` reset always
+// rides an `initChecker` epoch advance).
+let repSlotCacheEpoch = -1
+let repSlotCacheUserVer = -1
+let repSlotCacheLen = -1
+let repSlotByDecl: i32[] = []
+let repSlotKeySi: {[string]: i32} = Map()
+let repSlotKeyN: {[string]: i32} = Map()
+
+function repSlotCacheSync() {
+  if (
+    repSlotCacheEpoch == tyMutEpoch &&
+    repSlotCacheUserVer == cUserTypesVer &&
+    repSlotCacheLen == sNames.length
+  ) {
+    return 0
+  }
+  repSlotByDecl = []
+  repSlotKeySi = Map()
+  repSlotKeyN = Map()
   let si = 0
   while si < sNames.length {
     const di = cUserTypes[sNames[si]] ?? -1
     if di >= 0 {
       const dt = T.tys[di]
       if dt is TyObj {
-        if di == ty { return si }
-        if repCanonKey(di) == key {
-          found = si
-          n = n + 1
-        }
+        while repSlotByDecl.length <= di { repSlotByDecl.push(-1) }
+        if repSlotByDecl[di] < 0 { repSlotByDecl[di] = si }
+        const k = repCanonKey(di)
+        repSlotKeySi[k] = si
+        // Two statements, not `m[k] = (m[k] ?? 0) + 1`: the fused
+        // read-modify-write on a MISSING key trips a pre-existing map-lowering
+        // bug (OOB trap); the split temp takes the healthy path.
+        const kn = (repSlotKeyN[k] ?? 0) + 1
+        repSlotKeyN[k] = kn
       }
     }
     si = si + 1
   }
-  if n == 1 { return found }
+  // Stamp AFTER the build: `repCanonKey` above only reads the arena, so the
+  // generations compared at entry still hold for everything just recorded.
+  repSlotCacheEpoch = tyMutEpoch
+  repSlotCacheUserVer = cUserTypesVer
+  repSlotCacheLen = sNames.length
+  0
+}
+
+export function repSlotOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if !(t is TyObj) { return -1 }
+  repSlotCacheSync()
+  // Nominal identity first — the scan's `di == ty` early return.
+  if ty < repSlotByDecl.length {
+    if repSlotByDecl[ty] >= 0 { return repSlotByDecl[ty] }
+  }
+  // The structural→nominal bridge: the UNIQUE declared twin, else -1. (No slot
+  // has the queried arena index here, so the count is exactly the scan's `n`.)
+  const key = repCanonKey(ty)
+  if (repSlotKeyN[key] ?? 0) == 1 { return repSlotKeySi[key] ?? -1 }
   -1
 }
 
@@ -694,6 +786,17 @@ export function repReset() {
   repSeenGen = []
   repMaskMemo = []
   repGen = 0
+  // The canonical-key memo + slot cache (above) are also arena-index-keyed —
+  // drop them per program too. (Their generation stamps already catch this via
+  // `initChecker`'s epoch advance; this keeps the reset story in one place.)
+  repKeyMemo = []
+  repKeyMemoEpoch = -1
+  repSlotByDecl = []
+  repSlotKeySi = Map()
+  repSlotKeyN = Map()
+  repSlotCacheEpoch = -1
+  repSlotCacheUserVer = -1
+  repSlotCacheLen = -1
   0
 }
 

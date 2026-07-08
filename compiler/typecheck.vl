@@ -287,6 +287,23 @@ let scopeEC: i32[] = []
 // equivalent (and keeps the full compiler self-emittable). Reset by `initChecker`.
 export let cUserTypes: {[string]: i32} = Map()
 
+// ── Arena-mutation generations (the emit-side repOf memo invalidation) ───────
+// `tyMutEpoch` advances on EVERY in-place mutation of an EXISTING `T.tys` entry
+// — empty-collection pinning (`aElem`/`mKey`/`mVal`/`nInner`), return-inference
+// patching (`fnRet`), hole-shape field recording — i.e. any event that can
+// change a type's canonical structural key (`repCanonKey`, emit_rep.vl). Its
+// memos there are stamped with this epoch; a stale stamp discards the memo, so
+// a bump is always SAFE (worst case a recompute) while a MISSED bump is a
+// soundness bug (a stale key could merge/split struct slots wrongly). Minting a
+// NEW arena index needs no bump: no existing type's key walk can reach it.
+// `cUserTypesVer` advances on every `cUserTypes` WRITE (decl registration,
+// `resolveAnnot` memoization) — any event that can change which declared arena
+// index a struct-slot NAME resolves to (the `repSlotOfTy` scan input). Both
+// also advance in `initChecker`: the arena is re-minted per program, so no memo
+// stamped under an earlier program may survive on a shared instance.
+export let tyMutEpoch = 0
+export let cUserTypesVer = 0
+
 // GENERIC TYPE ALIASES (A10 stage 3, host `instantiateAlias`): a parameterized
 // `type Box<T> = { value: T }` registers here (NOT in `cUserTypes` — it has no
 // concrete type until applied). Three parallel arrays: the base name ("Box"),
@@ -444,6 +461,7 @@ function constrainEmpty(srcTy: i32, dstTy: i32) {
     if d is TyArray {
       if s.aElem < 0 {
         s.aElem = d.aElem
+        tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
       } else {
         constrainEmpty(s.aElem, d.aElem)
       }
@@ -452,8 +470,14 @@ function constrainEmpty(srcTy: i32, dstTy: i32) {
   }
   if s is TyMap {
     if d is TyMap {
-      if s.mKey < 0 { s.mKey = d.mKey }
-      if s.mVal < 0 { s.mVal = d.mVal }
+      if s.mKey < 0 {
+        s.mKey = d.mKey
+        tyMutEpoch = tyMutEpoch + 1 // in-place key pin
+      }
+      if s.mVal < 0 {
+        s.mVal = d.mVal
+        tyMutEpoch = tyMutEpoch + 1 // in-place value pin
+      }
     }
     return 0
   }
@@ -1353,6 +1377,12 @@ export function initChecker() {
   T.diags = []
   T.curRet = -1
   cUserTypes = Map()
+  // The arena is re-minted for this program: advance BOTH generations so no
+  // emit-side memo stamped under a previous program can be consulted on a
+  // shared instance (advance, never reset — a reset could collide with a stamp
+  // an earlier program left behind).
+  tyMutEpoch = tyMutEpoch + 1
+  cUserTypesVer = cUserTypesVer + 1
   gaNames = []
   gaParamLists = []
   gaDeclIxs = []
@@ -3627,6 +3657,7 @@ export function applyGenAlias(head: string, inner: string) {
   const ftys: i32[] = []
   const resIx = mkObjTy(fnames, ftys)
   cUserTypes[memoKey] = resIx
+  cUserTypesVer = cUserTypesVer + 1 // new declared-name resolution registered
   let bi = 0
   while bi < pnames.length {
     tpEnvNames.push(pnames[bi])
@@ -3666,6 +3697,9 @@ export function applyGenAlias(head: string, inner: string) {
       fi = fi + 1
     }
   }
+  // The placeholder registered above was just FILLED in place (its field arrays
+  // are `fnames`/`ftys`) — an existing arena entry changed shape.
+  tyMutEpoch = tyMutEpoch + 1
   let pj = 0
   while pj < pnames.length {
     tpEnvNames.pop()
@@ -5148,6 +5182,7 @@ function holeMemberTy(holeName: string, prop: string) {
     const d = mkTyVar("?fld." + prop + "." + holeName)
     st.objFieldNames.push(prop)
     st.objFieldTypes.push(d)
+    tyMutEpoch = tyMutEpoch + 1 // hole shape gained a field in place
     return d
   }
   TY_ERR
@@ -5741,6 +5776,7 @@ function checkCallNode(n: Call, ix: i32) {
           // a clean type error.
           if rt.aElem < 0 {
             rt.aElem = pat
+            tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
           } else if !assignableExpr(margs[0], pat, rt.aElem) {
             // `assignableExpr` (not bare `assignable`) so a float-literal argument re-encodes into
             // an `f32` element (`xs.push(2.5)` over `f32[]`), exactly as it does at a binding.
@@ -5882,6 +5918,7 @@ function checkCallNode(n: Call, ix: i32) {
           const v0 = checkNode(margs2[1])
           if rt.mKey < 0 {
             rt.mKey = k0
+            tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the key in place
           } else if !assignable(k0, rt.mKey) {
             tErr(
               "set: expected " + tyToStr(rt.mKey) + ", got " + tyToStr(k0),
@@ -5890,6 +5927,7 @@ function checkCallNode(n: Call, ix: i32) {
           }
           if rt.mVal < 0 {
             rt.mVal = v0
+            tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
           } else if !assignable(v0, rt.mVal) {
             tErr(
               "set: expected " + tyToStr(rt.mVal) + ", got " + tyToStr(v0),
@@ -5920,6 +5958,7 @@ function checkCallNode(n: Call, ix: i32) {
           const ka = checkNode(margs2[0])
           if rt.mKey < 0 {
             rt.mKey = ka
+            tyMutEpoch = tyMutEpoch + 1 // `.add` pinned the Set key in place
           } else if !assignable(ka, rt.mKey) {
             tErr(
               "add: expected " + tyToStr(rt.mKey) + ", got " + tyToStr(ka),
@@ -6537,7 +6576,10 @@ function resetReturnPending(name: string) {
   const h = lookup(name)
   if h >= 0 {
     const ht = T.tys[h]
-    if ht is TyFunc { ht.fnRet = -2 }
+    if ht is TyFunc {
+      ht.fnRet = -2
+      tyMutEpoch = tyMutEpoch + 1 // return-inference fixpoint reset in place
+    }
   }
   0
 }
@@ -7355,6 +7397,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         const bt = T.tys[bound]
         if bt is TyFunc {
           bt.fnRet = inferred
+          tyMutEpoch = tyMutEpoch + 1 // inferred return patched in place
           patched = true
         }
       }
@@ -7586,11 +7629,13 @@ function checkProgramNode(n: Program) {
         const bodyless0 = df0.length == 1 && df0[0] == (-1)
         if bodyless0 {
           cUserTypes[sd0.tdName] = TY_ERR
+          cUserTypesVer = cUserTypesVer + 1
         } else {
           const fnames0: string[] = []
           const ftys0: i32[] = []
           const sIx0 = mkObjTy(fnames0, ftys0)
           cUserTypes[sd0.tdName] = sIx0
+          cUserTypesVer = cUserTypesVer + 1
           cStructTyIxs.push(sIx0)
         }
       }
@@ -7598,6 +7643,7 @@ function checkProgramNode(n: Program) {
       const members0: i32[] = []
       const uIx0 = mkUnionTy(members0)
       cUserTypes[sd0.udName] = uIx0
+      cUserTypesVer = cUserTypesVer + 1
       cUnionTyIxs.push(uIx0)
       cUnionNames.push(sd0.udName)
     }
@@ -7659,6 +7705,9 @@ function checkProgramNode(n: Program) {
             }
             fi = fi + 1
           }
+          // The 0a placeholder was just FILLED in place (its field arrays are
+          // the ones pushed above) — an existing arena entry changed shape.
+          tyMutEpoch = tyMutEpoch + 1
         }
       }
     } else if sd is UnionDecl {
@@ -7715,6 +7764,9 @@ function checkProgramNode(n: Program) {
               }
               vi = vi + 1
             }
+            // The 0a placeholder union was just FILLED in place (`members` is
+            // its `uMembers` array) — an existing arena entry changed shape.
+            tyMutEpoch = tyMutEpoch + 1
             if resolvedAny && members.length == 0 {
               // Explain the empty intersection in SOURCE terms (matching the TS
               // host): name the two operands and their kinds (`A & B`, an object
@@ -10041,7 +10093,10 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
       if arrTy0 < 0 { arrTy0 = checkNode(tgt.idxArr) }
       const arrT0 = T.tys[arrTy0]
       if arrT0 is TyArray {
-        if arrT0.aElem < 0 { arrT0.aElem = rt }
+        if arrT0.aElem < 0 {
+          arrT0.aElem = rt
+          tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
+        }
       }
       // Index WRITE trap (B13, host `indexTrap` "[]="): `o[k] = v` on an
       // object that declares `"[]="` checks the value against the method's
@@ -10093,7 +10148,10 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
           let rhsNullable = false
           if rtT is TyNullable { rhsNullable = true }
           if !rhsNullable && !isNullTy(rt) && rt >= 0 {
-            if asgCt.nInner < 0 { asgCt.nInner = rt }
+            if asgCt.nInner < 0 {
+              asgCt.nInner = rt
+              tyMutEpoch = tyMutEpoch + 1 // nullable inner pinned in place
+            }
             declare(asgTgt.identName, nonNullTy(asgCur))
           }
         }
