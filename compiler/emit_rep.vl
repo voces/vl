@@ -897,9 +897,12 @@ export function repNodeScalarMask(ix: i32) {
 // `rdCovered == 0` for every composition it cannot name, the tree gives EVERY
 // post-mono type a full denotation:
 //
-//   Rep ::= Scalar(i32|i64|f32|f64) | Str | Atom | Struct(fields) | List(elem)
-//         | Map(val) | Box(members) | Closure(params, result)
+//   Rep ::= Scalar(i32|i64|f32|f64) | Bool | Str | Atom | Struct(fields)
+//         | List(elem) | Map(val) | Box(members) | Closure(params, result)
 //         | Nullable(inner, discipline) | Unsupported(reason)
+//
+// (`Bool` shares the i32 VALTYPE but keeps its own leaf: the canonical slot
+// key distinguishes `{f:boolean}` from `{f:i32}`, so tree identity must too.)
 //
 // — never a silent fallthrough: a shape whose ABI policy does not exist yet is
 // an EXPLICIT `unsup` node carrying a stable reason-code (the Stage B burn-down
@@ -1120,9 +1123,13 @@ function rtGo(ty: i32): i32 {
 }
 
 function rtOfPrim(pn: string, ty: i32): i32 {
-  // boolean shares the i32 scalar; `void` follows the flat ladder (the
+  // `boolean` keeps its OWN leaf even though its valtype is i32: the flat slot
+  // layer's canonical key distinguishes `{f:boolean}` from `{f:i32}` (pinned by
+  // structural-non-twin-distinct.vl — the shadow harness caught the merged
+  // version), so tree identity must too. `void` follows the flat ladder (the
   // void-ness of a RESULT is a separate axis — `rtDisc` on the closure node).
-  if pn == "i32" || pn == "boolean" { return rtLeafOf("i32", 0, "", ty) }
+  if pn == "i32" { return rtLeafOf("i32", 0, "", ty) }
+  if pn == "boolean" { return rtLeafOf("bool", 0, "", ty) }
   if pn == "i64" { return rtLeafOf("i64", 0, "", ty) }
   if pn == "f64" { return rtLeafOf("f64", 0, "", ty) }
   if pn == "f32" { return rtLeafOf("f32", 0, "", ty) }
@@ -1154,13 +1161,24 @@ function rtOfFunc(ty: i32, paramTys: i32[], retTy: i32): i32 {
 }
 
 function rtOfObj(ty: i32, fieldTys: i32[]): i32 {
-  const ix = rtAlloc("struct", ty)
-  rtByTyPut(ty, ix)
   // Checker metadata in: a union-VARIANT member's slot vocabulary is the
   // variant index, not the struct table — the discriminator keeps the two
   // apart through hash-consing.
-  if tyIxIsVariantMember(ty) { rtDisc[ix] = 1 }
-  rtSlot[ix] = repSlotOfTy(ty)
+  let disc = 0
+  if tyIxIsVariantMember(ty) { disc = 1 }
+  rtOfObjAs(ty, ty, disc, fieldTys)
+}
+
+// The struct-node builder, split from `rtOfObj` so a single-member union can
+// build its member's shape under the UNION's memo index with variant-ness
+// forced off. `memoTy` keys `rtByTy` (the cycle breaker — any self-reference
+// through the alias spelling resolves back to it); `objTy` names the fields
+// (the intern key reads them through `rtTy`) and claims the slot.
+function rtOfObjAs(memoTy: i32, objTy: i32, disc: i32, fieldTys: i32[]): i32 {
+  const ix = rtAlloc("struct", objTy)
+  rtByTyPut(memoTy, ix)
+  rtDisc[ix] = disc
+  rtSlot[ix] = repSlotOfTy(objTy)
   const kids: i32[] = []
   let fi = 0
   while fi < fieldTys.length {
@@ -1168,7 +1186,7 @@ function rtOfObj(ty: i32, fieldTys: i32[]): i32 {
     fi = fi + 1
   }
   rtSetKids(ix, kids)
-  rtComplete(ix, ty)
+  rtComplete(ix, memoTy)
 }
 
 function rtOfUnion(ty: i32, members: i32[]): i32 {
@@ -1186,12 +1204,14 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
   if members.length == 1 {
     const m = T.tys[members[0]]
     if m is TyObj {
-      // The canonicalized `{a} & {b}` struct alias — the member IS the rep.
-      // Terminates on `U → obj → U` cycles because the member's own alloc
-      // stamps `rtByTy` before its fields recurse back here.
-      const mix = rtGo(members[0])
-      rtByTyPut(ty, mix)
-      return mix
+      // The canonicalized `{a} & {b}` struct alias — a PLAIN struct, never a
+      // variant: the union-decl registration pushes even a single-variant
+      // decl's member into `cVariantMemberTyIxs` (arity-blind), but the
+      // emitter lowers a one-member union as the struct itself, so
+      // variant-ness is stripped here (disc 0). NOTE the member's OWN index
+      // still classifies "variant" through the flat TyObj arm — a latent flat
+      // inconsistency the shadow harness surfaced; reported, not fixed here.
+      return rtOfObjAs(ty, members[0], 0, m.objFieldTypes)
     }
     return rtLeafOf("unsup", 0, "union:single-nonobj", ty)
   }
@@ -1281,7 +1301,7 @@ function rtOfMap(ty: i32, mKey: i32, mVal: i32, mSet: i32): i32 {
   rtByTyPut(ty, ix)
   if mSet == 1 {
     // A Set is internally a boolean-valued map — the mono value rep.
-    rtChild[ix] = rtLeafOf("i32", 0, "", -1)
+    rtChild[ix] = rtLeafOf("bool", 0, "", -1)
   } else {
     rtChild[ix] = rtGo(mVal)
   }
@@ -1331,7 +1351,7 @@ export function repTreeReasonOf(ix: i32): string {
 export function repTreeVKind(ix: i32): VKind | null {
   if ix < 0 { return null }
   const k = rtKind[ix]
-  if k == "i32" { return "i32" }
+  if k == "i32" || k == "bool" { return "i32" }
   if k == "i64" { return "i64" }
   if k == "f64" { return "f64" }
   if k == "f32" { return "f32" }
@@ -1352,8 +1372,9 @@ export function repTreeVKind(ix: i32): VKind | null {
 function rtListVKind(elem: i32): VKind | null {
   if elem < 0 { return null }
   const ek = rtKind[elem]
-  // Atom elements share the i32-list backing (interned i32 ids).
-  if ek == "i32" || ek == "atom" { return "list" }
+  // Atom elements share the i32-list backing (interned i32 ids), as do
+  // boolean elements (same valtype).
+  if ek == "i32" || ek == "bool" || ek == "atom" { return "list" }
   if ek == "i64" { return "i64list" }
   if ek == "f64" { return "f64list" }
   if ek == "f32" { return "f32list" }
@@ -1385,7 +1406,16 @@ function rtNulVKind(ix: i32): VKind | null {
     const elem = rtChild[inner]
     if elem < 0 { return null }
     const ek = rtKind[elem]
-    if ek == "i32" || ek == "atom" { return "nullist" }
+    if ek == "i32" || ek == "bool" || ek == "atom" { return "nullist" }
+    // The flat nullable arm covers ANY litunion element as atom-backed
+    // (`K[] | null` re-mints its elem as an alias COPY; the pinned
+    // litunion-nullable-list.vl also runs an INLINE one as atoms) — mirror
+    // that here even where the tree keeps the elem an explicit policy node.
+    // NOTE the flat BARE-array arm gates the same elem on alias-ness and
+    // answers uncovered — a flat-path irregularity, reported not fixed.
+    if ek == "unsup" {
+      if rtReason[elem] == "litunion:noalias" { return "nullist" }
+    }
     if ek == "str" { return "nulstrlist" }
     if ek == "f64" { return "nulf64list" }
     if ek == "i64" { return "nuli64list" }
@@ -1414,11 +1444,16 @@ export function repTreeListElemName(ix: i32): string {
   const elem = rtChild[lix]
   if elem < 0 { return "" }
   const ek = rtKind[elem]
-  if ek == "i32" || ek == "atom" { return "i32" }
+  if ek == "i32" || ek == "bool" || ek == "atom" { return "i32" }
   if ek == "i64" || ek == "f64" || ek == "f32" { return ek }
   if ek == "str" { return "string" }
   if ek == "struct" { return "struct" }
   if ek == "closure" { return "closure" }
+  // The nullable-list flat arm treats a policy-pending litunion element as
+  // atom-backed (see `rtNulVKind`) — its element vocabulary is "i32".
+  if ek == "unsup" {
+    if rtReason[elem] == "litunion:noalias" { return "i32" }
+  }
   ""
 }
 
@@ -1550,7 +1585,12 @@ function repShadowCheckTy(ty: i32) {
     repShadowNote(
       "kind",
       ty,
-      "flat=" + d.rdKind + " tree=" + repTreeKindOf(tix),
+      "flat=" +
+        d.rdKind +
+        " tree=" +
+        repTreeKindOf(tix) +
+        "/" +
+        repSigTokOfKind(tk),
     )
     // The kind is the root fact — the projections below assume it agrees.
     return 0
