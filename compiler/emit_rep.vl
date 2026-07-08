@@ -1085,9 +1085,9 @@ function rtComplete(ix: i32, ty: i32): i32 {
 // The one TOTAL constructor: the rep tree of arena type `ty`. Always returns a
 // node; a shape without a settled lowering policy returns an `unsup` node
 // whose reason-code is one of the STABLE set (the coverage buckets):
-//   hole · prim:<name> · union:single-nonobj · union:unclassified · nul:hole ·
-//   nul:unclassified · list:hole · map:key · map:val-hole · neg ·
-//   leaf:unnarrowable
+//   hole · prim:<name> · litunion:noalias · union:single-nonobj ·
+//   union:unclassified · nul:hole · nul:unclassified · list:hole · map:key ·
+//   map:val-hole · neg · leaf:unnarrowable
 export function repTreeOfTy(ty: i32): i32 {
   rtSync()
   rtGo(ty)
@@ -1174,10 +1174,14 @@ function rtOfObj(ty: i32, fieldTys: i32[]): i32 {
 function rtOfUnion(ty: i32, members: i32[]): i32 {
   if tyIsLitUnion(ty) {
     // Alias-ness as explicit input: a DECLARED litunion alias is the interned
-    // i32 atom; an INLINE one is canon-softened to `string` (the flat arm
-    // leaves the inline case to the name ladder — the tree states the policy).
+    // i32 atom. A litunion at a NON-alias arena index is genuinely ambiguous
+    // TODAY: either a re-minted COPY of a declared alias (a wrapper's inner —
+    // atom-backed; the shadow harness caught `VKind | null` minting one) or
+    // an inline/inferred union (canon-softened to `string`), and the index
+    // test cannot tell them apart. An explicit policy gap until the checker
+    // carries alias provenance on the arena node (a Stage B decision).
     if tyIxIsUnionAliasDecl(ty) { return rtLeafOf("atom", 0, "", ty) }
-    return rtLeafOf("str", 0, "", ty)
+    return rtLeafOf("unsup", 0, "litunion:noalias", ty)
   }
   if members.length == 1 {
     const m = T.tys[members[0]]
@@ -1229,11 +1233,14 @@ function rtNulDiscOf(inner: i32): i32 {
   if it is TyFunc { return 1 }
   if it is TyObj { return 1 }
   if it is TyUnion {
-    if tyIsLitUnion(inner) {
-      if tyIxIsUnionAliasDecl(inner) { return 3 }
-      // Inline litunion — canon-softened to string, the `nulstr` niche.
-      return 1
-    }
+    // ANY litunion inner takes the atom sentinel — deliberately NOT gated on
+    // the alias index, mirroring the flat arm: a nullable wrapper re-mints
+    // its inner as a fresh arena COPY of the declared alias (the index test
+    // misses it), while a genuinely-inline `("a"|"b") | null` never survives
+    // canon as a litunion here. The INNER node may still be the explicit
+    // `litunion:noalias` policy node (see `rtOfUnion`): the discipline is
+    // decided even where the member vocabulary is the open question.
+    if tyIsLitUnion(inner) { return 3 }
     if tyIsValueUnionBox(inner) { return 4 }
     if it.uMembers.length == 1 {
       const m = T.tys[it.uMembers[0]]
@@ -1315,6 +1322,106 @@ export function repTreeReasonOf(ix: i32): string {
   rtReason[ix]
 }
 
+// The tree's projection onto the flat `VKind` vocabulary — the fact the
+// differential harness compares against `rdKind`, and the shim Stage B
+// consumers migrate through. `null` = the tree has no flat spelling (an
+// `unsup` node, or a composition the flat alphabet cannot name yet — e.g. a
+// nested list, a ref-element nullable list): the flat layer answers
+// `rdCovered == 0` there, so the two stay comparable exactly where both speak.
+export function repTreeVKind(ix: i32): VKind | null {
+  if ix < 0 { return null }
+  const k = rtKind[ix]
+  if k == "i32" { return "i32" }
+  if k == "i64" { return "i64" }
+  if k == "f64" { return "f64" }
+  if k == "f32" { return "f32" }
+  if k == "str" { return "str" }
+  if k == "atom" { return "i32" }
+  if k == "closure" { return "closure" }
+  if k == "box" { return "union" }
+  if k == "map" { return "map" }
+  if k == "struct" {
+    if rtDisc[ix] == 1 { return "variant" }
+    return "struct"
+  }
+  if k == "list" { return rtListVKind(rtChild[ix]) }
+  if k == "nul" { return rtNulVKind(ix) }
+  null
+}
+
+function rtListVKind(elem: i32): VKind | null {
+  if elem < 0 { return null }
+  const ek = rtKind[elem]
+  // Atom elements share the i32-list backing (interned i32 ids).
+  if ek == "i32" || ek == "atom" { return "list" }
+  if ek == "i64" { return "i64list" }
+  if ek == "f64" { return "f64list" }
+  if ek == "f32" { return "f32list" }
+  if ek == "str" { return "strlist" }
+  if ek == "struct" || ek == "closure" { return "reflist" }
+  null
+}
+
+function rtNulVKind(ix: i32): VKind | null {
+  const d = rtDisc[ix]
+  // The i32-sentinel niches (`boolean | null`, litunion `K | null`) keep the
+  // plain i32 valtype; the boxed discipline is the value-union box itself.
+  if d == 2 || d == 3 { return "i32" }
+  if d == 4 { return "union" }
+  if d != 1 { return null }
+  const inner = rtChild[ix]
+  if inner < 0 { return null }
+  const k = rtKind[inner]
+  if k == "str" { return "nulstr" }
+  if k == "closure" { return "nulclosure" }
+  if k == "struct" {
+    // A nullable VARIANT member's slot vocabulary is the variant index — the
+    // flat alphabet has no kind for it (the name ladder owns it).
+    if rtDisc[inner] == 1 { return null }
+    return "nulstruct"
+  }
+  if k == "map" { return "nulmap" }
+  if k == "list" {
+    const elem = rtChild[inner]
+    if elem < 0 { return null }
+    const ek = rtKind[elem]
+    if ek == "i32" || ek == "atom" { return "nullist" }
+    if ek == "str" { return "nulstrlist" }
+    if ek == "f64" { return "nulf64list" }
+    if ek == "i64" { return "nuli64list" }
+    if ek == "f32" { return "nulf32list" }
+    return null
+  }
+  null
+}
+
+// The tree's `rdNul` projection: the null discipline of the TOP node.
+export function repTreeNulOf(ix: i32): i32 {
+  if ix < 0 { return 0 }
+  if rtKind[ix] == "nul" { return rtDisc[ix] }
+  0
+}
+
+// The tree's `rdListElem` projection: the flat ELEMENT vocabulary of a list
+// (or nullable-list) node — "" for a non-list or an element outside the flat
+// alphabet.
+export function repTreeListElemName(ix: i32): string {
+  if ix < 0 { return "" }
+  let lix = ix
+  if rtKind[ix] == "nul" { lix = rtChild[ix] }
+  if lix < 0 { return "" }
+  if rtKind[lix] != "list" { return "" }
+  const elem = rtChild[lix]
+  if elem < 0 { return "" }
+  const ek = rtKind[elem]
+  if ek == "i32" || ek == "atom" { return "i32" }
+  if ek == "i64" || ek == "f64" || ek == "f32" { return ek }
+  if ek == "str" { return "string" }
+  if ek == "struct" { return "struct" }
+  if ek == "closure" { return "closure" }
+  ""
+}
+
 // Whether `root`'s tree contains an `unsup` node anywhere — and WHICH policy
 // gap, as the first reason-code reached (breadth-order, deterministic). "" =
 // the whole tree is real: this is the totality metric the coverage report
@@ -1343,3 +1450,168 @@ export function repTreeUnsupReason(root: i32): string {
   }
   ""
 }
+
+// ── The differential SHADOW harness (the Stage A gate) ───────────────────────
+// A debug-only sweep asserting the tree agrees with the flat descriptor on
+// every fact BOTH can express, wherever the flat side claims coverage
+// (`rdCovered == 1`): top kind, null discipline, list-element vocabulary,
+// `$fnsig` token, and struct-slot identity (up to the shipped
+// `repStructSlotsTwin` equivalence — a hash-cons merge may surface a TWIN
+// slot, never a different layout). A disagreement means one side is wrong: the
+// flat path is the battle-tested one, so it is either a bug in the tree (fix
+// it) or a latent flat-path inconsistency (report it — the flat path stays
+// frozen in Stage A). The sweep also tallies the COVERAGE report — how much of
+// the post-mono arena gets a fully-real tree, and which policy gaps
+// (`repTreeUnsupReason` buckets) block the rest: Stage B's burn-down list.
+//
+// OFF by default. The host arms it (`setRepShadow`, the `setEmitNames`
+// pattern) when `$VL_REP_SHADOW` is set and reads the report back through the
+// `diagMsgAt`-style accessors below; an unarmed compile pays ONE boolean test.
+export let repShadowOn = false
+
+export function setRepShadow(v: i32) {
+  repShadowOn = v != 0
+  0
+}
+
+let repShadowMsgs: string[] = []
+let repShadowSeen: {[string]: i32} = Map()
+let repShadowTys = 0
+let repShadowReal = 0
+let repShadowReasonNames: string[] = []
+let repShadowReasonCounts: i32[] = []
+let repShadowReasonIx: {[string]: i32} = Map()
+
+// The sweep — called once per program from `emitProgram` AFTER the module
+// bytes are final (the arena is complete then; monomorphization and the
+// collect passes have minted every late type). Restarts its tallies each run,
+// so an instance that compiles more than one program reports the last sweep.
+export function repShadowSweep() {
+  if !repShadowOn { return 0 }
+  repShadowMsgs = []
+  repShadowSeen = Map()
+  repShadowTys = 0
+  repShadowReal = 0
+  repShadowReasonNames = []
+  repShadowReasonCounts = []
+  repShadowReasonIx = Map()
+  // `T.tys.length` is re-read each pass: a slot query inside the sweep can
+  // itself memoize a new annotation spelling (`resolveAnnot`), growing the
+  // arena — those late types are swept too, and the growth terminates because
+  // the checker memoizes.
+  let ty = 0
+  while ty < T.tys.length {
+    repShadowCheckTy(ty)
+    ty = ty + 1
+  }
+  0
+}
+
+function repShadowBumpReason(r: string) {
+  const i = repShadowReasonIx[r] ?? -1
+  if i >= 0 {
+    repShadowReasonCounts[i] = repShadowReasonCounts[i] + 1
+    return 0
+  }
+  repShadowReasonIx[r] = repShadowReasonNames.length
+  repShadowReasonNames.push(r)
+  repShadowReasonCounts.push(1)
+  0
+}
+
+// Record one disagreement, deduped per (fact, canonical structure) — the same
+// composition reached through many arena indices reports once. Bounded: a
+// systematic drift would otherwise flood one line per arena index.
+function repShadowNote(tag: string, ty: i32, detail: string) {
+  const key = tag + "|" + repCanonKey(ty)
+  if (repShadowSeen[key] ?? 0) == 1 { return 0 }
+  repShadowSeen[key] = 1
+  if repShadowMsgs.length < 200 {
+    repShadowMsgs.push(
+      tag + " ty@" + i32ToStr(ty) + " " + repCanonKey(ty) + ": " + detail,
+    )
+  }
+  0
+}
+
+function repShadowCheckTy(ty: i32) {
+  const tix = repTreeOfTy(ty)
+  repShadowTys = repShadowTys + 1
+  const reason = repTreeUnsupReason(tix)
+  if reason == "" {
+    repShadowReal = repShadowReal + 1
+  } else {
+    repShadowBumpReason(reason)
+  }
+  const d = repOfTy(ty)
+  if d.rdCovered == 0 { return 0 }
+  const tk = repTreeVKind(tix)
+  if tk != d.rdKind {
+    repShadowNote(
+      "kind",
+      ty,
+      "flat=" + d.rdKind + " tree=" + repTreeKindOf(tix),
+    )
+    // The kind is the root fact — the projections below assume it agrees.
+    return 0
+  }
+  if repTreeNulOf(tix) != d.rdNul {
+    repShadowNote(
+      "nul",
+      ty,
+      "flat=" + i32ToStr(d.rdNul) + " tree=" + i32ToStr(repTreeNulOf(tix)),
+    )
+  }
+  if repTreeListElemName(tix) != d.rdListElem {
+    repShadowNote(
+      "elem",
+      ty,
+      "flat=" + d.rdListElem + " tree=" + repTreeListElemName(tix),
+    )
+  }
+  if repSigTokOfKind(tk) != d.rdSigTok {
+    repShadowNote(
+      "sigtok",
+      ty,
+      "flat=" + d.rdSigTok + " tree=" + repSigTokOfKind(tk),
+    )
+  }
+  if d.rdSlot >= 0 {
+    const ts = repTreeSlotOf(tix)
+    if ts < 0 {
+      repShadowNote("slot", ty, "flat=" + i32ToStr(d.rdSlot) + " tree=-1")
+    } else if repStructSlotsTwin(d.rdSlot, ts) == 0 {
+      repShadowNote(
+        "slot",
+        ty,
+        "flat=" + i32ToStr(d.rdSlot) + " tree=" + i32ToStr(ts) + " (not twins)",
+      )
+    }
+  }
+  0
+}
+
+// The host-readable report surface (the `diagCount`/`diagMsgLen`/`diagMsgAt`
+// accessor pattern — the compiler module is instantiated with no imports, so
+// strings cross the boundary one code point at a time).
+export function repShadowCount() { repShadowMsgs.length }
+
+export function repShadowMsgLen(i: i32) { repShadowMsgs[i].length }
+
+export function repShadowMsgAt(i: i32, j: i32) { repShadowMsgs[i][j] }
+
+// Coverage tallies: 0 = arena types swept · 1 = fully-real trees (no `unsup`
+// node anywhere). The difference is bucketed by `repShadowReason*` below.
+export function repShadowStat(k: i32): i32 {
+  if k == 0 { return repShadowTys }
+  if k == 1 { return repShadowReal }
+  0
+}
+
+export function repShadowReasonCount() { repShadowReasonNames.length }
+
+export function repShadowReasonLen(i: i32) { repShadowReasonNames[i].length }
+
+export function repShadowReasonAt(i: i32, j: i32) { repShadowReasonNames[i][j] }
+
+export function repShadowReasonN(i: i32) { repShadowReasonCounts[i] }
