@@ -352,6 +352,21 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
     Ok(())
 }
 
+/// Coarse phase timer, active only when `$VL_PROFILE` is set. Prints
+/// `[profile] <label>: <ms>` to stderr so the self-compile pipeline can be
+/// attributed (load/deserialize vs staging vs compile vs readback) without perf.
+macro_rules! phase {
+    ($label:expr, $body:expr) => {{
+        let profiling = std::env::var_os("VL_PROFILE").is_some();
+        let t0 = profiling.then(std::time::Instant::now);
+        let r = $body;
+        if let Some(t0) = t0 {
+            eprintln!("[profile] {}: {} ms", $label, t0.elapsed().as_millis());
+        }
+        r
+    }};
+}
+
 fn compile_vl(
     engine: &Engine,
     compiler: &CompilerSource,
@@ -360,7 +375,7 @@ fn compile_vl(
     entry: &str,
     emit_names: bool,
 ) -> Result<Vec<u8>> {
-    let (mut store, inst) = load_compiler(engine, compiler)?;
+    let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
 
     let compile = inst.get_typed_func::<(), i32>(&mut store, entry)?;
     let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
@@ -376,8 +391,8 @@ fn compile_vl(
         }
     }
 
-    stage_program(&mut store, &inst, source, source_path)?;
-    let rc = compile.call(&mut store, ())?;
+    phase!("stage_program", stage_program(&mut store, &inst, source, source_path))?;
+    let rc = phase!("compile.call", compile.call(&mut store, ()))?;
     if rc != 0 {
         let stage = match rc {
             1 => "parse",
@@ -387,11 +402,14 @@ fn compile_vl(
         let diags = render_diags(&inst, &mut store, source_path)?;
         bail!("{stage} error\n{}", diags.trim_end());
     }
-    let n = rlen.call(&mut store, ())?;
-    let mut bytes = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        bytes.push(rat.call(&mut store, i)? as u8);
-    }
+    let bytes = phase!("readback", {
+        let n = rlen.call(&mut store, ())?;
+        let mut bytes = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            bytes.push(rat.call(&mut store, i)? as u8);
+        }
+        Ok::<_, Error>(bytes)
+    })?;
     Ok(bytes)
 }
 
