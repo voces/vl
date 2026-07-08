@@ -129,6 +129,21 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   expected). The map-array element and any unresolved element stay unique (the
   map-struct index interlock); non-twins (`i32[]` vs `i64[]`) keep distinct element
   heaps and wrappers. (structural slot dedup, ref-list layer)
+  The dedup is CANONICAL, not just nominal: an INLINE-SHAPE slot (a `{v:i32}` field
+  shape `collectNestedFieldShapes` interned BEFORE its declared twin existed) keys
+  into `buildStructTwins` by resolving its spelling through the checker's name
+  grammar to the same `repCanonKey` vocabulary, and a shape SPELLING with no
+  `sNames` entry of its own (deduped onto the declared struct at intern time)
+  resolves through the layout-guarded structural bridge (`structIndexOfTypeName`,
+  tightened with the field-TYPE compat check) at the ref-array classification /
+  element-heap / twin-sig sites. Lookup follows the same nominal-fast-path,
+  canonical-fallback pattern: `rlSlotByName` falls back to the slot whose element
+  is a canonical-key + field-code layout twin (`repStructSlotsTwin`) with matching
+  `| null` niche parity. The bridge is GATED on a DECLARED twin (`nameIsStructDecl`):
+  a spelling matching only an anonymous-literal shape keeps its loud reject — the
+  union-arm narrow machinery it would newly enter still mis-lowers an inferred
+  closure-call binding's read (roadmap repOf item (d)). (structural slot dedup,
+  ref-list canonical layer)
 - **The shape-INTERN table keys on field CODES (layout), not `repCanonKey`
   (structure); the two are deliberately separate layers.** `annShapeIndexOf` is a
   LAYOUT table — two structurally-identical checker types can lower to DIFFERENT

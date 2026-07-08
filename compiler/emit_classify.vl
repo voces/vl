@@ -302,6 +302,7 @@ import {
   repSigSlotTokOfKind,
   repSigTokHasSlot,
   repSigTokOfKind,
+  repStructSlotsTwin,
 } from "./emit_rep"
 
 // The `$fnsig` PARAM-spine token for the parameter at `paramIx` — one token per distinct
@@ -5762,42 +5763,29 @@ export function structIndexOfTypeName(name: string) {
     if closeAt == name.length - 1 { spanOk = true }
   }
   if spanOk {
-    // Collect the top-level FIELD NAMES: a name run starts after `{` or a
-    // depth-0 `,` and ends at the depth-0 `:` (nested `{…}`/`[…]` skipped).
+    // Collect the top-level field NAMES + TYPE texts (`shapeFieldParse` — the
+    // variant resolver's grammar: depth-aware over `{}` `[]` `()`, spaces
+    // stripped so the canonical and spaced renders parse the same), then match
+    // by field-name set TIGHTENED with the field-TYPE layout guard
+    // (`shapeFieldTypeCompat`, the `variantIndexOfTypeName` discipline): two
+    // shapes sharing field names but differing in a field's TYPE must not
+    // collide onto the wrong slot — structural identity alone is not layout
+    // identity.
     const fnames: string[] = []
-    let cur = ""
-    let depth = 0
-    let collecting = true
-    let i = 1
-    while i < name.length - 1 {
-      const c = name[i]
-      if c == '{' || c == '[' {
-        depth = depth + 1
-      } else if c == '}' || c == ']' {
-        depth = depth - 1
-      } else if depth == 0 && c == ':' {
-        if collecting {
-          fnames.push(cur)
-          cur = ""
-          collecting = false
-        }
-      } else if depth == 0 && c == ',' {
-        collecting = true
-      } else if depth == 0 && collecting && c != ' ' {
-        // Skip the space after `, ` (`tyToStr` renders `{x: i32, y: i32}` with a separator
-        // space) — a field name is a bare identifier, so an embedded space is never part of it.
-        // Without this the 2nd+ field name collects as `" y"` and the field-set match fails.
-        cur = cur + fromCodePoint(c)
-      }
-      i = i + 1
-    }
+    const ftypes: string[] = []
+    shapeFieldParse(name, fnames, ftypes)
     let si2 = 0
     while si2 < sNames.length {
       if sFieldCount[si2] == fnames.length {
         let ok = true
         let k = 0
         while k < fnames.length {
-          if sFieldIndex(si2, fnames[k]) < 0 { ok = false }
+          const fj = sFieldIndex(si2, fnames[k])
+          if fj < 0 {
+            ok = false
+          } else if !shapeFieldTypeCompat(ftypes[k], sFieldTypeAt(si2, fj)) {
+            ok = false
+          }
           k = k + 1
         }
         if ok { return si2 }
@@ -6839,12 +6827,15 @@ export function isSName(name: string) { structIndexByName(name) >= 0 }
 
 // The struct-table index for a ref-list element NAME, stripping a `| null` niche suffix first
 // (a NULLABLE-struct array's slot keys on the full `"P | null"`, but the struct it stores/reads
-// is the bare `P`). For a plain `"P"` this is just `structIndexByName`.
+// is the bare `P`). Nominal first (`structIndexByName`), then the structural bridge
+// (`structIndexOfTypeName`): an INLINE-SHAPE element spelling (`{v:i32}` of a `{v:i32}[]`
+// param) that `collectAnnShapes` deduped onto its declared twin has no `sNames` entry of its
+// own, so only the layout-guarded field-set match resolves it.
 export function structIdxOfElemName(name: string) {
   let n = name
   const nn = nullablePartOf(name)
   if nn != "" { n = nn }
-  structIndexByName(n)
+  structIndexOfTypeName(n)
 }
 
 // The non-null STRUCT name of a NULLABLE-struct array element (`(P | null)[]` → "P"), or "".
@@ -6878,6 +6869,24 @@ function nullArrayArrElem(name: string) {
   const ik = refArrElemKind(nn + "[]")
   if ik == 4 || ik == 9 { return nn }
   ""
+}
+
+// The DECLARED-struct index an inline-SHAPE element spelling (`{v:i32}` of a
+// `{v:i32}[]` annotation) resolves to via the structural bridge
+// (`structIndexOfTypeName`), or -1. GATED on a DECLARED twin
+// (`nameIsStructDecl`): an inline spelling matching only an anonymous-literal /
+// interned-shape slot keeps its legacy classification — admitting it would
+// route a shape-armed union (`t is {f: boolean}[]` over an inferred closure-call
+// binding) into the union-arm narrow machinery, whose read side still
+// mis-lowers that flow (the pre-existing nominal `T[]`-arm hole), so the loud
+// REJECT must hold until that path is fixed. A non-`{...}` base fast-rejects.
+function shapeElemDeclaredStructIdx(base: string) {
+  if base.length < 2 { return -1 }
+  if base[0] != '{' || base[1] == '[' { return -1 }
+  const si = structIndexOfTypeName(base)
+  if si < 0 { return -1 }
+  if nameIsStructDecl(sNames[si]) { return si }
+  -1
 }
 
 // True if the array type-name `name` is a REF-element list — `S[]` over a declared
@@ -6942,6 +6951,10 @@ export function nameIsRefArray(name: string) {
   if n >= 3 && name[n - 2] == '[' && name[n - 1] == ']' {
     const base = name.slice(0, n - 2)
     if structIndexByName(base) >= 0 { return true }
+    // An INLINE-SHAPE element (`{v:i32}[]`) whose shape deduped onto a DECLARED
+    // struct at intern time (so the spelling has no `sNames` entry): the
+    // structural bridge resolves it — the shape-vs-declared twin of `S[]`.
+    if shapeElemDeclaredStructIdx(base) >= 0 { return true }
     // A `Cat[]` over a concrete union VARIANT — a ref list of bare variant structs.
     if variantIndexOf(base) >= 0 { return true }
     let u = 0
@@ -7467,6 +7480,11 @@ export function refArrElemName(name: string) {
       u = u + 1
     }
     if structIndexByName(base) >= 0 { return base }
+    // An INLINE-SHAPE element (`{v:i32}[]`) resolving to a DECLARED struct by the
+    // structural bridge — the SPELLING stays the table key (its slot twins with the
+    // declared name's slot at the heap layer, so the pair still dedups). Keyed
+    // exactly like `nameIsRefArray`'s bridge (the two must agree).
+    if shapeElemDeclaredStructIdx(base) >= 0 { return base }
     // A `Cat[]` concrete-variant element list — the bare variant name is the table key.
     if variantIndexOf(base) >= 0 { return base }
     // A NESTED ref array (`Cell[]` as the element of `Cell[][]`): the base is itself a ref array
@@ -7508,12 +7526,44 @@ export function rlInternName(name: string, kind: i32) {
   rlElemName.length - 1
 }
 
-// The table SLOT for a ref-list element type-NAME, or -1 if not interned.
+// The table SLOT for a ref-list element type-NAME. Nominal exact-name match is
+// the fast path; on a miss, the CANONICAL fallback (the struct table's
+// nominal-then-structural pattern, extended to the ref-list layer): a STRUCT
+// element spelled differently from the interned key — an inline shape vs its
+// declared twin (`{v:i32}` vs `A`), or two structurally-identical declared
+// names — resolves to the slot whose element backs the SAME heap type. The
+// two-layer discipline holds: the element names must resolve to struct slots
+// that are canonical-key AND field-code-layout twins (`repStructSlotsTwin`),
+// and the `| null` niche parity must agree (a niche-nullable element's index
+// read stays nullable — merging it with a non-null slot would change the read
+// discipline, not just the heap type). -1 when nothing matches.
 export function rlSlotByName(name: string) {
   let i = 0
   while i < rlElemName.length {
     if rlElemName[i] == name { return i }
     i = i + 1
+  }
+  const qn = nullablePartOf(name)
+  let qBase = name
+  if qn != "" { qBase = qn }
+  const qsi = structIndexOfTypeName(qBase)
+  if qsi < 0 { return -1 }
+  let j = 0
+  while j < rlElemName.length {
+    if rlElemKindTbl[j] == 1 {
+      const en = rlElemName[j]
+      const enn = nullablePartOf(en)
+      let parity = false
+      if qn == "" && enn == "" { parity = true }
+      if qn != "" && enn != "" { parity = true }
+      if parity {
+        let eBase = en
+        if enn != "" { eBase = enn }
+        const esi = structIndexOfTypeName(eBase)
+        if esi >= 0 && repStructSlotsTwin(qsi, esi) == 1 { return j }
+      }
+    }
+    j = j + 1
   }
   -1
 }
@@ -9527,10 +9577,12 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     if exprRefArray(e.idxArr, fnIx) {
       let nm = refListElemNameOfExpr(e.idxArr, fnIx)
       // A NULLABLE-struct element (`(P | null)[]`, slot key "P | null") resolves to the bare
-      // struct `P` — strip the `| null` so a narrowed `xs[i].field` finds P's layout.
+      // struct `P` — strip the `| null` so a narrowed `xs[i].field` finds P's layout. The
+      // structural bridge (`structIndexOfTypeName`) then also resolves an INLINE-SHAPE
+      // element (`{v:i32}[]` param) to its declared twin's layout.
       const nmnn = nullablePartOf(nm)
       if nmnn != "" { nm = nmnn }
-      const si = structIndexByName(nm)
+      const si = structIndexOfTypeName(nm)
       if si >= 0 { return si }
     }
     // A BARE `m[k]` over a STRUCT-valued map resolves to the value type's struct index, so a
