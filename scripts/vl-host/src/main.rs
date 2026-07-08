@@ -164,6 +164,18 @@ fn resolve_compiler(explicit: Option<String>) -> CompilerSource {
 /// is unsafe because a corrupt/forged artifact is UB — we only ever load a sidecar
 /// this same binary wrote next to the module it was derived from.
 fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>, Instance)> {
+    let module = load_compiler_module(engine, source)?;
+    let mut store = Store::new(engine, ());
+    let linker = Linker::new(engine);
+    let inst = linker.instantiate(&mut store, &module)?;
+    Ok((store, inst))
+}
+
+/// The module-loading half of `load_compiler` (the `.cwasm` sidecar dance), split
+/// out so `vl run --batch` can load + Cranelift-cache the compiler ONCE and then
+/// instantiate it freshly per case (a fresh Store per case keeps cases isolated;
+/// the Module — the expensive half — is engine-level and shareable).
+fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Module> {
     let module = match source {
         // Embedded seed (a `--features embed-seed` release binary): compile from the
         // baked-in bytes each run. No `.cwasm` sidecar — there's no path to key it on;
@@ -220,10 +232,7 @@ fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>,
             }
         }
     };
-    let mut store = Store::new(engine, ());
-    let linker = Linker::new(engine);
-    let inst = linker.instantiate(&mut store, &module)?;
-    Ok((store, inst))
+    Ok(module)
 }
 
 /// Read a file as UTF-8, distinguishing "missing/unreadable" from "present but
@@ -376,6 +385,22 @@ fn compile_vl(
     emit_names: bool,
 ) -> Result<Vec<u8>> {
     let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
+    compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names)
+}
+
+/// The per-invocation body of `compile_vl`, over an already-instantiated compiler:
+/// stage the source, call `entry`, read the emitted bytes back (or the compiler's
+/// diagnostics as the error). `vl run --batch` instantiates the compiler once per
+/// case (cheap) from a once-loaded Module (expensive) and calls this directly.
+fn compile_vl_instance(
+    store: &mut Store<()>,
+    inst: &Instance,
+    source: &str,
+    source_path: &str,
+    entry: &str,
+    emit_names: bool,
+) -> Result<Vec<u8>> {
+    let mut store = store;
 
     let compile = inst.get_typed_func::<(), i32>(&mut store, entry)?;
     let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
@@ -391,7 +416,7 @@ fn compile_vl(
         }
     }
 
-    phase!("stage_program", stage_program(&mut store, &inst, source, source_path))?;
+    phase!("stage_program", stage_program(store, inst, source, source_path))?;
     let rc = phase!("compile.call", compile.call(&mut store, ()))?;
     if rc != 0 {
         let stage = match rc {
@@ -399,7 +424,7 @@ fn compile_vl(
             2 => "type",
             _ => "emit",
         };
-        let diags = render_diags(&inst, &mut store, source_path)?;
+        let diags = render_diags(inst, store, source_path)?;
         bail!("{stage} error\n{}", diags.trim_end());
     }
     let bytes = phase!("readback", {
@@ -417,41 +442,160 @@ fn compile_vl(
 /// (top-level statements run via the wasm start function). Print output streams to
 /// stdout as it arrives.
 fn run_program(engine: &Engine, bytes: &[u8]) -> Result<()> {
+    run_program_with(engine, bytes, |line| println!("{line}"))
+}
+
+/// `run_program` with the print destination injected: every print import emits one
+/// LINE through `sink`. The default (`run_program`) streams lines to stdout as they
+/// arrive, byte-identical to before; `vl run --batch` captures them into a per-case
+/// buffer instead (many programs, one process, separated outputs).
+fn run_program_with(
+    engine: &Engine,
+    bytes: &[u8],
+    sink: impl Fn(&str) + Send + Sync + Clone + 'static,
+) -> Result<()> {
     let module = Module::new(engine, bytes)?;
     let chars: Arc<Mutex<Vec<u32>>> = Arc::default();
     let mut store = Store::new(engine, ());
     let mut linker = Linker::new(engine);
 
-    linker.func_wrap("imports", "__print_i32__", |v: i32| println!("{v}"))?;
-    linker.func_wrap("imports", "__print_i64__", |v: i64| println!("{v}"))?;
+    let s = sink.clone();
+    linker.func_wrap("imports", "__print_i32__", move |v: i32| s(&v.to_string()))?;
+    let s = sink.clone();
+    linker.func_wrap("imports", "__print_i64__", move |v: i64| s(&v.to_string()))?;
     // f64: Rust's `{}` Display matches JS `String(v)` for the corpus values (whole
     // numbers print without a trailing `.0`, e.g. 4.0 → "4"), mirroring the host's
     // `__print_f64__` (`String(v)`) so emitted output matches `@log`. (Slice 3.)
-    linker.func_wrap("imports", "__print_f64__", |v: f64| println!("{v}"))?;
+    let s = sink.clone();
+    linker.func_wrap("imports", "__print_f64__", move |v: f64| s(&v.to_string()))?;
     // f32: widen to f64 before Display so the printed decimal matches JS `String(v)`
     // (where a wasm f32 arrives as a JS number, i.e. its exact f64 value), mirroring the
     // host's `__print_f32__` (`String(v)`). Whole f32 values print without `.0` (e.g.
     // 6.5→"6.5", 10.0→"10"). (Slice 5.)
-    linker.func_wrap("imports", "__print_f32__", |v: f32| {
-        println!("{}", v as f64)
+    let s = sink.clone();
+    linker.func_wrap("imports", "__print_f32__", move |v: f32| {
+        s(&(v as f64).to_string())
     })?;
-    linker.func_wrap("imports", "__print_bool__", |v: i32| {
-        println!("{}", if v != 0 { "true" } else { "false" })
+    let s = sink.clone();
+    linker.func_wrap("imports", "__print_bool__", move |v: i32| {
+        s(if v != 0 { "true" } else { "false" })
     })?;
     let c = chars.clone();
     linker.func_wrap("imports", "__print_char__", move |code: i32| {
         c.lock().unwrap().push(code as u32);
     })?;
     let c = chars.clone();
+    let s = sink.clone();
     linker.func_wrap("imports", "__print_str_flush__", move || {
         let mut buf = c.lock().unwrap();
         let line: String = buf.iter().filter_map(|&cp| char::from_u32(cp)).collect();
         buf.clear();
-        println!("{line}");
+        s(&line);
     })?;
 
     // Instantiation runs the start function — the VL program's top level.
     let _instance = linker.instantiate(&mut store, &module)?;
+    Ok(())
+}
+
+/// `vl run --batch --out-dir DIR <file.vl>... [--compiler seed]` — run MANY
+/// programs in ONE process. The per-invocation fixed costs a `vl run` pays —
+/// process spawn, two engine builds, deserializing + relocating the multi-MB
+/// compiler `.cwasm` — are paid ONCE here, and each case only pays its own
+/// (cheap) instantiate + compile + run. This is the fuzz loop's shape: the CI
+/// rep-fuzz job runs hundreds of generated cases per seed, and the fixed costs
+/// dominated each of them.
+///
+/// Cases stay ISOLATED: a fresh Store (its own GC heap) per case for both the
+/// compiler instance and the program, so no state leaks between cases — only
+/// the immutable engine-level Modules are shared.
+///
+/// Per input `<name>`, writes into DIR:
+///   <name>.out — the program's print output (always written, even on failure)
+///   <name>.err — the same rendered error a failing `vl run` prints to stderr
+///                (compiler diagnostics / invalid-wasm / trap), only on failure
+/// The process exit code is 0 unless the batch itself cannot run (bad flags,
+/// unwritable DIR) — per-case failure is signalled by `<name>.err` existing, so
+/// one bad case never aborts the rest of the batch.
+fn run_batch(args: &[String]) -> Result<()> {
+    let mut compiler: Option<String> = None;
+    let mut out_dir: Option<String> = None;
+    let mut files: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--compiler" => {
+                compiler = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--out-dir" => {
+                out_dir = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--batch" => {}
+            a if !a.starts_with('-') => files.push(a.to_string()),
+            other => bail!("vl run --batch: unknown flag `{other}`"),
+        }
+        i += 1;
+    }
+    let Some(out_dir) = out_dir else {
+        bail!("usage: vl run --batch --out-dir <dir> <file.vl>...")
+    };
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| Error::from(e).context(format!("creating --out-dir `{out_dir}`")))?;
+    let compiler = resolve_compiler(compiler);
+
+    let compile_engine = gc_engine(Collector::Null)?;
+    let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
+    let module = load_compiler_module(&compile_engine, &compiler)?;
+    // Pre-link once; `instantiate_pre` re-checks nothing per case.
+    let pre = Linker::new(&compile_engine).instantiate_pre(&module)?;
+
+    for f in &files {
+        let name = std::path::Path::new(f)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| f.clone());
+        let captured: Arc<Mutex<String>> = Arc::default();
+        let sink = {
+            let buf = captured.clone();
+            move |line: &str| {
+                let mut b = buf.lock().unwrap();
+                b.push_str(line);
+                b.push('\n');
+            }
+        };
+        // Same pipeline as a single `vl run <file>`: prebuilt wasm runs directly,
+        // source compiles through the seed (names on, like `compile_and_run`).
+        let result = (|| -> Result<()> {
+            let raw = std::fs::read(f)
+                .map_err(|e| Error::from(e).context(format!("reading `{f}`")))?;
+            let bytes = if raw.starts_with(b"\0asm") {
+                raw
+            } else {
+                let source = String::from_utf8(raw).map_err(|e| {
+                    Error::from(e)
+                        .context(format!("`{f}` is neither UTF-8 VL source nor a wasm module"))
+                })?;
+                let mut store = Store::new(&compile_engine, ());
+                let inst = pre.instantiate(&mut store)?;
+                compile_vl_instance(&mut store, &inst, &source, f, "compileSrc", true)?
+            };
+            run_program_with(&run_engine, &bytes, sink.clone())
+        })();
+        std::fs::write(format!("{out_dir}/{name}.out"), captured.lock().unwrap().as_bytes())?;
+        let err_path = format!("{out_dir}/{name}.err");
+        match result {
+            // Clear a stale `.err` so a reused DIR can't misclassify a pass.
+            Ok(()) => {
+                let _ = std::fs::remove_file(&err_path);
+            }
+            // `{e:?}` renders the same context chain a failing `vl run` prints via
+            // `Error: {e:?}` on stderr, so downstream classification (grep for
+            // "parse error" / "failed to parse WebAssembly" / trap text) is stable.
+            Err(e) => std::fs::write(&err_path, format!("{e:?}\n"))?,
+        }
+    }
     Ok(())
 }
 
@@ -565,6 +709,10 @@ fn compile_and_run(
 /// shape (no file with `-e`/stdin) is dispatched before the positional parsing.
 fn run_cmd(args: &[String]) -> Result<()> {
     use std::io::{IsTerminal, Read};
+    // `--batch` is its own arg shape (many files, --out-dir) — dispatch first.
+    if args.iter().any(|a| a == "--batch") {
+        return run_batch(args);
+    }
     let mut compiler: Option<String> = None;
     let mut inline: Option<String> = None;
     let mut file: Option<String> = None;

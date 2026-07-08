@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # VL-NATIVE rep-composition fuzzer — the orchestrator half. Runs `scripts/fuzzgen.vl` (the generator)
 # through the native `vl`, splits its batch of self-describing `.vl` cases on `===CASE` markers, runs
-# each through `vl run`, and asserts the output matches the case's own `// @log` directive. NO Deno —
+# them all through ONE `vl run --batch` process (the compiler module loads once, each case still gets
+# a fresh isolated store), and asserts the output matches the case's own `// @log` directive. NO Deno —
 # the native host compiles + runs; the generator + the oracle (the buried literal) are pure VL.
 #
 # USAGE: scripts/fuzz-vl.sh [--seed N] [--count M] [--depth D] [--keep DIR] [--baseline FILE]
@@ -77,13 +78,31 @@ if ! "$VL" run "$WORK/gen.vl" --compiler "$SEED_WASM" > "$WORK/batch.txt" 2>"$WO
   echo "GENERATOR FAILED to run:"; cat "$WORK/generr.txt"; exit 2
 fi
 
-# Split the batch into one file per case on the `===CASE` marker.
+# Split the batch into one file per case on the `===CASE` marker, extracting each
+# case's `// @log` (expected output) and `// @shape` sidecars in the same pass —
+# the directives stay in the case file too, this just replaces two `sed` spawns
+# per case with zero (measurable at hundreds of cases × 16 CI seeds).
 awk -v dir="$WORK" '
   /^===CASE/ { n++; file = sprintf("%s/case_%05d.vl", dir, n); next }
-  n > 0 { print > file }
+  n > 0 {
+    print > file
+    if (sub(/^\/\/ @log /, ""))        print > (file ".log")
+    else if (sub(/^\/\/ @shape /, "")) print > (file ".shape")
+  }
 ' "$WORK/batch.txt"
 
 echo "fuzz-vl: seed $SEED, $(ls "$WORK"/case_*.vl 2>/dev/null | wc -l | tr -d ' ') cases"
+
+# Run every case in ONE `vl` process (`vl run --batch`): the per-case fixed costs
+# (process spawn, engine builds, deserializing the multi-MB compiler `.cwasm`)
+# are paid once for the whole batch instead of once per case. Per case_N.vl it
+# writes $WORK/out/case_N.vl.out (print output) and, on failure, .err — the same
+# rendered error a failing `vl run` prints, so the classification below greps
+# identical text. A batch-runner failure (not a case failure) is fatal.
+if ls "$WORK"/case_*.vl >/dev/null 2>&1; then
+  "$VL" run --batch --out-dir "$WORK/out" "$WORK"/case_*.vl --compiler "$SEED_WASM" \
+    || { echo "BATCH RUNNER FAILED (vl run --batch)"; exit 2; }
+fi
 
 findings=0
 known=0
@@ -91,16 +110,22 @@ declare -A seen=()
 declare -A count=()
 for f in "$WORK"/case_*.vl; do
   [ -f "$f" ] || continue
-  expected="$(sed -n 's|^// @log ||p' "$f")"
-  shape="$(sed -n 's|^// @shape ||p' "$f")"
+  b="$(basename "$f")"
+  expected="$(cat "$f.log" 2>/dev/null)"
+  shape="$(cat "$f.shape" 2>/dev/null)"
+  err="$WORK/out/$b.err"
   why=""
-  if ! actual="$("$VL" run "$f" --compiler "$SEED_WASM" 2>"$WORK/run.err")"; then
-    if grep -q "type error\|parse error\|emit error" "$WORK/run.err"; then why="REJECT"
-    elif grep -q "failed to compile\|failed to parse WebAssembly\|translation error\|Invalid input WebAssembly" "$WORK/run.err"; then why="INVALID-WASM"
+  if [ -f "$err" ]; then
+    if grep -q "type error\|parse error\|emit error" "$err"; then why="REJECT"
+    elif grep -q "failed to compile\|failed to parse WebAssembly\|translation error\|Invalid input WebAssembly" "$err"; then why="INVALID-WASM"
     else why="TRAP"; fi
-  elif [ "$actual" != "$expected" ]; then
-    why="MISMATCH"
-    { echo "expected: [$expected]"; echo "actual:   [$actual]"; } > "$WORK/run.err"
+  else
+    actual="$(cat "$WORK/out/$b.out" 2>/dev/null)"
+    if [ "$actual" != "$expected" ]; then
+      why="MISMATCH"
+      err="$WORK/run.err"
+      { echo "expected: [$expected]"; echo "actual:   [$actual]"; } > "$err"
+    fi
   fi
   [ -n "$why" ] || continue
 
@@ -122,12 +147,12 @@ for f in "$WORK"/case_*.vl; do
   if [ -n "$KEEP" ]; then
     base="$(basename "$f" .vl)"
     cp "$f" "$KEEP/$base.vl"
-    cp "$WORK/run.err" "$KEEP/$base.err"
+    cp "$err" "$KEEP/$base.err"
   fi
   if [ "$QUIET" -eq 0 ] && [ -z "${seen[$why]:-}" ]; then
     seen[$why]=1
     echo; echo "✗ $why  (repro: scripts/fuzz-vl.sh --seed $SEED --count $COUNT --depth $DEPTH)"
-    echo "  ── case ──"; sed 's/^/  /' "$f"; echo "  ── error ──"; sed 's/^/  /' "$WORK/run.err"
+    echo "  ── case ──"; sed 's/^/  /' "$f"; echo "  ── error ──"; sed 's/^/  /' "$err"
   fi
   echo "✗ $why  $shape"
 done
