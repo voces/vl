@@ -343,6 +343,7 @@ import {
   unionArmSigKey,
   variantIndexOf,
   variantIndexOfLet,
+  variantNestedShapeOk,
   variantSig,
 } from "./emit_classify"
 
@@ -2592,6 +2593,18 @@ export function collectA(_stmts: i32[]) {
     }
     i = i + 1
   }
+  // Union-VARIANT nested-struct fields (code 15, `{f: {f: f32}} | {w: i32}`): intern each
+  // field's target shape into the struct table — the intern `collectShapeVariantFields`'s
+  // acceptance deferred (`collectU` ran before the struct table existed). Idempotent (an
+  // inline union annotation's arms already interned via `internShapeDeep`'s recursion — this
+  // covers the declared-`UnionDecl` spelling too), a no-op for a DECLARED target name (the
+  // text is not a `{…}` shape). Runs BEFORE the struct-field pass below so a freshly
+  // interned shape's own map / ref-list / niche fields get their slots from that pass.
+  let ufn = 0
+  while ufn < uFieldTypes.length {
+    if uFieldTypes[ufn] == 15 { internInlineShape(uFieldElemName[ufn]) }
+    ufn = ufn + 1
+  }
   // Inline-struct MAP FIELDS (`const s: { m: {[string]: V} }`): `collectAnnShapes` registered
   // them as code-19 fields with the value name in `sFieldElemName`, but their inner map is
   // not a standalone TypeRef the scan above sees (the whole `{m:{[string]:V}}` is ONE name).
@@ -2987,7 +3000,19 @@ function collectShapeVariantFields(nm: string) {
         return emitFail("emitProgram: malformed inline union-variant shape")
       }
       const ftxt = part.slice(ci + 1, part.length)
-      const fc = nameFieldCode(ftxt)
+      let fc = nameFieldCode(ftxt)
+      if fc < 0 {
+        // A NESTED-STRUCT variant field (`{f: {f: f32}} | {w: i32}`): the shape-text twin of
+        // `internInlineShape`'s -1→15 fallback. Validated PURELY here (`collectU` runs before
+        // `collectS`, whose reset would wipe anything interned now); `collectA`'s variant
+        // field pass interns the accepted shape, and acceptance is monotone — a field code
+        // undecidable now can only IMPROVE by the time `internInlineShape` classifies it
+        // (union registration only grows), so the deferred intern never fails.
+        let nsBase = ftxt
+        const nsNul = nullablePartOf(nsBase)
+        if nsNul != "" { nsBase = nsNul }
+        if variantNestedShapeOk(nsBase) { fc = 15 }
+      }
       if fc < 0 {
         return emitFail(
           "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
@@ -3172,6 +3197,53 @@ function registerShapeFieldUnions(stmts: i32[], name: string) {
   0
 }
 
+// Pre-register the FIELD unions of a union-ARM shape `{…}` that the variant field
+// classifier would otherwise code -1 — a map-member union (`{[string]: f32} | string`),
+// a heterogeneous union (`boolean | {w: i32}`), a mixed struct union (`{…} | i64`) —
+// so `collectVariantFields` classifies the field as the union BOX (code 16), the
+// variant twin of `registerShapeFieldUnions` (which only single-shape annotations
+// reach). GATED to fields `nameFieldCode` cannot already classify whose text IS a
+// top-level union: an arm whose fields are all supported today registers nothing
+// (byte-identical), and a closure field's result union stays the closure-result
+// path's concern (the `registerShapeFieldUnions` discipline). MUST run before the
+// caller pushes its own `unNames`/`unVarStart` rows: a field union registered here
+// pushes its OWN variants, and interleaving would corrupt the caller's slice.
+function registerVariantArmFieldUnions(stmts: i32[], name: string) {
+  if !nameIsSingleShape(name) { return 0 }
+  const inner = name.slice(1, name.length - 1)
+  let depth = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    let brk = false
+    if k == inner.length {
+      brk = true
+    } else {
+      const c = inner[k]
+      if c == '{' || c == '[' || c == '(' { depth = depth + 1 }
+      if c == '}' || c == ']' || c == ')' { depth = depth - 1 }
+      if c == ',' && depth == 0 { brk = true }
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci > 0 {
+        const ftxt = part.slice(ci + 1, part.length)
+        if (
+          annArrowAt(ftxt) < 0 &&
+          nameFieldCode(ftxt) < 0 &&
+          unionMemberCount(ftxt) > 1
+        ) {
+          if registerInlineUnion(stmts, ftxt) < 0 { return -1 }
+        }
+      }
+      start = k + 1
+    }
+    k = k + 1
+  }
+  0
+}
+
 // Register the inline union synthetic name `name` (e.g. `"A|B"`) as a union alias in
 // the per-union tables, exactly as `collectU` registers a `UnionDecl`: record the
 // name + its variant-slice range, append each member to the GLOBAL `uVariants` list,
@@ -3292,6 +3364,14 @@ function registerInlineUnion(stmts: i32[], name: string) {
   if !isVariantBoxUnion(stmts, name) { return 0 }
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  // Field unions of the shape arms register FIRST (they push their own un*/uVariants
+  // rows) — after this union's rows are pushed, an interleaved registration would
+  // corrupt its variant slice.
+  let pfa = 0
+  while pfa < atoms.length {
+    if registerVariantArmFieldUnions(stmts, atoms[pfa]) < 0 { return -1 }
+    pfa = pfa + 1
+  }
   uDeclared = true
   unNames.push(name)
   unMemberSet.push(name)
@@ -3549,6 +3629,14 @@ export function collectU(stmts: i32[]) {
       const vs = s.udVariants
       if vs.length < 1 {
         return emitFail("emitProgram: union must have at least one variant")
+      }
+      // Field unions of inline-shape arms register FIRST (see the
+      // `registerInlineUnion` twin) — they push their own un*/uVariants rows,
+      // which must not interleave with this union's slice.
+      let pfd = 0
+      while pfd < vs.length {
+        if registerVariantArmFieldUnions(stmts, vs[pfd]) < 0 { return -1 }
+        pfd = pfd + 1
       }
       unNames.push(s.udName)
       // The alias's full member set, pipe-joined (atom members like `null` kept).
