@@ -131,14 +131,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      (`calleeIsUnionArmClosureMember`), and the member-STORE scalar widening
      (`emitScalarFieldStoreVal` — the pre-existing `p.g = 9` i64-field invalid-wasm, flat
      and nested). Baseline 249 → 221 (28 graduations, 4 pinned tests).
+     Stage B WAVE 2 slice 3b SHIPPED (→ `CHANGELOG.md`): map-through-closure-result in
+     union arms (`forceCloResultMapTypes` — the collect-scan forces the map machinery +
+     interns the value slot from a union arm's / nullable-closure's / curried closure
+     RESULT, the R2×R1 combo; a value-union result stays deliberately un-forced/loud).
+     Baseline 221 → 220 (1 graduation, 1 pinned test).
      STAGE B remaining charter (consumer migration, family-by-family, each PR gated by
      fixpoint + corpus + rep-fuzz + the shadow sweep): (b2, REMAINING TAIL) typed-value
-     maps in composition (R1) through `Map(val)` trees — map-through-closure-result in
-     union arms (the collect-scan closure-RESULT map forcing; the union-arm sig side
-     already keys), the nulclosure-sig family (`(() => f64) | null` et al. — a null-only
-     caller's narrowed call finds no interned sig), and the still-loud
-     nested/nullable-value policy set (each stays rejected until its rep is genuinely
-     minted); (b3) 2-D arrays
+     maps in composition (R1) through `Map(val)` trees — the nulclosure-sig family
+     (`(() => f64) | null` et al. — a null-only caller's narrowed call finds no
+     interned sig, incl. the map-result spelling `((i32) => {[string]: f64}) | null`),
+     and the still-loud nested/nullable-value policy set (each stays rejected until its
+     rep is genuinely minted); (b3) 2-D arrays
      (R4 — `List(List(_))` dissolves the special backing) + nullable-list-in-field /
      struct-through-list (R5/R6, compositional once consumers read the tree); (b4) closure
      composite results via sig keys interned from `Closure(params, result)` nodes (R2);

@@ -9129,6 +9129,46 @@ export function markMapUnionArms(name: string) {
   0
 }
 
+// Force the shared map machinery + intern the mv value slot of a MAP reached only as
+// a CLOSURE RESULT inside a composite annotation — a union arm
+// (`(() => {[string]: f64}) | {w: i32}`), the nullable-closure niche
+// (`((i32) => {[string]: f64}) | null`), or a curried result. The whole spelling is
+// ONE TypeRef whose map is invisible to every branch of the `collectA` scan, so the
+// narrowed arm's call-result map ops rejected "map type not collected" even though
+// the result names a map — the R2×R1 combo seam. Self-gating: a name with no arrow
+// arm (or no map result) forces nothing — byte-identical for every other program. A
+// value-UNION result (`() => {[string]: i32} | boolean`) is deliberately NOT forced:
+// that closure result stays a loud reject until its rep is minted.
+export function forceCloResultMapTypes(nm: string) {
+  // Cheap pre-gate (this runs per arena TypeRef): only a name spelling BOTH an
+  // arrow and a map can carry a closure-result map — two substring scans, no
+  // allocation, before the arm split allocates anything.
+  if !strContains(nm, "=>") || !strContains(nm, "{[") { return 0 }
+  const arms: string[] = []
+  splitUnionArmsAllDepth(nm, arms)
+  let i = 0
+  while i < arms.length {
+    const a = monoUnwrapParens(arms[i])
+    const fa = annArrowAt(a)
+    if fa >= 1 && a.length > 0 && a[0] == '(' {
+      let res = monoUnwrapParens(a.slice(fa + 2, a.length))
+      const rn = nulMapInnerName(res)
+      if rn != "" { res = rn }
+      if nameIsMap(res) && !nameIsMapMemberUnion(res) {
+        mUsed = true
+        lUsed = true
+        aUsed = true
+        mvShapeOfValName(mapValNameOf(res))
+      } else if annArrowAt(res) >= 0 {
+        // A curried result (`() => () => {[string]: V}`) recurses to ITS result.
+        forceCloResultMapTypes(res)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // True if the union member-set `name` has a MAP arm whose interned map value-slot is `slot` — the
 // guard `emitUnionCoerce` uses to confirm a map carrier actually matches an arm before boxing it
 // with that arm's `mapSlotTag`. A map expr whose value-slot matches no arm falls through (a
