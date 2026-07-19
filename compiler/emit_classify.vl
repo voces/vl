@@ -1237,6 +1237,24 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
       }
     }
   }
+  // Indexing a `(f64[] | null)[]` (a kind-6/7/8/10 ref list whose element slot keeps the
+  // `| null`) yields the NULLABLE leaf list — the read left it `(ref null $wrapper)`, so
+  // `const t = xs[i]; if t != null` narrows to the leaf list. The distinct-backing dual
+  // of `exprNullableList`'s kind-4 Index arm.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemNullable.length {
+        if rlElemNullable[slot] == 1 {
+          const k = rlElemKindTbl[slot]
+          if k == 6 { return "nulstrlist" }
+          if k == 7 { return "nulf64list" }
+          if k == 8 { return "nuli64list" }
+          if k == 10 { return "nulf32list" }
+        }
+      }
+    }
+  }
   null
 }
 
@@ -7015,9 +7033,11 @@ function nullStructArrElem(name: string) {
 // else "". Such an array reuses the `i32[][]` (kind 4) rep: a ref list over a `(ref null $lTypeIdx)`
 // backing (already nullable, so the `| null` element rides for free). It differs from `i32[][]` ONLY by
 // its slot key keeping the `| null` (so the index READ stays nullable — no `ref.as_non_null` — for the
-// `e != null` narrow). The inner array reuses its NON-nullable rep RECURSIVELY (kind 4 i32-list inner, or
-// kind 9 a nested ref-array inner — `(i32[][]|null)[]`, `({f:i32}[]|null)[]`, …); the structured
-// `rlElemNullable` bit drives the nullable read-skip + null-element generically over the inner kind.
+// `e != null` narrow). The inner array reuses its NON-nullable rep RECURSIVELY (kind 4 i32-list inner,
+// a DISTINCT-backing scalar/string inner — kinds 6/7/8/10, `(f64[] | null)[]` over the `$fl64` wrapper
+// singleton, the list-position dual of the `nulf64list` binding niche — or kind 9 a nested ref-array
+// inner — `(i32[][]|null)[]`, `({f:i32}[]|null)[]`, …); the structured `rlElemNullable` bit drives the
+// nullable read-skip + null-element generically over the inner kind.
 function nullArrayArrElem(name: string) {
   const elem = parenUnionArrElemName(name)
   if elem == "" { return "" }
@@ -7025,7 +7045,9 @@ function nullArrayArrElem(name: string) {
   if nn == "" { return "" }
   if !nameIsArray(nn) { return "" }
   const ik = refArrElemKind(nn + "[]")
-  if ik == 4 || ik == 9 { return nn }
+  if ik == 4 || ik == 6 || ik == 7 || ik == 8 || ik == 9 || ik == 10 {
+    return nn
+  }
   ""
 }
 
@@ -7656,11 +7678,22 @@ export function refArrElemName(name: string) {
 // SLOT index (existing slot if already present). `kind` is 1 (struct) or 2 (union box).
 // Heap/backing/wrapper indices are filled later in `emitModule`.
 // A ref-list element is a NULLABLE NICHE (the index read leaves it `(ref null $elem)`) iff it is a
-// niche-bearing KIND — a struct (1) or an i32-list (4) — AND its name carries `| null`. A value-union BOX
-// (kind 2) is NOT a niche even though `i32 | null` also has `| null` (its null is a tag inside a non-null
-// box). The KIND is the discriminator; recording it once here keeps the read/build sites kind-agnostic.
+// niche-bearing KIND — a struct (1), an inner LIST of any leaf (4, the distinct-backing scalar/string
+// 6/7/8/10, or a ref inner 9) — AND its name carries `| null`. A value-union BOX (kind 2) is NOT a
+// niche even though `i32 | null` also has `| null` (its null is a tag inside a non-null box). The KIND
+// is the discriminator; recording it once here keeps the read/build sites kind-agnostic.
 function rlElemNicheNullable(kind: i32, name: string) {
-  if kind != 1 && kind != 4 && kind != 9 { return false }
+  if (
+    kind != 1 &&
+    kind != 4 &&
+    kind != 6 &&
+    kind != 7 &&
+    kind != 8 &&
+    kind != 9 &&
+    kind != 10
+  ) {
+    return false
+  }
   return nullablePartOf(name) != ""
 }
 
@@ -11601,6 +11634,11 @@ function nestedRefListElemIs(idxArr: i32, fnIx: i32, elemKind: i32) {
   if exprRefArray(idxArr, fnIx) {
     const slot = refListSlotOfExpr(idxArr, fnIx)
     if slot >= 0 && slot < rlElemKindTbl.length {
+      // A NULLABLE-niche element (`(f64[] | null)[]`, kinds 6/7/8/10 with the `| null`
+      // slot key) reads `(ref null $wrapper)` — a nullable leaf list (`nulf64list` …,
+      // `exprNulScalarListKind`'s Index arm), NOT the non-null leaf list; claiming it
+      // here would route an unnarrowed read through the non-null scalar path.
+      if rlElemNullable[slot] == 1 { return false }
       if rlElemKindTbl[slot] == elemKind { return true }
     }
   }

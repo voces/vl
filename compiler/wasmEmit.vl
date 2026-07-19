@@ -3268,12 +3268,20 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
           }
           // A `(i32[] | null)[]` element (kind 4 nullable niche) may be a bare `null` → `ref.null
           // $lTypeIdx`; a `(<ref-array> | null)[]` element (kind 9 nullable niche) → `ref.null
-          // $innerWrapper`. Each seed only affects a `null` element (a non-null literal ignores it).
+          // $innerWrapper`; a distinct-backing `(f64[] | null)[]` / `(string[] | null)[]` element
+          // (kinds 6/7/8/10 nullable niches) → `ref.null` of the leaf-list wrapper SINGLETON.
+          // Each seed only affects a `null` element (a non-null literal ignores it).
           if elemNest == 4 && rlElemNullable[rslot] == 1 {
             elCtx.nulList = true
           }
           if elemNest == 9 && rlElemNullable[rslot] == 1 && nestInnerSlot >= 0 {
             elCtx.nulRefHeap = rlWrapIdx[nestInnerSlot]
+          }
+          if rlElemNullable[rslot] == 1 {
+            if elemNest == 6 { elCtx.nulRefHeap = mkListIdx }
+            if elemNest == 7 { elCtx.nulRefHeap = fl64TypeIdx }
+            if elemNest == 8 { elCtx.nulRefHeap = il64TypeIdx }
+            if elemNest == 10 { elCtx.nulRefHeap = fl32TypeIdx }
           }
           if emitExprExpect(body, elems[i], fnIx, elCtx) < 0 { return -1 }
         }
@@ -7208,6 +7216,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       // A UNION-box element list (`(C | S)[]`, kind 2): the stored value boxes into the
       // shared `{tag, payload}` rep (`emitUnionBoxArg`), a variant widening like a call arg.
       let storeUnionNm = ""
+      // A NESTED-list element (`b[i] = [7, 8]` over `i64[][]`, kinds 4/6/7/8/9/10): the
+      // stored value emits under the INNER list's context (`refElemValueCtx`).
+      let storeNestSlot = -1
       if isRef {
         if !rlUsed {
           return emitFail(
@@ -7223,6 +7234,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           storeStructIdx = structIdxOfElemName(rlElemName[rslot])
         }
         if rlElemKindTbl[rslot] == 2 { storeUnionNm = rlElemName[rslot] }
+        if rlElemIsNestedList(rslot) { storeNestSlot = rslot }
       } else if isStr {
         // A STRING list `xs[i] = s`: unwrap to its `(ref null $aTypeIdx)` string backing
         // (`mkListIdx`/`mkArrIdx`) and store the string ref — mirroring `emitIndex`'s
@@ -7293,6 +7305,11 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         if emitUnionBoxArg(body, storeUnionNm, a.binRight, fnIx) < 0 {
           return -1
         }
+      } else if storeNestSlot >= 0 {
+        // A nested-list row store: the RHS builds as the INNER list (inert for a
+        // non-literal RHS — an ident/call emits unchanged).
+        const snCtx = refElemValueCtx(storeNestSlot)
+        if emitExprExpect(body, a.binRight, fnIx, snCtx) < 0 { return -1 }
       } else if isF64 {
         // The stored value re-encodes at the element valtype (a bare-int / int-literal value
         // widens into the f64 slot, exactly as a binding / push does).
@@ -7504,6 +7521,53 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected an assignment expression")
 }
 
+// The expected-type context for ONE ELEMENT VALUE of the ref-list slot `rslot` — the
+// `.push`/indexed-assign twin of `emitArr`'s per-element `elCtx` seeds. A NESTED-list
+// element (kinds 4/6/7/8/9/10) resets the list context to the INNER list's kind so a
+// bare literal value builds the RIGHT inner list: `b.push([300])` over `i64[][]` must
+// build an i64 inner list (the plain-`emitExpr` default built the i32 list — a wrapper
+// heap mismatch, INVALID WASM); same for `d.push([2.5])` over `f32[][]` (the literal
+// self-classified f64) and the row-assign `b[i] = [7, 8]`. A kind-9 element seeds the
+// inner ref-list slot (recursively, so any depth composes); a NULLABLE element (the
+// `(i32[] | null)[]` / `(<ref-array> | null)[]` niches) seeds the null-element ref,
+// exactly as the literal path does. A non-literal value (an ident, a call) reads none
+// of these seeds, so the context is inert for it — literal-only semantics preserved.
+function refElemValueCtx(rslot: i32): ExpCtx {
+  const c = expCtxHere()
+  const k = rlElemKindTbl[rslot]
+  if k == 4 {
+    c.listKind = 0
+  } else if k == 6 {
+    c.listKind = 3
+  } else if k == 7 {
+    c.listKind = 4
+  } else if k == 8 {
+    c.listKind = 6
+  } else if k == 10 {
+    c.listKind = 7
+  } else if k == 9 {
+    c.listKind = 5
+    c.listSlot = rlSlotByName(refArrElemName(rlElemName[rslot]))
+  }
+  if rlElemNullable[rslot] == 1 {
+    if k == 4 { c.nulList = true }
+    if k == 6 { c.nulRefHeap = mkListIdx }
+    if k == 7 { c.nulRefHeap = fl64TypeIdx }
+    if k == 8 { c.nulRefHeap = il64TypeIdx }
+    if k == 10 { c.nulRefHeap = fl32TypeIdx }
+    if k == 9 && c.listSlot >= 0 { c.nulRefHeap = rlWrapIdx[c.listSlot] }
+  }
+  c
+}
+
+// True if the ref-list slot `rslot` holds NESTED-LIST elements (an inner list wrapper —
+// scalar kinds 4/6/7/8/10 or a ref inner list, kind 9): the element-value emit must run
+// under `refElemValueCtx` so a literal value builds the inner list, not the default.
+function rlElemIsNestedList(rslot: i32) {
+  const k = rlElemKindTbl[rslot]
+  k == 4 || k == 6 || k == 7 || k == 8 || k == 9 || k == 10
+}
+
 // Lower a `recv.push(x)` member-call statement onto `body` — the growable-list append
 // (mirroring `toWasm.ts`'s `__list_grow__`/`__list_push__`, but INLINED). `recv` must be
 // a bare `Ident` naming a LIST local/param (so its `local.get` is side-effect-free and
@@ -7578,6 +7642,9 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
       // shared `{tag, payload}` rep (`emitUnionBoxArg`) — a concrete variant widens like a
       // call arg, a literal boxes via `emitUnionBox`. "" for a non-union element.
       let pushUnionNm = ""
+      // A NESTED-list element (`i64[][].push([300])`, kinds 4/6/7/8/9/10): the pushed value
+      // emits under the INNER list's context (`refElemValueCtx`), like a literal element.
+      let pushNestSlot = -1
       if isRef {
         if !rlUsed {
           return emitFail(
@@ -7592,6 +7659,7 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
           pushStructIdx = structIdxOfElemName(rlElemName[rslot])
         }
         if rlElemKindTbl[rslot] == 2 { pushUnionNm = rlElemName[rslot] }
+        if rlElemIsNestedList(rslot) { pushNestSlot = rslot }
       } else if isStr {
         if !slUsed {
           return emitFail(
@@ -7702,6 +7770,11 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
           if emitUnionBoxArg(body, pushUnionNm, c.callArgs[0], fnIx) < 0 {
             return -1
           }
+        } else if pushNestSlot >= 0 {
+          // A nested-list element push: the value builds as the INNER list (an inert
+          // context for a non-literal value — an ident/call emits unchanged).
+          const pnCtx = refElemValueCtx(pushNestSlot)
+          if emitExprExpect(body, c.callArgs[0], fnIx, pnCtx) < 0 { return -1 }
         } else if isLitArr {
           const pluCtx = expCtxHere()
           pluCtx.litUnion = 1
