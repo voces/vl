@@ -7516,17 +7516,18 @@ export function arrLitIsRef(arrIx: i32) {
     // scan mints a `>a` (i32-list) closure sig, and a closure VALUE returning it miscompiles. As a
     // ref list it routes through `exprRefArray` (kind 5) like a struct-element literal.
     if e0 is FuncDecl { return true }
-    // A NESTED array literal (`[[1, 2], [3, 4]]`) whose inner elements are
-    // i32-ish is an `i32[][]` ref list (element kind 4). String / f64 / ref
-    // inner elements stay unsupported (loud failure downstream).
+    // A NESTED array literal (`[[1, 2], [3, 4]]`, `[["a"]]`, `[[1.5]]`,
+    // `[[6000000000]]`) is a ref list whose element is the INNER list's wrapper —
+    // element kind 4 (i32-ish leaves) or 6/7/8 (string / f64 / i64 leaves, via
+    // `arrLitElemKind`'s inner probe). Keying every scalar/string leaf here (not
+    // only i32) makes a SELF-classified nested literal — an un-annotated binding,
+    // a lambda result — build the SAME rep its leaves need: an i64-magnitude leaf
+    // (`[[62321678167]]`) previously still keyed the `i32[]` element while its
+    // inner literal built the i64 wrapper — a wrapper-heap mismatch, INVALID WASM
+    // (the `() => i64[][]` global). A REF inner literal (`[[{v: 1}]]`) stays
+    // annotation-driven (the threaded `pendingListKind`/slot path).
     if e0 is ArrayLit {
-      if (
-        !arrLitIsStr(a.arrElems[0], -1) &&
-        !arrLitIsF64(a.arrElems[0], -1) &&
-        !arrLitIsRef(a.arrElems[0])
-      ) {
-        return true
-      }
+      if !arrLitIsRef(a.arrElems[0]) { return true }
     }
   }
   false
@@ -7584,7 +7585,15 @@ export function arrLitElemKind(arrIx: i32) {
     }
     if a.arrElems.length >= 1 {
       const e0 = P.nodes[a.arrElems[0]]
-      if e0 is ArrayLit { return 4 }
+      // A nested-list element: the INNER literal's leaf picks the element kind —
+      // string 6 / f64 7 / i64 8, else the i32-list wrapper (4). Mirrors
+      // `arrLitElemName`'s leaf keying (the two must agree per slot).
+      if e0 is ArrayLit {
+        if arrLitIsStr(a.arrElems[0], -1) { return 6 }
+        if arrLitIsF64(a.arrElems[0], -1) { return 7 }
+        if arrLitIsI64(a.arrElems[0], -1) { return 8 }
+        return 4
+      }
       if e0 is ObjLit {
         // A union-variant element boxes into the union (kind 2); a plain struct is kind 1.
         if uDeclared {
@@ -7611,7 +7620,14 @@ export function arrLitElemName(arrIx: i32) {
     }
     if a.arrElems.length >= 1 {
       const e0 = P.nodes[a.arrElems[0]]
-      if e0 is ArrayLit { return "i32[]" }
+      // A nested-list element keys the INNER list's name by its leaf — the table
+      // key `arrLitElemKind` picks the matching kind for (6/7/8, else 4).
+      if e0 is ArrayLit {
+        if arrLitIsStr(a.arrElems[0], -1) { return "string[]" }
+        if arrLitIsF64(a.arrElems[0], -1) { return "f64[]" }
+        if arrLitIsI64(a.arrElems[0], -1) { return "i64[]" }
+        return "i32[]"
+      }
       if e0 is ObjLit {
         if uDeclared {
           const vn = objVariantName(a.arrElems[0])
@@ -8190,11 +8206,29 @@ function funcTypeFieldCodeSafe(c: i32): boolean {
     c == 27
 }
 
+// True if `nm` is a NESTED array bottoming out at a SCALAR/STRING leaf list —
+// `i32[][]` / `boolean[][]` / `K[][]` (kind 4), `string[][]` / `f64[][]` / `i64[][]` /
+// `f32[][]` (kinds 6/7/8/10), or a deeper recursion over those (`i32[][][]`, kind 9
+// whose element is itself such an array). NOT a struct/union/closure/map-element
+// array (their leaf reps carry the R6/R3/R1 composition seams). The R4 leaf test the
+// closure-result shape gate uses: such a field is a plain code-5 ref-list slot whose
+// element machinery is fully interned by the `collectA` field pass (`ensureRefElem`).
+export function nameIsNestedScalarLeafArray(nm: string): boolean {
+  if !nameIsRefArray(nm) { return false }
+  const k = refArrElemKind(nm)
+  if k == 4 || k == 6 || k == 7 || k == 8 || k == 10 { return true }
+  if k == 9 { return nameIsNestedScalarLeafArray(refArrElemName(nm)) }
+  false
+}
+
 // Whether inline shape `nm` (`{f:i32,g:{h:i32}}`) lowers as a closure result/param
 // with NO unsupported composite field, recursing through nested inline shapes (and
-// their `| null`). A map / value-union / nullable-list / ref-list / closure field
-// makes it un-lowerable — those reps are R1/R3/R5/R6, out of THIS slice, and the
+// their `| null`). A map / value-union / nullable-list / struct-element-list / closure
+// field makes it un-lowerable — those reps are R1/R3/R5/R6, out of THIS slice, and the
 // closure must stay a CLEAN reject (never invalid wasm), so the shape is not interned.
+// A NESTED-array field with a scalar/string leaf (`{f: boolean[][]}` — code 5, but its
+// element is a leaf LIST, no struct-through-list seam) IS lowerable: the field is a
+// plain ref-list slot the field pass interns like any binding's (the R4 dissolution).
 function funcTypeShapeLowerable(nm: string): boolean {
   if nm.length < 2 || nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' {
     return false
@@ -8232,7 +8266,10 @@ function funcTypeShapeLowerable(nm: string): boolean {
           if nb != "" { base = nb }
           if !funcTypeShapeLowerable(base) { okAll = false }
         } else if !funcTypeFieldCodeSafe(fc) {
-          okAll = false
+          // A code-5 field whose type is a nested SCALAR-LEAF array (`f: boolean[][]`)
+          // is a plain ref-list slot — lowerable (see the header note); any other
+          // unsafe code keeps the shape un-interned (the clean closure reject).
+          if !(fc == 5 && nameIsNestedScalarLeafArray(ftxt)) { okAll = false }
         }
         fieldCount = fieldCount + 1
       }
@@ -9605,6 +9642,42 @@ export function unionRefArrayArmSlotForMapElem(name: string, mvShape: i32) {
     }
     i = i + 1
   }
+  -1
+}
+
+// The interned reflist SLOT of the SINGLE NESTED-ARRAY arm of the union member-set
+// `name` (`string[][] | string`, `i64[][] | boolean | null` — an arm whose element is
+// itself a list, kinds 4/6/7/8/9/10), or -1 when the union has no such arm OR more
+// than one (an ambiguous route stays the loud reject — the checker cannot disambiguate
+// which arm a bare nested literal meant here). `emitUnionCoerce` routes an ArrayLit
+// carrier through this arm's OWN build (`pendingListKind = 1` + the arm's slot, the
+// same threading an annotated `T[][]` binding uses), so the inner lists build the
+// ARM's leaf — an `i64[][]` arm widens bare-int leaves at the store (`emitExprAsI64`),
+// a `string[][]` arm builds string inner lists — where the literal's SELF-classified
+// slot (`i32[][]`, or no ref classification at all for a string/f64-leaf literal)
+// either mismatched the arm (the old loud reject) or fell through toward the scalar
+// value-atom ladder (nested reject).
+export function unionNestedArrayArmSlot(name: string) {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let found = -1
+  let n = 0
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
+      const slot = rlSlotByName(refArrElemName(a))
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        const k = rlElemKindTbl[slot]
+        if k == 4 || k == 6 || k == 7 || k == 8 || k == 9 || k == 10 {
+          found = slot
+          n = n + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  if n == 1 { return found }
   -1
 }
 

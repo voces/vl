@@ -155,9 +155,10 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      fixpoint + corpus + rep-fuzz + the shadow sweep): (b2, REMAINING TAIL) typed-value
      maps in composition (R1) through `Map(val)` trees — the still-loud
      nested/nullable-value policy set (each stays rejected until its
-     rep is genuinely minted); (b3) 2-D arrays
-     (R4 — `List(List(_))` dissolves the special backing) + nullable-list-in-field /
-     struct-through-list (R5/R6, compositional once consumers read the tree); (b4) closure
+     rep is genuinely minted); (b3, REMAINING TAIL) nullable-list-in-field /
+     struct-through-list (R5/R6, compositional once consumers read the tree — the R4
+     2-D-array half SHIPPED: the family dissolved through the existing composed
+     machinery, → `CHANGELOG.md`); (b4) closure
      composite results via sig keys interned from `Closure(params, result)` nodes (R2);
      (b5) value-union composite members (R3b/R7 — the genuine ABI-policy cluster); then
      migrate `vtKindOfType`/the valtype ladders onto `repTreeVKind` and delete the flat

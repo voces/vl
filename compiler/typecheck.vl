@@ -7411,6 +7411,20 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // NESTED-LIST result (`() => i64[][] = () => ([[100]])`): a lambda whose body array
+        // literal is assignable to the expected nested scalar-leaf array adopts it, so the
+        // body literal builds under the pinned RETURN's threading (`synthRetAnnots` pins
+        // `fnRet`; the leaf widens at the store like a named function's return) and the
+        // `$fnsig` result keys the arm's reflist slot on BOTH producers. Unlike the 1-D
+        // scalar-list note below, the pinned `fnRet` TypeRef IS scanned by `collectA`'s
+        // ref-array branch (`ensureRefElem` + the leaf-pair forcing), so the call-result
+        // index finds its list types collected. (R4.)
+        if inferred != expRet && nestedLeafListRetName(expRet) != "" {
+          const nlTail = lambdaBodyTail(n.fnBody)
+          if nlTail >= 0 && assignableExpr(nlTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
         // (A SCALAR-ELEMENT LIST result — `(i32) => f32[] = (q0) => [97.5]` — is NOT adopted
         // here: the checker would accept it, but the emitter's list-type collection does not yet
         // register the f32[] list a `synthRetAnnots`-pinned lambda return introduces, so the
@@ -7581,6 +7595,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // loop REGISTERS the union and `synthRetAnnots`'s `isUName` arm pins the lambda's
         // `fnRet` to the same spelling `nodeUnionName` hands the emitter's binding resolution.
         if unm == "" { unm = refArmUnionRetName(inferred, gRootStmts) }
+        // A NESTED-LIST contextual return (`() => i64[][]`, adopted just above) — record its
+        // emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the nested array, whose
+        // return-position literal threading + `$fnsig` reflist-slot keying the annotated form
+        // already performs (the pinned TypeRef collects its own list types). (R4.)
+        if unm == "" { unm = nestedLeafListRetName(inferred) }
         // A LITERAL-UNION contextual return (`(i32) => K = (x) => "b"`, adopted just above) — record
         // the ALIAS name so `synthRetAnnots` pins the lambda's `fnRet` as the litunion, whose functype
         // result reps as an i32 atom (`vtKindOfType`): the `$fnsig` result keys `>i` to match the value
@@ -8603,6 +8622,43 @@ function elemValueUnionListRetName(er: i32) {
   if t is TyArray {
     const en = tyToEmitName(t.aElem)
     if en != "" && isValueUnionName(en) { return tyToEmitName(er) }
+  }
+  ""
+}
+
+// The emitter-format NAME of an inferred/contextual NESTED LIST return `er` with a
+// SCALAR/STRING LEAF — `i64[][]`, `f64[][]`, `string[][]`, `f32[][]`, or a deeper
+// recursion over those (`i64[][][]`): a `TyArray` whose element is itself a `TyArray`,
+// bottoming out at a scalar/string/boolean prim. Pinning a lambda's `fnRet` to this
+// (`synthRetAnnots`) makes the body literal build under the RETURN-position seed —
+// `() => ([[100]])` against `() => i64[][]` builds i64 INNER lists (the leaf widens at
+// the store), instead of the self-classified i32 default whose sig/wrapper diverge —
+// and the `$fnsig` result keys the SAME reflist slot the annotation side resolves. An
+// `i32[][]`/`boolean[][]` leaf is EXCLUDED: the self-classified build already agrees
+// with the annotation there (one i32[] backing), so no pin is needed — recording it
+// would only churn working programs. A struct/union/closure/map leaf is NOT this (the
+// R6/R3/R1 composition seams stay loud). "" otherwise.
+function nestedLeafListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const et = T.tys[t.aElem]
+    if et is TyArray {
+      if et.aElem < 0 { return "" }
+      const lt = T.tys[et.aElem]
+      if lt is TyPrim {
+        const pn = lt.primName
+        if pn == "i64" || pn == "f64" || pn == "f32" || pn == "string" {
+          return tyToEmitName(er)
+        }
+        return ""
+      }
+      if lt is TyArray {
+        // Deeper nesting: the leaf decides — recurse on the INNER array.
+        if nestedLeafListRetName(t.aElem) != "" { return tyToEmitName(er) }
+      }
+    }
   }
   ""
 }
