@@ -65,10 +65,14 @@ A valid program that compiled to bytes failing wasm validation / trapping, not a
 - **Nullable lists** ("bare null needs a struct-typed context"): `{f: i32[] | null}`,
   `{f: (i32 | null)[] | null}`. The known nullable-list-locals family — a nullable list has no rep in a
   struct field / binding. (See `vl-type-support-landscape` memory.)
-- **Struct inside list / nullable-list** ("field access receiver is not a struct"):
-  `({f: f64} | null)[]`, `{f: {f: f64}[]}`, `{f: {f: {f: i32}[]}}`. The field-access classifier loses the
-  struct through a list element or a nullable-list element.
 ## FIXED
+- **Struct inside list / nullable-list** ("field access receiver is not a struct"):
+  `({f: f64} | null)[]`, `{f: {f: f64}[]}`, `{f: {f: {f: i32}[]}}` — the R6 family. All three
+  round-trip on the composed machinery (the #833–835 structural-slot dedup: `structIndexOfExpr`'s
+  Index arm strips the element's `| null`, the ref-list slot layer resolves structurally) and are
+  corpus-pinned (`tests/cases/structs/struct-through-list-elem.vl`). The two live REMNANTS —
+  a shape-text union VARIANT's ref-list field and a closure-result shape's struct-element-list
+  field — are fixed at their collection seams (see the R6 slice entry in the matrix section).
 - **Same-field-name nested inline struct** (#668): `{f: {f: {f: i32}}}` failed while `{f: {g: {h: i32}}}`
   worked — the structural shape dedup (`annShapeIndexOf`) keyed each field on NAME + type CODE only, so a
   same-name recursion produced an identical `(f, code 15)` signature at every level and the outer shape
@@ -525,9 +529,43 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   reject genuinely dissolved), `union-element-nested-array.vl`,
   `tests/cases/closures/nested-array-closure-result.vl`. Still loud, correctly: a NON-literal
   cross-leaf union carrier (an `i32[][]` binding into an `i64[][]` arm — built leaves cannot
-  re-encode in place), ambiguous multi-nested-arm unions, struct-element-list closure-result
-  fields (R6), and the 1-D `(i32) => f32[]` closure-result family (R2 — deliberately
-  un-adopted until the closure sig/collection seam lands).
+  re-encode in place), ambiguous multi-nested-arm unions, and the 1-D `(i32) => f32[]`
+  closure-result family (R2 — deliberately un-adopted until the closure sig/collection seam
+  lands). (Struct-element-list closure-result fields are R6, since resolved — see the R6 entry.)
+- **R6 — struct-through-list: the three signature spellings verified green + pinned; the two live
+  remnants fixed at their COLLECTION seams (fuzz-neutral — 199 baselined, 0 new, 0 stale; both
+  remnants are hand-found, invisible at the CI seeds).**
+  - **Shape-text union VARIANT with a REF-LIST field** (`{a, f: {f: f64}[], z} | i32` inline, or a
+    declared alias `type U = {a, f: S[], z} | i32` — the `is`-narrowed field read): rejected
+    "ref-list field element type is not interned". Root, two halves: `shapeFieldElemName`'s code-5
+    arm keyed the element via `refArrElemName`, which cannot resolve a NAMED or INLINE-SHAPE element
+    while the struct/union tables are still empty (`collectU` registers shape-text variants before
+    `collectS` runs) — so even `S[]` recorded "" — and `collectA`'s variant field pass interned
+    code-15 targets and code-19 map values but never code-5 ref-list elements. Fix: the code-5 arm
+    records the STRIPPED ELEMENT TEXT as a deferred key (canonical for exactly the table-dependent
+    sorts; the pure-text sorts — paren-union / closure / map / scalar-2D — already resolved), and
+    the variant field pass gains the code-5 arm (the struct-field pass's twin): intern an
+    inline-SHAPE element first, force `rlUsed`/`raUsed`, `ensureRefElem` — so `variantFieldRefSlot`
+    (`rlSlotByName`) resolves at the type-section emit and the narrowed read chains into the
+    element struct. Frozen: `tests/cases/unions/variant-reflist-field.vl`.
+  - **Closure RESULT/PARAM shape with a struct-element list field** (`() => {f: {f: f64}[]}`,
+    `({p: {q: f64}[]}) => f64` — the R6 remnant the R4 slice-2 gate left loud): rejected
+    "ref valtype with no interned shape" (`funcTypeShapeLowerable` refused the shape, so the
+    closure result had no interned struct). Fix: admit a code-5 field whose element itself lowers
+    (`structElemArrayLowerable` — a declared plain struct name, NOT a union variant, or an inline
+    shape that recursively passes the gate), and pre-intern the inline element
+    (`internShapeFieldElems`, the functype twin of `collectNestedFieldShapes`' leaf strip) BEFORE
+    the shape interns, so the code-5 field records its element name and the `collectA` field pass
+    interns the slot. Union / nullable-struct / 2-D-struct elements stay un-admitted — loud
+    rejects, pinned by `tests/cases/closures/error-closure-result-union-elem-list-field.vl`.
+    Frozen: `tests/cases/closures/closure-result-struct-list-field.vl`.
+  - Pre-existing and OUT of scope (fails identically on master, separate seams): a union-ELEMENT
+    list in a variant field read back through `is` (`(S | string)[]` field — the narrowed string
+    element prints the box ref, INVALID-WASM at validation; a hand-found value-union box-read gap,
+    not a collection miss), the checker-side lambda-param inference through a variant field
+    (`{a, f: ((i32) => K0)[], z} | i32` — "cannot infer a type for parameter", the baselined R2
+    family), and index-place narrowing (`xs[0] != null` then `xs[0].f` — the checker narrows only
+    BINDINGS, both spellings of the family bind first).
 - **R5 — nullable lists of a NON-i32 leaf** (`K[]|null`, `i64[]|null`, `f64[]|null`, `f32[]|null`,
   `string[]|null`, in a binding/field/return): the LITUNION sub-case is RESOLVED; the distinct-backing
   scalar/ref leaves remain a deferred missing-rep.
