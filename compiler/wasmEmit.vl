@@ -509,6 +509,7 @@ import {
   structListPopGetElem,
   tyAnnRefListKind,
   tyAnnRefListSlot,
+  unionArmVariantForObj,
   unionClosureArmName,
   unionEqAtomOf,
   unionHasMapArmSlot,
@@ -1249,6 +1250,17 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
     } else if vcode == 27 {
       pendingListKind = 7
     }
+    // A NESTED-STRUCT variant field (code 15) seeds the TARGET struct so its literal
+    // builds that struct (not a field-shape guess) — the `emitObj` code-15 discipline.
+    // A MAP-typed variant field (code 19) seeds `pendingMapSlot` the same way, so a
+    // `Map()` field value constructs THIS field's value-typed map struct.
+    const savedVPSI = pendingStructIdx
+    if vcode == 15 {
+      pendingStructIdx = structIndexByName(variantFieldElemName(vi, fj))
+    }
+    if vcode == 19 {
+      pendingMapSlot = mvSlotOfValNameFind(variantFieldElemName(vi, fj))
+    }
     // A SCALAR f64/i64/f32 variant field widens its value at the construction boundary,
     // exactly as the plain struct-literal path does (`{f: i64} | i32` built from
     // `{f: 567}` must store an i64 — without the widen the box's variant struct got an
@@ -1296,11 +1308,32 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
     } else {
       if emitExpr(body, valIx, fnIx) < 0 { return -1 }
     }
+    if vcode == 15 { pendingStructIdx = savedVPSI }
+    if vcode == 19 {
+      pendingMapSlot = -1 // a non-`Map()` value never consumed it
+    }
     pendingListKind = 0
     fj = fj + 1
   }
   fbStructNew(uVarHeap[vi]) // 0xfb 0x00 <variant struct heap-type index>
   0
+}
+
+// Emit a field-STORE's RHS value with the scalar widening its field code demands —
+// f64 (17) / i64 (23) / f32 (24) re-encode at the boundary (pass-through for an
+// already-matching value), any other code emits plainly. The store-side twin of the
+// construct paths' widening (`emitObj` / `emitVariantStruct`); shared by all three
+// member-assignment branches (narrowed union, variant param, plain struct).
+function emitScalarFieldStoreVal(
+  body: i32[],
+  valIx: i32,
+  fnIx: i32,
+  code: i32,
+) {
+  if code == 17 { return emitExprAsF64(body, valIx, fnIx) }
+  if code == 23 { return emitExprAsI64(body, valIx, fnIx) }
+  if code == 24 { return emitExprAsF32(body, valIx, fnIx) }
+  emitExpr(body, valIx, fnIx)
 }
 
 // Lower an object literal `{ f: v, … }` BOXED into the declared union onto `body`:
@@ -1313,7 +1346,12 @@ function emitUnionBox(body: i32[], objIx: i32, fnIx: i32) {
   if vname == "" {
     return emitFail("emitProgram: object literal matches no union variant")
   }
-  const vi = variantIndexOf(vname)
+  emitUnionBoxAs(body, objIx, variantIndexOf(vname), fnIx)
+}
+
+// The body of `emitUnionBox` with the variant ALREADY RESOLVED — the union-context
+// pick (`unionArmVariantForObj`) enters here with its own `vi`.
+function emitUnionBoxAs(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
   // tag first (struct field 0 of the box), then the boxed payload (field 1).
   fbI32Const(uTags[vi]) // 0x41 i32.const <tag>
   if emitVariantStruct(body, objIx, vi, fnIx) < 0 { return -1 }
@@ -1959,6 +1997,13 @@ export function emitUnionCoerce(
   // This is what lets a MIXED union (`A | i32`) coerce either kind of member: an object
   // arm boxes as a variant struct, a scalar arm as a value box.
   if bare is ObjLit {
+    // The TARGET union's OWN arms are tried FIRST (`unionArmVariantForObj`): the global
+    // scan below picks the first field-name-set match across ALL unions, which can land
+    // on another union's arm sharing the names (two unions' nested-struct arms differing
+    // only in the nested layout collided onto the first arm's tag — a silent wrong-arm
+    // construct). A single-union program resolves the identical variant either way.
+    const ctxVi = unionArmVariantForObj(unionName, bareIx)
+    if ctxVi >= 0 { return emitUnionBoxAs(body, bareIx, ctxVi, fnIx) }
     // When the literal matches a union VARIANT, box it as that variant DIRECTLY rather than
     // routing through `emitExpr` — whose `structIndexOfObj` re-inference a field-name
     // COLLISION with an enclosing struct (an inner `{f:string}` arm boxed into a field of an
@@ -7316,7 +7361,20 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           if emitExpr(body, nm.memObj, fnIx) < 0 { return -1 }
           fbStructGet(uBoxIdx, 1)  // box field 1: value (anyref)
           fbRefCast(uVarHeap[nvi]) // ref.cast to the variant struct
-          if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
+          // A SCALAR f64/i64/f32 variant field widens its RHS at the store boundary,
+          // exactly as the construct does (`v.f = 9` into an i64 field emitted a raw
+          // `i32.const` — invalid wasm at `struct.set`).
+          if (
+            emitScalarFieldStoreVal(
+              body,
+              a.binRight,
+              fnIx,
+              variantFieldTypeAt(nvi, nfi),
+            ) <
+            0
+          ) {
+            return -1
+          }
           fbStructSet(uVarHeap[nvi], nfi)
           return 0
         }
@@ -7334,7 +7392,18 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
             )
           }
           if emitExpr(body, m1.memObj, fnIx) < 0 { return -1 }
-          if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
+          // Scalar-field RHS widening, as the narrowed branch above.
+          if (
+            emitScalarFieldStoreVal(
+              body,
+              a.binRight,
+              fnIx,
+              variantFieldTypeAt(pwvi, pwfi),
+            ) <
+            0
+          ) {
+            return -1
+          }
           fbStructSet(uVarHeap[pwvi], pwfi)
           return 0
         }
@@ -7411,6 +7480,14 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         const wlaCtx = expCtxHere()
         wlaCtx.litUnion = 1
         if emitExprExpect(body, a.binRight, fnIx, wlaCtx) < 0 { return -1 }
+      } else if fscode == 17 || fscode == 23 || fscode == 24 {
+        // A SCALAR f64/i64/f32 field widens its RHS at the store boundary, the exact
+        // treatment `emitObj` gives the construct (`p.g = 9` into an i64 field emitted
+        // a raw `i32.const` — invalid wasm at `struct.set`; pre-existing, flat AND
+        // nested spellings).
+        if emitScalarFieldStoreVal(body, a.binRight, fnIx, fscode) < 0 {
+          return -1
+        }
       } else {
         const fwCtx = expCtxHere()
         if fscode == 20 { fwCtx.nulString = true }

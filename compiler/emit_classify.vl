@@ -3858,6 +3858,52 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
         }
       }
     }
+    // NARROWING-BLIND last resort (the frame pre-pass): the receiver is an IDENT
+    // declared as a union whose STRUCT arm carries a code-16 field named `memProp` —
+    // probe both field tables across the arms, the `unionStructArmMapFieldMember`
+    // discipline. The pre-pass runs before any narrowing is active, so the probes
+    // above miss and a `const t1 = t0.f` binding's field union resolved "" — its map
+    // ops then indexed scratch locals past the frame (invalid wasm). At emit the
+    // narrowed probes above answer first, so this is strictly additive. GATED on the
+    // checker having typed the READ a union (a cheap arena test): an ordinary struct
+    // member read misses both probes above on every classifier query, and the
+    // ident-union resolution below (`parentLetOf` body walks) is too hot for that.
+    if !nodeTyIsUnion(memIx) { return "" }
+    const mObj = P.nodes[unwrapParen(m.memObj)]
+    if mObj is Ident {
+      const mun = unionNameOfIdent(mObj.identName, fnIx)
+      if mun != "" {
+        let mset = unionMemberSetOf(mun)
+        if mset == "" { mset = mun }
+        const mAtoms: string[] = []
+        splitUnionAtoms(mset, mAtoms)
+        let mi = 0
+        while mi < mAtoms.length {
+          const ma = mAtoms[mi]
+          if ma != "null" {
+            const msi = structIndexByName(ma)
+            if msi >= 0 {
+              const mfi = sFieldIndex(msi, m.memProp)
+              if mfi >= 0 {
+                if sFieldTypeAt(msi, mfi) == 16 {
+                  return sFieldElemNameAt(msi, mfi)
+                }
+              }
+            }
+            const mvi = variantIndexOf(ma)
+            if mvi >= 0 {
+              const mvfi = variantFieldIndex(mvi, m.memProp)
+              if mvfi >= 0 {
+                if variantFieldTypeAt(mvi, mvfi) == 16 {
+                  return variantFieldElemName(mvi, mvfi)
+                }
+              }
+            }
+          }
+          mi = mi + 1
+        }
+      }
+    }
   }
   ""
 }
@@ -3984,6 +4030,14 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
       // reserve `callRefSlot` conservatively so the narrowed emit's `call_ref` has its scratch
       // local (an unused reservation is a harmless spare local, never invalid wasm).
       if !isVal && calleeIsUnionClosureArrayIndex(n.callFn, fnIx) {
+        isVal = true
+      }
+      // `t0.f.f()` where `t0`'s union has a struct arm whose (possibly nested) field
+      // chain ends in a CLOSURE field: the `is`-narrowing that resolves the chain is
+      // not active in this pre-pass — reserve conservatively (a spare local is
+      // harmless; an unreserved `call_ref` spill shares the next frame's local —
+      // invalid wasm).
+      if !isVal && calleeIsUnionArmClosureMember(n.callFn, fnIx) {
         isVal = true
       }
     }
@@ -5912,10 +5966,47 @@ function mvValNamesCompat(va: string, ve: string): boolean {
 // slot's recorded `elem` name) — the code alone is value-blind.
 function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
   const want = nameFieldCode(t)
-  if want < 0 || code < 0 { return true }
+  if want < 0 || code < 0 {
+    // A NESTED-STRUCT candidate field (code 15) whose spelled type `nameFieldCode`
+    // cannot classify is (almost always) an INLINE nested shape — tighten by the
+    // canonical structural key so two unions' arms sharing a field-name set but
+    // differing in the nested layout (`{f: {f: f32}} | X` vs `{f: {f: i64}} | Y` in
+    // one program) do not collide onto the first arm's variant (invalid wasm at the
+    // construct — the code-19 lesson applied to code 15). PROVEN mismatches only:
+    // either side unresolvable through the checker stays lenient.
+    if code == 15 && elem != "" {
+      let tb = t
+      const tnb = nullablePartOf(tb)
+      if tnb != "" { tb = tnb }
+      return nestedStructNamesCompat(tb, elem)
+    }
+    return true
+  }
   if want != code { return false }
   if want == 19 && elem != "" { return mvValNamesCompat(mapValNameOf(t), elem) }
+  if want == 15 && elem != "" {
+    // A DECLARED-name nested-struct field (`inner: Inner`) against the variant's
+    // recorded target: the same canonical-key tightening as the inline spelling.
+    let tb15 = t
+    const tnb15 = nullablePartOf(tb15)
+    if tnb15 != "" { tb15 = tnb15 }
+    return nestedStructNamesCompat(tb15, elem)
+  }
   true
+}
+
+// True unless the two nested-struct TYPE spellings `ta` / `elem` are PROVEN to denote
+// distinct structures: both resolve through the checker's canonical structural key
+// (`repNameCanonKey`, the variant/map slot-layer vocabulary) and the keys differ.
+// Either side unresolvable ("" key) stays lenient — never a false reject of a twin
+// the canon layer does not cover.
+function nestedStructNamesCompat(ta: string, elem: string): boolean {
+  if ta == elem { return true }
+  const ka = repNameCanonKey(ta)
+  if ka == "" { return true }
+  const ke = repNameCanonKey(elem)
+  if ke == "" { return true }
+  ka == ke
 }
 
 function variantIndexOfTypeName(name: string) {
@@ -8119,6 +8210,60 @@ function funcTypeShapeLowerable(nm: string): boolean {
   okAll && fieldCount > 0
 }
 
+// Whether the inline shape text `nm` (`{f: f32}`, `{a: i64, f: i64, z: boolean}`) will
+// intern cleanly as a NESTED struct at the `collectA` phase — the PURE (intern-free)
+// mirror of `internInlineShape`'s acceptance, usable during `collectU` (the struct
+// table does not exist yet; `collectS`'s reset would wipe anything interned there).
+// A field `nameFieldCode` can classify is accepted as-is; an unclassifiable field
+// recurses into its own (`|null`-stripped) nested shape, exactly as the interner
+// does. Acceptance here OBLIGATES the `collectA` variant-field pass to intern `nm`
+// (idempotent), and is monotone-safe: union registration only grows between the two
+// phases, so a field code can only improve from -1 — never the reverse.
+export function variantNestedShapeOk(nm: string): boolean {
+  if nm.length < 2 || nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' {
+    return false
+  }
+  const inner = nm.slice(1, nm.length - 1)
+  let depth = 0
+  let start = 0
+  let k = 0
+  let okAll = true
+  let fieldCount = 0
+  while k <= inner.length {
+    const atEnd = k == inner.length
+    let brk = false
+    if !atEnd {
+      const ch = inner[k]
+      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
+      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
+      if ch == ',' && depth == 0 { brk = true }
+    } else {
+      brk = true
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci <= 0 {
+        okAll = false
+      } else {
+        const ftxt = part.slice(ci + 1, part.length)
+        if nameFieldCode(ftxt) < 0 {
+          // A nested inline-shape field (`g: {h: i32}` / `g: {h: i32} | null`):
+          // lowerable only if ITS shape is.
+          let base = ftxt
+          const nb = nullablePartOf(base)
+          if nb != "" { base = nb }
+          if !variantNestedShapeOk(base) { okAll = false }
+        }
+        fieldCount = fieldCount + 1
+      }
+      start = k + 1
+    }
+    k = k + 1
+  }
+  okAll && fieldCount > 0
+}
+
 // Intern the PLAINLY-LOWERABLE inline shapes buried in the params / result of a
 // function-type name `nm` (`(i32)=>{f:i32}`, `({a:i32})=>{b:i32}`), peeling the
 // grouping / nullable / array / nested-functype wrappers around each position. Only
@@ -9211,6 +9356,95 @@ export function calleeIsUnionClosureIdent(exprIx: i32, fnIx: i32) {
   false
 }
 
+// True if `exprIx` is a member CHAIN (`t0.f.f`) rooted at an IDENT declared as a union,
+// whose field path walks — NARROWING-BLINDLY through the arms' field tables (struct AND
+// variant), across code-15 nested-struct hops — to a CLOSURE field (code 14, or the
+// nullable-closure niche 22). The member-chain callee shape `blockHasCallRef` reserves
+// `callRefSlot` for: the `is`-narrowing that makes the root a struct arm is not active
+// during the frame pre-pass, so `exprIsClosure` misses the chain and the narrowed
+// `call_ref`'s closure spill landed on an UNRESERVED index — shared with the next frame
+// (the mv map frame in the observed case), a type-mismatched local (invalid wasm). An
+// over-reservation is a harmless spare local.
+export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
+  if !uDeclared {
+    return false // no unions declared — nothing to probe (cheap bail)
+  }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Member {
+    // Collect the field chain root-first: `t0.f.g` → root `t0`, props [f, g].
+    const props: string[] = []
+    let cur = unwrapParen(exprIx)
+    let rootName = ""
+    let guard = 0
+    while guard < 32 {
+      guard = guard + 1
+      const cn = P.nodes[cur]
+      if cn is Member {
+        props.push(cn.memProp)
+        cur = unwrapParen(cn.memObj)
+      } else if cn is Ident {
+        rootName = cn.identName
+        break
+      } else {
+        return false
+      }
+    }
+    if rootName == "" || props.length == 0 { return false }
+    // props collected leaf-first — reverse into walk order.
+    const path: string[] = []
+    let pr = props.length - 1
+    while pr >= 0 {
+      path.push(props[pr])
+      pr = pr - 1
+    }
+    const un = unionNameOfIdent(rootName, fnIx)
+    if un == "" { return false }
+    let uset = unionMemberSetOf(un)
+    if uset == "" { uset = un }
+    const atoms: string[] = []
+    splitUnionAtoms(uset, atoms)
+    let ai = 0
+    while ai < atoms.length {
+      if atoms[ai] != "null" {
+        if unionArmPathIsClosure(atoms[ai], path) { return true }
+      }
+      ai = ai + 1
+    }
+  }
+  false
+}
+
+// Walk field path `path` from union arm `arm`: the FIRST hop resolves through the arm's
+// struct-table OR variant-table row, every MID hop must be a code-15 nested-struct field
+// (following its target), and the LAST hop is a closure field (code 14 / 22).
+function unionArmPathIsClosure(arm: string, path: string[]): boolean {
+  // (code, elem) of the first hop, from whichever table holds the arm.
+  let hop = 0
+  let curSi = structIndexByName(arm)
+  const vi0 = variantIndexOf(arm)
+  while hop < path.length {
+    let code = -1
+    let elem = ""
+    if hop == 0 && curSi < 0 && vi0 >= 0 {
+      const vfi = variantFieldIndex(vi0, path[0])
+      if vfi < 0 { return false }
+      code = variantFieldTypeAt(vi0, vfi)
+      elem = variantFieldElemName(vi0, vfi)
+    } else {
+      if curSi < 0 { return false }
+      const fi = sFieldIndex(curSi, path[hop])
+      if fi < 0 { return false }
+      code = sFieldTypeAt(curSi, fi)
+      elem = sFieldElemNameAt(curSi, fi)
+    }
+    if hop == path.length - 1 { return code == 14 || code == 22 }
+    if code != 15 { return false }
+    curSi = structIndexByName(elem)
+    hop = hop + 1
+  }
+  false
+}
+
 // True if the union member-set `name` (pipe-joined atoms) has a REF-ELEMENT array arm whose
 // interned reflist slot is `slot` — the guard `emitUnionCoerce` uses to confirm a ref-array
 // carrier actually matches an arm before boxing it with that arm's `refArrSlotTag`. A ref-array
@@ -10020,6 +10254,33 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
           return structIndexByName(sFieldElemNameAt(msi, mfi))
         }
       }
+      return -1
+    }
+    // A NARROWED union member (`t0.f` after `is {f: {f: f32}}`) and a VARIANT-typed
+    // receiver resolve through the VARIANT field tables — the code-15 twin of
+    // `mapShapeOfExpr`'s Member dispatch (without it the struct-table miss returned -1
+    // and the nested read had no layout). AFTER the struct probe, and only on its
+    // receiver MISS: the struct path answers every plain receiver without paying the
+    // narrow-key/variant resolution (`memIsNarrowed` builds a path-key string — hot).
+    if memIsNarrowed(exprIx) {
+      const nvi = memNarrowVariantIndex(exprIx)
+      if nvi >= 0 {
+        const nvfi = variantFieldIndex(nvi, e.memProp)
+        if nvfi >= 0 {
+          if variantFieldTypeAt(nvi, nvfi) == 15 {
+            return structIndexByName(variantFieldElemName(nvi, nvfi))
+          }
+        }
+      }
+    }
+    const pvi = exprVariantIndex(e.memObj, fnIx)
+    if pvi >= 0 {
+      const pvfi = variantFieldIndex(pvi, e.memProp)
+      if pvfi >= 0 {
+        if variantFieldTypeAt(pvi, pvfi) == 15 {
+          return structIndexByName(variantFieldElemName(pvi, pvfi))
+        }
+      }
     }
   }
   -1
@@ -10603,6 +10864,36 @@ function objMapFieldCompat(objIx: i32, fname: string, elem: string): boolean {
   mvValNamesCompat(nodeTyMapValName(valIx), elem)
 }
 
+// The nested-struct compat of an object literal's field VALUE against a candidate
+// variant's code-15 field: a nested LITERAL value's field-NAME set must equal the
+// recorded target struct's (`elem`) — the code-15 twin of `objMapFieldCompat`.
+// NAME-set only, deliberately: the checker records the literal's INFERRED leaf types
+// (`{f: 663810583}` reads i32 where the arm declares i64), so a canonical-key compare
+// here false-rejects every widening construct. A non-literal value stays lenient (its
+// type already checked at the boundary; a wrong one fails loudly downstream).
+function objNestedFieldCompat(
+  objIx: i32,
+  fname: string,
+  elem: string,
+): boolean {
+  const valIx = objFieldVal(objIx, fname)
+  if valIx < 0 { return true }
+  const v = P.nodes[unwrapParen(valIx)]
+  if v is ObjLit {
+    const si = structIndexByName(elem)
+    if si < 0 { return true }
+    if v.objFields.length != sFieldCount[si] { return false }
+    let fi = 0
+    while fi < sFieldCount[si] {
+      if objFieldVal(valIx, sFieldNames[sFieldStart[si] + fi]) < 0 {
+        return false
+      }
+      fi = fi + 1
+    }
+  }
+  true
+}
+
 // The variant struct name an object literal at `objIx` matches: the union variant
 // whose field-name set EQUALS the literal's field names (order-independent), or "" if
 // none. Used to pick the tag + variant struct when boxing an object literal into the
@@ -10616,33 +10907,81 @@ export function objVariantName(objIx: i32) {
   if o is ObjLit {
     let vi = 0
     while vi < uVariants.length {
-      const cnt = uFieldCount[vi]
-      if cnt == o.objFields.length {
-        const start = uFieldStart[vi]
-        let allMatch = true
-        let fj = 0
-        while fj < cnt {
-          if objFieldVal(objIx, uFieldNames[start + fj]) < 0 {
-            allMatch = false
-          } else if uFieldTypes[start + fj] == 19 {
-            if (
-              !objMapFieldCompat(
-                objIx,
-                uFieldNames[start + fj],
-                uFieldElemName[start + fj],
-              )
-            ) {
-              allMatch = false
-            }
-          }
-          fj = fj + 1
-        }
-        if allMatch { return uVariants[vi] }
-      }
+      if objMatchesVariantIdx(objIx, vi) { return uVariants[vi] }
       vi = vi + 1
     }
   }
   ""
+}
+
+// Whether the object literal at `objIx` matches variant `vi`: the field-name set
+// EQUALS the variant's (order-independent), tightened per field by the value rep — a
+// map field (code 19) by `objMapFieldCompat`, a nested-struct field (code 15) by
+// `objNestedFieldCompat`. The one matcher behind `objVariantName` (global scan) and
+// `unionArmVariantForObj` (union-context scan), so the two resolutions never diverge.
+function objMatchesVariantIdx(objIx: i32, vi: i32): boolean {
+  const o = P.nodes[objIx]
+  if o is ObjLit {
+    const cnt = uFieldCount[vi]
+    if cnt != o.objFields.length { return false }
+    const start = uFieldStart[vi]
+    let allMatch = true
+    let fj = 0
+    while fj < cnt {
+      if objFieldVal(objIx, uFieldNames[start + fj]) < 0 {
+        allMatch = false
+      } else if uFieldTypes[start + fj] == 19 {
+        if (
+          !objMapFieldCompat(
+            objIx,
+            uFieldNames[start + fj],
+            uFieldElemName[start + fj],
+          )
+        ) {
+          allMatch = false
+        }
+      } else if uFieldTypes[start + fj] == 15 {
+        // A NESTED-STRUCT candidate field (code 15) is tightened by its target's
+        // field-name set, exactly as a map field is by its value rep.
+        if (
+          !objNestedFieldCompat(
+            objIx,
+            uFieldNames[start + fj],
+            uFieldElemName[start + fj],
+          )
+        ) {
+          allMatch = false
+        }
+      }
+      fj = fj + 1
+    }
+    return allMatch
+  }
+  false
+}
+
+// The VARIANT table index of the arm OF THE UNION whose registered member set is
+// `unionSet` (pipe-joined) that the object literal at `objIx` matches, or -1. The
+// union-CONTEXT-restricted `objVariantName`: `emitUnionCoerce` KNOWS its target
+// union, so the literal must match one of ITS arms — the global scan's first
+// name-set match can land on ANOTHER union's arm sharing the field names (two
+// unions' nested-struct arms differing only in a nested layout collided onto the
+// first arm's tag — a silent wrong-arm construct). Falls back to -1 (caller keeps
+// the global scan) when the set is not a registered union.
+export function unionArmVariantForObj(unionSet: string, objIx: i32): i32 {
+  let u = 0
+  while u < unNames.length {
+    if unNames[u] == unionSet || unMemberSet[u] == unionSet {
+      let vi = unVarStart[u]
+      while vi < unVarStart[u] + unVarCount[u] {
+        if objMatchesVariantIdx(objIx, vi) { return vi }
+        vi = vi + 1
+      }
+      return -1
+    }
+    u = u + 1
+  }
+  -1
 }
 
 // ── array-typedness of expressions ───────────────────────────────────────────

@@ -117,11 +117,26 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      tags with the arm's slot tag) and the frame pre-pass reserves the map scratch
      narrowing-blind for the `t[i][k]` read shape. Baseline 255 → 249 (6 graduations,
      1 pinned test).
+     Stage B WAVE 2 slice 3 SHIPPED (→ `CHANGELOG.md`): the R1 union-variant FIELD kinds
+     (the "only iN/boolean/string/array union-variant fields" bucket) — nested-struct
+     fields (code 15) accepted on the inline-shape variant path (`variantNestedShapeOk`,
+     the pure `internInlineShape` mirror; `collectA` interns the deferred target), field
+     UNIONS of union-arm shapes pre-registered (`registerVariantArmFieldUnions`, before
+     the outer union's rows so slices never interleave), the construct seeds
+     `pendingStructIdx`/`pendingMapSlot` (the `emitObj` discipline) with the target
+     union's OWN arms picked first (`unionArmVariantForObj` — the cross-union name-set
+     collision), `structIndexOfExpr`/`memberUnionFieldName` resolve narrowed/variant
+     receivers (the latter narrowing-BLIND for the frame pre-pass, `nodeTyIsUnion`-gated),
+     `callRefSlot` reserves for member-chain closure callees
+     (`calleeIsUnionArmClosureMember`), and the member-STORE scalar widening
+     (`emitScalarFieldStoreVal` — the pre-existing `p.g = 9` i64-field invalid-wasm, flat
+     and nested). Baseline 249 → 221 (28 graduations, 4 pinned tests).
      STAGE B remaining charter (consumer migration, family-by-family, each PR gated by
      fixpoint + corpus + rep-fuzz + the shadow sweep): (b2, REMAINING TAIL) typed-value
      maps in composition (R1) through `Map(val)` trees — map-through-closure-result in
-     union arms, map-member-union / nested-struct union-variant FIELDS (the
-     "only iN/boolean/string/array union-variant fields" bucket), and the still-loud
+     union arms (the collect-scan closure-RESULT map forcing; the union-arm sig side
+     already keys), the nulclosure-sig family (`(() => f64) | null` et al. — a null-only
+     caller's narrowed call finds no interned sig), and the still-loud
      nested/nullable-value policy set (each stays rejected until its rep is genuinely
      minted); (b3) 2-D arrays
      (R4 — `List(List(_))` dissolves the special backing) + nullable-list-in-field /
