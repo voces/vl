@@ -136,12 +136,25 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      interns the value slot from a union arm's / nullable-closure's / curried closure
      RESULT, the R2×R1 combo; a value-union result stays deliberately un-forced/loud).
      Baseline 221 → 220 (1 graduation, 1 pinned test).
+     Stage B WAVE 2 slice 3c SHIPPED (→ `CHANGELOG.md`): the nulclosure-sig R2 family
+     (`collectCloSigs` interns the inner closure key from every nulclosure annotation
+     TypeRef; `collectFnValUse` flips the machinery for kind 19 — a null-only caller's
+     narrowed call now finds its sig) + repOf item (d), the closure-value-call ref-arm
+     union-result narrow (`refArmUnionRetName`: adopt + record + pin + `nodeUnionName`
+     resolve — one renderer, producer and consumer agree). Baseline 220 → 213
+     (7 graduations, 2 pinned tests). Residuals stay loud: list/curried/value-union
+     nulclosure RESULTS (collection/sig seams still unminted), the no-lambda decoy-only
+     ref-arm union spelling, and the anonymous-element ref-arm unions behind the #911
+     declared-twin gate — widening the gate was ATTEMPTED and REVERTED: the structural
+     producer pin turns the construct-only fuzz line
+     (`p2c ((i32) => {f: boolean}[] | {w: i32}) | f64`) PASS → REJECT because
+     `emitReturnValue`'s union-arm matcher cannot box an anonymous-element reflist arm
+     ("array value does not match any array member"), so the gate holds until that
+     boxing seam lands.
      STAGE B remaining charter (consumer migration, family-by-family, each PR gated by
      fixpoint + corpus + rep-fuzz + the shadow sweep): (b2, REMAINING TAIL) typed-value
-     maps in composition (R1) through `Map(val)` trees — the nulclosure-sig family
-     (`(() => f64) | null` et al. — a null-only caller's narrowed call finds no
-     interned sig, incl. the map-result spelling `((i32) => {[string]: f64}) | null`),
-     and the still-loud nested/nullable-value policy set (each stays rejected until its
+     maps in composition (R1) through `Map(val)` trees — the still-loud
+     nested/nullable-value policy set (each stays rejected until its
      rep is genuinely minted); (b3) 2-D arrays
      (R4 — `List(List(_))` dissolves the special backing) + nullable-list-in-field /
      struct-through-list (R5/R6, compositional once consumers read the tree); (b4) closure
@@ -150,11 +163,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      migrate `vtKindOfType`/the valtype ladders onto `repTreeVKind` and delete the flat
      `RepDesc` when its last consumer moves.
      REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,
-     litunion/union-element arrays — subsumed by Stage B above); (d) the closure-value-call
-     union-result narrow: a `t is T[]` arm over a binding INFERRED from a closure-value call
-     mis-lowers the narrowed read (the `unionNameOfIdent` gate misses, the raw box leaks —
-     invalid wasm nominal, a TRAP annotated; pre-existing, fuzz-shielded by the declared-twin
-     gate on the shape bridge); (e) the variant⇄struct-table seam: a DECLARED struct twin
+     litunion/union-element arrays — subsumed by Stage B above); (e) the variant⇄struct-table seam: a DECLARED struct twin
      flowing into a variant-arm position (`pickU(k: Kot)` where `U = Cat | Dog`, `Kot`≅`Cat`)
      still fails validation — the box/`is` resolution is nominal (`variantIndexOf`) and
      `uVarHeap`/`sHeapIdx` do not dedup across the two tables — and an inline-shape union arm
