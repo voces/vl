@@ -517,6 +517,7 @@ import {
   unionMemberSetOf,
   unionNameOfExpr,
   unionNameOfIdent,
+  unionNestedArrayArmSlot,
   unionRefArrayArmSlotForElem,
   unionRefArrayArmSlotForMapElem,
   variantFieldElemName,
@@ -1964,6 +1965,43 @@ function emitUnionListLitViaRefArm(
   0
 }
 
+// Route an ARRAY-LITERAL union carrier into the union's single NESTED-ARRAY arm
+// (`string[][] | string`, `i64[][] | boolean | null` — `unionNestedArrayArmSlot`):
+// tag with the arm's slot and build the literal with the arm's ref-list slot
+// THREADED (`pendingListKind = 1` + slot — the same authoritative threading an
+// annotated `T[][]` binding uses), so each inner list builds the ARM's leaf: an
+// `i64[][]` arm widens bare-int leaves at the store (`[[50183]]` — the old
+// "leaf-scalar widening across a nested array is unsupported" reject), a
+// `string[][]` arm builds string inner lists (`[["ab"]]` — invisible to
+// `exprRefArray`, so the ref-array carrier path missed it and the literal fell
+// toward the scalar value-atom ladder's nested-array reject). Returns 1 when
+// routed, 0 when the union has no unambiguous nested-array arm (the caller keeps
+// its loud reject), -1 on a nested emit failure.
+function emitUnionNestedListLit(
+  body: i32[],
+  unionName: string,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  const bare = P.nodes[unwrapParen(exprIx)]
+  if bare is ArrayLit {
+    const armSlot = unionNestedArrayArmSlot(unionName)
+    if armSlot < 0 { return 0 }
+    fbI32Const(refArrSlotTag(armSlot))
+    const savedK = pendingListKind
+    const savedS = pendingListSlot
+    pendingListKind = 1
+    pendingListSlot = armSlot
+    const rc = emitExpr(body, exprIx, fnIx)
+    pendingListKind = savedK
+    pendingListSlot = savedS
+    if rc < 0 { return -1 }
+    fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
+    return 1
+  }
+  0
+}
+
 export function emitUnionCoerce(
   body: i32[],
   unionNameIn: string,
@@ -2060,10 +2098,17 @@ export function emitUnionCoerce(
     const viaArm = emitUnionListLitViaRefArm(body, unionName, exprIx, fnIx)
     if viaArm < 0 { return -1 }
     if viaArm == 1 { return 0 }
+    // A ref-array LITERAL whose interned slot matches no arm but whose union has ONE
+    // nested-array arm (`[[50183]]` self-classified `i32[][]` into `i64[][] | boolean |
+    // null`): rebuild it through the ARM's slot — the arm's inner-list build widens the
+    // bare-int leaves at the store (`emitExprAsI64`), so no in-place re-encode is needed.
+    const viaNest = emitUnionNestedListLit(body, unionName, exprIx, fnIx)
+    if viaNest < 0 { return -1 }
+    if viaNest == 1 { return 0 }
     // A ref-element array carrier whose interned slot matches NO ref-array arm of the union —
-    // e.g. a nested int-array literal `[[50183]]` (inferred `i32[][]`, element slot `i32[]`) flowing
-    // into an `i64[][] | …` arm (element slot `i64[]`): the leaf scalar would have to WIDEN, which the
-    // nested-list constructor cannot thread here. Falling through would mis-box the wrapper ref through
+    // a nested-literal case lands on the nested-arm route above; what remains is a non-literal
+    // carrier (a `i32[][]` BINDING into an `i64[][] | …` arm — its built leaves cannot re-encode
+    // in place) or an ambiguous/absent arm. Falling through would mis-box the wrapper ref through
     // the scalar value-atom ladder below (`struct.new` a scalar box on a ref → "expected i32, found
     // (ref $type)", invalid wasm). A ref array can only ride the box as a wrapper ref, so with no arm to
     // carry it there is no sound rep — fail loudly rather than emit the bad box.
@@ -2104,6 +2149,19 @@ export function emitUnionCoerce(
       return emitFail(
         "emitProgram: a union arm that is an array-of-map is not yet supported — use a named element type",
       )
+    }
+    // A NESTED array literal whose leaf does NOT self-classify as a ref array
+    // (`[["ab"]]` — a string-leaf inner makes `arrLitIsRef` false, so the
+    // `exprRefArray` carrier path above missed it entirely) flowing into a union
+    // with one nested-array arm (`string[][] | string`): route through the arm's
+    // build, exactly like the self-classified mismatch case.
+    if bare.arrElems.length >= 1 {
+      const bareE0 = P.nodes[bare.arrElems[0]]
+      if bareE0 is ArrayLit {
+        const viaNest2 = emitUnionNestedListLit(body, unionName, exprIx, fnIx)
+        if viaNest2 < 0 { return -1 }
+        if viaNest2 == 1 { return 0 }
+      }
     }
   }
   // A bare CLOSURE carrier (`() => i64`, a lambda literal or a closure-typed binding) flowing into
@@ -3225,14 +3283,18 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       }
       while i < elems.length {
         // A NON-nested-list element list must not hold array elements. Kinds 4/6/7/8 (scalar inner
-        // lists) and 9 (ref inner list) legitimately do.
+        // lists) and 9 (ref inner list) legitimately do — and so does a UNION-BOX element whose
+        // union has a LIST arm (`(i32[] | f64)[]` with a `[1, 2]` element): the array value boxes
+        // through `emitUnionBoxArg` → `emitUnionCoerce` below, which carries its own loud rejects
+        // for a list the union cannot box.
         if (
           elemNest != 4 &&
           elemNest != 6 &&
           elemNest != 7 &&
           elemNest != 8 &&
           elemNest != 9 &&
-          elemNest != 10
+          elemNest != 10 &&
+          elemUnionNm == ""
         ) {
           if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
             return emitFail("emitProgram: nested arrays are not supported")
@@ -3243,9 +3305,18 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
         if elemUnionNm != "" {
           // Box the element into the shared union box — a concrete VARIANT element
           // (`[s]` where `s: S`) widens via `emitUnionBoxArg`, like a call arg / return.
-          if emitUnionBoxArg(body, elemUnionNm, elems[i], fnIx) < 0 {
-            return -1
-          }
+          // The OUTER literal's list threading (`pendingListKind == 2` + this slot) is
+          // cleared around the box: a LIST-arm element (`[1, 2]` of a `(i32[] | f64)[]`)
+          // re-enters `emitArr` inside the coerce, and the stale outer kind would force
+          // it back onto THIS slot's ref build instead of its own value-atom list build.
+          const savedElemK = pendingListKind
+          const savedElemS = pendingListSlot
+          pendingListKind = 0
+          pendingListSlot = 0
+          const ubRc = emitUnionBoxArg(body, elemUnionNm, elems[i], fnIx)
+          pendingListKind = savedElemK
+          pendingListSlot = savedElemS
+          if ubRc < 0 { return -1 }
         } else {
           // Reset the `listKind`/`listSlot` context to the INNER list's kind so the element
           // builds the right list, NOT the outer ref-list kind it would inherit. Scalar inner
