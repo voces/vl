@@ -500,6 +500,34 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   literal-union VALUE returned from a function directly into `print`/another call arg
   (`print(pick(ks))` where `pick(p: K[]): K` — 1-D too), invalid wasm; index the result first
   (`print(mk()[0][0])`) and it lowers.
+- **R4 — CLOSED (the family dissolved through the composed machinery, as the audit predicted;
+  baseline 220 → 206 across two slices, no new backing minted).** Slice 1: the bare-machinery
+  OUTER `.push`/row-assign of a 2-D array emitted the pushed inner-list literal with no
+  inner-kind context (`i64[][].push([300])` built the i32 default into the i64 backing —
+  INVALID-WASM, unbaselined: the fuzzer never pushes) — `refElemValueCtx` threads the receiver's
+  inner kind at both sites, and the ref-push value scratch follows `rlElemNullable` generally;
+  nullable DISTINCT-BACKING inner lists (`(f64[] | null)[]` … + the 2-D `(f64[] | null)[][]`,
+  p0c/p0r) fold onto the kind-4 niche pattern over the leaf wrapper singletons (inner kinds
+  6/7/8/10 admitted by `nullArrayArrElem`/`rlElemNicheNullable`; the read binds as the R5
+  `nulf64list`-family kinds). Slice 2: an ArrayLit union carrier routes through the union's
+  SINGLE nested-array arm (`unionNestedArrayArmSlot` — `i64[][] | boolean | null` widens its
+  bare-int leaves at the arm's store, `string[][] | string` catches the literal `exprRefArray`
+  never sees; p1c/p1r + p3c/p3r); the union-BOX element loop admits an array VALUE when the
+  element union has an arm to box into (`(i32[] | f64)[][]` p2c/p2r, plus the map-value /
+  struct-field spellings `{[string]: (f64[] | i32)[]}` / `{a: i32, f: (i32[] | boolean)[],
+  z: f32}`); `funcTypeShapeLowerable` accepts nested-scalar-leaf code-5 fields (`(i32) =>
+  {f: boolean[][]}` p2c/p2r); and a SELF-classified nested literal keys its element by its
+  LEAF (`arrLitElemKind` 6/7/8) + the checker adopts/pins a contextual nested-list lambda
+  return — fixing the `() => i64[][]` INVALID-WASM landmine (off-CI seed 314159, wide-i64
+  leaf: the literal keyed `i32[]` while its inner built the i64 wrapper). Frozen:
+  `tests/cases/arrays/nested-array-outer-push-assign.vl`, `nullable-scalar-list-element.vl`,
+  `tests/cases/unions/nested-array-union-arm.vl` (replaces the `@emit-error` widen test — that
+  reject genuinely dissolved), `union-element-nested-array.vl`,
+  `tests/cases/closures/nested-array-closure-result.vl`. Still loud, correctly: a NON-literal
+  cross-leaf union carrier (an `i32[][]` binding into an `i64[][]` arm — built leaves cannot
+  re-encode in place), ambiguous multi-nested-arm unions, struct-element-list closure-result
+  fields (R6), and the 1-D `(i32) => f32[]` closure-result family (R2 — deliberately
+  un-adopted until the closure sig/collection seam lands).
 - **R5 — nullable lists of a NON-i32 leaf** (`K[]|null`, `i64[]|null`, `f64[]|null`, `f32[]|null`,
   `string[]|null`, in a binding/field/return): the LITUNION sub-case is RESOLVED; the distinct-backing
   scalar/ref leaves remain a deferred missing-rep.
