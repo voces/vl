@@ -8221,14 +8221,35 @@ export function nameIsNestedScalarLeafArray(nm: string): boolean {
   false
 }
 
+// True if `t` is a STRUCT-element array (`S[]`, `{g: f64}[]`) whose element itself
+// lowers as a closure-result field: a declared plain struct name (NOT a union
+// variant — its list rides the variant machinery), or an inline shape that
+// recursively passes `funcTypeShapeLowerable`. The struct-through-list closure-result
+// admission (R6): the element interns like any struct-field element (the code-5
+// `ensureRefElem` pass), so the field is a plain ref-list slot. A union / map /
+// closure / nullable element stays un-admitted (their reps carry the R1/R3/R5 seams).
+function structElemArrayLowerable(t: string): boolean {
+  if t.length < 3 || t[t.length - 2] != '[' || t[t.length - 1] != ']' {
+    return false
+  }
+  const base = t.slice(0, t.length - 2)
+  if base.length >= 2 && base[0] == '{' && base[1] != '[' {
+    return funcTypeShapeLowerable(base)
+  }
+  nameIsStructDecl(base) && variantIndexOf(base) < 0
+}
+
 // Whether inline shape `nm` (`{f:i32,g:{h:i32}}`) lowers as a closure result/param
 // with NO unsupported composite field, recursing through nested inline shapes (and
-// their `| null`). A map / value-union / nullable-list / struct-element-list / closure
-// field makes it un-lowerable — those reps are R1/R3/R5/R6, out of THIS slice, and the
-// closure must stay a CLEAN reject (never invalid wasm), so the shape is not interned.
+// their `| null`). A map / value-union / nullable-list / closure field makes it
+// un-lowerable — those reps are R1/R3/R5, out of THIS slice, and the closure must
+// stay a CLEAN reject (never invalid wasm), so the shape is not interned.
 // A NESTED-array field with a scalar/string leaf (`{f: boolean[][]}` — code 5, but its
 // element is a leaf LIST, no struct-through-list seam) IS lowerable: the field is a
 // plain ref-list slot the field pass interns like any binding's (the R4 dissolution).
+// A STRUCT-element list field (`{f: {g: f64}[]}` / `{f: S[]}`) is likewise lowerable
+// when its element is (`structElemArrayLowerable`) — the element shape pre-interns in
+// `internFuncTypeShapes` and the slot rides the same code-5 field pass.
 function funcTypeShapeLowerable(nm: string): boolean {
   if nm.length < 2 || nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' {
     return false
@@ -8267,9 +8288,17 @@ function funcTypeShapeLowerable(nm: string): boolean {
           if !funcTypeShapeLowerable(base) { okAll = false }
         } else if !funcTypeFieldCodeSafe(fc) {
           // A code-5 field whose type is a nested SCALAR-LEAF array (`f: boolean[][]`)
-          // is a plain ref-list slot — lowerable (see the header note); any other
-          // unsafe code keeps the shape un-interned (the clean closure reject).
-          if !(fc == 5 && nameIsNestedScalarLeafArray(ftxt)) { okAll = false }
+          // or a lowerable STRUCT-element array (`f: {g: f64}[]`, `f: S[]`) is a plain
+          // ref-list slot — lowerable (see the header note); any other unsafe code
+          // keeps the shape un-interned (the clean closure reject).
+          if (
+            !(
+              fc == 5 &&
+              (nameIsNestedScalarLeafArray(ftxt) || structElemArrayLowerable(ftxt))
+            )
+          ) {
+            okAll = false
+          }
         }
         fieldCount = fieldCount + 1
       }
@@ -8368,7 +8397,58 @@ function internFuncTypeShapes(nm: string): i32 {
     return internFuncTypeShapes(nm.slice(fa + 2, nm.length))
   }
   if nm[0] == '{' && nm[1] != '[' && nm[nm.length - 1] == '}' {
-    if funcTypeShapeLowerable(nm) { internInlineShape(nm) }
+    if funcTypeShapeLowerable(nm) {
+      internShapeFieldElems(nm)
+      internInlineShape(nm)
+    }
+  }
+  0
+}
+
+// Pre-intern the inline-SHAPE leaves of `nm`'s array-typed fields (`{f: {g: f64}[]}`
+// → intern `{g: f64}`), so `internInlineShape`'s code-5 arm resolves each element
+// name (its raw-text fallback requires the element already interned — interning
+// mid-field-loop would corrupt the flat `sField*` arrays). The functype twin of
+// `collectNestedFieldShapes`' leaf strip: peel every trailing `[]` pair and intern a
+// `{…}` leaf (`internInlineShape` no-ops on any other text). Runs only on a shape
+// `funcTypeShapeLowerable` accepted, BEFORE the shape itself interns.
+function internShapeFieldElems(nm: string) {
+  const inner = nm.slice(1, nm.length - 1)
+  let depth = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    const atEnd = k == inner.length
+    let brk = false
+    if !atEnd {
+      const ch = inner[k]
+      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
+      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
+      if ch == ',' && depth == 0 { brk = true }
+    } else {
+      brk = true
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci > 0 {
+        let ftxt = part.slice(ci + 1, part.length)
+        let peeled = false
+        while (
+          ftxt.length > 2 &&
+          ftxt[ftxt.length - 2] == '[' &&
+          ftxt[ftxt.length - 1] == ']'
+        ) {
+          ftxt = ftxt.slice(0, ftxt.length - 2)
+          peeled = true
+        }
+        if peeled && ftxt.length >= 2 && ftxt[0] == '{' && ftxt[1] != '[' {
+          internInlineShape(ftxt)
+        }
+      }
+      start = k + 1
+    }
+    k = k + 1
   }
   0
 }
@@ -8878,7 +8958,19 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
 // ref-list field its element name, a nested-struct field its (non-null) target
 // name, a value-union field its atom-set name; "" otherwise.
 export function shapeFieldElemName(ftxt: string, code: i32) {
-  if code == 5 { return refArrElemName(ftxt) }
+  if code == 5 {
+    const e5 = refArrElemName(ftxt)
+    if e5 != "" { return e5 }
+    // A NAMED-struct/union or inline-shape element (`S[]`, `{f: f64}[]`) is invisible
+    // to `refArrElemName` while the struct/union tables are still empty (`collectU`
+    // registers shape-text variants BEFORE `collectS`/`collectAnnShapes` run). The
+    // stripped element text IS the canonical slot key for exactly those spellings
+    // (the table-independent element sorts — paren-union / closure / map / scalar-2D
+    // — already resolved above), so record it DEFERRED; `collectA`'s variant field
+    // pass interns the element (`ensureRefElem`) once the tables exist.
+    if nameIsArray(ftxt) { return ftxt.slice(0, ftxt.length - 2) }
+    return ""
+  }
   if code == 15 {
     const nb = nullablePartOf(ftxt)
     if nb != "" { return nb }
