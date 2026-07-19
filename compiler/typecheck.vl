@@ -7370,6 +7370,24 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // REF-ARM value-union result (`(i32) => T[] | {w: i32}`, repOf item (d)): a lambda whose
+        // body infers ONE arm (`(q0) => ([{f: true}])` infers `T[]`) of the expected ref-arm
+        // union adopts the union, so the boxing lands at the return seam — `emitReturnValue`
+        // boxes the reflist/struct arm into the `{tag, value}` rep and the lambda's functype
+        // result IS the box (`synthRetAnnots` pins `fnRet` to the recorded name; its `$fnsig`
+        // keys `>u`, matching the call site's `annSigKey`). Without the pin the lambda's
+        // functype result was the RAW reflist while the narrowed call site `ref.cast` the
+        // funcref to the `>u` sig — a guaranteed runtime cast TRAP (annotated spelling) or,
+        // with the consumer gate also missing, INVALID-WASM (the #911 finding). The annotated
+        // named-function spelling (`mk(): T[] | {w: i32}`) already lowers this box soundly, so
+        // the pin only removes the annotation. NOMINAL-gated (`refArmUnionRetName` declines an
+        // anonymous-element array arm), so the #911 declared-twin-gated shapes stay loud.
+        if inferred != expRet && refArmUnionRetName(expRet, gRootStmts) != "" {
+          const raTail = lambdaBodyTail(n.fnBody)
+          if raTail >= 0 && assignableExpr(raTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
         // ELEMENT-NULLABLE LIST result (`() => (f64|null)[]`): a lambda whose body is an
         // array literal assignable to the expected value-union-box list adopts it, so
         // `emitReturnValue` seeds each nullable element (`[null]`) through the SAME rep the
@@ -7558,6 +7576,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the map-union box
         // (#865/#868), whose arm boxing `emitReturnValue` already performs for the annotated form.
         if unm == "" { unm = mapUnionRetName(inferred) }
+        // A REF-ARM value-union contextual return (`(i32) => T[] | {w: i32}`, adopted just
+        // above; repOf item (d)) — record its nominal render so `collectU`'s inferred-return
+        // loop REGISTERS the union and `synthRetAnnots`'s `isUName` arm pins the lambda's
+        // `fnRet` to the same spelling `nodeUnionName` hands the emitter's binding resolution.
+        if unm == "" { unm = refArmUnionRetName(inferred, gRootStmts) }
         // A LITERAL-UNION contextual return (`(i32) => K = (x) => "b"`, adopted just above) — record
         // the ALIAS name so `synthRetAnnots` pins the lambda's `fnRet` as the litunion, whose functype
         // result reps as an i32 atom (`vtKindOfType`): the `$fnsig` result keys `>i` to match the value
@@ -8608,6 +8631,64 @@ function mapUnionRetName(er: i32) {
       i = i + 1
     }
     return tyToEmitName(er)
+  }
+  ""
+}
+
+// The emitter-format NAME of a REF-ARM value union `er` (`T[] | {w: i32}` — a ≥2-member
+// union with at least one REF-ARRAY member and every member an object shape or an array
+// of object shapes; repOf item (d)'s shape class). Members render NOMINALLY when a
+// declared type matches (`nominalNameOfObj` — the emitter's narrow-atom compare is
+// name-keyed, and the program's `is T[]` spelling is nominal), falling back to the
+// structural `tyToEmitName` render for an anonymous arm (`{w:i32}`). The rendered name
+// is registered by `collectU`'s inferred-return loop, pinned onto the lambda by
+// `synthRetAnnots` (its `isUName` arm — same spelling), and returned to the emitter's
+// union-binding resolution by `nodeUnionName` — ONE renderer, so all three byte-match.
+// An ARRAY member whose element has no nominal name declines ("" — the #911
+// declared-twin gate keeps anonymous-element reflists a loud reject; rendering them
+// would only trade that reject for a deeper one). "" for any other shape (scalar /
+// string / map / closure / null members stay on their existing paths).
+function refArmUnionRetName(er: i32, stmts: i32[]) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyUnion {
+    const members = t.uMembers
+    if members.length < 2 { return "" }
+    // Structural pre-gate BEFORE any render (the #494 discipline): every member an
+    // object or an array-of-object, at least one array.
+    let hasList = false
+    let gi = 0
+    while gi < members.length {
+      const m = T.tys[members[gi]]
+      if m is TyArray {
+        const et = T.tys[m.aElem]
+        if !(et is TyObj) { return "" }
+        hasList = true
+      } else if !(m is TyObj) {
+        return ""
+      }
+      gi = gi + 1
+    }
+    if !hasList { return "" }
+    let name = ""
+    let i = 0
+    while i < members.length {
+      const m = T.tys[members[i]]
+      let mn = ""
+      if m is TyArray {
+        const en = nominalNameOfObj(m.aElem, stmts)
+        if en == "" { return "" }
+        mn = en + "[]"
+      } else {
+        mn = nominalNameOfObj(members[i], stmts)
+        if mn == "" { mn = tyToEmitName(members[i]) }
+        if mn == "" { return "" }
+      }
+      if i > 0 { name = name + "|" }
+      name = name + mn
+      i = i + 1
+    }
+    return name
   }
   ""
 }
@@ -9683,6 +9764,17 @@ export function nodeUnionName(ix: i32) {
         i = i + 1
       }
       if allValue { return valueUnionRetName(ty) }
+      // A REF-ARM value union (`T[] | {w: i32}` — repOf item (d)): a binding INFERRED from a
+      // closure-value call of this result type narrows (`t1 is T[]`) but its unbox gated on
+      // `unionNameOfIdent`, which reached this fallback and got "" — the raw box leaked into
+      // the indexed read (INVALID-WASM nominal / a TRAP annotated, the #911 finding). Render
+      // the union's NOMINAL name (the same spelling the recording arm registers and
+      // `synthRetAnnots` pins), so the narrowed read unboxes like any other union binding.
+      // Declines ("") for an anonymous-element array arm — the #911 declared-twin-gated
+      // shapes stay a loud reject. Reached only on the Call fallback (never the hot path),
+      // and `refArmUnionRetName` structurally pre-gates before rendering (#494 discipline).
+      const ran = refArmUnionRetName(ty, gRootStmts)
+      if ran != "" { return ran }
     }
   }
   // A nullable value SCALAR (`i32 | null`) is a `TyNullable`, NOT a `TyUnion`, yet reps as the
