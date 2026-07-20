@@ -2341,6 +2341,12 @@ export function nulRefMapValInnerOf(valName: string): string {
   if nonNull != 1 { return "" }
   if inner == "string" { return inner }
   if nameIsMap(inner) && !nameIsMapMemberUnion(inner) { return inner }
+  // A CLOSURE member (`(() => string) | null` — the member keeps its grouping parens, so the
+  // arrow sits at paren depth 1): the closure fat-pointer rides the SAME `(ref null
+  // $cloStruct)` vals element a non-null closure value uses — the closure niche of the
+  // nullable-value map. A top-level arrow on the RAW member would be a function RETURNING a
+  // nullable (never produced by `splitUnionAtoms`, which only yields depth-0 `|` members).
+  if annArrowAt(peelGroupParens(inner)) >= 0 { return inner }
   if structIndexByValName(inner) >= 0 { return inner }
   ""
 }
@@ -2409,6 +2415,19 @@ export function mvValKindOfName(valName: string): i32 {
       if nameIsMap(nin) {
         if mapValNestedListUnsupported(mapValNameOf(nin)) { return -3 }
         return 6
+      }
+      // A NULLABLE-CLOSURE value (`(() => string) | null`): kind 14 — the vals element is
+      // already the `(ref null $cloStruct)` fat-pointer, so the niche rides the non-null
+      // closure rep (a bare `null` stores `ref.null`, the fused `?? d` read preserves a
+      // stored null). Same litunion-RESULT gate as the non-null closure arm below: the map
+      // read recovers the call's result as `string`, not the i32 atom — reject loudly.
+      const ncl = peelGroupParens(nin)
+      const nca = annArrowAt(ncl)
+      if nca >= 0 {
+        let nri = nca + 2
+        while nri < ncl.length && ncl[nri] == ' ' { nri = nri + 1 }
+        if nameIsLitUnionType(ncl.slice(nri, ncl.length)) { return -3 }
+        return 14
       }
       return 1
     }
@@ -10371,6 +10390,14 @@ export function exprNulClosure(exprIx: i32, fnIx: i32) {
     const mrs = mapReadMvSlot(ux, fnIx)
     if mrs >= 0 { return mvValKind[mrs] == 14 }
   }
+  // A `m[k] ?? d` read over a NULLABLE-closure-valued map (`{[string]: (() => T) | null}`) is
+  // STILL nullable: the hit arm PRESERVES a stored null (the default fires only on a missing
+  // key), so the binding stays the kind-19 niche and narrows with `!= null` — the closure dual
+  // of `exprNullableStruct`'s coalesce arm.
+  if e is BinExpr {
+    const cns = coalesceMvSlot(ux, fnIx)
+    if cns >= 0 { return mvValKind[cns] == 14 && mvSlotNullable(cns) }
+  }
   false
 }
 
@@ -13191,7 +13218,10 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       // name collapses to `string` (`tyToEmitName` widens each member literal) — which the
       // slot resolver would treat as a slot-less STRING-valued map and reject loudly. Gate
       // on the checker's recorded litunion first (the atom map has no slot by design).
+      // Same for the NULLABLE-atom niche (`{[string]: K0 | null}` — the `-1` sentinel rides
+      // the mono map; its rendered value name would collapse to `string | null`).
       if nodeTyMapValIsLitUnion(exprIx) { return -1 }
+      if nodeTyMapValIsNulLitUnion(exprIx) { return -1 }
       return mvSlotOfMapValNameOrMono(nodeTyMapValName(exprIx))
     }
     return -1
