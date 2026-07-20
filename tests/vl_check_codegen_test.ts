@@ -7,13 +7,13 @@
 //   `vl check <file>`            exits 0  (fast path, no emit, misses the error)
 //   `vl check --codegen <file>`  exits 1  (emitter runs, error surfaced)
 //
-// The fixture is a `Tree` whose `kids` field is a MAP whose VALUE is a LIST of
-// `Tree` (`{ [string]: Tree[] }`) — a recursion cycle passing through TWO nested
-// collections. Single-collection recursion (`{ [i32]: Tree }`, `{ [string]: Tree }`)
-// now compiles, so this nested-collection shape is the stable emit-error fixture.
-// (The native emitter reports it as `map value type has no interned slot`; the
-// retired TS path phrased the same failure as "recursion limit exceeded". We assert
-// the exit-code contract + the emit-stage marker, not the host-specific wording.)
+// The fixture is a `Box` with a nullable-list field (`xs: i64[] | null`): the type
+// is well-formed (fast path clean) but a nullable list has no rep in a struct field,
+// so the emitter rejects. This is a live rep-fuzz baseline gap (nullable-list-locals
+// family) — if it graduates, swap in any other shape that type-checks clean but
+// emit-errors. (The native emitter reports it as `only i32 / boolean / string /
+// array struct fields are supported` + the `(emit error)` summary marker. We assert
+// the exit-code contract + that emit-stage marker, not the host-specific wording.)
 //
 // This is the native counterpart to the retired tests/cli_codegen_test.ts.
 //
@@ -57,11 +57,11 @@ const check = async (
   }
 };
 
-// Type-checks cleanly, fails the emitter (recursion through a map-of-lists).
+// Type-checks cleanly, fails the emitter (a nullable-list struct field has no rep).
 const EMIT_ERROR_SRC =
-  `type Tree = { value: i32, kids: { [string]: Tree[] } | null }\n` +
-  `let t: Tree = { value: 1, kids: null }\n` +
-  `print(t.value)\n`;
+  `type Box = { v: i32, xs: i64[] | null }\n` +
+  `const b: Box = { v: 1, xs: null }\n` +
+  `print(b.v)\n`;
 
 // A normal, fully valid file — passes both the fast and the full path.
 const CLEAN_SRC = `let x = 1\nprint(x)\n`;
@@ -83,7 +83,9 @@ Deno.test({
   fn: async () => {
     const { code, err } = await check(EMIT_ERROR_SRC, ["--codegen"]);
     if (code === 0) throw new Error(`expected non-zero exit with --codegen, got ${code}`);
-    // The emitter ran and the failure surfaced as an error at the emit stage.
+    // The emitter ran and the failure surfaced as an error at the emit stage:
+    // the `--concise` `error [line:col]` diagnostic plus the `(emit error)`
+    // summary marker that distinguishes an emit-stage failure from a type error.
     if (!err.includes("error [") || !err.includes("emit error")) {
       throw new Error(`expected an emit-stage error, got:\n${err}`);
     }
