@@ -7413,6 +7413,20 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
                 inferred = expRet
               }
             }
+            // The NULLABLE-LIST dual (`() => boolean[] | null = () => ([false])`): a lambda
+            // whose body infers the bare i32-backed LIST member of an expected `T[] | null`
+            // adopts the niche — its functype result is the nullable i32-list wrapper
+            // (`(ref null $lTypeIdx)`, the `>o` result token), exactly as the annotated
+            // `: boolean[] | null` named-function return lowers. Recorded by
+            // `nullableRetName`'s i32-backed-list arm + pinned by `synthRetAnnots`.
+            // The distinct-backing leaves (`i64[] | null`, …) are NOT adopted (outside
+            // the value-call ABI — they stay loud checker rejects).
+            if inferred != expRet && tyIsNulI32BackedListInner(etU.nInner) {
+              const nlTail = lambdaBodyTail(n.fnBody)
+              if nlTail >= 0 && assignableExpr(nlTail, inferred, expRet) {
+                inferred = expRet
+              }
+            }
             // The NULLABLE-CLOSURE dual (`(i32) => ((i32) => K0) | null = (q0) => (null)`): a
             // lambda whose body infers `null` (or a closure) against an expected nullable-closure
             // result adopts the niche — its functype result is `(ref null $cloStruct)`, and
@@ -7525,12 +7539,49 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
-        // (A SCALAR-ELEMENT LIST result — `(i32) => f32[] = (q0) => [97.5]` — is NOT adopted
-        // here: the checker would accept it, but the emitter's list-type collection does not yet
-        // register the f32[] list a `synthRetAnnots`-pinned lambda return introduces, so the
-        // call-result index (`v(1)[0]`) hits "list type not collected". Adopting would only move
-        // a clean checker reject to an internal emit reject — it stays a loud checker reject until
-        // the list-collection seam lands (sibling emit-rep territory).)
+        // SCALAR-LEAF LIST result (`(i32) => f32[] = (q0) => ([97.5])`, `() => i64[] =
+        // () => ([5])`): a lambda whose body array literal is assignable to the expected
+        // distinct-backing scalar-leaf list adopts it — the elements re-encode at the leaf
+        // (`assignableExpr`'s ArrayLit arm, the same grant a direct `const xs: f32[] = [1.5]`
+        // binding makes), the adopted name is recorded (`isScalarListRetName`) and
+        // `synthRetAnnots` pins `fnRet` to it, so the body literal builds the leaf's wrapper
+        // under the RETURN-position seed and the value-call index read finds its list types
+        // collected — the SAME sound path the annotated named-function spelling
+        // (`mk(q0: i32): f32[]`) already lowers.
+        if inferred != expRet && scalarLeafListRetName(expRet) != "" {
+          const slTail = lambdaBodyTail(n.fnBody)
+          if slTail >= 0 && assignableExpr(slTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
+        // LITUNION-ELEMENT LIST result (`(i32) => K0[] = (q0) => (["4664"])`): a lambda
+        // whose body array literal's elements are MEMBERS of the expected litunion-element
+        // list adopts it — `assignableExpr`'s ArrayLit arm records the destination array
+        // type on the literal (the atom-array contextual adoption a direct
+        // `const ks: K0[] = ["4664"]` binding makes), so the body builds the i32 atom
+        // list; the lambda's `>a` result token already byte-matches the annotation side
+        // (a litunion array shares the i32-list backing), so no pin is needed. The
+        // named-function spelling (`mk(q0: i32): K0[]`) lowers this already.
+        if inferred != expRet && litUnionElemListRetName(expRet) != "" {
+          const lulTail = lambdaBodyTail(n.fnBody)
+          if lulTail >= 0 && assignableExpr(lulTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
+        // STRUCT-ELEMENT LIST result (`(i32) => {f: f32}[]`, `(i32) => {a: f32, f: K0,
+        // z: i64}[]`): a lambda whose body array literal's element structs coerce FIELD-WISE
+        // into the expected element shape adopts the expected list — `assignableExpr`'s
+        // per-element ObjLit coercion RECORDS the coerced field types (a float-literal f32
+        // field, a small-int i64/f64 field, a litunion member) for the emitter's interner,
+        // exactly as a direct `const xs: {f: f32}[] = [{f: 1.5}]` binding does. Gated on
+        // plainly-lowerable element fields (`structElemListRetName`: scalar / string /
+        // litunion) so a map / union / nullable-field element stays a loud reject.
+        if inferred != expRet && structElemListRetName(expRet) != "" {
+          const seTail = lambdaBodyTail(n.fnBody)
+          if seTail >= 0 && assignableExpr(seTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
       }
     }
     // PERMISSIVE FALL-THROUGH (totality): an un-annotated function that can fall off the
@@ -7700,6 +7751,14 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // return-position literal threading + `$fnsig` reflist-slot keying the annotated form
         // already performs (the pinned TypeRef collects its own list types). (R4.)
         if unm == "" { unm = nestedLeafListRetName(inferred) }
+        // A MAP-ELEMENT list contextual return (`(i32) => {[string]: f32}[]`) — record its
+        // emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the map-element
+        // array, whose kind-3 slot keying the annotated named-function form already performs.
+        if unm == "" { unm = mapElemListRetName(inferred) }
+        // A LITUNION-ALIAS-element list contextual return (`(i32) => K0[]`, adopted just
+        // above) — record the `K0[]` name so `synthRetAnnots` pins the lambda's `fnRet`
+        // and the body member literals build the i32 ATOM list the annotated return does.
+        if unm == "" { unm = litUnionElemListRetName(inferred) }
         // A LITERAL-UNION contextual return (`(i32) => K = (x) => "b"`, adopted just above) — record
         // the ALIAS name so `synthRetAnnots` pins the lambda's `fnRet` as the litunion, whose functype
         // result reps as an i32 atom (`vtKindOfType`): the `$fnsig` result keys `>i` to match the value
@@ -8623,6 +8682,25 @@ function structUnionRetName(er: i32, stmts: i32[]) {
 // resolves — without it the lambda's return collapses to the bare non-null kind (`>s<idx>;`) and the
 // call's nullable key is un-interned. "" unless `er` is a nullable whose inner the emitter lowers (a
 // NAMED struct — niche `(ref null $struct)` — or string — niche `ref.null $array`).
+// Whether nullable-INNER type `it` is an ARRAY of a PRIM i32/boolean element — the
+// `T[] | null` subset that reps as the `nullist` niche (`(ref null $lTypeIdx)`) and
+// carries the `>o` value-call result token. The distinct-backing leaves (i64/f64/f32/
+// string elements) are NOT this — their nullable lists stay outside the value-call ABI.
+// A LITUNION element (`K0[] | null`) shares the i32 backing too but its lambda
+// adoption still mis-keys the sig producers (the named-function VALUE spelling works;
+// the lambda stays a clean checker reject until that seam is audited), so it is
+// deliberately excluded here.
+function tyIsNulI32BackedListInner(itIx: i32) {
+  if itIx < 0 { return false }
+  const it = T.tys[itIx]
+  if it is TyArray {
+    if it.aElem < 0 { return false }
+    const el = T.tys[it.aElem]
+    if el is TyPrim { return el.primName == "i32" || el.primName == "boolean" }
+  }
+  false
+}
+
 function nullableRetName(er: i32, stmts: i32[]) {
   if er < 0 { return "" }
   const t = T.tys[er]
@@ -8658,6 +8736,16 @@ function nullableRetName(er: i32, stmts: i32[]) {
       let irs = litUnionAliasNameOfTy(it.fnRet)
       if irs == "" { irs = tyToEmitName(it.fnRet) }
       if irs != "" { return "((" + ips + ")=>" + irs + ")|null" }
+    } else if tyIsNulI32BackedListInner(t.nInner) {
+      // The nullable i32-BACKED list (`boolean[] | null`, `i32[] | null`, a litunion
+      // `K0[] | null` — kind 15): the shared i32-list wrapper made nullable
+      // (`(ref null $lTypeIdx)`). Rendered NON-spaced (`boolean[]|null`) so
+      // `nullablePartOf` recognizes it; `synthRetAnnots` pins the lambda's `fnRet` to it
+      // and the annotated nullable-list return machinery (`retNulListFlag`) lowers the
+      // body — the lambda's `$fnsig` result keys `>o`, matching the value call's
+      // `annRetKind`. The distinct-backing leaves (`i64[] | null`, …) are NOT rendered
+      // (outside the value-call ABI — they stay loud rejects).
+      return tyToEmitName(t.nInner) + "|null"
     } else if tyToStr(t.nInner) == "string" {
       return "string|null"
     } else if tyToStr(t.nInner) == "boolean" {
@@ -8714,6 +8802,96 @@ function nulElemListRetName(er: i32) {
       const alias = litUnionAliasNameOfTy(et.nInner)
       if alias != "" { return "(" + alias + "|null)[]" }
     }
+  }
+  ""
+}
+
+// The emitter-format NAME of a DISTINCT-BACKING SCALAR-LEAF list return `er` — `i64[]`,
+// `f64[]`, `f32[]`: a `TyArray` whose element is one of the scalar leaves with its OWN list
+// backing. The name is in `isScalarListRetName`'s recordable set, and `synthRetAnnots` pins a
+// lambda's `fnRet` to it so the body literal builds the leaf's wrapper and the value-call
+// index read finds its list types collected — the SAME sound path the annotated
+// named-function return already lowers. An `i32[]`/`boolean[]`/`string[]`/litunion `K[]`
+// element is EXCLUDED: those self-classify identically to the annotation (a shared backing),
+// so no adoption is ever needed there. "" otherwise.
+function scalarLeafListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const et = T.tys[t.aElem]
+    if et is TyPrim {
+      const pn = et.primName
+      if pn == "i64" || pn == "f64" || pn == "f32" { return pn + "[]" }
+    }
+  }
+  ""
+}
+
+// The emitter-format NAME of a LITUNION-ALIAS-element list return `er` — `K0[]`: the
+// adoption gate + recorded name for a member-literal-bodied lambda
+// (`(i32) => K0[] = (q0) => (["4664"])`). `synthRetAnnots` pins the lambda's `fnRet` to
+// it so the body literal builds the i32 ATOM list under the annotated return's threading
+// (un-pinned, the member literals self-classify a STRING list into the i32-list functype
+// result — invalid wasm); the named-function spelling (`mk(q0: i32): K0[]`) lowers this
+// already. An alias-less INLINE litunion element declines ("" — no pinnable name).
+function litUnionElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    if tyIsLitUnion(t.aElem) {
+      const an = litUnionAliasNameOfTy(t.aElem)
+      if an != "" { return an + "[]" }
+    }
+  }
+  ""
+}
+
+// The emitter-format NAME of a STRUCT-ELEMENT list return `er` (`{f: f32}[]`,
+// `{a: f32, f: K0, z: i64}[]`) whose element fields are all PLAINLY LOWERABLE (a scalar /
+// string / boolean prim, or a litunion alias) — the element shapes the named-function
+// spelling (`mk(q0: i32): {f: f32}[]`) already round-trips through the value-call ABI, so a
+// lambda may adopt them. A map / union / nullable / list / closure / nested-struct field is
+// NOT this (those composition seams stay loud rejects). "" otherwise.
+function structElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const et = T.tys[t.aElem]
+    if et is TyObj {
+      let i = 0
+      while i < et.objFieldTypes.length {
+        const fty = et.objFieldTypes[i]
+        if fty < 0 { return "" }
+        const ft = T.tys[fty]
+        let ok = false
+        if ft is TyPrim { ok = true }
+        if tyIsLitUnion(fty) { ok = true }
+        if !ok { return "" }
+        i = i + 1
+      }
+      return tyToEmitName(er)
+    }
+  }
+  ""
+}
+
+// The emitter-format NAME of a MAP-ELEMENT list return `er` — `{[string]: f32}[]`: a
+// `TyArray` whose element is a string-keyed map. `synthRetAnnots` pins a lambda's `fnRet`
+// to it so its `$fnsig` result keys the SAME kind-3 map-element ref-list slot the
+// annotation-side value call resolves (the named-function spelling lowers this already);
+// un-pinned, the literal-side element spelling diverges and the call finds no interned
+// signature. A map value type the emitter cannot lower keeps rejecting loudly on the
+// annotated path itself. "" otherwise.
+function mapElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const et = T.tys[t.aElem]
+    if et is TyMap { return tyToEmitName(er) }
   }
   ""
 }

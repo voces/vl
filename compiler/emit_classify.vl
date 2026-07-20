@@ -11,6 +11,7 @@ import {
   TyArray,
   TyFunc,
   TyMap,
+  TyNullable,
   TyObj,
   TyPrim,
   TyUnion,
@@ -345,6 +346,12 @@ function cloParamTok(paramIx: i32) {
   // slot-less `m` and mis-lower. The soundness floor rejects a map-param value with a clear
   // message.
   if k == "map" { return "" }
+  // A NULLABLE-list param (`i32[] | null`, kind 15) stays OUTSIDE the value-call ABI
+  // (only nullable-list RESULTS are wired — the closure result carries the niche).
+  // `repSigTokOfKind("nullist")` now yields a RESULT token (`o`), so exclude it
+  // explicitly here (like map/nulstr/nulstruct/nulclosure) — else a nullable-list param
+  // would key a slot-less `o` and mis-lower. The soundness floor rejects it loudly.
+  if k == "nullist" { return "" }
   // Every slot-free kind reads the shared canonical token table (emit_rep) —
   // "" for the kinds outside the value-call ABI (scalar lists, niches).
   repSigTokOfKind(k)
@@ -1065,6 +1072,10 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
           if fn.fnRet >= 0 { return retNulListFlag(fn.fnRet) == 1 }
         }
       }
+      // A closure-VALUE call (`v()` with `v: () => boolean[] | null` — a binding or a
+      // param) whose resolved sig result is the nullable i32-backed list (`>o`), so an
+      // un-annotated `const t0 = v()` infers kind 15 and narrows with `if t0 != null`.
+      return calleeRetKind(callee.identName, fnIx) == "nullist"
     }
   }
   false
@@ -8295,7 +8306,17 @@ function internShapeArms(arms: string[]) {
     ) {
       uCore = uCore.slice(0, uCore.length - 2)
     }
-    if uCore.length >= 1 && uCore[0] == '{' { internShapeDeep(arms[uai]) }
+    if uCore.length >= 1 && uCore[0] == '{' {
+      internShapeDeep(arms[uai])
+    } else if annArrowAt(monoUnwrapParens(uCore)) >= 0 {
+      // A CLOSURE arm (`((i32) => {a: f64, f: K0, z: string}[]) | f64`): the inline
+      // shapes buried in its params/result are otherwise unreachable — the arm is ONE
+      // spelling inside the union name, so a narrowed arm's value-call result read found
+      // no interned struct ("field access but no struct type declared"). Route through
+      // the soundness-gated functype interner (`funcTypeShapeLowerable` keeps an
+      // unsupported-field shape un-interned — a clean reject, never invalid wasm).
+      internFuncTypeShapes(arms[uai])
+    }
     uai = uai + 1
   }
   0
@@ -8316,6 +8337,22 @@ export function internShapeDeep(nm: string) {
   // the parens peel (so `(i32|null)` reaches here) but BEFORE the `| null` peel (which would lose the atom).
   if isValueUnionName(nm) {
     registerValueUnionName(nm)
+    // A CLOSURE atom of the value union (`((i32) => {a: f64, f: K0, z: string}[]) | f64`)
+    // may bury inline shapes in its params/result — unreachable through the box
+    // registration (the arm is one spelling inside the union name), so a narrowed arm's
+    // value-call result read found no interned struct. Descend each arrow arm through
+    // the soundness-gated functype interner (`funcTypeShapeLowerable` keeps an
+    // unsupported-field shape un-interned — a clean reject, never invalid wasm).
+    if strContains(nm, "=>") {
+      const vArms: string[] = []
+      splitUnionArmsAllDepth(nm, vArms)
+      let va = 0
+      while va < vArms.length {
+        const vc = monoUnwrapParens(vArms[va])
+        if annArrowAt(vc) >= 0 { internFuncTypeShapes(vc) }
+        va = va + 1
+      }
+    }
     return 0
   }
   const np = nullablePartOf(nm)
@@ -9544,6 +9581,62 @@ export function forceCloResultMapTypes(nm: string) {
       } else if annArrowAt(res) >= 0 {
         // A curried result (`() => () => {[string]: V}`) recurses to ITS result.
         forceCloResultMapTypes(res)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Force the wrapper/backing types of a SCALAR-LEAF (or string) LIST reached only as a
+// CLOSURE RESULT inside a composite annotation — the nullable-closure niche
+// (`((i32) => f32[]) | null`), a union arm, a closure-typed param, or a curried result.
+// The whole spelling is ONE TypeRef whose result list is invisible to every branch of the
+// `collectA` scan, so a narrowed arm's value-call index read rejected "list type not
+// collected" whenever the program never CONSTRUCTS such a list itself (`useIt(null)`).
+// The list dual of `forceCloResultMapTypes`. Self-gating: a name with no arrow arm (or a
+// non-list result) forces nothing — byte-identical for every other program. A REF-element
+// list result resolves through its own annotation branches (`ensureRefElem`); a
+// nullable-LIST result (`boolean[] | null`) forces its non-null leaf list (the niche slot
+// only changes the valtype's nullability, not the types needed).
+export function forceCloResultListTypes(nm: string) {
+  // Cheap pre-gate (this runs per arena TypeRef): only a name spelling BOTH an arrow
+  // and an array can carry a closure-result list — two substring scans, no allocation.
+  if !strContains(nm, "=>") || !strContains(nm, "[]") { return 0 }
+  const arms: string[] = []
+  splitUnionArmsAllDepth(nm, arms)
+  let i = 0
+  while i < arms.length {
+    const a = monoUnwrapParens(arms[i])
+    const fa = annArrowAt(a)
+    if fa >= 1 && a.length > 0 && a[0] == '(' {
+      let res = monoUnwrapParens(a.slice(fa + 2, a.length))
+      const rp = nullablePartOf(res)
+      if rp != "" { res = rp }
+      if nameIsStringArray(res) {
+        slUsed = true
+        aUsed = true
+      } else if nameIsF64Array(res) {
+        fa64Used = true
+      } else if nameIsI64Array(res) {
+        ia64Used = true
+      } else if nameIsF32Array(res) {
+        fa32Used = true
+      } else if nameIsI32Array(res) {
+        lUsed = true
+        aUsed = true
+      } else if nameIsRefArray(res) {
+        // A REF-element list result (`((i32) => {a,f,z}[]) | f64` — a struct-element
+        // array returned by a union-arm / nullable-niche closure): intern its element
+        // slot + force the ref-list machinery, exactly as a BARE `S[]` annotation's
+        // branch does — else a narrowed arm's value call keys a `>r<slot>;` sig no
+        // producer interned (its slot unresolvable), or the read finds no wrapper.
+        rlUsed = true
+        raUsed = true
+        ensureRefElem(refArrElemName(res))
+      } else if annArrowAt(res) >= 0 {
+        // A curried result (`() => () => f32[]`) recurses to ITS result.
+        forceCloResultListTypes(res)
       }
     }
     i = i + 1
@@ -11692,6 +11785,20 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
     }
     // `m.values()` over a struct- / nested-list- / nested-map-valued map yields a ref list.
     if mapValuesResultKind(exprIx, fnIx) == 5 { return true }
+    // GENERAL FALLBACK: a value call the resolvers above miss — a NARROWED union
+    // binding's closure arm (`t0(1)` after `if t0 is (i32) => S[]`), a struct-FIELD
+    // closure (`v.f(1)`) — classifies by its resolved `$fnsig` result (`cloCallSigKey`,
+    // whose own fallback derives the key from the callee's CHECKER type). The consumer
+    // dual of the call emit's sig resolution, so the two always agree. A UNION-BOX
+    // element slot (kind 2 — `(i32 | {w: i32})[]`) is DECLINED: its element's narrowed
+    // binding read is not wired through this chain (the array-of-union-element family),
+    // so claiming it turned a loud reject into invalid wasm.
+    if callResTyElemIsUnion(nodeTyIxOf(exprIx)) { return false }
+    const gk = cloCallSigKey(exprIx, fnIx)
+    if sigKeyRetKind(gk) == "reflist" {
+      const gs = sigKeyRetSlot(gk)
+      if gs >= 0 && gs < rlElemKindTbl.length { return rlElemKindTbl[gs] != 2 }
+    }
     return false
   }
   if e is Ident {
@@ -11838,6 +11945,19 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
         const rs = sigKeyRetSlot(ck)
         if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
       }
+      // A NARROWED union binding's closure arm (`t0(1)` after `if t0 is (i32) => S[]`):
+      // the name-based `calleeCloSigKey` misses it, but the general `cloCallSigKey`
+      // fallback derives the key from the callee's CHECKER type — the same key the call
+      // emit resolves, so the element slot always matches the called functype's. A
+      // union-box element slot (kind 2) is declined, like `exprRefArray`'s fallback.
+      if callResTyElemIsUnion(nodeTyIxOf(exprIx)) { return "" }
+      const nk = cloCallSigKey(exprIx, fnIx)
+      if sigKeyRetKind(nk) == "reflist" {
+        const nrs = sigKeyRetSlot(nk)
+        if nrs >= 0 && nrs < rlElemName.length {
+          if rlElemKindTbl[nrs] != 2 { return rlElemName[nrs] }
+        }
+      }
       return ""
     }
     // A ref-valued `m.values()` yields a ref list whose element is the map's VALUE — read
@@ -11855,6 +11975,18 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
       }
       const ms = mfResultSlotOf(exprIx, fnIx)
       if ms >= 0 { return rlElemName[ms] }
+    }
+    // A struct-FIELD closure call (`v.f(1)` — the callee is a Member) whose result is a
+    // ref list: the resolved `$fnsig` result slot names the element (the same
+    // `cloCallSigKey` fallback as the Ident-callee arm above; a union-box element slot
+    // — kind 2 — is likewise declined).
+    if callResTyElemIsUnion(nodeTyIxOf(exprIx)) { return "" }
+    const mk2 = cloCallSigKey(exprIx, fnIx)
+    if sigKeyRetKind(mk2) == "reflist" {
+      const mrs2 = sigKeyRetSlot(mk2)
+      if mrs2 >= 0 && mrs2 < rlElemName.length {
+        if rlElemKindTbl[mrs2] != 2 { return rlElemName[mrs2] }
+      }
     }
     return ""
   }
@@ -12356,6 +12488,40 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
 // f32[] only when its declared type says so.
 function tyIsF32Array(tyIx: i32) { tyKindOf(tyIx) == 21 }
 
+// The checker-recorded type `tyIx` tested for an f32-element ARRAY — scoped to CALL
+// results only (`exprF32Array`'s curried-call arm). `tyKindOf` deliberately carries no
+// f32-array kind (a float LITERAL types f64, so a general typed claim would mis-claim a
+// literal-built f64 list as f32); a call result's f32-ness comes from the callee's
+// functype and is reliable.
+function callResTyIsF32Array(tyIx: i32) {
+  if tyIx < 0 { return false }
+  const t = T.tys[tyIx]
+  if t is TyArray {
+    if t.aElem < 0 { return false }
+    const el = T.tys[t.aElem]
+    if el is TyPrim { return el.primName == "f32" }
+  }
+  false
+}
+
+// The checker-recorded type `tyIx` tested for a UNION-element ARRAY (`(i32 | {w: i32})[]`)
+// — the guard the value-call ref-list FALLBACKS (`exprRefArray` / `refListElemNameOfExpr`)
+// decline on: a union-box element's narrowed binding read is not wired through that chain
+// (the array-of-union-element family), and a lambda whose body infers ONE arm interns a
+// sig slot CONTRADICTING the annotation's box element — claiming it would emit invalid
+// wasm where a loud reject stood.
+function callResTyElemIsUnion(tyIx: i32) {
+  if tyIx < 0 { return false }
+  const t = T.tys[tyIx]
+  if t is TyArray {
+    if t.aElem < 0 { return false }
+    const el = T.tys[t.aElem]
+    if el is TyUnion { return true }
+    if el is TyNullable { return true }
+  }
+  false
+}
+
 function declaredF32Array(name: string) { declaredKind(name) == "f32list" }
 
 function globalIsF32Array(name: string) {
@@ -12426,7 +12592,11 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
       // the f32 list (`>F`) — the f32 dual of the i64/f64-list callee arms.
       return calleeRetKind(callee.identName, fnIx) == "f32list"
     }
-    return false
+    // A CURRIED / composed value call (`t0()(1)` — the callee is itself a Call): the
+    // checker's recorded RESULT type decides. Reliable here, unlike a general typed-IR
+    // claim (see `tyIsF32Array`'s note — a float LITERAL types f64): a call result's
+    // f32-ness comes from the callee's functype, not a literal's default.
+    return callResTyIsF32Array(nodeTyIxOf(exprIx))
   }
   // `g[i]` over an `f32[][]` (ref-list element kind 10 — the inner f32-list wrapper) yields an
   // `f32[]`, so `g[i][j]` reads the f32 scalar.
@@ -13661,6 +13831,13 @@ function annRetKind(t: string) {
     }
     if hasNull && nonNull.length == 1 {
       if nonNull[0] == "string" { return ">" + repSigTokOfKind("nulstr") }
+      // A NULLABLE i32-backed LIST result (`boolean[] | null`, `i32[] | null`, a litunion
+      // `K0[] | null` — kind 15): the i32-list wrapper made nullable, slot-free. Matches
+      // `cloRetKeySuffix`'s `>o` (via `cloRetValKind` → `vtKindOfType` → "nullist"), so the
+      // value call's `ref.cast` byte-matches the closure's interned `$fnsig`. The
+      // distinct-backing nullable lists (`i64[] | null`, …) keep falling through to ""
+      // (outside the ABI — a loud reject, never invalid wasm).
+      if nameIsI32Array(nonNull[0]) { return ">" + repSigTokOfKind("nullist") }
       const msi = structIndexOfTypeName(nonNull[0])
       if msi >= 0 { return ">" + repSigSlotTokOfKind("nulstruct", msi) }
       // A NULLABLE-CLOSURE result (`((i32) => K0) | null`, kind 19): the shared closure
@@ -14196,8 +14373,27 @@ function exprIsClosureNoLocal(exprIx: i32, fnIx: i32) {
 // `escaping.vl`'s `o.go`.) Resolved against the receiver's struct table fields.
 function memberIsClosure(objIx: i32, prop: string, fnIx: i32) {
   const si = structIndexOfExpr(objIx, fnIx)
-  if si < 0 { return false }
-  return structFieldIsClosure(si, prop)
+  if si >= 0 { return structFieldIsClosure(si, prop) }
+  // A NARROWED union receiver (`t0.f(1)` after `if t0 is {f: (i32) => boolean[]}` over a
+  // `{f: …} | f64` binding): the receiver's struct index is not resolvable from its
+  // DECLARED (union) type, but the narrowed VARIANT's field tables carry the field code —
+  // a closure field (14) / nullable-closure field (22) reads back a closure and calls via
+  // `call_ref` (the member READ itself lowers through `emitNarrowedMem`).
+  const o = P.nodes[unwrapParen(objIx)]
+  if o is Ident {
+    const nv = narrowVariantFor(o.identName)
+    if nv != "" {
+      const vi = variantIndexOf(nv)
+      if vi >= 0 {
+        const vfi = variantFieldIndex(vi, prop)
+        if vfi >= 0 {
+          const vfc = variantFieldTypeAt(vi, vfi)
+          return vfc == 14 || vfc == 22
+        }
+      }
+    }
+  }
+  false
 }
 
 // True if field `prop` of struct table index `si` is a function-valued field — a bare
