@@ -2425,8 +2425,10 @@ export function mvValKindOfName(valName: string): i32 {
       // A NULLABLE-CLOSURE value (`(() => string) | null`): kind 14 — the vals element is
       // already the `(ref null $cloStruct)` fat-pointer, so the niche rides the non-null
       // closure rep (a bare `null` stores `ref.null`, the fused `?? d` read preserves a
-      // stored null). Same litunion-RESULT gate as the non-null closure arm below: the map
-      // read recovers the call's result as `string`, not the i32 atom — reject loudly.
+      // stored null). A litunion RESULT (`((i32) => K0) | null`) stays a loud reject: the
+      // read stays nullable (the hit arm preserves a stored null), so the call needs a
+      // narrowed spelling the checker does not yet accept for this value shape — the
+      // atom-result recovery the NON-null closure arm has cannot be exercised through it.
       const ncl = peelGroupParens(nin)
       const nca = annArrowAt(ncl)
       if nca >= 0 {
@@ -2528,17 +2530,11 @@ export function mvValKindOfName(valName: string): i32 {
     // A FUNCTION-valued map (`{[string]: (i32) => i32}`): each value is a closure fat-pointer
     // (`ref $cloStructIdx`), stored in a ref list whose element kind is 5 (the closure) — the
     // SAME rep an `((i32) => i32)[]` array uses. A read yields a closure local; the call
-    // resolves its sig from the value annotation.
-    //
-    // EXCEPT a closure whose RESULT is a literal-union atom (`(i32) => K0`): the map read
-    // recovers the call's result type as `string` (K0's underlying atom text) rather than the
-    // i32 atom id, so `print(m[k](x))` walks a raw i32 as a string ref — invalid wasm. (A
-    // closure → string / i64 / boolean / struct map value is fine; only the litunion result
-    // mis-recovers, and the SAME closure works standalone / in an array.) Reject loudly until
-    // the map closure-value call recovers the atom result.
-    let ri = annArrowAt(valName) + 2
-    while ri < valName.length && valName[ri] == ' ' { ri = ri + 1 }
-    if nameIsLitUnionType(valName.slice(ri, valName.length)) { return -3 }
+    // resolves its sig from the value annotation. A litunion RESULT (`(i32) => K0`) rides the
+    // same rep: the call's `$fnsig` keys the i32 atom (`>i`) and the atom widens to its member
+    // string at the print seam — `exprString`'s value-call arm gates its per-name `>S` claim on
+    // the call node's litunion-alias type, so the `??`-bound callee's SOFTENED render
+    // (`(i32) => string`) never routes the raw atom into the string path.
     kind = 14
   } else {
     if structIndexByValName(valName) >= 0 { kind = 1 }
@@ -13569,8 +13565,17 @@ export function exprString(exprIx: i32, fnIx: i32) {
     if callee is Ident {
       if fnRetString(callee.identName) { return true }
       // A string-returning function VALUE (a binding / `(i32) => string` param callee,
-      // invisible to `fnRetString`): its resolved `>S` sig.
-      if calleeReturnsString(callee.identName, fnIx) { return true }
+      // invisible to `fnRetString`): its resolved `>S` sig. EXCEPT a call the checker
+      // typed as an aliased LITUNION (`t(3)` where `t: (i32) => K0` came off a map
+      // `?? d` read): the binding's sig resolves through the checker's RENDERED type
+      // name, which softens `K0` to `string` — keying `>S` — while the call_ref's
+      // result reps the i32 ATOM. The node-type gate on the per-node fallback below
+      // already excludes it; the per-name claim needs the same gate, else `print`
+      // hands the raw atom to the string path (invalid wasm). The atom widens at
+      // `exprIsLitAtom` instead.
+      if calleeReturnsString(callee.identName, fnIx) {
+        if !nodeTyIsLitUnionAlias(exprIx) { return true }
+      }
     }
     // A string-returning FIELD-closure call (`o.label(3)` over a `(i32) => string` field).
     if callee is Member {
