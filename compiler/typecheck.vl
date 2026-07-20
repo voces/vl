@@ -3461,6 +3461,35 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
         }
         return ok
       }
+      // An array literal flowing into a UNION adopts the FIRST array arm it adapts into
+      // element-wise (`["a"]` into `K0[] | {w: i32}`, `[1.5]` into `f32[] | i64`) — the
+      // array dual of the ObjLit union-arm adoption above. The concrete arm is RECORDED
+      // on the literal node so the emitter classifies the list with the arm's element
+      // rep (an atom-id list, an f32 list), not the literal's softened one (`string[]` /
+      // `f64[]`), and the union box tags the arm the checker picked.
+      if d is TyUnion {
+        const members = d.uMembers
+        let mi = 0
+        while mi < members.length {
+          const mt = T.tys[members[mi]]
+          if mt is TyArray {
+            // An `f32[]` arm is NOT adopted: the union box has no f32-list atom rep, so
+            // admitting the literal would construct a mis-tagged f64 list into the box
+            // (a silent wrong rep) — the arm stays a loud checker reject until an
+            // f32-list atom exists.
+            if primNameOf(mt.aElem) != "f32" {
+              if assignableExpr(srcExpr, srcTy, members[mi]) {
+                if !inferQuiet {
+                  while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+                  nodeTyIx[srcExpr] = members[mi]
+                }
+                return true
+              }
+            }
+          }
+          mi = mi + 1
+        }
+      }
     }
   }
   false
@@ -10373,6 +10402,25 @@ function nulElemListAtomKind(name: string) {
 // 3 i64, 4 f64, 5 f32, 6 null, 11 closure (a function type — a REF atom riding the
 // box anyref) — or -1 for anything else (a struct name, an inline shape, an array).
 // The kind doubles as the atom's tag offset (`scalarTagOf`).
+// The literal-union ELEMENT name of a `K[]` / `("a"|"b")[]` array type-name, or "" when
+// `name` is not a litunion array. The checker-side twin of the emitter's
+// `nameIsLitUnionArray` (which typecheck cannot import): strip the trailing `[]`, peel
+// one grouping-paren layer, and require a litunion (`nameIsLitUnionType` — a named alias
+// or an inline all-quoted member set). Cheap-rejects any name not ending in `[]`.
+export function litUnionArrayElemOf(name: string) {
+  const n = name.length
+  if n < 3 { return "" }
+  if name[n - 2] != '[' || name[n - 1] != ']' { return "" }
+  let elem = name.slice(0, n - 2)
+  if elem.length > 1 {
+    if elem[0] == '(' {
+      if elem[elem.length - 1] == ')' { elem = elem.slice(1, elem.length - 1) }
+    }
+  }
+  if nameIsLitUnionType(elem) { return elem }
+  ""
+}
+
 export function valueAtomKind(name: string) {
   if name == "i32" { return 0 }
   if name == "boolean" { return 1 }
@@ -10385,6 +10433,12 @@ export function valueAtomKind(name: string) {
   // `value` field holds the list WRAPPER ref directly (like a string), no scalar box. Each
   // list type gets a distinct code so it tags distinctly (`boolean[]` shares the i32 list).
   if name == "i32[]" || name == "boolean[]" { return 7 }
+  // A literal-union ARRAY (`K[]` over `type K = "a" | "b"`, or an inline `("a"|"b")[]`): its
+  // elements are interned i32 ATOM ids, so the list shares the exact `i32[]` backing and rides
+  // the SAME kind-7 atom (`boolean[]`'s pattern — the construct seeds the atom-element context,
+  // a narrowed read yields the atom list). A real `i32[]`/`boolean[]` member cannot coexist with
+  // it in one union (same backing, one tag), so the shared tag never mis-discriminates.
+  if litUnionArrayElemOf(name) != "" { return 7 }
   if name == "f64[]" { return 8 }
   if name == "string[]" { return 9 }
   if name == "i64[]" { return 10 }

@@ -7769,6 +7769,37 @@ export function rlSlotByName(name: string) {
     if rlElemName[i] == name { return i }
     i = i + 1
   }
+  // A LITUNION-ALIAS atom inside a union ELEMENT name (`K0|i32` — the verbatim text of an
+  // `is (K0 | i32)[]` variant or its narrow key): the interning side keys the slot on the
+  // emit-canonical name, which renders a litunion member as its boxed `string` atom
+  // (`string|i32` — a litunion boxes as a string ref, R3's rule), so the verbatim spelling
+  // misses. Retry the exact match with each litunion-alias atom widened to `string`.
+  // Sound for the same reason the `is K0` string-tag compare is: a real `string` member
+  // cannot coexist with a litunion in one union (`K0 | string` collapses to `string`).
+  if unionMemberCount(name) > 1 {
+    const luAtoms: string[] = []
+    splitUnionAtoms(name, luAtoms)
+    let luChanged = false
+    let luCanon = ""
+    let luI = 0
+    while luI < luAtoms.length {
+      let a = luAtoms[luI]
+      if nameIsLitUnionType(a) {
+        a = "string"
+        luChanged = true
+      }
+      if luI > 0 { luCanon = luCanon + "|" }
+      luCanon = luCanon + a
+      luI = luI + 1
+    }
+    if luChanged {
+      let li = 0
+      while li < rlElemName.length {
+        if rlElemName[li] == luCanon { return li }
+        li = li + 1
+      }
+    }
+  }
   const qn = nullablePartOf(name)
   let qBase = name
   if qn != "" { qBase = qn }
@@ -10623,6 +10654,12 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // narrowing types it as the member). A sub-union narrowing (2+ atoms) keeps
     // the box.
     if narrowedValueAtomOf(e.identName) != "" { return false }
+    // A union binding narrowed to a REF-ELEMENT array arm reads UNBOXED to the reflist
+    // wrapper (`if x is (i32 | string)[] { const t = x … }`): in this scope it is a
+    // LIST, not a union value — the ref-array twin of the scalar-atom rule above.
+    // Without it a REBIND under the narrow classified as a union BOX while the init
+    // emitted the unboxed wrapper ref — invalid wasm.
+    if narrowedRefArrayOf(e.identName) != "" { return false }
     if paramUnion(fnIx, e.identName) { return true }
     if declaredUnion(e.identName) { return true }
     // A CAPTURED union box (`const a: C | D = …; () => … a is C …`): the env field is the union
@@ -11348,10 +11385,14 @@ export function exprArray(exprIx: i32, fnIx: i32) {
     return false
   }
   if e is Ident {
-    // A VALUE-union ident narrowed to an i32-backed LIST arm (`is i32[]`, `is (boolean |
-    // null)[]`, `is (K | null)[]` — value-atom kind 7) reads UNBOXED as the i32 list
-    // (`emitValueUnionUnboxRead`), so indexing / `.length` classify it as a list.
+    // A value-union ident narrowed to a KIND-7 i32-backed LIST atom classifies as an
+    // i32 list in the narrowed branch, checked FIRST — the binding's DECLARED type is
+    // the union, so the param/local/global tests below miss it. Two narrowing spellings:
+    // `is i32[]` / `is (boolean | null)[]` / `is (K | null)[]` read UNBOXED via
+    // `emitValueUnionUnboxRead` (the union-ident read kind), and `is K0[]` (a
+    // litunion-array member on the i32-list backing) via the narrowed value-atom.
     if unionIdentReadKind(exprIx, fnIx) == 7 { return true }
+    if valueAtomKind(narrowedValueAtomOf(e.identName)) == 7 { return true }
     if paramArray(fnIx, e.identName) { return true }
     if declaredArray(e.identName) { return true }
     if globalIsArray(e.identName) {
