@@ -37,6 +37,32 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 
 ## Next (highest leverage)
 
+> **#1 priority — drive the rep-composition fuzz baseline to 0** (`scripts/rep-fuzz-baseline.txt`;
+> item 2 below). Every remaining entry is a fail-loud REJECT — a coverage gap the compiler refuses
+> cleanly, never a miscompile — so this is *finishing the implementation of the language surface we
+> already accept*, not new features. As of 2026-07-19 it is **17** (from 199 earlier the same day;
+> `docs/internals/rep-fuzz-findings.md`). The residual is the deepest tail — nested
+> closures×maps×arrays×unions at depth 4-5 — which is exactly where the parallel kind-numbering
+> (below) hurts most, so the burn-down and the `repOf` rewrite reinforce each other.
+
+- ⬜ **Dogfood `match` + literal-unions to collapse the kind-numbering (use the surface we HAVE).**
+  The recurring authoring pain (evidence: the depth-4-5 burn-down tail) is that rep families are
+  *stringly-typed* (`"nullist"`, `"nuli64list"`) and *bare-i32 field codes* (18/28/29/30…), enumerated
+  in **parallel switch ladders that must stay hand-synced** — `fbValtype` / `fbValtypeNullable` /
+  `fbRefNullForKind` / `fbHeapIdxForKind` over one kind set; `fieldTypeCode` / `nameFieldCode` /
+  `anonFieldCode` over another. The dominant slice failure mode is "forgot the arm in ladder N," found
+  only at runtime as "no interned slot." **VL already has literal-union types + a working `match`
+  (A16/B21 phase 1) — adopt them in the compiler's own rep/kind code** so a missing arm is a
+  non-exhaustive-`match` *compile* error, not a runtime hole. Order: (1) make sure that surface is
+  actually load-bearing enough to carry rep code first — `match` exhaustiveness (A-exhaust / B21) and
+  literal-union ergonomics fully implemented and dogfood-tested; (2) migrate the kind ladders to a
+  single `match` over a literal-union of kinds, opportunistically as the `repOf` rewrite touches each.
+  Deliberately NOT building new enum/ADT machinery yet — only if adopting today's `match`+union
+  surface proves insufficient. Related: carry structured `Ty` through codegen instead of
+  round-tripping through emit-name strings (the `tyToEmitName` `K0→string` softening caused an
+  invalid-wasm this session; `splitUnionAtoms` paren-depth was the same class) — subsumed by the
+  `repOf(type)→descriptor` rewrite (item 3, which already derives from the `Ty` arena).
+
 - ⬜ **Emitter rep architecture — reduce the structural↔nominal / kind-scheme special-casing.** The
   recurring smell (see `DECISIONS.md` if expanded): the checker is **structural** (`{x:i32}`), the
   emitter is **nominal** (keyed by name in `structIndexByName`/`rlSlotByName`), and the same wasm rep
@@ -53,21 +79,21 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
      `structIndexOfTypeName`. The remaining `structIndexByName` sites stay nominal-only for now — migrate
      each opportunistically when a structural name actually reaches it (premature otherwise: today they
      all receive nominal names, so a blanket swap is a no-op with risk).
-  2. 🟡 **Rep-bug burn-down.** ✅ **Soundness milestone reached:** every unsound class
-     (INVALID-WASM, TRAP, MISMATCH) is now **0** at the pinned CI seeds — the residual baseline is
-     33 shapes, ALL fail-loud REJECT (coverage gaps the compiler refuses cleanly, never silent
-     miscompiles), and the check is now EXACT/bidirectional (`scripts/rep-fuzz-check.sh`: soundness
-     never baselineable, new rejects + stale entries both fail). Details + wave history in
-     `docs/internals/rep-fuzz-findings.md`. Baseline down to 25 shapes after union-with-array (#863)
-     and union-with-map, scalar/string/mono values (#865) shipped. (The former item (a) —
-     ref-VALUE map-union arms — LIFTED in #868: the box/tag/read seams already keyed ONE mv slot
-     per arm atom, so no heap-identity hazard remained; this list was stale. The map-value heap
-     type additionally dedups across the box seam by canonical layout now — repOf slot layer
-     below — so a TWIN-spelled map arm boxes/`is`-tests as one type.) REMAINING (coverage, not
-     soundness): **(c)** the map
-     READER path through the value-call ABI (construct-and-return is fixed, #860); **(d)** niche
-     nullable-scalar lists `(boolean|null)[]`/`(f64|null)[]` (clean rejects, no box rep) + the
-     lambda-param i64-context deferral tail. Keep graduating baseline shapes as fixes land.
+  2. 🟡 **Rep-bug burn-down — THE #1 PRIORITY (drive to 0).** ✅ **Soundness milestone holds:** every
+     unsound class (INVALID-WASM, TRAP, MISMATCH) is **0**; the check is EXACT/bidirectional
+     (`scripts/rep-fuzz-check.sh`: soundness never baselineable, new rejects + stale entries both
+     fail). Wave history in `docs/internals/rep-fuzz-findings.md`. **As of 2026-07-19 the baseline is
+     17** (a broad 16-seed net; down from 199 the same day — a session that graduated the map-reader
+     value-call path (former item (c)), the nullable-scalar & nullable-list families (former item (d)),
+     nullable-litunion/f32 struct fields, f32/f64-list value atoms, variant composite-field boxing,
+     closure-result composite/nullable/map results, array-of-(nullable-)closure elements, and several
+     hand-found TRAP/INVALID-WASM fixes the fuzzer never generated). REMAINING (coverage, not
+     soundness) is the DEEPEST tail — depth-4-5 compositions such as
+     `{[string]: {a, f: (i32) => (() => {[string]: i64}), z}}` (map→struct→closure→closure→map) and
+     `(((i32) => f32)[] | i32)[]` (closure-array-under-union in an array) — several of which resist
+     point-fixes and want the recursive `repOf` rewrite (item 3) + the `match`/kind dogfood (above)
+     rather than another parallel-ladder arm. Keep graduating baseline shapes as fixes land; when the
+     list empties the fuzzer is at true zero over the wide net.
   3. 🟡 **`repOf(type) → descriptor` unification (the "rewrite") — strangler, in progress.**
      Foundation SHIPPED (→ `CHANGELOG.md`): `emit_rep.vl`'s `RepDesc` derived table-driven from the
      `Ty` arena (cycle-safe: kind arms recurse ≤1 wrapper level; generation-stamped visited marks),
@@ -435,6 +461,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   `tests/vl_check_codegen_test.ts`, which deliberately asserts only the emit-stage *marker* so it
   won't pin the wording this item improves). Compile-time analogue of B-debug's value-rich panic
   messages (runtime traps).
+- ⬜ **B-repdebug. Rep-resolution introspection for compiler authors.** Diagnosing WHY a composite
+  shape rejects — or which parallel kind-ladder is missing an arm — is a manual minimal-repro hunt
+  today, the single biggest per-slice time sink in the rep burn-down. Two cheap tools would collapse
+  it: (1) `vl check --why-reject <file>` (/ `--explain-rep <type>`) printing the rep-resolution path
+  and the exact bail site (e.g. `map value kind → -3 at mvValKindOfName`) — the emit dual of the
+  checker's honest messages; (2) `vl build --dump-reps` dumping the interned rep / heap-type table +
+  the `mAssignTypeIndices` layout — the heap-index oracle is append-only and invisible, so seeing it
+  is the difference between a 30-second and a 30-minute diagnosis. Serves the compiler author, not
+  end-users (contrast B-emitmsg, the user-facing message). Adjacent, cheap: have the `.vl` corpus
+  runner label WHICH tier failed (run-oracle vs `assertLint`) — a lint-tier fixture-directive bug
+  (undeclared `@warning`, or an `@hint` the wasm-lint tier can't emit) reads as a compiler failure
+  today and has cost real misdiagnosis.
 - ⬜ H3 merge-by-renaming is a bridge — post-parity revisit notes live in native-modules-design.md
   §Post-parity revisit (symbol-based resolution replaces the rename walker).
 
