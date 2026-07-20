@@ -1,0 +1,53 @@
+// @run
+// @log 62484
+// @log b
+// @log 11
+// @log 2.5
+// @log 2
+// @log 78
+// The element lambdas ignore their params (they probe the ABI, not the arg):
+// @warning Unused parameter
+// A union VARIANT whose struct arm carries a CLOSURE-ARRAY field
+// (`{a: i32, f: ((i32) => K0)[], z: f64} | i32`) — the rep-fuzz p2c/p2r family this
+// graduates. Two composed pieces:
+//   1. CHECKER seeding: a struct literal flowing into the union descends into its arm
+//      (`unionObjArmForLit`), and the seed-safety gate now admits a closure-ARRAY field
+//      (`unionArmSeedSafe`'s TyArray-of-TyFunc arm) — so the bare element lambdas infer
+//      their params/result from the arm's field type (`(q0) => ("62484")` adopts
+//      `(i32) => K0`) instead of failing "cannot infer a type for parameter".
+//   2. EMIT reservation: the fused narrowed indexed call `t0.f[0](1)` resolves only under
+//      the `is`-narrowing, which the narrowing-blind frame pre-pass cannot see — so
+//      `blockHasCallRef` reserves `callRefSlot` conservatively for an INDEX over a member
+//      chain leafing at a closure-element reflist field (`calleeIsUnionArmCloArrayIndex`);
+//      without it the `call_ref` spill landed on an i32-typed local (invalid wasm).
+// Covers both fuzz positions: p2r (narrowed read through the box) and p2c (construct only),
+// plus the decoy fields, `.length`, both elements, and the scalar arm's narrow.
+type K0 = "b" | "62484"
+
+function makeIt(w: i32): {a: i32, f: ((i32) => K0)[], z: f64} | i32 {
+  if w == 0 { return { a: 11, f: [(q0) => ("62484"), (q1) => ("b")], z: 2.5 } }
+  return 77
+}
+
+function go() {
+  const v = makeIt(0)
+  const t0 = v
+  if t0 is {a: i32, f: ((i32) => K0)[], z: f64} {
+    print(t0.f[0](1))  // 62484 — the fused narrowed indexed value call
+    print(t0.f[1](2))  // b — second element, same reflist slot
+    print(t0.a)        // 11 — decoy sibling reads through the same box
+    print(t0.z)        // 2.5
+    print(t0.f.length) // 2
+  } else {
+    print("OTHER")
+  }
+  const w = makeIt(5)
+  const t1 = w
+  if t1 is i32 {
+    print(t1 + 1) // 78 — the scalar arm still narrows + reads
+  } else {
+    print("STRUCT")
+  }
+}
+
+go()

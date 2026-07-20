@@ -536,6 +536,43 @@ function internCloResultChain(tn: string) {
   0
 }
 
+// The nulclosure-ANNOTATION dual of `internCloResultChain`: intern every closure `$fnsig`
+// reachable through the RESULT chain of a NULLABLE closure annotation's inner function type
+// (`(() => ((i32) => f32)) | null` → the inner `(i32) => f32`; `((i32) => (() =>
+// {a: i64, f: i32, z: f64})) | null` → the inner `() => {a: …}`). The annotation may be the
+// program's ONLY spelling of these types (the value only ever `null`, narrowed and called),
+// so no concrete lambda ever mints them. Same spine walk and scalar/closure bound as
+// `internCloResultChain`, WIDENED to a single-shape STRUCT result: a `>sN;` result round-trips
+// through a chained value call (the struct is a plain ref read off the `call_ref` result), and
+// `unionArmSigKey` keys "" for a shape that never interned — that level then stays a clean
+// reject. The litunion / union-box / map / string results stay excluded (their recovery
+// through a CHAINED closure call is the same unfinished slice `internCloResultChain` bounds).
+function internNulCloResultSpine(tn: string) {
+  if tn == "" { return 0 }
+  let cur = peelWrapType(tn)
+  let guard = 0
+  while guard < 64 {
+    guard = guard + 1
+    const a = annArrowAt(cur)
+    if a < 0 { return 0 }
+    const ret = peelWrapType(cur.slice(a + 2, cur.length))
+    const retIsClosure = annArrowAt(ret) >= 0
+    if (retIsClosure || cloResultIsPlainScalar(ret) || nameIsSingleShape(ret)) {
+      const k = unionArmSigKey(cur)
+      if k != "" {
+        if cloSigPosOfKey(k) < 0 {
+          cloSigKeys.push(k)
+          cloSigRepFn.push(-1)
+        }
+      }
+    }
+    // Descend only THROUGH a nested-closure result — a scalar/struct result ends the spine.
+    if !retIsClosure { return 0 }
+    cur = ret
+  }
+  0
+}
+
 // Collect the distinct `$fnsig` env-leading functypes — one per distinct eligible
 // signature KEY across all lifted functions (any could be used as a value), in
 // `fnStmts` order. Runs AFTER `computeRetInference` (the key reads inferred return
@@ -685,6 +722,13 @@ export function collectCloSigs() {
             cloSigRepFn.push(-1)
           }
         }
+        // A nulclosure whose RESULT is ITSELF a closure (`(() => ((i32) => f32)) | null`,
+        // `((i32) => (() => {a: i64, f: i32, z: f64})) | null`): the intern above mints only
+        // the OUTER sig (result collapsed to the shared `>c` fat-pointer), so the CHAINED
+        // value call on the narrowed result (`t0()(1)`, `t0(1)()`) finds no interned sig for
+        // the inner closure. Walk the annotation's result spine and synthesize each nested
+        // result closure's `$fnsig` too.
+        internNulCloResultSpine(nullablePartOf(nm))
       }
       // A SHAPE annotation with a closure/nulclosure FIELD (`{f: () => i32} | null`,
       // `{f: (() => f32 | null) | null}`) whose program constructs NO lambda — the value

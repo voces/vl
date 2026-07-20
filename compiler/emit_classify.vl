@@ -4161,6 +4161,13 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
       if !isVal && calleeIsUnionClosureArrayIndex(n.callFn, fnIx) {
         isVal = true
       }
+      // `t0.f[0]()` where `t0`'s union has a struct arm carrying a CLOSURE-ARRAY field
+      // (`{a: i32, f: ((i32) => K0)[], z: f64} | i32`): the `is`-narrowing that resolves
+      // the member chain is not active in this pre-pass — reserve conservatively (the
+      // indexed-member twin of the two reservations around it).
+      if !isVal && calleeIsUnionArmCloArrayIndex(n.callFn, fnIx) {
+        isVal = true
+      }
       // `t0.f.f()` where `t0`'s union has a struct arm whose (possibly nested) field
       // chain ends in a CLOSURE field: the `is`-narrowing that resolves the chain is
       // not active in this pre-pass — reserve conservatively (a spare local is
@@ -8381,9 +8388,12 @@ function internShapeArms(arms: string[]) {
 // `{f:i32}`. A non-shape leaf (`i32`, a named type, a map) interns as a no-op.
 export function internShapeDeep(nm: string) {
   if nm.length < 2 { return 0 }
-  if nm[0] == '(' && nm[nm.length - 1] == ')' {
-    return internShapeDeep(nm.slice(1, nm.length - 1))
-  }
+  // Peel ONLY a grouping pair that wraps the WHOLE name. A functype whose leading `(` is its
+  // own PARAM LIST (`(i32)=>(()=>{a:i64,f:i32,z:f64})`) must NOT be blind-peeled — the garbled
+  // remainder (`i32)=>…`) dead-ends every case below, so the shapes buried in its RESULT spine
+  // never intern (and a chained value call's struct read then finds no interned shape).
+  const uw = monoUnwrapParens(nm)
+  if uw.length != nm.length { return internShapeDeep(uw) }
   // A VALUE UNION leaf (`i32 | null`, `string | i32`) — register its box reps. Do NOT peel its `| null`:
   // here the null is a union ATOM (a tag in a non-null box), NOT a nullable-niche wrapper. Checked AFTER
   // the parens peel (so `(i32|null)` reaches here) but BEFORE the `| null` peel (which would lose the atom).
@@ -8661,9 +8671,13 @@ export function variantNestedShapeOk(nm: string): boolean {
 // pre-slice behavior.
 function internFuncTypeShapes(nm: string): i32 {
   if nm.length < 2 { return 0 }
-  if nm[0] == '(' && nm[nm.length - 1] == ')' {
-    return internFuncTypeShapes(nm.slice(1, nm.length - 1))
-  }
+  // Peel ONLY a grouping pair that wraps the WHOLE name (`(()=>{f:i32})` → `()=>{f:i32}`).
+  // A functype whose leading `(` is its own PARAM LIST (`(i32)=>(()=>{f:i32})`) must NOT be
+  // blind-peeled — that garbles the name (`i32)=>(()=>{f:i32}`) and the shapes buried in a
+  // NESTED functype result never intern (a chained value call's struct read then finds no
+  // interned shape).
+  const uw = monoUnwrapParens(nm)
+  if uw.length != nm.length { return internFuncTypeShapes(uw) }
   const np = nullablePartOf(nm)
   if np != "" { return internFuncTypeShapes(np) }
   if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
@@ -10052,6 +10066,94 @@ export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
 // Walk field path `path` from union arm `arm`: the FIRST hop resolves through the arm's
 // struct-table OR variant-table row, every MID hop must be a code-15 nested-struct field
 // (following its target), and the LAST hop is a closure field (code 14 / 22).
+// True if `exprIx` is an INDEX whose receiver is a member CHAIN (`t0.f[0]`) rooted at an
+// IDENT declared as a union, whose field path walks — narrowing-blindly, same discipline as
+// `calleeIsUnionArmClosureMember` — to a CLOSURE-ELEMENT ARRAY field (a code-5 reflist field
+// whose element name is a function type). The indexed-member callee shape `blockHasCallRef`
+// reserves `callRefSlot` for: the `is`-narrowing that resolves the chain is not active during
+// the frame pre-pass, so `exprIsClosure` misses `t0.f[0]` and the narrowed `call_ref`'s
+// closure spill landed on an unreserved (i32-typed) index — invalid wasm. An over-reservation
+// is a harmless spare local.
+export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
+  if !uDeclared { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Index {
+    const m = P.nodes[unwrapParen(e.idxArr)]
+    if m is Member {
+      const props: string[] = []
+      let cur = unwrapParen(e.idxArr)
+      let rootName = ""
+      let guard = 0
+      while guard < 32 {
+        guard = guard + 1
+        const cn = P.nodes[cur]
+        if cn is Member {
+          props.push(cn.memProp)
+          cur = unwrapParen(cn.memObj)
+        } else if cn is Ident {
+          rootName = cn.identName
+          break
+        } else {
+          return false
+        }
+      }
+      if rootName == "" || props.length == 0 { return false }
+      const path: string[] = []
+      let pr = props.length - 1
+      while pr >= 0 {
+        path.push(props[pr])
+        pr = pr - 1
+      }
+      const un = unionNameOfIdent(rootName, fnIx)
+      if un == "" { return false }
+      let uset = unionMemberSetOf(un)
+      if uset == "" { uset = un }
+      const atoms: string[] = []
+      splitUnionAtoms(uset, atoms)
+      let ai = 0
+      while ai < atoms.length {
+        if atoms[ai] != "null" {
+          if unionArmPathIsCloArray(atoms[ai], path) { return true }
+        }
+        ai = ai + 1
+      }
+    }
+  }
+  false
+}
+
+// Walk field path `path` from union arm `arm` (the `unionArmPathIsClosure` walk), leafing
+// at a CLOSURE-ELEMENT ARRAY field: a code-5 reflist field whose element name is a function
+// type (`f: ((i32) => K0)[]`).
+function unionArmPathIsCloArray(arm: string, path: string[]): boolean {
+  let hop = 0
+  let curSi = structIndexByName(arm)
+  const vi0 = variantIndexOf(arm)
+  while hop < path.length {
+    let code = -1
+    let elem = ""
+    if hop == 0 && curSi < 0 && vi0 >= 0 {
+      const vfi = variantFieldIndex(vi0, path[0])
+      if vfi < 0 { return false }
+      code = variantFieldTypeAt(vi0, vfi)
+      elem = variantFieldElemName(vi0, vfi)
+    } else {
+      if curSi < 0 { return false }
+      const fi = sFieldIndex(curSi, path[hop])
+      if fi < 0 { return false }
+      code = sFieldTypeAt(curSi, fi)
+      elem = sFieldElemNameAt(curSi, fi)
+    }
+    if hop == path.length - 1 {
+      return code == 5 && annArrowAt(peelGroupParens(elem)) >= 0
+    }
+    if code != 15 { return false }
+    curSi = structIndexByName(elem)
+    hop = hop + 1
+  }
+  false
+}
+
 function unionArmPathIsClosure(arm: string, path: string[]): boolean {
   // (code, elem) of the first hop, from whichever table holds the arm.
   let hop = 0
