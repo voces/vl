@@ -21,6 +21,7 @@ import {
   isInferLetNulBool,
   isInferLetNulStr,
   isValueUnionName,
+  nameIsFuncTypeAtom,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
   nodeArrayElemIsLitUnion,
@@ -129,6 +130,7 @@ import {
   nonNullMemberCountOf,
   nulCloFlag,
   nulLitUnionInnerName,
+  nullClosureArrElem,
   nullablePartOf,
   numTextIsFloat,
   objFieldVal,
@@ -4920,7 +4922,12 @@ export function exprIsBool(ix: i32, fnIx: i32) {
 function cloArrSlotSigKey(slot: i32) {
   if slot < 0 || slot >= rlElemName.length { return "" }
   if rlElemKindTbl[slot] != 5 { return "" }
-  const nm = rlElemName[slot]
+  let nm = rlElemName[slot]
+  // A NULLABLE-closure element slot keys the full `"<closure> | null"` (the niche read
+  // discipline) — peel the `| null` to reach the parenthesized function type; the narrowed
+  // indexed call (`if e != null { e(1) }`) casts to the same functype a non-null element does.
+  const nmp = nullablePartOf(nm)
+  if nmp != "" { nm = nmp }
   if nm.length < 2 { return "" }
   if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
   return annSigKey(nm.slice(1, nm.length - 1))
@@ -4933,7 +4940,11 @@ function cloArrSlotSigKey(slot: i32) {
 export function cloArrSlotRetName(slot: i32) {
   if slot < 0 || slot >= rlElemName.length { return "" }
   if rlElemKindTbl[slot] != 5 { return "" }
-  const nm = rlElemName[slot]
+  let nm = rlElemName[slot]
+  // A NULLABLE-closure element slot: peel the `| null` (the call classifies on the
+  // narrowed non-null closure), mirroring `cloArrSlotSigKey`.
+  const nmrp = nullablePartOf(nm)
+  if nmrp != "" { nm = nmrp }
   if nm.length < 2 { return "" }
   if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
   const inner = nm.slice(1, nm.length - 1)
@@ -7316,10 +7327,13 @@ export function ensureRefElem(elemName: string) {
   const enp = nullablePartOf(elemName)
   if (
     enp != "" &&
-    (nameIsArray(enp) || (nameIsMap(enp) && !nameIsMapMemberUnion(enp)))
+    (nameIsArray(enp) ||
+      nameIsFuncTypeAtom(enp) ||
+      (nameIsMap(enp) && !nameIsMapMemberUnion(enp)))
   ) {
-    // A nullable-LIST element (`i32[] | null`) and a nullable-MAP element
-    // (`{[string]: V} | null`) both need their grouping parens back to read the kind.
+    // A nullable-LIST element (`i32[] | null`), a nullable-CLOSURE element
+    // (`((i32) => boolean) | null` — the kind-5 niche), and a nullable-MAP element
+    // (`{[string]: V} | null`) all need their grouping parens back to read the kind.
     arrName = "(" + elemName + ")[]"
   } else if (
     parenUnionArrElemName("(" + elemName + ")[]") != "" &&
@@ -7415,6 +7429,10 @@ export function refArrElemKind(name: string) {
   if nullArrayArrElem(name) != "" {
     return refArrElemKind(nullArrayArrElem(name) + "[]")
   }
+  // A `(((i32) => boolean) | null)[]` nullable-CLOSURE array is a closure ref list (kind 5)
+  // — its element is a `(ref null $cloStruct)` niche, not a union box. Checked before the
+  // value-union test below (whose kind-2 box has no rep for a niche-nullable closure).
+  if nullClosureArrElem(name) != "" { return 5 }
   // A `(string|i32)[]` value-union element list is a union-box list (kind 2).
   if parenUnionArrElemName(name) != "" { return 2 }
   // An `((i32) => i32)[]` array of functions is a closure-element list (kind 5).
@@ -7891,15 +7909,17 @@ export function refArrElemName(name: string) {
 // SLOT index (existing slot if already present). `kind` is 1 (struct) or 2 (union box).
 // Heap/backing/wrapper indices are filled later in `emitModule`.
 // A ref-list element is a NULLABLE NICHE (the index read leaves it `(ref null $elem)`) iff it is a
-// niche-bearing KIND — a struct (1), an inner LIST of any leaf (4, the distinct-backing scalar/string
-// 6/7/8/10, or a ref inner 9) — AND its name carries `| null`. A value-union BOX (kind 2) is NOT a
-// niche even though `i32 | null` also has `| null` (its null is a tag inside a non-null box). The KIND
-// is the discriminator; recording it once here keeps the read/build sites kind-agnostic.
+// niche-bearing KIND — a struct (1), a closure (5, the `(ref null $cloStruct)` fat-pointer), an
+// inner LIST of any leaf (4, the distinct-backing scalar/string 6/7/8/10, or a ref inner 9) — AND
+// its name carries `| null`. A value-union BOX (kind 2) is NOT a niche even though `i32 | null`
+// also has `| null` (its null is a tag inside a non-null box). The KIND is the discriminator;
+// recording it once here keeps the read/build sites kind-agnostic.
 function rlElemNicheNullable(kind: i32, name: string) {
   if (
     kind != 1 &&
     kind != 3 &&
     kind != 4 &&
+    kind != 5 &&
     kind != 6 &&
     kind != 7 &&
     kind != 8 &&
@@ -10435,6 +10455,15 @@ export function exprNulClosure(exprIx: i32, fnIx: i32) {
   // A bare `m[k]` over a FUNCTION-valued map (mv kind 14) reads back a NULLABLE closure
   // `(ref null $cloStruct)` — `const f = m[k]` binds the kind-19 niche, narrowed `if f != null`.
   if e is Index {
+    // Indexing a `(((i32) => boolean) | null)[]` (a kind-5 ref list whose element slot keeps
+    // the `| null`) yields a NULLABLE closure — the read left it `(ref null $cloStruct)`, so
+    // `const f = xs[i]; if f != null` narrows. The closure dual of `exprNullableList`'s arm.
+    if exprRefArray(e.idxArr, fnIx) {
+      const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemNullable.length {
+        if rlElemKindTbl[slot] == 5 && rlElemNullable[slot] == 1 { return true }
+      }
+    }
     const mrs = mapReadMvSlot(ux, fnIx)
     if mrs >= 0 { return mvValKind[mrs] == 14 }
   }
@@ -10996,6 +11025,11 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
       if ffe >= 0 { return fRetKind[ffe] == "union" }
     }
+    // A union-returning INDEXED closure-element call (`xs[i](1)` over a
+    // `((i32) => A | B)[]`): the element signature's result token is the box (`>u`).
+    // The checker net below can miss it (a union WITH null records nullable-shaped),
+    // so the sig-derived kind is consulted like the other `cloArrCallRetKind` arms.
+    if cloArrCallRetKind(exprIx, fnIx) == "union" { return true }
     // A PURE-litunion result (`pick(ks)` → `K`) reps as the i32 atom / string ref,
     // never the box — the checker-typed net must not claim it as a union value.
     if nodeTyIsPureLitUnion(exprIx) { return false }
@@ -14113,6 +14147,24 @@ export function identFnTypeAnnName(name: string, fnIx: i32) {
               if ini.binOp == "??" {
                 const jtn = nodeTyName(d.letInit)
                 if annArrowAt(jtn) >= 0 { return jtn }
+              }
+            }
+            // An UN-annotated binding read from a CLOSURE-element ref list (`const f = xs[i]`
+            // over `((i32) => R)[]` / `(((i32) => R) | null)[]`): the kind-5 slot's element
+            // name IS the function type — return it (grouping parens peeled for a plain
+            // element; a nullable element keeps its `| null`, which `cloNameSigKey` peels) so
+            // a call through the binding resolves the ELEMENT's real `$fnsig`, exactly as the
+            // direct indexed call (`xs[i](1)` → `cloArrSlotSigKey`) does.
+            if ini is Index {
+              if exprRefArray(ini.idxArr, fnIx) {
+                const islot = refListSlotOfExpr(ini.idxArr, fnIx)
+                if islot >= 0 && islot < rlElemKindTbl.length {
+                  if rlElemKindTbl[islot] == 5 {
+                    const enm = rlElemName[islot]
+                    if nullablePartOf(enm) != "" { return enm }
+                    return peelGroupParens(enm)
+                  }
+                }
               }
             }
           }
