@@ -8568,12 +8568,22 @@ function funcTypeShapeLowerable(nm: string): boolean {
         } else if !funcTypeFieldCodeSafe(fc) {
           // A code-5 field whose type is a nested SCALAR-LEAF array (`f: boolean[][]`)
           // or a lowerable STRUCT-element array (`f: {g: f64}[]`, `f: S[]`) is a plain
-          // ref-list slot — lowerable (see the header note); any other unsafe code
-          // keeps the shape un-interned (the clean closure reject).
+          // ref-list slot — lowerable (see the header note). A code-19 MAP field whose
+          // VALUE kind the mv interner represents (`mvValKindOfName != -3`) is likewise
+          // lowerable: the field is a plain map-struct slot the `collectA` field pass
+          // interns (`mvShapeOfValName`) exactly as for a non-closure struct field —
+          // the R1 composition rep the original gate predated. A code-16 union-BOX
+          // field whose union is REGISTERED (`isUName` — `registerInlineUnion`'s
+          // functype-return descent registers a result shape's field unions in
+          // `collectU`, before this gate runs from `internShapeDeep`) is a plain box
+          // ref slot the same machinery a non-closure struct field uses. Any other
+          // unsafe code keeps the shape un-interned (the clean closure reject).
           if (
             !(fc == 5 &&
               (nameIsNestedScalarLeafArray(ftxt) ||
-              structElemArrayLowerable(ftxt)))
+              structElemArrayLowerable(ftxt))) &&
+            !(fc == 19 && mvValKindOfName(mapValNameOf(ftxt)) != -3) &&
+            !(fc == 16 && isUName(ftxt))
           ) {
             okAll = false
           }
@@ -9780,6 +9790,31 @@ export function unionMapArmIdent(exprIx: i32, fnIx: i32) {
   if e is Ident {
     const un = unionNameOfIdent(e.identName, fnIx)
     if un != "" { return unionHasMapArm(un) }
+    // The typed-IR fallback: a union binding whose NAME the syntactic resolution cannot
+    // render (`const t1 = t0()` off a narrowed nullable-closure rebind — the Ident-callee
+    // miss) still records the union on its node type. The emitter lowers the narrowed map
+    // read regardless, so the frame pre-pass must reserve the map scratch from the same
+    // signal. (An over-reservation is a harmless spare.)
+    return nodeTyUnionHasMapArm(exprIx)
+  }
+  false
+}
+
+// True when the CHECKED type of `exprIx` is a union carrying a MAP member, or a bare
+// MAP (a narrowed occurrence records the NARROWED arm type, so the then-branch ident
+// of `if t1 is {[string]: i32}` types TyMap, not the union) — the typed-IR net behind
+// `unionMapArmIdent`'s syntactic miss.
+function nodeTyUnionHasMapArm(exprIx: i32): boolean {
+  const ty = nodeTyIxOf(exprIx)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return true }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if T.tys[t.uMembers[i]] is TyMap { return true }
+      i = i + 1
+    }
   }
   false
 }
@@ -12956,6 +12991,11 @@ export function exprMap(exprIx: i32, fnIx: i32) {
     if paramMap(fnIx, e.identName) { return true }
     if declaredMap(e.identName) { return true }
     if globalIsMap(e.identName) { return true }
+    // A CAPTURED map variable of a lifted lambda (`() => (h0)` with `h0` a parent-frame
+    // map binding): its env field carries the map ref — classify it exactly as a
+    // param/local receiver would, so a captured map flowing into a union-boxed RESULT
+    // (`() => {[string]: string} | boolean`) takes the map-arm boxing, not the raw ref.
+    if capturedKindOf(fnIx, e.identName) == "map" { return true }
     // A NULLABLE map binding (`{[string]: V} | null`, kind `nulmap`) IS a map ref in the narrowed
     // (`!= null`) branch — the checker proved the map op guarded. The map-op receiver recovers it
     // non-null (`ref.as_non_null` in `emitMapPrep`); its shape resolves through `mapShapeOfExpr`
@@ -13350,6 +13390,23 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     }
     if paramNulMap(fnIx, e.identName) {
       return paramMapShape(fnIx, e.identName)
+    }
+    // A CAPTURED map variable of a lifted lambda: resolve its shape from the PARENT
+    // frame's binding, the map dual of `capturedUnionName` — so a captured typed-value
+    // map boxes/reads with its own mv slot rather than the mono -1.
+    if capturedKindOf(fnIx, e.identName) == "map" {
+      const cfe = fnStmtsPosOf(fnIx)
+      if cfe >= 0 {
+        const cb = parentBindingOf(cfe, e.identName)
+        if cb >= 0 {
+          const cbn = P.nodes[cb]
+          if cbn is LetDecl {
+            const cpar = fnParent[cfe]
+            if cpar >= 0 { return letMapShapeOf(cb, fnStmts[cpar]) }
+          }
+        }
+      }
+      return -1
     }
     const gl = globalLetOf(e.identName)
     if gl >= 0 {

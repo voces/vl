@@ -2802,7 +2802,16 @@ export function collectA(_stmts: i32[]) {
   // program without an inline map-valued field.
   let sfi = 0
   while sfi < sFieldTypes.length {
-    if sFieldTypes[sfi] == 19 { mvShapeOfValName(sFieldElemName[sfi]) }
+    // A code-19 map field forces the shared map machinery like its nullable twin
+    // below: the field may be the module's only map mention (a closure-result shape
+    // `() => {f: {[string]: V}}` reached only through a union arm still emits the
+    // map read path).
+    if sFieldTypes[sfi] == 19 {
+      mUsed = true
+      lUsed = true
+      aUsed = true
+      mvShapeOfValName(sFieldElemName[sfi])
+    }
     // A NULLABLE map field (code 29) interns the same mv value slot as its non-null
     // twin, and forces the shared map machinery types — the field may be the module's
     // only map mention (a `{f: null}`-only construct still emits `(ref null $mapStruct)`).
@@ -3556,15 +3565,20 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // needs registration — un-registered, the null-narrowed inner call's `>u` box result has
   // no `uBoxIdx` (`uDeclared` stays false) and the value call rejects loudly (the
   // `cloCallUnionResultUnrepresentable` CASE-A floor). GATED to a pure VALUE union
-  // (`isValueUnionName` — scalar atoms + null): a map-member / composite union result does
-  // NOT yet read back through this nesting — registering it would satisfy the CASE-A floor
-  // while the box read mis-lowers (verified REJECT→INVALID-WASM), so those stay loud.
+  // (`isValueUnionName` — scalar atoms + null) or a MAP-member union
+  // (`(() => {[string]: i32} | boolean) | null` — the map arm rides the box tagged via
+  // `mapSlotTag`, and the narrowed read's map scratch frame is reserved by
+  // `unionMapArmIdent`'s typed-IR net): any OTHER composite union result stays loud —
+  // registering it would satisfy the CASE-A floor while the box read mis-lowers
+  // (verified REJECT→INVALID-WASM).
   if rnp != "" && nameIsNulClosure(name) {
     const ncBare = peelGroupParens(rnp)
     const ncA = annArrowAt(ncBare)
     if ncA >= 1 {
       const ncRes = monoUnwrapParens(ncBare.slice(ncA + 2, ncBare.length))
-      if isValueUnionName(ncRes) { return registerInlineUnion(stmts, ncRes) }
+      if isValueUnionName(ncRes) || nameIsMapMemberUnion(ncRes) {
+        return registerInlineUnion(stmts, ncRes)
+      }
     }
   }
   // A NESTED array of an inline union (`(C|D)[][]`, `(C|D)[][][]`): `parenUnionArrElemName` only
