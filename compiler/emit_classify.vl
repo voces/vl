@@ -41,6 +41,7 @@ import {
   nodeTyIsVariant,
   nodeTyIxOf,
   nodeTyMapValIsLitUnion,
+  nodeTyMapValIsNulLitUnion,
   nodeTyMapValName,
   nodeTyName,
   nodeTyWidenedRepName,
@@ -1345,6 +1346,12 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   // with the emitted rep.
   if e is BinExpr {
     if e.binOp == "??" {
+      // A fused read over a NULLABLE-string-valued map (`{[string]: string | null}`) is
+      // STILL `string | null`: the hit arm preserves a stored null.
+      const cns = coalesceMvSlot(exprIx, fnIx)
+      if cns >= 0 {
+        if mvValKind[cns] == 3 && mvSlotNullable(cns) { return true }
+      }
       if exprNullableString(e.binLeft, fnIx) {
         return exprNullableString(e.binRight, fnIx)
       }
@@ -1423,10 +1430,17 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     // A BARE map get `m[k]` over a STRUCT-valued map (`{[string]: S}`) is `S | null` — the
     // `vals` slot is `(ref null $S)` and `emitMapGet` yields it unrecovered (a miss is
     // `ref.null`). So `const v = m[k]` binds the kind-9 niche and narrows with `if v != null`,
-    // the map-read dual of the nullable-struct ARRAY element above. (A `?? d` read is a BinExpr,
-    // not this Index, and stays the non-null value.)
+    // the map-read dual of the nullable-struct ARRAY element above. (A `?? d` read over a
+    // NON-null value stays the non-null struct; see the BinExpr arm below for the nullable one.)
     const mrs = mapReadMvSlot(exprIx, fnIx)
     if mrs >= 0 { return mvValKind[mrs] == 1 }
+  }
+  // A `m[k] ?? d` read over a NULLABLE-struct-valued map (`{[string]: S | null}`) is STILL
+  // `S | null`: the hit arm PRESERVES a stored null (the default fires only on a missing key),
+  // so the binding stays the kind-9 niche and narrows with `!= null`.
+  if e is BinExpr {
+    const cns = coalesceMvSlot(exprIx, fnIx)
+    if cns >= 0 { return mvValKind[cns] == 1 && mvSlotNullable(cns) }
   }
   false
 }
@@ -2293,6 +2307,41 @@ function structIndexByValName(name: string) {
 // the two cannot drift: when the gate enumerated the value types independently it lacked the
 // scalar/atom/closure/union arms, and an annotated map return fell through to an i32 result
 // valtype over a ref-returning body — invalid wasm at the return seam.
+// The single non-null member of a NICHE-nullable map VALUE name — `{f: …} | null` yields
+// the struct member, `{[string]: V} | null` the map member — or "" when `valName` is not
+// `X | null` with exactly ONE non-null member of a kind the nullable-value map rep covers
+// (a struct shape or a map). The chokepoint `mvValKindOfName` / `mvShapeOfValName` / the
+// map op sites strip through, so the slot shares its vals rep (and heap dedup) with the
+// non-null twin.
+export function nulRefMapValInnerOf(valName: string): string {
+  if !unionHasAtom(valName, "null") { return "" }
+  const atoms: string[] = []
+  splitUnionAtoms(valName, atoms)
+  let inner = ""
+  let nonNull = 0
+  let i = 0
+  while i < atoms.length {
+    if atoms[i] != "null" {
+      nonNull = nonNull + 1
+      inner = atoms[i]
+    }
+    i = i + 1
+  }
+  if nonNull != 1 { return "" }
+  if inner == "string" { return inner }
+  if nameIsMap(inner) && !nameIsMapMemberUnion(inner) { return inner }
+  if structIndexByValName(inner) >= 0 { return inner }
+  ""
+}
+
+// True when the interned mv slot's value is a NICHE-nullable ref value (`{f: …} | null` /
+// `{[string]: V} | null`): the vals element legitimately holds null — the store seeds
+// `ref.null <elem>` for a bare `null` and the fused `?? d` read skips the non-null recover.
+export function mvSlotNullable(slot: i32) {
+  if slot < 0 { return false }
+  nulRefMapValInnerOf(mvValName[slot]) != ""
+}
+
 // True when a nested map's inner-value chain bottoms out in a ref LIST whose element is
 // itself a MAP (`{[string]: {[string]: {[string]: f32}[]}}` — a list of inner maps read two
 // map levels deep): the map op sites resolve that element one level shallow, so the deep
@@ -2323,36 +2372,50 @@ export function mvValKindOfName(valName: string): i32 {
   // members + `null`, or `boolean` + `null`) would else claim it and BOX the values into a
   // union box (the store coerced a raw i32 niche into a `(ref $box)` cell — invalid wasm).
   if nameIsNulLitUnion(valName) || nameIsNulBool(valName) { return -1 }
-  // A NULLABLE union value carrying a ref-COMPOSITE member (`{f: …} | null` struct,
-  // `{[string]: …} | null` map, `(…) => … | null` closure, `T[] | null` list, or a wider union
-  // like `{f: K0[]} | string | null`). A pure scalar/string nullable value-union
-  // (`i32 | null`, `i64 | string | null`) boxes fine — the shared value box has a null tag — and
-  // the nullable-atom NICHE forms (`K0 | null` / `boolean | null`) rep as a plain i32 and are
-  // handled above. But a struct / map member (`valueAtomKind < 0`) or a list / closure member
-  // (`valueAtomKind >= 7`) has no scalar box: the map store/read seams then mis-type the
-  // `(ref null)` vals element against the box `(ref $box)` — INVALID wasm on construct, a
-  // bare-box `.f` / call on read. A proper nullable ref-VALUE map rep (a `(ref null <elem>)` vals
-  // list carrying `null` directly, with `??` preserving a stored null) is a larger change; until
-  // it lands, reject only the ref-member nullables, loudly at every op site, never invalid wasm.
+  // A NULLABLE union value. Three sound shapes, one loud remainder:
+  //   · a NICHE nullable REF value — ONE struct (`{f: …} | null`) or map
+  //     (`{[string]: V} | null`) member + null — rides the SAME vals rep as its
+  //     non-null twin: the `(ref null <elem>)` vals slot carries a stored null
+  //     DIRECTLY, a bare `null` stores `ref.null <elem>`, and the fused `?? d`
+  //     read PRESERVES a stored null (the hit arm skips the non-null recover —
+  //     the default fires only on a MISSING key, the corpus oracle's semantics).
+  //     The read binds the corresponding NULLABLE local kind (`nulstruct`/`nulmap`).
+  //   · a pure scalar/string nullable value-union (`i32 | null`, `i64 | string |
+  //     null`) boxes fine — the shared value box has a null tag; the nullable-atom
+  //     NICHE forms (`K0 | null` / `boolean | null`) rep as a plain i32 above.
+  //   · a nullable union with TWO OR MORE non-null members carrying a ref member
+  //     (`{f: {[string]: f64}} | {w: i32} | null`) is a BOX union: `null` boxes as
+  //     the null-tagged box at the store (`emitUnionCoerce`'s NullLit arm), so the
+  //     vals element itself is never null — it falls to the union arm below.
+  //   · a SINGLE list / closure / bare-string member + null has no nullable-value
+  //     rep yet (`string | null` is not a value union — no box is ever minted; a
+  //     list/closure niche needs its own wrapper slot): reject loudly at every op
+  //     site, never invalid wasm.
   if unionHasAtom(valName, "null") {
+    const nin = nulRefMapValInnerOf(valName)
+    if nin != "" {
+      if nin == "string" { return 3 }
+      if nameIsMap(nin) {
+        if mapValNestedListUnsupported(mapValNameOf(nin)) { return -3 }
+        return 6
+      }
+      return 1
+    }
     const nulAtoms: string[] = []
     splitUnionAtoms(valName, nulAtoms)
+    let nonNull = 0
+    let refMember = false
     let na = 0
     while na < nulAtoms.length {
-      const nvk = valueAtomKind(nulAtoms[na])
-      if nvk < 0 || nvk >= 7 { return -3 }
+      if nulAtoms[na] != "null" {
+        nonNull = nonNull + 1
+        const nvk = valueAtomKind(nulAtoms[na])
+        if nvk < 0 || nvk >= 7 { refMember = true }
+      }
       na = na + 1
     }
-    // A nullable value name that is NOT a boxing value union — after the niche and
-    // ref-member arms above, exactly the `string | null` NICHE (one string member +
-    // null; `isValueUnionName` deliberately excludes it, so NO shared value box is
-    // ever minted for it). The union arm below would still claim it as kind 2 and
-    // every box site then referenced the unminted box type (index 0 — invalid wasm
-    // on any store). Its honest rep is a nullable string slot with `??` preserving
-    // a stored null — not expressible on the kind-3 string-map path (whose fused
-    // `?? d` read `ref.as_non_null`s a hit, TRAPPING on a stored null). Reject
-    // loudly until the recursive-rep map value lands.
-    if !isValueUnionName(valName) { return -3 }
+    if refMember && nonNull < 2 { return -3 }
+    if !refMember && !isValueUnionName(valName) { return -3 }
   }
   let kind = -1
   if valName == "string" {
@@ -2405,28 +2468,25 @@ export function mvValKindOfName(valName: string): i32 {
     // a ref-value list whose element is this value's wrapper (`ensureRefElem`, recursive). The
     // store seeds the value literal off this slot and the read classifies the value's element
     // recursively, so any nesting / leaf falls out — one predicate, no per-shape special cases.
+    //
+    // EXCEPT a list whose element is itself a MAP or a NULLABLE (`{[string]: {[string]: V}[]}`,
+    // `{[string]: (i64 | null)[]}`): the SAME one-level-shallow op-site resolution the nested-map
+    // arm above gates on — un-gated here, the deep element resolution walked an unresolved slot
+    // and the COMPILER ITSELF trapped out-of-bounds. Reject loudly until the op sites migrate to
+    // the recursive resolver.
+    if mapValNestedListUnsupported(valName) { return -3 }
     kind = 6
   } else if unionMemberCount(unionMemberSetOf(valName)) > 1 {
     // A UNION-valued map: each value is the shared union BOX ref (`uBoxIdx`), stored in a ref
     // list whose element kind is 2 (the union box) — the SAME ref-value spine as a struct
     // value, only the element heap + the store-coerce / read-classify differ. Covers a VALUE
     // union (`{[string]: i32 | string}`), a STRUCT / heterogeneous union (`{[string]: C | S}`),
-    // and a union ALIAS (`type Shape = C | S`; `unionMemberSetOf` expands it before the count).
-    //
-    // EXCEPT a union with a MAP member (`{[string]: {[string]: i32} | f64}`): a map arm boxes
-    // fine in BINDING position (`markMapUnionArms` + `mapSlotTag`), but the map-VALUE store /
-    // read seams (`emitMapSetV` / `emitMapGetOr` / the push-val path) coerce THIS value through
-    // `emitUnionBoxArg`, which has no map-member arm — the raw value (the scalar arm's f64, the
-    // map arm's struct ref) is written UNBOXED into the `(ref null $uBox)` vals element:
-    // invalid wasm on every store. Reject loudly until the union-box coerce seams resolve map
-    // members at the map-value position (Phase 2's recursive rep).
-    const mapArmAtoms: string[] = []
-    splitUnionAtoms(unionMemberSetOf(valName), mapArmAtoms)
-    let maa = 0
-    while maa < mapArmAtoms.length {
-      if nameIsMap(mapArmAtoms[maa]) { return -3 }
-      maa = maa + 1
-    }
+    // a union ALIAS (`type Shape = C | S`; `unionMemberSetOf` expands it before the count`),
+    // and a union with a MAP member (`{[string]: {[string]: i32} | boolean}`): the map arm
+    // boxes exactly as it does in BINDING position — the store/read seams route through
+    // `emitUnionBoxArg` → `emitUnionCoerce`, whose map-carrier arm tags the map-struct ref
+    // with the arm's `mapSlotTag`; `mvShapeOfValName` interns the arm's mv slot
+    // (`markMapUnionArms`) so the tag and the narrowed read resolve the same slot.
     kind = 2
   } else if annArrowAt(valName) >= 0 {
     // A FUNCTION-valued map (`{[string]: (i32) => i32}`): each value is a closure fat-pointer
@@ -2462,12 +2522,21 @@ export function mvShapeOfValName(valName: string) {
   const kind = mvValKindOfName(valName)
   if kind == -1 { return -1 }
   if kind < 0 { return -3 }
+  // A NICHE-nullable value name resolves its struct/map identity — and keys its vals
+  // ref-list slot — through the single non-null member, so the slot SHARES the vals rep
+  // (and the heap-type dedup) with its non-null twin.
+  let bare = valName
+  const nin = nulRefMapValInnerOf(valName)
+  if nin != "" { bare = nin }
   let vsi = -1
-  if kind == 1 { vsi = structIndexByValName(valName) }
+  if kind == 1 { vsi = structIndexByValName(bare) }
   // A VALUE union also interns its scalar value-box reps; a struct/heterogeneous
-  // union just rides the box payload, so no value boxes are needed.
+  // union just rides the box payload, so no value boxes are needed. A MAP arm's mv
+  // value slot is interned (`markMapUnionArms` — idempotent) so the store-coerce tag
+  // (`mapSlotTag`) and the narrowed read resolve the same slot at the map-value position.
   if kind == 2 {
     if isValueUnionName(valName) { registerValueUnionName(valName) }
+    markMapUnionArms(valName)
   }
   let i = 0
   while i < mvValName.length {
@@ -2482,14 +2551,14 @@ export function mvShapeOfValName(valName: string) {
   if kind == 6 {
     lUsed = true
     aUsed = true
-    if nameIsMap(valName) {
+    if nameIsMap(bare) {
       mUsed = true
-      mvShapeOfValName(mapValNameOf(valName))
+      mvShapeOfValName(mapValNameOf(bare))
     }
     // A non-i32 LIST value forces its inner list's type so the element wrapper heap exists.
-    if nameIsStringArray(valName) { slUsed = true }
-    else if nameIsF64Array(valName) { fa64Used = true }
-    else if nameIsI64Array(valName) { ia64Used = true }
+    if nameIsStringArray(bare) { slUsed = true }
+    else if nameIsF64Array(bare) { fa64Used = true }
+    else if nameIsI64Array(bare) { ia64Used = true }
   }
   mvValName.push(valName)
   mvValKind.push(kind)
@@ -2510,7 +2579,7 @@ export function mvShapeOfValName(valName: string) {
     // the three hand-coded interning cases that duplicated it. (The `mvShapeOfValName` classifier
     // still gates WHICH value types reach here; fully nested / closure list map VALUES additionally
     // need the map store/read/coerce paths migrated to the recursive resolver — a larger change.)
-    mvRlSlot.push(ensureRefElem(valName))
+    mvRlSlot.push(ensureRefElem(bare))
     rlUsed = true
     raUsed = true
   } else if kind == 14 {
@@ -3678,6 +3747,15 @@ export function sFieldIsLitUnionArray(si: i32, fi: i32) {
   if sFieldTypeAt(si, fi) != 4 { return false }
   const r = nameIsLitUnionArray(sFieldElemNameAt(si, fi))
   r
+}
+
+// The union-VARIANT twin of `sFieldIsLitUnionArray`: variant `vi`'s field `fj` is an
+// ATOM-ARRAY field (`f: K[]`, code 4 with a recorded litunion-array element name) — the
+// variant payload build (`emitVariantStruct`) seeds the atom context so the literal
+// builds the i32 list of atom ids, not a string list.
+export function variantFieldIsLitUnionArray(vi: i32, fj: i32) {
+  if variantFieldTypeAt(vi, fj) != 4 { return false }
+  nameIsLitUnionArray(variantFieldElemName(vi, fj))
 }
 
 // The struct table index whose name is `name`, or -1 if `name` is not a declared
@@ -6215,6 +6293,17 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   if e is Index {
     if nodeArrayElemIsNulLitUnion(e.idxArr) { return true }
   }
+  // A fused `m[k] ?? d` read over a NULLABLE-atom-valued map (`{[string]: K | null}`) yields
+  // the `K | null` niche i32 (a member id or the `-1` sentinel — a stored null is preserved),
+  // so an un-annotated `const t = m[k] ?? d` binds the niche and narrows with `!= null`.
+  if e is BinExpr {
+    if e.binOp == "??" {
+      const nbl = P.nodes[unwrapParen(e.binLeft)]
+      if nbl is Index {
+        if nodeTyMapValIsNulLitUnion(nbl.idxArr) { return true }
+      }
+    }
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -7022,6 +7111,16 @@ export function structIdxOfElemName(name: string) {
 // SLOT keys on the full `"P | null"` so a read can tell it from a non-null `P[]` (different slot)
 // and skip the `ref.as_non_null` recover. A value-niche element (`(i32 | null)[]`) is excluded —
 // its non-null part is not a declared struct, so it stays the value-union-box path.
+// The inner map of a `({[string]: V} | null)[]` nullable-MAP array element, else "".
+function nullMapArrElemOf(name: string) {
+  const elem = parenUnionArrElemName(name)
+  if elem == "" { return "" }
+  const nn = nullablePartOf(elem)
+  if nn == "" { return "" }
+  if nameIsMap(nn) && !nameIsMapMemberUnion(nn) { return nn }
+  ""
+}
+
 function nullStructArrElem(name: string) {
   const elem = parenUnionArrElemName(name)
   if elem == "" { return "" }
@@ -7171,7 +7270,12 @@ export function ensureRefElem(elemName: string) {
   // elements keep their existing (munged-name) kind and are unaffected.
   let arrName = elemName + "[]"
   const enp = nullablePartOf(elemName)
-  if enp != "" && nameIsArray(enp) {
+  if (
+    enp != "" &&
+    (nameIsArray(enp) || (nameIsMap(enp) && !nameIsMapMemberUnion(enp)))
+  ) {
+    // A nullable-LIST element (`i32[] | null`) and a nullable-MAP element
+    // (`{[string]: V} | null`) both need their grouping parens back to read the kind.
     arrName = "(" + elemName + ")[]"
   } else if (
     parenUnionArrElemName("(" + elemName + ")[]") != "" &&
@@ -7205,7 +7309,12 @@ export function ensureRefElem(elemName: string) {
     mUsed = true
     lUsed = true
     aUsed = true
-    mvShapeOfValName(mapValNameOf(elemName))
+    // A NULLABLE map element strips to its inner map for the value intern — the slot
+    // shares the map struct (and mv slot) with the non-null element.
+    let mve = elemName
+    const nme = nulMapInnerName(elemName)
+    if nme != "" { mve = nme }
+    mvShapeOfValName(mapValNameOf(mve))
   }
   // Force the leaf list-type wrapper `Used` flags for a SCALAR inner-list element, so its
   // singleton wrapper (`lTypeIdx` / `mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) is allocated. A
@@ -7253,6 +7362,10 @@ export function refArrElemKind(name: string) {
   // A `(P | null)[]` nullable-struct array is a STRUCT ref list (kind 1) — its element is a
   // `(ref null $P)` niche, not a union box. Checked before the value-union test below.
   if nullStructArrElem(name) != "" { return 1 }
+  // A `({[string]: V} | null)[]` nullable-MAP array is a MAP ref list (kind 3) — the same
+  // `(ref null $mapStruct)` backing the non-null map element uses; the slot key keeps the
+  // `| null` so the index read stays nullable (`rlElemNullable`) for the `e != null` narrow.
+  if nullMapArrElemOf(name) != "" { return 3 }
   // A `(i32[] | null)[]` nullable-LIST array is the i32[][] rep (kind 4) — its element is a
   // `(ref null $lTypeIdx)` i32-list niche, not a union box. Checked before the value-union test.
   if nullArrayArrElem(name) != "" {
@@ -7356,11 +7469,20 @@ export function fieldTypeCode(tyIx: i32) {
     // A MAP-typed field (`children: {[string]: Tree}`) stores a non-null ref to
     // its value-type's map struct — code 19. The mv SLOT is interned by
     // `collectA`'s arena TypeRef scan (this same annotation node), so emission
-    // re-finds it by the value name (`fieldRefElemName`). A NULLABLE map field
-    // (`{[…]}|null`) stays unsupported (falls through to -1).
+    // re-finds it by the value name (`fieldRefElemName`).
     // A map-MEMBER union field (`{[string]: string} | string`) starts with `{[` too, but it is a
     // union BOX field (code 16), not a map — `!nameIsMapMemberUnion` lets it fall to the union test.
     if nameIsMap(ty.tyName) && !nameIsMapMemberUnion(ty.tyName) { return 19 }
+    // A NULLABLE map field (`links: {[string]: V} | null`) stores a NULLABLE ref to the value
+    // type's map struct — code 29, the field analogue of the `nulmap` local/param/return niche
+    // (the map twin of code 28's nullable ref-list field). Gated to the SAME supported value
+    // kinds as the non-null map field (`retNulMapFlag`'s gate), so a nullable map over an
+    // unrepresentable value type keeps failing loudly (-1, no interned shape).
+    if nulMapInnerName(ty.tyName) != "" {
+      if mvValKindOfName(mapValNameOf(nulMapInnerName(ty.tyName))) != -3 {
+        return 29
+      }
+    }
     // A `string | null` niche field — `(ref null $aTypeIdx)`, code 20. Checked before
     // the value-union test (it is NOT a value union — a single ref + null is a niche).
     if nameIsNulString(ty.tyName) { return 20 }
@@ -7449,6 +7571,13 @@ export function fieldRefElemName(tyIx: i32) {
   if code == 19 {
     const ty19 = P.nodes[tyIx]
     if ty19 is TypeRef { return mapValNameOf(ty19.tyName) }
+    return ""
+  }
+  // A NULLABLE map field (code 29) records the `| null`-stripped map's VALUE type-name —
+  // the same mv-slot key its non-null twin uses, so both resolve one slot.
+  if code == 29 {
+    const ty29 = P.nodes[tyIx]
+    if ty29 is TypeRef { return mapValNameOf(nulMapInnerName(ty29.tyName)) }
     return ""
   }
   // A NULLABLE REF-LIST field (code 28, `S[] | null`): its element is the ref-array element of the
@@ -7720,6 +7849,7 @@ export function refArrElemName(name: string) {
 function rlElemNicheNullable(kind: i32, name: string) {
   if (
     kind != 1 &&
+    kind != 3 &&
     kind != 4 &&
     kind != 6 &&
     kind != 7 &&
@@ -8071,6 +8201,11 @@ export function nameFieldCode(t: string) {
   // field of a map-member-union type mis-stored the union box in a map-struct field slot
   // (invalid wasm). (The `nameIsMapMemberUnion` twin of `fieldTypeCode`.)
   if nameIsMap(t) && !nameIsMapMemberUnion(t) { return 19 }
+  // A NULLABLE map field (`{[string]: V} | null`) — code 29, the name-level mirror of
+  // `fieldTypeCode`'s nullable-map arm, with the same supported-value-kind gate.
+  if nulMapInnerName(t) != "" {
+    if mvValKindOfName(mapValNameOf(nulMapInnerName(t))) != -3 { return 29 }
+  }
   // A NULLABLE i32-list field (`rest: i32[] | null`) — code 18 (see fieldTypeCode).
   if nameIsNulI32List(t) { return 18 }
   if nameIsNulRefList(t) { return 28 }
@@ -8608,6 +8743,10 @@ export function internInlineShape(nm: string) {
       // so interning here would be wiped); the inner map of an inline `{m:{[string]:V}}` is
       // not a standalone TypeRef that `collectA`'s scan sees, so it interns code-19 FIELDS.
       sFieldElemName.push(mapValNameOf(texts[pi]))
+    } else if codes[pi] == 29 {
+      // A NULLABLE map field records the `| null`-stripped map's VALUE type-name — the
+      // same mv-slot key as code 19, interned by the same `collectA` field loop.
+      sFieldElemName.push(mapValNameOf(nulMapInnerName(texts[pi])))
     } else if codes[pi] == 5 {
       // A REF-LIST field (`f: N[]` / `f: (i32|null)[]`): record its element name (the CANONICAL ref-array
       // element name — parens stripped for a value-union element so it keys the same slot every other
@@ -9031,6 +9170,15 @@ export function shapeFieldElemName(ftxt: string, code: i32) {
   // union VARIANT with a map field (`{f: {[string]: i32}} | i32`) recorded "" and
   // every op site then failed the loud slot find (the R1 map-in-union-arm seam).
   if code == 19 { return mapValNameOf(ftxt) }
+  // A NULLABLE map field (code 29): the `| null`-stripped map's value name — same key.
+  if code == 29 { return mapValNameOf(nulMapInnerName(ftxt)) }
+  // An ATOM-ARRAY field (`f: K[]`, code 4) records its ARRAY type-name — the shape-text
+  // mirror of `fieldRefElemName`'s code-4 arm, so a shape-text union VARIANT with an
+  // atom-array field seeds the atom-element build (`variantFieldIsLitUnionArray`).
+  if code == 4 {
+    if nameIsLitUnionArray(ftxt) { return ftxt }
+    return ""
+  }
   ""
 }
 
@@ -9995,9 +10143,11 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   }
   // A `m[k] ?? default` over a STRUCT-valued map (`{[string]: S}`) yields the value struct — so a
   // bound `const p = m[k] ?? d` classifies as a struct local and `(m[k] ?? d).x` resolves.
+  // A NULLABLE-value slot (`{[string]: S | null}`) yields `S | null` instead (a stored null is
+  // PRESERVED through `??`) — `exprNullableStruct` claims it, not this non-null arm.
   if e is BinExpr {
     const cms = coalesceMvSlot(exprIx, fnIx)
-    if cms >= 0 { return mvValKind[cms] == 1 }
+    if cms >= 0 { return mvValKind[cms] == 1 && !mvSlotNullable(cms) }
     // A `<S|null> ?? <S>` coalesce yields the non-null struct (the generic nullable-struct `??` emit) —
     // so a bound `const p = r ?? d` classifies struct and `(r ?? d).x` resolves. The left is the
     // nullable struct; the right is a plain struct default.
@@ -12395,6 +12545,29 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
     if declaredNulMap(e.identName) { return true }
     return globalIsNulMap(e.identName)
   }
+  // A `recv.f` read of a NULLABLE map FIELD (`f: {[string]: V} | null`, code 29) yields a
+  // nullable map — `const t = v.f` infers kind `nulmap` and narrows with `if t != null`.
+  if e is Member { return memFieldTypeCode(exprIx, fnIx) == 29 }
+  // A read over a NULLABLE-inner-map-valued map (`{[string]: {[string]: V} | null}`) yields
+  // `map | null` — the fused `?? d` hit arm preserves a stored null, and the bare `m[k]` is
+  // nullable by construction. The binding infers kind `nulmap`; its shape resolves through
+  // `mapShapeOfExpr`'s composition arm (the inner map's own value slot).
+  if e is BinExpr {
+    const cnm = coalesceMvSlot(exprIx, fnIx)
+    if cnm >= 0 { return mvValIsMap(cnm) && mvSlotNullable(cnm) }
+  }
+  if e is Index {
+    // An INDEX into a nullable-map array (`({[string]: V} | null)[]`, element kind 3 with the
+    // nullable bit): the element legitimately holds null — `const e = xs[i]` binds `nulmap`.
+    if exprRefArray(e.idxArr, fnIx) {
+      const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemNullable.length {
+        if rlElemKindTbl[slot] == 3 && rlElemNullable[slot] == 1 { return true }
+      }
+    }
+    const mnm = mapReadMvSlot(exprIx, fnIx)
+    if mnm >= 0 { return mvValIsMap(mnm) && mvSlotNullable(mnm) }
+  }
   // A call whose ANNOTATED return is `{[string]: V} | null` yields a nullable map, so an
   // un-annotated `const t = mk(…)` infers kind `nulmap` and narrows with `if t != null`.
   if e is Call {
@@ -12471,7 +12644,9 @@ export function exprMap(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cmm = coalesceMvSlot(exprIx, fnIx)
     if cmm >= 0 {
-      if mvValIsMap(cmm) { return true }
+      // A NULLABLE inner-map value (`{[string]: {[string]: V} | null}`) yields `map | null`
+      // (a stored null is preserved through `??`) — `exprNullableMap` claims it instead.
+      if mvValIsMap(cmm) && !mvSlotNullable(cmm) { return true }
     }
   }
   // `scopes[i]` over a MAP ref list (`{[string]:i32}[]`, element kind 3) yields a Map ref
@@ -12487,12 +12662,15 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       // sibling ref-list classifiers already use — else `rlElemKindTbl[0]` on an empty table is a
       // compiler-internal OOB trap. (Same guard added to the `.pop()` twin above.)
       if slot >= 0 && slot < rlElemKindTbl.length {
-        return rlElemKindTbl[slot] == 3
+        // A NULLABLE map element (`({[string]: V} | null)[]`) yields `map | null` —
+        // `exprNullableMap`'s element arm claims it, not this non-null arm.
+        return rlElemKindTbl[slot] == 3 && rlElemNullable[slot] == 0
       }
     }
     const mri = mapReadMvSlot(exprIx, fnIx)
     if mri >= 0 {
-      if mvValIsMap(mri) { return true }
+      // A bare read of a NULLABLE inner-map value stays `map | null` — `exprNullableMap`'s.
+      if mvValIsMap(mri) && !mvSlotNullable(mri) { return true }
     }
   }
   false
@@ -12861,7 +13039,8 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       if nvi >= 0 {
         const nvfi = variantFieldIndex(nvi, e.memProp)
         if nvfi >= 0 {
-          if variantFieldTypeAt(nvi, nvfi) == 19 {
+          const nvc = variantFieldTypeAt(nvi, nvfi)
+          if nvc == 19 || nvc == 29 {
             return mvSlotOfValNameFind(variantFieldElemName(nvi, nvfi))
           }
         }
@@ -12871,7 +13050,8 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     if pvi >= 0 {
       const pvfi = variantFieldIndex(pvi, e.memProp)
       if pvfi >= 0 {
-        if variantFieldTypeAt(pvi, pvfi) == 19 {
+        const pvc = variantFieldTypeAt(pvi, pvfi)
+        if pvc == 19 || pvc == 29 {
           return mvSlotOfValNameFind(variantFieldElemName(pvi, pvfi))
         }
       }
@@ -12880,7 +13060,8 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     if msi >= 0 {
       const mfi = sFieldIndex(msi, e.memProp)
       if mfi >= 0 {
-        if sFieldTypeAt(msi, mfi) == 19 {
+        const mfc = sFieldTypeAt(msi, mfi)
+        if mfc == 19 || mfc == 29 {
           return mvSlotOfValNameFind(sFieldElemNameAt(msi, mfi))
         }
       }
@@ -12915,7 +13096,11 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
     if exprRefArray(e.idxArr, fnIx) {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
       if slot >= 0 && slot < rlElemKindTbl.length && rlElemKindTbl[slot] == 3 {
-        return mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[slot]))
+        // A NULLABLE map element strips to its inner map for the value-slot resolve.
+        let cen = rlElemName[slot]
+        const cnin = nulMapInnerName(cen)
+        if cnin != "" { cen = cnin }
+        return mvSlotOfMapValNameOrMono(mapValNameOf(cen))
       }
     }
   }
@@ -13074,9 +13259,10 @@ export function exprString(exprIx: i32, fnIx: i32) {
   }
   if e is BinExpr {
     // A `m[k] ?? d` / `m.get(k) ?? d` read over a STRING-valued map yields a
-    // string ref (the value type).
+    // string ref (the value type). A NULLABLE-string value (`{[string]: string | null}`)
+    // yields `string | null` instead (a stored null is preserved) — `exprNullableString`'s.
     const cms = coalesceMvSlot(exprIx, fnIx)
-    if cms >= 0 { return mvValKind[cms] == 3 }
+    if cms >= 0 { return mvValKind[cms] == 3 && !mvSlotNullable(cms) }
     // `r ?? d` over a `string | null` LHS yields a (non-null) string — the coalesce
     // recovers the non-null array ref, so `.length`/`+`/etc. on the result work.
     if e.binOp == "??" {

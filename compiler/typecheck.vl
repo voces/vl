@@ -3351,10 +3351,15 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
         // A nullable struct target (`S | null` / a `V?` map value) peels its wrapper so an object
         // literal still adapts field-wise into the inner struct — the ObjLit dual of the ArrayLit
         // nullable peel below (without it a float-literal `f32` field, a litunion field, or an
-        // omitted-nullable field fails to coerce through the `| null`).
+        // omitted-nullable field fails to coerce through the `| null`). The peel ITERATES: a
+        // nullable-VALUE map slot (`{[string]: S | null}` — the stored `V?` over `S | null`)
+        // stacks two wrappers, and a single unwrap left the literal against `S | null`.
         let dtix = dstTy
-        const dN = T.tys[dtix]
-        if dN is TyNullable { dtix = dN.nInner }
+        let dPeel = true
+        while dPeel {
+          const dNW = T.tys[dtix]
+          if dNW is TyNullable { dtix = dNW.nInner } else { dPeel = false }
+        }
         const d = T.tys[dtix]
         if d is TyObj {
           const dnames = d.objFieldNames
@@ -3424,10 +3429,14 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     // element is NOT widened — the per-element `assignableExpr` still rejects a lossy f64 demote.
     if e is ArrayLit {
       // A map value / niche slot is `V?` (`{[string]: f32[]}` seeds `f32[]?`) — peel the nullable
-      // wrapper so a literal array still adapts into the inner element type.
+      // wrapper(s) so a literal array still adapts into the inner element type (a nullable-VALUE
+      // map slot stacks two wrappers; iterate like the ObjLit peel above).
       let dtix = dstTy
-      const dN = T.tys[dtix]
-      if dN is TyNullable { dtix = dN.nInner }
+      let dPeel = true
+      while dPeel {
+        const dNW = T.tys[dtix]
+        if dNW is TyNullable { dtix = dNW.nInner } else { dPeel = false }
+      }
       const d = T.tys[dtix]
       if d is TyArray {
         let i = 0
@@ -9799,6 +9808,18 @@ export function nodeTyMapValIsLitUnion(ix: i32) {
   false
 }
 
+// True if node `ix`'s recorded type is a string-keyed MAP whose VALUE is a NULLABLE literal
+// union (`{[string]: K | null}`): each value is the interned atom id with the `-1` null
+// sentinel — still the MONO i32 map. The store/`??`-default sites read this to admit a bare
+// `null` (lowered as `-1`) alongside the member literals.
+export function nodeTyMapValIsNulLitUnion(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return tyIsNullableLitUnion(t.mVal) }
+  false
+}
+
 // The member literal TEXTS (raw inner lexeme, no quotes) of the VALUE literal union of node
 // `ix`'s recorded map type — the atom-map dual of `nodeLitUnionMemberTexts`. Empty if `ix`
 // is not an atom-valued map. The emitter's `??`-default gate checks the default literal is
@@ -9809,8 +9830,11 @@ export function nodeTyMapValLitUnionTexts(ix: i32) {
   if ty < 0 { return out }
   const t = T.tys[ty]
   if t is TyMap {
-    if !tyIsLitUnion(t.mVal) { return out }
-    const v = T.tys[t.mVal]
+    if !tyIsLitUnion(t.mVal) && !tyIsNullableLitUnion(t.mVal) { return out }
+    let mv = t.mVal
+    const mvN = T.tys[mv]
+    if mvN is TyNullable { mv = mvN.nInner }
+    const v = T.tys[mv]
     if v is TyUnion {
       let i = 0
       while i < v.uMembers.length {

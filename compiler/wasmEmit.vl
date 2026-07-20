@@ -13,6 +13,7 @@ import {
   nodeTyIsNulLitUnion,
   nodeTyIsNullableStruct,
   nodeTyMapValIsLitUnion,
+  nodeTyMapValIsNulLitUnion,
   nodeTyMapValLitUnionTexts,
   splitUnionAtoms,
   valueAtomKind,
@@ -456,6 +457,7 @@ import {
   mfResultSlotOf,
   mfSrcLocalFor,
   mvListValKind,
+  mvSlotNullable,
   mvSlotOfMapValNameOrMono,
   mvSlotOfValNameFind,
   nameIsRefArray,
@@ -491,6 +493,7 @@ import {
   sFieldIndex,
   sFieldIsLitUnion,
   sFieldIsLitUnionArray,
+  variantFieldIsLitUnionArray,
   sFieldTypeAt,
   scalarListElemKind,
   scalarTagOf,
@@ -727,6 +730,12 @@ export function pushFieldStorage(code: i32, refSlot: i32) {
     // map). A recursive value (Tree → map → Tree) ties in the shared rec group.
     wU8(100) // 0x64 (ref ht)
     wSLEB(mapTypeIdxOf(refSlot))
+  } else if code == 29 {
+    // A NULLABLE map field (`links: {[string]: V} | null`): the same map struct as
+    // code 19 with NULLABLE storage — the field genuinely carries null (the map
+    // twin of the code-28 nullable ref-list field).
+    wU8(99) // 0x63 (ref null ht)
+    wSLEB(mapTypeIdxOf(refSlot))
   } else if code == 20 {
     // A `string | null` niche field: a NULLABLE ref to the raw string array (the
     // same backing as code 3, the nullability in the field's storage type).
@@ -781,6 +790,11 @@ function emitOmittedFieldNull(_body: i32[], si: i32, fi: i32, scode: i32) {
   }
   if scode == 22 {
     fbRefNull(cloStructIdx) // ref.null $cloStruct (a nullable-closure field, kind 19)
+    return 0
+  }
+  if scode == 29 {
+    // A NULLABLE map field omitted -> `ref.null $mapStruct` (the value type's map struct).
+    fbRefNull(mapTypeIdxOf(mvSlotOfValNameFind(sFieldElemNameAt(si, fi))))
     return 0
   }
   if scode == 16 {
@@ -885,6 +899,13 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         else if rlElemKindTbl[fslot28] == 1 { pendingListKind = 1 }
         else { pendingListKind = 5 }
         if fslot28 < rlWrapIdx.length { pendingNulRefHeap = rlWrapIdx[fslot28] }
+      } else if scode == 29 {
+        // A NULLABLE map field value is a map ref (subtypes the nullable slot), a `Map()`
+        // constructor (build THIS field's value-typed map struct — the `pendingMapSlot`
+        // seed, as code 19), or a bare `null` -> `ref.null $mapStruct` (`pendingNulRefHeap`).
+        const mslot29 = mvSlotOfValNameFind(sFieldElemNameAt(si, fi))
+        pendingMapSlot = mslot29
+        pendingNulRefHeap = mapTypeIdxOf(mslot29)
       }
       // A NESTED-STRUCT field (code 15) seeds the TARGET struct so its literal
       // builds that struct (not a field-shape guess) and a bare `null` value
@@ -1297,6 +1318,15 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
       const rcNC = emitExpr(body, valIx, fnIx)
       pendingNulClosure = svNC
       if rcNC < 0 { return -1 }
+    } else if variantFieldIsLitUnionArray(vi, fj) {
+      // An ATOM-ARRAY variant field (`{f: K0[]}` as an arm of `{f: K0[]} | string`): the
+      // value is the i32 LIST of atom ids — the atom context routes the literal to the
+      // i32-list build (its member elements are string exprs syntactically, which would
+      // else build a string list whose wrapper ref mismatches the field's `$lTypeIdx`) —
+      // the `sFieldIsLitUnionArray` discipline at the variant payload boundary.
+      const vlaCtx = expCtxHere()
+      vlaCtx.litUnion = 1
+      if emitExprExpect(body, valIx, fnIx, vlaCtx) < 0 { return -1 }
     } else if vcode == 16 {
       // A VALUE-UNION variant field (`{f: boolean | i64}` as an arm of `{f:…} | i64`):
       // the field stores the shared union BOX, so coerce a raw scalar/string/null value
@@ -3370,6 +3400,9 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
             if elemNest == 7 { elCtx.nulRefHeap = fl64TypeIdx }
             if elemNest == 8 { elCtx.nulRefHeap = il64TypeIdx }
             if elemNest == 10 { elCtx.nulRefHeap = fl32TypeIdx }
+            // A `({[string]: V} | null)[]` element (kind 3 nullable niche) → `ref.null` of
+            // the element's map struct (the slot heap, resolved by the kind-3 passes).
+            if elemNest == 3 { elCtx.nulRefHeap = rlElemHeap[rslot] }
           }
           if emitExprExpect(body, elems[i], fnIx, elCtx) < 0 { return -1 }
         }
@@ -3816,14 +3849,20 @@ function emitMapGetOr(
         // the literal to the wrong layout (the store path's twin, see `emitMapSetV`).
         dfCtx.structIdx = mvValStructIdx[mslot]
       }
+      // A NULLABLE-value slot admits a bare `null` default (`m[k] ?? null` typing `S | null`) —
+      // seed the element heap so the NullLit lowers as `ref.null <elem>`.
+      if mvSlotNullable(mslot) { dfCtx.nulRefHeap = mvValElemHeapOf(mslot) }
       if emitExprExpect(body, defIx, fnIx, dfCtx) < 0 { return -1 }
     }
     cmSlot = mslot
     fbLocalSet(fnMvValStashLocal(mslot))
     fbEnd() // end (if)
     fbLocalGet(fnMvValStashLocal(mslot))
-    // A scalar f64/i64 result needs no null-recovery; a ref value does (`??` is non-null).
-    if scalarVK == null { fbRefAsNonNull() }
+    // A scalar f64/i64 result needs no null-recovery; a ref value does (`??` is non-null) —
+    // EXCEPT a NULLABLE-value slot (`{[string]: S | null}` / `{[string]: map | null}`), whose
+    // hit arm PRESERVES a stored null (the default fires only on a MISSING key): the result
+    // stays the `(ref null <elem>)` niche and the consumer narrows with `!= null`.
+    if scalarVK == null && !mvSlotNullable(mslot) { fbRefAsNonNull() }
     return 0
   }
   // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
@@ -3843,6 +3882,7 @@ function emitMapGetOr(
   // result) has the wrong rep for the fused i32 result — fail loudly.
   const atomTexts = nodeTyMapValLitUnionTexts(recvIx)
   let atomDef = false
+  let nulAtomDef = false
   if atomTexts.length > 0 {
     const du = P.nodes[unwrapParen(defIx)]
     if du is StrLit {
@@ -3850,6 +3890,14 @@ function emitMapGetOr(
       while mi < atomTexts.length {
         if quoteLex(atomTexts[mi]) == du.strText { atomDef = true }
         mi = mi + 1
+      }
+    } else if du is NullLit {
+      // A NULLABLE-atom value (`{[string]: K | null}`) admits a bare `null` default —
+      // the `-1` niche sentinel (a stored value hit still yields its own i32, so a
+      // stored `null` is preserved: the mono fused read is sentinel-transparent).
+      if nodeTyMapValIsNulLitUnion(recvIx) {
+        atomDef = true
+        nulAtomDef = true
       }
     } else if exprIsLitAtom(defIx, fnIx) {
       atomDef = true
@@ -3860,10 +3908,14 @@ function emitMapGetOr(
       )
     }
   }
-  if atomDef { pendingLitUnion = 1 }
-  const dfr = emitExpr(body, defIx, fnIx)
-  if atomDef { pendingLitUnion = 0 }
-  if dfr < 0 { return -1 }
+  if nulAtomDef {
+    fbI32Const(0 - 1)
+  } else {
+    if atomDef { pendingLitUnion = 1 }
+    const dfr = emitExpr(body, defIx, fnIx)
+    if atomDef { pendingLitUnion = 0 }
+    if dfr < 0 { return -1 }
+  }
   fbEnd() // end (if)
   0
 }
@@ -4460,8 +4512,20 @@ function emitMapSetValExpr(
     svCtx.listKind = 5
     svCtx.listSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
   }
-  // An atom-valued mono map's member-literal value lowers as its interned atom id.
-  if atomVal { svCtx.litUnion = 1 }
+  // An atom-valued mono map's member-literal value lowers as its interned atom id; a
+  // NULLABLE-atom value (`{[string]: K | null}`) stores a bare `null` as the `-1` sentinel.
+  if atomVal {
+    const vnul = P.nodes[unwrapParen(valIx)]
+    if vnul is NullLit {
+      fbI32Const(0 - 1)
+      return 0
+    }
+    svCtx.litUnion = 1
+  }
+  // A NULLABLE-value slot (`{[string]: S | null}` / `{[string]: map | null}`) stores a bare
+  // `null` as `ref.null <elem>` — the vals element carries it directly and the fused read
+  // preserves it. A non-null value ignores the seed.
+  if mvSlotNullable(mslot) { svCtx.nulRefHeap = mvValElemHeapOf(mslot) }
   // A STRUCT-valued map (`{[string]: {f:…}}`): force the value struct's OWN index so the
   // literal `{f:…}` builds the map's declared value struct, not a field-name-set twin.
   // Without this a program with two same-field-name-set inline struct map values (`{f:f32}`
@@ -4534,7 +4598,8 @@ function emitMapSetV(
   // value is the interned atom id (a plain i32). Its member-literal value is a StrLit
   // syntactically — it must BYPASS the mono string guard below and emit in atom context
   // (`pendingLitUnion`), so resolve the receiver's value type up front.
-  const atomVal = nodeTyMapValIsLitUnion(recvIx)
+  let atomVal = nodeTyMapValIsLitUnion(recvIx)
+  if nodeTyMapValIsNulLitUnion(recvIx) { atomVal = true }
   // A MONO (i32/boolean-valued) map cannot store a REF value (a string / struct /
   // list ref into an i32 array is invalid wasm) — fail loudly. A ref-valued map
   // (mv slot) stores string/struct values through its own typed vals list. (A
@@ -6834,6 +6899,15 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         }
         if exprString(c.callArgs[0], fnIx) {
           return emitPrintStrExpr(body, c.callArgs[0], fnIx)
+        }
+        // A NULLABLE-string value (`string | null` — a niche binding, or a fused read over a
+        // `{[string]: string | null}` map, which PRESERVES a stored null) may genuinely hold
+        // null: the fallback ladder below would hand its `(ref null)` to a scalar print
+        // import (invalid wasm). Narrowing is the supported spelling — fail loudly.
+        if exprNullableString(c.callArgs[0], fnIx) {
+          return emitFail(
+            "emitProgram: print of a nullable string — narrow it first (`if v != null { print(v) }`)",
+          )
         }
         // print(literal-union ATOM): WIDEN it to its member STRING — a per-member `if id == <id> { print
         // "<name>" }` chain (exactly one matches, so at most one prints). The atom→string widening in
