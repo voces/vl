@@ -7486,6 +7486,20 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // CLOSURE-ARM value-union result (`(i32) => (() => string) | i64`): a lambda whose
+        // body infers ONE arm (a closure or a scalar) of the expected closure-arm value union
+        // adopts the union, so the boxing lands at the return seam — `emitReturnValue` boxes
+        // the arm (a closure member is the kind-11 REF atom, riding the box's anyref value)
+        // and the lambda's functype result IS the box (`synthRetAnnots` pins `fnRet` via its
+        // `isValueUnionName` arm; the `$fnsig` keys `>u`, matching the value call's
+        // `annRetKind`). The annotated named-function-VALUE spelling of the same union result
+        // already lowers this box soundly, so the pin only removes the annotation.
+        if inferred != expRet && cloArmValueUnionRetName(expRet) != "" {
+          const cvTail = lambdaBodyTail(n.fnBody)
+          if cvTail >= 0 && assignableExpr(cvTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
         // MAP-MEMBER-UNION result (`() => {[string]:f32} | {w:i32}`): a lambda whose body infers
         // one struct arm of the expected map-member-union box result adopts the union, so the
         // widening lands at the return seam — `emitReturnValue` boxes the struct/map arm into the
@@ -7552,6 +7566,18 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         if inferred != expRet && elemValueUnionListRetName(expRet) != "" {
           const evTail = lambdaBodyTail(n.fnBody)
           if evTail >= 0 && assignableExpr(evTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
+        // ELEMENT-VARIANT-BOX-UNION LIST result (`(i32) => ({a,f,z} | i64)[]`): a lambda
+        // whose body array literal is assignable to the expected variant-box-element list
+        // adopts it, so `emitReturnValue` boxes each element through the SAME element-kind-2
+        // rep the annotated return / named-function-VALUE form already lowers
+        // (`synthRetAnnots` pins `fnRet` via its `parenUnionArrElemName` arm). The
+        // variant-box sibling of the element-value-union arm above.
+        if inferred != expRet && elemVariantBoxListRetName(expRet) != "" {
+          const vbeTail = lambdaBodyTail(n.fnBody)
+          if vbeTail >= 0 && assignableExpr(vbeTail, inferred, expRet) {
             inferred = expRet
           }
         }
@@ -7767,6 +7793,16 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // above) — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the
         // value-union-box list, whose element boxing `emitReturnValue` already performs.
         if unm == "" { unm = elemValueUnionListRetName(inferred) }
+        // An ELEMENT-VARIANT-BOX-UNION list contextual return (`(i32) => ({a,f,z}|i64)[]`,
+        // adopted just above) — record its emitter name so `synthRetAnnots` pins the lambda's
+        // `fnRet` as the variant-box-element list, whose element boxing `emitReturnValue`
+        // already performs for the annotated form.
+        if unm == "" { unm = elemVariantBoxListRetName(inferred) }
+        // A CLOSURE-ARM value-union contextual return (`(i32) => (() => string) | i64`,
+        // adopted just above) — record its emitter name so `collectU`'s inferred-return loop
+        // REGISTERS the union and `synthRetAnnots` pins the lambda's `fnRet` to it; the
+        // `$fnsig` result then keys `>u`, matching the value call.
+        if unm == "" { unm = cloArmValueUnionRetName(inferred) }
         // A MAP-MEMBER-UNION contextual return (`() => {[string]:f32} | {w:i32}`, adopted just above)
         // — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the map-union box
         // (#865/#868), whose arm boxing `emitReturnValue` already performs for the annotated form.
@@ -8954,6 +8990,78 @@ function elemValueUnionListRetName(er: i32) {
   if t is TyArray {
     const en = tyToEmitName(t.aElem)
     if en != "" && isValueUnionName(en) { return tyToEmitName(er) }
+  }
+  ""
+}
+
+// The emitter-format NAME of an inferred ELEMENT-VARIANT-BOX-UNION list return `er` —
+// `({a:boolean,f:boolean,z:i32}|i64)[]`, `(i32|{w:i32})[]`: a `TyArray` whose element is a
+// union `variantBoxUnionRetName` renders (an inline-struct arm + scalar/string/litunion-alias
+// siblings). Its elements are the `{tag, payload}` boxes (element kind 2 — the SAME rep the
+// annotated return / named-function-VALUE spelling already lowers), so the emitter pins a
+// lambda to it (`synthRetAnnots`) and routes through that existing sound path. The member
+// render is `variantBoxUnionRetName`'s (a litunion arm keeps its ALIAS — `rlSlotByName`'s
+// primary key), parens-wrapped to match `parenUnionArrElemName`. The variant-box sibling of
+// `elemValueUnionListRetName`. "" otherwise.
+function elemVariantBoxListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const en = variantBoxUnionRetName(t.aElem)
+    if en != "" { return "(" + en + ")[]" }
+  }
+  ""
+}
+
+// The emitter-format NAME of a CLOSURE-ARM value union return `er` (`(()=>string)|i64`,
+// `((i32)=>f64)|boolean`): a ≥2-member union mixing at least one FUNCTION-TYPE member with
+// scalar prims. A closure member is the kind-11 REF atom (`valueAtomKind` — the fat-pointer
+// rides the box's anyref value), rendered in the emitter's non-spaced, parens-grouped form
+// (`nullableRetName`'s TyFunc render); the RESULT preserves a litunion ALIAS so the inner
+// value call and interned inner `$fnsig` agree on the atom token. Gated through
+// `isValueUnionName` (the same gate the annotated path uses), so the pin routes the
+// anonymous lambda through the SAME sound box the annotated named-function-VALUE spelling
+// already lowers. "" for any other shape (map / array / object members stay on their paths).
+function cloArmValueUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyUnion {
+    const members = t.uMembers
+    if members.length < 2 { return "" }
+    let hasClo = false
+    let name = ""
+    let i = 0
+    while i < members.length {
+      const m = T.tys[members[i]]
+      let mn = ""
+      if m is TyFunc {
+        let ips = ""
+        const pts = m.fnParamTypes
+        let pj = 0
+        while pj < pts.length {
+          const pn = tyToEmitName(pts[pj])
+          if pn == "" { return "" }
+          if pj > 0 { ips = ips + "," }
+          ips = ips + pn
+          pj = pj + 1
+        }
+        let irs = litUnionAliasNameOfTy(m.fnRet)
+        if irs == "" { irs = tyToEmitName(m.fnRet) }
+        if irs == "" { return "" }
+        mn = "((" + ips + ")=>" + irs + ")"
+        hasClo = true
+      } else if m is TyPrim {
+        mn = m.primName
+      } else {
+        return ""
+      }
+      if i > 0 { name = name + "|" }
+      name = name + mn
+      i = i + 1
+    }
+    if !hasClo { return "" }
+    if isValueUnionName(name) { return name }
   }
   ""
 }
@@ -10386,6 +10494,14 @@ export function nodeUnionName(ix: i32) {
       if mixedVariantBoxGate(t.uMembers) {
         const vbn = variantBoxUnionRetName(ty)
         if vbn != "" { return vbn }
+        // A CLOSURE-ARM value union (`(()=>string) | i64`): a binding INFERRED from a
+        // closure-value call of this result type (an indexed closure-array element
+        // `v[0](1)`) holds the box, and its narrowed read must UNBOX — which keys on
+        // this name. Render the same spelling `cloArmValueUnionRetName` pins on the
+        // adopted lambda (the registered union name), so the unbox resolves exactly
+        // like the annotated-binding path.
+        const can = cloArmValueUnionRetName(ty)
+        if can != "" { return can }
       }
     }
   }

@@ -11,7 +11,6 @@ import {
   TyArray,
   TyFunc,
   TyMap,
-  TyNullable,
   TyObj,
   TyPrim,
   TyUnion,
@@ -10477,7 +10476,12 @@ export function exprNulClosure(exprIx: i32, fnIx: i32) {
         return true
       }
     }
-    return false
+    // An INDEXED closure-array element call (`v[0](1)` over a `((i32) => (fn | null))[]`)
+    // or a struct-FIELD closure call whose resolved `$fnsig` result is the
+    // nullable-closure niche (`>C`): the result is the kind-19 `(ref null $cloStruct)`,
+    // so `const f = v[0](1)` binds the niche and `f != null` narrows — the same
+    // `cloCallSigKey` resolution the call emit casts with, so the two always agree.
+    return sigKeyRetKind(cloCallSigKey(ux, fnIx)) == "nulclosure"
   }
   // A nullable-closure struct FIELD read (`recv.op` over a `((i32) => i32) | null` field,
   // code 22): the raw `(ref null $cloStruct)` — its `!= null` lowers to `ref.is_null` and
@@ -11950,17 +11954,17 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
     if mapValuesResultKind(exprIx, fnIx) == 5 { return true }
     // GENERAL FALLBACK: a value call the resolvers above miss — a NARROWED union
     // binding's closure arm (`t0(1)` after `if t0 is (i32) => S[]`), a struct-FIELD
-    // closure (`v.f(1)`) — classifies by its resolved `$fnsig` result (`cloCallSigKey`,
-    // whose own fallback derives the key from the callee's CHECKER type). The consumer
-    // dual of the call emit's sig resolution, so the two always agree. A UNION-BOX
-    // element slot (kind 2 — `(i32 | {w: i32})[]`) is DECLINED: its element's narrowed
-    // binding read is not wired through this chain (the array-of-union-element family),
-    // so claiming it turned a loud reject into invalid wasm.
-    if callResTyElemIsUnion(nodeTyIxOf(exprIx)) { return false }
+    // closure (`v.f(1)`), an INDEXED closure-array element (`v[0](1)`) — classifies by
+    // its resolved `$fnsig` result (`cloCallSigKey`, whose own fallback derives the key
+    // from the callee's CHECKER type). The consumer dual of the call emit's sig
+    // resolution, so the two always agree. A UNION-BOX element slot (kind 2 —
+    // `(i64 | string)[]`) is claimed too: the element's narrowed binding read rides the
+    // interned union-box element machinery, and the lambda-side sig now adopts the
+    // union-element list result, so the producers agree with this claim.
     const gk = cloCallSigKey(exprIx, fnIx)
     if sigKeyRetKind(gk) == "reflist" {
       const gs = sigKeyRetSlot(gk)
-      if gs >= 0 && gs < rlElemKindTbl.length { return rlElemKindTbl[gs] != 2 }
+      if gs >= 0 && gs < rlElemKindTbl.length { return true }
     }
     return false
   }
@@ -12112,14 +12116,11 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
       // the name-based `calleeCloSigKey` misses it, but the general `cloCallSigKey`
       // fallback derives the key from the callee's CHECKER type — the same key the call
       // emit resolves, so the element slot always matches the called functype's. A
-      // union-box element slot (kind 2) is declined, like `exprRefArray`'s fallback.
-      if callResTyElemIsUnion(nodeTyIxOf(exprIx)) { return "" }
+      // union-box element slot (kind 2) resolves too, like `exprRefArray`'s fallback.
       const nk = cloCallSigKey(exprIx, fnIx)
       if sigKeyRetKind(nk) == "reflist" {
         const nrs = sigKeyRetSlot(nk)
-        if nrs >= 0 && nrs < rlElemName.length {
-          if rlElemKindTbl[nrs] != 2 { return rlElemName[nrs] }
-        }
+        if nrs >= 0 && nrs < rlElemName.length { return rlElemName[nrs] }
       }
       return ""
     }
@@ -12139,17 +12140,15 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
       const ms = mfResultSlotOf(exprIx, fnIx)
       if ms >= 0 { return rlElemName[ms] }
     }
-    // A struct-FIELD closure call (`v.f(1)` — the callee is a Member) whose result is a
+    // A struct-FIELD closure call (`v.f(1)` — the callee is a Member) or an INDEXED
+    // closure-array element call (`v[0](1)` — the callee is an Index) whose result is a
     // ref list: the resolved `$fnsig` result slot names the element (the same
     // `cloCallSigKey` fallback as the Ident-callee arm above; a union-box element slot
-    // — kind 2 — is likewise declined).
-    if callResTyElemIsUnion(nodeTyIxOf(exprIx)) { return "" }
+    // — kind 2 — likewise resolves).
     const mk2 = cloCallSigKey(exprIx, fnIx)
     if sigKeyRetKind(mk2) == "reflist" {
       const mrs2 = sigKeyRetSlot(mk2)
-      if mrs2 >= 0 && mrs2 < rlElemName.length {
-        if rlElemKindTbl[mrs2] != 2 { return rlElemName[mrs2] }
-      }
+      if mrs2 >= 0 && mrs2 < rlElemName.length { return rlElemName[mrs2] }
     }
     return ""
   }
@@ -12666,24 +12665,6 @@ function callResTyIsF32Array(tyIx: i32) {
     if t.aElem < 0 { return false }
     const el = T.tys[t.aElem]
     if el is TyPrim { return el.primName == "f32" }
-  }
-  false
-}
-
-// The checker-recorded type `tyIx` tested for a UNION-element ARRAY (`(i32 | {w: i32})[]`)
-// — the guard the value-call ref-list FALLBACKS (`exprRefArray` / `refListElemNameOfExpr`)
-// decline on: a union-box element's narrowed binding read is not wired through that chain
-// (the array-of-union-element family), and a lambda whose body infers ONE arm interns a
-// sig slot CONTRADICTING the annotation's box element — claiming it would emit invalid
-// wasm where a loud reject stood.
-function callResTyElemIsUnion(tyIx: i32) {
-  if tyIx < 0 { return false }
-  const t = T.tys[tyIx]
-  if t is TyArray {
-    if t.aElem < 0 { return false }
-    const el = T.tys[t.aElem]
-    if el is TyUnion { return true }
-    if el is TyNullable { return true }
   }
   false
 }
