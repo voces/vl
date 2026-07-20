@@ -7395,14 +7395,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // `string | null` closure result (`(i32) => string | null = (x) => "hey"`) adopts the
         // nullable — its functype result is the string-ref `ref.null` NICHE (position-independent),
         // and `emitReturnValue` niches the value, exactly as the named-function VALUE (`= mk`) lowers.
-        // Recorded by the `nullableRetName` arm below + pinned by `synthRetAnnots`. RESTRICTED to the
-        // string niche: a nullable SCALAR (`i32 | null`) lowers STANDALONE but not as a map/nullable-
-        // wrapped COMPOSITION value, and a VALUE-UNION result (`string | i32`, `i64 | boolean`) boxes
-        // but its box READ does not yet compose through a nullable-closure param / map value — both
-        // would turn a clean reject into INVALID WASM in composition (verified: the named-function
-        // VALUE spelling cleanly REJECTS those, so adopting the lambda would EXPOSE invalid wasm),
-        // so they stay LOUD rejects until the sibling value-union/nullable COMPOSITION reps land
-        // (C2/C3). `TyNullable`-inner-`string` is checked directly (`valueUnionRetName` also claims
+        // Recorded by the `nullableRetName` arm below + pinned by `synthRetAnnots`. This arm
+        // covers the string/boolean NICHES only: a nullable numeric SCALAR (`i32 | null`,
+        // `f32 | null`) is the value-union BOX and adopts through the `valueUnionRetName` arm
+        // below (its `$fnsig` keys `>u` on both producers — `annRetKind`'s nullable-scalar arm).
+        // `TyNullable`-inner-`string` is checked directly (`valueUnionRetName` also claims
         // `T | null`, so the niche must be recognized before it).
         if inferred != expRet {
           const etU = T.tys[expRet]
@@ -7444,6 +7441,18 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             if etInnerTy is TyFunc {
               const ncTail = lambdaBodyTail(n.fnBody)
               if ncTail >= 0 && assignableExpr(ncTail, inferred, expRet) {
+                inferred = expRet
+              }
+            }
+            // The NULLABLE-STRUCT dual (`() => {a, f, z} | null = () => ({…})`): a lambda
+            // whose body infers the bare struct member (or `null`) of an expected `S | null`
+            // closure result adopts the nullable — its functype result is the `(ref null $S)`
+            // niche (`>n`, byte-matching the value call's `annRetKind`), exactly as the
+            // annotated named-function VALUE spelling already lowers. Recorded by
+            // `nullableRetName`'s TyObj arm + pinned by `synthRetAnnots`.
+            if etInnerTy is TyObj {
+              const nsoTail = lambdaBodyTail(n.fnBody)
+              if nsoTail >= 0 && assignableExpr(nsoTail, inferred, expRet) {
                 inferred = expRet
               }
             }
@@ -8736,6 +8745,16 @@ function nullableRetName(er: i32, stmts: i32[]) {
       // NON-spaced (`P|null`) — the emitter's internal name convention (`nullablePartOf`,
       // `structUnionRetName`'s `Cat|Dog`), not the spaced `tyToStr` render.
       if nm != "" { return nm + "|null" }
+      // An INLINE shape with no matching TypeDecl (`{a: boolean, f: {f: f64}, z: i32}`):
+      // render the emitter-format shape text — `structIndexOfTypeName` resolves it by
+      // FIELD-SET to the same struct index the annotation side keys, so the two `$fnsig`
+      // producers agree on `>n<idx>;`. A map (`{[`) is excluded (no struct rep); an
+      // un-internable shape leaves the sig unresolved downstream — a loud reject, exactly
+      // as before the pin.
+      const inm = tyToEmitName(t.nInner)
+      if inm.length >= 2 && inm[0] == '{' && inm[1] != '[' {
+        return inm + "|null"
+      }
     } else if it is TyFunc {
       // A NULLABLE-CLOSURE contextual return (`((i32) => K0) | null`, kind 19): the closure
       // fat-pointer made nullable (`(ref null $cloStruct)` — the niche). Render the inner
@@ -9083,6 +9102,16 @@ function refArmUnionRetName(er: i32, stmts: i32[]) {
 function variantBoxUnionRetName(er: i32) {
   if er < 0 { return "" }
   const t = T.tys[er]
+  // A NULLABLE variant-box union (`{a,f,z} | i32 | null` — canon wraps the null into a
+  // `TyNullable` over the 2+-member union): the box already carries a null member atom
+  // (`valueAtomKind("null")`), so the rep IS the same `>u` box — render the inner union
+  // and append the `|null` atom, which `registerInlineUnion`'s variant-box path admits
+  // (a `null` atom rides the tag, no variant slot) and `annRetKind` keys `>u` for.
+  if t is TyNullable {
+    const inner = variantBoxUnionRetName(t.nInner)
+    if inner != "" { return inner + "|null" }
+    return ""
+  }
   if t is TyUnion {
     const members = t.uMembers
     if members.length < 2 { return "" }
@@ -9536,6 +9565,26 @@ export function nodeTyIsNulBool(ix: i32) {
   if t is TyNullable {
     const inner = T.tys[t.nInner]
     if inner is TyPrim { return inner.primName == "boolean" }
+  }
+  false
+}
+// STRUCTURAL: node `ix`'s type is a nullable NUMERIC scalar (`i32 | null`, `i64 | null`,
+// `f64 | null`, `f32 | null`) — a `TyNullable` whose inner numeric prim has no spare value to
+// niche into, so the value reps as the value-union {tag, value} BOX (`repOfNullable`'s scalar
+// arm). The niche nullables (`string | null`, `boolean | null`, litunion/struct/closure/list
+// `| null`) are structurally excluded — they are NOT box values and must not classify union.
+export function nodeTyIsNulScalarBox(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const inner = T.tys[t.nInner]
+    if inner is TyPrim {
+      return (inner.primName == "i32" ||
+        inner.primName == "i64" ||
+        inner.primName == "f64" ||
+        inner.primName == "f32")
+    }
   }
   false
 }
@@ -10329,7 +10378,23 @@ export function nodeUnionName(ix: i32) {
   // union unbox / narrow, mirroring the annotated-closure path. `valueUnionRetName` gates through
   // `isValueUnionName`, which admits ONLY the numeric-scalar nullables that box (`i32|null`, …) and
   // declines the `boolean|null` / `string|null` NICHES, so those stay "" (their niche rep handles).
-  if t is TyNullable { return valueUnionRetName(ty) }
+  if t is TyNullable {
+    const nvn = valueUnionRetName(ty)
+    if nvn != "" { return nvn }
+    // A NULLABLE variant-box union (`{a,f,z} | i32 | null`): a binding inferred from a
+    // closure-value call of this result type holds the `>u` box (the null is a member
+    // atom) — render the same spelling `variantBoxUnionRetName` pins on the adopted
+    // lambda, so the narrowed read unboxes and `!= null` tag-tests like the annotated
+    // path. `mixedVariantBoxGate` pre-gates before any member renders (#494 discipline).
+    const nit = T.tys[t.nInner]
+    if nit is TyUnion {
+      if mixedVariantBoxGate(nit.uMembers) {
+        const nvb = variantBoxUnionRetName(ty)
+        if nvb != "" { return nvb }
+      }
+    }
+    return ""
+  }
   ""
 }
 

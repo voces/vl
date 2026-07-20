@@ -32,6 +32,7 @@ import {
   nodeTyIsMap,
   nodeTyIsNulBool,
   nodeTyIsNulLitUnion,
+  nodeTyIsNulScalarBox,
   nodeTyIsNulStruct,
   nodeTyIsNullableString,
   nodeTyIsNullableStruct,
@@ -10998,6 +10999,11 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // A PURE-litunion result (`pick(ks)` → `K`) reps as the i32 atom / string ref,
     // never the box — the checker-typed net must not claim it as a union value.
     if nodeTyIsPureLitUnion(exprIx) { return false }
+    // A nullable NUMERIC-scalar result (`f32 | null` from a chained value call
+    // `v(1)()`) is the value-union box (`repOfNullable`'s scalar arm) — the checker-typed
+    // net's TyNullable case. The niche nullables (string/boolean/litunion/struct/closure/
+    // list `| null`) are structurally excluded by the classifier.
+    if nodeTyIsNulScalarBox(exprIx) { return true }
     return nodeTyIsUnion(exprIx)
   }
   if e is Ident {
@@ -13950,13 +13956,21 @@ function annRetKind(t: string) {
       if strContains(nonNull[0], "=>") {
         return ">" + repSigTokOfKind("nulclosure")
       }
-      // A nullable numeric scalar `i32 | null` reps its result as the value-union {tag,value} BOX
-      // (`vtKindOfType` → "union", proven by a constructed `(i32) => i32 | null` interning `i>u`),
-      // so the token is `>u` — matching `cloRetKeySuffix`. Lets a value call over an `i32 | null`-
-      // returning closure resolve its interned sig; the boxed result recovers exactly as the
-      // annotated form's does. (`boolean | null` is the i32-sentinel NICHE, not a box — excluded;
-      // `f64|null` / `i64|null` construct is a separate hole, so they stay "".)
-      if nonNull[0] == "i32" { return ">" + repSigTokOfKind("union") }
+      // A nullable numeric scalar (`i32 | null`, `i64 | null`, `f64 | null`, `f32 | null`) reps
+      // its result as the value-union {tag,value} BOX (`repOfNullable`'s scalar arm → "union",
+      // proven by a constructed `(i32) => i32 | null` interning `i>u`), so the token is `>u` —
+      // matching `cloRetKeySuffix`. Lets a value call over a nullable-scalar-returning closure
+      // resolve its interned sig; the boxed result recovers exactly as the annotated form's
+      // does. (`boolean | null` is the i32-sentinel NICHE, not a box — excluded: its result
+      // valtype is plain i32, so the all-i32 arity fallback already agrees.)
+      if (
+        nonNull[0] == "i32" ||
+        nonNull[0] == "i64" ||
+        nonNull[0] == "f64" ||
+        nonNull[0] == "f32"
+      ) {
+        return ">" + repSigTokOfKind("union")
+      }
       return ""
     }
     if nonNull.length >= 2 { return ">" + repSigTokOfKind("union") }
@@ -14062,6 +14076,13 @@ export function identFnTypeAnnName(name: string, fnIx: i32) {
         const d = P.nodes[li]
         if d is LetDecl {
           if tyIsFuncType(d.letType) { return tyNameOf(d.letType) }
+          // A NULLABLE-closure annotation (`(() => string | null) | null`, kind 19): return
+          // its name — `cloNameSigKey` peels the `| null` + grouping parens to the bare
+          // closure — so a narrowed call through a null-seeded binding (`const v: (fn) | null
+          // = null; const t0 = v; if t0 != null { t0() }`) resolves its sig from the
+          // annotation even when no closure VALUE exists to trace. Every other caller guards
+          // on a top-level arrow (`annArrowAt`), which a nulclosure name never has.
+          if nulCloFlag(d.letType) == 1 { return tyNameOf(d.letType) }
           // An UN-annotated closure local from a CALL result (`const g = f(4)` where `f`
           // returns a closure): recover the function type from the checker's recorded type of
           // the init, so its `$fnsig` resolves (the intermediate binding of a curried lambda).
@@ -14104,6 +14125,8 @@ export function identFnTypeAnnName(name: string, fnIx: i32) {
     const gd = P.nodes[gi]
     if gd is LetDecl {
       if tyIsFuncType(gd.letType) { return tyNameOf(gd.letType) }
+      // The global dual of the local nulclosure-annotation arm above.
+      if nulCloFlag(gd.letType) == 1 { return tyNameOf(gd.letType) }
     }
   }
   ""

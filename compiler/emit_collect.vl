@@ -86,6 +86,7 @@ import {
   nulLitUnionInnerName,
   nullablePartOf,
   parenUnionArrElemName,
+  peelGroupParens,
   retBoolFlag,
   strContains,
   strLess,
@@ -683,8 +684,93 @@ export function collectCloSigs() {
           }
         }
       }
+      // A SHAPE annotation with a closure/nulclosure FIELD (`{f: () => i32} | null`,
+      // `{f: (() => f32 | null) | null}`) whose program constructs NO lambda — the value
+      // is only ever `null`, or narrowed and its field CALLED (`t0.f()`) — still needs
+      // the field's `$fnsig` interned: the member call derives its key (`cloCallSigKey` →
+      // `nodeTyName` → `annSigKey`) but found nothing interned and rejected loudly. The
+      // field dual of the nulclosure-annotation pass above (same normalization, so the
+      // keys byte-match; a result outside the value ABI keys "" and stays a loud reject).
+      let sb = nullablePartOf(nm)
+      if sb == "" { sb = nm }
+      if nameIsSingleShape(sb) { internShapeFieldCloSigs(sb) }
     }
     ni = ni + 1
+  }
+  0
+}
+
+// True if the single-shape text `nm` has a closure (code 14) or nullable-closure
+// (code 22) FIELD — the `collectFnValUse` gate for a shape annotation whose field
+// cell is a closure fat-pointer. Same depth-0 field split as `internShapeFieldCloSigs`.
+function shapeHasCloField(nm: string) {
+  const inner = nm.slice(1, nm.length - 1)
+  let depth = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    let brk = false
+    if k == inner.length {
+      brk = true
+    } else {
+      const c = inner[k]
+      if c == '{' || c == '[' || c == '(' { depth = depth + 1 }
+      if c == '}' || c == ']' || c == ')' { depth = depth - 1 }
+      if c == ',' && depth == 0 { brk = true }
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci > 0 {
+        const fc = nameFieldCode(part.slice(ci + 1, part.length))
+        if fc == 14 || fc == 22 { return true }
+      }
+      start = k + 1
+    }
+    k = k + 1
+  }
+  false
+}
+
+// Intern the `$fnsig` of every closure-typed FIELD of the single-shape text `nm` —
+// a code-14 field's own function type, a code-22 (nullable-closure) field's inner
+// closure. Depth-0 field split (the `registerShapeFieldUnions` grammar); idempotent
+// via `cloSigPosOfKey`, so a shape whose field closures are all concretely
+// constructed pushes nothing (byte-identical goldens).
+function internShapeFieldCloSigs(nm: string) {
+  const inner = nm.slice(1, nm.length - 1)
+  let depth = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    let brk = false
+    if k == inner.length {
+      brk = true
+    } else {
+      const c = inner[k]
+      if c == '{' || c == '[' || c == '(' { depth = depth + 1 }
+      if c == '}' || c == ']' || c == ')' { depth = depth - 1 }
+      if c == ',' && depth == 0 { brk = true }
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci > 0 {
+        const ftxt = part.slice(ci + 1, part.length)
+        const fc = nameFieldCode(ftxt)
+        let ck = ""
+        if fc == 14 { ck = unionArmSigKey(ftxt) }
+        if fc == 22 { ck = unionArmSigKey(nullablePartOf(ftxt)) }
+        if ck != "" {
+          if cloSigPosOfKey(ck) < 0 {
+            cloSigKeys.push(ck)
+            cloSigRepFn.push(-1)
+          }
+        }
+      }
+      start = k + 1
+    }
+    k = k + 1
   }
   0
 }
@@ -3442,6 +3528,22 @@ function registerInlineUnion(stmts: i32[], name: string) {
   if rnp != "" && nameIsSingleShape(rnp) {
     return registerInlineUnion(stmts, rnp)
   }
+  // A NULLABLE closure (`(() => i32 | boolean) | null`, kind 19): the `| null` niche is
+  // owned by the nulclosure machinery, but the INNER closure's VALUE-union RESULT still
+  // needs registration — un-registered, the null-narrowed inner call's `>u` box result has
+  // no `uBoxIdx` (`uDeclared` stays false) and the value call rejects loudly (the
+  // `cloCallUnionResultUnrepresentable` CASE-A floor). GATED to a pure VALUE union
+  // (`isValueUnionName` — scalar atoms + null): a map-member / composite union result does
+  // NOT yet read back through this nesting — registering it would satisfy the CASE-A floor
+  // while the box read mis-lowers (verified REJECT→INVALID-WASM), so those stay loud.
+  if rnp != "" && nameIsNulClosure(name) {
+    const ncBare = peelGroupParens(rnp)
+    const ncA = annArrowAt(ncBare)
+    if ncA >= 1 {
+      const ncRes = monoUnwrapParens(ncBare.slice(ncA + 2, ncBare.length))
+      if isValueUnionName(ncRes) { return registerInlineUnion(stmts, ncRes) }
+    }
+  }
   // A NESTED array of an inline union (`(C|D)[][]`, `(C|D)[][][]`): `parenUnionArrElemName` only
   // matches a SINGLE-bracket `(…)[]`, so strip the OUTER `[]` and recurse on the element list,
   // reaching the inner union at any depth — the registration dual of the recursive ref-array
@@ -3903,6 +4005,16 @@ export function collectFnValUse() {
       // intern even when the value is only ever `null` (no lambda anywhere else flips
       // the machinery on — the nulclosure-sig family's null-only-caller programs).
       if nameIsNulClosure(tyNameOf(i)) { fnValUsed = true }
+      // A SHAPE annotation with a closure/nulclosure FIELD (`{f: () => i32} | null`): the
+      // field cell is a closure fat-pointer whose member-call site (`t0.f()`) `call_ref`s
+      // through it — the closure machinery + the field's `$fnsig`
+      // (`internShapeFieldCloSigs`) must intern even when the value is only ever `null`
+      // (no lambda anywhere else flips it on).
+      let fvSb = nullablePartOf(tyNameOf(i))
+      if fvSb == "" { fvSb = tyNameOf(i) }
+      if nameIsSingleShape(fvSb) {
+        if shapeHasCloField(fvSb) { fnValUsed = true }
+      }
     }
     // An inferred CLOSURE-element array LITERAL (`const fs = [add, mul]`, no annotation): the
     // checker typed its element as a function type (`=>` in the element name), so its elements are
