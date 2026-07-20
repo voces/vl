@@ -2293,16 +2293,18 @@ function structIndexByValName(name: string) {
 // the two cannot drift: when the gate enumerated the value types independently it lacked the
 // scalar/atom/closure/union arms, and an annotated map return fell through to an i32 result
 // valtype over a ref-returning body — invalid wasm at the return seam.
-// True if the inner-value chain `v` of a NESTED map (`mvValKindOfName`'s `nameIsMap` arm)
-// bottoms out in a ref LIST whose element is itself a MAP or a NULLABLE — the two element
-// shapes the map read/store/coerce op sites resolve one level too shallow when the list is
-// reached through >= 2 map levels (a list-of-STRUCT / list-of-scalar reads fine; the SAME
-// list works as a DIRECT map value). Descends map nesting; stops at the first list.
+// True when a nested map's inner-value chain bottoms out in a ref LIST whose element is
+// itself a MAP (`{[string]: {[string]: {[string]: f32}[]}}` — a list of inner maps read two
+// map levels deep): the map op sites resolve that element one level shallow, so the deep
+// read casts to the wrong element heap. Rejected loudly until the op sites migrate to the
+// recursive resolver. A list of NULLABLE elements (`(i64 | null)[]`, `(string | null)[]`)
+// resolves recursively and round-trips, so it is NOT this. Descends map nesting; stops at
+// the first list.
 function mapValNestedListUnsupported(v: string): boolean {
   if nameIsMap(v) { return mapValNestedListUnsupported(mapValNameOf(v)) }
   if nameIsArray(v) {
     const e = refArrElemName(v)
-    return nameIsMap(e) || unionHasAtom(e, "null")
+    return nameIsMap(e)
   }
   false
 }
@@ -2375,14 +2377,14 @@ export function mvValKindOfName(valName: string): i32 {
     // reaches the union arm below (where a map MEMBER is rejected loudly — see there).
     //
     // EXCEPT a nested map whose inner-value chain bottoms out in a ref LIST whose element is
-    // itself a MAP or a NULLABLE (`{[string]: {[string]: {[string]: f32}[]}}` — a list of
-    // inner maps read two map levels deep; `{[string]: {[string]: (i64 | null)[]}}` — a list
-    // of nullable-i64). The vals intern side (`ensureRefElem`) IS recursive, but the map
-    // store/read/coerce OP SITES resolve the element one level shallow, so the deep read casts
-    // to the wrong element heap — a runtime TRAP (out-of-bounds cast) or invalid wasm. (A
-    // nested list-of-STRUCT / list-of-scalar — `{[string]: {[string]: S[]}}` — reads fine; and
-    // the SAME list-of-map / list-of-nullable works as a DIRECT map value, one level shallower.)
-    // Reject loudly until the op sites migrate to the recursive resolver.
+    // itself a MAP (`{[string]: {[string]: {[string]: f32}[]}}` — a list of inner maps read
+    // two map levels deep). The vals intern side (`ensureRefElem`) IS recursive, but the map
+    // store/read/coerce OP SITES resolve a list-of-map element one level shallow, so the deep
+    // read casts to the wrong element heap — a runtime TRAP (out-of-bounds cast) or invalid
+    // wasm. (A nested list-of-STRUCT / list-of-scalar / list-of-NULLABLE — `{[string]:
+    // {[string]: S[]}}`, `{[string]: {[string]: (i64 | null)[]}}` — resolves recursively and
+    // reads fine; a list-of-map works as a DIRECT map value, one level shallower.) Reject
+    // loudly until the op sites migrate to the recursive resolver.
     if mapValNestedListUnsupported(mapValNameOf(valName)) { return -3 }
     kind = 6
   } else if (
@@ -7110,6 +7112,12 @@ export function nameIsRefArray(name: string) {
   ) {
     return true
   }
+  // An array whose ELEMENT is a string-backed list (`(string | null)[][]` — the string
+  // niche list shares the `$mkListIdx` wrapper `string[]` uses, so the outer array is the
+  // same kind-6 ref list as `string[][]`). `nameIsStringArray` admits both spellings.
+  if nameIsArray(name) && nameIsStringArray(name.slice(0, name.length - 2)) {
+    return true
+  }
   // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
   // ITSELF a ref array. Recurses to the leaf (a struct / union / closure / scalar-2D ref array),
   // so any DEPTH and any ref leaf falls out — the outer element's heap is the inner list's
@@ -7226,7 +7234,11 @@ export function refArrElemKind(name: string) {
   // Nested lists of a NON-i32 scalar/string element — the element is that inner list's
   // WRAPPER (kinds 6/7/8 → `mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`). Used for a
   // string[]/f64[]/i64[]-VALUED map's vals ref-list (the value analogue of `i32[][]` kind 4).
-  if name == "string[][]" { return 6 }
+  if nameIsArray(name) && nameIsStringArray(name.slice(0, name.length - 2)) {
+    // `string[][]` AND the niche `(string | null)[][]`: the element is the string-list
+    // wrapper (`$mkListIdx`) either way — the nullable rides INSIDE the inner elements.
+    return 6
+  }
   if name == "f64[][]" { return 7 }
   if name == "i64[][]" { return 8 }
   if name == "f32[][]" {
@@ -7553,6 +7565,11 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
     // `nodeArrayElemIsNulLitUnion` recognizes — without this exclusion a string-FIRST literal claims
     // the string-list slot/collect while every consumer reads the atom rep (invalid wasm).
     if nodeArrayElemIsNulLitUnion(arrIx) { return false }
+    // A `(string | null)[]` literal with NO string-typed first element (`[null]`, `[null,
+    // "x"]`): the recorded context-adoption type is the only signal — it IS the string-ref
+    // niche list (`emitArr` seeds `pendingNulString` off the same recorded type), so the
+    // string-list build is authoritative even though the first-element probe below misses.
+    if nodeArrayElemIsNulStr(arrIx) { return true }
     return exprString(a.arrElems[0], fnIx)
   }
   false
@@ -7655,7 +7672,9 @@ export function refArrElemName(name: string) {
   if name == "i64[][]" { return "i64[]" }
   if name == "f64[][]" { return "f64[]" }
   if name == "f32[][]" { return "f32[]" }
-  if name == "string[][]" { return "string[]" }
+  if nameIsArray(name) && nameIsStringArray(name.slice(0, name.length - 2)) {
+    return name.slice(0, name.length - 2)
+  }
   if nameIsMapArray(name) { return name.slice(0, name.length - 2) }
   // `(string|i32)[]` → `string|i32` (the parens are annotation grouping only —
   // the TABLE key is the bare atom-set name every other union position uses).
@@ -11329,6 +11348,10 @@ export function exprArray(exprIx: i32, fnIx: i32) {
     return false
   }
   if e is Ident {
+    // A VALUE-union ident narrowed to an i32-backed LIST arm (`is i32[]`, `is (boolean |
+    // null)[]`, `is (K | null)[]` — value-atom kind 7) reads UNBOXED as the i32 list
+    // (`emitValueUnionUnboxRead`), so indexing / `.length` classify it as a list.
+    if unionIdentReadKind(exprIx, fnIx) == 7 { return true }
     if paramArray(fnIx, e.identName) { return true }
     if declaredArray(e.identName) { return true }
     if globalIsArray(e.identName) {
@@ -11887,6 +11910,9 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
     return false
   }
   if e is Ident {
+    // A VALUE-union ident narrowed to a string-backed LIST arm (`is string[]`, `is
+    // (string | null)[]` — value-atom kind 9) reads UNBOXED as the string list.
+    if unionIdentReadKind(exprIx, fnIx) == 9 { return true }
     if paramStringArray(fnIx, e.identName) { return true }
     if declaredStringArray(e.identName) { return true }
     if globalIsStringArray(e.identName) {
@@ -11922,6 +11948,9 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
   if e is Ident {
     const pt = paramTypeNode(fnIx, e.identName)
     if pt >= 0 { return nameIsNulStrList(tyNameOf(pt)) }
+    // A union binding narrowed to the `(string | null)[]` arm reads unboxed as the
+    // string list whose ELEMENT stays `(ref null)` — the same nullable read discipline.
+    if nameIsNulStrList(narrowVariantFor(e.identName)) { return true }
   }
   false
 }

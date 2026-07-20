@@ -3271,10 +3271,52 @@ function unionArmBoxSafe(tyIx: i32) {
 // `assignable` lattice, PLUS the float-literal→f32 exception (`isFloatLitExpr`). Used
 // where the SOURCE EXPRESSION node is in hand (so the literal can be recognized);
 // type-only sites keep using `assignable`.
+// Record the destination ARRAY type on an ArrayLit source whose element target is a
+// NICHE-nullable scalar (`K | null` / `boolean | null` / `string | null`), peeling a
+// nullable destination wrapper (`(K|null)[] | null`) and grouping parens. Runs BEFORE
+// `assignableExpr`'s plain-assignable short-circuit: `[null]` infers `null[]`, which IS
+// covariantly assignable, so the literal-aware adoption block (where the litunion-array
+// recording lives) is never reached for it — yet the recorded type is the emitter's ONLY
+// classification signal for a literal with no rep-classifying element (all-`null`, or a
+// string-first `["x", null]` that would else claim the plain string list).
+function recordNicheNulElemArrayLit(srcExpr: i32, dstTy: i32) {
+  if inferQuiet || srcExpr < 0 || dstTy < 0 { return 0 }
+  let dtix = dstTy
+  const dN = T.tys[dtix]
+  if dN is TyNullable { dtix = dN.nInner }
+  // An UNFILLED A-infer-null hole (`let x = null`) peels to no inner — nothing to record
+  // (indexing the arena at -1 traps the compiler).
+  if dtix < 0 { return 0 }
+  const d = T.tys[dtix]
+  if d is TyArray {
+    if tyIsNicheNulScalarElem(d.aElem) {
+      const e = P.nodes[srcExpr]
+      if e is Paren {
+        // Record on the WRAPPING Paren too, not only the inner literal: the emitter's
+        // typed-IR fast paths (`exprStringArray` and siblings) consult whichever node a
+        // consumer holds — a Paren keeping its stale pre-adoption record (`string[]`)
+        // would re-claim the wrong rep at the closure-result classification.
+        if recordNicheNulElemArrayLit(e.parInner, dtix) == 1 {
+          while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+          nodeTyIx[srcExpr] = dtix
+          return 1
+        }
+        return 0
+      }
+      if e is ArrayLit {
+        while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+        nodeTyIx[srcExpr] = dtix
+        return 1
+      }
+    }
+  }
+  0
+}
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // (A GENERIC function value meeting a CONCRETE function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case — `genericFnAssignable` — so it governs nested positions like an
   // array element too, not just this expression-level entry.)
+  recordNicheNulElemArrayLit(srcExpr, dstTy)
   if assignable(srcTy, dstTy) { return true }
   // A float literal re-encodes EXACTLY at f32, so it flows into any destination whose f32
   // position it fits: a bare `f32`, a nullable `f32?` (a map value / niche), or an f32 MEMBER
@@ -3404,7 +3446,17 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
         // i32 atom-id list (`nodeArrayElemIsLitUnion`). Its member elements are string
         // exprs syntactically, so the literal's own recorded type is `string[]`, which
         // would else claim the string-list rep at every seam (slot, collect, construct).
-        if ok && !inferQuiet && tyIsLitUnion(d.aElem) {
+        // The NICHE-nullable scalar elements (`K | null` / `boolean | null` / `string |
+        // null`) record the same way: an all-`null` `[null]` self-infers as `null[]` (no
+        // classifying element exists), so the recorded type is the ONLY signal the
+        // emitter's element probes (`nodeArrayElemIsNulLitUnion` / `…NulBool` /
+        // `…NulStr`) have at a position with no threaded annotation (a lambda body, an
+        // argument) — one signal, every position.
+        if (
+          ok &&
+          !inferQuiet &&
+          (tyIsLitUnion(d.aElem) || tyIsNicheNulScalarElem(d.aElem))
+        ) {
           if srcExpr < nodeTyIx.length { nodeTyIx[srcExpr] = dtix }
         }
         return ok
@@ -8604,6 +8656,15 @@ function nulElemListRetName(er: i32) {
       if inner == "f64" || inner == "i32" || inner == "i64" || inner == "f32" {
         return "(" + inner + "|null)[]"
       }
+      // The NICHE leaves: `(boolean|null)[]` (i32 sentinel-2 list), `(string|null)[]`
+      // (string-ref list with `ref.null` elements), `(K|null)[]` (i32 atom list with the
+      // `-1` sentinel, rendered by its ALIAS). Each rides an existing non-box list rep the
+      // annotated return already lowers; the pin routes the anonymous lambda through it.
+      if inner == "boolean" || inner == "string" {
+        return "(" + inner + "|null)[]"
+      }
+      const alias = litUnionAliasNameOfTy(et.nInner)
+      if alias != "" { return "(" + alias + "|null)[]" }
     }
   }
   ""
@@ -9139,6 +9200,15 @@ export function nodeTyIsNulI32List(ix: i32) {
         // interned i32 ids, sharing the i32-list backing/rep exactly like `i32[]` (the arena
         // dual of `nameIsI32Array`'s litunion arm). A scalar-elem / ref-elem list is not this.
         if tyIsLitUnion(e) { return true }
+        // A NICHE-nullable i32-backed element (`(K | null)[] | null`, `(boolean | null)[] |
+        // null`): the element's null rides IN the i32 (`-1` / 2 sentinel), so the list is the
+        // SAME i32 backing and the outer `| null` is the same `(ref null $lTypeIdx)` niche —
+        // the arena dual of `nameIsI32Array`'s nul-litunion/nul-boolean arms.
+        if tyIsNullableLitUnion(e) { return true }
+        if et is TyNullable {
+          const ei = T.tys[et.nInner]
+          if ei is TyPrim { return ei.primName == "boolean" }
+        }
       }
     }
   }
@@ -9555,9 +9625,9 @@ export function anyLitUnionUsed() {
 // emitter seeds atom construction for such an array literal's elements (they lower as ids, not
 // strings). A direct Ty check — no name round-trip (a rendered `"a" | "b"` would not re-parse).
 export function nodeArrayElemIsLitUnion(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
+  const pty = nodeArrayElemPeelTy(ix)
+  if pty < 0 { return false }
+  const t = T.tys[pty]
   if t is TyArray {
     const r = tyIsLitUnion(t.aElem)
     return r
@@ -9565,14 +9635,26 @@ export function nodeArrayElemIsLitUnion(ix: i32) {
   false
 }
 
+// The recorded type of node `ix` with ONE nullable wrapper peeled — a NULLABLE-list
+// receiver (`(K | null)[] | null`) indexed in its checker-proved non-null branch still
+// RECORDS the nullable type on the receiver node, so the element probes below must see
+// through the wrapper to classify the element. -1 (out-of-arena) when unrecorded.
+function nodeArrayElemPeelTy(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  ty
+}
+
 // True if node `ix` has a recorded ARRAY type whose ELEMENT is `boolean | null` (a
 // `(boolean | null)[]` literal). The emitter seeds `pendingNulBool` for such a literal's
 // elements so a `null` element lowers as the sentinel 2 (a `true`/`false` element rides
 // its i32 0/1 untouched) — the list analogue of the scalar `boolean | null` niche.
 export function nodeArrayElemIsNulBool(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
+  const pty = nodeArrayElemPeelTy(ix)
+  if pty < 0 { return false }
+  const t = T.tys[pty]
   if t is TyArray {
     const e = t.aElem
     if e >= 0 {
@@ -9591,9 +9673,9 @@ export function nodeArrayElemIsNulBool(ix: i32) {
 // element read `p[i]` STAYS nullable (a `nulstr` the caller narrows with `!= null`) rather than
 // recovering non-null the way a plain `string[]` element does. Mirrors `nodeArrayElemIsNulBool`.
 export function nodeArrayElemIsNulStr(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
+  const pty = nodeArrayElemPeelTy(ix)
+  if pty < 0 { return false }
+  const t = T.tys[pty]
   if t is TyArray {
     const e = t.aElem
     if e >= 0 {
@@ -9613,9 +9695,9 @@ export function nodeArrayElemIsNulStr(ix: i32) {
 // literal's elements — the atom-niche analogue of `nodeArrayElemIsNulBool`. Mirrors that probe with
 // `tyIsLitUnion` on the nullable's inner instead of a `boolean` primitive test.
 export function nodeArrayElemIsNulLitUnion(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
+  const pty = nodeArrayElemPeelTy(ix)
+  if pty < 0 { return false }
+  const t = T.tys[pty]
   if t is TyArray { return tyIsNullableLitUnion(t.aElem) }
   false
 }
@@ -9655,6 +9737,24 @@ export function tyIsNullableLitUnion(ty: i32): boolean {
 export function nodeTyIsLitUnion(ix: i32) {
   const r = tyIsLitUnion(nodeTyIxOf(ix))
   return r
+}
+
+// True if array-ELEMENT type `ty` is a NICHE-nullable scalar the emitter reps without a
+// box — `K | null` (litunion atom, i32 sentinel `-1`), `boolean | null` (i32 sentinel 2),
+// `string | null` (`(ref null $aTypeIdx)` element). Gates the ArrayLit context-adoption
+// recording: a literal accepted by such an element target IS the niche list, and the
+// recorded destination type is what the emitter's element probes key on.
+function tyIsNicheNulScalarElem(ty: i32): boolean {
+  if tyIsNullableLitUnion(ty) { return true }
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const inn = T.tys[t.nInner]
+    if inn is TyPrim {
+      return inn.primName == "boolean" || inn.primName == "string"
+    }
+  }
+  false
 }
 
 // True if node `ix`'s recorded type is a string-keyed MAP whose VALUE type is a literal
@@ -10224,6 +10324,50 @@ export function parenEnclosesWhole(name: string) {
   false
 }
 
+// The value-atom kind of a NICHE-nullable scalar-element LIST member name —
+// `(boolean | null)[]` / `(K | null)[]` share the i32-list backing (kind 7),
+// `(string | null)[]` the string-list backing (kind 9); -1 otherwise. The element's
+// null encodes INSIDE the element rep (sentinel 2 / `-1` / `ref.null $a`), so the
+// outer list carries no extra structure beyond its leaf backing's list.
+function nulElemListAtomKind(name: string) {
+  const n = name.length
+  if n < 5 { return -1 }
+  if name[n - 2] != '[' || name[n - 1] != ']' { return -1 }
+  let elem = name.slice(0, n - 2)
+  if elem.length > 1 {
+    if elem[0] == '(' && elem[elem.length - 1] == ')' {
+      elem = elem.slice(1, elem.length - 1)
+    }
+  }
+  const atoms: string[] = []
+  splitUnionAtoms(elem, atoms)
+  if atoms.length < 2 { return -1 }
+  let sawNull = false
+  const rest: string[] = []
+  let i = 0
+  while i < atoms.length {
+    if atoms[i] == "null" { sawNull = true } else { rest.push(atoms[i]) }
+    i = i + 1
+  }
+  if !sawNull { return -1 }
+  if rest.length == 0 { return -1 }
+  if rest.length == 1 {
+    if rest[0] == "boolean" { return 7 }
+    if rest[0] == "string" { return 9 }
+    if nameIsLitUnionType(rest[0]) { return 7 }
+    return -1
+  }
+  // The expanded inline litunion form (`("a" | "b" | null)[]`).
+  let core = rest[0]
+  let j = 1
+  while j < rest.length {
+    core = core + "|" + rest[j]
+    j = j + 1
+  }
+  if nameIsLitUnionType(core) { return 7 }
+  -1
+}
+
 // ── value-union atom classification ───────────────────────────────────────────
 // The atom KIND of a value-union member type name: 0 i32, 1 boolean, 2 string,
 // 3 i64, 4 f64, 5 f32, 6 null, 11 closure (a function type — a REF atom riding the
@@ -10244,6 +10388,13 @@ export function valueAtomKind(name: string) {
   if name == "f64[]" { return 8 }
   if name == "string[]" { return 9 }
   if name == "i64[]" { return 10 }
+  // A NICHE-nullable scalar-element LIST member (`(boolean | null)[]`, `(K | null)[]`,
+  // `(string | null)[]`): the element's null rides IN the element rep (an i32 sentinel /
+  // `ref.null` string), so the list IS its leaf backing's atom — the i32 list (7) or the
+  // string list (9). One kind per backing keeps the `is`-compare tag consistent with
+  // `emitUnionCoerce`'s carrier classification ("i32[]" / "string[]").
+  const nk = nulElemListAtomKind(name)
+  if nk >= 0 { return nk }
   // A CLOSURE member (`(() => i64) | i64`) is a REF atom (kind 11) — the closure
   // fat-pointer struct rides the box's anyref `value` directly (a `structref`
   // subtype), no per-rep scalar value box. Checked LAST so a concrete scalar/list
