@@ -2718,14 +2718,23 @@ export function collectA(_stmts: i32[]) {
     // is never a standalone TypeRef the scan sees, so without this a `{ f: null }` (no other string in the
     // module) left `$aTypeIdx` unallocated and the field read referenced a stale type → invalid wasm.
     if sFieldTypes[sfi] == 20 { aUsed = true }
-    // An ATOM-ARRAY field (`f: K[]`, code 4 with a recorded litunion-array elem name): the field
-    // IS the i32 list, but an inline-shape field type is never a standalone TypeRef the scan
-    // sees, and its atom-member literal is a STRING expr the ArrayLit scan files as a string
-    // list — force the i32 list wrapper/backing here.
-    if sFieldTypes[sfi] == 4 && sFieldElemName[sfi] != "" {
+    // An i32/boolean-LIST field (code 4, atom-array elem name or plain) and its NULLABLE twin
+    // (code 18, `i32[] | null`): the field IS (or holds) the i32 list, but an inline-shape field
+    // type is never a standalone TypeRef the scan sees — and the field may be the module's only
+    // list mention (a null-carrying construct never builds a literal). Force the wrapper/backing
+    // here so the field valtype and any narrowed read resolve.
+    if sFieldTypes[sfi] == 4 || sFieldTypes[sfi] == 18 {
       lUsed = true
       aUsed = true
     }
+    // A STRING-list field (code 6) forces its own wrapper/backing pair, same reasoning.
+    if sFieldTypes[sfi] == 6 {
+      slUsed = true
+      aUsed = true
+    }
+    // A SCALAR-LIST field (f64[]/i64[]/f32[], codes 25/26/27): `internInlineShape` forced the
+    // pair at intern time, but this pass's re-run resets the flags — re-derive from the table.
+    forceScalarListField(sFieldTypes[sfi])
     sfi = sfi + 1
   }
   // Union-VARIANT map fields (`{f: {[string]: V}} | i32`): the variant-table twin of the
@@ -2737,6 +2746,26 @@ export function collectA(_stmts: i32[]) {
   // byte-identical for any program without a map-valued union-variant field.
   let ufi = 0
   while ufi < uFieldTypes.length {
+    // The variant-table twins of the struct-field re-derivations above: a variant field's
+    // type is never a standalone TypeRef the scan sees (the whole union spelling is ONE
+    // name), and the registration-time forcing predates this pass's resets — re-derive
+    // each list-ish field's wrapper/backing needs from the surviving tables.
+    if uFieldTypes[ufi] == 4 || uFieldTypes[ufi] == 18 {
+      lUsed = true
+      aUsed = true
+    }
+    if uFieldTypes[ufi] == 6 {
+      slUsed = true
+      aUsed = true
+    }
+    forceScalarListField(uFieldTypes[ufi])
+    // A NULLABLE ref-list variant field (code 28): re-intern its element so the field's
+    // storage type + narrowed reads resolve the wrapper slot (`rlSlotByName`).
+    if uFieldTypes[ufi] == 28 {
+      rlUsed = true
+      raUsed = true
+      ensureRefElem(uFieldElemName[ufi])
+    }
     if uFieldTypes[ufi] == 19 {
       // Force the shared map machinery types too: the variant's map field may be the
       // program's ONLY map mention (a `({f: {[string]: string}} | string)[]` param whose
@@ -3112,17 +3141,6 @@ function collectShapeVariantFields(nm: string) {
           "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
         )
       }
-      // A NULLABLE-LIST variant field (`f: {[string]: i64}[] | null` code 28, `f: i32[] | null`
-      // code 18): the element ref-list slot is NOT deep-interned on the variant path (only the
-      // standalone-struct path interns it), so the field-READ emit later indexes an un-interned
-      // slot — a compiler-internal OOB (the map-array case) or invalid wasm (the i32-list case).
-      // Until the variant path interns these element shapes, reject loudly rather than crash / emit
-      // bad bytes. (rep-fuzz `{a: f64, f: {[string]: i64}[] | null, z: i32} | {w: i32}` read TRAP.)
-      if fc == 18 || fc == 28 {
-        return emitFail(
-          "emitProgram: a nullable-list union-variant field is not supported",
-        )
-      }
       uFieldTypes.push(fc)
       uFieldElemName.push(shapeFieldElemName(ftxt, fc))
       uFieldNames.push(part.slice(0, ci))
@@ -3169,15 +3187,6 @@ function collectVariantFields(stmts: i32[], name: string) {
             if code < 0 {
               return emitFail(
                 "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
-              )
-            }
-            // A NULLABLE-LIST variant field (code 18 / 28): its element ref-list slot is not
-            // deep-interned on the variant path, so a later field read OOBs / emits bad bytes.
-            // Reject loudly until the variant path interns it (the named-TypeDecl twin of the
-            // inline-shape guard above).
-            if code == 18 || code == 28 {
-              return emitFail(
-                "emitProgram: a nullable-list union-variant field is not supported",
               )
             }
             uFieldTypes.push(code)

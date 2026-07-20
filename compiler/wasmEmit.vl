@@ -895,6 +895,10 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         pendingListKind = 6 // i64[] field — widen bare-int elements to i64
       } else if scode == 27 {
         pendingListKind = 7 // f32[] field — re-encode float elements at f32
+      } else if scode == 18 {
+        // A NULLABLE i32-list field value is an i32 list (subtypes the nullable slot) OR a
+        // bare `null` -> `ref.null $lTypeIdx` (the `pendingNulRefHeap` seed; a list ignores it).
+        pendingNulRefHeap = lTypeIdx
       } else if scode == 28 {
         // A NULLABLE ref-list field value is a list (build it THROUGH the element slot, like code 5) OR a
         // bare `null` -> `ref.null $wrapper` (the `pendingNulRefHeap` seed; a list value ignores it).
@@ -1264,6 +1268,7 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
     // (4/6/7 — its elements coerce to f64 / widen to i64 / re-encode at f32 in `emitArr`).
     pendingListKind = 0
     pendingListSlot = 0
+    pendingNulRefHeap = -1
     const vcode = variantFieldTypeAt(vi, fj)
     if vcode == 5 {
       let vslot = variantFieldRefSlot(vi, fj)
@@ -1274,6 +1279,20 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
       } else {
         pendingListKind = 1
       }
+    } else if vcode == 18 {
+      // A NULLABLE i32-list variant field: a bare `null` -> `ref.null $lTypeIdx`
+      // (the `pendingNulRefHeap` seed; a list value ignores it) — the emitObj discipline.
+      pendingNulRefHeap = lTypeIdx
+    } else if vcode == 28 {
+      // A NULLABLE ref-list variant field: a list value builds THROUGH the element slot
+      // (like code 5), a bare `null` -> `ref.null $wrapper` — the emitObj code-28 discipline.
+      let vslot28 = variantFieldRefSlot(vi, fj)
+      if vslot28 < 0 { vslot28 = 0 }
+      pendingListSlot = vslot28
+      if rlElemKindTbl[vslot28] == 2 { pendingListKind = 2 }
+      else if rlElemKindTbl[vslot28] == 1 { pendingListKind = 1 }
+      else { pendingListKind = 5 }
+      if vslot28 < rlWrapIdx.length { pendingNulRefHeap = rlWrapIdx[vslot28] }
     } else if vcode == 6 {
       pendingListKind = 3
     } else if vcode == 25 {
@@ -11477,6 +11496,9 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     // (subtypes the nullable wrapper), a `null` argument is `ref.null $wrapper` (`cParamNulRefArrHeap`).
     let cParamNulRefArr = false
     let cParamNulRefArrHeap = -1
+    // A DISTINCT-backing nullable scalar-list param position (`i64[] | null` etc.): a list-literal
+    // argument builds the leaf wrapper (the build code), a `null` argument is `ref.null $wrapper`.
+    let cParamNulSLKind: VKind | null = null
     // A literal-union param position: a member-literal argument lowers as its interned i32 id.
     let cParamLitUnion = false
     let cParamNulLitUnion = false
@@ -11492,6 +11514,7 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           if retNulStringFlag(cpnb.parType) == 1 { cParamNulString = true }
           if nulCloFlag(cpnb.parType) == 1 { cParamNulClosure = true }
           if retNulListFlag(cpnb.parType) == 1 { cParamNulList = true }
+          cParamNulSLKind = nulScalarListKindOfNode(cpnb.parType)
           if retNulRefArrFlag(cpnb.parType) == 1 {
             cParamNulRefArr = true
             const cpRls = tyAnnRefListSlot(cpnb.parType)
@@ -11598,6 +11621,13 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
         if cParamNulList { argCtx.nulList = true }
         if cParamNulRefArr && cParamNulRefArrHeap >= 0 {
           argCtx.nulRefHeap = cParamNulRefArrHeap
+        }
+        const argNulSLK = cParamNulSLKind
+        if argNulSLK != null {
+          // A list-literal argument builds the leaf wrapper; a `null` argument
+          // is `ref.null $wrapper`. Mirrors the return-position seeding.
+          argCtx.listKind = nulScalarListBuildKind(argNulSLK)
+          argCtx.nulRefHeap = nulScalarListWrapHeap(argNulSLK)
         }
         if cParamLitUnion { argCtx.litUnion = 1 }
         if cParamNulLitUnion {
