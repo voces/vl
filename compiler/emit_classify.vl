@@ -6127,7 +6127,22 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
     }
     return true
   }
-  if want != code { return false }
+  if want != code {
+    // The AMBIGUOUS nullable-closure render: a code-22 field (`f: (() => i64) | null`)
+    // RENDERS ungrouped (`()=>i64|null` — the checker drops a union member's grouping
+    // parens), which `nameFieldCode` reads as a top-level arrow (code 14) returning a
+    // nullable. The grouped and ungrouped spellings render identically, so the text alone
+    // cannot refute the 22 layout — stay LENIENT (not a proven mismatch) when the arrow's
+    // RESULT carries a depth-0 `| null` tail. A genuine closure field with a non-nullable
+    // result (`f: () => i64`) keeps the proven-mismatch reject.
+    if code == 22 && want == 14 {
+      const aa = annArrowAt(t)
+      if aa >= 0 && nullablePartOf(t.slice(aa + 2, t.length)) != "" {
+        return true
+      }
+    }
+    return false
+  }
   if want == 19 && elem != "" { return mvValNamesCompat(mapValNameOf(t), elem) }
   if want == 15 && elem != "" {
     // A DECLARED-name nested-struct field (`inner: Inner`) against the variant's
@@ -8585,14 +8600,20 @@ function funcTypeShapeLowerable(nm: string): boolean {
           // field whose union is REGISTERED (`isUName` — `registerInlineUnion`'s
           // functype-return descent registers a result shape's field unions in
           // `collectU`, before this gate runs from `internShapeDeep`) is a plain box
-          // ref slot the same machinery a non-closure struct field uses. Any other
+          // ref slot the same machinery a non-closure struct field uses. A code-22
+          // NULLABLE-CLOSURE field (`f: (() => i64) | null`) is the shared
+          // `(ref null $cloStruct)` fat-pointer slot — the SAME rep the field carries in
+          // any non-closure-result struct, so the shape interns and the literal that
+          // builds it name-set-matches THIS shape (un-interned, the literal self-coded
+          // the field 14 — a non-null layout the code-22 reads then mis-cast). Any other
           // unsafe code keeps the shape un-interned (the clean closure reject).
           if (
             !(fc == 5 &&
               (nameIsNestedScalarLeafArray(ftxt) ||
               structElemArrayLowerable(ftxt))) &&
             !(fc == 19 && mvValKindOfName(mapValNameOf(ftxt)) != -3) &&
-            !(fc == 16 && isUName(ftxt))
+            !(fc == 16 && isUName(ftxt)) &&
+            fc != 22
           ) {
             okAll = false
           }
@@ -9772,6 +9793,29 @@ export function unionHasMapArmSlot(name: string, slot: i32) {
       ) {
         return true
       }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True when the union member-set `name` carries a map arm whose VALUE spelling is the bare
+// `string` — the checker's RENDER of a litunion-valued map (`{[string]: K0}` renders
+// `{[string]: string}`; the litunion bit lives on the NODE, not the name), so a union
+// registered through a rendered spelling (a lambda's pinned result, an inline expanded
+// litunion) interned the STRING-map slot for what is a MONO-map value. The box seam
+// (`emitUnionCoerce`'s map-carrier arm) consults this when a mono litunion-valued map
+// misses the slot match: the collapsed arm IS this value's arm, and the box tags MONO
+// (`mapSlotTag(-1)`) — the same tag an `is {[string]: K0}` test derives from its own
+// (litunion → mono) spelling, so store and narrow resolve one tag.
+export function unionHasCollapsedStringMapArm(name: string) {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    if a != "null" && nameIsMap(a) && !nameIsMapMemberUnion(a) {
+      if mapValNameOf(a) == "string" { return true }
     }
     i = i + 1
   }
