@@ -9104,6 +9104,24 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     return false
   }
   if e is Member {
+    // `t0.f` reading a literal-union atom FIELD through a NARROWED union receiver
+    // (`t0 is {f: K0} { print(t0.f) }`) or a variant-typed receiver yields the atom —
+    // the variant-table twin of the struct-receiver case below (the `memFieldTypeCode`
+    // dispatch order). Without it the read printed the raw atom id.
+    const mIxA = unwrapParen(exprIx)
+    let mviA = -1
+    if memIsNarrowed(mIxA) {
+      mviA = memNarrowVariantIndex(mIxA)
+    } else {
+      mviA = exprVariantIndex(e.memObj, fnIx)
+    }
+    if mviA >= 0 {
+      const mvfiA = variantFieldIndex(mviA, e.memProp)
+      if mvfiA >= 0 && variantFieldTypeAt(mviA, mvfiA) == 0 {
+        const rv = nameIsLitUnionType(variantFieldElemName(mviA, mvfiA))
+        return rv
+      }
+    }
     // `b.kind` reading a literal-union atom FIELD yields the atom.
     const msi = structIndexOfExpr(e.memObj, fnIx)
     if msi >= 0 {
@@ -9176,13 +9194,14 @@ export function shapeFieldElemName(ftxt: string, code: i32) {
   if code == 19 { return mapValNameOf(ftxt) }
   // A NULLABLE map field (code 29): the `| null`-stripped map's value name — same key.
   if code == 29 { return mapValNameOf(nulMapInnerName(ftxt)) }
-  // An ATOM-ARRAY field (`f: K[]`, code 4) records its ARRAY type-name — the shape-text
-  // mirror of `fieldRefElemName`'s code-4 arm, so a shape-text union VARIANT with an
-  // atom-array field seeds the atom-element build (`variantFieldIsLitUnionArray`).
-  if code == 4 {
-    if nameIsLitUnionArray(ftxt) { return ftxt }
-    return ""
-  }
+  // A literal-union ATOM field (code 0 named `K`) / ATOM-ARRAY field (code 4 named `K[]`)
+  // records its union (array) name, so the variant tables recover the atom rep + membership
+  // exactly as `sFieldElemName` does (`internInlineShape` / `collectS` parity) — without it a
+  // union-arm struct field `{f: K0} | i64` stored "" and construction emitted the raw member
+  // string ref into the i32 atom slot.
+  if code == 0 && nameIsLitUnionType(ftxt) { return ftxt }
+  if code == 4 && nameIsLitUnionArray(ftxt) { return ftxt }
+  if code == 4 { return "" }
   ""
 }
 
@@ -13454,6 +13473,23 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
     return tn != "" && annArrowAt(tn) >= 0
   }
   if e is Member {
+    // A closure FIELD of a NARROWED union receiver (`t0 is {a, f: (i32) => K0, z} {
+    // t0.f(1) }`) or a variant-typed receiver reads back a closure exactly like a plain
+    // struct's — the variant-table twin of `memberIsClosure` (the `memFieldTypeCode`
+    // dispatch order), so the call routes to `call_ref`.
+    let mviC = -1
+    if memIsNarrowed(exprIx) {
+      mviC = memNarrowVariantIndex(exprIx)
+    } else {
+      mviC = exprVariantIndex(e.memObj, fnIx)
+    }
+    if mviC >= 0 {
+      const mvfiC = variantFieldIndex(mviC, callMemProp(exprIx))
+      if mvfiC >= 0 {
+        const vfcC = variantFieldTypeAt(mviC, mvfiC)
+        if vfcC == 14 || vfcC == 22 { return true }
+      }
+    }
     // A struct field holding a function value reads back as a closure.
     return memberIsClosure(e.memObj, callMemProp(exprIx), fnIx)
   }

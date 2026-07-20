@@ -121,6 +121,7 @@ import {
   loopStackFind,
   mapValNameOf,
   memberPathKeyOf,
+  nameIsLitUnionArray,
   nameIsMap,
   nulCloFlag,
   nullablePartOf,
@@ -1337,6 +1338,20 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
       if emitUnionCoerce(body, variantFieldElemName(vi, fj), valIx, fnIx) < 0 {
         return -1
       }
+    } else if vcode == 0 && nameIsLitUnionType(variantFieldElemName(vi, fj)) {
+      // A literal-union atom variant field (`{f: K0} | i64` built from `{f: "aa"}`):
+      // the member literal lowers as its interned atom id — the variant twin of the
+      // plain struct-literal path's `sFieldIsLitUnion` arm. Without the atom context
+      // the member's raw string ref hit the i32 field slot (invalid wasm).
+      const fluCtx = expCtxHere()
+      fluCtx.litUnion = 1
+      if emitExprExpect(body, valIx, fnIx, fluCtx) < 0 { return -1 }
+    } else if vcode == 4 && nameIsLitUnionArray(variantFieldElemName(vi, fj)) {
+      // An ATOM-ARRAY variant field (`{f: K0[]} | string`): the value is the i32 LIST
+      // of atom ids — the variant twin of `sFieldIsLitUnionArray`'s construct arm.
+      const flaCtx = expCtxHere()
+      flaCtx.litUnion = 1
+      if emitExprExpect(body, valIx, fnIx, flaCtx) < 0 { return -1 }
     } else {
       if emitExpr(body, valIx, fnIx) < 0 { return -1 }
     }
@@ -2094,6 +2109,14 @@ export function emitUnionCoerce(
     return emitExpr(body, exprIx, fnIx)
   }
   if exprStruct(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
+  // A bare VARIANT value (a kind-8 local/param/call — its binding classified concrete via
+  // `letIsVariant`, which runs BEFORE the union case): a variant-init binding's own slot IS
+  // the raw variant ref, so pass it through — the same contract the `!unionHasValueAtom`
+  // fall-through below gives a struct-only union. Without this arm a union carrying a VALUE
+  // atom (`{f: K0} | i64`) dropped the variant ref into the scalar atom ladder and widened
+  // the ref (invalid wasm). A box-typed position (arg / return / element / map default)
+  // routes through `emitUnionBoxArg`, which boxes the variant ref BEFORE deferring here.
+  if exprVariantIndex(exprIx, fnIx) >= 0 { return emitExpr(body, exprIx, fnIx) }
   // A MAP carrier (`{[string]: string}`, `{[string]: i32}`) flowing into a union with a matching
   // map arm: the map STRUCT ref rides the box anyref directly (like a reflist wrapper), tagged by
   // its interned value-slot (`mapSlotTag`). Checked BEFORE the value-atom gate below — such a union
