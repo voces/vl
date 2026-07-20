@@ -21,6 +21,7 @@ import {
   isInferLetNulBool,
   isInferLetNulStr,
   isValueUnionName,
+  nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulLitUnion,
@@ -35,6 +36,7 @@ import {
   nodeTyIsNullableString,
   nodeTyIsNullableStruct,
   nodeTyIsObj,
+  nodeTyIsPureLitUnion,
   nodeTyIsStruct,
   nodeTyIsStructArray,
   nodeTyIsUnion,
@@ -9483,7 +9485,12 @@ export function vbHeapIdxOfAtom(atom: string) {
 // FIELD's atom set through it after `collectU` has run.
 export function registerValueUnionName(name: string) {
   if isUName(name) { return 0 }
-  if !isValueUnionName(name) { return 0 }
+  // A value union with a litunion-ALIAS arm (`K0 | i64`) registers here too: the alias
+  // arm rides the box as its member-string atom (tag `string`, the litunion box rep), so
+  // the union is value-box-shaped even though `valueAtomKind("K0")` is -1 — without the
+  // registration its scalar arms' value boxes are never minted and a boxed return emits
+  // a raw scalar into the box anyref (invalid wasm).
+  if !isValueUnionName(name) && !nameIsLitUnionArmValueUnion(name) { return 0 }
   uDeclared = true
   unNames.push(name)
   unMemberSet.push(name)
@@ -9528,6 +9535,11 @@ export function markValueUnionAtoms(name: string) {
     // force the closure rec-group types so that heap type exists (the union annotation may be
     // the only mention of a function value in the program), the string/list analogue above.
     if k == 11 { fnValUsed = true }
+    // A litunion-ALIAS member (`K0` in `K0 | i64`) rides the box anyref as its member-STRING
+    // ref (the litunion box rep), so force the string array type exactly like a `string`
+    // member — the narrowed `is K0` read's `ref.cast $aTypeIdx` must validate even when the
+    // module constructs no string.
+    if k < 0 && nameIsLitUnionType(atoms[i]) { aUsed = true }
     i = i + 1
   }
   0
@@ -10957,13 +10969,22 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       if fnRetUnion(callee.identName) { return true }
       // A union-returning function VALUE (a binding / `(…) => A | B` param callee) — its
       // result is the union box, `>u`.
-      return calleeRetKind(callee.identName, fnIx) == "union"
+      if calleeRetKind(callee.identName, fnIx) == "union" { return true }
+      // A miss here is NOT authoritative: a closure REBOUND from a composed carrier with
+      // no annotation (`const v = xs[0]; v(1)` over a union-result closure element) has no
+      // sig the syntactic resolution sees, yet its call_ref yields the union BOX — fall
+      // through to the checker-typed `nodeTyIsUnion` fallback below (the same net the
+      // Index-callee spelling already lands in), so the binding slot classifies as the box
+      // and the narrowed read unboxes instead of a raw i32 slot taking the ref.
     }
     // A union-returning FIELD-closure call.
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
       if ffe >= 0 { return fRetKind[ffe] == "union" }
     }
+    // A PURE-litunion result (`pick(ks)` → `K`) reps as the i32 atom / string ref,
+    // never the box — the checker-typed net must not claim it as a union value.
+    if nodeTyIsPureLitUnion(exprIx) { return false }
     return nodeTyIsUnion(exprIx)
   }
   if e is Ident {
@@ -11178,6 +11199,12 @@ function unionRetOfFnType(fnTyName: string) {
     const ret = monoUnwrapParens(fnTyName.slice(arrowAt + 2, fnTyName.length))
     if isUName(ret) { return ret }
     if isValueUnionName(ret) { return ret }
+    // A value union with a litunion-ALIAS arm (`K0 | i64`): never a registered union
+    // alias (a litunion decl is a `UnionDecl`, not a struct `TypeDecl`, so
+    // `isVariantBoxUnion` declines it) and not `isValueUnionName` (a `K0` atom is no
+    // value atom) — but it boxes as a value union (the alias arm rides the box as its
+    // member-string atom), so the name IS the atom set a narrowed read unboxes with.
+    if nameIsLitUnionArmValueUnion(ret) { return ret }
   }
   ""
 }

@@ -7508,6 +7508,20 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // VARIANT-BOX union result with an INLINE-struct arm (`(i32) => i32 | {w: i32}`,
+        // `() => {f: i32} | f64` — the R2 closure-result `$fnsig` seam): a lambda whose body
+        // infers ONE arm of the expected union adopts the whole union, so the boxing lands at
+        // the return seam (`emitReturnValue` boxes the arm) and the lambda's functype result IS
+        // the box — its `$fnsig` keys `>u`, byte-matching the value call's `annSigKey`. The
+        // annotated named-function spelling of every such union already lowers this box soundly
+        // (the value call reads it back through `is`), so the pin only removes the annotation.
+        // AFTER `refArmUnionRetName` (ref-array arms carry a slot render this arm declines).
+        if inferred != expRet && variantBoxUnionRetName(expRet) != "" {
+          const vbTail = lambdaBodyTail(n.fnBody)
+          if vbTail >= 0 && assignableExpr(vbTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
         // ELEMENT-NULLABLE LIST result (`() => (f64|null)[]`): a lambda whose body is an
         // array literal assignable to the expected value-union-box list adopts it, so
         // `emitReturnValue` seeds each nullable element (`[null]`) through the SAME rep the
@@ -7752,6 +7766,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // loop REGISTERS the union and `synthRetAnnots`'s `isUName` arm pins the lambda's
         // `fnRet` to the same spelling `nodeUnionName` hands the emitter's binding resolution.
         if unm == "" { unm = refArmUnionRetName(inferred, gRootStmts) }
+        // A VARIANT-BOX union contextual return with an INLINE-struct arm (`(i32) => i32 |
+        // {w: i32}`, adopted just above) — record its emitter name so `collectU`'s inferred-
+        // return loop REGISTERS the union and `synthRetAnnots`'s `isUName` arm pins the
+        // lambda's `fnRet` to it; the `$fnsig` result then keys `>u`, matching the value call.
+        if unm == "" { unm = variantBoxUnionRetName(inferred) }
         // A NESTED-LIST contextual return (`() => i64[][]`, adopted just above) — record its
         // emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the nested array, whose
         // return-position literal threading + `$fnsig` reflist-slot keying the annotated form
@@ -9042,6 +9061,117 @@ function refArmUnionRetName(er: i32, stmts: i32[]) {
   ""
 }
 
+// The emitter-format NAME of a VARIANT-BOX union `er` with an INLINE-struct arm and a
+// scalar/string sibling (`i32 | {w: i32}`, `{f: string} | {w: i32}`, `{f: i32} | f64`,
+// `{a: i32, f: i32, z: f64} | boolean`): a ≥2-member union whose every member is an
+// object shape or a scalar/string prim, with at least one object member. This is the
+// closure-RESULT unlock for the R2 `$fnsig` seam: the annotated named-function spelling
+// (`mk(x: i32): i32 | {w: i32}` bound to a `(i32) => i32 | {w: i32}` value) already
+// interns `>u` and its value call round-trips, so pinning a lambda's `fnRet` to this
+// name (`synthRetAnnots`'s `isUName` arm — the render is registered by `collectU`'s
+// inferred-return loop) routes the anonymous lambda through the SAME sound box.
+// `tyToEmitName` renders the emitter's non-spaced vocabulary, byte-matching the
+// `registerInlineUnion` / `splitUnionAtoms` name shape. Declines ("") when:
+//  · any member is a map / array / closure / nullable (those shapes are owned by
+//    `mapUnionRetName` / `refArmUnionRetName` / the nullable arms — or stay loud),
+//  · any member is a literal type (`TyLit` — a litunion member renders softened to
+//    `string`, divorcing the pinned name from the annotation's atom rep),
+//  · any member renders "" (an unrepresentable leaf), or no object member exists
+//    (a pure-scalar union is `valueUnionRetName`'s), or every member is a NOMINAL
+//    object (`structUnionRetName` owns the nominal render — checked by the caller
+//    running that arm first).
+function variantBoxUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyUnion {
+    const members = t.uMembers
+    if members.length < 2 { return "" }
+    let hasComposite = false
+    let name = ""
+    let i = 0
+    while i < members.length {
+      const mn = vbUnionMemberName(members[i])
+      if mn == "" { return "" }
+      if mn != "i32" && mn != "i64" && mn != "f64" && mn != "f32" {
+        if mn != "boolean" && mn != "string" { hasComposite = true }
+      }
+      if i > 0 { name = name + "|" }
+      name = name + mn
+      i = i + 1
+    }
+    if !hasComposite { return "" }
+    return name
+  }
+  ""
+}
+
+// One member's render for `variantBoxUnionRetName`: a scalar/string prim by name, a
+// literal-union ALIAS by its alias (`K0` — the i32-atom rep; `tyToEmitName` would soften
+// it to `string`, divorcing the pinned name from the annotation's atom member), and an
+// object shape field-wise (each field a prim or a litunion alias). "" for anything else
+// (map / array / closure / nullable / inline-litunion members stay on their own paths).
+function vbUnionMemberName(mIx: i32): string {
+  const alias = litUnionAliasNameOfTy(mIx)
+  if alias != "" { return alias }
+  const m = T.tys[mIx]
+  if m is TyPrim { return m.primName }
+  if m is TyObj {
+    const names = m.objFieldNames
+    const ftys = m.objFieldTypes
+    let out = "{"
+    let fi = 0
+    while fi < names.length {
+      let fs = litUnionAliasNameOfTy(ftys[fi])
+      if fs == "" {
+        const ft = T.tys[ftys[fi]]
+        if ft is TyPrim { fs = ft.primName } else { return "" }
+      }
+      if fi > 0 { out = out + "," }
+      out = out + names[fi] + ":" + fs
+      fi = fi + 1
+    }
+    return out + "}"
+  }
+  ""
+}
+
+// True if node `ix`'s recorded type is a PURE literal union (every member a `TyLit` —
+// an aliased or inline litunion): it reps as the i32 ATOM (alias) or the string ref
+// (inline), NEVER the value-union box, so the emitter's union-box classifiers must not
+// claim it. Gates `exprUnion`'s checker-typed Call fallback: without it a call whose
+// result is a litunion (`const r = pick(ks)`, `pick(p: K[]): K`) classified as a box
+// and the atom-valued store mismatched the ref cell.
+export function nodeTyIsPureLitUnion(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length < 2 { return false }
+    let i = 0
+    while i < t.uMembers.length {
+      if !(T.tys[t.uMembers[i]] is TyLit) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// True when at least one member of the union member list is NOT an object shape — the
+// cheap NO-RENDER pre-gate for `nodeUnionName`'s variant-box fallback arm. A mixed
+// union (`f64 | {w: i32}`, `K0 | boolean`) boxes value-union style and its narrowed
+// read needs the NAME to unbox; a pure-object union (`{f: string} | {w: i32}`, the
+// huge `Node`) narrows via the variant alone, so declining here keeps the costly
+// member renders off that path.
+function mixedVariantBoxGate(members: i32[]): boolean {
+  let i = 0
+  while i < members.length {
+    if !(T.tys[members[i]] is TyObj) { return true }
+    i = i + 1
+  }
+  false
+}
+
 // The public entry point: check the program rooted at node `rootIx`, returning
 // the number of diagnostics raised (diagnostics also accumulate on `T.diags`).
 // (The old PR #5 gap — a discarded/`let`-bound call return mis-lowering at module
@@ -10178,6 +10308,19 @@ export function nodeUnionName(ix: i32) {
       // and `refArmUnionRetName` structurally pre-gates before rendering (#494 discipline).
       const ran = refArmUnionRetName(ty, gRootStmts)
       if ran != "" { return ran }
+      // A MIXED variant-box union (`f64 | {w: i32}`, `K0 | boolean` — ≥1 non-object arm):
+      // a binding INFERRED from a closure-value call of this result type (an indexed
+      // closure-array element `v[0](1)`, a narrowed nullable-closure rebind `t0()`) holds
+      // the box, and its narrowed read must UNBOX — which keys on this name. Render the
+      // same spelling `variantBoxUnionRetName` pins on the adopted lambda (the registered
+      // union name), so the unbox resolves exactly like the annotated-binding path. A
+      // pure-OBJECT union (`{f: string} | {w: i32}`, the huge `Node`) stays "" — its
+      // narrow resolves via the variant alone and the render is the #494-costly op the
+      // hot path must avoid (`mixedVariantBoxGate` declines before any member renders).
+      if mixedVariantBoxGate(t.uMembers) {
+        const vbn = variantBoxUnionRetName(ty)
+        if vbn != "" { return vbn }
+      }
     }
   }
   // A nullable value SCALAR (`i32 | null`) is a `TyNullable`, NOT a `TyUnion`, yet reps as the
@@ -10613,6 +10756,32 @@ function nulElemListAtomKind(name: string) {
   }
   if nameIsLitUnionType(core) { return 7 }
   -1
+}
+
+// True if `name` is a VALUE union carrying a literal-union ALIAS arm (`K0 | i64`,
+// `K0 | f64`): ≥2 top-level atoms, every atom a value atom / `null` / a declared
+// litunion alias, at least one alias arm and ≥2 non-null arms. Such a union boxes
+// like a value union — the litunion arm rides the box as its member-string atom
+// (tag `string`), so a closure result pinned to this name lowers exactly like the
+// annotated named-function spelling. The alias arm makes `isValueUnionName`
+// decline (its `valueAtomKind` is -1), hence this dedicated predicate.
+export function nameIsLitUnionArmValueUnion(name: string) {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  if atoms.length < 2 { return false }
+  let hasAlias = false
+  let nonNull = 0
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    if a != "null" {
+      nonNull = nonNull + 1
+      if nameIsLitUnionType(a) { hasAlias = true }
+      else if valueAtomKind(a) < 0 { return false }
+    }
+    i = i + 1
+  }
+  hasAlias && nonNull >= 2
 }
 
 // ── value-union atom classification ───────────────────────────────────────────

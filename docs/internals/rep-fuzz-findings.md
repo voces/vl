@@ -403,6 +403,59 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   function value — a genuine reject, not an adoption gap): an ARBITRARY f64 VALUE into an f32 return
   (`(i32) => f32 = (x) => someF64Var`) stays a lossy-demote reject.
 
+- **R2/closures — closure/function-VALUE call whose RESULT is a COMPOSITE union (the `$fnsig`
+  `>u` seam)** (`(i32) => i32 | {w: i32}`, `() => {f: i32} | f64`, `(i32) => {f: string} |
+  {w: i32}`, `() => {a: i32, f: i64, z: f32} | boolean`, `(i32) => K0 | i64`, `(i32) => {f: K0}
+  | i64`, plus the composed carriers `((i32) => f64 | {w: i32})[]`, `(() => K0 | boolean) |
+  null`, `(() => K0 | f64) | string`, `{a: i32, f: (i32) => f32 | {w: i32}, z: f32}`,
+  `{[string]: (i32) => i32 | {w: i32}}`, `{a: boolean, f: {[string]: () => ((i32) => f32 |
+  {w: i32})}, z: i64}`): a REJECT (`function-value call arity has no interned signature`). The
+  annotated NAMED-function spelling already interned `>u` and its box round-tripped; only the
+  LAMBDA spelling never adopted the union — its functype result keyed the single inferred arm
+  (`>i`/`>d`/`>S`) while the value call keyed `>u`, and the sig never interned. Four seams, NO
+  new `$fnsig` token (the ABI vocabulary is unchanged — a composite-union result IS the
+  existing `>u` box token):
+  - checker ADOPTION (`variantBoxUnionRetName` + `vbUnionMemberName`): a lambda whose body tail
+    infers ONE arm of the expected variant-box union (members: scalar/string prims, litunion
+    ALIASES — rendered by alias, not the softened `string` — and object shapes whose fields are
+    prims/aliases) adopts the whole union when `assignableExpr` proves the tail assignable; the
+    recorded emitter name registers via `collectU`'s inferred-return loop, `synthRetAnnots`
+    pins `fnRet`, and `emitReturnValue` boxes at the return seam — so the `$fnsig` result keys
+    `>u`, byte-matching the value call.
+  - REGISTRATION (`nameIsLitUnionArmValueUnion`): a value union with a litunion-ALIAS arm
+    (`K0 | i64`) registers value-box style — the alias arm rides the box as its member-string
+    atom (tag `string`, forcing `aUsed` so the narrowed `is K0` cast validates even with no
+    constructed string); `registerValueUnionName` / `registerInlineUnion` / `synthRetAnnots` /
+    `unionRetOfFnType` all admit the name.
+  - the composed-carrier READ (the class-upgrade trap): adoption alone turned 4 baseline
+    REJECTs into INVALID-WASM — the box came back from a value call whose CALLEE has no
+    annotation the syntactic resolution sees (`xs[0](1)`, a narrowed nullable-closure rebind
+    `t0()`, a map-`??` closure chain `t0()(1)`, a union-member closure narrow), so the
+    un-annotated result binding never resolved the union name and the narrowed read leaked the
+    raw box. Fix: `nodeUnionName` gains a MIXED variant-box arm (`mixedVariantBoxGate` — ≥1
+    non-object member; a pure-OBJECT union still narrows via the variant alone and never pays
+    the render), and `exprUnion`'s Ident-callee miss falls through to the checker-typed
+    `nodeTyIsUnion` net instead of returning false.
+  - the net's litunion guard (`nodeTyIsPureLitUnion`): a PURE-litunion call result reps as the
+    i32 atom / string ref, never the box — the broadened fallback initially regressed
+    `literal-unions/atom-call-result-print.vl` (a global atom cell classified as a ref box over
+    an i32 store), caught by the corpus gate and excluded.
+  Graduated 25 baseline lines (111 → 86) across every position: `p2c/p2r (i32) => i32 |
+  {w: i32}` and `{f: string} | {w: i32}`, `p1c/p1r () => {f: i32} | f64` and `{a, f: i64,
+  z: f32} | boolean`, `p3c/p3r () => {a, f, z: f64} | boolean`, `p0c/p0r/p2r (i32) => K0 |
+  i64`, `p2r (i32) => {f: K0} | i64`, and the six composed-carrier shapes above (array /
+  nullable / struct-field / union-member / map-valued / deep map+closure). Frozen:
+  `tests/cases/closures/closure-result-variant-box-union.vl` (positions p0–p3, expr- and
+  block-bodied, else-branch struct AND scalar complement reads),
+  `closure-result-litunion-arm-union.vl` (alias arm + i64 complement + `{f: K0}` struct arm),
+  `closure-result-union-composed-carrier.vl` (all five carriers, direct AND rebind spellings).
+  Still loud, correctly: a NAMED single-arm function VALUE into a union-result slot
+  (`value-union closure RESULT is not yet representable` — rep invariance, no adoption
+  possible); 3-member `… | i32 | null` results (`ref valtype with no interned shape`);
+  nullable-scalar results (`(i32) => i64 | null`, `() => f32 | null` — the C2/C3 composition);
+  map-member unions; and the narrowed struct-arm EXTRACT into a fresh local (`const t = u` then
+  `t.f` after `is {f: i32}` — `field access receiver is not a struct`, fails identically for a
+  plain non-closure union binding: a separate rebind gap, not a closure seam).
 - **R2/closures — litunion RESULT via a lambda, + the value-call-result print widening**
   (`(i32) => K`, and the nested `{a: i64, f: {f: (i32) => K}, z: boolean}`): TWO seams, one CHECKER
   + one EMITTER, both required for the shape to round-trip.
