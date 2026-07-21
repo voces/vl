@@ -4,6 +4,40 @@ State of the rep-composition fuzz burndown as of master `6f21705`, written for p
 different machine. Everything here reproduces from a seed: `scripts/fuzz-vl.sh --seed S --count 200
 --depth D [flags]` regenerates the exact failing case (add `--keep DIR` to keep the `.vl` + `.err`).
 
+## ⚡ ADDENDUM — burndown session later on 2026-07-21 (PRs #932–#939, master `1c3f192`)
+
+Eight PRs landed; every §3 seed re-swept against the post-fix compiler. Net state:
+
+- **§0 both gate-red findings FIXED** (#932): the `string | null` global TRAP (global nulstr
+  read now respects `pendingNulString`) and the chained-closure `K0 | null` INVALID-WASM
+  (`nodeTyIsNullableString` excludes litunions; `exprNulLitUnion` gains the Call fallback).
+- **§3's only MISMATCH FIXED** (#934): `structIndexOfObjCtx` resolves a 2+-name-match
+  ambiguity via the checker's node type (same-field-name map-value vs closure-result structs).
+- **All three §3 TRAPs FIXED**: `(() => {f: K0} | null) | null` (#936 — nullable-result
+  adoption unwrap + litunion-alias preservation in `tyToEmitName`'s TyObj fields);
+  `mix:{f: {[string]: {f: string}} | null}` (#937 — was a COMPILER OOB crash: `sScanLim`
+  fences the struct matchers against `collectS`'s in-flight entry, and
+  `collectNestedFieldShapes` descends via `internShapeDeep` so the declared alias now WORKS
+  like the inline spelling).
+- **Graduations**: mixed-magnitude scalar array literals (`[712583, 13131313131]`, `[2, 1.5]`
+  — #935, all-element classification; plain bindings emitted invalid wasm before); the
+  nullable-litunion-struct closure-result family (#936); declared nullable struct-valued map
+  fields (#937).
+- **Made loudly reject** (never baselineable, still open as expressiveness gaps): un-interned
+  `>u` closure-result keys — the whole "multi-param-closure" cluster, which was NOT
+  multi-param at all (#938, clears seeds 70441494 / 383761456 / 674045282 and 615401451-p0r);
+  nullable-LIST map values `{[string]: {f: f64}[] | null}` (#939).
+- **Survivors: 17 distinct INVALID-WASM shapes, 0 TRAP, 0 MISMATCH** (report-only legs).
+  Fully clean seeds: 615401451, 70441494, 674045282, 383761456, 261329272, 468772662,
+  679748579. Remaining clusters: the declared `twin:`/`mix:` seams (structural-twin heap
+  dedup declines union-arm ref-list fields — `slotCanonKey` gap, squarely the repOf rewrite;
+  do NOT one-off patch per DECISIONS), and deep closure-in-struct/map composites
+  (`() => {…(i32,i32,i32)=>…}` nests, `{[string]: (() => {…})[][]}`). Re-sweep script
+  pattern: see `scripts/fuzz-vl.sh` invocations in the tables below; the 2026-07-21 sweep
+  used every §3 seed at `--count 200`.
+
+The §3 tables below are PRE-burndown; re-run any seed before trusting a row.
+
 ## Where things stand
 
 - **Pinned baseline (`scripts/rep-fuzz-baseline.txt`): 1 line** (199 → 1 over 2026-07-19..21).
