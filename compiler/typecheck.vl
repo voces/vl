@@ -9451,16 +9451,50 @@ function variantBoxUnionRetName(er: i32) {
   if t is TyUnion {
     const members = t.uMembers
     if members.length < 2 { return "" }
-    let hasComposite = false
+    // A litunion-ALIAS member's literals FLATTEN into sibling TyLit members
+    // (`flattenVariantsInto`: `K0 | {w: i32} | f64` -> ["pd", "42", {w:i32}, f64]),
+    // so no single member names the alias. Regroup: collect the str-lit members and
+    // resolve them as ONE registered alias by exact member-set match, rendered at
+    // the FIRST lit's position (preserving the annotation's member order so the
+    // pinned name byte-matches the annotation spelling). No exact alias match (or a
+    // non-str lit) declines the whole union, keeping the loud reject.
+    const litTexts: string[] = []
+    let i0 = 0
+    while i0 < members.length {
+      const m0 = T.tys[members[i0]]
+      if m0 is TyLit {
+        if m0.litKind != "str" { return "" }
+        litTexts.push(m0.litText)
+      }
+      i0 = i0 + 1
+    }
+    let litAlias = ""
+    if litTexts.length > 0 {
+      litAlias = litUnionAliasOfLitTexts(litTexts)
+      if litAlias == "" { return "" }
+    }
+    let hasComposite = litAlias != ""
     let name = ""
+    let litDone = false
     let i = 0
     while i < members.length {
-      const mn = vbUnionMemberName(members[i])
-      if mn == "" { return "" }
-      if mn != "i32" && mn != "i64" && mn != "f64" && mn != "f32" {
-        if mn != "boolean" && mn != "string" { hasComposite = true }
+      const m = T.tys[members[i]]
+      let mn = ""
+      if m is TyLit {
+        if litDone {
+          i = i + 1
+          continue
+        }
+        litDone = true
+        mn = litAlias
+      } else {
+        mn = vbUnionMemberName(members[i])
+        if mn == "" { return "" }
+        if mn != "i32" && mn != "i64" && mn != "f64" && mn != "f32" {
+          if mn != "boolean" && mn != "string" { hasComposite = true }
+        }
       }
-      if i > 0 { name = name + "|" }
+      if name != "" { name = name + "|" }
       name = name + mn
       i = i + 1
     }
@@ -10085,6 +10119,58 @@ export function litUnionAliasNameOfTy(ty: i32) {
   while i < cUnionTyIxs.length {
     if cUnionTyIxs[i] == ty { return cUnionNames[i] }
     i = i + 1
+  }
+  // STRUCTURAL fallback: an annotation position may REBUILD the alias's member union
+  // at a fresh arena index, so the index compare misses and the member was
+  // unnameable. An all-str-lit TyUnion in the arena is alias-derived
+  // (`canonEmitTypeNames` softens INLINE litunion spellings to `string` — string
+  // rep, never a lit-member TyUnion), so matching a registered litunion alias by
+  // member-literal SET is exact, not a guess.
+  const tu = T.tys[ty]
+  if tu is TyUnion {
+    const texts: string[] = []
+    let m0 = 0
+    while m0 < tu.uMembers.length {
+      const mt = T.tys[tu.uMembers[m0]]
+      if mt is TyLit { texts.push(mt.litText) }
+      m0 = m0 + 1
+    }
+    return litUnionAliasOfLitTexts(texts)
+  }
+  ""
+}
+
+// The registered litunion ALIAS whose member-literal set is EXACTLY `texts` (`["pd",
+// "42"]` -> "K0"), or "" — shared by the structural fallback above and the
+// flattened-member regroup in `variantBoxUnionRetName`.
+export function litUnionAliasOfLitTexts(texts: string[]): string {
+  if texts.length == 0 { return "" }
+  let a = 0
+  while a < cUnionTyIxs.length {
+    if tyIsLitUnion(cUnionTyIxs[a]) {
+      const rt = T.tys[cUnionTyIxs[a]]
+      if rt is TyUnion {
+        if rt.uMembers.length == texts.length {
+          let all = true
+          let m = 0
+          while m < texts.length {
+            let found = false
+            let r = 0
+            while r < rt.uMembers.length {
+              const rm = T.tys[rt.uMembers[r]]
+              if rm is TyLit {
+                if rm.litText == texts[m] { found = true }
+              }
+              r = r + 1
+            }
+            if !found { all = false }
+            m = m + 1
+          }
+          if all { return cUnionNames[a] }
+        }
+      }
+    }
+    a = a + 1
   }
   ""
 }
