@@ -8775,9 +8775,17 @@ function structFieldBoxRetName(er: i32) {
       }
       hasBox = true
     } else if ft is TyNullable {
-      // A nullable struct FIELD (`{f: S | null}`) is a niche, not the value-union box this pin
-      // routes through — decline (conservative; it stays a clean reject, never invalid wasm).
-      return ""
+      // A NULLABLE struct field (`{f: f64 | null}`, `{f: S | null}`) — a niche slot the
+      // ANNOTATED form already lowers. Record it as box-bearing (so the pin fires) when the
+      // inner is a prim/literal/object; an unlowerable inner (closure/map/list) declines the
+      // whole struct as before. The old blanket decline left the lambda UN-pinned — for a
+      // shape whose outer and nested structs share a field-name set (`{a: f32, f: {a: f64,
+      // f: {f: f64 | null}}}`), the un-pinned return resolution collapsed onto the WRONG
+      // same-name-set struct and emitted the outer f32 field as f64 — INVALID-WASM (fuzz
+      // seed 103465585 d6). Pinned, the lambda takes the annotated-form path (proven).
+      const nin = T.tys[ft.nInner]
+      if !(nin is TyPrim) && !(nin is TyLit) && !(nin is TyObj) { return "" }
+      hasBox = true
     } else if ft is TyObj {
       // A NESTED struct field (`{f: {f: i32 | string}}`): the boxed slot may sit one level
       // down — RECURSE so the pin fires for a lambda whose NESTED literal field adopted a
@@ -9307,7 +9315,16 @@ function nestedLeafListRetName(er: i32) {
 // union with a non-map/non-object member (an unrepresentable arm the box path rejects downstream).
 function mapUnionRetName(er: i32) {
   if er < 0 { return "" }
-  const t = T.tys[er]
+  // A NULLABLE map-member union (`{[string]: boolean} | i32 | null`) normalizes to
+  // TyNullable over the union — unwrap it for the member gate; the render keeps the
+  // full `…|null` spelling (`tyToEmitName(er)`), which `synthRetAnnots`'s nullable
+  // pin arm accepts and the annotated form already lowers. Un-recorded, the lambda's
+  // `$fnsig` result keyed the raw scalar arm (`>i`) while the binding local held the
+  // union box — INVALID-WASM at the call-result store (fuzz seed 103465585 d6).
+  let uIx = er
+  const tn = T.tys[er]
+  if tn is TyNullable { uIx = tn.nInner }
+  const t = T.tys[uIx]
   if t is TyUnion {
     const members = t.uMembers
     if members.length < 2 { return "" }
