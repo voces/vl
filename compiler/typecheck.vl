@@ -1112,6 +1112,117 @@ function lambdaBodyTail(bodyIx: i32) {
 // (`anonFieldCode`, which otherwise codes a small literal i32) interns the wide slot.
 // Anything else keeps the inferred shape, and `objNumWidens` in `fnSlotAssignable` rejects
 // it loudly (a function value's field rep is fixed; only a literal body can re-encode).
+// The FIELD WALK of `objRetWidenAdopt`, factored out so a NESTED object field recurses:
+// `litIx` is an ObjLit whose inferred type `sTyIx` adopts the expected `dTyIx` field-wise,
+// appending each re-encodable value node + its adopted field type to `recNodes`/`recTys`.
+// Returns false on any proven field mismatch (the caller keeps the inferred type).
+function objLitWidenFields(
+  litIx: i32,
+  sTyIx: i32,
+  dTyIx: i32,
+  recNodes: i32[],
+  recTys: i32[],
+): boolean {
+  const lit = P.nodes[litIx]
+  if !(lit is ObjLit) { return false }
+  const s = T.tys[sTyIx]
+  const d = T.tys[dTyIx]
+  if !(s is TyObj) { return false }
+  if !(d is TyObj) { return false }
+  if s.objFieldNames.length != d.objFieldNames.length { return false }
+  let i = 0
+  while i < d.objFieldNames.length {
+    const dty = d.objFieldTypes[i]
+    const sty = objFieldType(s, d.objFieldNames[i])
+    if sty < 0 { return false }
+    // The field's VALUE expression in the literal body (shared by the numeric-widen
+    // and the float-literal→f32 arms below).
+    let fv = -1
+    const fl = lit.objFields
+    let fi = 0
+    while fi < fl.length {
+      const fn = P.nodes[fl[fi]]
+      if fn is FieldInit {
+        if fn.fiName == d.objFieldNames[i] { fv = fn.fiValue }
+      }
+      fi = fi + 1
+    }
+    if numWidens(sty, dty) {
+      // The widening field's value must be a small int literal in the literal body.
+      if fv < 0 { return false }
+      const fvn = P.nodes[fv]
+      if fvn is NumLit {
+        if hasDot(fvn.numText) { return false }
+        if !intLexemeFitsI32(fvn.numText) { return false }
+        recNodes.push(fv)
+        recTys.push(dty)
+      } else {
+        return false
+      }
+    } else if primNameOf(dty) == "f32" && isFloatLitExpr(fv) {
+      // FLOAT-LITERAL → f32 field (`() => ({a: 3.5, …})` against `{a: f32, …}`): the field
+      // infers f64 but the literal re-encodes exactly at f32 (the field dual of the scalar
+      // arm above). Record f32 on the value node so `anonFieldCode` interns the f32 field
+      // slot (it would else code the float literal's default f64).
+      recNodes.push(fv)
+      recTys.push(dty)
+    } else if assignable(sty, dty) && !assignable(dty, sty) {
+      // The field WIDENS by BOXING — a bare scalar/struct arm into a UNION or NULLABLE
+      // field (`{f: false}` against `{f: boolean | {w: i32}}`, `{f: 99}` against
+      // `{f: i64 | string}`). Adopt when the literal value re-encodes at the wider field
+      // type (`assignableExpr`, field-wise) — the object dual of the value-union return
+      // arm. Record the field type so the emitter boxes the field slot and coerces the
+      // ObjLit value into the box, exactly as the annotated `: {f: boolean | {w: i32}}`
+      // named-function return already lowers. `synthRetAnnots` pins the lambda's `fnRet`
+      // to the whole struct shape (`nameIsStructWithUnionField`), so its `$fnsig` result
+      // is the union-field struct — without which the value call mis-recovered the plain
+      // struct (MISMATCH / INVALID-WASM at the boxed field read).
+      // A NESTED object field whose INNER field widens (`{f: {f: 16743}}` against
+      // `{f: {f: i32 | string}}`): the value is itself an ObjLit — RECURSE so the inner
+      // literal adopts the union-field shape and records ITS node type; without the
+      // descent the lambda body built the self-inferred `{f: i32}` layout while the sig
+      // keyed the union-field struct (INVALID-WASM at the return; fuzz-nightly run
+      // 29808029476, seed 78530533 d5 `(i32) => {f: {f: i32 | string}}`).
+      if fv < 0 { return false }
+      let fvIn = fv
+      let fvDone = false
+      while !fvDone {
+        const fvp = P.nodes[fvIn]
+        if fvp is Paren { fvIn = fvp.parInner } else { fvDone = true }
+      }
+      const fvNode = P.nodes[fvIn]
+      if fvNode is ObjLit {
+        if !objLitWidenFields(fvIn, sty, dty, recNodes, recTys) { return false }
+        recNodes.push(fvIn)
+        recTys.push(dty)
+      } else {
+        if !assignableExpr(fv, sty, dty) { return false }
+        recNodes.push(fv)
+        recTys.push(dty)
+      }
+    } else if tyIsLitUnion(dty) {
+      // LITUNION field (`f: "8"` against `f: K0 = "xz" | "8"`): the body value is a bare
+      // string literal that is a MEMBER of the expected literal-union. It infers the
+      // softened `string`, but re-encodes as the litunion's i32 ATOM — the field dual of
+      // the scalar litunion-return arm (`(i32) => K = (x) => "b"`). Adopt when the value is
+      // a member literal; record the litunion field type so `anonFieldCode` interns the
+      // atom slot (it would else code the string). The named-function VALUE spelling of the
+      // same struct-with-litunion-field return already lowers to this rep.
+      if fv < 0 { return false }
+      if !assignableExpr(fv, sty, dty) { return false }
+      recNodes.push(fv)
+      recTys.push(dty)
+    } else {
+      // A non-widening field must match exactly (mutual assignability) — a shape
+      // difference beyond numeric widening is not an adoption, it is a mismatch.
+      if !assignable(sty, dty) { return false }
+      if !assignable(dty, sty) { return false }
+    }
+    i = i + 1
+  }
+  true
+}
+
 function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
   if inferredTy < 0 || expRetTy < 0 { return false }
   let u = lambdaBodyTail(bodyIx)
@@ -1137,79 +1248,10 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
   const d = T.tys[expInnerTy]
   if s is TyObj {
     if d is TyObj {
-      if s.objFieldNames.length != d.objFieldNames.length { return false }
       const recNodes: i32[] = []
       const recTys: i32[] = []
-      let i = 0
-      while i < d.objFieldNames.length {
-        const dty = d.objFieldTypes[i]
-        const sty = objFieldType(s, d.objFieldNames[i])
-        if sty < 0 { return false }
-        // The field's VALUE expression in the literal body (shared by the numeric-widen
-        // and the float-literal→f32 arms below).
-        let fv = -1
-        const fl = lit.objFields
-        let fi = 0
-        while fi < fl.length {
-          const fn = P.nodes[fl[fi]]
-          if fn is FieldInit {
-            if fn.fiName == d.objFieldNames[i] { fv = fn.fiValue }
-          }
-          fi = fi + 1
-        }
-        if numWidens(sty, dty) {
-          // The widening field's value must be a small int literal in the literal body.
-          if fv < 0 { return false }
-          const fvn = P.nodes[fv]
-          if fvn is NumLit {
-            if hasDot(fvn.numText) { return false }
-            if !intLexemeFitsI32(fvn.numText) { return false }
-            recNodes.push(fv)
-            recTys.push(dty)
-          } else {
-            return false
-          }
-        } else if primNameOf(dty) == "f32" && isFloatLitExpr(fv) {
-          // FLOAT-LITERAL → f32 field (`() => ({a: 3.5, …})` against `{a: f32, …}`): the field
-          // infers f64 but the literal re-encodes exactly at f32 (the field dual of the scalar
-          // arm above). Record f32 on the value node so `anonFieldCode` interns the f32 field
-          // slot (it would else code the float literal's default f64).
-          recNodes.push(fv)
-          recTys.push(dty)
-        } else if assignable(sty, dty) && !assignable(dty, sty) {
-          // The field WIDENS by BOXING — a bare scalar/struct arm into a UNION or NULLABLE
-          // field (`{f: false}` against `{f: boolean | {w: i32}}`, `{f: 99}` against
-          // `{f: i64 | string}`). Adopt when the literal value re-encodes at the wider field
-          // type (`assignableExpr`, field-wise) — the object dual of the value-union return
-          // arm. Record the field type so the emitter boxes the field slot and coerces the
-          // ObjLit value into the box, exactly as the annotated `: {f: boolean | {w: i32}}`
-          // named-function return already lowers. `synthRetAnnots` pins the lambda's `fnRet`
-          // to the whole struct shape (`nameIsStructWithUnionField`), so its `$fnsig` result
-          // is the union-field struct — without which the value call mis-recovered the plain
-          // struct (MISMATCH / INVALID-WASM at the boxed field read).
-          if fv < 0 { return false }
-          if !assignableExpr(fv, sty, dty) { return false }
-          recNodes.push(fv)
-          recTys.push(dty)
-        } else if tyIsLitUnion(dty) {
-          // LITUNION field (`f: "8"` against `f: K0 = "xz" | "8"`): the body value is a bare
-          // string literal that is a MEMBER of the expected literal-union. It infers the
-          // softened `string`, but re-encodes as the litunion's i32 ATOM — the field dual of
-          // the scalar litunion-return arm (`(i32) => K = (x) => "b"`). Adopt when the value is
-          // a member literal; record the litunion field type so `anonFieldCode` interns the
-          // atom slot (it would else code the string). The named-function VALUE spelling of the
-          // same struct-with-litunion-field return already lowers to this rep.
-          if fv < 0 { return false }
-          if !assignableExpr(fv, sty, dty) { return false }
-          recNodes.push(fv)
-          recTys.push(dty)
-        } else {
-          // A non-widening field must match exactly (mutual assignability) — a shape
-          // difference beyond numeric widening is not an adoption, it is a mismatch.
-          if !assignable(sty, dty) { return false }
-          if !assignable(dty, sty) { return false }
-        }
-        i = i + 1
+      if !objLitWidenFields(u, inferredTy, expInnerTy, recNodes, recTys) {
+        return false
       }
       if recNodes.length == 0 { return false }
       if !inferQuiet {
@@ -4579,7 +4621,16 @@ function tyToEmitName(ix: i32) {
     const parts: string[] = []
     let i = 0
     while i < members.length {
-      const s = tyToEmitName(members[i])
+      // A MEMBER that is a registered litunion ALIAS (`K0 | i64`) keeps its alias name
+      // rather than softening to `string` — the alias arm reps as the i32 atom in the
+      // union box, and every `$fnsig`/slot key derived from this render must agree with
+      // the annotation side's `(K0|i64)` spelling. Without it a closure returning
+      // `(K0 | i64)[]` keyed `(string|i64)[]` while the value call keyed the alias —
+      // divergent functypes, a cast-failure TRAP (fuzz-nightly run 29808029476, seed
+      // 78530533 d5). The union-member sibling of the TyFunc-result / TyObj-field
+      // alias preservation above and below.
+      let s = litUnionAliasNameOfTy(members[i])
+      if s == "" { s = tyToEmitName(members[i]) }
       if s == "" { return "" }
       let dup = false
       let j = 0
@@ -8727,6 +8778,16 @@ function structFieldBoxRetName(er: i32) {
       // A nullable struct FIELD (`{f: S | null}`) is a niche, not the value-union box this pin
       // routes through — decline (conservative; it stays a clean reject, never invalid wasm).
       return ""
+    } else if ft is TyObj {
+      // A NESTED struct field (`{f: {f: i32 | string}}`): the boxed slot may sit one level
+      // down — RECURSE so the pin fires for a lambda whose NESTED literal field adopted a
+      // union-field shape (`objLitWidenFields`' descent). Without it the lambda's `$fnsig`
+      // kept the self-inferred plain layout while the value call keyed the boxed-field
+      // struct — INVALID-WASM (fuzz-nightly run 29808029476, seed 78530533 d5,
+      // `(i32) => {f: {f: i32 | string}}`). A nested shape with no box contributes
+      // nothing (the "" is a plain no-box, not a decline — its own unlowerable unions
+      // still fail loudly at the field-coding gate).
+      if structFieldBoxRetName(t.objFieldTypes[i]) != "" { hasBox = true }
     }
     i = i + 1
   }
