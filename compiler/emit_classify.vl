@@ -1956,6 +1956,29 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
   }
   if n is FuncDecl {
     if n.fnName != "" { bound.push(n.fnName) }
+    // A nested function's FREE variables that THIS scope does not bind are TRANSITIVE
+    // captures: the nested closure's env is built inside this lifted function
+    // (`emitCaptureRead` reads each capture in the enclosing frame), so a name the
+    // nested body needs from an outer frame must ride this env too. Scan the nested
+    // body against its OWN bound set (params + its self-name), then filter the frees
+    // through `capRecord` — names bound here (params/locals), globals, and function
+    // names drop out; the rest append in encounter order.
+    const ibound: string[] = []
+    const iparams = n.fnParams
+    let ipi = 0
+    while ipi < iparams.length {
+      const ip = P.nodes[iparams[ipi]]
+      if ip is Param { ibound.push(ip.parName) }
+      ipi = ipi + 1
+    }
+    if n.fnName != "" { ibound.push(n.fnName) }
+    const ifree: string[] = []
+    capScan(n.fnBody, ibound, ifree)
+    let ifi = 0
+    while ifi < ifree.length {
+      capRecord(ifree[ifi], bound, caps)
+      ifi = ifi + 1
+    }
     return 0
   }
   if n is Block {
@@ -2084,13 +2107,41 @@ export function fnEnvIdxOf(fe: i32) {
 // be used as a value (none in the corpus are).
 export function fnSigIsClosure(fe: i32) { fnSigIdxOfFn(fe) >= 0 }
 
-// The arena index of the parent frame's binding for a captured `name` — the parent
-// FuncDecl's matching `Param` node, or a `LetDecl` in the parent body, or -1. Used to
-// resolve a capture's wasm valtype (its declared type lives in the parent frame).
-function parentBindingOf(fe: i32, name: string) {
+// The `fnStmts` POSITION of the enclosing frame whose binding a captured `name`
+// resolves to — the direct parent when it binds `name` (a param or a body `let`),
+// else the nearest ANCESTOR frame that does (a TRANSITIVE capture: every
+// intermediate lifted function re-captures the name into its own env, so the VALUE
+// flows env-to-env, but the TYPE lives at the owning frame's binding). -1 when no
+// ancestor binds it.
+function parentBindingFrameOf(fe: i32, name: string): i32 {
   if fe < 0 || fe >= fnParent.length { return -1 }
   const par = fnParent[fe]
   if par < 0 || par >= fnStmts.length { return -1 }
+  const pfn = P.nodes[fnStmts[par]]
+  if pfn is FuncDecl {
+    const params = pfn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return par }
+      }
+      i = i + 1
+    }
+    if parentLetOf(pfn.fnBody, name) >= 0 { return par }
+    return parentBindingFrameOf(par, name)
+  }
+  -1
+}
+
+// The arena index of the enclosing frame's binding for a captured `name` — the owning
+// frame's matching `Param` node, or a `LetDecl` in its body, or -1. Resolves through
+// `parentBindingFrameOf`, so a TRANSITIVE capture (the binding lives frames above the
+// direct parent) types exactly as a direct one. Used to resolve a capture's wasm
+// valtype (its declared type lives in the owning frame).
+function parentBindingOf(fe: i32, name: string) {
+  const par = parentBindingFrameOf(fe, name)
+  if par < 0 { return -1 }
   const pfn = P.nodes[fnStmts[par]]
   if pfn is FuncDecl {
     const params = pfn.fnParams
@@ -2118,12 +2169,12 @@ export function captureValKind(fe: i32, name: string): VKind {
   if bn is LetDecl {
     if bn.letType >= 0 { return vtKindOfType(bn.letType) }
     // Un-annotated local: classify the INITIALIZER through the same ladder
-    // `collectLocals` types the binding with (resolved in the PARENT frame), so
+    // `collectLocals` types the binding with (resolved in the OWNING frame), so
     // a captured list/string/struct env field carries its real ref valtype —
     // `const store = [a, b]` captured by a closure is the i32-list wrapper ref
     // (kind 2), not an i32 cell. Order mirrors `collectLocals`.
     if bn.letInit >= 0 {
-      const pf = fnParent[fe]
+      const pf = parentBindingFrameOf(fe, name)
       if letIsMap(b, pf) { return "map" }
       if letIsNulRef(b, pf) { return "nulstruct" }
       // A value union wins over a scalar-list INIT (`f64[] | string = [1.5]`) — see the
@@ -2168,7 +2219,7 @@ export function captureValStructIdx(fe: i32, name: string) {
       return retStructIndex(bn.letType)
     }
     if bn.letInit >= 0 {
-      const pf = fnParent[fe]
+      const pf = parentBindingFrameOf(fe, name)
       // The kind-specific companion index, mirroring `captureValKind`'s ladder:
       // a map capture carries its mv SHAPE slot, a nullable-struct / struct
       // capture its struct table index, a ref-list capture its ref-list slot.
@@ -2364,22 +2415,6 @@ export function mvSlotNullable(slot: i32) {
   nulRefMapValInnerOf(mvValName[slot]) != ""
 }
 
-// True when a nested map's inner-value chain bottoms out in a ref LIST whose element is
-// itself a MAP (`{[string]: {[string]: {[string]: f32}[]}}` — a list of inner maps read two
-// map levels deep): the map op sites resolve that element one level shallow, so the deep
-// read casts to the wrong element heap. Rejected loudly until the op sites migrate to the
-// recursive resolver. A list of NULLABLE elements (`(i64 | null)[]`, `(string | null)[]`)
-// resolves recursively and round-trips, so it is NOT this. Descends map nesting; stops at
-// the first list.
-function mapValNestedListUnsupported(v: string): boolean {
-  if nameIsMap(v) { return mapValNestedListUnsupported(mapValNameOf(v)) }
-  if nameIsArray(v) {
-    const e = refArrElemName(v)
-    return nameIsMap(e)
-  }
-  false
-}
-
 export function mvValKindOfName(valName: string): i32 {
   if valName == "i32" || valName == "boolean" { return -1 }
   // A literal-union ATOM value (`{[string]: K0}`, `K0 = "aa" | "bb"`): each value IS the
@@ -2417,10 +2452,7 @@ export function mvValKindOfName(valName: string): i32 {
     const nin = nulRefMapValInnerOf(valName)
     if nin != "" {
       if nin == "string" { return 3 }
-      if nameIsMap(nin) {
-        if mapValNestedListUnsupported(mapValNameOf(nin)) { return -3 }
-        return 6
-      }
+      if nameIsMap(nin) { return 6 }
       // A NULLABLE-CLOSURE value (`(() => string) | null`): kind 14 — the vals element is
       // already the `(ref null $cloStruct)` fat-pointer, so the niche rides the non-null
       // closure rep (a bare `null` stores `ref.null`, the fused `?? d` read preserves a
@@ -2475,17 +2507,9 @@ export function mvValKindOfName(valName: string): i32 {
     // The member-union guard keeps a map-FIRST union value (`{[string]: i32} | f64` — a name
     // `nameIsMap` matches but which is a union BOX, not a nested map) out of this arm, so it
     // reaches the union arm below (where a map MEMBER is rejected loudly — see there).
-    //
-    // EXCEPT a nested map whose inner-value chain bottoms out in a ref LIST whose element is
-    // itself a MAP (`{[string]: {[string]: {[string]: f32}[]}}` — a list of inner maps read
-    // two map levels deep). The vals intern side (`ensureRefElem`) IS recursive, but the map
-    // store/read/coerce OP SITES resolve a list-of-map element one level shallow, so the deep
-    // read casts to the wrong element heap — a runtime TRAP (out-of-bounds cast) or invalid
-    // wasm. (A nested list-of-STRUCT / list-of-scalar / list-of-NULLABLE — `{[string]:
-    // {[string]: S[]}}`, `{[string]: {[string]: (i64 | null)[]}}` — resolves recursively and
-    // reads fine; a list-of-map works as a DIRECT map value, one level shallower.) Reject
-    // loudly until the op sites migrate to the recursive resolver.
-    if mapValNestedListUnsupported(mapValNameOf(valName)) { return -3 }
+    // The inner-value chain resolves recursively to ANY depth — a triple-nested map, or one
+    // bottoming out in a list of maps (`{[string]: {[string]: {[string]: f32}[]}}`) — through
+    // the same `ensureRefElem`/`mvShapeOfValName` mutual recursion the intern side uses.
     kind = 6
   } else if (
     nameIsI32Array(valName) ||
@@ -2505,13 +2529,10 @@ export function mvValKindOfName(valName: string): i32 {
     // a ref-value list whose element is this value's wrapper (`ensureRefElem`, recursive). The
     // store seeds the value literal off this slot and the read classifies the value's element
     // recursively, so any nesting / leaf falls out — one predicate, no per-shape special cases.
-    //
-    // EXCEPT a list whose element is itself a MAP or a NULLABLE (`{[string]: {[string]: V}[]}`,
-    // `{[string]: (i64 | null)[]}`): the SAME one-level-shallow op-site resolution the nested-map
-    // arm above gates on — un-gated here, the deep element resolution walked an unresolved slot
-    // and the COMPILER ITSELF trapped out-of-bounds. Reject loudly until the op sites migrate to
-    // the recursive resolver.
-    if mapValNestedListUnsupported(valName) { return -3 }
+    // A list-of-MAPS element (`{[string]: {[string]: V}[]}`) resolves through the same
+    // recursion: `ensureRefElem`'s map-element arm interns the inner map's own value slot
+    // BEFORE this slot's parallel arrays are pushed (`mvShapeOfValName`'s kind-6 pre-block),
+    // so the deep element read lands on a fully-resolved slot.
     kind = 6
   } else if unionMemberCount(unionMemberSetOf(valName)) > 1 {
     // A UNION-valued map: each value is the shared union BOX ref (`uBoxIdx`), stored in a ref
@@ -2577,8 +2598,12 @@ export function mvShapeOfValName(valName: string) {
   // A kind-6 (ref-VALUE: nested map / list) value forces the i32-list + map types, and a
   // MAP value also interns its INNER value shape first (so a ref-valued inner map's struct
   // exists) — for the common mono inner (`{[string]: i32}`) that is a no-op
-  // (`mvShapeOfValName("i32")` returns -1). Done BEFORE pushing this slot's parallel arrays
-  // so the recursive intern lands at an earlier slot index.
+  // (`mvShapeOfValName("i32")` returns -1). ALL of the recursive interning — including the
+  // vals ref-list slot (`ensureRefElem`, whose map-element arm RE-ENTERS `mvShapeOfValName`
+  // for a list-of-maps value) — runs BEFORE this slot's parallel arrays are pushed: a
+  // reentrant intern between `mvValName.push` and `mvRlSlot.push` would land its own
+  // `mvRlSlot` entry at THIS slot's index, skewing every parallel table after it.
+  let rls6 = -1
   if kind == 6 {
     lUsed = true
     aUsed = true
@@ -2590,6 +2615,10 @@ export function mvShapeOfValName(valName: string) {
     if nameIsStringArray(bare) { slUsed = true }
     else if nameIsF64Array(bare) { fa64Used = true }
     else if nameIsI64Array(bare) { ia64Used = true }
+    // The vals ref-list slot, keyed by the value name with the recursively-interned inner
+    // slots — the SAME `ensureRefElem` the array path uses. Its recursion strictly shrinks
+    // the element spelling, so it never re-enters on `valName` itself.
+    rls6 = ensureRefElem(bare)
   }
   mvValName.push(valName)
   mvValKind.push(kind)
@@ -2605,12 +2634,9 @@ export function mvShapeOfValName(valName: string) {
     raUsed = true
   } else if kind == 6 {
     // The map's VALUE is a ref LIST (`S[]` struct-list, `(C|D)[]` union-list, `i32[]` scalar
-    // list, or a nested map). Its vals ref-list slot is keyed by the value name with the
-    // recursively-interned inner slots — the SAME `ensureRefElem` the array path uses, replacing
-    // the three hand-coded interning cases that duplicated it. (The `mvShapeOfValName` classifier
-    // still gates WHICH value types reach here; fully nested / closure list map VALUES additionally
-    // need the map store/read/coerce paths migrated to the recursive resolver — a larger change.)
-    mvRlSlot.push(ensureRefElem(bare))
+    // list, or a nested map): the vals ref-list slot interned above, before this slot's
+    // parallel-array pushes.
+    mvRlSlot.push(rls6)
     rlUsed = true
     raUsed = true
   } else if kind == 14 {
@@ -13528,7 +13554,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
         if cb >= 0 {
           const cbn = P.nodes[cb]
           if cbn is LetDecl {
-            const cpar = fnParent[cfe]
+            const cpar = parentBindingFrameOf(cfe, e.identName)
             if cpar >= 0 { return letMapShapeOf(cb, fnStmts[cpar]) }
           }
         }
