@@ -4618,7 +4618,38 @@ function tyToEmitName(ix: i32) {
   }
   if t is TyUnion {
     const members = t.uMembers
+    // FLATTENED-alias regroup: a litunion-ALIAS member's literals flatten into sibling
+    // TyLit members (`flattenVariantsInto`: `K0 | i64` → ["64","bjtvb","tt", i64]), so
+    // the per-member alias lookup below never sees the alias and each lit softened to
+    // `string` — the widened spelling minted TWIN field/slot rows beside the
+    // annotation-spelled ones (divergent structs/mv slots — INVALID-WASM; fuzz-nightly
+    // seed 658239060 d5). In a MIXED union (at least one non-TyLit member) regroup the
+    // str-lit members into their exactly-matching registered alias, rendered at the
+    // FIRST lit's position. A PURE litunion keeps the historical `string` softening
+    // (the `canonEmitTypeNames` invariant), and a lit set matching no alias keeps the
+    // per-member path unchanged.
+    let rgAlias = ""
+    const rgTexts: string[] = []
+    let rgNonLit = false
+    let rg = 0
+    while rg < members.length {
+      const rm = T.tys[members[rg]]
+      if rm is TyLit {
+        if rm.litKind == "str" { rgTexts.push(rm.litText) }
+      } else {
+        let rmNull = false
+        if rm is TyPrim {
+          if rm.primName == "null" { rmNull = true }
+        }
+        if !rmNull { rgNonLit = true }
+      }
+      rg = rg + 1
+    }
+    if rgNonLit && rgTexts.length >= 2 {
+      rgAlias = litUnionAliasOfLitTexts(rgTexts)
+    }
     const parts: string[] = []
+    let rgDone = false
     let i = 0
     while i < members.length {
       // A MEMBER that is a registered litunion ALIAS (`K0 | i64`) keeps its alias name
@@ -4629,6 +4660,15 @@ function tyToEmitName(ix: i32) {
       // divergent functypes, a cast-failure TRAP (fuzz-nightly run 29808029476, seed
       // 78530533 d5). The union-member sibling of the TyFunc-result / TyObj-field
       // alias preservation above and below.
+      const rgm = T.tys[members[i]]
+      if rgAlias != "" && rgm is TyLit {
+        if !rgDone {
+          rgDone = true
+          parts.push(rgAlias)
+        }
+        i = i + 1
+        continue
+      }
       let s = litUnionAliasNameOfTy(members[i])
       if s == "" { s = tyToEmitName(members[i]) }
       if s == "" { return "" }

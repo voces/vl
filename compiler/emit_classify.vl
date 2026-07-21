@@ -2588,7 +2588,46 @@ export function mvValKindOfName(valName: string): i32 {
 // element's ref-list types (`rlInternName`), and every ref-valued map forces the
 // string-list (keys) + mono map types — the shared probe machinery and the keys
 // list ride on them.
-export function mvShapeOfValName(valName: string) {
+// Canonicalize a map-VALUE union name for the mv table: a litunion-ALIAS atom widens
+// to `string` (`K0|i64|null` → `string|i64|null` — R3's boxed member-string rule, the
+// SAME transform `rlSlotByName`'s fallback documents for ref-list slots). Two spellings
+// of one value union otherwise interned TWIN mv slots with divergent vals reps, and the
+// narrowed map read resolved the wrong twin's struct — INVALID-WASM (fuzz-nightly seed
+// 658239060 d5). A non-union / alias-free name passes through unchanged.
+export function mvCanonValName(valName: string) {
+  if unionMemberCount(valName) < 2 { return valName }
+  const atoms: string[] = []
+  splitUnionAtoms(valName, atoms)
+  // Widen ONLY a genuine MIX (a non-null, non-litunion sibling exists): a pure
+  // `K0 | null` value is the -1-sentinel MONO niche (`nameIsNulLitUnion`), NOT the
+  // string-atom box — widening it re-repped the niche as `string|null` and broke
+  // the nullable-litunion map values.
+  let hasOther = false
+  let h = 0
+  while h < atoms.length {
+    if atoms[h] != "null" && !nameIsLitUnionType(atoms[h]) { hasOther = true }
+    h = h + 1
+  }
+  if !hasOther { return valName }
+  let changed = false
+  let canon = ""
+  let i = 0
+  while i < atoms.length {
+    let a = atoms[i]
+    if nameIsLitUnionType(a) {
+      a = "string"
+      changed = true
+    }
+    if i > 0 { canon = canon + "|" }
+    canon = canon + a
+    i = i + 1
+  }
+  if changed { return canon }
+  valName
+}
+
+export function mvShapeOfValName(valNameIn: string) {
+  const valName = mvCanonValName(valNameIn)
   const kind = mvValKindOfName(valName)
   if kind == -1 { return -1 }
   if kind < 0 { return -3 }
@@ -2683,7 +2722,8 @@ export function mvShapeOfValName(valName: string) {
 // interning happens in `collectA`'s arena scan (a slot interned after
 // `mAssignTypeIndices` would mint no type index) — so a miss is a compiler bug
 // and fails loudly.
-export function mvSlotOfValNameFind(valName: string) {
+export function mvSlotOfValNameFind(valNameIn: string) {
+  const valName = mvCanonValName(valNameIn)
   // Mono-ness is decided by the ONE classifier the interner uses (`mvValKindOfName`):
   // i32 / boolean, a literal-union ATOM value (`{[string]: K0}` — a struct FIELD records
   // the alias name "K0" in `sFieldElemName`), and the nullable-atom niches (`K0 | null`,
@@ -14233,7 +14273,8 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
 // loudly, never the silent mono fallback). A mono-tolerant find (unlike
 // `mvSlotOfValNameFind`, which fails loudly on the mono miss) for the composition
 // read resolvers.
-export function mvSlotOfMapValNameOrMono(iv: string): i32 {
+export function mvSlotOfMapValNameOrMono(ivIn: string): i32 {
+  const iv = mvCanonValName(ivIn)
   if mvValKindOfName(iv) == -1 { return -1 }
   let i = 0
   while i < mvValName.length {
