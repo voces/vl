@@ -10,6 +10,7 @@ import {
   T,
   TyArray,
   TyFunc,
+  TyLit,
   TyMap,
   TyNullable,
   TyObj,
@@ -53,6 +54,7 @@ import {
   nodeUnionName,
   recordClonedNodeTy,
   splitUnionAtoms,
+  tyIsLitUnion,
   unionMemberCount,
   valueAtomKind,
 } from "./typecheck"
@@ -10254,10 +10256,14 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
   if e is Index {
     const m = unwrapParen(e.idxArr)
     if !(P.nodes[m] is Member) { return false }
-    // Collect the field chain root-first: `t0.f.g[0]` → root `t0`, props [f, g].
+    // Collect the field chain root-first: `t0.f.g[0]` → root `t0`, props [f, g]. The
+    // root may also be an INDEXED union ident (`t0[i].f[0][k]` — the union's REF-ARRAY
+    // arm's element struct carries the list-of-maps field): bottom out at `Index(Ident)`
+    // with the via-element flag, so the arm walk starts at the array arm's ELEMENT.
     const props: string[] = []
     let cur = m
     let rootName = ""
+    let viaElem = false
     let guard = 0
     while guard < 32 {
       guard = guard + 1
@@ -10267,6 +10273,13 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
         cur = unwrapParen(cn.memObj)
       } else if cn is Ident {
         rootName = cn.identName
+        break
+      } else if cn is Index {
+        const rin = P.nodes[unwrapParen(cn.idxArr)]
+        if rin is Ident {
+          rootName = rin.identName
+          viaElem = true
+        }
         break
       } else {
         return false
@@ -10288,7 +10301,14 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
     let ai = 0
     while ai < atoms.length {
       if atoms[ai] != "null" {
-        if unionArmPathIsMapList(atoms[ai], path) { return true }
+        let arm = atoms[ai]
+        if viaElem {
+          // The indexed-root form walks from the REF-ARRAY arm's element struct.
+          if nameIsRefArray(arm) { arm = refArrElemName(arm) } else { arm = "" }
+        }
+        if arm != "" {
+          if unionArmPathIsMapList(arm, path) { return true }
+        }
       }
       ai = ai + 1
     }
@@ -15022,11 +15042,28 @@ export function cloCallUnionResultUnrepresentable(
   let i = 0
   while i < t.uMembers.length {
     const mt = T.tys[t.uMembers[i]]
-    if mt is TyPrim { hasScalar = true }
-    else if mt is TyObj { hasComposite = true }
-    else if mt is TyArray { hasComposite = true }
-    else if mt is TyMap { hasComposite = true }
-    else if mt is TyFunc { hasComposite = true }
+    if mt is TyPrim {
+      hasScalar = true
+    } else if mt is TyLit {
+      // A LITUNION member (`K0 | {w: i32} | {q: i64}` — a bare TyLit atom OR the alias's
+      // NESTED all-lit TyUnion) reps as an i32 ATOM, so a litunion + composite mix is
+      // exactly as rep-heterogeneous as the scalar mix: it needs the box. A PURE litunion
+      // stays rep-uniform (`hasComposite` false → no reject, the `>i` path) — only the mix
+      // reaches the rep-consistency tail. Without this a FIELD-position lambda whose
+      // self-inferred `>s` sig disagreed with the union-typed call slipped the floor —
+      // INVALID-WASM (fuzz seed 248841346 d5).
+      hasScalar = true
+    } else if tyIsLitUnion(t.uMembers[i]) {
+      hasScalar = true
+    } else if mt is TyObj {
+      hasComposite = true
+    } else if mt is TyArray {
+      hasComposite = true
+    } else if mt is TyMap {
+      hasComposite = true
+    } else if mt is TyFunc {
+      hasComposite = true
+    }
     i = i + 1
   }
   if !hasScalar || !hasComposite { return false }
