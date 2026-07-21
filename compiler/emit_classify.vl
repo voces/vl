@@ -5734,6 +5734,25 @@ function mapReadMvSlot(exprIx: i32, fnIx: i32) {
     if exprMap(e.idxArr, fnIx) {
       const sl = mapShapeOfExpr(e.idxArr, fnIx)
       if sl >= 0 { return sl }
+      return -1
+    }
+    // Narrowing-blind fallback: `t0[k]` where `t0` is a union IDENT whose union has a MAP
+    // arm (`{[string]: (() => i64) | string} | {w: i32}`). In the frame pre-pass the
+    // `is`-narrow that makes `t0` a map is not active, so `exprMap` misses — resolve the
+    // arm's VALUE mv slot directly. Without this a `const t1 = t0[k] ?? d; t1()` never
+    // classified `t1` as the value union, `calleeIsUnionClosureIdent` missed its closure
+    // arm, and the narrowed `call_ref`'s closure spill landed on the UNRESERVED
+    // `callRefSlot` index — shared with the mv map frame's `mapRef` local (invalid wasm).
+    const ax = P.nodes[unwrapParen(e.idxArr)]
+    if ax is Ident {
+      const aun = unionNameOfIdent(ax.identName, fnIx)
+      if aun != "" {
+        const ma = unionMapArmName(aun)
+        if ma != "" {
+          const msl = mvSlotOfMapValNameOrMono(mapValNameOf(ma))
+          if msl >= 0 { return msl }
+        }
+      }
     }
     return -1
   }
@@ -8076,17 +8095,47 @@ function rlElemNicheNullable(kind: i32, name: string) {
 
 export function rlInternName(name: string, kind: i32) {
   if name == "" { return -1 }
+  // Canonicalize a litunion-ALIAS atom inside a union element name to its boxed
+  // `string` atom (`K0|i64` → `string|i64`, R3's rule) BEFORE interning — the
+  // emit-canonical key `rlSlotByName`'s widening fallback expects every slot to
+  // carry. Alias-preserving union renders (27eed81 / #941) let the verbatim
+  // spelling reach the interner, minting a DUPLICATE slot (`K0|i64` beside
+  // `string|i64`) — the two slots shared one wrapper heap type but keyed TWO
+  // `$fnsig` results (`>r0;` / `>r1;`), minting byte-identical yet DISTINCT
+  // functypes (iso-recursive typing), so a named fn-value's declared functype
+  // and the call site's `ref.cast` disagreed — a runtime cast failure. The same
+  // transform as the lookup fallback, applied at the single intern point, keeps
+  // the table canonical and every producer on one slot.
+  let name2 = name
+  if unionMemberCount(name2) > 1 {
+    const cAtoms: string[] = []
+    splitUnionAtoms(name2, cAtoms)
+    let cChanged = false
+    let cCanon = ""
+    let cI = 0
+    while cI < cAtoms.length {
+      let ca = cAtoms[cI]
+      if nameIsLitUnionType(ca) {
+        ca = "string"
+        cChanged = true
+      }
+      if cI > 0 { cCanon = cCanon + "|" }
+      cCanon = cCanon + ca
+      cI = cI + 1
+    }
+    if cChanged { name2 = cCanon }
+  }
   let i = 0
   while i < rlElemName.length {
-    if rlElemName[i] == name { return i }
+    if rlElemName[i] == name2 { return i }
     i = i + 1
   }
-  rlElemName.push(name)
+  rlElemName.push(name2)
   rlElemHeap.push(0)
   rlBackIdx.push(0)
   rlWrapIdx.push(0)
   rlElemKindTbl.push(kind)
-  if rlElemNicheNullable(kind, name) {
+  if rlElemNicheNullable(kind, name2) {
     rlElemNullable.push(1)
   } else {
     rlElemNullable.push(0)
@@ -9998,17 +10047,24 @@ export function unionHasCollapsedStringMapArm(name: string) {
 // member set first. Used by the frame pre-pass (`exprHasMapOp` → `unionMapArmIdent`) to reserve the
 // map scratch frame for a `t[k]` on a union binding narrowed to its map arm — the narrowing is not
 // active in that pass, so the map op must be spotted from the binding's DECLARED union.
-export function unionHasMapArm(name: string) {
+export function unionHasMapArm(name: string) { unionMapArmName(name) != "" }
+
+// The MAP arm NAME of the union member-set `name` (`{[string]: V}` in `{[string]: V} | {w: i32}`),
+// or "" when it has none (the FIRST map atom; the value-atom scheme carries one map arm per union).
+// The name-typed dual of `unionHasMapArm` — `mapReadMvSlot`'s narrowing-blind fallback resolves the
+// arm's VALUE mv slot from it so a `t[k] ?? d` binding classifies its value union in the frame
+// pre-pass (where the `is`-narrow that makes `t` a map is not active).
+export function unionMapArmName(name: string) {
   let nm = unionMemberSetOf(name)
   if nm == "" { nm = name }
   const atoms: string[] = []
   splitUnionAtoms(nm, atoms)
   let i = 0
   while i < atoms.length {
-    if nameIsMap(atoms[i]) { return true }
+    if nameIsMap(atoms[i]) { return atoms[i] }
     i = i + 1
   }
-  false
+  ""
 }
 
 // True if `exprIx` is an IDENT whose DECLARED union has a map arm — the receiver shape the frame
@@ -10176,6 +10232,92 @@ function unionArmPathIsMap(arm: string, path: string[]): boolean {
       elem = sFieldElemNameAt(curSi, fi)
     }
     if hop == path.length - 1 { return code == 19 }
+    if code != 15 { return false }
+    curSi = structIndexByName(elem)
+    hop = hop + 1
+  }
+  false
+}
+
+// True if `exprIx` is an INDEX (`t0.f[0]`) whose receiver is a member chain rooted at an
+// IDENT declared as a union, whose field path walks — narrowing-blindly, the
+// `unionStructArmMapFieldMember` discipline — to a LIST-OF-MAPS field (a code-5 reflist
+// field whose element name is a map, `{[string]: K0}[]`). The indexed-map-list receiver
+// shape (`t0.f[0][k] ?? d` after an `is {f: {[string]: K0}[]}` narrow) the frame pre-pass
+// must reserve the map scratch for: the `is`-narrow that resolves the chain is not active
+// in the pre-pass, so `exprMap` misses the receiver and the narrowed map read's scratch
+// stores landed on UNRESERVED indices — shared with unrelated locals (an i32 local
+// receiving the map struct ref, invalid wasm). (An over-reservation is a harmless spare.)
+export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
+  if !uDeclared { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Index {
+    const m = unwrapParen(e.idxArr)
+    if !(P.nodes[m] is Member) { return false }
+    // Collect the field chain root-first: `t0.f.g[0]` → root `t0`, props [f, g].
+    const props: string[] = []
+    let cur = m
+    let rootName = ""
+    let guard = 0
+    while guard < 32 {
+      guard = guard + 1
+      const cn = P.nodes[cur]
+      if cn is Member {
+        props.push(cn.memProp)
+        cur = unwrapParen(cn.memObj)
+      } else if cn is Ident {
+        rootName = cn.identName
+        break
+      } else {
+        return false
+      }
+    }
+    if rootName == "" || props.length == 0 { return false }
+    const path: string[] = []
+    let pr = props.length - 1
+    while pr >= 0 {
+      path.push(props[pr])
+      pr = pr - 1
+    }
+    const un = unionNameOfIdent(rootName, fnIx)
+    if un == "" { return false }
+    let nm = unionMemberSetOf(un)
+    if nm == "" { nm = un }
+    const atoms: string[] = []
+    splitUnionAtoms(nm, atoms)
+    let ai = 0
+    while ai < atoms.length {
+      if atoms[ai] != "null" {
+        if unionArmPathIsMapList(atoms[ai], path) { return true }
+      }
+      ai = ai + 1
+    }
+  }
+  false
+}
+
+// Walk field path `path` from union arm `arm` (the `unionArmPathIsMap` walk), leafing at
+// a LIST-OF-MAPS field: a code-5 reflist field whose element type-name is a map.
+function unionArmPathIsMapList(arm: string, path: string[]): boolean {
+  let hop = 0
+  let curSi = structIndexByName(arm)
+  const vi0 = variantIndexOf(arm)
+  while hop < path.length {
+    let code = -1
+    let elem = ""
+    if hop == 0 && curSi < 0 && vi0 >= 0 {
+      const vfi = variantFieldIndex(vi0, path[0])
+      if vfi < 0 { return false }
+      code = variantFieldTypeAt(vi0, vfi)
+      elem = variantFieldElemName(vi0, vfi)
+    } else {
+      if curSi < 0 { return false }
+      const fi = sFieldIndex(curSi, path[hop])
+      if fi < 0 { return false }
+      code = sFieldTypeAt(curSi, fi)
+      elem = sFieldElemNameAt(curSi, fi)
+    }
+    if hop == path.length - 1 { return code == 5 && nameIsMap(elem) }
     if code != 15 { return false }
     curSi = structIndexByName(elem)
     hop = hop + 1
@@ -13480,6 +13622,9 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
     // A map read through a union's ARRAY-OF-MAP arm (`t[i][k]` after an `is {[string]:V}[]`
     // narrow): likewise invisible — spot the index shape from the declared union.
     if unionMapArrayElemIndex(e.idxArr, fnIx) { return true }
+    // A map read through a union STRUCT arm's LIST-OF-MAPS field (`t.f[0][k]` after an
+    // `is {f: {[string]:V}[]}` narrow): likewise invisible — walk the arm's field path.
+    if unionStructArmMapListElemIndex(e.idxArr, fnIx) { return true }
     if exprHasMapOp(e.idxArr, fnIx) { return true }
     return exprHasMapOp(e.idxIndex, fnIx)
   }
@@ -13493,6 +13638,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
         if unionListElemMapFieldMember(lhs.idxArr, fnIx) { return true }
         if unionStructArmMapFieldMember(lhs.idxArr, fnIx) { return true }
         if unionMapArrayElemIndex(lhs.idxArr, fnIx) { return true }
+        if unionStructArmMapListElemIndex(lhs.idxArr, fnIx) { return true }
       }
       if lhs is Call {
         const lcallee = P.nodes[lhs.callFn]
@@ -13512,6 +13658,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
         if unionListElemMapFieldMember(target.idxArr, fnIx) { return true }
         if unionStructArmMapFieldMember(target.idxArr, fnIx) { return true }
         if unionMapArrayElemIndex(target.idxArr, fnIx) { return true }
+        if unionStructArmMapListElemIndex(target.idxArr, fnIx) { return true }
       }
     }
     if exprHasMapOp(e.binLeft, fnIx) { return true }
