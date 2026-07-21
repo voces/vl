@@ -10443,6 +10443,113 @@ export function calleeIsUnionClosureIdent(exprIx: i32, fnIx: i32) {
   if e is Ident {
     const un = unionNameOfIdent(e.identName, fnIx)
     if un != "" { return unionHasClosureArm(un) }
+    // REBIND of a union-arm FIELD union (`const t1 = t0.f; const t2 = t1; t2(1)` where
+    // `t0`'s arm carries `f: ((i32) => K0) | boolean | null`): the binding's own union
+    // name resolves "" here (the `??`-less member read has no syntactic union channel),
+    // so walk the init chain to the member's field table — a closure field (14/22) or a
+    // union-BOX field (16) with a closure arm means the narrowed `call_ref` needs its
+    // scratch. Reservation-only (an over-match is a harmless spare local); without it
+    // the closure spill indexed an UNRESERVED local — invalid wasm (fuzz seed
+    // 113148886 d6, `{a, f: ((i32) => K0) | boolean | null, z} | string`).
+    return identRebindUnionArmClosureField(e.identName, fnIx, 4)
+  }
+  false
+}
+
+// True when local `name`'s LET-INIT chain (rebinds followed up to `depth`) bottoms out at
+// a member CHAIN rooted at a union-typed IDENT whose arm field path leafs at a CLOSURE
+// field (code 14 / 22) or a closure-armed union-BOX field (code 16) — the rebound-binding
+// dual of `calleeIsUnionArmClosureMember`, for `blockHasCallRef`'s narrowing-blind
+// `callRefSlot` reservation.
+function identRebindUnionArmClosureField(
+  name: string,
+  fnIx: i32,
+  depth: i32,
+): boolean {
+  if depth <= 0 || fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  const li = parentLetOf(fn.fnBody, name)
+  if li < 0 { return false }
+  const d = P.nodes[li]
+  if !(d is LetDecl) { return false }
+  if d.letInit < 0 { return false }
+  const init = P.nodes[unwrapParen(d.letInit)]
+  if init is Ident {
+    return identRebindUnionArmClosureField(init.identName, fnIx, depth - 1)
+  }
+  if init is Member {
+    // Collect the field chain root-first (the `calleeIsUnionArmClosureMember` walk).
+    const props: string[] = []
+    let cur = unwrapParen(d.letInit)
+    let rootName = ""
+    let guard = 0
+    while guard < 32 {
+      guard = guard + 1
+      const cn = P.nodes[cur]
+      if cn is Member {
+        props.push(cn.memProp)
+        cur = unwrapParen(cn.memObj)
+      } else if cn is Ident {
+        rootName = cn.identName
+        break
+      } else {
+        return false
+      }
+    }
+    if rootName == "" || props.length == 0 { return false }
+    const path: string[] = []
+    let pr = props.length - 1
+    while pr >= 0 {
+      path.push(props[pr])
+      pr = pr - 1
+    }
+    const un = unionNameOfIdent(rootName, fnIx)
+    if un == "" { return false }
+    let uset = unionMemberSetOf(un)
+    if uset == "" { uset = un }
+    const atoms: string[] = []
+    splitUnionAtoms(uset, atoms)
+    let ai = 0
+    while ai < atoms.length {
+      if atoms[ai] != "null" {
+        if unionArmPathHasCloValue(atoms[ai], path) { return true }
+      }
+      ai = ai + 1
+    }
+  }
+  false
+}
+
+// Walk field path `path` from union arm `arm` (the `unionArmPathIsClosure` walk), leafing
+// at a closure field (14/22) OR a union-BOX field (16) whose member set has a closure arm.
+function unionArmPathHasCloValue(arm: string, path: string[]): boolean {
+  let hop = 0
+  let curSi = structIndexByName(arm)
+  const vi0 = variantIndexOf(arm)
+  while hop < path.length {
+    let code = -1
+    let elem = ""
+    if hop == 0 && curSi < 0 && vi0 >= 0 {
+      const vfi = variantFieldIndex(vi0, path[0])
+      if vfi < 0 { return false }
+      code = variantFieldTypeAt(vi0, vfi)
+      elem = variantFieldElemName(vi0, vfi)
+    } else {
+      if curSi < 0 { return false }
+      const fi = sFieldIndex(curSi, path[hop])
+      if fi < 0 { return false }
+      code = sFieldTypeAt(curSi, fi)
+      elem = sFieldElemNameAt(curSi, fi)
+    }
+    if hop == path.length - 1 {
+      if code == 14 || code == 22 { return true }
+      if code == 16 { return unionHasClosureArm(elem) }
+      return false
+    }
+    if code != 15 { return false }
+    curSi = structIndexByName(elem)
+    hop = hop + 1
   }
   false
 }
