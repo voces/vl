@@ -1316,6 +1316,30 @@ function unionObjArmForLit(u: TyUnion, objIx: i32) {
   }
   -1
 }
+// The union member index of `u`'s CLOSURE-ARRAY arm (`((i32) => f32)[]` — a `TyArray` whose
+// element is a `TyFunc`) whose element arity matches the array literal `arrIx`'s element lambdas,
+// or -1. Lets `seedExpected` descend an array LITERAL flowing into a union into that arm so a bare
+// element lambda infers its params/result from the arm's element function type. Gated to a
+// CLOSURE element: a scalar/string/struct array arm needs no contextual seed (its elements infer
+// standalone), and admitting only the closure-array arm keeps the seed off shapes the emitter has
+// no sound narrowed read for. FIRST match wins.
+function unionClosureArrayArmForLit(u: TyUnion, arrIx: i32) {
+  const an = P.nodes[arrIx]
+  if an is ArrayLit {
+    const members = u.uMembers
+    let i = 0
+    while i < members.length {
+      const m = members[i]
+      const mt = T.tys[m]
+      if mt is TyArray {
+        const aet = T.tys[mt.aElem]
+        if aet is TyFunc { return m }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
 function seedExpected(exprIx: i32, expectedTy: i32) {
   if exprIx < 0 || expectedTy < 0 { return 0 }
   let u = exprIx
@@ -1356,6 +1380,16 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
         seedExpected(en.arrElems[i], et.aElem)
         i = i + 1
       }
+    } else if et is TyUnion {
+      // An array LITERAL flowing into a union with a CLOSURE-ARRAY arm (`[(q) => …]` into
+      // `((i32) => f32)[] | i32`): descend into the matching array arm so a bare element
+      // lambda infers its params/result from that arm's element function type (the array
+      // dual of the closure-arm and struct-arm seeding above). Without this seed the element
+      // lambda has no context and fails "cannot infer a type for parameter". Re-entering with
+      // the arm's `TyArray` reuses the element-recursion branch; assignability still gates the
+      // whole literal against the union, so a wrong arm cannot be silently adopted.
+      const arm = unionClosureArrayArmForLit(et, u)
+      if arm >= 0 { seedExpected(u, arm) }
     }
   } else if en is ObjLit {
     if et is TyObj {
