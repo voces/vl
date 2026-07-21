@@ -39,9 +39,16 @@ A file is PROMOTABLE only when check passes AND run stdout exactly equals
 lists). A file that advances to a
 later failure stage is progress to report, not promote.
 
-To diagnose invalid emitted wasm:
+To diagnose invalid emitted wasm (`wasm-tools` is installed on PATH —
+spec-grade, full WasmGC support; see docs/internals/wasm-toolchain-audit.md §3):
     vl build <file> --compiler build/vl-compiler.wasm -o /tmp/x.wasm
-    deno eval "try{new WebAssembly.Module(await Deno.readFile('/tmp/x.wasm'));console.log('valid')}catch(e){console.log(e.message)}"
+    wasm-tools validate --features all /tmp/x.wasm   # precise byte offset + reason
+    wasm-tools print /tmp/x.wasm                     # WAT disassembly — READ the offending function
+    wasm-tools dump /tmp/x.wasm                      # byte-level section/LEB framing when too
+                                                     # malformed for the disassembler to parse
+For a trap, disassemble and trace the faulting function; for a mismatch, diff the
+WAT of the value's write path vs read path. Don't debug codegen blind against the
+validator message alone — the disassembly is the debugging view of `vl build` output.
 
 ## Trimmed gates (CI covers the full battery)
 - Per commit: `git status tests/golden/` empty (+ the REJECT_CASES loop if
