@@ -3840,6 +3840,13 @@ export function structIndexOfObjCtx(objIx: i32, fnIx: i32) {
   const o = P.nodes[objIx]
   if o is ObjLit {
     const nf = o.objFields.length
+    // AMBIGUITY resolution (see below): the name-only scan can match SEVERAL registered
+    // structs (`{f: "dn"}` matches both a `{f: string}` and a `{f: K0}` — a string literal
+    // legitimately initializes a litunion atom field, so no field-code axis can split
+    // them). First match won historically; when 2+ match, the checker's recorded node
+    // type picks the right one. `firstSi` keeps the unambiguous path byte-identical.
+    let firstSi = -1
+    let matches = 0
     let si = 0
     while si < sNames.length {
       if sFieldCount[si] == nf {
@@ -3883,10 +3890,31 @@ export function structIndexOfObjCtx(objIx: i32, fnIx: i32) {
           }
           k = k + 1
         }
-        if ok { return si }
+        if ok {
+          if firstSi < 0 { firstSi = si }
+          matches = matches + 1
+        }
       }
       si = si + 1
     }
+    if matches >= 2 {
+      // 2+ structs match by name/scalar-code alone — a genuine shape COLLISION (a map's
+      // `{f: K0}` value struct vs a closure's `{f: string}` result, seed 42931513 d5:
+      // first-match built the literal with the WRONG layout — a silent MISMATCH, or
+      // invalid wasm when the field valtypes differ). Consult the checker's recorded
+      // type for this literal (rendered ONLY on this ambiguous path — off the hot
+      // path, the #494 discipline) and resolve it through `structIndexOfTypeName`'s
+      // field-TYPE-guarded match. Falls back to the historic first match when the
+      // node carries no recorded type (an emit-time-cloned mono node).
+      if nodeTyIsObj(objIx) {
+        const sn = nodeTyName(objIx)
+        if sn != "" {
+          const tsi = structIndexOfTypeName(sn)
+          if tsi >= 0 { return tsi }
+        }
+      }
+    }
+    return firstSi
   }
   -1
 }
