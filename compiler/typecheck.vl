@@ -1124,7 +1124,17 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
   const lit = P.nodes[u]
   if !(lit is ObjLit) { return false }
   const s = T.tys[inferredTy]
-  const d = T.tys[expRetTy]
+  // A NULLABLE expected result (`() => {f: K0} | null` — spelled directly, or through the
+  // nullable-closure wrapper `(() => {f: K0} | null) | null`): adopt against the INNER
+  // struct. The caller still adopts the FULL nullable expected, so the lambda's `$fnsig`
+  // result keys the nullable struct exactly as the annotation-side consumer does. Without
+  // the unwrap a litunion field never adopted and the two sides keyed DIFFERENT structs
+  // (`{f: string}` vs `{f: K0}` — a cast-failure TRAP at the narrowed nullable-closure
+  // call; fuzz frontier seed 679748579 d5 --branching --multiobs).
+  let expInnerTy = expRetTy
+  const dn = T.tys[expRetTy]
+  if dn is TyNullable { expInnerTy = dn.nInner }
+  const d = T.tys[expInnerTy]
   if s is TyObj {
     if d is TyObj {
       if s.objFieldNames.length != d.objFieldNames.length { return false }
@@ -4600,7 +4610,25 @@ function tyToEmitName(ix: i32) {
     let out = "{"
     let fi = 0
     while fi < names.length {
-      const fs = tyToEmitName(ftys[fi])
+      // A FIELD preserves a literal-union ALIAS (`{f: K0}`, `{f: K0 | null}`) rather
+      // than the softened `string` — so a rendered shape resolves the SAME struct index
+      // the annotation side interned (`{f:K0}`, the i32-atom field layout), not the
+      // string-field twin. Without it a nullable-struct closure-result pin
+      // (`nullableRetName`'s TyObj arm) keyed `>n` on `{f:string}` while the annotated
+      // value call keyed `>n` on `{f:K0}` — divergent `$fnsig` entries: a cast-failure
+      // TRAP at the narrowed nullable-closure call (fuzz frontier seed 679748579 d5).
+      // The field dual of the TyFunc-result alias preservation below.
+      let fs = ""
+      const ftn = T.tys[ftys[fi]]
+      if ftn is TyNullable {
+        const fal = litUnionAliasNameOfTy(ftn.nInner)
+        if fal != "" { fs = fal + "|null" }
+      }
+      if fs == "" {
+        const fbal = litUnionAliasNameOfTy(ftys[fi])
+        if fbal != "" { fs = fbal }
+      }
+      if fs == "" { fs = tyToEmitName(ftys[fi]) }
       if fs == "" { return "" }
       if fi > 0 { out = out + "," }
       out = out + names[fi] + ":" + fs
