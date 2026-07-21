@@ -6179,6 +6179,25 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
       if tnb != "" { tb = tnb }
       return nestedStructNamesCompat(tb, elem)
     }
+    // A NULLABLE DISTINCT-BACKING SCALAR-LIST field spelling (`f64[] | null`,
+    // `i64[] | null`, `f32[] | null`, `string[] | null`) has NO field code at all —
+    // code 18 covers only the i32-backed leaf, code 28 only ref elements — so NO
+    // candidate layout can hold it: a PROVEN mismatch against every code, keeping the
+    // shape un-matched and the consumer failing LOUDLY. Without this, the lenient
+    // `want < 0` fall-through let `{f: i64[] | null}` adopt a same-field-name
+    // literal's `{f: i32[]}` layout and store i64 elements into the i32 array —
+    // INVALID-WASM (fuzz frontier seed 70441494 d4 --branching).
+    const tnul = nullablePartOf(t)
+    if tnul != "" {
+      if (
+        nameIsF64Array(tnul) ||
+        nameIsI64Array(tnul) ||
+        nameIsF32Array(tnul) ||
+        nameIsStringArray(tnul)
+      ) {
+        return false
+      }
+    }
     return true
   }
   if want != code {
@@ -7862,7 +7881,21 @@ export function arrLitIsF64(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
-    return exprIsF64(a.arrElems[0], fnIx)
+    // ANY f64 element makes the literal an f64 LIST (the i64 dual above): an
+    // int sibling re-encodes at the store, exactly as when the float comes
+    // FIRST. First-element-only classification let `[2, 1.5]` claim the i32
+    // list and emit `f64.const` into the i32 array — invalid wasm. An i64
+    // element keeps this false (mixed float/int is a checker-level union).
+    let anyF64 = false
+    let i = 0
+    while i < a.arrElems.length {
+      if exprIsI64(a.arrElems[i], fnIx) { return false }
+      if !anyF64 {
+        if exprIsF64(a.arrElems[i], fnIx) { anyF64 = true }
+      }
+      i = i + 1
+    }
+    return anyF64
   }
   false
 }
@@ -8279,15 +8312,34 @@ export function anonFieldCode(valIx: i32) {
     return -1
   }
   // A NUMERIC-element array literal field: an i32 list (code 4) for i32-range elements,
-  // the f64 / i64 scalar-list codes (25 / 26) for a float / i64-magnitude first element —
-  // the same leaf split the NumLit field takes (an i32-coded list field over an f64/i64
-  // literal mismatched the built list's wrapper).
+  // the f64 / i64 scalar-list codes (25 / 26) when ANY element is a float / i64-magnitude
+  // literal — the same leaf split the NumLit field takes (an i32-coded list field over an
+  // f64/i64 literal mismatched the built list's wrapper). ALL elements scan, exactly like
+  // `arrLitIsI64`/`arrLitIsF64`: coding by the FIRST element let `{f: [712583,
+  // 13131313131]}` intern an i32-list field and emit `i64.const` into the i32 array —
+  // INVALID-WASM (fuzz frontier seed 70441494 d4).
   if e is ArrayLit {
     if e.arrElems.length > 0 {
-      const ae = P.nodes[e.arrElems[0]]
-      if ae is NumLit {
-        if numTextIsFloat(ae.numText) { return 25 }
-        if !numLexFitsI32(ae.numText) { return 26 }
+      const ae0 = P.nodes[e.arrElems[0]]
+      if ae0 is NumLit {
+        let anyFloat = false
+        let anyI64 = false
+        let i = 0
+        while i < e.arrElems.length {
+          const ae = P.nodes[e.arrElems[i]]
+          if ae is NumLit {
+            if numTextIsFloat(ae.numText) { anyFloat = true }
+            else if !numLexFitsI32(ae.numText) { anyI64 = true }
+          }
+          // A non-literal element (a param read) stays unexamined, as before —
+          // only the literal elements steer the leaf split.
+          i = i + 1
+        }
+        // Mixed float + i64-magnitude literals join as a checker-level UNION, not a
+        // scalar list — unclassifiable here (-1), the loud path.
+        if anyFloat && anyI64 { return -1 }
+        if anyFloat { return 25 }
+        if anyI64 { return 26 }
         return 4
       }
     }
@@ -13089,7 +13141,23 @@ export function arrLitIsI64(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
-    return exprIsI64(a.arrElems[0], fnIx)
+    // ANY i64 element makes the literal an i64 LIST — a small-magnitude sibling
+    // widens at the store, exactly as it does when the i64 element comes FIRST.
+    // First-element-only classification let `[712583, 13131313131]` claim the i32
+    // list and emit `i64.const` into the i32 array — INVALID-WASM (fuzz frontier
+    // seed 70441494 d4, the `{f: i64[] | null}` closure-result lambda). An f64
+    // element keeps this false (a mixed float/int literal is a checker-level
+    // union, not a scalar list).
+    let anyI64 = false
+    let i = 0
+    while i < a.arrElems.length {
+      if exprIsF64(a.arrElems[i], fnIx) { return false }
+      if !anyI64 {
+        if exprIsI64(a.arrElems[i], fnIx) { anyI64 = true }
+      }
+      i = i + 1
+    }
+    return anyI64
   }
   false
 }
