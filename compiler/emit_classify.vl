@@ -1441,9 +1441,15 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   // to non-null (unlike a `P[]` element). `const e = xs[i]` binds the kind-9 niche.
   if e is Index {
     if exprRefArray(e.idxArr, fnIx) {
+      // GUARD the slot: a NARROWED union-arm rebind receiver (`t2[0]` after
+      // `t2 is (i64 | null)[]`) classifies `exprRefArray` true while the slot
+      // resolver can still miss (-1) — un-guarded, `rlElemKindTbl[-1]` was an
+      // OOB compiler CRASH (fuzz-nightly seed 484694996 d6).
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      if rlElemKindTbl[slot] == 1 {
-        if nullablePartOf(rlElemName[slot]) != "" { return true }
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 1 {
+          if nullablePartOf(rlElemName[slot]) != "" { return true }
+        }
       }
     }
     // A BARE map get `m[k]` over a STRUCT-valued map (`{[string]: S}`) is `S | null` — the
@@ -11118,7 +11124,10 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   // element kind comes from the receiver's distinct ref-list slot (1 = struct).
   if e is Index {
     if exprRefArray(e.idxArr, fnIx) {
+      // GUARD the slot (a narrowed union-arm rebind receiver can classify
+      // `exprRefArray` true while the slot resolver misses — OOB otherwise).
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot < 0 || slot >= rlElemKindTbl.length { return false }
       return rlElemKindTbl[slot] == 1
     }
   }
@@ -11794,7 +11803,10 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   // element kind comes from the receiver's distinct ref-list slot (2 = union box).
   if e is Index {
     if exprRefArray(e.idxArr, fnIx) {
+      // GUARD the slot (same discipline as the struct-element arm — a narrowed
+      // union-arm rebind receiver resolves no slot; OOB otherwise).
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot < 0 || slot >= rlElemKindTbl.length { return false }
       return rlElemKindTbl[slot] == 2
     }
     // A bare `m[k]` over a UNION-valued map yields the value union box.
@@ -11890,7 +11902,9 @@ export function unionNameOfIdent(name: string, fnIx: i32) {
         if iter >= 0 {
           if exprRefArray(iter, fnIx) {
             const slot = refListSlotOfExpr(iter, fnIx)
-            if rlElemKindTbl[slot] == 2 { return rlElemName[slot] }
+            if slot >= 0 && slot < rlElemKindTbl.length {
+              if rlElemKindTbl[slot] == 2 { return rlElemName[slot] }
+            }
           }
         }
       }
@@ -12072,6 +12086,18 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       // type from `identFnTypeAnnName` and take its union return.
       const bun = unionRetOfFnType(identFnTypeAnnName(callee.identName, fnIx))
       if bun != "" { return bun }
+      // A callee NARROWED to a union's closure ARM (`if t1 is (i32) => (i64|null)[] |
+      // {w: i32} { const t2 = t1(1) … }`): the binding's own annotation channel misses
+      // (the closure type lives on the ARM, not the binding), and `nodeUnionName`'s
+      // cheap all-value-atom gate declines the composite union render — so `t2` never
+      // classified as the union and its narrowed arm read skipped the box unbox
+      // (INVALID-WASM at the wrapper-typed store; fuzz-nightly seed 484694996 d6).
+      // The active narrow names the arm's function type exactly — take its RETURN.
+      const ncl = narrowedClosureOf(callee.identName)
+      if ncl != "" {
+        const nun = unionRetOfFnType(peelGroupParens(ncl))
+        if nun != "" { return nun }
+      }
     }
     // A union-returning FIELD-closure callee (`const r = o.run(7)` over a `(…) => A | B`
     // field) — the Member analogue of the binding case above: resolve the field's lifted
