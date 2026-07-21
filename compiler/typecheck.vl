@@ -4688,7 +4688,14 @@ function tyToEmitName(ix: i32) {
     return out + "}"
   }
   if t is TyArray {
-    const el = tyToEmitName(t.aElem)
+    // A litunion-ALIAS element (`K0[]`) keeps its alias name rather than softening to
+    // `string[]` — the two spell DIFFERENT reps (the alias array is the interned-i32
+    // ATOM list; `string[]` is the string-ref list), so a widened render minted a TWIN
+    // mv slot beside the annotation-spelled one and the narrowed map read resolved the
+    // other twin's struct (INVALID-WASM; fuzz-nightly seed 210853359 d6). The array
+    // sibling of the TyUnion-member / TyObj-field / TyMap-value alias preservation.
+    let el = litUnionAliasNameOfTy(t.aElem)
+    if el == "" { el = tyToEmitName(t.aElem) }
     if el == "" { return "" }
     if nameHasPipe(el) { return "(" + el + ")[]" }
     return el + "[]"
@@ -9514,6 +9521,46 @@ function vbUnionMemberName(mIx: i32): string {
   if alias != "" { return alias }
   const m = T.tys[mIx]
   if m is TyPrim { return m.primName }
+  // A SCALAR-LEAF array member (`i64[] | boolean`, `i64[][] | boolean` — a value-atom
+  // list or a nested scalar-leaf array): its rep is a plain wrapper ref riding the box
+  // (the value-atom / kind-9 nested-list rule), and the annotated named-fn spelling of
+  // such a union lowers fully (both arms round-trip, `is i64[][]` narrows) — so the
+  // rendered name pins a contextual lambda through the same sound path. An
+  // OBJECT-element array member stays declined (its arm-narrow registration and
+  // element-literal widening are the deferred repOf seams).
+  if m is TyArray {
+    let leaf = m.aElem
+    let vguard = 0
+    let scalarLeaf = false
+    while vguard < 8 {
+      vguard = vguard + 1
+      if leaf < 0 { break }
+      const lt = T.tys[leaf]
+      if lt is TyArray {
+        leaf = lt.aElem
+      } else {
+        if lt is TyPrim {
+          const pn = lt.primName
+          if (
+            pn == "i32" ||
+            pn == "i64" ||
+            pn == "f64" ||
+            pn == "f32" ||
+            pn == "boolean" ||
+            pn == "string"
+          ) {
+            scalarLeaf = true
+          }
+        }
+        break
+      }
+    }
+    if scalarLeaf {
+      const en = tyToEmitName(mIx)
+      if en != "" { return en }
+    }
+    return ""
+  }
   if m is TyObj {
     const names = m.objFieldNames
     const ftys = m.objFieldTypes
