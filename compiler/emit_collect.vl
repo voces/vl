@@ -17,6 +17,7 @@ import {
   inferRetNameOf,
   inferRetTyAt,
   isValueUnionName,
+  nameIsFuncTypeAtom,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
   nodeArrayElemIsLitUnion,
@@ -717,9 +718,20 @@ export function collectCloSigs() {
       if (nameIsNulClosure(nm)) {
         const nk = unionArmSigKey(nullablePartOf(nm))
         if nk != "" {
-          if cloSigPosOfKey(nk) < 0 {
-            cloSigKeys.push(nk)
-            cloSigRepFn.push(-1)
+          // A MIXED scalar+composite UNION result that is UNREGISTERED
+          // (`(() => K0 | {w: i32} | f64 | null) | null` — no named-fn annotation
+          // registered the union) has no producer path that pins/boxes it: a
+          // contextual lambda flowing in keeps its self-classified functype, so the
+          // synthetic `>u` sig would satisfy the call-site floor while the narrowed
+          // call's `ref.cast` TRAPS at runtime (fuzz-nightly lead). Skip the synth —
+          // the key stays un-interned and the call REJECTS loudly. A registered union
+          // keeps the synth, and a concrete producer's own `$fnsig` interns the same
+          // key via its `fnStmts` loop entry regardless.
+          if !nulCloMixedUnionUnregistered(nullablePartOf(nm)) {
+            if cloSigPosOfKey(nk) < 0 {
+              cloSigKeys.push(nk)
+              cloSigRepFn.push(-1)
+            }
           }
         }
         // A nulclosure whose RESULT is ITSELF a closure (`(() => ((i32) => f32)) | null`,
@@ -4179,4 +4191,47 @@ export function collectMapFilterUse() {
     i = i + 1
   }
   0
+}
+
+// True when the nul-closure arm's RESULT is a MIXED scalar+composite union
+// (`K0 | {w: i32} | f64 | null` — at least one scalar/litunion atom AND one
+// struct/map/array/closure atom) that NO registration path admitted (not a registered
+// union alias, not a value union, not a litunion-arm value union, not a map-member
+// union). Such a union has no pin/box path for a contextual lambda, so the synthetic
+// `>u` `$fnsig` must NOT be interned for it (see `collectCloSigs`' TypeRef pass) — the
+// call site then rejects loudly instead of cast-trapping at runtime.
+function nulCloMixedUnionUnregistered(arm: string) {
+  const bare = peelGroupParens(arm)
+  const aAt = annArrowAt(bare)
+  if aAt < 1 { return false }
+  const res = monoUnwrapParens(bare.slice(aAt + 2, bare.length))
+  const atoms: string[] = []
+  splitUnionAtoms(res, atoms)
+  if atoms.length < 2 { return false }
+  let hasScalar = false
+  let hasComposite = false
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    if a != "null" {
+      if valueAtomKind(a) >= 0 || nameIsLitUnionType(a) {
+        // A closure atom is value-atom kind 11 but composes like a ref — count only
+        // the NON-closure value atoms as the scalar side of the mix test.
+        if nameIsFuncTypeAtom(a) {
+          hasComposite = true
+        } else {
+          hasScalar = true
+        }
+      } else {
+        hasComposite = true
+      }
+    }
+    i = i + 1
+  }
+  if !hasScalar || !hasComposite { return false }
+  if isUName(res) { return false }
+  if isValueUnionName(res) { return false }
+  if nameIsLitUnionArmValueUnion(res) { return false }
+  if nameIsMapMemberUnion(res) { return false }
+  true
 }
