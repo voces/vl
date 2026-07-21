@@ -11,6 +11,7 @@ import {
   TyArray,
   TyFunc,
   TyMap,
+  TyNullable,
   TyObj,
   TyPrim,
   TyUnion,
@@ -8843,11 +8844,24 @@ function internFuncTypeShapes(nm: string): i32 {
   // interned shape).
   const uw = monoUnwrapParens(nm)
   if uw.length != nm.length { return internFuncTypeShapes(uw) }
-  const np = nullablePartOf(nm)
-  if np != "" { return internFuncTypeShapes(np) }
-  if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
-    return internFuncTypeShapes(nm.slice(0, nm.length - 2))
+  // A VALUE-UNION leaf (`f64 | null` as a closure RESULT, `i64 | boolean` as a param) —
+  // register its box reps, exactly as `internShapeDeep`'s value-union arm does (and
+  // BEFORE the `| null` peel: the null is a union ATOM here, not a nullable wrapper).
+  // Without it a producer-less closure-arm annotation (`(() => f64 | null) | string`)
+  // left the f64 value box UN-MINTED while the narrowed call's unbox still emitted the
+  // cast — `ref.cast` to a default type-0 index, INVALID-WASM at the `print` read
+  // (fuzz-nightly run 29808029476, seed 100113225 d4).
+  if isValueUnionName(nm) {
+    registerValueUnionName(nm)
+    return 0
   }
+  // The ARROW split runs BEFORE the `| null` peel: a TOP-LEVEL arrow (`()=>f64|null`)
+  // binds the `| null` to its RESULT (`nulCloFlag`'s rule) — the naive peel treated it
+  // as a nullable CLOSURE and the `f64 | null` result never surfaced, so its value box
+  // was never registered (the producer-less closure-arm annotation's unbox then cast to
+  // a bogus default index — INVALID-WASM; fuzz-nightly run 29808029476, seed 100113225
+  // d4). A genuinely nullable closure (`(()=>i32)|null`) nests its arrow in parens —
+  // `annArrowAt` is depth-aware, so it still takes the peel below.
   const fa = annArrowAt(nm)
   if fa >= 1 && nm[0] == '(' && nm[fa - 1] == ')' {
     const inner = nm.slice(1, fa - 1)
@@ -8861,6 +8875,11 @@ function internFuncTypeShapes(nm: string): i32 {
       }
     }
     return internFuncTypeShapes(nm.slice(fa + 2, nm.length))
+  }
+  const np = nullablePartOf(nm)
+  if np != "" { return internFuncTypeShapes(np) }
+  if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
+    return internFuncTypeShapes(nm.slice(0, nm.length - 2))
   }
   if nm[0] == '{' && nm[1] != '[' && nm[nm.length - 1] == '}' {
     if funcTypeShapeLowerable(nm) {
@@ -14813,6 +14832,34 @@ export function cloCallUnionResultUnrepresentable(
   }
   const ty = nodeTyIxOf(callIx)
   if ty < 0 { return false }
+  // A NULLABLE NUMERIC-SCALAR result (`() => f64 | null` as a union ARM's closure) reps
+  // as the SAME value-union box (`>u`, the nullable-scalar arm of `annRetKind`) — so it
+  // takes the identical rep-consistency tail the union case below uses: no sig / a
+  // non-box result token / an UN-INTERNED `>u` key means the box read has nothing to
+  // recover. Without this the TyUnion-only gate let a producer-less
+  // `(() => f64 | null) | string` arm's narrowed call emit a raw-scalar read against
+  // the box functype — INVALID-WASM (fuzz-nightly run 29808029476, seed 100113225 d4).
+  // `string | null` (the `>N` niche) and `boolean | null` (the i32 sentinel) are NOT
+  // the box — they keep their own paths. (Probed on its OWN binding, so the union
+  // narrow below keeps its clean `is` chain.)
+  const tn = T.tys[ty]
+  if tn is TyNullable {
+    const nit = T.tys[tn.nInner]
+    let nulBoxScalar = false
+    if nit is TyPrim {
+      const pn = nit.primName
+      if pn == "i32" || pn == "f64" || pn == "i64" || pn == "f32" {
+        nulBoxScalar = true
+      }
+    }
+    if !nulBoxScalar { return false }
+    const nkey = cloCallSigKey(callIx, fnIx)
+    if nkey == "" { return true }
+    const nrk = sigKeyRetKind(nkey)
+    if nrk == null { return true }
+    if nrk != "union" { return true }
+    return cloSigPosOfKey(nkey) < 0
+  }
   const t = T.tys[ty]
   if !(t is TyUnion) { return false }
   if t.uMembers.length < 2 { return false }
