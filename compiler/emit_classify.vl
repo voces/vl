@@ -8855,13 +8855,21 @@ export function internInlineShape(nm: string) {
         let fc = nameFieldCode(ftxt)
         if fc < 0 {
           // A NESTED inline-shape field: intern the nested shape (its `|null`
-          // wrapper stripped) and store a struct ref on it.
+          // wrapper stripped) and store a struct ref on it under the CANONICAL
+          // registered name. An earlier literal may have interned the identical
+          // shape as a synthetic `#anonN` (`anonFieldElemName` records that
+          // resolved name), so keying this field by the raw inline spelling
+          // (`{a:i32}`) both blocks the `annShapeIndexOf` dedup — minting a
+          // duplicate struct — and leaves the element `structIndexByName`-
+          // UNRESOLVABLE at type-section emit (a -1 `sHeapIdx` read). Store the
+          // interned struct's own `sNames` entry so both agree with the literal path.
           let base = ftxt
           const fnb = nullablePartOf(base)
           if fnb != "" { base = fnb }
-          if internInlineShape(base) >= 0 {
+          const iidx = internInlineShape(base)
+          if iidx >= 0 {
             fc = 15
-            ftxt = base
+            ftxt = sNames[iidx]
           }
         }
         if fc < 0 { ok = false }
@@ -10056,6 +10064,28 @@ export function unionClosureArmName(name: string) {
   let i = 0
   while i < atoms.length {
     if valueAtomKind(atoms[i]) == 11 { return atoms[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// The ELEMENT value-union of union member-set `name`'s REF-ARRAY arm whose element is itself a
+// value union carrying a bare-closure member (`((() => i32) | i64)[] | i64` → `(() => i32) | i64`),
+// or "". Such an arm is a union-ELEMENT array (`nameIsRefArray`, element kind 2), NOT a
+// `nameIsClosureArray` (whose element is a BARE closure) — so `unionHasClosureArrayArm` does not
+// cover it. Lets `t0[0]` off a union binding recover its element union narrowing-blindly (the
+// `is`-narrowing that makes `t0` the ref array is not active in the frame pre-pass).
+export function unionClosureArrElemUnion(name: string) {
+  let nm = unionMemberSetOf(name)
+  if nm == "" { nm = name }
+  const atoms: string[] = []
+  splitUnionAtoms(nm, atoms)
+  let i = 0
+  while i < atoms.length {
+    if nameIsRefArray(atoms[i]) {
+      const el = refArrElemName(atoms[i])
+      if isValueUnionName(el) && unionHasClosureArm(el) { return el }
+    }
     i = i + 1
   }
   ""
@@ -11597,6 +11627,20 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
       if slot >= 0 && slot < rlElemKindTbl.length {
         if rlElemKindTbl[slot] == 2 { return rlElemName[slot] }
+      }
+    }
+    // `t0[i]` where `t0` is a UNION binding whose ref-array arm has a value-union element with
+    // a closure member (`((() => i32) | i64)[] | i64`): narrowing-blind, `exprRefArray(t0)` is
+    // false (t0 is still the union box, not yet narrowed to the array), so recover the element
+    // union directly from the arm. Without this a `const t1 = t0[0]; t1()` left the narrowed
+    // `call_ref` closure spill on an UNRESERVED i32 local (`blockHasCallRef` →
+    // `calleeIsUnionClosureIdent` could not see t1's closure arm) — invalid wasm.
+    const ax = P.nodes[unwrapParen(e.idxArr)]
+    if ax is Ident {
+      const aun = unionNameOfIdent(ax.identName, fnIx)
+      if aun != "" {
+        const cel = unionClosureArrElemUnion(aun)
+        if cel != "" { return cel }
       }
     }
     // A bare `m[k]` over a UNION-valued map (the value union's box).
