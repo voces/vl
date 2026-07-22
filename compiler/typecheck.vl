@@ -1505,6 +1505,8 @@ export function initChecker() {
   gaNames = []
   gaParamLists = []
   gaDeclIxs = []
+  annotNameMemo = Map()
+  annotNameMemoNegVer = Map()
   tpEnvNames = []
   tpEnvTys = []
   bgSrcStack = []
@@ -6857,8 +6859,42 @@ function checkCallNode(n: Call, ix: i32) {
 // consulted by `nameToTy`, so a bare `T`, a `T[]` suffix, a structural
 // `{first: B, second: A}`, and a generic alias application `Box<T>` all
 // resolve through the one name grammar with the params substituted.
+// MEMOIZED for the env-free case (no typarams, no live type-param environment):
+// `nameToTy` MINTS fresh arena types per call for an inline spelling, so the
+// emitter's per-probe resolutions (`repNameCanonKey`'s dedup keys, the compat
+// probes' nested-name checks) re-minted the SAME structural types thousands of
+// times — on a deep same-fieldset composite the arena grew past 300K types and a
+// table allocation crossed the engine limit: a compiler CRASH ("allocation size
+// too large"; fuzz seed 459979688 d6 bm). One index per spelling per program is
+// also semantically TIGHTER: probes now compare against the one memoized
+// structure. Only SUCCESSFUL resolutions memoize (a name unresolvable early may
+// resolve once later declarations register); a live tpEnv (an enclosing generic
+// body / applyGenAlias substitution) bypasses — the same spelling means
+// different types under different bindings. Reset per program (`initChecker`).
+let annotNameMemo: {[string]: i32} = Map()
+// FAILED resolutions memoize too — under the version that failed (`cUserTypesVer`):
+// a name unresolvable NOW may resolve once later declarations register, so the
+// negative hit is honored only while no new declared-name resolution landed.
+// (`nameToTy` mints PARTIAL types before failing, so un-memoized failures re-probed
+// in a loop still grow the arena — the same runaway the positive memo closes.)
+let annotNameMemoNegVer: {[string]: i32} = Map()
 export function resolveAnnot(name: string, typarams: string[]) {
-  if typarams.length == 0 { return nameToTy(name) }
+  if typarams.length == 0 {
+    if tpEnvNames.length == 0 {
+      const hit = annotNameMemo[name] ?? -2
+      if hit != -2 { return hit }
+      const negVer = annotNameMemoNegVer[name] ?? -1
+      if negVer == cUserTypesVer { return -1 }
+      const r = nameToTy(name)
+      if r >= 0 {
+        annotNameMemo[name] = r
+      } else {
+        annotNameMemoNegVer[name] = cUserTypesVer
+      }
+      return r
+    }
+    return nameToTy(name)
+  }
   let i = 0
   while i < typarams.length {
     tpEnvNames.push(typarams[i])
