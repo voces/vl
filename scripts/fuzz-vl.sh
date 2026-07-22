@@ -150,7 +150,7 @@ for f in "$WORK"/case_*.vl; do
 
   # A baselined failure is a KNOWN issue (any class — INVALID-WASM/TRAP/MISMATCH/REJECT), not
   # a NEW finding. Known issues are committed to the baseline and burned down over time; the
-  # invariant CI enforces (via rep-fuzz-check.sh) is no regression — never a NEW or worse failure.
+  # invariant the LOCAL pre-push gate enforces (via rep-fuzz-check.sh) is no regression — never a NEW or worse failure.
   # The baseline is class-tagged `CLASS<TAB>SHAPE`, so a shape getting WORSE (e.g. REJECT ->
   # INVALID-WASM) is a new line and surfaces as a finding.
   if [ -n "$BASELINE" ] && grep -qxF "$(printf '%s\t%s' "$why" "$shape")" "$BASELINE" 2>/dev/null; then
