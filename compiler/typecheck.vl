@@ -3454,8 +3454,8 @@ function unionArmBoxSafe(tyIx: i32) {
 // recording lives) is never reached for it — yet the recorded type is the emitter's ONLY
 // classification signal for a literal with no rep-classifying element (all-`null`, or a
 // string-first `["x", null]` that would else claim the plain string list).
-function recordNicheNulElemArrayLit(srcExpr: i32, dstTy: i32) {
-  if inferQuiet || srcExpr < 0 || dstTy < 0 { return 0 }
+function recordNicheNulElemArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
+  if inferQuiet || srcExpr < 0 || dstTy < 0 || depth <= 0 { return 0 }
   let dtix = dstTy
   const dN = T.tys[dtix]
   if dN is TyNullable { dtix = dN.nInner }
@@ -3463,27 +3463,58 @@ function recordNicheNulElemArrayLit(srcExpr: i32, dstTy: i32) {
   // (indexing the arena at -1 traps the compiler).
   if dtix < 0 { return 0 }
   const d = T.tys[dtix]
+  const e = P.nodes[srcExpr]
+  if e is Paren {
+    // Record on the WRAPPING Paren too, not only the inner literal: the emitter's
+    // typed-IR fast paths (`exprStringArray` and siblings) consult whichever node a
+    // consumer holds — a Paren keeping its stale pre-adoption record (`string[]`)
+    // would re-claim the wrong rep at the closure-result classification.
+    if recordNicheNulElemArrayLit(e.parInner, dtix, depth) == 1 {
+      while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+      nodeTyIx[srcExpr] = dtix
+      return 1
+    }
+    return 0
+  }
   if d is TyArray {
     if tyIsNicheNulScalarElem(d.aElem) {
-      const e = P.nodes[srcExpr]
-      if e is Paren {
-        // Record on the WRAPPING Paren too, not only the inner literal: the emitter's
-        // typed-IR fast paths (`exprStringArray` and siblings) consult whichever node a
-        // consumer holds — a Paren keeping its stale pre-adoption record (`string[]`)
-        // would re-claim the wrong rep at the closure-result classification.
-        if recordNicheNulElemArrayLit(e.parInner, dtix) == 1 {
-          while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
-          nodeTyIx[srcExpr] = dtix
-          return 1
-        }
-        return 0
-      }
       if e is ArrayLit {
         while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
         nodeTyIx[srcExpr] = dtix
         return 1
       }
     }
+    return 0
+  }
+  // A niche-nul-elem array nested in a STRUCT-FIELD literal value (`{f: [null]}` against
+  // `{f: (K | null)[] | null}`): the WHOLE ObjLit is covariantly `assignable`, so
+  // `assignableExpr`'s field-wise recursion (line ~3733 — which would re-stamp the inner
+  // array) is never reached; descend here, mirroring `recordNullHoleObjAdopt`. Only the
+  // inner niche array is re-stamped — the ObjLit keeps its own struct record. Guarded
+  // against recursive destinations (`tyDeeperThan`) exactly like the null-hole sibling.
+  if d is TyObj {
+    if e is ObjLit {
+      if tyDeeperThan(dstTy, 16) { return 0 }
+      const dfn = d.objFieldNames
+      const dft = d.objFieldTypes
+      let k = 0
+      while k < e.objFields.length {
+        const f = P.nodes[e.objFields[k]]
+        if f is FieldInit {
+          let dj = -1
+          let j = 0
+          while j < dfn.length {
+            if dfn[j] == f.fiName { dj = j }
+            j = j + 1
+          }
+          if dj >= 0 {
+            recordNicheNulElemArrayLit(f.fiValue, dft[dj], depth - 1)
+          }
+        }
+        k = k + 1
+      }
+    }
+    return 0
   }
   0
 }
@@ -3647,7 +3678,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // (A GENERIC function value meeting a CONCRETE function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case — `genericFnAssignable` — so it governs nested positions like an
   // array element too, not just this expression-level entry.)
-  recordNicheNulElemArrayLit(srcExpr, dstTy)
+  recordNicheNulElemArrayLit(srcExpr, dstTy, 6)
   recordNullHoleObjAdopt(srcExpr, dstTy, 6)
   // REP SIDECAR (phase 0a2): an ObjLit/ArrayLit whose source type reaches an unresolved
   // empty-collection hole (`{nodes: []}`, `{m: Map()}`) is plainly `assignable` to its
