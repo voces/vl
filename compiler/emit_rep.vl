@@ -58,6 +58,7 @@ import {
   T,
   TyArray,
   TyFunc,
+  TyLit,
   TyMap,
   TyNeg,
   TyNullable,
@@ -311,11 +312,54 @@ function repCanonKeyGo(ty: i32): string {
   if t is TyArray { return repCanonKey(t.aElem) + "[]" }
   if t is TyNullable { return repCanonKey(t.nInner) + "?" }
   if t is TyUnion {
+    // MIX-widening (the `mvCanonValName` / `rlInternName` discipline at the key layer): a
+    // litunion member of a MIXED union — one with a non-null, non-litunion sibling — is
+    // STRING-repped in the box, so its canonical key renders "string". Without this a
+    // declared `{a: K0 | {w:i32} | {q:i64}}` and the inline spelling (interned under the
+    // checker's string-softened render) keyed DIFFERENTLY, declined the struct-twin dedup,
+    // and minted two byte-identical heap types — iso-recursively DISTINCT, so the
+    // declared-param call site's (ref $T0) mismatched the inline literal's twin
+    // (INVALID-WASM; fuzz-nightly 29875839073 declared leg, `mix:{a: K0 | {w: i32} |
+    // {q: i64}, …}` seed 88370995 d6). A PURE litunion (`K0`, `K0 | null`) keeps its
+    // structural render — the atom-i32 rep, NOT mergeable with `string`. Widened members
+    // dedup to one "string" render (the softened spelling collapses a `K0 | string` pair).
+    // Layout safety stays double-gated: `structFieldCodesEq` still refuses a merge whose
+    // emitted field codes differ.
+    let mixHasOther = false
+    let mi = 0
+    while mi < t.uMembers.length {
+      const mt = T.tys[t.uMembers[mi]]
+      let mLit = tyIsLitUnion(t.uMembers[mi])
+      if mt is TyLit { mLit = true }
+      let mNull = false
+      if mt is TyPrim {
+        if mt.primName == "null" { mNull = true }
+      }
+      if !mLit && !mNull { mixHasOther = true }
+      mi = mi + 1
+    }
     let s = "("
+    let emitted = 0
+    let sawWideStr = false
     let i = 0
     while i < t.uMembers.length {
-      if i > 0 { s = s + "|" }
-      s = s + repCanonKey(t.uMembers[i])
+      let r = repCanonKey(t.uMembers[i])
+      let skip = false
+      if mixHasOther {
+        let iLit = tyIsLitUnion(t.uMembers[i])
+        const it = T.tys[t.uMembers[i]]
+        if it is TyLit { iLit = true }
+        if iLit { r = "string" }
+        if r == "string" {
+          if sawWideStr { skip = true }
+          sawWideStr = true
+        }
+      }
+      if !skip {
+        if emitted > 0 { s = s + "|" }
+        s = s + r
+        emitted = emitted + 1
+      }
       i = i + 1
     }
     return s + ")"
