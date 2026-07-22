@@ -477,6 +477,35 @@ function tyReachesEmptyHole(ty: i32, depth: i32): boolean {
   false
 }
 
+// True when `ty` contains a `TyUnion` reachable through struct fields, array
+// elements, map values, or nullable inners. Gates `recordRepTyAdopt` for the
+// UNION-SOFTENING adoption case: an ObjLit field value whose self-inferred type is
+// a NARROWER member of a destination union field (`{f: "x"}` : `{f: string}` vs the
+// destination `{f: f32 | string}`) softens the recorded rep type, so a same-fieldset
+// twin (an inner `{f: union}` row interned beside the outer `{f: {f: union}}`) is
+// resolved WRONG by `structIndexOfObjCtx`'s ambiguity arm — the softened key matches
+// no row and `repRowOfTyStruct` declines. Re-stamping the literal's rep to the union-
+// bearing destination corrects it (fuzz sweep uM8vds declared leg, the `mix:` triple-
+// nest twin cluster). `TyNullable` is a distinct variant (handled by
+// `recordNullHoleObjAdopt`) — this reaches only genuine `TyUnion` softening.
+function tyReachesUnion(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion { return true }
+  if t is TyArray { return tyReachesUnion(t.aElem, depth - 1) }
+  if t is TyMap { return tyReachesUnion(t.mVal, depth - 1) }
+  if t is TyNullable { return tyReachesUnion(t.nInner, depth - 1) }
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length {
+      if tyReachesUnion(t.objFieldTypes[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
 // USAGE-DRIVEN INFERENCE through a TYPED context: when an empty `[]` / bare
 // `Map()`/`Set()` (open holes) flows into a slot with a concrete shape — a `T[]`
 // param at a call site, an annotated assignment (`const ys: i32[] = zs`), or a
@@ -3688,6 +3717,13 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // element-resolved shape (`{nodes: i32[]}`) rather than the naive hole (`{nodes: ![]}`).
   // PURE (writes only `nodeRepTyIx`) → byte-identical this phase.
   if !inferQuiet && srcExpr >= 0 && tyReachesEmptyHole(srcTy, 8) {
+    recordRepTyAdopt(srcExpr, dstTy, 6)
+  } else if !inferQuiet && srcExpr >= 0 && tyReachesUnion(dstTy, 8) {
+    // Union-softening adoption (see `tyReachesUnion`): an ObjLit/ArrayLit whose
+    // field value narrowed a destination union field leaves the recorded rep type
+    // softened, mis-resolving a same-fieldset twin. Re-stamp the destination rep so
+    // the emitter's structural row resolver keys the union-bearing shape. PURE
+    // (writes only `nodeRepTyIx`).
     recordRepTyAdopt(srcExpr, dstTy, 6)
   }
   if assignable(srcTy, dstTy) { return true }
