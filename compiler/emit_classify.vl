@@ -281,6 +281,7 @@ import {
   sFieldNames,
   sFieldStart,
   sFieldTypes,
+  sHeapIdx,
   sNames,
   scopeFrames,
   scopeNames,
@@ -292,6 +293,7 @@ import {
   uFieldNames,
   uFieldStart,
   uFieldTypes,
+  uVarHeap,
   uVarTwin,
   uVariants,
   unMemberSet,
@@ -4482,6 +4484,145 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
     let i = 0
     while i < elems.length {
       if blockHasCallRef(elems[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// True if the STRUCT-table entry `ssi` layout-matches a variant arm of SOME registered
+// variant-box union whose arm-variant heap type DIFFERS from `sHeapIdx[ssi]` — a struct of
+// this shape flowing into that union must be RE-BOXED (`emitStructExprAsVariantBox`), never
+// passed raw (the plain twin is a distinct heap type). The reservation pre-pass has no flow
+// context, so this over-approximates (a plain struct merely sharing a fieldset with some
+// arm reserves the stash even if it never flows there — a harmless spare local).
+function structIdxHasReboxVariant(ssi: i32): boolean {
+  if ssi < 0 || ssi >= sHeapIdx.length { return false }
+  let u = 0
+  while u < unNames.length {
+    let vi = unVarStart[u]
+    while vi < unVarStart[u] + unVarCount[u] {
+      if vi >= 0 && vi < uVarHeap.length {
+        if structIdxMatchesVariantIdx(ssi, vi) {
+          if sHeapIdx[ssi] != uVarHeap[vi] { return true }
+        }
+      }
+      vi = vi + 1
+    }
+    u = u + 1
+  }
+  false
+}
+
+// True if the expression at `exprIx` is a MULTI-FIELD struct-returning CALL (a non-re-
+// readable source — a call cannot be re-evaluated per field) whose result shape must be
+// RE-BOXED into a variant-box union arm. This is the one rebox case `emitStructExprAsVariant
+// Box` handles by STASHING the call result in `variantReboxSlot` (single-field / re-readable
+// sources re-emit in place and need no stash). Drives that slot's reservation.
+export function exprIsMultiFieldReboxCall(exprIx: i32, fnIx: i32): boolean {
+  const inner = unwrapParen(exprIx)
+  if inner < 0 { return false }
+  const n = P.nodes[inner]
+  if !(n is Call) { return false }
+  if !exprStruct(inner, fnIx) { return false }
+  const ssi = structIndexOfExpr(inner, fnIx)
+  // `structIndexOfExpr` can return a VARIANT index (its own heap table) for a variant-
+  // returning call — not a struct-table index. Bound to the struct table so it is never
+  // misused as one (a variant-returning call never reboxes; it builds the variant directly).
+  if ssi < 0 || ssi >= sFieldCount.length { return false }
+  if sFieldCount[ssi] <= 1 { return false }
+  structIdxHasReboxVariant(ssi)
+}
+
+// Whether the statement/expression tree at `ix` contains a multi-field struct-returning
+// call that must be re-boxed into a variant-box union arm (`exprIsMultiFieldReboxCall`) —
+// so the function reserves the `variantReboxSlot`. Mirrors `blockHasCallRef`'s traversal.
+// Under-reservation is SAFE (the emit floors loudly, never invalid wasm); over-reservation
+// is a harmless spare local — so exact flow-position matching is unnecessary here.
+export function blockHasVariantRebox(ix: i32, fnIx: i32): boolean {
+  if ix < 0 { return false }
+  if exprIsMultiFieldReboxCall(ix, fnIx) { return true }
+  const n = P.nodes[ix]
+  if n is Call {
+    if blockHasVariantRebox(n.callFn, fnIx) { return true }
+    const args = n.callArgs
+    let i = 0
+    while i < args.length {
+      if blockHasVariantRebox(args[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if n is Block {
+    const stmts = n.blkStmts
+    let i = 0
+    while i < stmts.length {
+      if blockHasVariantRebox(stmts[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 { return blockHasVariantRebox(n.letInit, fnIx) }
+    return false
+  }
+  if n is RetStmt {
+    if n.retArg >= 0 { return blockHasVariantRebox(n.retArg, fnIx) }
+    return false
+  }
+  if n is IfStmt {
+    if blockHasVariantRebox(n.ifCond, fnIx) { return true }
+    if blockHasVariantRebox(n.ifThen, fnIx) { return true }
+    if n.ifElse >= 0 { return blockHasVariantRebox(n.ifElse, fnIx) }
+    return false
+  }
+  if n is WhileStmt {
+    if blockHasVariantRebox(n.whileCond, fnIx) { return true }
+    return blockHasVariantRebox(n.whileBody, fnIx)
+  }
+  if n is ForRange {
+    if blockHasVariantRebox(n.frFrom, fnIx) { return true }
+    if blockHasVariantRebox(n.frTo, fnIx) { return true }
+    if n.frStep >= 0 {
+      if blockHasVariantRebox(n.frStep, fnIx) { return true }
+    }
+    return blockHasVariantRebox(n.frBody, fnIx)
+  }
+  if n is ForIn {
+    if blockHasVariantRebox(n.fiIter, fnIx) { return true }
+    return blockHasVariantRebox(n.fiBody, fnIx)
+  }
+  if n is BinExpr {
+    if blockHasVariantRebox(n.binLeft, fnIx) { return true }
+    return blockHasVariantRebox(n.binRight, fnIx)
+  }
+  if n is Unary { return blockHasVariantRebox(n.unArg, fnIx) }
+  if n is Paren { return blockHasVariantRebox(n.parInner, fnIx) }
+  if n is IsExpr { return blockHasVariantRebox(n.isObj, fnIx) }
+  if n is AsExpr { return blockHasVariantRebox(n.asObj, fnIx) }
+  if n is Member { return blockHasVariantRebox(n.memObj, fnIx) }
+  if n is Index {
+    if blockHasVariantRebox(n.idxArr, fnIx) { return true }
+    return blockHasVariantRebox(n.idxIndex, fnIx)
+  }
+  if n is ObjLit {
+    const fields = n.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if blockHasVariantRebox(f.fiValue, fnIx) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  if n is ArrayLit {
+    const elems = n.arrElems
+    let i = 0
+    while i < elems.length {
+      if blockHasVariantRebox(elems[i], fnIx) { return true }
       i = i + 1
     }
     return false
@@ -11666,6 +11807,40 @@ export function letIsStruct(letIx: i32, fnIx: i32) {
 // first, else the init's variant value (a variant param/local read). Checked AFTER the
 // struct/union local cases so only an explicit variant annotation / variant-valued init
 // reaches here.
+// True if the `LetDecl`'s init produces a PLAIN-STRUCT TWIN of a variant arm (a call /
+// literal built as the plain struct — its own interned heap, a layout TWIN of but DISTINCT
+// heap from the arm's variant struct), NOT a genuine kind-8 variant ref. Such a value is
+// RE-BOXED into the union (`emitStructExprAsVariantBox`, #1005), so the binding must be the
+// union BOX (kind 4) — a variant local `(ref $variant)` would receive the box `(ref $uBox)`
+// (invalid wasm). A genuine variant-REP init (a kind-8 variant local/param, a variant-
+// returning call) resolves `structIndexOfExpr < 0` and is left as a raw variant.
+function letInitReboxesToVariant(letIx: i32, fnIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    // Gated on a UNION annotation: only a `{…} | scalar`-typed binding flows its init into
+    // the union BOX. An UN-annotated variant-returning call (`const m = mk(7)`, `mk(): Cat`)
+    // must stay a raw kind-8 variant — its init merely shape-matches an arm.
+    if d.letType < 0 { return false }
+    const lt = P.nodes[d.letType]
+    if !(lt is TypeRef) { return false }
+    if !isUName(lt.tyName) { return false }
+    if nodeTyIsLitUnionAlias(d.letType) { return false }
+    // A genuine variant-REP init (a kind-8 variant local/param) resolves `structIndexOfExpr
+    // < 0` and stays raw + boxes at the boundary; only a PLAIN-STRUCT TWIN of an arm (a call
+    // / literal built as the plain struct — a DISTINCT heap) reboxes, so the binding must be
+    // the box, not a variant `(ref $variant)` that would receive the box `(ref $uBox)`.
+    const vi = exprVariantIndex(d.letInit, fnIx)
+    if vi < 0 || vi >= uVarHeap.length { return false }
+    const ssi = structIndexOfExpr(d.letInit, fnIx)
+    // `structIndexOfExpr` returns a VARIANT index (not a struct-table index) for a genuine
+    // variant-returning call — bound to the struct table so it is never misused as one (a
+    // variant-REP init stays raw; only a plain-struct twin reboxes).
+    if ssi < 0 || ssi >= sHeapIdx.length { return false }
+    return sHeapIdx[ssi] != uVarHeap[vi]
+  }
+  false
+}
+
 export function letIsVariant(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -11675,6 +11850,11 @@ export function letIsVariant(letIx: i32, fnIx: i32) {
         if variantIndexOf(lt.tyName) >= 0 { return true }
       }
     }
+    // A plain-struct-TWIN init (`const t: {w:i32}|i32 = mkS()`, mkS returning the PLAIN
+    // struct) matches a variant arm by SHAPE via `exprVariantIndex` but its value is RE-
+    // BOXED into the union — so it must bind the union BOX, not a variant. A genuine
+    // variant-REP init is untouched (see `letInitReboxesToVariant`).
+    if letInitReboxesToVariant(letIx, fnIx) { return false }
     return exprVariantIndex(d.letInit, fnIx) >= 0
   }
   false
@@ -11692,6 +11872,9 @@ export function variantIndexOfLet(letIx: i32, fnIx: i32) {
         if vi >= 0 { return vi }
       }
     }
+    // Mirrors `letIsVariant`: a plain-struct-twin init reboxes into the union box (kind 4),
+    // so it resolves NO concrete variant index.
+    if letInitReboxesToVariant(letIx, fnIx) { return -1 }
     return exprVariantIndex(d.letInit, fnIx)
   }
   -1
