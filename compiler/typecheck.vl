@@ -4685,6 +4685,13 @@ function tyToEmitName(ix: i32) {
       let s = litUnionAliasNameOfTy(members[i])
       if s == "" { s = tyToEmitName(members[i]) }
       if s == "" { return "" }
+      // A FUNCTION-TYPE member renders PARENTHESIZED (`(()=>f32|null)|{w:i32}`) — the
+      // annotation's atom spelling. Bare, the closure's result arms swallow the union's
+      // sibling members (`()=>f32|null|{w:i32}`), so `annSigKey` read a top-level arrow
+      // and keyed the whole result `>c` while the pinned lambda interned `>u` — a
+      // divergent `ref.cast` functype at the value call (INVALID-WASM; fuzz-nightly
+      // seed 556796311 d6).
+      if rgm is TyFunc { s = "(" + s + ")" }
       let dup = false
       let j = 0
       while j < parts.length {
@@ -4706,6 +4713,11 @@ function tyToEmitName(ix: i32) {
   if t is TyNullable {
     const inner = tyToEmitName(t.nInner)
     if inner == "" { return "" }
+    // A NULLABLE FUNCTION type keeps the kind-19 grouping parens (`((i32)=>string)|null`)
+    // — bare, the render spells a closure RETURNING `string|null` instead (the `|null`
+    // binds to the result), the same swallowed-arm ambiguity as the union-member case.
+    const nfn = T.tys[t.nInner]
+    if nfn is TyFunc { return "(" + inner + ")|null" }
     return inner + "|null"
   }
   if t is TyObj {
@@ -9556,8 +9568,11 @@ function refArmUnionRetName(er: i32, stmts: i32[]) {
 // inferred-return loop) routes the anonymous lambda through the SAME sound box.
 // `tyToEmitName` renders the emitter's non-spaced vocabulary, byte-matching the
 // `registerInlineUnion` / `splitUnionAtoms` name shape. Declines ("") when:
-//  · any member is a map / array / closure / nullable (those shapes are owned by
+//  · any member is a map / array / nullable (those shapes are owned by
 //    `mapUnionRetName` / `refArmUnionRetName` / the nullable arms — or stay loud),
+//  · a closure member appears WITHOUT a struct sibling (closure + scalar mixes are
+//    `cloArmValueUnionRetName`'s), or a second closure member appears (one kind-11
+//    ref atom per box — two closures would tag identically),
 //  · any member is a literal type (`TyLit` — a litunion member renders softened to
 //    `string`, divorcing the pinned name from the annotation's atom rep),
 //  · any member renders "" (an unrepresentable leaf), or no object member exists
@@ -9603,6 +9618,8 @@ function variantBoxUnionRetName(er: i32) {
       if litAlias == "" { return "" }
     }
     let hasComposite = litAlias != ""
+    let hasClo = false
+    let hasObj = false
     let name = ""
     let litDone = false
     let i = 0
@@ -9616,9 +9633,27 @@ function variantBoxUnionRetName(er: i32) {
         }
         litDone = true
         mn = litAlias
+      } else if m is TyFunc {
+        // A CLOSURE arm beside a STRUCT arm (`(() => f32|null) | {w: i32}`): the closure
+        // rides the box anyref as the kind-11 REF atom (`isVariantBoxUnion` admits it), and
+        // the annotated spelling of such a union already lowers soundly — so render the
+        // parenthesized functype atom, byte-matching the annotation's `((…)=>…)` member.
+        // ONE closure arm at most (two would share the kind-11 tag — indiscriminable), and
+        // the struct-sibling requirement below keeps closure + scalar/list mixes on their
+        // existing owners (`cloArmValueUnionRetName`) / loud paths. Without this the outer
+        // lambda of a `(i32) => (() => f32|null) | {w:i32}` value never adopted the union —
+        // its `$fnsig` interned the raw-closure result while the value call cast to the
+        // `>u` sig (INVALID-WASM; fuzz-nightly seed 556796311 d6).
+        if hasClo { return "" }
+        const cn = tyToEmitName(members[i])
+        if cn == "" { return "" }
+        mn = "(" + cn + ")"
+        hasClo = true
+        hasComposite = true
       } else {
         mn = vbUnionMemberName(members[i])
         if mn == "" { return "" }
+        if m is TyObj { hasObj = true }
         if mn != "i32" && mn != "i64" && mn != "f64" && mn != "f32" {
           if mn != "boolean" && mn != "string" { hasComposite = true }
         }
@@ -9627,6 +9662,7 @@ function variantBoxUnionRetName(er: i32) {
       name = name + mn
       i = i + 1
     }
+    if hasClo && !hasObj { return "" }
     if !hasComposite { return "" }
     return name
   }
