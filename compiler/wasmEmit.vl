@@ -388,6 +388,7 @@ import {
   exprNullableRefArray,
   exprNullableString,
   exprNullableStruct,
+  exprReReadable,
   exprRefArray,
   exprString,
   exprStringArray,
@@ -517,6 +518,7 @@ import {
   tyAnnRefListKind,
   tyAnnRefListSlot,
   unionArmVariantForObj,
+  unionArmVariantForStructExpr,
   unionClosureArmName,
   unionEqAtomOf,
   unionHasCollapsedStringMapArm,
@@ -1497,6 +1499,45 @@ function emitUnionBoxAs(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
   0
 }
 
+// Box a struct-typed EXPRESSION (an ident / call result already BUILT as the plain struct
+// `sHeapIdx[ssi]`) into union variant `vi`, whose variant struct `uVarHeap[vi]` is a
+// LAYOUT TWIN of but a DISTINCT heap type from the plain struct. The raw plain ref cannot
+// be boxed directly — the narrow (`is {…}`) casts the box payload to `uVarHeap[vi]`, which
+// a `(ref sHeapIdx[ssi])` payload fails (invalid wasm for an ident source, a runtime cast
+// TRAP for a call source that boxed the plain ref). Rebuild the variant struct by reading
+// each of its fields from the source (source & variant share the layout, so every field
+// read is store-compatible with the variant field), then tag + box. The source is re-
+// emitted ONCE PER FIELD, so the caller must ensure it is re-readable (`exprReReadable`)
+// or single-field (one emit).
+function emitStructExprAsVariantBox(
+  body: i32[],
+  exprIx: i32,
+  vi: i32,
+  ssi: i32,
+  fnIx: i32,
+) {
+  fbI32Const(uTags[vi]) // 0x41 i32.const <tag>
+  const start = uFieldStart[vi]
+  const cnt = uFieldCount[vi]
+  let fj = 0
+  while fj < cnt {
+    const sfi = sFieldIndex(ssi, uFieldNames[start + fj])
+    if sfi < 0 {
+      return emitFail(
+        "emitProgram: struct value is missing a union-variant field",
+      )
+    }
+    if emitExpr(body, exprIx, fnIx) < 0 {
+      return -1 // push the source struct ref
+    }
+    fbStructGet(sHeapIdx[ssi], sfi) // read this field (source & variant reps agree)
+    fj = fj + 1
+  }
+  fbStructNew(uVarHeap[vi]) // build the ARM's variant struct
+  fbStructNew(uBoxIdx)      // { tag, variant-struct ref }
+  0
+}
+
 // Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag),
 // then `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
@@ -2201,6 +2242,27 @@ export function emitUnionCoerce(
     if objVariantName(bareIx) != "" { return emitUnionBox(body, bareIx, fnIx) }
     return emitExpr(body, exprIx, fnIx)
   }
+  // A struct-typed IDENT / call result that IS a variant arm of `unionName` but was built
+  // as the plain struct (a DISTINCT heap type from the arm's variant struct — the twin the
+  // `sHeapIdx`/`uVarHeap` tables never cross-dedup): the raw passthrough below emits the
+  // plain ref where the box wants the variant struct (invalid wasm for an ident; a runtime
+  // cast trap once boxed). Re-box it against the matched arm (`emitStructExprAsVariantBox`).
+  // Gated on the heaps DIFFERING so an already-deduped shape keeps the byte-identical raw
+  // pass, and on re-readable / single-field so the per-field re-emit is sound.
+  if unionName != "" && exprStruct(exprIx, fnIx) {
+    const rbVi = unionArmVariantForStructExpr(unionName, exprIx, fnIx)
+    if rbVi >= 0 {
+      const rbSsi = structIndexOfExpr(exprIx, fnIx)
+      if rbSsi >= 0 && sHeapIdx[rbSsi] != uVarHeap[rbVi] {
+        if uFieldCount[rbVi] == 1 || exprReReadable(unwrapParen(exprIx)) {
+          return emitStructExprAsVariantBox(body, exprIx, rbVi, rbSsi, fnIx)
+        }
+        return emitFail(
+          "emitProgram: a multi-field struct value from a call or complex expression cannot yet be boxed into a variant-box union (only idents and single-field results are supported)",
+        )
+      }
+    }
+  }
   if exprStruct(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
   // A bare VARIANT value (a kind-8 local/param/call — its binding classified concrete via
   // `letIsVariant`, which runs BEFORE the union case): a variant-init binding's own slot IS
@@ -2494,6 +2556,22 @@ function emitUnionBoxArg(
   if !exprUnion(exprIx, fnIx) {
     const svi = exprVariantIndex(exprIx, fnIx)
     if svi >= 0 {
+      // A struct-typed value BUILT as the plain struct (an anonymous union arm returned
+      // from a `: {…}` function / bound to a struct local) is a layout TWIN of — but a
+      // DISTINCT heap type from — the arm's variant struct. Boxing the raw plain ref
+      // validates but the narrow's `ref.cast (ref uVarHeap[svi])` TRAPS at runtime.
+      // Rebuild it against the arm instead (source re-emitted once per field, so gate on
+      // re-readable / single-field; a genuine kind-8 variant local resolves `ssi < 0` and
+      // boxes raw as before).
+      const bssi = structIndexOfExpr(exprIx, fnIx)
+      if bssi >= 0 && sHeapIdx[bssi] != uVarHeap[svi] {
+        if uFieldCount[svi] == 1 || exprReReadable(unwrapParen(exprIx)) {
+          return emitStructExprAsVariantBox(body, exprIx, svi, bssi, fnIx)
+        }
+        return emitFail(
+          "emitProgram: a multi-field struct value from a call or complex expression cannot yet be boxed into a variant-box union (only idents and single-field results are supported)",
+        )
+      }
       fbI32Const(uTags[svi]) // 0x41 i32.const <variant tag> (program-global)
       if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx) // { tag, variant-ref }
