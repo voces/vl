@@ -1023,29 +1023,6 @@ export function letIsNulRef(letIx: i32, fnIx: i32) {
   false
 }
 
-// A bare `m[k]` map read is `V | null`. A struct (kind 9), string (16), or closure (19) value
-// binds a supported nullable local — but a UNION (mv kind 2) or ref-LIST (mv kind 6) value has no
-// nullable local rep, so the bare read would lower to a non-null local while `emitMapGet` yields a
-// `(ref null …)`: invalid wasm. Detect that shape so the binding is a CLEAN reject (use `m[k] ??
-// <default>`, which loads the non-null value) instead. Gated to un-annotated bindings — an
-// annotation drives the kind explicitly and is classified before this.
-export function letBareUnwiredNulMapRead(letIx: i32, fnIx: i32) {
-  const d = P.nodes[letIx]
-  if d is LetDecl {
-    if d.letType >= 0 { return false }
-    const mrs = mapReadMvSlot(d.letInit, fnIx)
-    if mrs >= 0 {
-      const k = mvValKind[mrs]
-      // A kind-6 read now BINDS through `letNulMapReadValKind` (the nullable list /
-      // nested-map local kinds) — only the UNION-valued read (kind 2) remains the
-      // clean reject (its element is the shared box; a bare nullable-box binding has
-      // no local rep yet — narrow with `m[k] ?? <default>`).
-      return k == 2
-    }
-  }
-  false
-}
-
 // The NULLABLE local VKind a bare `const t = m[k]` read of a LIST- or nested-MAP-valued
 // map binds (`{[string]: i32[]}` → `nullist`, `{[string]: S[]}` → `nulreflist`,
 // `{[string]: {[string]: V}}` → `nulmap`, …), or null when the init is not such a read.
@@ -1093,6 +1070,25 @@ export function letNulMapReadSlotArg(letIx: i32, fnIx: i32) {
     return mvSlotOfMapValNameOrMono(mapValNameOf(mvValName[mrs]))
   }
   -1
+}
+
+// True if the `LetDecl` at `letIx` is a bare `const t = m[k]` read of a UNION-valued
+// map (mv kind 2). The read is `V | null`, and the established local rep for a
+// `A | B | null` value is the SHARED BOX itself (kind `"union"`) with `null` riding as
+// the null-tagged atom (`scalarTagOf("null")` — `emitUnionCoerce`'s NullLit arm), so
+// the binding is the non-null `(ref $uBoxIdx)` cell: the hit arm stores the map's
+// stored box, the miss arm synthesizes the null-tagged box (`emitLetDeclStmt`'s
+// map-read arm), and the `!= null` / `is` narrow machinery lowers unchanged. Gated to
+// un-annotated bindings — an annotation drives the kind explicitly. Replaces the
+// former `letBareUnwiredNulMapRead` loud reject (the last unwired bare-read family).
+export function letNulMapReadUnionBox(letIx: i32, fnIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    const mrs = mapReadMvSlot(d.letInit, fnIx)
+    if mrs >= 0 { return mvValKind[mrs] == 2 }
+  }
+  false
 }
 
 // True if evaluating the expression at `exprIx` yields a NULLABLE i32-list ref —
