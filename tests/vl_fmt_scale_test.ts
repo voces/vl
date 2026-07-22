@@ -123,3 +123,72 @@ Deno.test({
     }
   },
 });
+
+// A single-line list with many ITEMS (one array literal, not many statements)
+// tripped a SEPARATE O(n²) hotspot: `wrapList`'s `oneLine = oneLine + item`
+// (and the wrapped-form `body = body + pad + item + ",\n"`) accumulators.
+// tests/cases/literals/long-literal-chunked.vl (a 10,001-element one-line
+// array) traps the compiler's non-freeing heap ("allocation size too large")
+// under the pre-fix quadratic form — the genSource() shape above (many small
+// statements) never exercises wrapList's single-list accumulation at all.
+const genListSource = (count: number): string => {
+  const items: string[] = [];
+  for (let i = 0; i < count; i++) items.push(String(i % 10));
+  return `function f() {\n  const a = [${items.join(",")}]\n  print(a.length)\n}\nf()\n`;
+};
+
+Deno.test({
+  name: "vl-fmt-scale: a large single-line list formats linearly (no O(n²) crash/hang) and is idempotent",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_list_scale_" });
+    try {
+      const half = `${dir}/half.vl`; // 6,000-element single-line list
+      const big = `${dir}/big.vl`; // 12,000-element single-line list
+      const bigSrc = genListSource(12000);
+      await Deno.writeTextFile(half, genListSource(6000));
+      await Deno.writeTextFile(big, bigSrc);
+
+      const check = (r: { code: number; out: string }, label: string, srcLen: number) => {
+        if (r.code !== 0) throw new Error(`fmt failed on the ${label} list file (code ${r.code}) — likely the wrapList O(n²) regression`);
+        if (r.out.length < srcLen / 2) throw new Error(`fmt produced suspiciously little output on the ${label} list file (${r.out.length} bytes)`);
+      };
+
+      let rHalf = await fmt(half);
+      check(rHalf, "half-size", bigSrc.length / 2);
+      let rBig = await fmt(big);
+      check(rBig, "large", bigSrc.length);
+
+      // Net 1 — absolute: the linear wrapList runs this in well under a second;
+      // the pre-fix quadratic form took minutes (and eventually trapped) at
+      // 10,001 elements. 30s leaves wide headroom without masking the regression.
+      if (rBig.secs > 30) throw new Error(`fmt took ${rBig.secs}s on a large single-line list — wrapList O(n²) regression suspected`);
+
+      // Net 2 — scaling, same method/bound as the statement-count net above.
+      const RATIO = 3.0;
+      const scaled = (h: number, b: number) => b > RATIO * Math.max(h, 0.1);
+      if (scaled(rHalf.secs, rBig.secs)) {
+        const rHalf2 = await fmt(half);
+        check(rHalf2, "half-size", bigSrc.length / 2);
+        const rBig2 = await fmt(big);
+        check(rBig2, "large", bigSrc.length);
+        rHalf = rHalf.secs <= rHalf2.secs ? rHalf : rHalf2;
+        rBig = rBig.secs <= rBig2.secs ? rBig : rBig2;
+      }
+      if (scaled(rHalf.secs, rBig.secs)) {
+        throw new Error(
+          `fmt scales superlinearly on single-line lists: ${rHalf.secs}s (6,000 items) -> ${rBig.secs}s (12,000 items), ` +
+            `> ${RATIO}x for 2x input — wrapList O(n²) regression suspected`,
+        );
+      }
+
+      // Idempotent on the wrapped output.
+      const big2 = `${dir}/big2.vl`;
+      await Deno.writeTextFile(big2, rBig.out);
+      const r2 = await fmt(big2);
+      if (r2.out !== rBig.out) throw new Error("fmt not idempotent on a large single-line list");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
