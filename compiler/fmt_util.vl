@@ -1,7 +1,8 @@
-// Pure, state-free formatting helpers extracted from `compiler/format.vl`
-// (kill-TS step 1 split). These reference no format.vl module-state globals — only
-// the parser arena (`P`) / AST node variants and each other — so they live in a
-// leaf module that `format.vl` imports back. NO behavior change from the split.
+// Pure formatting helpers extracted from `compiler/format.vl` (kill-TS step 1
+// split). These reference no format.vl module-state globals — only the parser
+// arena (`P`) / AST node variants, each other, and one deterministic memo
+// (`indentCache`) — so they live in a leaf module that `format.vl` imports back.
+// NO behavior change from the split.
 
 import {
   ArrayLit,
@@ -44,14 +45,23 @@ import {
   WhileStmt,
 } from "./ast"
 
+// Two-space indent strings, memoized per depth. `emitLine` asks for one per
+// emitted line, and the rebuild-every-call `s = s + "  "` loop allocated
+// O(depth) intermediate strings each time — under wasmtime every intermediate
+// is an `array.new` + `array.copy` libcall pair, so the memo removes a
+// per-line native allocation hotspot. The cache is deterministic (depth `n`
+// always maps to `2n` spaces), so persisting it across formats is invisible.
+const indentCache: string[] = []
 export function indentStr(n: i32) {
-  let s = ""
-  let i = 0
-  while i < n {
-    s = s + "  "
-    i = i + 1
+  if n <= 0 { return "" }
+  while indentCache.length <= n {
+    if indentCache.length == 0 {
+      indentCache.push("")
+    } else {
+      indentCache.push(indentCache[indentCache.length - 1] + "  ")
+    }
   }
-  s
+  indentCache[n]
 }
 
 // The START char offset (`pos`) of arena node `ix` — narrows to read the common
@@ -110,6 +120,9 @@ export function trimWs(s: string) {
   let b = s.length
   while a < b && isWs(s[a]) { a = a + 1 }
   while b > a && isWs(s[b - 1]) { b = b - 1 }
+  // Nothing to trim: hand back `s` itself (strings are immutable values, so
+  // this is indistinguishable from a full-range slice — minus the allocation).
+  if a == 0 && b == s.length { return s }
   const r = s.slice(a, b)
   r
 }
@@ -118,6 +131,7 @@ export function trimWs(s: string) {
 export function trimWsStart(s: string) {
   let a = 0
   while a < s.length && isWs(s[a]) { a = a + 1 }
+  if a == 0 { return s }
   const r = s.slice(a, s.length)
   r
 }
@@ -135,6 +149,8 @@ export function rstrip(s: string) {
       going = false
     }
   }
+  // The common already-clean line: no trailing whitespace, no fresh slice.
+  if b == s.length { return s }
   const r = s.slice(0, b)
   r
 }
@@ -189,26 +205,50 @@ export function splitLines(s: string) {
 }
 
 export function spaces(n: i32) {
-  let s = ""
-  let i = 0
-  while i < n {
-    s = s + " "
-    i = i + 1
-  }
-  s
+  if n <= 0 { return "" }
+  // One allocation, not the O(n²)-copy `s = s + " "` accumulator.
+  const buf = __array_new__(n, ' ')
+  fromCodePoints(buf)
 }
 
-// Concatenate `parts[lo..hi)` with a `\n` between every adjacent pair, splitting
-// the range in half so the total intermediate-string allocation is O(n log n)
-// rather than the O(n²) of a running `s = s + parts[i]` accumulator. That
-// quadratic blows up under the compiler's NON-FREEING null GC collector — on a
-// large file (e.g. the 6940-line typecheck.vl) the old form exhausted the heap
-// ("allocation size too large") or ran for minutes.
+// Concatenate `parts[lo..hi)` with a `\n` between every adjacent pair by sizing
+// ONE code-point buffer exactly and materializing it once — O(n) total
+// allocation and copying. The history here matters: a running `s = s + parts[i]`
+// accumulator was O(n²) and blew the compiler's NON-FREEING null-GC heap on a
+// large file (the 6940-line typecheck.vl: "allocation size too large" or
+// minutes of runtime); the divide-and-conquer concat that replaced it was
+// O(n log n) intermediate strings — fine under V8, but still the dominant
+// native cost, because under wasmtime every intermediate string is an
+// `array.new` plus per-element-cost `array.copy` libcalls. The single
+// preallocated buffer leaves one `fromCodePoints` conversion as the only
+// string allocation.
 export function joinLinesRange(parts: string[], lo: i32, hi: i32) {
   if hi - lo <= 0 { return "" }
   if hi - lo == 1 { return parts[lo] }
-  const mid = lo + (hi - lo) / 2
-  joinLinesRange(parts, lo, mid) + "\n" + joinLinesRange(parts, mid, hi)
+  let total = hi - lo - 1
+  let i = lo
+  while i < hi {
+    total = total + parts[i].length
+    i = i + 1
+  }
+  const buf = __array_new__(total, 0)
+  let k = 0
+  i = lo
+  while i < hi {
+    if i > lo {
+      buf[k] = '\n'
+      k = k + 1
+    }
+    const p = parts[i]
+    let j = 0
+    while j < p.length {
+      buf[k] = p[j]
+      k = k + 1
+      j = j + 1
+    }
+    i = i + 1
+  }
+  fromCodePoints(buf)
 }
 
 export function joinLines(parts: string[]) {
