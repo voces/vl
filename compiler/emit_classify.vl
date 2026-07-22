@@ -4357,6 +4357,11 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
       if !isVal && calleeIsUnionArmClosureMember(n.callFn, fnIx) {
         isVal = true
       }
+      // `t0[0].f()` where `t0`'s union has a ref-array arm whose ELEMENT struct
+      // carries a closure field — the indexed-element-field twin of the arms above.
+      if !isVal && calleeIsUnionElemFieldClosure(n.callFn, fnIx) {
+        isVal = true
+      }
     }
     if isVal { return true }
     if blockHasCallRef(n.callFn, fnIx) { return true }
@@ -10546,6 +10551,43 @@ export function calleeIsUnionClosureArrayIndex(exprIx: i32, fnIx: i32) {
     if arr is Ident {
       const un = unionNameOfIdent(arr.identName, fnIx)
       if un != "" { return unionHasClosureArrayArm(un) }
+    }
+  }
+  false
+}
+
+// `t0[0].f()` where `t0`'s union has a REF-ARRAY arm whose ELEMENT struct carries a
+// CLOSURE field (`{f: () => {[string]: string}}[] | f64`): the `is`-narrowing that
+// makes `t0` the ref array is not active in this frame pre-pass, so `exprIsClosure`
+// on the member chain is false — reserve `callRefSlot` conservatively (a spare local
+// is harmless; an UNRESERVED `call_ref` spill shares the next frame's local — here
+// the map RESULT local: INVALID-WASM, local fuzz sweep1 branching leg). The
+// indexed-ELEMENT-field twin of `calleeIsUnionArmClosureMember` /
+// `calleeIsUnionArmCloArrayIndex`. The arm test is conservative: any ref-array arm
+// whose element spelling carries an arrow.
+export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Member {
+    const ix = P.nodes[unwrapParen(e.memObj)]
+    if ix is Index {
+      const arr = P.nodes[unwrapParen(ix.idxArr)]
+      if arr is Ident {
+        let un = unionNameOfIdent(arr.identName, fnIx)
+        if un != "" {
+          const ums = unionMemberSetOf(un)
+          if ums != "" { un = ums }
+          const atoms: string[] = []
+          splitUnionAtoms(un, atoms)
+          let i = 0
+          while i < atoms.length {
+            const a = atoms[i]
+            if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
+              if strContains(refArrElemName(a), "=>") { return true }
+            }
+            i = i + 1
+          }
+        }
+      }
     }
   }
   false
