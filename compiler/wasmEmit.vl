@@ -416,6 +416,7 @@ import {
   globalIndexOf,
   globalLetOf,
   globalNameIsNonConst,
+  identChainTyMapArmUnion,
   identNullableBoolPop,
   ifArmIsValue,
   ifExprRefKind,
@@ -5183,7 +5184,15 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       if nsk == "nulstrlist" {
         emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
         fbArrayGet(mkArrIdx) // 0xfb 0x0b string backing
-        wU8(212)             // 0xd4 ref.as_non_null (non-null string element)
+        // A NULLABLE-element inner list (`(string | null)[] | null`, narrowed): the
+        // element legitimately holds null — the read STAYS `(ref null $aTypeIdx)` (a
+        // `nulstr` the caller narrows with `!= null`). The unconditional recover was
+        // written for `string[] | null` (elements never null) and TRAPPED on a null
+        // element (fuzz-nightly plain leg, seed 154928295 d6). `exprNulStrArray`
+        // resolves the element discipline from the annotation (param / binding /
+        // rebind chain, outer `| null` peeled).
+        if exprNulStrArray(nd.idxArr, fnIx) { return 0 }
+        wU8(212) // 0xd4 ref.as_non_null (non-null string element)
         return 0
       }
       let nek: VKind = "f64"
@@ -10769,6 +10778,15 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
   const mNm = narrowedMapOf(e.identName)
   if mNm != "" {
     if unionNameOfIdent(e.identName, fnIx) != "" {
+      return emitMapUnionUnboxRead(body, e.identName, mNm, fnIx)
+    }
+    // The typed-IR net behind the syntactic miss (`unionMapArmIdent`'s discipline): a
+    // rebind off a narrowed nullable-closure VALUE call (`const t1 = t0(); const t2 =
+    // t1`) has no `unionNameOfIdent` render, but the checker typed the chain's ORIGIN
+    // as the map-arm union — the read holds the BOX and skipping the unbox stored the
+    // box ref into the map-struct frame: INVALID-WASM (fuzz-nightly plain leg, seed
+    // 258048495 d6, `(() => {[string]: boolean} | {w: i32} | null) | null`).
+    if identChainTyMapArmUnion(e.identName, fnIx, 4) {
       return emitMapUnionUnboxRead(body, e.identName, mNm, fnIx)
     }
   }
