@@ -345,6 +345,7 @@ import {
   scopeUnbind,
   setNarrowFromCond,
   shapeFieldElemName,
+  sioMemoReset,
   stmtIsPushKind,
   stmtIsTailValue,
   structIdxOfElemName,
@@ -3234,6 +3235,9 @@ function collectNestedFieldShapes(stmts: i32[]) {
 // expression / param / local PRODUCES the struct (a `(ref $0)`) rather than an i32.
 export function collectS(stmts: i32[]) {
   sDeclared = false
+  // The per-program literal-resolution memo keys node indices against THIS table —
+  // both are program-scoped, so it resets with the table.
+  sioMemoReset()
   sNames = []
   sFieldNames = []
   sFieldStart = []
@@ -3561,7 +3565,33 @@ function registerShapeFieldUnions(stmts: i32[], name: string) {
 // caller pushes its own `unNames`/`unVarStart` rows: a field union registered here
 // pushes its OWN variants, and interleaving would corrupt the caller's slice.
 function registerVariantArmFieldUnions(stmts: i32[], name: string) {
-  if !nameIsSingleShape(name) { return 0 }
+  if !nameIsSingleShape(name) {
+    // A DECLARED struct arm (`type S = {a: (C|D)[]}` inside `S | i64`): walk its
+    // FieldDefs for the same ref-list-element unions the inline spelling registers
+    // below — the declared twin would otherwise miss the element-union registration
+    // and draw the same raw-element invalid wasm from the decl leg.
+    let di = 0
+    while di < stmts.length {
+      const ds = P.nodes[stmts[di]]
+      if ds is TypeDecl {
+        if ds.tdName == name {
+          let dfi = 0
+          while dfi < ds.tdFields.length {
+            const dfn = P.nodes[ds.tdFields[dfi]]
+            if dfn is FieldDef {
+              if registerArmFieldElemUnion(stmts, tyNameOf(dfn.fdType)) < 0 {
+                return -1
+              }
+            }
+            dfi = dfi + 1
+          }
+          return 0
+        }
+      }
+      di = di + 1
+    }
+    return 0
+  }
   const inner = name.slice(1, name.length - 1)
   let depth = 0
   let start = 0
@@ -3588,11 +3618,32 @@ function registerVariantArmFieldUnions(stmts: i32[], name: string) {
         ) {
           if registerInlineUnion(stmts, ftxt) < 0 { return -1 }
         }
+        if registerArmFieldElemUnion(stmts, ftxt) < 0 { return -1 }
       }
       start = k + 1
     }
     k = k + 1
   }
+  0
+}
+
+// A REF-LIST field of a union's struct ARM whose ELEMENT is itself a 2+-member union
+// (`a: (f64|{w:i32})[]` inside `{a: (f64|{w:i32})[]} | i64`, any depth `(…)[][]`,
+// `| null`-wrapped): register the element union so its variants intern — the
+// FIELD-position twin of `uRegisterVariantBox`'s arm-position element recursion.
+// Un-registered, `emitUnionCoerce`'s ObjLit arm missed both variant resolutions for
+// the element literal and FELL THROUGH to a raw struct in the box-element array —
+// INVALID-WASM (local fuzz sweep2 multiobs, `{a: (f64|{w:i32}|{q:i64})[][], …} |
+// i64 | f64`). A closure field's trailing `[]` (a list-RETURNING closure) is skipped
+// by the arrow gate; `registerInlineUnion` self-peels the `(…)[]` / nested-array
+// wrappers and self-gates to a no-op on non-union elements.
+function registerArmFieldElemUnion(stmts: i32[], ftxt: string) {
+  if ftxt == "" { return 0 }
+  if annArrowAt(ftxt) >= 0 { return 0 }
+  let fb = ftxt
+  const fnb = nullablePartOf(fb)
+  if fnb != "" { fb = fnb }
+  if nameIsArray(fb) { return registerInlineUnion(stmts, fb) }
   0
 }
 
