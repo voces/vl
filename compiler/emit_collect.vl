@@ -707,6 +707,15 @@ export function collectCloSigs() {
           }
         }
       }
+      // A single-shape struct ARM whose FIELD is a closure / closure-array (possibly
+      // inside its own union, `z: (() => i64)[] | i32`): intern the field closures'
+      // sigs. The single-shape TypeRef pass (`internShapeFieldCloSigs`) NEVER runs on a
+      // UNION ARM (a union is not `nameIsSingleShape`), so a narrowed `t0.z is
+      // (()=>i64)[]` element call had NO interned element sig and fell to the i32-arity
+      // fallback — a "no interned signature" reject, or "expected i64 found i32" when a
+      // sibling arity-0 closure supplied the wrong fallback sig (fuzz F5gJXz declared
+      // leg, seed 530559367 case_00309).
+      if nameIsSingleShape(atoms[uj]) { internShapeFieldCloSigs(atoms[uj]) }
       uj = uj + 1
     }
     ui = ui + 1
@@ -823,8 +832,31 @@ function shapeHasCloField(nm: string) {
       const part = inner.slice(start, k)
       const ci = part.indexOf(":")
       if ci > 0 {
-        const fc = nameFieldCode(part.slice(ci + 1, part.length))
+        const ftxt = part.slice(ci + 1, part.length)
+        const fc = nameFieldCode(ftxt)
         if fc == 14 || fc == 22 { return true }
+        // A CLOSURE-ARRAY field (`z: (() => i64)[]`) or a UNION field with a closure /
+        // closure-array arm (`z: (() => i64)[] | i32`): the cell holds closure
+        // fat-pointers too, so a narrowed member-array call (`t0.z is (()=>i64)[]`,
+        // `t0.z[0]()`) `call_ref`s through it — flip the machinery on even when no lambda
+        // elsewhere does (fuzz F5gJXz declared seed 530559367 case_00309).
+        if nameIsClosureArray(ftxt) || nullClosureArrElem(ftxt) != "" {
+          return true
+        }
+        if unionMemberCount(ftxt) > 1 {
+          const shcAtoms: string[] = []
+          splitUnionAtoms(ftxt, shcAtoms)
+          let shc = 0
+          while shc < shcAtoms.length {
+            const shcA = shcAtoms[shc]
+            if annArrowAt(shcA) >= 0 { return true }
+            if nameIsNulClosure(shcA) { return true }
+            if nameIsClosureArray(shcA) || nullClosureArrElem(shcA) != "" {
+              return true
+            }
+            shc = shc + 1
+          }
+        }
       }
       start = k + 1
     }
@@ -881,6 +913,35 @@ function internShapeFieldCloSigs(nm: string) {
           if cloSigPosOfKey(ck) < 0 {
             cloSigKeys.push(ck)
             cloSigRepFn.push(-1)
+          }
+        }
+        // A UNION field (`z: (() => i64)[] | i32`, `f: (() => i64) | boolean`) whose arm
+        // is a CLOSURE or CLOSURE-ARRAY: the fc-14/22/array arms above see only the whole
+        // union-box field code, so the arm's `$fnsig` (`() => i64`) stays un-interned — a
+        // narrowed `t0.z is (()=>i64)[]` element call then `ref.cast`s to a sig that never
+        // exists (fuzz F5gJXz declared seed 530559367 case_00309). Split the union atoms
+        // and intern each closure / closure-array-element arm's sig (the field dual of the
+        // top-level `unMemberSet` closure-arm pass).
+        if ck == "" && unionMemberCount(ftxt) > 1 {
+          const uatoms: string[] = []
+          splitUnionAtoms(ftxt, uatoms)
+          let ua = 0
+          while ua < uatoms.length {
+            let uck = unionArmSigKey(uatoms[ua])
+            if uck == "" {
+              let uel = nullClosureArrElem(uatoms[ua])
+              if uel == "" && nameIsClosureArray(uatoms[ua]) {
+                uel = uatoms[ua].slice(0, uatoms[ua].length - 2)
+              }
+              if uel != "" { uck = unionArmSigKey(uel) }
+            }
+            if uck != "" {
+              if cloSigPosOfKey(uck) < 0 {
+                cloSigKeys.push(uck)
+                cloSigRepFn.push(-1)
+              }
+            }
+            ua = ua + 1
           }
         }
       }
@@ -4335,6 +4396,22 @@ export function collectFnValUse() {
       if fvSb == "" { fvSb = tyNameOf(i) }
       if nameIsSingleShape(fvSb) {
         if shapeHasCloField(fvSb) { fnValUsed = true }
+      } else if unionMemberCount(fvSb) > 1 {
+        // A UNION whose ARM is a single-shape struct carrying a closure / closure-array
+        // field (`{…, z: (() => i64)[] | i32} | {w: i32} | {q: i64}`): the arm's field
+        // cell is a closure fat-pointer whose narrowed member-array call `call_ref`s
+        // through it, so flip the machinery on even when the value is only ever a
+        // non-closure arm (no lambda elsewhere) — the union-arm sibling of the
+        // single-shape case above (fuzz F5gJXz declared seed 530559367 case_00309).
+        const fvAtoms: string[] = []
+        splitUnionAtoms(fvSb, fvAtoms)
+        let fva = 0
+        while fva < fvAtoms.length {
+          if nameIsSingleShape(fvAtoms[fva]) {
+            if shapeHasCloField(fvAtoms[fva]) { fnValUsed = true }
+          }
+          fva = fva + 1
+        }
       }
     }
     // An inferred CLOSURE-element array LITERAL (`const fs = [add, mul]`, no annotation): the
