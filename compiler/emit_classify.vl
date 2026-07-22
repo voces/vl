@@ -6880,6 +6880,14 @@ export function synthTypeRef(name: string, pos: i32) {
 export function nulScalarListKind(name: string): VKind | null {
   const b = nullablePartOf(name)
   if nameIsStringArray(b) { return "nulstrlist" }
+  // A nullable-ELEMENT string list under the outer null (`(string | null)[] | null`):
+  // the SAME `$mkListIdx` wrapper heap type as `string[]` (a string element is already
+  // a nullable ref at the wasm level — see `nameIsNulStrList`), so the nullable CELL is
+  // the same `(ref null $wrapper)` kind. Un-admitted, the param fell through the ladder
+  // to the i32 DEFAULT and the call site pushed the wrapper ref into an i32 param —
+  // INVALID-WASM (fuzz-nightly plain leg, seed 154928295 d6). The element-read
+  // discipline (`(ref null)` element, narrowed with `!= null`) is `exprNulStrArray`'s.
+  if nameIsNulStrList(b) { return "nulstrlist" }
   if nameIsF64Array(b) { return "nulf64list" }
   if nameIsI64Array(b) { return "nuli64list" }
   if nameIsF32Array(b) { return "nulf32list" }
@@ -10184,6 +10192,47 @@ function nodeTyUnionHasMapArm(exprIx: i32): boolean {
   false
 }
 
+// The typed-IR net for the narrowed MAP-arm UNBOX gate (`emitIdent`'s `narrowedMapOf` arm):
+// follow `name`'s rebind chain (`const t2 = t1; const t1 = t0()`) to its ORIGIN expression
+// and test whether the checker typed IT as a union carrying a MAP member (optionally under a
+// nullable the `!= null` narrow peeled). The narrowed OCCURRENCE records the NARROWED arm
+// type (TyMap), so the receiver node itself cannot carry the gate — but the origin (a
+// nullable-closure VALUE call `t0()`, the syntactic `unionNameOfIdent` miss) records the
+// union before any narrowing. A bare-map origin stays false — its value is never boxed.
+export function identChainTyMapArmUnion(
+  name: string,
+  fnIx: i32,
+  depth: i32,
+): boolean {
+  if depth <= 0 || fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  const li = parentLetOf(fn.fnBody, name)
+  if li < 0 { return false }
+  const d = P.nodes[li]
+  if !(d is LetDecl) { return false }
+  if d.letInit < 0 { return false }
+  const initIx = unwrapParen(d.letInit)
+  const init = P.nodes[initIx]
+  if init is Ident {
+    return identChainTyMapArmUnion(init.identName, fnIx, depth - 1)
+  }
+  const ty = nodeTyIxOf(initIx)
+  if ty < 0 { return false }
+  let uy = ty
+  const tw = T.tys[ty]
+  if tw is TyNullable { uy = tw.nInner }
+  const tn = T.tys[uy]
+  if tn is TyUnion {
+    let i = 0
+    while i < tn.uMembers.length {
+      if T.tys[tn.uMembers[i]] is TyMap { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
 // True if `exprIx` is a MEMBER read (`t[i].f`) whose object indexes an IDENT declared as a
 // union with a REF-ARRAY arm whose ELEMENT struct's field `.f` is a MAP (code 19) — the
 // struct-field-map receiver shape (`t[i].f[k] ?? d` after an `is S[]` narrow) the frame
@@ -13243,10 +13292,67 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
   if e is Paren { return exprNulStrArray(e.parInner, fnIx) }
   if e is Ident {
     const pt = paramTypeNode(fnIx, e.identName)
-    if pt >= 0 { return nameIsNulStrList(tyNameOf(pt)) }
+    if pt >= 0 {
+      const ptn = tyNameOf(pt)
+      if nameIsNulStrList(ptn) { return true }
+      // A `(string | null)[] | null` PARAM narrowed with `!= null` — peel the outer
+      // null: the narrowed value is the same nulstr-element list (the read must stay
+      // `(ref null)`; the plain-string arm's recover TRAPPED on a null element —
+      // fuzz-nightly plain leg, seed 154928295 d6).
+      const ptnul = nullablePartOf(ptn)
+      if ptnul != "" { return nameIsNulStrList(ptnul) }
+      return false
+    }
     // A union binding narrowed to the `(string | null)[]` arm reads unboxed as the
     // string list whose ELEMENT stays `(ref null)` — the same nullable read discipline.
     if nameIsNulStrList(narrowVariantFor(e.identName)) { return true }
+    // A LOCAL/GLOBAL binding (or a rebind chain `const t0 = g`) annotated
+    // `(string | null)[]` — or `(string | null)[] | null`, narrowed via `t0 != null`.
+    if identBindingNulStrList(e.identName, fnIx, 4) { return true }
+  }
+  false
+}
+
+// The `exprNulStrArray` binding resolver: the LetDecl for `name` (function-local via
+// `parentLetOf`, else a module-level `startStmts` global) whose ANNOTATION — directly or
+// under an outer `| null` — is a `(string | null)[]` list; an un-annotated rebind
+// (`const t0 = g`) follows its init chain (depth-capped).
+function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
+  if depth <= 0 { return false }
+  let li = -1
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl { li = parentLetOf(fn.fnBody, name) }
+  }
+  if li < 0 {
+    // A rebind chain ending at a PARAM of the enclosing function (`const t0 = p`).
+    const pt = paramTypeNode(fnIx, name)
+    if pt >= 0 {
+      const ptn = tyNameOf(pt)
+      if nameIsNulStrList(ptn) { return true }
+      const ptnul = nullablePartOf(ptn)
+      if ptnul != "" { return nameIsNulStrList(ptnul) }
+      return false
+    }
+    // A module GLOBAL (`const g: (string | null)[] | null = …`) — top-level LetDecls
+    // live in `globalStmts` (they emit as wasm globals, not start statements).
+    li = globalLetOf(name)
+  }
+  if li < 0 { return false }
+  const d = P.nodes[li]
+  if !(d is LetDecl) { return false }
+  if d.letType >= 0 {
+    const tn = tyNameOf(d.letType)
+    if nameIsNulStrList(tn) { return true }
+    const tnul = nullablePartOf(tn)
+    if tnul != "" { return nameIsNulStrList(tnul) }
+    return false
+  }
+  if d.letInit >= 0 {
+    const init = P.nodes[unwrapParen(d.letInit)]
+    if init is Ident {
+      return identBindingNulStrList(init.identName, fnIx, depth - 1)
+    }
   }
   false
 }
