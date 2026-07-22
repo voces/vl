@@ -185,6 +185,7 @@ import {
   fnUsesMapFilter,
   fnUsesMapKeys,
   fnUsesMapVals,
+  fnUsesVariantRebox,
   fnValUsed,
   gF32PrintIdx,
   gF64PrintIdx,
@@ -268,6 +269,7 @@ import {
   uFieldStart,
   uTags,
   uVarHeap,
+  variantReboxSlot,
 } from "./emit_state"
 import {
   emitFail,
@@ -1506,9 +1508,14 @@ function emitUnionBoxAs(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
 // a `(ref sHeapIdx[ssi])` payload fails (invalid wasm for an ident source, a runtime cast
 // TRAP for a call source that boxed the plain ref). Rebuild the variant struct by reading
 // each of its fields from the source (source & variant share the layout, so every field
-// read is store-compatible with the variant field), then tag + box. The source is re-
-// emitted ONCE PER FIELD, so the caller must ensure it is re-readable (`exprReReadable`)
-// or single-field (one emit).
+// read is store-compatible with the variant field), then tag + box.
+//
+// A RE-READABLE source (ident / paren / member / index — side-effect-free, same value each
+// read) or a SINGLE-FIELD variant re-emits the source once per field directly. A NON-re-
+// readable MULTI-FIELD source (a CALL, which cannot be re-evaluated per field) is evaluated
+// ONCE into the `variantReboxSlot` stash (a `(ref null struct)` local reserved by
+// `fnUsesVariantRebox`) and each field re-reads it via `ref.cast (ref $plainStruct)`. If the
+// scan somehow left the slot unreserved, floor loudly rather than emit invalid wasm.
 function emitStructExprAsVariantBox(
   body: i32[],
   exprIx: i32,
@@ -1516,9 +1523,21 @@ function emitStructExprAsVariantBox(
   ssi: i32,
   fnIx: i32,
 ) {
+  const cnt = uFieldCount[vi]
+  const reReadable = cnt == 1 || exprReReadable(unwrapParen(exprIx))
+  if !reReadable {
+    if !fnUsesVariantRebox {
+      return emitFail(
+        "emitProgram: a multi-field struct value from a call cannot be boxed into a variant-box union (rebox scratch slot unreserved)",
+      )
+    }
+    if emitExpr(body, exprIx, fnIx) < 0 {
+      return -1 // evaluate the source struct ref ONCE
+    }
+    fbLocalSet(variantReboxSlot) // stash `(ref $plainStruct)` as `(ref null struct)`
+  }
   fbI32Const(uTags[vi]) // 0x41 i32.const <tag>
   const start = uFieldStart[vi]
-  const cnt = uFieldCount[vi]
   let fj = 0
   while fj < cnt {
     const sfi = sFieldIndex(ssi, uFieldNames[start + fj])
@@ -1527,8 +1546,13 @@ function emitStructExprAsVariantBox(
         "emitProgram: struct value is missing a union-variant field",
       )
     }
-    if emitExpr(body, exprIx, fnIx) < 0 {
-      return -1 // push the source struct ref
+    if reReadable {
+      if emitExpr(body, exprIx, fnIx) < 0 {
+        return -1 // re-read the source struct ref
+      }
+    } else {
+      fbLocalGet(variantReboxSlot)
+      fbRefCast(sHeapIdx[ssi]) // `(ref null struct)` → `(ref $plainStruct)`
     }
     fbStructGet(sHeapIdx[ssi], sfi) // read this field (source & variant reps agree)
     fj = fj + 1
@@ -2246,20 +2270,15 @@ export function emitUnionCoerce(
   // as the plain struct (a DISTINCT heap type from the arm's variant struct — the twin the
   // `sHeapIdx`/`uVarHeap` tables never cross-dedup): the raw passthrough below emits the
   // plain ref where the box wants the variant struct (invalid wasm for an ident; a runtime
-  // cast trap once boxed). Re-box it against the matched arm (`emitStructExprAsVariantBox`).
-  // Gated on the heaps DIFFERING so an already-deduped shape keeps the byte-identical raw
-  // pass, and on re-readable / single-field so the per-field re-emit is sound.
+  // cast trap once boxed). Re-box it against the matched arm (`emitStructExprAsVariantBox`,
+  // which stashes a non-re-readable multi-field CALL source in the reserved scratch slot).
+  // Gated on the heaps DIFFERING so an already-deduped shape keeps the byte-identical raw pass.
   if unionName != "" && exprStruct(exprIx, fnIx) {
     const rbVi = unionArmVariantForStructExpr(unionName, exprIx, fnIx)
     if rbVi >= 0 {
       const rbSsi = structIndexOfExpr(exprIx, fnIx)
       if rbSsi >= 0 && sHeapIdx[rbSsi] != uVarHeap[rbVi] {
-        if uFieldCount[rbVi] == 1 || exprReReadable(unwrapParen(exprIx)) {
-          return emitStructExprAsVariantBox(body, exprIx, rbVi, rbSsi, fnIx)
-        }
-        return emitFail(
-          "emitProgram: a multi-field struct value from a call or complex expression cannot yet be boxed into a variant-box union (only idents and single-field results are supported)",
-        )
+        return emitStructExprAsVariantBox(body, exprIx, rbVi, rbSsi, fnIx)
       }
     }
   }
@@ -2560,17 +2579,13 @@ function emitUnionBoxArg(
       // from a `: {…}` function / bound to a struct local) is a layout TWIN of — but a
       // DISTINCT heap type from — the arm's variant struct. Boxing the raw plain ref
       // validates but the narrow's `ref.cast (ref uVarHeap[svi])` TRAPS at runtime.
-      // Rebuild it against the arm instead (source re-emitted once per field, so gate on
-      // re-readable / single-field; a genuine kind-8 variant local resolves `ssi < 0` and
-      // boxes raw as before).
+      // Rebuild it against the arm instead (`emitStructExprAsVariantBox` re-emits a re-
+      // readable/single-field source per field, or stashes a non-re-readable multi-field
+      // CALL in the reserved scratch slot; a genuine kind-8 variant local resolves `ssi < 0`
+      // and boxes raw as before).
       const bssi = structIndexOfExpr(exprIx, fnIx)
       if bssi >= 0 && sHeapIdx[bssi] != uVarHeap[svi] {
-        if uFieldCount[svi] == 1 || exprReReadable(unwrapParen(exprIx)) {
-          return emitStructExprAsVariantBox(body, exprIx, svi, bssi, fnIx)
-        }
-        return emitFail(
-          "emitProgram: a multi-field struct value from a call or complex expression cannot yet be boxed into a variant-box union (only idents and single-field results are supported)",
-        )
+        return emitStructExprAsVariantBox(body, exprIx, svi, bssi, fnIx)
       }
       fbI32Const(uTags[svi]) // 0x41 i32.const <variant tag> (program-global)
       if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
