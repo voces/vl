@@ -949,6 +949,17 @@ let bodyChecked: {[string]: boolean} = Map()
 // emitter SYNTHESIZES after checking (monomorphized instance bodies) fall past the end and
 // read back -1 via `nodeTyIxOf`, so a consumer falls back to its syntactic path there.
 let nodeTyIx: i32[] = []
+// CONTEXT-RESOLVED type sidecar (rep-twin-matcher phase 0a): parallel to `nodeTyIx`, this table
+// records — at the arena-pure coercion/ADOPTION sites — the DESTINATION (context) type a literal
+// node was widened INTO, which the emitter actually builds the rep for. `nodeTyIx` holds the
+// checker's NAIVE self-inferred type (`{f: boolean}` for a `{f: boolean}` literal), and it stays
+// untouched for its existing consumers; the emitter's rep/layer keying reads `nodeRepTyIxOf`, which
+// returns the recorded context type when present and falls back to `nodeTyIxOf` otherwise. Recorded
+// for the union-box / nullable-niche / i32→i64 adoptions where the literal's built rep is the
+// destination (a `{f: boolean}` return adopted to `{f: boolean | {w: i32}}`), recursively into
+// fields/elements exactly where the adoption recursion goes (`tyDeeperThan`-guarded for recursive
+// types). NOTHING consumes it in this phase — the recorder is byte-identical.
+let nodeRepTyIx: i32[] = []
 // NOMINAL-IDENTITY sidecar (C1): the `Ty`-arena indices of DECLARED STRUCT types (`cStructTyIxs`)
 // and of UNION-VARIANT MEMBER types (`cVariantMemberTyIxs`). A struct annotation's node reads
 // `nodeTyIsStruct` = "its recorded type IS a declared struct and NOT a variant member" — the emitter's
@@ -1273,6 +1284,12 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
           nodeTyIx[rn] = recTys[r]
           r = r + 1
         }
+        // REP SIDECAR (phase 0a): `nodeTyIx` above stamps the WIDENING FIELD VALUES, but the
+        // top-level return literal `u` keeps its naive self-inferred type — the emitter's
+        // `structIndexOfObjCtx` keys on the literal NODE, so record the destination struct
+        // there (recursing into fields) so the rep layer resolves the union-field / i64-field
+        // / nullable-niche shape the emitter builds. Byte-identical (nothing reads it yet).
+        recordRepTyAdopt(u, expInnerTy, 6)
       }
       return true
     }
@@ -1534,6 +1551,7 @@ export function initChecker() {
   inferLetNulBoolIx = []
   bodyChecked = Map()
   nodeTyIx = []
+  nodeRepTyIx = []
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
   inferQuiet = false
@@ -3675,6 +3693,11 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
             }
             i = i + 1
           }
+          // REP SIDECAR (phase 0a): a field-wise-adopted ObjLit builds the DESTINATION
+          // struct rep (a boxed union field, an i64/f32 field, an omitted nullable field);
+          // record it on the literal node so the emitter's row resolver keys the shape it
+          // builds, not the naive self-inference. Unconsumed → byte-identical.
+          if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
           return ok
         }
         // A struct literal flowing into a UNION adopts the FIRST struct arm it adapts
@@ -3694,6 +3717,9 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
                 if !inferQuiet {
                   while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
                   nodeTyIx[srcExpr] = members[mi]
+                  // REP SIDECAR (phase 0a): the struct literal builds the concrete ARM
+                  // struct's rep — record it (recursing into fields) for the row resolver.
+                  recordRepTyAdopt(srcExpr, members[mi], 6)
                 }
                 return true
               }
@@ -3751,6 +3777,11 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
         ) {
           if srcExpr < nodeTyIx.length { nodeTyIx[srcExpr] = dtix }
         }
+        // REP SIDECAR (phase 0a): a literal array adopted element-wise (a struct-element
+        // list `{f: boolean}[]` widened to `{f: boolean | {w: i32}}[]`, an i64/f32 element)
+        // builds the destination element rep — recurse into the elements so each element
+        // ObjLit resolves the shape the emitter builds. Unconsumed → byte-identical.
+        if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
         return ok
       }
       // An array literal flowing into a UNION adopts the FIRST array arm it adapts into
@@ -3772,6 +3803,9 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
               if !inferQuiet {
                 while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
                 nodeTyIx[srcExpr] = members[mi]
+                // REP SIDECAR (phase 0a): record the concrete array ARM (recursing into
+                // elements) so the row resolver keys the arm the checker picked.
+                recordRepTyAdopt(srcExpr, members[mi], 6)
               }
               return true
             }
@@ -10481,6 +10515,146 @@ export function nodeTyIxOf(ix: i32) {
     if ix < nodeTyIx.length { return nodeTyIx[ix] }
   }
   -1
+}
+// The CONTEXT-RESOLVED companion of `nodeTyIxOf` (rep-twin-matcher phase 0a). Returns the
+// destination type recorded by `recordRepTyAdopt` at an adoption site when present, else the
+// naive `nodeTyIxOf`. The emitter's rep/layer resolvers key on THIS so a widened literal's row
+// resolves to the shape the emitter actually builds. No consumer yet (phase 0a is byte-identical).
+export function nodeRepTyIxOf(ix: i32) {
+  if ix >= 0 {
+    if ix < nodeRepTyIx.length {
+      const r = nodeRepTyIx[ix]
+      if r >= 0 { return r }
+    }
+  }
+  nodeTyIxOf(ix)
+}
+// Stamp the CONTEXT (destination) type `dstTy` onto a literal source `srcExpr` (and, recursively,
+// onto its ObjLit fields / ArrayLit elements against the corresponding destination sub-types) in
+// the `nodeRepTyIx` sidecar. Called at the arena-pure ADOPTION sites (an ObjLit/ArrayLit widened
+// into a union-field / nullable-niche / i64 destination): the literal's OWN checked type is its
+// naive self-inference, but the emitter builds the rep for the destination, so the sidecar carries
+// it. PURE — reads only `T.tys`/`P.nodes`, writes only `nodeRepTyIx`, so it cannot perturb any
+// existing checker/emitter behavior. Nullable wrappers are peeled (the emitter's struct row is the
+// inner shape). Recursive destinations are declined (`tyDeeperThan(…,16)`, mirroring
+// `recordNullHoleObjAdopt`): a recursive re-stamp would send the emitter's back-edge-free canon
+// render into unbounded recursion. Returns 1 when this node was stamped.
+function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
+  if inferQuiet || srcExpr < 0 || dstTy < 0 || depth <= 0 { return 0 }
+  if tyDeeperThan(dstTy, 16) { return 0 }
+  let dtix = dstTy
+  let peel = true
+  while peel {
+    const dN = T.tys[dtix]
+    if dN is TyNullable {
+      if dN.nInner < 0 { return 0 }
+      dtix = dN.nInner
+    } else {
+      peel = false
+    }
+  }
+  const d = T.tys[dtix]
+  const e = P.nodes[srcExpr]
+  if e is Paren {
+    recordRepTyAdopt(e.parInner, dtix, depth)
+    while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
+    nodeRepTyIx[srcExpr] = dtix
+    return 1
+  }
+  if e is ObjLit {
+    if d is TyObj {
+      const dfn = d.objFieldNames
+      const dft = d.objFieldTypes
+      let k = 0
+      while k < e.objFields.length {
+        const f = P.nodes[e.objFields[k]]
+        if f is FieldInit {
+          let j = 0
+          while j < dfn.length {
+            if dfn[j] == f.fiName {
+              recordRepTyAdopt(f.fiValue, dft[j], depth - 1)
+            }
+            j = j + 1
+          }
+        }
+        k = k + 1
+      }
+      while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
+      nodeRepTyIx[srcExpr] = dtix
+      return 1
+    }
+    // A nested ObjLit whose destination is a UNION (a struct arm boxed into a union
+    // FIELD): pick the first struct member whose field-name set corresponds and recurse
+    // against that concrete arm — the arm is the shape the emitter builds. A best-effort
+    // structural match (no `assignableExpr` re-entry, keeping the recorder side-effect free).
+    if d is TyUnion {
+      const members = d.uMembers
+      let mi = 0
+      while mi < members.length {
+        const mt = T.tys[members[mi]]
+        if mt is TyObj {
+          if objLitFieldsCorrespond(e, mt) {
+            return recordRepTyAdopt(srcExpr, members[mi], depth)
+          }
+        }
+        mi = mi + 1
+      }
+      return 0
+    }
+    return 0
+  }
+  if e is ArrayLit {
+    if d is TyArray {
+      let i = 0
+      while i < e.arrElems.length {
+        recordRepTyAdopt(e.arrElems[i], d.aElem, depth - 1)
+        i = i + 1
+      }
+      while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
+      nodeRepTyIx[srcExpr] = dtix
+      return 1
+    }
+    // An array literal boxed into a union arm — recurse against the first array member.
+    if d is TyUnion {
+      const members = d.uMembers
+      let mi = 0
+      while mi < members.length {
+        const mt = T.tys[members[mi]]
+        if mt is TyArray {
+          return recordRepTyAdopt(srcExpr, members[mi], depth)
+        }
+        mi = mi + 1
+      }
+      return 0
+    }
+    return 0
+  }
+  0
+}
+// True when the ObjLit `e`'s field-name set corresponds one-to-one with the struct type `mt`'s
+// declared field names (order-independent). Structural fieldset check for `recordRepTyAdopt`'s
+// union-arm pick — the recorder's own light dual of `objLitWidenFields`' correspondence, without
+// the assignability re-entry.
+function objLitFieldsCorrespond(e: ObjLit, mt: TyObj): boolean {
+  const dfn = mt.objFieldNames
+  if e.objFields.length != dfn.length { return false }
+  let k = 0
+  while k < e.objFields.length {
+    const f = P.nodes[e.objFields[k]]
+    if f is FieldInit {
+      let found = false
+      let j = 0
+      while j < dfn.length {
+        if dfn[j] == f.fiName { found = true }
+        j = j + 1
+      }
+      if !found { return false }
+    } else {
+      return false
+    }
+    k = k + 1
+  }
+  true
 }
 // EMIT-TIME typed-IR coverage (C1 endgame): the monomorphizer CLONES a generic instance's body,
 // creating fresh annotation nodes whose type-param names are substituted to CONCRETE names — these
