@@ -446,6 +446,37 @@ function unresolvedHole(ty: i32) {
   false
 }
 
+// Does `ty` reach an unresolved empty-collection hole (an empty `[]` element or a bare
+// `Map()`/`Set()` key/value) THROUGH struct fields / arrays / maps / nullable wrappers —
+// the deep analogue of `unresolvedHole`. The rep-twin phase-0a2 gate: an object/array
+// LITERAL carrying such a hole is plainly `assignable` to a concrete destination (an empty
+// fits any element type), so `assignableExpr`'s plain-assignable short-circuit accepts it
+// BEFORE the ObjLit/ArrayLit adoption block runs — the block that records the destination
+// rep on the `nodeRepTyIx` sidecar. This predicate re-routes those literals through the
+// recorder. Depth-bounded (recursive struct/array types are cyclic in the arena).
+function tyReachesEmptyHole(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 { return true }
+    return tyReachesEmptyHole(t.aElem, depth - 1)
+  }
+  if t is TyMap {
+    if t.mKey < 0 || t.mVal < 0 { return true }
+    return tyReachesEmptyHole(t.mVal, depth - 1)
+  }
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length {
+      if tyReachesEmptyHole(t.objFieldTypes[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyNullable { return tyReachesEmptyHole(t.nInner, depth - 1) }
+  false
+}
+
 // USAGE-DRIVEN INFERENCE through a TYPED context: when an empty `[]` / bare
 // `Map()`/`Set()` (open holes) flows into a slot with a concrete shape — a `T[]`
 // param at a call site, an annotated assignment (`const ys: i32[] = zs`), or a
@@ -3618,6 +3649,16 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // array element too, not just this expression-level entry.)
   recordNicheNulElemArrayLit(srcExpr, dstTy)
   recordNullHoleObjAdopt(srcExpr, dstTy, 6)
+  // REP SIDECAR (phase 0a2): an ObjLit/ArrayLit whose source type reaches an unresolved
+  // empty-collection hole (`{nodes: []}`, `{m: Map()}`) is plainly `assignable` to its
+  // concrete destination — the empty fits any element type — so the short-circuit below
+  // returns BEFORE the literal-aware adoption block (which records the destination rep).
+  // Record the destination struct/array here so the emitter's row resolver keys the
+  // element-resolved shape (`{nodes: i32[]}`) rather than the naive hole (`{nodes: ![]}`).
+  // PURE (writes only `nodeRepTyIx`) → byte-identical this phase.
+  if !inferQuiet && srcExpr >= 0 && tyReachesEmptyHole(srcTy, 8) {
+    recordRepTyAdopt(srcExpr, dstTy, 6)
+  }
   if assignable(srcTy, dstTy) { return true }
   // A float literal re-encodes EXACTLY at f32, so it flows into any destination whose f32
   // position it fits: a bare `f32`, a nullable `f32?` (a map value / niche), or an f32 MEMBER
