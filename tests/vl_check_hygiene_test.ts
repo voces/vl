@@ -111,15 +111,19 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      const n = 300; // past the 256 cap
-      for (let i = 0; i < n; i++) {
+      // Just past the 256 cap — the LIMIT is what's under test, so the chain
+      // only needs to exceed it (the anchor assertion below still pins the
+      // diagnostic to f256.vl, the first import past the cap). Writes go out
+      // in parallel; both trims keep this test off the slow-cases list.
+      const n = 258;
+      await Promise.all(Array.from({ length: n }, (_, i) => {
         const src = i === n - 1
           ? `export const v${i} = 0\n`
           : `import { v${i + 1} } from "./f${i + 1}"\nexport const v${i} = v${
             i + 1
           } + 1\n`;
-        await Deno.writeTextFile(`${dir}/f${i}.vl`, src);
-      }
+        return Deno.writeTextFile(`${dir}/f${i}.vl`, src);
+      }));
       const { code, err } = await run(["check", `${dir}/f0.vl`]);
       if (code !== 1) throw new Error(`expected exit 1, got ${code}: ${err}`);
       if (!err.includes("Import chain exceeds the maximum depth")) {
