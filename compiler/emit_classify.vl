@@ -4403,6 +4403,18 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
       if !isVal && calleeIsUnionElemFieldClosure(n.callFn, fnIx) {
         isVal = true
       }
+      // The typed-IR net for ANY callee spelling the syntactic classifiers above
+      // miss (`t1[0][0]()` through a narrowed 2-D closure-array arm — INVALID-WASM,
+      // fuzz sweep2 multiobs seed 655720167 case_00179): the checker records every
+      // callee's own checked type, so one that types as a closure reserves the
+      // scratch regardless of the callee's shape or depth. (An over-reservation is
+      // a harmless spare local.)
+      if !isVal {
+        const cty = nodeTyIxOf(n.callFn)
+        if cty >= 0 {
+          if T.tys[cty] is TyFunc { isVal = true }
+        }
+      }
     }
     if isVal { return true }
     if blockHasCallRef(n.callFn, fnIx) { return true }
@@ -10361,6 +10373,50 @@ export function identChainTyMapArmUnion(
   false
 }
 
+// The value-atom dual of `identChainTyMapArmUnion`: follow `name`'s rebind chain
+// (`const t1 = t0`) to its ORIGIN expression and test whether the checker typed IT as a
+// BOXED value union — a `TyUnion` (optionally under a nullable the `!= null` narrow
+// peeled) with ≥2 members, at least one non-literal (an ALL-literal union reps as the
+// i32 atom / bare string ref, never the box). The narrowed-atom unbox gate
+// (`emitIdent`'s `narrowedValueAtomOf` arm) consults this where the syntactic
+// `unionNameOfIdent` cannot render the binding's union (`const t0 = v[0](1)` — an
+// Index-callee closure call): the binding local holds the BOX, and skipping the unbox
+// pushed the box ref where the raw narrowed atom was expected — invalid wasm.
+export function identChainTyBoxedUnion(
+  name: string,
+  fnIx: i32,
+  depth: i32,
+): boolean {
+  if depth <= 0 || fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  const li = parentLetOf(fn.fnBody, name)
+  if li < 0 { return false }
+  const d = P.nodes[li]
+  if !(d is LetDecl) { return false }
+  if d.letInit < 0 { return false }
+  const initIx = unwrapParen(d.letInit)
+  const init = P.nodes[initIx]
+  if init is Ident {
+    return identChainTyBoxedUnion(init.identName, fnIx, depth - 1)
+  }
+  const ty = nodeTyIxOf(initIx)
+  if ty < 0 { return false }
+  let uy = ty
+  const tw = T.tys[ty]
+  if tw is TyNullable { uy = tw.nInner }
+  const tn = T.tys[uy]
+  if tn is TyUnion {
+    if tn.uMembers.length < 2 { return false }
+    let i = 0
+    while i < tn.uMembers.length {
+      if !(T.tys[tn.uMembers[i]] is TyLit) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
 // True if `exprIx` is a MEMBER read (`t[i].f`) whose object indexes an IDENT declared as a
 // union with a REF-ARRAY arm whose ELEMENT struct's field `.f` is a MAP (code 19) — the
 // struct-field-map receiver shape (`t[i].f[k] ?? d` after an `is S[]` narrow) the frame
@@ -14146,6 +14202,12 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
     // A map read through a union STRUCT arm's LIST-OF-MAPS field (`t.f[0][k]` after an
     // `is {f: {[string]:V}[]}` narrow): likewise invisible — walk the arm's field path.
     if unionStructArmMapListElemIndex(e.idxArr, fnIx) { return true }
+    // The typed-IR net for ANY receiver spelling the syntactic classifiers above miss
+    // (`t[i][j][k]` through a 2-D map-array arm, `t.f[k]` on a narrowed union-box
+    // binding): the checker records every receiver's own checked type, so one that
+    // types as a map — or a union carrying one — reserves the frame regardless of the
+    // receiver's shape or depth. (An over-reservation is a harmless spare.)
+    if nodeTyUnionHasMapArm(e.idxArr) { return true }
     if exprHasMapOp(e.idxArr, fnIx) { return true }
     return exprHasMapOp(e.idxIndex, fnIx)
   }
@@ -14160,6 +14222,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
         if unionStructArmMapFieldMember(lhs.idxArr, fnIx) { return true }
         if unionMapArrayElemIndex(lhs.idxArr, fnIx) { return true }
         if unionStructArmMapListElemIndex(lhs.idxArr, fnIx) { return true }
+        if nodeTyUnionHasMapArm(lhs.idxArr) { return true }
       }
       if lhs is Call {
         const lcallee = P.nodes[lhs.callFn]
@@ -14180,6 +14243,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
         if unionStructArmMapFieldMember(target.idxArr, fnIx) { return true }
         if unionMapArrayElemIndex(target.idxArr, fnIx) { return true }
         if unionStructArmMapListElemIndex(target.idxArr, fnIx) { return true }
+        if nodeTyUnionHasMapArm(target.idxArr) { return true }
       }
     }
     if exprHasMapOp(e.binLeft, fnIx) { return true }
@@ -14195,14 +14259,17 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
         if exprMap(callee.memObj, fnIx) { return true }
         if unionMapArmIdent(callee.memObj, fnIx) { return true }
         if unionMapArrayElemIndex(callee.memObj, fnIx) { return true }
+        if nodeTyUnionHasMapArm(callee.memObj) { return true }
       }
       if callee.memProp == "delete" {
         if exprMap(callee.memObj, fnIx) { return true }
         if unionMapArmIdent(callee.memObj, fnIx) { return true }
+        if nodeTyUnionHasMapArm(callee.memObj) { return true }
       }
       if callee.memProp == "keys" || callee.memProp == "values" {
         if exprMap(callee.memObj, fnIx) { return true }
         if unionMapArmIdent(callee.memObj, fnIx) { return true }
+        if nodeTyUnionHasMapArm(callee.memObj) { return true }
       }
     }
     if exprHasMapOp(e.callFn, fnIx) { return true }
