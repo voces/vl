@@ -8035,11 +8035,20 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // resolve. Takes precedence over `recordable` (which would else record the spaced `anm`,
       // an un-interned key). Empty unless the inferred struct genuinely carries a boxed field.
       const sfbNm = structFieldBoxRetName(inferred)
+      // A MAP-carrying STRUCT return (`{a: string, f: {f: {[string]: {f: i64}}}, z: f32}`):
+      // recorded under the CANONICAL emit name too — the spaced `recordable` render never
+      // pins, and the un-pinned body literal's nested `{f: h0}` resolved the map's own
+      // value struct `{f: i64}` by field-name set, minting a wrong-layout outer twin
+      // (INVALID-WASM; fuzz-nightly seed 184510897 d6). AFTER `sfbNm` (a boxed-field
+      // struct keeps its established pin).
+      let smfNm = ""
+      if sfbNm == "" { smfNm = structMapFieldRetName(inferred) }
       // A single STRUCT-shape (`{meow: i32}`) inferred return is recorded too — a lambda
       // that COLLAPSES to one union variant (`(a) => if a is Cat { a } else { catShape }`)
       // types as that variant's shape; the emitter resolves it to the concrete variant
       // (`variantIndexOfTypeName`) so a `.map` result is the variant ref list, not the box.
       const recordable = sfbNm == "" &&
+        smfNm == "" &&
         (isClassifiableRetName(anm) ||
         isObjShapeName(anm) ||
         isScalarListRetName(anm))
@@ -8051,6 +8060,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       let unm = ""
       if !recordable {
         unm = sfbNm
+        if unm == "" { unm = smfNm }
         if unm == "" { unm = valueUnionRetName(inferred) }
         if unm == "" { unm = structUnionRetName(inferred, gRootStmts) }
         // A NULLABLE-ref contextual return (`P | null`, `string | null`) — recorded under the same
@@ -8933,6 +8943,46 @@ function structFieldBoxRetName(er: i32) {
   }
   if !hasBox { return "" }
   tyToEmitName(er)
+}
+
+// The CANONICAL emitter NAME (`{a:string,f:{f:{[string]:{f:i64}}},z:f32}`) for an inferred
+// return `er` IF it is a bare STRUCT carrying a MAP field anywhere in its (recursively
+// nested-struct) field tree, else "". A map-carrying struct a lambda BODY literal builds
+// has NO field-set anchor for its nested literals — the un-pinned inner `{f: h0}` resolved
+// by first-field-name-set match to the map's own VALUE struct `{f: i64}` (interned first),
+// the map ref took the i64 field widen, and the outer literal minted a WRONG-layout twin
+// row beside the annotation's — INVALID-WASM (`i64.extend_i32_s` on a map ref; fuzz-nightly
+// run 29893544685, seed 184510897 d6, `() => {a: string, f: {f: {[string]: {f: i64}}},
+// z: f32}`). `synthRetAnnots` pins the lambda's `fnRet` to this canonical name so the body
+// ObjLit threads the SAME per-field struct indices the annotated named-function spelling
+// (which lowers already) seeds. Canonical (`tyToEmitName`), spaceless — the
+// `structIndexByName` / `internShapeDeep` key. The map-field sibling of
+// `structFieldBoxRetName`; checked AFTER it in the recorder (a boxed-field struct keeps
+// its own pin).
+function structMapFieldRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if !(t is TyObj) { return "" }
+  if !tyObjHasMapField(er) { return "" }
+  tyToEmitName(er)
+}
+
+// True if struct-arena entry `er` (a `TyObj`) carries a `TyMap` field directly or inside a
+// nested `TyObj` field (any depth). The `structMapFieldRetName` gate.
+function tyObjHasMapField(er: i32) {
+  const t = T.tys[er]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length {
+      const ft = T.tys[t.objFieldTypes[i]]
+      if ft is TyMap { return true }
+      if ft is TyObj {
+        if tyObjHasMapField(t.objFieldTypes[i]) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
 }
 
 // The CANONICAL emitter NAME (`{f:{f:f64}|boolean}[]`) for an inferred return `er` IF it is a
