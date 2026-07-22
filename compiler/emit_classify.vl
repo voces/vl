@@ -3958,11 +3958,52 @@ function sScanLim() {
 // struct an `{ … }` literal constructs (the struct analogue of `objVariantName`).
 export function structIndexOfObj(objIx: i32) { structIndexOfObjCtx(objIx, -1) }
 
+// PERF MEMO (the deep-composite compile wall, `resolveAnnot`-memo's emitter sibling):
+// `structIndexOfObjCtx` re-enters per candidate row × per parent literal query
+// (`anonFieldCode`'s nested-object arm recurses into child literals), so a deeply
+// nested literal tree re-resolved the SAME ObjLit millions of times — probed at
+// 1.67M calls / 74.8M row iterations / 5M `shapeFieldTypeCompat` name-parses over a
+// 51-row table (the ~140s wall; fuzz sweep keep_167929495). A node's HIT is stable
+// (rows only APPEND, so an existing first-match stays the first match); a MISS (-1)
+// is stamped with the row count and recomputed only after the table GROWS. Keyed by
+// node index + the querying `fnIx` (the f64 axis reads per-instance expression
+// context); reset per program in `collectS` (`sioMemoReset` — node indices and the
+// row table are both program-scoped).
+let sioMemoIx: i32[] = []
+let sioMemoFn: i32[] = []
+let sioMemoVer: i32[] = []
+export function sioMemoReset() {
+  sioMemoIx = []
+  sioMemoFn = []
+  sioMemoVer = []
+}
+
+export function structIndexOfObjCtx(objIx: i32, fnIx: i32) {
+  while sioMemoIx.length <= objIx {
+    sioMemoIx.push(0 - 2)
+    sioMemoFn.push(0 - 2)
+    sioMemoVer.push(0 - 1)
+  }
+  if sioMemoIx[objIx] != 0 - 2 && sioMemoFn[objIx] == fnIx {
+    // A hit requires the row count unchanged for EVERY cached result (not just
+    // misses): appends can turn a single name-match into a 2+-match, routing the
+    // AMBIGUITY arm to a typed-IR resolution the first computation never took.
+    // The table only grows during collect; the emit-phase recursion (where the
+    // exponential lived) queries a frozen table, so the memo still collapses it.
+    if sioMemoVer[objIx] == sNames.length { return sioMemoIx[objIx] }
+  }
+  const r = structIndexOfObjCtxGo(objIx, fnIx)
+  sioMemoIx[objIx] = r
+  sioMemoFn[objIx] = fnIx
+  sioMemoVer[objIx] = sNames.length
+  r
+}
+
 // The context-aware variant: `fnIx` (when >= 0) classifies field VALUES through
 // the expression family too, so a monomorphized instance's SHARED tail literal
 // (`{ x: self.x + b.x }`) resolves per instance — f64 against the f64-param
 // instance, i32 against the i32 one.
-export function structIndexOfObjCtx(objIx: i32, fnIx: i32) {
+function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
   const o = P.nodes[objIx]
   if o is ObjLit {
     const nf = o.objFields.length
