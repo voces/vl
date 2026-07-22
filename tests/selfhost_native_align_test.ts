@@ -165,6 +165,24 @@ const batchResults = (): Promise<Map<string, BatchResult>> =>
     return results;
   })();
 
+// One-time fixture, registered FIRST: build the batch here so its cost (the
+// dominant per-suite cost — process spawns + wasmtime engine builds + running
+// every RUN/TRAP case through the seed) is attributed to THIS named step
+// instead of silently landing on whichever per-case test happens to run first
+// (it used to make `arith/literal-add.vl` look ~17s slow in CI). The batch
+// stays lazy, so a filtered run that never touches RUN/TRAP cases still never
+// pays for it; per-case assertions are untouched.
+Deno.test({
+  name: "native-align setup: vl run --batch waves (one-time fixture; whole-batch cost lands here)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const results = await batchResults();
+    if (results.size === 0) {
+      throw new Error("vl run --batch produced no per-case results");
+    }
+  },
+});
+
 // ── RUN_CASES: `vl run` stdout EQUALS @log, and `vl check` compiles clean ──
 const RUN_CASES = [
   "arith/literal-add.vl",
