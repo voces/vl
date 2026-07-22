@@ -3654,6 +3654,27 @@ function registerVariantArmFieldUnions(stmts: i32[], name: string) {
         if annArrowAt(ftxt) < 0 && nameIsSingleShape(ftxt) {
           if registerInlineUnion(stmts, ftxt) < 0 { return -1 }
         }
+        // A bare-MAP field with a union VALUE (`a: {[string]: f32 | {w:i32} | string}`)
+        // carries its value union one level down — descend through `registerInlineUnion`'s
+        // bare-map arm (→ `mapValNameOf` → the value union's box), exactly as the
+        // single-shape spelling above descends its field unions and as a PLAIN annotation
+        // (`registerShapeFieldUnions`, which calls `registerInlineUnion` on every field)
+        // would. Without the descent the value union's scalar arm never marks its value
+        // box (`vbF32Used` stays false) and BOTH the `?? 15.5` default's boxing and the
+        // narrowed `is f32` read minted the box at the DEFAULT type index (the i32 box) —
+        // INVALID-WASM (fuzz post-#1001 sweep multiobs `(i32,i32,i32) => {a: {[string]:
+        // f32|{w:i32}|string}, …} | i32` + branching `{f: {[string]: f32|string|{q:i64}}}
+        // | f64`). The variant-arm-field twin of the #991 map-atom-value walk.
+        if (
+          annArrowAt(ftxt) < 0 &&
+          nameIsMap(ftxt) &&
+          !nameIsMapMemberUnion(ftxt)
+        ) {
+          const fmv = mapValNameOf(ftxt)
+          if fmv != "" {
+            if registerInlineUnion(stmts, fmv) < 0 { return -1 }
+          }
+        }
         if registerArmFieldElemUnion(stmts, ftxt) < 0 { return -1 }
       }
       start = k + 1
@@ -3829,6 +3850,18 @@ function registerInlineUnion(stmts: i32[], name: string) {
       // so the pin arm fires. An arm `isVariantBoxUnion` still rejects stays LOUD.
       if isVariantBoxUnion(stmts, ncRes) {
         return registerInlineUnion(stmts, ncRes)
+      }
+      // A BARE-MAP result (`(() => {[string]: i32 | string | {q: i64}}) | null`):
+      // the map itself needs no registration, but its VALUE union does — the gate
+      // above sees neither a value union nor a map-MEMBER union, so the value
+      // union's box/variant types were never minted and the narrowed `t0()[k] ?? d`
+      // read referenced the DEFAULT type index ("expected struct type at index 0,
+      // found (array (mut i32))") — INVALID-WASM (fuzz post-#996 sweep branching
+      // leg, seed 499060527 case_00095). The nul-closure sibling of the bare-map
+      // value recursion below and the #991 map-atom walk.
+      if nameIsMap(ncRes) && !nameIsMapMemberUnion(ncRes) {
+        const ncMv = mapValNameOf(ncRes)
+        if ncMv != "" { return registerInlineUnion(stmts, ncMv) }
       }
     }
   }

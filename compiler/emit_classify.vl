@@ -2372,58 +2372,22 @@ export function refPushScratchBaseFor(slot: i32) {
 }
 
 // Resolve a value type-NAME to a struct TABLE index: a declared struct by name, or
-// an inline object type `{a:T,b:U}` matched by FIELD-NAME SET against the table
-// (anonymous shapes are interned from literals by `collectAnonShapes` under `#anonN`
-// names, so the annotation text never matches by name — the field set is the key,
-// exactly how `structIndexOfObj` binds literals). -1 when nothing matches.
-function structIndexByValName(name: string) {
-  const si = structIndexByName(name)
-  if si >= 0 { return si }
-  if name.length < 2 { return -1 }
-  if name[0] != '{' { return -1 }
-  if name[1] == '[' { return -1 }
-  // Parse the field NAMES out of `{a:T,b:U}`: each field name runs from a `{`/`,`
-  // at depth 1 to its `:`. Nested `{}`/`[]` in field types are depth-tracked so
-  // their commas/colons don't split.
-  const fnames: string[] = []
-  let depth = 0
-  let i = 0
-  let start = -1
-  while i < name.length {
-    const c = name[i]
-    if c == '{' || c == '[' {
-      depth = depth + 1
-      if depth == 1 { start = i + 1 }
-    } else if c == '}' || c == ']' {
-      depth = depth - 1
-    } else if c == ',' {
-      if depth == 1 { start = i + 1 }
-    } else if c == ':' {
-      if depth == 1 {
-        if start >= 0 { fnames.push(name.slice(start, i)) }
-        start = -1
-      }
-    }
-    i = i + 1
-  }
-  if fnames.length == 0 { return -1 }
-  // Match by exact field-name set (count + every name present).
-  let s = 0
-  const sLim0 = sScanLim()
-  while s < sLim0 {
-    if sFieldCount[s] == fnames.length {
-      let ok = true
-      let k = 0
-      while k < fnames.length {
-        if sFieldIndex(s, fnames[k]) < 0 { ok = false }
-        k = k + 1
-      }
-      if ok { return s }
-    }
-    s = s + 1
-  }
-  -1
-}
+// an inline object type `{a:T,b:U}` matched against the table (anonymous shapes are
+// interned from literals by `collectAnonShapes` under `#anonN` names, so the
+// annotation text never matches by name — the field set is the key, exactly how
+// `structIndexOfObj` binds literals). -1 when nothing matches.
+//
+// The match is FIELD-TYPE-GUARDED (`structIndexOfTypeName`, the whole-span shape
+// resolver), not field-NAME-only: a map's value struct (`{a:f64,f:f64,z:string}`)
+// coexisting with a same-fieldset OUTER literal
+// (`{a:string|null,f:()=>i64,z:(…)=>…}`) shares the field-name set {a,f,z} but
+// differs in every field's TYPE. The old name-only scan keyed the FIRST {a,f,z}
+// row (the outer struct, interned first), minting the map's vals ref-list over the
+// wrong struct and building the `??`-default value literal with the wrong layout —
+// invalid wasm at the value store (fuzz multiobs seed 301346386 case_00047).
+// `shapeFieldTypeCompat` rejects only PROVEN mismatches, so the unambiguous
+// single-candidate path stays byte-identical.
+function structIndexByValName(name: string) { structIndexOfTypeName(name) }
 
 // The mv value KIND of a map VALUE type-name — the ONE enumeration of which value types a
 // string-keyed map supports (`mvValKind` vocabulary): `-1` a mono i32 value (i32 / boolean /
@@ -7514,7 +7478,12 @@ export function globalCellKind(letIx: i32): VKind {
       // claim the cell). `S | null` / `boolean | null` never register as union names (they
       // keep their niche kinds above).
       if letIsLitUnion(letIx) { return "i32" }
-      if letIsLitUnion(letIx) { return "i32" }
+      // A `K | null` NICHE global (`const g: K0 | null = "404"`) — the i32 atom cell
+      // with the `-1` null sentinel, the nullable twin of the litunion arm above.
+      // BEFORE `letIsString`, whose init fallback claimed a member-literal init as a
+      // STRING-ref cell while the read side classified the niche i32 — INVALID-WASM
+      // (fuzz post-#1000 sweep plain leg, `K0 | null` p3r).
+      if nodeTyIsNulLitUnion(d.letType) { return "i32" }
       if letIsUnion(letIx, -1) { return "union" }
       if letIsStringArray(letIx, -1) { return "strlist" }
       if letIsRefArray(letIx, -1) { return "reflist" }
