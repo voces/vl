@@ -12840,6 +12840,74 @@ export function unionArmVariantForObj(unionSet: string, objIx: i32): i32 {
   -1
 }
 
+// True if the PLAIN struct at table index `ssi` has the SAME field layout (name set,
+// count, per-field type code) as the union-variant arm `vi` — the struct-index dual of
+// `objMatchesVariantIdx` (which matches an object LITERAL). Used to recognize a struct-
+// typed value (an ident / call result — built as the plain struct, a DISTINCT heap type
+// from the arm's variant struct) as a member of the union so it can be re-boxed.
+function structIdxMatchesVariantIdx(ssi: i32, vi: i32): boolean {
+  if ssi < 0 { return false }
+  const cnt = uFieldCount[vi]
+  if cnt != sFieldCount[ssi] { return false }
+  const start = uFieldStart[vi]
+  let fj = 0
+  while fj < cnt {
+    const fname = uFieldNames[start + fj]
+    const sfi = sFieldIndex(ssi, fname)
+    if sfi < 0 { return false }
+    if sFieldTypeAt(ssi, sfi) != uFieldTypes[start + fj] { return false }
+    fj = fj + 1
+  }
+  true
+}
+
+// The union VARIANT arm (of `unionSet`) whose struct layout matches the struct-typed
+// expression at `exprIx`, or -1. The struct-EXPRESSION dual of `unionArmVariantForObj`:
+// a struct-typed IDENT / call result flowing into `unionSet` was BUILT as the plain
+// struct (its own interned heap type), which is a layout TWIN of — but a DISTINCT type
+// from — the union's variant struct; the emitter re-boxes it against the matched arm
+// (`emitStructExprAsVariantBox`) so the box payload is the arm's variant-struct type the
+// narrow (`is {…}`) casts to. Restricted to `unionSet`'s own arms exactly as
+// `unionArmVariantForObj` is (a global field-name-set scan can pick another union's arm).
+export function unionArmVariantForStructExpr(
+  unionSet: string,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  const ssi = structIndexOfExpr(exprIx, fnIx)
+  if ssi < 0 { return -1 }
+  let u = 0
+  while u < unNames.length {
+    if unNames[u] == unionSet || unMemberSet[u] == unionSet {
+      let vi = unVarStart[u]
+      while vi < unVarStart[u] + unVarCount[u] {
+        if structIdxMatchesVariantIdx(ssi, vi) { return vi }
+        vi = vi + 1
+      }
+      return -1
+    }
+    u = u + 1
+  }
+  -1
+}
+
+// True if re-evaluating the expression at `exprIx` is SIDE-EFFECT-FREE and yields the
+// same value — an ident (local / param / global / captured), a parenthesized such, or a
+// pure field/index navigation of one. A CALL is NOT re-readable (its effects would fire
+// again, and a fresh allocation each time). Gates the field-copy variant re-box, which
+// re-emits the source once PER FIELD.
+export function exprReReadable(exprIx: i32): boolean {
+  if exprIx < 0 { return false }
+  const e = P.nodes[exprIx]
+  if e is Ident { return true }
+  if e is Paren { return exprReReadable(e.parInner) }
+  if e is Member { return exprReReadable(e.memObj) }
+  if e is Index {
+    return exprReReadable(e.idxArr) && exprReReadable(e.idxIndex)
+  }
+  false
+}
+
 // ── array-typedness of expressions ───────────────────────────────────────────
 // Parallel to the struct family above: decide whether an expression / param / local
 // PRODUCES the i32 array (a `(ref $aTypeIdx)`) rather than an i32. An index read
