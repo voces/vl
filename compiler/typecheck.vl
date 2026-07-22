@@ -3438,11 +3438,168 @@ function recordNicheNulElemArrayLit(srcExpr: i32, dstTy: i32) {
   }
   0
 }
+// True when the type at `ti` carries a BARE-`null` HOLE in a struct-field / array-element
+// position (`{f: null}`, `{f: {f: null}}`, `null[]` inside a field): such a render is a
+// literal's own structural inference, never a spellable annotation — no registered shape
+// row can match it, so a name-keyed consumer resolving through it mis-keys. Walks
+// TyObj / TyArray only (a null inside a closure signature or map value is not a literal
+// hole); depth-capped against recursive types.
+function tyHasNullHole(ti: i32, depth: i32): boolean {
+  if ti < 0 || depth <= 0 { return false }
+  const t = T.tys[ti]
+  if t is TyPrim { return t.primName == "null" }
+  if t is TyObj {
+    const fts = t.objFieldTypes
+    let i = 0
+    while i < fts.length {
+      if tyHasNullHole(fts[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyArray { return tyHasNullHole(t.aElem, depth - 1) }
+  false
+}
+
+// True when the type structure reachable from `ti` nests DEEPER than `budget` levels
+// of obj/array/nullable/union wrappers — in particular, a RECURSIVE type
+// (`type L = {n: L | null}`) exceeds every finite budget. `recordNullHoleObjAdopt`
+// skips such destinations: a recursive re-stamp would send the emitter's canonical
+// render (`tyToEmitName`, no back-edge vocabulary) into unbounded recursion.
+function tyDeeperThan(ti: i32, budget: i32): boolean {
+  if ti < 0 { return false }
+  if budget <= 0 { return true }
+  const t = T.tys[ti]
+  if t is TyObj {
+    const fts = t.objFieldTypes
+    let i = 0
+    while i < fts.length {
+      if tyDeeperThan(fts[i], budget - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyArray { return tyDeeperThan(t.aElem, budget - 1) }
+  if t is TyNullable { return tyDeeperThan(t.nInner, budget - 1) }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      if tyDeeperThan(ms[i], budget - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// Record the DESTINATION type on an ObjLit (or ArrayLit-of-ObjLit) source whose OWN
+// checked type carries a bare-`null` hole (`[{f: {f: null}}]` against
+// `{f: {f: i64 | null}}[]`): the hole-carrying type is covariantly ASSIGNABLE, so
+// `assignableExpr`'s literal-aware adoption block is never reached — yet the recorded
+// type is the emitter's ambiguity-resolution signal (`structIndexOfObjCtx`), and the
+// null-hole render resolves NO registered row (its canon key is a proven mismatch
+// against every twin), falling back to the first same-fieldset row — the WRONG twin
+// when an inner/outer pair shares the fieldset (invalid wasm; fuzz sweep7 declared
+// leg, seed 129301940 case_00201). The struct-element sibling of
+// `recordNicheNulElemArrayLit`; like it, runs BEFORE the plain-assignable
+// short-circuit. Nested ObjLit field values re-stamp recursively so the inner
+// literal's resolution corrects too. Returns 1 when this node was re-stamped.
+function recordNullHoleObjAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
+  if inferQuiet || srcExpr < 0 || dstTy < 0 || depth <= 0 { return 0 }
+  // A RECURSIVE destination (`type L = {n: L | null}` — its `{n: null, v: 7}` tail
+  // literal is exactly a null-hole source) must NOT re-stamp: see `tyDeeperThan`.
+  if tyDeeperThan(dstTy, 16) { return 0 }
+  let dtix = dstTy
+  const dN = T.tys[dtix]
+  if dN is TyNullable { dtix = dN.nInner }
+  if dtix < 0 { return 0 }
+  const d = T.tys[dtix]
+  const e = P.nodes[srcExpr]
+  if e is Paren {
+    if recordNullHoleObjAdopt(e.parInner, dtix, depth) == 1 {
+      while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+      nodeTyIx[srcExpr] = dtix
+      return 1
+    }
+    return 0
+  }
+  if d is TyArray {
+    if e is ArrayLit {
+      let any = 0
+      let i = 0
+      while i < e.arrElems.length {
+        if recordNullHoleObjAdopt(e.arrElems[i], d.aElem, depth - 1) == 1 {
+          any = 1
+        }
+        i = i + 1
+      }
+      if any == 1 {
+        while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+        nodeTyIx[srcExpr] = dtix
+      }
+      return any
+    }
+    return 0
+  }
+  if d is TyObj {
+    if e is ObjLit {
+      // Only a literal whose OWN recorded type carries a null hole re-stamps —
+      // a fully-classified literal keeps its structural record untouched.
+      let own = -1
+      if srcExpr < nodeTyIx.length { own = nodeTyIx[srcExpr] }
+      if !tyHasNullHole(own, 6) { return 0 }
+      // Every literal field must exist on the destination (else this is not an
+      // adoption — the assignability error path owns it). Validate the full field
+      // set FIRST, so a late miss leaves no partial re-stamp behind.
+      const dfn = d.objFieldNames
+      const djs: i32[] = []
+      let k = 0
+      while k < e.objFields.length {
+        const f = P.nodes[e.objFields[k]]
+        if f is FieldInit {
+          let dj = -1
+          let j = 0
+          while j < dfn.length {
+            if dfn[j] == f.fiName { dj = j }
+            j = j + 1
+          }
+          if dj < 0 { return 0 }
+          djs.push(dj)
+        } else {
+          djs.push(-1)
+        }
+        k = k + 1
+      }
+      k = 0
+      while k < e.objFields.length {
+        const f = P.nodes[e.objFields[k]]
+        if f is FieldInit {
+          if djs[k] >= 0 {
+            recordNullHoleObjAdopt(
+              f.fiValue,
+              d.objFieldTypes[djs[k]],
+              depth - 1,
+            )
+          }
+        }
+        k = k + 1
+      }
+      while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+      nodeTyIx[srcExpr] = dtix
+      return 1
+    }
+    return 0
+  }
+  0
+}
+
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // (A GENERIC function value meeting a CONCRETE function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case — `genericFnAssignable` — so it governs nested positions like an
   // array element too, not just this expression-level entry.)
   recordNicheNulElemArrayLit(srcExpr, dstTy)
+  recordNullHoleObjAdopt(srcExpr, dstTy, 6)
   if assignable(srcTy, dstTy) { return true }
   // A float literal re-encodes EXACTLY at f32, so it flows into any destination whose f32
   // position it fits: a bare `f32`, a nullable `f32?` (a map value / niche), or an f32 MEMBER
@@ -10787,7 +10944,14 @@ export function nodeTyCanonObjName(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return "" }
   const t = T.tys[ty]
-  if t is TyObj { return tyToEmitName(ty) }
+  if t is TyObj {
+    // A RECURSIVE type (`type L = {n: L | null}` — reachable here through a field
+    // referencing a recursive-typed binding) has NO finite canonical render:
+    // `tyToEmitName` carries no back-edge vocabulary and recurses unboundedly.
+    // "" is the documented degenerate — the consumer keeps its fallback.
+    if tyDeeperThan(ty, 16) { return "" }
+    return tyToEmitName(ty)
+  }
   ""
 }
 
