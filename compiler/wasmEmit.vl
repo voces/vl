@@ -437,6 +437,7 @@ import {
   letIsNulString,
   letMapShapeOf,
   letNulBool,
+  letNulMapReadUnionBox,
   letUnionNameOf,
   listElemIsBool,
   listIdxKindOf,
@@ -4116,6 +4117,42 @@ function emitMapGet(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   fbElse()            // else
   fbI32Const(0)       // i32.const 0
   fbEnd()             // end
+  0
+}
+
+// Lower a bare map GET `m[k]` of a UNION-valued map (mv kind 2) onto `body`, leaving the
+// NON-null `(ref $uBoxIdx)` box a kind-4 `"union"` binding stores: the hit arm loads the
+// stored box from the vals slot, the miss arm synthesizes the NULL-TAGGED box (the same
+// `scalarTagOf("null")` rep `emitUnionCoerce`'s NullLit arm stores for an `A | B | null`
+// binding), and `ref.as_non_null` recovers the box the nullable valStash routing loses
+// (a live entry's val slot is never null; the miss arm's box is non-null by construction).
+// The `t != null` / `is` narrows then read the tag exactly as an annotated `V | null`
+// binding's do.
+function emitMapGetUnionBox(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
+  if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
+  if cmSlot < 0 {
+    return emitFail(
+      "emitProgram: union-valued map read but no mv slot resolved",
+    )
+  }
+  const mslot = cmSlot
+  pushMapScr(body, 5)          // entry
+  fbIf(64)                     // if (entry != 0 → found), void
+  pushMapVals(body)
+  fbStructGet(cmValsWrap(), 0) // vals backing
+  pushMapScr(body, 5)          // entry
+  fbI32Const(1)
+  fbI32Bin(107)                // i32.sub (entry - 1)
+  fbArrayGet(cmValsBack())     // the stored (ref null $uBoxIdx) slot read
+  fbLocalSet(fnMvValStashLocal(mslot))
+  fbElse()                     // else — a miss IS the read's `null`: the null-tagged box
+  fbI32Const(scalarTagOf("null"))
+  fbRefNullNone()              // the payload slot is unread under the null tag
+  fbStructNew(uBoxIdx)
+  fbLocalSet(fnMvValStashLocal(mslot))
+  fbEnd()                      // end (if)
+  fbLocalGet(fnMvValStashLocal(mslot))
+  fbRefAsNonNull()
   0
 }
 
@@ -9695,6 +9732,24 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     nslCtx.nulRefHeap = nulScalarListWrapHeap(localIsRef[slot])
     nslCtx.listKind = nulScalarListBuildKind(localIsRef[slot])
     if emitExprExpect(body, s.letInit, fnIx, nslCtx) < 0 { return -1 }
+  } else if (
+    localIsRef[slot] == "union" &&
+    letNulMapReadUnionBox(stmtIx, fnIx)
+  ) {
+    // A bare `const t = m[k]` read of a UNION-valued map (kind 2): the binding is the
+    // established `A | B | null` box local — hit loads the stored box, miss synthesizes
+    // the null-tagged box (`emitMapGetUnionBox`). The init is the Index the classifier
+    // resolved; read its receiver/key here.
+    const umr = P.nodes[unwrapParen(s.letInit)]
+    if umr is Index {
+      if emitMapGetUnionBox(body, umr.idxArr, umr.idxIndex, fnIx) < 0 {
+        return -1
+      }
+    } else {
+      return emitFail(
+        "emitProgram: union-valued map read binding's init is not an index read",
+      )
+    }
   } else if letUNm != "" {
     if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
   } else if letIsF32(stmtIx) {
