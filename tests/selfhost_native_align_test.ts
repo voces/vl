@@ -88,6 +88,83 @@ const vl = async (args: string[]): Promise<Run> => {
 const path = (rel: string) => new URL(rel, CASES).pathname;
 const stageOf = (err: string) => err.match(/(parse|type|emit) error/)?.[1] ?? "other";
 
+// ── Batched `vl run` (RUN_CASES + TRAP_CASES) ─────────────────────────────────
+// One `vl run --batch` process runs MANY cases: the per-spawn fixed costs
+// (process + two wasmtime engine builds + loading the multi-MB compiler module)
+// are paid once per batch instead of once per case; each case still gets a fresh
+// isolated Store (same protocol scripts/fuzz-vl.sh drives). Per input file the
+// host writes `<basename>.out` (print output, always) and `<basename>.err` (the
+// SAME rendered error a failing `vl run` prints — compiler diagnostics / trap
+// text — only on failure), so the per-case assertions below are unchanged in
+// strength: stdout still must equal `@log` exactly, and a trap still must render
+// "wasm trap". The `vl check` legs stay per-spawn (`vl check` has no batch mode).
+//
+// Outputs are keyed by BASENAME, and the corpus reuses basenames across dirs
+// (13× `entry.vl`, 4× `basics.vl`, …) — and module imports resolve relative to
+// the REAL entry path, so inputs cannot be renamed/symlinked flat. Instead the
+// cases are partitioned into WAVES with unique basenames per wave: wave k holds
+// each basename's k-th occurrence, so wave 0 carries ~95% of the cases and the
+// handful of extra waves only re-pay the fixed cost a dozen times, not ~300.
+//
+// The batch is LAZY (first test to need it kicks it off, everyone awaits the
+// same promise) so filtering/ignoring never pays for it, and per-case test
+// granularity + names are untouched.
+type BatchResult = { out: string; err: string | null };
+let batchP: Promise<Map<string, BatchResult>> | null = null;
+const batchResults = (): Promise<Map<string, BatchResult>> =>
+  batchP ??= (async () => {
+    const rels = [...new Set([...RUN_CASES, ...TRAP_CASES])];
+    const waves: string[][] = [];
+    const mult = new Map<string, number>();
+    for (const rel of rels) {
+      const base = rel.split("/").pop()!;
+      const k = mult.get(base) ?? 0;
+      mult.set(base, k + 1);
+      (waves[k] ??= []).push(rel);
+    }
+    const results = new Map<string, BatchResult>();
+    await Promise.all(waves.map(async (wave) => {
+      const dir = await Deno.makeTempDir({ prefix: "vl-native-align-batch-" });
+      try {
+        const { code, stderr } = await new Deno.Command(VL, {
+          args: [
+            "run",
+            "--batch",
+            "--out-dir",
+            dir,
+            ...wave.map(path),
+            "--compiler",
+            COMPILER,
+          ],
+          stdout: "piped",
+          stderr: "piped",
+          env: { RUST_BACKTRACE: "0", VL_STD: `${ROOT}/std` },
+        }).output();
+        // Nonzero exit = the BATCH itself could not run (per-case failure is a
+        // `.err` file, never a batch abort) — surface it in every awaiting test.
+        if (code !== 0) {
+          throw new Error(
+            `vl run --batch exited ${code}: ${new TextDecoder().decode(stderr).trim()}`,
+          );
+        }
+        for (const rel of wave) {
+          const base = rel.split("/").pop()!;
+          const out = await Deno.readTextFile(`${dir}/${base}.out`);
+          let err: string | null = null;
+          try {
+            err = await Deno.readTextFile(`${dir}/${base}.err`);
+          } catch {
+            // no `.err` file — the case ran clean.
+          }
+          results.set(rel, { out, err });
+        }
+      } finally {
+        await Deno.remove(dir, { recursive: true }).catch(() => {});
+      }
+    }));
+    return results;
+  })();
+
 // ── RUN_CASES: `vl run` stdout EQUALS @log, and `vl check` compiles clean ──
 const RUN_CASES = [
   "arith/literal-add.vl",
@@ -574,9 +651,9 @@ for (const rel of RUN_CASES) {
     ignore: !ENABLED,
     fn: async () => {
       const want = logsOf(src(rel));
-      const r = await vl(["run", path(rel)]);
-      if (r.code !== 0) {
-        throw new Error(`${rel}: vl run exited ${r.code}: ${r.err.trim().split("\n")[0]}`);
+      const r = (await batchResults()).get(rel)!;
+      if (r.err !== null) {
+        throw new Error(`${rel}: vl run failed: ${r.err.trim().split("\n")[0]}`);
       }
       const got = r.out.length ? r.out.replace(/\n$/, "").split("\n") : [];
       if (JSON.stringify(got) !== JSON.stringify(want)) {
@@ -597,12 +674,15 @@ for (const rel of TRAP_CASES) {
     name: `native-align trap: ${rel} — vl run traps (nonzero exit)`,
     ignore: !ENABLED,
     fn: async () => {
-      const r = await vl(["run", path(rel)]);
-      if (r.code === 0) throw new Error(`${rel}: expected a runtime trap, vl run exited 0`);
-      // A genuine RUNTIME trap, not a compile failure: stderr names a wasm trap and
-      // no compile stage rejected it.
+      const r = (await batchResults()).get(rel)!;
+      if (r.err === null) {
+        throw new Error(`${rel}: expected a runtime trap, vl run succeeded`);
+      }
+      // A genuine RUNTIME trap, not a compile failure: the rendered error names a
+      // wasm trap and no compile stage rejected it (a compile rejection renders
+      // "parse/type/emit error", never "wasm trap").
       if (!/wasm trap/.test(r.err)) {
-        throw new Error(`${rel}: nonzero exit but no "wasm trap" in stderr: ${r.err.trim().split("\n").slice(0, 3).join(" / ")}`);
+        throw new Error(`${rel}: failed but no "wasm trap" in the error: ${r.err.trim().split("\n").slice(0, 3).join(" / ")}`);
       }
     },
   });
