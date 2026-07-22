@@ -11810,25 +11810,31 @@ export function letIsStruct(letIx: i32, fnIx: i32) {
 // True if the `LetDecl`'s init produces a PLAIN-STRUCT TWIN of a variant arm (a call /
 // literal built as the plain struct — its own interned heap, a layout TWIN of but DISTINCT
 // heap from the arm's variant struct), NOT a genuine kind-8 variant ref. Such a value is
-// RE-BOXED into the union (`emitStructExprAsVariantBox`, #1005), so the binding must be the
-// union BOX (kind 4) — a variant local `(ref $variant)` would receive the box `(ref $uBox)`
-// (invalid wasm). A genuine variant-REP init (a kind-8 variant local/param, a variant-
-// returning call) resolves `structIndexOfExpr < 0` and is left as a raw variant.
+// RE-BOXED into the union (`emitStructExprAsVariantBox`, #1005) at whatever boundary later
+// consumes it, so the binding must NOT be a variant local `(ref $variant)`:
+//   - a UNION-annotated binding falls through to the union BOX (kind 4);
+//   - an UN-annotated binding (`const s = mk3(); return s`, mk3 returning the PLAIN struct)
+//     falls through to a plain STRUCT (kind 1) — the value IS a plain struct at this point;
+//     only its later flow into a union (return/arg/field) reboxes.
+// A genuine variant-REP init (a kind-8 variant local/param, a `: Cat`-returning call)
+// resolves `structIndexOfExpr < 0` and is left as a raw variant — untouched.
 function letInitReboxesToVariant(letIx: i32, fnIx: i32): boolean {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    // Gated on a UNION annotation: only a `{…} | scalar`-typed binding flows its init into
-    // the union BOX. An UN-annotated variant-returning call (`const m = mk(7)`, `mk(): Cat`)
-    // must stay a raw kind-8 variant — its init merely shape-matches an arm.
-    if d.letType < 0 { return false }
-    const lt = P.nodes[d.letType]
-    if !(lt is TypeRef) { return false }
-    if !isUName(lt.tyName) { return false }
-    if nodeTyIsLitUnionAlias(d.letType) { return false }
-    // A genuine variant-REP init (a kind-8 variant local/param) resolves `structIndexOfExpr
-    // < 0` and stays raw + boxes at the boundary; only a PLAIN-STRUCT TWIN of an arm (a call
-    // / literal built as the plain struct — a DISTINCT heap) reboxes, so the binding must be
-    // the box, not a variant `(ref $variant)` that would receive the box `(ref $uBox)`.
+    // When ANNOTATED, only a `{…} | scalar` UNION annotation qualifies (a plain-struct /
+    // variant-name annotation is authoritative and handled by `letIsVariant`'s annotation
+    // arm). An UN-annotated binding (`letType < 0`) is driven purely by the init's shape.
+    if d.letType >= 0 {
+      const lt = P.nodes[d.letType]
+      if !(lt is TypeRef) { return false }
+      if !isUName(lt.tyName) { return false }
+      if nodeTyIsLitUnionAlias(d.letType) { return false }
+    }
+    // A genuine variant-REP init (a kind-8 variant local/param, a `: Cat`-returning call)
+    // resolves `structIndexOfExpr < 0` and stays raw + boxes at the boundary; only a PLAIN-
+    // STRUCT TWIN of an arm (a call / literal built as the plain struct — a DISTINCT heap)
+    // reboxes, so the binding must not be a variant `(ref $variant)` that would receive the
+    // box `(ref $uBox)` (annotated) or the raw plain struct (un-annotated — invalid wasm).
     const vi = exprVariantIndex(d.letInit, fnIx)
     if vi < 0 || vi >= uVarHeap.length { return false }
     const ssi = structIndexOfExpr(d.letInit, fnIx)
