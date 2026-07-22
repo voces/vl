@@ -9364,7 +9364,75 @@ function internFuncTypeShapes(nm: string): i32 {
     if funcTypeShapeLowerable(nm) {
       internShapeFieldElems(nm)
       internInlineShape(nm)
+    } else {
+      // The result struct is NOT lowerable as a whole (`funcTypeShapeLowerable`
+      // false — e.g. it carries a plain CLOSURE field, code 14): the outer shape
+      // stays un-interned here (a literal names it via `collectAnonShapes`), but its
+      // NESTED inline-shape fields (`f: {f: string[]}`) and its closure fields' RESULT
+      // shapes (`a: () => {f: i64}`) must each still intern their OWN row. Otherwise
+      // a literal building the outer shape fieldset-collides the `{f: string[]}` field
+      // onto the same-fieldset `{f: i64}` twin (a closure-field sibling's result) — the
+      // interned twin drives invalid wasm at the nested struct.new. With both rows
+      // present the `collectAnonShapes` ambiguity resolver (`structIndexOfObjCtx`
+      // matches>=2 → the checker's recorded node type) disambiguates the nested literal.
+      internNonLowerableFieldShapes(nm)
     }
+  }
+  0
+}
+
+// Descend the fields of a NON-lowerable closure-result struct, interning the nested
+// inline-shape and closure fields' shapes (via `internShapeDeep`). Only composite
+// fields (a `{…}` nested shape, or a `=>` closure) are descended — a scalar / string /
+// map / value-union field is left untouched, preserving the closure's clean-reject
+// semantics for genuinely-unsupported reps. The depth-0 field split mirrors
+// `internShapeFieldElems`.
+function internNonLowerableFieldShapes(nm: string) {
+  const inner = nm.slice(1, nm.length - 1)
+  let depth = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    const atEnd = k == inner.length
+    let brk = false
+    if !atEnd {
+      const ch = inner[k]
+      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
+      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
+      if ch == ',' && depth == 0 { brk = true }
+    } else {
+      brk = true
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci > 0 {
+        const ftxt = part.slice(ci + 1, part.length)
+        // A closure field (`() => {f: i64}`) — intern its result shape. Depth-aware:
+        // an inner arrow makes the field a closure regardless of wrappers.
+        if annArrowAt(ftxt) >= 0 {
+          internShapeDeep(ftxt)
+        } else {
+          // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
+          // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
+          let base = ftxt
+          const nb = nullablePartOf(base)
+          if nb != "" { base = nb }
+          while (
+            base.length > 2 &&
+            base[base.length - 2] == '[' &&
+            base[base.length - 1] == ']'
+          ) {
+            base = base.slice(0, base.length - 2)
+          }
+          if base.length >= 2 && base[0] == '{' && base[1] != '[' {
+            internShapeDeep(base)
+          }
+        }
+      }
+      start = k + 1
+    }
+    k = k + 1
   }
   0
 }
