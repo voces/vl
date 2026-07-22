@@ -15,7 +15,9 @@
 #   - non-baselined REJECT only                        -> exit 0 (report-only: the fail-loud tail)
 #
 # USAGE: scripts/fuzz-nightly.sh [--seeds N] [--count M] [--depths "D1 D2 ..."] [--baseline FILE]
-#                                 [--out-dir DIR]
+#                                 [--out-dir DIR] [--jobs J]
+#   --jobs J        run up to J seeds CONCURRENTLY (default nproc-2; 1 = serial streaming). Safe:
+#                   each seed's fuzz-vl.sh has its own work dir + per-seed output paths.
 #   --seeds N       number of fresh random seeds to sample this run (default 10)
 #   --count M       programs generated per seed (default 200)
 #   --depths LIST   space-separated depths, cycled across seeds round-robin (default "4 5 6")
@@ -49,9 +51,16 @@ BRANCHING=""
 MULTIOBS=""
 DECLARED=""
 EXPERIMENTAL=0
+# Per-seed PARALLELISM: each seed's fuzz-vl.sh invocation is independent (its own mktemp work
+# dir, per-seed --shapes-out/--keep paths, the seed compiler read-only), so seeds fan out across
+# cores. Default = nproc-2 (leave headroom for the shell + the OS); --jobs 1 restores the exact
+# serial streaming behavior.
+JOBS="$(( $(nproc 2>/dev/null || echo 4) - 2 ))"
+[ "$JOBS" -ge 1 ] || JOBS=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --seeds) SEEDS_N="$2"; shift 2 ;;
+    --jobs) JOBS="$2"; shift 2 ;;
     --count) COUNT="$2"; shift 2 ;;
     --depths) DEPTHS="$2"; shift 2 ;;
     --baseline) BASELINE="$2"; shift 2 ;;
@@ -98,13 +107,32 @@ for s in "${seeds[@]}"; do
   echo "  seed $s -> depth ${seed_depth[$s]} (repro: scripts/fuzz-vl.sh --seed $s --count $COUNT --depth ${seed_depth[$s]})"
 done
 
-for s in "${seeds[@]}"; do
-  d="${seed_depth[$s]}"
-  echo; echo "-- running seed $s (depth $d) --"
-  # shellcheck disable=SC2086  # $EXTRA is bare flag tokens (--branching/--multiobs) or empty
-  ./scripts/fuzz-vl.sh --seed "$s" --count "$COUNT" --depth "$d" $EXTRA \
-    --baseline "$BASELINE" --shapes-out "$OUT_DIR/seed_$s.tsv" --keep "$OUT_DIR/keep_$s" --quiet
-done
+if [ "$JOBS" -le 1 ]; then
+  for s in "${seeds[@]}"; do
+    d="${seed_depth[$s]}"
+    echo; echo "-- running seed $s (depth $d) --"
+    # shellcheck disable=SC2086  # $EXTRA is bare flag tokens (--branching/--multiobs) or empty
+    ./scripts/fuzz-vl.sh --seed "$s" --count "$COUNT" --depth "$d" $EXTRA \
+      --baseline "$BASELINE" --shapes-out "$OUT_DIR/seed_$s.tsv" --keep "$OUT_DIR/keep_$s" --quiet
+  done
+else
+  echo "fuzz-nightly: running ${#seeds[@]} seeds with --jobs $JOBS"
+  for s in "${seeds[@]}"; do
+    d="${seed_depth[$s]}"
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
+    # Each parallel seed streams into its own log (interleaved stdout would be unreadable);
+    # the per-seed findings are replayed serially below, so nothing is lost vs the serial path.
+    # shellcheck disable=SC2086
+    ./scripts/fuzz-vl.sh --seed "$s" --count "$COUNT" --depth "$d" $EXTRA \
+      --baseline "$BASELINE" --shapes-out "$OUT_DIR/seed_$s.tsv" --keep "$OUT_DIR/keep_$s" --quiet \
+      > "$OUT_DIR/seed_$s.log" 2>&1 &
+  done
+  wait
+  for s in "${seeds[@]}"; do
+    echo; echo "-- seed $s (depth ${seed_depth[$s]}) --"
+    tail -n 6 "$OUT_DIR/seed_$s.log" 2>/dev/null || echo "  (no log — launch failed?)"
+  done
+fi
 
 # Aggregate: the complete non-baselined failure set across all seeds this run, class-tagged
 # `CLASS<TAB>SHAPE` — same exact-line suppression logic as rep-fuzz-check.sh (a baseline line only
