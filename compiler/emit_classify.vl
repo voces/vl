@@ -5269,7 +5269,38 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
         const mfn = P.nodes[fnStmts[mfe]]
         let mfArity = -1
         if mfn is FuncDecl { mfArity = mfn.fnParams.length }
-        if mfArity == c.callArgs.length { return cloSigKeyExt(mfe) }
+        if mfArity == c.callArgs.length {
+          const mfk = cloSigKeyExt(mfe)
+          // The arity guard alone cannot split SAME-ARITY twin fields: two shapes
+          // spelling the fieldset `{a, f, z}` (a nullable arm `{a: {f: i64},
+          // f: (i32,i32,i32) => K0, z: f32}` beside a closure-result row
+          // `{a: i32[], f: (i32,i32,i32) => string, z: K1}`) dedup, and
+          // `fieldClosureFeOf` returned the OTHER row's 3-ary lambda — the
+          // `ref.cast` took a struct-result functype and the narrowed field call
+          // TRAPPED (fuzz post-#991 branching leg, seed 142348133 case_00233).
+          // Verify against the CHECKER-typed callee when it is available and a
+          // proven function type: a divergent key means the syntactic resolve
+          // aliased the twin — the typed key is the one the field's real lambda
+          // interned. Either side unresolvable keeps the historic key.
+          const mcty = nodeTyIxOf(c.callFn)
+          if mcty >= 0 {
+            if T.tys[mcty] is TyFunc {
+              const mtn = nodeTyName(c.callFn)
+              if mtn != "" && annArrowAt(mtn) >= 0 {
+                const mtk = annSigKey(mtn)
+                // Only an INTERNED divergent key overrides: the checker render can
+                // spell a benign twin of the interned key (an inline shape vs its
+                // nominal — the closure-array-field-literal canary), and an
+                // un-interned key would turn a working call into a loud
+                // "no interned signature".
+                if mtk != "" && mtk != mfk {
+                  if cloSigPosOfKey(mtk) >= 0 { return mtk }
+                }
+              }
+            }
+          }
+          return mfk
+        }
       }
     }
     if cre is Index {
@@ -14825,7 +14856,17 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // A string-returning FIELD-closure call (`o.label(3)` over a `(i32) => string` field).
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return fRetKind[ffe] == "str" }
+      if ffe >= 0 {
+        // EXCEPT a call the checker typed as an aliased LITUNION — the atom reps
+        // i32, and same-fieldset twin rows can alias `fieldClosureFeOf` onto the
+        // OTHER row's string-result lambda (`f: (i32,i32,i32) => K0` beside a twin's
+        // `f: (i32,i32,i32) => string` — the `cloCallSigKey` twin discipline): the
+        // string claim would route `print` to the ref path over the raw i32 atom —
+        // INVALID-WASM (fuzz post-#991 branching leg, seed 142348133 case_00233).
+        // The member dual of the Ident-callee `calleeReturnsString` gate above.
+        if fRetKind[ffe] == "str" { return !nodeTyIsLitUnionAlias(exprIx) }
+        return false
+      }
     }
     // A closure-VALUE call whose callee sig the per-NAME resolvers above cannot key — a local
     // whose closure type was inferred from a Member/Index init (`const t0 = v[0].f`, a
