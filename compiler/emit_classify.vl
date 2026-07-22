@@ -1036,10 +1036,63 @@ export function letBareUnwiredNulMapRead(letIx: i32, fnIx: i32) {
     const mrs = mapReadMvSlot(d.letInit, fnIx)
     if mrs >= 0 {
       const k = mvValKind[mrs]
-      return k == 2 || k == 6
+      // A kind-6 read now BINDS through `letNulMapReadValKind` (the nullable list /
+      // nested-map local kinds) — only the UNION-valued read (kind 2) remains the
+      // clean reject (its element is the shared box; a bare nullable-box binding has
+      // no local rep yet — narrow with `m[k] ?? <default>`).
+      return k == 2
     }
   }
   false
+}
+
+// The NULLABLE local VKind a bare `const t = m[k]` read of a LIST- or nested-MAP-valued
+// map binds (`{[string]: i32[]}` → `nullist`, `{[string]: S[]}` → `nulreflist`,
+// `{[string]: {[string]: V}}` → `nulmap`, …), or null when the init is not such a read.
+// The read yields `V | null` — the `(ref null $wrapper)` vals element — and every target
+// kind is an ESTABLISHED nullable local (`i32[] | null` bindings, `{[string]:V} | null`
+// bindings) whose narrow/read machinery already lowers; this arm only routes the map-read
+// spelling onto them. Previously the whole kind-6 family was SUPPOSED to hit the
+// `letBareUnwiredNulMapRead` loud reject, but the guard's slot resolution missed some
+// receivers and the binding fell through the ladder to a MIS-KINDED local — INVALID-WASM
+// (`{[string]: {[string]: i32}}` bare read, R1 map-composition survey 2026-07-22).
+export function letNulMapReadValKind(letIx: i32, fnIx: i32): VKind | null {
+  const d = P.nodes[letIx]
+  if !(d is LetDecl) { return null }
+  if d.letType >= 0 { return null }
+  if d.letInit < 0 { return null }
+  const mrs = mapReadMvSlot(d.letInit, fnIx)
+  if mrs < 0 { return null }
+  if mvValKind[mrs] != 6 { return null }
+  const lvk = mvListValKind(mrs)
+  if lvk == "list" { return "nullist" }
+  if lvk == "strlist" { return "nulstrlist" }
+  if lvk == "f64list" { return "nulf64list" }
+  if lvk == "i64list" { return "nuli64list" }
+  if lvk == "f32list" { return "nulf32list" }
+  if lvk == "reflist" { return "nulreflist" }
+  // A NESTED-map value (`{[string]: {[string]: V}}` — vals element kind 3, the inner
+  // map struct): the read binds the nullable-map local.
+  if rlElemKindTbl[mvRlSlot[mrs]] == 3 { return "nulmap" }
+  null
+}
+
+// The `addLocalName` SLOT argument for a `letNulMapReadValKind` binding: the INNER
+// ref-list slot for a `nulreflist` (the value's element slot — the same resolution the
+// `?? []` default hint uses), the inner map's SHAPE slot for a `nulmap` (mono ⇒ -1),
+// -1 for the scalar-backed list kinds (their wrappers are global singletons).
+export function letNulMapReadSlotArg(letIx: i32, fnIx: i32) {
+  const d = P.nodes[letIx]
+  if !(d is LetDecl) { return -1 }
+  const mrs = mapReadMvSlot(d.letInit, fnIx)
+  if mrs < 0 { return -1 }
+  if mvListValKind(mrs) == "reflist" {
+    return rlSlotByName(refArrElemName(mvValName[mrs]))
+  }
+  if rlElemKindTbl[mvRlSlot[mrs]] == 3 {
+    return mvSlotOfMapValNameOrMono(mapValNameOf(mvValName[mrs]))
+  }
+  -1
 }
 
 // True if evaluating the expression at `exprIx` yields a NULLABLE i32-list ref —

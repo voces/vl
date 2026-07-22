@@ -299,6 +299,8 @@ import {
   letMapShapeOf,
   letNulBool,
   letNulLitUnion,
+  letNulMapReadSlotArg,
+  letNulMapReadValKind,
   letNulScalarListKind,
   letRefListSlot,
   listOpKindOfBin,
@@ -1294,17 +1296,37 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
             "nulmap",
             nulMapShapeOf(stmts[i], fnIx),
           )
+        } else if letNulMapReadValKind(stmts[i], fnIx) != null {
+          // A bare `const t = m[k]` read of a LIST- or nested-MAP-valued map (`V | null`):
+          // binds the value's ESTABLISHED nullable local kind (`nullist` / `nulstrlist` /
+          // `nulf64list` / `nuli64list` / `nulf32list` / `nulreflist` / `nulmap`) — the
+          // same kinds a direct `V | null` annotation produces, so the narrow + read
+          // machinery lowers unchanged. BEFORE the union-read guard (which now covers only
+          // the kind-2 box values) and the non-null kinds (a later `t = null`-free narrow
+          // must see the nullable cell).
+          const nmrK = letNulMapReadValKind(stmts[i], fnIx)
+          if nmrK != null {
+            slot = addLocalName(
+              s.letName,
+              nmrK,
+              letNulMapReadSlotArg(stmts[i], fnIx),
+            )
+          }
         } else if letIsMap(stmts[i], fnIx) {
           // The kind-6 parallel slot carries the map SHAPE: `-2` for a `Set()`
           // binding (its `.values()` walks the keys), an mv slot (>= 0) for a
-          // ref-valued map, `-1` for the mono i32 map.
+          // ref-valued map, `-1` for the mono i32 map. AFTER the bare-map-read arm:
+          // a `const t = m[k]` read of a nested-map value is `{[string]:V} | null`
+          // (the nulmap kind), which this arm's init fallback would else claim as a
+          // NON-null map local — the nullable vals element then stored into a
+          // non-null cell (INVALID-WASM, the R1 survey's w2).
           slot = addLocalName(s.letName, "map", letMapShapeOf(stmts[i], fnIx))
         } else if letBareUnwiredNulMapRead(stmts[i], fnIx) {
-          // `const v = m[k]` over a UNION- or ref-LIST-valued map is `V | null` with no nullable
+          // `const v = m[k]` over a UNION-valued map is `V | null` with no nullable
           // local rep — reject cleanly (bind `m[k] ?? <default>`) rather than emit invalid wasm.
-          // Struct / string / closure value reads fall through to their nullable kinds below.
+          // Struct / string / closure / list / nested-map value reads bind their nullable kinds.
           return emitFail(
-            "emitProgram: a bare `m[k]` read of a union- or list-valued map is `V | null`; " +
+            "emitProgram: a bare `m[k]` read of a union-valued map is `V | null`; " +
               "use `m[k] ?? <default>`",
           )
         } else if letIsNulRef(stmts[i], fnIx) {
