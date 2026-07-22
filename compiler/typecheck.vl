@@ -8116,6 +8116,22 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // ELEMENT-NULLABLE-MAP LIST result (`() => ({[string]: boolean} | null)[]`): a lambda
+        // whose body array literal (non-null maps, or a `null` hole) is assignable to the
+        // expected nullable-map-element list adopts it, so `emitReturnValue` builds each
+        // element through the kind-3 map NICHE (`(ref null $mapStruct)`) the annotated
+        // `(): ({[string]:boolean}|null)[]` named-function value spelling already lowers
+        // (`synthRetAnnots` pins `fnRet` via `parenUnionArrElemName`). Un-pinned, the body's
+        // non-null maps self-classified a `{[string]:V}[]` reflist keyed on a DIFFERENT slot
+        // than the annotation-side value call's `(…|null)[]` slot — a "no interned signature"
+        // reject / cast-failure TRAP (fuzz sweep YKq9Jw declared, seed 43421976). The
+        // nullable-map sibling of the nullable-struct arm above.
+        if inferred != expRet && nulMapElemListRetName(expRet) != "" {
+          const nmeTail = lambdaBodyTail(n.fnBody)
+          if nmeTail >= 0 && assignableExpr(nmeTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
         // ELEMENT-VALUE-UNION LIST result (`() => (i64|boolean)[]`): a lambda whose body array
         // literal is assignable to the expected value-union-box list adopts it, so `emitReturnValue`
         // boxes each element (`[7]`) through the SAME element-kind-2 rep the annotated
@@ -8136,6 +8152,21 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         if inferred != expRet && elemVariantBoxListRetName(expRet) != "" {
           const vbeTail = lambdaBodyTail(n.fnBody)
           if vbeTail >= 0 && assignableExpr(vbeTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
+        // ELEMENT-MAP-UNION LIST result (`() => ({[string]: string} | f64)[]`): a lambda
+        // whose body array literal is assignable to the expected map-union-element list
+        // adopts it, so `emitReturnValue` boxes each element through the SAME element-kind-2
+        // map-union box rep the annotated `(…)[]` return / named-function-VALUE form already
+        // lowers (`synthRetAnnots` pins `fnRet` via its `parenUnionArrElemName` arm). Un-pinned,
+        // the body's f64-array self-classified a `f64[]` reflist keyed on a DIFFERENT slot than
+        // the annotation-side value call's union-box `(…)[]` slot — a cast-failure TRAP (fuzz
+        // sweep YKq9Jw multiobs, seed 58637234). The map-union sibling of the element-value-union
+        // and element-variant-box arms above.
+        if inferred != expRet && elemMapUnionListRetName(expRet) != "" {
+          const meTail = lambdaBodyTail(n.fnBody)
+          if meTail >= 0 && assignableExpr(meTail, inferred, expRet) {
             inferred = expRet
           }
         }
@@ -8403,6 +8434,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // kind-1 struct-niche element seeding `emitReturnValue` already performs for the
         // annotated form.
         if unm == "" { unm = nulStructElemListRetName(inferred) }
+        // An ELEMENT-NULLABLE-MAP list contextual return (`() => ({[string]:boolean}|null)[]`,
+        // adopted just above) — record its canonical emit name so `synthRetAnnots` pins the
+        // lambda's `fnRet` as the nullable-map-element list (its `parenUnionArrElemName` arm),
+        // whose kind-3 map-niche element seeding `emitReturnValue` already performs for the
+        // annotated form.
+        if unm == "" { unm = nulMapElemListRetName(inferred) }
         // An ELEMENT-VALUE-UNION list contextual return (`() => (i64|boolean)[]`, adopted just
         // above) — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the
         // value-union-box list, whose element boxing `emitReturnValue` already performs.
@@ -8412,6 +8449,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // `fnRet` as the variant-box-element list, whose element boxing `emitReturnValue`
         // already performs for the annotated form.
         if unm == "" { unm = elemVariantBoxListRetName(inferred) }
+        // An ELEMENT-MAP-UNION list contextual return (`() => ({[string]:string}|f64)[]`,
+        // adopted just above) — record its emitter name so `synthRetAnnots` pins the lambda's
+        // `fnRet` as the map-union-box element list, whose element boxing `emitReturnValue`
+        // already performs for the annotated form.
+        if unm == "" { unm = elemMapUnionListRetName(inferred) }
         // A UNION-FIELD-STRUCT-element list contextual return (`() => {f: {f:f64}|boolean}[]`,
         // adopted just above) — record its emitter name so `synthRetAnnots` pins the lambda's
         // `fnRet` as the boxed-field-element list, whose element boxing the annotated
@@ -9773,6 +9815,31 @@ function nulStructElemListRetName(er: i32) {
   ""
 }
 
+// The emitter-format NAME of a NULLABLE-MAP-element list return `er` —
+// `({[string]: boolean} | null)[]`, `({[string]: string} | null)[]`: a `TyArray` whose
+// element is a `TyNullable` over a `TyMap`. Its elements are the kind-3 map struct made
+// nullable (`(ref null $mapStruct)`, the `rlElemNullable` niche — the SAME rep the annotated
+// `(…|null)[]` return / named-function-VALUE spelling already lowers), so `synthRetAnnots`
+// pins a lambda's `fnRet` to it (its `parenUnionArrElemName` arm — `{[string]:…}|null` is a
+// 2+-member `|` inner). Un-pinned, the body's non-null-map array self-classified a
+// `{[string]:V}[]` reflist keyed on a DIFFERENT slot than the annotation-side value call's
+// `(…|null)[]` slot — a "no interned signature" reject / cast-failure TRAP (fuzz sweep
+// YKq9Jw declared, seed 43421976). The nullable-map sibling of `nulStructElemListRetName`. ""
+// otherwise.
+function nulMapElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const et = T.tys[t.aElem]
+    if et is TyNullable {
+      const it = T.tys[et.nInner]
+      if it is TyMap { return tyToEmitName(er) }
+    }
+  }
+  ""
+}
+
 // The CANONICAL emitter NAME for a PLAIN struct inferred return (`{f: f32}`) whose
 // fields all pass `structElemFieldsPlain` — the bare-struct sibling of
 // `structElemListRetName`, feeding the recorder's `spfNm` canon record so
@@ -9885,6 +9952,24 @@ function elemVariantBoxListRetName(er: i32) {
   if t is TyArray {
     if t.aElem < 0 { return "" }
     const en = variantBoxUnionRetName(t.aElem)
+    if en != "" { return "(" + en + ")[]" }
+  }
+  ""
+}
+
+// The emitter-format NAME of an inferred ELEMENT-MAP-UNION list return `er` —
+// `({[string]: string} | f64)[]`, `({[string]: f32} | {w: i32})[]`: a `TyArray` whose
+// element is a map-member union `mapUnionRetName` renders (a map member + object/scalar
+// siblings, all riding the `{tag, payload}` box — element kind 2, the SAME rep the
+// annotated `(…)[]` return / named-function-VALUE spelling already lowers). The map-union
+// sibling of `elemVariantBoxListRetName` (`variantBoxUnionRetName` declines map members).
+// Pinned by `synthRetAnnots`'s `parenUnionArrElemName` arm (a 2+-member `|` inner). "" otherwise.
+function elemMapUnionListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const en = mapUnionRetName(t.aElem)
     if en != "" { return "(" + en + ")[]" }
   }
   ""
