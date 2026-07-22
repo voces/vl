@@ -169,8 +169,26 @@ export function repSigTokHasSlot(kind: VKind | null): boolean {
 // `;`-terminated decimal slot (`s3;`, `r0;`, `m2;`). The ONE place token digits
 // are assembled — the producers (`cloParamTok`/`cloRetKeySuffix`/`annParamKind`/
 // `annRetKind`) call this instead of hand-appending `i32ToStr(slot) + ";"`.
+//
+// SIG-SPACE CANONICALIZATION (rep-twin sig-canon slice): a STRUCT / NULLABLE-STRUCT
+// slot digit renders its `sTwin`-canonical representative (`repStructSlotRep`), not
+// the raw row. Two spelling-twin struct rows (`type A={v:i32}` vs an inline `{v:i32}`
+// annotation, or a closure-field / nullable-litunion twin) are `structFieldCodesEq`
+// under one `slotCanonKey`, so they emit BYTE-IDENTICAL functypes (`fbValtype` reads
+// `sHeapIdx[slot]`, and `sHeapIdx` collapses twins) — but their raw digits made the
+// three `$fnsig` producers key structurally-identical shapes under DIFFERENT sig
+// keys (the #980 KEY-vs-ROW divergence that blocks the phase-1 bridge leg + phase-2
+// authoritative swap). Rendering the canonical rep makes the sig KEY twin-invariant:
+// whichever row a resolver lands on, the digit — hence the interned functype key —
+// is the same, so structurally-identical shapes dedup to ONE `$fnsig`. The rep is
+// computed TIMING-INDEPENDENTLY (from `slotCanonKey`, never the `sTwin[]` array,
+// which `buildStructTwins` fills AFTER `collectCloSigs` has already interned the sig
+// set) so intern-time and emit-time renders agree. Other slot kinds (reflist /
+// variant / map) index their OWN tables and pass through unchanged.
 export function repSigSlotTokOfKind(kind: VKind | null, slot: i32): string {
-  repSigTokOfKind(kind) + i32ToStr(slot) + ";"
+  let s = slot
+  if kind == "struct" || kind == "nulstruct" { s = repStructSlotRep(slot) }
+  repSigTokOfKind(kind) + i32ToStr(s) + ";"
 }
 
 // The INVERSE projection — a `$fnsig` token character (an i32 code point) back
@@ -467,17 +485,16 @@ function repSlotCacheSync() {
   0
 }
 
-// The NOMINAL-IDENTITY leg of `repSlotOfTy`, exported on its own (rep-twin phase 1):
-// the declared-struct slot whose `cUserTypes` arena index IS `ty`, or -1 — no
-// structural bridge. This is the leg the DECLARED/NOMINAL annotation resolvers
-// (`retStructIndex`/`retNulRefIndex`) consume structural-first: a divergence probe
-// over the full corpus (975 emitting files) measured this leg at 452 agree /
-// 0 diverge against the name path, while the BRIDGE leg measured 2 divergences —
-// an inline-spelled annotation whose exact `sNames` row differs from the declared
-// twin the bridge collapses to (the #980 KEY-vs-ROW family; slot digits feed
-// `$fnsig` tokens, so a twin-slot shift is not byte-safe). The bridge therefore
-// stays out of the emission consumers until that family is resolved (phase 2+).
-export function repSlotOfTyDecl(ty: i32): i32 {
+// The NOMINAL-IDENTITY leg of `repSlotOfTy` (rep-twin phase 1): the declared-struct
+// slot whose `cUserTypes` arena index IS `ty`, or -1 — no structural bridge. Split
+// out so `repSlotOfTy` layers the bridge on top of one shared nominal lookup. Phase 1
+// consumed THIS leg alone in `retStructIndex` / `retNulRefIndex` (the BRIDGE leg's 2
+// corpus divergences were `sTwin` layout twins whose slot digits feed `$fnsig`
+// tokens — not byte-safe under phase 1's byte-identity gate, the #980 KEY-vs-ROW
+// family). The sig-canon slice canonicalizes those digits
+// (`repSigSlotTokOfKind`→`repStructSlotRep`), so a twin-slot shift now keys the SAME
+// `$fnsig`; those resolvers upgraded to the full `repSlotOfTy` (bridge included).
+function repSlotOfTyDecl(ty: i32): i32 {
   if ty < 0 { return -1 }
   const t = T.tys[ty]
   if !(t is TyObj) { return -1 }
@@ -595,6 +612,53 @@ export function repStructSlotsTwin(a: i32, b: i32): i32 {
   if ka == "" { return 0 }
   if ka != slotCanonKey(b) { return 0 }
   structFieldCodesEq(a, b)
+}
+
+// The canonical (smallest `sTwin`-equivalent) representative of struct slot `si` —
+// the smallest slot `j <= si` sharing `si`'s `slotCanonKey` under the
+// `structFieldCodesEq` layout guard, or `si` itself when `si` is the first (or only)
+// of its structure / does not participate in dedup (`""` key). This is the SAME
+// equivalence `buildStructTwins` records in `sTwin[]`, computed on demand and
+// TIMING-INDEPENDENTLY: `repSigSlotTokOfKind` renders it into `$fnsig` struct tokens
+// during `collectCloSigs` (sig interning) — BEFORE `mAssignTypeIndices` has built
+// `sTwin[]` — and again at emit time, and the two must agree. Reads only
+// `slotCanonKey` (memoized per arena index) so a spelling-twin row keys the SAME sig
+// digit as its representative, making structurally-identical shapes intern one
+// functype key. Memoized per `tyMutEpoch` (canon keys drop on any arena mutation;
+// `sNames` only APPENDS later slots, which never change an existing slot's rep, so
+// growth needs no reset).
+let repSlotRepMemo: i32[] = []
+let repSlotRepEpoch = -1
+
+function repSlotRepSync() {
+  if repSlotRepEpoch != tyMutEpoch {
+    repSlotRepMemo = []
+    repSlotRepEpoch = tyMutEpoch
+  }
+  0
+}
+
+export function repStructSlotRep(si: i32): i32 {
+  if si < 0 || si >= sNames.length { return si }
+  repSlotRepSync()
+  if si < repSlotRepMemo.length {
+    if repSlotRepMemo[si] >= 0 { return repSlotRepMemo[si] }
+  }
+  const key = slotCanonKey(si)
+  let rep = si
+  if key != "" {
+    let j = 0
+    while j < si {
+      if slotCanonKey(j) == key && structFieldCodesEq(j, si) == 1 {
+        rep = j
+        j = si // stop at the first (smallest) twin
+      }
+      j = j + 1
+    }
+  }
+  while repSlotRepMemo.length <= si { repSlotRepMemo.push(-1) }
+  repSlotRepMemo[si] = rep
+  rep
 }
 
 // Rep-twin phase 2 — the STRUCTURAL row resolver for `structIndexOfObjCtx`'s
