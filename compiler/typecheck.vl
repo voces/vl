@@ -7584,6 +7584,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   if inferring {
     inferStack.pop()
     let inferred = TY_VOID
+    // Set when the OBJECT-shaped contextual adoption fires (`objRetWidenAdopt` below):
+    // gates the plain-struct CANON record — a lambda whose self-inference already
+    // matches its context keeps the established un-pinned route (pinning EVERY
+    // plain-struct lambda regressed `.map`-collapse / factory / generic-HOF cases).
+    let objRetAdopted = false
     const sawCycle = cycleBreakCount > cbBefore
     if inferObserved >= 0 {
       inferred = inferObserved
@@ -7631,7 +7636,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // Object-shaped dual: `() => ({f: 5})` against `() => {f: i64}` — adopt the
         // expected shape when every widening field is a re-encodable literal
         // (`objRetWidenAdopt` also records the field types for the emitter's interner).
-        if objRetWidenAdopt(n.fnBody, inferred, expRet) { inferred = expRet }
+        if objRetWidenAdopt(n.fnBody, inferred, expRet) {
+          inferred = expRet
+          objRetAdopted = true
+        }
         // LITERAL-UNION dual: a bare string-literal body that is a MEMBER of the expected
         // literal-union (`(i32) => K = (x) => "b"`) adopts the litunion. Its inferred type is
         // the softened `string`; the direct `const k: K = "b"` binding grants the member flow
@@ -7913,6 +7921,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           const seTail = lambdaBodyTail(n.fnBody)
           if seTail >= 0 && assignableExpr(seTail, inferred, expRet) {
             inferred = expRet
+            objRetAdopted = true
           }
         }
       }
@@ -8043,12 +8052,26 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // struct keeps its established pin).
       let smfNm = ""
       if sfbNm == "" { smfNm = structMapFieldRetName(inferred) }
+      // A PLAIN struct return (`{f: f32}`, `{a: i64, f: f64, z: {…}}` — scalar /
+      // litunion / nested-plain fields only): recorded CANONICALLY too. The spaced
+      // `recordable` render never pins, and an un-pinned lambda's body literal
+      // fieldset-matches — a program with a same-fieldset TWIN row in scope resolved
+      // the WRONG row (`{f: 4.5}` took the `{f: f64}` twin where the context declared
+      // `{f: f32}` — INVALID-WASM, fuzz sweep3 multiobs leg, seed 784841544
+      // case_00222; the third same-fieldset pin-miss this arc after #969's map-field
+      // and case_00290's element-list). Composite fields (map / union / closure /
+      // list) keep their own recorder arms below.
+      let spfNm = ""
+      if sfbNm == "" && smfNm == "" && objRetAdopted {
+        spfNm = structPlainRetName(inferred)
+      }
       // A single STRUCT-shape (`{meow: i32}`) inferred return is recorded too — a lambda
       // that COLLAPSES to one union variant (`(a) => if a is Cat { a } else { catShape }`)
       // types as that variant's shape; the emitter resolves it to the concrete variant
       // (`variantIndexOfTypeName`) so a `.map` result is the variant ref list, not the box.
       const recordable = sfbNm == "" &&
         smfNm == "" &&
+        spfNm == "" &&
         (isClassifiableRetName(anm) ||
         isObjShapeName(anm) ||
         isScalarListRetName(anm))
@@ -8061,6 +8084,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       if !recordable {
         unm = sfbNm
         if unm == "" { unm = smfNm }
+        if unm == "" { unm = spfNm }
         if unm == "" { unm = valueUnionRetName(inferred) }
         if unm == "" { unm = structUnionRetName(inferred, gRootStmts) }
         // A NULLABLE-ref contextual return (`P | null`, `string | null`) — recorded under the same
@@ -8090,6 +8114,15 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // `fnRet` as the boxed-field-element list, whose element boxing the annotated
         // spelling already performs.
         if unm == "" { unm = structFieldBoxElemListRetName(inferred) }
+        // A PLAIN-STRUCT-element list return (`() => {a: i64, f: f64, z: {…}}[]`) — record
+        // its canonical name so `synthRetAnnots` pins the lambda and the element literals
+        // build under the annotated threading instead of fieldset-matching (a same-fieldset
+        // TWIN row in scope matched the wrong row — INVALID-WASM, fuzz sweep3 multiobs leg,
+        // seed 369283890 case_00290). ADOPTION-GATED like the plain-struct record above:
+        // a lambda whose self-inference already matched keeps the un-pinned route
+        // (un-gated, this record regressed the closure-value ref-list ABI suite cases).
+        if unm == "" && objRetAdopted { unm = structElemListRetName(inferred) }
+
         // A NULLABLE-CLOSURE-element list contextual return (`() => ((() => i64) | null)[]`,
         // adopted just above) — record its emitter name so `synthRetAnnots` pins the lambda's
         // `fnRet` (its `parenUnionArrElemName` arm): the pinned TypeRef collects the kind-5
@@ -9371,21 +9404,53 @@ function structElemListRetName(er: i32) {
     if t.aElem < 0 { return "" }
     const et = T.tys[t.aElem]
     if et is TyObj {
-      let i = 0
-      while i < et.objFieldTypes.length {
-        const fty = et.objFieldTypes[i]
-        if fty < 0 { return "" }
-        const ft = T.tys[fty]
-        let ok = false
-        if ft is TyPrim { ok = true }
-        if tyIsLitUnion(fty) { ok = true }
-        if !ok { return "" }
-        i = i + 1
-      }
+      if !structElemFieldsPlain(t.aElem, 4) { return "" }
       return tyToEmitName(er)
     }
   }
   ""
+}
+
+// The CANONICAL emitter NAME for a PLAIN struct inferred return (`{f: f32}`) whose
+// fields all pass `structElemFieldsPlain` — the bare-struct sibling of
+// `structElemListRetName`, feeding the recorder's `spfNm` canon record so
+// `synthRetAnnots`' whole-span-shape arm pins the lambda.
+function structPlainRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if !(t is TyObj) { return "" }
+  if !structElemFieldsPlain(er, 4) { return "" }
+  tyToEmitName(er)
+}
+
+// The field gate of `structElemListRetName`: every field a scalar / string / boolean
+// prim, a litunion alias, or (recursively) a NESTED plain struct. The nested-struct
+// admission is load-bearing: an UN-pinned lambda returning a list of such structs
+// self-resolves each element literal by field-name set, and a program with
+// same-fieldset TWIN rows in scope matched the WRONG row and boxed the element as a
+// union-box list — INVALID-WASM (fuzz sweep3 multiobs leg, seed 369283890
+// case_00290). The named-fn spelling lowers nested-struct fields already (code 15).
+// Map / union / nullable / list / closure fields stay declined (their composition
+// seams keep the loud rejects).
+function structElemFieldsPlain(objTy: i32, depth: i32): boolean {
+  if depth <= 0 { return false }
+  const et = T.tys[objTy]
+  if !(et is TyObj) { return false }
+  let i = 0
+  while i < et.objFieldTypes.length {
+    const fty = et.objFieldTypes[i]
+    if fty < 0 { return false }
+    const ft = T.tys[fty]
+    let ok = false
+    if ft is TyPrim { ok = true }
+    if tyIsLitUnion(fty) { ok = true }
+    if ft is TyObj {
+      if structElemFieldsPlain(fty, depth - 1) { ok = true }
+    }
+    if !ok { return false }
+    i = i + 1
+  }
+  true
 }
 
 // The emitter-format NAME of a MAP-ELEMENT list return `er` — `{[string]: f32}[]`: a
