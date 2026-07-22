@@ -6231,15 +6231,10 @@ export function fnStmtsPosOf(fnIx: i32) {
 // The struct table index a type NAME names: a declared struct name directly, or an
 // INLINE object-shape name (`{x:i32,y:i32}`) matched by field-name SET against the
 // interned shapes (the anonymous literals interned the same sets). -1 if neither.
-export function structIndexOfTypeName(name: string) {
-  const si = structIndexByName(name)
-  if si >= 0 { return si }
-  // Only a SINGLE shape spanning the WHOLE name is a bare struct — a composite (`{…}|null`,
-  // `{…}|{…}`, `{…}[]`) is not, so its first `{`'s matching `}` must be the LAST char. Without this
-  // guard a nullable-struct name (`{x:i32}|null`) mis-matches its LEADING shape as the bare struct,
-  // silently masking the `| null` (e.g. `annRetKind` would key a nullable result `>s` instead of
-  // `>n`, breaking a nullable-returning closure value call).
-  let spanOk = false
+// True if `name` is a single INLINE STRUCT shape spanning the WHOLE string (`{f: i32}`,
+// `{f: {f: i32|string}}`) — its first `{`'s matching `}` is the LAST char, and it is not
+// a map spelling (`{[`). A composite (`{…}|null`, `{…}|{…}`, `{…}[]`) is not.
+export function nameIsWholeSpanShape(name: string) {
   if name.length >= 2 && name[0] == '{' && name[1] != '[' {
     let d0 = 0
     let closeAt = -1
@@ -6254,9 +6249,20 @@ export function structIndexOfTypeName(name: string) {
       }
       q = q + 1
     }
-    if closeAt == name.length - 1 { spanOk = true }
+    if closeAt == name.length - 1 { return true }
   }
-  if spanOk {
+  false
+}
+
+export function structIndexOfTypeName(name: string) {
+  const si = structIndexByName(name)
+  if si >= 0 { return si }
+  // Only a SINGLE shape spanning the WHOLE name is a bare struct — a composite (`{…}|null`,
+  // `{…}|{…}`, `{…}[]`) is not, so its first `{`'s matching `}` must be the LAST char. Without this
+  // guard a nullable-struct name (`{x:i32}|null`) mis-matches its LEADING shape as the bare struct,
+  // silently masking the `| null` (e.g. `annRetKind` would key a nullable result `>s` instead of
+  // `>n`, breaking a nullable-returning closure value call).
+  if nameIsWholeSpanShape(name) {
     // Collect the top-level field NAMES + TYPE texts (`shapeFieldParse` — the
     // variant resolver's grammar: depth-aware over `{}` `[]` `()`, spaces
     // stripped so the canonical and spaced renders parse the same), then match
@@ -6397,6 +6403,14 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
       if tnb != "" { tb = tnb }
       return nestedStructNamesCompat(tb, elem)
     }
+    // A UNION-BOX candidate field (code 16) against a WHOLE-SPAN inline-shape
+    // spelling (`f: {f: i32|string}` — a nested-STRUCT field): a bare struct
+    // spelling never denotes the box, so this is a PROVEN mismatch. Without it
+    // the twin pair minted by a nested alias (`{f: {f: i32|string}}` beside its
+    // inner `{f: i32|string}` row, alias-registered inner-first) let the OUTER
+    // annotation leniently adopt the INNER row, and the outer literal built one
+    // level short — INVALID-WASM (fuzz sweep3 declared leg, seed 128787380).
+    if code == 16 && nameIsWholeSpanShape(t) { return false }
     // A NULLABLE DISTINCT-BACKING SCALAR-LIST field spelling (`f64[] | null`,
     // `i64[] | null`, `f32[] | null`, `string[] | null`) has NO field code at all —
     // code 18 covers only the i32-backed leaf, code 28 only ref elements — so NO
