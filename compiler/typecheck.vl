@@ -1026,6 +1026,12 @@ let nodeRepTyIx: i32[] = []
 // nominal classifier then confirms structurally instead of an O(nodes) `nameIsStructDecl` AST scan.
 // The arena stays purely STRUCTURAL (`TyObj` has no name); nominal-ness is checker metadata, not a Ty.
 let cStructTyIxs: i32[] = []
+// The declared NAME of each `cStructTyIxs` entry (parallel array), so a declared-struct
+// arena index resolves back to its alias name — the reverse map `cUnionTyIxs`/`cUnionNames`
+// already give unions. Used by the NAME-FAITHFUL renderer (`tyToNominalName`) to render a
+// nominal struct as its NAME rather than a structural `{…}` expansion, so an arena walk
+// reproduces the name walk's registration keys (rep-adoption name-faithful-renderer slice).
+let cStructNames: string[] = []
 let cVariantMemberTyIxs: i32[] = []
 // Declared UNION-ALIAS `Ty` indices (`type T = A | B`), for the emitter's `isUName` (C1).
 let cUnionTyIxs: i32[] = []
@@ -5139,6 +5145,212 @@ function tyToEmitName(ix: i32) {
   ""
 }
 
+// The declared NAME of DECLARED-STRUCT arena index `ty` (`type S = {…}` → "S"), or "" when
+// `ty` is not a registered declared struct. Reverse of `cUserTypes` via the parallel
+// `cStructTyIxs`/`cStructNames` arrays — the struct analogue of `litUnionAliasNameOfTy`'s
+// `cUnionTyIxs`/`cUnionNames` reverse map. First-match wins (a redeclared name overwrote
+// `cUserTypes` in pass 0a, so both decls share the LAST arena index and either name is
+// interchangeable). Used by `tyToNominalName` to render a nominal struct as its NAME.
+export function structNameOfTy(ty: i32): string {
+  if ty < 0 { return "" }
+  let i = 0
+  while i < cStructTyIxs.length {
+    if cStructTyIxs[i] == ty { return cStructNames[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// The declared ALIAS NAME of DECLARED-UNION arena index `ty` (`type U = A | B` → "U",
+// `type K = "a" | "b"` → "K"), or "" when `ty` is not a registered union alias — the
+// index-match leg of `litUnionAliasNameOfTy`, generalized to VALUE unions (which are not
+// litunions). Used by `tyToNominalName` to render a declared union alias by its name.
+export function unionAliasDeclNameOfTy(ty: i32): string {
+  if ty < 0 { return "" }
+  let i = 0
+  while i < cUnionTyIxs.length {
+    if cUnionTyIxs[i] == ty { return cUnionNames[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// NAME-FAITHFUL renderer (rep-adoption name-faithful-renderer slice). Like `tyToEmitName`,
+// but NOMINAL-FIRST: a TyObj that IS a registered declared struct renders as its NAME (via
+// `structNameOfTy`) and a TyUnion that IS a registered declared union alias renders as its
+// alias name (via `unionAliasDeclNameOfTy`), rather than the structural `{…}` / `A|B`
+// expansion `tyToEmitName` always produces. So an ARENA walk that renders each reachable
+// union with THIS function reproduces the name walk's exact `registerInlineUnion` keys — a
+// declared struct/union keeps the name the source annotation spelled (`tyNameOf`), never a
+// structural twin that a nominal `structIndexByName`/`isUName` lookup can't resolve. Litunion
+// aliases, nullable spelling, and grouping-paren preservation are inherited from `tyToEmitName`'s
+// arms (recursing into `tyToNominalName` for composites). Nominal-first ALSO tames recursion: a
+// named recursive struct (`type Tree = {children: Tree[]}`) short-circuits to "Tree" before its
+// self-referential field re-enters. NOTHING consumes this in emitted output yet — it is a
+// byte-identical foundation for the (deferred) arena registration walk.
+export function tyToNominalName(ix: i32): string {
+  if ix < 0 { return "" }
+  // NOMINAL-FIRST: a declared struct or union alias renders as its NAME.
+  const sdn = structNameOfTy(ix)
+  if sdn != "" { return sdn }
+  const udn = unionAliasDeclNameOfTy(ix)
+  if udn != "" { return udn }
+  const t = T.tys[ix]
+  if t is TyPrim {
+    if t.primName == "never" { return "" }
+    return t.primName
+  }
+  if t is TyLit {
+    if t.litKind == "str" { return "string" }
+    if t.litKind == "flt" { return "f64" }
+    if intLexemeFitsI32(t.litText) { return "i32" }
+    return "i64"
+  }
+  if t is TyUnion {
+    const members = t.uMembers
+    // SOURCE-FAITHFUL (alias-preserving) render, mirroring `tyToEmitName`'s union arm: a
+    // litunion-ALIAS member keeps its alias name (`K0` in `K0 | {w:i32}`), reconstructing a
+    // flattened lit run into its registered alias via the regroup. The POSITION-DEPENDENT
+    // litunion softening (`canonEmitName` softens `K0` in a DIRECT union but keeps it inside a
+    // closure RESULT) is NOT re-implemented here — a consumer applies `canonEmitName` once over
+    // the WHOLE rendered name, where the func-type structure is visible; softening per-arm in
+    // isolation would lose that context. So this arm produces exactly the source spelling the
+    // name walk started from, and `canonEmitName(render)` reproduces the name walk's key.
+    let rgAlias = ""
+    const rgTexts: string[] = []
+    let rgNonLit = false
+    let rg = 0
+    while rg < members.length {
+      const rm = T.tys[members[rg]]
+      if rm is TyLit {
+        if rm.litKind == "str" { rgTexts.push(rm.litText) }
+      } else {
+        let rmNull = false
+        if rm is TyPrim {
+          if rm.primName == "null" { rmNull = true }
+        }
+        if !rmNull { rgNonLit = true }
+      }
+      rg = rg + 1
+    }
+    if rgNonLit && rgTexts.length >= 2 {
+      rgAlias = litUnionAliasOfLitTexts(rgTexts)
+    }
+    const parts: string[] = []
+    let rgDone = false
+    let i = 0
+    while i < members.length {
+      const rgm = T.tys[members[i]]
+      if rgAlias != "" && rgm is TyLit {
+        if !rgDone {
+          rgDone = true
+          parts.push(rgAlias)
+        }
+        i = i + 1
+        continue
+      }
+      let s = litUnionAliasNameOfTy(members[i])
+      if s == "" { s = tyToNominalName(members[i]) }
+      if s == "" { return "" }
+      if rgm is TyFunc { s = "(" + s + ")" }
+      let dup = false
+      let j = 0
+      while j < parts.length {
+        if parts[j] == s { dup = true }
+        j = j + 1
+      }
+      if !dup { parts.push(s) }
+      i = i + 1
+    }
+    if parts.length == 0 { return "" }
+    let out = parts[0]
+    let k = 1
+    while k < parts.length {
+      out = out + "|" + parts[k]
+      k = k + 1
+    }
+    return out
+  }
+  if t is TyNullable {
+    const nal = litUnionAliasNameOfTy(t.nInner)
+    if nal != "" { return nal + "|null" }
+    // A nullable DECLARED struct/union keeps its nominal name (`S|null`, `U|null`).
+    const nsn = tyToNominalName(t.nInner)
+    if nsn == "" { return "" }
+    const nfn = T.tys[t.nInner]
+    if nfn is TyFunc { return "(" + nsn + ")|null" }
+    return nsn + "|null"
+  }
+  if t is TyObj {
+    const names = t.objFieldNames
+    const ftys = t.objFieldTypes
+    let out = "{"
+    let fi = 0
+    while fi < names.length {
+      let fs = ""
+      const ftn = T.tys[ftys[fi]]
+      if ftn is TyNullable {
+        const fal = litUnionAliasNameOfTy(ftn.nInner)
+        if fal != "" { fs = fal + "|null" }
+      }
+      if fs == "" {
+        const fbal = litUnionAliasNameOfTy(ftys[fi])
+        if fbal != "" { fs = fbal }
+      }
+      if fs == "" { fs = tyToNominalName(ftys[fi]) }
+      if fs == "" { return "" }
+      if fi > 0 { out = out + "," }
+      out = out + names[fi] + ":" + fs
+      fi = fi + 1
+    }
+    return out + "}"
+  }
+  if t is TyArray {
+    let el = litUnionAliasNameOfTy(t.aElem)
+    if el == "" { el = tyToNominalName(t.aElem) }
+    if el == "" { return "" }
+    const ae = T.tys[t.aElem]
+    if ae is TyFunc { return "(" + el + ")[]" }
+    if nameHasPipe(el) { return "(" + el + ")[]" }
+    return el + "[]"
+  }
+  if t is TyMap {
+    const mk = tyToNominalName(t.mKey)
+    let mv = litUnionAliasNameOfTy(t.mVal)
+    if mv == "" { mv = tyToNominalName(t.mVal) }
+    if mk == "" || mv == "" { return "" }
+    return "{[" + mk + "]:" + mv + "}"
+  }
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let out = "("
+    let i = 0
+    while i < ps.length {
+      const ps1 = tyToNominalName(ps[i])
+      if ps1 == "" { return "" }
+      if i > 0 { out = out + "," }
+      out = out + ps1
+      i = i + 1
+    }
+    let rs = ""
+    const rtn = T.tys[t.fnRet]
+    if rtn is TyNullable {
+      const nal = litUnionAliasNameOfTy(rtn.nInner)
+      if nal != "" { rs = nal + "|null" }
+    }
+    if rs == "" {
+      const bal = litUnionAliasNameOfTy(t.fnRet)
+      if bal != "" { rs = bal }
+    }
+    if rs == "" { rs = tyToNominalName(t.fnRet) }
+    if rs == "" { return "" }
+    const rt = T.tys[t.fnRet]
+    if rt is TyFunc { rs = "(" + rs + ")" }
+    return out + ")=>" + rs
+  }
+  ""
+}
+
 // Canonicalize one inline `{…}` shape name (an object `{f:T,…}` or a map
 // `{[K]:V}`): each field/key/value type recurses through `canonEmitName`, the
 // surrounding structure is rebuilt with the parser's exact conventions (no
@@ -8652,6 +8864,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
 function checkProgramNode(n: Program) {
   const stmts = n.progStmts
   cStructTyIxs = []
+  cStructNames = []
   cVariantMemberTyIxs = []
   cUnionTyIxs = []
   cUnionNames = []
@@ -8711,6 +8924,7 @@ function checkProgramNode(n: Program) {
           cUserTypes[sd0.tdName] = sIx0
           cUserTypesVer = cUserTypesVer + 1
           cStructTyIxs.push(sIx0)
+          cStructNames.push(sd0.tdName)
         }
       }
     } else if sd0 is UnionDecl {
