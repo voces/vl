@@ -4033,11 +4033,19 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
     // type picks the right one. `firstSi` keeps the unambiguous path byte-identical.
     let firstSi = -1
     let matches = 0
+    // A STRICTER first-match under the nested-struct field-code rule (see below): the
+    // first candidate that matches AND whose code-15 field VALUES align with code-15/16
+    // fields. Tracked ALONGSIDE the lenient `matches` (never reducing it) — used only as
+    // the AMBIGUITY tiebreak when the name/arena resolvers cannot decide, so the lenient
+    // resolution (and the `#anon` interning it gates) stays byte-identical.
+    let strictSi = -1
+    let strictCount = 0
     let si = 0
     const sLimA = sScanLim()
     while si < sLimA {
       if sFieldCount[si] == nf {
         let ok = true
+        let strict = true
         let k = 0
         while k < nf {
           const f = P.nodes[o.objFields[k]]
@@ -4045,6 +4053,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
             const mfi = sFieldIndex(si, f.fiName)
             if mfi < 0 {
               ok = false
+              strict = false
             } else {
               // F64 DISCRIMINATION: an `{x}` literal matches the i32 `{x}` and
               // the f64 `{x}` shapes by NAME — split them on the value's float-
@@ -4071,19 +4080,45 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
               } else if sc == 17 {
                 if fnIx >= 0 || vc >= 0 { ok = false }
               }
+              // NESTED-STRUCT tiebreak axis: a nested object-LITERAL field value
+              // (`f: {a: false}`, a struct ref) aligns only with a nested-struct field
+              // (code 15) or a union BOX field (code 16), never a scalar/niche/string/
+              // list code. This does NOT reduce the lenient `matches` (a same-fieldset
+              // twin whose field is a scalar niche `{f: boolean | null}`, code 21, still
+              // name-matches) — it only makes `strictSi` prefer the ref-field candidate,
+              // so the ambiguity resolver picks `{f: {a: boolean}}` (code 15) over the
+              // niche twin when the name/arena resolvers cannot (fuzz sweep 3aJP7v
+              // multiobs, the nul-litunion-field + nested-`{f}`-twins closure result).
+              if vc == 15 && sc != 15 && sc != 16 { strict = false }
             }
           } else {
             ok = false
+            strict = false
           }
           k = k + 1
         }
         if ok {
           if firstSi < 0 { firstSi = si }
           matches = matches + 1
+          if strict {
+            if strictSi < 0 { strictSi = si }
+            strictCount = strictCount + 1
+          }
         }
       }
       si = si + 1
     }
+    // NESTED-STRUCT UNIQUE-STRICT resolve: when 2+ candidates name-match but exactly ONE
+    // aligns its code-15 field VALUES with code-15/16 fields, the others are field-code
+    // INCOMPATIBLE (a nested-struct value into a scalar/niche field is invalid to build),
+    // so the strict candidate is definitively correct — take it BEFORE the name/arena
+    // resolvers (which can return the wrong same-fieldset niche twin for a lambda-body
+    // literal with a mis-recorded / absent type). Only fires when a `vc == 15` field
+    // actually split the candidates (a literal with no nested-struct field has every match
+    // strict → `strictCount == matches`, never uniquely 1 at 2+ matches), so the lenient
+    // resolution stays byte-identical elsewhere. Fuzz sweep 3aJP7v multiobs, the
+    // nul-litunion-field + nested-`{f}`-twins closure result.
+    if matches >= 2 && strictCount == 1 && strictSi >= 0 { return strictSi }
     if matches >= 2 {
       // 2+ structs match by name/scalar-code alone — a genuine shape COLLISION (a map's
       // `{f: K0}` value struct vs a closure's `{f: string}` result, seed 42931513 d5:
@@ -4134,6 +4169,13 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
       // those.
       const xr = repRowOfTyStruct(nodeRepTyIxOf(objIx), sLimA)
       if xr >= 0 { return xr }
+      // FIELD-CODE TIEBREAK: the name/arena resolvers could not decide (a lambda-body
+      // literal with no recorded obj name / rep type). Prefer the candidate whose
+      // code-15 field VALUES align with code-15/16 fields over the historic first
+      // match — a `{f: {a: false}}` literal resolves to `{f: {a: boolean}}` (code 15)
+      // instead of the same-fieldset `{f: boolean | null}` niche twin `firstSi` would
+      // pick (fuzz sweep 3aJP7v multiobs; the nested-`{f}`-twins closure result).
+      if strictSi >= 0 { return strictSi }
     }
     return firstSi
   }
@@ -16429,6 +16471,55 @@ export function cloCallUnionResultUnrepresentable(
     const prk = sigKeyRetKind(pk)
     if prk != null && prk != "union" { return true }
   }
+  // An INDEXED closure-array-element callee (`f[0]()` / `p.f[0]()`) whose result union has a
+  // VALUE-UNION-element-ARRAY arm (`(i64|boolean)[] | i32`): the element sig is the array-
+  // element ANNOTATION's box (`>u`), while the array may hold a concrete lambda that self-
+  // inferred the bare list arm (`>A`) — a param-fed array (`p.f`) has no producer to verify,
+  // so the twin check above (which needs a resolvable `pk`) never fires. Only the value-union-
+  // element-array arm is the deferred hole (the DIRECT binding of such a union rejects as "not
+  // yet representable"); a struct / closure composite arm (`f64 | {w:i32}`, `(() => string) |
+  // i64`) reps fine, so gate on the arm structure to keep those representable. Reject cleanly
+  // rather than TRAP at the narrow's `ref.cast` (fuzz sweep 3aJP7v plain, closure-array field
+  // of `(i64|boolean)[] | i32` results — the #1034 family one closure-array level deeper).
+  if tyUnionHasValueUnionElemArrayArm(ty) {
+    if calleeIsIndexedRefArrayCall(callIx, fnIx) {
+      if pk == "" { return true }
+      const prkI = sigKeyRetKind(pk)
+      if prkI == null || prkI != "union" { return true }
+    }
+  }
+  false
+}
+
+// True when the TyUnion at `ty` has a MEMBER that is an ARRAY whose element is itself a
+// value union (`(i64 | boolean)[]` — a ref array of value-union boxes). This arm is the
+// deferred hole in a closure-RESULT union: the box-of-value-union-element-array rep does
+// not yet compose through a closure result. A struct / closure / plain-scalar-list arm is
+// NOT flagged (those closure-result unions rep fine).
+function tyUnionHasValueUnionElemArrayArm(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  let i = 0
+  while i < t.uMembers.length {
+    const m = T.tys[t.uMembers[i]]
+    if m is TyArray {
+      const el = T.tys[m.aElem]
+      if el is TyUnion {
+        // A VALUE union element (2+ members, at least one scalar) — not a variant union.
+        if el.uMembers.length >= 2 {
+          let hasPrim = false
+          let j = 0
+          while j < el.uMembers.length {
+            if T.tys[el.uMembers[j]] is TyPrim { hasPrim = true }
+            j = j + 1
+          }
+          if hasPrim { return true }
+        }
+      }
+    }
+    i = i + 1
+  }
   false
 }
 
@@ -16442,6 +16533,20 @@ function callProducerCloSigKey(callIx: i32, fnIx: i32) {
     if cre is Ident { return producerCloSigKey(cre.identName, fnIx) }
   }
   ""
+}
+
+// True when a call's CALLEE is an INDEX into a ref (closure) array (`f[0]()`, `p.f[0]()`):
+// the element sig comes from the array-element ANNOTATION (`cloArrSlotSigKey`), not a
+// resolvable producer lambda. Used by the union-result floor to reject the deferred
+// scalar+composite closure-result union in this spelling (the array element may hold a
+// lambda that self-inferred a non-box arm; a param-fed array has no producer to verify).
+function calleeIsIndexedRefArrayCall(callIx: i32, fnIx: i32): boolean {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cre = P.nodes[c.callFn]
+    if cre is Index { return exprRefArray(cre.idxArr, fnIx) }
+  }
+  false
 }
 
 // The interned SLOT of a slot-carrying result token (`>s3;`, `>n1;`, `>V0;`, `>r2;`,
