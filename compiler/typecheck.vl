@@ -1471,14 +1471,22 @@ function unionObjArmForLit(u: TyUnion, objIx: i32) {
   }
   -1
 }
-// The union member index of `u`'s CLOSURE-ARRAY arm (`((i32) => f32)[]` — a `TyArray` whose
-// element is a `TyFunc`) whose element arity matches the array literal `arrIx`'s element lambdas,
-// or -1. Lets `seedExpected` descend an array LITERAL flowing into a union into that arm so a bare
-// element lambda infers its params/result from the arm's element function type. Gated to a
-// CLOSURE element: a scalar/string/struct array arm needs no contextual seed (its elements infer
-// standalone), and admitting only the closure-array arm keeps the seed off shapes the emitter has
-// no sound narrowed read for. FIRST match wins.
-function unionClosureArrayArmForLit(u: TyUnion, arrIx: i32) {
+// The union member index of `u`'s array arm covering the array literal `arrIx`, or -1. Lets
+// `seedExpected` descend an array LITERAL flowing into a union into that arm so a bare element
+// lambda (directly, or NESTED in a struct-element field) infers its params/result from the arm's
+// element type. Two admitted element shapes, both of which the emitter has a sound narrowed read
+// for (the direct `T[]` binding lowers today):
+//   - a CLOSURE element (`((i32) => f32)[] | i32`): the element lambda seeds off the function arm;
+//   - a STRUCT element (`{a: f64, f: (() => f64|null)[], z: string}[] | i64`) whose fields are
+//     seed-safe (`unionArmSeedSafe`) AND cover the literal's element ObjLit field names: a bare
+//     field/closure-array-field lambda deep in the element struct seeds off the arm's field types
+//     (else it self-infers a narrower result — e.g. `() => f64` for a `() => f64|null` field — and
+//     the boxed producer/consumer disagree → a runtime cast trap).
+// A scalar/string array arm needs no contextual seed (its elements infer standalone) and is left
+// out. Seeding only supplies contextual types; the whole literal is still gated by the normal
+// assignability check against the union, so a mis-matched arm cannot be silently accepted. FIRST
+// match wins.
+function unionArrayArmForLit(u: TyUnion, arrIx: i32) {
   const an = P.nodes[arrIx]
   if an is ArrayLit {
     const members = u.uMembers
@@ -1489,6 +1497,33 @@ function unionClosureArrayArmForLit(u: TyUnion, arrIx: i32) {
       if mt is TyArray {
         const aet = T.tys[mt.aElem]
         if aet is TyFunc { return m }
+        if aet is TyObj && unionArmSeedSafe(mt.aElem) {
+          // Every literal element that is an ObjLit must field-check against the arm's struct
+          // element (mirrors `unionObjArmForLit`), so a wrong-shaped arm is not seeded.
+          let ok = true
+          let j = 0
+          while j < an.arrElems.length {
+            let ei = an.arrElems[j]
+            let peeled = false
+            while !peeled {
+              const ep = P.nodes[ei]
+              if ep is Paren { ei = ep.parInner } else { peeled = true }
+            }
+            const en = P.nodes[ei]
+            if en is ObjLit {
+              let k = 0
+              while k < en.objFields.length {
+                const fnode = P.nodes[en.objFields[k]]
+                if fnode is FieldInit {
+                  if objFieldType(aet, fnode.fiName) < 0 { ok = false }
+                }
+                k = k + 1
+              }
+            }
+            j = j + 1
+          }
+          if ok { return m }
+        }
       }
       i = i + 1
     }
@@ -1537,13 +1572,15 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
       }
     } else if et is TyUnion {
       // An array LITERAL flowing into a union with a CLOSURE-ARRAY arm (`[(q) => …]` into
-      // `((i32) => f32)[] | i32`): descend into the matching array arm so a bare element
-      // lambda infers its params/result from that arm's element function type (the array
-      // dual of the closure-arm and struct-arm seeding above). Without this seed the element
-      // lambda has no context and fails "cannot infer a type for parameter". Re-entering with
-      // the arm's `TyArray` reuses the element-recursion branch; assignability still gates the
+      // `((i32) => f32)[] | i32`) or a STRUCT-ARRAY arm with closure-bearing element fields
+      // (`[{…, f: [() => 5], …}]` into `{a, f: (() => f64|null)[], z}[] | i64`): descend into the
+      // matching array arm so a bare element lambda — directly or nested in an element field —
+      // infers its params/result from that arm's element type (the array dual of the closure-arm
+      // and struct-arm seeding above). Without this seed a nested field lambda self-infers a
+      // narrower result and the boxed producer/consumer disagree (runtime cast trap). Re-entering
+      // with the arm's `TyArray` reuses the element-recursion branch; assignability still gates the
       // whole literal against the union, so a wrong arm cannot be silently adopted.
-      const arm = unionClosureArrayArmForLit(et, u)
+      const arm = unionArrayArmForLit(et, u)
       if arm >= 0 { seedExpected(u, arm) }
     }
   } else if en is ObjLit {
