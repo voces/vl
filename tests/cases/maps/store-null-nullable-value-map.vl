@@ -1,0 +1,159 @@
+// @run
+// @log true
+// @log false
+// @log true
+// @log 0
+// @log aa
+// @log NULL
+// @log 9
+// @log 5
+// @log 0
+// @log 99
+// @log 0
+// @log DEF
+// @log NULL
+// @log 5
+// @log 0
+// @log 7
+// @log 0
+// @log 7
+// @log 0
+
+// STORE a bare `null` into a nullable-VALUED map — `m[k] = null` — across every nullable value
+// family. This is the store-side dual of #1036's read-side `??` coalesce: each family seeds the
+// right null REP at the store (boolean|null sentinel 2, litunion|null sentinel -1, scalar|null /
+// value-union boxed null tag, struct/string/map/closure|null ref.null niche). Before the fix a
+// `boolean | null` store loud-rejected ("bare null needs a struct-typed context"); the other
+// families were seeded by #1036 already. Read-back proves each stored null: `?? d` coalesces to a
+// non-null default, and a `?? null` / bare `!= null` narrow reads it back AS null.
+
+type K = "aa" | "bb"
+
+// boolean | null — MONO i32 niche, null sentinel `2`. THIS is the family the store fix adds.
+function boolFam() {
+  const m: {[string]: boolean | null} = Map()
+  m["k"] = null
+  print(m["k"] ?? true)      // stored null -> coalesces to default -> true
+  m["k"] = false
+  print(m["k"] ?? true)      // present false -> false
+  print(m["absent"] ?? true) // missing key -> true
+  m["z"] = null
+  const v = m["z"] ?? null   // ?? null keeps boolean|null; stored null passes through
+  if v != null {
+    print(v) // -> 0
+  } else {
+    print(0)
+  }
+}
+boolFam()
+
+// litunion K | null — MONO i32 niche, null sentinel `-1`.
+function litunionFam() {
+  const m: {[string]: K | null} = Map()
+  m["k"] = null
+  const t: K = m["k"] ?? "aa"
+  print(t)                 // stored null -> aa
+  m["z"] = null
+  const v = m["z"] ?? null // ?? null keeps K|null
+  if v != null {
+    print(v) // -> NULL
+  } else {
+    print("NULL")
+  }
+}
+litunionFam()
+
+// scalar i32 | null — boxed null tag; `??` peels the raw scalar.
+function scalarFam() {
+  const m: {[string]: i32 | null} = Map()
+  m["k"] = null
+  print(m["k"] ?? 9) // stored null -> 9
+  m["k"] = 5
+  print(m["k"] ?? 9) // present -> 5
+  const s = m["absent"]
+  if s != null {
+    print(s) // bare read narrow, missing -> 0
+  } else {
+    print(0)
+  }
+}
+scalarFam()
+
+// struct | null — ref.null niche.
+function structFam() {
+  const m: {[string]: {f: i64} | null} = Map()
+  m["k"] = null
+  print((m["k"] ?? { f: 99 }).f) // stored null -> 99
+  const t = m["k"]
+  if t != null {
+    print(t.f) // bare read narrow -> 0
+  } else {
+    print(0)
+  }
+}
+structFam()
+
+// string | null — ref.null niche.
+function stringFam() {
+  const m: {[string]: string | null} = Map()
+  m["k"] = null
+  print(m["k"] ?? "DEF") // stored null -> DEF
+  const t = m["k"]
+  if t != null {
+    print(t) // bare read narrow -> NULL
+  } else {
+    print("NULL")
+  }
+}
+stringFam()
+
+// map | null — ref.null niche.
+function mapFam() {
+  const m: {[string]: {[string]: i64} | null} = Map()
+  m["k"] = null
+  const inner = m["k"] ?? Map()
+  print(inner["x"] ?? 5) // stored null -> default map -> 5
+  const t = m["k"]
+  if t != null {
+    print(1) // bare read narrow -> 0
+  } else {
+    print(0)
+  }
+}
+mapFam()
+
+// closure | null — ref.null niche.
+function closureFam() {
+  const m: {[string]: (() => i64) | null} = Map()
+  m["k"] = null
+  function d(): i64 { return 7 }
+  const t = m["k"] ?? d
+  print(t()) // stored null -> default closure -> 7
+  const c = m["k"]
+  if c != null {
+    print(1) // bare read narrow -> 0
+  } else {
+    print(0)
+  }
+}
+closureFam()
+
+// union i64 | string | null — boxed value union; multi-member stays a NON-null box.
+function unionFam() {
+  const m: {[string]: i64 | string | null} = Map()
+  const dv: i64 | string = 7
+  m["k"] = null
+  const t = m["k"] ?? dv
+  if t is i64 {
+    print(t) // stored null -> 7
+  } else {
+    print("STR")
+  }
+  const u = m["k"]
+  if u != null {
+    if u is i64 { print(u) } else { print("STR") }
+  } else {
+    print(0) // bare read narrow -> 0
+  }
+}
+unionFam()
