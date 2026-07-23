@@ -8604,7 +8604,17 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       valueUnionRetName(inferred) == ""
     ) {
       const itt = T.tys[inferred]
-      if itt is TyUnion {
+      // A VARIANT-BOX union (`{w: i32} | i32`, `Cat | i32`, and their nullable form
+      // `{w: i32} | i32 | null` — canon wraps the null into a `TyNullable`) lowers
+      // un-annotated: the A20 loop records `variantBoxUnionRetName` under the function's
+      // name, `collectU`'s inferred-return loop registers the box + its variant struct,
+      // and the emitter's `isUName` return classification boxes it exactly like the
+      // annotated `: {w: i32} | i32` spelling. Checked BEFORE the TyUnion/TyNullable arms
+      // (it spans both) so the floor accepts EXACTLY the box the emitter registers; a
+      // shape `variantBoxUnionRetName` still declines falls through to floor.
+      if variantBoxUnionRetName(inferred) != "" {
+        // lowers un-annotated — no floor
+      } else if itt is TyUnion {
         // A pure STRUCT-union whose every member maps to a NAMED type (`Cat | Dog`) lowers
         // un-annotated via the variant-boxed rep, exactly like the annotated form — so it
         // does NOT floor. The export uses the SAME `structUnionRetName` predicate, so the
@@ -10858,6 +10868,14 @@ function vbUnionMemberName(mIx: i32): string {
     return ""
   }
   if m is TyObj {
+    // A NOMINAL struct arm (`Cat | i32` where `type Cat = {legs: i32}`): render the
+    // declared type NAME so the registered variant matches the annotated `Cat | i32`
+    // spelling (`structUnionRetName`'s `nominalNameOfObj` render) and an `is Cat`
+    // narrow resolves the variant — otherwise the inline field-wise render below
+    // registers the variant by shape and `is Cat` finds no variant. Falls through to
+    // the inline render when no declared type structurally matches the shape.
+    const nom = nominalNameOfObj(mIx, gRootStmts)
+    if nom != "" { return nom }
     const names = m.objFieldNames
     const ftys = m.objFieldTypes
     let out = "{"
@@ -11037,6 +11055,16 @@ export function checkProgram(rootIx: i32) {
                 // nominal name so the emitter registers the union + classifies the
                 // binding (`registerInlineUnion` / `unionNameOfExpr`).
                 recordInferRet(efn.fnName, structUnionRetName(er, gRootStmts))
+              } else if variantBoxUnionRetName(er) != "" {
+                // A VARIANT-BOX union (`{w: i32} | i32`, `Cat | i32` — a struct arm beside a
+                // scalar) lowers un-annotated via the SAME `>u` box the annotated `: {w:
+                // i32} | i32` spelling interns: `collectU`'s inferred-return loop registers
+                // the box + its variant struct from this recorded name, the emitter's
+                // `isUName` return classification stores `"union"`, and `emitReturnValue`
+                // boxes the struct/scalar arm exactly as the annotated form does. Export
+                // the `variantBoxUnionRetName` emit render (the anonymous-lambda spelling
+                // already records this same name under its `#<nodeIx>` sentinel).
+                recordInferRet(efn.fnName, variantBoxUnionRetName(er))
               } else {
                 // A NICHE nullable (`boolean | null` / `string | null`) lowers via its
                 // sentinel / `ref.null $array` rep, not the box, so `valueUnionRetName`
