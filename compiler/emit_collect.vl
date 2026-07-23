@@ -9,6 +9,14 @@
 // (review N18).
 
 import {
+  T,
+  TyArray,
+  TyFunc,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyUnion,
+  canonEmitName,
   inferLetCount,
   inferLetNameOf,
   inferLetTyAt,
@@ -23,8 +31,10 @@ import {
   nodeArrayElemIsLitUnion,
   nodeArrayElemName,
   nodeTyIsLitUnionAlias,
+  nodeTyIxOf,
   nodeTyName,
   splitUnionAtoms,
+  tyToNominalName,
   unionMemberCount,
   valueAtomKind,
 } from "./typecheck"
@@ -4173,6 +4183,85 @@ function nliInferIfLet(walk: i32[], i: i32) {
   0
 }
 
+// ── UNIFIED ARENA REGISTRATION WALK ─────────────────────────────────────────
+// The structural sibling of `collectInlineUnionsIn`'s NAME walk: given an annotation
+// node's resolved arena type `tyIx` (from `nodeTyIxOf`), recurse over the `T.tys`
+// shape and register EVERY reachable `TyUnion` via `registerInlineUnion`. The name
+// walk registers a union only where a `tyToEmitName`/`tyNameOf` text render happens
+// to surface it (fnRet / parType / letType / fdType spellings + the accreted
+// `registerInlineUnion` recursions for the positions we thought to enumerate); a
+// union buried in a NOVEL nesting position (a value union in a map value inside a
+// closure-result struct field inside a union arm, etc.) is reachable in the arena but
+// was never enumerated by a name-walk recursion — the recurring "missed-descent"
+// bug (#983/#989/#991/#1000/#1002 all added ONE new descent each). This walk makes
+// the miss structurally impossible: it descends through EVERY composite variant
+// uniformly, so a reachable union registers regardless of how deeply / unusually it
+// nests.
+//
+// RENDER DISCIPLINE (the #1027 name-faithful renderer): a `TyUnion` is rendered with
+// `tyToNominalName` (nominal-first — a declared struct/union keeps its source NAME, so
+// the synthetic key matches the nominal `structIndexByName`/`isUName` lookups instead
+// of a structural twin), then `canonEmitName` is applied ONCE over the WHOLE render
+// (position-dependent litunion softening can only be decided with the surrounding
+// func-type structure visible — never per-arm). The result is EXACTLY the key the name
+// walk would have produced for that union, so registrations UNION IN: a union the name
+// walk already reached is an `isUName` no-op here, and the arena walk only ADDS the
+// ones the name walk missed. The register-growth oracle (#1027) is 0 over the corpus.
+//
+// Depth-capped at 16 (recursive struct/array/map types are cyclic in the arena; the
+// nominal short-circuit in `tyToNominalName` already tames named recursion, the cap
+// guards the anonymous case). Registration-ONLY: a `TyFunc` is descended for reachable
+// unions in its params/result, but its closure SIGNATURE is NOT interned here (sig
+// descent is the next slice — the slot digits are nominal-sensitive and need the
+// run-diff gate). Returns 0, or -1 (a `registerInlineUnion` `emitFail`).
+function collectTyReachRegister(stmts: i32[], tyIx: i32, depth: i32) {
+  if tyIx < 0 || depth <= 0 { return 0 }
+  const t = T.tys[tyIx]
+  if t is TyNullable {
+    return collectTyReachRegister(stmts, t.nInner, depth - 1)
+  }
+  if t is TyArray { return collectTyReachRegister(stmts, t.aElem, depth - 1) }
+  if t is TyMap { return collectTyReachRegister(stmts, t.mVal, depth - 1) }
+  if t is TyObj {
+    const ftys = t.objFieldTypes
+    let i = 0
+    while i < ftys.length {
+      if collectTyReachRegister(stmts, ftys[i], depth - 1) < 0 { return -1 }
+      i = i + 1
+    }
+    return 0
+  }
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let i = 0
+    while i < ps.length {
+      if collectTyReachRegister(stmts, ps[i], depth - 1) < 0 { return -1 }
+      i = i + 1
+    }
+    return collectTyReachRegister(stmts, t.fnRet, depth - 1)
+  }
+  if t is TyUnion {
+    // Render the union name-faithfully, canon once over the whole render, register.
+    // A "" render (an unresolvable nominal / over-deep recursion) declines silently —
+    // the name walk still covers those (this walk only ADDS coverage, never removes).
+    const nm = canonEmitName(tyToNominalName(tyIx))
+    if nm != "" {
+      if registerInlineUnion(stmts, nm) < 0 { return -1 }
+    }
+    // Descend into the members too: a member may itself be (or contain) a union in a
+    // position `registerInlineUnion`'s own name-descent does not reach. Idempotent —
+    // an already-registered union is an `isUName` no-op.
+    const members = t.uMembers
+    let i = 0
+    while i < members.length {
+      if collectTyReachRegister(stmts, members[i], depth - 1) < 0 { return -1 }
+      i = i + 1
+    }
+    return 0
+  }
+  0
+}
+
 // Scan every top-level FuncDecl's parameter + return annotations and every top-level
 // `let`/`const` annotation for INLINE union types, registering each as a synthetic
 // union alias (so it interns its variant shapes + heap types exactly like a named
@@ -4202,17 +4291,24 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       const retTy = s.fnRet
       const fnBody = s.fnBody
       if registerInlineUnion(stmts, tyNameOf(retTy)) < 0 { return -1 }
+      // Arena walk: register EVERY union reachable through the resolved return type,
+      // not just the ones the `tyNameOf` render surfaced (registrations union in).
+      if collectTyReachRegister(stmts, nodeTyIxOf(retTy), 16) < 0 { return -1 }
       let pi = 0
       while pi < params.length {
         const p = P.nodes[params[pi]]
         if p is Param {
-          if registerInlineUnion(stmts, tyNameOf(p.parType)) < 0 { return -1 }
+          const pt = p.parType
+          if registerInlineUnion(stmts, tyNameOf(pt)) < 0 { return -1 }
+          if collectTyReachRegister(stmts, nodeTyIxOf(pt), 16) < 0 { return -1 }
         }
         pi = pi + 1
       }
       if collectInlineUnionsBlock(stmts, fnBody) < 0 { return -1 }
     } else if s is LetDecl {
-      if registerInlineUnion(stmts, tyNameOf(s.letType)) < 0 { return -1 }
+      const letTy = s.letType
+      if registerInlineUnion(stmts, tyNameOf(letTy)) < 0 { return -1 }
+      if collectTyReachRegister(stmts, nodeTyIxOf(letTy), 16) < 0 { return -1 }
       // Usage-driven `let x = null` hole (A-infer-null): infer + register `T|null`.
       nliInferLet(walk, i)
       // An un-annotated `const x = if … then … else …` whose arms join to a value
@@ -4231,7 +4327,9 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
         if flds[tfi] >= 0 {
           const fdn = P.nodes[flds[tfi]]
           if fdn is FieldDef {
-            if registerInlineUnion(stmts, tyNameOf(fdn.fdType)) < 0 {
+            const fdt = fdn.fdType
+            if registerInlineUnion(stmts, tyNameOf(fdt)) < 0 { return -1 }
+            if collectTyReachRegister(stmts, nodeTyIxOf(fdt), 16) < 0 {
               return -1
             }
           }
