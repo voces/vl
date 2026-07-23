@@ -26,6 +26,7 @@ import {
   inferRetNameByNode,
   inferRetNameOf,
   inferRetTyAt,
+  inferRetTyIxAt,
   isValueUnionName,
   nameIsFuncTypeAtom,
   nameIsLitUnionArmValueUnion,
@@ -724,15 +725,6 @@ export function collectCloSigs() {
           }
         }
       }
-      // A single-shape struct ARM whose FIELD is a closure / closure-array (possibly
-      // inside its own union, `z: (() => i64)[] | i32`): intern the field closures'
-      // sigs. The single-shape TypeRef pass (`internShapeFieldCloSigs`) NEVER runs on a
-      // UNION ARM (a union is not `nameIsSingleShape`), so a narrowed `t0.z is
-      // (()=>i64)[]` element call had NO interned element sig and fell to the i32-arity
-      // fallback — a "no interned signature" reject, or "expected i64 found i32" when a
-      // sibling arity-0 closure supplied the wrong fallback sig (fuzz F5gJXz declared
-      // leg, seed 530559367 case_00309).
-      if nameIsSingleShape(atoms[uj]) { internShapeFieldCloSigs(atoms[uj]) }
       // A CLOSURE-ARRAY ARM (`((i32, i32, i32) => boolean)[] | i32`) — plain or
       // nullable-element (`(((i32) => R) | null)[]`, the kind-5 niche): the arm's
       // ELEMENT closure sig is never interned by the function-arm branch above (a
@@ -808,16 +800,6 @@ export function collectCloSigs() {
         // result closure's `$fnsig` too.
         internNulCloResultSpine(nullablePartOf(nm))
       }
-      // A SHAPE annotation with a closure/nulclosure FIELD (`{f: () => i32} | null`,
-      // `{f: (() => f32 | null) | null}`) whose program constructs NO lambda — the value
-      // is only ever `null`, or narrowed and its field CALLED (`t0.f()`) — still needs
-      // the field's `$fnsig` interned: the member call derives its key (`cloCallSigKey` →
-      // `nodeTyName` → `annSigKey`) but found nothing interned and rejected loudly. The
-      // field dual of the nulclosure-annotation pass above (same normalization, so the
-      // keys byte-match; a result outside the value ABI keys "" and stays a loud reject).
-      let sb = nullablePartOf(nm)
-      if sb == "" { sb = nm }
-      if nameIsSingleShape(sb) { internShapeFieldCloSigs(sb) }
       // A CLOSURE-ELEMENT array annotation — plain (`((i32) => R)[]`) or nullable-element
       // (`(((i32) => R) | null)[]`, the kind-5 niche) — whose value may carry NO concrete
       // lambda of the element type (a `[null]`-only construct, an empty literal): the
@@ -855,12 +837,15 @@ export function collectCloSigs() {
   // interned sig keeps its slot). Descend the arena type of each annotation the union
   // registration walk recorded (`cloSigWalkRoots` — the SAFE top-level + body root set,
   // never the generic/monomorphized template `TypeRef` nodes a blind `P.nodes` scan hits)
-  // and intern each reachable `TyFunc`'s `$fnsig`, catching closures the name walks miss
-  // because they nest in a position no spelling-descent enumerates — a closure FIELD of a
-  // CLOSURE-RESULT struct (`(i32) => {f: () => i32}`): the TypeRef's whole name is the outer
-  // closure, so `internShapeFieldCloSigs` never runs on the result struct. Idempotent +
-  // order-stable via `cloSigPosOfKey`; the `fnValUsed` gate at the top keeps a program
-  // without function values byte-identical (this loop is unreachable when `fnValUsed` false).
+  // and intern each reachable `TyFunc`'s `$fnsig`. This is the STRUCTURAL replacement for the
+  // retired `internShapeFieldCloSigs` NAME walk (whose depth-0 `{…}`-field spelling split this
+  // supersedes measurably — byte-identical corpus + a fresh-seed fuzz A/B with zero divergence):
+  // a closure buried in a struct FIELD, a nested single-shape field, a closure/closure-array
+  // union-arm field, or a closure FIELD of a CLOSURE-RESULT struct (`(i32) => {f: () => i32}` —
+  // the TypeRef's whole name is the outer closure, no spelling-descent enumerates it) is
+  // reachable in the arena regardless of nesting. Idempotent + order-stable via `cloSigPosOfKey`;
+  // the `fnValUsed` gate at the top keeps a program without function values byte-identical (this
+  // loop is unreachable when `fnValUsed` false).
   let ri = 0
   while ri < cloSigWalkRoots.length {
     if collectTyReachCloSigs(cloSigWalkRoots[ri], 16) < 0 { return -1 }
@@ -871,7 +856,7 @@ export function collectCloSigs() {
 
 // True if the single-shape text `nm` has a closure (code 14) or nullable-closure
 // (code 22) FIELD — the `collectFnValUse` gate for a shape annotation whose field
-// cell is a closure fat-pointer. Same depth-0 field split as `internShapeFieldCloSigs`.
+// cell is a closure fat-pointer. Same depth-0 field split the `shapeHasCloField` gate uses.
 function shapeHasCloField(nm: string) {
   const inner = nm.slice(1, nm.length - 1)
   let depth = 0
@@ -922,106 +907,6 @@ function shapeHasCloField(nm: string) {
     k = k + 1
   }
   false
-}
-
-// Intern the `$fnsig` of every closure-typed FIELD of the single-shape text `nm` —
-// a code-14 field's own function type, a code-22 (nullable-closure) field's inner
-// closure. Depth-0 field split (the `registerShapeFieldUnions` grammar); idempotent
-// via `cloSigPosOfKey`, so a shape whose field closures are all concretely
-// constructed pushes nothing (byte-identical goldens).
-function internShapeFieldCloSigs(nm: string) {
-  const inner = nm.slice(1, nm.length - 1)
-  let depth = 0
-  let start = 0
-  let k = 0
-  while k <= inner.length {
-    let brk = false
-    if k == inner.length {
-      brk = true
-    } else {
-      const c = inner[k]
-      if c == '{' || c == '[' || c == '(' { depth = depth + 1 }
-      if c == '}' || c == ']' || c == ')' { depth = depth - 1 }
-      if c == ',' && depth == 0 { brk = true }
-    }
-    if brk {
-      const part = inner.slice(start, k)
-      const ci = part.indexOf(":")
-      if ci > 0 {
-        const ftxt = part.slice(ci + 1, part.length)
-        const fc = nameFieldCode(ftxt)
-        let ck = ""
-        if fc == 14 { ck = unionArmSigKey(ftxt) }
-        if fc == 22 { ck = unionArmSigKey(nullablePartOf(ftxt)) }
-        if ck == "" {
-          // A CLOSURE-ELEMENT / NUL-CLOSURE-ELEMENT list FIELD
-          // (`a: (((i32,i32,i32) => string) | null)[]`) whose program constructs NO
-          // lambda of the element type (`a: [null]` only): the narrowed element call
-          // still `ref.cast`s to the ELEMENT's `$fnsig` — un-interned, the cast/key
-          // fell back to the i32-arity sig and the call result stored an i32 where
-          // the ref result was expected: INVALID-WASM (fuzz sweep5 multiobs seed
-          // 763624784 case_00307). The field dual of the top-level closure-element
-          // array pass (same `unionArmSigKey` normalization).
-          let fel = nullClosureArrElem(ftxt)
-          if fel == "" && nameIsClosureArray(ftxt) {
-            fel = ftxt.slice(0, ftxt.length - 2)
-          }
-          if fel != "" { ck = unionArmSigKey(fel) }
-        }
-        if ck != "" {
-          if cloSigPosOfKey(ck) < 0 {
-            cloSigKeys.push(ck)
-            cloSigRepFn.push(-1)
-          }
-        }
-        // A UNION field (`z: (() => i64)[] | i32`, `f: (() => i64) | boolean`) whose arm
-        // is a CLOSURE or CLOSURE-ARRAY: the fc-14/22/array arms above see only the whole
-        // union-box field code, so the arm's `$fnsig` (`() => i64`) stays un-interned — a
-        // narrowed `t0.z is (()=>i64)[]` element call then `ref.cast`s to a sig that never
-        // exists (fuzz F5gJXz declared seed 530559367 case_00309). Split the union atoms
-        // and intern each closure / closure-array-element arm's sig (the field dual of the
-        // top-level `unMemberSet` closure-arm pass).
-        if ck == "" && unionMemberCount(ftxt) > 1 {
-          const uatoms: string[] = []
-          splitUnionAtoms(ftxt, uatoms)
-          let ua = 0
-          while ua < uatoms.length {
-            let uck = unionArmSigKey(uatoms[ua])
-            if uck == "" {
-              let uel = nullClosureArrElem(uatoms[ua])
-              if uel == "" && nameIsClosureArray(uatoms[ua]) {
-                uel = uatoms[ua].slice(0, uatoms[ua].length - 2)
-              }
-              if uel != "" { uck = unionArmSigKey(uel) }
-            }
-            if uck != "" {
-              if cloSigPosOfKey(uck) < 0 {
-                cloSigKeys.push(uck)
-                cloSigRepFn.push(-1)
-              }
-            }
-            ua = ua + 1
-          }
-        }
-        // A NESTED STRUCT field (`a: {f: (() => i64) | null}`) carries its own
-        // closure fields one level deeper. The depth-0 field split above sees only
-        // the whole nested-shape field code (not 14/22/array/union), so an inner
-        // nullable-closure's `$fnsig` (`() => i64`) stayed un-interned — a narrowed
-        // `v.a.f()` then `ref.cast`s to a sig that never exists and falls to the
-        // i32-arity fallback: INVALID-WASM ("expected i64/ref, found i32") when a
-        // sibling arity-0 lambda supplies the wrong fallback sig, or a "no interned
-        // signature" reject otherwise (fuzz 6NuCoq multiobs seed 17245159). Recurse
-        // into single-shape struct fields (nullable peel first) — idempotent via
-        // `cloSigPosOfKey`, so a fully-constructed nested shape pushes nothing.
-        let nst = nullablePartOf(ftxt)
-        if nst == "" { nst = ftxt }
-        if nameIsSingleShape(nst) { internShapeFieldCloSigs(nst) }
-      }
-      start = k + 1
-    }
-    k = k + 1
-  }
-  0
 }
 
 // Recursively walk the node at `ix` (a statement or expression subtree) and append
@@ -4348,16 +4233,18 @@ function funcRetUnrepresentable(retIx: i32): boolean {
 // ── UNIFIED ARENA CLOSURE-SIG WALK ──────────────────────────────────────────
 // The sig-interning sibling of `collectTyReachRegister`: given an annotation node's
 // resolved arena type `tyIx`, recurse over the `T.tys` shape and, on EVERY reachable
-// `TyFunc`, intern that closure's `$fnsig` key. Retires the reliance on the accreted
-// hand-maintained NAME-split descents in `collectCloSigs`/`internShapeFieldCloSigs`
-// (the closure-array / nulclosure / union-arm / nested-shape-field passes), each of
-// which added ONE new spelling-descent per fuzz finding (#987/#1006-F2/#1016/#1018/
-// #1026 …). A closure buried in a NOVEL nesting position — a closure returning a closure
-// inside a struct FIELD of a union arm (`{a: () => ((i32,i32,i32) => string), …} | i64`,
-// the #1028 sig-descent draw) — is reachable in the arena but was never enumerated by a
-// name-walk recursion (the TypeRef's whole-name is the outer union, and the closure nests
-// below every `nameIsSingleShape`/`internShapeFieldCloSigs` entry). This walk makes the
-// miss structurally impossible: it descends through every composite variant uniformly.
+// `TyFunc`, intern that closure's `$fnsig` key. RETIRED the whole `internShapeFieldCloSigs`
+// NAME walk (the depth-0 single-shape `{…}`-field spelling split — closure/nullable-closure
+// fields, closure-array fields, closure-array union-arm fields, nested single-shape fields);
+// this walk supersedes it measurably (byte-identical corpus + a fresh-seed fuzz A/B with zero
+// divergence). Still ALONGSIDE the remaining `collectCloSigs` NAME passes (the closure-array /
+// nulclosure / union-arm annotation scans), each of which historically added ONE new
+// spelling-descent per fuzz finding (#987/#1006-F2/#1016/#1018/#1026 …). A closure buried in a
+// NOVEL nesting position — a closure returning a closure inside a struct FIELD of a union arm
+// (`{a: () => ((i32,i32,i32) => string), …} | i64`, the #1028 sig-descent draw) — is reachable
+// in the arena but was never enumerated by a name-walk recursion (the TypeRef's whole-name is
+// the outer union, and the closure nests below every `nameIsSingleShape` entry). This walk makes
+// the miss structurally impossible: it descends through every composite variant uniformly.
 //
 // RENDER DISCIPLINE (mirrors `collectTyReachRegister`): a `TyFunc` is rendered with
 // `tyToNominalName` (nominal-first) then `canonEmitName` ONCE over the WHOLE render, so
@@ -4650,6 +4537,15 @@ export function collectU(stmts: i32[]) {
   let iru = 0
   while iru < inferRetCount() {
     if registerInlineUnion(stmts, inferRetTyAt(iru)) < 0 { return -1 }
+    // Arena walk over the INFERRED return type: register EVERY union reachable through
+    // the resolved type (not just the ones the `inferRetTyAt` render surfaced) and record
+    // the type as a closure-sig walk root, exactly as the annotation sites do
+    // (`collectInlineUnionsIn`). Idempotent (`registerInlineUnion` is `isUName`-gated;
+    // `cloSigWalkRoots` interning is `cloSigPosOfKey`-gated), so an inferred type whose
+    // reps the name walk already reached is a no-op — this only ADDS the coverage the
+    // render missed. #1046 made inferred variant-box returns 0-growth redundancy here.
+    if collectTyReachRegister(stmts, inferRetTyIxAt(iru), 16) < 0 { return -1 }
+    cloSigWalkRoots.push(inferRetTyIxAt(iru))
     iru = iru + 1
   }
   // Inferred VALUE-union BINDINGS (`const x = if c then v else null`): same treatment,
@@ -4727,8 +4623,8 @@ export function collectFnValUse() {
       if nameIsNulClosure(tyNameOf(i)) { fnValUsed = true }
       // A SHAPE annotation with a closure/nulclosure FIELD (`{f: () => i32} | null`): the
       // field cell is a closure fat-pointer whose member-call site (`t0.f()`) `call_ref`s
-      // through it — the closure machinery + the field's `$fnsig`
-      // (`internShapeFieldCloSigs`) must intern even when the value is only ever `null`
+      // through it — the closure machinery + the field's `$fnsig` (the arena sig walk
+      // `collectTyReachCloSigs`) must intern even when the value is only ever `null`
       // (no lambda anywhere else flips it on).
       let fvSb = nullablePartOf(tyNameOf(i))
       if fvSb == "" { fvSb = tyNameOf(i) }
