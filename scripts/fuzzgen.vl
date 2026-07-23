@@ -883,79 +883,100 @@ function dummyExp(s: Slot): string {
 // for a value built clean (no stored null, no union decoy carried), so leaves print their `dexp`
 // and nullable/union nodes take the non-null / carrier branch. Used for the readthrough of a
 // nullable map value's STORED null, which `??` coalesces to the same-shape dummy default.
-function moLogLinesDum(s: Slot): string {
+// `mo` mirrors emitRead's flag EXACTLY: only the ROOT observation (mo=1) reads a decoy's siblings /
+// a map's SECOND entry / a union's alt arm; a nested DECOY subtree recurses at mo=0 and reads only
+// its carrier spine. The oracle must gate those extra lines on the SAME `mo`, or a nested decoy map
+// (nRep>=2)/struct/union over-counts vs the program emitRead actually emits (a false MISMATCH).
+function moLogLinesDum(s: Slot, mo: i32): string {
   if s.kind == 0 { return "// @log " + s.dexp + "\n" }
   const c = s.child
   if c == null { return "// @log -1\n" }
-  if s.kind == 1 || s.kind == 2 || s.kind == 7 { return moLogLinesDum(c) }
+  if s.kind == 1 || s.kind == 2 || s.kind == 7 { return moLogLinesDum(c, mo) }
   if s.kind == 3 {
-    return moLogLinesDum(c) // a dummy is never null
+    return moLogLinesDum(c, mo) // a dummy is never null
   }
   if s.kind == 4 {
-    let r = moLogLinesDum(c)
-    if s.kids.length == 2 {
-      r = r + moLogLinesDum(s.kids[0]) + moLogLinesDum(s.kids[1])
-    } else {
-      r = r + "// @log " + s.d1exp + "\n" + "// @log " + s.d2exp + "\n"
+    let r = moLogLinesDum(c, mo)
+    // decoy siblings are read only at the root observation (emitRead gates on mo==1, kids at mo=0)
+    if mo == 1 {
+      if s.kids.length == 2 {
+        r = r + moLogLinesDum(s.kids[0], 0) + moLogLinesDum(s.kids[1], 0)
+      } else {
+        r = r + "// @log " + s.d1exp + "\n" + "// @log " + s.d2exp + "\n"
+      }
     }
     return r
   }
   if s.kind == 5 {
-    let r = moLogLinesDum(c)
+    let r = moLogLinesDum(c, mo)
     if c.kind == 3 {
       const cin = c.child
-      if cin != null { r = moLogLinesDum(cin) }
+      if cin != null { r = moLogLinesDum(cin, mo) }
     }
-    if s.nRep >= 2 { r = r + "// @log " + dummyExp(c) + "\n" }
+    // the map's SECOND entry is read only at the root observation (emitRead gates on mo==1)
+    if mo == 1 && s.nRep >= 2 { r = r + "// @log " + dummyExp(c) + "\n" }
     return r
   }
   // kind 6 union: a dummy carries the CARRIER (never the alt) — reads the carrier subtree, then
-  // the alt decoy binding (a fixed value, same as the carrier oracle's).
-  return moLogLinesDum(c) + "// @log " + s.altExp + "\n"
+  // (at the root observation only) the alt decoy binding (a fixed value, same as the carrier oracle's).
+  let r = moLogLinesDum(c, mo)
+  if mo == 1 { r = r + "// @log " + s.altExp + "\n" }
+  return r
 }
 
-function moLogLines(s: Slot): string {
+// `mo` mirrors emitRead's flag (see moLogLinesDum) — the ROOT observation is mo=1; decoy branches
+// recurse at mo=0 so their extra sibling/second-entry/alt lines are suppressed in lockstep.
+function moLogLines(s: Slot, mo: i32): string {
   if s.kind == 0 { return "// @log " + s.expected + "\n" }
   const c = s.child
   if c == null { return "// @log -1\n" }
-  if s.kind == 1 || s.kind == 2 || s.kind == 7 { return moLogLines(c) }
+  if s.kind == 1 || s.kind == 2 || s.kind == 7 { return moLogLines(c, mo) }
   if s.kind == 3 {
     if s.isNull == 1 { return "// @log NULL\n" }
-    return moLogLines(c)
+    return moLogLines(c, mo)
   }
   if s.kind == 4 {
-    let r = moLogLines(c)
-    if s.kids.length == 2 {
-      r = r +
-        "// @log " +
-        s.kids[0].expected +
-        "\n" +
-        "// @log " +
-        s.kids[1].expected +
-        "\n"
-    } else {
-      r = r + "// @log " + s.d1exp + "\n" + "// @log " + s.d2exp + "\n"
+    let r = moLogLines(c, mo)
+    // decoy siblings are read only at the root observation (emitRead gates on mo==1)
+    if mo == 1 {
+      if s.kids.length == 2 {
+        r = r +
+          "// @log " +
+          s.kids[0].expected +
+          "\n" +
+          "// @log " +
+          s.kids[1].expected +
+          "\n"
+      } else {
+        r = r + "// @log " + s.d1exp + "\n" + "// @log " + s.d2exp + "\n"
+      }
     }
     return r
   }
   if s.kind == 5 {
     // A NULLABLE map value coalesces to the non-null inner (`c.child`): a stored null reads the
     // DUMMY, else the carrier — mirroring emitRead's `rc = c.child` read.
-    let r = moLogLines(c)
+    let r = moLogLines(c, mo)
     if c.kind == 3 {
       const cin = c.child
       if cin != null {
-        if c.isNull == 1 { r = moLogLinesDum(cin) } else { r = moLogLines(cin) }
+        if c.isNull == 1 {
+          r = moLogLinesDum(cin, mo)
+        } else {
+          r = moLogLines(cin, mo)
+        }
       }
     }
-    if s.nRep >= 2 { r = r + "// @log " + dummyExp(c) + "\n" }
+    // the map's SECOND entry is read only at the root observation (emitRead gates on mo==1)
+    if mo == 1 && s.nRep >= 2 { r = r + "// @log " + dummyExp(c) + "\n" }
     return r
   }
   // kind 6 union: the primary read prints the carrier subtree (or OTHER when it carries the decoy),
-  // then the alt second binding prints the decoy arm's read-back value.
+  // then (at the root observation only) the alt second binding prints the decoy arm's read-back value.
   let r = "// @log OTHER\n"
-  if s.carriesAlt == 0 { r = moLogLines(c) }
-  return r + "// @log " + s.altExp + "\n"
+  if s.carriesAlt == 0 { r = moLogLines(c, mo) }
+  if mo == 1 { r = r + "// @log " + s.altExp + "\n" }
+  return r
 }
 
 // Statements reading the payload reachable from `acc` and printing it. A nullable / union / map hop
@@ -1292,7 +1313,7 @@ function go() {
     // stays lockstep with emitRead's mo=1 print order). moLogLines draws no random, so this leaves
     // the OFF stream — and every downstream case — byte-identical.
     let logHdr = "// @log " + s.expected + "\n"
-    if MULTIOBS == 1 { logHdr = moLogLines(s) }
+    if MULTIOBS == 1 { logHdr = moLogLines(s, 1) }
     // ── DECLTYPES (opt-in). shapeTy = the stable `@shape` type (declared → `<marker>:{...}` inline,
     // never the minted `Tn`); readBody = the read-case body ("" → the master assemble()); ctorAnnTy
     // = the construct-only annotation. OFF: the block is skipped (no draws), so all three keep their
