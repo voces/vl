@@ -15574,7 +15574,19 @@ export function exprString(exprIx: i32, fnIx: i32) {
         // string claim would route `print` to the ref path over the raw i32 atom —
         // INVALID-WASM (fuzz post-#991 branching leg, seed 142348133 case_00233).
         // The member dual of the Ident-callee `calleeReturnsString` gate above.
-        if fRetKind[ffe] == "str" { return !nodeTyIsLitUnionAlias(exprIx) }
+        if fRetKind[ffe] == "str" {
+          if nodeTyIsLitUnionAlias(exprIx) { return false }
+          // A `{f: (…) => string}` field beside a `{f: (…) => boolean}` twin collapses to
+          // the SAME layout heap type, so `fieldClosureFeOf` can resolve the OTHER field's
+          // STRING lambda for a genuinely-BOOLEAN (or other non-string) closure call. Trust
+          // the CHECKER's recorded result type when present: it typed `p.z.f(1,1,1)` boolean
+          // (kind 0), so the string routing is wrong — `print` would read a raw i32 as a
+          // string ref (INVALID-WASM; fuzz sweep wo7cNe declared, seed 172658796). Fall back
+          // to the fe's kind only when the node is un-typed (defensive).
+          const nts = nodeTyIxOf(exprIx)
+          if nts >= 0 { return tyKindOf(nts) == 3 }
+          return true
+        }
         return false
       }
     }
@@ -16404,7 +16416,16 @@ export function cloCallUnionResultUnrepresentable(
         nulBoxScalar = true
       }
     }
-    if !nulBoxScalar { return false }
+    if !nulBoxScalar {
+      // A NULLABLE value-UNION result (`(() => string | null)[] | i32 | null` =
+      // TyNullable(TyUnion)): the non-null spelling (`(…)[] | i32`) floors via the main union
+      // analysis, but the outer `| null` wraps it in TyNullable, bypassing that branch. Route
+      // the inner union through the SAME scalar+composite analysis so the nullable spelling
+      // floors too rather than TRAP at the narrow's `ref.cast` (fuzz sweep wo7cNe declared
+      // backlog, `() => (() => string | null)[] | i32 | null`).
+      if nit is TyUnion { return cloCallUnionMixUnrep(tn.nInner, callIx, fnIx) }
+      return false
+    }
     const nkey = cloCallSigKey(callIx, fnIx)
     if nkey == "" { return true }
     const nrk = sigKeyRetKind(nkey)
@@ -16412,6 +16433,16 @@ export function cloCallUnionResultUnrepresentable(
     if nrk != "union" { return true }
     return cloSigPosOfKey(nkey) < 0
   }
+  if !(T.tys[ty] is TyUnion) { return false }
+  return cloCallUnionMixUnrep(ty, callIx, fnIx)
+}
+
+// The scalar+composite value-union analysis of `cloCallUnionResultUnrepresentable`, factored
+// so BOTH a direct TyUnion result AND a NULLABLE-wrapped union result (`(…)[] | i32 | null` =
+// TyNullable(TyUnion), whose `| null` bypasses the main TyUnion branch) run the identical
+// representability test. `ty` is the UNION type index; `callIx`/`fnIx` drive the `$fnsig`
+// producer checks (the same call node in both spellings).
+function cloCallUnionMixUnrep(ty: i32, callIx: i32, fnIx: i32): boolean {
   const t = T.tys[ty]
   if !(t is TyUnion) { return false }
   if t.uMembers.length < 2 { return false }
@@ -16483,6 +16514,26 @@ export function cloCallUnionResultUnrepresentable(
     const prk = sigKeyRetKind(pk)
     if prk != null && prk != "union" { return true }
   }
+  // A param/arg-fed closure (no resolvable producer, `pk == ""`) whose value-union result
+  // carries a MAP-ARRAY arm (`{[string]: f32}[] | f64`): the DIRECT binding of such a union
+  // already rejects as "not yet representable" (its `>u` box is never interned, so the
+  // `cloSigPosOfKey < 0` arm above catches it), but a NULLABLE-closure annotation
+  // (`((i32,i32,i32) => {[string]:f32}[] | f64) | null`) interns the box on the annotation
+  // side, slipping that check. Without a producer we cannot prove the closure VALUE carries
+  // the box, and the map-array composite arm is the deferred value-union-result hole
+  // (struct/closure/scalar-list/struct-list arms all rep fine) — reject cleanly rather than
+  // TRAP at the narrow's `ref.cast` (fuzz sweep wo7cNe branching, seed 565560412).
+  if pk == "" && tyUnionHasMapArrayArm(ty) { return true }
+  // A param/arg-fed closure (no resolvable producer, `pk == ""`) whose value-union result
+  // carries a CLOSURE-ARRAY arm (`(() => string | null)[] | i32`): the DIRECT binding of such
+  // a union already rejects as "not yet representable" (its `>u` box is never interned), but an
+  // outer `| null` on the union (`(() => string | null)[] | i32 | null`) interns the box on the
+  // annotation side, slipping the `cloSigPosOfKey < 0` arm above. Without a producer we cannot
+  // prove the closure VALUE carries the box, and the closure-array composite arm is the deferred
+  // value-union-result hole (struct-list / scalar-list arms rep fine) — reject cleanly rather
+  // than TRAP at the value call's `ref.cast` (fuzz sweep wo7cNe declared backlog, `() => (() =>
+  // string | null)[] | i32 | null`). The closure-array sibling of the map-array arm above.
+  if pk == "" && tyUnionHasClosureArrayArm(ty) { return true }
   // An INDEXED closure-array-element callee (`f[0]()` / `p.f[0]()`) whose result union has a
   // VALUE-UNION-element-ARRAY arm (`(i64|boolean)[] | i32`): the element sig is the array-
   // element ANNOTATION's box (`>u`), while the array may hold a concrete lambda that self-
@@ -16528,6 +16579,52 @@ function tyUnionHasValueUnionElemArrayArm(ty: i32): boolean {
           }
           if hasPrim { return true }
         }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True when the TyUnion at `ty` has a MEMBER that is an ARRAY whose element is a MAP
+// (`{[string]: f32}[]`). This arm is a deferred hole in a closure-RESULT value union:
+// the box-of-map-array rep does not yet compose through a closure result (the DIRECT
+// binding rejects as "not yet representable"). A struct-array (`{w:i32}[]`), plain
+// scalar-list (`i32[]`), struct, or closure arm is NOT flagged — those rep fine.
+function tyUnionHasMapArrayArm(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  let i = 0
+  while i < t.uMembers.length {
+    const m = T.tys[t.uMembers[i]]
+    if m is TyArray {
+      if T.tys[m.aElem] is TyMap { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True when the TyUnion at `ty` has a MEMBER that is an ARRAY whose element is a CLOSURE
+// (`(() => string | null)[]`, `((i32) => f64)[]` — a nullable-closure element peels its
+// `| null` to the TyFunc). This arm is a deferred hole in a closure-RESULT value union: the
+// box-of-closure-array rep does not yet compose through a closure result (the DIRECT binding
+// rejects as "not yet representable"). A struct-array / scalar-list arm is NOT flagged — those
+// rep fine.
+function tyUnionHasClosureArrayArm(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  let i = 0
+  while i < t.uMembers.length {
+    const m = T.tys[t.uMembers[i]]
+    if m is TyArray {
+      let el = m.aElem
+      const en = T.tys[el]
+      if en is TyNullable { el = en.nInner }
+      if el >= 0 {
+        if T.tys[el] is TyFunc { return true }
       }
     }
     i = i + 1

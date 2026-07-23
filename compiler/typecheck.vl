@@ -8466,6 +8466,21 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // NESTED (2-D+) UNION-ELEMENT array result (`() => ({f: (…) => boolean} | i32)[][]`):
+        // a lambda whose body nested array literal (`[[77], [{f:…}]]` self-infers `i32[][]`
+        // from the first inner list's leaf) is assignable to the expected 2-D+ box-element
+        // list adopts it, so `emitReturnValue` builds the nested lists through the SAME
+        // element-kind-2 box the annotated `(…)[][]` return / NAMED-function value spelling
+        // already lowers soundly (`synthRetAnnots` pins `fnRet` via `nameIsNestedUnionElemArray`).
+        // Un-pinned, the outer array self-classified `i32[][]` and stored a union-list element
+        // into the i32-list backing — INVALID-WASM (fuzz sweep wo7cNe declared, seed 174529790).
+        // The nested sibling of the 1-D element-value/variant/map-union arms above.
+        if inferred != expRet && nestedElemUnionListRetName(expRet) != "" {
+          const nueTail = lambdaBodyTail(n.fnBody)
+          if nueTail >= 0 && assignableExpr(nueTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
         // UNION-FIELD-STRUCT-element LIST result (`() => {f: {f: f64} | boolean}[]`): a
         // lambda whose body array literal is assignable to the expected list of
         // boxed-field structs adopts it, so each element literal builds the boxed field
@@ -8762,6 +8777,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // union-element-array + scalar union), whose element boxing `emitReturnValue` already
         // performs for the annotated form.
         if unm == "" { unm = elemRefArmValueUnionListRetName(inferred) }
+        // A NESTED (2-D+) union-element array contextual return (`() => ({f:…}|i32)[][]`,
+        // adopted just above) — record its emitter name so `synthRetAnnots` pins the lambda's
+        // `fnRet` as the nested box-element array (its `nameIsNestedUnionElemArray` arm), whose
+        // return-position `pendingListKind` threading + `$fnsig` reflist-slot keying the
+        // annotated NAMED-function form already performs.
+        if unm == "" { unm = nestedElemUnionListRetName(inferred) }
         // A UNION-FIELD-STRUCT-element list contextual return (`() => {f: {f:f64}|boolean}[]`,
         // adopted just above) — record its emitter name so `synthRetAnnots` pins the lambda's
         // `fnRet` as the boxed-field-element list, whose element boxing the annotated
@@ -10364,6 +10385,48 @@ function elemRefArmValueUnionListRetName(er: i32) {
   }
   if !hasArr { return "" }
   tyToEmitName(er)
+}
+
+// The emitter-format NAME of an inferred NESTED (2-D+) union-element array return `er` —
+// `({f: (i32,i32,i32) => boolean} | i32)[][]`, `(i64 | boolean)[][]`. A `TyArray` whose
+// element is ITSELF an array (≥2 dims) and whose innermost 1-D leaf array is one of the
+// recognized box-element lists (value-union / variant-box / map-union). Its elements are
+// nested ref-lists bottoming out at the kind-2 `{tag, payload}` box — the SAME rep the
+// annotated `(…)[][]` return / named-function-VALUE spelling already lowers soundly (a NAMED
+// fn with the explicit 2-D annotation works today). The emitter pins a lambda to it
+// (`synthRetAnnots`'s `nameIsNestedUnionElemArray` arm), so the body's nested array literal
+// builds under the return-position `pendingListKind` threading instead of self-classifying
+// the outer array from its first element's leaf (`[77]` → `i32[][]`) — INVALID-WASM at the
+// union-list element (fuzz sweep wo7cNe declared, seed 174529790). The nested sibling of
+// the 1-D `elemValueUnionListRetName` / `elemVariantBoxListRetName` / `elemMapUnionListRetName`.
+function nestedElemUnionListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if !(t is TyArray) { return "" }
+  if t.aElem < 0 { return "" }
+  const inner = T.tys[t.aElem]
+  if !(inner is TyArray) { return "" }
+  // Peel to the innermost (leaf) 1-D array.
+  let leafArr = t.aElem
+  let done = false
+  while !done {
+    const la = T.tys[leafArr]
+    if la is TyArray {
+      if la.aElem < 0 { return "" }
+      const le = T.tys[la.aElem]
+      if le is TyArray { leafArr = la.aElem } else { done = true }
+    } else {
+      done = true
+    }
+  }
+  if (
+    elemValueUnionListRetName(leafArr) != "" ||
+    elemVariantBoxListRetName(leafArr) != "" ||
+    elemMapUnionListRetName(leafArr) != ""
+  ) {
+    return tyToEmitName(er)
+  }
+  ""
 }
 
 // The emitter-format NAME of a CLOSURE-ARM value union return `er` (`(()=>string)|i64`,
