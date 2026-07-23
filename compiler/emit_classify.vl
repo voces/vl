@@ -21,6 +21,7 @@ import {
   inferRetNameOf,
   isInferLetNulBool,
   isInferLetNulStr,
+  isTopLevelFuncTypeName,
   isValueUnionName,
   nameIsFuncTypeAtom,
   nameIsLitUnionArmValueUnion,
@@ -2618,6 +2619,15 @@ export function mvCanonValName(valName: string) {
   // never a legit mv key — pass it through untouched so the kind classifier's -3
   // unsupported path fails LOUDLY instead of splitting/rendering a runaway name.
   if valName.length > 4096 { return valName }
+  // A ref-LIST value (`(K0|i32)[]`, the map value of `{[string]: (K0|i32)[]}`): soften its
+  // element union's litunion aliases THROUGH the array wrapper — the same canon
+  // `rlInternName` keys the vals ref-list slot on. Without this the annotation spelling and
+  // a self-inferred factory-return lambda (`() => (h0)`) minted twin mv/map structs, a cast
+  // TRAP at the returned-map read. (Func-type element arrays are left untouched inside.)
+  const vn = valName.length
+  if vn > 2 && valName[vn - 2] == '[' && valName[vn - 1] == ']' {
+    return rlCanonLitUnionAtoms(valName)
+  }
   if unionMemberCount(valName) < 2 { return valName }
   const atoms: string[] = []
   splitUnionAtoms(valName, atoms)
@@ -5448,6 +5458,56 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     }
   }
   ""
+}
+
+// The PRODUCER (concrete-lambda) `$fnsig` key of a function-VALUE binding `name` — the
+// functype the lambda VALUE actually carries (`cloSigKeyExt` of the resolved lambda),
+// chasing a plain copy to the source binding's initializer lambda. "" when `name` does
+// not resolve to a concrete lambda.
+function producerCloSigKey(name: string, fnIx: i32) {
+  const fe = identClosureFe(name, fnIx)
+  if fe >= 0 { return cloSigKeyExt(fe) }
+  const src = identCopySource(name, fnIx)
+  if src != "" && src != name { return producerCloSigKey(src, fnIx) }
+  ""
+}
+
+// SOUNDNESS FLOOR: a function-VALUE call whose RESOLVED cast `$fnsig` (`cloCallSigKey` — the
+// EXACT key `emitCallRef` casts the value to) and its concrete PRODUCER lambda's `$fnsig` are
+// BOTH interned REF-LIST results on DIFFERENT, non-layout-twin element slots — a latent twin.
+// A lambda whose literal element is NON-nullable (`() => ([{f: () => string}])`) self-infers a
+// `>r<nonNullSlot>;` sig, while the binding annotation's NULLABLE element (`() => ({f: () =>
+// string} | null)[]`) keys `>r<nullableSlot>;`; the two ref-list WRAPPER structs are distinct
+// heap types (array elements are INVARIANT — `(array (ref $e))` is not `(array (ref null $e))`),
+// so the call-ref `ref.cast` to the annotation's wrapper TRAPS on the producer's. `rlSlotsLayoutTwin`
+// gates OUT the benign case where the two slots dedup to one wrapper (no trap). Reject LOUDLY —
+// the deferred nullable-element ref-list composition (#875 / the twin-matcher rewrite); the
+// DIRECT array binding (element built nullable in place) lowers fully.
+export function cloCallReflistElemTwin(callIx: i32, fnIx: i32): boolean {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cre = P.nodes[c.callFn]
+    if cre is Ident {
+      const castK = cloCallSigKey(callIx, fnIx)
+      if castK == "" { return false }
+      const prodK = producerCloSigKey(cre.identName, fnIx)
+      if prodK == "" { return false }
+      if prodK == castK { return false }
+      if cloSigPosOfKey(castK) < 0 { return false }
+      if cloSigPosOfKey(prodK) < 0 { return false }
+      const crk = sigKeyRetKind(castK)
+      const prk = sigKeyRetKind(prodK)
+      if crk == null || prk == null { return false }
+      if crk == "reflist" && prk == "reflist" {
+        const cs = sigKeyRetSlot(castK)
+        const ps = sigKeyRetSlot(prodK)
+        if cs >= 0 && ps >= 0 && cs != ps {
+          if rlSlotsLayoutTwin(cs, ps) == 0 { return true }
+        }
+      }
+    }
+  }
+  false
 }
 
 // True if the list at `arrIx` carries BOOLEAN elements: a `[true, ...]` literal, a
@@ -8544,6 +8604,55 @@ function rlElemNicheNullable(kind: i32, name: string) {
   return nullablePartOf(name) != ""
 }
 
+// Soften every litunion-ALIAS atom in an element NAME to its boxed `string` atom
+// (`K0|i32` → `string|i32`, R3's rule), DESCENDING through array-of-union and paren
+// grouping so `(K0|i32)[]` canonicalizes to `(string|i32)[]`. A closure element / a
+// top-level function type is left untouched (its `=>`-result litunion is not a slot-key
+// union — descending would corrupt its param/result parens). Mirrors `canonEmitName`'s
+// guarded array/paren descent with the litunion-alias softening `canonEmitName` omits.
+function rlCanonLitUnionAtoms(name: string): string {
+  const n = name.length
+  if n == 0 { return name }
+  if isTopLevelFuncTypeName(name) { return name }
+  // A trailing `[]`: canon the element, re-grouping a union element with parens
+  // (`(K0|i32)[]`), exactly as `canonEmitName` re-wraps.
+  if n > 2 && name[n - 2] == '[' && name[n - 1] == ']' {
+    const core = rlCanonLitUnionAtoms(name.slice(0, n - 2))
+    if unionMemberCount(core) > 1 { return "(" + core + ")[]" }
+    if isTopLevelFuncTypeName(core) { return "(" + core + ")[]" }
+    return core + "[]"
+  }
+  // A parenthesized group wrapping the whole: strip and canon the inside — UNLESS the
+  // inner is a function type (`((i32) => K0)` — a GROUPED closure element, whose grouping
+  // parens are part of its ref-list slot key; stripping them re-keys the slot, and its
+  // `=>`-result litunion is not a slot-key union anyway). Leave such a name untouched.
+  if name[0] == '(' && name[n - 1] == ')' {
+    const inner = name.slice(1, n - 1)
+    if isTopLevelFuncTypeName(inner) { return name }
+    return rlCanonLitUnionAtoms(inner)
+  }
+  // A top-level union: soften each litunion-alias atom.
+  if unionMemberCount(name) > 1 {
+    const atoms: string[] = []
+    splitUnionAtoms(name, atoms)
+    let changed = false
+    let canon = ""
+    let i = 0
+    while i < atoms.length {
+      let a = atoms[i]
+      if nameIsLitUnionType(a) {
+        a = "string"
+        changed = true
+      }
+      if i > 0 { canon = canon + "|" }
+      canon = canon + a
+      i = i + 1
+    }
+    if changed { return canon }
+  }
+  name
+}
+
 export function rlInternName(name: string, kind: i32) {
   if name == "" { return -1 }
   // Canonicalize a litunion-ALIAS atom inside a union element name to its boxed
@@ -8556,26 +8665,12 @@ export function rlInternName(name: string, kind: i32) {
   // functypes (iso-recursive typing), so a named fn-value's declared functype
   // and the call site's `ref.cast` disagreed — a runtime cast failure. The same
   // transform as the lookup fallback, applied at the single intern point, keeps
-  // the table canonical and every producer on one slot.
-  let name2 = name
-  if unionMemberCount(name2) > 1 {
-    const cAtoms: string[] = []
-    splitUnionAtoms(name2, cAtoms)
-    let cChanged = false
-    let cCanon = ""
-    let cI = 0
-    while cI < cAtoms.length {
-      let ca = cAtoms[cI]
-      if nameIsLitUnionType(ca) {
-        ca = "string"
-        cChanged = true
-      }
-      if cI > 0 { cCanon = cCanon + "|" }
-      cCanon = cCanon + ca
-      cI = cI + 1
-    }
-    if cChanged { name2 = cCanon }
-  }
+  // the table canonical and every producer on one slot. `rlCanonLitUnionAtoms`
+  // extends the softening THROUGH array-of-union wrapping (`(K0|i32)[]` → the
+  // map-VALUE ref-list element of `{[string]: (K0|i32)[]}`, where the annotation
+  // and the self-inferred factory-return lambda otherwise minted twin mv/map
+  // structs — a cast TRAP at the returned-map read).
+  const name2 = rlCanonLitUnionAtoms(name)
   let i = 0
   while i < rlElemName.length {
     if rlElemName[i] == name2 { return i }
@@ -8610,6 +8705,16 @@ export function rlSlotByName(name: string) {
   while i < rlElemName.length {
     if rlElemName[i] == name { return i }
     i = i + 1
+  }
+  // The canonical form softens litunion-alias atoms THROUGH array-of-union wrapping
+  // (`(K0|i32)[]` → `(string|i32)[]`), the same transform `rlInternName` keys the slot on.
+  const cn = rlCanonLitUnionAtoms(name)
+  if cn != name {
+    let ci = 0
+    while ci < rlElemName.length {
+      if rlElemName[ci] == cn { return ci }
+      ci = ci + 1
+    }
   }
   // A LITUNION-ALIAS atom inside a union ELEMENT name (`K0|i32` — the verbatim text of an
   // `is (K0 | i32)[]` variant or its narrow key): the interning side keys the slot on the
@@ -16101,22 +16206,51 @@ export function cloCallUnionResultUnrepresentable(
     }
     i = i + 1
   }
-  if !hasScalar || !hasComposite { return false }
+  if !hasComposite { return false }
   // Rep-consistent only when the resolved closure `$fnsig` result IS the union box (`>u`).
   // No sig, an unparseable result, or a concrete-member result token (`>s…`, a scalar) means
-  // the box read has nothing to recover — the deferred hole. Reject.
+  // the box read has nothing to recover — the deferred hole for a scalar+composite mix. A
+  // COMPOSITE-ONLY union that resolves to a NON-box rep (a `Cat | Dog` VARIANT, `>V…;`, or no
+  // sig) is the working variant path — only the scalar+composite mix is a definite hole there,
+  // so those arms return `hasScalar` (reject the mix, pass the variant union through).
   const ckey = cloCallSigKey(callIx, fnIx)
-  if ckey == "" { return true }
+  if ckey == "" { return hasScalar }
   const rk = sigKeyRetKind(ckey)
-  if rk == null { return true }
-  if rk != "union" { return true }
+  if rk == null { return hasScalar }
+  if rk != "union" { return hasScalar }
   // A `>u` KEY TEXT alone is not consistency — some PRODUCER must have interned this exact
   // key (the box-result functype exists). A ref-arm union result (`{…}[] | i32`) renders
   // `>u` from the annotation while the lambda self-infers its bare scalar arm and never
   // interns it: the call then fell back to the all-i32 arity sig and stored the raw i32
   // into the box-typed local — INVALID-WASM (fuzz frontier seed 615401451 d6 --branching,
-  // any arity). Un-interned `>u` is the same deferred hole: reject loudly.
-  cloSigPosOfKey(ckey) < 0
+  // any arity). Un-interned `>u` is the same deferred hole for the mix: reject loudly.
+  if cloSigPosOfKey(ckey) < 0 { return hasScalar }
+  // The `>u` box IS interned (e.g. by an outer NULLABLE-closure annotation, or an inline
+  // composite-arm union), yet the concrete PRODUCER lambda self-inferred a NON-union arm
+  // (`(q0) => ([…])` reps the bare string-LIST arm `>A`, or a ref-list `>r…;`), so the closure
+  // VALUE carries that functype while the call casts to `>u` — an iso-recursive twin cast TRAP.
+  // This catches BOTH the nullable value-union spelling that bypassed the un-interned-`>u`
+  // check (the box minted on the annotation side: `((i32,i32,i32) => (() => i64)[] | i32) | null`)
+  // AND the ref-arm+struct-arm composite-only union (`(i32) => (f32 | string)[] | {w: i32}`,
+  // box vs `>A`). The deferred #938/#875 value-union-result composition; reject cleanly.
+  const pk = callProducerCloSigKey(callIx, fnIx)
+  if pk != "" && pk != ckey {
+    const prk = sigKeyRetKind(pk)
+    if prk != null && prk != "union" { return true }
+  }
+  false
+}
+
+// The concrete PRODUCER lambda's `$fnsig` key for a value-CALL whose callee is a plain
+// Ident binding — the functype the closure VALUE actually carries. "" for a non-Ident
+// callee or an unresolvable producer.
+function callProducerCloSigKey(callIx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cre = P.nodes[c.callFn]
+    if cre is Ident { return producerCloSigKey(cre.identName, fnIx) }
+  }
+  ""
 }
 
 // The interned SLOT of a slot-carrying result token (`>s3;`, `>n1;`, `>V0;`, `>r2;`,
