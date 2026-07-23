@@ -8431,6 +8431,20 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // ELEMENT-REFARM-VALUE-UNION LIST result (`() => ((i32|boolean)[] | i32)[]`): a lambda
+        // whose body array literal (`() => ([77])` infers `i32[]`) is assignable to the expected
+        // list of `(union-element-array | scalar)` boxes adopts it, so `emitReturnValue` boxes
+        // each element through the SAME element-kind-2 box the annotated `((i32|boolean)[]|i32)[]`
+        // return / named-function-VALUE spelling already lowers (`synthRetAnnots` pins `fnRet` via
+        // its `parenUnionArrElemName` arm). Un-pinned, the body's `i32[]` self-classified a plain
+        // reflist keyed on a DIFFERENT `$fnsig` slot than the annotation-side value call's box-list
+        // slot — a cast-failure TRAP. The union-element-array sibling of the element-value-union arm.
+        if inferred != expRet && elemRefArmValueUnionListRetName(expRet) != "" {
+          const raeTail = lambdaBodyTail(n.fnBody)
+          if raeTail >= 0 && assignableExpr(raeTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
         // UNION-FIELD-STRUCT-element LIST result (`() => {f: {f: f64} | boolean}[]`): a
         // lambda whose body array literal is assignable to the expected list of
         // boxed-field structs adopts it, so each element literal builds the boxed field
@@ -8715,6 +8729,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // `fnRet` as the map-union-box element list, whose element boxing `emitReturnValue`
         // already performs for the annotated form.
         if unm == "" { unm = elemMapUnionListRetName(inferred) }
+        // An ELEMENT-REFARM-VALUE-UNION list contextual return (`() => ((i32|boolean)[]|i32)[]`,
+        // adopted just above) — record its emitter name so `synthRetAnnots` pins the lambda's
+        // `fnRet` as the box-list (its `parenUnionArrElemName` arm registers the inner
+        // union-element-array + scalar union), whose element boxing `emitReturnValue` already
+        // performs for the annotated form.
+        if unm == "" { unm = elemRefArmValueUnionListRetName(inferred) }
         // A UNION-FIELD-STRUCT-element list contextual return (`() => {f: {f:f64}|boolean}[]`,
         // adopted just above) — record its emitter name so `synthRetAnnots` pins the lambda's
         // `fnRet` as the boxed-field-element list, whose element boxing the annotated
@@ -10236,6 +10256,53 @@ function elemMapUnionListRetName(er: i32) {
     if en != "" { return "(" + en + ")[]" }
   }
   ""
+}
+
+// The emitter-format NAME of an inferred ELEMENT-REFARM-VALUE-UNION list return `er` —
+// `((i32|boolean)[] | i32)[]`: a `TyArray` whose element is a union mixing a VALUE-union-element
+// ARRAY arm (`(i32|boolean)[]` — a union-element list, itself the kind-2 box list) with scalar
+// prim siblings. The element union's arms box as `{tag, payload}` (the array arm rides the box's
+// anyref `value` as a REF atom, the scalar arm boxes its value) — the SAME rep the annotated
+// `((i32|boolean)[]|i32)[]` return / named-function-VALUE spelling already lowers soundly, so the
+// emitter pins a lambda to it (`synthRetAnnots`'s `parenUnionArrElemName` arm registers the inner
+// union). Un-pinned, the body's `[77]` self-classified a plain `i32[]` reflist keyed on a
+// DIFFERENT `$fnsig` slot than the annotation-side value call's box-list slot — a cast-failure TRAP
+// (fuzz sweep zq0NPY multiobs, seed 24438928 case_00007). The union-element-array sibling of
+// `elemValueUnionListRetName` (which owns pure-scalar value-union elements) — its array arm is what
+// `variantBoxUnionRetName` / `refArmUnionRetName` decline (an array-of-scalar-union, not obj). ""
+// otherwise.
+function elemRefArmValueUnionListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if !(t is TyArray) { return "" }
+  if t.aElem < 0 { return "" }
+  const et = T.tys[t.aElem]
+  if !(et is TyUnion) { return "" }
+  const members = et.uMembers
+  if members.length < 2 { return "" }
+  let hasArr = false
+  let mi = 0
+  while mi < members.length {
+    const m = T.tys[members[mi]]
+    if m is TyArray {
+      // The array element must render as a VALUE union the emitter boxes (`(i32|boolean)[]`);
+      // a niche `(scalar|null)[]` element (`isValueUnionName` excludes it) or a struct/map/closure
+      // element is NOT this family — those stay on their own paths / loud rejects.
+      const eln = tyToEmitName(m.aElem)
+      if eln == "" { return "" }
+      if !isValueUnionName(eln) { return "" }
+      hasArr = true
+    } else if m is TyPrim {
+      // A scalar-prim sibling boxes as a value atom (`i32`) — fine.
+    } else {
+      // A struct / map / closure / nested-array sibling widens the family beyond the sound
+      // annotated box; decline so those stay on their established routes.
+      return ""
+    }
+    mi = mi + 1
+  }
+  if !hasArr { return "" }
+  tyToEmitName(er)
 }
 
 // The emitter-format NAME of a CLOSURE-ARM value union return `er` (`(()=>string)|i64`,
