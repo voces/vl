@@ -69,6 +69,35 @@ Deno.test({ name: "playground-run: compile yields no bytes + a diagnostic on a t
   if (diagnostics.length === 0) throw new Error("expected a diagnostic");
 });
 
+Deno.test({ name: "playground-run: an EMIT-stage failure yields a POSITIONED error diagnostic", ignore }, async () => {
+  // The squiggle pass (`check`) runs parse+type only; an emit-stage failure
+  // surfaces solely under codegen (`compile`). Before the span fix it was
+  // positionless (line 0), so the playground counted "1 error" yet the
+  // Diagnostics pane — which the Run verdict points at — rendered nothing. Now the
+  // diagnostic anchors at the failing function's declaration (`useIt`, line 4 →
+  // LSP 0-based line 3), so the pane has a real location to show.
+  const src = "function makeIt(): (i32) => {f: i64[] | null} {\n" +
+    "  return (q0) => ({ f: [1, 2] })\n" +
+    "}\n" +
+    "function useIt() {\n" +
+    "  const v: (i32) => {f: i64[] | null} = makeIt()\n" +
+    "  const s = v(1)\n" +
+    "  print(0)\n" +
+    "}\n" +
+    "useIt()\n";
+  const { bytes, diagnostics } = await seedChecker().compile(src, "main.vl", noSiblings);
+  if (bytes !== undefined) throw new Error("expected no bytes for an emit-stage failure");
+  const errors = diagnostics.filter((d) => d.severity === "error");
+  if (errors.length !== 1) {
+    throw new Error(`expected 1 emit error, got: ${JSON.stringify(diagnostics)}`);
+  }
+  // Positioned (not the old positionless line-0/col-0 span) — anchored at `useIt`.
+  assertEquals(errors[0].range.start.line, 3, "emit error anchors at useIt's line");
+  if (errors[0].range.start.character <= 0) {
+    throw new Error(`expected a non-zero column, got ${errors[0].range.start.character}`);
+  }
+});
+
 Deno.test({ name: "playground-run: runProgram compiles + runs + captures print output", ignore }, async () => {
   const result = await runProgram("print(42)\nlet s = 0\nwhile s < 10 { s = s + 1 }\nprint(s)\n", seedChecker());
   if (result.diagnostics.some((d) => d.severity === "error")) {
