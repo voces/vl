@@ -611,6 +611,15 @@ const isLocationless = (d: VLDiagnostic): boolean => {
 
 type AggregatedDiag = { file: string; diag: VLDiagnostic };
 
+// Diagnostics from the last Run's CODEGEN pass (emit-stage failures + runtime
+// traps), overlaid on the per-keystroke `check` diagnostics. The squiggle pass
+// (`lsp.diagnostics` → the seed's `check`) runs parse + type only — it does NOT
+// run the emitter — so an emit-stage failure ("Cannot run — 1 error") would
+// otherwise leave the Diagnostics pane empty ("✓ No problems found"), the very
+// tab the Run verdict tells the user to consult. Set on a failed Run, cleared on
+// a clean Run or the next edit (a codegen result is stale once the source changes).
+let codegenDiags: AggregatedDiag[] = [];
+
 // Recompute per-file diagnostics, set Monaco markers on each model, and re-render
 // the aggregated Diagnostics pane.
 //
@@ -639,12 +648,29 @@ const refreshDiagnostics = async (): Promise<void> => {
   for (const f of files) {
     const model = models.get(f.name);
     if (!model) continue;
-    const diags = perFile.get(f.name) ?? [];
-    monaco.editor.setModelMarkers(model, VL_LANGUAGE_ID, diags.map(toMarker));
-    for (const d of diags) all.push({ file: f.name, diag: d });
+    const checkDiags = perFile.get(f.name) ?? [];
+    // Fold in the last Run's codegen diagnostics for this file (emit errors carry
+    // a source span from the seed now; a runtime trap is positionless). Deduped
+    // against the check diagnostics by (message, position) so a parse/type error
+    // reported by BOTH passes appears once.
+    const overlay = codegenDiags
+      .filter((c) => c.file === f.name)
+      .map((c) => c.diag)
+      .filter((d) => !checkDiags.some((k) => sameDiag(k, d)));
+    const merged = [...checkDiags, ...overlay];
+    monaco.editor.setModelMarkers(model, VL_LANGUAGE_ID, merged.map(toMarker));
+    for (const d of merged) all.push({ file: f.name, diag: d });
   }
   renderDiagnostics(all);
 };
+
+// Two diagnostics are "the same" when their message and start position match —
+// used to dedupe the codegen overlay against the check pass (both report a
+// parse/type error, only codegen reports an emit error).
+const sameDiag = (a: VLDiagnostic, b: VLDiagnostic): boolean =>
+  a.message === b.message &&
+  a.range.start.line === b.range.start.line &&
+  a.range.start.character === b.range.start.character;
 
 const SEVERITY_RANK: Record<VLDiagnostic["severity"], number> = {
   error: 0,
@@ -924,10 +950,19 @@ const run = async () => {
         "error",
       );
       tabMeta.textContent = "";
+      // Surface the codegen diagnostics (whole-program, so keyed to the entry) in
+      // the Diagnostics pane the verdict points at — the `check` pass alone never
+      // runs the emitter, so an emit-stage error has no other way to appear there.
+      codegenDiags = result.diagnostics.map((diag) => ({
+        file: ENTRY_FILE,
+        diag,
+      }));
       refreshDiagnostics();
       setTab("diag");
       return;
     }
+    // A clean Run supersedes any earlier failure's overlay.
+    codegenDiags = [];
 
     for (const ln of result.logs) {
       const div = document.createElement("div");
@@ -997,6 +1032,8 @@ autorunBtn.addEventListener("click", () => setAutoRun(!autoRun));
 const onEdit = () => {
   updateEditorMeta();
 
+  // The last Run's codegen diagnostics no longer describe the edited source.
+  codegenDiags = [];
   if (diagTimer !== undefined) clearTimeout(diagTimer);
   diagTimer = setTimeout(() => refreshDiagnostics(), 200);
 
