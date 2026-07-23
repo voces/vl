@@ -8289,6 +8289,27 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // LITUNION-ARRAY value-union result (`(i32) => K0[] | i64`): a lambda whose body infers
+        // the bare scalar arm (`(q0) => (5000000077)` infers i64) of the expected `litunion-array
+        // | scalar` box result adopts the union, so the boxing lands at the return seam
+        // (`emitReturnValue` boxes the scalar into the `{tag, value}` rep, or the array arm rides
+        // as the kind-7 list ref) and the lambda's functype result IS the box — its `$fnsig` keys
+        // `>u`, matching the value call. `valueUnionRetName` declines this union (its `tyToStr`
+        // render flattens the litunion-array atom), so it needs its own alias-preserving arm.
+        // The annotated `mk(): K0[] | i64` named-function spelling already lowers this box.
+        if inferred != expRet && litUnionArrayValueUnionRetName(expRet) != "" {
+          const laTail = lambdaBodyTail(n.fnBody)
+          // Gate on STRICT `assignable` of the body's INFERRED type (not the expression-level
+          // `assignableExpr` the other arms use): the litunion-array arm reps as the kind-7
+          // i32-ATOM list, but a bare array-LITERAL body (`(q0) => (["84"])`) self-infers the
+          // SOFTENED `string[]` (kind-9 string-ref backing) — `assignableExpr` would element-re-type
+          // the literal to `K0[]` and adopt, yet the emitter boxes the string[] wrapper with the
+          // wrong tag (the consumer's `is K0[]` mismatches). Only a body already at the union's rep
+          // (a `return a` where `a: K0[]`, or a scalar arm) is `assignable`; the softened-literal
+          // spelling stays the loud reject master gives (litunion-array-LITERAL element re-typing
+          // in a boxed arm is a separate gap).
+          if laTail >= 0 && assignable(inferred, expRet) { inferred = expRet }
+        }
         // CLOSURE-ARM value-union result (`(i32) => (() => string) | i64`): a lambda whose
         // body infers ONE arm (a closure or a scalar) of the expected closure-arm value union
         // adopts the union, so the boxing lands at the return seam — `emitReturnValue` boxes
@@ -8689,6 +8710,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         if unm == "" { unm = smfNm }
         if unm == "" { unm = spfNm }
         if unm == "" { unm = valueUnionRetName(inferred) }
+        // A LITUNION-ARRAY value-union contextual return (`(i32) => K0[] | i64`, adopted just
+        // above) — record its alias-preserving emit name so `collectU`'s inferred-return loop
+        // REGISTERS the union and `synthRetAnnots`'s `isValueUnionName` arm pins the lambda's
+        // `fnRet` to it; the `$fnsig` result then keys `>u`, matching the value call. The
+        // litunion-array sibling of the `valueUnionRetName` arm above (which flattens the atom).
+        if unm == "" { unm = litUnionArrayValueUnionRetName(inferred) }
         if unm == "" { unm = structUnionRetName(inferred, gRootStmts) }
         // A NULLABLE-ref contextual return (`P | null`, `string | null`) — recorded under the same
         // node sentinel so `synthRetAnnots` pins a nullable-returning closure value position-
@@ -9780,6 +9807,40 @@ function valueUnionRetName(er: i32) {
     i = i + 1
   }
   if isValueUnionName(nm) { return nm }
+  ""
+}
+
+// The emitter-format union NAME (`K0[]|i64`) for an inferred return `er` that is a VALUE
+// union with a LITUNION-ARRAY arm (`K0[]`) and a scalar sibling — the litunion-array + scalar
+// case `valueUnionRetName` DECLINES: `collectRetAtoms` renders the array member with `tyToStr`,
+// which FLATTENS the litunion element (`"84"|"trl"|"bf"[]`), so `splitUnionAtoms` fractures the
+// atoms and `isValueUnionName` rejects. But `K0[]` IS a value atom (kind 7 — it shares the i32
+// list backing, `valueAtomKind`/`litUnionArrayElemOf`), so the union boxes exactly like
+// `i32[] | i64`. Render each member with `tyToEmitName` (alias-preserving — `K0[]` stays `K0[]`),
+// require ≥1 litunion-array member (else `valueUnionRetName` already owns the pure-scalar union),
+// and confirm the joined name is a value-union name. The annotated named-function spelling
+// (`mk(q0: i32): K0[] | i64`) already interns `>u` and lowers this box soundly (both arms
+// round-trip through `is`), so `synthRetAnnots`'s `isValueUnionName` pin routes the anonymous
+// lambda through the SAME box. The litunion-array dual of `valueUnionRetName`.
+function litUnionArrayValueUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if !(t is TyUnion) { return "" }
+  const members = t.uMembers
+  if members.length < 2 { return "" }
+  let hasLitArr = false
+  let name = ""
+  let i = 0
+  while i < members.length {
+    const mn = tyToEmitName(members[i])
+    if mn == "" { return "" }
+    if litUnionArrayElemOf(mn) != "" { hasLitArr = true }
+    if i > 0 { name = name + "|" }
+    name = name + mn
+    i = i + 1
+  }
+  if !hasLitArr { return "" }
+  if isValueUnionName(name) { return name }
   ""
 }
 
