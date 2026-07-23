@@ -976,6 +976,15 @@ let gRootStmts: i32[] = []
 // with `?? ""` mis-lowers (nullable-ref vs ref), so the TYPE stays in arrays. Reset per compile.
 let inferRetFn: string[] = []
 let inferRetTy: string[] = []
+// The ARENA-INDEX sibling of `inferRetTy` (parallel array): the `Ty`-arena index of each
+// recorded inferred return type, so the emitter's `collectU` inferred-return loop can drive
+// the STRUCTURAL arena walks (`collectTyReachRegister` / `collectTyReachCloSigs`) off the
+// resolved type — covering unions/closures reachable through an INFERRED return that the
+// `registerInlineUnion(inferRetTyAt)` NAME walk (rendered-name-driven) does not surface. Per
+// the #1046 inferred-variant-box work this is 0-growth redundancy over the name walk (verified
+// by the register/sig-growth oracle), a step toward retiring the name walks. `-1` when the
+// recorder had no arena index (falls through the walks harmlessly).
+let inferRetTyIx: i32[] = []
 // Name → its FIRST index in the arrays, so the hot `inferRetNameOf` is an O(1) map lookup
 // instead of a linear scan (it was ~6% of self-compile time). An i32-VALUED map (the well-
 // supported `{[string]: i32}` path — the string-valued map above mis-lowers), kept in sync via
@@ -1610,6 +1619,7 @@ export function initChecker() {
   gRootStmts = []
   inferRetFn = []
   inferRetTy = []
+  inferRetTyIx = []
   inferRetIdx = Map()
   inferLetIx = []
   inferLetTy = []
@@ -8855,7 +8865,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         if inferRetNameOf(nodeKey) == "" {
           let rty = unm
           if recordable { rty = anm }
-          recordInferRet(nodeKey, rty)
+          recordInferRet(nodeKey, rty, inferred)
         }
       }
     }
@@ -11040,7 +11050,7 @@ export function checkProgram(rootIx: i32) {
             // expression-based fallback already handles those, so leave them be.
             const enm = tyToStr(er)
             if isClassifiableRetName(enm) {
-              recordInferRet(efn.fnName, enm)
+              recordInferRet(efn.fnName, enm, er)
             } else {
               // A VALUE union/nullable inferred return (`i32 | string`, `i32 | null`)
               // lowers through the same `uBoxIdx` machinery as an annotation — export
@@ -11048,13 +11058,17 @@ export function checkProgram(rootIx: i32) {
               // return site pick it up.
               const un = valueUnionRetName(er)
               if un != "" {
-                recordInferRet(efn.fnName, un)
+                recordInferRet(efn.fnName, un, er)
               } else if structUnionRetName(er, gRootStmts) != "" {
                 // A STRUCT-union (`Cat | Dog`) lowers un-annotated via the variant-boxed
                 // rep — the SAME machinery as an annotated `: Cat | Dog`. Export its
                 // nominal name so the emitter registers the union + classifies the
                 // binding (`registerInlineUnion` / `unionNameOfExpr`).
-                recordInferRet(efn.fnName, structUnionRetName(er, gRootStmts))
+                recordInferRet(
+                  efn.fnName,
+                  structUnionRetName(er, gRootStmts),
+                  er,
+                )
               } else if variantBoxUnionRetName(er) != "" {
                 // A VARIANT-BOX union (`{w: i32} | i32`, `Cat | i32` — a struct arm beside a
                 // scalar) lowers un-annotated via the SAME `>u` box the annotated `: {w:
@@ -11064,7 +11078,7 @@ export function checkProgram(rootIx: i32) {
                 // boxes the struct/scalar arm exactly as the annotated form does. Export
                 // the `variantBoxUnionRetName` emit render (the anonymous-lambda spelling
                 // already records this same name under its `#<nodeIx>` sentinel).
-                recordInferRet(efn.fnName, variantBoxUnionRetName(er))
+                recordInferRet(efn.fnName, variantBoxUnionRetName(er), er)
               } else {
                 // A NICHE nullable (`boolean | null` / `string | null`) lowers via its
                 // sentinel / `ref.null $array` rep, not the box, so `valueUnionRetName`
@@ -11075,9 +11089,9 @@ export function checkProgram(rootIx: i32) {
                 if ert is TyNullable {
                   const innerNm = tyToStr(ert.nInner)
                   if innerNm == "boolean" {
-                    recordInferRet(efn.fnName, "boolean|null")
+                    recordInferRet(efn.fnName, "boolean|null", er)
                   } else if innerNm == "string" {
-                    recordInferRet(efn.fnName, "string|null")
+                    recordInferRet(efn.fnName, "string|null", er)
                   }
                 }
               }
@@ -11095,10 +11109,11 @@ export function checkProgram(rootIx: i32) {
 // inferred TYPE name rather than re-deriving from the return expression.
 // Record an inferred-return entry: push the parallel arrays AND the by-name map (first-wins).
 // Every `inferRetFn`/`inferRetTy` push goes through here so the map stays in sync.
-function recordInferRet(name: string, ty: string) {
+function recordInferRet(name: string, ty: string, tyIx: i32) {
   if !inferRetIdx.has(name) { inferRetIdx[name] = inferRetFn.length }
   inferRetFn.push(name)
   inferRetTy.push(ty)
+  inferRetTyIx.push(tyIx)
   0
 }
 
@@ -11166,6 +11181,10 @@ function isObjShapeName(nm: string) {
 // return is the program's only value union). `inferRetTyAt` is the rendered type name.
 export function inferRetCount() { inferRetFn.length }
 export function inferRetTyAt(i: i32) { inferRetTy[i] }
+// The `Ty`-arena index of the `i`th recorded inferred return (`-1` if none) — the emitter's
+// `collectU` drives the structural arena walks off this so an inferred return's reachable
+// unions/closures register/intern exactly like an annotated one.
+export function inferRetTyIxAt(i: i32) { inferRetTyIx[i] }
 
 // The emitter reads this to classify an un-annotated binding (`const x = if c then v
 // else null`) from its inferred value-union TYPE name (keyed by LetDecl node index),
