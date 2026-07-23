@@ -50,6 +50,7 @@ import {
   VKind,
   sAnonCanon,
   sFieldCount,
+  sFieldElemName,
   sFieldStart,
   sFieldTypes,
   sNames,
@@ -613,18 +614,77 @@ export function repNameCanonKey(nm: string): string {
   repCanonKey(di)
 }
 
+// The struct-table row whose sNames key is `nm`, or -1 — a local scan (the
+// `structIndexByName` twin; that resolver lives in emit_classify, ABOVE this
+// module, so the layout guard here reads the flat `emit_state` arrays directly).
+function repStructRowByName(nm: string): i32 {
+  let i = 0
+  while i < sNames.length {
+    if sNames[i] == nm { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// In-progress (elemA, elemB) pairs of the code-15 referenced-layer descent below —
+// layout equality over RECURSIVE shapes (`type L1 = {n: L1 | null}` vs a structural
+// twin) is COINDUCTIVE: a revisited pair is assumed equal (the canonical keys
+// already matched at every level above; only a genuine storage divergence refutes).
+const sfceStkA: i32[] = []
+const sfceStkB: i32[] = []
+
 // True when struct slots `a` and `b` have an IDENTICAL emitter field-code list
-// (same count, same per-field wasm code in order). A layout guard on top of the
-// structural key: `repCanonKey` equality guarantees the CHECKER structure is the
-// same, but a key collision whose EMITTED layout would differ (e.g. an atom-backed
-// litunion field `type K="a"|"b"` vs an inline `"a"|"b"`, coded differently by the
-// emitter) must NOT merge. Same key AND same codes ⟹ same emitted heap layout.
+// (same count, same per-field wasm code in order), with the referenced-layer
+// guard on code-15 fields (below). A layout guard on top of the structural key:
+// `repCanonKey` equality guarantees the CHECKER structure is the same, but a key
+// collision whose EMITTED layout would differ (e.g. an atom-backed litunion
+// field `type K="a"|"b"` vs an inline `"a"|"b"`, coded differently by the
+// emitter) must NOT merge. Same key AND same codes AND twin-equal referenced
+// rows ⟹ same emitted heap layout.
 function structFieldCodesEq(a: i32, b: i32): i32 {
   if sFieldCount[a] != sFieldCount[b] { return 0 }
   let i = 0
   while i < sFieldCount[a] {
     if sFieldTypes[sFieldStart[a] + i] != sFieldTypes[sFieldStart[b] + i] {
       return 0
+    }
+    if sFieldTypes[sFieldStart[a] + i] == 15 {
+      // A NESTED-STRUCT field (code 15) stores a `(ref null <elem heap>)` — the
+      // code alone does NOT pin the layout; the referenced rows must share one
+      // heap type too (the `variantFieldLayoutEq` referenced-layer discipline,
+      // which the struct layer lacked). Same key + same TOP-LEVEL codes is NOT
+      // enough: an `#anon` row's canon-key sidecar carries the literal's
+      // ADOPTED type (`{a:i32,f:{b:f32}}`) while its interned fields came from
+      // the SELF-classified spelling (`3.5` → an f64 inner row) — merging it
+      // with the annotation row stored a `(ref ${b:f32})` into a field typed
+      // `(ref null ${b:f64})`: INVALID-WASM (fuzz seed 451870974 d5,
+      // `() => {f: {a: i64, f: {a: i32, f: boolean, z: f32}, z: boolean}} | f64`).
+      // Byte-equal elem names trivially share a row; distinct names must
+      // resolve and be twins themselves. An unresolvable elem name DECLINES
+      // the merge (never-merged is the safe degenerate, the "" key discipline).
+      const ea = sFieldElemName[sFieldStart[a] + i]
+      const eb = sFieldElemName[sFieldStart[b] + i]
+      if ea != eb {
+        const ra = repStructRowByName(ea)
+        const rb = repStructRowByName(eb)
+        if ra < 0 || rb < 0 { return 0 }
+        if ra != rb {
+          let onStack = false
+          let k = 0
+          while k < sfceStkA.length {
+            if sfceStkA[k] == ra && sfceStkB[k] == rb { onStack = true }
+            k = k + 1
+          }
+          if !onStack {
+            sfceStkA.push(ra)
+            sfceStkB.push(rb)
+            const tw = repStructSlotsTwin(ra, rb)
+            sfceStkA.pop()
+            sfceStkB.pop()
+            if tw == 0 { return 0 }
+          }
+        }
+      }
     }
     i = i + 1
   }
