@@ -641,6 +641,23 @@ function genSlot(depth: i32, allowNul: i32, allowUni: i32): Slot {
     if RICHVALUES == 1 { nul = 0 }
     const c = genSlot(depth - 1, nul, 1)
     const s = slot(5, 0, "", c.expected, c)
+    // A NULLABLE map value (`{[string]: inner | null}`) read via `m["k"] ?? dummy` COALESCES on
+    // the value being null (USER SEMANTICS RULING 2026-07-23): a STORED null (c.isNull) reads back
+    // the DUMMY, else the carrier — either way a NON-null `inner`. The carrier "k" is always present,
+    // so the result is the DUMMY's leaf when the stored value is null, else the carrier's leaf.
+    // A NULLABLE inner (`inner | null`) is peeled NON-null by `??` — including a UNION inner
+    // (`A | B | null` normalizes to `TyNullable(A | B)`, peeled to the non-null union). Read the
+    // coalesced value through the inner; a stored null (c.isNull) reads back the DUMMY.
+    if c.kind == 3 {
+      const cin = c.child
+      if cin != null {
+        if c.isNull == 1 {
+          s.expected = dummyExp(cin)
+        } else {
+          s.expected = cin.expected
+        }
+      }
+    }
     // BRANCHING: extra map ENTRIES (carrier stays at "k"; siblings are same-typed dummies).
     if BRANCHING == 1 && rr(0, 1) == 0 { s.nRep = rr(2, 4) }
     return s
@@ -862,6 +879,41 @@ function dummyExp(s: Slot): string {
 // EXACT runtime order emitRead(.., mo=1) emits them (carrier subtree first, then this node's decoy
 // observations). Twin of emitRead — the two must stay in lockstep (a drift shows instantly as a
 // MISMATCH under --multiobs, and never touches the byte-stable OFF path).
+// The MULTIOBS `// @log` header of a DUMMY-valued read (emitCtor dum=1): the twin of moLogLines
+// for a value built clean (no stored null, no union decoy carried), so leaves print their `dexp`
+// and nullable/union nodes take the non-null / carrier branch. Used for the readthrough of a
+// nullable map value's STORED null, which `??` coalesces to the same-shape dummy default.
+function moLogLinesDum(s: Slot): string {
+  if s.kind == 0 { return "// @log " + s.dexp + "\n" }
+  const c = s.child
+  if c == null { return "// @log -1\n" }
+  if s.kind == 1 || s.kind == 2 || s.kind == 7 { return moLogLinesDum(c) }
+  if s.kind == 3 {
+    return moLogLinesDum(c) // a dummy is never null
+  }
+  if s.kind == 4 {
+    let r = moLogLinesDum(c)
+    if s.kids.length == 2 {
+      r = r + moLogLinesDum(s.kids[0]) + moLogLinesDum(s.kids[1])
+    } else {
+      r = r + "// @log " + s.d1exp + "\n" + "// @log " + s.d2exp + "\n"
+    }
+    return r
+  }
+  if s.kind == 5 {
+    let r = moLogLinesDum(c)
+    if c.kind == 3 {
+      const cin = c.child
+      if cin != null { r = moLogLinesDum(cin) }
+    }
+    if s.nRep >= 2 { r = r + "// @log " + dummyExp(c) + "\n" }
+    return r
+  }
+  // kind 6 union: a dummy carries the CARRIER (never the alt) — reads the carrier subtree, then
+  // the alt decoy binding (a fixed value, same as the carrier oracle's).
+  return moLogLinesDum(c) + "// @log " + s.altExp + "\n"
+}
+
 function moLogLines(s: Slot): string {
   if s.kind == 0 { return "// @log " + s.expected + "\n" }
   const c = s.child
@@ -887,7 +939,15 @@ function moLogLines(s: Slot): string {
     return r
   }
   if s.kind == 5 {
+    // A NULLABLE map value coalesces to the non-null inner (`c.child`): a stored null reads the
+    // DUMMY, else the carrier — mirroring emitRead's `rc = c.child` read.
     let r = moLogLines(c)
+    if c.kind == 3 {
+      const cin = c.child
+      if cin != null {
+        if c.isNull == 1 { r = moLogLinesDum(cin) } else { r = moLogLines(cin) }
+      }
+    }
     if s.nRep >= 2 { r = r + "// @log " + dummyExp(c) + "\n" }
     return r
   }
@@ -941,8 +1001,24 @@ function emitRead(acc: string, s: Slot, tmp: i32, mo: i32): string {
   }
   const t = "t" + itoa(tmp)
   if s.kind == 5 {
-    // read through `?? <same-shape dummy>`: the key is present, so the dummy must never win
+    // read through `?? <same-shape dummy>`. A NON-nullable value: the key is present, so the
+    // dummy never wins and the read is the carrier. A NULLABLE value (`inner | null`): `??`
+    // COALESCES the value-null (a stored null included) to the NON-null `inner` — so read `t`
+    // through the inner slot (`c.child`), NOT the nullable `c` (which would narrow a non-null t).
     const d = emitCtor(c, 1)
+    let rc = c
+    if c.kind == 3 {
+      const cin = c.child
+      // `??` peels the nullable value NON-null, so read through the inner (a stored null reads
+      // back the dummy).
+      if cin != null {
+        rc = cin
+        // The kind-3 read we bypass draws exactly one `guardCond` — replicate that draw
+        // (result discarded) so the deterministic fuzz STREAM (and its pinned baseline) is
+        // unchanged for every downstream case; only the coalesced-map cases' output moves.
+        guardCond(t + " != null")
+      }
+    }
     let r = d.pre +
       "const " +
       t +
@@ -955,7 +1031,7 @@ function emitRead(acc: string, s: Slot, tmp: i32, mo: i32): string {
       "] ?? " +
       d.expr +
       "\n" +
-      emitRead(t, c, tmp + 1, mo)
+      emitRead(t, rc, tmp + 1, mo)
     // MULTIOBS: also read the map's SECOND entry (present only under --branching, nRep >= 2). Its
     // value is the same-typed dummy twin, so the oracle is dummyExp(c). Read in mo=0 (single line).
     if mo == 1 && s.nRep >= 2 {
@@ -976,7 +1052,7 @@ function emitRead(acc: string, s: Slot, tmp: i32, mo: i32): string {
         "] ?? " +
         d2.expr +
         "\n" +
-        emitRead(mnm, c, base, 0)
+        emitRead(mnm, rc, base, 0)
     }
     return r
   }

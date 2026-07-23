@@ -12070,6 +12070,35 @@ export function nodeTyMapValIsNulLitUnion(ix: i32) {
   false
 }
 
+// True if node `ix`'s recorded type is a string-keyed MAP whose VALUE is `boolean | null`:
+// each value is 0/1 with the `2` null sentinel — still the MONO i32 map. The `??`-default
+// emitter reads this (alongside `nodeTyMapValIsNulLitUnion`) to coalesce a STORED null (the
+// sentinel) as well as a missing key.
+export function nodeTyMapValIsNulBool(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyMap) { return false }
+  const mv = T.tys[t.mVal]
+  if mv is TyNullable { return primNameOf(mv.nInner) == "boolean" }
+  if mv is TyUnion {
+    if mv.uMembers.length != 2 { return false }
+    let sawNull = false
+    let sawBool = false
+    let i = 0
+    while i < mv.uMembers.length {
+      const m = T.tys[mv.uMembers[i]]
+      if m is TyPrim {
+        if m.primName == "null" { sawNull = true }
+        else if m.primName == "boolean" { sawBool = true }
+      }
+      i = i + 1
+    }
+    return sawNull && sawBool
+  }
+  false
+}
+
 // The member literal TEXTS (raw inner lexeme, no quotes) of the VALUE literal union of node
 // `ix`'s recorded map type — the atom-map dual of `nodeLitUnionMemberTexts`. Empty if `ix`
 // is not an atom-valued map. The emitter's `??`-default gate checks the default literal is
@@ -12167,6 +12196,15 @@ export function nodeTyIsNullableStruct(ix: i32) {
     return it is TyObj
   }
   false
+}
+
+// True if node `ix` has a recorded NULLABLE type (`TyNullable`, any inner). The emitter
+// uses it to decide whether a `??` result stays nullable — a `?? null` (or a nullable-typed
+// default) leaves the coalesce result nullable, so the ref-value recover must be skipped.
+export function nodeTyIsNullable(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  T.tys[ty] is TyNullable
 }
 
 // True if node `ix` has a recorded `string | null` type — the niche-string (kind 16) dual of
@@ -13000,22 +13038,30 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
   // with `d`'s type (host `NullCoalesce`: `a ?? b` with a nullable `b` stays
   // nullable; a non-null default collapses to the inner type). A non-nullable
   // LHS just yields itself.
+  //
+  // `??` coalesces whenever the LHS evaluates to null — a STORED null in a
+  // nullable-valued map read (`m[k]` over `{[string]: V | null}` is a DOUBLE
+  // nullable `(V | null) | null`) is null just like a missing key, so peel the
+  // FULL nullability of the merged read type (`nonNullTy` collapses nested
+  // nullables), not one layer. A non-null default then types the whole `??`
+  // NON-NULL (universal operator contract; USER SEMANTICS RULING 2026-07-23).
   if op == "??" {
     const lt2 = T.tys[lt]
     if lt2 is TyNullable {
+      const innerFull = nonNullTy(lt)
       // A float-literal default re-encodes at an inner `f32`, so keep the result f32 — else
       // `joinTys` widens `f32 + f64` to f64 and a downstream `f32` slot rejects the demote.
-      if primNameOf(lt2.nInner) == "f32" && isFloatLitExpr(n.binRight) {
-        return lt2.nInner
+      if primNameOf(innerFull) == "f32" && isFloatLitExpr(n.binRight) {
+        return innerFull
       }
       // A literal-union inner with a MEMBER-LITERAL default stays the union (`m[k] ?? "aa"`
       // over a `{[string]: K}` map is a `K`, an i32 atom) — else the bare literal types
       // `string` and `joinTys` widens the whole result to `string`, divorcing the checked
       // type from the atom rep the read produces.
-      if isLitBearing(lt2.nInner) {
+      if isLitBearing(innerFull) {
         const dl = litTyOfExpr(n.binRight)
         if dl >= 0 {
-          if assignable(dl, lt2.nInner) { return lt2.nInner }
+          if assignable(dl, innerFull) { return innerFull }
         }
         // An ATOM-VALUED MAP get's default must itself be an atom — a member literal
         // (accepted above) or a value of the same literal union. The fused read's rep is
@@ -13025,7 +13071,7 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
         const mgl = P.nodes[n.binLeft]
         if mgl is Index {
           if nodeTyMapValIsLitUnion(mgl.idxArr) {
-            if !assignable(rt, lt2.nInner) {
+            if !assignable(rt, innerFull) {
               tErrUnsupported(
                 "`??` over an atom-valued map needs a member-literal (or atom) default",
                 ix,
@@ -13044,8 +13090,8 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
       // (`m[k] ?? d`, `d: {f: K}`) already returned the union — `joinTys` of two identical
       // types — so only the inline-literal default was wrong; this extends the same result to
       // it. `assignableExpr` (not `assignable`) so the object literal coerces field-wise.
-      if assignableExpr(n.binRight, rt, lt2.nInner) { return lt2.nInner }
-      return joinTys(lt2.nInner, rt)
+      if assignableExpr(n.binRight, rt, innerFull) { return innerFull }
+      return joinTys(innerFull, rt)
     }
     return lt
   }

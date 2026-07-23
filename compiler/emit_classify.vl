@@ -39,6 +39,7 @@ import {
   nodeTyIsNulLitUnion,
   nodeTyIsNulScalarBox,
   nodeTyIsNulStruct,
+  nodeTyIsNullable,
   nodeTyIsNullableString,
   nodeTyIsNullableStruct,
   nodeTyIsObj,
@@ -1421,11 +1422,14 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   // with the emitted rep.
   if e is BinExpr {
     if e.binOp == "??" {
-      // A fused read over a NULLABLE-string-valued map (`{[string]: string | null}`) is
-      // STILL `string | null`: the hit arm preserves a stored null.
+      // A fused read over a NULLABLE-string-valued map (`{[string]: string | null}`) stays
+      // `string | null` ONLY when the default is itself nullable — a non-null default
+      // coalesces every null (stored included) to a non-null string.
       const cns = coalesceMvSlot(exprIx, fnIx)
       if cns >= 0 {
-        if mvValKind[cns] == 3 && mvSlotNullable(cns) { return true }
+        if mvValKind[cns] == 3 && coalesceStaysNullable(exprIx, cns, fnIx) {
+          return true
+        }
       }
       if exprNullableString(e.binLeft, fnIx) {
         return exprNullableString(e.binRight, fnIx)
@@ -1516,12 +1520,14 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     const mrs = mapReadMvSlot(exprIx, fnIx)
     if mrs >= 0 { return mvValKind[mrs] == 1 }
   }
-  // A `m[k] ?? d` read over a NULLABLE-struct-valued map (`{[string]: S | null}`) is STILL
-  // `S | null`: the hit arm PRESERVES a stored null (the default fires only on a missing key),
-  // so the binding stays the kind-9 niche and narrows with `!= null`.
+  // A `m[k] ?? d` read over a NULLABLE-struct-valued map (`{[string]: S | null}`) stays
+  // `S | null` ONLY when the default is itself nullable; a non-null default coalesces every
+  // null (stored included) to the non-null struct (`exprStruct` claims that).
   if e is BinExpr {
     const cns = coalesceMvSlot(exprIx, fnIx)
-    if cns >= 0 { return mvValKind[cns] == 1 && mvSlotNullable(cns) }
+    if cns >= 0 {
+      return mvValKind[cns] == 1 && coalesceStaysNullable(exprIx, cns, fnIx)
+    }
   }
   false
 }
@@ -2451,6 +2457,22 @@ export function nulRefMapValInnerOf(valName: string): string {
 export function mvSlotNullable(slot: i32) {
   if slot < 0 { return false }
   nulRefMapValInnerOf(mvValName[slot]) != ""
+}
+
+// True when a BOXED value-union map slot's value is exactly `scalar | null` (one non-null
+// scalar member + null): the fused `m[k] ?? d` coalesce peels it to the RAW unboxed scalar
+// (`emitMapGetOrUnionBox`), NOT a union box — so the `??` result classifies as that scalar
+// (i32/i64/f64/f32), never a union. A multi-member `A | B | null` stays a boxed union.
+export function mvUnionIsScalarNull(slot: i32) {
+  if slot < 0 { return false }
+  if mvValKind[slot] != 2 { return false }
+  const vn = mvValName[slot]
+  if !unionHasAtom(vn, "null") { return false }
+  const atoms: string[] = []
+  splitUnionAtoms(vn, atoms)
+  if atoms.length != 2 { return false }
+  const ak = valueAtomKind(removeAtomFrom(vn, "null"))
+  ak >= 0 && ak != 2 && ak != 6
 }
 
 export function mvValKindOfName(valName: string): i32 {
@@ -6206,6 +6228,26 @@ function coalesceMvSlot(exprIx: i32, fnIx: i32) {
     if e.binOp == "??" { return mapReadMvSlot(unwrapParen(e.binLeft), fnIx) }
   }
   -1
+}
+
+// True when a `m[k] ?? d` read over a NULLABLE-value map (slot `cns`) STAYS nullable — i.e.
+// the DEFAULT `d` is itself nullable (a bare `null`, or a nullable-typed default). `??`
+// coalesces on the read VALUE being null — a STORED null included — so a NON-null default
+// collapses the whole read to the value's NON-null kind (USER SEMANTICS RULING 2026-07-23);
+// only a nullable default leaves it `V | null`. Every `??`-over-value-map classifier gates on
+// this: the nullable-kind arms require it, the non-null-kind arms require its negation.
+export function coalesceStaysNullable(exprIx: i32, cns: i32, _fnIx: i32) {
+  if cns < 0 { return false }
+  if !mvSlotNullable(cns) { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is BinExpr {
+    if e.binOp == "??" {
+      const d = P.nodes[unwrapParen(e.binRight)]
+      if d is NullLit { return true }
+      return nodeTyIsNullable(e.binRight)
+    }
+  }
+  false
 }
 
 // The list-element rep (2/7/12/20 — see `mvListValKind`) of a bare `m[k]` or `m[k] ?? d`
@@ -11937,7 +11979,11 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   // PRESERVED through `??`) — `exprNullableStruct` claims it, not this non-null arm.
   if e is BinExpr {
     const cms = coalesceMvSlot(exprIx, fnIx)
-    if cms >= 0 { return mvValKind[cms] == 1 && !mvSlotNullable(cms) }
+    if cms >= 0 {
+      // A nullable-value slot with a NON-null default coalesces to the non-null struct too
+      // (stored null included) — only a nullable default leaves it `S | null`.
+      return mvValKind[cms] == 1 && !coalesceStaysNullable(exprIx, cms, fnIx)
+    }
     // A `<S|null> ?? <S>` coalesce yields the non-null struct (the generic nullable-struct `??` emit) —
     // so a bound `const p = r ?? d` classifies struct and `(r ?? d).x` resolves. The left is the
     // nullable struct; the right is a plain struct default.
@@ -12059,13 +12105,15 @@ export function exprNulClosure(exprIx: i32, fnIx: i32) {
     const mrs = mapReadMvSlot(ux, fnIx)
     if mrs >= 0 { return mvValKind[mrs] == 14 }
   }
-  // A `m[k] ?? d` read over a NULLABLE-closure-valued map (`{[string]: (() => T) | null}`) is
-  // STILL nullable: the hit arm PRESERVES a stored null (the default fires only on a missing
-  // key), so the binding stays the kind-19 niche and narrows with `!= null` — the closure dual
-  // of `exprNullableStruct`'s coalesce arm.
+  // A `m[k] ?? d` read over a NULLABLE-closure-valued map (`{[string]: (() => T) | null}`)
+  // stays nullable ONLY when the default is itself nullable; a non-null default coalesces
+  // every null (stored included) to the non-null closure — the closure dual of
+  // `exprNullableStruct`'s coalesce arm.
   if e is BinExpr {
     const cns = coalesceMvSlot(ux, fnIx)
-    if cns >= 0 { return mvValKind[cns] == 14 && mvSlotNullable(cns) }
+    if cns >= 0 {
+      return mvValKind[cns] == 14 && coalesceStaysNullable(ux, cns, fnIx)
+    }
   }
   false
 }
@@ -12738,10 +12786,11 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     const mri = mapReadMvSlot(exprIx, fnIx)
     if mri >= 0 { return mvValKind[mri] == 2 }
   }
-  // `m[k] ?? d` over a UNION-valued map yields the value union box.
+  // `m[k] ?? d` over a UNION-valued map yields the value union box — EXCEPT a `scalar | null`
+  // value, which `??` peels to the raw unboxed scalar (classified by `exprIsI64`/`exprIsF64`/… ).
   if e is BinExpr {
     const cmu = coalesceMvSlot(exprIx, fnIx)
-    if cmu >= 0 { return mvValKind[cmu] == 2 }
+    if cmu >= 0 { return mvValKind[cmu] == 2 && !mvUnionIsScalarNull(cmu) }
   }
   // A plain read of a VALUE-UNION struct field (`o.y`, code 16) yields the field's
   // union BOX — a union value usable wherever a union is expected (`return o.y`, a
@@ -13055,7 +13104,10 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cmu = coalesceMvSlot(unwrapParen(exprIx), fnIx)
     if cmu >= 0 {
-      if mvValKind[cmu] == 2 { return mvValName[cmu] }
+      // `scalar | null` peels to a raw scalar (not a union), so it has no union name here.
+      if mvValKind[cmu] == 2 && !mvUnionIsScalarNull(cmu) {
+        return mvValName[cmu]
+      }
     }
   }
   // `ns[i]` over a UNION-element ref list yields the element union's box (the
@@ -14694,7 +14746,9 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
   // `mapShapeOfExpr`'s composition arm (the inner map's own value slot).
   if e is BinExpr {
     const cnm = coalesceMvSlot(exprIx, fnIx)
-    if cnm >= 0 { return mvValIsMap(cnm) && mvSlotNullable(cnm) }
+    if cnm >= 0 {
+      return mvValIsMap(cnm) && coalesceStaysNullable(exprIx, cnm, fnIx)
+    }
   }
   if e is Index {
     // An INDEX into a nullable-map array (`({[string]: V} | null)[]`, element kind 3 with the
@@ -14789,9 +14843,11 @@ export function exprMap(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cmm = coalesceMvSlot(exprIx, fnIx)
     if cmm >= 0 {
-      // A NULLABLE inner-map value (`{[string]: {[string]: V} | null}`) yields `map | null`
-      // (a stored null is preserved through `??`) — `exprNullableMap` claims it instead.
-      if mvValIsMap(cmm) && !mvSlotNullable(cmm) { return true }
+      // A NULLABLE inner-map value with a NULLABLE default yields `map | null` —
+      // `exprNullableMap` claims that; a non-null default coalesces to the non-null map.
+      if mvValIsMap(cmm) && !coalesceStaysNullable(exprIx, cmm, fnIx) {
+        return true
+      }
     }
   }
   // `scopes[i]` over a MAP ref list (`{[string]:i32}[]`, element kind 3) yields a Map ref
@@ -15459,11 +15515,13 @@ export function exprString(exprIx: i32, fnIx: i32) {
     return false
   }
   if e is BinExpr {
-    // A `m[k] ?? d` / `m.get(k) ?? d` read over a STRING-valued map yields a
-    // string ref (the value type). A NULLABLE-string value (`{[string]: string | null}`)
-    // yields `string | null` instead (a stored null is preserved) — `exprNullableString`'s.
+    // A `m[k] ?? d` / `m.get(k) ?? d` read over a STRING-valued map yields a string ref (the
+    // value type). A NULLABLE-string value with a NULLABLE default stays `string | null`
+    // (`exprNullableString`'s); a non-null default coalesces to a non-null string.
     const cms = coalesceMvSlot(exprIx, fnIx)
-    if cms >= 0 { return mvValKind[cms] == 3 && !mvSlotNullable(cms) }
+    if cms >= 0 {
+      return mvValKind[cms] == 3 && !coalesceStaysNullable(exprIx, cms, fnIx)
+    }
     // `r ?? d` over a `string | null` LHS yields a (non-null) string — the coalesce
     // recovers the non-null array ref, so `.length`/`+`/etc. on the result work.
     if e.binOp == "??" {
@@ -15685,10 +15743,14 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
     const mrs = mapReadMvSlot(exprIx, fnIx)
     if mrs >= 0 { return mvValKind[mrs] == 14 }
   }
-  // `m[k] ?? d` over a function-valued map yields the closure.
+  // `m[k] ?? d` over a function-valued map yields the closure (a nullable-value slot with a
+  // non-null default coalesces to the non-null closure; a nullable default stays
+  // `closure | null`, claimed by `exprNullableClosure`).
   if e is BinExpr {
     const cm = coalesceMvSlot(exprIx, fnIx)
-    if cm >= 0 { return mvValKind[cm] == 14 }
+    if cm >= 0 {
+      return mvValKind[cm] == 14 && !coalesceStaysNullable(exprIx, cm, fnIx)
+    }
   }
   false
 }
