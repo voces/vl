@@ -349,6 +349,7 @@ import {
   captureCountOf,
   captureNamesOf,
   cbRetVariantIdx,
+  cloCallReflistElemTwin,
   cloCallSigKey,
   cloCallUnionResultUnrepresentable,
   cloRetIsString,
@@ -1336,6 +1337,22 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
     pendingListSlot = 0
     pendingNulRefHeap = -1
     const vcode = variantFieldTypeAt(vi, fj)
+    // The `emitObj` closure-field floor (a LAMBDA value into a NON-closure field slot),
+    // MIRRORED for the variant-box path: a lambda-result struct whose fieldset collides
+    // with a value-union's STRUCT arm (`() => {f: () => {f: string} | string}` — the outer
+    // `{f: <closure>}` shares the fieldset `{f}` with the `{f: string}` arm and, un-interned
+    // as its own struct, routes here as that arm) would store the closure ref into a
+    // string/scalar variant field — invalid wasm. Reject loudly; the deferred same-fieldset
+    // twin-matcher composition (the named-fn spelling lowers fully). Codes 14/22 are the
+    // closure / closure-array field slots, 16 the closure-ARM union-box field.
+    const vcfv = P.nodes[unwrapParen(valIx)]
+    if vcfv is FuncDecl {
+      if vcode != 14 && vcode != 22 && vcode != 16 {
+        return emitFail(
+          "emitProgram: a lambda field value resolved to a non-closure variant field slot",
+        )
+      }
+    }
     if vcode == 5 {
       let vslot = variantFieldRefSlot(vi, fj)
       if vslot < 0 { vslot = 0 }
@@ -7489,6 +7506,15 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
     if cloCallUnionResultUnrepresentable(callIx, fnIx) {
       return emitFail(
         "emitProgram: value-union closure RESULT is not yet representable",
+      )
+    }
+    // A ref-list closure result whose PRODUCER lambda and cast annotation key distinct,
+    // non-layout-twin element slots (a nullable-element list built from a non-null literal):
+    // the wrapper structs are distinct heap types, so the call-ref `ref.cast` would TRAP.
+    // Reject cleanly — the deferred nullable-element ref-list composition.
+    if cloCallReflistElemTwin(callIx, fnIx) {
+      return emitFail(
+        "emitProgram: closure ref-list result element twin (deferred value-ABI composition)",
       )
     }
     // env = closure.env (field 1).
