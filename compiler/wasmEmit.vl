@@ -11,8 +11,10 @@ import {
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
   nodeTyIsNulLitUnion,
+  nodeTyIsNullable,
   nodeTyIsNullableStruct,
   nodeTyMapValIsLitUnion,
+  nodeTyMapValIsNulBool,
   nodeTyMapValIsNulLitUnion,
   nodeTyMapValLitUnionTexts,
   splitUnionAtoms,
@@ -4076,6 +4078,65 @@ function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   emitMapProbe(body)
 }
 
+// Emit the `??` DEFAULT `d` for a REF-valued map slot (`cmSlot >= 0`) onto `body`, in the
+// value's own rep (scalar / union box / struct-list / list-wrapper / struct / nullable
+// niche). Factored out of `emitMapGetOr` so the value-null coalesce can emit it exactly
+// once whether the read missed the key OR read a stored null.
+function emitMapValDefault(
+  body: i32[],
+  mslot: i32,
+  scalarVK: VKind | null,
+  defIx: i32,
+  fnIx: i32,
+) {
+  if scalarVK != null {
+    return emitScalarValue(body, defIx, fnIx, scalarVK)
+  } else if mslot >= 0 && mvValKind[mslot] == 2 {
+    // A UNION-valued map's default is coerced into the shared box, like a stored value — a
+    // concrete VARIANT default boxes (`emitUnionBoxArg`), as in a call arg / return.
+    return emitUnionBoxArg(body, mvValName[mslot], defIx, fnIx)
+  } else if mslot >= 0 && mvListValKind(mslot) == "reflist" {
+    // A STRUCT-LIST value: hint an empty `[]` default to an empty ref list of the inner
+    // struct (`listKind` 1 = struct-element, `listSlot` the inner slot).
+    const slCtx = expCtxHere()
+    slCtx.listKind = 1
+    slCtx.listSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
+    return emitExprExpect(body, defIx, fnIx, slCtx)
+  }
+  // For a non-i32 LIST-valued map, hint an empty `[]` default to the value's list
+  // wrapper (`listKind` 3 string / 4 f64 / 6 i64) — an unhinted `[]` defaults to
+  // the i32-list wrapper, which the `(ref null <wrapper>)` valStash would reject.
+  const dfCtx = expCtxHere()
+  const lvk = mvListValKind(mslot)
+  if lvk == "strlist" {
+    dfCtx.listKind = 3
+  } else if lvk == "f64list" {
+    dfCtx.listKind = 4
+  } else if lvk == "i64list" {
+    dfCtx.listKind = 6
+  } else if lvk == "f32list" {
+    dfCtx.listKind = 7
+  } else if mslot >= 0 && mvValKind[mslot] == 1 {
+    // A STRUCT-valued map's `?? {f:…}` default builds the map's declared value struct — force
+    // its index so a field-name-set twin (`{f:f32}` vs `{f:{[string]:i64}}`) does not resolve
+    // the literal to the wrong layout (the store path's twin, see `emitMapSetV`).
+    dfCtx.structIdx = mvValStructIdx[mslot]
+  }
+  // A NULLABLE-value slot admits a bare `null` default (`m[k] ?? null` typing `S | null`) —
+  // seed the element heap so the NullLit lowers as `ref.null <elem>`.
+  if mvSlotNullable(mslot) { dfCtx.nulRefHeap = mvValElemHeapOf(mslot) }
+  emitExprExpect(body, defIx, fnIx, dfCtx)
+}
+
+// True when a `??` DEFAULT is itself nullable — a bare `null` literal or a nullable-typed
+// expression. `m[k] ?? null` (over a nullable-value map) stays `V | null`, so the ref recover
+// must be skipped; a non-null default makes the whole `??` non-null.
+function defExprNullable(ix: i32) {
+  const u = P.nodes[unwrapParen(ix)]
+  if u is NullLit { return true }
+  nodeTyIsNullable(ix)
+}
+
 // Lower a map GET `m[k]` with a DEFAULT (`m[k] ?? d`) onto `body`: probe, then if the
 // key was found push `vals[entry-1]`, else push the default `d`. The self-host checker
 // ALWAYS reads a map through `?? -1` (a total fallback), so this is the primary get.
@@ -4094,9 +4155,26 @@ function emitMapGetOr(
     // non-null value), then `ref.as_non_null` recovers the non-null result the
     // `??` expression's type promises. A live entry's val slot is never null.
     const mslot = cmSlot
+    // A BOXED value-union map value that INCLUDES null (`{[string]: i32 | null}`,
+    // `{[string]: A | B | null}`) stores null as a null-TAGGED box. `??` peels the value NON-null
+    // (the checker types the result the raw scalar / non-null union), so the coalesce defaults on
+    // the box's null TAG — the value-union sibling of the ref-niche `ref.is_null` path below.
+    // A null-FREE union value (`{[string]: A | B}`) has no null tag and takes the plain path.
+    if mvValKind[mslot] == 2 {
+      if unionHasAtom(mvValName[mslot], "null") {
+        return emitMapGetOrUnionBox(body, mslot, defIx, fnIx)
+      }
+    }
     // A SCALAR-valued map (f64/i64) stores the value directly; its default is emitted in
     // the value's rep and it needs no `ref.as_non_null`. A ref value (string/struct) does.
     const scalarVK = mvScalarValKind(mslot)
+    // A NULLABLE-value REF niche (`{[string]: S | null}` / `{[string]: V | null}` where the
+    // value reps as `(ref null <elem>)`) stores null DIRECTLY in its vals slot, so the fused
+    // read is null on a MISSING key AND on a STORED null. `??` coalesces on the read VALUE
+    // being null (USER SEMANTICS RULING 2026-07-23), so read the raw nullable value first,
+    // then a single `ref.is_null` supplies the default — not only the missing-key branch.
+    const nullableRef = scalarVK == null && mvSlotNullable(mslot)
+    const stashL = fnMvValStashLocal(mslot)
     pushMapScr(body, 5)          // entry
     fbIf(64)                     // if (entry != 0 → found), void
     pushMapVals(body)
@@ -4105,72 +4183,184 @@ function emitMapGetOr(
     fbI32Const(1)
     fbI32Bin(107)                // i32.sub (entry - 1)
     fbArrayGet(cmValsBack())     // scalar (f64/i64) / (ref null <elem>) slot read
-    fbLocalSet(fnMvValStashLocal(mslot))
-    fbElse()                     // else
-    if scalarVK != null {
-      if emitScalarValue(body, defIx, fnIx, scalarVK) < 0 { return -1 }
-    } else if mslot >= 0 && mvValKind[mslot] == 2 {
-      // A UNION-valued map's default is coerced into the shared box, like a stored value — a
-      // concrete VARIANT default boxes (`emitUnionBoxArg`), as in a call arg / return.
-      if emitUnionBoxArg(body, mvValName[mslot], defIx, fnIx) < 0 { return -1 }
-    } else if mslot >= 0 && mvListValKind(mslot) == "reflist" {
-      // A STRUCT-LIST value: hint an empty `[]` default to an empty ref list of the inner
-      // struct (`listKind` 1 = struct-element, `listSlot` the inner slot).
-      const slCtx = expCtxHere()
-      slCtx.listKind = 1
-      slCtx.listSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
-      if emitExprExpect(body, defIx, fnIx, slCtx) < 0 { return -1 }
+    fbLocalSet(stashL)
+    fbElse()                     // else — a MISS
+    if nullableRef {
+      // A miss IS the read's null; the `ref.is_null` coalesce below supplies the default.
+      fbRefNull(mvValElemHeapOf(mslot))
+      fbLocalSet(stashL)
     } else {
-      // For a non-i32 LIST-valued map, hint an empty `[]` default to the value's list
-      // wrapper (`listKind` 3 string / 4 f64 / 6 i64) — an unhinted `[]` defaults to
-      // the i32-list wrapper, which the `(ref null <wrapper>)` valStash would reject.
-      const dfCtx = expCtxHere()
-      const lvk = mvListValKind(mslot)
-      if lvk == "strlist" {
-        dfCtx.listKind = 3
-      } else if lvk == "f64list" {
-        dfCtx.listKind = 4
-      } else if lvk == "i64list" {
-        dfCtx.listKind = 6
-      } else if lvk == "f32list" {
-        dfCtx.listKind = 7
-      } else if mslot >= 0 && mvValKind[mslot] == 1 {
-        // A STRUCT-valued map's `?? {f:…}` default builds the map's declared value struct — force
-        // its index so a field-name-set twin (`{f:f32}` vs `{f:{[string]:i64}}`) does not resolve
-        // the literal to the wrong layout (the store path's twin, see `emitMapSetV`).
-        dfCtx.structIdx = mvValStructIdx[mslot]
-      }
-      // A NULLABLE-value slot admits a bare `null` default (`m[k] ?? null` typing `S | null`) —
-      // seed the element heap so the NullLit lowers as `ref.null <elem>`.
-      if mvSlotNullable(mslot) { dfCtx.nulRefHeap = mvValElemHeapOf(mslot) }
-      if emitExprExpect(body, defIx, fnIx, dfCtx) < 0 { return -1 }
+      if emitMapValDefault(body, mslot, scalarVK, defIx, fnIx) < 0 { return -1 }
+      cmSlot = mslot
+      fbLocalSet(stashL)
     }
-    cmSlot = mslot
-    fbLocalSet(fnMvValStashLocal(mslot))
     fbEnd() // end (if)
-    fbLocalGet(fnMvValStashLocal(mslot))
-    // A scalar f64/i64 result needs no null-recovery; a ref value does (`??` is non-null) —
-    // EXCEPT a NULLABLE-value slot (`{[string]: S | null}` / `{[string]: map | null}`), whose
-    // hit arm PRESERVES a stored null (the default fires only on a MISSING key): the result
-    // stays the `(ref null <elem>)` niche and the consumer narrows with `!= null`.
-    if scalarVK == null && !mvSlotNullable(mslot) { fbRefAsNonNull() }
+    if nullableRef {
+      // Coalesce on the READ VALUE being null — a MISSING key OR a STORED null both take `d`.
+      fbLocalGet(stashL)
+      wU8(209) // 0xd1 ref.is_null
+      fbIf(64)
+      if emitMapValDefault(body, mslot, scalarVK, defIx, fnIx) < 0 { return -1 }
+      cmSlot = mslot
+      fbLocalSet(stashL)
+      fbEnd()
+    }
+    fbLocalGet(stashL)
+    // A scalar f64/i64 result needs no null-recovery; a ref value does (`??` is non-null).
+    // For a nullable niche the coalesce already replaced every null with `d`, so recover to
+    // non-null EXCEPT when the default itself is nullable (`m[k] ?? null` stays `S | null`).
+    if scalarVK == null {
+      if nullableRef {
+        if !defExprNullable(defIx) { fbRefAsNonNull() }
+      } else {
+        fbRefAsNonNull()
+      }
+    }
     return 0
   }
-  // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
-  pushMapScr(body, 5) // entry
-  fbIf(127)           // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
-  // vals.backing[entry-1]
+  // A nullable-ATOM value map (`{[string]: K | null}` / `{[string]: boolean | null}`) stores
+  // null as an i32 SENTINEL directly in the mono vals slot (`-1` for a litunion atom, `2` for a
+  // boolean), so the fused read is null on a MISSING key AND when the stored value IS the
+  // sentinel. `??` coalesces on the read VALUE being null (USER SEMANTICS RULING 2026-07-23):
+  // read the raw i32, then default when it equals the sentinel — not only on a miss. A
+  // non-nullable atom / plain-i32 map has no sentinel and keeps the direct value-typed `if`.
+  let nulSentinel = 0
+  let hasSentinel = false
+  if nodeTyMapValIsNulLitUnion(recvIx) {
+    nulSentinel = 0 - 1
+    hasSentinel = true
+  } else if nodeTyMapValIsNulBool(recvIx) {
+    nulSentinel = 2
+    hasSentinel = true
+  }
+  if !hasSentinel {
+    // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
+    pushMapScr(body, 5)      // entry
+    fbIf(127)                // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
+    pushMapVals(body)
+    fbStructGet(lTypeIdx, 0) // struct.get (vals backing), field 0: backing
+    pushMapScr(body, 5)      // entry
+    fbI32Const(1)
+    fbI32Bin(107)            // 0x6b i32.sub  (entry - 1)
+    fbArrayGet(aTypeIdx)     // array.get
+    fbElse()                 // else
+    if emitMonoMapDefault(body, recvIx, defIx, fnIx) < 0 { return -1 }
+    fbEnd()                  // end (if)
+    return 0
+  }
+  // raw = (entry != 0) ? backing[entry-1] : sentinel  — a miss reads as null.
+  pushMapScr(body, 5)     // entry
+  fbIf(127)               // if (entry != 0 → found), i32 blocktype
   pushMapVals(body)
-  fbStructGet(lTypeIdx, 0) // struct.get (vals backing), field 0: backing
-  pushMapScr(body, 5)      // entry
+  fbStructGet(lTypeIdx, 0)
+  pushMapScr(body, 5)
   fbI32Const(1)
-  fbI32Bin(107)            // 0x6b i32.sub  (entry - 1)
-  fbArrayGet(aTypeIdx)     // array.get
-  fbElse()                 // else
-  // An ATOM-valued mono map's default lowers as an i32 atom id: a MEMBER literal (atom
-  // context — `pendingLitUnion`) or an atom-typed expression. Anything else (a general
-  // string, a NON-member literal — which would mint a fresh id under a `string`-typed
-  // result) has the wrong rep for the fused i32 result — fail loudly.
+  fbI32Bin(107)
+  fbArrayGet(aTypeIdx)
+  fbElse()
+  fbI32Const(nulSentinel) // miss = null sentinel
+  fbEnd()
+  // Coalesce: raw == sentinel ? d : raw. Slot +8 (probe hash cursor) is dead after the probe.
+  setMapScr(body, 8)
+  pushMapScr(body, 8)
+  fbI32Const(nulSentinel)
+  fbI32Bin(70) // 0x46 i32.eq → raw == sentinel (null, missing OR stored)
+  fbIf(127)
+  if emitMonoMapDefault(body, recvIx, defIx, fnIx) < 0 { return -1 }
+  fbElse()
+  pushMapScr(body, 8)
+  fbEnd()
+  0
+}
+
+// Lower `m[k] ?? d` over a BOXED value-union map value that includes null (`{[string]: i32 | null}`,
+// `{[string]: A | B | null}`, mv kind 2 with a `null` atom). Reads the box (hit → the stored box;
+// miss → the null-tagged box), then COALESCES on the box's null TAG (`??` fires on the value being
+// null — a MISSING key AND a STORED null): a `scalar | null` value peels to the RAW unboxed scalar
+// (the checker's non-null result type), a multi-member `… | null` to the NON-null union box.
+function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
+  const uvn = mvValName[mslot]
+  const atoms: string[] = []
+  splitUnionAtoms(uvn, atoms)
+  const stashL = fnMvValStashLocal(mslot)
+  // raw box: hit → stored (ref null $uBox); miss → the null-tagged box.
+  pushMapScr(body, 5)          // entry
+  fbIf(64)                     // if (entry != 0 → found), void
+  pushMapVals(body)
+  fbStructGet(cmValsWrap(), 0) // vals backing
+  pushMapScr(body, 5)
+  fbI32Const(1)
+  fbI32Bin(107)                // i32.sub (entry - 1)
+  fbArrayGet(cmValsBack())     // the stored (ref null $uBox) slot read
+  fbLocalSet(stashL)
+  fbElse()                     // miss = the read's null (a null-tagged box)
+  fbI32Const(scalarTagOf("null"))
+  fbRefNullNone()
+  fbStructNew(uBoxIdx)
+  fbLocalSet(stashL)
+  fbEnd()
+  // A `scalar | null` value (exactly one non-null scalar member) peels to the RAW scalar — take
+  // the default on the null tag, else unbox the scalar payload.
+  if atoms.length == 2 {
+    const member = removeAtomFrom(uvn, "null")
+    const ak = valueAtomKind(member)
+    const vb = vbHeapIdxOfAtom(member)
+    if vb < 0 {
+      return emitFail("emitProgram: scalar|null map value has no value box")
+    }
+    let bt = 127 // i32 (0x7f; boolean shares it, but boolean|null is the mono niche)
+    if ak == 3 {
+      bt = 126 // i64 (0x7e)
+    } else if ak == 4 {
+      bt = 124 // f64 (0x7c)
+    } else if ak == 5 {
+      bt = 125 // f32 (0x7d)
+    }
+    fbLocalGet(stashL)
+    fbStructGet(uBoxIdx, 0) // field 0: tag
+    fbI32Const(scalarTagOf("null"))
+    fbI32Bin(70)            // 0x46 i32.eq → null?
+    fbIf(bt)                // value-typed if in the scalar's rep
+    ctrlEnter()
+    if ak == 3 {
+      if emitExprAsI64(body, defIx, fnIx) < 0 { return -1 }
+    } else if ak == 4 {
+      if emitExprAsF64(body, defIx, fnIx) < 0 { return -1 }
+    } else if ak == 5 {
+      if emitExprAsF32(body, defIx, fnIx) < 0 { return -1 }
+    } else {
+      if emitExpr(body, defIx, fnIx) < 0 { return -1 }
+    }
+    fbElse()
+    fbLocalGet(stashL)
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref payload)
+    fbRefCast(vb)
+    fbStructGet(vb, 0)      // the scalar payload
+    fbEnd()
+    ctrlLeave()
+    return 0
+  }
+  // A MULTI-member `… | null` value peels to the NON-null union box: on the null tag, box the
+  // default like a stored value (`emitUnionBoxArg`); else keep the stored box. `ref.as_non_null`
+  // recovers the non-null box the checker's non-null union result promises.
+  fbLocalGet(stashL)
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Const(scalarTagOf("null"))
+  fbI32Bin(70)            // 0x46 i32.eq → null?
+  fbIf(64)
+  if emitUnionBoxArg(body, uvn, defIx, fnIx) < 0 { return -1 }
+  fbLocalSet(stashL)
+  fbEnd()
+  fbLocalGet(stashL)
+  fbRefAsNonNull()
+  0
+}
+
+// Emit the `??` DEFAULT for a MONO-atom-valued map (`cmSlot < 0`) onto `body`: an i32 atom id
+// for a litunion value (a MEMBER literal under `pendingLitUnion`, or an atom-typed expr; a bare
+// `null` → the `-1` sentinel), else the value's own rep (boolean / i32). A non-member / general
+// string is the wrong rep for the fused i32 result — fail loudly.
+function emitMonoMapDefault(body: i32[], recvIx: i32, defIx: i32, fnIx: i32) {
   const atomTexts = nodeTyMapValLitUnionTexts(recvIx)
   let atomDef = false
   let nulAtomDef = false
@@ -4183,9 +4373,8 @@ function emitMapGetOr(
         mi = mi + 1
       }
     } else if du is NullLit {
-      // A NULLABLE-atom value (`{[string]: K | null}`) admits a bare `null` default —
-      // the `-1` niche sentinel (a stored value hit still yields its own i32, so a
-      // stored `null` is preserved: the mono fused read is sentinel-transparent).
+      // A NULLABLE-atom value (`{[string]: K | null}`) admits a bare `null` default — lowered as
+      // the `-1` niche sentinel (the `??` result stays `K | null`).
       if nodeTyMapValIsNulLitUnion(recvIx) {
         atomDef = true
         nulAtomDef = true
@@ -4201,13 +4390,12 @@ function emitMapGetOr(
   }
   if nulAtomDef {
     fbI32Const(0 - 1)
-  } else {
-    if atomDef { pendingLitUnion = 1 }
-    const dfr = emitExpr(body, defIx, fnIx)
-    if atomDef { pendingLitUnion = 0 }
-    if dfr < 0 { return -1 }
+    return 0
   }
-  fbEnd() // end (if)
+  if atomDef { pendingLitUnion = 1 }
+  const dfr = emitExpr(body, defIx, fnIx)
+  if atomDef { pendingLitUnion = 0 }
+  if dfr < 0 { return -1 }
   0
 }
 
