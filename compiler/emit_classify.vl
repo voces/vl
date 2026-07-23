@@ -2628,6 +2628,14 @@ export function mvCanonValName(valName: string) {
   if vn > 2 && valName[vn - 2] == '[' && valName[vn - 1] == ']' {
     return rlCanonLitUnionAtoms(valName)
   }
+  // A STRUCT / nested-MAP value (`{f: K0 | f64}` — the value of `{[string]: {f: K0|f64}}`):
+  // soften its field / value litunion aliases THROUGH the shape, the struct sibling of the
+  // ref-list `[]` arm above. Without this the annotation (`canonEmitTypeNames`-softened to
+  // `{f:string|f64}`) and a self-inferred factory-return lambda (`{f:K0|f64}`) minted twin
+  // mv slots → twin map/functypes → a `$fnsig` cast TRAP at the returned-map read.
+  if vn > 1 && valName[0] == '{' && valName[vn - 1] == '}' {
+    return rlCanonLitUnionAtoms(valName)
+  }
   if unionMemberCount(valName) < 2 { return valName }
   const atoms: string[] = []
   splitUnionAtoms(valName, atoms)
@@ -2650,6 +2658,14 @@ export function mvCanonValName(valName: string) {
     if nameIsLitUnionType(a) {
       a = "string"
       changed = true
+    } else if a != "null" {
+      // A struct / shape atom carrying a litunion one level down (`{f: K0|f64} | null`):
+      // descend it so the nullable-struct-value spelling keys the same softened slot.
+      const ra = rlCanonLitUnionAtoms(a)
+      if ra != a {
+        a = ra
+        changed = true
+      }
     }
     if i > 0 { canon = canon + "|" }
     canon = canon + a
@@ -8631,10 +8647,58 @@ function rlCanonLitUnionAtoms(name: string): string {
     if isTopLevelFuncTypeName(inner) { return name }
     return rlCanonLitUnionAtoms(inner)
   }
-  // A top-level union: soften each litunion-alias atom.
+  // An inline SHAPE `{…}`: soften litunion-alias atoms inside its field / value types —
+  // the struct sibling of the array `[]` descent. The map-VALUE struct of `{[string]: {f:
+  // K0 | f64}}` is canon-softened to `{f:string|f64}` on the annotation side
+  // (`canonEmitTypeNames`) but rendered `{f:K0|f64}` by a self-inferred factory-return
+  // lambda (`tyToEmitName` preserves litunion aliases) — two mv-slot KEYS, twin map/
+  // functypes, a `$fnsig` cast TRAP at the returned-map read. Descending here keys every
+  // producer on ONE slot.
+  if name[0] == '{' && name[n - 1] == '}' {
+    // A map `{[K]:V}`: soften the VALUE (a nested map / struct value); leave the key text.
+    if n >= 2 && name[1] == '[' {
+      const mv = mapValNameOf(name)
+      if mv == "" { return name }
+      const cmv = rlCanonLitUnionAtoms(mv)
+      if cmv == mv { return name }
+      // `name` = `{[` + key + `]:` + mv + `}` — replace only the value tail.
+      return name.slice(0, n - mv.length - 1) + cmv + "}"
+    }
+    // A struct `{f:T,…}`: soften each field type.
+    const fNames: string[] = []
+    const fTypes: string[] = []
+    shapeFieldParse(name, fNames, fTypes)
+    if fNames.length == 0 { return name }
+    let sChanged = false
+    let sOut = "{"
+    let sfi = 0
+    while sfi < fNames.length {
+      if sfi > 0 { sOut = sOut + "," }
+      const ct = rlCanonLitUnionAtoms(fTypes[sfi])
+      if ct != fTypes[sfi] { sChanged = true }
+      sOut = sOut + fNames[sfi] + ":" + ct
+      sfi = sfi + 1
+    }
+    sOut = sOut + "}"
+    if sChanged { return sOut }
+    return name
+  }
+  // A top-level union: soften each litunion-alias atom, and DESCEND non-litunion atoms
+  // (a nullable struct value `{f: K0|f64} | null`, whose struct atom carries the litunion
+  // one level down). NICHE GUARD (mirrors `mvCanonValName`): soften a litunion atom ONLY
+  // when a genuine non-null, non-litunion sibling exists (a real box MIX). A pure
+  // `K0 | null` is the -1-sentinel MONO niche — widening it to `string | null` re-reps the
+  // niche and breaks the nullable-litunion values; leave it (and any descent) untouched.
   if unionMemberCount(name) > 1 {
     const atoms: string[] = []
     splitUnionAtoms(name, atoms)
+    let hasOther = false
+    let h = 0
+    while h < atoms.length {
+      if atoms[h] != "null" && !nameIsLitUnionType(atoms[h]) { hasOther = true }
+      h = h + 1
+    }
+    if !hasOther { return name }
     let changed = false
     let canon = ""
     let i = 0
@@ -8643,6 +8707,12 @@ function rlCanonLitUnionAtoms(name: string): string {
       if nameIsLitUnionType(a) {
         a = "string"
         changed = true
+      } else if a != "null" {
+        const ra = rlCanonLitUnionAtoms(a)
+        if ra != a {
+          a = ra
+          changed = true
+        }
       }
       if i > 0 { canon = canon + "|" }
       canon = canon + a
