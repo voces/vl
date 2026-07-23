@@ -167,3 +167,70 @@ Deno.test({
     }
   },
 });
+
+// `vl build` (codegen) an emit-error program, and return the exit code + stderr.
+// `check` above runs only parse+type; an EMIT-stage failure surfaces solely under
+// codegen, so its diagnostic position needs the build path.
+const build = async (path: string): Promise<{ code: number; err: string }> => {
+  const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_out_" });
+  try {
+    const { code, stderr } = await new Deno.Command(VL, {
+      args: [
+        "build",
+        path,
+        "-o",
+        `${dir}/out.wasm`,
+        "--concise",
+        "--compiler",
+        COMPILER,
+      ],
+      stdout: "piped",
+      stderr: "piped",
+      env: { RUST_BACKTRACE: "0" },
+    }).output();
+    return { code, err: new TextDecoder().decode(stderr) };
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
+Deno.test({
+  name: "native-diag-pos: EMIT-stage failure anchors at the failing function's name",
+  ignore: !ENABLED,
+  fn: async () => {
+    // A closure whose result struct carries a nullable distinct-backing scalar-list
+    // field (`{f: i64[] | null}`) has no lowerable rep — the call `v(1)` inside
+    // `useIt` (line 4) fails at the EMIT stage. The diagnostic anchors at the
+    // enclosing function's NAME token (`useIt`, col 8 0-based → [4:9]), not
+    // positionless (line 0) as before — so a build/playground/LSP consumer can
+    // point the reader at the offending function instead of rendering the message
+    // bare. (`declNameTokOf` anchoring, matching the lint/type-diag convention.)
+    const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_" });
+    try {
+      const path = `${dir}/case.vl`;
+      await Deno.writeTextFile(
+        path,
+        "function makeIt(): (i32) => {f: i64[] | null} {\n" +
+          "  return (q0) => ({ f: [1, 2] })\n" +
+          "}\n" +
+          "function useIt() {\n" +
+          "  const v: (i32) => {f: i64[] | null} = makeIt()\n" +
+          "  const s = v(1)\n" +
+          "  print(0)\n" +
+          "}\n" +
+          "useIt()\n",
+      );
+      const r = await build(path);
+      if (r.code === 0) throw new Error("expected emit-stage rejection, got exit 0");
+      if (!r.err.includes("emit error")) {
+        throw new Error(`expected "emit error" in stderr, got:\n${r.err}`);
+      }
+      const needle = `${path}:4:9:`;
+      if (!r.err.includes(needle)) {
+        throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
