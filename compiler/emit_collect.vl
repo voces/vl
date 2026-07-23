@@ -12,9 +12,11 @@ import {
   T,
   TyArray,
   TyFunc,
+  TyLit,
   TyMap,
   TyNullable,
   TyObj,
+  TyPrim,
   TyUnion,
   canonEmitName,
   inferLetCount,
@@ -34,6 +36,7 @@ import {
   nodeTyIxOf,
   nodeTyName,
   splitUnionAtoms,
+  tyIsLitUnion,
   tyToNominalName,
   unionMemberCount,
   valueAtomKind,
@@ -124,6 +127,7 @@ import {
   cloSigBase,
   cloSigKeys,
   cloSigRepFn,
+  cloSigWalkRoots,
   cloStructIdx,
   criChanged,
   fRetBool,
@@ -275,6 +279,7 @@ import {
   forceCloResultListTypes,
   forceCloResultMapTypes,
   forceScalarListField,
+  funcTypeShapeLowerable,
   gaeEnsure,
   genTyParamArr,
   ifExprNliName,
@@ -845,6 +850,21 @@ export function collectCloSigs() {
       }
     }
     ni = ni + 1
+  }
+  // ARENA CLOSURE-SIG WALK (runs LAST — after every name-walk pass above, so an already
+  // interned sig keeps its slot). Descend the arena type of each annotation the union
+  // registration walk recorded (`cloSigWalkRoots` — the SAFE top-level + body root set,
+  // never the generic/monomorphized template `TypeRef` nodes a blind `P.nodes` scan hits)
+  // and intern each reachable `TyFunc`'s `$fnsig`, catching closures the name walks miss
+  // because they nest in a position no spelling-descent enumerates — a closure FIELD of a
+  // CLOSURE-RESULT struct (`(i32) => {f: () => i32}`): the TypeRef's whole name is the outer
+  // closure, so `internShapeFieldCloSigs` never runs on the result struct. Idempotent +
+  // order-stable via `cloSigPosOfKey`; the `fnValUsed` gate at the top keeps a program
+  // without function values byte-identical (this loop is unreachable when `fnValUsed` false).
+  let ri = 0
+  while ri < cloSigWalkRoots.length {
+    if collectTyReachCloSigs(cloSigWalkRoots[ri], 16) < 0 { return -1 }
+    ri = ri + 1
   }
   0
 }
@@ -4262,6 +4282,138 @@ function collectTyReachRegister(stmts: i32[], tyIx: i32, depth: i32) {
   0
 }
 
+// True if a closure whose RESULT arena type is `retIx` is NOT yet representable through
+// the value ABI — so a concrete lambda of that shape would NOT intern a sig either
+// (`cloRetKeySuffix` yields "" / a non-recoverable slot). The arena sig walk must SKIP
+// interning such a closure's sig: the render-based key (`annRetKind`) is more permissive
+// than the lambda-based one, and synthesizing a sig the concrete producer declines would
+// let a value CALL resolve past its clean reject into a downstream INVALID emit (the
+// closure-result-field composite draw `(i32) => {f: () => {f: i64} | i32}` — the outer
+// closure's result struct carries a bare-closure field, non-lowerable). Two holes:
+//   (1) an INLINE result STRUCT that is not `funcTypeShapeLowerable` — the exact gate
+//       `cloRetKeySuffix` applies via `cloRetValSlot`/`retStructIndex`. A DECLARED struct
+//       (nominal name, not `{`) is always representable.
+//   (2) a heterogeneous scalar+composite VALUE UNION (`{f: i64} | i32`) — the deferred
+//       #875 box hole; synthesizing its `>u` would defeat the
+//       `cloCallUnionResultUnrepresentable` floor ("un-interned `>u` ⟹ reject").
+// A concrete lambda that GENUINELY represents such a result interns its own sig earlier
+// (the `fnStmts` loop, before this walk), so skipping here never drops a needed sig.
+function funcRetUnrepresentable(retIx: i32): boolean {
+  if retIx < 0 { return false }
+  const t = T.tys[retIx]
+  if t is TyObj {
+    const nm = canonEmitName(tyToNominalName(retIx))
+    if nm.length > 0 && nm[0] == '{' && nm[1] != '[' {
+      return !funcTypeShapeLowerable(nm)
+    }
+    return false
+  }
+  if t is TyUnion {
+    const members = t.uMembers
+    if members.length < 2 { return false }
+    let hasScalar = false
+    let hasComposite = false
+    let i = 0
+    while i < members.length {
+      const mt = T.tys[members[i]]
+      if mt is TyPrim { hasScalar = true }
+      else if mt is TyLit { hasScalar = true }
+      else if tyIsLitUnion(members[i]) { hasScalar = true }
+      else if mt is TyObj { hasComposite = true }
+      else if mt is TyArray { hasComposite = true }
+      else if mt is TyMap { hasComposite = true }
+      else if mt is TyFunc { hasComposite = true }
+      i = i + 1
+    }
+    return hasScalar && hasComposite
+  }
+  false
+}
+
+// ── UNIFIED ARENA CLOSURE-SIG WALK ──────────────────────────────────────────
+// The sig-interning sibling of `collectTyReachRegister`: given an annotation node's
+// resolved arena type `tyIx`, recurse over the `T.tys` shape and, on EVERY reachable
+// `TyFunc`, intern that closure's `$fnsig` key. Retires the reliance on the accreted
+// hand-maintained NAME-split descents in `collectCloSigs`/`internShapeFieldCloSigs`
+// (the closure-array / nulclosure / union-arm / nested-shape-field passes), each of
+// which added ONE new spelling-descent per fuzz finding (#987/#1006-F2/#1016/#1018/
+// #1026 …). A closure buried in a NOVEL nesting position — a closure returning a closure
+// inside a struct FIELD of a union arm (`{a: () => ((i32,i32,i32) => string), …} | i64`,
+// the #1028 sig-descent draw) — is reachable in the arena but was never enumerated by a
+// name-walk recursion (the TypeRef's whole-name is the outer union, and the closure nests
+// below every `nameIsSingleShape`/`internShapeFieldCloSigs` entry). This walk makes the
+// miss structurally impossible: it descends through every composite variant uniformly.
+//
+// RENDER DISCIPLINE (mirrors `collectTyReachRegister`): a `TyFunc` is rendered with
+// `tyToNominalName` (nominal-first) then `canonEmitName` ONCE over the WHOLE render, so
+// the derived key is EXACTLY the one the value CALL site derives (`nodeTyName` →
+// `annSigKey`) and the one a concrete lambda's `cloSigKeyExt` interns — sigs UNION IN.
+// `unionArmSigKey` peels any grouping parens to the bare `(…)=>…` `annSigKey` expects.
+// The synth rep is -1 (`emitSynthCloSig` builds the functype from the key); the
+// `funcRetUnrepresentable` gate + the `nulCloMixedUnionUnregistered` floor keep a
+// not-yet-representable result a LOUD reject rather than unmasking a downstream INVALID
+// emit (the render key is more permissive than the concrete-lambda key).
+//
+// IDEMPOTENT + ORDER-STABLE: guarded by `cloSigPosOfKey`, and CALLED LAST in
+// `collectCloSigs` (after every name-walk pass + the concrete-lambda loop), so a sig
+// any existing path already interned keeps its slot and only a genuinely-missed sig is
+// appended at the END — minimizing the nominal-sensitive slot-digit churn (#1019). The
+// `$fnsig` slot digits feed interned sig TEXT, so this is run-diff-gated, not
+// byte-identical. Depth-capped at 16 (recursive arena types). Returns 0, or -1.
+function collectTyReachCloSigs(tyIx: i32, depth: i32) {
+  if tyIx < 0 || depth <= 0 { return 0 }
+  const t = T.tys[tyIx]
+  if t is TyNullable { return collectTyReachCloSigs(t.nInner, depth - 1) }
+  if t is TyArray { return collectTyReachCloSigs(t.aElem, depth - 1) }
+  if t is TyMap { return collectTyReachCloSigs(t.mVal, depth - 1) }
+  if t is TyObj {
+    const ftys = t.objFieldTypes
+    let i = 0
+    while i < ftys.length {
+      if collectTyReachCloSigs(ftys[i], depth - 1) < 0 { return -1 }
+      i = i + 1
+    }
+    return 0
+  }
+  if t is TyUnion {
+    const members = t.uMembers
+    let i = 0
+    while i < members.length {
+      if collectTyReachCloSigs(members[i], depth - 1) < 0 { return -1 }
+      i = i + 1
+    }
+    return 0
+  }
+  if t is TyFunc {
+    // Intern THIS closure's sig from its arena render (the key the value-call site and
+    // a concrete lambda both derive). A non-value-ABI result (string/i64/void) keys ""
+    // and stays unminted; a mixed-union unregistered result is skipped so the call
+    // rejects loudly (the name-pass discipline).
+    if !funcRetUnrepresentable(t.fnRet) {
+      const nm = canonEmitName(tyToNominalName(tyIx))
+      if nm != "" {
+        const ck = unionArmSigKey(nm)
+        if ck != "" && !nulCloMixedUnionUnregistered(nm) {
+          if cloSigPosOfKey(ck) < 0 {
+            cloSigKeys.push(ck)
+            cloSigRepFn.push(-1)
+          }
+        }
+      }
+    }
+    // Descend params + result to reach closures nested inside them (a result struct's
+    // closure field, a param closure, a closure arm of a field union).
+    const ps = t.fnParamTypes
+    let i = 0
+    while i < ps.length {
+      if collectTyReachCloSigs(ps[i], depth - 1) < 0 { return -1 }
+      i = i + 1
+    }
+    return collectTyReachCloSigs(t.fnRet, depth - 1)
+  }
+  0
+}
+
 // Scan every top-level FuncDecl's parameter + return annotations and every top-level
 // `let`/`const` annotation for INLINE union types, registering each as a synthetic
 // union alias (so it interns its variant shapes + heap types exactly like a named
@@ -4271,6 +4423,7 @@ function collectTyReachRegister(stmts: i32[], tyIx: i32, depth: i32) {
 function collectInlineUnions(stmts: i32[]) {
   nliLetIxs = []
   nliNames = []
+  cloSigWalkRoots = []
   collectInlineUnionsIn(stmts, stmts)
 }
 
@@ -4294,6 +4447,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       // Arena walk: register EVERY union reachable through the resolved return type,
       // not just the ones the `tyNameOf` render surfaced (registrations union in).
       if collectTyReachRegister(stmts, nodeTyIxOf(retTy), 16) < 0 { return -1 }
+      cloSigWalkRoots.push(nodeTyIxOf(retTy))
       let pi = 0
       while pi < params.length {
         const p = P.nodes[params[pi]]
@@ -4301,6 +4455,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
           const pt = p.parType
           if registerInlineUnion(stmts, tyNameOf(pt)) < 0 { return -1 }
           if collectTyReachRegister(stmts, nodeTyIxOf(pt), 16) < 0 { return -1 }
+          cloSigWalkRoots.push(nodeTyIxOf(pt))
         }
         pi = pi + 1
       }
@@ -4309,6 +4464,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       const letTy = s.letType
       if registerInlineUnion(stmts, tyNameOf(letTy)) < 0 { return -1 }
       if collectTyReachRegister(stmts, nodeTyIxOf(letTy), 16) < 0 { return -1 }
+      cloSigWalkRoots.push(nodeTyIxOf(letTy))
       // Usage-driven `let x = null` hole (A-infer-null): infer + register `T|null`.
       nliInferLet(walk, i)
       // An un-annotated `const x = if … then … else …` whose arms join to a value
@@ -4332,6 +4488,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
             if collectTyReachRegister(stmts, nodeTyIxOf(fdt), 16) < 0 {
               return -1
             }
+            cloSigWalkRoots.push(nodeTyIxOf(fdt))
           }
         }
         tfi = tfi + 1
