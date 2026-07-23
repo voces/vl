@@ -8424,6 +8424,22 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // ELEMENT-NULLABLE-SCALAR-LIST result (`() => (f64[] | null)[]`): a lambda whose
+        // body array literal (non-null inner lists, or a `null` hole) is assignable to the
+        // expected nullable-list-element list adopts it, so `emitReturnValue` builds each
+        // element through the nullable inner-wrapper niche (`(ref null $wrapper)`) the
+        // annotated `(): (f64[]|null)[]` named-function value spelling already lowers
+        // (`synthRetAnnots` pins `fnRet` via `parenUnionArrElemName`). Un-pinned, the body's
+        // non-null lists self-classified a plain `f64[][]` reflist keyed on a DIFFERENT slot
+        // than the annotation-side value call's `(…|null)[]` slot — a cast-failure TRAP
+        // (fuzz post-#1051 sweep GATING leg). The scalar-list sibling of the nullable-map
+        // arm above.
+        if inferred != expRet && nulListElemListRetName(expRet) != "" {
+          const nleTail = lambdaBodyTail(n.fnBody)
+          if nleTail >= 0 && assignableExpr(nleTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
         // ELEMENT-VALUE-UNION LIST result (`() => (i64|boolean)[]`): a lambda whose body array
         // literal is assignable to the expected value-union-box list adopts it, so `emitReturnValue`
         // boxes each element (`[7]`) through the SAME element-kind-2 rep the annotated
@@ -8777,6 +8793,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // whose kind-3 map-niche element seeding `emitReturnValue` already performs for the
         // annotated form.
         if unm == "" { unm = nulMapElemListRetName(inferred) }
+        // An ELEMENT-NULLABLE-SCALAR-LIST contextual return (`() => (f64[]|null)[]`, adopted
+        // just above) — record its canonical emit name so `synthRetAnnots` pins the lambda's
+        // `fnRet` as the nullable-list-element list (its `parenUnionArrElemName` arm), whose
+        // nullable inner-wrapper element seeding `emitReturnValue` already performs for the
+        // annotated form.
+        if unm == "" { unm = nulListElemListRetName(inferred) }
         // An ELEMENT-VALUE-UNION list contextual return (`() => (i64|boolean)[]`, adopted just
         // above) — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the
         // value-union-box list, whose element boxing `emitReturnValue` already performs.
@@ -10192,7 +10214,18 @@ function nulStructElemListRetName(er: i32) {
     if et is TyNullable {
       const it = T.tys[et.nInner]
       if it is TyObj {
-        if !structElemFieldsPlain(et.nInner, 4) { return "" }
+        // A BOXED-UNION-FIELD element (`({f: i64|string|{q:i64}} | null)[]` — the element
+        // struct carries a variant-box union field) is NOT `structElemFieldsPlain`, but the
+        // annotated `(…|null)[]` named-function-VALUE spelling already lowers it (the
+        // kind-1 struct niche over the boxed-field struct row), so admit it through the
+        // SAME pin when `structFieldBoxRetName` proves every field lowerable. Un-admitted,
+        // the bare lambda self-classified a plain `{f:…}[]` reflist slot vs the
+        // annotation-side `(…|null)[]` slot — a cast-failure TRAP / "bare null needs a
+        // struct-typed context" reject (fuzz post-#1051 sweep declared leg). The
+        // nullable-element sibling of `structFieldBoxElemListRetName`.
+        if !structElemFieldsPlain(et.nInner, 4) {
+          if structFieldBoxRetName(et.nInner) == "" { return "" }
+        }
         return tyToEmitName(er)
       }
     }
@@ -10220,6 +10253,37 @@ function nulMapElemListRetName(er: i32) {
     if et is TyNullable {
       const it = T.tys[et.nInner]
       if it is TyMap { return tyToEmitName(er) }
+    }
+  }
+  ""
+}
+
+// The emitter-format NAME of a NULLABLE-SCALAR-LIST-element list return `er` —
+// `(f64[] | null)[]`, `(i64[] | null)[]`: a `TyArray` whose element is a `TyNullable` over a
+// `TyArray` of a scalar/string PRIM leaf. Its elements are the inner list's wrapper ref kept
+// nullable (`(ref null $wrapper)`, the `rlElemNullable` bit over the kind-4/6/7/8/10 inner —
+// `nullArrayArrElem`'s rep, which the annotated `(…|null)[]` return / named-function-VALUE
+// spelling already lowers), so `synthRetAnnots` pins a lambda's `fnRet` to it (its
+// `parenUnionArrElemName` arm — `f64[]|null` is a 2+-member `|` inner). Un-pinned, the body's
+// non-null lists self-classified a plain `f64[][]` reflist keyed on a DIFFERENT slot than the
+// annotation-side value call's `(…|null)[]` slot — a cast-failure TRAP; an all-`[null]` body
+// missed the element seed entirely ("bare null needs a struct-typed context"; fuzz post-#1051
+// sweep GATING leg). The scalar-list sibling of `nulMapElemListRetName` /
+// `nulStructElemListRetName`. A nested (2-D+) or composite-element inner list stays declined
+// ("" — those composition seams keep their loud rejects).
+function nulListElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const et = T.tys[t.aElem]
+    if et is TyNullable {
+      const it = T.tys[et.nInner]
+      if it is TyArray {
+        if it.aElem < 0 { return "" }
+        const lt = T.tys[it.aElem]
+        if lt is TyPrim { return tyToEmitName(er) }
+      }
     }
   }
   ""
