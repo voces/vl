@@ -16569,6 +16569,15 @@ function cloCallUnionMixUnrep(ty: i32, callIx: i32, fnIx: i32): boolean {
   // than TRAP at the value call's `ref.cast` (fuzz sweep wo7cNe declared backlog, `() => (() =>
   // string | null)[] | i32 | null`). The closure-array sibling of the map-array arm above.
   if pk == "" && tyUnionHasClosureArrayArm(ty) { return true }
+  // A param/arg-fed closure (no resolvable producer, `pk == ""`) whose value-union result
+  // carries a NESTED (2-D+) LITUNION-array arm (`K0[][] | boolean`): the litunion 2-D array
+  // folds to a distinct wrapper slot the value-union box does not yet compose through (the
+  // DIRECT binding rejects as "not yet representable"), but the nullable-closure annotation
+  // interns the box, slipping the `cloSigPosOfKey < 0` arm — and the producer lambda's bare
+  // scalar arm makes the value call's closure `ref.cast` TRAP. Reject cleanly rather than
+  // trap (fuzz sweep P8mid2 branching, seed 75568152). The litunion-2D-array sibling of the
+  // map-array / closure-array arms above.
+  if pk == "" && tyUnionHasLitUnionNestedArrayArm(ty) { return true }
   // An INDEXED closure-array-element callee (`f[0]()` / `p.f[0]()`) whose result union has a
   // VALUE-UNION-element-ARRAY arm (`(i64|boolean)[] | i32`): the element sig is the array-
   // element ANNOTATION's box (`>u`), while the array may hold a concrete lambda that self-
@@ -16660,6 +16669,42 @@ function tyUnionHasClosureArrayArm(ty: i32): boolean {
       if en is TyNullable { el = en.nInner }
       if el >= 0 {
         if T.tys[el] is TyFunc { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True when the TyUnion at `ty` has a MEMBER that is a NESTED (2-D+) array whose ultimate
+// LEAF element is a LITUNION (`K0[][]`, `K0[][][]`). This arm is a deferred hole in a
+// closure-RESULT value union: the litunion 2-D array folds to a distinct wrapper slot
+// (`rlCanonElemName`'s i32-atom-leaf canon) that does not yet compose through a value-union
+// box result — the DIRECT binding already rejects as "not yet representable", but a
+// PARAM/arg-fed closure interns the box on the annotation side and slips the
+// `cloSigPosOfKey < 0` arm, then the concrete producer lambda self-infers its bare scalar
+// arm (`(q0,q1,q2) => (false)` → `boolean` functype) and the value call's closure
+// `ref.cast` to the `>u`-result functype TRAPS (fuzz sweep P8mid2 branching, seed 75568152:
+// `((i32,i32,i32) => K0[][] | boolean) | null`). A 1-D litunion array (`K0[]`) and a
+// SCALAR-leaf nested array (`i32[][]`, `string[][]`, `f64[][]`) rep fine — only the
+// litunion 2-D+ leaf is the hole, so gate precisely on it.
+function tyUnionHasLitUnionNestedArrayArm(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  let i = 0
+  while i < t.uMembers.length {
+    const m = T.tys[t.uMembers[i]]
+    if m is TyArray {
+      const el = T.tys[m.aElem]
+      // A NESTED array: the outer array's element is itself an array. Walk to the leaf.
+      if m.aElem >= 0 && el is TyArray {
+        let leaf = m.aElem
+        while leaf >= 0 {
+          const lt = T.tys[leaf]
+          if lt is TyArray { leaf = lt.aElem } else { break }
+        }
+        if leaf >= 0 && tyIsLitUnion(leaf) { return true }
       }
     }
     i = i + 1
