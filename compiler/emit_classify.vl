@@ -303,6 +303,9 @@ import {
   uVarHeap,
   uVarTwin,
   uVariants,
+  unMemTyCount,
+  unMemTyStart,
+  unMemTys,
   unMemberSet,
   unNames,
   unVarCount,
@@ -319,6 +322,7 @@ import {
 import { emitFail } from "./emit_bytes"
 import {
   recordSTyIx,
+  recordUnMemTys,
   repElemKeyOfName,
   repKindOfSigTok,
   repNameCanonKey,
@@ -10845,6 +10849,7 @@ export function registerValueUnionName(name: string) {
   uDeclared = true
   unNames.push(name)
   unMemberSet.push(name)
+  recordUnMemTys(name) // D-UNION foundation
   unVarStart.push(uVariants.length)
   unVarCount.push(0)
   markValueUnionAtoms(name)
@@ -11115,6 +11120,21 @@ export function unionMapArmName(name: string) {
   if nm == "" { nm = name }
   const atoms: string[] = []
   splitUnionAtoms(nm, atoms)
+  // D-UNION: pick the map arm from the row's recorded ARENA member types
+  // (`unMemIsMap` — `T.tys[m] is TyMap`) instead of re-classifying each atom's
+  // RENDERED spelling with `nameIsMap`. The recorded member slice is in atom order
+  // (the box-tag ABI order), so `atoms[m]` is this member's stored spelling — which is
+  // what the still-name-keyed map-slot layer downstream (`mapValNameOf`,
+  // `mvSlotOfMapValNameOrMono`) needs. An uncovered row keeps the legacy name path.
+  const mems: i32[] = []
+  if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+    let m = 0
+    while m < mems.length {
+      if unMemIsMap(mems[m]) { return atoms[m] }
+      m = m + 1
+    }
+    return ""
+  }
   let i = 0
   while i < atoms.length {
     if nameIsMap(atoms[i]) { return atoms[i] }
@@ -11492,6 +11512,18 @@ export function unionHasClosureArrayArm(name: string) {
   if nm == "" { nm = name }
   const atoms: string[] = []
   splitUnionAtoms(nm, atoms)
+  // D-UNION: `unMemIsFuncArray` (a `TyArray` over a `TyFunc`) is the arena dual of
+  // `nameIsClosureArray` — including its NULLABLE-element exclusion, which falls out
+  // for free (a `(((i32) => boolean) | null)[]` element is a `TyNullable`).
+  const mems: i32[] = []
+  if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+    let m = 0
+    while m < mems.length {
+      if unMemIsFuncArray(mems[m]) { return true }
+      m = m + 1
+    }
+    return false
+  }
   let i = 0
   while i < atoms.length {
     if nameIsClosureArray(atoms[i]) { return true }
@@ -11536,6 +11568,19 @@ export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
           if ums != "" { un = ums }
           const atoms: string[] = []
           splitUnionAtoms(un, atoms)
+          // D-UNION: the deliberately-conservative `strContains(elem, "=>")` arm test
+          // is a REACHABILITY question — `unMemIsFuncReachArray` asks it of the arena
+          // (a `TyArray` whose element structure reaches a `TyFunc`) instead of of the
+          // element's rendered spelling.
+          const mems: i32[] = []
+          if unionMemberTysOf(un, mems) && mems.length == atoms.length {
+            let m = 0
+            while m < mems.length {
+              if unMemIsFuncReachArray(mems[m]) { return true }
+              m = m + 1
+            }
+            return false
+          }
           let i = 0
           while i < atoms.length {
             const a = atoms[i]
@@ -11562,6 +11607,17 @@ export function unionHasClosureArm(name: string) {
   if nm == "" { nm = name }
   const atoms: string[] = []
   splitUnionAtoms(nm, atoms)
+  // D-UNION: value-atom kind 11 IS "the member is a function type" — ask the arena
+  // (`unMemIsFunc`) rather than `valueAtomKind`'s spelling ladder.
+  const mems: i32[] = []
+  if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+    let m = 0
+    while m < mems.length {
+      if unMemIsFunc(mems[m]) { return true }
+      m = m + 1
+    }
+    return false
+  }
   let i = 0
   while i < atoms.length {
     if valueAtomKind(atoms[i]) == 11 { return true }
@@ -11579,6 +11635,18 @@ export function unionClosureArmName(name: string) {
   if nm == "" { nm = name }
   const atoms: string[] = []
   splitUnionAtoms(nm, atoms)
+  // D-UNION: the arm SELECTION is structural (`unMemIsFunc`); the returned NAME stays
+  // the member's stored spelling, which `emitUnionCoerce` feeds to the still-name-keyed
+  // `scalarTagOf` (a D5 residual, not this slice).
+  const mems: i32[] = []
+  if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+    let m = 0
+    while m < mems.length {
+      if unMemIsFunc(mems[m]) { return atoms[m] }
+      m = m + 1
+    }
+    return ""
+  }
   let i = 0
   while i < atoms.length {
     if valueAtomKind(atoms[i]) == 11 { return atoms[i] }
@@ -12068,6 +12136,18 @@ export function unionHasMapArrayArm(name: string) {
   if nm == "" { nm = name }
   const atoms: string[] = []
   splitUnionAtoms(nm, atoms)
+  // D-UNION: a `TyArray` over a `TyMap` (`unMemIsMapArray`). The name path's
+  // `!nameIsMapMemberUnion(elem)` guard is free structurally — a map-member UNION
+  // element is a `TyUnion`, never a `TyMap`, however it renders.
+  const mems: i32[] = []
+  if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+    let m = 0
+    while m < mems.length {
+      if unMemIsMapArray(mems[m]) { return true }
+      m = m + 1
+    }
+    return false
+  }
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
@@ -13543,6 +13623,139 @@ export function unionMemberSetOf(name: string) {
     u = u + 1
   }
   name
+}
+
+// The `unNames` ROW of the union `name` — matched on the alias NAME or on the
+// pipe-joined member SET (a consumer that already resolved the alias hands us the
+// set), or -1. Nominal identity lookup, not a structural decision.
+export function unionRowOf(name: string): i32 {
+  if name == "" { return -1 }
+  let u = 0
+  while u < unNames.length {
+    if unNames[u] == name { return u }
+    u = u + 1
+  }
+  let v = 0
+  while v < unMemberSet.length {
+    if unMemberSet[v] == name { return v }
+    v = v + 1
+  }
+  -1
+}
+
+// The ARENA member types of the union `name`, appended to `out` in the row's recorded
+// ORDER (== `splitUnionAtoms(unMemberSet[row])` order — the box-tag ABI order). True
+// when the row is covered and EVERY member resolved; false leaves `out` untouched and
+// the caller must keep its legacy member-NAME path. The D-UNION query seam: consumers
+// classify each member STRUCTURALLY (`T.tys[m] is TyMap`, …) instead of re-deriving the
+// shape from the member's rendered spelling.
+export function unionMemberTysOf(name: string, out: i32[]): boolean {
+  const u = unionRowOf(name)
+  if u < 0 { return false }
+  if u >= unMemTyStart.length { return false }
+  const st = unMemTyStart[u]
+  if st < 0 { return false }
+  const n = unMemTyCount[u]
+  let i = 0
+  while i < n {
+    if unMemTys[st + i] < 0 { return false }
+    i = i + 1
+  }
+  let j = 0
+  while j < n {
+    out.push(unMemTys[st + j])
+    j = j + 1
+  }
+  true
+}
+
+// ── D-UNION structural member classifiers ────────────────────────────────────
+// The arena duals of the per-atom `nameIs*` re-classification the member-set
+// consumers used to perform on a RENDERED member spelling. Each answers the same
+// question `nameIsMap` / `nameIsClosureArray` / `valueAtomKind(.) == 11` /
+// `nameIsArray(.) && nameIsMap(refArrElemName(.))` asked of the atom TEXT, from the
+// member's arena type instead.
+
+// A MAP member (`{[string]: V}`). The `nameIsMapMemberUnion` exclusion the name path
+// carries is structural here for free: a union whose FIRST atom is a map renders as a
+// `{[`-prefixed name but IS a `TyUnion`, never a `TyMap`.
+export function unMemIsMap(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyMap { return true }
+  false
+}
+
+// A BARE-CLOSURE member (`(() => i64) | i32` — value-atom kind 11).
+export function unMemIsFunc(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyFunc { return true }
+  false
+}
+
+// A CLOSURE-ELEMENT ARRAY member (`((i32) => f64)[]`, `nameIsClosureArray`). A
+// NULLABLE-closure element (`(((i32) => boolean) | null)[]`) is a `TyNullable`
+// element, not a `TyFunc` — excluded here exactly as `nameIsClosureArray` excludes it.
+export function unMemIsFuncArray(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyArray {
+    const e = T.tys[t.aElem]
+    if e is TyFunc { return true }
+  }
+  false
+}
+
+// An ARRAY-OF-MAP member (`{[string]: V}[]`). The name path's
+// `!nameIsMapMemberUnion(elem)` guard is again free: a map-member-UNION element is a
+// `TyUnion`, not a `TyMap`.
+export function unMemIsMapArray(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyArray {
+    const e = T.tys[t.aElem]
+    if e is TyMap { return true }
+  }
+  false
+}
+
+// A REF-ARRAY member whose ELEMENT type REACHES a function type — the structural dual
+// of the deliberately-conservative `strContains(refArrElemName(a), "=>")` arm test
+// (`calleeIsUnionElemFieldClosure`). Depth-bounded and cycle-tolerant by the bound.
+export function unMemIsFuncReachArray(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyArray { return tyReachesFuncD(t.aElem, 12) }
+  false
+}
+
+// True when `ty` contains a `TyFunc` anywhere in its structure (fields, elements, map
+// values, nullable inners, union members) within `depth` wrapper hops.
+function tyReachesFuncD(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  if t is TyFunc { return true }
+  if t is TyArray { return tyReachesFuncD(t.aElem, depth - 1) }
+  if t is TyNullable { return tyReachesFuncD(t.nInner, depth - 1) }
+  if t is TyMap { return tyReachesFuncD(t.mVal, depth - 1) }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if tyReachesFuncD(t.uMembers[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyObj {
+    let j = 0
+    while j < t.objFieldTypes.length {
+      if tyReachesFuncD(t.objFieldTypes[j], depth - 1) { return true }
+      j = j + 1
+    }
+    return false
+  }
+  false
 }
 
 // The CURRENT narrowed variant set of a STRUCT-union binding `name`: its innermost
