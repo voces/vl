@@ -101,14 +101,39 @@ make an index authoritative, either (a) re-record on mutation, (b) record a *can
 than an index where the value must be stable, or (c) prove the family is mutation-free. Pick
 one deliberately per slice; do not assume.
 
-### D2 — the computed-name interning layer
+### D2 — the computed-name interning layer — ATTEMPTED, and it refuted the plan
 
 `rlInternName` / `rlSlotByName` / `mvCanonValName` mint a canonical name by string surgery
-(`rlCanonLitUnionAtoms`, `rlCanonElemName`, litunion→`string` widening) and then key a slot
-on the resulting text. Every one of those canonicalisations exists to make two spellings of
-one *rep* collide — which is exactly `repCanonKey`'s job. Re-key the slot tables on the
-canon key (or the arena index under `structFieldCodesEq`), and the canonicalisation helpers
-delete themselves.
+and key a slot on the resulting text. The plan said: those canonicalisations exist to make
+two spellings of one rep collide, which is `repCanonKey`'s job, so re-key on the canon key
+and the helpers delete themselves.
+
+**Measured — half right, and the wrong half matters.**
+
+- *Additive* probe (canon-key consult LAST, after every existing text fallback):
+  corpus **byte-identical**, suite green. So on the corpus the canon key never contradicts
+  the string surgery.
+- *Replacement* (delete the surgery, keep exact-match + canon key): **4 suite failures** —
+  `atom-2d-array`, `closure-value-2d-scalar-array-result`,
+  `closure-value-2d-nulstring-array-result`, `nested-array-closure-result`.
+
+The cause is not a gap in the canon key; it is a **category error in the plan**.
+`rlCanonElemName` folds `boolean[]` and a litunion `K[]` to `i32[]`, and `(string|null)[]`
+to `string[]`. Those are **structurally distinct types that share one WasmGC wrapper** —
+`i32[]`, `boolean[]` and `K[]` all ride the `lTypeIdx` i32-list backing. The surgery encodes
+**rep equivalence**. `repCanonKey` is a canonical key for the **arena type**, so it keeps
+them apart — correctly as a type key, wrongly as a slot key.
+
+**The correction, which applies to D3 as well:** the slot layers are keyed on
+REPRESENTATION, not on type. Destringifying them needs a **rep key** — a structural
+type→rep fold (i32-backed leaves → the i32-list wrapper, string-backed → the string-list
+wrapper, litunion → its boxed atom) — not `repCanonKey`. Building `repElemKey(ty)` is the
+real D2, and it is a genuine piece of design rather than a re-keying. Until it exists, the
+string surgery is *load-bearing* and must stay.
+
+This is the second time this program's plan has been corrected by measurement (see D1). The
+pattern is the same both times: an arena artifact that looks like a drop-in for a name key
+is answering a subtly different question.
 
 ### D3 — the `$fnsig` layer (highest risk, highest value)
 
