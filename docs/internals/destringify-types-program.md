@@ -82,12 +82,24 @@ not resolve** — the `#anon` literal rows that `slotCanonKey` currently falls b
 `sAnonCanon` for. Unconsumed → byte-identical. Mirrors #1009 (`nodeRepTyIx`) and #1022
 (`sAnonCanon`), both of which shipped byte-identical and then unlocked their consumers.
 
-### D1 — `slotCanonKey` and friends read the sidecar
+### D1 — `slotCanonKey` reads the sidecar — SHIPPED, and the plan above was wrong
 
-`slotCanonKey(si)` becomes `repCanonKey(sTyIx[si])` — no name parse, no `resolveAnnot`, no
-`renderFaithful` normalisation, and no `sAnonCanon` fallback. This is the hottest structural
-path in the emitter; it should also be measurably faster (it deletes a memoised parse).
-Metric: `repRowOfName`'s `-2` ("name didn't resolve") rate goes to zero.
+Landed as: the sidecar owns the rows **a name cannot resolve** (the `#anon` literal shapes),
+and `sAnonCanon` is deleted. `slotCanonKey` no longer consults any key-string table.
+
+**The sketch above — "becomes `repCanonKey(sTyIx[si])`", i.e. authoritative over the whole
+function — is refuted.** Ahead of the name path it fails 5 suite cases (nullable-struct list
+fields, variant reflist fields). The recorded index is the type as of **intern** time; the
+name path re-resolves at **query** time; and for name-resolvable rows those disagree once the
+arena mutates (`holeMemberTy` grows a hole's shape in place and bumps `tyMutEpoch`). This is
+the same shape as the phase-0 probe's 141 benign divergences — a recorded arena type and a
+resolver's answer are **not interchangeable by default**.
+
+**Consequence for the later phases, which assumed otherwise:** an arena-index key is only a
+drop-in replacement for a name key where the type cannot mutate after recording. Before D2/D3
+make an index authoritative, either (a) re-record on mutation, (b) record a *canon key* rather
+than an index where the value must be stable, or (c) prove the family is mutation-free. Pick
+one deliberately per slice; do not assume.
 
 ### D2 — the computed-name interning layer
 
