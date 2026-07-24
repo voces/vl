@@ -275,6 +275,38 @@ Deno.test({ name: "wasm-symbols: hoverTypeAt renders a non-empty type", ignore }
   }
 });
 
+Deno.test({
+  name: "wasm-symbols: an un-annotated param hovers as everything its body demands",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // An `is` guard over an un-annotated param contributes an ALTERNATIVE, not extra
+  // fields (see `tests/cases/inference/hole-is-guard-alternative.vl`). Hover reports
+  // the SAME disjunction the call-arg diagnostic names — the hole itself renders as
+  // an uninformative `any`.
+  const guarded = "function foobar(v) {\n" +
+    "  if v is { foo: string } then return v.foo\n" +
+    "  return v.bar\n" +
+    "}\n" +
+    'print(foobar({ foo: "foo" }))\n';
+  const want = "{foo: string} | {bar: any}";
+  // The param's declaration (line 0, col 16) and its use in `v.bar` (line 2, col 9).
+  const declTy = await checker.hoverTypeAt(guarded, "/tmp/x.vl", noSiblings, 0, 16);
+  if (declTy !== want) {
+    throw new Error(`expected ${want} at the param decl, got ${JSON.stringify(declTy)}`);
+  }
+  const useTy = await checker.hoverTypeAt(guarded, "/tmp/x.vl", noSiblings, 2, 9);
+  if (useTy !== want) {
+    throw new Error(`expected ${want} at the param use, got ${JSON.stringify(useTy)}`);
+  }
+  // A hole the body never constrains stays `any` — there is nothing to report.
+  const free = "function twice(n) { return n + n }\nprint(twice(3))\n";
+  const freeTy = await checker.hoverTypeAt(free, "/tmp/x.vl", noSiblings, 0, 15);
+  if (freeTy !== "any") {
+    throw new Error(`expected any for an unconstrained hole, got ${JSON.stringify(freeTy)}`);
+  }
+});
+
 Deno.test({ name: "wasm-symbols: typeAliasAt renders a user type name (decl + use)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // `type Pt = { x: i32 }` on line 0 (name at col 5); `let p: Pt = …` on line 1
