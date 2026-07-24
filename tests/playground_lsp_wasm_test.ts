@@ -76,11 +76,15 @@ Deno.test({ name: "playground-run: an EMIT-stage failure yields a POSITIONED err
   // Diagnostics pane — which the Run verdict points at — rendered nothing. Now the
   // diagnostic anchors at the failing function's declaration (`useIt`, line 4 →
   // LSP 0-based line 3), so the pane has a real location to show.
-  const src = "function makeIt(): (i32) => {f: i64[] | null} {\n" +
+  // (`{f: i64[] | null}` used to be the un-lowerable shape here; the four
+  // distinct-backing nullable scalar-list FIELD codes 31-34 graduated it, so this
+  // now uses a nullable REF-list result field — still outside the closure-result
+  // lowerable set, same loud "no interned signature" at the same anchor.)
+  const src = "function makeIt(): (i32) => {f: (i32 | null)[] | null} {\n" +
     "  return (q0) => ({ f: [1, 2] })\n" +
     "}\n" +
     "function useIt() {\n" +
-    "  const v: (i32) => {f: i64[] | null} = makeIt()\n" +
+    "  const v: (i32) => {f: (i32 | null)[] | null} = makeIt()\n" +
     "  const s = v(1)\n" +
     "  print(0)\n" +
     "}\n" +
