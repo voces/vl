@@ -388,6 +388,37 @@ let guardAltStack: i32[] = []
 // exactly one arm is live, breaking programs that lower fine today.
 let joinHoleUnions: i32[] = []
 
+// The UNCOLLAPSED deferred join a call site could not decide, parked under that
+// call's NODE index. `collapseDeferredJoin` hands the emitter-safe collapse out as
+// the call's type (a deferred join has no runtime shape, so it must never reach
+// codegen as a node type), but that collapse is LOSSY: over
+// hole members `joinTys` keeps whichever arm is assignable and drops the rest.
+//
+// A `return h(w)` in a RELAY body then advertised one arm as the relay's whole
+// inferred return, and the constraint carried by the other arm vanished a level
+// early — `ps(relay({bar: 42}))` type-checked clean and emitted invalid wasm. The
+// return-inference path reads the parked join back (`inferRetTyOf`) so the relay
+// carries the WHOLE join to its own call sites, where the pinned argument re-folds
+// it. Only the return path reads it; every other consumer still sees the collapse.
+let dJoinNode: i32[] = []
+let dJoinTy: i32[] = []
+
+// DEFERRED JOINS that ESCAPED a call site lossily — the collapse handed out ONE arm
+// while the join still named holes this site could not pin. Parallel arrays: the
+// uncollapsed join, the call node to anchor a diagnostic on, and the callee's name.
+//
+// Nothing re-examined these. Under the OUTER call that finally pins the holes the
+// join can re-fold to a genuine multi-member union: a two-armed `h(a, b, c)` used
+// as `function go(x) { print(h(x, "s", true)) }` with `go(1)` really does result in
+// `i32 | string`. The emitter has no rep for an un-annotated join return at a
+// monomorphized instance, so that spelling emitted INVALID WASM with `vl check`
+// reporting no errors. `validateEscJoins` re-folds each at the pinning call and
+// rejects loudly when the arms really do disagree — the same landing the direct
+// spelling `print(h(1, "s", true))` already gets from the print-of-a-union floor.
+let escJoinTy: i32[] = []
+let escJoinIx: i32[] = []
+let escJoinWho: string[] = []
+
 // DEFERRED binary-op constraints over un-annotated-param holes. When `a + b` / `s + "!"` / `n < 2`
 // has a HOLE operand, its validity can't be decided in the body (a hole is permissively assignable
 // to string AND numeric, so the eager check greedily picks a branch). Record `(lt, op, rt)`; the
@@ -1701,6 +1732,11 @@ export function initChecker() {
   holeAltTailN = []
   guardAltStack = []
   joinHoleUnions = []
+  dJoinNode = []
+  dJoinTy = []
+  escJoinTy = []
+  escJoinIx = []
+  escJoinWho = []
   binCstrLt = []
   binCstrOp = []
   binCstrRt = []
@@ -3523,6 +3559,43 @@ function collapseDeferredJoin(tyIx: i32) {
   tyIx
 }
 
+// Park the UNCOLLAPSED deferred join `tyIx` under call node `nodeIx` (last write
+// wins — the checker re-walks a body once per inference pass, and the pass whose
+// witnesses reach the call site is the last one).
+function noteDeferredJoinNode(nodeIx: i32, tyIx: i32) {
+  if nodeIx < 0 { return 0 }
+  let k = 0
+  while k < dJoinNode.length {
+    if dJoinNode[k] == nodeIx {
+      dJoinTy[k] = tyIx
+      return 0
+    }
+    k = k + 1
+  }
+  dJoinNode.push(nodeIx)
+  dJoinTy.push(tyIx)
+  0
+}
+
+// The type the RETURN accumulator should see for node `nodeIx`, whose checked type
+// came back as `t`: the parked UNCOLLAPSED deferred join when this node is a call
+// whose join the site could not decide, else `t` itself. This is the one consumer
+// allowed to see a deferred join outside `substTyDeep` — `elaborateInferRets`
+// already treats an inferred return that IS a deferred join as generic, exactly
+// like the bare `TyVar` return it stands in for.
+function inferRetTyOf(nodeIx: i32, t: i32) {
+  if nodeIx < 0 { return t }
+  let k = 0
+  while k < dJoinNode.length {
+    if dJoinNode[k] == nodeIx {
+      if dJoinTy[k] >= 0 { return dJoinTy[k] }
+      return t
+    }
+    k = k + 1
+  }
+  t
+}
+
 function isJoinHoleUnion(tyIx: i32) {
   let k = 0
   while k < joinHoleUnions.length {
@@ -3615,6 +3688,14 @@ function holeMemberDeadAt(mIx: i32, bNames: string[], bTys: i32[]) {
 // unresolved SURVIVES — the join stays deferred and re-folds again at the call site
 // that finally pins it. Returns `tyIx` unchanged when nothing was dropped and no
 // member changed (a concrete type keeps its arena identity).
+//
+// The re-join goes through `joinRetTys`, NOT `joinTys`: a surviving member that is
+// still a HOLE must not be collapsed away by the mutual-assignability rule (a hole
+// is permissively assignable both ways, so `joinTys` silently picks one arm). That
+// is the very drop `joinRetTys` exists to avoid in the return accumulator; the re-fold has to
+// hold the same line, or a re-fold that only RE-BASED its members (a generic body
+// calling a generic body) would hand back one arm and lose the rest. Members that
+// all resolved to concrete types fold through `joinTys` exactly as before.
 function refoldJoinUnion(
   tyIx: i32,
   orig: i32[],
@@ -3635,7 +3716,7 @@ function refoldJoinUnion(
   let j = 0
   while j < orig.length {
     if !holeMemberDeadAt(orig[j], bNames, bTys) {
-      res = joinTys(res, subst[j])
+      res = joinRetTys(res, subst[j])
       live = live + 1
     }
     j = j + 1
@@ -6557,15 +6638,82 @@ function noteArgCstr(at: i32, exp: i32, who: string) {
   0
 }
 
+// Record a DEFERRED JOIN that escaped call `ix` to callee `who` lossily (the collapse
+// kept one arm and dropped the rest because the join still named unpinned holes).
+// Idempotent per (ty, ix). Never recorded from a QUIET probe body — a probe's tables
+// are truncated but a constraint validated later, outside the probe, is not.
+function noteEscJoin(ty: i32, ix: i32, who: string) {
+  if inferQuiet { return 0 }
+  if ty < 0 || ix < 0 { return 0 }
+  let k = 0
+  while k < escJoinTy.length {
+    if escJoinTy[k] == ty && escJoinIx[k] == ix { return 0 }
+    k = k + 1
+  }
+  escJoinTy.push(ty)
+  escJoinIx.push(ix)
+  escJoinWho.push(who)
+  0
+}
+
+// Re-validate every escaped deferred join THIS call's bindings decide. A join that
+// re-folds to a single type was collapsed FAITHFULLY — the arms agree for this
+// argument, which is the overwhelmingly common case (`pick(x, y, true)` with both
+// arms i32). A join that re-folds to a genuine multi-member union was NOT: the
+// enclosing body was checked against one arm while the value really is the union,
+// and the emitter has no rep for an un-annotated join return at a monomorphized
+// instance. Reject at the INNER call — the position where the disagreement lives —
+// naming both the callee and the union its arms resolve to. Still touching a hole
+// (or still a deferred join) is undecided and defers to the site that pins it.
+function validateEscJoins(bNames: string[], bTys: i32[]) {
+  let ci = 0
+  while ci < escJoinTy.length {
+    const rj = substTyDeep(escJoinTy[ci], bNames, bTys)
+    if rj != escJoinTy[ci] && !tyIsHole(rj) && !tyIsDeferredJoin(rj) {
+      const rt = T.tys[rj]
+      if rt is TyUnion {
+        if rt.uMembers.length > 1 {
+          let who = escJoinWho[ci]
+          if who == "" { who = "a call" } else { who = "`" + who + "`" }
+          tErrUnsupported(
+            "the returns of " +
+              who +
+              " join to " +
+              tyToStr(rj) +
+              " for this argument — type-valid, but an inferred union return through an" +
+              " un-annotated parameter is not yet supported by codegen; annotate the return type",
+            escJoinIx[ci],
+          )
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
 // Re-validate every deferred call-argument constraint that THIS call resolves: substitute
 // the hole to the call's concrete argument type and check it against the recorded param
 // type. A constraint still touching an unresolved hole (not bound by this call, or a
 // nested generic) defers — `validateBinCstrs` for argument flow.
+//
+// RE-DEFERRAL. A constraint whose hole substituted to ANOTHER hole (the call passed
+// the ENCLOSING body's own hole down, so `?fld.bar.<hCallee>` re-based to
+// `?fld.bar.<hCaller>`) is not merely undecided at this site — it must be re-recorded
+// under the CALLER's hole, or nothing will re-check it when the OUTER call finally
+// pins that one. Without this the constraint dies at the first hop and the two-level
+// chain type-checks clean.
 function validateArgCstrs(bNames: string[], bTys: i32[], ix: i32) {
+  const nOrig = argCstrAt.length
   let ci = 0
-  while ci < argCstrAt.length {
+  while ci < nOrig {
     const rat = substTyDeep(argCstrAt[ci], bNames, bTys)
     const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
+    if rat != argCstrAt[ci] {
+      if tyIsHole(rat) || tyIsDeferredJoin(rat) {
+        if !tyIsHole(rexp) { noteArgCstr(rat, rexp, argCstrWho[ci]) }
+      }
+    }
     // A side still carrying a hole — bare, or as a DEFERRED JOIN arm — is undecided
     // at this site and defers to the call that pins it.
     if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
@@ -6612,11 +6760,19 @@ function argCstrsHold(bNames: string[], bTys: i32[]) {
 // the call's concrete argument types and check the operator is defined for them. A constraint still
 // touching an unresolved hole (not bound by this call, or a nested generic) defers. The general
 // capability check — numeric / string / relational all fall out of one rule.
+//
+// RE-DEFERRAL, exactly as in `validateArgCstrs`: an operand that substituted to
+// ANOTHER hole is re-recorded under that hole, so `function gb(v) { return v.bar + 1 }`
+// reached through `function go(w) { print(gb(w)) }` still rejects `go({bar: "s"})`.
 function validateBinCstrs(bNames: string[], bTys: i32[], ix: i32) {
+  const nOrigB = binCstrOp.length
   let ci = 0
-  while ci < binCstrOp.length {
+  while ci < nOrigB {
     const clt = substTyDeep(binCstrLt[ci], bNames, bTys)
     const crt = substTyDeep(binCstrRt[ci], bNames, bTys)
+    if clt != binCstrLt[ci] || crt != binCstrRt[ci] {
+      if tyIsHole(clt) || tyIsHole(crt) { noteBinCstr(clt, binCstrOp[ci], crt) }
+    }
     if !tyIsHole(clt) {
       if !tyIsHole(crt) {
         if !binOpDefinedFor(binCstrOp[ci], clt, crt) {
@@ -6692,11 +6848,55 @@ function mkGuardedRetTy(t: i32) {
   )
 }
 
+// How many DERIVED-read layers (`?fld.` / `?elem.` / `?ret.` / `?galt.`) a hole
+// name stacks over its base param hole. Every layer mints exactly one leading
+// `?`, and the base hole (`?<fn>.<i>`) one more, so the `?` count less one is the
+// depth. Used only to CAP the re-basing below.
+function holeDeriveDepth(name: string) {
+  let n = 0
+  let i = 0
+  while i < name.length {
+    if name[i] == '?' { n = n + 1 }
+    i = i + 1
+  }
+  if n < 1 { return 0 }
+  n - 1
+}
+
+// Re-basing budget. A derived hole re-based onto an OUTER hole at every call hop
+// grows its name by one layer per hop; a self-recursive generic body
+// (`function f(v) { return f(v.bar) }`) would grow it without bound as the
+// binding-group fixpoint iterates. Past this depth re-basing stops and the name
+// stays unresolved — the plain "cannot decide here" answer, so the cap can only lose
+// diagnostics, never soundness (an unresolved hole still records its demand and
+// still blocks nothing).
+const HOLE_REBASE_MAX = 8
+
+// RE-BASE a derived hole onto the hole its base resolved to. `?fld.bar.<hInner>`
+// under a binding `<hInner> := <hOuter>` IS `?fld.bar.<hOuter>` — the read is on
+// the SAME value, now named by the caller's hole. Returning the re-based name
+// (rather than -1, "unresolved") is what lets an argument constraint recorded
+// inside a generic body SURVIVE the hop out to the caller and be re-validated
+// when the OUTER call finally pins `<hOuter>` to a concrete argument. -1 when
+// the inner resolution is not a hole, or the depth cap is hit.
+function rebaseDerivedHole(prefix: string, innerTy: i32) {
+  if innerTy < 0 { return -1 }
+  const it = T.tys[innerTy]
+  if it is TyVar {
+    if holeDeriveDepth(it.tvName) >= HOLE_REBASE_MAX { return -1 }
+    return mkTyVar(prefix + it.tvName)
+  }
+  -1
+}
+
 // Resolve a (possibly DERIVED) hole NAME against a call's bindings: a direct
 // binding wins; `?ret.<h>` collapses to the pinned function's return (the
 // host's instantiate-and-collapse — keeps `inferred-return-soundness`
 // rejecting); `?fld.<prop>.<h>` to the pinned object's field (the structural
-// A13 read `self.x` concretized per call site). -1 = unresolved.
+// A13 read `self.x` concretized per call site). A base that resolves to ANOTHER
+// HOLE re-bases onto it (`rebaseDerivedHole`) instead of going unresolved — the
+// TWO-LEVEL chain `go` → `gb(w)` → `w.bar`, where dropping the link let an i32
+// reach a `string` param with no diagnostic. -1 = unresolved.
 function substHoleByName(name: string, bNames: string[], bTys: i32[]) {
   const b = bindOf(bNames, bTys, name)
   if b >= 0 { return b }
@@ -6721,7 +6921,9 @@ function substHoleByName(name: string, bNames: string[], bTys: i32[]) {
         bTys,
       )
       if gPin < 0 { return -1 }
-      if tyIsHole(gPin) { return -1 }
+      if tyIsHole(gPin) {
+        return rebaseDerivedHole("?galt." + restG.slice(0, g2 + 1), gPin)
+      }
       if holeAssignOk(-1, gPin, gAlt) { return gInner }
       return -1
     }
@@ -6730,6 +6932,7 @@ function substHoleByName(name: string, bNames: string[], bTys: i32[]) {
       if inner >= 0 {
         const it = T.tys[inner]
         if it is TyFunc { return it.fnRet }
+        return rebaseDerivedHole("?ret.", inner)
       }
       return -1
     }
@@ -6744,6 +6947,7 @@ function substHoleByName(name: string, bNames: string[], bTys: i32[]) {
         if itE is TyPrim {
           if itE.primName == "string" { return TY_I32 }
         }
+        return rebaseDerivedHole("?elem.", innerE)
       }
       return -1
     }
@@ -6773,6 +6977,7 @@ function substHoleByName(name: string, bNames: string[], bTys: i32[]) {
             const f = objFieldType(it2, rest.slice(0, dot))
             if f >= 0 { return f }
           }
+          return rebaseDerivedHole("?fld." + rest.slice(0, dot + 1), inner2)
         }
       }
       return -1
@@ -7893,11 +8098,21 @@ function checkCallNode(n: Call, ix: i32) {
       // because its hole arm accepts anything. It must record the demand too, or the
       // whole spelling type-checks clean and dies at wasm validation. This is the
       // net for the arms this PR stopped collapsing.
-      if tyIsHole(at) || tyIsDeferredJoin(at) {
+      //
+      // The demand is recorded on the argument's UNCOLLAPSED type: when the argument
+      // is a call whose deferred join this site could not decide, the collapse handed
+      // out ONE arm (`collapseDeferredJoin` — the emitter needs a real type), and a
+      // constraint keyed on that arm dies when the outer pin proves that arm
+      // UNREACHABLE. `ps(mid(w))` with `mid` relaying an `is`-guard join is exactly
+      // that: the guard arm was the one kept, `go({bar: 42})` cannot reach it, and the
+      // constraint evaporated instead of reporting the `bar` arm's i32. The parked
+      // join re-folds to the arm the pinned argument really takes.
+      const atCstr = inferRetTyOf(args[i], at)
+      if tyIsHole(atCstr) || tyIsDeferredJoin(atCstr) {
         if !tyIsHole(expected) {
           let ccWho = ""
           if cfn is Ident { ccWho = cfn.identName }
-          noteArgCstr(at, expected, ccWho)
+          noteArgCstr(atCstr, expected, ccWho)
         }
       }
       // A hole param whose body DEMANDED fields (member access on the hole)
@@ -7953,15 +8168,31 @@ function checkCallNode(n: Call, ix: i32) {
     // collapses to the pinned callee's return (see `substTyDeep`, which keeps
     // `functions/inferred-return-soundness.vl` rejecting).
     if bNames.length > 0 {
+      const dBeforeC = T.diags.length
       validateBinCstrs(bNames, bTys, ix)
       validateArgCstrs(bNames, bTys, ix)
+      // The escaped-join reject is the FALLBACK, not an additional voice: when this
+      // same site already reported a precise operand/argument-flow diagnostic, that
+      // one names the actual mismatch and the join report would only repeat it in
+      // vaguer words (`hole-join-generic-arg-reject.vl` gets both otherwise).
+      if T.diags.length == dBeforeC { validateEscJoins(bNames, bTys) }
       retTy = substTyDeep(retTy, bNames, bTys)
     }
     // A DEFERRED JOIN the re-fold could not decide here (the callee's arms name a
     // hole THIS site does not bind — a generic body calling a generic body) must not
     // ESCAPE as this call's type: the emitter reads node types and has no rep for a
-    // placeholder union. Collapse it back to the pre-change behavior.
-    return collapseDeferredJoin(retTy)
+    // placeholder union. Collapse it back to the pre-change behavior — but PARK the
+    // uncollapsed join first, so a `return h(w)` relay body can carry the whole join
+    // to its own call sites (`inferRetTyOf`) instead of the one arm the collapse
+    // happens to keep.
+    const cRetTy = collapseDeferredJoin(retTy)
+    if cRetTy != retTy {
+      noteDeferredJoinNode(ix, retTy)
+      let ejWho = ""
+      if cfn is Ident { ejWho = cfn.identName }
+      noteEscJoin(retTy, ix, ejWho)
+    }
+    return cRetTy
   }
   if ft is TyErr { return TY_ERR }
   if ft is TyVar {
@@ -8605,7 +8836,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           // A value-producing trailing expression is a value return POSITION (vs a
           // bare trailing statement); the redundant-return fixpoint defers only these.
           if !isStmtNode(stmts[s]) { fnSawValueRet = true }
-          noteInferredRet(stTy)
+          noteInferredRet(inferRetTyOf(stmts[s], stTy))
         } else {
           // Redundant-return rule: witness the trailing expression's NATURAL type
           // (before constrainEmpty pins a hole); an annotation-influenced trailing
@@ -15355,7 +15586,10 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
   if want == -2 {
     // `return <expr>` is always a value return position.
     fnSawValueRet = true
-    noteInferredRet(checkNode(n.retArg))
+    // A returned CALL whose deferred join this site could not decide contributes the
+    // WHOLE join, not the lossy collapse the emitter gets (`inferRetTyOf`).
+    const rArgTy = checkNode(n.retArg)
+    noteInferredRet(inferRetTyOf(n.retArg, rArgTy))
     return TY_VOID
   }
   // Bidirectional: `function mk(): (i32) => i32 { return (x) => … }` infers the returned

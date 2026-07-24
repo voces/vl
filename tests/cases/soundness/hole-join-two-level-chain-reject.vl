@@ -1,0 +1,69 @@
+// @check
+// @error-at 36:21 argument 1: expected string, got i32
+// @error-at 42:19 argument of type i32 flows into `ps` expecting string
+// @error-at 47:43 the returns of `h2` join to i32 | string for this argument
+// @error-at 58:42 the returns of `pick` join to i32 | string for this argument
+// @error-at 67:37 the returns of `midJoin` join to i32 | string for this argument
+// SOUNDNESS — the two-level chain carrying a JOINED return. Every spelling below
+// reported "no errors" and emitted INVALID WASM.
+//
+// #1076 taught the checker to DEFER a join whose arms include a hole, and to
+// COLLAPSE it back at the call site so the emitter never sees a placeholder
+// union. The collapse is lossy — over hole arms `joinTys` keeps whichever one is
+// assignable — and nothing carried the discarded arms one hop further:
+//
+//   * a RELAY that returns the join advertised the surviving arm as its whole
+//     inferred return, so `ps(relay({bar: 42}))` checked `string` against
+//     `string`;
+//   * an argument constraint recorded on the surviving arm evaporated when the
+//     outer pin proved that very arm UNREACHABLE (the guard arm, for an argument
+//     with no `foo`);
+//   * a join that really does resolve to a genuine union at the outer pin
+//     (`i32 | string`) has no rep at a monomorphized instance at all.
+//
+// The uncollapsed join is now parked per call node: the RETURN accumulator and
+// the deferred argument constraint both read it back, and an escaped join that
+// re-folds to a real multi-member union is a loud reject at the inner call — the
+// same landing the direct spelling `print(h(1, "s", true))` already gets.
+// `inference/hole-join-two-level-chain.vl` is the must-not-error twin.
+function ps(t: string) { print(t) }
+function h(v) {
+  if v is { foo: string } then return v.foo
+  return v.bar
+}
+
+// A guard join RELAYED, then sunk into an annotated param.
+function relay(w) { return h(w) }
+ps(relay({ bar: 42 }))
+
+// The same join relayed and sunk from INSIDE another generic body — the arm the
+// collapse kept is the one `{bar: 42}` can never reach.
+function mid(u) { return h(u) }
+function goRelay(w) { ps(mid(w)) }
+goRelay({ bar: 42 })
+
+// A non-guard join whose arms genuinely disagree at the outer pin, reaching
+// `print` — no annotated sink to constrain against, so the join itself is the
+// diagnostic.
+function goPrint(x) { print(h2(x, "s", true)) }
+function h2(a, b, c) {
+  if c then return a
+  return b
+}
+goPrint(1)
+
+// The same, reaching a UNION-annotated sink: type-valid, still no rep.
+function pu(t: string | i32) {
+  if t is i32 { print(t) } else { print(t) }
+}
+function goUnion(x) { pu(pick(x, "s", true)) }
+function pick(a, b, c) {
+  if c then return a
+  return b
+}
+goUnion(1)
+
+// Two hops with the join formed at the innermost one.
+function midJoin(x) { return h2(x, "s", true) }
+function goJoin3(x) { print(midJoin(x)) }
+goJoin3(1)
