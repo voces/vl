@@ -135,6 +135,37 @@ This is the second time this program's plan has been corrected by measurement (s
 pattern is the same both times: an arena artifact that looks like a drop-in for a name key
 is answering a subtly different question.
 
+**SHIPPED — `repElemKey(ty)`, the rep key.** Built as the correction prescribed: a structural
+type→rep fold in `emit_rep`, and `rlInternName` / `rlSlotByName` re-keyed on it (the deleted
+`rlCanonElemName` string-surgery *key*). The fold, arm by arm:
+
+- an i32-backed leaf array (`i32[]` / `boolean[]` / litunion `K[]` / `(boolean|null)[]` /
+  `(K|null)[]` — `tyIsI32LeafElem`) → one `$rlI32L` token; a string-backed leaf array
+  (`string[]` / `(string|null)[]`) → one `$rlStrL` token (the shared `lTypeIdx` / `$mkListIdx`
+  wrappers);
+- a MIXED union softens its litunion atoms to `string` (`repCanonKeyGo`'s arm, same niche
+  guard) — `K0|i64 ≡ string|i64`;
+- **a DECLARED struct keys on its nominal slot** (`repSlotOfTyDecl`), so declared twins
+  `type A={v:i32}` / `type B={v:i32}` stay in distinct ref-list slots
+  (`structural-twin-reflist-dedup.vl`); an **inline** shape is expanded structurally — its
+  arena index is minted fresh per spelling, so an index key would disagree between the intern
+  and the lookup (fuzz `(K0 | {w:i32})[] | string` proved it). This nominal/structural split
+  is the piece the "just use `repCanonKey`" plan missed on the *struct* end, exactly as the
+  array folds are the piece it missed on the *list* end.
+
+Method (the D1/D2 discipline): an **additive probe** first — `rlSlotByName` computed both the
+text answer and the `repElemKey` answer on every lookup and reported disagreements; **zero**
+over the corpus + **50,400** fuzz programs (seeds 1–14 × depths 4–6 × {plain, `--declared`} ×
+300) was the precondition for the replacement. Corpus stays **byte-identical**; the four
+reverted-D2 tests pass.
+
+One residual, scoped honestly: the string surgery survives as `rlElemStoredName` for the
+element's stored *name* (not its key). Downstream name-consumers that have not yet been
+destringified — the `is`-narrowing emit's litunion classifier, `mapValNameOf`,
+`structIdxOfElemName` — still read `rlElemName` and need the emit-canonical spelling (a raw
+`K0|{w:i32}` makes the `is`-emit pick the union-variant path and fail). The *key* is
+destringified; retiring the *name* column is D5's job, once those consumers move to the arena.
+
 ### D3 — the `$fnsig` layer (highest risk, highest value)
 
 `cloSigKeyExt` / `annSigKey` / `cloSigKeys`. Three producers must agree on the key text; the
