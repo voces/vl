@@ -5118,6 +5118,33 @@ function tyToStrGo(ix: i32) {
   "<?>"
 }
 
+// ── structural "renders as this PRIMITIVE" ───────────────────────────────────
+// The primitive name arena type `ix` RENDERS as (`tyToStr`), or "" when it renders
+// as anything else. `tyEq`'s discipline applied to the one-primitive case: the
+// answer is read off the arena, never off a built string. Differs from `primNameOf`
+// only in unwrapping a SINGLE-member union — `tyToStr`'s union arm joins members
+// with " | ", so a one-member union prints as its member bare (`mkUnionTy` does not
+// collapse, so such an entry is constructible) and the render-comparing sites this
+// replaces did accept it. The returned name is `TyPrim.primName`, the primitive's
+// own IDENTITY — the same thing `tyEq` compares — not a rendering of a structure.
+function tyPrimNameOf(ix: i32): string {
+  if ix < 0 { return "" }
+  const t = T.tys[ix]
+  if t is TyPrim { return t.primName }
+  if t is TyUnion {
+    if t.uMembers.length == 1 { return tyPrimNameOf(t.uMembers[0]) }
+  }
+  ""
+}
+
+// Whether arena type `ix` IS the primitive `nm` — the decision form of
+// `tyPrimNameOf`, replacing `tyToStr(ix) == "i32"` at the sites that were asking a
+// STRUCTURAL question ("is the inner the string primitive?") by rendering.
+function tyIsPrimNamed(ix: i32, nm: string): boolean {
+  if nm == "" { return false }
+  tyPrimNameOf(ix) == nm
+}
+
 // ── structural type equality ─────────────────────────────────────────────────
 // Whether two arena types RENDER identically (`tyToStr(a) == tyToStr(b)`),
 // decided structurally without building the strings. Powers the "redundant
@@ -5330,10 +5357,134 @@ function litBaseName(part: string) {
   "i64"
 }
 
+// Whether `ix` HAS an emitter-classifiable synthetic name — i.e. `tyToEmitName(ix)
+// != ""`, decided STRUCTURALLY without building the name. The callers that ask this
+// are asking a genuine CAPABILITY question ("can the emitter name this type?");
+// phrasing it as "render it and test the result for the empty string" minted a name
+// (and every nested name under it) purely to throw it away, and coupled the
+// predicate to the renderer's spelling rules. Same arms in the same order as
+// `tyToEmitName`: a `TyVar` / residual `TyNeg` / `TyErr` / the `never` prim has no
+// name, and a composite has one exactly when every component does.
+//
+// `tyToEmitName`'s litunion-ALIAS legs (`litUnionAliasNameOfTy` on a union member,
+// nullable inner, struct field, array element, map value, fn result) are NOT
+// mirrored here because they cannot change the ANSWER, only the spelling: an alias
+// name is only ever substituted for a type `tyIsLitUnion` accepts — a union of
+// string literals — and every one of those already names itself (`string`). Same
+// for the flattened-alias REGROUP, which only ever substitutes for `TyLit` members.
+// `tyToEmitName` has no cycle guard, so neither does this; a type that would
+// recurse forever here recursed forever there.
+function tyIsEmitRepresentable(ix: i32): boolean {
+  if ix < 0 { return false }
+  const t = T.tys[ix]
+  if t is TyPrim { return t.primName != "never" }
+  if t is TyLit { return true }
+  if t is TyUnion {
+    const members = t.uMembers
+    // An EMPTY union produces no parts, and `tyToEmitName` returns "" for it.
+    if members.length == 0 { return false }
+    let i = 0
+    while i < members.length {
+      if !tyIsEmitRepresentable(members[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  if t is TyNullable { return tyIsEmitRepresentable(t.nInner) }
+  if t is TyObj {
+    // A field-less shape renders `{}` — non-empty, so representable.
+    const ftys = t.objFieldTypes
+    let i = 0
+    while i < ftys.length {
+      if !tyIsEmitRepresentable(ftys[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  if t is TyArray { return tyIsEmitRepresentable(t.aElem) }
+  if t is TyMap {
+    if !tyIsEmitRepresentable(t.mKey) { return false }
+    return tyIsEmitRepresentable(t.mVal)
+  }
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let i = 0
+    while i < ps.length {
+      if !tyIsEmitRepresentable(ps[i]) { return false }
+      i = i + 1
+    }
+    return tyIsEmitRepresentable(t.fnRet)
+  }
+  false
+}
+
+// Whether `ix`'s emitter-classifiable name is EXACTLY `string` — `tyToEmitName(ix)
+// == "string"`, decided structurally. Only three of `tyToEmitName`'s arms can spell
+// a bare `string`: the `string` prim, a string LITERAL (softened to `string`), and a
+// union whose parts all render `string` (the render DEDUPS, so they collapse to one
+// part). Every other arm renders a composite (`{…}`, `…[]`, `(…)=>…`, `…|null`,
+// `{[…]:…}`) or a declared ALIAS name, none of which is the bare primitive.
+function tyEmitNameIsString(ix: i32): boolean {
+  if ix < 0 { return false }
+  const t = T.tys[ix]
+  if t is TyPrim { return t.primName == "string" }
+  if t is TyLit { return t.litKind == "str" }
+  if t is TyUnion {
+    const members = t.uMembers
+    if members.length == 0 { return false }
+    // The flattened-alias REGROUP (`tyToEmitName`'s union arm) replaces the literal
+    // run with a declared litunion NAME, so a fired regroup spells `string` only if
+    // that alias is itself named `string`. Mirrored rather than assumed away.
+    const rgTexts: string[] = []
+    let rgNonLit = false
+    let rg = 0
+    while rg < members.length {
+      const rm = T.tys[members[rg]]
+      if rm is TyLit {
+        if rm.litKind == "str" { rgTexts.push(rm.litText) }
+      } else {
+        let rmNull = false
+        if rm is TyPrim {
+          if rm.primName == "null" { rmNull = true }
+        }
+        if !rmNull { rgNonLit = true }
+      }
+      rg = rg + 1
+    }
+    let rgAlias = ""
+    if rgNonLit && rgTexts.length >= 2 {
+      rgAlias = litUnionAliasOfLitTexts(rgTexts)
+    }
+    if rgAlias != "" && rgAlias != "string" { return false }
+    let i = 0
+    while i < members.length {
+      const rgm = T.tys[members[i]]
+      let skip = false
+      if rgAlias != "" && rgm is TyLit { skip = true }
+      if !skip {
+        // A closure member renders PARENTHESIZED (`(()=>i32)`) — never bare.
+        if rgm is TyFunc { return false }
+        // A member that IS a registered litunion alias contributes its NAME.
+        const al = litUnionAliasNameOfTy(members[i])
+        if al != "" {
+          if al != "string" { return false }
+        } else if !tyEmitNameIsString(members[i]) {
+          return false
+        }
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
 // Render a RESOLVED arena type as an emitter-classifiable synthetic name, or
 // "" when it has none (a TyVar, a residual negation, err/never). Only the
 // `&`-fold arm of `canonEmitName` consults this — every other arm rewrites the
 // name STRUCTURALLY without resolving it, so a NAMED struct keeps its name.
+// The "does it have one at all?" question has a structural answer
+// (`tyIsEmitRepresentable`) — ask that rather than testing this for "".
 function tyToEmitName(ix: i32) {
   if ix < 0 { return "" }
   const t = T.tys[ix]
@@ -6337,14 +6488,16 @@ function holeShapeFieldCount(name: string) {
 }
 
 // The `holeAlt*` row hole `name` already carries for tested type `ty`, or -1.
-// Keyed by the RENDERED type for the same reason `noteHoleAlt` is: every pass over
-// the body re-resolves the `is` annotation to a FRESH arena entry.
+// Matched STRUCTURALLY (`tyEq`) rather than by arena index for the same reason
+// `noteHoleAlt` is: every pass over the body re-resolves the `is` annotation to a
+// FRESH arena entry, so the index differs while the type does not. `tyEq` decides
+// exactly the render-equality this used to spell as `tyToStr(a) == tyToStr(b)`,
+// without building either string.
 function holeAltRowOf(name: string, ty: i32) {
   if ty < 0 { return -1 }
-  const key = tyToStr(ty)
   let i = 0
   while i < holeAltNames.length {
-    if holeAltNames[i] == name && tyToStr(holeAltTys[i]) == key { return i }
+    if holeAltNames[i] == name && tyEq(holeAltTys[i], ty) { return i }
     i = i + 1
   }
   -1
@@ -6363,12 +6516,11 @@ function noteHoleAlt(name: string, ty: i32) {
   // guard. A re-check therefore keeps the existing row verbatim (returning -1, so the
   // guard does not re-patch its tail either) rather than appending a duplicate the
   // diagnostic would render twice or refreshing it from an already-grown shape.
-  // Keyed by the RENDERED type, not the arena index: each pass re-resolves the `is`
-  // annotation to a FRESH arena entry.
-  const key = tyToStr(ty)
+  // Matched STRUCTURALLY (`tyEq`), not by arena index: each pass re-resolves the
+  // `is` annotation to a FRESH arena entry. `holeAltRowOf` is the same test.
   let i = 0
   while i < holeAltNames.length {
-    if holeAltNames[i] == name && tyToStr(holeAltTys[i]) == key { return -1 }
+    if holeAltNames[i] == name && tyEq(holeAltTys[i], ty) { return -1 }
     i = i + 1
   }
   const pre = holeShapeFieldCount(name)
@@ -9037,13 +9189,15 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         if inferred != expRet {
           const etU = T.tys[expRet]
           if etU is TyNullable {
-            const etInner = tyToStr(etU.nInner)
             // The BOOLEAN-niche dual of the string niche: a lambda whose body infers a bare
             // `boolean` / `null` member of an expected `boolean | null` (`() => boolean | null =
             // () => null`) adopts the niche — its functype result is the i32 sentinel (2 = null),
             // exactly as the annotated `: boolean | null` return and the named-function VALUE lower.
             // Recorded by `nullableRetName` + pinned by `synthRetAnnots` (`nullablePartOf` non-empty).
-            if etInner == "string" || etInner == "boolean" {
+            if (
+              tyIsPrimNamed(etU.nInner, "string") ||
+              tyIsPrimNamed(etU.nInner, "boolean")
+            ) {
               const nsTail = lambdaBodyTail(n.fnBody)
               if nsTail >= 0 && assignableExpr(nsTail, inferred, expRet) {
                 inferred = expRet
@@ -9488,8 +9642,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // (sentinel `2` / `ref.null $array`) from it — so they do NOT floor. Only a
         // nullable the emitter still can't box/niche un-annotated (a nullable STRUCT ref)
         // hits the floor.
-        const innerNm = tyToStr(itt.nInner)
-        if innerNm != "boolean" && innerNm != "string" {
+        if (
+          !tyIsPrimNamed(itt.nInner, "boolean") &&
+          !tyIsPrimNamed(itt.nInner, "string")
+        ) {
           tErrUnsupported(
             "'" +
               n.fnName +
@@ -10526,7 +10682,7 @@ function structFieldBoxRetName(er: i32) {
             // `>s0;` while the value call keyed `>s1;`: a loud "no interned signature"
             // (fuzz post-#990 sweep plain leg, seed 40814368 case_00383). Require the
             // canonical render to succeed (the vbUnionMemberName map-admission twin).
-            if tyToEmitName(ft.uMembers[m]) == "" { return "" }
+            if !tyIsEmitRepresentable(ft.uMembers[m]) { return "" }
           } else if !tyIsLitUnion(ft.uMembers[m]) {
             return ""
           }
@@ -10881,9 +11037,9 @@ function nullableRetName(er: i32, stmts: i32[]) {
       // `annRetKind`. The distinct-backing leaves (`i64[] | null`, …) are NOT rendered
       // (outside the value-call ABI — they stay loud rejects).
       return tyToEmitName(t.nInner) + "|null"
-    } else if tyToStr(t.nInner) == "string" {
+    } else if tyIsPrimNamed(t.nInner, "string") {
       return "string|null"
-    } else if tyToStr(t.nInner) == "boolean" {
+    } else if tyIsPrimNamed(t.nInner, "boolean") {
       // The boolean niche (`boolean | null`): the i32 sentinel rep (2 = null). Pinned by
       // `synthRetAnnots` (`nullablePartOf` non-empty) so `emitReturnValue`'s `tyIsNulBool`
       // arm niches a `return null` / `return <bool>`, matching the annotated form.
@@ -10923,7 +11079,10 @@ function nulElemListRetName(er: i32) {
   if t is TyArray {
     const et = T.tys[t.aElem]
     if et is TyNullable {
-      const inner = tyToStr(et.nInner)
+      // The inner's PRIMITIVE name, read off the arena (`tyPrimNameOf`) rather than
+      // recovered from a `tyToStr` render — here the name is the emitted PAYLOAD, so
+      // it is still spelled into the result, but the DECISION is structural.
+      const inner = tyPrimNameOf(et.nInner)
       if inner == "f64" || inner == "i32" || inner == "i64" || inner == "f32" {
         return "(" + inner + "|null)[]"
       }
@@ -11190,7 +11349,7 @@ function structElemFieldsPlain(objTy: i32, depth: i32): boolean {
     // twinned). Gated on a non-empty `tyToEmitName` (an un-nameable map value stays a loud
     // reject on the annotated path itself, so the pin adds no invalid wasm).
     if ft is TyMap {
-      if tyToEmitName(fty) != "" { ok = true }
+      if tyIsEmitRepresentable(fty) { ok = true }
     }
     // A CLOSURE field (`z: () => f64` inside `{a: string, f: {[string]: f64}, z: …}`): the
     // annotated named-fn spelling lowers a closure field (the code-14 fat-pointer slot,
@@ -11203,7 +11362,7 @@ function structElemFieldsPlain(objTy: i32, depth: i32): boolean {
     // `tyToEmitName` (an un-lowerable closure stays a loud reject on the annotated path
     // itself, so the pin adds no invalid wasm — the map-field discipline above).
     if ft is TyFunc {
-      if tyToEmitName(fty) != "" { ok = true }
+      if tyIsEmitRepresentable(fty) { ok = true }
     }
     if ft is TyArray {
       // A PLAIN-STRUCT-ELEMENT LIST field (`f: {a: string, f: i32, z: f64}[]` inside
@@ -11246,7 +11405,7 @@ function structElemFieldsPlain(objTy: i32, depth: i32): boolean {
           // (the tFpE3l p0c sibling of the map field above). An un-nameable map-value element
           // stays a loud reject on the annotated path itself.
           if !ok && aet is TyMap {
-            if tyToEmitName(ft.aElem) != "" { ok = true }
+            if tyIsEmitRepresentable(ft.aElem) { ok = true }
           }
         }
       }
@@ -12049,10 +12208,9 @@ export function checkProgram(rootIx: i32) {
                 // valtype pick it up. A non-niche nullable (struct ref) stays floored.
                 const ert = T.tys[er]
                 if ert is TyNullable {
-                  const innerNm = tyToStr(ert.nInner)
-                  if innerNm == "boolean" {
+                  if tyIsPrimNamed(ert.nInner, "boolean") {
                     recordInferRet(efn.fnName, "boolean|null", er)
-                  } else if innerNm == "string" {
+                  } else if tyIsPrimNamed(ert.nInner, "string") {
                     recordInferRet(efn.fnName, "string|null", er)
                   }
                 }
@@ -13380,17 +13538,19 @@ export function nodeTyIsNullable(ix: i32) {
 // True if node `ix` has a recorded `string | null` type — the niche-string (kind 16) dual of
 // `nodeTyIsNullableStruct`. Gates `exprNullableString`'s fallback so a `string | null`-returning
 // closure value call whose callee it misses (an indexed closure-array element) classifies kind-16.
-// A nullable LITUNION (`K0 | null`) is EXCLUDED first: `tyToEmitName` renders each string-literal
-// member as `string` (then dedups), so the render alone can't tell `K0 | null` from `string | null`
-// — but the litunion niche reps as an i32 (atom id / `-1` sentinel), not a string ref, and claiming
-// it kind-16 stored the callee's i32 result into a `(ref null $array)` local (INVALID-WASM).
+// A nullable LITUNION (`K0 | null`) is EXCLUDED first: the emit name of each string-literal
+// member is `string` (and they dedup), so the emit NAME alone can't tell `K0 | null` from
+// `string | null` — but the litunion niche reps as an i32 (atom id / `-1` sentinel), not a
+// string ref, and claiming it kind-16 stored the callee's i32 result into a
+// `(ref null $array)` local (INVALID-WASM). Decided by `tyEmitNameIsString` — the same
+// question `tyToEmitName(t.nInner) == "string"` asked, answered off the arena.
 export function nodeTyIsNullableString(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
     if tyIsLitUnion(t.nInner) { return false }
-    return tyToEmitName(t.nInner) == "string"
+    return tyEmitNameIsString(t.nInner)
   }
   false
 }
