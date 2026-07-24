@@ -4242,6 +4242,40 @@ function rootUnionDeclMembers(stmts: i32[], udName: string) {
   collectTyMembersReach(stmts, udTyIx, 16, false)
 }
 
+// SAME-SHAPE UNION FALLBACK — the one annotation-site registration the arena register
+// walk (`collectTyReachRegister`) provably cannot reproduce. An inline union annotation
+// whose non-null members share a SHAPE (`A | B` where `type A`/`type B` have identical
+// fields) is DESTROYED at annotation resolution: `resolveAnnot` dedups the members
+// (`sameVariantTy`), so `members.length == 1` collapses the whole union to a SINGLE
+// struct member (a plain `TyObj`, no `TyUnion` node) — a `B` value structurally IS an
+// `A`. The arena walk therefore has no union to reach: `nodeTyIxOf(node)` is that
+// collapsed struct, whose `TyObj` field recursion registers nothing. Yet the emitter
+// still classifies the param/field/return by its SOURCE spelling `A | B` (`isUName` in
+// `emitProgram`'s param arm / the struct-field / return classifiers), and that composite
+// spelling lives ONLY in the annotation name — registering the two declared struct names
+// `A`, `B` individually does NOT satisfy `isUName("A | B")`. So drive this one case from
+// the annotation node's name: when the RESOLVED type is a plain struct but the SPELLING
+// is a union (two-plus top-level atoms), register the spelling. Every genuine
+// (non-collapsing) union stays a `TyUnion`/`TyNullable` in the arena and is fully covered
+// by `collectTyReachRegister` — so this fallback fires ONLY on the same-shape collapse,
+// which the disable-then-diff probe pinned to exactly two corpus shapes (`A | B` and
+// `Cat | Dog` same-shape params). Returns 0, or -1 (a `registerInlineUnion` `emitFail`).
+function registerCollapsedUnionName(stmts: i32[], node: i32) {
+  const tyIx = nodeTyIxOf(node)
+  if tyIx < 0 { return 0 }
+  const t = T.tys[tyIx]
+  // A genuine union / nullable / litunion is reached by the arena walk directly; only a
+  // spelling that RESOLVED to a plain struct (the same-shape collapse) needs the name.
+  if t is TyObj {
+    const nm = tyNameOf(node)
+    const atoms: string[] = []
+    splitUnionAtoms(nm, atoms)
+    // Two-plus top-level atoms ⇒ the source spelled a union that collapsed to this struct.
+    if atoms.length >= 2 { return registerInlineUnion(stmts, nm) }
+  }
+  0
+}
+
 // Scan every top-level FuncDecl's parameter + return annotations and every top-level
 // `let`/`const` annotation for INLINE union types, registering each as a synthetic
 // union alias (so it interns its variant shapes + heap types exactly like a named
@@ -4281,7 +4315,9 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       if collectTyReachRegister(stmts, nodeTyIxOf(retTy), 16, false) < 0 {
         return -1
       }
-      if registerInlineUnion(stmts, tyNameOf(retTy)) < 0 { return -1 }
+      // Same-shape collapse fallback (the ONE case the arena walk can't reach — the
+      // union spelling resolved to a single struct; see `registerCollapsedUnionName`).
+      if registerCollapsedUnionName(stmts, retTy) < 0 { return -1 }
       cloSigWalkRoots.push(nodeTyIxOf(retTy))
       let pi = 0
       while pi < params.length {
@@ -4292,7 +4328,8 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
           if collectTyReachRegister(stmts, nodeTyIxOf(pt), 16, false) < 0 {
             return -1
           }
-          if registerInlineUnion(stmts, tyNameOf(pt)) < 0 { return -1 }
+          // Same-shape collapse fallback (see the return-type site).
+          if registerCollapsedUnionName(stmts, pt) < 0 { return -1 }
           cloSigWalkRoots.push(nodeTyIxOf(pt))
         }
         pi = pi + 1
@@ -4304,7 +4341,8 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       if collectTyReachRegister(stmts, nodeTyIxOf(letTy), 16, false) < 0 {
         return -1
       }
-      if registerInlineUnion(stmts, tyNameOf(letTy)) < 0 { return -1 }
+      // Same-shape collapse fallback (see the return-type site).
+      if registerCollapsedUnionName(stmts, letTy) < 0 { return -1 }
       cloSigWalkRoots.push(nodeTyIxOf(letTy))
       // Usage-driven `let x = null` hole (A-infer-null): infer + register `T|null`.
       nliInferLet(walk, i)
@@ -4329,7 +4367,8 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
             if collectTyReachRegister(stmts, nodeTyIxOf(fdt), 16, false) < 0 {
               return -1
             }
-            if registerInlineUnion(stmts, tyNameOf(fdt)) < 0 { return -1 }
+            // Same-shape collapse fallback (see the return-type site).
+            if registerCollapsedUnionName(stmts, fdt) < 0 { return -1 }
             cloSigWalkRoots.push(nodeTyIxOf(fdt))
           }
         }
