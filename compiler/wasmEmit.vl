@@ -468,11 +468,13 @@ import {
   mfResultKindOf,
   mfResultSlotOf,
   mfSrcLocalFor,
+  monoIsRowMatch,
   mvListValKind,
   mvSlotNullable,
   mvSlotOfMapValNameOrMono,
   mvSlotOfValNameFind,
   nameIsRefArray,
+  nameIsWholeSpanShape,
   narrowVariantFor,
   narrowedMapOf,
   narrowedRefArrayOf,
@@ -1641,6 +1643,34 @@ function emitStructExprAsVariantBox(
 // Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag),
 // then `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
+// The COMPILE-TIME value of a monomorphized-instance `is` guard: 1 (always true), 0
+// (always false), or -1 (not statically decidable — the runtime paths in `emitIs`
+// handle it). Each mono instance pins an un-annotated param to ONE concrete type, so
+// `v is T` is decided per instance (host parity: instances never cross-contaminate).
+// Split out of `emitIs` so the STATEMENT emitter can also drop the provably-dead arm:
+// in the `v is {foo: string}` instance where `v` is bound to `i32`, the then-branch's
+// `v.foo` has no struct receiver and fails to emit ("field access but no struct type
+// declared") even though it can never run.
+function monoStaticIsResult(isIx: i32, fnIx: i32) {
+  const nd = P.nodes[isIx]
+  if nd is IsExpr {
+    if variantIndexOf(nd.isVariant) >= 0 { return -1 }
+    if exprUnion(nd.isObj, fnIx) { return -1 }
+    const sk = monoArgTyName(nd.isObj, fnIx)
+    if sk == "" { return -1 }
+    if sk == nd.isVariant { return 1 }
+    // The names differ — but an ANONYMOUS SHAPE argument binds `sk` to its interned
+    // ROW name (`#anon0`) while the test carries the source spelling, so the string
+    // compare alone reports a false NO. Resolve both to a struct row and compare
+    // structurally; -1 there means neither side names a row, so the string answer
+    // (NO) stands.
+    const rm = monoIsRowMatch(sk, nd.isVariant)
+    if rm >= 0 { return rm }
+    return 0
+  }
+  -1
+}
+
 function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   // `p is null` over a NULLABLE struct ref — `ref.is_null` (no union needed).
   const nd0 = P.nodes[isIx]
@@ -1821,14 +1851,10 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   // cross-contaminate). Union-typed operands took the tag-compare paths above;
   // a declared VARIANT name keeps the loud union-only failure below.
   if nd0 is IsExpr {
-    if variantIndexOf(nd0.isVariant) < 0 {
-      if !exprUnion(nd0.isObj, fnIx) {
-        const sk = monoArgTyName(nd0.isObj, fnIx)
-        if sk != "" {
-          if sk == nd0.isVariant { fbI32Const(1) } else { fbI32Const(0) }
-          return 0
-        }
-      }
+    const st = monoStaticIsResult(isIx, fnIx)
+    if st >= 0 {
+      fbI32Const(st)
+      return 0
     }
   }
   // `f is (A) => B` over a NULLABLE-closure operand (`f: ((i32) => i32) | null`) is a NON-NULL
@@ -10331,11 +10357,44 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
   return emitFail("emitProgram: bare call statement is not supported")
 }
 
+// The compile-time value of an `if` CONDITION that is a monomorphized-instance guard
+// testing an INLINE STRUCT SHAPE (1 / 0), or -1 for anything else. Dropping an arm is
+// a control-flow change, so this is deliberately narrower than `emitIs`'s static path:
+//   - the condition must be a bare `IsExpr` (no compound / parenthesized forms);
+//   - the receiver must be a bare IDENT — the monomorphized param. `emitIs`'s
+//     union-FIELD, optional-chain and box-tag receiver forms are RUNTIME tests;
+//   - a LITERAL variant name is a runtime VALUE test (a softened `0 | 1` union rides
+//     its base scalar, so `monoArgTyName` reports `i32` and the name compare would
+//     "decide" a test that must run — `soundness/literal-is-runtime-value.vl`);
+//   - a nullable-struct receiver is the `!ref.is_null` narrowing test;
+//   - and the tested name must be a whole-span `{…}` SHAPE, which scopes this to the
+//     anonymous-shape family that motivated it and leaves every scalar / closure /
+//     array / declared-name guard emitting both arms exactly as before.
+function monoStaticIsGuardOf(condIx: i32, fnIx: i32) {
+  const c = P.nodes[condIx]
+  if c is IsExpr {
+    const recv = P.nodes[unwrapParen(c.isObj)]
+    if !(recv is Ident) { return -1 }
+    if isLitVariantName(c.isVariant) { return -1 }
+    if !nameIsWholeSpanShape(c.isVariant) { return -1 }
+    if exprNullableStruct(c.isObj, fnIx) { return -1 }
+    return monoStaticIsResult(condIx, fnIx)
+  }
+  -1
+}
+
 function emitIfStmtStmt(body: i32[], s: IfStmt, _stmtIx: i32, fnIx: i32) {
   // Structured void `if`: push the i32 condition, then `if 0x04` with void
   // blocktype `0x40`. The then-branch's statements run when the condition is
   // non-zero; an optional `else 0x05` branch runs otherwise; `end 0x0b` closes it.
   // Both branches `return` on their own, so the `if` yields no value.
+  // A monomorphized-instance `is` guard is decided at COMPILE TIME (see
+  // `monoStaticIsResult`), so one arm can be provably UNREACHABLE in this instance.
+  // Emit that arm as EMPTY: its statements are typed against the OTHER instance's
+  // binding and generally cannot lower at all (`v.foo` where this instance's `v` is
+  // an i32 — "field access but no struct type declared"). Skipping is host parity:
+  // the branch can never run here. -1 = not static, both arms emit as before.
+  const staticGuard = monoStaticIsGuardOf(s.ifCond, fnIx)
   if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
   fbIf(64) // 0x04 if, 0x40 void blocktype
   // The `if` opens ONE control frame (the `else` reuses it, `end` closes it), so a
@@ -10346,9 +10405,11 @@ function emitIfStmtStmt(body: i32[], s: IfStmt, _stmtIx: i32, fnIx: i32) {
   // outer narrowing around the branch so nesting and the else-branch are unaffected.
   const savedTop = narrowTop
   const narrowed = setNarrowFromCond(s.ifCond, fnIx)
-  if emitStmts(body, s.ifThen, fnIx) < 0 { return -1 }
+  if staticGuard != 0 {
+    if emitStmts(body, s.ifThen, fnIx) < 0 { return -1 }
+  }
   if narrowed { restoreNarrow(savedTop) }
-  if s.ifElse >= 0 {
+  if s.ifElse >= 0 && staticGuard != 1 {
     fbElse() // 0x05 else
     // The else may be a Block or a nested IfStmt (`else if`); both go through
     // `emitStmt` (a lone statement) — a Block re-enters `emitStmts`. The then

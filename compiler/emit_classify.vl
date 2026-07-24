@@ -8127,6 +8127,30 @@ function nullArrayArrElem(name: string) {
 // The DECLARED-struct index an inline-SHAPE element spelling (`{v:i32}` of a
 // `{v:i32}[]` annotation) resolves to via the structural bridge
 // (`structIndexOfTypeName`), or -1. GATED on a DECLARED twin
+// Does a monomorphized instance's bound argument type `sk` SATISFY the type named by
+// an `is` test (`want`)? The static-`is` guard (`wasmEmit`'s `emitIs`) decides
+// `v is T` at compile time per instance, and it used to decide by STRING EQUALITY on
+// the two names. That silently answered NO for an ANONYMOUS SHAPE: an object-literal
+// argument binds `sk` to its interned row name (`#anon0`, minted by
+// `collectAnonShapes`) while the test carries the source spelling (`{foo:string}`),
+// so `hello({foo: "ok"})` with `if v is {foo: string}` took the ELSE arm — a SILENT
+// WRONG ANSWER, not a loud one. Names are the wrong comparison: resolve both sides to
+// a struct ROW and compare structurally (the same "stop re-deriving from a render"
+// principle that node-routed the twin resolvers in #1061-#1067). `sk` is a row name,
+// so `structIndexByName`; `want` is an annotation spelling, so `repRowOfName`'s
+// canonical key. Rows that are layout twins (`repStructSlotsTwin`) satisfy each other
+// — they are one heap type. Returns -1 when either side names no row, so the caller
+// keeps the string compare's answer (scalars, closures, arrays, declared names).
+export function monoIsRowMatch(sk: string, want: string) {
+  const skSi = structIndexByName(sk)
+  if skSi < 0 { return -1 }
+  const wSi = repRowOfName(want, sScanLim())
+  if wSi < 0 { return -1 }
+  if wSi == skSi { return 1 }
+  if repStructSlotsTwin(skSi, wSi) != 0 { return 1 }
+  0
+}
+
 // (`nameIsStructDecl`): an inline spelling matching only an anonymous-literal /
 // interned-shape slot keeps its legacy classification — admitting it would
 // route a shape-armed union (`t is {f: boolean}[]` over an inferred closure-call
@@ -9678,13 +9702,28 @@ export function nameIsNestedScalarLeafArray(nm: string): boolean {
 // variant — its list rides the variant machinery), or an inline shape that
 // recursively passes `funcTypeShapeLowerable`. The struct-through-list closure-result
 // admission (R6): the element interns like any struct-field element (the code-5
-// `ensureRefElem` pass), so the field is a plain ref-list slot. A union / map /
-// closure / nullable element stays un-admitted (their reps carry the R1/R3/R5 seams).
+// `ensureRefElem` pass), so the field is a plain ref-list slot. A NULLABLE-struct
+// element (`({f: i32} | null)[]`) admits too — it is the kind-1 struct NICHE in the
+// SAME ref-list wrapper (see the peel below). A union / map / closure element stays
+// un-admitted (their reps carry the R1/R3/R5 seams).
 function structElemArrayLowerable(t: string): boolean {
   if t.length < 3 || t[t.length - 2] != '[' || t[t.length - 1] != ']' {
     return false
   }
-  const base = t.slice(0, t.length - 2)
+  // The element text as WRITTEN carries any grouping parens the source spelled
+  // (`({g: i32})[]` — pure grouping, `({f: i32} | null)[]` — the nullable-struct
+  // NICHE element). Peel the grouping pair, then a `| null` wrapper, so both reach
+  // the same admission test the paren-free spelling (`{g:i32}[]`) takes. The
+  // nullable peel is the kind-1 struct NICHE (`rlElemNicheNullable`): the element
+  // is a `(ref null $S)` in the very same ref-list wrapper the non-null element
+  // uses, which the annotated named-function spelling (`mk(): {f: ({f:i32}|null)[]}`)
+  // already lowers soundly — so admitting it here only removes the annotation.
+  // Un-admitted, the whole closure-result struct stayed un-interned and the body
+  // literal fieldset-collided onto its own ELEMENT row (`{f:…}` on both) —
+  // INVALID-WASM at the `struct.new` (fuzz report-only branching leg).
+  let base = monoUnwrapParens(t.slice(0, t.length - 2))
+  const nb = nullablePartOf(base)
+  if nb != "" { base = monoUnwrapParens(nb) }
   if base.length >= 2 && base[0] == '{' && base[1] != '[' {
     return funcTypeShapeLowerable(base)
   }
@@ -10147,6 +10186,19 @@ export function internInlineShape(nm: string) {
       if e5 == "" {
         const raw5 = texts[pi].slice(0, texts[pi].length - 2)
         if structIndexByName(raw5) >= 0 { e5 = raw5 }
+        // A GROUPING-PAREN element spelling (`f: ({g: i32})[]` — the parens carry no
+        // meaning; the source is free to write them). `refArrElemName` keys the
+        // paren-FREE spelling, so peel the grouping pair and key the same slot the
+        // `{g: i32}[]` spelling does — otherwise the field recorded "" and the type
+        // section failed the loud "ref-list field element type is not interned"
+        // (or, with a same-fieldset twin in scope, the un-interned closure-result
+        // struct fieldset-collided onto its own element row — INVALID-WASM).
+        if e5 == "" {
+          const uw5 = monoUnwrapParens(raw5)
+          if uw5.length != raw5.length {
+            if structIndexByName(uw5) >= 0 { e5 = uw5 }
+          }
+        }
       }
       sFieldElemName.push(e5)
       if isValueUnionName(e5) { registerValueUnionName(e5) }
