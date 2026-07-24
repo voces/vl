@@ -4130,34 +4130,36 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
       // field-TYPE-guarded match. Falls back to the historic first match when the
       // node carries no recorded type (an emit-time-cloned mono node).
       if nodeTyIsObj(objIx) {
+        // NODE ROUTE (rep-slot-layer, AUTHORITATIVE): consult the checker's ADOPTED
+        // arena type for this literal (`nodeRepTyIxOf` — #988's
+        // `recordNullHoleObjAdopt` and #1024's union-softening `recordRepTyAdopt`
+        // re-stamp the DESTINATION type here) through `repRowOfTyStruct` (the
+        // `slotCanonKey == repCanonKey` pick under the `structFieldCodesEq` layout
+        // gate) FIRST — ahead of EVERY render-derived consult below. This IS the row
+        // the literal's proven type names; the SELF-classified render fed to
+        // `structIndexOfTypeName` only reaches it by leaning on
+        // `shapeFieldTypeCompat`'s whole-span refutation arms to DECLINE the wrong
+        // twin (`{f: {f: i64|null}}` vs its inner `{f: i64|null}` row — the render
+        // spells the nullable field `i64?` / softens a union leaf to `string`, so
+        // the canon key matches NO row and the lenient fieldset scan merges onto the
+        // inner twin). Consuming the adopted node directly is the #1015–#1019 "stop
+        // re-deriving from a render" principle, and hoisting it AHEAD of the nominal
+        // consult is what RETIRED arm 2 (#978): with the last render-fed callers
+        // node-routed (`structIndexOfObjCtx` #1061, `structIdxOfElemName` #1062,
+        // `shapeElemDeclaredStructIdx` + `structIndexOfExpr` #1063), no caller
+        // reaches the lenient scan with a whole-span self-classified render, so the
+        // refutation is unreachable. Trust the node when it covers this literal
+        // (>= 0); fall to the name path only when the node is uncovered
+        // (`repRowOfTyStruct` returns -1: no rep type, non-`TyObj`, empty key, or an
+        // ambiguous atom-vs-plain collision it must NOT guess through — #974's
+        // deliberate decline, which the name path keeps).
+        const nsi = repRowOfTyStruct(nodeRepTyIxOf(objIx), sLimA)
+        if nsi >= 0 { return nsi }
         const sn = nodeTyName(objIx)
         if sn != "" {
           const tsi = structIndexOfTypeName(sn)
           if tsi >= 0 { return tsi }
         }
-        // NODE ROUTE (rep-slot-layer p1): consult the checker's ADOPTED arena type
-        // for this literal (`nodeRepTyIxOf` — #988's `recordNullHoleObjAdopt` and
-        // #1024's union-softening `recordRepTyAdopt` re-stamp the DESTINATION type
-        // here) through `repRowOfTyStruct` (the `slotCanonKey == repCanonKey` pick
-        // under the `structFieldCodesEq` layout gate) — AUTHORITATIVELY, BEFORE the
-        // self-classified render is fed to the `?`-gated retry below. This IS the
-        // row the literal's proven type names; the `?`/softened SELF-classified
-        // render only reaches it by leaning on `shapeFieldTypeCompat` refutation
-        // arms to DECLINE the wrong twin. Consuming the adopted node directly (the
-        // #1015–#1019 "stop re-deriving from a render" principle) hoists this consult
-        // ahead of the render-retry + `strictSi` heuristics (it was the last-resort
-        // tail `xr` below). Placed AFTER the primary `structIndexOfTypeName(sn)`
-        // consult, not before it: pre-empting the nominal consult too (arena
-        // authoritative over the name path) is byte-identical on the corpus but
-        // GRADUATES an off-corpus reject family (`{f:{f:i32}|null}[]|i64=[{f:null}]`
-        // flips a "leaf-scalar widening across a nested array" reject to a run) —
-        // the arena-authoritative over-decline / unmasking risk, out of scope here.
-        // Trust the node when it covers this literal (>= 0); fall to the `?`-retry
-        // only when the node is uncovered (`repRowOfTyStruct` returns -1: no rep
-        // type, non-`TyObj`, empty key, or an ambiguous atom-vs-plain collision it
-        // must NOT guess through — the name path keeps that last case).
-        const nsi = repRowOfTyStruct(nodeRepTyIxOf(objIx), sLimA)
-        if nsi >= 0 { return nsi }
         // The SPACED render can spell a nullable field `i64?` — a spelling the
         // canon-key resolver (`repNameCanonKey` → `resolveAnnot`) reads as a
         // proven mismatch against the `i64|null`-keyed row, rejecting EVERY
@@ -6779,26 +6781,32 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
       if tnb != "" { tb = tnb }
       return nestedStructNamesCompat(tb, elem)
     }
-    // A UNION-BOX candidate field (code 16) against a WHOLE-SPAN inline-shape
-    // spelling (`f: {f: i32|string}` — a nested-STRUCT field): a bare struct
-    // spelling never denotes the box, so this is a PROVEN mismatch. Without it
-    // the twin pair minted by a nested alias (`{f: {f: i32|string}}` beside its
-    // inner `{f: i32|string}` row, alias-registered inner-first) let the OUTER
-    // annotation leniently adopt the INNER row, and the outer literal built one
-    // level short — INVALID-WASM (fuzz sweep3 declared leg, seed 128787380).
-    if code == 16 && nameIsWholeSpanShape(t) { return false }
-    // A CLOSURE / nullable-closure candidate field (code 14 / 22) against a
-    // WHOLE-SPAN inline-shape spelling: a bare `{…}` struct shape has no
-    // top-level arrow, so it can NEVER denote a closure field — a PROVEN
-    // mismatch. Without it a lambda returning a nested struct `{f: {f: f64}}`
-    // (whose inline spelling `nameFieldCode` cannot classify — an anonymous
-    // shape with no TypeDecl, want < 0) leniently matched the struct-ARM
-    // variant `{f: () => {f: {f: f64}}}` of a `{…} | f64` variant-box union,
-    // so `cbRetVariantIdx` mis-collapsed the return to that variant and the
-    // `$fnsig` result token keyed the arm struct instead of the return struct —
-    // INVALID-WASM at the lambda (fuzz plain/gating leg, seed 250447487, the
-    // `{f: () => {f: {f: f64}}} | f64` double-`{f}`-nest twin).
-    if (code == 14 || code == 22) && nameIsWholeSpanShape(t) { return false }
+    // RETIRED (arm 2, #978): a UNION-BOX candidate field (code 16) against a
+    // WHOLE-SPAN inline-shape spelling used to be refuted here, so the lenient
+    // fieldset scan would DECLINE a nested-alias twin pair (`{f: {f: i32|string}}`
+    // beside its inner `{f: i32|string}` row) rather than merge the outer
+    // annotation onto the inner row. That refutation existed only to make the NAME
+    // resolver decline a render the NODE resolver already answers correctly: every
+    // caller that could feed it a whole-span self-classified render is now routed
+    // through the adopted arena type (`structIndexOfObjCtx` #1061 — hoisted ahead
+    // of the nominal consult, `structIdxOfElemName` #1062 and the `rlTwin` heap
+    // loop it backs, `shapeElemDeclaredStructIdx` + `structIndexOfExpr` #1063) or
+    // through `repRowOfName`'s canon key, both of which separate those twins by the
+    // FULL nested field type. Witnesses: the four `nested-{null-hole,union-
+    // softening}-list-{elem,return}-twin` pins.
+    // RETIRED (arm 3's CLOSURE half, #1041): a code-14/22 (closure / nullable-
+    // closure) candidate field against a WHOLE-SPAN inline-shape spelling used to be
+    // refuted here, so a lambda returning a nested struct `{f: {f: f64}}` could not
+    // leniently match the struct-ARM variant `{f: () => {f: {f: f64}}}` of a
+    // `{…} | f64` variant-box union (`cbRetVariantIdx` mis-collapsed the return and
+    // the `$fnsig` result token keyed the arm struct). Same disposition as arm 2
+    // (#978): the refutation only made the NAME resolver decline a render the NODE
+    // resolver already answers, and every caller that can feed it a whole-span
+    // self-classified render is now routed through the adopted arena type or
+    // `repRowOfName`'s canon key. Witness: the #1041 pin
+    // `closures/variant-box-closure-field-nested-struct-result.vl`, plus #1056's
+    // `cbRetVariantIdx` plain-struct classification which now carries that case.
+    // The SCALAR/string sibling below is NOT retirable yet — see its note.
     // The SCALAR/string sibling of the code-16 reject above: a WHOLE-SPAN `{…}`
     // spelling never denotes a scalar or string field either (codes 0/3/17/23/24) —
     // a PROVEN mismatch. Without it the nullable nested-alias twin pair
@@ -6807,6 +6815,16 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
     // this lenient arm), and a `w: {f: {f: f64}} | null` binding's local took the
     // inner row's ref while the `T0 | null` param wanted the outer — INVALID-WASM
     // at the call (fuzz post-#993 sweep declared leg, seed 483043315 case_00363).
+    // KEPT — measured NO-RETIRE (disable-then-diff alongside the closure half above):
+    // corpus stays byte-identical and the suite stays green, but a pinned-seed fuzz
+    // A/B (25,200 programs/side) regresses THREE working shapes to loud rejects, all
+    // the same family — a nullable-struct PARAM annotated with the WHOLE-SPAN inline
+    // spelling (`p: {f: {f: i64}} | null` beside `type T0 = {f: {f: i64}}`, so the
+    // outer merges onto the inner row: "field access receiver is not a struct" at
+    // `t0.f.f`). That resolution runs through a NAME-only caller with no node — the
+    // nullable-struct annotation path, not the literal/element resolvers this arc
+    // routed — so retiring this half needs that caller routed through `repRowOfName`
+    // first (the same per-caller recipe as #1061–#1064).
     if nameIsWholeSpanShape(t) {
       if code == 0 || code == 3 || code == 17 || code == 23 || code == 24 {
         return false
