@@ -3570,49 +3570,6 @@ function nameIsSingleShape(name: string) {
   true
 }
 
-// Register every FIELD union of an inline struct-shape annotation `name` (`{f:A|B,g:C}`) — split
-// the shape body at depth 0 and recurse `registerInlineUnion` on each field's type text. The
-// inline-shape dual of `collectInlineUnionsIn`'s named-`TypeDecl` field loop, so a field union
-// (`{f: f32 | {w:i32}}`) interns its variant structs regardless of whether the struct is spelled
-// inline or as a named alias. A non-union field (`i32`, a nested plain struct, a map) is a
-// self-gated no-op through the same dispatch. Returns 0, or -1 (via `emitFail`).
-function registerShapeFieldUnions(stmts: i32[], name: string) {
-  const inner = name.slice(1, name.length - 1)
-  let depth = 0
-  let start = 0
-  let k = 0
-  while k <= inner.length {
-    let brk = false
-    if k == inner.length {
-      brk = true
-    } else {
-      const c = inner[k]
-      if c == '{' || c == '[' || c == '(' { depth = depth + 1 }
-      if c == '}' || c == ']' || c == ')' { depth = depth - 1 }
-      if c == ',' && depth == 0 { brk = true }
-    }
-    if brk {
-      const part = inner.slice(start, k)
-      const ci = part.indexOf(":")
-      if ci > 0 {
-        const ftxt = part.slice(ci + 1, part.length)
-        // A CLOSURE field (`f: (i32) => K0 | {w:i32}`) registers its RESULT union too:
-        // `registerInlineUnion`'s function-type branch peels to the return and recurses,
-        // so a field-position contextual lambda's pinned union box lowers exactly like
-        // the annotated named-fn spelling (un-registered, the pinned `$fnsig` result was
-        // the box but `emitReturnValue`'s union path never engaged — the body returned
-        // the RAW litunion arm into the box result, INVALID-WASM). A non-union closure
-        // result registers nothing (byte-identical); the old blanket skip predates the
-        // closure-result pin + floors that made this path regular.
-        if registerInlineUnion(stmts, ftxt) < 0 { return -1 }
-      }
-      start = k + 1
-    }
-    k = k + 1
-  }
-  0
-}
-
 // Register the inline union synthetic name `name` (e.g. `"A|B"`) as a union alias in
 // the per-union tables, exactly as `collectU` registers a `UnionDecl`: record the
 // name + its variant-slice range, append each member to the GLOBAL `uVariants` list,
@@ -3797,11 +3754,12 @@ function registerInlineUnion(stmts: i32[], name: string) {
     // shape's field union (`K0 | {w: i32}`) is never registered. Its field then codes -1 in
     // `internInlineShape` (`nameFieldCode` returns -1 for an unregistered heterogeneous union), so the
     // inner struct FAILS TO INTERN — and the reflist element resolves to the OUTER struct (all three
-    // shapes share field names a/f/z), storing the wrong reps: INVALID-WASM. Recurse on the single-shape
-    // element so `registerShapeFieldUnions` (the `nameIsSingleShape` path below) reaches its field union
-    // and registers it — after which the inner struct interns distinctly and the element resolves to it.
-    // `internShapeDeep` already peels a single `[]` for SHAPE interning; this is the union-REGISTRATION
-    // twin it lacks.
+    // shapes share field names a/f/z), storing the wrong reps: INVALID-WASM. The element shape's
+    // field unions are now registered by `collectTyReachRegister`'s structural walk (the retired
+    // `registerShapeFieldUnions` name split used to reach them via this recursion); this call is a
+    // self-gated no-op for a single shape (the `nameIsSingleShape` decline below) but is kept as
+    // the union-REGISTRATION peel twin of `internShapeDeep`'s single-`[]` SHAPE peel, so a future
+    // top-level-union element (not a bare shape) still registers here.
     if nameIsSingleShape(inner) { return registerInlineUnion(stmts, inner) }
   }
   // A bare MAP annotation with a union VALUE (`{[string]: C | S}`) registers that inner value union;
@@ -3825,13 +3783,17 @@ function registerInlineUnion(stmts: i32[], name: string) {
     }
   }
   // An inline STRUCT-SHAPE annotation (`{f: A | B}`, `{a: C | i32, b: {g: D | E}}`) carries its
-  // unions in its FIELDS, not at the top level — so `isVariantBoxUnion` sees one atom and misses
-  // them. A named `type T = {f: A | B}` registers each field union in `collectInlineUnionsIn`'s
-  // TypeDecl branch; give the inline form the SAME descent so a field union interns its variant
-  // structs the way the named-alias spelling does (not just the value-box reps `internInlineShape`
-  // would later mark). `nameIsSingleShape` gates out a union-of-shapes (`{x:i32}|{y:i32}`, handled
-  // by `isVariantBoxUnion` below) and a map (`{[string]: V}`, whose value recursion is above).
-  if nameIsSingleShape(name) { return registerShapeFieldUnions(stmts, name) }
+  // unions in its FIELDS, not at the top level. The `registerShapeFieldUnions` NAME split that
+  // used to descend the shape body here is RETIRED: `collectTyReachRegister`'s structural walk
+  // reaches every field union directly (its `TyObj` arm recurses each field type, its `TyFunc`
+  // arm the closure-field results), and it renders them with the SAME position-dependent litunion
+  // softening the shape NAME carries (`reachRegisterName`'s `underFunc` gate — a func-nested
+  // field's `K0|boolean` stays faithful, a direct field softens to `string|boolean`), so the
+  // arena registration keys EXACTLY match. The walk runs BEFORE this name call at every
+  // annotation site (bucket-(c) ordering), so a shape's field unions are interned before its own
+  // row — the ordering the name split preserved. A single shape has no top-level union to
+  // register here, so decline.
+  if nameIsSingleShape(name) { return 0 }
   if !isVariantBoxUnion(stmts, name) { return 0 }
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
@@ -3993,7 +3955,32 @@ function nliInferIfLet(walk: i32[], i: i32) {
 // unions in its params/result, but its closure SIGNATURE is NOT interned here (sig
 // descent is the next slice — the slot digits are nominal-sensitive and need the
 // run-diff gate). Returns 0, or -1 (a `registerInlineUnion` `emitFail`).
-function collectTyReachRegister(stmts: i32[], tyIx: i32, depth: i32) {
+// The name-walk key for a reachable union, honoring the position-dependent litunion
+// softening that `canonEmitName` bakes in. `underFunc` = the union sits INSIDE a
+// function type on the reachability path. `canonEmitName` leaves a top-level function
+// type VERBATIM (it never recurses into a func's params/result), so a litunion alias
+// embedded there — a struct FIELD's `K0 | boolean` inside `(i32) => {a: K0|boolean,…}`
+// — is NEVER softened: the name walk (which extracts field text from the func's
+// already-canon'd source spelling) keys it faithfully as `K0|boolean`. Outside any
+// func, `canonEmitName` DOES soften a direct/field litunion (`K0|boolean` →
+// `string|boolean`, the `unionAliasMembers` expansion), matching the emit-side
+// annotation rewrite for a direct struct spelling. So: under a func, render faithfully
+// (`tyToNominalName` already produces the source-faithful, alias-preserving spelling);
+// otherwise soften once via `canonEmitName`. Reproduces the name-walk key in BOTH
+// positions — the prerequisite for retiring `registerShapeFieldUnions`.
+function reachRegisterName(tyIx: i32, underFunc: boolean): string {
+  const nom = tyToNominalName(tyIx)
+  if nom == "" { return "" }
+  if underFunc { return nom }
+  canonEmitName(nom)
+}
+
+function collectTyReachRegister(
+  stmts: i32[],
+  tyIx: i32,
+  depth: i32,
+  underFunc: boolean,
+) {
   if tyIx < 0 || depth <= 0 { return 0 }
   const t = T.tys[tyIx]
   if t is TyNullable {
@@ -4003,7 +3990,9 @@ function collectTyReachRegister(stmts: i32[], tyIx: i32, depth: i32) {
     // already be registered when it fires. Descend the inner union's MEMBERS first —
     // WITHOUT registering the inner union itself, so the outer `…|null` name still
     // registers before the bare inner union (the name walk's registration order).
-    if collectTyMembersReach(stmts, t.nInner, depth - 1) < 0 { return -1 }
+    if collectTyMembersReach(stmts, t.nInner, depth - 1, underFunc) < 0 {
+      return -1
+    }
     // BUCKET (b): a NICHE nullable (`boolean|null`, `string|null`, a litunion `K0|null`,
     // a union-ALIAS `AB|null`, or a variant-box `X|Y|null`) carries its OWN emit-name
     // registration — the shared value box / variant box reps the `| null` spelling needs.
@@ -4014,31 +4003,39 @@ function collectTyReachRegister(stmts: i32[], tyIx: i32, depth: i32) {
     // spelling) and register it. Idempotent + self-dispatching: a nullable-STRUCT (`S|null`),
     // nullable-MAP, or nullable-scalar-LIST niche is owned by other machinery and no-ops in
     // `registerInlineUnion`; a union the name walk already reached is an `isUName` no-op.
-    const nn = canonEmitName(tyToNominalName(tyIx))
+    const nn = reachRegisterName(tyIx, underFunc)
     if nn != "" {
       if registerInlineUnion(stmts, nn) < 0 { return -1 }
     }
-    return collectTyReachRegister(stmts, t.nInner, depth - 1)
+    return collectTyReachRegister(stmts, t.nInner, depth - 1, underFunc)
   }
-  if t is TyArray { return collectTyReachRegister(stmts, t.aElem, depth - 1) }
-  if t is TyMap { return collectTyReachRegister(stmts, t.mVal, depth - 1) }
+  if t is TyArray {
+    return collectTyReachRegister(stmts, t.aElem, depth - 1, underFunc)
+  }
+  if t is TyMap {
+    return collectTyReachRegister(stmts, t.mVal, depth - 1, underFunc)
+  }
   if t is TyObj {
     const ftys = t.objFieldTypes
     let i = 0
     while i < ftys.length {
-      if collectTyReachRegister(stmts, ftys[i], depth - 1) < 0 { return -1 }
+      if collectTyReachRegister(stmts, ftys[i], depth - 1, underFunc) < 0 {
+        return -1
+      }
       i = i + 1
     }
     return 0
   }
   if t is TyFunc {
+    // Everything inside a function type is the `canonEmitName` VERBATIM region —
+    // descend with `underFunc = true` so embedded litunion aliases render faithfully.
     const ps = t.fnParamTypes
     let i = 0
     while i < ps.length {
-      if collectTyReachRegister(stmts, ps[i], depth - 1) < 0 { return -1 }
+      if collectTyReachRegister(stmts, ps[i], depth - 1, true) < 0 { return -1 }
       i = i + 1
     }
-    return collectTyReachRegister(stmts, t.fnRet, depth - 1)
+    return collectTyReachRegister(stmts, t.fnRet, depth - 1, true)
   }
   if t is TyUnion {
     // Descend into the members FIRST — bucket (c): a struct ARM's field may itself be
@@ -4052,11 +4049,14 @@ function collectTyReachRegister(stmts: i32[], tyIx: i32, depth: i32) {
     // element/map-value/closure-result unions (TyArray/TyMap/TyFunc recursion), and
     // the #1048 niche-nullable spellings (TyNullable arm). Idempotent — an
     // already-registered union is an `isUName` no-op.
-    if collectTyMembersReach(stmts, tyIx, depth - 1) < 0 { return -1 }
-    // Render the union name-faithfully, canon once over the whole render, register.
+    if collectTyMembersReach(stmts, tyIx, depth - 1, underFunc) < 0 {
+      return -1
+    }
+    // Render the union name-faithfully (`underFunc`-aware softening — see
+    // `reachRegisterName`), register.
     // A "" render (an unresolvable nominal / over-deep recursion) declines silently —
     // the name walk still covers those (this walk only ADDS coverage, never removes).
-    const nm = canonEmitName(tyToNominalName(tyIx))
+    const nm = reachRegisterName(tyIx, underFunc)
     if nm != "" {
       if registerInlineUnion(stmts, nm) < 0 { return -1 }
     }
@@ -4071,14 +4071,21 @@ function collectTyReachRegister(stmts: i32[], tyIx: i32, depth: i32) {
 // to register a variant-box union calls this first, so every struct arm's field
 // unions are registered when `collectVariantFields` fires. A non-union `tyIx`
 // (or -1 / exhausted depth) is a no-op. Returns 0, or -1.
-function collectTyMembersReach(stmts: i32[], tyIx: i32, depth: i32) {
+function collectTyMembersReach(
+  stmts: i32[],
+  tyIx: i32,
+  depth: i32,
+  underFunc: boolean,
+) {
   if tyIx < 0 || depth < 0 { return 0 }
   const t = T.tys[tyIx]
   if t is TyUnion {
     const members = t.uMembers
     let i = 0
     while i < members.length {
-      if collectTyReachRegister(stmts, members[i], depth) < 0 { return -1 }
+      if collectTyReachRegister(stmts, members[i], depth, underFunc) < 0 {
+        return -1
+      }
       i = i + 1
     }
   }
@@ -4232,7 +4239,7 @@ function collectTyReachCloSigs(tyIx: i32, depth: i32) {
 function rootUnionDeclMembers(stmts: i32[], udName: string) {
   let udTyIx = -1
   if cUserTypes.has(udName) { udTyIx = cUserTypes[udName] ?? (-1) }
-  collectTyMembersReach(stmts, udTyIx, 16)
+  collectTyMembersReach(stmts, udTyIx, 16, false)
 }
 
 // Scan every top-level FuncDecl's parameter + return annotations and every top-level
@@ -4271,7 +4278,9 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       // unions must already be registered when it does (the walk's members-first
       // TyUnion descent reaches them; the retired `registerVariantArmFieldUnions`
       // name split used to pre-register them inside `registerInlineUnion` itself).
-      if collectTyReachRegister(stmts, nodeTyIxOf(retTy), 16) < 0 { return -1 }
+      if collectTyReachRegister(stmts, nodeTyIxOf(retTy), 16, false) < 0 {
+        return -1
+      }
       if registerInlineUnion(stmts, tyNameOf(retTy)) < 0 { return -1 }
       cloSigWalkRoots.push(nodeTyIxOf(retTy))
       let pi = 0
@@ -4280,7 +4289,9 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
         if p is Param {
           const pt = p.parType
           // Arena walk first (bucket (c) ordering — see the return-type site).
-          if collectTyReachRegister(stmts, nodeTyIxOf(pt), 16) < 0 { return -1 }
+          if collectTyReachRegister(stmts, nodeTyIxOf(pt), 16, false) < 0 {
+            return -1
+          }
           if registerInlineUnion(stmts, tyNameOf(pt)) < 0 { return -1 }
           cloSigWalkRoots.push(nodeTyIxOf(pt))
         }
@@ -4290,7 +4301,9 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
     } else if s is LetDecl {
       const letTy = s.letType
       // Arena walk first (bucket (c) ordering — see the return-type site).
-      if collectTyReachRegister(stmts, nodeTyIxOf(letTy), 16) < 0 { return -1 }
+      if collectTyReachRegister(stmts, nodeTyIxOf(letTy), 16, false) < 0 {
+        return -1
+      }
       if registerInlineUnion(stmts, tyNameOf(letTy)) < 0 { return -1 }
       cloSigWalkRoots.push(nodeTyIxOf(letTy))
       // Usage-driven `let x = null` hole (A-infer-null): infer + register `T|null`.
@@ -4313,7 +4326,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
           if fdn is FieldDef {
             const fdt = fdn.fdType
             // Arena walk first (bucket (c) ordering — see the return-type site).
-            if collectTyReachRegister(stmts, nodeTyIxOf(fdt), 16) < 0 {
+            if collectTyReachRegister(stmts, nodeTyIxOf(fdt), 16, false) < 0 {
               return -1
             }
             if registerInlineUnion(stmts, tyNameOf(fdt)) < 0 { return -1 }
@@ -4470,7 +4483,9 @@ export function collectU(stmts: i32[]) {
     // interning is `cloSigPosOfKey`-gated), so an inferred type whose reps the name
     // walk already reached is a no-op — this only ADDS the coverage the render missed.
     // #1046 made inferred variant-box returns 0-growth redundancy here.
-    if collectTyReachRegister(stmts, inferRetTyIxAt(iru), 16) < 0 { return -1 }
+    if collectTyReachRegister(stmts, inferRetTyIxAt(iru), 16, false) < 0 {
+      return -1
+    }
     if registerInlineUnion(stmts, inferRetTyAt(iru)) < 0 { return -1 }
     cloSigWalkRoots.push(inferRetTyIxAt(iru))
     iru = iru + 1
