@@ -410,6 +410,204 @@ function repCanonKeyGo(ty: i32): string {
   "@" + i32ToStr(ty)
 }
 
+// ── repElemKey — the ref-list ELEMENT rep key (destringify D2) ────────────────
+// A canonical key for a ref-list element's REPRESENTATION (its WasmGC
+// wrapper-equivalence class), NOT its type. Equal iff two elements ride ONE
+// wrapper heap type / occupy ONE ref-list slot. The structural replacement for
+// the string-surgery `rlCanonElemName`.
+//
+// This is NOT `repCanonKey` — that keys the arena TYPE, and diverges from a slot
+// key on BOTH ends:
+//   · it keeps `i32[]`, `boolean[]`, litunion `K[]` and `(boolean|null)[]` APART
+//     (correct as a type key), yet all four ride the ONE `lTypeIdx` i32-list
+//     backing; likewise `(string|null)[]` shares `string[]`'s `$mkListIdx`
+//     wrapper. `repElemKey` FOLDS each shared-wrapper leaf list to one token.
+//   · it EXPANDS a declared struct to its field shape, so two declared twins
+//     (`type A = {v:i32}`, `type B = {v:i32}`) collapse — but the ref-list layer
+//     keeps them NOMINAL (distinct slots, deduped to one heap later via `rlTwin`;
+//     `structural-twin-reflist-dedup.vl`). `repElemKey` keys a DECLARED struct by
+//     its nominal slot (`repSlotOfTyDecl`); only an INLINE shape is expanded
+//     structurally (its arena index is minted fresh per spelling, so a nominal
+//     index key would be unstable between the intern and the lookup).
+// Everything else — the litunion-atom softening of a MIXED union, nested arrays,
+// nullable, maps, closures — is structural, mirroring `rlCanonLitUnionAtoms`.
+export function repElemKey(ty: i32): string {
+  if ty < 0 { return "!" }
+  let si = repElemKeyStack.length - 1
+  while si >= 0 {
+    if repElemKeyStack[si] == ty {
+      return "#" + i32ToStr(repElemKeyStack.length - si)
+    }
+    si = si - 1
+  }
+  repElemKeyStack.push(ty)
+  let s = repElemKeyGo(ty)
+  repElemKeyStack.pop()
+  if s.length > 262144 { s = "@big:" + i32ToStr(ty) }
+  s
+}
+
+// Cycle guard (de Bruijn back-edges), mirroring `repKeyStack` — a recursive type
+// reaches `repElemKey` through a declared struct (keyed nominally, which already
+// bottoms out) or, defensively, a union/map that could self-refer.
+const repElemKeyStack: i32[] = []
+
+function repElemKeyGo(ty: i32): string {
+  const t = T.tys[ty]
+  if t is TyArray {
+    // Top-level i32-backed leaf array (`i32[]`, `boolean[]`, litunion `K[]`,
+    // `(boolean | null)[]`, `(K | null)[]` — `nameIsI32Array`) → the shared
+    // i32-list wrapper. The `| null` niche rides INSIDE the elements (the outer
+    // list ref is non-null), so a top-level-nullable list (`i32[] | null`, a
+    // TyNullable) carries its `| null` OUTSIDE and is NOT this arm.
+    if tyIsI32LeafElem(t.aElem) { return "$rlI32L" }
+    // Top-level string-backed leaf array (`string[]`, `(string | null)[]` —
+    // `nameIsStringArray`) → the shared string-list wrapper.
+    if tyIsStrLeafElem(t.aElem) { return "$rlStrL" }
+    // A nested ref array (`S[][]`, `(K0|i32)[][]`): recurse — the inner litunion
+    // softening still applies, the inner struct stays nominal.
+    return repElemKey(t.aElem) + "[]"
+  }
+  // A struct. A DECLARED struct keys on its NOMINAL slot (declared twins
+  // `type A = {v:i32}` / `type B = {v:i32}` stay apart — the ref-list layer keeps
+  // them in distinct slots, `structural-twin-reflist-dedup.vl`). An INLINE shape
+  // keys STRUCTURALLY (recurse the fields): its arena index is minted fresh per
+  // spelling/occurrence (unstable), so an index key would make the intern and the
+  // lookup disagree — the structural expansion is stable and matches every
+  // occurrence of the same shape, while staying distinct from any declared slot.
+  if t is TyObj {
+    const ds = repSlotOfTyDecl(ty)
+    if ds >= 0 { return "S" + i32ToStr(ds) }
+    let s = "{"
+    let i = 0
+    while i < t.objFieldNames.length {
+      s = s + t.objFieldNames[i] + ":" + repElemKey(t.objFieldTypes[i]) + ","
+      i = i + 1
+    }
+    return s + "}"
+  }
+  if t is TyPrim { return t.primName }
+  if t is TyNullable { return repElemKey(t.nInner) + "?" }
+  if t is TyUnion {
+    // Mirror `repCanonKeyGo`'s MIX-widening: a litunion member of a MIXED union
+    // (one with a non-null, non-litunion sibling) is STRING-repped in the box, so
+    // it keys "string" — the same niche guard `rlCanonLitUnionAtoms` applies.
+    let mixHasOther = false
+    let mi = 0
+    while mi < t.uMembers.length {
+      const mt = T.tys[t.uMembers[mi]]
+      let mLit = tyIsLitUnion(t.uMembers[mi])
+      if mt is TyLit { mLit = true }
+      let mNull = false
+      if mt is TyPrim {
+        if mt.primName == "null" { mNull = true }
+      }
+      if !mLit && !mNull { mixHasOther = true }
+      mi = mi + 1
+    }
+    let s = "("
+    let emitted = 0
+    let sawWideStr = false
+    let i = 0
+    while i < t.uMembers.length {
+      let r = repElemKey(t.uMembers[i])
+      let skip = false
+      if mixHasOther {
+        let iLit = tyIsLitUnion(t.uMembers[i])
+        const it = T.tys[t.uMembers[i]]
+        if it is TyLit { iLit = true }
+        if iLit { r = "string" }
+        if r == "string" {
+          if sawWideStr { skip = true }
+          sawWideStr = true
+        }
+      }
+      if !skip {
+        if emitted > 0 { s = s + "|" }
+        s = s + r
+        emitted = emitted + 1
+      }
+      i = i + 1
+    }
+    return s + ")"
+  }
+  if t is TyFunc {
+    let s = "("
+    let i = 0
+    while i < t.fnParamTypes.length {
+      if i > 0 { s = s + "," }
+      s = s + repElemKey(t.fnParamTypes[i])
+      i = i + 1
+    }
+    return s + ")=>" + repElemKey(t.fnRet)
+  }
+  if t is TyMap {
+    let s = "M"
+    if t.mSet == 1 { s = "Se" }
+    return s + "[" + repElemKey(t.mKey) + ":" + repElemKey(t.mVal) + "]"
+  }
+  if t is TyNeg { return "!" + repElemKey(t.negTy) }
+  // TyVar / TyLit / TyErr — keep them distinct by arena index (never a false
+  // merge), matching `repCanonKeyGo`.
+  "@" + i32ToStr(ty)
+}
+
+// True when element type `e` rides the i32-list backing as a LEAF — `i32`,
+// `boolean`, a litunion (`K` / inline `"a"|"b"`), and their `| null` sentinel
+// niches (`boolean | null`, `K | null`). The structural twin of `nameIsI32Array`'s
+// element half (its base minus the trailing `[]`).
+function tyIsI32LeafElem(e: i32): boolean {
+  if e < 0 { return false }
+  const t = T.tys[e]
+  if t is TyPrim {
+    if t.primName == "i32" { return true }
+    if t.primName == "boolean" { return true }
+    return false
+  }
+  if tyIsLitUnion(e) { return true }
+  if t is TyNullable {
+    const it = T.tys[t.nInner]
+    if it is TyPrim {
+      if it.primName == "boolean" { return true }
+    }
+    if tyIsLitUnion(t.nInner) { return true }
+  }
+  false
+}
+
+// The string-leaf sibling of `tyIsI32LeafElem`: `string` and `string | null`
+// (`nameIsStringArray`'s element half). A `string[]` element is already a
+// nullable ref at wasm level, so the `| null` niche needs no new wrapper.
+function tyIsStrLeafElem(e: i32): boolean {
+  if e < 0 { return false }
+  const t = T.tys[e]
+  if t is TyPrim {
+    if t.primName == "string" { return true }
+    return false
+  }
+  if t is TyNullable {
+    const it = T.tys[t.nInner]
+    if it is TyPrim {
+      if it.primName == "string" { return true }
+    }
+  }
+  false
+}
+
+// The name bridge for the ref-list layer (which is name-keyed): resolve a
+// ref-list element NAME to its arena type (memoized per spelling by
+// `resolveAnnot`), then compute its rep key. A spelling that does not resolve
+// keys on the name itself (nominal — matches only an identical spelling), and
+// the runaway cap mirrors `repNameCanonKey`'s (a name this long is never a legit
+// slot key — feeding it to `resolveAnnot` mints fresh arena types per probe).
+export function repElemKeyOfName(name: string): string {
+  if name == "" { return "" }
+  if name.length > 4096 { return "name:" + name }
+  const di = resolveAnnot(name, repNoTyparams)
+  if di < 0 { return "name:" + name }
+  repElemKey(di)
+}
+
 // The interned STRUCT-table slot for an object type `ty`, derived from the arena
 // alone, or -1 when none is claimed (the consumer keeps its nominal path).
 //

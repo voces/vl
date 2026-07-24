@@ -274,6 +274,7 @@ import {
   refPushScratchBase,
   rlBackIdx,
   rlElemHeap,
+  rlElemKey,
   rlElemKindTbl,
   rlElemName,
   rlElemNullable,
@@ -316,6 +317,7 @@ import {
 import { emitFail } from "./emit_bytes"
 import {
   recordSTyIx,
+  repElemKeyOfName,
   repKindOfSigTok,
   repNameCanonKey,
   repOfNode,
@@ -9018,66 +9020,53 @@ function rlCanonLitUnionAtoms(name: string): string {
   name
 }
 
-// The ref-list ELEMENT canonicalizer: litunion-alias softening (`rlCanonLitUnionAtoms`)
-// PLUS the i32-BACKED leaf-list fold. An i32-backed leaf list (`boolean[]`, a litunion
-// `K[]`, `(boolean|null)[]`, `(K|null)[]` — `nameIsI32Array`) shares the ONE i32-list
-// wrapper `i32[]` uses: as a ref-list element it is byte-identically the same wrapper heap
-// type (element kind 4, `rlElemHeap = lTypeIdx`, name-INDEPENDENT), and the list ref itself
-// is non-null (the `| null` niche rides INSIDE the inner elements — a top-level-nullable
-// list `i32[] | null` carries its `| null` OUTSIDE and is NOT `nameIsI32Array`, so it keeps
-// its distinct niche slot). The ANNOTATION renders such an element by its source spelling
-// (`boolean[]` / `(boolean|null)[]`) while a self-inferred lambda softens it to `i32[]`,
-// minting TWIN rl slots for one wrapper → divergent `>r<slot>;` `$fnsig` result tokens →
-// a value-call `ref.cast` TRAP (`(i32) => boolean[][]`). Fold to `i32[]` at the single
-// intern/lookup point — the i32-leaf sibling of the litunion-atom softening.
-function rlCanonElemName(name: string): string {
+// The ref-list element's stored NAME normalizer (destringify D2). The slot KEY
+// is now `repElemKey` (structural, from the arena type); this produces the
+// canonical NAME the slot STORES, which the not-yet-destringified downstream
+// name-consumers still read to make their own decisions — the `is`-narrowing
+// emit's litunion classifier, the union-variant lookup, `mapValNameOf`,
+// `structIdxOfElemName`. Those live in later phases (D3+): until they migrate,
+// the stored name must be the emit-canonical spelling, so a litunion-alias atom
+// is softened to its boxed `string` (`K0|{w:i32}` → `string|{w:i32}`; else the
+// `is`-emit reads the raw `K0` and mis-selects the union-variant path) and an
+// i32-/string-backed leaf list folds to its shared-wrapper spelling. This is
+// name normalization for name-consumers, NOT the slot key — `rlCanonLitUnionAtoms`
+// (retained for the map-VALUE layer) does the softening, and the two array folds
+// mirror `nameIsI32Array` / `nameIsStringArray`.
+function rlElemStoredName(name: string): string {
   const c = rlCanonLitUnionAtoms(name)
   if nameIsI32Array(c) { return "i32[]" }
-  // The STRING-leaf sibling of the i32-leaf fold above. A `(string|null)[]` shares
-  // the EXACT string-list wrapper (`$mkListIdx`, `(ref null $aTypeIdx)` backing) that
-  // `string[]` uses — the `| null` niche rides INSIDE the elements (a string element
-  // is already a nullable ref; `null` lowers as `ref.null`), so as a ref-list ELEMENT
-  // the two are byte-identically the same wrapper heap type (`nameIsStringArray`). The
-  // ANNOTATION renders such an element by its source spelling (`(string|null)[]`) while
-  // a self-inferred lambda softens it to `string[]`, minting TWIN rl slots for one
-  // wrapper → divergent `>r<slot>;` `$fnsig` result tokens → a value-call `ref.cast`
-  // TRAP (`() => (string|null)[][]`). Fold to `string[]` at the single intern/lookup
-  // point. A top-level-nullable list (`string[] | null`) carries its `| null` OUTSIDE
-  // and is NOT `nameIsStringArray`, so it keeps its distinct niche slot; the inner
-  // element READ discipline stays driven by the checked expression type, not this slot.
   if nameIsStringArray(c) { return "string[]" }
   c
 }
 
 export function rlInternName(name: string, kind: i32) {
   if name == "" { return -1 }
-  // Canonicalize a litunion-ALIAS atom inside a union element name to its boxed
-  // `string` atom (`K0|i64` → `string|i64`, R3's rule) BEFORE interning — the
-  // emit-canonical key `rlSlotByName`'s widening fallback expects every slot to
-  // carry. Alias-preserving union renders (27eed81 / #941) let the verbatim
-  // spelling reach the interner, minting a DUPLICATE slot (`K0|i64` beside
-  // `string|i64`) — the two slots shared one wrapper heap type but keyed TWO
-  // `$fnsig` results (`>r0;` / `>r1;`), minting byte-identical yet DISTINCT
-  // functypes (iso-recursive typing), so a named fn-value's declared functype
-  // and the call site's `ref.cast` disagreed — a runtime cast failure. The same
-  // transform as the lookup fallback, applied at the single intern point, keeps
-  // the table canonical and every producer on one slot. `rlCanonLitUnionAtoms`
-  // extends the softening THROUGH array-of-union wrapping (`(K0|i32)[]` → the
-  // map-VALUE ref-list element of `{[string]: (K0|i32)[]}`, where the annotation
-  // and the self-inferred factory-return lambda otherwise minted twin mv/map
-  // structs — a cast TRAP at the returned-map read).
-  const name2 = rlCanonElemName(name)
+  // Dedup on the element's REP key (`repElemKey`, destringify D2) — the STRUCTURAL
+  // wrapper-equivalence class, NOT a string-canonicalized name. Two spellings that
+  // share a WasmGC wrapper collapse to ONE slot: an i32-backed leaf list
+  // (`boolean[]` / litunion `K[]` / `(boolean|null)[]` — the shared `lTypeIdx`
+  // i32-list wrapper), a string-backed leaf list (`(string|null)[]` — the
+  // `$mkListIdx` wrapper), and a litunion-alias union member softened to its boxed
+  // `string` atom (`K0|i64` ≡ `string|i64`, R3's rule — else two slots sharing one
+  // wrapper keyed TWO `$fnsig` results `>r0;`/`>r1;`, minting byte-identical yet
+  // iso-recursively DISTINCT functypes, a value-call `ref.cast` TRAP). Declared
+  // struct twins stay apart (`repElemKey` keys a struct nominally). The stored name
+  // is the canonical spelling for downstream name-consumers (see `rlElemStoredName`).
+  const key = repElemKeyOfName(name)
   let i = 0
   while i < rlElemName.length {
-    if rlElemName[i] == name2 { return i }
+    if rlElemKey[i] == key { return i }
     i = i + 1
   }
-  rlElemName.push(name2)
+  const stored = rlElemStoredName(name)
+  rlElemName.push(stored)
+  rlElemKey.push(key)
   rlElemHeap.push(0)
   rlBackIdx.push(0)
   rlWrapIdx.push(0)
   rlElemKindTbl.push(kind)
-  if rlElemNicheNullable(kind, name2) {
+  if rlElemNicheNullable(kind, stored) {
     rlElemNullable.push(1)
   } else {
     rlElemNullable.push(0)
@@ -9085,65 +9074,31 @@ export function rlInternName(name: string, kind: i32) {
   rlElemName.length - 1
 }
 
-// The table SLOT for a ref-list element type-NAME. Nominal exact-name match is
-// the fast path; on a miss, the CANONICAL fallback (the struct table's
-// nominal-then-structural pattern, extended to the ref-list layer): a STRUCT
-// element spelled differently from the interned key — an inline shape vs its
-// declared twin (`{v:i32}` vs `A`), or two structurally-identical declared
-// names — resolves to the slot whose element backs the SAME heap type. The
-// two-layer discipline holds: the element names must resolve to struct slots
-// that are canonical-key AND field-code-layout twins (`repStructSlotsTwin`),
-// and the `| null` niche parity must agree (a niche-nullable element's index
-// read stays nullable — merging it with a non-null slot would change the read
-// discipline, not just the heap type). -1 when nothing matches.
-export function rlSlotByName(name: string) {
+// The table SLOT for a ref-list element type-NAME (destringify D2). Nominal
+// exact-name match is the fast path; on a miss, the REP-KEY scan (`repElemKey`,
+// the fold-collapsing structural key the slot was interned on — the i32-leaf /
+// string-leaf list folds + the litunion-atom softening); then the struct-twin
+// FALLBACK (the struct table's nominal-then-structural bridge, extended to the
+// ref-list layer): a STRUCT element spelled differently from the interned key —
+// an inline shape vs its declared twin (`{v:i32}` vs `A`), or two
+// structurally-identical declared names — resolves to the slot whose element
+// backs the SAME heap type. The two-layer discipline holds: the element names
+// must resolve to struct slots that are canonical-key AND field-code-layout twins
+// (`repStructSlotsTwin`), and the `| null` niche parity must agree (a
+// niche-nullable element's index read stays nullable — merging it with a non-null
+// slot would change the read discipline, not just the heap type). -1 when nothing
+// matches.
+export function rlSlotByName(name: string): i32 {
   let i = 0
   while i < rlElemName.length {
     if rlElemName[i] == name { return i }
     i = i + 1
   }
-  // The canonical form softens litunion-alias atoms THROUGH array-of-union wrapping
-  // (`(K0|i32)[]` → `(string|i32)[]`) AND folds an i32-backed leaf list to `i32[]`
-  // (`boolean[]` / `(boolean|null)[]` — the shared i32-list wrapper), the same transform
-  // `rlInternName` keys the slot on.
-  const cn = rlCanonElemName(name)
-  if cn != name {
-    let ci = 0
-    while ci < rlElemName.length {
-      if rlElemName[ci] == cn { return ci }
-      ci = ci + 1
-    }
-  }
-  // A LITUNION-ALIAS atom inside a union ELEMENT name (`K0|i32` — the verbatim text of an
-  // `is (K0 | i32)[]` variant or its narrow key): the interning side keys the slot on the
-  // emit-canonical name, which renders a litunion member as its boxed `string` atom
-  // (`string|i32` — a litunion boxes as a string ref, R3's rule), so the verbatim spelling
-  // misses. Retry the exact match with each litunion-alias atom widened to `string`.
-  // Sound for the same reason the `is K0` string-tag compare is: a real `string` member
-  // cannot coexist with a litunion in one union (`K0 | string` collapses to `string`).
-  if unionMemberCount(name) > 1 {
-    const luAtoms: string[] = []
-    splitUnionAtoms(name, luAtoms)
-    let luChanged = false
-    let luCanon = ""
-    let luI = 0
-    while luI < luAtoms.length {
-      let a = luAtoms[luI]
-      if nameIsLitUnionType(a) {
-        a = "string"
-        luChanged = true
-      }
-      if luI > 0 { luCanon = luCanon + "|" }
-      luCanon = luCanon + a
-      luI = luI + 1
-    }
-    if luChanged {
-      let li = 0
-      while li < rlElemName.length {
-        if rlElemName[li] == luCanon { return li }
-        li = li + 1
-      }
-    }
+  const key = repElemKeyOfName(name)
+  let ci = 0
+  while ci < rlElemName.length {
+    if rlElemKey[ci] == key { return ci }
+    ci = ci + 1
   }
   const qn = nullablePartOf(name)
   let qBase = name
