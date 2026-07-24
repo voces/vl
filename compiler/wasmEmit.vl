@@ -332,6 +332,7 @@ import {
   mapTypeIdxOf,
   mvValElemHeapOf,
   mvValsBackOf,
+  nulScalarListFieldWrapHeap,
   nulScalarListWrapHeap,
   wSLEB,
   wU8,
@@ -430,6 +431,7 @@ import {
   ifExprRefSlot,
   ifExprValtype,
   internAtom,
+  isNulScalarListFieldCode,
   isNulScalarListKind,
   isUName,
   lastStmtIsValueIf,
@@ -480,6 +482,7 @@ import {
   nliNameOf,
   nulMapShapeOf,
   nulScalarListBuildKind,
+  nulScalarListCodeKind,
   nulScalarListKindOfNode,
   objVariantName,
   optChainStructIdxOf,
@@ -740,6 +743,15 @@ export function pushFieldStorage(code: i32, refSlot: i32) {
     // code 4, with NULLABLE storage — the field genuinely carries null.
     wU8(99) // 0x63 (ref null ht)
     wSLEB(lTypeIdx)
+  } else if isNulScalarListFieldCode(code) {
+    // A NULLABLE DISTINCT-BACKING scalar-list field (`string[] | null` 31, `f64[] | null`
+    // 32, `i64[] | null` 33, `f32[] | null` 34): the SAME leaf wrapper the non-null field
+    // codes 6/25/26/27 reference, with NULLABLE storage — the distinct-backing dual of
+    // code 18. The wrapper is a global SINGLETON per leaf (no per-field slot to resolve),
+    // and the field pass forces its backing pair (`forceScalarListField` + the code-31
+    // string-list arm), so the index always resolves.
+    wU8(99) // 0x63 (ref null ht)
+    wSLEB(nulScalarListFieldWrapHeap(code))
   } else if code == 28 {
     // A NULLABLE REF-LIST field (`S[] | null` / `(i32|null)[] | null`): a NULLABLE ref to the element's
     // ref-list wrapper — the ref-list analogue of code 18. `refSlot` is the element ref-list slot.
@@ -809,6 +821,12 @@ function emitOmittedFieldNull(_body: i32[], si: i32, fi: i32, scode: i32) {
   }
   if scode == 18 {
     fbRefNull(lTypeIdx) // ref.null $lTypeIdx (i32[] | null)
+    return 0
+  }
+  if isNulScalarListFieldCode(scode) {
+    // A NULLABLE DISTINCT-BACKING scalar-list field omitted -> `ref.null $leafWrapper`
+    // (codes 31/32/33/34 — the distinct-backing dual of code 18's `$lTypeIdx`).
+    fbRefNull(nulScalarListFieldWrapHeap(scode))
     return 0
   }
   if scode == 28 {
@@ -970,6 +988,19 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         // A NULLABLE i32-list field value is an i32 list (subtypes the nullable slot) OR a
         // bare `null` -> `ref.null $lTypeIdx` (the `pendingNulRefHeap` seed; a list ignores it).
         pendingNulRefHeap = lTypeIdx
+      } else if isNulScalarListFieldCode(scode) {
+        // A NULLABLE DISTINCT-BACKING scalar-list field (codes 31/32/33/34): a list-literal
+        // value builds the LEAF list (`pendingListKind` 3/4/6/7 — the same element coercion
+        // the non-null codes 6/25/26/27 seed, so `{f: [1, 2]}` of `{f: i64[] | null}` widens
+        // its bare ints to i64), and its non-null wrapper ref subtypes the nullable slot.
+        pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(scode))
+        // GATED on the field VALUE being a bare `null` (the #964 SEED-LEAK discipline, as
+        // code 28 above): un-gated, this whole-value wrapper seed would leak into the array
+        // literal's ELEMENT context and type a `{f: [null]}` element as `ref.null $wrapper`.
+        const nslV = P.nodes[unwrapParen(valIx)]
+        if nslV is NullLit {
+          pendingNulRefHeap = nulScalarListFieldWrapHeap(scode)
+        }
       } else if scode == 28 {
         // A NULLABLE ref-list field value is a list (build it THROUGH the element slot, like code 5) OR a
         // bare `null` -> `ref.null $wrapper` (the `pendingNulRefHeap` seed; a list value ignores it).

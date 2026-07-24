@@ -1316,6 +1316,11 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
       }
     }
   }
+  // A FIELD read of a nullable distinct-backing scalar list (`s.f` where `f: i64[]|null`,
+  // codes 31/32/33/34) yields the leaf's `(ref null $wrapper)` — so an un-annotated
+  // `const l = s.f` binds the matching nullable local kind and `l != null` narrows it.
+  // The distinct-backing dual of `exprNullableList`'s code-18 Member arm.
+  if e is Member { return nulScalarListCodeKind(memberFieldCode(exprIx, fnIx)) }
   // Indexing a `(f64[] | null)[]` (a kind-6/7/8/10 ref list whose element slot keeps the
   // `| null`) yields the NULLABLE leaf list — the read left it `(ref null $wrapper)`, so
   // `const t = xs[i]; if t != null` narrows to the leaf list. The distinct-backing dual
@@ -6822,14 +6827,23 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
     // GRADUATED the whole-span nullable spelling from a loud reject to working code
     // in both the param and the return position — witness
     // `structs/nullable-declared-twin-whole-span-annotation.vl`.
-    // A NULLABLE DISTINCT-BACKING SCALAR-LIST field spelling (`f64[] | null`,
-    // `i64[] | null`, `f32[] | null`, `string[] | null`) has NO field code at all —
-    // code 18 covers only the i32-backed leaf, code 28 only ref elements — so NO
-    // candidate layout can hold it: a PROVEN mismatch against every code, keeping the
-    // shape un-matched and the consumer failing LOUDLY. Without this, the lenient
-    // `want < 0` fall-through let `{f: i64[] | null}` adopt a same-field-name
-    // literal's `{f: i32[]}` layout and store i64 elements into the i32 array —
-    // INVALID-WASM (fuzz frontier seed 70441494 d4 --branching).
+    // MEASURED VACUOUS (arm 4): a NULLABLE DISTINCT-BACKING SCALAR-LIST field spelling
+    // (`f64[] | null`, `i64[] | null`, `f32[] | null`, `string[] | null`) used to have NO
+    // field code at all — code 18 covered only the i32-backed leaf, code 28 only ref
+    // elements — so this refuted it against EVERY candidate code, keeping the shape
+    // un-matched and the consumer failing LOUDLY. Without it the lenient `want < 0`
+    // fall-through let `{f: i64[] | null}` adopt a same-field-name literal's `{f: i32[]}`
+    // layout and store i64 elements into the i32 array — INVALID-WASM (fuzz frontier seed
+    // 70441494 d4 --branching).
+    // Those four spellings are now FIELD CODES 31/32/33/34 (`nulScalarListFieldCode`), so
+    // `want >= 0` for every one of them and this arm can only be reached with a candidate
+    // whose OWN code is unclassifiable (`code < 0`) — where the twin is already separated
+    // by `structFieldCodesEq`'s layout guard and `repRowOfName`'s canon key. Disable-diff
+    // measured on the code-31..34 landing: the 991-file `native-corpus-sweep` result is
+    // byte-identical with the arm removed, and a 25 200-program fuzz A/B (seeds 1-14 x
+    // depths 4,5,6 x {plain, --declared} x 300) produces an IDENTICAL shape set. Kept for
+    // one release as the conservative disposition (the arms-2/3 retirement convention);
+    // deleting it is a follow-up with that evidence already in hand.
     const tnul = nullablePartOf(t)
     if tnul != "" {
       if (
@@ -7540,6 +7554,37 @@ export function isNulScalarListKind(kind: VKind | null): boolean {
     kind == "nulf64list" ||
     kind == "nuli64list" ||
     kind == "nulf32list"
+}
+// The struct / variant FIELD code of a DISTINCT-backing nullable scalar-list spelling —
+// `string[] | null` 31 · `f64[] | null` 32 · `i64[] | null` 33 · `f32[] | null` 34 — or -1.
+// The FIELD-position mirror of the `nulScalarListKind` BINDING niche (and of the
+// `nullArrayArrElem` kind-6/7/8/10 list-ELEMENT position): each leaf keeps its OWN wrapper
+// heap type, so — unlike the i32-backed leaves, which all fold onto code 18's `$lTypeIdx` —
+// each spelling needs its own `(ref null $wrapper)` field code. One code per wrapper keeps
+// `structFieldCodesEq` splitting same-fieldset twins by their real emitted layout.
+// `nulScalarListWrapHeap` maps the kind back to the wrapper the storage type, the
+// omitted-field null and the whole-value null seed all reference.
+export function nulScalarListFieldCode(name: string) {
+  const k = nulScalarListKind(name)
+  if k == "nulstrlist" { return 31 }
+  if k == "nulf64list" { return 32 }
+  if k == "nuli64list" { return 33 }
+  if k == "nulf32list" { return 34 }
+  -1
+}
+// The nullable-scalar-list VKind behind FIELD code 31..34 — the inverse of
+// `nulScalarListFieldCode`, so the store/read/null paths recover the leaf's build kind
+// (`nulScalarListBuildKind`) and wrapper heap (`nulScalarListWrapHeap`) from the code alone.
+export function nulScalarListCodeKind(code: i32): VKind | null {
+  if code == 31 { return "nulstrlist" }
+  if code == 32 { return "nulf64list" }
+  if code == 33 { return "nuli64list" }
+  if code == 34 { return "nulf32list" }
+  null
+}
+// True if field code `c` is one of the four distinct-backing nullable-scalar-list codes.
+export function isNulScalarListFieldCode(c: i32): boolean {
+  c == 31 || c == 32 || c == 33 || c == 34
 }
 
 export function vtKindOfType(tyIx: i32): VKind {
@@ -8380,6 +8425,14 @@ export function forceScalarListField(code: i32) {
   if code == 25 { fa64Used = true }
   if code == 26 { ia64Used = true }
   if code == 27 { fa32Used = true }
+  // The NULLABLE twins (codes 32/33/34) ride the SAME leaf wrapper/backing pair — and are
+  // the more urgent case: a field that only ever holds `null` never builds a list literal,
+  // so nothing else in the module forces the pair and the field's `(ref null $wrapper)`
+  // storage type would reference an unallocated index. (Code 31's `string[] | null` pair is
+  // forced beside the code-6 string list, whose flags live outside this scalar trio.)
+  if code == 32 { fa64Used = true }
+  if code == 33 { ia64Used = true }
+  if code == 34 { fa32Used = true }
   0
 }
 
@@ -8436,6 +8489,12 @@ export function fieldTypeCode(tyIx: i32) {
     // value-union test (`i32[]` is not a value atom, so 16 never claims it).
     if nameIsNulI32List(ty.tyName) { return 18 }
     if nameIsNulRefList(ty.tyName) { return 28 }
+    // A NULLABLE DISTINCT-BACKING scalar-list field (`f64[] | null` 32, `i64[] | null` 33,
+    // `f32[] | null` 34, `string[] | null` 31): a `(ref null $leafWrapper)` slot — the field
+    // mirror of the same-named binding niche. Checked AFTER the ref-list arm so a spelling
+    // the ref-list layer already claims (`(string|null)[] | null`) keeps code 28's rep.
+    const nslF = nulScalarListFieldCode(ty.tyName)
+    if nslF >= 0 { return nslF }
     // A MAP-typed field (`children: {[string]: Tree}`) stores a non-null ref to
     // its value-type's map struct — code 19. The mv SLOT is interned by
     // `collectA`'s arena TypeRef scan (this same annotation node), so emission
@@ -9395,6 +9454,10 @@ export function nameFieldCode(t: string) {
   // A NULLABLE i32-list field (`rest: i32[] | null`) — code 18 (see fieldTypeCode).
   if nameIsNulI32List(t) { return 18 }
   if nameIsNulRefList(t) { return 28 }
+  // The DISTINCT-backing nullable scalar-list fields (codes 31/32/33/34) — the name-level
+  // mirror of `fieldTypeCode`'s arm, in the same order (after the ref-list claim).
+  const nslN = nulScalarListFieldCode(t)
+  if nslN >= 0 { return nslN }
   // The niche FIELDS: `string | null` (`(ref null $aTypeIdx)`, code 20) and
   // `boolean | null` (i32 sentinel, code 21) — before the value-union test (a single
   // ref/scalar + null is a niche, not a box).
@@ -9600,8 +9663,9 @@ export function internShapeDeep(nm: string) {
 // interns it identically), so the shape interns and the literal building it name-set-
 // matches THIS row instead of fieldset-colliding onto a same-fieldset twin (INVALID
 // WASM) or failing loudly ("no interned signature"). The DISTINCT-backing nullable
-// scalar lists (`f64[]|null` / `i64[]|null` / `f32[]|null` / `string[]|null`) have NO
-// field code at all (see `shapeFieldTypeCompat` arm 4) and stay a clean reject.
+// scalar lists (`f64[]|null` / `i64[]|null` / `f32[]|null` / `string[]|null`) are
+// codes 31/32/33/34 and lower the same way — each is the leaf list's own wrapper slot
+// made nullable, exactly what the field carries in any non-closure struct.
 function funcTypeFieldCodeSafe(c: i32): boolean {
   c == 0 ||
     c == 3 ||
@@ -9614,7 +9678,8 @@ function funcTypeFieldCodeSafe(c: i32): boolean {
     c == 24 ||
     c == 25 ||
     c == 26 ||
-    c == 27
+    c == 27 ||
+    isNulScalarListFieldCode(c)
 }
 
 // True if `nm` is a NESTED array bottoming out at a SCALAR/STRING leaf list —
@@ -9672,7 +9737,8 @@ function structElemArrayLowerable(t: string): boolean {
 // closure must stay a CLEAN reject (never invalid wasm), so the shape is not interned.
 // A code-18 i32-backed nullable scalar list (`i32[]|null` / `boolean[]|null`) IS
 // lowerable (`funcTypeFieldCodeSafe` admits it) — the same array+`|null` slot a
-// non-closure struct carries.
+// non-closure struct carries — and so are the four DISTINCT-backing nullable scalar
+// lists (codes 31/32/33/34), each a `(ref null $leafWrapper)` slot.
 // A NESTED-array field with a scalar/string leaf (`{f: boolean[][]}` — code 5, but its
 // element is a leaf LIST, no struct-through-list seam) IS lowerable: the field is a
 // plain ref-list slot the field pass interns like any binding's (the R4 dissolution).

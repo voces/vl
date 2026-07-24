@@ -57,11 +57,20 @@ const check = async (
   }
 };
 
-// Type-checks cleanly, fails the emitter (a nullable-list struct field has no rep).
+// Type-checks cleanly, fails the emitter (a closure whose result struct carries a
+// nullable REF-list field has no lowerable rep, so the call's sig never interns).
+// (The former `{ v: i32, xs: i64[] | null }` struct spelling lowers since the four
+// distinct-backing nullable scalar-list FIELD codes 31-34 landed.)
 const EMIT_ERROR_SRC =
-  `type Box = { v: i32, xs: i64[] | null }\n` +
-  `const b: Box = { v: 1, xs: null }\n` +
-  `print(b.v)\n`;
+  `function makeIt(): (i32) => {f: (i32 | null)[] | null} {\n` +
+  `  return (q0) => ({ f: [1, 2] })\n` +
+  `}\n` +
+  `function useIt() {\n` +
+  `  const v: (i32) => {f: (i32 | null)[] | null} = makeIt()\n` +
+  `  const s = v(1)\n` +
+  `  print(0)\n` +
+  `}\n` +
+  `useIt()\n`;
 
 // A normal, fully valid file — passes both the fast and the full path.
 const CLEAN_SRC = `let x = 1\nprint(x)\n`;
