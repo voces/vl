@@ -369,6 +369,25 @@ let holeAltTys: i32[] = []
 let holeAltPreN: i32[] = []
 let holeAltTailN: i32[] = []
 
+// The `is`-guard ALTERNATIVE rows (indices into `holeAlt*`) whose THEN-branch is
+// currently being checked. A `return` inside one is reached ONLY by an argument
+// that satisfies the alternative, so the type it contributes to the inferred
+// return is recorded as a GUARDED member (`?galt.` — see `mkGuardedRetTy`) rather
+// than as an unconditional one. Innermost row wins: dropping a member needs only
+// ONE guard proven false, and keeping it is always the sound direction.
+let guardAltStack: i32[] = []
+
+// Unions minted by `joinTys` that carry at least one HOLE member. `substTyDeep`
+// re-FOLDS such a union under a call's bindings instead of rebuilding it verbatim
+// (`refoldJoinUnion`): the members that RESOLVE are re-joined, and a member still
+// unresolved is DROPPED once some member did resolve — a `?fld.bar.<h>` that does
+// not resolve at a site whose pinned argument has no `bar` is a branch that
+// argument can never reach, and a `?galt.` guard member whose alternative the
+// pinned argument cannot satisfy is a branch it can never take. Without the
+// re-fold every hole-joined return would surface as a `A | B` union at sites where
+// exactly one arm is live, breaking programs that lower fine today.
+let joinHoleUnions: i32[] = []
+
 // DEFERRED binary-op constraints over un-annotated-param holes. When `a + b` / `s + "!"` / `n < 2`
 // has a HOLE operand, its validity can't be decided in the body (a hole is permissively assignable
 // to string AND numeric, so the eager check greedily picks a branch). Record `(lt, op, rt)`; the
@@ -1680,6 +1699,8 @@ export function initChecker() {
   holeAltTys = []
   holeAltPreN = []
   holeAltTailN = []
+  guardAltStack = []
+  joinHoleUnions = []
   binCstrLt = []
   binCstrOp = []
   binCstrRt = []
@@ -3432,6 +3453,221 @@ function joinTys(a: i32, b: i32) {
   }
   if hasNull { return mkNullableTy(res) }
   res
+}
+
+// The RETURN-inference join (`noteInferredRet` only — NOT the general `joinTys`).
+//
+// SOUNDNESS — a HOLE must not collapse HERE. An inference hole is PERMISSIVELY
+// assignable both ways, so `joinTys`'s mutual-assignability collapse silently picks
+// one side and DROPS the other. A function whose returns join a guard-narrowed value
+// with a hole-derived field —
+//     function foobar(v) {
+//       if v is {foo: string} then return v.foo   // `string`
+//       return v.bar                              // `?fld.bar.?foobar.0`
+//     }
+// — then advertised plain `string` to EVERY call site while the emitter lowered the
+// field's real type: `printString(foobar({bar: 42}))` reported no errors and emitted
+// invalid wasm (an i32 in a `(ref $type)` slot). Keeping both sides as a DEFERRED
+// JOIN hands the choice to the call site, where `substTyDeep` re-folds the members
+// under the pinned argument (`refoldJoinUnion`).
+//
+// Deliberately scoped to the return accumulator. A deferred join is a checker-internal
+// placeholder with NO runtime shape, so every path that could hand one to the emitter
+// has to collapse it again (`collapseDeferredJoin` at the call site); widening
+// `joinTys` itself put one on every value-`if` and let it escape as a node type, which
+// the emitter classified as a real union box — invalid wasm for programs that worked.
+function joinRetTys(a: i32, b: i32) {
+  if a < 0 { return b }
+  if b < 0 { return a }
+  if a == b { return a }
+  if !tyIsHole(a) && !tyIsHole(b) { return joinTys(a, b) }
+  const kept: i32[] = []
+  flattenVariantsInto(a, kept)
+  flattenVariantsInto(b, kept)
+  const uniq: i32[] = []
+  let i = 0
+  while i < kept.length {
+    let dup = false
+    let j = 0
+    while j < uniq.length {
+      if uniq[j] == kept[i] { dup = true }
+      j = j + 1
+    }
+    if !dup { uniq.push(kept[i]) }
+    i = i + 1
+  }
+  if uniq.length == 1 { return uniq[0] }
+  const res = mkUnionTy(uniq)
+  joinHoleUnions.push(res)
+  res
+}
+
+// Collapse a DEFERRED JOIN that is about to ESCAPE the checker (a call's result type,
+// which becomes a node type the emitter reads). Re-joining through the ordinary
+// `joinTys` restores exactly the pre-change collapse, so an unresolvable join — a
+// generic body calling a generic body, where the members name a hole this site does
+// not bind — behaves as it always did instead of reaching codegen as a union the
+// emitter has no rep for. Anything that is not a deferred join passes through.
+function collapseDeferredJoin(tyIx: i32) {
+  if !tyIsDeferredJoin(tyIx) { return tyIx }
+  const t = T.tys[tyIx]
+  if t is TyUnion {
+    let res = -1
+    let i = 0
+    while i < t.uMembers.length {
+      res = joinTys(res, t.uMembers[i])
+      i = i + 1
+    }
+    if res >= 0 { return res }
+  }
+  tyIx
+}
+
+function isJoinHoleUnion(tyIx: i32) {
+  let k = 0
+  while k < joinHoleUnions.length {
+    if joinHoleUnions[k] == tyIx { return true }
+    k = k + 1
+  }
+  false
+}
+
+// A type that is (or wraps) a DEFERRED join — a union still carrying a hole
+// member. It denotes no runtime shape of its own: each call site re-folds it to
+// the single arm that site's pinned argument reaches, so the codegen-support
+// floors that reject a genuine inferred union must skip it.
+function tyIsDeferredJoin(tyIx: i32) {
+  if tyIx < 0 { return false }
+  const t = T.tys[tyIx]
+  if t is TyNullable { return tyIsDeferredJoin(t.nInner) }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if tyIsHole(t.uMembers[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// The BASE hole a DERIVED member-read hole reads from: `?fld.<prop>.<h>` and
+// `?galt.<inner>.<alt>.<h>` both bottom out at `<h>` (and nest — `?fld.b.?fld.a.?h`).
+// Any other name (including a plain param hole, `?ret.` and `?elem.`) is returned
+// unchanged, which is how `holeMemberDeadAt` tells "this member is a read off a
+// pinned argument" from "this member IS an argument".
+function holeBaseName(name: string) {
+  if name.length > 5 {
+    if name.slice(0, 5) == "?fld." {
+      const rest = name.slice(5, name.length)
+      const d = dotIndexFrom(rest, 0)
+      if d > 0 { return holeBaseName(rest.slice(d + 1, rest.length)) }
+    }
+    if name.slice(0, 6) == "?galt." {
+      const restG = name.slice(6, name.length)
+      const g1 = dotIndexFrom(restG, 0)
+      if g1 >= 0 {
+        const g2 = dotIndexFrom(restG, g1 + 1)
+        if g2 >= 0 { return holeBaseName(restG.slice(g2 + 1, restG.length)) }
+      }
+    }
+  }
+  name
+}
+
+// SOUNDNESS GATE on the re-fold. Is deferred-join member `mIx` PROVABLY dead under
+// these bindings — a branch the pinned argument can never take?
+//
+// Only a DERIVED member-read hole can be proven dead, and only against a CONCRETE
+// pin: `?fld.bar.<h>` where `h` is pinned to an object with no `bar` (the read has
+// no meaning, so that return never runs), or `?galt.…` whose guard the pin cannot
+// satisfy. Everything else is LIVE — in particular a member that merely resolved to
+// ANOTHER hole (`pick(x, "s", true)` inside a generic body binds `?pick.0` to the
+// enclosing `?go.0`) is still undecided, not dead.
+//
+// Treating "still a hole after substitution" as dead — the first cut of this fix —
+// was itself a soundness hole: `printString(pick(x, "s", true))` dropped the `?go.0`
+// arm, reported plain `string`, recorded NO deferred argument constraint, and
+// emitted invalid wasm for `go(1)` — a spelling the pre-existing collapse CAUGHT.
+function holeMemberDeadAt(mIx: i32, bNames: string[], bTys: i32[]) {
+  if mIx < 0 { return false }
+  const t = T.tys[mIx]
+  if !(t is TyVar) { return false }
+  const base = holeBaseName(t.tvName)
+  if base == t.tvName {
+    return false // not a derived read — never provably dead
+  }
+  const pin = substHoleByName(base, bNames, bTys)
+  if pin < 0 {
+    return false // the base is not pinned here — defer
+  }
+  if tyIsHole(pin) {
+    return false // pinned to another hole — still undecided
+  }
+  // The base IS concrete, yet the derived read does not resolve: this branch cannot
+  // be reached by this argument.
+  substHoleByName(t.tvName, bNames, bTys) < 0
+}
+
+// Re-fold a deferred join under a call's bindings: drop every PROVABLY DEAD member
+// (`holeMemberDeadAt`) and re-join the rest, so a call site where exactly one arm is
+// live sees that arm's type rather than a spurious `A | B`. A member that is merely
+// unresolved SURVIVES — the join stays deferred and re-folds again at the call site
+// that finally pins it. Returns `tyIx` unchanged when nothing was dropped and no
+// member changed (a concrete type keeps its arena identity).
+function refoldJoinUnion(
+  tyIx: i32,
+  orig: i32[],
+  subst: i32[],
+  changed: boolean,
+  bNames: string[],
+  bTys: i32[],
+) {
+  let anyDead = false
+  let i = 0
+  while i < orig.length {
+    if holeMemberDeadAt(orig[i], bNames, bTys) { anyDead = true }
+    i = i + 1
+  }
+  if !anyDead && !changed { return tyIx }
+  let res = -1
+  let live = 0
+  let j = 0
+  while j < orig.length {
+    if !holeMemberDeadAt(orig[j], bNames, bTys) {
+      res = joinTys(res, subst[j])
+      live = live + 1
+    }
+    j = j + 1
+  }
+  // Every arm proven dead is not a type — keep the union rather than invent one.
+  if live == 0 || res < 0 { return mkUnionTy(subst) }
+  res
+}
+
+// Index of the first '.' in `s` at or after `from`, or -1. (Derived-hole names
+// pack integer fields ahead of the base hole name, which may itself contain dots.)
+function dotIndexFrom(s: string, from: i32) {
+  let i = from
+  while i < s.length {
+    if s[i] == '.' { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// The non-negative decimal value of an ALL-DIGIT string, or -1 for anything else.
+function decValOf(s: string) {
+  if s.length == 0 { return -1 }
+  let v = 0
+  let i = 0
+  while i < s.length {
+    const c = s[i]
+    if c < '0' || c > '9' { return -1 }
+    v = v * 10 + (c - '0')
+    i = i + 1
+  }
+  v
 }
 
 // Whether the expression is a bare `true`/`false` literal (through parens) —
@@ -6019,6 +6255,20 @@ function holeShapeFieldCount(name: string) {
   0
 }
 
+// The `holeAlt*` row hole `name` already carries for tested type `ty`, or -1.
+// Keyed by the RENDERED type for the same reason `noteHoleAlt` is: every pass over
+// the body re-resolves the `is` annotation to a FRESH arena entry.
+function holeAltRowOf(name: string, ty: i32) {
+  if ty < 0 { return -1 }
+  const key = tyToStr(ty)
+  let i = 0
+  while i < holeAltNames.length {
+    if holeAltNames[i] == name && tyToStr(holeAltTys[i]) == key { return i }
+    i = i + 1
+  }
+  -1
+}
+
 // Register an `is`-guard ALTERNATIVE `ty` for hole `name`, with the fields
 // demanded so far (reached before the guard) pinned as its required prefix.
 // Returns the new row's index so the guard can patch `holeAltTailN` once its arms
@@ -6292,8 +6542,10 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
 // CONCRETE param type `exp` of callee `who`. Idempotent per (at, exp) pair. An `exp` that
 // still carries a hole is NOT recorded — after `bindGenWalk`+`substTyDeep` at the inner
 // call it could only be one of the enclosing body's own holes, and that hole's demands
-// surface through its own bindings instead.
+// surface through its own bindings instead. Same for an `exp` that is a DEFERRED JOIN:
+// it is not yet a type, so there is nothing to hold the argument to.
 function noteArgCstr(at: i32, exp: i32, who: string) {
+  if tyIsDeferredJoin(exp) { return 0 }
   let k = 0
   while k < argCstrAt.length {
     if argCstrAt[k] == at && argCstrExp[k] == exp { return 0 }
@@ -6314,8 +6566,10 @@ function validateArgCstrs(bNames: string[], bTys: i32[], ix: i32) {
   while ci < argCstrAt.length {
     const rat = substTyDeep(argCstrAt[ci], bNames, bTys)
     const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
-    if !tyIsHole(rat) {
-      if !tyIsHole(rexp) {
+    // A side still carrying a hole — bare, or as a DEFERRED JOIN arm — is undecided
+    // at this site and defers to the call that pins it.
+    if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
+      if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
         if !assignable(rat, rexp) {
           let who = argCstrWho[ci]
           if who == "" { who = "a call" } else { who = "`" + who + "`" }
@@ -6344,8 +6598,8 @@ function argCstrsHold(bNames: string[], bTys: i32[]) {
   while ci < argCstrAt.length {
     const rat = substTyDeep(argCstrAt[ci], bNames, bTys)
     const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
-    if !tyIsHole(rat) {
-      if !tyIsHole(rexp) {
+    if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
+      if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
         if !assignable(rat, rexp) { return false }
       }
     }
@@ -6419,6 +6673,25 @@ function holeMemberTy(holeName: string, prop: string) {
   TY_ERR
 }
 
+// A GUARDED return member: `?galt.<innerTyIx>.<altTyIx>.<hole>` — the type a
+// `return` inside an `is`-guard's then-branch contributes, reachable ONLY by an
+// argument that satisfies the guard's tested type. Both fields are stable arena
+// indices, so the name survives the `holeAlt*` table being truncated. Minted only
+// for a CONCRETE branch type (a hole one needs no wrapper: it already defers).
+function mkGuardedRetTy(t: i32) {
+  if t < 0 { return t }
+  if tyIsHole(t) { return t }
+  if guardAltStack.length == 0 { return t }
+  const row = guardAltStack[guardAltStack.length - 1]
+  if row < 0 { return t }
+  if row >= holeAltNames.length { return t }
+  const altTy = holeAltTys[row]
+  if altTy < 0 { return t }
+  mkTyVar(
+    "?galt." + i32ToStr(t) + "." + i32ToStr(altTy) + "." + holeAltNames[row],
+  )
+}
+
 // Resolve a (possibly DERIVED) hole NAME against a call's bindings: a direct
 // binding wins; `?ret.<h>` collapses to the pinned function's return (the
 // host's instantiate-and-collapse — keeps `inferred-return-soundness`
@@ -6428,6 +6701,30 @@ function substHoleByName(name: string, bNames: string[], bTys: i32[]) {
   const b = bindOf(bNames, bTys, name)
   if b >= 0 { return b }
   if name.length > 5 {
+    // `?galt.<inner>.<alt>.<hole>` — a guarded return member (`mkGuardedRetTy`).
+    // The pinned argument decides REACHABILITY: it satisfies the guard's tested
+    // type, so the branch's type is this member's value; it cannot, so the branch
+    // is dead here and the member stays unresolved (the deferred-join re-fold then
+    // drops it). An unpinned hole defers, exactly like every other derived hole.
+    if name.slice(0, 6) == "?galt." {
+      const restG = name.slice(6, name.length)
+      const g1 = dotIndexFrom(restG, 0)
+      if g1 < 0 { return -1 }
+      const gInner = decValOf(restG.slice(0, g1))
+      const g2 = dotIndexFrom(restG, g1 + 1)
+      if g2 < 0 { return -1 }
+      const gAlt = decValOf(restG.slice(g1 + 1, g2))
+      if gInner < 0 || gAlt < 0 { return -1 }
+      const gPin = substHoleByName(
+        restG.slice(g2 + 1, restG.length),
+        bNames,
+        bTys,
+      )
+      if gPin < 0 { return -1 }
+      if tyIsHole(gPin) { return -1 }
+      if holeAssignOk(-1, gPin, gAlt) { return gInner }
+      return -1
+    }
     if name.slice(0, 5) == "?ret." {
       const inner = substHoleByName(name.slice(5, name.length), bNames, bTys)
       if inner >= 0 {
@@ -6625,7 +6922,15 @@ function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       out3.push(m2)
       u = u + 1
     }
-    if changed3 { res = mkUnionTy(out3) }
+    // A DEFERRED join (a union `joinTys` minted over a hole member) re-folds: every
+    // PROVABLY DEAD member is dropped and the rest re-joined. Checked even when no
+    // member CHANGED — a `?fld.bar.<h>` whose pin has no `bar` is dead precisely
+    // because it did not resolve. Any other union rebuilds verbatim, as before.
+    if isJoinHoleUnion(tyIx) {
+      res = refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
+    } else if changed3 {
+      res = mkUnionTy(out3)
+    }
   } else if t is TyMap {
     const k2 = substTyDeep(t.mKey, bNames, bTys)
     const v2 = substTyDeep(t.mVal, bNames, bTys)
@@ -7582,7 +7887,13 @@ function checkCallNode(n: Call, ix: i32) {
       // Record the demand; the generic call site that pins the hole re-validates
       // it under the substituted argument types (the deferred binary-op-constraint
       // pattern), so `function f(x) { g(x) }` with `g(n: i32)` rejects `f("s")`.
-      if tyIsHole(at) {
+      //
+      // A DEFERRED JOIN argument (`pick(x, "s", true)` — a union still carrying a
+      // hole arm) is vacuous here for the SAME reason: `assignable` accepts it
+      // because its hole arm accepts anything. It must record the demand too, or the
+      // whole spelling type-checks clean and dies at wasm validation. This is the
+      // net for the arms this PR stopped collapsing.
+      if tyIsHole(at) || tyIsDeferredJoin(at) {
         if !tyIsHole(expected) {
           let ccWho = ""
           if cfn is Ident { ccWho = cfn.identName }
@@ -7646,7 +7957,11 @@ function checkCallNode(n: Call, ix: i32) {
       validateArgCstrs(bNames, bTys, ix)
       retTy = substTyDeep(retTy, bNames, bTys)
     }
-    return retTy
+    // A DEFERRED JOIN the re-fold could not decide here (the callee's arms name a
+    // hole THIS site does not bind — a generic body calling a generic body) must not
+    // ESCAPE as this call's type: the emitter reads node types and has no rep for a
+    // placeholder union. Collapse it back to the pre-change behavior.
+    return collapseDeferredJoin(retTy)
   }
   if ft is TyErr { return TY_ERR }
   if ft is TyVar {
@@ -7764,10 +8079,14 @@ function noteInferredRet(t: i32) {
   // `flattenType(Union(...))`), so the caller sees the true type. First-wins silently
   // dropped later branches — the checker then mis-typed a `!= null` compare or let a
   // string flow through an i32 result and crash codegen.
+  // A return reached only through an `is`-guard over a HOLE param contributes a
+  // GUARDED member, so the call site can tell whether its pinned argument reaches
+  // this branch at all (`mkGuardedRetTy` / `substHoleByName`'s `?galt.` arm).
+  const g = mkGuardedRetTy(t)
   if inferObserved < 0 {
-    inferObserved = t
+    inferObserved = g
   } else {
-    inferObserved = joinTys(inferObserved, t)
+    inferObserved = joinRetTys(inferObserved, g)
   }
   0
 }
@@ -8893,10 +9212,16 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     // annotated path), so it does NOT floor. Only a union/nullable the emitter still
     // can't box un-annotated — struct-ref unions, `boolean | null` / `string | null`
     // niches — hits the floor.
+    // A DEFERRED join (a union `joinTys` minted over an inference HOLE — see
+    // `joinHoleUnions`) is NOT a union the emitter ever lowers: it is a placeholder
+    // that collapses to ONE arm at each call site, where `substTyDeep` re-folds it
+    // under the pinned argument. Flooring it here would reject the very
+    // `is`-guard-over-a-hole spelling `inference/hole-is-guard-alternative.vl` pins.
     if (
       !inferQuiet &&
       n.fnName != "" &&
       inferred >= 0 &&
+      !tyIsDeferredJoin(inferred) &&
       valueUnionRetName(inferred) == ""
     ) {
       const itt = T.tys[inferred]
@@ -9152,12 +9477,16 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // call, and `emitReturnValue` encodes the member literal as its atom id (`retLitUnion`).
         if unm == "" { unm = litUnionAliasNameOfTy(inferred) }
       }
+      // A DEFERRED JOIN is a per-call-site placeholder, not a shape the emitter can
+      // classify a return by — see the named-function twin in `elaborateInferRets`.
       if recordable || unm != "" {
-        const nodeKey = "#" + i32ToStr(fnIx)
-        if inferRetNameOf(nodeKey) == "" {
-          let rty = unm
-          if recordable { rty = anm }
-          recordInferRet(nodeKey, rty, inferred)
+        if !tyIsDeferredJoin(inferred) {
+          const nodeKey = "#" + i32ToStr(fnIx)
+          if inferRetNameOf(nodeKey) == "" {
+            let rty = unm
+            if recordable { rty = anm }
+            recordInferRet(nodeKey, rty, inferred)
+          }
         }
       }
     }
@@ -11428,13 +11757,21 @@ export function checkProgram(rootIx: i32) {
           // `TyVar` hole): their return is per-call-site, so the definition-time
           // inferred type is a placeholder that renders to a misleading name (e.g.
           // `sumsq(self)` → `string`). Only a fully concrete signature is elaborated.
+          // A DEFERRED JOIN return is generic for exactly the same reason — it is a
+          // placeholder that collapses to one arm per call site, NOT a union the
+          // emitter should register a box for. Exporting it made the emitter classify
+          // `function relay(x) { return pick(x, "s", true) }` as returning a value
+          // union while the body returned the plain arm — a module that fails
+          // validation ("expected (ref 2), got (ref 0)").
           let generic = false
           const ert0 = T.tys[er]
           if ert0 is TyVar { generic = true }
+          if tyIsDeferredJoin(er) { generic = true }
           let gp = 0
           while gp < eftt.fnParamTypes.length {
             const pt = T.tys[eftt.fnParamTypes[gp]]
             if pt is TyVar { generic = true }
+            if tyIsDeferredJoin(eftt.fnParamTypes[gp]) { generic = true }
             gp = gp + 1
           }
           if !generic && er >= 0 && er != TY_VOID && er != TY_ERR {
@@ -14361,6 +14698,11 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // COMPLEMENT path's fields alone and reject the argument the guard accepts.
   // Registered BEFORE the branch scope is pushed, so `lookup` still sees the hole.
   const altRows: i32[] = []
+  // The rows this guard tests, INCLUDING ones a previous pass over the same body
+  // already registered (`noteHoleAlt` reports only NEW rows, so its tail-patch stays
+  // first-pass-only). The guarded-return marking must fire on every pass — the real
+  // pass is the one whose `noteInferredRet` witnesses reach the call site.
+  const guardRows: i32[] = []
   let ai = 0
   while ai < tnNames.length {
     if !isPathKey(tnNames[ai]) {
@@ -14369,7 +14711,13 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
         const cur = T.tys[curIx]
         if cur is TyVar {
           const row = noteHoleAlt(cur.tvName, tnTys[ai])
-          if row >= 0 { altRows.push(row) }
+          if row >= 0 {
+            altRows.push(row)
+            guardRows.push(row)
+          } else {
+            const seen = holeAltRowOf(cur.tvName, tnTys[ai])
+            if seen >= 0 { guardRows.push(seen) }
+          }
         }
       }
     }
@@ -14380,7 +14728,13 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
     applyNarrows(tnNames, tnTys)
   }
   retTailPos = ifTail
+  // Every `return` lowered under this branch is reached ONLY by an argument that
+  // satisfies the guard's alternative — mark the branch so `noteInferredRet` records
+  // its contribution as a GUARDED member (see `guardAltStack`).
+  const guardedRet = guardRows.length > 0
+  if guardedRet { guardAltStack.push(guardRows[guardRows.length - 1]) }
   checkNode(n.ifThen)
+  if guardedRet { guardAltStack.pop() }
   retTailPos = false
   const thenTy = blockTailTy
   if tnNames.length > 0 { popScope() }
@@ -14394,7 +14748,13 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // unresolved TY_ERR (a recursive call with no base case seeded yet) must not be
   // mistaken for the return type, or a void procedure infers a spurious value/error.
   if ifTail && n.ifElse >= 0 {
-    if thenTy != TY_VOID && thenTy != TY_ERR { noteInferredRet(thenTy) }
+    if thenTy != TY_VOID && thenTy != TY_ERR {
+      // The then-arm's implicit-return value is guarded exactly like an explicit
+      // `return` inside it (`if v is T then v.foo else v.bar`).
+      if guardedRet { guardAltStack.push(guardRows[guardRows.length - 1]) }
+      noteInferredRet(thenTy)
+      if guardedRet { guardAltStack.pop() }
+    }
   }
   // Surviving paths' end-states, each as an unassigned snapshot. Seed with the
   // then-branch end if it survived.
