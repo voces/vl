@@ -23,6 +23,7 @@ import {
   isInferLetNulStr,
   isTopLevelFuncTypeName,
   isValueUnionName,
+  litUnionAliasNameOfTy,
   nameIsFuncTypeAtom,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
@@ -60,6 +61,7 @@ import {
   recordClonedNodeTy,
   splitUnionAtoms,
   tyIsLitUnion,
+  tyToEmitName,
   unionMemberCount,
   valueAtomKind,
 } from "./typecheck"
@@ -5537,17 +5539,16 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
           const mcty = nodeTyIxOf(c.callFn)
           if mcty >= 0 {
             if T.tys[mcty] is TyFunc {
-              const mtn = nodeTyName(c.callFn)
-              if mtn != "" && annArrowAt(mtn) >= 0 {
-                const mtk = annSigKey(mtn)
-                // Only an INTERNED divergent key overrides: the checker render can
-                // spell a benign twin of the interned key (an inline shape vs its
-                // nominal — the closure-array-field-literal canary), and an
-                // un-interned key would turn a working call into a loud
-                // "no interned signature".
-                if mtk != "" && mtk != mfk {
-                  if cloSigPosOfKey(mtk) >= 0 { return mtk }
-                }
+              // D3: key the callee's arena functype DIRECTLY (`sigKeyOfTy`) — the
+              // destringified dual of `nodeTyName` → `annSigKey`, walking the `TyFunc`
+              // spine rather than rendering a name and re-parsing it.
+              const mtk = sigKeyOfTy(mcty)
+              // Only an INTERNED divergent key overrides: the arena key can be a
+              // benign twin of the interned key (an inline shape vs its nominal —
+              // the closure-array-field-literal canary), and an un-interned key
+              // would turn a working call into a loud "no interned signature".
+              if mtk != "" && mtk != mfk {
+                if cloSigPosOfKey(mtk) >= 0 { return mtk }
               }
             }
           }
@@ -5561,17 +5562,16 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
         if k != "" { return k }
       }
     }
-    // GENERAL FALLBACK — derive the key from the callee's CHECKER type, uniformly for ANY callee the
-    // syntactic resolvers miss (an indexed closure-array element returning a struct/union, a value
-    // INFERRED from a factory call `const g = mk()`). `nodeTyName` renders the closure's `(params)=>ret`
-    // name (the checker proved its TyFunc), then the SAME `annSigKey` the annotation path uses produces
-    // a byte-identical key — so the call-site `ref.cast` resolves the functype the lambda interned, with
-    // no per-position sig producer. Off the hot path: reached only after the syntactic resolvers, so a
-    // common closure call (annotated binding/param) never renders.
-    const tn = nodeTyName(c.callFn)
-    if tn != "" {
-      if annArrowAt(tn) >= 0 { return annSigKey(tn) }
-    }
+    // GENERAL FALLBACK — derive the key from the callee's CHECKER arena type, uniformly for ANY
+    // callee the syntactic resolvers miss (an indexed closure-array element returning a struct/union,
+    // a value INFERRED from a factory call `const g = mk()`). `sigKeyOfTy` (destringify D3) walks the
+    // `TyFunc` spine of `nodeTyIxOf(c.callFn)` directly — the byte-identical dual of the former
+    // `nodeTyName` → `annSigKey` render+reparse — so the call-site `ref.cast` resolves the functype
+    // the lambda interned, with no per-position sig producer and no fragile whole-string spine scan.
+    // Off the hot path: reached only after the syntactic resolvers, so a common closure call
+    // (annotated binding/param) never reaches it. "" for a non-function callee (the arity fallback).
+    const ck = sigKeyOfTy(nodeTyIxOf(c.callFn))
+    if ck != "" { return ck }
   }
   ""
 }
@@ -16249,6 +16249,59 @@ function annSigKey(name: string) {
     }
   }
   const rc = annRetKind(retStr)
+  if rc == "" { return "" }
+  key + rc
+}
+
+// The `$fnsig` KEY of a FUNCTION-TYPE ARENA type `funcTyIx` (a `TyFunc`) — the destringify-D3
+// dual of `annSigKey(nodeTyName(node))`. Instead of RENDERING the whole functype to a NAME and
+// re-parsing its STRUCTURE (`annArrowAt` to find the separator, `annSplitParams` to cut the
+// params, the paren-peel — the fragile whole-string spine scan the `$fnsig` twins historically
+// came from), it walks the arena SPINE directly: the `fnParamTypes` array and `fnRet`. Each
+// LEAF is classified by the SAME `annParamKind` / `annRetKind` the string path uses, on the
+// leaf's own emit render — so the two producers cannot diverge on leaf classification, and the
+// STRUCTURAL decisions (arity, which slot is the return) come from the arena, not a scan.
+//
+// Byte-identical to `annSigKey(tyToEmitName(funcTyIx))` by construction: `tyToEmitName`'s TyFunc
+// arm builds the whole as `(` + join(param renders, `,`) + `)=>` + the return render, and
+// `annSplitParams` (paren/brace/bracket-depth aware) recovers exactly those leaf renders. The
+// return render mirrors that arm EXACTLY — a litunion ALIAS is preserved (`() => K0` keys the
+// i32-atom `>i`, not the softened `string`'s `>S`) and a function-type result keeps its grouping
+// parens (one result token). "" for a non-function type, or any leaf outside the value-call ABI
+// (the same "" the string path yields → the all-i32 arity fallback / soundness floor).
+export function sigKeyOfTy(funcTyIx: i32): string {
+  if funcTyIx < 0 { return "" }
+  const t = T.tys[funcTyIx]
+  if !(t is TyFunc) { return "" }
+  let key = ""
+  let i = 0
+  while i < t.fnParamTypes.length {
+    const pnm = tyToEmitName(t.fnParamTypes[i])
+    if pnm == "" { return "" }
+    const pc = annParamKind(pnm)
+    if pc == "" { return "" }
+    key = key + pc
+    i = i + 1
+  }
+  // The RETURN render, mirroring `tyToEmitName`'s TyFunc arm (see the doc-comment): the
+  // litunion-alias preservation is what keeps a `() => K0` closure keying `>i` on BOTH producers
+  // (a raw `tyToEmitName(fnRet)` would soften the alias to `string` and key `>S`), and the
+  // function-type paren-wrap keeps a curried result a single `>c`/nested token.
+  let rs = ""
+  const rtn = T.tys[t.fnRet]
+  if rtn is TyNullable {
+    const nal = litUnionAliasNameOfTy(rtn.nInner)
+    if nal != "" { rs = nal + "|null" }
+  }
+  if rs == "" {
+    const bal = litUnionAliasNameOfTy(t.fnRet)
+    if bal != "" { rs = bal }
+  }
+  if rs == "" { rs = tyToEmitName(t.fnRet) }
+  if rs == "" { return "" }
+  const rt = T.tys[t.fnRet]
+  if rt is TyFunc { rs = "(" + rs + ")" }
+  const rc = annRetKind(rs)
   if rc == "" { return "" }
   key + rc
 }
