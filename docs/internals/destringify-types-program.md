@@ -182,6 +182,61 @@ byte-identical; additive probe 0 disagreements; fuzz A/B identical.
 Re-key on the arena signature. **ABI-affecting** — run-diff, not byte-identity, and the
 corpus + fuzz A/B are the gate.
 
+### D-UNION — the union MEMBER-SET layer (`unMemberSet`) — foundation + batch 1 SHIPPED
+
+`unionMemberSetOf(name)` hands out a pipe-joined member STRING and ~21 consumers then
+`splitUnionAtoms` it and re-classify each atom **by its rendered text**
+(`nameIsMap(atom)`, `nameIsClosureArray(atom)`, `valueAtomKind(atom) == 11`,
+`strContains(refArrElemName(atom), "=>")`). That per-atom classification-by-render is the
+disease; an atom that is a **declared variant name** feeding `variantIndexOf` is nominal
+identity and is *not*.
+
+**Foundation (byte-identical, no consumer).** `unMemTys[]` ∥ `unMemTyStart`/`unMemTyCount`,
+parallel to `unNames`: each row's ARENA member type indices, recorded at all three
+registration sites (`registerValueUnionName`, `registerInlineUnion`, `collectU`) by
+resolving each member atom nominally (`cUserTypes`) then through the checker's annotation
+grammar (`resolveAnnot`). Pad-on-push like `recordSTyIx`, so a missed site self-heals to
+"uncovered" and its consumers keep the legacy name path.
+
+**ABI note.** The union box-tag scheme depends on member ORDER (`unVarStart`/`unVarCount`
+slice `uVariants`; `markValueUnionAtoms` mints value boxes in order). The recorder stores
+one index per `splitUnionAtoms` atom **in atom order**, and every consumer indexes the
+member slice in lock-step with the atom array (guarded by a `length` equality check), so no
+structural iteration can reorder anything.
+
+**Batch 1 — six consumers migrated**, each answering an "is there an arm of shape X"
+question structurally: `unionMapArmName` / `unionHasMapArm` (`TyMap`),
+`unionHasClosureArrayArm` (`TyArray` over `TyFunc`), `unionHasClosureArm` +
+`unionClosureArmName` (`TyFunc`), `unionHasMapArrayArm` (`TyArray` over `TyMap`),
+`calleeIsUnionElemFieldClosure` (`TyArray` whose element structure REACHES a `TyFunc` — the
+arena dual of the deliberately-conservative `strContains(elem, "=>")` arm test). Two of the
+name path's guards fall out for free: `nameIsMapMemberUnion`'s exclusion (a map-member union
+is a `TyUnion`, never a `TyMap`, however it renders) and `nameIsClosureArray`'s
+nullable-element exclusion (a `TyNullable` element is not a `TyFunc`).
+
+Method: an **additive probe** on all six, comparing the name path's first-match member INDEX
+with the arena path's, **plus a `-misalign` and a `-uncov` marker on every path** so an
+uncovered row cannot masquerade as agreement. **Sabotage-verified per site** — inverting a
+probe's comparison must make it fire. Three sites (`MapArm`, `CloArm`, `CloArmNm`) fire on
+the corpus; `CloArr` (6) and `MapArrArm` (4) needed a per-site inversion because the marker
+aborts the emit and a hotter probe fired first; `calleeIsUnionElemFieldClosure` fired on
+**nothing in the corpus** — a classifier with no test coverage at all, now covered by
+`tests/cases/unions/union-array-arm-elem-closure-field-map-call.vl`.
+
+**Still string-classified (the rest of the layer, honest scope).** The `unionArmPath*`
+family (`unionArmPathIsMap` / `IsMapList` / `IsClosure` / `IsCloArray` / `HasCloValue`) and
+its callers resolve an arm atom through `structIndexByName` / `variantIndexOf` and then walk
+the emitter's *field-code* tables (5/14/15/16/19/22). Destringifying those means re-deriving
+the field codes from the arena, which is a distinct piece of design, not a re-keying — a
+later batch. Likewise `unionRefArrayArmSlotForElemAtom` (atom-EQUALITY against a rendered
+element set), `unionClosureArrElemUnion` (returns an element NAME the name-keyed reflist
+layer consumes), and `emitUnionCoerce`'s alias expansion (the union-boxing ABI).
+
+**Correct as-is, deliberately untouched:** `unionMemberCount(unionMemberSetOf(…)) > 1` (a
+count), `structUnionNullCmpName` (`unionHasAtom(set, "null")` + a non-null count — `null` is
+a keyword, not a rendered shape), `setNarrowFromCondElse` / `currentStructNarrowSetOf`
+(narrow-SET algebra over the narrowing table, whose keys are member-set strings by design).
+
 ### D4 — residual structural decisions made by rendering
 
 The ~10 sites that decide structure by comparing rendered text
