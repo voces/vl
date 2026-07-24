@@ -91,13 +91,18 @@ Deno.test({
       if (rBig.secs > 30) throw new Error(`fmt took ${rBig.secs}s on a large file — O(n²) regression suspected`);
 
       // Net 2 — scaling: 2x input must stay near 2x time (measured 2.0x ± a few
-      // %); a quadratic term pushes toward 4x. Bound 3.0 splits the two. The
-      // 0.1s floor on the denominator keeps the ratio meaningful when a fast
-      // machine formats the half file quicker than timers resolve. A failing
-      // ratio is re-measured once (min of the two runs per size) so a one-off
-      // CI scheduler spike on the big run cannot flake the suite.
-      const RATIO = 3.0;
-      const scaled = (h: number, b: number) => b > RATIO * Math.max(h, 0.1);
+      // %); a quadratic term pushes toward 4x. Bound 3.5 splits the two with
+      // enough margin for a noisy runner: at 3.0 this net flaked on unrelated PRs
+      // twice (#1040 at 3.1x, 0.549s -> 1.7s; #1071 likewise), each costing a
+      // rerun, and BOTH measurements were nowhere near quadratic. Net 1 is the
+      // real O(n²) guard — the historical quadratic form took MINUTES at this
+      // size, so it trips the 30s absolute bound long before the ratio matters;
+      // net 2 is the secondary early-warning and 3.5 still separates 2.0x from
+      // 4.0x. The 0.5s floor on the denominator keeps a sub-second half-file run
+      // from making the ratio hypersensitive to a single scheduler spike. A
+      // failing ratio is still re-measured once (min of the two runs per size).
+      const RATIO = 3.5;
+      const scaled = (h: number, b: number) => b > RATIO * Math.max(h, 0.5);
       if (scaled(rHalf.secs, rBig.secs)) {
         const rHalf2 = await fmt(half);
         check(rHalf2, "half-size", bigSrc.length / 2);
@@ -164,9 +169,9 @@ Deno.test({
       // 10,001 elements. 30s leaves wide headroom without masking the regression.
       if (rBig.secs > 30) throw new Error(`fmt took ${rBig.secs}s on a large single-line list — wrapList O(n²) regression suspected`);
 
-      // Net 2 — scaling, same method/bound as the statement-count net above.
-      const RATIO = 3.0;
-      const scaled = (h: number, b: number) => b > RATIO * Math.max(h, 0.1);
+      // Net 2 — scaling, same method/bound/rationale as the statement-count net above.
+      const RATIO = 3.5;
+      const scaled = (h: number, b: number) => b > RATIO * Math.max(h, 0.5);
       if (scaled(rHalf.secs, rBig.secs)) {
         const rHalf2 = await fmt(half);
         check(rHalf2, "half-size", bigSrc.length / 2);
