@@ -790,6 +790,60 @@ export function repRowOfTyStruct(repTyIx: i32, lim: i32): i32 {
   best
 }
 
+// Normalize a checker RENDER (`tyToStr`, which spaces fields `{f: T}` and spells a
+// nullable with a `?` suffix) into the canonical spelling the annotation grammar
+// (`resolveAnnot`) parses — SCOPED to `repRowOfName` below, NEVER a global
+// `nameToTy` change. Two fidelity gaps a raw render trips:
+//   · SPACES — `nameToTy`'s inline-shape parser slices a field type
+//     `field.slice(colonAt+1)` = ` {f: …}` WITH the leading space, and its
+//     `name[0]=='{'` nested-shape test then fails → `TyErr`, so `repCanonKey`
+//     reads a spaced nested field as `!` (proven-mismatch vs every row). Dropping
+//     all spaces makes the render parse identically to `tyToEmitName`.
+//   · `?` NULLABLE — a rendered `i64?` is unparseable as an atom; rewriting it to
+//     the `i64|null` union spelling `repCanonKey` keys resolves it.
+// Both are position-independent textual rewrites over a canonical type render (no
+// string-literal atoms with internal spaces/`?` appear in the fuzz/corpus grammar;
+// the run-diff gate is the net for any exotic spelling).
+function renderFaithful(nm: string): string {
+  let out = ""
+  let i = 0
+  while i < nm.length {
+    const c = nm[i]
+    if c == ' ' {
+      // drop
+    } else if c == '?' {
+      out = out + "|null"
+    } else {
+      out = out + fromCodePoint(c)
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The struct-table row a checker RENDER `nm` names, after `renderFaithful`
+// normalization, resolved through the ONE `repRowOfTyStruct` vocabulary — the
+// name-input twin of the node route (which consumes `nodeRepTyIxOf` directly).
+// Tri-state so a caller can tell "the render did not resolve, feed a node type
+// instead" (-2) from "resolved, but names no dedup-participating row" (-1):
+//   -2  the spelling did not resolve through the annotation grammar
+//   -1  resolved to a non-`TyObj` / a shape that participates in no row
+//   >=0 the unique matching row (`repRowOfTyStruct`'s pick, `[0, lim)`)
+// Confirm-only seat (mirrors #1017's `repRowOfTyStruct` landing): no consumer yet,
+// so the whole export is byte-identical — it MINTS arena types via `resolveAnnot`
+// only when called, and nothing calls it.
+export function repRowOfName(nm: string, lim: i32): i32 {
+  if nm == "" { return -2 }
+  // The `repNameCanonKey` runaway cap (a render this long is never a legit key and
+  // MINTS fresh arena types per probe — the >1GB crash family): decline it.
+  if nm.length > 4096 { return -2 }
+  const di = resolveAnnot(renderFaithful(nm), repNoTyparams)
+  if di < 0 { return -2 }
+  const t = T.tys[di]
+  if !(t is TyObj) { return -1 }
+  repRowOfTyStruct(di, lim)
+}
+
 // Populate `sTwin` (parallel to `sNames`): `sTwin[i]` is the representative struct
 // slot for slot `i`'s WasmGC heap type — the smallest earlier slot with the same
 // canonical key AND field-code layout, or `i` itself when `i` is the first of its
