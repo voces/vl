@@ -48,13 +48,13 @@
 import { i32ToStr } from "./ast"
 import {
   VKind,
-  sAnonCanon,
   sFieldCount,
   sFieldElemName,
   sFieldStart,
   sFieldTypes,
   sNames,
   sTwin,
+  sTyIx,
 } from "./emit_state"
 import {
   T,
@@ -545,8 +545,48 @@ export function repSlotOfTy(ty: i32): i32 {
 // and keeps a private heap type. Nothing here needs to change for that.
 const repNoTyparams: string[] = []
 
+// The arena type index a struct-row NAME denotes, or -1 — the resolution
+// `slotCanonKey` used to inline. Exported so the row MINT sites can record it into
+// the `sTyIx` sidecar (phase D0) at the moment the annotation is in scope.
+export function sTyIxOfName(nm: string): i32 {
+  const di = cUserTypes[nm] ?? -1
+  if di >= 0 { return di }
+  // The inline-shape fallback: only a bare `{...}` spelling (not a map `{[`)
+  // resolves. This runs at INTERN time inside `collectS`'s row-minting loop and
+  // `resolveAnnot` mints arena types per call — the #961 runaway shape — so the
+  // cost was MEASURED, not assumed: self-compile 11.8s with this fallback vs 13.2s
+  // without (noise — the annotation-name memo #961 added is doing its job). A name
+  // that resolves through neither path stays -1 and `slotCanonKey` falls through to
+  // its existing name behaviour.
+  if (
+    nm.length >= 2 &&
+    nm[0] == '{' &&
+    nm[1] != '[' &&
+    nm[nm.length - 1] == '}'
+  ) {
+    return resolveAnnot(nm, repNoTyparams)
+  }
+  -1
+}
+
+// Record `v` as the arena type index of the struct row JUST pushed onto `sNames`
+// (phase D0). Pads with -1 so a mint site that does not call this self-heals to
+// "uncovered" — `slotCanonKey` then falls through to the legacy name path rather
+// than reading a mis-aligned entry.
+export function recordSTyIx(v: i32) {
+  while sTyIx.length + 1 < sNames.length { sTyIx.push(-1) }
+  sTyIx.push(v)
+  0
+}
+
 function slotCanonKey(si: i32): string {
   if si < 0 || si >= sNames.length { return "" }
+  // D1: the ARENA-INDEX sidecar (`sTyIx`, recorded at every row mint in D0) is
+  // authoritative — this row's type is known structurally, so there is nothing to
+  // re-derive from its name. Covers the `#anon` literal rows too (recorded from the
+  // literal's context-resolved rep type), which the name path cannot resolve at all
+  // and which previously needed a separate key-string sidecar. A row the sidecar
+  // does not cover (-1) keeps the legacy name path unchanged.
   const nm = sNames[si]
   let di = cUserTypes[nm] ?? -1
   if di < 0 {
@@ -566,29 +606,34 @@ function slotCanonKey(si: i32): string {
     if !(t is TyObj) { return "" }
     return repCanonKey(di)
   }
-  // The NAME did not resolve through the checker's annotation grammar (a
-  // synthetic `#anon` object-literal row, or an unresolvable spelling). The
-  // canon-key SIDECAR (`sAnonCanon`, filled at `collectAnonShapes` intern time
-  // from `repCanonKey(nodeRepTyIxOf(objLit))`) carries the row's structural key
-  // so an anonymous row still participates in twin dedup / row resolution. ""
-  // when the sidecar has no entry (a slot interned after the anon pass, or an
-  // uncovered literal) — the legacy never-merged behavior.
-  if si < sAnonCanon.length { return sAnonCanon[si] }
+  // The NAME did not resolve through the checker's annotation grammar — a
+  // synthetic `#anon` object-literal row, or an unresolvable spelling. The
+  // ARENA-INDEX sidecar (`sTyIx`, recorded at every row mint) carries the row's
+  // type, so an anonymous row still participates in twin dedup / row resolution.
+  // This REPLACED a key-STRING sidecar (`sAnonCanon`) that froze `repCanonKey` at
+  // intern time; keying off the index instead re-derives at query time, so the key
+  // follows later arena mutation. "" when the sidecar does not cover the row
+  // either — the legacy never-merged behaviour.
+  if si < sTyIx.length {
+    const dix = sTyIx[si]
+    if dix >= 0 {
+      const dt = T.tys[dix]
+      if dt is TyObj { return repCanonKey(dix) }
+    }
+  }
   ""
 }
 
-// The structural canon key to record for an anonymous object-literal shape row
-// (`collectAnonShapes`) into the `sAnonCanon` sidecar: the `repCanonKey` of the
-// literal node's CONTEXT-RESOLVED rep type (`nodeRepTyIxOf`, the sidecar-else-
-// naive arena type), or "" when the node is uncovered / not a `TyObj`. Exported
-// so the emit_collect intern site records it without pulling the arena
-// vocabulary (`T`/`repCanonKey`) across the module boundary.
-export function anonRowCanonKey(objIx: i32): string {
+// The arena type index to record for an anonymous object-literal shape row (phase
+// D0): the literal node's CONTEXT-RESOLVED rep type (`nodeRepTyIxOf`), or -1 when
+// the node is uncovered / not a `TyObj`. Exported so the `emit_collect` intern site
+// records it without pulling the arena vocabulary across the module boundary.
+export function anonRowTyIx(objIx: i32): i32 {
   const rix = nodeRepTyIxOf(objIx)
-  if rix < 0 { return "" }
+  if rix < 0 { return -1 }
   const t = T.tys[rix]
-  if !(t is TyObj) { return "" }
-  repCanonKey(rix)
+  if !(t is TyObj) { return -1 }
+  rix
 }
 
 // The canonical structural key of an arbitrary type-NAME spelling, resolved
