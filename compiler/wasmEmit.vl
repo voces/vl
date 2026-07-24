@@ -146,6 +146,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import {
+  blockAlwaysReturns,
   blockHasContinueFor,
   exprIsIfStmt,
   ifArmValueExpr,
@@ -10352,6 +10353,23 @@ function monoStaticIsGuardOf(condIx: i32, fnIx: i32) {
   -1
 }
 
+// The DUAL of `emitIfStmtStmt`'s dead-arm skip: a statement `if` whose mono-instance
+// `is` guard is statically TRUE and whose then-branch ALWAYS RETURNS ends the block
+// for this instance — everything after it is the guard's COMPLEMENT path, typed
+// against the other instances' bindings (`return v.bar` where THIS instance's `v` is
+// `{foo: string}`), and generally cannot lower at all. Truncating there is host
+// parity: those statements can never run in this instance. The caller emits an
+// `unreachable` at the cut so the block stays stack-polymorphic (the same padding
+// `emitProgram` writes for a proven-dead fall-through).
+function monoStaticGuardEndsBlock(stmtIx: i32, fnIx: i32) {
+  const s = P.nodes[stmtIx]
+  if s is IfStmt {
+    if monoStaticIsGuardOf(s.ifCond, fnIx) != 1 { return false }
+    return blockAlwaysReturns(s.ifThen)
+  }
+  false
+}
+
 function emitIfStmtStmt(body: i32[], s: IfStmt, _stmtIx: i32, fnIx: i32) {
   // Structured void `if`: push the i32 condition, then `if 0x04` with void
   // blocktype `0x40`. The then-branch's statements run when the condition is
@@ -10848,8 +10866,14 @@ export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
           return -1
         }
       }
-      pushPostGuardNarrow(stmts[i], fnIx)
-      i = i + 1
+      // A statically-TRUE `is` guard that always returns ends this instance's body.
+      if monoStaticGuardEndsBlock(stmts[i], fnIx) {
+        fbUnreachable() // 0x00 (dead padding — the cut path never runs)
+        i = n
+      } else {
+        pushPostGuardNarrow(stmts[i], fnIx)
+        i = i + 1
+      }
     }
     restoreNarrow(savedGuardTop)
     scopePop()
@@ -10876,8 +10900,13 @@ function emitStmts(body: i32[], blockIx: i32, fnIx: i32) {
         scopePop()
         return -1
       }
-      pushPostGuardNarrow(stmts[i], fnIx)
-      i = i + 1
+      if monoStaticGuardEndsBlock(stmts[i], fnIx) {
+        fbUnreachable() // 0x00 — see `monoStaticGuardEndsBlock`
+        i = stmts.length
+      } else {
+        pushPostGuardNarrow(stmts[i], fnIx)
+        i = i + 1
+      }
     }
     restoreNarrow(savedGuardTop)
     scopePop()
@@ -10905,15 +10934,23 @@ function emitStmtsTail(body: i32[], blockIx: i32, fnIx: i32) {
     // pushed in the loop, active for the TAIL statement, restored on exit.
     const savedGuardTop = narrowTop
     let i = 0
+    let cut = false
     while i < n - 1 {
       if emitStmt(body, stmts[i], fnIx) < 0 {
         scopePop()
         return -1
       }
-      pushPostGuardNarrow(stmts[i], fnIx)
-      i = i + 1
+      if monoStaticGuardEndsBlock(stmts[i], fnIx) {
+        fbUnreachable() // 0x00 — see `monoStaticGuardEndsBlock`
+        cut = true
+        i = n - 1
+      } else {
+        pushPostGuardNarrow(stmts[i], fnIx)
+        i = i + 1
+      }
     }
-    const rc = emitStmtTail(body, stmts[n - 1], fnIx)
+    let rc = 0
+    if !cut { rc = emitStmtTail(body, stmts[n - 1], fnIx) }
     restoreNarrow(savedGuardTop)
     scopePop()
     return rc

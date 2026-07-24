@@ -337,6 +337,38 @@ let holeShapeTys: i32[] = []
 // read `self[0]`), the indexing analogue of the demanded-shape check above.
 let holeArrayDemand: string[] = []
 
+// ALTERNATIVE hole constraints contributed by an `is` GUARD over the hole itself:
+//
+//     function foobar(v) {
+//       if v is {foo: string} then return v.foo
+//       return v.bar
+//     }
+//
+// Inside the then-branch `v` is NARROWED to `{foo: string}`, so `v.foo` reads the
+// narrowed binding and never grows the demanded shape — only the fall-through
+// `v.bar` does. The shape therefore records the constraint of the COMPLEMENT path
+// ALONE (`{bar: any}`), and checking every argument against it rejects the very
+// argument the guard exists to accept. The tested types are ALTERNATIVES, not
+// additional fields, so they are recorded here and the call-arg check accepts an
+// argument satisfying the demanded shape OR one of them.
+//
+// This is precise rather than a loosening, because each alternative also carries
+// WHICH demanded fields an argument taking the guard's TRUE path still reaches:
+//   • `holeAltPreN[k]` — the number of shape fields already demanded when the guard
+//     was reached. Those accesses run BEFORE the guard, so they are still required.
+//   • `holeAltTailN[k]` — the shape-field count at the END of the guard `if`, i.e.
+//     the start of the fields demanded AFTER it, or -1 when the then-branch
+//     DIVERGES (a `return`/`break`/`continue` guard clause) and the tail is
+//     therefore unreachable for an argument that satisfies the alternative.
+// Fields demanded strictly INSIDE the `if` (its else arm) are never required: the
+// guard being true means that arm did not run. So `if v is T then return v.foo` /
+// `return v.bar` accepts `{foo: string}` while `print(v.zap)` ahead of the guard,
+// or a non-diverging then-branch, keeps the complement's fields required.
+let holeAltNames: string[] = []
+let holeAltTys: i32[] = []
+let holeAltPreN: i32[] = []
+let holeAltTailN: i32[] = []
+
 // DEFERRED binary-op constraints over un-annotated-param holes. When `a + b` / `s + "!"` / `n < 2`
 // has a HOLE operand, its validity can't be decided in the body (a hole is permissively assignable
 // to string AND numeric, so the eager check greedily picks a branch). Record `(lt, op, rt)`; the
@@ -1644,6 +1676,10 @@ export function initChecker() {
   holeShapeNames = []
   holeShapeTys = []
   holeArrayDemand = []
+  holeAltNames = []
+  holeAltTys = []
+  holeAltPreN = []
+  holeAltTailN = []
   binCstrLt = []
   binCstrOp = []
   binCstrRt = []
@@ -5972,6 +6008,133 @@ function holeShapeOf(name: string) {
   -1
 }
 
+// How many fields hole `name`'s demanded shape carries right now (0 when it has
+// no shape yet). The shape's `TyObj` grows IN PLACE, so an alternative records a
+// COUNT, not a snapshot type.
+function holeShapeFieldCount(name: string) {
+  const shape = holeShapeOf(name)
+  if shape < 0 { return 0 }
+  const st = T.tys[shape]
+  if st is TyObj { return st.objFieldNames.length }
+  0
+}
+
+// Register an `is`-guard ALTERNATIVE `ty` for hole `name`, with the fields
+// demanded so far (reached before the guard) pinned as its required prefix.
+// Returns the new row's index so the guard can patch `holeAltTailN` once its arms
+// are checked, or -1 when there is nothing to patch (an unusable `ty`, or a row
+// this alternative already has — see below).
+function noteHoleAlt(name: string, ty: i32) {
+  if ty < 0 { return -1 }
+  // A body is checked more than once (the return-inference pre-pass, then the real
+  // pass) and the demanded shape ACCUMULATES across them — it is never cleared — so
+  // only the FIRST walk sees it grow from empty and can say which fields precede the
+  // guard. A re-check therefore keeps the existing row verbatim (returning -1, so the
+  // guard does not re-patch its tail either) rather than appending a duplicate the
+  // diagnostic would render twice or refreshing it from an already-grown shape.
+  // Keyed by the RENDERED type, not the arena index: each pass re-resolves the `is`
+  // annotation to a FRESH arena entry.
+  const key = tyToStr(ty)
+  let i = 0
+  while i < holeAltNames.length {
+    if holeAltNames[i] == name && tyToStr(holeAltTys[i]) == key { return -1 }
+    i = i + 1
+  }
+  const pre = holeShapeFieldCount(name)
+  holeAltNames.push(name)
+  holeAltTys.push(ty)
+  holeAltPreN.push(pre)
+  holeAltTailN.push(-1)
+  holeAltNames.length - 1
+}
+
+// The demanded-shape fields an argument satisfying alternative `k` STILL reaches:
+// the prefix demanded before the guard, plus (when the guard's then-branch does
+// not diverge) the suffix demanded after it. Returns -1 when nothing is required.
+function holeAltResidualTy(shape: i32, k: i32) {
+  if shape < 0 { return -1 }
+  const st = T.tys[shape]
+  if st is TyObj {
+    const names: string[] = []
+    const tys: i32[] = []
+    const all = st.objFieldNames
+    const allTys = st.objFieldTypes
+    let i = 0
+    while i < holeAltPreN[k] && i < all.length {
+      names.push(all[i])
+      tys.push(allTys[i])
+      i = i + 1
+    }
+    const tail = holeAltTailN[k]
+    if tail >= 0 {
+      let j = tail
+      while j < all.length {
+        names.push(all[j])
+        tys.push(allTys[j])
+        j = j + 1
+      }
+    }
+    if names.length == 0 { return -1 }
+    return mkObjTy(names, tys)
+  }
+  -1
+}
+
+// `srcExpr < 0` (a DISPATCH probe with no argument node — a UFCS receiver, an
+// operator operand) checks the type alone, so the literal-aware / rep-sidecar
+// recording in `assignableExpr` is not driven by a node index it does not have.
+function holeAssignOk(srcExpr: i32, at: i32, dst: i32) {
+  if srcExpr < 0 { return assignable(at, dst) }
+  assignableExpr(srcExpr, at, dst)
+}
+
+// Does `at` (the argument expression `srcExpr`) satisfy hole `name`'s demand? The
+// accumulated shape satisfies it, and so does any `is`-guard ALTERNATIVE whose
+// still-reachable demanded fields (`holeAltResidualTy`) are satisfied too. True
+// when the hole demands nothing.
+function holeDemandOk(name: string, srcExpr: i32, at: i32) {
+  const shape = holeShapeOf(name)
+  if shape < 0 { return true }
+  if holeAssignOk(srcExpr, at, shape) { return true }
+  let k = 0
+  while k < holeAltNames.length {
+    if holeAltNames[k] == name {
+      if holeAssignOk(srcExpr, at, holeAltTys[k]) {
+        const resid = holeAltResidualTy(shape, k)
+        if resid < 0 { return true }
+        if holeAssignOk(srcExpr, at, resid) { return true }
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+// The full EXPECTATION for hole `name` as ONE type: the demanded shape alone, or
+// — when the body also `is`-tested the hole — the DISJUNCTION of every accepted
+// arm, so the diagnostic and hover both name all of them rather than the
+// complement path's constraint alone. -1 when the hole demands nothing.
+function holeDemandTy(name: string) {
+  const shape = holeShapeOf(name)
+  const members: i32[] = []
+  let k = 0
+  while k < holeAltNames.length {
+    if holeAltNames[k] == name { members.push(holeAltTys[k]) }
+    k = k + 1
+  }
+  if shape >= 0 { members.push(shape) }
+  if members.length == 0 { return -1 }
+  if members.length == 1 { return members[0] }
+  mkUnionTy(members)
+}
+
+// `holeDemandTy` rendered — the `expected …` half of a failed hole-demand check.
+function holeDemandStr(name: string) {
+  const d = holeDemandTy(name)
+  if d < 0 { return "<none>" }
+  tyToStr(d)
+}
+
 // Record that hole `name` was indexed (so it demands an array). Idempotent.
 function noteArrayDemand(name: string) {
   let i = 0
@@ -6455,29 +6618,23 @@ function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
     const bTys: i32[] = []
     const p0t = T.tys[params[0]]
     if p0t is TyVar {
-      const hs0 = holeShapeOf(p0t.tvName)
-      if hs0 >= 0 {
-        if !assignable(lt, hs0) { return -1 }
-      }
+      if !holeDemandOk(p0t.tvName, -1, lt) { return -1 }
     }
     bindGenWalk(params[0], lt, bNames, bTys)
     bindGenWalk(params[1], rt, bNames, bTys)
     const expected = substTyDeep(params[1], bNames, bTys)
     const p1t = T.tys[params[1]]
     if p1t is TyVar {
-      const hs1 = holeShapeOf(p1t.tvName)
-      if hs1 >= 0 {
-        if !assignableExpr(rightIx, rt, hs1) {
-          tErr(
-            "operator '" +
-              op +
-              "': expected " +
-              tyToStr(hs1) +
-              ", got " +
-              tyToStr(rt),
-            ix,
-          )
-        }
+      if !holeDemandOk(p1t.tvName, rightIx, rt) {
+        tErr(
+          "operator '" +
+            op +
+            "': expected " +
+            holeDemandStr(p1t.tvName) +
+            ", got " +
+            tyToStr(rt),
+          ix,
+        )
       }
     }
     if !assignableExpr(rightIx, rt, expected) {
@@ -6611,10 +6768,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     const bTys: i32[] = []
     const p0 = T.tys[params[0]]
     if p0 is TyVar {
-      const hShape0 = holeShapeOf(p0.tvName)
-      if hShape0 >= 0 {
-        if !assignable(recvTy, hShape0) { return -1 }
-      }
+      if !holeDemandOk(p0.tvName, -1, recvTy) { return -1 }
     }
     bindGenWalk(params[0], recvTy, bNames, bTys)
     let i = 0
@@ -6624,19 +6778,16 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
       const expected = substTyDeep(params[i + 1], bNames, bTys)
       const pHole = T.tys[params[i + 1]]
       if pHole is TyVar {
-        const hShape = holeShapeOf(pHole.tvName)
-        if hShape >= 0 {
-          if !assignableExpr(args[i], at, hShape) {
-            tErr(
-              "argument " +
-                i32ToStr(i + 1) +
-                ": expected " +
-                tyToStr(hShape) +
-                ", got " +
-                tyToStr(at),
-              ix,
-            )
-          }
+        if !holeDemandOk(pHole.tvName, args[i], at) {
+          tErr(
+            "argument " +
+              i32ToStr(i + 1) +
+              ": expected " +
+              holeDemandStr(pHole.tvName) +
+              ", got " +
+              tyToStr(at),
+            ix,
+          )
         }
         if holeIsArrayDemanded(pHole.tvName) {
           if tyIsNonIndexableScalar(at) {
@@ -7378,19 +7529,16 @@ function checkCallNode(n: Call, ix: i32) {
       // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
       const pHole = T.tys[params[i]]
       if pHole is TyVar {
-        const hShape = holeShapeOf(pHole.tvName)
-        if hShape >= 0 {
-          if !assignableExpr(args[i], at, hShape) {
-            tErr(
-              "argument " +
-                i32ToStr(i + 1) +
-                ": expected " +
-                tyToStr(hShape) +
-                ", got " +
-                tyToStr(at),
-              ix,
-            )
-          }
+        if !holeDemandOk(pHole.tvName, args[i], at) {
+          tErr(
+            "argument " +
+              i32ToStr(i + 1) +
+              ": expected " +
+              holeDemandStr(pHole.tvName) +
+              ", got " +
+              tyToStr(at),
+            ix,
+          )
         }
         // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
         // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
@@ -8149,6 +8297,26 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         }
       }
       s = s + 1
+    }
+  }
+  // HOVER over an un-annotated param: the body has now recorded everything it demands
+  // of each param HOLE, so re-retain the binding's type as that demand — the same
+  // disjunction the call-arg diagnostic names (`{foo: string} | {bar: any}`) instead
+  // of the bare hole, which renders as an uninformative `any`. One source of truth for
+  // the message and the LSP. Holes the body never constrained keep the `TyVar` (still
+  // `any`, and still skipped by the inlay-hint scan's `inlayHole`).
+  if symEnabled != 0 && !inferQuiet {
+    let hp = 0
+    while hp < params.length {
+      const hpNode = P.nodes[params[hp]]
+      if hpNode is Param && paramTys[hp] >= 0 {
+        const hpTy = T.tys[paramTys[hp]]
+        if hpTy is TyVar {
+          const hpDemand = holeDemandTy(hpTy.tvName)
+          if hpDemand >= 0 { symRetainType(params[hp], hpDemand, 1) }
+        }
+      }
+      hp = hp + 1
     }
   }
   // Capture body TOTALITY (missing-return soundness) while the body scope is still LIVE
@@ -12737,6 +12905,7 @@ export function monoInferListElem(
   const sHoleN = holeShapeNames.length
   const sHoleT = holeShapeTys.length
   const sHoleArr = holeArrayDemand.length
+  const sHoleAlt = holeAltNames.length
   const sBinC = binCstrOp.length
   const sILet = inferLetIx.length
   const sINulS = inferLetNulStrIx.length
@@ -12789,6 +12958,12 @@ export function monoInferListElem(
   while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
   while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
   while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
+  while holeAltNames.length > sHoleAlt {
+    holeAltNames.pop()
+    holeAltTys.pop()
+    holeAltPreN.pop()
+    holeAltTailN.pop()
+  }
   while binCstrOp.length > sBinC {
     binCstrOp.pop()
     binCstrLt.pop()
@@ -12836,6 +13011,7 @@ export function monoInferLocalScalar(
   const sHoleN = holeShapeNames.length
   const sHoleT = holeShapeTys.length
   const sHoleArr = holeArrayDemand.length
+  const sHoleAlt = holeAltNames.length
   const sBinC = binCstrOp.length
   const sILet = inferLetIx.length
   const sINulS = inferLetNulStrIx.length
@@ -12884,6 +13060,12 @@ export function monoInferLocalScalar(
   while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
   while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
   while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
+  while holeAltNames.length > sHoleAlt {
+    holeAltNames.pop()
+    holeAltTys.pop()
+    holeAltPreN.pop()
+    holeAltTailN.pop()
+  }
   while binCstrOp.length > sBinC {
     binCstrOp.pop()
     binCstrLt.pop()
@@ -14106,6 +14288,28 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // `continue`) contributes nothing to the merge (its end is unreachable).
   const daEntry = daSnapshot()
   const daThenDiverges = daBranchDiverges(n.ifThen)
+  // `is`-GUARD ALTERNATIVES over an un-annotated-param HOLE. A then-narrow that
+  // refines a HOLE binding is not an extra field demand — it is an ALTERNATIVE the
+  // body handles on its own branch (`if v is {foo: string} then return v.foo`). The
+  // narrowed binding shadows the hole for the whole then-branch, so those uses never
+  // grow the demanded shape; without recording them the shape would carry the
+  // COMPLEMENT path's fields alone and reject the argument the guard accepts.
+  // Registered BEFORE the branch scope is pushed, so `lookup` still sees the hole.
+  const altRows: i32[] = []
+  let ai = 0
+  while ai < tnNames.length {
+    if !isPathKey(tnNames[ai]) {
+      const curIx = lookup(tnNames[ai])
+      if curIx >= 0 {
+        const cur = T.tys[curIx]
+        if cur is TyVar {
+          const row = noteHoleAlt(cur.tvName, tnTys[ai])
+          if row >= 0 { altRows.push(row) }
+        }
+      }
+    }
+    ai = ai + 1
+  }
   if tnNames.length > 0 {
     pushScope(-1)
     applyNarrows(tnNames, tnTys)
@@ -14157,6 +14361,20 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
       if elseTy != TY_VOID && elseTy != TY_ERR { noteInferredRet(elseTy) }
     }
     daElseEnd = daSnapshot()
+  }
+  // Close each `is`-guard alternative registered above. A then-branch that DIVERGES
+  // (a guard clause) leaves the code after this `if` unreachable for an argument that
+  // satisfies the alternative, so nothing past it is required (`holeAltTailN` stays
+  // -1). Otherwise execution rejoins here and every field demanded from now on IS
+  // reached — record where that suffix starts. Fields demanded strictly inside the
+  // `if` (the else arm) fall in neither range: the guard being true skipped them.
+  if !daThenDiverges {
+    let ac = 0
+    while ac < altRows.length {
+      const row = altRows[ac]
+      holeAltTailN[row] = holeShapeFieldCount(holeAltNames[row])
+      ac = ac + 1
+    }
   }
   // Join the surviving paths. Start from the empty set and fold in every
   // surviving path's unassigned set (the union = "unassigned on some surviving
