@@ -211,3 +211,52 @@ grep -nE '\b(sNames|rlElemName|mvValName|unNames|uVariants)\[[^]]*\] *(==|!=)' c
 `lint-self.sh` · `SELFHOST_NATIVE_ALIGN=1 deno task test` · corpus **run**-diff (status +
 stdout; a check-only diff cannot see "checks clean, emits invalid wasm") · fuzz A/B ≥20k
 programs/side · `fuzz-sweep.sh` gating leg.
+
+## Scorecard (measured at master 6bbd579, after D0–D4)
+
+Raw table ref-counts are a **poor metric** — the name tables persist for *rendering* and
+nominal lookup even where every structural decision has moved off them. The terminal
+condition names two things, so measure those:
+
+| metric | at start | now |
+|---|---|---|
+| structural decisions made from a **rendered** type (`tyToStr(x) == "string"` &c.) | 13 | **0** |
+| struct-row canon key derived by parsing a name | yes | **no** (`sTyIx`; `sAnonCanon` deleted) |
+| ref-list element slot key derived by string surgery | yes | **no** (`repElemKey`) |
+| `$fnsig` key derived by rendering + re-parsing | yes | **no** at `cloCallSigKey` (`sigKeyOfTy`) |
+| per-atom classify-by-render of a union member set | 15 sites | **15 sites** — the open arc |
+
+The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
+
+- **Legitimate nominal identity** — `unNames`/`uVariants` lookups (a declared name *is* the
+  identity), the `rlElemName` exact-match fast path ahead of the structural key.
+- **Legitimate ABI identity** — the `cloSigKeys` scan: that key text *is* the interned
+  WasmGC functype's identity, so a string is its natural representation. What mattered was
+  that every *producer* derives it structurally, which D3 did.
+- **Genuinely open** — the `mvValName` map-value scans (parked: re-keying removes a
+  comparison but not the string, which retires at D5) and `unMemberSet` (the union arc).
+
+### The open arc: union member sets
+
+`unionMemberSetOf(name)` returns a pipe-joined member string; ~15 consumers `splitUnionAtoms`
+it and classify each atom **by its rendered text** (`nameIsMap(atom)`, `refArrElemName(arm)`,
+`unionArmPathIsMap(atom, path)`). That per-atom re-derivation is the disease.
+
+**Scope carefully:** an atom that is a declared variant name (`Cat`) feeding
+`variantIndexOf` is *nominal identity — lossless and correct*. Only the inline-shape /
+composite atoms are the disease. **ABI hazard:** the box-tag scheme depends on member
+ORDER (`unVarStart`/`unVarCount` slice `uVariants`), so any reordering is an ABI change.
+
+## Method notes earned during this program
+
+1. **An additive probe must cover every resolution path of a layer, and must be
+   sabotage-verified** (invert the comparison; confirm it fires on the target shape) before a
+   "0 disagreements" means anything. A single-site probe on the map-value layer swept 0 and
+   then *failed* sabotage — the load-bearing path was elsewhere. An unverified 0 is worthless.
+2. **A recorded arena index ≠ a name key** (D1) — intern-time vs query-time resolution
+   diverge once the arena mutates in place.
+3. **A type key ≠ a rep key** (D2) — slot layers fold structurally-distinct types that share
+   a wrapper.
+
+All three are the same underlying mistake: assuming an arena artifact answers the same
+question the string did. Check which question the site is asking, first.
