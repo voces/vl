@@ -166,7 +166,16 @@ destringified — the `is`-narrowing emit's litunion classifier, `mapValNameOf`,
 `K0|{w:i32}` makes the `is`-emit pick the union-variant path and fail). The *key* is
 destringified; retiring the *name* column is D5's job, once those consumers move to the arena.
 
-### D3 — the `$fnsig` layer (highest risk, highest value)
+### D3 — the `$fnsig` layer — SHIPPED (#1081)
+
+`sigKeyOfTy(funcTyIx)` walks the arena `TyFunc` spine, classifying each leaf with the same
+`annParamKind`/`annRetKind` the string path used — byte-identical to
+`annSigKey(tyToEmitName(funcTyIx))` by construction, so structural decisions come from the arena.
+Replaced `cloCallSigKey`'s two `nodeTyName → annSigKey` sites. `annSigKey`/`unionArmSigKey` stay
+for the string-only callers (union-arm spellings, the annotation path) — D5 residuals. Corpus
+byte-identical; additive probe 0 disagreements; fuzz A/B identical.
+
+#### D3 (original sketch)
 
 `cloSigKeyExt` / `annSigKey` / `cloSigKeys`. Three producers must agree on the key text; the
 `repSigSlotTokOfKind`→`repStructSlotRep` canon (#1019) already fixed the slot-digit half.
