@@ -4134,6 +4134,56 @@ export function rlElemCloSigKey(slot: i32): string {
   annSigKey(nm.slice(1, nm.length - 1))
 }
 
+// The mv slot of a MAP-element ref-list slot's inner VALUE — the arena reading of
+// `mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[slot]))`, the ref-list twin of
+// `mvValInnerMvSlotAt`.
+// SENTINEL DISCIPLINE (D3'): the name resolver is TRI-STATE and overloaded (`-1` = a
+// MONO i32 map riding the shared struct, `-3` = uninterned/unsupported, `>= 0` = a
+// slot), so this leg answers ONLY a real slot (>= 0); every negative — uncovered, not
+// a map type, no row claims the inner value — is indistinguishable from "mono" here
+// and is therefore swallowed by the chokepoint, never returned to a caller.
+// `peelNul` strips ONE `TyNullable` hop first, the arena reading of the
+// `nulMapInnerName` peel the list-of-maps composition read performs; the twin
+// comparator and the nested-map read do NOT peel (`mapValNameOf` declines a nullable
+// spelling, so both legs decline together there).
+export function rlElemMapValMvSlotAt(slot: i32, peelNul: boolean): i32 {
+  const ty = rlElemTyIxAt(slot)
+  if ty < 0 { return -1 }
+  let b = ty
+  const t = T.tys[b]
+  if peelNul {
+    if t is TyNullable { b = t.nInner }
+  }
+  if b < 0 { return -1 }
+  const bt = T.tys[b]
+  if bt is TyMap { return mvSlotOfTy(bt.mVal) }
+  -1
+}
+
+// The mv slot a MAP-element ref-list slot's value type occupies (destringify
+// D5-final (c)) — the chokepoint the
+// `mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[s]))` readers share. ARENA first
+// (`rlElemTyIx` → the `TyMap`'s value → `mvSlotOfTy`, the mv layer's own
+// `repMvValKey` lookup), and ONLY for a real slot: the name resolver's `-1` (mono)
+// and `-3` (unsupported) answers stay its own.
+export function rlElemMapValMvSlot(slot: i32): i32 {
+  const ar = rlElemMapValMvSlotAt(slot, false)
+  if ar >= 0 { return ar }
+  mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[slot]))
+}
+
+// `rlElemMapValMvSlot` for a slot whose element may be a NULLABLE map: the arena leg
+// peels one `TyNullable`, the name leg the `nulMapInnerName` spelling, before asking
+// for the value's slot. Same sentinel discipline.
+export function rlElemNulMapValMvSlot(slot: i32): i32 {
+  const ar = rlElemMapValMvSlotAt(slot, true)
+  if ar >= 0 { return ar }
+  let cen = rlElemName[slot]
+  const cnin = nulMapInnerName(cen)
+  if cnin != "" { cen = cnin }
+  mvSlotOfMapValNameOrMono(mapValNameOf(cen))
+}
+
 // The ARENA type a map-VALUE slot's stored value name denotes (destringify D5-final
 // (b)), or -1 when the sidecar does not cover the slot. `mvValTyIx` pads on push and
 // is emptied per PROGRAM (method note 7), so a lagging / stale row answers
@@ -9676,8 +9726,8 @@ export function rlSlotsLayoutTwin(a: i32, b: i32): i32 {
     return rlSlotsLayoutTwin(rlElemInnerSlot(a), rlElemInnerSlot(b))
   }
   if ka == 3 {
-    const ma = mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[a]))
-    const mb = mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[b]))
+    const ma = rlElemMapValMvSlot(a)
+    const mb = rlElemMapValMvSlot(b)
     if ma == -1 && mb == -1 { return 1 }
     if ma < 0 || mb < 0 { return 0 }
     return repMapValSlotsTwin(ma, mb)
@@ -16836,9 +16886,7 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
   // Nested-map read: resolve the receiver's mv slot, then its inner map value.
   let os = coalesceMvSlot(exprIx, fnIx)
   if os < 0 { os = mapReadMvSlot(exprIx, fnIx) }
-  if os >= 0 && mvValIsMap(os) {
-    return mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[mvRlSlot[os]]))
-  }
+  if os >= 0 && mvValIsMap(os) { return rlElemMapValMvSlot(mvRlSlot[os]) }
   // List-of-maps element read: the element name is the map type; its value picks the slot.
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Index {
@@ -16846,10 +16894,7 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
       if slot >= 0 && slot < rlElemKindTbl.length && rlElemKindTbl[slot] == 3 {
         // A NULLABLE map element strips to its inner map for the value-slot resolve.
-        let cen = rlElemName[slot]
-        const cnin = nulMapInnerName(cen)
-        if cnin != "" { cen = cnin }
-        return mvSlotOfMapValNameOrMono(mapValNameOf(cen))
+        return rlElemNulMapValMvSlot(slot)
       }
     }
   }
