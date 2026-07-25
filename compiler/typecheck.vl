@@ -10834,18 +10834,127 @@ function retAtomsCheap(er: i32) {
   false
 }
 
+// The value-atom KIND of one LEAF of an inferred return type — the structural dual of
+// `valueAtomKind(tyToStr(leaf))`, read off the arena instead of a rendering. Only two
+// leaf shapes can classify: a PRIMITIVE (whose `primName` is the primitive's own
+// identity, not a rendering of a structure) and a PRIM-ELEMENT LIST (the emitter's list
+// atoms). Every other leaf renders to a name `valueAtomKind` rejects — a struct/map/
+// closure shape, a quoted literal, `<error>`, `any` — so it is -1 here.
+function retAtomKindOf(er: i32) {
+  if er < 0 { return -1 }
+  const t = T.tys[er]
+  if t is TyPrim { return valueAtomKind(t.primName) }
+  if t is TyArray {
+    if t.aElem < 0 { return -1 }
+    const et = T.tys[t.aElem]
+    if et is TyPrim {
+      const en = et.primName
+      // `i32[]` / `boolean[]` are matched by exact name AHEAD of `valueAtomKind`'s
+      // litunion-array arm; the other list atoms sit BEHIND it, so a declared litunion
+      // alias spelled like a primitive would claim them — ask the same question here.
+      if en == "i32" || en == "boolean" { return 7 }
+      if nameIsLitUnionType(en) { return 7 }
+      if en == "f64" { return 8 }
+      if en == "string" { return 9 }
+      if en == "i64" { return 10 }
+      if en == "f32" { return 12 }
+    }
+    return -1
+  }
+  if t is TyVar {
+    // An inference hole renders `any` — never an atom; a declared type param carries its
+    // own source name, which classifies exactly as the rendered atom would.
+    if t.tvName.length > 0 {
+      if t.tvName[0] == '?' { return -1 }
+    }
+    return valueAtomKind(t.tvName)
+  }
+  -1
+}
+
+// Push the value-atom KIND of every leaf of `er`, in `collectRetAtoms` order — `6` (the
+// `null` atom) for a nullable slot. The kind-valued dual of `collectRetAtoms`: same walk,
+// same order, no strings built.
+function collectRetAtomKinds(er: i32, out: i32[]) {
+  if er < 0 { return 0 }
+  const t = T.tys[er]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      collectRetAtomKinds(t.uMembers[i], out)
+      i = i + 1
+    }
+  } else if t is TyNullable {
+    collectRetAtomKinds(t.nInner, out)
+    out.push(6)
+  } else {
+    out.push(retAtomKindOf(er))
+  }
+  0
+}
+
+// `isValueUnionName`'s verdict over an already-classified atom-kind sequence: 2+ atoms,
+// every atom a value atom, and either 2+ non-null atoms or exactly one NUMERIC scalar
+// beside `null` (a boolean/ref + null stays a niche, not a box).
+function valueUnionFromAtomKinds(kinds: i32[]) {
+  if kinds.length < 2 { return false }
+  let nonNull = 0
+  let hasNull = false
+  let soloKind = -1
+  let i = 0
+  while i < kinds.length {
+    const k = kinds[i]
+    if k < 0 { return false }
+    if k == 6 {
+      hasNull = true
+    } else {
+      nonNull = nonNull + 1
+      soloKind = k
+    }
+    i = i + 1
+  }
+  if nonNull >= 2 { return true }
+  if nonNull == 1 && hasNull {
+    return soloKind == 0 || soloKind == 3 || soloKind == 4 || soloKind == 5
+  }
+  false
+}
+
+// Scratch for the leaf-kind scan — module level (like `tyEqAStack`) so the checker's
+// hottest decline path allocates nothing; drained by its only consumer.
+const vuAtomKinds: i32[] = []
+
+// Whether the inferred return `er` IS a value union the emitter boxes — the structural
+// dual of `isValueUnionName(<er's joined atom render>)`, decided from the arena BEFORE
+// anything is rendered. The join is transparent: under `retAtomsCheap` every admitted
+// leaf renders to a single top-level atom (no `|`, no `=>`, balanced groupers), so the
+// name's `splitUnionAtoms` atoms are exactly this walk's leaves, in this order.
+function tyIsValueUnion(er: i32) {
+  collectRetAtomKinds(er, vuAtomKinds)
+  const ok = valueUnionFromAtomKinds(vuAtomKinds)
+  while vuAtomKinds.length > 0 { vuAtomKinds.pop() }
+  ok
+}
+
 // The emitter-format union NAME (`i32|string`, `i32|null`) for an inferred return type
 // `er` IF it is a VALUE union the emitter can box (the `uBoxIdx` rep: ≥2 non-null value
-// atoms, or one numeric scalar + null — `isValueUnionName`, the same gate the annotated
-// path uses), else "". This is what lets an UN-annotated union/nullable return lower:
-// the name drives `registerValueUnionName` (type interning), the `"union"` return kind (the result
+// atoms, or one numeric scalar + null — the same gate the annotated path uses), else "".
+// This is what lets an UN-annotated union/nullable return lower: the name drives
+// `registerValueUnionName` (type interning), the `"union"` return kind (the result
 // valtype), and `emitUnionCoerce` at the return site — exactly the annotated path.
+//
+// The VERDICT is `tyIsValueUnion`'s, read off the arena; the name is built only for the
+// unions that ARE value unions, as the key those emitter tables want. Deciding from the
+// built name instead (`isValueUnionName`) renders, joins and re-splits the atoms of every
+// non-union inferred return too — the overwhelming majority of the calls, and the
+// compiler's single largest string cost.
 function valueUnionRetName(er: i32) {
   if er < 0 { return "" }
   // Decline a union with any composite leaf WITHOUT rendering it (`retAtomsCheap`) —
-  // `isValueUnionName` would reject its atom anyway, and the render of a recursive
-  // struct leaf is exponential in the `tyToStr` depth cap.
+  // its atom cannot classify anyway, and the render of a recursive struct leaf is
+  // exponential in the `tyToStr` depth cap.
   if !retAtomsCheap(er) { return "" }
+  if !tyIsValueUnion(er) { return "" }
   const atoms: string[] = []
   collectRetAtoms(er, atoms)
   let nm = ""
@@ -10855,8 +10964,26 @@ function valueUnionRetName(er: i32) {
     nm = nm + atoms[i]
     i = i + 1
   }
-  if isValueUnionName(nm) { return nm }
-  ""
+  nm
+}
+
+// Whether union `er` has a LITUNION-ARRAY member (`K0[]`, `("a"|"b")[]`) — the arm
+// `litUnionArrayValueUnionRetName` exists for, decided from the arena instead of from
+// `litUnionArrayElemOf` over a rendered member name.
+function tyUnionHasLitUnionArrayMember(er: i32) {
+  if er < 0 { return false }
+  const t = T.tys[er]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyArray {
+        if tyIsLitUnion(m.aElem) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
 }
 
 // The emitter-format union NAME (`K0[]|i64`) for an inferred return `er` that is a VALUE
@@ -10877,6 +11004,11 @@ function litUnionArrayValueUnionRetName(er: i32) {
   if !(t is TyUnion) { return "" }
   const members = t.uMembers
   if members.length < 2 { return "" }
+  // No litunion-array member, no name to build: decline from the arena before the
+  // per-member `tyToEmitName` renders. (A PRE-decline only — the rendered `hasLitArr`
+  // below stays the verdict, since the atom-level dual of `tyToEmitName`'s
+  // alias-preserving grammar is a separate piece of design from `retAtomKindOf`'s.)
+  if !tyUnionHasLitUnionArrayMember(er) { return "" }
   let hasLitArr = false
   let name = ""
   let i = 0

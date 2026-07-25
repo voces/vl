@@ -271,6 +271,48 @@ count), `structUnionNullCmpName` (`unionHasAtom(set, "null")` + a non-null count
 a keyword, not a rendered shape), `setNarrowFromCondElse` / `currentStructNarrowSetOf`
 (narrow-SET algebra over the narrowing table, whose keys are member-set strings by design).
 
+### D-RET — the inferred-return value-union VERDICT (`valueUnionRetName`) — SHIPPED
+
+`valueUnionRetName` built the emitter-format union name (`collectRetAtoms` renders every
+leaf with `tyToStr`, joined on `|`) and then asked `isValueUnionName` to **re-parse the
+string it had just built** — construct-a-name-then-classify-the-text, on every inferred
+return in the program. It was also the compiler's single largest string cost: 8.4% self
+plus 8.2% of all samples inside its `__str_concat__` calls (18.1% inclusive) on a
+self-compile profile.
+
+`tyIsValueUnion(er)` is the structural dual: `collectRetAtomKinds` walks the same
+union/nullable spine `collectRetAtoms` walks and pushes each leaf's ATOM KIND
+(`retAtomKindOf` — `valueAtomKind` over a primitive's own `primName`, or the list-atom
+kind of a prim-element array; `6` for the nullable slot), and `valueUnionFromAtomKinds` is
+`isValueUnionName`'s verdict over that kind sequence. The verdict now comes first and the
+name is built only when the answer is yes — as the emitter's name-keyed tables' key, which
+is the only thing it was ever for. The returned string is unchanged.
+
+Why the join is transparent (the piece that makes the mirror exact): behind
+`retAtomsCheap`, every admitted leaf renders to a single top-level atom — no `|`, no `=>`,
+balanced groupers — so the built name's `splitUnionAtoms` atoms are exactly the walk's
+leaves, in order. A composite leaf (which could render a `|`) is declined before either
+path runs. The two arms that must consult a name are the ones where the *name* is the
+identity: a primitive's `primName`, and `nameIsLitUnionType` for a prim-spelled list
+element (`valueAtomKind` tries its litunion-array arm ahead of `f64[]`/`string[]`/`i64[]`/
+`f32[]`, so the dual must ask the same question in the same order).
+
+Method: additive probe (compute both, keep using the old answer, `tErr` on disagreement in
+either direction) — **0 disagreements** over the 1,299-file corpus + battery and 25,200
+fuzz programs. Sabotage-verified by inverting the predicate: it fires on 1,208 of 1,299
+corpus files, with both directions witnessed (`old=yes new=no` on `i32|string` / `i32|null`,
+`old=no new=yes` on a plain `i32` return). Corpus + battery A/B: **byte-identical** wasm,
+identical run status/stdout; fuzz A/B shapes identical. Measured after: `valueUnionRetName`
+0.0% self, 0.01% inclusive; total `__str_concat__` self 11.9% → 5.2%; profile samples
+−15.8%.
+
+The sibling `litUnionArrayValueUnionRetName` gets a structural **pre-decline** only
+(`tyUnionHasLitUnionArrayMember` — no litunion-array member, no name to build). Its atoms
+come from `tyToEmitName`, whose alias-preserving grammar flattens nested unions into a
+member name, so the atom-level dual of THAT renderer is a separate piece of design (the D2
+lesson: a different renderer asks a different question); its rendered `hasLitArr` stays the
+verdict.
+
 ### D4 — residual structural decisions made by rendering
 
 The ~10 sites that decide structure by comparing rendered text
@@ -313,6 +355,7 @@ condition names two things, so measure those:
 | struct-row canon key derived by parsing a name | yes | **no** (`sTyIx`; `sAnonCanon` deleted) |
 | ref-list element slot key derived by string surgery | yes | **no** (`repElemKey`) |
 | `$fnsig` key derived by rendering + re-parsing | yes | **no** at `cloCallSigKey` (`sigKeyOfTy`) |
+| inferred-return value-union verdict derived by rendering + re-parsing | yes | **no** (`tyIsValueUnion`) |
 | per-atom classify-by-render of a union member set | 15 sites | **4 sites** — batch 1 took 6, batch 2 the `unionArmPath*` five |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
