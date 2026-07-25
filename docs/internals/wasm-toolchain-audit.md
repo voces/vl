@@ -120,9 +120,17 @@ verified present in [45.0.1 docs](https://docs.rs/wasmtime/45.0.1/wasmtime/struc
 
 ### 4.1 GC: collector choice + heap knobs
 
+> **Superseded — see [`memory-gc-design.md`](memory-gc-design.md) §4/§6.** The
+> "watch it" below resolved: wasmtime **46** made the **copying** collector the
+> default and gave it an in-Wasm bump-allocation fast path, so the tracing answer
+> to the churn problem shipped. The host now pins wasmtime 47, runs user programs
+> on `Collector::Auto` (tracing) with a `$VL_GC` override, and keeps `Null` for the
+> compiler instance. The measurements are in that doc; the survey below is kept for
+> the `Config` knobs it enumerates.
+
 - **`Config::collector(Collector)`** ([docs](https://docs.wasmtime.dev/api/wasmtime/enum.Collector.html)):
-  - `Collector::DeferredReferenceCounting` (DRC, the current default behind `Auto`): deferred RC +
-    stack over-approximation; better latency, worse throughput. **Cannot collect cycles** — they
+  - `Collector::DeferredReferenceCounting` (DRC, the default behind `Auto` through wasmtime 45):
+    deferred RC + stack over-approximation; better latency, worse throughput. **Cannot collect cycles** — they
     leak until the Store drops. Known to struggle under heavy allocation churn (see
     [wasmtime #9701](https://github.com/bytecodealliance/wasmtime/issues/9701)) — i.e. exactly the
     self-rebuild profile VL observed.
