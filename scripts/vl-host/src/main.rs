@@ -47,13 +47,44 @@ fn gc_engine(collector: Collector) -> Result<Engine> {
     cfg.wasm_function_references(true);
     // The COMPILER instance is one-shot batch work: the null collector (never
     // frees) skips every DRC barrier/refcount, trading memory for speed — give it
-    // a large reservation to grow into. User programs (`vl run`) keep DRC: they
-    // may be long-lived and actually need garbage collected.
+    // a large reservation to grow into. User programs (`vl run`) get a real
+    // collector: they may be long-lived and actually need garbage collected.
     cfg.collector(collector);
     if matches!(collector, Collector::Null) {
         cfg.gc_heap_reservation(8 << 30); // 8 GiB virtual reservation (lazily committed)
     }
     Engine::new(&cfg)
+}
+
+/// The collector for the USER PROGRAM's store (`vl run`) — `Collector::Auto`
+/// (the engine's best general-purpose collector: tracing, cycle-collecting,
+/// with an in-Wasm bump-allocation fast path) unless `$VL_GC` overrides it.
+///
+/// The knob is a RUNTIME tuning dial with no effect on program semantics: every
+/// collector runs the same emitted module to the same result, they differ only
+/// in throughput, pause behavior and peak footprint. It is deliberately an
+/// environment variable rather than a CLI flag — the engine is built before any
+/// guest code runs, and all `vl` flag parsing lives in the guest (`compiler/cli.vl`).
+///
+///   auto (default) — engine's choice; tracing, collects cycles
+///   tracing        — force the copying collector: fastest allocation, collects
+///                    cycles, stop-the-world pauses, uses half the heap
+///   refcount       — deferred reference counting: shorter pauses, much lower
+///                    throughput, and it CANNOT reclaim cycles (they leak for
+///                    the life of the process)
+///   none           — never collect; bump-allocate until the heap is exhausted,
+///                    then trap. For short batch runs only.
+///
+/// An unrecognized value is a hard error rather than a silent fallback: a typo
+/// here would otherwise quietly measure the wrong thing.
+fn run_collector() -> Result<Collector> {
+    match std::env::var("VL_GC").ok().as_deref() {
+        None | Some("") | Some("auto") => Ok(Collector::Auto),
+        Some("tracing") => Ok(Collector::Copying),
+        Some("refcount") => Ok(Collector::DeferredReferenceCounting),
+        Some("none") => Ok(Collector::Null),
+        Some(other) => bail!("unknown $VL_GC `{other}` (auto | tracing | refcount | none)"),
+    }
 }
 
 /// Render the compiler's accumulated diagnostics, one per line. A compiler
@@ -749,7 +780,7 @@ fn run_batch(args: &[String]) -> Result<()> {
     let compiler = resolve_compiler(compiler);
 
     let compile_engine = gc_engine(Collector::Null)?;
-    let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
+    let run_engine = gc_engine(run_collector()?)?;
     let module = load_compiler_module(&compile_engine, &compiler)?;
     // Pre-link once; `instantiate_pre` re-checks nothing per case.
     let pre = Linker::new(&compile_engine).instantiate_pre(&module)?;
@@ -892,7 +923,7 @@ fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
 }
 
 /// Compile `source` through the seed (names enabled, for legible trap traces) and
-/// run the emitted module on the DRC engine.
+/// run the emitted module on the user-program engine.
 fn compile_and_run(
     compiler: &CompilerSource,
     source: &str,
@@ -938,7 +969,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
     let compiler = resolve_compiler(compiler);
 
     const USAGE: &str = "usage: vl run <file.vl> | -e <source> | < stdin";
-    let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
+    let run_engine = gc_engine(run_collector()?)?;
 
     // A file argument (no `-e`): a prebuilt wasm runs directly; else it's source.
     if inline.is_none() {
