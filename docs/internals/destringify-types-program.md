@@ -1526,6 +1526,22 @@ then walk back to the enclosing function and dedupe.
     the name rung answers, because only the query half had migrated. "Byte-identical" said
     nothing; the per-witness diagnostic (which half diverges) said everything.
 
+16. **`vl run --batch` is a shared-MODULE run, not a shared-INSTANCE one** (D-ATOMKIND) —
+    every slice since D-MAPVAL has quoted it as the sidecar-LIFETIME gate note 7 asks for,
+    and it is not: `compile_vl_instance` instantiates the compiler once per CASE from a
+    once-loaded Module, so module globals are re-initialised between programs. A build whose
+    per-program column reset AND whose staleness check were both removed is byte-, output-
+    and transcript-identical over 751 `--batch` programs, and fails **21** cases of
+    `tests/cases_wasm_test.ts` — which builds ONE `WebAssembly.Instance` and compiles the
+    whole corpus through it. `SELFHOST_NATIVE_ALIGN=1 deno task test` is the lifetime gate.
+17. **A probe that reports at the END cannot see a sabotage that rejects EARLY**
+    (D-ATOMKIND) — the accumulating-marker discipline (note 7) puts the report at the end of
+    `emitProgram`, so a perturbation whose consequence is a loud `emitFail` earlier in the
+    same compile silently removes its own evidence. Four tags read 0 under an all-sites
+    sabotage for that reason alone and lit under a milder one that kept every consumer gate
+    satisfied. When a sabotage produces 0 at a site the coverage build says is reached, check
+    whether the program still reaches the report.
+
 The first three are the same underlying mistake: assuming an arena artifact answers the same
 question the string did. Check which question the site is asking, first.
 
@@ -2322,3 +2338,258 @@ standing script RC=0 again. The parse counts above are measured against 49c8c78.
   measured dual today. Left on the name path.
 - The `null` pins (`pushNarrow(nm, "null")`) bank nothing: `valueAtomKind("null")` is the
   first string compare in the ladder, so there is nothing to save.
+
+## D-ATOMKIND — the value-atom KIND is banked at the recorder, and 13 parses DELETED (#1110)
+
+D-UNION-ATOM (#1108) cleared the member-SET algebra in `wasmEmit.vl` + `emit_collect.vl` and
+left the ATOM algebra with an explicit hand-off:
+
+> The `valueAtomKind` / `scalarTagOf` / `vbHeapIdxOfAtom` family stays. `unMemKinds` is a
+> 5-way classifier and cannot produce a `valueAtomKind` code, which is a 13-way ABI tag.
+> The D-ANNSLOT technique applies exactly — `markValueUnionAtoms` already computes the kind
+> per atom and could bank an `unMemValKind` column — but that column lives in
+> `emit_state.vl` / `emit_rep.vl`. **HAND-OFF**, with #1095's warning attached.
+
+This slice takes it, and the enumeration moved the producer one step earlier than the
+hand-off named: **`recordUnMemTys` is the right recorder, not `markValueUnionAtoms`**.
+
+### Where the storage went, and why
+
+`emit_state.vl` — the natural home, beside `unMemKinds` — is owned by a concurrent agent, so
+the column lives in `emit_rep.vl` (this slice's file), which is where `recordUnMemTys` already
+is. That turned out to be the better home anyway, for three reasons:
+
+- `recordUnMemTys` is the ONE place a member set is ever split, and it holds each member's
+  atom TEXT already. `markValueUnionAtoms` runs only for rows that pass
+  `isValueUnionName` / `nameIsLitUnionArmValueUnion`; the recorder runs for **every**
+  registered row, so banking there covers strictly more.
+- The banked value is `valueAtomKind(a)` on the very string the consumers would pass —
+  **exact, not a fold** (#1095). No re-classification, no `unMemKinds` substitute.
+- The reset lives with the write. `unMemAtoms` is cleared from ABOVE this module (the top of
+  `emitProgram`, `collectU`), which cannot see a column in `emit_rep`; the recorder observes
+  the disagreement as a length mismatch and re-empties in the same call.
+
+### The enumeration (local-aware, by resolver called)
+
+A `scan_sites.py`-style scan of the three files for every call to the atom algebra
+(`valueAtomKind` / `scalarTagOf` / `vbHeapIdxOfAtom` / `litUnionArrayElemOf` and the two
+`wasmEmit`-private derivatives `atomIsRef` / `atomListWrapHeap`), each with its enclosing
+function and — for a bare-identifier argument — the `let`/`const`/param/assignment that bound
+it, INCLUDING re-assignments (method note 9). **46 call sites** (44 textual matches for the
+three exported names, of which 1 is a comment and 2 are the private helpers' own headers).
+
+The local-awareness earned its keep twice. `emitUnionCoerce`'s `atom` is bound `let atom =
+"i32"` and then RE-ASSIGNED at **16** further points before the tag is emitted — a
+bind-site-only scan reads it as the constant `"i32"` and mis-files the site as a keyword.
+And `emitIs`'s `isAtom` is re-assigned *between* its two `valueAtomKind` calls (the
+litunion→`"string"` rewrite), which is exactly why that site takes a `let` code kept in step
+rather than one `const`.
+
+| class | sites | what |
+|---|---|---|
+| **(i) keyword constants** | **13** | `scalarTagOf("null")` — a keyword, not a parse (#1108's reading, unchanged) |
+| **(iii) parser-domain** | **2** | `emit_collect`'s `registerInlineUnion` and `nulCloMixedUnionUnregistered` — annotation TEXT on its way into the tables |
+| **(ii) real consumers** | **31** | the family this slice takes |
+
+### 13 parses DELETED — the kind is derived ONCE and the decisions are projections of it
+
+The unlock is not the bank. It is that **three of the four decisions were never independent
+questions**: given `k = valueAtomKind(atom)`,
+
+- `scalarTagOf(atom)` **is** `uVariants.length + k` (`scalarTagOfKind`);
+- `vbHeapIdxOfAtom(atom)` **is** a 4-arm switch on `k` (`vbHeapIdxOfKind`);
+- `atomListWrapHeap(atom)`'s seven spelling questions are a partition of `k`
+  (`listWrapHeapOfKind`): kind 7 is exactly the i32-list backings (`i32[]`, `boolean[]`, a
+  litunion `K[]`, the `(boolean | null)[]` / `(K | null)[]` niches), kind 9 exactly the
+  string-list backings, and kinds 8/10/12 arise ONLY from the spellings `f64[]`/`i64[]`/`f32[]`;
+- `atomIsRef(atom)`'s `atom == "string"` **is** `k == 2` (`valueAtomKind` answers 2 for that
+  spelling and no other).
+
+So the consumers that needed two, three or five of these each compute the code once and read
+the projections. **No fall-through, nothing to measure** — the same shape as #1108's `RINL`:
+the site reads a value it already has.
+
+| site | before | after |
+|---|---|---|
+| `atomListWrapHeap` → `listWrapHeapOfKind` | `litUnionArrayElemOf` + `valueAtomKind` | — (kind-keyed) |
+| `atomIsRef` → `atomIsRefKind` | `valueAtomKind` | — (kind-keyed) |
+| `emitValueUnionUnboxRead` | 4 derivations (string test, closure test, list wrap, value box) | 1 |
+| `emitUnionCoerce` | 5 derivations (`scalarTagOf` + `atomIsRef`'s 3 + `vbHeapIdxOfAtom`) | 1 |
+| `emitIs` | `valueAtomKind` ×2 + `scalarTagOf` | 1 |
+| `emitNarrowedMem` | `valueAtomKind` + `vbHeapIdxOfAtom` | 1 (`mk` was already bound) |
+| `emitMapGetOrUnionBox` / `emitCoalesce` (call, field) | `vbHeapIdxOfAtom` beside a bound kind | — |
+
+### 6 consumers migrated to the BANK (arena-first, ladder)
+
+| tag | site | question | corpus reach | fuzz reach | decline |
+|---|---|---|---|---|---|
+| WMAP | `emitMapGetOrUnionBox` | the `X \| null` residual's ABI code | 3 | 87 | **0** |
+| WCOA1 | `emitCoalesce` (ident LHS) | ″ | 12 | 0 | **0** |
+| WCOA2 | `emitCoalesce` (call LHS) | ″ | 2 | 0 | **0** |
+| WCOA3 | `emitCoalesce` (field LHS) | ″ | 2 | 0 | **0** |
+| WEQW/WEQ | `emitUnionUnionEq` | the shared arms' tags, from the row's kind column | 4 | 0 | **0** |
+| RBANK | `msSoloValKind` itself | banked vs re-derived, at the point of use | 19 | 87 | – |
+
+The four residual sites share one chokepoint, `unionResidualSoloKind(set)`: the set ADT
+already performs the SUBTRACTION structurally (`msSubNull` clears the null members' bits) and
+then RENDERS the result, which the callers parsed back. Now the residual set keeps its
+identity — a singleton hands over its member's banked code, a non-singleton answers -1 (what
+`valueAtomKind` gives the rendered `""` / `"a|b"`), and only an uncovered set falls through.
+
+`emitUnionUnionEq` is the read/WRITE pair (method note 9 / #1105's discipline): the WRITE half
+is the arms loop, which pushes the left row's banked code beside each surviving spelling; the
+READ half is the tag emitted per arm. Both moved together, and an uncovered row marks its arms
+`-2` so the fall-through stays per-arm rather than per-union.
+
+### The measurement
+
+Additive probe, 15 tags, accumulated and reported ONCE at the end of `emitProgram`.
+**0 disagreements over 1,270 corpus files and 50,400 fuzz programs.** All 15 tags confirmed
+REACHED by a SEPARATELY built inverted (coverage) compiler — never the same build (note 7):
+corpus `SBANK` 426 · `WIS` 321 · `WCOE` 247 · `WUNB` 197 · `RBANK` 19 · `WCOA1` 12 ·
+`WEQ`/`WEQW` 4 · `WMAP` 3 · `WCOA2`/`WCOA3` 2 · `WNMEM` 1; fuzz `SBANK` 16,423 ·
+`WCOE` 6,190 · `WIS` 4,323 · `WUNB` 3,936 · `WMAP`/`RBANK` 87. Every DECLINE marker
+(`WMAPD`/`WCOA1D`/`WCOA2D`/`WCOA3D`/`WEQD`) fired **0** times: where these sites are
+reached, the arena leg answers.
+
+`SBANK` is the intern-time-vs-query-time question in its strongest form (method note 2). At
+the END of every emit the probe re-derives `valueAtomKind(unMemAtoms[m])` for **every**
+recorded member and compares it to what the recorder banked. That matters because
+`valueAtomKind` is not purely textual: it reads `cUserTypes` through `nameIsLitUnionType` for
+the `K[]` / `(K | null)[]` array-of-litunion spellings, so a member banked before the checker
+table settled would diverge. Over 1,270 corpus files (426 reaching) and 50,400 fuzz programs
+(16,423 reaching) it diverged **0** times.
+
+### Comparator sanity, per site (method note 12 — before believing any 0)
+
+The probe's own comparison channel was proven able to go red by building the migrated legs
+WRONG and re-sweeping: `WCOE` 194 · `SBANK` 194 · `WIS` 100 · `WUNB` 54 · `WNMEM` 1
+(class-leaving box/list/tag perturbations), and — with a milder perturbation, because the
+first one makes those programs a LOUD REJECT before the end-of-emit report runs —
+`SBANK` 167 · `RBANK` 17 · `WCOA1` 11 · `WMAP`/`WMAPB`/`WCOA2`/`WCOA2B`/`WCOA3`/`WCOA3B` 2 each.
+That "the sabotage killed the program before the marker could report" trap is worth its own
+note: a probe that reports at the END cannot observe a perturbation whose consequence is an
+early `emitFail`.
+
+The GATE channel was sabotaged per site (note 4), each perturbation chosen to leave the
+equivalence class the consumer actually distinguishes:
+
+| perturbation | what it breaks | corpus (vs migrated, 1,270 files) |
+|---|---|---|
+| `vbHeapIdxOfKind` i64 box ↔ f64 box | the `ref.cast` target + payload rep | **99 byte-diff + 93 run-status** |
+| `listWrapHeapOfKind` f64 list ↔ i64 list | the list wrapper cast (NOT the `>= 0` test) | **3 byte-diff + 3 run-status** |
+| `scalarTagOfKind` i32 tag ↔ boolean tag | the box tag the two share a value box under | **164 byte-diff + 4 stdout + 1 run-status** |
+| `msSoloValKind` → the row's last member | the residual's identity | **19 build-status + 19 run-status + 19 msg-diff** |
+| the BANK itself, i32 ↔ f64 | every projection downstream | **22 byte-diff + 19 run-status + 17 msg-diff** |
+| `msMemberValKindsOf` i32 ↔ boolean | the `==` arm chain's tags | **4 byte-diff, 0 run-diff** |
+
+The last row is the note-4 case in miniature: the perturbation is byte-observable on exactly
+the 4 files the probe says reach it, and observable in NOTHING else — the site is carried by
+the byte channel, not the run channel. And the all-sites sabotage was pushed through the whole
+harness at full volume before any 0 was believed: **205 byte-diff + 19 build-status + 107
+run-status + 4 stdout-diff** on the corpus and **5,382 tree diffs over 50,400 fuzz programs**.
+
+### A correction the sidecar-lifetime gate needed: `vl run --batch` is NOT shared-instance
+
+Method note 7 says a new arena-index column needs a shared-instance run, because corpus and
+fuzz give every program a fresh compiler. This slice's column is exactly that class, so the
+guard was sabotage-tested — and the test exposed that the gate this program has been quoting
+does not measure it:
+
+- **`vl run --batch` instantiates the compiler once PER CASE** from a once-loaded Module
+  (`compile_vl_instance`'s own doc comment in `scripts/vl-host/src/main.rs` says so). Module
+  globals are re-initialised per case. A build with BOTH lifetime guards removed — so a
+  misaligned column is actually READ — is byte-, output- and transcript-IDENTICAL over 751
+  programs in "one instance".
+- **`tests/cases_wasm_test.ts` is the shared-instance driver**: it builds ONE
+  `WebAssembly.Instance` of the seed and compiles the entire corpus through it. The same
+  guardless build fails **21** of its cases.
+
+So `SELFHOST_NATIVE_ALIGN=1 deno task test` is the sidecar-lifetime gate, and the `--batch`
+run is a shared-*Module* smoke test. Both are reported below, now labelled honestly.
+
+The sabotage also separated the two guards, which is why both are kept:
+
+- accessor length check present, recorder reset removed → the suite is **GREEN** (1,954
+  passed). The column silently goes DEAD after program 1 and every consumer falls through.
+  Correctness is preserved; the bank is not.
+- both removed → **21 failures**. The accessor's `unMemValKind.length == unMemAtoms.length`
+  invariant is the correctness guard; the recorder's reset is what keeps the bank ALIVE across
+  programs in one instance. (And the fact that the guardless build fails at all is positive
+  evidence the bank is read and consequential in a shared instance — a dead column would be
+  green.)
+
+### The call arithmetic
+
+Atom-algebra call sites in the three files, master → now:
+`vbHeapIdxOfAtom` **8 → 2**, `scalarTagOf` **20 → 16** (13 of which are the constant
+`scalarTagOf("null")`, so non-constant **7 → 3**), `litUnionArrayElemOf` **1 → 0**,
+`atomIsRef` **2 → 0**, `atomListWrapHeap` **3 → 0**, `valueAtomKind` **12 → 12** —
+net **46 → 30**.
+
+`valueAtomKind`'s flat total hides the move that matters: **one call migrated INTO the
+recorder** (`emit_rep`, the intern side — class (iii), where this program has always said a
+parse belongs) and `wasmEmit`'s ten became nine while ABSORBING five sites that previously
+derived the code inside `scalarTagOf` / `vbHeapIdxOfAtom` / `atomListWrapHeap`. Of the nine,
+**five are ladder fall-throughs behind an arena leg** and four are the single per-site
+derivation the projections read.
+
+Across all parsers in the three files (the SCORECARD CORRECTION's list): **155 → 144**
+(`wasmEmit` 55 → 43, `emit_collect` 98 unchanged, `emit_rep` 2 → 3).
+
+### What did NOT move, and why
+
+- **`scalarTagOf("null")` ×13** — a keyword, not a parse.
+- **`emitUnionPayloadUnbox` / `emitMem`** (`vbHeapIdxOfAtom`, 1 each) — neither has a kind in
+  hand, so converting them is 1 parse → 1 parse. They retire when their CALLERS carry the
+  code: `emitUnionPayloadUnbox`'s four callers already do at two of them (`emitUnionUnionEq`'s
+  `armK`), which is a signature change, not a resolution change. Left for the next slice.
+- **`emitUnionConcreteEq` / `emitUnionLitIs` / `emitUnionCoerce`'s closure arm**
+  (`scalarTagOf`, 3) — their atoms come from `unionEqAtomOf` / a literal ladder /
+  `unionClosureArmName`, none of which is a (row, index) into a recorded member. They need the
+  member→index resolution #1108 filed as the next export, not the kind bank.
+- **`emit_collect`'s 2 `valueAtomKind`** — parser-domain (class (iii)): `registerInlineUnion`
+  classifies annotation text on its way INTO the tables, and `nulCloMixedUnionUnregistered`
+  declines by construction.
+
+### Hand-offs
+
+- **`emit_classify.vl`** (concurrently owned): `vbHeapIdxOfAtom` should delegate to
+  `emit_rep`'s `vbHeapIdxOfKind`, and `scalarTagOf` to `scalarTagOfKind`, so the kind→box and
+  kind→tag tables have one home each. Exact diffs:
+  `export function scalarTagOf(atom: string) { scalarTagOfKind(valueAtomKind(atom)) }` and
+  `export function vbHeapIdxOfAtom(atom: string) { vbHeapIdxOfKind(valueAtomKind(atom)) }`
+  (plus the two names in the `./emit_rep` import). Until then the tables are kept in step by
+  hand, and the per-site sabotage above is what would catch a drift.
+- **`emit_state.vl`**: if the column is ever moved beside `unMemKinds`, its reset belongs in
+  `emitProgram`'s existing block and the recorder's lock-step guard can go — but the
+  accessor's length check must NOT, per the two-guard measurement above.
+- `emit_classify`'s private `msRowStart` can delegate to `emit_rep`'s `unMemRowStart` (same
+  bounds, same 31-bit mask limit); the duplication exists only because `emit_rep` is BELOW
+  `emit_classify` in the module graph.
+- D-NARROW (#1109) filed `currentNarrowSetIdOf` as the export that would let
+  `emitCoalesce`'s `??` complement skip the text→set resolution. That hand-off now covers
+  one more caller: `unionResidualSoloKind(cset)`'s entry is the same `msSetOfText`, so the
+  ident-LHS site would take the banked id directly and the whole path from narrowing table
+  to ABI code would never render a set at all. Same for `emitUnionUnionEq`'s
+  `msMemberValKindsOf(msSetOfText(lname), …)`, whose `lname` is a union NAME rather than a
+  narrowed set — that one wants a row id, not a set id.
+
+### Gate
+
+Corpus **byte-, run- AND message-identical** (1,270 files) · 66-case battery **0 diffs** ·
+fuzz A/B **50,400 programs/side** (seeds 1-14 × depths 4,5,6 × {plain, `--declared`} × 300),
+compared as whole `--out-dir` TREES, **0** diffs · shared-MODULE `vl run --batch` **751
+programs, 807 outputs** per side, rc 0, **0** traps, transcript identical · shared-INSTANCE
+(`tests/cases_wasm_test.ts`, one `WebAssembly.Instance` for the whole corpus) **1,954 passed,
+0 failed** · additive probe **0 disagreements** over 1,270 corpus files and 50,400 fuzz
+programs, all 15 tags REACH-confirmed by a separately built inverted compiler.
+
+`refresh-compiler.sh` / `rep-fuzz-check.sh` / `native-fixpoint.sh` / `lint-self.sh` /
+`SELFHOST_NATIVE_ALIGN=1 deno task test` (1,954 passed) / `fuzz-sweep.sh` all RC=0.
+
+The whole net was re-run after rebasing onto D-NARROW (#1109), which lands in the same two
+functions (`emitCoalesce`'s `??` complement, `emitMem`'s member-set dispatch): corpus 1,270
+files byte/run/message-identical, fuzz A/B 50,400 programs/side with 0 tree diffs, probe 0
+disagreements over both, battery 0 diffs, `--batch` 751 programs 0 traps 0 diffs, and every
+standing script RC=0 again. The counts above are measured against 16881cd.
