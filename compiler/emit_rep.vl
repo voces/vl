@@ -48,6 +48,8 @@
 import { i32ToStr } from "./ast"
 import {
   VKind,
+  mvValName,
+  mvValTyIx,
   sFieldCount,
   sFieldElemName,
   sFieldElemTyIx,
@@ -614,6 +616,163 @@ export function repElemKeyOfName(name: string): string {
   const di = resolveAnnot(name, repNoTyparams)
   if di < 0 { return "name:" + name }
   repElemKey(di)
+}
+
+// ── repMvValKey — the map-VALUE slot rep key ──────────────────────────────────
+// A canonical key for a `{[string]: V}` VALUE type's mv-table slot identity.
+// Equal iff two value spellings intern ONE `mvValName` row.
+//
+// It is neither of the two keys above, and the difference is the whole point:
+//   · NOT `repElemKey`. The ref-list layer FOLDS every shared-wrapper leaf list
+//     into one token (`i32[]`, `boolean[]`, litunion `K[]` → `$rlI32L`), because
+//     those elements ride one wrapper. The mv table does NOT: each leaf-list
+//     value spelling interns its OWN row (its `mvValName`, `mvValKind`,
+//     `mvMapTypeIdx` are per-row; the layout dedup happens LATER and separately,
+//     at `mvTwin`/`mvCanonRepOf`). Folding here would hand a caller a row whose
+//     recorded NAME is a different spelling — so the array arms recurse
+//     structurally and the leaf folds are deliberately absent.
+//   · NOT `repCanonKey`. That EXPANDS a declared struct to its field shape, so
+//     declared twins (`type A = {v:i32}` / `type B = {v:i32}`) collapse — yet
+//     `{[string]: A}` and `{[string]: B}` are distinct mv rows with distinct
+//     `mvValStructIdx`. A declared struct therefore keys on its NOMINAL slot
+//     (`repSlotOfTyDecl`), exactly as `repElemKey` does; only an INLINE shape is
+//     expanded structurally (its arena index is minted fresh per spelling, so an
+//     index key would make the intern and the lookup disagree).
+// The one FOLD it does perform mirrors `mvCanonValName`, the string surgery it
+// replaces: a litunion member of a MIXED union is STRING-repped in the box, so
+// it keys "string" (same niche guard — a PURE `K0` / `K0 | null` keeps its
+// atom-i32 render).
+//
+// Strictness is the safe direction: a key finer than the name equality makes the
+// resolver DECLINE (the caller falls through to its name scan), while a coarser
+// one would hand back another row's slot.
+export function repMvValKey(ty: i32): string {
+  if ty < 0 { return "!" }
+  let si = repMvKeyStack.length - 1
+  while si >= 0 {
+    if repMvKeyStack[si] == ty {
+      return "#" + i32ToStr(repMvKeyStack.length - si)
+    }
+    si = si - 1
+  }
+  repMvKeyStack.push(ty)
+  let s = repMvValKeyGo(ty)
+  repMvKeyStack.pop()
+  if s.length > 262144 { s = "@big:" + i32ToStr(ty) }
+  s
+}
+
+// Cycle guard (de Bruijn back-edges), mirroring `repElemKeyStack`.
+const repMvKeyStack: i32[] = []
+
+function repMvValKeyGo(ty: i32): string {
+  const t = T.tys[ty]
+  // No leaf-list fold: `i32[]` / `boolean[]` / `K[]` are DISTINCT mv rows.
+  if t is TyArray { return repMvValKey(t.aElem) + "[]" }
+  if t is TyObj {
+    const ds = repSlotOfTyDecl(ty)
+    if ds >= 0 { return "S" + i32ToStr(ds) }
+    let s = "{"
+    let i = 0
+    while i < t.objFieldNames.length {
+      s = s + t.objFieldNames[i] + ":" + repMvValKey(t.objFieldTypes[i]) + ","
+      i = i + 1
+    }
+    return s + "}"
+  }
+  if t is TyPrim { return t.primName }
+  if t is TyNullable { return repMvValKey(t.nInner) + "?" }
+  if t is TyUnion {
+    let mixHasOther = false
+    let mi = 0
+    while mi < t.uMembers.length {
+      const mt = T.tys[t.uMembers[mi]]
+      let mLit = tyIsLitUnion(t.uMembers[mi])
+      if mt is TyLit { mLit = true }
+      let mNull = false
+      if mt is TyPrim {
+        if mt.primName == "null" { mNull = true }
+      }
+      if !mLit && !mNull { mixHasOther = true }
+      mi = mi + 1
+    }
+    let s = "("
+    let emitted = 0
+    let sawWideStr = false
+    let i = 0
+    while i < t.uMembers.length {
+      let r = repMvValKey(t.uMembers[i])
+      let skip = false
+      if mixHasOther {
+        let iLit = tyIsLitUnion(t.uMembers[i])
+        const it = T.tys[t.uMembers[i]]
+        if it is TyLit { iLit = true }
+        if iLit { r = "string" }
+        if r == "string" {
+          if sawWideStr { skip = true }
+          sawWideStr = true
+        }
+      }
+      if !skip {
+        if emitted > 0 { s = s + "|" }
+        s = s + r
+        emitted = emitted + 1
+      }
+      i = i + 1
+    }
+    return s + ")"
+  }
+  if t is TyFunc {
+    let s = "("
+    let i = 0
+    while i < t.fnParamTypes.length {
+      if i > 0 { s = s + "," }
+      s = s + repMvValKey(t.fnParamTypes[i])
+      i = i + 1
+    }
+    return s + ")=>" + repMvValKey(t.fnRet)
+  }
+  if t is TyMap {
+    let s = "M"
+    if t.mSet == 1 { s = "Se" }
+    return s + "[" + repMvValKey(t.mKey) + ":" + repMvValKey(t.mVal) + "]"
+  }
+  if t is TyNeg { return "!" + repMvValKey(t.negTy) }
+  // TyVar / TyLit / TyErr — keep them distinct by arena index (never a false merge).
+  "@" + i32ToStr(ty)
+}
+
+// Record the arena type of the map VALUE name JUST pushed onto `mvValName`. Pads
+// with -1 so an intern site that does not call this self-heals to "uncovered".
+export function recordMvValTyIx(nm: string) {
+  while mvValTyIx.length + 1 < mvValName.length { mvValTyIx.push(-1) }
+  mvValTyIx.push(fieldElemTyIxOfName(nm))
+  0
+}
+
+// The interned mv slot whose VALUE type is `ty`, or -1 when the arena does not
+// claim one — the structural answer to the `mvValName[i] == valName` scans.
+// First-match-wins, exactly like the name scans it fronts. Both sides compute the
+// key at QUERY time from the recorded arena INDEX (never a key frozen at intern
+// time), so an in-place arena mutation moves both together — the D1 hazard.
+export function mvSlotOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const k = repMvValKey(ty)
+  let i = 0
+  while i < mvValTyIx.length {
+    if mvValTyIx[i] >= 0 {
+      if repMvValKey(mvValTyIx[i]) == k { return i }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The name bridge for the mv layer (still name-keyed at its entry points):
+// resolve a map-value NAME to its arena type, then to its slot. -1 when the name
+// does not resolve or no row claims it — the caller keeps its name scan.
+export function mvSlotOfValNameTy(nm: string): i32 {
+  mvSlotOfTy(fieldElemTyIxOfName(nm))
 }
 
 // The interned STRUCT-table slot for an object type `ty`, derived from the arena
