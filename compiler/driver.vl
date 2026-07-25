@@ -57,12 +57,22 @@ import { capHas } from "./emit_base"
 import { tokenize } from "./lexer"
 import {
   P,
+  TS_APP,
+  TS_MAP,
+  TS_NAME,
+  annTsOf,
   declNameTok,
   declNameTokOf,
   i32ToStr,
   mkProgram,
   nodeToks,
+  tsKidCount,
+  tsKidStart,
+  tsKids,
+  tsKind,
   tsReset,
+  tsText,
+  tsToName,
   ufcsAliasAdd,
   ufcsAliasReset,
 } from "./ast"
@@ -2374,10 +2384,65 @@ function modTypeRenamed(tn: string): string {
 // rewriter never sees them). A top-level name shadowed by a param, loop var, or
 // block-local `let`/`function` is left alone for that scope's extent
 // (`modShadow`, a save/restore stack).
+// ── D-PARSETY P1: the merge rewrites the SPELLING TREE, not the string ───────
+// Rename every TYPE-position identifier in the spelling subtree rooted at `root`
+// through the module's rename map: the head of a `TS_NAME` / `TS_APP` (`Point`,
+// `Box` of `Box<i32>`) and a `TS_MAP`'s KEY (itself a type name). A live generic
+// type-parameter (`modTyShadow`) is the parameter, never a colliding top-level
+// binding — the same guard `modTypeRenamed` applies per segment.
+//
+// What the TREE knows and the segment scanner cannot: `TS_FIELD.tsText` is a
+// FIELD name and `TS_LITSTR` / `TS_LITNUM` are literal lexemes, so none of them
+// is a rename candidate. `modTypeRenamed` sees only "an identifier run", so an
+// inline object field whose name collides with a top-level type declaration in
+// the same module (`type v = i32` + an annotation `{v: i32}`) had its FIELD
+// renamed to `v$mN` — the annotation then described a struct with a field no
+// literal has, and the diagnostic demangler stripped the `$mN` so the two types
+// RENDERED identically (`cannot assign {v: i32} to 'h' of type {v: i32}`). Pin:
+// `tests/cases/modules/field-name-shadows-type/`.
+function modRwTsName(root: i32): i32 {
+  if root < 0 { return 0 }
+  const k = tsKind[root]
+  if k == TS_NAME || k == TS_APP || k == TS_MAP {
+    const seg = tsText[root]
+    if seg.length > 0 && !capHas(modTyShadow, seg) {
+      let j = 0
+      while j < modRenameFrom.length {
+        if modRenameFrom[j] == seg { tsText[root] = modRenameTo[j] }
+        j = j + 1
+      }
+    }
+  }
+  const start = tsKidStart[root]
+  const cnt = tsKidCount[root]
+  let i = 0
+  while i < cnt {
+    modRwTsName(tsKids[start + i])
+    i = i + 1
+  }
+  0
+}
 function modRwType(tyIx: i32): i32 {
   if tyIx < 0 { return 0 }
   const t = P.nodes[tyIx]
-  if t is TypeRef { t.tyName = modTypeRenamed(t.tyName) }
+  if t is TypeRef {
+    // The parser recorded this annotation's structure — rewrite THAT and render
+    // the name from it, so the tree and the string stay in lockstep (note 22: an
+    // in-place string rewrite between producer and consumer is exactly what left
+    // the spelling tree describing the PRE-merge name).
+    const root = annTsOf(tyIx)
+    if root >= 0 {
+      modRwTsName(root)
+      t.tyName = tsToName(root)
+      return 0
+    }
+    // No recorded spelling: a `TypeRef` the parser never built. None exist at
+    // merge time (the emitter's `synthTypeRef` runs much later) — a sabotage
+    // build that poisons this arm is corpus byte-, message- and run-identical
+    // over 1,282 files — but the character scanner stays as the fall-through so
+    // the pass is total either way.
+    t.tyName = modTypeRenamed(t.tyName)
+  }
   0
 }
 // The first `saved` entries of a shadow stack (rebuild — a bare `.pop()`
