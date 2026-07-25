@@ -2013,6 +2013,9 @@ side answers.* With the sidecar it factors into three checkable parts:
    clones and synthesized return pins are covered. The only two annotation SYNTHESES that
    postdate `collectA#2` — `synthParamAnnots` and `collectLocals`' inferred `<elem>[]`
    binding — record at their own mint site, on the same predicate.
+   Both recorders are exercised, not defensive dead code: the param recorder's site is
+   reached on **140** corpus files and banks a row on 1; the `collectLocals` site is
+   reached on 4 and banks a row on 1.
 3. **A node with no recorded type is no longer a hole.** `annTyNulFlag`'s -1 arm now reads
    the sidecar's `| null` flag, so an uncovered node reaches `annRefArrSlot` instead of
    being gated out of it.
