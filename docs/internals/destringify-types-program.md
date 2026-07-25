@@ -1499,6 +1499,19 @@ then walk back to the enclosing function and dedupe.
     3,840 reaches. The struct table receives anonymous literal rows and the variant table
     does not, so the shared shape hides different input populations. Measure each site.
 
+12. **A comparator that cannot fire is not a clean A/B** (D-ANNSLOT) — a fuzz A/B compared
+    `<case>.out` while `vl run --batch --out-dir` writes `<case>.vl.out`, so every file it
+    checked was absent on both sides and it reported 0 diffs over 50,400 programs. It was
+    caught only because a SABOTAGE that reddens the corpus 163 times reported 0 on the same
+    fuzz leg. Run the sabotage through the whole harness before trusting a 0 — and prefer
+    comparing whole output TREES (`diff -r`) to per-file names you construct.
+
+13. **A migrated rung with two halves needs both measured** (D-ANNSLOT) — the struct-twin
+    rung resolves a QUERY row and a CANDIDATE row and compares them. Three structural
+    versions of it were byte-identical over 51,670 programs and answered 0 of the 6 cases
+    the name rung answers, because only the query half had migrated. "Byte-identical" said
+    nothing; the per-witness diagnostic (which half diverges) said everything.
+
 The first three are the same underlying mistake: assuming an arena artifact answers the same
 question the string did. Check which question the site is asking, first.
 
@@ -1945,7 +1958,9 @@ sources are worth killing, and it is a much smaller set than the call counts sug
   family. Retiring them is ONE piece of work — **prove `nodeTyIx` totality for annotation
   nodes** (the C1 endgame) and **give `rlSlotByName`'s struct-twin rung an arena input** —
   after which eleven legs fall together. That is the highest-leverage item this program has,
-  and this map is what identifies it as one item rather than eleven.
+  and this map is what identifies it as one item rather than eleven. (Done in D-ANNSLOT
+  below — 13 legs, and neither prerequisite turned out to be needed in the form stated: the
+  intern pass already knows the answer and can bank it on the node.)
 - The measurement also refutes a tempting shortcut: "delete the legs that never fire". Two
   of the seven load-bearing legs (`SFTGT`, `MVNIC`) fire on **6 corpus files each** — well
   inside the range a reader would dismiss as noise — and both are consequential **100%** of
@@ -1959,3 +1974,127 @@ measurement itself: probe and inverted probe each `refresh-compiler.sh` RC=0 fro
 pinned master seed; corpus sweep 1,269 files per build; fuzz 48,153 programs. Standing gate
 on the landed tree: `refresh-compiler.sh` / `rep-fuzz-check.sh` / `native-fixpoint.sh` /
 `lint-self.sh` / `SELFHOST_NATIVE_ALIGN=1 deno task test` / `fuzz-sweep.sh` all RC=0.
+
+## D-ANNSLOT — the first name fall-throughs DELETED: the intern pass banks its row on the node
+
+D-TOTALITY named the one piece of work that would retire the whole `nameIsRefArray`
+consumer family: prove the arena leg **total** for an annotation node. It listed two
+mechanisms a 0-consequential count cannot rule out — `nodeTyIx` coverage, and
+`rlSlotByName`'s struct-twin third rung. This slice closes the first, measures the second
+to a sharper verdict than the one it was given, and **deletes 13 name fall-throughs**.
+
+The unlock is not a better structural classifier. It is noticing that the question these
+consumers ask has *already been answered* earlier in the same compile:
+
+> `collectA`'s ref-array arm runs on exactly `nameIsRefArray(name) || nameIsNulRefList(name)`
+> — the same predicate the consumers' name legs evaluate — and interns the element's
+> ref-list ROW. That row IS what every one of those consumers wants.
+
+So the arm banks it on the annotation NODE (`annRlSlot` / `annRlNul`, an `i32` column pair
+keyed by node index, cleared with the ref-list table it names), and `annRefArrSlot` /
+`annTyNulFlag` read it after the recorded type declines. The parse stays exactly where this
+program always said it belonged — the **intern** side, class (iii) — and the 13 consumers
+become lookups.
+
+### Why this is total where a classifier is not
+
+The claim needed for deletion is: *if the deleted name path would have answered, the arena
+side answers.* With the sidecar it factors into three checkable parts:
+
+1. **The predicate is the same one.** `collectA`'s arm is guarded by the very
+   `nameIsRefArray` / `nameIsNulRefList` test the deleted legs ran, and the arm interns
+   unconditionally (`ensureRefElem` → `rlInternName`). Measured: the arm fires on **190**
+   corpus files and **3,425** fuzz programs; an EARLIER arm of the `else if` chain
+   (arrow / map / nulmap / string-array) swallowing a node the predicate accepts —
+   the one way the guard could be narrower than the consumers' — fires **0** times in
+   1,270 corpus files and 50,400 fuzz programs, as does an empty element name.
+2. **Every annotation node is walked.** `collectA` scans the whole node arena, and the
+   pass table re-runs it (`collectA#2`) after `monomorphize` and `synthRetAnnots`, so mono
+   clones and synthesized return pins are covered. The only two annotation SYNTHESES that
+   postdate `collectA#2` — `synthParamAnnots` and `collectLocals`' inferred `<elem>[]`
+   binding — record at their own mint site, on the same predicate.
+   Both recorders are exercised, not defensive dead code: the param recorder's site is
+   reached on **140** corpus files and banks a row on 1; the `collectLocals` site is
+   reached on 4 and banks a row on 1.
+3. **A node with no recorded type is no longer a hole.** `annTyNulFlag`'s -1 arm now reads
+   the sidecar's `| null` flag, so an uncovered node reaches `annRefArrSlot` instead of
+   being gated out of it.
+
+Part 3 is what the C1-endgame question was blocking on, and the study says the hole is
+narrower than feared. A probe that classifies **every** decline of the three helpers found,
+over 1,270 corpus files and 48,153 fuzz programs: **0** nodes with no recorded arena type,
+**0** covered-but-not-an-array nodes where the name sees an array, **0** rung-3-answerable
+misses. The synthesis side is equally clean — `synthTypeRef` recorded -1 **0** times; the
+only unresolvable-name records are the deliberate placeholder pins (`#anonN`, `=>sigkey`,
+30 corpus / 22 fuzz), never an array spelling. And the checker's own recorders cannot be
+skipped: `nodeTyIx` is sized to `P.nodes.length` at `checkProgram` entry, the checker
+creates no AST nodes, and an annotation it cannot resolve raises a diagnostic — which
+`compileSource` turns into "no emit" before the emitter ever runs.
+
+### What was deleted (13 legs)
+
+`tyAnnRefListSlot` · `tyAnnRefListKind` · `retRefArrFlag` · `retNulRefArrFlag` ·
+`paramRefArray` · `letIsNulRefArray` · `nulRefArrayInnerSlotOfLet` ·
+`nulRefArrayInnerSlot` (param arm) · `letIsRefArray` · and the ref-array rejects of
+`letIsStringArray` / `letIsF32Array` / `letIsI64Array` / `letIsF64Array`.
+
+Ref-array parser CALL counts, master → now (non-comment call sites):
+`nameIsRefArray` **44 → 35**, `refArrElemKind` **14 → 12**, `refArrElemName` **44 → 42**,
+`rlSlotByName` **26 → 25**, `nullablePartOf` **84 → 79** — net **−19** calls, including the
+3 the two late-synthesis recorders add back. The parser FUNCTIONS stay: they are the intern
+side's own machinery, which is where this program has always said the parse belongs.
+
+### Decline-rate re-measurement
+
+The 13 legs' fall-throughs no longer exist, so their reach is 0 by construction. Two
+measurements are worth recording instead.
+
+- **Before deleting**, the same D-TOTALITY probe re-run on the sidecar tree reproduced
+  master's numbers exactly (corpus: `ASLOT`/`AKIND` 918, `CPAR` 802, `DRETN` 778,
+  `CRET` 761, `DLETN` 551, `ELETRA` 14, `FSTR`/`FI64` 18, `FF64` 19, `FF32` 16;
+  consequential **0** everywhere) — and an added marker inside `ASLOT`'s decline shows its
+  `nameIsRefArray` gate is passed **0** times, so the whole 918-file decline population is
+  "not a ref array at all".
+- **The sidecar itself never fires**: on 1,270 corpus files and 46,310 reaching fuzz
+  programs, `annRefArrSlot`'s recorded-type leg answers or nothing does — the sidecar
+  supplied a row **0** times, and its `| null` flag **0** times. It is a proof obligation
+  discharged, not a hot path: it exists so that an uncovered node or a synthetic-`#anonN`
+  element row cannot silently answer "not a ref array" now that the name legs are gone.
+
+### The struct-twin rung: the QUERY half migrates, the CANDIDATE half does not
+
+D-TOTALITY attributed `sFieldRefSlot`'s (`WSFRL`) load-bearing fall-through to
+`rlSlotByName`'s third rung and asked whether that rung can take an arena input. It can be
+*asked* structurally — and the answer, measured, is that only half of it currently resolves:
+
+- A structural rung was implemented three ways (query row via `repSlotOfTy`, via
+  `structIndexOfTy`, via `repRowOfTyStruct`), each byte- and run-identical over 1,270
+  corpus files and 50,400 fuzz programs — and each answered **0** of the 6 corpus cases
+  where the name rung answers. Byte-identical AND useless is the honest reading: it was not
+  landed.
+- A per-call diagnostic at those 6 witnesses says why. The QUERY half migrates cleanly:
+  `repRowOfTyStruct(elemTy, sScanLim())` picks the **same** struct row as
+  `structIndexOfTypeName(qBase)` at 6/6. The `| null` niche parity migrates too
+  (`rlElemIsNulNiche` never disagreed with the stored name's `nullablePartOf`). The
+  CANDIDATE half does not: `rlElemStructRow(j)` — the ROW's own element→struct-row
+  resolution — differs from `structIndexOfTypeName(eBase)` at every witness, and the row's
+  (covered!) element type does not canon-resolve to the name's row either. Substituting the
+  name's candidate resolution makes the rung answer immediately.
+  **The blocker is `rlElemStructRow`, not `rlSlotOfTy`** — the next slice's target, and a
+  smaller one than "give the twin rung an arena input" suggested.
+- One correction to the D-TOTALITY map: `WSFRL`'s 6 consequential corpus declines all have
+  a **covered** element type (`WSFRLU`, the uncovered-element population, is 465 files and
+  is consequential **0** times). They are genuinely the twin-spelling class, not the
+  `#anonN` class — which is why the fix is a resolution-vocabulary fix and not a coverage one.
+
+### Gate
+
+Corpus **byte-identical + message-identical** (1,270 files, `vl build` bytes and the
+compiler's full stdout/stderr) · fuzz A/B **50,400 programs/side** (seeds 1-14 × depths
+4,5,6 × {plain, `--declared`} × 300), whole `--batch` output trees compared, **0** diffs ·
+66-case battery **0** diffs · shared-instance `vl run --batch` **700 programs in ONE
+instance**, rc 0, **0** traps, transcript and every output identical · sabotage (the bare
+leg forced to decline, i.e. the deletion made wrong) **163** corpus diffs and **288** fuzz
+diffs, so the A/B has power at these sites. `refresh-compiler.sh` / `rep-fuzz-check.sh` /
+`native-fixpoint.sh` / `lint-self.sh` / `SELFHOST_NATIVE_ALIGN=1 deno task test` (1,954
+passed) / `fuzz-sweep.sh` all RC=0.
