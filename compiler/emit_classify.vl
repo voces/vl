@@ -4075,6 +4075,35 @@ export function rlElemTyIxAt(slot: i32): i32 {
   rlElemTyIx[slot]
 }
 
+// ── the RENDER→PARSE round trip: "did the checker type this node as a FUNCTION" ──
+// `nodeTyName(ix)` RENDERS the node's recorded arena type; three consumers then took
+// the render apart with `annArrowAt(...) >= 0` (a top-level `=>` scan). The renderer
+// had the type, so the consumers can have it too (destringify D-ARROWTY).
+//
+// The dual is EXACT, not approximate, for every render `nodeTyName` can produce:
+//   · `TyPrim` / `TyObj` render through `tyToStr`, which spells a function type with
+//     `->` and never `=>`, and wraps an object in `{…}` so nothing sits at depth 0;
+//   · `TyArray` renders `tyToEmitName(elem) + "[]"` with the element PARENTHESIZED
+//     whenever it is a `TyFunc` (or contains a top-level `|`), precisely so the
+//     trailing `[]` cannot bind into a closure result — so an array's render has no
+//     depth-0 `=>` either;
+//   · `TyFunc` renders `"(" + params + ")=>" + result`, whose `=>` is always at
+//     depth 0 by construction;
+//   · every other kind renders "".
+// So for a NON-EMPTY render, `annArrowAt(nm) >= 0` holds exactly when the type is a
+// `TyFunc`. The one residual is a `TyFunc` whose render FAILS ("" — an unrenderable
+// param/result): the name test says no and this says yes. Callers therefore keep the
+// `!= ""` render guard where they already had one, which makes the substitution
+// byte-exact rather than merely measured. (Measured anyway: 0 disagreements in 11,846
+// comparisons over 1,274 corpus files + 50,400 fuzz programs, in BOTH directions.)
+export function nodeTyIsFuncTy(ix: i32): boolean {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyFunc { return true }
+  false
+}
+
 // `refArrElemName`'s structural dual over a ref-list ELEMENT type: peel one
 // `TyNullable` hop (the `(S[] | null)[]` niche the name path recurses through),
 // then take the `TyArray`'s element. -1 when the element is not an array — the
@@ -18072,8 +18101,11 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
     // The whole call is a closure iff the checker typed its RESULT as a function type; the
     // inner call lowers via its own `exprIsClosure`/`call_ref`. Reads the checker type
     // directly (the same source `cloCallSigKey` keys off), so no per-position resolver.
+    // The "is it a function type" question is asked of the ARENA (`nodeTyIsFuncTy`,
+    // D-ARROWTY) instead of of the render; the render survives only as the
+    // does-it-render gate that made the old `annArrowAt` test byte-exact.
     const tn = nodeTyName(exprIx)
-    return tn != "" && annArrowAt(tn) >= 0
+    return tn != "" && nodeTyIsFuncTy(exprIx)
   }
   if e is Member {
     // A closure FIELD of a NARROWED union receiver (`t0 is {a, f: (i32) => K0, z} {
@@ -18476,7 +18508,9 @@ export function identFnTypeAnnName(name: string, fnIx: i32) {
             const ini = P.nodes[d.letInit]
             if ini is Call {
               const itn = nodeTyName(d.letInit)
-              if annArrowAt(itn) >= 0 { return itn }
+              // D-ARROWTY: the arena answers "is this a function type"; the render
+              // is still the RETURN VALUE, so its `!= ""` gate stays.
+              if itn != "" && nodeTyIsFuncTy(d.letInit) { return itn }
             }
             // A COPY of another closure binding (`const t0 = p` where `p: ((i32) => string) | null`
             // — the intermediate the nullable-read pattern `const t0 = p; if t0 != null { t0(1) }`
@@ -18494,7 +18528,8 @@ export function identFnTypeAnnName(name: string, fnIx: i32) {
             if ini is BinExpr {
               if ini.binOp == "??" {
                 const jtn = nodeTyName(d.letInit)
-                if annArrowAt(jtn) >= 0 { return jtn }
+                // D-ARROWTY, as the Call arm above.
+                if jtn != "" && nodeTyIsFuncTy(d.letInit) { return jtn }
               }
             }
             // An UN-annotated binding read from a CLOSURE-element ref list (`const f = xs[i]`
