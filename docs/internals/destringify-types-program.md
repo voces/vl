@@ -342,14 +342,127 @@ just to a generator.
 `unionRefArrayArmSlotForElemAtom` (atom-EQUALITY against a rendered element set),
 `unionClosureArrElemUnion` (returns an element NAME the name-keyed reflist layer consumes),
 `unionHasRefArrayArmSlot` / `unionNestedArrayArmSlot` (refuted, above — they need a predicate
-that fuses shape with reflist intern state, which is D5's territory, not a shape dual),
-`unionHasCollapsedStringMapArm` (dead, above), and `emitUnionCoerce`'s alias expansion (the
-union-boxing ABI).
+that fuses shape with reflist intern state, which is D5's territory, not a shape dual), and
+`unionHasCollapsedStringMapArm` (dead, above). `emitUnionCoerce`'s atom ladder moved in batch
+4, below; its ALIAS EXPANSION (`unionMemberSetOf` at the head of the function) deliberately
+did not — it hands a member-set STRING to the arms further down that still classify text, and
+retiring it is the same job as retiring the name column itself (D5).
 
 **Correct as-is, deliberately untouched:** `unionMemberCount(unionMemberSetOf(…)) > 1` (a
 count), `structUnionNullCmpName` (`unionHasAtom(set, "null")` + a non-null count — `null` is
 a keyword, not a rendered shape), `setNarrowFromCondElse` / `currentStructNarrowSetOf`
 (narrow-SET algebra over the narrowing table, whose keys are member-set strings by design).
+
+**Batch 4 — the union-BOX ABI (`emitUnionCoerce`'s atom ladder and the tag selectors
+around it) — SHIPPED.** The highest-risk consumer batch: these predicates do not ask "is
+there an arm of shape X", they decide **which tag a value is boxed under**, so a wrong
+answer is a silent wrong answer at the matching `is` (or a cast trap), not a loud reject.
+
+**Every path enumerated first**, because that is what the two earlier parks in this program
+were caused by not doing. The layer is `unionHasAtom(set, <atom>)` — `splitUnionAtoms` the
+member set, compare each atom to a FIXED keyword — reached from **16 decision sites** (28
+calls), fifteen in `wasmEmit.vl` and one in `emit_classify`:
+
+| tag | site | the decision |
+|---|---|---|
+| `UCI` | `emitUnionCoerce` | a bare int boxes `i64` when the union has no `i32` arm but an `i64` one |
+| `EQA` | `unionEqAtomOf` | the same i32/i64 choice for the CONCRETE side of a union `==` |
+| `UCF` | `emitUnionCoerce` | a float literal boxes `f32` when the only float arm is `f32` |
+| `UCL` | `emitUnionCoerce` | an int-element list adopts the union's `i64[]`/`f64[]`/`f32[]` arm (+ `pendingListKind`) |
+| `UCLF` | `emitUnionCoerce` | the list twin of `UCF` |
+| `ULAE` | `emitUnionListLitViaRefArm` | the union's OWN value-atom list arm wins over the ref-arm route |
+| `ULA0` | `emitUnionListLitViaRefArm` | an empty `[]` — route only when NO value-atom list arm could claim it |
+| `EQH` | `emitUnionConcreteEq` | the other operand's rep has an arm (else statically unequal) |
+| `EQS` | `emitUnionUnionEq` | both sides carry `string` (the `!aUsed` loud reject) |
+| `LII` / `LIH` | `emitUnionLitIs` | the literal's rep atom, and whether an arm carries it |
+| `SFN` | `emitOmittedFieldNull` | a code-16 field omits to `null` only when `null` is a member |
+| `MVN` | `emitMapGetOr` | a boxed map value carrying `null` takes the null-TAG `??` path |
+| `CUN`/`KUN`/`MUN` | `emitCoalesce` | the ident / call / union-field `??` null-tag paths |
+
+`unMemHasAtom(name, atom)` is the structural dual, tri-state (1 / 0 / **-1 uncovered**), and
+`unionHasAtomTy` is the ladder-faithful wrapper: the arena decides where the row is covered,
+the member-NAME scan is the untouched fall-through.
+
+**`EQA` is in the batch because a read/write PAIR must not straddle two legs.**
+`unionEqAtomOf` is the concrete side's atom classifier — the read-side mirror of
+`emitUnionCoerce`'s `UCI` arm, running the identical `!has("i32") && has("i64")` test — and
+its answer is handed straight to `EQH`. Migrating the write side (`UCI`) and leaving the read
+side on the name path would mean that on any input where the two legs ever disagreed, a value
+would be BOXED under one tag and COMPARED under another: a silent wrong `==`. Nothing in the
+corpus or the fuzz corpus makes them disagree, so this is a latent asymmetry rather than a
+live bug — but introducing one deliberately is exactly the class of defect this program
+exists to remove, so both halves move together.
+
+**Which axis each site is on, decided before the swap.**
+- **D2 (type vs REP) — all 16, and the answer is "keep it a TYPE test".** The tempting reuse
+  is `unMemAtomKind` (already in the tree, batch 3). It is **wrong here**: it folds `i32[]`,
+  `boolean[]` and a litunion `K[]` onto one kind (they share the `lTypeIdx` i32-list
+  backing), and these callers turn the atom into `scalarTagOf(atom)`. A fold would hand back
+  a tag no producer interned for the value. So `unMemHasAtom` is deliberately EXACT: a
+  `TyPrim` with the atom's own `primName`, and for `X[]` a `TyArray` over exactly that
+  `TyPrim`. A `(i32 | null)[]` element (`TyNullable`) and a litunion element (`TyUnion`)
+  answer NO on both paths, as they must. This is the D2 lesson run in the opposite
+  direction from #1094's: there the existing keys were too COARSE, here the tempting one is.
+- **D1 (timing).** `unMemTys` records an INDEX at registration and every read re-derives from
+  `T.tys[m]` at query time, so an in-place arena mutation (`holeMemberTy`) moves both legs
+  together — the property D1's refutation showed a frozen key does not have.
+- **D3′ (structure vs intern state) — audited, and the sentinel is clean.** The failure mode
+  in #1093's refutation was a degenerate `-1` matching a caller's `-1`. Here the arena leg's
+  miss value is a tri-state `-1` consumed only by `unionHasAtomTy`, which turns it into "use
+  the name path"; no caller ever sees it. The predicate carries **no** intern state (unlike
+  `nameIsRefArray`): it reads the arena and nothing else.
+
+**Method + measurements.** Additive probe at all 16 sites at once (both answers computed, the
+NAME answer KEPT, an **accumulating** tag set reported once at the end of `emitProgram`):
+**0 disagreements** over the 1,265-file corpus (`tests/cases` + `std/` + the compiler's own
+source) and **0** over **25,200** fuzz programs (seeds 1–14 × depths 4–6 × {plain,
+`--declared`} × 300). Coverage came from the **inverted** build, never from the probe's own
+report channel (method note 7). Corpus **byte-identical** AND run-identical (status +
+stdout); 66-case battery 0 diffs; fuzz A/B identical (2,248 shape lines both sides);
+self-compile wall clock 1,309 ms → 1,320 ms (min of 7 interleaved rounds).
+
+**Sabotage-verified per site**, one all-sites inversion, gated on the arena leg having
+actually answered so "fired" means the MIGRATED leg ran — corpus / fuzz programs:
+`UCI` 137/1229 · `UCF` 58/1443 · `MVN` 23/436 · `ULAE` 17/385 · `UCL` 12/210 · `CUN` 12/0 ·
+`UCLF` 4/83 · `EQS` 4/0 · `LII` 3/0 · `LIH` 3/0 · `ULA0` 2/0 · `MUN` 2/0 · `KUN` 2/0 ·
+`EQH` 2/0 · `EQA` 2/0 · `SFN` 1/0. **No site had zero coverage**, so none was left unmigrated
+for want of evidence — the fuzzer reaches only the six `emitUnionCoerce`/map shapes, and the
+corpus carries the other ten.
+
+**Gate-channel sabotage, per site.** An arena leg whose verdict is INVERTED exactly where it
+answers (every other migrated site left correct) reddens the corpus A/B for **15 of the 16**:
+`UCI` 133 byte + 116 run-status + 14 stdout · `UCF` 58 + 56 + 1 · `MVN` 11 byte + 12 build +
+15 run · `CUN` 12 build + 12 run · `ULAE` 8 + 2 build + 8 run + 2 stdout · `UCL` 3 + 3 build +
+3 run + 3 stdout · `UCLF` 1 + 3 build + 3 run + 1 stdout · `LII` 3 + 2 stdout + 1 run ·
+`LIH` 3 + 2 stdout + 1 run · `EQH` 2 + 2 stdout · `EQA` 2 + 2 stdout · `KUN`/`MUN` 2 build +
+2 run each · `ULA0` 1 + 1 run · `SFN` 1 build + 1 run. All 15 `wasmEmit` sites inverted at
+once: **153 BYTEDIFF + 33 build-status**, **166 run-status + 14 stdout**.
+**`EQS` produces ZERO corpus diffs when deliberately broken** — its condition is
+`… && … && !aUsed`, and on the whole corpus `aUsed` is already true wherever it is reached,
+so the union tests cannot change the outcome. Stated plainly: **the probe (4 corpus firings,
+0 disagreements) is that site's only gate.** The risk it carries is bounded — a wrong answer
+there can only add or drop a *loud reject* (`union string == but array type not collected`),
+never mis-tag a box.
+
+**Sidecar lifetime (method note 7).** `unMemTyStart`/`unMemTyCount`/`unMemTys` are now emptied
+at the **top of `emitProgram`**, not only in `collectU`, for the reason D-MAPVAL paid four
+trapping suite cases to learn: the rows are `T.tys` indices and a fresh program re-mints the
+arena. Gated with a **shared-instance** run (`vl run --batch`, 307 union/struct/map/object/
+array programs in ONE compiler instance): 307/307 outputs, 0 errors, 0 traps, 0 diffs vs
+master. Measured honestly: removing the new reset leaves the 1,949-case suite and that batch
+**green**, so on today's surface `collectU` does run first and the reset is a *precaution* —
+but the sidecar's correctness should not rest on collect-pass ordering.
+
+**Still on the name path after batch 4 (12 raw `unionHasAtom` calls).** `emitUnionUnionEq`'s
+cross-union arm scan (`unionHasAtom(rname, lAtoms[ai])` — atom EQUALITY between two rendered
+member sets, whose result is then fed BACK as `scalarTagOf(arms[k])`; its dual needs a
+type-equality join, not an atom test), the eleven narrowing/classification readers in
+`emit_classify` (`nulRefMapValInnerOf`, `mvUnionIsScalarNull`, `retNullableUnion`, … — the
+narrowing layer, not the box ABI), and `emit_collect`'s inferred-return null test.
+`exprIsUnionStrEq`'s two `"string"` tests stay too, deliberately: that is the string-scratch
+FRAME reservation, and it pairs with the cross-union arm scan above — both halves of *that*
+pair are on the name path, which is the same "do not straddle two legs" argument `EQA` is in
+the batch for, applied in the other direction.
 
 ### D-RET — the inferred-return value-union VERDICT (`valueUnionRetName`) — SHIPPED
 
@@ -762,6 +875,7 @@ condition names two things, so measure those:
 | struct/variant FIELD-ELEMENT slot resolved by re-resolving a NAME | 14 sites | **0** for the ref-list + nested-struct layers (`sFieldElemTyIx`/`uFieldElemTyIx` → `rlSlotOfTy`/`structIndexOfTy`); the map-value / union-box readers stay |
 | struct/variant field LITUNION (atom-rep) classified by re-parsing a NAME | 4 sites | **0** (`tyIsLitUnion` / `tyIsLitUnionArray` over the D5 sidecars) |
 | `structFieldCodesEq`'s referenced ROW resolved from a recorded NAME | yes | **no** (`repStructRowByTy`; the `ea != eb` identity fast path stays, deliberately) |
+| union-BOX tag / widening chosen by comparing a member set's rendered ATOMS | 16 sites | **0** (`unMemHasAtom` → `unionHasAtomTy`; the atom scan is the fall-through). 12 raw `unionHasAtom` calls remain, none of them the box ABI — see D-UNION batch 4 |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
 
@@ -780,9 +894,11 @@ The 12 remaining `table[i] == name` scans split three ways, and **most are not t
 and classify each atom **by its rendered text**. That per-atom re-derivation is the disease.
 Batches 1–3 took seventeen of the twenty-three sites (the "is there an arm of shape X" family,
 the `unionArmPath*` field-path walks, and the `mark*` registration + the map-shaped `*ArmSlot`
-resolvers); what remains is the atom-EQUALITY / element-NAME / box-ABI residue named in
-D-UNION above, the two `nameIsRefArray`-gated slot resolvers refuted in batch 3, and the one
-classifier measured DEAD (`unionHasCollapsedStringMapArm`).
+resolvers) and **batch 4 took the box ABI itself** (the 16 `unionHasAtom` tag/widening
+decisions); what remains is the atom-EQUALITY / element-NAME residue named in D-UNION above,
+the two `nameIsRefArray`-gated slot resolvers refuted in batch 3, the one classifier measured
+DEAD (`unionHasCollapsedStringMapArm`), and the narrowing-layer `"null"` readers in
+`emit_classify` (a different question from the box's null tag).
 
 **Scope carefully:** an atom that is a declared variant name (`Cat`) feeding
 `variantIndexOf` is *nominal identity — lossless and correct*. Only the inline-shape /
