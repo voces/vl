@@ -11358,6 +11358,20 @@ export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
     if nm == "" { nm = un }
     const atoms: string[] = []
     splitUnionAtoms(nm, atoms)
+    // D-UNION: the arm's field path is walked over the member's ARENA type
+    // (`tyArmPathIsMap` — a `TyMap` leaf) instead of re-resolving the rendered atom to
+    // a struct/variant row and consulting its per-field lowering codes.
+    const mems: i32[] = []
+    if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+      let m = 0
+      while m < mems.length {
+        if atoms[m] != "null" {
+          if tyArmPathIsMap(mems[m], path) { return true }
+        }
+        m = m + 1
+      }
+      return false
+    }
     let ai = 0
     while ai < atoms.length {
       if atoms[ai] != "null" {
@@ -11457,6 +11471,22 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
     if nm == "" { nm = un }
     const atoms: string[] = []
     splitUnionAtoms(nm, atoms)
+    // D-UNION: the arm walk is structural (`tyArmPathIsMapList` — a `TyArray` over a
+    // `TyMap` leaf), and so is the indexed-root hop: `tyArmElem` takes a `TyArray` arm's
+    // element in place of `nameIsRefArray` + `refArrElemName` on the rendered atom.
+    const mems: i32[] = []
+    if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+      let m = 0
+      while m < mems.length {
+        if atoms[m] != "null" {
+          let mem = mems[m]
+          if viaElem { mem = tyArmElem(mem) }
+          if tyArmPathIsMapList(mem, path) { return true }
+        }
+        m = m + 1
+      }
+      return false
+    }
     let ai = 0
     while ai < atoms.length {
       if atoms[ai] != "null" {
@@ -11754,6 +11784,19 @@ function identRebindUnionArmClosureField(
     if uset == "" { uset = un }
     const atoms: string[] = []
     splitUnionAtoms(uset, atoms)
+    // D-UNION: the arm walk is structural (`tyArmPathHasCloValue` — a `TyFunc` leaf,
+    // bare / nullable, or a `TyUnion` with a `TyFunc` member).
+    const mems: i32[] = []
+    if unionMemberTysOf(uset, mems) && mems.length == atoms.length {
+      let m = 0
+      while m < mems.length {
+        if atoms[m] != "null" {
+          if tyArmPathHasCloValue(mems[m], path) { return true }
+        }
+        m = m + 1
+      }
+      return false
+    }
     let ai = 0
     while ai < atoms.length {
       if atoms[ai] != "null" {
@@ -11845,6 +11888,19 @@ export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
     if uset == "" { uset = un }
     const atoms: string[] = []
     splitUnionAtoms(uset, atoms)
+    // D-UNION: the arm walk is structural (`tyArmPathIsClosure` — a `TyFunc` leaf, bare
+    // or under the nullable-closure niche's `TyNullable`).
+    const mems: i32[] = []
+    if unionMemberTysOf(uset, mems) && mems.length == atoms.length {
+      let m = 0
+      while m < mems.length {
+        if atoms[m] != "null" {
+          if tyArmPathIsClosure(mems[m], path) { return true }
+        }
+        m = m + 1
+      }
+      return false
+    }
     let ai = 0
     while ai < atoms.length {
       if atoms[ai] != "null" {
@@ -11903,6 +11959,19 @@ export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
       if uset == "" { uset = un }
       const atoms: string[] = []
       splitUnionAtoms(uset, atoms)
+      // D-UNION: the arm walk is structural (`tyArmPathIsCloArray` — a `TyArray` over a
+      // `TyFunc` leaf).
+      const mems: i32[] = []
+      if unionMemberTysOf(uset, mems) && mems.length == atoms.length {
+        let m = 0
+        while m < mems.length {
+          if atoms[m] != "null" {
+            if tyArmPathIsCloArray(mems[m], path) { return true }
+          }
+          m = m + 1
+        }
+        return false
+      }
       let ai = 0
       while ai < atoms.length {
         if atoms[ai] != "null" {
@@ -13727,6 +13796,153 @@ export function unMemIsFuncReachArray(m: i32): boolean {
   if m < 0 { return false }
   const t = T.tys[m]
   if t is TyArray { return tyReachesFuncD(t.aElem, 12) }
+  false
+}
+
+// ── D-UNION arm-PATH walk, from the arena ────────────────────────────────────
+// The `unionArmPath*` family answers "does this union arm's field path `a.b.c` leaf
+// at a MAP / a list-of-maps / a closure / a closure-array / a closure-carrying value"
+// by resolving the arm nominally and walking the emitter's per-field LOWERING codes
+// (5 ref-list, 14 closure, 15 nested-struct, 16 union-box, 19 map, 22 nullable-closure).
+// The codes are lowering decisions, but the five questions asked of them are purely
+// STRUCTURAL, so the arena answers them directly — no arena→code bridge is needed:
+//
+//   code 15 mid hop      ≡ the field is a `TyObj` (or a `TyNullable` over one)
+//   code 19 leaf         ≡ the field is a `TyMap`
+//   code 5 + map elem    ≡ a `TyArray` over a `TyMap`
+//   code 5 + arrow elem  ≡ a `TyArray` over a `TyFunc`
+//   code 14 / 22 leaf    ≡ a `TyFunc`, bare or under a `TyNullable`
+//   code 16 + clo arm    ≡ a `TyUnion` with a `TyFunc` member
+//
+// Every walk is narrowing-blind and conservative by design (it over-reserves a frame
+// slot; an over-reservation is a harmless spare local, a MISS is invalid wasm), so the
+// arena path keeps the same shape: an arm it cannot resolve answers "no".
+
+// The inner of a `T | null`, else `ty` itself. The lowering codes fold a nullable
+// struct (`next: S | null`) into the same code-15 nested-struct hop as a bare `S`, and
+// a nullable closure into code 22 beside code 14's bare one.
+function tyPeelNul(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  ty
+}
+
+// The arena type of field `name` of the object type `ty` (nullable-peeled — a code-15
+// hop follows `S` and `S | null` alike), or -1 when `ty` is not an object or has no
+// such field.
+function tyObjFieldTy(ty: i32, name: string): i32 {
+  const b = tyPeelNul(ty)
+  if b < 0 { return -1 }
+  const t = T.tys[b]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldNames.length {
+      if t.objFieldNames[i] == name { return t.objFieldTypes[i] }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Walk the field path `path` from the union member type `m` and return the ARENA type
+// of the LEAF field, or -1. Mid hops must be object-typed — the structural dual of the
+// walk's `if code != 15 { return false }`, since a map / union-box / list mid field is
+// not a `TyObj` and yields no field. The leaf comes back UNCLASSIFIED so each consumer
+// applies its own predicate.
+function tyArmPathLeaf(m: i32, path: string[]): i32 {
+  if m < 0 || path.length == 0 { return -1 }
+  let cur = m
+  let hop = 0
+  while hop < path.length {
+    const ft = tyObjFieldTy(cur, path[hop])
+    if ft < 0 { return -1 }
+    if hop == path.length - 1 { return ft }
+    cur = ft
+    hop = hop + 1
+  }
+  -1
+}
+
+// The arm type a `t0[i].f…` root walks from: the ELEMENT of a ref-array arm. -1 for a
+// non-array arm (the name path's `nameIsRefArray(arm)` gate, structurally).
+function tyArmElem(m: i32): i32 {
+  if m < 0 { return -1 }
+  const t = T.tys[m]
+  if t is TyArray { return t.aElem }
+  -1
+}
+
+// `unionArmPathIsMap`'s leaf: a MAP field (code 19). NOT nullable-peeled — a
+// `{[string]: V} | null` field is code 29, which the code walk does not accept.
+export function tyArmPathIsMap(m: i32, path: string[]): boolean {
+  const leaf = tyArmPathLeaf(m, path)
+  if leaf < 0 { return false }
+  const t = T.tys[leaf]
+  if t is TyMap { return true }
+  false
+}
+
+// `unionArmPathIsMapList`'s leaf: a LIST-OF-MAPS field (code 5 whose element renders as
+// a map) — a `TyArray` over a `TyMap`.
+export function tyArmPathIsMapList(m: i32, path: string[]): boolean {
+  const leaf = tyArmPathLeaf(m, path)
+  if leaf < 0 { return false }
+  const t = T.tys[leaf]
+  if t is TyArray {
+    const e = T.tys[t.aElem]
+    if e is TyMap { return true }
+  }
+  false
+}
+
+// `unionArmPathIsClosure`'s leaf: a closure field (code 14) or its nullable niche
+// (code 22) — a `TyFunc`, bare or under one `TyNullable`.
+export function tyArmPathIsClosure(m: i32, path: string[]): boolean {
+  const leaf = tyArmPathLeaf(m, path)
+  if leaf < 0 { return false }
+  const b = tyPeelNul(leaf)
+  if b < 0 { return false }
+  const t = T.tys[b]
+  if t is TyFunc { return true }
+  false
+}
+
+// `unionArmPathIsCloArray`'s leaf: a CLOSURE-ELEMENT array field (code 5 whose element
+// name carries a top-level arrow) — a `TyArray` over a `TyFunc`. A nullable-closure
+// element is a `TyNullable`, excluded here exactly as the arrow scan excludes it (the
+// arrow sits under the element's own parens, never at depth 0).
+export function tyArmPathIsCloArray(m: i32, path: string[]): boolean {
+  const leaf = tyArmPathLeaf(m, path)
+  if leaf < 0 { return false }
+  const t = T.tys[leaf]
+  if t is TyArray {
+    const e = T.tys[t.aElem]
+    if e is TyFunc { return true }
+  }
+  false
+}
+
+// `unionArmPathHasCloValue`'s leaf: a closure field (14/22) OR a union-BOX field (16)
+// whose member set has a bare-closure arm — a `TyFunc`, or a `TyUnion` with a `TyFunc`
+// member. Both are nullable-peeled: an `((i32) => i32) | null` field is code 22, and a
+// `(A | B) | null` box field keeps its `null` atom in the member set the code walk
+// consults.
+export function tyArmPathHasCloValue(m: i32, path: string[]): boolean {
+  const leaf = tyArmPathLeaf(m, path)
+  if leaf < 0 { return false }
+  const b = tyPeelNul(leaf)
+  if b < 0 { return false }
+  const t = T.tys[b]
+  if t is TyFunc { return true }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const mt = T.tys[tyPeelNul(t.uMembers[i])]
+      if mt is TyFunc { return true }
+      i = i + 1
+    }
+  }
   false
 }
 
