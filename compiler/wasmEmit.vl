@@ -1,7 +1,6 @@
 import {
   inferRetNameOf,
   isValueUnionName,
-  litUnionArrayElemOf,
   nameIsLitUnionType,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulBool,
@@ -469,6 +468,8 @@ import {
   mfSrcLocalFor,
   monoIsRowMatch,
   msMemberAtomsOf,
+  msSetOfText,
+  msSubNull,
   mvListValKind,
   mvSlotNullable,
   mvSlotOfMapValNameOrMono,
@@ -560,7 +561,13 @@ import {
   vbHeapIdxOfAtom,
   vtKindOfParam,
 } from "./emit_classify"
-import { mvSlotOfTy } from "./emit_rep"
+import {
+  msMemberValKindsOf,
+  msSoloValKind,
+  mvSlotOfTy,
+  scalarTagOfKind,
+  vbHeapIdxOfKind,
+} from "./emit_rep"
 import { monoArgTyName } from "./emit_mono"
 //
 // Output representation: a VL `i32[]` of byte values 0..255. WasmGC has no `u8`,
@@ -1742,9 +1749,17 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
     // `emitUnionCoerce` boxes a litunion member as a STRING ref (its members are string
     // literals), so `is K0` is the string-tag compare. A real `string` member would have
     // absorbed the litunion (`K0 | string` collapses to `string`), so no tag collides.
+    // D-UNION-ATOM-KIND: the tested atom's ABI code, derived once and kept in step
+    // with the litunion rewrite below — `valueAtomKind("string")` is 2 by definition,
+    // so the rewritten atom's code needs no second derivation, and the tag is a
+    // projection of the code (`scalarTagOf` is `uVariants.length + code`).
     let isAtom = ndv.isVariant
-    if valueAtomKind(isAtom) < 0 {
-      if nameIsLitUnionType(isAtom) { isAtom = "string" }
+    let isak = valueAtomKind(isAtom)
+    if isak < 0 {
+      if nameIsLitUnionType(isAtom) {
+        isAtom = "string"
+        isak = 2
+      }
     }
     // The box tag the tested atom claims: a value atom's globally-stable `scalarTagOf`, OR a
     // REF-ELEMENT array arm's `refArrTagOf` (`x is S[]`, `x is (() => f64)[]`). Both discriminate
@@ -1752,7 +1767,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
     // optional chain / any union expr) are shared. `armTag < 0` (not a value atom, not an interned
     // ref-array arm) falls through to the struct-variant / literal paths.
     let armTag = -1
-    if valueAtomKind(isAtom) >= 0 { armTag = scalarTagOf(isAtom) }
+    if isak >= 0 { armTag = scalarTagOfKind(isak) }
     else if nameIsMap(isAtom) { armTag = mapTagOf(isAtom) }
     else if nameIsRefArray(isAtom) { armTag = refArrTagOf(isAtom) }
     if armTag >= 0 {
@@ -1990,7 +2005,9 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32) {
           }
           fbRefCast(aTypeIdx) // the payload IS the string array ref
         } else {
-          const mvb = vbHeapIdxOfAtom(mAtom)
+          // D-UNION-ATOM-KIND: `mk` IS `valueAtomKind(mAtom)`, bound above, and the
+          // value box is a projection of it — no second derivation from the spelling.
+          const mvb = vbHeapIdxOfKind(mk)
           if mvb < 0 {
             return emitFail(
               "emitProgram: narrowed union field atom has no value box",
@@ -2132,32 +2149,53 @@ function emitUnionBoxPush(_body: i32[], name: string, fnIx: i32) {
 // `$il64TypeIdx`), or -1 if `atom` is not a list type. A list member rides the box's anyref
 // `value` field as this wrapper ref directly (no scalar value box) — the `is`-narrow casts
 // to it, the coerce stores it.
-function atomListWrapHeap(atom: string) {
-  if atom == "i32[]" || atom == "boolean[]" { return lTypeIdx }
-  // A litunion array (`K0[]` — value-atom kind 7) shares the exact i32-list backing:
-  // its elements are interned i32 atom ids, so the payload IS the i32-list wrapper.
-  if litUnionArrayElemOf(atom) != "" { return lTypeIdx }
-  if atom == "f64[]" { return fl64TypeIdx }
-  if atom == "string[]" { return mkListIdx }
-  if atom == "i64[]" { return il64TypeIdx }
-  if atom == "f32[]" { return fl32TypeIdx }
-  // A NICHE-nullable scalar-element list atom (`(boolean | null)[]` / `(K | null)[]` →
-  // the i32-list kind 7; `(string | null)[]` → the string-list kind 9) shares its leaf
-  // backing's wrapper exactly — resolve by the atom KIND (the literal names above
-  // already returned, so only the niche spellings reach these arms).
-  const nk = valueAtomKind(atom)
-  if nk == 7 { return lTypeIdx }
-  if nk == 9 { return mkListIdx }
+// D-UNION-ATOM-KIND: keyed on the atom's KIND, not on its rendered spelling. The
+// name form this replaces asked seven spelling questions — `i32[]`/`boolean[]`, a
+// litunion array (`litUnionArrayElemOf`), `f64[]`, `string[]`, `i64[]`, `f32[]`, then
+// `valueAtomKind` for the niche-nullable element forms — and every one of them is a
+// partition of ONE `valueAtomKind` code: kind 7 is exactly the i32-list backings
+// (`i32[]`, `boolean[]`, a litunion `K[]`, and the `(boolean | null)[]` / `(K | null)[]`
+// niches), kind 9 exactly the string-list backings (`string[]`, `(string | null)[]`),
+// and kinds 8 / 10 / 12 arise ONLY from the exact spellings `f64[]` / `i64[]` / `f32[]`.
+// So the mapping is total and byte-faithful in both directions, and the caller — which
+// already needs the kind for its tag and its value box — computes it once.
+function listWrapHeapOfKind(k: i32) {
+  if k == 7 { return lTypeIdx }
+  if k == 8 { return fl64TypeIdx }
+  if k == 9 { return mkListIdx }
+  if k == 10 { return il64TypeIdx }
+  if k == 12 { return fl32TypeIdx }
   -1
 }
 
-// True if a value-union ATOM is a REF that rides the box's anyref `value` directly with no
-// per-rep scalar value box: a string, any list type, or a CLOSURE (the fat-pointer struct
-// is a `structref` subtype, so it stores into the box's anyref slot as-is).
-function atomIsRef(atom: string) {
-  if atom == "string" { return true }
-  if valueAtomKind(atom) == 11 { return true }
-  return atomListWrapHeap(atom) >= 0
+// The BANKED value-atom kind of the single member left when `null` is removed from the
+// member set `set` — the structural form of `valueAtomKind(removeAtomFromSet(set,
+// "null"))`, which four `… | null` peeling sites ask (`x ?? d` over an ident / a call /
+// a union field, and a `scalar | null` map value read with a default).
+//
+// The set ADT already answers the SUBTRACTION structurally (`msSubNull` clears the null
+// members' bits); what it hands back is a RENDERED residual, and the callers then parsed
+// that rendering to recover the ABI code. Here the residual set keeps its identity: a
+// singleton yields the member's kind straight out of the bank `recordUnMemTys` filled,
+// and a non-singleton yields -1 — the same answer `valueAtomKind` gives the rendered
+// `""` / `"a|b"`. -2 = the pool does not cover `set` (a narrowed subset spelling the
+// pool never interned) and the caller keeps its rendered-atom path, exactly as
+// `removeAtomFromSet` itself falls through to the string surgery there.
+function unionResidualSoloKind(set: string) {
+  const s = msSetOfText(set)
+  if s < 0 { return -2 }
+  msSoloValKind(msSubNull(s))
+}
+
+// True if a value-union atom of KIND `k` is a REF that rides the box's anyref `value`
+// directly with no per-rep scalar value box: a string (kind 2 — `valueAtomKind` answers
+// 2 for the spelling `string` and nothing else), any list type, or a CLOSURE (kind 11 —
+// the fat-pointer struct is a `structref` subtype, so it stores into the box's anyref
+// slot as-is).
+function atomIsRefKind(k: i32) {
+  if k == 2 { return true }
+  if k == 11 { return true }
+  return listWrapHeapOfKind(k) >= 0
 }
 
 function emitValueUnionUnboxRead(
@@ -2168,22 +2206,26 @@ function emitValueUnionUnboxRead(
 ) {
   if emitUnionBoxPush(body, name, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  if atom == "string" {
+  // D-UNION-ATOM-KIND: the atom's ABI code decides all four arms below, so it is
+  // derived ONCE here instead of four times (the `string` compare, the closure test,
+  // the list-wrapper ladder and `vbHeapIdxOfAtom`'s own re-derivation).
+  const ak = valueAtomKind(atom)
+  if ak == 2 {
     fbRefCast(aTypeIdx) // the payload IS the string array ref
     return 0
   }
   // A CLOSURE atom's payload IS the closure fat-pointer struct — recover it from the box's
   // anyref slot so a narrowed `x is (() => i64)` read yields the callable fat pointer.
-  if valueAtomKind(atom) == 11 {
+  if ak == 11 {
     fbRefCast(cloStructIdx)
     return 0
   }
-  const lw = atomListWrapHeap(atom)
+  const lw = listWrapHeapOfKind(ak)
   if lw >= 0 {
     fbRefCast(lw) // the payload IS the list WRAPPER ref
     return 0
   }
-  const vb = vbHeapIdxOfAtom(atom)
+  const vb = vbHeapIdxOfKind(ak)
   if vb < 0 {
     return emitFail("emitProgram: narrowed union atom has no value box")
   }
@@ -2664,7 +2706,13 @@ export function emitUnionCoerce(
     atom = "f32[]"
     coerceListKind = 7
   }
-  fbI32Const(scalarTagOf(atom))
+  // D-UNION-ATOM-KIND: the coerced atom's ABI code, derived once — the box TAG, the
+  // rides-the-anyref test and the scalar value box below are all projections of it
+  // (`scalarTagOf` / `atomIsRef` / `vbHeapIdxOfAtom` each re-derived it from the
+  // spelling). `atom` is final at this point: every arm of the ladder above assigns
+  // before the tag is emitted.
+  const cak = valueAtomKind(atom)
+  fbI32Const(scalarTagOfKind(cak))
   if atom == "i64" {
     if emitExprAsI64(body, exprIx, fnIx) < 0 { return -1 }
   } else if atom == "f64" {
@@ -2685,8 +2733,8 @@ export function emitUnionCoerce(
   }
   // A `string` / list member is a REF and rides the box's anyref `value` directly; only a
   // SCALAR atom wraps in its per-rep value box.
-  if !atomIsRef(atom) {
-    const vb = vbHeapIdxOfAtom(atom)
+  if !atomIsRefKind(cak) {
+    const vb = vbHeapIdxOfKind(cak)
     if vb < 0 { return emitFail("emitProgram: union atom has no value box") }
     fbStructNew(vb) // wrap the scalar payload
   }
@@ -3022,11 +3070,22 @@ function emitUnionUnionEq(
   // litunion alias `K0` is a member here and answers NO there. Each side declines
   // independently — a NARROWED subset spelling the pool never interned re-splits,
   // exactly as before.
+  //
+  // D-UNION-ATOM-KIND: alongside the spellings, the left row's BANKED value-atom
+  // codes travel with the arms that survive the intersection (the WRITE half of the
+  // pair whose READ half is the tag emitted per arm below). The kind column is
+  // index-parallel to the atom column, so an arm's code is the one recorded for the
+  // very member whose spelling was pushed; a row the kind bank does not cover marks
+  // its arms -2 and the tag falls back to the per-atom derivation, arm by arm.
   const lAtoms: string[] = []
   if !msMemberAtomsOf(lname, lAtoms) { splitUnionAtoms(lname, lAtoms) }
+  const lKinds: i32[] = []
+  let lKindsOk = msMemberValKindsOf(msSetOfText(lname), lKinds)
+  if lKinds.length != lAtoms.length { lKindsOk = false }
   const rAtoms: string[] = []
   const rOk = msMemberAtomsOf(rname, rAtoms)
   const arms: string[] = []
+  const armKinds: i32[] = []
   let ai = 0
   while ai < lAtoms.length {
     let inR = false
@@ -3039,7 +3098,10 @@ function emitUnionUnionEq(
     } else {
       inR = unionHasAtom(rname, lAtoms[ai])
     }
-    if lAtoms[ai] != "null" && inR { arms.push(lAtoms[ai]) }
+    if lAtoms[ai] != "null" && inR {
+      arms.push(lAtoms[ai])
+      if lKindsOk { armKinds.push(lKinds[ai]) } else { armKinds.push(-2) }
+    }
     ai = ai + 1
   }
   if (
@@ -3054,14 +3116,18 @@ function emitUnionUnionEq(
   // Outermost `if` is the LAST arm (the host wraps its chain in arm order).
   let k = arms.length - 1
   while k >= 0 {
+    // The READ half of the banked-kind pair: the arm's recorded code, or a per-atom
+    // derivation where the bank did not cover the row.
+    let armK = armKinds[k]
+    if armK == -2 { armK = valueAtomKind(arms[k]) }
     if emitExpr(body, lIx, fnIx) < 0 { return -1 }
     fbStructGet(uBoxIdx, 0) // left tag
-    fbI32Const(scalarTagOf(arms[k]))
+    fbI32Const(scalarTagOfKind(armK))
     fbI32Bin(70)            // 0x46 i32.eq
     fbIf(127)               // left holds this arm
     if emitExpr(body, rIx, fnIx) < 0 { return -1 }
     fbStructGet(uBoxIdx, 0) // right tag
-    fbI32Const(scalarTagOf(arms[k]))
+    fbI32Const(scalarTagOfKind(armK))
     fbI32Bin(70)            // 0x46 i32.eq
     fbIf(127)               // right holds it too → payload value-compare
     if emitExpr(body, lIx, fnIx) < 0 { return -1 }
@@ -4444,8 +4510,11 @@ function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
   // the default on the null tag, else unbox the scalar payload.
   if atoms.length == 2 {
     const member = removeAtomFromSet(uvn, "null")
-    const ak = valueAtomKind(member)
-    const vb = vbHeapIdxOfAtom(member)
+    // D-UNION-ATOM-KIND: the residual member's banked ABI code; the rendered atom is
+    // re-parsed only where the set pool declines. The value box follows from the code.
+    let ak = unionResidualSoloKind(uvn)
+    if ak == -2 { ak = valueAtomKind(member) }
+    const vb = vbHeapIdxOfKind(ak)
     if vb < 0 {
       return emitFail("emitProgram: scalar|null map value has no value box")
     }
@@ -12809,11 +12878,13 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
     const cunm = unionNameOfIdent(lhs.identName, fnIx)
     if cunm != "" {
       if isValueUnionName(cunm) && unionHasAtomTy(cunm, "null") {
-        const crest = removeAtomFromSet(
-          currentNarrowSetOf(lhs.identName, fnIx),
-          "null",
-        )
-        const cak = valueAtomKind(crest)
+        const cset = currentNarrowSetOf(lhs.identName, fnIx)
+        const crest = removeAtomFromSet(cset, "null")
+        // D-UNION-ATOM-KIND: the residual member's banked ABI code (see
+        // `unionResidualSoloKind`); the rendered residual is re-parsed only where the
+        // set pool declines — a narrowed subset spelling it never interned.
+        let cak = unionResidualSoloKind(cset)
+        if cak == -2 { cak = valueAtomKind(crest) }
         if cak >= 0 && cak != 6 {
           if cak == 2 {
             return emitFail(
@@ -12871,7 +12942,9 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
     if kunm != "" {
       if isValueUnionName(kunm) && unionHasAtomTy(kunm, "null") {
         const krest = removeAtomFromSet(kunm, "null")
-        const kak = valueAtomKind(krest)
+        // D-UNION-ATOM-KIND — see `unionResidualSoloKind`.
+        let kak = unionResidualSoloKind(kunm)
+        if kak == -2 { kak = valueAtomKind(krest) }
         if kak >= 0 && kak != 6 {
           if kak == 2 {
             return emitFail(
@@ -12910,7 +12983,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
           fbElse()                // 0x05 else — present → unbox the stash
           fbLocalGet(coalesceCallSlot)
           fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-          const kvb = vbHeapIdxOfAtom(krest)
+          const kvb = vbHeapIdxOfKind(kak)
           if kvb < 0 {
             return emitFail("emitProgram: union call atom has no value box")
           }
@@ -12981,7 +13054,9 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
           const munm = sFieldElemNameAt(msi, mfi)
           if isValueUnionName(munm) && unionHasAtomTy(munm, "null") {
             const mrest = removeAtomFromSet(munm, "null")
-            const mak = valueAtomKind(mrest)
+            // D-UNION-ATOM-KIND — see `unionResidualSoloKind`.
+            let mak = unionResidualSoloKind(munm)
+            if mak == -2 { mak = valueAtomKind(mrest) }
             if mak >= 0 && mak != 6 {
               if mak == 2 {
                 return emitFail(
@@ -13018,7 +13093,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
               if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
               fbStructGet(sHeapIdx[msi], mfi)
               fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-              const mvb = vbHeapIdxOfAtom(mrest)
+              const mvb = vbHeapIdxOfKind(mak)
               if mvb < 0 {
                 return emitFail(
                   "emitProgram: union field atom has no value box",

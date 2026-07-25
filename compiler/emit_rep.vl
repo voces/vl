@@ -72,6 +72,7 @@ import {
   sTyIx,
   uFieldElemName,
   uFieldElemTyIx,
+  uVariants,
   unMemAtomIds,
   unMemAtoms,
   unMemKinds,
@@ -79,6 +80,10 @@ import {
   unMemTyStart,
   unMemTys,
   unNames,
+  vbF32Idx,
+  vbF64Idx,
+  vbI32Idx,
+  vbI64Idx,
 } from "./emit_state"
 import {
   T,
@@ -103,6 +108,7 @@ import {
   tyIxIsVariantMember,
   tyLitUnionAliasIx,
   tyMutEpoch,
+  valueAtomKind,
 } from "./typecheck"
 
 // ── The descriptor ────────────────────────────────────────────────────────────
@@ -1046,6 +1052,130 @@ function unMemKindOf(atom: string, ty: i32): i32 {
   3
 }
 
+// ── D-UNION ATOM-KIND — the member's value-atom kind, banked at the recorder ──
+// `valueAtomKind(atom)` is the union box ABI's 13-way code (i32 · boolean · string ·
+// i64 · f64 · f32 · null · five scalar-element list flavours · closure, and -1 for
+// "not a value atom"). Three emitter decisions are pure projections of it — the box
+// TAG (`scalarTagOf` = `uVariants.length + kind`), the scalar VALUE-BOX heap index
+// (`vbHeapIdxOfKind`) and the list WRAPPER heap index — and every one of them was
+// reached by PARSING the member's rendered spelling, once per decision.
+//
+// `recordUnMemTys` already holds each member's atom TEXT while it walks the set (it
+// is the one place a member set is ever split — the intern side, where this program
+// has always said a parse belongs), so it banks the code here, in lock-step with the
+// other member columns. A consumer that can name the member by (row, index) — or by
+// a SET of the row's members — then reads the code instead of re-deriving it.
+//
+// **EXACT, never a fold** (#1095). The banked value is the very `valueAtomKind(atom)`
+// result the consumers computed, not a re-classification: `unMemKinds`' 5-way
+// null/nominal/scalar/composite/unresolved split cannot produce an ABI code, and a
+// folding predicate would hand `scalarTagOf` a tag NO producer interned — a runtime
+// `ref.cast` trap, not a loud reject.
+//
+// LIFETIME (method note 7). The column is index-parallel to `unMemAtoms`, which the
+// top of `emitProgram` and `collectU` clear without knowing this column exists. The
+// lock-step guard in `recordUnMemTys` re-empties it the moment the two lengths
+// disagree, and `unMemValKindAt` answers UNCOVERED while they do — so a previous
+// program's kind can never be read as this one's. -2 is the uncovered sentinel
+// because -1 is a real kind.
+export let unMemValKind: i32[] = []
+
+// The banked value-atom kind of recorded member `m`, or -2 when the bank does not
+// cover it (a member recorded before this column existed in this program, or a
+// column the external reset left behind — see the lock-step guard).
+export function unMemValKindAt(m: i32): i32 {
+  if m < 0 { return -2 }
+  if unMemValKind.length != unMemAtoms.length { return -2 }
+  if m >= unMemValKind.length { return -2 }
+  unMemValKind[m]
+}
+
+// The member slice of union row `u`, or -1 when the row is not covered by the member
+// reference columns. The lower-module twin of `emit_classify`'s `msRowStart` (private
+// there, and this module is BELOW it) — same bounds, same 31-bit mask limit, so a set
+// the pool minted is a set this column can index.
+function unMemRowStart(u: i32): i32 {
+  if u < 0 { return -1 }
+  if u >= unMemTyStart.length { return -1 }
+  const st = unMemTyStart[u]
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  if n < 1 || n > 31 { return -1 }
+  if st + n > unMemAtoms.length { return -1 }
+  st
+}
+
+// The banked value-atom kind of the SINGLE member of the interned member set `s` —
+// the question every `valueAtomKind(removeAtomFromSet(set, "null"))` consumer is
+// actually asking, since a residual with 0 or 2+ members renders as `""` / `"a|b"`
+// and `valueAtomKind` answers -1 for both. So: -1 for a non-singleton set (the same
+// answer the rendered form gives), the member's banked kind for a singleton, and -2
+// only when the pool or the bank does not cover the set and the caller must keep its
+// rendered-atom path.
+export function msSoloValKind(s: i32): i32 {
+  if s < 0 || s >= msSetRow.length { return -2 }
+  if msSetGen[s] != msGen { return -2 }
+  const u = msSetRow[s]
+  const st = unMemRowStart(u)
+  if st < 0 { return -2 }
+  const n = unMemTyCount[u]
+  const mask = msSetMask[s]
+  let solo = -1
+  let cnt = 0
+  let i = 0
+  while i < n {
+    if ((mask >>> i) & 1) == 1 {
+      solo = i
+      cnt = cnt + 1
+    }
+    i = i + 1
+  }
+  if cnt != 1 { return -1 }
+  unMemValKindAt(st + solo)
+}
+
+// ITERATION over the banked kinds — the kind column's twin of `msMemberAtomsOf`,
+// appending the set's members' banked codes to `out` in the row's recorded (box-tag
+// ABI) order, so a consumer that walks a set's members can carry the code alongside
+// the spelling instead of re-deriving it per member. False leaves `out` untouched and
+// the caller keeps its per-atom derivation.
+export function msMemberValKindsOf(s: i32, out: i32[]): boolean {
+  if s < 0 || s >= msSetRow.length { return false }
+  if msSetGen[s] != msGen { return false }
+  const u = msSetRow[s]
+  const st = unMemRowStart(u)
+  if st < 0 { return false }
+  if unMemValKind.length != unMemAtoms.length { return false }
+  const n = unMemTyCount[u]
+  const mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if ((mask >>> i) & 1) == 1 { out.push(unMemValKind[st + i]) }
+    i = i + 1
+  }
+  true
+}
+
+// The globally-stable box TAG of a value atom, from its KIND — the kind-keyed twin of
+// `emit_classify`'s `scalarTagOf(atom)`, which is exactly this over
+// `valueAtomKind(atom)`. Struct variants take the dense ranks below; atom kinds claim
+// the fixed slots above them.
+export function scalarTagOfKind(k: i32): i32 { uVariants.length + k }
+
+// The interned scalar VALUE-BOX heap index for a value atom of kind `k`, or -1 when
+// the kind rides the box's `anyref` payload directly (string, the five list flavours,
+// closure) or is not a value atom at all. The kind-keyed twin of `emit_classify`'s
+// `vbHeapIdxOfAtom(atom)`, whose body is exactly this over `valueAtomKind(atom)`.
+// HAND-OFF: that function should delegate here (`vbHeapIdxOfKind(valueAtomKind(atom))`)
+// so the kind→box table has one home; the two are kept in step by hand until then.
+export function vbHeapIdxOfKind(k: i32): i32 {
+  if k == 0 || k == 1 { return vbI32Idx }
+  if k == 3 { return vbI64Idx }
+  if k == 4 { return vbF64Idx }
+  if k == 5 { return vbF32Idx }
+  -1
+}
+
 // Drop every interned member SET (the D-UNION set ADT — see `msSetRow` in
 // `emit_state`) and bump the pool generation. A set id is a (union row, member mask)
 // pair, and both halves are per-PROGRAM: a fresh program re-mints `unNames` and the
@@ -1088,6 +1218,13 @@ export function recordUnMemTys(set: string) {
     unMemKinds = []
     msPoolReset()
   }
+  // The banked value-atom KINDS are index-parallel to `unMemAtoms` and live in THIS
+  // module, so the resets that clear the member columns from above (`collectU`, the
+  // top of `emitProgram`) cannot see them. The disagreement is observed here, before
+  // this row's members append, and re-empties the column — the only way the two can
+  // diverge is such an external reset, because nothing but the loop below appends to
+  // either.
+  if unMemValKind.length != unMemAtoms.length { unMemValKind = [] }
   while unMemTyStart.length + 1 < unNames.length {
     unMemTyStart.push(-1)
     unMemTyCount.push(0)
@@ -1104,6 +1241,7 @@ export function recordUnMemTys(set: string) {
     unMemAtoms.push(a)
     unMemAtomIds.push(msAtomIdOf(a))
     unMemKinds.push(unMemKindOf(a, ty))
+    unMemValKind.push(valueAtomKind(a))
     i = i + 1
   }
   0
