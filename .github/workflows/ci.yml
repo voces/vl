@@ -335,10 +335,28 @@ jobs:
           cp scripts/vl-host/target/release/vl /tmp/vl-plain
           cargo build --release --features embed-seed --manifest-path scripts/vl-host/Cargo.toml
           probe="$(mktemp -d)"
-          out="$(cd "$probe" && echo 'print(6 * 7)' | "$GITHUB_WORKSPACE/scripts/vl-host/target/release/vl" run)"
+          # Isolated cache dir: the embedded seed has no `build/` beside it, so its
+          # Cranelift compilation is cached here instead. Cold-compiling the ~1 MB seed
+          # takes SECONDS; every run after the first deserializes in milliseconds.
+          export VL_CACHE_DIR="$(mktemp -d)"
+          vl="$GITHUB_WORKSPACE/scripts/vl-host/target/release/vl"
+          out="$(cd "$probe" && echo 'print(6 * 7)' | "$vl" run)"
           if [ "$out" != "42" ]; then
             echo "embedded-seed smoke failed: expected 42 from the embedded fallback, got: $out"
             exit 1
           fi
-          echo "embedded-seed build runs with no on-disk seed (got 42)."
+          # The cache must MATERIALIZE — without it the shipped binary re-compiles the
+          # seed on every invocation. Deterministic check; timings are informational
+          # (runner-speed dependent, so never a gate).
+          if ! ls "$VL_CACHE_DIR"/seed-*.cwasm >/dev/null 2>&1; then
+            echo "embedded-seed cache was not written to \$VL_CACHE_DIR — every run would re-compile the seed"
+            exit 1
+          fi
+          out2="$(cd "$probe" && echo 'print(6 * 7)' | "$vl" run)"
+          if [ "$out2" != "42" ]; then
+            echo "embedded-seed cached run failed: expected 42, got: $out2"
+            exit 1
+          fi
+          echo "embedded-seed build runs with no on-disk seed (got 42), and caches its compile:"
+          ls -la "$VL_CACHE_DIR"
           mv /tmp/vl-plain scripts/vl-host/target/release/vl

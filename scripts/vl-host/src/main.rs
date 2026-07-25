@@ -160,6 +160,48 @@ fn embedded_seed() -> Option<&'static [u8]> {
     }
 }
 
+/// Where the EMBEDDED seed's compilation cache lives — the sidecar's counterpart for
+/// bytes that have no path of their own. A distributed `vl` has no `build/` next to
+/// it, so without this every invocation re-runs Cranelift over the whole ~1 MB seed
+/// (seconds, not milliseconds); with it, that cost is paid once per machine.
+///
+/// The file is CONTENT-KEYED on `$VL_SEED_KEY` (baked by `build.rs`), so two `vl`
+/// binaries carrying different seeds never collide and an upgraded binary simply
+/// misses instead of loading something stale.
+///
+/// Directory, first hit wins: `$VL_CACHE_DIR` · `$XDG_CACHE_HOME/vl` ·
+/// `$HOME/.cache/vl` · `%LOCALAPPDATA%\vl`. `None` (no home, no XDG) means "run
+/// uncached" — correct, just slow, which is the right failure for a cache.
+fn seed_cache_path() -> Option<std::path::PathBuf> {
+    #[cfg(not(feature = "embed-seed"))]
+    {
+        // No baked seed, so no `$VL_SEED_KEY` to name a cache with. The on-disk
+        // seed's own `.cwasm` sidecar covers this build.
+        None
+    }
+    #[cfg(feature = "embed-seed")]
+    {
+        seed_cache_path_impl()
+    }
+}
+
+#[cfg(feature = "embed-seed")]
+fn seed_cache_path_impl() -> Option<std::path::PathBuf> {
+    let dir = if let Some(d) = std::env::var_os("VL_CACHE_DIR") {
+        std::path::PathBuf::from(d)
+    } else if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
+        std::path::PathBuf::from(d).join("vl")
+    } else if let Some(h) = std::env::var_os("HOME") {
+        std::path::PathBuf::from(h).join(".cache/vl")
+    } else if let Some(d) = std::env::var_os("LOCALAPPDATA") {
+        std::path::PathBuf::from(d).join("vl")
+    } else {
+        return None;
+    };
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("seed-{}.cwasm", env!("VL_SEED_KEY"))))
+}
+
 /// Resolve which compiler seed to load, first hit wins:
 ///   --compiler <path>  →  $VL_COMPILER_WASM  →  ./build/vl-compiler.wasm  →  embedded
 /// An EXPLICIT request (flag or env) is honoured strictly — a missing file is an
@@ -208,13 +250,23 @@ fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>,
 /// the Module — the expensive half — is engine-level and shareable).
 fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Module> {
     let module = match source {
-        // Embedded seed (a `--features embed-seed` release binary): compile from the
-        // baked-in bytes each run. No `.cwasm` sidecar — there's no path to key it on;
-        // the Cranelift compile is the one cost a future cache could reclaim.
-        CompilerSource::Embedded(bytes) => Module::from_binary(engine, bytes)
-            .map_err(|e| e.context("loading the embedded compiler seed"))?,
+        // Embedded seed (a `--features embed-seed` release binary). Its cache lives in
+        // the user cache dir rather than beside the module, since a distributed `vl`
+        // has no `build/` of its own — and it is CONTENT-KEYED, so there is no
+        // freshness question to ask (different bytes ⇒ different file).
+        CompilerSource::Embedded(bytes) => cached_module(
+            engine,
+            seed_cache_path().as_deref(),
+            true,
+            || {
+                Module::from_binary(engine, bytes)
+                    .map_err(|e| e.context("loading the embedded compiler seed"))
+            },
+        )?,
+        // On-disk seed: the sidecar sits next to it and is keyed by FRESHNESS —
+        // rebuilt whenever the `.wasm` is newer than its `.cwasm`.
         CompilerSource::Path(compiler_path) => {
-            let sidecar = format!("{compiler_path}.cwasm");
+            let sidecar = std::path::PathBuf::from(format!("{compiler_path}.cwasm"));
             let fresh = match (
                 std::fs::metadata(&sidecar),
                 std::fs::metadata(compiler_path),
@@ -224,46 +276,64 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
                 }
                 _ => false,
             };
-            // Compile from the `.wasm` and rewrite the sidecar. The write is
-            // best-effort (read-only dirs etc. are non-fatal) and also runs on
-            // the fresh-but-undeserializable path below, so a sidecar from a
-            // different wasmtime version/config (e.g. restored by a CI cache
-            // with its mtime intact) heals on first use instead of forcing a
-            // recompile on every later invocation.
-            let compile_and_cache = || -> Result<Module> {
-                let m = Module::from_file(engine, compiler_path).map_err(|e| {
+            cached_module(engine, Some(&sidecar), fresh, || {
+                Module::from_file(engine, compiler_path).map_err(|e| {
                     e.context(format!(
                         "loading compiler module `{compiler_path}` (build it with: scripts/refresh-compiler.sh)"
                     ))
-                })?;
-                if let Ok(bytes) = m.serialize() {
-                    // Atomic publish: write a unique temp then rename() into place.
-                    // Parallel `vl` processes race otherwise — `fs::write` truncates-
-                    // then-writes, and a concurrent `deserialize_file` MMAPS this file,
-                    // so a torn read is UB (an intermittent hang/crash — surfaced as
-                    // lint-self.sh's per-file `vl fmt` fan-out stalling in CI). rename(2)
-                    // is atomic on POSIX: a reader sees either the whole old or whole new
-                    // file, and an existing mmap keeps the old inode. Best-effort still.
-                    let tmp = format!("{sidecar}.{}.tmp", std::process::id());
-                    if std::fs::write(&tmp, &bytes).is_ok() {
-                        if std::fs::rename(&tmp, &sidecar).is_err() {
-                            let _ = std::fs::remove_file(&tmp);
-                        }
-                    }
-                }
-                Ok(m)
-            };
-            if fresh {
-                match unsafe { Module::deserialize_file(engine, &sidecar) } {
-                    Ok(m) => m,
-                    Err(_) => compile_and_cache()?, // stale config/version — recompile
-                }
-            } else {
-                compile_and_cache()?
-            }
+                })
+            })?
         }
     };
     Ok(module)
+}
+
+/// Load a compiler module through a Cranelift-compilation cache: deserialize `cache`
+/// when it exists and `usable` says it is not superseded, else `compile` and publish
+/// the result there. Compiling the ~1 MB seed takes SECONDS and deserializing takes
+/// milliseconds, so this is the difference between a usable CLI and an unusable one.
+///
+/// `cache: None` means "no cache available" (no home dir, or a non-embed build) —
+/// every call compiles, correct but slow.
+///
+/// Publishing is best-effort in every direction: a read-only or full cache dir is
+/// non-fatal, and a cache entry that fails to deserialize (a different wasmtime
+/// version or engine config — e.g. a CI cache restoring a sidecar with its mtime
+/// intact, or a changed `$VL_GC`) falls through to a recompile that REWRITES it, so
+/// the miss costs one invocation instead of every later one.
+///
+/// `deserialize_file` is unsafe because a corrupt or forged artifact is UB — we only
+/// ever read a file this same binary wrote for this same module.
+fn cached_module(
+    engine: &Engine,
+    cache: Option<&std::path::Path>,
+    usable: bool,
+    compile: impl Fn() -> Result<Module>,
+) -> Result<Module> {
+    let compile_and_cache = || -> Result<Module> {
+        let m = compile()?;
+        if let (Some(path), Ok(bytes)) = (cache, m.serialize()) {
+            // Atomic publish: write a unique temp then rename() into place. Parallel
+            // `vl` processes race otherwise — `fs::write` truncates-then-writes, and a
+            // concurrent `deserialize_file` MMAPS this file, so a torn read is UB (an
+            // intermittent hang/crash — surfaced as lint-self.sh's per-file `vl fmt`
+            // fan-out stalling in CI). rename(2) is atomic on POSIX: a reader sees
+            // either the whole old or whole new file, and an existing mmap keeps the
+            // old inode. Best-effort still.
+            let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+            if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        Ok(m)
+    };
+    Ok(match cache {
+        Some(path) if usable => match unsafe { Module::deserialize_file(engine, path) } {
+            Ok(m) => m,
+            Err(_) => compile_and_cache()?, // stale config/version — recompile
+        },
+        _ => compile_and_cache()?,
+    })
 }
 
 /// Read a file as UTF-8, distinguishing "missing/unreadable" from "present but

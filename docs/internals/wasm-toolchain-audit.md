@@ -191,6 +191,32 @@ user programs that may run long).
 
 ### 4.2 AOT compilation & caching — eliminate per-run Cranelift
 
+> **Layer 1 is DONE, on both paths.** The on-disk seed gets a `.cwasm` sidecar beside
+> it; the **embedded** seed of a distributed `vl` — which has no `build/` to sit next
+> to — gets a content-keyed entry in the user cache dir (`$VL_CACHE_DIR` ·
+> `$XDG_CACHE_HOME/vl` · `$HOME/.cache/vl` · `%LOCALAPPDATA%\vl`). That second half
+> was the load-bearing one: **without it the shipped binary re-ran Cranelift over the
+> whole ~1 MB seed on every invocation — ~2.5–3.2 s for hello-world, against 11 ms on
+> the dev path.** Now it is 3.2 s once per machine, then 11 ms.
+>
+> **Why a runtime cache rather than baking the `.cwasm` into the binary.** A
+> serialized artifact records the ISA flags it was compiled with, and
+> `check_isa_flags` accepts it only if the host has *at least* those features
+> (`engine/serialization.rs`: a flag the artifact lacks is always fine, a flag it
+> requires is tested against the host). Compiling on the machine that will run it —
+> what a cache does by construction — therefore both always matches and gets the full
+> host feature set. Baking would mean pinning a conservative ISA baseline at build
+> time (get it wrong on a modern CI runner and the binary is rejected on older CPUs),
+> permanently forgoing host-specific codegen, growing the binary 22 MB → ~30 MB, and
+> teaching `build-binary.sh --target` to precompile per target triple. The cache also
+> reuses the sidecar's already-hardened publish path — atomic temp+rename, best-effort
+> writes, deserialize-failure heals by recompiling. The one case baking would win is
+> an ephemeral environment that never warms a cache (a fresh container per CI job);
+> the two are not exclusive, so that stays available if it ever bites.
+>
+> Layers 2 and 3 below are unaffected and still open — though see §4.0 on why layer 2
+> is no longer urgent.
+
 Three independent layers ([Module docs](https://docs.wasmtime.dev/api/wasmtime/struct.Module.html),
 [cache docs](https://docs.wasmtime.dev/cli-cache.html)):
 
