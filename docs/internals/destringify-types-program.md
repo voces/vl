@@ -369,6 +369,104 @@ The ~10 sites that decide structure by comparing rendered text
 Replace with arena predicates. `tyEq` (typecheck.vl) is the model — it already decides
 render-equality *structurally, without building the strings*.
 
+### D5 (enabler) — the struct/variant FIELD-ELEMENT layer — SHIPPED
+
+`sFieldElemName` (a field's element/target type NAME) was the **input to every slot
+resolver** the field layer consults — `rlSlotByName`, `structIndexByName`,
+`mvSlotOfValNameFind`, `emitUnionCoerce`. The name column cannot retire while it is the
+only way to ask *"which slot does this field's element type use?"*, so this slice builds
+the arena answer and moves the ref-list and nested-struct consumers onto it.
+
+**Sidecars (byte-identical, no consumer).** `sFieldElemTyIx[]` ∥ `sFieldElemName` and
+`uFieldElemTyIx[]` ∥ `uFieldElemName` — the arena type each recorded element/target name
+denotes, resolved ONCE at intern time (`recordSFieldElemTyIx` / `recordUFieldElemTyIx` →
+`fieldElemTyIxOfName`: nominal `cUserTypes` first, then `resolveAnnot`). Recorded at all
+**14** `push` sites (12 in `internInlineShape`/`internShapeAs`/`collectGenAliasShapes`,
+2 in `collectS`/`collectAnonShapes`; 2 more for the variant table). Pad-on-push like
+`recordSTyIx`, so a missed site self-heals to -1 and every consumer falls through to the
+name path. A synthetic `#anonN` element name resolves through neither path and records
+-1 — the honest "uncovered", and (see the coverage gap below) the reason two consumers
+had no coverage at all.
+
+**Arena-input resolvers.**
+- `rlSlotOfTy(ty)` — the ref-list layer is ALREADY keyed on `repElemKey` (D2), so this
+  is a lookup, not new design: it answers `rlSlotByName`'s first two rungs (the
+  exact-stored-name fast path, and the `repElemKeyOfName` rescan that resolves the name
+  back to a type to compute exactly this key) straight from the type. The THIRD rung —
+  the struct-twin NAME fallback — has no arena input and is deliberately not reproduced;
+  the caller keeps its name path for the -1 answer. That is D1 leg C's **ladder-faithful**
+  shape: the arena replaces the predicate in place, the fall-through is untouched.
+- `structIndexOfTy(ty)` — `structIndexByName`'s twin, scanning the D0 `sTyIx` sidecar
+  with the same first-match-wins order. Chokepointed as `sFieldTgtStructIdx(si, fi)` /
+  `uFieldTgtStructIdx(vi, fi)` (arena leg, then the recorded name).
+
+**Migrated — 14 consumers.** Ref-list slot: `sFieldRefSlot`, `variantFieldRefSlot`
+(**RL**, **VRL**). Code-15 nested-struct target: the field default's `ref.null $S`
+(**SI-DEF**), the literal seed (**SI-LIT**) and its variant twin (**VSI-LIT**), the
+struct-eq recursion (**SI-EQ**), the type section (**SI-TYS**, **VSI-TYS**), the
+closure-field scan (**SI-CLO**), the optional chain (**SI-OPT**), `structIndexOfExpr`'s
+member arm (**SI-MEM**) and its narrowed-variant arm (**VSI-NAR**), and
+`variantFieldLayoutEq`'s two twin probes (**VSI-TWA/TWB**).
+
+**Deliberately NOT migrated, with reasons.**
+- `structIndexOfExpr`'s **un-narrowed variant** arm — the arena twin exists and is used
+  everywhere else, but this arm fired on **zero** corpus files and **zero** of 50,400
+  fuzz programs under a per-site sabotage build. A declared variant *rejects*
+  nested-struct fields and an inline-shape arm resolves through `structIndexOfExpr`'s
+  struct leg first, so the arm looks unreachable on today's surface. Unverifiable ⇒
+  unmigrated.
+- The **map-value** consumers (`mvSlotOfValNameFind` ×4, `mvShapeOfValName` ×2) — the
+  layer is PARKED (`mvValName` has several resolution paths and an earlier single-site
+  probe under-covered); an arena entry point there is its own slice.
+- `emitUnionCoerce`'s code-16 field name and `unionHasAtom(elem, "null")` — the union
+  **boxing ABI**, the D-UNION residue.
+- `ensureRefElem` / `rlInternName` — INTERN sites, which still need the emit-canonical
+  stored *name* (`rlElemStoredName`, the D2 residual).
+- `emit_mono`'s `sFieldElemNameAt` — it returns a type NAME as a mono key; nominal
+  identity, correct as-is. Same for `sFieldUnionName` / `variantFieldElemName` readers.
+
+**Method + measurements.** Additive probe at all 14 sites (compute both, KEEP the name
+answer, marker on disagreement), gated on the arena leg actually answering so "fired"
+means the MIGRATED leg ran: **0 disagreements** over the 1,236-file corpus + the 66-case
+battery and **50,400** fuzz programs (seeds 1–14 × depths 4–6 × {plain, `--declared`} ×
+300). Corpus **byte-identical** and run-identical (status + stdout); battery 0 diffs;
+fuzz A/B findings identical (2,248 shape lines both sides).
+
+**Sabotage-verified per site.** The marker ACCUMULATES a tag set and reports once at the
+end of `emitProgram` rather than aborting at the first hit, so an all-sites inversion
+reports every site reached instead of only the first — the limitation D-UNION's batches
+worked around with one build per site. Per-site corpus counts: SI-TYS 79 · SI-LIT 69 ·
+RL 63 · SI-MEM 62 · SI-CLO 19 · VSI-TYS 13 · VSI-NAR 12 · VRL 12 · VSI-LIT 8 · VSI-TWB 3
+· VSI-TWA 3 · SI-OPT 2 · SI-EQ 1 · SI-DEF 1. Cross-checked against isolated single-tag
+builds for the two rarest.
+
+**Coverage gap found and pinned.** `SI-DEF` (the omitted-nullable-nested-struct-field
+null) and `SI-EQ` (the struct-equality recursion) fired on **nothing** in the corpus.
+The cause is not that the code is dead — it is that `objects/equality.vl` compares
+`{pos: {x: 1}}` literals, whose nested rows are synthetic `#anonN` shapes the sidecar
+records as -1, so the migrated leg was never consulted. It took an **annotated** nested
+field. Pinned as `tests/cases/objects/declared-nested-struct-field-equality.vl` and
+`declared-nested-struct-field-omitted.vl`; both now fire (1 file each).
+
+**Gate-channel sabotage.** A deliberately-wrong compiler — both arena legs returning an
+in-range but OFF-BY-ONE slot/row wherever they answer (and only there, so the break is
+exactly as narrow as the migrated legs) — produced **53 BYTEDIFF + 29 build-status** and
+**78 run-status + 1 stdout** diffs on the corpus, and the fuzz leg failed hard (the
+generator no longer compiles). Both gate channels are live for this slice; the D-RET
+"green A/B over a shape the generator cannot produce" trap does not apply here.
+
+**Residual name readers (the honest D5 picture).** `sFieldElemName` is NOT retirable yet.
+Its remaining non-diagnostic readers, by family: the **map-value** layer
+(`mvSlotOfValNameFind` in `wasmEmit` ×4 and `emit_sections`; `mvShapeOfValName` ×2 and
+`ensureRefElem` in `emit_collect`), the **union-box ABI** (`emitUnionCoerce` ×2,
+`unionHasAtom(…, "null")`, `sFieldUnionName`), the **litunion classifiers**
+(`sFieldIsLitUnion` / `sFieldIsLitUnionArray` — `nameIsLitUnionType` /
+`nameIsLitUnionArray` over the recorded name), the **row-dedup comparators**
+(`annShapeIndexOf`'s `en != bi`, `collectNestedFieldShapes`' scanner,
+`shapeFieldTypeCompat`'s two `sFieldElemName` reads in `emit_rep`), the `unionArmPath*`
+walkers' threaded `elem` local (5 sites), and `emit_mono`'s nominal mono key. Each is a
+distinct question; none is answered by the field-element slot resolvers this slice moved.
+
 ### D5 — delete the name columns
 
 Once nothing reads a table's name column for anything but diagnostics, demote it to a
@@ -406,6 +504,7 @@ condition names two things, so measure those:
 | `$fnsig` key derived by rendering + re-parsing | yes | **no** at `cloCallSigKey` (`sigKeyOfTy`) |
 | inferred-return value-union verdict derived by rendering + re-parsing | yes | **no** (`tyIsValueUnion`) |
 | per-atom classify-by-render of a union member set | 15 sites | **4 sites** — batch 1 took 6, batch 2 the `unionArmPath*` five |
+| struct/variant FIELD-ELEMENT slot resolved by re-resolving a NAME | 14 sites | **0** for the ref-list + nested-struct layers (`sFieldElemTyIx`/`uFieldElemTyIx` → `rlSlotOfTy`/`structIndexOfTy`); the map-value / union-box / litunion readers stay |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
 

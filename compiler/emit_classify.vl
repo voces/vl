@@ -285,11 +285,13 @@ import {
   sDeclared,
   sFieldCount,
   sFieldElemName,
+  sFieldElemTyIx,
   sFieldNames,
   sFieldStart,
   sFieldTypes,
   sHeapIdx,
   sNames,
+  sTyIx,
   scopeFrames,
   scopeNames,
   scopeSlots,
@@ -297,6 +299,7 @@ import {
   uDeclared,
   uFieldCount,
   uFieldElemName,
+  uFieldElemTyIx,
   uFieldNames,
   uFieldStart,
   uFieldTypes,
@@ -321,8 +324,10 @@ import {
 } from "./emit_state"
 import { emitFail } from "./emit_bytes"
 import {
+  recordSFieldElemTyIx,
   recordSTyIx,
   recordUnMemTys,
+  repElemKey,
   repElemKeyOfName,
   repKindOfSigTok,
   repNameCanonKey,
@@ -3433,7 +3438,7 @@ function shapeHasCloField(si: i32, seen: i32[]) {
     const code = sFieldTypeAt(si, fi)
     if code == 14 { return true }
     if code == 15 {
-      const nsi = structIndexByName(sFieldElemNameAt(si, fi))
+      const nsi = sFieldTgtStructIdx(si, fi)
       if nsi >= 0 {
         if shapeHasCloField(nsi, seen) { return true }
       }
@@ -3934,6 +3939,79 @@ export function sFieldElemNameAt(si: i32, fi: i32) {
   sFieldElemName[sFieldStart[si] + fi]
 }
 
+// The ARENA type of struct `si`'s field `fi`'s element/target (destringify D5) — the
+// `sFieldElemTyIx` sidecar's accessor, `sFieldElemNameAt`'s structural twin. -1 when
+// the sidecar does not cover the row (a shorter sidecar is the pad-on-push self-heal,
+// an unresolvable `#anonN` element spelling is a recorded -1); every consumer treats
+// -1 as "keep the name path".
+export function sFieldElemTyIxAt(si: i32, fi: i32): i32 {
+  const ix = sFieldStart[si] + fi
+  if ix >= sFieldElemTyIx.length { return -1 }
+  sFieldElemTyIx[ix]
+}
+
+// The `sFieldElemTyIxAt` twin for VARIANT fields (`uFieldElemTyIx`).
+export function uFieldElemTyIxAt(vi: i32, fi: i32): i32 {
+  const ix = uFieldStart[vi] + fi
+  if ix >= uFieldElemTyIx.length { return -1 }
+  uFieldElemTyIx[ix]
+}
+
+// The ref-list table SLOT for an ARENA element type (destringify D5) — the
+// arena-input entry point to the layer `repElemKey` ALREADY keys: `rlInternName`
+// interns each slot on `repElemKey` and `rlSlotByName` scans the same column, so this
+// is a lookup, not new design. It answers `rlSlotByName`'s first two rungs (the
+// exact-stored-name fast path and the `repElemKeyOfName` rescan, which resolves the
+// name back to an arena type to compute exactly this key) directly from the type. The
+// THIRD rung — the struct-twin name FALLBACK — has no arena input and is deliberately
+// NOT reproduced here: a caller keeps its name path for the -1 answer, the
+// ladder-faithful shape D1's leg C prescribed (the arena replaces the predicate in
+// place; the fall-through is untouched).
+export function rlSlotOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const key = repElemKey(ty)
+  if key == "" { return -1 }
+  let i = 0
+  while i < rlElemKey.length {
+    if rlElemKey[i] == key { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// The struct-table ROW for an ARENA type (destringify D5) — `structIndexByName`'s
+// arena-input twin, scanning the `sTyIx` sidecar (phase D0: the arena type each row
+// denotes, recorded at the row's mint) instead of the name column. Same
+// first-match-wins order as the name scan. A row the D0 sidecar does not cover is -1
+// there and never matches a real type, so the caller falls through to its name path.
+export function structIndexOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let i = 0
+  while i < sTyIx.length {
+    if sTyIx[i] == ty { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// The struct-table row a NESTED-STRUCT field (code 15) targets — the chokepoint every
+// code-15 consumer shares (field default / literal seed / struct-eq recursion / type
+// section / closure-field scan / optional-chain). ARENA first (`sFieldElemTyIx` →
+// `structIndexOfTy`), then the recorded NAME (`structIndexByName`) for a row the
+// sidecar does not cover.
+export function sFieldTgtStructIdx(si: i32, fi: i32): i32 {
+  const a = structIndexOfTy(sFieldElemTyIxAt(si, fi))
+  if a >= 0 { return a }
+  structIndexByName(sFieldElemNameAt(si, fi))
+}
+
+// The `sFieldTgtStructIdx` twin for a VARIANT's nested-struct field.
+export function uFieldTgtStructIdx(vi: i32, fi: i32): i32 {
+  const a = structIndexOfTy(uFieldElemTyIxAt(vi, fi))
+  if a >= 0 { return a }
+  structIndexByName(uFieldElemName[uFieldStart[vi] + fi])
+}
+
 // True if struct `si`'s field `fi` is a literal-union ATOM field (code 0 whose recorded elem name
 // is a literal union) — construction/read/assign seed the atom rep (`pendingLitUnion`) for it.
 export function sFieldIsLitUnion(si: i32, fi: i32) {
@@ -4251,7 +4329,7 @@ export function optChainStructIdxOf(exprIx: i32, fnIx: i32) {
     const pfi = sFieldIndex(psi, e.omProp)
     if pfi < 0 { return -1 }
     if sFieldTypeAt(psi, pfi) != 15 { return -1 }
-    return structIndexByName(sFieldElemNameAt(psi, pfi))
+    return sFieldTgtStructIdx(psi, pfi)
   }
   structIndexOfExpr(exprIx, fnIx)
 }
@@ -10119,6 +10197,7 @@ export function internInlineShape(nm: string) {
       // shared box + the value-box reps it needs (this runs after `collectU`,
       // but before any type-index math).
       sFieldElemName.push(texts[pi])
+      recordSFieldElemTyIx(texts[pi]) // D5
       registerValueUnionName(texts[pi])
     } else if codes[pi] == 15 {
       // The nested-struct field's TARGET name (`|null` stripped) — `emitObj`
@@ -10127,16 +10206,21 @@ export function internInlineShape(nm: string) {
       const nb15 = nullablePartOf(b15)
       if nb15 != "" { b15 = nb15 }
       sFieldElemName.push(b15)
+      recordSFieldElemTyIx(b15) // D5
     } else if codes[pi] == 19 {
       // A MAP field records its VALUE type-name (`i32` of `{[string]: i32}`) — the mv-slot
       // interning key. The slot itself is interned in `collectA` (which resets `mvValName`,
       // so interning here would be wiped); the inner map of an inline `{m:{[string]:V}}` is
       // not a standalone TypeRef that `collectA`'s scan sees, so it interns code-19 FIELDS.
-      sFieldElemName.push(mapValNameOf(texts[pi]))
+      const mv19 = mapValNameOf(texts[pi])
+      sFieldElemName.push(mv19)
+      recordSFieldElemTyIx(mv19) // D5
     } else if codes[pi] == 29 {
       // A NULLABLE map field records the `| null`-stripped map's VALUE type-name — the
       // same mv-slot key as code 19, interned by the same `collectA` field loop.
-      sFieldElemName.push(mapValNameOf(nulMapInnerName(texts[pi])))
+      const mv29 = mapValNameOf(nulMapInnerName(texts[pi]))
+      sFieldElemName.push(mv29)
+      recordSFieldElemTyIx(mv29) // D5
     } else if codes[pi] == 5 {
       // A REF-LIST field (`f: N[]` / `f: (i32|null)[]`): record its element name (the CANONICAL ref-array
       // element name — parens stripped for a value-union element so it keys the same slot every other
@@ -10166,6 +10250,7 @@ export function internInlineShape(nm: string) {
         }
       }
       sFieldElemName.push(e5)
+      recordSFieldElemTyIx(e5) // D5
       if isValueUnionName(e5) { registerValueUnionName(e5) }
     } else if codes[pi] == 28 {
       // A NULLABLE ref-list field (`f: S[] | null`): its element name is the ref-array element of the
@@ -10177,22 +10262,28 @@ export function internInlineShape(nm: string) {
         if structIndexByName(raw28) >= 0 { e28 = raw28 }
       }
       sFieldElemName.push(e28)
+      recordSFieldElemTyIx(e28) // D5
       if isValueUnionName(e28) { registerValueUnionName(e28) }
     } else if codes[pi] == 0 && nameIsLitUnionType(texts[pi]) {
       // A literal-union atom FIELD (code 0): record its union name so construction/read/assign
       // recover the atom rep + membership (`sFieldIsLitUnion`).
       sFieldElemName.push(texts[pi])
+      recordSFieldElemTyIx(texts[pi]) // D5
     } else if codes[pi] == 4 && nameIsLitUnionArray(texts[pi]) {
       // An ATOM-ARRAY field (`f: K[]`, code 4): record the array type-name so
       // `sFieldIsLitUnionArray` seeds the atom-element context at construct/assign
       // (and `collectA`'s field-table pass forces the i32 list types off it).
       sFieldElemName.push(texts[pi])
+      recordSFieldElemTyIx(texts[pi]) // D5
     } else if codes[pi] == 30 {
       // A NULLABLE-litunion niche field (`f: K | null`, code 30): record the
       // non-null union name so membership/atom recovery mirrors the code-0 field.
-      sFieldElemName.push(nulLitUnionInnerName(texts[pi]))
+      const nl30 = nulLitUnionInnerName(texts[pi])
+      sFieldElemName.push(nl30)
+      recordSFieldElemTyIx(nl30) // D5
     } else {
       sFieldElemName.push("")
+      recordSFieldElemTyIx("") // D5
     }
     pi = pi + 1
   }
@@ -10252,6 +10343,7 @@ export function internShapeAs(key: string, nm: string) {
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
     sFieldElemName.push("")
+    recordSFieldElemTyIx("") // D5
     pi = pi + 1
   }
   0
@@ -10399,6 +10491,7 @@ export function gaeEnsure(name: string) {
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
     sFieldElemName.push(elems[pi])
+    recordSFieldElemTyIx(elems[pi]) // D5
     pi = pi + 1
   }
   0
@@ -10661,6 +10754,12 @@ export function variantFieldTypeAt(vi: i32, fi: i32) {
 
 // The ref-list table SLOT of variant `vi`'s ref-list field `fi`, or -1 if not a ref list.
 export function variantFieldRefSlot(vi: i32, fi: i32) {
+  // D5: the ARENA leg — the field's recorded element type resolves the slot through
+  // the rep key the layer is already interned on; the recorded NAME is the
+  // fall-through for a row the sidecar does not cover (and for `rlSlotByName`'s
+  // struct-twin rung, which has no arena input).
+  const a = rlSlotOfTy(uFieldElemTyIxAt(vi, fi))
+  if a >= 0 { return a }
   rlSlotByName(uFieldElemName[uFieldStart[vi] + fi])
 }
 
@@ -10708,10 +10807,7 @@ function variantFieldLayoutEq(a: i32, b: i32): i32 {
       }
     } else if ca == 15 {
       if (
-        repStructSlotsTwin(
-          structIndexByName(uFieldElemName[uFieldStart[a] + fi]),
-          structIndexByName(uFieldElemName[uFieldStart[b] + fi]),
-        ) ==
+        repStructSlotsTwin(uFieldTgtStructIdx(a, fi), uFieldTgtStructIdx(b, fi)) ==
         0
       ) {
         return 0
@@ -13055,9 +13151,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     if msi >= 0 {
       const mfi = sFieldIndex(msi, e.memProp)
       if mfi >= 0 {
-        if sFieldTypeAt(msi, mfi) == 15 {
-          return structIndexByName(sFieldElemNameAt(msi, mfi))
-        }
+        if sFieldTypeAt(msi, mfi) == 15 { return sFieldTgtStructIdx(msi, mfi) }
       }
       return -1
     }
@@ -13073,7 +13167,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
         const nvfi = variantFieldIndex(nvi, e.memProp)
         if nvfi >= 0 {
           if variantFieldTypeAt(nvi, nvfi) == 15 {
-            return structIndexByName(variantFieldElemName(nvi, nvfi))
+            return uFieldTgtStructIdx(nvi, nvfi)
           }
         }
       }
@@ -13083,6 +13177,16 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
       const pvfi = variantFieldIndex(pvi, e.memProp)
       if pvfi >= 0 {
         if variantFieldTypeAt(pvi, pvfi) == 15 {
+          // DELIBERATELY NOT MIGRATED (destringify D5). The arena twin of this
+          // lookup is `uFieldTgtStructIdx`, and it is used at every OTHER code-15
+          // variant-field site — but this arm (a receiver that is variant-typed
+          // WITHOUT being struct-resolvable, i.e. a declared variant NAME) fired on
+          // ZERO corpus files and ZERO of 50,400 fuzz programs under a per-site
+          // sabotage build. A declared variant rejects nested-struct fields
+          // ("only i32 / boolean / string / array union-variant fields are
+          // supported") and an inline-shape arm resolves through `structIndexOfExpr`
+          // above, so the arm looks unreachable on today's surface. Unverifiable ⇒
+          // unmigrated: it keeps the name path until a shape that reaches it exists.
           return structIndexByName(variantFieldElemName(pvi, pvfi))
         }
       }
