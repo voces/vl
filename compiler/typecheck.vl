@@ -1058,14 +1058,21 @@ let gRootStmts: i32[] = []
 // with `?? ""` mis-lowers (nullable-ref vs ref), so the TYPE stays in arrays. Reset per compile.
 let inferRetFn: string[] = []
 let inferRetTy: string[] = []
-// D-UNION SET-ADT — the MEMBER COUNT the recorded name was joined from, parallel to
-// `inferRetTy`. The emitter's anonymous-nominal residual (`registerInferRetNominalUnion`,
-// #1057) asks "did this recorded name spell a UNION" and answered by RE-SPLITTING the
-// name it had just been handed; the count is a property of the arena type the name was
-// BUILT from (`retMemCountOf` walks the same union/nullable spine the name producers
-// walk), so recording it retires that parse. -1 = not recorded (the consumer keeps its
-// split).
-let inferRetMemCount: i32[] = []
+// #1057 — the TOP-LEVEL ATOM COUNT of the recorded name, parallel to `inferRetTy`. The
+// emitter's anonymous-nominal residual (`registerInferRetNominalUnion`) asks "did this
+// recorded name spell a UNION" and answered by RE-SPLITTING the name it had just been
+// handed; the recorder banks the answer instead, and the consumer is a lookup.
+//
+// The FIRST attempt at this column walked the recorded ARENA type's union/nullable spine
+// (`retMemCountOf`) and was REFUTED in `registerInferRetNominalUnion`'s own comment: a
+// litunion member renders as ONE atom (its ALIAS) while the spine walk counts its literal
+// members, so the two disagree on `K0 | null` — and in the other direction a bare `K0`
+// return renders one atom while the walk counts >= 2, which would register a union this
+// compiler does not register. The count belongs to the NAME PRODUCER (how many atoms it
+// joined), not to a walk of the type it rendered. `recordInferRet` is the single funnel
+// every producer's name lands in, so the count is banked there, on the very string the
+// consumer would have split. -1 is unreachable by construction (every push records).
+let inferRetAtomCount: i32[] = []
 // The ARENA-INDEX sibling of `inferRetTy` (parallel array): the `Ty`-arena index of each
 // recorded inferred return type, so the emitter's `collectU` inferred-return loop can drive
 // the STRUCTURAL arena walks (`collectTyReachRegister` / `collectTyReachCloSigs`) off the
@@ -1126,6 +1133,29 @@ let isVarTyIx: i32[] = []
 // fields/elements exactly where the adoption recursion goes (`tyDeeperThan`-guarded for recursive
 // types). NOTHING consumes it in this phase — the recorder is byte-identical.
 let nodeRepTyIx: i32[] = []
+// ANNOTATION ATOM-COUNT sidecar (#1055): how many TOP-LEVEL union atoms the annotation
+// node's EMIT-TIME spelling is joined from, banked BY THE PRODUCER OF THAT SPELLING.
+//
+// `canonEmitTypeNames` is that producer — it rewrites every `TypeRef`'s `tyName` into the
+// emitter's vocabulary at the end of `checkProgram`, and `compileSrc` hands the SAME arena
+// to `emitProgram`, so the name it writes is the name every emitter consumer reads. The
+// emitter used to re-derive the count by SPLITTING that rendered name back apart
+// (`registerCollapsedUnionName`); it now reads the number the producer already knows.
+//
+// Why the count cannot be recovered from the arena: an annotation whose members are
+// SAME-SHAPE declared structs (`A | B` with `type A = {v: i32}` / `type B = {v: i32}`)
+// resolves through `nameToTy`'s union arm, where `sameVariantTy` DEDUPS the two members
+// to one and the whole union collapses to a plain `TyObj`. After that collapse the arena
+// holds a struct, not a union, and "the source spelled a union" survives only in the
+// spelling. (`retMemCountOf`'s arena-spine walk was the refuted attempt at the sibling
+// question — see `recordInferRet`.)
+//
+// One entry per NODE (not per name): -1 for a node that is not a `TypeRef`, so a
+// consumer's `>= 2` test reads exactly what `splitUnionAtoms("")` gives it (1 atom, no
+// union) at a non-annotation node. Sized to the node arena and rebuilt inside
+// `canonEmitTypeNames`, which runs unconditionally on every checked program, so the
+// sidecar's lifetime is the program's.
+let annUnionAtoms: i32[] = []
 // NOMINAL-IDENTITY sidecar (C1): the `Ty`-arena indices of DECLARED STRUCT types (`cStructTyIxs`)
 // and of UNION-VARIANT MEMBER types (`cVariantMemberTyIxs`). A struct annotation's node reads
 // `nodeTyIsStruct` = "its recorded type IS a declared struct and NOT a variant member" — the emitter's
@@ -1764,7 +1794,7 @@ export function initChecker() {
   gRootStmts = []
   inferRetFn = []
   inferRetTy = []
-  inferRetMemCount = []
+  inferRetAtomCount = []
   inferRetTyIx = []
   inferRetIdx = Map()
   inferLetIx = []
@@ -1775,6 +1805,7 @@ export function initChecker() {
   nodeTyIx = []
   isVarTyIx = []
   nodeRepTyIx = []
+  annUnionAtoms = []
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
   inferQuiet = false
@@ -6208,12 +6239,24 @@ export function canonEmitName(name: string) {
 // `checkProgram` — `compileSrc` hands this SAME arena to `emitProgram`, so the
 // emitter only ever sees its own vocabulary.
 export function canonEmitTypeNames() {
+  annUnionAtoms = []
   let i = 0
   while i < P.nodes.length {
+    // The atom-count bank (#1055): one entry PUSHED per node, in node order, so the
+    // column is exactly `P.nodes.length` long and index == node index. A non-`TypeRef`
+    // node banks -1 (there is no annotation spelling to count); a `TypeRef` banks the
+    // count of the name this pass just PRODUCED — `unionMemberCount` is the counting
+    // dual of the `splitUnionAtoms` the emitter consumers used to run on the same
+    // string, so the banked number is exact rather than a structural approximation.
+    // Pushing (rather than pre-sizing and indexing) is what makes the reset above
+    // LOAD-BEARING: without it a second program in the same instance would shift every
+    // index, which the shared-instance suite catches immediately.
+    let atoms = -1
     const n = P.nodes[i]
     if n is TypeRef {
       const c = canonEmitName(n.tyName)
       if c != n.tyName { n.tyName = c }
+      atoms = unionMemberCount(c)
     } else if n is UnionDecl {
       const vs = n.udVariants
       let vi = 0
@@ -6223,6 +6266,7 @@ export function canonEmitTypeNames() {
         vi = vi + 1
       }
     }
+    annUnionAtoms.push(atoms)
     i = i + 1
   }
   0
@@ -12384,35 +12428,21 @@ function recordInferRet(name: string, ty: string, tyIx: i32) {
   if !inferRetIdx.has(name) { inferRetIdx[name] = inferRetFn.length }
   inferRetFn.push(name)
   inferRetTy.push(ty)
-  inferRetMemCount.push(retMemCountOf(tyIx))
+  // #1057 — bank the recorded name's TOP-LEVEL atom count HERE, at the one funnel every
+  // inferred-return name producer lands in. `unionMemberCount` is the counting dual of
+  // `splitUnionAtoms` (same depth/quote rules, same top-level-`=>` stop), so the banked
+  // number is exactly what the emitter's consumer used to re-derive — no arena
+  // approximation, and no litunion-alias disagreement (see the column's comment).
+  inferRetAtomCount.push(unionMemberCount(ty))
   inferRetTyIx.push(tyIx)
   0
 }
 
-// How many TOP-LEVEL members the emitter-format name of the inferred return type `er`
-// is joined from — the structural dual of `splitUnionAtoms(<that name>).length`. Every
-// name producer above (`valueUnionRetName`, `structUnionRetName`,
-// `variantBoxUnionRetName`, the `X|null` niches, a plain `tyToStr`) renders ONE atom per
-// leaf of the union/nullable spine, in spine order, so the count is that spine's leaf
-// count. -1 for an unresolved type: the consumer then keeps its own split.
-function retMemCountOf(er: i32): i32 {
-  if er < 0 { return -1 }
-  if er >= T.tys.length { return -1 }
-  const t = T.tys[er]
-  if t is TyUnion { return t.uMembers.length }
-  if t is TyNullable {
-    const inner = retMemCountOf(t.nInner)
-    if inner < 0 { return -1 }
-    return inner + 1
-  }
-  1
-}
-
-// The member COUNT of the inferred-return name at row `i` (`inferRetTyAt`'s sibling):
-// >= 1 when recorded, -1 when the row's type did not resolve.
-export function inferRetMemCountAt(i: i32) {
-  if i < 0 || i >= inferRetMemCount.length { return -1 }
-  inferRetMemCount[i]
+// The TOP-LEVEL atom count of the inferred-return NAME at row `i` (`inferRetTyAt`'s
+// sibling): >= 1 for every recorded row, -1 only for an out-of-range index.
+export function inferRetAtomCountAt(i: i32) {
+  if i < 0 || i >= inferRetAtomCount.length { return -1 }
+  inferRetAtomCount[i]
 }
 
 export function inferRetNameOf(name: string) {
@@ -12506,6 +12536,17 @@ export function inferLetIxAt(i: i32) { inferLetIx[i] }
 export function nodeTyIxOf(ix: i32) {
   if ix >= 0 {
     if ix < nodeTyIx.length { return nodeTyIx[ix] }
+  }
+  -1
+}
+// ANNOTATION ATOM COUNT (#1055): how many TOP-LEVEL `|`-joined atoms the annotation node
+// `ix`'s emit-time spelling has — the number `splitUnionAtoms(tyNameOf(ix)).length` would
+// re-derive, banked by `canonEmitTypeNames`, the pass that PRODUCED that spelling.
+// -1 for a node that is not a `TypeRef` (no annotation spelling) and for a node that
+// postdates the bank (an emitter-synthesized annotation); >= 1 otherwise.
+export function annUnionAtomsOf(ix: i32) {
+  if ix >= 0 {
+    if ix < annUnionAtoms.length { return annUnionAtoms[ix] }
   }
   -1
 }
