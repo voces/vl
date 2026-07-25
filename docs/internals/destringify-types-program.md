@@ -547,6 +547,99 @@ Its remaining non-diagnostic readers, by family: the **map-value** layer
 walkers' threaded `elem` local (5 sites), and `emit_mono`'s nominal mono key. Each is a
 distinct question; none is answered by the field-element slot resolvers this slice moved.
 
+### D-MAPVAL — the map-VALUE slot layer (`mvValName`) — SHIPPED
+
+The layer that had been parked TWICE: `mvValName` is the mv table's key, and a
+single-site probe on `mvSlotOfValNameFind` once swept the corpus with 0 disagreements
+and then FAILED sabotage verification — the load-bearing path was elsewhere. The
+unblocking tool is D5's **accumulating marker** (a tag SET reported once at the end of
+`emitProgram` instead of a sticky first-failure abort), which lets one all-sites
+inversion report every site reached.
+
+**Every resolution path in the layer, enumerated first.** Five `mvValName[i] == name`
+scans, three shared inputs:
+
+| path | where | miss answer |
+|---|---|---|
+| `mvShapeOfValName` | emit_classify — the INTERNER (find-or-mint) | mints a new row |
+| `mvSlotOfValNameFind` | emit_classify — the loud find | `emitFail` |
+| `mvSlotOfMapValNameOrMono` | emit_classify — the mono-tolerant find | `-3` |
+| `mapAnnShape` | emit_classify — the annotation's map shape | `-1` |
+| `mvSlotByValNameOr` | emit_collect — the element-heap resolver | `-1` |
+
+plus two things that are *not* separate resolvers and are covered transitively:
+`mvCanonValName` (the key CANONICALISER the first three run their input through — the
+D2 shape, string surgery encoding rep equivalence) and `ensureRefElem` (an INTERN entry
+point whose kind-3 arm calls `mvShapeOfValName` for its side effect and discards the
+answer — it makes no slot decision of its own). The nine field consumers D5 listed as
+residuals (`mvSlotOfValNameFind` ×4 in `wasmEmit`, ×2 in `emit_sections`, ×3 in
+`emit_classify`) are all callers of these five, so migrating the resolvers in place
+covers them without threading a type through each site.
+
+**`repMvValKey(ty)` — the layer's rep key.** Neither of the two existing keys works,
+and the reasons are the D2 lesson from both ends:
+
+- NOT `repElemKey`. The ref-list layer folds every shared-wrapper leaf list to one
+  token (`i32[]` / `boolean[]` / litunion `K[]` → `$rlI32L`). The mv table does not:
+  each spelling interns its OWN row, and the layout dedup happens later and separately
+  (`mvTwin` / `mvCanonRepOf`). Folding here would hand a caller a row whose recorded
+  NAME is a different spelling.
+- NOT `repCanonKey`. It expands a declared struct structurally, so `{[string]: A}` and
+  `{[string]: B}` (declared twins) would collapse — yet they are distinct mv rows with
+  distinct `mvValStructIdx`. A declared struct keys on its NOMINAL slot
+  (`repSlotOfTyDecl`); only an inline shape expands.
+
+The single fold it *does* perform is `mvCanonValName`'s: a litunion member of a MIXED
+union keys `"string"`, same niche guard. **Strictness is the safe direction** — a key
+finer than name-equality makes the resolver DECLINE (the caller falls through to its
+name scan); a coarser one would hand back another row's slot.
+
+**Sidecar.** `mvValTyIx[]` ∥ `mvValName`, recorded at intern time
+(`recordMvValTyIx` → `fieldElemTyIxOfName`), pad-on-push. Both sides of a comparison
+compute `repMvValKey` at QUERY time from the recorded INDEX — never a key frozen at
+intern time — so an in-place arena mutation moves both together (the D1 hazard).
+
+**A per-PROGRAM reset the name column never needed.** The sidecar's rows are indices
+into `T.tys`, which a fresh program REBUILDS; the name column is merely stale text, so
+`collectA`'s reset was late enough for it and is not for the sidecar. A compiler
+instance that lowers several programs (`cases_wasm_test.ts` shares one) let program
+N-1's rows answer a query issued before `collectA` — a stale index into a rebuilt
+arena, and 4 suite cases trapped `array element access out of bounds`. `mvValTyIx` is
+now emptied at the top of `emitProgram`, ahead of every collect pass, so that window
+resolves to "uncovered" and every consumer keeps its name path. **The corpus A/B could
+not see this**: `vl build` gives each file a fresh instance, so the corpus and the fuzz
+leg were both green while the shared-instance suite was red. A third gate channel —
+the suite's shared-instance driver — is the only one that expresses it.
+
+**Method + measurements.** Additive probe at all five sites (compute both, KEEP the
+name answer, accumulating marker), gated on the arena leg actually answering so
+"fired" means the MIGRATED leg ran: **0 disagreements** over the 1,265-file corpus
+(`tests/cases` + `std/` + the compiler's own source), **0** over **25,200** fuzz
+programs (seeds 1–14 × depths 4–6 × {plain, `--declared`} × 300), and **0** over the
+1,949-case suite under the probe seed. Corpus **byte-identical** and run-identical;
+66-case battery 0 diffs; fuzz A/B identical (2,248 shape lines both sides);
+self-compile wall clock unchanged (min 951 ms vs 952 ms over 7 interleaved rounds).
+
+**Sabotage-verified per site**, one all-sites inversion, 137 corpus files reached:
+`SHAPE` 133 · `MONO` 68 · `ANN` 52 · `FIND` 36 · `OR` 23. No site had a coverage gap,
+so none was left unmigrated for want of evidence.
+
+**Gate-channel sabotage, per site.** An arena leg answering an in-range but OFF-BY-ONE
+slot — broken only where the migrated leg answers — reddens the corpus A/B for *every*
+one of the five independently: SHAPE 32 build-status + 17 byte-diffs / 47 run-status +
+1 stdout · FIND 2 + 11 / 12 · MONO 14 + 11 / 24 · ANN 11 + 9 / 20 · OR 1 + 15 / 15.
+Unlike batch 3's `unionListElemMapFieldMember`, no site here rests on the probe alone.
+
+**What remains in the layer.** The mv table's NAME column is not retirable: the *key*
+is structural now, but `mvValName[slot]` is still READ as a type name by
+`emitUnionBoxArg` / `refArrElemName` / `unionHasAtom` in `wasmEmit`, by
+`nulRefMapValInnerOf` / `mvUnionIsScalarNull` / `repNameCanonKey` in `emit_classify`,
+and `mvValKindOfName` still classifies the value by its spelling. Those are the D5
+`sFieldElemName` situation one layer over: each is a distinct question, and none is
+answered by the slot resolvers this slice moved. `mvCanonValName` also survives as the
+stored-name canonicaliser (the `rlElemStoredName` residual's twin) even though it is no
+longer the key.
+
 ### D5 — delete the name columns
 
 Once nothing reads a table's name column for anything but diagnostics, demote it to a
@@ -584,7 +677,8 @@ condition names two things, so measure those:
 | `$fnsig` key derived by rendering + re-parsing | yes | **no** at `cloCallSigKey` (`sigKeyOfTy`) |
 | inferred-return value-union verdict derived by rendering + re-parsing | yes | **no** (`tyIsValueUnion`) |
 | per-atom classify-by-render of a union member set | 15 sites | **12 functions still contain the pattern**; batches 1-3 made the arena answer FIRST in most (see the counting caveat) |
-| struct/variant FIELD-ELEMENT slot resolved by re-resolving a NAME | 14 sites | **0** for the ref-list + nested-struct layers (`sFieldElemTyIx`/`uFieldElemTyIx` → `rlSlotOfTy`/`structIndexOfTy`); the map-value / union-box / litunion readers stay |
+| struct/variant FIELD-ELEMENT slot resolved by re-resolving a NAME | 14 sites | **0** for the ref-list + nested-struct layers (`sFieldElemTyIx`/`uFieldElemTyIx` → `rlSlotOfTy`/`structIndexOfTy`); the union-box / litunion readers stay |
+| map-VALUE slot keyed by canonical-name equality | 5 scans | **0** (`mvValTyIx` → `repMvValKey`; the name scan is the fall-through) |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
 
@@ -593,8 +687,9 @@ The 12 remaining `table[i] == name` scans split three ways, and **most are not t
 - **Legitimate ABI identity** — the `cloSigKeys` scan: that key text *is* the interned
   WasmGC functype's identity, so a string is its natural representation. What mattered was
   that every *producer* derives it structurally, which D3 did.
-- **Genuinely open** — the `mvValName` map-value scans (parked: re-keying removes a
-  comparison but not the string, which retires at D5) and `unMemberSet` (the union arc).
+- **Genuinely open** — `unMemberSet` (the union arc). The `mvValName` map-value scans
+  are done (D-MAPVAL): all five key on `repMvValKey` now, with the name scan as the
+  fall-through. The remaining `mvValName[slot]` reads are name CONSUMERS, not keys.
 
 ### The open arc: union member sets
 
@@ -659,6 +754,13 @@ then walk back to the enclosing function and dedupe.
    dedicated fixture now matches at the earlier arm and six hand-written attempts mis-narrow
    before the box site. **Do not migrate what you cannot sabotage-verify** — record the
    measurement and leave it on the name path.
+
+7. **An arena sidecar has a LIFETIME the name column it parallels does not** (D-MAPVAL) —
+   a recorded index is only meaningful while the arena it indexes is the one that minted
+   it, so every sidecar needs a reset no later than the first query of a new program. A
+   stale NAME is merely wrong text; a stale INDEX traps. Neither the corpus A/B nor the
+   fuzz leg can see this (both give each program a fresh compiler instance) — only the
+   suite's shared-instance driver does. Run it before believing a green A/B.
 
 The first three are the same underlying mistake: assuming an arena artifact answers the same
 question the string did. Check which question the site is asking, first.
