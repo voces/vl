@@ -1627,3 +1627,113 @@ name-faithfully and yields `S`. The site parses a type string (`refArrElemName(m
 and must go. **Verdict withdrawn.**
 
 **Terminal condition restated: 0 type-string parse calls outside the parser.** Currently 607.
+
+## D-REFARR — the ref-array interior chokepoints, ANNOTATION-NODE consumers (#1105)
+
+The three interior parsers `refArrElemName` (53) / `nameIsRefArray` (48) /
+`refArrElemKind` (15) are the *reflist naming layer's own machinery*: they keep ~10 further
+parsers alive (`nameIsClosureArray`, `nameIsI32ListArray`, `nameIsMapArray`,
+`nameIsStringArray`, `parenUnionArrElemName`, `nullClosureArrElem`, the `nameIsNul*`
+family). This slice takes the first coherent consumer family off them.
+
+### The enumeration (the counting method)
+
+A **local-aware** scan of all 16 compiler modules — every textual call, with the enclosing
+function and, for a bare-identifier argument, the `let`/`const`/param/assignment that bound
+it (`scan_sites.py` + `locals.py`). **116 textual matches; 102 non-comment; 3 of those are
+the parsers' own `function f(name: string)` headers ⇒ 99 real call sites** (14 comments).
+By file: emit_classify **81** · emit_collect **15** · wasmEmit **3**. (116 as a *match* count,
+99 as a *call* count — say which is being reported, or the scorecard drifts again.)
+
+| class | sites | what |
+|---|---|---|
+| **(i) parser-internal** | **15** | the family's own mutual recursion (`nameIsRefArray` 2, `refArrElemKind` 3, `refArrElemName` 2) + its intern machinery (`ensureRefElem` 2, `nullArrayArrElem`, `nameIsNestedScalarLeafArray` 3, `nameIsNulRefList`, `checkArrName`) — the layer, not consumers of it |
+| **(iii) parser-domain** | **27** | annotation / `is`-test TEXT on its way INTO the tables: `collectA` 11, `registerInlineUnion` 4, `internInlineShape` 2, `shapeFieldElemName` 2, `forceCloResultListTypes` 2, `refArrTagOf`, `emitIs`, and `annParamKind`/`annRetKind` 4 (a *rendered function-type substring* off `annSplitParams` — no node to key on; blocked behind the `$fnsig` producer) |
+| **(ii) real consumers** | **57** | **28** ANNOTATION-NODE family (this slice migrates 13 of its 18 functions = 18 of its 28 calls; the other 10 are name PRODUCERS) · **21** union-ATOM family (`unionHasRefArrayArmSlot` & friends — the REFUTED set, see below) · **8** stored-column (4 of them `refListElemNameOfExpr`, plus the `rlElemInnerSlot` / `mvValInnerRlSlot` fall-throughs already inside migrated chokepoints) |
+
+Name PRODUCERS across the consumer classes: **14** calls in 6 functions.
+
+### Shape vs intern state, per site
+
+Every consumer this slice touches asks **intern state**, and is migrated as such — *"which
+ref-list ROW holds this annotation's element"*, answered by `rlSlotOfTy` (the layer's own
+`repElemKey` lookup). None is migrated to the structural *"a `TyArray` over a non-scalar
+element"* dual that D-UNION batch 3 refuted, because that dual drops `nameIsRefArray`'s
+extra requirement — that the element be NAMEABLE by the reflist layer. Asking for the ROW
+asks the intern question directly, so the refuted gap (a degenerate `rlSlotByName("") == -1`
+matching a caller's `-1`) cannot open: a missing row is `-1` and every caller keeps its name
+path there.
+
+Three helpers carry it (`emit_classify.vl`): `annRefArrSlot` (`| null`-tolerant, matching
+the callers that peel `nullablePartOf` first), `annBareRefArrSlot` (non-nullable only — the
+callers that ask `nameIsRefArray` of the WHOLE annotation get NO for `S[] | null`, so the
+arena leg must too) and `annNulRefArrSlot` (its dual), over `annTyNulFlag`'s tri-state.
+
+### 13 consumers migrated, in one gated batch
+
+| tag | consumer | question | probe reach (corpus files) | sabotage (vs migrated, 1,269 files) |
+|---|---|---|---|---|
+| A-SLOT | `tyAnnRefListSlot` | element ROW | 174 | 154 build-fail + 11 byte-diff |
+| A-KIND | `tyAnnRefListKind` | ROW's interned kind | 172 | **see below** — 39 build-fail + 55 byte-diff only after leaving the equivalence class |
+| B-PAR | `nulRefArrayInnerSlot` (param arm) | inner ROW (READ half) | 4 | 3 build-fail + 1 byte-diff |
+| B-LET | `nulRefArrayInnerSlotOfLet` | inner ROW (WRITE half) | 7 | 6 build-fail + 1 byte-diff |
+| C-RET | `retRefArrFlag` | is a ref array | 52 | 15 build-fail + 37 byte-diff |
+| C-PAR | `paramRefArray` | is a ref array | 25 | 25 build-fail |
+| D-RETN | `retNulRefArrFlag` | is a NULLABLE ref array | 7 | 7 build-fail |
+| D-LETN | `letIsNulRefArray` | is a NULLABLE ref array | 8 | 7 build-fail + 1 byte-diff |
+| E-LETRA | `letIsRefArray` (residual behind `annRepKindOf`) | is a ref array | 55 | 50 build-fail + 5 byte-diff |
+| F-STR | `letIsStringArray`'s ref-array reject | is a ref array | 55 | 29 build-fail + 26 byte-diff |
+| F-F32 | `letIsF32Array`'s ref-array reject | is a ref array | 50 | 30 build-fail + 20 byte-diff |
+| F-I64 | `letIsI64Array`'s ref-array reject | is a ref array | 53 | 29 build-fail + 21 byte-diff |
+| F-F64 | `letIsF64Array`'s ref-array reject | is a ref array | 53 | 29 build-fail + 21 byte-diff |
+
+Read/WRITE pairs moved together: B-LET (the kind-18 local's stored inner slot) with B-PAR
+(the param/expr read of the same slot), and D-LETN (which bindings ARE kind 18) with B-LET
+(what slot they store).
+
+### The A-KIND sabotage that proved the method, not the site
+
+The first `A-KIND` sabotage rotated the returned kind `1→2, 2→5, 5→1`. It produced **0
+byte-diffs and 0 run-diffs over 1,269 corpus files**, and — with the WHOLE classifier
+rotated, both legs — **0 differences over 25,200 fuzz programs**. That is not an inert
+site; it is a sabotage that never left the equivalence class. `tyAnnRefListKind`'s only
+consumer is `pendingListKind`, and `emitArr`'s `== 1`, `== 2` and `== 5` arms have
+**byte-identical bodies** (`isRefLit = true`, the three scalar-literal flags cleared). The
+class boundary is *list vs NOT-a-list*. Answering `0` where the arena leg answers reddens
+immediately: 39 build failures + 55 byte-diffs. Recorded because "perturb the equivalence
+classes and verify you actually left the class" is otherwise easy to believe you did.
+
+### What did NOT move, and why
+
+- The **union-ATOM family** (`unionHasRefArrayArmSlot`, `unionRefArrayArmSlotForElemAtom`,
+  `unionRefArrayArmSlotForMapElem`, `unionNestedArrayArmSlot`, `unionHasMapArrayArm`,
+  `calleeIsUnionElemFieldClosure`, `unionClosureArrElemUnion`,
+  `unionStructArmMapListElemIndex`, `unionListElemMapFieldMember`) stays put — these are
+  exactly the sites D-UNION batch 3 refuted, and their input is a rendered ATOM, not a node.
+  The arena route for them is `unMemTys`/`unMemAtoms`, which is a separate slice.
+- The **14 name-PRODUCER calls** stay: converting them moves the parse to their consumers unless
+  the consumers move first. `refListElemNameOfExpr` in particular feeds an INTERN site, a
+  name COLUMN and two NOMINAL lookups.
+- `annParamKind` / `annRetKind` receive a **substring of a rendered function type**
+  (`annSplitParams`), with no node to key on; they retire with the `$fnsig` producer (D3).
+
+### Parsers deleted: 0 — and what deletion would take
+
+Every leg is ladder-faithful (D1 leg C): the arena answers first, the name path is the
+untouched fall-through, so the parse CALL count is unchanged at 99 — **18 of those 99 calls
+now sit behind an arena leg that answers first**. Deleting a name leg
+needs the arena leg proven **total** for that site's input, which means `nodeTyIx` coverage
+for every annotation node that reaches it — the C1-endgame question, not this slice's.
+The honest scorecard for a slice of this shape is *consumers migrated*, not *calls removed*.
+
+### Gate
+
+Corpus **byte-identical + run-identical** (1,269 files) · 66-case battery **0 divergences**
+· shared-instance `vl run --batch` **700 programs in ONE instance, rc 0, 0 traps, identical
+transcript** · fuzz A/B **25,200 programs/side** (seeds 1-14 × depths 4,5,6 × {plain,
+`--declared`} × 300) with identical shape sets · additive probe **0 disagreements** over
+1,271 corpus files and over 25,200 fuzz programs, with all 13 sites confirmed REACHED by
+the separately-built inverted (agreement) marker — never the same build as the
+disagreement channel. `refresh-compiler.sh` / `rep-fuzz-check.sh` / `native-fixpoint.sh` /
+`lint-self.sh` / `SELFHOST_NATIVE_ALIGN=1 deno task test` (1,953 passed) / `fuzz-sweep.sh`
+all RC=0.

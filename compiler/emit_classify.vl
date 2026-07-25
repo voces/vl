@@ -1230,7 +1230,13 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
     // A nulreflist PARAM has no local slot — resolve its inner ref-list slot from the annotation
     // (`refArrElemName` of the `| null`-stripped ref-array name), so `p[i]` and `const t = p` agree.
     if paramNulRefArray(fnIx, e.identName) {
-      const npS = nullablePartOf(tyNameOf(paramTypeNode(fnIx, e.identName)))
+      const ptS = paramTypeNode(fnIx, e.identName)
+      // ARENA (destringify D-REFARR): the param annotation's inner ref-list ROW, off the
+      // recorded type — the WRITE counterpart of `nulRefArrayInnerSlotOfLet`'s local store,
+      // so a `p[i]` read and a `const t = p` binding keep resolving the same row.
+      const raP = annNulRefArrSlot(ptS)
+      if raP >= 0 { return raP }
+      const npS = nullablePartOf(tyNameOf(ptS))
       if npS != "" { return rlSlotByName(refArrElemName(npS)) }
     }
     return -1
@@ -1265,6 +1271,10 @@ export function letIsNulRefArray(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
+        // ARENA (destringify D-REFARR): the nullable annotation's inner element ROW — the
+        // same intern-state test the name pair below performs, and the READ counterpart of
+        // `nulRefArrayInnerSlotOfLet`'s slot (both must agree on which bindings are kind 18).
+        if annNulRefArrSlot(d.letType) >= 0 { return true }
         const np = nullablePartOf(lt.tyName)
         // A value-union-element inner (`(i32|null)[] | null`) is excluded — its annotated-local value
         // build is not yet supported, so it falls through to a clean reject rather than the kind-18 path
@@ -1286,6 +1296,10 @@ export function nulRefArrayInnerSlotOfLet(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
+        // ARENA (destringify D-REFARR): the annotation's inner ref-list ROW off the recorded
+        // type — the WRITE half of the kind-18 pair whose READ is `nulRefArrayInnerSlot`.
+        const raL = annNulRefArrSlot(d.letType)
+        if raL >= 0 { return raL }
         const np = nullablePartOf(lt.tyName)
         if np != "" { return rlSlotByName(refArrElemName(np)) }
       }
@@ -4050,6 +4064,65 @@ export function tyRefArrElemOf(ty: i32): i32 {
 // every caller keeps its name path for that answer (the ladder-faithful shape).
 export function rlInnerSlotOfElem(slot: i32): i32 {
   rlSlotOfTy(tyRefArrElemOf(rlElemTyIxAt(slot)))
+}
+
+// ── the ref-array ANNOTATION-NODE chokepoints (destringify D-REFARR) ──────────
+// The three interior parsers (`refArrElemName` / `nameIsRefArray` / `refArrElemKind`)
+// are the reflist layer's own naming machinery. Their ANNOTATION-position consumers
+// all ask ONE of two questions, and the arena answers both without rendering a name:
+//
+//   * "what ref-list ROW holds this annotation's element" — INTERN STATE, not shape.
+//     `rlSlotOfTy` is the layer's own `repElemKey` lookup, so this is the SAME
+//     question `rlSlotByName(refArrElemName(...))` asks, minus the round trip through
+//     a rendered element name.
+//   * "is this annotation a (nullable) ref array" — which every such consumer resolves
+//     by that same row existing. Deliberately NOT the structural "a `TyArray` over a
+//     non-scalar element": that dual was REFUTED in D-UNION batch 3 (2 disagreements in
+//     50,400 fuzz programs) precisely because `nameIsRefArray` also requires the element
+//     be NAMEABLE by the reflist layer. Asking for the ROW asks the intern-state
+//     question directly, so the refuted gap cannot open.
+//
+// `1` when the type-ANNOTATION node's recorded arena type is a `TyNullable`, `0` when it
+// is not, `-1` when the checker recorded no type for the node (an emitter synthesis the
+// `synthTypeRef` recorder could not resolve, or a node never checked). The tri-state keeps
+// "uncovered" distinguishable from "not nullable", so a caller never reads a missing row
+// as a positive answer.
+export function annTyNulFlag(tyNodeIx: i32): i32 {
+  if tyNodeIx < 0 { return -1 }
+  const ty = nodeTyIxOf(tyNodeIx)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return 1 }
+  0
+}
+
+// The ref-list table SLOT the ref-ARRAY type a type-annotation node names — the arena
+// reading of `rlSlotByName(refArrElemName(<the node's rendered name>))`. `tyRefArrElemOf`
+// peels the SAME single `| null` hop the name path peels with `nullablePartOf` before
+// taking the element, so a `S[] | null` annotation resolves its inner ref-list row here
+// exactly as `refArrElemName(nullablePartOf(...))` does. -1 when the node has no recorded
+// type, is not an array, or no row claims the element — every caller keeps its name path
+// on -1 (D1 leg C: the arena replaces the predicate in place, the fall-through is untouched).
+export function annRefArrSlot(tyNodeIx: i32): i32 {
+  if tyNodeIx < 0 { return -1 }
+  rlSlotOfTy(tyRefArrElemOf(nodeTyIxOf(tyNodeIx)))
+}
+
+// `annRefArrSlot` restricted to a NON-nullable annotation. The consumers that ask
+// `nameIsRefArray(<the whole annotation>)` get NO for a `S[] | null` spelling (the name
+// predicate does not peel a top-level `| null`), so their arena leg must decline it too —
+// without this gate `tyRefArrElemOf`'s nullable hop would answer where the name says no.
+export function annBareRefArrSlot(tyNodeIx: i32): i32 {
+  if annTyNulFlag(tyNodeIx) != 0 { return -1 }
+  annRefArrSlot(tyNodeIx)
+}
+
+// `annRefArrSlot` restricted to a NULLABLE annotation (`<ref-array> | null`) — the dual of
+// `annBareRefArrSlot`. The consumers that peel `nullablePartOf` FIRST and decline a
+// non-null spelling outright need the same restriction on the arena leg.
+export function annNulRefArrSlot(tyNodeIx: i32): i32 {
+  if annTyNulFlag(tyNodeIx) != 1 { return -1 }
+  annRefArrSlot(tyNodeIx)
 }
 
 // `structIdxOfElemName`'s structural dual: the struct-table row of a ref-list
@@ -7919,6 +7992,17 @@ export function retStructIndex(tyIx: i32) {
 // `LetDecl`-specific wrapper (`letAnnRefListKind`) forwards its `letType` here.
 export function tyAnnRefListKind(tyIx: i32) {
   if tyIx >= 0 {
+    // ARENA (destringify D-REFARR): the annotation's element ROW, `| null`-tolerant exactly
+    // as the name path below (which peels `nullablePartOf` before re-testing). The row was
+    // interned under the very kind `refArrElemKind` computes (`ensureRefElem` passes it to
+    // `rlInternName`), so `rlElemKindTbl` IS the answer — read, not re-derived. -1 keeps the
+    // name path.
+    const raK = annRefArrSlot(tyIx)
+    if raK >= 0 && raK < rlElemKindTbl.length {
+      if rlElemKindTbl[raK] == 2 { return 2 }
+      if rlElemKindTbl[raK] == 5 { return 5 }
+      return 1
+    }
     const lt = P.nodes[tyIx]
     if lt is TypeRef {
       // A NULLABLE ref-array annotation (`S[] | null`, kind 18) threads the same kind as its non-null ref
@@ -7962,6 +8046,11 @@ export function tyAnnRefListKind(tyIx: i32) {
 // element type.
 export function tyAnnRefListSlot(tyIx: i32) {
   if tyIx >= 0 {
+    // ARENA (destringify D-REFARR): the same intern-state question — which ref-list ROW
+    // holds this annotation's element — asked of the recorded type instead of the rendered
+    // name. `| null`-tolerant, matching the name path's `nullablePartOf` peel below.
+    const raS = annRefArrSlot(tyIx)
+    if raS >= 0 { return raS }
     const lt = P.nodes[tyIx]
     if lt is TypeRef {
       let rln = lt.tyName
@@ -7984,6 +8073,12 @@ export function retRefArrFlag(tyIx: i32) {
     // (`S[]`) — the clean base case of `nameIsRefArray`, without the O(nodes) name scan its bare
     // element match walks. Confirms only; nested / union / niche ref arrays fall to the name path.
     if nodeTyIsStructArray(tyIx) { return 1 }
+    // ARENA (destringify D-REFARR): a ref-list ROW for the annotation's element IS the
+    // intern-state question `nameIsRefArray` asks, and covers the nested / union / niche
+    // element spellings the struct-array fast path above declines. Gated to a NON-nullable
+    // annotation: `nameIsRefArray` does not peel a top-level `| null` (that spelling is
+    // `retNulRefArrFlag`'s), so the arena leg must not either.
+    if annBareRefArrSlot(tyIx) >= 0 { return 1 }
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
       if nameIsRefArray(ty.tyName) { return 1 }
@@ -8004,6 +8099,10 @@ export function retRefArrFlag(tyIx: i32) {
 // for it — so it keeps failing loudly rather than mis-riding this niche.
 export function retNulRefArrFlag(tyIx: i32) {
   if tyIx >= 0 {
+    // ARENA (destringify D-REFARR): a `TyNullable` annotation whose inner array's element
+    // owns a ref-list ROW — the intern-state reading of `nullablePartOf` + `nameIsRefArray`,
+    // with the nullable gate carried by `annNulRefArrSlot` so a bare `S[]` still answers 0.
+    if annNulRefArrSlot(tyIx) >= 0 { return 1 }
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
       const np = nullablePartOf(ty.tyName)
@@ -15474,6 +15573,11 @@ function paramRefArray(fnIx: i32, name: string) {
   const pt = paramTypeNode(fnIx, name)
   // STRUCTURAL fast-path (C1): a recorded array-of-declared-struct param, else the name test.
   if nodeTyIsStructArray(pt) { return true }
+  // ARENA (destringify D-REFARR): a ref-list ROW for the param's element — the intern-state
+  // reading of `nameIsRefArray`, covering the nested / union / closure / niche element
+  // spellings the struct-array fast path declines. Non-nullable only (a `S[] | null` param is
+  // `paramNulRefArray`'s, and `nameIsRefArray` says no to that spelling).
+  if annBareRefArrSlot(pt) >= 0 { return true }
   nameIsRefArray(tyNameOf(pt))
 }
 
@@ -15800,8 +15904,12 @@ export function letIsRefArray(letIx: i32, fnIx: i32) {
         const k = annRepKindOf(d.letType)
         if k != null {
           if k == "reflist" { return true }
-        } else if nameIsRefArray(lt.tyName) {
-          return true
+        } else {
+          // ARENA (destringify D-REFARR): where `repOfArray` declines the element (nested
+          // arrays, niche-nullable / union-box / map elements) the reflist layer's own ROW
+          // still answers — the intern-state question, off the recorded type.
+          if annBareRefArrSlot(d.letType) >= 0 { return true }
+          if nameIsRefArray(lt.tyName) { return true }
         }
       }
     }
@@ -16164,6 +16272,10 @@ export function letIsStringArray(letIx: i32, fnIx: i32) {
         if lt is TypeRef {
           if nameIsStringArray(lt.tyName) { return true }
           // A REF-array annotation (a union-element list) is authoritative — see `letIsF64Array`.
+          // ARENA (destringify D-REFARR): the reject asks intern state ("the reflist layer holds
+          // a row for this element"), which `annBareRefArrSlot` answers off the recorded type —
+          // reaching the union / nested / niche element spellings `annRepKindOf` leaves uncovered.
+          if annBareRefArrSlot(d.letType) >= 0 { return false }
           if nameIsRefArray(lt.tyName) { return false }
           // A `(K | null)[]` annotation is the i32 atom-niche list, authoritative over a string-FIRST
           // init literal (`["a", null]`): its member elements are atom ids, not string refs. Without
@@ -16339,6 +16451,8 @@ export function letIsF32Array(letIx: i32, fnIx: i32) {
         if lt is TypeRef {
           if nameIsF32Array(lt.tyName) { return true }
           // A REF-array annotation (`(f32 | null)[]`) is authoritative — see `letIsF64Array`.
+          // ARENA (destringify D-REFARR): the intern-state reading of that reject.
+          if annBareRefArrSlot(d.letType) >= 0 { return false }
           if nameIsRefArray(lt.tyName) { return false }
         }
       }
@@ -16428,6 +16542,8 @@ export function letIsI64Array(letIx: i32, fnIx: i32) {
         if lt is TypeRef {
           if nameIsI64Array(lt.tyName) { return true }
           // A REF-array annotation (`(i64 | null)[]`) is authoritative — see `letIsF64Array`.
+          // ARENA (destringify D-REFARR): the intern-state reading of that reject.
+          if annBareRefArrSlot(d.letType) >= 0 { return false }
           if nameIsRefArray(lt.tyName) { return false }
         }
       }
@@ -16531,6 +16647,8 @@ export function letIsF64Array(letIx: i32, fnIx: i32) {
           // A REF-array annotation (`(f64 | null)[]` — union-BOX elements) is authoritative:
           // the float-literal init must not claim the binding as a scalar f64 list (kind 12)
           // when the slot is a kind-2 ref list — the literal's elements box instead.
+          // ARENA (destringify D-REFARR): the intern-state reading of that reject.
+          if annBareRefArrSlot(d.letType) >= 0 { return false }
           if nameIsRefArray(lt.tyName) { return false }
           // An `f32[]` annotation is authoritative too: its float-literal init reads as
           // `exprF64Array`, so without this guard a GLOBAL `const a: f32[] = [1.5]` claims
