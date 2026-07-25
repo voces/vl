@@ -360,12 +360,13 @@ answer is a silent wrong answer at the matching `is` (or a cast trap), not a lou
 
 **Every path enumerated first**, because that is what the two earlier parks in this program
 were caused by not doing. The layer is `unionHasAtom(set, <atom>)` — `splitUnionAtoms` the
-member set, compare each atom to a FIXED keyword — reached from **15 decision sites** (26
-calls), all in `wasmEmit.vl`:
+member set, compare each atom to a FIXED keyword — reached from **16 decision sites** (28
+calls), fifteen in `wasmEmit.vl` and one in `emit_classify`:
 
 | tag | site | the decision |
 |---|---|---|
 | `UCI` | `emitUnionCoerce` | a bare int boxes `i64` when the union has no `i32` arm but an `i64` one |
+| `EQA` | `unionEqAtomOf` | the same i32/i64 choice for the CONCRETE side of a union `==` |
 | `UCF` | `emitUnionCoerce` | a float literal boxes `f32` when the only float arm is `f32` |
 | `UCL` | `emitUnionCoerce` | an int-element list adopts the union's `i64[]`/`f64[]`/`f32[]` arm (+ `pendingListKind`) |
 | `UCLF` | `emitUnionCoerce` | the list twin of `UCF` |
@@ -382,8 +383,18 @@ calls), all in `wasmEmit.vl`:
 `unionHasAtomTy` is the ladder-faithful wrapper: the arena decides where the row is covered,
 the member-NAME scan is the untouched fall-through.
 
+**`EQA` is in the batch because a read/write PAIR must not straddle two legs.**
+`unionEqAtomOf` is the concrete side's atom classifier — the read-side mirror of
+`emitUnionCoerce`'s `UCI` arm, running the identical `!has("i32") && has("i64")` test — and
+its answer is handed straight to `EQH`. Migrating the write side (`UCI`) and leaving the read
+side on the name path would mean that on any input where the two legs ever disagreed, a value
+would be BOXED under one tag and COMPARED under another: a silent wrong `==`. Nothing in the
+corpus or the fuzz corpus makes them disagree, so this is a latent asymmetry rather than a
+live bug — but introducing one deliberately is exactly the class of defect this program
+exists to remove, so both halves move together.
+
 **Which axis each site is on, decided before the swap.**
-- **D2 (type vs REP) — all 15, and the answer is "keep it a TYPE test".** The tempting reuse
+- **D2 (type vs REP) — all 16, and the answer is "keep it a TYPE test".** The tempting reuse
   is `unMemAtomKind` (already in the tree, batch 3). It is **wrong here**: it folds `i32[]`,
   `boolean[]` and a litunion `K[]` onto one kind (they share the `lTypeIdx` i32-list
   backing), and these callers turn the atom into `scalarTagOf(atom)`. A fold would hand back
@@ -401,7 +412,7 @@ the member-NAME scan is the untouched fall-through.
   the name path"; no caller ever sees it. The predicate carries **no** intern state (unlike
   `nameIsRefArray`): it reads the arena and nothing else.
 
-**Method + measurements.** Additive probe at all 15 sites at once (both answers computed, the
+**Method + measurements.** Additive probe at all 16 sites at once (both answers computed, the
 NAME answer KEPT, an **accumulating** tag set reported once at the end of `emitProgram`):
 **0 disagreements** over the 1,265-file corpus (`tests/cases` + `std/` + the compiler's own
 source) and **0** over **25,200** fuzz programs (seeds 1–14 × depths 4–6 × {plain,
@@ -414,18 +425,18 @@ self-compile wall clock 1,309 ms → 1,320 ms (min of 7 interleaved rounds).
 actually answered so "fired" means the MIGRATED leg ran — corpus / fuzz programs:
 `UCI` 137/1229 · `UCF` 58/1443 · `MVN` 23/436 · `ULAE` 17/385 · `UCL` 12/210 · `CUN` 12/0 ·
 `UCLF` 4/83 · `EQS` 4/0 · `LII` 3/0 · `LIH` 3/0 · `ULA0` 2/0 · `MUN` 2/0 · `KUN` 2/0 ·
-`EQH` 2/0 · `SFN` 1/0. **No site had zero coverage**, so none was left unmigrated for want of
-evidence — the fuzzer reaches only the six `emitUnionCoerce`/map shapes, and the corpus
-carries the other nine.
+`EQH` 2/0 · `EQA` 2/0 · `SFN` 1/0. **No site had zero coverage**, so none was left unmigrated
+for want of evidence — the fuzzer reaches only the six `emitUnionCoerce`/map shapes, and the
+corpus carries the other ten.
 
 **Gate-channel sabotage, per site.** An arena leg whose verdict is INVERTED exactly where it
-answers (every other migrated site left correct) reddens the corpus A/B for **14 of the 15**:
+answers (every other migrated site left correct) reddens the corpus A/B for **15 of the 16**:
 `UCI` 133 byte + 116 run-status + 14 stdout · `UCF` 58 + 56 + 1 · `MVN` 11 byte + 12 build +
 15 run · `CUN` 12 build + 12 run · `ULAE` 8 + 2 build + 8 run + 2 stdout · `UCL` 3 + 3 build +
 3 run + 3 stdout · `UCLF` 1 + 3 build + 3 run + 1 stdout · `LII` 3 + 2 stdout + 1 run ·
-`LIH` 3 + 2 stdout + 1 run · `EQH` 2 + 2 stdout · `KUN`/`MUN` 2 build + 2 run each ·
-`ULA0` 1 + 1 run · `SFN` 1 build + 1 run. All 15 inverted at once: **153 BYTEDIFF + 33
-build-status**, **166 run-status + 14 stdout**.
+`LIH` 3 + 2 stdout + 1 run · `EQH` 2 + 2 stdout · `EQA` 2 + 2 stdout · `KUN`/`MUN` 2 build +
+2 run each · `ULA0` 1 + 1 run · `SFN` 1 build + 1 run. All 15 `wasmEmit` sites inverted at
+once: **153 BYTEDIFF + 33 build-status**, **166 run-status + 14 stdout**.
 **`EQS` produces ZERO corpus diffs when deliberately broken** — its condition is
 `… && … && !aUsed`, and on the whole corpus `aUsed` is already true wherever it is reached,
 so the union tests cannot change the outcome. Stated plainly: **the probe (4 corpus firings,
@@ -442,12 +453,16 @@ master. Measured honestly: removing the new reset leaves the 1,949-case suite an
 **green**, so on today's surface `collectU` does run first and the reset is a *precaution* —
 but the sidecar's correctness should not rest on collect-pass ordering.
 
-**Still on the name path after batch 4 (13 raw `unionHasAtom` calls).** `emitUnionUnionEq`'s
+**Still on the name path after batch 4 (12 raw `unionHasAtom` calls).** `emitUnionUnionEq`'s
 cross-union arm scan (`unionHasAtom(rname, lAtoms[ai])` — atom EQUALITY between two rendered
 member sets, whose result is then fed BACK as `scalarTagOf(arms[k])`; its dual needs a
 type-equality join, not an atom test), the eleven narrowing/classification readers in
 `emit_classify` (`nulRefMapValInnerOf`, `mvUnionIsScalarNull`, `retNullableUnion`, … — the
 narrowing layer, not the box ABI), and `emit_collect`'s inferred-return null test.
+`exprIsUnionStrEq`'s two `"string"` tests stay too, deliberately: that is the string-scratch
+FRAME reservation, and it pairs with the cross-union arm scan above — both halves of *that*
+pair are on the name path, which is the same "do not straddle two legs" argument `EQA` is in
+the batch for, applied in the other direction.
 
 ### D-RET — the inferred-return value-union VERDICT (`valueUnionRetName`) — SHIPPED
 
@@ -860,7 +875,7 @@ condition names two things, so measure those:
 | struct/variant FIELD-ELEMENT slot resolved by re-resolving a NAME | 14 sites | **0** for the ref-list + nested-struct layers (`sFieldElemTyIx`/`uFieldElemTyIx` → `rlSlotOfTy`/`structIndexOfTy`); the map-value / union-box readers stay |
 | struct/variant field LITUNION (atom-rep) classified by re-parsing a NAME | 4 sites | **0** (`tyIsLitUnion` / `tyIsLitUnionArray` over the D5 sidecars) |
 | `structFieldCodesEq`'s referenced ROW resolved from a recorded NAME | yes | **no** (`repStructRowByTy`; the `ea != eb` identity fast path stays, deliberately) |
-| union-BOX tag / widening chosen by comparing a member set's rendered ATOMS | 15 sites | **0** (`unMemHasAtom` → `unionHasAtomTy`; the atom scan is the fall-through). 13 raw `unionHasAtom` calls remain, none of them the box ABI — see D-UNION batch 4 |
+| union-BOX tag / widening chosen by comparing a member set's rendered ATOMS | 16 sites | **0** (`unMemHasAtom` → `unionHasAtomTy`; the atom scan is the fall-through). 12 raw `unionHasAtom` calls remain, none of them the box ABI — see D-UNION batch 4 |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
 
@@ -879,7 +894,7 @@ The 12 remaining `table[i] == name` scans split three ways, and **most are not t
 and classify each atom **by its rendered text**. That per-atom re-derivation is the disease.
 Batches 1–3 took seventeen of the twenty-three sites (the "is there an arm of shape X" family,
 the `unionArmPath*` field-path walks, and the `mark*` registration + the map-shaped `*ArmSlot`
-resolvers) and **batch 4 took the box ABI itself** (the 15 `unionHasAtom` tag/widening
+resolvers) and **batch 4 took the box ABI itself** (the 16 `unionHasAtom` tag/widening
 decisions); what remains is the atom-EQUALITY / element-NAME residue named in D-UNION above,
 the two `nameIsRefArray`-gated slot resolvers refuted in batch 3, the one classifier measured
 DEAD (`unionHasCollapsedStringMapArm`), and the narrowing-layer `"null"` readers in
