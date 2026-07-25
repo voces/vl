@@ -199,7 +199,44 @@ fn seed_cache_path_impl() -> Option<std::path::PathBuf> {
         return None;
     };
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join(format!("seed-{}.cwasm", env!("VL_SEED_KEY"))))
+    let ours = dir.join(format!("seed-{}.cwasm", env!("VL_SEED_KEY")));
+    prune_seed_cache(&dir, &ours);
+    Some(ours)
+}
+
+/// Keep the seed cache bounded. Entries are content-keyed, so every `vl` carrying a
+/// new seed adds one (~9 MB) and nothing retires the old ones — an upgrade treadmill
+/// would grow the user's cache dir without limit.
+///
+/// Policy: keep the `KEEP` most-recently-written `seed-*.cwasm` plus our own, delete
+/// the rest. A COUNT rather than an age, because an entry in daily use is only ever
+/// READ — its mtime stays as old as the day it was written, so any age rule would
+/// evict exactly the entries that are working. `KEEP > 1` so a dev checkout and a
+/// released `vl` sharing a cache dir do not evict each other on alternate runs.
+/// Evicting a live entry is survivable regardless — the next run recompiles and
+/// republishes it — which is why every step here is best-effort and silent.
+#[cfg(feature = "embed-seed")]
+fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path) {
+    const KEEP: usize = 3;
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut seeds: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            n.starts_with("seed-") && n.ends_with(".cwasm")
+        })
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    if seeds.len() <= KEEP {
+        return;
+    }
+    seeds.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    for (_, path) in seeds.into_iter().skip(KEEP) {
+        if path != ours {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Resolve which compiler seed to load, first hit wins:

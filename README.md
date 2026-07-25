@@ -56,8 +56,9 @@ A **release binary** bakes the seed in, so it has no `build/vl-compiler.wasm` to
 `.cwasm` sidecar beside. It caches the seed's compiled form under `$VL_CACHE_DIR` →
 `$XDG_CACHE_HOME/vl` → `$HOME/.cache/vl` → `%LOCALAPPDATA%\vl` instead: the first run on
 a machine pays a few seconds to compile the seed, every run after starts in milliseconds.
-The cache is content-keyed and self-healing — delete it and the next run rebuilds it; if
-the directory is unwritable, `vl` still works, just without the speedup.
+The cache is content-keyed, self-healing and size-bounded (a few seeds' worth; older
+entries are retired as new ones land) — delete it and the next run rebuilds it, and if
+the directory is unwritable `vl` still works, just without the speedup.
 
 `$VL_GC` picks the garbage collector `vl run` gives your program — a pure runtime
 tuning dial, with no effect on what the program computes:
