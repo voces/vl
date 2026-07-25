@@ -598,8 +598,9 @@ callers), the 4 `removeAtomFrom` + 1 `unionHasAtom` sites in `wasmEmit.vl` and t
 `emit_collect.vl` (both files concurrently edited — the migration is one call rename each,
 `removeAtomFromSet` / `unionSetHasNull` are exported and ready), the `splitUnionAtoms`
 sites whose argument is a bare type NAME rather than a member set, and the narrowing TABLE
-itself, which still stores rendered set strings — the last of these is the one that turns
-this from a representation win into a time win.
+itself, which still stores rendered set strings. (The narrowing table is done in D-NARROW
+below — and it did NOT turn this into a time win: the parses it removes are ~3% of a
+self-compile, so a 12-23% cut of them is around 0.5%, under the measurement floor.)
 
 ### D-RET — the inferred-return value-union VERDICT (`valueUnionRetName`) — SHIPPED
 
@@ -1506,6 +1507,19 @@ then walk back to the enclosing function and dedupe.
     fuzz leg. Run the sabotage through the whole harness before trusting a 0 — and prefer
     comparing whole output TREES (`diff -r`) to per-file names you construct.
 
+14. **A byte-identical migration makes the obvious profile A/B profile the SAME BINARY**
+    (D-NARROW) — the recipe `vl build compiler/entry.vl --compiler <seed> --names` builds the
+    profiled artifact from the CURRENT source, so with A and B differing only in a
+    byte-identical way, `named-before.wasm` and `named-after.wasm` came out `cmp`-identical
+    and the two profiles described one compiler. The profiled artifact must be built from
+    each side's OWN source; the fixed thing is the INPUT.
+15. **Count the work, do not time it** (D-NARROW) — a ~0.5% change is invisible to both a
+    1,400-sample profile and a wall clock on a shared box. Two instrumented compilers
+    (each side + call counters) compiling ONE fixed input answer "how much work was
+    removed" exactly and with no load sensitivity. Time the change only after checking
+    what share of the profile the surface actually holds: this slice cut 12-23% of a 3%
+    surface, and no honest wall-clock method was going to show it.
+
 13. **A migrated rung with two halves needs both measured** (D-ANNSLOT) — the struct-twin
     rung resolves a QUERY row and a CANDIDATE row and compares them. Three structural
     versions of it were byte-identical over 51,670 programs and answered 0 of the 6 cases
@@ -2099,160 +2113,212 @@ diffs, so the A/B has power at these sites. `refresh-compiler.sh` / `rep-fuzz-ch
 `native-fixpoint.sh` / `lint-self.sh` / `SELFHOST_NATIVE_ALIGN=1 deno task test` (1,954
 passed) / `fuzz-sweep.sh` all RC=0.
 
-## D-UNION-ATOM — the union member-SET algebra in the emitter's two big files (#1108)
+## D-NARROW — the NARROWING TABLE stops storing a parsable type (#1108)
 
-D-UNION-SET (#1104) built the representation — `unMemAtoms` / `unMemAtomIds` / `unMemKinds`
-recorded once per row by `recordUnMemTys`, sets as `(row, mask)` — and migrated 33 consumers
-in `emit_classify`. It left an explicit hand-off: *"the 4 `removeAtomFrom` + 1 `unionHasAtom`
-sites in `wasmEmit.vl` and the 1 in `emit_collect.vl` — one call rename each; the exports are
-ready."* This slice takes `wasmEmit.vl` + `emit_collect.vl`, and the hand-off turned out to be
-**five** renames and one **wrong** rename.
+`narrowVariants[i]` — the type a binding is narrowed to, as a rendered string — was the
+last big string-keyed structure in the emitter, and #1104's own report named it: *"the
+narrowing table itself still stores rendered strings — that last one is what converts
+this into a time win."* Every read of a narrowed binding re-classified that string
+(`valueAtomKind` → `nameIsFuncTypeAtom` → `annArrowAt`, `nameIsRefArray`, `nameIsMap`),
+and every complement narrowing rendered a member set only for the next complement to
+parse it back.
 
 ### The enumeration (local-aware, by resolver called)
 
-`scan_sites.py`-style scan of both files for every call to the member-set algebra
-(`splitUnionAtoms` / `unionHasAtom` / `removeAtomFrom` / `unionMemberCount` /
-`nonNullMemberCountOf`) and to the atom algebra (`valueAtomKind` / `scalarTagOf` /
-`vbHeapIdxOfAtom`), each with its enclosing function and — for a bare-identifier argument —
-the `let`/`const`/param that bound it (method note 9). **20 member-SET algebra calls** (11
-`splitUnionAtoms`, 4 `removeAtomFrom`, 3 `unionMemberCount`, 2 `unionHasAtom`) and **30 atom
-algebra calls**, of which 12 are the CONSTANT `scalarTagOf("null")` (a keyword, not a parse)
-and 21 `unionHasAtomTy` calls that D-UNION already migrated.
+A scan of all 16 compiler modules for every mention of the table and its accessors
+(`narrowNames` / `narrowVariants` / `narrowTop` / `narrowVariantFor` / `pushNarrow` /
+`currentNarrowSetOf` / `currentStructNarrowSetOf`), resolving each bare-identifier result
+to its binding and every later use of that local inside the same function (method note 9):
+**99 match lines**, of which 57 are local-uses.
 
-The enumeration corrected the hand-off in one place. `wasmEmit`'s single `unionHasAtom` is
-**not** a `unionSetHasNull` site (its atom is not `null`) and **must not** become
-`unionHasAtomTy`: `unMemHasAtom` is deliberately EXACT over keyword primitives, so it answers
-**0 — not "uncovered"** — for a closure arm `(() => i64)` or a litunion alias `K0`, both of
-which `unionHasAtom` reports as members. Renaming it would have silently dropped shared arms
-from a union `==`. It is migrated instead as a **recorded-member scan** (`msMemberAtomsOf` on
-the right operand, then the same verbatim spelling compare `unionHasAtom` performs).
-
-### 13 sites migrated
-
-| tag | site | what moves | corpus reach | fuzz reach | sabotage (vs migrated, corpus) |
-|---|---|---|---|---|---|
-| WSUB1 | `emitMapGetOrUnionBox` | `removeAtomFrom` → `removeAtomFromSet` | 3 | 87 | 3 build-fail |
-| WSUB2 | `emitCoalesce` (ident LHS) | ″ | 12 | 0 | 12 build-fail |
-| WSUB3 | `emitCoalesce` (call LHS) | ″ | 2 | 0 | 2 build-fail |
-| WSUB4 | `emitCoalesce` (field LHS) | ″ | 2 | 0 | 2 build-fail |
-| WHAS | `emitUnionUnionEq` | `unionHasAtom` → recorded-member scan | 4 | 0 | 4 byte-diff + 2 run-status |
-| WIT1 | `emitUnionUnionEq` | `splitUnionAtoms` → `msMemberAtomsOf` | 4 | 0 | 4 byte-diff |
-| WIT2 | `emitMem` (shared-field dispatch) | ″ | 4 | 0 | 3 byte-diff |
-| WIT3 | `emitMapGetOrUnionBox` | ″ | 5 | 113 | 4 build-fail + 1 byte-diff |
-| CHAS | `computeVoidFns` | `unionHasAtom(.,"null")` → `unionSetHasNull` | 13 | 0 | 13 byte-diff + 2 run-status |
-| CIT1 | `collectCloSigs` | the ROW's own recorded member column | 170 | 3,338 | **0 corpus / 10 fuzz** |
-| CIT2 | `collectFnValUse` | `msMemberAtomsOf` + the counting-dual gate | 220 | 6,422 | 3 build-fail |
-| CIT3 | `shapeHasCloField` | ″ | 43 | 904 | 1 build-fail |
-| RINL | `registerInlineUnion` | **the split DELETED** — reads the row it just recorded | 198 | 4,744 | 42 byte-diff |
-
-Three of these are not renames.
-
-- **CIT1** iterates the union ROW table, so it needs no text bridge at all: `msSetOfText`
-  exists for a consumer holding a set STRING, but here the row INDEX is the key. It reads
-  `unMemAtoms[unMemTyStart[ui] ..]` directly, which is also more total than the set pool —
-  the pool's 31-member mask limit does not apply to the raw column.
-- **CIT2 / CIT3** are a `unionMemberCount(x) > 1` gate followed by `splitUnionAtoms(x)`.
-  `unionMemberCount` is documented as "the counting dual of `splitUnionAtoms`", so the two
-  are one predicate over one list: the migrated form materialises the recorded members once
-  and gates on `atoms.length > 1`.
-- **RINL is a parser DELETED, not laddered.** `registerInlineUnion` split `name` and then, six
-  lines later, called `recordUnMemTys(name)` — which splits the same string again. The second
-  split is the one the program sanctions (the intern side, class (iii)); the first is
-  redundant. Moving the atom acquisition below the record and reading the column's TAIL
-  (`unMemAtoms.length - unMemTyCount[row]`) is total **by construction**: the recorder appends
-  exactly that row's members in the same call, so the tail slice is the atom list even across
-  the recorder's own self-heal reset. No fall-through, no decline branch, nothing to measure.
-
-### The #1057 hand-off, measured and REFUTED
-
-D-UNION-SET held a two-line `emit_collect` diff for a concurrently-edited file:
-`registerInferRetNominalUnion` should decide `splitUnionAtoms(nm).length >= 2` on the
-RECORDED count `inferRetMemCountAt` instead, reported as **0 disagreements over 389 reaching
-programs**. Landed and probed here, it **disagrees on 4 corpus files**.
-
-The mechanism: `retMemCountOf` walks the recorded arena type's union/nullable SPINE and counts
-its leaves. A litunion member is a `TyUnion` of literals in the arena but ONE atom in the
-render — every disagreement is the name `K0 | null`, recorded **3** or **4** against a split
-length of **2**. Both clear the `>= 2` gate, which is why the corpus stays byte-identical
-either way and why a coarser probe reads 0; the dual is unsound in the other direction, where
-a bare inferred `K0` return renders ONE atom and would record `>= 2`, registering a union this
-compiler does not register.
-
-**Verdict: the arena artifact answers a different question** (method note 3, and note 1 on
-what an unverified 0 is worth). The faithful dual is a count banked by the NAME PRODUCER —
-how many atoms `valueUnionRetName` / `structUnionRetName` actually joined — not a walk of the
-type it rendered. That is a `typecheck.vl` change and is left as a hand-off with this
-mechanism recorded. The site keeps its split.
-
-### The two sabotages that had to be sharpened
-
-- **WIT3**'s only consumer is `atoms.length == 2`. Reversing the member list — the
-  perturbation that leaves the class everywhere else, since the recorded order IS the box-tag
-  ABI order — is an in-class relabeling here: **0 diffs**. Truncating (a cardinality change)
-  reddens 4 build-failures + 1 byte-diff. Method note 8, in its cheapest form: check what the
-  consumer actually reads.
-- **CIT1** is the note-5 case. Reversing produced 0 corpus diffs; DROPPING a member produced
-  0 corpus diffs; **emptying** the list produced 0 corpus diffs — and the *same* drop-a-member
-  sabotage produces **10 tree diffs over 50,400 fuzz programs**. `collectCloSigs`' closure-arm
-  union pass exists for a shape (`(() => i64) | i32` with no concrete lambda) that
-  `tests/cases` does not carry and the fuzzer does. A green corpus is not a green gate.
-
-### Parsers deleted: 1 — and the call arithmetic
-
-Member-set algebra CALL sites in the two files, master → now: `removeAtomFrom` **4 → 0**,
-`unionHasAtom` **2 → 1**, `splitUnionAtoms` **11 → 10**, `unionMemberCount` **3 → 3** — net
-**20 → 14**. One of the six is a genuine **deletion** (RINL); five are relocations into
-`removeAtomFromSet` / `unionSetHasNull`'s fall-through, i.e. the usual ladder. Of the 14 that
-remain, **9 now sit behind an arena leg that answers first** and 5 are parser-domain (the two
-registration entry splits, `registerCollapsedUnionName`, the refuted `registerInferRetNominalUnion`,
-and `nulCloMixedUnionUnregistered`, which declines by construction).
-
-### The name PRODUCERS, per-producer verdict
-
-#1105 counted 14 producer calls in 6 functions across the consumer classes; four of those
-calls live in this slice's two files. The #1100 TERMINAL verdict on `refListElemNameOfExpr`
-was withdrawn on the grounds that its arena route used the WRONG renderer — `tyToNominalName`
-(typecheck.vl:5764) is nominal-first (`structNameOfTy` / `unionAliasDeclNameOfTy` before any
-structural render) and yields `S` where the structural render yields `{v: i32}`. That is
-confirmed by reading; the verdict below is per SITE.
-
-| producer call | consumers want | verdict |
+| class | sites | what |
 |---|---|---|
-| `emit_collect` `rlInternName(refListElemNameOfExpr(i, -1), 1)` | an INTERNED reflist row | **legitimate** — this is the intern side (class (iii)), the one place the program has always said a name belongs. The producer itself (in `emit_classify`) is a separate slice. |
-| `wasmEmit` `emitRefArrayUnionUnboxRead`: `rlSlotByName(refArrElemName(atom))` | a reflist SLOT, never a name | **migrate — blocked on an export.** The atom is a MEMBER of the union `name` already in hand, so the arena route is member type → `TyArray.aElem` → `rlSlotOfTy`. It needs an `emit_classify` helper that resolves a member atom to its recorded index (`unMemAtomIds` compare); `unionRefArrayArmSlotForElemAtom` is close but keys on a different question. HAND-OFF. |
-| `wasmEmit` `emitMapUnionUnboxRead`: `mvSlotOfMapValNameOrMono(mapValNameOf(atom))` | an mv SLOT | **migrate — same blocker**, member type → `TyMap` value → `mvSlotOfTy`. HAND-OFF. |
-| `emit_collect` `rlMapElemValSlot`: `mapValNameOf(en)` | an mv SLOT | **already migrated** — arena-first chokepoint (`rlElemMapValMvSlotAt`), `CRLMV` in the D-TOTALITY map, never consequential (26/0 corpus, 408/0 fuzz). |
+| WRITERS | **19** `pushNarrow` calls, all in `emit_classify` | 3 `is`-tests (ident / member path / `?.` path), 4 `null` pins, **12** complement pushes whose value is a `removeAtomFromSet` rendering |
+| the table itself | 6 | declaration (`emit_state`), reset (`emit_sections`), the push + the innermost-slot scan |
+| READERS that only ask "is it narrowed" / nominal identity | 8 | `memIsNarrowed` ×2, `memNarrowVariantIndex` ×2 (`variantIndexOf` — nominal), `memberIsClosure`, `emitNarrowedMem` ×2, `exprUnion`'s member arm |
+| READERS that PARSE the stored string | **7** | `narrowedValueAtomOf`, `narrowedRefArrayOf`, `narrowedMapOf` (+ `narrowedClosureOf` through the first), `exprNulStrArray`'s `nameIsNulStrList`, `unionNameOfExpr`'s `valueAtomKind`, and `emitNarrowedMem`'s `valueAtomKind` (wasmEmit) |
+| READERS that do SET ALGEBRA on it | **14** | the 12 complement writers' own `currentNarrowSetOf` / `currentStructNarrowSetOf` reads, plus `emitMem`'s `splitUnionAtoms(currentStructNarrowSetOf(…))` and `emitCoalesce`'s `removeAtomFrom(currentNarrowSetOf(…))` (both wasmEmit — hand-offs, below) |
 
-The general shape: every one of these producers is a *slot* question wearing a name. What
-blocks them is not the renderer — it is that the union-ATOM consumers receive a rendered atom
-STRING with no index, and the member→index resolution lives in `emit_classify`. That is the
-next slice, and it is one export, not four migrations.
+### The representation
 
-### Not migrated, and why
+Two `i32` columns beside `narrowVariants`, both -1 where they do not apply, so every
+consumer keeps its rendered path as the fall-through:
 
-The `valueAtomKind` / `scalarTagOf` / `vbHeapIdxOfAtom` family (30 calls) stays. `unMemKinds`
-is a 5-way classifier (null / nominal / scalar / composite / unresolved) and cannot produce a
-`valueAtomKind` code, which is a 13-way ABI tag distinguishing `i32`/`boolean`/`string`/
-`i64`/`f64`/`f32`/`null`/five list flavours/closure. The D-ANNSLOT technique applies exactly —
-`markValueUnionAtoms` already computes the kind per atom while minting the value boxes and
-could bank an `unMemValKind` column beside `unMemKinds` — but that column and its recorder
-live in `emit_state.vl` / `emit_rep.vl`. **HAND-OFF**, with the warning from #1095 attached:
-whatever banks that column must be exact, because the answer feeds `scalarTagOf` and a folding
-predicate hands back a tag no producer interned.
+- **`narrowSets`** — the interned member-SET id of a COMPLEMENT narrowing. A complement is
+  by construction a subset of the receiver's union row, which is exactly #1104's
+  `(row, mask)` ADT: `msSubNull` / `msSubAtom` already compute the surviving set, and the
+  push now BANKS that id instead of throwing it away and re-deriving it from the rendering
+  at the next subtraction (`currentNarrowSetIdOf` reads the banked id; its un-narrowed leg
+  is the same `msSetOfText` the string path used, so the deliberate ALIAS decline is
+  unchanged).
+- **`narrowTys`** — the arena TYPE of an `is`-test narrowing. This is the #1107 technique,
+  not a new classifier: `checkIsExprNode` ALREADY resolves the tested spelling
+  (`nameToTy(n.isVariant)`, to enforce the variant-membership rule) and now banks it on the
+  `is` NODE (`isVarTyIx` / `isVarTyIxOf`, sized and cleared with `nodeTyIx` at
+  `checkProgram`). The emitter's push carries it; an emitter-synthesized (monomorphized)
+  `is` node reads -1 and lands on the name path.
+
+`narrowSlotOf` is the one stack walk the queries share, and `narrowSlotTy` resolves a
+slot's type from either column — a complement that has subtracted down to ONE member
+(`i32 | null` minus `null`) binds that member's type via `msSoleMemberTy`.
+
+### What migrated (and the containment)
+
+| tag | site | arena leg | probe reach (corpus / fuzz programs) |
+|---|---|---|---|
+| V | `narrowedValueAtomOf` | `unMemAtomKind` (`valueAtomKind`'s arena dual) REJECTS a non-atom, non-litunion type | 200 / 1,520 |
+| R | `narrowedRefArrayOf` | `unMemAtomKind >= 0` or `!unMemIsRefElemArray` REJECTS | 188 / 1,604 |
+| M | `narrowedMapOf` | `!unMemIsMap` REJECTS | 181 / 1,252 |
+| C1 | `setNarrowFromCond` value-union `!= null` | banked set − `null` | 39 / 1,200 |
+| C2 | `setNarrowFromCond` struct-union `!= null` | banked set − `null` | 13 / 170 |
+| C3 | `setNarrowFromCondElse` value-union `is` | banked set − atom | 82 / 1,873 |
+| C4 | `setNarrowFromCondElse` member-PATH `is` | banked set − atom | 6 / 0 |
+| C5 | `setNarrowFromCondElse` struct-union `is` | banked set − atom | 213 / 2,544 |
+| C6 | `setNarrowFromCondElse` value-union `== null` | banked set − `null` | 1 / 0 |
+| C7 | `setNarrowFromCondElse` struct-union `== null` | banked set − `null` | 2 / 0 |
+| C8 | `pushPostGuardNarrow` assignment narrowing | declared set − `null` | 3 / 0 |
+
+The three READ legs are deliberately **reject-only**. The narrowed value's rendering is
+NOMINAL (`is N` where `type N = i32` renders `N`, and the answer these functions return IS
+that spelling), so an accepting arena leg would answer where the name path declines — the
+D5-final "wrong renderer" trap. Rejecting is sound in the other direction and is where the
+cost is: `valueAtomKind`'s reject path runs the whole ladder down to `annArrowAt`, and the
+dominant narrowed binding (a struct variant) is exactly a reject. Measured: the arena leg's
+ACCEPT direction agrees too (`VK` — arena kind == name kind — on 317 corpus files and 5,291
+fuzz programs, `RK` on 36/163), so the containment costs nothing today; it is insurance
+against the alias spelling nothing in the corpus produces. Worked backwards to its
+mechanism (per #1099's discipline), that spelling turns out to be a **loud reject** on
+today's surface — `type N = i32; function f(x: N | string) { if x is N { … } }` fails with
+`emitProgram: \`is\` names a type that is not a union variant`, on master and on this tree
+alike. So the accepting arena leg would very likely have been safe; the reject-only shape
+is kept because "very likely" is not the standard this program uses, and it costs nothing.
+
+### Probe
+
+Additive, all 11 sites at once, both answers computed, the OLD one kept, one accumulating
+tag reported once at the end of `emitProgram`: **0 disagreements** over **1,272** corpus
+files and **50,400** fuzz programs. Coverage came from a SEPARATELY BUILT inverted compiler
+(method note 7) — the table above is its output; every site is reached, and the banked-type
+rate at the read sites is **317 covered / 60 uncovered** corpus files (`VC`/`VU`).
+
+### The measurement: parses removed, deterministically — and the time that did NOT move
+
+This slice was expected to be where #1104's representation became a time win. It is not,
+and the reason is worth recording precisely.
+
+**What moved (deterministic).** Two instrumented compilers — master + counters and
+migrated + counters — compiling the **same fixed input** (a snapshot of master's
+`compiler/`), each reporting its call counts once at the end of `emitProgram`. No sampling,
+no load sensitivity:
+
+| parser | master (49c8c78) | migrated | Δ |
+|---|---|---|---|
+| `annArrowAt` | 183,173 | 160,885 | **−12.2%** |
+| `valueAtomKind` | 72,981 | 56,363 | **−22.8%** |
+| `nameIsFuncTypeAtom` | 70,936 | 54,318 | **−23.4%** |
+| `nameIsRefArray` | 29,353 | 23,781 | **−19.0%** |
+| `nameIsMap` | 114,347 | 108,885 | **−4.8%** |
+| `removeAtomFrom` | 2,090 | 2,090 | 0 |
+| `splitUnionAtoms` | 33,423 | 33,423 | 0 |
+| `unionHasAtom` | 322 | 322 | 0 |
+
+One in five re-classifications of a narrowed binding is gone. The WRITE side does not move:
+#1104 had already routed `removeAtomFromSet` through the set ADT, so banking the id removes
+a render→re-parse round trip *inside* it, not a call to the string surgery.
+
+**What did not move (wall clock).** Interleaved A/B, `vl build compiler/entry.vl` with the
+`.cwasm` AOT sidecar WARM (one untimed run per side first; the sidecar is worth ~10× on the
+absolute), on an otherwise quiet box (load average 4–12):
+
+| block | master seed | migrated seed |
+|---|---|---|
+| min of 25 (at 9068bdb) | **1,240 ms** | **1,237 ms** |
+| min of 12 (at 9068bdb) | **1,247 ms** | **1,234 ms** |
+| min of 14 (rebased, at 49c8c78) | **1,244 ms** | **1,249 ms** |
+
+That is parity — a ±13 ms difference against a 20–30 ms run-to-run spread, and the sign is
+not stable across blocks. Earlier blocks
+taken while a concurrent agent loaded the box to average 130–220 read 1,418 / 1,329 ms and
+should be ignored; a loaded box's min is not a clean estimator here.
+
+**Why, arithmetically.** The parsers this slice thins are ~3% of a self-compile, not 26%:
+`annArrowAt` 1.49% self, `nameIsRefArray` 1.66% inclusive, `valueAtomKind` 1.19% inclusive,
+`removeAtomFrom` **0.65% inclusive / 0.01% self** (the ~2.2% figure predates #1104's set
+ADT). Cutting 12–23% of a 3% surface is ≈0.5% of compile time — below what this harness can
+resolve. The 26% `__str_eq__` bill is identifier/symbol resolution, `modSrcPush` and
+`fnStmtsPosOf`, none of which the narrowing table touches.
+
+**Profile, before/after** — the profiled compiler is each side's OWN `--names` build, both
+compiling the same fixed input, 10 runs aggregated per side (13,785 / 16,108 samples).
+Reported for completeness; at these sample counts the error bars (±0.1–0.2% on a 1% entry)
+exceed the effect:
+
+| function (self / incl) | master | migrated |
+|---|---|---|
+| `__str_eq__` self | 26.70% | 25.54% |
+| `__str_concat__` self | 0.86% | 1.15% |
+| `annArrowAt` self | 1.49% | 1.51% |
+| `nameIsFuncTypeAtom` self | 0.91% | 0.83% |
+| `removeAtomFrom` incl | 0.65% | 0.65% |
+| `splitUnionAtoms` self | 0.31% | 0.31% |
+| `narrowedValueAtomOf` incl | 0.84% | 0.66% |
+| `narrowedMapOf` incl | 0.20% | 0.14% |
+| `narrowedRefArrayOf` incl | 1.81% | 1.84% |
+| `valueAtomKind` incl | 1.19% | 1.05% |
+
+A methodological trap worth recording: the obvious profiling recipe — build `named.wasm`
+from the CURRENT source with each seed, then profile each — produces **byte-identical**
+binaries on a byte-identical migration, so "before" and "after" profile the *same compiler*.
+The profiled artifact must be built from each side's OWN source; the fixed thing is the
+INPUT.
 
 ### Gate
 
-Corpus **byte-, run- AND message-identical** (1,270 files; the message channel normalises only
-the `-o` path) · 66-case battery **0 diffs** · shared-instance `vl run --batch` **751 programs
-in ONE instance** per side, rc 0, **0** traps, 807 outputs and the transcript identical · fuzz
-A/B **50,400 programs/side** (seeds 1-14 × depths 4,5,6 × {plain, `--declared`} × 300),
-compared as whole `--out-dir` TREES, **0** diffs · additive probe **0 disagreements** over
-1,270 corpus files and over 50,400 fuzz programs, with all 13 sites confirmed REACHED by a
-separately built INVERTED (coverage) compiler (method note 7 — never the same build).
+Corpus **byte-identical AND message-identical** (1,272 files: `tests/cases` + `std` +
+`compiler` + `scripts`; both `vl build` bytes and the compiler's full stdout/stderr) and
+**run-identical** (1,010 `@run` files) · fuzz A/B **50,400 programs/side** (seeds 1-14 ×
+depths 4,5,6 × {plain, `--declared`} × 300), whole `vl run --batch` output TREES compared
+(`diff -r`, `.out` + `.err` + per-config transcript): **0** diffs · 66-case battery **0**
+diffs · shared-instance `vl run --batch` **1,009 programs in ONE instance** per side, rc 0,
+**0** traps, 986 outputs, tree and transcript identical.
 
-**Comparator sanity** (method note 12): the all-sites sabotage was pushed through the entire
-harness at full volume before any 0 was believed — **56 byte-diffs + 22 build-status + 25
-run-status** on the corpus and **223 tree diffs over 50,400 fuzz programs**.
+**Gate-channel sabotage, per site** (each arena leg pushed OUT of its equivalence class —
+the reject legs made to reject every banked slot, the complement made to bank the
+UN-subtracted set), A/B'd against the migrated compiler over the 1,272-file corpus:
 
-`refresh-compiler.sh` / `rep-fuzz-check.sh` / `native-fixpoint.sh` / `lint-self.sh` /
-`SELFHOST_NATIVE_ALIGN=1 deno task test` (1,960 passed) / `fuzz-sweep.sh` all RC=0.
+| sabotage | build-status | message | run-status |
+|---|---|---|---|
+| V (`narrowedValueAtomOf`) | 39 | 159 | 193 |
+| R (`narrowedRefArrayOf`) | 36 | 0 | 36 |
+| M (`narrowedMapOf`) | 28 | 0 | 28 |
+| C (the complement banking) | 23 | 58 | 80 |
+| ALL | 113 | 130 | 238 |
+
+**Comparator sanity** (method note 12): the ALL sabotage was pushed through the *fuzz*
+harness at the volume the real A/B used — **9,101** differing paths over the same 50,400
+programs that reported 0. The comparator has power at the volume it is quoted at.
+
+`refresh-compiler.sh` / `rep-fuzz-check.sh` (exact, 0 new / 0 stale) / `native-fixpoint.sh`
+(stage3 == stage4) / `lint-self.sh` / `SELFHOST_NATIVE_ALIGN=1 deno task test` (1,367 passed,
+0 failed) / `fuzz-sweep.sh` all RC=0.
+
+The whole net was re-run after rebasing onto D-UNION-ATOM (#1108), which lands in the same
+subsystem: corpus 1,272 files byte/message/run-identical, fuzz A/B 50,400 programs/side with
+0 tree diffs, battery 0 diffs, shared-instance 1,009 programs 0 traps 0 diffs, and every
+standing script RC=0 again. The parse counts above are measured against 49c8c78.
+
+### What did NOT move
+
+- **The two `wasmEmit.vl` readers of the table** — `emitMem`'s member-set dispatch and
+  `emitCoalesce`'s `??` complement — were migrated to the set ADT by D-UNION-ATOM (#1108)
+  while this slice was in flight, so they now resolve the narrowed set from its RENDERING
+  (`msMemberAtomsOf` / `removeAtomFromSet` both start at `msSetOfText`). Both are one line
+  from the banked id: export `currentNarrowSetIdOf` and they skip the text→set resolution
+  entirely. Left as the obvious next step rather than taken across a concurrently edited
+  file.
+- `exprNulStrArray`'s `nameIsNulStrList(narrowVariantFor(…))` and `unionNameOfExpr`'s
+  member-path `valueAtomKind`: both read a narrowed value keyed by a member PATH, where the
+  slot's banked type exists but the question ("a `(string | null)[]` list") has no
+  measured dual today. Left on the name path.
+- The `null` pins (`pushNarrow(nm, "null")`) bank nothing: `valueAtomKind("null")` is the
+  first string compare in the ladder, so there is nothing to save.

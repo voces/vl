@@ -1108,6 +1108,13 @@ let bodyChecked: {[string]: boolean} = Map()
 // emitter SYNTHESIZES after checking (monomorphized instance bodies) fall past the end and
 // read back -1 via `nodeTyIxOf`, so a consumer falls back to its syntactic path there.
 let nodeTyIx: i32[] = []
+// `is`-TEST TYPE sidecar: the arena type an `IsExpr`'s CHECK type resolves to, keyed by the
+// `IsExpr` node. `checkIsExprNode` already resolves it (`nameToTy(n.isVariant)`) to enforce
+// the variant-membership rule, so the emitter's narrowing stack banks THE ANSWER instead of
+// re-deriving the narrowed type by picking apart the tested SPELLING. Sized with `nodeTyIx`
+// and read through `isVarTyIxOf`, so an emitter-synthesized (monomorphized) `is` node falls
+// past the end, reads -1, and its consumer keeps the name path.
+let isVarTyIx: i32[] = []
 // CONTEXT-RESOLVED type sidecar (rep-twin-matcher phase 0a): parallel to `nodeTyIx`, this table
 // records — at the arena-pure coercion/ADOPTION sites — the DESTINATION (context) type a literal
 // node was widened INTO, which the emitter actually builds the rep for. `nodeTyIx` holds the
@@ -1766,6 +1773,7 @@ export function initChecker() {
   inferLetNulBoolIx = []
   bodyChecked = Map()
   nodeTyIx = []
+  isVarTyIx = []
   nodeRepTyIx = []
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
@@ -12258,11 +12266,13 @@ export function checkProgram(rootIx: i32) {
   if rootN0 is Program { gRootStmts = rootN0.progStmts }
   // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
   nodeTyIx = []
+  isVarTyIx = []
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
   let ntz = 0
   while ntz < P.nodes.length {
     nodeTyIx.push(-1)
+    isVarTyIx.push(-1)
     ntz = ntz + 1
   }
   checkNode(rootIx)
@@ -12496,6 +12506,15 @@ export function inferLetIxAt(i: i32) { inferLetIx[i] }
 export function nodeTyIxOf(ix: i32) {
   if ix >= 0 {
     if ix < nodeTyIx.length { return nodeTyIx[ix] }
+  }
+  -1
+}
+// The arena type the `is` test at node `ix` checks AGAINST — what the narrowing binds the
+// tested place to — or -1 for a node the checker never resolved (an emitter-synthesized
+// `is`, or a non-`IsExpr` node). Recorded by `checkIsExprNode`.
+export function isVarTyIxOf(ix: i32) {
+  if ix >= 0 {
+    if ix < isVarTyIx.length { return isVarTyIx[ix] }
   }
   -1
 }
@@ -15733,6 +15752,14 @@ function checkObjLitNode(n: ObjLit, _ix: i32) {
 function checkIsExprNode(n: IsExpr, ix: i32) {
   const objTy = checkNode(n.isObj)
   const chkTy = nameToTy(n.isVariant)
+  // BANK the resolved check type on the `is` node: the emitter's narrowing stack
+  // carries the narrowed type as an arena index from here, instead of re-classifying
+  // the tested spelling at every read of the narrowed binding.
+  if chkTy >= 0 {
+    if ix >= 0 {
+      if ix < isVarTyIx.length { isVarTyIx[ix] = chkTy }
+    }
+  }
   if chkTy < 0 {
     tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
   } else if n.isVariant != "null" {
