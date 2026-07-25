@@ -533,6 +533,7 @@ import {
   structListPopGetElem,
   tyAnnRefListKind,
   tyAnnRefListSlot,
+  uFieldElemTyIxAt,
   uFieldTgtStructIdx,
   unionArmVariantForObj,
   unionArmVariantForStructExpr,
@@ -558,6 +559,7 @@ import {
   vbHeapIdxOfAtom,
   vtKindOfParam,
 } from "./emit_classify"
+import { mvSlotOfTy } from "./emit_rep"
 import { monoArgTyName } from "./emit_mono"
 //
 // Output representation: a VL `i32[]` of byte values 0..255. WasmGC has no `u8`,
@@ -674,6 +676,34 @@ export function sFieldRefSlot(si: i32, fi: i32) {
   const a = rlSlotOfTy(sFieldElemTyIxAt(si, fi))
   if a >= 0 { return a }
   rlSlotByName(sFieldElemNameAt(si, fi))
+}
+
+// The mv-table SLOT of struct `si`'s MAP field `fi` (codes 19 / 29) — the chokepoint
+// the `mvSlotOfValNameFind(sFieldElemNameAt(si, fi))` readers share (destringify: the
+// field-element MAP-VALUE layer, `sFieldRefSlot`'s map sibling; D5 shipped the ref-list
+// and nested-struct layers and left this one on the name path). ARENA first: the
+// field's element type was RECORDED at intern time (`sFieldElemTyIx`), so the slot
+// resolves through `repMvValKey` — the mv layer's own key — instead of feeding the
+// recorded value NAME back through `resolveAnnot` at QUERY time, which re-parses a
+// rendering and mints arena types per lookup (the D1 intern-time / query-time hazard,
+// and the `annShapeIndexOf` query-time-minting shape).
+// SENTINEL DISCIPLINE (D3'): the name resolver is tri-state and overloaded (`-1` = the
+// MONO map riding the shared struct, a loud `emitFail` on an uninterned value, `>= 0` =
+// a slot), so the arena leg answers ONLY a real slot; every negative — an uncovered
+// row, a value type no row claims — falls through to the name resolver unchanged, and
+// the mono verdict and the loud failure stay exactly where they were.
+export function sFieldMapValSlot(si: i32, fi: i32): i32 {
+  const a = mvSlotOfTy(sFieldElemTyIxAt(si, fi))
+  if a >= 0 { return a }
+  mvSlotOfValNameFind(sFieldElemNameAt(si, fi))
+}
+
+// The `sFieldMapValSlot` twin for a VARIANT's map field, off the `uFieldElemTyIx`
+// sidecar (the `uFieldTgtStructIdx` / `variantFieldRefSlot` shape).
+export function uFieldMapValSlot(vi: i32, fj: i32): i32 {
+  const a = mvSlotOfTy(uFieldElemTyIxAt(vi, fj))
+  if a >= 0 { return a }
+  mvSlotOfValNameFind(variantFieldElemName(vi, fj))
 }
 
 // Push the STORAGETYPE bytes (NOT the trailing mutability flag) for a struct / variant
@@ -859,7 +889,7 @@ function emitOmittedFieldNull(_body: i32[], si: i32, fi: i32, scode: i32) {
   }
   if scode == 29 {
     // A NULLABLE map field omitted -> `ref.null $mapStruct` (the value type's map struct).
-    fbRefNull(mapTypeIdxOf(mvSlotOfValNameFind(sFieldElemNameAt(si, fi))))
+    fbRefNull(mapTypeIdxOf(sFieldMapValSlot(si, fi)))
     return 0
   }
   if scode == 16 {
@@ -1041,7 +1071,7 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         // A NULLABLE map field value is a map ref (subtypes the nullable slot), a `Map()`
         // constructor (build THIS field's value-typed map struct — the `pendingMapSlot`
         // seed, as code 19), or a bare `null` -> `ref.null $mapStruct` (`pendingNulRefHeap`).
-        const mslot29 = mvSlotOfValNameFind(sFieldElemNameAt(si, fi))
+        const mslot29 = sFieldMapValSlot(si, fi)
         pendingMapSlot = mslot29
         pendingNulRefHeap = mapTypeIdxOf(mslot29)
       }
@@ -1052,9 +1082,7 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
       if scode == 15 { pendingStructIdx = sFieldTgtStructIdx(si, fi) }
       // A MAP-typed field (code 19) seeds `pendingMapSlot` so a `Map()` field
       // value constructs THIS field's value-typed map struct (not the mono map).
-      if scode == 19 {
-        pendingMapSlot = mvSlotOfValNameFind(sFieldElemNameAt(si, fi))
-      }
+      if scode == 19 { pendingMapSlot = sFieldMapValSlot(si, fi) }
       // A VALUE-UNION field (code 16) coerces a raw scalar/string/null value into
       // the box (`{ y: 5 }` against `{ y: string | i32 }` boxes the 5 with its
       // atom tag); a union-valued field expression passes through unchanged.
@@ -1458,9 +1486,7 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
     // `Map()` field value constructs THIS field's value-typed map struct.
     const savedVPSI = pendingStructIdx
     if vcode == 15 { pendingStructIdx = uFieldTgtStructIdx(vi, fj) }
-    if vcode == 19 {
-      pendingMapSlot = mvSlotOfValNameFind(variantFieldElemName(vi, fj))
-    }
+    if vcode == 19 { pendingMapSlot = uFieldMapValSlot(vi, fj) }
     // A SCALAR f64/i64/f32 variant field widens its value at the construction boundary,
     // exactly as the plain struct-literal path does (`{f: i64} | i32` built from
     // `{f: 567}` must store an i64 — without the widen the box's variant struct got an
