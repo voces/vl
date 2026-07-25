@@ -464,6 +464,143 @@ FRAME reservation, and it pairs with the cross-union arm scan above — both hal
 pair are on the name path, which is the same "do not straddle two legs" argument `EQA` is in
 the batch for, applied in the other direction.
 
+### D-UNION-SET — the member SET stops being a string (the set ADT) — SHIPPED
+
+Batches 1–4 moved what the consumers ASK of each member onto the arena. They left the
+**set itself** a string: `unMemberSet[u]` is a pipe-joined member list, and every
+operation on it — membership (`unionHasAtom`, substring search), subtraction
+(`removeAtomFrom`, string surgery, ~2.2% of a self-compile), cardinality
+(`unionMemberCount`/`nonNullMemberCountOf`, a re-count), iteration (`splitUnionAtoms`,
+a re-split) — serialized to that string and parsed it back. A union does not need to be
+a string: `Cat|Dog` can be a data structure.
+
+**The representation: a member REFERENCE list, plus sets as (row, mask).**
+`recordUnMemTys` already split each row's set once at registration to record the arena
+member types; it now records, in the same pass and the same atom order, three more
+columns parallel to `unMemTys` — `unMemAtoms` (the member's VERBATIM spelling),
+`unMemAtomIds` (that spelling interned after `peelGroupParens` — the identity two member
+references are compared by) and `unMemKinds` (0 the `null` keyword · 1 NOMINAL, a
+declared name `cUserTypes` resolved · 2 a scalar `TyPrim` · 3 a composite · -1
+unresolved). **That is the only place a member set is ever split.**
+
+A SET is then a subset of one row: `(msSetRow[s], msSetMask[s])`, a bitmask over the
+row's members **in the row's recorded order**. So membership is a kind test or a bit
+test, subtraction is `mask - (1 << i)`, cardinality is a bit count, and iteration walks
+the row's members. Sets are interned per row (`msRowChain`/`msSetNext`), and each is
+RENDERED once (`msSetText`) by joining the surviving members' verbatim spellings — which
+is byte-identical to the string surgery's output, because those spellings ARE the
+substrings the joined set was built from. (Rendering the recorded arena types instead
+would not be: the arena's render of a declared `S` is the structural `{v: i32}` — the
+D5-final lesson about using the right renderer, in the one place where getting it wrong
+would silently re-key a narrowing table.)
+
+**The ABI is safe by construction, not by care.** The box-tag scheme depends on member
+ORDER; the mask is defined *over* the recorded order and no operation re-derives it, so
+no structural iteration can reorder anything. `msSetOfText` — the bridge for a consumer
+still holding a string — matches ONLY a row whose recorded member set IS that exact
+string, so the members it hands back are provably the atoms `splitUnionAtoms` would
+produce, in the same order. An ALIAS name (`N`, not `A|B`) is declined deliberately: the
+legacy operations treat it as a one-atom set and expanding it would change answers.
+
+**33 consumers migrated in `emit_classify`, in three families**, each ladder-faithful
+(the structural leg answers, the string path is the untouched fall-through):
+subtraction `removeAtomFromSet` (9 — the `is`/`!= null` complement narrowing, both the
+`setNarrowFromCond` and `setNarrowFromCondElse` halves, the assignment narrowing, the
+`??` atom classifier), `null`-membership `unionSetHasNull` (8), non-null cardinality
+`unionSetNonNullCount` (1), and ITERATION `msMemberAtomsOf` (15 — every
+`unionMemberSetOf`-derived `splitUnionAtoms`, including one hidden behind a **rebound
+local** (`let un = …; un = ums`) that an expression-shaped grep misses, method note 9).
+
+**Two sites measured 0-coverage and were NOT migrated** (method note 6):
+`mvUnionIsScalarNull`'s subtraction tail (the fall-through of the `mvValUnionScalarNullAt`
+arena chokepoint AND of a 2-member gate) and `pushPostGuardNarrow`'s RHS null test —
+0 firings on 1,269 corpus files and 0 on 25,200 fuzz programs. Both keep the string path.
+
+**Method + measurements.** Additive probe at all 35 candidate sites at once (both answers
+computed, the OLD one kept, an accumulating tag set reported once at the end of
+`emitProgram`): **0 disagreements** over the 1,269-file corpus and **0** over **25,200**
+fuzz programs. Coverage came from a SEPARATE inverted build (method note 7) — per site,
+corpus/fuzz programs where the structural leg answered: `R7` 213/2544 · `R5` 82/1873 ·
+`I2` 61/673 · `R3` 39/1200 · `I4` 31/112 · `I10` 30/542 · `I9` 26/701 · `H3` 25/886 ·
+`H1` 24/883 · `H4` 23/236 · `I8` 20/286 · `R2` 17/100 · `H5` 15/170 · `N1` 15/170 ·
+`H9` 14/0 · `R4` 13/170 · `H8` 10/0 · `I14` 10/36 · `H6` 8/0 · `I1` 7/86 · `R6` 6/20 ·
+`I6` 6/20 · `I5` 5/4 · `I15` 4/35 · `H2` 4/26 · `R10` 3/0 · `I12` 3/30 · `R9` 2/0 ·
+`I3` 2/0 · `R8` 1/0 · `I7` 1/0 · `I11` 1/0 · `I13` 1/6. Corpus **byte-identical AND
+run-identical**; 66-case battery 0 diffs; fuzz A/B identical (2,248 shape lines both
+sides); shared-instance `vl run --batch` 605 programs in ONE instance, 649 outputs,
+0 traps, 0 diffs. Self-compile wall clock 1,345 ms → 1,344 ms (min of 9 interleaved
+rounds) — this slice buys the REPRESENTATION, not yet the time: the memoized
+`removeAtomFrom` is still the fall-through and the text→set bridge costs the map probe
+its memo used to. The time comes when the narrowing table holds set IDS instead of
+strings, which is the next slice and is what the ADT exists to enable.
+
+**Gate-channel sabotage, per site** (the structural leg's ANSWER perturbed exactly where
+it answers, A/B'd against the migrated compiler over that site's own reaching set):
+all-sites inversion reddens the corpus **103 BYTEDIFF + 23 build-status + 88 run-status +
+19 stdout**. Per site (byte/build/run): `R3` 37/2/39 · `I9` 26/0/26 · `R5` 14/0/13 ·
+`H9` 13/1/3 · `H8` 10/0/1 · `R7` 10/17/27 · `I14` 5/2/6 (+1 stdout) · `R4` 0/9/9 ·
+`R6` 1/2/3 · `H5` 1/1/2 · `H6` 1/0/1 · `R8`/`R9`/`R10` 1/0/1 each · `H1` 0/1/1 ·
+`H3` 0/1/1. **Seventeen sites produce ZERO output diffs when deliberately broken** —
+`R2`, `H2`, `H4`, `N1` and every `I` site except `I9`/`I14`. That is not a gap in the
+migration, it is the batch-3 finding again (method note 4): those consumers are
+narrowing-blind PRE-PASS classifiers whose answers are conservative frame-scratch
+over-reservations — `unionMapArmName`'s reversed-and-truncated member list still produced
+byte-identical output on all 62 files that reach it, because something else already
+reserves what it would. For those sites the carrying evidence is the probe's
+answer-equality, and the probe is exhaustive there: the `I` family compares the WHOLE
+atom array element-wise against the very `splitUnionAtoms` it replaces.
+
+**Sidecar lifetime, measured rather than asserted.** The member columns and the set pool
+are emptied at the top of `emitProgram`, the pool is generation-stamped (a set id that
+outlives its program reads as uncovered), and `recordUnMemTys` self-heals if it observes
+`unMemTys` reset behind it (`collectU`). Honest finding: **none of the three is
+load-bearing on today's surface.** Removing the `emitProgram` reset, or the self-heal, or
+both, leaves the 605-program shared-instance batch byte- and output-identical — and a
+control marker shows why the leg cannot see it: with both mechanisms removed, a marker on
+"the columns are out of sync at a query" fires on **0** of the 249 batch programs that
+reach the query, while an unconditional control marker at the same spot fires on 249. So
+`vl run --batch` does not in fact retain these module-level columns across programs. The
+mechanisms stay because a sidecar's correctness should not rest on pass ordering (method
+note 7) — but the shared-instance leg is weaker evidence for that class than it looks.
+
+**The two "irreducible" name fallbacks, revisited.** Both exist because "the composite
+nominal string lives nowhere in the arena".
+
+- **`registerInferRetNominalUnion` (#1057) — the parse RETIRES, measured.** Its decision
+  is `splitUnionAtoms(nm).length >= 2` over a name the compiler had just BUILT
+  (`structUnionRetName` joins `nominalNameOfObj` over `t.uMembers`; the niche arms join a
+  fixed two). The member count is therefore a property of the arena type the name was
+  joined from, and `retMemCountOf` (the union/nullable spine's leaf count) now records it
+  alongside the name as `inferRetMemCount` / `inferRetMemCountAt` — **this slice lands
+  that producer** (foundation-style: byte-identical, no consumer). The consumer half was
+  built and measured too: with `registerInferRetNominalUnion` deciding on the recorded
+  count and the split kept only as the unrecorded-row fall-through, the corpus is
+  **byte- and run-identical over 1,269 files**, a probe comparing the two verdicts finds
+  **0 disagreements**, and an inverted build shows the decision is reached with a recorded
+  count on **389** corpus programs. It is a two-line diff in `emit_collect.vl`, held as a
+  hand-off because that file is being edited concurrently. What does NOT retire is the
+  registration itself: the row is keyed by the composite NAME, which is nominal identity
+  and legitimately a string.
+- **`registerCollapsedUnionName` (#1055) — NOT reachable from this structure, and here is
+  precisely why.** Its subject is a spelling that is *not a registered union row* — the
+  fallback is what registers it — so a pool built over registered rows declines it by
+  construction. The information it needs is how many members the SOURCE spelled *before*
+  `resolveAnnot`'s `sameVariantTy` deduped them away, which exists only inside the
+  checker's annotation resolution. The #1057 recipe transfers exactly (record the count
+  where the members are still in hand, do not re-split the name), but the recording site
+  is `resolveAnnot`'s union arm and the sidecar is per-ANNOTATION-NODE, not per-union-row:
+  a different piece of work, not this one wearing a hat.
+
+**Still string-shaped after this slice** (honest scope): `removeAtomFrom` /
+`unionHasAtom` / `nonNullMemberCountOf` / `splitUnionAtoms` themselves (`emit_base` /
+`typecheck` — the fall-through implementations, plus the `unionMemberCount` name-COUNT
+callers), the 4 `removeAtomFrom` + 1 `unionHasAtom` sites in `wasmEmit.vl` and the 1 in
+`emit_collect.vl` (both files concurrently edited — the migration is one call rename each,
+`removeAtomFromSet` / `unionSetHasNull` are exported and ready), the `splitUnionAtoms`
+sites whose argument is a bare type NAME rather than a member set, and the narrowing TABLE
+itself, which still stores rendered set strings — the last of these is the one that turns
+this from a representation win into a time win.
+
 ### D-RET — the inferred-return value-union VERDICT (`valueUnionRetName`) — SHIPPED
 
 `valueUnionRetName` built the emitter-format union name (`collectRetAtoms` renders every
@@ -1271,6 +1408,11 @@ DEAD (`unionHasCollapsedStringMapArm`), and the narrowing-layer `"null"` readers
 `variantIndexOf` is *nominal identity — lossless and correct*. Only the inline-shape /
 composite atoms are the disease. **ABI hazard:** the box-tag scheme depends on member
 ORDER (`unVarStart`/`unVarCount` slice `uVariants`), so any reordering is an ABI change.
+
+**Update — D-UNION-SET closed the SET half.** The member set is now a structure
+(`unMemAtoms`/`unMemAtomIds`/`unMemKinds` + the (row, mask) set pool), and membership /
+subtraction / cardinality / iteration are structural operations on it at 33 consumers;
+the remaining string-shaped pieces are enumerated at the end of that section.
 
 
 ### Counting caveat — read before quoting a scorecard number
