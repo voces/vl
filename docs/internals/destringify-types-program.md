@@ -831,7 +831,9 @@ and `mvValKindOfName` still classifies the value by its spelling. Those are the 
 `sFieldElemName` situation one layer over: each is a distinct question, and none is
 answered by the slot resolvers this slice moved. `mvCanonValName` also survives as the
 stored-name canonicaliser (the `rlElemStoredName` residual's twin) even though it is no
-longer the key.
+longer the key. (**Update — D5-final (b), below:** every one of those readers except the
+`emitUnionBoxArg` name ARGUMENT, the `nameIsRefArray` write guard and the name PRODUCERS
+now answers from `mvValTyIx`, with the name path as the fall-through.)
 
 ### D5-final (a) — the ref-list ELEMENT-NAME readers (`rlElemName`) — SHIPPED
 
@@ -949,6 +951,112 @@ a raw NAME) does not, and straddling a resolver's ladder is the pair hazard abov
 name consumer; that is the D2 `rlElemStoredName` residual and it retires with its
 consumers, not here.
 
+### D5-final (b) — the map-VALUE-NAME readers (`mvValName`) — SHIPPED
+
+D-MAPVAL destringified the map-value slot **key** (`repMvValKey`) and said so honestly:
+"the remaining `mvValName[slot]` reads are name CONSUMERS, not keys". D5-final (a) then
+moved the ref-list element readers but **deliberately skipped** the map-value family,
+citing a tri-state sentinel overload. This slice is that family — the readers that recover
+**structure** by string surgery on the stored map-value name. It does not delete the
+column: names as strings are fine, deriving structure from a rendering is not.
+
+**Every reader enumerated first.** 20 `mvValName[...]` reads across three files (the brief's
+starting list was incomplete by three — two name PRODUCERS and one `refArrElemName`
+producer, all found by the enumeration). They split seven ways:
+
+| family | the surgery | sites | verdict |
+|---|---|---|---|
+| **A** inner ref-list slot of a list-valued map | `rlSlotByName(refArrElemName(mvValName[s]))` | 3 | migrated |
+| **E** inner mv slot of a nested-map value | `mvSlotOfMapValNameOrMono(mapValNameOf(mvValName[s]))` | 1 | migrated |
+| **C** does a boxed union value admit null | `unionHasAtomTy(mvValName[s], "null")` | 1 | migrated |
+| **F** is the value a niche-nullable ref | `nulRefMapValInnerOf(mvValName[s]) != ""` | 1 | migrated |
+| **U** is the value exactly `scalar \| null` | `splitUnionAtoms` + `valueAtomKind(removeAtomFrom(…))` | 1 | migrated |
+| **G** the `mvTwin` layout comparator | `repNameCanonKey(mvValName[a\|b])` | 2 | migrated |
+| **not this slice** | the union-BOX ABI's name argument (`emitUnionBoxArg`, 2), `emitMapGetOrUnionBox`'s atom peel (1), the `nameIsRefArray` write guard (1), the 3 name PRODUCERS, and the `mvValName[i] == name` nominal fast path | 8 | see below |
+
+**Sidecar: none added.** `mvValTyIx[]` ∥ `mvValName` already exists (D-MAPVAL, #1094),
+recorded at the single intern push (`recordMvValTyIx` → `fieldElemTyIxOfName`, pad-on-push)
+and — **verified, not assumed** (method note 8) — already emptied at the **top of
+`emitProgram`**, ahead of `collectU`/`collectS`/`collectA`. Every arena leg re-derives from
+`T.tys[ix]` at QUERY time, never from a key frozen at intern time (the D1 hazard).
+
+**Four chokepoints + two in-place legs, all ladder-faithful (D1 leg C).**
+`mvValInnerRlSlot` (A), `mvValInnerMvSlot` (E), `mvValUnionHasNull` (C), `mvValCanonKey`
+(G); `mvSlotNullable` (F) and `mvUnionIsScalarNull` (U) already were the layer's
+chokepoints, so their arena leg went in front of the existing body. The name path is
+untouched in all six.
+
+**Which axis each family is on, decided before the swap.**
+- **D2 (type vs REP).** Family A's answer is a ref-list SLOT — a rep question — so it goes
+  through `rlSlotOfTy`/`repElemKey`, and family E's is an mv SLOT, so it goes through
+  `mvSlotOfTy`/`repMvValKey` (#1094's deliberately-not-`repElemKey`, deliberately-not-
+  `repCanonKey` key). C/F/U are exact TYPE tests. G is a canonical KEY and stays on
+  `repCanonKey`, the vocabulary the name path already computed through `resolveAnnot`.
+- **D3′ (structure vs INTERN STATE / SENTINELS) — the hazard that parked this family.**
+  `mvSlotOfMapValNameOrMono` is tri-state: `-1` = a MONO i32 map that rides the shared
+  struct, `-3` = uninterned/unsupported, `>= 0` = a slot. A degenerate arena miss landing
+  on `-1` would be read as "mono" — the collision that refuted `nameIsRefArray` in D-UNION
+  batch 3. **Sentinel audit, per site:** every arena leg's miss is consumed *only* by its
+  own chokepoint, which turns it into "use the name path", so no caller ever sees it. E's
+  leg answers **only** `>= 0`; `-1` (uncovered / not a `TyMap` / no row claims the inner
+  value) is indistinguishable from "mono" *inside* the chokepoint and therefore never
+  escapes it. C/F/U answer `-1` = "the arena declines" — never "no" — so an object shape the
+  struct table does not claim (F) or a member kind the arena cannot classify (U) keeps the
+  rendered-name test rather than answering falsely. A's `-1` is swallowed before any slot
+  comparison, exactly as in D5-final (a).
+
+**Read/write pairing.** A's three sites are the pair: `emitMapSetValExpr` (the store — it
+builds the value list under that slot) and `emitMapValDefault` / `letNulMapReadSlotArg`
+(the reads that fill and bind it) now resolve the inner slot through ONE chokepoint. The
+vals WRAPPER those elements land in (`mvValsWrapOf` → `rlWrapIdx[mvRlSlot[slot]]`) was
+already index-keyed, so the sizing side needed no move. F is inherently both halves — it
+seeds `nulRefHeap` on the store and skips the non-null recover on the read. G is a WRITE
+decision (which slots share one map-struct heap index); every downstream reader of that
+decision is already index-keyed (`mvTwin`/`mvMapTypeIdx`).
+
+**Method + measurements.** Additive probe at all 8 tags at once (compute both, KEEP the
+name answer, an **accumulating** tag set reported once at the end of `emitProgram`; coverage
+never on the failure channel, method note 7): **0 disagreements** over the 1,265-file corpus
+and over **25,200** fuzz programs (seeds 1–14 × depths 4–6 × {plain, `--declared`} × 300) —
+and the probe build is itself corpus **byte-identical and run-identical**, so it really was
+additive. Migrated: corpus **byte-identical** AND run-identical, 66-case battery 0 diffs,
+fuzz A/B identical (2,248 shape lines both sides). **Shared-instance gate** (the only channel
+that sees a sidecar-lifetime bug): 601 programs through **ONE** `vl run --batch` instance per
+side, 645 outputs each, **0 traps, 0 diffs**.
+
+**Sabotage-verified per site**, gated on the arena leg having actually answered so "fired"
+means the MIGRATED leg ran — corpus files: `F-NIC` 109 · `G-KEY` 26 · `C-NUL` 23 · `U-SN` 18 ·
+`A-SET` 15 · `A-DEF` 13 · `E-LET` 1 · `A-LET` 1 (113 files reached in all). No site had a
+coverage gap, so none was left unmigrated for want of evidence.
+
+**Gate-channel sabotage, per site.** An arena leg broken only where that site's migrated leg
+answers (slots off-by-one, predicates inverted), every other site left correct, reddens the
+corpus A/B for **all eight**: `F-NIC` 92 byte + 5 build / 5 run · `A-SET` 13 + 2 / 15 ·
+`A-DEF` 13 / 13 · `C-NUL` 11 + 12 / 15 + 1 stdout · `U-SN` 6 + 12 / 18 · `A-LET` 1 / 1 ·
+`E-LET` 1 / 1 · `G-KEY` 1 + 1 / 2. All at once: **77 BYTEDIFF + 23 build-status, 41
+run-status**.
+**One sabotage lesson worth recording:** G's first break — prefixing the arena key with a
+constant — produced **ZERO** diffs, because the site is an *equality comparator* and any
+INJECTIVE relabeling of a key leaves every comparison unchanged. Only a break that changes
+which slots COLLIDE (suffixing each key with its own spelling, so no two slots ever twin)
+reddens it. When sabotaging a key site, break the equivalence, not the text.
+
+**What still reads `mvValName` after this slice, and why.** The union-BOX ABI's name
+ARGUMENT (`emitUnionBoxArg(body, mvValName[mslot], …)`, 2 sites) — it hands a NAME to a
+name-consuming API whose own tag/widening decisions D-UNION batch 4 already moved to the
+arena; retiring the argument is the union layer's slice, not this one. `emitMapGetOrUnionBox`'s
+`scalar | null` peel — it re-parses the member to reach `vbHeapIdxOfAtom` / `scalarTagOf`,
+and those are keyed by the atom's TEXT, so a folding arena predicate could hand back a tag no
+producer interned (#1095's refutation); its *classification* half is exactly `U-SN`, which
+this slice did migrate. The `nameIsRefArray(mvValName[mslot])` write GUARD — `nameIsRefArray`
+folds ref-list INTERN STATE (`shapeElemDeclaredStructIdx`, `variantIndexOf`, the `unNames`
+scan) into a shape test, and D-UNION batch 3 measured an arena dual of exactly that predicate
+disagreeing on 2 of 50,400 fuzz programs; it needs its own rep-classifier slice, and the SLOT
+it guards is migrated either way. The 3 sites that **return** `mvValName[slot]` (or
+`refArrElemName` of it) to a name consumer — the `rlElemStoredName` residual one layer over.
+And the `mvValName[i] == name` scan, which is the layer's nominal fast path ahead of
+`repMvValKey` (legitimate, #1094).
+
 ### D5 — delete the name columns
 
 Once nothing reads a table's name column for anything but diagnostics, demote it to a
@@ -993,6 +1101,7 @@ condition names two things, so measure those:
 | `structFieldCodesEq`'s referenced ROW resolved from a recorded NAME | yes | **no** (`repStructRowByTy`; the `ea != eb` identity fast path stays, deliberately) |
 | union-BOX tag / widening chosen by comparing a member set's rendered ATOMS | 16 sites | **0** (`unMemHasAtom` → `unionHasAtomTy`; the atom scan is the fall-through). 12 raw `unionHasAtom` calls remain, none of them the box ABI — see D-UNION batch 4 |
 | ref-list ELEMENT structure re-derived by string surgery on the stored name (its inner slot / struct row / niche / `$fnsig`) | 22 sites | **16 migrated** (`rlElemTyIx` → `rlElemInnerSlot`/`rlElemStructRow`/`rlElemIsNulNiche`/`rlElemCloSigKey`); 3 `rlSlotsLayoutTwin` sites left on the name path, measured **unreachable** — see D5-final (a). The map-value / variant-index / name-producing readers are untouched |
+| map-VALUE structure re-derived by string surgery on the stored name (its inner ref-list slot / inner mv slot / null atom / niche / `scalar\|null` peel / twin key) | 9 sites | **9 migrated** (`mvValTyIx` → `mvValInnerRlSlot`/`mvValInnerMvSlot`/`mvValUnionHasNull`/`mvValNulRefNicheAt`/`mvValUnionScalarNullAt`/`mvValCanonKey`) — see D5-final (b). The union-box name ARGUMENT, the `nameIsRefArray` guard and the 3 name-producing readers stay |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
 
@@ -1003,7 +1112,8 @@ The 12 remaining `table[i] == name` scans split three ways, and **most are not t
   that every *producer* derives it structurally, which D3 did.
 - **Genuinely open** — `unMemberSet` (the union arc). The `mvValName` map-value scans
   are done (D-MAPVAL): all five key on `repMvValKey` now, with the name scan as the
-  fall-through. The remaining `mvValName[slot]` reads are name CONSUMERS, not keys.
+  fall-through, and the value-name READERS are done too (D5-final (b)) — what is left of
+  `mvValName[slot]` is a name handed to a name consumer.
 
 ### The open arc: union member sets
 

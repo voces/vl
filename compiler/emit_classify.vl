@@ -262,6 +262,7 @@ import {
   mvValKind,
   mvValName,
   mvValStructIdx,
+  mvValTyIx,
   mvValsOutBase,
   narrowNames,
   narrowTop,
@@ -327,11 +328,13 @@ import {
 import { emitFail } from "./emit_bytes"
 import {
   fieldElemTyIxOfName,
+  mvSlotOfTy,
   mvSlotOfValNameTy,
   recordMvValTyIx,
   recordSFieldElemTyIx,
   recordSTyIx,
   recordUnMemTys,
+  repCanonKey,
   repElemKey,
   repElemKeyOfName,
   repKindOfSigTok,
@@ -1095,12 +1098,8 @@ export function letNulMapReadSlotArg(letIx: i32, fnIx: i32) {
   if !(d is LetDecl) { return -1 }
   const mrs = mapReadMvSlot(d.letInit, fnIx)
   if mrs < 0 { return -1 }
-  if mvListValKind(mrs) == "reflist" {
-    return rlSlotByName(refArrElemName(mvValName[mrs]))
-  }
-  if rlElemKindTbl[mvRlSlot[mrs]] == 3 {
-    return mvSlotOfMapValNameOrMono(mapValNameOf(mvValName[mrs]))
-  }
+  if mvListValKind(mrs) == "reflist" { return mvValInnerRlSlot(mrs) }
+  if rlElemKindTbl[mvRlSlot[mrs]] == 3 { return mvValInnerMvSlot(mrs) }
   -1
 }
 
@@ -2483,6 +2482,8 @@ export function nulRefMapValInnerOf(valName: string): string {
 // `ref.null <elem>` for a bare `null` and the fused `?? d` read skips the non-null recover.
 export function mvSlotNullable(slot: i32) {
   if slot < 0 { return false }
+  const ar = mvValNulRefNicheAt(slot)
+  if ar >= 0 { return ar == 1 }
   nulRefMapValInnerOf(mvValName[slot]) != ""
 }
 
@@ -2493,6 +2494,8 @@ export function mvSlotNullable(slot: i32) {
 export function mvUnionIsScalarNull(slot: i32) {
   if slot < 0 { return false }
   if mvValKind[slot] != 2 { return false }
+  const ar = mvValUnionScalarNullAt(slot)
+  if ar >= 0 { return ar == 1 }
   const vn = mvValName[slot]
   if !unionHasAtom(vn, "null") { return false }
   const atoms: string[] = []
@@ -4129,6 +4132,218 @@ export function rlElemCloSigKey(slot: i32): string {
   if nm.length < 2 { return "" }
   if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
   annSigKey(nm.slice(1, nm.length - 1))
+}
+
+// The ARENA type a map-VALUE slot's stored value name denotes (destringify D5-final
+// (b)), or -1 when the sidecar does not cover the slot. `mvValTyIx` pads on push and
+// is emptied per PROGRAM (method note 7), so a lagging / stale row answers
+// "uncovered" and every consumer keeps its value-NAME path.
+export function mvValTyIxAt(slot: i32): i32 {
+  if slot < 0 { return -1 }
+  if slot >= mvValTyIx.length { return -1 }
+  mvValTyIx[slot]
+}
+
+// The INNER ref-list slot of a ref-LIST-valued map slot — the arena reading of
+// `rlSlotByName(refArrElemName(mvValName[slot]))`. A SLOT is a REP question (D2), so
+// it resolves through `rlSlotOfTy`/`repElemKey` — the key the ref-list layer is
+// interned on — never `repCanonKey`. -1 when the sidecar does not cover the slot, the
+// value is not an array, or no ref-list slot claims the element type.
+export function mvValInnerRlSlotAt(slot: i32): i32 {
+  rlSlotOfTy(tyRefArrElemOf(mvValTyIxAt(slot)))
+}
+
+// The mv slot of a nested MAP-valued slot's INNER value — the arena reading of
+// `mvSlotOfMapValNameOrMono(mapValNameOf(mvValName[slot]))`.
+// SENTINEL DISCIPLINE (D3'): the name resolver's misses are TRI-STATE and overloaded
+// (`-1` = a MONO i32 map riding the shared struct, `-3` = uninterned/unsupported), so
+// the arena leg answers ONLY a real slot (>= 0); every negative — uncovered, not a map
+// type, no row claims the inner value — falls through to the name path. No caller can
+// see the arena's miss value, so an arena miss can never be read as "mono".
+export function mvValInnerMvSlotAt(slot: i32): i32 {
+  const ty = mvValTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  // NOT peeled through a `| null`: `mapValNameOf` requires a bare `{[K]:V}` spelling
+  // too (it answers "" for a nullable map name), so both legs decline together.
+  if t is TyMap { return mvSlotOfTy(t.mVal) }
+  -1
+}
+
+// Tri-state dual of `unionHasAtomTy(mvValName[slot], "null")` over a BOXED-union map
+// value: `1` the value type admits null, `0` it does not, `-1` the sidecar does not
+// cover the slot / the type is not a union (the caller keeps its member-set test).
+export function mvValUnionHasNullAt(slot: i32): i32 {
+  const ty = mvValTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return 1 }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const mt = T.tys[t.uMembers[i]]
+      if mt is TyPrim {
+        if mt.primName == "null" { return 1 }
+      }
+      if mt is TyNullable { return 1 }
+      i = i + 1
+    }
+    return 0
+  }
+  -1
+}
+
+// The single NON-null member of a nullable value type (`TyNullable`'s inner, or the one
+// non-null member of an `X | null` union) — `nulRefMapValInnerOf`'s structural front
+// half. -1 when the type is not "exactly one non-null member, plus null".
+function tyNulSoloMember(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  if t is TyUnion {
+    let solo = -1
+    let nonNull = 0
+    let hasNull = false
+    let i = 0
+    while i < t.uMembers.length {
+      const mt = T.tys[t.uMembers[i]]
+      let isNull = false
+      if mt is TyPrim {
+        if mt.primName == "null" { isNull = true }
+      }
+      if isNull {
+        hasNull = true
+      } else {
+        nonNull = nonNull + 1
+        solo = t.uMembers[i]
+      }
+      i = i + 1
+    }
+    if !hasNull { return -1 }
+    if nonNull != 1 { return -1 }
+    return solo
+  }
+  -1
+}
+
+// Tri-state dual of `nulRefMapValInnerOf(mvValName[slot]) != ""` — is the slot's value a
+// NICHE-nullable ref (string / map / closure / struct, plus null)? `1` yes, `0` no,
+// `-1` the arena DECLINES (uncovered, or an object shape the struct table does not
+// claim — where the name path's `structIndexByValName` might still resolve). Declining
+// is the safe direction: the caller keeps its rendered-name test.
+export function mvValNulRefNicheAt(slot: i32): i32 {
+  const ty = mvValTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const t0 = T.tys[ty]
+  let nullable = false
+  if t0 is TyNullable { nullable = true }
+  if t0 is TyUnion { nullable = true }
+  if !nullable { return 0 }
+  const inner = tyNulSoloMember(ty)
+  if inner < 0 { return 0 }
+  const it = T.tys[inner]
+  if it is TyPrim {
+    if it.primName == "string" { return 1 }
+    return 0
+  }
+  if it is TyMap { return 1 }
+  if it is TyFunc { return 1 }
+  // A LIST member has no niche rep (the vals slot would need the list WRAPPER) — the
+  // name path excludes it BEFORE its struct probe, and so does this.
+  if it is TyArray { return 0 }
+  if it is TyObj {
+    if structIndexOfTy(inner) >= 0 { return 1 }
+    return -1
+  }
+  -1
+}
+
+// `valueAtomKind`'s arena dual over a union MEMBER type: the same code vocabulary
+// (0 i32 · 1 boolean · 2 string · 3 i64 · 4 f64 · 5 f32 · 6 null · 7 i32-backed list ·
+// 8 f64 list · 9 string-backed list · 10 i64 list · 11 closure · 12 f32 list). `-1` is
+// the arena DECLINING, never "not an atom" — every consumer falls through.
+export function tyValueAtomKindOf(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    if t.primName == "i32" { return 0 }
+    if t.primName == "boolean" { return 1 }
+    if t.primName == "string" { return 2 }
+    if t.primName == "i64" { return 3 }
+    if t.primName == "f64" { return 4 }
+    if t.primName == "f32" { return 5 }
+    if t.primName == "null" { return 6 }
+    return -1
+  }
+  if t is TyFunc { return 11 }
+  if t is TyArray {
+    if tyIsI32LeafElem(t.aElem) { return 7 }
+    if tyIsStrLeafElem(t.aElem) { return 9 }
+    const et = T.tys[t.aElem]
+    if et is TyPrim {
+      if et.primName == "f64" { return 8 }
+      if et.primName == "i64" { return 10 }
+      if et.primName == "f32" { return 12 }
+    }
+    return -1
+  }
+  -1
+}
+
+// Tri-state dual of `mvUnionIsScalarNull`'s value test: is the boxed union value
+// exactly `<scalar> | null` (so the fused `?? d` peels to the RAW unboxed scalar)?
+// `1` yes, `0` no, `-1` the arena declines (uncovered, or a member kind it does not
+// classify) — the caller keeps its atom-set path.
+export function mvValUnionScalarNullAt(slot: i32): i32 {
+  const ty = mvValTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const solo = tyNulSoloMember(ty)
+  if solo < 0 { return 0 }
+  const ak = tyValueAtomKindOf(solo)
+  if ak < 0 { return -1 }
+  if ak == 2 { return 0 }
+  if ak == 6 { return 0 }
+  1
+}
+
+// The INNER ref-list slot of a ref-LIST-valued MAP slot (destringify D5-final (b)) —
+// the chokepoint the three `rlSlotByName(refArrElemName(mvValName[s]))` readers share.
+// ARENA first (`mvValTyIx` → the `TyArray`'s element → `rlSlotOfTy`, the ref-list
+// layer's own `repElemKey` lookup); the value-NAME surgery is the untouched
+// fall-through for a slot the sidecar does not cover (D1 leg C).
+export function mvValInnerRlSlot(slot: i32): i32 {
+  const ar = mvValInnerRlSlotAt(slot)
+  if ar >= 0 { return ar }
+  rlSlotByName(refArrElemName(mvValName[slot]))
+}
+
+// The mv slot of a NESTED-map value's inner value (destringify D5-final (b)). ARENA
+// first (`mvValTyIx` → the `TyMap`'s value → `mvSlotOfTy`, the layer's own
+// `repMvValKey` lookup), and ONLY for a real slot: the name resolver's `-1` (mono)
+// and `-3` (unsupported) answers are its own, never the arena's miss.
+export function mvValInnerMvSlot(slot: i32): i32 {
+  const ar = mvValInnerMvSlotAt(slot)
+  if ar >= 0 { return ar }
+  mvSlotOfMapValNameOrMono(mapValNameOf(mvValName[slot]))
+}
+
+// Does a BOXED-union map value admit `null` (destringify D5-final (b))? ARENA first
+// (a `TyNullable`, or a `TyUnion` with a null member); the union member-SET test is
+// the fall-through for a value the sidecar does not cover.
+export function mvValUnionHasNull(slot: i32): boolean {
+  const ar = mvValUnionHasNullAt(slot)
+  if ar >= 0 { return ar == 1 }
+  unionHasAtomTy(mvValName[slot], "null")
+}
+
+// The canonical structural key of a map-VALUE slot (destringify D5-final (b)) — the
+// `mvTwin` comparator's input. ARENA first (`repCanonKey` over the recorded index,
+// computed at QUERY time so an in-place arena mutation moves both sides together),
+// the render-and-re-resolve `repNameCanonKey` for an uncovered row.
+export function mvValCanonKey(slot: i32): string {
+  const ty = mvValTyIxAt(slot)
+  if ty >= 0 { return repCanonKey(ty) }
+  repNameCanonKey(mvValName[slot])
 }
 
 // The struct-table ROW for an ARENA type (destringify D5) — `structIndexByName`'s
@@ -9491,9 +9706,9 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
   if a < 0 || b < 0 { return 0 }
   const k = mvValKind[a]
   if k != mvValKind[b] { return 0 }
-  const ka = repNameCanonKey(mvValName[a])
+  const ka = mvValCanonKey(a)
   if ka == "" { return 0 }
-  if ka != repNameCanonKey(mvValName[b]) { return 0 }
+  if ka != mvValCanonKey(b) { return 0 }
   if k == 3 || k == 10 || k == 11 || k == 13 { return 1 }
   if k == 2 || k == 14 { return 1 }
   if k == 1 { return repStructSlotsTwin(mvValStructIdx[a], mvValStructIdx[b]) }
