@@ -4154,7 +4154,8 @@ vs master: **−18 bytes** (1,020,026 → 1,020,008).
     disagreements in 316,194 member comparisons (5,727 corpus + 310,467 fuzz) where the
     shape test disagreed twice in 50,400 programs. When a name predicate folds in intern state, the arena dual is a
     TABLE lookup keyed by the arena, not a structural classifier.
-## D-PARSETY — the parser stops throwing the type's STRUCTURE away (phase 0, #NNNN)
+
+## D-PARSETY — the parser stops throwing the type's STRUCTURE away (phase 0, #1117)
 
 Every sidecar this program has shipped — `sTyIx`, `annRlSlot`, `unMemTys`, `annUnionAtoms`,
 `inferRetAtomCount` — reconstructs structure the PARSER already had. `parseTypeName`
