@@ -9,6 +9,16 @@
 > **wasmtime**, producing the same results as the V8/Deno path. It is a spike,
 > not a landed dependency — the compiler was not touched.
 
+> **Caveat (X) below has since lapsed.** wasmtime 47 enables the GC proposal (and
+> function references, and exception handling) **by default**
+> ([#13594](https://github.com/bytecodealliance/wasmtime/pull/13594)), so `-W gc`
+> is no longer required and the embedder's `wasm_gc(true)` is now defensive rather
+> than load-bearing — verified by deleting it from `gc_engine` and re-running the
+> struct/array/string corpus. Caveat (Y) — VL supplies no WASI and needs a host for
+> its `imports::*` functions — still stands, and is why `scripts/vl-host` exists.
+> Everything below is the original 45-era spike record. See
+> `wasm-toolchain-audit.md` §4.0.
+
 ## TL;DR
 
 **wasmtime is a viable off-V8 target for VL's current output**, with two

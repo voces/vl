@@ -14,7 +14,8 @@ for how the seed is bootstrapped.
 
 ## Quick start (native)
 
-You need **Rust** (for the host) and a **compiler seed**. For a sandboxed,
+You need **Rust ≥ 1.94** (for the host — the pinned wasmtime requires it) and a
+**compiler seed**. For a sandboxed,
 batteries-included environment (node + deno + rust + Claude behind a network
 firewall, safe for `claude --dangerously-skip-permissions`), see the
 [Dev Container](./.devcontainer/README.md).

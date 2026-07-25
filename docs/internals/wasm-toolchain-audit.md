@@ -111,12 +111,47 @@ are implemented and **enabled by default in validation** (stage 4+ / Wasm 3.0 fe
 
 ---
 
-## 4. wasmtime 45+ audit for `vl-host`
+## 4. wasmtime audit for `vl-host`
 
-Latest stable is **45.0.1** ([releases](https://github.com/bytecodealliance/wasmtime/releases)) —
-the repo's pin is current. Full WasmGC shipped in
-[wasmtime 27.0](https://bytecodealliance.org/articles/wasmtime-27.0). All `Config` methods below
-verified present in [45.0.1 docs](https://docs.rs/wasmtime/45.0.1/wasmtime/struct.Config.html).
+The repo pins **47** ([releases](https://github.com/bytecodealliance/wasmtime/releases)). Full
+WasmGC shipped in [wasmtime 27.0](https://bytecodealliance.org/articles/wasmtime-27.0). §4.1–4.5
+below were written against 45; §4.0 records what 46 and 47 changed and which of those changes VL
+should act on. Where the two disagree, §4.0 wins.
+
+### 4.0 Delta: what 46 and 47 changed for VL
+
+wasmtime **46** (2026-06-22) and **47** (2026-07-20). Verdicts are the point of this section — a
+release note that VL should *not* act on is worth recording so it isn't re-litigated.
+
+**Adopted (shipped — `memory-gc-design.md`).** The default collector became the **copying**
+collector ([#13439](https://github.com/bytecodealliance/wasmtime/pull/13439)), which gained an
+**in-Wasm fast path for its bump allocator**
+([#13323](https://github.com/bytecodealliance/wasmtime/pull/13323)) — inlined allocation, the
+concrete gap against V8. DRC's GC-trigger heuristics were also fixed
+([#13422](https://github.com/bytecodealliance/wasmtime/pull/13422)) and the GC hardened against
+heap corruption ([#13321](https://github.com/bytecodealliance/wasmtime/pull/13321),
+[#13320](https://github.com/bytecodealliance/wasmtime/pull/13320)).
+
+**Worth acting on.**
+
+| change | why it matters to VL |
+|---|---|
+| **Branch hinting** — `Config::wasm_branch_hinting` reads the `metadata.code.branch_hint` custom section to lay out cold paths ([#13459](https://github.com/bytecodealliance/wasmtime/pull/13459)). Off by default "until the proposal has been fuzzed"; hints are advisory and never change semantics. | VL is an emitter that already writes a custom section (`selfhost-name-section.md`) and whose checker knows things no engine can infer — `is`-guard arm order, post-narrowing null checks, the provably-true discriminants A-exhaust already computes. A pure, safe optimization channel. → ROADMAP **B-hint**. |
+| **`ArrayRef::new_from_i8_slice`** — build a GC array from a host byte slice in one memcpy ([#13716](https://github.com/bytecodealliance/wasmtime/pull/13716)). **i8 elements only.** | Would collapse the per-code-point staging boundary (~3.4M host calls per self-compile) to one call — but only once strings are `(array i8)`. Ties **B7** to **B-mem**: the UTF-8 representation is no longer just a size win. |
+| **Bulk-transfer performance** — `{array,table,memory}.{copy,fill,init}` improved across nine PRs ([#13312](https://github.com/bytecodealliance/wasmtime/pull/13312), #13367, #13368, #13382, #13407, #13424, #13438, #13460, #13524). | `array.copy` is VL's list growth, map resize, `slice` and string ops — and per-element `array.copy` libcalls were once *the* self-compile bottleneck (`CHANGELOG.md`, H2). Any remaining copy-avoiding workaround deserves re-measuring before it is treated as load-bearing. |
+
+**No action needed — and why (so nobody chases these).**
+
+- **GC and function-references are now on by default** ([#13594](https://github.com/bytecodealliance/wasmtime/pull/13594), plus exception-handling in #13603). Verified: deleting `cfg.wasm_gc(true)` / `cfg.wasm_function_references(true)` from `gc_engine` still runs VL's struct/array/string modules correctly on 47. The calls stay as defensive intent-documentation, but they are no longer load-bearing — and `wasmtime-parity.md`'s "`-W gc` required" caveat is now historical.
+- **`call_indirect` optimized for `final` super types** ([#13572](https://github.com/bytecodealliance/wasmtime/pull/13572)). VL already qualifies for free: the emitter writes bare `0x5f` comptypes, and the GC binary format reads a bare comptype as `sub final ε ct` — final, no supertypes. Nothing to change.
+- **Smaller `.cwasm` traps/addrmap sections + a minimization guide** ([#13628](https://github.com/bytecodealliance/wasmtime/pull/13628), [#13630](https://github.com/bytecodealliance/wasmtime/pull/13630)). Measured on VL's seed sidecar: `generate_address_map(false)` + `debug_symbols(false)` takes 8.80 MB → 7.99 MB (**−9%**) and costs the wasm offsets in trap backtraces (`vl!boom` survives, `0xf6 - vl!boom` does not). Not worth it — the sidecar is a local/CI cache, never shipped.
+- **Instance initialization compiled into wasm** ([#13487](https://github.com/bytecodealliance/wasmtime/pull/13487)) and **passive segments optimized** ([#13394](https://github.com/bytecodealliance/wasmtime/pull/13394), [#13444](https://github.com/bytecodealliance/wasmtime/pull/13444)). Already banked: a warm `vl run` of a hello-world is **11 ms end to end**, of which `load_compiler` (deserialize + instantiate) is 4–5 ms. This also demotes §4.2's `Config::cache` item from "soon" to "when a large user module proves it" — there is no startup problem left to solve.
+- **Exception-handling on by default** ([#13603](https://github.com/bytecodealliance/wasmtime/pull/13603)). VL's failure model is traps-only, no catchable throw (`collections-design.md`, `error-handling-design.md`) — but VL's *error model is still an open language question* (`DECISIONS.md`), and the substrate for a catchable mechanism now exists in the target runtime. A data point for that decision, not a change.
+- **`wasi-common` and wasi-threads removed** ([#13558](https://github.com/bytecodealliance/wasmtime/pull/13558)); **WASI 0.3.0 is on by default** ([#13612](https://github.com/bytecodealliance/wasmtime/pull/13612)). Preview 1 — the surface H-M2 targets — is unaffected: it now lives in `wasmtime-wasi`'s `p1` module, reimplemented over p2. The ROADMAP's "p2/component-model still settling" framing is what moved.
+- **Rust 1.94.0 is now required** ([#13547](https://github.com/bytecodealliance/wasmtime/pull/13547)). Neither CI nor the devcontainer pins a toolchain (both take rustup stable), so this is a contributor-facing floor, documented in `README.md`.
+- **Graceful OOM in many more paths** (twelve PRs, #13371–#13414). Relevant to the null collector's 8 GiB reservation: §4.1's "may OOM-trap; size generously and fall back to DRC on trap" is less sharp than it was.
+
+**Not applicable:** the rest of 46/47 is component-model / WASIp3 / async-bindgen / Winch / RISC-V / Mach-O / C-API work that VL's module boundary — scalar-only, no components, no WASI yet — does not reach. Winch still has no GC support, so §4.3's "skip" stands.
 
 ### 4.1 GC: collector choice + heap knobs
 
