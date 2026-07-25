@@ -340,6 +340,8 @@ import {
   repSlotOfTy,
   repStructSlotsTwin,
   sTyIxOfName,
+  tyIsI32LeafElem,
+  tyIsStrLeafElem,
 } from "./emit_rep"
 
 // The `$fnsig` PARAM-spine token for the parameter at `paramIx` — one token per distinct
@@ -10970,12 +10972,24 @@ export function registerValueUnionName(name: string) {
 
 // Mark the per-rep value-box usage flags for every scalar atom of the value union
 // `name` (registration-time, so `mAssignTypeIndices` interns exactly the used reps).
+//
+// D-UNION: each member's atom KIND comes from the row's recorded ARENA member type
+// (`unMemAtomKind`) instead of a re-parse of its rendered spelling
+// (`valueAtomKind(atom)`), and the litunion-alias member likewise (`tyIsLitUnion`,
+// not `nameIsLitUnionType`). **The box-tag ABI is order-sensitive** — this function
+// mints the value-box reps in ATOM order — so the recorded slice is consumed in
+// lock-step behind a length guard (`unionMemberTysOf` is atom-order-aligned by
+// construction) and the loop's shape is untouched. An uncovered row keeps the
+// legacy name path.
 export function markValueUnionAtoms(name: string) {
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  const mems: i32[] = []
+  const cov = unionMemberTysOf(name, mems) && mems.length == atoms.length
   let i = 0
   while i < atoms.length {
-    const k = valueAtomKind(atoms[i])
+    let k = -1
+    if cov { k = unMemAtomKind(mems[i]) } else { k = valueAtomKind(atoms[i]) }
     if k == 0 || k == 1 { vbI32Used = true }
     // A STRING member rides the box's anyref `value` as the raw string-array ref (`$aTypeIdx`),
     // so force that array type even when the module CONSTRUCTS no string (`string | i32 = 42`):
@@ -11007,7 +11021,15 @@ export function markValueUnionAtoms(name: string) {
     // ref (the litunion box rep), so force the string array type exactly like a `string`
     // member — the narrowed `is K0` read's `ref.cast $aTypeIdx` must validate even when the
     // module constructs no string.
-    if k < 0 && nameIsLitUnionType(atoms[i]) { aUsed = true }
+    if k < 0 {
+      let lit = false
+      if cov {
+        lit = tyIsLitUnion(mems[i])
+      } else {
+        lit = nameIsLitUnionType(atoms[i])
+      }
+      if lit { aUsed = true }
+    }
     i = i + 1
   }
   0
@@ -11025,10 +11047,23 @@ export function markValueUnionAtoms(name: string) {
 export function markRefArrayArms(name: string) {
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  // D-UNION: the arm gate is a `TyArray` over a non-scalar-leaf element
+  // (`unMemIsRefElemArray`), not `valueAtomKind(a) < 0 && nameIsArray(a)` over the
+  // atom's rendering. The stored atom TEXT is still what the name-keyed reflist layer
+  // downstream (`internShapeDeep` / `refArrElemName` / `ensureRefElem`) needs, so it
+  // stays; only the classification moves. An uncovered row keeps the legacy gate.
+  const mems: i32[] = []
+  const cov = unionMemberTysOf(name, mems) && mems.length == atoms.length
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
-    if a != "null" && valueAtomKind(a) < 0 && nameIsArray(a) {
+    let isRefArr = false
+    if cov {
+      isRefArr = unMemIsRefElemArray(mems[i])
+    } else {
+      isRefArr = a != "null" && valueAtomKind(a) < 0 && nameIsArray(a)
+    }
+    if isRefArr {
       internShapeDeep(a)
       const elem = refArrElemName(a)
       if elem != "" {
@@ -11058,10 +11093,21 @@ export function markRefArrayArms(name: string) {
 export function markMapUnionArms(name: string) {
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  // D-UNION: a map arm is a `TyMap` member (`unMemIsMap`), not a `{[`-prefixed
+  // rendering. The arm's stored atom TEXT still keys the (name-keyed) map-value slot
+  // layer below (`mapValNameOf` → `mvShapeOfValName`). Uncovered rows keep the name gate.
+  const mems: i32[] = []
+  const cov = unionMemberTysOf(name, mems) && mems.length == atoms.length
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
-    if a != "null" && nameIsMap(a) {
+    let isMap = false
+    if cov {
+      isMap = unMemIsMap(mems[i])
+    } else {
+      isMap = a != "null" && nameIsMap(a)
+    }
+    if isMap {
       mUsed = true
       lUsed = true
       aUsed = true
@@ -11177,10 +11223,21 @@ export function forceCloResultListTypes(nm: string) {
 export function unionHasMapArmSlot(name: string, slot: i32) {
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  // D-UNION: the arm SHAPE test is structural (`unMemIsMap` — a `TyMap` member); the
+  // SLOT comparison stays where it is, because a slot is a REP question and
+  // `mvSlotOfMapValNameOrMono`/`mvCanonRepOf` already answer it canonically.
+  const mems: i32[] = []
+  const cov = unionMemberTysOf(name, mems) && mems.length == atoms.length
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
-    if a != "null" && nameIsMap(a) {
+    let isMap = false
+    if cov {
+      isMap = unMemIsMap(mems[i])
+    } else {
+      isMap = a != "null" && nameIsMap(a)
+    }
+    if isMap {
       if (
         mvCanonRepOf(mvSlotOfMapValNameOrMono(mapValNameOf(a))) ==
         mvCanonRepOf(slot)
@@ -11205,6 +11262,13 @@ export function unionHasMapArmSlot(name: string, slot: i32) {
 export function unionHasCollapsedStringMapArm(name: string) {
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  // D-UNION: DELIBERATELY NOT migrated. This classifier is DEAD on the whole corpus
+  // (measured: a per-site sabotage — one that fails the compile whenever the function
+  // is entered at all — fires on 0 of 1,234 corpus programs and 0 of 50,400 fuzz
+  // programs), so an arena leg here could not be sabotage-verified and would ship
+  // unmeasured. Its `mapValNameOf(a) == "string"` verdict is also NOT a candidate: it
+  // asks about the checker's RENDER of a litunion map value, which is exactly the
+  // information the arena keeps and the name loses.
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
@@ -11397,10 +11461,21 @@ export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
           if nm == "" { nm = un }
           const atoms: string[] = []
           splitUnionAtoms(nm, atoms)
+          // D-UNION (batch 2's `tyArmPathLeaf` walk, applied to an INDEXED root): the
+          // arm's element type is `tyArmElem` (a `TyArray` arm's element — the name
+          // path's `nameIsRefArray(a)` gate plus its `refArrElemName`/inline-shape
+          // re-resolution), and the `.f` leaf's code-19 map test is `tyArmPathIsMap`.
+          // An uncovered row keeps the legacy name walk.
+          const mems: i32[] = []
+          const cov = unionMemberTysOf(nm, mems) && mems.length == atoms.length
           let i = 0
           while i < atoms.length {
             const a = atoms[i]
-            if nameIsRefArray(a) {
+            if cov {
+              const path: string[] = []
+              path.push(e.memProp)
+              if tyArmPathIsMap(tyArmElem(mems[i]), path) { return true }
+            } else if nameIsRefArray(a) {
               // The arm's element struct: `refArrElemName` for a nominal element, the raw
               // `[]`-stripped text for an inline shape it cannot see (the interner's key).
               let en = refArrElemName(a)
@@ -12163,6 +12238,20 @@ function unionArmPathIsClosure(arm: string, path: string[]): boolean {
 export function unionHasRefArrayArmSlot(name: string, slot: i32) {
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  // D-UNION: NOT migrated — REFUTED by measurement, and the refutation is the point.
+  // `unMemIsRefElemArray` is the exact dual of `markRefArrayArms`' `nameIsArray` gate,
+  // but `nameIsRefArray` here asks a STRICTLY narrower question: it also requires the
+  // element to be NAMEABLE by the reflist layer (`structIndexByName` /
+  // `shapeElemDeclaredStructIdx` / `variantIndexOf` / the union scan), i.e. it folds in
+  // INTERN STATE, not just structure. An inline-shape element array reached only through
+  // a closure result (`(i32,i32,i32) => {f: i32}[] | f64`) is a `TyArray` over a `TyObj`
+  // — structurally a ref array — while its spelling never interned a struct row, so the
+  // name path answers NO and `refArrElemName` answers "". Substituting the arena
+  // predicate makes the slot compare below read `rlSlotByName("") == -1`, which MATCHES
+  // a `slot` of -1 and boxes under a tag no producer interned. Fuzz found the shape
+  // twice in 50,400 programs (seed 7 d6 plain, seed 13 d6 `--declared`); both are loud
+  // rejects today, so nothing broke — but the predicate is not interchangeable, which is
+  // the D1/D2 lesson wearing a third hat.
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
@@ -12246,23 +12335,30 @@ export function unionRefArrayArmSlotForMapElem(name: string, mvShape: i32) {
   if mvShape < -1 { return -1 }
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  // D-UNION: the arm SHAPE test is `unMemIsMapArray` (a `TyArray` over a `TyMap` —
+  // the `nameIsMapMemberUnion` exclusion is free structurally, a map-member UNION
+  // element being a `TyUnion`), and the arm's stored element NAME still keys the
+  // reflist/mv slot lookups, which are rep questions answered where they are.
+  const mems: i32[] = []
+  const cov = unionMemberTysOf(name, mems) && mems.length == atoms.length
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
-    if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
+    let isMapArr = false
+    if cov {
+      isMapArr = unMemIsMapArray(mems[i])
+    } else if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
+      const pen = refArrElemName(a)
+      isMapArr = nameIsMap(pen) && !nameIsMapMemberUnion(pen)
+    }
+    if isMapArr {
       const en = refArrElemName(a)
-      if nameIsMap(en) && !nameIsMapMemberUnion(en) {
-        const slot = rlSlotByName(en)
-        if (
-          slot >= 0 &&
-          slot < rlElemKindTbl.length &&
-          rlElemKindTbl[slot] == 3
-        ) {
-          const armMv = mvSlotOfMapValNameOrMono(mapValNameOf(en))
-          if armMv == -1 && mvShape == -1 { return slot }
-          if armMv >= 0 && mvShape >= 0 {
-            if mvCanonRepOf(armMv) == mvCanonRepOf(mvShape) { return slot }
-          }
+      const slot = rlSlotByName(en)
+      if slot >= 0 && slot < rlElemKindTbl.length && rlElemKindTbl[slot] == 3 {
+        const armMv = mvSlotOfMapValNameOrMono(mapValNameOf(en))
+        if armMv == -1 && mvShape == -1 { return slot }
+        if armMv >= 0 && mvShape >= 0 {
+          if mvCanonRepOf(armMv) == mvCanonRepOf(mvShape) { return slot }
         }
       }
     }
@@ -12286,6 +12382,12 @@ export function unionRefArrayArmSlotForMapElem(name: string, mvShape: i32) {
 export function unionNestedArrayArmSlot(name: string) {
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  // D-UNION: NOT migrated, for the reason spelled out at `unionHasRefArrayArmSlot` —
+  // `nameIsRefArray` folds the reflist layer's INTERN STATE into its answer, so the
+  // arena's `unMemIsRefElemArray` is a strict superset of it. (Here the over-accept
+  // would be inert — an unnameable element yields `rlSlotByName("") == -1` and the
+  // `slot >= 0` guard drops it — but "inert by argument" is not "equal by measurement",
+  // and this layer's whole discipline is the latter.)
   let found = -1
   let n = 0
   let i = 0
@@ -13917,6 +14019,75 @@ export function unMemIsFuncReachArray(m: i32): boolean {
   const t = T.tys[m]
   if t is TyArray { return tyReachesFuncD(t.aElem, 12) }
   false
+}
+
+// A REF-ELEMENT array member — the structural dual of `markRefArrayArms`' gate,
+// `valueAtomKind(a) < 0 && nameIsArray(a)`, over a member's rendered spelling. A
+// `TyArray` whose element does NOT ride a SCALAR-leaf list backing: the i32-list leaves
+// (`i32`/`boolean`/litunion and their sentinel niches — `tyIsI32LeafElem`), the
+// string-list leaves (`string`, `string | null` — `tyIsStrLeafElem`), and the three
+// per-width numeric lists (`f64`/`i64`/`f32`). Everything else (a struct, a union box,
+// a map, a closure, a nested list, a nullable struct/list element) rides the
+// `{backing,len,cap}` ref-list wrapper. A non-array member — a bare closure
+// `(i32) => f64[]`, whose RENDERING ends in `[]` and which the name gate must exclude
+// with `valueAtomKind == 11` — is not a `TyArray` at all.
+//
+// **Not** the dual of `nameIsRefArray`, which is a strict SUBSET of this: that
+// predicate also demands the element be NAMEABLE by the reflist layer, folding intern
+// state into a shape question. See the refutation at `unionHasRefArrayArmSlot`.
+export function unMemIsRefElemArray(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyArray {
+    const e = t.aElem
+    if e < 0 { return false }
+    if tyIsI32LeafElem(e) { return false }
+    if tyIsStrLeafElem(e) { return false }
+    const et = T.tys[e]
+    if et is TyPrim {
+      if et.primName == "f64" { return false }
+      if et.primName == "i64" { return false }
+      if et.primName == "f32" { return false }
+    }
+    return true
+  }
+  false
+}
+
+// The value-atom KIND of a union member, from the arena — the structural dual of
+// `valueAtomKind(atom)` over the member's rendered spelling (the classifier
+// `markValueUnionAtoms` drives the per-rep value-box flags from). Same code space,
+// same ORDER of tests:
+//   · a primitive answers on its own `primName` (`valueAtomKind`'s nominal half —
+//     `i32`/`boolean`/`string`/`i64`/`f64`/`f32`/`null`);
+//   · an i32-backed leaf array is kind 7 (`i32[]`, `boolean[]`, litunion `K[]`, and
+//     the `(boolean | null)[]` / `(K | null)[]` niches `nulElemListAtomKind` folds
+//     onto the i32 list) — asked FIRST, exactly as `valueAtomKind` asks its
+//     `i32[]`/`boolean[]`/litunion-array arms ahead of the per-width lists;
+//   · then the per-width numeric lists (8 f64, 10 i64, 12 f32) and the string-backed
+//     leaf array (9 — `string[]` and the `(string | null)[]` niche);
+//   · a function type is the closure atom (11), the box's anyref fat pointer.
+// Anything else — a struct, a ref-element array, a map, a union — is -1, the name
+// path's "not a value atom".
+export function unMemAtomKind(m: i32): i32 {
+  if m < 0 { return -1 }
+  const t = T.tys[m]
+  if t is TyPrim { return valueAtomKind(t.primName) }
+  if t is TyArray {
+    const e = t.aElem
+    if e < 0 { return -1 }
+    if tyIsI32LeafElem(e) { return 7 }
+    const et = T.tys[e]
+    if et is TyPrim {
+      if et.primName == "f64" { return 8 }
+      if et.primName == "i64" { return 10 }
+      if et.primName == "f32" { return 12 }
+    }
+    if tyIsStrLeafElem(e) { return 9 }
+    return -1
+  }
+  if t is TyFunc { return 11 }
+  -1
 }
 
 // ── D-UNION arm-PATH walk, from the arena ────────────────────────────────────

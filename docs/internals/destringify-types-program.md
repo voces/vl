@@ -261,10 +261,90 @@ pinned as `tests/cases/unions/union-box-field-arm-closure-array-index-call.vl` �
 must arrive as a **union-BOX FIELD read** (`const t0 = v.f`) for the conservative classifier
 to be consulted at all.
 
+**Batch 3 — the `mark*` REGISTRATION functions and the `*ArmSlot` resolvers, six of nine
+migrated, two REFUTED, one measured DEAD.** This is the batch that touches the box-tag
+**ABI**: `markValueUnionAtoms` mints the per-rep value boxes in ATOM order, so it consumes
+the (atom-order-aligned) `unMemTys` slice in lock-step behind the length guard and the loop's
+shape is untouched. Migrated:
+
+| site | was | now |
+|---|---|---|
+| `markValueUnionAtoms` | `valueAtomKind(atom)` + `nameIsLitUnionType(atom)` | `unMemAtomKind(m)` + `tyIsLitUnion(m)` |
+| `markRefArrayArms` | `valueAtomKind(a) < 0 && nameIsArray(a)` | `unMemIsRefElemArray(m)` |
+| `markMapUnionArms` | `nameIsMap(a)` | `unMemIsMap(m)` |
+| `unionHasMapArmSlot` | `nameIsMap(a)` | `unMemIsMap(m)` |
+| `unionListElemMapFieldMember` | `nameIsRefArray(a)` + elem-struct field code 19 | `tyArmPathIsMap(tyArmElem(m), [f])` |
+| `unionRefArrayArmSlotForMapElem` | that gate + `nameIsMap(refArrElemName(a))` | `unMemIsMapArray(m)` |
+
+Two new arena predicates carry it. `unMemAtomKind` is `valueAtomKind`'s structural dual in
+the same code space and the same test ORDER (a `TyPrim` answers on its own `primName`; the
+i32-backed leaf array is asked FIRST, ahead of the per-width `f64`/`i64`/`f32` lists and the
+string-backed leaf, mirroring `valueAtomKind`'s litunion-array arm sitting ahead of them).
+`unMemIsRefElemArray` is the D2 reading of "ref array": a `TyArray` whose element does **not**
+ride a scalar-leaf list backing (`tyIsI32LeafElem` / `tyIsStrLeafElem`, now exported from
+`emit_rep`, plus the three numeric widths). **Only the arm-SHAPE test moves.** Every slot
+comparison stays where it is — `rlSlotByName` is already `repElemKey`-keyed (D2) and
+`mvCanonRepOf` is already canonical, and a slot is a REP question, not a type question.
+
+**REFUTED: `nameIsRefArray` is not a shape predicate.** `unionHasRefArrayArmSlot` and
+`unionNestedArrayArmSlot` were migrated to `unMemIsRefElemArray`, swept clean over the corpus,
+and then the **fuzz probe found 2 disagreements in 50,400 programs** (seed 7 d6 plain, seed 13
+d6 `--declared`) — both the shape `(i32,i32,i32) => {f: i32}[] | f64`. `nameIsRefArray` is a
+strict SUBSET of "a `TyArray` over a non-scalar leaf": it *also* requires the element to be
+NAMEABLE by the reflist layer (`structIndexByName` / `shapeElemDeclaredStructIdx` /
+`variantIndexOf` / the `unNames` scan), which is **intern state, not structure**. An
+inline-shape element array reached only through a closure result is structurally a ref array
+whose spelling never interned a struct row, so the name path says NO and `refArrElemName`
+answers `""`. With the arena predicate the slot compare degenerates to
+`rlSlotByName("") == -1`, which MATCHES a caller's `slot` of -1 and would box under a tag no
+producer interned. Both witnesses are loud rejects today, so nothing broke — and both sites
+are back on the name path. **The same predicate is exact at `markRefArrayArms`**, whose gate
+is `nameIsArray` (spelling only, no intern state); that one stays migrated. This is the D1/D2
+lesson wearing a third hat: check *which* question the site is asking, and note that "the
+corpus swept clean" was not enough here — only the fuzz leg found it.
+
+**`unionHasCollapsedStringMapArm` is deliberately NOT migrated — it is DEAD.** A sabotage
+that fails the compile whenever the function is *entered at all* fires on **0** of the 1,234
+corpus programs and **0** of 50,400 fuzz programs; its own dedicated fixture
+(`map-closure-return-map-member-union.vl`) reaches `unionHasMapArmSlot` and matches there, so
+the collapsed-arm fall-through behind it never runs. Six hand-written attempts at the shape
+(`{[string]: K0}` into a `{[string]: string} | X` in binding / arg / return / element
+position) also failed to reach it — they mis-narrow *before* the box site, a pre-existing
+silent-mismatch family unrelated to this program. With no reachable shape there is nothing to
+sabotage-verify against, so migrating it would ship unmeasured; it stays on the name path.
+(Its `mapValNameOf(a) == "string"` verdict is not a candidate in any case: it asks about the
+checker's RENDER of a litunion map value — the very information the arena keeps and the name
+loses.)
+
+Method: an additive probe on all nine sites (both answers computed, the NAME answer kept, a
+sticky `emitFail` marker on disagreement) — **0 disagreements** over the corpus (1,234 files,
+including `std/` and the compiler's own source) for every site, and **0 over 50,400 fuzz
+programs for the six shipped sites** (the only 2 fuzz disagreements were the refuted
+`nameIsRefArray` pair above). Sabotage-verified per site, gated on the arena leg actually
+having run: `markValueUnionAtoms` 433 · `markRefArrayArms` 433 · `markMapUnionArms` 433 ·
+`unionHasMapArmSlot` 25 · `unionHasRefArrayArmSlot` 19 · `unionNestedArrayArmSlot` 4 ·
+`unionRefArrayArmSlotForMapElem` 1 · `unionListElemMapFieldMember` 2 ·
+`unionHasCollapsedStringMapArm` **0** (the dead one above). Corpus **byte-identical** and
+run-identical, 66-case battery 0 diffs — so the ABI/order invariant held.
+
+**The gate channel was sabotage-verified too**, and it found a blind spot worth recording.
+Swapping `unMemAtomKind`'s i64/f32 list kinds reddens it (3 byte-diffs + 1 build failure);
+declining struct-element arrays in `unMemIsRefElemArray` reddens it hard (11 build failures,
+via `markRefArrayArms`).
+But **breaking `unionListElemMapFieldMember`'s arena leg outright produces ZERO corpus diffs**
+— that classifier is a narrowing-blind frame-scratch *over*-reservation, and on the corpus
+something else already reserves what it would. Its migration therefore rests on the probe's
+answer-equality (2 corpus programs + fuzz), not on the output gate: the D-RET lesson (a green
+A/B is not evidence for what the channel cannot express) applies to a *consumer* here, not
+just to a generator.
+
 **Still string-classified (the rest of the layer, honest scope).**
 `unionRefArrayArmSlotForElemAtom` (atom-EQUALITY against a rendered element set),
 `unionClosureArrElemUnion` (returns an element NAME the name-keyed reflist layer consumes),
-and `emitUnionCoerce`'s alias expansion (the union-boxing ABI).
+`unionHasRefArrayArmSlot` / `unionNestedArrayArmSlot` (refuted, above — they need a predicate
+that fuses shape with reflist intern state, which is D5's territory, not a shape dual),
+`unionHasCollapsedStringMapArm` (dead, above), and `emitUnionCoerce`'s alias expansion (the
+union-boxing ABI).
 
 **Correct as-is, deliberately untouched:** `unionMemberCount(unionMemberSetOf(…)) > 1` (a
 count), `structUnionNullCmpName` (`unionHasAtom(set, "null")` + a non-null count — `null` is
@@ -503,7 +583,7 @@ condition names two things, so measure those:
 | ref-list element slot key derived by string surgery | yes | **no** (`repElemKey`) |
 | `$fnsig` key derived by rendering + re-parsing | yes | **no** at `cloCallSigKey` (`sigKeyOfTy`) |
 | inferred-return value-union verdict derived by rendering + re-parsing | yes | **no** (`tyIsValueUnion`) |
-| per-atom classify-by-render of a union member set | 15 sites | **4 sites** — batch 1 took 6, batch 2 the `unionArmPath*` five |
+| per-atom classify-by-render of a union member set | 15 sites | **12 functions still contain the pattern**; batches 1-3 made the arena answer FIRST in most (see the counting caveat) |
 | struct/variant FIELD-ELEMENT slot resolved by re-resolving a NAME | 14 sites | **0** for the ref-list + nested-struct layers (`sFieldElemTyIx`/`uFieldElemTyIx` → `rlSlotOfTy`/`structIndexOfTy`); the map-value / union-box / litunion readers stay |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
@@ -520,14 +600,37 @@ The 12 remaining `table[i] == name` scans split three ways, and **most are not t
 
 `unionMemberSetOf(name)` returns a pipe-joined member string; consumers `splitUnionAtoms` it
 and classify each atom **by its rendered text**. That per-atom re-derivation is the disease.
-Batches 1 and 2 took eleven of the fifteen sites (the "is there an arm of shape X" family and
-the `unionArmPath*` field-path walks); what remains is the atom-EQUALITY / element-NAME /
-box-ABI residue named in D-UNION above.
+Batches 1–3 took seventeen of the twenty-three sites (the "is there an arm of shape X" family,
+the `unionArmPath*` field-path walks, and the `mark*` registration + the map-shaped `*ArmSlot`
+resolvers); what remains is the atom-EQUALITY / element-NAME / box-ABI residue named in
+D-UNION above, the two `nameIsRefArray`-gated slot resolvers refuted in batch 3, and the one
+classifier measured DEAD (`unionHasCollapsedStringMapArm`).
 
 **Scope carefully:** an atom that is a declared variant name (`Cat`) feeding
 `variantIndexOf` is *nominal identity — lossless and correct*. Only the inline-shape /
 composite atoms are the disease. **ABI hazard:** the box-tag scheme depends on member
 ORDER (`unVarStart`/`unVarCount` slice `uVariants`), so any reordering is an ABI change.
+
+
+### Counting caveat — read before quoting a scorecard number
+
+Two different things get called "sites", and conflating them produced disagreeing numbers in
+this doc's own history (a "15 → 4" and a "15 → 5 + 1 dead", neither reproducible by an
+independent scan, which found 12).
+
+- **Source-pattern count**: functions that still `splitUnionAtoms` a member set and call a
+  `nameIs*` / `valueAtomKind` on an atom. A **ladder-faithful** migration — the shape D1's
+  refutation forced, where the arena replaces the predicate *in place* and the name
+  fall-through is deliberately untouched — **leaves this pattern in the source**. So this
+  count barely moves even when the arena is doing the deciding.
+- **Authority count**: how many consult the arena *first*, with the name path reached only
+  when the arena declines.
+
+The second is what the program changes; the first is what a grep can see. Quote both, or
+neither. Reproduce the source-pattern count with: for each `splitUnionAtoms` line, look ahead
+~14 lines for
+`(nameIsMap|nameIsRefArray|nameIsArray|nameIsClosureArray|refArrElemName|valueAtomKind|nameIsLitUnionType|annArrowAt|strContains)\s*\(\s*(atoms?\[|arm|a\b|at\b)`,
+then walk back to the enclosing function and dedupe.
 
 ## Method notes earned during this program
 
@@ -540,5 +643,22 @@ ORDER (`unVarStart`/`unVarCount` slice `uVariants`), so any reordering is an ABI
 3. **A type key ≠ a rep key** (D2) — slot layers fold structurally-distinct types that share
    a wrapper.
 
-All three are the same underlying mistake: assuming an arena artifact answers the same
+4. **Sabotage the GATE CHANNEL, not only the probe** (batch 3) — three deliberately-wrong
+   compilers were built to check the corpus byte/run-diff can go red for each migrated
+   predicate. Two did; the third (`unionListElemMapFieldMember`) produced **zero** diffs,
+   because a conservative over-reservation's wrong answer is invisible in the output. A site
+   like that can only be defended by the probe's answer-equality — know which of your two
+   pieces of evidence is actually carrying the site.
+5. **A green CORPUS is not a green probe** (batch 3) — `unMemIsRefElemArray` swept the whole
+   corpus clean at `unionHasRefArrayArmSlot` and disagreed on **2 of 50,400** fuzz programs.
+   The predicate it replaced folded reflist INTERN STATE into a shape test. Run the fuzz leg
+   of the probe before the replacement, not only after it.
+6. **A zero-coverage consumer may be DEAD, not merely untested** (batch 3) — all three union
+   batches found a classifier that fires on nothing. Batches 1 and 2 pinned theirs with a new
+   fixture. Batch 3's (`unionHasCollapsedStringMapArm`) could not be reached at all: its own
+   dedicated fixture now matches at the earlier arm and six hand-written attempts mis-narrow
+   before the box site. **Do not migrate what you cannot sabotage-verify** — record the
+   measurement and leave it on the name path.
+
+The first three are the same underlying mistake: assuming an arena artifact answers the same
 question the string did. Check which question the site is asking, first.
