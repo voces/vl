@@ -371,6 +371,153 @@ export function nodeEndOf(nodeIx: i32) {
   t.start + t.text.length
 }
 
+// ── Type-SPELLING side arena (the parser KEEPS what it parsed) ───────────────
+// `parseTypeName` is a recursive-descent parser that has the annotation's whole
+// structure in hand and returns a STRING built by concatenation (`"A|B"`,
+// `"i32[]"`, `"{[string]:i32}"`, `"(i32)=>S"`). Every later pass that needs the
+// structure back takes that string apart again. This arena is the parser's
+// record of what it saw, built as it recurses — a flat SPELLING tree:
+//
+//   tsKind[i]     — the node kind (`TS_*` below)
+//   tsText[i]     — identifier / literal lexeme / field name / map key ("" if unused)
+//   tsKidStart[i] — the children are `tsKids[start, start + count)`
+//   tsKidCount[i]
+//
+// It is a SPELLING tree, not a type. `Box<i32>` is recorded as an APPLICATION of
+// the identifier `Box`, not as the object it resolves to, because resolution
+// needs the program's declared-type environment (`cUserTypes`, the live `<T>`
+// bindings) and that does not exist while the parser runs — a type may be
+// declared after its use, or in another module. The parser records the
+// SPELLING; interning it is the checker's job.
+//
+// Children are collected on a shared STACK rather than a per-node array: every
+// producer pushes its finished node, and `tsMk` moves the stack region above a
+// caller-taken mark into the flat `tsKids` column. Depth-first parsing makes
+// that region contiguous and exclusively the caller's, so a spelling node costs
+// four column pushes and NO per-annotation allocation.
+export const TS_NAME = 0    // a bare identifier or primitive name (`i32`, `Cat`, `T`)
+export const TS_APP = 1     // `Head<a, b>` — tsText = head, kids = the arguments
+export const TS_ARR = 2     // `X[]` — one kid
+export const TS_UNION = 3   // `A | B | …` — two or more kids
+export const TS_ISECT = 4   // `A & B` — two or more kids
+export const TS_NEG = 5     // `!A` — one kid
+export const TS_PAREN = 6   // `(A)` / `(A, B)` — the comma list
+export const TS_FUNC = 7    // `(params) => ret` — kids = the params, then the RETURN last
+export const TS_MAP = 8     // `{[K]: V}` — tsText = the key name, one kid = V
+export const TS_OBJ = 9     // `{x: T, y: U}` — kids = `TS_FIELD` nodes
+export const TS_FIELD = 10  // one inline-object field — tsText = its name, one kid = its type
+export const TS_LITSTR = 11 // a string-literal type — tsText keeps the QUOTED lexeme
+export const TS_LITNUM = 12 // a numeric-literal type — tsText is the raw lexeme
+export const TS_NULL = 13   // the `null` type
+export const TS_ERR = 14    // the `expect("IDENT")` recovery leaf (the parser's `""` name)
+
+export let tsKind: i32[] = []
+export let tsText: string[] = []
+export let tsKidStart: i32[] = []
+export let tsKidCount: i32[] = []
+export let tsKids: i32[] = []
+// The child stack. Only ever holds the nodes of the spellings currently OPEN on
+// the parser's recursion, so it is empty between annotations.
+let tsStack: i32[] = []
+
+// The stack mark a producer takes BEFORE parsing its children.
+export function tsMark() { tsStack.length }
+
+// Finish a spelling node whose children are the stack region above `mark`: move
+// them into `tsKids`, pop them, push the new node. Returns its arena index.
+export function tsMk(kind: i32, text: string, mark: i32) {
+  const start = tsKids.length
+  let i = mark
+  while i < tsStack.length {
+    tsKids.push(tsStack[i])
+    i = i + 1
+  }
+  const cnt = tsKids.length - start
+  while tsStack.length > mark { tsStack.pop() }
+  tsKind.push(kind)
+  tsText.push(text)
+  tsKidStart.push(start)
+  tsKidCount.push(cnt)
+  const ix = tsKind.length - 1
+  tsStack.push(ix)
+  ix
+}
+
+// Wrap the node on top of the stack (the `[]` array suffix: `X` → `X[]`).
+export function tsWrap(kind: i32, text: string) {
+  let mark = tsStack.length - 1
+  if mark < 0 { mark = 0 }
+  tsMk(kind, text, mark)
+}
+
+// Take the finished root a type producer left on the stack. Every producer
+// pushes exactly one node — the error arm pushes `TS_ERR` — so this is total on
+// a producer's return; the `-1` guard is the same "never trap on a misaligned
+// side table" contract `nodeToks` / `declNameTok` keep.
+export function tsPop() {
+  const n = tsStack.length
+  if n == 0 { return -1 }
+  const ix = tsStack[n - 1]
+  tsStack.pop()
+  ix
+}
+
+// The annotation-node → spelling-root map, as two parallel PUSH columns:
+// `annTsNode[r]` is a `TypeRef` node index and `annTsRoot[r]` its spelling root.
+//
+// SPARSE, not parallel to `P.nodes`, and that is a measured choice: annotations
+// are ~2.4% of the node arena, so a `declNameTok`-shaped column (grown lazily to
+// the last annotation's index) costs one `i32` per AST NODE — 225,619 entries on
+// the compiler's own self-compile against 5,398 annotations, 21x the storage for
+// the same information. Two pushed rows per annotation cost what the information
+// costs.
+//
+// `annTsNode` is STRICTLY INCREASING by construction: a row is pushed
+// immediately after the `mkTypeRef` it describes, and the node arena only
+// appends — so `annTsOf` is a binary search, not a scan. A harness that resets
+// `P.nodes` without resetting these leaves earlier programs' rows in front of
+// the current one's, which the search finds first: a missing reset is a WRONG
+// ANSWER a consumer can see, not a silently-absorbed hole.
+export let annTsNode: i32[] = []
+export let annTsRoot: i32[] = []
+
+export function setAnnTs(nodeIx: i32, root: i32) {
+  annTsNode.push(nodeIx)
+  annTsRoot.push(root)
+  0
+}
+
+// The spelling-tree root recorded for `nodeIx`, or `-1` when none was — every
+// non-`TypeRef` node, an emitter-SYNTHESIZED `TypeRef` (`synthTypeRef`, built
+// from a name the emitter computed that never passed through the parser), and
+// the string-only type spellings (`is` / `as` / a `UnionDecl` member).
+export function annTsOf(nodeIx: i32) {
+  let lo = 0
+  let hi = annTsNode.length - 1
+  while lo <= hi {
+    const mid = lo + (hi - lo) / 2
+    const at = annTsNode[mid]
+    if at == nodeIx { return annTsRoot[mid] }
+    if at < nodeIx { lo = mid + 1 } else { hi = mid - 1 }
+  }
+  -1
+}
+
+// Clear the spelling arena and its node columns. The driver calls this alongside
+// `P.nodes = []` / `nodeToks = []` — a recorded root indexes THIS program's
+// arena and means nothing against the next one's.
+export function tsReset() {
+  tsKind = []
+  tsText = []
+  tsKidStart = []
+  tsKidCount = []
+  tsKids = []
+  tsStack = []
+  annTsNode = []
+  annTsRoot = []
+  0
+}
+
 // ── Arena constructors ───────────────────────────────────────────────────────
 // Each appends its variant to `P.nodes` and returns the new node's index. Every
 // constructor takes `pos` — the CHAR OFFSET of the construct's START token (the
