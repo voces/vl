@@ -1486,6 +1486,18 @@ then walk back to the enclosing function and dedupe.
    — three of that slice's seven sites spell it `let en = table[i]` … `f(en)`, and they were
    the WRITE half of a read/write pair whose read half the brief did enumerate. Enumerate by
    *resolver called*, not by expression shape.
+10. **REACHED is not the same measurement as CONSEQUENTIAL** (D-TOTALITY) — a decline path
+    reached 47,000 times can never once change the caller's answer, and a decline path
+    reached 6 times can change it all 6. Every slice before this one measured whether the
+    arena leg AGREED where it answered; none measured what the name fall-through does where
+    the arena DECLINES. Deletion is decided by the second question, so instrument the
+    fall-through against *the value the caller would get if the fall-through were deleted*,
+    not against whether the branch ran.
+11. **A 0 does not transfer between SIBLING sites** (D-TOTALITY) — `sFieldRefSlot` and
+    `variantFieldRefSlot` are the same four lines over two tables; one's fall-through is
+    consequential 18 times in 49,422 programs and the other's is consequential 0 times in
+    3,840 reaches. The struct table receives anonymous literal rows and the variant table
+    does not, so the shared shape hides different input populations. Measure each site.
 
 The first three are the same underlying mistake: assuming an arena artifact answers the same
 question the string did. Check which question the site is asking, first.
@@ -1737,3 +1749,213 @@ the separately-built inverted (agreement) marker — never the same build as the
 disagreement channel. `refresh-compiler.sh` / `rep-fuzz-check.sh` / `native-fixpoint.sh` /
 `lint-self.sh` / `SELFHOST_NATIVE_ALIGN=1 deno task test` (1,953 passed) / `fuzz-sweep.sh`
 all RC=0.
+
+## D-TOTALITY — the DECLINE-rate map: which name fall-throughs are dead weight (#1106)
+
+Fifteen slices of ladder-faithful migration have deleted **zero** parsers, and #1105 said
+why: deletion needs the arena leg proven **TOTAL** for its input. This slice measures the
+thing that decides it — not what the arena leg *answers*, but what happens where it
+**declines**.
+
+Every ladder-faithful leg in this program has a decline branch: the arena says "I do not
+cover this" and the name fall-through — a type-string PARSE — runs. Two questions per
+site, and they are not the same question:
+
+- **reach** — was the decline branch entered at all (did the parse RUN)?
+- **consequential** — was the decline entered AND did the name path's answer DIFFER from
+  the value the caller would get if the fall-through were simply deleted (did the parse
+  MATTER)?
+
+A leg whose decline is reached 47,000 times and is **never consequential** is dead weight
+on the sampled surface. A leg reached 6 times and consequential all **6** is load-bearing.
+Reach alone cannot tell those apart, which is why every earlier scorecard in this document
+under-determined the deletion question.
+
+### Method
+
+One probe build, 48 instrumented decline branches, a tag accumulated per site and reported
+ONCE at the end of `emitProgram` through `emitFail`. A pure REACH probe, so the abort IS
+the intended signal and channel separation (method note 7) does not apply — but the
+**consequential** channel is a comparison, so it was sabotage-verified on a **separately
+built inverted** compiler (`ttNote` flipped: the `+` tag fires exactly where the reach
+probe's does not). Corpus = 1,269 files (`tests/cases` + `std/` + the compiler's own
+source); fuzz = **48,153** programs (seeds 1–14 × depths 4,5,6 × {plain, `--declared`} ×
+300). The fuzz GENERATOR runs on the master seed — the probe compiler fails every build by
+design and cannot host it.
+
+### The map (reach / consequential, corpus · fuzz)
+
+| tag | leg — its name fall-through | corpus R/C | fuzz R/C | verdict |
+|---|---|---|---|---|
+| SFTGT | `sFieldTgtStructIdx` → `structIndexByName` | 6 / **6** | 0 / 0 | **load-bearing, 100%** |
+| MVNIC | `mvSlotNullable` → `nulRefMapValInnerOf` | 6 / **6** | 122 / **122** | **load-bearing, 100%** |
+| MSCNT | `unionSetNonNullCount` → `nonNullMemberCountOf` | 17 / **17** | 26 / **26** | **load-bearing, 100%** |
+| RLLSR | `rlElemLitStructRow` → `nullablePartOf` + `structIndexByName` | 25 / **17** | 197 / **90** | **load-bearing, ~50%** |
+| RLSR | `rlElemStructRow` → `structIdxOfElemName` | 103 / **28** | 1,920 / **246** | **load-bearing, ~15%** |
+| MSNUL | `unionSetHasNull` → `unionHasAtom` | 149 / **33** | 6,351 / **289** | **load-bearing, ~5%** |
+| WSFRL | `sFieldRefSlot` → `rlSlotByName` | 492 / **6** | 15,621 / **12** | **load-bearing, 0.1%** |
+| ASLOT | `tyAnnRefListSlot` → `nameIsRefArray` + `rlSlotByName` | 917 / 0 | 46,085 / 0 | never consequential |
+| AKIND | `tyAnnRefListKind` → `nameIsRefArray` + `refArrElemKind` | 917 / 0 | 46,085 / 0 | never consequential |
+| DLETN | `letIsNulRefArray` → `nullablePartOf` + `nameIsRefArray` | 550 / 0 | 29,752 / 0 | never consequential |
+| DRETN | `retNulRefArrFlag` → `nullablePartOf` + `nameIsRefArray` | 777 / 0 | 28,953 / 0 | never consequential |
+| CRET | `retRefArrFlag` → `nameIsRefArray` | 760 / 0 | 27,644 / 0 | never consequential |
+| CPAR | `paramRefArray` → `nameIsRefArray` | 801 / 0 | 11,481 / 0 | never consequential |
+| ELETRA | `letIsRefArray` → `nameIsRefArray` | 14 / 0 | 26 / 0 | never consequential |
+| FSTR | `letIsStringArray`'s ref-array reject | 18 / 0 | 167 / 0 | never consequential |
+| FF32 | `letIsF32Array`'s ref-array reject | 16 / 0 | 167 / 0 | never consequential |
+| FI64 | `letIsI64Array`'s ref-array reject | 18 / 0 | 169 / 0 | never consequential |
+| FF64 | `letIsF64Array`'s ref-array reject | 19 / 0 | 169 / 0 | never consequential |
+| NBNSTR | `retNulStringFlag` → `nullablePartOf(tyNameOf)` | 944 / 0 | 48,153 / 0 | never consequential |
+| NBCLO | `nulCloFlag` → `nameIsNulClosure` | 737 / 0 | 12,994 / 0 | never consequential |
+| NBNLST | `retNulListFlag` → `nameIsNulI32List` | 721 / 0 | 11,565 / 0 | never consequential |
+| NBCLOA | `nameIsClosureArrayTy` → `nameIsClosureArray` / `nullClosureArrElem` | 24 / 0 | 16 / 0 | never consequential |
+| SFLU | `sFieldIsLitUnion` → `nameIsLitUnionType` | 269 / 0 | 5,505 / 0 | never consequential |
+| UFLU | `variantFieldIsLitUnion` → `nameIsLitUnionType` | 138 / 0 | 1,675 / 0 | never consequential |
+| SFLUA | `sFieldIsLitUnionArray` → `nameIsLitUnionArray` | 22 / 0 | 184 / 0 | never consequential |
+| UFLUA | `variantFieldIsLitUnionArray` → `nameIsLitUnionArray` | 23 / 0 | 20 / 0 | never consequential |
+| UFRL | `variantFieldRefSlot` → `rlSlotByName` | 193 / 0 | 3,647 / 0 | never consequential |
+| CRLMV | `rlMapElemValSlot` → `mapValNameOf` + `mvSlotByValNameOr` | 26 / 0 | 408 / 0 | never consequential |
+| WSFMV | `sFieldMapValSlot` → `mvSlotOfValNameFind` | 10 / 0 | 349 / 0 | never consequential |
+| WUFMV | `uFieldMapValSlot` → `mvSlotOfValNameFind` | 2 / 0 | 29 / 0 | never consequential |
+| RLNMV | `rlElemNulMapValMvSlot` → `nulMapInnerName` + `mapValNameOf` | 20 / 0 | 105 / 0 | never consequential |
+| RLMV | `rlElemMapValMvSlot` → `mapValNameOf` | 4 / 0 | 97 / 0 | never consequential |
+| MVSN | `mvUnionIsScalarNull`'s atom tail | 4 / 0 | 26 / 0 | never consequential |
+| RLNIC | `rlElemIsNulNiche` → `nullablePartOf` | 5 / 0 | 0 / 0 | never consequential |
+| MVCK | `mvValCanonKey` → `repNameCanonKey` | 0 / 0 | 4 / 0 | never consequential |
+| MVMV | `mvValInnerMvSlot` → `mapValNameOf` | 1 / 0 | 0 / 0 | never consequential |
+| RLCSK | `rlElemCloSigKey` → paren-strip + `annSigKey` | 0 / 0 | 1 / 0 | never consequential — **now pinned** |
+| ARK | `annRepKindOf` → `null` (the D-CLASSIFY name ladders) | 164 / – | 4,192 / – | reach-only channel |
+| MSSUB | `removeAtomFromSet` → `removeAtomFrom` | 27 / – | 2 / – | reach-only channel |
+| MSIT | `msMemberAtomsOf` → `splitUnionAtoms` (15 sites) | 17 / – | 0 / – | reach-only channel |
+| NBSCAL | `nodeScalarName`'s uncovered-node arm | 873 / – | 48,153 / – | reach-only channel |
+| NBAEL | `arrElemRep`'s uncovered-node arm | 769 / – | 48,153 / – | reach-only channel |
+| RLIN | `rlElemInnerSlot` → `refArrElemName` + `rlSlotByName` | **0** / 0 | **0** / 0 | **NEVER REACHED** |
+| MVRL | `mvValInnerRlSlot` → `refArrElemName` + `rlSlotByName` | **0** / 0 | **0** / 0 | **NEVER REACHED** |
+| MVNUL | `mvValUnionHasNull` → `unionHasAtomTy` | **0** / 0 | **0** / 0 | **NEVER REACHED** |
+| UBAT | `unionHasAtomTy` → `unionHasAtom` | **0** / 0 | **0** / 0 | **NEVER REACHED** |
+| UFTGT | `uFieldTgtStructIdx` → `structIndexByName` | **0** / 0 | **0** / 0 | **NEVER REACHED** |
+| BPAR | `nulRefArrayInnerSlot`'s param arm | **0** / 0 | **0** / 0 | **NEVER REACHED** |
+| BLET | `nulRefArrayInnerSlotOfLet` | **0** / 0 | **0** / 0 | **NEVER REACHED** |
+| NBBOOL | `tyIsNulBool` → `nullablePartOf` | **0** / 0 | **0** / 0 | **NEVER REACHED** |
+
+The `MSIT` row deserves its own note: `msMemberAtomsOf`'s decline — the 15 surviving
+`splitUnionAtoms` iteration sites — is reached by **17 files, every one of them
+`compiler/*.vl`**, and by **0** of 48,153 fuzz programs. The union set ADT's alias-decline
+is a compiler-scale phenomenon; nothing in `tests/cases` exercises it.
+
+**Channel sabotage (the inverted build, corpus).** Every site with reach > 0 lit its `+`
+tag under inversion, at exactly its reach count — `AKIND` 917 · `NBNSTR` 944 · `CPAR` 801 ·
+`DRETN` 777 · `CRET` 760 · `NBCLO` 737 · `NBNLST` 721 · `DLETN` 550 · `WSFRL` 492 ·
+`SFLU` 269 · `UFRL` 193 · `MSNUL` 124 · `RLSR` 75 · `CRLMV` 26 · `NBCLOA` 24 ·
+`UFLUA` 23 · `SFLUA` 22 · `RLNMV` 20 · `FF64` 19 · `FSTR`/`FI64` 18 · `FF32` 16 ·
+`ELETRA` 14 · `WSFMV` 10 · `RLLSR` 8 · `RLNIC` 5 · `RLMV` 4 · `WUFMV` 2 · `MVMV` 1 — and
+the three 100%-consequential sites (`SFTGT`, `MVNIC`, `MSCNT`) correctly lit **nothing**.
+So the consequential channel is live at every measured site, and a 0 there is a
+measurement rather than a dead wire.
+
+Two sites need their `0` read carefully. `ASLOT`'s `+` marker sits *inside* its
+`nameIsRefArray` gate and fired 0 under inversion too — meaning the gate itself is never
+passed; `AKIND` evaluates the identical predicate on the identical nodes and its inverted
+count (917 = its full reach) is the measurement. `MVSN`'s marker sits behind two early
+`return false`s that always take.
+
+### Parsers deleted: 0 — and this time the reason is a measured gap, not an unasked question
+
+Eleven legs — the whole `nameIsRefArray` D-REFARR consumer family — are never consequential
+across **49,422** programs. That is the strongest deletion case this program has ever had,
+and it still does not close, for two mechanisms a 0-firing count cannot rule out:
+
+1. **`nodeTyIx` coverage.** `annBareRefArrSlot` declines whenever the annotation node has
+   no recorded arena type, *whatever the spelling is*. `synthTypeRef` → `recordClonedNodeTy`
+   records `nameToTy(name)`, which is -1 for a name that grammar cannot parse; and the
+   checker's annotation recorders (`nodeTyIx[n.fnRet]`, `[p.parType]`, `[d.letType]`,
+   `[fd.fdType]`) only run for functions it actually checks. A `S[]`-spelled annotation on
+   an unrecorded node makes `nameIsRefArray` say YES where the arena says nothing. Nothing
+   in the corpus or the fuzz corpus produces one; the mechanism exists.
+2. **`rlSlotByName`'s third rung.** `rlSlotOfTy` reproduces rungs 1–2 (exact stored name,
+   `repElemKey` rescan) and deliberately **not** rung 3, the struct-twin name fallback,
+   which has no arena input. That rung is not hypothetical: it is exactly what makes
+   `WSFRL` consequential on 6 corpus files and 12 fuzz programs.
+
+And (2) carries the slice's sharpest finding, a **sibling asymmetry**: `sFieldRefSlot`
+(`WSFRL`) and `variantFieldRefSlot` (`UFRL`) are the same four lines over the struct table
+and the variant table. `WSFRL`'s fall-through is consequential 18 times; `UFRL`'s is
+consequential **0** times in 3,840 reaches. Deleting `UFRL`'s name leg on its 0 would be
+deleting the twin of a leg proven load-bearing. **A 0 does not transfer between siblings**,
+and the minimal witness is `type T0 = {f: {f: string}}` used as `T0[]` at a param while the
+value is spelled inline `{f: {f: string}}[]` — the declared-vs-inline spelling twin rung 3
+exists for (fuzz seed 13, depth 5, `--declared`).
+
+### Reachability study — the eight NEVER-REACHED legs
+
+`RLIN`, `MVRL`, `MVNUL`, `UBAT`, `UFTGT`, `BPAR`, `BLET`, `NBBOOL`: 0 reaches in 49,422
+programs. Per #1099's discipline a 0 is not a proof, so each was worked backwards to the
+mechanism that would generate it and eight programs were constructed against those
+mechanisms. **No reacher was found** — and no impossibility could be argued either. These
+are the specific blockers, recorded so the next attempt starts here rather than at the
+sampling:
+
+- **`RLIN`** needs a ref-list slot whose element is a NESTED array *and* whose `rlElemTyIx`
+  is uncovered. Uncovered rl rows are common (`RLNIC` finds 5, all inline-shape element
+  rows whose stored name is a `#anonN` the resolver declines) — but an `#anonN[]` element,
+  i.e. a nested array of an inline shape, is a **loud reject** today (`emitProgram: nested
+  arrays are not supported`). The two preconditions do not currently intersect.
+- **`BPAR`/`BLET`** are reachable only *through* `DRETN`/`DLETN`'s name leg: their guards
+  (`paramNulRefArray`, `letIsNulRefArray`) answer via `annNulRefArrSlot` whenever the arena
+  covers the node, and in that case the inner slot resolves off the same call. So these two
+  are downstream of the D-REFARR question, not independent of it.
+- **`UFTGT`** is the variant twin of `SFTGT`, which is 100% consequential on 6 corpus
+  files — all of them ANON rows minted by object literals (`objects/pass.vl`'s
+  `{a: {x: 7}, b: 2}`). A variant row's field element names come from the union arm's
+  *spelling*, never a `#anonN`; and a nested-struct field on a union variant is itself a
+  loud reject (`only i32 / boolean / string / array union-variant fields are supported`).
+- **`MVRL`/`MVNUL`/`MVCK`** need an uncovered mv row. Every `mvValName.push` is paired with
+  `recordMvValTyIx` at the single mint site, so the only gap is a value spelling
+  `fieldElemTyIxOfName` cannot resolve; four fuzz programs reach `MVCK` that way, none
+  consequential, and none of them is a ref-list or nested-map value.
+- **`UBAT`** needs `unionHasAtomTy` called with a union NAME whose row `unMemTys` does not
+  cover. Uncovered member-set TEXT is common (`MSNUL` 6,500 reaches) — but those are
+  *narrowed subsets*, never registered rows, and `unionHasAtomTy`'s callers all pass a
+  registered union name. The two populations do not overlap.
+- **`NBBOOL`** is `tyIsFuncType`'s shape (`if nodeTyIxOf(tyIx) >= 0 { return … }`) — and
+  `tyIsFuncType` has ALREADY retired its name leg in this tree on the same gate. It is the
+  closest thing to a free deletion here, and it is still gated on the same unproven
+  `nodeTyIx`-totality claim as (1) above.
+
+### The one pin this slice lands
+
+`tests/cases/closures/map-value-nullable-closure-list-elem-sigkey.vl` — the single shape in
+49,422 measured programs that reaches `rlElemCloSigKey`'s name fall-through
+(a `{[string]: (() => boolean | null)[]}` map value: a list of NULLABLE-returning closures).
+0 corpus files, 1 fuzz program (seed 5, depth 6, plain). That fall-through computes a
+`$fnsig` key — the closure ABI's identity — so its failure mode is an iso-recursively
+distinct functype and a `ref.cast` trap, never a loud reject. The corpus now carries it.
+
+### What this changes about the program's strategy
+
+The SCORECARD CORRECTION said: kill the SOURCES, not the call sites. This map says which
+sources are worth killing, and it is a much smaller set than the call counts suggest.
+
+- **7 of 48** decline paths are load-bearing. Three of those seven fall through to
+  `structIndexByName` / `nonNullMemberCountOf`, which are **nominal identity and a count** —
+  explicitly not targets of this program. The genuinely load-bearing *parses* are
+  `structIdxOfElemName` (`RLSR`), `nullablePartOf` (`RLLSR`), `nulRefMapValInnerOf`
+  (`MVNIC`), `unionHasAtom` (`MSNUL`) and `rlSlotByName`'s twin rung (`WSFRL`). Five.
+- **38 of 48** never change an answer, and 11 of those 38 are the single `nameIsRefArray`
+  family. Retiring them is ONE piece of work — **prove `nodeTyIx` totality for annotation
+  nodes** (the C1 endgame) and **give `rlSlotByName`'s struct-twin rung an arena input** —
+  after which eleven legs fall together. That is the highest-leverage item this program has,
+  and this map is what identifies it as one item rather than eleven.
+- The measurement also refutes a tempting shortcut: "delete the legs that never fire". Two
+  of the seven load-bearing legs (`SFTGT`, `MVNIC`) fire on **6 corpus files each** — well
+  inside the range a reader would dismiss as noise — and both are consequential **100%** of
+  the time they fire. Low reach is not low stakes.
+
+### Gate
+
+Source-identical to master apart from the pin and this section, so the corpus A/B, the
+66-case battery and the shared-instance batch are byte-identical by construction. The
+measurement itself: probe and inverted probe each `refresh-compiler.sh` RC=0 from the
+pinned master seed; corpus sweep 1,269 files per build; fuzz 48,153 programs. Standing gate
+on the landed tree: `refresh-compiler.sh` / `rep-fuzz-check.sh` / `native-fixpoint.sh` /
+`lint-self.sh` / `SELFHOST_NATIVE_ALIGN=1 deno task test` / `fuzz-sweep.sh` all RC=0.
