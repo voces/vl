@@ -51,6 +51,14 @@ The compiler seed is resolved in order:
 An explicit `--compiler`/env is honoured strictly; the embedded copy is the final
 fallback and exists only in a release build (next section).
 
+`$VL_GC` picks the garbage collector `vl run` gives your program — a pure runtime
+tuning dial, with no effect on what the program computes:
+`auto` (default; tracing, collects cycles) · `tracing` · `refcount` (shorter pauses,
+much lower throughput, **cannot reclaim cycles**) · `none` (never collects; traps when
+the heap fills — short batch runs only). It applies to the `vl` host; a module you
+ship to a browser gets whatever that engine provides.
+Background and measurements: [`docs/internals/memory-gc-design.md`](./docs/internals/memory-gc-design.md).
+
 A **self-contained release binary** bakes the seed in, so a shipped `vl` is one
 file that runs anywhere with no out-of-band asset:
 

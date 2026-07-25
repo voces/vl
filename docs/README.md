@@ -23,6 +23,7 @@ Compiler internals, self-hosting, contributor and agent process.
 - [`internals/cli-design.md`](internals/cli-design.md) — the `vl` command-queue pump.
 - [`internals/genesis-design.md`](internals/genesis-design.md) — seed bootstrap and lineage.
 - [`internals/codegen-architecture.md`](internals/codegen-architecture.md) — wasm emitter architecture.
+- [`internals/memory-gc-design.md`](internals/memory-gc-design.md) — WasmGC vs linear memory; collector choice.
 - [`internals/codegen-builder-migration-plan.md`](internals/codegen-builder-migration-plan.md) — emitter builder refactor plan.
 - [`internals/monomorphization-design.md`](internals/monomorphization-design.md) — generic instantiation.
 - [`internals/match-design.md`](internals/match-design.md) — `match` exhaustive value/variant dispatch.

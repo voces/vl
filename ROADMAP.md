@@ -415,6 +415,26 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   - **LSP quick-fixes** (code actions): "remove unused binding" / "prefix with `_`" / "`let`→`const`".
     Diagnostics already carry stable `code`s; the LSP has no code-action provider yet.
   - Cross-cutting: thread `severity` through all remaining error variants; consistent message style.
+- 🟡 **B-mem. Linear memory — make it a design, not a scratch page**
+  (design: `docs/internals/memory-gc-design.md`). The collector half shipped (`vl run` on the
+  engine's tracing collector + the `$VL_GC` knob). REMAINING, in order:
+  - **Audit gaps** (small, mechanical): SEVEN of the ten memory builtins declared in
+    `typecheck.vl`'s default scope have no emitter lowering — they typecheck, then fail at emit
+    with `call to unknown function` (safe, but the diagnostic reads like a typo). Either lower them
+    or stop declaring them, and say "not implemented". The store/load matrix is also asymmetric —
+    four `__store_*__` widths, only `__load_i32__`.
+  - **Bulk host I/O.** Export `ioMem` and implement the staging ABI `scripts/vl-host` already
+    documents and probes for (`<name>Reserve` / `<name>Load`, plus an `rbyte` bulk sibling): today
+    source crosses at ONE host call per code point (~3.4M per self-compile) and emitted bytes at one
+    call per byte (~1M).
+  - **The tier itself** — an allocator (bump/arena), a data section, and the `Buffer`/`Array<T>`
+    escape (`collections-design.md` §OQ.7), designed once for FFI / SIMD / bulk-I/O rather than
+    accreted as intrinsics. Not a second object model → `DECISIONS.md`.
+- ⬜ **B-alloc. Allocate less** (the real answer to GC pressure, `memory-gc-design.md` §4.4).
+  Heap2Local on the DEFAULT path (today `wasm-opt` runs only under an explicit `-O`, so the pass
+  `DECISIONS.md` leans on is opt-in); representation inference (B6 §VL.7) to drop the
+  `{backing,len,cap}` wrapper for never-grown lists; more union-arm niche encodings to drop
+  `{tag,value}` boxes; `Set`'s dead `vals` array (B6a-opt).
 - ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
   position and emit it.
 - ⬜ **B-chore-liststore-fuse. Re-fuse the three split-form list stores in `emit_rep.vl`**

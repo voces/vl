@@ -99,6 +99,27 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   WasmGC structs/arrays; linear memory is an opt-in escape hatch;
   escape-analysis stack allocation is a later optimization. Lean on binaryen's
   Heap2Local rather than hand-rolling SROA. (B1)
+- **No second, self-managed object model — linear memory stays ONE scoped tier.**
+  A linear-memory heap would unlock what WasmGC structurally forbids (SIMD over
+  bytes, inline aggregates, slices-as-views, explicit free), but it costs a
+  hand-written tracing collector plus a shadow stack on every call (wasm cannot
+  scan a frame's locals for roots) and it retires the wasm validator as VL's
+  memory-safety proof — today an emitter type confusion is a loud invalid module.
+  A whole-program "own memory" mode would also double the corpus/fuzz/fixpoint
+  surface for a mode almost nobody would pick. The scoped alternative (a `Buffer`
+  escape for FFI/SIMD/bulk-I/O inside a GC program) gets most of the win for one
+  type. The one argument that WOULD justify a real second backend is running on
+  non-GC engines (WAMR/wazero/wasm2c) — a distribution call, not a perf one.
+  (`docs/internals/memory-gc-design.md`)
+- **The collector is a RUNTIME knob, never language surface.** `vl run` defaults to
+  the engine's tracing collector; `$VL_GC` (`auto|tracing|refcount|none`) overrides
+  it. Deferred reference counting — the previous default — is ~21× slower on
+  allocation-heavy code and, because it cannot reclaim cycles, holds ~175× the
+  memory on cyclic garbage. An env var rather than a `--gc` flag because the engine
+  is built before any guest code runs and all `vl` flag parsing lives in the guest.
+  Nothing in a `.vl` file may depend on the choice: a module shipped to a browser
+  gets whatever that engine provides. The compiler's own null collector (one-shot
+  batch work) stays internal and is NOT routed through the knob.
 - **Keep binaryen (unlike antlr4).** Pure WASM/JS, does the IR/validate/optimize
   heavy lifting, and is a library binding that does _not_ block self-hosting —
   it stays for the TS compiler. (Track B)
