@@ -913,13 +913,13 @@ compiler instance per side — 645 outputs each, **0 traps, 0 diffs** vs master.
 `A-LIT9` 24 · `C-FOR` 8 · `A-NRA` 7 · `B-ST` 3 · `B-POP` 2 · `A-FOR` 2 · `A-CTX9` 2 ·
 `B-AN` 1.
 
-**Three sites are NOT migrated, on zero evidence — `rlSlotsLayoutTwin`'s kind-9 arm and
-its struct tail** (`A-TW9`, `B-TWS`, `C-TW`). A *reach* marker — one that fires on merely
-ENTERING the chokepoint, covered or not — fires on **0 of 1,265** corpus files and **0 of
-25,200** fuzz programs for all three. The function is reached (its singleton-kind arms
-answer), but the nested-list arm and the struct fall-through are not, on today's surface.
-Unverifiable ⇒ unmigrated; they keep the element-NAME path. This is the sixth consumer in
-this program to stand correctly unmigrated for want of a sabotage witness.
+**Three sites are NOT migrated here — `rlSlotsLayoutTwin`'s kind-9 arm and its struct
+tail** (`A-TW9`, `B-TWS`, `C-TW`). A *reach* marker — one that fires on merely ENTERING
+the chokepoint, covered or not — fires on **0 of 1,265** corpus files and **0 of 25,200**
+fuzz programs for all three, so at this slice they are unverifiable and keep the
+element-NAME path. (The reachability study below later *constructed* the reachers and
+migrated them; the 0-firing measurement was a property of the sampled surface, not a
+proof of deadness.)
 
 **Gate-channel sabotage, per site.** An arena leg answering an in-range but OFF-BY-ONE
 slot/row (C inverted, F key-mangled) — broken only where that site's migrated leg answers,
@@ -1100,7 +1100,7 @@ condition names two things, so measure those:
 | struct/variant field LITUNION (atom-rep) classified by re-parsing a NAME | 4 sites | **0** (`tyIsLitUnion` / `tyIsLitUnionArray` over the D5 sidecars) |
 | `structFieldCodesEq`'s referenced ROW resolved from a recorded NAME | yes | **no** (`repStructRowByTy`; the `ea != eb` identity fast path stays, deliberately) |
 | union-BOX tag / widening chosen by comparing a member set's rendered ATOMS | 16 sites | **0** (`unMemHasAtom` → `unionHasAtomTy`; the atom scan is the fall-through). 12 raw `unionHasAtom` calls remain, none of them the box ABI — see D-UNION batch 4 |
-| ref-list ELEMENT structure re-derived by string surgery on the stored name (its inner slot / struct row / niche / `$fnsig`) | 22 sites | **16 migrated** (`rlElemTyIx` → `rlElemInnerSlot`/`rlElemStructRow`/`rlElemIsNulNiche`/`rlElemCloSigKey`); 3 `rlSlotsLayoutTwin` sites left on the name path, measured **unreachable** — see D5-final (a). The map-value / variant-index / name-producing readers are untouched |
+| ref-list ELEMENT structure re-derived by string surgery on the stored name (its inner slot / struct row / niche / `$fnsig`) | 22 sites | **19 migrated** (`rlElemTyIx` → `rlElemInnerSlot`/`rlElemStructRow`/`rlElemIsNulNiche`/`rlElemCloSigKey`) — the last 3 were `rlSlotsLayoutTwin`'s kind-9 arm + struct tail, reached and migrated by the reachability study below. The map-value / variant-index / name-producing readers are untouched |
 | map-VALUE structure re-derived by string surgery on the stored name (its inner ref-list slot / inner mv slot / null atom / niche / `scalar\|null` peel / twin key) | 9 sites | **9 migrated** (`mvValTyIx` → `mvValInnerRlSlot`/`mvValInnerMvSlot`/`mvValUnionHasNull`/`mvValNulRefNicheAt`/`mvValUnionScalarNullAt`/`mvValCanonKey`) — see D5-final (b). The union-box name ARGUMENT, the `nameIsRefArray` guard and the 3 name-producing readers stay |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
@@ -1210,7 +1210,9 @@ Measured, not asserted. The reproducible commands are in "How to verify" and the
 ### The 6 genuinely unmigrated, each with its measured reason
 
 - `rlSlotsLayoutTwin` ×4 — a **reach** marker fired on 0/1265 corpus files and 0/25,200 fuzz
-  programs. Unverifiable, so not migrated (#1096).
+  programs. Unverifiable at the time, so not migrated (#1096). **Superseded**: the
+  reachability study below reached the kind-9 arm and the struct tail and migrated them;
+  the ×2 map-value sites (the kind-3 arm) remain.
 - `refListElemNameOfExpr` — a name **producer**; it retires with its consumers, not here.
 - `compositionMapReadSlot` — the map-element map-value slot, deferred in #1096's enumeration.
 
@@ -1221,6 +1223,42 @@ every layer that decides structure, representation, or ABI. Names persist for re
 for nominal identity, and as the fall-through of ladders whose arena leg decides first.
 That was the stated terminal condition, and it holds.
 
-**Seven consumers stand deliberately unmigrated** across the program because sabotage
+**Six consumers stand deliberately unmigrated** across the program because sabotage
 measured them unverifiable (0 firings) — no test or fuzz program could prove a change
 correct. That is the intended outcome of the method, not a shortfall.
+
+## Reachability study — `rlSlotsLayoutTwin`'s kind-9 arm and struct tail
+
+A 0-firing reach marker says *the sampled surface does not reach this*, not *nothing
+reaches this*. Worked backwards from the arm preconditions instead of sampling: what makes
+two DISTINCT ref-list slots of the same kind exist at once, and which caller compares them.
+
+The answer is the **canonical-key/rep-key split**. `repCanonKey` (the variant + map-value
+dedup key) EXPANDS a declared struct to its field shape, while `repElemKey` (the ref-list
+intern key) keeps a declared struct NOMINAL. So `{ns: A[]}` and `{ns: B[]}` with `type A =
+{v:i32}` / `type B = {v:i32}` key the same at the layer that asks the question and intern
+DISTINCT slots at the layer that answers it — exactly the precondition. Two programs, both
+found on the first attempt:
+
+- struct tail — twin variants with a ref-list field of declared-twin elements
+  (`tests/cases/unions/variant-twin-reflist-field-struct-twin-elem.vl`);
+- kind-9 arm — the same with `A[][]`/`B[][]`
+  (`tests/cases/unions/variant-twin-nested-reflist-field-struct-twin-elem.vl`), and through
+  the map-value caller with `{[string]: A[]}` (the vals list's element IS a ref array, so
+  the map slot pair lands on kind 9).
+
+Both arms are load-bearing: with either forced to "not twins", the pins TRAP (variant heap
+split under a structural crossing) or emit INVALID WASM (map-struct heap split). Both are
+now on the arena chokepoints (`rlElemInnerSlot`, `rlElemStructRow`, `rlElemIsNulNiche`), and
+a leg probe confirms the ARENA leg is what answers in every reaching program.
+
+Two guards inside the arms stay **unverifiable** and were measured as such: forcing the
+`| null` niche-parity refusal off, and forcing the struct-row comparison to always agree,
+each leave the corpus (1,269 files) and the 66-case battery byte- and run-identical. Every
+pair that reaches these arms comes pre-filtered by canonical-key equality, so the arms only
+ever answer "twin" on today's surface; their refusal direction has no witness.
+
+The kind-3 (map-element) arm is reachable too — `tests/cases/unions/variant-twin-map-elem-list-field.vl`
+and, already in the corpus, `tests/cases/maps/map-value-twin-heap.vl` — but its two sites
+need the tri-state `mvSlotOfMapValNameOrMono` sentinel untangled first (the D3′ collision
+above), so they stay on the name path with a pin now guarding them.
