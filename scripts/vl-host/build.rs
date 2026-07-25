@@ -27,7 +27,7 @@ fn main() {
     let out =
         PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("vl-compiler.wasm");
 
-    std::fs::copy(&seed, &out).unwrap_or_else(|e| {
+    let bytes = std::fs::read(&seed).unwrap_or_else(|e| {
         panic!(
             "embed-seed: cannot read the compiler seed `{}`: {e}\n  \
              build it first (scripts/fetch-seed.sh or scripts/refresh-compiler.sh), \
@@ -35,6 +35,20 @@ fn main() {
             seed.display(),
         )
     });
+    std::fs::write(&out, &bytes).expect("embed-seed: staging the seed into OUT_DIR");
+
+    // The embedded seed's identity, baked in as `$VL_SEED_KEY`, so the runtime can
+    // name a compilation cache for bytes that have no path (see `seed_cache_path`).
+    // Computed HERE rather than at startup because hashing a ~1 MB seed on every
+    // invocation would cost a visible slice of the very latency the cache exists to
+    // remove. FNV-1a: no dependency, and the key only has to be stable and
+    // collision-free across seeds, not cryptographic.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in &bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    println!("cargo:rustc-env=VL_SEED_KEY={h:016x}");
 
     println!("cargo:rerun-if-changed={}", seed.display());
     println!("cargo:rerun-if-env-changed=VL_EMBED_SEED");
