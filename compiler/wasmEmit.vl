@@ -129,7 +129,6 @@ import {
   numLexIsDecimal,
   numTextIsFloat,
   objFieldVal,
-  removeAtomFrom,
   retF32Flag,
   retF64Flag,
   retI64Flag,
@@ -469,6 +468,7 @@ import {
   mfResultSlotOf,
   mfSrcLocalFor,
   monoIsRowMatch,
+  msMemberAtomsOf,
   mvListValKind,
   mvSlotNullable,
   mvSlotOfMapValNameOrMono,
@@ -496,6 +496,7 @@ import {
   refArrTagOf,
   refListSlotOfExpr,
   refPushScratchBaseFor,
+  removeAtomFromSet,
   restoreNarrow,
   retNulMapFlag,
   retNulRefArrFlag,
@@ -3011,14 +3012,34 @@ function emitUnionUnionEq(
     )
   }
   // The shared non-null arms (matched by atom — atoms tag globally).
+  // D-UNION set ADT: BOTH operands' member lists come from the RECORDED member
+  // columns when the pool covers them — `msMemberAtomsOf` hands back exactly the
+  // atoms `splitUnionAtoms` would, in the row's recorded (box-tag ABI) order — so
+  // the intersection is a walk of two recorded lists instead of one split plus a
+  // re-split of `rname` per left atom (`unionHasAtom` splits on every call). The
+  // membership compare stays the VERBATIM spelling compare `unionHasAtom` performs,
+  // not `unMemHasAtom`'s keyword-primitive test: an arm spelled `(() => i64)` or a
+  // litunion alias `K0` is a member here and answers NO there. Each side declines
+  // independently — a NARROWED subset spelling the pool never interned re-splits,
+  // exactly as before.
   const lAtoms: string[] = []
-  splitUnionAtoms(lname, lAtoms)
+  if !msMemberAtomsOf(lname, lAtoms) { splitUnionAtoms(lname, lAtoms) }
+  const rAtoms: string[] = []
+  const rOk = msMemberAtomsOf(rname, rAtoms)
   const arms: string[] = []
   let ai = 0
   while ai < lAtoms.length {
-    if lAtoms[ai] != "null" && unionHasAtom(rname, lAtoms[ai]) {
-      arms.push(lAtoms[ai])
+    let inR = false
+    if rOk {
+      let rj = 0
+      while rj < rAtoms.length {
+        if rAtoms[rj] == lAtoms[ai] { inR = true }
+        rj = rj + 1
+      }
+    } else {
+      inR = unionHasAtom(rname, lAtoms[ai])
     }
+    if lAtoms[ai] != "null" && inR { arms.push(lAtoms[ai]) }
     ai = ai + 1
   }
   if (
@@ -3185,8 +3206,13 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
       if shRecv is Ident {
         const shSet = currentStructNarrowSetOf(shRecv.identName, fnIx)
         if shSet != "" {
+          // D-UNION set ADT — the narrowed set's members from the recorded member
+          // columns (the row's recorded order IS the box-tag order this dispatch
+          // walks); a narrowed subset the pool has not interned re-splits.
           const shAtoms: string[] = []
-          splitUnionAtoms(shSet, shAtoms)
+          if !msMemberAtomsOf(shSet, shAtoms) {
+            splitUnionAtoms(shSet, shAtoms)
+          }
           // Validate: every member a struct VARIANT carrying the field as i32.
           const shVis: i32[] = []
           const shFis: i32[] = []
@@ -4393,8 +4419,10 @@ function emitMapGetOr(
 // (the checker's non-null result type), a multi-member `… | null` to the NON-null union box.
 function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
   const uvn = mvValName[mslot]
+  // D-UNION set ADT — the map value union's members from the recorded member
+  // columns; an un-interned value spelling re-splits (the ladder fall-through).
   const atoms: string[] = []
-  splitUnionAtoms(uvn, atoms)
+  if !msMemberAtomsOf(uvn, atoms) { splitUnionAtoms(uvn, atoms) }
   const stashL = fnMvValStashLocal(mslot)
   // raw box: hit → stored (ref null $uBox); miss → the null-tagged box.
   pushMapScr(body, 5)          // entry
@@ -4415,7 +4443,7 @@ function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
   // A `scalar | null` value (exactly one non-null scalar member) peels to the RAW scalar — take
   // the default on the null tag, else unbox the scalar payload.
   if atoms.length == 2 {
-    const member = removeAtomFrom(uvn, "null")
+    const member = removeAtomFromSet(uvn, "null")
     const ak = valueAtomKind(member)
     const vb = vbHeapIdxOfAtom(member)
     if vb < 0 {
@@ -12781,7 +12809,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
     const cunm = unionNameOfIdent(lhs.identName, fnIx)
     if cunm != "" {
       if isValueUnionName(cunm) && unionHasAtomTy(cunm, "null") {
-        const crest = removeAtomFrom(
+        const crest = removeAtomFromSet(
           currentNarrowSetOf(lhs.identName, fnIx),
           "null",
         )
@@ -12842,7 +12870,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
     const kunm = unionNameOfExpr(e.binLeft, fnIx)
     if kunm != "" {
       if isValueUnionName(kunm) && unionHasAtomTy(kunm, "null") {
-        const krest = removeAtomFrom(kunm, "null")
+        const krest = removeAtomFromSet(kunm, "null")
         const kak = valueAtomKind(krest)
         if kak >= 0 && kak != 6 {
           if kak == 2 {
@@ -12952,7 +12980,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
         if sFieldTypeAt(msi, mfi) == 16 {
           const munm = sFieldElemNameAt(msi, mfi)
           if isValueUnionName(munm) && unionHasAtomTy(munm, "null") {
-            const mrest = removeAtomFrom(munm, "null")
+            const mrest = removeAtomFromSet(munm, "null")
             const mak = valueAtomKind(mrest)
             if mak >= 0 && mak != 6 {
               if mak == 2 {

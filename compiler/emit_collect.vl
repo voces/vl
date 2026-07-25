@@ -110,7 +110,6 @@ import {
   strLess,
   tyIsFuncType,
   tyNameOf,
-  unionHasAtom,
   unionStructAliasShape,
   unwrapParen,
 } from "./emit_base"
@@ -233,6 +232,7 @@ import {
   uVarHeap,
   uVarTwin,
   uVariants,
+  unMemAtoms,
   unMemTyCount,
   unMemTyStart,
   unMemTys,
@@ -353,6 +353,7 @@ import {
   mfResultKindOf,
   mfResultSlotOf,
   monoUnwrapParens,
+  msMemberAtomsOf,
   mvCanonRepOf,
   mvCanonValName,
   mvShapeOfValName,
@@ -396,6 +397,7 @@ import {
   structIndexOfTypeName,
   synthTypeRef,
   unionArmSigKey,
+  unionSetHasNull,
   variantIndexOf,
   variantIndexOfLet,
   variantNestedShapeOk,
@@ -728,8 +730,29 @@ export function collectCloSigs() {
   // (a closure union arm flips it), so a program without one emits byte-identical types.
   let ui = 0
   while ui < unMemberSet.length {
+    // D-UNION set ADT — this walk iterates the ROW, so it reads the row's own
+    // recorded member column directly (`recordUnMemTys` split the set ONCE, at the
+    // mint, and the columns keep that exact atom order). No `msSetOfText` text
+    // bridge is needed and the 31-member mask limit does not apply: the row index
+    // IS the key. The split survives only for a row the recorder missed or one
+    // whose slice outruns the reference columns (the self-heal reset).
     const atoms: string[] = []
-    splitUnionAtoms(unMemberSet[ui], atoms)
+    let uSt = -1
+    if ui < unMemTyStart.length {
+      uSt = unMemTyStart[ui]
+      if uSt >= 0 {
+        if uSt + unMemTyCount[ui] > unMemAtoms.length { uSt = -1 }
+      }
+    }
+    if uSt >= 0 {
+      let um = 0
+      while um < unMemTyCount[ui] {
+        atoms.push(unMemAtoms[uSt + um])
+        um = um + 1
+      }
+    } else {
+      splitUnionAtoms(unMemberSet[ui], atoms)
+    }
     let uj = 0
     while uj < atoms.length {
       const ak = unionArmSigKey(atoms[uj])
@@ -911,9 +934,16 @@ function shapeHasCloField(nm: string) {
         if nameIsClosureArray(ftxt) || nullClosureArrElem(ftxt) != "" {
           return true
         }
-        if unionMemberCount(ftxt) > 1 {
-          const shcAtoms: string[] = []
-          splitUnionAtoms(ftxt, shcAtoms)
+        // D-UNION set ADT — a field type that IS a registered union row's member
+        // set answers from the recorded member column, and the CARDINALITY gate
+        // becomes that list's length (`unionMemberCount` is the counting dual of
+        // `splitUnionAtoms`, so the two gates are the same predicate). An
+        // un-interned field spelling keeps the count-then-split pair.
+        const shcAtoms: string[] = []
+        if !msMemberAtomsOf(ftxt, shcAtoms) {
+          if unionMemberCount(ftxt) > 1 { splitUnionAtoms(ftxt, shcAtoms) }
+        }
+        if shcAtoms.length > 1 {
           let shc = 0
           while shc < shcAtoms.length {
             const shcA = shcAtoms[shc]
@@ -1205,7 +1235,7 @@ export function computeVoidFns() {
               // i32 expression but `stmtIsTailValue` rejects — still classifies void.
               if (
                 !blockTailIsValue(fn.fnBody, fnStmts[i]) &&
-                !unionHasAtom(inferRetNameOf(fn.fnName), "null") &&
+                !unionSetHasNull(inferRetNameOf(fn.fnName)) &&
                 !fnReturnsClosure(i)
               ) {
                 // A function whose tail is a function VALUE (`(a) => (b) => …`) returns a
@@ -3869,8 +3899,6 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // register here, so decline.
   if nameIsSingleShape(name) { return 0 }
   if !isVariantBoxUnion(stmts, name) { return 0 }
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
   // Field unions of the shape arms must already be registered HERE (they push their
   // own un*/uVariants rows — after this union's rows are pushed, an interleaved
   // registration would corrupt its variant slice). The arm-field pre-registration is
@@ -3882,6 +3910,21 @@ function registerInlineUnion(stmts: i32[], name: string) {
   unNames.push(name)
   unMemberSet.push(name)
   recordUnMemTys(name) // D-UNION foundation
+  // D-UNION set ADT — the member list below is the row JUST recorded, not a second
+  // split of the same string: `recordUnMemTys` splits `name` ONCE and appends exactly
+  // `unMemTyCount` verbatim spellings to `unMemAtoms`, so the column's TAIL is that
+  // atom list. Reading it back is total by construction (it holds even across the
+  // recorder's own self-heal reset, which clears the reference columns and refills
+  // them in the same call), which is why this parse is DELETED rather than laddered.
+  const atoms: string[] = []
+  const uRow = unNames.length - 1
+  const uMemN = unMemTyCount[uRow]
+  const uMemBase = unMemAtoms.length - uMemN
+  let uMemI = 0
+  while uMemI < uMemN {
+    atoms.push(unMemAtoms[uMemBase + uMemI])
+    uMemI = uMemI + 1
+  }
   unVarStart.push(uVariants.length)
   // Only STRUCT members occupy variant slots (a `null` atom rides the tag, a value-atom
   // tags via `scalarTagOf` and boxes into the shared value boxes). Count + push the
@@ -4371,6 +4414,17 @@ function registerCollapsedUnionName(stmts: i32[], node: i32) {
 // is `isUName` after the walk (skip). Fires exactly on the anonymous-nominal struct-union /
 // variant-box residual (the disable-then-diff probe pinned it to 6 corpus shapes). Returns 0,
 // or -1 (a `registerInlineUnion` `emitFail`).
+// The #1057 hand-off ("decide on the RECORDED member count `inferRetMemCountAt`, not on a
+// re-split of the name") was measured here and is **REFUTED**: `retMemCountOf` walks the
+// recorded arena type's union/nullable SPINE, and a litunion member's spine leaf count is
+// not the rendered name's atom count. An additive probe over the 1,270-file corpus
+// disagreed on **4** files — all of them the name `K0 | null`, where the renderer emits the
+// litunion ALIAS as ONE atom (2) and the spine walk counts its literal members (3, 4). Both
+// answers clear the `>= 2` gate there, so the corpus is byte-identical either way, but the
+// dual is unsound in the other direction: a bare inferred `K0` return renders ONE atom and
+// records >= 2, which would register a union this compiler does not register. The faithful
+// dual is a count recorded by the NAME PRODUCER (how many atoms it joined), not by a walk of
+// the type it rendered — a `typecheck.vl` change, so it is not made here.
 function registerInferRetNominalUnion(stmts: i32[], nm: string) {
   if isUName(nm) { return 0 }
   const atoms: string[] = []
@@ -4740,17 +4794,24 @@ export function collectFnValUse() {
       // the alias-blindness, not before.
       let fvSb = nullablePartOf(tyNameOf(i))
       if fvSb == "" { fvSb = tyNameOf(i) }
+      // D-UNION set ADT — the arms come from the recorded member column when the
+      // annotation IS a registered row's member set, and the cardinality gate is
+      // that list's length (the counting dual identity, see `shapeHasCloField`).
+      const fvAtoms: string[] = []
+      if !nameIsSingleShape(fvSb) {
+        if !msMemberAtomsOf(fvSb, fvAtoms) {
+          if unionMemberCount(fvSb) > 1 { splitUnionAtoms(fvSb, fvAtoms) }
+        }
+      }
       if nameIsSingleShape(fvSb) {
         if shapeHasCloField(fvSb) { fnValUsed = true }
-      } else if unionMemberCount(fvSb) > 1 {
+      } else if fvAtoms.length > 1 {
         // A UNION whose ARM is a single-shape struct carrying a closure / closure-array
         // field (`{…, z: (() => i64)[] | i32} | {w: i32} | {q: i64}`): the arm's field
         // cell is a closure fat-pointer whose narrowed member-array call `call_ref`s
         // through it, so flip the machinery on even when the value is only ever a
         // non-closure arm (no lambda elsewhere) — the union-arm sibling of the
         // single-shape case above (fuzz F5gJXz declared seed 530559367 case_00309).
-        const fvAtoms: string[] = []
-        splitUnionAtoms(fvSb, fvAtoms)
         let fva = 0
         while fva < fvAtoms.length {
           if nameIsSingleShape(fvAtoms[fva]) {

@@ -2098,3 +2098,161 @@ leg forced to decline, i.e. the deletion made wrong) **163** corpus diffs and **
 diffs, so the A/B has power at these sites. `refresh-compiler.sh` / `rep-fuzz-check.sh` /
 `native-fixpoint.sh` / `lint-self.sh` / `SELFHOST_NATIVE_ALIGN=1 deno task test` (1,954
 passed) / `fuzz-sweep.sh` all RC=0.
+
+## D-UNION-ATOM — the union member-SET algebra in the emitter's two big files (#1108)
+
+D-UNION-SET (#1104) built the representation — `unMemAtoms` / `unMemAtomIds` / `unMemKinds`
+recorded once per row by `recordUnMemTys`, sets as `(row, mask)` — and migrated 33 consumers
+in `emit_classify`. It left an explicit hand-off: *"the 4 `removeAtomFrom` + 1 `unionHasAtom`
+sites in `wasmEmit.vl` and the 1 in `emit_collect.vl` — one call rename each; the exports are
+ready."* This slice takes `wasmEmit.vl` + `emit_collect.vl`, and the hand-off turned out to be
+**five** renames and one **wrong** rename.
+
+### The enumeration (local-aware, by resolver called)
+
+`scan_sites.py`-style scan of both files for every call to the member-set algebra
+(`splitUnionAtoms` / `unionHasAtom` / `removeAtomFrom` / `unionMemberCount` /
+`nonNullMemberCountOf`) and to the atom algebra (`valueAtomKind` / `scalarTagOf` /
+`vbHeapIdxOfAtom`), each with its enclosing function and — for a bare-identifier argument —
+the `let`/`const`/param that bound it (method note 9). **20 member-SET algebra calls** (11
+`splitUnionAtoms`, 4 `removeAtomFrom`, 3 `unionMemberCount`, 2 `unionHasAtom`) and **30 atom
+algebra calls**, of which 12 are the CONSTANT `scalarTagOf("null")` (a keyword, not a parse)
+and 21 `unionHasAtomTy` calls that D-UNION already migrated.
+
+The enumeration corrected the hand-off in one place. `wasmEmit`'s single `unionHasAtom` is
+**not** a `unionSetHasNull` site (its atom is not `null`) and **must not** become
+`unionHasAtomTy`: `unMemHasAtom` is deliberately EXACT over keyword primitives, so it answers
+**0 — not "uncovered"** — for a closure arm `(() => i64)` or a litunion alias `K0`, both of
+which `unionHasAtom` reports as members. Renaming it would have silently dropped shared arms
+from a union `==`. It is migrated instead as a **recorded-member scan** (`msMemberAtomsOf` on
+the right operand, then the same verbatim spelling compare `unionHasAtom` performs).
+
+### 13 sites migrated
+
+| tag | site | what moves | corpus reach | fuzz reach | sabotage (vs migrated, corpus) |
+|---|---|---|---|---|---|
+| WSUB1 | `emitMapGetOrUnionBox` | `removeAtomFrom` → `removeAtomFromSet` | 3 | 87 | 3 build-fail |
+| WSUB2 | `emitCoalesce` (ident LHS) | ″ | 12 | 0 | 12 build-fail |
+| WSUB3 | `emitCoalesce` (call LHS) | ″ | 2 | 0 | 2 build-fail |
+| WSUB4 | `emitCoalesce` (field LHS) | ″ | 2 | 0 | 2 build-fail |
+| WHAS | `emitUnionUnionEq` | `unionHasAtom` → recorded-member scan | 4 | 0 | 4 byte-diff + 2 run-status |
+| WIT1 | `emitUnionUnionEq` | `splitUnionAtoms` → `msMemberAtomsOf` | 4 | 0 | 4 byte-diff |
+| WIT2 | `emitMem` (shared-field dispatch) | ″ | 4 | 0 | 3 byte-diff |
+| WIT3 | `emitMapGetOrUnionBox` | ″ | 5 | 113 | 4 build-fail + 1 byte-diff |
+| CHAS | `computeVoidFns` | `unionHasAtom(.,"null")` → `unionSetHasNull` | 13 | 0 | 13 byte-diff + 2 run-status |
+| CIT1 | `collectCloSigs` | the ROW's own recorded member column | 170 | 3,338 | **0 corpus / 10 fuzz** |
+| CIT2 | `collectFnValUse` | `msMemberAtomsOf` + the counting-dual gate | 220 | 6,422 | 3 build-fail |
+| CIT3 | `shapeHasCloField` | ″ | 43 | 904 | 1 build-fail |
+| RINL | `registerInlineUnion` | **the split DELETED** — reads the row it just recorded | 198 | 4,744 | 42 byte-diff |
+
+Three of these are not renames.
+
+- **CIT1** iterates the union ROW table, so it needs no text bridge at all: `msSetOfText`
+  exists for a consumer holding a set STRING, but here the row INDEX is the key. It reads
+  `unMemAtoms[unMemTyStart[ui] ..]` directly, which is also more total than the set pool —
+  the pool's 31-member mask limit does not apply to the raw column.
+- **CIT2 / CIT3** are a `unionMemberCount(x) > 1` gate followed by `splitUnionAtoms(x)`.
+  `unionMemberCount` is documented as "the counting dual of `splitUnionAtoms`", so the two
+  are one predicate over one list: the migrated form materialises the recorded members once
+  and gates on `atoms.length > 1`.
+- **RINL is a parser DELETED, not laddered.** `registerInlineUnion` split `name` and then, six
+  lines later, called `recordUnMemTys(name)` — which splits the same string again. The second
+  split is the one the program sanctions (the intern side, class (iii)); the first is
+  redundant. Moving the atom acquisition below the record and reading the column's TAIL
+  (`unMemAtoms.length - unMemTyCount[row]`) is total **by construction**: the recorder appends
+  exactly that row's members in the same call, so the tail slice is the atom list even across
+  the recorder's own self-heal reset. No fall-through, no decline branch, nothing to measure.
+
+### The #1057 hand-off, measured and REFUTED
+
+D-UNION-SET held a two-line `emit_collect` diff for a concurrently-edited file:
+`registerInferRetNominalUnion` should decide `splitUnionAtoms(nm).length >= 2` on the
+RECORDED count `inferRetMemCountAt` instead, reported as **0 disagreements over 389 reaching
+programs**. Landed and probed here, it **disagrees on 4 corpus files**.
+
+The mechanism: `retMemCountOf` walks the recorded arena type's union/nullable SPINE and counts
+its leaves. A litunion member is a `TyUnion` of literals in the arena but ONE atom in the
+render — every disagreement is the name `K0 | null`, recorded **3** or **4** against a split
+length of **2**. Both clear the `>= 2` gate, which is why the corpus stays byte-identical
+either way and why a coarser probe reads 0; the dual is unsound in the other direction, where
+a bare inferred `K0` return renders ONE atom and would record `>= 2`, registering a union this
+compiler does not register.
+
+**Verdict: the arena artifact answers a different question** (method note 3, and note 1 on
+what an unverified 0 is worth). The faithful dual is a count banked by the NAME PRODUCER —
+how many atoms `valueUnionRetName` / `structUnionRetName` actually joined — not a walk of the
+type it rendered. That is a `typecheck.vl` change and is left as a hand-off with this
+mechanism recorded. The site keeps its split.
+
+### The two sabotages that had to be sharpened
+
+- **WIT3**'s only consumer is `atoms.length == 2`. Reversing the member list — the
+  perturbation that leaves the class everywhere else, since the recorded order IS the box-tag
+  ABI order — is an in-class relabeling here: **0 diffs**. Truncating (a cardinality change)
+  reddens 4 build-failures + 1 byte-diff. Method note 8, in its cheapest form: check what the
+  consumer actually reads.
+- **CIT1** is the note-5 case. Reversing produced 0 corpus diffs; DROPPING a member produced
+  0 corpus diffs; **emptying** the list produced 0 corpus diffs — and the *same* drop-a-member
+  sabotage produces **10 tree diffs over 50,400 fuzz programs**. `collectCloSigs`' closure-arm
+  union pass exists for a shape (`(() => i64) | i32` with no concrete lambda) that
+  `tests/cases` does not carry and the fuzzer does. A green corpus is not a green gate.
+
+### Parsers deleted: 1 — and the call arithmetic
+
+Member-set algebra CALL sites in the two files, master → now: `removeAtomFrom` **4 → 0**,
+`unionHasAtom` **2 → 1**, `splitUnionAtoms` **11 → 10**, `unionMemberCount` **3 → 3** — net
+**20 → 14**. One of the six is a genuine **deletion** (RINL); five are relocations into
+`removeAtomFromSet` / `unionSetHasNull`'s fall-through, i.e. the usual ladder. Of the 14 that
+remain, **9 now sit behind an arena leg that answers first** and 5 are parser-domain (the two
+registration entry splits, `registerCollapsedUnionName`, the refuted `registerInferRetNominalUnion`,
+and `nulCloMixedUnionUnregistered`, which declines by construction).
+
+### The name PRODUCERS, per-producer verdict
+
+#1105 counted 14 producer calls in 6 functions across the consumer classes; four of those
+calls live in this slice's two files. The #1100 TERMINAL verdict on `refListElemNameOfExpr`
+was withdrawn on the grounds that its arena route used the WRONG renderer — `tyToNominalName`
+(typecheck.vl:5764) is nominal-first (`structNameOfTy` / `unionAliasDeclNameOfTy` before any
+structural render) and yields `S` where the structural render yields `{v: i32}`. That is
+confirmed by reading; the verdict below is per SITE.
+
+| producer call | consumers want | verdict |
+|---|---|---|
+| `emit_collect` `rlInternName(refListElemNameOfExpr(i, -1), 1)` | an INTERNED reflist row | **legitimate** — this is the intern side (class (iii)), the one place the program has always said a name belongs. The producer itself (in `emit_classify`) is a separate slice. |
+| `wasmEmit` `emitRefArrayUnionUnboxRead`: `rlSlotByName(refArrElemName(atom))` | a reflist SLOT, never a name | **migrate — blocked on an export.** The atom is a MEMBER of the union `name` already in hand, so the arena route is member type → `TyArray.aElem` → `rlSlotOfTy`. It needs an `emit_classify` helper that resolves a member atom to its recorded index (`unMemAtomIds` compare); `unionRefArrayArmSlotForElemAtom` is close but keys on a different question. HAND-OFF. |
+| `wasmEmit` `emitMapUnionUnboxRead`: `mvSlotOfMapValNameOrMono(mapValNameOf(atom))` | an mv SLOT | **migrate — same blocker**, member type → `TyMap` value → `mvSlotOfTy`. HAND-OFF. |
+| `emit_collect` `rlMapElemValSlot`: `mapValNameOf(en)` | an mv SLOT | **already migrated** — arena-first chokepoint (`rlElemMapValMvSlotAt`), `CRLMV` in the D-TOTALITY map, never consequential (26/0 corpus, 408/0 fuzz). |
+
+The general shape: every one of these producers is a *slot* question wearing a name. What
+blocks them is not the renderer — it is that the union-ATOM consumers receive a rendered atom
+STRING with no index, and the member→index resolution lives in `emit_classify`. That is the
+next slice, and it is one export, not four migrations.
+
+### Not migrated, and why
+
+The `valueAtomKind` / `scalarTagOf` / `vbHeapIdxOfAtom` family (30 calls) stays. `unMemKinds`
+is a 5-way classifier (null / nominal / scalar / composite / unresolved) and cannot produce a
+`valueAtomKind` code, which is a 13-way ABI tag distinguishing `i32`/`boolean`/`string`/
+`i64`/`f64`/`f32`/`null`/five list flavours/closure. The D-ANNSLOT technique applies exactly —
+`markValueUnionAtoms` already computes the kind per atom while minting the value boxes and
+could bank an `unMemValKind` column beside `unMemKinds` — but that column and its recorder
+live in `emit_state.vl` / `emit_rep.vl`. **HAND-OFF**, with the warning from #1095 attached:
+whatever banks that column must be exact, because the answer feeds `scalarTagOf` and a folding
+predicate hands back a tag no producer interned.
+
+### Gate
+
+Corpus **byte-, run- AND message-identical** (1,270 files; the message channel normalises only
+the `-o` path) · 66-case battery **0 diffs** · shared-instance `vl run --batch` **751 programs
+in ONE instance** per side, rc 0, **0** traps, 807 outputs and the transcript identical · fuzz
+A/B **50,400 programs/side** (seeds 1-14 × depths 4,5,6 × {plain, `--declared`} × 300),
+compared as whole `--out-dir` TREES, **0** diffs · additive probe **0 disagreements** over
+1,270 corpus files and over 50,400 fuzz programs, with all 13 sites confirmed REACHED by a
+separately built INVERTED (coverage) compiler (method note 7 — never the same build).
+
+**Comparator sanity** (method note 12): the all-sites sabotage was pushed through the entire
+harness at full volume before any 0 was believed — **56 byte-diffs + 22 build-status + 25
+run-status** on the corpus and **223 tree diffs over 50,400 fuzz programs**.
+
+`refresh-compiler.sh` / `rep-fuzz-check.sh` / `native-fixpoint.sh` / `lint-self.sh` /
+`SELFHOST_NATIVE_ALIGN=1 deno task test` (1,960 passed) / `fuzz-sweep.sh` all RC=0.
