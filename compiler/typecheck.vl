@@ -5527,6 +5527,19 @@ function tyEmitNameIsString(ix: i32): boolean {
   false
 }
 
+// The TOP-LEVEL atom count of the name the LAST `tyToEmitName` call returned — the
+// number `unionMemberCount` would report for it, produced BY THE RENDERER instead of
+// re-derived by scanning the finished string (#1113). A rendered name gains a top-level
+// `|` at exactly two places (the union arm's join and the nullable arm's `|null`
+// suffix); every other arm builds a name whose separators all sit inside a grouper or
+// behind a top-level `=>`, so it is ONE atom. Meaningful only when the render is
+// non-empty — a "" result is a failure signal no caller counts.
+//
+// Not an arena-lifetime sidecar (method note 7): a scalar written on the way out of
+// every non-empty return and read by the immediate caller, never carried between
+// programs.
+let emitNameAtoms = 1
+
 // Render a RESOLVED arena type as an emitter-classifiable synthetic name, or
 // "" when it has none (a TyVar, a residual negation, err/never). Only the
 // `&`-fold arm of `canonEmitName` consults this — every other arm rewrites the
@@ -5534,6 +5547,7 @@ function tyEmitNameIsString(ix: i32): boolean {
 // The "does it have one at all?" question has a structural answer
 // (`tyIsEmitRepresentable`) — ask that rather than testing this for "".
 export function tyToEmitName(ix: i32) {
+  emitNameAtoms = 1
   if ix < 0 { return "" }
   const t = T.tys[ix]
   if t is TyPrim {
@@ -5579,6 +5593,11 @@ export function tyToEmitName(ix: i32) {
       rgAlias = litUnionAliasOfLitTexts(rgTexts)
     }
     const parts: string[] = []
+    // The render's atom count, accumulated as the parts are KEPT: the join below inserts
+    // exactly one top-level `|` per part boundary, so the whole render is as wide as its
+    // parts together. A part is not always ONE atom — a nullable member renders `X|null` —
+    // which is why this is summed rather than read off `parts.length` at the end.
+    let psum = 0
     let rgDone = false
     let i = 0
     while i < members.length {
@@ -5595,12 +5614,19 @@ export function tyToEmitName(ix: i32) {
         if !rgDone {
           rgDone = true
           parts.push(rgAlias)
+          psum = psum + 1
         }
         i = i + 1
         continue
       }
+      // An ALIAS name is one identifier — one atom. Only the RENDER leg can be wider,
+      // and it reports its own width in `emitNameAtoms`.
+      let sc = 1
       let s = litUnionAliasNameOfTy(members[i])
-      if s == "" { s = tyToEmitName(members[i]) }
+      if s == "" {
+        s = tyToEmitName(members[i])
+        sc = emitNameAtoms
+      }
       if s == "" { return "" }
       // A FUNCTION-TYPE member renders PARENTHESIZED (`(()=>f32|null)|{w:i32}`) — the
       // annotation's atom spelling. Bare, the closure's result arms swallow the union's
@@ -5608,14 +5634,21 @@ export function tyToEmitName(ix: i32) {
       // and keyed the whole result `>c` while the pinned lambda interned `>u` — a
       // divergent `ref.cast` functype at the value call (INVALID-WASM; fuzz-nightly
       // seed 556796311 d6).
-      if rgm is TyFunc { s = "(" + s + ")" }
+      // The grouping parens put every separator inside a grouper — one atom again.
+      if rgm is TyFunc {
+        s = "(" + s + ")"
+        sc = 1
+      }
       let dup = false
       let j = 0
       while j < parts.length {
         if parts[j] == s { dup = true }
         j = j + 1
       }
-      if !dup { parts.push(s) }
+      if !dup {
+        parts.push(s)
+        psum = psum + sc
+      }
       i = i + 1
     }
     if parts.length == 0 { return "" }
@@ -5625,6 +5658,7 @@ export function tyToEmitName(ix: i32) {
       out = out + "|" + parts[k]
       k = k + 1
     }
+    emitNameAtoms = psum
     return out
   }
   if t is TyNullable {
@@ -5636,14 +5670,26 @@ export function tyToEmitName(ix: i32) {
     // build (fuzz sweep4 plain leg, seed 142958508 case_00046). The nullable sibling of
     // the TyUnion-member / TyObj-field / TyMap-value / TyArray-element alias preservation.
     const nal = litUnionAliasNameOfTy(t.nInner)
-    if nal != "" { return nal + "|null" }
+    if nal != "" {
+      // An alias identifier plus the `null` arm — two atoms.
+      emitNameAtoms = 2
+      return nal + "|null"
+    }
     const inner = tyToEmitName(t.nInner)
+    const innerAtoms = emitNameAtoms
     if inner == "" { return "" }
     // A NULLABLE FUNCTION type keeps the kind-19 grouping parens (`((i32)=>string)|null`)
     // — bare, the render spells a closure RETURNING `string|null` instead (the `|null`
     // binds to the result), the same swallowed-arm ambiguity as the union-member case.
     const nfn = T.tys[t.nInner]
-    if nfn is TyFunc { return "(" + inner + ")|null" }
+    if nfn is TyFunc {
+      // The grouped closure is one atom; `null` is the second.
+      emitNameAtoms = 2
+      return "(" + inner + ")|null"
+    }
+    // A union INNER keeps its own top-level `|`s (`A|B|null`), so the `null` arm ADDS to
+    // the inner render's width rather than making the whole name two atoms.
+    emitNameAtoms = innerAtoms + 1
     return inner + "|null"
   }
   if t is TyObj {
@@ -5676,6 +5722,10 @@ export function tyToEmitName(ix: i32) {
       out = out + names[fi] + ":" + fs
       fi = fi + 1
     }
+    // Every field separator sits inside the braces — ONE atom. Set rather than
+    // inherited: the field renders above left `emitNameAtoms` holding the last field's
+    // width.
+    emitNameAtoms = 1
     return out + "}"
   }
   if t is TyArray {
@@ -5696,6 +5746,10 @@ export function tyToEmitName(ix: i32) {
     // all-i32 arity sig (INVALID-WASM at `p()`'s reflist result). The array sibling of the
     // TyFunc-result / union-member / nullable-closure grouping-paren preservation.
     const ae = T.tys[t.aElem]
+    // A list name is ONE atom in every form — a union element is parenthesized precisely
+    // so its `|`s stop being top-level. Set rather than inherited (the element render
+    // left its own width behind).
+    emitNameAtoms = 1
     if ae is TyFunc { return "(" + el + ")[]" }
     if nameHasPipe(el) { return "(" + el + ")[]" }
     return el + "[]"
@@ -5713,6 +5767,8 @@ export function tyToEmitName(ix: i32) {
     let mv = litUnionAliasNameOfTy(t.mVal)
     if mv == "" { mv = tyToEmitName(t.mVal) }
     if mk == "" || mv == "" { return "" }
+    // The key/value separators sit inside the braces — one atom.
+    emitNameAtoms = 1
     return "{[" + mk + "]:" + mv + "}"
   }
   // A FUNCTION type renders the emitter's closure-annotation form `(p1, p2) => ret` — so an
@@ -5752,6 +5808,10 @@ export function tyToEmitName(ix: i32) {
     // single result token (`(i32)=>((i32)=>i32)`), matching the source-annotation form.
     const rt = T.tys[t.fnRet]
     if rt is TyFunc { rs = "(" + rs + ")" }
+    // A function type is ONE atom: the params are parenthesized and everything after the
+    // top-level `=>` belongs to the RESULT — the #516 rule `unionMemberCount` implements
+    // by stopping at a top-level arrow, so `(i32)=>A|B` counts 1, not 2.
+    emitNameAtoms = 1
     return out + ")=>" + rs
   }
   ""
@@ -6079,6 +6139,24 @@ function singleMemberAliasName(name: string) {
   ""
 }
 
+// The TOP-LEVEL atom count of the name the LAST `canonEmitName` call returned, and its
+// `nulLitUnionPreserve` sibling. `canonEmitTypeNames` — the pass that PRODUCES every
+// emit-time annotation spelling — reads it instead of re-splitting the string it has just
+// joined (#1113, retiring the `unionMemberCount(c)` #1112 banked with).
+//
+// The invariant that makes it total: a canon'd name gains a TOP-LEVEL `|` at exactly two
+// places, the union arm's join and `nulLitUnionPreserve`'s `|null` suffix. Every other arm
+// either recurses (and inherits the recursive count) or builds a name whose separators
+// are inside a grouper / behind a top-level `=>` — ONE atom. The `!nameNeedsCanon`
+// early-out is the load-bearing case, and it is exact by that predicate's own shape: it
+// returns TRUE on any `|` ANYWHERE in the name, so a name that reaches the early-out has
+// no `|` at all.
+//
+// Neither is an arena-lifetime sidecar (method note 7): both are scalars written on the
+// way out of a call and read by the immediate caller, never carried between programs.
+let canonAtoms = 1
+let nluAtoms = 1
+
 // A NULLABLE LITERAL-UNION's preserved canonical name, or "" if `parts` (the top-level `|`-split
 // members of a union annotation) are not one. `K | null` / `"a" | "b" | null` must keep the litunion
 // members intact — the generic union soften below collapses each quoted literal to `string`, erasing
@@ -6101,11 +6179,19 @@ function nulLitUnionPreserve(parts: string[]) {
     core = core + "|" + rest[j]
     j = j + 1
   }
-  if nameIsLitUnionType(core) { return core + "|null" }
+  if nameIsLitUnionType(core) {
+    // The reconstructed name's atom count, banked for `canonEmitName` (#1113): `rest`
+    // holds TOP-LEVEL members of the original split (so none carries a top-level `|` of
+    // its own) and the `null` arm adds one. Duplicate `null` members collapse into the
+    // single suffix, which is why this is `rest.length + 1` and not `parts.length`.
+    nluAtoms = rest.length + 1
+    return core + "|null"
+  }
   ""
 }
 
 export function canonEmitName(name: string) {
+  canonAtoms = 1
   if name.length == 0 { return name }
   // A single-member union alias is transparent — resolve it to its member's emit name FIRST (before
   // the `nameNeedsCanon` early-out, which would otherwise return a bare alias name unchanged). The
@@ -6124,29 +6210,49 @@ export function canonEmitName(name: string) {
     splitTypeName(name, '|', parts)
     // A nullable literal-union (`K | null`) keeps its litunion members — see `nulLitUnionPreserve`.
     const nlu = nulLitUnionPreserve(parts)
-    if nlu != "" { return nlu }
+    if nlu != "" {
+      canonAtoms = nluAtoms
+      return nlu
+    }
     const kept: string[] = []
+    // The kept members' atom counts, SUMMED — not `kept.length`. A kept member is
+    // normally one atom, but the union-ALIAS expansion below substitutes a whole rendered
+    // member SET for one member (`AB` → `A|B`), so `AB | null` keeps TWO entries and
+    // joins to a THREE-atom name.
+    let atoms = 0
     let i = 0
     while i < parts.length {
       let c = canonEmitName(parts[i])
+      let ca = canonAtoms
       // A union-ALIAS member flattens into this outer union (`AB | null` → `A | B | null`):
       // a union of unions is one union, so expand the alias to its members — matching the
       // inline `(A | B) | null` form the emitter recognizes. (A bare `AB` annotation has no
       // top-level `|`, so it never reaches here and stays its alias name.)
       const exp = unionAliasMembers(c)
-      if exp != "" { c = exp }
+      if exp != "" {
+        c = exp
+        // `unionAliasMembers` renders through `tyToEmitName`, which reports the render's
+        // own atom width — the flattened member set is as wide as the alias's union.
+        ca = emitNameAtoms
+      }
       // A FUNCTION-type member keeps grouping parens (`((i32) => i32) | null` — a NULLABLE
       // function), so the rejoined name stays distinct from `(i32) => i32 | null` (a
       // function returning a nullable). `canonEmitName` strips a member's own wrapping
       // parens (the bare `(i32) => i32`, a top-level function type), so re-add them.
-      if isTopLevelFuncTypeName(c) { c = "(" + c + ")" }
+      if isTopLevelFuncTypeName(c) {
+        c = "(" + c + ")"
+        ca = 1
+      }
       let dup = false
       let j = 0
       while j < kept.length {
         if kept[j] == c { dup = true }
         j = j + 1
       }
-      if !dup { kept.push(c) }
+      if !dup {
+        kept.push(c)
+        atoms = atoms + ca
+      }
       i = i + 1
     }
     let out = kept[0]
@@ -6155,6 +6261,7 @@ export function canonEmitName(name: string) {
       out = out + "|" + kept[k]
       k = k + 1
     }
+    canonAtoms = atoms
     return out
   }
   // A top-level INTERSECTION: fold through the checker algebra (`nameToTy`
@@ -6164,8 +6271,18 @@ export function canonEmitName(name: string) {
     const folded = nameToTy(name)
     if folded >= 0 {
       const r = tyToEmitName(folded)
-      if r != "" { return r }
+      // The FOLD's render carries its own width — `(0|1|2) & !2` folds to the one-atom
+      // `i32`, but a fold that stays a union renders as one.
+      const ra = emitNameAtoms
+      if r != "" {
+        canonAtoms = ra
+        return r
+      }
     }
+    // The unchanged name: it reached here with no top-level `|` at all (the union arm
+    // above claims every name that has one, bar a top-level function type — whose atoms
+    // stop at the arrow), so it is one atom.
+    canonAtoms = 1
     return name
   }
   // A trailing `[]`: canon the ELEMENT (no top-level `|`/`&` here, so the
@@ -6180,6 +6297,10 @@ export function canonEmitName(name: string) {
     !isTopLevelFuncTypeName(name)
   ) {
     const core = canonEmitName(name.slice(0, name.length - 2))
+    // A list name is ONE atom in every form below — a union element is parenthesized
+    // precisely so its `|`s stop being top-level. Set rather than inherited: the element
+    // recursion left the ELEMENT's width in `canonAtoms`.
+    canonAtoms = 1
     if nameHasPipe(core) { return "(" + core + ")[]" }
     // A FUNCTION-type element keeps grouping parens (`((i32) => i32)[]` — an ARRAY OF
     // functions), so the name stays distinct from `(i32) => i32[]` (a function RETURNING
@@ -6220,6 +6341,10 @@ export function canonEmitName(name: string) {
     }
     let rc = canonEmitName(name.slice(fa + 2, name.length))
     if isTopLevelFuncTypeName(rc) { rc = "(" + rc + ")" }
+    // A function type is ONE atom (the params are parenthesized, the result sits behind
+    // the top-level `=>` where `unionMemberCount` stops). Set rather than inherited: the
+    // param/result recursions left their own widths behind.
+    canonAtoms = 1
     return out + ")=>" + rc
   }
   // A literal member → its base scalar.
@@ -6229,7 +6354,11 @@ export function canonEmitName(name: string) {
   if name[0] == '!' { return name }
   // An inline `{…}` shape: canon its field/value types.
   if name[0] == '{' && name[name.length - 1] == '}' {
-    return canonShapeName(name)
+    const shp = canonShapeName(name)
+    // Every separator sits inside the braces — one atom. Set rather than inherited: the
+    // field recursions inside `canonShapeName` left their own widths behind.
+    canonAtoms = 1
+    return shp
   }
   name
 }
@@ -6245,9 +6374,12 @@ export function canonEmitTypeNames() {
     // The atom-count bank (#1055): one entry PUSHED per node, in node order, so the
     // column is exactly `P.nodes.length` long and index == node index. A non-`TypeRef`
     // node banks -1 (there is no annotation spelling to count); a `TypeRef` banks the
-    // count of the name this pass just PRODUCED — `unionMemberCount` is the counting
-    // dual of the `splitUnionAtoms` the emitter consumers used to run on the same
-    // string, so the banked number is exact rather than a structural approximation.
+    // count of the name this pass just PRODUCED — reported BY `canonEmitName` in
+    // `canonAtoms` (#1113). #1112 banked it by running `unionMemberCount` over the
+    // finished string, which is the same number arrived at by taking apart a string this
+    // very pass had just joined; the producer knows the width of every `|` it writes, so
+    // it hands it over instead. Exact, not a structural approximation — the count is
+    // accumulated from the same joins that build the name.
     // Pushing (rather than pre-sizing and indexing) is what makes the reset above
     // LOAD-BEARING: without it a second program in the same instance would shift every
     // index, which the shared-instance suite catches immediately.
@@ -6256,7 +6388,7 @@ export function canonEmitTypeNames() {
     if n is TypeRef {
       const c = canonEmitName(n.tyName)
       if c != n.tyName { n.tyName = c }
-      atoms = unionMemberCount(c)
+      atoms = canonAtoms
     } else if n is UnionDecl {
       const vs = n.udVariants
       let vi = 0
