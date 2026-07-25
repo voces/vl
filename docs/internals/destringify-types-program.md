@@ -1572,3 +1572,58 @@ it** (containment: the arena leg answers only `>= 0`, its miss consumed inside t
 chokepoint) and migrated both sites; those two pins are exactly the files that redden under
 the `TW3A`/`TW3B` gate-channel sabotage, which is the entombment test a byte-identical
 migration can have.
+
+## SCORECARD CORRECTION — the program has been measuring the wrong thing
+
+The owner's terminal condition, stated precisely:
+
+> A **name is a name** — nominal identity (`structIndexByName("Cat")`) is fine, and rendering a
+> type for a human is fine. But **parsing a type string outside the parser is always wrong.**
+
+Every scorecard in this document above measured *proxies*: render-equality comparisons, and
+readers of specific name columns. Both went to ~0 while the actual disease was untouched.
+
+**Measured against the real condition — calls that PARSE a rendered type:**
+
+| parser | calls |
+|---|---|
+| `nullablePartOf` | 88 |
+| `annArrowAt` | 60 |
+| `splitUnionAtoms` | 58 |
+| `refArrElemName` | 53 |
+| `nameIsRefArray` | 48 |
+| `mapValNameOf` | 46 |
+| `nameIsMap` | 40 |
+| `nameIsLitUnionType` | 38 |
+| `nameIsArray` | 37 |
+| `nameIsMapMemberUnion` | 29 |
+| `nameIsStringArray` / `nameIsI32Array` / `nameIsClosureArray` | 45 |
+| `isTopLevelFuncTypeName` / `unionMemberCount` / `peelGroupParens` / `parenUnionArrElemName` / `annSplitParams` / `nameIsSingleShape` | 65 |
+| **TOTAL** | **607** |
+
+By file: emit_classify 387 · emit_collect 87 · emit_base 77 · typecheck 25 · wasmEmit 12 ·
+emit_mono 8 · others 11.
+
+### Why the earlier numbers were not wrong, but were not the point
+
+Nine slices genuinely moved *decision* layers onto the arena, and those gates hold. But a
+migrated decision that still receives a **rendered name** and picks it apart has relocated the
+parse, not removed it. The chokepoints introduced (`rlElemInnerSlot`, `rlElemStructRow`, …)
+each still parse inside their name fall-through.
+
+### The correct strategy: kill the SOURCES, not the call sites
+
+Each of the 607 parses consumes a string produced somewhere. Migrating a parse site in
+isolation is whack-a-mole; converting its **producer** to hand over a type index deletes the
+parse outright. Work backwards from the producers (`tyToEmitName`, `sNames[]`, `rlElemName[]`,
+`mvValName[]`, `sFieldElemName[]`, `fRetRArrElem[]`) and let the parsers die.
+
+### A verdict this correction overturns
+
+`refListElemNameOfExpr` was filed TERMINAL in #1100 on the evidence that its arena route
+renders `{v:i32}` where the stored name is `S`. That is not evidence the string is required —
+it is evidence the **wrong renderer** was used. `tyToNominalName` (typecheck.vl:5755) renders
+name-faithfully and yields `S`. The site parses a type string (`refArrElemName(mvValName[…])`)
+and must go. **Verdict withdrawn.**
+
+**Terminal condition restated: 0 type-string parse calls outside the parser.** Currently 607.

@@ -4,6 +4,10 @@
 // `emit_query`) import. Carved out of `wasmEmit.vl`.
 
 import {
+  T,
+  TyArray,
+  TyFunc,
+  TyNullable,
   inferRetNameOf,
   isValueUnionName,
   nameIsFuncTypeAtom,
@@ -12,6 +16,7 @@ import {
   nodeTyIsClosureArray,
   nodeTyIsFunc,
   nodeTyIsLitUnionAlias,
+  nodeTyIsNulBool,
   nodeTyIsNulClosure,
   nodeTyIsNulI32List,
   nodeTyIsNulString,
@@ -729,6 +734,12 @@ export function nullablePartOf(name: string) {
 // non-null is purely type-level (the i32 is already 0/1 in the branch).
 export function tyIsNulBool(tyIx: i32) {
   if tyIx < 0 { return false }
+  // STRUCTURAL first (destringify): where the checker recorded a type for the node, the
+  // ARENA decides — a `TyNullable` over the `boolean` prim (`nodeTyIsNulBool`), the dual of
+  // the `nullablePartOf(name) == "boolean"` surgery below. Ladder-faithful (D1 leg C): an
+  // UNCOVERED node keeps the annotation-name path unchanged. Mirrors `retNulStringFlag`,
+  // whose `nodeTyIsNulString` leg is this test's `string` sibling.
+  if nodeTyIxOf(tyIx) >= 0 { return nodeTyIsNulBool(tyIx) }
   const ty = P.nodes[tyIx]
   if ty is TypeRef { return nullablePartOf(ty.tyName) == "boolean" }
   false
@@ -995,6 +1006,28 @@ export function retNulStringFlag(tyIx: i32) {
 // wins if a name were somehow both — it cannot be, the lexemes are disjoint.) String
 // is a distinct code from array purely for typedness clarity; `pushVT` emits the SAME
 // array ref valtype for both, since a string IS the i32-array type here.
+// STRUCTURAL (destringify): the annotation node at `tyIx` is an array whose ELEMENT is a
+// NULLABLE closure (`(((i32) => boolean) | null)[]`) — a `TyArray` over a `TyNullable` over a
+// `TyFunc`. The arena dual of `nullClosureArrElem(tyNameOf(tyIx)) != ""`: `nullClosureArrElem`
+// answers the same question by string surgery (peel the `(...)[]` element, split the `| null`,
+// re-test the non-null part for a top-level arrow). `nodeTyIsClosureArray` covers only the
+// BARE-closure element, so this is the nullable-element arm of the same kind-5 classifier.
+function tyIsNulClosureArrayNode(tyIx: i32) {
+  const ty = nodeTyIxOf(tyIx)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    const e = t.aElem
+    if e >= 0 {
+      const et = T.tys[e]
+      if et is TyNullable {
+        const inner = T.tys[et.nInner]
+        if inner is TyFunc { return true }
+      }
+    }
+  }
+  false
+}
 // `1` if the type-annotation node at `tyIx` is an ARRAY OF FUNCTIONS (`((i32) => i32)[]`),
 // else `0` — the closure-element ref-list guard `vtKindOfType` checks before the kind-14
 // function-type test.
@@ -1002,8 +1035,10 @@ export function nameIsClosureArrayTy(tyIx: i32) {
   if nodeTyIxOf(tyIx) >= 0 {
     if nodeTyIsClosureArray(tyIx) { return 1 }
     // A NULLABLE-closure-element array (`(((i32) => boolean) | null)[]`, kind-5 niche):
-    // the structural fast path has no nullable-element arm, so classify from the name.
-    if nullClosureArrElem(tyNameOf(tyIx)) != "" { return 1 }
+    // `nodeTyIsClosureArray` has no nullable-element arm, so the SAME arena spine answers
+    // it here (destringify) — a `TyArray` over a `TyNullable` over a `TyFunc`, replacing
+    // the `nullClosureArrElem` string surgery over the annotation's rendered name.
+    if tyIsNulClosureArrayNode(tyIx) { return 1 }
     return 0
   }
   if nameIsClosureArray(tyNameOf(tyIx)) { return 1 }
