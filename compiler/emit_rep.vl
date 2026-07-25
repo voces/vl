@@ -46,8 +46,20 @@
 // terminate via a generation-stamped visited mark per arena index.
 
 import { i32ToStr } from "./ast"
+import { peelGroupParens } from "./emit_base"
 import {
   VKind,
+  msAtomIds,
+  msAtomTexts,
+  msGen,
+  msRowChain,
+  msSetByText,
+  msSetGen,
+  msSetMask,
+  msSetMiss,
+  msSetNext,
+  msSetRow,
+  msSetText,
   mvValName,
   mvValTyIx,
   sFieldCount,
@@ -60,6 +72,9 @@ import {
   sTyIx,
   uFieldElemName,
   uFieldElemTyIx,
+  unMemAtomIds,
+  unMemAtoms,
+  unMemKinds,
   unMemTyCount,
   unMemTyStart,
   unMemTys,
@@ -997,13 +1012,82 @@ export function unMemAtomTyIx(atom: string): i32 {
   resolveAnnot(atom, repNoTyparams)
 }
 
+// The interned id of a union member's atom SPELLING, after `peelGroupParens` (the
+// same normalization `removeAtomFrom` applies to both sides of its comparison, so a
+// `(() => i64)` member and an `is () => i64` test are the same member reference).
+// Two member references are equal iff their ids are — set membership and subtraction
+// are then integer work, with no string scan and nothing re-parsed. Ids are pure text
+// identities carrying no arena or table content, so the table lives across programs.
+export function msAtomIdOf(atom: string): i32 {
+  const p = peelGroupParens(atom)
+  const hit = msAtomIds[p] ?? -1
+  if hit >= 0 { return hit }
+  const id = msAtomTexts.length
+  msAtomTexts.push(p)
+  msAtomIds[p] = id
+  id
+}
+
+// WHAT a union member IS, recorded next to its arena type: 0 the `null` keyword
+// (a token, not a rendered shape) · 1 NOMINAL — a declared alias / struct / variant
+// name, whose identity IS the name (`cUserTypes` resolved it) · 2 a scalar primitive
+// · 3 a composite (map / array / closure / inline shape / nested union) · -1 the
+// spelling did not resolve to an arena type. `ty` is the member's already-resolved
+// arena index, so this classification costs one map probe and one arena read — it
+// never re-derives anything from the member's TEXT beyond the `null` keyword test.
+function unMemKindOf(atom: string, ty: i32): i32 {
+  if atom == "null" { return 0 }
+  const di = cUserTypes[atom] ?? -1
+  if di >= 0 { return 1 }
+  if ty < 0 { return -1 }
+  if ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyPrim { return 2 }
+  3
+}
+
+// Drop every interned member SET (the D-UNION set ADT — see `msSetRow` in
+// `emit_state`) and bump the pool generation. A set id is a (union row, member mask)
+// pair, and both halves are per-PROGRAM: a fresh program re-mints `unNames` and the
+// arena the member columns were recorded against. The generation stamp makes a
+// missed reset site read as "uncovered" (the consumer keeps its member-NAME path)
+// rather than answering from the previous program's rows — method note 7.
+export function msPoolReset() {
+  msSetRow = []
+  msSetMask = []
+  msSetNext = []
+  msSetText = []
+  msSetGen = []
+  msRowChain = []
+  msSetByText = Map()
+  msSetMiss = Map()
+  msGen = msGen + 1
+  0
+}
+
 // Record the ARENA member types of the union row JUST pushed onto `unNames`, whose
 // pipe-joined member set is `set` (the D-UNION foundation — see `unMemTys` in
 // `emit_state`). Pads with an empty slice so a mint site that does not call this
 // self-heals to "uncovered" and its consumers keep the legacy member-NAME path.
 // ORDER-PRESERVING by construction: one recorded index per `splitUnionAtoms` atom,
 // in atom order — the union box-tag ABI depends on it.
+//
+// This is also the ONE place a member set is ever split: alongside each member's
+// arena index it records the member REFERENCE columns (`unMemAtoms`/`unMemAtomIds`/
+// `unMemKinds`), so every downstream membership / subtraction / cardinality /
+// iteration is a structural operation on the recorded members instead of a re-split
+// of the joined string (the D-UNION set ADT).
 export function recordUnMemTys(set: string) {
+  // The member columns are reset in `collectU` and at the top of `emitProgram`, both
+  // of which clear `unMemTys` — the reference columns are cleared HERE when that is
+  // observed, so they can never answer with a slice of the previous program's rows
+  // (an over-long column is the signature: only this function appends, in lock-step).
+  if unMemAtoms.length > unMemTys.length {
+    unMemAtoms = []
+    unMemAtomIds = []
+    unMemKinds = []
+    msPoolReset()
+  }
   while unMemTyStart.length + 1 < unNames.length {
     unMemTyStart.push(-1)
     unMemTyCount.push(0)
@@ -1014,7 +1098,12 @@ export function recordUnMemTys(set: string) {
   unMemTyCount.push(atoms.length)
   let i = 0
   while i < atoms.length {
-    unMemTys.push(unMemAtomTyIx(atoms[i]))
+    const a = atoms[i]
+    const ty = unMemAtomTyIx(a)
+    unMemTys.push(ty)
+    unMemAtoms.push(a)
+    unMemAtomIds.push(msAtomIdOf(a))
+    unMemKinds.push(unMemKindOf(a, ty))
     i = i + 1
   }
   0

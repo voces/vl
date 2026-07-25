@@ -257,6 +257,15 @@ import {
   mfSrcKinds,
   mfSrcSlots,
   monoOrigNode,
+  msGen,
+  msRowChain,
+  msSetByText,
+  msSetGen,
+  msSetMask,
+  msSetMiss,
+  msSetNext,
+  msSetRow,
+  msSetText,
   mvMapTypeIdx,
   mvRlSlot,
   mvValKind,
@@ -309,6 +318,9 @@ import {
   uVarHeap,
   uVarTwin,
   uVariants,
+  unMemAtomIds,
+  unMemAtoms,
+  unMemKinds,
   unMemTyCount,
   unMemTyStart,
   unMemTys,
@@ -328,6 +340,7 @@ import {
 import { emitFail } from "./emit_bytes"
 import {
   fieldElemTyIxOfName,
+  msAtomIdOf,
   mvSlotOfTy,
   mvSlotOfValNameTy,
   recordMvValTyIx,
@@ -2443,7 +2456,7 @@ function structIndexByValName(name: string) { structIndexOfTypeName(name) }
 // map op sites strip through, so the slot shares its vals rep (and heap dedup) with the
 // non-null twin.
 export function nulRefMapValInnerOf(valName: string): string {
-  if !unionHasAtom(valName, "null") { return "" }
+  if !unionSetHasNull(valName) { return "" }
   const atoms: string[] = []
   splitUnionAtoms(valName, atoms)
   let inner = ""
@@ -2497,10 +2510,14 @@ export function mvUnionIsScalarNull(slot: i32) {
   const ar = mvValUnionScalarNullAt(slot)
   if ar >= 0 { return ar == 1 }
   const vn = mvValName[slot]
-  if !unionHasAtom(vn, "null") { return false }
+  if !unionSetHasNull(vn) { return false }
   const atoms: string[] = []
   splitUnionAtoms(vn, atoms)
   if atoms.length != 2 { return false }
+  // NOT migrated onto the set ADT: this tail sits behind the arena chokepoint
+  // `mvValUnionScalarNullAt` AND a 2-member gate, and it answered on 0 of the 1,269
+  // corpus files and 0 of 25,200 fuzz programs — no witness to sabotage-verify
+  // against, so it keeps the string surgery (method note 6).
   const ak = valueAtomKind(removeAtomFrom(vn, "null"))
   ak >= 0 && ak != 2 && ak != 6
 }
@@ -2538,7 +2555,7 @@ export function mvValKindOfName(valName: string): i32 {
   //     rep yet (`string | null` is not a value union — no box is ever minted; a
   //     list/closure niche needs its own wrapper slot): reject loudly at every op
   //     site, never invalid wasm.
-  if unionHasAtom(valName, "null") {
+  if unionSetHasNull(valName) {
     const nin = nulRefMapValInnerOf(valName)
     if nin != "" {
       if nin == "string" { return 3 }
@@ -4889,7 +4906,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
         let mset = unionMemberSetOf(mun)
         if mset == "" { mset = mun }
         const mAtoms: string[] = []
-        splitUnionAtoms(mset, mAtoms)
+        if !msMemberAtomsOf(mset, mAtoms) { splitUnionAtoms(mset, mAtoms) }
         let mi = 0
         while mi < mAtoms.length {
           const ma = mAtoms[mi]
@@ -5474,8 +5491,8 @@ function coalesceAtomKind(exprIx: i32, fnIx: i32) {
     if e.binOp == "??" {
       const nm = unionNameOfExpr(e.binLeft, fnIx)
       if nm != "" {
-        if isValueUnionName(nm) && unionHasAtom(nm, "null") {
-          const k = valueAtomKind(removeAtomFrom(nm, "null"))
+        if isValueUnionName(nm) && unionSetHasNull(nm) {
+          const k = valueAtomKind(removeAtomFromSet(nm, "null"))
           if k >= 0 && k != 6 { return k }
         }
       }
@@ -6344,7 +6361,7 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
         pushNarrow(nm, "null")
         return true
       }
-      const rest = removeAtomFrom(currentNarrowSetOf(nm, fnIx), "null")
+      const rest = removeAtomFromSet(currentNarrowSetOf(nm, fnIx), "null")
       if rest != "" {
         pushNarrow(nm, rest)
         return true
@@ -6363,7 +6380,10 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
         pushNarrow(snm, "null")
         return true
       }
-      const srest = removeAtomFrom(currentStructNarrowSetOf(snm, fnIx), "null")
+      const srest = removeAtomFromSet(
+        currentStructNarrowSetOf(snm, fnIx),
+        "null",
+      )
       if srest != "" {
         pushNarrow(snm, srest)
         return true
@@ -6393,7 +6413,7 @@ function structUnionNullCmpName(condIx: i32, fnIx: i32) {
           if un != "" {
             if !isValueUnionName(un) {
               const uset = unionMemberSetOf(un)
-              if unionHasAtom(uset, "null") && nonNullMemberCountOf(uset) >= 2 {
+              if unionSetHasNull(uset) && unionSetNonNullCount(uset) >= 2 {
                 return r.identName
               }
             }
@@ -6448,7 +6468,7 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
         const un = unionNameOfIdent(recv.identName, fnIx)
         if un != "" {
           if isValueUnionName(un) {
-            const rest = removeAtomFrom(
+            const rest = removeAtomFromSet(
               currentNarrowSetOf(recv.identName, fnIx),
               c.isVariant,
             )
@@ -6471,7 +6491,7 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
             let mcur = unionMemberSetOf(mun)
             const mNar = narrowVariantFor(mk)
             if mNar != "" { mcur = mNar }
-            const mrest = removeAtomFrom(mcur, c.isVariant)
+            const mrest = removeAtomFromSet(mcur, c.isVariant)
             if mrest != "" {
               pushNarrow(mk, mrest)
               return true
@@ -6507,7 +6527,7 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
     const srecv = P.nodes[unwrapParen(c.isObj)]
     if srecv is Ident {
       if exprUnion(c.isObj, fnIx) {
-        const srest = removeAtomFrom(
+        const srest = removeAtomFromSet(
           currentStructNarrowSetOf(srecv.identName, fnIx),
           c.isVariant,
         )
@@ -6532,7 +6552,7 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
         pushNarrow(nm, "null")
         return true
       }
-      const rest = removeAtomFrom(currentNarrowSetOf(nm, fnIx), "null")
+      const rest = removeAtomFromSet(currentNarrowSetOf(nm, fnIx), "null")
       if rest != "" {
         pushNarrow(nm, rest)
         return true
@@ -6549,7 +6569,10 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
         pushNarrow(snm, "null")
         return true
       }
-      const srest = removeAtomFrom(currentStructNarrowSetOf(snm, fnIx), "null")
+      const srest = removeAtomFromSet(
+        currentStructNarrowSetOf(snm, fnIx),
+        "null",
+      )
       if srest != "" {
         pushNarrow(snm, srest)
         return true
@@ -6592,16 +6615,19 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
       const tgt = P.nodes[s.binLeft]
       if tgt is Ident {
         const un = unionNameOfIdent(tgt.identName, fnIx)
-        if un != "" && isValueUnionName(un) && unionHasAtom(un, "null") {
+        if un != "" && isValueUnionName(un) && unionSetHasNull(un) {
           const rhs = P.nodes[unwrapParen(s.binRight)]
           let rhsNullable = false
           if rhs is NullLit { rhsNullable = true }
           const rn = unionNameOfExpr(s.binRight, fnIx)
           if rn != "" {
+            // NOT migrated: the RHS union name here is never a covered member SET
+            // on any measured surface (0 of 1,269 corpus files, 0 of 25,200 fuzz
+            // programs), so it keeps the member-name scan (method note 6).
             if unionHasAtom(rn, "null") { rhsNullable = true }
           }
           if !rhsNullable {
-            pushNarrow(tgt.identName, removeAtomFrom(un, "null"))
+            pushNarrow(tgt.identName, removeAtomFromSet(un, "null"))
           }
         }
       }
@@ -6886,10 +6912,10 @@ export function fnRetNullBearing(fnIx: i32) {
   if retNulRefFlag(r) == 1 { return true }
   if retNulListFlag(r) == 1 { return true }
   if retNulMapFlag(r) == 1 { return true }
-  if retUnionFlag(r) == 1 { return unionHasAtom(tyNameOf(r), "null") }
+  if retUnionFlag(r) == 1 { return unionSetHasNull(tyNameOf(r)) }
   if r < 0 {
     const im = inferRetNameOf(fn.fnName)
-    if isValueUnionName(im) { return unionHasAtom(im, "null") }
+    if isValueUnionName(im) { return unionSetHasNull(im) }
     if inferNicheNullByName(fn.fnName) != "" { return true }
   }
   false
@@ -11737,7 +11763,7 @@ export function unionMapArmName(name: string) {
   let nm = unionMemberSetOf(name)
   if nm == "" { nm = name }
   const atoms: string[] = []
-  splitUnionAtoms(nm, atoms)
+  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
   // D-UNION: pick the map arm from the row's recorded ARENA member types
   // (`unMemIsMap` — `T.tys[m] is TyMap`) instead of re-classifying each atom's
   // RENDERED spelling with `nameIsMap`. The recorded member slice is in atom order
@@ -11902,7 +11928,7 @@ export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
           let nm = unionMemberSetOf(un)
           if nm == "" { nm = un }
           const atoms: string[] = []
-          splitUnionAtoms(nm, atoms)
+          if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
           // D-UNION (batch 2's `tyArmPathLeaf` walk, applied to an INDEXED root): the
           // arm's element type is `tyArmElem` (a `TyArray` arm's element — the name
           // path's `nameIsRefArray(a)` gate plus its `refArrElemName`/inline-shape
@@ -11986,7 +12012,7 @@ export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
     let nm = unionMemberSetOf(un)
     if nm == "" { nm = un }
     const atoms: string[] = []
-    splitUnionAtoms(nm, atoms)
+    if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
     // D-UNION: the arm's field path is walked over the member's ARENA type
     // (`tyArmPathIsMap` — a `TyMap` leaf) instead of re-resolving the rendered atom to
     // a struct/variant row and consulting its per-field lowering codes.
@@ -12099,7 +12125,7 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
     let nm = unionMemberSetOf(un)
     if nm == "" { nm = un }
     const atoms: string[] = []
-    splitUnionAtoms(nm, atoms)
+    if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
     // D-UNION: the arm walk is structural (`tyArmPathIsMapList` — a `TyArray` over a
     // `TyMap` leaf), and so is the indexed-root hop: `tyArmElem` takes a `TyArray` arm's
     // element in place of `nameIsRefArray` + `refArrElemName` on the rendered atom.
@@ -12170,7 +12196,7 @@ export function unionHasClosureArrayArm(name: string) {
   let nm = unionMemberSetOf(name)
   if nm == "" { nm = name }
   const atoms: string[] = []
-  splitUnionAtoms(nm, atoms)
+  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
   // D-UNION: `unMemIsFuncArray` (a `TyArray` over a `TyFunc`) is the arena dual of
   // `nameIsClosureArray` — including its NULLABLE-element exclusion, which falls out
   // for free (a `(((i32) => boolean) | null)[]` element is a `TyNullable`).
@@ -12226,7 +12252,7 @@ export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
           const ums = unionMemberSetOf(un)
           if ums != "" { un = ums }
           const atoms: string[] = []
-          splitUnionAtoms(un, atoms)
+          if !msMemberAtomsOf(un, atoms) { splitUnionAtoms(un, atoms) }
           // D-UNION: the deliberately-conservative `strContains(elem, "=>")` arm test
           // is a REACHABILITY question — `unMemIsFuncReachArray` asks it of the arena
           // (a `TyArray` whose element structure reaches a `TyFunc`) instead of of the
@@ -12265,7 +12291,7 @@ export function unionHasClosureArm(name: string) {
   let nm = unionMemberSetOf(name)
   if nm == "" { nm = name }
   const atoms: string[] = []
-  splitUnionAtoms(nm, atoms)
+  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
   // D-UNION: value-atom kind 11 IS "the member is a function type" — ask the arena
   // (`unMemIsFunc`) rather than `valueAtomKind`'s spelling ladder.
   const mems: i32[] = []
@@ -12293,7 +12319,7 @@ export function unionClosureArmName(name: string) {
   let nm = unionMemberSetOf(name)
   if nm == "" { nm = name }
   const atoms: string[] = []
-  splitUnionAtoms(nm, atoms)
+  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
   // D-UNION: the arm SELECTION is structural (`unMemIsFunc`); the returned NAME stays
   // the member's stored spelling, which `emitUnionCoerce` feeds to the still-name-keyed
   // `scalarTagOf` (a D5 residual, not this slice).
@@ -12324,7 +12350,7 @@ export function unionClosureArrElemUnion(name: string) {
   let nm = unionMemberSetOf(name)
   if nm == "" { nm = name }
   const atoms: string[] = []
-  splitUnionAtoms(nm, atoms)
+  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
   let i = 0
   while i < atoms.length {
     if nameIsRefArray(atoms[i]) {
@@ -12412,7 +12438,7 @@ function identRebindUnionArmClosureField(
     let uset = unionMemberSetOf(un)
     if uset == "" { uset = un }
     const atoms: string[] = []
-    splitUnionAtoms(uset, atoms)
+    if !msMemberAtomsOf(uset, atoms) { splitUnionAtoms(uset, atoms) }
     // D-UNION: the arm walk is structural (`tyArmPathHasCloValue` — a `TyFunc` leaf,
     // bare / nullable, or a `TyUnion` with a `TyFunc` member).
     const mems: i32[] = []
@@ -12516,7 +12542,7 @@ export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
     let uset = unionMemberSetOf(un)
     if uset == "" { uset = un }
     const atoms: string[] = []
-    splitUnionAtoms(uset, atoms)
+    if !msMemberAtomsOf(uset, atoms) { splitUnionAtoms(uset, atoms) }
     // D-UNION: the arm walk is structural (`tyArmPathIsClosure` — a `TyFunc` leaf, bare
     // or under the nullable-closure niche's `TyNullable`).
     const mems: i32[] = []
@@ -12587,7 +12613,7 @@ export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
       let uset = unionMemberSetOf(un)
       if uset == "" { uset = un }
       const atoms: string[] = []
-      splitUnionAtoms(uset, atoms)
+      if !msMemberAtomsOf(uset, atoms) { splitUnionAtoms(uset, atoms) }
       // D-UNION: the arm walk is structural (`tyArmPathIsCloArray` — a `TyArray` over a
       // `TyFunc` leaf).
       const mems: i32[] = []
@@ -12753,7 +12779,7 @@ function unionRefArrayArmSlotForElemAtom(name: string, elemAtom: string) {
         let es = unionMemberSetOf(en)
         if es == "" { es = en }
         const eAtoms: string[] = []
-        splitUnionAtoms(es, eAtoms)
+        if !msMemberAtomsOf(es, eAtoms) { splitUnionAtoms(es, eAtoms) }
         let j = 0
         while j < eAtoms.length {
           if eAtoms[j] == elemAtom { return slot }
@@ -12860,7 +12886,7 @@ export function unionHasMapArrayArm(name: string) {
   let nm = unionMemberSetOf(name)
   if nm == "" { nm = name }
   const atoms: string[] = []
-  splitUnionAtoms(nm, atoms)
+  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
   // D-UNION: a `TyArray` over a `TyMap` (`unMemIsMapArray`). The name path's
   // `!nameIsMapMemberUnion(elem)` guard is free structurally — a map-member UNION
   // element is a `TyUnion`, never a `TyMap`, however it renders.
@@ -14461,6 +14487,261 @@ export function unionHasAtomTy(name: string, atom: string): boolean {
   const a = unMemHasAtom(name, atom)
   if a >= 0 { return a == 1 }
   unionHasAtom(name, atom)
+}
+
+// ── D-UNION SET ADT — the union member set as a STRUCTURE ────────────────────
+// A member set is a SUBSET of one union row's recorded members: the pair (row,
+// mask), where bit `i` of the mask is member `i` of the row in the row's RECORDED
+// ORDER. That order is the box-tag ABI order (`unVarStart`/`unVarCount` slice
+// `uVariants`; `markValueUnionAtoms` mints value boxes in atom order), and nothing
+// here can reorder it — the order is never re-derived, only masked.
+//
+// The members themselves are the reference columns `recordUnMemTys` writes
+// (`unMemAtoms`/`unMemAtomIds`/`unMemKinds`/`unMemTys` — spelling, interned identity,
+// what the member IS, its arena type). So:
+//   membership   — a KIND test (`null`) or an interned-id compare, never a substring
+//                  search over a joined string;
+//   subtraction  — clearing bits, never string surgery;
+//   cardinality  — a bit count, never a re-split;
+//   iteration    — a walk of the row's members in the row's order.
+// A set is RENDERED (`msTextOf`) only where it is handed to a name-keyed consumer,
+// by joining the surviving members' VERBATIM spellings — which is byte-identical to
+// what the string surgery produced, because those spellings are the very substrings
+// the joined set was built from. (Rendering the recorded arena types instead would
+// NOT be: the arena's render of a declared `S` is the structural `{v: i32}` — the
+// D5-final lesson about using the right renderer.)
+
+// The member slice of union row `u`, or -1 when the row is not covered by the
+// reference columns (a row the recorder missed, an empty row, or one wider than the
+// 31-bit mask). `unMemTyStart`/`unMemTyCount` slice all four member columns alike.
+function msRowStart(u: i32): i32 {
+  if u < 0 { return -1 }
+  if u >= unMemTyStart.length { return -1 }
+  const st = unMemTyStart[u]
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  if n < 1 || n > 31 { return -1 }
+  if st + n > unMemAtoms.length { return -1 }
+  st
+}
+
+// Is member `i` present in `mask`? (Bitwise `&` binds LOOSER than `==` in this
+// language, so the test is parenthesized once here rather than at five call sites.)
+function msBitSet(mask: i32, i: i32): boolean { ((mask >>> i) & 1) == 1 }
+
+// The rendered form of the subset `mask` of row `u`: the surviving members'
+// verbatim spellings, joined on `|`, in the row's recorded order.
+function msRenderSet(u: i32, mask: i32): string {
+  const st = msRowStart(u)
+  if st < 0 { return "" }
+  const n = unMemTyCount[u]
+  let out = ""
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if out != "" { out = out + "|" }
+      out = out + unMemAtoms[st + i]
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The interned set id for the subset `mask` of row `u` — one id per distinct
+// (row, mask), so a set's rendering is built once and every later operation on it is
+// a table read. Stamped with the pool generation (method note 7).
+function msSetIntern(u: i32, mask: i32): i32 {
+  while msRowChain.length <= u { msRowChain.push(-1) }
+  let s = msRowChain[u]
+  while s >= 0 {
+    if msSetMask[s] == mask && msSetGen[s] == msGen { return s }
+    s = msSetNext[s]
+  }
+  const id = msSetRow.length
+  const txt = msRenderSet(u, mask)
+  msSetRow.push(u)
+  msSetMask.push(mask)
+  msSetGen.push(msGen)
+  msSetNext.push(msRowChain[u])
+  msSetText.push(txt)
+  msRowChain[u] = id
+  if txt != "" {
+    if (msSetByText[txt] ?? -1) < 0 { msSetByText[txt] = id }
+  }
+  id
+}
+
+// The set id of union row `u`'s FULL member set, or -1 when the row is uncovered.
+function msSetOfRow(u: i32): i32 {
+  const st = msRowStart(u)
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  msSetIntern(u, (1 << n) - 1)
+}
+
+// The set id for a member-set STRING — the bridge that lets a consumer still holding
+// one join the structural side. A set the pool already rendered answers from the text
+// index; otherwise the string must be some union row's FULL member set (the only
+// place a set string is ever minted from a declaration), and a row whose recorded set
+// is exactly this text hands over its members. -1 = uncovered, and every consumer
+// keeps its string path — an ALIAS name (`N`, not `A|B`) lands here deliberately: the
+// legacy operations treat it as a one-atom set, and expanding it would change answers.
+export function msSetOfText(set: string): i32 {
+  if set == "" { return -1 }
+  const hit = msSetByText[set] ?? -1
+  if hit >= 0 {
+    if msSetGen[hit] == msGen { return hit }
+  }
+  if (msSetMiss[set] ?? -1) == msGen { return -1 }
+  let u = 0
+  while u < unMemberSet.length {
+    if unMemberSet[u] == set {
+      const id = msSetOfRow(u)
+      if id >= 0 { return id }
+    }
+    u = u + 1
+  }
+  msSetMiss[set] = msGen
+  -1
+}
+
+// The rendered member set of `s` (see `msRenderSet`).
+export function msTextOf(s: i32): string {
+  if s < 0 || s >= msSetText.length { return "" }
+  msSetText[s]
+}
+
+// ITERATION — append the set's member SPELLINGS to `out`, in the row's recorded
+// (box-tag ABI) order, without re-splitting anything: the recorded member column IS
+// the atom array `splitUnionAtoms` would rebuild, because `msSetOfText` hands back a
+// set only when the string IS that row's recorded member set, and the row's members
+// were split from exactly that string once, at registration. False = uncovered, `out`
+// untouched, and the caller splits as before.
+export function msMemberAtomsOf(set: string, out: string[]): boolean {
+  const s = msSetOfText(set)
+  if s < 0 { return false }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return false }
+  const n = unMemTyCount[u]
+  const mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) { out.push(unMemAtoms[st + i]) }
+    i = i + 1
+  }
+  true
+}
+
+// MEMBERSHIP of the `null` keyword — a member-KIND test over the set's members, with
+// no string compare at all.
+export function msHasNull(s: i32): boolean {
+  if s < 0 || s >= msSetRow.length { return false }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return false }
+  const n = unMemTyCount[u]
+  const mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if unMemKinds[st + i] == 0 { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// CARDINALITY of the non-`null` members — a bit count over the kind column.
+export function msNonNullCount(s: i32): i32 {
+  if s < 0 || s >= msSetRow.length { return 0 }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return 0 }
+  const n = unMemTyCount[u]
+  const mask = msSetMask[s]
+  let c = 0
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if unMemKinds[st + i] != 0 { c = c + 1 }
+    }
+    i = i + 1
+  }
+  c
+}
+
+// SUBTRACTION of the `null` keyword: clear every member whose KIND is the null token.
+export function msSubNull(s: i32): i32 {
+  if s < 0 || s >= msSetRow.length { return -1 }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  let mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if unMemKinds[st + i] == 0 { mask = mask - (1 << i) }
+    }
+    i = i + 1
+  }
+  msSetIntern(u, mask)
+}
+
+// SUBTRACTION of a named member: clear every member whose interned IDENTITY is the
+// removed one. `msAtomIdOf` peels grouping parens on both sides, exactly as the
+// string surgery's `peelGroupParens` comparison did, so an `is () => i64` test still
+// strips the `(() => i64)` member.
+export function msSubAtom(s: i32, removed: string): i32 {
+  if s < 0 || s >= msSetRow.length { return -1 }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  const rid = msAtomIdOf(removed)
+  let mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if unMemAtomIds[st + i] == rid { mask = mask - (1 << i) }
+    }
+    i = i + 1
+  }
+  msSetIntern(u, mask)
+}
+
+// ── the set ADT's consumers (structure first, string surgery as fall-through) ──
+
+// Set SUBTRACTION — the else-branch complement of `is removed` / `!= null`. The
+// structural path resolves the set, clears the removed member's bits and renders the
+// survivors in the row's recorded ORDER; `removeAtomFrom`'s string surgery stays as
+// the fall-through for a set the pool does not cover.
+export function removeAtomFromSet(set: string, removed: string): string {
+  const s = msSetOfText(set)
+  if s >= 0 {
+    let r = -1
+    // `null` is a KEYWORD, not a rendered shape — it is the one member the structural
+    // path identifies without any name at all (`unMemKinds`), and it is the dominant
+    // removal (every `!= null` else-branch).
+    if removed == "null" { r = msSubNull(s) } else { r = msSubAtom(s, removed) }
+    if r >= 0 { return msTextOf(r) }
+  }
+  removeAtomFrom(set, removed)
+}
+
+// MEMBERSHIP of `null` in a member set, structurally.
+export function unionSetHasNull(set: string): boolean {
+  const s = msSetOfText(set)
+  if s >= 0 { return msHasNull(s) }
+  unionHasAtom(set, "null")
+}
+
+// CARDINALITY of a member set's non-`null` members, structurally.
+export function unionSetNonNullCount(set: string): i32 {
+  const s = msSetOfText(set)
+  if s >= 0 { return msNonNullCount(s) }
+  nonNullMemberCountOf(set)
 }
 
 // ── D-UNION structural member classifiers ────────────────────────────────────
