@@ -281,6 +281,7 @@ import {
   rlElemKindTbl,
   rlElemName,
   rlElemNullable,
+  rlElemTyIx,
   rlUsed,
   rlWrapIdx,
   sDeclared,
@@ -325,6 +326,7 @@ import {
 } from "./emit_state"
 import { emitFail } from "./emit_bytes"
 import {
+  fieldElemTyIxOfName,
   mvSlotOfValNameTy,
   recordMvValTyIx,
   recordSFieldElemTyIx,
@@ -1230,9 +1232,7 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
   }
   if e is Index {
     const slot = refListSlotOfExpr(e.idxArr, fnIx)
-    if slot >= 0 && slot < rlElemName.length {
-      return rlSlotByName(refArrElemName(rlElemName[slot]))
-    }
+    if slot >= 0 && slot < rlElemName.length { return rlElemInnerSlot(slot) }
   }
   // A nulreflist-returning CALL (`const t = mk()`): its inner ref-list slot is the return's inner element.
   if e is Call {
@@ -1535,7 +1535,7 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
       if slot >= 0 && slot < rlElemKindTbl.length {
         if rlElemKindTbl[slot] == 1 {
-          if nullablePartOf(rlElemName[slot]) != "" { return true }
+          if rlElemIsNulNiche(slot) { return true }
         }
       }
     }
@@ -3998,6 +3998,139 @@ export function rlSlotOfTy(ty: i32): i32 {
   -1
 }
 
+// The ARENA type a ref-list SLOT's stored element name denotes (destringify
+// D5-final), or -1 when the sidecar does not cover the slot. The column pads on
+// push, so a lagging or missing entry answers "uncovered" and every consumer keeps
+// its element-NAME path.
+export function rlElemTyIxAt(slot: i32): i32 {
+  if slot < 0 { return -1 }
+  if slot >= rlElemTyIx.length { return -1 }
+  rlElemTyIx[slot]
+}
+
+// `refArrElemName`'s structural dual over a ref-list ELEMENT type: peel one
+// `TyNullable` hop (the `(S[] | null)[]` niche the name path recurses through),
+// then take the `TyArray`'s element. -1 when the element is not an array — the
+// name path answers "" there and its `rlSlotByName("")` misses, so both legs
+// decline together.
+export function tyRefArrElemOf(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let b = ty
+  const t = T.tys[b]
+  if t is TyNullable { b = t.nInner }
+  if b < 0 { return -1 }
+  const bt = T.tys[b]
+  if bt is TyArray { return bt.aElem }
+  -1
+}
+
+// The ref-list slot of a NESTED ref-list element's INNER list — the arena reading
+// of `rlSlotByName(refArrElemName(rlElemName[slot]))`. -1 when the sidecar does not
+// cover the slot, the element is not an array, or no slot claims the element type;
+// every caller keeps its name path for that answer (the ladder-faithful shape).
+export function rlInnerSlotOfElem(slot: i32): i32 {
+  rlSlotOfTy(tyRefArrElemOf(rlElemTyIxAt(slot)))
+}
+
+// `structIdxOfElemName`'s structural dual: the struct-table row of a ref-list
+// element TYPE, peeling the `| null` niche exactly as the name path does before
+// resolving. -1 when uncovered / not a declared row (the caller keeps its name path).
+export function structIdxOfElemTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let b = ty
+  const t = T.tys[b]
+  if t is TyNullable { b = t.nInner }
+  structIndexOfTy(b)
+}
+
+// The struct-table row of a ref-list SLOT's element, off the arena sidecar.
+export function rlElemStructIdxAt(slot: i32): i32 {
+  structIdxOfElemTy(rlElemTyIxAt(slot))
+}
+
+// Tri-state dual of `nullablePartOf(rlElemName[slot]) != ""`: `1` the element type
+// is a `TyNullable`, `0` it is not, `-1` the sidecar does not cover the slot — the
+// caller then keeps its name test, so the arena never answers where it cannot.
+export function rlElemTyNullableAt(slot: i32): i32 {
+  const ty = rlElemTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return 1 }
+  0
+}
+
+// The `$fnsig` key of a CLOSURE-element ref-list slot, off the arena: peel the
+// `| null` niche (the narrowed indexed call casts to the same functype a non-null
+// element does), then key the `TyFunc` spine directly (`sigKeyOfTy`, destringify
+// D3) instead of stripping the element name's grouping parens and re-parsing the
+// rendered signature. "" when uncovered or not a function type.
+export function rlElemCloSigKeyAt(slot: i32): string {
+  const ty = rlElemTyIxAt(slot)
+  if ty < 0 { return "" }
+  let b = ty
+  const t = T.tys[ty]
+  if t is TyNullable { b = t.nInner }
+  if b < 0 { return "" }
+  const bt = T.tys[b]
+  if bt is TyFunc { return sigKeyOfTy(b) }
+  ""
+}
+
+// The INNER ref-list slot of a nested / nullable ref-array ELEMENT (destringify
+// D5-final) - the chokepoint the eight `rlSlotByName(refArrElemName(rlElemName[s]))`
+// readers share. ARENA first (`rlElemTyIx` then the `TyArray`'s element then
+// `rlSlotOfTy`, the layer's own `repElemKey` lookup); the element-NAME surgery is the
+// untouched fall-through for a slot the sidecar does not cover (D1 leg C).
+export function rlElemInnerSlot(slot: i32): i32 {
+  const ar = rlInnerSlotOfElem(slot)
+  if ar >= 0 { return ar }
+  rlSlotByName(refArrElemName(rlElemName[slot]))
+}
+
+// The STRUCT-TABLE ROW of a ref-list element (destringify D5-final) - the chokepoint
+// the `structIdxOfElemName(rlElemName[s])` readers share. ARENA first (peel the
+// `TyNullable` niche, then `structIndexOfTy`), the recorded NAME for an uncovered row.
+export function rlElemStructRow(slot: i32): i32 {
+  const ar = rlElemStructIdxAt(slot)
+  if ar >= 0 { return ar }
+  structIdxOfElemName(rlElemName[slot])
+}
+
+// The array-LITERAL element's struct row: the same arena leg, but the fall-through is
+// the NOMINAL `structIndexByName` this site has always used (NOT the structural bridge
+// `structIdxOfElemName` adds) - a -1 here routes on to the concrete-VARIANT lookup, so
+// widening the name leg would change which arm answers.
+export function rlElemLitStructRow(slot: i32): i32 {
+  const ar = rlElemStructIdxAt(slot)
+  if ar >= 0 { return ar }
+  let ln = rlElemName[slot]
+  const lnn = nullablePartOf(ln)
+  if lnn != "" { ln = lnn }
+  structIndexByName(ln)
+}
+
+// Is a ref-list slot's element a NULLABLE NICHE (destringify D5-final)? ARENA first
+// (`T.tys[..] is TyNullable`), the `nullablePartOf` render test for an uncovered row.
+export function rlElemIsNulNiche(slot: i32): boolean {
+  const ar = rlElemTyNullableAt(slot)
+  if ar >= 0 { return ar == 1 }
+  nullablePartOf(rlElemName[slot]) != ""
+}
+
+// The `$fnsig` key of a CLOSURE-element ref-list slot (destringify D5-final): the
+// arena keys the `TyFunc` spine directly (`sigKeyOfTy`, D3), so the grouping-paren
+// strip + `annSigKey` re-parse of the rendered element name is the fall-through only.
+export function rlElemCloSigKey(slot: i32): string {
+  const ar = rlElemCloSigKeyAt(slot)
+  if ar != "" { return ar }
+  let nm = rlElemName[slot]
+  const nmp = nullablePartOf(nm)
+  if nmp != "" { nm = nmp }
+  if nm.length < 2 { return "" }
+  if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
+  annSigKey(nm.slice(1, nm.length - 1))
+}
+
 // The struct-table ROW for an ARENA type (destringify D5) — `structIndexByName`'s
 // arena-input twin, scanning the `sTyIx` sidecar (phase D0: the arena type each row
 // denotes, recorded at the row's mint) instead of the name column. Same
@@ -5569,15 +5702,7 @@ export function exprIsBool(ix: i32, fnIx: i32) {
 function cloArrSlotSigKey(slot: i32) {
   if slot < 0 || slot >= rlElemName.length { return "" }
   if rlElemKindTbl[slot] != 5 { return "" }
-  let nm = rlElemName[slot]
-  // A NULLABLE-closure element slot keys the full `"<closure> | null"` (the niche read
-  // discipline) — peel the `| null` to reach the parenthesized function type; the narrowed
-  // indexed call (`if e != null { e(1) }`) casts to the same functype a non-null element does.
-  const nmp = nullablePartOf(nm)
-  if nmp != "" { nm = nmp }
-  if nm.length < 2 { return "" }
-  if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
-  return annSigKey(nm.slice(1, nm.length - 1))
+  rlElemCloSigKey(slot)
 }
 
 // The closure RESULT type-NAME of a closure-element ref-list slot (kind 5): the element name is the
@@ -6274,7 +6399,7 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
       // A NULLABLE-struct element ref list (`(P | null)[]`, slot key "P | null"): the loop var
       // binds as a kind-9 niche (`for e in xs { if e != null { … e.v … } }`), and the element
       // read stays nullable (no `ref.as_non_null`). A plain `S[]` is the non-null kind 1.
-      if nullablePartOf(rlElemName[rslot]) != "" { return "nulstruct" }
+      if rlElemIsNulNiche(rslot) { return "nulstruct" }
       return "struct"
     }
     // A UNION-box element ref list (`(C | S)[]`, kind 2): the loop var binds as a kind-4
@@ -9209,6 +9334,12 @@ export function rlInternName(name: string, kind: i32) {
   const stored = rlElemStoredName(name)
   rlElemName.push(stored)
   rlElemKey.push(key)
+  // The ARENA type the STORED spelling denotes (destringify D5-final) — recorded
+  // here, once, because this is where the row is minted and the spelling is in
+  // scope. It is the STORED name that every downstream reader sees, so that is the
+  // spelling resolved (not the raw `name`, which `rlElemStoredName` may have folded).
+  // -1 for a spelling neither path resolves; consumers then keep their name path.
+  rlElemTyIx.push(fieldElemTyIxOfName(stored))
   rlElemHeap.push(0)
   rlBackIdx.push(0)
   rlWrapIdx.push(0)
@@ -18039,9 +18170,7 @@ export function structListPopGetElem(exprIx: i32, fnIx: i32) {
         if exprRefArray(callee.memObj, fnIx) {
           const slot = refListSlotOfExpr(callee.memObj, fnIx)
           if slot >= 0 && slot < rlElemKindTbl.length {
-            if rlElemKindTbl[slot] == 1 {
-              return structIdxOfElemName(rlElemName[slot])
-            }
+            if rlElemKindTbl[slot] == 1 { return rlElemStructRow(slot) }
           }
         }
       }
