@@ -3883,3 +3883,274 @@ unchanged on the new base (`typecheck.vl` 21 -> 20, the other two files untouche
     write; not necessary, because the ladder stops calling producers once one answers, so the
     winner is always the last writer. Identify the control-flow property that makes the read
     correct and state it — "every function writes it" is a habit, not an argument.
+
+## D-ELEMROW + D-UARMSLOT — the ref-list element ROW ladder, and the union ref-array ARM scanners (#1116)
+
+Two pieces, both aimed by #1114's transferable lesson (**a resolver is a LADDER; a dual of
+one rung is not a dual of the resolver**) and both settled by carrying every candidate
+beside the authority in ONE sweep.
+
+### The brief this slice was given is stale, and that is the first finding
+
+The brief's priority-1 target was *"the eleven-leg `nameIsRefArray` consumer family (ASLOT,
+AKIND, DLETN, DRETN, CRET, CPAR, ELETRA, FSTR, FF32, FI64, FF64) — the strongest deletion
+case this program has produced"*, carried forward from #1114's "What did NOT move". **All
+eleven were deleted in D-ANNSLOT (#1107)** — they are the first eleven of that slice's
+"What was deleted (13 legs)" list, and the current tree confirms it: `tyAnnRefListSlot`,
+`tyAnnRefListKind`, `retRefArrFlag`, `retNulRefArrFlag`, `paramRefArray`,
+`letIsNulRefArray`, `letIsRefArray` and the four `letIs*Array` ref-array rejects each read
+`annRefArrSlot` / `annBareRefArrSlot` / `annNulRefArrSlot` and have no name leg at all.
+What survives under that heading is a DIFFERENT population — the 24 residual
+`nameIsRefArray` call sites, of which the intern side owns most and the **union member-ATOM
+scanners** own the rest. Those are D-UARMSLOT below, and they were never annotation-node
+consumers. A stale line in a "what did NOT move" section outlived the work that moved it.
+
+### Harness
+
+Corpus = all **1,243** `tests/cases/**/*.vl`, three channels: per-file `vl build` **byte**
+compare, full stdout+stderr **message** compare (out-dir paths normalised), and
+`vl run --batch --out-dir` over the whole corpus as a **tree** `diff -r` plus transcript.
+Fuzz = **100,800 programs/side** (seeds 1-14 × depths 4,5,6 × {plain, `--branching
+--multiobs --declared`} × 1,200 per bucket, 84 buckets), generated ONCE by the master compiler so both sides see
+identical programs, compared as whole `--out-dir` trees. Probe builds report an accumulated
+tag table once at the end of `emitProgram` through `emitFail` (note 7), with `emitFailed`
+cleared first so a program that already rejected still reports.
+
+### D-ELEMROW — `rlElemStructRow` resolves its row in the arena's vocabulary, and the fieldset PARSE leaves the path
+
+`structIdxOfElemName` is a **four-rung** resolver: peel `nullablePartOf`, then
+`structIndexByName` (nominal), then `repRowOfName` (`renderFaithful` + `resolveAnnot` +
+the canon key), then `structIndexOfTypeName` (nominal again, then `nameIsWholeSpanShape` +
+`shapeFieldParse` + the `shapeFieldTypeCompat`-TIGHTENED field-name-set scan).
+`rlElemStructRow`'s arena leg reproduced rung 2 only — which is exactly why D-TOTALITY
+measured its fall-through (`RLSR`) **consequential 28 corpus / 246 fuzz**, the
+second-most load-bearing name leg on the whole map.
+
+One sweep, every candidate beside the authority, at the site:
+
+| at `rlElemStructRow` | corpus (1,243 files) | fuzz (100,800 programs) |
+|---|---|---|
+| calls reached | **697** (221 files) | **18,873** (9,939 programs) |
+| arena identity answers, name agrees | 530 | 14,060 |
+| … and DISAGREES | **0** | **0** |
+| arena declines, name answers (**consequential**) | **64** | **1,092** |
+| … answering rung = `structIndexByName` (nominal) | 48 | 468 |
+| … answering rung = `repRowOfName` (canon key) | 16 | 624 |
+| … answering rung = the TIGHTENED fieldset scan | **0** | **0** |
+| … `repRowOfTyStruct` off the RECORDED type reproduces it | 38 eq / 26 decline / **0 wrong** | 1,052 eq / 40 decline / **0 wrong** |
+| … the LENIENT (untightened) scan reproduces it | 22 eq / 24 decline / **18 WRONG** | 908 eq / 36 decline / **148 WRONG** |
+| both legs decline (answer unchanged at -1) | 103 | 3,721 |
+
+So the shipped ladder is **arena identity → NOMINAL identity → the canon-key row off the
+recorded type**, and the whole `structIdxOfElemName` call — with `repRowOfName`'s
+`resolveAnnot` and `structIndexOfTypeName`'s `shapeFieldParse` inside it — is **deleted from
+this path**. Candidate answers vs today's answer: **697/697 and 18,873/18,873 equal, 0
+disagreements**, in both rung orders tested.
+
+Three things this measurement decided that reading the code would not have:
+
+- **The `| null` peel stays.** The no-peel variant is equal on the whole corpus and
+  declines **4** calls in **2** fuzz programs. A parse kept because a witness says so.
+- **The lenient field-name-set scan is not admissible here.** #1114 shipped it inside
+  `rlSlotOfTyTwin` because `repStructSlotsTwin` re-gates a lenient match; this row is a
+  store/push struct index, and the same scan is WRONG on 18 corpus + 148 fuzz calls. Method
+  note 27's asymmetry, run backwards: a site whose answer IS byte-observable cannot take a
+  rung whose errors a twin guard would have absorbed.
+- **`rlElemLitStructRow` must NOT get the new rung.** Its comment always claimed that
+  ("widening the name leg would change which arm answers"); measured, the canon-key rung —
+  in either order — changes **7** corpus calls and **311** fuzz programs, every one a
+  both-decline today, i.e. exactly the -1 the concrete-VARIANT route depends on.
+
+### D-UARMSLOT — the four union ref-array ARM scanners, and D-UNION's standing refutation answered
+
+Four scanners (`unionHasRefArrayArmSlot`, `unionRefArrayArmSlotForElemAtom`,
+`unionRefArrayArmSlotForMapElem`, `unionNestedArrayArmSlot`) each walked
+`splitUnionAtoms(name)` and ran the same per-atom step:
+
+```
+a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a)  →  rlSlotByName(refArrElemName(a))
+```
+
+Three of them carry a D-UNION comment saying the arena is **not** interchangeable here,
+and that comment is right about the predicate it names: `unMemIsRefElemArray` is a SHAPE
+test (a `TyArray` over a non-scalar) and `nameIsRefArray` folds INTERN STATE into its
+answer, so substituting the shape test over-accepts an element the reflist layer never
+named. The migration does not substitute it. It asks the **intern-state question
+directly** — *does the ref-list table hold a ROW for this member's element type* —
+`unMemRefArrArmSlot(m) = rlSlotOfTy(tyRefArrElemOf(m))`, which is the same question
+`rlSlotByName(refArrElemName(a))` asks, one vocabulary down. An element the layer never
+named has no row and declines exactly as `rlSlotByName("")` does. This is D-ANNSLOT's
+unlock (*ask for the ROW, not for the shape*) applied to union MEMBERS.
+
+| per-member, name step vs arena composite | corpus | fuzz |
+|---|---|---|
+| comparisons (U1 / U2 / U3 / U4) | 63 / 113 / 5,542 / 9 | 796 / 1,473 / 308,130 / 68 |
+| **disagreements** | **0** | **0** |
+| arena answers where the name declines (the refuted over-accept) | **0** | **0** |
+| name answers where the arena declines | **0** | **0** |
+| member columns UNCOVERED at a reach | **0** | **0** |
+
+**Why the arena leg is total here (mechanism, not a 0).** Coverage is `unionMemberTysOf`,
+which needs a registered row with every member type recorded. All four scanners are reached
+only from `emitUnionCoerce`'s box-building path, where `unionName` is the coercion TARGET
+union — the same population D-UHATOTAL closed for `unionHasAtomTy` (union rows are minted
+atomically with their member arena columns at exactly three sites; a box exists only
+because that registration happened), and the same `unionName` reaches `unionHasAtomTy`
+in the same lowering, which now `emitFail`s loudly for an unregistered row (on the
+literal-arm path that call is AHEAD of the arm scanner; on the carrier path it is
+below it, so it is corroboration, not a precondition). A
+scanner that nevertheless declined would answer "no arm", which at all four sites degrades
+into an existing LOUD reject, never a silent mis-tag — the failure direction that made this
+deletion cheaper to justify than #1114's.
+
+Two faithfulness guards the equality probe could not sample, both added deliberately:
+
+- **`unionArmMemberTys` declines an ALIAS spelling.** `unionRowOf` matches `unNames`
+  first, so `unionMemberTysOf("N")` would EXPAND an alias into its members — where the
+  name loops split `"N"` into one atom that no arm test accepts. Declining reproduces the
+  old answer. (Measured: no alias ever reaches these sites — the probe's coverage tag
+  required `mems.length == atoms.length` and never once failed.)
+- **`unionHasRefArrayArmSlot` returns false for `slot < 0`.** The old loop could match a
+  carrier slot of -1 against an arm whose element named no row (`-1 == -1`) — the very
+  mis-tag its D-UNION comment warns about. Inert in practice: the only caller floors its
+  slot at 0 (`refListSlotOfExpr`).
+
+`unionRefArrayArmSlotForElemAtom` still reads a member-set SPELLING for its element-atom
+test, and now reads the ARM ROW's stored one; `rlElemName[slot] == refArrElemName(a)` at
+**31** corpus and **151** fuzz calls, 0 disagreements. `unionRefArrayArmSlotForMapElem`'s
+`mvSlotOfMapValNameOrMono(mapValNameOf(en))` became the ref-list layer's own chokepoint
+`rlElemMapValMvSlot(slot)` — a dedup, since that chokepoint's name fall-through IS the
+expression it replaced, tri-state discipline included.
+
+### Entombment (method note 21) — four sabotages, all with power
+
+Both pieces are behaviour-preserving refactors, so neither can have a fails-on-master test.
+The evidence is equivalence plus sabotages that leave the equivalence class:
+
+| sabotage | corpus byte | msg files | run-tree lines | files that stop emitting |
+|---|---|---|---|---|
+| `rlElemStructRow`'s whole fall-through forced to -1 | **19** | 17 | **86** | 1 |
+| ONLY the new canon-key rung forced to -1 (nominal rung intact) | **8** | 8 | **39** | 0 |
+| `unMemRefArrArmSlot` forced to -1 | **7** | 30 | **204** | 23 |
+| `unMemRefArrArmSlot` returns a same-KIND twin row (still an interned slot) | **3** | 5 | **52** | 3 |
+
+The second row is the one that matters most: it says the rung this slice ADDED is
+load-bearing on its own, so "the arena canon key reproduces `repRowOfName`" is not an
+untested claim riding a byte-identical A/B. Unlike #1114's D-TWINROW, no piece of this
+slice is invisible to every output channel.
+
+Corpus witnesses per migrated arm site (from the probe's per-file hits): U1 19 files
+(e.g. `closures/closure-array-union-arm-field-call.vl`), U2 10, U3 8, U4 4
+(`unions/nested-array-union-arm.vl`, `unions/nested-box-array-arm-element-union.vl`,
+`maps/nested-map-array-union-arm-read.vl`,
+`closures/nested-closure-array-union-arm-call.vl`).
+
+### The call arithmetic (non-comment call sites, the five owned files)
+
+| resolver | master | now | delta |
+|---|---|---|---|
+| `refArrElemName` | 39 | 34 | **−5** |
+| `nameIsRefArray` | 28 | 24 | **−4** |
+| `rlSlotByName` | 22 | 18 | **−4** |
+| `splitUnionAtoms` | 34 | 30 | **−4** |
+| `valueAtomKind` | 36 | 32 | **−4** |
+| `mapValNameOf` | 32 | 31 | **−1** |
+| `mvSlotOfMapValNameOrMono` | 16 | 15 | **−1** |
+| `nameIsMap` / `nameIsMapMemberUnion` | 27 / 18 | 26 / 17 | **−1 / −1** |
+| `structIdxOfElemName` | 3 | 2 | **−1** |
+| `nullablePartOf` | 56 | 57 | **+1** |
+| `unionMemberSetOf` | 23 | 24 | **+1** |
+
+**NET −24 call sites.** Reported honestly by class:
+
+- **Type-string PARSES deleted: 17** — `refArrElemName` ×5, `nameIsRefArray` ×4,
+  `splitUnionAtoms` ×4, `mapValNameOf` ×1, `nameIsMap` ×1, `nameIsMapMemberUnion` ×1, and
+  the `nullablePartOf` inside the deleted `structIdxOfElemName` call ×1.
+- **Name-keyed RESOLVERS deleted: 6** — `rlSlotByName` ×4, `mvSlotOfMapValNameOrMono` ×1,
+  `structIdxOfElemName` ×1 (the four-rung one).
+- **Deleted from a PATH, not from the source: 2** — `repRowOfName`'s
+  `renderFaithful` + `resolveAnnot`, and `structIndexOfTypeName`'s `shapeFieldParse` +
+  tightened fieldset scan, both of which keep other callers.
+- **Keyword-ladder sites deleted: 4** (`valueAtomKind`) — method note 18 says these score
+  **0** as parses; counted separately, not in the parse total.
+- **Parses ADDED: 0.** The two additions are the `| null` peel that moved from inside
+  `structIdxOfElemName` to the call site (a wash) and one NOMINAL `unionMemberSetOf`
+  alias guard.
+- **Consumers migrated to a ladder with a live name fall-through: 0.** Both pieces are
+  deletions on their paths.
+
+### Gate
+
+Corpus **byte-, message- AND run-identical**: 1,243 files, 1,056 emitting wasm — **0**
+byte-diffs, **0** message-diff files, **0** run-tree diff lines, transcripts identical.
+Fuzz A/B **100,800 programs/side**, 105,434 output files/side, whole `--out-dir` trees:
+**0** diffs.
+
+`refresh-compiler.sh` RC=0 (1,020,008 bytes) · `rep-fuzz-check.sh` RC=0 (exact; 1
+baselined failure — 0 unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=0
+(stage3 == stage4, 1,020,008 bytes) · `lint-self.sh` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno
+task test` RC=0 (**1,956 passed, 0 failed**, 14 ignored — this worktree's number; the
+brief quotes 1,962/8 for `/workspace` and the delta is still unexplained). Binary delta
+vs master: **−18 bytes** (1,020,026 → 1,020,008).
+
+### What did NOT move, and the blocking mechanism
+
+- **`structIdxOfElemName` itself survives**, for its one remaining caller
+  (`structIdxOfElemName(refListElemNameOfExpr(iterIx, fnIx))`). That caller consumes a
+  name PRODUCER — the close-out list's terminal item — so it cannot take a recorded type
+  until `refListElemNameOfExpr` does. Its rung 3 (the tightened fieldset scan) is
+  therefore still live source; what this slice proves is that the scan answers **0** times
+  on the ref-list ROW population.
+- **`rlElemTyIx` coverage.** 24 corpus / 36 fuzz consequential calls have no recorded
+  element type at all, and are answered by the NOMINAL rung. The mechanism is visible:
+  `rlInternName` records `fieldElemTyIxOfName(stored)` — it RESOLVES the name it just
+  stored instead of receiving a type from the producer. The uncovered population is
+  EXACTLY the synthetic-`#anonN` population, and that is a CROSS-TAB, not two totals that
+  happen to match: over the calls where the new ladder's rungs 2-3 answer, corpus is
+  {uncovered ∧ `#`: **24**, uncovered ∧ not-`#`: **0**, covered ∧ `#`: **0**, covered ∧
+  plain: 40} and fuzz is {**36**, **0**, **0**, 1,056}. Uncovered ⟺ `#`-spelled, both
+  directions, 102,043 programs. The fix is the bank-at-the-producer play (`rlInternName(name, kind, tyIx)`),
+  and it is what would let the nominal rung retire too. Not attempted here: 5 of the 9
+  intern call sites are in `emit_collect.vl` (concurrently owned).
+- **`rlElemLitStructRow`** stays nominal-only, on the 7/311 measurement above.
+- **`unionRefArrayArmSlotForElemAtom`'s element-union atom test** still compares rendered
+  atom spellings (`eAtoms[j] == elemAtom`). `elemAtom` is produced by `emitUnionCoerce`'s
+  literal probe as a keyword or a variant name, so it is a name-identity compare, not a
+  parse — but the SET it is compared against is still reached through a member-set
+  spelling.
+
+### Hand-offs
+
+- **`emit_collect.vl` / whoever owns the intern sites**: `rlInternName` should take the
+  element's arena type from its callers rather than re-resolving the stored spelling.
+  Nine call sites (`emit_collect.vl` ×5, `emit_classify.vl` ×4 — `mvRlSlot` ×3 and
+  `ensureRefElem`); each already holds either a node type or a struct/variant row. That
+  single change is what makes `rlElemStructRow`'s nominal rung retirable, and it also
+  feeds every other `rlElemTyIxAt` consumer.
+- **The other three `unMemRefArrArmSlot` shapes**: `unionHasClosureArrayArm`,
+  `unionHasMapArrayArm` and `unionArmPathIsCloArray` run the same atom loop over a
+  member set; the first two already have `unMem*` shape predicates and need only the
+  ROW composite plus the same reach/agreement/decline probe triple.
+
+### Method notes earned
+
+30. **A "what did NOT move" entry outlives the work that moved it** (this slice) — the
+    eleven-leg `nameIsRefArray` family was carried forward as the top target through two
+    briefs after D-ANNSLOT deleted every one of the eleven. Sections that record a
+    BLOCKER are written once and never re-checked, unlike the sections that record work.
+    Re-derive a target from the tree before spending a slice on it; the cheapest possible
+    check (grep the named functions for the named fall-through) refutes it in a minute.
+31. **A candidate rung must be measured at the SITE that will consume it, not at the
+    layer** (D-ELEMROW) — the untightened field-name-set scan is correct inside
+    `rlSlotOfTyTwin` (#1114) and WRONG at `rlElemStructRow` (18 corpus + 148 fuzz calls),
+    because the first re-gates a lenient match through `repStructSlotsTwin` and the second
+    returns the row straight to a `struct.new`. A rung's admissibility is a property of
+    the consumer's error tolerance, not of the rung.
+32. **Ask for the ROW, not for the shape** (D-UARMSLOT) — D-UNION refuted the structural
+    predicate `unMemIsRefElemArray` as a substitute for `nameIsRefArray` and three
+    comments recorded the site as unmigratable. The refutation is sound and the conclusion
+    was too broad: `nameIsRefArray`'s extra content is INTERN STATE, so the faithful dual
+    is not a shape test but the intern-state lookup `rlSlotOfTy(tyRefArrElemOf(m))` — 0
+    disagreements in 316,194 member comparisons (5,727 corpus + 310,467 fuzz) where the
+    shape test disagreed twice in 50,400 programs. When a name predicate folds in intern state, the arena dual is a
+    TABLE lookup keyed by the arena, not a structural classifier.
