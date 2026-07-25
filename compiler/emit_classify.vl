@@ -4221,6 +4221,17 @@ export function rlElemStructIdxAt(slot: i32): i32 {
   structIdxOfElemTy(rlElemTyIxAt(slot))
 }
 
+// The recorded element type of ref-list slot `slot` with its `| null` niche peeled —
+// the arena reading of `nullablePartOf(rlElemName[slot])`, and the input the canon-key
+// row rung keys on. -1 when the sidecar does not cover the slot.
+export function rlElemNonNulTyAt(slot: i32): i32 {
+  const ty = rlElemTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  ty
+}
+
 // Tri-state dual of `nullablePartOf(rlElemName[slot]) != ""`: `1` the element type
 // is a `TyNullable`, `0` it is not, `-1` the sidecar does not cover the slot — the
 // caller then keeps its name test, so the arena never answers where it cannot.
@@ -4260,19 +4271,77 @@ export function rlElemInnerSlot(slot: i32): i32 {
   rlSlotByName(refArrElemName(rlElemName[slot]))
 }
 
-// The STRUCT-TABLE ROW of a ref-list element (destringify D5-final) - the chokepoint
-// the `structIdxOfElemName(rlElemName[s])` readers share. ARENA first (peel the
-// `TyNullable` niche, then `structIndexOfTy`), the recorded NAME for an uncovered row.
+// The interned ref-list SLOT of union MEMBER `m`'s ref-ARRAY arm (destringify
+// D-UARMSLOT) — the arena reading of the four arm scanners' shared per-atom step
+// (`a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a)`, then
+// `rlSlotByName(refArrElemName(a))`), and the answer to D-UNION's standing refutation.
+//
+// That refutation is about the SHAPE predicate: `unMemIsRefElemArray` (a `TyArray`
+// over a non-scalar) accepts an element the reflist layer never NAMED, where
+// `nameIsRefArray` folds INTERN STATE into its answer — so substituting it
+// over-accepts. This asks the intern-state question DIRECTLY: not "is this member
+// structurally a ref array" but "does the ref-list table hold a ROW for this member's
+// element type", which is what all four consumers actually want. A member the layer
+// never named has no row and declines here exactly as `rlSlotByName("")` does; a
+// member that is not an array at all declines inside `tyRefArrElemOf`. -1 = no arm.
+//
+// A bare-SCALAR array member (`i32[]`, `string[]`) cannot answer through this by
+// construction: a ref-list row's element type is never a bare scalar (a scalar leaf
+// list is not a ref list — the rows of kinds 4/6/7/8/10 hold LIST elements), so
+// `rlSlotOfTy` of a scalar finds no row. Measured: 0 disagreements with the name step
+// over 5,727 corpus + 310,467 fuzz member comparisons (1,243 files + 100,800
+// programs), and the member columns covered 100% of those reaches.
+export function unMemRefArrArmSlot(m: i32): i32 {
+  rlSlotOfTy(tyRefArrElemOf(m))
+}
+
+// The STRUCT-TABLE ROW of a ref-list element (destringify D5-final, D-ELEMROW) — the
+// chokepoint the `structIdxOfElemName(rlElemName[s])` readers share. THREE rungs, in the
+// order `structIdxOfElemName` itself resolves them (method note 26: a resolver is a
+// LADDER, and a dual of one rung is not a dual of the resolver):
+//
+//   1. ARENA IDENTITY — the recorded element type, `| null` peeled, through the D0
+//      `sTyIx` sidecar (`rlElemStructIdxAt`).
+//   2. NOMINAL IDENTITY — `structIndexByName` on the stored spelling. A name is a name:
+//      this is the exact-match rung the name ladder opens with, and the only rung that
+//      answers for a row the arena does not cover — and the uncovered population is
+//      EXACTLY the synthetic-`#anonN` one, cross-tabbed both ways (24 of 24 corpus and
+//      36 of 36 fuzz calls, with 0 uncovered non-`#` and 0 covered `#`).
+//   3. The CANON-KEY row, off the RECORDED TYPE (`repRowOfTyStruct`) — what
+//      `repRowOfName` computes, minus its `renderFaithful` + `resolveAnnot` re-parse of
+//      a spelling the intern site already resolved.
+//
+// The `structIndexOfTypeName` rung the name ladder ends with — `nameIsWholeSpanShape` +
+// `shapeFieldParse` + the `shapeFieldTypeCompat`-tightened field-name-set scan — is
+// DELETED here, not laddered: it is the ANSWERING rung at this site **0** times over
+// 1,243 corpus files and 100,800 fuzz programs (rung 1 answers 48 + 468 of the calls
+// where the arena identity declines, rung 3's dual 16 + 624, the fieldset scan 0 + 0).
+// The `| null` peel above it is NOT deletable and is kept: dropping it declines 4 calls
+// in 2 fuzz programs that resolve a row today.
+//
+// The LENIENT (untightened) field-name-set scan `rlSlotOfTyTwin` uses is deliberately
+// NOT a rung here: it disagrees with the name resolver on 18 corpus and 148 fuzz calls.
+// A twin-row consumer can absorb a lenient match (`repStructSlotsTwin` re-gates it);
+// this row is a store/push struct index, where a leniently-matched row is a wrong heap
+// type — the same asymmetry method note 27 draws around layout twins, in reverse.
 export function rlElemStructRow(slot: i32): i32 {
   const ar = rlElemStructIdxAt(slot)
   if ar >= 0 { return ar }
-  structIdxOfElemName(rlElemName[slot])
+  let ln = rlElemName[slot]
+  const lnn = nullablePartOf(ln)
+  if lnn != "" { ln = lnn }
+  const bn = structIndexByName(ln)
+  if bn >= 0 { return bn }
+  repRowOfTyStruct(rlElemNonNulTyAt(slot), sScanLim())
 }
 
 // The array-LITERAL element's struct row: the same arena leg, but the fall-through is
 // the NOMINAL `structIndexByName` this site has always used (NOT the structural bridge
 // `structIdxOfElemName` adds) - a -1 here routes on to the concrete-VARIANT lookup, so
-// widening the name leg would change which arm answers.
+// widening the name leg would change which arm answers. That is now MEASURED, not
+// argued: giving this site `rlElemStructRow`'s canon-key rung (in either order) changes
+// the answer on **7** corpus calls and **311** fuzz programs — every one of them a
+// both-decline today, i.e. exactly the -1 the variant route depends on.
 export function rlElemLitStructRow(slot: i32): i32 {
   const ar = rlElemStructIdxAt(slot)
   if ar >= 0 { return ar }
@@ -13007,33 +13076,33 @@ function unionArmPathIsClosure(arm: string, path: string[]): boolean {
   false
 }
 
+// The recorded member TYPES of a member-SET spelling, for the four ref-array ARM
+// scanners (destringify D-UARMSLOT). `unionMemberTysOf` accepts an ALIAS name too
+// (`unionRowOf` matches `unNames` first), and an alias must NOT expand here: the name
+// loops these scanners replaced split the alias spelling into ONE atom (`N`), which no
+// arm test accepts, so expanding it would be an extension, not a migration. Declining
+// an alias reproduces that. Measured: every reach at all four sites is a set spelling
+// whose recorded member count matches its atom split (0 alias / uncovered reaches over
+// 1,243 corpus files and 100,800 fuzz programs).
+function unionArmMemberTys(name: string, out: i32[]): boolean {
+  if unionMemberSetOf(name) != name { return false }
+  unionMemberTysOf(name, out)
+}
+
 // True if the union member-set `name` (pipe-joined atoms) has a REF-ELEMENT array arm whose
 // interned reflist slot is `slot` — the guard `emitUnionCoerce` uses to confirm a ref-array
 // carrier actually matches an arm before boxing it with that arm's `refArrSlotTag`. A ref-array
 // expr whose slot matches no arm falls through (a checker-impossible case) rather than mis-tag.
 export function unionHasRefArrayArmSlot(name: string, slot: i32) {
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
-  // D-UNION: NOT migrated — REFUTED by measurement, and the refutation is the point.
-  // `unMemIsRefElemArray` is the exact dual of `markRefArrayArms`' `nameIsArray` gate,
-  // but `nameIsRefArray` here asks a STRICTLY narrower question: it also requires the
-  // element to be NAMEABLE by the reflist layer (`structIndexByName` /
-  // `shapeElemDeclaredStructIdx` / `variantIndexOf` / the union scan), i.e. it folds in
-  // INTERN STATE, not just structure. An inline-shape element array reached only through
-  // a closure result (`(i32,i32,i32) => {f: i32}[] | f64`) is a `TyArray` over a `TyObj`
-  // — structurally a ref array — while its spelling never interned a struct row, so the
-  // name path answers NO and `refArrElemName` answers "". Substituting the arena
-  // predicate makes the slot compare below read `rlSlotByName("") == -1`, which MATCHES
-  // a `slot` of -1 and boxes under a tag no producer interned. Fuzz found the shape
-  // twice in 50,400 programs (seed 7 d6 plain, seed 13 d6 `--declared`); both are loud
-  // rejects today, so nothing broke — but the predicate is not interchangeable, which is
-  // the D1/D2 lesson wearing a third hat.
+  // `refListSlotOfExpr` floors a miss at 0, so the only caller never asks about a
+  // negative slot; the guard keeps "the carrier has no slot" from matching a member
+  // that has no arm row (both -1) — the mis-tag the D-UNION note above warned about.
+  if slot < 0 { return false }
+  const mems: i32[] = []
+  if !unionArmMemberTys(name, mems) { return false }
   let i = 0
-  while i < atoms.length {
-    const a = atoms[i]
-    if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
-      if rlSlotByName(refArrElemName(a)) == slot { return true }
-    }
+  while i < mems.length {
+    if unMemRefArrArmSlot(mems[i]) == slot { return true }
     i = i + 1
   }
   false
@@ -13074,25 +13143,26 @@ export function unionRefArrayArmSlotForElem(name: string, elemAtom: string) {
 // The exact-atom pass of `unionRefArrayArmSlotForElem`: the first union-box-element
 // ref-array arm whose element union carries `elemAtom` verbatim (any arm for "").
 function unionRefArrayArmSlotForElemAtom(name: string, elemAtom: string) {
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
+  // The arm slot per MEMBER, off the arena (D-UARMSLOT). The element-union ATOM test
+  // below still reads a member-set spelling, and it reads the ARM ROW's stored one:
+  // `rlElemName[slot] == refArrElemName(a)` at 31 corpus and 151 fuzz calls, 0
+  // disagreements — the row stores the very spelling the parse produced.
+  const mems: i32[] = []
+  if !unionArmMemberTys(name, mems) { return -1 }
   let i = 0
-  while i < atoms.length {
-    const a = atoms[i]
-    if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
-      const en = refArrElemName(a)
-      const slot = rlSlotByName(en)
-      if slot >= 0 && rlElemKindTbl[slot] == 2 {
-        if elemAtom == "" { return slot }
-        let es = unionMemberSetOf(en)
-        if es == "" { es = en }
-        const eAtoms: string[] = []
-        if !msMemberAtomsOf(es, eAtoms) { splitUnionAtoms(es, eAtoms) }
-        let j = 0
-        while j < eAtoms.length {
-          if eAtoms[j] == elemAtom { return slot }
-          j = j + 1
-        }
+  while i < mems.length {
+    const slot = unMemRefArrArmSlot(mems[i])
+    if slot >= 0 && rlElemKindTbl[slot] == 2 {
+      if elemAtom == "" { return slot }
+      const en = rlElemName[slot]
+      let es = unionMemberSetOf(en)
+      if es == "" { es = en }
+      const eAtoms: string[] = []
+      if !msMemberAtomsOf(es, eAtoms) { splitUnionAtoms(es, eAtoms) }
+      let j = 0
+      while j < eAtoms.length {
+        if eAtoms[j] == elemAtom { return slot }
+        j = j + 1
       }
     }
     i = i + 1
@@ -13109,29 +13179,20 @@ function unionRefArrayArmSlotForElemAtom(name: string, elemAtom: string) {
 // loud reject.
 export function unionRefArrayArmSlotForMapElem(name: string, mvShape: i32) {
   if mvShape < -1 { return -1 }
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
-  // D-UNION: the arm SHAPE test is `unMemIsMapArray` (a `TyArray` over a `TyMap` —
-  // the `nameIsMapMemberUnion` exclusion is free structurally, a map-member UNION
-  // element being a `TyUnion`), and the arm's stored element NAME still keys the
-  // reflist/mv slot lookups, which are rep questions answered where they are.
+  // D-UNION / D-UARMSLOT: the arm SHAPE test is `unMemIsMapArray` (a `TyArray` over a
+  // `TyMap` — the `nameIsMapMemberUnion` exclusion is free structurally, a map-member
+  // UNION element being a `TyUnion`), the arm ROW is `unMemRefArrArmSlot`, and the
+  // arm's map-VALUE slot is the ref-list layer's own chokepoint `rlElemMapValMvSlot`
+  // — whose name fall-through IS the `mvSlotOfMapValNameOrMono(mapValNameOf(...))`
+  // this site used to spell out, tri-state discipline included.
   const mems: i32[] = []
-  const cov = unionMemberTysOf(name, mems) && mems.length == atoms.length
+  if !unionArmMemberTys(name, mems) { return -1 }
   let i = 0
-  while i < atoms.length {
-    const a = atoms[i]
-    let isMapArr = false
-    if cov {
-      isMapArr = unMemIsMapArray(mems[i])
-    } else if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
-      const pen = refArrElemName(a)
-      isMapArr = nameIsMap(pen) && !nameIsMapMemberUnion(pen)
-    }
-    if isMapArr {
-      const en = refArrElemName(a)
-      const slot = rlSlotByName(en)
+  while i < mems.length {
+    if unMemIsMapArray(mems[i]) {
+      const slot = unMemRefArrArmSlot(mems[i])
       if slot >= 0 && slot < rlElemKindTbl.length && rlElemKindTbl[slot] == 3 {
-        const armMv = mvSlotOfMapValNameOrMono(mapValNameOf(en))
+        const armMv = rlElemMapValMvSlot(slot)
         if armMv == -1 && mvShape == -1 { return slot }
         if armMv >= 0 && mvShape >= 0 {
           if mvCanonRepOf(armMv) == mvCanonRepOf(mvShape) { return slot }
@@ -13156,27 +13217,23 @@ export function unionRefArrayArmSlotForMapElem(name: string, mvShape: i32) {
 // either mismatched the arm (the old loud reject) or fell through toward the scalar
 // value-atom ladder (nested reject).
 export function unionNestedArrayArmSlot(name: string) {
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
-  // D-UNION: NOT migrated, for the reason spelled out at `unionHasRefArrayArmSlot` —
-  // `nameIsRefArray` folds the reflist layer's INTERN STATE into its answer, so the
-  // arena's `unMemIsRefElemArray` is a strict superset of it. (Here the over-accept
-  // would be inert — an unnameable element yields `rlSlotByName("") == -1` and the
-  // `slot >= 0` guard drops it — but "inert by argument" is not "equal by measurement",
-  // and this layer's whole discipline is the latter.)
+  // D-UARMSLOT: the arm rows come off the recorded member types. The D-UNION note this
+  // replaced said the arena's `unMemIsRefElemArray` is a strict SUPERSET of
+  // `nameIsRefArray` and that an inert over-accept is still not an equality — which is
+  // why the migrated form asks `unMemRefArrArmSlot` (does a ROW exist for the member's
+  // element) rather than the shape predicate, and why the equality was measured.
+  const mems: i32[] = []
+  if !unionArmMemberTys(name, mems) { return -1 }
   let found = -1
   let n = 0
   let i = 0
-  while i < atoms.length {
-    const a = atoms[i]
-    if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
-      const slot = rlSlotByName(refArrElemName(a))
-      if slot >= 0 && slot < rlElemKindTbl.length {
-        const k = rlElemKindTbl[slot]
-        if k == 4 || k == 6 || k == 7 || k == 8 || k == 9 || k == 10 {
-          found = slot
-          n = n + 1
-        }
+  while i < mems.length {
+    const slot = unMemRefArrArmSlot(mems[i])
+    if slot >= 0 && slot < rlElemKindTbl.length {
+      const k = rlElemKindTbl[slot]
+      if k == 4 || k == 6 || k == 7 || k == 8 || k == 9 || k == 10 {
+        found = slot
+        n = n + 1
       }
     }
     i = i + 1
