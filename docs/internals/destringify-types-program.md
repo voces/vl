@@ -1057,6 +1057,145 @@ it guards is migrated either way. The 3 sites that **return** `mvValName[slot]` 
 And the `mvValName[i] == name` scan, which is the layer's nominal fast path ahead of
 `repMvValKey` (legitimate, #1094).
 
+### D5-final (c) — the map-ELEMENT ref-list readers (`rlElemName` → the mv layer) — SHIPPED
+
+D5-final (a) migrated the ref-list element readers and **deliberately skipped one family**:
+the sites that ask *"which mv slot does this map ELEMENT's value occupy?"* —
+`mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[s]))` and its `mvSlotByValNameOr` twin.
+The stated reason was the D3′ sentinel: the name resolvers are **tri-state and overloaded**
+(`-1` = a MONO i32 map riding the shared struct, `-3` = uninterned/unsupported, `>= 0` = a
+slot), so a degenerate arena `-1` would be read as "mono" — the collision that refuted
+`nameIsRefArray` in D-UNION batch 3, where a clean corpus and **2 disagreements in 50,400
+fuzz programs** were the whole difference. This slice is that family.
+
+**Every path enumerated first, and the enumeration corrected the scope by three.** The
+starting list carried four sites (`rlSlotsLayoutTwin`'s kind-3 arm ×2, `compositionMapReadSlot`
+×2). Scanning for the same surgery performed *through a local* — `let en = rlElemName[s]` …
+`mapValNameOf(en)`, which no `mapValNameOf(rlElemName[…])` grep can see — found **three more
+in `mAssignTypeIndices`**, and those three are the **WRITE half of the pair** the twin
+comparator reads:
+
+| tag | site | file | the decision |
+|---|---|---|---|
+| `TW3A`/`TW3B` | `rlSlotsLayoutTwin`'s kind-3 arm | emit_classify | do two MAP-element ref-list slots share an element heap |
+| `CMPN` | `compositionMapReadSlot`, nested-map read | emit_classify | the mv slot an `outer[k]` read's inner map has |
+| `CMPL` | `compositionMapReadSlot`, list-of-maps read | emit_classify | the same for `xs[i]` over a `{[string]:V}[]` |
+| `WSIG3` | `mAssignTypeIndices`' `rlSig` kind-3 arm | emit_collect | which ref-list slots TWIN (`"3:m"` mono vs `"3:<rep>"`) |
+| `WHP3A` | `mAssignTypeIndices`' `rlElemHeap` kind-3, pass 1 | emit_collect | the shared `mStructIdxPre` vs a deferred typed map struct |
+| `WHP3B` | `mAssignTypeIndices`' kind-3 second pass | emit_collect | the element's own `mvMapTypeIdx` |
+
+`rlSlotsLayoutTwin`'s own doc comment states the invariant that makes this a pair — *"each
+arm must stay at least as strict as its `rlSig` twin, so a claimed twin always resolves equal
+(backing, wrapper) pairs there"*. Migrating the comparator and leaving the sig on the name
+path is exactly the straddle `EQA` was pulled into D-UNION batch 4 to avoid: on any input
+where the two legs disagreed, slots would be *claimed* twins by one resolution and given
+*different* heap pairs by the other. Both halves move together. (The read side has a third
+consumer, `mapShapeOfExpr`, which is itself the one chokepoint both the local's declared map
+struct — the write — and every later map op on it — the read — go through, so
+`compositionMapReadSlot` is inherently both halves.)
+
+**One arena leg + three chokepoints, all ladder-faithful (D1 leg C).**
+`rlElemMapValMvSlotAt(slot, peelNul)` is the arena leg — `rlElemTyIx` → (optionally peel one
+`TyNullable`) → the `TyMap`'s value → `mvSlotOfTy`, i.e. the mv layer's own `repMvValKey`
+lookup. `rlElemMapValMvSlot` / `rlElemNulMapValMvSlot` (emit_classify) and `rlMapElemValSlot`
+(emit_collect, whose `canon` flag picks which of the two *name* legs falls through) put it in
+front of the untouched name path.
+
+**Which axis each site is on, decided before the swap.**
+- **D2 (type vs REP).** The answer is an mv SLOT — a rep question — so it resolves through
+  `mvSlotOfTy`/`repMvValKey`, never `repCanonKey` (which expands a declared struct and would
+  collapse `{[string]:A}` / `{[string]:B}` twins that hold distinct mv rows) and never
+  `repElemKey` (which folds every shared-wrapper leaf list onto one token). The
+  `mvCanonValName` fold the second heap pass performs on its *name* is subsumed:
+  `repMvValKey` performs the same mixed-litunion→`string` fold itself, so the arena leg needs
+  no `canon` flag and the two name legs keep theirs.
+- **D1 (timing).** The sidecar stores an INDEX and every read re-derives from `T.tys[ix]` at
+  QUERY time, so an in-place arena mutation (`holeMemberTy`) moves both legs together.
+  `rlElemTyIx` is already emptied at the **top of `emitProgram`** — verified, not assumed
+  (method note 8) — ahead of `collectU`/`collectS`/`collectA`; no new sidecar was added.
+- **D3′ (structure vs SENTINELS) — the hazard that parked this family, audited per site.**
+  Every arena leg answers **only `>= 0`**. Its own miss — uncovered row, not a `TyMap`, no mv
+  row claims the inner value — is *indistinguishable from "mono" inside the chokepoint* and
+  is therefore consumed there and turned into "use the name path". No caller ever sees the
+  arena's miss, so the degenerate `-1 == -1` collision cannot arise: `rlSlotsLayoutTwin`'s
+  `ma == -1 && mb == -1 { return 1 }` rung and `mAssignTypeIndices`' `mmv < 0 → "3:m"` rung
+  are reached only with the NAME path's own `-1`. This is `E-LET`'s containment discipline
+  from D5-final (b), applied to six sites instead of one.
+
+**Method + measurements.** Additive probe at all 7 tags at once (compute both, KEEP the name
+answer, an **accumulating** tag set reported once at the end of `emitProgram`; coverage never
+on the failure channel, method note 7): **0 disagreements** over the 1,269-file corpus
+(`tests/cases` + `std/` + the compiler's own source) and over **25,200** fuzz programs
+(seeds 1–14 × depths 4–6 × {plain, `--declared`} × 300) — and the probe build is itself
+corpus **byte-identical and run-identical**, so it really was additive. Migrated: corpus
+**byte-identical** AND run-identical, 66-case battery 0 diffs, fuzz A/B identical (2,248
+shape lines both sides). **Shared-instance gate** (the only channel that sees a
+sidecar-lifetime bug): 605 array/struct/union/map/object/closure/type programs through **ONE**
+`vl run --batch` instance per side — 649 outputs each, **0 traps, 0 diffs**.
+
+**Coverage, per site** — files where the ARENA leg actually answered, counted in the INVERTED
+build, never on the probe's own report channel: `WSIG3` 24 · `WHP3A` 24 · `WHP3B` 24 ·
+`CMPL` 14 · `CMPN` 10 · `TW3A` 2 · `TW3B` 2. No site had a coverage gap, so none was left
+unmigrated for want of evidence. (A pure *reach* marker — entering the site, covered or not —
+fires on 33 `CMPL` / 13 `CMPN` / 13 `RLEMV` / 2 `TW3` files; the difference is rows the
+sidecar does not cover, which keep the name path.)
+
+**Gate-channel sabotage, per site.** An arena leg broken only where that site's migrated leg
+answers, every other site left correct — corpus byte / build-status / run-status:
+`WHP3B` 23 byte / 22 run · `CMPL` 12 + 2 build / 12 · `CMPN` 5 + 4 build / 8 ·
+`WSIG3` 3 + 1 build / 4 · `TW3A` 2 / 2 · `TW3B` 1 / 1. All seven at once: **18 BYTEDIFF +
+6 build-status, 22 run-status**. Both kind-3 pins (`maps/map-value-twin-heap.vl` and
+`unions/variant-twin-map-elem-list-field.vl`, the reachers #1099's study constructed) are the
+files that redden for `TW3A`/`TW3B` — the entombment test the brief prescribes for a
+byte-identical migration, where a pin *cannot* fail on master.
+
+**Two sabotage lessons worth recording.**
+- **`TW3A`'s off-by-one perturbation produced ZERO diffs, and the reason is method note 9.**
+  `ma` is the LOWER of the two slots the comparator is handed, so `ma + 1` lands on the OTHER
+  member of the same layout-twin class — an injective relabeling INSIDE one equivalence class,
+  which leaves every comparison unchanged. Forcing the arena's answer to the mono sentinel
+  instead changes which slots COLLIDE, and reddens both pins. `TW3B` reddened under the
+  off-by-one only because `mb + 1` runs off the end of the mv table and degrades to the same
+  mono forcing. When sabotaging a comparator, break the equivalence — and check that your
+  perturbation actually left the class.
+- **`WHP3A` produces ZERO corpus diffs when deliberately broken, and that is provable rather
+  than a corpus gap.** The second heap pass (`WHP3B`) overwrites `rlElemHeap[rmf]`
+  unconditionally wherever its own resolve answers `>= 0`, and its arena leg is *the same
+  leg* — so on every input where `WHP3A`'s migrated leg answers, `WHP3B` answers too and
+  writes over it. `WHP3A`'s decision is unobservable **by construction**, not merely on this
+  surface. Stated plainly: **the probe (24 corpus firings, 0 disagreements) is that site's
+  only gate**, and it is in the batch because leaving one of the three passes on a different
+  resolution is precisely the straddle this slice exists to prevent. (The D-RET lesson — a
+  green A/B is not evidence for what the channel cannot express — applied for the fourth time
+  in this program; see also batch 3's `unionListElemMapFieldMember` and D5-final (a)'s `B-AN`.)
+
+**`refListElemNameOfExpr` is TERMINAL — a name producer, measured, not asserted.** Its
+map-read arm (`refArrElemName(mvValName[slsMv])`) was the last item on the close-out's
+unmigrated list, classified as "a name producer; it retires with its consumers". The
+classification was re-checked two ways and both confirm it.
+
+*By consumer.* `refListElemNameOfExpr` returns a NAME, and its callers consume it as one:
+`rlInternName(refListElemNameOfExpr(i, -1), 1)` (emit_collect — an **INTERN** site, which
+needs the emit-canonical stored spelling, the D2 `rlElemStoredName` residual),
+`fRetRArrElem[i] = …` (a name COLUMN), `structIndexByName` / `variantIndexOf` at
+`structIndexOfExpr`'s and `exprVariantIndex`'s Index arms (**nominal identity** — a declared
+name *is* the identity, explicitly not a target of this program), `structIdxOfElemName`, and
+`rlSlotByName` via `refListSlotOfExpr` (already `repElemKey`-keyed since D2). Nothing here
+re-derives structure from the rendering; the site FORWARDS a name to name-keyed APIs.
+
+*By measurement.* The only arena route to a NAME is to render the recorded index
+(`tyToEmitName(tyRefArrElemOf(mvValTyIxAt(slsMv)))`), and an additive probe comparing the two
+**disagrees on 5 of the 1,269 corpus files**, in the direction that matters: the stored name
+is NOMINAL and alias-preserving, the arena render is STRUCTURALLY EXPANDED —
+`S` vs `{v:i32}`, `P` vs `{n:i32}`, `Cat|Dog` vs `{meow:i32}|{bark:i32}`,
+`C|S` vs `{kind:i32,r:i32}|{kind:i32,side:i32}`, `((i32)=>i32)` vs `(i32)=>i32`
+(`maps/ref-list-values.vl`, `maps/ref-list-value-boundary.vl`, `maps/struct-list-valued-map.vl`,
+`types/union-array-operations.vl`, `closures/closure-array-literal-classify.vl`). Feeding the
+expanded spelling to `structIndexByName` / `variantIndexOf` answers NO exactly where the
+stored spelling answers YES. This is the D2/D-RET lesson once more — *a different renderer
+asks a different question* — and here it is load-bearing rather than theoretical. **The site
+stays name-keyed**, and it retires when the `rlElemStoredName` column does, not before.
+
 ### D5 — delete the name columns
 
 Once nothing reads a table's name column for anything but diagnostics, demote it to a
@@ -1100,7 +1239,8 @@ condition names two things, so measure those:
 | struct/variant field LITUNION (atom-rep) classified by re-parsing a NAME | 4 sites | **0** (`tyIsLitUnion` / `tyIsLitUnionArray` over the D5 sidecars) |
 | `structFieldCodesEq`'s referenced ROW resolved from a recorded NAME | yes | **no** (`repStructRowByTy`; the `ea != eb` identity fast path stays, deliberately) |
 | union-BOX tag / widening chosen by comparing a member set's rendered ATOMS | 16 sites | **0** (`unMemHasAtom` → `unionHasAtomTy`; the atom scan is the fall-through). 12 raw `unionHasAtom` calls remain, none of them the box ABI — see D-UNION batch 4 |
-| ref-list ELEMENT structure re-derived by string surgery on the stored name (its inner slot / struct row / niche / `$fnsig`) | 22 sites | **19 migrated** (`rlElemTyIx` → `rlElemInnerSlot`/`rlElemStructRow`/`rlElemIsNulNiche`/`rlElemCloSigKey`) — the last 3 were `rlSlotsLayoutTwin`'s kind-9 arm + struct tail, reached and migrated by the reachability study below. The map-value / variant-index / name-producing readers are untouched |
+| ref-list ELEMENT structure re-derived by string surgery on the stored name (its inner slot / struct row / niche / `$fnsig`) | 22 sites | **19 migrated** (`rlElemTyIx` → `rlElemInnerSlot`/`rlElemStructRow`/`rlElemIsNulNiche`/`rlElemCloSigKey`) — the last 3 were `rlSlotsLayoutTwin`'s kind-9 arm + struct tail, reached and migrated by the reachability study below. The variant-index / name-producing readers are untouched |
+| ref-list MAP-ELEMENT value slot re-derived by string surgery on the stored name | 7 sites | **7 migrated** (`rlElemTyIx` → `rlElemMapValMvSlotAt` → `rlElemMapValMvSlot`/`rlElemNulMapValMvSlot`/`rlMapElemValSlot`) — see D5-final (c). Both the twin comparator (read) and `mAssignTypeIndices`' three sig/heap passes (write) move together |
 | map-VALUE structure re-derived by string surgery on the stored name (its inner ref-list slot / inner mv slot / null atom / niche / `scalar\|null` peel / twin key) | 9 sites | **9 migrated** (`mvValTyIx` → `mvValInnerRlSlot`/`mvValInnerMvSlot`/`mvValUnionHasNull`/`mvValNulRefNicheAt`/`mvValUnionScalarNullAt`/`mvValCanonKey`) — see D5-final (b). The union-box name ARGUMENT, the `nameIsRefArray` guard and the 3 name-producing readers stay |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
@@ -1192,29 +1332,46 @@ then walk back to the enclosing function and dedupe.
    disagreements. That aborted 241 corpus builds and quintupled the fuzz findings, i.e. the
    probe stopped being additive and its own A/B gate went dark. Coverage counts belong in the
    INVERTED (sabotage) build, where an abort is the intended signal.
+8. **Sabotage a COMPARATOR by breaking the equivalence, not the text** (D5-final (b), and
+   again in (c)) — an INJECTIVE relabeling of a key leaves every comparison unchanged and
+   reads as a false "probe-only" verdict. D5-final (b) learned it from a constant key prefix
+   that produced zero diffs; (c) hit the sharper version: an OFF-BY-ONE slot at `TW3A` landed
+   on the other member of the same layout-twin class — a relabeling *inside* one equivalence
+   class — and produced zero diffs, while the identical perturbation at `TW3B` reddened only
+   because it ran off the end of the table and degraded into a sentinel forcing. After
+   perturbing, check that you actually left the class.
+9. **A grep for `f(table[i])` misses the same surgery routed through a LOCAL** (D5-final (c))
+   — three of that slice's seven sites spell it `let en = table[i]` … `f(en)`, and they were
+   the WRITE half of a read/write pair whose read half the brief did enumerate. Enumerate by
+   *resolver called*, not by expression shape.
 
 The first three are the same underlying mistake: assuming an arena artifact answers the same
 question the string did. Check which question the site is asking, first.
 
-## Close-out measurement (master e1e2ad6, after 11 slices)
+## Close-out measurement (after D5-final (c), 13 slices)
 
 Measured, not asserted. The reproducible commands are in "How to verify" and the
 "Counting caveat".
 
-| check | result |
+| check | at e1e2ad6 (11 slices) | now |
+|---|---|---|
+| structural decision from a **rendered** type | 0 | **0** (the 4 grep hits are doc comments naming the retired pattern) |
+| string surgery on a stored name column | 18 matches → 7 doc comments, 5 ladder fall-throughs, **6 genuinely unmigrated** | 17 matches → **9 doc comments**, **7 ladder fall-throughs** (inside a migrated chokepoint, by design; an 8th hides behind a local in `emit_collect`'s `rlMapElemValSlot`), **1 genuinely unmigrated** |
+| name-keyed `table[i] == name` scans | 13 | **12** real scans (14 grep hits − 1 doc comment − 1 `!= ""` emptiness test) — nominal identity (`sNames`/`unNames`/`uVariants`), ABI identity (`cloSigKeys`), the union member-set algebra (`unMemberSet`), and the exact-match fast paths ahead of the structural keys |
+
+### The 6, resolved: 5 migrated, 1 terminal
+
+| item | verdict |
 |---|---|
-| structural decision from a **rendered** type | **0** |
-| string surgery on a stored name column | 18 matches → **7 doc comments**, **5 ladder fall-throughs** (inside a migrated chokepoint, by design), **6 genuinely unmigrated** |
-| name-keyed `table[i] == name` scans | 13 — nominal identity (`unNames`/`uVariants`), ABI identity (`cloSigKeys`), and the exact-match fast paths ahead of the structural keys |
+| `rlSlotsLayoutTwin`'s kind-9 arm + struct tail (×2 of the original ×4) | **migrated** (#1099) — the reachability study *constructed* the reachers a 0-firing marker had missed |
+| `rlSlotsLayoutTwin`'s kind-3 arm (×2) | **migrated** — D5-final (c), `TW3A`/`TW3B`; sentinel contained inside the chokepoint |
+| `compositionMapReadSlot` (×2 — the enumeration found it is two sites, not one) | **migrated** — D5-final (c), `CMPN`/`CMPL` |
+| `refListElemNameOfExpr` | **TERMINAL, with a measurement.** A name PRODUCER whose output feeds an INTERN site (`rlInternName`), a name COLUMN (`fRetRArrElem`) and two NOMINAL lookups (`structIndexByName` / `variantIndexOf`). The only arena route to a name renders the recorded index, and that render **disagrees on 5 corpus files** — nominal `S` / `Cat\|Dog` vs structurally-expanded `{v:i32}` / `{meow:i32}\|{bark:i32}` — in the direction that would break the nominal lookups. It retires with the `rlElemStoredName` column, not before. |
 
-### The 6 genuinely unmigrated, each with its measured reason
-
-- `rlSlotsLayoutTwin` ×4 — a **reach** marker fired on 0/1265 corpus files and 0/25,200 fuzz
-  programs. Unverifiable at the time, so not migrated (#1096). **Superseded**: the
-  reachability study below reached the kind-9 arm and the struct tail and migrated them;
-  the ×2 map-value sites (the kind-3 arm) remain.
-- `refListElemNameOfExpr` — a name **producer**; it retires with its consumers, not here.
-- `compositionMapReadSlot` — the map-element map-value slot, deferred in #1096's enumeration.
+Plus **3 sites the enumeration added** and D5-final (c) migrated: `mAssignTypeIndices`'
+`rlSig` kind-3 arm and its two `rlElemHeap` kind-3 passes — the WRITE half of the pair
+`rlSlotsLayoutTwin`'s kind-3 arm reads, invisible to a `mapValNameOf(rlElemName[…])` grep
+because the surgery runs through a local.
 
 ### What "done" means here
 
@@ -1223,9 +1380,16 @@ every layer that decides structure, representation, or ABI. Names persist for re
 for nominal identity, and as the fall-through of ladders whose arena leg decides first.
 That was the stated terminal condition, and it holds.
 
-**Six consumers stand deliberately unmigrated** across the program because sabotage
-measured them unverifiable (0 firings) — no test or fuzz program could prove a change
-correct. That is the intended outcome of the method, not a shortfall.
+**A handful of consumers stand deliberately unmigrated** across the program, each for a
+reason that was *measured*, not assumed: sabotage found them unverifiable (0 firings —
+`unionHasCollapsedStringMapArm`, `shapeFieldTypeCompat`'s atom arms,
+`structIndexOfExpr`'s un-narrowed variant arm), or the arena artifact was shown to answer a
+**different question** than the name path (`nameIsRefArray`'s reflist intern state,
+`structFieldCodesEq`'s `ea != eb` identity fast path, `annShapeIndexOf`'s query-time minting,
+and — the last item on the close-out list — `refListElemNameOfExpr`, whose arena render
+disagrees with the stored nominal spelling on 5 corpus files). A reasoned *"this must stay
+name-keyed"* converts an open item into a terminal one; that is the intended outcome of the
+method, not a shortfall.
 
 ## Reachability study — `rlSlotsLayoutTwin`'s kind-9 arm and struct tail
 
@@ -1260,5 +1424,9 @@ ever answer "twin" on today's surface; their refusal direction has no witness.
 
 The kind-3 (map-element) arm is reachable too — `tests/cases/unions/variant-twin-map-elem-list-field.vl`
 and, already in the corpus, `tests/cases/maps/map-value-twin-heap.vl` — but its two sites
-need the tri-state `mvSlotOfMapValNameOrMono` sentinel untangled first (the D3′ collision
-above), so they stay on the name path with a pin now guarding them.
+needed the tri-state `mvSlotOfMapValNameOrMono` sentinel untangled first (the D3′ collision
+above), so they stayed on the name path with a pin guarding them. **D5-final (c) untangled
+it** (containment: the arena leg answers only `>= 0`, its miss consumed inside the
+chokepoint) and migrated both sites; those two pins are exactly the files that redden under
+the `TW3A`/`TW3B` gate-channel sabotage, which is the entombment test a byte-identical
+migration can have.

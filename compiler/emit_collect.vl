@@ -375,6 +375,7 @@ import {
   retRefArrElemName,
   retStructIndex,
   rlElemInnerSlot,
+  rlElemMapValMvSlotAt,
   rlElemStructRow,
   rlInternName,
   scopeBind,
@@ -2207,6 +2208,28 @@ function mvSlotByValNameOr(vn: string): i32 {
   mvSlotByValName(vn)
 }
 
+// The mv slot a MAP-element ref-list slot's VALUE occupies — the element-heap
+// resolver's twin of `rlElemMapValMvSlot` (destringify D5-final (c)). ARENA first
+// (`rlElemTyIx` → peel one `TyNullable` → the `TyMap`'s value → `mvSlotOfTy`), the
+// element-NAME surgery as the untouched fall-through. `canon` picks which name leg:
+// the second heap pass canonicalises the value name before its lookup (a mixed
+// litunion-alias value `K0 | i64` interns as `string | i64`), the sig / first heap
+// pass does not. The arena leg needs no such flag — `repMvValKey` performs that fold
+// itself (#1094).
+// SENTINEL DISCIPLINE (D3'): `mvSlotByValNameOr` misses with -1, which every caller
+// reads as "the MONO map"; the arena leg therefore answers ONLY a real slot (>= 0)
+// and its own miss is swallowed here, never returned.
+function rlMapElemValSlot(slot: i32, canon: boolean): i32 {
+  const ar = rlElemMapValMvSlotAt(slot, true)
+  if ar >= 0 { return ar }
+  let en = rlElemName[slot]
+  const enn = nulMapInnerName(en)
+  if enn != "" { en = enn }
+  let vn = mapValNameOf(en)
+  if canon { vn = mvCanonValName(vn) }
+  mvSlotByValNameOr(vn)
+}
+
 // Walk the type-section emit order with the `mAllocType` counter, assigning each
 // type's heap index into the module-global index state (`sHeapIdx`/`uVarHeap`/
 // `uBoxIdx`/`aTypeIdx`/`lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`mkArrIdx`/`mkListIdx`/
@@ -2314,10 +2337,7 @@ export function mAssignTypeIndices(_n: i32) {
       // its backing then held inner-map refs where nested maps flow: INVALID-WASM (fuzz
       // sweep4 branching seed 353749292 + sweep5 declared seed 167105674 — the family's
       // 2nd independent draw).
-      let rse3 = rlElemName[rss]
-      const rse3n = nulMapInnerName(rse3)
-      if rse3n != "" { rse3 = rse3n }
-      const mmv = mvSlotByValNameOr(mapValNameOf(rse3))
+      const mmv = rlMapElemValSlot(rss, false)
       if mmv < 0 {
         sig = "3:m"
       } else {
@@ -2382,10 +2402,7 @@ export function mAssignTypeIndices(_n: i32) {
       // AFTER this loop) — deferred to the second pass below (heap 0 here). This is the
       // position-independent rep: a map element resolves the SAME struct a standalone
       // `{[string]: V}` binding does, whichever value type it carries.
-      let k3en = rlElemName[rs]
-      const k3nin = nulMapInnerName(k3en)
-      if k3nin != "" { k3en = k3nin }
-      if mvSlotByValNameOr(mapValNameOf(k3en)) < 0 {
+      if rlMapElemValSlot(rs, false) < 0 {
         rlElemHeap[rs] = mStructIdxPre
       } else {
         rlElemHeap[rs] = 0
@@ -2570,17 +2587,14 @@ export function mAssignTypeIndices(_n: i32) {
   let rmf = 0
   while rmf < rlElemName.length {
     if rlElemKindTbl[rmf] == 3 {
-      // A NULLABLE map element (`{[string]: V} | null` slot key) strips to its inner map.
-      let rmfen = rlElemName[rmf]
-      const rmfnin = nulMapInnerName(rmfen)
-      if rmfnin != "" { rmfen = rmfnin }
-      // Canonicalize the value name (`mvCanonValName`) BEFORE the lookup: the mv table is
-      // keyed CANONICALLY (a mixed litunion-alias value `K0 | i64` interns as `string | i64`),
-      // so a raw element-map name (the closure-result / tyToEmitName render PRESERVES the `K0`
-      // alias — #945) would miss the slot and leave the element heap at the shared MONO map
-      // (i32-backed vals) while the map's own binding uses the box-backed struct — INVALID-WASM
-      // (fuzz-sweep.0ZaYSm branching p2c). Mirrors `mvShapeOfValName`/`mvSlotOfValNameFind`.
-      const mmv = mvSlotByValNameOr(mvCanonValName(mapValNameOf(rmfen)))
+      // `canon` = the value-NAME leg canonicalizes (`mvCanonValName`) BEFORE its lookup:
+      // the mv table is keyed CANONICALLY (a mixed litunion-alias value `K0 | i64` interns
+      // as `string | i64`), so a raw element-map name (the closure-result / tyToEmitName
+      // render PRESERVES the `K0` alias — #945) would miss the slot and leave the element
+      // heap at the shared MONO map (i32-backed vals) while the map's own binding uses the
+      // box-backed struct — INVALID-WASM (fuzz-sweep.0ZaYSm branching p2c). Mirrors
+      // `mvShapeOfValName`/`mvSlotOfValNameFind`. The ARENA leg folds that itself.
+      const mmv = rlMapElemValSlot(rmf, true)
       if mmv >= 0 { rlElemHeap[rmf] = mvMapTypeIdx[mmv] }
     }
     rmf = rmf + 1
