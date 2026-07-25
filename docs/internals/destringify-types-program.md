@@ -4703,3 +4703,292 @@ any `<` in the VALUE, so it cannot see one — left alone deliberately, not over
     program with a non-generic type and running it on MASTER. Two of the three were
     pre-existing; the third (three shapes composed in one program) is genuinely new and is
     reported as such rather than folded into the fix.
+## D-ARROWTY + D-ANNRLREC — the SECOND arc: the emitter renders a type and then takes the render apart (#1119)
+
+#1117 refuted the framing that the parser is *the* source of the parsed strings: of 557
+non-comment parse sites, only 71 (12.7%) take `TypeRef.tyName` within one function's reach,
+and its own closing note named a **second arc** — `arena → tyToEmitName → parse` — as the
+larger share and as unreachable from a parser-side tree. That arc lives in the emitter. This
+slice maps it in the five emit files and kills the part it can prove.
+
+### The enumeration, and the counting method
+
+A **local-aware** scan over `emit_classify.vl` / `emit_rep.vl` / `emit_state.vl` /
+`wasmEmit.vl` / `emit_rewrite.vl`: every non-comment call of the SCORECARD parser list
+(plus `refArrElemKind` / `nameIsI32ListArray` / `nameIsMapArray` / `nullClosureArrElem`),
+with the argument expression traced back through the enclosing function's `const`/`let`
+bindings and params, and then **ONE HOP** into the callee for a call-shaped argument — the
+step #1117's scan deliberately did not take, and the reason its renderer share reads 0.5%.
+A function is classified RENDER if it (transitively, by name) reaches `tyToEmitName` /
+`tyToStr` / `tyToNominalName` / `renderFaithful`; COLUMN if it indexes a stored emitter name
+column; PARSERSTR if it reads `.tyName`.
+
+**354 parse call sites** in the five files on master (emit_classify 331 · wasmEmit 12 ·
+emit_rewrite 9 · emit_rep 2) — the same 354 on #1117's base and on #1118's, so the
+arithmetic below is base-independent.
+
+| provenance of the parsed string | sites |
+|---|---|
+| an expression this scan could not attribute | 152 |
+| the enclosing function's own `string` parameter | 130 |
+| **a stored emitter name COLUMN** (`rlElemName`, `mvValName`, `narrowVariants`, …) | **27** |
+| **a RENDERER's output** (one hop) | **18** |
+| a string literal | 11 |
+| `TypeRef.tyName` | 10 |
+| the `inferRetNameByNode` table (a STORED render) | 6 |
+
+Hand-verified, the RENDER column resolves to exactly **three producers**, and only one of
+them is a renderer the emitter calls directly:
+
+- **`nodeTyName(ix)`** — `tyToStr`/`tyToEmitName` of `nodeTyIxOf(ix)`. Six consumer sites:
+  `exprIsClosure` (1 `annArrowAt`), `identFnTypeAnnName` (2 `annArrowAt`), `synthParamAnnots`
+  (4: `nullablePartOf`, `nameIsRefArray` ×2, `refArrElemName`), `structIndexOfExpr`
+  (2 `structIndexOfTypeName` rungs).
+- **`inferRetNameByNode(nodeIx)`** — a STORED `tyToEmitName` render (`irRendered`,
+  typecheck.vl:1103). One consumer, `synthRetAnnots`, which takes it apart at **19** sites.
+- the remaining 12 RENDER rows are one-hop false positives of the transitive classifier
+  (a callee that reaches a renderer on some *other* path); each was read and rejected.
+
+So the second arc, in this partition, is **three producers and 31 consumer sites** — not a
+diffuse condition. That is the finding the enumeration was for.
+
+### D-ARROWTY — three consumers stop asking a render whether it has an arrow
+
+`annArrowAt(nodeTyName(ix)) >= 0` asks "did the checker type this node as a FUNCTION". The
+renderer had the type. The arena dual is `nodeTyIsFuncTy(ix)` = `T.tys[nodeTyIxOf(ix)] is
+TyFunc`, and it is **exact by construction**, which the site comment records: `tyToStr`
+spells a function with `->` and never `=>` and wraps an object in `{…}`; `tyToEmitName`'s
+`TyArray` arm PARENTHESIZES a `TyFunc` element (`(()=>i32)[]`) precisely so the trailing
+`[]` cannot bind into a closure result; `tyToEmitName`'s `TyFunc` arm always emits its `=>`
+at depth 0. So for a NON-EMPTY render the two agree, always. The single residual is a
+`TyFunc` whose render FAILS (`""`) — where the name test says no and the arena says yes —
+and every call site already carried the `!= ""` guard that closes it, so the substitution is
+byte-exact rather than merely measured.
+
+Measured anyway, candidate beside authority in one sweep:
+
+| site | corpus reaches | fuzz reaches | auth YES | cand YES | **disagreements** |
+|---|---|---|---|---|---|
+| `exprIsClosure` (chained value call) | 447 | 270 | 11 / 236 | 11 / 236 | **0 / 0** |
+| `identFnTypeAnnName` (Call init) | 542 | 473 | 402 / 0 | 402 / 0 | **0 / 0** |
+| `identFnTypeAnnName` (`??` init) | 454 | 9,660 | 439 / 9,593 | 439 / 9,593 | **0 / 0** |
+
+**11,846 comparisons, 0 disagreements, in both directions** (of 1,274 corpus files, 1,058
+reach `emitProgram` and report — the rest are lex/parse/check rejects that never get there;
+of 50,400 fuzz programs, 50,047 report). The probe measurement was taken on #1117's base;
+the sites and the arithmetic are unchanged on #1118's.
+
+### D-ANNRLREC — `synthParamAnnots`'s ref-list ROW record is DEAD, and half of it provably
+
+The block below `recordNodeTyFrom` re-derived, from the render, the ref-list row the
+annotation node names:
+
+```
+const nnName = resolveShapeToNominal(tn)        // a SECOND call, byte-identical to line 610's
+const nnNp = nullablePartOf(nnName)
+if nnNp != "" && nameIsRefArray(nnNp) { nnBase = nnNp; nnNul = 1 }
+if nameIsRefArray(nnBase) { recordAnnRlSlot(nn, rlSlotByName(refArrElemName(nnBase)), nnNul) }
+```
+
+`recordAnnRlSlot`'s two columns have exactly **one reader each**: `annRlNulAt` inside
+`annTyNulFlag`, and `annRlSlotAt` inside `annRefArrSlot` — and both consult the node's
+recorded arena type FIRST.
+
+- **The nullable half is dead BY CONSTRUCTION.** The `recordNodeTyFrom(nn, ps[pi])` on the
+  line above guarantees `nodeTyIxOf(nn) >= 0` (the arm is entered only when
+  `tn = nodeTyName(ps[pi]) != ""`, which means the param HAS a recorded type), so
+  `annTyNulFlag(nn)` returns from the arena and can never reach `annRlNulAt`.
+- **The slot half is dead by measurement.** Over **15,760 reaches** (466 corpus + 15,294
+  fuzz) the `nameIsRefArray` gate opened **2** times, both corpus; on both,
+  `annRefArrSlot`'s own arena rung (`rlSlotOfTy(tyRefArrElemOf(...))` over the SAME type)
+  already resolved the SAME row, and the name leg never once answered where the arena
+  declined. Rows only ever append, so a row the arena resolves at synth time it still
+  resolves at the consumer.
+- The duplicated `resolveShapeToNominal(tn)` went with it: 0 divergence between the two
+  calls over all 15,760 reaches (the function is pure — `structIndexOfTypeName` +
+  `variantIndexOfTypeName` are lookups), so the deleted call was one whole
+  `nameIsArray` + `nameIsWholeSpanShape` + `shapeFieldParse` + fieldset scan per reach.
+
+### The REFUTED one: `structIndexOfExpr`'s render→fieldset rungs stay
+
+`structIndexOfExpr`'s Call fallback renders the node type twice (`nodeTyCanonObjName`, then
+`nodeTyName`) and feeds each to `structIndexOfTypeName` — the loudest render→parse in the
+file. The obvious dual is `structIndexOfTy(nodeTyIxOf(exprIx))`. **It is not a dual**, and
+only measuring showed it:
+
+| at `structIndexOfExpr`'s node-type fallback | corpus | fuzz |
+|---|---|---|
+| reaches | 200 | 3,804 |
+| the name ladder answers | 196 | 3,287 |
+| `structIndexOfTy` answers | 17 | 265 |
+| … and **DISAGREES** | 0 | **172** (3 programs) |
+| `structIndexOfTy` DECLINES where the name answers | **179** | **3,023** |
+
+The mechanism: `structIndexOfTy` scans the D0 `sTyIx` sidecar for arena-index **identity**,
+and the `Ty` arena is not hash-consed — the checker's per-node type for `{a,f,z}` is a
+different index from the one recorded when the struct ROW was minted, so identity declines
+(92% of the time); and where identity does hit, it can hit a row the field-set scan would
+not have picked, which is the 172. Witness: fuzz `s5_d5_plain_00837` (37 reaches, 37
+disagreements) — `((i32) => {a: boolean, f: string | null, z: i32})[] | null`, the closure-
+array element call `t0[0](1).f`. This is method note 26 again with a new face: the name
+resolver is a LADDER (nominal, then a TIGHTENED field-set scan) and an arena-IDENTITY lookup
+is not a dual of either rung. Filed with the mechanism, not with a verdict.
+
+### Entombment (method note 21) — one piece reddens, one cannot
+
+Both pieces are behaviour-preserving, so neither can have a fails-on-master test.
+
+| sabotage | corpus byte | msg files | run-tree lines | files that stop emitting |
+|---|---|---|---|---|
+| S1 `nodeTyIsFuncTy` always FALSE | **10** | 10 | **70** | 10 |
+| S2 `nodeTyIsFuncTy` always TRUE (over-accept) | **28** | 19 | **129** | 25 |
+| S3 master records a WRONG ref-list row + flipped nul at `synthParamAnnots` | **0** | 0 | **0** | 0 |
+
+(Each row re-measured on the rebase base; S1/S2 identical to the #1117-base run.)
+
+S1/S2 say D-ARROWTY's migrated leg is load-bearing in both directions (witnesses:
+`closures/closure-result-closure-valuecall.vl`, `closures/curried-contextual-typing.vl`,
+`maps/map-struct-closure-closure-map-value.vl`, …). S1 also carries the FUZZ channel:
+**731** tree-diff lines and 146 extra output files over 50,400 programs — the comparator
+sanity at intended volume against a deliberately wrong build. (S2 is **0** on fuzz: the
+generator emits no chained value call or `??`-defaulted closure binding, so that channel is
+blind to two of the three sites. A 0 does not transfer between channels.)
+
+**S3 is inert, and that is the honest report for D-ANNRLREC.** Recording a neighbouring row
+and the flipped nullable flag ON MASTER changes nothing across 1,282 corpus files and 50,400
+fuzz programs (0 byte, 0 message, 0 run-tree lines on both channels). So the deleted leg is invisible to every output channel, **no pin can exist
+for it**, and its evidence is the construction argument above plus the 15,760-reach
+measurement — the #1114 case, stated rather than dressed up.
+
+### The call arithmetic
+
+Local-aware, by resolver actually called, non-comment, over the five owned files:
+
+| resolver | master | now | delta |
+|---|---|---|---|
+| `annArrowAt` | 30 | 27 | **−3** |
+| `nameIsRefArray` | 23 | 21 | **−2** |
+| `nullablePartOf` | 57 | 56 | **−1** |
+| `refArrElemName` | 33 | 32 | **−1** |
+| **TOTAL** | **354** | **347** | **NET −7** |
+
+- **Type-string PARSES deleted: 7.** All of them; there is no laddering in this slice.
+- **Name-keyed RESOLVERS deleted: 2** — `rlSlotByName` ×1, `recordAnnRlSlot` ×1.
+- **Deleted from a PATH, not from the source: 1** — the duplicated `resolveShapeToNominal`,
+  which carries `nameIsArray` + `structIndexOfTypeName`'s `nameIsWholeSpanShape` +
+  `shapeFieldParse` + tightened fieldset scan, all still live for other callers.
+- **Parses ADDED: 0. Consumers laddered: 0. Sidecars added: 0** (this slice adds no state).
+- Cross-file: `emit_collect` / `emit_base` / `typecheck` / `emit_sections` unchanged.
+
+Binary: 1,025,610 → **1,025,661** bytes (+51). (All numbers in this section are measured on
+the rebase base `9df6029`/#1118; the call arithmetic is identical on #1117's base.)
+
+### A correction to the brief's numbers
+
+- **`nameIsRefArray` does not have 35 call sites.** 35 is the RAW TEXTUAL MATCH count over
+  `compiler/*.vl`; 6 of those are inside comments and 1 is the definition header, so master
+  has **30 real call sites** and this slice leaves **28**. #1105 warned about exactly this
+  ("116 as a *match* count, 99 as a *call* count — say which is being reported, or the
+  scorecard drifts again"); the drift happened anyway, one slice later.
+- **#1117's 0.5% renderer share is an artefact of its scan depth, not a measurement of the
+  arc.** Its provenance scan attributed within one function only, so `nodeTyName(ix)` — a
+  renderer wrapper — counted as an unattributable call. One hop deeper, the `nodeTyName`
+  consumers alone are 6 sites in this partition, twice the 3 that scan attributed to
+  renderers tree-wide, and the stored-render `inferRetNameByNode` adds 19 more in one
+  function. The renderer arc is real and the 0.5% understates it; the 12.7% `TypeRef.tyName`
+  figure is unaffected and reproduces.
+- **The suite count**: this worktree measures **1,962 / 0 / 8** on #1117's base and
+  **1,969 / 0 / 8** on #1118's — the `/workspace` shape (8 ignored), not the 1,956/14 the
+  brief predicted for worktrees. The 6-test worktree gap the last two slices reported does
+  not reproduce here.
+
+### Gate
+
+Corpus **byte-, message- AND run-identical** (1,282 files = `tests/cases` + `compiler/` +
+`std/` + `scripts/*.vl`; 1,092 emitting wasm; compiler stdout/stderr with the out-path
+normalised, exit codes compared): **0** byte-diffs, **0** message-diff files, **0**
+run-tree diff lines over 1,414 output files/side, transcripts identical. Fuzz A/B **50,400
+programs/side** (7 seeds × depths 4/5/6 × {plain, `--branching --multiobs --declared`},
+generated ONCE by the master compiler so both sides see identical programs), whole
+`--out-dir` TREES via `diff -r`, **52,745** output files/side: **0** differing paths, **0**
+transcript lines.
+
+`refresh-compiler.sh` RC=0 (1,025,661 bytes) · `rep-fuzz-check.sh` RC=0 (exact; 1 baselined
+failure — 0 unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=0 (stage3 ==
+stage4, 1,025,661 bytes) · `lint-self.sh` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test`
+RC=0 (**1,969 passed, 0 failed, 8 ignored**).
+
+### What did NOT move, and the blocking mechanism
+
+- **`synthRetAnnots`'s 19-site ladder over `inferRetNameByNode` — the single richest
+  render→parse round trip in this partition — is blocked on ONE accessor in a file this
+  partition does not own.** `ctx` is a stored `tyToEmitName` render, taken apart by 16 named
+  classifiers (`nameIsLitUnionType`, `nullablePartOf`, `nameIsMapMemberUnion`,
+  `parenUnionArrElemName`, `nameIsNestedUnionElemArray`, `nameIsNestedScalarLeafArray`,
+  `nameIsLitUnionArray`, `nameIsMapArray`, `nameIsStructWithLitUnionField`,
+  `nameIsStructWithUnionField`, `nameIsStructWithMapField`, `nameIsWholeSpanShape`, …), two
+  `resolveShapeToNominal` calls and two inline `[`/`]`-suffix slices. The arena column it
+  needs **already exists and is already populated**: `inferRetTyIx` (typecheck.vl:1115,
+  pushed by `recordInferRet` beside the name), added for `collectU`'s structural walks. What
+  is missing is a node-keyed accessor — `inferRetTyIxAt(i)` is exported but the `"#<node>" →
+  i` index is not. **Measured, not assumed**: a probe exporting
+  `inferRetTyIxByNode` finds the column covers **788 of 788** corpus and **13,374 of
+  13,374** fuzz reaches where `ctx != ""` — **100%, 0 uncovered**, over 1,307 + 25,303
+  anonymous lambdas.
+- **`structIndexOfExpr`'s two render→fieldset rungs** — REFUTED above, with the disagreement
+  count, the decline rate, the mechanism (`sTyIx` is arena-IDENTITY over a non-hash-consed
+  arena) and a witness.
+- **The 27 stored-COLUMN parse sites.** The `rlElemName[slot]` family is already a laddered
+  arena-first chokepoint set (D5-final); every residual name leg there is gated on
+  `rlElemTyIx` COVERAGE, which is #1116's open hand-off (`rlInternName` re-RESOLVES the name
+  it just stored via `fieldElemTyIxOfName`; 5 of its 9 call sites are in `emit_collect.vl`).
+  Not attemptable from this partition, and re-banking only the 4 in-partition sites would
+  change which ladder rung answers — a behaviour change, not a refactor.
+
+### Hand-offs (exact diffs)
+
+**1. `typecheck.vl` — export the node-keyed inferred-return type index.** Nine lines beside
+`inferRetTyIxAt`, no new state:
+
+```
+export function inferRetTyIxByNode(nodeIx: i32) {
+  const k = "#" + i32ToStr(nodeIx)
+  if inferRetIdx.has(k) {
+    const i = inferRetIdx[k] ?? -1
+    if i >= 0 { return inferRetTyIx[i] }
+  }
+  0 - 1
+}
+```
+
+That unblocks up to 19 consumer sites in `synthRetAnnots` (`emit_rewrite.vl`), on a column
+measured 100%-covering. The migration is per-arm and each arm needs its own
+candidate-beside-authority sweep (method note 31: admissibility is the CONSUMER's, and this
+consumer PINS `fn.fnRet`, so a wrong arm is a wrong functype, not an absorbed guess).
+
+**2. Whoever owns `emit_collect.vl`**: #1116's `rlInternName(name, kind, tyIx)` hand-off is
+still the gate on the whole `rlElemName[slot]` parse family, and is now the gate on 27 sites
+by this slice's count.
+
+### Method notes earned
+
+35. **A renderer WRAPPER hides the arc from a one-function provenance scan** (D-ARROWTY) —
+    #1117 measured a 0.5% renderer share and concluded the arc was small; the scan attributed
+    within one function, so `nodeTyName(ix)` (which is `tyToStr`/`tyToEmitName` of
+    `nodeTyIxOf(ix)`) counted as an unattributable call, as did `inferRetNameByNode` (a
+    stored render). One hop into the callee turns 3 renderer-attributed sites tree-wide into
+    31 in five files. When a scan's answer is "the arc is small", check whether the arc's
+    producers are named by wrappers before believing it.
+36. **The exactness of an arena dual can come from the RENDERER's disambiguation rules**
+    (D-ARROWTY) — `annArrowAt(nodeTyName(ix)) >= 0` ⟺ `is TyFunc` is not a lucky
+    coincidence measured to 0: it holds because `tyToEmitName`'s array arm parenthesizes a
+    closure element and `tyToStr` spells arrows `->`. The renderer's own
+    ambiguity-avoidance is what makes the round trip information-preserving, and therefore
+    what makes it deletable. Read the renderer, not just the parser, before deciding a
+    round trip is lossy.
+37. **A leg can be dead by CONSTRUCTION on one column and dead by MEASUREMENT on its twin**
+    (D-ANNRLREC) — `recordAnnRlSlot` writes two columns from one call site; the nullable
+    column is unreachable because a line above guarantees the arena covers the node, while
+    the slot column needed 15,760 reaches to show the name leg never answers where the arena
+    declines. Reporting them as one "0" would have hidden that half the deletion rests on a
+    sweep and could regress, and half cannot.
