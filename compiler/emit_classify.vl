@@ -333,13 +333,9 @@ import {
   unNames,
   unVarCount,
   unVarStart,
-  vbF32Idx,
   vbF32Used,
-  vbF64Idx,
   vbF64Used,
-  vbI32Idx,
   vbI32Used,
-  vbI64Idx,
   vbI64Used,
 } from "./emit_state"
 import { emitFail } from "./emit_bytes"
@@ -366,8 +362,11 @@ import {
   repSlotOfTy,
   repStructSlotsTwin,
   sTyIxOfName,
+  scalarTagOfKind,
   tyIsI32LeafElem,
   tyIsStrLeafElem,
+  unMemRowStart,
+  vbHeapIdxOfKind,
 } from "./emit_rep"
 
 // The `$fnsig` PARAM-spine token for the parameter at `paramIx` — one token per distinct
@@ -4391,7 +4390,7 @@ export function mvValInnerMvSlotAt(slot: i32): i32 {
   -1
 }
 
-// Tri-state dual of `unionHasAtomTy(mvValName[slot], "null")` over a BOXED-union map
+// Tri-state dual of `unionHasAtomTy(mvValName[slot], "null", false)` over a BOXED-union map
 // value: `1` the value type admits null, `0` it does not, `-1` the sidecar does not
 // cover the slot / the type is not a union (the caller keeps its member-set test).
 export function mvValUnionHasNullAt(slot: i32): i32 {
@@ -4554,7 +4553,7 @@ export function mvValInnerMvSlot(slot: i32): i32 {
 export function mvValUnionHasNull(slot: i32): boolean {
   const ar = mvValUnionHasNullAt(slot)
   if ar >= 0 { return ar == 1 }
-  unionHasAtomTy(mvValName[slot], "null")
+  unionHasAtomTy(mvValName[slot], "null", false)
 }
 
 // The canonical structural key of a map-VALUE slot (destringify D5-final (b)) — the
@@ -4968,7 +4967,10 @@ export function unionEqAtomOf(otherIx: i32, unionName: string, fnIx: i32) {
   } else if exprIsBool(otherIx, fnIx) {
     atom = "boolean"
   } else {
-    if !unionHasAtomTy(unionName, "i32") && unionHasAtomTy(unionName, "i64") {
+    if (
+      !unionHasAtomTy(unionName, "i32", false) &&
+      unionHasAtomTy(unionName, "i64", false)
+    ) {
       atom = "i64"
     }
     const bare = P.nodes[unwrapParen(otherIx)]
@@ -11529,8 +11531,12 @@ export function variantSig(vi: i32) {
 // fixed slots above them. Stable across every union in the module (mirroring the
 // host's interned `tagOf(variantKey)` global table), so a value boxed as
 // `string | i32 | boolean` keeps its tag inside the sub-union `string | i32`.
+// The kind→tag table itself lives in `emit_rep` (`scalarTagOfKind`), which is where the
+// banked member KIND is read; this is the atom-spelled entry point into it, and NOT a
+// second copy of the table (#1110's hand-off — a hand-kept duplicate is a silent
+// miscompile waiting for one of the two to be edited).
 export function scalarTagOf(atom: string) {
-  uVariants.length + valueAtomKind(atom)
+  scalarTagOfKind(valueAtomKind(atom))
 }
 
 // The globally-stable tag of the REF-ELEMENT-ARRAY arm whose interned reflist slot is `slot`.
@@ -11580,16 +11586,12 @@ export function mapTagOf(atom: string) {
 
 // The interned VALUE-BOX heap-type index for a scalar atom (`boolean` shares the
 // i32 box — same wasm rep), or -1 for `string`/`null` (no inner box: a string ref
-// is already an `anyref` subtype; a null payload is `ref.null`).
+// is already an `anyref` subtype; a null payload is `ref.null`), and likewise for the
+// five list flavours and the closure atom, which ride the box anyref directly.
+// The kind→box table lives in `emit_rep` (`vbHeapIdxOfKind`), beside the banked member
+// KIND; this is the atom-spelled entry point into it (#1110's hand-off).
 export function vbHeapIdxOfAtom(atom: string) {
-  const k = valueAtomKind(atom)
-  if k == 0 || k == 1 { return vbI32Idx }
-  if k == 3 { return vbI64Idx }
-  if k == 4 { return vbF64Idx }
-  if k == 5 { return vbF32Idx }
-  // k == 2 (string) / 7..10, 12 (lists) / 11 (closure) ride the box anyref directly —
-  // no per-rep scalar box (see `atomIsRef`).
-  -1
+  vbHeapIdxOfKind(valueAtomKind(atom))
 }
 
 // Register the VALUE union `name` in the per-union table (no variant structs —
@@ -14643,13 +14645,21 @@ export function unionMemberTysOf(name: string, out: i32[]): boolean {
 }
 
 // The union-BOX ABI's atom test, from the arena: 1 = the union `name` has a member
-// whose type is EXACTLY the keyword primitive `atom` (or exactly an array over it,
-// when `atom` is spelled `X[]`), 0 = it has none, -1 = the row is UNCOVERED (an
-// unregistered union, or a member spelling that did not resolve) and the caller must
-// keep its member-NAME scan. The structural dual of `unionHasAtom(name, atom)` for the
-// fixed keyword atoms `emitUnionCoerce`'s ladder and the `==` / literal-`is` tag
-// selectors test ("i32"/"i64"/"f64"/"f32"/"string"/"boolean"/"null" and their `[]`
-// forms).
+// whose type is EXACTLY the keyword primitive `want`, or exactly an ARRAY over it when
+// `arr`; 0 = it has none, -1 = the row is UNCOVERED (an unregistered union, or a member
+// spelling that did not resolve) and the caller must keep its member-NAME scan. The
+// structural dual of `unionHasAtom(name, atom)` for the fixed keyword atoms
+// `emitUnionCoerce`'s ladder and the `==` / literal-`is` tag selectors test
+// ("i32"/"i64"/"f64"/"f32"/"string"/"boolean"/"null" and their `[]` forms).
+//
+// **The atom arrives in TWO PIECES, and that is the point** (destringify D-ATOMPAIR).
+// This function used to take the JOINED spelling and take it apart again — an
+// `atom[n-2] == '['` suffix test plus an `atom.slice(0, n-2)` — i.e. it parsed the
+// structure encoded in a type string, outside the parser. Every caller already knew
+// both halves at its own source (each is a keyword ladder or a literal; the one
+// composite site rendered `elemAtom + "[]"` purely to feed this peel), so the pieces
+// are passed instead of joined-then-split. Nothing renders a list spelling for this
+// test and nothing peels one: the parse is DELETED, not relocated.
 //
 // **Deliberately EXACT, not a rep fold** (the D2 lesson, applied in the direction that
 // matters here): the caller turns the atom into a TAG (`scalarTagOf(atom)`), so the
@@ -14660,18 +14670,9 @@ export function unionMemberTysOf(name: string, out: i32[]): boolean {
 // own `primName`, and for a list atom a `TyArray` over exactly that `TyPrim`: a
 // `(i32 | null)[]` element is a `TyNullable`, a litunion element a `TyUnion`, and both
 // answer NO on both paths.
-export function unMemHasAtom(name: string, atom: string): i32 {
+export function unMemHasAtom(name: string, want: string, arr: boolean): i32 {
   const mems: i32[] = []
   if !unionMemberTysOf(name, mems) { return -1 }
-  let want = atom
-  let arr = false
-  const an = atom.length
-  if an >= 3 {
-    if atom[an - 2] == '[' && atom[an - 1] == ']' {
-      want = atom.slice(0, an - 2)
-      arr = true
-    }
-  }
   let i = 0
   while i < mems.length {
     let m = mems[i]
@@ -14697,10 +14698,20 @@ export function unMemHasAtom(name: string, atom: string): i32 {
 // member types decide when the row is covered (`unMemHasAtom`), and the member-NAME
 // scan stays as the fall-through for an uncovered row: the ladder-faithful shape, where
 // the arena replaces the predicate IN PLACE and nothing downstream of it moves.
-export function unionHasAtomTy(name: string, atom: string): boolean {
-  const a = unMemHasAtom(name, atom)
+//
+// The atom is a (primitive, is-list) PAIR, not a spelling (destringify D-ATOMPAIR): the
+// arena leg never sees a joined name, and the joined spelling is built ONLY here, on the
+// legacy member-NAME fall-through, which is a name-keyed scan by construction.
+export function unionHasAtomTy(
+  name: string,
+  want: string,
+  arr: boolean,
+): boolean {
+  const a = unMemHasAtom(name, want, arr)
   if a >= 0 { return a == 1 }
-  unionHasAtom(name, atom)
+  let sp = want
+  if arr { sp = want + "[]" }
+  unionHasAtom(name, sp)
 }
 
 // ── D-UNION SET ADT — the union member set as a STRUCTURE ────────────────────
@@ -14728,16 +14739,9 @@ export function unionHasAtomTy(name: string, atom: string): boolean {
 // The member slice of union row `u`, or -1 when the row is not covered by the
 // reference columns (a row the recorder missed, an empty row, or one wider than the
 // 31-bit mask). `unMemTyStart`/`unMemTyCount` slice all four member columns alike.
-function msRowStart(u: i32): i32 {
-  if u < 0 { return -1 }
-  if u >= unMemTyStart.length { return -1 }
-  const st = unMemTyStart[u]
-  if st < 0 { return -1 }
-  const n = unMemTyCount[u]
-  if n < 1 || n > 31 { return -1 }
-  if st + n > unMemAtoms.length { return -1 }
-  st
-}
+// The bounds live ONCE, in `emit_rep` beside the recorder that writes the columns
+// (#1110's hand-off) — this is the local spelling of that one function, not a copy.
+function msRowStart(u: i32): i32 { unMemRowStart(u) }
 
 // Is member `i` present in `mask`? (Bitwise `&` binds LOOSER than `==` in this
 // language, so the test is parenthesized once here rather than at five call sites.)

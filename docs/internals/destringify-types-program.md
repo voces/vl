@@ -2593,3 +2593,247 @@ functions (`emitCoalesce`'s `??` complement, `emitMem`'s member-set dispatch): c
 files byte/run/message-identical, fuzz A/B 50,400 programs/side with 0 tree diffs, probe 0
 disagreements over both, battery 0 diffs, `--batch` 751 programs 0 traps 0 diffs, and every
 standing script RC=0 again. The counts above are measured against 16881cd.
+
+## D-ABIDEDUP + D-ATOMPAIR — the ABI tables get ONE home, and the `[]` suffix parse dies (#1111)
+
+Two fully-measured pieces of #1110's hand-off list, plus a **refutation of #1110's own
+filing** of what was blocking the rest, plus a measurement that **inverts D-ANNSLOT's
+recorded diagnosis of the struct-twin rung**.
+
+### D-ABIDEDUP — the three delegations #1110 handed off
+
+`emit_classify` kept hand-copied twins of three things `emit_rep` owns. A drift between any
+pair is a silent miscompile, and #1110 said so explicitly when it left them:
+
+| was (emit_classify) | now | the one home |
+|---|---|---|
+| `scalarTagOf(atom)` = `uVariants.length + valueAtomKind(atom)` | `scalarTagOfKind(valueAtomKind(atom))` | `emit_rep:scalarTagOfKind` |
+| `vbHeapIdxOfAtom(atom)` = a 5-arm kind→box switch | `vbHeapIdxOfKind(valueAtomKind(atom))` | `emit_rep:vbHeapIdxOfKind` |
+| `msRowStart(u)` = 6 bounds lines | `unMemRowStart(u)` (now exported) | `emit_rep:unMemRowStart` |
+
+A consequence worth recording, because it is the check that the table really MOVED rather
+than merely gaining a caller: `emit_classify` no longer imports `vbI32Idx` / `vbI64Idx` /
+`vbF64Idx` / `vbF32Idx` **at all**. The four value-box heap-index globals are now read in
+exactly ONE place in the whole compiler (`vbHeapIdxOfKind`), and the self-lint's
+unused-import warning is what proved it.
+
+**This is a dedup, so its evidence is the opposite of a distinguishing test.** No test can
+fail on master and pass here — master is correct and the two copies agree. The claim is "no
+behaviour changed", and the proof is byte-identity plus a demonstration that the channel
+carrying that identity has power. What the change buys is structural: a future edit to one
+table can no longer desynchronise from the other, because there is no other.
+
+### D-ATOMPAIR — `unMemHasAtom` stops taking a type string apart
+
+`unMemHasAtom(name, atom)` answered "does this union have an arm spelled exactly `atom`",
+and for a LIST atom it recovered the element by hand:
+
+```
+const an = atom.length
+if an >= 3 {
+  if atom[an - 2] == '[' && atom[an - 1] == ']' {
+    want = atom.slice(0, an - 2)
+    arr = true
+  }
+}
+```
+
+A suffix test and a slice over the structure encoded in a type string, in the emitter. By
+the owner's rule that is a parse and it must die — and it dies rather than moving, because
+**every caller already held both halves at its own source**. The 31 `unionHasAtomTy` call
+sites pass string LITERALS (`"i32"`, `"f64[]"`, `"null"`, …) or a keyword ladder's variable
+whose whole range is keyword literals; the single composite site built `elemAtom + "[]"`
+*purely so this function could take it apart again*. The atom is now a
+`(primitive, is-list)` PAIR:
+
+```
+export function unMemHasAtom(name: string, want: string, arr: boolean): i32
+export function unionHasAtomTy(name: string, want: string, arr: boolean): boolean
+```
+
+Nothing renders a list spelling for this test and nothing peels one. The joined spelling is
+built in exactly one place — inside `unionHasAtomTy`, on the legacy member-NAME
+fall-through, which is a name-keyed scan by construction.
+
+**And that fall-through is never reached.** An `emitFail` marker inside it fires **0** times
+over 1,242 corpus files; the same marker in a build whose arena leg is forced to decline
+fires **182** times, so the 0 is a measurement and not a broken probe. The arena leg of this
+predicate is TOTAL on the corpus, which makes the fall-through — and with it the last join —
+a deletion candidate for the next slice, once the fuzz leg is measured too.
+
+### The counting method, and the two numbers reported separately
+
+Local-aware, by resolver called: every textual `unionHasAtomTy` / `unMemHasAtom` call in the
+four files that hold them, with its enclosing function and, for a bare-identifier second
+argument, the `let`/assignment chain that bound it. **31 call sites**; 2 pass a variable
+(`emitUnionConcreteEq`'s `atom` from `unionEqAtomOf`, `emitUnionListLitViaRefArm`'s
+`elemAtom`), and both ladders' whole range is string literals — established by reading every
+ASSIGNMENT to them, not just the binding.
+
+- **Parses DELETED, with no fall-through: 1** — `unMemHasAtom`'s `[]` suffix-test + slice,
+  together with the one type-string PRODUCER (`elemAtom + "[]"`) that existed only to feed it.
+- **Consumers migrated to a ladder: 0.** Nothing here gained an arena leg with a name
+  fall-through; the parse was removed by changing what the callers hand over.
+- **Hand-kept table duplications removed: 3** (kind→tag, kind→box, member-slice bounds).
+
+### A refutation: #1110's three "waiters" do not need the member→index export
+
+#1110 filed `emitUnionConcreteEq`, `emitUnionLitIs` and `emitUnionCoerce`'s closure arm as
+blocked on a member-atom → recorded-index resolution. Read against their producers, none of
+them is a parse site at all:
+
+- `unionEqAtomOf`'s **entire range** is the six string literals `"i32"` `"string"` `"f32"`
+  `"f64"` `"i64"` `"boolean"` — `atom` is initialised to a literal and every one of its
+  assignments is a literal. So `scalarTagOf(atom)` there is #1108's class (i) **keyword**
+  case, exactly like the 13 `scalarTagOf("null")`, and never one of the 607.
+- `emitUnionLitIs`'s literal ladder has range `"i32"` `"string"` `"f64"` `"i64"` — same
+  verdict.
+- `unionClosureArmName`'s name leg returns an atom selected BY the test
+  `valueAtomKind(a) == 11`, so its kind is 11 by construction; its arena leg selects by
+  `unMemIsFunc`. There is no member index to look up — there is a value already known.
+
+Migrating any of the three would score **0** against the terminal condition. The honest
+disposition is to reclassify them as class (i), not to build an export for them. (The
+worthwhile change at those sites is the D-ATOMKIND *projection* shape — carry the kind the
+ladder already picked instead of re-deriving it — which saves work but deletes no parse, so
+it is not what this slice spent its budget on.)
+
+**A second conflation to correct:** the "two `wasmEmit` producers" #1108 filed are
+`emitMem`'s member-set dispatch and `emitCoalesce`'s `??` complement, and what they wait on
+is **`currentNarrowSetIdOf`** — a narrowed-SET id — not a member→index resolution. Those are
+two different hand-offs, named in two different bullets of #1110's "What did NOT move".
+`currentNarrowSetIdOf` already exists, private, in `emit_classify`; exporting it is a
+one-line change whose consumers are in `wasmEmit`. It is left for the next slice only
+because it deletes a text→set RESOLUTION (`msSetOfText`, a whole-string scan), not a parse.
+
+### The struct-twin rung: D-ANNSLOT's diagnosis is REFUTED, and the real blocker named
+
+D-ANNSLOT recorded:
+
+> The QUERY half migrates cleanly … The CANDIDATE half does not: `rlElemStructRow(j)` …
+> differs from `structIndexOfTypeName(eBase)` at every witness. **The blocker is
+> `rlElemStructRow`, not `rlSlotOfTy`.**
+
+Measured at the site, it is the other way round. A probe compiler implementing the candidate
+half structurally — `rlElemTwinStructRow(slot)` = the exact `structIndexOfTy` scan first,
+then `repRowOfTyStruct(base, sScanLim())` — and reporting AT THE SITE inside
+`sFieldRefSlot`'s decline (so no early reject can eat the evidence, method note 17)
+reproduces D-ANNSLOT's population exactly: **6 of 1,241 corpus files**, `WSFRL-MISS` 6,
+`WSFRL-WRONG` **0**. The per-call diagnostic then splits the rung:
+
+- **The CANDIDATE half agrees 12/12.** At every candidate of every witness,
+  `rlElemTwinStructRow(j)` equals the name path's `structIdxOfElemName(rlElemName[j])` —
+  including the 6 candidates where `rlElemStructRow`'s exact `structIndexOfTy` leg declines
+  (`exact=-1`) and `repRowOfTyStruct` supplies the row. D-ANNSLOT's blocker is not one.
+- **The QUERY half disagrees 6/6**, and the reason is a resolution VOCABULARY difference,
+  not a coverage hole. `structIndexOfTypeName(qBase)` is the **lenient FIELD-NAME-SET scan**
+  (`shapeFieldParse` + `sFieldIndex` + `shapeFieldTypeCompat`). Every witness is the
+  nested-alias twin pattern — an outer `{f: X}` beside its inner `X`, both carrying the
+  one-field fieldset `{f}` — so the name scan matches the INNER spelling onto the OUTER row,
+  while `repRowOfTyStruct` answers the inner row by canonical key. `repStructSlotsTwin` of
+  the two is 0 at all six.
+
+Witnesses (query `qBase` → name row vs canon-key row): `{f:f64}` → 1 vs 0 ·
+`{a:boolean,f:{[string]:boolean},z:string}` → 1 vs 0 · `{f:i64|null}` → 1 vs 0 (×2) ·
+`{f:f32|string|{q:i64}}` → 3 vs 1, and → 2 vs 1. Four of the six are the
+`nested-{null-hole,union-softening}-list-{elem,return}-twin` pins that
+`shapeFieldTypeCompat`'s own RETIRED-arm comments name as the witnesses for that leniency —
+so the leniency is deliberate, documented, and load-bearing.
+
+**The blocker, with its mechanism:** giving rung 3 an arena input needs an arena dual of the
+FIELDSET scan — `repRowOfTyFieldset(ty, lim)`: match the `TyObj`'s field-NAME set against
+each row's `sFieldNames`, tightened by the arena form of `shapeFieldTypeCompat` — and it must
+reproduce all four of that function's RETIRED refutation arms (#978, #1041, #996, #935) or
+the twin pins change answers. A canonical-key resolver cannot substitute: it is strictly
+stricter, and the leniency is the point.
+
+**Rung 3 is load-bearing** (measured, so nobody re-derives it): deleting it outright gives
+**9** corpus byte-diffs, **243** message-diff lines and **51** run-tree diff lines over 1,241
+files. And it is worth stating what this does NOT unblock: the 11-leg `nameIsRefArray`
+family stays blocked, because `sFieldRefSlot`'s fall-through still answers 6 corpus cases the
+arena cannot.
+
+Nothing from this study shipped. A structural rung that is byte-identical and answers 0 of 6
+is exactly what D-ANNSLOT already declined to land, and the reason has not changed.
+
+### The pin
+
+`tests/cases/unions/atom-scalar-beside-own-list-arm.vl` — a value union carrying BOTH a
+primitive atom and the LIST over that same primitive (`i32 | i32[]`, `string | string[]`,
+`f64 | f64[]`, `i64 | i64[]`). No shape in 1,241 corpus files carried a scalar beside its own
+list, and the two arms take distinct box tags (kinds 0/7, 2/9, 4/8, 3/10) and distinct
+payload reps, so it is a real coverage addition to the atom band.
+
+**It is NOT this slice's distinguishing test, and is not claimed as one.** Measured: it is
+inert under both perturbations of the (primitive, is-list) key — because a union holding BOTH
+answers the same for `("i32", true)` and `("i32", false)`, which is precisely what makes it a
+good tag-band pin and a bad key pin. The distinguishing evidence for D-ATOMPAIR is the
+existing corpus, below.
+
+### Gate
+
+Corpus **byte-, message- AND run-identical**: 1,241 files, 1,054 of which emit wasm (187 are
+rejects on both sides), **0** byte-diffs · **0** message-diff lines (full stdout+stderr per
+build, each side's out-dir normalised out) · **0** run-tree diff lines (`vl run --batch
+--out-dir`, whole trees via `diff -r`).
+
+Fuzz A/B **50,400 programs/side** (seeds 1-14 × depths 4,5,6 × {plain, `--declared`} × 300;
+batches generated once by a FIXED generator compiler so both sides see identical programs),
+compared as whole `--out-dir` trees: **0** diffs.
+
+**Comparator sanity, per channel, at full corpus volume** (before any 0 was believed):
+
+| perturbation | what it breaks | corpus |
+|---|---|---|
+| `vbHeapIdxOfKind` i64 box ↔ f64 box (the DRIFT the dedup now makes impossible) | the `ref.cast` target + payload rep | **99** byte-diff, **719** run-tree lines, 0 msg |
+| `unMemHasAtom`'s `arr` bit inverted | the (primitive, is-list) key | **57** byte-diff, **131** msg lines, **414** run-tree lines |
+| `rlSlotByName` rung 3 deleted | the struct-twin fallback | **9** byte-diff, **243** msg lines, **51** run-tree lines |
+
+The first row independently reproduces D-ATOMKIND's recorded 99 byte-diffs for the same
+perturbation. The second is D-ATOMPAIR's entombment: 57 corpus files change under a
+class-leaving perturbation of exactly the key this slice re-shaped.
+
+The FUZZ comparator was proven at the SAME 50,400-program volume it reports 0 at (method
+note 12, whose original failure was a fuzz A/B that compared 0 files and said 0): the
+`arr`-inverted build against the migrated one gives **4,161 tree-diff lines, spread across
+all 84** (seed, depth, mode) buckets. A 0 from this harness is a measurement.
+
+Two harness bugs were caught and fixed before any number above was trusted, both instances of
+method note 12: the message channel compared each side's own out-dir path (2,108 phantom
+diff lines) and the byte channel counted a program REJECTED on both sides — no `.wasm` on
+either — as a diff (187 phantom byte-diffs). A comparator that reports diffs where there are
+none is as useless as one that reports none where there are diffs.
+
+`refresh-compiler.sh` RC=0 · `rep-fuzz-check.sh` RC=0 (exact; 1 baselined REJECT, 0 unsound,
+0 new, 0 stale) · `native-fixpoint.sh` RC=0 (stage3 == stage4, 1,018,294 bytes) ·
+`lint-self.sh` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test` RC=0 (**1,961 passed, 0
+failed**, 8 ignored) — the shared-INSTANCE lifetime gate, run because it is the standing gate,
+though this slice adds no sidecar column.
+
+### Method notes earned
+
+18. **A keyword LADDER's RANGE is part of its call site's classification** (D-ATOMPAIR) —
+    three sites were filed as parse consumers on the shape of the call (`scalarTagOf(atom)`,
+    a variable). Reading every ASSIGNMENT to that variable, not just its binding, shows the
+    range is six string literals, which makes the site class (i). Method note 9 said to
+    enumerate by resolver called and to follow locals; this is its other half: follow the
+    local far enough to know its RANGE, or a keyword site reads as a parse site and a slice
+    gets spent on a migration worth 0.
+19. **A coverage pin and a distinguishing test are different artifacts, and a pin can be
+    inert BY CONSTRUCTION** (D-ATOMPAIR) — the `i32 | i32[]` shape is the sharpest-looking
+    pin for a (primitive, is-list) key and is provably insensitive to every perturbation of
+    it, because a union holding BOTH members answers the same either way. Run the sabotage
+    THROUGH the new pin before quoting it as evidence; when it is inert, say so and point at
+    whatever actually carries the change.
+20. **A ladder's fall-through can be measured to zero cheaply, and that number IS the next
+    slice's brief** (D-ATOMPAIR) — one `emitFail` inside `unionHasAtomTy`'s name leg, one
+    corpus sweep: 0 reaches, with a forced-decline build firing 182 to prove the marker
+    works. That single number converts "the fall-through is untouched by design" into "the
+    fall-through is a deletion candidate", which is what D-TOTALITY needed a whole slice to
+    learn for its map.
+21. **A behaviour-preserving change cannot have a fails-on-master test, and demanding one
+    inverts the evidence** (D-ABIDEDUP) — a dedup's whole claim is "nothing changed", so its
+    proof is byte-identity plus a sabotage showing the identity channel has power. The
+    entombment rule exists to stop unproven behaviour CHANGES shipping; applied literally to
+    a dedup it would force reverting correct work. State which kind of change is on the table
+    before choosing the evidence.
