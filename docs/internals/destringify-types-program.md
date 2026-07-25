@@ -3106,3 +3106,226 @@ call-arithmetic and work counts above are measured against bba4b4c.
     are different numbers. Method note 2 (index vs name, intern time vs query time) has a
     twin on the NAME side: when the string itself is rewritten between producer and
     consumer, bank at the LAST producer, not the first.
+
+## D-CANONWIDTH — the canon pass hands over the width it just wrote (#1113)
+
+#1112 banked the annotation-spelling atom count at its producers and retired 2 emitter
+parses — but its NET was zero, because the bank itself was taken by running
+`unionMemberCount` over the finished string. This slice removes that last scan: the
+producer that JOINS the name reports the name's width, so nothing takes apart a string the
+compiler has just assembled.
+
+`canonEmitTypeNames`:
+
+```
+-      atoms = unionMemberCount(c)
++      atoms = canonAtoms
+```
+
+`canonAtoms` is set by `canonEmitName` on the way out of every return; `emitNameAtoms` is
+its `tyToEmitName` sibling, because two of `canonEmitName`'s arms hand back a RENDER and
+need the renderer's width.
+
+### The invariant that makes the threading total
+
+A canon'd or rendered name gains a TOP-LEVEL `|` at exactly **three** places: the union
+arm's join, `nulLitUnionPreserve`'s `|null` suffix, and `tyToEmitName`'s nullable arm.
+Every other arm either recurses (and inherits the recursive count) or builds a name whose
+separators sit inside a grouper or behind a top-level `=>` — ONE atom, which is exactly
+where `unionMemberCount` stops counting.
+
+The load-bearing case is the `!nameNeedsCanon(name)` early-out, which returns the name
+UNCHANGED and therefore has no join to count. It is exact anyway, and by that predicate's
+own shape: `nameNeedsCanon` returns TRUE on any `|` ANYWHERE in the name, so a name that
+reaches the early-out has no `|` at all and is one atom by construction. The arms that
+recurse and then build a DIFFERENT name (`[]`, the `{…}` shape, the function-type
+re-render) reset the count to 1 rather than inheriting the sub-name's width.
+
+### A refutation of this slice's own brief: `kept.length` is NOT the atom count
+
+The brief named `kept.length` in `canonEmitName`'s top-level-union arm as a free, verified
+count. It is not the count, and the program doc already said so in #1112's own hand-off
+note — the union-ALIAS expansion substitutes a whole rendered member SET for one member:
+
+```
+type AB = A | B
+const u: AB | null       // parts = [AB, null] -> kept = ["A|B", "null"] -> "A|B|null"
+                         // kept.length = 2, top-level atoms = 3
+```
+
+Measured, not argued. An additive probe carrying BOTH candidate counts beside
+`unionMemberCount(c)`:
+
+| tag | corpus (1,274 files) | fuzz (50,400) |
+|---|---|---|
+| `R` — annotation nodes reaching the bank | **57,846** | **103,402** |
+| `POS` — the name says >= 2 atoms | 1,127 | 18,018 |
+| `EXP` — the union-alias expansion fired | 29 | 1,383 |
+| `DIS` — THREADED count != `unionMemberCount` | **0** | **0** |
+| `KDIS` — `kept.length` != `unionMemberCount` | **2** | 0 |
+| `KPOSDIS` — the two disagree on the `>= 2` projection | 0 | 0 |
+
+The two `KDIS` nodes are both in `tests/cases/types/nullable-union-alias.vl` — the shipped
+pin for the very flattening (`AB | null` -> `A|B|null`) that breaks the shortcut.
+
+`KPOSDIS = 0` is the honest other half: the ONE consumer today projects the count to
+`>= 2`, and on that projection `kept.length` is currently invisible. A build shipping it is
+byte-, message- and run-IDENTICAL over the 1,274-file corpus. It is still the wrong number:
+the `>= 2` projection flips wherever an expansion is the SOLE kept entry (`(A | B) | AB`,
+`AB | AB` — both dedup to one entry whose join is 2 atoms), and #1112's hand-off asks the
+bank to serve CARDINALITY consumers, for which a wrong count is a wrong answer rather than
+a harmless one. Those two shapes are rejected by this emitter for unrelated reasons
+(`ref valtype with no interned shape`), so the shortcut is a loaded gun rather than a live
+bug — the same verdict #1112 reached about `retMemCountOf`, and the same disposition:
+do not ship it.
+
+### A refutation of #1112's 7-site hand-off: **0 of the 7 can read the bank**
+
+#1112 filed `emit_classify`'s 4 and `emit_base`'s 3 `unionMemberCount` sites as consumers
+that "can take the bank directly". Enumerated by argument provenance, none of them can:
+every one is a STRING-keyed helper whose argument is a peeled, derived or recursively
+rebuilt name, not a whole annotation spelling read off a node.
+
+| site | argument | why the node bank cannot serve it |
+|---|---|---|
+| `emit_base:1327` `parenUnionArrElemName` | the helper's `name` param | callers pass `leaf`, `ctx`, `"(" + elemName + ")[]"` — synthesized names with no node |
+| `emit_base:1351` same helper | `name.slice(1, n-3)` | a PEELED element, not the spelling |
+| `emit_base:1656` `isVariantBoxUnion` | the helper's `name` param | callers pass `ncRes` / peeled arm names |
+| `emit_classify:2649` | `unionMemberSetOf(valName)` | a DERIVED alias-expanded member set |
+| `emit_classify:2713` `mvCanonValName` | a map-VALUE name | a component of a spelling, not the spelling |
+| `emit_classify:9676` `rlCanonLitUnionAtoms` | `rlCanonLitUnionAtoms(name.slice(...))` | a recursive peel |
+| `emit_classify:9731` same helper | the recursion's `name` | same |
+
+**Hand-off withdrawn.** Migrating any of them means giving the helper a node-keyed twin,
+which is a different (and larger) piece of work than "read the bank".
+
+### And a third: the count-then-split pairs are not redundant double-parses
+
+Four sites in the owned files spell `if unionMemberCount(x) > 1 { splitUnionAtoms(x, out) }`
+(and `isVariantBoxUnion` spells the `< 2` early-out before an unconditional split). Deleting
+the count and reading `out.length` is exactly equivalent — `unionMemberCount` is
+`splitUnionAtoms`'s counting dual, separator for separator — and it would score a clean
+`-4` on the parse count.
+
+It is the wrong change. `unionMemberCount` is the ALLOCATION-FREE dual: it exists so the
+common single-atom name does not allocate an array and a slice. Converting the gate makes
+every non-union call allocate, and this compiler is WasmGC-allocation-bound, not scan-bound.
+A `-4` bought that way makes the compiler slower while moving no decision out of the
+emitter — metric-gaming, so the sites stay and the reason is recorded here.
+
+The same discipline caught a regression in this slice's own first draft: `tyToEmitName`'s
+union arm carried the per-member counts in a parallel `i32[]` pushed beside `parts` — one
+extra array per union render. Accumulating a running `psum` instead is the same number with
+no allocation, and the shipped build is 319 bytes smaller than that draft.
+
+### The call arithmetic
+
+Local-aware scan (by resolver called, comments and the parsers' own definition headers
+excluded) of the SCORECARD CORRECTION's parser list, over the three files this slice owns:
+
+| file | master (6f5422c) | now | what moved |
+|---|---|---|---|
+| `compiler/typecheck.vl` | **22** | **21** | `unionMemberCount` 3 -> 2 |
+| `compiler/emit_collect.vl` | 85 | 85 | — |
+| `compiler/emit_base.vl` | 65 | 65 | — |
+| combined | **172** | **171** | |
+
+**1 parse DELETED with no fall-through · 0 parses ADDED · 0 consumers laddered · 0
+resolutions deleted · NET −1.** One is a small number, and it is the whole point: #1112
+moved two decisions for a net of zero, and this slice closes that zero by deleting the
+scan #1112 opened rather than by opening another one somewhere else.
+
+Deterministic work removed: **53,228** `unionMemberCount` scans over the pinned 31-file
+`compiler/` + `std/` snapshot (swept file-by-file), **57,846** over the whole corpus — one
+full pass over every annotation name in the program, replaced by an integer already in a
+register. Added: the `emitNameAtoms` / `canonAtoms` assignments, no allocation.
+
+### Entombment (method note 21) — and the one leg no pin can reach
+
+Byte-, message- and run-identical over 1,274 corpus files and 50,400 fuzz programs, so by
+construction there is no test that fails on master and passes here. What carries the slice:
+
+- the additive probe's exact equality at **57,846 + 103,402** annotation nodes, with its
+  disagreement channel verified at FULL reach by two separately built perturbations
+  (bank + 1 and bank − 99 both light `DIS` at exactly `R`: 57,846 on the corpus, 15,232 on
+  a 7,200-program fuzz leg);
+- the gate channel: suppressing the bank (`atoms = 1`, i.e. never register) reddens exactly
+  **3** corpus files on build status, message AND run —
+  `types/struct-union-same-shape.vl`, `types/struct-union-same-shape-field-slot.vl`,
+  `soundness/union-same-shape-discriminant-sound.vl`. (The same sabotage is invisible on
+  7,200 fuzz programs — #1112 measured the same thing: the generator never produces the
+  same-shape collapse in a consequential position.)
+
+**No new pin ships, and here is why rather than a pin I know to be inert.** The bank has
+exactly one consumer and it asks `>= 2`. Every leg this slice adds is therefore only
+observable through that projection, and in the OVER-registration direction a wrong answer
+is absorbed by `registerInlineUnion`'s self-gate — note 4 again. Measured: a build with the
+`[]`-arm reset REMOVED (so `(A|B)[]` banks 2 instead of 1) is byte-, message- and
+run-identical over the whole corpus. Three attempts at a distinguishing fixture
+(`A | B | null` with same-shape members, in the param, binding and `is`-discriminant
+positions) all hit pre-existing emitter gaps on MASTER, so none of them is a pin for this
+change. The probe's answer-equality is the evidence carrying the per-leg correctness here,
+and the corpus A/B is not — knowing which is which is the whole of note 4.
+
+### Sidecar lifetime
+
+No new arena-lifetime column: `emitNameAtoms`, `canonAtoms` and `nluAtoms` are scalars
+written on the way out of a call and read by the immediate caller. `annUnionAtoms` keeps
+#1112's push-per-node shape, and method note 24's property is preserved and RE-VERIFIED
+rather than assumed: with BOTH resets removed the shared-instance suite
+(`SELFHOST_NATIVE_ALIGN=1 deno task test`) goes **1,954 passed / 2 failed**
+(`soundness/union-same-shape-discriminant-sound.vl`,
+`types/struct-union-same-shape-field-slot.vl`) while the shipped build is 1,956 / 0.
+
+### A harness correction: a compiler TRAP's backtrace is not a divergence
+
+A first fuzz A/B reported **2 differing paths**. Both were `.err` files from cases where
+the COMPILER ITSELF traps (`wasm trap: out of bounds array access`) on A and on B, in the
+same six wasm functions — the only difference was the hex ADDRESSES in the backtrace, which
+move because the two compiler binaries have different layouts. The harness now normalises
+`0x…` in `.err` before the tree compare, and the function indices (which do carry
+information) survive. This is the #1111 phantom-diff lesson in a new costume: a fresh
+harness's first red is more likely the harness.
+
+### Gate
+
+Corpus **byte-, message- AND run-identical** (1,274 files: `tests/cases` + a PINNED
+snapshot of master's `compiler/` + `std/` + two `scripts/*.vl`; `vl build` bytes by `cmp`,
+the compiler's full stdout/stderr with the per-side out-path normalised, and `vl run`
+stdout/status) · a SEPARATE full `@run` sweep over all **1,011** `@run` cases: identical ·
+fuzz A/B **50,400 programs/side**, whole `vl run --batch --out-dir` TREES compared
+(`diff -r`, **52,830** output files per side): **0** differing paths · the same harness
+reports **4,663** differing paths over 2,400 programs against a build that rejects every
+program, so the 0 is a measurement and not a dark wire · additive probe **0** disagreements
+over 1,274 corpus files and 50,400 fuzz programs, both channels perturbation-verified at
+full reach.
+
+`refresh-compiler.sh` (RC=0, 1,018,523 bytes) · `rep-fuzz-check.sh` (exact, 0 new / 0
+stale) · `native-fixpoint.sh` (stage3 == stage4, 1,018,523 bytes) · `lint-self.sh` (RC=0) ·
+`SELFHOST_NATIVE_ALIGN=1 deno task test` (**1,956 passed, 0 failed**) — all RC=0.
+
+### What did NOT move, and why
+
+- **`recordInferRet`'s `unionMemberCount(ty)`** (the other count #1112 added) stays. Its
+  producers are five separate name builders — `tyToStr` behind the `isClassifiableRetName`
+  gate, `valueUnionRetName`, `structUnionRetName`, `variantBoxUnionRetName`, and the two
+  literal `"boolean|null"` / `"string|null"` spellings — plus the anonymous-lambda site.
+  Retiring it means threading a width out of `tyToStr` and three more join loops; the
+  mechanism is identical to this slice's and the work is a slice of its own. **Named, not
+  waved at**: the funnel is `recordInferRet`, the producers are the five above, and each
+  one's `|` join is where its width is free.
+- **The four count-then-split gates** — see above: the count is the allocation guard, not a
+  redundant parse.
+- **The 7 hand-off sites** — see above: string-keyed, no node.
+
+### Method note earned
+
+23. **A "free" count read off a container's LENGTH is only free when the container's
+    entries are atoms** (D-CANONWIDTH) — `canonEmitName`'s union arm holds its members in
+    `kept` and joins them with `|`, which makes `kept.length` look like the atom count of
+    the result; it is not, because one arm substitutes a whole rendered member SET for one
+    entry. The general form: when a producer's loop can replace one unit with many, the
+    loop's iteration count and the result's unit count are different numbers, and only the
+    accumulated sum is the second one. The corollary that made this cheap to settle: a probe
+    should carry BOTH candidate answers beside the authority, not just the one you intend to
+    ship — the shipped answer's 0 and the rejected answer's 2 came out of the same sweep.
