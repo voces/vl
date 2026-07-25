@@ -546,6 +546,86 @@ Its remaining non-diagnostic readers, by family: the **map-value** layer
 `shapeFieldTypeCompat`'s two `sFieldElemName` reads in `emit_rep`), the `unionArmPath*`
 walkers' threaded `elem` local (5 sites), and `emit_mono`'s nominal mono key. Each is a
 distinct question; none is answered by the field-element slot resolvers this slice moved.
+(The litunion classifiers and `structFieldCodesEq`'s row resolution moved in D-LITUNION,
+below; `annShapeIndexOf` and `shapeFieldTypeCompat` are measured-and-deferred there.)
+
+### D-LITUNION — the litunion FIELD classifiers + the row-dedup comparators — SHIPPED
+
+Two families that re-derived structure from a recorded field-element NAME, among the last
+non-diagnostic readers of `sFieldElemName` / `uFieldElemName`.
+
+**Migrated — 5 sites, all on the D2 (type vs REP) axis for the classifiers and the D5
+chokepoint pattern for the comparator.** "Is this field ATOM-repped?" is a *rep* question,
+and the D5 sidecars already record the arena type each recorded element name denotes, so
+the answer is a structural test, not a re-classification of a rendering:
+
+| tag | site | was | now |
+|---|---|---|---|
+| LU-S | `sFieldIsLitUnion` | `nameIsLitUnionType(sFieldElemNameAt(si,fi))` | `tyIsLitUnion(sFieldElemTyIxAt(si,fi))` |
+| LU-SA | `sFieldIsLitUnionArray` | `nameIsLitUnionArray(…)` | `tyIsLitUnionArray(…)` |
+| LU-V | `variantFieldIsLitUnion` (new chokepoint for `emitVariantStruct`'s code-0 arm + `exprIsLitAtom`'s narrowed-variant member read) | `nameIsLitUnionType(variantFieldElemName(vi,fj))` | `tyIsLitUnion(uFieldElemTyIxAt(vi,fj))` |
+| LU-VA | `variantFieldIsLitUnionArray` (+ `emitVariantStruct`'s code-4 arm routed through it) | `nameIsLitUnionArray(…)` | `tyIsLitUnionArray(…)` |
+| RD-ROW | `structFieldCodesEq`'s code-15 referenced-row resolution | `repStructRowByName(ea)` / `(eb)` | `repStructRowByTy(repFieldElemTyIx(…))`, name for the -1 |
+
+One new arena predicate carries the array half: `tyIsLitUnionArray` — a `TyArray` whose
+element `tyIsLitUnion`. It needs neither of the name predicate's two peels (a grouping paren
+is not a type; exactly one array hop is taken), and the exclusions line up on both sides: a
+2-D `K[][]` (element is itself a `TyArray`), a `(K | null)[]` and a `("a"|"b"|null)[]` (a
+`TyNullable` element / member) all answer NO on both paths. Every site keeps the
+**ladder-faithful** shape (D1 leg C): the arena replaces the predicate in place, the
+fall-through to the recorded name is untouched, so an uncovered row (-1 — a plain field's ""
+element, or an `#anonN` spelling) answers exactly as before.
+
+**What deliberately does NOT move in `structFieldCodesEq`: the `ea != eb` trigger.** Equal
+recorded names are a *sufficient* identity fast path. Swapping it for arena-index equality
+would newly MERGE rows whose element spelling the struct table cannot name — struct/reflist
+**intern state**, not structure — which is the D3′ refutation's exact shape. The probe
+measured that swap too (tag `RD-EQ`, 7 corpus programs, 0 disagreements); it is left
+unmigrated on the argument, not on the measurement.
+
+**Deliberately NOT migrated, with reasons.**
+- `annShapeIndexOf`'s `en != bi` element compare and its two #974 atom-vs-plain arms
+  (`AS-EN` 18 / `AS-L0` 1 / `AS-L4` **0** corpus programs under sabotage): the query side is
+  an annotation TEXT with **no recorded arena index**. The only arena input is `resolveAnnot`
+  at query time, which MINTS arena types *inside the interning scan* — D1's timing axis at its
+  worst, and it perturbs `tyMutEpoch` mid-intern. Probed with the non-minting nominal lookup
+  only: 0 disagreements, but that leg covers 18 of the 144+ reached rows, and these arms are
+  the #974 ABI split where a wrong answer is invalid wasm.
+- `shapeFieldTypeCompat`'s `want == 0` / `want == 4` atom-identity arms (`SC0`/`SC4`) —
+  **UNVERIFIABLE, 0 firings.** The `elemTy` plumbing was built and reverted. A reach-marker
+  build shows the `want == 0` arm IS entered (29 corpus files) but its recorded `elem` is
+  **""** on every single reach — 0 of 1,265 corpus files and 0 of 25,200 fuzz programs ever
+  hand it a non-empty recorded element name, so the arena leg could never run; `want == 4` is
+  not reached at all. Nothing to sabotage-verify against ⇒ left on the name path.
+- `emit_collect`'s three `sFieldElemName[sfi]` reads (`mvShapeOfValName` ×2, `ensureRefElem`)
+  — the map-value layer and an INTERN site needing the emit-canonical stored name (the D2
+  residual). Out of scope, per D5.
+
+**Method + measurements.** Additive probe at all 11 candidate sites at once, with the
+**accumulating** marker (a tag set reported once at the end of `emitProgram`, not a sticky
+first-hit abort): **0 disagreements** over the 1,265-file corpus (`tests/cases` + `std/` + the
+compiler's own source) and **25,200** fuzz programs (seeds 1–14 × depths 4–6 × {plain,
+`--declared`} × 300; shape output identical to master, 2,248 lines both sides). *A probe
+lesson worth recording:* the first probe build also carried `?` "uncovered" coverage markers,
+which — sharing the `emitFail` report channel — silently **aborted** 241 corpus builds and
+5× the fuzz findings. A coverage marker that rides the failure channel is not additive; the
+counts came from the inverted build instead.
+
+**Sabotage-verified per site**, gated on the arena leg having actually answered, corpus
+counts: `LU-S` 29 · `AS-EN` 18 · `RD-EQ` 7 · `LU-V` 4 · `LU-SA` 3 · `RD-ROW` 2 · `LU-VA` 1 ·
+`AS-L0` 1 · `AS-L4` 0 · `SC0` 0 · `SC4` 0.
+
+**Gate-channel sabotage.** A deliberately-wrong compiler — every migrated arena leg inverted
+(and the row leg returning an in-range OFF-BY-ONE row), only where it answers — produced
+**34 BYTEDIFF + 33 run-status** diffs on the corpus. `RD-ROW` was sabotaged **alone** as well,
+because a row-resolution divergence could plausibly be invisible: it reddens on its own
+(1 BYTEDIFF + 1 run-status, `structs/structural-twin-heap-dedup.vl`). Both gate channels are
+live for every migrated site here; the D-RET blind-spot trap does not apply.
+
+Corpus **byte-identical** and run-identical (1,265 files), 66-case battery 0 diffs, fuzz A/B
+identical. The #974 atom-vs-plain row split (`types/atom-vs-plain-field-twin-rows.vl`) is
+byte-identical under the migration — it lives in `annShapeIndexOf`, which this slice
+deliberately left alone.
 
 ### D-MAPVAL — the map-VALUE slot layer (`mvValName`) — SHIPPED
 
@@ -679,6 +759,9 @@ condition names two things, so measure those:
 | per-atom classify-by-render of a union member set | 15 sites | **12 functions still contain the pattern**; batches 1-3 made the arena answer FIRST in most (see the counting caveat) |
 | struct/variant FIELD-ELEMENT slot resolved by re-resolving a NAME | 14 sites | **0** for the ref-list + nested-struct layers (`sFieldElemTyIx`/`uFieldElemTyIx` → `rlSlotOfTy`/`structIndexOfTy`); the union-box / litunion readers stay |
 | map-VALUE slot keyed by canonical-name equality | 5 scans | **0** (`mvValTyIx` → `repMvValKey`; the name scan is the fall-through) |
+| struct/variant FIELD-ELEMENT slot resolved by re-resolving a NAME | 14 sites | **0** for the ref-list + nested-struct layers (`sFieldElemTyIx`/`uFieldElemTyIx` → `rlSlotOfTy`/`structIndexOfTy`); the map-value / union-box readers stay |
+| struct/variant field LITUNION (atom-rep) classified by re-parsing a NAME | 4 sites | **0** (`tyIsLitUnion` / `tyIsLitUnionArray` over the D5 sidecars) |
+| `structFieldCodesEq`'s referenced ROW resolved from a recorded NAME | yes | **no** (`repStructRowByTy`; the `ea != eb` identity fast path stays, deliberately) |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
 
@@ -761,6 +844,11 @@ then walk back to the enclosing function and dedupe.
    stale NAME is merely wrong text; a stale INDEX traps. Neither the corpus A/B nor the
    fuzz leg can see this (both give each program a fresh compiler instance) — only the
    suite's shared-instance driver does. Run it before believing a green A/B.
+7. **A coverage marker must not ride the FAILURE channel** (D-LITUNION) — the first probe
+   build reported "uncovered" with the same accumulating `emitFail` marker it used for
+   disagreements. That aborted 241 corpus builds and quintupled the fuzz findings, i.e. the
+   probe stopped being additive and its own A/B gate went dark. Coverage counts belong in the
+   INVERTED (sabotage) build, where an abort is the intended signal.
 
 The first three are the same underlying mistake: assuming an arena artifact answers the same
 question the string did. Check which question the site is asking, first.
