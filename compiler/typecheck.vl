@@ -1073,6 +1073,37 @@ let inferRetTy: string[] = []
 // every producer's name lands in, so the count is banked there, on the very string the
 // consumer would have split. -1 is unreachable by construction (every push records).
 let inferRetAtomCount: i32[] = []
+// The TOP-LEVEL atom count of the name the LAST inferred-return name producer returned —
+// the number `unionMemberCount` would report for it, produced BY THE PRODUCER THAT JOINED
+// IT instead of re-derived by scanning the finished string (#1115, the `emitNameAtoms`
+// discipline of #1113 applied to the inferred-return funnel).
+//
+// The contract every producer honours: **write this immediately before each NON-EMPTY
+// return** (`irAtoms` / `irRendered` do it in one expression). Writing only on the
+// non-empty returns is what makes the ladder in `checkFuncDeclNode` total without an
+// entry-reset: the rungs short-circuit, so the LAST producer to return non-empty is the
+// one whose name is recorded, and every earlier rung's "" (however much its own nested
+// calls churned this scalar) is overwritten by the winner.
+//
+// Not an arena-lifetime sidecar (method note 7): a scalar written on the way out of a
+// call and read by the immediate caller, never carried between programs.
+let inferRetNameAtoms = 1
+
+// Hand back inferred-return name `nm` and report that it is `atoms` top-level atoms wide.
+// The producers' way of returning a second value: VL has one return slot, and the width is
+// free at the `|` join that built the name.
+function irAtoms(nm: string, atoms: i32): string {
+  inferRetNameAtoms = atoms
+  return nm
+}
+
+// `irAtoms` for a name that IS a `tyToEmitName` render: adopt the RENDERER's own reported
+// width (`emitNameAtoms`, #1113). Written as a call so the render is evaluated BEFORE
+// `emitNameAtoms` is read, with no dependence on argument evaluation order.
+function irRendered(nm: string): string {
+  inferRetNameAtoms = emitNameAtoms
+  return nm
+}
 // The ARENA-INDEX sibling of `inferRetTy` (parallel array): the `Ty`-arena index of each
 // recorded inferred return type, so the emitter's `collectU` inferred-return loop can drive
 // the STRUCTURAL arena walks (`collectTyReachRegister` / `collectTyReachCloSigs`) off the
@@ -10055,8 +10086,20 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // the ALIAS name so `synthRetAnnots` pins the lambda's `fnRet` as the litunion, whose functype
         // result reps as an i32 atom (`vtKindOfType`): the `$fnsig` result keys `>i` to match the value
         // call, and `emitReturnValue` encodes the member literal as its atom id (`retLitUnion`).
-        if unm == "" { unm = litUnionAliasNameOfTy(inferred) }
+        // `litUnionAliasNameOfTy` is a general-purpose helper (every renderer calls it), so
+        // it does NOT report a width — its answer is a declared ALIAS identifier, one atom,
+        // reported here at its only recorder rung (#1115).
+        if unm == "" { unm = irAtoms(litUnionAliasNameOfTy(inferred), 1) }
       }
+      // The width of the name this ladder settled on, handed over by the producer that
+      // JOINED it rather than re-derived by splitting it (#1115). The rungs short-circuit,
+      // so the LAST producer to answer non-empty is the one that wrote `inferRetNameAtoms`.
+      // The `recordable` name is `anm`, which is not a producer's join: all three gates
+      // (`isClassifiableRetName` / `isScalarListRetName` / `isObjShapeName`) admit only
+      // ONE-atom spellings — a fixed scalar/list name, or a `{…}` shape whose every
+      // separator `isObjShapeName` has just proved sits inside the braces.
+      let rAtoms = 1
+      if !recordable { rAtoms = inferRetNameAtoms }
       // A DEFERRED JOIN is a per-call-site placeholder, not a shape the emitter can
       // classify a return by — see the named-function twin in `elaborateInferRets`.
       if recordable || unm != "" {
@@ -10065,7 +10108,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           if inferRetNameOf(nodeKey) == "" {
             let rty = unm
             if recordable { rty = anm }
-            recordInferRet(nodeKey, rty, inferred)
+            recordInferRet(nodeKey, rty, inferred, rAtoms)
           }
         }
       }
@@ -10928,7 +10971,7 @@ function structFieldBoxRetName(er: i32) {
     i = i + 1
   }
   if !hasBox { return "" }
-  tyToEmitName(er)
+  irRendered(tyToEmitName(er))
 }
 
 // The CANONICAL emitter NAME (`{a:string,f:{f:{[string]:{f:i64}}},z:f32}`) for an inferred
@@ -10950,7 +10993,7 @@ function structMapFieldRetName(er: i32) {
   const t = T.tys[er]
   if !(t is TyObj) { return "" }
   if !tyObjHasMapField(er) { return "" }
-  tyToEmitName(er)
+  irRendered(tyToEmitName(er))
 }
 
 // True if struct-arena entry `er` (a `TyObj`) carries a `TyMap` field directly or inside a
@@ -10986,7 +11029,7 @@ function structFieldBoxElemListRetName(er: i32) {
   if !(t is TyArray) { return "" }
   if t.aElem < 0 { return "" }
   if structFieldBoxRetName(t.aElem) == "" { return "" }
-  tyToEmitName(er)
+  irRendered(tyToEmitName(er))
 }
 
 // True when every LEAF atom of the (possibly nested) union/nullable type `er` renders
@@ -11157,7 +11200,10 @@ function valueUnionRetName(er: i32) {
     nm = nm + atoms[i]
     i = i + 1
   }
-  nm
+  // One atom per LEAF, exactly: `tyIsValueUnion`'s own invariant is that under
+  // `retAtomsCheap` every admitted leaf renders to a single top-level atom (no `|`, no
+  // `=>`, balanced groupers), so the join's width is the leaf count. (#1115.)
+  irAtoms(nm, atoms.length)
 }
 
 // Whether union `er` has a LITUNION-ARRAY member (`K0[]`, `("a"|"b")[]`) — the arm
@@ -11204,17 +11250,23 @@ function litUnionArrayValueUnionRetName(er: i32) {
   if !tyUnionHasLitUnionArrayMember(er) { return "" }
   let hasLitArr = false
   let name = ""
+  // A member RENDER can itself be wider than one atom (`tyToEmitName`'s nullable arm
+  // spells `X|null`), so the join's width is the SUM of the members' reported widths, not
+  // the member count — method note 23's trap, avoided by accumulating (#1115).
+  let psum = 0
   let i = 0
   while i < members.length {
     const mn = tyToEmitName(members[i])
+    const mw = emitNameAtoms
     if mn == "" { return "" }
     if litUnionArrayElemOf(mn) != "" { hasLitArr = true }
     if i > 0 { name = name + "|" }
     name = name + mn
+    psum = psum + mw
     i = i + 1
   }
   if !hasLitArr { return "" }
-  if isValueUnionName(name) { return name }
+  if isValueUnionName(name) { return irAtoms(name, psum) }
   ""
 }
 
@@ -11266,7 +11318,9 @@ function structUnionRetName(er: i32, stmts: i32[]) {
       name = name + nm
       i = i + 1
     }
-    return name
+    // Every member is a DECLARED TYPE NAME — one identifier, one atom — so the join's
+    // width is the member count (#1115).
+    return irAtoms(name, members.length)
   }
   ""
 }
@@ -11316,7 +11370,8 @@ function nullableRetName(er: i32, stmts: i32[]) {
       const nm = nominalNameOfObj(t.nInner, stmts)
       // NON-spaced (`P|null`) — the emitter's internal name convention (`nullablePartOf`,
       // `structUnionRetName`'s `Cat|Dog`), not the spaced `tyToStr` render.
-      if nm != "" { return nm + "|null" }
+      // A declared type NAME is one atom; `null` is the second (#1115).
+      if nm != "" { return irAtoms(nm + "|null", 2) }
       // An INLINE shape with no matching TypeDecl (`{a: boolean, f: {f: f64}, z: i32}`,
       // the anonymous `(i32) => {f: i64} | null` spelling): render the emitter-format shape
       // text — `structIndexOfTypeName` resolves it by FIELD-SET to the same struct index the
@@ -11325,7 +11380,9 @@ function nullableRetName(er: i32, stmts: i32[]) {
       // downstream — a loud reject, exactly as before the pin.
       const inm = tyToEmitName(t.nInner)
       if inm.length >= 2 && inm[0] == '{' && inm[1] != '[' {
-        return inm + "|null"
+        // The `{…}` shape's separators all sit inside the braces (the renderer reports
+        // its own width); `null` adds one atom (#1115).
+        return irAtoms(inm + "|null", emitNameAtoms + 1)
       }
     } else if it is TyFunc {
       // A NULLABLE-CLOSURE contextual return (`((i32) => K0) | null`, kind 19): the closure
@@ -11351,7 +11408,9 @@ function nullableRetName(er: i32, stmts: i32[]) {
       }
       let irs = litUnionAliasNameOfTy(it.fnRet)
       if irs == "" { irs = tyToEmitName(it.fnRet) }
-      if irs != "" { return "((" + ips + ")=>" + irs + ")|null" }
+      // The grouped closure is ONE atom (its separators AND its top-level `=>` sit inside
+      // the parens); `null` is the second (#1115).
+      if irs != "" { return irAtoms("((" + ips + ")=>" + irs + ")|null", 2) }
     } else if tyIsNulI32BackedListInner(t.nInner) {
       // The nullable i32-BACKED list (`boolean[] | null`, `i32[] | null`, a litunion
       // `K0[] | null` — kind 15): the shared i32-list wrapper made nullable
@@ -11361,14 +11420,15 @@ function nullableRetName(er: i32, stmts: i32[]) {
       // body — the lambda's `$fnsig` result keys `>o`, matching the value call's
       // `annRetKind`. The distinct-backing leaves (`i64[] | null`, …) are NOT rendered
       // (outside the value-call ABI — they stay loud rejects).
-      return tyToEmitName(t.nInner) + "|null"
+      const lnm = tyToEmitName(t.nInner)
+      return irAtoms(lnm + "|null", emitNameAtoms + 1)
     } else if tyIsPrimNamed(t.nInner, "string") {
-      return "string|null"
+      return irAtoms("string|null", 2)
     } else if tyIsPrimNamed(t.nInner, "boolean") {
       // The boolean niche (`boolean | null`): the i32 sentinel rep (2 = null). Pinned by
       // `synthRetAnnots` (`nullablePartOf` non-empty) so `emitReturnValue`'s `tyIsNulBool`
       // arm niches a `return null` / `return <bool>`, matching the annotated form.
-      return "boolean|null"
+      return irAtoms("boolean|null", 2)
     }
   }
   ""
@@ -11386,7 +11446,8 @@ function nulLitUnionRetName(er: i32) {
   const t = T.tys[er]
   if t is TyNullable {
     const alias = litUnionAliasNameOfTy(t.nInner)
-    if alias != "" { return alias + "|null" }
+    // An alias identifier plus the `null` arm — two atoms (#1115).
+    if alias != "" { return irAtoms(alias + "|null", 2) }
   }
   ""
 }
@@ -11409,17 +11470,17 @@ function nulElemListRetName(er: i32) {
       // it is still spelled into the result, but the DECISION is structural.
       const inner = tyPrimNameOf(et.nInner)
       if inner == "f64" || inner == "i32" || inner == "i64" || inner == "f32" {
-        return "(" + inner + "|null)[]"
+        return irAtoms("(" + inner + "|null)[]", 1)
       }
       // The NICHE leaves: `(boolean|null)[]` (i32 sentinel-2 list), `(string|null)[]`
       // (string-ref list with `ref.null` elements), `(K|null)[]` (i32 atom list with the
       // `-1` sentinel, rendered by its ALIAS). Each rides an existing non-box list rep the
       // annotated return already lowers; the pin routes the anonymous lambda through it.
       if inner == "boolean" || inner == "string" {
-        return "(" + inner + "|null)[]"
+        return irAtoms("(" + inner + "|null)[]", 1)
       }
       const alias = litUnionAliasNameOfTy(et.nInner)
-      if alias != "" { return "(" + alias + "|null)[]" }
+      if alias != "" { return irAtoms("(" + alias + "|null)[]", 1) }
     }
   }
   ""
@@ -11446,7 +11507,7 @@ function nulClosureElemListRetName(er: i32) {
       const it = T.tys[et.nInner]
       if it is TyFunc {
         const en = nullableRetName(t.aElem, gRootStmts)
-        if en != "" { return "(" + en + ")[]" }
+        if en != "" { return irAtoms("(" + en + ")[]", 1) }
       }
     }
   }
@@ -11489,7 +11550,7 @@ function litUnionElemListRetName(er: i32) {
     if t.aElem < 0 { return "" }
     if tyIsLitUnion(t.aElem) {
       const an = litUnionAliasNameOfTy(t.aElem)
-      if an != "" { return an + "[]" }
+      if an != "" { return irAtoms(an + "[]", 1) }
     }
   }
   ""
@@ -11509,7 +11570,7 @@ function structElemListRetName(er: i32) {
     const et = T.tys[t.aElem]
     if et is TyObj {
       if !structElemFieldsPlain(t.aElem, 4) { return "" }
-      return tyToEmitName(er)
+      return irRendered(tyToEmitName(er))
     }
   }
   ""
@@ -11550,7 +11611,7 @@ function nulStructElemListRetName(er: i32) {
         if !structElemFieldsPlain(et.nInner, 4) {
           if structFieldBoxRetName(et.nInner) == "" { return "" }
         }
-        return tyToEmitName(er)
+        return irRendered(tyToEmitName(er))
       }
     }
   }
@@ -11576,7 +11637,7 @@ function nulMapElemListRetName(er: i32) {
     const et = T.tys[t.aElem]
     if et is TyNullable {
       const it = T.tys[et.nInner]
-      if it is TyMap { return tyToEmitName(er) }
+      if it is TyMap { return irRendered(tyToEmitName(er)) }
     }
   }
   ""
@@ -11607,7 +11668,7 @@ function nulListElemListRetName(er: i32) {
       if it is TyArray {
         if it.aElem < 0 { return "" }
         const lt = T.tys[it.aElem]
-        if lt is TyPrim { return tyToEmitName(er) }
+        if lt is TyPrim { return irRendered(tyToEmitName(er)) }
         // A BOX-ELEMENT inner list (`((i32|boolean)[] | null)[]`, `((i64|{q:i64})[] | null)[]`):
         // the inner list's elements ride the union `{tag, payload}` box (element kind 2), so the
         // OUTER element is that box-list's wrapper kept nullable — `nullArrayArrElem`'s kind-9
@@ -11618,10 +11679,10 @@ function nulListElemListRetName(er: i32) {
         // TRAP (fuzz post-#1063 sweep branching leg). The value-union sibling of the scalar-leaf
         // arm above; a map-union / ref-arm / nested-2D inner stays declined (its own route).
         if elemValueUnionListRetName(et.nInner) != "" {
-          return tyToEmitName(er)
+          return irRendered(tyToEmitName(er))
         }
         if elemVariantBoxListRetName(et.nInner) != "" {
-          return tyToEmitName(er)
+          return irRendered(tyToEmitName(er))
         }
       }
     }
@@ -11638,7 +11699,7 @@ function structPlainRetName(er: i32) {
   const t = T.tys[er]
   if !(t is TyObj) { return "" }
   if !structElemFieldsPlain(er, 4) { return "" }
-  tyToEmitName(er)
+  irRendered(tyToEmitName(er))
 }
 
 // The field gate of `structElemListRetName`: every field a scalar / string / boolean
@@ -11754,7 +11815,7 @@ function mapElemListRetName(er: i32) {
   if t is TyArray {
     if t.aElem < 0 { return "" }
     const et = T.tys[t.aElem]
-    if et is TyMap { return tyToEmitName(er) }
+    if et is TyMap { return irRendered(tyToEmitName(er)) }
   }
   ""
 }
@@ -11771,7 +11832,7 @@ function elemValueUnionListRetName(er: i32) {
   const t = T.tys[er]
   if t is TyArray {
     const en = tyToEmitName(t.aElem)
-    if en != "" && isValueUnionName(en) { return tyToEmitName(er) }
+    if en != "" && isValueUnionName(en) { return irRendered(tyToEmitName(er)) }
   }
   ""
 }
@@ -11791,7 +11852,7 @@ function elemVariantBoxListRetName(er: i32) {
   if t is TyArray {
     if t.aElem < 0 { return "" }
     const en = variantBoxUnionRetName(t.aElem)
-    if en != "" { return "(" + en + ")[]" }
+    if en != "" { return irAtoms("(" + en + ")[]", 1) }
   }
   ""
 }
@@ -11809,7 +11870,7 @@ function elemMapUnionListRetName(er: i32) {
   if t is TyArray {
     if t.aElem < 0 { return "" }
     const en = mapUnionRetName(t.aElem)
-    if en != "" { return "(" + en + ")[]" }
+    if en != "" { return irAtoms("(" + en + ")[]", 1) }
   }
   ""
 }
@@ -11865,7 +11926,7 @@ function elemRefArmValueUnionListRetName(er: i32) {
     mi = mi + 1
   }
   if !hasArr { return "" }
-  tyToEmitName(er)
+  irRendered(tyToEmitName(er))
 }
 
 // The emitter-format NAME of an inferred NESTED (2-D+) union-element array return `er` —
@@ -11905,7 +11966,7 @@ function nestedElemUnionListRetName(er: i32) {
     elemVariantBoxListRetName(leafArr) != "" ||
     elemMapUnionListRetName(leafArr) != ""
   ) {
-    return tyToEmitName(er)
+    return irRendered(tyToEmitName(er))
   }
   ""
 }
@@ -11931,7 +11992,9 @@ function cloArmValueUnionRetName(er: i32) {
   // (fuzz sweep4 plain leg, seed 395013828 case_00309).
   if t is TyNullable {
     const inner = cloArmValueUnionRetName(t.nInner)
-    if inner != "" { return inner + "|null" }
+    // The inner union keeps its own top-level `|`s, so `null` ADDS one atom to the width
+    // the recursion just reported (#1115).
+    if inner != "" { return irAtoms(inner + "|null", inferRetNameAtoms + 1) }
     return ""
   }
   if t is TyUnion {
@@ -11969,7 +12032,10 @@ function cloArmValueUnionRetName(er: i32) {
       i = i + 1
     }
     if !hasClo { return "" }
-    if isValueUnionName(name) { return name }
+    // Every member render is ONE atom — a prim's own name, or a closure PARENTHESIZED
+    // (which puts its separators and its `=>` inside a grouper) — so the join's width is
+    // the member count (#1115).
+    if isValueUnionName(name) { return irAtoms(name, members.length) }
   }
   ""
 }
@@ -11998,13 +12064,15 @@ function nestedLeafListRetName(er: i32) {
       if lt is TyPrim {
         const pn = lt.primName
         if pn == "i64" || pn == "f64" || pn == "f32" || pn == "string" {
-          return tyToEmitName(er)
+          return irRendered(tyToEmitName(er))
         }
         return ""
       }
       if lt is TyArray {
         // Deeper nesting: the leaf decides — recurse on the INNER array.
-        if nestedLeafListRetName(t.aElem) != "" { return tyToEmitName(er) }
+        if nestedLeafListRetName(t.aElem) != "" {
+          return irRendered(tyToEmitName(er))
+        }
       }
     }
   }
@@ -12051,7 +12119,7 @@ function mapUnionRetName(er: i32) {
       i = i + 1
     }
     if !hasMap { return "" }
-    return tyToEmitName(er)
+    return irRendered(tyToEmitName(er))
   }
   ""
 }
@@ -12127,7 +12195,11 @@ function refArmUnionRetName(er: i32, stmts: i32[]) {
       name = name + mn
       i = i + 1
     }
-    return name
+    // Every member render is ONE atom — the structural pre-gate above admits only an
+    // array-of-object (`S[]` / `{…}[]`), an object shape and a scalar prim, and each of
+    // those spells its separators inside a grouper — so the join's width is the member
+    // count (#1115).
+    return irAtoms(name, members.length)
   }
   ""
 }
@@ -12164,7 +12236,9 @@ function variantBoxUnionRetName(er: i32) {
   // (a `null` atom rides the tag, no variant slot) and `annRetKind` keys `>u` for.
   if t is TyNullable {
     const inner = variantBoxUnionRetName(t.nInner)
-    if inner != "" { return inner + "|null" }
+    // The inner union keeps its own top-level `|`s, so `null` ADDS one atom to the width
+    // the recursion just reported (#1115).
+    if inner != "" { return irAtoms(inner + "|null", inferRetNameAtoms + 1) }
     return ""
   }
   if t is TyUnion {
@@ -12196,6 +12270,12 @@ function variantBoxUnionRetName(er: i32) {
     let hasClo = false
     let hasObj = false
     let name = ""
+    // The APPEND count, not `members.length`: the litunion regroup below CONTRACTS a run
+    // of `TyLit` members into ONE alias atom (`continue`), so the loop's iteration count
+    // and the result's atom count are different numbers — method note 23's shape in the
+    // contracting direction. Every appended `mn` is one atom (an alias identifier, a
+    // parenthesized functype, or a `vbUnionMemberName` prim/`{…}`/`X[]`). (#1115.)
+    let psum = 0
     let litDone = false
     let i = 0
     while i < members.length {
@@ -12235,11 +12315,12 @@ function variantBoxUnionRetName(er: i32) {
       }
       if name != "" { name = name + "|" }
       name = name + mn
+      psum = psum + 1
       i = i + 1
     }
     if hasClo && !hasObj { return "" }
     if !hasComposite { return "" }
-    return name
+    return irAtoms(name, psum)
   }
   ""
 }
@@ -12498,7 +12579,9 @@ export function checkProgram(rootIx: i32) {
             // expression-based fallback already handles those, so leave them be.
             const enm = tyToStr(er)
             if isClassifiableRetName(enm) {
-              recordInferRet(efn.fnName, enm, er)
+              // `isClassifiableRetName`'s admitted set is six scalar spellings plus
+              // `i32[]`/`string[]` — every one of them a single atom (#1115).
+              recordInferRet(efn.fnName, enm, er, 1)
             } else {
               // A VALUE union/nullable inferred return (`i32 | string`, `i32 | null`)
               // lowers through the same `uBoxIdx` machinery as an annotation — export
@@ -12506,17 +12589,16 @@ export function checkProgram(rootIx: i32) {
               // return site pick it up.
               const un = valueUnionRetName(er)
               if un != "" {
-                recordInferRet(efn.fnName, un, er)
+                recordInferRet(efn.fnName, un, er, inferRetNameAtoms)
               } else if structUnionRetName(er, gRootStmts) != "" {
                 // A STRUCT-union (`Cat | Dog`) lowers un-annotated via the variant-boxed
                 // rep — the SAME machinery as an annotated `: Cat | Dog`. Export its
                 // nominal name so the emitter registers the union + classifies the
                 // binding (`registerInlineUnion` / `unionNameOfExpr`).
-                recordInferRet(
-                  efn.fnName,
-                  structUnionRetName(er, gRootStmts),
-                  er,
-                )
+                // The width is read AFTER the render that reports it (#1115) — a local,
+                // so no argument-evaluation order is relied on.
+                const sun = structUnionRetName(er, gRootStmts)
+                recordInferRet(efn.fnName, sun, er, inferRetNameAtoms)
               } else if variantBoxUnionRetName(er) != "" {
                 // A VARIANT-BOX union (`{w: i32} | i32`, `Cat | i32` — a struct arm beside a
                 // scalar) lowers un-annotated via the SAME `>u` box the annotated `: {w:
@@ -12526,7 +12608,8 @@ export function checkProgram(rootIx: i32) {
                 // boxes the struct/scalar arm exactly as the annotated form does. Export
                 // the `variantBoxUnionRetName` emit render (the anonymous-lambda spelling
                 // already records this same name under its `#<nodeIx>` sentinel).
-                recordInferRet(efn.fnName, variantBoxUnionRetName(er), er)
+                const vbn = variantBoxUnionRetName(er)
+                recordInferRet(efn.fnName, vbn, er, inferRetNameAtoms)
               } else {
                 // A NICHE nullable (`boolean | null` / `string | null`) lowers via its
                 // sentinel / `ref.null $array` rep, not the box, so `valueUnionRetName`
@@ -12535,10 +12618,11 @@ export function checkProgram(rootIx: i32) {
                 // valtype pick it up. A non-niche nullable (struct ref) stays floored.
                 const ert = T.tys[er]
                 if ert is TyNullable {
+                  // Two atoms, written out literally right here (#1115).
                   if tyIsPrimNamed(ert.nInner, "boolean") {
-                    recordInferRet(efn.fnName, "boolean|null", er)
+                    recordInferRet(efn.fnName, "boolean|null", er, 2)
                   } else if tyIsPrimNamed(ert.nInner, "string") {
-                    recordInferRet(efn.fnName, "string|null", er)
+                    recordInferRet(efn.fnName, "string|null", er, 2)
                   }
                 }
               }
@@ -12556,16 +12640,19 @@ export function checkProgram(rootIx: i32) {
 // inferred TYPE name rather than re-deriving from the return expression.
 // Record an inferred-return entry: push the parallel arrays AND the by-name map (first-wins).
 // Every `inferRetFn`/`inferRetTy` push goes through here so the map stays in sync.
-function recordInferRet(name: string, ty: string, tyIx: i32) {
+function recordInferRet(name: string, ty: string, tyIx: i32, atoms: i32) {
   if !inferRetIdx.has(name) { inferRetIdx[name] = inferRetFn.length }
   inferRetFn.push(name)
   inferRetTy.push(ty)
   // #1057 — bank the recorded name's TOP-LEVEL atom count HERE, at the one funnel every
-  // inferred-return name producer lands in. `unionMemberCount` is the counting dual of
-  // `splitUnionAtoms` (same depth/quote rules, same top-level-`=>` stop), so the banked
-  // number is exactly what the emitter's consumer used to re-derive — no arena
-  // approximation, and no litunion-alias disagreement (see the column's comment).
-  inferRetAtomCount.push(unionMemberCount(ty))
+  // inferred-return name producer lands in. #1112 took the number by running
+  // `unionMemberCount` over the finished string; #1115 takes it from `atoms`, the width
+  // the CALLER's producer already knew at its own `|` join. Same number, no scan of a
+  // string the compiler just assembled — the `canonEmitName` -> `canonAtoms` trade of
+  // #1113, applied to this funnel. (The refuted alternative is an arena-SPINE walk of the
+  // recorded TYPE — see the column's comment: a litunion member renders as one atom while
+  // its spine counts several. The width must be the producer's JOIN width, never a walk.)
+  inferRetAtomCount.push(atoms)
   inferRetTyIx.push(tyIx)
   0
 }
