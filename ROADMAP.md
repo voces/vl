@@ -357,7 +357,10 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   (bulk JS-host interop — dart2wasm/Kotlin-Wasm style); UTF-8/i8 packing (size); richer methods.
   **Strings direction:** `docs/guide/strings-design.md` — long-term UTF-8 internal storage,
   code-point-indexed API made O(1) for the ASCII common case via an ASCII fast-path flag; strings
-  immutable. Ties A7.
+  immutable. Ties A7. **Third argument for the i8 packing, beyond size:** wasmtime's
+  `ArrayRef::new_from_i8_slice` (memcpy a host byte slice straight into a GC array) is i8-only, so
+  `(array i8)` is what lets the host stage source in ONE call instead of ~3.4M — see B-mem. Weigh
+  against the loss of word-at-a-time scanning (`memory-gc-design.md` §2.2).
 - 🟡 **B8. Loops.** REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
   destructuring forms; **expression `step`** on a counter range (`for i = 1 to 5 step i * 2` — a
   multiplicative/variable step, not just a const increment), distinct from the const-step
@@ -426,10 +429,23 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   - **Bulk host I/O.** Export `ioMem` and implement the staging ABI `scripts/vl-host` already
     documents and probes for (`<name>Reserve` / `<name>Load`, plus an `rbyte` bulk sibling): today
     source crosses at ONE host call per code point (~3.4M per self-compile) and emitted bytes at one
-    call per byte (~1M).
+    call per byte (~1M). **Cheaper alternative to weigh first:** wasmtime 47's
+    `ArrayRef::new_from_i8_slice` builds a GC array from a host byte slice in ONE memcpy — no linear
+    memory, no `ioMem`, no data section. It is **i8-only**, so it lands free the moment strings are
+    `(array i8)` (B7) and not before. Sequencing question, not a fork: if B7 comes first this bullet
+    shrinks to a driver-ABI change.
   - **The tier itself** — an allocator (bump/arena), a data section, and the `Buffer`/`Array<T>`
     escape (`collections-design.md` §OQ.7), designed once for FFI / SIMD / bulk-I/O rather than
     accreted as intrinsics. Not a second object model → `DECISIONS.md`.
+- ⬜ **B-hint. Emit branch hints** (`wasm-toolchain-audit.md` §4.0). wasmtime reads the
+  `metadata.code.branch_hint` custom section to lay cold blocks out of line
+  (`Config::wasm_branch_hinting`; off by default until the proposal is fuzzed, so the host opts
+  in). Hints are ADVISORY — never semantics — so a wrong hint costs speed, never correctness,
+  which makes this the cheapest optimization channel VL has. The emitter already writes a custom
+  section (`selfhost-name-section.md`), and the checker already knows what an engine cannot infer:
+  `is`-guard arm ordering, null checks the narrowing pass proved, and the provably-true
+  discriminants A-exhaust computes. Start with the one-sided cases (a trap arm is cold; a
+  `?? default` fallback is cold) and measure before widening.
 - ⬜ **B-alloc. Allocate less** (the real answer to GC pressure, `memory-gc-design.md` §4.4).
   Heap2Local on the DEFAULT path (today `wasm-opt` runs only under an explicit `-O`, so the pass
   `DECISIONS.md` leans on is opt-in); representation inference (B6 §VL.7) to drop the
@@ -625,15 +641,20 @@ independent).*
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime
   (wasmtime — full WasmGC since v27) + a small host shim. No V8, no binaryen, no Deno.
   **Engine choice re-validated (2026 survey):** wasmtime remains the only standards-track
-  non-browser engine with complete, production WasmGC (27.0+, DRC + null collectors; the
-  collector is a per-invocation tuning knob). Wasmer gets GC mainly via its V8 backend (a JS
+  non-browser engine with complete, production WasmGC (27.0+; as of 46 a **copying** collector is
+  the default alongside DRC and null, and the collector is a per-invocation tuning knob —
+  `$VL_GC`, `memory-gc-design.md`). Wasmer gets GC mainly via its V8 backend (a JS
   engine again); WAMR/wazero are embedded/Go niches without GC. **System-API strategy:** WASI
   preview 1 is the whole OS surface `vl` needs (fd_read/fd_write/path_open/args_get/proc_exit),
   implemented natively by wasmtime — we write no OS code. The split: formatting + all compiler
   logic in VL; ONE emitter prerequisite — a linear memory + a GC-string→linear-memory copy
   (the `__store_string__` analog), since WASI's ptr/len ABI can't take GC refs (this also
   subsumes H4.5: emitted bytes leave via fd_write, killing the decimal-string handoff).
-  Target WASI p1 (p2/component-model + GC interop still settling). Distribution: zero-code via
+  Target WASI p1 — still the right target, but for a changed reason: wasmtime 46 **removed the
+  `wasi-common` crate** and p1 now lives in `wasmtime-wasi`'s `p1` module reimplemented over p2,
+  while **WASI 0.3.0 is on by default** as of 46. So p1 is a stable shim over a moving stack rather
+  than its own implementation, and "p2/component-model still settling" no longer describes the
+  landscape — GC↔component interop is the part that still does. Distribution: zero-code via
   `wasmtime run --dir . vl.cwasm` (AOT-compiled) behind a launcher script; a single static
   `vl` binary is an OPTIONAL thin Rust embedding of the wasmtime crate (engine setup +
   preopens only — no OS logic), deferrable until the flip.
