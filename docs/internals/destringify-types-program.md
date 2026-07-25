@@ -4737,20 +4737,35 @@ arithmetic below is base-independent.
 | `TypeRef.tyName` | 10 |
 | the `inferRetNameByNode` table (a STORED render) | 6 |
 
-Hand-verified, the RENDER column resolves to exactly **three producers**, and only one of
-them is a renderer the emitter calls directly:
+Hand-verified, the RENDER column resolves to exactly **TWO producers** — and one of them is
+not a renderer the emitter calls at all, it is a renderer's output the CHECKER stored:
 
-- **`nodeTyName(ix)`** — `tyToStr`/`tyToEmitName` of `nodeTyIxOf(ix)`. Six consumer sites:
-  `exprIsClosure` (1 `annArrowAt`), `identFnTypeAnnName` (2 `annArrowAt`), `synthParamAnnots`
-  (4: `nullablePartOf`, `nameIsRefArray` ×2, `refArrElemName`), `structIndexOfExpr`
-  (2 `structIndexOfTypeName` rungs).
+- **`nodeTyName(ix)`** — `tyToStr` / `tyToEmitName` of `nodeTyIxOf(ix)`. **6 producer calls**
+  in these files, feeding **6 consumers**:
+
+  | producer call | consumer | SCORECARD parses | name-keyed resolutions |
+  |---|---|---|---|
+  | `exprIsClosure` | `annArrowAt(tn) >= 0` | 1 | 0 |
+  | `identFnTypeAnnName` (Call init) | `annArrowAt` | 1 | 0 |
+  | `identFnTypeAnnName` (`??` init) | `annArrowAt` | 1 | 0 |
+  | `synthParamAnnots` | `nullablePartOf`, `nameIsRefArray` ×2, `refArrElemName` | 4 | 3 (`resolveShapeToNominal` ×2, `rlSlotByName`) |
+  | `structIndexOfExpr` (+ its `nodeTyCanonObjName` rung) | `structIndexOfTypeName` | 0 | 2 |
+  | `structIndexOfObjCtxGo` (+ its canonical-render retry) | `structIndexOfTypeName` | 0 | 2 |
+  | **total** | | **7** | **7** |
+
 - **`inferRetNameByNode(nodeIx)`** — a STORED `tyToEmitName` render (`irRendered`,
-  typecheck.vl:1103). One consumer, `synthRetAnnots`, which takes it apart at **19** sites.
+  typecheck.vl:1103). ONE producer call, ONE consumer — `synthRetAnnots` — which takes the
+  string apart at **19** sites (16 named classifiers, 2 `resolveShapeToNominal`, 2 inline
+  `[`/`]`-suffix slices; 5 of the 19 are on the SCORECARD list).
 - the remaining 12 RENDER rows are one-hop false positives of the transitive classifier
   (a callee that reaches a renderer on some *other* path); each was read and rejected.
 
-So the second arc, in this partition, is **three producers and 31 consumer sites** — not a
-diffuse condition. That is the finding the enumeration was for.
+So the second arc, in this partition, is **two producers, 7 consumers and 33 sites** — not a
+diffuse condition. That is the finding the enumeration was for. (A first draft of this
+section said "three producers and 31 sites", counting `structIndexOfExpr` as a producer when
+it is a `nodeTyName` CONSUMER, and missing `structIndexOfObjCtxGo`'s two rungs entirely. The
+correction is recorded rather than silently applied: the enumeration is the deliverable, so
+its arithmetic has to be auditable.)
 
 ### D-ARROWTY — three consumers stop asking a render whether it has an arrow
 
@@ -4938,6 +4953,11 @@ RC=0 (**1,969 passed, 0 failed, 8 ignored**).
 - **`structIndexOfExpr`'s two render→fieldset rungs** — REFUTED above, with the disagreement
   count, the decline rate, the mechanism (`sTyIx` is arena-IDENTITY over a non-hash-consed
   arena) and a witness.
+- **`structIndexOfObjCtxGo`'s two rungs** are the same shape and were NOT probed. Stated as a
+  non-measurement, not as a claim: the site already opens with a node route
+  (`repRowOfTyStruct(nodeRepTyIxOf(objIx))`) that `structIndexOfExpr` reaches only lower
+  down, so its residual population is a different one and the 172-disagreement result above
+  does not transfer to it in either direction.
 - **The 27 stored-COLUMN parse sites.** The `rlElemName[slot]` family is already a laddered
   arena-first chokepoint set (D5-final); every residual name leg there is gated on
   `rlElemTyIx` COVERAGE, which is #1116's open hand-off (`rlInternName` re-RESOLVES the name
