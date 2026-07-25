@@ -23,6 +23,7 @@ import {
   isInferLetNulStr,
   isTopLevelFuncTypeName,
   isValueUnionName,
+  isVarTyIxOf,
   litUnionAliasNameOfTy,
   nameIsFuncTypeAtom,
   nameIsLitUnionArmValueUnion,
@@ -276,7 +277,9 @@ import {
   mvValTyIx,
   mvValsOutBase,
   narrowNames,
+  narrowSets,
   narrowTop,
+  narrowTys,
   narrowVariants,
   nestedNameSet,
   nliLetIxs,
@@ -2949,7 +2952,10 @@ export function scalarListElemKind(exprIx: i32, fnIx: i32): VKind | null {
 // push a binding, so BOTH `ta` and `tb` stay narrowed in the inner branch — a single
 // slot would lose the outer one. A branch saves the stack LENGTH and truncates back
 // on exit, so nesting + the else-branch see the right scope. `narrowVariantFor`
-// resolves a receiver name to its INNERMOST active variant (shadowing-correct).
+// resolves a receiver name to its INNERMOST active variant (shadowing-correct);
+// `narrowSlotTy` resolves the same slot's narrowed TYPE from the structure columns
+// (`narrowTys`/`narrowSets`) the push banked, so a consumer asks the arena what the
+// binding now is instead of re-classifying the rendered variant.
 // `narrowTop` is the logical stack DEPTH: only `narrowNames[0 .. narrowTop-1]` are
 // active. Entries are appended on push; on branch exit the depth is rewound (the arrays
 // keep their slots — no `.pop()`, so no global-list-pop self-host dependency). A push
@@ -2958,29 +2964,68 @@ export function scalarListElemKind(exprIx: i32, fnIx: i32): VKind | null {
 // early, before `computeRetInference` — module-level `let`s must textually
 // precede the function bodies/call sites that read them.)
 
+// The STACK SLOT of the innermost active narrowing of `name`, or -1 when `name` is not
+// currently narrowed. The one scan every narrowing query shares, so a consumer that wants
+// both the rendered variant and its structure pays for one walk.
+function narrowSlotOf(name: string): i32 {
+  let i = narrowTop - 1
+  while i >= 0 {
+    if narrowNames[i] == name { return i }
+    i = i - 1
+  }
+  -1
+}
+
 // The variant a union local `name` is narrowed to in the current scope (the innermost
 // active binding within `narrowTop`), or "" if `name` is not currently narrowed.
 export function narrowVariantFor(name: string) {
-  let i = narrowTop - 1
-  while i >= 0 {
-    if narrowNames[i] == name { return narrowVariants[i] }
-    i = i - 1
-  }
-  ""
+  const i = narrowSlotOf(name)
+  if i < 0 { return "" }
+  narrowVariants[i]
 }
 
-// Push an active narrowing `name → variant`, growing the stack arrays if needed. Returns
-// the new depth.
-function pushNarrow(name: string, variant: string) {
+// The arena TYPE the narrowing at stack slot `i` binds: the type banked by an `is` push,
+// or — for a complement push — the SOLE surviving member of its set (`i32 | null` minus
+// `null` binds `i32`). -1 when the slot binds no single type: a 2+-member set, a set the
+// pool does not cover, or a push that banked nothing.
+function narrowSlotTy(i: i32): i32 {
+  const t = narrowTys[i]
+  if t >= 0 { return t }
+  msSoleMemberTy(narrowSets[i])
+}
+
+// Push an active narrowing `name → variant` carrying its STRUCTURE: `ty` is the narrowed
+// type's arena index (a one-type narrowing), `set` the interned member-set id (a
+// complement narrowing) — each -1 where it does not apply. Grows the stack arrays if
+// needed; all four columns move together, so a slot index is valid in every one of them.
+// Returns the new depth.
+function pushNarrowRep(name: string, variant: string, ty: i32, set: i32) {
   if narrowTop < narrowNames.length {
     narrowNames[narrowTop] = name
     narrowVariants[narrowTop] = variant
+    narrowTys[narrowTop] = ty
+    narrowSets[narrowTop] = set
   } else {
     narrowNames.push(name)
     narrowVariants.push(variant)
+    narrowTys.push(ty)
+    narrowSets.push(set)
   }
   narrowTop = narrowTop + 1
   narrowTop
+}
+
+// Push a narrowing whose structure is not carried (the rendered variant is all the
+// entry has — every consumer falls through to its name path for it).
+function pushNarrow(name: string, variant: string) {
+  pushNarrowRep(name, variant, -1, -1)
+}
+
+// Push an `is`-test narrowing: the tested SPELLING plus the arena type the checker
+// resolved it to at the `is` node (`isVarTyIxOf` — -1 for a node the checker never saw,
+// e.g. a monomorphized clone, which lands on the name path).
+function pushNarrowIs(name: string, variant: string, condIx: i32) {
+  pushNarrowRep(name, variant, isVarTyIxOf(condIx), -1)
 }
 
 // Append the declared-local name `name` to `localNames` as a FRESH slot (one wasm
@@ -6407,7 +6452,7 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
     const recv = P.nodes[c.isObj]
     if recv is Ident {
       if exprUnion(c.isObj, fnIx) {
-        pushNarrow(recv.identName, c.isVariant)
+        pushNarrowIs(recv.identName, c.isVariant, condIx)
         return true
       }
     }
@@ -6418,7 +6463,7 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
       if memberUnionFieldName(unwrapParen(c.isObj), fnIx) != "" {
         const mk = memberPathKeyOf(unwrapParen(c.isObj))
         if mk != "" {
-          pushNarrow(mk, c.isVariant)
+          pushNarrowIs(mk, c.isVariant, condIx)
           return true
         }
       }
@@ -6434,7 +6479,11 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
           if sFieldTypeAt(omSi, omFi) == 16 {
             const omRoot = P.nodes[unwrapParen(mrecv.omObj)]
             if omRoot is Ident {
-              pushNarrow(omRoot.identName + "." + mrecv.omProp, c.isVariant)
+              pushNarrowIs(
+                omRoot.identName + "." + mrecv.omProp,
+                c.isVariant,
+                condIx,
+              )
               return true
             }
           }
@@ -6470,6 +6519,8 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
         pushNarrow(nm, "null")
         return true
       }
+      const nsid = currentNarrowSetIdOf(nm, fnIx)
+      if pushNarrowComplement(nm, nsid, "null") != "" { return true }
       const rest = removeAtomFromSet(currentNarrowSetOf(nm, fnIx), "null")
       if rest != "" {
         pushNarrow(nm, rest)
@@ -6489,6 +6540,8 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
         pushNarrow(snm, "null")
         return true
       }
+      const ssid = currentStructNarrowSetIdOf(snm, fnIx)
+      if pushNarrowComplement(snm, ssid, "null") != "" { return true }
       const srest = removeAtomFromSet(
         currentStructNarrowSetOf(snm, fnIx),
         "null",
@@ -6577,6 +6630,10 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
         const un = unionNameOfIdent(recv.identName, fnIx)
         if un != "" {
           if isValueUnionName(un) {
+            const esid = currentNarrowSetIdOf(recv.identName, fnIx)
+            if pushNarrowComplement(recv.identName, esid, c.isVariant) != "" {
+              return true
+            }
             const rest = removeAtomFromSet(
               currentNarrowSetOf(recv.identName, fnIx),
               c.isVariant,
@@ -6597,9 +6654,19 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
         if mun != "" {
           const mk = memberPathKeyOf(unwrapParen(c.isObj))
           if mk != "" {
-            let mcur = unionMemberSetOf(mun)
-            const mNar = narrowVariantFor(mk)
-            if mNar != "" { mcur = mNar }
+            let mcur = ""
+            let msid = -1
+            // The member PATH's own narrowing stack slot carries both its rendered
+            // current set and that set's identity — one walk answers both.
+            const mslot = narrowSlotOf(mk)
+            if mslot >= 0 {
+              mcur = narrowVariants[mslot]
+              msid = narrowSets[mslot]
+            } else {
+              mcur = unionMemberSetOf(mun)
+              msid = msSetOfText(mcur)
+            }
+            if pushNarrowComplement(mk, msid, c.isVariant) != "" { return true }
             const mrest = removeAtomFromSet(mcur, c.isVariant)
             if mrest != "" {
               pushNarrow(mk, mrest)
@@ -6636,6 +6703,10 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
     const srecv = P.nodes[unwrapParen(c.isObj)]
     if srecv is Ident {
       if exprUnion(c.isObj, fnIx) {
+        const ssid = currentStructNarrowSetIdOf(srecv.identName, fnIx)
+        if pushNarrowComplement(srecv.identName, ssid, c.isVariant) != "" {
+          return true
+        }
         const srest = removeAtomFromSet(
           currentStructNarrowSetOf(srecv.identName, fnIx),
           c.isVariant,
@@ -6661,6 +6732,8 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
         pushNarrow(nm, "null")
         return true
       }
+      const nsid = currentNarrowSetIdOf(nm, fnIx)
+      if pushNarrowComplement(nm, nsid, "null") != "" { return true }
       const rest = removeAtomFromSet(currentNarrowSetOf(nm, fnIx), "null")
       if rest != "" {
         pushNarrow(nm, rest)
@@ -6678,6 +6751,8 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
         pushNarrow(snm, "null")
         return true
       }
+      const ssid = currentStructNarrowSetIdOf(snm, fnIx)
+      if pushNarrowComplement(snm, ssid, "null") != "" { return true }
       const srest = removeAtomFromSet(
         currentStructNarrowSetOf(snm, fnIx),
         "null",
@@ -6736,7 +6811,10 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
             if unionHasAtom(rn, "null") { rhsNullable = true }
           }
           if !rhsNullable {
-            pushNarrow(tgt.identName, removeAtomFromSet(un, "null"))
+            const asid = msSetOfText(un)
+            if pushNarrowComplement(tgt.identName, asid, "null") == "" {
+              pushNarrow(tgt.identName, removeAtomFromSet(un, "null"))
+            }
           }
         }
       }
@@ -14369,8 +14447,25 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
 // narrowed to `null` / narrowed to a struct variant. A non-"" answer means an
 // ident READ unboxes to that atom's rep.
 export function narrowedValueAtomOf(name: string) {
-  const v = narrowVariantFor(name)
+  const i = narrowSlotOf(name)
+  if i < 0 { return "" }
+  const v = narrowVariants[i]
   if v == "" { return "" }
+  // CONTAINMENT: the narrowed TYPE decides the REJECT — a type that is neither a value
+  // atom (`unMemAtomKind`, `valueAtomKind`'s arena dual) nor a litunion has no unboxing
+  // arm, whatever it is spelled, and that is the population whose rendered spelling is
+  // expensive to classify (a struct variant / a list / a map runs the whole
+  // `valueAtomKind` ladder down to its arrow scan). Where the type IS an atom the
+  // SPELLING decides, because the answer is the spelling: a nominal alias renders
+  // itself, not its structure.
+  const ty = narrowSlotTy(i)
+  if ty >= 0 {
+    const tk = unMemAtomKind(ty)
+    if tk == 6 { return "" }
+    if tk < 0 {
+      if !tyIsLitUnion(ty) { return "" }
+    }
+  }
   const k = valueAtomKind(v)
   if k >= 0 && k != 6 { return v }
   // A litunion-alias narrow (`x is K0` where `type K0 = "a" | "b"`) unboxes as the
@@ -14386,8 +14481,19 @@ export function narrowedValueAtomOf(name: string) {
 // the reflist WRAPPER ref from the box (`ref.cast` of the anyref payload) so indexing /
 // `.length` see the list directly.
 export function narrowedRefArrayOf(name: string) {
-  const v = narrowVariantFor(name)
+  const i = narrowSlotOf(name)
+  if i < 0 { return "" }
+  const v = narrowVariants[i]
   if v == "" { return "" }
+  const ty = narrowSlotTy(i)
+  if ty >= 0 {
+    if unMemAtomKind(ty) >= 0 { return "" }
+    // CONTAINMENT: `unMemIsRefElemArray` is the SHAPE question (a `TyArray` over a
+    // non-scalar-leaf element) and `nameIsRefArray` is that shape PLUS the reflist
+    // layer's nameability, so the arena leg can only REJECT — and rejecting is what
+    // almost every narrowed binding needs. A shape-yes re-asks the name.
+    if !unMemIsRefElemArray(ty) { return "" }
+  }
   if valueAtomKind(v) >= 0 { return "" }
   if nameIsRefArray(v) { return v }
   ""
@@ -14410,8 +14516,17 @@ export function narrowedClosureOf(name: string) {
 // a non-"" answer means an ident READ recovers the MAP STRUCT ref from the box (`ref.cast` of the
 // anyref payload) so `x[k]` / `x[k] ?? d` / `x.has(k)` route through the map lowering directly.
 export function narrowedMapOf(name: string) {
-  const v = narrowVariantFor(name)
+  const i = narrowSlotOf(name)
+  if i < 0 { return "" }
+  const v = narrowVariants[i]
   if v == "" { return "" }
+  // CONTAINMENT (as in `narrowedValueAtomOf`): a narrowed type that is not a `TyMap`
+  // cannot be the map arm, whatever it is spelled — and the map-member-UNION the name
+  // path has to exclude is a `TyUnion`, so the arena leg rejects it for free.
+  const ty = narrowSlotTy(i)
+  if ty >= 0 {
+    if !unMemIsMap(ty) { return "" }
+  }
   if valueAtomKind(v) >= 0 { return "" }
   // A narrow can land on a member SET, not a single arm: `t != null` over a map-member
   // union (`{[string]: V} | string | null`) narrows to `{[string]: V}|string` — a name
@@ -14770,6 +14885,31 @@ export function msNonNullCount(s: i32): i32 {
   c
 }
 
+// The arena TYPE of the set's SOLE member, or -1 when the set is empty, uncovered, or
+// has two or more members. The bridge from the set ADT to the per-type classifiers: a
+// complement narrowing that has subtracted its way down to one member (`i32 | null`
+// minus `null`) binds that member's type, and every "what is this binding now" question
+// is asked of that type rather than of the rendered survivor.
+export function msSoleMemberTy(s: i32): i32 {
+  if s < 0 || s >= msSetRow.length { return -1 }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  const mask = msSetMask[s]
+  let found = -1
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if found >= 0 { return -1 }
+      found = st + i
+    }
+    i = i + 1
+  }
+  if found < 0 { return -1 }
+  unMemTys[found]
+}
+
 // SUBTRACTION of the `null` keyword: clear every member whose KIND is the null token.
 export function msSubNull(s: i32): i32 {
   if s < 0 || s >= msSetRow.length { return -1 }
@@ -14827,6 +14967,42 @@ export function removeAtomFromSet(set: string, removed: string): string {
     if r >= 0 { return msTextOf(r) }
   }
   removeAtomFrom(set, removed)
+}
+
+// Set subtraction that KEEPS the set identity: subtract `removed` from the set `s` and
+// push the survivors as `name`'s narrowing, banking the resulting set id so the next
+// complement over the same binding subtracts from a (row, mask) pair instead of parsing
+// a rendered survivor list back into one. Returns the pushed rendering, or "" when the
+// structural path declines — the caller then runs its unchanged string path.
+function pushNarrowComplement(name: string, s: i32, removed: string): string {
+  if s < 0 { return "" }
+  let r = -1
+  if removed == "null" { r = msSubNull(s) } else { r = msSubAtom(s, removed) }
+  if r < 0 { return "" }
+  const txt = msTextOf(r)
+  if txt == "" { return "" }
+  pushNarrowRep(name, txt, -1, r)
+  txt
+}
+
+// The interned SET a binding is currently narrowed to — the set-ADT reading of
+// `currentNarrowSetOf`: the innermost active narrowing's banked set when it has one,
+// else the declared union's own set. -1 = no set (an `is`-pinned narrowing, an alias
+// name the pool declines by design, an unregistered union), and the caller keeps the
+// rendered path. The un-narrowed leg resolves exactly what `removeAtomFromSet` would
+// have resolved from the same text, so the alias-decline contract is unchanged.
+function currentNarrowSetIdOf(name: string, fnIx: i32): i32 {
+  const i = narrowSlotOf(name)
+  if i >= 0 { return narrowSets[i] }
+  msSetOfText(unionNameOfIdent(name, fnIx))
+}
+
+// The struct-union dual of `currentNarrowSetIdOf` (`currentStructNarrowSetOf`'s set):
+// an un-narrowed binding resolves through the ALIAS EXPANSION its rendered twin uses.
+function currentStructNarrowSetIdOf(name: string, fnIx: i32): i32 {
+  const i = narrowSlotOf(name)
+  if i >= 0 { return narrowSets[i] }
+  msSetOfText(unionMemberSetOf(unionNameOfIdent(name, fnIx)))
 }
 
 // MEMBERSHIP of `null` in a member set, structurally.
