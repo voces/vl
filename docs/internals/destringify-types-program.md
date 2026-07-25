@@ -313,6 +313,55 @@ member name, so the atom-level dual of THAT renderer is a separate piece of desi
 lesson: a different renderer asks a different question); its rendered `hasLitArr` stays the
 verdict.
 
+### D-CLASSIFY — the name-CLASSIFIER layer (batch 1 SHIPPED)
+
+The diffuse leg: ~9% of a self-compile's self-time sits in functions that PARSE a rendered
+type name character by character (`splitUnionAtoms`, `nameIsRefArray`, `refArrElemName`,
+`nameIsI32Array`, `nameIsMap`, `annArrowAt`, …). No single hotspot — the cost is the
+*drivers* that call them, and the hottest family is the `letIs*` BINDING classifiers, which
+re-parse a `let`'s annotation rendering on every ladder rung, per binding, per query.
+
+**The seam already existed.** `vtKindOfType` (the value/composite-position ladder) has
+consulted `repOfNode` FIRST since the repOf strangler landed: where the checker's arena
+covers an annotation's shape, the descriptor decides the rep and the name ladder is skipped.
+That leg is now `annRepKindOf(tyNodeIx) : VKind | null` — `null` = "the arena does not decide
+this shape; keep your name ladder" — and the binding classifiers consult the SAME one, so
+"what rep does this annotation have" has a single structural answer.
+
+**Batch 1 — seven binding classifiers migrated**: `letIsArray` (`"list"`), `letIsRefArray`
+(`"reflist"`), `letIsStringArray` (`"strlist"` / `"reflist"`-rejects), `letIsF32Array`,
+`letIsI64Array`, `letIsF64Array`, `letIsMap` (`"map"`). Each keeps its ladder SHAPE exactly:
+the arena replaces the name PREDICATES in place (accepts and authoritative rejects alike) and
+the fall-through to the initializer path is untouched, so a covered annotation never changes
+which arm answers — only how that arm computes. Three name tests fall out for free:
+`nameIsStringArray`'s `(string|null)[]` fold and `nameIsI32Array`'s `boolean[]`/litunion
+folds are the arena's list arms, and `nameIsMap`'s `nameIsMapMemberUnion` exclusion is just
+"a map-member union is a `TyUnion`, not a `TyMap`". `isUName` stays a name lookup — a
+declared union NAME is nominal identity, not a structural re-derivation.
+
+Method (the D1/D2 discipline): an **additive probe** computing both answers at all seven
+sites with a sticky `emitFail` marker on disagreement — **0** over the corpus (1,234 cases),
+**0** over **50,400** fuzz programs (seeds 1–14 × depths 4–6 × {plain, `--declared`} × 300),
+0 on the compiler's own source. **Sabotage-verified per site**, gated on the annotation
+actually being arena-covered so "the site fired" means the MIGRATED leg ran: 247–572 corpus
+programs per site (`letIsArray` 247 · `letIsRefArray` 477 · `letIsStringArray` 478 ·
+`letIsF32Array` 468 · `letIsI64Array` 467 · `letIsF64Array` 474 · `letIsMap` 572) — unlike
+D-UNION's batches, no site had a coverage gap to pin. Corpus **byte-identical** and
+run-identical; fuzz A/B identical findings.
+
+**Measured** (8 guest profiles per side, self-compile): classifier self-time **7.4% → 4.6%**;
+the `letIs*` drivers **2.12% → 0.04%** combined. Wall-clock self-compile on identical source,
+9 interleaved runs: min **1.276s → 1.234s**.
+
+**What remains in this layer.** The residual classifier time is now driven by
+`parenUnionArrElemName` (1.3%) and `valueAtomKind` (0.8%) — the union-element-list and
+union-atom families, i.e. the D-UNION arc, not the binding ladder. The composite name tests
+(`nameIsI32ListArray` / `nameIsMapArray` / `nameIsLitUnionArray`) are now called almost
+exclusively from those, and `tyAnnRefListKind` / `tyAnnRefListSlot` / `paramRefArray` (~0.2%
+each) are the next annotation-keyed sites — the same `annRepKindOf` seam applies to them.
+The other `letIs*` members (`letIsStruct`, `letIsUnion`, `letIsNulRefArray`, …) do not appear
+in the driver profile at all (< 0.05%) and were left alone.
+
 ### D4 — residual structural decisions made by rendering
 
 The ~10 sites that decide structure by comparing rendered text

@@ -7582,6 +7582,21 @@ export function isNulScalarListFieldCode(c: i32): boolean {
   c == 31 || c == 32 || c == 33 || c == 34
 }
 
+// The wasm rep KIND the checker's ARENA assigns to the type-ANNOTATION node `tyNodeIx`,
+// or `null` where the arena does not decide it. This is `vtKindOfType`'s `repOf`-first
+// leg on its own: when it answers, the annotation's rep is settled STRUCTURALLY and no
+// name parse can add anything; when it answers `null` the caller keeps its name ladder.
+// The binding classifiers (`letIs*`) consult it so a `let`'s rep comes off the checked
+// type rather than a character-by-character re-parse of the annotation's rendering — the
+// name-CLASSIFIER layer's hot path (`nameIsRefArray` recursing through `splitUnionAtoms` /
+// `refArrElemName` / `structIndexByName` on every ladder rung, per binding, per query).
+function annRepKindOf(tyNodeIx: i32): VKind | null {
+  if tyNodeIx < 0 { return null }
+  const rd = repOfNode(tyNodeIx)
+  if rd.rdCovered == 1 { return rd.rdKind }
+  null
+}
+
 export function vtKindOfType(tyIx: i32): VKind {
   // repOf-FIRST (the strangler seam, roadmap Next#1): where the checker's arena covers the
   // annotation's shape, the descriptor (`emit_rep.vl`) decides the kind — ONE structural
@@ -7590,9 +7605,10 @@ export function vtKindOfType(tyIx: i32): VKind {
   // tree-primary), so this delegation reads the tree wherever the flat arms claim coverage.
   // The ladder below remains the fallback for the uncovered remainder (typed-value maps,
   // union-element lists, nested arrays, nullable lists beyond `i32[] | null`, …) and shrinks
-  // as coverage widens.
-  const rd = repOfNode(tyIx)
-  if rd.rdCovered == 1 { return rd.rdKind }
+  // as coverage widens. `annRepKindOf` IS this leg — the binding classifiers consult the
+  // same one, so "what rep does this annotation have" has a single structural answer.
+  const rk = annRepKindOf(tyIx)
+  if rk != null { return rk }
   // A literal-union annotation (`type K = "a" | "b"`) is an i32-backed interned atom (`"i32"`), NOT
   // a value-union box — checked first (it IS a `TyUnion`, so `retUnionFlag` would claim it).
   if tyIx >= 0 {
@@ -14361,9 +14377,19 @@ export function letIsArray(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
-      if lt is TypeRef {
-        if nameIsI32Array(lt.tyName) { return true }
+      // ARENA-FIRST: where the checker's arena decides the annotation's rep, the i32-list
+      // question IS "is that rep the i32 list" — no name parse. `nameIsI32Array`'s folds
+      // (`boolean[]`, litunion `K[]`) are the arena's `"list"` arm; its POSITION-decided
+      // spellings (an INLINE litunion element, the `(boolean|null)[]`/`(K|null)[]` niches)
+      // are deliberately uncovered there, so they keep the name test below.
+      const k = annRepKindOf(d.letType)
+      if k != null {
+        if k == "list" { return true }
+      } else {
+        const lt = P.nodes[d.letType]
+        if lt is TypeRef {
+          if nameIsI32Array(lt.tyName) { return true }
+        }
       }
     }
     return exprArray(d.letInit, fnIx)
@@ -14705,8 +14731,19 @@ export function letIsRefArray(letIx: i32, fnIx: i32) {
         // A UNION annotation (even `S[] | i64`, a union WITH a ref-array member) is a union-BOX
         // local, NOT a reflist local — the init coerces into the box. Return false so a ref-array
         // INIT below does not mis-pick the reflist valtype (an invalid boxed-store otherwise).
+        // A declared union NAME is nominal identity, so this stays a name lookup.
         if isUName(lt.tyName) { return false }
-        if nameIsRefArray(lt.tyName) { return true }
+        // ARENA-FIRST: the arena's `"reflist"` arm is exactly `nameIsRefArray`'s settled base
+        // cases (an array over a struct / variant / inline shape / closure element); the
+        // spellings it declines — nested arrays, niche-nullable elements, union-box elements,
+        // map elements — are the ones `repOfArray` leaves uncovered, so they keep the name
+        // walk below rather than the recursive `refArrElemName` re-parse.
+        const k = annRepKindOf(d.letType)
+        if k != null {
+          if k == "reflist" { return true }
+        } else if nameIsRefArray(lt.tyName) {
+          return true
+        }
       }
     }
     return exprRefArray(d.letInit, fnIx)
@@ -15053,16 +15090,28 @@ export function letIsStringArray(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
-      if lt is TypeRef {
-        if nameIsStringArray(lt.tyName) { return true }
-        // A REF-array annotation (a union-element list) is authoritative — see `letIsF64Array`.
-        if nameIsRefArray(lt.tyName) { return false }
-        // A `(K | null)[]` annotation is the i32 atom-niche list, authoritative over a string-FIRST
-        // init literal (`["a", null]`): its member elements are atom ids, not string refs. Without
-        // this the init's `exprStringArray` claimed the string-list slot while the construct/read
-        // used the i32 rep (invalid wasm). Mirrors the `nameIsRefArray` authority above.
-        if nameIsNulLitUnionList(lt.tyName) { return false }
+      // ARENA-FIRST (see `letIsArray`): a covered annotation answers both questions the
+      // name ladder asks — `"strlist"` is its `nameIsStringArray` (both `string[]` and the
+      // `(string|null)[]` niche share the `$mkListIdx` wrapper), and `"reflist"` is its
+      // authoritative `nameIsRefArray` reject. The `(K|null)[]` reject has no covered
+      // counterpart (`repOfArray` leaves the atom-niche element uncovered), so that
+      // spelling reaches the name arm below.
+      const k = annRepKindOf(d.letType)
+      if k != null {
+        if k == "strlist" { return true }
+        if k == "reflist" { return false }
+      } else {
+        const lt = P.nodes[d.letType]
+        if lt is TypeRef {
+          if nameIsStringArray(lt.tyName) { return true }
+          // A REF-array annotation (a union-element list) is authoritative — see `letIsF64Array`.
+          if nameIsRefArray(lt.tyName) { return false }
+          // A `(K | null)[]` annotation is the i32 atom-niche list, authoritative over a string-FIRST
+          // init literal (`["a", null]`): its member elements are atom ids, not string refs. Without
+          // this the init's `exprStringArray` claimed the string-list slot while the construct/read
+          // used the i32 rep (invalid wasm). Mirrors the `nameIsRefArray` authority above.
+          if nameIsNulLitUnionList(lt.tyName) { return false }
+        }
       }
     }
     if exprStringArray(d.letInit, fnIx) { return true }
@@ -15221,11 +15270,18 @@ export function letIsF32Array(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
-      if lt is TypeRef {
-        if nameIsF32Array(lt.tyName) { return true }
-        // A REF-array annotation (`(f32 | null)[]`) is authoritative — see `letIsF64Array`.
-        if nameIsRefArray(lt.tyName) { return false }
+      // ARENA-FIRST (see `letIsArray`).
+      const k = annRepKindOf(d.letType)
+      if k != null {
+        if k == "f32list" { return true }
+        if k == "reflist" { return false }
+      } else {
+        const lt = P.nodes[d.letType]
+        if lt is TypeRef {
+          if nameIsF32Array(lt.tyName) { return true }
+          // A REF-array annotation (`(f32 | null)[]`) is authoritative — see `letIsF64Array`.
+          if nameIsRefArray(lt.tyName) { return false }
+        }
       }
     }
     return exprF32Array(d.letInit, fnIx)
@@ -15303,11 +15359,18 @@ export function letIsI64Array(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
-      if lt is TypeRef {
-        if nameIsI64Array(lt.tyName) { return true }
-        // A REF-array annotation (`(i64 | null)[]`) is authoritative — see `letIsF64Array`.
-        if nameIsRefArray(lt.tyName) { return false }
+      // ARENA-FIRST (see `letIsArray`).
+      const k = annRepKindOf(d.letType)
+      if k != null {
+        if k == "i64list" { return true }
+        if k == "reflist" { return false }
+      } else {
+        const lt = P.nodes[d.letType]
+        if lt is TypeRef {
+          if nameIsI64Array(lt.tyName) { return true }
+          // A REF-array annotation (`(i64 | null)[]`) is authoritative — see `letIsF64Array`.
+          if nameIsRefArray(lt.tyName) { return false }
+        }
       }
     }
     return exprI64Array(d.letInit, fnIx)
@@ -15394,20 +15457,30 @@ export function letIsF64Array(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
-      if lt is TypeRef {
-        if nameIsF64Array(lt.tyName) { return true }
-        // A REF-array annotation (`(f64 | null)[]` — union-BOX elements) is authoritative:
-        // the float-literal init must not claim the binding as a scalar f64 list (kind 12)
-        // when the slot is a kind-2 ref list — the literal's elements box instead.
-        if nameIsRefArray(lt.tyName) { return false }
-        // An `f32[]` annotation is authoritative too: its float-literal init reads as
-        // `exprF64Array`, so without this guard a GLOBAL `const a: f32[] = [1.5]` claims
-        // BOTH kinds — the ordered ladders (`buildLocals`, `globalCellKind`) pick f32
-        // first, but `exprF64Array`'s Ident arm consults `globalIsF64Array` directly and
-        // the double claim routed `.push` through the f64 frame against the f32 cell
-        // (invalid wasm). The annotation names the kind; the init must not override it.
-        if nameIsF32Array(lt.tyName) { return false }
+      // ARENA-FIRST (see `letIsArray`): a covered annotation's kind IS the authority the
+      // three name tests below were spelling out — `"f64list"` accepts, `"reflist"` and
+      // `"f32list"` reject, and nothing else can reach the init fallback wrongly.
+      const k = annRepKindOf(d.letType)
+      if k != null {
+        if k == "f64list" { return true }
+        if k == "reflist" { return false }
+        if k == "f32list" { return false }
+      } else {
+        const lt = P.nodes[d.letType]
+        if lt is TypeRef {
+          if nameIsF64Array(lt.tyName) { return true }
+          // A REF-array annotation (`(f64 | null)[]` — union-BOX elements) is authoritative:
+          // the float-literal init must not claim the binding as a scalar f64 list (kind 12)
+          // when the slot is a kind-2 ref list — the literal's elements box instead.
+          if nameIsRefArray(lt.tyName) { return false }
+          // An `f32[]` annotation is authoritative too: its float-literal init reads as
+          // `exprF64Array`, so without this guard a GLOBAL `const a: f32[] = [1.5]` claims
+          // BOTH kinds — the ordered ladders (`buildLocals`, `globalCellKind`) pick f32
+          // first, but `exprF64Array`'s Ident arm consults `globalIsF64Array` directly and
+          // the double claim routed `.push` through the f64 frame against the f32 cell
+          // (invalid wasm). The annotation names the kind; the init must not override it.
+          if nameIsF32Array(lt.tyName) { return false }
+        }
       }
     }
     return exprF64Array(d.letInit, fnIx)
@@ -15807,11 +15880,20 @@ export function letIsMap(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
-        // A UNION annotation whose FIRST atom is a map (`{[string]: string} | f64`) has a name that
-        // STARTS with `{[`, so `nameIsMap` matches the whole union name — but it is a union BOX local,
-        // NOT a map (the map arm boxes into the union). A bare map has ONE top-level atom; a union has
-        // 2+. Gate so the union rides its box, and the map arm's read narrows through the union.
-        if nameIsMap(lt.tyName) && !nameIsMapMemberUnion(lt.tyName) {
+        // ARENA-FIRST (see `letIsArray`): a `TyMap` is a map however it renders, and a
+        // map-member UNION is a `TyUnion` — so the arena's `"map"` arm subsumes BOTH the
+        // `nameIsMap` test and its `nameIsMapMemberUnion` exclusion, without splitting the
+        // name into top-level atoms. The typed-value maps `repOfMap` leaves uncovered
+        // (struct / nullable values, whose slot gates the emitter still owns) fall to the
+        // name pair below.
+        const k = annRepKindOf(d.letType)
+        if k != null {
+          if k == "map" { return true }
+        } else if nameIsMap(lt.tyName) && !nameIsMapMemberUnion(lt.tyName) {
+          // A UNION annotation whose FIRST atom is a map (`{[string]: string} | f64`) has a name that
+          // STARTS with `{[`, so `nameIsMap` matches the whole union name — but it is a union BOX local,
+          // NOT a map (the map arm boxes into the union). A bare map has ONE top-level atom; a union has
+          // 2+. Gate so the union rides its box, and the map arm's read narrows through the union.
           return true
         }
         // Any registered UNION annotation (a map-member union — map-FIRST `{[..]}|X`, whose
