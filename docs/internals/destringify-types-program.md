@@ -833,6 +833,122 @@ answered by the slot resolvers this slice moved. `mvCanonValName` also survives 
 stored-name canonicaliser (the `rlElemStoredName` residual's twin) even though it is no
 longer the key.
 
+### D5-final (a) — the ref-list ELEMENT-NAME readers (`rlElemName`) — SHIPPED
+
+D2 destringified the ref-list slot **key** (`repElemKey`) and left the **name** column
+standing for its readers — "the *key* is destringified; retiring the *name* column is
+D5's job, once those consumers move to the arena". This slice moves the readers that
+recover **structure** by string surgery on the stored element name. It deliberately does
+**not** try to delete the column: names as strings are fine, deriving structure from a
+rendering is not.
+
+**Every reader enumerated first** (the discipline two earlier parks in this program were
+caused by skipping). 30 call sites in four files read `rlElemName[slot]`; they split
+five ways:
+
+| family | the surgery | sites |
+|---|---|---|
+| **A** inner slot of a nested/nullable ref-array element | `rlSlotByName(refArrElemName(rlElemName[s]))` | 8 |
+| **B** struct row of a struct element | `structIdxOfElemName(rlElemName[s])` (+ one `structIndexByName` after a manual `\| null` peel) | 9 |
+| **C** is the element a nullable niche | `nullablePartOf(rlElemName[s]) != ""` | 4 |
+| **F** the closure element's `$fnsig` | strip grouping parens, `annSigKey` the rendered signature | 1 |
+| **not this slice** | the map-VALUE slot of a map element (`mapValNameOf` → `mvSlot*`, 6 sites), the concrete-VARIANT index of an element name (3), `rlSlotByName`'s own struct-twin rung, and the ~11 sites that simply **return** `rlElemName[slot]` as a name to a name consumer | — |
+
+**Sidecar.** `rlElemTyIx[]` ∥ `rlElemName` — the arena type each slot's **stored**
+spelling denotes (`fieldElemTyIxOfName`, recorded once at `rlInternName`'s push;
+pad-on-push, -1 = uncovered). The *stored* name is resolved, not the raw one:
+`rlElemStoredName` may re-spell (`boolean[]` → `i32[]`), and the stored spelling is what
+every reader sees. Emptied at the **top of `emitProgram`** as well as in `collectA`
+(method note 7): `collectU`/`collectS` run before `collectA`, and a stale `T.tys` index
+traps where a stale name is merely wrong text.
+
+**Five chokepoints, all ladder-faithful (D1 leg C — the arena replaces the predicate in
+place, the fall-through is untouched):** `rlElemInnerSlot` (A: peel `TyNullable`, take
+`TyArray.aElem`, `rlSlotOfTy` — the layer's own `repElemKey` lookup), `rlElemStructRow`
+and `rlElemLitStructRow` (B: peel the niche, `structIndexOfTy`), `rlElemIsNulNiche`
+(C: `T.tys[..] is TyNullable`), `rlElemCloSigKey` (F: `sigKeyOfTy` off the `TyFunc`
+spine, D3's key). **16 of the 22 candidate call sites migrated.**
+
+**Which axis each family is on, decided before the swap.**
+- **D1 (timing).** The sidecar stores an INDEX and every read re-derives from `T.tys[ix]`
+  at query time, so an in-place arena mutation (`holeMemberTy`) moves both legs together
+  — the property D1's refutation showed a frozen key does not have.
+- **D2 (type vs REP).** Family A's answer is a ref-list SLOT, which is a rep question —
+  so it goes through `rlSlotOfTy`/`repElemKey`, the key the layer is already interned on,
+  never `repCanonKey`. Families B/C/F are type questions (a struct ROW, a niche, a
+  functype), and they stay exact.
+- **D3′ (structure vs intern state).** Every arena leg's miss value is consumed only by
+  its own chokepoint, which turns it into "use the name path"; no caller ever sees it. In
+  particular `rlSlotByName` misses with -1 and A's arena leg *also* returns -1 on a miss —
+  but the -1 is swallowed by the chokepoint before any slot comparison, so the degenerate
+  `-1 == -1` collision that refuted `nameIsRefArray` in D-UNION batch 3 cannot arise.
+
+**Read/write pairing (#1095's lesson), and it decided the batch boundary.** The families
+each contain both halves of a pair, and both halves move together:
+`mAssignTypeIndices`'s `rlSig` + `rlElemHeap` (A-SIG9/A-HEAP9, B-SIG/B-HEAP) DECIDE which
+WasmGC heap a slot's element gets — the **write** — while `emitArr` / `refElemValueCtx` /
+the indexed-store / `.push` sites (A-LIT9, A-CTX9, B-LIT, B-ST, B-PUSH) **read** the same
+resolution to build and store elements, and `structListPopGetElem` / the nullable-index
+classifier (B-POP, C-IDX) read it back out. Sizing a heap under one resolution and filling
+it under another is exactly the defect this program exists to remove.
+
+**Method + measurements.** Foundation (sidecar, no consumer) **byte-identical** over the
+1,265-file corpus. Additive probe at all 19 candidate tags at once (compute both, KEEP the
+name answer, an **accumulating** tag set reported once at the end of `emitProgram` — never
+a first-hit abort, and coverage never on the failure channel, method note 7):
+**0 disagreements** over the corpus and over **25,200** fuzz programs (seeds 1–14 ×
+depths 4–6 × {plain, `--declared`} × 300; the probe build is itself corpus-byte-identical,
+so it really was additive). Migrated: corpus **byte-identical** and run-identical, 66-case
+battery 0 diffs, fuzz A/B identical (2,248 shape lines both sides).
+
+**Shared-instance gate** (the only channel that sees a sidecar-lifetime bug): 601
+array/struct/union/map/object/closure/type programs through **ONE** `vl run --batch`
+compiler instance per side — 645 outputs each, **0 traps, 0 diffs** vs master.
+
+**Sabotage-verified per site**, gated on the arena leg having actually answered so
+"fired" means the MIGRATED leg ran — corpus files: `B-SIG` 155 · `B-HEAP` 155 ·
+`C-IDX` 120 · `B-LIT` 110 · `F-SIG` 50 · `A-SIG9` 35 · `A-HEAP9` 35 · `B-PUSH` 31 ·
+`A-LIT9` 24 · `C-FOR` 8 · `A-NRA` 7 · `B-ST` 3 · `B-POP` 2 · `A-FOR` 2 · `A-CTX9` 2 ·
+`B-AN` 1.
+
+**Three sites are NOT migrated, on zero evidence — `rlSlotsLayoutTwin`'s kind-9 arm and
+its struct tail** (`A-TW9`, `B-TWS`, `C-TW`). A *reach* marker — one that fires on merely
+ENTERING the chokepoint, covered or not — fires on **0 of 1,265** corpus files and **0 of
+25,200** fuzz programs for all three. The function is reached (its singleton-kind arms
+answer), but the nested-list arm and the struct fall-through are not, on today's surface.
+Unverifiable ⇒ unmigrated; they keep the element-NAME path. This is the sixth consumer in
+this program to stand correctly unmigrated for want of a sabotage witness.
+
+**Gate-channel sabotage, per site.** An arena leg answering an in-range but OFF-BY-ONE
+slot/row (C inverted, F key-mangled) — broken only where that site's migrated leg answers,
+every other site left correct — reddens the corpus A/B for **15 of the 16**:
+`C-IDX` 104 byte + 16 build / 16 run · `B-HEAP` 76 byte / 75 run · `A-HEAP9` 34 / 34 ·
+`A-LIT9` 21 + 3 build / 24 · `B-PUSH` 19 build / 19 · `B-SIG` 18 byte / 13 ·
+`B-LIT` 15 + 23 build / 38 · `C-FOR` 6 + 2 build / 2 · `A-NRA` 2 + 5 build / 7 ·
+`F-SIG` 3 + 26 build / 29 · `A-SIG9` 1 + 32 build / 33 · `A-CTX9` 2 / 2 ·
+`A-FOR` 1 + 1 build / 2 · `B-ST` 1 build / 1 · `B-POP` 1 build / 1. All at once:
+**76 BYTEDIFF + 108 build-status**, **146 run-status**.
+**`B-AN` produces ZERO corpus diffs when deliberately broken** — including when its arena
+leg is broken to `-1` outright. Its one reaching program is
+`tests/cases/intrinsics/array-new-ref-elems.vl`, whose `__array_new__` struct fill the
+NATIVE emitter rejects downstream for unrelated reasons (the case is host-corpus only), so
+the element struct row it computes never reaches the output. Stated plainly: **the probe
+(1 corpus firing, 0 disagreements) is that site's only gate.**
+
+**What still reads `rlElemName` after this slice, and why.** The **map-VALUE** family
+(`mapValNameOf(rlElemName[..])` → `mvSlotOfMapValNameOrMono`/`mvSlotByValNameOr`, 6 sites
+in `rlSlotsLayoutTwin` / `compositionMapReadSlot` / `mAssignTypeIndices`) — an arena entry
+exists (`mvSlotOfTy`, D-MAPVAL) but the callers' miss values are **tri-state and
+overloaded** (`-1` means "mono map, rides the shared struct", `-3` "uninterned"), so an
+arena `-1` would be read as "mono": the D3′ sentinel collision, and untangling it is its
+own slice. The concrete-**VARIANT** index of an element name (3 sites) — the variant table
+has no arena sidecar yet, so there is no `variantIndexOfTy` to call. `rlSlotByName`'s own
+struct-twin rung — half of it (the row side) has an arena input and half (the query side,
+a raw NAME) does not, and straddling a resolver's ladder is the pair hazard above.
+`cloArrSlotRetName` and the ~11 `return rlElemName[slot]` sites — they hand a NAME to a
+name consumer; that is the D2 `rlElemStoredName` residual and it retires with its
+consumers, not here.
+
 ### D5 — delete the name columns
 
 Once nothing reads a table's name column for anything but diagnostics, demote it to a
@@ -876,6 +992,7 @@ condition names two things, so measure those:
 | struct/variant field LITUNION (atom-rep) classified by re-parsing a NAME | 4 sites | **0** (`tyIsLitUnion` / `tyIsLitUnionArray` over the D5 sidecars) |
 | `structFieldCodesEq`'s referenced ROW resolved from a recorded NAME | yes | **no** (`repStructRowByTy`; the `ea != eb` identity fast path stays, deliberately) |
 | union-BOX tag / widening chosen by comparing a member set's rendered ATOMS | 16 sites | **0** (`unMemHasAtom` → `unionHasAtomTy`; the atom scan is the fall-through). 12 raw `unionHasAtom` calls remain, none of them the box ABI — see D-UNION batch 4 |
+| ref-list ELEMENT structure re-derived by string surgery on the stored name (its inner slot / struct row / niche / `$fnsig`) | 22 sites | **16 migrated** (`rlElemTyIx` → `rlElemInnerSlot`/`rlElemStructRow`/`rlElemIsNulNiche`/`rlElemCloSigKey`); 3 `rlSlotsLayoutTwin` sites left on the name path, measured **unreachable** — see D5-final (a). The map-value / variant-index / name-producing readers are untouched |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
 
