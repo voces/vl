@@ -1195,3 +1195,32 @@ then walk back to the enclosing function and dedupe.
 
 The first three are the same underlying mistake: assuming an arena artifact answers the same
 question the string did. Check which question the site is asking, first.
+
+## Close-out measurement (master e1e2ad6, after 11 slices)
+
+Measured, not asserted. The reproducible commands are in "How to verify" and the
+"Counting caveat".
+
+| check | result |
+|---|---|
+| structural decision from a **rendered** type | **0** |
+| string surgery on a stored name column | 18 matches → **7 doc comments**, **5 ladder fall-throughs** (inside a migrated chokepoint, by design), **6 genuinely unmigrated** |
+| name-keyed `table[i] == name` scans | 13 — nominal identity (`unNames`/`uVariants`), ABI identity (`cloSigKeys`), and the exact-match fast paths ahead of the structural keys |
+
+### The 6 genuinely unmigrated, each with its measured reason
+
+- `rlSlotsLayoutTwin` ×4 — a **reach** marker fired on 0/1265 corpus files and 0/25,200 fuzz
+  programs. Unverifiable, so not migrated (#1096).
+- `refListElemNameOfExpr` — a name **producer**; it retires with its consumers, not here.
+- `compositionMapReadSlot` — the map-element map-value slot, deferred in #1096's enumeration.
+
+### What "done" means here
+
+The disease this program targeted — *deriving structure from a rendering* — is gone from
+every layer that decides structure, representation, or ABI. Names persist for rendering,
+for nominal identity, and as the fall-through of ladders whose arena leg decides first.
+That was the stated terminal condition, and it holds.
+
+**Seven consumers stand deliberately unmigrated** across the program because sabotage
+measured them unverifiable (0 firings) — no test or fuzz program could prove a change
+correct. That is the intended outcome of the method, not a shortfall.
