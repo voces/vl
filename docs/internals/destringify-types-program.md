@@ -2837,3 +2837,272 @@ though this slice adds no sidecar column.
     entombment rule exists to stop unproven behaviour CHANGES shipping; applied literally to
     a dedup it would force reverting correct work. State which kind of change is on the table
     before choosing the evidence.
+## D-ANNCOUNT — the two ANNOTATION-SPELLING member counts are banked at their producers (#1112)
+
+Two decisions in `emit_collect.vl` re-split a type name the compiler had just handed them,
+to ask the same one-bit question: *did this spelling name a UNION?*
+
+- `registerCollapsedUnionName` (#1055) — an annotation whose members are SAME-SHAPE
+  declared structs (`A | B`, `type A = {v: i32}` / `type B = {v: i32}`) resolves through
+  `nameToTy`'s union arm, where `sameVariantTy` DEDUPS the members and the union COLLAPSES
+  to a plain `TyObj`. After the collapse the arena holds a struct, so the arena register
+  walk cannot reach the union and the emitter drives the registration from the SPELLING —
+  `splitUnionAtoms(tyNameOf(node)).length >= 2`.
+- `registerInferRetNominalUnion` (#1057) — the anonymous-nominal inferred-return residual,
+  `splitUnionAtoms(inferRetTyAt(iru)).length >= 2` over a name the compiler had just BUILT.
+
+Both are now lookups. Neither has a name fall-through.
+
+### Where the bank went, and why that place and not the other candidates
+
+| # | the producer | what it banks | keyed by |
+|---|---|---|---|
+| 1055 | `canonEmitTypeNames` | `unionMemberCount(c)` of the name it just wrote to `n.tyName` | NODE (`annUnionAtoms`, `annUnionAtomsOf`) |
+| 1057 | `recordInferRet` | `unionMemberCount(ty)` of the name it is recording | ROW (`inferRetAtomCount`, `inferRetAtomCountAt`) |
+
+The brief for this slice named `resolveAnnot` (`typecheck.vl:8410`) as #1055's recording
+site, "before `sameVariantTy` dedups". **That is the wrong site, and the reason is the D1
+timing axis.** `resolveAnnot` sees the SOURCE spelling; the consumer reads
+`tyNameOf(node)`, which is the spelling `canonEmitTypeNames` REWROTE at the end of
+`checkProgram` — and that rewrite is not atom-count-preserving. Its union arm dedups
+canon'd members (`"a" | "b"` both soften to `string` and collapse to ONE atom) and expands
+union ALIASES (`AB | null` becomes `A|B|null`, THREE atoms from two). A pre-canon count and
+a post-canon count are different numbers for the same node. The producer of the string the
+consumer actually reads is `canonEmitTypeNames`, so that is where the count is banked.
+
+`nameToTy`'s union arm — the one place a union annotation is ever SPLIT, and the obvious
+"bank at the recorder" answer — is wrong for the same reason, and additionally has no node
+in hand (resolution is name-keyed; only `annotDiagAt` carries a position, and only for the
+positioned entry points).
+
+The banked value is `unionMemberCount` on the very string the consumer would have split —
+**exact, not a structural dual** (the #1110 discipline). `unionMemberCount` is
+`splitUnionAtoms`'s counting dual: same grouper depth, same quoted-atom skip, same
+top-level-`=>` stop.
+
+### The refuted arena dual, re-measured — and its unsound direction now has a witness
+
+`inferRetMemCount` shipped in D-UNION-SET as an arena-SPINE walk (`retMemCountOf`:
+`TyUnion` -> `uMembers.length`, `TyNullable` -> inner + 1). #1057's own comment recorded it
+as REFUTED on 4 corpus files. A probe carrying BOTH columns side by side reproduces that
+and extends it:
+
+| tag | what | corpus (1,272) | fuzz (50,400) |
+|---|---|---|---|
+| `SPR` | rows reaching the recorder->consumer pair | 444 | 8,948 |
+| `SPDIS` | spine count != joined-atom count | **17** | **879** |
+| `SPDIS2` | the same, past the `isUName` gate (the #1057 comment's number) | **4** | 46 |
+| `SPHIGH` | spine >= 2 while the NAME has ONE atom | **13** | **833** |
+| `SPLOW` | joined >= 2 while the spine is smaller | 0 | 0 |
+
+The 4 `SPDIS2` files are exactly the `K0 | null` shape the comment predicted
+(`closure-array-nullable-litunion-result`, `chained-closure-nullable-litunion-result`,
+`nullable-map-closure-nullable-litunion-result`, `closure-nullable-litunion-result-arm`).
+The 13 `SPHIGH` files are the direction the comment called unsound but had no witness for —
+a recorded name of ONE atom whose arena spine counts >= 2, i.e. the walk voting to register
+a union this compiler does not register. All 13 are absorbed by the `isUName` gate today
+(`SPHIGH2` = 0), so the refuted column would have been byte-identical on the current
+surface; the population exists anyway, and `retMemCountOf` is deleted rather than left as a
+loaded gun.
+
+### The totality argument (why the name legs are DELETED, not laddered)
+
+- **#1057**: `row` indexes the very table `nm` was read from. `recordInferRet` pushes name
+  and count in lock-step, so a recorded name always has a recorded count. -1 is
+  unreachable.
+- **#1055**: `canonEmitTypeNames` walks the WHOLE node arena and runs unconditionally at
+  the end of every `checkProgram` (no early return precedes it; `compileSrc` refuses to
+  emit when the checker raised a diagnostic). `registerCollapsedUnionName` runs inside
+  `collectU`, the FIRST emit pass, and no pass between the two creates AST nodes — the
+  three annotation SYNTHESES (`synthRetAnnots`, `synthParamAnnots`, `monomorphize`) all sit
+  after it in the pass table. So no node handed to the consumer postdates the bank.
+  Measured, not only argued: **0 uncovered reaches over 1,272 corpus files and 50,400 fuzz
+  programs**. And the -1 arm is not a silent wrong answer if it were ever reached — it is
+  the same answer the deleted `splitUnionAtoms(tyNameOf(node))` gave at a non-`TypeRef`
+  node (`""` splits to one atom), and its failure mode is the LOUD reject the sabotage
+  below produces, never invalid wasm.
+
+### Probe
+
+Additive, both answers computed, the OLD one kept, tags accumulated and reported ONCE at
+the end of `collectU` (both sites live inside that pass, so the report needs no file this
+slice does not own). Over **1,273 corpus files** and **50,400 fuzz programs** (seeds 1-14 x
+depths 4,5,6 x {plain, `--declared`} x 300):
+
+| tag | corpus | fuzz |
+|---|---|---|
+| `C55R` — reached with a `TyObj` | 237 | 10,306 |
+| `C55POS` — the name says >= 2 atoms | 3 | 0 |
+| `C55DIS` / `C55UNCOV` / `C55MISS` / `C55EXTRA` | **0** | **0** |
+| `C57R` — reached | 445 | 8,948 |
+| `C57R2` — past `isUName` | 392 | 7,259 |
+| `C57POS` — the name says >= 2 atoms | 30 | 357 |
+| `C57DIS` / `C57DIS2` / `C57UNCOV` / `C57MISS` / `C57EXTRA` | **0** | **0** |
+
+**Comparator sanity, per channel, at full volume** (method note 12 — two separately built
+perturbations, because one perturbation cannot light all four channels):
+
+| perturbation | channels lit, corpus | channels lit, fuzz |
+|---|---|---|
+| bank + 1 | `C55DIS` 236, `C55EXTRA` 234, `C57DIS` 444, `C57DIS2` 391, `C57EXTRA` 365 | `C55DIS` 10,306, `C55EXTRA` 10,306, `C57DIS` 8,948, `C57DIS2` 7,259, `C57EXTRA` 6,939 |
+| bank - 99 | `C55UNCOV` 236, `C55MISS` 2, `C57UNCOV` 444, `C57MISS` 30 | `C55UNCOV` 10,306, `C57UNCOV` 8,948, `C57MISS` 357 |
+
+Every zero above is a measurement on a wire that has been shown to carry a planted signal
+at exactly the site's full reach count.
+
+### Gate-channel sabotage — and a note-4 asymmetry
+
+| sabotage | corpus (1,273 files), vs the migrated compiler | fuzz (50,400) |
+|---|---|---|
+| `annUnionAtomsOf(node) >= 99` (never register) | **2 build-status + 2 message + 2 run** | 0 |
+| `inferRetAtomCountAt(row) >= 99` (never register) | **6 files: 4 build-status, 6 message, 5 run** | 0 |
+| both `>= 1` (always register) | **0** | **0** |
+
+The over-registration direction is invisible — the note-4 case again: a spurious
+`registerInlineUnion` is absorbed by the `isUName` self-gate and changes no output. These
+sites are carried by the UNDER-registration direction, and the fuzz surface carries neither
+(its generator never produces the same-shape-collapse or anonymous-nominal-residual shapes
+in a consequential position, though it reaches them 10,306 and 8,948 times). The fuzz
+comparator itself has power: the same harness reports 202,544 differing paths against a
+build that fails every compile.
+
+### The pin
+
+`tests/cases/types/struct-union-same-shape-field-slot.vl` — the same-shape collapse at the
+struct-FIELD annotation slot (`type W = { s: A | B }`) plus a same-shape union RETURN.
+`types/struct-union-same-shape.vl` and `soundness/union-same-shape-discriminant-sound.vl`
+already covered the PARAM slot (they are the two `C55POS` files at master); the field slot
+had no pin, and it is the slot whose failure mode is loudest: with the decision suppressed
+the field has no union rep and the program is a hard reject ("only i32 / boolean / string /
+array struct fields are supported"). It is the third `C55POS` file.
+
+**Honest note on entombment** (independently reached as method note 21 by the concurrent
+D-ABIDEDUP slice, which is corroboration rather than coincidence). A migration that is
+byte-, message- and run-identical over 1,273 corpus files and 50,400 fuzz programs cannot,
+by construction, have a test that fails on master and passes here — that identity is the goal, and a behavioural difference would
+be a bug report rather than a pin. What a byte-identical slice can have, and what this one
+has, is: a pin that REDDENS when the migrated leg is broken (all three `C55POS` files under
+the `>= 99` sabotage, six more for #1057), and a probe whose every zero sits on a
+sabotage-verified wire.
+
+### Sidecar lifetime — and a shape that makes the reset load-bearing
+
+`annUnionAtoms` is a new arena-lifetime column, so method note 7 applies. The first draft
+pre-pushed `-1` per node and then wrote `annUnionAtoms[i]`; with BOTH resets removed that
+build was byte-identical on the corpus **and green on `SELFHOST_NATIVE_ALIGN=1 deno task
+test` (1,961 passed)** — because the index write overwrites the stale prefix, so a missing
+reset leaks memory without ever returning a wrong answer. Rewriting the loop to PUSH the
+value (index == node index by construction) makes the reset carry correctness: the
+guardless build of the shipped shape is still byte-, message- and run-IDENTICAL over the
+1,273-file corpus (fresh instance per program) and **fails 2 cases** of the shared-instance
+suite — `soundness/union-same-shape-discriminant-sound.vl` among them. That is note 16 in
+miniature, and a new lesson beside it: *prefer the sidecar shape whose reset is
+load-bearing*, so the lifetime gate has something to catch.
+
+### The call arithmetic — reported as two numbers, because they are two numbers
+
+Local-aware scan (by resolver called, comments and the parsers' own headers excluded) of
+the SCORECARD CORRECTION's parser list, over the two files this slice owns:
+
+| file | master (bba4b4c) | now | what moved |
+|---|---|---|---|
+| `emit_collect.vl` | **87** | **85** | `splitUnionAtoms` 7 -> 5 |
+| `typecheck.vl` | **20** | **22** | `unionMemberCount` 1 -> 3 |
+| combined | 107 | 107 | — |
+
+**2 parses DELETED with no fall-through** (both class (ii) real consumers, in the emitter's
+decision layer) and **2 parses ADDED** at class (iii) producers in the checker. The
+program's currency is *which layer parses*, not the raw call count, and this slice moves two
+decisions out of the emitter at the cost of two scans on the intern side — the same trade
+#1110 made. Quoting only "-2" would be dishonest; so would quoting only "+/-0".
+
+Deterministic work counts (method note 15 — two instrumented compilers, ONE fixed input:
+the pinned master `compiler/` snapshot, counters reported once at the end of `collectU`):
+
+| | per self-compile |
+|---|---|
+| `unionMemberCount` added — annotation bank | **5,379** |
+| `unionMemberCount` added — inferred-return bank | **1,941** |
+| `splitUnionAtoms` removed — `registerCollapsedUnionName` | **108** |
+| `splitUnionAtoms` removed — `registerInferRetNominalUnion` | **1,940** |
+| `retMemCountOf` arena walks removed (function deleted) | **1,941** |
+
+So the annotation bank is computed ~50x more often than it is read. The wall clock cannot
+resolve it: interleaved min-of-25 read 1,333 ms (master) / 1,356 ms (migrated) while a
+repeat of the SAME master binary read 1,239 ms — a 94 ms swing on an unchanged compiler,
+on a box a concurrent agent was loading to a 15-minute average of 41. Per D-NARROW's method
+notes 14/15 the count is the measurement and the clock is not.
+
+### What did NOT move, and why
+
+- **`emit_collect`'s two `valueAtomKind` calls stay parser-domain — #1110's classification
+  RE-EXAMINED and CONFIRMED.** `registerInlineUnion` is the intern site itself (annotation
+  TEXT on its way into the union tables). `nulCloMixedUnionUnregistered` is a GATE on an
+  intern (`cloSigKeys.push`), and its verdict is not a structural question: its four
+  terminal tests (`isUName` / `isValueUnionName` / `nameIsLitUnionArmValueUnion` /
+  `nameIsMapMemberUnion` on the closure RESULT spelling) ask INTERN STATE, so an arena leg
+  answering only structure would disagree wherever interning declined — the D3' refutation
+  exactly. It stays.
+- **`collectFnValUse`'s `unionMemberCount(fvSb) > 1`** is node-keyed
+  (`fvSb = nullablePartOf(tyNameOf(i))`) but asks the count of the NULLABLE-PEELED name,
+  which the node bank does not hold; migrating it would be a ladder, not a deletion, and the
+  site already carries a measured DESTRINGIFY-REFUTED verdict for its alias-blindness.
+- **`registerInlineUnion`'s 30 parses and `collectA`'s 17** are the intern side, class (iii)
+  — where this program has always said the parse belongs.
+
+### Hand-offs
+
+- **`emit_classify.vl` / `emit_base.vl`** (not owned by this slice): `annUnionAtomsOf` is
+  exported and TOTAL for annotation nodes, so any consumer that currently spells
+  `unionMemberCount(tyNameOf(n))` or `splitUnionAtoms(tyNameOf(n), ...).length` for a
+  CARDINALITY test can take the bank directly. `emit_classify` has 4 `unionMemberCount` and
+  `emit_base` 3; each needs the local-aware check that its argument is the WHOLE annotation
+  spelling and not a peeled part.
+- The bank holds a COUNT, not the member list. A consumer that needs the ATOMS still splits.
+  If a second cardinality consumer appears, banking the member IDs (the `unMemAtomIds`
+  vocabulary) on the node is the next step, and `canonEmitName`'s union arm already has the
+  member list in hand (`kept`) — but note that `kept.length` is NOT the atom count when a
+  union ALIAS member expands (`AB | null` -> `A|B|null`), which is why this slice counted
+  the finished string rather than the join.
+
+### Gate
+
+Corpus **byte-, message- AND run-identical** (1,273 files: `tests/cases` + a PINNED snapshot
+of master's `compiler/` + `std/` + `scripts/`, `vl build` bytes by sha1, the compiler's full
+stdout/stderr, and `vl run` stdout for the 1,009 `@run` cases) - fuzz A/B **50,400
+programs/side**, whole `vl run --batch --out-dir` TREES compared (`diff -r`, 52,648 output
+files per side): **0** diffs - shared-MODULE `vl run --batch` **1,009 programs, 986
+outputs** per side, rc 0, 0 traps, trees and transcripts identical - shared-INSTANCE
+(`tests/cases_wasm_test.ts`, one `WebAssembly.Instance` for the whole corpus) **1,961
+passed, 0 failed** - additive probe **0 disagreements** over 1,273 corpus files and 50,400
+fuzz programs, all four disagreement channels sabotage-verified at full reach.
+
+A note on the corpus harness: the `compiler/` inputs MUST be a pinned snapshot. A first run
+compared the live tree and reported 15 byte-diffs + 1,082 message-diffs — every one of them
+a compiler module, because this slice edits `compiler/*.vl` and the sweep compiles those
+files AS INPUTS. The A/B fixes the compiler and varies the input, so the input has to be
+the one thing that does not move.
+
+`refresh-compiler.sh` (RC=0) / `rep-fuzz-check.sh` (exact, 0 new / 0 stale) /
+`native-fixpoint.sh` (stage3 == stage4, 1,018,677 bytes) / `lint-self.sh` (RC=0) /
+`SELFHOST_NATIVE_ALIGN=1 deno task test` (1,961 passed, 0 failed) / `fuzz-sweep.sh`
+(gating leg clean) — all RC=0.
+
+The whole net was re-run after rebasing onto D-ABIDEDUP + D-ATOMPAIR (#1111), which lands
+in the same subsystem: corpus **1,274 files** byte-, message- and run-identical (both sides
+built from the same seed, inputs re-pinned at 7b065ec), fuzz A/B 50,400 programs/side with
+**0** tree diffs over 52,648 output files each, shared-module `--batch` 1,010 programs /
+987 outputs 0 traps 0 diffs, shared-instance suite **1,962 passed, 0 failed**, and every
+standing script RC=0 again (`native-fixpoint` stage3 == stage4 at 1,018,324 bytes). The
+call-arithmetic and work counts above are measured against bba4b4c.
+
+### Method note earned
+
+22. **A bank taken at the RESOLVER can be the wrong bank when a later pass REWRITES the
+    string** (D-ANNCOUNT) — the obvious "record it where the members are still in hand"
+    site for #1055 was `nameToTy`'s union arm, and it is wrong: `canonEmitTypeNames` runs
+    AFTER resolution and rewrites every annotation, deduping canon'd members and expanding
+    union aliases, so a pre-rewrite count and the count of the string the consumer reads
+    are different numbers. Method note 2 (index vs name, intern time vs query time) has a
+    twin on the NAME side: when the string itself is rewritten between producer and
+    consumer, bank at the LAST producer, not the first.

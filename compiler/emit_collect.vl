@@ -18,11 +18,13 @@ import {
   TyObj,
   TyPrim,
   TyUnion,
+  annUnionAtomsOf,
   cUserTypes,
   canonEmitName,
   inferLetCount,
   inferLetNameOf,
   inferLetTyAt,
+  inferRetAtomCountAt,
   inferRetCount,
   inferRetNameByNode,
   inferRetNameOf,
@@ -4385,11 +4387,17 @@ function registerCollapsedUnionName(stmts: i32[], node: i32) {
   // A genuine union / nullable / litunion is reached by the arena walk directly; only a
   // spelling that RESOLVED to a plain struct (the same-shape collapse) needs the name.
   if t is TyObj {
-    const nm = tyNameOf(node)
-    const atoms: string[] = []
-    splitUnionAtoms(nm, atoms)
     // Two-plus top-level atoms ⇒ the source spelled a union that collapsed to this struct.
-    if atoms.length >= 2 { return registerInlineUnion(stmts, nm) }
+    // The count is READ, not re-derived: `canonEmitTypeNames` — the pass that PRODUCED this
+    // node's emit-time spelling — banked it on the node (`annUnionAtomsOf`, #1055). No name
+    // fall-through, and none is reachable: the bank is rebuilt over the whole node arena at
+    // the end of every `checkProgram`, and this runs inside `collectU`, the FIRST emit pass,
+    // so no node handed here postdates the bank. A -1 (a node that is not a `TypeRef`) is
+    // the same answer the deleted `splitUnionAtoms(tyNameOf(node))` gave for one — `""`
+    // splits to a single atom, i.e. not a union.
+    if annUnionAtomsOf(node) >= 2 {
+      return registerInlineUnion(stmts, tyNameOf(node))
+    }
   }
   0
 }
@@ -4414,25 +4422,27 @@ function registerCollapsedUnionName(stmts: i32[], node: i32) {
 // is `isUName` after the walk (skip). Fires exactly on the anonymous-nominal struct-union /
 // variant-box residual (the disable-then-diff probe pinned it to 6 corpus shapes). Returns 0,
 // or -1 (a `registerInlineUnion` `emitFail`).
-// The #1057 hand-off ("decide on the RECORDED member count `inferRetMemCountAt`, not on a
-// re-split of the name") was measured here and is **REFUTED**: `retMemCountOf` walks the
-// recorded arena type's union/nullable SPINE, and a litunion member's spine leaf count is
-// not the rendered name's atom count. An additive probe over the 1,270-file corpus
-// disagreed on **4** files — all of them the name `K0 | null`, where the renderer emits the
-// litunion ALIAS as ONE atom (2) and the spine walk counts its literal members (3, 4). Both
-// answers clear the `>= 2` gate there, so the corpus is byte-identical either way, but the
-// dual is unsound in the other direction: a bare inferred `K0` return renders ONE atom and
-// records >= 2, which would register a union this compiler does not register. The faithful
-// dual is a count recorded by the NAME PRODUCER (how many atoms it joined), not by a walk of
-// the type it rendered — a `typecheck.vl` change, so it is not made here.
-function registerInferRetNominalUnion(stmts: i32[], nm: string) {
+// The #1057 hand-off is TAKEN, at the RECORDER rather than at the arena. The first attempt
+// ("decide on the RECORDED member count", `retMemCountOf`) was measured here and REFUTED:
+// that column walked the recorded arena type's union/nullable SPINE, and a litunion
+// member's spine leaf count is not the rendered name's atom count. An additive probe over
+// the corpus disagreed on **4** files at this decision — all of them the name `K0 | null`,
+// where the renderer emits the litunion ALIAS as ONE atom (2) and the spine walk counts its
+// literal members (3, 4). The dual is unsound in the other direction too, and that
+// population is real: 13 corpus files and 833 of 50,400 fuzz programs record a name of ONE
+// atom whose spine walk counts >= 2 (a bare inferred litunion / closure-result alias), i.e.
+// the walk would vote to register a union this compiler does not register — they are only
+// saved by the `isUName` gate above. The faithful dual is a count recorded by the NAME
+// PRODUCER (how many atoms it JOINED), not by a walk of the type it rendered.
+// `recordInferRet` is the single funnel every inferred-return name producer lands in, so the
+// count is banked there on the very string this function would have split; `row` reads it.
+function registerInferRetNominalUnion(stmts: i32[], nm: string, row: i32) {
   if isUName(nm) { return 0 }
-  const atoms: string[] = []
-  splitUnionAtoms(nm, atoms)
   // A genuine union spelling (`Cat|Dog`, `Cat|i32`, `{w:i32}|i32|null`) the arena walk left
   // unregistered ⇒ the anonymous-nominal residual. A single-atom name (a scalar / list /
-  // bare struct return) has no top-level union to register.
-  if atoms.length >= 2 { return registerInlineUnion(stmts, nm) }
+  // bare struct return) has no top-level union to register. No name fall-through: `row`
+  // indexes the very table `nm` was read from, so the count is recorded whenever the name is.
+  if inferRetAtomCountAt(row) >= 2 { return registerInlineUnion(stmts, nm) }
   0
 }
 
@@ -4694,7 +4704,9 @@ export function collectU(stmts: i32[]) {
     // reproduce (see `registerInferRetNominalUnion`): an inferred STRUCT-union /
     // VARIANT-BOX return whose members are ANONYMOUS inferred shapes, recorded under
     // its NOMINAL composite (`Cat|Dog`, `Cat|i32`) which lives only in the name.
-    if registerInferRetNominalUnion(stmts, inferRetTyAt(iru)) < 0 { return -1 }
+    if registerInferRetNominalUnion(stmts, inferRetTyAt(iru), iru) < 0 {
+      return -1
+    }
     cloSigWalkRoots.push(inferRetTyIxAt(iru))
     iru = iru + 1
   }
