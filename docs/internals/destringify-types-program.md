@@ -4154,3 +4154,302 @@ vs master: **−18 bytes** (1,020,026 → 1,020,008).
     disagreements in 316,194 member comparisons (5,727 corpus + 310,467 fuzz) where the
     shape test disagreed twice in 50,400 programs. When a name predicate folds in intern state, the arena dual is a
     TABLE lookup keyed by the arena, not a structural classifier.
+## D-PARSETY — the parser stops throwing the type's STRUCTURE away (phase 0, #NNNN)
+
+Every sidecar this program has shipped — `sTyIx`, `annRlSlot`, `unMemTys`, `annUnionAtoms`,
+`inferRetAtomCount` — reconstructs structure the PARSER already had. `parseTypeName`
+(`compiler/parser.vl`) is a recursive-descent parser that returns a string built by
+concatenation (`inner + "," + parseTypeName()`, `name + "<" + parseTypeName()`, `name + "[]"`),
+and `nameToTy` (`typecheck.vl:4811`) is a second recursive-descent parser that takes the same
+string back apart. This slice makes the first one KEEP what it parsed. It consumes nothing.
+
+### The framing, checked — and where it does NOT hold
+
+**Verified at the mechanism, with two reproductions.** The parser's structural decisions are
+not merely discarded, they are re-decided DIFFERENTLY downstream, and both divergences are
+reachable from source today:
+
+1. **`(i32) => i32 | null`.** The parser read the arrow's return as a single ATOM and let the
+   caller's union loop close over the result — `((i32)=>i32) | null`, a nullable function, as
+   its own comment claimed. `nameToTy` takes a top-level `=>` as binding LOOSER than `|`
+   (`isTopLevelFuncTypeName` guards the union split), so the same characters denote
+   `(i32) => (i32|null)`. `const g: (i32) => i32 | null = id; const r = g(1); print(r + 1)`
+   errors with `operator '+' is not defined for i32? and i32` — the checker's grouping wins,
+   because the parser's was thrown away.
+2. **`Box<i32 | null>`.** `nameHasSep` tracks `{`/`[`/`(` depth and NOT `<`/`>`, so the
+   union split shreds a generic application: `type Box<T> = { v: T }` + `const b: Box<i32 | null>`
+   is rejected with **`unknown type 'Box<i32|null>'`**. The parser had the argument list's
+   boundaries exactly.
+
+**NOT verified as an account of the program's 607 parse calls.** A local-aware provenance scan
+of all 557 non-comment call sites of the SCORECARD parser list, classifying each argument
+within its enclosing function:
+
+| provenance of the parsed string | sites | share |
+|---|---|---|
+| the enclosing function's own `name: string` PARAMETER (provenance is the caller's) | 136 | 24.4% |
+| a local this single-function scan could not attribute | 123 | 22.1% |
+| DERIVED — a peel/slice/join, or another parser's output | 110 | 19.7% |
+| an expression this scan could not attribute | 96 | 17.2% |
+| **`TypeRef.tyName` — the PARSER's own synthetic name** | **71** | **12.7%** |
+| a stored emitter name COLUMN (`rlElemName`, `mvValName`, …) | 18 | 3.2% |
+| a RENDERER's output (`tyToEmitName` / `tyToStr` / `tyToNominalName`) | 3 | 0.5% |
+
+So "the strings originate at the parser, which is why the terminal condition cannot be reached
+by migrating consumers one at a time" is **an over-claim as stated**. 71 sites are reachable
+from a parser-side spelling; 21 provably are not; 465 need an interprocedural trace this scan
+does not do. The doc's own SCORECARD CORRECTION points the other way — five of the six
+producers it names to work backwards from (`tyToEmitName`, `sNames[]`, `rlElemName[]`,
+`mvValName[]`, `sFieldElemName[]`) are RENDERERS, not the parser. The honest statement is that
+the parser is **one** of at least two sources, it is the one no slice had touched, and the
+loop `arena → tyToEmitName → parse` is a separate arc that a parser-side tree does not reach.
+
+### What the parser now records
+
+A flat SPELLING arena in `compiler/ast.vl`, built as `parseTypeName` recurses — four parallel
+columns (`tsKind`, `tsText`, `tsKidStart`, `tsKidCount`) plus a flat `tsKids` child column, and
+15 node kinds (`TS_NAME`, `TS_APP`, `TS_ARR`, `TS_UNION`, `TS_ISECT`, `TS_NEG`, `TS_PAREN`,
+`TS_FUNC`, `TS_MAP`, `TS_OBJ`, `TS_FIELD`, `TS_LITSTR`, `TS_LITNUM`, `TS_NULL`, `TS_ERR`).
+
+**It is a SPELLING tree, not a type, and that is forced.** `Box<i32>` is recorded as an
+APPLICATION of the identifier `Box`, because resolving it needs `cUserTypes` and the live `<T>`
+bindings — a type may be declared after its use or in another module, so no `Ty` arena index
+can exist at parse time. The parser records what it SAW; interning stays the checker's.
+
+Children ride a shared STACK, not a per-node array: each producer pushes its finished node and
+`tsMk` moves the region above a caller-taken mark into `tsKids`. Depth-first parsing makes that
+region contiguous and exclusively the caller's, so a spelling node costs four column pushes and
+**no per-annotation allocation**. The error arm pushes `TS_ERR`, so every producer leaves
+exactly one root and the discipline is total on malformed input (190 of the 1,274 corpus files
+do not build).
+
+### The sidecar shape — measured, not assumed (method note 24)
+
+The first shipped shape was `declNameTok`'s: an `i32` column parallel to `P.nodes`, grown
+lazily to the last annotation's node index. Measured with the probe, that column reaches
+**2,176,954 entries over the corpus** and **225,619 on the compiler's own self-compile** —
+against **5,398 annotations** in that compile. One `i32` per AST NODE, **37.7x** the storage
+of the information it holds.
+
+Shipped instead: two PUSHED columns, `annTsNode` (the `TypeRef` node index) and `annTsRoot`
+(its spelling root) — **57,815 rows over the corpus**, exactly the annotation count.
+`annTsNode` is strictly increasing by construction (a row is pushed immediately after the
+`mkTypeRef` it describes; the node arena only appends), so `annTsOf` is a binary search, not a
+scan. Every other probe number is identical between the two shapes.
+
+### Prove the structure is right — the probe
+
+Two comparisons, both reported as a checker diagnostic at the end of `checkProgram` (method
+note 17: a probe reporting at end-of-EMIT cannot see a program that never gets there; the 75
+of 1,274 corpus files that do not report here are LEX/PARSE rejects, which never reach
+`checkProgram` at all):
+
+- **RT** — round-trip: does `tsToName(root)` reproduce the string the parser built? Swept over
+  every `TypeRef` in the arena, BEFORE `canonEmitTypeNames` rewrites the names (note 22).
+- **RES** — resolution: `tsToTy(root)` (a structural dual of `nameToTy`, arm for arm) against
+  the answer the checker actually used. Hooked at BOTH positioned funnels — `nameToTyAt` and
+  the three `nameToTy` legs plus the memo inside `resolveAnnot` — so the live `<T>` environment
+  is the same for both resolvers.
+
+**`tyToStr` is not the comparator.** It renders `Nullable(TyFunc)` and `TyFunc(-> Nullable)`
+to the same text, which is precisely the collision the arrow divergence lives in. The authority
+is a structural `tyDeepEq` over the arena; the rendered comparison rides beside it as the
+rejected candidate (method note 23).
+
+| tag | corpus (1,274 files, 1,199 checked) | fuzz (50,400) |
+|---|---|---|
+| `rows` — annotations recorded | **57,815** | **103,402** |
+| `nots` — a `TypeRef` with NO spelling | **0** | **0** |
+| `rtdis` — round-trip disagreement | **0** | **0** |
+| `rtmang` — round-trip vs a MERGE-renamed name | 2,908 | 0 |
+| `res` — resolution comparisons | **138,955** | **180,990** |
+| `resmang` — of those, on a merge-renamed name | 6,580 | 0 |
+| `bothneg` — both resolvers declined | 10 | 0 |
+| `oneneg` — exactly one declined (non-mangled) | **0** | **0** |
+| `dis` — STRUCTURAL disagreement, before the fix below | **451** (87 files) | **5,081** |
+| `disstr` — the same rows under a RENDERED comparison | **0** | **0** |
+| `dis` — as shipped | **0** | **0** |
+| `app` — generic applications interned by the probe | 32 | 0 |
+
+### The disagreements, classified — and the one the parser could prevent
+
+Every one of the 451 corpus rows and 5,081 fuzz rows was the SAME class: **the arrow/pipe
+precedence divergence**. Not a checker transformation to leave alone, and not a structural loss
+the checker inflicted — **the parser's own tree was the wrong one**. `nameToTy`'s grouping is
+the language's (and TypeScript's): the return extends as far right as it can.
+
+Shipped fix, one token: `parseTypeAtom`'s arrow arm parses its return with `parseTypeName()`
+instead of `parseTypeAtom()`. **The emitted NAME is identical either way** — the same
+characters are concatenated in the same order, `"(i32)=>" + "i32|null"` vs
+`"(i32)=>i32" + "|" + "null"` — which is why the corpus stays byte-identical and why the bug
+could sit there. It changes token consumption only where `parseTypeAtom` is called DIRECTLY:
+`parseAsType` (`x as (i32) => i32 | y`) and the `type AB = {…} & …` operand chain. Both are
+already type errors for a function-typed operand, and both are 0 across corpus and fuzz.
+
+The other two classes are accounted, not fixed:
+
+- **`rtmang` / `resmang` (2,908 / 6,580 rows, corpus only)** — the module MERGE rewrites every
+  `TypeRef.tyName` IN PLACE (`driver.vl:2380`, `t.tyName = modTypeRenamed(t.tyName)`:
+  `Point` -> `Point$m1`), so after it the spelling tree describes the PRE-merge name. This is
+  method note 22 with a second instance: the string is rewritten between producer and consumer,
+  by a pass the note did not know about. It is also a **type-string parser the SCORECARD does
+  not count** — `modTypeRenamed` is a hand-rolled identifier-segment scanner over a rendered
+  type name.
+- **`bothneg` (10)** — both resolvers decline. Vacuous agreement, counted apart from the 132,365
+  rows where both answered.
+
+### Comparator sanity, at intended volume, against deliberately WRONG builds
+
+| build | `rtdis` | `dis` | `disstr` |
+|---|---|---|---|
+| shipped | **0** | **0** | **0** |
+| RT wire forced | **54,686** (= 57,815 rows − 2,908 mangled − 221 names of length <= 2) | 0 | 0 |
+| RES wire forced | 0 | **132,249** (= the 132,365 both-answered rows − 116 renders of length <= 2) | 0 |
+| VALUE: the parser stops recording the `[]` suffix | **14,224** | **31,250** | **31,250** |
+
+The value sabotage is the load-bearing one: it perturbs the recorded STRUCTURE, not the
+comparison, and both channels light at five figures. (It is also visible to the rendered
+comparison — unlike the arrow class, which is why that class survived.)
+
+### Sidecar lifetime — and a THIRD shared-instance channel
+
+With zero consumers the reset cannot be load-bearing, and it is not: a build with all seven
+`tsReset()` calls DELETED is clean on `SELFHOST_NATIVE_ALIGN=1 deno task test` (**1,962
+passed, 0 failed**), the shared-INSTANCE gate. Stated plainly rather than dressed up.
+
+What the shape buys is that the reset becomes load-bearing the moment anything reads it. The
+guardless PROBE build — where the probe IS the consumer — is wrong from the SECOND program of a
+shared instance and then dies:
+
+```
+guarded    rows=10 nots=0 rtdis=0 | rows=15 nots=0 rtdis=0 | rows=19 nots=0 rtdis=0 …
+guardless  rows=10 nots=0 rtdis=0 | rows=11 nots=4 rtdis=1 | rows=13 nots=6 rtdis=2 …
+                                          ^ stale rows in front of the current program's
+… and over the whole tests/cases tree: wasm trap: out of bounds array access
+```
+
+**`vl check <dir>` is a shared-INSTANCE channel** — one `Store`, one instance, a command loop
+over every file (`main.rs`'s `CMD_LIST_DIR`/`CMD_READ_FILE` loop) — and it costs seconds, not
+the whole suite. Method note 16 established that `vl run --batch` is NOT one; this is the cheap
+one that is.
+
+### Allocation cost, measured
+
+Over the whole 1,274-file corpus: **119,105** spelling nodes (4 column pushes each), **26,585**
+child slots, **57,815** annotation rows (2 columns). On the largest single compile (the
+compiler itself, 226,408 AST nodes): **9,996** spelling nodes, **1,436** child slots, **5,398**
+annotation rows — the spelling arena is 4.4% of the node arena, and nothing is allocated per
+annotation (the child stack is reused). The rejected node-parallel shape cost 225,619 `i32` on
+that same compile.
+
+Binary: **1,020,026 -> 1,022,333 bytes (+2,307)**.
+
+### The call arithmetic
+
+**0 parses added · 0 parses deleted · 0 consumers laddered · NET 0.** By construction: this
+slice consumes nothing. Local-aware scan by resolver called, over every file this slice touches
+plus the three the partition owns:
+
+| file | master (40455c4) | now |
+|---|---|---|
+| `compiler/ast.vl` | 0 | 0 |
+| `compiler/parser.vl` | 0 | 0 |
+| `compiler/driver.vl` | 0 | 0 |
+| `compiler/typecheck.vl` | 20 | 20 (untouched) |
+| `compiler/emit_collect.vl` | 89 | 89 (untouched) |
+| `compiler/emit_base.vl` | 63 | 63 (untouched) |
+
+(The `emit_collect` / `emit_base` numbers are 89/63 against #1115's 85/65 because this scan's
+parser list adds `refArrElemKind` / `nameIsI32ListArray` / `nameIsMapArray` /
+`nullClosureArrElem`. Before == after either way.)
+
+### Entombment (method note 21)
+
+Phase 0 consumes nothing, so it is byte-identical BY CONSTRUCTION and no test can fail on
+master and pass here. The arrow-grouping fix is byte-identical for a sharper reason — the
+string it produces is character-identical — so the corpus channel carries nothing for it
+either. What carries this slice:
+
+- the probe's exact equality at **57,815 + 103,402** round-trip rows and **138,955 + 180,990**
+  resolution comparisons, both channels perturbation-verified at full reach;
+- the sabotage table above, at five figures on both channels.
+
+**No pin ships, and the reason is that nothing observable moved.** Both reproductions behave
+exactly as they did on master — `Box<i32|null>` is still rejected with `unknown type`, and
+`(i32) => i32 | null` still means "returns `i32?`" — so a fixture for either would be a pin on
+MASTER's behaviour, not on this slice's. They are written down here as witnesses of the
+mechanism and as the P1/P3 targets, which is what they are (note 19: say when a pin would be
+inert instead of shipping one).
+
+### Gate
+
+Corpus **byte-, message- AND run-identical** (1,274 files: `tests/cases` + a pinned snapshot of
+master's `compiler/` + `std/` + `scripts/*.vl`; **1,084** emit bytes, **1,012** `@run` cases;
+compiler stdout/stderr with the out-path normalised): **0** byte-diffs, **0** message-diff
+files, **0** run-diffs. Fuzz A/B **50,400 programs/side**, whole `--out-dir` TREES (`diff -r`,
+**52,830** output files/side): **0** differing paths — 2 paths differ only in the COMPILER's own
+`<wasm function N>` indices inside an identical pre-existing trap backtrace, which shift by
+exactly the 7 functions this slice adds (#1113's harness correction, second instance). The same
+fuzz harness reports **98,370** differing paths against the probe seed.
+
+`refresh-compiler.sh` RC=0 (1,022,333 bytes) · `rep-fuzz-check.sh` RC=0 (exact; 1 baselined
+failure — 0 unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=0 (stage3 == stage4,
+1,022,333 bytes) · `lint-self.sh` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test` RC=0
+(**1,962 passed, 0 failed, 8 ignored**).
+
+### What did NOT get recorded, and why
+
+- **`is` / `as` / `UnionDecl` member spellings.** `parseIsType`, `parseAsType`,
+  `parseVariantName`, `parseVariantAtom` build a string that lands on an `IsExpr` / `CastExpr` /
+  `UnionDecl` as a `string` field — there is no annotation NODE to key a root to. Their trees
+  are built and dropped (the child stack stays balanced; the nodes stay unreferenced in the
+  arena). Each needs its own node-keyed column, which is phase 2.
+- **Emitter-SYNTHESIZED annotations** (`synthTypeRef`, `emit_classify.vl:8225`) are minted from
+  a name the emitter computed and never passed through the parser. `annTsOf` answers -1 for
+  them by construction; at CHECK time there are none (`nots = 0` on both surfaces).
+
+### The phased plan, and the first consumer named
+
+- **P1 — `modTypeRenamed` (driver.vl:2310) reads the tree.** The module merge's rename is a
+  hand-rolled identifier-segment scanner over a rendered type name; with the tree it is
+  `tsText[node] = renamed` on the `TS_NAME`/`TS_APP` nodes plus one render. It deletes a
+  type-string parser the scorecard never counted AND retires this slice's own 2,908-row
+  staleness, which every later phase would otherwise inherit. **Blocker: none measured.** It
+  needs `tsToName`, which the probe has already run over 161,217 rows.
+- **P2 — record the string-only spellings** (`is` / `as` / `UnionDecl`). Blocker: three new
+  node-keyed columns; no structural obstacle.
+- **P3 — `nameToTy` resolves from the tree** at the positioned entry points, with the string
+  route as the fall-through. The dual already exists and agrees on 132,365 corpus and 180,990
+  fuzz resolutions. **Blocker: the emitter's re-resolutions**, which call `nameToTy` on names
+  with no spelling (`synthTypeRef`, computed names) — so this is a laddered migration, not a
+  deletion, until `nodeTyIx` coverage (the C1 endgame) closes.
+- **P4 — the canon pass rewrites the tree**, and #1115's eight "this pass IS the last producer"
+  parses in `canonEmitName` / `nulLitUnionPreserve` become tree walks. Blocker: its OUTPUT is
+  the string the whole emitter reads, so the tree and the string must be rewritten in lockstep
+  (note 22 again).
+- **P5 is a DIFFERENT arc.** The renderer loop (`tyToEmitName` -> a name column -> a parse) is
+  not reachable from a parser-side tree, and the provenance table above says it is the larger
+  share. Two sources, two arcs.
+
+### Method notes earned
+
+30. **A structure the parser records can be WRONG, and only recording it can show that**
+    (D-PARSETY) — the phase-0 discipline is "dual-write, consume nothing, prove equivalence",
+    and the equivalence probe found 451 corpus rows where the parser's tree and the checker's
+    resolution are different TYPES from the same characters. The brief expected the
+    disagreements to be either a loss the parser prevents or a transformation to leave alone;
+    the actual class was neither — the parser's grouping of `=>` against `|` contradicted its
+    own comment and the language. A dual-write phase is not bookkeeping; it is the first time
+    the producer's answer is checkable at all.
+31. **A RENDERED comparison cannot see a regrouping** (D-PARSETY) — `tyToStr` prints
+    `Nullable(TyFunc(i32 -> i32))` and `TyFunc(i32 -> Nullable(i32))` as the same text
+    `(i32) -> i32?`, so the rendered comparison read **0** on all 451 corpus and 5,081 fuzz
+    disagreements the structural comparator found. Method note 8's sabotage lesson has a
+    measurement twin: when the thing under test is a type's SHAPE, the comparator must walk the
+    arena. This program's own founding rule — never decide from a rendering — applies to its
+    probes.
+32. **`vl check <dir>` is a shared-INSTANCE channel** (D-PARSETY) — one `Store`, one instance,
+    a host command loop over every file. Note 16 ruled out `vl run --batch` and left
+    `SELFHOST_NATIVE_ALIGN=1 deno task test` as the only sidecar-lifetime gate; this one costs
+    seconds, reports per program, and caught the guardless build's staleness on the SECOND
+    program and its trap on the tree.

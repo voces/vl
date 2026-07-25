@@ -43,6 +43,30 @@
 // cursor primitives stay PRIVATE to this module.
 import { mkMatch } from "./ast"
 import { BinExpr, Ident, P, Tok, mkDeclNameTok } from "./ast"
+// The type-SPELLING side arena — the structure `parseTypeName` builds while it
+// recurses, recorded instead of being thrown away with the string it returns.
+import {
+  TS_APP,
+  TS_ARR,
+  TS_ERR,
+  TS_FIELD,
+  TS_FUNC,
+  TS_ISECT,
+  TS_LITNUM,
+  TS_LITSTR,
+  TS_MAP,
+  TS_NAME,
+  TS_NEG,
+  TS_NULL,
+  TS_OBJ,
+  TS_PAREN,
+  TS_UNION,
+  setAnnTs,
+  tsMark,
+  tsMk,
+  tsPop,
+  tsWrap,
+} from "./ast"
 import {
   mkArrayLit,
   mkAsExpr,
@@ -343,7 +367,14 @@ function expectTypeGt() {
 // after a base name, an `LBRACK` must be immediately followed by `RBRACK`.
 export function parseType() {
   const p0 = peekTok().start
-  const ix = mkTypeRef(parseTypeName(), p0)
+  const nm = parseTypeName()
+  // The spelling tree the name was built from — recorded on the annotation node
+  // it becomes, so a later pass can read the STRUCTURE instead of re-deriving it
+  // from `tyName`. Popped before the node is made: `mkTypeRef` pushes no
+  // spelling, and the producer left exactly one root on the stack.
+  const root = tsPop()
+  const ix = mkTypeRef(nm, p0)
+  setAnnTs(ix, root)
   // A well-formed annotation drains every `>` a `>>`/`>>>` banked (the credits
   // are consumed by the enclosing generic closes inside the recursion above).
   // A credit left here is an EXTRA `>` — report it and drop it, or it would
@@ -360,6 +391,10 @@ export function parseType() {
 // map case embed the value type's name into its own synthetic name WITHOUT a
 // `P.nodes[...] is TypeRef` round-trip (an arena-element read `is` can't narrow here).
 export function parseTypeName() {
+  // The spelling stack mark: every member `parseTypeIsect` returns pushes its
+  // own root, so a union closes over exactly the region above this.
+  const tm = tsMark()
+  let members = 1
   let name = parseTypeIsect()
   // Inline UNION annotation `A | B | null`. In TYPE position (after a `:`), `|` is a
   // union separator (vs the bitwise-OR operator in expression position). Encoded as
@@ -371,8 +406,12 @@ export function parseTypeName() {
   while more {
     advance() // "|"
     name = name + "|" + parseTypeIsect()
+    members = members + 1
     more = peekKind() == "PIPE"
   }
+  // A one-member "union" is the member — mirroring the name, which is the
+  // member's own text with no `|` in it.
+  if members > 1 { tsMk(TS_UNION, "", tm) }
   name
 }
 
@@ -382,13 +421,17 @@ export function parseTypeName() {
 // splits on top-level `&` and folds the operands through `intersectTy` (so a
 // finite annotation like `(0 | 1 | 2) & !2` simplifies to a concrete union).
 function parseTypeIsect() {
+  const tm = tsMark()
+  let operands = 1
   let name = parseTypeAtom()
   let more = peekKind() == "AMPERSAND"
   while more {
     advance() // "&"
     name = name + "&" + parseTypeAtom()
+    operands = operands + 1
     more = peekKind() == "AMPERSAND"
   }
+  if operands > 1 { tsMk(TS_ISECT, "", tm) }
   name
 }
 
@@ -401,20 +444,27 @@ function parseTypeIsect() {
 // a string literal keeps its QUOTED lexeme (`"a"|"b"`), so the checker's
 // depth-aware name scanners skip quoted segments.
 function parseTypeAtom() {
+  // Each arm below closes ONE spelling node over the region above this mark, so
+  // the atom leaves exactly one root on the stack — including the error arm,
+  // which pushes `TS_ERR` for the `""` name it returns.
+  const tm = tsMark()
   let name = ""
   if peekKind() == "BANG" {
     // Prefix negation `!A` — binds tighter than `&` (so `A & !B` is "A but not
     // B"); recurses through the atom so `!!A` and `!(A | B)` parse.
     advance() // "!"
     name = "!" + parseTypeAtom()
+    tsMk(TS_NEG, "", tm)
   } else if peekKind() == "STRING" {
     // A string-literal type: the raw lexeme KEEPS its quotes, so the synthetic
     // name is `"a"` and the checker decodes the member with the quotes intact.
     name = advance().text
+    tsMk(TS_LITSTR, name, tm)
   } else if peekKind() == "NUMBER" {
     // A numeric-literal type (`0 | 1 | 2`, `1.5 | 2.5`): the raw lexeme is the
     // member name; the checker classifies int vs float by the `.`.
     name = advance().text
+    tsMk(TS_LITNUM, name, tm)
   } else if peekKind() == "LPAREN" {
     // Either a FUNCTION TYPE `(params) => ret` (`() => void`, `(i32, i32) => i32` —
     // disambiguated by an `=>` after the `)`) or a parenthesized GROUP `(A | B)` (kept in
@@ -439,14 +489,30 @@ function parseTypeAtom() {
     if peekKind() == "EQUAL" && peek2Kind() == "GT" {
       advance() // "="
       advance() // ">"
-      // The return type is a single ATOM (`i32`, `void`, `S`, a parenthesized `(A | B)`),
-      // so a top-level `|`/`&` stays OUTSIDE the arrow — `((i32) => i32) | null` is a
-      // nullable function, NOT a function returning `i32 | null` (parenthesize the return
-      // for that). Synthetic name `"(params)=>ret"`; the `=>` marks it a function type.
-      const retName = parseTypeAtom()
+      // The return type extends as far RIGHT as it can (`parseTypeName`, so a
+      // union/intersection chain): `(i32) => i32 | null` is a function returning
+      // `i32 | null`, NOT a nullable function — parenthesize the FUNCTION for
+      // that (`((i32) => i32) | null`). Synthetic name `"(params)=>ret"`; the
+      // `=>` marks it a function type.
+      //
+      // This grouping is `nameToTy`'s, not a choice: the checker resolves the
+      // synthetic name by taking a top-level `=>` as binding LOOSER than `|`/`&`
+      // (`isTopLevelFuncTypeName` guards the union split), so `(i32)=>i32|null`
+      // has ALWAYS denoted a function returning `i32?`. Reading the RETURN as a
+      // single atom and letting the caller's union loop close over the result
+      // built the opposite tree from the same tokens — invisible while the tree
+      // was thrown away and the string was the only survivor, and measured at
+      // 451 annotations in 87 corpus files once the parser started keeping it.
+      // The emitted NAME is identical either way (the same characters are
+      // concatenated in the same order), which is why nothing downstream moves.
+      const retName = parseTypeName()
       name = "(" + inner + ")=>" + retName
+      // Kids = the parameter list in order, then the RETURN atom LAST (it is the
+      // one child every function spelling has; a zero-param `() => T` has only it).
+      tsMk(TS_FUNC, "", tm)
     } else {
       name = "(" + inner + ")"
+      tsMk(TS_PAREN, "", tm)
     }
   } else if peekKind() == "LBRACE" {
     advance() // "{"
@@ -467,6 +533,9 @@ function parseTypeAtom() {
       const valName = parseTypeName() // the value type's name (recurses for nesting)
       expectClose("RBRACE")           // "}"
       name = "{[" + keyName + "]:" + valName + "}"
+      // The KEY is a bare identifier token, not a parsed type, so it stays text
+      // on the node; the one kid is the VALUE spelling.
+      tsMk(TS_MAP, keyName, tm)
     } else {
       // An INLINE OBJECT type `{ x: i32, y: string }` (an anonymous structural
       // annotation, e.g. a `{ x: i32 } | null` return). Encoded as the synthetic
@@ -475,6 +544,7 @@ function parseTypeAtom() {
       let first = true
       let fgoing = peekKind() != "RBRACE"
       while fgoing {
+        const fm = tsMark()
         let fname = ""
         if peekKind() == "IDENT" {
           fname = advance().text
@@ -483,6 +553,7 @@ function parseTypeAtom() {
         }
         expect("COLON")
         const ftyName = parseTypeName()
+        tsMk(TS_FIELD, fname, fm)
         if !first { name = name + "," }
         name = name + fname + ":" + ftyName
         first = false
@@ -495,12 +566,15 @@ function parseTypeAtom() {
       }
       expectClose("RBRACE")
       name = name + "}"
+      tsMk(TS_OBJ, "", tm)
     }
   } else if peekKind() == "NULL" {
     advance() // `null` is a valid union member type
     name = "null"
+    tsMk(TS_NULL, "null", tm)
   } else if peekKind() == "IDENT" {
     name = advance().text
+    const head = name // the identifier alone — the name grows a `<…>` below
     if peekKind() == "LT" {
       // A generic-alias APPLICATION `Box<i32>` / `Pair<i32, string>` — in TYPE
       // position the `<` is unambiguous (no comparison can appear here). The
@@ -522,15 +596,22 @@ function parseTypeAtom() {
       }
       expectTypeGt() // ">"
       name = name + ">"
+      tsMk(TS_APP, head, tm)
+    } else {
+      tsMk(TS_NAME, head, tm)
     }
   } else {
     expect("IDENT")
+    // The recovery leaf for the `""` name this arm returns — pushed so the atom
+    // leaves exactly one root even on a malformed annotation.
+    tsMk(TS_ERR, "", tm)
   }
   let going = peekKind() == "LBRACK"
   while going {
     advance()             // "["
     expectClose("RBRACK") // "]"
     name = name + "[]"
+    tsWrap(TS_ARR, "")
     going = peekKind() == "LBRACK"
   }
   name
@@ -941,12 +1022,19 @@ function parseUnary() {
 // The TYPE on the right of `is` / `!is`, as the synthetic NAME string the
 // checker resolves with `nameToTy`. `null` is its own one-token type; anything
 // else is a full annotation (`parseTypeName`: names, inline objects, unions, …).
+// The spelling tree is DROPPED here: the `is` type lands as a string field on
+// the `IsExpr` node, not as a `TypeRef`, so there is no annotation node to key a
+// root to. Popping keeps the child stack balanced (the tree itself stays in the
+// arena, unreferenced) — recording it needs an `IsExpr`-keyed column, which is a
+// later phase, not this one.
 function parseIsType() {
   if peekKind() == "NULL" {
     advance()
     return "null"
   }
-  parseTypeName()
+  const nm = parseTypeName()
+  tsPop()
+  nm
 }
 
 // The TARGET type of an `x as T` cast, as a synthetic NAME string. A single type
@@ -956,7 +1044,28 @@ function parseIsType() {
 // checker rejects any non-numeric-scalar atom with "`as` supports numeric
 // conversions only", so an unusual target (`x as string`, `x as i32[]`) still
 // parses here and errors cleanly at the type tier.
-function parseAsType() { parseTypeAtom() }
+// The spelling tree is DROPPED, for the same reason as `parseIsType`: the cast
+// target is a string field on the `CastExpr`, not a `TypeRef` node.
+function parseAsType() {
+  const nm = parseTypeAtom()
+  tsPop()
+  nm
+}
+
+// One `type N = A | B` variant, and one `type AB = { … } & { … }` operand. A
+// `UnionDecl` holds its members as a `string[]`, so — like `is` / `as` — there
+// is no annotation NODE to key a spelling root to and the tree is dropped.
+function parseVariantName() {
+  const nm = parseTypeIsect()
+  tsPop()
+  nm
+}
+
+function parseVariantAtom() {
+  const nm = parseTypeAtom()
+  tsPop()
+  nm
+}
 
 // Precedence climbing from `minPrec`, seeded by an already-parsed `left`. A
 // binary expression anchors at its LEFT operand's start offset (`leftPos`, the
@@ -1141,7 +1250,7 @@ function parseTypeDecl() {
   const afterEq = peekKind()
   if afterEq != "LBRACE" {
     const variants: string[] = []
-    variants.push(parseTypeIsect())
+    variants.push(parseVariantName())
     // A multiline union puts each `|` on its own line, so a NEWLINE may precede
     // the next `|` — skip newlines before testing for the pipe. `endTok` pins the
     // cursor just past the LAST variant so the trailing newline-skip below does
@@ -1153,7 +1262,7 @@ function parseTypeDecl() {
     while more {
       advance()      // "|"
       skipNewlines() // and after it, before the variant name
-      variants.push(parseTypeIsect())
+      variants.push(parseVariantName())
       endTok = P.pos
       skipNewlines()
       more = peekKind() == "PIPE"
@@ -1178,7 +1287,10 @@ function parseTypeDecl() {
     expect("COLON")
     const typ0 = peekTok().start // the field type's leading token
     const ftyName = parseTypeName()
-    fields.push(mkFieldDef(fname, mkTypeRef(ftyName, typ0), fp0))
+    const froot = tsPop()
+    const ftyIx = mkTypeRef(ftyName, typ0)
+    setAnnTs(ftyIx, froot)
+    fields.push(mkFieldDef(fname, ftyIx, fp0))
     if synth != "" { synth = synth + "," }
     synth = synth + fname + ":" + ftyName
     skipNewlines()               // a field may be followed by a NEWLINE before the `,`/`}`
@@ -1200,7 +1312,7 @@ function parseTypeDecl() {
     let igoing = peekKind() == "AMPERSAND"
     while igoing {
       advance() // "&"
-      first = first + "&" + parseTypeAtom()
+      first = first + "&" + parseVariantAtom()
       igoing = peekKind() == "AMPERSAND"
     }
     const variants: string[] = []
@@ -1213,7 +1325,7 @@ function parseTypeDecl() {
     while umore {
       advance() // "|"
       skipNewlines()
-      variants.push(parseTypeIsect())
+      variants.push(parseVariantName())
       endTok2 = P.pos
       skipNewlines()
       umore = peekKind() == "PIPE"
