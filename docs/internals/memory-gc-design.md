@@ -374,13 +374,20 @@ byte-for-byte, and all three collectors emit byte-identical modules.
    frequency; the default is currently unexamined.
 3. **Expect one `.cwasm` recompile per config change.** The sidecar is keyed on
    engine configuration, so the first run after changing the collector recompiles
-   the seed through Cranelift (~3–5 s observed) and rewrites it. Self-healing, but surprising if
+   the seed through Cranelift (~3–5 s observed) and rewrites it — including when a
+   CI cache restores a sidecar built by a different wasmtime version, which heals on
+   first use rather than costing every later invocation. Self-healing, but surprising if
    measured naively — this is why `VL_GC` deliberately does not touch the compiler
    engine.
-4. **Watch the Cranelift inliner.** wasmtime still does no GC-aware whole-module
+4. **Budget one slow `ci-native` run per wasmtime bump.** That job's cargo cache is
+   keyed on `Cargo.lock`, so a version bump misses it and rebuilds the host from
+   scratch — 2m19s observed, against ~30 s for everything else in the job. The
+   post-job step saves the new key, so it is a one-time cost per branch. Worth
+   knowing before reading a single slow run as a regression.
+5. **Watch the Cranelift inliner.** wasmtime still does no GC-aware whole-module
    optimization (`wasm-toolchain-audit.md` §1), so binaryen remains VL's only source
    of Heap2Local. A Cranelift inliner is the prerequisite for that changing.
-5. **Re-check `Collector::Copying`'s doc comment.** It still reads "under
+6. **Re-check `Collector::Copying`'s doc comment.** It still reads "under
    construction and is not yet functional" on `main` while simultaneously being what
    `Auto` selects — stale text, not a status signal. VL should track the release
    notes, not the enum docs.
