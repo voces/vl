@@ -3329,3 +3329,294 @@ stale) · `native-fixpoint.sh` (stage3 == stage4, 1,018,523 bytes) · `lint-self
     accumulated sum is the second one. The corollary that made this cheap to settle: a probe
     should carry BOTH candidate answers beside the authority, not just the one you intend to
     ship — the shipped answer's 0 and the rejected answer's 2 came out of the same sweep.
+
+## D-UHATOTAL + D-SETID + D-TWINROW — a dead fall-through DELETED, the set ids exported, and the struct-twin rung finally gets an arena input (#1114)
+
+Three pieces, in ascending order of how much they overturned.
+
+### The harness, and its power (established before any 0 was believed)
+
+Corpus = **all 1,242** `tests/cases/**/*.vl`, three channels: per-file `vl build` **byte**
+compare, full stdout+stderr **message** compare (each side's out-dir path normalised out —
+method note 12's phantom-diff trap), and `vl run --batch --out-dir` **whole-tree** `diff -r`.
+A program rejected on BOTH sides is not a byte diff (#1111's other phantom).
+
+Fuzz = **100,800 programs/side** — seeds 1-14 × depths 4,5,6 × {plain, `--branching
+--multiobs --declared`} × 600-count batches, generated ONCE by a FIXED generator compiler
+(master) so both sides see identical programs, compared as whole `--out-dir` trees.
+
+Self-test: A-vs-A is 0 on every channel; the D-UHATOTAL sabotage below is **156 byte-diffs,
+98 message-diff files, 1,315 run-tree lines**. The channels have power — except at one site,
+where they provably do not (method note 27).
+
+### D-UHATOTAL — `unionHasAtomTy`'s legacy member-NAME fall-through is DELETED
+
+#1111 measured this leg at 0 reaches over 1,242 corpus files and teed it up. The 0 is
+confirmed and extended, and — the part a 0 alone cannot supply — the **mechanism** is now on
+record.
+
+| probe | corpus | fuzz |
+|---|---|---|
+| ENTRY to `unionHasAtomTy` (is the 0 vacuous?) | **182** files | **8,420** programs |
+| the name fall-through actually reached | **0** | **0** |
+| same marker, arena leg FORCED to decline | **182** | **8,420** |
+| a registered member whose spelling does not resolve to an arena type (`unMemAtomTyIx` -1) | **0** | **0** |
+
+The forced-decline population is **identical** to the entry population, at both volumes: every
+program that asks this predicate would reach the fall-through if the arena leg declined, and
+none does. The arena leg answers at **100%** of 8,602 asking programs.
+
+**Why it is total** — `unMemHasAtom` declines for exactly three reasons, each closed:
+
+1. *A row minted without its members recorded.* Structurally impossible: a union row is
+   minted at exactly THREE sites (`registerInlineUnion`, `registerValueUnionName`,
+   `collectU`'s `UnionDecl` arm) and each pushes `unNames` / `unMemberSet`, calls
+   `recordUnMemTys`, and pushes the value box's `unVarStart` slice in ONE uninterrupted
+   statement sequence. Row identity, member arena columns and box slice are minted
+   ATOMICALLY. (`recordUnMemTys`' padding loop exists for a mint site that does not record;
+   there is none.)
+2. *A member spelling that does not resolve.* Measured 0 at the recorder, above.
+3. *A name that is not a registered row.* Every one of the 31 call sites is lowering a VALUE
+   BOX — coerce, `==`, literal `is`, the `??` and map-get residuals, a boxed list-literal
+   arm, the boxed map-value and struct-field null tests — and a box exists only because the
+   registration that minted its tag slice also recorded its members, by (1).
+
+So the fall-through is deleted rather than laddered, and with it the last `want + "[]"` join
+in the predicate. An uncovered row now says so LOUDLY (`emitFail`) instead of silently
+answering "no such arm": a false `false` here picks a box tag or an `==` arm no producer
+interned, which is a silent miscompile, and the assert makes the totality claim
+self-enforcing.
+
+`unionHasAtom` non-comment call sites in `emit_classify`: **5 → 4**.
+
+### D-SETID — the narrowed-SET ids exported, and the hand-off's stated benefit REFUTED
+
+#1109 filed `currentNarrowSetIdOf` as an export; #1110 added a second caller; #1111 confirmed
+the filing and measured it as one line. Exported (with its struct dual
+`currentStructNarrowSetIdOf`, which is what `emitMem`'s member-set dispatch actually needs —
+a third conflation in that hand-off chain), plus two id-taking accessors:
+`msMemberAtomsOfSet` and `unionResidualSoloKindOfSet`. Three consumers now take a banked
+(row, mask) id instead of resolving a rendering:
+
+| site | was | now |
+|---|---|---|
+| `emitCoalesce`, ident LHS | `unionResidualSoloKind(currentNarrowSetOf(…))` | `unionResidualSoloKindOfSet(currentNarrowSetIdOf(…))` |
+| `emitMem`, member-set dispatch | `msMemberAtomsOf(currentStructNarrowSetOf(…))` | `msMemberAtomsOfSet(currentStructNarrowSetIdOf(…))` |
+| `emitUnionUnionEq` | `msMemberAtomsOf(lname)` **and** `msMemberValKindsOf(msSetOfText(lname))` | one `lsid`, both readers |
+
+**The refutation.** Three slices filed this as deleting a text→set RESOLUTION
+(`msSetOfText` — a map probe plus, on a miss, a linear scan of every registered
+`unMemberSet` row). It does — **on the narrowed leg**. On the un-narrowed leg
+`currentNarrowSetIdOf` *is* `msSetOfText(unionNameOfIdent(…))`, i.e. literally the resolution
+the old code performed. And the narrowed leg is never taken at either consumer: a marker on
+`narrowVariantFor(recv) != ""` at both sites fires **0** times over 1,242 corpus files (the
+fuzz grammar reaches neither site at all), against site reaches of **12** (`??` ident) and
+**4** (`emitMem`). So:
+
+- **resolutions genuinely deleted on the measured population: 1** — `emitUnionUnionEq`'s
+  DUPLICATE (`msMemberAtomsOf`'s internal resolution of `lname` plus the explicit one that
+  fed `msMemberValKindsOf`; the spellings and the kinds are two columns of the same (row,
+  mask), not two questions). Reached 4 corpus files.
+- the other two are **structural**, not a saving: the path from narrowing table to ABI code
+  is now id-native, and it will stop rendering the moment a narrowed binding reaches it.
+
+Banked-id vs resolved-id agreement was measured before shipping (both the set ids and the
+resulting ABI kind / atom lists): **0** disagreements at both sites over corpus and fuzz.
+
+That the narrowed leg is unexercised also means the migration is byte-identical *by
+construction* on everything the corpus runs — and that its narrowed leg is entombed by
+nothing. Stated plainly rather than claimed.
+
+### D-TWINROW — the struct-twin rung gets an arena input, and BOTH prior diagnoses are wrong
+
+D-ANNSLOT: *"The blocker is `rlElemStructRow`, not `rlSlotOfTy`"* — the CANDIDATE half.
+#1111: *"the CANDIDATE half agrees 12/12 … the QUERY half disagrees 6/6 … the blocker is an
+arena dual of the FIELDSET scan reproducing all four of `shapeFieldTypeCompat`'s RETIRED
+refutation arms."*
+
+Measured at the site, with the RECORDED arena input (`sFieldElemTyIxAt(si, fi)` — which every
+witness has: `isObj=1` at all 6, no nullable hop needed), on the same 6-of-1,241 population:
+
+- **The QUERY half agrees 6/6** — by the fieldset dual AND by `repRowOfTyStruct`'s canonical
+  key. #1111's 6/6 disagreement does not reproduce from the recorded type.
+- **The CANDIDATE half is where it splits**, and it splits by CANDIDATE KIND. Every witness
+  has exactly two kind-1 candidates: a DECLARED alias (`T0`) and an INLINE shape.
+
+| candidate | `structIndexOfTypeName` (name) | `structIndexOfTy` (identity) | canon key | field-name-set scan |
+|---|---|---|---|---|
+| declared alias `T0` (×6) | 1,3,1,1,1,2 | **same 6/6** | **same 6/6** | wrong 6/6 |
+| inline shape (×6) | 0,1,0,0,0,1 | -1 (declines) | **wrong 6/6** | **same 6/6** |
+
+**The real mechanism: `structIndexOfTypeName` is a TWO-RUNG resolver** — `structIndexByName`
+(nominal identity) first, the lenient field-name-set scan second — and every attempt across
+three slices implemented exactly ONE rung. The arena composite that reproduces it is
+
+```
+structIndexOfTy(ty)            // identity, via the D0 sidecar sTyIx
+  ?? <field-NAME-set scan>     // leniency, over the TyObj's objFieldNames
+```
+
+which matches the name resolver at **12/12 candidates and 6/6 queries**, and the full arena
+rung built on it (`rlSlotOfTyTwin`, with the `| null` parity as a `TyNullable` test) returns
+exactly the slot the rendered rung returns at **6/6** witnesses.
+
+**And `shapeFieldTypeCompat` is not the blocker at all.** The field-code TIGHTENING is not
+reproduced here, deliberately: the field-code vocabulary has exactly two producers, both
+string-driven — `nameFieldCode(t: string)` over a rendered type and `fieldTypeCode(tyIx)`
+over an AST `TypeRef` node's `tyName` — and NO `Ty`-arena classifier, so an arena tightening
+would mean a THIRD hand-copied copy of a 34-arm table, which is the exact drift hazard
+D-ABIDEDUP had just removed. It is also unnecessary: the row this scan produces feeds
+`repStructSlotsTwin` at the only call site, a canonical-key AND field-code-LAYOUT equality
+over the two rows, so a row matched more leniently than the name scan cannot yield a slot
+unless it is a layout twin anyway. (The four RETIRED arms #1111 named are retired — that
+branch of `shapeFieldTypeCompat` returns `true` unconditionally apart from the code-15
+nested-struct key tightening.)
+
+**Shipped:** `rlSlotByNameTy(name, ty)` — rungs 1 and 2 untouched and still first (a hint
+must never preempt the exact-name or rep-key match), then the arena rung. `sFieldRefSlot`
+passes its recorded element type; the other **23** `rlSlotByName` call sites pass -1 and keep
+the rendered rung unchanged. **On the hinted path the rendered rung is DELETED**, on this
+evidence:
+
+| probe (hinted calls only) | corpus | fuzz |
+|---|---|---|
+| arena rung REACHED (answers) | **6** files | **38** programs |
+| … and the rendered rung agrees | 6/6 | 22/22 |
+| … and the rendered rung DECLINES (arena extends coverage) | 0 | 16 |
+| … and they CONTRADICT | **0** | **0** |
+| arena rung declines AND the rendered rung would have answered | **0** | **0** |
+| same marker, arena rung FORCED to decline | **6** | **22** |
+
+### A refutation of this slice's own brief: rung 3 is NOT load-bearing at `sFieldRefSlot`
+
+The brief (from #1111) says deleting `rlSlotByName`'s rung 3 costs **9** corpus byte-diffs
+and **51** run-tree lines, "so it cannot simply be removed". That is true across all 24
+callers. At `sFieldRefSlot` — the site the whole `WSFRL` story is about — it is not:
+
+- forcing the arena rung to -1 **with the rendered rung already deleted for hinted calls**
+  (so `sFieldRefSlot` gets -1 at all 6 reaches) is **byte-, message- AND run-identical** over
+  1,242 corpus files and **0 tree diffs** over 100,800 fuzz programs.
+
+So the rung is **reached 6 times and consequential 0 times** here, and D-TOTALITY's
+"`sFieldRefSlot`'s fall-through is consequential 18 times in 49,422 programs" is carried by
+rungs **1 and 2** (the exact-NAME match and `repElemKeyOfName`), not by the struct-twin rung.
+**That reassigns the target**: what gates deleting `sFieldRefSlot`'s name fall-through is the
+exact-name rung and `repElemKeyOfName`'s coverage gap against `repElemKey` — not the fieldset
+dual three slices have been chasing.
+
+### The pins, and the one that cannot exist
+
+No new test case. Per method note 21 all three pieces are behaviour-preserving refactors, so
+none can have a fails-on-master test; the entombment is byte-identity plus a sabotage with
+power:
+
+| sabotage | what it breaks | corpus |
+|---|---|---|
+| `unionHasAtomTy`'s arena answer inverted (`a == 0`) | the union-box atom test | **156** byte-diff, **98** msg files, **1,315** run-tree lines |
+| `msMemberAtomsOfSet` member order REVERSED + `unionResidualSoloKindOfSet` loses its `msSubNull` | the box-tag ABI order and the residual's identity | **32** byte-diff, **19** msg files, **356** run-tree lines |
+| `rlSlotOfTyTwin` loses its `repStructSlotsTwin` guard | which twin slot is returned | **0** |
+| `rlSlotOfTyTwin` loses its IDENTITY rung (the variant that answers 0 where the name rung answers 1, ×3) | the query/candidate row | **0** |
+| `rlSlotOfTyTwin` forced to -1, rendered rung already deleted for hinted calls | the rung's whole answer | **0** (and 0 on 100,800 fuzz programs) |
+
+The last three are one finding, and it is method note 27: **a rung whose contract is
+"return a LAYOUT TWIN of the query" cannot be entombed by an output channel**, because layout
+twins emit the same heap type. D-TWINROW is carried by its answer-equality probe and by
+nothing else, and this doc says so rather than quoting the corpus at it.
+
+A first sabotage attempt for D-SETID — swapping `lname`/`rname` at `emitUnionUnionEq` and
+swapping the value/struct set duals at the other two sites — produced **0 diffs** and was
+discarded: at all 4 `emitUnionUnionEq` reaches both operands are the same union, and the two
+duals differ only by an alias EXPANSION no reaching binding uses. Method note 8, again.
+
+### The three numbers, reported separately
+
+- **Parses DELETED, with no fall-through: 1** — `unionHasAtomTy`'s legacy member-NAME scan
+  (`unionHasAtom`, whose body is `splitUnionAtoms`) together with the `want + "[]"` join that
+  fed it. All 31 call sites of the predicate are now arena-only.
+- **Name fall-throughs DELETED on a path: 1** — `rlSlotByNameTy`'s rendered struct-twin rung
+  for a hinted caller. No `nullablePartOf`, no `structIndexOfTypeName`, no `shapeFieldParse`
+  on `sFieldRefSlot`'s path any more. The rendered rung's SOURCE stays: 23 unhinted callers
+  still need it.
+- **Consumers migrated to a ladder: 0.** Nothing gained an arena leg with a live name
+  fall-through; the two arena legs added are total on their paths and the fall-throughs went.
+- **Text→set RESOLUTIONS deleted: 1** (measured population) — `emitUnionUnionEq`'s duplicate.
+  Two further sites became id-native with a measured saving of **0**, because their consumers
+  only ever take the un-narrowed leg.
+
+### Gate
+
+Corpus **byte-, message- AND run-identical**: 1,242 files, 1,055 emitting wasm (187 rejects
+on both sides) — **0** byte-diffs, **0** message-diff files, **0** run-tree diff lines.
+Fuzz A/B **100,800 programs/side**, whole `--out-dir` trees: **0** diffs.
+
+`refresh-compiler.sh` RC=0 · `rep-fuzz-check.sh` RC=0 (exact; 1 baselined failure — 0
+unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=0 (stage3 == stage4, 1,019,498
+bytes) · `lint-self.sh` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test` RC=0 (**1,955
+passed, 0 failed**, 14 ignored) — the shared-INSTANCE lifetime gate (this slice adds no
+sidecar column, but it is the standing gate).
+
+**Re-run in full after rebasing onto D-ANNCOUNT (#1112) and D-CANONWIDTH (#1113)**, both of
+which land in `typecheck.vl` / `emit_collect.vl`: corpus **1,243 files, 1,056 emitting** —
+0 byte-diffs, 0 message-diff files, 0 run-tree diff lines; fuzz A/B **100,800
+programs/side** re-generated by the rebased master compiler — **0** tree diffs;
+`refresh-compiler.sh` / `rep-fuzz-check.sh` / `native-fixpoint.sh` (stage3 == stage4,
+1,019,727 bytes) / `lint-self.sh` all RC=0; `SELFHOST_NATIVE_ALIGN=1 deno task test`
+**1,956 passed, 0 failed**, 14 ignored.
+
+### What did NOT move, and the blocking mechanism
+
+- **`repRowOfTyFieldset` as a faithful dual of the TIGHTENED fieldset scan.** Blocked on an
+  arena→field-CODE projection: `nameFieldCode` (a rendered type) and `fieldTypeCode` (an AST
+  `TypeRef`'s `tyName`) are the only two producers of the 34-code field vocabulary, and both
+  are string-driven. The honest fix is not a third copy but ONE arena-keyed home
+  (`tyFieldCode(ty)`) that both become projections of — the D-ABIDEDUP shape applied to the
+  field-code table. Until then the shipped rung uses the UNTIGHTENED name-set scan, guarded
+  downstream by `repStructSlotsTwin`, and that is stated at the function.
+- **The 11-leg `nameIsRefArray` family** stays. Not for the reason on record: with rung 3
+  arena-fed and measured non-consequential at `sFieldRefSlot`, the remaining gate at that
+  site is rung 1 (the exact-NAME match) and rung 2's `repElemKeyOfName` coverage against
+  `repElemKey`. `nodeTyIx` coverage is the other, and is outside this partition.
+- **`emitUnionUnionEq`'s `rname` side** still resolves through `msMemberAtomsOf(rname, …)`.
+  It has no second reader, so there is no duplicate to remove.
+
+### Hand-offs
+
+- **`typecheck.vl` / `emit_collect.vl`** (concurrently owned): `nameFieldCode` and
+  `fieldTypeCode` should both become projections of a single `tyFieldCode(ty)` over the `Ty`
+  arena. That one function is what unblocks a faithful `repRowOfTyFieldset`, and it removes
+  a two-copy table at the same time.
+- **`rlSlotByNameTy`'s hint is available at more callers than one.** `variantFieldRefSlot`
+  has `uFieldElemTyIxAt`; `mvValInnerRlSlot` and the `rlElemInnerSlot` family have
+  `rlElemTyIx`. Each is a one-line hint plus the same reach/agreement/decline probe triple.
+- **`emit_state.vl`**: nothing new; `rlElemTyIx` and `sTyIx` both proved load-bearing for
+  this slice and neither needs a reset change.
+
+### Method notes earned
+
+24. **Comparator sanity must be proven against a deliberately WRONG build, not an older
+    correct one** (the owner's, this cycle) — a 1,009-of-1,009 SAME reading between master
+    and a compiler 20 PRs older is the CORRECT answer when the whole arc is
+    behaviour-preserving, and reads as a broken harness. Prove power with a sabotage.
+25. **A hand-off's stated BENEFIT can be real on a leg the corpus never takes** (D-SETID) —
+    three slices filed `currentNarrowSetIdOf` as deleting a text→set resolution. It does, on
+    the NARROWED leg; the UN-narrowed leg is literally that resolution. Measured: the
+    narrowed leg is reached 0 of 12 and 0 of 4 times at the two consumers. Measure which LEG
+    of an accessor the consumer takes before quoting the accessor's saving.
+26. **A resolver with two rungs needs BOTH, and a dual implementing one looks byte-identical
+    and is wrong** (D-TWINROW) — `structIndexOfTypeName` is nominal identity THEN a lenient
+    field-name-set scan. `structIndexOfTy` / the canon key reproduce rung 1 (6/6 on declared
+    inputs, wrong 6/6 on inline ones); the fieldset scan reproduces rung 2 (the mirror
+    image). Three attempts over two slices each built one rung and each was written up as
+    "byte-identical, answers 0 of 6" — which is what a half-resolver always looks like.
+    Before building a dual, count the resolver's rungs.
+27. **A rung whose contract is "return a LAYOUT TWIN" cannot be entombed by any output
+    channel** (D-TWINROW) — three class-leaving sabotages of the struct-twin rung (drop the
+    twin guard, drop the identity rung, force the whole rung to -1) are ALL 0-diff on 1,242
+    corpus files and 100,800 fuzz programs, because every answer the rung can give emits the
+    same heap type. Note 4's "conservative wrong answer is invisible" in its strongest form:
+    such a site is carried by answer-equality alone, and a slice quoting byte-identity as its
+    evidence there is quoting nothing.
+28. **"Reached" and "consequential" must be re-measured PER CALLER, not per function**
+    (D-TWINROW) — `rlSlotByName`'s rung 3 costs 9 corpus byte-diffs when deleted for all 24
+    callers and **0** when deleted for the one caller the whole investigation was about. A
+    function-level load-bearing verdict pointed three slices at the wrong half of a resolver.

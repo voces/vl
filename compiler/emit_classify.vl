@@ -9836,7 +9836,27 @@ export function rlInternName(name: string, kind: i32) {
 // niche-nullable element's index read stays nullable — merging it with a non-null
 // slot would change the read discipline, not just the heap type). -1 when nothing
 // matches.
-export function rlSlotByName(name: string): i32 {
+export function rlSlotByName(name: string): i32 { rlSlotByNameTy(name, -1) }
+
+// `rlSlotByName` with the caller's RECORDED arena element type as a hint for the
+// struct-twin rung (destringify D-TWINROW). Rungs 1 and 2 are untouched and still
+// run first — a hint must never preempt the exact-name or rep-key match. Rung 3 is
+// the one that had no arena input: it resolves a struct ROW from a rendered element
+// spelling on BOTH sides (`structIndexOfTypeName` → `shapeFieldParse`), and
+// `rlSlotOfTyTwin` is its arena dual.
+//
+// **A HINTED call never runs the rendered rung 3** — that leg is DELETED for it, not
+// laddered, because the arena leg is TOTAL there and was measured so: an
+// `emitFail` where the arena rung declines AND the rendered rung would have answered
+// fires **0** times over 1,242 corpus files and 100,800 fuzz programs, while the
+// same marker in a build whose arena rung is forced to decline fires on **6** corpus
+// files and **22** fuzz programs. Where both answer they never disagree (6/6 corpus,
+// 22/22 fuzz); the arena rung additionally answers 16 fuzz cases the rendered rung
+// declines, so it strictly EXTENDS coverage rather than overriding it.
+//
+// `ty` -1 = no hint (every caller but `sFieldRefSlot`), and those keep the rendered
+// rung unchanged — it is still load-bearing for them.
+export function rlSlotByNameTy(name: string, ty: i32): i32 {
   let i = 0
   while i < rlElemName.length {
     if rlElemName[i] == name { return i }
@@ -9848,6 +9868,11 @@ export function rlSlotByName(name: string): i32 {
     if rlElemKey[ci] == key { return ci }
     ci = ci + 1
   }
+  const tw = rlSlotOfTyTwin(ty)
+  if tw >= 0 { return tw }
+  // The DELETED rendered rung, for a hinted caller (see the header): no
+  // `nullablePartOf`, no `structIndexOfTypeName`, no `shapeFieldParse` on this path.
+  if ty >= 0 { return -1 }
   const qn = nullablePartOf(name)
   let qBase = name
   if qn != "" { qBase = qn }
@@ -9866,6 +9891,110 @@ export function rlSlotByName(name: string): i32 {
         if enn != "" { eBase = enn }
         const esi = structIndexOfTypeName(eBase)
         if esi >= 0 && repStructSlotsTwin(qsi, esi) == 1 { return j }
+      }
+    }
+    j = j + 1
+  }
+  -1
+}
+
+// The struct table row an ARENA type resolves to, with the SAME two-rung shape
+// `structIndexOfTypeName` has — which is the thing three earlier attempts at this
+// rung each implemented only half of (destringify D-TWINROW):
+//
+//   rung 1, IDENTITY. `structIndexByName(name)` is nominal: a row minted under this
+//   exact spelling IS the answer. Its arena reading is `structIndexOfTy` over the D0
+//   sidecar `sTyIx` — the arena index recorded AT the row's mint. Measured: at every
+//   `T0`-style declared-alias candidate of the `WSFRL` witness set, `structIndexOfTy`
+//   returns exactly the row `structIndexByName` returns.
+//   `repRowOfTyStruct`'s CANON key also reproduces this rung (same 6/6) — and that is
+//   why a canon-key resolver looks right until it meets rung 2.
+//
+//   rung 2, LENIENT FIELD-NAME SET. For an INLINE shape spelling no row was minted
+//   under, the name resolver falls to a field-NAME-set scan in row order. The canon
+//   key does NOT reproduce this — it is strictly stricter, and the leniency is the
+//   point (the nested-alias twin pattern: an outer `{f: X}` matching its inner `X`
+//   row). Measured: at every inline candidate of the witness set, `structIndexOfTy`
+//   declines and the name-set scan returns exactly the row the name resolver returns,
+//   while `repRowOfTyStruct` returns a DIFFERENT one.
+//
+// The name resolver TIGHTENS rung 2 with `shapeFieldTypeCompat`, a field-CODE test.
+// That tightening is deliberately NOT reproduced here, for a reason and with a
+// guard. The reason: the field-code vocabulary has exactly two producers, both
+// string-driven — `nameFieldCode(t: string)` over a rendered type and
+// `fieldTypeCode(tyIx)` over an AST `TypeRef` node's `tyName` — and no `Ty`-arena
+// classifier, so an arena tightening would mean a THIRD hand-copied copy of a
+// 34-arm table (the exact drift hazard D-ABIDEDUP had just removed). The guard: this
+// row feeds `repStructSlotsTwin` at the only call site, which is a canonical-key AND
+// field-code-LAYOUT equality over the two rows — so a row this scan matches more
+// leniently than the name scan cannot yield a slot unless it is a layout twin
+// anyway. The rung stays an ARENA LEG: where it declines, the rendered rung runs
+// unchanged.
+function repRowOfTyLenientRow(ty: i32, lim: i32): i32 {
+  const idr = structIndexOfTy(ty)
+  if idr >= 0 && idr < lim { return idr }
+  if ty < 0 { return -1 }
+  if ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if !(t is TyObj) { return -1 }
+  const n = t.objFieldNames.length
+  let si = 0
+  while si < lim && si < sNames.length {
+    // The half-built-row skip `structIndexOfTypeName` documents: `internInlineShape`
+    // pushes a row HEADER before its per-field rows, and this scanner can be
+    // re-entered mid-field-loop.
+    if sFieldStart[si] + sFieldCount[si] > sFieldElemName.length {
+      si = si + 1
+      continue
+    }
+    if sFieldCount[si] == n {
+      let ok = true
+      let k = 0
+      while k < n {
+        if sFieldIndex(si, t.objFieldNames[k]) < 0 { ok = false }
+        k = k + 1
+      }
+      if ok { return si }
+    }
+    si = si + 1
+  }
+  -1
+}
+
+// The ARENA dual of `rlSlotByName`'s struct-twin rung (destringify D-TWINROW): the
+// ref-list slot whose ELEMENT is a layout twin of the arena type `ty`, with both
+// sides resolved from recorded arena types (`sTyIx` via `repRowOfTyLenientRow`, and
+// each candidate slot's `rlElemTyIx`) instead of from rendered element spellings.
+// The `| null` niche PARITY the name rung enforces is a `TyNullable` test here — the
+// same single hop, structurally. -1 = no arena answer, and the rendered rung runs.
+export function rlSlotOfTyTwin(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  if ty >= T.tys.length { return -1 }
+  let qty = ty
+  let qNul = false
+  const qt = T.tys[ty]
+  if qt is TyNullable {
+    qty = qt.nInner
+    qNul = true
+  }
+  const qsi = repRowOfTyLenientRow(qty, sScanLim())
+  if qsi < 0 { return -1 }
+  let j = 0
+  while j < rlElemName.length {
+    if rlElemKindTbl[j] == 1 {
+      const ety = rlElemTyIxAt(j)
+      if ety >= 0 && ety < T.tys.length {
+        let eb = ety
+        let eNul = false
+        const et = T.tys[ety]
+        if et is TyNullable {
+          eb = et.nInner
+          eNul = true
+        }
+        if eNul == qNul {
+          const esi = repRowOfTyLenientRow(eb, sScanLim())
+          if esi >= 0 && repStructSlotsTwin(qsi, esi) == 1 { return j }
+        }
       }
     }
     j = j + 1
@@ -14647,7 +14776,8 @@ export function unionMemberTysOf(name: string, out: i32[]): boolean {
 // The union-BOX ABI's atom test, from the arena: 1 = the union `name` has a member
 // whose type is EXACTLY the keyword primitive `want`, or exactly an ARRAY over it when
 // `arr`; 0 = it has none, -1 = the row is UNCOVERED (an unregistered union, or a member
-// spelling that did not resolve) and the caller must keep its member-NAME scan. The
+// spelling that did not resolve). The -1 is now a "cannot happen" its only caller
+// diagnoses — see `unionHasAtomTy` for the three closed decline causes. The
 // structural dual of `unionHasAtom(name, atom)` for the fixed keyword atoms
 // `emitUnionCoerce`'s ladder and the `==` / literal-`is` tag selectors test
 // ("i32"/"i64"/"f64"/"f32"/"string"/"boolean"/"null" and their `[]` forms).
@@ -14694,14 +14824,43 @@ export function unMemHasAtom(name: string, want: string, arr: boolean): i32 {
   0
 }
 
-// Arena-FIRST `unionHasAtom` — the union-BOX ABI's atom test (D-UNION). The recorded
-// member types decide when the row is covered (`unMemHasAtom`), and the member-NAME
-// scan stays as the fall-through for an uncovered row: the ladder-faithful shape, where
-// the arena replaces the predicate IN PLACE and nothing downstream of it moves.
+// The union-BOX ABI's atom test (D-UNION), answered ONLY from the arena
+// (destringify D-UHATOTAL). The legacy member-NAME fall-through
+// (`unionHasAtom(name, want + "[]")`) is DELETED: it was the last place in the
+// compiler that rendered a joined list spelling, and it was measured DEAD.
 //
-// The atom is a (primitive, is-list) PAIR, not a spelling (destringify D-ATOMPAIR): the
-// arena leg never sees a joined name, and the joined spelling is built ONLY here, on the
-// legacy member-NAME fall-through, which is a name-keyed scan by construction.
+// **Why the arena leg is total here**, which is what deletion required — three
+// decline causes, each closed:
+//
+//  1. *A row minted without its members recorded* is structurally impossible.
+//     A union row is minted at exactly THREE sites (`registerInlineUnion`,
+//     `registerValueUnionName`, `collectU`'s `UnionDecl` arm); each pushes
+//     `unNames` / `unMemberSet`, calls `recordUnMemTys`, and pushes the box's
+//     `unVarStart` slice in ONE uninterrupted statement sequence. Row identity,
+//     member arena columns and value-box slice are minted ATOMICALLY.
+//  2. *A member spelling that does not resolve to an arena type* (`unMemAtomTyIx`
+//     → -1) would leave `unionMemberTysOf` uncovered. A marker at the recorder
+//     fired **0** times over 1,242 corpus files and 100,800 fuzz programs.
+//  3. *A name that is not a registered row at all.* Every caller of this predicate
+//     is lowering a VALUE BOX (coerce / `==` / literal `is` / the `??` and map-get
+//     residuals / a boxed list-literal arm / the boxed map-value and struct-field
+//     null tests), and a box exists only because the registration that minted its
+//     tag slice also recorded its members — see (1).
+//
+// Measured, not assumed: a marker inside the deleted fall-through fired **0**
+// times over 1,242 corpus files and 100,800 fuzz programs, while the SAME marker
+// in a build whose arena leg is forced to decline fired on **182** corpus files
+// and **8,420** fuzz programs — precisely the population that reaches this
+// predicate at all (an entry marker gives the identical 182 / 8,420). So the
+// arena leg answers at 100% of the sites that ask.
+//
+// An uncovered row is therefore a "cannot happen", and it says so LOUDLY rather
+// than silently answering "no such arm" — a false `false` here picks a box tag or
+// an `==` arm no producer interned, which is a silent miscompile.
+//
+// The atom is a (primitive, is-list) PAIR, not a spelling (destringify
+// D-ATOMPAIR); with the fall-through gone, NOTHING in this compiler joins a
+// primitive to `[]` for a membership test, and nothing peels one back apart.
 export function unionHasAtomTy(
   name: string,
   want: string,
@@ -14709,9 +14868,11 @@ export function unionHasAtomTy(
 ): boolean {
   const a = unMemHasAtom(name, want, arr)
   if a >= 0 { return a == 1 }
-  let sp = want
-  if arr { sp = want + "[]" }
-  unionHasAtom(name, sp)
+  emitFail(
+    "emitProgram: union box atom test on a union with no recorded members: " +
+      name,
+  )
+  false
 }
 
 // ── D-UNION SET ADT — the union member set as a STRUCTURE ────────────────────
@@ -14836,8 +14997,17 @@ export function msTextOf(s: i32): string {
 // were split from exactly that string once, at registration. False = uncovered, `out`
 // untouched, and the caller splits as before.
 export function msMemberAtomsOf(set: string, out: string[]): boolean {
-  const s = msSetOfText(set)
+  msMemberAtomsOfSet(msSetOfText(set), out)
+}
+
+// `msMemberAtomsOf` for a caller that already HOLDS the set id — the whole point of
+// banking one (destringify D-SETID). `msSetOfText` is a text→set RESOLUTION (a map
+// probe plus, on a miss, a linear scan of every registered `unMemberSet` row); a
+// consumer that got its set from the narrowing table or from an earlier resolution of
+// the same name has no reason to render it and look it up again.
+export function msMemberAtomsOfSet(s: i32, out: string[]): boolean {
   if s < 0 { return false }
+  if s >= msSetRow.length { return false }
   const u = msSetRow[s]
   const st = msRowStart(u)
   if st < 0 { return false }
@@ -14995,7 +15165,7 @@ function pushNarrowComplement(name: string, s: i32, removed: string): string {
 // name the pool declines by design, an unregistered union), and the caller keeps the
 // rendered path. The un-narrowed leg resolves exactly what `removeAtomFromSet` would
 // have resolved from the same text, so the alias-decline contract is unchanged.
-function currentNarrowSetIdOf(name: string, fnIx: i32): i32 {
+export function currentNarrowSetIdOf(name: string, fnIx: i32): i32 {
   const i = narrowSlotOf(name)
   if i >= 0 { return narrowSets[i] }
   msSetOfText(unionNameOfIdent(name, fnIx))
@@ -15003,7 +15173,7 @@ function currentNarrowSetIdOf(name: string, fnIx: i32): i32 {
 
 // The struct-union dual of `currentNarrowSetIdOf` (`currentStructNarrowSetOf`'s set):
 // an un-narrowed binding resolves through the ALIAS EXPANSION its rendered twin uses.
-function currentStructNarrowSetIdOf(name: string, fnIx: i32): i32 {
+export function currentStructNarrowSetIdOf(name: string, fnIx: i32): i32 {
   const i = narrowSlotOf(name)
   if i >= 0 { return narrowSets[i] }
   msSetOfText(unionMemberSetOf(unionNameOfIdent(name, fnIx)))

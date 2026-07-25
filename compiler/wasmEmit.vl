@@ -359,7 +359,9 @@ import {
   criFnIsAnonLambda,
   ctrlEnter,
   ctrlLeave,
+  currentNarrowSetIdOf,
   currentNarrowSetOf,
+  currentStructNarrowSetIdOf,
   currentStructNarrowSetOf,
   declaredKind,
   declaredNulString,
@@ -468,6 +470,7 @@ import {
   mfSrcLocalFor,
   monoIsRowMatch,
   msMemberAtomsOf,
+  msMemberAtomsOfSet,
   msSetOfText,
   msSubNull,
   mvListValKind,
@@ -511,6 +514,7 @@ import {
   rlElemLitStructRow,
   rlElemStructRow,
   rlSlotByName,
+  rlSlotByNameTy,
   rlSlotOfTy,
   sFieldElemNameAt,
   sFieldElemTyIxAt,
@@ -683,7 +687,11 @@ export function sFieldRefSlot(si: i32, fi: i32) {
   // element spelling), and `rlSlotByName`'s struct-twin rung, which has no arena input.
   const a = rlSlotOfTy(sFieldElemTyIxAt(si, fi))
   if a >= 0 { return a }
-  rlSlotByName(sFieldElemNameAt(si, fi))
+  // D-TWINROW: the recorded element type also feeds `rlSlotByName`'s struct-twin
+  // rung, which until now had no arena input at all — it resolved a struct ROW from
+  // a rendered element spelling on both sides. Rungs 1 and 2 of `rlSlotByName` still
+  // run first; the hint only reaches rung 3.
+  rlSlotByNameTy(sFieldElemNameAt(si, fi), sFieldElemTyIxAt(si, fi))
 }
 
 // The mv-table SLOT of struct `si`'s MAP field `fi` (codes 19 / 29) — the chokepoint
@@ -2182,7 +2190,14 @@ function listWrapHeapOfKind(k: i32) {
 // pool never interned) and the caller keeps its rendered-atom path, exactly as
 // `removeAtomFromSet` itself falls through to the string surgery there.
 function unionResidualSoloKind(set: string) {
-  const s = msSetOfText(set)
+  unionResidualSoloKindOfSet(msSetOfText(set))
+}
+
+// `unionResidualSoloKind` for a caller that already HOLDS the set id (destringify
+// D-SETID). `msSetOfText` is a text→set RESOLUTION — a map probe and, on a miss, a
+// linear scan of every registered `unMemberSet` row — so a caller whose set came out
+// of the narrowing table has no reason to render it and resolve the rendering back.
+function unionResidualSoloKindOfSet(s: i32) {
   if s < 0 { return -2 }
   msSoloValKind(msSubNull(s))
 }
@@ -3080,10 +3095,18 @@ function emitUnionUnionEq(
   // index-parallel to the atom column, so an arm's code is the one recorded for the
   // very member whose spelling was pushed; a row the kind bank does not cover marks
   // its arms -2 and the tag falls back to the per-atom derivation, arm by arm.
+  //
+  // D-SETID: `lname` is resolved to its set id ONCE and both readers take the id.
+  // The member SPELLINGS and the member KINDS are two columns of the same (row,
+  // mask), so resolving the same text twice — `msMemberAtomsOf`'s internal
+  // `msSetOfText` and the one that fed `msMemberValKindsOf` — was a duplicated
+  // whole-string resolution, not two questions. (It wants a SET id, not a row id:
+  // `msMemberValKindsOf` derives the row from the set itself.)
+  const lsid = msSetOfText(lname)
   const lAtoms: string[] = []
-  if !msMemberAtomsOf(lname, lAtoms) { splitUnionAtoms(lname, lAtoms) }
+  if !msMemberAtomsOfSet(lsid, lAtoms) { splitUnionAtoms(lname, lAtoms) }
   const lKinds: i32[] = []
-  let lKindsOk = msMemberValKindsOf(msSetOfText(lname), lKinds)
+  let lKindsOk = msMemberValKindsOf(lsid, lKinds)
   if lKinds.length != lAtoms.length { lKindsOk = false }
   const rAtoms: string[] = []
   const rOk = msMemberAtomsOf(rname, rAtoms)
@@ -3281,8 +3304,19 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
           // D-UNION set ADT — the narrowed set's members from the recorded member
           // columns (the row's recorded order IS the box-tag order this dispatch
           // walks); a narrowed subset the pool has not interned re-splits.
+          //
+          // D-SETID: the set id comes from the narrowing table's banked (row, mask)
+          // pair (`currentStructNarrowSetIdOf`, the set-ADT reading of the
+          // `currentStructNarrowSetOf` above — same un-narrowed alias EXPANSION),
+          // not from resolving the rendering this site still needs for the split
+          // fall-through.
           const shAtoms: string[] = []
-          if !msMemberAtomsOf(shSet, shAtoms) {
+          if (
+            !msMemberAtomsOfSet(
+              currentStructNarrowSetIdOf(shRecv.identName, fnIx),
+              shAtoms,
+            )
+          ) {
             splitUnionAtoms(shSet, shAtoms)
           }
           // Validate: every member a struct VARIANT carrying the field as i32.
@@ -12889,7 +12923,17 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
         // D-UNION-ATOM-KIND: the residual member's banked ABI code (see
         // `unionResidualSoloKind`); the rendered residual is re-parsed only where the
         // set pool declines — a narrowed subset spelling it never interned.
-        let cak = unionResidualSoloKind(cset)
+        //
+        // D-SETID: the set arrives as the narrowing table's BANKED (row, mask) id
+        // (`currentNarrowSetIdOf` — the set-ADT reading of the `currentNarrowSetOf`
+        // above), so the whole path from narrowing table to ABI code never renders a
+        // set and never resolves a rendering back. Its un-narrowed leg IS
+        // `msSetOfText(unionNameOfIdent(…))`, i.e. exactly what this site resolved
+        // before; its narrowed leg reads the id the complement push banked instead of
+        // re-interning the survivor spelling.
+        let cak = unionResidualSoloKindOfSet(
+          currentNarrowSetIdOf(lhs.identName, fnIx),
+        )
         if cak == -2 { cak = valueAtomKind(crest) }
         if cak >= 0 && cak != 6 {
           if cak == 2 {
