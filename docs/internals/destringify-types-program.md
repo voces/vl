@@ -4454,3 +4454,252 @@ failure — 0 unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=0 (s
     `SELFHOST_NATIVE_ALIGN=1 deno task test` as the only sidecar-lifetime gate; this one costs
     seconds, reports per program, and caught the guardless build's staleness on the SECOND
     program and its trap on the tree.
+
+## D-GENBRACKET + D-PARSETY P1 — the generic-application BRACKETS, and the merge rewrites the TREE (#1118)
+
+Two things, in that order of importance. The first is a user-visible bug #1117 surfaced and
+this slice fixes; the second is D-PARSETY's phase 1, whose first consumer #1117 named.
+
+### The bug, reproduced and diagnosed at the mechanism
+
+```vl
+type Box<T> = { v: T }
+const b: Box<i32 | null> = { v: 3 }
+print(b.v)
+```
+→ `unknown type 'Box<i32|null>'`. `Box<i32>` works. A **union argument to a generic breaks
+the annotation.**
+
+Verified cause, at the code: `nameHasSep` (`typecheck.vl`) tracks `{`/`[`/`(` depth and NOT
+`<`/`>`, so `nameHasPipe("Box<i32|null>")` is true, `splitTypeName` cuts the name into the
+garbage atoms `Box<i32` and `null>`, the first resolves to -1, and `nameToTy` returns -1
+before the generic-application arm 200 lines below ever runs. The parser had the argument
+list's boundaries exactly (`parseTypeAtom`'s `expectTypeGt`) and threw them away.
+
+**It is not one scanner.** Nine more in the two owned emit files and eight more in
+`typecheck.vl` carry the identical defect, each reachable from a different source shape —
+enumerated in the pin table below. Fixing only `nameHasSep` moved the failure from the
+checker to the emitter (`ref valtype with no interned shape`, on `Pair<(i32)=>i32,i32>`),
+which is how the emit-side siblings were found: by building the checker-only fix and
+re-running the battery, not by reading.
+
+**A second witness, worse than a rejection.** `const m: {[string]: Box<i32 | null>} = Map()`
+is accepted by master's `vl check` with **no diagnostic at all** — `nameToTy`'s map arm does
+not guard its VALUE against -1, so the hole is interned as the map's value type — and then
+`vl build` **traps the compiler**: `wasm trap: out of bounds array access` (a `T.tys[-1]`).
+With the fix it is a clean `emitProgram: unsupported map value type`. It ships no pin: the
+program still does not lower (a generic-alias struct as a map value is unsupported with or
+without a union argument — `Box<i32>` fails identically on master), so a fixture would pin an
+emit gap, not this fix.
+
+### Where `<`/`>` is a bracket — the rule, and the MEASUREMENT that refuted the first one
+
+The first shipped rule was "`<` opens, `>` closes unless it is the arrow's tail (`=>`)",
+justified from the producers: the only `<` any of these scanners can see comes from
+`parseTypeAtom`'s application arm, whose own comment records that "in TYPE position the `<` is
+unambiguous (no comparison can appear here)" — a type name never contains an expression, so
+the RELATIONAL `<`/`>` cannot reach them.
+
+That justification is sound for `<` and **wrong for `>`**. An audit probe — a counter hooked
+into all eleven repaired `typecheck.vl` scanners, re-walking each input with the proposed
+depth rule and reporting as a checker diagnostic — over the 1,274-file corpus:
+
+| build | scanner calls | inputs with `<`/`>` | `<` | bare `>` | depth NEGATIVE | depth ends != 0 |
+|---|---|---|---|---|---|---|
+| `=`-exemption only (first rule) | 3,180,609 | 890 | 657 | **927** | **263** | **263** |
+| `angOpen`-gated (shipped) | 3,180,601 | 627 | **657** | **657** | **0** | **0** |
+
+The 263 came with their strings attached (the probe banks the first offender). Two other
+string languages ride these same scanners and both spell a `>` that closes nothing:
+
+- **`tyToStr`'s diagnostic render spells the arrow `->`** — `()->f64`, `{f: () -> i64 | f64}`,
+  `(i32,i32,i32)->string`. Not a parser-built name at all.
+- **the `$fnsig` closure-signature KEY** spells its param/return split with a bare `>` —
+  `"=>ii>i"` (`emit_base.annArrowAt`, `emit_mono`).
+
+So the shipped predicate gates on an OPEN `<`:
+
+```vl
+export function tyGtIsClose(name: string, i: i32, angOpen: i32) {
+  if angOpen <= 0 { return false }        // no `<` open — this `>` closes nothing
+  if i > 0 { return name[i - 1] != '=' }  // the arrow's tail, inside a generic argument
+  true
+}
+```
+
+Each repaired loop carries its own `angOpen` counter beside its existing depth. The `=`
+exemption survives INSIDE the gate for the one case where both hold: an arrow nested in a
+generic argument, `Box<(i32)=>i32>`.
+
+**The gate is load-bearing, and the corpus cannot see it.** A build with `angOpen <= -999`
+(the refuted rule, everything else identical) is corpus byte-, message- AND run-identical to
+the shipped one on all 1,275 pre-existing files. On the FUZZ channel — 8,400 programs/side,
+shipped vs sabotage — it produces **16 differing paths and 13 non-baselined INVALID-WASM
+findings** that do not exist with the gate (`p1r {[string]: () => {[string]: (i32) => K0}} |
+string`, `p2r () => {[string]: ((i32) => K0)[] | i32}`). Note 33's "byte-identity does not
+confirm a derived value is correct" with a soundness consequence: the naive rule is a live
+miscompile that the entire corpus is blind to.
+
+### The scanners repaired, and the pin each one carries
+
+Every pin FAILS on master (5eb115d) and passes here — this is a behaviour change, so note
+21's byte-identity exemption does not apply.
+
+| pin | shape | scanners it needs |
+|---|---|---|
+| `generics/type-arg-union.vl` | `Box<i32 \| null>`, `Box<i32 \| string>`, `Box<Box<i32 \| null>>` | `nameHasSep`, `splitTypeName` |
+| `generics/type-arg-intersection.vl` | `Box<A & B>` | `nameHasSep('&')`, `splitTopAmp` |
+| `generics/type-arg-closure.vl` | `Pair<(i32) => i32, string>` + the same as a RETURN | `splitGenArgs`, `topLevelArrowIndex`, **`emit_base.gaeSplitArgs`** |
+| `generics/type-arg-inline-object-field.vl` | `{ v: Pair<i32, string> }` | `nameToTy`'s field + colon splitters |
+| `generics/type-arg-list-element.vl` | `Pair<i32 \| null, string>[]` | the union split above the `[]` peel |
+| `generics/type-arg-nullable.vl` | `Box<i32 \| null> \| null` | **`emit_base.nullablePartOf`** |
+| `modules/field-name-shadows-type/` | P1 — see below | `driver.modRwType` |
+
+Repaired but with **no pin that reaches them alone today** (coverage-only, stated per note
+19): `splitUnionAtoms` / `unionMemberCount` / `nameIsFuncTypeAtom` / `parenEnclosesWhole` /
+`canonShapeName` in `typecheck.vl`; `annArrowAt` / `annSplitParams` / `annSplitPipe` /
+`nameIsStructWithUnionField` / `nameIsStructWithLitUnionField` in `emit_base.vl`; three field
+scans in `emit_collect.vl`. They are on the same names by construction (the audit counts 657
+`<` reaching the typecheck set over the corpus), and the sabotage above shows the family is
+observable — but no single program in this slice's 18-shape battery pins one alone.
+
+### The frontier this OPENS, reported rather than hidden
+
+Programs master rejected at the annotation now reach the emitter, and three shapes land on
+pre-existing coverage gaps. Each has a NON-generic control that fails identically on master,
+so none is caused by this fix:
+
+| shape | now | control (no generic) |
+|---|---|---|
+| `{[string]: Box<i32 \| null>}` | `unsupported map value type` (was a compiler TRAP) | `{[string]: Box<i32>}` — same error on master |
+| `Box<i32 \| null> \| Tag` | `ref valtype with no interned shape` | `Box<i32> \| Tag` — same error on master |
+| `type Holder = { h: Box<i32 \| string> }` | `only i32 / boolean / string / array struct fields` | `{ h: Box<i32> }` — same error on master |
+
+One shape is NEW: the three pin shapes `{v: Pair<i32,string>}` + `Pair<i32|null,string>[]` +
+`Box<i32|null>|null` in ONE program emit-fail with `field access receiver is not a struct`,
+while their non-generic analogue compiles and runs. Any TWO of the three compose fine. That
+is a rep-composition gap, not a scanner one — which is why the pins ship split.
+
+### D-PARSETY P1 — `modRwType` reads the spelling tree
+
+#1117 named the P1 consumer: the module merge rewrites `TypeRef.tyName` IN PLACE
+(`driver.vl:2380`) through `modTypeRenamed`, a hand-rolled identifier-segment scanner over a
+rendered type name that the SCORECARD never counted, and that leaves the parser's spelling
+tree describing the PRE-merge name (#1117's 2,908 `rtmang` rows).
+
+**The tree survives the rewrite.** Modules parse into the SHARED arena with no `tsReset`
+between them (`modCompile` step 2), so `annTsNode`/`annTsRoot` cover every module and stay
+strictly increasing. Shipped:
+
+- `ast.tsToName(root)` — the tree's WRITE-BACK, arm for arm the concatenations of
+  `parseTypeName` / `parseTypeIsect` / `parseTypeAtom`.
+- `driver.modRwTsName(root)` — renames only genuine TYPE positions: a `TS_NAME`, a `TS_APP`'s
+  HEAD, a `TS_MAP`'s key. Then `t.tyName = tsToName(root)`.
+
+**P1 is not a refactor — it fixes a second user-visible bug, and the string scanner could not
+have.** `modTypeRenamed` sees "an identifier run" and cannot tell a type reference from a
+FIELD name. A module that declares `type v = i32` and also spells an annotation `{v: i32}`
+had its FIELD renamed to `v$m1`, so the annotation described a struct with a field no literal
+has:
+
+```
+cannot assign {v: i32} to 'h' of type {v: i32}
+no field 'v' on {v: i32}
+```
+
+— two types that RENDER identically, because the diagnostic demangler strips the `$m1` the
+field name grew. Note 31 again, in the user's face this time. The tree knows
+`TS_FIELD.tsText` is a field name and `TS_LITSTR`/`TS_LITNUM` are lexemes, so none of them is
+a rename candidate. Pin: `tests/cases/modules/field-name-shadows-type/`.
+
+**The fall-through is measured DEAD.** `modRwType` keeps `modTypeRenamed` for a `TypeRef` with
+no recorded spelling, so the pass is total. A sabotage build that prefixes `@@POISON@@` onto
+every fall-through result is corpus byte-, message- and run-identical to the shipped build
+(1,282 files, including the compiler's own 16-module build): **every `TypeRef` at merge time
+has a recorded spelling, 0 fall-throughs taken.** Not a totality proof — a measurement on this
+corpus.
+
+`modTypeRenamed` itself STAYS, for the four string-only spellings P2 has not recorded yet
+(`tdName`, `udName`, `udVariants`, `isVariant`).
+
+### The call arithmetic
+
+**0 parses added · 0 parses deleted · 1 consumer laddered · NET 0.** Local-aware scan by
+resolver called (the SCORECARD CORRECTION's parser list plus every type-name scanner this
+slice touches — the same list on both sides; the absolutes are NOT comparable to #1117's,
+which used a shorter list):
+
+| file | master (5eb115d) | now |
+|---|---|---|
+| `compiler/ast.vl` | 0 | 0 |
+| `compiler/parser.vl` | 0 | 0 |
+| `compiler/driver.vl` | 5 | 5 |
+| `compiler/typecheck.vl` | 85 | 85 |
+| `compiler/emit_collect.vl` | 96 | 96 |
+| `compiler/emit_base.vl` | 61 | 61 |
+| **total** | **247** | **247** |
+
+The `modTypeRenamed` site at `modRwType` is a LADDER, not a deletion — the call is still
+there, behind an arena leg whose fall-through measured 0. Counted honestly as one consumer
+migrated, zero parses removed. **21 scanners were REPAIRED**, which the scorecard has no
+column for and which was the point of the slice.
+
+### Gate
+
+Corpus **byte-, message- AND run-diff**, 1,282 files (`tests/cases` + a pinned snapshot of
+master's `compiler/` + `std/` + `scripts/*.vl`; **1,085 -> 1,092** emit bytes, **1,018**
+`@run` cases): **7 byte-diffs, 7 message-diff files, 7 run-diffs — all 7 are the new pins**,
+which master rejects and this build compiles. **0 diffs on all 1,275 pre-existing files.**
+
+The shared-INSTANCE channel (note 32) agrees and classifies the message delta: `vl check
+tests/cases` goes from `Found 217 errors` to `Found 204 errors`, the 13 removed errors are
+exactly the pins' `unknown type` / `no field` rejections, and the 3 lines added are
+`redundant type annotation` HINTS on the newly-compiling pin files. Every message change is a
+fix; none is a regression. `vl check compiler` and `vl check std` are byte-identical.
+
+Fuzz A/B **25,200 programs/side** (126 fixed seeds x 200, depths 4/5/6 cycled), whole
+`--out-dir` TREES (`diff -r`, **1,439** output files/side, the harness's mktemp path
+normalised): **0 differing paths**. The same harness reports **16** differing paths against
+the `angOpen` sabotage at 8,400 programs/side — the comparator's power, at volume, against a
+known-WRONG build.
+
+`refresh-compiler.sh` RC=0 (1,025,610 bytes) · `rep-fuzz-check.sh` RC=0 (exact; 1 baselined
+failure — 0 unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=0 (stage3 == stage4,
+1,025,610 bytes) · `lint-self.sh` RC=0 · `deno check compiler/*.ts` RC=0 · `deno lint` RC=0 ·
+`SELFHOST_NATIVE_ALIGN=1 deno task test` RC=0 (**1,969 passed, 0 failed, 8 ignored** — 1,962
++ the 7 new pins, measured in this worktree).
+
+### What did NOT move, and the hand-off
+
+**Nine `<>`-blind depth scanners remain in `emit_classify.vl`**, which a concurrent agent owns
+this cycle — untouched by construction, listed here with the exact repair (`tyGtIsClose` is
+exported and takes the caller's `angOpen`):
+
+`nameIsWholeSpanShape` (7423) · `shapeFieldParse` (7521) · `splitUnionArmsAllDepth` (10400) ·
+`funcTypeShapeLowerable` (10652) · `variantNestedShapeOk` (10736) ·
+`internNonLowerableFieldShapes` (10858) · `internShapeFieldElems` (10915) ·
+`internInlineShape` (10972) · `internShapeAs` (11154).
+
+No program in this slice's 18-shape battery reaches one of them consequentially — the three
+that still fail have non-generic controls failing identically on master. The place to look is
+the frontier table above.
+
+Also not moved: `canonShapeName`'s map-KEY scan terminates at the key's `]`, which precedes
+any `<` in the VALUE, so it cannot see one — left alone deliberately, not overlooked.
+
+### Method notes earned
+
+33. **A depth rule justified from its PRODUCER can still be wrong at its CONSUMER**
+    (D-GENBRACKET) — "`<` is only ever the generic bracket" is true of every producer, and the
+    matching claim for `>` is false, because two OTHER string languages share the same
+    scanners: `tyToStr`'s `->` render and the `$fnsig` key's `ii>i`. The producer argument
+    licensed a rule the audit then refuted at **263 corpus inputs**, and the refuted rule is a
+    live INVALID-WASM miscompile on the fuzz channel. The gate that makes it total
+    (`angOpen > 0`) is not derivable from the producer at all — only from what the consumers
+    actually receive.
+34. **A pre-existing gap and a new one look identical; the CONTROL is what separates them**
+    (D-GENBRACKET) — unblocking an annotation moves the failure downstream, and three of the
+    freshly-reachable shapes fail at emit. Each was classified only by writing the same
+    program with a non-generic type and running it on MASTER. Two of the three were
+    pre-existing; the third (three shapes composed in one program) is genuinely new and is
+    reported as such rather than folded into the fix.
