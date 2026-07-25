@@ -223,14 +223,48 @@ aborts the emit and a hotter probe fired first; `calleeIsUnionElemFieldClosure` 
 **nothing in the corpus** — a classifier with no test coverage at all, now covered by
 `tests/cases/unions/union-array-arm-elem-closure-field-map-call.vl`.
 
-**Still string-classified (the rest of the layer, honest scope).** The `unionArmPath*`
-family (`unionArmPathIsMap` / `IsMapList` / `IsClosure` / `IsCloArray` / `HasCloValue`) and
-its callers resolve an arm atom through `structIndexByName` / `variantIndexOf` and then walk
-the emitter's *field-code* tables (5/14/15/16/19/22). Destringifying those means re-deriving
-the field codes from the arena, which is a distinct piece of design, not a re-keying — a
-later batch. Likewise `unionRefArrayArmSlotForElemAtom` (atom-EQUALITY against a rendered
-element set), `unionClosureArrElemUnion` (returns an element NAME the name-keyed reflist
-layer consumes), and `emitUnionCoerce`'s alias expansion (the union-boxing ABI).
+**Batch 2 — the `unionArmPath*` family's five callers migrated.** The deferred question
+was whether the field codes the walk consults (5 ref-list, 14 closure, 15 nested-struct,
+16 union-box, 19 map, 22 nullable-closure) encode *structure* or *lowerability* — the
+latter being the phase-3-arm-4 (#935) case no structural re-keying can replace. **Measured:
+structure, for these five questions.** The codes as a whole ARE lowering decisions (code 5
+vs 4/6/25/26/27 is which WasmGC wrapper the list rides), but every leaf test the walk
+performs factors through the element/field *type*, so the answers come straight off the
+arena spine and **no arena→field-code bridge is needed**:
+
+| the walk's test | the arena's answer |
+|---|---|
+| `code != 15` mid hop | the field is a `TyObj` (or a `TyNullable` over one) — anything else has no field to follow |
+| `code == 19` leaf | the field is a `TyMap` (a nullable map is code 29, so the leaf is deliberately NOT peeled) |
+| `code == 5 && nameIsMap(elem)` | a `TyArray` over a `TyMap` |
+| `code == 5 && annArrowAt(peelGroupParens(elem)) >= 0` | a `TyArray` over a `TyFunc` (a nullable-closure element is a `TyNullable`, excluded on both sides) |
+| `code == 14 \|\| code == 22` | a `TyFunc`, bare or under one `TyNullable` |
+| `code == 16 && unionHasClosureArm(elem)` | a `TyUnion` with a `TyFunc` member |
+
+One shared walk (`tyArmPathLeaf`) plus five leaf predicates replaces the per-caller
+`structIndexByName` / `variantIndexOf` re-resolution; `unionStructArmMapListElemIndex`'s
+indexed-root hop drops `nameIsRefArray(arm)` + `refArrElemName(arm)` for `tyArmElem` (a
+`TyArray` arm's element). Migrated callers: `unionStructArmMapFieldMember`,
+`unionStructArmMapListElemIndex`, `identRebindUnionArmClosureField`,
+`calleeIsUnionArmClosureMember`, `calleeIsUnionArmCloArrayIndex`. The `unionArmPath*`
+functions stay as the uncovered-row fallback.
+
+Method: an additive probe on all five, comparing the name answer with the arena answer per
+atom, with `-uncov`/`-misalign` markers so an uncovered row cannot masquerade as agreement.
+**0 disagreements** over the corpus + **50,400** fuzz programs; corpus **byte-identical**.
+**Sabotage-verified per site** — MapArm 13, MapList 3, Clo 3, HasClo 1 corpus programs.
+`calleeIsUnionArmCloArrayIndex` fired on **nothing** in the corpus even under a per-site
+inversion: its own dedicated case (`variant-closure-array-field.vl`) no longer reaches it,
+because `exprIsClosure` resolves `t0.f[0]` first when the union local comes from a call or a
+literal. The FUZZER reached it (6 of 50,400, `--declared` and plain), and that shape is now
+pinned as `tests/cases/unions/union-box-field-arm-closure-array-index-call.vl` — the union
+must arrive as a **union-BOX FIELD read** (`const t0 = v.f`) for the conservative classifier
+to be consulted at all.
+
+**Still string-classified (the rest of the layer, honest scope).**
+`unionRefArrayArmSlotForElemAtom` (atom-EQUALITY against a rendered element set),
+`unionClosureArrElemUnion` (returns an element NAME the name-keyed reflist layer consumes),
+and `emitUnionCoerce`'s alias expansion (the union-boxing ABI).
 
 **Correct as-is, deliberately untouched:** `unionMemberCount(unionMemberSetOf(…)) > 1` (a
 count), `structUnionNullCmpName` (`unionHasAtom(set, "null")` + a non-null count — `null` is
@@ -279,7 +313,7 @@ condition names two things, so measure those:
 | struct-row canon key derived by parsing a name | yes | **no** (`sTyIx`; `sAnonCanon` deleted) |
 | ref-list element slot key derived by string surgery | yes | **no** (`repElemKey`) |
 | `$fnsig` key derived by rendering + re-parsing | yes | **no** at `cloCallSigKey` (`sigKeyOfTy`) |
-| per-atom classify-by-render of a union member set | 15 sites | **15 sites** — the open arc |
+| per-atom classify-by-render of a union member set | 15 sites | **4 sites** — batch 1 took 6, batch 2 the `unionArmPath*` five |
 
 The 12 remaining `table[i] == name` scans split three ways, and **most are not the disease**:
 
@@ -293,9 +327,11 @@ The 12 remaining `table[i] == name` scans split three ways, and **most are not t
 
 ### The open arc: union member sets
 
-`unionMemberSetOf(name)` returns a pipe-joined member string; ~15 consumers `splitUnionAtoms`
-it and classify each atom **by its rendered text** (`nameIsMap(atom)`, `refArrElemName(arm)`,
-`unionArmPathIsMap(atom, path)`). That per-atom re-derivation is the disease.
+`unionMemberSetOf(name)` returns a pipe-joined member string; consumers `splitUnionAtoms` it
+and classify each atom **by its rendered text**. That per-atom re-derivation is the disease.
+Batches 1 and 2 took eleven of the fifteen sites (the "is there an arm of shape X" family and
+the `unionArmPath*` field-path walks); what remains is the atom-EQUALITY / element-NAME /
+box-ABI residue named in D-UNION above.
 
 **Scope carefully:** an atom that is a declared variant name (`Cat`) feeding
 `variantIndexOf` is *nominal identity — lossless and correct*. Only the inline-shape /
