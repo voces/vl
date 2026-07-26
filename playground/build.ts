@@ -21,15 +21,31 @@
 //     would break that.
 //   * conditions ["browser"]: pick binaryen's browser export over its node one.
 //
-// Output: playground/dist/playground.js (one self-contained ESM module loaded by
-// index.html). Run via `deno task playground:build` (or `deno task playground`,
-// which also serves).
+// Output: playground/dist/ — a SELF-CONTAINED, deployable directory holding the
+// resolved `index.html`, the content-hashed entry points, the code-split chunks
+// and the hashed compiler seed. Run via `deno task playground:build` (or
+// `deno task playground`, which also serves).
+//
+// Cache busting (see assets.ts for the full rationale): every asset the browser
+// caches carries a content hash in its filename, and the one un-hashed file —
+// `index.html`, which points at them — is served no-cache. Shipping a change
+// therefore reaches a returning visitor without a hard reload, while a rebuild
+// that changes nothing emits byte-identical names and keeps their cache warm.
 
 import * as esbuild from "esbuild";
 import { denoPlugins } from "esbuild-deno-loader";
+import {
+  cleanDist,
+  hashedSeed,
+  renderIndexHtml,
+  SEED_FALLBACK,
+  TEMPLATE,
+  writeSeedModule,
+} from "./assets.ts";
 
 const HERE = new URL(".", import.meta.url);
 const ROOT = new URL("../", HERE);
+const DIST = new URL("dist/", HERE);
 
 // Locate binaryen's real ESM entry (`index.js`) under the materialized npm tree.
 // `import.meta.resolve` honors the deno.json import map (binaryen -> npm:...),
@@ -67,8 +83,9 @@ const nodeBuiltinsExternalPlugin: esbuild.Plugin = {
   },
 };
 
-const build = async (): Promise<void> => {
+const build = async (): Promise<{ js: string; css: string }> => {
   const result = await esbuild.build({
+    metafile: true,
     plugins: [
       binaryenPlugin,
       nodeBuiltinsExternalPlugin,
@@ -82,12 +99,19 @@ const build = async (): Promise<void> => {
     // esbuild's cwd anchors the native loader's `deno info` at the repo root, so
     // node_modules and the import map are found.
     absWorkingDir: ROOT.pathname,
-    // The object form names the entry output `playground.js` (+ `playground.css`)
-    // under `outdir`, which `splitting` requires (it can't target a single
-    // `outfile`). index.html loads `./dist/playground.js`; the split chunk(s) sit
-    // beside it and are fetched lazily by their relative URLs.
+    // The object form names the entry output `playground-<hash>.js` (+ the
+    // sibling `playground-<hash>.css`) under `outdir`, which `splitting`
+    // requires (it can't target a single `outfile`). The resolved `index.html`
+    // written below loads those exact names; the split chunk(s) sit beside them
+    // and are fetched lazily by their relative URLs.
     entryPoints: { playground: new URL("src/main.ts", HERE).pathname },
-    outdir: new URL("dist", HERE).pathname,
+    outdir: DIST.pathname,
+    // Content-hash the ENTRY points, as the chunks already were. These are the
+    // two URLs index.html hard-referenced under stable names, so they were the
+    // two a browser could serve from cache indefinitely after a ship. esbuild's
+    // entry hash covers the chunk specifiers the entry imports, so a change
+    // anywhere in the graph propagates out to this name.
+    entryNames: "[name]-[hash]",
     bundle: true,
     format: "esm",
     platform: "browser",
@@ -111,31 +135,56 @@ const build = async (): Promise<void> => {
   for (const w of result.warnings) {
     console.warn(`warn: ${w.text}`);
   }
-  console.error("built playground/dist/playground.js");
-};
-
-// Copy the self-hosted compiler seed next to the bundle so the page can fetch it
-// (`wasmCheckerBrowser.ts` resolves `vl-compiler.wasm` relative to the loaded
-// module). The seed backs the playground's LSP features (hover/completion/
-// semantic tokens/inlay/definition/format) — the same one the Node LSP and
-// `vl check` run. A missing seed isn't fatal here (the page degrades those
-// features to empty), but warn loudly: build it with `./scripts/refresh-compiler.sh`.
-const copySeed = async (): Promise<void> => {
-  const seed = new URL("build/vl-compiler.wasm", ROOT);
-  const dest = new URL("dist/vl-compiler.wasm", HERE);
-  try {
-    await Deno.copyFile(seed, dest);
-    console.error("copied build/vl-compiler.wasm → playground/dist/");
-  } catch (err) {
-    console.warn(
-      `warn: could not copy the compiler seed (${
-        err instanceof Error ? err.message : String(err)
-      }) — the playground's LSP features will be disabled. ` +
-        "Build the seed with ./scripts/refresh-compiler.sh",
-    );
+  // Read the emitted entry names out of the metafile rather than reconstructing
+  // them: esbuild owns the hash, so asking it is the only way to be sure the
+  // names in index.html are the names on disk. The JS entry is the single output
+  // whose `entryPoint` is our `main.ts`; `cssBundle` names its style sibling.
+  const outputs = Object.entries(result.metafile.outputs);
+  const entry = outputs.find(([, o]) => o.entryPoint?.endsWith("playground/src/main.ts"));
+  if (!entry) throw new Error("esbuild emitted no entry output for src/main.ts");
+  const [jsPath, jsMeta] = entry;
+  if (!jsMeta.cssBundle) {
+    throw new Error("esbuild emitted no CSS bundle for the entry (Monaco styles missing)");
   }
+  const base = (p: string): string => p.slice(p.lastIndexOf("/") + 1);
+  return { js: base(jsPath), css: base(jsMeta.cssBundle) };
 };
 
-await build();
-await copySeed();
+// Write the compiler seed into dist under its CONTENT-HASHED name, and return
+// that name for the generated module the bundle imports. The seed backs the
+// playground's LSP features (hover/completion/semantic tokens/inlay/definition/
+// format) — the same one the Node LSP and `vl check` run — and it is rebuilt on
+// every compiler merge, which made its old stable name the most frequently
+// stale URL on the deployed site. A missing seed isn't fatal (the page degrades
+// those features to empty), but warn loudly: build it with
+// `./scripts/refresh-compiler.sh`.
+const emitSeed = async (): Promise<string> => {
+  const seed = await hashedSeed(new URL("build/vl-compiler.wasm", ROOT));
+  if (!seed) {
+    console.warn(
+      "warn: could not read build/vl-compiler.wasm — the playground's LSP " +
+        "features will be disabled. Build the seed with ./scripts/refresh-compiler.sh",
+    );
+    return SEED_FALLBACK;
+  }
+  await Deno.writeFile(new URL(seed.name, DIST), seed.bytes);
+  console.error(`seed: build/vl-compiler.wasm → playground/dist/${seed.name}`);
+  return seed.name;
+};
+
+// Resolve the hand-maintained template against the names esbuild just emitted.
+// This is the ONE un-hashed file the browser fetches, so it is also the only one
+// that must not be cached (serve.ts sends it no-cache; see assets.ts).
+const writeIndexHtml = async (assets: { js: string; css: string }): Promise<void> => {
+  const html = renderIndexHtml(await Deno.readTextFile(TEMPLATE), assets);
+  await Deno.writeTextFile(new URL("index.html", DIST), html);
+  console.error(`page: playground/dist/index.html → ${assets.js} + ${assets.css}`);
+};
+
+// Order matters: dist is emptied first so it stays a snapshot of THIS build
+// (hashed names would otherwise accumulate forever), and the seed is hashed
+// before bundling because esbuild inlines its name via the generated module.
+await cleanDist(DIST);
+await writeSeedModule(await emitSeed());
+await writeIndexHtml(await build());
 esbuild.stop();

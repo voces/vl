@@ -16,9 +16,19 @@
 import * as esbuild from "esbuild";
 import { denoPlugins } from "esbuild-deno-loader";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
+import {
+  cacheControl,
+  hashedSeed,
+  isHashedAsset,
+  renderIndexHtml,
+  SEED_FALLBACK,
+  TEMPLATE,
+  writeSeedModule,
+} from "./assets.ts";
 
 const HERE = new URL(".", import.meta.url);
 const ROOT = new URL("../", HERE);
+const DIST = new URL("dist/", HERE);
 
 // The self-hosted seed the playground's LSP features run on. Built by
 // `./scripts/refresh-compiler.sh`; absent on a fresh clone, in which case the
@@ -162,7 +172,123 @@ const fail = (msg: string): never => {
   Deno.exit(1);
 };
 
+const exists = async (u: URL): Promise<boolean> => {
+  try {
+    await Deno.stat(u);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// Cache busting (the DX fix): assert the page cannot reference a URL a browser
+// could serve from cache after a ship. Split in two — the template/classifier
+// half runs ALWAYS (it needs no build), the on-disk half needs `dist/` and says
+// loudly when it is skipped, so a green run can't be mistaken for a full one.
+const verifyCacheBusting = async (): Promise<void> => {
+  // --- always-on: the template still has its placeholders --------------------
+  const template = await Deno.readTextFile(TEMPLATE);
+  if (template.length === 0) fail("playground/index.html is empty");
+  for (const token of ["{{JS}}", "{{CSS}}"]) {
+    if (!template.includes(token)) {
+      fail(`playground/index.html lost its ${token} placeholder — the entry would ship un-hashed`);
+    }
+  }
+  if (/(src|href)="\.\/dist\/playground\.(js|css)"/.test(template)) {
+    fail("playground/index.html references a literal un-hashed entry (the cached-forever URL)");
+  }
+
+  // --- always-on: rendering substitutes, and REFUSES to silently under-substitute
+  const rendered = renderIndexHtml(template, {
+    js: "playground-AAAAAAAA.js",
+    css: "playground-BBBBBBBB.css",
+  });
+  if (!rendered.includes("playground-AAAAAAAA.js") || !rendered.includes("playground-BBBBBBBB.css")) {
+    fail("renderIndexHtml did not substitute the hashed names");
+  }
+  if (rendered.includes("{{")) fail("renderIndexHtml left a placeholder unsubstituted");
+  // Negative control: a template whose placeholder was hand-edited back to a
+  // literal name must THROW, not quietly emit an un-bustable page.
+  let threw = false;
+  try {
+    renderIndexHtml(template.replace("{{JS}}", "./playground.js"), { js: "a.js", css: "b.css" });
+  } catch {
+    threw = true;
+  }
+  if (!threw) fail("renderIndexHtml accepted a template with no {{JS}} placeholder");
+
+  // --- always-on: the cache classifier splits both ways ----------------------
+  for (const hashed of ["playground-1A2B3C4D.js", "chunk-2BRMWJCO.js", "vl-compiler-DEADBEEF.wasm"]) {
+    if (!isHashedAsset(hashed)) fail(`isHashedAsset missed the hashed name ${hashed}`);
+    if (!cacheControl(hashed).includes("immutable")) {
+      fail(`hashed asset ${hashed} would not be cached immutably`);
+    }
+  }
+  for (const plain of ["index.html", "playground.js", "vl-compiler.wasm"]) {
+    if (isHashedAsset(plain)) fail(`isHashedAsset wrongly treated ${plain} as content-addressed`);
+    if (!cacheControl(plain).includes("no-cache")) {
+      fail(`un-hashed ${plain} would be cached — index.html MUST revalidate`);
+    }
+  }
+  console.error("OK: template placeholders intact, render substitutes/throws, cache classifier splits both ways");
+
+  // --- on-disk: what the build actually emitted ------------------------------
+  const builtIndex = new URL("index.html", DIST);
+  if (!await exists(builtIndex)) {
+    console.error(
+      "SKIP: playground/dist/index.html not built (deno task playground:build) — " +
+        "emitted-asset checks skipped",
+    );
+    return;
+  }
+  const page = await Deno.readTextFile(builtIndex);
+  if (page.length === 0) fail("playground/dist/index.html is empty");
+
+  // Every LOCAL reference the page makes must be content-addressed and present.
+  const refs = [...page.matchAll(/(?:src|href)="([^"]+)"/g)]
+    .map((m) => m[1])
+    .filter((r) => !/^https?:/.test(r));
+  if (refs.length === 0) fail("dist/index.html references no local assets at all");
+  for (const ref of refs) {
+    if (!isHashedAsset(ref)) fail(`dist/index.html references an un-hashed asset: ${ref}`);
+    if (!await exists(new URL(ref.replace(/^\.\//, ""), DIST))) {
+      fail(`dist/index.html references a missing asset: ${ref}`);
+    }
+  }
+
+  // The seed's emitted name must be the hash of the seed that was actually
+  // built — the half of the bug that bites on every compiler merge.
+  const seed = await hashedSeed(new URL("build/vl-compiler.wasm", ROOT));
+  if (!seed) {
+    console.error("SKIP: compiler seed not built — hashed-seed name check skipped");
+  } else {
+    if (!await exists(new URL(seed.name, DIST))) {
+      fail(`dist/ has no ${seed.name} — the seed's name does not match its content hash`);
+    }
+    if (seed.name === SEED_FALLBACK) fail("hashedSeed returned the un-hashed fallback name");
+    // …and the bundle must FETCH that name, not the old stable one.
+    const bundle = refs.find((r) => r.endsWith(".js"));
+    const js = await Deno.readTextFile(new URL(bundle!.replace(/^\.\//, ""), DIST));
+    if (js.length === 0) fail("the built entry bundle is empty");
+    if (!js.includes(seed.name)) {
+      fail(`the built bundle does not fetch ${seed.name} (it would request a stale seed)`);
+    }
+  }
+  console.error(
+    `OK: dist/index.html references ${refs.length} assets, all content-hashed and present` +
+      (seed ? `; bundle fetches ${seed.name}` : ""),
+  );
+};
+
 const main = async (): Promise<void> => {
+  // `wasmCheckerBrowser.ts` imports the git-ignored, build-generated module that
+  // pins the seed's hashed name. Regenerate it here so `verify` works on a fresh
+  // clone that has never run `playground:build` — otherwise the full-bundle build
+  // below would fail on an unresolved import. Uses the real seed's hash when one
+  // is on disk, so the assertions downstream check the true name.
+  const seedNow = await hashedSeed(new URL("build/vl-compiler.wasm", ROOT));
+  await writeSeedModule(seedNow?.name ?? SEED_FALLBACK);
+
   console.error("bundling DOM-free core (browser settings)…");
   const code = await bundleCore("src/playground.ts");
 
@@ -447,6 +573,10 @@ const main = async (): Promise<void> => {
   // 6. The full page bundle (main.ts + Monaco) builds with the LSP wiring.
   console.error("\nbuilding the full page bundle (Monaco + providers)…");
   await verifyFullBundleBuilds();
+
+  // 7. Cache busting: nothing the browser caches keeps a stable URL.
+  console.error("\nchecking cache busting…");
+  await verifyCacheBusting();
 
   console.error(
     "\nALL CHECKS PASSED — binaryen + the client-side LSP run via the bundle.",

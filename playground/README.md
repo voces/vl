@@ -8,8 +8,9 @@ all in the browser, with no server-side compile and no language-server process.
 
 The whole compiler **and language server** run in the page, on the **self-hosted
 compiler seed** (`build/vl-compiler.wasm`, the same one the Node LSP and `vl
-check`/`vl build` run): `src/wasmCheckerBrowser.ts` fetches the seed (copied next
-to the bundle by `build.ts`) and drives it through the environment-agnostic
+check`/`vl build` run): `src/wasmCheckerBrowser.ts` fetches the seed (written next
+to the bundle by `build.ts` under a content-hashed name) and drives it through the
+environment-agnostic
 `createWasmChecker` core (`lsp/src/wasmChecker.ts`), exactly as the Node LSP does.
 The **Run** path compiles VL → wasm on the seed too (`createWasmChecker.compile`
 → the driver's `compileSrc`) and executes the bytes with the pure `runWasm`
@@ -52,18 +53,58 @@ This builds the browser bundle and starts a static server, then open the printed
 URL (default <http://localhost:8000/>). The first build downloads esbuild and the
 Deno esbuild loader; subsequent builds are ~1s.
 
-Open `index.html` over HTTP (not `file://`) — module scripts and the bundle's
-MIME type require it, which is what the bundled server provides.
+Open the page over HTTP (not `file://`) — module scripts and the bundle's MIME
+type require it, which is what the bundled server provides. Note the served page
+is the **built** `dist/index.html`, not the `index.html` template; opening the
+template directly shows unsubstituted `{{JS}}`/`{{CSS}}` placeholders.
 
 Sub-tasks:
 
 | Task | What it does |
 | --- | --- |
-| `deno task playground:build` | Bundle `playground/src/main.ts` -> `playground/dist/playground.{js,css}` |
-| `deno task playground` | Build, then serve `playground/` (pass `--port N` after the script to change the port) |
+| `deno task playground:build` | Bundle `playground/src/main.ts` -> `playground/dist/playground-<hash>.{js,css}` + the resolved `dist/index.html` |
+| `deno task playground` | Build, then serve `playground/dist/` (pass `--port N` after the script to change the port) |
 | `deno task playground:verify` | Headless check that the browser bundle compiles + runs (see below) |
 
-The built bundle lands in `playground/dist/` (git-ignored).
+The build lands in `playground/dist/` (git-ignored), which is **self-contained**:
+the resolved `index.html`, the content-hashed entry pair, the code-split chunks
+and the hashed compiler seed. That directory is exactly what gets served locally
+and what the Pages workflow uploads, so local and deployed layouts match.
+
+## Cache busting
+
+Shipping a change used to not reach a returning visitor: `index.html` referenced
+`dist/playground.js`, `dist/playground.css` and the page fetched
+`dist/vl-compiler.wasm` — three **stable** URLs a browser is free to keep serving
+from cache. (The code-split `chunk-*.js` were already content-hashed; only the
+entries and the seed were not. The seed is the sharp edge: it is rebuilt on every
+compiler merge.)
+
+Every cacheable asset now carries a **content hash** in its filename, and the one
+un-hashed file — `index.html`, which points at them — is served `no-cache`:
+
+| File | Cached |
+| --- | --- |
+| `index.html` | `no-cache, must-revalidate` — it is the pointer; it must be re-read |
+| `playground-<hash>.{js,css}`, `chunk-*.js`, `vl-compiler-<hash>.wasm` | `public, max-age=31536000, immutable` |
+
+A content hash rather than a `?v=<timestamp>` query on purpose: a timestamp
+changes every URL on every build, throwing away the cache even when nothing the
+browser holds actually changed. A hash changes **exactly** when the bytes change —
+so a rebuild with no source change emits byte-identical names and keeps the
+visitor's cache warm, while any real change renames what they must re-fetch.
+
+`serve.ts` sends those headers locally. The deployed site is **GitHub Pages**
+(`.github/workflows/pages.yml`), which sends its own `Cache-Control` and offers
+no way to configure it — so renaming the file is not merely the nicer lever
+there, it is the only one.
+
+Two guards keep this from silently rotting, both exercised by `playground:verify`:
+`index.html` is a **template** whose `{{JS}}`/`{{CSS}}` placeholders `build.ts`
+substitutes (it fails the build if one is missing, i.e. if someone pastes a
+literal name back), and the seed's hashed name is pinned into the bundle by a
+**generated module** (`src/generated/seedName.ts`, git-ignored) so a missed
+resolution is a build error rather than a visitor's 404.
 
 ## How it's built
 
@@ -71,16 +112,23 @@ The built bundle lands in `playground/dist/` (git-ignored).
 Deno (the root `deno.json` import map + the `.ts` sloppy-import graph), targeting
 `platform: browser`, `format: esm`, `conditions: ["browser"]`.
 
-**Code-splitting** is on (`splitting: true`, `outdir`): the entry is `playground.js`
-(~2 MB) and everything reached only through a dynamic `import()` lands in a
-`chunk-*.js` fetched on demand — most importantly **binaryen** (~13 MB), which the
-WAT renderer (`wasmToWat`) pulls lazily, so it never weighs on the initial load.
-`index.html` loads only `playground.js` + `playground.css`; the chunks sit beside
-them and are fetched by their relative URLs.
+**Code-splitting** is on (`splitting: true`, `outdir`): the entry is
+`playground-<hash>.js` (~2 MB) and everything reached only through a dynamic
+`import()` lands in a `chunk-*.js` fetched on demand — most importantly
+**binaryen** (~13 MB), which the WAT renderer (`wasmToWat`) pulls lazily, so it
+never weighs on the initial load. The built `index.html` loads only
+`playground-<hash>.js` + `playground-<hash>.css`; the chunks sit beside them and
+are fetched by their relative URLs. `entryNames: "[name]-[hash]"` supplies the
+entry hashes, and `build.ts` reads the emitted names back out of esbuild's
+**metafile** rather than reconstructing them — esbuild owns the hash, so asking
+it is the only way to be sure the names in `index.html` are the names on disk.
+(An entry embeds the specifier of every chunk it imports, so a change anywhere in
+the graph renames a chunk and therefore renames the entry too.)
 
 **Monaco** (`npm:monaco-editor`) is bundled through the same pipeline. Its ESM
 imports `.css` (widget styles) and a `.ttf` (the codicon icon font); esbuild
-emits the CSS into a sibling `dist/playground.css` (loaded by `index.html`) and a
+emits the CSS into a sibling `dist/playground-<hash>.css` (loaded by the built
+`index.html`) and a
 `{ ".ttf": "dataurl" }` loader inlines the font, so there's no extra asset to
 serve. Monaco's optional language workers (TS/JSON/CSS/HTML) are **not** used —
 only a `vital` language is registered, with our own providers — so
@@ -128,7 +176,13 @@ and asserts:
   go-to-definition, completion, and format;
 - the **full** page bundle (`src/main.ts` + Monaco) builds — emitting both the JS
   and the sibling CSS — with every LSP provider wired (the headline Monaco
-  integration risk). Monaco needs the DOM so it's built, not evaluated, here.
+  integration risk). Monaco needs the DOM so it's built, not evaluated, here;
+- **cache busting** holds: the template still has its placeholders and no literal
+  entry name, rendering both substitutes and *throws* on a missing placeholder,
+  the cache classifier splits hashed/un-hashed both ways, and — when `dist/` has
+  been built — every local reference in `dist/index.html` is content-hashed and
+  present, with the seed's filename matching the hash of the seed actually built
+  and the bundle fetching that exact name.
 
 The Run-path and LSP checks drive the on-disk seed (the headless analogue of the
 page's fetch); they self-skip if it isn't built. Note: under Deno the bundle is
@@ -157,16 +211,23 @@ browser `process` is undefined and that branch is skipped.
 
 ```
 playground/
-  index.html        single-page UI (Monaco editor host, Run, output panes)
+  index.html        single-page UI (Monaco host, Run, output panes) — the TEMPLATE;
+                    {{JS}}/{{CSS}} are resolved into dist/index.html by build.ts
   src/
     main.ts         Monaco + LSP-provider wiring to the DOM (the bundle entry)
     lspAdapter.ts   pure browser "language server": wraps the pure LSP helpers
     playground.ts   DOM-free Run path: seed compile (compileSrc) -> runWasm -> WAT
     samples.ts      seed programs (from tests/cases/**)
-  build.ts          esbuild bundler (-> dist/playground.js + dist/playground.css)
-  serve.ts          tiny static file server
-  verify.ts         headless bundle test
-  dist/             build output (git-ignored)
+    generated/      seedName.ts — the seed's hashed name (written by build.ts,
+                    git-ignored; imported by wasmCheckerBrowser.ts)
+  assets.ts         content hashing, cache-control policy, index.html templating
+                    (shared by build.ts / serve.ts / verify.ts)
+  build.ts          esbuild bundler (-> the self-contained dist/ below)
+  serve.ts          tiny static file server (web root = dist/), sends the headers
+  verify.ts         headless bundle test (incl. the cache-busting guards)
+  dist/             build output, self-contained + deployable (git-ignored):
+                    index.html, playground-<hash>.{js,css}, chunk-*.js,
+                    vl-compiler-<hash>.wasm
 ```
 
 ## Limitations / future work
