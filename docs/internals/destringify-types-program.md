@@ -15028,3 +15028,377 @@ with the arithmetic, and nothing speculative exported** — `tyLitMemberTexts` /
    masks — the program then prints the mask) or **fail the emit with the number in the message** (used
    for the work counts — the corpus message channel carries it). Both are cheap; neither is obvious
    from the harness.
+
+## D-REFELEM + D-UNIONARMS — the ref-array ELEMENT pair and the union-ARM iteration each get ONE home; and `unionArmsOf`'s fall-through is NOT deletable, with the mechanism (#1152)
+
+**Slice: `compiler/emit_classify.vl` only** (plus this doc). Branched at `b71888e` (#1149) and
+**rebased onto `5d011ff`** after #1150 (D-ARROWHOME …) and #1151 (D-ATOMIS + D-ATOMPRINT) landed
+mid-slice. **Every number below is re-taken at `5d011ff`, in one session**, against a master
+compiler built in that same session and proved stable across two successive
+`refresh-compiler.sh` runs (`ac-MASTER2.wasm`, md5 `40deb486f818796920827fbdb79e6c2b`,
+1,027,758 B). Nothing is carried from a hand-off, and nothing from the pre-rebase measurement.
+
+**The rebase mattered and was re-verified rather than assumed.** #1150 rewrote `emit_base.vl` and
+`emit_collect.vl` — including `annArrowAt`, which every one of this slice's homes reaches
+transitively — and #1151 touched `typecheck.vl` and `wasmEmit.vl`. **Neither touched
+`emit_classify.vl`**, the code commit replayed with no edit, and the scoreboard DELTA is identical
+either side of the rebase (**−17**), as is the binary delta (**−520 B**) and the per-file
+`emit_classify` reading (**203 → 186**). The pre-rebase base `b71888e` read 346/36/382; quoting it
+here would be wrong by 3 core and 1 off-list.
+
+### Scoreboard at this base, and the delta
+
+Re-measured with `scratchpad/parsercount.py compiler` (unit: **non-comment CALL SITES** of the
+23-resolver CORE list + #1141's off-list table, definition headers excluded):
+
+| | CORE | OFF-LIST | TRUE |
+|---|---|---|---|
+| master `5d011ff` | **343** | **35** | **378** |
+| this PR | **326** | **35** | **361** |
+| delta | **−17** | **0** | **−17** |
+
+All −17 are in `emit_classify.vl` (**203 → 186**; 200+3 → 183+3). `emit_query.vl` is unmoved at 2.
+Per resolver in that file: `refArrElemName` **25 → 18**, `nameIsRefArray` **18 → 12**,
+`splitUnionAtoms` **11 → 8**, `nameIsArray` **15 → 14**. **0 added, 0 laddered, 0 sidecars.**
+Compiler binary **1,027,758 → 1,027,238 = −520 B**. Source: CODE lines **12,314 → 12,308** (−6),
+comment lines +93 — the four home headers carry their own justification, which is the point.
+
+### The technique, again: enumerate by what the CODE is
+
+Three grammars, **25 hand-written copies**, four homes.
+
+**(1) `refArrElemNameIf` — the ref-array ELEMENT pair, 7 copies.**
+
+```vl
+if nameIsRefArray(x) { <use> refArrElemName(x) }      // and "" otherwise
+```
+
+at `retRefArrElemName`, `paramRefArrayName`, `letRefListElemName`, `fnRetNulRefArrayName`,
+`unionStructArmMapListElemIndex`, `calleeIsUnionElemFieldClosure`, `unionClosureArrElemUnion`.
+Each copy is **two** ladder walks over one spelling, and 7 copies are 7 places that had to agree
+about *why the guard is there*.
+
+**The guard is NOT redundant, and that is the finding that makes this more than a dedup — but the
+first version of this paragraph was WRONG about WHY, and a probe corrected it.** `nameIsRefArray`
+carries two rejections of its own that `refArrElemName` never learned: a TOP-LEVEL arrow
+(`(i32) => S[]` is a closure RETURNING an array) and a literal-union array (`K[]`, whose elements
+are interned i32 ATOMS). I asserted from reading the code that `refArrElemName` answers a NON-empty
+element for BOTH. **Measured, it answers one:**
+
+| channel | `refArrElemNameIf` calls | guard says NO | of those, `refArrElemName` != "" (the guard is LOAD-BEARING) | of those, top-level arrow |
+|---|---|---|---|---|
+| corpus (1,137 programs) | 6,242 | 3,410 | **20** (6 files) | **0** |
+| fuzz (18,323 programs) | 24,728 | 12,742 | **100** (50 programs) | **0** |
+| **total** | **30,970** | **16,152** | **120** | **0** |
+
+So the LITUNION-ARRAY rejection is the load-bearing half — a litunion `K` is a registered `unNames`
+row, so `refArrElemName("K[]")`'s trailing base-name match fires and returns `"K"` — and the ARROW
+rejection has **zero witnesses on either channel**. The six corpus files are named
+(`literal-unions/atom-array.vl`, `lists/atom-array-literal-binding.vl`,
+`functions/nullable-refarray-return.vl`, `functions/nullable-refarray-body-read.vl`,
+`arrays/return-nullable-niche-field-struct-array.vl`, `lists/nullable-list-map-field-struct.vl`).
+Either way `refArrElemNameIf` keeps the guard: 120 answers change without it. **Measure, don't
+reason — even about a two-line function you have just read.**
+
+**(2) `unionArmTys` / `unionSetArmTys` — the union-ARM iteration, 16 copies.**
+
+```vl
+const atoms: string[] = []
+const nm = unionArmsOf(name, atoms)                              // arm SPELLINGS
+const mems: i32[] = []
+const cov = unionMemberTysOf(nm, mems) && mems.length == atoms.length
+```
+
+Sixteen classifiers wrote that four-line preamble out, then branched on `cov` — an arena loop over
+`mems[i]`, else the legacy spelling loop over `atoms[i]`. The index-parallel pairing rule and the
+LENGTH check that establishes it were re-decided at each site, and the resolved set name `nm` was
+held by every one of them for exactly one use.
+
+**THE SIXTEEN ARE NOT ONE HOME — THEY ARE TWO, AND PROVING THAT IS THE WORK.** Twelve resolve an
+alias (`unionArmsOf` → `unionMemberSetOf` first); **four do not** (`markValueUnionAtoms`,
+`markRefArrayArms`, `markMapUnionArms`, `unionHasMapArmSlot` call `splitUnionAtoms` directly). For a
+registered alias `U` (`type U = A | B`) the two differ: `unionArmsOf("U")` yields two arms,
+`splitUnionAtoms("U")` yields the single atom `"U"`. Three of the four are fed a member SET by
+construction (`unMemberSet[u]`, an inline set, or `registerValueUnionName`'s `name`, which is pushed
+as BOTH the row name and the row set); the fourth, `markMapUnionArms(valName)`, takes a map's VALUE
+spelling, which CAN be an alias name. So the difference is real at the API and the two homes stay
+two. `unionSetArmTys` is a pure hoist (it still calls `splitUnionAtoms`); it takes that resolver from
+4 sites to 1.
+
+**(3) `refArrElemKeyDeferred` — the DEFERRED element key, 2 copies** (`shapeFieldElemName`'s code-5
+and code-28 arms):
+
+```vl
+const e = refArrElemName(x); if e != "" { return e }
+if nameIsArray(x) { return x.slice(0, x.length - 2) }
+return ""
+```
+
+A **third** copy of this grammar exists (`unionListElemMapFieldMember`) and is **deliberately not
+folded in**: it gates the fallback on `a.length > 2` where these two gate on `nameIsArray(a)`. The
+two guards agree only because that copy already sits inside a `nameIsRefArray(a)` arm — unifying
+them would be a behaviour change wearing a dedup's clothes. Filed, not smuggled.
+
+### TARGET 1 — `unionArmsOf`'s `splitUnionAtoms` fall-through is NOT a one-line deletion. The construction argument exists, is provable, and is INSUFFICIENT.
+
+The hand-off asked for the construction argument that **`msMemberAtomsOf` cannot decline for a
+registered row**, on top of a measurement of 0 fall-throughs. **Both halves reproduce, the argument
+is provable — and it does not license the deletion.**
+
+**Measured at this head** (probe: module-local counters in `emit_classify.vl`, reported once per
+program through `emitFail` at the end of `emitProgram`; a cross-module `export let` is not a shared
+counter):
+
+| channel | denominator | `unionArmsOf` invocations | fall-throughs |
+|---|---|---|---|
+| corpus (`find tests/cases -name '*.vl'`, 1,340 files) | **1,137** programs reaching end-of-emit | **1,444** | **0** |
+| fuzz (8 seeds × 3 depths × {plain, declared}, COUNT=200) | **18,323** of 19,200 generated programs reaching end-of-emit | **2,902** | **0** |
+| **total** | **19,460 programs** | **4,346** | **0** |
+
+That 0 is wired, not blind: a comparator-sanity build that forces the branch
+(`if !msMemberAtomsOf(nm, out) || true`) reads **armsfall = arms = 1,469** — 100% of reaches, on
+119 files.
+
+**The construction argument, proved:**
+
+1. `unNames` has exactly **THREE** push sites tree-wide (`emit_collect.vl:4011`, `emit_collect.vl:4870`,
+   `emit_classify.vl:11806`). Each is followed, in the same straight-line block with no branch
+   between, by `unMemberSet.push(<set>)` and `recordUnMemTys(<that same set>)`.
+2. `recordUnMemTys` splits the set ONCE with `splitUnionAtoms` and appends exactly `unMemTyCount`
+   verbatim atoms to `unMemAtoms`, so for a covered row `msMemberAtomsOf`'s output is
+   byte-identical to what `splitUnionAtoms` would rebuild.
+3. The only reset that could strand a row (`collectU`) clears `unNames` **and** `unMemTyStart` /
+   `unMemTyCount` / `unMemTys` in one straight-line block, so no observation point can see a row
+   whose columns were cleared under it.
+
+⇒ **for a `name` that IS a registered union row (by alias name or by member-set text),
+`msMemberAtomsOf` cannot decline.** The fall-through is dead for that population, by construction.
+
+**AND THAT IS NOT ENOUGH.** `unionArmsOf`'s contract does not require `name` to be a registered
+union at all. `unionMemberSetOf` returns its argument unchanged on a miss and `msSetOfText` then
+declines — so for a NON-union name the `splitUnionAtoms` fall-through **is not a coverage backstop,
+it is the IDENTITY path**: it is what makes `unionHasMapArm("i32")` answer "one atom, no map arm"
+instead of "no atoms at all". Deleting the line would silently turn every such call from one atom
+into zero. Nothing in the signature, the callee, or the arena prevents that population — it is empty
+only because all 15 call sites happen to gate on `un != ""` from `unionNameOfIdent` or on an already
+resolved member set. **That is a caller-side invariant across 15 sites, not a construction.**
+
+**Verdict: DECLINED, and the line stays.** The hand-off's framing was the right question aimed at
+the wrong half of the function: the registered-row half is closable and closed above; the
+unregistered-name half is the half that keeps the line alive.
+
+### The `letRefListElemName` fold, and the cell it merges
+
+Six of the seven `refArrElemNameIf` conversions are exact by inspection (their else-branch already
+returned ""). The seventh, `letRefListElemName`, has an else-branch that falls through to the
+initializer, so the fold merges two answers master kept apart: "not a ref array" (fall through) and
+"a ref array whose element does not resolve" (return ""). That second cell is **measured empty**:
+
+| channel | `refArrElemNameIf` invocations | of which `nameIsRefArray` TRUE | `nameIsRefArray && refArrElemName == ""` |
+|---|---|---|---|
+| corpus (1,137 programs) | **6,242** (639 files) | **2,832** (160 files) | **0** |
+| fuzz (18,323 programs) | **24,728** (6,452 progs) | **11,986** (1,092 progs) | **0** |
+| **total** | **30,970** | **14,818** | **0** |
+
+Wired, not blind: inverting the test (`if acpe != ""`) reads **elemhole = elemyes = 2,877** on the
+corpus — 100% of the guard-true reaches.
+
+### Gate — every RC checked explicitly
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh` | **RC=0**, 1,027,238 B (and stable across two successive runs on the master side) |
+| `native-fixpoint.sh` | **RC=0** — stage3 == stage4 byte-for-byte (1,027,238 B) |
+| `lint-self.sh` (after `vl fmt f > tmp && mv tmp f`) | **RC=0**, self-lint + fmt-check clean |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **RC=0 — 2,060 passed / 0 failed / 8 ignored**, master baseline re-measured in the SAME session with the SAME command reads **2,060 / 0 / 8**, and the ignored-test **NAME SETS are identical** |
+| corpus A/B (build rc + wasm sha256 + normalized message + run rc + stdout + stderr, one output FILE per input, `diff -r`) | **1,340 rows, 0 differences** |
+| lint-tier A/B (`vl check` over the same 1,340 files) | **0 differences** |
+| fuzz A/B (14 seeds × 3 depths × {plain, declared} × 200) | **33,600 programs/side, 0 differences** on build rc + wasm sha256 + normalized message + run rc + stdout (the message is normalized for the compiler's own `wasm[0]::function[N]` backtrace indices, which any dedup renumbers) |
+| `rep-fuzz-check.sh` | **RC=0** — `exact ✅ (1 baselined failure — 0 unsound, 1 reject; 0 new, 0 stale)` |
+| invocation counts on both sides of every home | **21 counters, byte-identical both sides** (below) |
+
+**Channel populations, so the 0 is not an empty run.** Corpus (side A): 1,137 rows build clean ·
+203 build rejects · **1,133 distinct wasm hashes** · 1,084 rows carry a `@run` section · 4 non-zero
+run rcs · all 1,340 rows carry a message. Lint tier: 192 rows carry an `[ERROR]/[WARN]/[INFO]`, 180
+have a non-zero `CHECK_RC`. Fuzz (side A): 32,060 build clean · 1,540 build rejects · **22,374
+distinct wasm hashes** · 1,541 non-zero run rcs.
+The A/B candidate compiler is **byte-identical** (md5 `c259cc497d992ad7711bd0ef0cd29578`) to the
+`refresh-compiler.sh` output the fixpoint gate proved, so every leg tested the shipped artefact.
+**Two harness bugs were caught by implausible magnitude, both in the direction that reports LESS
+difference:** a first fuzz-A/B build silently wrote **0 rows** (an `IFS=$'\t' read` that never
+split), and the population summary of a 33,600-row run read **0 / 0 / 0** because the glob blew
+`ARG_MAX` — the `diff -rq` beside it was correct both times. Check the magnitude before believing a
+0, including a 0 you like.
+
+**PUBLISHED FUZZ BLIND SPOT.** `scripts/fuzzgen.vl` emits SINGLE FILES, so the module-merge paths
+are corpus-and-pin-only; it emits the map constructor at exactly one site, always as an annotated
+local, and never a `return Map()` or an un-annotated global bound to a call. The
+`markMapUnionArms(valName)` population that SAB-H3 needed to separate is one the generator cannot
+reach, which is part of why that sabotage is inert — the corpus, not the fuzzer, is the channel that
+would have to witness it.
+
+**Comparator PROVED, in one build each:**
+- **SAB-H1** (`refArrElemNameIf` returns "" instead of the element, guard kept) → **47 corpus files
+  differ**, and **6 of 800** fuzz programs. The 0 on the real candidate is a measurement.
+- **SAB-A/SAB-B** (the two counting-probe inversions above) → 100% fire at every reach.
+
+### The work check — a "no behaviour change" gate CANNOT see a work regression
+
+Both sides instrumented with per-function EXECUTION counters (`emit_base.vl` 10, `emit_classify.vl`
+6, `typecheck.vl` 4 — reset at the top of `emitProgram`, so this is emit-phase work), run over the
+same 1,137 corpus programs:
+
+| counter | master | this PR |
+|---|---|---|
+| `nameIsArray` | 868,850 | 868,850 |
+| `listElemNameOf` | 532,567 | 532,567 |
+| `nullablePartOf` | 426,313 | 426,313 |
+| `nameIsMap` | 210,124 | 210,124 |
+| `nameIsLitUnionArray` | 174,703 | 174,703 |
+| `splitUnionAtoms` | 160,467 | 160,467 |
+| `nameIsBareMap` | 150,656 | 150,656 |
+| `unionMemberCount` | 138,585 | 138,585 |
+| `nameIsStringArray` | 125,815 | 125,815 |
+| `nameIsLitUnionType` | 109,313 | 109,313 |
+| `nameIsI32Array` | 102,115 | 102,115 |
+| `refArrShapeKind` | 78,134 | 78,134 |
+| `nameIsRefArray` | 74,867 | 74,867 |
+| `isValueUnionName` | 72,916 | 72,916 |
+| `refArrElemName` | 35,258 | 35,258 |
+| `mapValNameOf` | 11,247 | 11,247 |
+| `unionMemberTysOf` | 9,652 | 9,652 |
+| `msMemberAtomsOf` | 7,779 | 7,779 |
+| `peelGroupParens` | 6,075 | 6,075 |
+| `unionArmsOf` | 1,444 | 1,444 |
+| **TOTAL** | **3,296,880** | **3,296,880** |
+
+(`annArrowAt` is the one resolver of the intended 21 that is NOT instrumented: #1150 rewrote it as a
+single-line delegator to `tyTopLevelIndexOf`, which the counter-injector's "opening brace ends the
+line" pattern does not match. It is missed IDENTICALLY on both sides and no home in this slice
+touches it — stated rather than quietly dropped.)
+
+**Exactly 0 delta on every counter** — the four homes are pure relocations. That required two
+deliberate decisions, both of which the first draft got wrong and the invocation count would have
+caught:
+- `unionClosureArrElemUnion` keeps an `el != ""` test in front of `isValueUnionName(el)`. Folding
+  the `nameIsRefArray` guard away without it would have run an `unionMemberCount` scan once per
+  non-ref-array atom — work the loop never used to pay.
+- `fnRetNulRefArrayName` keeps its `np != ""` conjunct rather than leaning on
+  `nameIsRefArray("")`, which is not free (an `annArrowAt` scan, a `nameIsLitUnionArray`, and a
+  whole `refArrShapeKind` ladder).
+
+### Entombment
+
+This slice is a **behaviour-preserving refactor**, so by the standing rule it cannot have a pin that
+fails on master; it is entombed by the equivalence evidence above plus a pin that fails under
+sabotage. **SAB-H1 is that pin** — **47 corpus files** redden at this base (and 6 of 800 fuzz
+programs, measured on the pre-rebase pair) when the home stops returning the element, so the merge
+is not over-merged and the pre-existing corpus already covers the converted sites.
+
+**One sabotage came back INERT, and it is a finding, not a footnote. SAB-H3** — point all four
+set-exact sites at the alias-resolving home (i.e. assert the two homes ARE interchangeable) — reads
+**0 differences over 1,340 corpus files**. Search performed, and it is where a decline's honesty
+lives: three of the four sites are fed member SETS by construction (proved above), so only
+`markMapUnionArms(valName)` can separate them, and it needs a **union alias with a bare-map arm**
+reached through its NAME. Seven hand-built programs were tried; `type U = {[string]: i32} | i32` and
+`type U = {[string]: i32} | {w: i32}` are **parse errors** (a map member in FIRST position is not
+spellable), `type U = {a: i32} | {[string]: i32}` parses but did not separate the sides in any of the
+map-value / narrowed-read / boxed-store shapes built on it. **No pin exists for the two-home split
+on either channel; the split is kept because master's behaviour at those four sites IS
+`splitUnionAtoms`, and merging them would be a behaviour change with no witness in either
+direction.** Entombment graded DOWN accordingly rather than averaged away.
+
+### Refutations (worth more than the agreement)
+
+0. **All five refutations below were re-verified at `5d011ff` after the rebase, not carried over.**
+1. **This doc's hand-off #1 of D-CLASSHOME — "`annRetNameOf` has FIVE un-swept copies in
+   `emit_classify.vl`" plus "three FURTHER `annFnDecompose` copies … would take `annSplitParams`
+   from 3 to 0" — IS ALREADY DONE at `5d011ff` (and was already done at `b71888e`).** All eight sites now call the homes
+   (`cloArrSlotRetName`, `calleeCloRetName`, `forceCloResultMapTypes`, `forceCloResultListTypes`,
+   `unionRetOfFnType`, `internFuncTypeShapes`, `annSigKey`, `nominalizeFnType`), and
+   `annSplitParams` has **0** call sites in `emit_classify.vl` (at `5d011ff` its only two
+   tree-wide are both in `emit_base.vl`; #1150 took the `emit_mono.vl` one). Re-grep every lead
+   against the head you are briefing against — this is the same class of stale lead the file has
+   now logged four times.
+2. **Hand-off #2 of the same section — "`emit_query.vl:835` is the SIXTEENTH copy of the bare-map
+   grammar" — IS ALSO ALREADY DONE.** `paramMap` calls `nameIsBareMap`; the single remaining
+   `nameIsMapMemberUnion` occurrence in `emit_query.vl` (line 832) is inside the comment that
+   records the conversion.
+3. **"The SEVENTEEN map-VALUE sites" re-measures at SIXTEEN.** At `5d011ff`: `mvSlotOfMapName`
+   **6** callers (not 7 — lines 4471, 4483, 4676, 7140, 17648, 18297; 17779 is the definition),
+   `mvShapeOfMapName` **5** (2843, 9270, 11958, 11999, 17598), `mapValKindLowerable` **5** (1702,
+   8592, 8622, 9435, 10827). The shape of the hand-off survives (all
+   sixteen in `emit_classify.vl`, each one line, and the blocker is that the three homes need a NODE
+   index rather than a name); the count does not.
+4. **TARGET 1's construction argument is provable AND insufficient** — see above. The registered-row
+   half closes; the fall-through's real job is the UNregistered name.
+5. **`nameIsRefArray` and `refArrElemName` are not interchangeable** — measured at **120**
+   answer-changing calls (20 corpus / 100 fuzz) — so the seven-copy pair collapses to a GUARDED
+   home, not to the bare resolver. **And my own first statement of WHY was wrong:** I claimed both
+   of `nameIsRefArray`'s extra rejections (top-level arrow, literal-union array) change the answer;
+   the arrow one has **0** witnesses on either channel, and every one of the 120 is the
+   litunion-array rejection. Reading a two-line function is not measuring it.
+
+### Hand-offs, each with its measurement
+
+1. **`emit_collect.vl:4071` is the EIGHTH copy of the ref-array element pair**, in another
+   partition, and the diff is exact — `if raa != "null" && valueAtomKind(raa) < 0 &&
+   nameIsRefArray(raa) { const ren = refArrElemName(raa)` becomes `if raa != "null" &&
+   valueAtomKind(raa) < 0 { const ren = refArrElemNameIf(raa)`, plus `refArrElemNameIf` in the
+   `./emit_classify` import list. **−2 core in `emit_collect`**, and it preserves the
+   `valueAtomKind` short-circuit exactly as this slice's identical conversion at
+   `calleeIsUnionElemFieldClosure` does. Verified at `5d011ff` that this is the only remaining copy
+   outside `emit_classify.vl`: `emit_collect` holds 7 `nameIsRefArray` call sites and only `:4071`
+   is this pair (`:1328` and `:2883` have no paired element read, `:2895` pairs with the
+   `refArrElemKind`/element-name hoists a prior slice already deduped, `:3881` and `:3949` recurse
+   into `registerInlineUnion`), and every `nameIsRefArray` hit in `emit_base` (4), `emit_rep` (1)
+   and `typecheck` (1) is inside a comment.
+2. **The sixteen (not seventeen) map-VALUE sites remain ONE arena migration** and the blocker is
+   unchanged and re-verified: `mvSlotOfMapName` / `mvShapeOfMapName` / `mapValKindLowerable` all
+   take a NAME, and their callers hold `lt.tyName` / an atom spelling, not a node. `mvValTyIx`
+   already exists and `mvValTyIxAt` already serves six arena duals off it — the missing piece is a
+   node index at the three homes, which is a bank-at-the-intern-site problem.
+3. **`nullablePartOf` is unmoved at 29 in `emit_classify.vl`** and this slice confirms #1146's
+   reading: what remains genuinely BRANCHES on nullability, and the next reduction is `TyNullable`
+   off `nodeTyIx`, not another home.
+4. **`emit_query.vl` is at its floor for a name-side dedup, and the arena leg is a MODULE-GRAPH
+   move, not a sweep.** Its two CORE calls are `paramArray` (`nameIsI32Array`) and
+   `paramStringArray` (`nameIsStringArray`), two of SIX one-line siblings (`paramF64Array`,
+   `paramF32Array`, `paramI64Array`, `paramMap`) sharing the grammar
+   `nameIsXArray(tyNameOf(paramTypeNode(fnIx, name)))`. They ask six DIFFERENT questions of one
+   already-shared accessor, so there is no dedup left.
+   The only move is the arena-first leg `letIs*Array` already has — and **`annRepKindOf` is not
+   reachable from where these six live**: it is defined in `emit_classify.vl`, which **imports**
+   `emit_query.vl` (line 199), so calling it there is an import cycle. Its body is four lines over
+   `repOfNode`, which lives in `emit_rep.vl` — and `emit_rep.vl` imports only
+   `ast`/`emit_base`/`emit_state`/`typecheck`, **not** `emit_query`. So the leg IS available, by
+   importing `repOfNode` directly or by moving `annRepKindOf` down into `emit_rep.vl`; it is a
+   one-function relocation first and a migration second. Even then it is a LADDER — CORE-neutral
+   unless total, and a bank-first probe in front of a resolver that already cheap-rejects — so
+   **measure the coverage at those six sites before taking it.** This slice declined it rather than
+   ship a metric-neutral work regression.
+5. **The third `refArrElemKeyDeferred` copy (`unionListElemMapFieldMember`) uses `a.length > 2`
+   where the two folded copies use `nameIsArray(a)`.** Reconciling them is a latent-bug fix needing
+   its own fixture, not a dedup — the two guards diverge on any non-array spelling longer than two
+   characters, and they agree today only because that copy sits inside a `nameIsRefArray(a)` arm.
+
+### Method notes earned
+
+106. **A construction argument can be PROVABLE and still not license the deletion.** TARGET 1's
+    argument ("`msMemberAtomsOf` cannot decline for a registered row") is true, and closing it took
+    three facts — three `unNames.push` sites, each straight-line-paired with `recordUnMemTys`; the
+    recorder splitting the set exactly once; and the one reset clearing rows and columns together.
+    It licenses nothing, because the fall-through's live population is the *un*registered name,
+    where `splitUnionAtoms` is the IDENTITY path rather than a backstop. **Ask what the line does
+    for the population the argument does NOT cover, before deleting on the strength of the
+    population it does.**
+107. **A resolver PAIR that looks like one call is often a guard that carries rejections the other
+    half lacks.** `nameIsRefArray` refuses a top-level arrow and a literal-union array;
+    `refArrElemName` answers both. Seven copies existed because each site had to re-decide that. The
+    home must keep the guard — the collapse is `f(x) if g(x)`, never `f(x)`.
+108. **When 16 copies of one preamble are really 2 preambles, say which 4 are the other one and
+     why.** The four registration-path copies of the union-arm grammar differ from the twelve by a
+     single `unionMemberSetOf` call, which is invisible in a diff and decisive at the API. Splitting
+     them into two named homes turns an unwritten invariant into a readable one — and the sabotage
+     that tests it (SAB-H3) coming back inert is a *finding about the corpus*, not a licence to
+     merge them.
