@@ -7898,6 +7898,64 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   0
 }
 
+// ── numeric-opcode intrinsics ────────────────────────────────────────────────
+// The IEEE bitcasts. A bitcast moves no bits: the same 32/64-bit pattern is simply
+// read at the other type, which is what makes float state hashable, a NaN payload
+// canonicalizable, and bit-level range reduction expressible. Each is exactly one
+// wasm instruction, so there is no import, no runtime, and nothing for the linker.
+const OP_I32_REINTERPRET_F32 = 0xbc
+const OP_I64_REINTERPRET_F64 = 0xbd
+const OP_F32_REINTERPRET_I32 = 0xbe
+const OP_F64_REINTERPRET_I64 = 0xbf
+// `emitBitcastIntr`'s "this name is not an intrinsic" answer, distinct from its
+// success (0) and its failure (-1) — the caller falls through to its own error.
+const NUM_INTR_NONE = -2
+
+// One single-BYTE numeric instruction: the whole encoding IS the opcode byte (no
+// immediates), so writing the byte writes the instruction.
+function fbNumOp(op: i32) {
+  wU8(op)
+  0
+}
+
+// Lower `f32bits` / `f64bits` / `f32fromBits` / `f64fromBits`: push the argument at
+// the source type, then the one reinterpret instruction. Returns `NUM_INTR_NONE` when
+// `name` is not one of them. The argument rides the coercing emitters, so an i32 in
+// f64 position converts exactly as it would at any other f64 boundary — the CAST is
+// ordinary, only the reinterpretation is not.
+function emitBitcastIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
+  if (
+    name != "f32bits" &&
+    name != "f64bits" &&
+    name != "f32fromBits" &&
+    name != "f64fromBits"
+  ) {
+    return NUM_INTR_NONE
+  }
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 1 {
+      return emitFail("emitProgram: " + name + " takes exactly one argument")
+    }
+    const arg = c.callArgs[0]
+    if name == "f32bits" {
+      if emitExprAsF32(body, arg, fnIx) < 0 { return -1 }
+      return fbNumOp(OP_I32_REINTERPRET_F32) // 0xbc i32.reinterpret_f32
+    }
+    if name == "f64bits" {
+      if emitExprAsF64(body, arg, fnIx) < 0 { return -1 }
+      return fbNumOp(OP_I64_REINTERPRET_F64) // 0xbd i64.reinterpret_f64
+    }
+    if name == "f32fromBits" {
+      if emitExpr(body, arg, fnIx) < 0 { return -1 }
+      return fbNumOp(OP_F32_REINTERPRET_I32) // 0xbe f32.reinterpret_i32
+    }
+    if emitExprAsI64(body, arg, fnIx) < 0 { return -1 }
+    return fbNumOp(OP_F64_REINTERPRET_I64) // 0xbf f64.reinterpret_i64
+  }
+  NUM_INTR_NONE
+}
+
 // Node shapes read: Call { callFn: i32, callArgs: i32[] }, callee Ident { identName }.
 function emitCall(body: i32[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
@@ -8144,6 +8202,12 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         if exprIsClosure(c.callFn, fnIx) {
           return emitCallRef(body, callIx, fnIx)
         }
+        // The NUMERIC-OPCODE intrinsics (the IEEE bitcasts): one wasm instruction over
+        // the argument, no import and no runtime. Reached only where the name resolved
+        // to no function and no closure value, which IS the shadowing rule the checker
+        // types against — a program that defines its own `f32bits` calls its own.
+        const bcRc = emitBitcastIntr(body, callIx, fnIx, callee.identName)
+        if bcRc != NUM_INTR_NONE { return bcRc }
         return emitFail("emitProgram: call to unknown function")
       }
       // A direct call to a CAPTURING lifted function (`add(10)` where `add` captures `n`

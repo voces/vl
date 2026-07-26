@@ -8484,6 +8484,66 @@ function guardFactOf(exprIx: i32, paramNames: string[]) {
   -1
 }
 
+// ── numeric-opcode intrinsics ────────────────────────────────────────────────
+// The operations that ARE a single wasm instruction: the IEEE bitcasts. They are
+// not a library — there is no runtime behind them, only an opcode — so the checker
+// types them here and the emitter writes the byte.
+//
+//   f32bits(x: f32): i32      i32.reinterpret_f32
+//   f64bits(x: f64): i64      i64.reinterpret_f64
+//   f32fromBits(b: i32): f32  f32.reinterpret_i32
+//   f64fromBits(b: i64): f64  f64.reinterpret_i64
+//
+// These are the bit-exact primitives deterministic code is built on: hashing float
+// state, canonicalizing a NaN payload, bit-level range reduction.
+
+// Is `name` bound by the PROGRAM — a declared function (hoisted, so a forward
+// reference counts) or any in-scope binding? A user definition wins over the
+// intrinsic of the same name, so adding an intrinsic can never capture a call that
+// already resolved to the program's own function. The emitter reads the same rule
+// off its collected function table (`fnIndexOf`), which the same declarations fill.
+function numIntrShadowed(name: string) {
+  if (fnDeclIx[name] ?? -1) >= 0 { return true }
+  lookup(name) >= 0
+}
+
+// The ARGUMENT type of the bitcast named `name`, or -1 when it is not a bitcast.
+function bitcastArgTy(name: string) {
+  if name == "f32bits" { return TY_F32 }
+  if name == "f64bits" { return TY_F64 }
+  if name == "f32fromBits" { return TY_I32 }
+  if name == "f64fromBits" { return TY_I64 }
+  -1
+}
+
+// The RESULT type of the bitcast named `name` — the SAME 32/64 bit width read at the
+// other type, which is the whole point: no value conversion, only a reinterpretation.
+function bitcastRetTy(name: string) {
+  if name == "f32bits" { return TY_I32 }
+  if name == "f64bits" { return TY_I64 }
+  if name == "f32fromBits" { return TY_F32 }
+  if name == "f64fromBits" { return TY_F64 }
+  -1
+}
+
+// Type the bitcast call `name(arg)`, or -1 when `name` is not a bitcast. Arity and the
+// argument type are checked here; `assignableExpr` (not bare `assignable`) so a float
+// LITERAL argument re-encodes into an `f32` parameter, matching every other f32 position.
+function bitcastCallTy(name: string, n: Call, ix: i32) {
+  const want = bitcastArgTy(name)
+  if want < 0 { return -1 }
+  const args = n.callArgs
+  if args.length != 1 {
+    tErr(name + " expects 1 argument, got " + i32ToStr(args.length), ix)
+  } else {
+    const got = checkNode(args[0])
+    if !assignableExpr(args[0], got, want) {
+      tErr(name + " expects " + tyToStr(want) + ", got " + tyToStr(got), ix)
+    }
+  }
+  bitcastRetTy(name)
+}
+
 // A call expression: array-method builtins (`xs.push`), string-method builtins
 // (`.slice`/`.indexOf`/`.includes`/`.charCodeAt`), the `print`/`fromCodePoint`
 // builtins, then the generic function-call path (arity + per-arg assignability).
@@ -9036,6 +9096,14 @@ function checkCallNode(n: Call, ix: i32) {
         }
       }
       return TY_VOID
+    }
+    // The NUMERIC-OPCODE intrinsics: each lowers to exactly one wasm instruction, so
+    // the checker only has to type them. A user BINDING of the same name shadows the
+    // intrinsic (`numIntrShadowed`), and the emitter gates on the same rule — the
+    // intrinsic arm is a fallback for a name the program did not define itself.
+    if !numIntrShadowed(cfn.identName) {
+      const bcTy = bitcastCallTy(cfn.identName, n, ix)
+      if bcTy >= 0 { return bcTy }
     }
   }
   const fnTy = checkNode(n.callFn)
