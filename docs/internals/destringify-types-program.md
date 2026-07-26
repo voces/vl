@@ -16810,3 +16810,400 @@ channel generates. **PUBLISHED BLIND SPOT, not a clean bill of health.**
    shape, union arm, intersection) rather than hand-building shapes: **hand-built shapes compared
    candidate-vs-merged are how the original attribution went wrong, and a control that must pass is
    the whole difference.**
+
+## D-ARMNAMELEG — the union-arm field-path guards were never uncovered; their NAME leg was DEAD, and a typed-IR net answers for all 356 of their positive answers (#PRNUM)
+
+**Slice: `compiler/emit_classify.vl` only** (plus this doc). Branched at `65347c2` (#1155) and
+**rebased onto `b7cc723`** after #1156 (D-QUOTEWALK/A + D-FINDFOLD) landed mid-slice.
+**Every number below is re-taken at the gating head `b7cc723`, in one session**, against a master
+compiler built in that same session (1,024,084 B, proved a fixpoint before use). **Nothing is
+inherited — and re-measuring overturned the hand-off's headline TARGET, its fixture request, and one
+of its own refutations.**
+
+**The rebase mattered and was re-verified rather than assumed.** #1156 rewrote `emit_base.vl` —
+which moves the tree-wide totals (OFF-LIST 33 → 31, TRUE 350 → 348) and retires two hand-written
+bracket walks (`tyTopLevelIndexOf`, `tyTopLevelSplit`, 11 → 9 tree-wide) — but **did not touch
+`emit_classify.vl`**; the code commit replayed with no edit, the doc conflict was append/append
+(resolved keeping both sides whole, **0 deletions from either parent**, asserted line-by-line), and
+**every delta below is identical either side of the rebase**: −3 CORE, −1,139 B, and all 21
+invocation counters at 0. Quoting the pre-rebase base here would be wrong by 2 off-list.
+It also grew the corpus by one file (1,340 → **1,341**), which is why every corpus population moves
+by one and no probe count does.
+
+### Scoreboard at this base, and the delta
+
+Re-measured with an independently re-derived `parsercount.py` (unit: **non-comment CALL SITES** of
+the 23-resolver CORE list + #1141's off-list table, definition headers excluded). It reproduces
+#1155's published base **to the unit**:
+
+| | CORE | OFF-LIST | TRUE |
+|---|---|---|---|
+| master `b7cc723` | **317** | **31** | **348** |
+| this PR | **314** | **31** | **345** |
+| delta | **−3** | **0** | **−3** |
+
+All −3 are in `emit_classify.vl` (**177 → 174**, of which 175 → 172 core + 2 off, unmoved). Per
+resolver in that file: `annArrowAt` **19 → 18**, `nameIsMap` **9 → 8**, `peelGroupParens` **6 → 5**.
+`emit_query.vl` is **unmoved at 2** — see TARGET 3, which is REFUTED rather than declined.
+**0 added, 0 laddered, 0 sidecars.**
+
+**THE WALK-COPY METRIC DOES NOT MOVE, AND SAYING SO IS THE POINT.** A newly written scanner
+(`walkcount.py`: a function holding both a per-character `.length` scan and a depth counter mutated
+on bracket-character literals) reproduces #1155's breakdown exactly and independently —
+**9 tree-wide at `b7cc723`** (11 at `65347c2`; #1156 retired `tyTopLevelIndexOf` and
+`tyTopLevelSplit`), of which 3 are the published homes (`tyGroupWrapsWhole` in `emit_base`,
+`tyTopIndexOf` / `tyGroupEndIndex` in `typecheck`), 1 is the source FORMATTER
+(`format.splitTopLevel`), and **5 are the COPIES, all in `emit_classify.vl`**
+(`shapeFieldParse`, `splitUnionArmsAllDepth`, `annRetKind`, `unionArmSigKey`, `monoUnwrapParens`).
+This slice leaves that at **9 / 5 COPIES, unchanged** — the grammar it retires is a field-TABLE
+walk, not a bracket-depth walk. Quoting a −1 there would be wrong. (#1156 quotes the same metric as
+"8+2 → 6+2"; that is a different UNIT — it excludes the formatter and counts the homes separately —
+and both readings agree that the COPY count, the number that should go to zero, is **5**.)
+
+Compiler binary **1,024,084 → 1,022,945 = −1,139 B** (the same −1,139 either side of the rebase).
+Source: CODE lines **12,186 → 12,090** (**−96**), comment lines **6,740 → 6,731** (−9).
+Diff: **+74 / −184**.
+
+### TARGET 1 — the hand-off asked for a fixture. The fixture already exists, the classifiers ARE covered, and what is dead is the thing #1155 sabotaged
+
+The hand-off's headline item:
+
+> *"Five classifiers whose own headers name the silent-invalid-wasm bugs they prevent have ZERO
+> regression coverage on either channel … those five bugs can come back silently. Write [the
+> fixture] first."*
+
+**Measured, and it is wrong.** Probe **PA** instruments all five consumers
+(`unionStructArmMapFieldMember`, `unionStructArmMapListElemIndex`,
+`identRebindUnionArmClosureField`, `calleeIsUnionArmClosureMember`,
+`calleeIsUnionArmCloArrayIndex`) for reach · arena-COVERED · **YES** (a positive answer) · name-leg
+taken, driven through `probehost.ts` over the whole corpus (1,341 `.vl` files = **1,313 cases**; 28
+multi-file module directories drive as one case each):
+
+| consumer | reach | arena covered | **YES** | NAME leg |
+|---|---|---|---|---|
+| `unionStructArmMapFieldMember` | 21 | 21 | **8** | **0** |
+| `unionStructArmMapListElemIndex` | 8 | 8 | **4** | **0** |
+| `identRebindUnionArmClosureField` | 1 | 1 | **1** | **0** |
+| `calleeIsUnionArmClosureMember` | 8 | 8 | **8** | **0** |
+| `calleeIsUnionArmCloArrayIndex` | 1 | 1 | **1** | **0** |
+| **TOTAL** | **39** | **39** | **22** | **0** |
+
+**23 corpus files reach them and 22 of the 39 reaches are POSITIVE answers** — the reservations the
+headers describe. Printed rather than counted, they include exactly the files written for the named
+bugs: `maps/union-arm-map-list-elem-read.vl`, `maps/union-array-arm-map-list-elem-read.vl`,
+`unions/nullable-union-struct-nested-map-read.vl`,
+`unions/union-box-field-arm-closure-array-index-call.vl`,
+`closures/rebind-union-arm-closure-field-call.vl`, `unions/variant-closure-field.vl` (5 positives on
+its own), `unions/variant-closure-array-field.vl`, `unions/deep-composite-elem-union-narrowed-reads.vl`,
+`arrays/union-elem-list-field-variant-arm.vl`, `unions/variant-twin-map-elem-list-field.vl`, and
+thirteen more.
+
+**What has zero coverage is not the classifiers — it is their NAME FALL-THROUGH, and that is what
+SAB-S4 sabotaged.** All five consumers have the shape
+
+```vl
+const mems: i32[] = []
+if unionArmTys(un, atoms, mems) { …arena walk…; return false }   // <- a HARD return
+…the name walk over the rendered atoms…                          // <- reached only when it declines
+```
+
+`unionArmTys` covered the row at **39 of 39** reaches, so `unionArmPathLeafIs` was unreachable.
+#1155's SAB-S4 made that unreachable function answer `true` and correctly observed nothing changed.
+
+**And it sabotaged in the HARMLESS direction as well.** Every one of the five headers states the
+asymmetry — *"an over-reservation is a harmless spare local, never invalid wasm"*. `true` is the
+safe answer; forcing it could not have broken anything even had the leg been live.
+
+**The two sabotages that actually test something, both built and both run at this head:**
+
+| sabotage | corpus files differing |
+|---|---|
+| **SAB_A** — the ARENA leaf walk `tyArmPathLeaf` returns −1, so all five guards answer FALSE | **0 of 1,341** |
+| **SAB_NET** — the TYPED-IR NET after them is disabled (`nodeTyUnionHasMapArm` → false; the `nodeTyIxOf(callee) is TyFunc` test in `blockHasCallRef` → dead) | **285 of 1,341** — byte 285 · **stdout 5** · **rc 5** |
+
+**SAB_A's 0 is comparator-PROVED, not blind.** Rebuilding probe PA *on top of SAB_A* reads reach 39
+and covered 39 **unchanged** with **every `YES` gone (22 → 0)**. The sabotage changes 22 real
+answers and the emitted bytes do not move.
+
+**Why: the guards are SUBSUMED by the typed-IR net that sits after them in the same disjunction.**
+`exprHasMapOp` ends its `||` chain with `nodeTyUnionHasMapArm(receiver)` and `blockHasCallRef` with
+`nodeTyIxOf(callee) is TyFunc` — each described in its own comment as *"the typed-IR net for ANY
+receiver/callee spelling the syntactic classifiers above miss"*. Probe **PB** asks, at every one of
+the **9** guard call SITES, whether the net would have answered true whenever the guard did:
+
+| channel | guard-POSITIVE answers | net also true (**subsumed**) | net false (**load-bearing**) |
+|---|---|---|---|
+| corpus, 1,313 cases | **44** | **44** | **0** |
+| fuzz, 33,600 programs | **312** | **312** | **0** |
+| **total** | **356** | **356** | **0** |
+
+**⇒ The five guards are dead weight, and the corpus DOES hold their answers up — through the net,
+which SAB_NET breaks on 285 files, five of them into wrong runtime behaviour.** The fixture the
+hand-off asked for cannot pin the guards, because no program in either channel distinguishes them
+from the net. That is the finding; a sixth, seventh and eighth corpus file of the same shapes would
+have added nothing and none is added here.
+
+### What this slice ships — D-ARMNAMELEG
+
+The NAME leg is deleted: `unionArmPathLeafIs` (the 27-line two-table field-path walk), its five
+`want`-selected wrappers, and the five consumers' fall-through loops. Where the arena declines, the
+answer is now **`armPathArenaDeclined()` — the constant `true`**, with the reason in one place:
+
+> It is `true`, and that is the ONLY sound answer — every one of those five guards exists to RESERVE
+> a frame slot the narrowing-blind pre-pass would otherwise miss, and each one's own header states
+> the asymmetry: an over-reservation is a harmless spare local; an under-reservation is invalid wasm.
+> So a guard that does not KNOW must say yes.
+
+**This is strictly safer than what it replaces.** The retired walk could answer FALSE — the unsound
+direction — from a *re-parse of a rendered atom*, three lines below a structural walk over the same
+arms. It never did, because it never ran.
+
+**Probe PD measures the new decline path on BOTH channels, with the comparator in the same
+instrument:**
+
+| build | channel | guard reaches | **decline fires** |
+|---|---|---|---|
+| candidate | corpus, 1,313 cases | 39 | **0** |
+| candidate | fuzz, 33,600 programs | **136** | **0** |
+| forced-decline control | corpus | 32 | **32** |
+| forced-decline control | fuzz | 129 | **129** |
+
+**175 reaches, 175 arena-covered, 0 declines** — and the same `print` fires **161** times in the
+control, so the 0 is a measurement. (The control reads 32/129 rather than 39/136 because answering
+`true` early short-circuits the `if !isVal && …` chain in `blockHasCallRef`, which is itself
+evidence the sabotage is live.) The corpus 39 reproduces probe PA's 39 through a **different
+instrument on a different build**.
+
+### TARGET 3 — the `emit_query` construction argument is REFUTED, at a 260-reach residue
+
+#1155 declined the arena LADDER on its arithmetic and named the route past it:
+
+> *"A slice that establishes `rdCovered == 0 ⇒ not a scalar-element list` BY CONSTRUCTION can DELETE
+> the name leg rather than ladder in front of it, taking `emit_query` to CORE 0."*
+
+Probe **PQ** re-instruments the five `param*Array` predicates (importing `repOfNode` from
+`emit_rep` — #1155's P3 edge, re-proved to build here) and adds the decomposition the argument turns
+on: **why** an uncovered reach is uncovered.
+
+| site | reach | `paramTypeNode == −1` | covered | name YES | **YES & uncovered** | **disagree** |
+|---|---|---|---|---|---|---|
+| `paramArray` | 6,107 | 4,125 | 1,914 | 267 | **0** | **0** |
+| `paramStringArray` | 8,889 | 7,506 | 1,308 | 94 | **0** | **0** |
+| `paramF64Array` | 8,948 | 7,657 | 1,207 | 55 | **0** | **0** |
+| `paramF32Array` | 6,323 | 5,668 | 648 | 10 | **0** | **0** |
+| `paramI64Array` | 6,295 | 5,664 | 605 | **0** | **0** | **0** |
+| **TOTAL** | **36,562** | **30,620** | **5,682** | **426** | **0** | **0** |
+
+The **426** positives reproduce #1155's 426 exactly, on a different harness with a different
+denominator — so the agreement half of its measurement is confirmed. **The construction argument is
+not.**
+
+- **30,620 of the 30,880 uncovered reaches (99.16%) ARE by construction**: `paramTypeNode` returned
+  −1, and `tyNameOf(-1)` is `""` by its own definition, so the name predicate answers false for the
+  same reason the arena declines. That much is a real lemma.
+- **The residue is 260 reaches** where a genuine annotation node exists and `repOfNode` still
+  declines — and **every one of them has `nodeTyIxOf(nd) >= 0`** (probe PQ2: 260 `u-typed`, **0**
+  `u-notyped`). So the decline is *not* "the checker knows nothing about this node".
+- **145 of the 260 are the plain spelling `i32`.** `repOfTyFlat` covers `TyPrim i32` — the decline
+  there is structural, not ignorance. The rest are composites the flat derivation deliberately
+  leaves to the name ladder (`Node[]`, `i64[][]`, `{[string]:i32}|null`, `(P|null)[]`, `T`, …).
+- **None of the 260 is spelled as one of the five scalar lists** — which is why `uncovLive` is 0.
+
+**⇒ `rdCovered == 0` is a *structural* verdict about a type the arena fully understands, not a proxy
+for "unknown", so no `declined ⇒ not a scalar list` lemma can be derived from it.** The 0 on the
+residue is a measurement over 260 reaches, and a measurement cannot license deleting the name leg
+when the argument's whole value was being a construction. `emit_query` stays at **CORE 2**, and this
+is a refutation, not a decline — the route named in #1155's hand-off does not exist as stated. What
+would establish it is a *checker-side* lemma ("every `TypeRef` annotation node spelling `i32[]` /
+`string[]` / `f64[]` / `f32[]` / `i64[]` has a recorded `nodeTyIx` that `repOfTyFlat` classifies"),
+which lives in `typecheck.vl`, not here.
+
+### Refutations (worth more than the agreement)
+
+1. **TARGET 1's premise is WRONG.** The five classifiers do not have "ZERO regression coverage on
+   either channel": **23 corpus files** reach them for **39 reaches and 22 positive answers**, and
+   the fuzz channel reaches them **136** times. What has zero coverage is the NAME FALL-THROUGH.
+   **Printing the sites is what separated the two.**
+2. **#1155's SAB-S4 sabotaged the wrong function, in the harmless direction.** It forced the
+   *unreachable* `unionArmPathLeafIs` to `true` — the direction all five headers name as safe. The
+   two real sabotages are SAB_A (**0 of 1,340**, comparator-proved by re-running PA on it) and
+   SAB_NET (**285 of 1,340**, 5 into wrong runtime behaviour). **An inert sabotage can be sabotaging
+   the wrong function.**
+3. **The specific fixture shape the hand-off named ALREADY EXISTS.** *"`unionStructArmMapListElemIndex`
+   additionally wants the INDEXED-root form (`t0[i].f[0][k]`)"* is
+   `tests/cases/maps/union-array-arm-map-list-elem-read.vl`, in the corpus at that base, and PA shows
+   it reaching that consumer with a positive answer. Twelfth vindication of RE-MEASURE THE HAND-OFF.
+4. **TARGET 3's construction argument is REFUTED** at a 260-reach residue whose uncoveredness is
+   structural, not ignorance (145 of it is the spelling `i32`, a type the arena fully covers).
+5. **#1155's "the union-arm field-path family is a population the generator cannot reach" is wrong
+   about the family.** The generator reaches the five CONSUMERS **136 times** over 33,600 programs
+   and produces **312** positive answers there. What it cannot reach is the arena DECLINE — a much
+   narrower claim, and the right one.
+6. **This slice moves the walk-COPY metric by ZERO and says so.** The retired grammar is a
+   field-TABLE walk (struct row → variant row → per-field lowering codes), not a bracket-depth walk.
+   The metric stands at **11 tree-wide / 5 COPIES**, independently re-derived.
+
+### The work check — a "no behaviour change" gate CANNOT see a work regression
+
+Both sides instrumented with per-function EXECUTION counters (16 in `emit_classify`, 5 in
+`emit_base`), reset at the top of `emitProgram` — so this is emit-phase work — over the same 1,138
+building corpus programs (the count `refresh`-clean at this head).
+
+**21 counters · 2,043,554 executions on each side · EVERY delta exactly 0.**
+
+| counter | master | this PR | delta |
+|---|---|---|---|
+| `nameIsArray` | 869,544 | 869,544 | 0 |
+| `nullablePartOf` | 426,648 | 426,648 | 0 |
+| `annArrowAt` | 307,762 | 307,762 | 0 |
+| `nameIsMap` | 210,199 | 210,199 | 0 |
+| `structIndexByName` | 90,835 | 90,835 | 0 |
+| `nameIsRefArray` | 74,888 | 74,888 | 0 |
+| `refArrElemName` | 35,258 | 35,258 | 0 |
+| `unionMemberTysOf` | 9,652 | 9,652 | 0 |
+| `refArrElemNameIf` | 6,242 | 6,242 | 0 |
+| `peelGroupParens` | 6,075 | 6,075 | 0 |
+| `unionArmsOf` | 1,444 | 1,444 | 0 |
+| `unionStructArmMapFieldMember` | 1,381 | 1,381 | 0 |
+| `unionStructArmMapListElemIndex` | 1,373 | 1,373 | 0 |
+| `unionArmTys` | 1,181 | 1,181 | 0 |
+| `identRebindUnionArmClosureField` | 725 | 725 | 0 |
+| `calleeIsUnionArmCloArrayIndex` | 120 | 120 | 0 |
+| `calleeIsUnionArmClosureMember` | 119 | 119 | 0 |
+| `tyArmPathLeaf` | 61 | 61 | 0 |
+| `unionHasClosureArm` | 47 | 47 | 0 |
+| **`unionArmPathLeafIs`** (master only) | **0** | — | — |
+| **`armPathArenaDeclined`** (this PR only) | — | **0** | — |
+| **TOTAL** | **2,043,554** | **2,043,554** | **0** |
+
+**The two zeros are comparator-proved in the same build:** 19 of the 21 counters are non-zero and
+were installed by the identical patcher through the identical `emitFail` report path, so a 0 is the
+program's behaviour and not a silent instrument. `unionArmPathLeafIs` reading **0** is the
+retiring code's own execution count, measured by a *third* instrument (after PA and PD) and agreeing
+with both. **A rename can hide a 3,545-call relocation (#1155's H3); here there is nothing to
+relocate, because the deleted code never ran.**
+
+**WHAT THIS INSTRUMENT DOES NOT COVER.** It counts CALLS, not allocations. The deleted leg allocated
+nothing on any measured path (it never ran), and the replacement is a constant — so there is no
+allocation axis to hide a regression in. It also cannot see work inside the arena walk, which is
+untouched (`tyArmPathLeaf` reads 61 on both sides).
+
+### Gate — every RC checked explicitly
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh` | **RC=0**, 1,022,945 B |
+| `native-fixpoint.sh` | **RC=0** — stage3 == stage4 byte-for-byte (1,022,945 B) |
+| `lint-self.sh` (after `vl fmt`; fmt changed one line, and the re-build is byte-identical) | **RC=0**, self-lint + fmt-check clean |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **RC=0 — 2,055 passed / 0 failed / 14 ignored**; the master baseline re-run in the SAME session with the SAME command — **master SOURCE and master SEED**, see the harness note below — reads **2,055 / 0 / 14**, and the ignored-test **NAME SETS are identical** (diffed, 14 names) |
+| corpus A/B (wasm sha256 + build rc + normalised message + run rc + stdout, per input) | **1,341 rows, 0 differences** |
+| lint-tier A/B (`vl check` over the same 1,341 files) | **1,341 rows, 0 differences** |
+| fuzz A/B (14 seeds × 3 depths × {plain, declared} × 200) | **33,600 programs/side, 0 differences** |
+| `rep-fuzz-check.sh` | **RC=0** — `exact ✅ (1 baselined failure — 0 unsound, 1 reject; 0 new, 0 stale)` |
+| invocation counts both sides | **21 counters, 2,043,554 → 2,043,554 (+0)**, every delta 0 |
+
+**A WORKTREE HAS NO `scripts/vl-host/target/release/vl` AND NO SEED, SO EVERY NATIVE SUITE
+SELF-IGNORES.** Both were copied in before any measurement, and the ignored-name SET was diffed
+between the two same-session suite runs (14 names, identical) so the 2,054 is a full suite on both
+sides, not a third of one.
+
+**Channel populations, so no 0 is an empty run.** Corpus (side A): **1,138** build clean · 203 build
+rejects · **1,134 distinct wasm hashes** · 1,098 rows produce stdout (937 distinct) · 2 distinct
+build rcs · 2 distinct run rcs. Lint tier: **192** rows carry an `[ERROR]/[WARN]/[INFO]`, **762
+distinct** check outputs over 1,341 rows. Fuzz (side A): **32,060** build clean · 1,540 build
+rejects · **22,374 distinct wasm hashes** · 1,541 non-zero run rcs. The A/B candidate is
+**byte-identical** (md5 `73eba827c2865107f48ebb68d354abeb`) to the `refresh-compiler.sh` output the
+fixpoint gate proved, so every leg tested the shipped artefact.
+
+**⚠️ SECOND HARNESS DEFECT, caught by a line that should not have printed.** The first attempt at
+the master-baseline suite used `git stash push compiler/emit_classify.vl` — which after the rebase
+found **"No local changes to save"**, because the slice is a COMMIT, not a working-tree edit. It ran
+the CANDIDATE source against the master seed and reported a perfectly plausible 2,055 / 0 / 14. The
+re-run uses `git checkout b7cc723 -- compiler/emit_classify.vl`, verifies the tree is dirty, and
+restores after. **A baseline harness that silently measures the candidate produces exactly the
+answer you expected — the only tell was a status line.**
+
+**⚠️ HARNESS DEFECT, caught by implausible magnitude.** The first fuzz A/B run reported every channel
+population as **0** while `DIFFERING` read 0 too. Cause: the aggregator globbed `grep … "$OUT"/A/*`
+over 33,600 files and hit `Argument list too long`, so the population lines were `grep`'s failure,
+not the run's. Rebuilt with `find -exec`: 32,060 / 22,374 / 1,541. **A 0 next to a 0 is exactly where
+a harness failure hides — the DIFFERING=0 was real and the populations beside it were not.** Same
+class as #1155's `^`-anchored grep reading 182 of 1,137.
+
+**PUBLISHED FUZZ BLIND SPOT.** `scripts/fuzzgen.vl` emits SINGLE FILES, so the module-merge paths are
+corpus-only. It *does* reach the five guards (136 reaches, 312 positive answers over 33,600
+programs — #1155's note that it cannot is corrected above), but it never produces an arena DECLINE at
+them, so the new `armPathArenaDeclined` path has 0 coverage on both channels and is entombed by the
+forced-decline control (161 fires) rather than by a pin.
+
+### Entombment — graded, and the grade is different from #1155's
+
+This is a behaviour-preserving refactor, so by the standing rule it cannot have a pin that fails on
+master. #1155 graded entombment DOWN because it believed the shapes were unreachable. **The correct
+grade is different and better in one direction, worse in another:**
+
+- **BETTER: the shapes ARE reached and ARE exercised** — 23 corpus files, 39 reaches, 22 positive
+  answers, plus 136 fuzz reaches and 312 fuzz positives. The refactored consumers run on real
+  programs on both channels.
+- **WORSE: no sabotage of these guards can fail, and now we know WHY.** It is not corpus poverty
+  (#1155's reading) — it is that the typed-IR net answers identically at **356 of 356** positive call
+  sites. SAB_NET (**285 of 1,340**, 5 into wrong runtime behaviour) shows what the corpus is really
+  pinning.
+- The new decline path itself is entombed only by the forced-decline control, and that is stated
+  rather than averaged away.
+
+### Hand-offs, each with its measurement
+
+1. **THE FIVE UNION-ARM FIELD-PATH GUARDS ARE DEAD WEIGHT — ~440 lines and, MEASURED, ZERO further
+   CORE calls — AND THE DELETION IS DECLINED HERE, WITH THE ARITHMETIC.** Counted rather than
+   guessed: the five consumers span **342 lines** and the `tyArmPathLeaf` / `tyArmElem` / five
+   `tyArmPath*` walk they alone use adds ~100 more, and **`parsercount.py` finds no CORE and no
+   off-list call left in any of them** — after this slice the family is fully destringified, so what
+   remains is dead weight, not string-shaped weight, and deleting it would move the scoreboard by 0. `unionStructArmMapFieldMember`,
+   `unionStructArmMapListElemIndex`, `identRebindUnionArmClosureField`,
+   `calleeIsUnionArmClosureMember` and `calleeIsUnionArmCloArrayIndex` are subsumed by the typed-IR
+   net at **356 of 356** positive answers across 1,313 corpus cases and 33,600 fuzz programs, and
+   SAB_A (all five answering false) is **byte-identical on 1,341 corpus entries**. That is a
+   measured 0 for a guard whose failure mode is **silent invalid wasm**, and the program's own rule
+   is that "dead by construction" beats "measured at 0". **What would license the deletion is a
+   construction argument that `nodeTyIxOf` is populated for every receiver/callee these five can
+   answer TRUE for** — precisely the `nodeTyIx`-coverage question C1's endgame is about, and
+   precisely where the known monomorphized-clone hole lives. Establish that and ~440 lines go.
+2. **`emit_query` stays at CORE 2 and the named route to CORE 0 does not exist.** `rdCovered == 0`
+   is a structural verdict, not an ignorance proxy: 260 reaches decline with a recorded arena type,
+   145 of them spelled plain `i32`. The remaining lever is a checker-side lemma in `typecheck.vl`
+   (every `TypeRef` annotation spelling a scalar list has a classifiable `nodeTyIx`), not an
+   `emit_query` change. Measured inputs: 36,562 reaches · 30,620 with no annotation node at all ·
+   5,682 covered · 426 positives · 0 uncovLive · 0 disagreements.
+3. **The code-axis census in `emit_classify` is now FLAT, and that is the news.** After #1146,
+   #1155 and this slice, the 172 remaining CORE calls spread over ~90 enclosing functions with the
+   largest single concentration at **12** (`refArrShapeKind`), then 10 (`refArrElemName`), 9
+   (`mvValKindOfName`), 6, 6, 6, 6. There is no 25-call grammar left to find in this file. The
+   next −10 there is many small migrations or one authority change, not another dedup.
+4. **`unionArmTys`' own decline is now the single fall-through for the whole family** — one call
+   site, one constant. If `unionMemberTysOf` is ever shown total for these five roots, that constant
+   and the `atoms` array with it can go, and the five consumers become pure arena walks.
+
+### Method notes earned
+
+114. **AN INERT SABOTAGE CAN BE SABOTAGING THE WRONG FUNCTION — CHECK WHICH LEG IS LIVE FIRST.**
+     #1155's SAB-S4 correctly measured 0 on 1,340 + 33,600 and drew the wrong conclusion ("these
+     guards have no coverage"), because the function it broke sat behind a hard `return` that an
+     arena leg took at 39 of 39 reaches. **Before grading a sabotage inert, instrument the branch
+     that reaches it.** The tell was available for free: the consumers' own call counts (1,381 and
+     1,373) were never zero.
+115. **A GUARD'S COVERAGE AND A GUARD'S PIN ARE DIFFERENT QUESTIONS, AND ONLY THE SECOND NEEDS A
+     SABOTAGE.** 23 corpus files reach these five and 22 answers are positive — full coverage — and
+     *no sabotage of them can fail*, because a later disjunct answers the same. "Uncovered" and
+     "unpinnable" were conflated for a whole slice. The distinguishing probe is not a sabotage of
+     the guard; it is asking, at the guard's own call site, **what the rest of the disjunction would
+     have said**.
+116. **THE DECLINE OF A DELIBERATELY PARTIAL DERIVATION IS NOT A PROXY FOR IGNORANCE.**
+     `rdCovered == 0` reads on 145 corpus reaches whose type is plain `i32` — a type `repOfTyFlat`
+     covers. Any argument of the form "the arena declined, therefore it cannot be an X" is unsound
+     for a partial derivation whose declines are structural choices. Decompose an uncovered
+     population by WHY before building a construction argument on top of it.
+117. **A 0 NEXT TO A 0 IS WHERE A HARNESS FAILURE HIDES.** The fuzz A/B reported `DIFFERING: 0`
+     (real) with every channel population also `0` (a `grep: Argument list too long`). The result
+     line and the line that makes it meaningful failed independently and looked identical. **Compute
+     the denominators with a different mechanism from the one that computes the answer.**
