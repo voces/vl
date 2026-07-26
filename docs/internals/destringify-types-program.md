@@ -16474,3 +16474,339 @@ check), not through the counter — stated rather than claimed as two independen
      of a collapsed ladder unobservable, which is exactly what makes it easy to pick wrong: the two
      candidate orders here differ by **27×** in helper executions (+100 vs +2,686) with byte-identical
      output. Measure the order, do not argue it.
+---
+## D-QUOTEWALK/A + D-FINDFOLD — the emitter's FIND walk joins the checker's quote-aware home and is DELETED rather than aliased; the 24-cell quote-blind population closes, and a mid-slice REBASE is what took it from 15 to 24 (#1156)
+
+**Base re-measured at TWO heads, because master moved under me mid-slice — and the two readings are
+themselves the finding.** Started at `1c8d911`, where `parsercount.py` reproduces the brief's **CORE
+325 · OFF-LIST 34 · TRUE 359** exactly. #1155 (D-FIELDHOME) landed while the gate was running;
+rebased onto `65347c2` and **re-ran every leg there** with the master baseline compiler rebuilt at
+that head in the same session.
+
+| | master `65347c2` | this PR |
+|---|---|---|
+| **CORE** (23-resolver list) | 317 | **317** (unchanged) |
+| **OFF-LIST** (#1141's table) | 33 | **31** |
+| **TRUE TOTAL** | 350 | **348** |
+| `emit_base.vl` | 51 (48 + 3) | **49 (48 + 1)** |
+| `emit_collect.vl` · `emit_mono.vl` | 54 · 5 | 54 · 5 (untouched) |
+| **hand-written type-name walks** | **8 copies + 2 homes** | **6 copies + 2 homes** |
+| binary | 1,024,539 B | **1,024,084 B** (**−455 B**) |
+
+`tyGtIsClose` 8 → 6 sites: the two ladders deleted here each carried one, and `tyGtIsClose` is on the
+off-list table, so OFF-LIST falls by exactly 2.
+
+### 🔁 THE SAME UNCHANGED DIFF SCORED 15/24 AT ONE BASE AND 24/24 AT THE NEXT
+
+Not one character of `emit_base.vl` differs between the two builds. At `1c8d911` this half closed
+**15 of the 24** quote-blind cells and the residual 9 were *all* inline-object-SHAPE cells, because
+`emit_classify` still carried a SECOND, private definition of `shapeInnerFieldSplit` with its own
+quote-blind ladder. #1155 deleted that copy in favour of `emit_base.shapeInnerFieldSplit`, which
+delegates to `tyTopLevelSplit` — the function this PR makes quote-aware. At `65347c2` the same diff
+closes **24 of 24**.
+
+This is worth more than the number. #1153 filed the second half as a 30-line REWRITE of the private
+copy; #1154, independently, filed it as a ONE-WORD import plus a 44-line deletion, and valued it only
+as "one of the nine remaining ladders (9 → 8)". **They were the same fix, neither slice knew, and
+neither had the other half built.** I built the pair at `1c8d911` before the rebase and measured
+24/24 for the import-and-delete form — then #1155 shipped exactly that. *Two filings, three slices,
+one action: when a hand-off says "necessary but not sufficient", build the sufficient set once and
+say which spelling of the other half you measured.*
+
+### The unit for the walk count, and a census that had to be repaired TWICE
+
+UNIT: one FUNCTION whose body contains a LOOP that maintains a nesting DEPTH counter (or toggles an
+in-string flag) over a type-NAME string. Source-TEXT scanners (`parser`/`lexer`/`format`/`fmt_*`/
+`driver`) are excluded by file. A mechanical sweep at `65347c2` flags **10**; two of them
+(`recordRedundantAnnot`, `recordRedundantRet`) walk `P.toks[t].kind`, i.e. TOKENS, not a type name —
+so **8 copies + 2 homes**, and this PR takes it to **6 + 2**. The remaining six are
+`emit_base.tyGroupWrapsWhole` and `emit_classify`'s `shapeFieldParse`, `splitUnionArmsAllDepth`,
+`annRetKind`, `unionArmSigKey`, `monoUnwrapParens`. At `1c8d911` the same sweep gave 9 + 2 and
+reproduced #1153's table function-for-function.
+
+**MY OWN CENSUS WAS WRONG TWICE, IN OPPOSITE DIRECTIONS, AND BOTH TIMES MAGNITUDE WAS THE TELL.**
+
+1. The first extractor brace-matched bodies over comment-stripped lines and reported
+   `nameIsWholeSpanShape` as **12,220 lines long**. **A `'{'` CHAR LITERAL is a brace to a naive
+   matcher.** Fixed by masking string/char literal CONTENTS for the matcher while keeping the real
+   text for the content tests — the two passes are the same length, so indices still line up.
+2. The repaired extractor then flagged **54** functions, because the predicate was "has a `while` and
+   two grouper char literals" — which catches every `name[0] == '{' && name[n-1] == '}'` shape TEST.
+   **A test is not a walk**: `{v: A, w: B}` cannot be split by a test. Requiring a depth counter
+   gives 10.
+
+*#1154 lost two ladders to a truncating extractor; I gained forty-one to a loose predicate. Validate
+an extractor in BOTH directions — against a function you know has the shape, and one you know does
+not.*
+
+---
+
+### TARGET 1 — the 300-cell matrix rebuilt from scratch, and it reproduces the hand-off CELL FOR CELL
+
+I did not inherit the grade. I re-generated all 300 cells (15 quoted texts — a control `ab` plus
+`a,b` `a|b` `a:b` `a{b` `a}b` `a[b` `a]b` `a(b` `a)b` `a<b` `a>b` `a&b` `a=b` `a=>b` — × 10 positions
+× {plain, nullable}), each a whole program with a known expected stdout so every cell is GRADED.
+Master's quote-blind population — the cells that fail while their own `ab` CONTROL passes — is **24
+cells over 9 characters and 6 positions**, with #1153's per-position breakdown, and it is **identical
+at `1c8d911` and at `65347c2`**:
+
+| position | failing texts | n |
+|---|---|---|
+| `nul` 2-arg generic `P<A,B>` | `,` `{` `}` `[` `]` `(` `)` `<` `=>` | 9 |
+| `nul` 2-field shape `{v:…,w:i32}` | `,` `{` `}` `[` `]` `(` `)` `<` `=>` | 9 |
+| `nul` 1-field shape · `nul` 1-arg generic | `,` `=>` (each) | 4 |
+| `plain` 1-arg generic · `plain` 2-arg generic | `=>` (each) | 2 |
+
+**A CORRECTION TO THE HANDED-OFF GRADE, found by reading a cell instead of trusting its bucket.**
+#1153 published master as `231 ok / 54 reject / 15 invalid-wasm`, and my first run reproduced those
+three numbers exactly. Then `plain_gen_arrow` — filed under `reject` — turned out to print
+`Error: failed to parse WebAssembly module`; my grader, like #1153's, only matched
+`failed to compile: wasm[`. With the classifier repaired, master is **231 ok · 37 reject · 32
+invalid-wasm**: **seventeen cells both of us filed as clean rejects are unparseable modules, and TWO
+of those seventeen are inside the 24-cell quote-blind population.** So for `Box<"a=>b"|"zz">` and
+`P<"a=>b"|"zz",i32>` the defect is not loud at all — it passes `vl check` and dies in the runtime.
+*A bucket label is a claim about a program. Grade them all, then read one.*
+
+### Result at `65347c2`
+
+| | |
+|---|---|
+| cells fixed | **24 of 24** |
+| regressions (ok → not-ok) | **0** |
+| traps / wrong-output / timeouts | **0** |
+| other grade changes | **0** |
+| matrix totals | 231 ok → **255 ok** · 37 reject → 15 · 32 invalid-wasm → 30 |
+
+### The FIND wrapper is DELETED, not left as a one-line alias — and the reason is the work count
+
+The filed diff made `tyTopLevelIndexOf`'s body `tyTopIndexOf(name, sep, 0, 0)`. I built exactly that,
+and the work instrument said it costs **+738,657 call frames over the corpus and +5,027,206 over the
+fuzz set** — one per invocation, paid to permute two arguments. `tyTopLevelIndexOf` had **zero
+cross-module consumers** (grep over `compiler/`, `lsp/`, `std/`) and three call sites, all in
+`emit_base`: `nullablePartOf`, `annArrowAt`, `nameIsStructWithUnionField`. Deleting it and spelling
+the home at those three sites removes every one of those frames and leaves the ten counters otherwise
+bit-identical (verified: the instrumented alias build and the instrumented folded build print the
+same ten numbers). *A one-line delegate is not free, and it is an invitation to a future copy.*
+
+Filed hunk 3 (`annArrowAt` → `tyTopIndexOf`) re-verified STALE at both heads — #1150 made it a
+one-line delegate — and no `skipQuotedName` export is needed: `tyTopIndexOf` has been exported since
+#1143. Re-grepped, not assumed.
+
+---
+
+### The fixture pins the CORRECTED behaviour, and its shape CHANGED at the rebase
+
+`tests/cases/literal-unions/quoted-separator-in-litunion-member.vl`, five `@log` lines, one cell per
+distinct reason the population had: a generic argument (`nul_gen_comma`), a two-argument generic
+(`nul_gen2_lt`), a PLAIN member carrying the arrow (`plain_gen_arrow` — the invalid-wasm one), and
+two inline-object-SHAPE cells (`nul_sh2_comma`, `nul_sh2_rbrace`). Verified RED by RUNNING it on a
+master-built compiler at `65347c2` (`rc=1`, `emitProgram: bare null needs a struct-typed context`)
+and green on the candidate.
+
+**At `1c8d911` the last two lines could NOT ship**, because they are in the residual nine; the file
+committed at that base carried three lines and a header telling the next slice not to add them until
+`emit_classify`'s copy retired. #1155 retired it, and the rebase let them in. **#1153's own filed
+fixture is `nul_sh2_comma` — at `1c8d911` it would have shipped RED**, which is what "pin the
+CORRECTED behaviour, not today's, and ship only what your half actually fixes" costs if you take a
+filed fixture on trust.
+
+### Gate — every leg at `65347c2`, master baseline rebuilt at that head in this session
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh` | RC=0 — master **1,024,539 B**, candidate **1,024,084 B** (**−455 B**) |
+| `native-fixpoint.sh` | stage3 == stage4 byte-for-byte (1,024,084 B) |
+| `lint-self.sh` | RC=0, fmt clean |
+| suite (`SELFHOST_NATIVE_ALIGN=1 deno task test`) | **2,061 passed / 0 failed / 8 ignored** |
+| suite, master **re-measured at this head, same session, same command** | **2,060 / 0 / 8** — delta **+1**, exactly the new fixture; ignored-test NAME SETS **identical**, diffed as sets |
+| corpus A/B | **1,341 files, 1 differing — the new fixture, in the intended direction.** Over the 1,340 PRE-EXISTING entries: **0 differing** on build-rc + wasm SHA + compiler message + run-rc + stdout, every file compared BY NAME |
+| corpus channel populations (side A) | 1,137 produce wasm (1,133 distinct SHAs) · 204 build-rc≠0 · 1,097 produce stdout (936 distinct) |
+| lint-tier A/B (`vl check --severity hint`) | **1,341 rows, 762 carrying ≥1 diagnostic, 0 differing** |
+| fuzz A/B | 12 seeds × 3 depths × 2 modes × 300 = **43,200 programs/side, 0 differing** (whole per-case `--out-dir` trees, `diff -r`) |
+| `rep-fuzz-check.sh` | exact ✅ (1 baselined, 0 unsound, 0 new, 0 stale) |
+| invocation counts, both sides, both channels | below |
+| final artifact | `cmp`-checked byte-identical to the compiler every leg was measured with |
+
+Every leg above was ALSO run to green at `1c8d911` before the rebase (corpus 1,341/1 differing, fuzz
+43,200/0, suite 2,060 → 2,061, rep-fuzz exact, −455 B). The gate was run twice, in full.
+
+**A HARNESS ERROR I MADE AND CAUGHT — recorded because the gate did NOT catch it for me.** Three legs
+(`lint-self`, the suite, `rep-fuzz-check`) read `build/vl-compiler.wasm`, and I had left a THROWAWAY
+both-halves build there from the `emit_classify` experiment. All three ran green — against a compiler
+that was not the candidate. **Rebuild the seed and `cmp` it against the stashed candidate before
+every seed-reading leg**; a green leg proves nothing about a compiler it did not run.
+
+**A WORKTREE SELF-IGNORES MORE THAN THE BRIEF SAYS.** Symlinking `scripts/vl-host/target/release/vl`
+brought the native suites back, but the suite still reported **14 ignored**: six `native-opt` cases
+were self-ignoring on `missing wasm-opt`, because a worktree has no `node_modules`. Symlinking that
+too gives **8** — the figure #1153 reports. *Diff the ignored NAME SET, and when it is bigger than
+the hand-off's, find out why instead of reporting the number.*
+
+### THE WORK COUNT, on both sides of every home — CORPUS **and** FUZZ
+
+One instrumentation script applied to BOTH sides, driven through #1154's Deno probe host (the
+compiler cannot `print` under the Rust host or the corpus oracle; the probe host supplies the
+`__print_*` family and drives `srcReset`/`srcPush`/`compileSrc` in ONE shared instance — 43,200 fuzz
+programs in 7 seconds). Counters are module globals dumped at the start of every `compileSrc`; a
+sentinel case sorted last makes the final line the running total. **The master column counts the char
+steps of the loops the candidate DELETES** — #1154's lesson (b): omit them and moved work reads as
+new work.
+
+**CORPUS — 1,314 cases (1,342 `.vl` files; module directories are one case), 1,314 compiled, 0 threw**
+
+| counter | master | candidate | Δ |
+|---|---|---|---|
+| `tyTopIndexOf` entries | 662,431 | 1,425,925 | **+763,494** |
+| `tyTopIndexOf` loop iterations | 5,672,099 | 14,269,461 | +8,597,362 |
+| FIND form: entries (wrapper → 3 direct sites) | 738,523 | 738,657 | +134 |
+| FIND form: OWN loop iterations | 8,439,598 | **0** | −8,439,598 |
+| `tyTopLevelSplit` entries | 16,612 | 16,600 | −12 |
+| `tyTopLevelSplit` loop iterations | 176,336 (per CHAR) | 24,701 (per PART) | −151,635 |
+| `tyTopLevelSplit` parts pushed | 24,720 | 24,701 | **−19** |
+| `tyGtIsClose` entries | 153,081 | 153,036 | −45 |
+| `skipQuotedName` entries | 1,881 | 2,833 | **+952** |
+| **TOTAL CHAR STEPS in every type-name walk** | **14,288,033** | **14,269,461** | **−18,572 (−0.130%)** |
+| **TOTAL CALL FRAMES for that work** | 755,135 | 779,958 | **+24,823** |
+
+**FUZZ — 43,200 programs, 43,200 compiled**
+
+| counter | master | candidate | Δ |
+|---|---|---|---|
+| `tyTopIndexOf` entries | 4,960,182 | 10,195,242 | **+5,235,060** |
+| FIND form: entries | 5,027,206 | 5,027,206 | **0** |
+| FIND form: OWN loop iterations | 50,326,780 | **0** | −50,326,780 |
+| `tyTopLevelSplit` entries · parts | 129,747 · 207,854 | 129,747 · 207,854 | **0 · 0** |
+| `tyGtIsClose` entries | 916,936 | 916,936 | **0** |
+| `skipQuotedName` entries | 50,132 | 51,934 | **+1,802** |
+| **TOTAL CHAR STEPS** | **94,093,365** | **93,956,150** | **−137,215 (−0.146%)** |
+| **TOTAL CALL FRAMES** | 5,156,953 | 5,364,807 | **+207,854** |
+
+**THE RELOCATION IDENTITY IS EXACT ON THE FUZZ SIDE, AND ITS CORPUS RESIDUAL IS THE FIX ITSELF.**
+Predicted Δ(`tyTopIndexOf` entries) = FIND-form entries + `tyTopLevelSplit` loop iterations, since
+each of those makes exactly one call to the home.
+*Fuzz*: 5,027,206 + 207,854 = **5,235,060 — residual 0, and every other counter is bit-identical.**
+*Corpus*: 738,657 + 24,701 = 763,358 against an observed 763,494 — **residual +136**, which is
+`typecheck`'s OWN calls rising because the quote fix changes what the checker is subsequently asked.
+Three more corpus counters move where the fuzz column does not budge: parts pushed **−19**,
+`tyGtIsClose` **−45**, `skipQuotedName` **+952**. The residual is 0.018% of the relocation and it is
+the only place the two sides are permitted to differ.
+
+**THE COMPARATOR IS PROVED IN THE SAME BUILD.** `skipQuotedName` **+952 corpus / +1,802 fuzz** says
+the new quote skip is REACHED 2,754 times on programs where corpus, lint and fuzz A/B are all
+0-differing. *Coverage is not agreement* — here both are measured and they are different numbers.
+
+**The call-frame line is the honest cost, stated rather than buried:** +24,823 on the corpus and
++207,854 on fuzz, in both cases **one per part `tyTopLevelSplit` produces** (24,701 and 207,854),
+bought for −18,572 / −137,215 char steps. **Without the FIND-wrapper deletion it would have been
++763,480 and +5,235,060** — that deletion is what makes this net-neutral-to-negative instead of a
+work regression, and it is why the filed alias form is not what shipped.
+
+**What this instrument does NOT cover, stated rather than omitted:** (a) the `string[]`/slice
+ALLOCATIONS — 19 fewer parts on the corpus is 19 fewer slices, an uncounted saving, so the true delta
+is slightly more negative than the table; (b) the char steps spent inside `tyGtIsClose` (counted as
+entries, not steps — identical on fuzz, −45 on corpus); (c) the LSP query families, which neither
+channel drives.
+
+### Entombment — four sabotages, three consequential, ONE INERT AND MEASURED
+
+| sabotage | hunk | pre-existing corpus files reddened |
+|---|---|---|
+| **S1** `annArrowAt` asks the home from index 1 | FIND fold, arrow site | **198** |
+| **S2** `nullablePartOf` asks the home from index 1 | FIND fold, bar site | **104** |
+| **S3** `tyTopLevelSplit`'s resume loop terminates at `s.length - 1` | SPLIT resume loop | **357** |
+| **S4** `nameIsStructWithUnionField` asks for `,` instead of `\|` | FIND fold, union-field site | **0 — INERT** |
+
+Every hunk is covered by a consequential sabotage. (S3's fire set grew 225 → 357 across the rebase:
+#1155 routed `emit_classify`'s six shape-scanner callers through this split.) The quote skip's own
+liveness is pinned by the fixture, RUN red on a master-built compiler.
+
+**S4 IS INERT, AND THE MEASUREMENT SAYS WHICH KIND OF INERT.** A two-variable probe computing BOTH
+predicates at that one site, over both channels, identical at both bases:
+
+| | corpus (1,314 cases) | fuzz (43,200) | total |
+|---|---|---|---|
+| site REACHES | 101 | 887 | **988** |
+| real predicate answers TRUE | 15 | 67 | **82** |
+| **sabotaged answer DIFFERS** | **15** | **67** | **82** |
+
+The site is not dead and the sabotage is not a no-op: **it flips 82 live TRUE answers to FALSE across
+44,514 programs and not one channel observes it.** "0 differing" and "the site does nothing" are
+different claims, and only the second licenses deletion — this is the first, so nothing is deleted.
+The mechanism is visible in the numbers: the sabotage asks for a top-level `,` in a FIELD TYPE TEXT
+that `shapeInnerFieldSplit` has already split on commas, so it can only answer FALSE, and 82
+union-field slots quietly stop being recognised with no observable consequence on any program either
+channel generates. **PUBLISHED BLIND SPOT, not a clean bill of health.**
+
+### REFUTATIONS — worth more than the agreements
+
+1. **"The `emit_base` merge fixes 15 of 24; the residual needs a second home."** True at `1c8d911`
+   and REFUTED at `65347c2` **with the diff unchanged**: 24 of 24. The residual was never a property
+   of this diff, it was a property of a duplicate that #1155 deleted. *A "cells fixed" figure is a
+   statement about a TREE, not about a patch — re-run it at your head.*
+2. **"The residual needs a REWRITE of `emit_classify.shapeInnerFieldSplit`" (#1153 hunk 3).**
+   Refuted by a build at `1c8d911`: it needs that copy **DELETED** in favour of `emit_base`'s home —
+   #1154's filed diff (A), one word in and 44 lines out, measured at **24/24, 0 regressions**. Two
+   slices filed one fix twice under two names.
+3. **"The residual 9 are spread across shapes and generics."** No: **all nine were inline-object
+   SHAPE cells**, and every generic-position cell fell to the `emit_base` half alone. #1151's
+   original attribution (a quoted comma in a GENERIC ARGUMENT) is not only wrong about the cause —
+   the generic positions are the ones that never needed the second home.
+4. **"master is 231 ok / 54 reject / 15 invalid-wasm."** Reproduced exactly, then refuted by reading
+   one cell: 17 of those "rejects" print `failed to parse WebAssembly module`. The true grade is
+   **231 / 37 / 32**, and **2 of the 24 quote-blind cells are invalid wasm, not clean rejects**.
+5. **#1153's filed FIXTURE.** It is cell `nul_sh2_comma`, one of the residual nine, so it would have
+   shipped RED at the base it was filed against. It ships here only because the rebase made it green.
+6. **The filed hunk 3 and the `skipQuotedName` export.** Both re-verified stale/unnecessary at BOTH
+   heads, as #1153 said. Re-grepped, not assumed.
+7. **"Make `tyTopLevelIndexOf` a one-line delegate."** Declined on arithmetic: the delegate costs
+   **+738,657 corpus and +5,027,206 fuzz frames** for nothing. Deleted instead — 0 cross-module
+   consumers, 3 call sites.
+8. **My own census, twice, in opposite directions.** 12,220-line functions (char literals read as
+   braces) and 54 flagged walks (a shape TEST is not a walk).
+9. **My own gate, once.** Three legs ran against a throwaway compiler left in `build/`. Caught by
+   `cmp`, re-run, recorded here rather than quietly redone.
+10. **"A worktree self-ignores the native suites."** True and INCOMPLETE — it also self-ignores six
+    `native-opt` cases on missing `node_modules`. 14 ignored, not 8, until both symlinks exist.
+
+### DECLINED, with the arithmetic
+
+* **`emit_collect.vl` and `emit_mono.vl` are NOT touched.** The census finds **zero** hand-written
+  type-name walks in either — they are pure consumers of `emit_base`'s vocabulary — and their
+  scoreboard columns (54 core + 0 off-list, and 5 + 0) are call sites of the named resolvers, not
+  duplicate grammar. Nothing in this partition's other two files can be removed under the
+  destringify unit without inventing a resolver, which #1154's trailing-`[]` arithmetic already
+  showed costs more names than it saves.
+* **No `shapeFieldSplit(name, …)` wrapper** for the `slice(1, n - 1)` brace unwrap its call sites
+  spell out (#1154's decline, re-checked at this head — now `emit_classify` ×6 through the shared
+  home, `emit_base` ×2, `emit_collect` ×2). One new function and one new frame at 10 sites to remove
+  ten two-token slices every caller has already validated with its own `{`/`}` gate. No walk removed.
+* **`tyGroupWrapsWhole` stays.** It is `emit_base`'s last flagged walk and it is NOT a shorter
+  spelling of `typecheck.tyGroupEndIndex`: on a group that never closes (`{{x}`) it answers TRUE
+  where the checker's reading answers FALSE (#1147 hand-off 1, still open). Merging it is a
+  behaviour change needing its own graded population, not a cleanup.
+
+### Hand-offs, best-measured first
+
+1. **`emit_classify.splitUnionArmsAllDepth` uses a NAKED `inStr` toggle** — quote-aware but
+   ESCAPE-blind, so `"a\"|b"` walks straight through it. **Exactly the class of defect this PR just
+   closed**, and one of the six remaining copies. The 300-cell matrix does not reach it (no cell
+   carries an escaped quote); a 16th text `a\"b` would extend the harness to grade it. Carried
+   forward from #1153 with the observation added.
+2. **THE NULLABLE-LITUNION ALIAS MISCOMPILE is still live at `65347c2`** — my matrix reads
+   `invalid-wasm` on all 15 `nul_alias` cells **including the control**, cell for cell identical on
+   both sides of this PR, so nothing here touches it. #1153's mechanism (the emitter boxes because
+   `nameIsNulLitUnion` reads the NAME while every classifier downstream reads the arena) and its
+   built-but-unshipped `canonEmitName` arm stand as filed; the arm needs its `emit_classify`
+   companion (`exprIsLitAtom` / `exprNulLitUnion` Member+Index arms) or loud becomes silent.
+3. **The `,`-for-`|` blind spot at `nameIsStructWithUnionField`** (S4): 988 reaches, 82 live TRUE
+   answers, and no channel — 1,340 corpus files or 43,200 fuzz programs — observes one flipping.
+   Either the corpus needs a struct-with-union-field case whose emit path depends on that verdict,
+   or the verdict is unobservable and the site can be simplified. **Measure which before doing
+   either; a program that reddens S4 is worth more than a refactor.**
+4. **The 300-cell harness is reusable and cheap** — 300 graded programs in 3.5 seconds against a
+   given compiler, each with its own CONTROL so pre-existing gaps subtract out. It is what turned a
+   one-character one-position story into 24 cells / 9 characters / 6 positions, and what caught the
+   17 mislabelled rejects. Extend the text list (escapes, multibyte) and the position list (nested
+   shape, union arm, intersection) rather than hand-building shapes: **hand-built shapes compared
+   candidate-vs-merged are how the original attribution went wrong, and a control that must pass is
+   the whole difference.**
