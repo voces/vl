@@ -14025,3 +14025,337 @@ removed from the pin with the reason stated in the file, because pinning it gree
    `emit_rewrite`/`emit_mono`; the `typecheck.vl` side is a three-line `recordNodeTyIx`.
 6. **`shapeFieldParse`** — the one grammar copy left standing, with the reason (a second question and
    a space strip in the same loop) and the shape of its conversion.
+
+## D-GLOBALNICHE — the un-annotated global ladder was missing FIVE rep kinds, not one; plus `annRetNameOf`/`annFnDecompose`/bare-map get their homes (#1149)
+
+Branched at `2fae030` (D-CLASSHOME, #1146) and **rebased onto `0249fce`** after #1147 (D-TYWALK)
+and #1148 (D-LITPRINT) landed mid-slice. **Every number below was re-taken at `0249fce`, in one
+session**, with a master compiler built from the same bootstrap seed in that same session and
+every artefact md5-checked before use — nothing is carried over from the pre-rebase measurement.
+Files: `compiler/emit_classify.vl`, `compiler/emit_query.vl`, a **one-line** hunk in
+`compiler/wasmEmit.vl`, three new fixtures, and this doc.
+
+**The rebase mattered and was re-verified rather than assumed.** #1147 rewrote `emit_base.vl` (474
+lines) — the module that HOMES all three grammars this slice adopts — and took its own core count
+from 56 to 48. Neither merged PR touched `emit_classify.vl`, `emit_query.vl` or `wasmEmit.vl`, all
+three code commits replayed with no edit, and **all three pins are still RED on a compiler built
+from `0249fce` by running them**: two `Invalid input WebAssembly code … expected i32, found (ref
+null $type)` and one `wasm trap: null reference`. The scoreboard DELTA is identical either side of
+the rebase (**−13**), and the per-file breakdown is unchanged.
+
+### The brief's TARGET 1 reproduced, and its "only kind" claim REFUTED
+
+The hand-off (filed by #1145, corpus-A/B'd, with a red-on-master pin) said: an un-annotated global
+bound to a `{[string]: V} | null`-returning call is silent invalid wasm, and **an 18-rep-kind sweep
+found `nulmap` is the only kind that is silent-and-wrong in that position**. The first half
+reproduces exactly at `2fae030`; `vl check` → "Checked 1 file, no errors", `vl build` → `wrote …
+(719 bytes)`, `vl run` → `Invalid input WebAssembly code at offset 266: type mismatch: expected
+i32, found (ref null $type)`. The one-line fix applies by context and closes it.
+
+**The second half does not survive re-measurement.** Per this program's standing rule — re-measure
+the hand-off, do not inherit it — the sweep was rebuilt from scratch: **33 rep kinds**, each an
+un-annotated module global bound to a call returning that type, classified as OK / BUILDREJECT /
+INVALID / TRAP by running them. Master is silent-and-wrong on **TEN** of the 33, not one:
+
+| kind at the un-annotated global | master `2fae030` | this PR |
+|---|---|---|
+| `{[string]: i32} \| null` (the report) | **INVALID** | ok |
+| `{[string]: string} \| null` · `{[string]: boolean} \| null` | **INVALID** | ok |
+| `{[string]: S} \| null` · `{[string]: S[]} \| null` · nested-map value | **INVALID** | ok |
+| **`string[] \| null`** | **INVALID** | ok |
+| **`f64[] \| null`** · **`i64[] \| null`** · **`f32[] \| null`** | **INVALID** | ok |
+| `nulstr` · `nulstruct` · `union` · `closure` · `litunion` · `K\|null` · `(S\|null)[]` · struct · reflist · list · strlist · f64list · i64list · f32list · map · str · i32 · i64 · f64 · f32 | ok | unchanged |
+| `nullist` · `nulreflist` · `nulclosure` · `f32list`-literal | BUILDREJECT (loud) | unchanged |
+
+The four extra INVALID kinds are the **distinct-backing nullable scalar lists**, and they are
+missing from the very same ladder: `globalCellKind`'s ANNOTATED branch resolves them one arm above
+the map arm (`nulScalarListKindOfNode(d.letType)`), and the UN-ANNOTATED branch had no counterpart.
+The fix is the binding-level twin, because there is no annotation node to read —
+`letNulScalarListKind(letIx, -1)`, whose own fall-through is the init's `exprNulScalarListKind`.
+Everything downstream already existed (`emit_sections`'s `nulScalarListBuildKind(gck)` seed,
+`fbValtypeNullable` / `fbRefNullForKind`); as with `nulmap`, **only the classifier declined to name
+the kind**.
+
+### A THIRD defect, pre-existing and INDEPENDENT, uncovered by fixing the second
+
+With the classifier arm in, the four scalar-list kinds stopped being invalid wasm and started
+**trapping**: `wasm trap: null reference`. Disassembling the start function named it in one step —
+
+```wat
+(func (;5;) (type 4)          ;; the synthetic start function
+    call 4
+    global.set 0
+    global.get 0
+    ref.as_non_null           ;; <-- traps on exactly the value being null-tested
+    ref.is_null
+    call 1)
+```
+
+`wasmEmit.vl`'s non-const global read eagerly recovers the non-null ref for every cell kind not on
+an exclusion list. `i32` / `nulstruct` / `i64` / `f64` / `f32` / `nullist` / `nulclosure` / `nulmap`
+are all excluded *because they legitimately hold null* — and the four nulscalarlist kinds were not.
+**One line**, `&& !isNulScalarListKind(gck0)`, using a predicate `wasmEmit.vl` already imports.
+
+**It is independent, and that was measured rather than assumed.** A compiler carrying the
+`ref.as_non_null` exclusion but with the un-annotated classifier arm disabled fixes the ANNOTATED
+spelling (`const r: string[] | null = mk()`) and leaves the un-annotated one invalid; the annotated
+spelling traps on master, with no involvement from the classifier at all. Two defects, two
+spellings, one gate:
+
+| spelling, value | master | + classifier arm only | + both |
+|---|---|---|---|
+| annotated, non-null | ok | ok | ok |
+| **annotated, NULL** | **TRAP** | TRAP | **ok** |
+| **un-annotated, non-null** | **INVALID** | **ok** | ok |
+| **un-annotated, NULL** | **INVALID** | TRAP | **ok** |
+
+The corpus agrees structurally. The single PRE-EXISTING file whose bytes move is
+`tests/cases/lists/nul-str-elem-list-outer-null.vl`, and the whole structural diff is **one
+instruction**:
+
+```
+144d143
+<     ref.as_non_null
+```
+
+941 → 940 bytes, stdout and rc identical. That file's own header documents the *element*-read twin
+of this exact seam ("the unconditional `ref.as_non_null` TRAPPED on a null element", fuzz-nightly
+seed `154928295 d6`). This slice removes the **global-read** instance of the same mistake, one
+layer up.
+
+### TARGET 2 — three grammars, nine sites, −13 core
+
+Re-grepped at this head (the hand-off's line numbers had all shifted +16, explained by this PR's
+own two fix commits, and every one was re-verified before use).
+
+| grammar | copies at `0249fce` | after | core calls deleted |
+|---|---|---|---|
+| **`annRetNameOf`** — `annArrowAt(x)` then `x.slice(at + 2, x.length)` | **5** (2 exact, 3 paren-gated) | 0 | **5** |
+| **`annFnDecompose`** — arrow index + `[0]=='('` + `[fa-1]==')'` + param slice + guarded `annSplitParams` + return slice | **3** | 0 | **6** |
+| **`nameIsBareMap`** — the SIXTEENTH copy, in `emit_query`'s `paramMap` | **1** | 0 | **2** |
+| | **9** | **0** | **13** |
+
+| scoreboard | master `0249fce` | this slice | Δ |
+|---|---|---|---|
+| **CORE** — the 23-resolver SCORECARD list | **359** | **346** | **−13** |
+| **OFF-LIST** — #1141's table | 36 | 36 | 0 |
+| **TRUE TOTAL** | **395** | **382** | **−13** |
+
+Per file after: `emit_classify` **211 → 200** core · `emit_query` **4 → 2** core; every other file
+byte-identical. `annSplitParams` goes to **ZERO** call sites in `emit_classify.vl` (tree-wide 5 → 2:
+`emit_base` 1, inside `annFnDecompose` itself, and `emit_mono` 1). `nameIsMapMemberUnion` is
+**retired from a fourth file** — tree-wide 5 → 4 (`emit_base` 1 inside `nameIsBareMap`,
+`emit_collect` 2, `emit_rewrite` 1), exactly as #1146's hand-off predicted.
+
+Unit: **CALL SITES** — a textual `NAME(` in non-comment code, string-literal-aware `//` stripper,
+the resolver's own `function NAME(` header excluded, per-file sums cross-checked against the
+tree-wide total. Command: `parsercount.py compiler`. **The comparator reproduces #1146's published
+per-file table exactly at this base** before any edit.
+
+Three of the five `annRetNameOf` adoptions also **hoist the caller's own `[0] == '('` test AHEAD of
+the depth scan** — the one-char reject now gates `annArrowAt` instead of following it. That is a
+work reduction, and it is measured below rather than asserted.
+
+### Evidence
+
+Every channel re-run at `0249fce`, against a master compiler built in the same session from the
+same seed.
+
+* **Corpus A/B isolating the DEDUP** (bug-fix build vs bug-fix + dedup build, so the refactor is
+  measured alone): **1,333 files, `DIFFERING FILES: 0`** on wasm md5 + build rc + normalised
+  compiler message + run stdout + run rc. Channel populations, measured on side A so the 0 means
+  something: **1,132 files produce wasm across 1,128 distinct hashes · 1,333 carry a compiler
+  message · 1,092 produce stdout across 934 distinct · 201 build rejects · 212 nonzero run rcs.**
+  By channel: byte 0 · rc 0 · message 0 · stdout 0 · run-rc 0.
+* **Corpus A/B, master vs ship**: **4 of 1,333 differ** — this PR's three new fixtures, plus the
+  single one-instruction pre-existing file above. **Build rc 0 differing, compiler message 0
+  differing**; 3 of the 4 differ on run stdout/rc (the pins), the fourth on bytes only.
+* **Suite: 2,051 passed / 0 failed / 8 ignored.** The master baseline was re-measured **in the same
+  session, same command** (`SELFHOST_NATIVE_ALIGN=1 deno task test`, in a worktree wired with the
+  native `vl` and `node_modules`, so this is the FULL suite, not the ~1,4xx a self-ignoring worktree
+  reports): **2,048 passed / 3 failed / 8 ignored**, and the three failures are **exactly** this
+  PR's three pins. 2,048 + 3 = 2,051 accounts for every test, and the **ignored-test NAME SETS are
+  identical** (empty symmetric difference both directions) — a test that silently stops running
+  looks exactly like a pass.
+* **Fuzz A/B — 51,200 programs/side** (32 seeds × 1,600, depth 5; cases generated ONCE per seed by
+  the MASTER compiler so both sides see byte-identical inputs, each side a FRESH out-dir because
+  `--shapes-out` appends): **0 differing paths, raw and backtrace-normalised.** Populations: 50,540
+  non-empty `.out`, 660 `.err`, 51,860 files/side. **All 64 legs' first log lines were read** and
+  every one is empty — `unknown arg:` count 0 — because a `0` on a fuzz leg can be the argument
+  parser rather than agreement.
+* **Fuzz A/B, survey dimensions** (`--branching --values --multiobs`, 16 seeds, **25,600
+  programs/side**, 25,165 non-empty `.out` + 435 `.err`): **2 raw differing paths, 0 normalised.**
+  Both raw diffs are the documented `.err` harness defect — the wasm backtrace **function indices
+  are IDENTICAL on both sides** (1343 / 1668 / 1690 / 1981 / 1982) and only the code ADDRESSES
+  differ, because the candidate binary is smaller. Measured pre-rebase; the plain 32-seed leg was
+  re-run in full afterwards.
+* **Lint-tier A/B** — a channel `vl build` cannot see (`vl check --severity info` over
+  `tests/cases` + `std` + `compiler`): **1,362 files, 239 carrying at least one diagnostic, 389
+  diagnostics in total, 0 differing.**
+* `native-fixpoint.sh` **byte-for-byte** (stage3 == stage4, 1,027,627 B) · `rep-fuzz-check.sh`
+  **exact** (1 baselined, 0 unsound, 0 new, 0 stale) · `lint-self.sh` **RC=0** (info-gated) ·
+  `refresh-compiler.sh --prove-fixpoint` RC=0.
+* Compiler binary **1,029,199 → 1,027,627 B (−1,572)**; the bug fixes alone cost **+53 B**, the
+  dedup returns **−1,625 B** — both deltas identical either side of the rebase.
+
+### Invocation counts on both sides — the leg that catches a work regression
+
+Unit: **DYNAMIC INVOCATIONS**. Denominator: the **1,132 of 1,333** `tests/cases` files that reach
+end-of-emit (identical on every build, so the comparison is like-for-like). Command: `vl build <f>
+--compiler <counting build>`, where the counting build sets `emitFailed`/`emitErr` **directly** at
+`emitProgram`'s tail — not through `emitFail`, whose first-message-wins would let an earlier real
+failure hide the count. Counters live in the module that DEFINES each scanner and are read through
+an accessor in that same module (a cross-module `export let` is not a shared counter). Two
+independent sweeps of the same build are **byte-identical**, so these are not noise.
+
+| | `annArrowAt` | `annSplitParams` | `nameIsMap` |
+|---|---|---|---|
+| master `0249fce` | 310,181 | 9,162 | 209,488 |
+| + the three bug fixes | 310,399 (**+218**) | 9,162 (0) | 209,950 (**+462**) |
+| **+ the dedup (ship)** | **307,134 (−3,265)** | **9,162 (0)** | **209,950 (0)** |
+| net vs master | −3,047 (−0.98%) | 0 | +462 (+0.22%) |
+
+**All three deltas reproduced EXACTLY across the rebase** (+218 / −3,265 / +462), even though
+#1147 moved every absolute baseline by rewriting the depth ladder underneath them — an independent
+confirmation that the deltas are this slice's and not the base's.
+
+**The dedup is a strict work REDUCTION with zero increase on any counter** — the hoisted
+`[0] == '('` reject removes 3,265 whole-string depth scans, and `annFnDecompose` performs exactly
+the guarded split its three copies did (`annSplitParams` flat to the unit). The `+462` `nameIsMap`
+belongs entirely to the BUG FIXES — the two new `globalCellKind` arms classify un-annotated globals
+they previously skipped — and it was attributed by **splitting the two edited files**: a build with
+`emit_classify` from ship and `emit_query` from the fix commit reads **identical to ship on all
+three counters** (307,134 / 9,162 / 209,950), and its complement reads **identical to the fix
+commit** (310,399 / 9,162 / 209,950). So the `emit_query` bare-map collapse costs **exactly zero**
+invocations, and the whole delta is `emit_classify`'s.
+
+**This measurement caught its own comparator error first.** The initial baseline reverted *both*
+partition files to master — which also reverted the bug fixes, since they live in
+`emit_classify.vl` — and reported an unattributable `+462`. Naming the 18 files that moved (all
+nullable/map shapes, one of them this PR's own `nulmap` fixture) is what exposed it. **When a
+refactor and a fix share a file, the refactor's baseline is the FIX commit, not master.**
+
+### Entombment: NINE per-site sabotages, SIX red, THREE explained by a two-variable probe
+
+One class-leaving sabotage per adopted SITE (not per home — the aggregate hides the slice),
+corpus-A/B'd **against the candidate**. Each breaks the home's invariant ("the answer is the
+function type's RETURN") while leaving the `""`-sentinel gate untouched, so the FIRE CONDITION is
+identical and only the VALUE changes — the permutation trap #1146's S10 fell into. Every sabotage
+binary was checksummed against the candidate's (all differ, so each really compiled in).
+
+| # | sabotage | differing / 1,333 |
+|---|---|---|
+| D2 | `annSigKey`'s `annFnDecompose` answers `"i32"` | **208** |
+| D1 | `internFuncTypeShapes`'s `annFnDecompose` answers `"i32"` | **40** |
+| R4 | `forceCloResultListTypes`'s `annRetNameOf` answers `"i32"` | **5** |
+| M1 | `paramMap`'s `nameIsBareMap` → `nameIsMap` (drop the member-union exclusion) | **3** |
+| D3 | `nominalizeFnType`'s `annFnDecompose` answers `"i32"` | **2** |
+| R3 | `forceCloResultMapTypes`'s `annRetNameOf` answers `"i32"` | **1** |
+| R1 | `cloArrSlotRetName`'s `annRetNameOf` answers `"i32"` | **0** |
+| R2 | `calleeCloRetName`'s `annRetNameOf` answers `"i32"` | **0** |
+| R5 | `unionRetOfFnType`'s `annRetNameOf` answers `"i32"` | **0** |
+
+**D2 proves the comparator in ONE build**, and on all five channels at once: 88 build-rc, 208 wasm,
+168 run-rc, 88 message, 168 stdout. The fuzz comparator was proved the same way — the D2 sabotage
+against the candidate over 4 seeds / 6,400 cases reports **701 differing paths**, so the 0 over
+51,200 is a real 0 and not harness blindness.
+
+**The three zeros are a REDUNDANT SIBLING, not "no reacher" — and only a two-variable sabotage
+could say so.** Six hand-built fixtures aimed at those consumers (`(i32) => boolean | null` through
+a closure binding, a `K | null` closure result, a nullable-closure result, a closure ARRAY element
+returning `K | null`, a value-union closure result, the same behind a `| null` niche) all came back
+byte-identical on both sides. The reason is visible one line above the site: `exprNulBool` opens
+with the typed-IR fast path `nodeTyIsNulBool(exprIx)`, and #1126 measured `nodeTyIx` at 99.977%
+coverage at emit. So:
+
+| build | vs candidate |
+|---|---|
+| **V1** — arena fast path OFF, name leg intact | 8 differing |
+| **V2** — arena fast path OFF, name leg sabotaged | 10 differing |
+| **V1 vs V2 — the decisive comparison** | **2 differing** |
+
+The name leg **is** reached and **is** consequential — on
+`tests/cases/types/nullable-boolean-closure-param-call.vl` and
+`tests/cases/types/nullable-boolean-lambda-return.vl` — but only once the arena stops answering
+first. The arena leg itself carries 8 files. **A one-variable sabotage cannot distinguish a leg that
+nothing reaches from a leg that something reaches first**, and the honest reading of R1/R2/R5 is the
+second: these are measured-shadowed fall-throughs, which makes them **deletion candidates once the
+arena coverage is proven total, not pin candidates.** Graded down rather than averaged in.
+
+### Hand-offs, each with its measurement
+
+1. **`unionArmsOf`'s `splitUnionAtoms` fall-through fires ZERO times on TWO independent channels,
+   and this is the strongest deletion lead in the file.** It is already arena-first —
+   `if !msMemberAtomsOf(nm, out) { splitUnionAtoms(nm, out) }`. Instrumented count, denominator and
+   command stated: over the **1,132** corpus programs that reach end-of-emit, **1,462 `unionArmsOf`
+   invocations, 0 fall-throughs**; over **12,633** fuzz programs (8 seeds × 1,600), **1,990
+   invocations, 0 fall-throughs**. **3,452 invocations, 100% arena coverage, both channels.**
+   Per this program's own rule this is "measured at 0", NOT "dead by construction" — the deletion
+   still needs the construction argument that `msMemberAtomsOf` cannot decline for a registered
+   row. That argument, plus this measurement, is a one-line deletion and takes `splitUnionAtoms`
+   from 11 to 10 in `emit_classify` (32 to 31 tree-wide).
+2. **The seventeen map-VALUE sites are still ONE arena migration.** Re-counted at this head:
+   `mvSlotOfMapName` **7**, `mvShapeOfMapName` **5**, `mapValKindLowerable` **5** — all seventeen in
+   `emit_classify.vl`, each one line, and they are the only three places left in the file that ask a
+   question about a bare map's VALUE. `T.tys[m] is TyMap` plus `emit_rep`'s `tyMapValOf` (#1125)
+   gives the value type directly. Not taken here because it needs a node index rather than a name at
+   the three homes, which is a "bank at the intern site" problem, not a sweep.
+3. **`nullablePartOf` is 29 in `emit_classify` and the next reduction there is `TyNullable` off
+   `nodeTyIx`, not another home** (carried forward from #1146, unchanged by this slice).
+4. **The three `tyGtIsClose` depth scanners remain DECLINED**, for #1146's arithmetic reason, which
+   re-verified here: 13 off-list call sites, unchanged.
+5. **A pre-existing LOUD limitation, not pinned:** a CONSTEXPR literal-null init of a distinct-backing
+   nullable scalar list (`const gf: f64[] | null = null`) is rejected with `emitProgram: bare null
+   needs a struct-typed context`, on master and on this branch alike. It is loud, so it is a
+   limitation rather than a miscompile; it was cut out of this PR's third fixture rather than
+   averaged into it.
+
+### PUBLISHED FUZZ BLIND SPOT
+
+**`scripts/fuzzgen.vl` cannot reach any of this slice's three defects**, so 0 fuzz divergence says
+nothing about them either way. It emits the map constructor at exactly one site, always as an
+ANNOTATED LOCAL hoisted into a `pre` prefix; it never generates an un-annotated module GLOBAL bound
+to a call, in any rep kind. All three defects are un-annotated-global or annotated-global shapes.
+That is stated because it is also the explanation for their survival: **the population of the
+changed arm on the corpus was ZERO before this PR added it.**
+
+### Method notes earned
+
+91. **Re-measuring a hand-off's SWEEP is worth as much as re-measuring its DIFF.** The brief's
+    one-line fix applied by context and was correct; its accompanying "an 18-rep-kind sweep found
+    `nulmap` is the only kind" was not, and rebuilding the sweep from scratch found **four more
+    silent-invalid kinds** in the same ladder — a 5× larger defect than the one handed over. A
+    hand-off's diff tends to be verified; its SURVEY tends to be a by-product, and by-products are
+    where the unverified claims live. **Re-run the enumeration, not just the repro.**
+92. **A fix that turns INVALID WASM into a TRAP has uncovered a second bug, not finished the
+    first.** The nulscalarlist classifier arm made the module validate and the program then trapped
+    on `ref.as_non_null`. The instinct to ship the classifier arm alone would have shipped a changed
+    failure mode as a fix. **Disassemble the emitted module: `global.get; ref.as_non_null;
+    ref.is_null` names the defect in one line**, and the eager-recover EXCLUSION LIST is a standing
+    invariant that every legitimately-nullable cell kind must be on — an exclusion list is a place
+    where adding a kind elsewhere silently creates a bug.
+93. **When a refactor and a bug fix share a file, the refactor's invocation-count baseline is the
+    FIX COMMIT, not master.** Reverting "the partition files" to master reverted the fixes too and
+    produced a +462 that could not be attributed to any collapsed grammar. The tell was available in
+    the data: naming the 18 files that moved showed they were all nullable/map shapes, including the
+    PR's own new fixture. **Attribute a work delta by splitting the FILES and then the COMMITS, and
+    keep splitting until each side reads identical to one of the two endpoints.**
+94. **A per-site sabotage that reads 0 against a consumer with an ARENA FAST PATH above it is
+    reporting the fast path, not the site.** Method note 88 named the permutation trap; this is its
+    twin — the sabotage is a genuine class-leaving break, the site is genuinely reached, and the
+    answer is still identical because a sibling answers first. **The two-variable sabotage (disable
+    the sibling, then compare sabotaged against intact) is the only probe that separates them**, and
+    it converted three "unwitnessable" homes into a named two-file population plus a concrete
+    recommendation to delete rather than pin.
+95. **Read one log per leg AND assert the flags landed.** A survey fuzz leg silently ran nothing
+    because a `$(for … echo '-e s/…/')` construction word-split each sed expression; it failed
+    LOUDLY only by luck. The harness now builds the sed argv as an array and then **greps the
+    generated generator for each flag it was asked to set** — the check that would have caught a
+    survey leg quietly running the plain stream and reporting a meaningless 0.
+96. **Prove the comparator on every channel it reports, not just the one you expect to move.** This
+    slice's first corpus A/B read **1,130 phantom message diffs on a 0-byte-diff run**: the harness
+    normalised `$W/` with `W` unset inside the parallel subshell, so `s#$W/##g` collapsed to
+    `s#/##g` and deleted every slash in every path. The same run's population counts read **7,158
+    "files producing wasm" out of 1,328 rows** because the glob swept the `.msg`/`.out` sidecars.
+    **Both were caught by an implausible magnitude, in the direction that reports MORE difference —
+    the direction a refactor's author is least likely to check.**
