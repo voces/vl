@@ -61,7 +61,6 @@ import {
   nodeUnionName,
   recordClonedNodeTy,
   splitUnionAtoms,
-  tyGtIsClose,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyToEmitName,
@@ -169,6 +168,7 @@ import {
   tyIsFuncType,
   tyIsNulBool,
   tyNameOf,
+  tyTopLevelSplit,
   unionHasAtom,
   unwrapParen,
 } from "./emit_base"
@@ -7607,64 +7607,89 @@ export function structIndexOfTypeName(name: string) {
 // collapsed `.map` callback return the checker rendered structurally) — the variant
 // analogue of `structIndexOfTypeName`. -1 if no variant matches. A NAME that is already a
 // variant alias resolves directly. Field-name parsing mirrors `structIndexOfTypeName`.
+// `name` with every SPACE dropped, or `name` itself when it carries none.
+//
+// This is the ONE thing `shapeFieldParse`'s ladder did that is not the type
+// grammar: `tyToStr` renders an object shape SPACED (`{a: i32, b: string}`) and
+// `tyToEmitName` renders it tight, and the field-set resolvers must read both as the
+// same shape. The ladder could fold the normalisation into its walk because it
+// accumulated character by character; the split home works in SLICES, so it happens
+// once, up front. Measured over corpus + fuzz: **18,666 of 89,166 shape names carry a
+// space (21%)** — the normalisation is LIVE, not a dead defensive branch, and the
+// other 79% must not pay an allocation for it, which is why the scan returns `name`
+// itself when there is nothing to drop.
+//
+// It is NOT a depth ladder: it counts no brackets and asks nothing about structure,
+// so it does not reintroduce the grammar copy this function's rewrite deletes.
+function spacelessName(name: string) {
+  let i = 0
+  while i < name.length {
+    if name[i] == ' ' {
+      let out = name.slice(0, i)
+      let j = i
+      while j < name.length {
+        if name[j] != ' ' { out = out + fromCodePoint(name[j]) }
+        j = j + 1
+      }
+      return out
+    }
+    i = i + 1
+  }
+  name
+}
 // Parse a canonical inline SHAPE name `{a:T,b:U}` into PARALLEL field-name / field-type
-// string lists (appended to `outNames` / `outTypes`). Depth-aware over `{}` `[]` AND `()`
-// so a nested struct / list / closure field type is captured whole (a closure type carries
-// its own `,` between params and `:`-free `=>`). Spaces are stripped so both the canonical
-// (`tyToEmitName`) and spaced (`tyToStr`) renders parse the same. A non-`{…}` name appends
-// nothing. Shared by the variant / struct field-set resolvers so a field-NAME match can be
+// string lists (appended to `outNames` / `outTypes`). A non-`{…}` name appends nothing.
+// Shared by the variant / struct field-set resolvers so a field-NAME match can be
 // tightened with a field-TYPE (`nameFieldCode`) check — two shapes sharing field names but
 // differing in a field's TYPE (`{a:i32,f:i64,z:f64}` vs a union arm
 // `{a:boolean,f:()=>{…},z:i32}`) no longer collide onto the wrong slot.
+//
+// D-SHAPEFIELD — THIS WAS THE COMPILER'S LAST HAND-WRITTEN TYPE-NAME DEPTH LADDER.
+// It carried its own `{}` `[]` `()` `<>` depth counter, its own `angOpen`/`tyGtIsClose`
+// close rule and its own per-character accumulator, and it is now a resume loop over
+// `tyTopLevelSplit` — the published SPLIT home, which rides the checker's `tyTopIndexOf`.
+// The structural walk census (a loop that increments AND decrements an integer while
+// testing a character against a grouper) reads **0 copies + 2 homes** after this, from
+// 1 + 2 at the parent and 5 + 2 two PRs ago.
+//
+// THE INHERITED HAND-OFF SAID THIS WAS NOT A DEDUP TARGET ("a multi-field SPLITTER, not
+// a wrap/find question; retiring it needs the field list to come from the TYPE"). That is
+// REFUTED by the code one module down: `emit_base.shapeInnerFieldSplit` splits exactly
+// this grammar and has been a resume loop over the home since #1147, and
+// `typecheck.canonShapeName` splits it a third time the same way. A splitter IS a
+// repeated FIND, and the home's header says so — it counts depth FROM `from`, so a split
+// that resumes at the character after a top-level separator still costs ONE pass.
+//
+// Two behavioural notes, both MEASURED (89,166 twin comparisons over corpus + fuzz, 0
+// disagreements, inverted twin firing on every multi-field reach):
+//   · The home is QUOTE-AWARE (`skipQuotedName`) where this ladder was quote-BLIND, so a
+//     `,` or `:` inside a quoted literal member no longer splits a field. 1,059 reaches
+//     carry a quote and none of them has a separator inside it, so the fix is real but
+//     its witness population is empty on both channels — stated, not dressed up.
+//   · A part with no `:` keeps the WHOLE part as the field name (`ci < 0`), and a part
+//     that STARTS with `:` yields an empty name — the ladder's exact convention, kept
+//     deliberately. Reusing `shapeInnerFieldSplit` outright (which pushes an empty name
+//     AND an empty type for both) was built and measured too: 0 disagreements, because
+//     that population is EMPTY on every channel (0 of 89,166). An unreached difference is
+//     a coverage statement, not a licence, so the faithful form ships.
 function shapeFieldParse(name: string, outNames: string[], outTypes: string[]) {
   if name.length >= 2 && name[0] == '{' && name[1] != '[' {
-    let curN = ""
-    let curT = ""
-    let depth = 0
-    // The generic-application brackets count as a grouper (D-GENBRACKET): a field
-    // whose type is a generic APPLICATION carries the argument list's own `,` and
-    // `:` (`{v: Pair<i32,string>}`), and a bracket-blind depth split the FIELD list
-    // at them. `>` closes only against an OPEN `<` (`tyGtIsClose`) — two other
-    // string languages ride this scanner and both spell a `>` that closes nothing:
-    // `tyToStr`'s `->` arrow render and the `$fnsig` key's `ii>i`.
-    let angOpen = 0
-    let collecting = true // true: reading the field NAME; false: reading its TYPE
-    let i = 1
-    while i < name.length - 1 {
-      const c = name[i]
-      if c == '{' || c == '[' || c == '(' {
-        depth = depth + 1
-        if !collecting { curT = curT + fromCodePoint(c) }
-      } else if c == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-        if !collecting { curT = curT + fromCodePoint(c) }
-      } else if c == '}' || c == ']' || c == ')' {
-        depth = depth - 1
-        if !collecting { curT = curT + fromCodePoint(c) }
-      } else if c == '>' && tyGtIsClose(name, i, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-        if !collecting { curT = curT + fromCodePoint(c) }
-      } else if depth == 0 && c == ':' && collecting {
-        collecting = false
-      } else if depth == 0 && c == ',' {
-        outNames.push(curN)
-        outTypes.push(curT)
-        curN = ""
-        curT = ""
-        collecting = true
-      } else if c != ' ' {
-        if collecting {
-          curN = curN + fromCodePoint(c)
-        } else {
-          curT = curT + fromCodePoint(c)
-        }
+    const flat = spacelessName(name)
+    const parts: string[] = []
+    tyTopLevelSplit(flat.slice(1, flat.length - 1), ',', false, parts)
+    let k = 0
+    while k < parts.length {
+      const part = parts[k]
+      const ci = part.indexOf(":")
+      if ci < 0 {
+        outNames.push(part)
+        outTypes.push("")
+      } else {
+        outNames.push(part.slice(0, ci))
+        outTypes.push(part.slice(ci + 1, part.length))
       }
-      i = i + 1
+      k = k + 1
     }
-    outNames.push(curN)
-    outTypes.push(curT)
   }
 }
 
@@ -10708,9 +10733,16 @@ function structElemArrayLowerable(t: string): boolean {
 //
 // `emit_base`'s copy had already been migrated onto the published depth-walk home
 // (`tyTopLevelSplit`, #1147) while this one still spelled the ladder out, so the two
-// were no longer even the same CODE — only the same behaviour. Importing it retires the
-// last hand-written FIELD-list walk in this file and leaves the grammar with one home
-// for all four of its consumers here, `emit_base`'s two and `emit_collect`'s two.
+// were no longer even the same CODE — only the same behaviour. Importing it leaves the
+// grammar with one home for all six of its consumers here, `emit_base`'s two and
+// `emit_collect`'s two.
+//
+// ⚠️ THE SENTENCE THAT USED TO END THAT PARAGRAPH — "retires the LAST hand-written
+// FIELD-list walk in this file" — WAS FALSE WHEN IT WAS WRITTEN. `shapeFieldParse`, 3,000
+// lines up, was a second hand-written field-list walk in this same file, with its own
+// `angOpen`/`tyGtIsClose` ladder, and the structural walk census counted it every time.
+// It is retired by D-SHAPEFIELD; the claim is true now, and is left standing here only
+// because a corrected claim is worth more than a deleted one.
 
 // Whether inline shape `nm` (`{f:i32,g:{h:i32}}`) lowers as a closure result/param
 // with NO unsupported composite field, recursing through nested inline shapes (and

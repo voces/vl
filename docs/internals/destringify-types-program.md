@@ -20106,3 +20106,363 @@ population is measured EMPTY**, so no pin can exist. Said plainly rather than dr
    **94.8% and 96.8% of its calls are asking about a name that has no wrapper at all.**
 6. **The fuzz generator still emits no generic applications** (#1165's finding, unchanged): `gae*`
    coverage rests on the corpus alone. Worth closing before any slice trusts a fuzz zero there.
+
+## D-SHAPEFIELD + D-PARAMARR — the compiler's LAST hand-written type-name depth ladder is deleted (0 copies + 2 homes), and `emit_query` reaches ZERO
+
+**Slice: `compiler/emit_classify.vl` + `emit_query.vl` + `emit_base.vl` (comments only).
+No new fixture — the pre-existing corpus already reddens on FOUR of the five sabotages, so
+every relocated leg is entombed by fixtures that exist.**
+
+### Base re-measured, not inherited
+
+Branched from **`706d901`** (#1168). `parsercount.py` reproduces the brief's **CORE 305 ·
+OFF-LIST 28 · TRUE 333** exactly, per file `emit_classify` 176 (175 + 1) · `emit_base` **48** ·
+`typecheck` 46 (19 + 27) · `emit_collect` **43** · `emit_rewrite` 5 · `emit_mono` 5 · `wasmEmit` 5 ·
+`emit_query` **2** · `emit_rep` 2 · `emit_sections` 1. Master rebuilt from source in this session is
+**1,029,179 B**, SHA-256 `1d1f0f66…` — byte-identical to the artifact #1168 shipped, which
+independently confirms the base is the merged #1168 and not a neighbour.
+
+| | master `706d901` | this PR |
+|---|---|---|
+| **CORE** (23-resolver list) | **305** | **303** |
+| **OFF-LIST** (#1141's table) | **28** | **27** |
+| **TRUE TOTAL** | **333** | **330** |
+| `emit_classify.vl` | 176 (175 + 1) | **175** (175 + 0) |
+| `emit_query.vl` | **2** | **0** |
+| `emit_base` · `emit_collect` · `emit_mono` | 48 · 43 · 5 | 48 · 43 · 5 |
+| **hand-written type-name DEPTH LADDERS** | **1 copy + 2 homes** | **0 copies + 2 homes** |
+| binary | 1,029,179 B (`1d1f0f66…`) | **1,029,637 B** (`e0a312ca…`), **+458 B** |
+
+### 🔁 REFUTATION 1 — the inherited "NOT a dedup target" was a DECLINE, and the code one module down refutes it
+
+#1168's hand-off 4 read: *"`shapeFieldParse` is the last hand-written ladder in the emitter and is
+NOT a dedup target. It is a multi-field SPLITTER (depth-aware over `(),:<>[]{}`, with a
+`collecting` flag), not a wrap/find question; `tyTopIndexOf`/`tyGroupEndIndex` answer 'where does
+this group end', which is one rung of it. Retiring it needs the field list to come from the TYPE,
+i.e. the `nodeTyIx` coverage question — not another home."*
+
+**A SPLITTER IS A REPEATED FIND, and this compiler had already written that down twice.**
+`emit_base.tyTopLevelSplit` (#1147) is a resume loop over `tyTopIndexOf` and its header says
+exactly why it costs one pass, not one per part: *"the home counts depth FROM `from`, and a resume
+point is always a position where the depth was 0 by the split's own condition."*
+`emit_base.shapeInnerFieldSplit` splits **this same `{a:T,b:U}` grammar** through it, and
+`typecheck.canonShapeName` splits it a third time the same way. The decline was never measured — it
+was read off the shape of the function. **A DECLINE IS ONLY AS GOOD AS ITS SEARCH, and this one
+searched the wrong module.**
+
+### 🔁 REFUTATION 2 — a header that was wrong for two slices was wrong a THIRD time, now in the opposite direction
+
+`emit_base.vl`'s `shapeInnerFieldSplit` header carried, in bold, a measured hand-off:
+*"**`emit_classify.vl` still defines a PRIVATE `shapeInnerFieldSplit` with SIX callers, and that
+copy never even shared this walk**"*, worth *"a whole hand-written bracket ladder"* and *"24 of 24
+quote-blind cells"*. Verified at this base by grep, not by reading: **`compiler/` contains exactly
+ONE definition of `shapeInnerFieldSplit`, in `emit_base.vl:2150`.** `emit_classify.vl` imports it
+and calls it at precisely the six sites the hand-off named (`funcTypeShapeLowerable`,
+`variantNestedShapeOk`, `internNonLowerableFieldShapes`, `internShapeFieldElems`,
+`internInlineShape`, `internShapeArms`). **The retirement had already happened; the paragraph
+describing it as pending outlived it by two slices.**
+
+That header's own warning is *"A HEADER COMMENT IS NOT EVIDENCE — this one was wrong for two
+slices."* It was wrong for three. Both stale claims are corrected in place rather than deleted,
+including `emit_classify`'s companion claim that importing the home *"retires the last hand-written
+FIELD-list walk in this file"* — which was **false when written**: `shapeFieldParse` sat 3,000 lines
+up in the same file, hand-writing the same grammar, and the structural walk census counted it every
+time.
+
+### TARGET 1 — D-SHAPEFIELD: the last ladder
+
+`shapeFieldParse` carried its own `{}` `[]` `()` `<>` depth counter, its own `angOpen` +
+`tyGtIsClose` close rule, a `collecting` flag, and a per-CHARACTER string accumulator. It is now:
+
+```vl
+const flat = spacelessName(name)
+const parts: string[] = []
+tyTopLevelSplit(flat.slice(1, flat.length - 1), ',', false, parts)
+// … per part: the first `:` cuts name from type
+```
+
+**The structural walk census — a loop that increments AND decrements an integer while testing a
+character against a grouper, so no variable-naming convention can hide one — reads:**
+
+| | at `706d901` | this PR |
+|---|---|---|
+| `emit_classify.shapeFieldParse` | FLAGGED | **gone** |
+| `typecheck.tyTopIndexOf` | home | home |
+| `typecheck.tyGroupEndIndex` | home | home |
+| **FLAGGED** | **3** | **2** |
+
+**The compiler has no hand-written type-name depth ladder outside its two homes.** Five copies +
+two homes at `5d40f22`, one + two at `706d901`, **zero + two here.**
+
+**The ONE thing the ladder did that is not the grammar is the SPACE normalisation** (`tyToStr`
+renders shapes spaced, `tyToEmitName` tight, and the field-set resolvers must read both as one
+shape). It could fold that into its walk because it accumulated character by character; the split
+home works in slices, so it is now `spacelessName`, called once, up front. **It is LIVE, not a dead
+defensive branch: 18,666 of 89,166 shape names carry a space (21%)** — so the 79% that do not must
+not pay an allocation, which is why the scan returns `name` itself when there is nothing to drop.
+It counts no brackets and asks nothing about structure, so it does not reintroduce the copy.
+
+### TARGET 2 — D-PARAMARR: `emit_query` reaches ZERO, and the arena leg was already in production
+
+The five `param*Array` predicates rendered a parameter's annotation NODE to a synthetic name and
+parsed the render back:
+
+```vl
+export function paramArray(fnIx: i32, name: string) {
+  nameIsI32Array(tyNameOf(paramTypeNode(fnIx, name)))   // and 4 siblings
+}
+```
+
+`emit_base`'s `ret*ArrFlag` family answers the identical question off `nodeTyArrayElemRepName`,
+whose own header says it *"Mirrors `nameIsI32Array`/`nameIsF64Array`/… exactly"*. **This is not a
+new arena leg being trusted for the first time: `vtKindOfType` (`emit_classify.vl:2289`) already
+classifies `Param.parType` nodes through `retArrFlag`/`retStrArrFlag`/… with NO name fall-through**,
+so the arena has been authoritative for this exact node population all along; these five predicates
+were the last consumers asking the same nodes the same question through a render.
+
+That is an argument, and this program does not accept arguments, so it was measured. The
+`ret*ArrFlag` family **declines to 0** when `nodeTyIx` is unset, so a coverage gap would silently
+lose a list.
+
+| | corpus | fuzz (plain) | fuzz (values+branching) | total |
+|---|---|---|---|---|
+| twin invocations | 36,975 | 73,611 | 80,106 | **190,692** |
+| **disagreements** | **0** | **0** | **0** | **0** |
+| calls with a real param annotation node | 5,985 | 6,305 | 6,287 | **18,577** |
+| of those, arena-COVERED | 5,985 | 6,305 | 6,287 | **18,577 — 100%** |
+| `uncovLive` (name says yes, arena declines) | **0** | **0** | **0** | **0** |
+| inverted twin disagreements | 36,975/36,975 | 73,611/73,611 | — | **100% of reaches** |
+
+The 172,115 uncovered rows are `paramTypeNode` returning **-1** — the ident is not a parameter of
+this function at all — where both legs answer false. Reporting the raw 16% "coverage" without that
+split would have been the misleading number; the decision-relevant one is 18,577 of 18,577.
+
+### The shape twin — 89,166 comparisons, and a candidate DECLINED on an EMPTY population
+
+Two candidates were built and measured against the ladder simultaneously:
+
+| | corpus | fuzz plain | fuzz values | total |
+|---|---|---|---|---|
+| `shapeFieldParse` reaches | 3,618 | 36,692 | 48,856 | **89,166** |
+| **B** (resume loop over `tyTopLevelSplit`) disagreements | **0** | **0** | **0** | **0** |
+| **C** (reuse `shapeInnerFieldSplit` wholesale) disagreements | **0** | **0** | **0** | **0** |
+| names carrying a SPACE | 1,481 | 7,757 | 9,428 | 18,666 |
+| names carrying a QUOTE | 49 | 417 | 593 | 1,059 |
+| parts with NO `:` | **0** | **0** | **0** | **0** |
+| parts starting with `:` | **0** | **0** | **0** | **0** |
+
+**B SHIPS AND C DOES NOT, and the reason is the last two rows.** C is the bigger deletion —
+`shapeFieldParse` collapses to two lines — but `shapeInnerFieldSplit` pushes an EMPTY name AND an
+empty type for a malformed part, where the ladder keeps the whole part as the name. C's 0 is
+therefore not agreement, it is an **empty divergence population**: the shape that would separate
+them occurs 0 times in 89,166. An unreached difference is a coverage statement, not a licence — the
+same reading #1168 applied to `normTypeAtom`'s dead trim — so the faithful form ships and C is
+recorded as measured-equivalent-but-declined. Sabotage **S3 installs C's convention and reddens 0
+files**, which is the same fact from the other side.
+
+**The quote row is a real fix with an empty witness, and is stated that way.** The home is
+quote-aware (`skipQuotedName`) where the ladder was quote-blind, so a `,` or `:` inside a quoted
+literal member no longer splits a field. 1,059 reaches carry a quote; none of them has a separator
+inside it. The behaviour improves and **no pin can exist for it on either channel.**
+
+### Gate — every leg, RC checked EXPLICITLY, master baseline rebuilt at MY head in THIS session
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh --prove-fixpoint` | RC=0 — master **1,029,179 B** (`1d1f0f66…`), ship **1,029,637 B** (`e0a312ca…`), **+458 B**; both one-compile fixed points |
+| `native-fixpoint.sh` | RC=0 — stage3 == stage4 byte-for-byte (1,029,637 B) |
+| `lint-self.sh` | RC=0, fmt clean (`vl fmt` re-run on every edited file before every build) |
+| suite (`SELFHOST_NATIVE_ALIGN=1 deno task test`) | **2,094 passed / 0 failed / 14 ignored** |
+| suite, master **re-measured in this session, same command, same tree** | **2,094 / 0 / 14** — delta **0**, as a pure refactor must be; ignored-test NAME SETS diffed as SETS, **identical, 14 non-empty names each** |
+| corpus A/B, master vs ship | **1,374 files, 0 differing** on wasm SHA-256, build rc, compiler message, run rc and stdout, compared BY NAME |
+| corpus channel populations (side A) | 1,154 produce wasm (1,150 distinct SHAs) · 220 carry a compiler message (217 distinct) · 1,114 produce stdout (950 distinct) · 2 distinct build rcs · 2 distinct run rcs |
+| **`vl check <dir>` SHARED-INSTANCE leg** | RC=1 both sides (the corpus carries deliberate rejects) — **7,277 output lines each, 1,820 diagnostic lines, 0 differing** |
+| lint-tier A/B (`vl check --severity hint`, per file) | **1,374 rows, 783 carrying ≥1 TAGGED diagnostic, 781 distinct texts — 0 differing** |
+| fuzz A/B, master vs ship | 12 seeds × 3 depths × 2 modes = **86,400 programs/side**, 87,196 output files/side, 796 `.err`, 7,157 + 6,980 distinct `.out` contents across the two modes; whole `--out-dir` trees via `diff -r` — **RC=0, 0 differing paths** |
+| `rep-fuzz-check.sh` | RC=0, exact ✅ (1 baselined, 0 unsound, 0 new, 0 stale) |
+| invocation counts, both sides, both channels | below — **every relocation identity residual 0** |
+| final artifact | `cmp`-checked byte-identical to `CAND.wasm`, the compiler every leg above was measured with |
+
+**THE INHERITED `lintab.py` STILL HAD THE DENOMINATOR BUG — for the THIRD slice running.** #1165
+found it (`grep error` matches the trailing `no errors.` on every row, printing 100%), #1168 fixed
+it in its own copy, and the copy this slice inherited still counted `x[1]` non-empty. Fixed to match
+on the `[HINT]`/`[WARNING]`/`[ERROR]`/`[INFO]` tag: **783 of 1,374**, not 1,374 of 1,374.
+*A bug that is fixed in a report and not in the harness is not fixed — and copying a harness copies
+its bugs.*
+
+### THE WORK COUNT — every delta attributed, and the one that did not close was CHASED
+
+Counters installed identically on master's source and the ship's, driven through `probehost.ts`.
+**Every charstep anchor is the FUNCTION HEADER**, never a loop preamble — #1168's harness anchored
+on `tyGroupEndIndex`'s preamble and silently measured `tyTopIndexOf`, 38 lines above, which has a
+character-identical one.
+
+**CORPUS (1,346 cases)** / **FUZZ (43,200 programs)**
+
+| counter | master (corpus) | ship | Δ | Δ (fuzz) | identity |
+|---|---|---|---|---|---|
+| `shapeFieldParse` | 3,618 | 3,618 | **0** | **0** | untouched — the callers did not move |
+| the deleted ladder's iterations | 51,731 | **0** | −51,731 | −595,619 | deleted |
+| `tyTopLevelSplit` calls | 16,607 | 20,225 | **+3,618** | **+36,692** | **= `shapeFieldParse`'s reach EXACTLY** |
+| `nameIsI32Array` / `retArrFlag` | −6,153 | +6,153 | | −12,132 / +12,132 | **residual 0** |
+| `nameIsStringArray` / `retStrArrFlag` | −9,002 | +9,002 | | −20,350 / +20,350 | **residual 0** |
+| `nameIsF64Array` / `retF64ArrFlag` | −9,058 | +9,058 | | −17,708 / +17,708 | **residual 0** |
+| `nameIsF32Array` / `retF32ArrFlag` | −6,395 | +6,395 | | −11,781 / +11,781 | **residual 0** |
+| `nameIsI64Array` / `retI64ArrFlag` | −6,367 | +6,367 | | −11,640 / +11,640 | **residual 0** |
+| per-character string APPENDS in the shape parse | 40,040 | 16,024 | **−24,016 (−60%)** | 473,072 → 119,171 (**−75%**) | the copy-on-concat shape retires |
+
+**`tyTopIndexOf` was the one delta that did not close on the first reading, and it was decomposed
+rather than explained.** Corpus +4,978, fuzz +64,855 — neither equal to the part count. A second
+counter inside `tyTopLevelSplit`'s loop splits it:
+
+| | corpus | fuzz |
+|---|---|---|
+| `tyTopIndexOf` calls, total Δ | +4,978 | +64,855 |
+| … of which issued BY `tyTopLevelSplit` | **+5,570** | **+65,796** |
+| … all other callers | **−592** | **−941** |
+| `nullablePartOf` calls Δ | −554 | **−941** |
+
+**The `tyTopLevelSplit` figure is an EXACT match to a SECOND, INDEPENDENT INSTRUMENT**: the shape
+twin counted **5,570 / 65,796 fields** produced by those same splits, measured in a different probe
+build on a different day of the slice. Two instruments, same number, residual 0 — which is the whole
+reason the rule says two.
+
+The negative half is the five deleted name predicates taking their own downstream parses with them.
+On fuzz it is `nullablePartOf` **exactly** (−941 of −941, residual 0). On the corpus 554 of the 592
+are `nullablePartOf` and **38 are unattributed to a named callee** — 0.0026% of the counter, in the
+decreasing direction the deletion predicts. Recorded as an open residual rather than rounded away.
+
+**CHARSTEPS ARE NOT A WIN HERE, AND SAYING SO IS THE POINT.** Corpus 14,446,628 → 14,500,177
+(**+53,549, +0.4%**); fuzz 101,937,507 → 102,579,131 (**+641,624, +0.6%**). `spacelessName` scans the
+whole name and re-scans its tail when a space is present, where the ladder scanned `length − 2` once.
+#1168 shipped a −16% charstep reduction; **this slice does not, and the honest framing is that it is
+work-NEUTRAL on the loop axis and a 60–75% reduction on the ALLOCATION axis** — which is the axis
+method note 13 says matters ("this compiler is WasmGC-allocation-bound"). Binary +458 B.
+
+### TARGET 3 — the code-axis census, re-run by DISCOVERY, and the two columns move OPPOSITE ways
+
+Not a seed vocabulary: all **2,535** compiler function headers machine-read (2,531 distinct names);
+a function is a type-string resolver if it has a `string` parameter and either does its own
+character surgery (a char-literal comparison against `{}[]()<>|,:`, a `.slice`/`.indexOf`/
+`strContains`, or a whole-spelling equality) **or** passes one of its own string params to a known
+resolver, to fixpoint.
+
+**MY INSTRUMENT IS NOT #1168's AND DOES NOT REPRODUCE IT — SAY WHICH UNIT OR THE NUMBER IS
+MEANINGLESS.** Mine reads **463 resolvers / 2,074 call sites** tree-wide where #1168 published
+**375 / 1,791**; the partition reads **1,354** (CORE 273 · OFF-LIST 0 · NEITHER 1,081) against its
+**1,114** (280 · 1 · 833). Mine is the broader vocabulary — its whole-spelling-equality arm admits
+functions like `capScan` whose string equality is not about types — so it is a strict overcount in
+the NEITHER bucket, and the overcount is named rather than buried. **The DELTA is what this section
+claims; the absolute is quoted only with its vocabulary attached.**
+
+| bucket | tree-wide base → ship | partition base → ship |
+|---|---|---|
+| CORE (the 23-list) | 305 → 303 | 273 → 271 |
+| **NEITHER** | — | **1,081 → 1,080** |
+| **TOTAL discovered call sites** | **2,074 → 2,071 (−3)** | **1,354 → 1,351 (−3)** |
+
+**AND THE TWO COLUMNS MOVE IN OPPOSITE DIRECTIONS, EXACTLY AS THE BRIEF WARNED.** Per file:
+
+| file | discovered call sites | attribution |
+|---|---|---|
+| `emit_query.vl` | 25 → **20 (−5)** | the five deleted render-then-parse calls, one per predicate |
+| `emit_classify.vl` | 881 → **883 (+2)** | `spacelessName` +1 and `tyTopLevelSplit` +1 — **two CALLS that replaced a 46-line inline ladder** |
+
+**A DELETED INLINE LADDER IS NOT A CALL.** The 23-resolver list cannot see it (`emit_classify`'s
+CORE is 175 on both sides); the discovered-call-site column scores it **+2**; only the walk census
+and the inline-surgery column see the work. On the inline axis (units (b)+(c) under my definition:
+any char-literal comparison, `.slice`/`.indexOf`/`.charCodeAt`/`strContains`, whole-spelling `==`)
+the tree reads **3,870 → 3,866 (−4)**, all of it in `emit_classify` (938 → 934), decomposing as
+**char-literal comparisons 738 → 729 (−9)** and **slice/indexOf 219 → 224 (+5)**: the ladder's
+ELEVEN grouper comparisons became TWO whitespace ones, and five slices replaced the per-character
+accumulation. **Four census columns, four different verdicts on the same patch: −2, −3, +2, −4.**
+
+### Entombment — five sabotages and two positive controls, all built from the SHIPPED source
+
+Each was built from the shipped source with a master-built compiler and A/B'd against the ship over
+the full 1,374-file corpus. The ship source was restored and `cmp`-proved between every one.
+
+| | sabotage | corpus reddened | verdict |
+|---|---|---|---|
+| **P1** | `shapeFieldParse` yields no fields | **28** | positive control — the site IS observed |
+| **P2** | the whole migrated `param*Array` family answers false | **30** | positive control — the family IS observed |
+| S1 | the relocated SPACE normalisation is dropped | **4** | **PINNED by pre-existing fixtures** |
+| S2 | the relocated SPLIT separator is `;` not `,` | **10** | **PINNED** |
+| S3 | candidate C's malformed-part convention (the declined change) | **0** | inert **BY MEASUREMENT** — 0 of 89,166 |
+| S4 | `paramArray` reads the WRONG arena classifier (`retStrArrFlag`) | **27** | **PINNED** |
+| S5 | off-by-one in the relocated name/type cut | **5** | **PINNED** |
+
+S1's four: `arrays/filter-struct-array.vl`, `arrays/map-struct-to-struct.vl`,
+`closures/closure-result-array-of-map-closure-field-structs.vl`,
+`inference/struct-map-callback-param.vl`.
+S2's ten add `closures/closure-struct-value-array-factory.vl`,
+`closures/lambda-nullable-struct-result.vl`,
+`maps/same-fieldset-map-value-closure-arm-original.vl`,
+`maps/same-fieldset-map-value-outer-struct-twin.vl`,
+`structs/nested-struct-vs-niche-fieldset-twin-closure-result.vl`,
+`unions/closure-result-union-nested-struct-arm.vl`.
+S5's five: the three above plus `structs/plain-struct-field-lambda-f32-twin.vl` and
+`maps/same-fieldset-map-value-outer-struct-twin.vl`.
+S4's twenty-seven span `inference/` (7), `generics/` (6), `closures/` (4), `modules/` (3),
+`arrays/` (2), `functions/` (2), `literal-unions/` (2), `lists/` (1).
+
+**Entombment therefore needs NO new fixture: the corpus already fails on a compiler that breaks any
+of the four live relocations.** S3 is inert and that is the finding, not a gap — it is the
+measured-empty population of the candidate this slice declined.
+
+### REFUTATIONS — worth more than the agreements
+
+1. **"`shapeFieldParse` is NOT a dedup target" is refuted by `tyTopLevelSplit`, `shapeInnerFieldSplit`
+   and `canonShapeName` — three splitters over this grammar already written as resume loops over the
+   home.** The decline read the function's shape instead of grepping the module below it.
+2. **A header that warns "A HEADER COMMENT IS NOT EVIDENCE — this one was wrong for two slices" was
+   wrong a third time, in the reverse direction**, filing a retirement that had already happened as
+   pending work worth a whole ladder. Both it and `emit_classify`'s companion "last hand-written
+   FIELD-list walk in this file" (false when written) are corrected in place.
+3. **The inherited `lintab.py` denominator bug survived a second reported-but-unfixed cycle.**
+4. **`paramMap` does NOT migrate, and the obvious dual is a trap.** `emit_classify.retMapFlag` looks
+   like the arena answer for "is this node a bare map" and is not: its body is
+   `nameIsBareMap(ty.tyName)` over the same render, plus a `mapValKindLowerable` gate this predicate
+   lacks. Switching would be lateral AND silently narrowing. One hop into the callee, per method
+   note 10.
+5. **The `param*Array` coverage figure is 16% or 100% depending on which question is asked**, and
+   only one of them is decision-relevant. 5,985 of 36,975 corpus calls are arena-covered; but
+   18,577 of 18,577 calls that have a parameter annotation node at all are. The other 172,115 are
+   `paramTypeNode` = -1 and both legs answer false.
+6. **This slice is NOT a work win on the charstep axis (+0.4% / +0.6%)** and does not claim one. It
+   is a 60–75% allocation reduction inside the migrated function and +458 B of binary.
+7. **My discovery census does not reproduce #1168's** (463/2,074 vs 375/1,791). Different
+   vocabulary, overcount named, deltas only.
+
+### Hand-offs, best-measured first
+
+1. **`nameIsBareMap` is now unblocked, and the blocker its own header names is DISCHARGED.** That
+   header says the migration is "an edit to THIS function" once "the annotation-node consumers get a
+   covered `nodeTyIx`". **That coverage is measured here: 18,577 of 18,577 parameter annotation nodes
+   over corpus + fuzz.** What remains is its **21 call sites** (`emit_classify` 15, `emit_collect` 4,
+   `emit_base` 1, `emit_query` 1) — a slice of its own. `paramMap` is the single-site starting point
+   and its header carries the mechanism.
+2. **The last hand-written `nonNulBaseOf` fold is STILL OPEN, and its filed LINE NUMBER has already
+   gone stale by one** (#1168 filed `wasmEmit.vl:4112`; at this head the `let rlen = rlElemName[rslot]`
+   is **`wasmEmit.vl:4111`**). Re-verified by grep, not inherited: `wasmEmit.vl` still spells the
+   three-line peel and contains **zero** occurrences of `nonNulBaseOf`. Its warning holds too — the
+   diff may STRAND `nullablePartOf`'s import, which only `lint-self.sh` sees. `wasmEmit.vl` is not
+   this partition's file. *(Third consecutive slice in which a filed line number moved: quote the
+   ANCHOR TEXT, not only the line.)*
+3. **`typecheck.topLevelArrowIndex` and `emit_base.annArrowAt` are still character-identical**
+   (#1168's hand-off 2), both `{ tyTopIndexOf(name, '=', 0, 0) }`. **Line numbers re-verified at THIS
+   head: typecheck.vl:4788, emit_base.vl:2001** — unchanged from `e5be130`, so the filed diff still
+   applies verbatim. OFF-LIST −3.
+4. **The two homes are now the whole grammar, which changes what "one more repair" costs.** Every
+   `<>`/quote repair this program shipped (#1118, #1120, D-CLASSANG, #1146) had to be applied copy by
+   copy. There are no copies left: a repair to `tyTopIndexOf` or `tyGroupEndIndex` is now a repair to
+   the compiler. **That is the terminal state for the WALK axis; it is not the terminal state for the
+   program** — 303 CORE call sites and ~1,080 NEITHER sites in this partition remain.
+5. **`spacelessName` is the residue of the ladder and is a candidate for deletion, not adoption.**
+   It exists only because `tyToStr` and `tyToEmitName` render the same shape two ways. **One agreed
+   emit renderer retires it outright** — which is the census's step 3, already filed as "a
+   prerequisite, not a cleanup". Its FIRE data sizes the prize: 18,666 of 89,166 (21%) of shape names
+   reaching the field parser are in the spaced vocabulary.
+6. **The fuzz generator still emits no generic applications** (#1165, unchanged at this head): `gae*`
+   coverage rests on the corpus alone. It also emits single files, so the module merge is
+   fuzz-unreachable. Both channels were required here for exactly that reason.
