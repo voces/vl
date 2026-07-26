@@ -9500,6 +9500,17 @@ Diagnostics anchoring is deliberately NOT `nameToTyAt`'s: an `is` type has never
 resolution still reports exactly where it reported before. That is what makes the byte-identity
 below reachable at all.
 
+**The name leg is DEAD at these five sites, and structurally so — say it rather than let the word
+"ladder" imply a live rung.** `mkIsExpr`/`mkIsExprNeg` have exactly three call sites, all three in
+`parser.vl` (the `is` and `!is` operators and `parseMatchPattern`), and each banks a root with
+`setAnnTs` on the line after minting the node — so **no `IsExpr` exists without a spelling tree**.
+`checkProgram` is called from `driver.vl` and nowhere else, so all five sites run before the
+emitter can synthesize an `IsExpr` at all. The measured `notree = 0` over 228,869 reads is
+therefore a confirmation of a structural fact, not a lucky coverage number. **Nothing is deleted
+anyway**, because the fall-through is `annotResolve`'s SHARED body — the rung serving the
+un-positioned population — and not a branch private to this site. This is a ladder in the
+bookkeeping sense only.
+
 ### The call arithmetic, and the unit that means something
 
 **0 type-string parsers DELETED · 5 resolution sites LADDERED · NET −5 `nameToTy` call sites.**
