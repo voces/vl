@@ -21724,3 +21724,297 @@ can never fail this way, so a green local ladder is evidence about your seed, no
      cannot self-compile without this fix" is the most convincing evidence a compiler fix can have,
      and it is precisely the evidence that cannot ride in the same PR. Take the corpus pin for the
      fix, and land the self-compile use as the follow-up that also re-proves it.
+
+## D-SIGSKIP + D-ARRROUTE — the ONE non-inert `$fnsig` intern site gets its guard, and the ARRAY-NAME grammar leaves three more files (#PRNUM)
+
+Off master `63cdb61` (#1175). Two subjects, one partition
+(`emit_collect` / `emit_mono` / `emit_rep` / `emit_rewrite`).
+
+### PART 1 — #1174's site 3: RE-DERIVED AT THIS HEAD, REPRODUCED, AND THE MECHANISM IT COULD NOT NAME
+
+#1174 filed: *"Site 3 (line 640, a lifted function's nulclosure RETURN) is the ONE synth
+site whose missing mixed-union skip is not provably inert."* It shipped no guard and no
+witness, and offered the one-line fix.
+
+**The line number was already stale and the lead was still right.** At `63cdb61` site 3 is
+`emit_collect.vl:681`, not 640 — 640 was the pre-collapse `3974381` line the census table
+was built from. Re-derived by anchor text (`cloRetValKind(fe) == "nulclosure"` →
+`nullablePartOf(tyNameOf(rfn.fnRet))`), not by line.
+
+**Site 1's inertness is upheld** — its `takes` gate admits only a nested closure, a plain
+scalar or (annotation entry) a whole-span shape, never a union, so the mix test cannot fire.
+Unchanged.
+
+#### The witness
+
+**Four probe builds, each a `emitFail` POISON at site 3** (the compiler's `print` needs a
+host import `vl build` does not provide, so a poison is the only instrument that survives
+the self-compile): REACH (any non-empty key), FIRE (the guard would fire), DEC (the four
+registration predicates as a bit-string), KEY (the banked `$fnsig` key).
+
+| probe | corpus (1,399) | fuzz | hand-built CONCRETE battery (20) |
+|---|---|---|---|
+| REACH | **9 files** | 28 / 12,000 | 20 / 20 |
+| FIRE  | **0 files** | 0 / 800 | **0 / 20** |
+
+**Every one of the 20 concrete mixed-union spellings reads `[U]` — `isUName` is TRUE.**
+That is #1174's subsumption hypothesis, confirmed: `collectTyReachRegister` registers a
+concrete closure-result union, so the guard declines. Building more concrete cells was
+never going to produce a witness, and that is why four of them were inert.
+
+**THE POPULATION IS AN UN-INSTANTIATED GENERIC TEMPLATE, AND THE REASON IS PASS ORDER.**
+`collectU` — which owns `collectInlineUnions` → `collectTyReachRegister` — is emit pass
+**#1**. `synthRetAnnots` and `monomorphize` run later, and **there is no `collectU#2`**
+(`emit_sections.runEmitPass`'s `#2` stage re-runs `collectA`/`buildFnMap`/`computeVoidFns`/
+`computeRetInference`, not `collectU`). A generic TEMPLATE is in `fnStmts` and its declared
+return spelling still carries the type PARAMETER:
+
+```
+function mk<T>(_x: T): ((i32) => i32 | T) | null { return null }
+```
+
+`cloResultAtomOf` yields `i32|T`. `T` is neither a value atom nor a litunion, so it is the
+**composite** side of the mix test; `i32` is the scalar side; and **all four registration
+predicates decline** — decision vector `[]`, measured, against `[U]` on all 20 concrete
+cells. The guard fires.
+
+FIRE over the constructed generic batteries: **2/10, then 8/13.** Shapes that fire:
+`i32|T`, `T|i32[]`, `string|T`, `boolean|T`, `f64|T`. Shapes that do NOT: `T|{w:i32}`
+(both sides composite — no scalar), `A|B` (two params, both composite).
+
+#### The key, and the two divergence mechanisms
+
+The KEY probe reads the banked key at site 3. For the template it is **`i>u`** — and for
+the concrete `((i32)=>i32|{w:i32})` it is **`i>u` as well, byte for byte**. So the template
+banks an ABI key derived from a spelling that mentions a type PARAMETER, into the same slot
+space a real closure uses.
+
+A/B (master `63cdb61` seed vs the fix), five fields per program:
+
+| # | mechanism | witnesses | signature |
+|---|---|---|---|
+| A | **SPURIOUS ENTRY** — an extra synthesized functype | 9 of 14 (battery 3) + 6 of 13 (battery 2) | module **7 bytes shorter** under the fix (253→246, 220→213, 500→493 …), run output IDENTICAL |
+| B | **REP OVERWRITE** — the template's `-1` synth rep pre-empts a concrete lambda's, because `internCloSigKey` keeps the FIRST rep for a key | 4 of 7 (battery 4) + the shipped fixture | **SAME size, DIFFERENT bytes** (410 B / 410 B; the fixture 517 B / 517 B) |
+
+**WHAT I DID NOT FIND, STATED PLAINLY: no program on which this changes RUN OUTPUT.**
+Searched: 44 constructed programs across four batteries, the full 1,399-file corpus, and
+the fuzz grid below. Every A/B pair above is byte-divergent and output-identical. So this
+is a **tightening**, not a bug fix, and it is entombed by a **wasm-SHA** pin, not a `@log`
+one — `deno task test` compares OUTPUT and therefore *cannot* see it. Sabotage S2 below is
+what makes that pin real.
+
+The three shapes that *would* have been observable were each caught by a DIFFERENT floor
+first: the narrowed value call rejects at `value-union closure RESULT is not yet
+representable` on both sides, and two composed attempts reject at
+`monomorphize: unsupported argument type`. Recorded so the next operator does not re-walk
+them.
+
+#### A SEPARATE, LIVE, PRE-EXISTING INVALID-WASM MISCOMPILE, found by the control and NOT fixed here
+
+```
+function mk<T>(_x: T): ((i32) => i32) | null { return null }
+const a = mk(1)
+print(1)
+```
+→ `Invalid input WebAssembly code … type mismatch: expected i32, found (ref null $type)`,
+on master AND on this build. **No union anywhere** — it is the CONTROL for the witness
+battery, which is how it surfaced. The narrowed-call form runs fine:
+```
+function go() { const t0 = mk(1)  if t0 != null { print(t0(1)) } else { print(9) } }
+```
+prints 9. So the trigger is an **UNREAD binding of a generic function's nullable-closure
+return**. Not this slice's file and not this slice's subject; filed with its control rather
+than folded in. It is also the reason six of the battery-2 A/B rows are "both sides
+invalid, differently" — those rows witness site 3's non-inertness but say nothing about
+whether either side is correct, and are reported as such.
+
+### PART 2 — the ARRAY-NAME grammar: #1175's homes get their callers in this partition
+
+#1175 built `emit_base.arrElemNameRaw` (the RAW trailing-`[]` CUT) beside `nameIsArray`
+(the TEST), and exported it naming `emit_mono` as the caller it was built for. **The home
+existed before this slice wrote a line — the job was routing, not homing.** Rebased onto
+`63cdb61` and checked first, exactly so a second home was not built.
+
+**UNIT (character-grammar census):** one OCCURRENCE = one textual match of the grammar in
+`//`-stripped, **char-literal-PRESERVING** source, flattened to one logical stream so a
+predicate split across three lines counts once. (Blanking char literals as strings scores
+every one of these columns 0 — #1139's harness note, re-earned.)
+
+**Instrument validated against #1174's published partition figures before it produced a new
+number: 4 of 5 columns reproduce EXACTLY** (peel 5, shape-open 5, paren-open 2, arrow-prefix
+2). The fifth reads **6 vs their 5** — my suffix regex also matches `emit_mono:1445`'s
+`an2[an2n - 2] != '['`, which is HALF the grammar (no `]` test). Named, not smoothed.
+
+| grammar | partition before | after | tree-wide before → after |
+|---|---|---|---|
+| `[]`-elem peel `.slice(0, X.length-2)` | **5** | **0** | 25 → 20 |
+| `[]`-suffix test `X[n-2]=='[' && X[n-1]==']'` | **6** | **1** | 24 → 19 |
+| SHAPE-not-MAP open `X[0]=='{' && X[1]!='['` | 5 | 5 | 14 → 14 |
+| PAREN open `X[0]=='('` | 2 | 2 | 16 → 16 |
+| ARROW prefix `X[0]=='=' && X[1]=='>'` | 2 | 2 | 4 → 4 |
+
+**`emit_rewrite.vl` leaves the character-grammar census entirely — 0 in all five columns.**
+Six sites routed: `emit_collect` `gaePeelWrappers` (the repeated-`[]` while loop) and
+`registerInlineUnion`'s nested-array peel; `emit_mono` `monoStructAnnName`,
+`monoArgTyName`'s Index arm, and `monoCoerceFnValueName`; `emit_rewrite`'s two
+`synthRetAnnots` element-list arms.
+
+Every routed site keeps its own `length > 2` / `n >= 3` guard **in front of** `nameIsArray`
+rather than folding it in: those guards exclude the degenerate `"[]"`, which `nameIsArray`
+accepts and whose raw cut is `""` — the exact ambiguity the home's header says it asserts
+nothing about. Faithful, not harmonized.
+
+**THREE GRAMMARS DELIBERATELY NOT MOVED, and the reason is the partition, not the code.**
+SHAPE-not-MAP open (5), PAREN open (2) and ARROW prefix (2) have **no home anywhere**, and
+the home for all three belongs in `emit_base.vl`, which another agent holds. Building one in
+`emit_collect` would be a *second* home for a grammar whose mass (6 + 5 + 1) is in
+`emit_classify` — the precise failure this program exists to remove. **Filed, not built.**
+
+**ONE MORE SITE DELIBERATELY NOT MOVED, with its mechanism:** `emit_mono:1445/1454` is a
+HALF test (`an2[an2n - 2] != '['`, no `]` check) followed by a raw cut
+(`an2.slice(0, an2n - 2)`). Routing the test to `!nameIsArray` would TIGHTEN it (a name
+ending `[x` currently passes and would stop passing) and routing only the cut would
+de-synchronize the pair. They move together or not at all, and moving them is a behaviour
+change needing its own gate. Left.
+
+### THE COUNTS, IN FOUR COLUMNS, TWO OF WHICH GO UP
+
+**UNIT (call sites):** a textual `NAME(` in `//`-stripped, non-string code preceded by a
+non-`[A-Za-z0-9_.]` character, each resolver's own `function NAME(` header excluded, per-file
+sums cross-checked against a tree-wide recount (they are equal, asserted by the harness).
+**Vocabulary: my own 23-name reading of the SCORECARD list. I could NOT reproduce #1174's
+exact 55 for this partition (I read 75), so only the DELTA is comparable — the absolute is
+not.** Say which unit, or the number is meaningless.
+
+| column | before | after | delta |
+|---|---|---|---|
+| 23-resolver CALL SITES, this partition | 75 | 80 | **+5** |
+| 23-resolver CALL SITES, tree-wide | 364 | 369 | +5 |
+| INLINE `[]` SURGERY (peel + suffix), this partition | **11** | **1** | **−10** |
+| INLINE `[]` SURGERY, tree-wide | 49 | 39 | −10 |
+
+**The call column goes UP and that is the correct report, decomposed exactly:** five new
+`nameIsArray` calls — `emit_collect` +1 (`gaePeelWrappers`), `emit_mono` +2, `emit_rewrite`
++2. `arrElemNameRaw` is not on the 23-name list, so its six new calls are invisible to that
+column. **A deleted INLINE ladder is not a call** (#1169's note, third instance). Residual 0.
+
+Binary **1,032,729 → 1,031,647 B (−1,082)**, both artifacts checksummed, the baseline built
+at this slice's own gating head.
+
+### EVIDENCE — every RC checked explicitly
+
+- `refresh-compiler.sh` **RC=0**; refreshed seed sha256 `ccec4a40…` / 1,031,647 B, and
+  `cmp` shows it BYTE-IDENTICAL to the `CAND.wasm` every A/B below ran against — the gated
+  artifact and the shipped artifact are one object. Re-run after `vl fmt` and re-`cmp`'d
+  (a source round-trip must be proved byte-neutral, not assumed).
+- `native-fixpoint.sh` **RC=0** — stage3 == stage4 byte-for-byte (1,031,647 B).
+- `SELFHOST_NATIVE_ALIGN=1 deno task test` **RC=0** — **2,132 passed / 0 failed / 14
+  ignored**. Graded against the MASTER seed in the SAME tree, SAME session: **2,132 / 0 /
+  14** as well, and the **IGNORED NAME SETS ARE IDENTICAL (14 = 14, diff empty)**. Master
+  totals 2,131 + this slice's 1 new fixture. (A run without the env var reports ~1,400 and
+  RC=0 — an implausibly LOW pass count is as much a red flag as a failure.)
+- `deno check tests/cases_wasm_test.ts` **RC=0** — the leg `deno task test` cannot see.
+- `lint-self.sh` **RC=0** (self-lint at `--severity info` + `vl fmt --check`). It caught two
+  unformatted files first; formatted via `vl fmt f > tmp && mv tmp f`, never in place.
+- `rep-fuzz-check.sh` **RC=0** — `exact ✅` (1 baselined failure: 0 unsound, 1 reject; 0
+  new, 0 stale).
+- **Corpus A/B, all 1,400 files, FIVE fields** (build rc · wasm sha256 · build diagnostics ·
+  run rc · run stdout+stderr), every temp path normalized out of the compared text:
+  **exactly 1 differing file — this slice's own new fixture — and it differs ONLY in the
+  wasm SHA (same 517-byte size, same diagnostics, same run output). 1,399 of 1,399
+  pre-existing files IDENTICAL on all five fields.**
+- **Shared-instance `vl check <dir>`** (the sidecar-lifetime channel — ONE compiler instance
+  across a whole tree, which `vl run --batch` does NOT exercise): `std` **IDENTICAL** (21
+  lines), `compiler` **IDENTICAL** (2,185 lines), `tests/cases` **IDENTICAL** (7,433 lines).
+- **Fuzz A/B: 67,200 programs per side, 84 cells** (7 seeds × 3 depths × 4
+  dimension combos — plain / declared / branching / multiobs), whole per-case signature
+  (stdout, or the first error line): **0 divergent cells, 0 divergences.**
+
+**AND THAT FUZZ ZERO IS BLINDNESS, NOT AGREEMENT — MEASURED, NOT ASSUMED.** The rule says
+treat a 0 on either channel as a coverage question until the other channel confirms it, so
+sabotage **S1 — which reddens 3 corpus files** — was re-run through the SAME fuzz harness:
+**0 divergences over 12,800 programs per side in 16 cells.** A sabotage that is loud on the
+corpus is silent on the fuzz grid, so on THIS code path the fuzz channel cannot testify at
+all. (Consistent with the REACH probe: site 3 is reached by only 28 of 12,000 fuzz programs
+and by 9 of 1,399 corpus files, and the generator emits no *generic* nulclosure return at
+any depth.) **The corpus is the channel that carries this change; the fuzz run is reported
+as a non-regression sweep, NOT as evidence of equivalence.** Third instance in this arc of
+channel-specific blindness, after #1125 (224 corpus / 0 fuzz) and #1127.
+
+### A ZERO IS WORTHLESS UNTIL THE COMPARATOR IS SHOWN TO FIRE
+
+Eight sabotages, each built from the SHIPPED source with the PRISTINE master seed and the
+source restored from a SAVED ARTIFACT afterwards — never by re-running `refresh-compiler.sh`,
+which self-compiles and would compile clean source with the sabotaged compiler (the
+self-poisoning that produced two false "reddened" reports earlier in this arc). Each A/B'd
+over the full 1,400-file corpus against the shipped candidate.
+
+| # | sabotage | corpus files reddened |
+|---|---|---|
+| S1 | site 3 interns NOTHING | **3** |
+| S2 | site 3 keeps master's UNGUARDED intern (the polarity flip) | **1 — exactly this slice's fixture** |
+| S3 | `emit_mono`'s routed RAW cut swapped for the PAREN-STRIPPING home | **0 — inert, stated** |
+| S4 | same swap in `emit_rewrite` | build-fails (no such import) — not a sabotage, withdrawn |
+| S5 | `gaePeelWrappers` loses the degenerate-`"[]"` guard the routing preserved | **0 — inert, stated** |
+| S6 | `emit_collect`'s routed cut DROPPED (element = the array name) | **75** |
+| S7 | `emit_rewrite`'s routed cut DROPPED, both arms | **6** |
+| S8 | `emit_mono`'s routed cut DROPPED in `monoStructAnnName` | **3** |
+
+**S2 is the entombment of Part 1 and it is the whole reason the fixture ships**: the
+fixture is the ONLY file in 1,400 that distinguishes master from the fix, and it does
+distinguish them. **S3 and S5 are honest zeros**: their divergence populations are EMPTY
+(no corpus closure-array element carries the paren shape `listElemNameOf` would strip; `"[]"`
+is not a producible corpus type name). Unreached ≠ licenced — the faithful forms ship and
+the measured zeros are published rather than read as agreement.
+
+### METHOD NOTES THIS SLICE EARNED
+
+112. **A DECLINE'S "I COULD NOT BUILD A WITNESS" IS A STATEMENT ABOUT THE BUILDER'S
+     VOCABULARY, NOT ABOUT THE POPULATION.** #1174 wrote four cells for this guard and all
+     four were inert. Every one was a CONCRETE spelling, and every concrete spelling is
+     registered by construction — the population it needed was *the un-instantiated
+     template*, a shape no amount of concrete-cell enumeration reaches. **When cells come
+     back inert, ask what the cells all had in common, not whether to write more.**
+113. **PASS ORDER IS A SUBSUMPTION BOUNDARY, AND IT IS INVISIBLE IN THE FUNCTION YOU ARE
+     READING.** "`collectTyReachRegister` registers exactly those unions" is true and still
+     leaves a hole, because the registering pass is emit **#1** and the consuming pass runs
+     after `monomorphize`. **Before accepting "another pass already handles this", find both
+     passes in the pass TABLE and compare their positions.**
+114. **A POISON PROBE OUTLIVES A PRINT PROBE IN A SELF-HOSTED COMPILER.** `print` inside the
+     compiler adds a host import (`__print_i32__`) that `vl build --compiler` does not
+     provide, so the instrumented compiler will not load at all — and its first symptom is
+     a clean-looking `0` from the harness, not an error. Routing the message through
+     `emitFail` makes every reach a greppable build failure and needs no host change.
+     **Sanity-check any instrument that reports 0 by first making it report non-zero.**
+115. **AN A/B THAT CHANGES BYTES BUT NOT OUTPUT IS STILL A WITNESS — SAY WHICH.** Two
+     mechanisms here look nothing alike on the wire: a spurious entry is *7 bytes shorter*,
+     a stolen representative is *the same size, different bytes*. Reporting only "the wasm
+     differs" would have hidden that the second one exists. **Report the SIZE delta and the
+     SHA delta separately; they are different findings.**
+
+116. **PROVE THE CHANNEL BEFORE YOU BANK ITS ZERO — AND EXPECT ONE OF THEM TO BE BLIND.**
+     67,200 fuzz programs read 0 here, and so did the SAME harness run against a sabotage
+     that reddens 3 corpus files. The fuzz zero was worth nothing on this code path and
+     would have read exactly like agreement. **Grade every channel with a sabotage you
+     already know is live on the other one; report the blind channel as a sweep, not as
+     evidence.**
+
+### HAND-OFFS
+
+1. **`emit_base.vl` (not my partition) — the SHAPE-not-MAP open `X[0]=='{' && X[1]!='['` has
+   no home and 14 tree-wide occurrences** (`emit_classify` 6 · `emit_collect` 3 · `emit_rep`
+   2 · `emit_base` 2 · `typecheck` 1). It is one rule — "opens as a SHAPE, not a MAP" — and
+   it is the largest remaining un-homed character grammar. Same for PAREN-open (16) and
+   ARROW-prefix (4). Whoever owns `emit_base` can home all three; this partition then routes
+   in one follow-up.
+2. **`emit_mono:1445/1454`** — a HALF `[]` test plus a raw cut, which must move together;
+   moving them TIGHTENS the test and needs its own gate. Exact anchors in Part 2.
+3. **LIVE INVALID-WASM, not mine:** an UNREAD binding of a generic function's
+   nullable-closure return (`function mk<T>(_x: T): ((i32) => i32) | null` + `const a =
+   mk(1)`) emits an unparseable module on master and on this build, with no union involved.
+   Control that runs is in Part 1. Belongs to whoever owns the mono/closure lowering.
+4. **The template should probably not reach `collectCloSigs` at all.** This slice guarded the
+   one site where that leak was measurable; the general statement — *an un-instantiated
+   generic template contributes `$fnsig` entries keyed on spellings containing type
+   parameters* — is broader than one guard and was not taken on without a witness for the
+   wider claim.
