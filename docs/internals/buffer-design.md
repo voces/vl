@@ -398,10 +398,20 @@ Three options.
 *(a) Widen the dunder floor, `Buffer` is std VL.* The compiler gains 18 generic `__load_*__`/
 `__store_*__`/`__memory_*__` intrinsics; `std:buffer` defines the struct, the allocator and 14 UFCS
 methods over them. Smallest compiler change, entirely in the existing idiom, and every piece is
-measured working except §B3. Cost: each `buf.loadF32(i)` is a real wasm `call` — measured, the
-compiler does no inlining of its own, and **`wasm-opt -O` (what `vl build -O` runs) does not inline
-these wrappers; `-O3 --closed-world` does** (the two wrapper calls disappear). So (a)'s codegen is
-acceptable only on the release profile P1.3 asks for, which is not today's default.
+measured working except §B3. Cost: each `buf.loadF32(i)` is a real wasm `call` — the compiler does
+no inlining of its own, and **`wasm-opt -O` (what `vl build -O` runs) does not inline these
+wrappers; `-O3 --closed-world` does.** Measured on the §A5 program, where the wrapper calls vanish
+while the load/store instruction counts *rise* — which is what distinguishes inlining from the
+whole thing being constant-folded away:
+
+| | direct calls | `i32.store` | `i32.load` | output |
+| --- | --- | --- | --- | --- |
+| unoptimized | 2×`$0`, 2×`$1`, 2×`$2` | 2 | 1 | `64 111 222` |
+| `-O` (host flags) | 2×`$0`, 2×`$1`, 2×`$2` | 2 | 1 | `64 111 222` |
+| `-O3 --closed-world` | 2×`$0` | **3** | **2** | `64 111 222` |
+
+So (a)'s codegen is acceptable only on the release profile P1.3 asks for, which is not today's
+default.
 *(b) `Buffer` is a compiler-known nominal type* whose member calls lower to single instructions. Best
 codegen unconditionally, no dependency on §B3, but it is the first builtin method family on a
 non-container receiver, it needs nominal-type machinery the arena does not have (see
@@ -560,8 +570,8 @@ inside a `Buffer`, which is orthogonal to everything above. Neither is designed 
   hash granularity, the render-publish ring's aliasing rules), they are not reflected here.
 - **Whether webcraft's sim uses lambdas at all** — which decides whether §B3 is a blocker or a
   latent one for them specifically. It is a blocker for the general case regardless.
-- **The real cost of the per-access call under a hot loop.** Measured: the calls exist at `-O` and
-  disappear at `-O3 --closed-world`. Not measured: what that is worth in ns on a
+- **The real cost of the per-access call under a hot loop.** Measured: the calls survive `-O` and
+  are inlined away at `-O3 --closed-world`. Not measured: what that is worth in ns on a
   `for i { x[i] += vx[i] }` kernel, because there is no such kernel to run yet and a synthetic one
   would measure binaryen, not VL. This is the number that should decide O1(b) vs O1(c), and it can
   only be taken after S5.
