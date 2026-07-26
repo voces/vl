@@ -6041,3 +6041,243 @@ The bisect that narrows it: the same two functions beside ONE, TWO, … FIVE of 
 DECLARATIONS all compile and run on this build (and all fail on master). So it is not the count
 of `{v:i32}` variant rows in `uVariants`, nor any single member kind — it is the composition
 with the CONSTRUCTED-and-narrowed globals. That is where to start.
+
+## D-FIELDCODE — the FIELD-CLASSIFICATION tables get ONE home (#1123)
+
+`repRowOfTyLenientRow`'s own comment (emit_classify.vl) names the target and the cost:
+
+> the field-code vocabulary has exactly two producers, both string-driven —
+> `nameFieldCode(t: string)` over a rendered type and `fieldTypeCode(tyIx)` over an AST
+> `TypeRef` node's `tyName` — and no `Ty`-arena classifier, so an arena tightening would
+> mean a THIRD hand-copied copy of a 34-arm table (the exact drift hazard D-ABIDEDUP had
+> just removed).
+
+Two hand-copied copies of one ladder is two copies of every parse in it. This slice makes
+the field-code table, and the field-ELEMENT-name table below it, single-homed. It is
+D-ABIDEDUP's move applied to the field layer: **NET −9 on the parser list, −28 counting
+every type-name classifier**. (A first draft of this line called it the program's largest
+single-file parse deletion. It is not — D-ELEMROW/D-UARMSLOT (#1116) scored NET −24 with 17
+parses deleted. The correction is recorded rather than silently applied, on this doc's
+standing rule that a superlative is a measurement.)
+
+### The enumeration, and the counting method
+
+Local-aware, **by resolver actually called**, over `compiler/emit_classify.vl` alone (this
+slice's whole partition). Line comments and string literals are blanked before matching;
+the resolver's own definition header is excluded. The list is the SCORECARD CORRECTION's
+parser list plus D-ARROWTY's four additions (`refArrElemKind` / `nameIsI32ListArray` /
+`nameIsMapArray` / `nullClosureArrElem`).
+
+**328 parse call sites** in `emit_classify.vl` at master `adbe6f0`. (D-ARROWTY measured 331
+in this file at #1118's base; #1120–#1122 took three.)
+
+The four functions this slice touches, and what they held:
+
+| function | parser-list sites | every type-name classifier |
+|---|---|---|
+| `fieldTypeCode(tyIx)` — the NODE entry point | 8 | 24 |
+| `nameFieldCode(t)` — the SPELLING entry point | 9 | 25 |
+| `fieldRefElemName(tyIx)` — the NODE element-name recorder | 6 | 7 |
+| `shapeFieldElemName(ftxt, code)` — the SPELLING element-name recorder | 9 | 11 |
+
+`fieldTypeCode` and `nameFieldCode` are the same 34-arm ladder written twice, and the two
+copies do **not** agree on arm ORDER: `fieldTypeCode` tests the nullable-list group (18 /
+28 / `nulScalarListFieldCode`) ahead of the map group (19 / 29) and `nameFieldCode` tests
+them the other way round. `fieldRefElemName` and `shapeFieldElemName` are the same
+code-dispatch written twice, with three arms that genuinely differ and four that do not.
+
+### The shape
+
+One table, two entry points, and the ONE arm whose *evidence* differs is a parameter:
+
+```
+function fieldCodeOfSpelling(t: string, litNode: i32)   // the 34 arms, once
+export function nameFieldCode(t: string)                // + the 2 name-driven closure arms
+export function fieldTypeCode(tyIx: i32)                // + the 2 ARENA closure arms
+                                                        // + the inline-shape tail
+```
+
+`litNode >= 0` is an AST node index and the literal-union arm is answered from the
+checker's recorded type (`nodeTyIsLitUnionAlias` — no parse); `litNode < 0` means there is
+no node and the spelling answers (`nameIsLitUnionType`). Passing the NODE rather than a
+precomputed flag is what keeps the arm lazy on both paths — a `boolean` parameter would
+have made every `"i32"` field pay for a literal-union verdict the scalar arms above settle.
+
+`fieldRefElemName` keeps exactly the three arms where the node recorder is not the shape
+recorder, and delegates the other four:
+
+| code | node recorder | shape recorder | disposition |
+|---|---|---|---|
+| 15 nested struct | NOMINALIZES (`structIndexOfTypeName` → `sNames[idx]`) | records the spelling | **kept** — S4 reddens |
+| 28 nullable ref-list | no deferred fallback | deferred `[]`-slice fallback | **kept** |
+| 0 / 30 litunion atom + niche | `""` | records the union name | **kept** |
+| 16 / 19 / 29 / 4 | identical | identical | delegated |
+| 5 ref-list element | `refArrElemName` else raw `[]`-slice, UNGATED | same, gated on `nameIsArray` | delegated — **the gate is implied**: code 5 is only ever assigned under `nameIsArray`, so the two fallbacks have the same domain |
+
+### The measurement — probes on BOTH entry points, sabotage-verified on both channels
+
+Additive probe: master's ladder and the candidate computed side by side at every call, the
+master answer returned, disagreements counted and reported at the end of a successful
+`emitProgram` (the report is the first `emitFail`, so it is never masked).
+
+| probe | corpus reaches | fuzz reaches | **disagreements** |
+|---|---|---|---|
+| P1a `fieldTypeCode` (NODE entry) | 3,851 | 11,829 | **0 / 0** |
+| P1b `fieldRefElemName` (NODE element name) | 3,865 | 12,780 | **0 / 0** |
+| P2 `nameFieldCode` (SPELLING entry) | 7,825 | 60,321 | **0 / 0** |
+
+**100,471 comparisons, 0 disagreements.** Corpus = 1,294 files, of which 1,102 reach
+`emitProgram`'s end and report; fuzz = 50,400 programs for P1a/P1b (48,093 report) and
+14,400 for P2 (13,700 report).
+
+Comparator sanity (method note 12) — the SAME harness, against a candidate perturbed to
+disagree on every reach:
+
+| sabotage of the comparator | corpus | fuzz |
+|---|---|---|
+| P1a candidate `= master + 1` | **3,851 / 3,851** | **3,378 / 3,378** (14,400 programs) |
+| P1b candidate `= master + "X"` | **3,865 / 3,865** | **3,580 / 3,580** |
+| P2 candidate `= master + 1` | **7,825 / 7,825** | **60,321 / 60,321** (14,400 programs) |
+
+100% of reaches on both channels: neither probe is a dead comparator, and neither channel is
+dark.
+
+### Entombment — one seam reddens, three are inert and one is inert BY CONSTRUCTION
+
+The change is behaviour-preserving, so it cannot have a fails-on-master test. Each sabotage
+below is applied to the SHIPPED build and diffed against it over the corpus (byte, message
+AND run):
+
+| sabotage | corpus byte | msg | run | fuzz tree-diff |
+|---|---|---|---|---|
+| S1 the NODE entry stops using its arena literal-union verdict (`fieldCodeOfSpelling(tyName, -1)`) | 0 | 0 | 0 | 0 / 21,600 |
+| S2 the shared table restores master `fieldTypeCode`'s arm ORDER | 0 | 0 | 0 | — |
+| S3 `fieldRefElemName` stops guarding the atom codes (0 / 30 delegate) | 0 | 0 | 0 | **0 / 21,600** |
+| **S4 `fieldRefElemName` stops NOMINALIZING a nested-struct target (15 delegates)** | **1** | **1** | **1** | — |
+| S5 `fieldRefElemName`'s code-28 arm delegates (gains the deferred `[]`-slice fallback) | 0 | 0 | 0 | **0 / 21,600** |
+
+- **S4 is the pin.** `tests/cases/closures/twin-fieldset-closure-field-string-vs-bool-result.vl`
+  stops building — `emitProgram: nested-struct field element type is not interned` — because
+  an inline-shape nested-struct field recorded its SPELLING instead of the interned struct's
+  name, and every nominal-keyed use site (`structIndexByName`) then missed. So the one arm
+  where the node recorder is deliberately *not* the shape recorder is load-bearing, and the
+  merge is not over-merged.
+- **S2 is inert by construction and is stated as such**, not as evidence. It is method note
+  8's case: the arm order is exactly the equivalence P1a measured over 15,680 comparisons,
+  so perturbing it does not leave the equivalence class. It is recorded because it is the
+  one difference between the two former copies, and its inertness is the reason a single
+  table could exist at all.
+- **S1, S3 and S5 are inert on BOTH channels** — 1,294 corpus files and 21,600 fuzz
+  programs each — so **no pin can exist for them today**, stated plainly as #1114 and #1119
+  did. S1 says the node's arena literal-union rung and the spelling test agree everywhere
+  either channel reaches; the rung is kept because it is the destringified one, not because a
+  channel can see it. S3 and S5 say the code-0/30 and code-28 differences between the two
+  element-name recorders are unobservable; they are kept because they are documented,
+  deliberate distinctions and merging them would be a behaviour change this slice is not
+  making. (Both sabotages leave the equivalence class — S3 makes a code-0 field record its
+  union name where it recorded "", S5 makes an unresolvable code-28 element record a raw
+  `[]`-slice where it recorded "" — so this is not method note 8's false null.)
+
+### The work, counted not timed (method note 15)
+
+The one thing this slice CHANGES at runtime is the node path's arm order: the map group
+(19 / 29) now runs ahead of the nullable-list group (18 / 28 / `nulScalarListFieldCode`),
+because the single table keeps the spelling entry point's order. Both compilers were
+instrumented identically — a tick at each of the ten parse helpers the table calls — and run
+over the same corpus:
+
+| | executions of the ten helpers, whole corpus |
+|---|---|
+| master | 8,616,290 |
+| now | **8,616,134** |
+| | **−156** |
+
+1,102 files report on both sides (identical population). Per file: **7 better (−208), 6 worse
+(+52)**, and the direction of each is the arm order plus the `nulMapInnerName` CSE, exactly:
+`structs/nullable-map-field.vl` −84 and `structs/declared-nullable-struct-map-field.vl` −44
+(a nullable-map field no longer parses its inner map name twice, and no longer walks three
+nullable-list arms first); `structs/nul-distinct-scalar-list-field.vl` +24 and
+`arrays/struct-field-nullable-struct-elem-array.vl` +12 (a nullable-list field now walks the
+two map arms first). A net win, and small enough in both directions that no honest wall clock
+would have shown it.
+
+### The call arithmetic
+
+`emit_classify.vl` only; no other file changes.
+
+| resolver | master | now | delta |
+|---|---|---|---|
+| `mapValNameOf` | 30 | 27 | **−3** |
+| `refArrElemName` | 31 | 30 | **−1** |
+| `nameIsMap` | 25 | 24 | **−1** |
+| `nameIsMapMemberUnion` | 16 | 15 | **−1** |
+| `nameIsArray` | 18 | 17 | **−1** |
+| `nameIsStringArray` | 14 | 13 | **−1** |
+| `nameIsI32Array` | 10 | 9 | **−1** |
+| **parser-list TOTAL** | **328** | **319** | **NET −9** |
+
+Counting every type-name classifier the four functions call, not only the parser list, the
+18 further predicates (`nameIsString`, `nameIsF64Array`, `nameIsI64Array`, `nameIsF32Array`,
+`nameIsNulI32List`, `nameIsNulRefList`, `nulScalarListFieldCode`, `nulMapInnerName`,
+`nameIsNulString`, `nameIsNulBool`, `nameIsNulLitUnion`, `isValueUnionName`, `isUName`,
+`nameIsStructDecl`, `nameIsLitUnionArray`, `nameIsNulClosure`, `mvValKindOfName`,
+`nulLitUnionInnerName`) go **141 → 122, −19**. Total type-name classifier calls deleted from
+the file: **28**.
+
+- **Type-string PARSES deleted: 9** (parser list) / **28** (every classifier). No laddering:
+  the two entry points are entry points, not rungs, and neither gained a fall-through.
+- **Parses ADDED: 0. Sidecars added: 0. Consumers laddered: 0.**
+- **Name-keyed RESOLUTIONS deleted: 0; one delegation edge ADDED**
+  (`fieldRefElemName` → `shapeFieldElemName`), which retires 5 hand-copied arms.
+  `structIndexOfTypeName` stays at 22 calls: both of its uses in these functions are the
+  NODE-only arms (the inline-shape tail, and the code-15 nominalization S4 pins).
+- One redundant recomputation deleted from the PATH: `nulMapInnerName(t)` was evaluated
+  twice per reach in each copy.
+- Source: **147 insertions, 212 deletions** (−65 lines).
+- Binary: 1,030,554 → **1,029,445** bytes (**−1,109**).
+
+### What did not move, and the mechanism
+
+- **`nameIsRefArray` (19 call sites in this file; 28 tree-wide — 19 here, 7 in
+  `emit_collect`, 2 in `wasmEmit`, and every raw hit in `emit_base` / `emit_rep` /
+  `typecheck` is a comment).** Untouched, and not for want of trying: it is not a spelling
+  predicate. It folds INTERN STATE into its answer — `structIndexByName`,
+  `shapeElemDeclaredStructIdx`, `variantIndexOf` and a scan of `unNames` all sit inside it —
+  so no structural reading of a type can be its dual, and its call sites take arbitrary
+  strings rather than nodes. Deleting it needs the *element* layer's slot to be banked at the
+  intern site, which is `emit_state.vl`/`emit_rep.vl` state, not this partition's.
+- **`annParamKind` / `annRetKind`** look like the next twin pair (5 + 10 parser-list sites)
+  and are not one: `annRetKind` carries litunion / `void` / map / union-split arms that
+  `annParamKind` has no counterpart for, and their shared arms differ in order for a reason
+  (`annRetKind` must claim a literal-union result before the union split). Merging them would
+  be a behaviour change, not a dedup.
+- **`fieldTypeCode`'s remaining `structIndexOfTypeName` tail** is the inline-shape bridge and
+  belongs to the node entry point alone — the spelling entry point's inline shapes are
+  interned by the annotation pass instead.
+- **The `nulMapInnerName` → `mapValNameOf` → `mvValKindOfName` chain inside the one table**
+  is now the richest remaining parse cluster on the field path (3 parser-list calls in one
+  arm, plus a 13-parse callee). Its dual is a map-value KIND banked at the mv intern site —
+  `mvValKind[slot]` already exists as a column; what is missing is a name→slot lookup ahead
+  of the classifier. That is `emit_state.vl`/`emit_collect.vl` work.
+
+### Hand-off
+
+The "THIRD hand-copied copy" objection in `repRowOfTyLenientRow` is now a **SECOND**, and
+does not have to be a copy at all: an arena field-code classifier is a third `litNode`-style
+parameter on `fieldCodeOfSpelling` (or a pre-rung ahead of it), not a new ladder. The
+tightening `repRowOfTyLenientRow` declines to reproduce — `shapeFieldTypeCompat`'s field-CODE
+test — is therefore reachable from the arena side for the first time.
+
+Exact diff for whoever takes it: `fieldCodeOfSpelling(t: string, litNode: i32)` at
+`compiler/emit_classify.vl`; the arm to extend is
+
+```
+  if litNode >= 0 {
+    if nodeTyIsLitUnionAlias(litNode) { return 0 }
+  } else {
+    if nameIsLitUnionType(t) { return 0 }
+  }
+```
+
+— every other arm is a pure function of the spelling and will need its own arena reading
+before the table can answer without one.
