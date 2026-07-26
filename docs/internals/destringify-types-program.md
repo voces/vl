@@ -18330,6 +18330,165 @@ way in and out, and `git status` is clean afterwards.
      "17 fixed" would have been the same error as the six two-variable controls this bug was
      originally filed with.
 
+## D-POISONARM — an unknown type name inside a union member TRAPPED the compiler; the poison rule had two holes, and completing it also closed a silent-accept and an invalid-wasm class
+
+Defect slice, not a destringify slice. **Scoreboard NET 0** (see the census below), stated
+plainly rather than padded.
+
+### The reported crash, and where the defect actually is
+
+```vl
+function f(v: {foo: string} | {bar: nope}) { return v.bar }
+print(f({ bar: 1 }))
+```
+`vl check` dies with `wasm trap: out of bounds array access`. Symbolicated (`--names` seed):
+`unionArmSeedSafe` <- `unionObjArmForLit` <- `seedExpected` <- `checkCallNode`.
+
+`tsToTy` / `nameToTy` poison-propagate an unresolved component in **every** arm — array element,
+union member, intersection operand, `!` operand, function param and return — with **two
+exceptions**: the inline-object FIELD type and the map VALUE type, both of which pushed the raw
+resolver result straight into the constructor. The map arm even *documented* the omission
+("resolved UNCONDITIONALLY into the constructor, and is NOT poison-checked"). So a `-1`
+sentinel was stored in `TyObj.objFieldTypes` / `TyMap.mVal`, and `unionArmSeedSafe` — which
+indexes `T.tys` by a field type to decide whether a union's struct arm is seed-safe — trapped
+on it. The array arm's own comment had already named this exact failure mode for its element
+("a member access on that hole indexes the type arena at -1 — a checker CRASH"); the object arm
+simply never applied the rule.
+
+**The fix is the rule, applied where it was missing** — 4 sites (both arms in both resolvers).
+
+### The population: one leak, four consequence classes
+
+A 120-cell grid — an unknown name in **20 type positions** x **6 consumers** (param+call,
+param+field-read, `let` annotation, return annotation, struct-decl field, alias-into-union),
+one variable per cell. Graded with CHECK / BUILD / RUN as three separate channels.
+
+| outcome on master | cells | after |
+|---|---|---|
+| CRASH (compiler trap) | 13 | clean `unknown type '…'` |
+| INVALID WASM (checker clean) | 1 | clean `unknown type '…'` |
+| SILENT ACCEPT (checker clean; one **compiled and ran**) | 18 | clean `unknown type '…'` |
+| misleading diagnostic naming `<none>` | 23 | the real `unknown type '…'` |
+| unchanged (the control that must pass) | 65 | unchanged |
+| **regressed** | **0** | |
+
+`const x: {bar: nope} = { bar: 1 }` type-checked with **zero errors** on master, compiled, and
+printed. `<none>` in a diagnostic was the visible tip of the same -1; it no longer appears.
+
+### The SECOND crash, of the same class, found by the shared-instance leg — and PRE-EXISTING
+
+The poison fix was inert on the corpus (0 of 1,359 per-process) and reddened **2 suite tests**
+with the *same* `array element access out of bounds`. It is not this slice's bug:
+`slotCanonKey` dereferences the `sTyIx` struct-row sidecar into `T.tys`, but `sTyIx` and
+`sFieldElemTyIx` are emptied by **`collectS`, pass 2**, and `uFieldElemTyIx` inside `collectU`
+— so `collectU`'s inline-union registration, the FIRST pass, resolves rows against **program
+N-1's arena indices**. `emitProgram` already hoists four sidecars (`mvValTyIx`, `rlElemTyIx`,
+`annRlSlot`/`annRlNul`, `unMem*`) for precisely this reason, each with the same comment. These
+three were missed. Hoisting them completes the pattern; within a program each hoist is a no-op
+because the owning pass empties them again.
+
+**Measured with a PAIRWISE sweep** (fresh instance, compile P, then compile T) over 1,297
+predecessors x 2 targets = **2,592 pairs, same population both sides**:
+
+| | poisoning pairs |
+|---|---|
+| master | **17 of 2,592** |
+| this slice | **0 of 2,592** |
+
+Master's are 12 distinct predecessors, from `inference/hole-*` to `structs/nul-distinct-scalar-list-field.vl`.
+
+### Instruments, and what each one could not see
+
+| leg | verdict | blind to |
+|---|---|---|
+| corpus A/B, one process per file | 3 of 1,363 (all 3 are the new pins) | every cross-program leak |
+| `vl check <dir>` (shared instance) | byte-identical, 7,213 lines/side | anything after the emit passes |
+| `deno task test` (one instance) | found the 2 failures | — |
+| whole-chain order oracle | **0 traps on BOTH sides** | a trap that needs ONE specific predecessor |
+| **pairwise sweep** | 17 -> 0 | — |
+
+The whole-chain oracle is the refutation worth recording: running all 1,297 in order shows
+**zero** traps on master, because a later program overwrites the poisoned row before the victim
+runs. Only the pairwise probe isolates it. It also measured, incidentally, that **1,057 of 1,297
+corpus files emit different BYTES depending on what was compiled before them, on master and
+unchanged by this slice** — semantically benign (the suite compiles in exactly that shared
+instance and is green), byte-stable on repeat (4x the same program is identical), and NOT this
+slice's business; recorded so the next reader does not re-derive it.
+
+### `print` — the type it actually has
+
+The brief's premise was that `(any) -> null` is invented by the display layer. **Refuted:**
+`compiler/driver.vl`'s `builtinScan` hand-writes it, `lsp/src/wasmChecker.ts` reads it over the
+`builtinType*` ABI, and the LSP and playground render it verbatim. The compiler was the source
+of the claim.
+
+Both halves were wrong. `any` is not a VL type (`unknown type 'any'`), and the result is `void`,
+not `null`. Enumerated by RUNNING 65 cells, not by reading the checker arm:
+
+| | shapes |
+|---|---|
+| runs correctly | `i32 i64 f32 f64 boolean string`, same-rep literal/finite unions, narrowed unions |
+| loud checker reject | boxed value unions, incl. `i32?`/`i64?`/`f64?` and a map `.get` |
+| loud emit reject | arity != 1; `print(null)` |
+| **silent invalid wasm** | arrays, structs, maps, sets, function values, void |
+| **silent wrong value** | `boolean\|null` holding null prints `true`; `string\|null` holding null TRAPS |
+
+The last two rows are NOT in the rendered set. The array subset is an in-flight emit fix, so
+this slice deliberately adds **no** checker gate that would contradict it — the enumeration is
+filed, not duplicated. `print` is genuinely an overload set (one `__print_*__` sink per rep) and
+VL spells neither overloads nor `any`, so the accepted set is rendered as a union of real VL type
+names — the convention `toString`'s `(i32 | boolean) -> string` already uses in the same table:
+
+    (i32 | i64 | f32 | f64 | boolean | string) -> void
+
+`any` remains correct where the compiler already uses it: `tyToStr` renders an un-annotated
+inference hole as `any`. That hover test is untouched.
+
+### Scoreboard, and a 37-site blind spot at the centre of the program
+
+`parsercount.py` at this head and at `f9d4f88`, both measured this session:
+**CORE 313 · OFF-LIST 29 · TRUE 342, IDENTICAL** — `typecheck.vl` 46 = 19 core + 27 off-list.
+This slice is **NET 0**: it adds no parse and removes none.
+
+My own census (hand-classified against the owner's rule, *not* a heuristic — a first heuristic
+pass swept in `rstrip`/`splitLines`/`parseI32` and produced an indefensible 545) finds **56 type-
+string parse call sites that NEITHER list counts, 38 of them in this partition**:
+
+| calls | scanner | |
+|---|---|---|
+| 17 | `nameToTy` | **THE string->type parser itself** |
+| 16 | `tyTopIndexOf` | depth-aware top-level scan over a type name |
+| 4 | `tyGroupEndIndex` | matching-bracket scan over a type name |
+| 4 | `shapeHasCloField` / 4 `repRowOfName` / 4 `sTyIxOfName` / 3 `hasDot` / 2 `parenEnclosesWhole` / 1 `renderFaithful` / 1 `mapShapeKeyName` | |
+
+**The scoreboard counts the resolver's ARMS and not the resolver.** `nameToTy` + its two depth
+scanners = **37 uncounted sites** at the exact centre of the thing the program is trying to
+delete. `hasDot` is 3, not 9: six of its call sites pass `<node>.numText`, an expression lexeme,
+not a type — counted by argument, and stated because an un-argument-aware count would have
+inflated it.
+
+### Method notes earned
+
+123. **A POISON RULE WITH ONE HOLE IS NOT A POISON RULE.** Six of eight arms of the same two
+     functions propagated an unresolved component; the two that did not produced a crash, an
+     invalid-wasm class, a silent-accept class, and 23 misleading diagnostics. When a codebase
+     applies an invariant per-arm, enumerate the arms and diff them against each other — the
+     defect is the arm that is missing, and one of the correct arms usually documents why.
+124. **A WHOLE-CHAIN ORDER ORACLE CAN READ ZERO WHILE A PAIRWISE PROBE READS 17.** Note 118 says
+     a per-file A/B cannot see a cross-program leak; this is the next step. A leak that a LATER
+     program repairs is invisible to the full chain. The probe that finds it is *fresh instance,
+     ONE predecessor, then the victim* — and it gives a population (2,592 pairs) instead of an
+     anecdote.
+125. **BYTE-LEVEL ORDER-DEPENDENCE IS NOT AUTOMATICALLY A BUG, AND SAYING SO REQUIRES A CONTROL.**
+     1,057 of 1,297 corpus files emit different bytes after 1,000 predecessors. The control that
+     makes this reportable rather than alarming: the same program compiled 4x in one instance is
+     byte-identical, and the suite compiles in exactly that shared instance and is green. Publish
+     the control with the number or do not publish the number.
+126. **WHEN A SIBLING AGENT OWNS A FIX, THE HONEST MOVE IS TO ENUMERATE AND NOT GATE.** `print`
+     silently mis-lowers six shape families, of which arrays are assigned elsewhere. Adding a
+     checker reject would have looked like progress and would have collided with their fix. The
+     deliverable is the measured table plus a rendered type that is true today.
+
 ## D-PRINTREF (filed) + D-ARMDEDUP — `print` of ANY reference is silent invalid wasm, and the union-arm splitter's DUPLICATE is deleted
 
 Base **`5a072ec`**, every figure re-measured here in one session, nothing inherited. The master
