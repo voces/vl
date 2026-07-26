@@ -15755,7 +15755,22 @@ same length, not new work; (c) the fuzz side (the counters were summed over the 
    core call sites in one name→name rewriter, 19 of the file's 47. It is blocked exactly where the
    census says: `canonEmitName` is not `tyToEmitName ∘ nameToTy`, so **one agreed emit renderer is
    the prerequisite**, not a cleanup.
-5. **DECLINED WITH ARITHMETIC:** `isValueUnionName`'s `unionMemberCount(name) < 2` in front of
+5. **THE TWO RENDERERS ASK A QUESTION ABOUT A STRING THEY JUST BUILT — analysed, NOT attempted.**
+   `tyToEmitNameGo:6177` and `tyToNominalName:6409` are the SAME four lines twice — the array-element
+   grouping rule — and both end in `if nameHasPipe(el) { return "(" + el + ")[]" }`, i.e. the
+   renderer parsing its own output for a top-level `|`. Worth 2 off-list sites and one duplicated
+   grammar. Two duals exist and BOTH have a stated hazard, which is why this is a lead and not a
+   patch: (a) the BANK — `tyToEmitName` already reports the render's atom width in `emitNameAtoms`,
+   so `>= 2` is the same question, but `emitNameAtoms` stops at a top-level `=>` where `nameHasPipe`
+   does not (harmless at THIS site, because the `ae is TyFunc` arm returns one line earlier — check
+   that before reusing it elsewhere), and `tyToNominalName` has **no** such bank, so the bank route
+   covers only one of the two sites; (b) STRUCTURAL — `ae is TyUnion || ae is TyNullable` is not a
+   drop-in either, because `litUnionAliasNameOfTy` may have supplied `el` as a bare ALIAS
+   identifier for a type that IS a `TyUnion` (no pipe in the render), and a ONE-member `TyUnion`
+   (which the arena really does hold — an arrow-bodied `type F = …` is one) renders without a pipe
+   too. A correct move needs the "did the alias claim it" flag threaded into a shared home. Measure
+   before writing.
+6. **DECLINED WITH ARITHMETIC:** `isValueUnionName`'s `unionMemberCount(name) < 2` in front of
    `splitUnionAtoms` looks like the same one-value-two-parses shape and is not — it is a
    non-allocating cheap reject in front of an allocating split, so deleting it is a WORK
    REGRESSION (#1138's rule). Left alone.
