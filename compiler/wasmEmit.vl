@@ -133,7 +133,6 @@ import {
   retI64Flag,
   retNulListFlag,
   retNulStringFlag,
-  strContains,
   strToCps,
   tyIsNulBool,
   tyNameOf,
@@ -565,14 +564,16 @@ import {
   variantFieldRefSlot,
   variantFieldTypeAt,
   variantIndexOf,
-  vbHeapIdxOfAtom,
   vtKindOfParam,
 } from "./emit_classify"
 import {
   msMemberValKindsOf,
   msSoloValKind,
   mvSlotOfTy,
+  nullBoxTag,
+  nullValKind,
   scalarTagOfKind,
+  tyDenotesFunc,
   tyMapValOf,
   vbHeapIdxOfKind,
 } from "./emit_rep"
@@ -915,7 +916,7 @@ function emitOmittedFieldNull(_body: i32[], si: i32, fi: i32, scode: i32) {
   if scode == 16 {
     // A value/box-union field defaults to null ONLY when `null` is a member.
     if unionHasAtomTy(sFieldElemNameAt(si, fi), "null", false) {
-      fbI32Const(scalarTagOf("null"))
+      fbI32Const(nullBoxTag())
       fbRefNullNone() // payload slot unread under the null tag
       fbStructNew(uBoxIdx)
       return 0
@@ -1967,8 +1968,19 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   // `f is (A) => B` over a NULLABLE-closure operand (`f: ((i32) => i32) | null`) is a NON-NULL
   // test — the closure-typed `is` form of `f != null`. Calling `f(x)` in the then-branch
   // already ref-casts the nullable value to non-null, so no narrowing key is needed.
+  //
+  // Destringify D-ISTY (the hand-off #1125 filed and declined for want of a pin): the gate
+  // asks "is the tested type a FUNCTION type", and master answered it by scanning the tested
+  // SPELLING for `=>`. That scan cannot see through a declared alias — `type F = (i32) => i32`
+  // then `h is F` carries no arrow — so an aliased test fell past this arm into the variant
+  // ladder and hit `emitProgram: `is` names a type that is not a union variant`, a loud reject
+  // for a program the checker accepts. The checker's banked type for THIS `is` node
+  // (`isVarTyIxOf`, total for every emitting program — see `isArmTagOfTy`) resolves the alias
+  // and answers structurally. The opposite direction (the scan says yes, the type says no) is
+  // the 111 measured divergences of #1125's ARROW probe — struct shapes carrying a closure
+  // FIELD — and every one of them is inert here, because `exprNulClosure` is false at all 111.
   if nd0 is IsExpr {
-    if strContains(nd0.isVariant, "=>") {
+    if tyDenotesFunc(isVarTyIxOf(isIx)) {
       if exprNulClosure(nd0.isObj, fnIx) {
         if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
         wU8(209)   // 0xd1 ref.is_null
@@ -2049,7 +2061,7 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32) {
     if variantFieldTypeAt(vi, idx) == 16 {
       const mAtom = narrowVariantFor(memberPathKeyOf(memIx))
       const mk = valueAtomKind(mAtom)
-      if mk >= 0 && mk != 6 {
+      if mk >= 0 && mk != nullValKind() {
         fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
         if mAtom == "string" {
           if !aUsed {
@@ -2125,7 +2137,7 @@ function emitOptChainIsNull(body: i32[], exprIx: i32, fnIx: i32) {
       if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[psi], pfi) // the field's union box (non-null ref)
       fbStructGet(uBoxIdx, 0)         // box field 0: tag
-      fbI32Const(scalarTagOf("null"))
+      fbI32Const(nullBoxTag())
       fbI32Bin(70)                    // 0x46 i32.eq
     } else {
       fbI32Const(0) // a non-nullable field is never null past its links
@@ -2262,15 +2274,18 @@ function atomIsRefKind(k: i32) {
 function emitValueUnionUnboxRead(
   body: i32[],
   name: string,
-  atom: string,
+  ak: i32,
   fnIx: i32,
 ) {
   if emitUnionBoxPush(body, name, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  // D-UNION-ATOM-KIND: the atom's ABI code decides all four arms below, so it is
-  // derived ONCE here instead of four times (the `string` compare, the closure test,
-  // the list-wrapper ladder and `vbHeapIdxOfAtom`'s own re-derivation).
-  const ak = valueAtomKind(atom)
+  // D-UNION-ATOM-KIND: the atom's ABI code decides all four arms below (the `string`
+  // compare, the closure test, the list-wrapper ladder and `vbHeapIdxOfAtom`'s own
+  // re-derivation), so it arrives AS the code. It used to be re-derived here from the
+  // rendered atom the caller passed — which threw away `emitCoalesce`'s work: that
+  // caller had already read the residual member's code out of the BANK
+  // (`unionResidualSoloKindOfSet`), rendered the residual set for this parameter, and
+  // this line parsed the rendering straight back into the code it already held.
   if ak == 2 {
     fbRefCast(aTypeIdx) // the payload IS the string array ref
     return 0
@@ -2480,7 +2495,7 @@ export function emitUnionCoerce(
   // (invalid wasm — a pre-existing gap that hits named functions too).
   if bare is IfStmt { return emitUnionIfValue(body, unionName, bareIx, fnIx) }
   if bare is NullLit {
-    fbI32Const(scalarTagOf("null"))
+    fbI32Const(nullBoxTag())
     fbRefNullNone() // the payload slot is unread under the null tag
     fbStructNew(uBoxIdx)
     return 0
@@ -3005,27 +3020,40 @@ function emitVariantIfArm(body: i32[], vi: i32, blockIx: i32, fnIx: i32) {
 // union operand is restricted to a simple BINDING read — re-reading an ident is
 // effect-free and yields the same box. Anything effectful fails loudly.
 
-// Unbox a union payload already pushed as `anyref` (`struct.get $box 1`) to the
-// atom's rep: a string payload IS the string array (cast only); a scalar rides
-// its per-rep value box (cast + field 0). Mirrors `emitValueUnionUnboxRead`.
-function emitUnionPayloadUnbox(_body: i32[], atom: string) {
-  if atom == "string" {
+// Unbox a union payload already pushed as `anyref` (`struct.get $box 1`) to the rep
+// of the arm whose value-atom KIND is `k`: a string payload (kind 2) IS the string
+// array (cast only); a scalar rides its per-rep value box (cast + field 0). Mirrors
+// `emitValueUnionUnboxRead`.
+//
+// D-UNION-ATOM-KIND: the two questions this asked of the atom's SPELLING —
+// `atom == "string"` and `vbHeapIdxOfAtom(atom)` — are both projections of that one
+// code, and every caller already holds it (the box TAG it emits one instruction
+// earlier IS `scalarTagOfKind` of the same code, and `emitUnionUnionEq`'s arms carry
+// it out of the BANK). `valueAtomKind` answers 2 for the spelling `string` and for
+// nothing else, so the kind test is the same partition, not a widening; a member that
+// is not a value atom at all (a litunion alias `K0`, code -1) reaches
+// `vbHeapIdxOfKind(-1)` = -1 and the same loud reject the spelling path gave.
+function emitUnionPayloadUnbox(_body: i32[], k: i32) {
+  if k == 2 {
     fbRefCast(aTypeIdx) // the payload IS the string array ref
     return 0
   }
-  const vb = vbHeapIdxOfAtom(atom)
+  const vb = vbHeapIdxOfKind(k)
   if vb < 0 { return emitFail("emitProgram: union `==` atom has no value box") }
   fbRefCast(vb)      // 0xfb 0x16 <value box>
   fbStructGet(vb, 0) // the scalar payload
   0
 }
 
-// Emit the concrete operand at `otherIx` in the atom's rep (the host's
-// `withDesiredType(member, …)` — an i32 literal widens to the arm's i64/f64/f32).
-function emitUnionEqOther(body: i32[], otherIx: i32, atom: string, fnIx: i32) {
-  if atom == "i64" { return emitExprAsI64(body, otherIx, fnIx) }
-  if atom == "f64" { return emitExprAsF64(body, otherIx, fnIx) }
-  if atom == "f32" {
+// Emit the concrete operand at `otherIx` in the rep of the arm whose value-atom KIND
+// is `k` (the host's `withDesiredType(member, …)` — an i32 literal widens to the arm's
+// i64/f64/f32). D-UNION-ATOM-KIND: the three spelling compares this ran are the codes
+// 3 / 4 / 5, which `valueAtomKind` assigns to `i64` / `f64` / `f32` and to no other
+// spelling — the caller's single derivation answers all three.
+function emitUnionEqOther(body: i32[], otherIx: i32, k: i32, fnIx: i32) {
+  if k == 3 { return emitExprAsI64(body, otherIx, fnIx) }
+  if k == 4 { return emitExprAsF64(body, otherIx, fnIx) }
+  if k == 5 {
     const savedF32 = pendingF32
     pendingF32 = true
     if emitExprAsF32(body, otherIx, fnIx) < 0 { return -1 }
@@ -3059,16 +3087,23 @@ function emitUnionConcreteEq(
     )
   }
   const atom = unionEqAtomOf(otherIx, uname, fnIx)
+  // D-UNION-ATOM-KIND: the other operand's rep CODE, derived once. The box tag, the
+  // `string` special-cases, the payload unbox and the widened operand emit are all
+  // projections of it — master re-derived it from the spelling at each of them
+  // (`scalarTagOf`, `vbHeapIdxOfAtom` inside the unbox, and five `atom == …` compares).
+  // The spelling is still needed for the MEMBERSHIP test (`unionHasAtomTy` is a
+  // verbatim member compare, not a rep question) and for `atomEqOpcode`.
+  const eak = valueAtomKind(atom)
   if !unionHasAtomTy(uname, atom, false) {
     // No arm has the other operand's rep: the box can never hold such a value.
     if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
-    if emitUnionEqOther(body, otherIx, atom, fnIx) < 0 { return -1 }
+    if emitUnionEqOther(body, otherIx, eak, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
     if isNe { fbI32Const(1) } else { fbI32Const(0) }
     return 0
   }
-  if atom == "string" && !aUsed {
+  if eak == 2 && !aUsed {
     return emitFail(
       "emitProgram: union string `==` but array type not collected",
     )
@@ -3076,14 +3111,14 @@ function emitUnionConcreteEq(
   // tag == tagOf(atom), gating the payload compare.
   if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-  fbI32Const(scalarTagOf(atom))
+  fbI32Const(scalarTagOfKind(eak))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
   if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  if emitUnionPayloadUnbox(body, atom) < 0 { return -1 }
-  if emitUnionEqOther(body, otherIx, atom, fnIx) < 0 { return -1 }
-  if atom == "string" {
+  if emitUnionPayloadUnbox(body, eak) < 0 { return -1 }
+  if emitUnionEqOther(body, otherIx, eak, fnIx) < 0 { return -1 }
+  if eak == 2 {
     if emitStrEqCore(body) < 0 { return -1 }
   } else {
     fbI32Bin(atomEqOpcode(atom))
@@ -3202,11 +3237,11 @@ function emitUnionUnionEq(
     fbIf(127)               // right holds it too → payload value-compare
     if emitExpr(body, lIx, fnIx) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1) // left payload (anyref)
-    if emitUnionPayloadUnbox(body, arms[k]) < 0 { return -1 }
+    if emitUnionPayloadUnbox(body, armK) < 0 { return -1 }
     if emitExpr(body, rIx, fnIx) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1) // right payload (anyref)
-    if emitUnionPayloadUnbox(body, arms[k]) < 0 { return -1 }
-    if arms[k] == "string" {
+    if emitUnionPayloadUnbox(body, armK) < 0 { return -1 }
+    if armK == 2 {
       if emitStrEqCore(body) < 0 { return -1 }
     } else {
       fbI32Bin(atomEqOpcode(arms[k]))
@@ -3274,27 +3309,33 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
     fbI32Const(0)
     return 0
   }
-  if atom == "string" && !aUsed {
+  // D-UNION-ATOM-KIND: the literal's rep CODE, derived once from the atom the ladder
+  // above settled — the tag, the payload unbox and the three constant-emit arms are
+  // projections of it (`scalarTagOf` and `vbHeapIdxOfAtom` each re-derived it, and
+  // three more `atom == …` compares asked it a fourth and fifth time). The spelling
+  // survives only for `unionHasAtomTy`'s verbatim membership test above.
+  const lak = valueAtomKind(atom)
+  if lak == 2 && !aUsed {
     return emitFail(
       "emitProgram: string `is` test but array type not collected",
     )
   }
   if emitExpr(body, objIx, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-  fbI32Const(scalarTagOf(atom))
+  fbI32Const(scalarTagOfKind(lak))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
   if emitExpr(body, objIx, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-  if emitUnionPayloadUnbox(body, atom) < 0 { return -1 }
-  if atom == "string" {
+  if emitUnionPayloadUnbox(body, lak) < 0 { return -1 }
+  if lak == 2 {
     // The literal lexeme rides a synthesized `StrLit` (same shape as `strText`).
     if emitExpr(body, mkStr(lit, -1), fnIx) < 0 { return -1 }
     if emitStrEqCore(body) < 0 { return -1 }
-  } else if atom == "f64" {
+  } else if lak == 4 {
     fbF64Const(lit)
     fbI32Bin(97) // 0x61 f64.eq
-  } else if atom == "i64" {
+  } else if lak == 3 {
     const pr = parseI64Pair(lit)
     fbI64Const(pr[0], pr[1])
     fbI32Bin(81) // 0x51 i64.eq
@@ -3457,8 +3498,13 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
     if sFieldTypeAt(si, idx) == 16 {
       const mAtom = narrowedValueAtomOf(memberPathKeyOf(memIx))
       if mAtom != "" {
+        // D-UNION-ATOM-KIND: the narrowed atom's ABI code decides both arms, exactly
+        // as it already does at the VARIANT-field twin of this read (`emitNarrowedMem`
+        // — same three instructions, same two arms); `vbHeapIdxOfAtom` re-derived it a
+        // second time here, and `mAtom == "string"` was code 2 asked in spelling form.
+        const mfk = valueAtomKind(mAtom)
         fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-        if mAtom == "string" {
+        if mfk == 2 {
           if !aUsed {
             return emitFail(
               "emitProgram: narrowed string union field read but array type not collected",
@@ -3466,7 +3512,7 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
           }
           fbRefCast(aTypeIdx) // the payload IS the string array ref
         } else {
-          const mvb = vbHeapIdxOfAtom(mAtom)
+          const mvb = vbHeapIdxOfKind(mfk)
           if mvb < 0 {
             return emitFail(
               "emitProgram: narrowed union field atom has no value box",
@@ -4585,7 +4631,7 @@ function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
   fbArrayGet(cmValsBack())     // the stored (ref null $uBox) slot read
   fbLocalSet(stashL)
   fbElse()                     // miss = the read's null (a null-tagged box)
-  fbI32Const(scalarTagOf("null"))
+  fbI32Const(nullBoxTag())
   fbRefNullNone()
   fbStructNew(uBoxIdx)
   fbLocalSet(stashL)
@@ -4612,7 +4658,7 @@ function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
     }
     fbLocalGet(stashL)
     fbStructGet(uBoxIdx, 0) // field 0: tag
-    fbI32Const(scalarTagOf("null"))
+    fbI32Const(nullBoxTag())
     fbI32Bin(70)            // 0x46 i32.eq → null?
     fbIf(bt)                // value-typed if in the scalar's rep
     ctrlEnter()
@@ -4639,7 +4685,7 @@ function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
   // recovers the non-null box the checker's non-null union result promises.
   fbLocalGet(stashL)
   fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Const(scalarTagOf("null"))
+  fbI32Const(nullBoxTag())
   fbI32Bin(70)            // 0x46 i32.eq → null?
   fbIf(64)
   if emitUnionBoxArg(body, uvn, defIx, fnIx) < 0 { return -1 }
@@ -4750,7 +4796,7 @@ function emitMapGet(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
 // Lower a bare map GET `m[k]` of a UNION-valued map (mv kind 2) onto `body`, leaving the
 // NON-null `(ref $uBoxIdx)` box a kind-4 `"union"` binding stores: the hit arm loads the
 // stored box from the vals slot, the miss arm synthesizes the NULL-TAGGED box (the same
-// `scalarTagOf("null")` rep `emitUnionCoerce`'s NullLit arm stores for an `A | B | null`
+// `nullBoxTag()` rep `emitUnionCoerce`'s NullLit arm stores for an `A | B | null`
 // binding), and `ref.as_non_null` recovers the box the nullable valStash routing loses
 // (a live entry's val slot is never null; the miss arm's box is non-null by construction).
 // The `t != null` / `is` narrows then read the tag exactly as an annotated `V | null`
@@ -4773,7 +4819,7 @@ function emitMapGetUnionBox(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   fbArrayGet(cmValsBack())     // the stored (ref null $uBoxIdx) slot read
   fbLocalSet(fnMvValStashLocal(mslot))
   fbElse()                     // else — a miss IS the read's `null`: the null-tagged box
-  fbI32Const(scalarTagOf("null"))
+  fbI32Const(nullBoxTag())
   fbRefNullNone()              // the payload slot is unread under the null tag
   fbStructNew(uBoxIdx)
   fbLocalSet(fnMvValStashLocal(mslot))
@@ -7386,7 +7432,7 @@ function emitNulArmToLocal(
 // for a `string | null` (rep 1).
 function emitNulNullToLocal(_body: i32[], idx: i32, rep: i32) {
   if rep == 0 {
-    fbI32Const(scalarTagOf("null"))
+    fbI32Const(nullBoxTag())
     fbRefNullNone() // the payload slot is unread under the null tag
     fbStructNew(uBoxIdx)
   } else if rep == 1 {
@@ -10127,7 +10173,7 @@ export function emitNullForRet(_body: i32[], fnIx: i32) {
     if isValueUnionName(inferRetNameOf(fn.fnName)) { isU = true }
   }
   if isU {
-    fbI32Const(scalarTagOf("null"))
+    fbI32Const(nullBoxTag())
     fbRefNullNone() // payload slot unread under the null tag
     fbStructNew(uBoxIdx)
     return 0
@@ -11556,8 +11602,11 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
   // the value-box field — `if u is i32 { print(u) }` yields the raw i32.
   const vAtom = narrowedValueAtomOf(e.identName)
   if vAtom != "" {
+    // D-UNION-ATOM-KIND: the narrowed atom's ABI code, derived ONCE for both reads
+    // below (master derived it inside the callee, i.e. once per read).
+    const vak = valueAtomKind(vAtom)
     if unionNameOfIdent(e.identName, fnIx) != "" {
-      return emitValueUnionUnboxRead(body, e.identName, vAtom, fnIx)
+      return emitValueUnionUnboxRead(body, e.identName, vak, fnIx)
     }
     // The typed-IR net behind the syntactic miss (the map arm's discipline, below): a
     // binding off an INDEX-callee closure call (`const t0 = v[0](1)` over a
@@ -11566,7 +11615,7 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
     // skipping the unbox pushed the box ref where the raw narrowed atom was expected
     // (INVALID-WASM; fuzz sweep2 multiobs seed 655720167 case_00209).
     if identChainTyBoxedUnion(e.identName, fnIx, 4) {
-      return emitValueUnionUnboxRead(body, e.identName, vAtom, fnIx)
+      return emitValueUnionUnboxRead(body, e.identName, vak, fnIx)
     }
   }
   // A union binding narrowed to a REF-ELEMENT array arm reads UNBOXED to the reflist WRAPPER
@@ -12194,7 +12243,7 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       if exprUnion(nref, fnIx) {
         if emitExpr(body, nref, fnIx) < 0 { return -1 }
         fbStructGet(uBoxIdx, 0) // box field 0: tag
-        fbI32Const(scalarTagOf("null"))
+        fbI32Const(nullBoxTag())
         if e.binOp == "!=" {
           fbI32Bin(71) // 0x47 i32.ne
         } else {
@@ -12988,7 +13037,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
           currentNarrowSetIdOf(lhs.identName, fnIx),
         )
         if cak == -2 { cak = valueAtomKind(crest) }
-        if cak >= 0 && cak != 6 {
+        if cak >= 0 && cak != nullValKind() {
           if cak == 2 {
             return emitFail(
               "emitProgram: `??` over a string|null union is not supported yet",
@@ -12998,7 +13047,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
             return -1 // the box
           }
           fbStructGet(uBoxIdx, 0) // field 0: tag
-          fbI32Const(scalarTagOf("null"))
+          fbI32Const(nullBoxTag())
           fbI32Bin(70)            // 0x46 i32.eq → null?
           let cbt = 127           // 0x7f i32 (boolean shares it)
           if cak == 3 {
@@ -13022,7 +13071,9 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
             if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
           }
           fbElse() // 0x05 else — present → unbox
-          if emitValueUnionUnboxRead(body, lhs.identName, crest, fnIx) < 0 {
+          // The banked code `cak` travels INTO the unbox: master rendered `crest` for
+          // this parameter and the callee parsed the rendering back into `cak`.
+          if emitValueUnionUnboxRead(body, lhs.identName, cak, fnIx) < 0 {
             return -1
           }
           fbEnd() // 0x0b end
@@ -13048,7 +13099,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
         // D-UNION-ATOM-KIND — see `unionResidualSoloKind`.
         let kak = unionResidualSoloKind(kunm)
         if kak == -2 { kak = valueAtomKind(krest) }
-        if kak >= 0 && kak != 6 {
+        if kak >= 0 && kak != nullValKind() {
           if kak == 2 {
             return emitFail(
               "emitProgram: `??` over a string|null call result is not supported yet",
@@ -13060,7 +13111,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
           fbLocalSet(coalesceCallSlot)
           fbLocalGet(coalesceCallSlot)
           fbStructGet(uBoxIdx, 0) // field 0: tag
-          fbI32Const(scalarTagOf("null"))
+          fbI32Const(nullBoxTag())
           fbI32Bin(70)            // 0x46 i32.eq → null?
           let kbt = 127           // 0x7f i32 (boolean shares it)
           if kak == 3 {
@@ -13160,7 +13211,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
             // D-UNION-ATOM-KIND — see `unionResidualSoloKind`.
             let mak = unionResidualSoloKind(munm)
             if mak == -2 { mak = valueAtomKind(mrest) }
-            if mak >= 0 && mak != 6 {
+            if mak >= 0 && mak != nullValKind() {
               if mak == 2 {
                 return emitFail(
                   "emitProgram: `??` over a string|null union field is not supported yet",
@@ -13169,7 +13220,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
               if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
               fbStructGet(sHeapIdx[msi], mfi) // the union box
               fbStructGet(uBoxIdx, 0)         // field 0: tag
-              fbI32Const(scalarTagOf("null"))
+              fbI32Const(nullBoxTag())
               fbI32Bin(70)                    // 0x46 i32.eq → null?
               let mbt = 127                   // 0x7f i32 (boolean shares it)
               if mak == 3 {

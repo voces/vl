@@ -7217,3 +7217,335 @@ nodes are minted by passes the fuzz grammar never triggers.
     123,005 covered reaches, 0 disagreements, and a comparator-sane probe is still not
     deletable, because two annotations on one file have no recorded arena type. Coverage is not
     agreement (note 51's sibling); AGREEMENT IS NOT TOTALITY either, and only totality deletes.
+## D-ATOMKIND — the union box ABI keys on the atom's CODE, the `null` tag is a CONSTANT, and D-ISTY's declined ARROW hand-off is pinnable after all (#1128)
+
+`wasmEmit.vl` is the file where a wrong answer is wrong BYTES, and its largest single
+type-name-classifier concentration was `scalarTagOf` at 16 calls. **Thirteen of the sixteen were
+`scalarTagOf("null")`** — a classifier walking six literal compares to reach a constant of the
+box ABI. The other three, and every sibling in the union-`==` / literal-`is` / narrowed-unbox
+machinery, ask questions that are all projections of ONE value the file already has in hand;
+two sites had it BANKED and threw it away to re-derive it from a rendering one call later.
+
+### The enumeration, and the counting method
+
+**Unit: CALL SITES** — a textual `name(` in non-comment code, string-literal-aware `//` stripper,
+the resolver's own `function name(` header excluded. Not grep hits: `scalarTagOf("null")` has
+**14 raw matches** in `wasmEmit.vl` and **13 call sites** (the fourteenth is inside a comment).
+Counted over the four files this slice owns (`wasmEmit` / `emit_rep` / `emit_state` /
+`emit_rewrite`) and cross-checked tree-wide over all 25 compiler modules.
+
+The list is the value-atom CLASSIFIER family — the resolvers that answer a question about a type
+by taking its rendered spelling apart. The census the brief quotes counts these; the SCORECARD
+CORRECTION's parser list does not.
+
+| resolver | master (4 owned files) | now | delta | tree-wide master → now |
+|---|---|---|---|---|
+| `scalarTagOf` | 16 | **1** | **−15** | 16 → **1** |
+| `vbHeapIdxOfAtom` | 2 | **0** | **−2** | 2 → **0** (dead compiler-wide) |
+| `valueAtomKind` | 9 | 12 | **+3** | 41 → 44 |
+| `strContains` over a type spelling | 2 | 1 | **−1** | 22 → 21 |
+| `atomEqOpcode` | 2 | 2 | 0 | 2 → 2 |
+| `removeAtomFromSet` | 4 | 4 | 0 | 13 → 13 |
+| **TOTAL** | **35** | **20** | **NET −15** | **96 → 81, NET −15** |
+
+**The SCORECARD parser list over the same four files is 40 → 40, NET 0**, and that is stated
+first because it is the number this program's headline tracks. This slice moves the value-atom
+family, not that list. Nothing outside the four owned files changed, so the tree-wide delta
+equals the partition delta exactly — a cross-check, not a second measurement.
+
+Two further units, because they are not resolver calls and must not be counted as if they were:
+
+- **Whole-spelling EQUALITY tests against a type name: 12 deleted, 0 added.** `atom == "string"`
+  ×5 (the payload unbox, `==`'s two, literal `is`'s two), `atom == "i64"` / `"f64"` / `"f32"` ×3
+  (the widened `==` operand), `atom == "f64"` / `"i64"` ×2 (literal `is`'s constant emit),
+  `arms[k] == "string"` ×1, `mAtom == "string"` ×1 (the narrowed union-FIELD read). Each becomes
+  a compare against the ABI code.
+- **Substring SCANS of a type spelling: 1 deleted** — `strContains(nd0.isVariant, "=>")`.
+
+**The brief's census figure is not reproducible and is one release stale.** It reports
+`wasmEmit` at 83 operations with `valueAtomKind` at 9; at `fd411bd` `valueAtomKind` is **8** in
+that file (#1125 deleted one), and the widest filter this slice could justify — the six
+resolvers above plus every SCORECARD-list call in the file — totals **52**, not 83. The 83 is
+quoted here as the brief gave it, with the note that no stated resolver list reproduces it.
+
+### `scalarTagOf("null")` ×13 — a classifier whose argument never varies
+
+`null` is a KEYWORD, not a rendered type. `valueAtomKind("null")` is 6 by the seventh arm of a
+ladder whose first six compare against six different literals, so the map is a bijection at this
+one point and the walk is dead work — 13 times, in `emitUnionCoerce`'s NullLit arm, the `??` tag
+test over an ident / a call / a union FIELD, `emitMapGetOrUnionBox`'s miss-box and both of its
+peels, the omitted-field default, the optional-chain null test, and four further null-tagged
+stores. `emit_rep` now names the code (`nullValKind()`) and the tag (`nullBoxTag()`) beside
+`scalarTagOfKind`, where the kind→tag table already lives, and the four `!= 6` guards read
+`nullValKind()` too — so the ABI's null code has ONE home.
+
+### The union `==` / literal `is` / unbox machinery is one code asked six ways
+
+`emitUnionConcreteEq` held an atom SPELLING and asked it: the box TAG (`scalarTagOf`), "is it a
+string" twice, the payload cast (`emitUnionPayloadUnbox` → `atom == "string"` then
+`vbHeapIdxOfAtom`), and the other operand's widened rep (`emitUnionEqOther` → three more
+compares). Six derivations of `valueAtomKind(atom)` spread over three functions.
+`emitUnionPayloadUnbox` and `emitUnionEqOther` now take the CODE; `emitUnionConcreteEq` and
+`emitUnionLitIs` derive it once.
+
+**`emitUnionUnionEq` already had it.** `armKinds[]` comes out of `recordUnMemTys`' banked
+`unMemValKind` column — D-UNION-ATOM-KIND's WRITE half, whose READ half this function already
+used for the tag — and it then handed the callee the arm's SPELLING to re-derive the same code
+for the payload cast. #1110's shape, one layer out: *the bank was read and then discarded.*
+
+The sharpest instance is `emitCoalesce`'s ident arm. It reads the residual member's code out of
+the bank (`unionResidualSoloKindOfSet` over the narrowing table's banked set id — the entire
+point of D-SETID), renders the residual set to fill `emitValueUnionUnboxRead`'s `atom`
+parameter, and that callee's first line parsed the rendering straight back into the code the
+caller was already holding. `emitValueUnionUnboxRead` now takes the code.
+
+**Why the substitutions are EXACT, not a fold** (#1095's rule). `valueAtomKind`'s first six arms
+are literal compares against six distinct lexemes and nothing below them can produce codes 0–6:
+`nulElemListAtomKind` yields only 7 or 9, `litUnionArrayElemOf` only 7, `nameIsFuncTypeAtom`
+only 11. So `atom == "string"` ⇔ `k == 2`, `"i64"` ⇔ 3, `"f64"` ⇔ 4, `"f32"` ⇔ 5, `"null"` ⇔ 6,
+in BOTH directions. A member that is not a value atom at all (a litunion alias `K0`, code −1)
+reaches `vbHeapIdxOfKind(-1)` = −1 and the identical loud reject the spelling path gave; and
+`scalarTagOf(a)` is *defined* as `scalarTagOfKind(valueAtomKind(a))`, so the tag substitution is
+an inlining.
+
+**One substitution is not a CSE and is called out as such:** at `emitCoalesce`'s ident arm the
+callee's producer CHANGES — from `valueAtomKind(crest)` over the rendered residual to the banked
+`cak`. They are the same by `unionResidualSoloKind`'s contract ("the structural form of
+`valueAtomKind(removeAtomFromSet(set, "null"))`"), and master already relied on that equality at
+this very site: it used `cak` for the value-typed blocktype and the `!= 6` gate three lines
+above, so a disagreement was already a live miscompile before this slice. The corpus and fuzz
+channels measure the equality directly (below).
+
+### TARGET 1 — D-ISTY's ARROW hand-off: the filed diff was WRONG, and the pin exists
+
+#1125 measured `strContains(isVariant, "=>")` as a divergent-but-inert dual (111 divergences, 0
+consequential), declined it as "a behaviour change with no pin on any channel", and filed:
+
+```
+-    if strContains(nd0.isVariant, "=>") {
++    if unMemIsFunc(isVarTyIxOf(isIx)) {
+```
+
+**Both halves are refuted, and the second was refuted by BUILDING the filed diff.**
+
+**1. The pin exists.** #1125's unreachability argument is about the OPERAND: `f: F | null` as a
+param fails `emitProgram`'s parameter check, and a narrowed call through the alias fails the
+checker. Both re-verified here on `fd411bd`, plus a third the note did not have (`: F | null` as
+a RETURN fails with `emitProgram: bare null needs a struct-typed context`). But the gate reads
+the `is` TYPE, and the two spellings are independent. An **inline-spelled** nullable-closure
+binding tested through the **alias name** reaches the site with the scan false:
+
+```vl
+type F = (i32) => i32
+function inc(a: i32): i32 { a + 1 }
+function go() {
+  const h: ((i32) => i32) | null = inc
+  if h is F { print(1) } else { print(0) }                 // master: emit REJECT
+  if h is (i32) => i32 { print(h(40)) } else { print(0) }  // master: 41
+}
+go()
+```
+
+On master the first test is `emitProgram: `is` names a type that is not a union variant` — a
+loud emit reject for a program the checker accepts. Shipped as
+`tests/cases/closures/nullable-closure-is-alias-name.vl`; it FAILS on `fd411bd` (verified by
+running it with `--compiler` against a master-built seed) and prints `1` / `41` here.
+
+**2. `unMemIsFunc(isVarTyIxOf(isIx))` is a NO-OP at that site.** A probe build wired exactly the
+filed diff and reported, from the site itself, `ty >= 0 but not TyFunc`. The reason is #1122's:
+`parser.vl` encodes every non-`{…}`-bodied `type N = …` as a **one-member `UnionDecl`**, the
+checker's pass 0a registers a `TyUnion` placeholder for it, and #1122's transparency collapse
+(`aliasRefIsPlainName`) admits only a plain NAME or a generic APPLICATION member — an ARROW body
+is neither, because `aliasRefIsPlainName` requires an identifier head and `(i32) => i32` starts
+with `(`. So `T.tys[nameToTy("F")]` is a `TyUnion` over one `TyFunc`. `emit_rep`'s
+`tyDenotesFunc` peels the degenerate wrapper (iteratively — an alias chain can nest them) and
+then asks `TyFunc`. **A one-member union has nothing to discriminate; it denotes its member —
+#1122's own rule, applied one construct further out.**
+
+The sabotage that pins the peel IS the filed diff: `S-ARROWPEEL` stops `tyDenotesFunc` peeling,
+and the new fixture stops building.
+
+The direction #1125 measured — the scan says yes, the type says no, at 24 corpus + 87 fuzz
+reaches, all struct shapes with a closure FIELD — is untouched: `exprNulClosure` is false at all
+111, and the corpus (1,306 pre-existing files) and fuzz (50,400 programs) channels both report
+byte-identity, which is that inertness measured again from the other side.
+
+### Channels
+
+Measured on TWO successive landing bases as master moved under the slice — `fd411bd` (D-ISTY)
+and `fcc2272` (D-CYCTY, #1127: `emit_collect`). The four owned files are byte-identical across
+the two bases (`git diff fd411bd fcc2272 -- <the four>` is empty), and every number reproduces.
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / message / run, base `fcc2272` | **1,312 files** | **1 / 1 / 1 — and it is the new ARROW pin, nothing else** |
+| corpus, pre-existing files only | 1,310 | **0 / 0 / 0** |
+| corpus, base `fd411bd` | 1,307 files | same: **1 / 1 / 1**, the same file |
+| fuzz A/B, whole `--out-dir` trees, base `fd411bd` | **50,400 programs/side**, 52,708 output files/side | **0 differing paths** |
+| fuzz A/B, base `fcc2272` | **50,400 programs/side**, 52,708 output files/side | **0 differing paths** |
+
+The single differing corpus row is the comparator sanity: a sweep reporting 0 over a corpus that
+contains a fails-on-master fixture would be measuring nothing.
+
+### Entombment — eight legs reddened by the PRE-EXISTING corpus, one needed a new pin
+
+Nine sabotages, each applied to the SHIPPED build and swept against it over the whole corpus
+(byte, message AND run), on the `fd411bd` base — 1,306 files for the first three rows, 1,307
+once the new `union-eq` pin landed. Method note 4: perturb so the value LEAVES the equivalence
+class the consumer distinguishes.
+
+| sabotage | what it breaks | byte | msg | run |
+|---|---|---|---|---|
+| **S-NULLTAG** — `nullBoxTag()` returns the tag of kind 7 | every null-tagged box vs `isArmTagOfTy`'s independently derived null tag | **99** | 0 | 1 stdout + 1 status |
+| **S-PAYLOAD** — the payload unbox claims the STRING cast for kind 3 | the `==` / `is` payload `ref.cast` | 7 build-status | **7** | 6 status |
+| **S-EQOTHER** — the widened `==` operand's i64 arm never fires | the concrete operand's rep | **1** (see below) | 0 | 1 status |
+| **S-EAK** — `emitUnionConcreteEq` gates on `scalarTagOfKind(eak + 1)` | the `==` arm-tag compare | 2 | 0 | 2 stdout |
+| **S-LAK** — `emitUnionLitIs` gates on `scalarTagOfKind(lak + 1)` | the literal-`is` arm-tag compare | 3 | 0 | 2 stdout + 1 status |
+| **S-UNBOXK** — `??` unboxes the residual at `cak + 1` | the `??` non-null arm's cast | 1 | 0 | 1 status |
+| **S-ARMK** — union==union unboxes each arm at `armK + 1` | both payload casts | 4 | 1 | 3 status |
+| **S-MFK** — the narrowed union-FIELD read claims the STRING cast for kind 3 | the field unbox | 6 build-status + 1 byte | **7** | 7 status |
+| **S-ARROWPEEL** — `tyDenotesFunc` stops peeling the one-member union | the ARROW gate (== #1125's filed diff) | 1 build-status | 1 | 1 status |
+
+**S-EQOTHER was INERT on the pre-existing corpus — 0 / 0 / 0 over 1,306 files — and that is
+reported before its fix, not instead of it.** `operators/union-eq.vl` and
+`operators/union-eq-reversed.vl` cover the i32 / string / boolean arms, none of which needs a
+widening, so the `i64` arm of `emitUnionEqOther` had no pin anywhere in the corpus: master could
+have deleted it silently. `tests/cases/operators/union-eq-i64-arm-widens-literal.vl` is that pin
+(`i64 | string` compared with an int literal, both `==` and `!=`); it is byte-, message- and
+run-IDENTICAL between master and the shipped build, and the sabotage build emits invalid wasm on
+it. The re-sweep with it present is the row above.
+
+### The call arithmetic, restated as this doc's four counts
+
+- **Type-string classifier calls DELETED: 18** (`scalarTagOf` ×15, `vbHeapIdxOfAtom` ×2,
+  `strContains` ×1). **ADDED: 3** (`valueAtomKind` at `emitUnionConcreteEq`, `emitUnionLitIs`,
+  and the shared derivation in `emitIdentNode`). **NET −15.**
+- **Whole-spelling equality tests deleted: 12. Added: 0.**
+- **Consumers laddered: 0. Sidecars added: 0** (no new state, no reset obligation:
+  `nullValKind`/`nullBoxTag`/`tyDenotesFunc` are pure functions of existing tables).
+- **Resolutions removed from the PATH, not only from the source:** `emitUnionUnionEq` runs
+  `valueAtomKind` zero times per arm where master ran it twice; `emitUnionConcreteEq` and
+  `emitUnionLitIs` once where master ran it twice; `emitCoalesce`'s ident arm zero times where
+  master ran it once on a rendering it had just produced; and thirteen `null`-tag sites run a
+  seven-compare ladder zero times.
+- New exports (`emit_rep`): `nullValKind`, `nullBoxTag`, `tyDenotesFunc`. Signature changes
+  (private, `wasmEmit`): `emitUnionPayloadUnbox`, `emitUnionEqOther`, `emitValueUnionUnboxRead`
+  take an i32 code where they took a `string`.
+- Cross-file: `typecheck` / `emit_classify` / `emit_collect` / `emit_base` / `parser` /
+  `driver` / `ast` UNCHANGED.
+
+Binary: 1,033,840 → **1,033,945** bytes (**+105**) on `fcc2272`; 1,031,979 → 1,032,084, the same
++105, on `fd411bd`.
+
+### What did NOT move, and the mechanism for each
+
+- **`scalarTagOf`'s last caller** — `emitUnionCoerce`'s bare-closure arm,
+  `fbI32Const(scalarTagOf(clArm))` with `clArm = unionClosureArmName(unionName)`. That
+  function's own comment already files it ("the returned NAME stays the member's stored
+  spelling, which `emitUnionCoerce` feeds to the still-name-keyed `scalarTagOf` — a D5
+  residual"). Its arm SELECTION is already structural (`unMemIsFunc(mems[m])`), so the honest
+  repair is for it to return the arm's INDEX and the tag to come from `unMemValKindAt` — and it
+  lives in `emit_classify`. Folding the tag to the constant `scalarTagOfKind(11)` here instead
+  would be a behaviour change in exactly the alias population TARGET 1 just proved reachable
+  (an arm spelled `F` has `valueAtomKind("F") == -1`), so it was NOT taken blind.
+- **`isValueUnionName` (9 calls in `wasmEmit`, the census's second concentration)** — not a
+  projection of one member's kind. It asks a property of the whole member SET (≥2 atoms, every
+  atom a value atom, plus the solo-numeric-with-null rule), and its callers hold a rendered
+  union NAME with no row id. Its arena dual is a walk of `unMemValKind` over a set id, which
+  needs `msSetOfText` first — the same text resolution, plus a decline path. That is a
+  laddering, not a deletion. Deliberately not taken.
+- **`removeAtomFromSet` (4)** — already the migrated chokepoint (`msSubNull` / `msSubAtom` with
+  the string surgery as the fall-through). What its callers did with the rendered residual is
+  what this slice deleted at one of the four sites; the resolution itself is one layer down.
+- **`emitNarrowedMem`'s `mAtom == "string"`** — the VARIANT-field twin of the struct-field read
+  this slice migrated, and it already holds `mk = valueAtomKind(mAtom)` one line above, so the
+  change is `if mk == 2`. It was not taken because it landed after the corpus, fuzz and nine
+  sabotage builds were measured, and shipping a line the gate had not seen — or re-spending a
+  50,400-program gate for a substitution proved identical eleven lines away — was the worse of
+  the two. It is one line, in this partition, for the next slice.
+- **`emitAsCast`'s `tgt == "f64"` / `"i64"` / `"f32"`** — the emit half of #1124's live
+  miscompile, re-verified on `fd411bd`: `type W = f64; const x = 5 as W; print(x)` builds and
+  fails to instantiate (`type mismatch: expected f64, found i32`). The checker half
+  (`canonEmitTypeNames` never canonising `AsExpr.asTy`) is a concurrent agent's target this
+  cycle and is NOT duplicated here. Recorded as a dependency, with the observation that the
+  canon fix leaves the emitter still classifying a cast TARGET by its spelling — the same class
+  of blindness TARGET 1 just fixed for `is`.
+
+### REFUTATION — #1123's `nameIsRefArray` hand-off is STALE; the state it asks for exists
+
+#1123 filed: *"Deleting it needs the element layer's slot to be banked at the intern site, which
+is `emit_state.vl`/`emit_rep.vl` state, not this partition's."* **The column is already there.**
+`emit_state.vl:634` declares `rlElemTyIx` — "the ARENA type the slot's STORED element name
+denotes … recorded ONCE per slot at intern time (`rlInternName`)" — written at
+`emit_classify.vl:9927` and read through `rlElemTyIxAt` (7 call sites) and `rlSlotOfTy` (8). It
+landed with destringify D5-final, before #1123 was written.
+
+What is missing is on the CALLER side and cannot be supplied from this partition:
+`nameIsRefArray` has **26 call sites** (19 `emit_classify`, 7 `emit_collect`, **0** in the four
+files this slice owns — #1125 took the last two), and every one receives a rendered string with
+no node and no arena index. The resolver also folds INTERN STATE into its answer
+(`structIndexByName`, `shapeElemDeclaredStructIdx`, `variantIndexOf`, a scan of `unNames`), so
+its dual is `rlSlotOfTy(…) >= 0` — which needs a type, which is what those call sites do not
+have. **Banking more state in `emit_state` unblocks nothing; the work is giving those 26 sites
+a node.**
+
+### Hand-offs, each with a verified diff
+
+1. **`emit_classify.vl` — `vbHeapIdxOfAtom` now has ZERO callers compiler-wide** (verified with
+   the same stripper: only its own definition header and comments remain). `scalarTagOf` has
+   exactly one, above. Both are the atom-spelled entry points #1110 left behind.
+2. **`emit_base.vl` — split `atomEqOpcode`.** It is `valueAtomKind(atom)` plus a four-arm kind
+   table, and both of its call sites (both in `wasmEmit`) now hold the code:
+   ```
+   +export function atomEqOpcodeOfKind(k: i32) { …the four arms… }
+   -export function atomEqOpcode(atom: string) { const k = valueAtomKind(atom) … }
+   +export function atomEqOpcode(atom: string) { atomEqOpcodeOfKind(valueAtomKind(atom)) }
+   ```
+   This slice did NOT move the table into `emit_rep` unilaterally: that leaves a hand-kept
+   duplicate, the exact drift hazard #1110's comment and #1123's whole thesis are about.
+3. **`emit_classify.vl` — `exprNulClosure` is spelling-blind to an aliased nullable closure, and
+   that is a LIVE INVALID-WASM miscompile.** Measured on `fd411bd`, unchanged by this slice:
+   ```vl
+   type F = (i32) => i32
+   function inc(a: i32): i32 { a + 1 }
+   const h: F | null = inc                              // the DECLARATION carries the alias
+   if h is (i32) => i32 { print(1) } else { print(0) }
+   ```
+   → `Invalid input WebAssembly code … type mismatch: expected i32, found (ref $type)`. Identical
+   with a module-global `let g: F | null`, and with `h is F`. `exprNulClosure` reaches
+   `declaredNulClosure` / `paramNulClosure` / `globalCellKind`, each of which classifies the
+   binding's rendered annotation; `F | null` carries no arrow, so the kind-19 niche is never
+   assigned and the `is` falls through to the variant ladder. The `is`-side half of this family
+   is what TARGET 1 fixed; the DECLARATION side is `emit_classify`'s, and it is a MISCOMPILE,
+   not a reject.
+4. **`typecheck.vl`** — `nameToTy` returns a one-member `TyUnion` for an arrow-bodied alias
+   while returning the member itself for a plain-NAME alias (#1122's `cPlainAliasNames`). Every
+   arena consumer that asks "is this type a closure / a map / an array" must therefore peel, or
+   answer wrongly for one alias spelling and not the other. `tyDenotesFunc` peels for the one
+   consumer this slice needed; the general fix is to extend `aliasRefIsPlainName`'s collapse to
+   any one-member body, or to hand consumers a `tyDenotes*` family.
+
+### Method notes earned
+
+62. **A classifier call whose ARGUMENT is a literal is a deletion, not a migration**
+    (D-ATOMKIND) — 13 of `wasmEmit`'s 16 `scalarTagOf` calls passed the constant `"null"`. The
+    census counted them as consumer operations and they were; but the fix needed no bank, no
+    probe and no equivalence argument, because `valueAtomKind("null")` is 6 by inspection of a
+    ladder of literal compares. Before designing a dual, check whether the argument varies.
+63. **A filed one-line diff is a hypothesis; build it before quoting it** (D-ATOMKIND) —
+    #1125's ARROW hand-off shipped an exact diff with its rationale, and the diff is a no-op:
+    the alias resolves to a `TyUnion` over a `TyFunc`, so `unMemIsFunc` answers false at the
+    very site the diff exists to fix. One probe build said so; no amount of reading would have.
+    (Note 49's shape, applied to a hand-off rather than to a refinement.)
+64. **"No pin is available" is a claim about a SEARCH, and the search can be looking at the
+    wrong operand** (D-ATOMKIND) — #1125 looked for a program whose nullable-closure OPERAND
+    could be spelled through an alias, proved that unreachable twice, and concluded the site was
+    unpinnable. The gate reads the `is` TYPE. Spelling the operand inline and the TEST through
+    the alias reaches it in five lines. When a two-gate site is declared unreachable, check that
+    the reachability argument is about the gate being migrated.
+65. **An inert sabotage is a hole in the CORPUS, and the slice that finds it should fill it**
+    (D-ATOMKIND) — S-EQOTHER deleted the `i64` widening from every union `==` and changed
+    nothing over 1,306 files, because the three existing `union-eq` fixtures use arms that need
+    no widening. Reporting "inert, so no pin can exist" (#1114/#1119/#1123's honest form) was
+    available and would have been wrong here: the pin did not exist, but it was five lines away.
+    Try to WRITE the pin before recording that none can be had.
