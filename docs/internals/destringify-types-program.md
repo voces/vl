@@ -6040,8 +6040,9 @@ regression — the fix moves the failure, it does not create it.
 The bisect that narrows it: the same two functions beside ONE, TWO, … FIVE of those union
 DECLARATIONS all compile and run on this build (and all fail on master). So it is not the count
 of `{v:i32}` variant rows in `uVariants`, nor any single member kind — it is the composition
-with the CONSTRUCTED-and-narrowed globals. That is where to start.
 ## D-FIELDCODE — the FIELD-CLASSIFICATION tables get ONE home (#PRNUM)
+
+## D-FIELDCODE — the FIELD-CLASSIFICATION tables get ONE home (#1123)
 
 `repRowOfTyLenientRow`'s own comment (emit_classify.vl) names the target and the cost:
 
@@ -6145,13 +6146,13 @@ The change is behaviour-preserving, so it cannot have a fails-on-master test. Ea
 below is applied to the SHIPPED build and diffed against it over the corpus (byte, message
 AND run):
 
-| sabotage | corpus byte | msg | run |
-|---|---|---|---|
-| S1 the NODE entry stops using its arena literal-union verdict (`fieldCodeOfSpelling(tyName, -1)`) | 0 | 0 | 0 |
-| S2 the shared table restores master `fieldTypeCode`'s arm ORDER | 0 | 0 | 0 |
-| S3 `fieldRefElemName` stops guarding the atom codes (0 / 30 delegate) | 0 | 0 | 0 |
-| **S4 `fieldRefElemName` stops NOMINALIZING a nested-struct target (15 delegates)** | **1** | **1** | **1** |
-| S5 `fieldRefElemName`'s code-28 arm delegates (gains the deferred `[]`-slice fallback) | 0 | 0 | 0 |
+| sabotage | corpus byte | msg | run | fuzz tree-diff |
+|---|---|---|---|---|
+| S1 the NODE entry stops using its arena literal-union verdict (`fieldCodeOfSpelling(tyName, -1)`) | 0 | 0 | 0 | 0 / 21,600 |
+| S2 the shared table restores master `fieldTypeCode`'s arm ORDER | 0 | 0 | 0 | — |
+| S3 `fieldRefElemName` stops guarding the atom codes (0 / 30 delegate) | 0 | 0 | 0 | **0 / 21,600** |
+| **S4 `fieldRefElemName` stops NOMINALIZING a nested-struct target (15 delegates)** | **1** | **1** | **1** | — |
+| S5 `fieldRefElemName`'s code-28 arm delegates (gains the deferred `[]`-slice fallback) | 0 | 0 | 0 | **0 / 21,600** |
 
 - **S4 is the pin.** `tests/cases/closures/twin-fieldset-closure-field-string-vs-bool-result.vl`
   stops building — `emitProgram: nested-struct field element type is not interned` — because
@@ -6164,13 +6165,39 @@ AND run):
   so perturbing it does not leave the equivalence class. It is recorded because it is the
   one difference between the two former copies, and its inertness is the reason a single
   table could exist at all.
-- **S1, S3 and S5 are inert on the corpus**, i.e. no pin exists for them there. S1 says the
-  node's arena literal-union rung and the spelling test agree everywhere the corpus reaches
-  — the rung is kept because it is the destringified one, not because a channel can see it.
-  S3 and S5 say the code-0/30 and code-28 differences between the two element-name recorders
-  are not corpus-observable; they are kept because they are documented, deliberate, and a
-  merge that changed them would be a behaviour change this slice is not making. Stated
-  plainly, as #1114 and #1119 did.
+- **S1, S3 and S5 are inert on BOTH channels** — 1,294 corpus files and 21,600 fuzz
+  programs each — so **no pin can exist for them today**, stated plainly as #1114 and #1119
+  did. S1 says the node's arena literal-union rung and the spelling test agree everywhere
+  either channel reaches; the rung is kept because it is the destringified one, not because a
+  channel can see it. S3 and S5 say the code-0/30 and code-28 differences between the two
+  element-name recorders are unobservable; they are kept because they are documented,
+  deliberate distinctions and merging them would be a behaviour change this slice is not
+  making. (Both sabotages leave the equivalence class — S3 makes a code-0 field record its
+  union name where it recorded "", S5 makes an unresolvable code-28 element record a raw
+  `[]`-slice where it recorded "" — so this is not method note 8's false null.)
+
+### The work, counted not timed (method note 15)
+
+The one thing this slice CHANGES at runtime is the node path's arm order: the map group
+(19 / 29) now runs ahead of the nullable-list group (18 / 28 / `nulScalarListFieldCode`),
+because the single table keeps the spelling entry point's order. Both compilers were
+instrumented identically — a tick at each of the ten parse helpers the table calls — and run
+over the same corpus:
+
+| | executions of the ten helpers, whole corpus |
+|---|---|
+| master | 8,616,290 |
+| now | **8,616,134** |
+| | **−156** |
+
+1,102 files report on both sides (identical population). Per file: **7 better (−208), 6 worse
+(+52)**, and the direction of each is the arm order plus the `nulMapInnerName` CSE, exactly:
+`structs/nullable-map-field.vl` −84 and `structs/declared-nullable-struct-map-field.vl` −44
+(a nullable-map field no longer parses its inner map name twice, and no longer walks three
+nullable-list arms first); `structs/nul-distinct-scalar-list-field.vl` +24 and
+`arrays/struct-field-nullable-struct-elem-array.vl` +12 (a nullable-list field now walks the
+two map arms first). A net win, and small enough in both directions that no honest wall clock
+would have shown it.
 
 ### The call arithmetic
 
