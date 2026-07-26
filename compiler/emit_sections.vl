@@ -10,6 +10,7 @@
 
 import {
   isNumIntrinsicName,
+  nameIsMemLoadIntrinsic,
   nodeArrayElemIsLitUnion,
   nodeTyIsLitUnionAlias,
   nodeTyIsNulLitUnion,
@@ -20,6 +21,7 @@ import {
   REP_SCAL_I64,
   msPoolReset,
   repKindOfSigTok,
+  repMemLoadScalarMask,
   repNodeScalarMask,
   repReset,
   repShadowSweep,
@@ -2039,6 +2041,29 @@ function scanPrintUse() {
         ) {
           memUsed = true
         }
+        // The load-WIDTH matrix forces the memory exactly as `__load_i32__` does, and
+        // additionally forces a `__print_*__` import when its result is a WIDE scalar:
+        // `print(__load_f64__(0))` routes to `__print_f64__` in a program that spells
+        // `f64` NOWHERE, so the annotation scan below cannot see it. Read off the NAME
+        // (`repMemLoadScalarMask`), which is total — see its comment for why the arena
+        // is the wrong source here.
+        if nameIsMemLoadIntrinsic(pcallee.identName) {
+          memUsed = true
+          const lscal = repMemLoadScalarMask(pcallee.identName)
+          if (lscal & REP_SCAL_I64) != 0 { sawI64Ann = true }
+          if (lscal & REP_SCAL_F64) != 0 { sawF64 = true }
+          if (lscal & REP_SCAL_F32) != 0 { sawF32 = true }
+        }
+        // `memory.size` / `memory.grow` are instructions ON the memory: a program whose
+        // ONLY memory contact is `__memory_size__()` still needs section 5 emitted, or
+        // the instruction refers to a memory that does not exist and the module fails to
+        // validate. Both are i32-valued, so neither touches the print-import scan.
+        if (
+          pcallee.identName == "__memory_size__" ||
+          pcallee.identName == "__memory_grow__"
+        ) {
+          memUsed = true
+        }
         if pcallee.identName == "__log__" {
           memUsed = true
           memLogUsed = true
@@ -3360,10 +3385,44 @@ function emitExportSection(_n: i32) {
     }
     rxi = rxi + 1
   }
-  if reExpNm.length == 0 { return 0 }
+  // P0.2 — EXPORT THE LINEAR MEMORY (`buffer-design.md` §C5, ruling O4(i)).
+  //
+  // The memory is exported under the universal name `memory`, automatically, and
+  // gated on the memory EXISTING at all: `memUsed` is the same flag that decides
+  // whether section 5 is emitted, so a program that never touches linear memory is
+  // byte-identical to before — no new section, no new entry, no new name.
+  //
+  // Why automatic rather than a `--export-memory` flag: an unused memory is not
+  // emitted, so there is nothing to opt out OF, and a flag here would be the first
+  // `vl build` option that changes the emitted ABI. Why `memory`: it is what a host
+  // reaches for (`instance.exports.memory.buffer`) and the convention every wasm
+  // toolchain follows.
+  //
+  // The collision is real and is rejected LOUDLY. Wasm export names must be unique,
+  // so a user `export function memory()` in a memory-using program would otherwise
+  // build an invalid module. It is a rare and mechanically fixable reject (rename the
+  // function), which is the trade O4(i) makes.
+  if memUsed {
+    let mci = 0
+    while mci < reExpNm.length {
+      if reExpNm[mci] == "memory" {
+        return emitFail(
+          "emitProgram: this program exports a function named 'memory', but a program that uses linear memory exports the memory itself under that name — rename the function",
+        )
+      }
+      mci = mci + 1
+    }
+  }
+  // An export-free program still omits the section — UNLESS the memory is exported,
+  // in which case section 7 exists to carry that one entry. (Master returned here
+  // whenever there were no function exports, which would have dropped the memory
+  // export in exactly the program that wants it most: a memory-only module.)
+  if reExpNm.length == 0 && !memUsed { return 0 }
+  let nExports = reExpNm.length
+  if memUsed { nExports = nExports + 1 }
   const exportPayload: i32[] = []
   const exPrev = wTarget(exportPayload)
-  wULEB(reExpNm.length)
+  wULEB(nExports)
   // Each entry: the bare public name pointing at the target's func index.
   let rei = 0
   while rei < reExpNm.length {
@@ -3371,6 +3430,14 @@ function emitExportSection(_n: i32) {
     wU8(0) // export kind: func
     wULEB(gImports + reExpEi[rei])
     rei = rei + 1
+  }
+  // The memory entry LAST, so every function export keeps the index it had — the
+  // export section is order-insensitive to a host, but keeping the prefix identical
+  // makes the A/B byte diff read as a pure append.
+  if memUsed {
+    wName("memory")
+    wU8(2)   // export kind: memory
+    wULEB(0) // memory index 0 (the one module-defined memory)
   }
   wTarget(exPrev)
   wSection(7, exportPayload)

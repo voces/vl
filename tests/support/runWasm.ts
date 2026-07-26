@@ -11,7 +11,22 @@
 // `@trap` position directives are skipped via `isTrapPosition`), so the VLQ /
 // source-map decode machinery is omitted.
 
-export type RunResult = { logs: string[] };
+export type RunResult = {
+  logs: string[];
+  /**
+   * The instantiated module's exports. Carries the P0.2 **exported linear memory**
+   * as `exports.memory` for any program that uses linear memory at all (the emitter
+   * gates the export on the memory existing, so a memory-free program has no such
+   * entry) — plus the program's exported functions.
+   *
+   * DETACHMENT: a `__memory_grow__` in the guest DETACHES every view previously
+   * taken on `memory.buffer`. Re-read `.buffer` after any call that can grow;
+   * never cache a `Uint8Array`/`DataView` across a guest call. An indexed read of
+   * a detached view returns `undefined` rather than throwing, which is why this is
+   * called out here and not left to the reader.
+   */
+  exports: WebAssembly.Exports;
+};
 
 export class VLRuntimeError extends Error {
   /** The wasm function name (from the name section), when present in the trace. */
@@ -51,6 +66,19 @@ const parseWasmFrame = (
 // version, so match on substrings.
 const trapReason = (message: string): string => {
   const lower = message.toLowerCase();
+  // LINEAR-MEMORY out-of-bounds, checked BEFORE the array branch below because
+  // that branch matches any "out of bounds" text and would relabel this one.
+  // Measured, V8 distinguishes the two precisely — "memory access out of bounds"
+  // vs "array element access out of bounds" — and the old collapse reported a
+  // linear-memory fault as "array index out of bounds", naming a data structure
+  // the program need not even contain. That mislabel was unreachable while the
+  // one page was almost unaddressable; with the load-width matrix and
+  // `memory.grow` it is the ordinary way a raw address goes wrong, so it is
+  // worth reporting as itself. (Array cases are untouched: their text has no
+  // "memory access".)
+  if (lower.includes("memory access out of bounds")) {
+    return "memory access out of bounds";
+  }
   if (lower.includes("out of bounds") || lower.includes("array")) {
     return "array index out of bounds";
   }
@@ -86,49 +114,31 @@ const mapTrap = (err: unknown): unknown => {
 };
 
 /**
- * Instantiate compiled wasm with the VL host-import ABI (`memory` +
- * `__print_*__`/`__log*__`), capturing each emitted value as a formatted line.
- * The entry runs as the module's START function, so a trap throws during
- * `instantiate` — it is rethrown as a {@link VLRuntimeError}.
+ * Instantiate compiled wasm with the VL host-import ABI (the `__print_*__` family),
+ * capturing each emitted value as a formatted line. The entry runs as the module's
+ * START function, so a trap throws during `instantiate` — it is rethrown as a
+ * {@link VLRuntimeError}.
+ *
+ * NO `imports.memory`. The native emitter DEFINES the module's own linear memory
+ * (`emit_sections.vl`'s section 5, gated on `memUsed`) and synthesizes an in-module
+ * `__log__` decoder rather than importing one — so the memory this host used to
+ * hand over was never the memory the guest wrote to. Censused over every corpus
+ * module that builds (1,149 of them): **0 import a memory, 0 import `__log__` or
+ * `__log_string__`**; the only imports any module declares are the seven
+ * `__print_*__` sinks below. The dead `imports.memory` and the two sinks that
+ * existed only to decode bytes out of it are gone — with P0.2 exporting the real
+ * memory as `exports.memory`, keeping a second, unrelated memory in the import
+ * object is an active trap (a host reads the one it provided and sees all zeros).
+ * See `docs/internals/buffer-design.md` §B6.
  */
 export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
   const logs: string[] = [];
   // Accumulates code points streamed by `__print_char__` until `__print_str_flush__`.
   const printChars: number[] = [];
-  const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536 });
+  let exports: WebAssembly.Exports = {};
   try {
-    await WebAssembly.instantiate(wasm, {
+    const { instance } = await WebAssembly.instantiate(wasm, {
       imports: {
-        memory,
-        // Read `length` raw bytes at `offset` and render them as a UTF-8 string
-        // (the byte form a `__store_string__` writes from a GC string).
-        __log_string__: (offset: number, length: number) => {
-          logs.push(
-            new TextDecoder().decode(
-              new Uint8Array(memory.buffer, offset, length),
-            ),
-          );
-        },
-        __log__: (offset: number, length: number) => {
-          const view = new Int32Array(memory.buffer, offset, length / 4);
-          const args: (number | bigint)[] = [];
-          for (let i = 0; i < length / 4; i++) {
-            if (view[i] === 1) {
-              const low = BigInt(view[++i]) & BigInt(0xFFFFFFFF);
-              const high = BigInt(view[++i]) << BigInt(32);
-              args.push(high | low);
-            } else if (view[i] === 2) {
-              i++;
-              args.push(new Float32Array(memory.buffer, offset + i * 4, 1)[0]);
-            } else if (view[i] === 3) {
-              const swap = new Int32Array(2);
-              swap[0] = view[++i];
-              swap[1] = view[++i];
-              args.push(new Float64Array(swap.buffer, 0, 1)[0]);
-            } else args.push(view[++i]);
-          }
-          logs.push(args.map((a) => a.toString()).join(" "));
-        },
         // Direct value sinks for the `print(x)` builtin. A wasm i64 arrives as a
         // JS bigint; the rest as numbers. Booleans render as `true`/`false`.
         __print_i32__: (v: number) => logs.push(String(v)),
@@ -152,8 +162,9 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
         },
       },
     });
+    exports = instance.exports;
   } catch (err) {
     throw mapTrap(err);
   }
-  return { logs };
+  return { logs, exports };
 };

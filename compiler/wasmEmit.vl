@@ -4,6 +4,7 @@ import {
   isValueUnionName,
   isVarTyIxOf,
   nameIsLitUnionType,
+  nameIsMemLoadIntrinsic,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulBool,
   nodeArrayElemIsNulLitUnion,
@@ -7913,6 +7914,75 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   0
 }
 
+// ── linear-memory opcodes: the load-width matrix + memory.size/grow ──────────
+// The instruction bytes for `buffer-design.md` §C2's load matrix. `i32.load` (0x28)
+// itself lives with the other Phase-A encoders in `emit_bytes.vl` (`fbI32Load`); the
+// seven widths added here sit beside their dispatch, the same way the numeric-opcode
+// family's `fbNumOp` does below.
+const OP_I64_LOAD = 0x29
+const OP_F32_LOAD = 0x2a
+const OP_F64_LOAD = 0x2b
+const OP_I32_LOAD8_S = 0x2c
+const OP_I32_LOAD8_U = 0x2d
+const OP_I32_LOAD16_S = 0x2e
+const OP_I32_LOAD16_U = 0x2f
+const OP_MEMORY_SIZE = 0x3f
+const OP_MEMORY_GROW = 0x40
+
+// The opcode byte for load width `name`, or -1 for a name that is not one. Paired with
+// `memLoadAlignExp` below — the two are read together at the single call site.
+function memLoadOpcode(name: string) {
+  if name == "__load_i8__" { return OP_I32_LOAD8_S }
+  if name == "__load_u8__" { return OP_I32_LOAD8_U }
+  if name == "__load_i16__" { return OP_I32_LOAD16_S }
+  if name == "__load_u16__" { return OP_I32_LOAD16_U }
+  if name == "__load_i64__" { return OP_I64_LOAD }
+  if name == "__load_f32__" { return OP_F32_LOAD }
+  if name == "__load_f64__" { return OP_F64_LOAD }
+  -1
+}
+
+// The NATURAL alignment exponent for load width `name`: log2 of the access width in
+// bytes (0 for 8-bit, 1 for 16-bit, 2 for 32-bit, 3 for 64-bit).
+//
+// This immediate is a HINT, not a constraint — the wasm spec permits an access at any
+// address regardless of what the alignment says, and an engine treats a mismatch as a
+// missed optimization, never a fault. `__load_i32__` has always written exponent 2 and
+// reads correctly at odd addresses (measured); these widths inherit that property, and
+// the corpus pins an unaligned read at every width so the claim is not just asserted.
+function memLoadAlignExp(name: string) {
+  if name == "__load_i8__" { return 0 }
+  if name == "__load_u8__" { return 0 }
+  if name == "__load_i16__" { return 1 }
+  if name == "__load_u16__" { return 1 }
+  if name == "__load_i64__" { return 3 }
+  if name == "__load_f32__" { return 2 }
+  if name == "__load_f64__" { return 3 }
+  -1
+}
+
+// One load instruction: `<opcode> <align-exp> <offset>`. Offset 0 always — VL spells the
+// address as an ordinary expression, so the static offset immediate has nothing to carry.
+function fbMemLoad(op: i32, alignExp: i32) {
+  wU8(op)
+  wU8(alignExp)
+  wU8(0) // static offset 0 (the address is the stack operand)
+  0
+}
+
+// `memory.size` → 0x3f 0x00 and `memory.grow` → 0x40 0x00. The trailing byte is the
+// memory INDEX immediate, not a flags byte: there is one memory, so it is 0.
+function fbMemorySize() {
+  wU8(OP_MEMORY_SIZE)
+  wU8(0) // memory index 0
+  0
+}
+function fbMemoryGrow() {
+  wU8(OP_MEMORY_GROW)
+  wU8(0) // memory index 0
+  0
+}
+
 // ── numeric-opcode intrinsics ────────────────────────────────────────────────
 // The IEEE bitcasts. A bitcast moves no bits: the same 32/64-bit pattern is simply
 // read at the other type, which is what makes float state hashable, a NaN payload
@@ -8295,6 +8365,51 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         }
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
         fbI32Load()
+        return 0
+      }
+      // The seven OTHER load widths (`buffer-design.md` §C2). One arm, because the
+      // shape is identical for all of them — push the address, write the opcode with
+      // its natural alignment — and the per-width difference is exactly two bytes,
+      // which `memLoadOpcode`/`memLoadAlignExp` hold. `__load_i32__` keeps its own arm
+      // above so its bytes stay provably untouched by this change.
+      if nameIsMemLoadIntrinsic(callee.identName) {
+        if c.callArgs.length != 1 {
+          return emitFail(
+            "emitProgram: " +
+              callee.identName +
+              " takes exactly one argument (the byte address)",
+          )
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+        fbMemLoad(
+          memLoadOpcode(callee.identName),
+          memLoadAlignExp(callee.identName),
+        )
+        return 0
+      }
+      // `memory.size` / `memory.grow` — the two ops that lift the 64 KiB ceiling
+      // (`buffer-design.md` §B2/§S4). Both take the memory index as an IMMEDIATE
+      // (0x00, the one memory), not as a stack operand:
+      //   memory.size          → 0x3f 0x00   ()      -> i32   pages currently mapped
+      //   memory.grow <pages>  → 0x40 0x00   (i32)   -> i32   the PREVIOUS page count,
+      //                                                       or -1 if the grow failed
+      // The -1 is the wasm spec's failure signal and is passed through unchanged: VL
+      // does not translate it, so a caller checks it exactly as the spec describes.
+      if callee.identName == "__memory_size__" {
+        if c.callArgs.length != 0 {
+          return emitFail("emitProgram: __memory_size__ takes no arguments")
+        }
+        fbMemorySize()
+        return 0
+      }
+      if callee.identName == "__memory_grow__" {
+        if c.callArgs.length != 1 {
+          return emitFail(
+            "emitProgram: __memory_grow__ takes exactly one argument (the page count to add)",
+          )
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+        fbMemoryGrow()
         return 0
       }
       if callee.identName == "__log__" {
