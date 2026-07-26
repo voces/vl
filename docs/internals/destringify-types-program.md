@@ -6054,9 +6054,11 @@ of `{v:i32}` variant rows in `uVariants`, nor any single member kind — it is t
 
 Two hand-copied copies of one ladder is two copies of every parse in it. This slice makes
 the field-code table, and the field-ELEMENT-name table below it, single-homed. It is
-D-ABIDEDUP's move applied to the field layer, and it is the largest single-file parse
-deletion the program has landed (NET −9 on the parser list, −28 counting every type-name
-classifier).
+D-ABIDEDUP's move applied to the field layer: **NET −9 on the parser list, −28 counting
+every type-name classifier**. (A first draft of this line called it the program's largest
+single-file parse deletion. It is not — D-ELEMROW/D-UARMSLOT (#1116) scored NET −24 with 17
+parses deleted. The correction is recorded rather than silently applied, on this doc's
+standing rule that a superlative is a measurement.)
 
 ### The enumeration, and the counting method
 
