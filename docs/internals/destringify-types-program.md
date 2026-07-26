@@ -15402,6 +15402,297 @@ direction.** Entombment graded DOWN accordingly rather than averaged away.
      them into two named homes turns an unwritten invariant into a readable one — and the sabotage
      that tests it (SAB-H3) coming back inert is a *finding about the corpus*, not a licence to
      merge them.
+---
+
+## D-PARENHOME + D-MONOTWIN — the last paren-only wrap walk loses every cross-module consumer, `emit_mono`'s private `[]`-peel twin retires, and a live INVALID-WASM miscompile is found by a failed fixture attempt
+
+Partition: `compiler/emit_collect.vl` + `compiler/emit_base.vl` + `compiler/emit_mono.vl`.
+Base: master **`4758935`**. **The base moved TWICE under this slice** — opened at `7bf59e3`,
+rebased onto `5d011ff` (#1151), then onto `4758935` (#1152) — and the whole gate, both probes,
+all four sabotages and the suite were **re-measured at each new head**, never inherited.
+
+### Scoreboard at my own re-measured base, and after
+
+| | `7bf59e3` | `5d011ff` | **`4758935` (final base)** | this slice |
+|---|---|---|---|---|
+| CORE (23-resolver SCORECARD list) | 343 | 343 | **326** | **326** |
+| OFF-LIST (#1141's table) | 35 | 35 | **35** | **35** |
+| TRUE TOTAL | 378 | 378 | **361** | **361** |
+
+(The `343 → 326` step is #1152's, not this slice's. Re-measuring caught it: a brief written at
+`7bf59e3` would have reported a 17-count base that no longer exists.)
+
+**NET 0 on the published scoreboard, and that is the honest number** — not one of the four
+functions this slice moves (`monoUnwrapParens`, `normTypeAtom`, `listElemNameOf`,
+`monoArrElemName`) appears on the 23-resolver list or on #1141's off-list table. Same
+*named-subset* artifact #1141 found and #1148 hit in the opposite direction. What DID move:
+
+| metric (unit stated) | base | after |
+|---|---|---|
+| **cross-module call sites of `emit_classify.monoUnwrapParens`** (the last hand-written paren-only wrap walk) | **5** (emit_collect ×3, emit_mono ×2) | **0** |
+| its total call sites / files | 17 / 3 | **12 / 1** |
+| **named duplicate homes of the trailing-`[]` cut** | 3 | **2** |
+| hand-written trailing-`[]` TEST sites, tree-wide | 31 | **30** |
+| hand-written trailing-`[]` PEEL sites, tree-wide | 46 | **45** |
+| hand-written bracket-depth LADDERS, tree-wide | 14 | 14 (all 9 non-home copies are outside this partition) |
+| compiler binary (at `4758935`) | 1,027,238 B | **1,027,045 B (−193 B)** |
+
+**Gate re-run in full at `4758935`** (the head this PR targets): refresh RC=0 · native-fixpoint
+byte-for-byte (1,027,045 B) · lint-self RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test`
+**2,054 passed / 0 failed / 14 ignored on BOTH sides with IDENTICAL ignored-test NAME SETS**
+(measured in one session, same command) · corpus A/B **1,340 entries, 0 differing** on
+byte+message+stdout+rc with channels proven populated (1,137 wasm / 1,133 distinct SHAs; 203
+messages / 201 distinct; 1,097 stdout / 936 distinct; 2 build rcs; 2 run rcs) · lint-tier A/B
+**1,340 rows, 761 distinct lint texts, 0 differing** · `rep-fuzz-check.sh` exact · fuzz A/B
+**23,000 programs/side, 24,477 output files and 1,477 `.err` per side, 5,071 distinct `.out`
+contents, 0 differing paths** · **probe 1 re-run at `4758935`: 456,003 invocations, 0
+disagreements, 17/17 corpus sites, 15/17 fuzz sites — identical to both earlier heads.**
+
+### The census, re-derived — and a CORRECTION to the handed-off walk count
+
+**UNIT:** one hand-written bracket-depth ladder = one FUNCTION BODY that (a) compares a character
+to a grammar OPENER literal, (b) compares one to the matching CLOSER, and (c) carries an integer
+that is both incremented and decremented. Comment-stripped, string- **and char-literal-aware**.
+Denominator: all 25 `compiler/*.vl`.
+
+**14 tree-wide at `5d011ff`**, of which **5 are declared homes** (`emit_base.tyTopLevelIndexOf` /
+`tyTopLevelSplit` / `tyGroupWrapsWhole`, `typecheck.tyTopIndexOf` / `tyGroupEndIndex`), so
+**9 non-home copies**: `emit_classify` ×7 (`nameIsWholeSpanShape`, `shapeFieldParse`,
+`splitUnionArmsAllDepth`, **`shapeInnerFieldSplit`**, `annRetKind`, `unionArmSigKey`,
+`monoUnwrapParens`), `typecheck.isObjShapeName`, `format.splitTopLevel`.
+
+**My first extractor read 12, not 14 — and the two it lost are the two that matter.** A function
+whose signature spans MULTIPLE LINES (`function f(\n  a: string,\n) {`) truncated to a one-line
+body, because the brace counter saw depth 0 on the header line and stopped. Fixing it (balance the
+signature parens FIRST, then count body braces) recovered `emit_base.tyTopLevelSplit` and
+**`emit_classify.shapeInnerFieldSplit`**. **A census whose extractor cannot parse a wrapped
+signature under-reports exactly the functions big enough to need one.**
+
+**Zero non-home ladders live in this partition** — `emit_base` holds three of the five homes,
+`emit_collect` and `emit_mono` hold none. That is why this slice's work is call-site relocation and
+duplicate-home deletion rather than ladder collapse, and it is worth saying plainly: after
+#1147/#1150 the emitter's lower modules are out of ladders.
+
+### 1. The home was ALREADY IMPORTED — in the same file, three lines from the copy
+
+`emit_collect.vl` imported **both** `emit_base.normTypeAtom` (line 109) **and**
+`emit_classify.monoUnwrapParens` (line 364), and used them for the SAME grammar:
+`internCloResultSpine` peeled a closure result's grouping parens with the home, while
+`registerInlineUnion` ×2 and `nulCloMixedUnionUnregistered` reached one module UP for the copy.
+`emit_mono` did the same from two sites. Fifth instance of the sharpest form of the rule.
+
+`monoUnwrapParens`'s body lives in `emit_classify.vl`, another slice's file, so **its BODY could
+not be retired here**. What could be — and was — is every consumer outside it, so the filed
+deletion becomes a purely in-file change.
+
+**Equivalence, measured at every call site (17/17), not sampled:**
+
+| channel | invocations | sites reached | **disagreements** |
+|---|---|---|---|
+| corpus (`tests/cases`, 1,312 cases) | 31,975 | **17 / 17** | **0** |
+| fuzz (23,000 generated programs, 7 seeds × 4 dimensions, depth 4–7) | 424,028 | **15 / 17** | **0** |
+| **total** | **456,003** | | **0** |
+
+**Comparator PROVED in the same build shape:** the INVERTED probe (comparator fed
+`normTypeAtom(s) + "@"`) fires on **456,003 / 456,003 = 100 %** of reaches, **at every one of the
+17 sites**. A 0 with an unwired comparator would look identical.
+
+**FUZZ BLIND SPOT, published:** sites **7** (`emit_classify:11102`) and **16** (`emit_mono:989`,
+the annotated function-type param pin) have **ZERO fuzz reach** while the corpus reaches them 2 and
+8 times. A fuzz-only measurement would have shipped two unmeasured sites. Third independent
+instance after #1125 and #1127.
+
+### 2. `emit_mono`'s private `[]`-peel twin
+
+`monoArrElemName` (private, `emit_mono`) was `emit_base.listElemNameOf` minus one naive
+grouping-paren strip — a `(…)`-wrapped element is the only shape the two can disagree on. Measured
+at both of its call sites: **362 corpus invocations (7 + 355), 0 disagreements**; comparator
+inverted → **362 / 362**. Fuzz reach **0** (the generator never emits a generic function with an
+array-typed pinned param) — a second blind spot, so this one rests on the corpus alone and says so.
+
+**DECLINED in the same neighbourhood, with the arithmetic:** `emit_mono:1273`'s
+`tname.slice(0, tname.length - 2)` stays a RAW cut. `listElemNameOf` would strip a paren layer
+naively and mangle a non-wrapped function-type element (`(i32)=>(i32)` → `i32)=>(i32`), which
+`normTypeAtom`'s balanced walk correctly declines. **The peel question and the cut question are
+separate; a home that fuses them is wrong for this caller.**
+
+### 3. THE WORK COUNT CAUGHT A REGRESSION THE WHOLE GATE READ AS CLEAN
+
+First candidate: corpus A/B 0 differing, lint A/B 0 differing, fuzz A/B 0 differing, suite green,
+fixpoint byte-for-byte, binary −214 B — **and the walk charsteps went UP**. `monoUnwrapParens`
+demanded BOTH a leading `(` and a trailing `)` before walking; `normTypeAtom` demanded only the
+leading `(`. So every `(i32) => i32`-shaped name paid a whole `tyGroupWrapsWhole` walk to be told
+what its last character already said: `tyGroupWrapsWhole` **+172 invocations / +2,809 charsteps**
+against `monoUnwrapParens` −1,177 → **net +1,632 charsteps (+3.34 %)**. #1144's rule, hit again:
+*a home placed in front of a resolver that already cheap-rejects loses the early exit.*
+
+**Keeping the home AND the short-circuit** (`t[t.length - 1] == ')'` restored inside
+`normTypeAtom`) turned it into **−294 charsteps (−0.60 %)**. That reject can only change an answer
+for a group that NEVER CLOSES — where the current code peels a REAL character off the end
+(`(abc` → `ab`) — and that population is **0 of 19,680 invocations** (corpus 1,604 + fuzz 18,076)
+with the enclosing branch **proven reached 496 times** (113 corpus + 383 fuzz). Measured empty, not
+dead by construction; stated as such.
+
+**Exact relocation identities** (corpus, 1,312 files, master vs candidate):
+
+| home | master | candidate | delta | identity |
+|---|---|---|---|---|
+| `normTypeAtom` invocations | 435 | 1,604 | **+1,169** | = 137+9+986+8+29, the retired sites' measured reach, **exactly** |
+| `listElemNameOf` invocations | 534,636 | 534,998 | **+362** | = `monoArrElemName`'s measured count, **exactly** |
+| `nameIsArray` invocations | 872,614 | 872,976 | **+362** | one per new `listElemNameOf`, **exactly** |
+| `monoArrElemName` invocations | 362 | — | **−362** | function deleted |
+| `tyGroupWrapsWhole` invocations | 1,291 | 1,350 | **+59** | = 172 new `(`-leading calls − 113 the reject absorbs, **exactly** |
+| `monoUnwrapParens` charsteps | 27,314 | 26,137 | −1,177 | |
+| `tyGroupWrapsWhole` charsteps | 21,492 | 22,375 | +883 | |
+| **walk charsteps, combined** | **48,806** | **48,512** | **−294 (−0.60 %)** | |
+
+**What this instrument does NOT cover:** only the six named functions are counted. Callers' own
+work, allocation, and every other resolver sit outside the total; the charstep figures are loop
+iterations of the two WALKS only, and `normTypeAtom`'s two whitespace-trim loops are counted on
+neither side (identical code on both).
+
+### 4. Entombment — one sabotage is INERT and no pin can exist for it
+
+A behaviour-preserving refactor cannot have a pin that fails on master, so: equivalence evidence
+plus pins that fail under sabotage. Each sabotage LEAVES the equivalence class (it drops a step, it
+does not permute one).
+
+| sabotage | what it breaks | corpus | fuzz |
+|---|---|---|---|
+| **S1** `emit_collect`'s 3 migrated sites lose the peel | the peel itself | **0 differing** | **0 differing / 23,000** |
+| **S2** `emit_mono`'s 2 migrated sites lose the peel | the peel itself | **2 differing** ✅ | — |
+| **S3** `emit_mono`'s 2 migrated `[]` cuts lose the cut | the cut itself | **6 differing** ✅ | — |
+| **S4** `normTypeAtom`'s new trailing-`)` reject INVERTED | the new guard | **2 differing** ✅ | — |
+
+**S1's 0 is NOT "no reacher", and I measured which of the two explanations it is.** A
+consequential-reach probe at the three sites: **reach 1,132 corpus / 12,525 fuzz; the peel CHANGES
+THE VALUE 43 times on the corpus (site 13 → 5, site 14 → 0, site 15 → 38) and 1,026 times on the
+fuzz corpus (23 / 4 / 999)**. So the sabotage alters **1,069 derived values across 24,312 programs
+and NO channel in the gate can observe one of them.** Eight hand-written fixtures aimed at the
+site-15 shape (nul-closure results: mixed union, value union, map, ref-list, alias-spelled,
+parenthesised, union-arm, closure-array element) **all read identical on both sides**. **No pin can
+exist for S1 on any channel I have — stated, not averaged away.** S2/S3/S4 are the pins for the
+rest of the change.
+
+### 5. `emit_base`'s `shapeInnerFieldSplit` header claimed a retirement that never happened
+
+The header said *"THE ONE HOME of the shape layer's field scanner, for the whole compiler …
+`emit_classify`'s own private copy retires by importing this one."* Verified at `5d011ff`:
+**`emit_classify.vl` still defines a PRIVATE `shapeInnerFieldSplit` with SIX callers** (10767,
+10834, 10940, 10980, 11020, 11152), **and that copy never even shared this walk** — it carries its
+own inline `{}[]()<>` ladder with its own `angOpen` / `tyGtIsClose` arms, where the `emit_base`
+body delegates to `tyTopLevelSplit`. So the duplicate is worth a whole hand-written ladder, and it
+is invisible to any census whose extractor mis-parses a wrapped signature (§ above). The header is
+corrected in place; the deletion is filed below. **A HEADER COMMENT IS NOT EVIDENCE — this one was
+wrong for two slices.**
+
+### 6. 🐛 A LIVE INVALID-WASM MISCOMPILE ON MASTER, found by a FAILED fixture attempt
+
+Three of the eight S1 fixture candidates emitted an unparseable module **on master and on the
+candidate alike**. Minimized to five lines and verified on a compiler built from `5d011ff` **and**
+one built from `7bf59e3` — **pre-existing, not a regression, and not caused by this slice**:
+
+```vl
+const h: (() => i32 | boolean) | null = () => 7
+if h != null {
+  const r = h()
+  if r is i32 { print(r) }
+}
+```
+
+`vl check` → `Checked 1 file, no errors.` · `vl run` → **`Error: failed to compile:
+wasm[0]::function[5]`** (INVALID WASM).
+
+**Every ingredient proven necessary by a cell that removes it and PASSES** (18 programs run, each
+cell exercised — never inferred):
+
+| cell | verdict |
+|---|---|
+| the repro (global, nullable, union result with a scalar arm, bound, read) | **INVALID WASM** |
+| the same code as a **LOCAL** inside a function | prints 7 |
+| a **non-nullable** closure (`() => i32 \| boolean`) | prints 7 |
+| the closure as a **PARAM** instead of a global | prints 7 |
+| an **all-STRUCT** result union (`W \| Q`) | prints 1 |
+| the call **not bound** (`if h() is i32 { print(2) }`) | prints 2 |
+| narrowed but the binding **not read** (`print(1)`) | prints 1 |
+| result `i32 \| null` (the niche) | **INVALID WASM** |
+| narrowing to the **other** arm (`is boolean`) | **INVALID WASM** |
+| the closure type spelled through an **alias** (`type F = () => i32 \| W`) | **INVALID WASM** |
+| a **named function** instead of a lambda | **INVALID WASM** |
+| `print(r == 7)` with no `is` at all | clean `emit error` (correctly loud) |
+
+So: **reading a narrowed union-typed call result, where the callee is a narrowed nullable-closure
+GLOBAL and the result union has at least one scalar arm, emits invalid wasm.** Not arm-specific,
+not lambda-specific, not spelling-specific. The all-struct result and the param position both work,
+which is where a fix should be bisected from. **Outside this partition (`emit_classify` /
+`wasmEmit`) — filed, not fixed, and deliberately NOT pinned, because a pin for a defect nobody is
+fixing would redden CI.**
+
+### 7. Filed diffs (measured here, for the owning partitions)
+
+**(A) `emit_classify.vl` — delete the private `shapeInnerFieldSplit` (≈31 lines including its own
+ladder) and add ONE word to an import list that already names ~20 `emit_base` functions:**
+
+```
+ import {
+   ...
++  shapeInnerFieldSplit,
+   strContains,
+ } from "./emit_base"
+```
+
+Its six callers already pass `nm.slice(1, nm.length - 1)`, exactly the home's parameter. Worth
+**one of the nine remaining non-home bracket ladders (9 → 8)**.
+
+**(B) `emit_classify.vl` — retire `monoUnwrapParens` (the LAST paren-only wrap walk, → 0):** it now
+has 12 call sites, all in that one file. Replace each with `normTypeAtom` (already exported from
+`emit_base`, which `emit_classify` already imports from) and delete the function. **Measured across
+all 17 of its call sites before the 5 external ones moved: 456,003 invocations, 0 disagreements,
+comparator firing at 100 %.** The `normTypeAtom` that ships here carries the trailing-`)` cheap
+reject, so the substitution is work-neutral-to-negative — do NOT drop that guard when taking this.
+
+**(C) The miscompile in § 6**, with its 18-cell enumeration.
+
+### 8. Declines, with arithmetic
+
+* **The trailing-`[]` grammar is NOT collapsed into a named home** — extending the previous slice's
+  estimate (`~12 inline tests`) to a **measured tree-wide population: 31 TEST sites and 46 PEEL
+  sites** across `emit_classify` 13/24, `emit_base` 7/9, `emit_mono` 4/5, `typecheck` 4/4,
+  `emit_rewrite` 2/2, `emit_collect` 1/2. Naming it would ADD ~15 call sites of a new resolver
+  while removing ~4 `nameIsArray` calls: **TRUE TOTAL 378 → ~387 under an honest vocabulary**, and
+  it removes **no walk at all** (a three-character suffix probe is not a ladder). The decline is on
+  the arithmetic, not on risk. What *was* taken is the strictly-positive part: the **named duplicate
+  home** (`monoArrElemName`) is gone, 3 → 2.
+* **No `shapeFieldSplit(name, …)` wrapper** for the `slice(1, n - 1)` brace unwrap that all **10**
+  `shapeInnerFieldSplit` call sites spell out (`emit_classify` ×6, `emit_base` ×2, `emit_collect`
+  ×2). It would add one function and one call frame at 10 sites to remove ten two-token slices that
+  every caller has already validated with its own `{`/`}` gate. No walk, no drift risk.
+
+### 9. Method notes earned here
+
+* **A CENSUS EXTRACTOR THAT CANNOT PARSE A WRAPPED SIGNATURE UNDER-REPORTS THE BIGGEST FUNCTIONS.**
+  Two of fourteen ladders were invisible, including the one this slice was sent to find. Validate an
+  extractor against a function you KNOW has the shape.
+* **THE COMPILER CANNOT `print`, BUT YOU CAN GIVE IT THE IMPORTS.** The Rust host and the corpus
+  oracle both instantiate the compiler with an EMPTY import object, so a `print` inside the compiler
+  fails to link (`unknown import: imports::__print_i32__`). Rather than routing probe output through
+  `emitFail` or the compiled program, this slice wrote a **60-line Deno probe host** that supplies
+  the `__print_*` family and drives `srcReset`/`srcPush`/`compileSrc` over a whole directory in ONE
+  shared instance: **23,000 fuzz programs in 8 seconds**, versus a per-file `vl build` sweep. It
+  also carries the module-table protocol, so multi-file corpus cases probe too. This is the cheapest
+  instrument this program has had; reuse it.
+* **IMPLAUSIBLE MAGNITUDE, AGAIN, AND IT WAS THE HARNESS.** The first fuzz A/B reported
+  `programs: 0` and 0 everywhere — `ls "$DIR"/*.vl` over 23,000 files died with *Argument list too
+  long* and the script carried on with an empty list. **A 0 that arrives with every other counter
+  also 0 is a harness failure, not a result.** Use `find`, and always print the denominator.
+* **AN INERT SABOTAGE IS STILL A MEASUREMENT IF YOU MEASURE THE VALUES IT CHANGES.** S1 read 0 on
+  both channels; the consequential-reach probe showed it changes 1,069 values over 24,312 programs.
+  "0 differing" and "the site does nothing" are different claims, and only the second one licenses
+  deletion.
+* **A FAILED FIXTURE HUNT IS A BUG HUNT.** Eight programs written to redden a sabotage reddened
+  nothing — and three of them turned out to miscompile on master (§ 6). The fixture attempt was
+  worth more than the pin it failed to produce.
+
 
 ## D-QUOTEWALK (filed, not shipped) + D-BANKREAD — the quote-blind grammar defect is TWO homes and 24 cells, not one home and one cell; and three checker decisions stop re-deriving a value their producer banked
 
