@@ -14359,3 +14359,347 @@ changed arm on the corpus was ZERO before this PR added it.**
     "files producing wasm" out of 1,328 rows** because the glob swept the `.msg`/`.out` sidecars.
     **Both were caught by an implausible magnitude, in the direction that reports MORE difference —
     the direction a refactor's author is least likely to check.**
+
+
+## D-ATOMIS + D-ATOMPRINT — a literal-union value is an i32 ATOM, and two emitter gates asked its RENDER instead: `is` compared a union-box tag against it, `print` handed it to the string printer (#PRNUM)
+
+**Base `b71888e`, re-measured here, not inherited: CORE 346 · OFF-LIST 36 · TRUE TOTAL 382**
+(`parsercount.py`, the 23-resolver SCORECARD list + #1141's off-list table, non-comment call sites,
+definition headers excluded). The brief's `0249fce` numbers — CORE 359 · OFF-LIST 36 · TRUE 395 —
+reproduced exactly at `0249fce`, and #1149 then took CORE 359 → 346 under this slice. **NET parse
+count 0 on every unit** (346 · 36 · 382 on both sides). Say that first: this slice buys correctness.
+The deletion work it was briefed to also carry is *measured and filed*, because both of its homes
+live in another agent's file.
+
+### The two defects, each reproduced and re-derived before being fixed
+
+Both were filed by #1148 with a mechanism. Both reproduce at `b71888e`. **One of the two filed fixes
+is REFUTED by measurement and the other is INCOMPLETE**; the sections below give the readings.
+
+#### (C) `is` over a literal-union receiver
+
+```vl
+type K = "x" | "y"
+const g: K = "x"
+if g is K { print(1) }        // master: failed to compile: wasm[0]::function[4]
+```
+
+`wasm-tools print` on the 418-byte module: `global.get 1` — and global 1 is `(mut i32)`, the
+interned ATOM id — then `struct.get 0 0 / i32.const 2 / i32.eq`, the value-union box's tag field
+read out of an i32. `isArmTagOfTy` is right (a litunion arm inside a REAL box does tag 2);
+`unionNameOfIdent(g)` claims the receiver because `K` is a registered union NAME, while the value's
+REP is a bare id. **The tag arm is right; the receiver classification is wrong** — #1148's reading,
+confirmed.
+
+The `K | null` receiver is worse and quieter: it does not reach the box path at all
+(`unionNameOfIdent` answers "" for the nullable spelling) and falls through to the static-guard
+fold, so **`if p is K` const-folds FALSE — a guard that never fires**. #1148 filed this as "the
+global is invalid wasm while the local and param silently produce no output"; **at `b71888e` all
+three binding forms const-fold FALSE**, the global included. Re-measured, not inherited.
+
+#### (D) `print` of a `K | null` niche
+
+| program | master `b71888e` |
+|---|---|
+| `const e: "a" \| "b" \| null = "b"; print(e)` | **invalid wasm** |
+| `function g(e: "a" \| "b" \| null) { print(e) }` | **rc=0, NO OUTPUT** |
+| `const e: K \| null = "b"; if e != null { print(e) }` | **invalid wasm** |
+| `const m: {[string]: K} = Map(); m["k"]="ab"; print(m["k"])` | **rc=0, NO OUTPUT** |
+
+A probe compiler that emits the classifier verdicts as a constant into the compiled program (the
+compiler's own `print` is unusable — the host defines no `__print_i32__` for it) reads, per cell,
+`exprString / exprNullableString / exprIsLitAtom / nodeTyIsNulLitUnion / texts`:
+
+| cell | mask | reading |
+|---|---|---|
+| `"a" \| null` global (WORKS on master) | 1 | exprString only; **`exprIsLitAtom` FALSE** |
+| `"a" \| "b" \| null` global | 13 | exprString **T**, atom T, nulLitUnion T, **texts 0** |
+| `"a" \| "b" \| null` local/param | 12 | exprString F, atom T, nulLitUnion T, **texts 0** |
+| narrowed `K \| null` global | 205 | exprString **T**, atom T, nulLitUnion F, **texts 2** |
+| narrowed `K \| null` local | 204 | exprString F, atom T, texts 2 |
+
+So **(D) is TWO independent bugs, not one**:
+
+* **the ORDER bug** — for an atom-repped GLOBAL, `exprString` also answers true (it reads the
+  softened render, which says `string` about a cell laid out `(mut i32)`), and `print` asks it
+  first, so the string printer is handed a raw atom id. This is the narrowed cell too (mask 205),
+  which is why `if e != null { print(e) }` worked for a local and not for a global.
+* **the EMPTY-CHAIN bug** — `exprIsLitAtom` claims a `K | null` niche on the standing assumption
+  that a consuming position has narrowed it (its own comment says so), and takes the member texts
+  from the NARROWED type. Un-narrowed, `nodeLitUnionMemberTexts` returns NOTHING and the widening
+  loop emits an EMPTY chain: rc=0, no output. **The assumption was never checked.**
+
+**REFUTATION 1 — #1148's filed fix for (D) ("swap the `exprString` / `exprIsLitAtom` order") is
+correct but NOT SUFFICIENT, and I nearly declined it for the wrong reason.** I reasoned from the
+code that the swap would regress the working `const e: "a" | null = "a"` cell, because
+`nodeTyIsNulLitUnion` accepts a one-member inner litunion. **The measurement says
+`exprIsLitAtom` is FALSE there (mask 1), so the swap is safe** — reasoning wrong, measurement right.
+But the swap alone converts the global cells from invalid wasm into the *silent* empty chain, i.e.
+it turns a loud failure into the quiet one. Both halves are needed, and each is entombed by its own
+sabotage below.
+
+### The fix — the REP decides, and the rep is in the arena
+
+Three hunks, `typecheck.vl` + `wasmEmit.vl`:
+
+1. **`tyLitMemberTexts(ty)`** (`typecheck.vl`) — one home for "the string-literal member texts of an
+   atom-repped type": a union of literals, or a bare `TyLit` (a fully-narrowed atom, and the type an
+   `is "x"` test carries). A nullable answers EMPTY by construction — the null arm has no member
+   text. `nodeLitUnionMemberTexts` becomes a `TyUnion`-gated call on it, which is behaviour-identical
+   (same walk, same skips) and is what makes the empty list mean "not a widenable atom".
+2. **`emitIs`'s litunion-ATOM arm** (`wasmEmit.vl`), ahead of every box path. Gated on
+   `exprIsLitAtom(receiver)`, the emitter's own REP question, with the tested member set read off
+   `isVarTyIxOf` — **neither side is a spelling**. Two rungs:
+   * the receiver's own members are all in the tested set (`nodeLitMembersWithin`) → `i32.const 1`,
+     folded without evaluating the receiver, the same shape as the concrete-variant fold already at
+     the end of that function;
+   * otherwise the membership chain `id == m0 || id == m1 || …`. **The `K | null` sentinel is `-1`,
+     which is no member's interned id, so the chain IS the non-null test** — one lowering covers the
+     nullable receiver with no extra arm.
+   A ONE-member tested type is ONE compare, so any receiver expression is safe; two or more re-read
+   the receiver, so those require an IDENT. That restriction is what keeps a map read or a call from
+   being silently duplicated, and it is measured below.
+3. **`print`'s dispatch** (`wasmEmit.vl`) — the atom question is asked FIRST, and an empty member-text
+   list is a loud `emitFail` ("print of a nullable literal union — narrow it first"), the rule the
+   nullable STRING three lines below already carried.
+
+### The rep space, enumerated and RUN — 160 + 60 cells, not a sample
+
+The brief's cell tables are a sample. Per #1149's rule (*enumerate the whole rep space and run each
+cell*), the matrix is **8 receiver FORMS × 4 receiver TYPES × 4 tested TYPES for `is`, plus the same
+forms × types for `print` = 160 programs**, each with a known expected output so every cell is
+GRADED (ok / wrong / reject / invalid-wasm / trap), not merely diffed:
+
+| | count |
+|---|---|
+| cells | **160** |
+| master ok → candidate ok (unchanged) | 68 |
+| master NOT ok → candidate **ok** | **80** |
+| master ok → candidate not ok (**REGRESSION**) | **0** |
+| silent-wrong → loud reject (neither "ok"; a strict improvement) | 12 |
+
+The 80 fixed cells are every binding form — global, local, param, array element, map read, struct
+field, call result, reassigned `let` — against `K`, `K | null` and an inline `"x"|"y"|null`. **No
+cell produced a TRAP on either side**, which is the check #1149 earned: fixing a classifier arm can
+convert invalid wasm into a trap, and here it does not.
+
+A second matrix covers the **DIRECT (non-Ident) receiver** the arm deliberately restricts:
+`xs[0] is K`, `m["k"] is K`, `s.f is K`, `mk() is K`, `(r) is K` — **60 cells, 27 changed, all from
+wrong to correct, 33 identical**. The 27 residual cells that are still not correct are listed in the
+hand-off with their category; **none of them is made worse.**
+
+### Gate
+
+Every leg run at `b71888e`, with the master baseline rebuilt **at this head, in this session, with
+the same command**. Both compilers checksummed before and after every leg; the candidate was
+re-derived from HEAD source and `cmp`-checked against the saved artifact after the last measurement
+(`CANDB.wasm` == a fresh `vl build compiler/entry.vl` == the installed seed).
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh` | RC=0 — master **1,027,627 B**, candidate **1,028,746 B** (**+1,119**) |
+| `native-fixpoint.sh` | stage3 == stage4 byte-for-byte (1,028,746 B) |
+| `lint-self.sh` | RC=0, fmt clean |
+| suite (`SELFHOST_NATIVE_ALIGN=1 deno task test`) | **2,053 passed / 0 failed / 14 ignored** |
+| suite, master baseline **re-measured at this head, same session, same command** | **2,045 / 0 / 14** — delta **+8**, accounted exactly: 6 new pins + the 2 derived `selfhost_native_align_test.ts` emit-reject rows the two `@emit-error` pins add; ignored-test NAME SETS **identical** (8 names, diffed as sets) |
+| corpus A/B (master vs candidate) | **1,339 entries, 6 differing = exactly the 6 new pins**; **1,333 pre-existing entries identical** on build-rc + wasm SHA + compiler message + run-rc + stdout |
+| corpus channel populations (side A) | 1,138 files produce wasm · 1,134 distinct SHAs · 201 carry a compiler message (199 distinct) · 1,093 produce stdout (933 distinct) |
+| lint-tier A/B (`vl check --severity hint`) | **1,336 rows, 1,336 carrying ≥1 lint, 759 distinct lint texts, 0 differing** |
+| `rep-fuzz-check.sh` | exact ✅ (1 baselined, 0 new, 0 stale) |
+| fuzz A/B | 12 seeds × 3 depths × 2 modes × 300 = **43,200 programs/side, 0 divergences** |
+
+**The corpus A/B at the PREVIOUS base read 0 of 1,330 differing.** That is the whole reason these two
+defects survived: **the defect population in the corpus is empty**, so nothing but a new fixture can
+see them. Six pins were added; each is verified `rc=1`/wrong-output on a master-built compiler and
+correct on the candidate.
+
+### Entombment — four sabotages, and the fire sets PARTITION the pin set
+
+| sabotage | pins reddened | corpus entries reddened (cand vs sabotage, 1,339 rows) |
+|---|---|---|
+| **S1** — kill the litunion-atom `is` arm (its tested member set is always empty) | `is-atom-receiver`, `is-atom-nullable-receiver`, `is-atom-member-subset` | **3** — exactly those three |
+| **S2** — drop the SUBSET rule from the constant-TRUE fold | `is-atom-member-subset` | **1** |
+| **S3** — drop the un-narrowed-nullable print REJECT | `print-nullable-litunion-rejected`, `print-map-read-nullable-litunion-rejected` | **2** |
+| **S4** — put the atom probe back BEHIND `exprString` (master's dispatch order) | `print-narrowed-nullable-litunion` | **1** |
+
+The union covers all six pins. **S2 is what keeps the fold from being over-merged**: without the
+subset rule `g is "y"` wrongly answers TRUE, and the subset pin is the only thing that says so.
+**S2 deliberately does NOT redden the nullable pin, and that is a finding, not a gap** — a nullable
+receiver is declined one rung earlier (`tyLitMemberTexts` returns empty for a `TyNullable`), so the
+nullable arm is entombed by S1 alone. Naming which rung a sabotage cannot reach is the difference
+between a partition and an overlap.
+
+### The WORK count, on both sides — and it is NOT free
+
+Gate item 9. The `is` arm sits in FRONT of the box ladder and the print reorder puts one classifier
+in front of another, which is exactly #1144's work-regression shape. Two instrumented pairs, a
+shared counter (a *function* over module-local `let`s in `emit_state.vl` — a cross-module
+`export let` is not a shared counter), reported by failing the emit so the corpus MESSAGE channel
+carries it, summed over the **1,138 / 1,136 of 1,339** corpus files that reach emit (the candidate
+reaches emit on two fewer: the two new `@emit-error` pins reject before the report).
+
+**Probe 1 — calls at the touched sites:**
+
+| counter | master | candidate | Δ |
+|---|---|---|---|
+| `emitIs` entries (denominator) | 964 | 964 | **0** |
+| `exprIsLitAtom` @ the new `is` arm | 0 | 956 | +956 |
+| `exprIsLitAtom` @ `print` | 3,737 | 5,365 | +1,628 |
+| `exprString` @ `print` | 5,367 | 5,202 | **−165** |
+| total | 9,104 | 11,523 | **+2,419 (+26.6 %)** |
+
+**That number overstates the cost by ~4×, and probe 2 says so.** `exprIsLitAtom`'s first statement
+is `if gLitUnionUsed == 0 { return false }` — one module-global compare for any program with no
+literal union anywhere:
+
+| counter (all callers, tree-wide) | master | candidate | Δ |
+|---|---|---|---|
+| `exprIsLitAtom` entries | 20,391 | 22,973 | +2,582 |
+| … of which the CHEAP REJECT | 18,189 (89.2 %) | 20,223 (88.0 %) | +2,034 |
+| … **doing real work** | **2,202** | **2,750** | **+548** |
+| `exprString` entries | 47,660 | 47,486 | **−174** |
+
+So the honest statement is: **+548 real `exprIsLitAtom` bodies and −174 `exprString` bodies over the
+corpus** — 2.2 % of one classifier's tree-wide total against 0.4 % of the other's — with the
+remaining +2,034 added calls being a single compare each. It is a cost, it is small, and it buys the
+defect. **Reported rather than omitted, because a "no behaviour change" gate cannot see it and the
+raw call count would have read as a 26.6 % regression.**
+
+### TARGET 2 — the two grammar homes DO disagree, and the divergence has a WITNESS
+
+#1148 filed "the same grammar now has two homes that disagree — on quoting, on the `=>` token, and
+on the resume offset", and asked for *a fixture pinning the quoted-member divergence first, then the
+unification*. #1143 had measured that scanner class **dead on both channels over eight shapes** and
+#1148's own probe read **0 corpus + 0 fuzz** differences. **Both of those readings are correct and
+the population is still not empty.**
+
+A throwaway probe (`emit_base.vl` belongs to another agent; **never committed**) applies the whole
+merge — `tyTopLevelIndexOf` → `tyTopIndexOf(name, sep, 0, 0)`, `tyTopLevelSplit` → a resume loop over
+`tyTopIndexOf`, and `annArrowAt` → `tyTopIndexOf(name, '=', 0, 0)` (the two-code-point token only the
+checker's home can express, which is *why* `emit_base` still hand-writes that one ladder). Measured
+against the candidate:
+
+* **corpus A/B: 0 differing of 1,339, and fuzz A/B 21,600 programs/side, 0 divergences** — the
+  population really is empty on both channels;
+* binary **−632 B**; scoreboard **CORE 346 unchanged · OFF-LIST 36 → 33 · TRUE 382 → 379** (the three
+  deleted ladders take three `tyGtIsClose` call sites with them);
+* **a hand-built witness DIVERGES, and it is a user-visible miscompile:**
+
+```vl
+type Box<T> = { v: T }
+const b: Box<"a,b" | "c" | null> = { v: "a,b" }
+if b.v != null { print(b.v) }
+```
+
+| | result |
+|---|---|
+| master `b71888e` / candidate (two homes) | `Error: emit error — emitProgram: bare null needs a struct-typed context` |
+| merged home (quote-aware) | prints `a,b` |
+
+Controls, all green on master: `Box<"ab" \| "c" \| null>` · `Box<"a\|b" \| "c" \| null>` ·
+`Box<"a:b" \| "c" \| null>`. **The trigger is a quoted COMMA inside a literal member of a generic
+ARGUMENT**: `gaeSplitArgs` splits the argument list on `,` with the quote-blind home, so
+`"a,b" | "c" | null` becomes two garbage arguments and the instantiation is built from rubble. A
+`|` or a `:` inside the quotes is inert because that home splits only on `,` there.
+
+Nine further witness shapes (a struct field, a param, an array element, a map value, a closure
+return, a two-field struct, each with a quoted `,` or `|`) read **identical on both sides** — so the
+divergence is narrow, and the eight-shape and corpus-scale zeros that preceded it were not wrong,
+they were **under-sampled at the generic-application position**. *"No witness exists" must name where
+it searched* — this is the second time that rule has paid this arc.
+
+**The fixture is NOT shipped here, deliberately.** It is red on master and would stay red until the
+`emit_base.vl` merge lands, and pinning the current behaviour green would pin a defect. The fixture
+text and the exact three-hunk diff are in the hand-off, to land in one PR with the fix.
+
+### TARGET 3 — re-measured at this base; the move is still not in this partition
+
+| | #1148 at `4dadedd` | here at `b71888e` |
+|---|---|---|
+| `recordClonedNodeTy` entries | 1,554 | **1,539** |
+| of which `nameToTy` RESOLVES | 92.0 % | **92.0 %** |
+| `nameToTy` entries (same population) | 10,508 | **10,412** |
+| `recordClonedNodeTy`'s share | 14.79 % | **14.78 %** |
+
+#1148's correction reproduces to two decimal places at a base two merges later; the original 31.6 %
+is refuted a second time. `synthTypeRef` still has **33 non-comment call sites** (`emit_rewrite` 18,
+`emit_mono` 14, `emit_collect` 1 — *a grep count, not a call count*), and **`synthTypeRef` itself
+lives in `emit_classify.vl`**: the parameter that would carry the index is a signature change in a
+file this slice does not own, so even the 18 `emit_rewrite` callers cannot move alone. **Declined,
+with the arithmetic, and nothing speculative exported** — `tyLitMemberTexts` /
+`nodeLitMembersWithin` are exported because `wasmEmit.vl` calls them in this PR.
+
+### Refutations
+
+1. **"Swap the `exprString`/`exprIsLitAtom` order in `print`'s dispatch" fixes (D).** Partly — it
+   fixes the GLOBAL cells, and the sabotage S4 proves it load-bearing. But alone it converts them to
+   the *silent* empty chain. The empty-text reject is the other half; S3 proves that half separately.
+2. **My own reasoning that the swap regresses `const e: "a" | null = "a"`.** Refuted by the probe:
+   `exprIsLitAtom` answers FALSE there (mask 1). Reasoning from `nodeTyIsNulLitUnion`'s one-member
+   tolerance was wrong; the classifier that actually gates the arm is a different one.
+3. **"(C)'s `K | null` cells are invalid wasm for a global and silent for a local/param."** At
+   `b71888e` **all three binding forms are silent** — the guard const-folds FALSE everywhere. The
+   filed split does not reproduce.
+4. **"The quoted-member divergence between the two grammar homes is dead on every channel."**
+   Refuted by construction at the generic-argument position: `Box<"a,b" | "c" | null>` is an emit
+   error with two homes and runs with one. Corpus (1,339) and the nine other hand-built shapes are
+   still 0 — the population is narrow, not empty.
+5. **"The reorder is free because `exprIsLitAtom` cheap-rejects."** Refuted in both directions: it is
+   not free (+548 real bodies) and it is not the 26.6 % the raw call count reads (88 % of the added
+   calls are one compare). **Neither the optimistic nor the pessimistic reading survives measurement.**
+6. **`recordClonedNodeTy` is 31.6 % of `nameToTy`.** 14.78 % here, reproducing #1148's 14.79 %.
+7. **"A single-member `is` test needs an Ident receiver too."** Refuted by construction: one member
+   is one compare, so the receiver is evaluated exactly once. Relaxing that gate took the
+   direct-receiver matrix from 43 wrong cells to 27 with no regression.
+
+### Hand-off, best-measured first
+
+1. **MERGE THE TWO GRAMMAR HOMES — it now has a witness, a diff and a measurement.** Owner:
+   whoever holds `emit_base.vl`. The three hunks, measured together as corpus-clean over 1,339
+   entries and **−632 B**:
+   * `tyTopLevelIndexOf(name, sep)` body → `tyTopIndexOf(name, sep, 0, 0)`;
+   * `tyTopLevelSplit(s, sep, dropEmpty, out)` body → a resume loop over `tyTopIndexOf(s, sep, 0,
+     start)` (the resume offset makes a k-way split ONE pass, which the current copy is not);
+   * `annArrowAt(name)` body → `tyTopIndexOf(name, '=', 0, 0)` — **the reason `emit_base` still
+     hand-writes a ladder at all**: #1147's `sep` is one code point and the arrow is two;
+   * add `tyTopIndexOf` to the existing `./typecheck` import (`tyGtIsClose` is already there);
+   * the three deleted ladders take three `tyGtIsClose` call sites with them: OFF-LIST **36 → 33**.
+
+   Ship it **with** this fixture, which is red today:
+   ```vl
+   // @run
+   // @log a,b
+   // CONTRACT: a quoted COMMA inside a literal member of a GENERIC ARGUMENT. `gaeSplitArgs`
+   // splits the argument list at top level, and the emit_base depth walk was quote-BLIND, so
+   // `"a,b" | "c" | null` split into two garbage arguments and the instantiation was built from
+   // rubble (`emitProgram: bare null needs a struct-typed context`). The checker's home has
+   // skipped quoted members since #1143; this is what unifying them buys.
+   // Controls that already ran: Box<"ab"|"c"|null>, Box<"a|b"|"c"|null>, Box<"a:b"|"c"|null>.
+   type Box<T> = { v: T }
+   const b: Box<"a,b" | "c" | null> = { v: "a,b" }
+   if b.v != null { print(b.v) }
+   ```
+2. **The 27 residual DIRECT-receiver `is` cells** (measured, categorised, none regressed):
+   * **9 are CHECKER rejects** (`xs[0] is …` over a `(K|null)[]` / inline litunion array) — a
+     checker question, not an emit one;
+   * **10 are a multi-member tested type over a non-Ident receiver** (`m["k"] is K`, `s.f is K`,
+     `mk() is K`) — this slice's own deliberate decline, because the chain re-reads the receiver.
+     The clean fix is one scratch i32 local (`local.tee`), which needs the per-function frame
+     reservation that `emitAtomToStr` already has for the str-op slots — an `emit_classify` +
+     `wasmEmit` pair, not a `wasmEmit` one-liner;
+   * **8 are receivers the emitter does not rep as atoms at all** (an inline `"x"|"y"` field/param
+     reps as a STRING, so `exprIsLitAtom` correctly declines) — those answer `is` WRONGLY today by a
+     different mechanism, and want their own slice.
+3. **`print(m[k])` over a litunion-valued map now REJECTS; the NARROWED spelling still does not
+   work.** `const t = m["k"]; if t != null { print(t) }` fails on **both** sides with
+   `emitProgram: bare null needs a struct-typed context` — a pre-existing map-read narrowing gap,
+   not caused here, and the reason the map pin can only pin the reject.
+4. **`recordClonedNodeTy`** — 1,539 entries / 92.0 % resolved / 14.78 % of `nameToTy` at `b71888e`.
+   Blocked on `synthTypeRef`'s signature, which is `emit_classify.vl`; the 18 `emit_rewrite` callers
+   cannot move without it.
+5. **Method note earned here: the compiler cannot `print`.** The host defines no `__print_i32__`
+   import for the compiler itself, so a classifier probe has to report through a channel that
+   survives: either **emit the verdict as a constant into the compiled program** (used for the (C)/(D)
+   masks — the program then prints the mask) or **fail the emit with the number in the message** (used
+   for the work counts — the corpus message channel carries it). Both are cheap; neither is obvious
+   from the harness.
