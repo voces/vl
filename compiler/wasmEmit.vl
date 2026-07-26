@@ -1,5 +1,6 @@
 import {
   inferRetNameOf,
+  isNumIntrinsicName,
   isValueUnionName,
   isVarTyIxOf,
   nameIsLitUnionType,
@@ -1430,6 +1431,19 @@ function emitCaptureRead(_body: i32[], name: string, fnIx: i32) {
     return 0
   }
   if emitCapturedRead(_body, name, fnIx) == 1 { return 0 }
+  // A NUMERIC-OPCODE INTRINSIC name reaching capture resolution: capture analysis records
+  // every free identifier that is not a local, a global or a collected function, and the
+  // intrinsics are none of those — so a lambda body calling one lands here, as it does for
+  // `__load_i32__` and the rest of the declared-but-not-collected family. Name the real
+  // problem rather than a variable the author never wrote. (Reached only on the already-
+  // failing path: a local/global/transitive capture of the same name resolved above.)
+  if isNumIntrinsicName(name) {
+    return emitFail(
+      "emitProgram: '" +
+        name +
+        "' cannot be called from inside a lambda — call it from a named function",
+    )
+  }
   emitFail("emitProgram: captured variable not found in enclosing frame")
 }
 
@@ -7956,6 +7970,144 @@ function emitBitcastIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
   NUM_INTR_NONE
 }
 
+// The f32 instruction for the float intrinsic `name`, or -1 when it is not one.
+//   abs 0x8b · ceil 0x8d · floor 0x8e · trunc 0x8f · nearest 0x90 · sqrt 0x91
+//   min 0x96 · max 0x97 · copysign 0x98
+function floatIntrOpF32(name: string) {
+  if name == "abs" { return 0x8b }
+  if name == "ceil" { return 0x8d }
+  if name == "floor" { return 0x8e }
+  if name == "trunc" { return 0x8f }
+  if name == "nearest" { return 0x90 }
+  if name == "sqrt" { return 0x91 }
+  if name == "min" { return 0x96 }
+  if name == "max" { return 0x97 }
+  if name == "copysign" { return 0x98 }
+  -1
+}
+
+// The f64 instruction for the float intrinsic `name`, or -1 when it is not one — the
+// f32 table shifted up by one block, exactly as the arithmetic opcodes are.
+//   abs 0x99 · ceil 0x9b · floor 0x9c · trunc 0x9d · nearest 0x9e · sqrt 0x9f
+//   min 0xa4 · max 0xa5 · copysign 0xa6
+function floatIntrOpF64(name: string) {
+  if name == "abs" { return 0x99 }
+  if name == "ceil" { return 0x9b }
+  if name == "floor" { return 0x9c }
+  if name == "trunc" { return 0x9d }
+  if name == "nearest" { return 0x9e }
+  if name == "sqrt" { return 0x9f }
+  if name == "min" { return 0xa4 }
+  if name == "max" { return 0xa5 }
+  if name == "copysign" { return 0xa6 }
+  -1
+}
+
+// The i32 instruction for the integer intrinsic `name`, or -1 when it is not one.
+//   clz 0x67 · ctz 0x68 · popcnt 0x69 · div_u 0x6e · rem_u 0x70 · rotl 0x77 · rotr 0x78
+//   lt_u 0x49 · gt_u 0x4b · le_u 0x4d · ge_u 0x4f
+function intIntrOpI32(name: string) {
+  if name == "clz" { return 0x67 }
+  if name == "ctz" { return 0x68 }
+  if name == "popcnt" { return 0x69 }
+  if name == "divU" { return 0x6e }
+  if name == "remU" { return 0x70 }
+  if name == "rotl" { return 0x77 }
+  if name == "rotr" { return 0x78 }
+  if name == "ltU" { return 0x49 }
+  if name == "gtU" { return 0x4b }
+  if name == "leU" { return 0x4d }
+  if name == "geU" { return 0x4f }
+  -1
+}
+
+// The i64 instruction for the integer intrinsic `name`, or -1 when it is not one.
+//   clz 0x79 · ctz 0x7a · popcnt 0x7b · div_u 0x80 · rem_u 0x82 · rotl 0x89 · rotr 0x8a
+//   lt_u 0x54 · gt_u 0x56 · le_u 0x58 · ge_u 0x5a
+function intIntrOpI64(name: string) {
+  if name == "clz" { return 0x79 }
+  if name == "ctz" { return 0x7a }
+  if name == "popcnt" { return 0x7b }
+  if name == "divU" { return 0x80 }
+  if name == "remU" { return 0x82 }
+  if name == "rotl" { return 0x89 }
+  if name == "rotr" { return 0x8a }
+  if name == "ltU" { return 0x54 }
+  if name == "gtU" { return 0x56 }
+  if name == "leU" { return 0x58 }
+  if name == "geU" { return 0x5a }
+  -1
+}
+
+// Lower a FLOAT intrinsic (`sqrt`, `min`, `copysign`, …): push every argument at the
+// operation's width, then the one instruction. The width rule is the binary operators'
+// — f32 when an operand is f32 and neither side is a genuine (non-literal) f64 — so
+// `min(x, 0.5)` over an f32 `x` computes in f32 exactly as `x * 0.5` does.
+function emitFloatIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
+  const opF32 = floatIntrOpF32(name)
+  if opF32 < 0 { return NUM_INTR_NONE }
+  const c = P.nodes[callIx]
+  if c is Call {
+    const args = c.callArgs
+    if args.length == 0 {
+      return emitFail("emitProgram: " + name + " takes at least one argument")
+    }
+    let anyF32 = false
+    let i = 0
+    while i < args.length {
+      if exprIsF32(args[i], fnIx) { anyF32 = true }
+      i = i + 1
+    }
+    // `binMixHardF64` over the first and last argument IS the operators' rule: true when
+    // either side is a genuine (non-literal) f64. A one-argument intrinsic passes its one
+    // operand as both sides, which asks the same question of it.
+    const hardF64 = binMixHardF64(args[0], args[args.length - 1], fnIx)
+    const useF32 = anyF32 && !hardF64
+    let j = 0
+    while j < args.length {
+      if useF32 {
+        if emitExprAsF32(body, args[j], fnIx) < 0 { return -1 }
+      } else {
+        if emitExprAsF64(body, args[j], fnIx) < 0 { return -1 }
+      }
+      j = j + 1
+    }
+    if useF32 { return fbNumOp(opF32) }
+    return fbNumOp(floatIntrOpF64(name))
+  }
+  NUM_INTR_NONE
+}
+
+// Lower an INTEGER intrinsic (`clz`, `rotl`, `divU`, `ltU`, …): push every argument at
+// the operation's width, then the one instruction. i64 when an operand is i64 (the i32
+// side sign-extends), else i32 — the selection the i64 binary operators use.
+function emitIntIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
+  const opI32 = intIntrOpI32(name)
+  if opI32 < 0 { return NUM_INTR_NONE }
+  const c = P.nodes[callIx]
+  if c is Call {
+    const args = c.callArgs
+    let useI64 = false
+    let i = 0
+    while i < args.length {
+      if exprIsI64(args[i], fnIx) { useI64 = true }
+      i = i + 1
+    }
+    let j = 0
+    while j < args.length {
+      if useI64 {
+        if emitExprAsI64(body, args[j], fnIx) < 0 { return -1 }
+      } else {
+        if emitExpr(body, args[j], fnIx) < 0 { return -1 }
+      }
+      j = j + 1
+    }
+    if useI64 { return fbNumOp(intIntrOpI64(name)) }
+    return fbNumOp(opI32)
+  }
+  NUM_INTR_NONE
+}
+
 // Node shapes read: Call { callFn: i32, callArgs: i32[] }, callee Ident { identName }.
 function emitCall(body: i32[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
@@ -8202,12 +8354,16 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         if exprIsClosure(c.callFn, fnIx) {
           return emitCallRef(body, callIx, fnIx)
         }
-        // The NUMERIC-OPCODE intrinsics (the IEEE bitcasts): one wasm instruction over
-        // the argument, no import and no runtime. Reached only where the name resolved
-        // to no function and no closure value, which IS the shadowing rule the checker
-        // types against — a program that defines its own `f32bits` calls its own.
+        // The NUMERIC-OPCODE intrinsics: one wasm instruction over the arguments, no
+        // import and no runtime. Reached only where the name resolved to no function and
+        // no closure value, which IS the shadowing rule the checker types against — a
+        // program that defines its own `min` calls its own.
         const bcRc = emitBitcastIntr(body, callIx, fnIx, callee.identName)
         if bcRc != NUM_INTR_NONE { return bcRc }
+        const fiRc = emitFloatIntr(body, callIx, fnIx, callee.identName)
+        if fiRc != NUM_INTR_NONE { return fiRc }
+        const iiRc = emitIntIntr(body, callIx, fnIx, callee.identName)
+        if iiRc != NUM_INTR_NONE { return iiRc }
         return emitFail("emitProgram: call to unknown function")
       }
       // A direct call to a CAPTURING lifted function (`add(10)` where `add` captures `n`

@@ -67,14 +67,12 @@ hatch").** All four are prerequisites for each other in practice:
 - ⬜ **P0.2 Exported memory** — export the module's linear memory (`--export-memory`, or automatic
   when `Buffer` is used). Replaces the per-scalar host-call ABI for bulk data; the host overlays
   `Float32Array`/`DataView` in place. Nothing else in the export contract changes.
-- ⬜ **P0.3 Reinterpret casts** — `f32bits`/`f32fromBits`/`f64bits`/`f64fromBits`. **One opcode each,
-  currently absent entirely**, and everything determinism-critical routes through them (float-state
-  hashing, NaN canonicalization, WC3-matched transcendentals). Cheapest P0 item by a wide margin.
-- ⬜ **P0.4 Float/int opcode intrinsics** — f32/f64 `sqrt abs floor ceil trunc nearest min max
-  copysign`; i32/i64 `clz ctz popcnt rotl rotr` + unsigned `divU remU ltU leU gtU geU`.
-  **Explicitly the *entire* math library they want from us** — `sin/cos/pow/exp` are a deliberate
-  non-ask (a std `sin` would be a determinism trap). Unsigned ops matter for hashing/RNG/fourCC;
-  i64-widening emulation works but poisons hot loops.
+- ✅ **P0.3 Reinterpret casts** — `f32bits`/`f32fromBits`/`f64bits`/`f64fromBits`, one opcode each.
+- ✅ **P0.4 Float/int opcode intrinsics** — f32/f64 `sqrt abs floor ceil trunc nearest min max
+  copysign`; i32/i64 `clz ctz popcnt rotl rotr` + unsigned `divU remU ltU leU gtU geU`. Free
+  functions, width taken from the operands, shadowable by a program's own function of the same name.
+  `sin/cos/pow/exp` stay a deliberate non-ask — no wasm opcode computes one, so any std `sin` would
+  be a policy choice in its last bit, i.e. a determinism trap.
 
 **P1 — gates the port being GOOD.**
 - ⬜ **P1.1 Typed views over Buffer** (`buf.f32view(off, count)`, `x[i]`, `.length`) — the kernel is
@@ -117,10 +115,11 @@ in-language GC knobs.
   through a **command-queue protocol** (host pumps `rnNextCmd()`, executes, commits back) and
   **the linker stays EMPTY — no host-function imports at all**. So a browser driver is the same loop
   in JS with nothing to shim, and the VL brain survives the H-M2 Rust-host teardown unchanged.
-  Two things to settle, both real:
-  1. **Sequencing.** The charter says "v1 lands with std-design slice 4"; the owner's ordering
-     (*test runner before std expansion*) inverts that. Either pull `std:testing` out of slice 4 as its
-     own unit, or move slice 4 first.
+  Two things to settle, one now decided:
+  1. **Sequencing — DECIDED: `vl test` lands BEFORE the std expansion.** The charter's "v1 lands with
+     std-design slice 4" is **superseded**; `std:testing` comes out of slice 4 as its own unit. The
+     reason is the owner's stated preference — a real test runner and assertion library must exist
+     before std grows, so every std addition arrives with tests written in VL rather than TypeScript.
   2. **The genuine gate is the failable-IO story, not the ABI.** The VL-side walk consumes fs
      primitives, so `std:fs` must exist, and `std:fs` is **gated on `docs/error-handling-design.md`
      (`T | E` with a structural `IoError = { code, msg }`) which is DRAFTED, PENDING OWNER REVIEW**.
@@ -346,8 +345,9 @@ in-language GC knobs.
 - ⬜ **`vl test`.** DESIGNED: `docs/internals/test-runner-design.md` (jest-shaped `describe`/`it`/`expect`
   over `std:testing`; two-phase registration, host-driven `vlt*` protocol; `*.test.vl` discovery
   + configurable globs; files parallel by default / in-file serial, opt-in fresh-instance
-  `it.concurrent`; per-test capture, failure-first reporting). v1 lands with std-design slice 4;
-  chartered follow-ups: compiler-injected call sites, generic `expect<T>` + structural diffs,
+  `it.concurrent`; per-test capture, failure-first reporting). **v1 lands BEFORE the std expansion,
+  not with std-design slice 4** — the charter's sequencing is superseded (see the promotion note under
+  Next); chartered follow-ups: compiler-injected call sites, generic `expect<T>` + structural diffs,
   power-`assert` rewriting. New behavioral tests switch to `*.test.vl` at v1 (directive-corpus
   growth stops; conversion waits for the TS-tier teardown).
 - ⬜ **Error-handling design** — DRAFTED, pending owner review: `docs/error-handling-design.md`

@@ -333,6 +333,27 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   empty is `T|null` (normal absence). A sentinel-encoded scalar nullable
   (`boolean|null`) builds its `null` from the i32 sentinel, not `ref.null`. (B6,
   §VL.6)
+- **Single-instruction numeric operations are compiler intrinsics, spelled as
+  bare free functions, and shadowable.** A std function needs a body; these have
+  only an opcode, so `std/` cannot hold them. Bare over dunder because the rule
+  the builtin surface actually follows is *raw-floor machinery is dunder, safe
+  total functions are bare* (`print`/`toString`/`fromCodePoint` vs
+  `__trap__`/`__store_i32__`). Shadowable because `min`/`max`/`abs` are the names
+  programs most often define themselves, and an intrinsic that captured such a
+  call would silently kill the user's function. Width comes from the operands
+  under the binary operators' rule, not from a second declaration — VL has no
+  overload resolution and gains none.
+- **Unsigned integer ops are operations, not a `u32` type.** `divU`/`ltU` read
+  the same bit pattern under a different interpretation; VL's `i32` is signed
+  (`/` is `div_s`) and already exposed one unsigned instruction as an operator
+  (`>>>`). A `u32` would touch the type arena, every rep table, every widening
+  rule and every emitter kind code to express something the operand need not
+  carry.
+- **No transcendentals, ever, as a language or std primitive.** No wasm opcode
+  computes `sin`/`pow`/`exp`, so any implementation is a library whose last bit
+  is a policy choice. A program that must match another implementation exactly
+  has to own that choice; shipping one would give it a trap to avoid rather than
+  work to save. (`docs/internals/numeric-intrinsics.md`)
 
 ## Parser, distribution & bootstrapping
 
