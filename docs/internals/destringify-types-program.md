@@ -9387,7 +9387,10 @@ green suite** — the ignored count is the check.
 
 ## D-ISVARTY + D-ALIASFN — the `is`-test spelling joins the ladder, and an alias-spelled FUNCTION type becomes callable (#1137)
 
-Branched at `47b98e6` (D-TSTY #1134). Two things, and they are counted separately because they
+Branched at `47b98e6` (D-TSTY #1134), **rebased onto `caad41a`** (#1136 D-COERCEKIND et al.,
+which lands in `wasmEmit`/`emit_rep`/`emit_state`/`emit_rewrite` — consumers of exactly what
+D-ALIASFN changes, so the whole gate was re-run on the rebased head; see "Re-verified at the
+rebase base" below). Two things, and they are counted separately because they
 are different kinds of work: **D-ISVARTY** ladders the five `is`-test resolution sites onto the
 parser's spelling tree (behaviour-preserving, entombed by equivalence + sabotage), and
 **D-ALIASFN** admits a `TyFunc` member to `singleAliasMemberTyIx` (a SOUNDNESS fix, entombed by
@@ -9682,6 +9685,25 @@ test` RC=0 — **2,026 passed / 0 failed / 8 ignored**, against a master baselin
 / 0 failed / 8 ignored** measured in this same worktree with the changes stashed: **+4 = exactly
 the four new pins**, and the IGNORED TEST NAME SETS are byte-identical (`diff` RC=0), so nothing
 that ran on master silently stopped running.
+
+### Re-verified at the rebase base `caad41a`
+
+#1136 changed no line of `typecheck.vl` and no line of `parser.vl`, so every probe/work figure
+above (measured at `47b98e6` on the 1,335-file corpus) stands as measured. Everything that could
+interact was re-run against a `caad41a`-built compiler, on a corpus re-frozen at that base
+(1,306 `tests/cases` files with this slice's four pins removed + the 31-file parent snapshot
+carrying `caad41a`'s `typecheck.vl`):
+
+| re-run at `caad41a` | result |
+|---|---|
+| corpus A/B — SHA + build rc + message + run stdout + run rc, **1,337 entries** | **0 differing** |
+| corpus LINT tier A/B (`--severity hint`), 1,337 rows, **689** carrying >=1 lint | **0 differing** |
+| fuzz A/B, 50,400 programs/side, 52,801 output files/side, `diff -r` | **RC=0, 0 differing paths** |
+| the four pins against a `caad41a`-built compiler | all four still red, same four distinct messages |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **2,028 / 0 / 8** vs a `caad41a` baseline of **2,024 / 0 / 8** measured in this worktree; ignored NAME SETS byte-identical |
+| `refresh` · `native-fixpoint` · `lint-self` · `rep-fuzz-check` | all **RC=0**; fixpoint 1,038,216 B |
+| binary, like-for-like (ONE compiler, two sources) | 1,038,163 -> **1,038,216 (+53 B)** — the same delta as at `47b98e6` |
+
 
 ### What did NOT move, and the mechanism
 
