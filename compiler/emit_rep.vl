@@ -104,6 +104,7 @@ import {
   resolveAnnot,
   splitUnionAtoms,
   tyIsLitUnion,
+  tyIsNullableLitUnion,
   tyIsValueUnionBox,
   tyIxIsVariantMember,
   tyLitUnionAliasIx,
@@ -1925,6 +1926,18 @@ function repOfTyFlat(ty: i32): RepDesc {
       if tyLitUnionAliasIx(ty) >= 0 { return repMk("i32", 0, "") }
       return repUncovered()
     }
+    // The EXPANDED nullable-litunion `"a" | "b" | null` — a null member plus an
+    // all-quoted-literal remainder. It is the SAME TYPE as the two-part `K | null`
+    // spelling `repOfNullable` gives the i32 atom + `-1` sentinel niche (`rdNul` 3)
+    // fifty lines below, so it must get the SAME rep; without this arm it fell to
+    // `tyIsValueUnionBox` and reps'd as the union BOX, while every read classified
+    // from the arena — where the two spellings are one type — and lowered the atom.
+    // `type K = "ab" | "zz" | null` interns as exactly this shape, so its cell was
+    // built as a box and `print(v)` handed that `(ref $box)` to `__print_i32__`:
+    // INVALID WASM. No alias gate here, matching `repOfNullable`: canon PRESERVES a
+    // nullable litunion's members (`nulLitUnionPreserve`), so the inline and aliased
+    // spellings both rep as the atom.
+    if tyIsNullableLitUnion(ty) { return repMk("i32", 3, "") }
     // A single-member object union is the canonicalized `{a} & {b}` struct
     // alias — reps as the struct itself.
     if t.uMembers.length == 1 {
@@ -2650,6 +2663,24 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
     // node; the flat projections carry its positional truths.
     if tyLitUnionAliasIx(ty) >= 0 { return rtLeafOf("atom", 0, "", ty) }
     return rtLeafOf("unsup", 0, "litunion:noalias", ty)
+  }
+  // D-NULLITHOME: the EXPANDED nullable-litunion `"a" | "b" | null`. It is the SAME
+  // type the two-part `K | null` spelling builds as a `nul` node with the atom-sentinel
+  // discipline (disc 3) over the litunion inner, so build it identically here and let
+  // the hash-cons fold the two spellings into ONE node. Without this arm it fell to the
+  // `box` arm below and the TREE — which is AUTHORITATIVE over the flat kind at
+  // `repOfTy` — answered "union" for a type every reader lowers as the i32 atom niche,
+  // so a `type K = "ab" | "zz" | null` param/return got a `(ref $box)` valtype while its
+  // body read the `-1` sentinel: INVALID WASM. The child is the same explicit
+  // `litunion:noalias` policy node an INLINE `"a" | "b" | null` inner yields — the
+  // member vocabulary stays the open question, the DISCIPLINE is decided.
+  if tyIsNullableLitUnion(ty) {
+    const nix = rtAlloc("nul", ty)
+    rtByTyPut(ty, nix)
+    rtDisc[nix] = 3
+    rtChild[nix] = rtLeafOf("unsup", 0, "litunion:noalias", -1)
+    rtKidCount[nix] = 0
+    return rtComplete(nix, ty)
   }
   if members.length == 1 {
     const m = T.tys[members[0]]

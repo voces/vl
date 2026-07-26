@@ -4712,6 +4712,32 @@ function nameHasSep(name: string, sep: i32) {
 
 function nameHasPipe(name: string) { nameHasSep(name, '|') }
 
+// D-ARRGROUP — THE ONE HOME of the array-ELEMENT grouping rule, shared by the two
+// renderers. Render the array whose element rendered as `el` and whose element ARENA type
+// is `elTy`: the element is wrapped in grouping parens before the `[]` exactly when the
+// suffix would otherwise re-bind — a FUNCTION element (`((i32) => i32)[]` is an array of
+// functions, whereas bare the trailing `[]` binds into the closure's RESULT, spelling
+// `(i32) => i32[]`, a function RETURNING a list; a depth-3 chain `(()=>(()=>i32)[])[]`
+// mangled to `(()=>()=>i32[])` minted a ref-list slot distinct from the annotation's, the
+// value call's `$fnsig` key missed and fell to the all-i32 arity sig — INVALID WASM at the
+// call) or a UNION element, which is parenthesized precisely so its `|`s stop being
+// top-level. The array sibling of the TyFunc-result / union-member / nullable-closure
+// grouping-paren preservation.
+//
+// `tyToEmitNameGo` and `tyToNominalName` each carried this as a private four-line copy.
+// They are the two renderers the SCORECARD CORRECTION's "kill the SOURCES" strategy points
+// at, and a renderer asking `nameHasPipe` about a string it has just built is the disease
+// in miniature — but the two DUALS analysed in #1153's hand-off item 5 (the `emitNameAtoms`
+// BANK, and a structural `ae is TyUnion || ae is TyNullable` test) each have a stated hazard
+// and only one of them covers `tyToNominalName`, which has no bank at all. Merging the copies
+// is the part that is provable today; it leaves ONE site to convert instead of two, and the
+// conversion is then a one-line change inside a single home.
+function arrElemRender(el: string, elTy: i32): string {
+  if T.tys[elTy] is TyFunc { return "(" + el + ")[]" }
+  if nameHasPipe(el) { return "(" + el + ")[]" }
+  el + "[]"
+}
+
 // The index of a TOP-LEVEL `=>` in `name`, or -1 — the FUNCTION-TYPE marker the parser
 // emits for `(params) => ret`. An arrow nested in a param/return group
 // (`((i32) => i32) => void`) or in a generic ARGUMENT (`Box<(i32) => i32>`) is NOT the
@@ -6161,21 +6187,12 @@ function tyToEmitNameGo(ix: i32) {
     let el = litUnionAliasNameOfTy(t.aElem)
     if el == "" { el = tyToEmitName(t.aElem) }
     if el == "" { return "" }
-    // A CLOSURE element keeps grouping parens (`(()=>i32)[]`) — bare, the trailing `[]`
-    // binds into the closure's RESULT (`()=>i32[]`), spelling a DIFFERENT type (a closure
-    // returning `i32[]` instead of an array of `()=>i32` closures). A depth-3 chain
-    // `(()=>(()=>i32)[])[]` mangled to `(()=>()=>i32[])` here, minting a ref-list slot
-    // distinct from the annotation's — the value-call `$fnsig` key missed and fell to the
-    // all-i32 arity sig (INVALID-WASM at `p()`'s reflist result). The array sibling of the
-    // TyFunc-result / union-member / nullable-closure grouping-paren preservation.
-    const ae = T.tys[t.aElem]
     // A list name is ONE atom in every form — a union element is parenthesized precisely
     // so its `|`s stop being top-level. Set rather than inherited (the element render
-    // left its own width behind).
+    // left its own width behind). The grouping itself is `arrElemRender`'s (D-ARRGROUP),
+    // which also carries the CLOSURE-element rationale this arm used to state twice.
     emitNameAtoms = 1
-    if ae is TyFunc { return "(" + el + ")[]" }
-    if nameHasPipe(el) { return "(" + el + ")[]" }
-    return el + "[]"
+    return arrElemRender(el, t.aElem)
   }
   if t is TyMap {
     const mk = tyToEmitName(t.mKey)
@@ -6404,10 +6421,7 @@ export function tyToNominalName(ix: i32): string {
     let el = litUnionAliasNameOfTy(t.aElem)
     if el == "" { el = tyToNominalName(t.aElem) }
     if el == "" { return "" }
-    const ae = T.tys[t.aElem]
-    if ae is TyFunc { return "(" + el + ")[]" }
-    if nameHasPipe(el) { return "(" + el + ")[]" }
-    return el + "[]"
+    return arrElemRender(el, t.aElem)
   }
   if t is TyMap {
     const mk = tyToNominalName(t.mKey)
@@ -14090,14 +14104,34 @@ export function nodeTyIsStructArray(ix: i32) {
 // index is a registered union alias (`cUnionTyIxs`) that is a litunion. Matches `nameIsLitUnionType` at
 // emit time: `canonEmitTypeNames` softens an INLINE `"a" | "b"` annotation to `string` (string rep), but
 // an alias keeps its name (atom rep), so only aliases classify as litunions here.
-// STRUCTURAL (C1): node `ix`'s type is a nullable litunion (`K | null` / `"a" | "b" | null`) — a
-// `TyNullable` whose inner is a litunion. Matches `nameIsNulLitUnion`: `canonEmitTypeNames` PRESERVES a
-// nullable litunion's members (`nulLitUnionPreserve`), so BOTH inline and aliased forms classify here.
+// STRUCTURAL (C1): node `ix`'s type is a nullable litunion (`K | null` / `"a" | "b" | null`) — the
+// per-NODE form of `tyIsNullableLitUnion`, which is THE ONE HOME of the question. Matches
+// `nameIsNulLitUnion`: `canonEmitTypeNames` PRESERVES a nullable litunion's members
+// (`nulLitUnionPreserve`), so BOTH inline and aliased forms classify here.
+//
+// D-NULLITHOME: this body used to be a PRIVATE COPY that handled only the `TyNullable` form
+// (`K | null`) and answered NO for the EXPANDED `TyUnion` form (a null member plus all-quoted
+// literal members) that `tyIsNullableLitUnion` — 500 lines below, in this same file — has always
+// accepted. `type K = "ab" | "zz" | null` interns as that expanded union, so the niche arm of
+// `globalCellKind` (and of `buildLocals`, the param ladder and the return ladder) declined and the
+// cell was built as a union BOX, while every READ classified from the arena, where the alias and
+// the inline spelling are one type, and lowered the atom niche — `struct.get`-free
+// `call __print_i32__` on a `(ref $box)`, i.e. INVALID WASM, at every construction site. The
+// header above already CLAIMED both forms classify here; only the body disagreed.
+//
+// The variant dispatch below is the retiring copy's CHEAP REJECT, kept (#1138): only a
+// `TyNullable` (the two-part `K | null`) or a `TyUnion` (the expanded `"a" | "b" | null`) can be
+// this niche, and every OTHER arena variant is the overwhelming majority of what this is asked
+// about — 13.4M entries per corpus sweep. A bare `tyIsNullableLitUnion(nodeTyIxOf(ix))`
+// delegation is CORRECT and was measured: it doubles that home's entries (+17.5M, +90%) because
+// every non-union node pays a call to re-derive a reject this test settles in place. Both live
+// arms still delegate, so the grammar has ONE home.
 export function nodeTyIsNulLitUnion(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
   const t = T.tys[ty]
-  if t is TyNullable { return tyIsLitUnion(t.nInner) }
+  if t is TyNullable { return tyIsNullableLitUnion(ty) }
+  if t is TyUnion { return tyIsNullableLitUnion(ty) }
   false
 }
 
