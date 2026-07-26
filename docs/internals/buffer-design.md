@@ -785,6 +785,14 @@ callee-position skip) still needs no such pairing.
   because a seed-backed test named `exported_memory_test.ts` matches neither `ci-native` glob and so
   would have run NOWHERE in CI while passing locally by self-ignoring. Renamed to
   `vl_exported_memory_test.ts`.
+- **THE LOCAL GATE RUNS A DIFFERENT COMMAND THAN CI, and that gap cost a round-trip.**
+  `deno task test` is `deno test -A --no-check --parallel tests/`. `ci-native` additionally runs
+  **`deno test -A tests/cases_wasm_test.ts` without `--no-check`** — that single step is the repo's
+  TypeScript gate, and it type-checks `tests/support/runWasm.ts` transitively. A `TS2339` in the
+  host adapter passed every local leg (fixpoint, lint-self, 2,122 tests, corpus A/B, 25,200 fuzz
+  programs) and failed CI immediately. **A green local gate is evidence about the local gate.** The
+  fix for the next slice is mechanical: run the `ci.yml` commands verbatim, not the task aliases —
+  `deno lint`, `deno check compiler/*.ts`, the two `--no-check` suites, and the one that is not.
 
 ### H7. Two findings this slice did not go looking for
 
