@@ -4596,15 +4596,46 @@ export function tyGtIsClose(name: string, i: i32, angOpen: i32) {
   true
 }
 
-// True if the type name contains the TOP-LEVEL separator `sep` (`|` for an
-// inline-union synthetic name `A|B|null`, `&` for an intersection `A&B`).
-// Depth-aware: a separator inside `{…}`/`[…]`/`(…)`/`<…>` (an inline-object field's
-// own union type, a map value, a parenthesized group, a generic-application ARGUMENT)
-// or inside a quoted literal member does NOT make the whole name a union/intersection.
-function nameHasSep(name: string, sep: i32) {
+// ── THE ONE TYPE-NAME SCANNER ────────────────────────────────────────────────
+// A rendered type name is a bracket language: `{}` object / map, `[]` array,
+// `()` group and param list, `<>` generic application, `"…"` literal member, plus
+// the separators `|` `&` `,` `:` and the function arrow `=>`. Walking it at TOP
+// LEVEL — the same `depth`/`angOpen`/quote-skip ladder — was hand-written out
+// FOURTEEN times in this file alone, and eleven more times across `emit_base`,
+// `emit_collect` and `emit_classify`.
+//
+// That is not a style problem, it is the compiler's most-repeated BUG SHAPE: every
+// extension of the grammar has had to be re-taught to each copy, and the copies
+// have twice been caught disagreeing — #1118/#1120 taught `<…>` to the scanners
+// that had never heard of it, #1140 collapsed three copies of the ref-array
+// ladder. The copies in THIS file still disagree today: `parenEnclosesWhole` and
+// `nameIsFuncTypeAtom` do not skip quoted members, `splitUnionAtoms` and
+// `unionMemberCount` skip them with a naked `inStr` toggle that an escaped quote
+// (`"a\"b"`) walks straight through, and `canonShapeName`'s map-key scan never
+// learned `<…>` at all. One home ends the class.
+//
+// The two entry points below are the WHOLE grammar. Everything else in this file
+// asks them a question; nothing else counts a bracket.
+
+// The index of the first TOP-LEVEL occurrence of `a` — or of `b`, when `b` is not
+// 0 — at or after `from`, or -1. Quoted literal members skip whole (escape-aware,
+// via `skipQuotedName`); `{}`/`[]`/`()`/`<>` nest; a `>` closes only against an
+// OPEN `<` (`tyGtIsClose`), so the arrow's own `>` and `tyToStr`'s `->` stay inert.
+//
+// `'='` means the function ARROW: it matches only when the next character is `>`.
+// The four callers that hand-rolled that two-character lookahead now share it.
+//
+// DEPTH IS COUNTED FROM `from`, and that is exact rather than approximate: a
+// caller resuming a split at the character after a top-level separator resumes at
+// a point where the depth was 0 by the split's own condition, so restarting the
+// count there reproduces it. A whole split therefore still costs ONE pass over the
+// name — the scan runs from the previous separator to the next, not from 0 each
+// time — which is what keeps `splitUnionAtoms` (the hottest caller at ~168 K
+// invocations over the corpus) off the O(n²) path its own header warns about.
+function tyTopIndexOf(name: string, a: i32, b: i32, from: i32) {
   let depth = 0
   let angOpen = 0
-  let i = 0
+  let i = from
   while i < name.length {
     const c = name[i]
     if c == '"' {
@@ -4620,53 +4651,66 @@ function nameHasSep(name: string, sep: i32) {
       } else if c == '>' && tyGtIsClose(name, i, angOpen) {
         depth = depth - 1
         angOpen = angOpen - 1
-      } else if c == sep && depth == 0 {
-        return true
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
-function nameHasPipe(name: string) { nameHasSep(name, '|') }
-
-// The index of a TOP-LEVEL `=>` (`=` at depth 0, followed by `>`) in `name`, or -1 — the
-// FUNCTION-TYPE marker the parser emits for `(params) => ret`. Depth/quote-aware, so an
-// arrow nested in a param/return group (`((i32) => i32) => void`) or in a generic
-// ARGUMENT (`Box<(i32) => i32>`) is NOT the top one.
-function topLevelArrowIndex(name: string) {
-  let depth = 0
-  let angOpen = 0
-  let i = 0
-  while i < name.length {
-    const c = name[i]
-    if c == '"' {
-      i = skipQuotedName(name, i)
-    } else {
-      if c == '{' || c == '[' || c == '(' {
-        depth = depth + 1
-      } else if c == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      } else if c == '}' || c == ']' || c == ')' {
-        depth = depth - 1
-      } else if c == '>' && tyGtIsClose(name, i, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      } else if (
-        depth == 0 &&
-        c == '=' &&
-        i + 1 < name.length &&
-        name[i + 1] == '>'
-      ) {
-        return i
+      } else if depth == 0 && (c == a || c == b) {
+        if c != '=' { return i }
+        if i + 1 < name.length && name[i + 1] == '>' { return i }
       }
       i = i + 1
     }
   }
   -1
 }
+
+// The index at which the group opened by `name[from - 1]` CLOSES — the first
+// closer that would take the depth (counted from `from`) below zero — or -1 when
+// the group never closes. The same ladder as `tyTopIndexOf`, with the closer as
+// the target instead of a separator.
+//
+// Callers gate on the OPENER themselves (`name[0] == '('`, `inner[0] == '['`),
+// which is what makes `from` meaningful; a `>` cannot be the closer found here
+// because `tyGtIsClose` needs an open `<` that a `from`-relative depth of 0 has
+// not seen.
+function tyGroupEndIndex(name: string, from: i32) {
+  let depth = 0
+  let angOpen = 0
+  let i = from
+  while i < name.length {
+    const c = name[i]
+    if c == '"' {
+      i = skipQuotedName(name, i)
+    } else {
+      if c == '{' || c == '[' || c == '(' {
+        depth = depth + 1
+      } else if c == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      } else if c == '}' || c == ']' || c == ')' {
+        if depth == 0 { return i }
+        depth = depth - 1
+      } else if c == '>' && tyGtIsClose(name, i, angOpen) {
+        if depth == 0 { return i }
+        depth = depth - 1
+        angOpen = angOpen - 1
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// True if the type name contains the TOP-LEVEL separator `sep` (`|` for an
+// inline-union synthetic name `A|B|null`, `&` for an intersection `A&B`).
+function nameHasSep(name: string, sep: i32) {
+  tyTopIndexOf(name, sep, 0, 0) >= 0
+}
+
+function nameHasPipe(name: string) { nameHasSep(name, '|') }
+
+// The index of a TOP-LEVEL `=>` in `name`, or -1 — the FUNCTION-TYPE marker the parser
+// emits for `(params) => ret`. An arrow nested in a param/return group
+// (`((i32) => i32) => void`) or in a generic ARGUMENT (`Box<(i32) => i32>`) is NOT the
+// top one; `'='` is the scanner's arrow token, so the `>` lookahead lives in the home.
+function topLevelArrowIndex(name: string) { tyTopIndexOf(name, '=', 0, 0) }
 
 // True if `name` is a top-level FUNCTION TYPE `(params)=>ret` — a top-level `=>` with the
 // leading `(...)` param group closing right before it. The `=>` binds LOOSER than `|`/`&`,
@@ -4687,36 +4731,17 @@ export function isTopLevelFuncTypeName(name: string) {
 // `out`. Shared by the union (`|`), intersection (`&`) and param-list (`,`) arms of
 // `nameToTy`.
 function splitTypeName(name: string, sep: i32, out: string[]) {
-  let depth = 0
-  let angOpen = 0
   let start = 0
-  let i = 0
-  while i <= name.length {
-    let atSplit = i == name.length
-    let step = 1
-    if !atSplit {
-      const c = name[i]
-      if c == '"' {
-        step = skipQuotedName(name, i) - i
-      } else if c == '{' || c == '[' || c == '(' {
-        depth = depth + 1
-      } else if c == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      } else if c == '}' || c == ']' || c == ')' {
-        depth = depth - 1
-      } else if c == '>' && tyGtIsClose(name, i, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      } else if c == sep && depth == 0 {
-        atSplit = true
-      }
+  let going = true
+  while going {
+    const at = tyTopIndexOf(name, sep, 0, start)
+    if at < 0 {
+      out.push(name.slice(start, name.length))
+      going = false
+    } else {
+      out.push(name.slice(start, at))
+      start = at + 1
     }
-    if atSplit {
-      out.push(name.slice(start, i))
-      start = i + 1
-    }
-    i = i + step
   }
   0
 }
@@ -4736,38 +4761,17 @@ function gaIndexOf(name: string) {
 // skip whole, and the function arrow's `>` is NOT a closer (`(i32)=>i32,string`
 // must still split at its comma). Empty parts drop (a tolerated trailing comma).
 function splitGenArgs(s: string, out: string[]) {
-  let depth = 0
-  let angOpen = 0
   let start = 0
-  let i = 0
-  while i <= s.length {
-    const isEnd = i == s.length
-    let step = 1
-    let split = isEnd
-    if !isEnd {
-      const c = s[i]
-      if c == '"' {
-        step = skipQuotedName(s, i) - i
-      } else if c == '{' || c == '[' || c == '(' {
-        depth = depth + 1
-      } else if c == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      } else if c == '}' || c == ']' || c == ')' {
-        depth = depth - 1
-      } else if c == '>' && tyGtIsClose(s, i, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      } else if c == ',' && depth == 0 {
-        split = true
-      }
+  let going = true
+  while going {
+    let end = tyTopIndexOf(s, ',', 0, start)
+    if end < 0 {
+      end = s.length
+      going = false
     }
-    if split {
-      const part = s.slice(start, i)
-      if part.length > 0 { out.push(part) }
-      start = i + 1
-    }
-    i = i + step
+    const part = s.slice(start, end)
+    if part.length > 0 { out.push(part) }
+    start = end + 1
   }
   0
 }
@@ -5300,37 +5304,12 @@ function nameToTy(name: string) {
       if negd < 0 { return -1 }
       return mkNegTy(negd)
     }
-    // A PARENTHESIZED group `(A | B)` — strip when the outer parens enclose the
-    // whole name (depth never returns to 0 before the final `)`).
+    // A PARENTHESIZED group `(A | B)` — strip when the leading `(` closes only at
+    // the final character (`parenEnclosesWhole`'s question, asked of the home).
     if name[0] == '(' && name[name.length - 1] == ')' {
-      let pdepth = 0
-      let pAng = 0
-      let pj = 0
-      let wraps = true
-      while pj < name.length {
-        const pc = name[pj]
-        if pc == '"' {
-          pj = skipQuotedName(name, pj)
-        } else {
-          if pc == '{' || pc == '[' || pc == '(' {
-            pdepth = pdepth + 1
-          } else if pc == '<' {
-            pdepth = pdepth + 1
-            pAng = pAng + 1
-          } else if (
-            pc == '}' ||
-            pc == ']' ||
-            pc == ')' ||
-            (pc == '>' && tyGtIsClose(name, pj, pAng))
-          ) {
-            if pc == '>' { pAng = pAng - 1 }
-            pdepth = pdepth - 1
-            if pdepth == 0 && pj < name.length - 1 { wraps = false }
-          }
-          pj = pj + 1
-        }
+      if tyGroupEndIndex(name, 1) == name.length - 1 {
+        return nameToTy(name.slice(1, name.length - 1))
       }
-      if wraps { return nameToTy(name.slice(1, name.length - 1)) }
     }
     // A FUNCTION TYPE `(params)=>ret` (the parser's synthetic name for `(i32) => i32`):
     // the leading `(...)` is the param list, then `=>`, then the return atom. Build a
@@ -5408,69 +5387,26 @@ function nameToTy(name: string) {
     if name[0] == '{' && name[nlen - 1] == '}' {
       const fnames: string[] = []
       const ftys: i32[] = []
-      let fdepth = 0
-      let fAng = 0
+      // The fields are the top-level commas of the brace's INTERIOR — scanned from
+      // index 1, so the opening `{` is not counted and the field commas sit at depth
+      // 0; the run ends at the closing brace rather than at the end of the name.
       let fstart = 1
-      let fi = 1
-      while fi <= nlen - 1 {
-        let fSplit = fi == nlen - 1
-        let fstep = 1
-        if !fSplit {
-          const fc = name[fi]
-          if fc == '"' {
-            fstep = skipQuotedName(name, fi) - fi
-          } else if fc == '{' || fc == '[' || fc == '(' {
-            fdepth = fdepth + 1
-          } else if fc == '<' {
-            fdepth = fdepth + 1
-            fAng = fAng + 1
-          } else if fc == '}' || fc == ']' || fc == ')' {
-            fdepth = fdepth - 1
-          } else if fc == '>' && tyGtIsClose(name, fi, fAng) {
-            fdepth = fdepth - 1
-            fAng = fAng - 1
-          } else if fc == ',' && fdepth == 0 {
-            fSplit = true
+      let fgoing = true
+      while fgoing {
+        let fend = tyTopIndexOf(name, ',', 0, fstart)
+        if fend < 0 {
+          fend = nlen - 1
+          fgoing = false
+        }
+        const field = name.slice(fstart, fend)
+        if field.length > 0 {
+          const colonAt = tyTopIndexOf(field, ':', 0, 0)
+          if colonAt > 0 {
+            fnames.push(field.slice(0, colonAt))
+            ftys.push(nameToTy(field.slice(colonAt + 1, field.length)))
           }
         }
-        if fSplit {
-          const field = name.slice(fstart, fi)
-          if field.length > 0 {
-            // split `fname:ftype` at the first top-level `:`
-            let cdepth = 0
-            let cAng = 0
-            let ci = 0
-            let colonAt = -1
-            while ci < field.length {
-              const cc = field[ci]
-              if cc == '"' {
-                ci = skipQuotedName(field, ci) - 1
-              } else if cc == '{' || cc == '[' || cc == '(' {
-                cdepth = cdepth + 1
-              } else if cc == '<' {
-                cdepth = cdepth + 1
-                cAng = cAng + 1
-              } else if (
-                cc == '}' ||
-                cc == ']' ||
-                cc == ')' ||
-                (cc == '>' && tyGtIsClose(field, ci, cAng))
-              ) {
-                if cc == '>' { cAng = cAng - 1 }
-                cdepth = cdepth - 1
-              } else if cc == ':' && cdepth == 0 && colonAt < 0 {
-                colonAt = ci
-              }
-              ci = ci + 1
-            }
-            if colonAt > 0 {
-              fnames.push(field.slice(0, colonAt))
-              ftys.push(nameToTy(field.slice(colonAt + 1, field.length)))
-            }
-          }
-          fstart = fi + 1
-        }
-        fi = fi + fstep
+        fstart = fend + 1
       }
       return mkObjTy(fnames, ftys)
     }
@@ -6511,93 +6447,37 @@ export function tyToNominalName(ix: i32): string {
 function canonShapeName(name: string) {
   const inner = name.slice(1, name.length - 1)
   if inner.length > 0 && inner[0] == '[' {
-    // A map `{[K]:V}` — the key ends at its matching `]` (depth-aware).
-    let depth = 0
-    let i = 0
-    while i < inner.length {
-      const c = inner[i]
-      if c == '"' {
-        i = skipQuotedName(inner, i)
-      } else {
-        if c == '[' || c == '{' || c == '(' { depth = depth + 1 }
-        if c == ']' || c == '}' || c == ')' {
-          depth = depth - 1
-          if depth == 0 {
-            const key = inner.slice(1, i)
-            const val = inner.slice(i + 2, inner.length)
-            return "{[" + canonEmitName(key) + "]:" + canonEmitName(val) + "}"
-          }
-        }
-        i = i + 1
-      }
+    // A map `{[K]:V}` — the key ends where its own `[` closes.
+    const kend = tyGroupEndIndex(inner, 1)
+    if kend >= 0 {
+      const key = inner.slice(1, kend)
+      const val = inner.slice(kend + 2, inner.length)
+      return "{[" + canonEmitName(key) + "]:" + canonEmitName(val) + "}"
     }
     return name
   }
-  // An object shape `{f:T,…}`: split fields at depth 0 (quoted literal members
-  // skipped), canon each field's type past its first depth-0 `:`.
+  // An object shape `{f:T,…}`: split the interior at its top-level commas, canon
+  // each field's type past its first top-level `:`.
   let out = "{"
-  let depth = 0
-  let angOpen = 0
   let start = 0
-  let i = 0
-  while i <= inner.length {
-    let atSplit = i == inner.length
-    let step = 1
-    if !atSplit {
-      const c = inner[i]
-      if c == '"' {
-        step = skipQuotedName(inner, i) - i
-      } else if c == '{' || c == '[' || c == '(' {
-        depth = depth + 1
-      } else if c == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      } else if c == '}' || c == ']' || c == ')' {
-        depth = depth - 1
-      } else if c == '>' && tyGtIsClose(inner, i, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      } else if c == ',' && depth == 0 {
-        atSplit = true
-      }
+  let going = true
+  while going {
+    let end = tyTopIndexOf(inner, ',', 0, start)
+    if end < 0 {
+      end = inner.length
+      going = false
     }
-    if atSplit {
-      const field = inner.slice(start, i)
-      // The field's type starts past its first depth-0 `:` (quote-aware).
-      let cdepth = 0
-      let cAng = 0
-      let colonAt = -1
-      let ci = 0
-      while ci < field.length {
-        const cc = field[ci]
-        if cc == '"' {
-          ci = skipQuotedName(field, ci) - 1
-        } else if cc == '{' || cc == '[' || cc == '(' {
-          cdepth = cdepth + 1
-        } else if cc == '<' {
-          cdepth = cdepth + 1
-          cAng = cAng + 1
-        } else if cc == '}' || cc == ']' || cc == ')' {
-          cdepth = cdepth - 1
-        } else if cc == '>' && tyGtIsClose(field, ci, cAng) {
-          cdepth = cdepth - 1
-          cAng = cAng - 1
-        } else if cc == ':' && cdepth == 0 && colonAt < 0 {
-          colonAt = ci
-        }
-        ci = ci + 1
-      }
-      if start > 0 { out = out + "," }
-      if colonAt >= 0 {
-        out = out +
-          field.slice(0, colonAt + 1) +
-          canonEmitName(field.slice(colonAt + 1, field.length))
-      } else {
-        out = out + field
-      }
-      start = i + 1
+    const field = inner.slice(start, end)
+    const colonAt = tyTopIndexOf(field, ':', 0, 0)
+    if start > 0 { out = out + "," }
+    if colonAt >= 0 {
+      out = out +
+        field.slice(0, colonAt + 1) +
+        canonEmitName(field.slice(colonAt + 1, field.length))
+    } else {
+      out = out + field
     }
-    i = i + step
+    start = end + 1
   }
   out + "}"
 }
@@ -15250,93 +15130,48 @@ export function splitUnionAtoms(name: string, out: string[]) {
   // struct's ~5 K-char render (the third recurrence of the per-code-point-concat
   // quadratic class — see `retAtomsCheap`, which now also gates that render away).
   //
-  // `pdepth` counts ALL groupers — braces, brackets, AND parens — and gates BOTH the `|`
-  // splitting and the top-level-`=>` detection. Paren-aware splitting keeps a paren-GROUPED
-  // arm whole: `(i32 | string)[] | {w: i32}` splits to `(i32 | string)[]` + `{w: i32}` (the
-  // legacy brace/bracket-only depth mis-split it into the garbage atoms `(i32` + `string)[]`,
-  // so the WHOLE union mis-classified — the binding silently dropped its union rep and every
-  // `is` against the list arm const-folded FALSE, a live miscompile). A paren-grouped closure
-  // member (`((i32) => A | B) | f64`) needs no special casing anymore: its return's `|` sits
-  // at `pdepth >= 1`. The generic-application brackets `<…>` count too, so a union ARGUMENT
-  // (`Box<i32|null>`) stays ONE atom; the arrow's own `>` is exempt (`tyGtIsClose`), without
-  // which `((i32)=>i32)|f64` would run the depth negative and never split at all.
-  // Quoted litunion members are skipped verbatim (`inStr`) so a grouper or
-  // `|` INSIDE a string-literal atom (`"(a" | "b"`) neither splits nor derails the depth.
+  // Paren-aware splitting keeps a paren-GROUPED arm whole: `(i32 | string)[] | {w: i32}`
+  // splits to `(i32 | string)[]` + `{w: i32}` (a brace/bracket-only depth mis-split it into
+  // the garbage atoms `(i32` + `string)[]`, so the WHOLE union mis-classified — the binding
+  // silently dropped its union rep and every `is` against the list arm const-folded FALSE, a
+  // live miscompile). The generic-application brackets `<…>` count too, so a union ARGUMENT
+  // (`Box<i32|null>`) stays ONE atom. All of that is now the ONE scanner's business.
+  //
+  // A TOP-LEVEL `=>` stops the split: the whole name is a single function-type member and its
+  // return is absorbed verbatim (a `|` inside it belongs to the return union, split
+  // separately). Asking for `|` OR the arrow in one query is what keeps this a single pass.
   let start = 0
-  let pdepth = 0
-  let angOpen = 0
-  let inStr = false
-  let i = 0
-  while i < name.length {
-    const c = name[i]
-    if inStr {
-      if c == '"' { inStr = false }
-    } else if c == '"' {
-      inStr = true
-    } else if c == '{' || c == '[' || c == '(' {
-      pdepth = pdepth + 1
-    } else if c == '<' {
-      pdepth = pdepth + 1
-      angOpen = angOpen + 1
-    } else if c == '}' || c == ']' || c == ')' {
-      pdepth = pdepth - 1
-    } else if c == '>' && tyGtIsClose(name, i, angOpen) {
-      pdepth = pdepth - 1
-      angOpen = angOpen - 1
-    } else if (c == '=' && i + 1 < name.length && name[i + 1] == '>') {
-      if pdepth == 0 {
-        // A top-level function arrow: the whole name is a single function-type member — absorb
-        // the return verbatim (a `|` inside it belongs to the return union, split separately),
-        // i.e. stop scanning; the final push below takes everything from `start`.
-        i = name.length
-      }
-    } else if pdepth == 0 && c == '|' {
-      out.push(name.slice(start, i))
-      start = i + 1
+  let going = true
+  while going {
+    const at = tyTopIndexOf(name, '|', '=', start)
+    if at < 0 || name[at] == '=' {
+      out.push(name.slice(start, name.length))
+      going = false
+    } else {
+      out.push(name.slice(start, at))
+      start = at + 1
     }
-    i = i + 1
   }
-  out.push(name.slice(start, name.length))
   0
 }
 
 // The number of TOP-LEVEL `|`-separated members in the synthetic name `name` (1 for a
 // bare name). Counts separators without materializing the atom strings.
 export function unionMemberCount(name: string) {
+  // The counting dual of `splitUnionAtoms` — the same query, without materializing the
+  // atom strings (a top-level `=>` stops the count, so `(i32) => i32 | string` is ONE
+  // function type and not a 2-member union).
   let n = 1
-  // All-grouper depth + quoted-atom skipping, the counting dual of `splitUnionAtoms`
-  // (paren- and angle-aware, so a paren-GROUPED arm's or a generic ARGUMENT's inner `|` is
-  // not a separator; the arrow's `>` is exempt, exactly as in `splitUnionAtoms`).
-  let pdepth = 0
-  let angOpen = 0
-  let inStr = false
-  let i = 0
-  while i < name.length {
-    const c = name[i]
-    if inStr {
-      if c == '"' { inStr = false }
-    } else if c == '"' {
-      inStr = true
-    } else if c == '{' || c == '[' || c == '(' {
-      pdepth = pdepth + 1
-    } else if c == '<' {
-      pdepth = pdepth + 1
-      angOpen = angOpen + 1
-    } else if c == '}' || c == ']' || c == ')' {
-      pdepth = pdepth - 1
-    } else if c == '>' && tyGtIsClose(name, i, angOpen) {
-      pdepth = pdepth - 1
-      angOpen = angOpen - 1
-    } else if (c == '=' && i + 1 < name.length && name[i + 1] == '>') {
-      if pdepth == 0 {
-        // A top-level `=>` — the rest is the function RETURN (one member); stop counting so
-        // `(i32) => i32 | string` is ONE function type, not a 2-member union.
-        return n
-      }
-    } else if pdepth == 0 && c == '|' {
+  let start = 0
+  let going = true
+  while going {
+    const at = tyTopIndexOf(name, '|', '=', start)
+    if at < 0 || name[at] == '=' {
+      going = false
+    } else {
       n = n + 1
+      start = at + 1
     }
-    i = i + 1
   }
   n
 }
@@ -15360,63 +15195,22 @@ export function nameIsFuncTypeAtom(nameIn: string) {
   ) {
     name = name.slice(1, name.length - 1)
   }
-  let depth = 0
-  let angOpen = 0
-  let i = 0
-  while i < name.length {
-    const c = name[i]
-    if c == '(' || c == '{' || c == '[' {
-      depth = depth + 1
-    } else if c == '<' {
-      depth = depth + 1
-      angOpen = angOpen + 1
-    } else if c == ')' || c == '}' || c == ']' {
-      depth = depth - 1
-    } else if c == '>' && tyGtIsClose(name, i, angOpen) {
-      depth = depth - 1
-      angOpen = angOpen - 1
-    } else if (
-      depth == 0 &&
-      c == '=' &&
-      i + 1 < name.length &&
-      name[i + 1] == '>'
-    ) {
-      return true
-    }
-    i = i + 1
-  }
-  false
+  tyTopIndexOf(name, '=', 0, 0) >= 0
 }
 
 // True when the LEADING bracket of `name` closes only at the FINAL char — i.e. the outer
 // group encloses the whole string (`(()=>i64)` yes; `(i32)=>(i32)` no, the first `)`
 // closes mid-string). Lets `nameIsFuncTypeAtom` strip only genuine grouping parens.
-// Both callers (`nameIsFuncTypeAtom`, `peelGroupParens`) gate on `name[0] == '('` before
-// calling, so the `<…>` arm only ever runs on a group NESTED inside those parens; a bare
-// `Box<i32>` reaching here would answer true, which is correct for "the leading bracket
-// closes at the end" but is not a paren peel — do not drop those guards.
+// Both callers (`nameIsFuncTypeAtom`, `peelGroupParens`) gate on `name.length >= 2` and
+// `name[0] == '('` before calling, so the `<…>` arm only ever runs on a group NESTED
+// inside those parens; a bare `Box<i32>` reaching here would answer true, which is
+// correct for "the leading bracket closes at the end" but is not a paren peel — do not
+// drop those guards. The LENGTH guard is load-bearing too, and differently: on the EMPTY
+// name this answers true (`tyGroupEndIndex` returns -1, and `"".length - 1` is also -1)
+// where the hand-written scan it replaces answered false. No caller can reach it — both
+// require two characters — but a third caller must gate, or add the guard here.
 export function parenEnclosesWhole(name: string) {
-  let depth = 0
-  let angOpen = 0
-  let i = 0
-  while i < name.length {
-    const c = name[i]
-    if c == '(' || c == '{' || c == '[' {
-      depth = depth + 1
-    } else if c == '<' {
-      depth = depth + 1
-      angOpen = angOpen + 1
-    } else if c == ')' || c == '}' || c == ']' {
-      depth = depth - 1
-      if depth == 0 { return i == name.length - 1 }
-    } else if c == '>' && tyGtIsClose(name, i, angOpen) {
-      depth = depth - 1
-      angOpen = angOpen - 1
-      if depth == 0 { return i == name.length - 1 }
-    }
-    i = i + 1
-  }
-  false
+  tyGroupEndIndex(name, 1) == name.length - 1
 }
 
 // The value-atom kind of a NICHE-nullable scalar-element LIST member name —

@@ -12402,3 +12402,288 @@ is doubly occupied in this document — read the slice tag, not the number.)
     edit the copy, or wait. (The same class as note 88's `git checkout HEAD -- <file>`: an edit
     whose blast radius is a process you are not looking at.)
 
+## D-TCSCAN — the checker's type-name grammar had FOURTEEN hand-written copies; they now have ONE home (#1143)
+
+**Slice: `compiler/typecheck.vl` only, plus three new corpus fixtures.**
+
+### The count this slice was given, re-measured at its own base
+
+Counted at the branch's base with the string-literal-aware counter
+(`scratchpad/parsercount.py`: `//` stripped respecting quotes, the resolver's own definition header
+excluded, `NAME(` matched, per-file sums cross-checked against the tree-wide total). Base is
+`c4e1674` after two rebases; **the deltas were identical at all three bases** (`441102b`, `7cefaa0`,
+`c4e1674`) because nothing that merged in between touched `typecheck.vl`:
+
+| | before | after | delta |
+|---|---|---|---|
+| CORE (23-resolver SCORECARD list) | **451** | **451** | **0** |
+| OFF-LIST scanners (#1141's table) | **59** | **40** | **−19** |
+| TRUE TOTAL | **510** | **491** | **−19** |
+| …of which `typecheck.vl` | 68 = 20 core + **48 off** | 49 = 20 core + **29 off** | **−19, all off-list** |
+
+(At `441102b` the same measurement read CORE 475 → 475, TRUE TOTAL 534 → 515; #1144 took 24 off the
+core list from `emit_base`/`emit_collect` in between and none of them from this file.)
+
+Per scanner in `typecheck.vl`: `tyGtIsClose` **13 → 2**, `skipQuotedName` **10 → 2**. Tree-wide
+`tyGtIsClose` **24 → 13** (the 11 survivors are all outside this partition — see the hand-off).
+Source **−212 lines**; compiler binary **1,036,055 → 1,033,705 B (−2,350)**.
+
+**The core list did not move and was never going to.** This is the third slice in a row for which
+that is true, and #1141's method note 86 is the reason: the list is a named subset, not an
+inventory. Reporting it unchanged, next to the delta that did happen, is the point.
+
+### What the code IS (the enumeration that found the target)
+
+Enumerated by *what the code is* rather than *what the argument is* — #1139's technique — the file
+contains **one grammar written out fourteen times**: walk a rendered type name at top level,
+tracking `{}` / `[]` / `()` / `<>` depth and skipping quoted literal members, and act on a depth-0
+character. The fourteen copies:
+
+| # | site | question it asks |
+|---|---|---|
+| 1 | `nameHasSep` | is there a top-level `sep`? |
+| 2 | `topLevelArrowIndex` | where is the top-level `=>`? |
+| 3 | `splitTypeName` | split at every top-level `sep` |
+| 4 | `splitGenArgs` | split a generic argument list at its commas |
+| 5 | `nameToTy` paren-wrap | does the leading `(` close at the end? |
+| 6 | `nameToTy` object fields | split `{…}` at its top-level commas |
+| 7 | `nameToTy` field colon | first top-level `:` of `name:type` |
+| 8 | `canonShapeName` map key | where does `[K]` close? |
+| 9 | `canonShapeName` object fields | split at top-level commas |
+| 10 | `canonShapeName` field colon | first top-level `:` |
+| 11 | `splitUnionAtoms` | split at top-level `\|`, stop at a top-level `=>` |
+| 12 | `unionMemberCount` | count the same, materializing nothing |
+| 13 | `nameIsFuncTypeAtom` | is there a top-level `=>`? |
+| 14 | `parenEnclosesWhole` | does the leading bracket close at the end? |
+
+They are now two functions — `tyTopIndexOf(name, a, b, from)` (the separator/arrow finder) and
+`tyGroupEndIndex(name, from)` (the group-closer finder). Nothing else in the file counts a bracket.
+
+**The copies were not all the same grammar, which is the argument for the home.** `parenEnclosesWhole`
+and `nameIsFuncTypeAtom` never skipped quoted members; `splitUnionAtoms` and `unionMemberCount`
+skipped them with a naked `inStr` toggle that an escaped quote walks through, where `skipQuotedName`
+is escape-aware; `canonShapeName`'s map-key scan never learned `<…>` at all. Every one of those is
+the defect #1118 and #1120 shipped fixes for, still latent in a different copy.
+
+**`splitTypeName` resumes the scan at the character after each separator with the depth reset to 0,
+and that is exact, not approximate**: a top-level separator sits at depth 0 by the split's own
+condition, so restarting the count there reproduces it. That is what keeps a k-member split at ONE
+pass over the name instead of k passes — the property `splitUnionAtoms`' own header calls out as
+load-bearing (it is the file's hottest scanner, ~168 K invocations over the corpus, and the header
+records a 14-second compile from an earlier O(n²) regression).
+
+### Equivalence evidence — 1,585,621 twin comparisons, 0 disagreements
+
+A probe build ran the OLD copy and the NEW home side by side at all fourteen sites and counted per
+site (**the aggregate hides the slice**):
+
+| channel | programs | comparisons | disagreements | sites populated |
+|---|---|---|---|---|
+| corpus (`tests/cases`) | 1,142 of 1,319 | **514,766** | **0** | 14 of 14 |
+| fuzz (12 seeds × 300, depth 5, `--declared --branching`) | 7,106 of 7,200 | **1,070,855** | **0** | 13 of 14 (`splitGenArgs` has no fuzz witness) |
+
+The denominators are the programs that reach the dump: a file that fails to parse or check returns
+before emit and reports nothing.
+
+**The first version of this probe reported through `tErr`, and that BLOCKED the phase it reported
+from** — a diagnostic makes `T.diags` non-empty, so the driver returns before emit and the whole
+file's counters are lost. On the first sabotage run that silently discarded **338 of 1,142 files**.
+The shipped probe counts only, and records one witness string per site. This is #1141's method
+note 82 recurring in the same file, one slice later.
+
+### Comparator proved: three class-leaving sabotages, union covers all 14 sites
+
+| sabotage | disagreements (corpus) | sites fired |
+|---|---|---|
+| **SAB1** depth-blind (match a separator at any depth) | 89,145 | 1,2,3,5,6,9,11,12,13,14 |
+| **SAB2** angle-blind (`<>` not brackets — the #1118/#1120 defect) | 110 | 1,2,3,6,9,11,12 |
+| **SAB4** off-by-one (`return i + 1`) | 142,310 | 2,3,4,5,6,7,8,9,10,11,12,14 |
+| **SAB3** quote-blind (do not skip a quoted member) | **0** | **none** |
+
+`SAB1 ∪ SAB2 ∪ SAB4` = all fourteen. **A 0 on a single sabotage would have been blindness** — SAB1
+alone leaves S4/S7/S8/S10 inert, because their target (the leading `name:` colon, a map key's own
+`]`, a flat argument list) is already at depth 0.
+
+### Entombment — the sabotage applied to the SHIPPED home
+
+A behaviour-preserving refactor cannot have a pin that fails on master; it is entombed by
+equivalence plus a pin that fails under the sabotage. Each sabotage was applied to the shipped code
+and the corpus re-run against the candidate:
+
+* **SAB1: 246 / 1,319 corpus entries redden.**
+* **SAB4: 740 / 1,319 redden.**
+* **SAB2: 1 / 1,319** — the whole generic-bracket leg rested on a single corpus file,
+  `generics/type-arg-list-element.vl`, which goes from printing `u`/`w` to
+  `failed to compile: wasm[0]::function[4]`.
+* **SAB3: 0 / 1,319, and 0 on 7,200 fuzz programs.**
+
+**SAB2's population of one is why this slice adds three fixtures**, not because anything was broken:
+`generics/type-arg-union-param.vl`, `type-arg-union-return.vl`, `type-arg-union-nested-list.vl` —
+a generic application carrying a union argument in parameter, return and nested-element position.
+All three are byte-identical on master and on the candidate (they are refactor pins, not bug pins)
+and all three go to invalid wasm under SAB2. The leg now has four witnesses instead of one.
+
+**SAB3 is an INERT sabotage, and that is a finding, stated rather than papered over.** The
+quote-skip in these scanners has **no witness on either channel**, and I could not construct one:
+every program I built whose type name carries a bracket, comma, colon or arrow *inside* a quoted
+literal member (`type T = "(" | "b"`, `"a,b"`, `"{a:1}"`, `"a:b"`, `"<x>"`, `"x=>y"`, as const, list
+element, struct field and parameter) answers identically with the quote-skip removed. The one
+program whose behaviour SAB3 changes is `const v: "ab" | i32 = 3` — and that one is a **pre-existing
+invalid-wasm miscompile on master** (see the bug report below), so no green pin can exist. The
+quote-skip stays because deleting it would be a behaviour change with no evidence either way; it is
+recorded here as measured-dead, not as covered.
+
+### Gate
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh` | RC=0, 1,033,705 B |
+| `native-fixpoint.sh` | stage3 == stage4 byte-for-byte |
+| `lint-self.sh` | RC=0 (`vl fmt` applied to `typecheck.vl` and two fixtures first) |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **2,040 passed / 0 failed / 8 ignored** (master re-measured in the same session at the same head, same command: 2,037/0/8; **ignored-test NAME SETS identical**) |
+| corpus A/B | **1,319 entries, 0 differences** on byte + message + run + rc. Channels populated: 1,118 distinct wasm hashes, 198 build rejects, 209 nonzero run rcs. The 3 new fixtures verified separately: byte-identical wasm on both sides. |
+| fuzz A/B | **7,200 programs, 0 differences** on the same four channels. 5,578 distinct wasm hashes, 613 rejects. Cases were generated with the MASTER compiler, so the candidate is never in the generation loop. |
+| lint-tier A/B | 172 files, 55 lint rows, **identical**. (The lint assembly does not include `typecheck.vl`, but it is COMPILED BY the compiler under test — that is the channel.) |
+| `rep-fuzz-check.sh` | exact, 1 baselined failure, 0 new / 0 stale |
+
+### Work — COUNTED, not timed, because the timing harness cannot resolve it
+
+Over the same 1,145 corpus files, with a counter in every scanner copy (master) and in the two homes
+(candidate):
+
+| | master | candidate | delta |
+|---|---|---|---|
+| scanner / home **calls** | 515,147 | 700,187 | **+185,040 (+35.9%)** |
+| **characters examined** | 6,096,695 | 6,029,936 | **−66,759 (−1.1%)** |
+
+The added calls are exactly one home call per split SEGMENT where there used to be one scanner call
+per split; the character work went DOWN, because the old `splitTypeName` / `splitGenArgs` ran a
+sentinel iteration past the end of every name and `nameIsFuncTypeAtom` now skips a quoted run whole
+instead of walking it. Binary −2,350 B.
+
+**The timing measurement is reported only to say it proves nothing.** Self-compile min-of-9:
+MASTER 1,682 ms, CAND 1,811 ms — but a **byte-identical copy of MASTER** measured 1,817 ms on the
+same harness in the same run. The noise floor (135 ms) is larger than the difference, so the harness
+cannot resolve it and no timing claim is made in either direction.
+
+### Refutations
+
+1. **"The 48 off-list sites in `typecheck.vl` are 48 separate targets."** They are not: 19 of them
+   are the internals of one grammar and fall to one home. The remaining 29 are a different
+   population — `canonEmitName`'s twelve (a string→string rewriter), `nameToTy`'s own arm
+   selection, and the four one-call predicates — and none of them is deletable without either the
+   emitter's `annotResolve` fall-through (ruled out of this partition) or a single agreed emit
+   renderer (#1129's census item 3).
+2. **"A quote-blind scanner is obviously wrong, so a fixture must exist."** Refuted by construction
+   over eight shapes plus both channels: measured dead.
+3. **"Timing shows a 1.8% regression."** Refuted by the control: the harness's own noise floor on
+   byte-identical inputs is 8%.
+4. **My own first probe's numbers were wrong and are withdrawn.** The `tErr`-reporting version read
+   SAB1 = 2,554 disagreements over 804 files; the non-blocking version reads **89,145 over 1,142**.
+   The first figure was 3% of the truth because the probe's own diagnostics aborted emit.
+5. **`splitGenArgs` has no fuzz witness at all** (reach 0 over 7,200 programs) — the generator emits
+   no generic application. Its 257 corpus reaches are the whole evidence for that site, and SAB4 is
+   the only sabotage that fires there. Said plainly rather than folded into the 1.58 M total.
+
+### Two live defects found on `441102b` while hunting for the SAB3 fixture — NEITHER is mine to fix
+
+**(A) A narrowed literal-union value builds an invalid module, or its guard const-folds FALSE.**
+Six cells, all verified on a master-built compiler:
+
+```vl
+type P = "x" | "y"
+const z: P | null = "x"
+if z != null { print(z) }        // -> failed to compile: wasm[0]::function[4]
+```
+```vl
+type P = "x" | "y"
+const z: P = "x"
+if z is P { print(z) }           // -> failed to compile: wasm[0]::function[4]
+```
+```vl
+type P = "x" | "y"
+function f(z: P | null) { if z is P { print(z) } }
+f("x")                            // -> NO OUTPUT: the guard is false
+```
+The inline spelling (`const z: "x" | "y" | null = "x"; if z is "x" { print(z) }`) is invalid wasm
+too. The controls all pass: the same litunion printed, compared with `==`, passed as a parameter and
+declared nullable-but-unnarrowed all run correctly. So the trigger is **narrowing**, not the
+literal union.
+
+**(B) A union of a string literal and a scalar is invalid wasm.**
+```vl
+const v: "ab" | i32 = 3
+print(v)                          // -> failed to compile: wasm[0]::function[4]
+```
+No `|` inside the literal is needed. `canonEmitName`'s own comment says this shape is meant to work
+(“a mixed-base union keeps each softened member — `"a" | 1` stays the boxed `string|i32`”).
+
+Both are emitter-side and outside this partition. **Keep your own reproductions and re-run them
+against whatever claims to fix them** — that rule is why these are recorded here rather than lost.
+
+### HAND-OFF — the same grammar is written out ELEVEN more times, in three other files
+
+The home is deliberately private today; making it available is a one-word diff (`export`), and the
+import wiring already exists — `emit_base`, `emit_collect` and `emit_classify` all import
+`tyGtIsClose` from `typecheck` already. Exact sites, at `c4e1674` (**re-grepped after #1144 landed — it took seven other grammars and none of these**):
+
+| file:line | enclosing function | question |
+|---|---|---|
+| `emit_base.vl:710` | `nullablePartOf` | top-level `\|` |
+| `emit_base.vl:1504` | `gaeSplitArgs` | top-level `,` |
+| `emit_base.vl:1863` | `annArrowAt` | top-level `=>` |
+| `emit_base.vl:1982` | `shapeInnerFieldSplit` | top-level `,` |
+| `emit_base.vl:2060` | `nameIsStructWithUnionField` | field `:` then `\|` |
+| `emit_base.vl:2159` | `annSplitParams` | top-level `,` |
+| `emit_base.vl:2196` | `annSplitPipe` | top-level `\|` |
+| `emit_collect.vl:3737` | `nameIsSingleShape` | group close |
+| `emit_classify.vl:7579` | `shapeFieldParse` | top-level `,` + `:` |
+| `emit_classify.vl:10416` | `splitUnionArmsAllDepth` | top-level `\|` |
+| `emit_classify.vl:10687` | `shapeInnerFieldSplit` | top-level `,` |
+
+**Take the free one first: `shapeInnerFieldSplit` is BYTE-IDENTICAL in `emit_base.vl` (1962) and
+`emit_classify.vl` (10667) — the two bodies differ by the `export` keyword and nothing else** (I
+diffed the whole bodies, and re-diffed them at `c4e1674` after #1144 merged). `emit_classify` already imports from `emit_base` (line 171). Deleting the
+`emit_classify` copy is a pure dedup of one whole grammar with no measurement needed beyond the
+usual gate. It is *not* the `shapeHasCloField` situation #1134 refuted with a witness — those two
+homonyms had different behaviour; these two have the same bytes.
+
+**Two more that I read rather than assumed:**
+
+* **`splitUnionArmsAllDepth` (emit_classify:10392) is `splitUnionAtoms` under a misleading name** —
+  it splits at **depth 0**, not at all depths; the `<>` arm, the `tyGtIsClose` exemption and the
+  top-level-arrow stop are all present and its body differs from `splitUnionAtoms` only in stopping
+  with `break` instead of `i = name.length`. It maps onto `tyTopIndexOf(nm, '|', '=', start)`
+  exactly. **The name is a trap for anyone auditing by grep — rename it or it will keep being filed
+  as "deliberately different".**
+* **`nameIsStructWithUnionField`'s inner loop (emit_base:1955) is `nameHasSep(ftype, '|')`**, one
+  quote-skip short: it is one of the copies that never learned to skip a quoted literal member.
+
+The others were not read closely enough to promise; `shapeFieldParse` and `nameIsSingleShape` carry
+a second condition inside the same loop and want their own measurement. **Do not unify on shape
+alone — SAB1 exists to punish exactly that assumption**, and it fires at ten of my fourteen sites.
+
+### New method notes (87–90)
+
+87. **Enumerate by what the CODE is, and then COUNT THE COPIES OF ONE GRAMMAR — the copies will not
+    agree.** #1139 established the technique; this slice adds the corollary that matters. Fourteen
+    copies of one scanner in one file were not fourteen copies of the same scanner: three different
+    quote policies (skip-with-escapes / naked `inStr` toggle / no skip at all) and one that had
+    never learned `<…>`. The divergence is invisible to any per-argument audit and is exactly the
+    bug shape two earlier slices shipped fixes for. **The copies are the finding, not the count.**
+88. **A resume-with-reset split is exact, and it is the difference between one pass and k passes.**
+    Expressing a k-member split as k calls to a "find the next top-level separator from `i`"
+    primitive looks like an O(n·k) regression and is not: a top-level separator sits at depth 0 by
+    the split's own condition, so restarting the depth count immediately after it reproduces the
+    running count, and the k scans partition the string. Measured: character work went DOWN 1.1%
+    while call count went up 36%.
+89. **Report a timing measurement WITH a byte-identical control, or do not report it.** MASTER
+    1,682 ms vs CAND 1,811 ms reads like a 7.7% regression; a byte-identical copy of MASTER
+    measured 1,817 ms in the same run. The control is one extra `cp` and it is the difference
+    between a claim and an artifact. **Counted work is the reportable unit; timing is only ever
+    evidence that timing cannot decide.**
+90. **A sabotage that fires at N sites is not a comparator proof for N+1.** SAB1 (depth-blind) fired
+    at 10 of 14 twins and left 4 inert — not because those twins were dead (they had 257–2,306
+    reaches each) but because their target is *always already* at depth 0, so a depth-blind scanner
+    cannot move it. It took a second, orthogonal sabotage (off-by-one) to reach them. **Check the
+    fire set against the SITE LIST, not against the total.**
