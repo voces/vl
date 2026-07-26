@@ -5354,3 +5354,408 @@ difference. Fixed (capture, then normalise) and re-run: 0/0/0.
     rc=$?` records sed's 0 for every failing build, so a corpus A/B compared two absent
     artefacts and reported 190 byte-diffs. The always-fires and the cannot-fire comparator
     (note 12) are the same bug; sanity-check in BOTH directions before reading a number.
+
+## D-PARSETY P2 — the STRING-ONLY type spellings, and a rep frontier that is not a rep gap (#1121)
+
+Two things. The first is D-PARSETY's phase 2, which #1117 named and #1118 left open: the
+three type spellings the parser builds and then DROPS because they land on a node as a
+`string`, not as a `TypeRef`. Recording them and letting the module merge rewrite the TREE
+fixes the SAME user-visible bug P1 fixed, in two more positions. The second is TARGET 2 — a
+minimal reproduction and mechanism for the composition failure #1118 reported, which turns
+out to be neither a rep-composition gap nor new.
+
+### P2 — what is recorded, and the bug it fixes
+
+#1118's P1 taught `modRwType` to rename the parser's spelling TREE instead of scanning the
+rendered name for identifier runs, because `modTypeRenamed` **cannot tell a type reference
+from a FIELD name**. It fixed that for a `TypeRef`. The same scanner still ran on three other
+strings, and two of them can carry a field name:
+
+| position | node field | reachable spelling with a FIELD name |
+|---|---|---|
+| `x is T` | `IsExpr.isVariant` | `x is { v: i32 }` |
+| `type N = A \| B` | `UnionDecl.udVariants[]` | `type AB = Q \| { v: i32 }` |
+| `x as T` | `AsExpr.asTy` | — the merge **never renames it** (`modRwExpr`'s `AsExpr` arm rewrites only the operand), so there is no consumer and nothing is recorded |
+
+Reproduced on master (`2c5e9cd`), one module declaring a type whose name collides with a
+field name in the same module:
+
+```vl
+// lib.vl
+export type v = i32
+export type Q = { q: string }
+export type AB = Q | { v: i32 }
+export function mk(): AB { const a: AB = { v: 7 }  a }
+```
+→ `cannot assign {v: i32} to 'a' of type {q: string} | {v: i32}` — two types that RENDER
+identically, because the diagnostic demangler strips the `$m1` the FIELD name grew. The `is`
+position gives the second face: `` `is` check type '{w:string}' is not a variant of
+{v: i32} | {w: string} ``.
+
+Shipped:
+
+- **`parser.vl`** — `parseIsType` / `parseVariantName` / `parseVariantAtom` stop dropping
+  their root. It travels in a one-slot channel (`lastTyTsRoot`, the `pendingGt` shape),
+  because these producers return a NAME and their caller mints the owning node afterwards;
+  the caller banks it immediately, so `annTsNode` stays strictly increasing. `is null` builds
+  its `TS_NULL` leaf directly (the one-token type never enters `parseTypeName`).
+- **`ast.vl`** — `tsLeaf` / `tsMkKids`, the off-stack constructors (`tsMk`'s contract is "the
+  children are the stack region above a mark", which only a producer mid-recursion can
+  satisfy), and `udTsNode` / `udTsRoot`, the MULTI-root twin of `annTs`: a `UnionDecl` holds
+  its members as a `string[]`, so one row per MEMBER in member order, non-decreasing key,
+  binary search to the leftmost row then index by `k`.
+- **`driver.vl`** — the `IsExpr` and `UnionDecl` arms read the tree, `modRwTsName` it, and
+  render. `modTypeRenamed` stays as the fall-through.
+
+**The one member the parser does not get from a type producer.** `type N = { … } | { … }`
+takes the LBRACE path, whose FIRST member is the synthetic `"{" + synth + "}"` text assembled
+from the field list. Its spelling is assembled the same way — a `TS_FIELD` per field over the
+type root the field already recorded, under one `TS_OBJ` (plus a `TS_ISECT` when the `&`
+chain fires) — and `tsToName` renders it back to exactly the same characters, because
+`TS_FIELD` is `name + ":" + type` and `TS_OBJ` is `"{" + comma-joined + "}"`, which is what
+`synth` is built by. Nothing is built unless the `&`/`|` continuation fires, so a plain
+`type X = { … }` struct declaration adds no spelling node.
+
+### The pins, and each leg reddened separately (method note 21)
+
+This is a behaviour CHANGE, so every pin FAILS on master (`2c5e9cd`) and passes here.
+
+| pin | the leg it needs | master |
+|---|---|---|
+| `modules/union-variant-field-shadows-type/` | `udTsRootAt` (the `parseVariantName` member) | `cannot assign {v: i32} to 'a' of type {q: string} \| {v: i32}` |
+| `modules/union-first-operand-field-shadows-type/` | the SYNTHESIZED `TS_OBJ` first member | `cannot assign {v: i32} to 'a' of type {v: i32} \| {w: string}` |
+| `modules/is-type-field-shadows-type/` | `annTsOf` on the `IsExpr` **and** the member leg | `cannot assign {w: string} to 'a' of type {v: i32} \| {w: string}` |
+
+Sabotages, each one leg disabled, everything else shipped — the separation is exact:
+
+| sabotage | union-variant | union-first-operand | is-type | field-name (P1) |
+|---|---|---|---|---|
+| S1 `annTsOf(ix)` → -1 in the `IsExpr` arm | pass | pass | **FAIL** | pass |
+| S2 `udTsRootAt(ix, i)` → -1 | **FAIL** | **FAIL** | **FAIL** | pass |
+| S3 the synthesized `TS_OBJ` root → -1 | pass | **FAIL** | pass | pass |
+
+(S2 reddens the `is` pin too, and that is the shape of the dependency: with the members
+mangled the union never types at all. S1 reddens ONLY the `is` pin — with the members clean
+and the check type still scanned as characters, the emitter rejects `{w$m1: string}` as "not
+a variant".)
+
+### The fall-throughs are measured DEAD, and the comparator is measured POWERFUL
+
+- **Fall-throughs.** A build that prefixes `@@POISON@@` onto BOTH string fall-throughs
+  (`vs.push(modTypeRenamed(…))` and `n.isVariant = modTypeRenamed(…)`) is corpus byte-,
+  message- AND run-identical to the shipped build over **1,290 files**: **0 diffs of any
+  kind**. Every `IsExpr` and every `UnionDecl` member at merge time has a recorded spelling.
+  Not a totality proof — a measurement, though it is total by construction too: all four
+  `mkIsExpr` / `mkIsExprNeg` / `mkUnionDecl` call sites are the parser's, and each now
+  records.
+- **Comparator power, at volume, against known-WRONG builds.** The fuzz generator emits
+  single files and this slice only changes the module MERGE, so the fuzz channel is BLIND to
+  it by construction — its 0 is a regression check, not evidence (a 0 does not transfer
+  between channels). The channel that CAN see it is the corpus:
+
+| build | corpus files that diverge |
+|---|---|
+| `modRwTsName` renames NOTHING (wire sabotage) | **32** — including the compiler's own 16-module build (`compiler/*.vl` entries) |
+| `modRwTsName` renames `TS_FIELD` too (the string scanner's defect, moved INTO the tree) | **4** — exactly the four field-shadow pins, and nothing else |
+
+The second row is the sharper one: it says the field-name discrimination — the whole point of
+P1 and P2 — changes exactly four programs in this corpus and no others, so the pins are the
+complete reach and the 0-diff on the other 1,285 is not luck.
+
+### Allocation, measured (method note 24)
+
+| | master | now | Δ |
+|---|---|---|---|
+| corpus (1,288 files, `faf7de6` base) spelling NODES | 119,608 | 119,674 | **+66** |
+| corpus child slots | 26,506 | 26,546 | +40 |
+| corpus `annTs` rows | 58,438 | 91,295 | +32,857 |
+| corpus `udTs` rows | 0 | 1,819 | +1,819 |
+| the compiler's own 16-module build: spelling nodes | 10,066 | **10,066** | **0** |
+| … `annTs` rows | 5,447 | 8,521 | +3,074 |
+| … `udTs` rows | 0 | 90 | +90 |
+
+**+66 spelling nodes over the entire corpus** — the `is null` leaves plus the `{…} & … | …`
+re-encode's `TS_FIELD`/`TS_OBJ`, which no file in the compiler's own source uses. The row
+growth is one `annTs` row per `is` expression and one `udTs` row per union MEMBER: exactly
+what the information costs, the shape #1117 measured and kept.
+
+Binary: 1,026,243 (`2c5e9cd`) → **1,029,996** bytes (+3,753). (The allocation sweep above
+was taken on the `faf7de6` base, both sides over the same 1,288-file list; #1120 touches
+neither `parser.vl` nor `ast.vl`, so the arena figures carry unchanged.)
+
+### The call arithmetic
+
+**0 parses added · 0 parses deleted · 2 consumers laddered · NET 0.** Local-aware scan by
+resolver called. **Counting method, stated:** line comments are stripped before matching
+(`//` outside a string literal); a match is `NAME(` with the preceding char not
+`[A-Za-z0-9_.]`; the parser's own `function NAME(` definition header is excluded; the parser
+list is the SCORECARD CORRECTION's plus #1117's four additions (`refArrElemKind` /
+`nameIsI32ListArray` / `nameIsMapArray` / `nullClosureArrElem`). **This is a call count, not
+a grep count.**
+
+| file | master (2c5e9cd) | now |
+|---|---|---|
+| `compiler/parser.vl` | 0 | 0 |
+| `compiler/ast.vl` | 0 | 0 |
+| `compiler/driver.vl` | 0 | 0 |
+| `compiler/emit_collect.vl` | 98 | 98 (untouched) |
+| `compiler/emit_base.vl` | 66 | 66 (untouched) |
+| **total** | **164** | **164** |
+
+The scanner this slice actually moves is `modTypeRenamed`, which the SCORECARD has never
+counted (#1117 flagged it as "a type-string parser the scorecard does not count"). Its call
+sites: **5 on master, 5 now** — `modRwType` (laddered by #1118), the two this slice ladders
+(`udVariants`, `isVariant`), and `tdName` / `udName`, which are DECLARATION names built from
+an identifier token, not from `parseTypeName`, and are correctly renamed whole. Cumulative
+across P1+P2: **3 of the 5 are now arena-first with a measured-dead fall-through.**
+
+### Why the emit-side consumers did NOT move — the blocker, measured
+
+The question TARGET 1 asks of every parse site is "does the node whose name this is still
+have its parser tree, and is the tree the answer?". For the annotation-node consumers in this
+partition — `collectA`'s 25 sites over `nd.tyName` (`emit_collect.vl:2863-2985`),
+`collectGenAliasShapes`, and `emit_base`'s `tyIsNulBool` / `retNulStringFlag` /
+`nameIsClosureArrayTy` over `tyNameOf(tyIx)` — the answer today is **no**, and it is a
+measurement, not a reading.
+
+A probe build that fails the emit the moment a `TypeRef` at `collectA` has no recorded
+spelling, or one whose `tsToName` differs from `tyName`, over the 1,288-file corpus
+(`faf7de6` base):
+
+| | files |
+|---|---|
+| tree present AND identical to `tyName` | **1,042** |
+| **NOSPELL** — a `TypeRef` with no recorded spelling | **203** |
+| **STALE** — a recorded spelling that renders a DIFFERENT name | **43** |
+
+**19.1% of corpus files carry a `TypeRef` the tree cannot answer for at emit time.** The two
+classes are exactly the two the phased plan predicted, now with witnesses:
+
+- **NOSPELL** — emitter-SYNTHESIZED annotations (`synthTypeRef`, `synthRetAnnots`,
+  monomorphization clones): `string[]`, `K0|null`, `({[string]:boolean}|null)[]`,
+  `{a:f64,f:K0,z:string}[]`. These names were computed by the emitter and never passed
+  through the parser.
+- **STALE** — the CANON pass (P4). `canonEmitTypeNames` widens a literal union to its base
+  and resolves aliases, in place, between producer and consumer (note 22): `"a"|"b"` →
+  `string`, `0|1|2` → `i32`, `1.5|2.5` → `f64`, `Id` → `i32`, `AB|null` →
+  `{t:i32,a:i32}|{t:i32,b:i32}|null`, `K0|{w:i32}` → `string|{w:i32}`, `(0|1|2)&!2` → `i32`.
+
+So P3/P4 are not "next"; **P4 is the gate on every emit-side consumer**, and it is a lockstep
+rewrite (the canon pass's OUTPUT is the string the whole emitter reads). Filed with the
+number and the mechanism rather than as a verdict.
+
+### TARGET 2 — the "rep-composition gap" is neither rep-composition nor new
+
+#1118 reported: "the three pin shapes `{v: Pair<i32,string>}` + `Pair<i32|null,string>[]` +
+`Box<i32|null>|null` in ONE program emit-fail with `field access receiver is not a struct`,
+while their non-generic analogue compiles and runs. Any TWO of the three compose fine. That
+is a rep-composition gap." **Three claims; all three are refuted by measurement.**
+
+**1. "Any two compose fine" is false.** The subset matrix, one program per non-empty subset:
+
+| A `{v: Pair<i32,string>}` | B `Pair<i32\|null,string>[]` | C `Box<i32\|null>\|null` | result |
+|---|---|---|---|
+| ✓ | | | runs |
+| | ✓ | | runs |
+| | | ✓ | runs |
+| ✓ | ✓ | | runs |
+| | ✓ | ✓ | runs |
+| ✓ | | ✓ | **`field access receiver is not a struct`** |
+| ✓ | ✓ | ✓ | **`field access receiver is not a struct`** |
+
+**2. It needs no union, no nullable, no array, no `is`, and no composition of three shapes.**
+Minimal reproduction — four lines, one generic, no union anywhere:
+
+```vl
+type Box<T> = { a: T, b: string }
+const o: { v: Box<i32> } = { v: { a: 1, b: "z" } }
+print(o.v.b)
+const q: { v: i32 } = { v: 4 }
+print(q.v)
+```
+→ `emitProgram: nested struct fields are not supported`. Shipped as
+`tests/cases/generics/type-arg-inline-object-field-collision.vl`, marked `@emit-error`
+because that IS the honest current state.
+
+**3. It is not new.** The same program fails identically on **`5eb115d`** — #1117's base,
+*before* #1118 — so the `<>` repair did not create it. (#1118's own comma-carrying spelling
+`{v: Pair<i32,string>}` was rejected by the CHECKER on `5eb115d`, which is why it looked new:
+the fix moved the failure downstream onto a gap that was always there. Method note 34's
+control discipline, applied one commit further back.)
+
+**The mechanism, in three parts, each established by a differential run rather than by
+reading.** A probe build dumping the registered struct rows at the end of the pass table:
+
+| program | rows registered |
+|---|---|
+| `{v: Box<i32>}` alone | `#anon0`(a,b) · `#anon1`(v) — both minted from the LITERALS |
+| `{v: Box<i32>}` + `{k: i32}` | `{k:i32}` · `#anon1`(a,b) · `#anon2`(v) — runs |
+| `{v: Box<i32>}` + `{v: i32}` | `{v:i32}` · `#anon1`(a,b) — **the outer `{v: …}` row is MISSING** |
+| `{v: Box}` (non-generic) + `{v: i32}` | `Box` · `{v:Box}` · `{v:i32}` — runs |
+
+1. **`nameFieldCode` (`emit_classify.vl:10423`) has no struct-TABLE rung.** Its tail is
+   `nameIsStructDecl(base) → 15`, which scans `TypeDecl` nodes for `tdName == base`. A
+   generic alias's `tdName` is `Box<T>`; the APPLICATION `Box<i32>` never matches, so the
+   field codes -1 and `internInlineShape` sets `ok = false` and **declines the whole outer
+   shape** — the annotation mints no struct row. Its sibling `fieldTypeCode` (line 9396) has
+   the missing rung: `!nameIsArray(base) && structIndexOfTypeName(base) >= 0 → 15`. **Probe
+   build on `2c5e9cd`, rung added:** a program where the application IS registered
+   (`const w: Box<i32>` beside `{ v: Box<i32> }` beside `{ v: i32 }`) COMPILES AND RUNS —
+   for the `Pair<i32,string>` comma spelling too.
+2. **The application is never registered when it appears ONLY in an interior position.**
+   `collectGenAliasShapes` (`emit_collect.vl:3336`) peels `|null` and a trailing `[]` off
+   each `TypeRef.tyName` and hands what is left to `gaeEnsure`, so a generic application
+   inside an inline-object FIELD is invisible to it — no instance row, and part 1's rung has
+   nothing to find. This is why the shipped pin still fails with the rung added while the
+   `const w: Box<i32>` variant does not: **parts 1 and 2 are both necessary, and together
+   they are sufficient** (measured, both spellings, on `2c5e9cd`).
+
+   A third contributor was live one commit ago and is now closed: `internInlineShape`'s
+   top-level-comma split tracked `{`/`[`/`(` depth and NOT `<`/`>`, so
+   `{v:Pair<i32,string>}` split into `v:Pair<i32` and `string>` and declined a SECOND,
+   independent way. On `faf7de6` the rung-only probe fixed the `Box<i32>` spelling and NOT
+   the `Pair<i32,string>` one; on `2c5e9cd` (#1120's `<>` repair) it fixes both. The
+   comma-free minimal repro was chosen precisely because it never depended on that half.
+3. **The lenient field-NAME-SET scan converts "no row" into "the WRONG row".** With no row
+   from the annotation, the outer row is minted lazily from the object LITERAL by
+   `structIndexOfObjCtx`, whose scan matches on field NAMES (with f64/i64/nested-struct
+   tiebreaks only). It finds the coexisting `{v: i32}` row, so no `#anon` row is minted and
+   the literal is built against a field coded i32 — hence `nested struct fields are not
+   supported` on the literal, and `field access receiver is not a struct` on `o.v.b`.
+
+That is why "any two of the three compose fine" LOOKED true: the failure needs a SECOND
+struct with the same field-name set, and in #1118's three-shape program `Box<i32|null>`
+(fields `{v}`) was that second struct. It is a **name-resolution** gap on a generic
+application, not a rep-composition one.
+
+**No fix is attempted here**, per the slice's brief. The repair is the two hand-offs below,
+which have to land together: half of it (`nameFieldCode`'s rung) is in a file a concurrent
+agent owns, and the other half (`collectGenAliasShapes`'s descent) is in this partition but
+registers rows that `nameFieldCode` still cannot code on its own.
+
+### Gate
+
+Corpus **byte-, message- AND run-diff**, **1,290 files** (`tests/cases` + `compiler/` +
+`std/` + `scripts/*.vl`; compiler stdout/stderr with the out-path normalised, exit codes
+compared): **3 byte-diffs, 3 message-diff files, 3 run-diffs — all 3 are the new module
+pins**, which master rejects and this build compiles and runs. **0 diffs on all 1,287
+pre-existing files** (the frontier `@emit-error` pin is identical on both sides).
+
+The shared-INSTANCE channel (note 32) agrees and classifies the message delta: `vl check
+tests/cases` goes from `Found 207 errors, 117 warnings` to `Found 204 errors, 117 warnings`,
+and the 3 removed lines are exactly the pins' `cannot assign` rejections — every message
+change is a fix, none is a regression. `vl check compiler` and `vl check std` are
+byte-identical (0 diff lines).
+
+Fuzz A/B **50,400 programs/side** (14 seeds × depths 4/5/6 × {plain, `--branching --multiobs
+--declared`} × 300, generated ONCE by the master compiler so both sides see identical
+programs), whole `--out-dir` TREES via `diff -r`, **52,708** output files/side with the
+harness's mktemp path normalised: **0 differing paths**. Stated with its caveat above: the
+generator emits single files, so this channel is a regression check on the parser-side
+additions, not evidence for the merge legs.
+
+`refresh-compiler.sh` RC=0 (1,029,996 bytes) · `rep-fuzz-check.sh` RC=0 (exact; 1 baselined
+failure — 0 unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=0 (stage3 == stage4,
+1,029,996 bytes) · `lint-self.sh` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test` RC=0
+(**1,976 passed, 0 failed, 8 ignored** — 1,971 + 3 module pins + 2 tiers of the frontier pin).
+
+### What did NOT move, and the hand-offs
+
+- **`x as T`'s spelling stays dropped.** The merge's `AsExpr` arm rewrites only the operand
+  (the cast target is a numeric primitive by the checker's own rule), so there is no consumer
+  and recording it would be dead weight (note 19).
+- **`tdName` / `udName` keep `modTypeRenamed`.** They are declaration names built from an
+  identifier token, not from `parseTypeName`; there is no tree for them and renaming them
+  whole is correct.
+- **Every emit-side annotation consumer** — blocked on P4, with the 203 / 43 measurement
+  above. The order is now forced: P4 (the canon pass rewrites the tree in lockstep with the
+  string) before P3, and `nodeTyIx` coverage before the NOSPELL class closes.
+- **Hand-off 1 — `nameFieldCode`, `emit_classify.vl:10423`** (a concurrent agent's file), the
+  exact diff — the rung its sibling `fieldTypeCode` (line 9396) already has:
+  ```
+  if nameIsStructDecl(base) { return 15 }
+  if !nameIsArray(base) && structIndexOfTypeName(base) >= 0 { return 15 }   // ← add
+  -1
+  ```
+  Verified in a probe build on `2c5e9cd`: with it, a generic application in an inline-object
+  field lowers as a nested-struct field **as long as the instance row exists** — both the
+  `Box<i32>` and the `Pair<i32,string>` spellings.
+- **Hand-off 2 — `collectGenAliasShapes` (`emit_collect.vl:3336`) should descend, not peel.**
+  It currently strips `|null` and a trailing `[]` off the rendered name and interns what is
+  left; the structural form is a walk of the spelling tree interning every `TS_APP` whose
+  head is a generic-alias base, which reaches an inline-object FIELD, a map VALUE and a union
+  ARM for free. This is the half that makes hand-off 1's rung find something.
+
+  **They must land together**, and the pin
+  (`tests/cases/generics/type-arg-inline-object-field-collision.vl`) is the gate: neither
+  half alone flips it, and its `@emit-error` directive turns into `@run` when both do.
+
+### A third report, REFUTED: "generics do not parse inside union variants"
+
+Handed to this slice as a verified bug in `parser.vl`: `union U { A: Box<i32> }` →
+``expected an expression but found RBRACE``, `union U { A: Pair<i32,string> }` and
+`union U { A: { v: Pair<i32,string> } }` → ``expected `}` but found `>` ``, with "the same
+applications parse fine in an alias or a `const` annotation, so the union-variant payload
+grammar does not admit a generic application". (#1120's hand-off 4 carries it too.)
+
+**There is no `union` declaration form in VL.** A discriminated union is `type U = A | B`;
+`union` is not a keyword and `parser.vl` has no such production. `union U { … }` lexes as
+three ordinary top-level expressions — the identifier `union`, the identifier `U`, and an
+OBJECT LITERAL — and inside an object literal `Box<i32>` is in EXPRESSION position, where
+`<` and `>` are the relational operators. That is the documented, correct behaviour
+(`parseTypeAtom`'s own comment: the `<` is unambiguous *in type position*).
+
+The control that settles it carries no generic at all:
+
+```vl
+union U { A: i32, B: i32 }
+```
+→ **parses cleanly**, then `undeclared identifier 'union'` / `'U'` / `'i32'` ×2. The generic
+spellings differ only in *where* the expression parse gives up (`>` and `,` instead of the
+identifiers), and the newline-separated variants add "expected `}`" because an object
+literal wants commas. Nothing about generics, nothing about a payload grammar, nothing to
+widen — and therefore nothing that a restriction was protecting.
+
+**What the report was reaching for does exist, and it is not a parse bug.** A generic
+application as a real union member type-checks and then miscompiles:
+
+```vl
+type Box<T> = { v: T }
+type Tag = { t: i32 }
+type U = Box<i32> | Tag
+const u: U = { v: 3 }
+print(2)
+```
+→ `failed to parse WebAssembly module: type mismatch: expected (ref $type), found (ref
+$type)`. Same for `Pair<i32, string> | Tag`. The non-generic control
+(`type P = {a: i32, b: string}` + `type U = P | Tag`) runs. That is INVALID WASM out of a
+program the checker accepts — the generic-alias soundness bug the concurrent agent is
+already diagnosing in `typecheck.vl`, reported here with its non-generic control rather than
+duplicated.
+
+### Method notes earned
+
+43. **A "composition" failure is a claim about the CONJUNCTS, and the subset matrix is
+    cheap** (#1121) — #1118 reported three shapes that fail together and "any two compose
+    fine". Seven programs (one per non-empty subset) refuted it in one run: the pair A+C
+    fails, and the minimal repro needs neither of the two shapes the diagnosis leaned on.
+    When a bug is reported as "these N things together", enumerate the subsets before
+    believing the N.
+44. **A frontier inherited from the previous slice needs a control one commit FURTHER
+    back** (#1121) — note 34 says a pre-existing gap and a new one are separated by the
+    non-generic control. That control said "new" here, because #1118's spelling was rejected
+    by the checker on the older build. Running the MINIMISED repro (which the checker always
+    accepted) on `5eb115d` said "pre-existing". Minimise first, then date it.
+45. **A syntax that does not EXIST parses as something else, and the error points at the
+    something else** (#1121) — "generics do not parse inside union variants at any arity"
+    was three parse errors from a construct VL has no production for: `union U { … }` is an
+    identifier, an identifier and an object literal, and the errors are what
+    `Box<i32>` does in EXPRESSION position. The one-line control (`union U { A: i32, B: i32 }`
+    — same construct, no generic) parses and reaches the CHECKER. Before widening a grammar,
+    check that the grammar has the rule you think you are widening.
+46. **The spelling tree's usable LIFETIME is a measurable property, and it ends at the canon
+    pass** (D-PARSETY P2) — "the node still has its parser tree" is true at merge time (0
+    fall-throughs over 1,288 files) and false at emit time (203 files with no spelling, 43
+    with a stale one, 19.1% together). The same sidecar is authoritative in one pass and
+    wrong two passes later; a migration's admissibility is a question about WHERE in the
+    pipeline the consumer sits, not about the sidecar.

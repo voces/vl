@@ -62,8 +62,11 @@ import {
   TS_PAREN,
   TS_UNION,
   setAnnTs,
+  setUdTs,
+  tsLeaf,
   tsMark,
   tsMk,
+  tsMkKids,
   tsPop,
   tsWrap,
 } from "./ast"
@@ -1009,31 +1012,50 @@ function parseUnary() {
   // (a `Unary "!"` contributes the inverted branch's narrowings).
   if pk == "IS" {
     advance() // "is"
-    return mkIsExpr(node, parseIsType(), p0)
+    // The check type's SPELLING is recorded on the `IsExpr` node (D-PARSETY P2):
+    // the root must be taken from `lastTyTsRoot` BEFORE the node is minted, and
+    // banked immediately after, so `annTsNode` stays strictly increasing.
+    const isNm = parseIsType()
+    const isRoot = lastTyTsRoot
+    const isIx = mkIsExpr(node, isNm, p0)
+    setAnnTs(isIx, isRoot)
+    return isIx
   }
   if pk == "BANG" && kindAt(P.pos + 1) == "IS" {
     advance() // "!"
     advance() // "is"
-    return mkUnary("!", mkIsExprNeg(node, parseIsType(), p0), p0)
+    const ngNm = parseIsType()
+    const ngRoot = lastTyTsRoot
+    const ngIx = mkIsExprNeg(node, ngNm, p0)
+    setAnnTs(ngIx, ngRoot)
+    return mkUnary("!", ngIx, p0)
   }
   node
 }
 
+// The spelling root of the type the last STRING-returning type producer built.
+// `parseIsType` / `parseVariantName` / `parseVariantAtom` return a name, not a
+// node, and their callers mint the owning node afterwards — so the root travels
+// in this one-slot channel (the `pendingGt` shape) and the caller banks it on
+// the node it just made. Read IMMEDIATELY after the call; any further type
+// parsing overwrites it.
+let lastTyTsRoot = -1
+
 // The TYPE on the right of `is` / `!is`, as the synthetic NAME string the
 // checker resolves with `nameToTy`. `null` is its own one-token type; anything
 // else is a full annotation (`parseTypeName`: names, inline objects, unions, …).
-// The spelling tree is DROPPED here: the `is` type lands as a string field on
-// the `IsExpr` node, not as a `TypeRef`, so there is no annotation node to key a
-// root to. Popping keeps the child stack balanced (the tree itself stays in the
-// arena, unreferenced) — recording it needs an `IsExpr`-keyed column, which is a
-// later phase, not this one.
+// D-PARSETY P2: the spelling is KEPT and banked on the `IsExpr` node by the
+// caller (`annTsOf` keys on any node, not only a `TypeRef`). The `null` arm
+// builds its `TS_NULL` leaf directly — the one-token type never enters
+// `parseTypeName`, so no producer left a root on the stack for it.
 function parseIsType() {
   if peekKind() == "NULL" {
     advance()
+    lastTyTsRoot = tsLeaf(TS_NULL, "null")
     return "null"
   }
   const nm = parseTypeName()
-  tsPop()
+  lastTyTsRoot = tsPop()
   nm
 }
 
@@ -1053,17 +1075,18 @@ function parseAsType() {
 }
 
 // One `type N = A | B` variant, and one `type AB = { … } & { … }` operand. A
-// `UnionDecl` holds its members as a `string[]`, so — like `is` / `as` — there
-// is no annotation NODE to key a spelling root to and the tree is dropped.
+// `UnionDecl` holds its members as a `string[]`, so a member's root cannot ride
+// the single-root `annTs` table; the caller collects them and banks the list on
+// the `UnionDecl` node (`setUdTs`) once the node exists. D-PARSETY P2.
 function parseVariantName() {
   const nm = parseTypeIsect()
-  tsPop()
+  lastTyTsRoot = tsPop()
   nm
 }
 
 function parseVariantAtom() {
   const nm = parseTypeAtom()
-  tsPop()
+  lastTyTsRoot = tsPop()
   nm
 }
 
@@ -1250,7 +1273,11 @@ function parseTypeDecl() {
   const afterEq = peekKind()
   if afterEq != "LBRACE" {
     const variants: string[] = []
+    // Each member's spelling root, in member order (D-PARSETY P2) — banked on
+    // the `UnionDecl` node below, once it exists.
+    const vroots: i32[] = []
     variants.push(parseVariantName())
+    vroots.push(lastTyTsRoot)
     // A multiline union puts each `|` on its own line, so a NEWLINE may precede
     // the next `|` — skip newlines before testing for the pipe. `endTok` pins the
     // cursor just past the LAST variant so the trailing newline-skip below does
@@ -1263,12 +1290,14 @@ function parseTypeDecl() {
       advance()      // "|"
       skipNewlines() // and after it, before the variant name
       variants.push(parseVariantName())
+      vroots.push(lastTyTsRoot)
       endTok = P.pos
       skipNewlines()
       more = peekKind() == "PIPE"
     }
     P.pos = endTok
     const uix = mkUnionDecl(name, variants, p0)
+    setUdTs(uix, vroots)
     mkDeclNameTok(uix, nameTok)
     return uix
   }
@@ -1278,6 +1307,14 @@ function parseTypeDecl() {
   // (`{a:i32,b:i32}`), so a `{ … } & …` / `{ … } | …` continuation can
   // re-encode the whole RHS as a UnionDecl alias without re-parsing.
   let synth = ""
+  // The field NAMES and their type spelling ROOTS, kept for the `{ … } & … | …`
+  // re-encode below: that path's FIRST union member is the synthetic `{…}` text,
+  // assembled from this list rather than returned by a type producer, so its
+  // spelling tree has to be assembled the same way (D-PARSETY P2). Nothing is
+  // built unless the continuation fires — a plain `type X = { … }` struct
+  // declaration adds no spelling node here.
+  const fNames: string[] = []
+  const fRoots: i32[] = []
   skipNewlines() // a multiline `{` puts the first field on the next line
   let going = peekKind() != "RBRACE"
   while going {
@@ -1291,6 +1328,8 @@ function parseTypeDecl() {
     const ftyIx = mkTypeRef(ftyName, typ0)
     setAnnTs(ftyIx, froot)
     fields.push(mkFieldDef(fname, ftyIx, fp0))
+    fNames.push(fname)
+    fRoots.push(froot)
     if synth != "" { synth = synth + "," }
     synth = synth + fname + ":" + ftyName
     skipNewlines()               // a field may be followed by a NEWLINE before the `,`/`}`
@@ -1309,14 +1348,36 @@ function parseTypeDecl() {
   // the checker's `nameToTy` folds the `&` chain into a merged TyObj.
   if peekKind() == "AMPERSAND" || peekKind() == "PIPE" {
     let first = "{" + synth + "}"
+    // The same object, as a spelling: a `TS_FIELD` per field over the type root
+    // the field already recorded, under one `TS_OBJ`. `tsToName` renders it back
+    // to exactly `"{" + synth + "}"` — `TS_FIELD` is `name + ":" + type` and
+    // `TS_OBJ` is `"{" + comma-joined + "}"`, the same concatenations `synth` is
+    // built by.
+    const fkids: i32[] = []
+    let fk = 0
+    while fk < fNames.length {
+      const oneKid: i32[] = []
+      oneKid.push(fRoots[fk])
+      fkids.push(tsMkKids(TS_FIELD, fNames[fk], oneKid))
+      fk = fk + 1
+    }
+    let firstRoot = tsMkKids(TS_OBJ, "", fkids)
     let igoing = peekKind() == "AMPERSAND"
+    // The `&` operands join the object under a `TS_ISECT`, mirroring the `"&"`
+    // the name is built with.
+    const iKids: i32[] = []
+    iKids.push(firstRoot)
     while igoing {
       advance() // "&"
       first = first + "&" + parseVariantAtom()
+      iKids.push(lastTyTsRoot)
       igoing = peekKind() == "AMPERSAND"
     }
+    if iKids.length > 1 { firstRoot = tsMkKids(TS_ISECT, "", iKids) }
     const variants: string[] = []
+    const vroots2: i32[] = []
     variants.push(first)
+    vroots2.push(firstRoot)
     // Pin the end-token past the last variant (see the sibling union path) so a
     // trailing newline-skip cannot stretch the decl span onto a following line.
     let endTok2 = P.pos
@@ -1326,12 +1387,14 @@ function parseTypeDecl() {
       advance() // "|"
       skipNewlines()
       variants.push(parseVariantName())
+      vroots2.push(lastTyTsRoot)
       endTok2 = P.pos
       skipNewlines()
       umore = peekKind() == "PIPE"
     }
     P.pos = endTok2
     const u2ix = mkUnionDecl(name, variants, p0)
+    setUdTs(u2ix, vroots2)
     mkDeclNameTok(u2ix, nameTok)
     return u2ix
   }
