@@ -740,6 +740,28 @@ collection gap; an `f32 + i32` type error), which the first harness reported as 
 the lambda, the lambda still returning i32 — both are the same capture failure, and two controls
 (`__log__` in that shape; the shape with no intrinsic at all) confirm the shape itself compiles.
 
+**A measurement that sharpens O7's narrow-vs-proper choice.** O7's objection to the narrow fix
+(adding these names to `isBuiltinFnName`) is that the list is consulted by NAME and would swallow a
+genuine capture of a same-named local. #1167's reservation was expected to have removed that risk by
+rejecting the definition — but censused over `__load_i32__`, `__load_f32__` and `__memory_grow__`,
+the reservation covers `function`, top-level `const`/`let` and an inner `const`, and does **not**
+cover a **function parameter** or a **lambda parameter**. A parameter is therefore still a way to
+create such a local, and the exact hazard shape works correctly today:
+
+```vl
+function go(__load_i32__: i32): i32 {
+  const f = () => __load_i32__ + 1
+  f()
+}
+print(go(41))          // → 42, measured; an ordinary-parameter control also 42
+```
+
+The narrow fix would regress that program to `captured variable not found in enclosing frame`. So
+the cost is real but tiny and, more usefully, **removable**: extending #1167's reservation to
+parameters first would close the hole before the exemption list opens it, at which point the narrow
+fix has no known cost. That pairing is the recommendation; the proper fix (`capScan`'s
+callee-position skip) still needs no such pairing.
+
 ### H6. Refutations, and things this slice got wrong before it got them right
 
 - **`ROADMAP.md` / `webcraft-requirements.md` / `memory-gc-design.md` "4 store widths, 1 load
