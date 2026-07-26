@@ -450,6 +450,38 @@ export function tsWrap(kind: i32, text: string) {
   tsMk(kind, text, mark)
 }
 
+// A CHILDLESS spelling node built OFF the stack. `tsMk`'s contract is "the
+// children are the stack region above a mark", which only a producer that is
+// mid-recursion can satisfy; a caller that already holds finished roots (the
+// `type N = {…} & …` re-encode below, the `is null` leaf) needs the plain
+// constructor. Nothing is pushed to `tsStack`, so the recursion's balance is
+// untouched.
+export function tsLeaf(kind: i32, text: string) {
+  tsKind.push(kind)
+  tsText.push(text)
+  tsKidStart.push(tsKids.length)
+  tsKidCount.push(0)
+  tsKind.length - 1
+}
+
+// The same, with an explicit child list. Used where the parser assembles a
+// spelling from roots it already popped — `parseTypeDecl`'s `{ … } & …`
+// re-encode, whose first union member is built from the FIELD list it just
+// parsed rather than by a `parseTypeName` call.
+export function tsMkKids(kind: i32, text: string, kids: i32[]) {
+  const start = tsKids.length
+  let i = 0
+  while i < kids.length {
+    tsKids.push(kids[i])
+    i = i + 1
+  }
+  tsKind.push(kind)
+  tsText.push(text)
+  tsKidStart.push(start)
+  tsKidCount.push(kids.length)
+  tsKind.length - 1
+}
+
 // Take the finished root a type producer left on the stack. Every producer
 // pushes exactly one node — the error arm pushes `TS_ERR` — so this is total on
 // a producer's return; the `-1` guard is the same "never trap on a misaligned
@@ -487,10 +519,60 @@ export function setAnnTs(nodeIx: i32, root: i32) {
   0
 }
 
+// The MULTI-root twin, for a node whose type spellings are a LIST: a
+// `UnionDecl`'s members, which live on the node as a `string[]` and so cannot
+// key one root each in the single-root table above. One row per MEMBER, pushed
+// in member order immediately after the `mkUnionDecl` that owns them, so
+// `udTsNode` is NON-DECREASING (equal within a node, increasing across nodes)
+// and a member's root is `udTsRoot[first(node) + k]`.
+//
+// A member root may be -1 — a member whose producer left nothing on the stack
+// (`tsPop` on an empty stack, only reachable from a malformed parse). Its
+// consumer keeps the string fall-through, so the pass is total either way. The
+// `type N = { … } & … | …` re-encode's FIRST member, which no type producer
+// returns, is NOT such a case: `parseTypeDecl` assembles its spelling from the
+// field list (`tsMkKids`) so that member has a real root like every other.
+export let udTsNode: i32[] = []
+export let udTsRoot: i32[] = []
+
+export function setUdTs(nodeIx: i32, roots: i32[]) {
+  let i = 0
+  while i < roots.length {
+    udTsNode.push(nodeIx)
+    udTsRoot.push(roots[i])
+    i = i + 1
+  }
+  0
+}
+
+// The `k`-th member spelling root recorded for `nodeIx`, or -1 when the node has
+// none (or fewer than `k + 1`). Binary search for the LEFTMOST row of `nodeIx`
+// over the non-decreasing key column, then index by `k`.
+export function udTsRootAt(nodeIx: i32, k: i32) {
+  let lo = 0
+  let hi = udTsNode.length - 1
+  let first = -1
+  while lo <= hi {
+    const mid = lo + (hi - lo) / 2
+    const at = udTsNode[mid]
+    if at < nodeIx {
+      lo = mid + 1
+    } else {
+      if at == nodeIx { first = mid }
+      hi = mid - 1
+    }
+  }
+  if first < 0 { return -1 }
+  const r = first + k
+  if r >= udTsNode.length { return -1 }
+  if udTsNode[r] != nodeIx { return -1 }
+  udTsRoot[r]
+}
+
 // The spelling-tree root recorded for `nodeIx`, or `-1` when none was — every
 // non-`TypeRef` node, an emitter-SYNTHESIZED `TypeRef` (`synthTypeRef`, built
 // from a name the emitter computed that never passed through the parser), and
-// the string-only type spellings (`is` / `as` / a `UnionDecl` member).
+// the string-only type spellings the parser still drops (`as`).
 export function annTsOf(nodeIx: i32) {
   let lo = 0
   let hi = annTsNode.length - 1
@@ -515,6 +597,8 @@ export function tsReset() {
   tsStack = []
   annTsNode = []
   annTsRoot = []
+  udTsNode = []
+  udTsRoot = []
   0
 }
 
