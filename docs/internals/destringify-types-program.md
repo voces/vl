@@ -13371,3 +13371,302 @@ until that lands, leaving them and saying so is the honest move.
     cosmetics and they are **31 of the 83 deleted calls** — and they are precisely where the arena
     migration collapses seventeen call sites into three. **Do not skip a grammar because its home
     would be a one-liner: the metric is the number of COPIES, not the size of the home.**
+
+## D-TYWALK + D-FIELDREC + D-TRAPFLOOR — the emitter's bracket-depth ladder gets ONE home, the declared-FIELD record ladder gets one, and the reported compiler TRAP is FIXED (#1147)
+
+**Slice: `compiler/emit_base.vl` + `compiler/emit_collect.vl`, plus one new corpus fixture.**
+Branched at `c4e1674` (#1144), **rebased onto `2fae030`** (after #1143 D-TCSCAN, #1145
+D-RETMAPSHAPE and #1146 D-CLASSHOME landed). Every number below is re-taken at `2fae030` in one
+session; the two files this slice owns are byte-identical at both bases, so the per-file deltas
+carry, but the TREE-WIDE totals do not — #1143 took 19 off the off-list and #1146 took 83 off
+`emit_classify`, so quoting `c4e1674`'s 451/59/510 here would be wrong by 42/19/61.
+
+### The unit, the counter, and its validation
+
+**Unit: CALL SITES.** A textual `NAME(` in non-comment code where the preceding character is not
+`[A-Za-z0-9_.$]`; string literals blanked (char literals KEPT — method note 92), then `//`
+comments; the resolver's own `function NAME(` header excluded. The CORE list is #1139's 23
+resolvers (the SCORECARD CORRECTION's 19 plus #1117's four); the OFF-LIST is #1141's 13.
+
+**Validated against five published figures before it was used to claim anything**: `emit_collect`
+**71** / `emit_base` **64** at `7cefaa0` (#1144's parent table), and `emit_collect` **55** /
+`emit_base` **56** / tree-wide **451** at `c4e1674` (#1144's shipped table). All five reproduce
+exactly. Off-list at `c4e1674` reproduces **59**, the standing brief's figure.
+
+### The scoreboard, at THIS slice's base
+
+| unit | `2fae030` | shipped | delta |
+|---|---|---|---|
+| **CORE** (23-resolver list, tree-wide) | **368** | **359** | **−9** |
+| **OFF-LIST** (13 scanners, tree-wide) | **40** | **36** | **−4** |
+| **TRUE TOTAL** | **408** | **395** | **−13** |
+| …`compiler/emit_base.vl` | 56 core + 7 off | **48 core + 3 off** | **−8 / −4** |
+| …`compiler/emit_collect.vl` | 55 core + 1 off | **54 core + 1 off** | **−1 / 0** |
+| **hand-written bracket-DEPTH ladders, tree-wide** (`tyGtIsClose` call sites) | **13** — emit_base **7** · emit_classify 3 · typecheck 2 · emit_collect 1 | **9** — emit_base **3** | **−4, all from `emit_base`** |
+
+After #1143 took `typecheck` from 13 ladders to 2, **`emit_base`'s seven were the largest
+remaining concentration in the compiler.** They are now three: the two homes, and `annArrowAt`.
+
+### What the CODE is — the duplicate-grammar census
+
+Enumerated by *what the code is*, not *what the argument is*. Counted by exact signature over
+comment-stripped source, tree-wide over `compiler/*.vl`, at `2fae030`:
+
+| grammar | copies at `2fae030` | home |
+|---|---|---|
+| **the type-name bracket-DEPTH walk** (`{[(` open · `)]}` close · `<` open · `>` closes only an OPEN `<` via `tyGtIsClose`) | **7 in `emit_base`** — `nullablePartOf` · `gaeSplitArgs` · `annSplitParams` · `annSplitPipe` · `shapeInnerFieldSplit` · `nameIsStructWithUnionField`'s inline field-union scan · `annArrowAt` | **2**: `tyTopLevelIndexOf(name, sep)` (FIND) + `tyTopLevelSplit(s, sep, dropEmpty, out)` (SPLIT); `annArrowAt` keeps its own (see below) |
+| the DECLARED-FIELD element-name record ladder (`fieldRefElemName` + the code-0 / code-4 / code-30 patches) | **2** — `collectS`'s struct loop and `collectVariantFields`'s variant loop, *and they had already DRIFTED* | `fieldRecElemName(tyIx, code)` (`emit_collect`) |
+| the nullable-litunion niche (`nullablePartOf` split, then the expanded `"a"\|"b"\|null` form) | **4 functions, up to 5 scans of one name** — `nameIsNulLitUnion` · `nulLitUnionInnerName` · `nameHasNullMember` · `nulLitUnionCore` | **1** — `nulLitUnionInnerName`, the primitive; the predicate is `!= ""` |
+| the `{…}` object-shape decomposition in the mono trio (#1144's filed **hand-off 3**) | **2** — `monoAnnHasTyParam` · `monoSubstAnn` | `annObjFieldSplit(ann, outNames, outTexts)` |
+| "a nullable's non-null part is a FUNCTION type" | **2** — `nameIsNulClosure` hand-wrote `annArrowAt(peelGroupParens(b)) >= 0`; `nullClosureArrElem`, **twenty lines down**, already called `nameIsFuncTypeAtom(b)` for the identical question | `nameIsFuncTypeAtom` (already imported) |
+| the nullable-SCALAR niche compare `nullablePartOf(x) == "<scalar>"` | **4** — of which 2 (`nameIsNulString`, `nameIsNulBool`) ARE the named homes and 2 (`retNulStringFlag`, `tyIsNulBool`) hand-wrote their bodies **in the same file, eight lines from the definition** | the two existing named predicates |
+| count-then-split of the SAME name (`unionMemberCount` then `splitUnionAtoms`) | **4 tree-wide** — `emit_base`'s `isVariantBoxUnion` (**taken**), `emit_classify` ×2, `typecheck` ×1 (hand-offs) | one walk: `atoms.length` IS the count |
+
+**`annArrowAt` deliberately keeps its own walk.** It is the compiler's second-hottest scanner
+(309,526 invocations over the corpus) and its separator is the TWO-character `=>`; routing it
+through a single-character finder would either need a lone-`=` assumption or a second parameter
+on the hot path. Named, not taken — and its walk is this slice's work-measurement CONTROL.
+
+**`nullablePartOf` now returns at the FIRST top-level bar.** Its copy scanned to the END of the
+name and kept only the first — the same answer for strictly less work, and the reason the home
+is not merely a relocation.
+
+### The compiler TRAP, FIXED — with the two-variable measurement its filing did not have
+
+The trap filed against `emit_collect` (a `vl check`-clean program whose `vl build` dies with
+`wasm trap: out of bounds array access`, six compiler frames) **reproduces at `2fae030`** and is
+fixed here by the two filed hunks, both **re-verified by context at this head, not inherited**:
+
+- **A1 — the fail-loud floor.** `assignTags` bails on `emitFailed`. A registration helper's
+  `emitFail` -1 that a caller SWALLOWED (`registerInlineUnion`'s map-atom and ref-array-atom
+  recursions discard theirs) leaves `uFieldStart` pushed with no `uFieldCount` twin, and the tag
+  ranking reads past the row tables.
+- **A2 — the ordering fix.** `collectTyMembersReach` descends `TyMap`'s value and `TyArray`'s
+  element, so a variant-box union reached only through a nullable COLLECTION registers its arms'
+  FIELD unions before its own variant rows.
+
+**An 18-shape sweep across four compilers, all `vl check`-clean, re-measured here:**
+
+| build | trapping shapes | outcome |
+|---|---|---|
+| master `2fae030` | **14 of 18** | `wasm trap: out of bounds array access` |
+| **A1 only** (A2 removed) | 0 | all 14 become the loud `emitProgram: only i32 / boolean / string / array union-variant fields are supported` |
+| **A2 only** (A1 removed) | 0 | all 14 **compile and run** |
+| **A1 + A2** (shipped) | 0 | all 14 compile and run |
+
+**A2 MASKS A1 on every shape reachable today, and that is stated rather than papered over**
+(method note 90, run forward). Five further hand-written shapes aimed at reaching A1 alone
+(`{f: boolean | i32[]}` arms behind the map-atom and ref-array-atom recursions) all REJECT loudly
+on master already, so **no single fixture can pin A1**: its evidence is the A2-absent column
+above, where it converts 14 of 14 trapped compilations into diagnosable rejects. It is kept as the
+floor the coordinator asked for, with that claim stated exactly.
+
+**The coordinator's literal repro is NOT fully fixed here, and that is the headline residue.**
+`const r = f()` (an UN-ANNOTATED module global bound to a nulmap-returning call) goes
+**TRAP → INVALID-WASM** under A1+A2: the trap is gone, the remaining defect is #1145's **Bug 2**,
+whose fix is one line in `globalCellKind` — `emit_classify.vl`, another partition. Re-filed below
+with its fixture. The shipped fixture therefore pins the DIRECT-call form.
+
+### The channels — every denominator and population stated
+
+| channel | volume + population on side A | result |
+|---|---|---|
+| corpus A/B — wasm SHA + build rc + compiler message (tmp paths normalised, and it carries the emitted BYTE SIZE) + run stdout + run rc | **1,326 files × 5 observations**; **1,127 produce wasm across 1,123 distinct SHAs**, 1,326 carry a build message across **1,030 distinct texts**, **1,296 produce run output across 1,135 distinct texts**, 2 distinct build rcs, 2 distinct run rcs | **1 differing file — this slice's own new fixture, on all five channels.** Over the 1,325 pre-existing files: **0 · 0 · 0 · 0 · 0** |
+| corpus LINT tier (`vl check --severity hint` over `tests/cases` + `std` + `compiler`), TAB-safe per-file trees + `diff -r` | **1,355 files**, 778 distinct lint texts | **`diff -r` RC=0, 0 differing** |
+| fuzz A/B — cases generated **ONCE** with the master compiler, the IDENTICAL case files run through both; `.err` normalised for the compiler's own backtrace addresses (method note 94) | **12 legs × 600 = 7,200 programs/side**, 7,435 output files/side (6,965 non-empty `.out`, 235 `.err`); depths 4/5/6 × plain / `--branching --multiobs` / `--declared` / all-flags | **`diff -r` RC=0, 0 differing paths** |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | master baseline **2043 / 0 / 8** re-measured in the SAME session at the SAME head with my two files reverted and the fixture held out; shipped **2044 / 0 / 8** | **+1 = exactly the one new fixture**; ignored-test **NAME SET** diff EMPTY. Magnitude check: 2044/8, not 1,4xx/6xx — the whole suite ran |
+| `native-fixpoint.sh` | — | **RC=0**, stage3 == stage4 byte-for-byte, 1,028,392 B |
+| `lint-self.sh` | — | **RC=0** |
+| `rep-fuzz-check.sh` | — | **exact ✅** (1 baselined, 0 unsound, 0 new, 0 stale) |
+
+**PUBLISHED FUZZ BLIND SPOT.** `scripts/fuzzgen.vl` emits `Map()` at exactly one site, always as
+an annotated local, and never `return Map()` nor an un-annotated global bound to a call — so **the
+0 on the fuzz channel says nothing about the TRAP shapes**, in either direction. The trap is pinned
+on the corpus and by the 18-shape sweep, not by the fuzzer. (The fuzz A/B's own log was checked
+for `unknown arg:` on its first line before its 0 was believed.)
+
+Binary, like-for-like (ONE compiler — the `c4e1674` seed — compiling two sources):
+master `2fae030` **1,030,051** → shipped **1,028,392** bytes (**−1,659**).
+Source: **299 insertions / 274 deletions** across the two compiler files, plus a 33-line fixture.
+
+### THE WORK COUNT, on both sides of every home
+
+#1144's trap — *a home in front of a resolver that already cheap-rejects loses the early exit, and
+the loss is invisible on every output channel* — is why this exists. Two probe compilers, built
+identically, differing ONLY in this slice's two files plus the same instrumentation: 19 counters
+behind an exported `wpTick` FUNCTION in `ast.vl` (method note 84 — a cross-module `export let` is
+not a shared counter), reported by an `emitFail` immediately after `emitModule` returns (method
+note 85). **CHARSTEPS is one tick per loop ITERATION of every depth walk this slice moves**, so it
+measures characters actually examined rather than name lengths — the two differ precisely where
+the new home returns early.
+
+**Denominator: the 1,127 corpus files that reach `emitModule`** (of 1,326; the rest fail parse or
+check before emit and report nothing).
+
+| counter | master `2fae030` | shipped | delta |
+|---|---|---|---|
+| **CHARSTEPS — every depth walk this slice moves** | **11,090,900** | **10,371,323** | **−719,577 (−6.49%)** |
+| `unionMemberCount` invocations | 145,020 | 138,358 | **−6,662 (−4.59%)** |
+| `annArrowAt` invocations | 317,321 | 309,526 | **−7,795 (−2.46%)** |
+| `peelGroupParens` invocations | 13,820 | 6,029 | **−7,791 (−56.4%)** |
+| `nameIsFuncTypeAtom` invocations | 60,054 | 67,840 | +7,786 |
+| `tyTopIndexOf` invocations (the checker's home, #1143) | 681,191 | 674,248 | −6,943 |
+| `splitUnionAtoms` invocations | 166,590 | 166,290 | −300 |
+| `nullablePartOf` invocations | 423,447 | 423,320 | −127 |
+| `annSplitParams` · `gaeSplitArgs` · `annSplitPipe` · `shapeInnerFieldSplit` · `isVariantBoxUnion` · `parenEnclosesWhole` · `tyGroupEndIndex` | — | — | **0 each — the four split homes are RELOCATIONS, which is the check that they are not extra passes** |
+| **TOTAL invocations, like-for-like** (excluding the one RENAMED primitive, below) | **1,908,353** | **1,886,472** | **−21,881 (−1.15%)** |
+
+**CHARSTEPS per file: 493 fewer, 556 the same, 78 more.** The 78 total **+4,527** charsteps, and
+the mechanism is named rather than rounded away: `tyTopLevelSplit` runs `i <= s.length` where
+`annSplitParams`/`annSplitPipe` ran `i < s.length`, i.e. **+1 iteration per call** — an upper
+bound of 11,731 over their 11,731 combined invocations, against **−719,577** elsewhere.
+
+**The one counter that goes UP is a RENAME, not work.** `nulLitUnionInnerName` reads 36 → 59,049
+because `nameIsNulLitUnion` is now *defined as* `nulLitUnionInnerName(name) != ""`; the family's
+actual work fell (master asked one name for the nullable split and then split the union TWICE more
+in `nameHasNullMember` + `nulLitUnionCore`; the shipped primitive does one split, and
+`splitUnionAtoms` invocations fell by 300 net even while `isVariantBoxUnion` started splitting
+every name it is asked about). **All 556 invocation-worse files are worse only because of that
+slot**: 293 have NO other changed counter, and the other 263 have every other counter NEGATIVE
+(e.g. `{nullablePartOf −7, splitUnionAtoms −1, unionMemberCount −7, annArrowAt −10,
+nameIsFuncTypeAtom +9, peelGroupParens −9, tyTopIndexOf −7}`).
+
+**The CONTROL is honest about what it is.** `annArrowAt`'s own walk — untouched by this slice —
+reads 4,051,554 → 4,018,139 charsteps (**−0.82%**). It is NOT constant, and the reason is stated:
+`annArrowAt` is *called* 7,795 fewer times because `nameIsNulClosure` stopped asking it. Per
+invocation it is unchanged. What the control proves is that no NEW `annArrowAt` work appeared.
+
+### Entombment — one fixture, four sabotages, two fail-loud probes with inverted twins
+
+The fixture: **`tests/cases/unions/nullable-collection-of-variant-box-arm-field-union.vl`**, three
+shapes (inline map value, doubly-nested map value, and the NAMED-alias spelling).
+**Shown RED on a `2fae030`-built compiler by running it**: `vl run` exits with
+`wasm trap: out of bounds array access` and six compiler backtrace frames — the compiler does not
+produce a module at all. Green on the shipped build (`true` / `true` / `true`).
+
+Each sabotage is applied to the SHIPPED source, rebuilt with the same seed, and swept over the
+whole corpus (1,326 files × 5 channels) against the shipped build:
+
+| sabotage / probe | result | what it establishes |
+|---|---|---|
+| **S1B** — `tyTopLevelIndexOf` becomes DEPTH-BLIND | **42 of 1,326** (byte 41 · msg 42 · build-rc 37 · run-rc 39 · stdout 40) | the shared walk is LIVE and its bracket ladder is load-bearing — not a cosmetic relocation |
+| **S3** — `nameIsNulClosure` drops the grouping-paren peel (`annArrowAt(b)` for `nameIsFuncTypeAtom(b)`) | **15 of 1,326**, all five channels | the `nameIsFuncTypeAtom` swap carries real content; it is not a rename |
+| **S4** — `fieldRecElemName` drops its code-0 arm | **2 of 1,326** — `literal-unions/atom-field.vl`, `structs/structural-non-twin-distinct.vl` (byte/msg/run-rc/stdout; build rc 0) | the field-record home is LIVE at BOTH tables it now serves |
+| **S1** — `tyTopLevelIndexOf` returns the LAST top-level hit instead of the FIRST | **0 of 1,326 — INERT, and it is a FINDING** | see below |
+| **S2** — `tyTopLevelSplit` always drops empty parts (`dropEmpty` ignored) | **0 of 1,326 — INERT BY CONSTRUCTION** | see below |
+| **P1** — fail-loud when `unionMemberCount(name) != splitUnionAtoms(name).length` at `registerInlineUnion` | **0 disagreements / 1,326** | the count/split DUALITY that licenses deleting `isVariantBoxUnion`'s count is MEASURED |
+| **P1INV** — the same probe INVERTED (fires when they AGREE) | **437 of 1,326** | the comparator is wired, not blind |
+| **P2** — fail-loud when `fieldRefElemName` does NOT already return the litunion-ARRAY name at code 4 | **0 disagreements / 1,326** | the deleted code-4 arm was redundant |
+| **P2INV** — inverted | **1 of 1,326 — `structs/atom-array-field.vl`** | **THE AGGREGATE HID THE SLICE and the inverted twin named it**: the code-4 population is exactly ONE corpus file. A 0-diff A/B would have "passed" for a population of one |
+
+- **S1 is inert for a reason worth recording.** `nullablePartOf`'s contract is a TWO-part split, and
+  a multi-bar name's remainder classifies as nothing under either reading: a hand-written
+  `A | B | null` probe (three-member struct union, narrowed and read) is byte-identical on both
+  builds, because the one shape where FIRST and LAST diverge meaningfully — the expanded
+  `"a" | "b" | null` — is answered by `nulLitUnionInnerName`'s OWN split, which is bar-count-blind.
+  So the FIRST/LAST choice is a work property, not a semantic one; **S1B is the sabotage that
+  carries the home's content**, and it reddens 42.
+- **S2 is inert BY CONSTRUCTION, which is a different claim from "measured at 0".**
+  `annSplitParams("")` differs only in producing ONE EMPTY part versus none, and every caller
+  either guards on `inner.length > 0` (`annFnDecompose`, `emit_mono.vl:1196` — this is exactly what
+  D-GRAMHOME's S5 fixture pins) or folds the part into a signature KEY, where an empty part
+  contributes no characters. A hand-written zero-parameter-closure program (array element, param,
+  and return positions) is byte-identical on both builds. The two conventions are therefore
+  **deliberately preserved rather than unified** — unifying them would be a behaviour change with
+  no benefit.
+
+### REFUTATIONS — worth more than the agreements
+
+1. **`emit_base`'s new homes are NOT the compiler's one home for this grammar, and the brief's
+   "sweep ACROSS modules" is why that got caught.** #1143 (D-TCSCAN) landed the SAME two entry
+   points one module down — `tyTopIndexOf(name, a, b, from)` and `tyGroupEndIndex(name, from)` —
+   and its header explicitly counts "eleven more [copies] across `emit_base`, `emit_collect` and
+   `emit_classify`". They are **not** interchangeable with these: the checker's home SKIPS QUOTED
+   literal members (escape-aware, via `skipQuotedName`) and `emit_base`'s six copies **do not**.
+   Routing `nullablePartOf` through `tyTopIndexOf` would make
+   `nullablePartOf("\"a|b\"|null")` return `"a|b"` where it returns `""` today — a latent-bug FIX,
+   not a relocation, and out of scope for a slice whose whole claim is byte-identity. Filed as
+   hand-off 1 with the divergence named.
+2. **The two declared-FIELD record ladders had already DRIFTED, and the drift was in the
+   REDUNDANT direction.** `collectVariantFields` carried a code-4 arm re-deriving what
+   `fieldRefElemName` already returns (it falls through to `shapeFieldElemName(name, 4)`, whose
+   `nameIsLitUnionArray` arm returns that very name); `collectS`'s twin never had it. The comment
+   above the copy — "`fieldRefElemName` is "" for it" — **is wrong for code 4**; it is "" only for
+   codes 0 and 30. P2/P2INV measure it: 0 disagreements, 1 reaching file.
+3. **A2 subsumes A1 on every shape reachable today**, which is the opposite of the filing's
+   implicit reading that both are needed to make the programs compile. A1's value is entirely
+   prospective (a floor against the NEXT swallowed `emitFail`), and no fixture can pin it while A2
+   is in — stated, with the A2-absent column as its evidence, rather than dressed up as a test.
+4. **Fixing the TRAP does not fix the reported repro.** `const r = f()` becomes silent
+   INVALID-WASM, not a working program, because of a defect in another partition. Reporting the
+   trap as "fixed" without that sentence would have been wrong.
+
+### Hand-offs, each with its measurement
+
+1. **`typecheck.vl` — export `tyTopIndexOf` (and `tyGroupEndIndex`) so `emit_base`'s two homes can
+   ride the checker's.** That takes the compiler's bracket-depth ladders from **9 to 7** and, with
+   `emit_classify`'s three, to **4**. It is NOT free: the checker's finder skips quoted members and
+   the emitter's copies never did, so adopting it changes `nullablePartOf` /
+   `nameIsStructWithUnionField` on a name carrying a `|` INSIDE a quoted literal member. That is
+   almost certainly a latent bug (#1143's own header lists the same divergence class), but it needs
+   its own fixture and its own A/B. **Do not fold it into a byte-identity slice.**
+2. **`emit_classify.vl` — `globalCellKind`'s missing `nulmap` arm (#1145's diff (B), still
+   unlanded).** With A1+A2 in, this is now the ONLY thing standing between the reported repro and a
+   working program, and its failure mode is silent invalid wasm. Exact diff and the fixture
+   `tests/cases/maps/global-infers-nulmap-from-call.vl` are in #1145's section above; both
+   re-verified against this head (the repro `function f(): {[string]: {f: boolean | {w: i32}} |
+   boolean} | null { return null }` + `const r = f()` reads master TRAP → shipped INVALID-WASM →
+   REJECT under A1-only).
+3. **`emit_classify.vl` ×2 and `typecheck.vl` ×1 — the count-then-split double walk.**
+   `emit_classify.vl:2715`, `emit_classify.vl:9859`, `typecheck.vl:15564` each ask
+   `unionMemberCount(X)` and then `splitUnionAtoms(X, …)` of the SAME name. P1 measured the duality
+   at 0 disagreements over 1,326 files with a 437-file inverted twin, so the substitution is
+   licensed; it is **−3 CORE call sites** and −3 whole scans per call.
+4. **`emit_collect.vl` — `nulRefListInner`.** `collectA` hand-writes
+   `nullablePartOf(ran)` + `nameIsRefArray(ranp)` (`emit_collect.vl:2889/2895`) three lines after
+   calling `nameIsNulRefList(nd.tyName)`, which IS that pair — but it needs the inner NAME, not the
+   boolean. Moving `nulRefListInner` DOWN into `emit_base` and expressing `emit_classify`'s
+   `nameIsNulRefList` as `nulRefListInner(n) != ""` is **−2 core in `emit_classify`** and 0 net in
+   `emit_collect`; taken alone inside `emit_collect` it scores 0, which is why this slice declined
+   it. It needs the two partitions together.
+5. **`registerInlineUnion` still holds 17 of `emit_collect`'s 54 core sites** and #1127's verdict
+   still stands: the parameter is a NAME it peels and recurses on. What THIS slice found that
+   #1127 did not is that `registerInlineUnion` splits `name` and then `isVariantBoxUnion` splits it
+   AGAIN at two of three call sites — an `isVariantBoxUnionOf(stmts, name, atoms)` primitive taking
+   the pre-split atoms saves 2 whole scans per registration for 0 on the call-site metric. Named,
+   measured, not taken.
+
+### Method notes earned
+
+96. **A home is not "the" home until you have swept the module BELOW you, and the module below
+    may have built it while you were building yours** (D-TYWALK). #1143 landed
+    `tyTopIndexOf`/`tyGroupEndIndex` in `typecheck.vl` — the same two entry points, one module
+    down — in the same cycle this slice built `tyTopLevelIndexOf`/`tyTopLevelSplit` in
+    `emit_base.vl`. The rebase is what surfaced it. **And they are not interchangeable**: the
+    checker's skips quoted literal members and the emitter's copies never did, so the "obvious"
+    unification is a behaviour change. Sweep down the import graph BEFORE naming a home, and when
+    you find a near-twin, diff its GRAMMAR, not its signature.
+97. **When a fix's two hunks are filed together, measure them SEPARATELY before believing either
+    claim about the other** (D-TRAPFLOOR, extending note 90). A1 was filed as "kills the trap
+    class" and A2 as "makes the programs compile". Both are true, and the pair-wise measurement
+    adds the fact neither filing states: **A2 alone also kills the trap class**, because it removes
+    the rejection that produced the half-written row. So A1 is unpinnable while A2 is in, and the
+    honest deliverable is the A2-absent column, not a fixture that would pass for the wrong reason.
+98. **A fail-loud probe's INVERTED twin is what turns "0 disagreements" into a measurement, and
+    when the population is ONE the inverted twin is the only thing that can say so**
+    (D-FIELDREC). P2 read 0 over 1,326 files; P2INV named the single reaching file
+    (`structs/atom-array-field.vl`). Without it, "0 of 1,326" for a deletion is indistinguishable
+    from "the arm is never reached", which is precisely the licence-to-delete error the standing
+    brief forbids.
+99. **A counter that goes UP can be a RENAME; prove it by checking that every worse file is worse
+    ONLY on that counter** (D-TYWALK). `nulLitUnionInnerName` reads 36 → 59,049 (+164,000%) purely
+    because the predicate is now defined in terms of the primitive. 293 of the 556 worse files have
+    no other changed counter and the other 263 have every other counter negative — which is the
+    check that turns an alarming headline into a bookkeeping note. Quote the like-for-like total
+    (**−21,881, −1.15%**) NEXT to the raw one, never instead of it.
+100. **A TSV A/B harness silently mis-joins any row whose payload contains a TAB** (D-TYWALK,
+    harness). The lint-tier A/B reported 3 differing files; two were `compiler/emit_classify.vl`'s
+    own hint output bleeding across the column boundary after `sort`, and the third
+    (`generics/recursive-generic-alias-array.vl`) was byte-identical when checked directly. The
+    fix is one output FILE per input and `diff -r`. The tell was the same one note 92 records: a
+    "difference" whose content was structurally impossible.

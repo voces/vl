@@ -96,7 +96,6 @@ import {
   nameIsF32Array,
   nameIsF64Array,
   nameIsI64Array,
-  nameIsLitUnionArray,
   nameIsMap,
   nameIsMapArray,
   nameIsMapMemberUnion,
@@ -141,6 +140,7 @@ import {
   cloSigWalkRoots,
   cloStructIdx,
   criChanged,
+  emitFailed,
   fRetBool,
   fRetKind,
   fRetRArrElem,
@@ -3398,6 +3398,36 @@ function collectNestedFieldShapes(stmts: i32[]) {
   0
 }
 
+// THE ONE HOME of the DECLARED-FIELD element-NAME recording: the name a `FieldDef`'s
+// annotation node `tyIx` (already coded `code`) records into the flat
+// `sFieldElemName` / `uFieldElemName` column.
+//
+// `collectS`'s struct loop and `collectVariantFields`'s variant loop are the SAME ladder —
+// same codes, same order, same column, differing only in which table they push to — and
+// each carried this patch on top of `fieldRefElemName` by hand. Being two copies, they had
+// already DRIFTED: the variant copy re-derived the code-4 (litunion ARRAY) recording that
+// `fieldRefElemName` performs itself, and the struct copy did not. The two are now one
+// reading, and the redundant arm is gone rather than mirrored.
+//
+// `fieldRefElemName` answers every code but 0 and 30 — for those two it returns "" BY
+// CONSTRUCTION (`emit_classify.vl`'s `fieldRefElemName`, whose comment says so: "the ATOM
+// codes the shape-text recorder keys and the NODE recorder does not"), and the atom name
+// comes from the annotation's own spelling, which is what these two arms supply.
+function fieldRecElemName(tyIx: i32, code: i32) {
+  const en = fieldRefElemName(tyIx)
+  // A literal-union atom field (code 0) records its union NAME (not the ref-elem name,
+  // which is "" for it) so `sFieldIsLitUnion` recovers the atom rep + membership.
+  if code == 0 {
+    const ftn = tyNameOf(tyIx)
+    if nameIsLitUnionType(ftn) { return ftn }
+    return en
+  }
+  // A NULLABLE-litunion niche field (code 30) records the non-null union name — the
+  // code-0 recording over the `| null`-stripped part.
+  if code == 30 { return nulLitUnionInnerName(tyNameOf(tyIx)) }
+  en
+}
+
 // ── struct-type collection + struct-typedness of expressions ─────────────────
 // `isSName` tells whether a type-name refers to the declared struct; `collectS`
 // records the program's single struct type; the rest decide whether a given
@@ -3455,25 +3485,14 @@ export function collectS(stmts: i32[]) {
               )
             }
             sFieldTypes.push(code)
-            // A literal-union atom field (code 0) records its union NAME (not the ref-elem name,
-            // which is "" for it) so `sFieldIsLitUnion` recovers the atom rep + membership.
-            let elemNm = fieldRefElemName(fnode.fdType)
-            if code == 0 {
-              const ftn = tyNameOf(fnode.fdType)
-              if nameIsLitUnionType(ftn) { elemNm = ftn }
-            }
-            // A NULLABLE-litunion niche field (code 30) records the non-null union
-            // name — the code-0 recording over the `| null`-stripped part.
-            if code == 30 {
-              elemNm = nulLitUnionInnerName(tyNameOf(fnode.fdType))
-            }
+            const elemNm = fieldRecElemName(fnode.fdType, code)
             sFieldElemName.push(elemNm)
             recordSFieldElemTyIx(elemNm) // D5
             sFieldNames.push(fnode.fdName)
-            // A value-union field interns its box reps (collectAnnShapes parity).
-            if code == 16 {
-              registerValueUnionName(fieldRefElemName(fnode.fdType))
-            }
+            // A value-union field interns its box reps (collectAnnShapes parity). The
+            // recorded name IS `fieldRefElemName`'s answer at code 16 (neither of the home's
+            // two arms fires), so this re-derivation is the same value for a third scan.
+            if code == 16 { registerValueUnionName(elemNm) }
             forceScalarListField(code)
             cnt = cnt + 1
           } else {
@@ -3585,26 +3604,18 @@ function collectVariantFields(stmts: i32[], name: string) {
               )
             }
             uFieldTypes.push(code)
-            // A literal-union atom field (code 0) / atom-array field (code 4) records its union
-            // name so the variant's construct/read sites recover the atom rep + membership —
-            // the variant-table twin of `collectS`'s recording (`fieldRefElemName` is "" for it).
-            let vElemNm = fieldRefElemName(fnode.fdType)
-            if code == 0 || code == 4 {
-              const vftn = tyNameOf(fnode.fdType)
-              if code == 0 && nameIsLitUnionType(vftn) { vElemNm = vftn }
-              if code == 4 && nameIsLitUnionArray(vftn) { vElemNm = vftn }
-            }
-            // A nullable-litunion niche variant field (code 30): the non-null union name.
-            if code == 30 {
-              vElemNm = nulLitUnionInnerName(tyNameOf(fnode.fdType))
-            }
+            // The struct twin's ladder exactly (`fieldRecElemName`) — the variant table
+            // records the SAME name for the same code. Its own code-4 (litunion ARRAY) arm
+            // was REDUNDANT: `fieldRefElemName` falls through to
+            // `shapeFieldElemName(name, 4)`, whose `nameIsLitUnionArray` arm returns that
+            // very name, so the copy re-derived what its callee had already returned — which
+            // is exactly why `collectS`'s twin never needed it.
+            const vElemNm = fieldRecElemName(fnode.fdType, code)
             uFieldElemName.push(vElemNm)
             recordUFieldElemTyIx(vElemNm) // D5
             uFieldNames.push(fnode.fdName)
             // A value-union variant field interns its box reps (standalone-struct parity).
-            if code == 16 {
-              registerValueUnionName(fieldRefElemName(fnode.fdType))
-            }
+            if code == 16 { registerValueUnionName(vElemNm) }
             // Scalar-list variant fields force their list types (see the inline-shape twin).
             forceScalarListField(code)
             cnt = cnt + 1
@@ -3651,6 +3662,15 @@ function variantFieldCodesEq(a: i32, b: i32) {
 // `uTags[i]` is variant i's tag: the number of variants whose sig sorts strictly
 // before variant i's (sigs are distinct, so this is a dense 0..n-1 permutation).
 function assignTags() {
+  // A registration helper's `emitFail` -1 that a caller SWALLOWED (the map-atom and
+  // ref-array-atom `registerInlineUnion` recursions discard theirs) leaves the variant
+  // row tables HALF-WRITTEN: `collectShapeVariantFields` pushes `uFieldStart` before it
+  // can reject a field, so the rejected variant owns a start with no count. Ranking then
+  // reads `uFieldCount`/`uFieldNames` past their end and TRAPS THE COMPILER instead of
+  // reporting the recorded failure. A failed emit has nothing left to rank — bail on the
+  // flag, so the loud message reaches the user (`emitProgram`'s post-`emitModule` catch
+  // is too late; this pass runs first).
+  if emitFailed { return -1 }
   // The signatures, computed ONCE (the rank loop below reads each O(n) times, and a
   // variant-heavy union — the compiler's own `Node` — has dozens of them).
   const sigs: string[] = []
@@ -4287,6 +4307,19 @@ function collectTyMembersReach(
       }
       i = i + 1
     }
+  }
+  // A COLLECTION carrying the union (`{[string]: V} | null`, `V[] | null`): the
+  // caller's own registration of the outer name recurses by NAME into the value /
+  // element union (`registerInlineUnion`'s map-atom and ref-array-atom arms), so
+  // that union's variant rows are pushed from inside the caller's `registerInlineUnion`
+  // — with no arm-field pre-descent of its own. Descend through the collection so the
+  // arms' FIELD unions register first, exactly as a direct union member's do. The
+  // collection itself owns no registration, so this only re-orders, never adds.
+  if t is TyMap {
+    return collectTyMembersReach(stmts, t.mVal, depth - 1, underFunc)
+  }
+  if t is TyArray {
+    return collectTyMembersReach(stmts, t.aElem, depth - 1, underFunc)
   }
   0
 }
