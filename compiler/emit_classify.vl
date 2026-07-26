@@ -2529,6 +2529,45 @@ export function mvUnionIsScalarNull(slot: i32) {
   ak >= 0 && ak != 2 && ak != 6
 }
 
+// THE ONE HOME of the SCALAR-ELEMENT LIST classification: which of the five scalar
+// backings a list type-name rides, or `-1` for "not a scalar-element list".
+//
+//   0 = the i32-backed list — `i32[]`, `boolean[]`, a literal-union `K[]`, and the two
+//       niche forms `(boolean|null)[]` / `(K|null)[]` (all one `lTypeIdx` wrapper)
+//   1 = the string-backed list — `string[]` and `(string|null)[]` (`$mkListIdx`)
+//   2 = `f64[]`   ·   3 = `i64[]`   ·   4 = `f32[]`   (each its own wrapper heap)
+//
+// FIVE classifiers wrote this same five-predicate ladder out by hand — `mvValKindOfName`
+// (as a five-way `||` disjunction), `fieldCodeOfSpelling` (→ field codes 4/6/25/26/27),
+// `forceCloResultListTypes` (→ the `slUsed`/`fa64Used`/`ia64Used`/`fa32Used`/`lUsed` type
+// flags), and the two `$fnsig` ABI producers `annParamKind` / `annRetKind` (→ the
+// `list`/`strlist`/`f64list`/`i64list`/`f32list` tokens). Twenty-five calls, five places
+// that each had to re-decide that this enumeration is CLOSED and what its members are —
+// and five places a sixth scalar backing would have to be added to, in agreement.
+//
+// The five predicates are pairwise DISJOINT (`nameIsF64Array`/`nameIsI64Array`/
+// `nameIsF32Array` are whole-name equalities on `f64[]`/`i64[]`/`f32[]`; `nameIsI32Array`
+// and `nameIsStringArray` admit only the i32-backed and string-backed niches, and a
+// litunion element is all-quoted where `string`/`null` are not), so the ORDER of the arms
+// is not load-bearing and the copies' three different orders are one answer. Probe P1
+// measures that disjointness rather than asserting it.
+//
+// NOT folded in, each with the reason: `tyAnnRefListKind` and `nulScalarListKind` look
+// like this ladder but SPLIT what this one FOLDS — they answer `nameIsNulBoolList` /
+// `nameIsNulLitUnionList` / `nameIsNulStrList` as their own kinds, which arm 0/1 here
+// deliberately absorbs. `mvShapeOfValName`'s three arms and `rlElemStoredName`'s two are
+// PREFIXES of this ladder that never ask the remaining arms — routing them here would add
+// predicate calls the sites never used to pay (method note: a bank-first ladder in front
+// of a resolver that already cheap-rejects is a work regression).
+export function scalarListKindOfName(t: string): i32 {
+  if nameIsI32Array(t) { return 0 }
+  if nameIsStringArray(t) { return 1 }
+  if nameIsF64Array(t) { return 2 }
+  if nameIsI64Array(t) { return 3 }
+  if nameIsF32Array(t) { return 4 }
+  -1
+}
+
 // True if the BARE MAP spelling `mapName` has a value type the mv layer can lower —
 // `mvValKindOfName` of its VALUE, tested against the `-3` unsupported sentinel. FIVE
 // classifiers (the local / return / nullable-return / field / non-lowerable-field
@@ -2636,13 +2675,7 @@ export function mvValKindOfName(valName: string): i32 {
     // bottoming out in a list of maps (`{[string]: {[string]: {[string]: f32}[]}}`) — through
     // the same `ensureRefElem`/`mvShapeOfValName` mutual recursion the intern side uses.
     kind = 6
-  } else if (
-    nameIsI32Array(valName) ||
-    nameIsStringArray(valName) ||
-    nameIsF64Array(valName) ||
-    nameIsI64Array(valName) ||
-    nameIsF32Array(valName)
-  ) {
+  } else if scalarListKindOfName(valName) >= 0 {
     // A LIST-valued map (`{[string]: i32[]}` / `string[]` / `f64[]` / `i64[]` / `f32[]` /
     // `boolean[]`): the value is a list WRAPPER ref, stored in a ref list whose element kind
     // picks the inner list's wrapper (`refArrElemKind("<value>[]")` → 4/6/7/8/10). Same ref-value
@@ -9406,16 +9439,18 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
   }
   if nameIsString(t) { return 3 }
   if nameIsArray(t) {
-    if nameIsI32Array(t) { return 4 }
-    // A `string[]` field is a string-ref list (code `6`) — it reuses the map keys
-    // list types (`mkListIdx`/`mkArrIdx`). Any OTHER `X[]` is a struct/union ref list.
-    if nameIsStringArray(t) { return 6 }
-    // A SCALAR-element list field stores its scalar-list wrapper (code 25/26/27), NOT a ref-list
-    // wrapper (code 5 is for struct/union/closure elements only — returning 5 here emitted the wrong
-    // heap type, the invalid-wasm hole).
-    if nameIsF64Array(t) { return 25 }
-    if nameIsI64Array(t) { return 26 }
-    if nameIsF32Array(t) { return 27 }
+    // The scalar-element backings, in the ONE home's order (`scalarListKindOfName`). A
+    // `string[]` field is a string-ref list (code `6`) — it reuses the map keys list types
+    // (`mkListIdx`/`mkArrIdx`). A SCALAR-element list field stores its scalar-list wrapper
+    // (code 25/26/27), NOT a ref-list wrapper (code 5 is for struct/union/closure elements
+    // only — returning 5 here emitted the wrong heap type, the invalid-wasm hole). Any
+    // OTHER `X[]` is a struct/union ref list.
+    const sk = scalarListKindOfName(t)
+    if sk == 0 { return 4 }
+    if sk == 1 { return 6 }
+    if sk == 2 { return 25 }
+    if sk == 3 { return 26 }
+    if sk == 4 { return 27 }
     return 5
   }
   // A MAP-typed field (`children: {[string]: Tree}`) stores a non-null ref to
@@ -12038,16 +12073,21 @@ export function forceCloResultListTypes(nm: string) {
       const ret0 = annRetNameOf(a)
       if ret0 != "" {
         const res = nonNulBaseOf(monoUnwrapParens(ret0))
-        if nameIsStringArray(res) {
+        // The five scalar-element backings via the ONE home (`scalarListKindOfName`).
+        // This copy asked them in a THIRD order (string first, i32 last); the five
+        // predicates are pairwise disjoint, so the home's order is the same answer —
+        // probe P1 measures that rather than asserting it.
+        const sk = scalarListKindOfName(res)
+        if sk == 1 {
           slUsed = true
           aUsed = true
-        } else if nameIsF64Array(res) {
+        } else if sk == 2 {
           fa64Used = true
-        } else if nameIsI64Array(res) {
+        } else if sk == 3 {
           ia64Used = true
-        } else if nameIsF32Array(res) {
+        } else if sk == 4 {
           fa32Used = true
-        } else if nameIsI32Array(res) {
+        } else if sk == 0 {
           lUsed = true
           aUsed = true
         } else if nameIsRefArray(res) {
@@ -12413,11 +12453,36 @@ export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
   false
 }
 
-// Walk field path `path` from union arm `arm` (the `unionArmPathIsClosure` walk),
-// leafing at a MAP field (code 19). The first hop resolves through the arm's
-// struct-table OR variant-table row; every mid hop must be a code-15 nested-struct
-// field (following its target); the last hop is the map field.
-function unionArmPathIsMap(arm: string, path: string[]): boolean {
+// THE ONE HOME of the union-ARM FIELD-PATH walk: follow field path `path` from union arm
+// `arm` through the arm's own field table, and answer whether the LEAF field is of the
+// kind `want` names.
+//
+// The walk itself — resolve the arm through the struct table OR the variant table, take
+// the first hop from whichever holds it, require every MID hop to be a code-15
+// nested-struct field and follow its target, then test the LAST hop — was hand-written
+// FIVE times in this file, character for character, by `unionArmPathIsMap`,
+// `unionArmPathIsMapList`, `unionArmPathIsClosure`, `unionArmPathHasCloValue` and
+// `unionArmPathIsCloArray`. The five differed ONLY in the leaf test, which is one to five
+// lines out of twenty-seven; everything above it — the two-table first-hop dispatch, the
+// `-1` bail on an unresolvable arm, the code-15 mid-hop rule, and the `structIndexByName`
+// re-resolution of each nested target — was five copies of one rule, and the frame
+// pre-pass reservations that ride on it (`blockHasCallRef`, the mv map scratch) have to
+// agree about that rule or a narrowed read lands on an unreserved local.
+//
+// `want` names the leaf question, and putting the five side by side is the point — they
+// are a closed set of "what does this arm's field path bottom out in":
+//
+//   0 — a MAP field (code 19)
+//   1 — a LIST-OF-MAPS field (a code-5 reflist whose element name is a map)
+//   2 — a CLOSURE field (code 14, or the nullable-closure niche 22)
+//   3 — a closure VALUE: 2, or a union-BOX field (16) whose member set has a closure arm
+//   4 — a CLOSURE-ELEMENT array (a code-5 reflist whose element name is a function type)
+//
+// Arms 2 and 3 differ by exactly the code-16 line, and arms 1 and 4 by exactly which
+// question the code-5 element is asked — two facts that were invisible while the five
+// walks sat 200 lines apart.
+function unionArmPathLeafIs(arm: string, path: string[], want: i32): boolean {
+  // (code, elem) of the first hop, from whichever table holds the arm.
   let hop = 0
   let curSi = structIndexByName(arm)
   const vi0 = variantIndexOf(arm)
@@ -12436,12 +12501,27 @@ function unionArmPathIsMap(arm: string, path: string[]): boolean {
       code = sFieldTypeAt(curSi, fi)
       elem = sFieldElemNameAt(curSi, fi)
     }
-    if hop == path.length - 1 { return code == 19 }
+    if hop == path.length - 1 {
+      if want == 0 { return code == 19 }
+      if want == 1 { return code == 5 && nameIsMap(elem) }
+      if want == 2 { return code == 14 || code == 22 }
+      if want == 3 {
+        if code == 14 || code == 22 { return true }
+        if code == 16 { return unionHasClosureArm(elem) }
+        return false
+      }
+      return code == 5 && annArrowAt(peelGroupParens(elem)) >= 0
+    }
     if code != 15 { return false }
     curSi = structIndexByName(elem)
     hop = hop + 1
   }
   false
+}
+
+// Walk field path `path` from union arm `arm`, leafing at a MAP field (code 19).
+function unionArmPathIsMap(arm: string, path: string[]): boolean {
+  unionArmPathLeafIs(arm, path, 0)
 }
 
 // True if `exprIx` is an INDEX (`t0.f[0]`) whose receiver is a member chain rooted at an
@@ -12534,33 +12614,10 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
   false
 }
 
-// Walk field path `path` from union arm `arm` (the `unionArmPathIsMap` walk), leafing at
-// a LIST-OF-MAPS field: a code-5 reflist field whose element type-name is a map.
+// Walk field path `path` from union arm `arm`, leafing at a LIST-OF-MAPS field: a code-5
+// reflist field whose element type-name is a map.
 function unionArmPathIsMapList(arm: string, path: string[]): boolean {
-  let hop = 0
-  let curSi = structIndexByName(arm)
-  const vi0 = variantIndexOf(arm)
-  while hop < path.length {
-    let code = -1
-    let elem = ""
-    if hop == 0 && curSi < 0 && vi0 >= 0 {
-      const vfi = variantFieldIndex(vi0, path[0])
-      if vfi < 0 { return false }
-      code = variantFieldTypeAt(vi0, vfi)
-      elem = variantFieldElemName(vi0, vfi)
-    } else {
-      if curSi < 0 { return false }
-      const fi = sFieldIndex(curSi, path[hop])
-      if fi < 0 { return false }
-      code = sFieldTypeAt(curSi, fi)
-      elem = sFieldElemNameAt(curSi, fi)
-    }
-    if hop == path.length - 1 { return code == 5 && nameIsMap(elem) }
-    if code != 15 { return false }
-    curSi = structIndexByName(elem)
-    hop = hop + 1
-  }
-  false
+  unionArmPathLeafIs(arm, path, 1)
 }
 
 // True if the union member-set `name` has a CLOSURE-ARRAY arm (`(() => f64)[]`). `p[0]()` on
@@ -12826,37 +12883,10 @@ function identRebindUnionArmClosureField(
   false
 }
 
-// Walk field path `path` from union arm `arm` (the `unionArmPathIsClosure` walk), leafing
-// at a closure field (14/22) OR a union-BOX field (16) whose member set has a closure arm.
+// Walk field path `path` from union arm `arm`, leafing at a closure field (14/22) OR a
+// union-BOX field (16) whose member set has a closure arm.
 function unionArmPathHasCloValue(arm: string, path: string[]): boolean {
-  let hop = 0
-  let curSi = structIndexByName(arm)
-  const vi0 = variantIndexOf(arm)
-  while hop < path.length {
-    let code = -1
-    let elem = ""
-    if hop == 0 && curSi < 0 && vi0 >= 0 {
-      const vfi = variantFieldIndex(vi0, path[0])
-      if vfi < 0 { return false }
-      code = variantFieldTypeAt(vi0, vfi)
-      elem = variantFieldElemName(vi0, vfi)
-    } else {
-      if curSi < 0 { return false }
-      const fi = sFieldIndex(curSi, path[hop])
-      if fi < 0 { return false }
-      code = sFieldTypeAt(curSi, fi)
-      elem = sFieldElemNameAt(curSi, fi)
-    }
-    if hop == path.length - 1 {
-      if code == 14 || code == 22 { return true }
-      if code == 16 { return unionHasClosureArm(elem) }
-      return false
-    }
-    if code != 15 { return false }
-    curSi = structIndexByName(elem)
-    hop = hop + 1
-  }
-  false
+  unionArmPathLeafIs(arm, path, 3)
 }
 
 // True if `exprIx` is a member CHAIN (`t0.f.f`) rooted at an IDENT declared as a union,
@@ -12996,64 +13026,16 @@ export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
   false
 }
 
-// Walk field path `path` from union arm `arm` (the `unionArmPathIsClosure` walk), leafing
-// at a CLOSURE-ELEMENT ARRAY field: a code-5 reflist field whose element name is a function
-// type (`f: ((i32) => K0)[]`).
+// Walk field path `path` from union arm `arm`, leafing at a CLOSURE-ELEMENT ARRAY field: a
+// code-5 reflist field whose element name is a function type (`f: ((i32) => K0)[]`).
 function unionArmPathIsCloArray(arm: string, path: string[]): boolean {
-  let hop = 0
-  let curSi = structIndexByName(arm)
-  const vi0 = variantIndexOf(arm)
-  while hop < path.length {
-    let code = -1
-    let elem = ""
-    if hop == 0 && curSi < 0 && vi0 >= 0 {
-      const vfi = variantFieldIndex(vi0, path[0])
-      if vfi < 0 { return false }
-      code = variantFieldTypeAt(vi0, vfi)
-      elem = variantFieldElemName(vi0, vfi)
-    } else {
-      if curSi < 0 { return false }
-      const fi = sFieldIndex(curSi, path[hop])
-      if fi < 0 { return false }
-      code = sFieldTypeAt(curSi, fi)
-      elem = sFieldElemNameAt(curSi, fi)
-    }
-    if hop == path.length - 1 {
-      return code == 5 && annArrowAt(peelGroupParens(elem)) >= 0
-    }
-    if code != 15 { return false }
-    curSi = structIndexByName(elem)
-    hop = hop + 1
-  }
-  false
+  unionArmPathLeafIs(arm, path, 4)
 }
 
+// Walk field path `path` from union arm `arm`, leafing at a CLOSURE field (14, or the
+// nullable-closure niche 22).
 function unionArmPathIsClosure(arm: string, path: string[]): boolean {
-  // (code, elem) of the first hop, from whichever table holds the arm.
-  let hop = 0
-  let curSi = structIndexByName(arm)
-  const vi0 = variantIndexOf(arm)
-  while hop < path.length {
-    let code = -1
-    let elem = ""
-    if hop == 0 && curSi < 0 && vi0 >= 0 {
-      const vfi = variantFieldIndex(vi0, path[0])
-      if vfi < 0 { return false }
-      code = variantFieldTypeAt(vi0, vfi)
-      elem = variantFieldElemName(vi0, vfi)
-    } else {
-      if curSi < 0 { return false }
-      const fi = sFieldIndex(curSi, path[hop])
-      if fi < 0 { return false }
-      code = sFieldTypeAt(curSi, fi)
-      elem = sFieldElemNameAt(curSi, fi)
-    }
-    if hop == path.length - 1 { return code == 14 || code == 22 }
-    if code != 15 { return false }
-    curSi = structIndexByName(elem)
-    hop = hop + 1
-  }
-  false
+  unionArmPathLeafIs(arm, path, 2)
 }
 
 // The recorded member TYPES of a member-SET spelling, for the four ref-array ARM
@@ -18214,11 +18196,15 @@ function annParamKind(t: string) {
   if t == "f32" { return repSigTokOfKind("f32") }
   if isUName(t) { return repSigTokOfKind("union") }
   if nameIsString(t) { return repSigTokOfKind("str") }
-  if nameIsI32Array(t) { return repSigTokOfKind("list") }
-  if nameIsStringArray(t) { return repSigTokOfKind("strlist") }
-  if nameIsF64Array(t) { return repSigTokOfKind("f64list") }
-  if nameIsI64Array(t) { return repSigTokOfKind("i64list") }
-  if nameIsF32Array(t) { return repSigTokOfKind("f32list") }
+  // The five scalar-element list backings, via the ONE home (`scalarListKindOfName`) —
+  // the SAME enumeration, in the same order, `annRetKind` reads for its `>`-prefixed
+  // result token, so the two `$fnsig` producers cannot drift on what a scalar list is.
+  const sk = scalarListKindOfName(t)
+  if sk == 0 { return repSigTokOfKind("list") }
+  if sk == 1 { return repSigTokOfKind("strlist") }
+  if sk == 2 { return repSigTokOfKind("f64list") }
+  if sk == 3 { return repSigTokOfKind("i64list") }
+  if sk == 4 { return repSigTokOfKind("f32list") }
   const si = structIndexByName(t)
   if si >= 0 { return repSigSlotTokOfKind("struct", si) }
   // A concrete-variant name (`Cat`), keyed by the variant index (matches `cloParamTok`).
@@ -18272,11 +18258,12 @@ function annRetKind(t: string) {
   // `(boolean | null)[]` and a litunion `K[]` — all sharing the i32-list "a" backing that
   // `cloRetValKind` → `vtKindOfType` reports as "list" — key the SAME `>a` the concrete
   // lambda interns; the param dual (`annParamKind`) already keys these via `nameIsI32Array`.
-  if nameIsI32Array(t) { return ">" + repSigTokOfKind("list") }
-  if nameIsStringArray(t) { return ">" + repSigTokOfKind("strlist") }
-  if nameIsF64Array(t) { return ">" + repSigTokOfKind("f64list") }
-  if nameIsI64Array(t) { return ">" + repSigTokOfKind("i64list") }
-  if nameIsF32Array(t) { return ">" + repSigTokOfKind("f32list") }
+  const sk = scalarListKindOfName(t)
+  if sk == 0 { return ">" + repSigTokOfKind("list") }
+  if sk == 1 { return ">" + repSigTokOfKind("strlist") }
+  if sk == 2 { return ">" + repSigTokOfKind("f64list") }
+  if sk == 3 { return ">" + repSigTokOfKind("i64list") }
+  if sk == 4 { return ">" + repSigTokOfKind("f32list") }
   // A REF-LIST return — `S[]` / `((i32) => i32)[]` / a union list, matching
   // `cloRetKeySuffix`. BEFORE the closure case so a closure-ELEMENT array's nested `=>` is not
   // misread as a single-closure result. The slot resolves via the element name — the SAME
