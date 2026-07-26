@@ -19537,7 +19537,7 @@ Master baseline **rebuilt at the gating head in this session** and the branch se
 | corpus A/B, **1,374 files**, three channels (`vl check` rc+TEXT, `vl build` BYTES, `vl run` rc+stdout) | **7 differ, EVERY ONE NAMED**: the 6 new pins (`CHECKSTATUS(0/1) BUILDSTATUS(0/1)`, and `error-redefine-intrinsic.vl` also `RUNSTATUS(0/1)` — it printed `0` on master) + `types/unknown-type-in-map-value.vl` (`CHECKTEXT`). **1,367 pre-existing files identical on all three channels**, #1166's three new memory-intrinsic cases among them. |
 | **shared-instance** `vl check tests/cases` | 231 → 238 errors, 123 warnings unchanged; the diff names **exactly those 7 files** |
 | **shared-instance** probe host (`compileSrc`, ONE `WebAssembly.Instance`, 1,346 cases) | **1,346 compiled / 0 threw on BOTH sides** |
-| fuzz A/B, **76,800 programs/side** (4 seeds × default/`--values`/`--branching`/`--declared`) | **0 differing paths**; 78,441 outputs and 1,641 `.err` per side, **13,501 distinct `.out` contents** (the non-vacuity assertion) |
+| fuzz A/B, **76,800 programs/side** (4 seeds × default/`--values`/`--branching`/`--declared`, regenerated at `b89aa99`) | **0 differing paths**; 78,439 outputs and 1,639 `.err` per side, **13,501 distinct `.out` contents** (the non-vacuity assertion) |
 | `rep-fuzz-check.sh` | RC=0, `exact ✅` (1 baselined reject, 0 unsound, 0 new, 0 stale) |
 | lint-tier A/B, 89 files (all of `tests/cases/lint` + 60 more) | identical, 117 lines each side. **Reported with its own weakness stated**: the lint assembly is lexer+ast+parser+lint+harness and contains NEITHER of this slice's files, so what it actually tests is whether the two SEEDS compile that assembly to the same behaviour — a real channel, but not a test of the diff |
 
