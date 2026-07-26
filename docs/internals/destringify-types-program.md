@@ -6040,7 +6040,7 @@ regression — the fix moves the failure, it does not create it.
 The bisect that narrows it: the same two functions beside ONE, TWO, … FIVE of those union
 DECLARATIONS all compile and run on this build (and all fail on master). So it is not the count
 of `{v:i32}` variant rows in `uVariants`, nor any single member kind — it is the composition
-## D-FIELDCODE — the FIELD-CLASSIFICATION tables get ONE home (#PRNUM)
+with the CONSTRUCTED-and-narrowed globals. That is where to start.
 
 ## D-FIELDCODE — the FIELD-CLASSIFICATION tables get ONE home (#1123)
 
