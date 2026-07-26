@@ -84,6 +84,7 @@ import {
 } from "./ast"
 import {
   annArrowAt,
+  annRetNameOf,
   cloArrElemNameOf,
   gaeLtAt,
   isStructAtom,
@@ -106,6 +107,7 @@ import {
   nameIsStringArray,
   nameNamesFunction,
   nodeIsTypeDecl,
+  normTypeAtom,
   nulLitUnionInnerName,
   nullablePartOf,
   parenUnionArrElemName,
@@ -502,35 +504,6 @@ export function collectFns(stmts: i32[]) {
   fnStmts.length
 }
 
-// Trim ASCII whitespace and peel ONE fully-wrapping `(...)` pair from a type name — the
-// form a closure RESULT arrives in (`((i32) => f32)` groups the arrow one paren-depth
-// down). Shares the exact normalization `unionArmSigKey` applies before keying, so the
-// peeled string re-enters the result walk (`internCloResultChain`) as a bare `(p)=>r`.
-function peelWrapType(arm: string) {
-  let lo = 0
-  let hi = arm.length
-  while lo < hi && (arm[lo] == ' ' || arm[lo] == '\t') { lo = lo + 1 }
-  while hi > lo && (arm[hi - 1] == ' ' || arm[hi - 1] == '\t') { hi = hi - 1 }
-  let t = arm.slice(lo, hi)
-  if t.length >= 2 && t[0] == '(' {
-    let depth = 0
-    let ci = 0
-    let wraps = true
-    while ci < t.length {
-      const cch = t[ci]
-      if cch == '(' {
-        depth = depth + 1
-      } else if cch == ')' {
-        depth = depth - 1
-        if depth == 0 && ci < t.length - 1 { wraps = false }
-      }
-      ci = ci + 1
-    }
-    if wraps { t = t.slice(1, t.length - 1) }
-  }
-  t
-}
-
 // True if function-result type NAME `r` ROUND-TRIPS through the nested-closure value-call
 // ABI — i.e. a value call on a closure returning `r` recovers it correctly. Only a plain
 // numeric/boolean SCALAR does: it is the closure `call_ref`'s literal result valtype, read
@@ -578,13 +551,15 @@ function internCloResultChain(tn: string) { internCloResultSpine(tn, false) }
 // difference is load-bearing rather than incidental — sabotage S4 measures it.
 function internCloResultSpine(tn: string, wideShape: boolean) {
   if tn == "" { return 0 }
-  let cur = peelWrapType(tn)
+  let cur = normTypeAtom(tn)
   let guard = 0
   while guard < 64 {
     guard = guard + 1
-    const a = annArrowAt(cur)
-    if a < 0 { return 0 }
-    const ret = peelWrapType(cur.slice(a + 2, cur.length))
+    // `annRetNameOf` IS the `annArrowAt`-then-slice this loop spelled out; "" is its
+    // "no top-level arrow" answer, the spine's terminator.
+    const rawRet = annRetNameOf(cur)
+    if rawRet == "" { return 0 }
+    const ret = normTypeAtom(rawRet)
     const retIsClosure = annArrowAt(ret) >= 0
     let takes = retIsClosure || cloResultIsPlainScalar(ret)
     // Evaluated ONLY when the two cheap disjuncts declined — the short-circuit the two
@@ -816,7 +791,13 @@ export function collectCloSigs() {
     if nn is TypeRef {
       const nm = nn.tyName
       if (nameIsNulClosure(nm)) {
-        const nk = unionArmSigKey(nullablePartOf(nm))
+        // The nulclosure's INNER function type, classified ONCE. Three sites in this
+        // block asked `nullablePartOf(nm)` for the SAME answer; `nullablePartOf` is a
+        // pure scan of `nm` and nothing between them writes `nm`, so the hoist is total
+        // by construction (unlike D-RAKIND's, which straddled an intern and had to be
+        // probed).
+        const nInner = nullablePartOf(nm)
+        const nk = unionArmSigKey(nInner)
         if nk != "" {
           // A MIXED scalar+composite UNION result that is UNREGISTERED
           // (`(() => K0 | {w: i32} | f64 | null) | null` — no named-fn annotation
@@ -827,7 +808,7 @@ export function collectCloSigs() {
           // the key stays un-interned and the call REJECTS loudly. A registered union
           // keeps the synth, and a concrete producer's own `$fnsig` interns the same
           // key via its `fnStmts` loop entry regardless.
-          if !nulCloMixedUnionUnregistered(nullablePartOf(nm)) {
+          if !nulCloMixedUnionUnregistered(nInner) {
             if cloSigPosOfKey(nk) < 0 {
               cloSigKeys.push(nk)
               cloSigRepFn.push(-1)
@@ -840,7 +821,7 @@ export function collectCloSigs() {
         // value call on the narrowed result (`t0()(1)`, `t0(1)()`) finds no interned sig for
         // the inner closure. Walk the annotation's result spine and synthesize each nested
         // result closure's `$fnsig` too.
-        internNulCloResultSpine(nullablePartOf(nm))
+        internNulCloResultSpine(nInner)
       }
       // A CLOSURE-ELEMENT array annotation — plain (`((i32) => R)[]`) or nullable-element
       // (`(((i32) => R) | null)[]`, the kind-5 niche) — whose value may carry NO concrete
@@ -893,6 +874,23 @@ export function collectCloSigs() {
   0
 }
 
+// THE ONE HOME of the D-UNION set-ADT read WITH its cardinality gate: fill `out` with
+// `name`'s union members, preferring the recorded member column (`msMemberAtomsOf`) and
+// falling back to a split ONLY when the name is a multi-member union
+// (`unionMemberCount > 1` — the counting dual of the splitter, so the pair is one
+// predicate). A single-member name leaves `out` EMPTY, which is what both consumers'
+// `length > 1` tests want.
+//
+// `shapeHasCloField` and `collectFnValUse` carried this five-line pair verbatim. The
+// unguarded form (`if !msMemberAtomsOf(x, o) { splitUnionAtoms(x, o) }`) that
+// `emit_classify.vl` uses 15 times is a DIFFERENT reading — it wants the one-element
+// list for a non-union name — so it is deliberately not folded in here.
+function unionMemberAtomsIfMulti(name: string, out: string[]) {
+  if msMemberAtomsOf(name, out) { return 0 }
+  if unionMemberCount(name) > 1 { splitUnionAtoms(name, out) }
+  0
+}
+
 // True if the single-shape text `nm` has a closure (code 14) or nullable-closure
 // (code 22) FIELD — the `collectFnValUse` gate for a shape annotation whose field
 // cell is a closure fat-pointer. Same depth-0 field split the `shapeHasCloField` gate uses.
@@ -918,9 +916,7 @@ function shapeHasCloField(nm: string) {
       // `splitUnionAtoms`, so the two gates are the same predicate). An
       // un-interned field spelling keeps the count-then-split pair.
       const shcAtoms: string[] = []
-      if !msMemberAtomsOf(ftxt, shcAtoms) {
-        if unionMemberCount(ftxt) > 1 { splitUnionAtoms(ftxt, shcAtoms) }
-      }
+      unionMemberAtomsIfMulti(ftxt, shcAtoms)
       if shcAtoms.length > 1 {
         let shc = 0
         while shc < shcAtoms.length {
@@ -2828,17 +2824,21 @@ export function collectA(_stmts: i32[]) {
         }
       }
     } else if nd is TypeRef {
-      if annArrowAt(nd.tyName) >= 0 {
-        // A TOP-LEVEL function-type annotation (`(i32) => R`): the function-type name
-        // itself needs no array/list type, but its RETURN `R` may (an `i32[]`/`string[]`/
-        // `f64[]` result list, or a `string`). Force the return's backing types so the
-        // closure `$fnsig` result valtype resolves even when the only `i32[]` in the
-        // module rides this annotation. The arrow is TOP-LEVEL, so `((i32) => i32)[]` (a
-        // NESTED arrow — an array OF functions) is NOT caught here; it falls through to
-        // the array branches below. Checked FIRST so the trailing `[]` of a list-returning
-        // function type (`(i32) => i32[]`) is never mis-read as an array name.
-        const fra = annArrowAt(nd.tyName)
-        const frRet = nd.tyName.slice(fra + 2, nd.tyName.length)
+      // A TOP-LEVEL function-type annotation (`(i32) => R`): the function-type name
+      // itself needs no array/list type, but its RETURN `R` may (an `i32[]`/`string[]`/
+      // `f64[]` result list, or a `string`). Force the return's backing types so the
+      // closure `$fnsig` result valtype resolves even when the only `i32[]` in the
+      // module rides this annotation. The arrow is TOP-LEVEL, so `((i32) => i32)[]` (a
+      // NESTED arrow — an array OF functions) is NOT caught here; it falls through to
+      // the array branches below. Checked FIRST so the trailing `[]` of a list-returning
+      // function type (`(i32) => i32[]`) is never mis-read as an array name.
+      //
+      // Master asked `annArrowAt(nd.tyName)` TWICE for this one answer — once as the
+      // branch GATE and once to slice the return out. `annRetNameOf` is that pair, and
+      // its "" is the gate: a name with a top-level arrow always has a return spelling
+      // after it.
+      const frRet = annRetNameOf(nd.tyName)
+      if frRet != "" {
         if frRet == "i32[]" {
           lUsed = true
           aUsed = true
@@ -2887,7 +2887,13 @@ export function collectA(_stmts: i32[]) {
         // still emits the element's ref-list type.
         let ran = nd.tyName
         const ranp = nullablePartOf(ran)
-        if ranp != "" && nameIsRefArray(ranp) { ran = ranp }
+        // "Is this the NULLABLE ref-list spelling" — asked ONCE. Master spelled the
+        // identical `ranp != "" && nameIsRefArray(ranp)` conjunction out twice, once to
+        // peel `ran` and once (twenty lines down) to set the banked row's null flag; the
+        // second read is by construction the same answer, since `ranp` is never rewritten
+        // and `nameIsRefArray` is not called across an intern here.
+        const ranIsNul = ranp != "" && nameIsRefArray(ranp)
+        if ranIsNul { ran = ranp }
         // The element KIND, classified ONCE. Master asked `refArrElemKind(ran)` SEVEN
         // times in this arm for one answer, straddling the `ensureRefElem` intern — the
         // only call between them that mutates any table the classifier reads. Measured
@@ -2896,17 +2902,23 @@ export function collectA(_stmts: i32[]) {
         // comparator is sane (inverting the hoist reddens it on the first reaching file).
         // `ran` is final here — the `| null` peel two lines up is its last write.
         const raKind = refArrElemKind(ran)
+        // The element NAME, resolved ONCE for the same reason the kind is: master asked
+        // `refArrElemName(ran)` in the kind-2 reject AND again in the `recordAnnRlSlot`
+        // bank below, and the bank's call is UNCONDITIONAL — so hoisting it here strictly
+        // REMOVES work (one resolution instead of two on every kind-2 element) rather
+        // than adding a speculative one.
+        const ren = refArrElemName(ran)
         // A kind-2 (union-box) element that is a NICHE nullable (`(boolean | null)[]`,
         // `(string | null)[]` — one non-null member + null, deliberately NOT a value
         // union) has no list rep: the box lowering would emit the element's raw value
         // (invalid wasm). Reject cleanly. A value-union element (`(i32 | null)[]`,
         // `(f64 | null)[]`) and a struct/heterogeneous element union box as usual.
         if raKind == 2 {
-          const ren = refArrElemName(ran)
-          if !isValueUnionName(ren) && nullablePartOf(ren) != "" {
+          const renNul = nullablePartOf(ren)
+          if !isValueUnionName(ren) && renNul != "" {
             return emitFail(
               "emitProgram: a nullable-" +
-                nullablePartOf(ren) +
+                renNul +
                 " list element has no rep; use a non-null element type",
             )
           }
@@ -2919,8 +2931,8 @@ export function collectA(_stmts: i32[]) {
         // row recorded here is the answer each of them needs — read back through
         // `annRefArrSlot` without re-deriving it from the rendering.
         let ranNul = 0
-        if ranp != "" && nameIsRefArray(ranp) { ranNul = 1 }
-        recordAnnRlSlot(i, ensureRefElem(refArrElemName(ran)), ranNul)
+        if ranIsNul { ranNul = 1 }
+        recordAnnRlSlot(i, ensureRefElem(ren), ranNul)
         // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
         // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
         if raKind == 4 {
@@ -3734,6 +3746,23 @@ function nameIsSingleShape(name: string) {
   true
 }
 
+// THE ONE HOME of "a bare MAP's VALUE union needs registering too". `registerInlineUnion`
+// reaches a map from FOUR positions — a map ATOM of a multi-member union, a NULLABLE map,
+// a nul-closure RESULT map, and the bare top-level map — and each spelled out the same
+// `mapValNameOf` + non-empty test + recursion. The four are the same rule ("the map itself
+// needs no registration, its VALUE does"), and the four bug reports in their comments are
+// four discoveries of that ONE rule at four positions.
+//
+// Returns `-2` when the map has NO value name (the "did not fire" answer, which `0` cannot
+// carry — `registerInlineUnion` already uses `0` for success), else `registerInlineUnion`'s
+// own `0` / `-1`. The three callers that RETURN on a fire test `!= -2`; the fourth (the
+// atom loop) ignores the result exactly as it did.
+function registerMapValUnion(stmts: i32[], mapName: string) {
+  const mv = mapValNameOf(mapName)
+  if mv == "" { return -2 }
+  registerInlineUnion(stmts, mv)
+}
+
 // Register the inline union synthetic name `name` (e.g. `"A|B"`) as a union alias in
 // the per-union tables, exactly as `collectU` registers a `UnionDecl`: record the
 // name + its variant-slice range, append each member to the GLOBAL `uVariants` list,
@@ -3807,10 +3836,7 @@ function registerInlineUnion(stmts: i32[], name: string) {
       // plain leg, seed 75710791 case_00323). The map-value sibling of the
       // ref-array atom recursion above; `nameIsMapMemberUnion` keeps a map-FIRST
       // union name from being mis-read as a bare map.
-      if aa != "null" && nameIsBareMap(aa) {
-        const amv = mapValNameOf(aa)
-        if amv != "" { registerInlineUnion(stmts, amv) }
-      }
+      if aa != "null" && nameIsBareMap(aa) { registerMapValUnion(stmts, aa) }
       ak = ak + 1
     }
   }
@@ -3851,8 +3877,8 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // keeps `isVariantBoxUnion`'s LOUD fail. The nullable twin of the bare-map value
   // recursion below.
   if rnp != "" && nameIsBareMap(rnp) {
-    const nmv = mapValNameOf(rnp)
-    if nmv != "" { return registerInlineUnion(stmts, nmv) }
+    const nmr = registerMapValUnion(stmts, rnp)
+    if nmr != -2 { return nmr }
   }
   // A NULLABLE closure (`(() => i32 | boolean) | null`, kind 19): the `| null` niche is
   // owned by the nulclosure machinery, but the INNER closure's VALUE-union RESULT still
@@ -3866,10 +3892,8 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // registering it would satisfy the CASE-A floor while the box read mis-lowers
   // (verified REJECT→INVALID-WASM).
   if rnp != "" && nameIsNulClosure(name) {
-    const ncBare = peelGroupParens(rnp)
-    const ncA = annArrowAt(ncBare)
-    if ncA >= 1 {
-      const ncRes = monoUnwrapParens(ncBare.slice(ncA + 2, ncBare.length))
+    const ncRes = monoUnwrapParens(annRetNameOf(peelGroupParens(rnp)))
+    if ncRes != "" {
       if isValueUnionName(ncRes) || nameIsMapMemberUnion(ncRes) {
         return registerInlineUnion(stmts, ncRes)
       }
@@ -3890,8 +3914,8 @@ function registerInlineUnion(stmts: i32[], name: string) {
       // leg, seed 499060527 case_00095). The nul-closure sibling of the bare-map
       // value recursion below and the #991 map-atom walk.
       if nameIsBareMap(ncRes) {
-        const ncMv = mapValNameOf(ncRes)
-        if ncMv != "" { return registerInlineUnion(stmts, ncMv) }
+        const ncMr = registerMapValUnion(stmts, ncRes)
+        if ncMr != -2 { return ncMr }
       }
       // An ARRAY result whose ELEMENT is a value-union (`(() => ({[string]: string} |
       // f64)[]) | null`): the ref array itself needs no registration, but its element
@@ -3931,19 +3955,16 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // MEMBER union (`{[string]: i32} | boolean`, which also matches `nameIsMap` — it starts `{[`) is
   // NOT mis-parsed as a map value but instead falls through to the `isVariantBoxUnion` box path.
   if nameIsMap(name) && matoms.length < 2 {
-    const mvn = mapValNameOf(name)
-    if mvn != "" { return registerInlineUnion(stmts, mvn) }
+    const mvr = registerMapValUnion(stmts, name)
+    if mvr != -2 { return mvr }
   }
   // A function-type annotation (`(i32) => C | S`) carries an inline union in its RETURN (a closure
   // value whose result is a union). Register that return union so a value call's result narrows —
   // the function type itself is not a union. Mirrors the array/map element recursion above.
   if name.length > 0 && name[0] == '(' {
-    const fra = annArrowAt(name)
-    if fra >= 1 {
-      return registerInlineUnion(
-        stmts,
-        monoUnwrapParens(name.slice(fra + 2, name.length)),
-      )
+    const fnRes = annRetNameOf(name)
+    if fnRes != "" {
+      return registerInlineUnion(stmts, monoUnwrapParens(fnRes))
     }
   }
   // An inline STRUCT-SHAPE annotation (`{f: A | B}`, `{a: C | i32, b: {g: D | E}}`) carries its
@@ -4996,11 +5017,7 @@ export function collectFnValUse() {
       // that list's length (the counting dual identity, see `shapeHasCloField`).
       const fvAtoms: string[] = []
       const fvIsShape = nameIsSingleShape(fvSb)
-      if !fvIsShape {
-        if !msMemberAtomsOf(fvSb, fvAtoms) {
-          if unionMemberCount(fvSb) > 1 { splitUnionAtoms(fvSb, fvAtoms) }
-        }
-      }
+      if !fvIsShape { unionMemberAtomsIfMulti(fvSb, fvAtoms) }
       if fvIsShape {
         if shapeHasCloField(fvSb) { fnValUsed = true }
       } else if fvAtoms.length > 1 {
@@ -5117,10 +5134,8 @@ export function collectMapFilterUse() {
 // `>u` `$fnsig` must NOT be interned for it (see `collectCloSigs`' TypeRef pass) — the
 // call site then rejects loudly instead of cast-trapping at runtime.
 function nulCloMixedUnionUnregistered(arm: string) {
-  const bare = peelGroupParens(arm)
-  const aAt = annArrowAt(bare)
-  if aAt < 1 { return false }
-  const res = monoUnwrapParens(bare.slice(aAt + 2, bare.length))
+  const res = monoUnwrapParens(annRetNameOf(peelGroupParens(arm)))
+  if res == "" { return false }
   const atoms: string[] = []
   splitUnionAtoms(res, atoms)
   if atoms.length < 2 { return false }
