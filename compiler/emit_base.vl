@@ -7,11 +7,13 @@ import {
   T,
   TyArray,
   TyFunc,
+  TyMap,
   TyNullable,
   inferRetNameOf,
   isValueUnionName,
   nameIsFuncTypeAtom,
   nameIsLitUnionType,
+  nameIsMemLoadIntrinsic,
   nodeTyArrayElemRepName,
   nodeTyIsClosureArray,
   nodeTyIsFunc,
@@ -134,13 +136,36 @@ export function capHas(caps: string[], name: string) {
   }
   false
 }
-// Record a free-variable reference to `name`: a capture unless it is bound locally,
-// a module global, or a top-level/lifted function name (addressable directly).
-// A compiler BUILTIN function name (`print`, `toString`, `Map`, …): a call target the
-// emitter lowers directly, NOT a value — so it is never a captured variable. Excluded in
-// `capRecord` alongside user functions, else a closure whose body calls a builtin (e.g.
-// `function f() { print(1) }` used as a value) spuriously "captures" the builtin name and
-// fails `captured variable not found`.
+// True if `name` is a call target the emitter LOWERS INLINE — a builtin (`print`,
+// `toString`, `Map`, …) or a dunder intrinsic. Such a name in CALLEE POSITION denotes
+// instructions, not a value, so it is not a captured variable: a closure whose body calls
+// one (`function f() { print(1) }` used as a value) must not "capture" the name and fail
+// `captured variable not found`.
+//
+// D-CAPCALLEE: this is consulted at exactly ONE place, `capScan`'s `Call` arm, and only
+// for the CALLEE. It used to be consulted in `capRecord`, i.e. at every identifier in
+// every position — which suppressed genuine captures of a LOCAL that merely shares one of
+// these names. `const toString = 5` + `() => toString + 1` failed with
+// `identifier is not a parameter, local, or global` on master; a name is only a call
+// target where it is being CALLED.
+//
+// THE MEMORY INTRINSICS ARE THE OTHER HALF. All ten (`__store_i32__`, `__load_i32__`, the
+// seven load widths, `__memory_size__`/`__memory_grow__`) were missing here, so every one
+// of them failed inside a lambda body, and inside a named function in any module that uses
+// a function value — uniform 10/10, censused. Since every `Buffer` method is a named
+// function wrapping an intrinsic, that made `std:buffer` unwritable
+// (`docs/internals/buffer-design.md` §B3/O7, slice S1).
+//
+// ⚠ THIS SET IS A PARTIAL COPY OF `typecheck.nameIsEmitterIntrinsic`, WHICH IS PRIVATE.
+// That function is the authoritative "the emitter dispatches this name at the call site
+// before looking up a declaration" list, and its own header says the lists "must be kept
+// in step — a new inline-lowered intrinsic belongs here the same day". The seven load
+// widths come from it directly (`nameIsMemLoadIntrinsic`, which IS exported, for exactly
+// this reason); the other four dunder names below cannot, only because the enclosing
+// predicate is not exported. **The one-word fix is `export function
+// nameIsEmitterIntrinsic` in `typecheck.vl`**, after which the whole dunder block here
+// collapses to a single delegation — filed as a hand-off rather than taken, because
+// `typecheck.vl` is another partition's file.
 export function isBuiltinFnName(name: string) {
   if name == "print" { return true }
   if name == "toString" { return true }
@@ -153,6 +178,12 @@ export function isBuiltinFnName(name: string) {
   if name == "__array_copy__" { return true }
   if name == "__log__" { return true }
   if name == "__trap__" { return true }
+  // The LINEAR-MEMORY intrinsics — the same shape as `__log__`/`__trap__` above.
+  if nameIsMemLoadIntrinsic(name) { return true }
+  if name == "__store_i32__" { return true }
+  if name == "__load_i32__" { return true }
+  if name == "__memory_size__" { return true }
+  if name == "__memory_grow__" { return true }
   false
 }
 // A single-entry cache for `parentLetOf`: the block whose name->LetDecl map is built, and the
@@ -1394,10 +1425,30 @@ export function mapArmValueBoxable(_mapAtom: string) { true }
 // reading holding at 21 of them. This is that reading, named once.
 //
 // It is also the shape the ARENA answers directly: `ty is TyMap` is true for a bare map
-// and false for a `TyUnion` with a map arm, so when the annotation-node consumers get a
-// covered `nodeTyIx` the migration is an edit to THIS function, not to every pair.
+// and false for a `TyUnion` with a map arm — that is `typecheck.nodeTyIsMap`, and
+// D-BAREMAP moved every ANNOTATION-NODE consumer onto it (`retMapFlag`,
+// `retIsMapLocalAnnot`, `letIsMap`, `letMapShapeOf`, `paramMap`). What is left here is
+// the calls that hold a STRING and no node — an atom peeled out of a union, a slice of
+// a bigger spelling, `nameIsMapArray`'s element — where there is no type to ask.
 export function nameIsBareMap(name: string) {
   nameIsMap(name) && !nameIsMapMemberUnion(name)
+}
+// True if the type-ANNOTATION node at `tyIx` is a NULLABLE bare map (`{[string]: V} | null`) —
+// the ARENA dual of `nulMapInnerName(<the node's rendering>) != ""`, and the nullable twin of
+// `nodeTyIsMap`. A `TyNullable` over a `TyMap`: the `| null` peel and the bare-map test the
+// name pair spells as two scans are ONE walk down two variant tags, with no union split and
+// no substring. (`typecheck.vl` carries `nodeTyIsNullableStruct`, the same shape over `TyObj`;
+// the map sibling lives here because this is where its only consumers are.)
+export function tyIsNulBareMap(tyIx: i32) {
+  const ty = nodeTyIxOf(tyIx)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if t.nInner < 0 { return false }
+    const it = T.tys[t.nInner]
+    return it is TyMap
+  }
+  false
 }
 // True if the array type-name `name` is a string-keyed-MAP list `{[string]:i32}[]` —
 // a ref list whose ELEMENT is the map struct (`mStructIdx`). It is a `nameIsMap` name

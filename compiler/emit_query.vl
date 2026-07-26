@@ -3,7 +3,7 @@
 // arr-new scans (`if*`/`block*`/`expr*`/`nli*`). State-free; depends only on
 // `emit_base` + the lower modules. Carved out of `wasmEmit.vl`.
 
-import { valueAtomKind } from "./typecheck"
+import { nodeTyIsMap, valueAtomKind } from "./typecheck"
 import {
   ArrayLit,
   AsExpr,
@@ -38,7 +38,6 @@ import {
 import { numLexFitsI32 } from "./emit_bignum"
 import {
   isConstInit,
-  nameIsBareMap,
   nulCloFlag,
   numTextIsFloat,
   pushUniqueAtom,
@@ -849,30 +848,23 @@ export function paramI64Array(fnIx: i32, name: string) {
   retI64ArrFlag(paramTypeNode(fnIx, name)) == 1
 }
 // True if the parameter `name` of function `fnIx` is a map type.
+//
+// A UNION param whose FIRST atom is a map (`{[string]: V} | X`) has a NAME that starts with
+// `{[`, so the old `nameIsMap` probe matched the whole union spelling and every consumer had to
+// subtract the false positive with a second scan (a top-level union split). It is a union BOX
+// param, not a bare map — the map arm boxes into the union, and an un-annotated copy of the
+// param (`const t0 = p`) must ride the box so the map arm reads through the `is`-narrowing.
+//
+// The ARENA never had the false positive to subtract: a bare map is a `TyMap`, a map-member
+// union is a `TyUnion`. `nodeTyIsMap` IS that test, already exported and already in production
+// for EXPRESSION nodes. D-PARAMARR left this predicate rendering its node
+// (`nameIsBareMap(tyNameOf(…))`) because the coverage was unmeasured; D-BAREMAP measured it —
+// 48,781 of 48,781 calls that HAVE a parameter annotation node are arena-covered, 0
+// disagreements over 354,137 twin invocations, 0 uncovered-live. So the render and both name
+// scans go, not just one of them. (The remaining 305,356 reaches are `paramTypeNode` = -1 — the
+// ident is not a parameter of this function — where the name leg read `nameIsBareMap("")`.)
 export function paramMap(fnIx: i32, name: string) {
-  // A UNION param whose FIRST atom is a map (`{[string]: V} | X`) has a name that STARTS
-  // with `{[`, so `nameIsMap` matches the whole union name — but it is a union BOX param, NOT
-  // a bare map (the map arm boxes into the union). Guard so an un-annotated copy of the param
-  // (`const t0 = p`) rides the union box and the map arm reads through the `is`-narrowing,
-  // rather than mis-typing the local as a bare (mono) map struct. The param twin of the
-  // let/return/field `nameIsMapMemberUnion` guards. The grammar itself is
-  // `emit_base`'s `nameIsBareMap` (#1139) — this was its SIXTEENTH hand-written copy and
-  // the last one outside the home's own module.
-  //
-  // D-PARAMARR DELIBERATELY LEFT THIS ONE RENDERING, and the reason is a hop into the
-  // callee rather than a guess. The obvious dual is `emit_classify.retMapFlag`, the
-  // `vtKindOfType` arm that answers "is this annotation node a bare map" — but
-  // `retMapFlag` is NOT arena-first: its body is `nameIsBareMap(ty.tyName)` over the same
-  // rendered name, plus a `mapValKindLowerable` gate this predicate does not have. So
-  // switching to it would be a lateral move that also silently narrows the answer. The
-  // real dual is a `TyMap` test on `nodeTyIxOf`, which `nameIsBareMap`'s own header at
-  // `emit_base` already sketches ("`ty is TyMap` is true for a bare map and false for a
-  // `TyUnion` with a map arm ... the migration is an edit to THIS function"), gated on
-  // annotation-node coverage. That coverage is now MEASURED and total — 18,577 of 18,577
-  // parameter annotation nodes carry a `nodeTyIx` over corpus + fuzz — so the blocker that
-  // header names is discharged; what remains is the 21 CALL SITES of `nameIsBareMap`,
-  // which is a slice of its own, not a line in this one.
-  nameIsBareMap(tyNameOf(paramTypeNode(fnIx, name)))
+  nodeTyIsMap(paramTypeNode(fnIx, name))
 }
 // True if the `LetDecl` at `letIx` binds a SET — its initializer is the `Set()`
 // constructor. Set-ness is an emitter-side flavor bit over the shared map rep: a
