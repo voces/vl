@@ -18329,3 +18329,343 @@ way in and out, and `git status` is clean afterwards.
      function-scope control failing on BOTH sides — so it cannot go to `ok`, and folding it into
      "17 fixed" would have been the same error as the six two-variable controls this bug was
      originally filed with.
+
+---
+
+## D-NULBASE — the `| null` peel had a home all along, and the peel that hid a REJECT (#1165)
+
+**Slice: `compiler/emit_collect.vl` only, plus one new corpus fixture.**
+
+### Base re-measured, not inherited — and the WALK census re-derived from scratch
+
+Branched from **`277ba0b`** (#1159). `parsercount.py` reproduces the brief's **CORE 313 ·
+OFF-LIST 29 · TRUE 342** exactly, per file `emit_classify` 174 (172 + 2) · `emit_collect` **54** ·
+`emit_base` **48** · `typecheck` 46 (19 + 27) · `emit_mono` **5**; master rebuilt from source in
+this session is **1,022,924 B**, `cmp`-equal to #1159's artifact (SHA-256 `2ef3826f…`).
+
+**🔁 THE BASE MOVED UNDER ME AND EVERY LEG WAS RE-RUN.** #1160, #1162 and #1161 landed while the
+gate was running, so this branch was rebased onto **`f9d4f88`** and **every leg below was re-graded
+there**, with the master baseline rebuilt from source in the same session
+(**1,029,817 B**, SHA-256 `6e9d2ba3…`). The absolute scoreboard **did not move at all** — master at
+`f9d4f88` still reads CORE 313 · OFF-LIST 29 · TRUE 342 with `emit_collect` 54 — and neither did any
+delta, any A/B verdict or the walk census. Populations grew with the corpus (1,343 → 1,360 files;
+suite 2,063/2,062 → 2,082/2,081) and the binary grew by 6,893 B from #1161's intrinsics, so the
+figures are quoted at both heads rather than silently at one.
+
+| | master `277ba0b` | master `f9d4f88` (gating head) | this PR |
+|---|---|---|---|
+| **CORE** (23-resolver list) | **313** | **313** | **308** |
+| **OFF-LIST** (#1141's table) | 29 | 29 | 29 |
+| **TRUE TOTAL** | **342** | **342** | **337** |
+| `emit_collect.vl` | **54** (54 + 0) | **54** (54 + 0) | **49** (49 + 0) |
+| `emit_base.vl` · `emit_mono.vl` | 48 · 5 | 48 · 5 | 48 · 5 (untouched) |
+| **hand-written type-name walks** | **6 copies + 2 homes** (see below) | **6 + 2** | 6 + 2 (unchanged) |
+| binary | 1,022,924 B | 1,029,817 B | **1,029,772 B** (**−45 B**, the same delta at both heads) |
+
+`nullablePartOf` in `emit_collect` **9 → 5**; `peelGroupParens` **2 → 1**. Every other file is
+byte-identical on both sides — the diff against `origin/master` is one source file plus one fixture.
+
+### REFUTATION 1 — the walk census is **6 copies + 2 homes**, not 5, and a NAME hid the sixth
+
+#1159 published **5 copies + 2 homes** and named them: `emit_classify`'s `shapeFieldParse`,
+`splitUnionArmsAllDepth`, `annRetKind`, `unionArmSigKey`, `monoUnwrapParens`, over
+`typecheck.tyTopIndexOf` + `tyGroupEndIndex`. I first rebuilt that sweep with a depth-variable NAME
+list (`depth|d|lvl|level|dep|nest`) and it reproduced the published table **function for function** —
+which is exactly why it is worth distrusting. A name list is a hypothesis about how other people
+name variables.
+
+Re-derived STRUCTURALLY — a function with a loop in which *some* integer is both incremented and
+decremented (or a boolean flipped), whose body tests a character against a grouper/separator — the
+sweep flags **8 = 6 copies + 2 homes**. The sixth is **`emit_classify.nameIsWholeSpanShape`
+(line 7517)**, whose depth counter is called **`d0`**. `\bd\b` does not match `d0`, so every
+name-list sweep this program has run was blind to it.
+
+It is not a marginal case. It is a **brace-only** depth ladder over a type name, i.e. precisely the
+shape #1153 retired from `typecheck.isObjShapeName` on the ground that a brace-only reading
+disagrees with the home "in the direction that loses a shape" (`{a:"}|{"}`). Its own header defends
+the brace-only *alphabet* at length — correctly, since `<>` cannot change brace balance — and says
+**nothing about quoted literal members, which can**.
+
+`emit_collect.nameIsSingleShape` asks the SAME question through the quote-AWARE home
+(`tyGroupWrapsWhole` → `tyGroupEndIndex` → `skipQuotedName`). Computing BOTH at every invocation:
+
+| | reaches | names carrying `"` | TRUE (A) | TRUE (B) | **DISAGREEMENTS** |
+|---|---|---|---|---|---|
+| corpus (1,315 cases) | 10,514 | 17 | 1,107 | 1,107 | **0** |
+| fuzz (43,200) | 95,138 | 282 | 4,291 | 4,291 | **0** |
+| **total** | **105,652** | **299** | — | — | **0** |
+
+So the filed diff below is a **deletion, not a repair**, and it is answer-exact over 105,652 live
+invocations. *A census whose unit mentions "a DEPTH counter" must not be implemented as a list of
+the words people use for one.*
+
+### The code-axis census, re-run over all 107 sites of the partition
+
+> Enumerate by what the CODE is, not by what the ARGUMENT is.
+
+By ENCLOSING FUNCTION the partition is: `emit_collect` `registerInlineUnion` **17** · `collectA`
+**12** · `nulCloMixedUnionUnregistered` 4 · then 3, 3, 2, 2, 2 and eleven singletons;
+`emit_base` max **5** (`nameIsNestedUnionElemArray`), then 3, 3, 3, 3 — **FLAT**, and every one of
+its top clusters is inside a resolver's own primitive definition; `emit_mono` **5 sites in 5
+different functions**.
+
+By EXPRESSION — every expression containing a resolver call, normalised to a resolver-only
+skeleton — exactly two repeat with a shared reading:
+
+| skeleton | n | verdict |
+|---|---|---|
+| `const v = nullablePartOf(v)` | 11 | **4 are the FOLD** (below); the other 7 genuinely branch on nullability |
+| `splitUnionAtoms(v, v)` after `const v: v[] = []` | 10 | not a grammar — every one consumes the atoms differently |
+| `const v = normTypeAtom(annRetNameOf(peelGroupParens(v)))` | **2** | **one grammar, no home** |
+
+`registerInlineUnion`'s 17 are a **wrapper-peel DISPATCH**: ten arms, each peeling a *different*
+composition (paren-union element, nullable ref array, nullable shape, nullable map, nul-closure
+result, nested array, bare map, function return) and recursing. It is the largest concentration in
+the partition and it is **not** one grammar written ten times; it is ten peels sharing a recursion.
+Recorded so the next slice does not re-derive it.
+
+### The home ALREADY EXISTED, was ALREADY EXPORTED, and was one import name away
+
+`emit_classify.nonNulBaseOf` (line 9395) — *"THE TYPE UNDER THE `| null`"* — was created because
+**seventeen classifiers in that file** each wrote the fold out with a different pair of variable
+names. `emit_collect` hand-wrote it at **four** sites and never imported it:
+
+| site | function | spelling |
+|---|---|---|
+| A | `rlElemVariantHeap` | `let rsen = …; const rsnn = nullablePartOf(rsen); if rsnn != "" { rsen = rsnn }` |
+| B | `gaePeelWrappers` | `let nm = name; const nb = nullablePartOf(nm); if nb != "" { nm = nb }` |
+| C | `collectShapeVariantFields` | `let nsBase = ftxt; const nsNul = …; if nsNul != "" { nsBase = nsNul }` |
+| D | `collectFnValUse` | `let fvSb = nullablePartOf(tyNameOf(i)); if fvSb == "" { fvSb = tyNameOf(i) }` |
+
+D is the same fold **spelled the other way round** — which is why a search for the A/B/C shape
+misses it, and why the mechanical matcher below looks for both directions. A tree-wide sweep finds
+**six** hand-written folds: these four, `emit_classify.vl:9579` (**the home's own file, 184 lines
+below the home**) and `wasmEmit.vl:4097`. The two outside this partition are filed.
+
+The second grammar, `normTypeAtom(annRetNameOf(peelGroupParens(x)))`, appeared verbatim twice
+(`registerInlineUnion`'s nul-closure arm and `nulCloMixedUnionUnregistered`) and becomes
+`cloResultAtomOf` — the three resolvers compose in a fixed order and only in that order.
+
+### REFUTATION 2 — five inert sabotages were the tell, and the fifth one found a REJECT
+
+Every one of S1–S5 (drop the peel at each adoption site; drop the paren peel inside the new
+closure-result home) reddened **0 of 1,342** corpus files. Five zeros in a row is the shape of a
+broken comparator, so I stopped and did two things the program's own notes demand.
+
+**First, positive controls — a check that must FAIL.** `P1` (`nullablePartOf` returns `""` always)
+reddens **178** corpus files and **2,408** fuzz output files. The comparator is a comparator.
+`P3` (`nameIsSingleShape` returns `false` always) reddens **2**. `P2` (`cloResultAtomOf` returns its
+argument unchanged) reddens **0** — so the whole nul-closure result-registration family is
+**reached 1,123 times on the corpus and 14,409 on fuzz and observed by nothing**, published here as
+a blind spot rather than dressed up as coverage.
+
+**Second, "inert" decomposed.** A peel that is never *taken* and a peel whose answer is never
+*observed* are different claims, and only the second needed the sabotage:
+
+| site | corpus reaches | corpus **FIRES** | fuzz reaches | fuzz **FIRES** | sabotage on corpus | sabotage on fuzz |
+|---|---|---|---|---|---|---|
+| A `rlElemVariantHeap` | 104 | **13** | 1,222 | **100** | 0 | — |
+| B `gaePeelWrappers` | 343 | **10** | **0** | 0 | 0 | — |
+| C `collectShapeVariantFields` | 25 | **0** | 210 | **16** | 0 | — |
+| D `collectFnValUse` | 5,924 | **475** | 78,060 | **5,955** | 0 | **1 of 43,200** |
+| `peelGroupParens` inside the new home | 1,123 | **320** | 14,409 | **2,579** | 0 (S5) | — |
+| `normTypeAtom` inside the new home | 1,123 | **43** | 14,409 | **862** | 0 (S6) | — |
+
+The peels FIRE — 13, 10, 475 times on the corpus alone — and the corpus observes none of it. **A
+POPULATION OF ONE IS STILL A REFUTATION**: S4 changed exactly one fuzz program of 43,200, and that
+program is the finding below.
+
+### The sabotage compiled a program master REJECTS — the nullable closure ARRAY
+
+`s48514_d4_branching/case_00561`: under master it is a loud **REJECT**; with site D's peel removed
+it compiles and prints its own expected `NULL`. Reduced to ten lines and verified by RUNNING a
+master-built compiler:
+
+```vl
+function useIt(p: ((i32, i32, i32) => f32)[] | null) {
+  const t0 = p
+  if t0 != null { print(t0[0](1, 1, 1)) } else { print("NULL") }
+}
+useIt(null)
+```
+> `emit error: emitProgram: function-value call arity has no interned signature`
+
+`collectFnValUse`'s `TypeRef` pass already flips `fnValUsed` for a function type
+(`tyIsFuncType`), a closure ARRAY (`nameIsClosureArrayTy`), a NULLABLE closure
+(`nameIsNulClosure`), a shape with a closure field, and any union ARM that is a closure array. The
+**nullable closure ARRAY is the CROSS of two of those and the hole neither covers**: the annotation
+node is a `TyNullable`, so the closure-array test declines, and its non-null part is an ARRAY, not a
+closure, so the nullable-closure test declines. The `| null` peel then leaves ONE atom, so the
+union-arm loop — which carries the right test — never runs. With no lambda elsewhere in the program
+the element signature never interns and the narrowed indexed call is refused, for a program every
+part of which is representable.
+
+The fix is the union-ARM loop's own test applied to the `| null`-peeled WHOLE — one rule, both
+positions — behind a **one-character cheap reject**, because both of `cloArrElemNameOf`'s legs open
+with a depth scan (`annArrowAt`) before reaching the trailing-`[]` test they both require:
+
+```vl
+if fvSb.length > 0 && fvSb[fvSb.length - 1] == ']' {
+  if cloArrElemNameOf(fvSb) != "" { fnValUsed = true }
+}
+```
+
+**The cheap reject is measured, not asserted: it removes 70,925 of the 78,062 calls the fix would
+otherwise add on fuzz (90.9%) and 5,019 of 5,928 on the corpus (84.7%)**, and a corpus A/B between
+the guarded and unguarded builds is **0-differing over 1,343 files**, so the guard is answer-exact.
+This is #1144's rule — keep the home AND the short-circuit — applied to a call rather than a home.
+
+### Gate — every leg, RC checked explicitly, master baseline rebuilt at MY head in THIS session
+
+All figures below are at the **gating head `f9d4f88`** unless a `277ba0b` column says otherwise;
+each leg was run at BOTH heads and every verdict is identical.
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh` | RC=0 — master **1,029,817 B**, ship **1,029,772 B** (**−45 B**; at `277ba0b`: 1,022,924 → 1,022,879, the same −45) |
+| `native-fixpoint.sh` | RC=0 — stage3 == stage4 byte-for-byte (1,029,772 B) |
+| `lint-self.sh` | RC=0, fmt clean |
+| suite (`SELFHOST_NATIVE_ALIGN=1 deno task test`) | **2,082 passed / 0 failed / 8 ignored** (at `277ba0b`: 2,063) |
+| suite, master **re-measured at this head, same session, same command** | **2,081 / 0 / 8** — **+1 = exactly the new pin** (at `277ba0b`: 2,062, same +1); ignored-test NAME SETS diffed as sets, identical, **8 non-empty names each** |
+| corpus A/B, master vs ship | **1,360 files, 1 differing — the new pin, named**; build-rc + wasm SHA-256 + compiler message + run-rc + stdout, compared BY NAME (at `277ba0b`: 1,343 files, same 1) |
+| corpus A/B isolating the REFACTOR (master vs refactor-only) | **1,342 files, 0 differing** on every channel |
+| corpus A/B isolating the CHEAP REJECT (fix vs fix+guard) | **1,343 files, 0 differing** |
+| corpus channel populations (side A) | 1,152 produce wasm (1,148 distinct SHAs) · 208 build-rc≠0 · 1,360 messages · 1,095 produce stdout |
+| lint-tier A/B (`vl check --severity hint`) | **1,360 rows, 772 carrying ≥1 tagged diagnostic — 0 differing** (at `277ba0b`: 1,343 rows / 761 tagged / 1,070 distinct texts / 446 KB, 0 differing) |
+| fuzz A/B, master vs ship | 12 seeds × 3 depths × 2 modes = **43,200 programs/side**, 43,611/43,610 output files, 42,789 non-empty `.out`, 411 `.err` (backtrace addresses normalised), whole `--out-dir` trees via `diff -r` — **1 differing: the REJECT that now produces its own expected output**. 0 regressions, at BOTH heads |
+| fuzz A/B isolating the REFACTOR | **43,200 programs/side, `diff -r` RC=0, 0 output lines** |
+| `rep-fuzz-check.sh` | RC=0, exact ✅ (1 baselined, 0 unsound, 0 new, 0 stale) |
+| invocation counts, both sides, both channels | below |
+| final artifact | `cmp`-checked byte-identical to the compiler every leg was measured with |
+
+**The lint-tier population was WRONG on its first print and is corrected here rather than quietly.**
+The harness counted "rows carrying ≥1 diagnostic" with a grep for `error`, which matches the
+trailing `Checked 1 file, no errors.` on **every** row — it printed **1,343 of 1,343**, a 100% that
+should never have survived a glance. Re-counted on the `[HINT]`/`[WARNING]`/`[ERROR]` tag: **761**.
+*A denominator that comes out at exactly 100% is a bug report about the denominator.*
+
+Nine throwaway compilers were built into the scratchpad by way of `vl build` (work probes ×2 counter
+sets, a fire probe, a span probe, six sabotages, three controls, two fix variants); the seed was
+`cmp`-checked against the stashed candidate before and after every seed-reading leg, and the shipped
+patch was re-applied from `SHIP.patch` and rebuilt to a byte-identical artifact after the last of
+them.
+
+### THE WORK COUNT — corpus AND fuzz, both sides, every delta attributed
+
+Counters are module globals in `emit_base.vl` dumped at the START of every `compileSrc`, driven
+through `probehost.ts`; **a sentinel compile appended after the last case makes the final dump a
+true running total** — without it the last case's own contribution is never printed. (The compiler
+cannot `print` under the Rust host: `refresh-compiler.sh` fails an instrumented build with
+`unknown import: imports::__print_i32__`, which is exactly why that host exists.)
+
+**THE REFACTOR ALONE — master vs refactor-only, over the UNCHANGED 1,314-case corpus and 43,200 fuzz programs**
+
+| counter | corpus master | corpus refactor | Δ | fuzz master | fuzz refactor | Δ |
+|---|---|---|---|---|---|---|
+| `nullablePartOf` ENTRIES | 428,588 | 428,588 | **0** | 3,016,886 | 3,016,886 | **0** |
+| `peelGroupParens` ENTRIES | 6,163 | 6,163 | **0** | 77,073 | 77,073 | **0** |
+| `normTypeAtom` ENTRIES | 1,604 | 1,604 | **0** | 22,051 | 22,051 | **0** |
+| `annRetNameOf` ENTRIES | 21,012 | 21,012 | **0** | 164,211 | 164,211 | **0** |
+| `nonNulBaseOf` ENTRIES | 5,982 | 12,378 | **+6,396** | 61,622 | 141,114 | **+79,492** |
+| `tyNameOf` ENTRIES | 269,891 | 264,442 | **−5,449** | 1,237,874 | 1,165,769 | **−72,105** |
+
+**BOTH IDENTITIES ARE EXACT.** Predicted Δ(`nonNulBaseOf`) = the four fold sites' own reaches:
+*corpus* 104 + 343 + 25 + 5,924 = **6,396**, observed 6,396, **residual 0**; *fuzz*
+1,222 + 0 + 210 + 78,060 = **79,492**, observed 79,492, **residual 0**. Predicted Δ(`tyNameOf`) =
+site D's DECLINE count, where master evaluates `tyNameOf(i)` a SECOND time: *corpus* **5,449**,
+*fuzz* **72,105** — observed exactly, **residual 0 on both**. **The refactor is a pure relocation
+that adds 0 parser calls and REMOVES 5,449 / 72,105 frames.**
+
+**THE FIX'S COST, stated rather than buried — master vs ship, fuzz (43,200 programs)**
+
+| counter | master | ship (guarded) | Δ | (unguarded would be) |
+|---|---|---|---|---|
+| `cloArrElemNameOf` | 81,072 | 88,209 | **+7,137** | +78,062 |
+| `parenUnionArrElemName` | 527,141 | 534,278 | **+7,137** | +78,062 |
+| `nameIsClosureArray` | 441,573 | 448,652 | **+7,079** | +78,004 |
+| `nullablePartOf` | 3,016,886 | 3,022,573 | **+5,687** | +5,687 (guard removes none — every one is behind a `]`) |
+| `tyNameOf` | 1,237,874 | 1,165,775 | **−72,099** | −72,099 |
+
+On the corpus the same columns read **+909 / +909 / +901 / +718** against **−5,408** `tyNameOf`.
+**NET the slice REMOVES more frames than it adds on both channels** — corpus **−1,971**, fuzz
+**−45,059** — so a loud-reject bug is fixed at negative cost. The `+2` on
+`peelGroupParens`/`normTypeAtom`/`annRetNameOf` in the master-vs-ship columns is the single fuzz
+program that now compiles further; it is attributed, not rounded away.
+
+**What this instrument does NOT cover:** the LSP query families, which neither channel drives.
+
+### Entombment
+
+The pin (`tests/cases/closures/nullable-closure-array-param-null-only.vl`) **fails on a
+master-built compiler by running it** — `emit error: function-value call arity has no interned
+signature` — in both spellings it carries (a nullable-closure-array PARAM and a nullable-closure-array
+LOCAL). The refactor half ships no pin because it is inert on every channel and a green-on-both-sides
+fixture is not a pin; its evidence is the four residual-0 identities above plus P1/P3 proving the
+comparator, and the five inert sabotages are published as coverage-without-observability rather than
+as a clean bill of health.
+
+### REFUTATIONS — worth more than the agreements
+
+1. **"5 copies + 2 homes."** It is **6 + 2**. `emit_classify.nameIsWholeSpanShape` is a
+   hand-written brace-only depth walk over a type name in a non-excluded file; every sweep this
+   program has run missed it because its counter is named **`d0`** and the sweeps matched a list of
+   depth-variable NAMES. My own first sweep reproduced the published table function-for-function —
+   agreement with a wrong answer.
+2. **My own five sabotages, initially.** S1–S5 all read 0 and I nearly filed "these peels are
+   unobservable". P1 reddens 178 corpus files, so the comparator works; and the FIRE probe shows the
+   peels are taken 13/10/475 times on the corpus. The claim that survives is the narrow one:
+   **covered, and unpinnable on the corpus** — with site D pinnable on fuzz, at a population of one.
+3. **The brief's hand-off 3, "the sentinel-value protocol retires 23 comparisons".** True, and it
+   moves the scoreboard by **zero**: `annArrowAt` would still be CALLED 32 times and `nullablePartOf`
+   46 times — an optional return changes the COMPARISON at the call site, not the call. Worth doing
+   for the code, but it is not a destringify delta and should not be filed as one.
+4. **`emit_base` is done on the code axis.** Its 48 sites spread over 27 functions with a maximum of
+   5, and every top cluster is inside a resolver's own primitive definition. There is no grammar
+   left to dedup in that file; the next −1 there is an authority change.
+5. **`emit_mono` re-measured and upheld** (#1156's decline, third confirmation): 5 sites, 5
+   different functions, no repeated skeleton.
+6. **My own lint-tier denominator.** It printed 1,343 of 1,343 rows "carrying ≥1 diagnostic" because
+   the grep matched `no errors`. True figure **761**. *100% is a bug report about the denominator.*
+
+### Hand-offs, best-measured first
+
+1. **Delete `emit_classify.nameIsWholeSpanShape`'s hand-written walk** — replace the body with the
+   quote-aware home (add `tyGroupWrapsWhole` to that file's `emit_base` import; the probe build
+   compiles):
+   ```vl
+   export function nameIsWholeSpanShape(name: string) {
+     if name.length < 2 { return false }
+     if name[0] != '{' || name[1] == '[' || name[name.length - 1] != '}' { return false }
+     tyGroupWrapsWhole(name)
+   }
+   ```
+   **0 disagreements over 105,652 invocations** (10,514 corpus + 95,138 fuzz), with **299
+   quote-carrying names** reaching the site. Takes the census to **5 copies + 2 homes** and closes a
+   quote-blindness of exactly the class #1153 retired from `isObjShapeName`. It also makes the body
+   **character-identical to `emit_collect.nameIsSingleShape`**, so the follow-up is to delete one of
+   the two and rename the survivor's sites — *state plainly that the resulting CORE move is a naming
+   artifact* (`nameIsSingleShape` is on the 23-list, `nameIsWholeSpanShape` is not), not −6 of real
+   work.
+2. **The two remaining hand-written `nonNulBaseOf` folds**, both one-line diffs:
+   `emit_classify.vl:9579` (**inside the home's own file, 184 lines below it** — `let base =
+   nullablePartOf(ty.tyName); if base == "" { base = ty.tyName }` → `const base =
+   nonNulBaseOf(ty.tyName)`) and `wasmEmit.vl:4097` (`let rlen = rlElemName[rslot]; const rnn =
+   nullablePartOf(rlen); if rnn != "" { rlen = rnn }` → `const rlen =
+   nonNulBaseOf(rlElemName[rslot])`; add `nonNulBaseOf` to its `emit_classify` import at line 569).
+   The detector matches BOTH spelling directions, which is what found site D.
+3. **`typecheck.topLevelArrowIndex` and `emit_base.annArrowAt` are CHARACTER-IDENTICAL** — both are
+   `{ tyTopIndexOf(name, '=', 0, 0) }`, one private with 3 OFF-LIST sites, one exported with 32 CORE
+   sites. Two names for one delegate. Merging them is an OFF-LIST −3 and, more importantly, removes
+   a second spelling of the arrow question from the compiler.
+4. **`registerInlineUnion`'s ten-arm wrapper-peel dispatch (17 of `emit_collect`'s 49).** It is the
+   file's whole remaining concentration and it is NOT a dedup target — ten different peels sharing
+   one recursion. Bringing it down needs the recursion to take a TYPE rather than a NAME, i.e. the
+   `nodeTyIx` coverage question, not another home.
+5. **`cloResultAtomOf` is reached 1,123 times on the corpus and 14,409 on fuzz and NOTHING observes
+   its answer** (P2: returning the raw argument reddens 0 corpus files). Either a program that
+   observes it exists and is worth having, or the nul-closure result-registration family is dead
+   code — and that is a deletion lead worth more than a refactor.
+6. **`emit_collect.collectShapeVariantFields`'s peel fires 0 times on the corpus and 16 on fuzz**;
+   `gaePeelWrappers` fires 10 times on the corpus and is **never reached** by the fuzzer (0 of
+   43,200 — the generator emits no generic applications). The fuzz generator's blind spot to
+   generics is worth closing before the next slice trusts fuzz coverage of `gae*`.
