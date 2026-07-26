@@ -39,19 +39,19 @@ import { numLexFitsI32 } from "./emit_bignum"
 import {
   isConstInit,
   nameIsBareMap,
-  nameIsF32Array,
-  nameIsF64Array,
-  nameIsI32Array,
-  nameIsI64Array,
-  nameIsStringArray,
   nulCloFlag,
   numTextIsFloat,
   pushUniqueAtom,
+  retArrFlag,
+  retF32ArrFlag,
   retF32Flag,
+  retF64ArrFlag,
   retF64Flag,
+  retI64ArrFlag,
   retI64Flag,
   retNulListFlag,
   retNulStringFlag,
+  retStrArrFlag,
   tyIsFuncType,
   tyIsNulBool,
   tyNameOf,
@@ -747,7 +747,9 @@ export function ifExprCollectAtoms(ifIx: i32, atoms: string[]) {
 // True if the parameter `name` of function `fnIx` is an array type.
 // The TYPE-annotation node index of parameter `name` of function `fnIx` (its `parType`),
 // or -1 (no such param / module scope / an un-annotated param). The single param-scan the
-// `param*` type predicates share — each then reads the node via `tyNameOf` / a `ret*Flag`.
+// `param*` type predicates share — each then reads the node via a `ret*Flag` classifier
+// (D-PARAMARR took the last five off `tyNameOf`; only `paramMap` still renders, and its
+// header says why).
 export function paramTypeNode(fnIx: i32, name: string) {
   if fnIx < 0 { return -1 }
   const fn = P.nodes[fnIx]
@@ -765,12 +767,34 @@ export function paramTypeNode(fnIx: i32, name: string) {
   -1
 }
 
+// D-PARAMARR — the `param*Array` family asks the LIST-REP question of a parameter's
+// annotation NODE, and it used to answer it by RENDERING that node to a synthetic name
+// (`tyNameOf`) and parsing the render back (`nameIsI32Array` / `nameIsStringArray` /
+// `nameIsF64Array` / `nameIsF32Array` / `nameIsI64Array`). The node is right there, and
+// `emit_base`'s `ret*ArrFlag` family answers the identical question STRUCTURALLY off
+// `nodeTyArrayElemRepName` — whose own header says it "Mirrors `nameIsI32Array` /
+// `nameIsF64Array`/… exactly".
+//
+// THE ARENA LEG IS NOT NEW AND IT IS NOT A GAMBLE: `vtKindOfType` already classifies
+// `Param.parType` nodes through `retArrFlag`/`retStrArrFlag`/… with no name fall-through
+// (`emit_classify.vl:2289`), so the arena is ALREADY authoritative for this exact node
+// population — these five predicates were the last consumers asking the same nodes the
+// same question through a render.
+//
+// COVERAGE, MEASURED rather than assumed (the `ret*ArrFlag` family DECLINES to 0 when
+// `nodeTyIx` is unset, so a gap here would silently lose a list): over corpus + fuzz,
+// **190,692 twin invocations, 0 disagreements**; of those, **18,577 have a real parameter
+// annotation node and 18,577 of them are arena-covered — 100%**. The other 172,115 are
+// `paramTypeNode` returning -1 (the ident is not a parameter of this function at all),
+// where both legs answer false; `uncovLive` — a call where the NAME says yes and the
+// arena declines — is **0** on every channel. The inverted twin disagrees on
+// 110,586 of 110,586 reaches, so the comparator is not inert.
 export function paramArray(fnIx: i32, name: string) {
-  nameIsI32Array(tyNameOf(paramTypeNode(fnIx, name)))
+  retArrFlag(paramTypeNode(fnIx, name)) == 1
 }
 // True if the parameter `name` of function `fnIx` is a `string[]` type.
 export function paramStringArray(fnIx: i32, name: string) {
-  nameIsStringArray(tyNameOf(paramTypeNode(fnIx, name)))
+  retStrArrFlag(paramTypeNode(fnIx, name)) == 1
 }
 // USAGE-DRIVEN element inference for an UN-ANNOTATED EMPTY `[]` binding: the
 // element type comes from what is PUSHED — a string-literal argument makes the
@@ -811,16 +835,18 @@ export function letInfStrListByUse(letIx: i32) {
   }
   false
 }
-// True if the parameter `name` of function `fnIx` is an `f64[]` type.
+// True if the parameter `name` of function `fnIx` is an `f64[]` type. The three
+// scalar-element siblings of `paramArray`, migrated onto the same arena classifiers by
+// the same measurement (D-PARAMARR — see `paramArray`'s header).
 export function paramF64Array(fnIx: i32, name: string) {
-  nameIsF64Array(tyNameOf(paramTypeNode(fnIx, name)))
+  retF64ArrFlag(paramTypeNode(fnIx, name)) == 1
 }
 export function paramF32Array(fnIx: i32, name: string) {
-  nameIsF32Array(tyNameOf(paramTypeNode(fnIx, name)))
+  retF32ArrFlag(paramTypeNode(fnIx, name)) == 1
 }
 
 export function paramI64Array(fnIx: i32, name: string) {
-  nameIsI64Array(tyNameOf(paramTypeNode(fnIx, name)))
+  retI64ArrFlag(paramTypeNode(fnIx, name)) == 1
 }
 // True if the parameter `name` of function `fnIx` is a map type.
 export function paramMap(fnIx: i32, name: string) {
@@ -832,6 +858,20 @@ export function paramMap(fnIx: i32, name: string) {
   // let/return/field `nameIsMapMemberUnion` guards. The grammar itself is
   // `emit_base`'s `nameIsBareMap` (#1139) — this was its SIXTEENTH hand-written copy and
   // the last one outside the home's own module.
+  //
+  // D-PARAMARR DELIBERATELY LEFT THIS ONE RENDERING, and the reason is a hop into the
+  // callee rather than a guess. The obvious dual is `emit_classify.retMapFlag`, the
+  // `vtKindOfType` arm that answers "is this annotation node a bare map" — but
+  // `retMapFlag` is NOT arena-first: its body is `nameIsBareMap(ty.tyName)` over the same
+  // rendered name, plus a `mapValKindLowerable` gate this predicate does not have. So
+  // switching to it would be a lateral move that also silently narrows the answer. The
+  // real dual is a `TyMap` test on `nodeTyIxOf`, which `nameIsBareMap`'s own header at
+  // `emit_base` already sketches ("`ty is TyMap` is true for a bare map and false for a
+  // `TyUnion` with a map arm ... the migration is an edit to THIS function"), gated on
+  // annotation-node coverage. That coverage is now MEASURED and total — 18,577 of 18,577
+  // parameter annotation nodes carry a `nodeTyIx` over corpus + fuzz — so the blocker that
+  // header names is discharged; what remains is the 21 CALL SITES of `nameIsBareMap`,
+  // which is a slice of its own, not a line in this one.
   nameIsBareMap(tyNameOf(paramTypeNode(fnIx, name)))
 }
 // True if the `LetDecl` at `letIx` binds a SET — its initializer is the `Set()`
