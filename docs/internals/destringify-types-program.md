@@ -18329,3 +18329,427 @@ way in and out, and `git status` is clean afterwards.
      function-scope control failing on BOTH sides — so it cannot go to `ok`, and folding it into
      "17 fixed" would have been the same error as the six two-variable controls this bug was
      originally filed with.
+
+## D-PRINTREF (filed) + D-ARMDEDUP — `print` of ANY reference is silent invalid wasm, and the union-arm splitter's DUPLICATE is deleted
+
+Base **`5a072ec`**, every figure re-measured here in one session, nothing inherited. The master
+baseline compiler was rebuilt from this tree's source and is **`9ead430961f8ea5b…` / 1,024,045 B**;
+after the revert of every probe it rebuilt **byte-identical**, which is the control that says the
+build is deterministic and no throwaway compiler leaked into a measurement.
+
+### 🔁 THE BASE MOVED MID-SLICE — EVERY LEG RE-RUN AT THE GATING HEAD `f9d4f88`
+
+**#1161** (the numeric-opcode intrinsics — and it touches `typecheck.vl` and the `__print_*__`
+import scan) and **#1162** landed while this gate was running. Rebased onto `f9d4f88` and **every
+leg below re-run there**, with the master baseline rebuilt from `f9d4f88`'s own `compiler/` in the
+same session and **proved a fixpoint** (`compile(MASTER, master-source) == MASTER` byte-identical,
+`6e9d2ba325b74e16…` / **1,029,817 B**). #1156's lesson taken rather than re-learned.
+
+**Nothing moved.** The absolute figures below are quoted at `5a072ec`; here is the same table at the
+gating head, and every delta is identical:
+
+| | master `5a072ec` | master `f9d4f88` (gating head) | this PR at `f9d4f88` |
+|---|---|---|---|
+| CORE · OFF-LIST · TRUE | 313 · 29 · 342 | **313 · 29 · 342** | **317 · 28 · 345** |
+| `emit_classify.vl` · `emit_query.vl` | 174 · 2 | **174 · 2** | **177 · 2** |
+| walk COPIES (flagged) | 5 (8) | **5 (8)** | **4 (7)** |
+| binary | 1,024,045 B | 1,029,817 B | **1,028,959 B** (**−858 B**) |
+| equivalence probe: corpus + fuzz invocations / disagreements | 4,194 + 68,374 / **0** | 4,194 + 68,374 / **0** | — |
+| comparator sabotage (reversed arms) | 483 / 4,194 | **483 / 4,194** | — |
+| deletion sabotage (depth-blind splitter) | 29 corpus files reddened | — | **29 corpus files reddened** |
+| `W-SUA` / `W-TTI` / `W-SQN` / `W-SUAD` | 162,536 / 1,428,157 / 2,872 / 4,194 | **162,642 / 1,430,123 / 2,878 / 4,194** | **166,836 / 1,434,839 / 2,878 / —** |
+| suite (same test set both sides) | 2,059→2,060 / 0 / 14 | **2,076 / 0 / 14** | **2,076 / 0 / 14** |
+| corpus A/B · shared-instance corpus A/B · shared-instance fuzz A/B | 1,345 / 1,317 / 38,400, all **0** | — | 1,360 / 1,332 / 38,400, all **0** |
+| `vl check tests/cases` | 7,133 lines identical | 7,213 lines | **7,213 lines identical** |
+| D-PRINTREF candidate | CAND2, 24 reference cells reject, 20 controls print | — | **CAND3 rebuilt at `f9d4f88` — patch applies with offsets 209/219, same verdict, suite 2,076/0/14, corpus A/B 1,360 files 0 differing** |
+
+The work deltas are unchanged to the unit: `splitUnionAtoms` **+4,194**, `tyTopIndexOf` **+4,716**,
+`skipQuotedName` **0**. Both sides compiled 1,127 ok / 205 fail over the same 1,332 corpus cases.
+*A scoreboard figure is a statement about a TREE — quote the head you measured at.*
+
+### TARGET 1 — the owner's `print([])`. IT IS NOT AN ARRAY BUG, AND IT IS NOT AN EMPTY-LITERAL BUG
+
+All three of the owner's spellings reproduce at `5a072ec`, `vl check` clean, `vl run` failing:
+
+| program | `vl check` | `vl run` |
+|---|---|---|
+| `print([])` | rc 0, "Checked 1 file, no errors." | rc 1, `wasm[0]::function[4]` |
+| `print([1])` | rc 0, "no errors" | rc 1, same |
+| `const e: i32[] = []` + `print(e)` | rc 0, "no errors" | rc 1, same |
+
+The validator's own words, identical for every shape below:
+`Invalid input WebAssembly code at offset N: type mismatch: expected i32, found (ref $type)`
+(the playground's `call[0] expected type i32, found struct.new of type (ref 1)` is V8's wording of
+the same thing).
+
+**The mechanism is one unguarded fallback, not an array gap.** `wasmEmit.vl`'s `print` ladder is a
+sequence of POSITIVE tests — literal-union atom, `exprString`, nullable-string reject, f32, f64,
+i64, bool — ending in an unconditional `else { fbCall(0) }`, i.e. `call __print_i32__ : (i32)->()`.
+Everything that reaches that arm is assumed i32. Every classifier in the ladder
+(`exprIsLitAtom`, `exprString`, `exprNullableString`, `exprIsF32/F64/I64`, `exprIsBool`) lives in
+`emit_classify.vl`; the fallback itself does not.
+
+**Census — 25 silently-invalid cells (24 reference + 1 void), 20 must-print controls, one
+mechanism.** Written and graded one shape per
+cell, `vl check` and `vl run` both recorded, failure strings enumerated rather than matched
+(`failed to compile: wasm[` / `failed to parse WebAssembly module` / `wasm trap:` / `emit error` /
+the checker's `not yet supported by codegen` are five different outcomes and are bucketed as five):
+
+| family | cells | at `5a072ec` |
+|---|---|---|
+| arrays — `[]`, `[1]`, annotated empty, populated i32/string/f64/i64, `S[]`, `i32[][]`, a returned `i32[]`, `.slice(…)` | 11 | check CLEAN + invalid wasm |
+| struct — named `S`, bare `{v:1}`, `S \| null` | 3 | check CLEAN + invalid wasm |
+| map — `{[string]: i32}`, `{[string]: i32} \| null` | 2 | check CLEAN + invalid wasm |
+| function value — a named-fn binding, a lambda, `((i32)=>i32) \| null` | 3 | check CLEAN + invalid wasm |
+| nullable array `i32[] \| null` | 1 | check CLEAN + invalid wasm |
+| a struct UNION `A \| B` | 1 | check CLEAN + invalid wasm |
+| the same inside a function body (top level is not the variable) | 3 | check CLEAN + invalid wasm |
+| **`print(<void call>)`** | 1 | check CLEAN + invalid wasm — **a separate cell, see below** |
+| **= silently invalid** | **25** | |
+| **controls that must keep working** — `1`, `true`, `"hi"`, i64, f64, f32, an i32 binding, `"a"+"b"`, `e[0]` (i32 and string), `e.length`, `m.length`, a struct field, a `while`-loop element read, a literal union `K`, `0\|1`, a nullable string, `toString(1)`, a generic `T` param | **20** | all rc 0; **19 print their expected output**, and the generic-`T` cell compiles clean and prints nothing because **VL does not auto-invoke `main()`** — stated rather than counted as a print |
+| **controls already rejected LOUDLY by the union gate** — `i32\|string`, `m.get(k)` (an `i32\|null` box), `i32\|null` | 3 | `tyPrintsAsUnionBox` raises |
+| **already loud for OTHER reasons, unchanged** — an un-annotated `Map()`/`Set()` ("cannot infer a type"), `bool[]` ("unknown type"), `"x" + <array>`, `print()` / `print(1,2)` (an emit-stage arity reject) | 6 | unchanged on both sides |
+
+**VERDICT: the checker rejects, and `print` does not learn to lower arrays.** Five reasons, each
+measured rather than argued:
+
+1. **It is not about arrays.** Structs, maps, sets, closures, nullable arrays and struct unions fail
+   with the *same* validator message. "print lowers arrays" leaves 14 of the 25 cells untouched.
+2. **The language already made this exact decision at this exact site.** `typecheck.vl:8869` raises
+   `tErrUnsupported` for `print(<boxed value union>)`, with the comment *"`print` renders ONE
+   scalar/string rep at runtime"* — the rule the reference cells violate. A second, differently
+   shaped answer for arrays would contradict the first.
+3. **`print([])` has no element type to lower.** Its arena type is `TyArray{aElem: -1}`; `tyToStr`
+   renders it `<none>[]`. Any "lower arrays" answer needs a separate answer for the empty literal;
+   the reject needs none.
+4. **`print` has no declared type and `any` is not a VL type**, so this cannot be an ordinary
+   arity/assignability error — it has to be the same UNSUPPORTED-LOWERING admission the union arm
+   already uses (stable `unsupported-lowering` code, not a soundness verdict).
+5. **Half the owner's report is that `vl check` says the program is clean.** An emitter-side
+   `emitFail` would fix the invalid wasm and leave `vl check` lying. Only the checker arm fixes both.
+
+#### The filed diff — BUILT, GATED AND MEASURED HERE, then reverted (`typecheck.vl` is not this slice's file)
+
+`compiler/typecheck.vl`, two hunks, +49 lines, no new export:
+
+```vl
+// in `checkNode`'s `print` arm, immediately after the `tyPrintsAsUnionBox` gate:
+        // The SAME rule for the other reps `print` has no import for: an array, a
+        // struct, a map/set, a function value, and any of those behind `| null`.
+        // The emitter's print ladder ends in an unguarded `call __print_i32__`, so
+        // each of these handed a `(ref $t)` to an `(i32) -> ()` import and the module
+        // failed to VALIDATE — while `vl check` reported the program clean.
+        if tyPrintsAsRef(pt, 24) {
+          tErrUnsupported(
+            "print of " +
+              tyToStr(pt) +
+              " is type-valid but not yet supported by codegen — `print` renders one scalar or string; print the elements/fields individually, e.g. `print(xs[0])`",
+            pargs[pj],
+          )
+        }
+```
+
+```vl
+// beside `tyPrintsAsUnionBox`:
+// Whether `print(x)` would be handed a WasmGC REFERENCE the scalar print imports cannot
+// take. `print` renders ONE scalar/string rep (the union gate says the same thing about a
+// box); the emitter's print ladder ends in an unguarded `call __print_i32__`, so every
+// value whose rep is a reference — an array, a struct, a map/set, a function value, a
+// union carrying one of those, and any of them behind `| null` — was handed to an
+// `(i32) -> ()` import with a `(ref $t)` on the stack. The module then failed to VALIDATE
+// ("expected i32, found (ref $type)") while `vl check` reported the program clean.
+//
+// `string` is deliberately NOT here: it is a reference too, but the ladder routes it to
+// the string streaming printer. Nor is a LITERAL union (i32/string atoms widened to their
+// member text), nor a `TyVar` (a generic body's `T` — monomorphization decides its rep at
+// the call site, and the concrete argument is gated there).
+//
+// Depth-bounded like `tyReachesUnion`: a self-referential alias reached through a union or
+// nullable member would otherwise not terminate.
+function tyPrintsAsRef(pt: i32, depth: i32) {
+  if pt < 0 { return false }
+  if depth <= 0 { return false }
+  const t = T.tys[pt]
+  if t is TyArray { return true }
+  if t is TyObj { return true }
+  if t is TyMap { return true }
+  if t is TyFunc { return true }
+  if t is TyNullable { return tyPrintsAsRef(t.nInner, depth - 1) }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      if tyPrintsAsRef(ms[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+```
+
+**Measured, not proposed.** Built as `CAND2` (1,024,855 B), refresh RC=0:
+
+| leg | result |
+|---|---|
+| the 24 REFERENCE cells | **all 24 now reject at `vl check`** with the message above, rc 1, `unsupported-lowering` (the 25th, the void call, is the arm this candidate drops — see below) |
+| the 20 must-print controls | **all 20 still print**, byte-for-byte the same output |
+| the 2 already-loud controls | unchanged |
+| `deno task test` (`SELFHOST_NATIVE_ALIGN=1`) | **2,059 passed / 0 failed / 14 ignored** — identical to the master baseline run in the same session, and the ignored-test NAME SETS diff clean with **both files asserted non-empty (14 each)** |
+| corpus A/B, 1,345 files, three channels (`vl check` rc+TEXT, `vl build` BYTES, `vl run` rc+stdout) | **0 differing** |
+| shared-instance `vl check tests/cases` | 7,133 lines, 217 errors, 121 warnings — **identical to master** |
+
+Sample messages: `print of i32[] is …`, `print of {v: i32} is …`, `print of {[string]: i32} is …`,
+`print of (i32) -> i32 is …`, `print of i32[]? is …`, and for the owner's own program
+`print of <none>[] is …`.
+
+#### THE VOID ARM WAS DROPPED, AND THE SUITE IS WHAT DROPPED IT
+
+The first candidate (`CAND1`) also raised on `pt == TY_VOID`, because `print(v())` over a void
+function is the 25th cell. **`deno task test` failed on exactly one file** —
+`functions/inferred-nullable-if-binding.vl:41:14`, `print(x ?? -1)` — and the corpus A/B named the
+same single file (`CHECKSTATUS(0/1) BUILDSTATUS(0/1) RUNSTATUS(0/1)`), which is also this slice's
+**comparator sabotage proof**: the same harness that reads 0 for the shipped diff reads 1 here, with
+the file named.
+
+Probing the cell produced a **third defect, pre-existing on a master-built compiler**:
+
+```vl
+function fe(c: boolean) {
+  const x = if c then 5      // else-less: the false path is the implicit null
+  const z = x ?? -1          // ERROR: cannot bind the void result of 'z'
+}
+```
+`(else-less if) ?? default` types as **void** in the checker, while the emitter lowers it correctly
+(the same expression inside `print(…)` prints `5` and `-1`). The explicit `else null` spelling types
+fine. So `pt == TY_VOID` is not a usable signal until that is fixed, and the void `print` cell is
+filed separately rather than folded into this one. *A decline is a hypothesis; the suite is the
+verdict.*
+
+#### A FOURTH DEFECT, found by writing this slice's own control fixture
+
+Minimal, on a master-built compiler at `5a072ec`, `vl check` **clean**:
+
+```vl
+const m: {[string]: i32} = Map()
+m.set("p", 1)
+```
+→ `Invalid input WebAssembly code at offset 202: unknown local N: local index out of bounds`.
+
+Graded: `.set` **at top level** on a string-keyed map (i32-valued, string-valued) and `Set.add`
+likewise emit a `local.get` the START function never declared. The same code **inside a function
+body runs**; a top-level `xs.push(1)` runs; a top-level `m.delete(k)` runs; and adding a `m.get(k)`
+alongside the `.set` makes it run (the get forces the frame). Same family as D-STARTFRAME /
+D-STARTBLOCK — the start function's local frame is not sized for the map-op scratch. **Filed, not
+fixed** (`wasmEmit`/`emit_sections`). This slice's fixture routes its map through a function and
+says why in a comment, rather than silently avoiding the shape.
+
+#### SHIPPED for TARGET 1: the FALSE-side fence
+
+`tests/cases/types/print-scalar-boundary-controls.vl` (`@run`, 11 `@log` lines) pins the eleven
+cells the filed predicate must NOT touch — a literal union, a nullable string, a struct field read,
+three array element reads, a map `.length`, f64, i64, `true`, and `toString`. It passes on master,
+on this slice, and under the filed diff. It is the complement of `types/print-union-rejected.vl`,
+which pins the same admission for a boxed value union. **A behaviour CHANGE needs a pin that fails
+on master; this PR ships no behaviour change, so what it can ship is the fence the change must not
+break** — and the fence is what makes the filed diff safe to apply without re-deriving its boundary.
+
+### TARGET 2 — `splitUnionArmsAllDepth` DELETED, re-measured rather than inherited (D-ARMDEDUP)
+
+The hand-off filed this as a straight duplicate of `typecheck.splitUnionAtoms` with *0 arm-list
+disagreements over 52,584 invocations*. **Re-measured here at `5a072ec`, with a probe rebuilt from
+scratch:**
+
+| channel | invocations | arm-list DISAGREEMENTS |
+|---|---|---|
+| corpus (1,317 cases, `compileSrc`, one shared instance) | **4,194** | **0** |
+| fuzz (38,400 generated programs, same shared-instance driver) | **68,374** | **0** |
+| **total** | **72,568** | **0** |
+
+The corpus figure reproduces the hand-off's 4,194 exactly. The probe is ADDITIVE (the original
+ladder still supplies `out`), computes both at every invocation, compares ELEMENT-WISE, and prints
+the NAME on divergence — sites, not a count.
+
+**COMPARATOR SABOTAGE-PROVED.** A second probe identical but for REVERSING the home's arm list —
+invisible to a length check and to any 1-arm name, so it exercises exactly the comparison the result
+rests on — fires **483 disagreements over the same 4,194 invocations**, names printed
+(`(i64|null)[]|i64`, `{b:(f64|{q:i64})[]}|f64`, `((i32)=>(()=>f32|null)|{w:i32})|boolean`, …).
+
+**A NOTE ON HOW THE PROBE HAD TO BE RUN, because the obvious way is impossible.** The native host
+instantiates the compiler with a BARE `Linker::new` (`vl-host/src/main.rs:279`) — a compiler whose
+source contains `print(…)` imports `imports::__print_i32__` and cannot be instantiated at all
+(`unknown import`). Probe output therefore goes through a Deno driver that supplies the print family
+and drives `compileSrc` over the tree in ONE `WebAssembly.Instance`. That is a bonus, not a
+workaround: it is the **sidecar-lifetime channel**, the one that catches a per-program sidecar with
+a missing reset — the failure mode that trapped the compiler on 12 corpus files last slice, and the
+one `vl check <dir>` is blind to because it stops before the emit passes.
+
+#### The gate, every leg with its exit code checked explicitly
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh --prove-fixpoint` | RC=0, `compile(next) == next` (2 compiles) |
+| `native-fixpoint.sh` | RC=0, stage3 == stage4 byte-for-byte, **1,023,187 B** |
+| `lint-self.sh` | RC=0 (self-lint + `vl fmt --check` clean) |
+| `deno task test` `SELFHOST_NATIVE_ALIGN=1` | **2,060 passed / 0 failed / 14 ignored** (2,059 + this slice's new fixture); master baseline in the same session 2,059/0/14; ignored NAME SETS diff clean, **both non-empty (14 each)** |
+| corpus A/B, 1,345 files, three channels | **0 differing — no file to name** |
+| **shared-instance** corpus A/B (`compileSrc`, one instance, emitted-byte digest per file) | 1,317 files, **0 differing**, compile-ok 1,116 both sides |
+| **shared-instance** fuzz A/B | **38,400 programs/side**, **0 differing**, compile-ok 36,649 both sides |
+| `vl check tests/cases` (shared instance) | 7,133 lines, 217 errors, 121 warnings — identical both sides |
+| `rep-fuzz-check.sh` | RC=0, `exact ✅` (1 baselined, 0 unsound, 0 new, 0 stale) |
+| lint-tier A/B, 60 files | identical, 90 lines each side — **and structurally insensitive**: the lint assembly is lexer+ast+parser+lint+harness, `emit_classify.vl` is not in it. Reported as a null leg, not as evidence |
+
+**IDENTICAL IS NOT CORRECT, so the A/B was sabotaged too.** A build in which the four rewired sites
+call a depth-BLIND splitter reddens the shared-instance corpus A/B on **29 files**
+(`unions/struct-arm-grouped-union-list-field.vl`, `maps/union-arm-map-list-elem-read.vl`,
+`structs/same-fieldset-nest-with-union-elem-array-field.vl`, … — 2 of them rc0→rc3, the rest
+byte-diffs). The sites are covered by the existing corpus; a wrong replacement cannot pass.
+
+#### Invocation counts both sides, every delta attributed
+
+One printed line per call, `grep -c` over the stream — no shared counter, so no counter can go
+negative and no crashed program can silently subtract. Both sides compiled 1,116 ok / 201 fail over
+the same 1,317 corpus cases, which is the assertion that the instrument did not die.
+
+| counter | master | this PR | Δ | attribution |
+|---|---|---|---|---|
+| `emit_classify.splitUnionArmsAllDepth` | 4,194 | — (deleted) | **−4,194** | the whole ladder |
+| `typecheck.splitUnionAtoms` | 162,536 | 166,730 | **+4,194** | **one-for-one**, the same 4,194 |
+| `typecheck.tyTopIndexOf` | 1,428,157 | 1,432,873 | **+4,716** | one scan per arm; 4,716/4,194 = **1.124 arms per split** (these names are nearly all single-arm) |
+| `typecheck.skipQuotedName` | 2,872 | 2,872 | **0** | **not one of the 4,194 names carries a `"` at all** — which is precisely why the deleted ladder's escape-blind `inStr` toggle was unobservable |
+
+Character-step work is unchanged (both are one pass over the name — `tyTopIndexOf` counts depth from
+`from`, and a split resumes at a point where depth was 0 by its own condition). The residue is
++4,716 function calls out of 1.43 M (**+0.33 %**). Wall clock on the heaviest realistic workload, a
+full self-compile, 3 interleaved runs per side: master 1384/1387/1350 ms, this PR 1395/1373/1358 ms
+— inside the noise. Binary **−858 B**.
+
+#### THE SCOREBOARD GOES UP, AND THAT IS THE HONEST NUMBER
+
+| | master `5a072ec` | this PR |
+|---|---|---|
+| **CORE** (23-resolver list) | **313** | **317** |
+| **OFF-LIST** (#1141's table) | **29** | **28** |
+| **TRUE TOTAL** | **342** | **345** |
+| `emit_classify.vl` | 174 (172 + 2) | **177 (176 + 1)** |
+| `emit_query.vl` | 2 | 2 (untouched) |
+| **hand-written type-name walk COPIES** | **5** | **4** |
+| binary | 1,024,045 B | **1,023,187 B** |
+
+CORE rises by exactly 4 because the four call sites now call `splitUnionAtoms`, which is ON the
+23-name list, while `splitUnionArmsAllDepth` was on NEITHER list; OFF-LIST falls by exactly 1
+because the deleted ladder held one of `tyGtIsClose`'s sites (4 → 3). **A 44-line hand-written
+grammar is gone, 52 lines net are gone, 858 bytes are gone, and the headline metric moves the wrong
+way by 3.** The metric that captures it is the walk-COPY count, **5 → 4**: the remaining four are
+`shapeFieldParse`, `annRetKind`, `unionArmSigKey`, `monoUnwrapParens`, all in `emit_classify.vl`,
+beside 2 homes in `typecheck.vl` and 1 correctly-declined brace-only counter
+(`nameIsWholeSpanShape`, #1120). Walk census reproduced function-for-function: **8 flagged → 7**.
+
+#### The comment that was load-bearing and is now false
+
+The old body carried *"`splitUnionAtoms` is paren-blind, so a `(...)`-grouped arm mis-splits"*. That
+was true when it was written and is not true now — `splitUnionAtoms`'s own header spells the paren
+rule out. The rewritten comment says what actually differs between the two branches at
+`internShapeDeep`: **the SPLIT is the same query; only the control flow differs** (the paren-free
+branch RETURNS after interning, the paren-carrying one falls through to the paren descent). *A stale
+comment is how a duplicate survives three audits.*
+
+An unrelated ORPHAN surfaced next to the deletion: the paragraph documenting
+`emit_collect.collectAnnShapes` still sits in `emit_classify.vl`, left behind when that function
+moved out, and `collectAnnShapes` carries no doc of its own. Left in place (`emit_collect.vl` is not
+this slice's file) with a marker and a blank line so it cannot read as `internShapeArms`'s header.
+**Hand-off: move it.**
+
+### REFUTATIONS
+
+1. **"`print([])` is an empty-literal edge case."** REFUTED. `print([1])`, `const e: i32[] = [1,2]`,
+   `print(f())` over an `i32[]`-returning function and `print(e.slice(0,1))` all fail identically.
+2. **"`print([])` is an array bug."** REFUTED, and this is the one that changes the fix. Structs,
+   object literals, maps, sets, closures, lambdas, nullable arrays and struct unions produce the
+   **same validator message from the same instruction**. 14 of the 25 cells are not arrays.
+3. **"The right fix is teaching `print` to lower arrays."** REFUTED on the evidence above —
+   it would leave 14 cells silently invalid, needs a separate answer for `print([])`'s absent
+   element type, and contradicts the rule the union gate already enforces at the same site.
+4. **"An emitter `emitFail` is enough."** REFUTED against the owner's actual report: it would leave
+   `vl check` reporting the program clean, which is half of what was reported.
+5. **"`pt == TY_VOID` is a safe extra arm."** REFUTED by the suite on the first run — one corpus
+   file, `print(x ?? -1)`, because `(else-less if) ?? d` types as void. **Own prediction wrong, probe
+   said so.**
+6. **"`splitUnionArmsAllDepth` needed a quote-skip patch."** Already refuted by the hand-off (0 cells
+   closed); **re-confirmed from the other side here** — `skipQuotedName` is invoked 2,872 times on
+   both sides, delta 0, i.e. not one of the 4,194 names reaching those sites contains a quote.
+7. **"The lint-tier A/B is a green leg."** REFUTED as evidence. The lint assembly does not include
+   `emit_classify.vl`; its 60-file identity is structurally guaranteed and is reported as a null.
+8. **"`emit_query.vl` is nearly clean at CORE 2."** REFUTED, third independent confirmation, with my
+   own census this time: of **39 `nameIs*` predicate definitions** in `compiler/*.vl`, the two
+   scorecard lists see **12** (129 call sites) and miss **27** (136 call sites) — one of which
+   (`nameIsClosureArrayTy`) takes a node index and is not a name parser at all, so the honest figure
+   is **26 uncounted string-taking predicates / 134 call sites**, against a whole-tree TRUE TOTAL of
+   345. `nameIsF64Array` / `nameIsF32Array` / `nameIsI64Array` are one-line `name == "f64[]"` tests —
+   *simpler* than the counted `nameIsI32Array`, which carries three extra arms — and `nameIsString`
+   (8 sites) is `name == "string"`. Beyond the `nameIs*` family the uncounted list continues with
+   genuine parsers: `isValueUnionName` (36 sites, splits a rendered union and classifies its atoms),
+   `nonNulBaseOf` (18) and `nulMapInnerName` (10) (both `nullablePartOf` wrappers), `monoUnwrapParens`
+   (12), `annRetNameOf` (11). A mechanical upper bound — every function whose first parameter is a
+   `string` its body reads structurally, source-text scanners excluded by file — is **462
+   definitions, of which the lists see 32 (305 sites) and miss 430 (1,889 sites)**; that bound is
+   deliberately loose (it sweeps in legitimate NOMINAL lookups like `structIndexByName`, `declare`,
+   `lookup`, which the owner's rule explicitly blesses) and is quoted as a bound, not a score.
+9. **`refArrShapeKind` (12) + `refArrElemName` (10) as a dedup.** REFUTED, as filed. Re-measured at
+   this base: 12 and 10, still 22 of `emit_classify`'s sites. `refArrShapeKind`'s nested-ref-array
+   arm CALLS `refArrElemName`, and `refArrElemName` opens with a `nullablePartOf` recursion that
+   `refArrShapeKind` does not have — the rung ORDER differs, so they are two projections of one
+   grammar and merging them is a design change needing its own graded population, not a rename.
+   **Not attempted here** (#1155's "you cannot reason out an ordering — measure it").
+
+### HAND-OFFS
+
+1. **Apply the D-PRINTREF diff above.** It is built, gated and measured; it needs only an owner for
+   `typecheck.vl`. `tests/cases/types/print-scalar-boundary-controls.vl` is already in the tree as
+   its FALSE-side fence. **The four reject pins are written and VERIFIED BY RUNNING THEM** — each is
+   rc 0 with **0 errors** on a compiler built from `f9d4f88`'s own sources (i.e. it pins the defect),
+   and rc 1 with an exact message match under the candidate. Drop them in with the diff:
+
+   ```vl
+   // tests/cases/types/print-array-rejected.vl
+   // @check
+   // @error print of i32[] is type-valid but not yet supported by codegen
+   const xs = [1, 2, 3]
+   print(xs)
+   ```
+   ```vl
+   // tests/cases/types/print-struct-rejected.vl
+   // @check
+   // @error print of {v: i32} is type-valid but not yet supported by codegen
+   type S = { v: i32 }
+   const s: S = { v: 1 }
+   print(s)
+   ```
+   ```vl
+   // tests/cases/maps/print-map-rejected.vl
+   // @check
+   // @error print of {[string]: i32} is type-valid but not yet supported by codegen
+   const m: {[string]: i32} = Map()
+   print(m)
+   ```
+   ```vl
+   // tests/cases/closures/print-closure-rejected.vl
+   // @check
+   // @error print of (i32) -> i32 is type-valid but not yet supported by codegen
+   function id(x: i32): i32 { x }
+   const g: (i32) => i32 = id
+   print(g)
+   ```
+   They are NOT in this PR because a pin for a behaviour change cannot land before the change: on
+   master all four are accepted and each would fail the suite as an unmatched `@error`.
+2. **`(else-less if) ?? default` types as void** in the checker while the emitter lowers it
+   correctly — `const z = (if c then 5) ?? -1` is rejected, `print((if c then 5) ?? -1)` prints 5.
+   Blocks the void `print` cell.
+3. **A top-level `Map.set` / `Set.add` emits invalid wasm** (`unknown local N`), `vl check` clean —
+   two lines to reproduce, works inside a function, works alongside a `.get`.
+4. **Move the `collectAnnShapes` doc paragraph** out of `emit_classify.vl` into `emit_collect.vl`.
+5. **The remaining four walk copies** are `shapeFieldParse`, `annRetKind`, `unionArmSigKey`,
+   `monoUnwrapParens`. The last three are PAREN-ONLY depth counters; `tyTopIndexOf` already answers
+   a paren-only query when asked for a separator that never appears at depth 0, so the question for
+   them is whether the home's alphabet over-nests (`<>`) relative to what they want — **check the
+   alphabet before filing the merge** (#1120's rule).
