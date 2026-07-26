@@ -15402,3 +15402,329 @@ direction.** Entombment graded DOWN accordingly rather than averaged away.
      them into two named homes turns an unwritten invariant into a readable one — and the sabotage
      that tests it (SAB-H3) coming back inert is a *finding about the corpus*, not a licence to
      merge them.
+
+## D-QUOTEWALK (filed, not shipped) + D-BANKREAD — the quote-blind grammar defect is TWO homes and 24 cells, not one home and one cell; and three checker decisions stop re-deriving a value their producer banked
+
+**Base re-measured, not inherited.** Started at `5d011ff`, where `parsercount.py` reproduces the
+brief's **CORE 343 · OFF-LIST 35 · TRUE 378** exactly. #1152 landed mid-slice; rebased onto
+`4758935` and **re-measured everything there**: master **CORE 326 · OFF-LIST 35 · TRUE 361**,
+this slice **CORE 325 · OFF-LIST 34 · TRUE 359** (`typecheck.vl` 49 → 47, i.e. 20 core + 29
+off-list → 19 + 28). Every gate leg below was re-run at `4758935` with the master baseline
+compiler rebuilt at that head in the same session.
+
+**The better metric, with its unit stated.** UNIT: one FUNCTION containing its own character loop
+over a type-NAME string that tracks grouper depth or scans for a top-level separator, excluding
+the two designated homes. Source-TEXT scanners (`parser`/`lexer`/`format`/`fmt_util`/`driver`)
+are not type-name walks and are excluded by file. At `4758935` a mechanical sweep flags 14 loops;
+**two of them (`recordRedundantAnnot`, `recordRedundantRet`) walk `P.toks[t].kind`, i.e. TOKENS,
+not a type name** — excluded. That leaves **10 hand-written copies + 2 homes**; this slice takes
+it to **9 + 2**. The brief's "9" is within one of mine and the difference is the unit: I count
+`typecheck.isObjShapeName`'s BRACE-ONLY ladder, which is a genuine hand-written type-name walk.
+*Say which unit.*
+
+| file | walk | status at `4758935` |
+|---|---|---|
+| `typecheck.vl` | `tyTopIndexOf` | **HOME** (find) |
+| `typecheck.vl` | `tyGroupEndIndex` | **HOME** (group end) |
+| `typecheck.vl` | `isObjShapeName` | copy — **retired by this slice** |
+| `emit_base.vl` | `tyTopLevelIndexOf` | copy — quote-BLIND, filed below |
+| `emit_base.vl` | `tyTopLevelSplit` | copy — quote-BLIND, filed below |
+| `emit_base.vl` | `tyGroupWrapsWhole` | copy (a DIFFERENT reading — see #1147 hand-off 1) |
+| `emit_classify.vl` | `shapeInnerFieldSplit` | copy — quote-BLIND, filed below |
+| `emit_classify.vl` | `shapeFieldParse` | copy — quote-BLIND, **measured NOT the residual** |
+| `emit_classify.vl` | `splitUnionArmsAllDepth` | copy (naked `inStr`, escape-blind) |
+| `emit_classify.vl` | `annRetKind` | copy |
+| `emit_classify.vl` | `unionArmSigKey` | copy |
+| `emit_classify.vl` | `monoUnwrapParens` | copy (paren-only; #1150's hand-off) |
+
+---
+
+### TARGET 1 — the witness reproduces, and #1151's ATTRIBUTION IS REFUTED
+
+`Box<"a,b" | "c" | null>` reproduces at `5d011ff` exactly as filed — `Error: emit error /
+emitProgram: bare null needs a struct-typed context`, with `Box<"ab"|…>`, `Box<"a|b"|…>` and
+`Box<"a:b"|…>` all running. So the witness is real. **Its explanation is not.**
+
+#1151 filed the trigger as *"a quoted COMMA inside a GENERIC ARGUMENT (`gaeSplitArgs`)"*, with ten
+hand-built shapes — including a two-field struct carrying a quoted `,` — read as identical on both
+sides. Both halves of that are wrong, and the first control I tried says so:
+
+```vl
+const b: {v: "a,b" | "c" | null} = { v: "a,b" }   // NO GENERIC ANYWHERE
+if b.v != null { print(b.v) }                     // → the SAME emit error
+```
+
+**IDENTICAL IS NOT CORRECT.** #1151's ten shapes were compared *candidate-vs-merged*; a shape
+broken on BOTH sides reads "identical". Comparing against a control that is expected to WORK is
+what separates the two.
+
+**The space, enumerated and RUN — 300 cells, not a sample.** 15 quoted texts (a control `ab`, plus
+`a,b` `a|b` `a:b` `a{b` `a}b` `a[b` `a]b` `a(b` `a)b` `a<b` `a>b` `a&b` `a=b` `a=>b`) × 10
+POSITIONS (global · alias · 1-field shape · 2-field shape · generic arg · 2-arg generic · array
+element · map value · param · return) × {plain, nullable}, each with a known expected stdout so
+every cell is GRADED (ok / wrong / reject / invalid-wasm / trap).
+
+Master `5d011ff`: **231 ok · 54 reject · 15 invalid-wasm**. Subtracting the cells whose own CONTROL
+(`ab`) also fails — those are pre-existing gaps, not quoting — the **quote-blind population is 24
+cells**:
+
+| position | failing texts | n |
+|---|---|---|
+| `nul` 2-arg generic `P<T,B>` | `,` `{` `}` `[` `]` `(` `)` `<` `=>` | 9 |
+| `nul` 2-field shape `{v:…,w:i32}` | `,` `{` `}` `[` `]` `(` `)` `<` `=>` | 9 |
+| `nul` 1-field shape / `nul` generic | `,` `=>` (each) | 4 |
+| `plain` generic / `plain` 2-arg generic | `=>` (each) | 2 |
+
+**The largest sub-population is a PLAIN INLINE TWO-FIELD STRUCT with no generic in it, and the
+failing character set is NINE wide, not one.** The generic case is a consequence, not the cause:
+`Box<T> = {v:T}` instantiates to exactly the struct annotation that fails on its own.
+
+**THE FIX NEEDS TWO HOMES, AND #1151's ONE-HOME DIFF IS NECESSARY BUT NOT SUFFICIENT.** Measured in
+three builds:
+
+| build | cells fixed | regressions |
+|---|---|---|
+| `emit_base` merge alone (`tyTopLevelIndexOf` + `tyTopLevelSplit` → `tyTopIndexOf`) | **15 of 24** | 0 |
+| + `emit_classify.shapeFieldParse` made quote-aware | **15 of 24 — NO CHANGE** | 0 |
+| + `emit_classify.shapeInnerFieldSplit` → `tyTopIndexOf` | **24 of 24** | 0 |
+
+`shapeFieldParse` is quote-blind and looked like the obvious residual; **a build says it is not
+reached by this population at all.** The residual is `shapeInnerFieldSplit` — the function whose own
+header calls it "THE ONE HOME of the shape layer's field scanner, six functions used to carry a
+hand-copied private copy". *One home for six copies is still a copy of the grammar.*
+
+**Two stale items in the filed diff, caught by re-grepping at the head:** hunk 3 (`annArrowAt`'s
+body → `tyTopIndexOf`) is already **done** — #1150's D-ARROWHOME made `annArrowAt` a one-line
+delegate to `tyTopLevelIndexOf`, so hunk 1 covers it; and no `skipQuotedName` export is needed, because
+`shapeInnerFieldSplit` becomes a resume loop over the already-exported `tyTopIndexOf` rather than an
+inline quote skip. The shipped form is **three hunks in two files**, and it deletes two more
+hand-written walks than the filed one did.
+
+**Evidence for the filed fix (all measured by me):** 24/24 cells fixed, **0 regressions, 0 traps**;
+corpus A/B **1,340 entries, 0 differing** on build-rc + wasm SHA + compiler message + run-rc +
+stdout; binary **1,027,758 → 1,027,120 B, −638 B**; walks **10 → 8**; OFF-LIST unchanged
+(`tyGtIsClose` sheds 3 sites, `tyTopIndexOf` is not on the list).
+
+**The exact diff is in the PR body** (`emit_base.vl` hunks 1–2 belong to the `emit_collect`/
+`emit_base`/`emit_mono` owner; the `emit_classify.vl` hunk to the `emit_classify`/`emit_query`
+owner). **Not shipped here, for the reason #1151 gave and one more:** pinning today's behaviour
+green would pin a defect, and the fix now spans two partitions neither of which is mine. Ship the
+fixture WITH it:
+
+```vl
+// @run
+// @log a,b
+// CONTRACT: a quoted separator inside a literal member of an INLINE OBJECT SHAPE. Both the
+// emit_base depth walk and `shapeInnerFieldSplit` were quote-BLIND, so `{v:"a,b"|"c"|null}`
+// split at the quoted comma into two garbage fields and the annotation was built from rubble
+// (`emitProgram: bare null needs a struct-typed context`). The checker's `tyTopIndexOf` has
+// skipped quoted members since #1143; this is what unifying them buys. NB the generic
+// spelling `Box<"a,b"|"c"|null>` is the SAME defect one instantiation later, and the
+// non-generic control below is the one that shows it is not about generics.
+const b: {v: "a,b" | "c" | null, w: i32} = { v: "a,b", w: 7 }
+if b.v != null { print(b.v) }
+```
+
+---
+
+### A NEW LIVE INVALID-WASM MISCOMPILE, found by the same sweep — filed, deliberately unshipped
+
+The 300-cell matrix reads `invalid-wasm` on all **15** `nul_alias` cells **including the control**,
+which is not a quoting defect at all. Minimized and verified on `5d011ff` and `4758935`:
+
+```vl
+type K = "ab" | "zz" | null      // the `| null` INSIDE the alias
+const v: K = "ab"
+if v != null { print(v) }        // → failed to compile: wasm[0]::function[4]
+```
+
+Controls that all RUN: the inline `const v: "ab"|"zz"|null` · the null OUTSIDE the alias
+(`type K = "ab"|"zz"; const v: K|null`) · the alias without a null arm · `print(v == null)`
+un-narrowed. **Every construction site is affected** — global, local, param, struct field and
+function result each measured as invalid wasm (and `v == "ab"` is a separate clean reject,
+``==` over a struct union is not supported yet`).
+
+**MECHANISM, read from the emitted bytes rather than theorised.** The alias cell is
+`(global (mut (ref 0)))` where type 0 is `(struct (field i32) (field anyref))` — the union BOX —
+and the guard is `struct.get 0 0 / i32.const 6 / i32.ne`, a tag compare against the null tag; the
+inline cell is `(global (mut i32))` with `i32.const -1 / i32.ne`, the ATOM NICHE. Inside the guard
+the alias build emits `global.get 1` (a `(ref 0)`) straight into `call __print_i32__`. The niche is
+selected by `nameIsNulLitUnion`, which needs either a top-level `| null` split or an all-quoted
+member list; **a bare alias NAME carries neither**, so the emitter boxes while every classifier
+downstream answers from the arena, where both spellings are the same type.
+
+**A candidate fix was BUILT and MEASURED and is NOT shipped, because it is necessary but not
+sufficient** — the #1148/#1149 shape again. `canonEmitName` gains one arm expanding a declared
+alias whose arena type `tyIsNullableLitUnion` (with ≥2 literal members) into the inline
+`"a"|"b"|null` spelling, so the alias and the inline annotation become one name. Result on the
+300-cell matrix: **15 cells invalid-wasm → clean reject, 0 regressions, 0 other changes** — a
+strict improvement. But on the wider hand-built set it converts the struct-field cell
+(`{v: K}`) from invalid wasm into **silent wrong output** (`print(b.v)` emits `struct.get; call
+__print_i32__` on the raw atom id and prints `0`), because the niche is now correct while the
+widening gate declines: the alias's arena form is a `TyNullable` and `nodeLitUnionMemberTexts`
+requires a `TyUnion` by design. **Silent-wrong is worse than loud, so the arm does not ship
+alone.** Its companion is #1151's own open hand-off item 2 — `exprIsLitAtom` / `exprNulLitUnion`'s
+Member and Index arms, both in `emit_classify.vl`. The arm's text is in the PR body.
+
+---
+
+### D-BANKREAD — what this slice DOES ship: three checker decisions stop re-deriving a banked value
+
+All three are in `typecheck.vl`. All three are behaviour-preserving, and each is entombed by a
+sabotage that reddens **pre-existing** corpus files — no new fixture.
+
+**H1 — `nodeTyIsUnionAlias`'s same-shape-union recovery reads the ATOM-COUNT BANK.** The arm asks
+"did the source spell a union that collapsed to this struct?" and answered it by
+`splitTypeName(nd.tyName, '|', parts); parts.length >= 2`. `canonEmitTypeNames` — the pass that
+PRODUCES that spelling — already banks the count per node (`annUnionAtomsOf`, #1055/#1113), and
+`emit_collect.vl:collectU` has asked this identical question that way since #1055. Two sites, one
+column now.
+
+**H2 — `nulElemListAtomKind` stops JOINING its atoms and re-PARSING the join.** The expanded
+inline-litunion arm built `core = rest[0] + "|" + …` and handed it to `nameIsLitUnionType`, which
+re-SPLIT it (`nameIsInlineLitUnion` → `splitUnionAtoms`) back into the list `rest` already was.
+Equal by construction on both of that predicate's legs — its `cUserTypes` leg is dead here (a
+joined name carries a `|`, and no declared type NAME can), and its inline leg is exactly "2+
+top-level atoms, each a quoted string literal", which is a test on `rest`.
+
+**H3 — `isObjShapeName` joins the one home.** The file's last hand-written type-name walk outside
+the two homes, and the narrowest: a BRACE-ONLY depth counter, blind to `[]`/`()`/`<>` and to quoted
+members. It is not a shorter spelling of the home's — it DISAGREES, in the direction that loses a
+shape: `{a:"}|{"}` had its brace closed early by the quoted `}`, so the following `|` read as
+top-level and a single object shape was rejected as a union.
+
+#### Coverage and agreement, measured in one instrumented build
+
+A fail-loud probe (the compiler cannot `print` — the report rides `emitFail` into the corpus
+MESSAGE channel) counting reaches, bank-misses and disagreements, over **1,340 corpus files (1,137
+reach emit)** and **43,200 generated fuzz programs (41,084 reach emit)**:
+
+| | corpus | fuzz | total |
+|---|---|---|---|
+| H1 arm reaches | 9,764 | 114,662 | **124,426** |
+| … node is a `TypeRef` | 9,764 (100%) | 114,662 (100%) | 124,426 |
+| … **bank MISSING** (node postdates the bank) | 3,415 | 25,800 | **29,215 (23.5%)** |
+| … **DISAGREEMENTS** | **0** | **0** | **0** |
+| H2 arm reaches | 136 | 119 | 255 |
+| … **DISAGREEMENTS** | **0** | **0** | **0** |
+
+**The bank-missing population is NOT empty and I am not claiming it is** — 23.5% of reaches take
+the `-1`. What is measured empty is the DISAGREEMENT: the deleted split never answered "union"
+where the bank answers "not". The construction argument behind that: an emitter-SYNTHESIZED
+`TypeRef` is minted from a RENDER, and the render of a `TyObj` is a `{…}` shape or a nominal name —
+one top-level atom either way, so a post-bank node cannot spell the collapsed union this arm looks
+for. *"Dead by construction" beats "measured at 0" — this one has both, and they are different
+statements.*
+
+**COMPARATOR PROVED IN ONE BUILD.** Forcing the bank leg's answer FALSE lights the H1 comparator up
+at **62 of 9,764 corpus reaches** — so the instrument can see a divergence at this arm, and the
+live population where the old path says "union" is 62. The same forcing leaves H2's comparator at
+**0**, which is a *finding about the corpus*, not a working comparator: that arm never answers TRUE
+on any file I have. H2's liveness is proved instead by its sabotage (below), which is
+consequential on both channels.
+
+#### Gate — every leg at `4758935`, master baseline rebuilt at that head in this session
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh` | RC=0 — master **1,027,238 B**, candidate **1,027,024 B** (**−214 B**) |
+| `native-fixpoint.sh` | stage3 == stage4 byte-for-byte (1,027,024 B) |
+| `lint-self.sh` | RC=0, fmt clean |
+| suite (`SELFHOST_NATIVE_ALIGN=1 deno task test`) | **2,060 passed / 0 failed / 8 ignored** |
+| suite, master **re-measured at this head, same session, same command** | **2,060 / 0 / 8** — delta **0** (a behaviour-preserving refactor adds no pin); ignored-test NAME SETS **identical**, diffed as sets |
+| corpus A/B | **1,340 entries, 0 differing** on build-rc + wasm SHA + compiler message + run-rc + stdout — every file compared by NAME |
+| corpus channel populations (side A) | 1,137 produce wasm (1,133 distinct SHAs) · 203 build-rc≠0 · 203 carry a message (201 distinct) · 1,097 produce stdout (936 distinct) |
+| lint-tier A/B (`vl check --severity hint`) | **1,340 rows, 733 carrying ≥1 lint, 0 differing** |
+| fuzz A/B | 12 seeds × 3 depths × 2 modes × 300 = **43,200 programs/side, 0 differing** (whole per-case `--out-dir` trees, `diff -r`) |
+| `rep-fuzz-check.sh` | exact ✅ (1 baselined, 0 new, 0 stale) |
+| invocation counts, both sides | below |
+
+#### Entombment — three sabotages, and the fire sets PARTITION
+
+| sabotage | hunk | pre-existing corpus files reddened |
+|---|---|---|
+| **S1** `annUnionAtomsOf(ix) >= 3` | H1 | **3** — `soundness/union-same-shape-discriminant-sound.vl`, `types/struct-union-same-shape-field-slot.vl`, `types/struct-union-same-shape.vl` |
+| **S2** the all-quoted member test stops rejecting a non-literal atom | H2 | **1** — `lists/union-element-array-litunion.vl` (also 1 fuzz case) |
+| **S3** `isObjShapeName` inverts its top-level-`|` verdict | H3 | **11** — 8 `closures/*`, `arrays/map-collapse-to-variant.vl`, `unions/closure-call-union-result-narrow.vl` |
+
+The three fire sets are **pairwise disjoint** and every hunk is covered, so no fixture is owed.
+
+#### The WORK count, on both sides — and what the instrument does NOT cover
+
+Gate item 9. Same instrumentation applied to BOTH sides by one script, summed over the 1,137 corpus
+files that reach emit:
+
+| counter | master | candidate | Δ | % |
+|---|---|---|---|---|
+| `splitTypeName` entries | 19,452 | 9,688 | **−9,764** | −50.20% |
+| `nameIsLitUnionType` entries | 110,032 | 109,896 | **−136** | −0.12% |
+| `splitUnionAtoms` entries | 160,622 | 160,622 | **0** | 0.00% |
+| `tyTopIndexOf` entries | 664,900 | 655,237 | **−9,663** | −1.45% |
+| CHARSTEPS inside the one home | 5,730,578 | 5,607,909 | **−122,669** | −2.14% |
+| `annUnionAtomsOf` entries | 501 | 10,265 | +9,764 | — |
+
+**Every identity is exact.** `splitTypeName` −9,764 ≡ `annUnionAtomsOf` +9,764 ≡ the probe's H1
+reach count — a 0-net relocation, one bank read for each deleted split. `nameIsLitUnionType` −136 ≡
+H2's corpus reach count. `tyTopIndexOf` −9,663 = −9,826 (the deleted splits: 9,764 of them called
+the home once, and the 62 that found a separator called it twice) **+163** (H3's new calls).
+
+**What this instrument does not cover, stated rather than omitted:** (a) the `string[]` and slice
+ALLOCATIONS that went with the 9,764 deleted splits, and the 136 string JOINS deleted by H2 — all
+savings, uncounted, so the true delta is more negative than the table; (b) the char steps of the
+hand-written loop H3 DELETED, which are not in the master column — so H3's apparent +163 calls /
++2,542 charsteps is work MOVED into the instrumented home from an uninstrumented loop of about the
+same length, not new work; (c) the fuzz side (the counters were summed over the corpus only).
+
+#### Refutations
+
+1. **"The trigger is a quoted COMMA inside a GENERIC ARGUMENT (`gaeSplitArgs`)."** Refuted by its
+   own control: `{v: "a,b" | "c" | null}` with no generic anywhere fails identically. The
+   population is 24 cells over 9 characters and 6 positions, and the largest sub-population is a
+   plain two-field inline struct.
+2. **"Ten further hand-built shapes read identical on both sides."** True and misleading — they
+   were compared candidate-vs-merged, and a shape broken on BOTH sides reads identical. Three of
+   those ten (the two-field struct with a quoted `,`, and both generic shapes) are in my failing
+   set.
+3. **"The filed three-hunk `emit_base` diff fixes it."** It fixes **15 of 24**. The residual needs
+   `emit_classify.shapeInnerFieldSplit`.
+4. **`shapeFieldParse` is the residual.** It is quote-blind and it is the obvious candidate; a
+   build with it repaired fixes **zero** additional cells.
+5. **The filed hunk 3 (`annArrowAt` → `tyTopIndexOf`).** Already done by #1150 — `annArrowAt` is a
+   one-line delegate today, so hunk 1 subsumes it. *Re-grep every lead against the head.*
+6. **"`typecheck.vl`'s copies still disagree today"** (the header at `typecheck.vl:4611`).
+   Verified stale: `parenEnclosesWhole`, `nameIsFuncTypeAtom`, `splitUnionAtoms`,
+   `unionMemberCount`, `canonShapeName`, `splitTypeName` and `splitGenArgs` all ride the home at
+   `4758935`. **A header comment is not evidence** — it was describing the pre-#1143 state in the
+   present tense.
+7. **Hand-written walks tree-wide = 9.** Under my stated unit it is **10 copies + 2 homes** at
+   `4758935`; a mechanical sweep flags 14, two of which (`recordRedundantAnnot`,
+   `recordRedundantRet`) walk TOKEN KINDS, not a type name. *Name the unit or the number is not
+   comparable.*
+8. **The nullable-litunion-alias canon arm fixes the miscompile.** It converts 15 invalid-wasm
+   cells into clean rejects with 0 regressions, and converts the struct-field cell from invalid
+   wasm into **silent wrong output**. Necessary, not sufficient; not shipped.
+9. **A witness for H3's behaviour change.** I searched at `isObjShapeName`'s only consumer (the
+   lambda inferred-return recorder) and could not construct one: the `xs.map(x => ({...}))` form
+   the shape needs does not parse, and **the control fails identically**, so the attempt refutes
+   itself rather than the change. H3 ships as a refactor with 0 divergence over 1,340 corpus +
+   43,200 fuzz programs, entombed by S3's 11-file fire set.
+
+#### Hand-off, best-measured first
+
+1. **THE QUOTE-BLIND GRAMMAR — three hunks, two files, 24 graded cells, corpus-clean, −638 B.**
+   Exact diff in the PR body. Owners: `emit_base.vl` (hunks 1–2) and `emit_classify.vl` (hunk 3).
+   Ship with the fixture above. This retires **two** more hand-written walks (10 → 8).
+2. **THE NULLABLE-LITUNION ALIAS MISCOMPILE** — invalid wasm at five construction sites on master,
+   mechanism read from the bytes, candidate arm measured. Needs the `emit_classify` companion
+   (`exprIsLitAtom` / `exprNulLitUnion` Member+Index arms) landed in the same PR, or the loud
+   failure becomes a silent one.
+3. **`emit_classify.splitUnionArmsAllDepth` uses a NAKED `inStr` toggle** — quote-aware but
+   ESCAPE-blind, so `"a\"|b"` walks straight through it. Same class, not covered by hunks 1–3.
+4. **The remaining `typecheck.vl` off-list concentration is `canonEmitName`** — 11 off-list + 8
+   core call sites in one name→name rewriter, 19 of the file's 47. It is blocked exactly where the
+   census says: `canonEmitName` is not `tyToEmitName ∘ nameToTy`, so **one agreed emit renderer is
+   the prerequisite**, not a cleanup.
+5. **DECLINED WITH ARITHMETIC:** `isValueUnionName`'s `unionMemberCount(name) < 2` in front of
+   `splitUnionAtoms` looks like the same one-value-two-parses shape and is not — it is a
+   non-allocating cheap reject in front of an allocating split, so deleting it is a WORK
+   REGRESSION (#1138's rule). Left alone.
