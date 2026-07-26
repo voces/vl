@@ -122,6 +122,8 @@ import {
   tsKids,
   tsKind,
   tsText,
+  tsToName,
+  udTsRootAt,
 } from "./ast"
 import {
   ArrayLit,
@@ -2376,37 +2378,6 @@ function operandKind(ix: i32) {
   if t is TyArray { return "an array" }
   if t is TyMap { return "a map" }
   "a type"
-}
-
-// Split a synthetic intersection name (`A&B`, `{a:i32}&B`) into its TOP-LEVEL
-// operands (depth-aware, so a nested `{…}`/`[…]`/`(…)`/`<…>` `&` doesn't split). One
-// element when there is no top-level `&`.
-function splitTopAmp(name: string) {
-  const parts: string[] = []
-  let depth = 0
-  let angOpen = 0
-  let start = 0
-  let i = 0
-  while i < name.length {
-    const c = name[i]
-    if c == '{' || c == '[' || c == '(' {
-      depth = depth + 1
-    } else if c == '<' {
-      depth = depth + 1
-      angOpen = angOpen + 1
-    } else if c == '}' || c == ']' || c == ')' {
-      depth = depth - 1
-    } else if c == '>' && tyGtIsClose(name, i, angOpen) {
-      depth = depth - 1
-      angOpen = angOpen - 1
-    } else if c == '&' && depth == 0 {
-      parts.push(name.slice(start, i))
-      start = i + 1
-    }
-    i = i + 1
-  }
-  parts.push(name.slice(start, name.length))
-  parts
 }
 
 // The base scalar a literal type SOFTENS to (host: `StringLiteral` → string,
@@ -6726,6 +6697,41 @@ function isPlainAliasRef(name: string) {
 // declared function type could resolve THROUGH — so the transparency is unconditional
 // (no `isPlainAliasRef` gate, which exists only to keep the canonicalized intersection's
 // named-struct route alive).
+//
+// WHY THE ARRAY MEMBER (D-ALIASARR), AND WHY ONLY OVER A SCALAR SPINE. `type L = i32[]` is the
+// same degenerate wrapper one arm over, and #1137 handed it on with a caution: that an array,
+// UNLIKE a function, might have a nominal emit route to lose. Measured, that caution is right
+// for EXACTLY ONE element kind and wrong for the rest — which is why the gate below is a
+// property of the ELEMENT and not of the array.
+//
+// Method: a 17-position alias-vs-inline twin table over six alias bodies (`i32[]`, `string[]`,
+// `f64[]`, `boolean[]`, `Cat[]`, `i32[][]`), 102 cells, run against a parent-built compiler and
+// against this one. On the parent, 17/17 positions differ for every body and there are 0 cells
+// where the alias spelling works and the inline spelling does not — there is no working route
+// to lose because there is no working route at all: `xs[0]` reads ``cannot index non-array
+// i32[]``, `.length`/`.push` read ``field '…' is not on every member of i32[]``, and a RETURN
+// whose result is never read builds an INVALID MODULE, the same silent-miscompile shape
+// D-ALIASFN found one arm over.
+//
+// The ONE exception is a NOMINAL element. `singleMemberAliasName` hands the emitter
+// `tyToEmitName(m)`, and that renders a declared struct element STRUCTURALLY — `Cat[]` becomes
+// `{n:i32}[]` — so the declared name the emitter's element tables key on is dropped. That is a
+// real route, and it is load-bearing: `type Cat = {n: i32}; type L = Cat[]` used as a UNION ARM
+// in a parameter (`f(x: L | i32)`) COMPILES AND RUNS on the parent and becomes an emit reject
+// if the render is substituted. So the arm is gated on `arrSpineIsScalar` — peel the array
+// spine and require a `TyPrim` leaf, the condition under which `tyToEmitName` is
+// name-faithful. Five of the six bodies qualify; `Cat[]` keeps the parent's behaviour exactly,
+// in both directions, and is handed off rather than forced.
+//
+// The corpus population is empty either way: 0 array-bodied aliases in the 1,314 `tests/cases`
+// files, and `singleAliasMemberTyIx` meets a one-member union over a `TyArray` 0 times in a
+// `vl check --codegen` sweep of them (against 67 `TyPrim`, 48 `TyFunc`, 41 `TyObj` and 18
+// `TyLit` members of 178 one-member unions, out of 2,551 `TyUnion` meets). So the arm cannot
+// regress anything extant and its entombment comes from new fixtures.
+//
+// `TyMap` is deliberately NOT included: the same shape of hole (`map=0` in that sweep, so also
+// unpopulated) but it has its own twin table to build and its own value-name family to check,
+// and widening two arms behind one measurement is what D-ALIASFN's sabotage S2 exists to punish.
 function singleAliasMemberTyIx(ti: i32, name: string) {
   const t = T.tys[ti]
   if t is TyUnion {
@@ -6734,12 +6740,42 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
       const mt = T.tys[m0]
       if mt is TyPrim { return m0 }
       if mt is TyFunc { return m0 }
+      if mt is TyArray {
+        if arrSpineIsScalar(m0) { return m0 }
+      }
       if mt is TyObj {
         if isPlainAliasRef(name) { return m0 }
       }
     }
   }
   -1
+}
+
+// True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is a primitive — the
+// exact condition under which `tyToEmitName` renders the type name-faithfully, because every
+// rung it walks (`T[]`, and a `TyPrim`'s own spelling) is the spelling the annotation had.
+// Any other leaf — a declared or inline object, a map, a union, a nullable, a function — is
+// rendered structurally or softened, so the render is NOT a faithful substitute for the alias
+// and the member stays opaque. Bounded by the arena walk itself: an array's element is always
+// a strictly earlier construction, so the spine cannot cycle.
+function arrSpineIsScalar(ty: i32) {
+  let cur = ty
+  let going = true
+  let ans = false
+  while going {
+    if cur < 0 {
+      going = false
+    } else {
+      const t = T.tys[cur]
+      if t is TyArray {
+        cur = t.aElem
+      } else {
+        if t is TyPrim { ans = true }
+        going = false
+      }
+    }
+  }
+  ans
 }
 
 // The single member's EMIT name of a declared one-member union ALIAS (`type Id = i32` → "i32",
@@ -7093,12 +7129,38 @@ export function canonEmitTypeNames() {
       // deliberately excluded: it carries no `UnionDecl`, its annotation keeps the
       // application NAME (`nullablePartOf` peels straight to it), and `is Box<i32>` already
       // resolves there — rewriting it would break the one spelling that works.
+      //
+      // D-ISALIAS: the same repair for a TRANSPARENT one-member alias
+      // (`type L = i32[]`, `type Id = i32`, `type F = (i32) => i32`,
+      // `type MyCat = Cat`). The union-variant arm above canon'd `L` to its
+      // member's emit name through `singleMemberAliasName`, so an `is L` left
+      // spelled `L` names a variant the emitter no longer has — and the
+      // consequence is not a clean miss: for a SCALAR-element arm the emitter
+      // falls through to code it cannot validate (an INVALID MODULE), and only
+      // for a ref-element arm does it reach the located
+      // ``is` names a type that is not a union variant`` reject. Measured on
+      // master, this bites EVERY transparency arm that predates this slice —
+      // `type Id = i32` in a union, narrowed with `is`, is an invalid module
+      // today — so the rewrite is written against the whole rule and not
+      // against the array arm that surfaced it.
+      //
+      // Gated on `singleMemberAliasName` rather than run through
+      // `canonEmitName` unconditionally: the general canon softens a literal
+      // member to its base scalar (`"a"` → `string`), which would destroy a
+      // literal-union `is` test that resolves correctly today. The gate is the
+      // TRANSPARENCY predicate itself, and the value written is what
+      // `canonEmitName` computes for that same name (its first arm is
+      // `singleMemberAliasName` then a recursion) — the same producer the
+      // variant arm above used, which is the invariant that keeps the two
+      // spellings of one annotation from diverging.
       const opTy = nodeTyIxOf(n.isObj)
       if opTy >= 0 {
         const ot = T.tys[opTy]
         if ot is TyUnion {
           const gis = unionMemberGenAppShape(n.isVariant)
           if gis != "" { n.isVariant = gis }
+          const sis = singleMemberAliasName(n.isVariant)
+          if sis != "" { n.isVariant = canonEmitName(sis) }
         }
       }
     } else if n is AsExpr {
@@ -11099,7 +11161,18 @@ function checkProgramNode(n: Program) {
             let resolvedAny = false
             const declMemberIxs: i32[] = []
             while vi < variants.length {
-              const m = nameToTy(variants[vi])
+              // D-UDVARTY: a union MEMBER is a parser spelling, banked on this
+              // declaration node in member order by `setUdTs` — so resolve the
+              // TREE, not the concatenated name. `annotResolve` is the shared
+              // ladder (`tsToTy` when a root is present, `nameToTy` when it is
+              // not), the same one every positioned annotation and the `is`
+              // test already climb. Measured over the 1,314-file corpus swept
+              // with `vl check --codegen`: 548 of 548 reads carry a root (0
+              // misses), 547 rows answer on both sides with 224 distinct
+              // rendered types per side, and the STRICT structural walk finds 0
+              // disagreements — while `tyEq` finds 0 under a sabotage the strict
+              // walk catches 547 times, which is why the walk is the comparator.
+              const m = annotResolve(variants[vi], udTsRootAt(stmts[ti], vi))
               if m >= 0 {
                 declMemberIxs.push(m)
                 resolvedAny = true
@@ -11145,7 +11218,36 @@ function checkProgramNode(n: Program) {
               // and a string literal), or call out a self-reference
               // (`type E = A & E`). Falls back to the generic wording for a
               // non-binary / non-intersection never (e.g. `type C = NeverAlias`).
-              const ops = splitTopAmp(variants[0])
+              // D-UDNEVER: the intersection's OPERANDS are the kids of the
+              // member's `TS_ISECT` spelling node. Read them; do not re-split the
+              // name the parser concatenated. `splitTopAmp` — a depth-aware
+              // top-level `&` scanner over a rendered type, `<>`-aware since
+              // D-CLASSANG — had this as its ONLY call site and is deleted with it.
+              //
+              // Behaviour is preserved at the two gates that matter. `ops.length
+              // == 2` selected a BINARY top-level intersection, and the kid count
+              // of a `TS_ISECT` is exactly that count; a member with no top-level
+              // `&` has a non-`TS_ISECT` root and yields 0 kids, where the old
+              // scanner yielded the 1-element whole name — both miss `== 2` and
+              // fall to the generic wording. A member with no recorded root does
+              // the same. `tsToName` reproduces the spelling character for
+              // character (it is what `driver.vl`'s module merge itself pushes
+              // into `udVariants`), so `expr` and the self-reference NAME test are
+              // unchanged.
+              const opRoots: i32[] = []
+              const ops: string[] = []
+              const isectRoot = udTsRootAt(stmts[ti], 0)
+              if isectRoot >= 0 {
+                if tsKind[isectRoot] == TS_ISECT {
+                  const opStart = tsKidStart[isectRoot]
+                  let opk = 0
+                  while opk < tsKidCount[isectRoot] {
+                    opRoots.push(tsKids[opStart + opk])
+                    ops.push(tsToName(tsKids[opStart + opk]))
+                    opk = opk + 1
+                  }
+                }
+              }
               let didDetail = false
               if variants.length == 1 && ops.length == 2 {
                 const expr = ops[0] + " & " + ops[1]
@@ -11166,9 +11268,9 @@ function checkProgramNode(n: Program) {
                       "` is `never` (an empty type — `" +
                       expr +
                       "`, " +
-                      operandKind(nameToTy(ops[0])) +
+                      operandKind(tsToTy(opRoots[0])) +
                       " and " +
-                      operandKind(nameToTy(ops[1])) +
+                      operandKind(tsToTy(opRoots[1])) +
                       ", have no common values), so it has no values",
                     stmts[ti],
                   )
