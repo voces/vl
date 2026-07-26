@@ -356,6 +356,64 @@ const toLsp = (pos: Position): { line: number; char: number } => ({
   char: pos.column,
 });
 
+// ---- displayable types ------------------------------------------------------
+//
+// Every rendered type string the editor shows — inlay labels, hover bodies,
+// completion details — comes from ONE native producer, `tyToStr`
+// (compiler/typecheck.vl), whose own header calls it "type → string (for
+// diagnostics)". A diagnostic renderer may legitimately say "there is no type
+// here"; an EDITOR SURFACE may not, because both surfaces are annotation-shaped:
+// an inlay hint is literally formatted `: T` (a suggestion of the annotation to
+// write) and a hover body is fenced as a `vital` code block (a claim that the
+// text IS VL). So a rendering the user could not type must never reach them.
+//
+// `tyToStr` has FOUR give-up markers, and they split into two groups that must be
+// treated differently — measured over the 1,311-file `tests/cases` corpus
+// (7,733 rendered type strings), counting sightings on files with NO error-tier
+// diagnostic:
+//
+//   ABSENCE of a type — safe to suppress on:
+//     `<error>`  TyErr, the unresolved annotation   clean 0 · errored 23
+//     `<none>`   no arena entry (index < 0)         clean 1 · errored 10
+//     `<?>`      an arm `tyToStrGo` doesn't handle  clean 0 · errored  0
+//   PRESENCE of a type, elided — must NOT suppress on:
+//     `…`        the depth cap (`tyToStrDepth > 8`) clean 45 · errored 0
+//
+// That last row is why this list is a measurement and not a guess: `…` is the
+// ONLY marker that fires at volume on healthy code (deep recursive types, e.g.
+// `generics/recursive-generic-alias-array.vl`). Suppressing on it would delete 45
+// informative hints from correct programs — a worse defect than the one this
+// fixes. The three absence markers carry no information the user can act on: the
+// single clean `<none>` sighting is `types/infer-null-unconstrained.vl` rendering
+// `let _x = null` as `: <none>?`, itself unspellable (VL spells that type `null`).
+//
+// NOTE this is a SENTINEL test, not type-string parsing: these are fixed literals
+// `tyToStr` emits in place of a type, and no writable VL type rendering contains
+// `<` (a generic application renders structurally — `Box<i32>` prints as
+// `{v: i32}`). Nothing here inspects a type's STRUCTURE.
+const ABSENT_TYPE_MARKERS = ["<error>", "<none>", "<?>"];
+
+/**
+ * Whether a native rendered type is fit to show in an annotation-shaped editor
+ * surface — i.e. it names a type the user could actually write. False for the
+ * empty string and for any rendering carrying one of `tyToStr`'s
+ * absence-of-a-type sentinels (see {@link ABSENT_TYPE_MARKERS}). A truncated but
+ * real type (`…`) stays displayable.
+ */
+export const isDisplayableType = (rendered: string): boolean =>
+  rendered.length > 0 && !ABSENT_TYPE_MARKERS.some((m) => rendered.includes(m));
+
+/**
+ * {@link isDisplayableType} as a pass-through filter for the hover chain: a
+ * rendering that isn't displayable becomes `undefined`, so the caller treats it
+ * as "no answer" and falls through to the next resolver (member access → type
+ * alias → builtin) instead of printing a non-VL type name.
+ */
+export const displayableType = (
+  rendered: string | undefined,
+): string | undefined =>
+  rendered !== undefined && isDisplayableType(rendered) ? rendered : undefined;
+
 /**
  * One inlay-hint CANDIDATE from an external source (the wasm checker's
  * `inlayHintsAt`): an unannotated declaration with its inferred type. `kind` 0 = a
@@ -387,6 +445,9 @@ export const inlayHintsFromWasm = (
   const lines = splitLines(source);
   const hints: TypeInlayHint[] = [];
   for (const c of candidates) {
+    // An inlay hint is a suggestion of the annotation to WRITE (`: T`), so a
+    // rendering that names no type must not be offered as one.
+    if (!isDisplayableType(c.type)) continue;
     const idEnd: Position = { line: c.line, column: c.col };
     // A function's return-type hint sits after the param list's `)`; a value
     // binding's after its name. Skip a function whose `)` can't be located.
@@ -621,7 +682,10 @@ export const scopeCompletionsFromBindings = (
     byName.set(b.name, {
       name: b.name,
       kind: scopeBindingKind(b.kind),
-      detail: b.type.length > 0 ? b.type : undefined,
+      // The detail renders as `: T` on the label row and as a `vital` code block
+      // in the docs panel, so it takes the same displayable-type filter as the
+      // inlay label — an undisplayable rendering is dropped, not shown.
+      detail: isDisplayableType(b.type) ? b.type : undefined,
     });
   }
   return [...byName.values()];
@@ -654,7 +718,7 @@ export const builtinCompletionsFromWasm = (
   builtins.map((b) => ({
     name: b.name,
     kind: b.kind === 1 ? "function" : "type",
-    detail: b.detail.length > 0 ? b.detail : undefined,
+    detail: isDisplayableType(b.detail) ? b.detail : undefined,
   }));
 
 /**
@@ -674,7 +738,7 @@ export const memberCompletionsFromWasm = (
     byName.set(m.name, {
       name: m.name,
       kind: m.isMethod ? "function" : "variable",
-      detail: m.detail.length > 0 ? m.detail : undefined,
+      detail: isDisplayableType(m.detail) ? m.detail : undefined,
     });
   }
   return [...byName.values()];

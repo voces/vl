@@ -110,6 +110,52 @@ in order of safety:
   vis spans with an import-visibility check) rather than a flat global scope. Def/refs/
   hover are unaffected — they disambiguate by module tag (`symOccModuleAt`).
 
+- **`tyToStr` is a DIAGNOSTIC renderer doing an ANNOTATION renderer's job.** Every type
+  the editor shows — inlay labels, hover bodies, completion details — is `tyToStr`
+  output, and its own header says "type → string (for diagnostics)". But those surfaces
+  are annotation-shaped: an inlay hint is formatted `: T` (a suggestion of the
+  annotation to write) and a hover is fenced as a `vital` code block (a claim the text
+  is VL). So the renderer's give-up markers and internal names leak into positions that
+  imply the user could type them. The host now filters the three ABSENCE markers
+  (`<error>`/`<none>`/`<?>`, via `isDisplayableType` in `lsp/src/typeFeatures.ts`) —
+  measured 0 sightings on diagnostic-free corpus files, so the filter is confined to
+  broken code. **`…` is deliberately NOT filtered** (45 clean sightings — the depth cap
+  on legitimately deep recursive types; it means a type is PRESENT but elided).
+  Remaining: `any` still reaches the editor. It renders a `?fn.N` inference hole and
+  cannot be filtered host-side without deleting informative hints from healthy code
+  (`: any[]`, `: {x: any, y: any}`, 88 clean corpus labels). The real fix is a separate
+  DISPLAY renderer that spells a hole as a type parameter (`T`, `U` — which VL can
+  actually write, and which preserves the distinctness `any` destroys), leaving
+  `tyToStr` alone for error messages.
+
+- **`inlayHole` is shallow, and `check_state.vl`'s header says otherwise.** The comment
+  at `check_state.vl` ("A type that's still an inference hole … is skipped") is true
+  only of a TOP-LEVEL hole: `inlayHole` (`typecheck.vl`) tests one arena node, so a
+  `TyUnion` whose members are all holes passes the guard and a return hint renders
+  `any | any` — two DISTINCT holes (`?f.0`, `?f.1`) that the renderer prints
+  identically. This is the owner-reported defect. A validated four-line union arm on
+  `inlayHole` (probe-built and measured: corpus inlay hints 4,249 → 4,207, unspellable
+  labels 110 → 74, all 36 removed being all-holes unions, `: any | string` and
+  `: {foo: any, bar: any}` both preserved, diagnostics unchanged) is filed with the
+  `typecheck.vl` owner. NB the union case should be skipped for the same reason the
+  scalar case already is — a lone hole return renders no hint today.
+
+- **A function whose parameter annotation fails to resolve can still get a confident
+  return hint.** `function f(v: {foo: string} | {bar: any}) { if v is {foo: string} {
+  return v.foo }; return v.bar }` — the annotation does not resolve (`any` is not a VL
+  type), yet the `is`-narrowed arm supplies `string` and the editor offers `: string`.
+  Root: in the return-inference join, `inferObserved >= 0` wins over `inferSawErr`, so
+  error-typed arms are dropped rather than poisoning the result.
+
+- **The return-inference cascade guard misses the unresolvable-annotation case.**
+  `paramUninferable` exists to suppress a redundant "cannot infer a return type" once a
+  parameter already reported its own root cause, but it is set ONLY for an anonymous
+  lambda param with no annotation and no contextual type. A named function whose
+  written annotation fails to RESOLVE reports both `unknown type '…'` and the return
+  message. Measured one variable apart, all three of `v: any`, `v: {bar: any}`,
+  `v: {foo: string} | {bar: any}` behave identically — the message count tracks the
+  presence of an `is` guard, NOT the annotation's nesting depth.
+
 ## Test infrastructure
 
 - **Per-file isolation vs wasm traps.** `runWasm` rethrows on trap and drops the
