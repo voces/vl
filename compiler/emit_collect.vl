@@ -84,12 +84,13 @@ import {
 } from "./ast"
 import {
   annArrowAt,
+  cloArrElemNameOf,
   gaeLtAt,
   isStructAtom,
   isVariantBoxUnion,
   mapValNameOf,
   nameIsArray,
-  nameIsClosureArray,
+  nameIsBareMap,
   nameIsClosureArrayTy,
   nameIsF32Array,
   nameIsF64Array,
@@ -106,11 +107,11 @@ import {
   nameNamesFunction,
   nodeIsTypeDecl,
   nulLitUnionInnerName,
-  nullClosureArrElem,
   nullablePartOf,
   parenUnionArrElemName,
   peelGroupParens,
   retBoolFlag,
+  shapeInnerFieldSplit,
   strContains,
   strLess,
   tyIsFuncType,
@@ -563,7 +564,19 @@ function cloResultIsPlainScalar(r: string) {
 // litunion / map / string) is deliberately left un-interned so the value call stays a clean
 // REJECT — synthesizing its sig would let a mis-lowering nested body reach INVALID-WASM /
 // TRAP (the recovery of a boxed/atom result through a CHAINED closure call is a later slice).
-function internCloResultChain(tn: string) {
+function internCloResultChain(tn: string) { internCloResultSpine(tn, false) }
+// THE ONE HOME of the closure RESULT-SPINE walk. `internCloResultChain` (the CHECKER-type
+// entry, off a closure-returning lambda's `nodeTyName`) and `internNulCloResultSpine` (the
+// nulclosure-ANNOTATION entry, off the annotation's `| null` inner) were the SAME loop with
+// the SAME guard, the SAME `unionArmSigKey`/`cloSigPosOfKey` intern and the SAME
+// descend-only-through-a-closure-result rule; they differed in ONE disjunct.
+//
+// `wideShape` is that disjunct: the ANNOTATION entry also interns a level whose result is a
+// single-shape STRUCT (`>sN;` round-trips through a chained value call — the struct is a
+// plain ref read off the `call_ref` result, and `unionArmSigKey` keys "" for a shape that
+// never interned, so that level stays a clean reject). The CHECKER entry does not, and the
+// difference is load-bearing rather than incidental — sabotage S4 measures it.
+function internCloResultSpine(tn: string, wideShape: boolean) {
   if tn == "" { return 0 }
   let cur = peelWrapType(tn)
   let guard = 0
@@ -573,7 +586,11 @@ function internCloResultChain(tn: string) {
     if a < 0 { return 0 }
     const ret = peelWrapType(cur.slice(a + 2, cur.length))
     const retIsClosure = annArrowAt(ret) >= 0
-    if retIsClosure || cloResultIsPlainScalar(ret) {
+    let takes = retIsClosure || cloResultIsPlainScalar(ret)
+    // Evaluated ONLY when the two cheap disjuncts declined — the short-circuit the two
+    // copies had, kept exactly (`nameIsSingleShape` is the depth scanner, not a char test).
+    if !takes && wideShape { takes = nameIsSingleShape(ret) }
+    if takes {
       const k = unionArmSigKey(cur)
       if k != "" {
         if cloSigPosOfKey(k) < 0 {
@@ -600,31 +617,7 @@ function internCloResultChain(tn: string) {
 // `unionArmSigKey` keys "" for a shape that never interned — that level then stays a clean
 // reject. The litunion / union-box / map / string results stay excluded (their recovery
 // through a CHAINED closure call is the same unfinished slice `internCloResultChain` bounds).
-function internNulCloResultSpine(tn: string) {
-  if tn == "" { return 0 }
-  let cur = peelWrapType(tn)
-  let guard = 0
-  while guard < 64 {
-    guard = guard + 1
-    const a = annArrowAt(cur)
-    if a < 0 { return 0 }
-    const ret = peelWrapType(cur.slice(a + 2, cur.length))
-    const retIsClosure = annArrowAt(ret) >= 0
-    if (retIsClosure || cloResultIsPlainScalar(ret) || nameIsSingleShape(ret)) {
-      const k = unionArmSigKey(cur)
-      if k != "" {
-        if cloSigPosOfKey(k) < 0 {
-          cloSigKeys.push(k)
-          cloSigRepFn.push(-1)
-        }
-      }
-    }
-    // Descend only THROUGH a nested-closure result — a scalar/struct result ends the spine.
-    if !retIsClosure { return 0 }
-    cur = ret
-  }
-  0
-}
+function internNulCloResultSpine(tn: string) { internCloResultSpine(tn, true) }
 
 // Collect the distinct `$fnsig` env-leading functypes — one per distinct eligible
 // signature KEY across all lifted functions (any could be used as a value), in
@@ -789,10 +782,7 @@ export function collectCloSigs() {
       // `fnSigIdxForArity` — a "no interned signature" reject. The union-ARM dual of
       // the top-level closure-array pass (same `unionArmSigKey` element-key
       // normalization the call site derives via `cloArrSlotSigKey`).
-      let uCael = nullClosureArrElem(atoms[uj])
-      if uCael == "" && nameIsClosureArray(atoms[uj]) {
-        uCael = atoms[uj].slice(0, atoms[uj].length - 2)
-      }
+      const uCael = cloArrElemNameOf(atoms[uj])
       if uCael != "" {
         const uCak = unionArmSigKey(uCael)
         if uCak != "" {
@@ -860,10 +850,7 @@ export function collectCloSigs() {
       // `unionArmSigKey` peels the element's grouping parens to the SAME key the call
       // sites derive (`cloArrSlotSigKey` / `cloNameSigKey`); a live lambda of the same
       // shape dedups onto its key via `cloSigPosOfKey`.
-      let cael = nullClosureArrElem(nm)
-      if cael == "" && nameIsClosureArray(nm) {
-        cael = nm.slice(0, nm.length - 2)
-      }
+      const cael = cloArrElemNameOf(nm)
       if cael != "" {
         const cak = unionArmSigKey(cael)
         if cak != "" {
@@ -910,69 +897,42 @@ export function collectCloSigs() {
 // (code 22) FIELD — the `collectFnValUse` gate for a shape annotation whose field
 // cell is a closure fat-pointer. Same depth-0 field split the `shapeHasCloField` gate uses.
 function shapeHasCloField(nm: string) {
-  const inner = nm.slice(1, nm.length - 1)
-  let depth = 0
-  let angOpen = 0
-  let start = 0
-  let k = 0
-  while k <= inner.length {
-    let brk = false
-    if k == inner.length {
-      brk = true
-    } else {
-      const c = inner[k]
-      if c == '{' || c == '[' || c == '(' { depth = depth + 1 }
-      if c == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
+  let fi = 0
+  while fi < fnames.length {
+    if fnames[fi] != "" {
+      const ftxt = ftexts[fi]
+      const fc = nameFieldCode(ftxt)
+      if fc == 14 || fc == 22 { return true }
+      // A CLOSURE-ARRAY field (`z: (() => i64)[]`) or a UNION field with a closure /
+      // closure-array arm (`z: (() => i64)[] | i32`): the cell holds closure
+      // fat-pointers too, so a narrowed member-array call (`t0.z is (()=>i64)[]`,
+      // `t0.z[0]()`) `call_ref`s through it — flip the machinery on even when no lambda
+      // elsewhere does (fuzz F5gJXz declared seed 530559367 case_00309).
+      if cloArrElemNameOf(ftxt) != "" { return true }
+      // D-UNION set ADT — a field type that IS a registered union row's member
+      // set answers from the recorded member column, and the CARDINALITY gate
+      // becomes that list's length (`unionMemberCount` is the counting dual of
+      // `splitUnionAtoms`, so the two gates are the same predicate). An
+      // un-interned field spelling keeps the count-then-split pair.
+      const shcAtoms: string[] = []
+      if !msMemberAtomsOf(ftxt, shcAtoms) {
+        if unionMemberCount(ftxt) > 1 { splitUnionAtoms(ftxt, shcAtoms) }
       }
-      if c == '}' || c == ']' || c == ')' { depth = depth - 1 }
-      if c == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
+      if shcAtoms.length > 1 {
+        let shc = 0
+        while shc < shcAtoms.length {
+          const shcA = shcAtoms[shc]
+          if annArrowAt(shcA) >= 0 { return true }
+          if nameIsNulClosure(shcA) { return true }
+          if cloArrElemNameOf(shcA) != "" { return true }
+          shc = shc + 1
+        }
       }
-      if c == ',' && depth == 0 { brk = true }
     }
-    if brk {
-      const part = inner.slice(start, k)
-      const ci = part.indexOf(":")
-      if ci > 0 {
-        const ftxt = part.slice(ci + 1, part.length)
-        const fc = nameFieldCode(ftxt)
-        if fc == 14 || fc == 22 { return true }
-        // A CLOSURE-ARRAY field (`z: (() => i64)[]`) or a UNION field with a closure /
-        // closure-array arm (`z: (() => i64)[] | i32`): the cell holds closure
-        // fat-pointers too, so a narrowed member-array call (`t0.z is (()=>i64)[]`,
-        // `t0.z[0]()`) `call_ref`s through it — flip the machinery on even when no lambda
-        // elsewhere does (fuzz F5gJXz declared seed 530559367 case_00309).
-        if nameIsClosureArray(ftxt) || nullClosureArrElem(ftxt) != "" {
-          return true
-        }
-        // D-UNION set ADT — a field type that IS a registered union row's member
-        // set answers from the recorded member column, and the CARDINALITY gate
-        // becomes that list's length (`unionMemberCount` is the counting dual of
-        // `splitUnionAtoms`, so the two gates are the same predicate). An
-        // un-interned field spelling keeps the count-then-split pair.
-        const shcAtoms: string[] = []
-        if !msMemberAtomsOf(ftxt, shcAtoms) {
-          if unionMemberCount(ftxt) > 1 { splitUnionAtoms(ftxt, shcAtoms) }
-        }
-        if shcAtoms.length > 1 {
-          let shc = 0
-          while shc < shcAtoms.length {
-            const shcA = shcAtoms[shc]
-            if annArrowAt(shcA) >= 0 { return true }
-            if nameIsNulClosure(shcA) { return true }
-            if nameIsClosureArray(shcA) || nullClosureArrElem(shcA) != "" {
-              return true
-            }
-            shc = shc + 1
-          }
-        }
-      }
-      start = k + 1
-    }
-    k = k + 1
+    fi = fi + 1
   }
   false
 }
@@ -2287,6 +2247,29 @@ function rlMapElemValSlot(slot: i32, canon: boolean): i32 {
   mvSlotByValNameOr(vn)
 }
 
+// The VARIANT struct heap index of ref-list slot `slot`'s element (`Cat[]` → the `Cat`
+// variant's `uVarHeap`), or -1. `mAssignTypeIndices` asked this twice — once building the
+// dedup SIGNATURE and once resolving the element HEAP — with the `| null` peel and the
+// `variantIndexOf` lookup hand-copied at both. One home, so the two answers cannot drift
+// apart (they are the same question by construction: the sig pass exists to predict the
+// heap pass) and the DESTRINGIFY note below has one address instead of two.
+//
+// DESTRINGIFY — MEASURED UNVERIFIABLE (#1098, re-stated here): an arena reading (peel the
+// recorded `TyNullable` off `rlElemTyIx`, gate on `tyIxIsVariantMember`, take the row by
+// the peeled type's NOMINAL name) was built and swept. A reach marker enters this peel on
+// 79 of the corpus files, but `variantIndexOf` answers on ZERO of them, and neither a
+// hand-written `Cat[]` variant-element list nor a variant-returning `.map` collapse
+// reaches it. A leg that cannot be sabotage-verified is not migrated (method note 6) — the
+// peel stays until a reacher exists, and now it stays in ONE place.
+function rlElemVariantHeap(slot: i32): i32 {
+  let rsen = rlElemName[slot]
+  const rsnn = nullablePartOf(rsen)
+  if rsnn != "" { rsen = rsnn }
+  const evi = variantIndexOf(rsen)
+  if evi < 0 { return -1 }
+  uVarHeap[evi]
+}
+
 // Walk the type-section emit order with the `mAllocType` counter, assigning each
 // type's heap index into the module-global index state (`sHeapIdx`/`uVarHeap`/
 // `uBoxIdx`/`aTypeIdx`/`lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`mkArrIdx`/`mkListIdx`/
@@ -2409,20 +2392,10 @@ export function mAssignTypeIndices(_n: i32) {
       if esi >= 0 {
         sig = "h:" + i32ToStr(sHeapIdx[esi])
       } else {
-        // The concrete-VARIANT fall-through. DESTRINGIFY — MEASURED UNVERIFIABLE: an
-        // arena reading (peel the recorded `TyNullable` off `rlElemTyIx`, gate on
-        // `tyIxIsVariantMember`, then take the row by the peeled type's NOMINAL name)
-        // was built and swept. A reach marker enters this `else` on 79 of the 1,269
-        // corpus files, but `variantIndexOf` answers on ZERO of them (an element that
-        // is neither a struct row nor a variant leaves heap 0), and neither a
-        // hand-written `Cat[]` variant-element list nor a variant-returning `.map`
-        // collapse reaches it. A leg that cannot be sabotage-verified is not migrated
-        // (method note 6) — the peel stays until a reacher exists.
-        let rsen = rlElemName[rss]
-        const rsnn = nullablePartOf(rsen)
-        if rsnn != "" { rsen = rsnn }
-        const evi = variantIndexOf(rsen)
-        if evi >= 0 { sig = "h:" + i32ToStr(uVarHeap[evi]) }
+        // The concrete-VARIANT fall-through — `rlElemVariantHeap`, which is also the
+        // heap pass's, and which carries this leg's DESTRINGIFY note.
+        const evh = rlElemVariantHeap(rss)
+        if evh >= 0 { sig = "h:" + i32ToStr(evh) }
       }
     }
     rlSig.push(sig)
@@ -2500,17 +2473,10 @@ export function mAssignTypeIndices(_n: i32) {
       if esi >= 0 {
         rlElemHeap[rs] = sHeapIdx[esi]
       } else {
-        let rsen = rlElemName[rs]
-        const rsnn = nullablePartOf(rsen)
-        if rsnn != "" { rsen = rsnn }
         // A concrete-VARIANT element (`Cat[]`): the element heap is the variant struct
         // `uVarHeap[vi]` (no standalone `sNames` entry — variants ride the union's structs).
-        const evi = variantIndexOf(rsen)
-        if evi >= 0 {
-          rlElemHeap[rs] = uVarHeap[evi]
-        } else {
-          rlElemHeap[rs] = 0
-        }
+        const evh = rlElemVariantHeap(rs)
+        if evh >= 0 { rlElemHeap[rs] = evh } else { rlElemHeap[rs] = 0 }
       }
     }
     rs = rs + 1
@@ -2884,7 +2850,7 @@ export function collectA(_stmts: i32[]) {
         } else if nameIsString(frRet) {
           aUsed = true
         }
-      } else if nameIsMap(nd.tyName) && !nameIsMapMemberUnion(nd.tyName) {
+      } else if nameIsBareMap(nd.tyName) {
         // A `{[string]: i32}` annotation (G8) is a string-keyed map: the map struct
         // + the keys list (string-ref backing) + the i32 VALS list (the existing
         // `lTypeIdx`/`aTypeIdx`). So it forces `aUsed` (string backing + vals backing)
@@ -2922,12 +2888,20 @@ export function collectA(_stmts: i32[]) {
         let ran = nd.tyName
         const ranp = nullablePartOf(ran)
         if ranp != "" && nameIsRefArray(ranp) { ran = ranp }
+        // The element KIND, classified ONCE. Master asked `refArrElemKind(ran)` SEVEN
+        // times in this arm for one answer, straddling the `ensureRefElem` intern — the
+        // only call between them that mutates any table the classifier reads. Measured
+        // (D-RAKIND probe): over the whole corpus and 25,200 fuzz programs the hoisted
+        // value and a re-derivation after the intern NEVER disagree, and the probe's
+        // comparator is sane (inverting the hoist reddens it on the first reaching file).
+        // `ran` is final here — the `| null` peel two lines up is its last write.
+        const raKind = refArrElemKind(ran)
         // A kind-2 (union-box) element that is a NICHE nullable (`(boolean | null)[]`,
         // `(string | null)[]` — one non-null member + null, deliberately NOT a value
         // union) has no list rep: the box lowering would emit the element's raw value
         // (invalid wasm). Reject cleanly. A value-union element (`(i32 | null)[]`,
         // `(f64 | null)[]`) and a struct/heterogeneous element union box as usual.
-        if refArrElemKind(ran) == 2 {
+        if raKind == 2 {
           const ren = refArrElemName(ran)
           if !isValueUnionName(ren) && nullablePartOf(ren) != "" {
             return emitFail(
@@ -2939,7 +2913,7 @@ export function collectA(_stmts: i32[]) {
         }
         rlUsed = true
         raUsed = true
-        rElemKind = refArrElemKind(ran)
+        rElemKind = raKind
         // Bank the interned ROW on the annotation NODE (`annRlSlot`): this arm runs on
         // exactly the spellings the annotation-node consumers call a ref array, so the
         // row recorded here is the answer each of them needs — read back through
@@ -2949,20 +2923,20 @@ export function collectA(_stmts: i32[]) {
         recordAnnRlSlot(i, ensureRefElem(refArrElemName(ran)), ranNul)
         // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
         // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
-        if refArrElemKind(ran) == 4 {
+        if raKind == 4 {
           lUsed = true
           aUsed = true
         }
         // A nested NON-i32 scalar / string 2D array (`string[][]`/`f64[][]`/`i64[][]`, element
         // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
         // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
-        if refArrElemKind(ran) == 6 {
+        if raKind == 6 {
           slUsed = true
           aUsed = true
         }
-        if refArrElemKind(ran) == 7 { fa64Used = true }
-        if refArrElemKind(ran) == 10 { fa32Used = true }
-        if refArrElemKind(ran) == 8 { ia64Used = true }
+        if raKind == 7 { fa64Used = true }
+        if raKind == 10 { fa32Used = true }
+        if raKind == 8 { ia64Used = true }
         if nameIsMapArray(ran) {
           mUsed = true
           lUsed = true
@@ -3521,78 +3495,51 @@ export function collectS(stmts: i32[]) {
 // union-variant field tables — the variant-table twin of `collectAnnShapes`'s
 // field split (same depth-aware `,`/`:` grammar).
 function collectShapeVariantFields(nm: string) {
-  const inner = nm.slice(1, nm.length - 1)
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
   uFieldStart.push(uFieldNames.length)
   let cnt = 0
-  let depth = 0
-  let angOpen = 0
-  let start = 0
-  let k = 0
-  while k <= inner.length {
-    const atEnd = k == inner.length
-    let brk = false
-    if !atEnd {
-      if inner[k] == '{' || inner[k] == '[' || inner[k] == '(' {
-        depth = depth + 1
-      }
-      if inner[k] == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      }
-      if inner[k] == '}' || inner[k] == ']' || inner[k] == ')' {
-        depth = depth - 1
-      }
-      if inner[k] == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      }
-      if inner[k] == ',' && depth == 0 { brk = true }
-    } else {
-      brk = true
+  let fi = 0
+  while fi < fnames.length {
+    if fnames[fi] == "" {
+      return emitFail("emitProgram: malformed inline union-variant shape")
     }
-    if brk {
-      const part = inner.slice(start, k)
-      const ci = part.indexOf(":")
-      if ci <= 0 {
-        return emitFail("emitProgram: malformed inline union-variant shape")
-      }
-      const ftxt = part.slice(ci + 1, part.length)
-      let fc = nameFieldCode(ftxt)
-      if fc < 0 {
-        // A NESTED-STRUCT variant field (`{f: {f: f32}} | {w: i32}`): the shape-text twin of
-        // `internInlineShape`'s -1→15 fallback. Validated PURELY here (`collectU` runs before
-        // `collectS`, whose reset would wipe anything interned now); `collectA`'s variant
-        // field pass interns the accepted shape, and acceptance is monotone — a field code
-        // undecidable now can only IMPROVE by the time `internInlineShape` classifies it
-        // (union registration only grows), so the deferred intern never fails.
-        let nsBase = ftxt
-        const nsNul = nullablePartOf(nsBase)
-        if nsNul != "" { nsBase = nsNul }
-        if variantNestedShapeOk(nsBase) { fc = 15 }
-      }
-      if fc < 0 {
-        return emitFail(
-          "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
-        )
-      }
-      uFieldTypes.push(fc)
-      const vfen = shapeFieldElemName(ftxt, fc)
-      uFieldElemName.push(vfen)
-      recordUFieldElemTyIx(vfen) // D5
-      uFieldNames.push(part.slice(0, ci))
-      // A VALUE-UNION variant field (`{f: i32 | null}` as an arm of `{f:…} | string`)
-      // interns its box reps — the standalone-struct-field parity (`collectS`). Without
-      // it the field's per-rep value boxes were never interned, so the arm's construction
-      // `struct.new`'d a raw scalar where the box `(ref)` was required (invalid wasm).
-      if fc == 16 { registerValueUnionName(shapeFieldElemName(ftxt, fc)) }
-      // A scalar-list field (`f: i64[]` in `{f: i64[]} | i32`) forces its backing +
-      // wrapper pair, exactly as a struct's field does — a variant may be the type's
-      // ONLY mention (no standalone `i64[]` TypeRef sets the flag).
-      forceScalarListField(fc)
-      cnt = cnt + 1
-      start = k + 1
+    const ftxt = ftexts[fi]
+    let fc = nameFieldCode(ftxt)
+    if fc < 0 {
+      // A NESTED-STRUCT variant field (`{f: {f: f32}} | {w: i32}`): the shape-text twin of
+      // `internInlineShape`'s -1→15 fallback. Validated PURELY here (`collectU` runs before
+      // `collectS`, whose reset would wipe anything interned now); `collectA`'s variant
+      // field pass interns the accepted shape, and acceptance is monotone — a field code
+      // undecidable now can only IMPROVE by the time `internInlineShape` classifies it
+      // (union registration only grows), so the deferred intern never fails.
+      let nsBase = ftxt
+      const nsNul = nullablePartOf(nsBase)
+      if nsNul != "" { nsBase = nsNul }
+      if variantNestedShapeOk(nsBase) { fc = 15 }
     }
-    k = k + 1
+    if fc < 0 {
+      return emitFail(
+        "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
+      )
+    }
+    uFieldTypes.push(fc)
+    const vfen = shapeFieldElemName(ftxt, fc)
+    uFieldElemName.push(vfen)
+    recordUFieldElemTyIx(vfen) // D5
+    uFieldNames.push(fnames[fi])
+    // A VALUE-UNION variant field (`{f: i32 | null}` as an arm of `{f:…} | string`)
+    // interns its box reps — the standalone-struct-field parity (`collectS`). Without
+    // it the field's per-rep value boxes were never interned, so the arm's construction
+    // `struct.new`'d a raw scalar where the box `(ref)` was required (invalid wasm).
+    if fc == 16 { registerValueUnionName(vfen) }
+    // A scalar-list field (`f: i64[]` in `{f: i64[]} | i32`) forces its backing +
+    // wrapper pair, exactly as a struct's field does — a variant may be the type's
+    // ONLY mention (no standalone `i64[]` TypeRef sets the flag).
+    forceScalarListField(fc)
+    cnt = cnt + 1
+    fi = fi + 1
   }
   uFieldCount.push(cnt)
   0
@@ -3860,7 +3807,7 @@ function registerInlineUnion(stmts: i32[], name: string) {
       // plain leg, seed 75710791 case_00323). The map-value sibling of the
       // ref-array atom recursion above; `nameIsMapMemberUnion` keeps a map-FIRST
       // union name from being mis-read as a bare map.
-      if aa != "null" && nameIsMap(aa) && !nameIsMapMemberUnion(aa) {
+      if aa != "null" && nameIsBareMap(aa) {
         const amv = mapValNameOf(aa)
         if amv != "" { registerInlineUnion(stmts, amv) }
       }
@@ -3903,7 +3850,7 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // dispatch: a supported union registers its box; an unsupported map-member neighbour
   // keeps `isVariantBoxUnion`'s LOUD fail. The nullable twin of the bare-map value
   // recursion below.
-  if rnp != "" && nameIsMap(rnp) && !nameIsMapMemberUnion(rnp) {
+  if rnp != "" && nameIsBareMap(rnp) {
     const nmv = mapValNameOf(rnp)
     if nmv != "" { return registerInlineUnion(stmts, nmv) }
   }
@@ -3942,7 +3889,7 @@ function registerInlineUnion(stmts: i32[], name: string) {
       // found (array (mut i32))") — INVALID-WASM (fuzz post-#996 sweep branching
       // leg, seed 499060527 case_00095). The nul-closure sibling of the bare-map
       // value recursion below and the #991 map-atom walk.
-      if nameIsMap(ncRes) && !nameIsMapMemberUnion(ncRes) {
+      if nameIsBareMap(ncRes) {
         const ncMv = mapValNameOf(ncRes)
         if ncMv != "" { return registerInlineUnion(stmts, ncMv) }
       }
@@ -5048,12 +4995,13 @@ export function collectFnValUse() {
       // annotation IS a registered row's member set, and the cardinality gate is
       // that list's length (the counting dual identity, see `shapeHasCloField`).
       const fvAtoms: string[] = []
-      if !nameIsSingleShape(fvSb) {
+      const fvIsShape = nameIsSingleShape(fvSb)
+      if !fvIsShape {
         if !msMemberAtomsOf(fvSb, fvAtoms) {
           if unionMemberCount(fvSb) > 1 { splitUnionAtoms(fvSb, fvAtoms) }
         }
       }
-      if nameIsSingleShape(fvSb) {
+      if fvIsShape {
         if shapeHasCloField(fvSb) { fnValUsed = true }
       } else if fvAtoms.length > 1 {
         // A UNION whose ARM is a single-shape struct carrying a closure / closure-array
@@ -5072,12 +5020,7 @@ export function collectFnValUse() {
           // indexed call (`t0[0](1,1,1)`) `call_ref`s through them, so flip the machinery on even
           // when the value is only ever the non-closure (scalar) arm — the union-arm sibling of the
           // top-level closure-array annotation case (`nameIsClosureArrayTy`) above.
-          if (
-            nameIsClosureArray(fvAtoms[fva]) ||
-            nullClosureArrElem(fvAtoms[fva]) != ""
-          ) {
-            fnValUsed = true
-          }
+          if cloArrElemNameOf(fvAtoms[fva]) != "" { fnValUsed = true }
           fva = fva + 1
         }
       }
