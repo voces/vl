@@ -18912,3 +18912,368 @@ this slice's file) with a marker and a blank line so it cannot read as `internSh
    a paren-only query when asked for a separator that never appears at depth 0, so the question for
    them is whether the home's alphabet over-nests (`<>`) relative to what they want — **check the
    alphabet before filing the merge** (#1120's rule).
+
+## D-PRINTREF (LANDED) + D-INTRINSHADOW — `print([])` rejects cleanly, and a user function that silently never ran (#1163 hand-off)
+
+Base **`f9561b8`**. **Nothing inherited** — every figure #1163 filed was re-derived here from a
+master compiler rebuilt in this session from `f9561b8`'s own `compiler/`
+(`fd594009db1ff8a7…` / **1,029,174 B**, `refresh --prove-fixpoint` RC=0, `compile(next) == next`).
+That rule is why this slice found a cell the filed census did not have.
+
+### TARGET 1 — the owner's `print([])`. WHAT IT DOES NOW
+
+```
+$ vl check p.vl     # const xs = [1,2,3]; print(xs)
+[ERROR]: print of i32[] is type-valid but not yet supported by codegen — `print` renders one
+scalar or string; print the elements/fields individually, e.g. `print(xs[0])`
+  print(xs)
+        ^
+  at p.vl:2:7
+Found 1 error. (type error)
+```
+
+rc 1, on the stable `unsupported-lowering` code. Before: `vl check` said *"Checked 1 file, no
+errors."* and `vl run` said `Invalid input WebAssembly code at offset N: type mismatch: expected
+i32, found (ref $type)`. The owner's own three spellings — `print([])`, `print([1])`,
+`const e: i32[] = []` + `print(e)` — now all reject, and `print([])` names itself
+`print of <none>[]`.
+
+#### The census, re-graded at THIS head, and it is 25 + a 26th the filed census did not have
+
+54 cells, one shape per cell, `vl check` and `vl run` both recorded, outcomes **enumerated into
+eight buckets** (`CHECK-CLEAN` / `CHECK-UNSUP` / `CHECK-ERR` / `RUN-OK` / `RUN-INVALID-WASM` /
+`RUN-PARSE-FAIL` / `RUN-TRAP` / `RUN-EMIT-ERR`) rather than matched against one string.
+
+| family | cells | master `f9561b8` | this PR |
+|---|---|---|---|
+| arrays — `[]`, `[1]`, annotated empty, i32/string/f64/i64, `S[]`, `i32[][]`, a returned `i32[]`, `.slice(…)` | 11 | CHECK-CLEAN + RUN-INVALID-WASM | **CHECK-UNSUP** |
+| struct — named `S`, bare `{v:1}`, `S \| null` | 3 | CHECK-CLEAN + RUN-INVALID-WASM | **CHECK-UNSUP** |
+| map — `{[string]: i32}`, `… \| null` | 2 | CHECK-CLEAN + RUN-INVALID-WASM | **CHECK-UNSUP** |
+| function value — named-fn binding, lambda, `((i32)=>i32) \| null` | 3 | CHECK-CLEAN + RUN-INVALID-WASM | **CHECK-UNSUP** |
+| nullable array `i32[] \| null` | 1 | CHECK-CLEAN + RUN-INVALID-WASM | **CHECK-UNSUP** |
+| struct UNION `A \| B` | 1 | CHECK-CLEAN + RUN-INVALID-WASM | **CHECK-UNSUP** |
+| the same inside a function body | 3 | CHECK-CLEAN + RUN-INVALID-WASM | **CHECK-UNSUP** |
+| **= the 24 REFERENCE cells** | **24** | | **all 24 reject** |
+| `print(<void call>)` | 1 | CHECK-CLEAN + RUN-INVALID-WASM | **unchanged — deliberately not taken, see below** |
+| **must-print controls** | 20 | 19 print, 1 broken (below) | **byte-identical, all 20** |
+| already loud (union gate) | 3 | `tyPrintsAsUnionBox` raises | unchanged |
+| already loud (other) | 6 | unchanged | 4 unchanged, 2 gain a SECOND, truthful error |
+
+**The two `loud-other` cells that moved are `const m = Map()` / `const s = Set()` + `print(m)`.**
+The primary `cannot infer a type` diagnostic is preserved and still FIRST; a second error
+(`print of {[<none>]: <none>} is …`) is appended, which is true — the map is unprintable
+independently of being uninferred. Named rather than swept into "unchanged".
+
+#### THE 20th CONTROL WAS NOT A CONTROL — a 26th silently-invalid cell, and it is not about `print`
+
+The filed census listed **`0|1`** among the must-print controls. Written as an ALIAS it is not:
+
+```vl
+type Z = 0 | 1
+const z: Z = 1
+print(z)          // vl check CLEAN; vl run: expected i32, found (ref $type)
+```
+
+and **it has nothing to do with `print`** — `const w = z + 1; print(w)` and `print(toString(z))`
+fail identically, `const w: i32 = z` fails, and the compiler names the mechanism itself on the
+comparison spelling: **`` `==` over a struct union is not supported yet ``**. A numeric-literal
+union declared through a `type` ALIAS is classified as a STRUCT UNION (a reference rep). Boundary,
+measured one variable at a time:
+
+| spelling | verdict |
+|---|---|
+| `const z: 0 \| 1 = 1` (INLINE) | runs, prints 1 |
+| `const z: 0 \| 1 \| 2 = 2` (inline, 3 arms) | runs |
+| `type K = "a" \| "b"` + `const k: K` (STRING alias) | runs — and this is what the shipped fence pins |
+| `type Z = i32` + `const z: Z` | runs |
+| `function g(z: Z)` / `function g(): Z` (param, return) | runs |
+| **`type Z = 0 \| 1` + `const z: Z`** | **invalid wasm** |
+| **`type Z = 1` (ONE numeric literal)** | **invalid wasm** |
+| **`type Z0 = 0\|1; type Z = Z0`** (chain) | **invalid wasm, a DIFFERENT message** (`failed to parse`) |
+| **the same as a struct FIELD, `type S = {v: Z}`** | **invalid wasm** |
+| **the same as a local inside a function body** | **invalid wasm** |
+| `let` instead of `const` | invalid wasm |
+| declared but never READ | runs (so it is the READ that is mis-lowered) |
+
+`tyPrintsAsRef` deliberately does **not** claim it — `0|1` IS printable and the reject would be
+wrong. **Filed, not fixed** (`typecheck.vl:1249`'s `tyIxIsUnionAliasDecl` neighbourhood is the
+lead; the string-literal sibling already works, so this is the numeric arm of an existing rule).
+*A control that fails is a finding, not a broken harness — and this one only exists because the
+rule against inheriting a filed figure was obeyed.*
+
+#### The void arm, again declined — and the mechanism is NOT what was filed
+
+`pt == TY_VOID` stays out. #1163 declined it because *"`(else-less if) ?? default` types as void"*.
+Re-probed here, that description is wrong in a way that matters to whoever fixes it: **`??` is not
+involved at all.** An else-less `if` used as an EXPRESSION types `TY_VOID`
+(`typecheck.vl:17214`, and its own header comment says so deliberately); `??` merely returns its
+LHS type unchanged. Every consumer sees void:
+
+| program | verdict |
+|---|---|
+| `const x = if c then 5` | binds — the LetDecl path EXEMPTS an `IfStmt` init explicitly |
+| `const x: i32 \| null = if c then 5` | **`cannot assign void to 'x' of type i32?`** |
+| `const y: string = x` | **`cannot bind the void result of 'y'`** — so `x` reads void, not `i32?` |
+| `const z = (if c then 5) ?? -1` | **`cannot bind the void result of 'z'`** |
+| `const z = ((if c then 5) ?? -1) + 1` | **`operator '+' is not defined for void and i32`** |
+| `if x is i32 { print(x) }` | works — narrowing overrides |
+| `print(x ?? -1)` | works, prints 5 / -1 — because `print` accepts void today |
+| `const x = if c then 5 else null` (EXPLICIT else) | types `i32?` correctly, everything works |
+
+**The load-bearing comment is now false.** `typecheck.vl:17208` justifies the void with *"the
+emitter can't yet leave a nullable value on the stack"* — but `nliInferIfLet` gave the emitter
+exactly that, and `tests/cases/functions/inferred-nullable-if-binding.vl` runs it. A HEADER
+COMMENT IS NOT EVIDENCE, for the fifth time this arc. Filed with the site, not fixed: making the
+if-expression's value type `mkNullableTy(thenTy)` outside tail position is a language change whose
+blast radius (a bound `x` becomes a union box, so `print(x)` would newly reject through the union
+gate) needs its own graded population.
+
+#### What shipped
+
+`compiler/typecheck.vl` — `tyPrintsAsRef(pt, depth)` beside `tyPrintsAsUnionBox`, +49 lines, no new
+export, and **zero type-name parses**: it reads the arena (`TyArray`/`TyObj`/`TyMap`/`TyFunc`
+directly, `TyNullable`/`TyUnion` by recursion) and is depth-bounded like `tyReachesUnion`.
+`string` is excluded (it is a reference but routes to the string printer), as are a LITERAL union
+and a `TyVar`.
+
+`compiler/driver.vl` — `builtinScan`'s comment beside the published
+`(i32 | i64 | f32 | f64 | boolean | string) -> void` said the checker *admits* these shapes and the
+emitter mis-lowers them. It no longer does, so the comment now says the gate and the string are one
+statement. **The published type and the rejections agree** — verified cell by cell: every rejected
+shape is outside that union, every accepted shape inside it (plus the two the union already
+covers implicitly, a literal union and a nullable string).
+
+Four reject pins, plus the FALSE-side fence #1163 shipped:
+`types/print-array-rejected.vl`, `types/print-struct-rejected.vl`, `maps/print-map-rejected.vl`,
+`closures/print-closure-rejected.vl`. **Each verified by RUNNING it: rc 0 with 0 errors on the
+master-built compiler, rc 1 with an exact message match here.**
+`types/print-scalar-boundary-controls.vl` passes on both, log-for-log.
+
+**One PRE-EXISTING corpus file was uncovered by the gate**: `types/unknown-type-in-map-value.vl`
+carries a `print(f)` over a function value. Its second `@error` is recorded rather than suppressed,
+with a comment saying why it is not a cascade (a `TyFunc` is rejected whatever its return renders
+as; only the `<error>` in the render comes from the first diagnostic).
+
+### TARGET 2 — D-INTRINSHADOW: the silent wrong answer, TAKEN
+
+#1161's report: `function __load_i32__(a: i32) { return 7 }` + `print(__load_i32__(1))` prints
+**0**. Reproduced, then **censused over all 19 declared intrinsic names plus 6 of #1161's
+numeric-opcode intrinsics**, in TWO call positions, against an ordinary-name control:
+
+| position | outcome on master |
+|---|---|
+| value (`print(f(1))`) | `__load_i32__` **SILENT WRONG ANSWER (0)**; `__array_new__`/`__array_new_default__`/`__log__`/`__store_i32__` loud at run; `__trap__` loud at check; the other 13 names + all 6 numeric intrinsics: **user function wins, correctly** |
+| statement (`f(1,2)` with a `print(99)` body) | **`__store_i32__` and `__log__` are ALSO silent** — the body simply vanishes; `__load_i32__` loud here; `__array_copy__`/`__trap__` loud at check |
+
+**So the "loud" verdicts were an accident of stack shape, not a diagnostic** — an `i32.store`
+leaves nothing where an i32 was wanted, an `i32.load` leaves exactly one, and a differently-shaped
+user signature loses the accident either way. The invariant is the NAME: `wasmEmit` dispatches on
+`callee.identName` **before** it looks up any declaration.
+
+**Shipped:** `nameIsEmitterIntrinsic` + `checkNotEmitterIntrinsic` in `typecheck.vl`, called from
+`checkFuncDeclNode` (top-level AND nested `function` — the two report the same (message, anchor)
+pair and `tErrCoded` dedups them) and from the `let`/`const` binding path (`const __store_i32__ =
+(a,b) => …` is called through the same inline arm). A PARAMETER of a reserved name is untouched —
+it is never a callee — and the control still prints 7. Reserved: `__store_i32__`, `__load_i32__`,
+`__log__`, `__trap__`, `__array_new__`, `__array_new_default__`, `__array_copy__`. The seven
+emitter arms stay where they are: each picks a DIFFERENT lowering, so they are a dispatch, not a
+classification, and merging them into the predicate would be a rename, not a home.
+
+Two pins, `intrinsics/error-redefine-intrinsic.vl` (**prints `0` on a master build — the defect
+pinned by running it**) and `intrinsics/error-redefine-intrinsic-binding.vl`.
+
+#### AND `__memory_size__` IS NOT ONE DEAD DECLARATION — IT IS SEVEN OF TEN
+
+Calling each declared memory intrinsic with no user definition, `vl check` clean on all ten:
+
+| lowers | `call to unknown function` at EMIT |
+|---|---|
+| `__store_i32__`, `__load_i32__`, `__log__` (**3**) | `__store_i64__`, `__store_f32__`, `__store_f64__`, `__store_string__`, `__log_string__`, `__memory_grow__`, `__memory_size__` (**7**) |
+
+A check/emit TIER MISMATCH, not a miscompile (`vl check --codegen` catches it), so it is filed
+rather than taken: the answer is either seven emit lowerings or seven deleted declarations, and
+that is a surface decision, not a bug fix.
+
+### TARGET 2 — top-level `Map.set` / `Set.add`: DIAGNOSED TO THE LINE, filed (not my file)
+
+`const m: {[string]: i32} = Map()` + `m.set("p", 1)` →
+`unknown local 14: local index out of bounds`, `vl check` clean. **The mechanism, proved by a
+population rather than argued:**
+
+`emit_classify.exprHasMapOp`'s `Call` arm enumerates `has` / `delete` / `keys` / `values` and
+**omits `set` and `add`**. So those two reserve no map scratch frame. Decisive control set:
+
+| program | run |
+|---|---|
+| `.set` ALONE at top level | **invalid wasm** |
+| `.add` ALONE at top level | **invalid wasm** |
+| `.delete("z")` then the SAME `.set` | **runs** |
+| `const b = m.has("z")` then the SAME `.set` | **runs** |
+| `.set` then `.delete` | runs |
+| the same `.set` on a map PARAM inside a function | runs |
+| `m["p"] = 1` (the index-assign spelling) | runs |
+| `.set` then `m.length` | **invalid wasm** (#1163's note that "a `.get` alongside makes it run" is right; `.length` does not) |
+| `m.has("p")` as a bare statement | a different, loud error: `unsupported member-call statement` |
+
+The frame is reserved by the SIBLING op, never by the `.set`. Inside a function body the
+map-typed local/param reserves it, which is exactly why only the top level failed.
+
+**`emit_classify.vl` is not this slice's file.** The exact diff, mirroring the `delete` arm two
+lines above it:
+
+```vl
+      // `recv.set(k, v)` / `recv.add(k)` — the WRITE side, missing from this ladder. With
+      // no arm here neither reserved the map scratch frame, so a `.set`/`.add` as the ONLY
+      // map op in the START function emitted `local.get` against a frame that declared no
+      // such local (`unknown local 14: local index out of bounds`) while `vl check`
+      // reported the program clean. A function body was unaffected only because its
+      // map-typed local/param reserved the frame anyway.
+      if callee.memProp == "set" || callee.memProp == "add" {
+        if exprMap(callee.memObj, fnIx) { return true }
+        if unionMapArmIdent(callee.memObj, fnIx) { return true }
+        if nodeTyUnionHasMapArm(callee.memObj) { return true }
+      }
+```
+
+Deliberately NOT worked around in `emit_sections.vl` (which IS this slice's file) — a start-fn-only
+detector would be a fourth hand-written copy of a grammar this program exists to give one home.
+
+### The gate — every leg, exit code checked EXPLICITLY
+
+Master baseline **rebuilt at the gating head in this session** and the branch seed rebuilt and
+**checksummed**; both fixpoints proved.
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh --prove-fixpoint` | RC=0, `compile(next) == next` (2 compiles), **1,030,556 B**, sha `2556686057460a50…` |
+| the standalone candidate build vs the refreshed seed | **byte-identical** — the build is deterministic and no throwaway compiler leaked into a measurement |
+| `native-fixpoint.sh` | RC=0, stage3 == stage4 byte-for-byte, 1,030,556 B |
+| `lint-self.sh` | RC=0 (self-lint + `vl fmt --check` clean) |
+| `deno task test` `SELFHOST_NATIVE_ALIGN=1` | **2,087 / 0 / 14**; master baseline **same session, same command, 2,081 / 0 / 14**; **+6 = this PR's six new pins**; ignored-test NAME SETS diff **clean, both files asserted non-empty (14 each)** |
+| corpus A/B, **1,370 files**, three channels (`vl check` rc+TEXT, `vl build` BYTES, `vl run` rc+stdout) | **7 differ, EVERY ONE NAMED**: the 6 new pins (`CHECKSTATUS(0/1) BUILDSTATUS(0/1)`, and `error-redefine-intrinsic.vl` also `RUNSTATUS(0/1)` — it printed `0` on master) + `types/unknown-type-in-map-value.vl` (`CHECKTEXT`). **1,363 pre-existing files identical on all three channels.** |
+| **shared-instance** `vl check tests/cases` | 231 → 238 errors, 123 warnings unchanged; the diff names **exactly those 7 files** |
+| **shared-instance** probe host (`compileSrc`, ONE `WebAssembly.Instance`, 1,342 cases) | **1,342 compiled / 0 threw on BOTH sides** |
+| fuzz A/B, **76,800 programs/side** (4 seeds × default/`--values`/`--branching`/`--declared`) | **0 differing paths**; 78,441 outputs and 1,641 `.err` per side, **13,501 distinct `.out` contents** (the non-vacuity assertion) |
+| `rep-fuzz-check.sh` | RC=0, `exact ✅` (1 baselined reject, 0 unsound, 0 new, 0 stale) |
+| lint-tier A/B, 89 files (all of `tests/cases/lint` + 60 more) | identical, 117 lines each side. **Reported with its own weakness stated**: the lint assembly is lexer+ast+parser+lint+harness and contains NEITHER of this slice's files, so what it actually tests is whether the two SEEDS compile that assembly to the same behaviour — a real channel, but not a test of the diff |
+
+#### Invocation counts both sides — and the count CORROBORATES the corpus A/B
+
+One printed line per call through the probe host (no shared counter, so none can go negative and
+no crashed program can silently subtract); the additive probes change no decision.
+
+| counter | master | this PR | reading |
+|---|---|---|---|
+| `W-PRINTARG` — every `print(x)` argument the checker types | **9,117** | **9,117** | **identical** — the instrument-did-not-die control, over 1,342 cases compiled on both sides |
+| `W-PRINTREF` — `tyPrintsAsRef` invocations | 0 | **10,172** | 9,117 top-level + **1,055** recursive descents into nullable/union members |
+| `W-PRINTREFT` — TRUE verdicts | 0 | **5** | **exactly the 5 print cells the corpus A/B named** — an independent channel agreeing to the unit |
+| `W-INTRIN` — `checkNotEmitterIntrinsic` invocations | 0 | **12,204** | one whole-string compare per function/binding declaration; **0** hits in the corpus |
+
+Added work: two arena walks per `print` argument and one string compare per declaration. Binary
+**+1,382 B** (1,029,174 → 1,030,556).
+
+**No per-program STATE is introduced** — both new functions are pure, over the arena and over a
+name, with no module-global array or sidecar. The pairwise-predecessor probe (#1164's poison-class
+instrument) therefore has nothing to bite on here, and the shared-instance legs above are the
+channel that would show it if it did.
+
+### THE SCOREBOARD DOES NOT MOVE, AND THAT IS THE HONEST NUMBER
+
+| | master `f9561b8` | this PR |
+|---|---|---|
+| **CORE** (23-resolver list) | **317** | **317** |
+| **OFF-LIST** (#1141's table) | **28** | **28** |
+| **TRUE TOTAL** | **345** | **345** |
+| `emit_classify` · `emit_collect` · `emit_base` · `typecheck` | 176 · 54 · 48 · 19+27 | **identical, file for file** |
+
+Reproduced by running the same counter over both revs. **This slice deletes no parse and adds
+none**: `tyPrintsAsRef` reads the arena, and `nameIsEmitterIntrinsic` is whole-NAME equality —
+nominal identity, which the owner's rule explicitly blesses. Two user-visible defect classes
+closed for zero scoreboard movement is the same lesson #1163 recorded from the other direction.
+
+#### MY OWN CENSUS BEYOND THE LISTS — the RENDERERS' consumers
+
+The lists count PARSERS. Nobody has counted the other end: a render into a human message is
+blessed by the owner's rule, a render into a decision (or into a parser's argument) is the disease
+— and it is invisible to CORE/OFF-LIST, because the parse is attributed to the parser, not to the
+render that manufactured its input.
+
+Method: `tyToStr` / `tyToEmitName` / `tyToNominalName`, string-literal-aware `//` stripper, own
+headers excluded, bucketed by the call's syntactic SINK (hand-checkable from the printed line).
+
+| | count |
+|---|---|
+| render call sites, tree-wide | **202** |
+| …inside a renderer's own body (self/mutual recursion — NOT a consumer) | **24** |
+| **genuine consumer sites** | **178** (typecheck 167 · check_query 6 · emit_collect 3 · emit_classify 2) |
+| sink = **MSG** (concatenated into a diagnostic) — blessed | **111** |
+| sink = **CMP** (compared, or used as a map key) | **0** |
+| sink = **ARG** (handed straight to another function) | **23** — of which **16 are `irRendered(tyToEmitName(er))`** |
+| sink = **BIND** (bound to a local, sink needs hand review) | **68** |
+
+Two readings worth keeping. **CMP is 0** — the "compare two renders" antipattern that cost #1117 a
+whole measurement is not present at any call site today. And the ARG bucket is 23 of which **16 are
+one shape**: `irRendered(tyToEmitName(er))`, the inferred-return string column. That is precisely
+the PRODUCER the SCORECARD CORRECTION says to kill, seen from the render side rather than the parse
+side — and #1120 already measured that column as **not** a dual of the decision it feeds. The two
+findings are the same wall approached from opposite directions.
+
+I also **re-ran the brief's uncounted figures at this head rather than quoting them**, same method.
+All seven reproduce **exactly**, so they are not stale: `nameToTy` **17**, `tyTopIndexOf` **16**
+(typecheck 12 + emit_base 4), `isValueUnionName` **36** (emit_classify 23 · emit_collect 5 ·
+typecheck 4 · wasmEmit 2 · emit_base 1 · emit_rewrite 1), `nonNulBaseOf` **18**,
+`monoUnwrapParens` **12**, `annRetNameOf` **11**, `nulMapInnerName` **10** — **120 sites over 7
+names**, against a whole-tree TRUE TOTAL of 345.
+
+### REFUTATIONS
+
+1. **"The filed census's 20 controls all print."** REFUTED, and it is the finding of this slice.
+   **`type Z = 0 | 1` + `print(z)` is CHECK-CLEAN + invalid wasm on master** — a 26th silently-invalid
+   cell, in the control column. It is not a `print` bug (`z + 1` and `toString(z)` fail too) and the
+   shipped fix deliberately does not claim it.
+2. **"`(else-less if) ?? default` types as void."** REFUTED as a description. **`??` is not
+   involved**: the else-less `if` EXPRESSION types void at `typecheck.vl:17214`, by a documented
+   decline, and `??` returns its LHS type unchanged. The annotated spelling
+   `const x: i32|null = if c then 5` fails with `cannot assign void`, no `??` present.
+3. **"`typecheck.vl:17208`'s reason for the void is current."** REFUTED. It says the emitter cannot
+   leave a nullable on the stack outside tail position; `nliInferIfLet` gave it exactly that and
+   `functions/inferred-nullable-if-binding.vl` runs it. A HEADER COMMENT IS NOT EVIDENCE.
+4. **"`__memory_size__` is a dead declaration."** TRUE but far too small — **7 of the 10** declared
+   memory intrinsics are dead. Measured one call per name.
+5. **"The intrinsic-shadowing bug is `__load_i32__`."** REFUTED as a boundary. In STATEMENT position
+   `__store_i32__` and `__log__` discard the user's body just as silently; the other names are loud
+   only by ACCIDENT of stack shape, which a differently-shaped signature loses.
+6. **"Top-level `Map.set` is a start-function frame-sizing bug."** REFUTED as a location. It is
+   `exprHasMapOp`'s `Call` arm missing `set`/`add`; the start function is merely the only place with
+   no map-typed local to reserve the frame incidentally. Proved by a control set, not by reading.
+7. **"An emitter `emitFail` would have been enough."** REFUTED against the report as filed — `vl
+   check` reporting the program clean is half of what the owner reported.
+8. **"The lint-tier A/B is evidence for this diff."** REFUTED, as #1163 also found. The assembly
+   contains neither `typecheck.vl` nor `driver.vl`; it tests the two SEEDS, not the change. Kept and
+   reported for what it is.
+9. **"A corpus A/B that reads 0 proves the print gate is inert."** REFUTED by construction — it
+   reads **5** print cells and **names them**, and the independent invocation probe reads **5 TRUE
+   verdicts** over the same corpus. IDENTICAL IS NOT CORRECT; these two channels agree on a
+   non-zero number.
+
+### HAND-OFFS
+
+1. **`type Z = 0 | 1` (a NUMERIC literal union behind a type ALIAS) lowers as a struct union** —
+   silent invalid wasm at every read, at top level, in a function body and as a struct field; the
+   one-member form `type Z = 1` too; the STRING-literal sibling `type K = "a" | "b"` is correct.
+   Boundary table above. Lead: `typecheck.vl:1249`'s `tyIxIsUnionAliasDecl` note.
+2. **`exprHasMapOp` is missing its `set`/`add` arms** — exact diff above, `emit_classify.vl`.
+3. **An else-less `if` EXPRESSION types `TY_VOID`** (`typecheck.vl:17214`); the binding site
+   exempts it and the emitter lowers it. Fixing it means `mkNullableTy(thenTy)` outside tail
+   position, which turns a bound `x` into a union box — graded population needed first.
+4. **7 of 10 declared memory intrinsics are dead** (`__store_i64__`, `__store_f32__`,
+   `__store_f64__`, `__store_string__`, `__log_string__`, `__memory_grow__`, `__memory_size__`):
+   `vl check` accepts the call, emit says `call to unknown function`. Seven lowerings or seven
+   deletions — a surface decision.
+5. **`m.has(k)` as a bare statement** is `unsupported member-call statement`, while `m.delete(k)`
+   as a bare statement runs. Same neighbourhood as (2).
+6. **Negative zero renders `-0` under the Rust host** for both `f64` and `f32` (confirmed here),
+   against `main.rs`'s stated JS-parity intent — the Deno test host prints `0`. A host-side
+   formatting divergence, no VL-side change.
+7. `types/unknown-type-in-map-value.vl` now carries two `@error`s. If the first one's cause is ever
+   fixed, the second stays — it pins the function-value print cell.
