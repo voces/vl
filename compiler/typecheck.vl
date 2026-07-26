@@ -98,6 +98,31 @@ import {
   orderArgsByParamNames,
   ufcsAliasOf,
 } from "./ast"
+// The parser's SPELLING TREE (D-PARSETY, #1117) — what `parseTypeName` saw,
+// before it concatenated it into a name. `tsToTy` resolves from this instead of
+// re-parsing the concatenation.
+import {
+  TS_APP,
+  TS_ARR,
+  TS_ERR,
+  TS_FIELD,
+  TS_FUNC,
+  TS_ISECT,
+  TS_LITNUM,
+  TS_LITSTR,
+  TS_MAP,
+  TS_NEG,
+  TS_NULL,
+  TS_OBJ,
+  TS_PAREN,
+  TS_UNION,
+  annTsOf,
+  tsKidCount,
+  tsKidStart,
+  tsKids,
+  tsKind,
+  tsText,
+} from "./ast"
 import {
   ArrayLit,
   AsExpr,
@@ -4786,14 +4811,39 @@ function splitGenArgs(s: string, out: string[]) {
 // reported positioned).
 let annotDiagAt = -1
 
-// Resolve annotation NAME with resolution diagnostics anchored at node `at`.
-function nameToTyAt(name: string, at: i32) {
+// Resolve an annotation from the parser's SPELLING TREE where the annotation
+// node carries one, and from the concatenated NAME where it does not.
+//
+// `annTsOf` answers -1 for exactly two populations, and neither is a checker-time
+// annotation: an emitter-SYNTHESIZED `TypeRef` (`synthTypeRef`), minted from a
+// name the emitter computed and never passed through the parser, and a name a
+// later pass rewrote without the node (`emit_rep`'s post-canon re-resolutions).
+// Both reach `nameToTy` through the UNpositioned entries, which is why this is a
+// ladder and not a replacement — see D-ASCANON's measurement (#1129): at the two
+// POSITIONED funnels the tree is present on 333,073 of 333,073 reads.
+function annotResolve(name: string, root: i32) {
+  if root >= 0 { return tsToTy(root) }
+  nameToTy(name)
+}
+
+// Resolve annotation NAME with resolution diagnostics anchored at node `at`,
+// reading the spelling tree banked on annotation node `ann`.
+//
+// `at` and `ann` are the same node at three of the four callers. They differ at
+// a struct FIELD, whose "unknown type" diagnostic anchors on the `FieldDef` (so
+// the message points at the field, not at its type) while the spelling is banked
+// on the `TypeRef` CHILD. Passing one node for both jobs is what made 3,851
+// corpus reads look like a coverage hole in #1129's probe; the hop is the fix.
+function nameToTyAnn(name: string, at: i32, ann: i32) {
   const saved = annotDiagAt
   annotDiagAt = at
-  const r = nameToTy(name)
+  const r = annotResolve(name, annTsOf(ann))
   annotDiagAt = saved
   r
 }
+
+// The same, where the diagnostic anchor IS the annotation node.
+function nameToTyAt(name: string, at: i32) { nameToTyAnn(name, at, at) }
 
 // Apply a generic alias (`Box<i32>`, `Pair<i32,string>`, `Box<T>` under a live
 // type-param env): resolve the arguments in the CURRENT environment, check the
@@ -4809,19 +4859,46 @@ function nameToTyAt(name: string, at: i32) {
 // here (the full name is otherwise well-formed, anchored at `annotDiagAt`)
 // and yields the error type.
 export function applyGenAlias(head: string, inner: string) {
+  applyGenAliasArgs(head, inner, -1)
+}
+
+// The body of `applyGenAlias`, with the ARGUMENT list taken from either source:
+// `appIx >= 0` is a `TS_APP` spelling node whose kids are the arguments, and
+// `inner` is then unused; `appIx < 0` splits `inner` at its top-level commas.
+// Everything after the argument list — arity, the resolved memo key, the
+// placeholder registration, the field substitution — is one body precisely
+// because the two routes must not be able to drift.
+function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   const gi = gaIndexOf(head)
   if gi < 0 { return -1 }
   const pnames: string[] = []
   splitGenArgs(gaParamLists[gi], pnames)
-  const argNames: string[] = []
-  splitGenArgs(inner, argNames)
   const argTys: i32[] = []
-  let ai = 0
-  while ai < argNames.length {
-    const a = nameToTy(argNames[ai])
-    if a < 0 { return -1 }
-    argTys.push(a)
-    ai = ai + 1
+  if appIx >= 0 {
+    const astart = tsKidStart[appIx]
+    const acnt = tsKidCount[appIx]
+    let ti = 0
+    while ti < acnt {
+      const kid = tsKids[astart + ti]
+      // The recovery leaf renders `""`, which `splitGenArgs` drops — so `Box<>`
+      // is an ARITY error on both routes, not an unresolved argument.
+      if tsKind[kid] != TS_ERR {
+        const a = tsToTy(kid)
+        if a < 0 { return -1 }
+        argTys.push(a)
+      }
+      ti = ti + 1
+    }
+  } else {
+    const argNames: string[] = []
+    splitGenArgs(inner, argNames)
+    let ai = 0
+    while ai < argNames.length {
+      const a = nameToTy(argNames[ai])
+      if a < 0 { return -1 }
+      argTys.push(a)
+      ai = ai + 1
+    }
   }
   if argTys.length != pnames.length {
     tErr(
@@ -4865,7 +4942,10 @@ export function applyGenAlias(head: string, inner: string) {
         if fd.fdType >= 0 {
           const ftn = P.nodes[fd.fdType]
           if ftn is TypeRef {
-            const r = nameToTy(ftn.tyName)
+            // The alias body's field annotation is a parsed `TypeRef` like any
+            // other, so it resolves from its own spelling tree — under the `<T>`
+            // bindings pushed above, which both routes read from `tpEnvNames`.
+            const r = annotResolve(ftn.tyName, annTsOf(fd.fdType))
             if r >= 0 {
               fty = r
               // Record the resolved type on the field's TYPE-ANNOTATION node so the emitter
@@ -4896,6 +4976,268 @@ export function applyGenAlias(head: string, inner: string) {
     pj = pj + 1
   }
   resIx
+}
+
+// ── The three LEAF rungs both resolvers bottom out at ────────────────────────
+// `nameToTy` (the character-surgery resolver) and `tsToTy` (the structural one)
+// differ only in how they take a COMPOSITION apart — a union, an array suffix,
+// an inline object. Where the spelling is a bare identifier there is nothing to
+// take apart, and both must answer identically, so the three leaf rungs live
+// here once. Each is a NOMINAL lookup: a name is a name (the program plan's
+// terminal condition explicitly keeps `structIndexByName("Cat")`), and none of
+// them inspects a character of its argument.
+
+// The primitive spellings. -1 = "not a primitive" (every hit is a fixed arena
+// index, all >= 0, so the sentinel cannot collide with an answer).
+function primTyOfName(name: string) {
+  if name == "i32" { return TY_I32 }
+  if name == "i64" { return TY_I64 }
+  if name == "f64" { return TY_F64 }
+  if name == "f32" { return TY_F32 }
+  if name == "boolean" { return TY_BOOL }
+  if name == "string" { return TY_STR }
+  if name == "void" { return TY_VOID }
+  // The `null` type itself — the check type of `x is null` (host: an Alias
+  // named "null"); union members spell it through the `|`-split / `TS_NULL`.
+  if name == "null" { return TY_NULL }
+  -1
+}
+
+// A live type-parameter BINDING (a generic function's `<T>` while its
+// annotations resolve via `resolveAnnot`, or a generic alias application's
+// params while its body resolves via `applyGenAlias`) — innermost wins.
+// `tpEnvTys` only ever receives `mkTyVar` results and already-resolved argument
+// types, both >= 0, so -1 unambiguously means "not bound".
+function tpEnvTyOfName(name: string) {
+  let tpi = tpEnvNames.length - 1
+  while tpi >= 0 {
+    if tpEnvNames[tpi] == name { return tpEnvTys[tpi] }
+    tpi = tpi - 1
+  }
+  -1
+}
+
+// A declared struct/union type (registered by the program's pre-pass). A SINGLE-MEMBER union
+// alias (`type Id = i32`, `type Name = string`, `type MyCat = Cat`) is TRANSPARENT — it denotes
+// its member, not a one-variant union box. The parser accepts a bare `type N = A` as a one-member
+// union, but a union of one is just that one type, so resolve to the member (`x: Id` is a plain
+// `i32`, usable with `+`; before this it was the box → "operator + not defined" / invalid wasm).
+function declaredTyOfName(name: string) {
+  if cUserTypes.has(name) {
+    const ut = cUserTypes[name] ?? -1
+    if ut >= 0 {
+      const utt = T.tys[ut]
+      if utt is TyUnion {
+        // Collapse a PRIMITIVE-scalar single member, and an OBJECT member reached through a
+        // plain alias REFERENCE (`type MyCat = Cat`, `type Y = Box<i32>`). The one-member
+        // OBJECT case that stays opaque is the canonicalized intersection (`type AB = {a}&{b}`),
+        // which the emitter DOES intern as a named struct. `singleAliasMemberTyIx` is the single
+        // rule both sides read — collapsing here without the emitter's `singleMemberAliasName`
+        // agreeing (or the reverse) diverges the two.
+        const sm = singleAliasMemberTyIx(ut, name)
+        if sm >= 0 { return sm }
+      }
+    }
+    return ut
+  }
+  // A BARE reference to a generic alias has no concrete type — its parameters
+  // were never supplied (host: `Generic type … was used without any`).
+  if gaIndexOf(name) >= 0 {
+    tErr(
+      "Generic type `" +
+        name +
+        "` expects type arguments but was used without any",
+      annotDiagAt,
+    )
+    return TY_ERR
+  }
+  -1
+}
+
+// The leaf a SPELLING NODE with nothing to decompose resolves to: `TS_NAME`'s
+// identifier, `TS_MAP`'s key token, and `TS_ERR`'s `""`. All three are single
+// tokens the lexer produced, so the composition arms `nameToTy` runs between
+// the primitive check and the type-param check (an array suffix, a `{`-shape,
+// a `<`-application) provably cannot fire on them — an IDENT lexeme holds no
+// `[`, `{`, `<` or `|`.
+function tsLeafTy(name: string) {
+  const pv = primTyOfName(name)
+  if pv >= 0 { return pv }
+  const tv = tpEnvTyOfName(name)
+  if tv >= 0 { return tv }
+  declaredTyOfName(name)
+}
+
+// ── `tsToTy` — the structural dual of `nameToTy` ─────────────────────────────
+// `nameToTy` below is the compiler's SECOND recursive-descent type parser: the
+// first one is `parseTypeName` (`compiler/parser.vl`), which had the annotation's
+// whole structure in hand and returned a string built by concatenation. D-PARSETY
+// (#1117) made that parser KEEP what it saw, as a flat spelling tree; this is the
+// function that consumes it.
+//
+// Arm for arm, in `nameToTy`'s order, with the same constructors in the same
+// sequence — the arena is not hash-consed, so a dual that allocates a different
+// number of entries in a different order is not a dual. Every place `nameToTy`
+// scans characters to find a boundary, this reads a child edge:
+//
+//   `nameHasPipe` + `splitTypeName(name, '|')`  → `TS_UNION`'s kids
+//   `nameHasSep(name, '&')` + `splitTypeName`   → `TS_ISECT`'s kids
+//   the `wraps` depth scan                      → `TS_PAREN`'s single kid
+//   `topLevelArrowIndex` + the param split      → `TS_FUNC`'s kids (return LAST)
+//   the trailing `[]` test                      → `TS_ARR`
+//   the `"]:"` search                           → `TS_MAP`'s key text + value kid
+//   the field/colon depth scans                 → `TS_OBJ`'s `TS_FIELD` kids
+//   the `<`-scan + `slice`                      → `TS_APP`'s head text + kids
+//
+// Three places mirror a SKIP the string side gets for free from an empty render,
+// and each is marked below: the parser's recovery leaf `TS_ERR` renders `""`, and
+// `""` is dropped by `splitGenArgs`, by the union arm's `part.length > 0` guard,
+// and by `(paramsStr.length > 0)`. `TS_ISECT` has no such guard and must NOT skip
+// — `A &` poisons to -1 on both sides.
+function tsToTy(ix: i32) {
+  if ix < 0 { return -1 }
+  const k = tsKind[ix]
+  const start = tsKidStart[ix]
+  const cnt = tsKidCount[ix]
+  // An inline UNION `A | B | null`. A `null` member makes the result NULLABLE;
+  // duplicate members COLLAPSE (host `flattenType` dedup); an UNRESOLVED member
+  // poisons the whole union (-1), because `assignable` treats a negative side as
+  // "accept anything" and `Bogus | i32` must not silently accept everything.
+  if k == TS_UNION {
+    const members: i32[] = []
+    let hasNull = false
+    let pi = 0
+    while pi < cnt {
+      const kid = tsKids[start + pi]
+      const kk = tsKind[kid]
+      if kk == TS_NULL {
+        hasNull = true
+      } else if kk != TS_ERR {
+        // renders "" — the string arm's `part.length > 0`
+        const m = tsToTy(kid)
+        if m < 0 { return -1 }
+        let dup = false
+        let dj = 0
+        while dj < members.length {
+          if sameVariantTy(m, members[dj]) { dup = true }
+          dj = dj + 1
+        }
+        if !dup { members.push(m) }
+      }
+      pi = pi + 1
+    }
+    let inner = TY_ERR
+    if members.length == 1 { inner = members[0] }
+    else if members.length > 1 { inner = mkUnionTy(members) }
+    if hasNull { return mkNullableTy(inner) }
+    return inner
+  }
+  // An INTERSECTION `A & B` (A3) — fold the operands through `intersectTy` so a
+  // finite annotation simplifies to a concrete type (`(0|1|2) & !2` → `0 | 1`).
+  if k == TS_ISECT {
+    let acc = -1
+    let ii = 0
+    while ii < cnt {
+      const operand = tsToTy(tsKids[start + ii])
+      if operand < 0 { return -1 }
+      if ii == 0 { acc = operand } else { acc = intersectTy(acc, operand) }
+      ii = ii + 1
+    }
+    return acc
+  }
+  // A prefix NEGATION `!A` (A4): "anything but A".
+  if k == TS_NEG {
+    const negd = tsToTy(tsKids[start])
+    if negd < 0 { return -1 }
+    return mkNegTy(negd)
+  }
+  // A parenthesized GROUP `(A)`. The string arm strips the parens and re-enters,
+  // so a COMMA group `(A, B)` re-enters on `"A,B"` — which matches no arm and
+  // resolves to -1. A group is a single type or it is nothing.
+  if k == TS_PAREN {
+    if cnt == 1 { return tsToTy(tsKids[start]) }
+    return -1
+  }
+  // A FUNCTION TYPE `(params)=>ret` — the kids are the parameters in order and
+  // then the RETURN last (`parseTypeAtom`'s contract).
+  if k == TS_FUNC {
+    const ptys: i32[] = []
+    let pn = cnt - 1
+    // A lone recovery param renders `""`, so the string arm sees `paramsStr`
+    // empty and builds a ZERO-parameter function. Two of them render `","` and
+    // do NOT collapse, so the skip is exact only at count 1.
+    if pn == 1 {
+      if tsKind[tsKids[start]] == TS_ERR { pn = 0 }
+    }
+    let pk = 0
+    while pk < pn {
+      const pt = tsToTy(tsKids[start + pk])
+      if pt < 0 { return -1 }
+      ptys.push(pt)
+      pk = pk + 1
+    }
+    const rty = tsToTy(tsKids[start + cnt - 1])
+    if rty < 0 { return -1 }
+    return mkFuncTy(ptys, rty)
+  }
+  // A STRING-LITERAL type `"a"` — `tsText` keeps the QUOTED lexeme (that is what
+  // makes `tsToName` reproduce the annotation exactly), and the member is the RAW
+  // inner text, as on the literal-expression side.
+  if k == TS_LITSTR {
+    const lex = tsText[ix]
+    return mkLitTy("str", lex.slice(1, lex.length - 1))
+  }
+  // A NUMERIC-LITERAL type (`0`, `1.5`): int vs float by the `.` in the LEXEME.
+  if k == TS_LITNUM {
+    if hasDot(tsText[ix]) { return mkLitTy("flt", tsText[ix]) }
+    return mkLitTy("int", tsText[ix])
+  }
+  if k == TS_NULL { return TY_NULL }
+  // An array type `T[]`. An UNRESOLVED element poisons the annotation: building
+  // `mkArrayTy(-1)` would leak the empty-`[]` ELEMENT HOLE as the type of every
+  // `xs[i]` read, and a member access on that hole indexes the arena at -1 — a
+  // checker CRASH (`generics/type-alias-nested.vl`).
+  if k == TS_ARR {
+    const aeTy = tsToTy(tsKids[start])
+    if aeTy < 0 { return -1 }
+    return mkArrayTy(aeTy)
+  }
+  // A string-keyed MAP `{[K]: V}`. The key is a bare identifier TOKEN, not a
+  // parsed type, so it rides `tsText`; only string keys are supported (the
+  // host's map rep), and a non-string key resolves to -1 for "unknown type".
+  // The value is resolved UNCONDITIONALLY into the constructor, and is NOT
+  // poison-checked — as on the string side.
+  if k == TS_MAP {
+    const mk = tsLeafTy(tsText[ix])
+    if mk != TY_STR { return -1 }
+    return mkMapTy(mk, tsToTy(tsKids[start]), 0)
+  }
+  // An INLINE OBJECT type `{x: T, y: U}`. A field whose NAME failed to parse
+  // renders `":T"`, whose first top-level colon is at index 0 — the string arm's
+  // `colonAt > 0` drops it, so an empty field name drops here too.
+  if k == TS_OBJ {
+    const fnames: string[] = []
+    const ftys: i32[] = []
+    let fi = 0
+    while fi < cnt {
+      const fdIx = tsKids[start + fi]
+      if tsKind[fdIx] == TS_FIELD {
+        if tsText[fdIx].length > 0 {
+          fnames.push(tsText[fdIx])
+          ftys.push(tsToTy(tsKids[tsKidStart[fdIx]]))
+        }
+      }
+      fi = fi + 1
+    }
+    return mkObjTy(fnames, ftys)
+  }
+  // A generic alias APPLICATION `Box<i32>` / `Pair<i32,string>` — substitute the
+  // arguments into the declared body (A10 stage 3). The head is the identifier
+  // the parser read, never a slice of a rendered name.
+  if k == TS_APP { return applyGenAliasArgs(tsText[ix], "", ix) }
+  // `TS_NAME` (a bare identifier), and `TS_ERR`, whose `""` text falls through
+  // every leaf rung to -1 exactly as `nameToTy("")` does.
+  tsLeafTy(tsText[ix])
 }
 
 function nameToTy(name: string) {
@@ -5027,16 +5369,8 @@ function nameToTy(name: string) {
       return mkLitTy("int", name)
     }
   }
-  if name == "i32" { return TY_I32 }
-  if name == "i64" { return TY_I64 }
-  if name == "f64" { return TY_F64 }
-  if name == "f32" { return TY_F32 }
-  if name == "boolean" { return TY_BOOL }
-  if name == "string" { return TY_STR }
-  if name == "void" { return TY_VOID }
-  // The `null` type itself — the check type of `x is null` (host: an Alias
-  // named "null"); union members spell it through the `|`-split above.
-  if name == "null" { return TY_NULL }
+  const pv = primTyOfName(name)
+  if pv >= 0 { return pv }
   // An array type `T[]`: the parser appends a literal `[]` per array suffix to the
   // type NAME (`i32[]`, `Tok[]`, `i32[][]`). Strip one suffix and wrap the element.
   const nlen = name.length
@@ -5148,11 +5482,8 @@ function nameToTy(name: string) {
   // A live type-parameter BINDING (a generic function's `<T>` while its
   // annotations resolve via `resolveAnnot`, or a generic alias application's
   // params while its body resolves via `applyGenAlias`) — innermost wins.
-  let tpi = tpEnvNames.length - 1
-  while tpi >= 0 {
-    if tpEnvNames[tpi] == name { return tpEnvTys[tpi] }
-    tpi = tpi - 1
-  }
+  const tv = tpEnvTyOfName(name)
+  if tv >= 0 { return tv }
   // A generic alias APPLICATION `Box<i32>` / `Pair<i32,string>` — the parser
   // folds the arguments into the synthetic name; substitute them into the
   // declared body (A10 stage 3).
@@ -5178,40 +5509,7 @@ function nameToTy(name: string) {
       }
     }
   }
-  // A declared struct/union type (registered by the program's pre-pass). A SINGLE-MEMBER union
-  // alias (`type Id = i32`, `type Name = string`, `type MyCat = Cat`) is TRANSPARENT — it denotes
-  // its member, not a one-variant union box. The parser accepts a bare `type N = A` as a one-member
-  // union, but a union of one is just that one type, so resolve to the member (`x: Id` is a plain
-  // `i32`, usable with `+`; before this it was the box → "operator + not defined" / invalid wasm).
-  if cUserTypes.has(name) {
-    const ut = cUserTypes[name] ?? -1
-    if ut >= 0 {
-      const utt = T.tys[ut]
-      if utt is TyUnion {
-        // Collapse a PRIMITIVE-scalar single member, and an OBJECT member reached through a
-        // plain alias REFERENCE (`type MyCat = Cat`, `type Y = Box<i32>`). The one-member
-        // OBJECT case that stays opaque is the canonicalized intersection (`type AB = {a}&{b}`),
-        // which the emitter DOES intern as a named struct. `singleAliasMemberTyIx` is the single
-        // rule both sides read — collapsing here without the emitter's `singleMemberAliasName`
-        // agreeing (or the reverse) diverges the two.
-        const sm = singleAliasMemberTyIx(ut, name)
-        if sm >= 0 { return sm }
-      }
-    }
-    return ut
-  }
-  // A BARE reference to a generic alias has no concrete type — its parameters
-  // were never supplied (host: `Generic type … was used without any`).
-  if gaIndexOf(name) >= 0 {
-    tErr(
-      "Generic type `" +
-        name +
-        "` expects type arguments but was used without any",
-      annotDiagAt,
-    )
-    return TY_ERR
-  }
-  -1
+  declaredTyOfName(name)
 }
 
 // If `name` is a synthetic map shape `{[K]:V}` (the parser's index-signature
@@ -8971,13 +9269,26 @@ let annotNameMemo: {[string]: i32} = Map()
 // in a loop still grow the arena — the same runaway the positive memo closes.)
 let annotNameMemoNegVer: {[string]: i32} = Map()
 export function resolveAnnot(name: string, typarams: string[]) {
+  resolveAnnotTs(name, typarams, -1)
+}
+
+// `resolveAnnot`, with the annotation's spelling ROOT threaded to the three
+// legs that actually resolve. `root < 0` is the NAME route — what the exported
+// entry point (and its 7 `emit_rep.vl` callers) get, since a post-canon emit-time
+// name has no live tree.
+//
+// The MEMO is untouched and stays keyed on the name, deliberately: it is the one
+// index per spelling per program that closed the arena runaway, and a memo HIT
+// must return the same index it minted whichever route minted it. Only the MISS
+// path resolves, so only the miss path reads the tree.
+function resolveAnnotTs(name: string, typarams: string[], root: i32) {
   if typarams.length == 0 {
     if tpEnvNames.length == 0 {
       const hit = annotNameMemo[name] ?? -2
       if hit != -2 { return hit }
       const negVer = annotNameMemoNegVer[name] ?? -1
       if negVer == cUserTypesVer { return -1 }
-      const r = nameToTy(name)
+      const r = annotResolve(name, root)
       if r >= 0 {
         annotNameMemo[name] = r
       } else {
@@ -8985,7 +9296,7 @@ export function resolveAnnot(name: string, typarams: string[]) {
       }
       return r
     }
-    return nameToTy(name)
+    return annotResolve(name, root)
   }
   let i = 0
   while i < typarams.length {
@@ -8993,7 +9304,7 @@ export function resolveAnnot(name: string, typarams: string[]) {
     tpEnvTys.push(mkTyVar(typarams[i]))
     i = i + 1
   }
-  const r = nameToTy(name)
+  const r = annotResolve(name, root)
   let j = 0
   while j < typarams.length {
     tpEnvNames.pop()
@@ -9008,7 +9319,7 @@ export function resolveAnnot(name: string, typarams: string[]) {
 function resolveAnnotAt(name: string, typarams: string[], at: i32) {
   const saved = annotDiagAt
   annotDiagAt = at
-  const r = resolveAnnot(name, typarams)
+  const r = resolveAnnotTs(name, typarams, annTsOf(at))
   annotDiagAt = saved
   r
 }
@@ -10681,7 +10992,9 @@ function checkProgramNode(n: Program) {
               if fd.fdType >= 0 {
                 const ftn = P.nodes[fd.fdType]
                 if ftn is TypeRef {
-                  const r = nameToTyAt(ftn.tyName, dfields[fi])
+                  // The diagnostic anchors on the FIELD (`dfields[fi]`); the
+                  // spelling tree is banked on its `TypeRef` child.
+                  const r = nameToTyAnn(ftn.tyName, dfields[fi], fd.fdType)
                   if r >= 0 {
                     fty = r
                     // Record the resolved type on the field's annotation node so the emitter
