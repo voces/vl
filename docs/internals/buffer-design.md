@@ -501,8 +501,9 @@ becomes necessary if the memory is ever `shared` (webcraft's explicitly-later as
   shipped version has a real call per access unless built with `-O3 --closed-world`, and that must be
   documented rather than discovered.
 - **Automatic `memory` export (O4i)** forecloses a program exporting a function named `memory`. It
-  does not foreclose `ioMem` later — a module may export several memories' worth of names over one
-  memory, and the staging ABI can have its own alias.
+  does not foreclose `ioMem` later: measured, one memory may carry **two export names** in a valid
+  module (`exports: [… {"name":"memory","kind":"memory"}, {"name":"ioMem","kind":"memory"}]`), so
+  the staging ABI can keep its own alias over the same memory.
 - **Lazy growth (O5i)** forecloses "host views are valid for the process lifetime" as a contract.
   The epoch export is what keeps that from being silent.
 - **Keeping the engine trap as the bounds policy (A4)** forecloses a recoverable out-of-bounds
