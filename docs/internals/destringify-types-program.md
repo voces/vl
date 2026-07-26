@@ -10703,6 +10703,486 @@ deltas (−8, because `valueAtomKind` also loses one) were right; the tree-wide 
     over a mixed union, no `??` over a boxed value union" would have been a true sentence
     doing false work. #1125 found this in one direction and #1127 in the other; the rule is
     to publish the REACH count per channel next to every 0.
+## D-REFARRKIND — the ref-array ladder had THREE hand-written copies in one file; the five paren arms were one value (#1140)
+
+Branched at `47b98e6` (D-TSTY, #1134) and **rebased three times while gating** — onto `7a714fd`
+(#1136, #1137), then `62807d4` (#1139), then **`74d6f71` (#1138 D-VALUNION et al.), the final
+base**. `compiler/emit_classify.vl` only — no other compiler file changes.
+
+**Three concurrent slices landed underneath this one, so every number below states the base it was
+taken at, and the gate was re-run in full at the final one.** Which measurements can move under a
+rebase is checkable rather than asserted:
+
+- **The 440,134-comparison equivalence probe (§4) cannot move.** Its subject is the ladder and the
+  helpers it calls. `git diff 47b98e6 7a714fd -- compiler/emit_classify.vl compiler/emit_base.vl`
+  is EMPTY, and across `62807d4` a per-function body diff of all 22 helpers the ladder reaches
+  found exactly ONE change — `nameIsMapArray`, whose `nameIsMap(b) && !nameIsMapMemberUnion(b)` was
+  extracted verbatim into #1139's new `nameIsBareMap(b)`. Semantically identical, and this slice
+  now **calls that helper** rather than re-inlining the pair #1139 had just collapsed.
+- **Everything else was re-run at `74d6f71`**: suite (both sides, same session, ignored NAME SETS
+  diffed), corpus A/B, fuzz A/B, fixpoint, lint, rep-fuzz, and the parse counts.
+
+The brief asked for two things in order: **re-derive this file's denominator, because the
+discovery census's 1,047 did not reproduce for #1133** — then cut the largest genuinely string-keyed
+structural decision. Both are below, in that order, and the denominator work refutes three figures
+the brief carried.
+
+### 1. The denominator, re-derived — and the instrument validated before it quoted anything
+
+**UNIT = static CALL SITES.** A textual `NAME(` in non-comment, non-string code. Method: a
+string-literal-aware `//` stripper (a `//` inside `"…"`, `'…'` or a backtick literal is not a
+comment), string literals then blanked so a resolver name inside a message never counts, match
+`\bNAME\s*\(`, each resolver's own `function NAME(` / `export function NAME(` header excluded,
+scanned over `compiler/*.vl` + `std/*.vl` + `scripts/*.vl`, **per-file sums cross-checked against the
+tree-wide total** (#1123's rule, after the `grep -n` field-count slip).
+
+**VOCABULARY (state it or the number means nothing):** the SCORECARD CORRECTION's parser list plus
+D-ARROWTY's four additions (`refArrElemKind` / `nameIsI32ListArray` / `nameIsMapArray` /
+`nullClosureArrElem`) = **23 resolvers**.
+
+**The instrument was validated against published figures at the commits that published them, before
+it produced any new number:**
+
+| commit | published | this instrument |
+|---|---|---|
+| `cd69bd9` (#1129's own commit) | 530 tree-wide · 319 in `emit_classify.vl` | **530 · 319** |
+| `f82263e` (#1133's base) | 523 tree-wide · 312 in `emit_classify.vl` | **523 · 312** |
+
+Two independent parties' figures, at two commits, reproduced exactly. **At this slice's head
+`47b98e6`: 523 tree-wide, 312 in `emit_classify.vl`.**
+
+Per resolver in this file at `47b98e6`: `nullablePartOf` 52 · `refArrElemName` 29 · `annArrowAt` 27 ·
+`splitUnionAtoms` 26 · `mapValNameOf` 24 · `nameIsMap` 24 · `nameIsRefArray` 19 ·
+`nameIsLitUnionType` 18 · `nameIsArray` 17 · `nameIsMapMemberUnion` 15 · `nameIsStringArray` 13 ·
+`nameIsI32Array` 9 · `parenUnionArrElemName` 7 · `peelGroupParens` 6 · `nameIsClosureArray` 5 ·
+`unionMemberCount` 4 · `refArrElemKind` 4 · `isTopLevelFuncTypeName` 3 · `annSplitParams` 3 ·
+`nameIsI32ListArray` 3 · `nameIsMapArray` 3 · `nullClosureArrElem` 1.
+
+**THE SHAPE OF THE POPULATION IS THE FINDING, AND IT REDIRECTED THIS SLICE.** Attributing all 312
+sites to their enclosing function gives **114 functions, maximum 13 in any one**
+(`mvValKindOfName`). There is no large parser-list concentration in this file to cut. The density
+is not in call sites, it is in **LADDERS** — which is why the honest unit for this slice is
+duplicated-ladder deletion plus *dynamic* work, and both are reported below with their denominators.
+
+**Three figures the brief carried, re-measured at `47b98e6`:**
+
+| brief | measured here | verdict |
+|---|---|---|
+| census: **1,047 operations** in `emit_classify.vl` | does not reproduce under any resolver list that can be stated | **CONFIRMS #1133's non-reproduction** — second independent failure to reproduce it |
+| `tyGtIsClose` **33** call sites tree-wide | **28** (typecheck 14 · emit_base 8 · emit_classify 3 · emit_collect 3) | **STALE.** 33 is #1129's figure; #1130's D-ELEMHOME collapsed 5 of this file's 8 scanners into `shapeInnerFieldSplit`, and no one re-measured the total afterwards |
+| `nameIsRefArray` **26** tree-wide, **19** here | **26** (emit_classify 19 · emit_collect 7 · nowhere else) | **CONFIRMED** |
+
+The `tyGtIsClose` slip is this arc's fourth instance of the same failure: *measure at time T, merge,
+then brief from time-T facts.* It is worth noting that the brief's own framing — "`tyGtIsClose`'s 33
+calls ARE the proof that this file re-implements the annotation grammar" — **survives the
+correction**: 28 is still 28 hand-rolled angle-bracket heuristics, and 3 of them are here.
+
+### 2. The target: ONE ladder written THREE times, and FIVE arms that were one value
+
+`emit_classify.vl` carries three exported entry points over the same ref-array grammar, and two of
+them say so in their own headers:
+
+- `nameIsRefArray(name)` — *is this a ref-element list?*
+- `refArrElemKind(name)` — *which WasmGC wrapper does its element use?*
+- `refArrElemName(name)` — *what is the element's table key?* — whose header reads
+  **"Mirrors `refArrElemKind` but yields the table key"** and, at its base arm,
+  **"Keyed exactly like `nameIsRefArray`'s bridge (the two must agree)."**
+
+D-FIELDCODE's find, one layer down, and again **named by a comment that filed it as a reason not to
+act**. Two copies of a ladder are two copies of every parse in it, and — exactly as D-FIELDCODE
+found for `fieldTypeCode`/`nameFieldCode` — the copies did not agree on arm ORDER.
+
+**The sharper find is inside `refArrElemKind`.** Its last five arms were
+
+```
+if nullStructArrElem(name) != "" { return 1 }
+if nullMapArrElemOf(name)  != "" { return 3 }
+if nullArrayArrElem(name)  != "" { return refArrElemKind(nullArrayArrElem(name) + "[]") }
+if nullClosureArrElem(name) != "" { return 5 }
+if parenUnionArrElemName(name) != "" { return 2 }
+```
+
+and all four helpers open with the **same two lines** — `parenUnionArrElemName(name)` then
+`nullablePartOf(elem)` — differing only in the single predicate applied to the result. So
+`parenUnionArrElemName` ran **5x** and `nullablePartOf` **4x** on one spelling, per call. Each
+`parenUnionArrElemName` is itself an `annArrowAt` depth scan plus up to two `unionMemberCount`
+splits. This is method note 2 (*parses that are projections of ONE value*) at its purest: the
+paren-grouped element and its nullable part decide all five arms.
+
+The nullable-LIST arm was worse than 5x. `nullArrayArrElem` reaches its verdict by running the
+**whole `refArrElemKind` ladder** on a freshly concatenated `elem + "[]"`; the arm then called
+`nullArrayArrElem` a **second** time for the value and ran the ladder a **third** time on its
+result — three ladder walks and three string allocations, in a WasmGC-allocation-bound compiler,
+to produce one integer.
+
+And in `nameIsRefArray` the first two arms were `nullStructArrElem` and `nullArrayArrElem` — **both
+strictly SUBSUMED** by the `parenUnionArrElemName` arm five lines below them (each *requires* a
+paren-grouped element, and every arm in between returns only `true`). So every call to
+`nameIsRefArray` on **any** name — `i32`, `S[]`, `string` — paid for two `parenUnionArrElemName`
+scans, one `nullablePartOf`, and on a hit an entire second ladder walk, to answer a boolean the arm
+below already answered.
+
+### 3. The shape
+
+```
+function refArrShapeKind(name: string): i32   // the 13 SHAPE arms, once; -1 = "no arm claimed it"
+export function nameIsRefArray(name: string)  // 2 exclusion guards + shape >= 0 + its 4-lookup base arm
+export function refArrElemKind(name: string)  // shape, else its 1-lookup base arm, else 1
+```
+
+Inside `refArrShapeKind` the paren block is **one** `parenUnionArrElemName` and **one**
+`nullablePartOf`, with the four former helpers as four consecutive arms **in byte-for-byte the order
+`refArrElemKind` tested them**.
+
+Two things deliberately stay OUT of the shared ladder, and each is the D-FIELDCODE rule (*keep the
+arm whose EVIDENCE differs*):
+
+- **`nameIsRefArray`'s two exclusion guards** (`annArrowAt`, `nameIsLitUnionArray`).
+  `refArrElemKind` is specified on a name already known to be a ref array; folding the guards in
+  would change its answers.
+- **The BASE arm.** `nameIsRefArray` needs four element-table lookups (`structIndexByName`,
+  `shapeElemDeclaredStructIdx`, `variantIndexOf`, `unNames`) for a boolean; `refArrElemKind` needs
+  one (`unNames` → 2, else 1) because every other base resolves to its default. Merging them is
+  answer-preserving but would make `refArrElemKind` pay for `shapeElemDeclaredStructIdx`'s
+  `repRowOfName` → `resolveAnnot` on every struct array. **Declined on the work argument, not a
+  correctness one** — stated here rather than dressed up as a sabotage.
+
+`nullStructArrElem`, `nullMapArrElemOf` and `nullArrayArrElem` are **deleted** — callerless once the
+block exists.
+
+### 4. The measurement — an additive probe on BOTH entry points, both channels, comparator proved
+
+Additive probe (method note: accumulating, never fail-fast): master's ladders kept verbatim
+alongside the candidate, computed side by side at every call, **master's answer returned**,
+disagreements accumulated and reported as the end-of-`emitProgram` `emitFail` so the report is never
+masked. Master's leg was given its own `refArrElemNameM` so it can never re-enter the candidate
+through the nested-ref arm.
+
+| probe | corpus reaches | fuzz reaches | **disagreements** |
+|---|---|---|---|
+| `nameIsRefArray` (boolean) | 75,721 | 307,751 | **0 / 0** |
+| `refArrElemKind` (kind) | 7,032 | 47,403 | **0 / 0** |
+| the concat-free inner-list kind (a filed candidate, NOT shipped) | 1,621 | 606 | **0 / 0** |
+
+**440,134 comparisons, 0 disagreements.** Corpus = 1,304 files of which **1,106 reach the end of
+`emitProgram` and report**; fuzz = **28,800 programs of which 27,826 report**.
+
+**Comparator sanity, on BOTH channels, before either 0 was believed** (method notes 4/12 — and
+#1125's inversion of them: *a 0 on either channel can be blindness*). The same harness with all
+three comparators inverted:
+
+| | corpus | fuzz (2,400 programs) |
+|---|---|---|
+| `nameIsRefArray` | **75,721 / 75,721** | **22,796 / 22,796** |
+| `refArrElemKind` | **7,032 / 7,032** | **4,016 / 4,016** |
+| inner-list | **1,621 / 1,621** | **109 / 109** |
+
+100% of reaches on both channels: neither probe is a dead comparator, and neither channel is dark.
+
+### 5. The channels
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / build-RC / MESSAGE / run-RC / run stdout, at `47b98e6` | **1,304 files** (every `tests/cases/**/*.vl`, not only `@run`) | **1,304 identical on all five fields** |
+| re-run at `7a714fd` | **1,310 files** | **1,310 identical on all five fields** |
+| re-run at `62807d4` | **1,312 files** | **1,312 identical on all five fields** |
+| re-run at the final base `74d6f71` | **1,314 files** | **1,314 identical on all five fields** |
+| fuzz A/B, whole `--out-dir` trees, at `47b98e6` | **76,800 programs/side, 78,902 output files/side** | **2 differing paths, both PROVEN artifacts — 0 after normalizing them** |
+| the same, re-run in full at `7a714fd` | **76,800 programs/side, 78,902 output files/side** | **0 differing paths** |
+
+Corpus channel populations, so the 0 is not read as an empty run: at `47b98e6`, **1,106 files build
+on side A** (198 are `@check-error`/`@emit-error` cases that never produce a module) and **1,053
+files exercise the run channel**; at `74d6f71`, **1,116** and **1,063**. The 198 non-building files
+are the same count at every base — they are the `@check-error` population, not a failure. The corpus harness is **proved live** by the sabotages in §7 — S1 reddens 10 of
+these same 1,304 rows.
+
+**THE TWO FUZZ PATHS ARE A NORMALIZATION ARTIFACT, PROVEN NOT ASSERTED.** Both are `.err` files for
+fuzz cases `00267`/`00268` (seed 6, depth 5, `--branching --multiobs`) on which **the compiler
+itself traps on both sides** — a pre-existing crash, side A being a plain master build. The captured
+text differs only in the **compiler's own wasm function indices and code offsets**:
+
+```
+A:  0: 0x8d35c - <wasm function 1324>   ...   5: 0xeb105 - <wasm function 2226>
+B:  0: 0x8d12a - <wasm function 1322>   ...   5: 0xeaed3 - <wasm function 2224>
+```
+
+The index delta is **exactly 2 on every one of the 6 frames**, which is **exactly this slice's net
+function-count change** (`emit_classify.vl` goes 678 → 676 top-level functions: three deleted, one
+added). Normalizing `wasm function N` and `0xADDR` makes the two outputs byte-identical. This is the
+coordinator's warned-of class — *a compiler-internal identifier leaking into a compared field* —
+in a form worth naming separately from a leaked temp path: **deleting a function renumbers every
+function after it, so any captured backtrace becomes a false diff for any dedup slice.** Re-run with that normalization applied to every output file: **76,800 programs/side, 78,902 output
+files/side, 0 differing paths** — seed 6 included.
+
+### 6. The work, COUNTED not timed (method note 15)
+
+Two compilers instrumented **identically** (a tick at `parenUnionArrElemName` and at
+`nullablePartOf`, reported per program), differing only in `emit_classify.vl`, swept over the same
+corpus with the **same 1,106-file reporting population on both sides**. Measured at `47b98e6` and
+NOT re-run after the rebase, because it cannot move: the instrument lives in `emit_base.vl` and the
+change in `emit_classify.vl`, and **both files are byte-identical at `7a714fd`** — only the corpus
+is 6 files larger there:
+
+| | `parenUnionArrElemName` executions | `nullablePartOf` executions |
+|---|---|---|
+| master | 306,383 | 530,566 |
+| now | **133,397** | **444,342** |
+| | **−172,986 (−56.5%)** | **−86,224 (−16.3%)** |
+
+`parenUnionArrElemName` is a full `annArrowAt` depth scan plus up to two `unionMemberCount` union
+splits, so **more than half of this file's paren-union parsing was redundant re-derivation of one
+value**. No allocation is added anywhere; the nullable-LIST arm *removes* two `elem + "[]"`
+allocations and two whole ladder walks per hit. Binary: 1,038,622 → **1,038,060** bytes
+(**−562**). Source: 116 insertions, 134 deletions, one file.
+
+### 7. Entombment — four sabotages redden the PRE-EXISTING corpus; three are inert and say why
+
+The change is behaviour-preserving, so it cannot have a fails-on-master pin (method note 11); it is
+entombed by the equivalence evidence above plus pins that fail under SABOTAGE. Each sabotage is
+applied to the SHIPPED source, built, and swept against the SHIPPED build over all 1,304 files
+(byte + message + run):
+
+| sabotage | byte/RC | msg | run |
+|---|---|---|---|
+| **S1** the nullable-STRUCT arm delegates to the value-union fall-through (kind 1 → 2) | **10** | **10** | **10** |
+| **S2** the nullable-MAP arm delegates (kind 3 → 2) | **4** | **4** | **4** |
+| **S3** the nullable-LIST arm delegates (inner kind → 2) | **10** | **10** | **10** |
+| **S4** the nullable-CLOSURE arm delegates (kind 5 → 2) | **4** | **4** | **4** |
+| S5 the two exclusion guards folded INTO the shared ladder | 0 | 0 | 0 |
+| S6 the nullable-LIST arm loses its kind-SET gate | 0 | 0 | 0 |
+| S7 the paren block runs BEFORE the map-array arm | 0 | 0 | 0 |
+
+**S1–S4 are the pins, and they needed NO new fixture** — the pre-existing corpus already pins every
+one of the four arms the merge collapsed, on all three channels. Named files:
+`types/nullable-struct-array.vl` + 9 more (S1); `lists/nullable-map-element-list.vl` + 3 (S2);
+`arrays/nullable-list-array-element.vl` + 9 (S3); `arrays/nullable-closure-element-list.vl` + 3
+(S4). So the merge is **not over-merged**: each of the four arms the paren block folds together is
+independently load-bearing.
+
+The three inert sabotages are reported as measured equivalences, **not as evidence** (D-FIELDCODE's
+S2 lesson — a sabotage must break an invariant, not permute one), each with the mechanism that makes
+it inert by construction rather than by coverage:
+
+- **S7 is inert BY CONSTRUCTION.** `parenUnionArrElemName` requires `name[0] == '('` and
+  `nameIsMapArray` requires `name[0] == '{'`: the two arms have disjoint domains, so the one arm
+  order the merge permutes for `nameIsRefArray` cannot be observed. That disjointness is *why* a
+  single table could exist, which is why it is recorded — but it is not evidence.
+- **S5 is inert BY CONSTRUCTION.** `parenUnionArrElemName` and `nameIsClosureArray` each already
+  carry their own `annArrowAt` guard, and no shape arm matches a bare litunion array, so hoisting
+  the two exclusion guards into the ladder changes no shape answer. The guards remain load-bearing
+  where they always were — over the **base** arm, which the ladder does not contain (without the
+  litunion guard, `nameIsRefArray("K[]")` would find `K` in `unNames` and answer true).
+- **S6** — see §8; its inertness is a *finding*, not a gap.
+
+### 8. A DEAD BRANCH found by a sabotage coming back inert
+
+S6 removes the `ik == 4 || 6 || 7 || 8 || 9 || 10` gate the old `nullArrayArrElem` applied to the
+inner list's kind, and is inert on the corpus. Rather than file that as "no pin can exist"
+(#1114/#1119/#1123's honest-but-passive decline), the mechanism was chased with a dedicated probe
+counting every REACH of the gate and every REFUSAL:
+
+| | reaches | refusals |
+|---|---|---|
+| corpus (1,106 reporting files) | 1,621 | **0** |
+| fuzz (28,800 programs, 27,826 reporting) | 606 | **0** |
+
+**2,227 reaches, 0 refusals — the gate never rejects.** And it is expected not to:
+`nameIsArray(nn)` makes `nn + "[]"` a 2-D array name, every 2-D array name lands on one of
+4/6/7/8/9/10, and kinds 1/2/3/5 each require a NON-array element. So **S6's inertness is by
+construction, not a coverage gap, and no fixture can pin it** — which is a different statement from
+"no pin can exist", and the reason to say which one is that only the second implies a corpus hole.
+
+**The gate is nevertheless kept, verbatim, and the measurement is recorded beside it in the code.**
+"Measured dead over 2,227 reaches" is not "proven dead"; it costs one integer compare; and removing
+it would be a behaviour change with no channel able to catch a mistake. This slice is a refactor and
+declines to spend that risk. Filed as a hand-off for anyone who wants to prove the branch
+unreachable and delete it.
+
+### 9. The call arithmetic
+
+`emit_classify.vl` only; no other file changes.
+
+| resolver | master | now | delta |
+|---|---|---|---|
+| `parenUnionArrElemName` | 7 | 3 | **−4** |
+| `nullablePartOf` | 52 | 50 | **−2** |
+| `nameIsArray` | 17 | 15 | **−2** |
+| `refArrElemName` | 29 | 28 | **−1** |
+| `nameIsRefArray` | 19 | 18 | **−1** |
+| `nameIsStringArray` | 13 | 12 | **−1** |
+| `nameIsClosureArray` | 5 | 4 | **−1** |
+| `refArrElemKind` | 4 | 3 | **−1** |
+| `nameIsI32ListArray` | 3 | 2 | **−1** |
+| `nameIsMapArray` | 3 | 2 | **−1** |
+| `nameIsMap` | 24 | 23 | **−1** (adopting #1139's `nameIsBareMap`) |
+| `nameIsMapMemberUnion` | 15 | 14 | **−1** (same) |
+| **`nullClosureArrElem`** | **1** | **0** | **−1** (gone from this file entirely) |
+| **parser-list TOTAL, `emit_classify.vl`** | **312** | **294** | **NET −18** |
+| **parser-list TOTAL, tree-wide** | **493** | **475** | **NET −18** |
+
+- **Type-string PARSES deleted: 18.** 0 added, 0 laddered, 0 sidecars, 0 fall-throughs.
+  16 of them are the ladder merge; **the last 2 come from adopting `nameIsBareMap`** — #1139
+  introduced exactly the `nameIsMap(x) && !nameIsMapMemberUnion(x)` conjunction this slice's
+  nullable-MAP arm had inlined, so the arm now calls the shared helper rather than re-inlining the
+  pair that slice had just finished collapsing. Two concurrent slices converging on one home is the
+  program working as intended; re-inlining it would have been a silent regression of #1139.
+
+**DELETED, not merely unreachable — and the static count is not the evidence for that, the dynamic
+one is.** The 16 are call sites removed from the source, which on its own would be consistent with
+the work merely moving somewhere the counter cannot see. It did not: over the identical corpus
+population the *executions* of the two resolvers the merge deduplicates fall by **172,986** and
+**86,224** (§6). A relocation would have held the execution count flat. Both the static and the
+dynamic figure move, in the same direction, by the same mechanism.
+
+**A SUPERLATIVE OFFERED TO THIS SLICE, REFUTED BY MEASUREMENT** (this doc's standing rule: a
+superlative is a measurement). It was put to me that this is "the first slice in the program to
+actually delete parsers, every prior slice having moved call counts while the 23-parser list sat at
+523". The first half is false and the second is true only of a five-slice window. The list, traced
+with the validated instrument at each merge commit:
+
+| head | slice | 23-parser list, tree-wide |
+|---|---|---|
+| `cd69bd9` | #1129 D-ASCANON + D-RECRENDER | 530 |
+| `bc48776` | #1130 D-ELEMHOME + D-GAELEAF | **523** (−7 — *parsers deleted, by a prior slice*) |
+| `f82263e` | #1131 D-MATCHTY | 523 |
+| `47b98e6` | #1134 D-TSTY | 523 |
+| `caad41a` | #1136 D-COERCEKIND et al. | 523 |
+| `7a714fd` | #1137 D-ISVARTY + D-ALIASFN | 523 |
+| `62807d4` | #1139 D-COLLHOME + D-RAKIND | **493** (**−30**) |
+| this slice | D-REFARRKIND | **475** (**−18**) |
+
+So: **#1130 deleted 7 on this list and #1123 deleted 9 on its in-file form — the claim of a first is
+wrong.** What is true: **the list was frozen at 523 across five consecutive merged heads**
+(#1131 · #1133 · #1134 · #1136 · #1137). Those five bought correctness, structure and two compiler
+crashes, which is worth more than a count; but the count did not move, and saying so is the point of
+tracking it.
+
+**AND A SUPERLATIVE OF MY OWN, SELF-REFUTED BEFORE PUBLICATION.** An earlier draft of this section
+said "−16 is the largest single-slice drop on it in this arc". **`#1139` landed while this slice was
+gating and took the list 523 → 493, a −30.** Mine is −18 and is the *second* largest. This is the
+handoff's own standing warning — *measure at time T, merge, then write from time-T facts* — and I
+walked into it inside my own document, hours after recording it as a lesson. **The rule that catches
+it is mechanical: re-measure every quoted count against the head you are actually basing on, at the
+moment you publish, not at the moment you first measured.** (See method note 80.)
+- **Whole functions deleted: 3** (`nullStructArrElem`, `nullMapArrElemOf`, `nullArrayArrElem`);
+  1 added (`refArrShapeKind`). Net top-level functions in the file **678 → 676**.
+- Off the parser list, the same move deletes 6 calls to the three deleted helpers and removes the
+  `elem + "[]"` string allocation from the nullable-LIST arm's hot path.
+
+### 10. The gate
+
+| leg | result |
+|---|---|
+| `scripts/refresh-compiler.sh` | **RC=0** at every base. Final `74d6f71`: master 1,036,664 B → **1,036,090 B**, a **−574 B** (it was −562 before adopting `nameIsBareMap`). Both binaries **reproduction-verified** per method note 79 |
+| `scripts/native-fixpoint.sh` | **RC=0** — stage3 == stage4 byte-for-byte, at every base (final: 1,036,090 B) |
+| `scripts/lint-self.sh` | **RC=0** (its first run caught the now-unused `nullClosureArrElem` import — the parse this slice deletes) |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **RC=0** — 2,022/0/8 at `47b98e6`, 2,028/0/8 at `7a714fd`, 2,030/0/8 at `62807d4`, **2,032 / 0 / 8** at `74d6f71`. At every base the master baseline was re-measured **in the same session** and read the same, with the **ignored-test NAME SETS diffed and identical** (the same 8 files). This worktree symlinks `scripts/vl-host/target` and `node_modules`, so no native suite self-ignores — 8 is the real figure, not a green run over a third of the suite |
+| corpus A/B | **1,304/1,304 · 1,310/1,310 · 1,312/1,312 · 1,314/1,314** at the four bases — identical on byte, build-RC, message, run-RC and run stdout at every one. Every leg from `7a714fd` on used **reproduction-verified** binaries (method note 79) |
+| fuzz A/B | **RC=0** — 76,800 programs/side, 78,902 output files/side, **0 differing paths**; run in full at `47b98e6`, at `7a714fd`, and at the final base `74d6f71` (whole `--out-dir` trees, `diff -rq`, backtraces normalized) |
+| `scripts/rep-fuzz-check.sh` | **RC=0** at every base — exact, 1 baselined failure, 0 new / 0 stale |
+
+### 11. What did NOT move, and hand-offs with exact diffs
+
+1. **`refArrElemName` is the THIRD copy and did not join the table.** Its arms map onto the same
+   grammar but it returns a NAME, not a kind, and it orders the nullable-ARRAY recursion
+   (`nullablePartOf(name)` → `refArrElemName(ranp)`) FIRST — an arm the other two do not have at
+   all. Folding it needs the shared table to return a (kind, name) pair, which in VL costs an
+   out-param array **allocation per call** in an allocation-bound compiler. Declined on that, with
+   the note that the honest fix is for the table to return the kind and for `refArrElemName` to
+   switch on it — a slice, not a line.
+2. **The concat-free inner-list kind, MEASURED at 0 / 2,227 with a proved comparator, deliberately
+   NOT shipped.** The nullable-LIST arm still re-forms `nn + "[]"` and re-enters `refArrElemKind`
+   once (down from three times). The concat-free dual is:
+   ```
+   if nameIsI32Array(nn)    { return 4 }
+   if nameIsStringArray(nn) { return 6 }
+   if nn == "f64[]" { return 7 }
+   if nn == "i64[]" { return 8 }
+   if nn == "f32[]" { return 10 }
+   if nameIsRefArray(nn)    { return 9 }
+   ```
+   It agreed on **2,227 of 2,227** reaches (1,621 corpus + 606 fuzz) with the comparator proved
+   firing at 100% under inversion on both channels. It is held back only because 2,227 is a thin
+   population next to the 383,472 the shipped claim rests on, and the win is one allocation on a
+   rare arm. **Whoever takes it needs no new discovery — only a wider fuzz population.**
+3. **`emit_collect.vl` (another partition) calls `refArrElemKind(ran)` SIX TIMES on the same
+   operand** at `emit_collect.vl:2930–2965`, immediately after `nameIsRefArray(nd.tyName)` at 2917
+   — the same projection-of-one-value shape this slice fixed one module up, and now cheaper to fix
+   because the ladder has one home. Exact diff: hoist `const rk = refArrElemKind(ran)` above line
+   2930 and replace the six calls with `rk`. Measured: `refArrElemKind` is 7 sites in
+   `emit_collect.vl` of 11 tree-wide.
+4. **A PRE-EXISTING COMPILER TRAP, found by this slice's fuzz leg and reproducing on plain
+   `47b98e6`.** Not introduced here, and not in the rep-fuzz baseline:
+   ```vl
+   function makeIt(): {[string]: {a: f64, f: boolean | {w: i32} | f64, z: i64} | boolean} | null {
+     const h0: {[string]: {a: f64, f: boolean | {w: i32} | f64, z: i64} | boolean} = Map()
+     h0["k"] = false
+     return h0
+   }
+   function go() {
+     const v: {[string]: {a: f64, f: boolean | {w: i32} | f64, z: i64} | boolean} | null = makeIt()
+     print(0)
+   }
+   go()
+   ```
+   `vl run` dies with a wasm backtrace **from the compiler itself** (6 frames), on both master and
+   this build. A nullable map whose value is a struct-carrying union; declaring and calling is
+   enough — the second case does not even read the map. Filed, not fixed: it is a `collectU` /
+   map-value-union interaction, and this slice is a refactor.
+
+### 12. Method notes earned
+
+75. **A dedup slice renumbers every function after the ones it deletes, so any captured wasm
+    backtrace is a FALSE DIFF** (D-REFARRKIND). The fuzz leg read 2 differing paths on a change
+    the probe had proved identical over 440,134 comparisons; both were `.err` files in which the
+    *compiler's own* trap backtrace printed `wasm function 1324` on one side and `1322` on the
+    other. The delta was **exactly** the slice's net function-count change on all 6 frames — which
+    is what turned "suspicious" into "proven". The generalization of the leaked-temp-path rule:
+    **normalize every compiler-internal identifier out of a compared field, not only paths** —
+    function indices, code offsets, type indices. And the check that settles it in one step is
+    *does the delta equal a quantity my diff determines?*
+76. **Two arms of a ladder can be SUBSUMED by a third below them, and subsumption is provable
+    without a probe** (D-REFARRKIND). `nameIsRefArray`'s first two arms each *required* the
+    condition its ninth arm tested, and every arm in between returned only `true` — so deleting
+    them cannot change the answer, whatever the input. The audit that finds this: for each early
+    arm, ask *what does it presuppose*, then look for a later arm testing exactly that
+    presupposition with the same polarity. The two arms deleted here were the most expensive in
+    the function and ran on **every** call, including on `i32`.
+77. **When the parser-list population is DIFFUSE, the unit has to change or the slice will be
+    trivial** (D-REFARRKIND). 312 sites across 114 functions, max 13 — measured *before* choosing a
+    target, and it ruled out the single-concentration cut the brief's framing implied. What the
+    density actually pointed at was ladders with duplicate copies, whose honest units are
+    *duplicated-ladder deletion* and *dynamic work* — here −16 static sites but **−56.5% of one
+    resolver's executions**. Measure the shape of the population, not only its size.
+78. **A sabotage that comes back inert should be classified as by-construction or by-coverage
+    before it is reported** (D-REFARRKIND). Three of seven came back 0. Two of them are inert
+    because the arms they permute have provably disjoint domains — reporting those as "no pin can
+    exist" would have implied a coverage gap where there is none. The distinction is cheap to make
+    and it is the difference between an honest decline and a misleading one.
+79. **VERIFY AN A/B BINARY BY REPRODUCTION, NOT BY THE LOG LINE THAT CLAIMS TO HAVE PRODUCED IT**
+    (D-REFARRKIND). A saved candidate `.wasm` in this slice's scratchpad silently held the wrong
+    content — **1,038,181 bytes, only −35 from master, where the change determines −562** — while
+    the refresh log that "produced" it read 1,037,654. **Two gate legs (the new-base corpus and fuzz
+    A/Bs) had already consumed it before the discrepancy surfaced**, and it surfaced only because a
+    final `cmp` of the freshly-built compiler against the saved artifact failed. The tell was a
+    SIZE that did not match a quantity the diff determines — method note 75's check applied to the
+    harness's INPUTS rather than its outputs. Both legs were re-run. The procedure that would have
+    caught it immediately, now standard here: **rebuild each side from its own source and assert
+    byte-equality with the saved artifact, `md5sum` both before the sweep, and `md5sum` both again
+    after** (a long parallel sweep writes `.cwasm` sidecars beside the compiler it is given, so the
+    directory is not read-only). Both binaries in this slice's final legs are reproduction-verified:
+    master rebuilds byte-for-byte from the base commit, candidate from two independent seeds.
+80. **RE-MEASURE EVERY QUOTED COUNT AT THE MOMENT YOU PUBLISH, AGAINST THE HEAD YOU ARE ACTUALLY
+    BASING ON** (D-REFARRKIND). This handoff has warned about *measure at time T, merge, write from
+    time-T facts* for four slices running. I wrote it down as a lesson and then committed it inside
+    the same document: my draft claimed "−16 is the largest single-slice drop on this list in the
+    arc" while **#1139 landed mid-gate and took the list 523 → 493, a −30**. Three concurrent
+    slices merged under this one during a single gating session (#1136/#1137, then #1139, then
+    #1138), each requiring a rebase. **With N agents live, a superlative has a shelf life measured
+    in hours** — so either re-derive it against `origin/master` immediately before pushing, or do
+    not claim it. The mechanical form: every number in a PR body should be reproducible by one
+    command against the branch's actual base, and that command should be run last, not first.
+
 
 ## D-UDVARTY + D-UDNEVER + D-ALIASARR + D-ISALIAS — the union DECLARATION stops re-parsing its own members, a parser is deleted, and the transparency rule's `is` spelling catches up (#1141)
 
