@@ -136,10 +136,13 @@ print(foobar({ bar: "okie" }))
   }
 
   // The defect is diagnosed to the user by the checker, not by a bogus type.
+  // The message names the OFFENDING COMPONENT (`'any' within '{foo:string}|{bar:any}'`)
+  // rather than the whole composite — the checker-side half of this same report, landed
+  // in the queued-defects slice; the two halves were found independently and agree.
   const diags = await checker.check(src, "/tmp/x.vl", noSiblings);
   assertEquals(
     diags.map((d) => d.message),
-    ["unknown type '{foo:string}|{bar:any}'"],
+    ["unknown type 'any' within '{foo:string}|{bar:any}'"],
     "the annotation is reported",
   );
 });
@@ -191,7 +194,7 @@ Deno.test({
   assertEquals(
     await msgs(`${ann} {\n  if true { return v.foo }\n  return v.bar\n}\nprint(1)\n`),
     [
-      "unknown type '{foo:string}|{bar:any}'",
+      "unknown type 'any' within '{foo:string}|{bar:any}'",
       "cannot infer a return type for 'f' — annotate a return type",
     ],
     "plain `if`: both diagnostics",
@@ -200,7 +203,7 @@ Deno.test({
     await msgs(
       `${ann} {\n  if v is { foo: string } { return v.foo }\n  return v.bar\n}\nprint(1)\n`,
     ),
-    ["unknown type '{foo:string}|{bar:any}'"],
+    ["unknown type 'any' within '{foo:string}|{bar:any}'"],
     "`is` guard: the second diagnostic is lost",
   );
 });

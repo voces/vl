@@ -1260,6 +1260,13 @@ let cLitUnionCopyAliasIxs: i32[] = []
 let cFuncPinTyIx = -1
 // A single placeholder `TyObj` arena index for interned anonymous-shape `#anonN` names (C1 endgame).
 let cObjPinTyIx = -1
+// The node index of the if-EXPRESSION currently being checked as a `let`/`const`
+// INITIALIZER, or -1. The one position outside return-tail where the emitter CAN lower an
+// else-less if-expression's `T | null` value (`emit_collect.nliInferIfLet`), so the one
+// position where `checkIfStmtNode` widens it instead of typing it `TY_VOID`. Written and
+// restored around the initializer check in `checkLetDeclNode`; peeled through `Paren` so
+// `const r = (if c { 5 })` marks the same node `checkNode` reaches.
+let letInitIfIx = -1
 let inferQuiet = false
 let cycleBreakCount = 0
 let inferTentative: string[] = []
@@ -1830,6 +1837,8 @@ export function initChecker() {
   gaDeclIxs = []
   annotNameMemo = Map()
   annotNameMemoNegVer = Map()
+  annotPartNames = []
+  annotPartVals = []
   tpEnvNames = []
   tpEnvTys = []
   bgSrcStack = []
@@ -1984,6 +1993,11 @@ export function initChecker() {
   // four dead `__store_*__` declarations above stay dead (see `docs/internals/
   // buffer-design.md` §"the smallest first slice"). A program stores i32s and reads
   // them back at every width, which is what makes the widths measurable.
+  //
+  // "Stay dead" no longer means SILENT, though: those four and `__log_string__` are the
+  // five names `nameIsUnimplementedIntrinsic` lists, and calling one is now a positioned
+  // CHECKER diagnostic instead of an `emitProgram: call to unknown function` that reads
+  // like a typo'd identifier.
   declare("__load_i8__", mkFuncTy([TY_I32], TY_I32))
   declare("__load_u8__", mkFuncTy([TY_I32], TY_I32))
   declare("__load_i16__", mkFuncTy([TY_I32], TY_I32))
@@ -2041,6 +2055,43 @@ export function nameIsMemLoadIntrinsic(name: string) {
   if name == "__load_i64__" { return true }
   if name == "__load_f32__" { return true }
   if name == "__load_f64__" { return true }
+  false
+}
+
+// THE DECLARED-BUT-UNLOWERED MEMORY INTRINSICS — the five that pass `vl check` and then
+// die at emit with `emitProgram: call to unknown function`. Re-censused at this head, in
+// three call POSITIONS each (statement / value / binding), against the seventeen names
+// `defaultScope` declares: after #1170 gave the load-width matrix and `memory.size`/
+// `memory.grow` their arms, TWELVE lower and these FIVE do not.
+//
+//   `__store_i64__`  `__store_f32__`  `__store_f64__`   — the wide store widths
+//   `__store_string__`  `__log_string__`                — host-boundary string sinks
+//
+// Named here so the CHECKER says that, positioned and in the author's terms, instead of
+// letting the call reach the emitter and come back as `call to unknown function` — a
+// message that reads like a TYPO'D IDENTIFIER when the identifier is real and the
+// IMPLEMENTATION is what is missing. `docs/internals/memory-gc-design.md` §1.2 filed
+// exactly that as "the half worth fixing first"; this is that half.
+//
+// The three store widths are a table entry away from working — the exact duals of
+// `__load_i64__`/`__load_f32__`/`__load_f64__` — and the lowering WAS built and measured
+// this slice (13 of 14 round-trip cells correct by VALUE). It is not shipped because one
+// shape stays broken without a line in a file this slice does not own: a wide store as a
+// function's implicit TAIL statement (`function put(a: i32, v: f64) { __store_f64__(a, v) }`)
+// emits an invalid module, because `emit_classify.stmtIsTailValue` hard-codes the void
+// intrinsics by name and does not know these three. Shipping the lowering without that
+// line would trade a clean emit REJECT for a silent invalid module, which is the wrong
+// direction. The exact diffs are filed with the PR.
+//
+// The two string sinks are NOT a table entry away: `__store_string__` would have to copy
+// a GC `(array i32)` into linear memory with no byte encoding decided, and `__log_string__`
+// is a host import the native runner does not provide. Each needs a design.
+export function nameIsUnimplementedIntrinsic(name: string) {
+  if name == "__store_i64__" { return true }
+  if name == "__store_f32__" { return true }
+  if name == "__store_f64__" { return true }
+  if name == "__store_string__" { return true }
+  if name == "__log_string__" { return true }
   false
 }
 
@@ -5074,7 +5125,7 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
               }
             } else {
               tErr(
-                "unknown type '" + ftn.tyName + "' for field '" + fd.fdName + "'",
+                unknownTyText(ftn.tyName) + " for field '" + fd.fdName + "'",
                 dfields[fi],
               )
             }
@@ -5213,7 +5264,79 @@ function tsLeafTy(name: string) {
 // `""` is dropped by `splitGenArgs`, by the union arm's `part.length > 0` guard,
 // and by `(paramsStr.length > 0)`. `TS_ISECT` has no such guard and must NOT skip
 // — `A &` poisons to -1 on both sides.
+// ── the UNKNOWN-TYPE component bank ────────────────────────────
+// Both type resolvers answer -1 for "did not resolve", and -1 propagates straight out
+// of every composite arm (an unresolved element poisons its array, an unresolved member
+// poisons its union, an unresolved field poisons its shape — each by design, so no `-1`
+// sentinel leaks into the arena). The consequence for DIAGNOSTICS is that the caller
+// only ever holds the WHOLE annotation, and the message degraded as the type nested:
+//
+//   v: any                        → unknown type 'any'
+//   v: {bar: any}                 → unknown type '{bar:any}'          (blames the shape)
+//   v: {foo: string} | {bar: any} → unknown type '{foo:string}|{bar:any}' (blames both)
+//
+// `unkTyPart` banks the FIRST failing component, written by the resolver wrappers below:
+// the INNERMOST recursion to fail writes its own spelling and every enclosing frame sees
+// a non-empty bank and leaves it alone, so what survives is the leaf, not the composite
+// that carried it. The bank costs nothing on the success path (one length test) and no
+// resolver arm changed — the wrapper is the whole mechanism.
+//
+// LIFETIME is one OUTERMOST resolution: `unkTyDepth` counts frames and the first frame
+// clears the bank, so a speculative resolution elsewhere (`canonEmitName`'s `&` fold,
+// `unionAliasMembers`) can never leave a stale part behind for a later diagnostic. The
+// two resolvers share the counter deliberately — `tsToTy`'s generic-application arm calls
+// into `nameToTy`, so they are one recursion, not two.
+//
+// REFUTED while measuring this: the report that the UNION case additionally "loses the
+// second diagnostic entirely". It does not, at this head — 3 annotations × 7 function
+// bodies, 21 cells: whether `cannot infer a return type for 'f'` accompanies the message
+// is decided by the BODY (a body that returns the un-inferable param produces it, a body
+// with no value return does not) and is identical for `any`, `{bar: any}` and
+// `{foo: string} | {bar: any}`. Only the naming half of that report reproduces.
+let unkTyPart = ""
+let unkTyDepth = 0
+
+// The `unknown type` diagnostic text for the whole annotation `name`, naming the
+// offending COMPONENT when the bank holds one that is not the whole name. Read
+// immediately after the failing resolution (every call site is a resolve/`tErr` pair).
+function unknownTyText(name: string) {
+  const part = unkTyPart
+  if part.length == 0 { return "unknown type '" + name + "'" }
+  if part == name { return "unknown type '" + name + "'" }
+  // "within", not "in": two of the six call sites already append their own `in …` clause
+  // (`… for field 'a'`, `… in union 'Both<T>'`), and "unknown type 'T' in 'T&S' in union
+  // 'Both<T>'" reads as one clause too many.
+  "unknown type '" + part + "' within '" + name + "'"
+}
+
+// The SPELLING-TREE resolver, wrapped: bank this subtree's spelling if it is the
+// innermost frame that failed. `tsToName` re-renders the parser's own tree, so the part
+// is quoted in the same canonical spacing the whole name is.
 function tsToTy(ix: i32) {
+  unkTyDepth = unkTyDepth + 1
+  if unkTyDepth == 1 { unkTyPart = "" }
+  const r = tsToTyReal(ix)
+  if r < 0 {
+    if unkTyPart.length == 0 { unkTyPart = tsToName(ix) }
+  }
+  unkTyDepth = unkTyDepth - 1
+  r
+}
+
+// The NAME resolver, wrapped the same way (the unpositioned entries and the emitter's
+// re-resolutions come through here).
+function nameToTy(name: string) {
+  unkTyDepth = unkTyDepth + 1
+  if unkTyDepth == 1 { unkTyPart = "" }
+  const r = nameToTyReal(name)
+  if r < 0 {
+    if unkTyPart.length == 0 { unkTyPart = name }
+  }
+  unkTyDepth = unkTyDepth - 1
+  r
+}
+
+function tsToTyReal(ix: i32) {
   if ix < 0 { return -1 }
   const k = tsKind[ix]
   const start = tsKidStart[ix]
@@ -5370,7 +5493,7 @@ function tsToTy(ix: i32) {
   tsLeafTy(tsText[ix])
 }
 
-function nameToTy(name: string) {
+function nameToTyReal(name: string) {
   // An inline UNION `A | B | null` — the parser joins the members with `|` into one
   // synthetic name. Split on TOP-LEVEL `|`s (depth-aware), resolve each member, and
   // build the union (a `null` member makes it NULLABLE). Checked FIRST so a member's
@@ -6809,6 +6932,63 @@ function singleMemberAliasName(name: string) {
   tyToEmitName(m)
 }
 
+// The BASE-SCALAR emit name of a NUMERIC literal-union type (`0 | 1` → "i32",
+// `1.5 | 2.5` → "f64", the one-member `1` → "i32"), or "" for anything else —
+// a string litunion, a mixed-base union, a union with a non-literal member.
+//
+// `softenLitTy` IS the rule (host: "a numeric-literal union is its base type for
+// ARITHMETIC and ordering — the union constrains what may be ASSIGNED, not what may
+// be computed"), so this is a projection of the checker's own algebra, not a second
+// answer: it returns the type unchanged for every set it does not claim, and only a
+// homogeneous all-`TyLit` union moves.
+//
+// The STRING base is excluded on purpose. `type K = "a" | "b"` keeps its alias NAME at
+// emit because that name IS the atom identity (`nodeTyIsLitUnionAlias` → the interned
+// i32 atom rep); softening it to `string` would store an atom id in a `(ref $array)`
+// cell. A numeric literal union has no such identity to keep — its members ARE i32s.
+//
+// A one-member union WRAPPER is peeled first (`type Y = Z`): the parser encodes every
+// non-`{`-bodied `type N = …` as a one-member `UnionDecl`, so an alias-of-an-alias is a
+// union over a union. Depth-bounded rather than free recursion — a declared type may be
+// cyclic (`applyGenAlias` registers an instance under its own index; see #1127's
+// `guardFiniteUserTypes`) and this runs BEFORE any emit-side finiteness guard.
+function numLitUnionBaseName(ty: i32): string {
+  let cur = ty
+  let peels = 0
+  while peels < 8 {
+    if cur < 0 { return "" }
+    const t = T.tys[cur]
+    let inner = -1
+    if t is TyUnion {
+      if t.uMembers.length == 1 { inner = t.uMembers[0] }
+    }
+    if inner < 0 {
+      peels = 8
+    } else {
+      cur = inner
+      peels = peels + 1
+    }
+  }
+  if cur < 0 { return "" }
+  const soft = softenLitTy(cur)
+  if soft == cur { return "" }
+  if soft < 0 { return "" }
+  const st = T.tys[soft]
+  if st is TyPrim {
+    const pn = st.primName
+    if pn == "i32" || pn == "i64" || pn == "f64" { return pn }
+  }
+  ""
+}
+
+// The emit name of a DECLARED alias for a numeric literal union, or "".
+function numLitUnionAliasName(name: string) {
+  if !cUserTypes.has(name) { return "" }
+  const ti = cUserTypes[name] ?? -1
+  if ti < 0 { return "" }
+  numLitUnionBaseName(ti)
+}
+
 // True if `name` is an APPLICATION of a DECLARED generic alias whose argument list closes
 // the whole name (`Box<i32>`, `Pair<i32,string>`) — not `Box<i32>[]` (an array of one) and
 // not `Box<i32>|Tag` (a union carrying one), whose suffix / separator a caller peels first.
@@ -6919,6 +7099,30 @@ export function canonEmitName(name: string) {
   // member is itself canon'd, so `type Id = i32` → "i32" and `type Ids = Id[]`-style nesting resolves.
   const sma = singleMemberAliasName(name)
   if sma != "" { return canonEmitName(sma) }
+  // A declared alias for a NUMERIC literal union (`type Z = 0 | 1`, and the one-member
+  // `type Z = 1`) denotes its BASE SCALAR here — the identical name the INLINE spelling
+  // produces (the union arm below canons `0` and `1` to `i32` through `litBaseName` and
+  // dedups them to one atom). Before the `nameNeedsCanon` early-out, which sees a bare
+  // alias name with no digit/pipe/quote in it and returns it untouched.
+  //
+  // Untouched, the emitter received the ALIAS NAME, `collectU` had registered it in
+  // `unNames` (a `UnionDecl` whose single variant is not a `{…}` shape is not skipped),
+  // so `isUName` claimed the annotation for the `{tag, value}` UNION BOX while every READ
+  // of the value lowered as the plain i32 the checker's own algebra says it is —
+  // `global.get` of a `(ref $box)` handed to `__print_i32__`, SILENT INVALID WASM at
+  // every read position (top level, function body, struct field, array element), with
+  // `vl check` clean. The compiler named the mis-classification itself on `==`:
+  // "`==` over a struct union is not supported yet".
+  //
+  // Both halves of the split were already right on their own: `isValueUnionBox` excludes
+  // a homogeneous literal union ("all-`str` (`"a"|"b"`) or all-numeric (`0|1|2`)") and
+  // `nodeTyIsUnionAlias`'s comment already asserted that `0 | 1 | 2` "canon-names i32".
+  // It did not — for the ALIAS spelling — until here.
+  const nla = numLitUnionAliasName(name)
+  if nla != "" {
+    canonAtoms = 1
+    return nla
+  }
   if !nameNeedsCanon(name) { return name }
   // A top-level UNION: canon each member and collapse duplicates (`"a" | "b"`
   // both soften to string → the bare scalar; a mixed-base union keeps each
@@ -9163,6 +9367,31 @@ function checkCallNode(n: Call, ix: i32) {
       if uu >= 0 { return uu }
     }
   }
+  // A memory intrinsic that is DECLARED in the default scope but has no emitter arm
+  // (`nameIsUnimplementedIntrinsic` — the five re-censused there). Reported HERE rather
+  // than left to the emitter, which answers `emitProgram: call to unknown function`: a
+  // message that reads like a typo'd identifier when the identifier is real and the
+  // IMPLEMENTATION is what is missing. Same channel `print` of a reference uses — an
+  // emitter-capability admission, positioned in the source, not a type error.
+  //
+  // Gated on the program NOT declaring a function of that name. Unlike the seven names
+  // #1167 reserved, these five are NOT emitter-intercepted — the emitter has no arm for
+  // them, so `function __store_f64__(a: i32, v: f64) { … }` genuinely SHADOWS the
+  // builtin and genuinely runs today (measured). A diagnostic that fired on a user's own
+  // function would delete a working escape hatch to fix a message.
+  if cfn is Ident {
+    if (
+      nameIsUnimplementedIntrinsic(cfn.identName) &&
+      (fnDeclIx[cfn.identName] ?? -1) < 0
+    ) {
+      tErrUnsupported(
+        "'" +
+          cfn.identName +
+          "' is declared but has no implementation yet — it type-checks and then has nothing to lower (see `docs/internals/memory-gc-design.md` §1.2)",
+        ix,
+      )
+    }
+  }
   // `print(x)` is a compiler builtin (no module/import system yet): it accepts a
   // single value of any printable type and yields void. Special-cased so a program
   // that prints does not trip "undeclared identifier 'print'". Each argument is
@@ -9615,6 +9844,31 @@ let annotNameMemo: {[string]: i32} = Map()
 // (`nameToTy` mints PARTIAL types before failing, so un-memoized failures re-probed
 // in a loop still grow the arena — the same runaway the positive memo closes.)
 let annotNameMemoNegVer: {[string]: i32} = Map()
+// …and so does the failing COMPONENT the miss banked (`unkTyPart`). The diagnostic sites
+// read that bank on the line after their resolution, and a NEGATIVE memo hit returns -1
+// WITHOUT re-entering the resolver — so without this the message would quote whatever
+// name failed LAST anywhere in the program. It reproduced immediately: two functions,
+// `a(v: nope[][])` then `b(v: bad[])`, and `a` reported `unknown type 'bad' within
+// 'nope[][]'` — the checker hoists every top-level signature in pass 1 (silently, priming
+// the negative memo) and reports in pass 2, so EVERY reported name is a memo hit.
+// Parallel ARRAYS, not a `{[string]: string}` map, and not by preference: a
+// string-valued map read coalesced with `??` AS A FUNCTION RESULT emits invalid wasm on
+// this compiler (`return m[k] ?? ""` — filed with its repro; the same read bound to a
+// local inside a function is fine, and the i32-valued sibling is fine). The list is only
+// walked on an ERROR path and holds one entry per distinct unresolvable spelling.
+let annotPartNames: string[] = []
+let annotPartVals: string[] = []
+
+// The component banked for the failing spelling `name`, or "".
+function annotPartOf(name: string) {
+  let i = 0
+  while i < annotPartNames.length {
+    if annotPartNames[i] == name { return annotPartVals[i] }
+    i = i + 1
+  }
+  ""
+}
+
 export function resolveAnnot(name: string, typarams: string[]) {
   resolveAnnotTs(name, typarams, -1)
 }
@@ -9634,12 +9888,19 @@ function resolveAnnotTs(name: string, typarams: string[], root: i32) {
       const hit = annotNameMemo[name] ?? -2
       if hit != -2 { return hit }
       const negVer = annotNameMemoNegVer[name] ?? -1
-      if negVer == cUserTypesVer { return -1 }
+      if negVer == cUserTypesVer {
+        // Restore the component this name banked when it actually resolved, so the
+        // caller's `unknownTyText` reads THIS name's leaf and not the last one anywhere.
+        unkTyPart = annotPartOf(name)
+        return -1
+      }
       const r = annotResolve(name, root)
       if r >= 0 {
         annotNameMemo[name] = r
       } else {
         annotNameMemoNegVer[name] = cUserTypesVer
+        annotPartNames.push(name)
+        annotPartVals.push(unkTyPart)
       }
       return r
     }
@@ -10072,7 +10333,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         if ptn is TypeRef {
           pt = resolveAnnotAt(ptn.tyName, n.fnTyParams, pNode.parType)
           if pt < 0 {
-            tErr("unknown type '" + ptn.tyName + "'", pNode.parType)
+            tErr(unknownTyText(ptn.tyName), pNode.parType)
             pt = TY_ERR
           }
           // Record the resolved type on the param's TYPE-ANNOTATION node too (not just the
@@ -10135,7 +10396,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     if rtn is TypeRef {
       ret = resolveAnnotAt(rtn.tyName, n.fnTyParams, n.fnRet)
       if ret < 0 {
-        tErr("unknown type '" + rtn.tyName + "'", n.fnRet)
+        tErr(unknownTyText(rtn.tyName), n.fnRet)
         ret = TY_ERR
       }
       // Record the resolved return type on the RETURN-ANNOTATION node so the emitter can
@@ -11357,11 +11618,7 @@ function checkProgramNode(n: Program) {
                     }
                   } else {
                     tErr(
-                      "unknown type '" +
-                        ftn.tyName +
-                        "' for field '" +
-                        fd.fdName +
-                        "'",
+                      unknownTyText(ftn.tyName) + " for field '" + fd.fdName + "'",
                       dfields[fi],
                     )
                   }
@@ -11432,11 +11689,7 @@ function checkProgramNode(n: Program) {
                 if !isNeverTy(m) { members.push(m) }
               } else {
                 tErr(
-                  "unknown type '" +
-                    variants[vi] +
-                    "' in union '" +
-                    sd.udName +
-                    "'",
+                  unknownTyText(variants[vi]) + " in union '" + sd.udName + "'",
                   stmts[ti],
                 )
               }
@@ -16423,7 +16676,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
             n.letType,
           )
         } else {
-          tErr("unknown type '" + tn.tyName + "'", n.letType)
+          tErr(unknownTyText(tn.tyName), n.letType)
         }
         annot = TY_ERR
       }
@@ -16448,7 +16701,14 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       if liN.fnName == "" { noteValBindLambda(n.letInit) }
     }
   }
+  // The if-EXPRESSION initializer position, marked for `checkIfStmtNode`'s else-less
+  // widening (see its tail). A scalar written on the way IN and restored on the way OUT —
+  // never carried between statements, let alone between programs — and it names ONE node,
+  // so a nested `if` inside the initializer is unaffected.
+  const savedLetInitIf = letInitIfIx
+  letInitIfIx = ifExprNodeOf(n.letInit)
   if n.letInit >= 0 { initTy = checkNode(n.letInit) }
+  letInitIfIx = savedLetInitIf
   // A `void` initializer (`const x = f()` over a void function) has NO value to bind.
   // The assignment path (`x = f()`) already rejects it; the BINDING path did not — an
   // un-annotated binding had no assignability check, and `assignableExpr(void, T)` is
@@ -17085,6 +17345,30 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
 }
 
 // Extracted from `checkNodeReal`'s `IfStmt` arm (C3: thin the dispatcher).
+// The node index of `ix` when it is an if-EXPRESSION (peeling grouping parens), else -1.
+// The producer of `letInitIfIx`; mirrors the `isIfInit` peel `checkLetDeclNode` already
+// runs a few lines below for the inferred-union export, so the two positions are the same
+// position by construction rather than by coincidence.
+function ifExprNodeOf(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  let cur = ix
+  let peels = 0
+  while peels < 8 {
+    const nd = P.nodes[cur]
+    if nd is Paren {
+      cur = nd.parInner
+      if cur < 0 { return -1 }
+      peels = peels + 1
+    } else {
+      peels = 8
+    }
+  }
+  if cur < 0 { return -1 }
+  const fin = P.nodes[cur]
+  if fin is IfStmt { return cur }
+  -1
+}
+
 function checkIfStmtNode(n: IfStmt, ix: i32) {
   // An `if`/`else` in VALUE position is an EXPRESSION whose value is the join of its
   // branch tail values (`if c { 1 } else { 2 }` is `i32`). Capture whether THIS `if`
@@ -17301,11 +17585,29 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // that path is `null` (exactly the #484 function fall-through), so the function's
   // return is `thenTy | null`. The emitter routes this to `emitIfTail` (the then-arm
   // returns the value; the false path falls through to the function-end null padding,
-  // `emitNullForRet`). Outside tail position (an inline `const x = if c then 5`) the
-  // emitter can't yet leave a nullable value on the stack, so it stays TY_VOID — a clean
-  // "cannot assign void" at the use site, pending a typed-blocktype if-expression.
-  if ifTail && thenTy != TY_VOID && thenTy != TY_ERR {
-    return mkNullableTy(thenTy)
+  // `emitNullForRet`).
+  //
+  // …AND in a `let`/`const` INITIALIZER (`const r = if c { 5 }`), which is new here. The
+  // comment that stood in this spot said "outside tail position the emitter can't yet
+  // leave a nullable value on the stack, so it stays TY_VOID — a clean `cannot assign
+  // void` at the use site, pending a typed-blocktype if-expression". **THAT REASON IS NO
+  // LONGER TRUE FOR THIS POSITION**: `emit_collect.nliInferIfLet` lowers an if-expression
+  // BINDING against the checker's exported inferred union (`inferLetIx`/`inferLetTy`,
+  // whose own gate — `isIfInit` in `checkLetDeclNode` — is this exact position), so the
+  // capability the decline was waiting for arrived and nothing re-read the decline.
+  // Measured: `const r = if c { 5 }` then `r ?? 0` / `r == null` / `r + 1` / a `string`
+  // arm / an annotated `: i32 | null` binding all ran correctly under the widening, in
+  // and out of a function body; the reported symptom (filed as a `??` bug — `??` is not
+  // involved, it returns its LHS unchanged) was the checker refusing at the BINDING.
+  //
+  // The widening is POSITION-GATED, not global, and the gate is a measurement: the three
+  // positions the emitter still cannot lower — a call ARGUMENT, an explicit `return`, and
+  // a bare `print(if c { 5 } ?? 0)` — all answer `emitProgram: union if-expression
+  // requires an else arm`, so widening there would trade the checker's clean, positioned
+  // "cannot assign void" for an emit-stage reject. Those keep master's behaviour exactly.
+  if thenTy != TY_VOID && thenTy != TY_ERR {
+    if ifTail { return mkNullableTy(thenTy) }
+    if ix == letInitIfIx { return mkNullableTy(thenTy) }
   }
   return TY_VOID
 }

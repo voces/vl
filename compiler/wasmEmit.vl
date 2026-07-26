@@ -8179,6 +8179,42 @@ function emitIntIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
   NUM_INTR_NONE
 }
 
+// One operand of a LINEAR-MEMORY intrinsic, emitted with every WIDE-SCALAR context
+// flag CLEARED — the same discipline (and the same reason) as the `call_ref` argument
+// spine in `emitCallRef` and the index-receiver arms in the `Index` lowering.
+//
+// EVERY memory-intrinsic operand is an i32 BY DECLARATION (`typecheck.vl`'s default
+// scope: `__store_i32__(i32,i32)`, `__load_*__(i32)`, `__memory_grow__(i32)`,
+// `__log__(i32,i32)`) — a byte address, a stored i32 word, a page count. So no wide
+// scalar an ENCLOSING position wants may reach it. `emitLetDecl`'s `letIsF32` arm and
+// `emitReturnValue`'s f32 arm seed `pendingF32` across the WHOLE init/result subtree,
+// and an address literal then lowers as `f32.const` — `f32.const 0` followed by
+// `f32.load`, which is an UNPARSEABLE MODULE with `vl check` clean.
+//
+// Measured on the parent commit over a position matrix: 9 of 11 f32 positions
+// (`const q: f32 = __load_f32__(0)` annotated and inferred, module scope and function
+// scope, an `f32` return, an `f32` argument, and anything nested in them) and 1 of 4
+// i64 positions (an `i64` ARGUMENT) emit `type mismatch: expected i32, found f32/i64`.
+// f64 escaped only by accident of routing: its `letIsF64`/return arms call
+// `emitExprAsF64` and never seed the flag at all.
+//
+// The array intrinsics are deliberately NOT routed here — `__array_new__(n, fill)`'s
+// FILL operand takes the element's own valtype, so clearing the context there would
+// break an f64/i64 fill. Their address-free operands have their own coercion.
+function emitMemIntrinArg(body: i32[], ix: i32, fnIx: i32) {
+  const savedF32 = pendingF32
+  const savedF64 = pendingF64
+  const savedI64 = pendingI64
+  pendingF32 = false
+  pendingF64 = false
+  pendingI64 = false
+  const r = emitExpr(body, ix, fnIx)
+  pendingF32 = savedF32
+  pendingF64 = savedF64
+  pendingI64 = savedI64
+  r
+}
+
 // Node shapes read: Call { callFn: i32, callArgs: i32[] }, callee Ident { identName }.
 function emitCall(body: i32[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
@@ -8304,17 +8340,29 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           }
           return 0
         }
+        // A NULLABLE-string value (`string | null` — a niche binding, a `(string|null)[]`
+        // element, a fused read over a `{[string]: string | null}` map, which PRESERVES a
+        // stored null) may genuinely hold null, and it prints `null` when it does.
+        //
+        // Asked BEFORE `exprString`, and that ORDER is the fix — the same ordering argument
+        // the literal-atom arm above carries. `exprString` ALSO claims this value (it reads
+        // the softened render, which says `string` about a cell whose rep is
+        // `(ref null $a)`), so master streamed a possibly-null ref straight into
+        // `array.len`: a runtime `wasm trap: null reference` with `vl check` clean. The two
+        // classifiers disagree only where the value IS the niche, and there the niche answer
+        // is the REP. (The dead `emitFail` that used to sit here was UNREACHABLE for exactly
+        // this reason — every nullable string reached `exprString` first.)
+        if exprNullableString(c.callArgs[0], fnIx) {
+          return emitPrintNulString(body, c.callArgs[0], fnIx)
+        }
+        // The other NICHE: `boolean | null`, an i32 with the null SENTINEL 2. The fallback
+        // ladder ends in `__print_bool__`, which renders any non-zero as `true` — so a null
+        // printed **true**, silently.
+        if exprNulBool(c.callArgs[0], fnIx) {
+          return emitPrintNulBool(body, c.callArgs[0], fnIx)
+        }
         if exprString(c.callArgs[0], fnIx) {
           return emitPrintStrExpr(body, c.callArgs[0], fnIx)
-        }
-        // A NULLABLE-string value (`string | null` — a niche binding, or a fused read over a
-        // `{[string]: string | null}` map, which PRESERVES a stored null) may genuinely hold
-        // null: the fallback ladder below would hand its `(ref null)` to a scalar print
-        // import (invalid wasm). Narrowing is the supported spelling — fail loudly.
-        if exprNullableString(c.callArgs[0], fnIx) {
-          return emitFail(
-            "emitProgram: print of a nullable string — narrow it first (`if v != null { print(v) }`)",
-          )
         }
         // An i64-typed argument lowers to `i64.const`/`local.get` of an i64 slot, so it
         // must route to `__print_i64__` (import 4) — its functype is `(i64)->()`, so the
@@ -8352,8 +8400,8 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
             "emitProgram: __store_i32__ takes exactly two arguments",
           )
         }
-        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
+        if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
+        if emitMemIntrinArg(body, c.callArgs[1], fnIx) < 0 { return -1 }
         fbI32Store()
         return 0
       }
@@ -8363,7 +8411,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
             "emitProgram: __load_i32__ takes exactly one argument",
           )
         }
-        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+        if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
         fbI32Load()
         return 0
       }
@@ -8380,7 +8428,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
               " takes exactly one argument (the byte address)",
           )
         }
-        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+        if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
         // The guard above and the two tables below are THREE lists keyed by the same
         // names, in two files. They agree today; a fourth width added to one and not
         // the others would reach here with -1 and write it as an opcode byte — a
@@ -8420,7 +8468,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
             "emitProgram: __memory_grow__ takes exactly one argument (the page count to add)",
           )
         }
-        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+        if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
         fbMemoryGrow()
         return 0
       }
@@ -8428,8 +8476,8 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         if c.callArgs.length != 2 {
           return emitFail("emitProgram: __log__ takes exactly two arguments")
         }
-        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
+        if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
+        if emitMemIntrinArg(body, c.callArgs[1], fnIx) < 0 { return -1 }
         fbCall(gMemLogIdx)
         return 0
       }
@@ -12012,6 +12060,130 @@ function quoteLex(inner: string) {
 function emitPrintStrExpr(body: i32[], strExpr: i32, fnIx: i32) {
   if emitExpr(body, strExpr, fnIx) < 0 { return -1 }
   fbLocalSet(strScratchBase + 0)
+  emitPrintStrFromScratch(body)
+}
+
+// The literal text `null`, streamed through the SAME `__print_char__` (import 2) /
+// `__print_str_flush__` (import 3) pair `print(<string>)` uses — and through no scratch
+// frame at all: a CONSTANT text needs neither a string-ref slot nor loop counters, so
+// this arm is available in a function that reserved nothing. The null branch of the two
+// nullable-NICHE prints below.
+function emitPrintNullWord() {
+  fbI32Const(110) // 'n'
+  fbCall(2)       // __print_char__
+  fbI32Const(117) // 'u'
+  fbCall(2)
+  fbI32Const(108) // 'l'
+  fbCall(2)
+  fbI32Const(108) // 'l'
+  fbCall(2)
+  fbCall(3)       // __print_str_flush__
+  0
+}
+
+// `print(<string | null>)`. The NICHE rep is a `(ref null $aTypeIdx)`, and the plain
+// string arm below streams it unconditionally — `array.len` on a null ref, i.e. a
+// runtime `wasm trap: null reference` with `vl check` clean, for every program whose
+// value actually WAS null. (`types/print-scalar-boundary-controls.vl` filed this in
+// prose and pinned the value-holding cell around it: "the ladder's nullable-string arm
+// has no null path. That is a MISSING ARM, not a gate question.")
+//
+// Structure — one `br_on_null` (0xd5, the same function-references proposal this emitter
+// already uses for `ref.as_non_null` / `call_ref`), which is what makes ONE evaluation of
+// the argument enough. There is no nullable string LOCAL to stash it in (`strScrA` is
+// declared non-null `(ref $aTypeIdx)`), and re-evaluating would call a
+// `string | null`-returning function twice:
+//
+//   block $out
+//     block $null
+//       <arg>            ;; (ref null $a)
+//       br_on_null $null ;; pops it; on non-null leaves (ref $a)
+//       local.set strScrA
+//       <stream>
+//       br $out
+//     end
+//     <print "null">
+//   end
+function emitPrintNulString(body: i32[], argIx: i32, fnIx: i32) {
+  fbBlock(64) // $out
+  ctrlEnter()
+  fbBlock(64) // $null
+  ctrlEnter()
+  // The RAW nullable ref. Without `rawNullRead` a kind-16 read recovers itself with
+  // `ref.as_non_null` (0xd4) — which TRAPS on the very value this arm exists to handle,
+  // before `br_on_null` can see it. Same context flag the `??` arms over a nullable
+  // string set for their own `ref.is_null`.
+  const rawCtx = expCtxHere()
+  rawCtx.rawNullRead = true
+  if emitExprExpect(body, argIx, fnIx, rawCtx) < 0 { return -1 }
+  wU8(213) // 0xd5 br_on_null
+  wULEB(0) // → $null (the enclosing block)
+  fbLocalSet(strScratchBase + 0)
+  if emitPrintStrFromScratch(body) < 0 { return -1 }
+  fbBr(1) // → $out
+  fbEnd()
+  ctrlLeave()
+  emitPrintNullWord()
+  fbEnd()
+  ctrlLeave()
+  0
+}
+
+// `print(<boolean | null>)`. The NICHE rep is an i32 whose null value is the SENTINEL 2
+// (`boolean` being 0/1), and the fallback ladder below routes it to `__print_bool__` —
+// which renders any non-zero as `true`. So a `boolean | null` holding NULL printed
+// **true**, silently, with `vl check` clean. That is the worse half of the same missing
+// arm: the string niche at least trapped.
+//
+// Structure — a `br_table` on the niche value itself, which is already exactly the arm
+// index (0 = false, 1 = true, 2 = null). Like the string arm this evaluates the argument
+// ONCE and needs no local: `br_table` consumes the value AS the selector, and each arm
+// then knows its own constant. No scratch frame is reserved for a bare boolean print, and
+// this arm does not need one.
+//
+//   block $out          block $null          block $true          block $false
+//     <arg> ; br_table 0 1 2 (default 2)
+//   end $false → i32.const 0 ; __print_bool__ ; br $out
+//   end $true  → i32.const 1 ; __print_bool__ ; br $out
+//   end $null  → <print "null">
+function emitPrintNulBool(body: i32[], argIx: i32, fnIx: i32) {
+  fbBlock(64) // $out
+  ctrlEnter()
+  fbBlock(64) // $null
+  ctrlEnter()
+  fbBlock(64) // $true
+  ctrlEnter()
+  fbBlock(64) // $false
+  ctrlEnter()
+  if emitExpr(body, argIx, fnIx) < 0 { return -1 }
+  wU8(14)     // 0x0e br_table
+  wULEB(3)    // three indexed targets, then the default
+  wULEB(0)    // 0 → $false (depth 0 from here)
+  wULEB(1)    // 1 → $true
+  wULEB(2)    // 2 → $null
+  wULEB(2)    // default → $null (unreachable: the niche is 0/1/2)
+  fbEnd()
+  ctrlLeave()
+  fbI32Const(0)
+  fbCall(1)   // __print_bool__ → "false"
+  fbBr(2)     // → $out
+  fbEnd()
+  ctrlLeave()
+  fbI32Const(1)
+  fbCall(1)   // __print_bool__ → "true"
+  fbBr(1)     // → $out
+  fbEnd()
+  ctrlLeave()
+  emitPrintNullWord()
+  fbEnd()
+  ctrlLeave()
+  0
+}
+
+// The streaming loop over the string already stashed in `strScrA` — `emitPrintStrExpr`'s
+// tail, split out so the nullable arm above can reach it with the ref it recovered from
+// `br_on_null` instead of re-evaluating the expression.
+function emitPrintStrFromScratch(body: i32[]) {
   fbI32Const(0)
   setStrScrI(body, 0)
   pushStrScrRef(body, 0)

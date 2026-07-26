@@ -20765,3 +20765,263 @@ numbers are not a simple sum of the edits, and that is stated rather than smooth
 6. **`nameIsBareMap` is down to 16 sites and every one of them holds a STRING, not a node** — an atom
    peeled out of a union, a slice of a bigger spelling, `nameIsMapArray`'s element. They do not move
    until the thing that produced the substring hands over a type instead.
+---
+
+## PR — QUEUED DEFECTS: the numeric-literal-union alias, the two nullable-print niches, the memory-intrinsic operand context, the else-less `if` binding, the `unknown type` component, and the dead-intrinsic census (off master `b57bed0`)
+
+A DEFECT slice, not a destringify slice. **NET parse count 0** on every column — nothing on the
+SCORECARD list moved, no resolver was retired, no new type-name parse was added. Six queued defects
+were re-verified at this head, five fixed, one refuted in half; two NEW defects were found while
+measuring and one of those fixed. What follows is what each defect now does.
+
+### FIXED
+
+**1. A numeric-literal union behind a type ALIAS emitted SILENT INVALID WASM at every read.**
+`type Z = 0 | 1` + `const z: Z = 1` + `print(z)` built a module that failed to parse as WebAssembly
+with `vl check` clean; so did `z + 1`, `toString(z)`, a function-body binding, a struct FIELD, an
+array ELEMENT, a three-member alias and an alias-of-the-alias. `z == 1` was a clean emit reject whose
+message named the mis-classification itself — "`==` over a struct union is not supported yet". **10
+of 20 graded cells; the INLINE spelling (`const z: 0 | 1 = 1`), the STRING sibling
+(`type K = "a" | "b"`), a PARAM and a RETURN all worked, which is what made the split visible.**
+
+Mechanism, read from the emitted bytes: the cell was a union BOX
+(`(global (mut (ref 0))) i32.const 1 struct.new 1 struct.new 0`) while every READ lowered as the
+plain i32 the checker's own algebra says the value is. Both halves were individually right —
+`isValueUnionBox` explicitly excludes a homogeneous literal union ("all-`str` (`"a"|"b"`) or
+all-numeric (`0|1|2`)"), and `nodeTyIsUnionAlias`'s comment already asserted that `0 | 1 | 2`
+"canon-names i32". **It did not, for the alias spelling.** `canonEmitName` resolves a one-member
+alias and softens an inline union, but a bare alias NAME has no digit, quote or pipe in it, so
+`nameNeedsCanon` returned it untouched, the emitter received `Z`, and `collectU` had registered `Z`
+in `unNames` (a `UnionDecl` whose single variant is not a `{…}` shape is not skipped), so `isUName`
+claimed the annotation for the box.
+
+Fix: one arm in `canonEmitName`, beside the existing single-member-alias transparency, delegating to
+**`softenLitTy` — the checker's own "a numeric-literal union is its base type for arithmetic and
+ordering" rule**, not a second answer. The STRING base is excluded deliberately (there the alias name
+IS the interned-atom identity; softening it stores an atom id in a `(ref $array)` cell), and the
+exclusion is load-bearing: **sabotage S1, which lets the string base through, reddens 45 corpus
+files.** MEMBERSHIP is untouched — `canonEmitTypeNames` runs at the END of `checkProgram`, after every
+membership decision, and all eight reject cells (initializer / assignment / argument / return / field
+/ element / i32-into-Z / string-into-Z) are byte-identical on both sides.
+
+**2. `print(<string | null>)` TRAPPED on an actual null; `print(<boolean | null>)` printed `true`.**
+Both `vl check` clean. The string niche is a `(ref null $aTypeIdx)` and the print ladder streamed it
+unconditionally — `array.len` on a null ref. The boolean niche is an i32 whose null value is the
+SENTINEL 2, and the ladder ended in `__print_bool__`, which renders any non-zero as `true`: **silently
+wrong, which is worse than the trap.**
+
+**A CHECKER GATE WAS BUILT FIRST AND THE CORPUS REFUTED IT.** Rejecting every null-bearing `print`
+turned the trap into a clean error and ALSO rejected four working programs, two of them corpus files
+— and one of those, `types/print-scalar-boundary-controls.vl`, exists precisely to pin what `print`
+must keep accepting, and had already filed this defect in prose with the right diagnosis: *"the
+ladder's nullable-string arm has no null path. That is a MISSING ARM, not a gate question: the
+reference gate must keep declining `string | null`, or this cell would stop printing."* A wider
+first candidate also over-rejected `literal-unions/nullable-litunion-alias-sites.vl`, where the
+checker does NOT narrow the expanded `type K = "ab" | "zz" | null` form but the EMITTER does — so the
+gate would have rejected a correct, narrowed program on the strength of a separate checker gap.
+
+Shipped as the missing arms. Both evaluate the argument EXACTLY ONCE and reserve nothing: the string
+arm recovers the non-null ref with **`br_on_null`** (there is no nullable string local to stash it in
+— `strScrA` is declared non-null `(ref $aTypeIdx)`), and the boolean arm uses **`br_table` on the
+niche value, which is already the arm index** (0 false / 1 true / 2 null). The literal text `null`
+streams through the same `__print_char__`/`__print_str_flush__` imports with no scratch frame, because
+a constant text needs no ref slot and no loop counters. The `exprNullableString` test moved BEFORE
+`exprString` — the same ordering argument the literal-atom arm above it already carries, and the
+`emitFail` that used to sit after `exprString` was UNREACHABLE for exactly that reason.
+
+**A FOURTH SILENTLY-WRONG CELL FELL OUT, AND IT WAS ENTOMBED IN A FIXTURE AS EXPECTED OUTPUT.**
+`closures/closure-value-2d-scalar-array-result.vl` pinned `print(r[1][0])` over a
+`(boolean | null)[][]` holding `false` as **`@log 0`**, five lines below its `boolean[][]` sibling
+`print(t1[1][0])` — the same value — pinned as `@log false`. One value, two renderings, selected only
+by whether the element type carried `| null`. Corrected to `@log false` in place, with the reason.
+
+**3. A memory intrinsic's OPERAND inherited an enclosing WIDE-SCALAR context → invalid wasm.**
+`const q: f32 = __load_f32__(0)` emitted `f32.const 0` followed by `f32.load`. `emitLetDecl`'s
+`letIsF32` arm seeds `pendingF32` across the whole initializer subtree and the intrinsic arms emitted
+their arguments with it still set. **Every memory-intrinsic operand is an i32 BY DECLARATION** — a
+byte address, a stored word, a page count — so the fix is the discipline the `call_ref` argument
+spine thirty lines below already applies, with a comment naming this exact failure mode.
+
+Position matrix, graded: **9 of 11 f32 positions and 1 of 4 i64 positions** emit `type mismatch:
+expected i32, found f32/i64`. f64 escaped only by accident of routing — its `let`/return arms call
+`emitExprAsF64` and never seed the flag. *(This defect was not on the queue; it surfaced from the
+dead-intrinsic census in **BINDING** position, which the census's statement and value positions did
+not reach. Method note 95's rule, one position further out.)*
+
+**4. An else-less `if` used as a `let`/`const` INITIALIZER typed `TY_VOID`.**
+`const r = if c { 5 }` then `r ?? 0` / `r == null` / `r + 1` — every use refused, one message each
+(`cannot assign void to 'r'`, `return type mismatch: expected i32, got void`, `operator '+' is not
+defined for void and i32`, `cannot compare void with null`). **Filed as a `??` bug; `??` IS NOT
+INVOLVED** — it returns its LHS unchanged, and the refusal is at the binding.
+
+The decline was documented, and **its stated reason was false when read**: "outside tail position the
+emitter can't yet leave a nullable value on the stack … pending a typed-blocktype if-expression".
+`emit_collect.nliInferIfLet` lowers exactly this binding against the checker's own exported inferred
+union, and that export's gate (`isIfInit` in `checkLetDeclNode`) IS this position. The capability
+arrived and nothing re-read the decline.
+
+**POSITION-GATED, and the gate is a measurement.** An ungated probe compiler was built and graded: 7
+of 10 cells go from a check error to a correct run, and the three that do not — a call ARGUMENT, an
+explicit `return`, and a module-scope binding read through `print` — all answer `emitProgram: union
+if-expression requires an else arm`. Widening there would trade the checker's clean POSITIONED refusal
+for an emit-stage reject, so those keep master's behaviour exactly and one of them is pinned.
+
+**5. The `unknown type` diagnostic named the whole composite instead of the offending component.**
+`v: {bar: any}` said `unknown type '{bar:any}'`; a union of two shapes blamed the union. Both
+resolvers answer -1 and -1 propagates out of every composite arm by design (an unresolved element
+poisons its array, an unresolved member poisons its union — so no `-1` sentinel leaks into the
+arena), so the caller only ever held the composite. The resolver wrappers now bank the INNERMOST
+failing spelling; the leaf case is byte-identical, because the part IS the whole name there. Six
+diagnostic sites read it. `nope[][]`, `(nope)=>i32`, `{a:{b:nope}}`, `{[string]:nope}`,
+`{foo:string}|{bar:nope}`, `Bogus|i32`, `T&S in union Both<T>` all now name `nope` / `Bogus` / `T`.
+
+**6. The five DECLARED-BUT-UNLOWERED memory intrinsics now say so at `vl check`, positioned.**
+Re-censused at this head across seventeen declared names in three call POSITIONS each: twelve lower,
+and `__store_i64__`, `__store_f32__`, `__store_f64__`, `__store_string__`, `__log_string__` do not —
+reproducing the count `docs/internals/memory-gc-design.md` §1.2 and #1166 reached independently, a
+third instrument. Their failure was `emitProgram: call to unknown function`, which §1.2 itself filed
+as "the half worth fixing first" because it reads like a typo'd IDENTIFIER when the identifier is real
+and the IMPLEMENTATION is what is missing. Now an `unsupported-lowering` admission at the call site.
+**Gated on `fnDeclIx` not holding the name**: unlike the seven names #1167 reserved, these five are
+not emitter-intercepted, so `function __store_f64__(…)` genuinely shadows the builtin and genuinely
+runs — measured, and the escape hatch is preserved.
+
+### REFUTED
+
+1. **"The union case LOSES the second diagnostic entirely" is FALSE at this head.** Graded over 3
+   annotations × 7 function bodies (21 cells): whether `cannot infer a return type for 'f'`
+   accompanies the message is decided by the BODY — a body that returns the un-inferable param
+   produces it, a body with no value return does not — and is IDENTICAL for `any`, `{bar: any}` and
+   `{foo: string} | {bar: any}`. The naming half of that report reproduces exactly; the dropping half
+   does not. **A second, independent instrument agrees and predates the slice:
+   `tests/cases/types/unknown-type-in-union-member.vl` has pinned BOTH diagnostics for exactly that
+   union shape since it was written.**
+2. **The filed line `typecheck.vl:17214` for the else-less decline is not the decline** — it is
+   `const enElse = P.nodes[n.ifElse]`, 86 lines above the actual site. The anchor text
+   (`// An else-less `if` in RETURN-TAIL position`) is the durable reference. *(Fifth consecutive
+   slice in which a filed line number was stale.)*
+3. **`print(<string | null>)` cannot be fixed by a checker gate** — see defect 2. The corpus file that
+   would break is the one that pins the gate's own boundary.
+4. **Reviving the three wide store widths is NOT shippable from this partition**, and the reason is
+   not scope discipline — it is that the incomplete version is WORSE than the reject. See the hand-off.
+
+### NEWLY FILED, each with a reproduction
+
+1. **Negative zero prints `-0` under the Rust host and `0` under the Deno oracle.** `main.rs:811`
+   lowers `__print_f64__` to `v.to_string()`, and Rust's `Display` prints `-0` where JS
+   `String(-0)` is `"0"` — against the comment three lines above it, which states JS parity as the
+   rule ("Rust's `{}` Display matches JS `String(v)` for the corpus values … mirroring the host's
+   `__print_f64__` (`String(v)`)"). Reproduced for f64 (`-0.0`, `0.0 * -1.0`, `-1.0 * 0.0`) and f32.
+   **Renderer-side is not an option: VL has no f64 `toString` (`toString` takes `i32 | boolean`), so
+   the decimal is produced entirely by the host import.** `scripts/vl-host/` is not this partition.
+   Exact diff — `linker.func_wrap("imports", "__print_f64__", move |v: f64| s(if v == 0.0 { "0" }
+   else { &v.to_string() }))`, and the same guard on the f32 arm's widened value; `v == 0.0` is true
+   for both signs, so it matches `String(v)` exactly for the whole zero family.
+2. **`return m[k] ?? ""` over a `{[string]: string}` map emits INVALID WASM** (`type mismatch:
+   expected (ref null $type), found (ref $type)`), `vl check` clean. **Found by writing this slice's
+   own fix** — the natural spelling for the diagnostic bank was a `{[string]: string}` memo, and the
+   compiler could not compile itself with it. Narrowed in three cells: the same read bound to a LOCAL
+   inside a function runs (`const v = m[k] ?? ""`), the i32-valued sibling runs
+   (`return m[k] ?? 0`), and only the string-valued RESULT position fails. Worked around here with
+   parallel arrays, and the workaround says why in the source.
+3. **The three wide store widths, with the lowering built and measured.** `__store_i64__` → `i64.store`
+   (0x37), `__store_f32__` → `f32.store` (0x38), `__store_f64__` → `f64.store` (0x39), alignment
+   exponents 3/2/3, the value operand coerced to the declared width. **13 of 14 round-trip cells go
+   from `emit error` to correct BY VALUE** (a stored f32 read back as its i32 bit pattern gives
+   1065353216; an i64 5000000077 round-trips). **The 14th is why it is not shipped:** a wide store as
+   a function's implicit TAIL statement (`function put(a: i32, v: f64) { __store_f64__(a, v) }`) emits
+   an INVALID MODULE, because `emit_classify.stmtIsTailValue` hard-codes the void intrinsics by name
+   and does not know these three — a one-line addition
+   (`if nameIsMemStoreIntrinsic(callee.identName) { return false }`, beside the existing
+   `__store_i32__` line) in a file this slice does not own. Shipping without it would trade a clean
+   emit REJECT for a silent invalid module, which is the wrong direction. The full diff is in the PR
+   body; it also touches `emit_sections`'s `memUsed`/wide-scalar scan and the `dropIt` list, both in
+   this partition.
+4. **A module-scope `const r = if c { 5 }` still emit-fails** (`union if-expression requires an else
+   arm`) where the function-scope form now runs — the start-function binding path does not reach
+   `nliInferIfLet`. Unchanged from master, filed.
+
+### EVIDENCE
+
+Gate, every RC checked explicitly, all at the gating head (`build/vl-compiler.wasm` md5
+`28c85b4c…`, 1,035,845 B): `refresh-compiler.sh` RC=0 · `native-fixpoint.sh` RC=0 (stage3 == stage4
+byte-for-byte) · `lint-self.sh` RC=0 · `rep-fuzz-check.sh` `exact ✅` · the ci.yml commands verbatim
+including `deno test -A tests/cases_wasm_test.ts` **without** `--no-check` (deno-lint, deno check
+compiler/*.ts, `deno task test`, the native suites, the TYPE-CHECKED corpus oracle, the editor
+suites) — all RC=0.
+
+**Suite A/B, same tree, same session, same command, both seeds:** master seed **2,112 passed / 10
+failed / 14 ignored**, candidate seed **2,122 passed / 0 failed / 14 ignored**. The delta was
+asserted before it was read (2,112 + 10 = 2,122) and the 10 failures are EXACTLY the new and
+intentionally-changed pins, named. **IGNORED NAME SETS IDENTICAL**, both files asserted non-empty
+(14 each) — nothing that ran stopped running.
+
+**Corpus A/B, 1,396 files, every differing file named:** 40 differ — 7 new fixtures, 5 pre-existing
+files whose only change is an improved message, and **28 BYTES-only** (the nullable-print lowering
+sites: same rc, same diagnostics, same RUN output). **1,356 pre-existing files byte-, message- and
+run-identical.**
+
+**Shared-instance `vl check <dir>` leg:** `std` and `compiler` IDENTICAL; `tests/cases` differs by
+exactly 7 removed lines (the else-less-if binding, now legal), 10 improved messages and 1 new
+positioned diagnostic, in two files, both this slice's.
+
+**Fuzz A/B: 25,600 programs per side** (4 seeds × 4 dimension combos × 1,600, whole `--shapes-out`
+failure sets diffed per cell): **0 of 16 cells differ, 356 failure lines on both sides. That 0 is a
+COVERAGE statement, not agreement** — the generator emits no `print` of a nullable niche, no
+numeric-literal-union alias, no memory intrinsic, no else-less if-expression binding and no
+unresolvable type name. The corpus channel is where this change is visible (33 pre-existing files),
+and the comparator was proved live on it by sabotage (below).
+
+**Lint-tier A/B:** `std` and `compiler` IDENTICAL; `tests/cases` differs only inside the new
+`else-less-if-expression-binding.vl` fixture, which now earns redundant-annotation HINTS because its
+return types became inferrable.
+
+**ENTOMBMENT — seven named sabotages, A/B'd over the full corpus against the shipped compiler:**
+
+| # | sabotage | corpus files reddened |
+|---|---|---|
+| S1 | the numeric-litunion canon also claims the STRING base | **45** |
+| S2 | the nullable-boolean `br_table` swaps the false/true arms | **17** |
+| S3 | the memory-intrinsic operand keeps the enclosing wide context (master's behaviour) | **1** (the new pin) |
+| S4 | the else-less-`if` widening loses its POSITION gate | **1** (the boundary control) |
+| S5 | the nullable-string print loses its raw-null read (`ref.as_non_null` traps) | **18** |
+| S6 | the unknown-type bank never clears at the outermost frame | **0 — inert, stated** |
+| S7 | the negative-memo hit does not restore its banked component | **1** (the lifetime cell) |
+
+S3, S4 and S7 have no pre-existing witness and are pinned by this slice's own fixtures — which is the
+honest form, not a stronger claim. **S6 is inert on the corpus and no pin exists for it**: the depth
+reset is a lifetime guarantee, and the population that would exercise it is empty here. Every other
+hunk is pinned by files that predate the slice.
+
+### THE METHOD NOTES THIS SLICE EARNED
+
+103. **A NEGATIVE MEMO IS A LIFETIME HAZARD FOR ANY SIDECAR THE FAILING PATH WRITES.**
+     `resolveAnnotTs` memoizes FAILURES (`annotNameMemoNegVer`), and the checker hoists every
+     top-level signature in pass 1 (silently) and reports in pass 2 — so **every reported name is a
+     memo hit and never re-enters the resolver**. The unknown-type component bank was therefore
+     correct at resolve time and stale at report time: two functions, `a(v: nope[][])` then
+     `b(v: bad[])`, and `a` reported *`unknown type 'bad' within 'nope[][]'`*. Fixed by banking the
+     component ALONGSIDE the negative memo and restoring it on the hit. **The bug was in my own fix
+     and the thing that found it was the WITNESS CELL WRITTEN TO CONVERT AN INERT SABOTAGE INTO A
+     PINNED ONE** — the sabotage said "0 files redden", the honest response was to construct the
+     population, and constructing it exposed the defect. *Do not accept an inert sabotage without
+     first trying to build its witness.*
+104. **A CORPUS FIXTURE CAN BE THE AUTHORITY ON HOW A DEFECT SHOULD BE FIXED.** The checker-gate
+     candidate for `print(<string|null>)` was measured, over-rejected two corpus files, and one of
+     them — `types/print-scalar-boundary-controls.vl` — had already written the diagnosis in prose
+     ("a MISSING ARM, not a gate question") AND pinned the cell the gate would break. **Read the
+     fixture that fails before deciding it is wrong.**
+105. **A PIN CAN ENTOMB A WRONG ANSWER.** `closure-value-2d-scalar-array-result.vl` pinned `@log 0`
+     for a `(boolean|null)[][]` element read whose `boolean[][]` sibling five lines up pinned
+     `@log false` — the SAME value. A fixture written to pin ONE property will happily bake in
+     whatever the compiler did about every other property in the same file. **When a `RUN` diff
+     appears in a file whose subject is unrelated, check the sibling line before assuming regression.**
+106. **CENSUS THE BINDING POSITION TOO.** Method note 95 said grade a call-site defect in both value
+     and STATEMENT position. The memory-intrinsic census did, read "5 dead", and the **BINDING**
+     position (`const q = __load_f32__(0)`) turned up a silent invalid module that neither of the
+     other two positions showed. Three positions, not two.
+107. **"NOT SHIPPABLE FROM THIS PARTITION" IS A MEASUREMENT, NOT A BOUNDARY.** The store-width
+     revival is 13/14 correct and the 14th needs one line in another agent's file. The relevant fact
+     is not who owns the line — it is that **the 13/14 build introduces a NEW silent invalid module
+     in the most natural shape a user would write**, so the incomplete version is worse than the
+     clean reject it replaces. File it whole.
