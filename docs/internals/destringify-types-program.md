@@ -6872,3 +6872,348 @@ on `adbe6f0`, said the same over 1,263 files.)
     one wrong** (D-ISTY) — the ARROW site's legs disagree 111 times and the site's behaviour is
     identical at all 111, because `exprNulClosure` rejects every one. "Disagrees" was not the
     finding; "disagrees and cannot matter, and therefore cannot be pinned" was.
+
+## D-CYCTY — the compiler TRAP bounded, and the emit_collect concentration AUDITED (#1127)
+
+The brief: fix or bound the compiler CRASH #1124's sweep filed (a recursive generic alias
+traps the compiler), establish whether it and #1126's `tyToEmitName` non-termination are one
+bug or two, then attack `emit_collect.vl` — "the largest un-audited concentration in the
+compiler", 288 operations, and `emit_base.vl`'s 337.
+
+What ships is the crash bound, with the two populations SEPARATED by measurement. What the
+audit produced is four refutations and one probe that says the brief's named "free win" is a
+ladder, not a deletion — with the witness.
+
+### The crash, and its mechanism
+
+`vl check` ACCEPTS `type L<T> = { head: T, tail: L<T> | null }` + `const a: L<i32> = …`.
+`vl build` TRAPS: `wasm trap: call stack exhausted`, `tyToNominalName` recursing into itself
+through `litUnionAliasNameOfTy`.
+
+The mechanism is deliberate, and the D-UNIONGEN note that filed this ("the checker cannot
+instantiate one at all, so the new structural render can never be handed a cyclic object") is
+**REFUTED**: `applyGenAlias` (`typecheck.vl:4810`) registers an EMPTY `mkObjTy` placeholder
+under the instance's resolved memo key BEFORE it resolves the fields, precisely *"so a
+recursive application lands on its own (cyclic) arena index instead of recursing forever"*.
+The checker instantiates it, `T.diags` is empty, and the emitter is handed the cyclic object.
+
+What a recursive DECLARED struct has and a generic INSTANCE does not is a NAME against its
+index. `tyToNominalName` short-circuits at `structNameOfTy(ix) != ""` / `unionAliasDeclNameOfTy`;
+`type Tree = { kids: Tree[] }` is equally cyclic and renders as `"Tree"` in one step. A
+generic instance is registered in `cUserTypes` but not in `cStructTyIxs`, so nothing stops the
+descent.
+
+Three separate unbounded loops are reachable from one such program, and which one fires
+depends on the field's shape — measured by building each:
+
+| program | trapping function | file |
+|---|---|---|
+| `tail: L<T> \| null` | `tyToNominalName` <- `reachRegisterName` <- `collectTyReachRegister` | `typecheck.vl` <- `emit_collect.vl` |
+| `tail: L<T>[]` (no union anywhere) | `gaeEnsure` re-entering itself on its own field spelling | `emit_classify.vl` <- `emit_collect.vl:3357` |
+| any (latent) | `tyToEmitName` — #1126's hand-off 4 | `typecheck.vl` |
+
+### ONE root, TWO DISJOINT populations — the measurement
+
+Root cause: a renderer with no cycle guard over an arena the checker deliberately makes
+cyclic. `tyToStr` (diagnostics) has a depth cap and is why the type ERROR path prints
+`{head: i32, tail: {head: …, tail: …}}` instead of trapping; `tyToEmitName` and
+`tyToNominalName` have none.
+
+They are NOT the same bug, and a probe settles it. A probe build swept every `TypeRef` node of
+every corpus file with two cycle detectors — the NOMINAL one (mirroring `tyToNominalName`'s
+short-circuits) and the STRUCTURAL one (the same walk with the two nominal lines removed,
+which is `tyToEmitName`'s reachability):
+
+| population | files | which |
+|---|---|---|
+| **nom > 0** (the live crash) | **3** | only the three new pins |
+| **str > 0, nom = 0** (latent, #1126's) | **14** | `recursive-linked-list-sound` · `recursive-binary-tree-sound` · `recursive-type-build-traverse` · `recursive-alias-nullable-arg` · `xfail-mutual-recursive-types` · `mutual-recursive-type` · `recursive-tree` · `recursive-array-element` · `recursive-map-value` · `nullable-recursive-call-narrow-canary` · `optional-chain-member-recv` · `structural-twin-heap-dedup` · `scripts/fuzzgen.vl` (str=28) · the new nominal-boundary pin |
+
+The two sets are **disjoint**: every pre-existing file in the structural population reads
+`nom = 0`. So this fix does NOT protect a future `tyToEmitName` consumer — 13 pre-existing
+corpus files (including the FUZZ GENERATOR itself) still trap one — and a `tyToEmitName` guard
+would not have fixed this crash. Two guards, one root. #1126's "15 of 1,294" and this 13+1 are
+the same finding at slightly different probe granularity.
+
+### What ships
+
+One guard, in `collectU` — the FIRST emit pass, so it precedes every renderer:
+
+```
+ export function collectU(stmts: i32[]) {
++  if guardFiniteUserTypes() < 0 { return -1 }
+```
+
+`guardFiniteUserTypes` scans `cUserTypes` (which keys every declared alias AND every
+generic-alias INSTANCE — `applyGenAlias` memoizes each under its resolved key, so one scan is
+complete for this family) and, for each, asks whether a name-faithful render would terminate.
+The test mirrors `tyToNominalName`'s descent exactly minus the string building: the same
+nominal short-circuits, the same composite arms, a path stack instead of the concatenation. A
+litunion alias is an all-`TyLit` member set and cannot carry a cycle, so the arms the renderer
+short-circuits through `litUnionAliasNameOfTy` are descended here without over-reporting.
+
+The message names the type by the SOURCE SPELLING of the first annotation whose recorded type
+is the offending index (`L<i32>`) — the arena type has no finite render, which is the point.
+That lookup is a linear `P.nodes` scan on the FAILURE path only.
+
+```
+- Error: error while executing at wasm backtrace: … wasm trap: call stack exhausted
++ Error: emit error emitProgram: recursive generic type `L<i32>` is not supported —
++   its expansion has no finite type name
+```
+
+`vl check` still accepts (an emit-coverage gap is not a check failure — `driver.vl`'s standing
+policy), which is why this is an `@emit-error` pin and not a parser reject. A parser-side
+"a generic alias may not reference itself" rule was considered and declined on two
+measurements: it cannot see the MUTUAL case (neither declaration mentions itself), and it
+would reject a declared-but-never-applied alias, which compiles today and is pinned below.
+
+### Pins — three FAIL ON MASTER, verified by running them against the master seed
+
+| pin | master (`fd411bd` seed) | this build |
+|---|---|---|
+| `generics/recursive-generic-alias-nullable.vl` | **TRAP** `<wasm function 437>` (`tyToNominalName`) | `@emit-error` |
+| `generics/recursive-generic-alias-array.vl` | **TRAP** `<wasm function 1291>` (`gaeEnsure`) | `@emit-error` |
+| `generics/recursive-generic-alias-mutual.vl` | **TRAP** `<wasm function 437>` | `@emit-error` |
+| `generics/recursive-generic-alias-uninstantiated.vl` | runs, `7` | runs, `7` (boundary: no instance ⇒ no cyclic entry) |
+| `generics/recursive-type-as-generic-argument.vl` | runs, `1` | runs, `1` (boundary: a cycle WITH a nominal exit) |
+
+The two boundary pins are the reject's edges, and the second one is load-bearing: the
+structural probe reads `str = 3` on it and the shipped guard reads `nom = 0`.
+
+### Comparator sanity — the guard's nominal short-circuit is load-bearing
+
+Sabotage **S-NOM**: delete the two nominal short-circuit lines (the guard then rejects any
+cyclic type, nominal or not). Against the shipped build over the same 1,305-file corpus:
+**18 message diffs, 14 byte diffs** — every recursive declared-struct fixture in the corpus,
+plus the fuzz generator. The corpus channel sees this guard; the 0/0/0 below is not vacuous.
+
+### Gate
+
+| channel | volume | result |
+|---|---|---|
+| corpus BYTE (`vl build` per file, `diff -rq` of the whole wasm tree) | 1,305 files (`tests/cases/**` 1,274 + `compiler/*.vl` 25 + `std/*.vl` 4 + `scripts/*.vl` 2) | **0 differing** |
+| corpus MESSAGE (rc + stderr per file) | 1,305 files | **0 differing** |
+| corpus RUN (`vl run --batch --out-dir`, whole-tree `diff -r`) | 1,274 files, 1,398 outputs | **0 differing**, transcript identical |
+| fuzz A/B, whole `--out-dir` trees | **50,400 programs/side** (21 fixed seeds x 3 depths x 4 legs x 600), 52,083 output files/side | **0 differing paths** |
+| `refresh-compiler.sh` | | RC=0 |
+| `rep-fuzz-check.sh` | exact ✅ 1 baselined reject, 0 new / 0 stale | RC=0 |
+| `native-fixpoint.sh` | stage3 == stage4 | RC=0 (1,033,840 bytes) |
+| `lint-self.sh` | | RC=0 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 2,007 tests | **1,993 passed, 0 failed, 14 ignored** |
+
+The suite magnitude reconciles exactly with the brief's 1,991/0/8 at `fd411bd`: +8 tests from
+the 5 new fixtures (3 of which also mint a `selfhost_native_align` emit-reject case), and 6
+`native-opt` cases ignored on this box (no binaryen) that counted as passes there —
+1,991 − 6 + 8 = 1,993.
+
+Binary 1,031,979 → **1,033,840** (+1,861). Self-compile wall clock, min of 9 interleaved:
+master **1,365 ms**, this build **1,347 ms** — the guard's cost is below the noise floor,
+because every declared struct/union entry answers at its own root in one registry lookup and
+only a genuinely cyclic entry is walked.
+
+### THE AUDIT — `emit_collect.vl` and `emit_base.vl`, counted
+
+Method, stated: unit = **CALL SITES** (several on one line count separately), `grep -Hn`,
+comments stripped **string-literal-aware** (a `//` inside a `"…"` is not a comment), function
+DEFINITION headers excluded, per-file sums cross-checked against an independent tree-wide
+`grep -Hn` recount (115 and 77 reproduce exactly: 123 raw → 118 stripped → −3 headers, and
+101 → 100 → −23 headers). Measured on the `fd411bd` blob.
+
+**REFUTATION — 288 and 337 do not reproduce under the definition the brief gives.**
+
+| | `emit_collect.vl` (5,081 ln) | `emit_base.vl` (2,386 ln) |
+|---|---|---|
+| SCORECARD resolver CALL SITES | **115** | **77** |
+| inline character surgery (slice / char probe / indexOf / `[]`-suffix) | 56 | 132 |
+| … + `.length` probes on a provable string | 74 | 178 |
+| **total, stated definition** | **189** | **255** |
+| widest defensible reading (the 227-function string-parameter family) | 290 | 290 |
+
+288 is within 2 of `emit_collect`'s MAXIMAL reading and ~1.5x its scorecard reading. 337 is
+reached by NO reading; the gap is closed only by also counting whole-string equality tests
+(`== "i32[]"`, `!= "null"` — 135 in `emit_base`, 149 in `emit_collect`), which are atomic
+identity tests, not parses. Quote 189/255, or say "maximal family" when quoting 290.
+
+**REFUTATION — neither file is where the mass is.** Tree-wide, the SCORECARD resolvers are
+called 679 times: **`emit_classify.vl` 487 (72%)**, `emit_collect.vl` 115 (17%),
+`emit_base.vl` 77 (11%). And `emit_base` is 23 of the 42 resolver DEFINITIONS: **96 of its 178
+surgery operations and 42 of its 77 resolver calls are INSIDE another resolver's body**, so
+they retire when the resolver does, not when a call site migrates. Its density (0.107 ops/line
+vs 0.037) is the definitional shape, not a migration target.
+
+**The four concentrations, split by what the argument IS** — (a) a `TypeRef.tyName` /
+`nodeTyName` node spelling (an arena index can replace it one-for-one), (b) a name the emitter
+itself synthesized (peeled / sliced / split), (c) a name read out of a banked table column:
+
+| concentration | sites | (a) node | (b) synthesized | (c) table |
+|---|---|---|---|---|
+| `registerInlineUnion` | 34 | **0** | 31 | 3 |
+| `collectA` | 28 | 11 | 17 | 0 |
+| `collectFnValUse` | 9 | 2 | 5 | 2 |
+| `collectCloSigs` | 6 | 5 | 0 | 1 |
+| **total** | **77 of 115 (67%)** | **18 (23%)** | 53 | 6 |
+
+**Only 18 of 77 sit on something an arena index can replace.** `registerInlineUnion` is the
+blocker and it is structural, not incidental: it has 19 dynamic call entries and **15 are
+RECURSIVE self-calls passing a peeled substring**. Of the 4 external entries, 1 is a node
+spelling, 2 are `reachRegisterName(tyIx, …)` — i.e. ALREADY a render off the arena — and 1 is
+a banked inferred-return column. Its parameter cannot become an arena index until the arena
+carries a node for every peeled sub-name it recurses on. That is the mechanism behind "kill the
+SOURCES, not the call sites" at this site, stated as a requirement rather than a slogan.
+
+Two further findings from the same enumeration:
+
+- **`shapeHasCloField` has TWO definitions with different signatures, and the destringified
+  one is already in production.** `emit_collect.vl:912` parses the rendered shape text (5
+  scorecard calls inside its body); `emit_classify.vl:3516` walks the shape TABLE by index
+  (`sFieldCount` / `sFieldTypeAt` / `sFieldTgtStructIdx`) with a `seen` cycle guard. The
+  string twin's 2 callers pass emitter-derived names (`fvSb`, `fvAtoms[fva]`), so retiring it
+  needs a name→shape-index hop at those two sites and the indexed twin EXPORTED — a hand-off,
+  `emit_classify` is another partition.
+- **`collectFnValUse` already carries an in-source `DESTRINGIFY — MEASURED AND REFUTED`
+  note**: an arena reading disagreed on 15 of 1,269 corpus files because the name walk is
+  alias-blind and `fnValUsed` is monotone. Do not re-open it without new evidence; this audit
+  did not.
+
+### The brief's named "free win" is a LADDER, not a deletion — measured, with the witness
+
+The claim under test: *"`nameIsMapMemberUnion`'s 25 sites are free — a union is a `TyUnion`,
+never a `TyMap`, so the guard evaporates the moment its paired `nameIsMap` becomes
+`nodeTyIsMap`."*
+
+**The count is 24, not 25** (`grep -Hn`, comments stripped, header excluded), and they live
+`emit_classify` 15 · `emit_collect` 6 · `emit_base` 1 · `emit_query` 1 · `emit_rewrite` 1 —
+**62% outside both target files**.
+
+**The REASONING holds at 21 of 24.** `nameIsMap` is `name[0]=='{' && name[1]=='['` plus a
+trailing-`[]` reject, so `{[string]: i32} | boolean` passes it; `nameIsMapMemberUnion` exists
+only to correct that false positive, and `nameIsMap(X) && !nameIsMapMemberUnion(X)` is exactly
+"X is a bare map" — what a `TyMap` test answers. All 21 use the identical operand on the same
+line in that idiom.
+
+**It FAILS at 3.** `emit_collect.vl:3924` and `emit_collect.vl:5079` and `emit_rewrite.vl:429`
+are POSITIVE classifiers, not corrective guards — no paired `nameIsMap` exists (indeed
+`nameIsMap` has ZERO call sites in all of `emit_rewrite.vl`), and `emit_rewrite:429` is a
+dispatch ARM that pins a lambda's `fnRet` to a map-member-union box. Each becomes net-new
+arena work ("is this a `TyUnion` with a map arm?"), not a deletion.
+
+**And "free" presumes the paired `nameIsMap` can become `nodeTyIsMap`, which needs a NODE.**
+Only **6 of the 24 operands are node-backed**; 13 are derived substrings (`nullablePartOf(…)`,
+`.slice(…)`, `monoUnwrapParens(…)`, split atoms) with no arena node at all, 3 are parameters,
+2 are table reads.
+
+So the one node-backed site inside this partition was probed properly, at
+`collectA`'s `nd.tyName` map arm (`emit_collect.vl:2885`) — candidate `nodeTyIsMap(i)` beside
+authority `nameIsMap(nd.tyName) && !nameIsMapMemberUnion(nd.tyName)`, accumulated and reported
+once (method note 10: `uncovLive` = the arena DECLINED and the name leg answered LIVE):
+
+| channel | reach | cov | **DIS** | **uncovLive** |
+|---|---|---|---|---|
+| corpus (1,006 reporting files) | 123,037 | 123,005 | **0** | **2** |
+| fuzz, plain + declared legs (23,695 reporting of 25,200) | 91,319 | 91,319 | **0** | **0** |
+
+Comparator sanity first (method note 12): the same probe rebuilt with the arena leg INVERTED
+reads **DIS = 123,005 / 123,005** on the corpus. The 0 is not vacuous.
+
+**Verdict: agreement is total where the arena answers, and the site is still not deletable.**
+`uncovLive = 2` — one corpus file, `maps/map-value-union-struct-map-field.vl`, has two map
+annotations with NO recorded `nodeTyIx` where the name leg answers TRUE. Replacing the name
+test outright would stop those two annotations forcing `mUsed`/`lUsed`/`aUsed` and their mv
+slot. A ladder keeps both name calls alive, so the honest score for this "free win" is
+**0 parses deleted**. It becomes a deletion the day `nodeTyIx` covers emitter-minted
+annotation nodes — #1126's hand-off 3, not this partition.
+
+And the shape of that measurement is method note 56 again, in the same direction: **the fuzz
+channel read `uncovLive = 0` over 91,319 reaches** and would have green-lit the deletion on
+its own. The corpus is the sensitive channel for `nodeTyIx` coverage, because the uncovered
+nodes are minted by passes the fuzz grammar never triggers.
+
+### The call arithmetic
+
+- **Type-string parses DELETED: 0. Laddered: 0. Name-keyed resolutions deleted: 0.
+  Parses ADDED: 0. NET 0.**
+- This slice adds a structural ARENA walk (`tyNomRenderLoopsGo`) and two typecheck imports
+  (`structNameOfTy`, `unionAliasDeclNameOfTy` — both already exported; `typecheck.vl` is
+  UNCHANGED). New private helpers in `emit_collect.vl`: `nomPathHas`, `tyNomRenderLoopsGo`,
+  `tyNomRenderLoops`, `annSpellingOfTyIx`, `guardFiniteUserTypes`. One module-level `i32[]`
+  path stack, popped to empty on every exit — no arena-lifetime obligation (note 7), and the
+  suite's shared-INSTANCE driver is green.
+- Files touched: `emit_collect.vl` + 5 fixtures. `parser.vl` / `ast.vl` / `driver.vl` /
+  `emit_base.vl` UNCHANGED — the crash's fix does not live in any of them, and the audit says
+  why for `emit_base` (its calls are inside its own resolver bodies).
+
+### Hand-offs (exact diffs)
+
+1. **`typecheck.vl` — `tyToEmitName` needs the same cycle guard, for the 13 pre-existing
+   corpus files this one does not cover.** `tyToStr` already carries the pattern; the emit
+   renderer is the one without it:
+   ```
+   +let emitNameDepth = 0
+    export function tyToEmitName(ix: i32) {
+      emitNameAtoms = 1
+      if ix < 0 { return "" }
+   +  if emitNameDepth > 32 { return "" }
+   +  emitNameDepth = emitNameDepth + 1
+   +  const r = tyToEmitNameGo(ix)
+   +  emitNameDepth = emitNameDepth - 1
+   +  r
+   +}
+   ```
+   A depth cap returns `""` (the renderer's existing "has no emit name" answer, which every
+   caller already handles) rather than a truncated name. `isEquatable`'s `seen` stack is the
+   exact alternative; the depth cap is cheaper and `tyToStr` is the precedent. **Do not ship
+   it without re-running the corpus** — 13 files reach the cyclic types today and get finite
+   names only because nothing renders those annotations.
+2. **`typecheck.vl` — `tyToNominalName`'s comment claims more than it delivers.** *"Nominal-first
+   ALSO tames recursion"* is true only for a NAMED recursive struct; a generic-alias instance
+   has no name registered against its index and the same comment reads as a guarantee. Record
+   that the taming is nominal, not structural, beside the `applyGenAlias` note at 4806.
+3. **`emit_classify.vl` — `gaeEnsure` has no in-progress guard.** It recurses on its own field
+   spellings and its only stop is `structIndexByName(name) >= 0`, which is satisfied only AFTER
+   interning completes:
+   ```
+   +const gaeInFlight: string[] = []
+    export function gaeEnsure(name: string) {
+   +  if capHas(gaeInFlight, name) { return 0 }
+    ...
+   +  gaeInFlight.push(name)
+    ...   (pop before every return)
+   ```
+   `collectU`'s guard reaches it first today, so this is defence in depth — but it is the
+   second of the three loops and it is not in `typecheck.vl`.
+4. **`emit_classify.vl` — export the INDEXED `shapeHasCloField(si, seen)`** so
+   `emit_collect.vl`'s string twin (line 912, and 5 scorecard calls inside it) can retire:
+   ```
+   -function shapeHasCloField(si: i32, seen: i32[]) {
+   +export function shapeHasCloField(si: i32, seen: i32[]) {
+   ```
+   The two `emit_collect` callers pass emitter-derived names, so they also need a
+   name→shape-index hop; that is the real work, and it is small.
+5. **For whoever takes `collectA`** — the 11 node-backed sites are the whole opportunity in
+   that pass, the probe above says the arena AGREES on all of them where it answers, and
+   `uncovLive` is the only thing standing between a ladder and a deletion. Measure
+   `uncovLive` per site before migrating; it was 2 on the one site probed here and the fuzz
+   channel cannot see it.
+
+### Method notes earned
+
+58. **A trap in a self-hosted compiler is a bug in the FIRST pass that walks, not in the
+    function that recurses** (D-CYCTY) — three unbounded loops in three files are reachable
+    from one four-line program, and which one fires depends on whether the recursive field is
+    a union, an array, or neither. Bounding the walk's ENTRY (one guard in the first pass over
+    the checker's own registry) covers all three; guarding the recursing function covers one.
+59. **Two non-terminations with one root cause can have DISJOINT populations, and the corpus
+    will tell you which** (D-CYCTY) — the nominal renderer loops on 3 files (all new pins) and
+    the structural renderer on 14, with ZERO overlap. "Same root cause" was true and would
+    have been the wrong thing to act on: fixing either one leaves the other's population
+    trapping.
+60. **Ask what the argument IS before counting call sites** (D-CYCTY) — 115 scorecard calls in
+    `emit_collect.vl` look like 115 migration candidates; 18 of them sit on a node spelling and
+    53 sit on strings the emitter peeled itself. The (a)/(b)/(c) split is a five-minute
+    measurement that reprices an entire slice, and it is what turns "the largest un-audited
+    concentration" into "one recursive string-rewrite loop with 15 self-calls".
+61. **`uncovLive = 2` on ONE corpus file is the whole verdict** (D-CYCTY) — a site with
+    123,005 covered reaches, 0 disagreements, and a comparator-sane probe is still not
+    deletable, because two annotations on one file have no recorded arena type. Coverage is not
+    agreement (note 51's sibling); AGREEMENT IS NOT TOTALITY either, and only totality deletes.

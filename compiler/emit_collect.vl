@@ -40,9 +40,11 @@ import {
   nodeTyIxOf,
   nodeTyName,
   splitUnionAtoms,
+  structNameOfTy,
   tyGtIsClose,
   tyIsLitUnion,
   tyToNominalName,
+  unionAliasDeclNameOfTy,
   unionMemberCount,
   valueAtomKind,
 } from "./typecheck"
@@ -4688,6 +4690,130 @@ function collectInlineUnionsBlock(stmts: i32[], blockIx: i32) {
   0
 }
 
+// ── UNRENDERABLE (CYCLIC) DECLARED TYPES — rejected before anything renders ──
+// `applyGenAlias` instantiates a recursive generic alias (`type L<T> = { head: T,
+// tail: L<T> | null }`) by registering an EMPTY placeholder under the instance's memo
+// key BEFORE it resolves the fields, so a self-application lands on its own arena
+// index instead of recursing forever. The resolved `Ty` is therefore genuinely
+// CYCLIC — and unlike a recursive DECLARED struct (`type Tree = { kids: Tree[] }`,
+// whose index is registered under a name), a generic INSTANCE has no name registered
+// against it, so nothing short-circuits a renderer walking it. Every emit-side
+// renderer then descends forever: `tyToNominalName` (the registration walk below),
+// `tyToEmitName` (the canon pass), and `gaeEnsure`'s field recursion in the shape
+// pass. All three exhaust the call stack and TRAP the compiler, which gives the user
+// nothing to act on. The emitter rejects such a program by name instead.
+//
+// The test mirrors `tyToNominalName`'s descent exactly, minus the string building:
+// the same nominal short-circuits (a declared struct / declared union alias renders
+// as its NAME and the walk stops), the same composite arms, and a path stack in place
+// of the concatenation. The renderer additionally short-circuits a litunion ALIAS
+// (`litUnionAliasNameOfTy`) at several arms; a litunion is an all-`TyLit` member set
+// and cannot carry a cycle, so descending it here can only find what the renderer
+// would also have found — no arm is over-reported.
+
+// The arena indices on the current descent path. Module-level so a deep type costs
+// no per-call allocation. Emptied by every entry and popped to empty on the way out,
+// so it holds nothing between programs (no arena-lifetime obligation — note 7).
+const nomPath: i32[] = []
+
+function nomPathHas(ix: i32): boolean {
+  let i = 0
+  while i < nomPath.length {
+    if nomPath[i] == ix { return true }
+    i = i + 1
+  }
+  false
+}
+
+function tyNomRenderLoopsGo(ix: i32): boolean {
+  if ix < 0 { return false }
+  // NOMINAL-FIRST, exactly as the renderer: a declared struct or union alias IS its
+  // name, and the descent stops there.
+  if structNameOfTy(ix) != "" { return false }
+  if unionAliasDeclNameOfTy(ix) != "" { return false }
+  if nomPathHas(ix) { return true }
+  nomPath.push(ix)
+  let loops = false
+  const t = T.tys[ix]
+  if t is TyUnion {
+    const ms = t.uMembers
+    let mi = 0
+    while mi < ms.length {
+      if tyNomRenderLoopsGo(ms[mi]) { loops = true }
+      mi = mi + 1
+    }
+  } else if t is TyNullable {
+    if tyNomRenderLoopsGo(t.nInner) { loops = true }
+  } else if t is TyObj {
+    const ftys = t.objFieldTypes
+    let fi = 0
+    while fi < ftys.length {
+      if tyNomRenderLoopsGo(ftys[fi]) { loops = true }
+      fi = fi + 1
+    }
+  } else if t is TyArray {
+    if tyNomRenderLoopsGo(t.aElem) { loops = true }
+  } else if t is TyMap {
+    if tyNomRenderLoopsGo(t.mKey) { loops = true }
+    if tyNomRenderLoopsGo(t.mVal) { loops = true }
+  } else if t is TyFunc {
+    const ps = t.fnParamTypes
+    let pi = 0
+    while pi < ps.length {
+      if tyNomRenderLoopsGo(ps[pi]) { loops = true }
+      pi = pi + 1
+    }
+    if tyNomRenderLoopsGo(t.fnRet) { loops = true }
+  }
+  nomPath.pop()
+  loops
+}
+
+// Would a name-faithful render of arena type `ix` fail to terminate?
+function tyNomRenderLoops(ix: i32): boolean {
+  while nomPath.length > 0 { nomPath.pop() }
+  tyNomRenderLoopsGo(ix)
+}
+
+// The SOURCE spelling of the first annotation whose resolved type is `ix` (`L<i32>`),
+// for the diagnostic — the arena type itself has no finite render, which is the whole
+// point. Failure path only, so the linear `P.nodes` scan costs nothing otherwise.
+function annSpellingOfTyIx(ix: i32): string {
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is TypeRef {
+      if nodeTyIxOf(i) == ix { return n.tyName }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Reject every declared type whose expansion has no finite name, BEFORE the first
+// pass renders one. `cUserTypes` keys every declared alias and every generic-alias
+// INSTANCE (`applyGenAlias` memoizes each under its resolved key), so one scan of the
+// checker's registry covers the whole family; a declared struct/union entry answers
+// at its own root and costs one registry lookup. Returns 0, or -1 (via `emitFail`).
+function guardFiniteUserTypes(): i32 {
+  const ks = cUserTypes.keys()
+  let i = 0
+  while i < ks.length {
+    const v = cUserTypes[ks[i]] ?? (-1)
+    if tyNomRenderLoops(v) {
+      let shown = annSpellingOfTyIx(v)
+      if shown == "" { shown = ks[i] }
+      return emitFail(
+        "emitProgram: recursive generic type `" +
+          shown +
+          "` is not supported — its expansion has no finite type name",
+      )
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Scan the top-level statements for EVERY union alias `type N = A | B | …` (a
 // `UnionDecl`); for each, record its name + variant-slice range in the per-union table
 // (`unNames`/`unVarStart`/`unVarCount`), append its variant struct names to the GLOBAL
@@ -4695,6 +4821,9 @@ function collectInlineUnionsBlock(stmts: i32[], blockIx: i32) {
 // assign globally-unique tags across all variants of all unions. Multiple unions
 // coexist (mirroring the multi-struct table). Returns 0, or -1 (via `emitFail`).
 export function collectU(stmts: i32[]) {
+  // The FIRST emit pass, so this is the first thing in the emitter that would walk a
+  // declared type — reject the ones no renderer can finish before any of them tries.
+  if guardFiniteUserTypes() < 0 { return -1 }
   uDeclared = false
   vbI32Used = false
   vbI64Used = false
