@@ -9384,3 +9384,397 @@ green suite** — the ignored count is the check.
     not create the hole; it made the hole VISIBLE, because a per-row perturbation is a one-line
     edit only after the collapse. A "collapse N copies" slice should sabotage every row, not
     every copy.
+
+## D-ISVARTY + D-ALIASFN — the `is`-test spelling joins the ladder, and an alias-spelled FUNCTION type becomes callable (#PRNUM)
+
+Branched at `47b98e6` (D-TSTY #1134). Two things, and they are counted separately because they
+are different kinds of work: **D-ISVARTY** ladders the five `is`-test resolution sites onto the
+parser's spelling tree (behaviour-preserving, entombed by equivalence + sabotage), and
+**D-ALIASFN** admits a `TyFunc` member to `singleAliasMemberTyIx` (a SOUNDNESS fix, entombed by
+four pins that fail on master). Neither deletes a parser: the 23-parser list reads **523
+tree-wide on both sides**.
+
+Every number below is measured at `47b98e6` with the corpus and the fuzz population frozen once,
+by the master compiler, before any edit.
+
+**UNITS, stated once.** *Reads* = dynamic executions of one of the five `is` resolution sites.
+*Invocations* = dynamic executions of a named function. *Call sites* = a textual `NAME(` in
+non-comment code, string-literal-aware `//` stripper, `function NAME(` header excluded, per-file
+rows printed and cross-checked against the tree-wide total on every run. *Corpus* = 1,335 files
+(1,304 `tests/cases` + a 31-file pinned parent snapshot of `compiler/`+`std/`+`scripts/*.vl`).
+*Fuzz* = 50,400 programs (14 seeds × depths 4/5/6 × {plain, `--branching --multiobs
+--declared`} × 300), generated ONCE by the master compiler.
+
+### The brief's headline figure was a 3.0x UNDERSTATEMENT — re-measured at this head
+
+#1134's hand-off measured the `is` sites at **76,342 reads across both channels** and said the
+five sites were ready. The readiness holds. The figure does not: #1134 probed **two** of the five
+sites (`checkIsExprNode` and `checkMatchTypeArms`). The three narrowing sites were never
+measured, and they are 60% of the population.
+
+| site | corpus reads | fuzz reads |
+|---|---|---|
+| `collectThenNarrows` | 60,971 | 15,142 |
+| `collectElseNarrows` | 60,952 | 15,142 |
+| `ifChainExhausts` | 296 | **0** |
+| `checkMatchTypeArms` | 43 | **0** |
+| `checkIsExprNode` | 61,181 | 15,142 |
+| **total** | **183,443** | **45,426** |
+
+**228,869 reads, not 76,342.** (#1134's two-site corpus figure of 61,200 re-derives here as
+61,224 — the 24-read gap is the corpus differing by the fixture that slice added and the 31-file
+snapshot.)
+
+**Both channels are needed and neither is a superset**, again: `ifChainExhausts` and
+`checkMatchTypeArms` have **no fuzz witness at all** (the generator emits no `is`-chain
+exhaustiveness shape and no `match` type pattern), while the fuzz channel carries 45,426 reads
+through composition depths the corpus never reaches.
+
+### D-ISVARTY — the measurement, at the consumer's own position
+
+The probe is ADDITIVE: each site keeps its own `nameToTy` answer and the probe only *adds* the
+structural resolution, so no probe build changes a checking decision and no sabotage can suppress
+the report by rejecting early. Swept on the shared-INSTANCE `vl check <dir>` channel, where the
+counters accumulate, so the per-root maximum is that root's cumulative total.
+
+| | corpus | fuzz |
+|---|---|---|
+| reads at the five sites | **183,443** | **45,426** |
+| tree PRESENT | 183,443 | 45,426 |
+| tree renders the EXACT spelling (fresh) | 183,443 | 45,426 |
+| **STALE** | **0** | **0** |
+| **MISSING** | **0** | **0** |
+| both routes answered / both declined / exactly one declined | 183,443 / 0 / **0** | 45,426 / 0 / **0** |
+| **STRUCTURAL disagreement** | **0** | **0** |
+| the same rows under `tyEq` | 0 | 0 |
+| comparator depth-cap hits (a cyclic arena would bail here) | **0** | **0** |
+
+The comparator is `pbDeepEq`, a strict structural walk — no union-layer flattening, no nullable
+folding, no `?`-hole tolerance — with a depth cap that is COUNTED rather than trusted (0 hits, so
+the walk never bailed).
+
+### The comparator is proved, not chosen — and so is the wire
+
+Three perturbations of the probe build, each swept over both channels:
+
+| probe build | corpus `dis` | corpus `disstr` (`tyEq`) | fuzz `dis` | fuzz `disstr` |
+|---|---|---|---|---|
+| shipped | **0** | **0** | **0** | **0** |
+| **P1 — WIRE**: the probe reads `tsToTy(root − 1)` | **172,982** (+1,201 one-declined) | 172,982 | **36,798** (+8,610) | 36,798 |
+| **P2 — an extra UNION LAYER** in `tsToTy` | **405** | **0** | **1,758** | **0** |
+| **P3 — VALUE**: `tsToTy`'s `TS_ARR` drops the `[]` | 840 | 840 | — | — |
+
+**P1 reclassifies 174,183 of 183,443 corpus reads (94.9%) and 45,408 of 45,426 fuzz reads
+(99.96%)** — the 0 above is wired, on both channels, not blind.
+
+**P2 is the one that matters.** It makes `tsToTy` return `Union([Union([a,b])])` where the string
+route returns `Union([a,b])` — a genuinely different type — and `tyEq`'s `unionMembersInto`
+flattens both to the same member sequence. The strict walk reads **405 + 1,758 = 2,163**;
+render-equality reads **0**. Method note 74's measurement reproduced inside this slice's own
+probe: had `tyEq` been the comparator, the whole `dis=0` would have been worthless.
+
+P3 also perturbs the SHIPPED `tsToTy` (it is the same function #1134 laddered the positioned
+funnels onto), which is why the probe's own read count collapses from 183,443 to 5,125 — most
+files now fail the checker before reaching an `is`. That collapse is itself evidence the shipped
+route is load-bearing.
+
+### What ships (D-ISVARTY)
+
+One new function, five callers:
+
+```vl
+function isTypeTy(name: string, isIx: i32) { annotResolve(name, annTsOf(isIx)) }
+```
+
+`parseIsType` banks the spelling tree on the `IsExpr` node ITSELF (D-PARSETY P2), and
+`parseMatchPattern` mints a real `IsExpr` for a `match` TYPE pattern — so both are the same node
+shape on the same channel and the five sites are one home, not five copies of a read.
+`ifChainExhausts` hoists `condUnderParens(node.ifCond)` into a local so the node it already
+computed is the node it keys on.
+
+Diagnostics anchoring is deliberately NOT `nameToTyAt`'s: an `is` type has never set
+`annotDiagAt`, and `annotResolve` does not touch it, so a generic-arity error raised inside
+resolution still reports exactly where it reported before. That is what makes the byte-identity
+below reachable at all.
+
+### The call arithmetic, and the unit that means something
+
+**0 type-string parsers DELETED · 5 resolution sites LADDERED · NET −5 `nameToTy` call sites.**
+
+| | master `47b98e6` | now |
+|---|---|---|
+| the 23-parser list, tree-wide | **523** | **523** |
+| `nameToTy` — `typecheck.vl` | 25 | **20** |
+| `nameToTy` — everywhere else in the tree | **0** | **0** |
+| `annotResolve` / `isTypeTy` / `tsToTy` | 5 / 0 / 11 | **6 / 5 / 11** |
+| `nameToTyAt` · `nameToTyAnn` · `resolveAnnotAt` · `resolveAnnotTs` · `resolveAnnot` (`emit_rep`) | 3 · 2 · 4 · 2 · 7 | unchanged |
+
+**REFUTED: #1134's enumeration ends "Plus `emit_rep.vl` 1 and `wasmEmit.vl` 1, other
+partitions". `nameToTy` has ZERO call sites outside `typecheck.vl`** — all five raw hits in
+`emit_rep.vl` (4) and `wasmEmit.vl` (1) are inside `//` comments. The comment-stripping counter
+finds 25 in `typecheck.vl` and 25 tree-wide at master, and the per-file sum equals the tree-wide
+total on every run. This is the fourth instance in this program of a raw grep reported as a call
+count, and the second where the miscount survived into a hand-off.
+
+**The static count is the wrong unit for a ladder; here is the right one** (method note 72). Two
+identically-instrumented compilers, invocation counters on the resolver and every scanner beneath
+it, compiling the SAME frozen 1,335-file corpus:
+
+| invocations | master | ship | Δ |
+|---|---|---|---|
+| **`nameToTy`** | **192,696** | **2,185** | **−190,511 (−98.9%)** |
+| `nameHasSep` (the `\|` and `&` depth scans) | 436,940 | 56,562 | −380,378 |
+| `topLevelArrowIndex` | 228,996 | 38,756 | −190,240 |
+| `tyGtIsClose` | 8,383 | 4,946 | −3,437 |
+| `splitTypeName` | 2,534 | 1,655 | −879 |
+| `isTopLevelFuncTypeName` | 37,345 | 36,587 | −758 |
+| `skipQuotedName` | 5,634 | 5,520 | −114 |
+| `splitGenArgs` | 269 | 215 | −54 |
+| `applyGenAlias`, string route | 89 | 35 | −54 |
+| **`tsToTy`** (structural) | 63,100 | **253,077** | +189,977 |
+
+**575,860 whole-string depth scans deleted.** The checker's second recursive-descent type parser
+now runs **2,185 times over the whole corpus, down from 192,696** — and #1134's own like-for-like
+figure two slices ago was 257,325 before it and 192,591 after (a near-exact match for the 192,696
+measured here on a slightly different denominator, which is the cross-check that the two
+measurements are the same measurement). **`nameToTy` is at ~0.85% of its pre-#1134 volume.**
+
+It is still a ladder and still not a deletion: 2,185 invocations remain, and the 20 static sites
+are enumerable — 10 are `nameToTy`'s own recursion, 1 is `annotResolve`'s fall-through, 1
+`applyGenAliasArgs`'s string route, 3 `UnionDecl` variant/operand names, 1 `canonEmitName`, 1
+`unionMemberGenAppShape`, 1 `recordClonedNodeTy`, 2 the `paramTyNames[]` mono columns.
+
+### D-ALIASFN — an alias-spelled FUNCTION type was not callable ANYWHERE
+
+The brief inherited #1133's framing: four clean *located* rejects (nullable closure as a local, a
+param, a return, and `is` over an alias-spelled binding), with `singleAliasMemberTyIx` admitting a
+`TyFunc` named as the better of two homes. Verifying that judgement turned up something larger.
+
+**On master, `type F = (i32) => i32` produces a value you can declare and never call.** The
+parser encodes every non-`{…}`-bodied `type N = …` as a one-member `UnionDecl`, so `F` denotes
+`TyUnion[TyFunc]`, and a union is not callable. The ALIAS vs INLINE twin table — the identical
+program with `F` and with `((i32) => i32)`, measured both ways on both builds:
+
+| position | master, alias | master, inline | ship, alias | ship, inline |
+|---|---|---|---|---|
+| plain global, called | **type error** | runs | runs | runs |
+| plain local, called | **type error** | runs | runs | runs |
+| plain param, called | **type error** | runs | runs | runs |
+| plain return, called | **type error** | runs | runs | runs |
+| nullable global, `!= null` | runs | runs | runs | runs |
+| nullable local, `!= null` | **emit reject** | runs | runs | runs |
+| nullable param, `!= null` | **emit reject** | runs | runs | runs |
+| nullable return, `!= null` | emit reject | emit reject | emit reject | emit reject |
+| nullable struct field, `!= null` | runs | runs | runs | runs |
+| `is`-narrowed call | **type error** (`is F`) | runs | runs | runs |
+| | **6 of 10 DIFFER** | | **0 of 10 differ** | |
+
+The checker's message is `called value is not a function ((i32) -> i32)` — which reads as
+nonsense precisely because `tyToStr` renders a one-member union as its member. That rendering is
+why the defect survived: the diagnostic prints the type the user expected.
+
+**A NEW SILENT INVALID-WASM CELL, found by varying the EXERCISE rather than the position**
+(method note 72's converse — exercise it as LITTLE as will still reach the layer under test):
+
+```vl
+type F = (i32) => i32
+function inc(a: i32) { a + 1 }
+function mk(): F | null { inc }     // declared, NEVER CALLED
+print(1)
+```
+
+Master builds a module wasmtime refuses to compile — `failed to compile:
+wasm[0]::function[5]::mk` — while its inline twin prints 1. `wasmEmit`'s `retNulClosure` asks
+`nulCloFlag(fn.fnRet)`, whose arena leg wants `TyNullable(TyFunc)` and was handed
+`TyNullable(TyUnion[TyFunc])`, while `emit_sections`' `vtKindOfType` wrote the closure result
+valtype: the two halves of the return disagreed. Every richer program in the family reaches an
+emit REJECT first, so — exactly as for #1133's `-unread` global — the miscompile is observable
+only in a program that declares the function and never calls it.
+
+**REFUTED: the nullable-closure RETURN is NOT one of the four alias rejects.** #1133's position
+table records the return row as "inline: runs · alias: emit reject". Measured here, the INLINE
+spelling `function mk(): ((i32) => i32) | null { inc }` **fails identically on master and on this
+build** (`emitProgram: bare null needs a struct-typed context`) whenever the result is read, in
+all four variants tried (bare `null` body, branching body, called, uncalled-with-read). The
+reject is not alias-specific and this slice correctly does not fix it; what this slice fixes is
+the alias/inline DIVERGENCE at that position, which was the silent invalid wasm above. The
+residual reject belongs to `emit_classify`/`emit_sections`/`wasmEmit` and is filed as hand-off 2.
+
+### What ships (D-ALIASFN)
+
+```diff
+       if mt is TyPrim { return m0 }
++      if mt is TyFunc { return m0 }
+       if mt is TyObj {
+         if isPlainAliasRef(name) { return m0 }
+       }
+```
+
+Unconditional, with no `isPlainAliasRef` gate, and the reason is in the code: that gate exists
+only to keep the canonicalized INTERSECTION's named-struct route (`unionStructAliasShape`) alive.
+**A function type has no nominal emit route to lose** — there is no `unNames`/`sNames` row a
+declared function type could resolve through — so there is nothing for transparency to break.
+`singleMemberAliasName` reads the same predicate, so the checker and the emitter cannot diverge
+on the same annotation, which is the invariant that function's header has always asserted.
+
+**The wrapper population, measured.** Over the frozen corpus plus the new fixtures, master's
+`declaredTyOfName` meets a `TyUnion` **5,822** times; **58** of those are a one-member union over
+a `TyFunc` — the exact population `emit_rep`'s `tyDenotesFunc` peel exists for, and the exact
+population this arm collapses at the source.
+
+### The channels
+
+| channel | volume | result |
+|---|---|---|
+| corpus: wasm SHA + build rc + compiler message (out-path normalised) + run stdout + run rc | **1,335 files** | **0 differing — byte, message AND run identical** |
+| corpus LINT tier (`vl check --severity hint`), a channel the build/run A/B cannot see | **1,335 rows**, 689 carrying ≥1 lint | **0 differing** |
+| fuzz A/B, whole `--out-dir` trees via `diff -r` | **50,400 programs/side**, 52,801 output files/side | **`diff -r` RC=0, 0 output lines, 0 differing paths** |
+
+The corpus contains only 4 files with an arrow-bodied bare alias (all four are #1133's closure
+pins) and none of them changes, so **D-ALIASFN's blast radius on everything extant is zero** and
+its entombment has to come from new fixtures. It does.
+
+### Entombment
+
+Four pins, each verified against a MASTER-built compiler with `--compiler`, each red for a
+DIFFERENT reason:
+
+| pin | master `47b98e6` | now |
+|---|---|---|
+| `closures/fn-type-alias-call-positions.vl` | type error — `called value is not a function ((i32) -> i32)` | runs |
+| `closures/nullable-closure-alias-local-param.vl` | emit reject — unsupported parameter | runs |
+| `closures/nullable-closure-alias-return-unread.vl` | **INVALID WASM** — `failed to compile: wasm[0]::function[5]::mk` | runs |
+| `closures/fn-type-alias-is-narrow-call.vl` | type error — `called value is not a function ((i32) -> i32)` | runs |
+
+D-ISVARTY is behaviour-preserving and cannot have a fails-on-master pin. Three sabotages of the
+SHIPPED path (no probe present), each swept over the whole corpus on all three channels and
+through the suite:
+
+| sabotage | corpus differing | byte | message | run | suite failures |
+|---|---|---|---|---|---|
+| **S1** — `isTypeTy` reads `annTsOf(isIx) − 1` (D-ISVARTY's wire) | **355** | 338 | 351 | 355 | **379** |
+| **S2** — every one-member alias member is transparent (D-ALIASFN's arm set, WIDENED) | **3** | 3 | 3 | 2 | **3** |
+| **S3** — the `TyFunc` arm removed (D-ALIASFN's arm set, reverted to master) | the 4 new pins | | | | **4** |
+
+**S2 is the one worth keeping.** Widening the rule to "any one-member alias is transparent"
+reddens exactly three corpus cases — `literal-unions/single-literal-type.vl` (a `TyLit` member),
+`types/intersection-object-merge.vl` and `types/union-alias-stays-a-union.vl` (the
+`isPlainAliasRef` gate) — which is the measured statement that the arm set is *exactly* right
+rather than lazily wide. A sabotage that merely removed the new arm would only have re-proved the
+pins.
+
+### Allocation and binary
+
+`isTypeTy` adds one binary search (`annTsOf`) per `is` resolution and removes a whole-string
+recursive descent; `tsToTy` allocates the same constructors in the same order as `nameToTy` and
+takes no `slice`. The 575,860 deleted depth scans are the allocation story: every one of them
+built `string[]` part lists or sliced substrings. D-ALIASFN allocates nothing new — it returns an
+arena index that already existed. Binary, like-for-like (ONE compiler, two sources):
+1,038,622 → **1,038,675 bytes (+53)**. Source: **47 insertions, 9 deletions** in
+`compiler/typecheck.vl`, plus four fixtures.
+
+### Gate
+
+`refresh-compiler.sh` RC=0 (1,038,675 bytes) · `native-fixpoint.sh` RC=0 (stage3 == stage4,
+byte-for-byte, 1,038,675 bytes) · `lint-self.sh` RC=0 · `rep-fuzz-check.sh` RC=0 (exact; 1
+baselined failure — 0 unsound, 1 reject; 0 new, 0 stale) · `SELFHOST_NATIVE_ALIGN=1 deno task
+test` RC=0 — **2,026 passed / 0 failed / 8 ignored**, against a master baseline of **2,022 passed
+/ 0 failed / 8 ignored** measured in this same worktree with the changes stashed: **+4 = exactly
+the four new pins**, and the IGNORED TEST NAME SETS are byte-identical (`diff` RC=0), so nothing
+that ran on master silently stopped running.
+
+### What did NOT move, and the mechanism
+
+- **`type L = i32[]` is the same defect one arm over, and is NOT fixed here.**
+  `const xs: L = [1,2,3]; xs[0]` is `cannot index non-array i32[]` on master AND on this build —
+  the one-member `UnionDecl` wraps a `TyArray` exactly as it wrapped the `TyFunc`, and the
+  message misreads for exactly the same reason. It is deliberately not taken: the `TyFunc` arm
+  ships with a measured emit-side consequence (the invalid-wasm return) and an alias/inline twin
+  table; the array arm has neither yet, and widening an arm without its own gate is what S2
+  exists to punish. Hand-off 1.
+- **A GENERIC function alias** (`type F<T> = (T) => T`) is a clean checker reject on both sides
+  (``unknown type '(T)=>T' in union 'F<T>'``) — pre-existing, untouched, and not a producer of
+  the wrapper.
+- **The nullable-closure RETURN when the result is READ** stays an emit reject, for the alias and
+  the inline spelling alike. `emit_sections`' `vtKindOfType` and `wasmEmit`'s bare-`null` return
+  path must flip together; both are other partitions. Hand-off 2.
+- **`emit_rep.vl`'s `tyDenotesFunc` peel** is untouched (another partition), and its header
+  comment — "`type F = (i32) => i32` keeps the wrapper and `T.tys[nameToTy("F")]` is a `TyUnion`
+  over one `TyFunc`" — is now FALSE for the checker-side producer. Hand-off 3, with the number.
+- **`wasmEmit.vl:1736`'s comment** still says the `is` type is banked via `nameToTy(n.isVariant)`.
+  It is `isTypeTy` now. One-word comment fix in another partition; listed rather than reached
+  across.
+
+### Hand-offs, each with the exact diff
+
+1. **`typecheck.vl` — the `TyArray` (and `TyMap`) arm of `singleAliasMemberTyIx`.** Same
+   one-liner, same function, same file:
+   ```
+        if mt is TyPrim { return m0 }
+        if mt is TyFunc { return m0 }
+   +    if mt is TyArray { return m0 }
+   ```
+   Reproduction on this build: `type L = i32[]` + `const xs: L = [1,2,3]` + `xs[0]` →
+   `cannot index non-array i32[]`. What must be measured BEFORE shipping it, because the array
+   arm — unlike the function arm — DOES have a nominal emit route to lose: whether
+   `singleMemberAliasName`'s `tyToEmitName(m)` for an array member collides with the
+   `nameIsRefArray` / `refArrElemName` family's element-name tables. Build the alias-vs-inline
+   twin table first (the harness is `mktwins.sh` in this slice's scratchpad); S2's three-file
+   witness is the tripwire that says the gates are load-bearing.
+2. **`emit_classify.vl` + `emit_sections.vl` + `wasmEmit.vl` — the nullable-closure RETURN.**
+   Not an alias defect (measured above: the inline twin fails identically). `vtKindOfType`
+   writes the closure result valtype while `wasmEmit`'s bare-`null` return path does not, and
+   #1133 declined it for the same reason this slice does: they must move together, in one
+   partition. The pin that would go red is
+   `function mk(): ((i32) => i32) | null { null }` + a `!= null` read of the result.
+3. **`emit_rep.vl` — `tyDenotesFunc`'s peel has lost its checker-side producer.** 58 of 5,822
+   declared-name `TyUnion` resolutions on master were a one-member union over a `TyFunc`; with
+   D-ALIASFN `declaredTyOfName` collapses all 58 at the source, so the peel is unreachable from
+   an annotation. **Do NOT delete it on that alone** — the measurement covers the checker's
+   producer only; `emit_rep`'s own 7 post-canon `resolveAnnot` calls and `applyGenAlias`'s memo
+   are unmeasured, and the generic-alias route is a checker reject rather than a producer, which
+   is suggestive but not a census. The peel is cheap and defensive; the header COMMENT is the
+   part that is now wrong and should be corrected either way.
+4. **The `UnionDecl` variant names (3 sites in `checkProgramNode`)** — #1134's hand-off 2,
+   re-verified as still open at this head (`nameToTy` sites 3 of the remaining 20). P2 banked
+   `udTsNode`/`udTsRoot` for these, a per-DECLARATION root LIST rather than the single-root
+   `annTs` table, so the read is `udTsRootAt(node, k)`-keyed and not `annTsOf`. **Still
+   unmeasured** — a 0 does not transfer between sibling sites, and this slice's own three sites
+   with a 0-fuzz witness are the reason to say so again.
+
+### Method notes earned
+
+76. **A hand-off's measurement can be RIGHT and its SCOPE wrong** (D-ISVARTY) — #1134 measured
+    the `is` sites at 76,342 reads with 0 disagreements, and every one of those numbers is
+    reproducible. It probed two of the five sites it was handing off. The three unprobed sites
+    carry 122,219 more corpus reads, and two of them have **no fuzz witness at all**, so a
+    successor who trusted the figure would have shipped a change to five sites on evidence
+    covering two. **Re-run the hand-off's own probe over the hand-off's own site list before
+    believing its total** — the re-grep rule (note 71) applies to a measurement's DENOMINATOR,
+    not only to its numerator.
+77. **A raw grep reported as a call count survives into the NEXT slice's arithmetic**
+    (D-ISVARTY) — #1134's enumeration of the 25 surviving `nameToTy` sites ends "Plus
+    `emit_rep.vl` 1 and `wasmEmit.vl` 1, other partitions". All five raw hits across those two
+    files are inside `//` comments; `nameToTy` has zero call sites outside `typecheck.vl`. This
+    is the fourth instance in this program, and the tell was cheap: the enumerated typecheck
+    sites already summed to exactly 25, so the extra two were double-counting a total that was
+    already complete. **When an enumeration and a total agree, an "and also" is a red flag.**
+78. **A "clean located reject" can be one exercise away from a silent miscompile**
+    (D-ALIASFN) — the brief named the nullable-closure RETURN as one of four clean rejects.
+    Reading the result IS a clean reject, on both spellings, on both builds. **Declaring the
+    function and never calling it builds an invalid module on master.** #1133 earned the same
+    note from the other end (its `-unread` global) and it generalises: for any position where the
+    compiler rejects, ask what the program looks like with the rejecting READ removed, because a
+    reject that fires first is a lid on the defect underneath it.
+79. **A transparency fix's acceptance test is a TWIN TABLE, not a pass list** (D-ALIASFN) —
+    "the alias is transparent" is exactly the claim "the alias and its inline spelling are
+    indistinguishable", so the measurement is the same program in both spellings across every
+    position: 6 of 10 differ on master, 0 of 10 after. The table also produced the slice's
+    strongest refutation for free — the one position that still rejects rejects for BOTH
+    spellings, which is how it was identified as somebody else's defect rather than a residual
+    hole in this one.
+80. **The build/run A/B cannot see the LINT tier** (D-ISVARTY) — `vl build` and `vl run` emit no
+    hints, warnings or infos, so a byte-, message- and run-identical corpus says nothing about
+    whether a change moved a diagnostic that only `vl check --severity` prints. A separate
+    1,335-row `--severity hint` sweep (689 rows carrying at least one lint) is one more cheap
+    channel, and the population count is what makes its 0 mean something.
