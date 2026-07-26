@@ -689,33 +689,104 @@ export function inferNicheNullByName(name: string) {
   if im == "string|null" { return "string|null" }
   ""
 }
+// ── the type-name DEPTH WALK: one home for the bracket ladder ─────────────────
+// THE ONE HOME of the type-name depth walk, "FIND" form: the index of the first
+// TOP-LEVEL (grouper depth 0) occurrence of the single-code-point separator `sep` in
+// `name`, or -1.
+//
+// SEVEN functions in this file hand-wrote the identical bracket ladder — `{`/`[`/`(`
+// open, `}`/`]`/`)` close, `<` open, and a `>` that closes only an OPEN `<`
+// (`tyGtIsClose`) — and differed ONLY in what they do when the depth is 0. The rules
+// are one thing, and this program has already paid for their being seven: the `<>`
+// repairs #1118 / #1120 / D-CLASSANG shipped had to be applied to each copy
+// separately, one PR at a time, because a copy that had not been visited yet ran its
+// depth NEGATIVE on a generic argument list.
+//
+// `sep` must not itself be a grouper (every caller separates on `|` or `,`): the
+// grouper arms are tested first, exactly as each copy tested them.
+//
+// It returns at the FIRST hit. `nullablePartOf`'s copy scanned to the END of the name
+// and kept only the first bar, so this is the same answer for strictly less work.
+export function tyTopLevelIndexOf(name: string, sep: i32) {
+  let depth = 0
+  let angOpen = 0
+  let i = 0
+  while i < name.length {
+    const ch = name[i]
+    if ch == '{' || ch == '[' || ch == '(' {
+      depth = depth + 1
+    } else if ch == '<' {
+      depth = depth + 1
+      angOpen = angOpen + 1
+    } else if ch == '}' || ch == ']' || ch == ')' {
+      depth = depth - 1
+    } else if ch == '>' && tyGtIsClose(name, i, angOpen) {
+      depth = depth - 1
+      angOpen = angOpen - 1
+    } else if depth == 0 && ch == sep {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+// THE ONE HOME of the type-name depth walk, "SPLIT" form: append the TOP-LEVEL
+// (grouper depth 0) `sep`-separated parts of `s` to `out`.
+//
+// `dropEmpty` is the ONE axis its four callers differed on: `gaeSplitArgs` drops an
+// empty part (a tolerated trailing comma in a generic argument list), while
+// `annSplitParams` / `annSplitPipe` / `shapeInnerFieldSplit` keep it — an EMPTY input
+// yields exactly ONE empty part, which each of those reads as its "no parts /
+// malformed" case (`annFnDecompose`'s empty-param guard exists because of it).
+//
+// Parts are VERBATIM SLICES of `s`. Two of the four copies accumulated the part one
+// code point at a time (`cur = cur + fromCodePoint(c)`), the copy-on-concat shape
+// `splitUnionAtoms` was already repaired for; slicing makes the home strictly cheaper
+// than the copies it replaces, not merely equal.
+export function tyTopLevelSplit(
+  s: string,
+  sep: i32,
+  dropEmpty: boolean,
+  out: string[],
+) {
+  let depth = 0
+  let angOpen = 0
+  let start = 0
+  let i = 0
+  while i <= s.length {
+    let brk = i == s.length
+    if !brk {
+      const c = s[i]
+      if c == '{' || c == '[' || c == '(' {
+        depth = depth + 1
+      } else if c == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      } else if c == '}' || c == ']' || c == ')' {
+        depth = depth - 1
+      } else if c == '>' && tyGtIsClose(s, i, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
+      } else if depth == 0 && c == sep {
+        brk = true
+      }
+    }
+    if brk {
+      const part = s.slice(start, i)
+      if part.length > 0 || !dropEmpty { out.push(part) }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  0
+}
 // ── nullable struct refs (`S | null`) ─────────────────────────────────────────
 // "S|null" / "null|S" (exactly TWO `|` parts, one of them `null`) → the non-null
 // part's name, or "" when the name is not a two-part nullable.
 export function nullablePartOf(name: string) {
   // Depth-aware: a `|` INSIDE an inline shape (`{y:string|i32}|null`) is part of
   // the FIELD's union, not the nullable wrapper — only a depth-0 bar splits.
-  let bar = -1
-  let depth = 0
-  let angOpen = 0
-  let i = 0
-  while i < name.length {
-    const ch = name[i]
-    if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
-    if ch == '<' {
-      depth = depth + 1
-      angOpen = angOpen + 1
-    }
-    if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
-    if ch == '>' && tyGtIsClose(name, i, angOpen) {
-      depth = depth - 1
-      angOpen = angOpen - 1
-    }
-    if ch == '|' && depth == 0 {
-      if bar < 0 { bar = i }
-    }
-    i = i + 1
-  }
+  const bar = tyTopLevelIndexOf(name, '|')
   if bar < 0 { return "" }
   const a = name.slice(0, bar)
   const b = name.slice(bar + 1, name.length)
@@ -739,7 +810,9 @@ export function tyIsNulBool(tyIx: i32) {
   // whose `nodeTyIsNulString` leg is this test's `string` sibling.
   if nodeTyIxOf(tyIx) >= 0 { return nodeTyIsNulBool(tyIx) }
   const ty = P.nodes[tyIx]
-  if ty is TypeRef { return nullablePartOf(ty.tyName) == "boolean" }
+  // `nameIsNulBool` IS `nullablePartOf(name) == "boolean"` — this arm hand-wrote its
+  // body eight lines above the definition, so the niche's spelling had two homes.
+  if ty is TypeRef { return nameIsNulBool(ty.tyName) }
   false
 }
 // True if the type-annotation node at `tyIx` is `boolean`/`bool`.
@@ -815,62 +888,57 @@ export function nameIsNulLitUnionList(name: string) {
 // its all-quoted non-null members. Routes to `vtKindOfType` kind 0 (plain i32); `== null` is a
 // `-1` compare and narrowing to the bare litunion is purely type-level (the i32 already holds a
 // valid id in the non-null branch).
+// It is the PREDICATE form of `nulLitUnionInnerName`, which is the primitive: the niche
+// exists exactly when there IS a non-null litunion part to name, so one function decides
+// both and they cannot disagree.
 export function nameIsNulLitUnion(name: string) {
+  nulLitUnionInnerName(name) != ""
+}
+// THE ONE HOME of the nullable-litunion niche. The NON-null part of a nullable-litunion
+// name — the litunion alias (`K` of `K | null`) or the re-joined quoted members of the
+// expanded inline form (`"a" | "b"` of `"a" | "b" | null`). "" when `name` is not a
+// nullable litunion, which is also the "no" of the predicate above.
+//
+// This family was FOUR functions asking the SAME name the SAME question up to FIVE times:
+// `nameIsNulLitUnion` scanned for the nullable split, then split the union in
+// `nameHasNullMember`, then split it AGAIN in `nulLitUnionCore`; `nulLitUnionInnerName`
+// called that whole cascade and then re-derived the nullable split and the union split for
+// itself. The expanded form is decided by ONE pass over ONE split now — a top-level `null`
+// member, and 2+ non-null members that are ALL quoted string literals — and the same pass
+// builds the answer it was deciding about.
+export function nulLitUnionInnerName(name: string) {
   // Two-part `K | null`: the non-null part is a litunion alias / inline union.
   const b = nullablePartOf(name)
-  if b != "" { return nameIsLitUnionType(b) }
-  // Expanded multi-member form `"a" | "b" | null`: a top-level `null` member plus an all-quoted-
-  // literal remainder (2+ members, so `nullablePartOf`'s two-part split missed it).
-  if !nameHasNullMember(name) { return false }
-  nulLitUnionCore(name)
-}
-// The NON-null part of a nullable-litunion name — the litunion alias (`K` of `K | null`)
-// or the re-joined quoted members of the expanded inline form (`"a" | "b"` of
-// `"a" | "b" | null`). "" when `name` is not a nullable litunion.
-export function nulLitUnionInnerName(name: string) {
-  if !nameIsNulLitUnion(name) { return "" }
-  const b = nullablePartOf(name)
-  if b != "" { return b }
-  const parts: string[] = []
-  splitUnionAtoms(name, parts)
-  let out = ""
-  let i = 0
-  while i < parts.length {
-    if parts[i] != "null" {
-      if out == "" { out = parts[i] } else { out = out + " | " + parts[i] }
-    }
-    i = i + 1
+  if b != "" {
+    if nameIsLitUnionType(b) { return b }
+    return ""
   }
-  out
-}
-// True if `name` has a top-level (depth-0) `null` union member.
-function nameHasNullMember(name: string) {
-  const parts: string[] = []
-  splitUnionAtoms(name, parts)
-  let i = 0
-  while i < parts.length {
-    if parts[i] == "null" { return true }
-    i = i + 1
-  }
-  false
-}
-// True if `name`'s NON-null top-level members are 2+ and all quoted string literals (the expanded
-// inline nullable-litunion core `"a" | "b" | null`).
-function nulLitUnionCore(name: string) {
+  // Expanded multi-member form `"a" | "b" | null`: a top-level `null` member plus an
+  // all-quoted-literal remainder (2+ members, so `nullablePartOf`'s two-part split missed
+  // it). The literal test rejects on the FIRST unquoted member, exactly as `nulLitUnionCore`
+  // did; reaching that reject before seeing the `null` member is the same answer, since both
+  // conditions were required.
   const parts: string[] = []
   splitUnionAtoms(name, parts)
   let lits = 0
+  let hasNull = false
+  let out = ""
   let i = 0
   while i < parts.length {
     const p = parts[i]
-    if p != "null" {
-      if p.length < 2 { return false }
-      if p[0] != '"' { return false }
+    if p == "null" {
+      hasNull = true
+    } else {
+      if p.length < 2 { return "" }
+      if p[0] != '"' { return "" }
       lits = lits + 1
+      if out == "" { out = p } else { out = out + " | " + p }
     }
     i = i + 1
   }
-  lits >= 2
+  if !hasNull { return "" }
+  if lits < 2 { return "" }
+  out
 }
 // A NULLABLE FUNCTION-VALUE type name — `((i32) => i32) | null` (kind 19): a
 // `(ref null $cloStruct)` cell, the closure analogue of the nullable struct (kind 9). The
@@ -889,7 +957,14 @@ export function nameIsNulClosure(name: string) {
   // whole is a nullable ref-array / nullable struct, not the closure niche (kind 19). Mis-
   // classifying them as nulclosure typed the field/binding slot `(ref null $cloStruct)` and the
   // construct stored a ref-array wrapper into it — invalid wasm.
-  annArrowAt(peelGroupParens(b)) >= 0
+  //
+  // `nameIsFuncTypeAtom` IS "peel every fully-enclosing grouping-paren layer, then test for
+  // a top-level arrow" — character-for-character the `annArrowAt(peelGroupParens(b))` this
+  // line spelled out (its peel and `peelGroupParens` share `parenEnclosesWhole`; its arrow
+  // scan and `annArrowAt` are the same walk), and it is the predicate the sibling
+  // `nullClosureArrElem` already calls to ask the IDENTICAL question of the identical kind
+  // of name — "is this nullable's non-null part a FUNCTION type".
+  nameIsFuncTypeAtom(b)
 }
 // `1` if the type-annotation node at `tyIx` is a nullable function `(fn) | null`, else `0`
 // — the closure dual of `retNulRefFlag`.
@@ -981,7 +1056,9 @@ export function retNulStringFlag(tyIx: i32) {
     if nodeTyIsNulString(tyIx) { return 1 }
     return 0
   }
-  if nullablePartOf(tyNameOf(tyIx)) == "string" { return 1 }
+  // `nameIsNulString` IS this compare (the code-20 niche's one home) — the same
+  // hand-copy `tyIsNulBool` carried for the boolean sibling.
+  if nameIsNulString(tyNameOf(tyIx)) { return 1 }
   0
 }
 // Combine the struct/array/string flags for a type-annotation node at `tyIx` into the
@@ -1484,37 +1561,10 @@ export function gaeLtAt(name: string) {
   -1
 }
 // Split a type-argument list at its TOP-LEVEL commas (`<>`/`{}`/`[]`/`()`
-// nest); empty parts drop (a tolerated trailing comma).
+// nest); empty parts drop (a tolerated trailing comma) — the `dropEmpty` reading of
+// the shared depth walk.
 export function gaeSplitArgs(s: string, out: string[]) {
-  let depth = 0
-  let angOpen = 0
-  let start = 0
-  let i = 0
-  while i <= s.length {
-    const atEnd = i == s.length
-    let brk = atEnd
-    if !atEnd {
-      const c = s[i]
-      if c == '{' || c == '[' || c == '(' { depth = depth + 1 }
-      if c == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      }
-      if c == '}' || c == ']' || c == ')' { depth = depth - 1 }
-      if c == '>' && tyGtIsClose(s, i, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      }
-      if c == ',' && depth == 0 { brk = true }
-    }
-    if brk {
-      const part = s.slice(start, i)
-      if part.length > 0 { out.push(part) }
-      start = i + 1
-    }
-    i = i + 1
-  }
-  0
+  tyTopLevelSplit(s, ',', true, out)
 }
 // Substitute a declared param name (or its `T[]` array form) in a field's
 // type name with the application's argument name.
@@ -1737,9 +1787,13 @@ export function isStructAtom(stmts: i32[], a: string) {
 // has no struct/ref-array, so it is handled earlier by `isValueUnionName`; a single struct +
 // `null` (`A | null`) has one non-null member, so it stays the kind-9 niche nullable ref.
 export function isVariantBoxUnion(stmts: i32[], name: string) {
-  if unionMemberCount(name) < 2 { return false }
+  // ONE walk of `name`, not two. `unionMemberCount` is the COUNTING DUAL of
+  // `splitUnionAtoms` — the identical depth ladder, the identical quoted-atom skip, the
+  // identical top-level-arrow stop — so asking the count and then asking for the atoms of
+  // the SAME name walked it twice for one answer; `atoms.length` IS that count.
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  if atoms.length < 2 { return false }
   let structAtoms = 0
   let refArrAtoms = 0
   let mapAtoms = 0
@@ -1935,6 +1989,49 @@ export function annGenAppDecompose(ann: string, outArgs: string[]) {
   const head = ann.slice(0, lt)
   head
 }
+// THE ONE HOME of the inline OBJECT-SHAPE decomposition `{a:T,b:U}` in the generic
+// instantiation layer: fills `outNames` / `outTexts` with the top-level field names and
+// field type TEXTS, returning `1` for an object shape, `0` for a MAP (`{[`) and `-1` when
+// `ann` is not a `{…}` group at all.
+//
+// `monoAnnHasTyParam` and `monoSubstAnn` carried this same four-part test plus its
+// `gaeSplitArgs` + `indexOf(":")` cut — D-GRAMHOME's third mono grammar, filed as its
+// hand-off 3 and taken here. The tri-state is what the two callers actually differ on: a
+// MAP annotation is not descended by either, but one answers `false` for the whole
+// function while the other returns the annotation UNCHANGED, so "not an object" and "a map
+// object" have to stay distinguishable.
+//
+// A malformed part (no `name:` prefix) pushes an EMPTY name, `shapeInnerFieldSplit`'s
+// convention: `monoAnnHasTyParam`'s `ci > 0` skip and `monoSubstAnn`'s `ci <= 0` bail are
+// both exactly `outNames[i] == ""`. It deliberately splits with `gaeSplitArgs` (empty parts
+// DROPPED) rather than reusing `shapeInnerFieldSplit` (empty parts KEPT): the two
+// conventions disagree on a trailing comma, and only the dropping one preserves what these
+// two callers do today.
+export function annObjFieldSplit(
+  ann: string,
+  outNames: string[],
+  outTexts: string[],
+) {
+  const n = ann.length
+  if n < 2 { return -1 }
+  if ann[0] != '{' || ann[n - 1] != '}' { return -1 }
+  if n >= 3 && ann[1] == '[' { return 0 }
+  const fields: string[] = []
+  gaeSplitArgs(ann.slice(1, n - 1), fields)
+  let j = 0
+  while j < fields.length {
+    const ci = fields[j].indexOf(":")
+    if ci <= 0 {
+      outNames.push("")
+      outTexts.push("")
+    } else {
+      outNames.push(fields[j].slice(0, ci))
+      outTexts.push(fields[j].slice(ci + 1, fields[j].length))
+    }
+    j = j + 1
+  }
+  1
+}
 // Split the INNER text of an inline object shape (`{…}`'s contents — `a:i32,b:{c:f64}`)
 // into PARALLEL field-NAME / field-TYPE-TEXT lists at depth 0.
 //
@@ -1946,13 +2043,15 @@ export function annGenAppDecompose(ann: string, outArgs: string[]) {
 // both importers already depend on, so the home belongs here and every consumer can
 // reach it (`emit_classify`'s own private copy retires by importing this one).
 //
-// Depth-aware over `{}` `[]` `()` AND the generic-application brackets: a field whose
-// type is a generic APPLICATION carries the argument list's own `,` (`{v: Pair<i32,
-// string>}`) and a bracket-blind depth splits the FIELD list at it. `>` closes only
-// against an OPEN `<` (`tyGtIsClose`) — two other string languages ride this scanner and
-// both spell a `>` that closes nothing: `tyToStr`'s `->` render and the `$fnsig` key's
-// `ii>i`, and counting those runs the depth NEGATIVE. Applying that repair one scanner
-// at a time is what #1118/#1120 had to do; this is why.
+// The depth walk itself is `tyTopLevelSplit`'s, shared with every other top-level split
+// in this file. Depth-aware over `{}` `[]` `()` AND the generic-application brackets: a
+// field whose type is a generic APPLICATION carries the argument list's own `,`
+// (`{v: Pair<i32, string>}`) and a bracket-blind depth splits the FIELD list at it. `>`
+// closes only against an OPEN `<` (`tyGtIsClose`) — two other string languages ride this
+// scanner and both spell a `>` that closes nothing: `tyToStr`'s `->` render and the
+// `$fnsig` key's `ii>i`, and counting those runs the depth NEGATIVE. Applying that repair
+// one scanner at a time is what #1118/#1120 had to do; ONE walk is why they cannot drift
+// apart again.
 //
 // A part with no `name:` prefix is MALFORMED and pushes an EMPTY name (a well-formed
 // field name always has at least one character before its `:`, so `outNames[i] == ""`
@@ -1964,40 +2063,18 @@ export function shapeInnerFieldSplit(
   outNames: string[],
   outTexts: string[],
 ) {
-  let depth = 0
-  let angOpen = 0
-  let start = 0
+  const parts: string[] = []
+  tyTopLevelSplit(inner, ',', false, parts)
   let k = 0
-  while k <= inner.length {
-    const atEnd = k == inner.length
-    let brk = false
-    if !atEnd {
-      const ch = inner[k]
-      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
-      if ch == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      }
-      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
-      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      }
-      if ch == ',' && depth == 0 { brk = true }
+  while k < parts.length {
+    const part = parts[k]
+    const ci = part.indexOf(":")
+    if ci <= 0 {
+      outNames.push("")
+      outTexts.push("")
     } else {
-      brk = true
-    }
-    if brk {
-      const part = inner.slice(start, k)
-      const ci = part.indexOf(":")
-      if ci <= 0 {
-        outNames.push("")
-        outTexts.push("")
-      } else {
-        outNames.push(part.slice(0, ci))
-        outTexts.push(part.slice(ci + 1, part.length))
-      }
-      start = k + 1
+      outNames.push(part.slice(0, ci))
+      outTexts.push(part.slice(ci + 1, part.length))
     }
     k = k + 1
   }
@@ -2043,28 +2120,10 @@ export function nameIsStructWithUnionField(name: string) {
     if fnames[fi] != "" {
       const ftype = ftexts[fi]
       // A CLOSURE field (top-level `=>`) binds any `|` to its RESULT — skip it. Only a field
-      // type that is itself a top-level UNION (`|` at depth 0) is a boxed field slot.
+      // type that is itself a top-level UNION (`|` at depth 0) is a boxed field slot. The
+      // depth-0 bar scan is `tyTopLevelIndexOf`'s, the same walk `nullablePartOf` asks.
       if annArrowAt(ftype) < 0 {
-        let fd = 0
-        let fAng = 0
-        let j = 0
-        while j < ftype.length {
-          const cc = ftype[j]
-          if cc == '{' || cc == '[' || cc == '(' {
-            fd = fd + 1
-          } else if cc == '<' {
-            fd = fd + 1
-            fAng = fAng + 1
-          } else if cc == '}' || cc == ']' || cc == ')' {
-            fd = fd - 1
-          } else if cc == '>' && tyGtIsClose(ftype, j, fAng) {
-            fd = fd - 1
-            fAng = fAng - 1
-          } else if cc == '|' && fd == 0 {
-            return true
-          }
-          j = j + 1
-        }
+        if tyTopLevelIndexOf(ftype, '|') >= 0 { return true }
         // A NESTED bare-shape field (`{f:{f:i32|string}}`): the boxed slot may sit one
         // level down — RECURSE, so the `synthRetAnnots` pin fires for a lambda whose
         // NESTED literal field adopted a union-field shape (`objLitWidenFields`'
@@ -2138,75 +2197,19 @@ export function nameIsStructWithMapField(name: string) {
   }
   false
 }
-// Split a function-type PARAM list (`i32,f64,S`) on top-level commas (depth-aware).
+// Split a function-type PARAM list (`i32,f64,S`) on top-level commas (depth-aware) —
+// the KEEP-empty reading of the shared depth walk, so an empty param list yields ONE
+// empty part (see `annFnDecompose`'s guard, and D-GRAMHOME's S5 fixture).
 export function annSplitParams(s: string, out: string[]) {
-  let cur = ""
-  let depth = 0
-  let angOpen = 0
-  let i = 0
-  while i < s.length {
-    const c = s[i]
-    if c == '(' || c == '{' || c == '[' {
-      depth = depth + 1
-      cur = cur + fromCodePoint(c)
-    } else if c == '<' {
-      depth = depth + 1
-      angOpen = angOpen + 1
-      cur = cur + fromCodePoint(c)
-    } else if c == ')' || c == '}' || c == ']' {
-      depth = depth - 1
-      cur = cur + fromCodePoint(c)
-    } else if c == '>' && tyGtIsClose(s, i, angOpen) {
-      depth = depth - 1
-      angOpen = angOpen - 1
-      cur = cur + fromCodePoint(c)
-    } else if depth == 0 && c == ',' {
-      out.push(cur)
-      cur = ""
-    } else {
-      cur = cur + fromCodePoint(c)
-    }
-    i = i + 1
-  }
-  out.push(cur)
-  0
+  tyTopLevelSplit(s, ',', false, out)
 }
 // The closure-ABI return suffix for a type NAME (`i32`/`boolean` → ">i", `f64` → ">d", a
 // struct → ">s<idx>;"), or "" outside the value-returning ABI. (`void` is a later slice —
 // its `>v` sig is not interned by the value-eligible pass.)
 // Depth-aware split of a type NAME on its top-level `|` (the union/nullable separator) —
-// the `annSplitParams` analogue for `|`.
+// the `annSplitParams` analogue for `|`, the same KEEP-empty reading of the shared walk.
 export function annSplitPipe(s: string, out: string[]) {
-  let cur = ""
-  let depth = 0
-  let angOpen = 0
-  let i = 0
-  while i < s.length {
-    const c = s[i]
-    if c == '(' || c == '{' || c == '[' {
-      depth = depth + 1
-      cur = cur + fromCodePoint(c)
-    } else if c == '<' {
-      depth = depth + 1
-      angOpen = angOpen + 1
-      cur = cur + fromCodePoint(c)
-    } else if c == ')' || c == '}' || c == ']' {
-      depth = depth - 1
-      cur = cur + fromCodePoint(c)
-    } else if c == '>' && tyGtIsClose(s, i, angOpen) {
-      depth = depth - 1
-      angOpen = angOpen - 1
-      cur = cur + fromCodePoint(c)
-    } else if depth == 0 && c == '|' {
-      out.push(cur)
-      cur = ""
-    } else {
-      cur = cur + fromCodePoint(c)
-    }
-    i = i + 1
-  }
-  out.push(cur)
-  0
+  tyTopLevelSplit(s, '|', false, out)
 }
 // True if the type-annotation node at `tyIx` is a function type — the self-host parses a
 // function-typed annotation as a `TypeRef` whose name contains `=>` or `(`/`)->`. For the
@@ -2294,7 +2297,6 @@ export function monoBindOf(tvN: string[], tvV: string[], tp: string) {
 // shape's field type (`{first:B,second:A}`)?
 export function monoAnnHasTyParam(ann: string, typarams: string[]) {
   if monoTyParamOf(ann, typarams) != "" { return true }
-  const n = ann.length
   const parts: string[] = []
   if annGenAppDecompose(ann, parts) != "" {
     let i = 0
@@ -2304,19 +2306,15 @@ export function monoAnnHasTyParam(ann: string, typarams: string[]) {
     }
     return false
   }
-  if n >= 2 && ann[0] == '{' && ann[n - 1] == '}' {
-    if n >= 3 && ann[1] == '[' { return false }
-    const fields: string[] = []
-    gaeSplitArgs(ann.slice(1, n - 1), fields)
+  const onames: string[] = []
+  const otexts: string[] = []
+  const okind = annObjFieldSplit(ann, onames, otexts)
+  if okind == 0 { return false }
+  if okind > 0 {
     let j = 0
-    while j < fields.length {
-      const ci = fields[j].indexOf(":")
-      if ci > 0 {
-        if (
-          monoAnnHasTyParam(fields[j].slice(ci + 1, fields[j].length), typarams)
-        ) {
-          return true
-        }
+    while j < onames.length {
+      if onames[j] != "" {
+        if monoAnnHasTyParam(otexts[j], typarams) { return true }
       }
       j = j + 1
     }
@@ -2355,7 +2353,6 @@ export function monoSubstAnn(
     if ann == tp { return b }
     return b + "[]"
   }
-  const n = ann.length
   const parts: string[] = []
   const gHead = annGenAppDecompose(ann, parts)
   if gHead != "" {
@@ -2370,24 +2367,19 @@ export function monoSubstAnn(
     }
     return outAnn + ">"
   }
-  if n >= 2 && ann[0] == '{' && ann[n - 1] == '}' {
-    if n >= 3 && ann[1] == '[' { return ann }
-    const fields: string[] = []
-    gaeSplitArgs(ann.slice(1, n - 1), fields)
+  const onames: string[] = []
+  const otexts: string[] = []
+  const okind = annObjFieldSplit(ann, onames, otexts)
+  if okind == 0 { return ann }
+  if okind > 0 {
     let outObj = "{"
     let j = 0
-    while j < fields.length {
-      const ci = fields[j].indexOf(":")
-      if ci <= 0 { return ann }
-      const fs = monoSubstAnn(
-        fields[j].slice(ci + 1, fields[j].length),
-        typarams,
-        tvN,
-        tvV,
-      )
+    while j < onames.length {
+      if onames[j] == "" { return ann }
+      const fs = monoSubstAnn(otexts[j], typarams, tvN, tvV)
       if fs == "" { return "" }
       if j > 0 { outObj = outObj + "," }
-      outObj = outObj + fields[j].slice(0, ci) + ":" + fs
+      outObj = outObj + onames[j] + ":" + fs
       j = j + 1
     }
     return outObj + "}"
