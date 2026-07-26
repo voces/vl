@@ -166,6 +166,7 @@ import {
   tyGroupWrapsWhole,
   tyIsBool,
   tyIsFuncType,
+  tyIsNulBareMap,
   tyIsNulBool,
   tyNameOf,
   tyTopLevelSplit,
@@ -1699,7 +1700,9 @@ function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
           if d.letType >= 0 {
             const lt = P.nodes[d.letType]
             if lt is TypeRef {
-              if nameIsBareMap(lt.tyName) {
+              // ARENA (D-BAREMAP): a `TyMap` annotation, never the union box a map-FIRST
+              // spelling used to fool `nameIsMap` into claiming.
+              if nodeTyIsMap(d.letType) {
                 // A supported map value type — the same classifier `retMapFlag` gates the
                 // boundary with (`mvValKindOfName`); the return's SHAPE is recovered at the
                 // functype-result site via `mapShapeOfExpr` over this same local.
@@ -2056,7 +2059,10 @@ function capRecord(name: string, bound: string[], caps: string[]) {
   if capIsBound(bound, name) { return 0 }
   if globalIndexOf(name) >= 0 { return 0 }
   if fnIndexOf(name) >= 0 { return 0 }
-  if isBuiltinFnName(name) { return 0 }
+  // D-CAPCALLEE: the `isBuiltinFnName` exemption used to sit HERE — at every identifier in
+  // every position — and it is POSITIONAL, so it moved to `capScan`'s `Call` arm. A builtin
+  // name denotes instructions where it is CALLED and nothing anywhere else, so filtering it
+  // here suppressed genuine captures of a local that merely shares the name.
   if capHas(caps, name) { return 0 }
   caps.push(name)
   0
@@ -2146,7 +2152,21 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     return 0
   }
   if n is Call {
-    capScan(n.callFn, bound, caps)
+    // D-CAPCALLEE — the ONE place a builtin/intrinsic name is exempt from capture, and it
+    // is a POSITION, not a name filter. In callee position `print` / `Map` / `__load_f64__`
+    // denote instructions the emitter lowers inline, so there is nothing to read out of an
+    // enclosing frame; anywhere else the same spelling is an ordinary identifier and MUST
+    // be captured. A callee that is NOT on the list (a closure local, a param holding a
+    // function value) still falls through to the scan below, so `const cb = …; () => cb(1)`
+    // keeps capturing `cb`.
+    // Parens are unwrapped so `(print)(1)` reads the same as `print(1)` — the master
+    // behaviour, whose filter ran inside `capRecord` and so could not see the wrapper.
+    let skipCallee = false
+    const cal = P.nodes[unwrapParen(n.callFn)]
+    if cal is Ident {
+      if isBuiltinFnName(cal.identName) { skipCallee = true }
+    }
+    if !skipCallee { capScan(n.callFn, bound, caps) }
     const args = n.callArgs
     let i = 0
     while i < args.length {
@@ -8647,13 +8667,14 @@ export function retMapFlag(tyIx: i32) {
       // boundary). The gate is the SAME classifier the local path interns with
       // (`mvValKindOfName`) — every map value type that binds locally also crosses a
       // param/return boundary; anything outside it stays a loud rejection.
-      // A map-member UNION (`{[string]: V} | X`) also STARTS with `{[`, so `nameIsMap` matches
-      // the whole union name — but it is a union BOX, not a map. Guard so a struct FIELD (or any
-      // `vtKindOfType` consumer) of a map-member-union type falls through to `retUnionFlag` and
-      // rides the union box valtype, rather than mis-typing the field as a bare map struct. The
-      // param/return paths already catch the union in an earlier branch; this guard makes the
-      // classifier consistent everywhere. (The `nameIsMapMemberUnion` twin of the let/field guards.)
-      if nameIsBareMap(ty.tyName) {
+      // A map-member UNION (`{[string]: V} | X`) also STARTS with `{[`, so the old `nameIsMap`
+      // test matched the whole union name — but it is a union BOX, not a map, and every consumer
+      // had to subtract that false positive with a second scan (`nameIsMapMemberUnion`, a
+      // top-level union SPLIT). The ARENA never had the false positive to subtract: a bare map is
+      // a `TyMap` and a map-member union is a `TyUnion`, so `nodeTyIsMap` — typecheck's variant-tag
+      // test, already in production for EXPRESSION nodes — is the whole guard, allocation-free.
+      // (D-BAREMAP: 285,915 twin invocations at this site, 0 disagreements, 0 uncovered-live.)
+      if nodeTyIsMap(tyIx) {
         if mapValKindLowerable(ty.tyName) { return 1 }
       }
     }
@@ -8678,13 +8699,17 @@ export function nulMapInnerName(name: string) {
 // hoisted to the map struct). Gated to the SAME supported value kinds as the non-null `retMapFlag`
 // (`mvValKindOfName(mapValNameOf(inner)) != -3`), so a nullable map over an unrepresentable value type
 // keeps failing loudly rather than mis-riding this niche. Feeds the `"nulmap"` arm of `vtKindOfType`.
+// D-BAREMAP: the DECISION is the arena's (`tyIsNulBareMap` — a `TyNullable` over a `TyMap`,
+// 348,214 twin invocations against the name pair, 0 disagreements, 0 uncovered-live); only the
+// value-SHAPE payload still needs the inner spelling, so `nulMapInnerName` moved BEHIND the gate.
+// It used to run on every `TypeRef` this classifier saw — a `| null` top-level scan plus a bare-map
+// test, 348,214 times to answer yes 7,742 times.
 export function retNulMapFlag(tyIx: i32) {
   if tyIx >= 0 {
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
-      const inner = nulMapInnerName(ty.tyName)
-      if inner != "" {
-        if mapValKindLowerable(inner) { return 1 }
+      if tyIsNulBareMap(tyIx) {
+        if mapValKindLowerable(nulMapInnerName(ty.tyName)) { return 1 }
       }
     }
   }
@@ -17404,11 +17429,14 @@ export function letIsMap(letIx: i32, fnIx: i32) {
         const k = annRepKindOf(d.letType)
         if k != null {
           if k == "map" { return true }
-        } else if nameIsBareMap(lt.tyName) {
-          // A UNION annotation whose FIRST atom is a map (`{[string]: string} | f64`) has a name that
-          // STARTS with `{[`, so `nameIsMap` matches the whole union name — but it is a union BOX local,
-          // NOT a map (the map arm boxes into the union). A bare map has ONE top-level atom; a union has
-          // 2+. Gate so the union rides its box, and the map arm's read narrows through the union.
+        } else if nodeTyIsMap(d.letType) {
+          // The REP is uncovered but the TYPE is not: `annRepKindOf` answers only where the
+          // emitter also knows how to LOWER the map (`repOfMap` declines a struct/nullable value
+          // type), while `nodeTyIsMap` answers the strictly weaker question this branch asks —
+          // "is this annotation a map at all". So the fall-through is still the arena, one
+          // variant tag down, instead of the `nameIsMap` + top-level-union-split pair that had to
+          // subtract the map-FIRST union (`{[string]: string} | f64` — a union BOX local, not a
+          // map) by hand. D-BAREMAP measured 18,506 twin invocations here, 0 disagreements.
           return true
         }
         // Any registered UNION annotation (a map-member union — map-FIRST `{[..]}|X`, whose
@@ -17465,8 +17493,9 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
         // A map-member UNION annotation is NOT a bare map (see `letIsMap`) — skip it so the union
-        // box, not a garbled map value shape, is picked.
-        if nameIsBareMap(lt.tyName) { return mvShapeOfMapName(lt.tyName) }
+        // box, not a garbled map value shape, is picked. ARENA (D-BAREMAP): a `TyUnion` is not a
+        // `TyMap`, so the exclusion is the classifier itself rather than a second scan after it.
+        if nodeTyIsMap(d.letType) { return mvShapeOfMapName(lt.tyName) }
       }
     }
     return mapShapeOfExpr(d.letInit, fnIx)
