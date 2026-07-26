@@ -2624,6 +2624,32 @@ function modRwStmt(ix: i32): i32 {
   }
   modRwExpr(ix)
 }
+
+// The CHECK-TYPE half of the `IsExpr` merge rename, split out so a `match` arm's TYPE pattern
+// — an `IsExpr` whose object is the shared scrutinee node, already rewritten by the owning
+// `MatchExpr` arm — can rename its type WITHOUT re-walking that object. A no-op on any other
+// node kind, so the caller need not pre-classify.
+//
+// D-PARSETY P2: the `is` check type is a parser SPELLING banked on this node, so the merge
+// renames the TREE and renders — the same repair P1 made for a `TypeRef`, and it fixes the same
+// bug in this position (`type v = i32` in a module + `x is { v: i32 }` renamed the FIELD, and
+// the check type stopped being a variant of its own union). Pin:
+// `tests/cases/modules/is-type-field-shadows-type/`.
+function modRwIsType(ix: i32): i32 {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is IsExpr {
+    const isRoot = annTsOf(ix)
+    if isRoot >= 0 {
+      modRwTsName(isRoot)
+      n.isVariant = tsToName(isRoot)
+      return 0
+    }
+    n.isVariant = modTypeRenamed(n.isVariant)
+  }
+  0
+}
+
 function modRwExpr(ix: i32): i32 {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
@@ -2699,20 +2725,7 @@ function modRwExpr(ix: i32): i32 {
   }
   if n is IsExpr {
     modRwExpr(n.isObj)
-    // D-PARSETY P2: the `is` check type is a parser SPELLING banked on this node,
-    // so the merge renames the TREE and renders — the same repair P1 made for a
-    // `TypeRef`, and it fixes the same bug in this position (`type v = i32` in a
-    // module + `x is { v: i32 }` renamed the FIELD, and the check type stopped
-    // being a variant of its own union). Pin:
-    // `tests/cases/modules/is-type-field-shadows-type/`.
-    const isRoot = annTsOf(ix)
-    if isRoot >= 0 {
-      modRwTsName(isRoot)
-      n.isVariant = tsToName(isRoot)
-      return 0
-    }
-    n.isVariant = modTypeRenamed(n.isVariant)
-    return 0
+    return modRwIsType(ix)
   }
   if n is AsExpr {
     modRwExpr(n.asObj)
@@ -2748,11 +2761,22 @@ function modRwExpr(ix: i32): i32 {
   // A `match` (value- or statement-position; `modRwStmt` falls through to here). The merge
   // rename must descend into the scrutinee and EVERY arm body — else an imported / merged
   // name used in an arm (`match k { "a" => sink(1) }`) keeps its bare spelling and resolves
-  // to nothing after the export's rename. Patterns are string literals / the `_` wildcard
-  // (no renamable identifier), so they are left alone. A body may be a block (its own scope)
-  // or a bare expression — `modRwStmt` dispatches both.
+  // to nothing after the export's rename. A body may be a block (its own scope) or a bare
+  // expression — `modRwStmt` dispatches both.
+  //
+  // PATTERNS: a string literal / the `_` wildcard hold no renamable identifier, but a TYPE
+  // pattern is an `IsExpr` whose check type IS renamable (`match u { Shape => … }` over an
+  // imported `Shape`), and its OBJECT is the scrutinee node this arm already rewrote — so the
+  // patterns take `modRwIsType`, the check-type half of the `IsExpr` arm above, and NOT
+  // `modRwExpr`, which would walk the shared scrutinee once more per arm and rename it n+1
+  // times over (`x` → `x$m0` → `x$m0$m0`).
   if n is MatchExpr {
     modRwExpr(n.matchScrut)
+    let p = 0
+    while p < n.matchPats.length {
+      modRwIsType(n.matchPats[p])
+      p = p + 1
+    }
     let i = 0
     while i < n.matchBodies.length {
       modRwStmt(n.matchBodies[i])

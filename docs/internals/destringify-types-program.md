@@ -8247,3 +8247,15 @@ Two findings:
     stash commit) and verified by rebuilding to a byte-identical artifact. Keep a copy of the
     good file beside the sabotage script and restore with `cp`; commit before the first
     sabotage.
+70. **A new LANGUAGE surface is where the destringified channels get paid back** (B21 phase 2a,
+    `match` over value unions — not a destringify slice, logged here because it is a consumer).
+    The feature needed a type in arm position. The pre-program way to build it was a new
+    string channel (a pattern spelling on the `MatchExpr`, re-split downstream); what it
+    actually cost was `mkIsExpr(scrut, ty, pos) + setAnnTs(...)` in the parser — the D-PARSETY P2
+    node — after which the module merge renamed it (P2's own arm), lint's flat scan found it,
+    `nameToTy`/`sameVariantTy` decided membership from the ARENA, and the emitter read the
+    banked `isVarTyIxOf` (D-ATOMKIND's ABI). **Zero new type-string parsing, zero emitter
+    change, corpus byte-identical.** The measurable form: when a feature can be built by
+    MINTING AN EXISTING NODE rather than by adding a channel, the program's terminal condition
+    is holding for that shape. The one place a spelling was still needed — rendering the pattern
+    back in `vl fmt` — is the node's own source SPAN, not a re-derivation.

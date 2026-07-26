@@ -57,6 +57,11 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   actually load-bearing enough to carry rep code first — `match` exhaustiveness (A-exhaust / B21) and
   literal-union ergonomics fully implemented and dogfood-tested; (2) migrate the kind ladders to a
   single `match` over a literal-union of kinds, opportunistically as the `repOf` rewrite touches each.
+  **Step (1) widened in B21 phase 2a**: exhaustiveness-checked `match` is no longer literal-union-only
+  — it covers struct / scalar / mixed / `| null` unions too, so a ladder keyed on a VALUE union (the
+  `Ty` arena's own shape) gets the same missing-arm compile error a litunion ladder does. The one
+  union kind still outside it is a union with LITERAL members (`0 | 1 | 2`): an arm's test would be
+  `n is 0`, which does not lower — see B21 below.
   Deliberately NOT building new enum/ADT machinery yet — only if adopting today's `match`+union
   surface proves insufficient. Related: carry structured `Ty` through codegen instead of
   round-tripping through emit-name strings (the `tyToEmitName` `K0→string` softening caused an
@@ -473,12 +478,32 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 - ⬜ **B20. Loops as expressions + `break <value>`.** Lift `for`/`while` into expression position;
   a loop evaluates to its `break` value or `null`. Three layers: grammar → types (mirror the
   `returnTypes` mechanism) → codegen (`__brk` block gets a result type).
-- ⬜ **B21. `match` over tagged unions (payload binding).** Phase 1 (literal-union `match`,
-  exhaustiveness-by-default — a missing arm is a hard error, à la Rust/Swift) has shipped
-  (→ `CHANGELOG.md`; `tests/cases/match/*`). REMAINING: arms that discriminate on a tagged union's
-  TYPE (not just a string-literal member) and bind the matched arm's payload/fields — extending
-  compiler-enforced completeness from literal discrimination to structural/tagged-union
-  discrimination, complementing the if-chain coverage check (A-exhaust).
+- 🟡 **B21. `match` over tagged unions (payload binding).** Phase 1 (literal-union `match`,
+  exhaustiveness-by-default — a missing arm is a hard error, à la Rust/Swift) and **phase 2a
+  (VALUE-union scrutinees)** have shipped (→ `CHANGELOG.md`; `tests/cases/match/*`). Phase 2a is the
+  discrimination half: an arm pattern is a member TYPE (`C =>`, `i32 =>`, `null =>`, `A | B =>`),
+  parsed into a real `IsExpr` over the scrutinee, so compiler-enforced completeness now covers
+  structural/tagged-union discrimination — the complement to the if-chain coverage check
+  (A-exhaust), which cannot demand completeness at all. Every arm binds the narrowed member.
+  REMAINING:
+  1. **Payload/field BINDING** — `Move{x, y} => x + y`, binding an arm-local name per field rather
+     than re-reading through the narrowed scrutinee. The desugar is the extension point: an arm is
+     already `if scrut is Move { <body> }`, so a binding arm prepends `const x = scrut.x` statements
+     to that block. Nothing about the chain, the narrowing or the emitter has to change.
+  2. **Unions with LITERAL members** (`0 | 1 | 2`, `"x" | 7`) — refused at the type tier today
+     (`match over a union with literal members is not supported`) because an arm's test would be
+     `n is 0`, which the emitter has no rep for (`literal \`is\` over a struct union is not
+     supported`, on master too). Two ways out: teach the emitter the literal `is`, or route a
+     homogeneous numeric-literal union through phase 1's `==` arm path (its members already
+     canon-collapse to the base scalar).
+  3. **A `_` written before other arms is silently REORDERED to last** (phase 1 behaviour, unchanged:
+     `desugarMatchAt` makes the wildcard the bare `else` wherever it sits, so `match k { _ => a,
+     "x" => b }` runs `b` for `"x"`). First-match-wins says `a`. Either honour source order or
+     reject a non-final `_`.
+  4. **An OR-arm's residual is a pre-existing emitter gap**, not a match one: `A | B => …` lowers to
+     `(u is A) || (u is B)`, and reading a field on the complement in a LATER arm hits
+     `emitProgram: field access but no struct type declared` — reproducible on master from the
+     hand-written `if u is A || u is B { … } else { u.c }`.
 - 🟡 **B-debug. Source maps + trap diagnostics follow-ups.** REMAINING: (1) **full source-mapped
   stack traces** — map every wasm frame in the trap's stack → VL `function (file:L:C)`, not just
   the top frame; (2) **value-rich panic messages** — a host `panic(msg)` abort path that formats
