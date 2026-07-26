@@ -498,6 +498,7 @@ import {
   refPushScratchBaseFor,
   removeAtomFromSet,
   restoreNarrow,
+  retMapFlag,
   retNulMapFlag,
   retNulRefArrFlag,
   retNulRefFlag,
@@ -10080,6 +10081,12 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   // is the map SHAPE (for the null heap + a `return Map()`).
   let retNulMap = false
   let retNulMapShape = -1
+  // A NON-NULL map return (`{[string]: V}`, kind 6): a `return Map()` must `struct.new` THIS
+  // value type's `$mapStruct`, not the shared mono one — `retMapShape` carries the annotation's
+  // map SHAPE for the constructor, the bare-map twin of `retNulMapShape`. (`return m` passes an
+  // already-built map ref and needs no seed, which is why only the DIRECT constructor is at risk.)
+  let retMap = false
+  let retMapShape = -1
   let retNulSLKind: VKind | null = null
   let retLitUnion = false
   let retNulLitUnion = false
@@ -10160,6 +10167,10 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
       retNulMap = true
       retNulMapShape = mapAnnShape(fn.fnRet)
     }
+    if retMapFlag(fn.fnRet) == 1 {
+      retMap = true
+      retMapShape = mapAnnShape(fn.fnRet)
+    }
     retNulSLKind = nulScalarListKindOfNode(fn.fnRet)
     if nodeTyIsLitUnionAlias(fn.fnRet) { retLitUnion = true }
     // A `K | null` NICHE return: a `return null` lowers as the i32 sentinel `-1`, a `return "a"`
@@ -10226,6 +10237,12 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
       retCtx.nulRefHeap = mapTypeIdxOf(retNulMapShape)
       retCtx.mapSlot = retNulMapShape
     }
+    // A bare MAP return: a `return Map()` builds THIS map's `$mapStruct` (`mapSlot`), the
+    // same seed the `let`/global/field constructor sites thread. Without it the constructor
+    // read the ambient `pendingMapSlot` (-1 — the mono i32 map) while the functype result is
+    // the value-typed map struct: INVALID-WASM inside the returning function itself, for
+    // EVERY non-mono value type (`string`, `f64`, a struct, a union, a list, a nested map).
+    if retMap { retCtx.mapSlot = retMapShape }
     // A DISTINCT-backing nullable scalar list return: a `return [x]` builds the leaf list
     // (`listKind`, which subtypes the nullable result), a `return null` is `ref.null $wrapper`.
     if retNulSLKind != null {
