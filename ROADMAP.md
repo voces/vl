@@ -37,7 +37,132 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 
 ## Next (highest leverage)
 
-> **#1 priority — drive the rep-composition fuzz baseline to 0** (`scripts/rep-fuzz-baseline.txt`;
+> **#1 priority — destringify types (`docs/internals/destringify-types-program.md`).** The 2026-07-25
+> discovery census measured **2,414 type-string operations** still live — *under its own vocabulary*:
+> 222 discovered resolvers + any character-literal comparison + whole-spelling structure equality
+> (1,435 resolver calls · 931 inline surgery · 48 whole-spelling), **703 of them distinct consumer
+> decisions**. Quote that number *with* its denominator or not at all — the old SCORECARD list covered
+> 38% of one column and 0% of another, which is why every prior "we're done" verdict was premature.
+> The single highest-value target: **`nameToTy` is the checker's SECOND recursive-descent type parser**
+> (~150 ops), and its bank is already shipped and proven — #1117's spelling tree probed at **0
+> disagreement over 319,945 comparisons** — and still **completely unread** (`typecheck.vl` does not
+> contain the string `annTs`). #1129 measured away the prerequisite that was thought to gate it: the
+> canon pass runs at the *end* of `checkProgram`, so it cannot reach a checker-time resolution
+> (333,073 reads · 0 stale · 0 missing). `tsToTy` is the whole remaining cost.
+
+### Consumer-driven requirements — webcraft (`docs/webcraft-requirements.md`)
+
+The first real downstream consumer, currently TS with a planned VL rewrite, has published a tiered
+ask keyed to **our own item IDs** (A14, A16, B6a, B15a, B-mem, B-hint). Its tiers are adopted as-is
+rather than re-derived. The forcing date is **M7** (the port begins); M2–M6 gate on nothing from us.
+
+**P0 — gates the port STARTING. The `Buffer` linear-memory tier (our B-mem, "one deliberate escape
+hatch").** All four are prerequisites for each other in practice:
+- ⬜ **P0.1 `Buffer` alloc + the full load/store width matrix** — `Buffer(n)`, `.length`, and
+  u8/i8/u16/i16/i32/i64/f32/f64 both directions (today: 4 store widths, 1 load width). Needs a real
+  allocator (bump is fine — the sim allocates a few large Buffers at init and never frees), replacing
+  today's "program picks raw addresses, two users collide" scratch page. **`Buffer.copy` / `buf.fill`
+  lowering to `memory.copy`/`memory.fill` are load-bearing, not conveniences** — snapshot and rollback
+  *are* those ops; without them a snapshot is a per-word loop.
+- ⬜ **P0.2 Exported memory** — export the module's linear memory (`--export-memory`, or automatic
+  when `Buffer` is used). Replaces the per-scalar host-call ABI for bulk data; the host overlays
+  `Float32Array`/`DataView` in place. Nothing else in the export contract changes.
+- ⬜ **P0.3 Reinterpret casts** — `f32bits`/`f32fromBits`/`f64bits`/`f64fromBits`. **One opcode each,
+  currently absent entirely**, and everything determinism-critical routes through them (float-state
+  hashing, NaN canonicalization, WC3-matched transcendentals). Cheapest P0 item by a wide margin.
+- ⬜ **P0.4 Float/int opcode intrinsics** — f32/f64 `sqrt abs floor ceil trunc nearest min max
+  copysign`; i32/i64 `clz ctz popcnt rotl rotr` + unsigned `divU remU ltU leU gtU geU`.
+  **Explicitly the *entire* math library they want from us** — `sin/cos/pow/exp` are a deliberate
+  non-ask (a std `sin` would be a determinism trap). Unsigned ops matter for hashing/RNG/fourCC;
+  i64-widening emulation works but poisons hot loops.
+
+**P1 — gates the port being GOOD.**
+- ⬜ **P1.1 Typed views over Buffer** (`buf.f32view(off, count)`, `x[i]`, `.length`) — the kernel is
+  structure-of-arrays; this is "the thing most worth absorbing into the language".
+- ⬜ **P1.2 `flat` record layouts (AoS)** — declared field order = layout, fixed sizes, no reordering,
+  scalars and nested `flat` only; `buf.rows<T>(off, count)`. The C-struct tier **WasmGC structurally
+  cannot provide**. Forcing customer is a Lua 5.3 VM needing bit-exact `pairs()` order. Ships after
+  P1.1; only the Lua port is blocked on it.
+- ⬜ **P1.3 Optimization defaults** — Heap2Local in the blessed pipeline + a documented release
+  profile (`--closed-world -O3 --gufa`). Our union boxes and `{backing,len,cap}` wrappers **must melt**
+  in per-tick scratch code or alloc-free-steady-state becomes "avoid half the language".
+- ⬜ **P1.4 Bounds-check ergonomics** — not asking for unsafe access; asking that the canonical
+  view loop either hoists the bound or relies on the memory trap, **and that this is stated** so
+  kernel code can be written to the fast pattern deliberately.
+- ⬜ **P1.5 Nominal/opaque types (= our A14)** — `EntityId`/`PlayerSlot`/`AbilityHandle` are all i32
+  and interchange silently today. Zero-cost newtype. Cheap, high-value for engine code.
+- ⬜ **P1.6 `vl test`** — already designed and already slated (see Track H); webcraft needs it to
+  *exist* by M7 for thousands of table-driven cases. **See the promotion note below.**
+
+**P2 — wanted, not gating:** i32-keyed Map/Set + `for k in map` (B6a); contextual f32 literals (sim
+code is f32-saturated and today every constant needs a cast); **`match` phase 2 — variant payload
+binding** (`match cmd { Move{x,y} => … }`); literal-union compact representation (A16); readonly
+fields / A9 variance; default params (B15a); SIMD over Buffer (unlocked by P0, not requested yet);
+keep emitting a names section on non-`-O` builds.
+
+**Non-asks, deliberate — do not build these for them:** exceptions/async (our `T|E` + trap model is
+*preferred*), separate compilation / wasm linking, UTF-8 strings (B7), WASI, a std math/trig library,
+in-language GC knobs.
+
+- ⬜ **PROMOTE `vl test` ahead of the std expansion.** (Owner's ordering: *"before we expand the std
+  library, I'd prefer we get our own test runner and assertion library"*.) It is **already designed** —
+  `docs/internals/test-runner-design.md` — and the design **already encodes the owner's "as much code
+  as possible in VL, Rust is a thin wrapper" direction**: *"the brain is VL; Rust is the mechanism
+  pump"*, *"runner logic in VL wherever possible, not Rust"*. `std:test/runner` is **a VL program**
+  owning all POLICY (argv interpretation, the directory WALK + glob/filter, the plan, `.only`/skip,
+  report formatting, the exit code); the host owns only mechanism the wasm capability model cannot
+  express, as RAW primitives never policy — `listDir`, `readFile`, thread pool, instance lifecycle,
+  capture buffers, trap catching, timeouts.
+  **Browser execution falls out for free**, which is the property to protect: the two sides talk
+  through a **command-queue protocol** (host pumps `rnNextCmd()`, executes, commits back) and
+  **the linker stays EMPTY — no host-function imports at all**. So a browser driver is the same loop
+  in JS with nothing to shim, and the VL brain survives the H-M2 Rust-host teardown unchanged.
+  Two things to settle, both real:
+  1. **Sequencing.** The charter says "v1 lands with std-design slice 4"; the owner's ordering
+     (*test runner before std expansion*) inverts that. Either pull `std:testing` out of slice 4 as its
+     own unit, or move slice 4 first.
+  2. **The genuine gate is the failable-IO story, not the ABI.** The VL-side walk consumes fs
+     primitives, so `std:fs` must exist, and `std:fs` is **gated on `docs/error-handling-design.md`
+     (`T | E` with a structural `IoError = { code, msg }`) which is DRAFTED, PENDING OWNER REVIEW**.
+     That review is the critical-path item. Note also `std-design.md` files `std:fs`/`std:args`/`std:io`
+     as "WASI-era additions" — reconcile with (a) browser execution and (b) webcraft's explicit WASI
+     non-ask: the primitive set should be host-neutral (`listDir` is deliberately shaped as
+     `fd_readdir` so the VL walk survives a WASI transition with only the transport changing).
+  Motivation is independently strong: **all 38 test files are TypeScript/Deno today**, so the language
+  cannot test itself and Track J has no on-ramp. The runner is also *"the first nontrivial VL program
+  (not compiler module) in the tree"* — demand-driven dogfooding.
+
+- ⬜ **Host ABI for VL scripts (dogfooding).** *Not* a test-runner blocker (above) — this is about the
+  12 shell scripts. VL programs today can **compute and print, nothing else**: the entire import
+  surface is seven print builtins, so `scripts/fuzzgen.vl` writes to stdout and the shell splits it,
+  and `fuzz-vl.sh` passes parameters by **sed-rewriting the VL source before compiling it**
+  (`s/^let RICHVALUES = .*/let RICHVALUES = $VALUES/` — rename that `let` and the flag silently stops
+  working). Value order: **(1) `argv`** (kills the sed-patching); **(2) file read/write**;
+  **(3) directory listing**; **(4) process spawn + exit code + captured stdout/stderr** — which is what
+  unlocks the orchestrators, since `refresh-compiler.sh` / `rep-fuzz-check.sh` / `native-fixpoint.sh`
+  exist to run the compiler and compare; **(5) `env` + `exit`**.
+  **Cost to name up front: every new import must land in THREE hosts** — `scripts/vl-host/src/main.rs`,
+  `tests/support/runWasm.ts`, `scripts/wasmtime-host.rs` — plus the declaration in `compiler/wasmEmit.vl`.
+  Miss one and a script runs under the CLI and fails under `deno task test`. Keep the ABI tiny, land it
+  as one batch. These are the same syscalls a `vl` CLI written in VL needs, so it is step 1 of Track H.
+
+- ⬜ **`match` over ALL unions, not just literal unions.** Verified at `cd69bd9`: a litunion scrutinee
+  works, and both other union kinds are rejected by the checker —
+  `match scrutinee must be a literal union, got {c: i32} | {d: i32}` and `…got i32 | string`. The
+  workaround is an `is`-chain, which works but is not exhaustiveness-checked — so the one property that
+  makes `match` worth adopting in the compiler's own kind ladders (a missing arm is a *compile* error,
+  not a runtime "no interned slot") is exactly the property unavailable on the unions the compiler
+  actually uses. This is the load-bearing dependency under the kind-numbering collapse below, which
+  currently reads "make sure that surface is actually load-bearing enough to carry rep code first" —
+  **it is not, yet, and this is why.** Needs: scrutinee admission for struct/scalar/mixed unions in
+  `typecheck.vl`, arm patterns that bind the narrowed type (reusing the `is` narrowing machinery), a
+  tag-switch lowering (the union box already carries a tag — `is` chains re-test it linearly), and
+  exhaustiveness over the member set (which is now a real data structure, `unMemTys`/`unMemberSet`).
+  **Distinct from webcraft's P2 "match phase 2" (variant payload binding, `Move{x,y} => …`)** — that
+  extends the *arm*, this extends the *scrutinee* — but they share the narrowing and lowering work, so
+  do them adjacently and let phase 2 ride the tag-switch this lands.
+
+> **#2 priority — drive the rep-composition fuzz baseline to 0** (`scripts/rep-fuzz-baseline.txt`;
 > item 2 below). Every remaining entry is a fail-loud REJECT — a coverage gap the compiler refuses
 > cleanly, never a miscompile — so this is *finishing the implementation of the language surface we
 > already accept*, not new features. As of 2026-07-19 it is **17** (from 199 earlier the same day;
