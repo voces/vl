@@ -16810,3 +16810,357 @@ channel generates. **PUBLISHED BLIND SPOT, not a clean bill of health.**
    shape, union arm, intersection) rather than hand-building shapes: **hand-built shapes compared
    candidate-vs-merged are how the original attribution went wrong, and a control that must pass is
    the whole difference.**
+## D-NULLITHOME + D-ARRGROUP — a literal-union alias that carries its own `| null` was FOUR deciders' blind spot and invalid wasm at every construction site; and the brief's OTHER miscompile is not about closures or nullability at all
+
+**Base re-measured, not inherited — TWICE.** Branched from `1c8d911`, where `parsercount.py`
+reproduces the brief's **CORE 325 · OFF-LIST 34 · TRUE 359** exactly. One correction to the hand-off
+in passing: the brief says `typecheck.vl` is "47 (20 core + 27 off-list)"; the counter says **47 =
+19 core + 28 off-list**, which is also what #1153's own table records. Same total, different split.
+
+**#1155 and #1156 landed mid-slice.** Rebased onto `b7cc723` and **re-measured everything there**,
+with the master baseline compiler rebuilt at that head in the same session: master is **CORE 317 ·
+OFF-LIST 31 · TRUE 348**, this slice **316 · 30 · 346** — the same −2, because neither intervening PR
+touches `typecheck.vl` (still 47 = 19 + 28 on master at `b7cc723`). **The 29-cell grade is
+identical on both masters, cell for cell** (13 ok · 15 invalid-wasm · 1 reject), so the miscompile is
+unmoved by them. Every gate leg below was re-run at `b7cc723`.
+
+| | master `1c8d911` | master `b7cc723` | shipped (on `b7cc723`) |
+|---|---|---|---|
+| CORE | 325 | 317 | **316** |
+| OFF-LIST | 34 | 31 | **30** |
+| TRUE TOTAL | 359 | 348 | **346** |
+| `typecheck.vl` | 47 (19 + 28) | 47 (19 + 28) | **46 (19 + 27)** |
+| `wasmEmit.vl` | 6 | 6 | **5** |
+| hand-written type-name walks (#1153's unit: one FUNCTION with its own char loop over a type NAME tracking grouper depth or scanning for a top-level separator, excluding the designated homes; `parser`/`lexer`/`format`/`fmt_util`/`driver` excluded by file) | — | — | **unchanged** — this slice retires a 4-line RULE, not a char loop |
+| graded miscompile cells fixed | — | — | **9 of 15**, all to the CORRECT value |
+
+---
+
+### TARGET 1(B) — the nullable-literal-union ALIAS. Reproduced, re-derived, and FOUR homes deep
+
+The witness from the brief reproduces at `1c8d911` exactly as filed:
+
+```vl
+type K = "ab" | "zz" | null
+const v: K = "ab"
+if v != null { print(v) }        // → failed to compile: wasm[0]::function[4]
+```
+
+**MECHANISM, re-read from the emitted bytes.** Global 1 is `(mut (ref 0))` where type 0 is
+`(struct (field i32) (field anyref))` — the union BOX — initialised `i32.const 2 / global.get 0 /
+struct.new 0` (tag 2 = string, payload the `"ab"` array). The guard is `struct.get 0 0 /
+i32.const 6 / i32.ne`, a tag compare against the null tag. Inside the guard: `global.get 1 /
+call 0`, i.e. a `(ref $box)` straight into `__print_i32__`. The inline control is
+`(global (mut i32))` with `i32.const -1 / i32.ne` — the ATOM NICHE. So the CELL is a box and the
+READ is an atom, and they disagree because the cell is chosen from a NAME and the read from the
+ARENA.
+
+**WHY: the arena shape, which is the part #1153's filing did not have.** `type K = "ab" | "zz" |
+null` interns as an EXPANDED `TyUnion` — a `null` member plus all-quoted literal members — NOT as
+a `TyNullable` over a litunion. `typecheck.vl` has always had a predicate that handles **both**
+forms, `tyIsNullableLitUnion`. It also had **four private copies of the question that handle only
+the `TyNullable` form**:
+
+| # | decider | file | what it decided wrongly |
+|---|---|---|---|
+| 1 | `nodeTyIsNulLitUnion` | `typecheck.vl` | the per-NODE niche test — a private body 500 lines above the ONE HOME |
+| 2 | `repOfTyFlat`'s `TyUnion` arm | `emit_rep.vl` | fell through to `tyIsValueUnionBox` → `"union"` |
+| 3 | `rtOfUnion` (the rep TREE) | `emit_rep.vl` | built a `box` node — and the TREE is **authoritative over the flat kind** at `repOfTy` |
+| 4a | `emitLetDecl`'s `letUNm` gate | `wasmEmit.vl` | `nameIsLitUnionType(letAnnNm)` — a NAME test; a bare alias name has no members to scan |
+| 4b | `emitReturnValue`'s `retUNm` gate | `wasmEmit.vl` | same shape, same miss |
+
+**A HEADER COMMENT IS NOT EVIDENCE, again.** `nodeTyIsNulLitUnion`'s own header said *"Matches
+`nameIsNulLitUnion` … so BOTH inline and aliased forms classify here."* Only the body disagreed.
+
+**#3 is the one that would have burned another slice.** Fixing the flat arm (#2) alone changed
+**nothing at the param and return boundaries**, because `repOfTy` computes the flat descriptor,
+and then — wherever the flat side claims coverage — REPLACES its kind with the tree's projection.
+A probe build (`vtKindOfParam` printing `nodeTyIxOf` / `annRepKindOf` / the arm verdicts through
+the 60-line Deno probe host) settled it in one run: the annotation node **is** covered
+(`nodeTyIxOf` = 20, `annRepKindOf` non-null), so the ladder's own arena arm was never reached and
+the tree's `box` was the answer. *Where a seam has an authority, patch the authority.*
+
+### The space, enumerated and GRADED — 29 cells with expected stdout, not a sample
+
+Every cell carries `// EXPECT: <stdout>`, so each is graded ok / WRONG / reject / invalid-wasm /
+trap rather than pass/fail. 15 controls, 14 alias cells over 6 construction sites.
+
+| | master `1c8d911` | shipped |
+|---|---|---|
+| ok | 13 | **22** |
+| invalid-wasm | 15 | **6** |
+| reject | 1 | 1 |
+| **WRONG (silent)** | **0** | **0** |
+
+Every one of the 9 fixed cells prints the value its own control prints. **No cell moved from
+invalid-wasm to WRONG** — which is the specific failure the brief warned about, and the reason
+#1153's `canonEmitName` candidate was not shipped. Fixed: global (×3: `const`, `let`, `= null`),
+local (×2), param (×2: member and `null`), return-with-annotated-binding (×2).
+
+**The 6 that remain, each still LOUD, with the exact residual named** (all in files this partition
+does not own — filed below): struct FIELD ×3 (`fieldCodeOfSpelling`'s code-30 arm is
+`nameIsNulLitUnion(t)`, a name test; `isUName("K")` then claims code 16, the box), un-annotated
+return binding ×2 (`globalCellKind`'s no-annotation `letIsUnion` arm claims `"union"` — the
+CALLEE is now correct, `i32.const 0 / return`, and only the receiving cell is wrong), array
+element ×1.
+
+### D-ARRGROUP — the array-element grouping rule had three copies; two of them are the same four lines
+
+#1153's hand-off item 5 pointed at `tyToEmitNameGo:6177` and `tyToNominalName:6409` — *"the SAME
+four lines twice … both end in `if nameHasPipe(el) { return "(" + el + ")[]" }`, i.e. the renderer
+parsing its own output"* — and analysed two duals, each with a stated hazard, only one of which
+covers `tyToNominalName` (which has no `emitNameAtoms` bank). **Both hazards are real and neither
+is resolved here.** What IS provable today is the merge: the two copies become one home,
+`arrElemRender(el, elTy)`. That is worth −1 OFF-LIST (`nameHasPipe` 5 sites → 4) and it leaves
+**one** site to convert instead of two, so when a dual is finally chosen it is a one-line change
+inside a single function. Corpus **byte-identical** across the merge (B7→B8: 0 of 1341 differing,
+byte channel 0) — a pure dedup, which is the strongest evidence available for one.
+
+### The other conversion this slice makes, and its arithmetic
+
+`emitLetDecl`'s litunion exclusion was `!nameIsLitUnionType(letAnnNm)` — a CORE-list parse of the
+RENDER — while the RETURN boundary asked the arena (`nodeTyIsLitUnionAlias`). Two spellings of one
+question at the two ends of the same value. The let side now asks the arena too: **−1 CORE**, and
+corpus 0 of 1341 differing across that change alone (B6→B7).
+
+---
+
+### Gate — every RC checked EXPLICITLY, at `b7cc723`, master baseline rebuilt at that head in this session
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh --prove-fixpoint` | ✅ one-compile rung |
+| `native-fixpoint.sh` | ✅ stage3 == stage4 byte-for-byte, 1,024,266 B (master `b7cc723`: 1,024,084 B — **+182 B**) |
+| `lint-self.sh` | ✅ self-lint + fmt-check clean (a first pass flagged one now-unused local — fixed, not suppressed) |
+| `deno task test` | ✅ **1460 passed · 0 failed · 610 ignored**; master at the same head, same session, **with my fixture parked** (it correctly fails there — `call[0] expected type i32, found local.get of type (ref 0)`): **1459 · 0 · 610**. The +1 is my fixture |
+| ignored-test NAME SET | ✅ **identical**, 610 = 610, `diff` empty — nothing that RAN stopped running |
+| corpus A/B vs master | **1 of 1342 differing — named: `tests/cases/literal-unions/nullable-litunion-alias-sites.vl`** (invalid-wasm → `ab zz 1 ab zz`). Channels populated on side A: 1,139 files produce wasm / 1,135 distinct SHAs · 203 messages / 201 distinct · 1,098 stdouts / 937 distinct |
+| lint-tier A/B | ✅ **IDENTICAL** over 400 corpus files; 299 diagnostic lines, 290 distinct |
+| fuzz A/B | ✅ **0 differing paths over 38,400 programs** (16 generator runs: 4 seeds × {plain, `--declared`, `--branching --multiobs`, `--values --declared`}); 40,184 outputs/side, 1,784 `.err`/side, 7,602 distinct `.out` |
+| `rep-fuzz-check.sh` | ✅ exact (1 baselined, 0 unsound, 0 new, 0 stale) |
+| invocation counts, both sides | below |
+
+*(The same nine legs were run in full at the pre-rebase base `1c8d911` too — corpus 1 of 1341, fuzz
+0 of 38,400, suite 1459/1458, lint-tier identical. Both sets agree; the tables below quote the
+`1c8d911` run where a figure was measured only there, and say so.)*
+
+### COMPARATOR PROVED, in ONE session, through BOTH A/B harnesses
+
+Note 12's rule. `SABC` makes the ONE HOME answer YES for every multi-member union:
+
+| channel | candidate | SABC |
+|---|---|---|
+| corpus | 1 of 1341 | **303 of 1341** (byte 303 · message 209 · stdout 278 · rc 284) |
+| fuzz (same 38,400 programs) | 0 paths | **9,065 differing paths** |
+
+Both instruments demonstrably fire. A 0 from either now means something.
+
+### Entombment — seven sabotages, applied to the SHIPPED source, and ONE of them is a finding
+
+| sab | hunk | fire |
+|---|---|---|
+| **S1** | `nodeTyIsNulLitUnion`'s expanded-union arm | fixture → `emit error: bare null needs a struct-typed context` |
+| **S2** | `repOfTyFlat`'s new arm | **INERT in production** — see below |
+| **S3** | `rtOfUnion`'s new arm | fixture → invalid wasm at `takesK` |
+| **S4** | `emitLetDecl`'s niche exclusion | fixture → invalid wasm at `localForm` |
+| **S5** | `emitReturnValue`'s niche exclusion | fixture → invalid wasm at `makesK` |
+| **S6** | `arrElemRender`'s union arm | **44** pre-existing corpus files |
+| **S7** | `arrElemRender`'s function arm | **11** pre-existing corpus files |
+
+**S2 IS INERT ON EVERY PRODUCTION CHANNEL AND STILL NOT DEAD CODE.** Removing the flat arm changes
+0 of the 29 graded cells and passes the fixture: `repOfTy` returns the flat descriptor only when
+`rdCovered == 0`, and without the new arm the expanded union is still COVERED — by
+`tyIsValueUnionBox` → `"union"` — after which the tree overwrites the kind anyway. So the
+production answer is identical **by construction**, not merely measured at 0. But the file's own
+design says *"the flat facts remain as the debug-mode CROSS-CHECK: under `$VL_REP_SHADOW` the
+post-emit sweep asserts the FLAT answer against the tree's"* — and it is observable there:
+
+```
+$ VL_REP_SHADOW=1 vl build …/nullable-litunion-alias-sites.vl --compiler SAB_S2.wasm
+rep-shadow[…]: DISAGREE kind ty@20 (@21|@22|null): flat=union tree=nul/i
+$ VL_REP_SHADOW=1 vl build …                          --compiler <shipped>
+(no DISAGREE line)
+```
+
+So the flat arm is pinned, on a channel no default gate leg runs. Recorded as such rather than
+either deleting a hunk that upholds a stated invariant or pretending it carries the fix.
+
+### THE WORK COUNT, on both sides — and it caught BOTH a harness bug and a real regression
+
+Gate item 9. One instrumentation script applied to master and candidate alike, driven over the
+1,313-case corpus through the probe host; the counters are module globals in a SHARED instance, so
+each report is CUMULATIVE and the total is the FINAL triple.
+
+**HARNESS BUG, caught by implausible magnitude.** The first summariser SUMMED the per-program
+triples — a triangular sum over 1,112 reports — and printed 19,377,047 entries for a predicate
+whose neighbours in this doc's tables run to hundreds of thousands. The true figure is **24,663**,
+three orders of magnitude smaller. The corrected script asserts cumulative monotonicity on both
+sides so the shape of the data is checked, not assumed.
+
+**A REAL WORK REGRESSION, caught and fixed before shipping.** The obvious body for
+`nodeTyIsNulLitUnion` is the one-line delegation `tyIsNullableLitUnion(nodeTyIxOf(ix))`. It is
+correct, and it **discards the retiring copy's cheap reject** (#1138's rule): master settled every
+non-nullable, non-union node in place, and the delegation makes each one pay a call to re-derive
+the same reject.
+
+| counter (1,112 corpus programs reaching the report) | master | one-line delegation | SHIPPED | Δ shipped |
+|---|---|---|---|---|
+| `tyIsNullableLitUnion` entries | 24,663 | 55,892 (**+126.6%**) | **39,672** | +15,009 (+60.9%) |
+| `nodeTyIsNulLitUnion` entries | 21,659 | 22,120 | **22,120** | +461 (+2.1%) |
+| member-loop steps inside the home | 5,399 | 19,625 | **19,625** | +14,226 (+263%) |
+
+The shipped body keeps a variant dispatch in front and delegates from both live arms, so the
+grammar still has ONE home. **Every identity is exact:** delegation 55,892 − shipped 39,672 =
+**16,220** = the calls the cheap reject removes; 22,120 − 16,220 = **5,900** = the calls that still
+delegate; 24,663 + 5,900 + 9,109 (`emit_rep`'s two new arms) = **39,672**. The member-loop column is
+identical on both candidate bodies, because the cheap reject only removes calls whose type could
+never have entered that loop — an internal consistency check that had to hold and does.
+
+**This slice is a net work ADDITION and says so:** ≈13.5 predicate entries and ≈12.8 member steps
+per program, the price of actually answering a question master answered wrongly-but-cheaply. The
+member loop rejects on its first non-conforming member, so the added scan averages ~0.6 steps per
+new call.
+
+**What this instrument does NOT cover, stated rather than omitted:** (a) the fuzz side — the
+counters were summed over the corpus only; (b) the extra `is` variant tests in the two `emit_rep`
+arms and the shipped dispatch, which are branch tests, not counted entries; (c) the emitted-bytes
+cost, which is separately visible: **+182 B** (1,026,831 → 1,027,013 at `1c8d911`; 1,024,084 →
+1,024,266 at `b7cc723` — the same +182 on both bases). The work table itself was measured at
+`1c8d911`; the counters instrument functions neither #1155 nor #1156 touches.
+
+---
+
+### REFUTATIONS — worth more than the agreements
+
+1. **"(A) is a nullable closure whose result is a union — 18 cells were run and each ingredient
+   proven necessary by a PASSING control."** **Refuted by the first control I tried.** Neither the
+   closure nor the nullability is an ingredient:
+   ```vl
+   const u: i32 | boolean = 7
+   if true { const r = u; if r is i32 { print(r) } }   // → invalid wasm. No closure. No null.
+   ```
+   The real condition is **a union-typed binding declared inside a top-level BLOCK**. The brief's
+   controls each moved the binding OUT of the block — to top level (where it becomes a wasm
+   GLOBAL) or into a function (where `parentLetOf` finds it) — so they changed two variables at
+   once. Enumerated with a passing FUNCTION-SCOPE control per row: **13 module-scope cells
+   invalid-wasm, 13 function-scope controls ok**, spanning 5 atom arms (i32/boolean/string/f64/i64),
+   6 read positions (print / arithmetic / comparison / rebind / call-arg / assign) and the
+   ref-array arm. `structs`, `plain`, `plainstr` pass on both sides and are the controls that must.
+2. **"The brief's (B) needs a `canonEmitName` arm, which is necessary but not sufficient and turns
+   the struct-field cell SILENT-WRONG."** The premise is that the fix must make the alias NAME
+   expand. It does not: the arena already knows, and four deciders were simply not asking it. The
+   shipped fix touches no renderer, converts **0 cells to silence**, and turns 9 into the correct
+   VALUE rather than into a clean reject as the `canonEmitName` candidate did.
+3. **`typecheck.vl` is "20 core + 27 off-list".** The counter says 19 + 28 at `1c8d911`, which is
+   also what #1153's table says. Same total.
+4. **The `emit_rep` FLAT arm carries the param/return fix.** It fixes 0 additional cells; the TREE
+   arm does. The flat layer decides COVERAGE, the tree decides the KIND — and at this seam the
+   type was already covered by the wrong arm.
+5. **`shapeFieldParse`-style "obvious residual" reasoning, one layer up.** Fixing
+   `nodeTyIsNulLitUnion` alone (the predicate whose name matches the symptom) fixes the 3 GLOBAL
+   cells and none of the other 12. Four homes, measured one build at a time.
+6. **My own first work measurement.** 19.4M entries was a triangular sum. Corrected in place,
+   and the corrected script now checks monotonicity so the same class of bug cannot pass silently.
+
+---
+
+### Hand-offs, best-measured first
+
+1. **🐛 THE MODULE-SCOPE BLOCK BINDING — a live invalid-wasm miscompile, exact diff, corpus-clean,
+   13 graded cells.** `unionNameOfIdent`'s module leg resolves a binding only through
+   `globalLetOf`, which is the wasm-GLOBAL name table; a `const` inside a top-level `if`/`while`
+   body is a START-FUNCTION LOCAL, so it resolves to "" and every union classifier declines. The
+   two typed-IR nets that already patch this exact shape twice (`identChainTyBoxedUnion`,
+   `identChainTyMapArmUnion`) both begin `if depth <= 0 || fnIx < 0 { return false }`, i.e. they
+   are function-only and cannot cover module scope. **Measured: fixes 13 of 13 cells, every output
+   equal to its function-scope control's, corpus A/B 1,340 files 0 differing** (channels: 1,137
+   wasm / 1,133 SHAs, 203 messages, 1,097 stdouts). Owner: `emit_classify.vl`.
+   ```diff
+   @@ import block @@
+      slUsed,
+   +  startStmts,
+      uDeclared,
+   @@ export function unionNameOfIdent @@
+      const gi = globalLetOf(name)
+      if gi >= 0 { return letUnionNameOf(gi, -1) }
+   +  const bl = startBlockLetOf(name)
+   +  if bl >= 0 { return letUnionNameOf(bl, -1) }
+      ""
+    }
+   +
+   +// The `LetDecl` for a MODULE-scope binding declared inside a top-level BLOCK
+   +// (`if true { const r = g() }`), or -1. Such a binding is a START-FUNCTION LOCAL, not
+   +// a wasm global, so `globalLetOf` — which is the wasm-global name table — cannot see
+   +// it; `parentLetOf` finds the function-scope dual but is never reached at module scope
+   +// (`fnIx < 0`). Scans each top-level statement with the same walker.
+   +function startBlockLetOf(name: string) {
+   +  let si = 0
+   +  while si < startStmts.length {
+   +    const li = parentLetOf(startStmts[si], name)
+   +    if li >= 0 { return li }
+   +    si = si + 1
+   +  }
+   +  -1
+   +}
+   ```
+   Ship it with this fixture (verified: passes with the diff, `failed to compile:
+   wasm[0]::function[5]` without it):
+   ```vl
+   // @run
+   // @log 7
+   // CONTRACT: a union-typed binding declared inside a TOP-LEVEL BLOCK. It is a
+   // START-FUNCTION LOCAL, not a wasm global, so `unionNameOfIdent`'s module leg
+   // (`globalLetOf` — the wasm-global table) could not resolve it and the narrowed read
+   // skipped its unbox, handing the `(ref $box)` to `__print_i32__`. NB neither a closure
+   // nor a `| null` is involved; the same block inside a `function` has always worked.
+   function g(): i32 | boolean { return 7 }
+   if true {
+     const r = g()
+     if r is i32 { print(r) }
+   }
+   ```
+2. **The 6 residual nullable-litunion-alias cells, each with its named decider.** (a) struct FIELD
+   — `fieldCodeOfSpelling`'s `if nameIsNulLitUnion(t) { return 30 }` is a NAME test that a bare
+   alias cannot satisfy, and `isUName(t)` then returns 16; the arena dual `nodeTyIsNulLitUnion(tyIx)`
+   is already in scope at `fieldTypeCode`'s `TypeRef` arm. (b) un-annotated binding of a
+   `K`-returning call — `globalCellKind`'s no-annotation branch reaches `letIsUnion` → `"union"`;
+   it needs a `tyIsNullableLitUnion` arm on the init's arena type ahead of that. Both
+   `emit_classify.vl`. The CALLEE side is already fixed here, so (b) is a one-sided disagreement now.
+3. **`vtKindOfType`'s two arena arms are unreachable at any node the descriptor covers.**
+   `annRepKindOf` is consulted FIRST and returns non-null for every annotation node with a recorded
+   type, so `nodeTyIsLitUnionAlias` / `nodeTyIsNulLitUnion` in the ladder below fire only where the
+   descriptor declines. Verified by probe (`annRepKindOf` non-null, both arm verdicts true, neither
+   reached). Not a defect today — the descriptor agrees — but any future fix applied to those arms
+   will read as inert for this reason, and that is the third time this program has lost a build to
+   patching a shadowed layer.
+4. **The `arrElemRender` home is now ONE site, and the conversion is still open.** Both duals from
+   #1153's item 5 remain hazardous (the `emitNameAtoms` bank stops at a top-level `=>` where
+   `nameHasPipe` does not, and covers only one of the two callers; the structural `ae is TyUnion ||
+   ae is TyNullable` test is not a drop-in because `litUnionAliasNameOfTy` may have supplied a bare
+   ALIAS identifier and a ONE-member `TyUnion` renders without a pipe). The merge does not resolve
+   them — it makes resolving them a one-line change with two callers already served.
+5. **DECLINED WITH ARITHMETIC:** collapsing `nodeTyIsNulLitUnion` to the one-line delegation
+   `tyIsNullableLitUnion(nodeTyIxOf(ix))`. It is correct, it is prettier, and it costs **+31,229
+   predicate entries (+126.6%) instead of +15,009 (+60.9%)** on the corpus — 16,220 avoidable calls
+   — because it discards the retiring copy's cheap reject. Measured in two instrumented builds, not
+   argued.
+
+### Method notes earned
+
+91. **WHERE A SEAM HAS AN AUTHORITY, PATCH THE AUTHORITY** (D-NULLITHOME) — `repOfTy` computes the
+    flat answer and then, wherever the flat side claims coverage, REPLACES its kind with the rep
+    TREE's projection. A correct flat arm therefore fixed the global/local cells (which read the
+    descriptor's `rdNul`) and **zero** param/return cells (which read its kind). A layer that is
+    shadowed by a later authority absorbs fixes silently. Check which of the two a seam returns
+    before crediting a build.
+92. **A CUMULATIVE COUNTER IN A SHARED INSTANCE MUST NOT BE SUMMED** (D-NULLITHOME) — the probe
+    host drives ONE instance, so module-global counters accumulate and the per-program report is a
+    running total. Summing the reports is a triangular sum: it overstated one figure by 786×.
+    The total is the LAST report; assert monotonicity so the shape of the data is checked.
+93. **AN INERT HUNK MAY BE PINNED ON A CHANNEL NO GATE LEG RUNS** (D-NULLITHOME) — the flat rep arm
+    changes nothing observable in production *by construction*, and its removal is loud under
+    `$VL_REP_SHADOW`, which the nine-leg gate never sets. "Inert" is a statement about the channels
+    you ran; name them.
+94. **A CONTROL THAT MOVES TWO VARIABLES PROVES NOTHING** (D-NULLITHOME) — the brief's (A) had six
+    passing controls and each of them changed the binding's SCOPE as well as the ingredient under
+    test, so all six agreed on an explanation that a one-line cell refutes. Vary one thing.
