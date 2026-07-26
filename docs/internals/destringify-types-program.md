@@ -6022,3 +6022,22 @@ gaps by their non-generic controls.
     registration gap and the field-code gap look like one bug ("a generic application in an
     interior position doesn't resolve"). Adding an unrelated `const w: Box<i32>` to each program
     separates them in one measurement: the map value starts working, the struct field does not.
+
+### D-UNIONGEN addendum — the `is`-gate pin, and a composed program that still fails
+
+The `IsExpr` gate's guard is pinned as its own program
+(`union-member-generic-application-is-gate.vl`): a declared-union operand and a NULLABLE
+operand testing the SAME `is Box<i32>` in one module. An ungated rewrite compiles the first and
+breaks the second, and no other shape can tell them apart.
+
+One composed program still fails on BOTH sides, and the bisect is recorded so the next slice
+does not redo it. Take the mixed pin's five constructed unions (`UShape` / `UScalar` / `UNull` /
+`UTwo` / `UAlias`, each carrying a `{v:i32}` variant, each with its own `const` + narrowed read)
+and append the is-gate pin's two functions: master rejects at `viaUnion`'s `is`, this build
+rejects one line later at `viaNullable`'s (`narrowed receiver names no union variant`). Not a
+regression — the fix moves the failure, it does not create it.
+
+The bisect that narrows it: the same two functions beside ONE, TWO, … FIVE of those union
+DECLARATIONS all compile and run on this build (and all fail on master). So it is not the count
+of `{v:i32}` variant rows in `uVariants`, nor any single member kind — it is the composition
+with the CONSTRUCTED-and-narrowed globals. That is where to start.
