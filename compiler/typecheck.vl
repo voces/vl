@@ -13536,17 +13536,19 @@ function isObjShapeName(nm: string) {
   if nm.length < 2 { return false }
   if nm[0] != '{' || nm[nm.length - 1] != '}' { return false }
   // Reject a brace that is actually part of a larger composite (`{…} | {…}`, `{…}?`): a
-  // single shape has balanced braces only at the outer ends with no top-level `|`.
-  let depth = 0
-  let i = 0
-  while i < nm.length {
-    const c = nm[i]
-    if c == '{' { depth = depth + 1 }
-    else if c == '}' { depth = depth - 1 }
-    else if c == '|' && depth == 0 { return false }
-    i = i + 1
-  }
-  true
+  // single shape has no TOP-LEVEL `|`.
+  //
+  // This was the file's LAST hand-written type-name walk outside the two homes, and the
+  // narrowest of them: a BRACE-ONLY depth counter, blind to `[]`/`()`/`<>` and to quoted
+  // literal members. The brace-only reading is not merely a shorter spelling of the home's
+  // — it disagrees, and in the direction that loses a shape:
+  //   `{a:"}|{"}`  — the quoted `}` closed the brace early, the following `|` then read as
+  //   TOP-LEVEL, and a single object shape was rejected as a union.
+  // `tyTopIndexOf` skips a quoted member whole (escape-aware) and counts every grouper, so
+  // both spellings of that answer come from one place. Nothing else here changes: a `|`
+  // nested inside the braces is depth >= 1 to both walks, and a `|` between two shapes is
+  // depth 0 to both.
+  tyTopIndexOf(nm, '|', 0, 0) < 0
 }
 
 // Iteration over the inferred-return table (the emitter's `collectU` registers any
@@ -14183,14 +14185,27 @@ export function nodeTyIsUnionAlias(ix: i32) {
   // A SAME-SHAPE union (`A | B` with A, B structurally IDENTICAL) collapses to a single `TyObj` in the
   // arena — structural equality dedups the members — losing its union-ness, though the emitter keeps the
   // union box for tag discrimination (`isUName`). The arena can't represent this, so recover it locally
-  // from the annotation node: a `TypeRef` whose name has a TOP-LEVEL `|` yet resolved to a struct.
+  // from the annotation node: a `TypeRef` whose emit-time spelling has 2+ TOP-LEVEL atoms yet resolved
+  // to a struct.
+  //
+  // The count is READ, not re-derived. `canonEmitTypeNames` — the pass that PRODUCES every
+  // emit-time annotation spelling — banks it per node (`annUnionAtomsOf`, #1055/#1113), and
+  // `emit_collect.vl`'s `collectU` already asks this identical question that way. The two
+  // sites are now the same query against the same column, which is the point: the split that
+  // stood here re-derived, from a string, a number the producer had already written down.
+  //
+  // The `-1` the bank returns for a non-`TypeRef` node is the same answer the split gave for
+  // one (it never ran — the `nd is TypeRef` gate). A node that POSTDATES the bank also reads
+  // `-1`, i.e. "not a union", and that population is NOT empty — it is 29,215 of the 124,426
+  // reaches this arm takes (3,415/9,764 corpus + 25,800/114,662 fuzz, 23.5%). What IS measured
+  // empty is the DISAGREEMENT: over all 124,426 reaches, bank-missing ones included, the split
+  // never answered "union" where the bank answers "not" — 0 divergences, with the comparator
+  // proved in the same build (forcing the bank leg FALSE lights up 62 corpus reaches). The
+  // reason is structural: an emitter-SYNTHESIZED `TypeRef` (`synthTypeRef`) is minted from a
+  // RENDER, and the render of a `TyObj` is a `{…}` shape or a nominal name — one top-level
+  // atom either way, so a post-bank node cannot spell the collapsed union this arm looks for.
   if t is TyObj {
-    const nd = P.nodes[ix]
-    if nd is TypeRef {
-      const parts: string[] = []
-      splitTypeName(nd.tyName, '|', parts)
-      if parts.length >= 2 { return true }
-    }
+    if annUnionAtomsOf(ix) >= 2 { return true }
   }
   if t is TyNullable {
     const inner = t.nInner
@@ -15381,15 +15396,28 @@ function nulElemListAtomKind(name: string) {
     if nameIsLitUnionType(rest[0]) { return 7 }
     return -1
   }
-  // The expanded inline litunion form (`("a" | "b" | null)[]`).
-  let core = rest[0]
-  let j = 1
-  while j < rest.length {
-    core = core + "|" + rest[j]
-    j = j + 1
+  // The expanded inline litunion form (`("a" | "b" | null)[]`) — decided from the ATOMS
+  // this function already holds, not from a name rebuilt out of them.
+  //
+  // It used to JOIN `rest` back into `"a"|"b"` and hand the join to `nameIsLitUnionType`,
+  // which re-SPLIT it (`nameIsInlineLitUnion` → `splitUnionAtoms`) into the very list
+  // `rest` already is: a decision that was a projection of a value the caller was holding
+  // (method note 2). The join and the re-split are both gone, and the answer is unchanged
+  // by construction on both of that predicate's legs:
+  //   · its DECLARED-alias leg (`cUserTypes.has`) is dead here — a joined name carries a
+  //     `|`, and no declared type NAME can, so the lookup could never hit;
+  //   · its INLINE leg is exactly "2+ top-level atoms, each a quoted string literal", and
+  //     `rest` IS that top-level split (a `|`-join of top-level atoms re-splits to itself,
+  //     since no atom carries a top-level `|` of its own), with `rest.length >= 2` already
+  //     established by the arm above.
+  let q = 0
+  while q < rest.length {
+    const a = rest[q]
+    if a.length < 2 { return -1 }
+    if a[0] != '"' { return -1 }
+    q = q + 1
   }
-  if nameIsLitUnionType(core) { return 7 }
-  -1
+  7
 }
 
 // True if `name` is a VALUE union carrying a literal-union ALIAS arm (`K0 | i64`,
