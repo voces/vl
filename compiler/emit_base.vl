@@ -489,25 +489,13 @@ export function unionEqOperandOk(exprIx: i32) {
   if e is Ident { return true }
   false
 }
-// The value-eq opcode (i32 result) for a scalar union atom: `i32`/`boolean`
-// share `i32.eq`; i64/f64/f32 take their own. -1 for `string` (its eq loop) /
-// `null` (tag equality alone decides it — no payload).
-export function atomEqOpcode(atom: string) {
-  const k = valueAtomKind(atom)
-  if k == 0 || k == 1 {
-    return 70 // 0x46 i32.eq
-  }
-  if k == 3 {
-    return 81 // 0x51 i64.eq
-  }
-  if k == 4 {
-    return 97 // 0x61 f64.eq
-  }
-  if k == 5 {
-    return 91 // 0x5b f32.eq
-  }
-  -1
-}
+// D-EQOPCODE (#1136) moved the value-eq opcode table to `emit_rep`'s
+// `atomEqOpcodeOfKind(k)` — its two `wasmEmit` call sites already held the ABI KIND, so
+// the `valueAtomKind(atom)` re-derivation this wrapper existed for is gone. Re-grepped at
+// `caad41a`: **0 call sites compiler-wide** (`compiler/*.vl` + `std/*.vl` + `scripts/*.vl`;
+// every remaining textual hit is a doc comment), and no import list names it. Deleted here
+// rather than left as a second copy of the same four-arm table — the duplicate-table drift
+// hazard #1128's hand-off 2 opened this split to close.
 // Lower a field read `recv.field` onto `body`: evaluate the receiver (must be a
 // struct), then `struct.get $0 <fieldidx>` (`0xfb 0x02 0x00 idx`).
 // The narrowing-stack KEY of a member path over a plain Ident root (`o.y`, or
@@ -1051,8 +1039,7 @@ export function nameIsClosureArrayTy(tyIx: i32) {
     if tyIsNulClosureArrayNode(tyIx) { return 1 }
     return 0
   }
-  if nameIsClosureArray(tyNameOf(tyIx)) { return 1 }
-  if nullClosureArrElem(tyNameOf(tyIx)) != "" { return 1 }
+  if cloArrElemNameOf(tyNameOf(tyIx)) != "" { return 1 }
   0
 }
 // `1` if the type-annotation node at `tyIx` is an `f64[]` (the f64-element list), else
@@ -1258,6 +1245,20 @@ export function nameIsMapMemberUnion(name: string) {
 // intermediate binding / field / return classifiers mis-typing a map-member union as a bare map,
 // now guarded by `nameIsMapMemberUnion` at every `paramMap` / `retMapFlag` / `nameFieldCode` site.)
 export function mapArmValueBoxable(_mapAtom: string) { true }
+// True if `name` is a BARE map (`{[string]: V}`) — the composite `nameIsMap(name) &&
+// !nameIsMapMemberUnion(name)`, which is the ONE question five call sites in this file
+// and `emit_collect.vl` were each spelling out. `nameIsMap` is a two-character probe
+// (`{` then `[`), so a map-FIRST union (`{[string]: i32} | boolean`) passes it and every
+// consumer that wants "a map, not a box" has to subtract the false positive by hand;
+// #1127's audit measured 24 `nameIsMapMemberUnion` sites and found the corrective-guard
+// reading holding at 21 of them. This is that reading, named once.
+//
+// It is also the shape the ARENA answers directly: `ty is TyMap` is true for a bare map
+// and false for a `TyUnion` with a map arm, so when the annotation-node consumers get a
+// covered `nodeTyIx` the migration is an edit to THIS function, not to every pair.
+export function nameIsBareMap(name: string) {
+  nameIsMap(name) && !nameIsMapMemberUnion(name)
+}
 // True if the array type-name `name` is a string-keyed-MAP list `{[string]:i32}[]` —
 // a ref list whose ELEMENT is the map struct (`mStructIdx`). It is a `nameIsMap` name
 // with a trailing `[]`. The scope chain (`typecheck.vl`'s `scopes: {[string]:i32}[]`)
@@ -1271,7 +1272,7 @@ export function nameIsMapArray(name: string) {
   // (`({[string]: i32} | boolean)[]` whose paren-stripped element `{[string]: i32}|boolean` starts
   // with `{[` too): that is a union-BOX ref list (kind 2), not a list-of-maps (kind 3).
   const bare = name.slice(0, n - 2)
-  nameIsMap(bare) && !nameIsMapMemberUnion(bare)
+  nameIsBareMap(bare)
 }
 // True if `name` is an ARRAY OF FUNCTIONS — `((i32) => i32)[]`: a trailing `[]` whose
 // element is a fully-parenthesized FUNCTION type, the arrow NESTED (depth > 0). A
@@ -1311,6 +1312,25 @@ export function nullClosureArrElem(name: string) {
   const nn = nullablePartOf(elem)
   if nn == "" { return "" }
   if nameIsFuncTypeAtom(nn) { return nn }
+  ""
+}
+// The ELEMENT function-type atom of a closure-array name, PLAIN or nullable-element:
+// `((i32) => R)[]` → `(i32) => R`, `(((i32) => R) | null)[]` → `((i32) => R)`, else "".
+// The one home of an idiom six call sites carried by hand (`emit_base` ×1,
+// `emit_collect` ×5): the nullable-element form first (its element keeps the `| null`
+// grouping parens, so the plain test declines it), then the plain form's `[]` peel.
+//
+// The two are the SAME question — "does this name's element ride the closure
+// fat-pointer" — and every caller wanted one of exactly two answers from it: the
+// element NAME (to key a `$fnsig`) or the BOOLEAN. `cloArrElemNameOf(n) != ""` is that
+// boolean exactly: `nullClosureArrElem` returns a non-empty function-type atom or "",
+// and `nameIsClosureArray` requires `n >= 4` with a trailing `[]`, so its peel is
+// non-empty whenever it fires. Both orders of the old disjunction agree — the tests are
+// disjoint (a `| null` element is not a `nameIsFuncTypeAtom`) and both are pure.
+export function cloArrElemNameOf(name: string) {
+  const nul = nullClosureArrElem(name)
+  if nul != "" { return nul }
+  if nameIsClosureArray(name) { return name.slice(0, name.length - 2) }
   ""
 }
 // The VALUE-union element name of a parenthesized union-array annotation:
@@ -1810,6 +1830,92 @@ export function annArrowAt(name: string) {
   }
   -1
 }
+// Split the INNER text of an inline object shape (`{…}`'s contents — `a:i32,b:{c:f64}`)
+// into PARALLEL field-NAME / field-TYPE-TEXT lists at depth 0.
+//
+// THE ONE HOME of the shape layer's field scanner, for the whole compiler. #1130
+// (D-ELEMHOME) collapsed six hand-copied copies of this loop inside
+// `emit_classify.vl`; FOUR MORE live one module down — `nameIsStructWithUnionField` /
+// `nameIsStructWithLitUnionField` here, and `shapeHasCloField` /
+// `collectShapeVariantFields` in `emit_collect.vl`. `emit_base` is the lowest module
+// both importers already depend on, so the home belongs here and every consumer can
+// reach it (`emit_classify`'s own private copy retires by importing this one).
+//
+// Depth-aware over `{}` `[]` `()` AND the generic-application brackets: a field whose
+// type is a generic APPLICATION carries the argument list's own `,` (`{v: Pair<i32,
+// string>}`) and a bracket-blind depth splits the FIELD list at it. `>` closes only
+// against an OPEN `<` (`tyGtIsClose`) — two other string languages ride this scanner and
+// both spell a `>` that closes nothing: `tyToStr`'s `->` render and the `$fnsig` key's
+// `ii>i`, and counting those runs the depth NEGATIVE. Applying that repair one scanner
+// at a time is what #1118/#1120 had to do; this is why.
+//
+// A part with no `name:` prefix is MALFORMED and pushes an EMPTY name (a well-formed
+// field name always has at least one character before its `:`, so `outNames[i] == ""`
+// is exactly the `ci <= 0` test each copy applied inline). The split is PURE — every
+// caller's per-field side effects run in the same left-to-right order they did when
+// they were interleaved with the scan.
+export function shapeInnerFieldSplit(
+  inner: string,
+  outNames: string[],
+  outTexts: string[],
+) {
+  let depth = 0
+  let angOpen = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    const atEnd = k == inner.length
+    let brk = false
+    if !atEnd {
+      const ch = inner[k]
+      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
+      if ch == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      }
+      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
+      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
+      }
+      if ch == ',' && depth == 0 { brk = true }
+    } else {
+      brk = true
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci <= 0 {
+        outNames.push("")
+        outTexts.push("")
+      } else {
+        outNames.push(part.slice(0, ci))
+        outTexts.push(part.slice(ci + 1, part.length))
+      }
+      start = k + 1
+    }
+    k = k + 1
+  }
+  0
+}
+// True if `name` is a bare CANONICAL STRUCT shape name — a `{…}` group that is not a map
+// (`{[`), carries no TOP-LEVEL arrow, and is SPACE-FREE. The gate its three
+// `nameIsStructWith*Field` consumers each spelled out identically; the space test is the
+// load-bearing half — a `tyToStr` obj render (`{f: () -> i32 | boolean}`) is NOT an
+// `sNames` key, and its `->` hides a closure field from `annArrowAt`, so any space marks
+// a non-canonical name and rejects it.
+export function canonBareShapeName(name: string) {
+  if name.length < 2 { return false }
+  if name[0] != '{' || name[name.length - 1] != '}' { return false }
+  if name[1] == '[' { return false }
+  if annArrowAt(name) >= 0 { return false }
+  let sp = 0
+  while sp < name.length {
+    if name[sp] == ' ' { return false }
+    sp = sp + 1
+  }
+  true
+}
 // True if `name` is a bare CANONICAL STRUCT shape (`{f:…,…}`, not a map) with at least one FIELD
 // whose type is a top-level UNION — `{f:boolean|{w:i32}}`, `{f:i64|string}`. Such a struct has a
 // BOXED field slot (a `(ref $uBox)`), which a body ObjLit built from bare-scalar/struct literals
@@ -1821,87 +1927,55 @@ export function annArrowAt(name: string) {
 // closure RESULT, not the field: `(i32) => f32 | {w:i32}` is a closure returning a union, NOT a
 // union field). A top-level arrow / a map (`{[`) is not a struct here.
 export function nameIsStructWithUnionField(name: string) {
-  if name.length < 2 { return false }
-  if name[0] != '{' || name[name.length - 1] != '}' { return false }
-  if name[1] == '[' { return false }
-  if annArrowAt(name) >= 0 { return false }
-  // CANONICAL only: a `tyToStr` obj render (spaces, `->` closure arrows — what the `recordable`
-  // return path stores, e.g. `{f: () -> i32 | boolean}`) is NOT a `sNames` key, and its `->` hides
-  // a closure field from `annArrowAt`; a space anywhere marks such a non-canonical name — reject it.
-  let sp = 0
-  while sp < name.length {
-    if name[sp] == ' ' { return false }
-    sp = sp + 1
-  }
-  const inner = name.slice(1, name.length - 1)
-  let depth = 0
-  let angOpen = 0
-  let start = 0
-  let k = 0
-  while k <= inner.length {
-    let brk = k == inner.length
-    if k < inner.length {
-      const c = inner[k]
-      if c == '{' || c == '[' || c == '(' {
-        depth = depth + 1
-      } else if c == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      } else if c == '}' || c == ']' || c == ')' {
-        depth = depth - 1
-      } else if c == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      } else if c == ',' && depth == 0 {
-        brk = true
-      }
-    }
-    if brk {
-      const field = inner.slice(start, k)
-      const ci = field.indexOf(":")
-      if ci > 0 {
-        const ftype = field.slice(ci + 1, field.length)
-        // A CLOSURE field (top-level `=>`) binds any `|` to its RESULT — skip it. Only a field
-        // type that is itself a top-level UNION (`|` at depth 0) is a boxed field slot.
-        if annArrowAt(ftype) < 0 {
-          let fd = 0
-          let fAng = 0
-          let j = 0
-          while j < ftype.length {
-            const cc = ftype[j]
-            if cc == '{' || cc == '[' || cc == '(' {
-              fd = fd + 1
-            } else if cc == '<' {
-              fd = fd + 1
-              fAng = fAng + 1
-            } else if cc == '}' || cc == ']' || cc == ')' {
-              fd = fd - 1
-            } else if cc == '>' && tyGtIsClose(ftype, j, fAng) {
-              fd = fd - 1
-              fAng = fAng - 1
-            } else if cc == '|' && fd == 0 {
-              return true
-            }
-            j = j + 1
+  // CANONICAL only, and not a map / closure — `canonBareShapeName`, the gate this
+  // function and its two siblings each spelled out.
+  if !canonBareShapeName(name) { return false }
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(name.slice(1, name.length - 1), fnames, ftexts)
+  let fi = 0
+  while fi < fnames.length {
+    if fnames[fi] != "" {
+      const ftype = ftexts[fi]
+      // A CLOSURE field (top-level `=>`) binds any `|` to its RESULT — skip it. Only a field
+      // type that is itself a top-level UNION (`|` at depth 0) is a boxed field slot.
+      if annArrowAt(ftype) < 0 {
+        let fd = 0
+        let fAng = 0
+        let j = 0
+        while j < ftype.length {
+          const cc = ftype[j]
+          if cc == '{' || cc == '[' || cc == '(' {
+            fd = fd + 1
+          } else if cc == '<' {
+            fd = fd + 1
+            fAng = fAng + 1
+          } else if cc == '}' || cc == ']' || cc == ')' {
+            fd = fd - 1
+          } else if cc == '>' && tyGtIsClose(ftype, j, fAng) {
+            fd = fd - 1
+            fAng = fAng - 1
+          } else if cc == '|' && fd == 0 {
+            return true
           }
-          // A NESTED bare-shape field (`{f:{f:i32|string}}`): the boxed slot may sit one
-          // level down — RECURSE, so the `synthRetAnnots` pin fires for a lambda whose
-          // NESTED literal field adopted a union-field shape (`objLitWidenFields`'
-          // descent; without the pin its `$fnsig` kept the self-inferred plain layout —
-          // INVALID-WASM, fuzz-nightly run 29808029476 seed 78530533 d5). A nested map
-          // (`{[`) declines inside the recursion's own gate.
-          if (
-            ftype.length >= 2 &&
-            ftype[0] == '{' &&
-            ftype[ftype.length - 1] == '}'
-          ) {
-            if nameIsStructWithUnionField(ftype) { return true }
-          }
+          j = j + 1
+        }
+        // A NESTED bare-shape field (`{f:{f:i32|string}}`): the boxed slot may sit one
+        // level down — RECURSE, so the `synthRetAnnots` pin fires for a lambda whose
+        // NESTED literal field adopted a union-field shape (`objLitWidenFields`'
+        // descent; without the pin its `$fnsig` kept the self-inferred plain layout —
+        // INVALID-WASM, fuzz-nightly run 29808029476 seed 78530533 d5). A nested map
+        // (`{[`) declines inside the recursion's own gate.
+        if (
+          ftype.length >= 2 &&
+          ftype[0] == '{' &&
+          ftype[ftype.length - 1] == '}'
+        ) {
+          if nameIsStructWithUnionField(ftype) { return true }
         }
       }
-      start = k + 1
     }
-    k = k + 1
+    fi = fi + 1
   }
   false
 }
@@ -1917,55 +1991,24 @@ export function nameIsStructWithUnionField(name: string) {
 // twin — a runtime cast-failure TRAP at the narrowed call (fuzz-nightly seed 26306770 d4,
 // `() => ((i32) => {f: K0}) | i32`). Same CANONICAL-spelling gate as the sibling.
 export function nameIsStructWithLitUnionField(name: string) {
-  if name.length < 2 { return false }
-  if name[0] != '{' || name[name.length - 1] != '}' { return false }
-  if name[1] == '[' { return false }
-  if annArrowAt(name) >= 0 { return false }
-  let sp = 0
-  while sp < name.length {
-    if name[sp] == ' ' { return false }
-    sp = sp + 1
-  }
-  const inner = name.slice(1, name.length - 1)
-  let depth = 0
-  let angOpen = 0
-  let start = 0
-  let k = 0
-  while k <= inner.length {
-    let brk = k == inner.length
-    if k < inner.length {
-      const c = inner[k]
-      if c == '{' || c == '[' || c == '(' {
-        depth = depth + 1
-      } else if c == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      } else if c == '}' || c == ']' || c == ')' {
-        depth = depth - 1
-      } else if c == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      } else if c == ',' && depth == 0 {
-        brk = true
+  if !canonBareShapeName(name) { return false }
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(name.slice(1, name.length - 1), fnames, ftexts)
+  let fi = 0
+  while fi < fnames.length {
+    if fnames[fi] != "" {
+      const ftype = ftexts[fi]
+      if nameIsLitUnionType(ftype) { return true }
+      if (
+        ftype.length >= 2 &&
+        ftype[0] == '{' &&
+        ftype[ftype.length - 1] == '}'
+      ) {
+        if nameIsStructWithLitUnionField(ftype) { return true }
       }
     }
-    if brk {
-      const field = inner.slice(start, k)
-      const ci = field.indexOf(":")
-      if ci > 0 {
-        const ftype = field.slice(ci + 1, field.length)
-        if nameIsLitUnionType(ftype) { return true }
-        if (
-          ftype.length >= 2 &&
-          ftype[0] == '{' &&
-          ftype[ftype.length - 1] == '}'
-        ) {
-          if nameIsStructWithLitUnionField(ftype) { return true }
-        }
-      }
-      start = k + 1
-    }
-    k = k + 1
+    fi = fi + 1
   }
   false
 }
@@ -1980,20 +2023,15 @@ export function nameIsStructWithLitUnionField(name: string) {
 // out (a map is not a field struct), and any deeper `{[` occurrence IS a map field at
 // some nesting level (no other canon construct spells `{[`).
 export function nameIsStructWithMapField(name: string) {
-  if name.length < 2 { return false }
-  if name[0] != '{' || name[name.length - 1] != '}' { return false }
-  if name[1] == '[' { return false }
-  if annArrowAt(name) >= 0 { return false }
+  if !canonBareShapeName(name) { return false }
   let sp = 0
-  let hasMapOpen = false
   while sp < name.length {
-    if name[sp] == ' ' { return false }
     if name[sp] == '{' && sp + 1 < name.length {
-      if name[sp + 1] == '[' { hasMapOpen = true }
+      if name[sp + 1] == '[' { return true }
     }
     sp = sp + 1
   }
-  hasMapOpen
+  false
 }
 // Split a function-type PARAM list (`i32,f64,S`) on top-level commas (depth-aware).
 export function annSplitParams(s: string, out: string[]) {
