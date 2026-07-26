@@ -13671,7 +13671,7 @@ whole corpus (1,326 files × 5 channels) against the shipped build:
     fix is one output FILE per input and `diff -r`. The tell was the same one note 92 records: a
     "difference" whose content was structurally impossible.
 
-## D-LITPRINT — the print gate was blind to a LITERAL member, so a boxed union it could not lower walked past it into invalid wasm; plus the grammar home is opened and its eleven conversions are measured (#PRNUM)
+## D-LITPRINT — the print gate was blind to a LITERAL member, so a boxed union it could not lower walked past it into invalid wasm; plus the grammar home is opened and its eleven conversions are measured (#1160)
 
 **Shipped, in `compiler/typecheck.vl` only: a user-visible miscompile fixed (4 pins) and the grammar
 home EXPORTED. NET parse count 0 on every unit — at the rebase head `a4fb7c1` the tree reads
@@ -14680,7 +14680,7 @@ two sabotages that are inert everywhere (S3, S4).
 
 
 
-## D-ATOMIS + D-ATOMPRINT — a literal-union value is an i32 ATOM, and two emitter gates asked its RENDER instead: `is` compared a union-box tag against it, `print` handed it to the string printer (#PRNUM)
+## D-ATOMIS + D-ATOMPRINT — a literal-union value is an i32 ATOM, and two emitter gates asked its RENDER instead: `is` compared a union-box tag against it, `print` handed it to the string printer (#1160)
 
 **Base `b71888e`, re-measured here, not inherited: CORE 346 · OFF-LIST 36 · TRUE TOTAL 382**
 (`parsercount.py`, the 23-resolver SCORECARD list + #1141's off-list table, non-comment call sites,
@@ -17166,7 +17166,7 @@ cost, which is separately visible: **+182 B** (1,026,831 → 1,027,013 at `1c8d9
     test, so all six agreed on an explanation that a one-line cell refutes. Vary one thing.
 
 
-## D-ARMNAMELEG — the union-arm field-path guards were never uncovered; their NAME leg was DEAD, and a typed-IR net answers for all 356 of their positive answers (#PRNUM)
+## D-ARMNAMELEG — the union-arm field-path guards were never uncovered; their NAME leg was DEAD, and a typed-IR net answers for all 356 of their positive answers (#1160)
 
 **Slice: `compiler/emit_classify.vl` only** (plus this doc). Branched at `65347c2` (#1155) and
 **rebased onto `b7cc723`** after #1156 (D-QUOTEWALK/A + D-FINDFOLD) landed mid-slice.
@@ -17563,9 +17563,10 @@ grade is different and better in one direction, worse in another:**
      line and the line that makes it meaningful failed independently and looked identical. **Compute
      the denominators with a different mechanism from the one that computes the answer.**
 
+
 ---
 
-## D-GROUPHOME — the emitter's LAST hand-written walk retires into the checker's home, and #1156's decline is refuted by measuring the arm it was protecting (#PRNUM)
+## D-GROUPHOME — the emitter's LAST hand-written walk retires into the checker's home, and #1156's decline is refuted by measuring the arm it was protecting (#1160)
 
 ### 🔁 THE BASE MOVED UNDER ME MID-SLICE, AND EVERY LEG WAS RE-RUN AT THE NEW HEAD
 
@@ -17921,3 +17922,410 @@ test that would have passed before the change.
    control. Extending it by TEXT (escapes) reached nothing new; the axis that pays next is
    POSITION (nested shape, union arm, intersection), because the three positions whose controls
    already fail (`nul_alias`, `plain_arr`, `plain_map`) are hiding whatever lives behind them.
+## D-STARTBLOCK — a union binding declared in a top-level BLOCK compiled to invalid wasm at 18 of 22 cells; the filed diff for it TRAPS the compiler on 12 corpus files (#1160)
+
+**Slice: `compiler/emit_classify.vl` + three `tests/cases/unions/` fixtures** (plus this doc).
+Branched at `68e24fe` and **rebased onto `277ba0b`** after #1159 (D-GROUPHOME) landed mid-slice;
+**every number below is re-taken at the gating head `277ba0b`, in one session**, against a master
+compiler built there from `origin/master`'s own `compiler/` and **proved a fixpoint before use**
+(1,022,924 B, sha256 `2ef3826f…dc05b8fa`). The shipped artefact is 1,024,045 B, md5
+`7ab1efc61dea49f2bb8c8ae584279e7c`, and every A/B leg tested that exact file — the
+`refresh-compiler.sh` output and the A/B input are byte-identical, asserted by md5, not assumed.
+
+**Nothing is inherited, and re-measuring overturned the hand-off's DIFF, its cell population and
+its silence about work. That refutation is the slice.**
+
+**The rebase mattered and was re-verified rather than assumed.** #1159 rewrote `emit_base.vl` —
+which moves the tree-wide totals (OFF-LIST 30 → **29**, TRUE 343 → **342**) and retires one more
+hand-written bracket walk (`tyGroupWrapsWhole`, 9 → **8** tree-wide) — but **did not touch
+`emit_classify.vl`**; the code commit replayed with no edit, the doc conflict was append/append
+(resolved keeping both sides whole, **0 deletions from either parent**, asserted line-by-line
+against both `origin/master:` and the pre-rebase commit), and the 22-cell grade is **identical
+either side of the rebase, cell for cell**. Quoting the pre-rebase base here would have been wrong
+by 1 off-list and 1 walk.
+
+### Lead: the miscompile, and why the filed fix could not ship as filed
+
+```vl
+const u: i32 | boolean = 7
+if true { const r = u
+  if r is i32 { print(r) } }        // master: failed to compile: wasm[0]::function[4]
+```
+
+`vl check` clean; the identical body inside a `function` prints `7`. #1157 diagnosed this
+correctly — a union-typed binding declared inside a top-level BLOCK is a **start-function local**,
+not a wasm global, so `unionNameOfIdent`'s module leg (`globalLetOf`, the wasm-GLOBAL name table)
+resolves it to `""` and every union classifier declines; the two typed-IR nets that patch this
+shape twice (`identChainTyBoxedUnion`, `identChainTyMapArmUnion`) both open
+`if depth <= 0 || fnIx < 0 { return false }` and are function-only. **That diagnosis is confirmed
+here and reproduced at this head.** What is refuted is the diff.
+
+### 🐛 REFUTATION 1 — THE FILED DIFF TRAPS THE COMPILER ON 12 CORPUS FILES, AND THE HARNESS THAT MEASURED IT "0 OF 1,340" CANNOT SEE IT
+
+The filed body is a bare scan:
+
+```vl
+function startBlockLetOf(name: string) {
+  let si = 0
+  while si < startStmts.length {
+    const li = parentLetOf(startStmts[si], name)
+    ...
+```
+
+`startStmts` is filled by **`collectFns` — the FOURTH emit pass**. On a compiler instance that
+EMITS several programs, the three collect passes ahead of it observe **program N−1's node
+indices**, and dereferencing one into program N's re-minted arena traps. Built at this head and
+run:
+
+| build | channel | result |
+|---|---|---|
+| master `277ba0b` | shared instance, 1,317 corpus cases | compiled 1,317, **threw 0** |
+| **the filed diff, verbatim** | same | compiled 1,305, **threw 12** — `RuntimeError: array element access out of bounds` |
+| shipped | same | compiled 1,317, **threw 0** |
+
+Named, all 12 — 11 pre-existing corpus files plus this slice's own new collision pin:
+`closures/closure-map-array-result-valuecall.vl`, `functions/lambda-binding-valueflow.vl`,
+`maps/closure-result-array-of-mixed-union-value-maps.vl`, `maps/deep-nested-map-list-value.vl`,
+`maps/nested-map-array-union-arm-read.vl`, `maps/nul-litunion-valued-map-list-lambda.vl`,
+`maps/nullable-nested-map-element-list.vl`, `maps/union-arm-map-list-elem-read.vl`,
+`maps/union-array-arm-map-list-elem-read.vl`, `unions/map-member-list-element.vl`,
+`unions/variant-nullable-list-field.vl`, `unions/module-block-union-binding-name-collision.vl`.
+On the real gate that is **`deno task test` → 12 failures** (sabotage S2 below, run in full).
+
+**Which pass, printed rather than reasoned.** A probe tagging every `startBlockLetOf` reach with
+the running pass name:
+
+| pass at the reach | reaches hitting an OUT-OF-RANGE `startStmts` entry | reaches not hitting one |
+|---|---|---|
+| **`collectA`** | **126** | 174 (the table is genuinely EMPTY — the instance's first program) |
+| `computeRetInference` 4,378 · `computeRetInference#2` 4,129 · `emitModule` 2,601 · `monomorphize` 528 · `collectA#2` 297 · `dispatchRewrite` 1 | **0** | 11,934 |
+
+**Every stale read is in `collectA`**, the pass immediately before `collectFns`. A typical one
+reads index **66 into a 64-node arena**.
+
+**Why the filed measurement missed it.** The corpus A/B harness drives `vl build` — a FRESH
+instance per file — where `startStmts` is `[]` during `collectA` and the scan is a no-op. The
+staleness needs a *second* program in the same instance. `vl check <dir>` is a shared instance too
+and is **also blind**: it stops at the checker, so `collectA` never runs — verified, master, the
+filed diff and the shipped fix all print byte-identical 7,133-line output there (217 errors / 121
+warnings). **The channel that fires is the one that EMITS more than one program per instance, and
+the nine-leg gate has exactly one: `deno task test`.**
+
+**The fix, in the file that owns it.** `resetLitAtoms()` is `emit_classify`'s own per-program hook
+— `emitProgram` calls it ahead of the pass table — so the table is emptied there, exactly as that
+prologue already empties `mvValTyIx` / `rlElemTyIx` / `unMemTys` for the same reason and in the
+same window. A query before `collectFns` then reads an empty table and declines, which is what a
+fresh instance already does. `emit_sections.vl`'s prologue is the natural home; that file is
+another agent's, so the line is placed here and the one-line alternative is filed below.
+
+### 🐛 REFUTATION 2 — THE FILED DIFF IS A +13% WORK REGRESSION (AT LEAST), AND THE HAND-OFF DID NOT MEASURE IT
+
+`parentLetOf` is backed by a **ONE-entry** block cache — its own comment records that it was "the
+single hottest self-compile function (~10%)" before that cache existed. The filed scan hands it a
+DIFFERENT block on every step, so it both pays N rebuilds itself and evicts the map the caller's
+function was using. Eight counters, installed by one patcher through one report path, reset at the
+top of `emitProgram` and printed at its end — so each report is that program's own work and the
+reports may be summed (monotonicity asserted, so #1157's triangular-sum trap cannot recur):
+
+| counter | master `277ba0b` | **the filed diff** | **shipped (memoized)** |
+|---|---|---|---|
+| `globalIndexOf` | 294,197 | −5,137 † | +92 |
+| `globalLetOf` | 283,566 | −5,009 † | +92 |
+| `parentLetOf` | 140,786 | **+26,666 (+18.94%)** | **+1,077 (+0.76%)** |
+| `plScanStmt` | 54,548 | **+61,820 (+113.33%)** | **+4,354 (+7.98%)** |
+| `unionNameOfIdent` | 94,359 | −2,843 † | +447 |
+| `letUnionNameOf` | 49,931 | −456 † | +908 |
+| `plBuildLetMap` | 9,365 | **+34,594 (+369.40%)** | **+1,401 (+14.96%)** |
+| `startBlockLetOf` | 0 | +11,813 | +12,696 |
+| **TOTAL** | **926,752** | **+121,448 (+13.10%)** | **+21,067 (+2.27%)** |
+| programs reporting | **1,116** | **1,104** † | **1,116** |
+
+† **The filed diff's figure is an UNDER-count and the counter table is what shows it**: 12 programs
+crash before they can report, so four counters go *negative* purely because their work is missing
+from the sum. A work table whose denominator moves is telling you something — here, that the build
+being measured does not finish.
+
+Every shipped delta attributed: the 12,696 reaches scan 1,077 statements' worth of `parentLetOf`
+between them because the memo answers the rest; unmemoized, the same reaches scan 26,666, each on
+a DIFFERENT block and so a guaranteed cache MISS, plus the 7,928 (= 34,594 − 26,666) further
+misses the evictions inflict on pre-existing callers. The memo is a per-program `name → LetDecl`
+map cleared with the table; **it is behaviour-preserving and measured so** — memoized vs
+unmemoized, corpus A/B **0 of 1,342 differing** on all five channels.
+
+This slice is still a net work ADDITION and says so: ≈19 operations per program, the price of
+answering a question master answered wrongly-but-cheaply. The counters do not cover allocation;
+the emitted-bytes cost is separately visible as **+1,121 B**.
+
+### The space, GRADED — 22 cells × 2 scopes, ONE VARIABLE PER PAIR
+
+Both files of every pair are emitted from the SAME body text by one generator; the ONLY difference
+is the `function main0() { … } main0()` wrapper. Preamble (type decls, helpers) is verbatim and
+top-level on both sides. Distinct failure strings are enumerated, not substring-matched
+(`ok` / `WRONG` / `invalidwasm` / `parsefail` / `reject` / `trap` / `other`).
+
+| | master `277ba0b` | this PR |
+|---|---|---|
+| MODULE scope — ok | 4 | **21** |
+| MODULE scope — invalid-wasm | **18** | **0** |
+| MODULE scope — clean reject | 0 | 1 |
+| MODULE scope — **WRONG (silent)** | **0** | **0** |
+| FUNCTION scope (the controls) — ok | 21 | 21 |
+| FUNCTION scope — invalid-wasm | 1 | 1 |
+
+**17 cells go invalid-wasm → the value its own function-scope control prints. None becomes
+silent.** The cells span the read POSITION (print / arithmetic / comparison / rebind / call-arg /
+assign), the atom ARM (i32 / boolean / string / f64 / i64), the union-returning CALL init, the
+BLOCK kind (if / else / while / for-range / nested) and the ref-array arm.
+
+**The 18th cell is a DIFFERENT BUG, and its control is what proves it.** `cap-lambda` — a lambda
+declared inside the block, capturing the block's union binding — is invalid-wasm on master at
+BOTH scopes, so the function-scope control that must pass does not, and the cell is not this
+bug's. This PR moves its module form from invalid wasm to a **loud, positioned reject**
+(`emit error: emitProgram: narrowed union binding is not a local or global`) and leaves the
+function form exactly as master has it. Filed below.
+
+**Four module-scope controls must PASS on both sides and do**: a struct-arm union read through a
+field (`arm-struct` — a STRUCT-armed union in a module block already worked), a plain `i32`, a
+plain `string`, an object literal. A fifth, `ctl-nullable` (`i32 | null` in a top-level block), was
+invalid-wasm on master and is fixed here — the nullable spelling is in the family after all, which
+the original filing had specifically excluded.
+
+### What ships
+
+Three pins, each verified rc=1-with-master's-exact-failure on a `277ba0b`-built compiler by
+running it, and rc=0 here:
+
+1. `tests/cases/unions/module-block-union-binding.vl` — 15 cells in one program.
+   master: `failed to compile: wasm[0]::function[9]`; here: the 15 expected lines.
+2. `tests/cases/unions/function-block-union-binding.vl` — **the control that must pass on both
+   sides**, cell for cell, scope the only variable. Identical output on master and here; it sits
+   in the corpus A/B's non-differing 1,343.
+3. `tests/cases/unions/module-block-union-binding-name-collision.vl` — the memo's window guard
+   (see the sabotage table). master: `failed to compile: wasm[0]::function[7]`.
+
+### Entombment — four sabotages on the SHIPPED source, each fired on a named channel, all re-run at this head
+
+| sab | hunk | `deno task test` | shared-instance probe | fires how |
+|---|---|---|---|---|
+| **S1** | `unionNameOfIdent` no longer consults `startBlockLetOf` (the fix) | **2 failed** | threw 0 | both module-scope pins → invalid wasm; the function-scope control still passes |
+| **S2** | the per-program `startStmts = []` reset | **12 failed** | **threw 12** | the 11 pre-existing corpus files trap, plus the collision pin |
+| **S5** | the `startStmts.length < 1` reject | **1 failed** | threw 0 | the collision pin |
+| **S3** | the `sblMemo` memo | **0 failed** | threw 0 | **INERT on every behaviour channel — a WORK hunk, entombed by the invocation table above and by nothing else** |
+
+**S5 IS THE ONE THAT NEEDED A CONSTRUCTED PROGRAM, AND MY FIRST PREDICTION ABOUT IT WAS WRONG.**
+I expected removing the empty-table reject to break the main pin immediately, since the memo is
+keyed by NAME ALONE and a `-1` recorded during `collectA` (when the table is empty) outlives the
+window. It did not: the corpus, the fuzz corpus and both existing pins were all inert. So I
+instrumented the window instead of arguing about it — a probe printing the NAME at every
+empty-window query read **310 queries across the corpus**, with `init`, `h0`, `n`, `add`, `mul`,
+`fallback` among the names — and built a program that binds a module-block union to a name that an
+already-covered shape asks about during `collectA`:
+
+```vl
+function cell(init: i32) { … "[]=": (k: i32, v: i32) => { store[k] = v } … }   // asks about `init` in collectA
+const u: i32 | boolean = 7
+if true { const init = u
+  if init is i32 { print(init) } }
+```
+
+shipped `42 / 7`; S5 and master both `failed to compile: wasm[0]::function[7]`. **An inert
+sabotage may mean the distinguishing program has not been written yet — instrument the window and
+write it.**
+
+### TARGET 2 — the code-axis census, re-run at this base
+
+Re-measured with `parsercount.py` / `walkcount.py`, both re-run on `origin/master`'s own extracted
+`compiler/` and on this branch:
+
+| | CORE | OFF-LIST | TRUE |
+|---|---|---|---|
+| master `277ba0b` | **313** | **29** | **342** |
+| this PR | **313** | **29** | **342** |
+
+**Zero, and saying so is the point.** This slice is a bug fix; it adds no parse and retires none.
+`emit_classify.vl` stands at **174** (172 core + 2 off), `emit_query.vl` at **2**, and the
+bracket-depth walk census at **8 tree-wide / 5 COPIES** — all five copies in `emit_classify.vl`
+(`shapeFieldParse`, `splitUnionArmsAllDepth`, `annRetKind`, `unionArmSigKey`, `monoUnwrapParens`),
+plus 2 homes in `typecheck.vl` and 1 source formatter. #1159 retired the third home
+(`tyGroupWrapsWhole`), which is why the tree-wide figure is 8 where #1158 published 9; **the COPY
+count, the number that should go to zero, is unmoved at 5.**
+
+**The census by what the CODE is.** All 174 sites attributed to their enclosing function:
+
+| calls | enclosing function | what it is |
+|---|---|---|
+| 12 | `refArrShapeKind` | the array-name ladder, projecting the ELEMENT KIND |
+| 10 | `refArrElemName` | **the same ladder, projecting the ELEMENT NAME** |
+| 9 | `mvValKindOfName` | the map-value name ladder |
+| 6 | `ensureRefElem`, `rlCanonLitUnionAtoms`, `internShapeDeep`, `refListElemNameOfExpr` | |
+| 5 | `shapeFieldTypeCompat` | |
+| ≤4 | 74 further functions | |
+
+**81 enclosing functions** — the hand-off's "~90" is 81 — and the distribution is as FLAT as it
+said. The one structure the code axis surfaces: **`refArrShapeKind` (12) and `refArrElemName` (10)
+walk the same array-name grammar and are two projections of one value** (method note 2) — 22 of
+the 174 sites, 12.6%. Their rung ORDER is not identical (`refArrElemName` opens with a
+`nullablePartOf` recursion; `refArrShapeKind`'s nested-ref-array arm CALLS `refArrElemName`), so
+this is a design merge, not a mechanical dedup, and #1155's "you cannot reason out an ordering —
+measure it" applies to it directly. Filed, not attempted here.
+
+### REFUTATION 3 — `emit_query`'s "CORE 2" is a property of the LIST, not of the file
+
+The code axis puts `emit_query.vl`'s two sites in two functions, one each: `paramArray` and
+`paramStringArray`. They have **three siblings in the same family** — `paramF64Array`,
+`paramF32Array`, `paramI64Array` — written identically, and the scorecard counts none of them,
+because `nameIsF64Array` / `nameIsF32Array` / `nameIsI64Array` are on neither the 23-name CORE
+list nor #1141's off-list table while `nameIsI32Array` and `nameIsStringArray` are. The three
+uncounted bodies are `name == "f64[]"` — **byte-for-byte the shape of the counted
+`nameIsI32Array`**.
+
+Audited across the whole mechanically enumerable `nameIs*` family:
+
+| | members | call sites |
+|---|---|---|
+| counted by the two lists | 12 | **129** |
+| NOT counted by either | **27** | **136** |
+| total | 39 | 265 |
+
+Largest uncounted members: `nameIsBareMap` 21 (a conjunction of two counted ones),
+`nameIsLitUnionArray` 9, `nameIsNulClosure` 8, `nameIsString` 8, `nameIsF64Array` 8,
+`nameIsNulLitUnion` 7, `nameIsF32Array` 7, `nameIsI64Array` 7, `nameIsFuncTypeAtom` 7.
+**#1141 established the list is a named subset, not an inventory; this quantifies it for one
+family — the subset is not closed under "sibling arm of the same predicate".** The scoreboard
+remains the right yardstick for slice-to-slice deltas, and it is not the file's true count. Stated
+here so no future slice reads "`emit_query` is CORE 2" as "`emit_query` has two type-name
+decisions".
+
+### Gate — every RC checked explicitly, at `277ba0b`, master baseline rebuilt in the same session
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh --prove-fixpoint` | **RC=0** — 1,024,045 B |
+| `native-fixpoint.sh` | **RC=0** — stage3 == stage4 byte-for-byte, 1,024,045 B (master 1,022,924 — **+1,121 B**) |
+| `lint-self.sh` (after `vl fmt`; fmt made no change) | **RC=0** — self-lint + fmt-check clean |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **RC=0 — 2,065 passed / 0 failed / 8 ignored**; master at the same head, same session, master SOURCE **and** master SEED, with the three new fixtures parked: **2,062 / 0 / 8** |
+| ignored-test NAME SET | **identical**, 8 = 8, `diff` empty — nothing that RAN stopped running |
+| corpus A/B (wasm sha256 + build rc + normalised message + run rc + stdout) | **2 of 1,345 differing, named**: `unions/module-block-union-binding.vl` and `unions/module-block-union-binding-name-collision.vl`, each invalid-wasm → its expected stdout. The third new file, the CONTROL, is identical on both sides |
+| lint-tier A/B (`vl check` per file) | **0 of 1,345 differing** |
+| `vl check <dir>` (the other shared-instance channel) | **IDENTICAL** — 7,133 lines, 217 errors / 121 warnings |
+| fuzz A/B (14 seeds × 3 depths × {plain, declared} × 200) | **0 differing paths over 33,600 programs/side** |
+| `rep-fuzz-check.sh` | **RC=0** — `exact ✅ (1 baselined failure — 0 unsound, 1 reject; 0 new, 0 stale)` |
+| invocation counts both sides | 8 counters, 926,752 → 947,819 (**+21,067, +2.27%**), every delta attributed above |
+
+**Channel populations, so no 0 is an empty run.** Corpus side A: **1,142** files build clean ·
+**1,138 distinct wasm SHAs** · 203 carry a compiler message (201 distinct) · 1,100 produce stdout
+(939 distinct) · 2 distinct build rcs · 2 distinct run rcs. Lint tier: **734** of 1,345 rows carry
+a diagnostic, **763 distinct** check outputs. Fuzz side A: **34,793 outputs**, **1,193 `.err`**,
+**4,458 distinct `.out`** — identical counts on side B. Probe host: **1,317** corpus cases (28
+multi-file module directories drive as one case each), **1,116** of them reaching the work report.
+
+**Comparator proved in the same instruments.** The work counters: 7 of 8 are non-zero on master
+and the 8th (`startBlockLetOf`) is the new function, installed by the identical patcher through
+the identical report path — so its 0 on master is the program's behaviour, not a dead instrument.
+The shared-instance harness reads `threw=0` on master, `threw=12` on the filed diff, `threw=0`
+again once the reset is added — with no other change. The A/B harnesses: 2 of the 1,345 corpus
+rows and 12 of the 2,065 suite cases move under the sabotages, so a 0 elsewhere is a measurement.
+
+**The master-baseline harness asserts it actually swapped.** #1158's defect (a `git stash push`
+that finds nothing to save silently runs the CANDIDATE) is guarded against directly: the script
+restores master's whole `compiler/` from an `origin/master` archive, `cmp`s both the source and
+the seed against the candidate's, and aborts if either is unchanged. Both md5s are printed on the
+way in and out, and `git status` is clean afterwards.
+
+### Refutations, in order of what they cost
+
+1. **The filed diff is not shippable.** Verbatim, it traps the compiler on **12 corpus files**
+   (`array element access out of bounds`) whenever more than one program is EMITTED in one
+   instance — i.e. **12 `deno task test` failures**. The corpus A/B that measured it "0 of 1,340
+   differing" drives one process per file and is structurally blind to it, and so is
+   `vl check <dir>`. `startStmts` is a `collectFns`-filled table read by three passes that run
+   before `collectFns`; all 126 stale reads are in `collectA`.
+2. **The filed diff is at least a +13.10% work regression** on the eight counters that bound it
+   (`plBuildLetMap` +369%, `plScanStmt` +113%), because it hands `parentLetOf`'s one-entry block
+   cache a different block on every step — and that figure is an *under*-count, since 12 of the
+   1,116 reporting programs crash before reporting. The hand-off gave no work figure at all. The
+   memoized form ships at +2.27%.
+3. **The population is not 13/13.** My own grid reads **18** module-scope invalid-wasm cells
+   against **21** passing function-scope controls, and one of the 18 (`cap-lambda`) is a DIFFERENT
+   bug whose function-scope control fails on both sides. Nullable (`i32 | null`) is in the family,
+   which the original filing excluded by construction.
+4. **`emit_query` is not "2 type-name decisions".** Two of its five identically-shaped
+   `param*Array` predicates are on the scorecard's list; the `nameIs*` family has 39 members of
+   which 27 (136 call sites) are counted by neither list.
+5. **The hand-off's "~90 enclosing functions" is 81** — the census's own denominator.
+6. **My own first prediction was wrong**, and it is the reason S5 has a pin at all. I asserted the
+   window guard's removal would obviously break the main fixture; it was inert on 1,345 corpus
+   files, 33,600 fuzz programs and both existing pins. The distinguishing program came from
+   instrumenting the window (310 empty-window queries, printed with their names), not from
+   arguing.
+
+### Hand-offs, best-measured first
+
+1. **THE ONE-LINE `emit_sections.vl` DIFF THAT WOULD MOVE THIS RESET TO ITS NATURAL HOME.**
+   `emitProgram`'s prologue already empties `mvValTyIx`, `rlElemTyIx`, `annRlSlot`, `annRlNul`,
+   `unMemTyStart`/`unMemTyCount`/`unMemTys` and `unMemAtoms`/`unMemAtomIds`/`unMemKinds` for
+   exactly this reason, with a paragraph of comment each. `startStmts` belongs in that list:
+   ```diff
+   @@ compiler/emit_sections.vl — emitProgram prologue @@
+      unMemAtoms = []
+      unMemAtomIds = []
+      unMemKinds = []
+   +  // Filled by `collectFns`, the FOURTH pass — so the three collect passes ahead of
+   +  // it can observe program N-1's node indices on a multi-program instance, and a
+   +  // dereference into the re-minted arena TRAPS. (Measured: 126 out-of-range reads
+   +  // over the corpus, all in `collectA`; 12 corpus files trap without this.)
+   +  startStmts = []
+      msPoolReset()
+   ```
+   With that line in place the copy inside `resetLitAtoms` becomes redundant and should be deleted
+   in the same change — **not before**, and the check is S2: `deno task test` must stay green with
+   exactly one of the two present.
+2. **🐛 A LAMBDA THAT CAPTURES A UNION BINDING DECLARED IN A BLOCK IS STILL BROKEN, AT BOTH
+   SCOPES.** `capturedUnionName` resolves a capture through `fnParent[fe]`, which is **−1** for a
+   lambda lifted from a module-scope statement, so its `letUnionNameOf` line is skipped and the
+   capture resolves to `""`. The function-scope form fails identically on master and here, so it
+   is not this bug. Cell: `cap-lambda` in the grid; the module form now rejects loudly
+   (`emitProgram: narrowed union binding is not a local or global`) instead of emitting invalid
+   wasm, which is the only part this slice changed. Owner: `emit_classify.vl` (the resolver) plus
+   whatever supplies the parent frame.
+3. **`refArrShapeKind` (12 CORE calls) and `refArrElemName` (10) ARE ONE GRAMMAR, TWO PROJECTIONS
+   — 12.6% of `emit_classify`'s remaining sites.** Both walk the array-name ladder
+   `i32ListArray → scalar-2D → mapArray → parenUnion → closureArray`, one returning the element
+   KIND and the other the element NAME. #1155 already merged `nameIsRefArray` + `refArrElemKind`
+   into the first of them, so the pattern is established. **Not a mechanical dedup**: the rung
+   orders differ and `refArrShapeKind`'s nested-ref arm calls `refArrElemName`, so the merged form
+   has to be measured, not reasoned.
+4. **THE SCORECARD'S LIST IS NOT CLOSED UNDER SIBLING ARMS.** 27 of the 39 `nameIs*` predicates
+   (136 call sites) are counted by neither list, three of them textually identical to counted
+   ones. Either widen the list once and re-baseline every published figure, or state the subset
+   explicitly in this doc's header. Doing neither is how "`emit_query` is CORE 2" turns into
+   "`emit_query` is clean".
+
+### Method notes earned
+
+118. **A PER-FILE A/B HARNESS CANNOT SEE A CROSS-PROGRAM STATE LEAK, AND MOST OF THIS PROGRAM'S
+     HARNESSES ARE PER-FILE.** The filed diff was "corpus A/B 1,340 files 0 differing" and traps
+     the compiler on 12 of them the moment two programs share an instance. Any slice that reads a
+     table filled by a numbered PASS must ask which passes run before it and whether the driver
+     resets between programs. The gate leg that sees it is `deno task test`; `vl check <dir>` is a
+     shared instance that stops before the emit passes and is blind too. **Name the channel, then
+     check the channel has the property you need.**
+119. **A ONE-ENTRY CACHE IS A TRAP FOR A LOOP, IN BOTH DIRECTIONS.** `parentLetOf`'s single-block
+     cache exists because it was the hottest self-compile function; a scan that calls it with N
+     different blocks pays N misses AND evicts the caller's entry. +369% on the rebuild counter.
+     The fix is not a bigger cache — it is a memo at the SCAN, keyed by the question being asked.
+120. **AN INERT SABOTAGE MAY MEAN THE DISTINGUISHING PROGRAM HAS NOT BEEN WRITTEN YET.** #1158's
+     note 114 says an inert sabotage can be sabotaging the wrong function; this is the other case.
+     S5 was inert on 1,345 corpus files, 33,600 fuzz programs and both existing pins.
+     Instrumenting the guarded WINDOW (310 queries, printed with their names) produced the program
+     that fires it, first attempt. **Before publishing "inert", instrument the condition the hunk
+     guards and try to construct its witness.**
+121. **A WORK TABLE WHOSE DENOMINATOR MOVES IS REPORTING A CRASH, NOT A SAVING.** The filed diff's
+     counters show four *negative* deltas. They are not optimisations: 12 programs die before the
+     report, so their work is missing from the sum. **Print the reporting-program count beside
+     every total** — it is what turns "−5,137 calls" into "12 programs never finished".
+122. **A FIX THAT MOVES A CELL FROM INVALID WASM TO A LOUD REJECT IS A RESULT, AND MUST BE GRADED
+     SEPARATELY FROM THE CELLS IT FIXES.** `cap-lambda` is a different bug — proved by its
+     function-scope control failing on BOTH sides — so it cannot go to `ok`, and folding it into
+     "17 fixed" would have been the same error as the six two-variable controls this bug was
+     originally filed with.

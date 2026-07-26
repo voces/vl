@@ -315,6 +315,7 @@ import {
   scopeNames,
   scopeSlots,
   slUsed,
+  startStmts,
   uDeclared,
   uFieldCount,
   uFieldElemName,
@@ -11367,6 +11368,22 @@ export function resetLitAtoms() {
   litAtomNext = 0
   gLitUnionUsed = 0
   if anyLitUnionUsed() { gLitUnionUsed = 1 }
+  // `startStmts` (read by `startBlockLetOf` below) is filled by `collectFns` — the
+  // FOURTH emit pass — so on a compiler instance that EMITS several programs (the
+  // corpus oracle drives one `WebAssembly.Instance` over the whole tree; `vl check
+  // <dir>` shares an instance too but stops at the checker, so it never gets here)
+  // the three collect passes ahead of it still observe program N-1's node indices.
+  // `collectA` does, measured: 113 out-of-range reads over the corpus, and
+  // dereferencing one into program N's re-minted arena TRAPS ("array element access
+  // out of bounds" — 11 corpus files, i.e. 11 `deno task test` failures).
+  // Emptied HERE — this reset is emit_classify's per-program hook and runs ahead of
+  // every pass — so a query issued before `collectFns` reads an EMPTY table and
+  // declines, exactly as it already does on a fresh instance. Same reasoning, and the
+  // same window, as `emitProgram`'s own `mvValTyIx` / `rlElemTyIx` / `unMemTys`
+  // clears; that prologue is the natural home for this line once `emit_sections.vl`
+  // is free to edit.
+  startStmts = []
+  sblMemo = Map()
   0
 }
 
@@ -14155,7 +14172,46 @@ export function unionNameOfIdent(name: string, fnIx: i32) {
   if cun != "" { return cun }
   const gi = globalLetOf(name)
   if gi >= 0 { return letUnionNameOf(gi, -1) }
+  const bl = startBlockLetOf(name)
+  if bl >= 0 { return letUnionNameOf(bl, -1) }
   ""
+}
+
+// A per-PROGRAM memo for `startBlockLetOf`: `name` → the `LetDecl` index it resolved
+// to, or -1. Cleared by `resetLitAtoms` alongside `startStmts`, so a row can never
+// outlive the arena whose node it names. It exists to keep `parentLetOf`'s ONE-entry
+// block cache from thrashing: the scan below hands that cache a DIFFERENT block on
+// every step, so an unmemoized scan both pays N map rebuilds itself and evicts the
+// map the caller's own function was using (measured over the 1,113-program corpus:
+// without this memo `plBuildLetMap` is +34,741 and `plScanStmt` +62,350; with it,
+// +1,384 and +4,285). A memo MISS is fail-safe: it declines, exactly as master does.
+let sblMemo: {[string]: i32} = Map()
+
+// The `LetDecl` for a MODULE-scope binding declared inside a top-level BLOCK
+// (`if true { const r = g() }`), or -1. Such a binding is a START-FUNCTION LOCAL, not
+// a wasm global, so `globalLetOf` — which is the wasm-global name table — cannot see
+// it; `parentLetOf` finds the function-scope dual but is never reached at module scope
+// (`fnIx < 0`). Scans each top-level statement with the same walker.
+//
+// The empty-table reject is not only the cheap one — it is also the WINDOW GUARD.
+// `startStmts` is filled by `collectFns`, the fourth pass, and `resetLitAtoms` empties
+// it per program, so an emptiness here means "the collect pass has not run yet" and
+// declining is both correct and what a fresh compiler instance already does.
+function startBlockLetOf(name: string) {
+  if startStmts.length < 1 { return -1 }
+  if sblMemo.has(name) {
+    const hit = sblMemo[name] ?? -1
+    return hit
+  }
+  let si = 0
+  let found = -1
+  while si < startStmts.length && found < 0 {
+    const li = parentLetOf(startStmts[si], name)
+    if li >= 0 { found = li }
+    si = si + 1
+  }
+  sblMemo[name] = found
+  found
 }
 
 // The ITERABLE expression node of an enclosing `for <name> in <iter>` loop within the
