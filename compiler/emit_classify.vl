@@ -10540,6 +10540,15 @@ export function internShapeDeep(nm: string) {
   // interned shape"). `internFuncTypeShapes` interns each PLAINLY-LOWERABLE shape
   // reached — see the soundness note there.
   if annArrowAt(nm) >= 1 && nm[0] == '(' { return internFuncTypeShapes(nm) }
+  // A GENERIC-APPLICATION leaf (`Pair<i32,string>`): `collectGenAliasShapes` interns an
+  // application only where a TypeRef spells it BARE (behind `| null` / `[]`), so one
+  // buried INSIDE another annotation's field text — the list element of
+  // `{v: Pair<i32,string>[]}` — reached no interner at all, and the code-5 field's
+  // element lookup then failed loudly ("ref-list field element type is not interned").
+  // This is the shape-descent dual of the map-VALUE `gaeEnsure` `collectGenAliasShapes`
+  // already does for the same reason. `gaeEnsure` no-ops on anything that is not a
+  // registered base's application, and is idempotent (`structIndexByName` guard).
+  gaeEnsure(nm)
   internInlineShape(nm) // no-op for any non-shape leaf
   0
 }
@@ -10621,6 +10630,72 @@ function structElemArrayLowerable(t: string): boolean {
   nameIsStructDecl(base) && variantIndexOf(base) < 0
 }
 
+// Split the INNER text of an inline object shape (`{…}`'s contents — `a:i32,b:{c:f64}`)
+// into PARALLEL field-NAME / field-TYPE-TEXT lists at depth 0. The ONE home of the
+// shape layer's field scanner: six functions used to carry a hand-copied private copy
+// of this loop (`funcTypeShapeLowerable`, `variantNestedShapeOk`,
+// `internNonLowerableFieldShapes`, `internShapeFieldElems`, `internInlineShape`,
+// `internShapeAs`), which is how the `<>` repair (D-GENBRACKET, #1118, then #1120's
+// sweep) had to be applied one scanner at a time — the drift hazard D-ABIDEDUP and
+// D-FIELDCODE removed from the ABI and field-code tables, here for the grammar itself.
+//
+// Depth-aware over `{}` `[]` `()` AND the generic-application brackets: a field whose
+// type is a generic APPLICATION carries the argument list's own `,` (`{v: Pair<i32,
+// string>}`) and a bracket-blind depth splits the FIELD list at it. `>` closes only
+// against an OPEN `<` (`tyGtIsClose`) — two other string languages ride this scanner
+// and both spell a `>` that closes nothing: `tyToStr`'s `->` render and the `$fnsig`
+// key's `ii>i`, and counting those runs the depth NEGATIVE.
+//
+// A part with no `name:` prefix is MALFORMED and pushes an EMPTY name (a well-formed
+// field name always has at least one character before its `:`, so `outNames[i] == ""`
+// is exactly the `ci <= 0` test each copy applied inline). The split is PURE — every
+// caller's per-field side effects run in the same left-to-right order they did when
+// they were interleaved with the scan.
+function shapeInnerFieldSplit(
+  inner: string,
+  outNames: string[],
+  outTexts: string[],
+) {
+  let depth = 0
+  let angOpen = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    const atEnd = k == inner.length
+    let brk = false
+    if !atEnd {
+      const ch = inner[k]
+      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
+      if ch == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      }
+      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
+      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
+      }
+      if ch == ',' && depth == 0 { brk = true }
+    } else {
+      brk = true
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci <= 0 {
+        outNames.push("")
+        outTexts.push("")
+      } else {
+        outNames.push(part.slice(0, ci))
+        outTexts.push(part.slice(ci + 1, part.length))
+      }
+      start = k + 1
+    }
+    k = k + 1
+  }
+  0
+}
+
 // Whether inline shape `nm` (`{f:i32,g:{h:i32}}`) lowers as a closure result/param
 // with NO unsupported composite field, recursing through nested inline shapes (and
 // their `| null`). A map / value-union / DISTINCT-backing-nullable-list / closure
@@ -10640,87 +10715,58 @@ export function funcTypeShapeLowerable(nm: string): boolean {
   if nm.length < 2 || nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' {
     return false
   }
-  const inner = nm.slice(1, nm.length - 1)
-  let depth = 0
-  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
-  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
-  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
-  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
-  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
-  let angOpen = 0
-  let start = 0
-  let k = 0
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
   let okAll = true
   let fieldCount = 0
-  while k <= inner.length {
-    const atEnd = k == inner.length
-    let brk = false
-    if !atEnd {
-      const ch = inner[k]
-      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
-      if ch == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      }
-      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
-      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      }
-      if ch == ',' && depth == 0 { brk = true }
+  let fi = 0
+  while fi < fnames.length {
+    if fnames[fi] == "" {
+      okAll = false
     } else {
-      brk = true
-    }
-    if brk {
-      const part = inner.slice(start, k)
-      const ci = part.indexOf(":")
-      if ci <= 0 {
-        okAll = false
-      } else {
-        const ftxt = part.slice(ci + 1, part.length)
-        const fc = nameFieldCode(ftxt)
-        if fc < 0 {
-          // A NESTED inline-shape field (`g:{h:i32}` / `g:{h:i32}|null`): recurse
-          // into the base shape — lowerable only if IT is.
-          let base = ftxt
-          const nb = nullablePartOf(base)
-          if nb != "" { base = nb }
-          if !funcTypeShapeLowerable(base) { okAll = false }
-        } else if !funcTypeFieldCodeSafe(fc) {
-          // A code-5 field whose type is a nested SCALAR-LEAF array (`f: boolean[][]`)
-          // or a lowerable STRUCT-element array (`f: {g: f64}[]`, `f: S[]`) is a plain
-          // ref-list slot — lowerable (see the header note). A code-19 MAP field whose
-          // VALUE kind the mv interner represents (`mvValKindOfName != -3`) is likewise
-          // lowerable: the field is a plain map-struct slot the `collectA` field pass
-          // interns (`mvShapeOfValName`) exactly as for a non-closure struct field —
-          // the R1 composition rep the original gate predated. A code-16 union-BOX
-          // field whose union is REGISTERED (`isUName` — `registerInlineUnion`'s
-          // functype-return descent registers a result shape's field unions in
-          // `collectU`, before this gate runs from `internShapeDeep`) is a plain box
-          // ref slot the same machinery a non-closure struct field uses. A code-22
-          // NULLABLE-CLOSURE field (`f: (() => i64) | null`) is the shared
-          // `(ref null $cloStruct)` fat-pointer slot — the SAME rep the field carries in
-          // any non-closure-result struct, so the shape interns and the literal that
-          // builds it name-set-matches THIS shape (un-interned, the literal self-coded
-          // the field 14 — a non-null layout the code-22 reads then mis-cast). Any other
-          // unsafe code keeps the shape un-interned (the clean closure reject).
-          if (
-            !(fc == 5 &&
-              (nameIsNestedScalarLeafArray(ftxt) ||
-              structElemArrayLowerable(ftxt) ||
-              nameIsClosureArray(ftxt))) &&
-            !(fc == 19 && mvValKindOfName(mapValNameOf(ftxt)) != -3) &&
-            !(fc == 16 && isUName(ftxt)) &&
-            fc != 22
-          ) {
-            okAll = false
-          }
+      const ftxt = ftexts[fi]
+      const fc = nameFieldCode(ftxt)
+      if fc < 0 {
+        // A NESTED inline-shape field (`g:{h:i32}` / `g:{h:i32}|null`): recurse
+        // into the base shape — lowerable only if IT is.
+        let base = ftxt
+        const nb = nullablePartOf(base)
+        if nb != "" { base = nb }
+        if !funcTypeShapeLowerable(base) { okAll = false }
+      } else if !funcTypeFieldCodeSafe(fc) {
+        // A code-5 field whose type is a nested SCALAR-LEAF array (`f: boolean[][]`)
+        // or a lowerable STRUCT-element array (`f: {g: f64}[]`, `f: S[]`) is a plain
+        // ref-list slot — lowerable (see the header note). A code-19 MAP field whose
+        // VALUE kind the mv interner represents (`mvValKindOfName != -3`) is likewise
+        // lowerable: the field is a plain map-struct slot the `collectA` field pass
+        // interns (`mvShapeOfValName`) exactly as for a non-closure struct field —
+        // the R1 composition rep the original gate predated. A code-16 union-BOX
+        // field whose union is REGISTERED (`isUName` — `registerInlineUnion`'s
+        // functype-return descent registers a result shape's field unions in
+        // `collectU`, before this gate runs from `internShapeDeep`) is a plain box
+        // ref slot the same machinery a non-closure struct field uses. A code-22
+        // NULLABLE-CLOSURE field (`f: (() => i64) | null`) is the shared
+        // `(ref null $cloStruct)` fat-pointer slot — the SAME rep the field carries in
+        // any non-closure-result struct, so the shape interns and the literal that
+        // builds it name-set-matches THIS shape (un-interned, the literal self-coded
+        // the field 14 — a non-null layout the code-22 reads then mis-cast). Any other
+        // unsafe code keeps the shape un-interned (the clean closure reject).
+        if (
+          !(fc == 5 &&
+            (nameIsNestedScalarLeafArray(ftxt) ||
+            structElemArrayLowerable(ftxt) ||
+            nameIsClosureArray(ftxt))) &&
+          !(fc == 19 && mvValKindOfName(mapValNameOf(ftxt)) != -3) &&
+          !(fc == 16 && isUName(ftxt)) &&
+          fc != 22
+        ) {
+          okAll = false
         }
-        fieldCount = fieldCount + 1
       }
-      start = k + 1
+      fieldCount = fieldCount + 1
     }
-    k = k + 1
+    fi = fi + 1
   }
   okAll && fieldCount > 0
 }
@@ -10738,57 +10784,28 @@ export function variantNestedShapeOk(nm: string): boolean {
   if nm.length < 2 || nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' {
     return false
   }
-  const inner = nm.slice(1, nm.length - 1)
-  let depth = 0
-  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
-  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
-  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
-  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
-  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
-  let angOpen = 0
-  let start = 0
-  let k = 0
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
   let okAll = true
   let fieldCount = 0
-  while k <= inner.length {
-    const atEnd = k == inner.length
-    let brk = false
-    if !atEnd {
-      const ch = inner[k]
-      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
-      if ch == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      }
-      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
-      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      }
-      if ch == ',' && depth == 0 { brk = true }
+  let fi = 0
+  while fi < fnames.length {
+    if fnames[fi] == "" {
+      okAll = false
     } else {
-      brk = true
-    }
-    if brk {
-      const part = inner.slice(start, k)
-      const ci = part.indexOf(":")
-      if ci <= 0 {
-        okAll = false
-      } else {
-        const ftxt = part.slice(ci + 1, part.length)
-        if nameFieldCode(ftxt) < 0 {
-          // A nested inline-shape field (`g: {h: i32}` / `g: {h: i32} | null`):
-          // lowerable only if ITS shape is.
-          let base = ftxt
-          const nb = nullablePartOf(base)
-          if nb != "" { base = nb }
-          if !variantNestedShapeOk(base) { okAll = false }
-        }
-        fieldCount = fieldCount + 1
+      const ftxt = ftexts[fi]
+      if nameFieldCode(ftxt) < 0 {
+        // A nested inline-shape field (`g: {h: i32}` / `g: {h: i32} | null`):
+        // lowerable only if ITS shape is.
+        let base = ftxt
+        const nb = nullablePartOf(base)
+        if nb != "" { base = nb }
+        if !variantNestedShapeOk(base) { okAll = false }
       }
-      start = k + 1
+      fieldCount = fieldCount + 1
     }
-    k = k + 1
+    fi = fi + 1
   }
   okAll && fieldCount > 0
 }
@@ -10876,65 +10893,36 @@ function internFuncTypeShapes(nm: string): i32 {
 // semantics for genuinely-unsupported reps. The depth-0 field split mirrors
 // `internShapeFieldElems`.
 function internNonLowerableFieldShapes(nm: string) {
-  const inner = nm.slice(1, nm.length - 1)
-  let depth = 0
-  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
-  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
-  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
-  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
-  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
-  let angOpen = 0
-  let start = 0
-  let k = 0
-  while k <= inner.length {
-    const atEnd = k == inner.length
-    let brk = false
-    if !atEnd {
-      const ch = inner[k]
-      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
-      if ch == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      }
-      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
-      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      }
-      if ch == ',' && depth == 0 { brk = true }
-    } else {
-      brk = true
-    }
-    if brk {
-      const part = inner.slice(start, k)
-      const ci = part.indexOf(":")
-      if ci > 0 {
-        const ftxt = part.slice(ci + 1, part.length)
-        // A closure field (`() => {f: i64}`) — intern its result shape. Depth-aware:
-        // an inner arrow makes the field a closure regardless of wrappers.
-        if annArrowAt(ftxt) >= 0 {
-          internShapeDeep(ftxt)
-        } else {
-          // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
-          // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
-          let base = ftxt
-          const nb = nullablePartOf(base)
-          if nb != "" { base = nb }
-          while (
-            base.length > 2 &&
-            base[base.length - 2] == '[' &&
-            base[base.length - 1] == ']'
-          ) {
-            base = base.slice(0, base.length - 2)
-          }
-          if base.length >= 2 && base[0] == '{' && base[1] != '[' {
-            internShapeDeep(base)
-          }
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
+  let fi = 0
+  while fi < fnames.length {
+    if fnames[fi] != "" {
+      const ftxt = ftexts[fi]
+      // A closure field (`() => {f: i64}`) — intern its result shape. Depth-aware:
+      // an inner arrow makes the field a closure regardless of wrappers.
+      if annArrowAt(ftxt) >= 0 {
+        internShapeDeep(ftxt)
+      } else {
+        // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
+        // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
+        let base = ftxt
+        const nb = nullablePartOf(base)
+        if nb != "" { base = nb }
+        while (
+          base.length > 2 &&
+          base[base.length - 2] == '[' &&
+          base[base.length - 1] == ']'
+        ) {
+          base = base.slice(0, base.length - 2)
+        }
+        if base.length >= 2 && base[0] == '{' && base[1] != '[' {
+          internShapeDeep(base)
         }
       }
-      start = k + 1
     }
-    k = k + 1
+    fi = fi + 1
   }
   0
 }
@@ -10947,56 +10935,27 @@ function internNonLowerableFieldShapes(nm: string) {
 // `{…}` leaf (`internInlineShape` no-ops on any other text). Runs only on a shape
 // `funcTypeShapeLowerable` accepted, BEFORE the shape itself interns.
 function internShapeFieldElems(nm: string) {
-  const inner = nm.slice(1, nm.length - 1)
-  let depth = 0
-  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
-  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
-  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
-  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
-  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
-  let angOpen = 0
-  let start = 0
-  let k = 0
-  while k <= inner.length {
-    const atEnd = k == inner.length
-    let brk = false
-    if !atEnd {
-      const ch = inner[k]
-      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
-      if ch == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
+  let fi = 0
+  while fi < fnames.length {
+    if fnames[fi] != "" {
+      let ftxt = ftexts[fi]
+      let peeled = false
+      while (
+        ftxt.length > 2 &&
+        ftxt[ftxt.length - 2] == '[' &&
+        ftxt[ftxt.length - 1] == ']'
+      ) {
+        ftxt = ftxt.slice(0, ftxt.length - 2)
+        peeled = true
       }
-      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
-      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
+      if peeled && ftxt.length >= 2 && ftxt[0] == '{' && ftxt[1] != '[' {
+        internInlineShape(ftxt)
       }
-      if ch == ',' && depth == 0 { brk = true }
-    } else {
-      brk = true
     }
-    if brk {
-      const part = inner.slice(start, k)
-      const ci = part.indexOf(":")
-      if ci > 0 {
-        let ftxt = part.slice(ci + 1, part.length)
-        let peeled = false
-        while (
-          ftxt.length > 2 &&
-          ftxt[ftxt.length - 2] == '[' &&
-          ftxt[ftxt.length - 1] == ']'
-        ) {
-          ftxt = ftxt.slice(0, ftxt.length - 2)
-          peeled = true
-        }
-        if peeled && ftxt.length >= 2 && ftxt[0] == '{' && ftxt[1] != '[' {
-          internInlineShape(ftxt)
-        }
-      }
-      start = k + 1
-    }
-    k = k + 1
+    fi = fi + 1
   }
   0
 }
@@ -11012,88 +10971,57 @@ function internShapeFieldElems(nm: string) {
 export function internInlineShape(nm: string) {
   if nm.length < 2 { return -1 }
   if nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' { return -1 }
-  const inner = nm.slice(1, nm.length - 1)
-  // Split `x:i32,y:string` into names + codes at depth 0. `texts` keeps each
-  // field's type TEXT (a code-16 union field interns its union and records the
-  // name in `sFieldElemName`; a code-15 nested field records its base shape).
+  // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
+  // the shape layer's ONE field scanner). `texts` keeps each field's type TEXT (a
+  // code-16 union field interns its union and records the name in `sFieldElemName`;
+  // a code-15 nested field records its base shape).
+  const rawNames: string[] = []
+  const rawTexts: string[] = []
+  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), rawNames, rawTexts)
   const names: string[] = []
   const codes: i32[] = []
   const texts: string[] = []
   let ok = true
-  let depth = 0
-  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
-  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
-  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
-  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
-  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
-  let angOpen = 0
-  let start = 0
-  let k = 0
-  while k <= inner.length {
-    const atEnd = k == inner.length
-    let brk = false
-    if !atEnd {
-      if inner[k] == '{' || inner[k] == '[' || inner[k] == '(' {
-        depth = depth + 1
-      }
-      if inner[k] == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      }
-      if inner[k] == '}' || inner[k] == ']' || inner[k] == ')' {
-        depth = depth - 1
-      }
-      if inner[k] == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      }
-      if inner[k] == ',' && depth == 0 { brk = true }
+  let fi = 0
+  while fi < rawNames.length {
+    if rawNames[fi] == "" {
+      ok = false
     } else {
-      brk = true
-    }
-    if brk {
-      const part = inner.slice(start, k)
-      // part is `name:type` — split at the first `:`.
-      const ci = part.indexOf(":")
-      if ci <= 0 {
-        ok = false
-      } else {
-        let ftxt = part.slice(ci + 1, part.length)
-        // PRE-INTERN any inline shape / value union buried in the field type BEFORE classifying. A
-        // nullable ref-list field (`{g:i32}[] | null` / `(i32|null)[] | null`, code 28) needs its element
-        // shape interned (or value-union registered) for `nameFieldCode` to even recognize the non-null
-        // part as a ref array. `internShapeDeep` peels array / nullable / grouping wrappers to the leaf and
-        // interns/registers it; a no-op for a scalar / nominal / map field. MUST be the parse loop (the
-        // outer shape is pushed to `sNames` only after this, so the flat `sField*` arrays aren't corrupted).
-        internShapeDeep(ftxt)
-        let fc = nameFieldCode(ftxt)
-        if fc < 0 {
-          // A NESTED inline-shape field: intern the nested shape (its `|null`
-          // wrapper stripped) and store a struct ref on it under the CANONICAL
-          // registered name. An earlier literal may have interned the identical
-          // shape as a synthetic `#anonN` (`anonFieldElemName` records that
-          // resolved name), so keying this field by the raw inline spelling
-          // (`{a:i32}`) both blocks the `annShapeIndexOf` dedup — minting a
-          // duplicate struct — and leaves the element `structIndexByName`-
-          // UNRESOLVABLE at type-section emit (a -1 `sHeapIdx` read). Store the
-          // interned struct's own `sNames` entry so both agree with the literal path.
-          let base = ftxt
-          const fnb = nullablePartOf(base)
-          if fnb != "" { base = fnb }
-          const iidx = internInlineShape(base)
-          if iidx >= 0 {
-            fc = 15
-            ftxt = sNames[iidx]
-          }
+      let ftxt = rawTexts[fi]
+      // PRE-INTERN any inline shape / value union buried in the field type BEFORE classifying. A
+      // nullable ref-list field (`{g:i32}[] | null` / `(i32|null)[] | null`, code 28) needs its element
+      // shape interned (or value-union registered) for `nameFieldCode` to even recognize the non-null
+      // part as a ref array. `internShapeDeep` peels array / nullable / grouping wrappers to the leaf and
+      // interns/registers it; a no-op for a scalar / nominal / map field. MUST run BEFORE any row is
+      // pushed (the outer shape is pushed to `sNames` only after this loop, so the flat `sField*`
+      // arrays aren't corrupted by the re-entrant intern).
+      internShapeDeep(ftxt)
+      let fc = nameFieldCode(ftxt)
+      if fc < 0 {
+        // A NESTED inline-shape field: intern the nested shape (its `|null`
+        // wrapper stripped) and store a struct ref on it under the CANONICAL
+        // registered name. An earlier literal may have interned the identical
+        // shape as a synthetic `#anonN` (`anonFieldElemName` records that
+        // resolved name), so keying this field by the raw inline spelling
+        // (`{a:i32}`) both blocks the `annShapeIndexOf` dedup — minting a
+        // duplicate struct — and leaves the element `structIndexByName`-
+        // UNRESOLVABLE at type-section emit (a -1 `sHeapIdx` read). Store the
+        // interned struct's own `sNames` entry so both agree with the literal path.
+        let base = ftxt
+        const fnb = nullablePartOf(base)
+        if fnb != "" { base = fnb }
+        const iidx = internInlineShape(base)
+        if iidx >= 0 {
+          fc = 15
+          ftxt = sNames[iidx]
         }
-        if fc < 0 { ok = false }
-        names.push(part.slice(0, ci))
-        codes.push(fc)
-        texts.push(ftxt)
       }
-      start = k + 1
+      if fc < 0 { ok = false }
+      names.push(rawNames[fi])
+      codes.push(fc)
+      texts.push(ftxt)
     }
-    k = k + 1
+    fi = fi + 1
   }
   if !ok || names.length == 0 { return -1 }
   const existing = annShapeIndexOf(names, codes, texts)
@@ -11111,36 +11039,7 @@ export function internInlineShape(nm: string) {
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
     forceScalarListField(codes[pi])
-    if codes[pi] == 16 {
-      // The union FIELD's name keys its atom set; registering it interns the
-      // shared box + the value-box reps it needs (this runs after `collectU`,
-      // but before any type-index math).
-      sFieldElemName.push(texts[pi])
-      recordSFieldElemTyIx(texts[pi]) // D5
-      registerValueUnionName(texts[pi])
-    } else if codes[pi] == 15 {
-      // The nested-struct field's TARGET name (`|null` stripped) — `emitObj`
-      // seeds a nested literal to it, `structIndexByName`-resolvable.
-      let b15 = texts[pi]
-      const nb15 = nullablePartOf(b15)
-      if nb15 != "" { b15 = nb15 }
-      sFieldElemName.push(b15)
-      recordSFieldElemTyIx(b15) // D5
-    } else if codes[pi] == 19 {
-      // A MAP field records its VALUE type-name (`i32` of `{[string]: i32}`) — the mv-slot
-      // interning key. The slot itself is interned in `collectA` (which resets `mvValName`,
-      // so interning here would be wiped); the inner map of an inline `{m:{[string]:V}}` is
-      // not a standalone TypeRef that `collectA`'s scan sees, so it interns code-19 FIELDS.
-      const mv19 = mapValNameOf(texts[pi])
-      sFieldElemName.push(mv19)
-      recordSFieldElemTyIx(mv19) // D5
-    } else if codes[pi] == 29 {
-      // A NULLABLE map field records the `| null`-stripped map's VALUE type-name — the
-      // same mv-slot key as code 19, interned by the same `collectA` field loop.
-      const mv29 = mapValNameOf(nulMapInnerName(texts[pi]))
-      sFieldElemName.push(mv29)
-      recordSFieldElemTyIx(mv29) // D5
-    } else if codes[pi] == 5 {
+    if codes[pi] == 5 {
       // A REF-LIST field (`f: N[]` / `f: (i32|null)[]`): record its element name (the CANONICAL ref-array
       // element name — parens stripped for a value-union element so it keys the same slot every other
       // union position uses), so `sFieldRefSlot` (`rlSlotByName`) finds the element's interned slot.
@@ -11183,26 +11082,23 @@ export function internInlineShape(nm: string) {
       sFieldElemName.push(e28)
       recordSFieldElemTyIx(e28) // D5
       if isValueUnionName(e28) { registerValueUnionName(e28) }
-    } else if codes[pi] == 0 && nameIsLitUnionType(texts[pi]) {
-      // A literal-union atom FIELD (code 0): record its union name so construction/read/assign
-      // recover the atom rep + membership (`sFieldIsLitUnion`).
-      sFieldElemName.push(texts[pi])
-      recordSFieldElemTyIx(texts[pi]) // D5
-    } else if codes[pi] == 4 && nameIsLitUnionArray(texts[pi]) {
-      // An ATOM-ARRAY field (`f: K[]`, code 4): record the array type-name so
-      // `sFieldIsLitUnionArray` seeds the atom-element context at construct/assign
-      // (and `collectA`'s field-table pass forces the i32 list types off it).
-      sFieldElemName.push(texts[pi])
-      recordSFieldElemTyIx(texts[pi]) // D5
-    } else if codes[pi] == 30 {
-      // A NULLABLE-litunion niche field (`f: K | null`, code 30): record the
-      // non-null union name so membership/atom recovery mirrors the code-0 field.
-      const nl30 = nulLitUnionInnerName(texts[pi])
-      sFieldElemName.push(nl30)
-      recordSFieldElemTyIx(nl30) // D5
     } else {
-      sFieldElemName.push("")
-      recordSFieldElemTyIx("") // D5
+      // EVERY OTHER CODE is recorded IDENTICALLY from the field's spelling, so the
+      // shape-text table answers (D-ELEMHOME — the same collapse D-FIELDCODE made of
+      // the two field-CODE ladders, one layer down): code 16 the union name, 15 the
+      // `| null`-stripped nested-struct target, 19 / 29 the map's VALUE name, 0 / 4 the
+      // litunion atom / atom-ARRAY name, 30 the `K | null` niche's union — and "" for
+      // anything else, including a PLAIN code 0 / 4. Only codes 5 and 28 above stay
+      // local: this recorder resolves an element through the ALREADY-INTERNED tables
+      // (`structIndexByName`, plus the grouping-paren peel) where the shape-text one
+      // records a DEFERRED `[]`-slice for `collectA`'s variant field pass to intern.
+      const en = shapeFieldElemName(texts[pi], codes[pi])
+      sFieldElemName.push(en)
+      recordSFieldElemTyIx(en) // D5
+      // The union FIELD's name keys its atom set; registering it interns the shared
+      // box + the value-box reps it needs (this runs after `collectU`, but before any
+      // type-index math).
+      if codes[pi] == 16 { registerValueUnionName(en) }
     }
     pi = pi + 1
   }
@@ -11213,55 +11109,25 @@ export function internInlineShape(nm: string) {
 // `key` — the same field parsing as `collectAnnShapes`, but keyed under the
 // alias name so `structIndexByName(key)` resolves params/locals/literals.
 export function internShapeAs(key: string, nm: string) {
-  const inner = nm.slice(1, nm.length - 1)
+  const rawNames: string[] = []
+  const rawTexts: string[] = []
+  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), rawNames, rawTexts)
   const names: string[] = []
   const codes: i32[] = []
-  let depth = 0
-  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
-  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
-  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
-  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
-  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
-  let angOpen = 0
-  let start = 0
-  let k = 0
-  while k <= inner.length {
-    const atEnd = k == inner.length
-    let brk = false
-    if !atEnd {
-      if inner[k] == '{' || inner[k] == '[' || inner[k] == '(' {
-        depth = depth + 1
-      }
-      if inner[k] == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      }
-      if inner[k] == '}' || inner[k] == ']' || inner[k] == ')' {
-        depth = depth - 1
-      }
-      if inner[k] == '>' && tyGtIsClose(inner, k, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      }
-      if inner[k] == ',' && depth == 0 { brk = true }
-    } else {
-      brk = true
+  let fi = 0
+  while fi < rawNames.length {
+    if rawNames[fi] == "" {
+      return emitFail("emitProgram: malformed struct field")
     }
-    if brk {
-      const part = inner.slice(start, k)
-      const ci = part.indexOf(":")
-      if ci <= 0 { return emitFail("emitProgram: malformed struct field") }
-      const fc = nameFieldCode(part.slice(ci + 1, part.length))
-      if fc < 0 {
-        return emitFail(
-          "emitProgram: only i32 / boolean / string / array struct fields are supported",
-        )
-      }
-      names.push(part.slice(0, ci))
-      codes.push(fc)
-      start = k + 1
+    const fc = nameFieldCode(rawTexts[fi])
+    if fc < 0 {
+      return emitFail(
+        "emitProgram: only i32 / boolean / string / array struct fields are supported",
+      )
     }
-    k = k + 1
+    names.push(rawNames[fi])
+    codes.push(fc)
+    fi = fi + 1
   }
   if names.length == 0 {
     return emitFail("emitProgram: empty struct alias shape")
@@ -11393,18 +11259,22 @@ export function gaeEnsure(name: string) {
         code = 15
         elem = tn
       }
-    } else if code == 15 {
-      const nb = nullablePartOf(tn)
-      if nb != "" { elem = nb } else { elem = tn }
     } else if code == 5 {
+      // The APPLIED element text, RAW: an instance field's list element is spelled
+      // by `gaeApplyFieldTy`'s substitution (`Box<i32>[]` → element `Box<i32>`), a
+      // name the canonicalizing recorder (`refArrElemName`) does not key. The one arm
+      // this path does not share with the shape-text table.
       elem = tn.slice(0, tn.length - 2)
-    } else if code == 16 {
-      elem = tn
-      registerValueUnionName(tn)
-    } else if code == 4 && nameIsLitUnionArray(tn) {
-      // An ATOM-ARRAY field of a generic instance (`f: K[]`) — same recording as the
-      // inline-shape path, so `sFieldIsLitUnionArray` covers monomorphized shapes.
-      elem = tn
+    } else if code >= 0 {
+      // Codes 15 / 16 / 4 are recorded IDENTICALLY from the field's spelling, so the
+      // shape-text table answers (D-ELEMHOME): the `| null`-stripped nested target,
+      // the union name, and the atom-ARRAY name (so `sFieldIsLitUnionArray` covers
+      // monomorphized shapes). The arm list is EXACTLY master's — this path records
+      // "" for the map (19/29), litunion-atom (0), nullable-ref-list (28) and
+      // `K | null` (30) codes where the shape-text table records a key. That
+      // difference is NOT merged here; it is a measured, filed divergence.
+      elem = shapeFieldElemName(tn, code)
+      if code == 16 { registerValueUnionName(elem) }
     }
     if code < 0 { ok = false }
     names.push(gaeFieldNames[fs + fi])
@@ -11834,15 +11704,6 @@ export function scalarTagOf(atom: string) {
 // the value-atom band.
 export function refArrSlotTag(slot: i32) { uVariants.length + 13 + slot * 2 }
 
-// The tag of a ref-element-array union ARM by its type NAME (`S[]`, `(() => f64)[]`,
-// `(C | D)[]`), or -1 when the arm's reflist slot was never interned (a mis-registered
-// union — a loud caller failure, never a silent wrong tag).
-export function refArrTagOf(atom: string) {
-  const slot = rlSlotByName(refArrElemName(atom))
-  if slot < 0 { return -1 }
-  refArrSlotTag(slot)
-}
-
 // The globally-stable tag of the MAP arm whose interned map value-slot is `slot` (the mono i32 /
 // atom map rides slot `-1`, its shared `$mStructIdx`). Maps claim the offsets of the band above
 // the value-atom band — `uVariants.length + 16 + 2*slot` — parity-interleaved with the ref-array
@@ -11858,14 +11719,6 @@ export function mapSlotTag(slot: i32) {
   let s = slot
   if s >= 0 { s = mvCanonRepOf(s) }
   uVariants.length + 16 + s * 2
-}
-
-// The tag of a map union ARM by its type NAME (`{[string]: string}`, `{[string]: i32}`), keyed on
-// its map VALUE's interned mv slot (`-1` for a mono/atom value). Non-failing: an un-interned value
-// resolves to the mono slot, so a map arm the union failed to register would tag as the mono map
-// rather than trap — a mis-registration is a loud caller failure at boxing/`is` time, not here.
-export function mapTagOf(atom: string) {
-  mapSlotTag(mvSlotOfMapValNameOrMono(mapValNameOf(atom)))
 }
 
 // The interned VALUE-BOX heap-type index for a scalar atom (`boolean` shares the

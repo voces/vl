@@ -7891,3 +7891,359 @@ it, which is the same answer without the string.
     the corpus, 0 over 50,400 fuzz programs, 0 TRUE returns on either, because `noteHoleAlt`
     dedups the same alternatives with `tyEq` one layer up. Ship it, say the sabotage is inert
     on every channel, and give the number instead of a pin.
+
+## D-ELEMHOME + D-GAELEAF — the shape layer's FIELD SCANNER and its ELEMENT-NAME table get ONE home, and TARGET 2's premise is refuted twice (#1130)
+
+Branched at `fd411bd`, rebased through `0d25eaa` (D-ATOMKIND #1128) onto **`cd69bd9`**
+(D-ASCANON + D-RECRENDER #1129). Every number below is stated against `cd69bd9`; where a
+measurement was first taken at an earlier base and MOVED, both readings are given, because the
+move is the finding.
+
+Three things, in `compiler/emit_classify.vl` only:
+
+1. **D-DEADTAG** — `mapTagOf` / `refArrTagOf`, which #1125 left with zero callers, are deleted.
+2. **D-ELEMHOME** — the `{…}` field SCANNER (six hand-copied copies) and the field
+   ELEMENT-NAME dispatch (three hand-copied copies) each get one home: D-FIELDCODE's move
+   applied to the two tables one layer down.
+3. **D-GAELEAF** — a generic APPLICATION buried inside another annotation's field text now
+   interns. Closes the gap `tests/cases/generics/type-arg-list-field.vl` was pinned on, and an
+   INVALID-WASM hole in the generic-instance interner.
+
+### The counting method, and the UNIT
+
+Local-aware, **by resolver actually called**, over `compiler/emit_classify.vl` (this slice's
+whole partition). Comments stripped and string literals blanked before matching; each
+resolver's own `function NAME(` header excluded; per-file sums cross-checked against the
+tree-wide total. The list is the SCORECARD CORRECTION's parser list plus D-ARROWTY's four
+additions — **319 call sites at master `cd69bd9`**, reproducing D-FIELDCODE's number exactly
+(`emit_classify.vl` is byte-identical at `0d25eaa` and `cd69bd9`).
+
+Two other census UNITS appear below and are NOT interchangeable with it: *inline character
+surgery* (the hand-written depth scanners) and *name-keyed resolutions*.
+
+### 1. D-DEADTAG — two functions with zero callers
+
+Re-grepped at `cd69bd9`, not taken from #1125's hand-off: `mapTagOf` and `refArrTagOf` have
+**0 call sites compiler-wide** (`compiler/*.vl` + `std/*.vl` + `scripts/*.vl`; every remaining
+textual hit is a doc comment). Deleting them removes **2 parses** (`mapValNameOf`,
+`refArrElemName`) and **2 name-keyed resolutions** (`mvSlotOfMapValNameOrMono`, `rlSlotByName`).
+`mapSlotTag` / `refArrSlotTag` — the slot→tag halves, which `wasmEmit` calls 3 + 5 times —
+stay; their `emit_classify` call counts go 1 → 0 because the deleted wrappers were their only
+callers here.
+
+### 2a. D-ELEMHOME, the SCANNER — six copies of the annotation grammar become one
+
+`emit_classify.vl` carried **eight** `{}[]()<>`-depth scanners. Six of them are the SAME loop
+over the SAME alphabet with the SAME `part.indexOf(":")` split, differing only in what they do
+with each `(name, text)` pair:
+
+| function | what it does per field |
+|---|---|
+| `funcTypeShapeLowerable` | classify + recurse; reject an unsupported code |
+| `variantNestedShapeOk` | the intern-free mirror of the same acceptance |
+| `internNonLowerableFieldShapes` | descend a closure / nested-shape field |
+| `internShapeFieldElems` | peel `[]` and intern a `{…}` leaf |
+| `internInlineShape` | classify, pre-intern, push the row |
+| `internShapeAs` | classify, `emitFail` on a bad field |
+
+They are now `shapeInnerFieldSplit(inner, outNames, outTexts)` plus six loops. The split is
+PURE, so every caller's per-field side effects (`internShapeDeep`, `internInlineShape`,
+`registerValueUnionName`) run in the same left-to-right order they did interleaved with the
+scan. A malformed part (`ci <= 0`) pushes an EMPTY name — a well-formed field name always has
+at least one character before its `:`, so `outNames[i] == ""` is exactly the test each copy
+applied inline.
+
+**This is why #1118's `<>` repair and #1120's sweep had to be applied one scanner at a time.**
+Measured, unit = *inline character surgery*: `tyGtIsClose` call sites in this file go
+**8 → 3** — the shared splitter, plus the two scanners that are genuinely different grammars
+and are documented as staying (see "what did not move").
+
+### 2b. D-ELEMHOME, the TABLE — the field ELEMENT-NAME dispatch
+
+`shapeFieldElemName(ftxt, code)` is the shape-text element-name recorder. #1123 already routed
+the NODE recorder (`fieldRefElemName`) through it, keeping the three arms that genuinely
+differ. Two more hand-copied copies remained: `internInlineShape`'s per-field push loop (10
+arms) and `gaeEnsure`'s (4 arms). Both now delegate.
+
+`internInlineShape` — arms 16 / 15 / 19 / 29 / 0 / 4 / 30 and the default are **character-for-
+character the same recording** as `shapeFieldElemName`'s, so they delegate; the code-16 arm's
+`registerValueUnionName` SIDE EFFECT stays at the call site. Codes **5 and 28 stay local** and
+are documented: this recorder resolves an element through the ALREADY-INTERNED tables
+(`structIndexByName`, plus a grouping-paren peel) where the shape-text one records a DEFERRED
+`[]`-slice for `collectA`'s variant field pass. That difference is load-bearing — sabotage S2.
+
+### 3. D-GAELEAF — the buried generic APPLICATION
+
+`collectGenAliasShapes` (`emit_collect`) interns an application only where a TypeRef spells it
+BARE, behind `| null` / `[]` (`gaePeelWrappers`). Its own comment records the same hole for the
+map-VALUE position and patches it there. The INLINE-SHAPE FIELD position has it too: in
+`{v: Pair<i32,string>[]}` the application is interior to the shape spelling, so no interner
+reached it and the code-5 field's element lookup failed loudly.
+
+`internShapeDeep` already peels every wrapper (grouping / `| null` / `[]`) and descends a MAP's
+value position; it now interns a generic-application LEAF through `gaeEnsure`. One line, at the
+bottom of the descent, where the leaf is already in hand.
+
+And `gaeEnsure`'s own element table was 4 arms where the shape-text table has 9 — a code-0
+litunion-atom field of a generic instance recorded `""`, so the row read back as a plain i32
+slot and the member literal emitted as a STRING ref into it. **INVALID WASM on master**, the
+exact shared-layout / different-encoding split `annShapeIndexOf`'s code-0 comment describes for
+the inline-shape path. The delegation closes it.
+
+Four programs graduate, each pinned:
+
+| pin | master `cd69bd9` | now |
+|---|---|---|
+| `generics/type-arg-list-field.vl` (was an `@emit-error`) | "ref-list field element type is not interned" | **runs** |
+| `generics/type-arg-list-field-return.vl` (new) | same reject | **runs** |
+| `generics/type-arg-nested-list-field.vl` (new, `Box<i32>[][]`) | same reject | **runs** |
+| `generics/type-arg-litunion-field.vl` (new) | **"failed to parse WebAssembly module"** | **runs** |
+
+Verified with `--compiler`: master's suite run with the three new files present is
+**1,998 passed / 3 failed**; the shipped build is **2,000 passed / 0 failed**.
+
+### The measurement — corpus and fuzz, both channels
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / message / run (A = `cd69bd9`, B = shipped) | **1,319 files** | **4 differ, all four the intended graduations; 1,315 byte-, message- AND run-identical** |
+| fuzz A/B, whole `--out-dir` trees | **50,400 programs/side**, 52,708 output files/side | **0 differing paths** |
+
+### The work, COUNTED not timed (method note 15)
+
+The split now allocates two arrays per scanner call where four of the six copies allocated
+none. Both compilers were instrumented identically — a tick at each scanner entry and at each
+`part` produced — and swept over the same corpus:
+
+| | scanner calls | parts produced | reporting files |
+|---|---|---|---|
+| master | 3,492 | 5,363 | 1,112 |
+| now | 3,498 | 5,369 | 1,115 |
+
+On the **identical 1,112-file population** the counts are **3,492 → 3,492** and
+**5,363 → 5,363**, with **0 per-file differences**; the +6/+6 is exactly the three programs
+that newly reach `emitProgram`'s end. So the character scanning is unchanged and the added
+cost is two array allocations per call — ~3 per corpus file. Counted, because a change this
+size is invisible to a wall clock (method note 15).
+
+### Entombment — four sabotages redden, one is corpus-blind and fuzz-red, one is inert
+
+Each sabotage is applied to the SHIPPED build and diffed against it over the corpus (byte,
+message AND run), on the landing base `cd69bd9`:
+
+| sabotage | corpus byte | msg | run | fuzz tree-diff |
+|---|---|---|---|---|
+| **S1 the shared splitter goes `<>`-BLIND** (the `<` / `>` arms deleted) | **2** | **2** | **2** | — |
+| **S2 `internInlineShape`'s code-5/28 arms DELEGATE** | 0 | 0 | 0 | **4 / 25,200** |
+| **S3 `gaeEnsure` reverts to master's 4-arm element list** | **1** | **1** | **1** | — |
+| **S4 `internShapeDeep` loses the `gaeEnsure` leaf arm** | **3** | **3** | **3** | — |
+| S5 the splitter's MALFORMED marker inverted (push the raw part as the NAME) | 0 | 0 | 0 | **0 / 25,200** |
+| **S6 the `internInlineShape` delegation is neutered** (`shapeFieldElemName(txt, -1)`) | **126** | **126** | **125** | — |
+
+- **S1 is the single-splitter pin.** One edit, in ONE function, reddens the generic-bracket
+  fixtures — which is the whole point: on master the same edit would have had to be made six
+  times to have the same effect, and #1118 is the record of what five-out-of-six looks like.
+  (`type-arg-nested-list-field.vl` is correctly unaffected: `Box<i32>[][]` has one type
+  argument and therefore no comma to mis-split.)
+- **S2 is CORPUS-BLIND and fuzz-RED** — method note 5's case, found only by running both. The
+  witness (seed 6, depth 6, `--declared --branching --multiobs`, case 353) is a declared-twin
+  program with a `{f: {f: i32}[]}` field: master and the shipped build both reject it with
+  "ref-list field element type is not interned"; S2 **compiles and runs it**. So merging the
+  code-5/28 arms is a behaviour CHANGE (one that graduates programs), not a dedup — filed as a
+  hand-off rather than taken.
+- **S5 is inert on both channels, and mostly inert BY CONSTRUCTION** (method note 8), stated as
+  such rather than as evidence. For five of the six consumers the perturbation cannot leave the
+  equivalence class: `nameFieldCode("")` is -1, which drives `okAll = false` / `ok = false` /
+  a no-op descent — exactly what the `ci <= 0` branch did. It leaves the class for
+  `internShapeAs` alone, where the message changes from "malformed struct field" to "only i32 /
+  boolean / string / array struct fields are supported" — and no channel reaches a malformed
+  field in `internShapeAs`. **No pin can exist for it today** (the #1114 / #1119 / #1123 form),
+  and per method note 65 the attempt to write one was made: a malformed shape alias is not
+  constructible through the parser, which is what makes the branch dead in the first place.
+
+### The call arithmetic
+
+`emit_classify.vl` only; no other file changes.
+
+| resolver | master `cd69bd9` | now | delta | where |
+|---|---|---|---|---|
+| `mapValNameOf` | 27 | 24 | **−3** | `mapTagOf` ×1, `internInlineShape` codes 19 + 29 ×2 |
+| `nullablePartOf` | 54 | 52 | **−2** | `internInlineShape` code 15, `gaeEnsure` code 15 |
+| `refArrElemName` | 30 | 29 | **−1** | `refArrTagOf` |
+| `nameIsLitUnionType` | 19 | 18 | **−1** | `internInlineShape`'s code-0 guard |
+| **parser-list TOTAL** | **319** | **312** | **NET −7** | |
+
+Off the parser list, the same delegations take `nulMapInnerName` 8 → 7,
+`nameIsLitUnionArray` 9 → 7, `nulLitUnionInnerName` 2 → 1 — **−4 further type-name classifier
+calls**, so **11** in total.
+
+- **Type-string PARSES deleted: 7** (parser list) / **11** (every classifier).
+- **Parses ADDED: 0. Sidecars added: 0. Consumers laddered: 0.**
+- **Name-keyed RESOLUTIONS deleted: 2** — `mvSlotOfMapValNameOrMono` 13 → 12,
+  `rlSlotByName` 14 → 13.
+- **Inline character surgery deleted: 5 of 8 depth scanners** — `tyGtIsClose` 8 → 3.
+- Delegation edges ADDED: 2 (`internInlineShape` → `shapeFieldElemName`,
+  `gaeEnsure` → `shapeFieldElemName`), retiring 14 hand-copied arms.
+  `gaeEnsure` 1 → 2 calls (the new `internShapeDeep` leaf arm).
+- Tree-wide parser list: **530 → 523**.
+- Source: **284 insertions, 427 deletions** (−147 lines in `emit_classify.vl`).
+- Binary: 1,034,041 → **1,030,494** bytes (**−3,547**).
+
+### TARGET 2 — the arena field-code classifier: the hand-off's premise refuted, and MY OWN blocker refuted one commit later
+
+D-FIELDCODE's hand-off proposed that an arena field-code classifier "does not have to be a copy
+at all: … a third `litNode`-style parameter on `fieldCodeOfSpelling`", making
+`shapeFieldTypeCompat`'s field-CODE tightening reachable from `repRowOfTyLenientRow`.
+
+**Refutation 1 — the parameter cannot be called.** `fieldCodeOfSpelling(t: string, litNode: i32)`
+is a function OF `t`. `litNode` changes which evidence ONE arm consults; the other 33 arms are
+predicates on the spelling, and the CALLER must supply it. `repRowOfTyLenientRow` has no
+spelling — that is what makes it the arena leg. The hand-off's own closing sentence says so
+(*"every other arm is a pure function of the spelling and will need its own arena reading"*);
+what it did not follow through is that the intended CALLER has nothing to pass. So the option
+set is: (a) render the arena type and feed the existing table; (b) write the third 34-arm
+ladder over `Ty` — `ty is TyPrim && primName == "i32"` cannot share an arm with `t == "i32"` —
+which is the exact drift hazard `repRowOfTyLenientRow`'s comment declines and that D-ABIDEDUP /
+D-FIELDCODE exist to have removed.
+
+**Refutation 2 — of this slice's own first answer.** At base `0d25eaa` a probe build that calls
+`tyToEmitName(ty)` at `repRowOfTyLenientRow`'s entry — route (a), the only route from an arena
+index to a spelling — **TRAPPED the compiler on 9 of 1,315 corpus files** that master compiled
+cleanly (`types/recursive-tree.vl`, `types/mutual-recursive-type.vl`, the four
+`soundness/recursive-*` files, `soundness/xfail-mutual-recursive-types.vl`,
+`structs/structural-twin-heap-dedup.vl`, `structs/optional-chain-member-recv.vl`); the backtrace
+was `tyToEmitName` self-recursing. That was written up as a hard blocker. **#1129 (D-RECRENDER)
+landed while this slice was gating, and the identical probe rebuilt at `cd69bd9` traps on
+0 of 1,319** — only the two pre-existing false positives (programs already failing the CHECKER
+on both sides) remain. The blocker is gone; the finding survives only as a dated measurement,
+and as the reason to re-take every number after a rebase.
+
+Route (a) is still the wrong route, but now for a reason on the program's own terms rather than
+a crash: reaching the tightening by rendering buys it with **a render plus a 34-arm SPELLING
+classification per field per candidate row** — i.e. it adds exactly the parse this program
+exists to delete. Measured on the probe: rendering every `repRowOfTyLenientRow` query costs
+**5,037 rendered characters over 357 queries** on the corpus and **89,342 over 5,153 queries**
+over 25,200 fuzz programs.
+
+**And the tightening does not need a field CODE at all**, which is the useful part. A probe on
+master measured the rung and its inputs (accumulated per program, emitted as the first
+`emitFail` at the end of `emitProgram`):
+
+| tag | corpus (1,319 files, 1,120 reporting) | fuzz (25,200 programs, 24,006 reporting) |
+|---|---|---|
+| `repRowOfTyLenientRow` rung 1 (identity, `structIndexOfTy`) | 163 | 2,388 |
+| **rung 2 (the un-tightened lenient field-NAME-set scan)** | **8** | **34** |
+| declines | 186 | 2,731 |
+| `rlSlotOfTyTwin` calls | 317 | 4,569 |
+| `rlSlotOfTyTwin` returns a SLOT | 6 | 6 |
+| …**of which at least one row came from RUNG 2** | **6** | **6** |
+| rung-2 matched row carries a recorded arena type (`sTyIx >= 0`) | **7 / 8** | **34 / 34** |
+| rung-2 QUERY `TyObj` has every `objFieldTypes[k] >= 0` † | **8 / 8** | **34 / 34** |
+
+† measured at `0d25eaa`, where `emit_classify.vl` is byte-identical; every other row in the
+table reproduces at `cd69bd9` (LR1 160→163 and TWQ 314→317 are the three corpus files #1129
+added that reach the site).
+
+Two findings:
+
+1. **The un-tightened rung is not vestigial — it decides EVERY slot `rlSlotOfTyTwin` ever
+   returns**, on both channels (6 of 6, 6 of 6). The six corpus witnesses are
+   `structs/declared-twin-inline-elem-{map-field,array}-param.vl` and the four
+   `structs/nested-{null-hole,union-softening}-list-{elem,return}-twin.vl`. So the tightening
+   question is live, not moot.
+2. **The arena dual of `shapeFieldTypeCompat` at this rung is a per-field TYPE comparison, not a
+   CODE comparison.** The candidate row's own arena type is recorded (`sTyIx`) at 7/8 corpus and
+   34/34 fuzz rung-2 matches, and the query's per-field arena types are complete at 8/8 and
+   34/34 — so both sides of the comparison are already in hand and no field-code vocabulary
+   enters. What it needs instead is a structural type equality over the arena, which this
+   program has already flagged as behaviour-changing ("tyEq is behavior-changing", the C1
+   de-stringify note), and 87.5% corpus coverage means it LADDERS rather than deletes. That is
+   the shape of the next slice, and it is a different slice from the one the hand-off described.
+
+### What did not move, and the mechanism
+
+- **`shapeFieldParse` and `splitUnionArmsAllDepth` keep their own scanners.**
+  `splitUnionArmsAllDepth` splits on `|`, not `,` — a different grammar. `shapeFieldParse` is
+  the FIELD-SET MATCHER's grammar and differs from `shapeInnerFieldSplit` in two ways that are
+  both load-bearing for it: it STRIPS SPACES (so the canonical `tyToEmitName` render and the
+  spaced `tyToStr` render parse the same) and it keeps a MALFORMED part's text as the field
+  NAME (so a name-set match fails cleanly rather than matching an empty name). Folding it in
+  would need two flags and would change the malformed contract; it is one scanner, not five.
+- **`internShapeAs` still records `""` for every field's element name.** It is the only one of
+  the three interners that does, and it is untouched here because that is a separate,
+  unmeasured question from the two copies this slice merged.
+- **`gaeEnsure`'s code-5 arm** keeps its raw `tn.slice(0, len-2)` element: an instance field's
+  list element is spelled by `gaeApplyFieldTy`'s substitution (`Box<i32>[]` → `Box<i32>`), a
+  name the canonicalizing `refArrElemName` does not key.
+- **`nameIsRefArray` — 19 call sites in this file, re-measured at `cd69bd9` and unchanged.**
+  #1123's mechanism holds: it folds INTERN state (`structIndexByName`,
+  `shapeElemDeclaredStructIdx`, `variantIndexOf`, a scan of `unNames`), so no structural reading
+  is its dual, and its faithful dual is the table lookup `rlSlotOfTy(tyRefArrElemOf(m))` — which
+  needs the element slot banked in `emit_state.vl`, another partition.
+- **The generic-instance MAP field (code 19) still fails at emit.** With the delegation the row
+  now records the map's VALUE name instead of `""`, but the mv SLOT itself is never interned for
+  a generic instance, so `Holder<S>` over `{[string]: S}` keeps its "map value type has no
+  interned slot" reject — identical on both sides. That interning is `collectA`'s
+  (`emit_collect.vl`), a different partition.
+
+### Hand-offs (exact diffs)
+
+1. **`emit_base.vl` L1699 / L1709 and `wasmEmit.vl` L1737-1751 name `mapTagOf` / `refArrTagOf`
+   in comments.** Both functions are gone; the concepts live on as `mapSlotTag` /
+   `refArrSlotTag`. Not edited here — other partitions.
+2. **`internInlineShape`'s code-5/28 arms could adopt the DEFERRED `[]`-slice fallback**, and
+   S2 measures exactly what that buys: **4 differing paths over 25,200 fuzz programs**, all in
+   the direction of graduating a program both master and this build reject
+   ("ref-list field element type is not interned" on a `{f: {f: i32}[]}` declared-twin field).
+   The diff is to delete the two local arms and let the `else` branch take them. It is a
+   behaviour change with a fuzz witness available today (seed 6, depth 6,
+   `--declared --branching --multiobs`, case 353) — write it as a fixture first.
+3. **`internShapeAs` records `""` for every element name** where its two siblings now share a
+   9-arm table:
+   ```
+   -    sFieldElemName.push("")
+   -    recordSFieldElemTyIx("") // D5
+   +    const en = shapeFieldElemName(rawTexts[pi], codes[pi])
+   +    sFieldElemName.push(en)
+   +    recordSFieldElemTyIx(en) // D5
+   ```
+   (`rawTexts` is already in scope after this slice.) Unmeasured — `internShapeAs`'s callers
+   need enumerating first.
+4. **`collectGenAliasShapes`** (`emit_collect.vl`) could drop its map-VALUE special case: with
+   D-GAELEAF, `internShapeDeep` reaches an application under ANY composition wrapper including
+   a map value, so the two are now redundant paths to the same `gaeEnsure`. Measure before
+   deleting — the phase ORDER differs (`collectGenAliasShapes` runs before `collectAnnShapes`).
+5. **The rung-2 tightening**, per TARGET 2 above: a per-field ARENA-TYPE comparison between
+   `T.tys[ty].objFieldTypes[k]` and `T.tys[sTyIx[si]].objFieldTypes[j]` at the matched field
+   name, gated on `sTyIx[si] >= 0` (7/8 corpus, 34/34 fuzz) and laddering to today's answer
+   where it is not. It needs a structural `tyEq` and it will ladder, not delete.
+
+### Method notes earned
+
+66. **A hand-off that names a PARAMETER has hidden an assumption about the CALLER**
+    (D-ELEMHOME) — D-FIELDCODE's `litNode` parameter works because both entry points hold the
+    spelling and one of them ALSO holds a node. The proposed third parameter cannot work,
+    because the caller it is for holds NEITHER a spelling nor a node it could get one from.
+    Before building a filed diff, check what the intended caller has in hand — not what the
+    function could accept. (Method note 63's shape, one level up: the hand-off was not a no-op,
+    it was addressed to a caller that cannot call it.)
+67. **A refactor's pin is a ONE-PLACE edit that reddens where the pre-refactor edit would have
+    had to be made N times** (D-ELEMHOME) — S1 deletes two `if` arms from `shapeInnerFieldSplit`
+    and two corpus files go red. On master the identical semantic sabotage requires six edits,
+    and #1118 is the record of what five-out-of-six looks like in production. For a
+    "collapse N copies into one" slice, that asymmetry IS the evidence; a byte-identical corpus
+    only says the collapse was faithful.
+68. **A TRAP is a measurement — and it expires like any other** (D-ELEMHOME / TARGET 2) — rather
+    than argue about `tyToEmitName`'s cycle guard, a probe build that simply CALLS it at the
+    site under discussion answered in one sweep: 9 of 1,315 corpus files that built cleanly on
+    `0d25eaa` stopped building. Two commits later (#1129, D-RECRENDER) the same probe traps on
+    **0 of 1,319**. The blocker was real when measured and false when shipped, and only the
+    re-measurement after the rebase caught it. A slice that quotes a blocker it took at its
+    branch point is quoting a stale lead — including when the slice is its own source.
+69. **The `git checkout -- <file>` that reverts a sabotage also reverts the SLICE**
+    (D-ELEMHOME, operational) — a sabotage/restore loop that spells "restore" as
+    `git checkout -- compiler/x.vl` silently discards uncommitted work, and the next build
+    "passes" because master compiles fine. Recovered from `git fsck --unreachable` (the dropped
+    stash commit) and verified by rebuilding to a byte-identical artifact. Keep a copy of the
+    good file beside the sabotage script and restore with `cp`; commit before the first
+    sabotage.
