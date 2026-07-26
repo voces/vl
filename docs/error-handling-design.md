@@ -1,16 +1,16 @@
 # VL error-handling design — errors as values over unions, no catchable throw
 
-> Status: **draft / design — pending owner review.** No compiler or std change
-> is proposed here; this doc changes none. It records the _direction_ for how VL
-> programs report and recover from failure, so the eventual fallible-std PRs
-> (`std:fs`, parsing) are small and uncontested. It **commits** a model now, but
-> the implementation is **sequenced** behind the Phase-2 rep rewrite
-> (§Sequencing); the `DECISIONS.md` entry lands with implementation, not before
-> — the spirit of `docs/guide/collections-design.md` and
-> `docs/internals/modules-design.md`. The owner has asked to see examples and a
-> cross-language survey before signing off; both are below (§Examples, §Survey),
-> and the open questions the owner must rule on are collected at the end
-> (§Open).
+> Status: **design — MODEL RULED BY THE OWNER (2026-07-26); implementation
+> sequenced.** No compiler or std change is proposed here; this doc changes none.
+> It records the _direction_ for how VL programs report and recover from failure,
+> so the eventual fallible-std PRs (`std:fs`, parsing) are small and uncontested.
+> The model is **committed** — errors as values (O1), and the **`as` trio**
+> (`as` propagates · `as?` coalesces to null · `as!` traps, §Trio) — but the
+> implementation is **sequenced** behind the Phase-2 rep rewrite (§Sequencing);
+> the `DECISIONS.md` entry lands with implementation, not before — the spirit of
+> `docs/guide/collections-design.md` and `docs/internals/modules-design.md`.
+> Examples and a cross-language survey are below (§Examples, §Survey); the
+> owner's rulings are collected at the end (§Open).
 
 ## Why this exists (the frame)
 
@@ -29,7 +29,7 @@ The good news: VL already has the machinery. Value unions, `is`-narrowing, `??`,
 _itself_ is written this way — `typecheck.vl` accumulates errors on `T.diags`
 rather than throwing, because "VL has no exceptions" (typecheck.vl ~:229). The
 question is not _what to build_ but _what convention to bless_ on top of what
-exists, and what small sugar (union-`as` propagation, §Chartered) to add later.
+exists, and what small sugar (the `as` trio, §Trio) to add later.
 
 ## Principles
 
@@ -193,7 +193,7 @@ The owner asked what modern languages do. The honest tradeoffs:
   conversion trait — VL has neither generics-over-error-types sugar nor traits
   today. **VL takes the substance (errors as values, early-return sugar) without
   the machinery**: our `T | E` union is Rust's `Result` spelled structurally,
-  and VL's propagation is union-`as` (§Sequencing) rather than postfix `?` — it
+  and VL's propagation is union-`as` (§Trio) rather than postfix `?` — it
   _names the wanted arm_ (`x as T`) instead of the error arm, which suits a
   structural union with no nominal `Result` to hang a trait on.
 
@@ -215,7 +215,7 @@ The owner asked what modern languages do. The honest tradeoffs:
   `E!T` is _a union of an error set and a value_, and `try` is exactly "unwrap
   or early-return the error." No exceptions, no allocation, exhaustive. **This
   is the model VL is closest to** — our `T | E` is Zig's `E!T` written with VL's
-  general union syntax, and the chartered union-`as` (§Sequencing) is Zig's
+  general union syntax, and the chartered union-`as` (§Trio) is Zig's
   `try`, generalized: because VL's error side is _everything except the named
   arm_, `x as T` propagates the remainder without needing a distinguished error
   set.
@@ -269,13 +269,48 @@ the rep family the Phase-2 rep rewrite is still burning down (R3b / R7). So:
    an _implementation-order_ constraint, not a paper blocker — std-design.md's
    D2 inventory already gates `std:fs` "on the error-handling design," and this
    is that design saying "yes, and here is the one rep prerequisite."
-3. **Follow-up (charter below):** the `?` propagation operator, once real chains
-   prove the ladder boilerplate.
+3. **Follow-up (§Trio):** the `as` trio. `as!` and `as?` can land with (or
+   before) the first fallible std surface — neither needs the rep work, and both
+   are useful the moment `T | null` exists. Propagating `as` is the one that
+   wants a real chain (`std:fs` + the test runner) to judge against, but its
+   **semantics are decided**, not open.
 
 `__trap__(msg)` can land independently of the rep work (it is a message + the
 existing `__trap__`), and resolves OD2 whenever convenient.
 
-### Chartered follow-up: union-`as` propagation
+### The `as` trio — RULED (2026-07-26, owner)
+
+**`as` propagates · `as?` coalesces to null · `as!` traps.** Three sad-path
+behaviors on one happy path; the happy-path type is identical in all three
+(`x as T`, `x as? T`, `x as! T` all yield a `T` when `x` is a `T` — `as?` yields
+`T | null` as an expression, the others `T`).
+
+| form | when `x` is not a `T` | use when |
+| --- | --- | --- |
+| `x as T` | early-returns the remainder to the caller | the caller needs the reason |
+| `x as? T` | yields `null` | a miss is expected and the reason is not needed |
+| `x as! T` | **traps** | a miss is a bug; or there is no caller (`main`) |
+
+This is Swift's `try` / `try?` / `try!` trio with `as` as the keyword, and it
+matches how Rust (`?` / `.ok()` / `unwrap()`) and Zig (`try` / `catch null` /
+`catch unreachable`) each ended up with all three on three spellings. The
+**cheapest-to-type form propagates**, which is the gradient those three languages
+converged on: the form you should reach for most should cost the least.
+
+Why the trio is not redundant: `as?` **destroys the error value** — it collapses
+`IoError{code, msg}` into `null`. For the `T | E` half of the model it is a lossy
+propagation, not a cheaper one, so it cannot stand in for `as` precisely when the
+reason matters most. `as!` cannot stand in either — a wasm trap kills the
+instance, which in a browser test runner or a long-lived sim is the end of the
+program, not a handled failure. The three cover three different quadrants:
+*reason needed* · *absence* · *bug*.
+
+**No migration cost, measured.** At master `2407531`, union-operand `as` is a
+clean compile error — ``[ERROR]: `as` supports numeric conversions only`` — so
+all three spellings are unclaimed and no existing program can change meaning.
+(This measurement is what retired the "ship trapping first because adding
+propagation later is non-breaking" sequencing argument: that asymmetry only
+bites once a trapping union-`as` has shipped, and none has.)
 
 The propagation ladder (§Examples, `loadAndParse`) is one `is`-check + early
 return _per fallible call_. VL removes it not with a Rust-style postfix `?` but
@@ -333,14 +368,34 @@ operand type. This is what lets fallible parsing (§Extensions) read `s as i32`
 with propagation and lossy numerics read `f as i32` with a trap — same syntax,
 the operand decides.
 
+**The known cost, stated rather than argued away.** `as` genuinely does two
+things: convert-and-trap for numerics, narrow-or-escape for unions — and which
+one a given line does depends on the operand's static type, which may not be on
+screen. Rust and Zig instead mark propagation lexically (`?`, `try`), identically
+regardless of operand. VL accepts the split because the **return-type obligation
+bounds it**: the checker requires the propagated remainder to be assignable to
+the enclosing function's declared return type, so a function whose return type
+has no error arm **cannot contain a propagating `as`** — it is a compile error.
+The reader's rule is therefore checkable from the signature alone:
+
+> _No error arm in the return type ⇒ nothing in this body can early-return._
+
+Numeric `as` never propagates by rule, and a numeric kernel returns a scalar, so
+webcraft-style `as f32`/`as i32` code is excluded twice over — by the operand
+rule and by its own signature. The residue is real but narrow: inside a function
+that *does* return `T | E`, finding the escape points means scanning for `as`
+with no distinguishing glyph. That is the context where propagating is the
+intent, which is why it was judged acceptable.
+
 ### Future extensions (design sketches — not chartered, open questions)
 
-- **(a) `as!` — assert instead of propagate.** `x as! T` narrows or **traps**
-  (rather than early-returning) when `x` is not a `T` — the "I know this is the
-  arm; a miss is a bug" form, usable in `main`/top-level where there is no
-  caller to propagate to. Possibly a bare `x!` shorthand for the `T | null` case
-  (`x!` ≡ `x as! (T where the null arm is dropped)`). _Open:_ is `as!` worth it
-  over an explicit `if !(x is T) { __trap__(...) }`?
+- ~~**(a) `as!` — assert instead of propagate.**~~ **CHARTERED, not an extension
+  — see §Trio.** `x as! T` narrows or **traps**. The "is it worth it over an
+  explicit `if !(x is T) { __trap__(...) }`" question is answered by the
+  no-caller case: `main` and top-level have nowhere to propagate, so without
+  `as!` every top-level cast is a hand-written trap ladder. A bare `x!`
+  shorthand for the `T | null` case (`x!` ≡ `x as! (T minus null)`) remains
+  **open sugar, not chartered**.
 - **(b) User-defined cast functions — `as(self: A): B`.** A UFCS-style operator
   overload: defining `as(self: string): i32 | ParseError` makes `s as i32`
   resolve to it. The composition is the payoff: a user cast returning
@@ -384,68 +439,66 @@ the operand decides.
 - **O4 — trap-with-message.** ~~Adopt `panic(msg)`?~~ **Ruled (2026-07): extend
   `__trap__` with an optional message instead — no new intrinsic name (VL keeps
   intrinsics dunder-only, on purpose), no keyword. Resolves std-design.md OD2.**
-> **⚠ O5/O6 — OWNER PROPOSED A DIFFERENT MECHANISM (2026-07-26). The questions below
-> are written against the PROPAGATION model; the owner's model is a CHECKED CAST.
-> Resolve the fork before answering the sub-questions — four of the five dissolve.**
->
-> - **Doc model:** `x as T` narrows, or **early-returns the remainder to the caller**
->   (the `?`/`try` analogue). All five O5 sub-questions exist only because of this.
-> - **Owner model:** `x as T` narrows, or **traps**; `as?` narrows or yields **null**.
->
-> **The owner's model is arguably more coherent**: numeric `as` is *already*
-> convert-and-trap, so `as` would mean one thing everywhere, whereas the doc model
-> makes `as` propagate for unions and trap for numerics — two mechanisms, one keyword.
-> It also dissolves the return-type obligation, the lambda rule, and the no-caller
-> case outright. **What it gives up is the early-return sugar** this doc's own survey
-> called "the only thing missing" vs Rust/Zig: fallible chains become Go-style
-> `is`-check ladders. Three landings, in preference order:
-> 1. Owner semantics now; **defer propagation sugar** to a distinct spelling
->    (`try x` / postfix `?`) once `std:fs` exists to judge the ergonomics against. ← recommended
-> 2. Owner semantics only; no propagation form ever.
-> 3. Doc model (`as` propagates, `as!` traps) — best chains, overloads `as`.
->
-> **Owner rulings already given on the sub-questions:**
-> - **Non-arm target** — `x as T` where `T` is not an arm of `x` is a **type error**. ✅ agrees with doc.
-> - **Narrowing-state** — `let bar = foo as string` should narrow **`foo` too**.
->   **Doc was wrong here; owner is right.** Under a trapping `as`, reaching the next
->   statement *proves* the cast succeeded, so flow-narrowing `foo` is sound and matches
->   how `if foo is string { … }` already behaves. (Sound under the propagation model too —
->   the remainder early-returned — so the doc's "unchanged" was over-conservative either way.)
->
-- **O5 — union-`as` propagation charter.** Accept union-`as` (`x as T` narrows
-  or early-returns the remainder) as the chartered propagation mechanism under
-  the unified `as` principle (numeric casts convert-and-trap, do not propagate)
-  — gated on real fallible chains, not v1. Sub-questions to rule on:
-  - **Return-type obligation.** The checker requires the propagated remainder
-    (`A | … minus T`) be assignable to the enclosing function's declared return
-    type. Require it spelled (leaning) vs infer it into the signature?
-  - **Propagation out of a lambda.** `as` inside a lambda early-returns to the
-    _lambda's_ caller, so the _lambda's own_ return type must admit the
-    remainder (not the outer function's). Confirm.
-  - **No-caller context.** union-`as` in `main`/top-level has nowhere to
-    propagate. Proposal: **compile error**, directing the author to `as!` (trap)
-    or an explicit `is`-check.
-  - **Non-arm target.** `x as T` where `T` is _not_ an arm of `x`'s union is a
-    **hard type error** (not a runtime miss). Confirm.
-  - **Narrowing-state interaction.** After `let bar = foo as string`,
-    `bar:
-    string` (the narrowed binding); `foo` is **unchanged** (still
-    `i32 | string`). Confirm this over auto-narrowing `foo` itself.
+- **O5 — the `as` trio.** ~~Accept union-`as` as the chartered propagation
+  mechanism; five sub-questions.~~ **RULED (2026-07-26, owner): `as` PROPAGATES ·
+  `as?` COALESCES TO NULL · `as!` TRAPS.** The fork is closed — see §Trio for the
+  model and the cross-language precedent. The owner briefly proposed the inverse
+  (a trapping bare `as`, on the grounds that numeric `as` already traps, so one
+  keyword would mean one thing); the trio was chosen over it because the
+  cheapest-to-type form should be the one you reach for most, which is the
+  gradient Rust, Zig and Swift all converged on. The coherence cost of the split
+  is recorded honestly in §The unified `as` principle rather than argued away.
+  All five sub-questions resolve:
+  - **Return-type obligation — REQUIRED AND SPELLED.** The checker requires the
+    propagated remainder (`A | … minus T`) be assignable to the enclosing
+    function's **declared** return type; it is not inferred into the signature.
+    This is load-bearing beyond type safety — it is what makes propagation
+    visible at the function level, which is the whole answer to "the early return
+    is invisible at the line level."
+  - **Propagation out of a lambda — the LAMBDA's own return type. CONFIRMED.**
+    `as` inside a lambda early-returns to the *lambda's* caller, so the lambda's
+    return type must admit the remainder, never the enclosing function's. In
+    practice `xs.map(x => parse(x) as i32)` is therefore a **compile error**
+    (the combinator's callback type does not admit `ParseError`), directing the
+    author to `as?` or to restructuring the loop. Stated explicitly because an
+    unstated rule here is a genuine trap: the intuitive read is that `as`
+    escapes the *enclosing function*, and it does not.
+  - **No-caller context — COMPILE ERROR.** union-`as` in `main`/top-level has
+    nowhere to propagate; the diagnostic directs the author to `as!` (trap) or
+    `as?` (null). This is the case that justifies `as!` existing at all.
+  - **Non-arm target — HARD TYPE ERROR. CONFIRMED** (owner agreed with the doc).
+    `x as T` where `T` is not an arm of `x`'s union is rejected at compile time,
+    not a runtime miss. Applies to all three forms.
+  - **Narrowing-state — `foo` NARROWS TOO. Doc was wrong; owner is right.**
+    After `let bar = foo as string`, both `bar` and `foo` are `string` on the
+    fall-through path. Sound under propagation for the same reason it is sound
+    under trapping: reaching the next statement *proves* the value was the named
+    arm, since the remainder early-returned. Matches how `if foo is string { … }`
+    already behaves. Same for `as!` (the miss trapped). **Not** for `as?`, where
+    the fall-through path includes the miss — `bar` is `string | null` and `foo`
+    is unchanged.
 - **O6 — future `as` extensions.** ~~(a) `as!` assert-or-trap; (b) user-defined
   casts; (c) `is?` castability pre-check.~~ **Owner ruled 2026-07-26, and both
   objections hold:**
-  - **(a) `as!` COLLAPSES.** It existed only because doc-`as` propagated, so a
-    trap variant was needed. Under the owner's trapping `as`, `as!` *is* `as`.
-    Dropped. (A bare `x!` for `T | null` may still be wanted as sugar for
-    `x as <non-null>` — separate question, not chartered.)
+  - **(a) `as!` UN-COLLAPSES — it is CHARTERED (§Trio).** An earlier revision of
+    this section recorded `as!` as dropped, on the reasoning that it existed only
+    because doc-`as` propagated, so under a trapping bare `as` it would be a
+    synonym. **That reasoning died with the O5 ruling**: `as` propagates, so the
+    trap form is a distinct, needed behavior — and it is the only form usable in
+    `main`/top-level, where there is no caller. (A bare `x!` for `T | null`
+    remains separate, open sugar — not chartered.)
   - **(c) `is?` MOSTLY collapses** — owner: "`x is T` implies `x as T` would
     succeed already." True for *narrowing* casts. The one gap: `is` is a type
     TEST while `as` can **convert** — `x is f64` is false for an `i32`, yet
     `x as f64` succeeds. So `is?` would mean "would the cast succeed", which is
     distinguishable from `is` **only in the converting (numeric) cases**. Thin
     value; **dropped unless a real use appears.**
-  - **(b) user-defined casts** — still open, but note it was framed as "composing
-    with propagation", which the fork above may remove. Re-frame after O5 lands.
+  - **(b) user-defined casts** — **still open, and its framing SURVIVES.** It was
+    framed as "composing with propagation", which the O5 fork threatened to
+    remove; the fork closed in propagation's favour, so a user cast returning
+    `i32 | ParseError` still feeds straight into the narrow-or-propagate rule and
+    `s as i32` still propagates `ParseError` for free. Open sub-questions are
+    unchanged: resolution/overload rules, ambiguity with builtin numeric casts.
 - **O7 — sequencing.** ~~Confirm fallible std (`std:fs`) is sequenced _after_ the
   R3b/R7 rep family, per the audit.~~ **RE-SCOPE THIS — the gate is measured much
   weaker than written.** R3b/R7 is ROADMAP Stage-B item (b5), "value-union

@@ -8260,7 +8260,356 @@ Two findings:
     is holding for that shape. The one place a spelling was still needed — rendering the pattern
     back in `vl fmt` — is the node's own source SPAN, not a re-derivation.
 
-## D-TSTY — `nameToTy` stops being the compiler's SECOND type parser at every positioned annotation (#1132)
+## D-NULCLOALIAS + D-STARTFRAME — an ALIAS-spelled nullable closure, the start function's missing `call_ref` frame, and TARGET 2's leads re-measured (#1133)
+
+Branched at `f82263e`, rebased onto `2407531` (docs only — `compiler/` is byte-identical across
+the two, so every number below holds at both). Two SILENT INVALID-WASM families, and a third
+found by the sweep the brief asked for. `compiler/emit_classify.vl` (this slice's partition)
+and `compiler/emit_sections.vl` (unowned by any of this cycle's three partitions).
+
+### The mechanism, read from the emitted bytes
+
+**Cell A — an alias-spelled nullable-closure GLOBAL.** `wasm-tools print` on the module for
+
+```vl
+type F = (i32) => i32
+function inc(x: i32) { x + 1 }
+const h: F | null = inc
+print(1)
+```
+
+shows the whole defect in two lines:
+
+```wat
+(global (;0;) (mut i32) i32.const 0)     ;; the CELL
+...
+ref.func 4  ref.null struct  i32.const 4  struct.new 1  global.set 0
+```
+
+The cell is a plain i32 while the start function stores a closure fat-pointer into it —
+`type mismatch: expected i32, found (ref $type)` at instantiation, with **no read of the
+binding anywhere in the program**. `globalCellKind`'s kind-19 arm asks `nulCloFlag`, and BOTH
+of that flag's legs answer no: its arena leg (`nodeTyIsNulClosure`) wants `TyNullable` over a
+`TyFunc`, but `parser.vl` encodes every non-`{…}`-bodied `type N = …` as a ONE-MEMBER
+`UnionDecl`, so the annotation arrives as `TyNullable(TyUnion[TyFunc])`; and its name leg
+(`nameIsNulClosure`) wants an arrow in the spelling, and `F | null` carries none. This is
+#1128's TARGET-1 finding one construct further out — there the *tested* type was alias-blind,
+here the *declaration* is.
+
+`nulCloFlagAnn` peels the degenerate wrapper through `tyDenotesFunc` (a one-member union has
+nothing to discriminate; it denotes its member — #1122's transparency rule) and feeds
+`globalCellKind` and `fieldTypeCode`.
+
+**Cell B — a closure CALL in a top-level block.** The bad module again:
+
+```wat
+(func (;5;) (type 3)          ;; the start function — NO locals vector
+  ...
+  global.get 0  ref.as_non_null  local.set 0   ;; unknown local 0
+```
+
+`call_ref` stages its fat pointer in `callRefSlot`, and `startFnDetectScratch` ran
+`blockHasCallRef` **only in the `else` arm** of its statement-shape split — the bare-statement
+arm. An `if`/`while`/`for` statement went to `startScanIf` / `startScanBlock`, walkers that
+carry every OTHER scratch detector (`blockHasStrOp`, `blockHasArrNew`, `blockHasCoalesceCall`,
+`blockHasMapOp`, the push/pop bits, the ref-push slots) and not this one. The detector now runs
+over the WHOLE statement, ahead of the split — which is where it belongs, because
+`blockHasCallRef` recurses into an `if`/`while`/`for` body itself.
+
+**This is not a nullable-closure bug at all**, which is why the brief's 2×2 could not localise
+it: `const h: (i32) => i32 = inc` then `if 1 == 1 { print(h(1)) }` is invalid wasm on master,
+and so is the lambda form. The brief's cell B (inline decl + `is` narrow) is invalid while the
+`!= null` twin *runs* — and the reason is an accident: a closure `!=` reserves the SEPARATE
+two-slot `cloEqScratchBase` frame (`leqScanStmt`, which does sweep every top-level statement),
+which happens to make the bad `local.set 0` in-bounds. `is` reserves nothing, so the same
+program traps validation. **A cell that "works" by landing inside a neighbouring frame is not
+a working cell** — the `!= null` form was one frame-layout change away from the same
+miscompile.
+
+### The position table — a nullable closure in every type position
+
+Master `f82263e` vs this slice, `type F = (i32) => i32` (ALIAS) against `((i32) => i32)`
+(INLINE) in each position. Two exercise modes, because they reach different layers and the
+brief's warning is exact: adding a CALL turns most alias cells into a **checker** error
+(`called value is not a function`) that hides the emit behaviour underneath.
+
+Exercise = `if h != null { print(1) } else { print(0) }` (no call — reaches emit):
+
+| position | inline, master | alias, master | inline, now | alias, now |
+|---|---|---|---|---|
+| module global | runs | **emit reject** (bare null needs a struct-typed context) | runs | **runs** |
+| top-level narrow (`!=`) | runs | **emit reject** (same) | runs | **runs** |
+| local (in a function) | runs | emit reject (same) | runs | emit reject (unchanged) |
+| param | runs | emit reject (only i32/…/string parameters) | runs | emit reject (unchanged) |
+| return | runs | emit reject (bare null needs a struct-typed context) | runs | emit reject (unchanged) |
+| struct field | runs | emit reject (only i32 / boolean / string / array struct fields) | runs | **runs** |
+| ref-list element | runs | runs | runs | runs |
+| map value | runs | runs | runs | runs |
+| `is` operand, inline-spelled binding | runs | runs (`is F`) | runs | runs |
+| `is` operand, alias-spelled binding | — | emit reject (`is` names a type that is not a union variant) | — | emit reject (unchanged) |
+
+Exercise = a narrowed CALL, which is where the INVALID WASM lives:
+
+| shape | master | now |
+|---|---|---|
+| alias global, **never read** | **INVALID WASM** (`expected i32, found (ref $type)`) | **runs** |
+| alias global + `is` narrow + call | emit reject (call to unknown function) | **runs** |
+| inline global + `is` narrow + call at TOP LEVEL | **INVALID WASM** (`unknown local 0`) | **runs** |
+| inline global + `!=` narrow + call at top level | runs (accidentally — see above) | runs |
+| **any** closure call in a top-level `if` body | **INVALID WASM** (`unknown local 0`) | **runs** |
+| **any** closure call in a top-level `while` body | **INVALID WASM** (`unknown local 0`) | **runs** |
+| lambda call in a top-level `if` body | **INVALID WASM** (`unknown local 0`) | **runs** |
+| alias `let` global, reassigned, `is` narrow + call | emit reject (call to unknown function) | **runs** |
+| alias-of-alias (`type G = F`) global + narrow + call | emit reject (call to unknown function) | **runs** |
+| alias field, multi-field struct, narrow + call | emit reject (unsupported struct field) | **runs** |
+| alias field, `{op: null}` | emit reject (unsupported struct field) | **runs** |
+
+**Every INVALID-WASM cell is gone. Every remaining alias cell is a located emit reject**, and
+each one is named with its mechanism under "what did not move".
+
+One reject CHANGED message and is called out rather than buried: a declared struct with an
+alias-nulclosure field COEXISTING with an inline-shape twin of the same field set
+(`type S = {op: F|null}` plus `const b: {op: F|null} = …`) went from the unlocated
+"only i32 / boolean / string / array struct fields are supported" to the LOCATED
+"binding's inline-shape type has an unsupported field". The declared struct now interns; the
+inline-shape twin still does not, because the SHAPE-TEXT ladder (`fieldCodeOfSpelling`) has its
+own copy of the alias blindness. A reject on both sides, with a better position on this one.
+
+### The channels
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / message / run (A = `f82263e`, B = shipped) | **1,303 files** | **4 differ — the four new pins, nothing else; 1,299 byte-, message- AND run-identical** |
+| fuzz A/B, whole `--out-dir` trees | **76,800 programs/side**, 79,317 output files/side | **0 differing paths** |
+
+The fuzz corpus is generated ONCE with the A seed and both compilers run the identical case
+files; the diff is `diff -rq` over whole trees (method note 12). Six generator configurations ×
+16 pinned seeds: plain depth 4, plain depth 5, `--values`, `--branching --multiobs`,
+`--declared`, `--declared --branching --multiobs`.
+
+**The fuzz comparator was proved to fire before the 0 was believed** (method notes 4/12): the
+same harness at **25,600 programs/side** with B = the S3 sabotage reports **1,317 differing
+paths**.
+
+### Entombment — four pins, all failing on master, and four sabotages
+
+Every pin was run against a MASTER-built compiler with `--compiler`, not inferred. The suite
+with the four new files present reads **2,010 passed / 4 failed** on `f82263e` and
+**2,014 passed / 0 failed / 14 ignored** here (the worktree baseline is 2,010 / 0 / 14 —
+6 binaryen `native-opt` tests self-ignore without `node_modules`).
+
+| pin | master `f82263e` | now |
+|---|---|---|
+| `closures/nullable-closure-alias-global-unread.vl` | **INVALID WASM** — `type mismatch: expected i32, found (ref $type)` | runs |
+| `closures/nullable-closure-alias-global.vl` | emit reject — `call to unknown function` | runs |
+| `closures/nullable-closure-alias-struct-field.vl` | emit reject — unsupported struct field | runs |
+| `closures/closure-call-in-toplevel-block.vl` | **INVALID WASM** — `unknown local 0: local index out of bounds` | runs |
+
+`-unread.vl` exists as a separate four-line file for a reason worth recording: **every richer
+program in the family reaches an emit REJECT before the module is built**, so the miscompile
+itself is only observable in a program that writes the binding and never reads it. A pin that
+merely "fails on master" would have pinned the reject, not the invalid wasm.
+
+Sabotages, each applied to the SHIPPED build and swept against it over the whole corpus (byte,
+message AND run):
+
+| sabotage | corpus byte | msg | run |
+|---|---|---|---|
+| **S1 the one-member-union PEEL is dead** (`tyDenotesFunc` never sees the inner) | **3** | **3** | **3** |
+| **S2 the `call_ref` detector goes back to the bare-statement arm** (= master's placement) | **2** | **2** | **1** |
+| **S3 EVERY nullable annotation claims the kind-19 niche** (the peel over-claims) | **49** | **39** | **48** |
+| **S4 `emit_collect`'s `shapeHasCloField` answers code 14 only** (the "delete the twin" diff) | **1** | **1** | **1** |
+
+- **S3 is the comparator sanity for the classifier's ANSWER, not its text** (method note 8):
+  the perturbation leaves the equivalence class in the only direction that matters — it says
+  "nullable closure" where the type is a nullable struct / string / list / map — and 49 corpus
+  files change. It is also the sabotage the fuzz leg was proved against.
+- **S2 reddens `closure-call-in-toplevel-block` on all three channels**, and reddens
+  `nullable-closure-alias-global`'s BYTES and MESSAGE while its RUN stays identical — the
+  accidental-frame effect above, measured from the other side: that file's `!= null` sibling
+  reserves the closure-eq frame, so the missing reservation is invisible in its output.
+
+### The work, COUNTED not timed (method note 15)
+
+The added compile-time work is one `blockHasCallRef` walk per top-level compound statement
+where master ran none. Two probe compilers were built — identical except for the detector's
+placement — each incrementing a counter at `blockHasCallRef`'s entry and reporting the
+per-program total as the last `emitFail` of `emitProgram`, then swept over the corpus:
+
+| | reporting files | `blockHasCallRef` node visits |
+|---|---|---|
+| master placement | 1,106 | 13,371 |
+| shipped placement | 1,106 | **13,546** |
+
+**+175 node visits over the identical 1,106-file reporting population, concentrated in 8
+files** (`lists/struct-pop-get-map.vl` 69 → 134 is the largest). `blockHasCallRef` is a pure
+boolean recursion that allocates nothing, and `nulCloFlagAnn` adds one `nodeTyIxOf` + one
+arena index + one `is TyNullable` test on the FALSE path of two classifiers — **no allocation
+added anywhere** (the WasmGC-bound constraint). Counted, because +1.3% of one detector's node
+visits is invisible to any wall clock.
+
+Binary: 1,035,387 → **1,035,517** bytes (**+130**). Source: 32 insertions, 4 deletions across
+the two compiler files.
+
+### TARGET 2 — the leads RE-MEASURED at `f82263e`, and two of four are refuted
+
+Unit and method stated first, because three of this arc's stale leads were unit confusions.
+**UNIT = CALL SITES** — a textual `name(` in non-comment code, string-literal-aware `//`
+stripper, each resolver's own `function NAME(` header excluded, per-file sums cross-checked
+against the tree-wide total over all compiler modules plus `std/` and `scripts/`.
+
+The method is validated against a known number before any new number is quoted: the SCORECARD
+CORRECTION's parser list plus D-ARROWTY's four additions reads **312 in `emit_classify.vl`**
+and **523 tree-wide** at `f82263e` — reproducing #1130's post-slice figures exactly. **This
+slice changes neither: parses deleted 0, parses ADDED 0, sidecars added 0, consumers laddered
+0.** It is a soundness fix, not a destringification, and is counted as such.
+
+**The brief's census figure of 1,047 operations for `emit_classify.vl` does not reproduce**,
+the same finding #1128 recorded for its own 83. The three units it sums are measurable
+separately and total far less: parser list **312**; inline character surgery
+(`tyGtIsClose`) **3** in this file (28 tree-wide, 14 of them in `typecheck`); the widest
+type-name classifier family that can be justified adds a few hundred more, not 700. Quoted as
+the brief gave it, with the note that no stated resolver list reproduces it.
+
+| lead | brief | measured at `f82263e` | verdict |
+|---|---|---|---|
+| `nameIsRefArray` call sites | 19 in this file / 28 tree-wide | **19 in `emit_classify`, 7 in `emit_collect`, 0 in `wasmEmit` → 26 tree-wide** | per-file figure CORRECT; **tree-wide is STALE** — #1125 took `wasmEmit`'s last two, as #1128's own refutation already recorded |
+| `shapeHasCloField` "has TWO definitions … export the indexed one and delete the twin" | a dedup | **REFUTED — they are homonyms, not twins** | see below |
+| `gaeEnsure`'s "missing in-flight guard" | an unguarded recursion | **STALE — #1127 (D-CYCTY) bounded it** | see below |
+| the shape-intern family / `sTyIxOfName` | "the tyIx is reachable and is being recomputed by re-parse" | **1 of 3 sites is a real parse** | see below |
+
+**`shapeHasCloField` — REFUTED, with a witness.** The two functions share a name across two
+modules and answer materially different questions:
+
+- `emit_classify.vl:3517 shapeHasCloField(si: i32, seen: i32[])` — takes an INTERNED struct
+  index, walks `sFieldTypeAt` for code **14 only**, recursing through code-15 nested-struct
+  fields with a `seen` guard. Consumer: `cloEqNoteBin` → `fnUsesCloEq`, the 2-slot closure-EQ
+  scratch frame.
+- `emit_collect.vl:912 shapeHasCloField(nm: string)` — takes a shape SPELLING, splits its
+  fields at depth 0 only (no descent), and answers true for code **14 OR 22**, for a
+  closure-ARRAY field, and for a UNION field with a closure / nul-closure / closure-array arm.
+  Consumer: `collectFnValUse` → `fnValUsed`, a MONOTONE machinery gate.
+
+Different code sets, different reach, different consumers, different monotonicity contracts.
+The filed diff is a behaviour change, and **S4 is its witness**: narrowing the string version's
+code set to the indexed version's (`fc == 14` alone) reddens
+`closures/variant-box-nullable-closure-field-result.vl` on byte, message AND run. The string
+version also carries its own MEASURED refutation in a comment (alias-blind by construction; an
+additive arena probe disagreed on 15 of 1,269 corpus files, every one in the direction of extra
+`true`s). **Method note 66's shape at the level of a NAME: two functions called the same thing
+in two modules are not one home with a duplicate.**
+
+**`gaeEnsure`'s in-flight guard — STALE.** `gaeEnsure` does recurse un-memoised
+(`gaeEnsure(base)` in the field loop, with `structIndexByName(name) >= 0` only set after the
+intern completes), and #1127 (D-CYCTY) already bounded it — one layer up, as a whole-program
+REJECT, and `applyGenAlias`'s comment names `gaeEnsure`'s field recursion explicitly as one of
+the three renderers it protects. Re-verified: `type Node<T> = { v: T, kids: Node<T>[] }` and
+the mutual pair both reject with "recursive generic type `…` is not supported — its expansion
+has no finite type name"; the directly self-referential non-array form is refused by the
+CHECKER first. No trap is reachable; there is nothing to add.
+
+**`sTyIxOfName` — 1 of 3 sites in this file is a parse; the other 2 are nominal identity.**
+`sTyIxOfName(nm)` is `cUserTypes[nm]` with a `{…}`-only `resolveAnnot` fallback.
+
+- `internShapeAs`'s `sTyIxOfName(key)` — `key` is a DECLARED alias name. That is the nominal
+  lookup the terminal condition explicitly exempts. Not a target.
+- `gaeEnsure`'s `sTyIxOfName(name)` — `name` is a generic APPLICATION (`Box<i32>`), which is
+  neither a `cUserTypes` key nor a `{`-shape, so both legs decline. A pure decline, and its
+  consequence is unmeasured (method note 10: reached ≠ consequential).
+- **`internInlineShape`'s `sTyIxOfName(nm)` — `nm` IS a `{a:i32,b:i32}` spelling, so this one
+  takes the `resolveAnnot` re-parse.** Deleting it means the CALLER hands over the index, and
+  `internInlineShape` has 6 call sites (4 `emit_classify`, 2 `emit_collect`) of which only some
+  hold an annotation NODE — several are handed a text derived by string surgery (e.g.
+  `sNames[iidx]`). It LADDERS through a second entry point; it is a slice, not a line.
+
+### What did NOT move, and the mechanism for each
+
+- **An alias-spelled nullable-closure LOCAL and PARAM.** `collectLocals` classifies through
+  `emit_query.vl`'s `letIsNulClosure`, and a param through `paramNulClosure` + `checkParams` —
+  both `nulCloFlag` verbatim. `emit_query.vl` is documented as depending on `emit_base` and the
+  lower modules only, and `emit_classify` imports FROM `emit_query`, so routing them through
+  this slice's `nulCloFlagAnn` is a cycle. The honest single home is `nulCloFlag` itself
+  (`emit_base.vl`) — another partition this cycle. Both positions reject cleanly today.
+- **An alias-spelled nullable-closure RETURN.** `wasmEmit`'s `nulCloFlag(fn.fnRet)` decides
+  `retNulClosure` and `emit_sections`' `vtKindOfType(fn.fnRet)` writes the result valtype. This
+  slice deliberately did NOT touch `vtKindOfType`: making the valtype kind-19 while
+  `wasmEmit`'s bare-`null` return path still reads the un-peeled flag would trade a clean
+  reject for a NEW divergence. The two must move together, in one partition.
+- **The SHAPE-TEXT field ladder (`fieldCodeOfSpelling`) is still alias-blind.** `fieldTypeCode`
+  (the NODE entry point) peels; its spelling twin does not, which is why an inline-shape twin of
+  a now-internable declared struct still rejects. The same split D-FIELDCODE's `litNode`
+  parameter exists to bridge, one code further down.
+- **The CHECKER does not narrow an alias-spelled nullable closure to a callable through
+  `!= null`.** `if h != null { h(1) }` with `h: F | null` is `called value is not a function
+  ((i32) -> i32)` — a type error, at every position, on both sides. `h is (i32) => i32` DOES
+  narrow it. That asymmetry is what makes the no-call exercise mode necessary to see the emit
+  layer at all, and it is `typecheck.vl`'s.
+
+### Hand-offs, each with the exact diff
+
+1. **`emit_base.vl` — give `nulCloFlag` the peel, and this slice's helper retires.** The whole
+   family (local, param, return, and the two sites this slice patched) collapses to one home:
+   ```
+    export function nulCloFlag(tyIx: i32) {
+      if nodeTyIxOf(tyIx) >= 0 {
+        if nodeTyIsNulClosure(tyIx) { return 1 }
+   +    const t = T.tys[nodeTyIxOf(tyIx)]
+   +    if t is TyNullable { if tyDenotesFunc(t.nInner) { return 1 } }
+        return 0
+      }
+   ```
+   `emit_base` cannot import `emit_rep` (it is below it), so either `tyDenotesFunc` moves down
+   to `emit_base` or the peel goes into `typecheck.vl`'s `nodeTyIsNulClosure` — which is the
+   better home and is hand-off 2. Measure the RETURN position with it: `vtKindOfType` and
+   `wasmEmit`'s `retNulClosure` must flip together.
+2. **`typecheck.vl` — `singleAliasMemberTyIx` admits a `TyFunc` member.** The root fix, and the
+   one #1128's hand-off 4 already described in prose:
+   ```
+        if mt is TyPrim { return m0 }
+   +    if mt is TyFunc { return m0 }
+        if mt is TyObj { if isPlainAliasRef(name) { return m0 } }
+   ```
+   With it, `canonEmitName("F | null")` produces `((i32)=>i32)|null` and the alias stops
+   existing for every emit consumer at once — including the spelling ladder and the checker's
+   `!= null` narrowing. It is a wider blast radius than either patch above (it changes what
+   `nameToTy("F")` returns), so it needs its own corpus + fuzz gate; this slice did not take it
+   because `typecheck.vl` is another partition.
+3. **`emit_classify.vl` — `internShapeAs` still records `""` for every element name.** #1130's
+   hand-off 3, re-verified as still open at `f82263e`; unchanged here.
+4. **`emit_classify.vl` — `internInlineShape`'s `sTyIxOfName` re-parse**, per TARGET 2 above: a
+   second entry point taking the annotation NODE, laddering to today's spelling where the
+   caller has only text.
+
+### Method notes earned
+
+71. **A cell that "works" can be working by ACCIDENT of a neighbouring frame** (D-STARTFRAME) —
+    the brief's 2×2 had `!= null` running and `is` invalid, which reads as a narrowing-form bug.
+    It is not: both forms emit the identical `call_ref` with the identical missing reservation,
+    and `!=` merely also reserves the two-slot closure-EQ frame, which makes the out-of-bounds
+    `local.set 0` land in bounds. Reading the BYTES of the passing cell — not only the failing
+    one — is what separated "the `is` path is broken" from "the frame is missing for both".
+72. **Sweeping the neighbourhood means varying the EXERCISE, not only the position**
+    (D-NULCLOALIAS) — a nullable-closure sweep that calls the value reports a CHECKER error in
+    9 of 10 alias positions and never reaches emit; the same sweep with
+    `if h != null { print(1) }` reports the emit layer in all 10. The brief's own warning
+    ("exercise the value, not a literal") has a converse: exercise it as LITTLE as will still
+    reach the layer under test. The invalid-wasm cell was the one with NO read at all.
+73. **A detector placed in one arm of a shape SPLIT is a hole shaped like the other arms**
+    (D-STARTFRAME) — `startFnDetectScratch` splits top-level statements into
+    for/for-in/while/if and "everything else", and eight scratch detectors are distributed
+    across those arms by hand. Seven recurse into block bodies from the arm they sit in; the
+    eighth sat in the `else` arm while its walker recursed on its own. The audit that finds this
+    is: for each detector, does it live at the SPLIT or inside an arm — and if inside, does
+    every other arm reach it? (`blockHasVariantRebox`, `mfScan` and `leqScanStmt` all sit at the
+    split; they were the control that showed `blockHasCallRef` was the odd one.)
+74. **Two functions with the SAME NAME in two modules are not a duplicated home**
+    (D-NULCLOALIAS / TARGET 2) — `shapeHasCloField` reads as an obvious dedup and is not one:
+    different code sets (14 vs 14|22|array|union-arm), different reach (nested-struct recursion
+    vs depth-0), different consumers, different monotonicity. The check that settles it is a
+    sabotage that makes one adopt the other's rule; here that is a one-line edit with a corpus
+    witness. Before filing "delete the twin", write the diff and sweep it.
+
+## D-TSTY — `nameToTy` stops being the compiler's SECOND type parser at every positioned annotation (#1134)
 
 Branched at `f82263e` (D-MATCHTY #1131). Every number below is measured **at that head**; where a
 figure the brief inherited disagrees, the disagreement is recorded rather than reconciled.
