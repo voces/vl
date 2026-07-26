@@ -979,7 +979,18 @@ fn binaryen_missing_note(flag: &str, tool: &str, env_override: &str, consequence
 /// `vl build -O`: shell out to `wasm-opt` to shrink the emitted module IN PLACE,
 /// when a `wasm-opt` is available. VL output is WasmGC, so the GC + reference-type
 /// features are REQUIRED for binaryen to even validate it; we enable EXACTLY those
-/// two — `-all` would turn on post-3.0 features that wasmtime then refuses to load.
+/// (plus bulk memory, below) — `-all` would turn on post-3.0 features that wasmtime
+/// then refuses to load.
+///
+/// `--enable-bulk-memory` is the linear-memory tier's flag. Binaryen 130 (the pinned
+/// version) HARD-FAILS validation on `memory.copy`/`memory.fill` without it — measured,
+/// `rc=1` and NO OUTPUT FILE WRITTEN, so a `vl build -O` would leave the unoptimized
+/// module on disk and `bail!` — and the flag is set here AHEAD of the emitter writing
+/// those opcodes so the day it does, `-O` does not break. Both engines VL targets
+/// (wasmtime 47, V8) have bulk memory on by default: it is wasm 2.0 core, so enabling
+/// it for binaryen costs nothing and closes a loud future failure.
+/// See `docs/internals/buffer-design.md` §B4.
+///
 /// A missing `wasm-opt` is a soft no-op (the unoptimized module is already written).
 fn optimize_in_place(path: &str) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
@@ -992,6 +1003,7 @@ fn optimize_in_place(path: &str) -> Result<()> {
             "-O",
             "--enable-reference-types",
             "--enable-gc",
+            "--enable-bulk-memory",
             "-o",
             path,
         ])
@@ -1005,8 +1017,11 @@ fn optimize_in_place(path: &str) -> Result<()> {
 
 /// `vl build --wat`: shell out to `wasm-dis` to write a `.wat` text dump beside the
 /// emitted module. Like `-O`, WasmGC output needs the GC + reference-type features
-/// enabled for `wasm-dis` to parse it (NOT `-all` — see `optimize_in_place`). A
-/// missing `wasm-dis` is a soft no-op (the `.wasm` is already written).
+/// enabled for `wasm-dis` to parse it (NOT `-all` — see `optimize_in_place`), and
+/// carries `--enable-bulk-memory` for symmetry with `-O`. Measured: `wasm-dis`
+/// tolerates bulk-memory opcodes either way (rc=0 both), so this flag changes nothing
+/// today — it is here so the two binaryen call sites cannot drift apart.
+/// A missing `wasm-dis` is a soft no-op (the `.wasm` is already written).
 fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
     let Some(dis) = binaryen_tool("wasm-dis", "VL_WASM_DIS") else {
         binaryen_missing_note("--wat", "wasm-dis", "VL_WASM_DIS", "skipped the .wat");
@@ -1017,6 +1032,7 @@ fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
             wasm_path,
             "--enable-reference-types",
             "--enable-gc",
+            "--enable-bulk-memory",
             "-o",
             wat_path,
         ])

@@ -46,11 +46,46 @@ buf.loadF64(off): f64   buf.storeF64(off, v)
 ```
 
 > Maintainer's note (vl side): "4 store widths" counts *declarations*. Measured,
-> **one** store width and one load width are lowered by the emitter — the other
+> **one** store width and one load width were lowered by the emitter — the other
 > four `__store_*__`/`__memory_*__` names typecheck and then fail at emit. The
 > four-width world was the deleted TS compiler's. See
 > [`internals/buffer-design.md`](internals/buffer-design.md) §A1 for the probe
 > table; the ask below is unchanged, only the baseline is.
+>
+> **Update — the LOAD half of this matrix has shipped, as raw intrinsics.** All
+> eight load widths lower to single wasm instructions today, verified by
+> disassembly, and so do `memory.size`/`memory.grow`:
+>
+> ```vl
+> __load_i8__(a): i32     // i32.load8_s   — sign-extends
+> __load_u8__(a): i32     // i32.load8_u   — zero-extends
+> __load_i16__(a): i32    // i32.load16_s
+> __load_u16__(a): i32    // i32.load16_u
+> __load_i32__(a): i32    // i32.load
+> __load_i64__(a): i64    // i64.load
+> __load_f32__(a): f32    // f32.load
+> __load_f64__(a): f64    // f64.load
+> __memory_size__(): i32       // pages currently mapped
+> __memory_grow__(pages): i32  // the PREVIOUS page count, or -1 on failure
+> ```
+>
+> `a` is a byte address into the module's linear memory, which is now **exported
+> as `memory`** (P0.2, below). The port can start against
+> `__load_f32__(base + (i << 2))` — the same shape as the TS twin's `DataView` —
+> while the `Buffer` surface is designed. What is NOT here: the seven store
+> widths (only `__store_i32__` lowers, so a column is written as i32 words), the
+> `Buffer` type and its allocator, and the bulk ops. Two limits worth knowing
+> before you build on this:
+>
+> - **Top level and plain named functions only.** A named function wrapping one
+>   of these fails to emit in any module that uses a function value anywhere
+>   (`captured variable not found in enclosing frame`) — censused, it is all ten
+>   names in that position, and it is why no `Buffer` method surface ships yet.
+>   `buffer-design.md` §B3/O7.
+> - **`memory.grow` detaches every host view**, silently: `byteLength` becomes 0
+>   and an indexed read returns `undefined` rather than throwing. Re-read
+>   `.buffer` after any call that can grow; never cache a view across a guest
+>   call.
 
 - A real allocator (bump is fine — the sim allocates a few large Buffers at
   init and never frees), replacing today's "program picks raw addresses,
@@ -67,7 +102,7 @@ authoritative sim state — ECS columns, entity tables, RNG/tick counters,
 pathing grids, the Lua VM arena — lives here so that snapshot/rollback/hash
 are memcpy-class and byte-comparable with the TS twin's ArrayBuffers.
 
-### P0.2 Exported memory (zero-copy host visibility)
+### P0.2 Exported memory (zero-copy host visibility)  ✅ SHIPPED
 
 The compiled module's linear memory must be exported (`--export-memory` or
 automatic when `Buffer` is used). This single change replaces the current
@@ -75,6 +110,34 @@ per-scalar host-call ABI for bulk data: the JS host overlays
 `Float32Array`/`DataView` on `instance.exports.memory.buffer` and reads
 columns in place; commands go in by writing bytes and calling a scalar
 export with `(offset, len)`.
+
+> Maintainer's note (vl side): **done, automatic, no flag.** The memory is
+> exported under the name `memory`, gated on the module having a linear memory at
+> all — which it only does when the program uses one — so nothing changes for a
+> program that does not. `instance.exports.memory` is a `WebAssembly.Memory`;
+> `DataView` and `Float32Array` overlays read guest bytes in place, and a host
+> write through such a view is visible to the guest. Proved from both hosts
+> (`tests/vl_exported_memory_test.ts`; a wasmtime 47 embedding reads the same
+> module). No host change was needed anywhere.
+>
+> Two consequences to design around:
+>
+> - **A user function exported as `memory` is now a compile error** in a program
+>   that also uses linear memory, because wasm export names must be unique. It is
+>   a mechanical fix (rename the function) and the reject names it.
+> - **`memory.grow` detaches every host view.** This is the one sharp edge in the
+>   combination of P0.1's growth and P0.2's export: a `Float32Array` taken before
+>   a growth reports `byteLength === 0` afterwards and an indexed read of it
+>   yields `undefined` — it does not throw. In a render-publish path that is a
+>   silent wrong answer, so **re-read `.buffer` after any guest call that can
+>   grow**, and never cache a view across one. The test suite asserts this
+>   behaviour rather than describing it. (A Rust/wasmtime host gets the same
+>   hazard as a borrow-check error, because the byte slice borrows the `Store`
+>   that growing needs mutably.)
+>
+> The `shared` memory option below is untouched and still not P0. Note it would
+> require declaring a maximum size, which the emitter does not do today (`min 1`,
+> no max).
 
 - The existing scalar-only export contract then needs *nothing else* — C-style
   `ptr/len` embedding falls out. `snapshotPtr(): i32`-style exports let the
