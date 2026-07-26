@@ -104,7 +104,8 @@ import {
 import { numLexFitsI32, numLexIs2Pow31 } from "./emit_bignum"
 import {
   annArrowAt,
-  annSplitParams,
+  annFnDecompose,
+  annRetNameOf,
   annSplitPipe,
   callMemProp,
   capHas,
@@ -6282,10 +6283,10 @@ export function cloArrSlotRetName(slot: i32) {
   nm = nonNulBaseOf(nm)
   if nm.length < 2 { return "" }
   if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
-  const inner = nm.slice(1, nm.length - 1)
-  const at = annArrowAt(inner)
-  if at < 0 { return "" }
-  return inner.slice(at + 2, inner.length)
+  // `annRetNameOf` (#1144) IS this `annArrowAt`-then-slice pair. Its gate is `< 1` where
+  // this copy spelled `< 0`; the two differ only for an arrow at index 0, i.e. a name
+  // BEGINNING `=>`, which no renderer produces (the home's own header argues this).
+  return annRetNameOf(nm.slice(1, nm.length - 1))
 }
 
 // The wide-SCALAR coercion kind of parameter `idx` read from a `$fnsig` KEY's param-token
@@ -7895,9 +7896,9 @@ export function calleeCloRetName(name: string, fnIx: i32) {
   }
   // A closure-typed LOCAL / GLOBAL binding annotation.
   if ft == "" { ft = identFnTypeAnnName(name, fnIx) }
-  const at = annArrowAt(ft)
-  if at < 0 { return "" }
-  return ft.slice(at + 2, ft.length)
+  // The second exact copy of `annRetNameOf` (#1144); same `< 0` vs `< 1` note as
+  // `cloArrSlotRetName` above.
+  return annRetNameOf(ft)
 }
 
 // True if the expression is a NAME (param / local / module global) annotated
@@ -10888,19 +10889,18 @@ function internFuncTypeShapes(nm: string): i32 {
   // a bogus default index — INVALID-WASM; fuzz-nightly run 29808029476, seed 100113225
   // d4). A genuinely nullable closure (`(()=>i32)|null`) nests its arrow in parens —
   // `annArrowAt` is depth-aware, so it still takes the peel below.
-  const fa = annArrowAt(nm)
-  if fa >= 1 && nm[0] == '(' && nm[fa - 1] == ')' {
-    const inner = nm.slice(1, fa - 1)
-    if inner.length > 0 {
-      const parts: string[] = []
-      annSplitParams(inner, parts)
-      let pi = 0
-      while pi < parts.length {
-        internFuncTypeShapes(parts[pi])
-        pi = pi + 1
-      }
+  // `annFnDecompose` (#1144) IS this arrow-index + `[0] == '('` + `[fa - 1] == ')'` triple,
+  // its param-list slice, its `length > 0`-guarded `annSplitParams` and its return slice —
+  // the home's own header names this file's three copies as the residue.
+  const fParts: string[] = []
+  const fRet = annFnDecompose(nm, fParts)
+  if fRet != "" {
+    let pi = 0
+    while pi < fParts.length {
+      internFuncTypeShapes(fParts[pi])
+      pi = pi + 1
     }
-    return internFuncTypeShapes(nm.slice(fa + 2, nm.length))
+    return internFuncTypeShapes(fRet)
   }
   const np = nullablePartOf(nm)
   if np != "" { return internFuncTypeShapes(np) }
@@ -11953,19 +11953,25 @@ export function forceCloResultMapTypes(nm: string) {
   let i = 0
   while i < arms.length {
     const a = monoUnwrapParens(arms[i])
-    const fa = annArrowAt(a)
-    if fa >= 1 && a.length > 0 && a[0] == '(' {
-      let res = monoUnwrapParens(a.slice(fa + 2, a.length))
-      const rn = nulMapInnerName(res)
-      if rn != "" { res = rn }
-      if nameIsBareMap(res) {
-        mUsed = true
-        lUsed = true
-        aUsed = true
-        mvShapeOfMapName(res)
-      } else if annArrowAt(res) >= 0 {
-        // A curried result (`() => () => {[string]: V}`) recurses to ITS result.
-        forceCloResultMapTypes(res)
+    // `annRetNameOf` (#1144) IS the `annArrowAt` + `slice(fa + 2, …)` pair, and its `< 1`
+    // gate IS this site's `fa >= 1`. The caller keeps its own `a[0] == '('` test — which
+    // now runs FIRST, so the one-char reject precedes the depth scan instead of following
+    // it (a strict work REDUCTION: `annArrowAt` no longer runs on an arm that cannot pass).
+    if a.length > 0 && a[0] == '(' {
+      const ret0 = annRetNameOf(a)
+      if ret0 != "" {
+        let res = monoUnwrapParens(ret0)
+        const rn = nulMapInnerName(res)
+        if rn != "" { res = rn }
+        if nameIsBareMap(res) {
+          mUsed = true
+          lUsed = true
+          aUsed = true
+          mvShapeOfMapName(res)
+        } else if annArrowAt(res) >= 0 {
+          // A curried result (`() => () => {[string]: V}`) recurses to ITS result.
+          forceCloResultMapTypes(res)
+        }
       }
     }
     i = i + 1
@@ -11993,33 +11999,38 @@ export function forceCloResultListTypes(nm: string) {
   let i = 0
   while i < arms.length {
     const a = monoUnwrapParens(arms[i])
-    const fa = annArrowAt(a)
-    if fa >= 1 && a.length > 0 && a[0] == '(' {
-      const res = nonNulBaseOf(monoUnwrapParens(a.slice(fa + 2, a.length)))
-      if nameIsStringArray(res) {
-        slUsed = true
-        aUsed = true
-      } else if nameIsF64Array(res) {
-        fa64Used = true
-      } else if nameIsI64Array(res) {
-        ia64Used = true
-      } else if nameIsF32Array(res) {
-        fa32Used = true
-      } else if nameIsI32Array(res) {
-        lUsed = true
-        aUsed = true
-      } else if nameIsRefArray(res) {
-        // A REF-element list result (`((i32) => {a,f,z}[]) | f64` — a struct-element
-        // array returned by a union-arm / nullable-niche closure): intern its element
-        // slot + force the ref-list machinery, exactly as a BARE `S[]` annotation's
-        // branch does — else a narrowed arm's value call keys a `>r<slot>;` sig no
-        // producer interned (its slot unresolvable), or the read finds no wrapper.
-        rlUsed = true
-        raUsed = true
-        ensureRefElem(refArrElemName(res))
-      } else if annArrowAt(res) >= 0 {
-        // A curried result (`() => () => f32[]`) recurses to ITS result.
-        forceCloResultListTypes(res)
+    // `annRetNameOf` (#1144), exactly as in `forceCloResultMapTypes` above: its `< 1` gate
+    // IS this site's `fa >= 1`, and the caller's own `a[0] == '('` test now runs FIRST so
+    // the one-char reject precedes the depth scan.
+    if a.length > 0 && a[0] == '(' {
+      const ret0 = annRetNameOf(a)
+      if ret0 != "" {
+        const res = nonNulBaseOf(monoUnwrapParens(ret0))
+        if nameIsStringArray(res) {
+          slUsed = true
+          aUsed = true
+        } else if nameIsF64Array(res) {
+          fa64Used = true
+        } else if nameIsI64Array(res) {
+          ia64Used = true
+        } else if nameIsF32Array(res) {
+          fa32Used = true
+        } else if nameIsI32Array(res) {
+          lUsed = true
+          aUsed = true
+        } else if nameIsRefArray(res) {
+          // A REF-element list result (`((i32) => {a,f,z}[]) | f64` — a struct-element
+          // array returned by a union-arm / nullable-niche closure): intern its element
+          // slot + force the ref-list machinery, exactly as a BARE `S[]` annotation's
+          // branch does — else a narrowed arm's value call keys a `>r<slot>;` sig no
+          // producer interned (its slot unresolvable), or the read finds no wrapper.
+          rlUsed = true
+          raUsed = true
+          ensureRefElem(refArrElemName(res))
+        } else if annArrowAt(res) >= 0 {
+          // A curried result (`() => () => f32[]`) recurses to ITS result.
+          forceCloResultListTypes(res)
+        }
       }
     }
     i = i + 1
@@ -14367,9 +14378,13 @@ export function letUnionNameOf(letIx: i32, fnIx: i32) {
 // The UNION return of a function-type NAME (`(i32) => A | B` → "A | B", an alias `(i32) => Sh` → its
 // member set via `isUName`), or "" when the name is not a function type returning a multi-member union.
 function unionRetOfFnType(fnTyName: string) {
-  const arrowAt = annArrowAt(fnTyName)
-  if arrowAt >= 1 && fnTyName.length > 0 && fnTyName[0] == '(' {
-    const ret = monoUnwrapParens(fnTyName.slice(arrowAt + 2, fnTyName.length))
+  // `annRetNameOf` (#1144): its `< 1` gate IS this site's `arrowAt >= 1`, and the caller
+  // keeps its own `[0] == '('` test — hoisted AHEAD of the scan, as in the two
+  // `forceCloResult*` twins.
+  if fnTyName.length > 0 && fnTyName[0] == '(' {
+    const ret0 = annRetNameOf(fnTyName)
+    if ret0 == "" { return "" }
+    const ret = monoUnwrapParens(ret0)
     if isUName(ret) { return ret }
     if isValueUnionName(ret) { return ret }
     // A value union with a litunion-ALIAS arm (`K0 | i64`): never a registered union
@@ -18282,23 +18297,19 @@ function annRetKind(t: string) {
 // call over an annotated callee resolves the interned signature. "" if any param/return
 // type is outside the value-call ABI (the all-i32 arity fallback then applies).
 function annSigKey(name: string) {
-  const arrowAt = annArrowAt(name)
-  if arrowAt < 1 { return "" }
-  if name[0] != '(' { return "" }
-  if name[arrowAt - 1] != ')' { return "" }
-  const paramsStr = name.slice(1, arrowAt - 1)
-  const retStr = name.slice(arrowAt + 2, name.length)
+  // `annFnDecompose` (#1144) IS this whole preamble — the three gates, the param-list
+  // slice, the `length > 0`-guarded `annSplitParams` and the return slice. The home's ""
+  // sentinel covers all three of this copy's own `return ""` legs.
+  const parts: string[] = []
+  const retStr = annFnDecompose(name, parts)
+  if retStr == "" { return "" }
   let key = ""
-  if paramsStr.length > 0 {
-    const parts: string[] = []
-    annSplitParams(paramsStr, parts)
-    let i = 0
-    while i < parts.length {
-      const pc = annParamKind(parts[i])
-      if pc == "" { return "" }
-      key = key + pc
-      i = i + 1
-    }
+  let i = 0
+  while i < parts.length {
+    const pc = annParamKind(parts[i])
+    if pc == "" { return "" }
+    key = key + pc
+    i = i + 1
   }
   const rc = annRetKind(retStr)
   if rc == "" { return "" }
@@ -19521,22 +19532,18 @@ export function cloRetTypeName(fe: i32) {
 // `rlSlotByName`, `structIndexByName`) want `P` / `P[]`. Applied ONCE at the mono boundary so the
 // instance is nominal throughout. A non-function name, or one with no resolvable shape, passes through.
 export function nominalizeFnType(name: string) {
-  const at = annArrowAt(name)
-  if at < 1 { return name }
-  if name[0] != '(' { return name }
-  if name[at - 1] != ')' { return name }
-  const paramsStr = name.slice(1, at - 1)
-  const retStr = name.slice(at + 2, name.length)
+  // `annFnDecompose` (#1144) IS the three gates + both slices + the guarded param split;
+  // this copy's three `return name` legs are exactly the home's "" sentinel. The third and
+  // last copy in this file — `annSplitParams` goes to ZERO call sites here.
+  const parts: string[] = []
+  const retStr = annFnDecompose(name, parts)
+  if retStr == "" { return name }
   let out = "("
-  if paramsStr.length > 0 {
-    const parts: string[] = []
-    annSplitParams(paramsStr, parts)
-    let i = 0
-    while i < parts.length {
-      if i > 0 { out = out + "," }
-      out = out + resolveShapeToNominal(parts[i])
-      i = i + 1
-    }
+  let i = 0
+  while i < parts.length {
+    if i > 0 { out = out + "," }
+    out = out + resolveShapeToNominal(parts[i])
+    i = i + 1
   }
   out + ")=>" + resolveShapeToNominal(retStr)
 }
