@@ -14359,3 +14359,321 @@ changed arm on the corpus was ZERO before this PR added it.**
     "files producing wasm" out of 1,328 rows** because the glob swept the `.msg`/`.out` sidecars.
     **Both were caught by an implausible magnitude, in the direction that reports MORE difference —
     the direction a refactor's author is least likely to check.**
+## D-ARROWHOME + D-GROUPEND + D-MONOHOME + D-FIELDROW — the LAST hand-written bracket ladders in `emit_base`/`emit_collect` retire, and the ann-decomposition home that was already imported gets used
+
+### The unit, the denominator, and the command — and my OWN base
+
+Base **`b71888e`** — and MASTER MOVED UNDER ME MID-SLICE: I opened at `a4fb7c1` (359/36/395),
+#1148 and #1149 landed while I measured, and every number below is RE-MEASURED at the base I
+actually gate against. Measured in this session with `scratchpad/parsercount.py`
+(string-literal-aware `//` stripper, definition headers excluded, per-file sums cross-checked
+against the tree total). The unit is **non-comment CALL SITES of the named resolver list**, not
+call counts and not greps.
+
+| | CORE (23-list) | OFF-LIST | TRUE TOTAL |
+|---|---|---|---|
+| my base `b71888e` | **346** | **36** | **382** |
+| this slice | **343** | **35** | **378** |
+| delta | **−3** | **−1** | **−4** |
+
+Per file, mine only: **`emit_collect` 55 → 54** (54+1 → 54+0) · **`emit_base` 51 → 51** (48+3 →
+48+3) · **`emit_mono` 8 → 5**. The brief's scoreboard was accurate at `a4fb7c1` (359/36/395) and **13 CORE stale by the time I
+gated** — `emit_classify` 211 → 200 and `emit_query` 4 → 2 landed under me, both outside my
+partition, which left my three files at exactly 55/51/8 across the rebase. I also measured the
+SLICE BEFORE ME the same way (`2fae030` reads 368/40/408, so #1147 was CORE −9 / TRUE −13; the
+brief's "−13" is the TRUE-total figure).
+
+The call-site metric is the SMALL half of this slice. The bigger half is the walk census:
+
+| hand-written type-name walk | `b71888e` | this slice |
+|---|---|---|
+| `depth`+`angOpen` bracket ladders, tree-wide | **9** | **8** |
+| — of them, NOT a home | 4 (`annArrowAt`, `nameIsSingleShape`, +2 in `emit_classify`) | **2** (both in `emit_classify`) |
+| paren-only "does the wrap enclose the whole" walks | **2** | **1** |
+| **total hand-written type-name walks** | **11** | **9** |
+
+Binary: **1,027,627 → 1,026,639 B (−988)**. Both artifacts checksummed BEFORE and AFTER every
+use (the `b71888e` baseline `MASTER2.wasm` = `a3a42837…`, rebuilt AT the head I gate against — the
+`a4fb7c1` baseline `c404ca21…` was DISCARDED, not reused — the stale-baseline defect
+that cost a previous cycle a wrong −3,227 B figure), and both built from the SAME master seed.
+
+### What the CODE is — the census that picked the targets
+
+`emit_base` + `emit_collect` + `emit_mono`, enumerated by grammar rather than by argument:
+
+1. **The bracket ladder, EIGHTH copy.** #1147 gave the ladder two homes in `emit_base`
+   (`tyTopLevelIndexOf` / `tyTopLevelSplit`) and left `annArrowAt` with its own. The copy differed
+   from the FIND home in exactly ONE thing — the arrow's two-character lookahead. (The `||` chains
+   list the same three grouper pairs in a different order, which a depth counter cannot see.)
+2. **The "does the leading group wrap the whole name" walk, FOUR copies, THREE ladders, TWO
+   readings** — `emit_collect.nameIsSingleShape` (full ladder), `emit_base.normTypeAtom`
+   (paren-only), `emit_classify.monoUnwrapParens` (paren-only), `typecheck.parenEnclosesWhole`
+   (full ladder + quote skip, and a DIFFERENT answer on a group that never closes).
+3. **`annFnDecompose`, the home that already existed AND whose two ingredients were already
+   imported.** D-GRAMHOME built it in `emit_base` and collapsed the four copies in that file. A
+   FIFTH sat one module up in `emit_mono.monoFnTypeAnnParamsName`, in a file whose import list
+   already names `annArrowAt` AND `annSplitParams` — it imported the home's ingredients and never
+   the home. A sixth idiom, `annArrowAt` + `slice(at + 2, n)` = `annRetNameOf`, sat 200 lines away.
+4. **The FIELD-ROW push, THREE copies.** #1147 named `fieldRecElemName` after finding the
+   element-NAME arm written twice. The ROW AROUND IT was written three times — `collectS`
+   (struct table), `collectVariantFields` (variant table, NODE recorder) and
+   `collectShapeVariantFields` (variant table, SHAPE-TEXT recorder) — four parallel-column pushes
+   plus the same two per-row side effects, character for character.
+5. **`registerInlineUnion` splitting the same name three times** (#1147's hand-off 5, measured
+   there and not taken).
+
+### The five changes
+
+**D-ARROWHOME.** `tyTopLevelIndexOf` learns the ARROW as its `'='` token (a hit requires the next
+character to be `>`; a lone `=` keeps the scan going), and `annArrowAt` becomes
+`tyTopLevelIndexOf(name, '=')`. The checker's `tyTopIndexOf` spells the same rule one module down;
+the two stay distinct because the checker's ladder SKIPS quoted literal members and this one never
+has (#1147's hand-off 1, still open).
+
+**D-GROUPEND.** A third form of the home, `tyGroupWrapsWhole(name)` — "no closer returns the depth
+to 0 before the final character". `nameIsSingleShape` (`emit_collect`) and `normTypeAtom`'s wrap
+test (`emit_base`) both retire into it. `peelGroupParens` deliberately does NOT: it rides the
+checker's `parenEnclosesWhole`, which is a different READING, not just a different ladder (below).
+
+**D-MONOHOME.** `monoFnTypeAnnParamsName` becomes `annFnDecompose(name, out) != ""`, and the
+`annArrowAt`+slice pair 200 lines up becomes `annRetNameOf`. `emit_mono` drops `annArrowAt` ×2 and
+`annSplitParams` ×1: **−3 CORE**, 8 → 5.
+
+**D-FIELDROW.** `pushFieldRow(toVariant, code, elemNm, fName)` — the four parallel-column pushes,
+the D5 arena sidecar recorder, the code-16 value-union box intern and the scalar-list forcing. The
+elem-NAME derivation stays at the call site because the three recorders genuinely differ there
+(two read a `FieldDef` node, one reads a field TYPE TEXT); the ROW is what all three share.
+
+**`isVariantBoxUnionAtoms`.** #1147's hand-off 5, taken. `registerInlineUnion` splits `name` into
+`matoms` at its top and then asked `isVariantBoxUnion` of the SAME name at two dispatch arms;
+`splitUnionAtoms` is pure in `name` alone, so the atom-taking form answers from the split already
+in hand.
+
+### The channels — every denominator and population stated
+
+Corpus A/B over **every** `tests/cases/**/*.vl`, five channels, master-seed-built both sides:
+
+| channel | population | differing |
+|---|---|---|
+| wasm bytes | 1,133 of 1,334 built | **0** |
+| build RC | 1,334 | **0** |
+| build message | 1,334 | **0** |
+| run RC + stdout | 1,080 `@run` files | **0** |
+| lint tier (`vl check --severity info`, one output FILE per input + `diff -r`) | 1,334 files, **192 carrying ≥1 diagnostic, 262 diagnostics total** | **0** |
+
+`deno task test`: **2,046 passed / 0 failed / 14 ignored**. The suite trap was checked rather than
+assumed — a bare worktree self-ignores 602 tests, so the vl host binary was linked in AND
+`SELFHOST_NATIVE_ALIGN=1` set; the master baseline was re-measured **at my head, same session,
+same command**, and the **ignored NAME SETS are byte-identical** (14 = 8 xfail/soundness cases +
+6 `native-opt`). Without the env gate both sides read 602 ignored — a third of the suite — which
+is exactly the "green RC over a third of the suite" trap.
+
+`native-fixpoint.sh`: stage3 == stage4 byte-for-byte (1,026,639 B). `rep-fuzz-check.sh`: exact,
+1 baselined REJECT, 0 new, 0 stale. Fuzz A/B, two legs, `--shapes-out` written to a FRESH file per
+side (it appends): plain seed 424242 (800 cases) **11 = 11 findings, shape sets identical**;
+survey seed 916355 `--branching --multiobs --declared --values` (800 cases) **57 = 57, identical**.
+Both legs' FIRST log line reads `fuzz-vl: seed …, 800 cases` — not `unknown arg:`.
+
+### THE WORK COUNT, on both sides of every home
+
+Counters are module globals in `emit_base`; the dump fires at the START of `collectS` for the
+1000th `emitProgram` of a SINGLE `vl check --codegen tests/cases` process, so the denominator is
+**999 COMPLETE compiles** — no partial program is in the total. (`print` is unusable inside the
+compiler: the host instantiates it with an EMPTY linker, so `__print_i32__` is unresolved. The
+dump reports through `emitFail`, which BLOCKS the program it reports from — hence reporting at
+the START of a pass rather than the end, so the blocked program contributes nothing.)
+
+| slot | | MASTER | MINE | delta |
+|---|---|---|---|---|
+| 0/1 | `tyTopLevelIndexOf` inv / charsteps | 370,018 / 4,381,414 | 637,499 / 8,618,118 | +267,481 / +4,236,704 |
+| 2/3 | `tyTopLevelSplit` inv / charsteps | 12,222 / 91,532 | 12,222 / 91,532 | **0 / 0** |
+| 4/5 | `tyGroupWrapsWhole` inv / charsteps | — | 1,020 / 20,516 | new home |
+| 6/7 | `annArrowAt` inv / OWN-ladder charsteps | 267,481 / 4,236,704 | 267,481 / 0 | **0** / −4,236,704 |
+| 8/9 | `normTypeAtom` inv / OWN wrap-walk charsteps | 412 / 6,126 | 412 / 0 | **0** / −6,126 |
+| 10/11 | `nameIsSingleShape` inv / OWN walk charsteps | 14,163 / 14,390 | 14,163 / 0 | **0** / −14,390 |
+| 12 | `isVariantBoxUnion` (name form) inv | 4,252 | 110 | −4,142 |
+| 13 | `isVariantBoxUnionAtoms` inv | 0 | 4,252 | +4,252 |
+| 14 | `splitUnionAtoms` calls made by the box classifier | 4,252 | 110 | **−4,142 (−97.4 %)** |
+| 15 | `nameIsSingleShape` calls REACHING the walk | 752 | 752 | **0** |
+| 16 | `normTypeAtom` calls REACHING the paren branch | 268 | 268 | **0** |
+| 99 | **TOTAL charsteps over every instrumented walk** | **8,730,166** | **8,730,166** | **0 (0.00 %)** |
+
+**The relocation identities are EXACT, not approximate**, which is what makes "0.00 %" a
+measurement rather than a coincidence:
+
+    slot1 delta  +4,236,704  ==  master slot7             4,236,704
+    mine slot5       20,516  ==  master slot9 + slot11    6,126 + 14,390
+    slot0 delta    +267,481  ==  master slot6               267,481
+    mine slot4        1,020  ==  slot15 + slot16             752 + 268
+
+Slots 15 and 16 are the PER-SITE coverage the aggregate would hide: both consumers of the new home
+are reached, 752 and 268 times, and neither count moves.
+
+**The one counter that moves in aggregate moves DOWN**, and its denominator is stated: slot 14 is
+the number of whole-name union SPLITS the variant-box classifier performs, 4,252 → 110. Its
+charsteps are NOT in slot 99 — `splitUnionAtoms` lives in `typecheck.vl`, outside this partition,
+so it could not be instrumented. **Slot 99's 0.00 % is the emitter-side walks only; the true work
+delta is negative, not zero.**
+
+### Entombment — one fixture, six sabotages (four red, TWO inert), four probes with inverted twins
+
+Every sabotage is applied to the SHIPPED source, rebuilt with the same master seed, and swept over
+the whole corpus (1,334 files × 5 channels) against the shipped build.
+
+| sabotage / probe | result | what it establishes |
+|---|---|---|
+| **S1** — the home's `'='` ARROW lookahead checks the WRONG neighbour (`name[i-1] == '>'`) | **169 of 1,334** (byte 43 · build-rc 125 · msg 162 · run-rc 130) | the arrow TOKEN routing is live and carries `annArrowAt`'s whole content |
+| **S2** — `tyGroupWrapsWhole` ignores its walk (always "wraps") | **34 of 1,334** (byte 18 · build-rc 16 · msg 19 · run-rc 16) | the group-end walk is live |
+| **S5** — `pushFieldRow` writes EVERY row to the struct table | **203 of 1,334** | the field-row home is live at BOTH tables |
+| **S6** — `registerInlineUnion` hands the atom form an EMPTY atom list | **204 of 1,334** | the pre-split atoms carry the classifier's answer |
+| **S3** — `tyGroupWrapsWhole`'s NEVER-CLOSES arm returns `false` (the checker's reading) | **0 of 1,334, and 0 over 800 fuzz cases — INERT, and it is a FINDING** | see below |
+| **S4** — `pushFieldRow` drops its code-16 value-union intern | **0 of 1,334 — INERT, and the two-variable probe pair resolves WHY** | see below |
+| **P1** — fail-loud when `annFnDecompose`'s answer DISAGREES with master's three-part test | **0 of 1,334**, and 0 over 800 fuzz cases | the empty-RETURN conflation the home carries is unreachable |
+| **P1INV** — the same probe inverted (fires when they AGREE) | **15 of 1,334** | the comparator is wired, and it NAMES the reaching population: fifteen files |
+| **P2** — fail-loud when the shared full-bracket ladder disagrees with `normTypeAtom`'s paren-ONLY walk | **0 of 1,334**, and 0 over 800 fuzz cases | the ladder WIDENING is inert on every reachable atom |
+| **P2INV** — inverted | **11 of 1,334** | the widening's byte-visible population is ELEVEN files — a 0-diff A/B would have "passed" for a population of eleven |
+| **P3** — fail-loud whenever `pushFieldRow` REACHES code 16 | **23 of 1,334** | the arm S4 shows inert IS reached |
+| **P4** — fail-loud only when that code-16 union is ALREADY registered | **21 of 1,334** | in 21 of the 23 the intern is REDUNDANT |
+
+- **S3 is inert BY CONSTRUCTION, which is a stronger claim than "measured at 0"**, and it is the
+  reason `peelGroupParens` was NOT merged into the new home. The never-closes case needs an
+  UNBALANCED name: `nameIsSingleShape` gates on `name[0] == '{'` AND `name[len-1] == '}'`, and
+  `normTypeAtom` on `t[0] == '('`; every name reaching either is a parser-built name or a slice of
+  one taken at a grouper boundary, so the depth cannot still be positive at the last character.
+  The three emitter copies and the checker's `parenEnclosesWhole` therefore disagree LATENTLY, not
+  observably — so the readings are preserved separately and named in both headers rather than
+  unified by eyeball.
+- **S4's 0 has TWO explanations and the two-variable pair separates them.** P3 (23) says the arm is
+  REACHED; P4 (21) says the union was already registered in 21 of those 23. The two files where it
+  was NOT already registered — `closures/nul-closure-nullable-field-arm-union-graduation.vl` and
+  `closures/nul-closure-nullable-field-arm-union-result.vl` — are still byte-identical under S4, so
+  some later path registers them too. **The arm is redundant on today's corpus and is deliberately
+  NOT deleted**: "0 of 1,334" with 23 live reachers is not a licence, its own header records the
+  invalid-wasm bug it was added for, and the population off-corpus is unmeasured. Filed, measured,
+  not taken.
+
+The fixture is **`tests/cases/types/type-name-walk-homes-coverage.vl`**, and it is honest about
+what it is: **GREEN ON MASTER TOO**. This slice is byte-identical over the whole corpus, so no
+fixture can be red on master — pretending otherwise would be the "fixture that passes for the
+wrong reason" error. Its value is per-site COVERAGE with a durable reacher for each home, and it
+is graded by the sabotages rather than by master: **red under S1, S2, S5 and S6**, green under the
+two sabotages that are inert everywhere (S3, S4).
+
+### REFUTATIONS — worth more than the agreements
+
+1. **My own "quoted literal member" repro was REFUTED BY ITS OWN CONTROL, and the control is why
+   I ran it.** `{ g: "}" | "x" } | { w: i32 }` is rejected by master (`` `is` names a type that is
+   not a union variant ``), which looks exactly like the quote-blindness #1147 filed as hand-off 1
+   — a `}` inside a quoted member closing the shape's leading `{` early. The CONTROL
+   (`{ g: "a" | "x" } | { w: i32 }`, no brace in the literal) fails IDENTICALLY. The reject is an
+   unrelated limitation of an inline literal-union FIELD in a union arm, and the quoted-member
+   divergence is still unreached. **A repro without its control is a guess.**
+2. **`emit_base`'s `shapeInnerFieldSplit` header claims a retirement that never happened.** It says
+   "(`emit_classify`'s own private copy retires by importing this one)". It has not:
+   `emit_classify.vl:10684` still defines a private `shapeInnerFieldSplit` with its own
+   hand-written bracket ladder, and its six call sites use that copy — in a file that already
+   imports `annSplitParams`, `annSplitPipe` and `gaeSplitArgs` from the very same home module.
+   Comments in this area are not evidence. Filed as hand-off 1 with the exact diff.
+3. **`normTypeAtom`'s header defended a restriction that was already unnecessary.** It said the
+   paren-ONLY walk was load-bearing because "a `>` in a `$fnsig` key or a `tyToStr` render must not
+   be able to unbalance it". `tyGtIsClose` already makes a `>` with no OPEN `<` inert, so `ii>i`
+   and `->` cannot unbalance the shared ladder either; P2/P2INV measure the widening at 0
+   disagreements with an 11-file live population.
+4. **The surviving field-record comment CHECKS OUT — verified against the code, not read.** #1147's
+   claim that `fieldRefElemName` returns "" only for codes 0 and 30 is exactly what
+   `emit_classify.vl:9540-9541` does. The one thing its header does NOT say is that
+   `fieldRefElemName` also returns "" for `tyIx < 0` and for a non-`TypeRef` node — harmless
+   (`fieldRecElemName`'s code-0 arm then reads `tyNameOf(tyIx)`, also "", and falls back to the
+   same ""), but it is a gap in the stated contract, not a covered case.
+5. **`annArrowAt`'s replacement is NOT free of a work question, and the answer is that it is
+   free.** Routing it through the home adds one `ch != '='` test — but only on a HIT, never per
+   character. Slot 99 confirms it to the character: 8,730,166 on both sides.
+6. **A "0" on the fuzz leg was checked at the FIRST LINE, not the diff.** Both legs print
+   `fuzz-vl: seed …, 800 cases`; the argument parser is not the thing reporting zero.
+
+### DECLINED, with the arithmetic
+
+- **Routing `nameIsSingleShape` / `normTypeAtom` through the checker's `parenEnclosesWhole`.** It
+  is the same question with a DIFFERENT reading (never-closes → false, not true) AND a
+  quoted-member skip neither emitter copy has ever had. S3 measures the reading difference at 0
+  over corpus and fuzz — i.e. adopting it would be a behaviour change that no test can currently
+  see, which is the worst kind to smuggle into a byte-identity slice. Two ladders, both named,
+  both explained.
+- **Collapsing the ~12 inline `name[n-2] == '[' && name[n-1] == ']'` suffix tests into
+  `nameIsArray`.** They ARE hand-written copies of a resolver's body (`emit_base` ×5, `emit_mono`
+  ×4, `emit_collect` ×1, plus two negations), and consolidating them would reduce the number of
+  PLACES that parse a type name. But every replacement ADDS a counted `nameIsArray(` call site:
+  the scoreboard would go UP by ~12 for a change that removes no walk and adds ~12 calls of real
+  work. Named here so the next slice does not rediscover it as a win.
+- **Rewriting `nameIsBareMap` to split once instead of asking `nameIsMap` twice.** It saves one
+  two-character probe per call and costs a re-inlined `splitUnionAtoms` — expanding a grammar copy
+  to save nothing measurable. Declined.
+
+### Hand-offs, each with its measurement
+
+1. **`emit_classify.vl` — retire the private `shapeInnerFieldSplit` (`emit_classify.vl:10684`) by
+   importing `emit_base`'s.** The two are character-identical: the same `{[(` / `<` / `}])` /
+   `tyGtIsClose` ladder, the same `,` break, the same `part.indexOf(":")` + `ci <= 0` → push
+   `""`/`""` convention; `emit_base`'s rides `tyTopLevelSplit(inner, ',', false, parts)`, which is
+   that ladder with `dropEmpty` false. Six call sites move
+   (`emit_classify.vl:10750/10817/10924/10964/11004/11136`). That is **one more bracket ladder
+   gone, 8 → 7**, and it is the retirement `emit_base`'s own header already claims has happened.
+2. **`emit_classify.vl` — `monoUnwrapParens` (`emit_classify.vl:19531`) is the fourth copy of the
+   wrap walk.** It is paren-only, and its reading is `tyGroupWrapsWhole`'s on every balanced input
+   (P2 measures exactly that widening at 0 disagreements over the corpus and 800 fuzz cases, for
+   the `emit_base` twin). Importing `tyGroupWrapsWhole` takes the paren-only walks from 1 to 0. It
+   needs its own A/B because `monoUnwrapParens` is called on far more names than `normTypeAtom`'s
+   412.
+3. **`emit_classify.vl` ×4 — `annArrowAt` + `slice(fa + 2, …)` is `annRetNameOf`.**
+   `emit_classify.vl:11942`, `:11982`, `:14356` and `:10469` spell the pair out; the home is in
+   `emit_base` and `emit_classify` already imports `annArrowAt` from it. **−4 CORE**, and it is the
+   same "the home is already imported" shape this slice found in `emit_mono`.
+4. **`emit_classify.vl` ×2 and `typecheck.vl` ×1 — the count-then-split double walk.** #1147's
+   hand-off 3, unchanged and still unlanded: **−3 CORE**.
+5. **`typecheck.vl` — export `tyTopIndexOf` / `tyGroupEndIndex`.** #1147's hand-off 1, unchanged.
+   My S3 adds one fact to it: the emitter's and the checker's walks differ on TWO axes, not one —
+   the quoted-member skip AND the never-closes reading — and only the first is a candidate
+   bug-fix. The second is a genuine semantic difference between "the group closes at the end" and
+   "the group does not close early", and any unification has to pick one deliberately.
+6. **`emit_collect.vl`/`emit_classify.vl` — `nulRefListInner`.** #1147's hand-off 4, re-verified
+   at this head: `collectA` still hand-writes `nullablePartOf(ran)` + `nameIsRefArray(ranp)` three
+   lines after calling `nameIsNulRefList(nd.tyName)`. It still scores 0 inside `emit_collect`
+   alone and **−2 CORE in `emit_classify`**; it still needs the two partitions together.
+7. **`pushFieldRow`'s code-16 arm is REDUNDANT on today's corpus** (P3 23 reachers, P4 21 already
+   registered, S4 0 differences). Deleting it needs an off-corpus population argument this slice
+   does not have.
+
+### Method notes earned
+
+101. **A HOME IS NOT ENTOMBED BY ITS OWN HEADER — check the retirement it claims.** `emit_base`'s
+     `shapeInnerFieldSplit` says in prose that "`emit_classify`'s own private copy retires by
+     importing this one". The private copy is still there, with its own ladder and six callers, in
+     a file that imports three OTHER functions from the same home module. The claim was aspiration
+     written in the past tense. **Grep for the copy the header says is gone** — that one line of
+     verification is worth more than reading the whole header.
+102. **A REPRO WITHOUT ITS CONTROL IS A GUESS.** A hand-built `{ g: "}" | "x" }` union arm is
+     REJECTED by master, which is precisely the failure the quoted-member divergence predicts. The
+     control with no brace in the literal fails identically: the reject is an unrelated limitation
+     and the divergence is untouched. **Build the control BEFORE believing the repro**, especially
+     when the repro confirms what you already expected.
+103. **A COMPILER PROBE'S OUTPUT CHANNEL IS PART OF THE MEASUREMENT DESIGN, and `print` is not
+     one.** The vl host instantiates the compiler wasm with an EMPTY `Linker`, so any `print` in
+     `compiler/*.vl` compiles to an unresolved `__print_i32__` import and every invocation dies
+     before running. The only channel out is `emitFail` — which BLOCKS the program it reports
+     from (the same hazard as the `tErr` probes). The design that works is: accumulate module
+     globals across a WHOLE-corpus single process (`vl check --codegen tests/cases`) and report
+     at the START of a pass on the Nth program, so the blocked program contributes NOTHING and the
+     denominator is exactly "N−1 complete compiles".
+104. **PROVE A RELOCATION BY THE IDENTITY, NOT BY THE TOTAL** (sharpening note 99). "Total
+     charsteps unchanged" is weak: two independent errors can cancel. What makes it a measurement
+     is that EACH moved counter's delta equals the retired counter EXACTLY — `tyTopLevelIndexOf`
+     gains precisely `annArrowAt`'s 4,236,704, and `tyGroupWrapsWhole`'s 20,516 is precisely
+     `normTypeAtom`'s 6,126 plus `nameIsSingleShape`'s 14,390 — and that each home's own
+     invocation count moves by ZERO. Quote the four identities, not the one total.
+105. **"INERT BY CONSTRUCTION" IS A REASON TO KEEP TWO READINGS APART, NOT TO MERGE THEM.** S3
+     flips only the never-closes arm of the new home and reddens nothing, in corpus or fuzz —
+     because every name reaching it is balanced. The temptation is to conclude the readings are
+     interchangeable and adopt the checker's. The correct conclusion is the opposite: an
+     unobservable difference is one that NO test can defend, so the safe move is to preserve both,
+     name them in both headers, and file the unification with the axis count (here: TWO axes, only
+     one of which is a candidate bug-fix).
