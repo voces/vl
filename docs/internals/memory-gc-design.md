@@ -67,11 +67,20 @@ state, verified against `compiler/typecheck.vl`, `compiler/wasmEmit.vl` and
   `__load_i16__`, `__load_u16__`, `__load_i64__`, `__load_f32__`, `__load_f64__`.
 - **Twelve are lowered** by the emitter: `__store_i32__`, `__load_i32__`, `__log__`,
   the seven load widths, `__memory_size__` and `__memory_grow__`.
-  The other **five typecheck and then fail at emit** with
-  `emitProgram: call to unknown function` — safe (no wrong bytes) but the
-  diagnostic reads like a typo'd identifier, not "this builtin has no
-  implementation." They are `__store_i64__`, `__store_f32__`, `__store_f64__`,
-  `__store_string__` and `__log_string__`.
+  The other **five have no emitter arm**: `__store_i64__`, `__store_f32__`,
+  `__store_f64__`, `__store_string__` and `__log_string__`.
+  *(Re-censused independently in three call POSITIONS each — statement, value and
+  binding — which reproduced this five exactly, a third instrument after this
+  bullet and #1166.)*
+  **THE DIAGNOSTIC HALF IS DONE.** They used to typecheck and then fail at emit
+  with `emitProgram: call to unknown function` — safe (no wrong bytes) but reading
+  like a typo'd identifier rather than "this builtin has no implementation", which
+  this bullet called the half worth fixing first (§B1). The CHECKER now says it
+  itself, positioned at the call, on the `unsupported-lowering` channel
+  (`nameIsUnimplementedIntrinsic` in `typecheck.vl`). A program that DECLARES one of
+  these names still shadows the builtin and still runs — unlike the seven
+  emitter-intercepted names #1167 reserved, these five are not intercepted, so the
+  diagnostic is gated on the program not declaring a function of the name.
   *(This bullet read "Ten builtins … Three are lowered … the other seven" before the
   P0.2/load-width slice, and the ten/three/seven counts were right at the time. The
   numbers moved because seven load widths and the two memory-size ops acquired
