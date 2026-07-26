@@ -9104,6 +9104,19 @@ function checkCallNode(n: Call, ix: i32) {
             pargs[pj],
           )
         }
+        // The SAME rule for the other reps `print` has no import for: an array, a
+        // struct, a map/set, a function value, and any of those behind `| null`.
+        // The emitter's print ladder ends in an unguarded `call __print_i32__`, so
+        // each of these handed a `(ref $t)` to an `(i32) -> ()` import and the module
+        // failed to VALIDATE — while `vl check` reported the program clean.
+        if tyPrintsAsRef(pt, 24) {
+          tErrUnsupported(
+            "print of " +
+              tyToStr(pt) +
+              " is type-valid but not yet supported by codegen — `print` renders one scalar or string; print the elements/fields individually, e.g. `print(xs[0])`",
+            pargs[pj],
+          )
+        }
         pj = pj + 1
       }
       return TY_VOID
@@ -12207,6 +12220,45 @@ function tyPrintsAsUnionBox(pt: i32) {
   const ok = valueUnionFromAtomKinds(pgAtomKinds)
   while pgAtomKinds.length > 0 { pgAtomKinds.pop() }
   ok
+}
+
+// Whether `print(x)` would be handed a WasmGC REFERENCE the scalar print imports cannot
+// take. `print` renders ONE scalar/string rep (the union gate above says the same thing
+// about a box); the emitter's print ladder is a run of POSITIVE tests ending in an
+// unguarded `call __print_i32__`, so every value whose rep is a reference — an array, a
+// struct, a map/set, a function value, a union carrying one of those, and any of them
+// behind `| null` — was handed to an `(i32) -> ()` import with a `(ref $t)` on the stack.
+// The module then failed to VALIDATE ("expected i32, found (ref $type)") while `vl check`
+// reported the program clean. `driver.builtinScan` publishes `print`'s accepted set as
+// `(i32 | i64 | f32 | f64 | boolean | string) -> void`; this is the gate that makes that
+// string true.
+//
+// `string` is deliberately NOT here: it is a reference too, but the ladder routes it to
+// the string streaming printer. Nor is a LITERAL union (i32/string atoms widened to their
+// member text), nor a `TyVar` (a generic body's `T` — monomorphization decides its rep at
+// the call site, and the concrete argument is gated there).
+//
+// Depth-bounded like `tyReachesUnion`: a self-referential alias reached through a union or
+// nullable member would otherwise not terminate.
+function tyPrintsAsRef(pt: i32, depth: i32) {
+  if pt < 0 { return false }
+  if depth <= 0 { return false }
+  const t = T.tys[pt]
+  if t is TyArray { return true }
+  if t is TyObj { return true }
+  if t is TyMap { return true }
+  if t is TyFunc { return true }
+  if t is TyNullable { return tyPrintsAsRef(t.nInner, depth - 1) }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      if tyPrintsAsRef(ms[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
 }
 
 // `isValueUnionName`'s verdict over an already-classified atom-kind sequence: 2+ atoms,
