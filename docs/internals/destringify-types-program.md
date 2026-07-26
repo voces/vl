@@ -6636,3 +6636,239 @@ pattern the emit renderer lacks.
     scalar. The gap between "is" and "resolves to" is the entire alias vocabulary, and it made
     `as` unusable with any named type in module mode. Three previous slices read that note and
     inherited it.
+
+
+## D-ISTY — the `is`-test TYPE was already banked; the emitter stops re-classifying its SPELLING (#1125)
+
+`emitIs`'s box-tag ladder took the tested type's SOURCE SPELLING apart four ways, and the two
+narrowed-arm unbox reads took the same spelling apart again after it had travelled through the
+narrowing stack. Every one of those answers is a projection of ONE value the CHECKER had
+already resolved and banked — `isVarTyIxOf`, recorded by `checkIsExprNode` since D-NARROW and
+read, until this slice, by exactly one consumer (`pushNarrowRep`).
+
+### The producer chain, and why the emitter never used it
+
+```
+parser        IsExpr{ isVariant: "S[]" }        (the only mint site for an `is` node)
+checker       chkTy = nameToTy(n.isVariant)     → isVarTyIx[isIx] = chkTy   (checkIsExprNode)
+narrowing     pushNarrowRep(name, variant, isVarTyIxOf(condIx), setId)      → narrowTys[i]
+emitter       …re-classified `n.isVariant` / `narrowVariants[i]` from scratch
+```
+
+Both banks are **total for any program that emits**, by construction and by measurement:
+`IsExpr` nodes are minted ONLY by the parser (`mkIsExpr` has two callers, both in `parser.vl`),
+so every one of them predates `checkProgram`'s sizing of the sidecar; and an `is` whose type
+does NOT resolve raises `tErr("unknown type … in 'is'")`, which `driver.vl` turns into
+`if T.diags.length > 0 { return 2 }` — the emitter never runs. Measured: **8,031 of 8,031
+reaches covered** (below), with **0** reaches where the bank declined and the name ladder
+answered anything.
+
+### The four spelling tests are one question
+
+`emitIs` ran `valueAtomKind(isAtom)`, then `nameIsLitUnionType(isAtom)` (rewriting the atom to
+`"string"`), then `nameIsMap(isAtom)` → `mapTagOf`, then `nameIsRefArray(isAtom)` →
+`refArrTagOf`. All four decide ONE i32: the box tag the arm claims. `isArmTagOfTy(ity)` derives
+it from the banked type — `unMemAtomKind` (`valueAtomKind`'s arena dual) → `scalarTagOfKind`,
+`tyIsLitUnion` → kind 2's tag (the structural form of the `isAtom = "string"` rewrite),
+`unMemIsMap` → `mapSlotTag(mvSlotOfTy(tyMapValOf(ity)))`, `unMemIsRefElemArray` →
+`refArrSlotTag(rlSlotOfTy(tyRefArrElemOf(ity)))`. #1110's shape, one layer up: *when several
+parses are projections of ONE value, banking that value deletes them all at once.*
+
+The two composites it replaces are `mapTagOf` = `mapSlotTag(mvSlotOfMapValNameOrMono(
+mapValNameOf(atom)))` and `refArrTagOf` = `refArrSlotTag(rlSlotByName(refArrElemName(atom)))`:
+the same compositions with the name slicer swapped for the arena hop. `nameIsRefArray`'s extra
+content over a shape test is the reflist layer's INTERN STATE (#1116), and that is exactly what
+`rlSlotOfTy(...) >= 0` asks, so the guard and the tag were always one lookup.
+
+### The narrowed-arm reads: the same bank, one hop later
+
+`emitRefArrayUnionUnboxRead` / `emitMapUnionUnboxRead` received the arm's rendered NAME
+(`narrowedRefArrayOf` / `narrowedMapOf`) and re-resolved it — `rlSlotByName(refArrElemName(atom))`
+and `mvSlotOfMapValNameOrMono(mapValNameOf(atom))`. The narrowing stack banked the arm's arena
+type at the push, so `narrowedArmTyOf(name)` (a twin of `emit_classify`'s private
+`narrowSlotOf` + `narrowSlotTy` over the same `emit_state` tables) hands the structure over and
+both re-resolutions become `rlSlotOfTy(tyRefArrElemOf(...))` / `mvSlotOfTy(tyMapValOf(...))`.
+The `atom` parameter is gone from both signatures.
+
+The MONO sentinel is the one place the two legs could have parted: `mvSlotOfMapValNameOrMono`
+answers -1 for a mono/atom-valued map, and `mvSlotOfTy` answers -1 for "no row claims this
+type". They coincide numerically and `mapTypeIdxOf(-1)` is the shared `$mStructIdx` either way,
+so the probe compared the SLOT the consumer casts with, not the intermediate names — 724 of 724
+agreeing.
+
+### The probe: candidate beside authority, at the consumer
+
+Six tags, accumulated and reported ONCE at the end of `emitProgram`. `cov` = the bank answered;
+`DIS` = covered and the candidate differs from the authority; `uncovLive` = the bank declined
+AND the name leg produced a live answer (method note 10: consequence, not reach).
+
+| tag | site | corpus reach / cov / DIS / uncovLive | fuzz reach / cov / DIS / uncovLive |
+|---|---|---|---|
+| **ISTY** | `emitIs`'s arm tag | 893 / 893 / **0** / 0 | 7,138 / 7,138 / **0** / 0 |
+| **RAUB** | ref-array unbox slot | 75 / 75 / **0** / 0 | 263 / 263 / **0** / 0 |
+| **MAPUB** | map unbox slot | 61 / 61 / **0** / 0 | 663 / 663 / **0** / 0 |
+| **MVRA** | map-VALUE ref-list guard | 364 / 217 / **0** / 0 | 14,500 / 9,741 / **0** / 0 |
+| ARROW | `strContains(isVariant, "=>")` | 325 / 325 / **24** / 0 | 1,304 / 1,304 / **87** / 0 |
+| ARROWC | …of which CONSEQUENTIAL | 24 / 24 / **0** / – | 87 / 87 / **0** / – |
+| MONOSH | `nameIsWholeSpanShape(isVariant)` | 1,424 / 1,424 / **224** / 0 | 9,534 / 9,534 / **0** / 0 |
+
+1,274 corpus files (397 reporting) + 50,400 fuzz programs (10,090 reporting), 51,674 total.
+
+**Comparator sanity, per tag, before believing any 0** (method note 12): the probe was rebuilt
+with each candidate leg deliberately wrong and re-swept. ISTY's atom+map arms → **461**
+disagreements, ISTY's ref-array arm ALONE (a separate build, because the first perturbation
+never reaches it) → **70**, MVRA → **217/217**, RAUB → **75/75**, MAPUB → **61/61**. The 0s are
+not vacuous.
+
+### Two REFUTATIONS the same probe produced
+
+**MONOSH — `nameIsWholeSpanShape` is a question about the SPELLING, and the arena cannot ask
+it.** `monoStaticIsGuardOf` scopes the dead-arm drop to an anonymous `{…}` shape guard, and its
+comment says why: "leaves every scalar / closure / array / **declared-name** guard emitting both
+arms exactly as before". The arena resolves `Cat` to the very same `TyObj` the inline shape
+resolves to — nominality is not in the type — so a `TyObj` test WIDENS the guard to declared
+names and drops arms the guard deliberately keeps. 224 corpus disagreements, every witness a
+declared name (`Cat`, `Dog`, `C`, `S`, `A`, `B`). **Not migrated. Not migratable** without a
+nominal-anonymity marker, which is a parser-side record, not an arena property.
+
+And the shape of that measurement matters more than the verdict: **fuzz reported 0
+disagreements on 9,534 reaches** at the same tag. The fuzz grammar emits no declared-name `is`
+guard inside a monomorphized instance, so the fuzz channel is BLIND to the entire divergent
+population. A slice that ran fuzz first and stopped would have shipped it. (Method note 5's
+inverse: a green FUZZ is not a green probe either.)
+
+**ARROW — the `=>` scan diverges 111 times, is inert every time, and is deliberately NOT
+migrated.** `strContains(nd0.isVariant, "=>")` gates the nullable-closure non-null test. Its
+arena dual (`unMemIsFunc` — the type IS a `TyFunc`) is TIGHTER: the 24 + 87 divergences are all
+struct shapes with a closure FIELD (`{f:(i32)=>K0[]|i64}`, `{a:f64,z:(()=>i64)[]|i32}`), where
+the name test says yes and the type says no. All 111 are inconsequential — the site's real gate,
+`exprNulClosure(nd0.isObj)`, is false at every one of them. The other direction (a NAMED
+function-type alias, `type F = (i32) => i32`, where the name test says no and the type says
+yes) is **unreachable today for two independent reasons measured by building the programs**:
+`f: F | null` as a param fails emit outright ("only i32, i64, f64, f32, boolean, struct, union,
+array, or string parameters are supported"), and a narrowed call through such an alias fails the
+CHECKER ("called value is not a function"). So the migration would be a behaviour change in a
+population that cannot occur, with **no pin available on any channel** — the #1114 / #1119 case,
+and this slice declines it rather than shipping an unpinnable non-equivalence for one
+non-SCORECARD parse. Filed as a hand-off with its exact diff below.
+
+### Entombment — every migrated leg is pinned by the PRE-EXISTING corpus
+
+Six gate sabotages (note 4: perturb so the value LEAVES the equivalence class the consumer
+distinguishes), each vs the shipped build over the corpus (1,270 files at the measurement, 1,274
+after the last rebase):
+
+| sabotage | what it breaks | byte | message | run |
+|---|---|---|---|---|
+| **S-ISTY** — litunion arm claims kind 0's tag, not kind 2's | the `is K0` string-tag compare | 20 | 0 | 17 stdout + 1 status |
+| **S-ISTYMAP** — the map arm always tags the MONO slot | the map arm's tag band | 23 | 0 | 20 stdout |
+| **S-ISTYRA** — the ref-array arm's tag + 2 | the ref-array arm's tag band | 36 | 0 | 26 stdout + 3 status |
+| **S-RAUB** — the narrowed ref-array slot + 1 | the wrapper `ref.cast` target | 8 byte + 22 build-status | 22 | 30 status |
+| **S-MAPUB** — the narrowed map slot forced MONO | the map-struct `ref.cast` target | 23 | 0 | 23 status |
+| **S-MVRA** — the ref-list value seed never fires | the stored list's build | 2 byte + 7 build-status | 9 | 9 status |
+
+No new fixture was needed: the corpus already holds a pin for each of the six.
+
+### The call arithmetic
+
+Local-aware scan (the #1119 method: by resolver actually called, non-comment, argument traced
+through the enclosing function's bindings, ONE hop into the callee) over the four owned files
+`wasmEmit.vl` / `emit_rep.vl` / `emit_state.vl` / `emit_rewrite.vl`:
+
+| SCORECARD resolver | master | now | delta |
+|---|---|---|---|
+| `nameIsRefArray` | 2 | 0 | **−2** |
+| `nameIsLitUnionType` | 3 | 2 | **−1** |
+| `nameIsMap` | 1 | 0 | **−1** |
+| `refArrElemName` | 1 | 0 | **−1** |
+| `mapValNameOf` | 1 | 0 | **−1** |
+| **TOTAL (4 files)** | **19** | **13** | **NET −6** |
+
+- **Type-string PARSES deleted: 7** — the six above plus `valueAtomKind(isAtom)` at `emitIs`
+  (a parse of the same family, not on the SCORECARD list).
+- **Deleted from a PATH, not from the source: 2** — `mapTagOf` and `refArrTagOf` reached
+  `mapValNameOf` and `refArrElemName` inside `emit_classify`; those calls no longer run for any
+  `is` test. Both functions now have **ZERO callers compiler-wide** (see hand-offs).
+- **Name-keyed RESOLUTIONS deleted: 4** — `rlSlotByName` ×1, `mvSlotOfMapValNameOrMono` ×1,
+  `mapTagOf` ×1, `refArrTagOf` ×1.
+- **Parses ADDED: 0. Consumers laddered: 0. Sidecars added: 0** (both banks already existed;
+  this slice adds no state and no reset obligation).
+- **Resolutions REMOVED at runtime, not just at compile time:** the MVRA arm now resolves the
+  map value's ref-list slot ONCE where master ran `nameIsRefArray` and then `mvValInnerRlSlot`.
+- New exports: `tyMapValOf` (`emit_rep`, one hop over `TyMap.mVal`). New private helpers:
+  `isArmTagOfTy`, `narrowedArmTyOf` (`wasmEmit`).
+- Cross-file: `emit_classify` / `typecheck` / `emit_collect` / `emit_base` / `parser` UNCHANGED.
+
+Binary: 1,031,675 → **1,031,979** bytes (+304).
+
+### Gate
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / message / run | 1,274 files | **0 / 0 / 0** |
+| fuzz A/B, whole `--out-dir` trees | **50,400 programs/side**, 52,708 output files/side | **0 differing paths** |
+| probe (candidate beside authority) | 51,674 programs | **0** disagreements on the 4 migrated tags |
+| `refresh-compiler.sh` | | RC=0 |
+| `rep-fuzz-check.sh` | exact ✅ 1 baselined reject, 0 new/stale | RC=0 |
+| `native-fixpoint.sh` | stage3 == stage4 | RC=0 (1,031,979 bytes) |
+| `lint-self.sh` | | RC=0 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 1,999 tests | **1,985 passed, 0 failed** |
+
+Every number in this section was re-measured on THREE successive landing bases as master moved
+under it — `5bca019` (D-UNIONGEN, #1124: `typecheck` / `emit_collect`), `3b1fad4` (D-FIELDCODE,
+#1123: 28 parses deleted in `emit_classify`, whose field-classification tables these arm
+resolvers sit on top of) and `d1154cc` (D-PARSETY P3, #1126: `parser` / `driver`). Every re-run
+reproduces the whole net exactly: corpus byte-, message- and run-identical (1,270 files, then
+1,274), fuzz A/B 50,400 programs/side with 0 differing paths, the probe's four migrated tags 0
+over both channels (ISTY 893 corpus + 7,138 fuzz reaches, all covered), all six sabotages
+reddening the same files with the same counts, and every standing script RC=0. (The first run,
+on `adbe6f0`, said the same over 1,263 files.)
+
+### Hand-offs (exact diffs)
+
+1. **`emit_classify.vl` — `mapTagOf` and `refArrTagOf` are now DEAD** (0 callers compiler-wide;
+   `vl check` does not flag an unused EXPORT, so the gate is green either way). Deleting them
+   removes 2 more parses (`mapValNameOf`, `refArrElemName`) and 2 name-keyed resolutions
+   (`mvSlotOfMapValNameOrMono`, `rlSlotByName`) from the source. They are the last consumers of
+   the atom→tag entry points; `mapSlotTag` / `refArrSlotTag` (the slot→tag halves) stay.
+2. **`emit_classify.vl` — export `narrowSlotTy`** (or a `narrowedArmTyOf(name)` beside
+   `narrowedRefArrayOf`), and `wasmEmit`'s private twin goes:
+   ```
+   -function narrowSlotTy(i: i32): i32 {
+   +export function narrowSlotTy(i: i32): i32 {
+   ```
+   Better still, `narrowedRefArrayOf` / `narrowedMapOf` could return the SLOT their own
+   containment checks already resolve the type for, and the emitter would stop receiving a
+   rendered arm name at all.
+3. **The ARROW site** (`wasmEmit.vl`, `emitIs`'s nullable-closure arm), measured above and NOT
+   taken. The diff is one line, and the reason to hold it is the missing pin, not the risk:
+   ```
+   -    if strContains(nd0.isVariant, "=>") {
+   +    if unMemIsFunc(isVarTyIxOf(isIx)) {
+   ```
+   It becomes pinnable the day a named function-type alias can be a nullable param — i.e. when
+   `f: F | null` stops failing `emitProgram`'s parameter check. That is the fixture to write
+   first.
+4. **`typecheck.vl`** — `isVarTyIxOf`'s comment still says the bank exists "for the emitter's
+   narrowing stack". It now has four more consumers; the comment is the place to record that
+   the bank is TOTAL for emitting programs (the `T.diags` gate above), because that totality is
+   what let this slice DELETE rather than ladder.
+
+### Method notes earned
+
+55. **A bank can be TOTAL by construction, and that is what turns a ladder into a deletion**
+    (D-ISTY) — every previous consumer of a `nodeTyIx`-family sidecar kept a name fall-through
+    because emitter-synthesized nodes read past the end. `IsExpr` is different for a reason a
+    grep can check in one line: `mkIsExpr` has two callers and both are in the parser, so no
+    `is` node can postdate the checker's sizing. Before laddering a sidecar consumer, ask who
+    MINTS the node — the answer decides whether the fall-through is load-bearing or ballast.
+56. **A 0 on the fuzz channel can mean the generator has no grammar for the divergence**
+    (D-ISTY) — the MONOSH tag reads 224 disagreements on 1,270 corpus files and **0 on 50,400
+    fuzz programs**, because the generator emits no declared-name `is` guard inside a
+    monomorphized instance. Method note 5 says a green corpus is not a green probe; this is its
+    mirror, and it is the more dangerous one, because the fuzz leg is the one quoted for
+    volume.
+57. **When two legs disagree, measure the CONSEQUENCE at the next gate before calling either
+    one wrong** (D-ISTY) — the ARROW site's legs disagree 111 times and the site's behaviour is
+    identical at all 111, because `exprNulClosure` rejects every one. "Disagrees" was not the
+    finding; "disagrees and cannot matter, and therefore cannot be pinned" was.
