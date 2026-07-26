@@ -9302,6 +9302,105 @@ export function nameIsNulRefList(name: string) {
   return nameIsRefArray(np)
 }
 
+// The per-field wasm-type code a field type SPELLING carries — the ONE home of
+// the field-code ladder, shared by both entry points: `fieldTypeCode` (an AST
+// `TypeRef` node) and `nameFieldCode` (an inline object-type annotation member's
+// text). Both reps of a field must agree arm for arm and in arm ORDER, and a
+// single table is the only form of that agreement a reader can check.
+//
+// `litNode` selects how the literal-union arm is decided, and is the one arm whose
+// EVIDENCE differs between the callers: `>= 0` is an AST node index, answered from
+// the checker's recorded type (`nodeTyIsLitUnionAlias` — no parse); `-1` means
+// there is no node and the spelling must answer (`nameIsLitUnionType`). Passing the
+// node rather than a precomputed flag keeps the arm LAZY on both paths, so neither
+// caller pays for a verdict the scalar arms above already settle.
+function fieldCodeOfSpelling(t: string, litNode: i32) {
+  if t == "i32" { return 0 }
+  if t == "boolean" { return 0 }
+  // An f64 field (`x: f64`) stores a raw f64 valtype slot — code 17. An i64 / f32 field is
+  // the same idea in the other scalar valtypes — codes 23 / 24 (0x7e / 0x7d storage).
+  if t == "f64" { return 17 }
+  if t == "i64" { return 23 }
+  if t == "f32" { return 24 }
+  // A literal-union field (`kind: K`, or inline `"a"|"b"`) stores an interned-i32 ATOM —
+  // code 0 (i32 valtype), NOT a box. Checked before the value/struct-union tests (a literal
+  // union registers as a union name, which would otherwise claim it as code 16). The field's
+  // union name is recorded in `sFieldElemName` so construction/read/assign recover the atom
+  // rep + membership.
+  if litNode >= 0 {
+    if nodeTyIsLitUnionAlias(litNode) { return 0 }
+  } else {
+    if nameIsLitUnionType(t) { return 0 }
+  }
+  if nameIsString(t) { return 3 }
+  if nameIsArray(t) {
+    if nameIsI32Array(t) { return 4 }
+    // A `string[]` field is a string-ref list (code `6`) — it reuses the map keys
+    // list types (`mkListIdx`/`mkArrIdx`). Any OTHER `X[]` is a struct/union ref list.
+    if nameIsStringArray(t) { return 6 }
+    // A SCALAR-element list field stores its scalar-list wrapper (code 25/26/27), NOT a ref-list
+    // wrapper (code 5 is for struct/union/closure elements only — returning 5 here emitted the wrong
+    // heap type, the invalid-wasm hole).
+    if nameIsF64Array(t) { return 25 }
+    if nameIsI64Array(t) { return 26 }
+    if nameIsF32Array(t) { return 27 }
+    return 5
+  }
+  // A MAP-typed field (`children: {[string]: Tree}`) stores a non-null ref to
+  // its value-type's map struct — code 19. The mv SLOT is interned by
+  // `collectA`'s arena TypeRef scan (the annotation node), so emission
+  // re-finds it by the value name (`fieldRefElemName`).
+  // A map-MEMBER union field (`{[string]: string} | string`) starts with `{[` too, but it is a
+  // union BOX field (code 16), not a map — `!nameIsMapMemberUnion` lets it fall to the union test.
+  if nameIsMap(t) && !nameIsMapMemberUnion(t) { return 19 }
+  // A NULLABLE map field (`links: {[string]: V} | null`) stores a NULLABLE ref to the value
+  // type's map struct — code 29, the field analogue of the `nulmap` local/param/return niche
+  // (the map twin of code 28's nullable ref-list field). Gated to the SAME supported value
+  // kinds as the non-null map field (`retNulMapFlag`'s gate), so a nullable map over an
+  // unrepresentable value type keeps failing loudly (-1, no interned shape).
+  const nmi = nulMapInnerName(t)
+  if nmi != "" {
+    if mvValKindOfName(mapValNameOf(nmi)) != -3 { return 29 }
+  }
+  // A NULLABLE i32-list field (`rest: i32[] | null`) stores a NULLABLE ref to
+  // the same wrapper as code 4 — code 18 (`0x63 lTypeIdx`). Checked before the
+  // value-union test (`i32[]` is not a value atom, so 16 never claims it).
+  if nameIsNulI32List(t) { return 18 }
+  if nameIsNulRefList(t) { return 28 }
+  // A NULLABLE DISTINCT-BACKING scalar-list field (`f64[] | null` 32, `i64[] | null` 33,
+  // `f32[] | null` 34, `string[] | null` 31): a `(ref null $leafWrapper)` slot — the field
+  // mirror of the same-named binding niche. Checked AFTER the ref-list arm so a spelling
+  // the ref-list layer already claims (`(string|null)[] | null`) keeps code 28's rep.
+  const nsl = nulScalarListFieldCode(t)
+  if nsl >= 0 { return nsl }
+  // A `string | null` niche field — `(ref null $aTypeIdx)`, code 20. Checked before
+  // the value-union test (it is NOT a value union — a single ref + null is a niche).
+  if nameIsNulString(t) { return 20 }
+  // A `boolean | null` niche field — i32 sentinel, code 21.
+  if nameIsNulBool(t) { return 21 }
+  // A `K | null` nullable-litunion niche field — the i32 atom slot with the spare
+  // value `-1` = `null` (member ids are interned ≥ 0), code 30. The field analogue
+  // of the kind-0 `K | null` binding niche; checked before the value-union test
+  // (a single atom set + null is a niche, not a box).
+  if nameIsNulLitUnion(t) { return 30 }
+  // A BOX-union field — a VALUE union (`v: i32 | null`, `y: string | i32`) OR a
+  // registered STRUCT / HETEROGENEOUS union (`v: A | B`, `v: A | i32`) — stores the
+  // shared union BOX ref (code 16). Checked BEFORE the nullable-struct strip, so a
+  // declared `type Opt = { v: i32 | null }` carries the same rep as the inline
+  // `{v:i32|null}` annotation.
+  if isValueUnionName(t) { return 16 }
+  if isUName(t) { return 16 }
+  // A field naming ANOTHER STRUCT (`inner: Inner`) or a NULLABLE struct
+  // (`next: Node|null`) stores a `(ref null $S)` — code 15. Resolved via the
+  // DECLARATION scan (not the incrementally-built struct table) so a forward /
+  // mutually-recursive reference ties in the shared rec group.
+  let base = t
+  const nb = nullablePartOf(base)
+  if nb != "" { base = nb }
+  if nameIsStructDecl(base) { return 15 }
+  -1
+}
+
 export function fieldTypeCode(tyIx: i32) {
   if tyIx < 0 { return -1 }
   // A NULLABLE-function field (`op: ((i32) => i32) | null`) stores a NULLABLE closure
@@ -9309,98 +9408,27 @@ export function fieldTypeCode(tyIx: i32) {
   // bare-function test (and before `tyIsFuncType`, exactly as `vtKindOfType` orders it):
   // `((i32) => i32) | null` is a nullable function (arrow nested under a top-level `|`),
   // whereas `(i32) => i32 | null` is a function RETURNING a nullable (handled elsewhere).
+  // Both arms read the NODE, so this entry point spends no parse on them.
   if nulCloFlag(tyIx) == 1 { return 22 }
   // A function-typed field (`op: (i32) => i32`) stores the closure fat-pointer (code 14),
-  // the field analogue of a function-valued local. Checked first (a `=>` name).
+  // the field analogue of a function-valued local.
   if tyIsFuncType(tyIx) { return 14 }
   const ty = P.nodes[tyIx]
   if ty is TypeRef {
-    if ty.tyName == "i32" { return 0 }
-    if ty.tyName == "boolean" { return 0 }
-    // An f64 field (`x: f64`) stores a raw f64 valtype slot — code 17. An i64 / f32 field is
-    // the same idea in the other scalar valtypes — codes 23 / 24 (0x7e / 0x7d storage).
-    if ty.tyName == "f64" { return 17 }
-    if ty.tyName == "i64" { return 23 }
-    if ty.tyName == "f32" { return 24 }
-    // A literal-union field (`kind: K`) stores an interned-i32 ATOM — code 0 (i32 valtype),
-    // NOT a box. Checked before the value/struct-union tests (a literal union registers as a
-    // union name, which would otherwise claim it as code 16). The field's union name is recorded
-    // in `sFieldElemName` so construction/read/assign recover the atom rep + membership.
-    if nodeTyIsLitUnionAlias(tyIx) { return 0 }
-    if nameIsString(ty.tyName) { return 3 }
-    if nameIsArray(ty.tyName) {
-      if nameIsI32Array(ty.tyName) { return 4 }
-      // A `string[]` field is a string-ref list (code `6`) — it reuses the map keys
-      // list types (`mkListIdx`/`mkArrIdx`). Any OTHER `X[]` is a struct/union ref list.
-      if nameIsStringArray(ty.tyName) { return 6 }
-      // A SCALAR-element list field stores its scalar-list wrapper (code 25/26/27), NOT a ref-list
-      // wrapper (code 5 is for struct/union/closure elements only — returning 5 here emitted the wrong
-      // heap type, the invalid-wasm hole).
-      if nameIsF64Array(ty.tyName) { return 25 }
-      if nameIsI64Array(ty.tyName) { return 26 }
-      if nameIsF32Array(ty.tyName) { return 27 }
-      return 5
-    }
-    // A NULLABLE i32-list field (`rest: i32[] | null`) stores a NULLABLE ref to
-    // the same wrapper as code 4 — code 18 (`0x63 lTypeIdx`). Checked before the
-    // value-union test (`i32[]` is not a value atom, so 16 never claims it).
-    if nameIsNulI32List(ty.tyName) { return 18 }
-    if nameIsNulRefList(ty.tyName) { return 28 }
-    // A NULLABLE DISTINCT-BACKING scalar-list field (`f64[] | null` 32, `i64[] | null` 33,
-    // `f32[] | null` 34, `string[] | null` 31): a `(ref null $leafWrapper)` slot — the field
-    // mirror of the same-named binding niche. Checked AFTER the ref-list arm so a spelling
-    // the ref-list layer already claims (`(string|null)[] | null`) keeps code 28's rep.
-    const nslF = nulScalarListFieldCode(ty.tyName)
-    if nslF >= 0 { return nslF }
-    // A MAP-typed field (`children: {[string]: Tree}`) stores a non-null ref to
-    // its value-type's map struct — code 19. The mv SLOT is interned by
-    // `collectA`'s arena TypeRef scan (this same annotation node), so emission
-    // re-finds it by the value name (`fieldRefElemName`).
-    // A map-MEMBER union field (`{[string]: string} | string`) starts with `{[` too, but it is a
-    // union BOX field (code 16), not a map — `!nameIsMapMemberUnion` lets it fall to the union test.
-    if nameIsMap(ty.tyName) && !nameIsMapMemberUnion(ty.tyName) { return 19 }
-    // A NULLABLE map field (`links: {[string]: V} | null`) stores a NULLABLE ref to the value
-    // type's map struct — code 29, the field analogue of the `nulmap` local/param/return niche
-    // (the map twin of code 28's nullable ref-list field). Gated to the SAME supported value
-    // kinds as the non-null map field (`retNulMapFlag`'s gate), so a nullable map over an
-    // unrepresentable value type keeps failing loudly (-1, no interned shape).
-    if nulMapInnerName(ty.tyName) != "" {
-      if mvValKindOfName(mapValNameOf(nulMapInnerName(ty.tyName))) != -3 {
-        return 29
-      }
-    }
-    // A `string | null` niche field — `(ref null $aTypeIdx)`, code 20. Checked before
-    // the value-union test (it is NOT a value union — a single ref + null is a niche).
-    if nameIsNulString(ty.tyName) { return 20 }
-    // A `boolean | null` niche field — i32 sentinel, code 21.
-    if nameIsNulBool(ty.tyName) { return 21 }
-    // A `K | null` nullable-litunion niche field — the i32 atom slot with the spare
-    // value `-1` = `null` (member ids are interned ≥ 0), code 30. The field analogue
-    // of the kind-0 `K | null` binding niche; checked before the value-union test
-    // (a single atom set + null is a niche, not a box).
-    if nameIsNulLitUnion(ty.tyName) { return 30 }
-    // A BOX-union field — a VALUE union (`v: i32 | null`, `y: string | i32`) OR a
-    // registered STRUCT / HETEROGENEOUS union (`v: A | B`, `v: A | i32`) — stores the
-    // shared union BOX ref (code 16). Checked BEFORE the nullable-struct strip, exactly
-    // like `nameFieldCode` (the annotation-shape path), so a declared `type Opt = { v:
-    // i32 | null }` carries the same rep as the inline `{v:i32|null}` annotation.
-    if isValueUnionName(ty.tyName) { return 16 }
-    if isUName(ty.tyName) { return 16 }
-    // A field naming ANOTHER STRUCT (`inner: Inner`) or a NULLABLE struct
-    // (`next: Node|null`) stores a `(ref null $S)` — code 15. Resolved via the
-    // DECLARATION scan (not the incrementally-built struct table) so a forward /
-    // mutually-recursive reference ties in the shared rec group.
-    let base = ty.tyName
-    const nb = nullablePartOf(base)
-    if nb != "" { base = nb }
-    if nameIsStructDecl(base) { return 15 }
+    const c = fieldCodeOfSpelling(ty.tyName, tyIx)
+    if c >= 0 { return c }
     // An INLINE-SHAPE struct field (`inner: {x:i32}`) — not a declared name, so resolve it
     // STRUCTURALLY to its interned struct (pre-interned by `collectNestedFieldShapes`). The
     // structural→nominal bridge applied at field classification, the dual of a nominal `inner: Inner`.
+    // The NODE entry point's own arm: an inline object-type annotation member reaching
+    // `nameFieldCode` is interned by the annotation pass instead.
     // GUARD against an array base (`{x:i32}[]` of a `{x:i32}[] | null` field): `structIndexOfTypeName`
     // ignores the trailing `[]` and would match the element shape, mis-coding a NULLABLE STRUCT-LIST
     // field as a nullable struct (code 15) — invalid wasm. A nominal `Node[] | null` already falls to
     // -1 (clean reject); this brings the inline form to par until nullable ref-list fields are repped.
+    let base = ty.tyName
+    const nb = nullablePartOf(base)
+    if nb != "" { base = nb }
     if !nameIsArray(base) && structIndexOfTypeName(base) >= 0 { return 15 }
     return -1
   }
@@ -9432,81 +9460,44 @@ function nameIsStructDecl(name: string) {
 // being fully populated (collectS builds it incrementally; a field may reference a
 // later-declared struct). Used to fill `sFieldElemName`/`uFieldElemName`.
 export function fieldRefElemName(tyIx: i32) {
+  if tyIx < 0 { return "" }
   const code = fieldTypeCode(tyIx)
-  // A VALUE-UNION field (code 16) records its union NAME — the key into the
-  // atom-set tables (and `registerValueUnionName` interns its box reps at the
-  // collection site).
-  if code == 16 {
-    const ty16 = P.nodes[tyIx]
-    if ty16 is TypeRef { return ty16.tyName }
-    return ""
-  }
-  // A NESTED-STRUCT field (code 15) records its TARGET struct name (the `S` of
-  // `inner: S` / `next: S|null`) — resolved to a struct table index at use sites.
-  if code == 15 {
-    const ty15 = P.nodes[tyIx]
-    if ty15 is TypeRef {
-      let base = nullablePartOf(ty15.tyName)
-      if base == "" { base = ty15.tyName }
-      // An INLINE-SHAPE field (`inner: {x:i32}`) records the NOMINAL name of its interned struct
-      // (`structIndexOfTypeName` resolves the shape — to its own `{x:i32}` key, or a matching declared
-      // struct), so every nominal-keyed use site (`structIndexByName`) resolves it like `inner: Inner`.
+  const ty = P.nodes[tyIx]
+  if ty is TypeRef {
+    // A NESTED-STRUCT field (code 15) records its TARGET struct name (the `S` of
+    // `inner: S` / `next: S|null`) — resolved to a struct table index at use sites.
+    // The NODE recorder NOMINALIZES where the shape-text one does not: an INLINE-SHAPE
+    // field (`inner: {x:i32}`) records the NAME of its interned struct
+    // (`structIndexOfTypeName` resolves the shape — to its own `{x:i32}` key, or a
+    // matching declared struct), so every nominal-keyed use site (`structIndexByName`)
+    // resolves it like `inner: Inner`.
+    if code == 15 {
+      let base = nullablePartOf(ty.tyName)
+      if base == "" { base = ty.tyName }
       const idx = structIndexOfTypeName(base)
       if idx >= 0 { return sNames[idx] }
       return base
     }
-    return ""
-  }
-  // A MAP-typed field (code 19) records its VALUE type-name (`Tree` of
-  // `{[string]: Tree}`) — the mv-slot interning key (`mvValName`).
-  if code == 19 {
-    const ty19 = P.nodes[tyIx]
-    if ty19 is TypeRef { return mapValNameOf(ty19.tyName) }
-    return ""
-  }
-  // A NULLABLE map field (code 29) records the `| null`-stripped map's VALUE type-name —
-  // the same mv-slot key its non-null twin uses, so both resolve one slot.
-  if code == 29 {
-    const ty29 = P.nodes[tyIx]
-    if ty29 is TypeRef { return mapValNameOf(nulMapInnerName(ty29.tyName)) }
-    return ""
-  }
-  // A NULLABLE REF-LIST field (code 28, `S[] | null`): its element is the ref-array element of the
-  // non-null part (`refArrElemName(nullablePartOf(name))` — `S[]|null` -> `S`, `(i32|null)[]|null` ->
-  // `i32|null`), so `sFieldRefSlot` (`rlSlotByName`) finds the element's interned slot.
-  if code == 28 {
-    const ty28 = P.nodes[tyIx]
-    if ty28 is TypeRef { return refArrElemName(nullablePartOf(ty28.tyName)) }
-    return ""
-  }
-  // An ATOM-ARRAY field (`f: K[]`, code 4 via `nameIsLitUnionArray`) records its ARRAY
-  // type-name so `sFieldIsLitUnionArray` recovers the atom-element rep at the construct/
-  // assign sites (a plain `i32[]`/`boolean[]` field stays ""). The ARRAY name — not the
-  // element — so `sFieldIsLitUnion` (code-0 scalar atoms, `nameIsLitUnionType`-keyed)
-  // does not claim the list-ref field.
-  if code == 4 {
-    const ty4 = P.nodes[tyIx]
-    if ty4 is TypeRef {
-      if nameIsLitUnionArray(ty4.tyName) { return ty4.tyName }
-    }
-    return ""
-  }
-  if code != 5 { return "" }
-  const ty = P.nodes[tyIx]
-  if ty is TypeRef {
-    // CANONICAL element name (`refArrElemName` — parens stripped, nullable-array peeled),
-    // NOT the raw `[]`-slice: a DECLARED struct field `f: (f64|null)[]` recorded the
-    // grouping-paren spelling `(f64|null)`, which misses the rl-slot table every other
-    // position keys bare (`f64|null`) — the field literal's element seed then defaulted
-    // and stored a RAW f64 into the box-ref backing (INVALID-WASM; fuzz-nightly
-    // 29875839073 declared leg, `decl:{f: (f64 | null)[]} | null` seed 240165064 d6).
-    // The inline-annotation interner (`internInlineShape`, #670) already records the
-    // canonical name; this brings the declared-TypeDecl path to parity. The raw slice
-    // stays as the fallback for elements the canonicalizer cannot resolve (e.g. a
-    // struct declared later in the same collection pass — identical spellings anyway).
-    const canon = refArrElemName(ty.tyName)
-    if canon != "" { return canon }
-    return ty.tyName.slice(0, ty.tyName.length - 2)
+    // A NULLABLE REF-LIST field (code 28, `S[] | null`): its element is the ref-array element of the
+    // non-null part (`refArrElemName(nullablePartOf(name))` — `S[]|null` -> `S`, `(i32|null)[]|null` ->
+    // `i32|null`), so `sFieldRefSlot` (`rlSlotByName`) finds the element's interned slot. No DEFERRED
+    // `[]`-slice fallback here (the shape-text recorder's): this path runs after the struct/union
+    // tables exist, so an element the canonicalizer cannot name is a genuine "".
+    if code == 28 { return refArrElemName(nullablePartOf(ty.tyName)) }
+    // The ATOM codes the shape-text recorder keys and the NODE recorder does not: a
+    // code-0 literal-union field and a code-30 `K | null` niche field carry their union
+    // name from the annotation interner, not from here.
+    if code == 0 { return "" }
+    if code == 30 { return "" }
+    // Every other code is recorded IDENTICALLY from a spelling, so the shape-text
+    // table answers: code 16 the union name, 19 / 29 the map's value name, 4 the atom
+    // ARRAY name, 5 the canonical ref element (`refArrElemName`, parens stripped and
+    // nullable-array peeled — a DECLARED struct field `f: (f64|null)[]` otherwise
+    // recorded the grouping-paren spelling that misses the rl-slot table, storing a raw
+    // f64 into the box-ref backing). Its code-5 `[]`-slice fallback is reachable from
+    // here too and means the same thing: code 5 is only ever assigned under
+    // `nameIsArray`, which is exactly that fallback's guard.
+    return shapeFieldElemName(ty.tyName, code)
   }
   ""
 }
@@ -10351,11 +10342,12 @@ export function anonFieldElemName(valIx: i32, code: i32) {
 }
 
 // The per-field wasm-type code an INLINE OBJECT-TYPE annotation member names
-// (`x:i32` → 0, `name:string` → 3, `tags:i32[]` → 4, …) — the NAME-level mirror
-// of `fieldTypeCode` (which reads a TypeRef node).
+// (`x:i32` → 0, `name:string` → 3, `tags:i32[]` → 4, …) — the SPELLING entry point
+// into the shared field-code table (`fieldCodeOfSpelling`); `fieldTypeCode` is the
+// AST-node one.
 export function nameFieldCode(t: string) {
   // A NULLABLE function field text (`((i32) => i32) | null`) is the nullable closure
-  // fat-pointer, code 22 — the text mirror of `fieldTypeCode`'s `nulCloFlag` arm.
+  // fat-pointer, code 22 — the text reading of `fieldTypeCode`'s `nulCloFlag` arm.
   if nameIsNulClosure(t) { return 22 }
   // A function-typed field name — a TOP-LEVEL arrow (`(i32)=>i32`) — is the closure rep,
   // code 14. Depth-aware (`annArrowAt`, not a substring test): a UNION carrying a closure
@@ -10363,65 +10355,8 @@ export function nameFieldCode(t: string) {
   // 16, the box) — the substring test claimed it as a bare closure and the constructed
   // box ref mismatched the closure-typed field (an unparseable module when global).
   if annArrowAt(t) >= 0 { return 14 }
-  if t == "i32" { return 0 }
-  if t == "boolean" { return 0 }
-  if t == "f64" { return 17 }
-  if t == "i64" { return 23 }
-  if t == "f32" { return 24 }
-  // A literal-union field (`kind: K`, or inline `"a"|"b"`) — an interned-i32 ATOM, code 0 (the
-  // name-based mirror of `fieldTypeCode`'s litunion branch). Before the union/string tests.
-  if nameIsLitUnionType(t) { return 0 }
-  if nameIsString(t) { return 3 }
-  if nameIsArray(t) {
-    if nameIsI32Array(t) { return 4 }
-    if nameIsStringArray(t) { return 6 }
-    // Scalar-element list fields (code 25/26/27), same as `fieldTypeCode`.
-    if nameIsF64Array(t) { return 25 }
-    if nameIsI64Array(t) { return 26 }
-    if nameIsF32Array(t) { return 27 }
-    return 5
-  }
-  // A MAP-typed field (`m: {[string]: i32}`) — code 19, the name-level mirror of the
-  // `fieldTypeCode` map case. Its mv SLOT is resolved at emit by the value name recorded in
-  // `sFieldElemName` (see `internInlineShape`/`internShapeAs`).
-  // A map-MEMBER union field (`{[string]: V} | X`) starts with `{[` too, but it is a union BOX
-  // field (code 16), not a map — `!nameIsMapMemberUnion` lets it fall to the union test below,
-  // exactly as `fieldTypeCode`'s node-based map arm does. Without this an inline object-type
-  // field of a map-member-union type mis-stored the union box in a map-struct field slot
-  // (invalid wasm). (The `nameIsMapMemberUnion` twin of `fieldTypeCode`.)
-  if nameIsMap(t) && !nameIsMapMemberUnion(t) { return 19 }
-  // A NULLABLE map field (`{[string]: V} | null`) — code 29, the name-level mirror of
-  // `fieldTypeCode`'s nullable-map arm, with the same supported-value-kind gate.
-  if nulMapInnerName(t) != "" {
-    if mvValKindOfName(mapValNameOf(nulMapInnerName(t))) != -3 { return 29 }
-  }
-  // A NULLABLE i32-list field (`rest: i32[] | null`) — code 18 (see fieldTypeCode).
-  if nameIsNulI32List(t) { return 18 }
-  if nameIsNulRefList(t) { return 28 }
-  // The DISTINCT-backing nullable scalar-list fields (codes 31/32/33/34) — the name-level
-  // mirror of `fieldTypeCode`'s arm, in the same order (after the ref-list claim).
-  const nslN = nulScalarListFieldCode(t)
-  if nslN >= 0 { return nslN }
-  // The niche FIELDS: `string | null` (`(ref null $aTypeIdx)`, code 20) and
-  // `boolean | null` (i32 sentinel, code 21) — before the value-union test (a single
-  // ref/scalar + null is a niche, not a box).
-  if nameIsNulString(t) { return 20 }
-  if nameIsNulBool(t) { return 21 }
-  // A `K | null` nullable-litunion niche field — i32 with the `-1` null sentinel,
-  // code 30 (the name-based mirror of `fieldTypeCode`'s arm).
-  if nameIsNulLitUnion(t) { return 30 }
-  // A BOX-union field — a VALUE union (`y: string | i32`) OR a registered STRUCT /
-  // HETEROGENEOUS union (`v: A | B`, `v: A | i32`) — stores the union BOX ref (code 16);
-  // its union name rides `sFieldElemName` (the tag set + value-box / variant reps).
-  // Checked before the nullable-struct strip (`i32|null` is a value union, not a
-  // nullable struct name).
-  if isValueUnionName(t) { return 16 }
-  if isUName(t) { return 16 }
-  let base = t
-  const nb = nullablePartOf(base)
-  if nb != "" { base = nb }
-  if nameIsStructDecl(base) { return 15 }
-  -1
+  // -1: there is no node, so the literal-union arm is decided from the spelling.
+  fieldCodeOfSpelling(t, -1)
 }
 
 // Intern every INLINE OBJECT-TYPE annotation (`(p: { x: i32 })`, `: { x: i32 } |
