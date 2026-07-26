@@ -11535,3 +11535,494 @@ involved.
     report the list unchanged at 523, report the deletion separately, and hand the inventory
     question over explicitly. **Report the metric you were given AND the thing you actually
     changed; never quietly substitute one for the other.**
+
+## D-VALKIND — the union-box ATOM test stops being keyed by a KEYWORD, and the emitter's most-repeated name-keyed row lookup loses 13 of its 27 calls
+
+Partition: `compiler/emit_rep.vl` + `compiler/wasmEmit.vl` + `compiler/emit_state.vl` +
+`compiler/emit_rewrite.vl` (the last two are untouched — see the refutations), plus
+`tests/cases/**` and this file. `emit_classify.vl` and `typecheck.vl` belong to two other
+live agents; every finding that lands in them is filed as an exact diff below, not applied.
+
+### The unit, stated before the numbers
+
+**This slice deletes ZERO calls from the 23-resolver parser list, and the list is 475
+before and after.** `unionHasAtomTy` has been arena-only since D-UHATOTAL; it parses
+nothing. What it does is resolve its union **by NAME on every call** — `unionRowOf`, a
+linear scan of `unNames` and then of `unMemberSet`, both whole-string compares — and
+materialize every member's arena type into a fresh `i32[]`, in order to answer a question
+keyed by a **type-name string**: `"i32"`, `"i64"`, `"f64"`, `"f32"`, `"string"`, `"null"`.
+That keyword is a type name used to make a structural decision — the program's terminal
+condition — and at five of the fourteen sites the caller **already held the ABI code** and
+handed over a spelling for the callee to re-derive it from.
+
+So the units here are **static call sites** and **dynamic work**, and they are reported as
+such rather than dressed up as parser-list movement.
+
+| unit (counted, not grepped) | master `441102b` | this slice |
+|---|---|---|
+| `unionHasAtomTy` call sites, `wasmEmit.vl` | **27** | **14** (**−13**) |
+| … what the 14 survivors are | | 13 LIST-atom (`arr = true`) tests + the new ladder's single decline leg |
+| `msSetOfText` call sites, `wasmEmit.vl` | 9 | **12** (+3) |
+| `valueAtomKind` call sites, `wasmEmit.vl` | 9 | **9** |
+| 23-resolver parser list, tree-wide | **475** | **475** |
+
+Counted with a string-literal-aware `//` stripper over `compiler/` + `std/` + `scripts/`,
+definition headers excluded, per-file sums asserted equal to the tree-wide total. **The
+brief's "`unionHasAtomTy` re-counts at exactly 27 calls there" reproduces exactly.**
+
+**The brief's parser-list figure of 493 also reproduces exactly — at `74d6f71`, the base it
+was taken at.** Master has since moved to **475** (#1140 D-REFARRKIND and #1141 D-UDVARTY
+deleted 18 between them), and this slice leaves it at 475. That round trip is reported
+because it validates the counter against a published number before the counter is used to
+claim anything: 493 at `74d6f71`, 475 at `441102b`, 475 here. `std/` and `scripts/`
+contribute **0** to the list at every one of those revisions.
+
+### What shipped
+
+**`msHasValKind(s, k)` — `emit_rep.vl`.** Membership of a scalar value atom by its ABI
+KIND, read off the banked kind column (`unMemValKind`: one `valueAtomKind` code per
+recorded member, in the row's box-tag ABI order, written once at registration by
+`recordUnMemTys`). This is `msHasNull`'s generalization from the `null` keyword to the
+whole scalar keyword row. Tri-state — 1 present · 0 absent · **−1 uncovered** — and the −1
+is what makes it safe to consume.
+
+**`unionHasAtomK(s, nm, kw, k)` — `wasmEmit.vl`.** The ladder, one home for all fourteen
+sites: ask the bank; fall through to `unionHasAtomTy(nm, kw, false)` on a decline. The
+keyword survives ONLY as the decline argument. That shape is deliberate: it answers
+#1136's objection to a kind→keyword RENDERER, which would have relocated the spelling
+instead of deleting it.
+
+Two restrictions are in the code because they are load-bearing, not as convention:
+
+- **kinds 0–6 only.** `unMemHasAtom` is deliberately EXACT (a `TyPrim` spelled exactly
+  `want` — see its header), and only across the seven scalar keywords is the kind map a
+  bijection. Kind 7 folds `i32[]` / `boolean[]` / litunion-`K[]` onto ONE code — precisely
+  the fold `unMemHasAtom` forbids — and every list member's arena type is a `TyArray`, so
+  the primitive test answers NO for a list spelling where a kind test would answer YES.
+  This is also what makes the two VARIABLE-kind sites safe: `emitUnionConcreteEq`'s `eak`
+  and `emitUnionLitIs`'s `lak` are passed straight in, and a list / closure atom's code
+  falls outside 0–6, so those reaches keep the exact primitive path untouched.
+- **the ALIAS decline.** A member the kind column does not classify (`valueAtomKind` = −1)
+  whose RECORDED ARENA TYPE is nonetheless a `TyPrim` would answer YES on the primitive
+  path and NO here; the whole set is declared uncovered rather than differ. Reported below
+  as a guard I could not witness firing, with the mechanism that empties it.
+
+### Where the fourteen sites are, and what each one already held
+
+| # | site | atom | kind in hand? | set id in hand? |
+|---|---|---|---|---|
+| 0 | struct-field default, code 16 | `"null"` | `nullValKind()` | **no** — one `msSetOfText` added |
+| 1,2 | `emitUnionCoerce`'s integer-widen arm | `"i32"`/`"i64"` | literal | **no** — ONE added for both |
+| 3,4 | `emitUnionCoerce`'s f64→f32 re-encode | `"f64"`/`"f32"` | literal | **no** — ONE added for both |
+| 5 | `emitUnionConcreteEq`'s membership gate | VARIABLE | **`eak`, one line above** | **`usid`, at the gate** |
+| 6,7 | `emitUnionUnionEq`'s two `string` tests | `"string"` | literal | **`lsid`/`rsid`, banked by D-SETONCE** |
+| 8,9 | `emitUnionLitIs`'s integer-widen arm | `"i32"`/`"i64"` | literal | **`usid`, at the gate** |
+| 10 | `emitUnionLitIs`'s membership gate | VARIABLE | **`lak`, from the ladder** | **`usid`** |
+| 11 | `??` over a boxed union ident | `"null"` | `nullValKind()` | **was resolved TWICE** — now once |
+| 12 | `??` over a boxed union CALL | `"null"` | `nullValKind()` | **`ksid`** |
+| 13 | `??` over a value-union FIELD | `"null"` | `nullValKind()` | **`msid`** |
+
+Sites 3/4 needed one structural change: the `cak == 4` gate was hoisted out of a three-term
+`&&` chain into its own `if`, so the set resolution is paid by a float-classified value and
+not by every coercion. Sites 1/2 sit inside the ladder's final `else` for the same reason.
+Site 11 is a straight dedup: master resolved that set once for the value-union gate and
+again, by NAME, inside `unionHasAtomTy`.
+
+### Harness
+
+Corpus = all **1,351** `.vl` files under `tests/cases`, `compiler`, `std`, `scripts`, three
+channels: per-file `vl build` **byte** compare (md5), full stdout+stderr **message**
+compare (out paths normalised), and `vl run` **stdout + rc**. Fuzz = 7 seeds × depths
+4,5,6 × {plain, `--branching --multiobs --declared`} × 600 per bucket = 50,400
+programs/side, generated ONCE by the master compiler so both sides see identical programs,
+compared as whole `--out-dir` TREES. The agreement probe reports an accumulated per-SITE
+table once at the end of `emitProgram` through `emitFail` (`emitFailed` cleared first, so a
+program that already rejected still reports); the probe compiler is fail-loud, so the fuzz
+GENERATOR is compiled by MASTER, never by the probe (method note: a fail-loud probe cannot
+generate its own fuzz corpus).
+
+### Agreement — per SITE, because the aggregate would have hidden nothing but could have
+
+Every reach carries the shipped answer beside the candidate. `Cs` = candidate covered
+(≥ 0), `Ds` = disagreements, `Cn`/`Dn` = the same for the NAIVE candidate (no alias-decline
+arm), `S`/`S2` = the two comparator sanities (`msHasValKind(s, (k+1) mod 7)` and
+`(k+3) mod 7` against the authority).
+
+| site | reaches | covered | agree | **disagree** | naive disagree | TRUE | S | S2 | files |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 3 | 3 | 3 | **0** | 0 | 3 | 0 | 3 | 1 |
+| 1 | 239 | 239 | 239 | **0** | 0 | 209 | 174 | 223 | 149 |
+| 2 | 30 | 30 | 30 | **0** | 0 | 30 | 30 | 20 | 22 |
+| 3 | 99 | 99 | 99 | **0** | 0 | 71 | 99 | 66 | 62 |
+| 4 | 28 | 28 | 28 | **0** | 0 | 28 | 17 | 28 | 14 |
+| 5 | 15 | 15 | 15 | **0** | 0 | 15 | 15 | 15 | 4 |
+| 6 | 8 | 8 | 8 | **0** | 0 | 8 | 5 | 4 | 5 |
+| 7 | 8 | 8 | 8 | **0** | 0 | 8 | 5 | 4 | 5 |
+| 8 | 6 | 6 | 6 | **0** | 0 | 3 | 3 | 6 | 4 |
+| 9 | 3 | 3 | 3 | **0** | 0 | 3 | 3 | 3 | 1 |
+| 10 | 18 | 18 | 18 | **0** | 0 | 18 | 18 | 18 | 6 |
+| 11 | 26 | 26 | 26 | **0** | 0 | 26 | 3 | 26 | 13 |
+| 12 | 16 | 16 | 16 | **0** | 0 | 16 | 7 | 16 | 3 |
+| 13 | 6 | 6 | 6 | **0** | 0 | 6 | 2 | 6 | 3 |
+| **ALL** | **505** | **505 (100%)** | **505** | **0** | **0** | 444 | 381 | 438 | |
+
+**Coverage is 100% at EVERY site, not just in aggregate** — the per-site split is published
+because #1138's lesson was that an aggregate can hide a slice, and the check has to be run
+even when it comes back uniform. Channel population: 444 TRUE / 61 FALSE on the covered
+side, over 1,164 reporting programs.
+
+**Comparator sabotage-proved.** A comparator that never separates proves nothing, so two
+were run. The `k+1` comparator reads 0 at site 0 (a `X | null` union has both the null and
+the i32 arm, so both answers are TRUE); the `k+3` comparator separates there. Neither alone
+covers all fourteen; **the union of the two separates at every one of the fourteen sites**
+— this is method note 76 applied to the comparator as well as to the sabotages.
+
+**Fuzz.** 16,800 generated programs, 16,577 reporting: **2,141 reaches / 2,141 covered / 0
+disagreements** (1,729 TRUE, 412 FALSE), reproducing #1138's hand-off figure to the unit.
+**And its blind spot is published rather than glossed:** fuzz reaches ONLY sites 1–4
+(`emitUnionCoerce`). It reaches sites 0 and 5–13 **zero** times — the generator emits no
+union `==`, no literal `is` over a mixed-rep union, no `??` over a boxed value union and no
+value-union struct field. So ten of the fourteen sites are confirmed by the CORPUS alone,
+and four by both. Neither channel is a superset; each 0 is labelled with the channel that
+could have seen it.
+
+### Work, COUNTED not timed — and the two instruments agree to the unit
+
+A throwaway counter build (counters in `ast.vl`, which OWNS the state, bumped through an
+exported function because a cross-module `export let` is a copy) applied to master source
+and to branch source, both swept over the whole corpus. 1,164 reporting programs per side:
+
+| counter | master | this slice | delta |
+|---|---|---|---|
+| `unionRowOf` entries | 13,639 | 13,134 | **−505** |
+| `unMemHasAtom` entries | 654 | 149 | **−505** |
+| `unionRowOf` whole-string compares | 52,890 | 52,091 | **−799** |
+| member arena types materialized by `unMemHasAtom` | 1,417 | 299 | **−1,118** |
+| `msSetOfText` entries | 118,543 | 118,884 | **+341** |
+| `msSetOfText` linear-scan steps | 36,144 | 36,158 | **+14** |
+
+**The −505 is exactly the agreement probe's 505 covered reaches** — two instruments built
+for different purposes agreeing to the unit, the cross-check #1138 established. Each
+deleted entry is one `unionRowOf` name resolution (a scan of `unNames`, then of
+`unMemberSet`) plus one `i32[]` allocation and one member-type materialization.
+
+**The price is stated too.** +341 `msSetOfText` resolutions, of which **+14 are actual
+linear-scan steps** — the rest are memo hits or misses already cached, because eleven of
+the fourteen sites either already held a set id or share one that a neighbouring gate had
+already interned. Binary: 1,036,055 → **1,036,708 (+653 B)**.
+
+### Channels
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / message / run, base `441102b` | **1,351 files** | **0 / 0 / 0** |
+| fuzz A/B, whole `--out-dir` trees | **50,400 programs/side**, 52,746 output files/side | **0 differing paths** |
+| agreement probe, corpus | 1,164 programs / 505 reaches / 505 covered | **0 disagreements** |
+| agreement probe, fuzz | 16,577 programs / 2,141 reaches / 2,141 covered | **0 disagreements**, 4 of 14 sites reached |
+
+Corpus channel population, shown rather than claimed: **1,146 distinct wasm hashes, 201
+build rejects, 212 nonzero run rcs.**
+
+### Entombment — 7 sabotages against the SHIPPED build, four with power and three INERT
+
+Each sabotage is applied to the shipped source, built, and swept against the shipped build
+over the whole corpus (byte, message AND run). The restore is a `cp` from a copy kept
+beside the runner, and **the restored source rebuilds a byte-identical artifact (verified
+by `cmp`).**
+
+| sabotage | what it breaks | files | byte | msg | run |
+|---|---|---|---|---|---|
+| **S-K3** — the kind column is compared against `(k+3) mod 7` | every migrated site | **87** | 70 + 17 build-status | 41 | 70 rc + 12 stdout |
+| **S-K1** — compared against `(k+1) mod 7` | every migrated site | **58** | 54 + 4 build-status | 40 | 40 rc + 13 stdout |
+| **S-NULLARM** — the bank answers 0 for the `null` kind (6) | the four null tests | **17** | 17 build-status | 17 | 17 rc |
+| **S-STRARM** — the bank answers 0 for the `string` kind (2) | the `==` string tests | **3** | 3 | 3 | 2 stdout + 1 rc |
+| S-FORCE — the ladder's DECLINE leg answers `false` instead of consulting the name path | (coverage) | **0** | 0 | 0 | 0 |
+| S-ALIASARM — the alias-decline arm is REMOVED | (inert — mechanism below) | **0** | 0 | 0 | 0 |
+| S-WIDEN — the "kinds 0–6 only" restriction is removed | (inert — mechanism below) | **0** | 0 | 0 | 0 |
+
+**Fire sets, checked against the per-site reach table rather than asserted.** Mapping each
+sabotage's differing FILES onto the sites those files reach: S-K3 → **all 14**; S-K1 → 13 of
+them (not site 0); S-NULLARM → {0,1,2,3,4,11,12,13}; S-STRARM → {1,8,10}. **Union = every
+site, 0 left over.** The new fixture is in S-K1's and S-K3's differing sets, so site 9 —
+the one the corpus could not reach before this slice — is pinned by both. File-level attribution is what a byte-diff gives — a differing
+file may reach several sites and only one be responsible — so the CAUSAL statement is made
+by each sabotage's own construction instead: S-NULLARM perturbs ONLY kind 6, S-STRARM ONLY
+kind 2, and no other site can ask for those.
+
+**S-FORCE's 0 is the coverage statement, not a hole.** It makes the ladder answer `false`
+wherever the bank declines instead of consulting `unionHasAtomTy`. Zero diffs says the bank
+covers **100%** of the fourteen sites' reaches on this corpus, independently confirming the
+probe's per-site `Cs == R` — a second instrument for the same claim, arrived at from the
+output side rather than the instrumentation side.
+
+**S-WIDEN is INERT, and that is a finding about the corpus, not a licence to widen.**
+Removing the "kinds 0–6" restriction changes nothing over 1,351 files because no reach at
+the two VARIABLE-kind sites carries a list or closure atom on this corpus (the probe's
+`Cs == R` says the same thing: every reach had `k ≤ 6`). The restriction is kept because it
+is derived — `unMemHasAtom`'s exactness is documented in its own header and the kind map is
+provably not a bijection above 6 — so it is **correct by construction rather than
+load-bearing by measurement**, and this file says which.
+
+**S-ALIASARM is INERT, and the mechanism that empties it is nameable.** The arm exists
+because `type MyInt = i32` used as a union member could in principle reach
+`recordUnMemTys` spelled `MyInt`, with an arena type of `TyPrim("i32")` — YES on the
+primitive path, NO on the kind column. It never does, and the reason is
+`canonEmitTypeNames` (typecheck.vl): the post-check sweep rewrites **every `UnionDecl`
+variant name** through `canonEmitName`, so a transparent prim alias is already spelled
+`i32` by the time the emitter registers the row. Verified directly — a hand-written
+`type MyI64 = i64; type U = MyI64 | string` registers the member set `{i64|string}`, and a
+counter inside `recordUnMemTys` counting members with an unclassified spelling AND a
+`TyPrim` arena type reads **0** across 1,164 corpus programs and 16,577 fuzz programs,
+including #1141's four new prim-alias fixtures. A parenthesized `(i32)` member is likewise
+peeled before the set text is built. The guard is kept for the routes that do NOT go
+through `canonEmitTypeNames` — `registerInlineUnion` / `registerValueUnionName` mint rows
+from names the emitter composes itself — and this file records that it is **belt-and-braces
+with three closed routes named, not a measured-load-bearing arm.**
+
+### A corpus hole found and FILLED — `tests/cases/unions/literal-is-i64-widen-arm.vl`
+
+The per-site probe found **site 9 at ZERO reaches** across the whole corpus:
+`emitUnionLitIs`'s fourth ladder arm — an IN-RANGE integer literal that settles on the i64
+atom only because the union has no `i32` member and does have an `i64` one. Every other
+reach of site 8 answers TRUE and short-circuits the `&&`, so site 9 never runs. Its sibling
+`literal-is-i64-arm-kind.vl` (#1138) pins the OUT-OF-RANGE lexeme arm above it, which never
+consults the union at all.
+
+`const v: i64 | string = 7; if v is 7 { … }` is that arm. Master and this slice are byte-,
+message- and run-identical on it; under **S-K3** it goes red. Without it, either membership
+test in that arm could be shipped wrong and every existing file would stay green — the
+#1138 pattern in its third instance.
+
+### Gate
+
+| check | result |
+|---|---|
+| `scripts/refresh-compiler.sh` | **RC=0** |
+| `scripts/native-fixpoint.sh` | stage3 == stage4 byte-for-byte (1,036,708 B) — **RC=0** |
+| `scripts/lint-self.sh` | self-lint + fmt-check clean — **RC=0** |
+| `scripts/rep-fuzz-check.sh` | exact ✅ 1 baselined reject, 0 new / 0 stale — **RC=0** |
+| `deno task test` | master `441102b` **1,443 / 0 / 602** → **1,444 / 0 / 602** (+1 = the new fixture) |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | master `441102b` **2,037 / 0 / 8** → **2,038 / 0 / 8** (+1) |
+
+**Both the MAGNITUDE and the ignored NAME SET were checked**, in one session, master and
+branch with the same commands at the same head. A plain `deno task test` in this worktree
+self-ignores **602** tests; only `SELFHOST_NATIVE_ALIGN=1` runs the native suites. The
+ignored-test **name sets** are IDENTICAL on both invocations (602 vs 602 named, 8 vs 8) — 0
+tests newly ignored, 0 that stopped being ignored. The worktree was given the host binary
+and `node_modules` (`scripts/agent-setup.sh`) so the native and binaryen suites actually
+execute; without that a first run reads green over a third of the suite.
+
+Source: `emit_rep` **+63 / −0**, `wasmEmit` **+73 / −26**, one new fixture (+26). Binary **1,036,055 → 1,036,708 (+653 B)**.
+
+### RE-TAKEN at the rebase base `441102b` (#1140 D-REFARRKIND, #1141 D-UDVARTY + D-ISALIAS)
+
+This slice was first measured at `74d6f71` and rebased onto **`441102b`**. The four owned
+files are **byte-identical across both bases** (`git diff 74d6f71 441102b --` over them is
+empty), but #1141 is a change to how a union DECLARATION spells its own members and ships
+four PRIM-ALIAS fixtures — exactly the population the alias-decline arm reasons about — so
+the agreement probe, the work counters, both A/B channels and the whole suite were **re-run
+at the new base**, not assumed. Every figure above is the re-taken one. For the record, the
+figures at `74d6f71` were: corpus 1,346 files 0/0/0 · fuzz 50,400/side 52,746 files/side 0 ·
+agreement probe 489 reaches / 489 covered / 0 · fuzz probe 2,141 / 2,141 / 0 · suite
+1,438→1,439 and 2,032→2,033 · fixpoint 1,036,664 → 1,037,317 (**+653 B**, the same delta).
+The seven sabotages were run at `74d6f71` against the then-shipped build and are NOT
+re-taken: they instrument only the two owned files, which #1140/#1141 did not touch.
+
+### Refutations — things this slice found WRONG, including in its own brief
+
+1. **The brief's "`msHasValKind` … is EXACT for kinds 0–6 (the kind map is a bijection
+   there)" is right about the kind map and INCOMPLETE about the predicate.** The bijection
+   is between codes and keyword LEXEMES; the predicate compares a MEMBER SPELLING's banked
+   code against a code, while `unMemHasAtom` compares a member's ARENA TYPE against a
+   keyword. Those differ whenever a member's spelling is not a keyword but its arena type
+   is a `TyPrim` — an alias. The handed-off body has no arm for that and would have been a
+   silent wrong answer if the population were non-empty. It is empty, for a reason two
+   layers away (`canonEmitTypeNames`), and finding that took a probe and a hand-written
+   fixture, not a re-reading. **A handed-off body is a lead, not a proof — the same rule the
+   brief states for handed-off measurements applies to handed-off CODE.**
+2. **"corpus 480/480, fuzz 2,141/2,141" re-measures at 505/505 and 2,141/2,141.** The fuzz
+   figure reproduces to the unit; the corpus figure moved because the corpus moved (1,345 →
+   1,351 files across two merges plus this slice's fixture). Re-measured, not inherited.
+3. **The brief's "ten sites" is fourteen `arr = false` call sites** grouped into ten source
+   statements. Two of them (`emitUnionUnionEq`'s pair, `emitUnionCoerce`'s pairs) are two
+   calls inside one `&&`, and the difference matters because the SECOND call of each pair
+   is short-circuited away at most reaches — which is exactly why site 9 had zero coverage
+   and needed a fixture. **State whether a "site" is a call or a statement.**
+4. **`repRowOfName`'s header, corrected by #1138 to "six live call sites … all on hot
+   classification paths", is right about the count and wrong about "hot" being uniform.**
+   Measured: 72% of its 5,999 corpus calls are ONE site (`retStructIndex`), one site has 11
+   calls, and one has **zero**. See the hand-off.
+5. **`emit_state.vl` and `emit_rewrite.vl` were in the partition and are untouched, on
+   purpose.** `emit_state` holds the member-reference columns' declarations and no
+   resolver; `emit_rewrite`'s single `isValueUnionName` is #1138's site 10 (0% coverage,
+   `inferRetTyByNode`'s population) and its three inline character-surgery sites are
+   `synthRetAnnots`', gated on the same checker-side producer. Editing them to show
+   movement in the partition would have been movement without a measurement.
+
+### Hand-offs
+
+#### 1. `emit_classify.vl` — `repRowOfName`, MEASURED per site, with the exact diff
+
+**The measurement first, because the brief's version of this lead had none.** A throwaway
+probe carrying the arena candidate beside the shipped answer at all six call sites, swept
+over the corpus (1,164 reporting programs):
+
+**`repRowOfName` is called 5,999 times and renders + re-parses 64,120 characters of type
+spelling per corpus sweep** (`tyToStr` render → `renderFaithful` character rewrite →
+`resolveAnnot` re-parse).
+
+| # | site | reaches | arena+name both answer | **equal** | **differ** | name answers, arena declines | no arena route |
+|---|---|---|---|---|---|---|---|
+| 0 | `retNulRefIndex` | 11 | 10 | 10 | **0** | **1** | 0 |
+| 1 | `retStructIndex` | **4,302** | 421 | 421 | **0** | 0 | 0 |
+| 2 | `paramStructIndex` | 900 | 354 | 354 | **0** | 0 | 0 |
+| 3 | `structIdxOfElemName` | **0** | — | — | — | — | — |
+| 4 | `monoIsRowMatch` | 61 | — | — | — | — | 61 |
+| 5 | `shapeElemDeclaredStructIdx` | 725 | — | — | — | — | 725 |
+| | **ALL** | **5,999** | **785** | **785** | **0** | **1** | 786 |
+
+The arena candidate is `repRowOfTyStruct(nullableInnerOf(nodeRepTyIxOf(tyIx)), sScanLim())`
+— the `| null` peel and the row lookup both off the RECORDED type, with no render, no
+character rewrite and no re-parse. **785 comparisons, 0 disagreements.**
+
+**The pre-gate breakdown, which is where the real prize is.** Over the 5,213 reaches at the
+three node-bearing sites:
+
+| the recorded type at the reach | count |
+|---|---|
+| absent (`nodeRepTyIxOf` uncovered) | **0** |
+| present but not a `TyNullable` | 45 |
+| a `TyNullable` whose inner resolves a row (**the answering population**) | **785** |
+| a `TyNullable` whose inner resolves NO row | **4,383** |
+
+So the arena covers **100%** of these reaches, and **4,383 of 5,213 calls render and
+re-parse a spelling only to return the same −1/−2 the arena already knew** (they are
+`i32 | null`-shaped annotations whose base is not a dedup-participating struct row).
+
+**And the obvious optimization is REFUTED by exactly one reach.** "If the arena declines,
+skip the call" is wrong: at site 0 there is **1** reach where `repRowOfName` answers and
+the arena candidate declines — an INLINE-SHAPE nullable return, witness
+`tests/cases/structs/nullable-wrapper-literal-widen.vl` (`function mk(): {f: f32} | null`).
+1 in 5,213. The ladder must keep its name leg; only the ORDER changes.
+
+**The exact diff** (three hunks in `emit_classify.vl`, one in `emit_rep.vl`; not applied
+here because `emit_classify.vl` is another agent's partition):
+
+```diff
+--- a/compiler/emit_rep.vl
++++ b/compiler/emit_rep.vl
+@@ (immediately below `repRowOfTyStruct`)
++// The struct-table row a NULLABLE-struct ANNOTATION NODE names, taken off the node's
++// RECORDED type: peel the `TyNullable` and resolve the inner through the ONE
++// `repRowOfTyStruct` vocabulary. The arena twin of
++// `repRowOfName(nullablePartOf(ty.tyName), lim)` — same question, asked of the
++// structure instead of a `tyToStr` render put through `renderFaithful` and re-parsed.
++// -1 when the node has no recorded type, the recorded type is not a `TyNullable`, or
++// the inner names no dedup-participating row; the caller keeps its name ladder, which
++// is NOT dead (measured: 1 consequential reach in 5,213, an inline-shape nullable
++// return — `tests/cases/structs/nullable-wrapper-literal-widen.vl`).
++export function repRowOfNulTyStruct(repTyIx: i32, lim: i32): i32 {
++  if repTyIx < 0 { return -1 }
++  if repTyIx >= T.tys.length { return -1 }
++  const t = T.tys[repTyIx]
++  if t is TyNullable { return repRowOfTyStruct(t.nInner, lim) }
++  -1
++}
+```
+
+```diff
+--- a/compiler/emit_classify.vl
++++ b/compiler/emit_classify.vl
+@@ retNulRefIndex
+       const base = nullablePartOf(ty.tyName)
+       if base != "" {
+-        const rr = repRowOfName(base, sScanLim())
+-        if rr >= 0 { return rr }
++        // D-REPROWNUL: the `| null` peel and the row lookup, both off the RECORDED
++        // type. The name ladder below stays — it is consequential at this site.
++        const ar = repRowOfNulTyStruct(nodeRepTyIxOf(tyIx), sScanLim())
++        if ar >= 0 { return ar }
++        const rr = repRowOfName(base, sScanLim())
++        if rr >= 0 { return rr }
+         return structIndexOfTypeName(base)
+       }
+@@ retStructIndex
+       const base = nullablePartOf(ty.tyName)
+       if base != "" {
+-        const rr = repRowOfName(base, sScanLim())
+-        if rr >= 0 { return rr }
++        const ar = repRowOfNulTyStruct(nodeRepTyIxOf(tyIx), sScanLim())
++        if ar >= 0 { return ar }
++        const rr = repRowOfName(base, sScanLim())
++        if rr >= 0 { return rr }
+         return structIndexOfTypeName(base)
+       }
+@@ paramStructIndex
+               const pbase = nullablePartOf(ty.tyName)
+               if pbase != "" {
+-                const prr = repRowOfName(pbase, sScanLim())
+-                if prr >= 0 { return prr }
++                const par = repRowOfNulTyStruct(nodeRepTyIxOf(p.parType), sScanLim())
++                if par >= 0 { return par }
++                const prr = repRowOfName(pbase, sScanLim())
++                if prr >= 0 { return prr }
+                 return structIndexOfTypeName(pbase)
+               }
+```
+
+That ladder skips `repRowOfName` on **785 of 5,999** calls with 0 measured disagreements.
+**The bigger prize needs one more decision and is NOT filed as a diff**: the 4,383 declining
+calls are the waste, and skipping them requires establishing that "recorded `TyNullable`,
+no row" implies "the render does not resolve a row either" — which the single site-0 witness
+above shows is FALSE as stated, so it needs a narrower predicate (e.g. gate on the recorded
+inner being a `TyObj` at all) and its own probe. **Do not take it on this file's numbers
+alone.**
+
+The remaining three sites: `structIdxOfElemName` is **0 reaches on this corpus** (its
+`repRowOfName` rung was added by D-ELEMROW and the fixtures that exercised it are now
+answered a rung earlier) — a candidate for a coverage fixture, not a migration.
+`monoIsRowMatch` (61 reaches) and `shapeElemDeclaredStructIdx` (725) have no annotation
+node at their signatures, but `monoIsRowMatch`'s `want` side DOES have a banked arena type
+one frame up: `isVarTyIxOf(isIx)` (#1137's D-ISVARTY bank, `nameToTy(n.isVariant)`), read at
+`monoStaticIsResult` in `wasmEmit.vl`. Threading that index instead of the spelling is a
+two-file change (signature in `emit_classify`, argument in `wasmEmit`) and wants a probe
+comparing `nameToTy` against `resolveAnnot(renderFaithful(·))` before it is taken.
+
+#### 2. `typecheck.vl` — bank the inferred-return TYPE (`inferRetTyByNode`), unchanged and re-endorsed
+
+#1136 filed it off `synthRetAnnots`' 19-site ladder; #1138 measured it a second time from
+`isValueUnionName`'s two low-coverage sites. This slice adds nothing to it and touches
+none of it — recorded here only so the lead does not look dropped. It remains the
+highest-value single move left in the emitter's second arc.
+
+#### 3. `emit_rep.vl`'s remaining `resolveAnnot` population
+
+Seven calls, counted: `repElemKeyOfName`, `sTyIxOfName`, `fieldElemTyIxOfName`,
+`unMemAtomTyIx`, `slotCanonKey`, `repNameCanonKey`, `repRowOfName`. With `repRowOfName`
+measured above, `slotCanonKey` is next: its `resolveAnnot` leg duplicates what
+`sTyIxOfName` already recorded into the `sTyIx` sidecar at every row mint, but the sidecar
+is consulted LAST — an ordering question a `repCanonKey`-TOLERANCE probe (never index
+equality: index identity is not type identity) can settle in one build.
+
+### Method notes earned
+
+79. **A handed-off BODY is a lead, not a proof — the same rule the program already applies
+    to handed-off measurements.** #1138 wrote `msHasValKind`'s body into the doc precisely
+    so it would not be a stale pointer, and that was the right call; the body still had a
+    missing arm (the alias case), which no amount of re-reading found and one hand-written
+    four-line fixture plus a counter inside the producer did. **Re-derive the predicate
+    from its contract before shipping code you were handed, even when it was handed over
+    with numbers attached.**
+80. **"Correct by construction" and "load-bearing by measurement" are different claims and
+    a slice should say which each guard has.** Two of this slice's three inert sabotages
+    (S-WIDEN, S-ALIASARM) protect against populations the corpus does not contain. One is
+    derived from a documented contract (`unMemHasAtom` is exact; the kind map is not a
+    bijection above 6) and one is empirically empty for a reason two modules away
+    (`canonEmitTypeNames` canonicalizes every union variant spelling). Both stay; the doc
+    records which is which, so a later slice does not delete the derived one on the
+    strength of the empirical one's 0.
+81. **A `&&` chain hides its own coverage.** Site 9 of fourteen read ZERO reaches on the
+    entire corpus purely because the site before it in the same `&&` answers TRUE at every
+    reach and short-circuits. Per-STATEMENT counting would have reported that pair as
+    covered. **Count each CALL, not each statement, or the second operand of every
+    short-circuit is an unmeasured arm.**

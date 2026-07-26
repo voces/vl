@@ -566,6 +566,7 @@ import {
 } from "./emit_classify"
 import {
   atomEqOpcodeOfKind,
+  msHasValKind,
   msIsValueUnion,
   msMemberValKindsOf,
   msSoloValKind,
@@ -916,7 +917,10 @@ function emitOmittedFieldNull(_body: i32[], si: i32, fi: i32, scode: i32) {
   }
   if scode == 16 {
     // A value/box-union field defaults to null ONLY when `null` is a member.
-    if unionHasAtomTy(sFieldElemNameAt(si, fi), "null", false) {
+    // D-VALKIND: the member set resolved ONCE, then a KIND test over its banked
+    // codes (`nullValKind()` — the box ABI's null code, not the lexeme).
+    const fnm = sFieldElemNameAt(si, fi)
+    if unionHasAtomK(msSetOfText(fnm), fnm, "null", nullValKind()) {
       fbI32Const(nullBoxTag())
       fbRefNullNone() // payload slot unread under the null tag
       fbStructNew(uBoxIdx)
@@ -2785,9 +2789,13 @@ export function emitUnionCoerce(
   } else if exprIsBool(exprIx, fnIx) {
     cak = 1 // "boolean"
   } else {
+    // D-VALKIND: ONE set resolution for both arm tests, each answered from the
+    // banked kind column. Resolved HERE rather than beside the alias peel above, so
+    // a coercion that never reaches this arm pays nothing.
+    const usid = msSetOfText(unionName)
     if (
-      !unionHasAtomTy(unionName, "i32", false) &&
-      unionHasAtomTy(unionName, "i64", false)
+      !unionHasAtomK(usid, unionName, "i32", 0) &&
+      unionHasAtomK(usid, unionName, "i64", 3)
     ) {
       cak = 3 // "i64"
     }
@@ -2799,12 +2807,16 @@ export function emitUnionCoerce(
   }
   // A float literal types f64 by default, but if the union's float atom is f32 (`f32 | string`,
   // no f64) the literal re-encodes at f32 — pick the f32 atom so it boxes into the f32 value box.
-  if (
-    cak == 4 &&
-    !unionHasAtomTy(unionName, "f64", false) &&
-    unionHasAtomTy(unionName, "f32", false)
-  ) {
-    cak = 5 // "f32"
+  // D-VALKIND: the `cak == 4` gate is hoisted out of the `&&` chain so the set
+  // resolution below is paid only by a float-classified value, not by every coercion.
+  if cak == 4 {
+    const fsid = msSetOfText(unionName)
+    if (
+      !unionHasAtomK(fsid, unionName, "f64", 4) &&
+      unionHasAtomK(fsid, unionName, "f32", 5)
+    ) {
+      cak = 5 // "f32"
+    }
   }
   // An INT-element list whose union has no `i32[]` member but an `i64[]`/`f64[]` one
   // (`i64[] | boolean = [670563]` — the elements are small int literals, so the list
@@ -3115,6 +3127,27 @@ function emitUnionEqOther(body: i32[], otherIx: i32, k: i32, fnIx: i32) {
   emitExpr(body, otherIx, fnIx)
 }
 
+// The union-box ATOM test, asked of the BANKED member kinds first and of the
+// name-keyed arena row only where the bank declines — D-VALKIND, the ladder every
+// scalar-keyword `unionHasAtomTy(nm, kw, false)` in this file now takes.
+//
+// `s` is the interned member SET the caller already resolved (the whole point: the
+// callee otherwise re-resolves the union from its NAME on every call — `unionRowOf`,
+// a linear scan of `unNames` and then of `unMemberSet`, both whole-string compares).
+// `k` is the atom's ABI KIND, which at five of these sites the caller ALREADY HOLDS
+// (`eak` / `lak` / the coerce ladder's own codes) and handed over as a spelling for
+// the callee to re-derive. `nm`/`kw` survive ONLY as the fall-through's arguments:
+// `msHasValKind` declines for a kind outside the seven scalar keywords (a list atom,
+// a closure, an unclassified spelling) and for a set the pool or the kind bank does
+// not cover, and the legacy path answers those unchanged — including its LOUD
+// `emitFail` on an unregistered row, which the bank can never mask (a covered set is
+// a registered row by construction).
+function unionHasAtomK(s: i32, nm: string, kw: string, k: i32): boolean {
+  const b = msHasValKind(s, k)
+  if b >= 0 { return b == 1 }
+  unionHasAtomTy(nm, kw, false)
+}
+
 // union == concrete (either operand order — equality is symmetric): the box's
 // tag must select the arm whose rep matches the other side, then the unboxed
 // payload value-compares it. A rep with no arm is statically unequal (`==` 0 /
@@ -3147,11 +3180,16 @@ function emitUnionConcreteEq(
   // `string` special-cases, the payload unbox and the widened operand emit are all
   // projections of it — master re-derived it from the spelling at each of them
   // (`scalarTagOf`, `vbHeapIdxOfAtom` inside the unbox, and five `atom == …` compares).
-  // The spelling now survives ONLY for the MEMBERSHIP test (`unionHasAtomTy` is a
-  // verbatim member compare against `TyPrim.primName`, not a rep question) — the
-  // payload-compare opcode took the code in D-EQOPCODE.
+  // The payload-compare opcode took the code in D-EQOPCODE; D-VALKIND took the
+  // membership test below, so the spelling now survives only as that test's DECLINE
+  // argument (a kind outside the seven scalar keywords keeps the exact
+  // `TyPrim.primName` path, which is what a list / closure atom needs).
   const eak = valueAtomKind(atom)
-  if !unionHasAtomTy(uname, atom, false) {
+  // D-VALKIND: the membership test takes the CODE the line above already settled,
+  // over the set id resolved at the gate; the spelling is the decline argument only
+  // (a LIST / closure atom's kind is outside 0-6, so those keep the exact
+  // `TyPrim.primName` path unchanged).
+  if !unionHasAtomK(usid, uname, atom, eak) {
     // No arm has the other operand's rep: the box can never hold such a value.
     if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
@@ -3277,8 +3315,8 @@ function emitUnionUnionEq(
     ai = ai + 1
   }
   if (
-    unionHasAtomTy(lname, "string", false) &&
-    unionHasAtomTy(rname, "string", false) &&
+    unionHasAtomK(lsid, lname, "string", 2) &&
+    unionHasAtomK(rsid, rname, "string", 2) &&
     !aUsed
   ) {
     return emitFail(
@@ -3368,10 +3406,9 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   // minting a spelling and parsing it back four lines later (`valueAtomKind(atom)`,
   // now gone). The map is a bijection ON THIS LADDER'S IMAGE — `valueAtomKind` answers
   // 0 for `i32` and nothing else, 2 for `string`, 4 for `f64`, 3 for `i64` — so the
-  // code the ladder assigns IS the code the parse returned, arm for arm. The spelling
-  // survives ONLY for `unionHasAtomTy`'s verbatim membership test, which is
-  // deliberately exact (a `TyPrim.primName` compare, not a rep question); its
-  // structural twin is the `msHasValKind` hand-off in the destringify doc.
+  // code the ladder assigns IS the code the parse returned, arm for arm. D-VALKIND
+  // then took the membership test itself (`msHasValKind` over the banked kind
+  // column), so the spelling survives only as that test's DECLINE argument.
   let atom = "i32"
   let lak = 0
   if lit[0] == '"' {
@@ -3384,13 +3421,15 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
     atom = "i64"
     lak = 3
   } else if (
-    !unionHasAtomTy(uname, "i32", false) &&
-    unionHasAtomTy(uname, "i64", false)
+    !unionHasAtomK(usid, uname, "i32", 0) &&
+    unionHasAtomK(usid, uname, "i64", 3)
   ) {
     atom = "i64"
     lak = 3
   }
-  if !unionHasAtomTy(uname, atom, false) {
+  // D-VALKIND: the ladder's own code decides the membership test — the round trip
+  // "mint a spelling, hand it over, re-derive the code from it" is gone on this path.
+  if !unionHasAtomK(usid, uname, atom, lak) {
     if emitExpr(body, objIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
     fbI32Const(0)
@@ -13118,9 +13157,14 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
     if cunm != "" {
       // D-VALUNION: the DECLARED union's set. (The narrowing table's id below answers
       // a different question — the set SURVIVING the narrow — so both are resolved.)
+      // D-VALKIND + D-SETONCE: master resolved this set TWICE — once for the
+      // value-union gate and once inside `unionHasAtomTy`'s name-keyed row lookup.
+      // One resolution now feeds both, and the null test is a KIND test over the
+      // banked codes.
+      const csid = msSetOfText(cunm)
       if (
-        isValueUnionOfSet(msSetOfText(cunm), cunm) &&
-        unionHasAtomTy(cunm, "null", false)
+        isValueUnionOfSet(csid, cunm) &&
+        unionHasAtomK(csid, cunm, "null", nullValKind())
       ) {
         // D-UNION-ATOM-KIND: the residual member's banked ABI code (see
         // `unionResidualSoloKind`); the rendered residual is re-parsed only where the
@@ -13191,7 +13235,10 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
       // residual code below, which master resolved a second time inside
       // `unionResidualSoloKind`.
       const ksid = msSetOfText(kunm)
-      if isValueUnionOfSet(ksid, kunm) && unionHasAtomTy(kunm, "null", false) {
+      if (
+        isValueUnionOfSet(ksid, kunm) &&
+        unionHasAtomK(ksid, kunm, "null", nullValKind())
+      ) {
         // D-UNION-ATOM-KIND — see `unionResidualSoloKind`.
         let kak = unionResidualSoloKindOfSet(ksid)
         if kak == -2 {
@@ -13290,7 +13337,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
           const msid = msSetOfText(munm)
           if (
             isValueUnionOfSet(msid, munm) &&
-            unionHasAtomTy(munm, "null", false)
+            unionHasAtomK(msid, munm, "null", nullValKind())
           ) {
             // D-UNION-ATOM-KIND — see `unionResidualSoloKind`.
             let mak = unionResidualSoloKindOfSet(msid)
