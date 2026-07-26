@@ -1718,9 +1718,11 @@ function parseIf() {
 
 // `match scrut { pat [| pat]* => body … }` — exhaustive value dispatch. Reached from
 // `parsePrimary` (expression position), so a bare `match` statement is an expression statement.
-// Each arm is one-or-more patterns (a STRING literal, or `_` wildcard) joined by `|`, then `=>`
-// and a body (a `{` block, or a bare expression for the value-mapping case). Arms are newline-
-// or comma-separated.
+// Each arm is one-or-more patterns (a STRING literal, a TYPE, or the `_` wildcard) joined by
+// `|`, then `=>` and a body (a `{` block, or a bare expression for the value-mapping case).
+// Arms are newline- or comma-separated. The SCRUTINEE node is threaded into the pattern parser:
+// a TYPE pattern is minted as a real `IsExpr` over it (see `parseMatchPattern`), which is what
+// makes the value-union arm ride the `x is T` machinery instead of a second one.
 function parseMatch(): i32 {
   const p0 = peekTok().start // "match"
   advance()                  // "match"
@@ -1737,7 +1739,7 @@ function parseMatch(): i32 {
     let cnt = 0
     let morePat = true
     while morePat {
-      pats.push(parseMatchPattern())
+      pats.push(parseMatchPattern(scrut))
       cnt = cnt + 1
       if peekKind() == "PIPE" {
         advance() // "|"  (an OR-pattern)
@@ -1768,14 +1770,63 @@ function parseMatch(): i32 {
   mkMatch(scrut, pats, armStart, armCount, bodies, p0)
 }
 
-// One match arm pattern: a STRING literal (a litunion member), or `_` (the wildcard, lexed as
-// the identifier `_`). Any other token is a parse error.
-function parseMatchPattern(): i32 {
+// Whether the token at the cursor can START a match arm's TYPE pattern: a name
+// (`C`, `i32`, `Box<i32>`), an inline object (`{c: i32}`), the `null` type, or a
+// numeric-literal-type lexeme (`0`, `1.5` — a numeric literal union's arms). Kept
+// a closed set so a token that starts NO type still gets the pattern diagnostic
+// below rather than `parseTypeAtom`'s generic "expected IDENT" recovery.
+function matchPatStartsType() {
+  const k = peekKind()
+  if k == "IDENT" { return true }
+  if k == "LBRACE" { return true }
+  if k == "NULL" { return true }
+  if k == "NUMBER" { return true }
+  false
+}
+
+// One match arm pattern: a STRING literal (a litunion member), `_` (the wildcard, lexed as
+// the identifier `_`), or a TYPE (a VALUE-union arm — `C`, `i32`, `{c: i32}`, `null`). Any
+// other token is a parse error.
+//
+// A TYPE pattern is minted as a real `IsExpr` over the SCRUTINEE node, exactly the node
+// `scrut is T` would have produced — so the check type's spelling tree is banked the same way
+// (`setAnnTs`, D-PARSETY P2), the module merge renames it through the same arm, the lint
+// walker's flat type-name scan sees it, the checker's `narrowTys`/`isVarTyIxOf` ABI is filled
+// from the same place, and `desugarMatchAt` can use the pattern node ITSELF as the arm's
+// condition. There is no second narrowing path and no second type-name channel.
+//
+// The pattern is minted here rather than at desugar time because `isVarTyIx`/`nodeTyIx` are
+// sized to the node arena at `checkProgram` entry: a node minted later reads back -1 forever.
+// It also keeps `annTsNode` strictly increasing (the node is minted immediately after its
+// spelling parse, before the arm BODY's nodes).
+//
+// A pattern is ONE type ATOM (`parseTypeAtom`), not a whole `parseTypeName`: the arm separator
+// `|` must stay the OR-PATTERN separator it already is for string patterns, so `A | B => …`
+// is two patterns joined into `(u is A) || (u is B)` — the form the emitter lowers. A single
+// `is` against a UNION check type does not lower at all (`emitProgram: \`is\` names a type that
+// is not a union variant`, on master too), so reading `A | B` as one union-typed pattern would
+// have type-checked and then failed in codegen.
+//
+// `(` is likewise not a pattern starter: `(A|B) =>` would be eaten by `parseTypeAtom`'s
+// FUNCTION-type arm (`(params) => ret`), silently swallowing the arrow and the arm body.
+function parseMatchPattern(scrut: i32): i32 {
   const pp = peekTok().start
   if peekKind() == "STRING" { return mkStr(advance().text, pp) }
-  if peekKind() == "IDENT" { return mkIdent(advance().text, pp) }
+  if peekKind() == "IDENT" && peekTok().text == "_" {
+    return mkIdent(advance().text, pp)
+  }
+  if matchPatStartsType() {
+    // The spelling root must be taken off the stack BEFORE the node is minted and banked
+    // immediately after — `parseIsType`'s contract, with `parseTypeAtom` in place of
+    // `parseTypeName` (the atom leaves exactly one root, including on its error arm).
+    const nm = parseTypeAtom()
+    const root = tsPop()
+    const isIx = mkIsExpr(scrut, nm, pp)
+    setAnnTs(isIx, root)
+    return isIx
+  }
   P.diags.push(
-    { msg: "match pattern must be a string literal or `_`", at: P.pos },
+    { msg: "match pattern must be a type, a string literal, or `_`", at: P.pos },
   )
   advance()
   mkErr("pat", P.pos, pp)
