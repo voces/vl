@@ -95,12 +95,44 @@ question and nothing here forecloses it.
   an intrinsic RESULT scalar appears nowhere as an annotation.
 - `tests/cases/numerics/bitcast-*.vl`, `float-opcodes-*.vl`, `int-*.vl`.
 
-## Known limitation
+## Known limitation — capture analysis mistakes the name for a variable
 
-An intrinsic call **inside a lambda body** fails at emit with `captured variable not found in
-enclosing frame`: the emitter's capture analysis records any free identifier that is not a local, a
-global or a collected function, and the builtin-name exemption list (`isBuiltinFnName`,
-`compiler/emit_base.vl`) does not list these names. The same is true today of `__load_i32__` and
-every other declared-but-not-collected intrinsic, so this is the family's pre-existing shape rather
-than a new defect — but it is a real limit on hot loops written with `.map`, and the fix is one line
-in that list.
+The emitter's capture analysis (`capScan`/`capRecord`, `compiler/emit_classify.vl`) records every
+free identifier that is not bound locally, not a module global, and not a collected function. An
+intrinsic is none of those, so its **name** rides the capture list and the env build has nothing to
+read it from. Two shapes hit it, both **loud rejects, never miscompiles**:
+
+1. a lambda body that calls one — `xs.map((v: f64) => sqrt(v))`;
+2. an **ordinary named function** that calls one, in a module that also uses a function value
+   anywhere — because such a module routes every "capturing" function through its closure env
+   (`emitCall`: `fnValUsed && captureCountOf(target) > 0`). Remove the lambda and the same file
+   compiles.
+
+A generic function whose body calls one, instantiated at **two** types, is rejected by a third path
+(`emit_mono`'s single-type capturing-lambda guard) with a message about lambdas.
+
+This is the whole declared-intrinsic family's pre-existing shape — `__load_i32__` fails identically
+on master in all three — but it is a real limit and worth fixing.
+
+**The naive fix is wrong.** `capRecord` has a builtin-name exemption (`isBuiltinFnName`,
+`compiler/emit_base.vl`) and adding these names to it would work for calls — but that list is
+consulted *by name*, after only `capIsBound` (names bound inside the lambda), `globalIndexOf` and
+`fnIndexOf`, none of which cover an **enclosing frame's local**. So it already breaks a genuine
+capture of a same-named local:
+
+```vl
+function go(): i32 {
+  const toString = 5
+  const f = () => toString + 1
+  return f()
+}
+```
+is rejected on master (`identifier is not a parameter, local, or global`) because `isBuiltinFnName`
+swallowed a real capture. Extending that list to `min`/`max`/`abs`/`sqrt` — names far likelier to be
+locals than `toString` — would widen a live bug.
+
+The correct fix is positional, in `capScan`'s `Call` arm: a builtin or intrinsic in **callee
+position** is a lowering target, not a value, so skip that callee `Ident` rather than filtering the
+name everywhere. (A callee that is a captured closure *variable* of the same name still needs the
+enclosing-frame check, so the arm should skip only where no binding could resolve it.) That also
+fixes the `toString` case above.
