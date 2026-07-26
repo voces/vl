@@ -44,10 +44,19 @@ at build. (`vl check --codegen` does surface it, with the same positionless mess
 `ROADMAP.md`'s copy of the same phrase.** There is **one** working store width and one working load
 width. The "four" counts *declarations*: `memory-gc-design.md` §1.2 states the declared count and
 the lowered count in adjacent bullets, and the requirements doc carried the first number without the
-second. The four-store-width world was real — in the **deleted TS compiler**: `compiler/defaultScope.ts`
-defined all ten with wasm bodies until commit `f17e204e` ("kill-TS", #466) removed the file. The
-declarations in `typecheck.vl` are that scope transcribed for parity; seven of them never acquired an
-emitter arm.
+second.
+
+The four-store-width world was real — in the **deleted TS compiler**. `compiler/wasmBuiltins.ts`
+(at `f17e204e^`) added seven of them as actual wasm functions in the module: `i32.store`,
+`i32.load`, `i64.store`, `f32.store`, `f64.store`, `memory.grow`, `memory.size`. The other three
+(`__store_string__`, `__log_string__`, `__log__`) were host imports. Commit `f17e204e` ("kill-TS",
+#466) deleted the file; the declarations in `typecheck.vl` are `defaultScope.ts` transcribed for
+parity, and seven of them never acquired a native emitter arm. So the requirements doc's number was
+accurate — about a compiler that no longer exists.
+
+Worth noting for **O1**: the TS versions were real `call`s, not inlined ("TODO: These don't need to
+be actual functions… but I think binaryen does that for us"). A per-access call was the historical
+baseline here, not a regression the `Buffer` tier would introduce.
 
 So the P0.1 gap is **12 of the 14 named load/store operations**, not 9 of 14.
 
