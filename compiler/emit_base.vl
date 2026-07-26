@@ -1305,6 +1305,42 @@ export function nameIsArray(name: string) {
   if name[n - 1] != ']' { return false }
   true
 }
+// ── the ARRAY-NAME grammar: `nameIsArray` TESTS it, `arrElemNameRaw` CUTS it ───
+// THE ONE HOME of the trailing-`[]` CUT: the RAW 1-D element name of an array type name
+// — `name` minus its final two characters — or "" when `name` is not an array name.
+//
+// The grammar is one rule with two halves ("a name ending in `[]` is a 1-D list, and its
+// element is that name minus those two characters"), and only the TEST half had a home.
+// Censused over comment-stripped source at `3974381`, the CUT half was hand-written
+// **nine** times in this file alone and the TEST half **seven**, in ten functions — the
+// largest single repeated grammar left here. Tree-wide the pair reads 104 occurrences
+// (emit_classify 49 · emit_base 23 · typecheck 12 · emit_mono 9 · emit_rewrite 6 ·
+// emit_collect 5).
+//
+// It is RAW deliberately — `listElemNameOf` below is this cut PLUS the naive
+// grouping-paren strip, and the two are not interchangeable. `emit_mono.vl`'s own comment
+// at its hand-written copy says exactly that ("The `[]` cut stays RAW here (not
+// `listElemNameOf`): that home strips one …"), which is a caller asking for a home that
+// did not exist. It exists now, and it is exported for that caller.
+//
+// `""` doubles as "not an array name" and as the element of the degenerate `"[]"`, the
+// convention `listElemNameOf` already documents and its four callers already read as
+// `false`. The three sites where those two answers are NOT interchangeable
+// (`nameIsClosureArray`, `monoTyParamOf`, `monoBindFromAnn` — each of which does
+// something other than decline on an empty element) keep an explicit `nameIsArray` test in
+// front, so this merge asserts nothing about whether `"[]"` is a producible type name.
+// That candidate WAS built and measured: sabotage S4 installs the one-call form at the two
+// `mono*` sites and reddens 0 of 1,398 corpus files and 0 of 38,400 fuzz programs. A 0 is
+// not agreement when the divergence population is empty — it is the absence of a witness,
+// so the faithful two-call form ships and the one-call form is filed with its measurement.
+// (The cut is BOUND rather than left as the trailing expression: a bare member-call
+// statement is not a lowerable form — `emitProgram: unsupported member-call statement` —
+// which is why `annRetNameOf` binds its slice the same way.)
+export function arrElemNameRaw(name: string) {
+  if !nameIsArray(name) { return "" }
+  const elem = name.slice(0, name.length - 2)
+  elem
+}
 // THE ONE HOME of the 1-D LIST-ELEMENT peel: the trailing `[]` cut plus the ONE layer of
 // disambiguating grouping parens a composite element carries (`(boolean|null)[]` →
 // `boolean|null`, `K[]` → `K`). "" when `name` is not an array name.
@@ -1315,15 +1351,16 @@ export function nameIsArray(name: string) {
 // and each then asked ONE question of the result. Named once, the four become one-liners
 // and the family cannot drift on what an element IS.
 //
-// The paren strip is deliberately the NAIVE one the four copies carried (first char `(`,
-// last char `)`, no balance walk), NOT `normTypeAtom`/`peelGroupParens`: every element
-// reaching here is a single canonical atom, and widening the strip to a balanced one would
-// change what `(a)|(b)`-shaped elements classify as. `""` doubles as "not an array" and as
-// the element of the degenerate `"[]"` — every consumer answers `false` for both, exactly
-// as the four copies did.
+// The `[]` cut itself is `arrElemNameRaw`'s, above: this function is the RAW cut plus the
+// paren strip, not a second copy of the cut. The paren strip is deliberately the NAIVE one
+// the four copies carried (first char `(`, last char `)`, no balance walk), NOT
+// `normTypeAtom`/`peelGroupParens`: every element reaching here is a single canonical atom,
+// and widening the strip to a balanced one would change what `(a)|(b)`-shaped elements
+// classify as. `""` doubles as "not an array" and as the element of the degenerate `"[]"`
+// — every consumer answers `false` for both, exactly as the four copies did.
 export function listElemNameOf(name: string) {
-  if !nameIsArray(name) { return "" }
-  let elem = name.slice(0, name.length - 2)
+  let elem = arrElemNameRaw(name)
+  if elem == "" { return "" }
   if elem.length > 1 {
     if elem[0] == '(' {
       if elem[elem.length - 1] == ')' { elem = elem.slice(1, elem.length - 1) }
@@ -1370,8 +1407,9 @@ export function nameIsLitUnionArray(name: string) {
 // drifting enumeration. A deeper `i32[][][]` is NOT this (its element `i32[][]` is itself a ref
 // array, kind 9 via the recursion) — only a single i32-backed leaf list qualifies.
 export function nameIsI32ListArray(name: string) {
-  if !nameIsArray(name) { return false }
-  return nameIsI32Array(name.slice(0, name.length - 2))
+  const elem = arrElemNameRaw(name)
+  if elem == "" { return false }
+  return nameIsI32Array(elem)
 }
 // True if the type-name `name` is a string-keyed MAP `{[string]: i32}` (G8) — the
 // synthetic name `parseType` builds for an index-signature type, which starts with
@@ -1381,10 +1419,10 @@ export function nameIsI32ListArray(name: string) {
 // `{[string]:i32}[]`) is NOT a bare map — that is handled by the ref-array path.
 export function nameIsMap(name: string) {
   if name.length < 2 { return false }
-  // A trailing `[]` makes it a LIST of maps, not a bare map.
-  if name[name.length - 1] == ']' {
-    if name[name.length - 2] == '[' { return false }
-  }
+  // A trailing `[]` makes it a LIST of maps, not a bare map — the array-name grammar's
+  // TEST half, at its home. (This spelled the same two character compares out inline; at
+  // length >= 2 the two readings accept exactly the same names.)
+  if nameIsArray(name) { return false }
   if name[0] != '{' { return false }
   if name[1] != '[' { return false }
   true
@@ -1455,14 +1493,16 @@ export function tyIsNulBareMap(tyIx: i32) {
 // with a trailing `[]`. The scope chain (`typecheck.vl`'s `scopes: {[string]:i32}[]`)
 // is exactly this. Routed through the ref-list machinery as element-kind `3`.
 export function nameIsMapArray(name: string) {
-  const n = name.length
-  if n < 2 { return false }
-  if name[n - 2] != '[' { return false }
-  if name[n - 1] != ']' { return false }
   // The bare element (without the trailing `[]`) must be a BARE map name — NOT a map-member union
   // (`({[string]: i32} | boolean)[]` whose paren-stripped element `{[string]: i32}|boolean` starts
   // with `{[` too): that is a union-BOX ref list (kind 2), not a list-of-maps (kind 3).
-  const bare = name.slice(0, n - 2)
+  // The cut is RAW (`arrElemNameRaw`, not `listElemNameOf`) because that is what this
+  // function did before the merge — NOT because the difference is observed. Sabotage S5
+  // installs the paren-STRIPPING cut here and reddens 0 of 1,398 corpus files and 0 of
+  // 38,400 fuzz programs, so the two readings have a measured-EMPTY divergence population
+  // on both channels. Unreached is not the same claim as licenced; the faithful cut ships.
+  const bare = arrElemNameRaw(name)
+  if bare == "" { return false }
   nameIsBareMap(bare)
 }
 // True if `name` is an ARRAY OF FUNCTIONS — `((i32) => i32)[]`: a trailing `[]` whose
@@ -1474,10 +1514,13 @@ export function nameIsMapArray(name: string) {
 export function nameIsClosureArray(name: string) {
   const n = name.length
   if n < 4 { return false }
-  if name[n - 2] != '[' { return false }
-  if name[n - 1] != ']' { return false }
+  // The array-name grammar at its two homes. The TEST stays in front of the `annArrowAt`
+  // walk exactly as the inline compares did — running that walk on a non-array name would
+  // be a work regression — and the CUT stays behind it, so no name pays for a slice it is
+  // about to be rejected for.
+  if !nameIsArray(name) { return false }
   if annArrowAt(name) >= 0 { return false }
-  const elem = name.slice(0, n - 2)
+  const elem = arrElemNameRaw(name)
   if elem.length < 1 { return false }
   if elem[0] != '(' { return false }
   // The element must be a genuine FUNCTION type — a TOP-LEVEL arrow (paren-aware, after
@@ -1521,7 +1564,7 @@ export function nullClosureArrElem(name: string) {
 export function cloArrElemNameOf(name: string) {
   const nul = nullClosureArrElem(name)
   if nul != "" { return nul }
-  if nameIsClosureArray(name) { return name.slice(0, name.length - 2) }
+  if nameIsClosureArray(name) { return arrElemNameRaw(name) }
   ""
 }
 // The VALUE-union element name of a parenthesized union-array annotation:
@@ -1537,8 +1580,9 @@ export function parenUnionArrElemName(name: string) {
   // makes `unionMemberCount > 1` — mis-typing the whole closure LOCAL as a union-box ref list.
   // (`nameIsClosureArray` carries the same guard for the closure-element-array case.)
   if annArrowAt(name) >= 0 { return "" }
-  if name[name.length - 2] != '[' { return "" }
-  if name[name.length - 1] != ']' { return "" }
+  // The array-name grammar's TEST half, at its home (this spelled the same two character
+  // compares out inline; `name.length >= 5` is already established above).
+  if !nameIsArray(name) { return "" }
   if name[0] != '(' { return "" }
   if name[name.length - 3] != ')' { return "" }
   // The whole name must be ONE atom — a multi-arm union that merely STARTS with a paren
@@ -1581,13 +1625,14 @@ export function parenUnionArrElemName(name: string) {
 // an array) is excluded.
 export function nameIsNestedUnionElemArray(name: string): boolean {
   if annArrowAt(name) >= 0 { return false }
-  if !nameIsArray(name) { return false }
-  const inner = name.slice(0, name.length - 2)
+  const inner = arrElemNameRaw(name)
   if !nameIsArray(inner) { return false }
   let leaf = inner
   let done = false
   while !done {
-    const nx = leaf.slice(0, leaf.length - 2)
+    // `leaf` is an array name at every iteration (the line above establishes it, and the
+    // loop only advances on a `nameIsArray` hit), so the home's cut IS this slice.
+    const nx = arrElemNameRaw(leaf)
     if nameIsArray(nx) { leaf = nx } else { done = true }
   }
   parenUnionArrElemName(leaf) != ""
@@ -2408,15 +2453,17 @@ export function monoTyParamOf(ann: string, typarams: string[]) {
     if typarams[i] == ann { return typarams[i] }
     i = i + 1
   }
-  const n = ann.length
-  if n >= 2 {
-    if ann[n - 2] == '[' && ann[n - 1] == ']' {
-      const base = ann.slice(0, n - 2)
-      let j = 0
-      while j < typarams.length {
-        if typarams[j] == base { return typarams[j] }
-        j = j + 1
-      }
+  // The array-name grammar at its two homes. The TEST is kept in front of the CUT rather
+  // than reading the cut's `""`: this loop compares `base` against each type-param name, so
+  // "not an array" and "the element of `[]`" are the one pair of answers `arrElemNameRaw`
+  // does NOT keep apart, and collapsing them here would be a behaviour claim about whether
+  // `"[]"` is a producible annotation.
+  if nameIsArray(ann) {
+    const base = arrElemNameRaw(ann)
+    let j = 0
+    while j < typarams.length {
+      if typarams[j] == base { return typarams[j] }
+      j = j + 1
     }
   }
   ""
@@ -2560,13 +2607,12 @@ export function monoBindFromAnn(
   if tp != "" {
     let bind = actual
     if pat != tp {
-      const an = actual.length
-      if an < 2 { return 0 }
-      if an >= 2 && actual[an - 2] == '[' && actual[an - 1] == ']' {
-        bind = actual.slice(0, an - 2)
-      } else {
-        return 0
-      }
+      // A `T[]` pattern binds `T` to the ARGUMENT's element — the array-name grammar at
+      // its two homes. The TEST is kept in front of the CUT for `monoTyParamOf`'s reason:
+      // `bind` is pushed as a binding, so an empty element is not the same answer as "not
+      // an array" and this merge asserts nothing about `"[]"`.
+      if !nameIsArray(actual) { return 0 }
+      bind = arrElemNameRaw(actual)
     }
     if monoBindOf(tvN, tvV, tp) == "" {
       tvN.push(tp)
