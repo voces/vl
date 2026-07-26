@@ -5,6 +5,7 @@ import {
   isVarTyIxOf,
   nameIsLitUnionType,
   nameIsMemLoadIntrinsic,
+  nameIsMemStoreIntrinsic,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulBool,
   nodeArrayElemIsNulLitUnion,
@@ -7926,6 +7927,9 @@ const OP_I32_LOAD8_S = 0x2c
 const OP_I32_LOAD8_U = 0x2d
 const OP_I32_LOAD16_S = 0x2e
 const OP_I32_LOAD16_U = 0x2f
+const OP_I64_STORE = 0x37
+const OP_F32_STORE = 0x38
+const OP_F64_STORE = 0x39
 const OP_MEMORY_SIZE = 0x3f
 const OP_MEMORY_GROW = 0x40
 
@@ -7961,13 +7965,35 @@ function memLoadAlignExp(name: string) {
   -1
 }
 
-// One load instruction: `<opcode> <align-exp> <offset>`. Offset 0 always — VL spells the
-// address as an ordinary expression, so the static offset immediate has nothing to carry.
-function fbMemLoad(op: i32, alignExp: i32) {
+// One memarg-carrying memory instruction: `<opcode> <align-exp> <offset>`. Offset 0
+// always — VL spells the address as an ordinary expression, so the static offset
+// immediate has nothing to carry. Loads and stores share this encoding exactly; they
+// differ only in their stack effect, which the caller has already arranged.
+function fbMemAccess(op: i32, alignExp: i32) {
   wU8(op)
   wU8(alignExp)
   wU8(0) // static offset 0 (the address is the stack operand)
   0
+}
+
+// The opcode byte for wide store width `name`, or -1 for a name that is not one. The
+// exact duals of `memLoadOpcode`'s wide trio, and the same memarg encoding — a store
+// differs only in taking a second (VALUE) stack operand and leaving nothing.
+function memStoreOpcode(name: string) {
+  if name == "__store_i64__" { return OP_I64_STORE }
+  if name == "__store_f32__" { return OP_F32_STORE }
+  if name == "__store_f64__" { return OP_F64_STORE }
+  -1
+}
+
+// The NATURAL alignment exponent for wide store width `name` — log2 of the access width
+// in bytes, the same hint-not-constraint immediate `memLoadAlignExp` documents. i64 and
+// f64 write 8 bytes (3); f32 writes 4 (2), matching `__store_i32__`'s long-standing 2.
+function memStoreAlignExp(name: string) {
+  if name == "__store_i64__" { return 3 }
+  if name == "__store_f32__" { return 2 }
+  if name == "__store_f64__" { return 3 }
+  -1
 }
 
 // `memory.size` → 0x3f 0x00 and `memory.grow` → 0x40 0x00. The trailing byte is the
@@ -8183,10 +8209,13 @@ function emitIntIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
 // flag CLEARED — the same discipline (and the same reason) as the `call_ref` argument
 // spine in `emitCallRef` and the index-receiver arms in the `Index` lowering.
 //
-// EVERY memory-intrinsic operand is an i32 BY DECLARATION (`typecheck.vl`'s default
-// scope: `__store_i32__(i32,i32)`, `__load_*__(i32)`, `__memory_grow__(i32)`,
+// Every operand ROUTED HERE is an i32 BY DECLARATION (`typecheck.vl`'s default scope:
+// `__store_i32__(i32,i32)`, `__load_*__(i32)`, `__memory_grow__(i32)`,
 // `__log__(i32,i32)`) — a byte address, a stored i32 word, a page count. So no wide
-// scalar an ENCLOSING position wants may reach it. `emitLetDecl`'s `letIsF32` arm and
+// scalar an ENCLOSING position wants may reach it. The three WIDE stores' second
+// operand is the one memory-intrinsic operand that is NOT an i32; it takes its declared
+// width through `emitExprAsI64`/`emitExprAsF32`/`emitExprAsF64` instead, and only their
+// ADDRESS comes here. `emitLetDecl`'s `letIsF32` arm and
 // `emitReturnValue`'s f32 arm seed `pendingF32` across the WHOLE init/result subtree,
 // and an address literal then lowers as `f32.const` — `f32.const 0` followed by
 // `f32.load`, which is an UNPARSEABLE MODULE with `vl check` clean.
@@ -8415,6 +8444,59 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         fbI32Load()
         return 0
       }
+      // The three WIDE store widths (`buffer-design.md` §C2, §H9 item 3) — the exact
+      // duals of the three wide loads. One arm, because the shape is identical for all
+      // three: push the ADDRESS (an i32 in all fourteen ops, so it takes the same
+      // context-clearing spine as every other memory-intrinsic operand), push the VALUE
+      // at the width the DECLARATION names, then the opcode with its natural alignment.
+      //
+      // The value is the one memory-intrinsic operand that is not an i32, so it must NOT
+      // go through `emitMemIntrinArg`: `__store_f64__(0, 1.5)` needs `f64.const 1.5`, and
+      // an i32-context emit would write `i32.const 1` (or reject). The `emitExprAs*`
+      // helpers are the same ones the binding / argument / return boundaries use, so an
+      // integer literal re-encodes at i64, a float literal at f32/f64, and a narrower
+      // VARIABLE widens exactly where the checker permits it.
+      //
+      // The f32 arm seeds `pendingF32` across the value subtree, as every other f32
+      // coercion boundary does (`emitLetDecl`'s `letIsF32`, `emitDirectCall`'s f32 param,
+      // the f32 push): without it a float literal nested inside the value expression
+      // lowers at f64 and the store's operand is the wrong width.
+      if nameIsMemStoreIntrinsic(callee.identName) {
+        if c.callArgs.length != 2 {
+          return emitFail(
+            "emitProgram: " +
+              callee.identName +
+              " takes exactly two arguments (the byte address and the value)",
+          )
+        }
+        if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
+        if callee.identName == "__store_i64__" {
+          if emitExprAsI64(body, c.callArgs[1], fnIx) < 0 { return -1 }
+        } else if callee.identName == "__store_f32__" {
+          const savedStF32 = pendingF32
+          pendingF32 = true
+          const stRc = emitExprAsF32(body, c.callArgs[1], fnIx)
+          pendingF32 = savedStF32
+          if stRc < 0 { return -1 }
+        } else {
+          if emitExprAsF64(body, c.callArgs[1], fnIx) < 0 { return -1 }
+        }
+        // The same drift guard the load arm carries, for the same reason: the name list
+        // and the two tables are THREE lists over the same names in two files, and a
+        // width added to one and not the others would reach here with -1 and write it as
+        // an opcode byte — a silently invalid module. Unreachable while they agree.
+        const msOp = memStoreOpcode(callee.identName)
+        const msAlign = memStoreAlignExp(callee.identName)
+        if msOp < 0 || msAlign < 0 {
+          return emitFail(
+            "emitProgram: '" +
+              callee.identName +
+              "' is a declared store width with no opcode — the intrinsic-name list and the opcode table have drifted",
+          )
+        }
+        fbMemAccess(msOp, msAlign)
+        return 0
+      }
       // The seven OTHER load widths (`buffer-design.md` §C2). One arm, because the
       // shape is identical for all of them — push the address, write the opcode with
       // its natural alignment — and the per-width difference is exactly two bytes,
@@ -8444,7 +8526,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
               "' is a declared load width with no opcode — the intrinsic-name list and the opcode table have drifted",
           )
         }
-        fbMemLoad(mlOp, mlAlign)
+        fbMemAccess(mlOp, mlAlign)
         return 0
       }
       // `memory.size` / `memory.grow` — the two ops that lift the 64 KiB ceiling
@@ -11253,6 +11335,7 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
     let dropIt = callee.identName != "print"
     // The void memory intrinsics leave nothing on the stack.
     if callee.identName == "__store_i32__" { dropIt = false }
+    if nameIsMemStoreIntrinsic(callee.identName) { dropIt = false }
     if callee.identName == "__log__" { dropIt = false }
     // The void array intrinsics: `__array_copy__` leaves nothing; `__trap__`
     // is `unreachable` (no value reaches the drop).

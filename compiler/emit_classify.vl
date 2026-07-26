@@ -25,9 +25,11 @@ import {
   isValueUnionName,
   isVarTyIxOf,
   litUnionAliasNameOfTy,
+  nameIsEmitterIntrinsic,
   nameIsFuncTypeAtom,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
+  nameIsMemStoreIntrinsic,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
@@ -2161,10 +2163,28 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     // keeps capturing `cb`.
     // Parens are unwrapped so `(print)(1)` reads the same as `print(1)` — the master
     // behaviour, whose filter ran inside `capRecord` and so could not see the wrapper.
+    //
+    // TWO lists are asked, and the second is the one that ends the drift.
+    // `emit_base.isBuiltinFnName` is a PARTIAL COPY of `typecheck.nameIsEmitterIntrinsic`
+    // — its own header says so, and says the one-word fix is to export the authoritative
+    // predicate so "the whole dunder block here collapses to a single delegation", filed
+    // as a hand-off only because `typecheck.vl` was another partition's file. It is
+    // exported now, and asked HERE, at the single site that consumes either. The
+    // authoritative list is by construction exactly the set of names whose CALL SITE the
+    // emitter rewrites before it looks up a declaration — which is precisely the
+    // condition that makes the exemption sound — so a new inline-lowered intrinsic can no
+    // longer be reserved in one file and left capturing in the other. (The three wide
+    // store widths are the first names to arrive through it.)
+    //
+    // `isBuiltinFnName` is still asked because it also carries `print` / `toString` /
+    // `fromCodePoint(s)` / `Map` / `Set`, which are builtins rather than dunder
+    // intrinsics and are not on the reservation list. Its dunder block is now redundant;
+    // deleting it belongs to that file's owner.
     let skipCallee = false
     const cal = P.nodes[unwrapParen(n.callFn)]
     if cal is Ident {
       if isBuiltinFnName(cal.identName) { skipCallee = true }
+      if nameIsEmitterIntrinsic(cal.identName) { skipCallee = true }
     }
     if !skipCallee { capScan(n.callFn, bound, caps) }
     const args = n.callArgs
@@ -7344,8 +7364,13 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
     const callee = P.nodes[s.callFn]
     if callee is Ident {
       if callee.identName == "print" { return false }
-      // The void memory intrinsics are statements, never tail values.
+      // The void memory intrinsics are statements, never tail values. The three WIDE
+      // store widths join `__store_i32__` here the day they acquire a lowering: a store
+      // as a function's implicit TAIL (`function put(a: i32, v: f64) { __store_f64__(a, v) }`)
+      // leaves nothing on the stack, so classifying it as the body's value emits a
+      // function that promises a result and produces none — an invalid module.
       if callee.identName == "__store_i32__" { return false }
+      if nameIsMemStoreIntrinsic(callee.identName) { return false }
       if callee.identName == "__log__" { return false }
       // The void array intrinsics likewise: `__array_copy__` yields nothing;
       // `__trap__` diverges (no value).
