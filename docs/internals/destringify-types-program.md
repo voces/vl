@@ -9385,7 +9385,7 @@ green suite** — the ignored count is the check.
     edit only after the collapse. A "collapse N copies" slice should sabotage every row, not
     every copy.
 
-## D-ISVARTY + D-ALIASFN — the `is`-test spelling joins the ladder, and an alias-spelled FUNCTION type becomes callable (#PRNUM)
+## D-ISVARTY + D-ALIASFN — the `is`-test spelling joins the ladder, and an alias-spelled FUNCTION type becomes callable (#1137)
 
 Branched at `47b98e6` (D-TSTY #1134). Two things, and they are counted separately because they
 are different kinds of work: **D-ISVARTY** ladders the five `is`-test resolution sites onto the
