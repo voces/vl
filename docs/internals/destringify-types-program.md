@@ -17562,3 +17562,362 @@ grade is different and better in one direction, worse in another:**
      (real) with every channel population also `0` (a `grep: Argument list too long`). The result
      line and the line that makes it meaningful failed independently and looked identical. **Compute
      the denominators with a different mechanism from the one that computes the answer.**
+
+---
+
+## D-GROUPHOME — the emitter's LAST hand-written walk retires into the checker's home, and #1156's decline is refuted by measuring the arm it was protecting (#PRNUM)
+
+### 🔁 THE BASE MOVED UNDER ME MID-SLICE, AND EVERY LEG WAS RE-RUN AT THE NEW HEAD
+
+Started at `b7cc723` (#1156), where `parsercount.py` reproduces the brief's **CORE 317 · OFF-LIST 31
+· TRUE 348** exactly, the corrected `walkcensus.py` reproduces **10 flagged − 2 token-walkers = 6
+copies + 2 homes** function-for-function, and master rebuilt from source is **1,024,084 B** —
+`cmp`-equal to #1156's artifact. **#1157 and #1158 then landed while the gate was running**, so I
+rebased onto `68e24fe` and **re-ran every leg there** with the master baseline rebuilt at that head
+in the same session. #1156's lesson, taken rather than re-learned.
+
+**The absolute scoreboard moved by 5 and my deltas did not move at all.** #1157/#1158 took master
+from 348 to 343; this PR's contribution is −1 either way. *A scoreboard figure is a statement about
+a TREE — quote the head you measured at.*
+
+| | master `b7cc723` | master `68e24fe` (gating head) | this PR |
+|---|---|---|---|
+| **CORE** (23-resolver list) | 317 | 313 | **313** (unchanged) |
+| **OFF-LIST** (#1141's table) | 31 | 30 | **29** |
+| **TRUE TOTAL** | 348 | 343 | **342** |
+| `emit_base.vl` | 49 (48 + 1) | 49 (48 + 1) | **48 (48 + 0)** |
+| `emit_collect.vl` · `emit_mono.vl` | 54 · 5 | 54 · 5 | 54 · 5 (untouched) |
+| **hand-written type-name walks** | 6 copies + 2 homes | **6 copies + 2 homes** | **5 copies + 2 homes** |
+| binary | 1,024,084 B | 1,023,127 B | **1,022,924 B** (**−203 B**) |
+
+`tyGtIsClose` 5 → 4 sites at `b7cc723`, 4 → 3 at the gating head. `emit_base`'s only off-list call lived inside the walk this PR deletes,
+so the file now holds **zero** hand-written walks and **zero** off-list scanner calls — the first
+emitter file to hold neither.
+
+### THE DECLINE WAS PROTECTING AN ARM THAT IS TAKEN ZERO TIMES IN 44,513 PROGRAMS
+
+#1156 declined exactly this merge, with a reason that reads as decisive:
+
+> **`tyGroupWrapsWhole` stays.** It is `emit_base`'s last flagged walk and it is NOT a shorter
+> spelling of `typecheck.tyGroupEndIndex`: on a group that never closes (`{{x}`) it answers TRUE
+> where the checker's reading answers FALSE. Merging it is a behaviour change needing its own
+> graded population, not a cleanup.
+
+Every clause of that is true, and the conclusion does not follow. **The divergence is in the
+COMPARISON, not in the home.** `parenEnclosesWhole` spells the checker's reading as
+`tyGroupEndIndex(name, 1) == name.length - 1`, and it is that `== name.length - 1` which throws the
+never-closes case away (`-1` compares FALSE). `tyGroupEndIndex` *itself* does not throw it away: it
+returns an **INDEX** and reserves `-1` for "never closes". So the emitter's reading is one arm on
+top of the shared ladder, and the walk does not need to exist:
+
+```vl
+export function tyGroupWrapsWhole(name: string) {
+  const e = tyGroupEndIndex(name, 1)
+  if e < 0 { return true }
+  e == name.length - 1
+}
+```
+
+#1156 compared this function against `parenEnclosesWhole`'s BOOLEAN and concluded the home was
+unusable. What it read as one indivisible reading is two independent things — a LADDER and a
+COMPARISON — and only the ladder was ever shared. *When a decline rests on "the home answers
+differently", check whether the home answers a WIDER question that the other caller is narrowing.*
+
+**And the arm that decline was protecting is never taken.** A two-variable probe at the site, over
+both channels:
+
+| | corpus (1,313 cases) | fuzz (43,200) | total |
+|---|---|---|---|
+| `tyGroupWrapsWhole` ENTRIES | 1,352 | 22,676 | **24,028** |
+| entries taking the `e < 0` never-closes arm | **0** | **0** | **0** |
+
+The mechanism is visible: both call sites gate on a TRAILING closer themselves
+(`name[name.length - 1] == '}'` in `nameIsSingleShape`, `t[t.length - 1] == ')'` in `normTypeAtom`),
+and with a trailing closer present the scan can only fail to find a depth-0 closer when the name is
+unbalanced (`{{x}`) — which neither channel generates. The arm is **kept anyway**, because
+preserving the behaviour exactly costs one line; but it is kept out of caution, not evidence, and
+that distinction is recorded here rather than dressed up as a verified invariant.
+
+### The behaviour that DOES change — reached, measured, and observed by nothing
+
+The only real change is that the scan now skips a QUOTED literal member (escape-aware, via
+`skipQuotedName`). A quoted CLOSER inside a literal member closed the group EARLY, so
+`nameIsSingleShape("{v:\"a}b\"|\"zz\"}")` answered FALSE for a name that IS a single inline shape.
+
+| | corpus | 360-cell matrix | total |
+|---|---|---|---|
+| site REACHES | 1,352 | 71 | **1,423** |
+| quote-blind answer TRUE | 1,208 | 65 | 1,273 |
+| **quote-aware answer DIFFERS** | **1** | **6** | **7** |
+
+The corpus disagreement is on `{v:"a}b"|"zz"|null,w:i32}` — a name #1156's own fixture produces.
+**All 7 are inert**: corpus, lint-tier and fuzz A/B are 0-differing, and the 360-cell matrix is
+grade-for-grade identical on both sides. I then hunted a reddening program on purpose — 8 shapes
+(nullable inline shape ×3, array-of-nullable-shape, nested, return, param, nullable-field) × 8
+texts = **64 graded programs, each with its own `ab` control: 0 reddening cells**. The consequence
+I expected (`emit_collect.vl:3912`, where a nullable inline shape whose `nameIsSingleShape` answers
+FALSE loses its field-union registration and the init literal fails to find a struct) is real in the
+code and unreachable from the surface syntax I could construct.
+
+**PUBLISHED BLIND SPOT, not a clean bill of health.** Seven live invocations answer differently and
+no channel — 1,341 corpus files, 43,200 fuzz programs, 360 graded cells, 64 hand-built shapes —
+observes one. A program that reddens this is worth more than another refactor.
+
+### TARGET 1 — REFUTED. The added escape text closes ZERO cells, and the real finding is a DUPLICATE
+
+The brief's headline: *"`emit_classify.splitUnionArmsAllDepth` uses a naked `inStr` toggle —
+quote-aware but ESCAPE-BLIND, so `"a\"b|c"` walks straight through. Its 300-cell harness reaches it
+with one added text `a\"b`."*
+
+**The code claim is TRUE. The harness claim is FALSE, measured.** I rebuilt the harness and extended
+it with three escape-carrying texts — `a\"b` (bare escaped quote), `a\"|b` (escaped quote then a
+SEPARATOR, the hand-off's own example) and `a\\b` (escaped backslash) — giving **360 cells**.
+
+At `b7cc723` the original-300 subset reproduced master's post-#1156 grade **255 ok · 15 reject · 30
+invalid-wasm** exactly, and the 60 new cells read 51 ok / 6 invalid-wasm / 3 reject — every one of
+the 9 failures having an identically-failing control, at the three positions whose `ab` control was
+already broken (`nul_alias`, the nullable-litunion alias miscompile; `plain_arr`; `plain_map`).
+
+**At the gating head `68e24fe` the matrix MOVED, because #1157 fixed the `nul_alias` miscompile —
+#1156's own hand-off 2.** Master now grades **324 ok · 18 reject · 18 invalid-wasm** over the 360
+(270/15/15 on the original-300 subset, 54/3/3 on the new cells): eighteen previously-invalid cells,
+all fifteen `nul_alias` texts plus their three escape twins, now pass.
+
+**This was the run that could have overturned the refutation and did not.** A control that starts
+passing UNMASKS every cell it was subtracting, so 15 newly-live `nul_alias` cells had to be re-graded
+before the claim could stand. **Quote-blind population at `68e24fe`: still 0 cells**, and the only
+remaining escape failures are `plain_arr` and `plain_map`, whose controls still fail.
+
+**Quote-blind population added by the escape texts: 0 cells, at BOTH bases.**
+
+So I probed the function directly instead of grading around it, and the result reframes the
+hand-off entirely. **`splitUnionArmsAllDepth` is a behaviourally identical duplicate of
+`typecheck.splitUnionAtoms`, which `emit_classify` ALREADY IMPORTS at line 63.** Both split on
+top-level `|`, both nest `{}` `[]` `()` `<>`, both gate `>` through `tyGtIsClose`, and both stop at a
+top-level `=>` absorbing the remainder — `splitUnionAtoms` as a resume loop over the escape-aware
+`tyTopIndexOf`, `splitUnionArmsAllDepth` as a hand-written ladder with the naked toggle. Computing
+BOTH at every invocation and comparing the arm lists element-wise:
+
+| | reaches | names carrying `\"` | **arm-list DISAGREEMENTS** |
+|---|---|---|---|
+| corpus (1,313 cases) | 4,194 | 0 | **0** |
+| fuzz (43,200) | 48,320 | 0 | **0** |
+| 360-cell matrix | 70 | **4** | **0** |
+| **total** | **52,584** | **4** | **0** |
+
+**The filed diff is therefore a 44-line DELETION plus four call-site renames** (`emit_classify.vl`
+10587, 10625, 11968, 12014 → `splitUnionAtoms`), **not a quote-skip patch, and it needs no new
+export** — the import is already there. That takes the census to **4 copies + 2 homes**.
+
+**State the limit honestly: 0 over 52,584 is COVERAGE, not a proof of equivalence.** The two
+*must* differ on a top-level union whose first member carries an escaped quote (`"a\"b"|"zz"`: the
+naked toggle leaves `inStr` inverted for the rest of the scan and yields ONE arm where the home
+yields two). Four names carrying `\"` did reach the site and agreed — they are inline SHAPES, where
+the escaped quote sits below a grouper and cannot reach a top-level `|`. Whether any VL surface
+syntax drives the divergent name to this call site is the open question, and it is the one worth
+answering before or after the deletion — the deletion is safe either way, because where they differ
+`splitUnionAtoms` is the correct one.
+
+*Two slices have now filed this defect as a quote-skip repair. It is a duplicate. #1156's own
+lesson — "before implementing a filed hand-off, grep for whether another filing describes the same
+code" — has a sibling: **before repairing a copy, check whether its home is already in the import
+list.***
+
+### TARGET 2 — the code-axis census of the three files
+
+> Enumerate by what the CODE is, not by what the ARGUMENT is.
+
+107 call sites across `emit_base` (48), `emit_collect` (54), `emit_mono` (5), bucketed by the shape
+of the code that CONSUMES the answer:
+
+| shape | n | what it means |
+|---|---|---|
+| **BIND** | 27 | the answer is bound and used structurally — the migration targets |
+| **OTHER** | 25 | compound conditions, nested calls — needs per-site reading |
+| **PRED** | 18 | used directly as a boolean condition |
+| **CMP** | 16 | compared against `""` / `-1` / `>= 0` — a SENTINEL protocol, not a type |
+| **STMT** | 15 | called for effect through an out-param |
+| **ARG** | 5 | passed straight into another call |
+| **RET** | 1 | returned |
+
+Per file: `emit_collect` BIND=18 OTHER=17 PRED=9 STMT=4 ARG=4 CMP=2 · `emit_base` STMT=11 CMP=11
+BIND=9 PRED=8 OTHER=7 ARG=1 RET=1 · `emit_mono` CMP=3 PRED=1 OTHER=1.
+
+Two readings worth carrying forward:
+
+1. **The `CMP` bucket (16 sites) is a sentinel protocol, and it is concentrated.** `annArrowAt` is
+   CMP=10 of its 14 sites and `nullablePartOf` BIND=13 of 15 — i.e. *one* resolver returns an index
+   that 10 sites compare against `-1`/`>= 0`, and *another* returns a string that 13 sites test for
+   `""`. These are not 25 decisions about types; they are two decisions about **absence**, spelled
+   as a magic value 23 times. A nullable/optional return would retire the comparison at every one.
+2. **`emit_mono` has 5 sites and none of them is a grammar** — 3 CMP, 1 PRED, 1 OTHER, all pure
+   consumers of `emit_base`'s vocabulary. #1156's decline ("nothing in `emit_collect`/`emit_mono`
+   can be removed under the destringify unit without inventing a resolver") is **re-measured and
+   upheld** for `emit_mono`. For `emit_collect` it is upheld on the WALK axis (0 hand-written
+   walks) but its 18 BIND sites are the largest single concentration of structural-use call sites
+   in my partition and are where its 54 will actually come down.
+
+### Gate — every leg, RC checked explicitly, master baseline rebuilt at MY head in THIS session
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh` | RC=0 — master **1,023,127 B**, candidate **1,022,924 B** (**−203 B**) |
+| `native-fixpoint.sh` | RC=0 — stage3 == stage4 byte-for-byte (1,022,924 B) |
+| `lint-self.sh` | RC=0, fmt clean |
+| suite (`SELFHOST_NATIVE_ALIGN=1 deno task test`) | **2,062 passed / 0 failed / 8 ignored** |
+| suite, master **re-measured at this head, same session, same command** | **2,062 / 0 / 8** — delta **0**; ignored-test NAME SETS diffed as sets, **identical**, 8 non-empty names each |
+| corpus A/B | **1,342 files, 0 differing** on build-rc + wasm SHA-256 + compiler message + run-rc + stdout, every file compared BY NAME |
+| corpus channel populations (side A) | 1,139 produce wasm (1,135 distinct SHAs) · 203 build-rc≠0 · 1,342 messages (1,041 distinct) · 1,099 produce stdout (938 distinct) |
+| lint-tier A/B (`vl check --severity hint`) | **1,342 rows, 763 carrying ≥1 diagnostic, 0 differing** |
+| fuzz A/B | 12 seeds × 3 depths × 2 modes × 300 = **43,200 programs/side, 0 differing** (whole per-case `--out-dir` trees, `diff -r`) |
+| 360-cell graded matrix A/B | 324 ok / 18 invalid-wasm / 18 reject **both sides** — 0 fixed, 0 regressed, 0 other grade changes |
+| `rep-fuzz-check.sh` | RC=0, exact ✅ (1 baselined, 0 unsound, 0 new, 0 stale) |
+| invocation counts, both sides, both channels | below |
+| final artifact | `cmp`-checked byte-identical to the compiler every leg was measured with |
+
+**The `cmp` check is not ceremony.** #1156 lost three gate legs to a throwaway compiler left in
+`build/`. This slice built **seven** throwaway compilers (2 probes, 1 duplicate probe, 1 reach probe,
+3 sabotages) into `build/` by way of `refresh-compiler.sh`; the seed was rebuilt and `cmp`-checked
+against the stashed candidate before and after every seed-reading leg, and the candidate patch was
+re-applied from `CAND.patch` and rebuilt to a **byte-identical** artifact after the last
+of them.
+
+### THE WORK COUNT — corpus AND fuzz, both sides, every delta attributed
+
+One instrumentation script applied identically to both sides, driven through the Deno probe host
+(the compiler cannot `print` under the Rust host — `refresh-compiler.sh` fails an instrumented build
+with `unknown import: imports::__print_i32__`, which is exactly why that host exists). Counters are
+module globals dumped at the start of every `compileSrc`; **a sentinel compile appended after the
+last case makes the final dump a true running total** — without it the last case's own contribution
+is never printed. The master column counts the char steps of the loop the candidate DELETES.
+
+**CORPUS — 1,314 cases, at the gating head `68e24fe`**
+
+| counter | master | candidate | Δ |
+|---|---|---|---|
+| `tyGroupWrapsWhole` ENTRIES | 1,352 | 1,352 | **0** |
+| WRAP walk's OWN char steps | 22,404 | **0** | −22,404 |
+| `tyGroupEndIndex` ENTRIES | 11,785 | 13,137 | **+1,352** |
+| `tyGroupEndIndex` char steps | 166,682 | 189,091 | +22,409 |
+| `tyGtIsClose` ENTRIES | 153,036 | 153,036 | **0** |
+| `skipQuotedName` ENTRIES | 2,839 | 2,872 | **+33** |
+| **TOTAL CHAR STEPS (w2+w4)** | **189,086** | **189,091** | **+5 (+0.003%)** |
+
+**FUZZ — 43,200 programs, at the gating head `68e24fe`**
+
+| counter | master | candidate | Δ |
+|---|---|---|---|
+| `tyGroupWrapsWhole` ENTRIES | 22,676 | 22,676 | **0** |
+| WRAP walk's OWN char steps | 372,821 | **0** | −372,821 |
+| `tyGroupEndIndex` ENTRIES | 77,241 | 99,917 | **+22,676** |
+| `tyGroupEndIndex` char steps | 880,500 | 1,253,321 | +372,821 |
+| `tyGtIsClose` ENTRIES | 916,936 | 916,936 | **0** |
+| `skipQuotedName` ENTRIES | 51,934 | 51,934 | **0** |
+| **TOTAL CHAR STEPS (w2+w4)** | **1,253,321** | **1,253,321** | **0 (0.000%)** |
+
+**Re-measured at the gating head, every counter but one is bit-identical to the `b7cc723` run**
+(`skipQuotedName` +6 on each side, from the fixture #1157 added) — so the relocation below is a
+property of the code, not of either base.
+
+**THE RELOCATION IDENTITY IS EXACT ON BOTH CHANNELS.** Predicted Δ(`tyGroupEndIndex` entries) =
+master's `tyGroupWrapsWhole` entries, since each wrap call makes exactly one call to the home.
+*Corpus*: predicted 1,352, observed 1,352 — **residual 0**. *Fuzz*: predicted 22,676, observed
+22,676 — **residual 0**, and on fuzz **every other counter is bit-identical and the total char
+steps do not move by one**. The 372,821 deleted steps reappear at the home exactly.
+
+**The corpus residual IS the fix.** +5 char steps and `skipQuotedName` **+33** are the quote skip
+being reached on 33 corpus names — where the walk now continues past a quoted closer it used to stop
+at, and skips a quoted span in one iteration instead of L. `tyGtIsClose` **+0** on both channels
+says the `>` gate is consulted exactly as often: the ladders are the same ladder.
+
+**THE COMPARATOR IS PROVED IN THE SAME BUILD.** `skipQuotedName` +33 on the corpus, on programs
+where corpus, lint-tier and fuzz A/B are all 0-differing. *Coverage is not agreement* — here both
+are measured and they are different numbers, so a 0-differing A/B is a finding rather than a
+harness that never ran.
+
+**The honest cost, stated rather than buried:** **+1,352 call frames on the corpus and +22,676 on
+fuzz** — one `tyGroupEndIndex` frame per wrap call — bought for the deletion of a 22,404 / 372,821
+step loop and a grammar copy. Unlike #1156's declined `tyTopLevelIndexOf` alias (**+738,657 corpus /
++5,027,206 fuzz frames to permute two arguments, and nothing deleted**), this wrapper is not a
+delegate: it converts an INDEX to a BOOLEAN under a reading its two call sites both need, so
+spelling it out at both would re-duplicate the very thing being removed. **What this instrument does
+NOT cover:** the LSP query families, which neither channel drives.
+
+### Entombment — three sabotages, two consequential, ONE INERT AND MEASURED UNREACHED
+
+| sabotage | what it breaks | pre-existing corpus files reddened |
+|---|---|---|
+| **S1** `tyGroupEndIndex(name, 0)` — scan from the opener the caller already counted | line 1 | **34** |
+| **S2** `if e < 0 { return false }` — the never-closes arm inverted | line 2 | **0 — INERT** |
+| **S3** `e == name.length` — off-by-one on "closes at the final char" | line 3 | **16** |
+
+Every line of the three-line body carries a sabotage. S1 and S3 are consequential on the corpus.
+**S2 is inert on BOTH channels — 0 of 1,341 corpus files and 0 of 43,200 fuzz programs — and the
+reach probe above says WHICH KIND of inert: the arm is taken 0 times in 24,028 invocations.** That
+is a stronger and cleaner statement than #1156's S4 (which was reached 988 times and flipped 82 live
+answers unobserved): here the site is not merely unobserved, it is **unreached**. "0 differing" and
+"the arm does nothing" are different claims, and this time the measurement licenses the second.
+
+**No fixture ships.** The behaviour change is inert on every channel I can drive, so **no pin that
+fails on master can exist** — and a green-on-both-sides fixture is not a pin. Entombment is
+therefore equivalence evidence (corpus / lint / fuzz / 360-cell matrix, all 0-differing) plus the
+two consequential sabotages, and the blind spot is published above rather than papered over with a
+test that would have passed before the change.
+
+### REFUTATIONS — worth more than the agreements
+
+1. **#1156's decline: "`tyGroupWrapsWhole` is NOT a shorter spelling of `tyGroupEndIndex`."**
+   Refuted by construction. The divergence is `parenEnclosesWhole`'s `== name.length - 1`, not the
+   home; `tyGroupEndIndex` returns an INDEX and reserves `-1`, so the emitter reading is one arm on
+   top. *Check whether a home answers a WIDER question the other caller is narrowing.*
+2. **That decline's premise, measured.** The never-closes arm it was protecting is taken **0 times
+   in 24,028 invocations** across 44,513 programs. It was guarding an unreached case.
+3. **TARGET 1's harness claim: "the 300-cell harness reaches it with one added text `a\"b`."**
+   Refuted: three escape texts × 10 positions × 2 = 60 new cells add **0** to the quote-blind
+   population; all 9 failures have identically-failing controls. The 300-cell subset does reproduce
+   master's 255/15/30 exactly, so the harness is sound — it simply does not reach this defect.
+4. **TARGET 1's remedy: "add a quote skip to `splitUnionArmsAllDepth`."** Refuted as the wrong fix.
+   It is a DUPLICATE of `typecheck.splitUnionAtoms` — 0 arm-list disagreements over **52,584**
+   invocations — and `emit_classify` already imports it. The diff is a deletion, not a patch, and
+   needs no new export.
+5. **`typecheck.vl:4612`'s comment is STALE.** It names `splitUnionAtoms` and `unionMemberCount` as
+   skipping quoted members "with a naked `inStr` toggle that an escaped quote walks straight
+   through". Both were migrated to `tyTopIndexOf` and neither has a toggle today; the census does
+   not flag either. **A HEADER COMMENT IS NOT EVIDENCE — including a header comment that reports a
+   BUG.** The two functions genuinely lacking a quote skip in that sentence (`parenEnclosesWhole`,
+   `nameIsFuncTypeAtom`) are still as described.
+6. **My own census, in the vacuous direction.** My first ignored-NAME-SET diff compared two EMPTY
+   files and printed "IGNORED NAME SETS IDENTICAL" — the extraction grepped `ignored (` before
+   stripping ANSI colour codes, which sit between the word and the paren. *Two empty files diff
+   clean. A set comparison needs its cardinality asserted non-empty* — it is 8 names each.
+7. **My own harness, once.** `fuzz_ab.sh` `cd`s to the worktree root, so a RELATIVE compiler path
+   silently becomes a missing file and the run dies at generation (`GEN FAILED`). It failed loudly
+   rather than quietly, but the same shape with a path that happens to exist would not.
+
+### Hand-offs, best-measured first
+
+1. **DELETE `emit_classify.splitUnionArmsAllDepth` (44 lines) and rename its four call sites
+   (`emit_classify.vl` 10587, 10625, 11968, 12014) to `splitUnionAtoms`.** Already imported at line
+   63 — no export, no new grammar. **0 arm-list disagreements over 52,584 invocations** (4,194
+   corpus + 48,320 fuzz + 70 matrix), computing both at every call and comparing element-wise.
+   Takes the census to **4 copies + 2 homes** and closes the escape-blindness as a side effect. The
+   open question, worth answering either way: can any VL surface syntax drive a top-level union
+   whose first member carries an escaped quote (`"a\"b"|"zz"`) to this call site? 4 escaped-quote
+   names reached it and all were inline SHAPES, where the escape sits below a grouper.
+2. **The `emit_collect` BIND concentration (18 of its 54 sites).** The code-axis census says
+   `emit_collect`'s remaining cost is not grammar (0 walks) but 18 sites that bind a resolver's
+   answer and use it structurally. That is where its 54 comes down; the walk axis is exhausted.
+3. **The sentinel-value protocol, 23 sites in two resolvers.** `annArrowAt` returns an index that 10
+   sites compare to `-1`/`>= 0`; `nullablePartOf` returns a string 13 sites test for `""`. One
+   optional-return change per resolver retires 23 comparisons — and both are `emit_base`'s, so it is
+   a single-file change with cross-file call-site renames.
+4. **A program that reddens the `tyGroupWrapsWhole` quote fix.** 7 live invocations answer
+   differently and nothing observes them; the expected consequence is `emit_collect.vl:3912` (a
+   nullable inline shape losing its field-union registration). 64 hand-built graded shapes did not
+   reach it. **A program that reddens this is worth more than the next refactor** — and if none
+   exists, the honest conclusion is that `nameIsSingleShape`'s verdict is unobservable there, which
+   is itself a deletion lead.
+5. **The 360-cell harness is reusable and cheap** — 360 graded programs in 5.6 s, each with its own
+   control. Extending it by TEXT (escapes) reached nothing new; the axis that pays next is
+   POSITION (nested shape, union arm, intersection), because the three positions whose controls
+   already fail (`nul_alias`, `plain_arr`, `plain_map`) are hiding whatever lives behind them.
