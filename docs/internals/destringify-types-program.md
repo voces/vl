@@ -5012,3 +5012,345 @@ by this slice's count.
     the slot column needed 15,760 reaches to show the name leg never answers where the arena
     declines. Reporting them as one "0" would have hidden that half the deletion rests on a
     sweep and could regress, and half cannot.
+
+## D-CLASSANG + D-INFERRETTY — the emitter's last `<>`-blind scanners, and the inferred-return arena column measured NOT a dual (#1120)
+
+Two things. The first finishes #1118's hand-off; the second answers #1119's — with a
+refutation, which is the more useful of the two results.
+
+### D-INFERRETTY — REFUTED: the coverage figure reproduces exactly, and the column is still not a dual
+
+#1119 filed `synthRetAnnots`'s 19-site ladder as blocked on ONE unexported accessor, over a
+column "measured **788 of 788** corpus and **13,374 of 13,374** fuzz reaches — **100%, 0
+uncovered**". **That figure reproduces.** It is also not the question the migration turns on.
+
+The probe is candidate-beside-authority AT THE CONSUMER, with the consumer's own tolerance as
+the comparator (method note 31): for every lambda `synthRetAnnots` reaches with
+`fn.fnRet < 0`, take the stored name `ctx = inferRetNameByNode(lamIx)` and the arena column
+`ix = inferRetTyIxByNode(lamIx)`, then run the SAME 15-arm ladder over `ctx` and over
+`tyToEmitName(ix)` and compare (a) the ARM selected and (b) the name that arm would PIN onto
+`fn.fnRet`. Not a render-vs-render diff (method note 32): the authority *is* a render, and
+what is compared is the DECISION each one drives.
+
+| at `synthRetAnnots` | corpus (1,092 emitting programs) | fuzz (16,017 of 16,800) | total |
+|---|---|---|---|
+| reaches (`fn.fnRet < 0`) | 1,283 | 8,494 | 9,777 |
+| the ladder runs (`ctx != ""`) | 778 | 4,637 | 5,415 |
+| **arena column COVERS** | 778 | 4,637 | **5,415 — 100%, 0 uncovered** |
+| `tyToEmitName(ix) == ctx` | 585 | 3,648 | 4,233 (78.2%) |
+| **ladder selects a DIFFERENT ARM** | 99 | 661 | **760** |
+| same arm, **DIFFERENT PIN** | 11 | 12 | **23** |
+| **`fn.fnRet` decisions CHANGED** | **110** | **673** | **783 / 5,415 = 14.5%** |
+
+Three families, each with witnesses and a consequence:
+
+| family | n | witnesses | consequence |
+|---|---|---|---|
+| arm 1 → **no arm** | 393 | `K0` vs arena `string`; `C\|S` vs `{c:i32}\|{s:i32}`; `Cat\|Dog` vs `{meow:i32}\|{bark:i32}`; `T[]\|{w:i32}` vs `{f:boolean}[]\|{w:i32}` | the union / litunion pin is **LOST** — the lambda's `$fnsig` result stops matching the value call, the exact miscompile the arm exists to prevent |
+| **no arm** → arm 15 | 346 | `{x: i32}` vs `{x:i32}`; `{a: i32, f: i64, z: f64}` vs `{a:i32,f:i64,z:f64}` | master declines through arm 15's deliberate `!strContains(ctx, " ")` SPACE guard ("a legacy SPACED record must keep its established un-pinned route"); the arena's canonical render has no spaces, so **346 pins are ADDED** |
+| **no arm** → arm 13 | 21 | `{f: i64[]?}` vs `{f:i64[]\|null}`; `{f: () -> i64?}` vs `{f:(()=>i64)\|null}` | the stored name is a **`tyToStr`** render whose `?` no classifier knows; the arena's `\|null` render is `nameIsStructWithUnionField` — pins ADDED |
+| same arm, different pin | 23 | arm 2 ×9 `P\|null` vs `{x:i32}\|null`; arm 7 ×12 `(K0)[]` vs `K0[]`; arm 1 ×1 | a different pinned TypeRef |
+
+Two of the witnesses are worth naming separately, because they are not spelling noise:
+`{f: () -> i32[]}` vs arena `{f:(()=>i32)[]}` and `{[string]: i32 | {w: i32} | string[]}` vs
+arena `{[string]:(i32|{w:i32}|string)[]}` — the stored `tyToStr` render is genuinely
+AMBIGUOUS between "a closure returning a list" and "a list of closures", and the arena reads
+it the other way. Method note 32's hazard, met head-on rather than in a comparator.
+
+**The mechanism, at the producer, in one line.** `recordInferRet(name, ty, tyIx, atoms)` is
+called `recordInferRet(nodeKey, rty, inferred, rAtoms)`: `rty` is the SPELLING the checker's
+adoption ladder settled on (a declared union alias, a litunion alias via
+`litUnionAliasNameOfTy`, or the `recordable` render) and `inferred` is the raw arena type the
+ladder was deciding ABOUT. The parallel-array shape makes them look like two views of one
+thing. They are the DECISION and its INPUT. `inferRetTyIx` exists (its own comment says so)
+for `collectU`'s structural walks, precisely BECAUSE the rendered name does not surface
+everything the type reaches; nothing ever claimed it renders back to the name, and it does
+not. The identical non-duality is already written down one column over, about the WIDTH: "a
+litunion member renders as one atom while its spine counts several. The width must be the
+producer's JOIN width, never a walk."
+
+So the 19 sites stay, and no amount of extra coverage can move them: a structural classifier
+over `T.tys[ix]` cannot recover `K0` from `string`, because the litunion alias is not in the
+type. **`inferRetTyIxByNode` is therefore NOT shipped** — an exported accessor with no caller
+is dead code, and the finding is that it should not acquire one until the PRODUCER changes.
+
+**A latent hazard found on the way, measured and NOT live.** `recordInferRet` pushes FOUR
+parallel columns (`inferRetFn`, `inferRetTy`, `inferRetAtomCount`, `inferRetTyIx`) plus a map
+entry. The two speculative-inference windows (`monoInferListElem` and its scalar twin)
+snapshot `inferRetFn.length` and on rollback pop **only `inferRetFn` and `inferRetTy`** —
+`inferRetAtomCount`, `inferRetTyIx` and the `inferRetIdx` entries survive. One row recorded
+inside a speculative window would desync row `i` of the name columns from row `i` of the
+arena/width columns permanently — exactly what a consumer reading `inferRetTyIxAt(i)` beside
+`inferRetTyAt(i)` would suffer. A probe reporting `inferRetTyIx.length - inferRetFn.length`
+at the end of every emit reads **0 over 1,092 corpus and 16,017 fuzz programs**: the windows
+record nothing today. Reported with its measurement, not fixed — a guard whose absence
+nothing can catch is method note 24's wrong shape, so the fix belongs with the first consumer
+that would notice.
+
+### D-CLASSANG — the last nine `<>`-blind scanners: eight repaired, one rejected
+
+#1118 repaired 21 scanners and handed off nine in `emit_classify.vl`. Two audit probes
+(#1118's shape) over the 1,092-program corpus and 16,800 fuzz programs. Probe A re-walks each
+input under BOTH depth rules and compares the depth-0 `,`/`|`/`:` seams (run on MASTER
+source). Probe B counts the two `>` populations separately (run on the SHIPPED source):
+`arrowGt`, a `>` preceded by `=`, which the `=`-exemption already neutralises under either
+rule; and **HAZ**, a `>` NOT preceded by `=` reached with no `<` open — the only population
+the `angOpen` gate exists for.
+
+| scanner | calls (corpus / fuzz) | inputs with `<` | **seams MOVE** | `arrowGt` inputs | **HAZ inputs (occurrences)** |
+|---|---|---|---|---|---|
+| S1 `nameIsWholeSpanShape` | 75,682 / 39,176 | 1 / 0 | — | 749 / 2,435 | 27 (30) / 129 (140) |
+| S2 `shapeFieldParse` | 3,556 / 24,396 | 0 / 0 | 0 / 0 | 194 / 2,073 | **172 (188) / 786 (839)** |
+| S3 `splitUnionArmsAllDepth` | 4,054 / 27,835 | 4 / 0 | **4** / 0 | 3,447 / 25,670 | 0 / 0 |
+| S4 `funcTypeShapeLowerable` | 524 / 3,229 | 0 / 0 | 0 / 0 | 62 / 330 | 0 / 0 |
+| S5 `variantNestedShapeOk` | 33 / 128 | 0 / 0 | 0 / 0 | 1 / 6 | 0 / 0 |
+| S6 `internNonLowerableFieldShapes` | 45 / 201 | 0 / 0 | 0 / 0 | 20 / 155 | 0 / 0 |
+| S7 `internShapeFieldElems` | 255 / 1,721 | 0 / 0 | 0 / 0 | 18 / 60 | 0 / 0 |
+| S8 `internInlineShape` | 120,081 / 107,667 | 62 / 0 | **24** / 0 | 433 / 3,476 | 3 (6) / 0 |
+| S9 `internShapeAs` | 2 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| **total** | **204,232 / 204,353** | **67 / 0** | **28 / 0** | **4,924 / 32,105** | **202 (224) / 915 (979)** |
+
+Three things fall out before any code changes.
+
+- **The `>` hazard is real but far smaller than the raw `>` count**, and an earlier draft of
+  this section got that wrong. 36,120 fuzz inputs carry a `>` with no `<` — but 32,105 of
+  them are the arrow `=>`, which the `=`-exemption already covers under BOTH rules. The
+  population that only the `angOpen` gate can save is **915 fuzz and 202 corpus inputs**, and
+  every witness is a **`tyToStr` `->` render**: `f: () -> i32`, `f: () -> i64?`,
+  `a: () -> i64 | f64, f: i32, z: () -> i32[]`. The refuted rule's own string language,
+  reproduced at this file's call sites.
+- **The `<` bug is rare here**: 67 corpus inputs, **0 fuzz** — `scripts/fuzzgen.vl` declares
+  no generic at all. Channel separation, stated: the corpus and the pin gate the `<` half,
+  fuzz gates the `>` half. Neither channel can substitute for the other.
+- The hazard concentrates in **S2**, which is the one scanner fed CHECKER renders
+  (`structIndexOfTypeName` / `variantIndexOfTypeName` resolve a rendered shape name); the
+  interners (S4–S9) are fed `tyToEmitName` output, which spells arrows `=>`.
+
+**Eight repaired.** S2–S9 each gained an `angOpen` counter beside its existing depth; `<`
+opens both, `>` closes both only through `tyGtIsClose(name, i, angOpen)`.
+
+**S1 `nameIsWholeSpanShape` is NOT repaired, and repairing it blindly would have been wrong.**
+Its depth alphabet is BRACES ONLY — it never counted `[` or `(` either — because it asks one
+question: at which index does brace depth return to 0. A `<`/`>` pair cannot change brace
+balance, so adding it to that counter cannot move `closeAt`. Inert **by construction**, not
+merely unmeasured. Its 27 corpus / 129 fuzz HAZ inputs show the hazard class reaches it; it
+simply cannot act there.
+
+### Why the `<` half is CONSERVATIVE everywhere but one program
+
+The repair is corpus byte-, message- and run-identical and fuzz tree-identical. That is not
+"unreachable" — 67 corpus inputs carry a `<` and 28 of them MOVE a seam. It is that in this
+file a moved seam can only ever LOSE an intern, never mint a wrong one:
+
+- `internInlineShape` / `internShapeAs`: the mis-split's trailing fragment (`string>`,
+  `i32>`) has no `:` at all → `ci <= 0` → `ok = false`; where it does have one, its type text
+  (`i32}>`) fails `nameFieldCode` → `ok = false`. Both abandon the WHOLE shape
+  (`if !ok … return -1`). No fragment of a generic argument list reads as a valid field.
+- `funcTypeShapeLowerable` / `variantNestedShapeOk`: the same fragment sets `okAll = false`.
+- `internNonLowerableFieldShapes` / `internShapeFieldElems`: guarded by `ci > 0`; skipped.
+- `shapeFieldParse`: a mis-split yields a field-NAME set containing `string>`, and both
+  consumers match by field-name SET — a set with a non-identifier member matches no row.
+- `splitUnionArmsAllDepth`: a `|` inside `<…>` always leaves the closing `>` attached to the
+  LAST fragment (`{b:i32}>`), and `internShapeDeep` requires a `}`-terminated `{…}` — so the
+  bogus arm is a no-op. This is the ONE path that could in principle intern an EXTRA shape
+  and perturb struct-table ORDER; the grammar keeps it shut.
+
+Every wrong answer is absorbed by a downstream reject (method note 4's shape), which is why a
+25-program hand-written battery of generic-argument shapes produced exactly ONE behaviour
+change.
+
+### The pin (fails on master)
+
+`tests/cases/generics/type-arg-list-field.vl` — `{ v: Pair<i32, string>[] }`:
+
+| build | result |
+|---|---|
+| master `faf7de6` | `emitProgram: ref valtype with no interned shape` |
+| here | `emitProgram: ref-list field element type is not interned` |
+
+The shape interns now (one code-5 ref-list field) and the reject moves to the gap actually
+left: the element is a generic APPLICATION and `internShapeFieldElems` descends only a `{…}`
+leaf. `deno test tests/cases_wasm_test.ts` under the MASTER seed: **1,223 passed, 1 failed** —
+this fixture; under the shipped seed it passes. Its non-generic control
+(`type PairIS = { a: i32, b: string }; const o: { v: PairIS[] } = …`) compiles and RUNS on
+master, which is what separates the residual gap from the scanner defect above it (note 34).
+
+### Entombment (method note 21)
+
+The `<` half has a fails-on-master pin. The `>` gate is a behaviour change no corpus program
+can see, so it is entombed by SABOTAGE — **S-ANG**: the eight repaired scanners drop the
+`angOpen` gate and use the REFUTED rule ("a `>` closes unless it is the arrow's tail"),
+everything else identical.
+
+| build pair | corpus byte / msg / run (1,282 files) | fuzz tree-diff lines |
+|---|---|---|
+| shipped vs master | 0 / 0 / 0 | **0** (50,400 programs/side, 52,745 output files/side) |
+| shipped vs **S-ANG** | **0 / 0 / 0** | **10** (21,600 programs/side, 22,594 files/side) |
+
+The corpus is byte-, message- AND run-identical to the refuted rule on all 1,282 files —
+#1118's finding reproduced at a different set of call sites — and only fuzz sees it. Witness,
+`seed=3 depth=5 multi case_00203`:
+
+```vl
+type K0 = "028" | "jbn" | "dd"
+type T0 = {f: () => {f: () => {a: f32, f: K0, z: i64}}}
+type T1 = {f: () => {f: () => {a: f32, f: K0, z: i64}}}
+function useTwin(p: T1) { print(p.f().f().f) … }
+```
+
+shipped: `jbn / 3.5 / 6000000000`; S-ANG: `emitProgram: function-value call arity has no
+interned signature`. The mechanism is exactly the probe's most frequent S2 hazard witness —
+`f: () -> {a: f32, f: "028" | "jbn" | "dd", z: i64}`, the `tyToStr` render of that very field,
+42 hits on the fuzz sweep: the `->`'s `>` runs `shapeFieldParse`'s depth negative, the field
+seams move, the layout-TWIN resolves to the wrong row and the value call finds no signature.
+HAZ reach and sabotage consequence are the same program family, which is what makes the
+0 in the row above mean something (method note 8).
+
+### The call arithmetic
+
+Local-aware, by resolver actually CALLED, over `compiler/*.vl`. **Counting method, stated:**
+`//` line comments are stripped (quote-aware, so a `//` inside a string literal does not
+truncate code); the definition header (`function NAME(`) is excluded; an occurrence counts
+only when followed by `(`, so an `import {}` / `export {}` mention is NOT a call; several
+calls on one line all count.
+
+| | master `faf7de6` | now |
+|---|---|---|
+| all 25 SCORECARD resolvers (`nameIsRefArray`, `refArrElemName`, `nullablePartOf`, `annArrowAt`, `nameIsArray`, `splitUnionAtoms`, `unionMemberCount`, `mapValNameOf`, `nameFieldCode`, `isUName`, `isValueUnionName`, `nameIsLitUnionType`, `nameIsMapMemberUnion`, `parenUnionArrElemName`, `nameIsLitUnionArray`, `nameIsMapArray`, `resolveShapeToNominal`, `nameIsWholeSpanShape`, `shapeFieldParse`, `splitUnionArmsAllDepth`, `nameIsNestedUnionElemArray`, `nameIsNestedScalarLeafArray`, `nameIsStructWithUnionField`, `nameIsStructWithLitUnionField`, `nameIsStructWithMapField`) | — | **every one IDENTICAL** |
+| `tyGtIsClose` | 25 | **33** (+8) |
+
+- **Type-string PARSES deleted: 0 · added: 0 · consumers laddered: 0 · name-keyed resolutions
+  deleted: 0 — NET 0.** This slice REPAIRS eight scanners, which the scorecard has no column
+  for; that was #1118's note too.
+- `tyGtIsClose` is the depth rule's character predicate ("is this `>` a closer"), not a
+  type-name parse, so the +8 does not enter the parse count.
+- New state: **none**. New sidecars: **none**. Binary 1,025,661 → **1,026,243** (+582).
+
+### Target-3 enumeration, and a correction to the brief's `nameIsRefArray` figure
+
+The brief quotes **30** real `nameIsRefArray` call sites on master. On `faf7de6` — which IS
+#1119's result, and #1119 deleted two — there are **28**, which #1119 itself predicted ("this
+slice leaves 28"). Both numbers are right about different commits; the current one is 28.
+Under the filter above:
+
+| resolver | calls on `faf7de6` | raw textual matches | of those, in comments | definition headers |
+|---|---|---|---|---|
+| `nullablePartOf` | 78 | 105 | 22 | 1 |
+| `annArrowAt` | 56 | 73 | 13 | 1 |
+| `splitUnionAtoms` | 48 | 83 | 29 | 1 |
+| `isValueUnionName` | 44 | | | 1 |
+| `mapValNameOf` | 39 | 58 | 15 | 1 |
+| `nameIsLitUnionType` | 37 | | | 1 |
+| `refArrElemName` | 35 | 74 | 36 | 1 |
+| `nameIsArray` | 32 | 45 | 9 | 1 |
+| `isUName` | 32 | | | 1 |
+| **`nameIsRefArray`** | **28** | **63** | **32** | **1** |
+| `nameIsMapMemberUnion` | 25 | | | 1 |
+| `nameIsLitUnionArray` | 13 | | | 1 |
+| `unionMemberCount` / `parenUnionArrElemName` | 11 / 11 | | | 1 |
+| `nameFieldCode` | 8 | 22 | 12 | 1 |
+| `resolveShapeToNominal` | 6 | | | 1 |
+| `nameIsMapArray` | 5 | | | 1 |
+| `nameIsWholeSpanShape` / `splitUnionArmsAllDepth` | 4 / 4 | | | 1 |
+| `shapeFieldParse` / `nameIsNestedScalarLeafArray` / `nameIsStructWithUnionField` | 3 each | | | 1 |
+| `nameIsStructWithLitUnionField` | 2 | | | 1 |
+| `nameIsNestedUnionElemArray` / `nameIsStructWithMapField` | 1 each | | | 1 |
+
+`nameIsRefArray`'s 28 sit in `emit_classify` (19), `emit_collect` (7), `wasmEmit` (2). The 19
+in this partition are not attemptable from here for the reason #1119 filed: they are the
+laddered `rlElemName[slot]` chokepoint family, gated on `rlElemTyIx` COVERAGE, whose producer
+(`rlInternName`) lives in `emit_collect.vl`.
+
+### What did NOT move, and the mechanism
+
+- **`synthRetAnnots`'s 19 sites** — refuted above, 5,415 comparisons on both channels, 783
+  changed pins, three families, and the producer line that makes the two columns non-dual.
+  Not "needs more coverage": more coverage cannot help.
+- **`structIndexOfExpr` / `structIndexOfObjCtxGo`'s render→fieldset rungs** — unchanged;
+  #1119's refutation (`sTyIx` is arena-INDEX identity over a non-hash-consed arena) stands
+  and was not re-probed.
+- **The residual gap the pin opens onto** is `internShapeFieldElems`' element descent, which
+  peels `[]` and interns only a `{…}` leaf. A generic APPLICATION element needs
+  `emit_base.gaeApplyFieldTy`'s expansion ahead of that peel — not in this partition.
+- **A parser bug the battery found, filed not fixed**: `union U { A: { v: Pair<i32, string> },
+  B: { n: i32 } }` is a **parse error** — ``expected `}` but found `>` `` — a generic
+  application inside a union VARIANT's inline shape; the non-generic control parses.
+  `parser.vl`, not in this partition.
+
+### Gate
+
+Corpus **byte-, message- AND run-diff** over 1,282 files (`tests/cases` + `compiler/` +
+`std/` + `scripts/*.vl`; build stdout/stderr with the out-path normalised, exit codes
+compared, `vl run` status + stdout compared): **0 byte-diffs, 0 message-diffs, 0 run-diffs.**
+Fuzz A/B **50,400 programs/side** (7 seeds × depths 4/5/6 × {plain, `--branching --multiobs
+--declared`}, generated ONCE by the master compiler so both sides see identical programs),
+whole `--out-dir` TREES via `diff -r`, **52,745** output files/side: **0 differing lines**.
+
+`refresh-compiler.sh` RC=**0** (1,026,243 bytes) · `rep-fuzz-check.sh` RC=**0** (exact; 1
+baselined failure — 0 unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=**0**
+(stage3 == stage4, 1,026,243 bytes) · `lint-self.sh` RC=**0** ·
+`SELFHOST_NATIVE_ALIGN=1 deno task test` RC=**0** (**1,971 passed, 0 failed, 8 ignored** —
+1,969 + the new pin, which two suites each run).
+
+A harness correction worth recording: the FIRST corpus A/B reported **190 BYTEDIFFs**. They
+were an artefact — `m=$(vl build … 2>&1 | sed …); rc=$?` takes **sed's** exit code, so every
+REJECT fixture read as a successful build and `cmp` on two absent artefacts reported a
+difference. Fixed (capture, then normalise) and re-run: 0/0/0.
+
+### Hand-offs (exact)
+
+1. **Do NOT export `inferRetTyIxByNode` for `synthRetAnnots`.** The measurement is above. If
+   the 19 sites are to move, the change is at the PRODUCER: `recordInferRet(nodeKey, rty,
+   inferred, rAtoms)` would have to record the arena type `rty` DENOTES (the litunion alias's
+   own type, the declared union's own type) rather than the type the adoption ladder was
+   deciding about — and that is a behaviour change to `collectU`'s structural walks, which
+   consume `inferRetTyIxAt` today and want the raw `inferred`. Two consumers, two different
+   types: the honest shape is a THIRD column, not a re-use. Nine lines:
+   ```
+   // beside inferRetTyIx, written by the SAME recordInferRet call
+   let inferRetPinTyIx: i32[] = []          // the arena type `rty` denotes, or -1
+   ...
+   inferRetPinTyIx.push(pinTyIx)            // the caller passes it at each adoption rung
+   ```
+   The rungs that would have to supply it are the ~30 `recordInferRet` producers around
+   `typecheck.vl:10245` and `12729-12749`; each already HAS the type it chose the name for.
+2. **The speculative-window rollback** (`typecheck.vl`, `monoInferListElem` + its scalar
+   twin) pops `inferRetFn`/`inferRetTy` but not `inferRetAtomCount`/`inferRetTyIx`/the
+   `inferRetIdx` entries. Measured **0** skews over 17,109 programs. Four lines to make it
+   total; land it WITH the first consumer that reads the two columns side by side, so the fix
+   has a gate that can catch its own absence.
+3. **`emit_base.vl` / `emit_collect.vl`**: `{ v: Pair<i32, string>[] }` now interns its field
+   and fails at the ELEMENT (`tests/cases/generics/type-arg-list-field.vl`).
+   `internShapeFieldElems` peels `[]` and interns a `{…}` leaf; a generic-application element
+   needs `gaeApplyFieldTy`'s expansion ahead of that peel.
+4. **`parser.vl`**: `union U { A: { v: Pair<i32, string> } }` → ``expected `}` but found `>` ``.
+
+### Method notes earned
+
+38. **100% COVERAGE and 0% duality are compatible, and only the CONSUMER's comparator
+    separates them** (D-INFERRETTY) — the arena column answers on 5,415 of 5,415 reaches and
+    changes 783 of them. A coverage sweep says 100%; a render-equality sweep says 78.2% and
+    reads like spelling noise; running the CONSUMER'S LADDER over both renders says 85.5% and
+    names three families with three different consequences. Run the consumer over the
+    candidate, not a string comparison beside it.
+39. **A column recorded BESIDE a name at one call is not an encoding OF that name**
+    (D-INFERRETTY) — `recordInferRet(name, rty, inferred, …)` records a decision and its input
+    in one row; the parallel-array shape makes them look like two views of one thing. Read the
+    producer's ARGUMENTS before treating a sidecar as a dual. The give-away here was already
+    written down one column over, about the WIDTH.
+40. **A depth rule can be reachable, seam-moving and still unobservable — check whether the
+    consumer's failure is CONSERVATIVE** (D-CLASSANG) — 67 corpus inputs carry a `<`, 28 move
+    a seam, and the corpus is 0/0/0, because every consumer of a mis-split fragment sets
+    `ok = false` and abandons the whole shape. "The scanner is wrong wherever it runs" is
+    true; "therefore something will differ" does not follow. A repair like this becomes
+    visible only where the NEXT gate is already implemented.
+41. **Split a hazard count by the exemption that already covers it** (D-CLASSANG) — an earlier
+    draft of this section claimed 36,120 fuzz inputs would be corrupted by the refuted `>`
+    rule. 32,105 of them are `=>`, which the `=`-exemption neutralises under BOTH rules; the
+    population only the `angOpen` gate saves is 915. Counting "inputs containing the hazardous
+    character" over-states a gate's value by 35x. Count the inputs on which the two rules
+    actually DISAGREE.
+42. **`$?` after a pipe is the LAST stage's** (D-CLASSANG, harness) — `m=$(cmd 2>&1 | sed …);
+    rc=$?` records sed's 0 for every failing build, so a corpus A/B compared two absent
+    artefacts and reported 190 byte-diffs. The always-fires and the cannot-fire comparator
+    (note 12) are the same bug; sanity-check in BOTH directions before reading a number.

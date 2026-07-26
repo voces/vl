@@ -61,6 +61,7 @@ import {
   nodeUnionName,
   recordClonedNodeTy,
   splitUnionAtoms,
+  tyGtIsClose,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyToEmitName,
@@ -7442,6 +7443,16 @@ export function fnStmtsPosOf(fnIx: i32) {
 // True if `name` is a single INLINE STRUCT shape spanning the WHOLE string (`{f: i32}`,
 // `{f: {f: i32|string}}`) — its first `{`'s matching `}` is the LAST char, and it is not
 // a map spelling (`{[`). A composite (`{…}|null`, `{…}|{…}`, `{…}[]`) is not.
+//
+// The ONE scanner in this file that deliberately does NOT learn the generic-application
+// brackets (D-GENBRACKET's hand-off listed it with the other eight). Its depth alphabet is
+// BRACES ONLY — it asks nothing about `[`, `(` or `<` — and it is looking for the position
+// at which brace depth returns to 0. A `<`/`>` pair cannot change brace balance, so adding
+// it to this counter could not move `closeAt`; the repair would be inert by construction,
+// not merely unmeasurable. The hazard class does reach here (an audit probe counted 777
+// angle-bearing inputs over the corpus and 2,564 over 16,800 fuzz programs, of which 776
+// and 2,564 carry a BARE `>` — `tyToStr`'s `->` and the `$fnsig` key — with just ONE
+// carrying a `<` at all); it simply cannot affect a brace-only span test.
 export function nameIsWholeSpanShape(name: string) {
   if name.length >= 2 && name[0] == '{' && name[1] != '[' {
     let d0 = 0
@@ -7543,6 +7554,13 @@ function shapeFieldParse(name: string, outNames: string[], outTypes: string[]) {
     let curN = ""
     let curT = ""
     let depth = 0
+    // The generic-application brackets count as a grouper (D-GENBRACKET): a field
+    // whose type is a generic APPLICATION carries the argument list's own `,` and
+    // `:` (`{v: Pair<i32,string>}`), and a bracket-blind depth split the FIELD list
+    // at them. `>` closes only against an OPEN `<` (`tyGtIsClose`) — two other
+    // string languages ride this scanner and both spell a `>` that closes nothing:
+    // `tyToStr`'s `->` arrow render and the `$fnsig` key's `ii>i`.
+    let angOpen = 0
     let collecting = true // true: reading the field NAME; false: reading its TYPE
     let i = 1
     while i < name.length - 1 {
@@ -7550,8 +7568,16 @@ function shapeFieldParse(name: string, outNames: string[], outTypes: string[]) {
       if c == '{' || c == '[' || c == '(' {
         depth = depth + 1
         if !collecting { curT = curT + fromCodePoint(c) }
+      } else if c == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+        if !collecting { curT = curT + fromCodePoint(c) }
       } else if c == '}' || c == ']' || c == ')' {
         depth = depth - 1
+        if !collecting { curT = curT + fromCodePoint(c) }
+      } else if c == '>' && tyGtIsClose(name, i, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
         if !collecting { curT = curT + fromCodePoint(c) }
       } else if depth == 0 && c == ':' && collecting {
         collecting = false
@@ -10417,6 +10443,12 @@ export function nameFieldCode(t: string) {
 // regressed the pinned net). A name with no top-level `|` appends one arm.
 function splitUnionArmsAllDepth(nm: string, out: string[]) {
   let depth = 0
+  // The generic-application brackets are a grouper too (D-GENBRACKET), so a union
+  // ARGUMENT (`Box<i32|null>`) stays ONE arm instead of splitting into the garbage
+  // atoms `Box<i32` + `null>`. `>` closes only against an OPEN `<` (`tyGtIsClose`):
+  // `tyToStr`'s `->` and the `$fnsig` key's `ii>i` both spell a `>` that closes
+  // nothing, and counting those runs the depth NEGATIVE.
+  let angOpen = 0
   let inStr = false
   let start = 0
   let i = 0
@@ -10428,8 +10460,14 @@ function splitUnionArmsAllDepth(nm: string, out: string[]) {
       inStr = true
     } else if c == '{' || c == '[' || c == '(' {
       depth = depth + 1
+    } else if c == '<' {
+      depth = depth + 1
+      angOpen = angOpen + 1
     } else if c == '}' || c == ']' || c == ')' {
       depth = depth - 1
+    } else if c == '>' && tyGtIsClose(nm, i, angOpen) {
+      depth = depth - 1
+      angOpen = angOpen - 1
     } else if (
       c == '=' &&
       depth == 0 &&
@@ -10669,6 +10707,12 @@ export function funcTypeShapeLowerable(nm: string): boolean {
   }
   const inner = nm.slice(1, nm.length - 1)
   let depth = 0
+  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
+  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
+  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
+  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
+  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
+  let angOpen = 0
   let start = 0
   let k = 0
   let okAll = true
@@ -10679,7 +10723,15 @@ export function funcTypeShapeLowerable(nm: string): boolean {
     if !atEnd {
       const ch = inner[k]
       if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
+      if ch == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      }
       if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
+      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
+      }
       if ch == ',' && depth == 0 { brk = true }
     } else {
       brk = true
@@ -10753,6 +10805,12 @@ export function variantNestedShapeOk(nm: string): boolean {
   }
   const inner = nm.slice(1, nm.length - 1)
   let depth = 0
+  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
+  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
+  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
+  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
+  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
+  let angOpen = 0
   let start = 0
   let k = 0
   let okAll = true
@@ -10763,7 +10821,15 @@ export function variantNestedShapeOk(nm: string): boolean {
     if !atEnd {
       const ch = inner[k]
       if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
+      if ch == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      }
       if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
+      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
+      }
       if ch == ',' && depth == 0 { brk = true }
     } else {
       brk = true
@@ -10877,6 +10943,12 @@ function internFuncTypeShapes(nm: string): i32 {
 function internNonLowerableFieldShapes(nm: string) {
   const inner = nm.slice(1, nm.length - 1)
   let depth = 0
+  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
+  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
+  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
+  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
+  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
+  let angOpen = 0
   let start = 0
   let k = 0
   while k <= inner.length {
@@ -10885,7 +10957,15 @@ function internNonLowerableFieldShapes(nm: string) {
     if !atEnd {
       const ch = inner[k]
       if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
+      if ch == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      }
       if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
+      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
+      }
       if ch == ',' && depth == 0 { brk = true }
     } else {
       brk = true
@@ -10934,6 +11014,12 @@ function internNonLowerableFieldShapes(nm: string) {
 function internShapeFieldElems(nm: string) {
   const inner = nm.slice(1, nm.length - 1)
   let depth = 0
+  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
+  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
+  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
+  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
+  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
+  let angOpen = 0
   let start = 0
   let k = 0
   while k <= inner.length {
@@ -10942,7 +11028,15 @@ function internShapeFieldElems(nm: string) {
     if !atEnd {
       const ch = inner[k]
       if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
+      if ch == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      }
       if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
+      if ch == '>' && tyGtIsClose(inner, k, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
+      }
       if ch == ',' && depth == 0 { brk = true }
     } else {
       brk = true
@@ -10992,6 +11086,12 @@ export function internInlineShape(nm: string) {
   const texts: string[] = []
   let ok = true
   let depth = 0
+  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
+  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
+  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
+  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
+  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
+  let angOpen = 0
   let start = 0
   let k = 0
   while k <= inner.length {
@@ -11001,8 +11101,16 @@ export function internInlineShape(nm: string) {
       if inner[k] == '{' || inner[k] == '[' || inner[k] == '(' {
         depth = depth + 1
       }
+      if inner[k] == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      }
       if inner[k] == '}' || inner[k] == ']' || inner[k] == ')' {
         depth = depth - 1
+      }
+      if inner[k] == '>' && tyGtIsClose(inner, k, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
       }
       if inner[k] == ',' && depth == 0 { brk = true }
     } else {
@@ -11174,6 +11282,12 @@ export function internShapeAs(key: string, nm: string) {
   const names: string[] = []
   const codes: i32[] = []
   let depth = 0
+  // The generic-application brackets count as a grouper (D-GENBRACKET), so a field
+  // whose type is a generic APPLICATION keeps its argument list's `,` off the FIELD
+  // seam (`{v: Pair<i32,string>}`). `>` closes only against an OPEN `<`
+  // (`tyGtIsClose`): `tyToStr`'s `->` render and the `$fnsig` key's `ii>i` both
+  // spell a `>` that closes nothing, and counting those runs the depth NEGATIVE.
+  let angOpen = 0
   let start = 0
   let k = 0
   while k <= inner.length {
@@ -11183,8 +11297,16 @@ export function internShapeAs(key: string, nm: string) {
       if inner[k] == '{' || inner[k] == '[' || inner[k] == '(' {
         depth = depth + 1
       }
+      if inner[k] == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      }
       if inner[k] == '}' || inner[k] == ']' || inner[k] == ')' {
         depth = depth - 1
+      }
+      if inner[k] == '>' && tyGtIsClose(inner, k, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
       }
       if inner[k] == ',' && depth == 0 { brk = true }
     } else {
