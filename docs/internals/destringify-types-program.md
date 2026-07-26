@@ -19686,3 +19686,372 @@ names**, against a whole-tree TRUE TOTAL of 345.
    `tyPrintsAsRef` must keep declining `string | null`.
 7. `types/unknown-type-in-map-value.vl` now carries two `@error`s. If the first one's cause is ever
    fixed, the second stays — it pins the function-value print cell.
+
+## D-SPANHOME + D-MONOPAREN + D-ARMPAREN — the emitter's hand-written type-name ladders go from FIVE copies to ONE, and the census that was blind to them is the finding
+
+**Slice: `compiler/emit_classify.vl` + `emit_collect.vl` + `emit_base.vl` + `emit_mono.vl`.
+No new fixture — the pre-existing corpus already pins two of the three conversions, and the third
+is measured unpinnable rather than asserted clean.**
+
+### Base re-measured, not inherited
+
+Branched from **`5d40f22`** (#1165). `parsercount.py` reproduces the brief's **CORE 312 · OFF-LIST
+28 · TRUE 340** exactly, per file `emit_classify` 177 (176 + 1) · `emit_collect` **49** ·
+`emit_base` **48** · `typecheck` 46 (19 + 27) · `wasmEmit` 5 · `emit_rewrite` 5 · `emit_mono` **5** ·
+`emit_rep` 2 · `emit_query` **2** · `emit_sections` 1. Master rebuilt from source in this session is
+**1,029,129 B**, SHA-256 `0d4c5822…`, and it is a self-compilation fixed point at one compile.
+
+| | master `5d40f22` | this PR |
+|---|---|---|
+| **CORE** (23-resolver list) | **312** | **305** |
+| **OFF-LIST** (#1141's table) | 28 | 28 |
+| **TRUE TOTAL** | **340** | **333** |
+| `emit_classify.vl` | 177 (176 + 1) | **176** (175 + 1) |
+| `emit_collect.vl` | **49** | **43** |
+| `emit_base.vl` · `emit_mono.vl` · `emit_query.vl` | 48 · 5 · 2 | 48 · 5 · 2 |
+| **hand-written type-name DEPTH LADDERS** | **5 copies + 2 homes** | **1 copy + 2 homes** |
+| **inline character-surgery operations** (census unit (b)+(c)) | **1,077** | **1,059** (**−18**) |
+| **discovered-resolver CALL SITES**, tree-wide | **1,791** | **1,793** (**+2**) |
+| binary | 1,029,129 B | **1,027,797 B** (**−1,332 B**) |
+| corpus walk CHARSTEPS | 294,821 | **247,298** (**−16.1%**) |
+| fuzz walk CHARSTEPS | 4,677,829 | **3,896,547** (**−16.7%**) |
+
+**THE TWO CENSUS COLUMNS MOVE IN OPPOSITE DIRECTIONS AND BOTH ARE REPORTED.** Deleting an INLINE
+ladder is invisible to a CALL-SITE census — the ladder is not a call — while the home that replaces
+it *is* one. So the same three conversions read **−18 inline operations** and **+2 call sites**. A
+slice that quoted only the second number would look like a regression; one that quoted only the
+first would look twice as good as it is. Net under the census's own unit: **−16 operations**.
+
+### REFUTATION 1 — the walk census at this base is **5 copies + 2 homes**, not 6 + 2, and the brief's number went stale across its own base's parent
+
+#1165 published **6 copies + 2 homes** and named the sixth (`nameIsWholeSpanShape`, found
+structurally after four name-list sweeps missed its `d0` counter). Re-derived structurally at
+`5d40f22` — a function with a loop in which *some* integer is both incremented and decremented and
+compared, whose body tests a character against a grouper/separator — the sweep flags **5 + 2**:
+
+| | function | ladder |
+|---|---|---|
+| copy | `emit_classify.shapeFieldParse` | FULL `(),:<>[]{}` |
+| copy | `emit_classify.annRetKind` | paren |
+| copy | `emit_classify.unionArmSigKey` | paren |
+| copy | `emit_classify.monoUnwrapParens` | paren |
+| copy | `emit_classify.nameIsWholeSpanShape` | brace |
+| home | `typecheck.tyTopIndexOf` | FULL |
+| home | `typecheck.tyGroupEndIndex` | FULL |
+
+The missing sixth is **`splitUnionArmsAllDepth`, which #1163 (D-ARMDEDUP) deleted** — and #1163 is
+`f9561b8`, the DIRECT PARENT of `5d40f22`. #1165 measured at `f9d4f88`, before that merge, and the
+figure was carried into a brief whose base is one commit past the deletion. *This is the memory
+file's own "number went stale across a merge" failure, on its fourth recorded instance; the rule
+that catches it is re-derive the census at the head you are briefing against, not at the head you
+measured.* (`format.splitTopLevel` also matches the structural filter and is excluded by rule: it
+walks SOURCE text for the formatter, not a type name.)
+
+**This PR takes it to 1 copy + 2 homes.** The survivor is `shapeFieldParse`, which is not a copy of
+anything — it is a multi-field SPLITTER, not a wrap/find question, and no home has its shape.
+
+### D-SPANHOME — the brace-only walk retires, and its twin one module up is DELETED
+
+`nameIsWholeSpanShape`'s body becomes the quote-aware home:
+
+```vl
+export function nameIsWholeSpanShape(name: string) {
+  if name.length < 2 { return false }
+  if name[0] != '{' || name[1] == '[' || name[name.length - 1] != '}' {
+    return false
+  }
+  tyGroupWrapsWhole(name)
+}
+```
+
+Computing BOTH readings at every live invocation, at MY head:
+
+| | reaches | names carrying `"` | never-closes | TRUE (walk) | TRUE (home) | **DISAGREEMENTS** |
+|---|---|---|---|---|---|---|
+| corpus (1,337 cases) | 10,581 | 17 | **0** | 1,105 | 1,105 | **0** |
+| fuzz (86,400) | 189,040 | 391 | **0** | 9,390 | 9,390 | **0** |
+| **total** | **199,621** | **408** | **0** | — | — | **0** |
+
+The INVERTED comparator fires on **10,581 / 10,581** and **189,040 / 189,040** — 100% of reaches on
+both channels — so the zero is a measurement, not a dead wire.
+
+There are **TWO** divergence classes, not one, and the header this replaces named neither. The
+quote skip is the known one. The second is a leading `{` that NEVER CLOSES: the walk read FALSE
+(`closeAt` stays −1), the home reads TRUE (`tyGroupEndIndex` returns −1 and `tyGroupWrapsWhole`
+answers "it wraps"). The final-character cheap reject closes it, and `P_WSNC` fired **0** times on
+either channel anyway.
+
+**The twin is then deleted.** With the walk gone the body is character-identical to
+`emit_collect.nameIsSingleShape`, which has asked this same question through the same home since
+#1160. `emit_collect` already imports `emit_classify`, so the survivor is the one already exported
+and already reached from three other modules; the six sites now call it. **The resulting CORE −6 is
+a NAMING ARTIFACT and is reported as one** — `nameIsSingleShape` is on the 23-list and
+`nameIsWholeSpanShape` is not, so the same six questions are asked the same number of times under a
+name the list does not count. The work count below shows the rename is exact to the invocation.
+
+### D-MONOPAREN — the compiler's LAST paren-only wrap walk, re-measured rather than inherited
+
+#1150 moved `monoUnwrapParens`'s five out-of-file consumers to `emit_base.normTypeAtom` and filed
+the remaining twelve as a measured hand-off (456,003 invocations / 0 disagreements over all 17
+sites, at that head). **RE-MEASURED AT MINE**, because a hand-off is a hypothesis:
+
+| | invocations | sites reached | **DISAGREEMENTS** |
+|---|---|---|---|
+| corpus | 31,005 | **12 of 12** | **0** |
+| fuzz | 1,081,802 | 11 of 12 | **0** |
+| **total** | **1,112,807** | — | **0** |
+
+Inverted comparator: **100% of reaches on both channels, and at every one of the twelve sites
+individually.** Site 7 has **ZERO fuzz reach** and exactly **2** corpus reaches — the corpus is the
+only channel that covers it. A fuzz-only verdict would have been a coverage claim wearing an
+agreement claim's clothes, which is #1125's and #1127's finding twice over.
+
+The two readings differ in THREE ways, all measured rather than argued: the home TRIMS surrounding
+whitespace, its wrap test is the FULL ladder rather than a paren count, and its `>` is gated by
+`tyGtIsClose`.
+
+### D-ARMPAREN — the same grammar, written out a THIRD and FOURTH time in the same file
+
+`unionArmSigKey`'s prelude is `normTypeAtom`'s body character for character — and **the home's own
+header has said so since #1150** ("`emit_classify.vl`'s `unionArmSigKey` prelude was a
+CHARACTER-IDENTICAL copy of this"). `annRetKind` writes the peel a fourth time, without the trim.
+A comment saying two things must not drift is not a mechanism that stops them.
+
+| site | corpus | fuzz | total | DIS (string) | DIS (arrow CONSEQUENCE) |
+|---|---|---|---|---|---|
+| `unionArmSigKey` prelude | 1,916 | 52,608 | **54,524** | **0** | **0** |
+| `annRetKind`'s `tc` peel | 5,582 | 58,073 | **63,655** | **0** | **0** |
+
+Inverted comparator on the STRING channel: **100% at both sites, both channels**. The CONSEQUENCE
+channel's zero is NOT independently proved — appending a character does not change
+`annArrowAt(x) >= 0` — and it does not need to be: string equality implies consequence equality, so
+the proven stronger channel carries it. *Stated rather than quietly counted as a second zero.*
+
+### THE TRIM IS REACHED 1,280,943 TIMES AND TAKEN ZERO TIMES
+
+D-MONOPAREN and D-ARMPAREN take `normTypeAtom` from 1,606 corpus invocations to 40,109 and from
+48,351 fuzz to 1,240,834 — a 25× move that turns an allocation from noise into a cost.
+`arm.slice(lo, hi)` with `lo == 0 && hi == arm.length` builds a whole new string to say "nothing was
+trimmed", so the ship guards it:
+
+```vl
+  let t = arm
+  if lo != 0 || hi != arm.length { t = arm.slice(lo, hi) }
+```
+
+A FIRE probe says the guard never has to slice: the trim fires **0 of 1,280,943** invocations
+(40,109 corpus + 1,240,834 fuzz). **A ZERO THAT LARGE IS A BUG REPORT ABOUT THE WIRE UNTIL THE WIRE
+IS PROVED**, so the fire wire was INVERTED (print when the trim is NOT needed) and fires
+**40,109 / 40,109** on the corpus. The trim genuinely never fires on any live input on either
+channel; the guard is answer-exact by construction (`s.slice(0, s.length)` IS `s`) and removes
+1,280,943 string allocations. Published as a blind spot rather than a licence: the two trim loops
+exist for `| `-split arms and no channel here produces one with surrounding whitespace.
+
+### TARGET 2 — the code-axis census, re-run by DISCOVERY and by CODE
+
+> Enumerate by what the CODE is, not by what the ARGUMENT is — and not by name.
+
+Not a seed vocabulary: all **2,530** compiler functions machine-read; a function is a type-string
+resolver if it has a `string` parameter and either does its own character surgery (a char-literal
+comparison against `{}[]()<>|,:`, a `.slice`/`.indexOf`/`strContains` on a string param, or a
+whole-spelling equality) **or** passes one of its own string params to a known resolver, applied to
+fixpoint. **375 resolvers, 1,791 call sites tree-wide at master.**
+
+| bucket | tree-wide | **my partition (5 files)** |
+|---|---|---|
+| CORE (the 23-list) | 312 | 280 |
+| OFF-LIST (#1141's table) | 26 | 1 |
+| **NEITHER** | **1,453** | **833** |
+| **TOTAL** | **1,791** | **1,114** |
+
+**THE SCOREBOARD SEES 25% OF ITS OWN CENTRE.** 281 of the 1,114 type-string resolver calls in this
+partition are on either list. Hand-classifying the top 30 NEITHER resolvers: **28 are genuine
+type-grammar parsing** (`isValueUnionName` 29, `valueAtomKind` 27, `nonNulBaseOf` 22,
+`nameIsBareMap` 21, `structIndexOfTypeName` 21, `sigKeyRetKind` 19, `registerInlineUnion` 16,
+`calleeRetKind` 14, …), **2 are legitimate residue** (`strContains` 14, a generic substring helper;
+`numTextIsFloat` 10, a numeric lexeme the census excludes BY RULE). The instrument overcounts, and
+the overcount is named rather than buried.
+
+**REFUTATION 2 — two of the brief's seven off-scoreboard figures do not reproduce at this base.**
+Measured on a frozen `git archive 5d40f22` snapshot: `nameToTy` **17** ✅ · `tyTopIndexOf` **16** ✅ ·
+`isValueUnionName` **36** ✅ · `monoUnwrapParens` **12** ✅ · `nulMapInnerName` **10** ✅ ·
+`nonNulBaseOf` **22** (brief: 18 — #1165 added four adoption sites *in the PR the brief was written
+from*) · `annRetNameOf` **10** (brief: 11). Five of seven exact; the two that moved are both stale
+across #1165 itself. Total **123**, not 120.
+
+By ENCLOSING FUNCTION and by EXPRESSION the partition reads as #1165 recorded it, with one
+correction: after D-MONOPAREN the `normTypeAtom(annRetNameOf(peelGroupParens(v)))` skeleton is no
+longer the only repeated composition — `normTypeAtom(...)` is now the file's single most-called
+`emit_base` entry point at 40,109 corpus invocations, and every one of them is a *question about a
+wrapper*, which is exactly the shape a typed IR answers for free.
+
+### Gate — every leg, RC checked EXPLICITLY, master baseline rebuilt at MY head in THIS session
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh --prove-fixpoint` | RC=0 — master **1,029,129 B** (`0d4c5822…`), ship **1,027,797 B** (`c29bcb8c…`), **−1,332 B**; both are one-compile fixed points |
+| `native-fixpoint.sh` | RC=0 — stage3 == stage4 byte-for-byte (1,027,797 B) |
+| `lint-self.sh` | RC=0, fmt clean (`vl fmt` re-run on every edited file before every build) |
+| suite (`SELFHOST_NATIVE_ALIGN=1 deno task test`) | **2,082 passed / 0 failed / 14 ignored** |
+| suite, master **re-measured at this head, same session, same command** | **2,082 / 0 / 14** — delta **0**, as a pure refactor must be; ignored-test NAME SETS diffed as SETS, **identical, 14 non-empty names each** |
+| corpus A/B, master vs ship | **1,365 files, 0 differing** on wasm SHA-256, build rc, compiler message, run rc and stdout, compared BY NAME |
+| corpus channel populations (side A) | 1,154 produce wasm (1,150 distinct SHAs) · 211 carry a compiler message (209 distinct) · 1,114 produce stdout (950 distinct) · 2 distinct build rcs · 2 distinct run rcs |
+| **`vl check <dir>` SHARED-INSTANCE leg** | RC=1 both sides (the corpus carries deliberate rejects) — **7,233 output lines each, 1,809 diagnostic lines, 0 differing** |
+| lint-tier A/B (`vl check --severity hint`, per file) | **1,365 rows, 777 carrying ≥1 tagged diagnostic, 776 distinct texts — 0 differing** |
+| fuzz A/B, master vs ship | 12 seeds × 3 depths × 2 modes = **86,400 programs/side** (double #1165's population), 89,931 output files/side, 82,869 non-empty `.out`, 3,531 `.err`, 13,456 distinct `.out` contents; whole `--out-dir` trees via `diff -r` — **RC=0, 0 differing paths** |
+| `rep-fuzz-check.sh` | RC=0, exact ✅ (1 baselined, 0 unsound, 0 new, 0 stale) |
+| invocation counts, both sides, both channels | below — **every relocation identity residual 0** |
+| final artifact | `cmp`-checked byte-identical to `CAND3.wasm`, the compiler every leg above was measured with |
+
+**THE LINT-TIER DENOMINATOR WAS STILL WRONG IN THE INHERITED HARNESS.** #1165 found and reported the
+bug (`grep error` matches the trailing `no errors.` on every row, printing 100%) but fixed it in its
+report, not in `lintab.py`. The harness this slice inherited still counted `x[1]` non-empty. Fixed to
+match on the `[HINT]`/`[WARNING]`/`[ERROR]`/`[INFO]` tag: **777 of 1,365**, not 1,365 of 1,365.
+*Fix the harness, not the paragraph.*
+
+### THE WORK COUNT — every delta attributed, residual 0 on all five
+
+Counters installed identically on master's source and the ship's, driven through `probehost.ts`
+(shared instance; counts are per-token line counts, not summed cumulative globals).
+
+**CORPUS (1,337 cases)**
+
+| counter | master | ship | Δ | attribution |
+|---|---|---|---|---|
+| `tyTopIndexOf` | 1,438,789 | 1,438,789 | **0** | untouched |
+| `nullablePartOf` | 431,212 | 431,212 | **0** | the fold moved, the call did not |
+| `monoUnwrapParens` | 31,005 | **0** | −31,005 | deleted |
+| `nameIsSingleShape` | 20,298 | **0** | −20,298 | deleted |
+| `nameIsWholeSpanShape` | 10,581 | 30,879 | **+20,298** | **= `nameIsSingleShape`'s reach exactly. Residual 0 — a pure rename** |
+| `normTypeAtom` | 1,606 | 40,109 | **+38,503** | **= 31,005 + 1,916 + 5,582, the three relocated sites' measured reach. Residual 0** |
+| `tyGroupWrapsWhole` | 1,352 | 5,041 | **+3,689** | decomposed below |
+| `tyGroupEndIndex` | 13,386 | 17,075 | **+3,689** | **identical Δ; non-`tyGroupWrapsWhole` callers are 12,034 on BOTH sides. Residual 0** |
+| `nonNulBaseOf` | 12,399 | 12,446 | **+47** | = the one adopted fold site's reach |
+
+`tyGroupWrapsWhole` decomposed by caller: master **1,011** (`nameIsSingleShape`) + **341**
+(`normTypeAtom`) = 1,352; ship **2,181** (`nameIsWholeSpanShape`) + **2,860** (`normTypeAtom`) =
+5,041. **Both sums exact.**
+
+**FUZZ (86,400 programs)** — same shape, same verdicts: `tyTopIndexOf` 22,965,322 both sides,
+`nullablePartOf` 6,572,397 both sides, `monoUnwrapParens` 1,081,802 → 0, `nameIsSingleShape`
+272,548 → 0, `nameIsWholeSpanShape` 189,040 → **461,588** (+272,548, **exactly**
+`nameIsSingleShape`'s reach), `normTypeAtom` 48,351 → **1,240,834** (+1,192,483 = 1,081,802 + 52,608
++ 58,073, **exactly**), `tyGroupEndIndex` 214,468 → 277,027, `nonNulBaseOf` 316,753 → 318,731.
+
+**CHARSTEPS — the relocation is a work REDUCTION, not a regression.** One token per loop ITERATION
+of every walk this slice deletes or feeds:
+
+| | master | ship | Δ |
+|---|---|---|---|
+| corpus: home ladder (`tyGroupEndIndex`) | 193,155 | 247,298 | +54,143 |
+| corpus: the four deleted walks | 101,666 | **0** | −101,666 |
+| **corpus TOTAL** | **294,821** | **247,298** | **−47,523 (−16.1%)** |
+| **fuzz TOTAL** | **4,677,829** | **3,896,547** | **−781,282 (−16.7%)** |
+
+The reduction is not a rounding artifact of a richer ladder being cheaper — it is one specific
+defect being removed. Master's `nameIsWholeSpanShape` had **no early exit**: it scanned the ENTIRE
+string for every name starting `{` and not `{[`, then compared `closeAt` to the last index. The
+home returns at the first closer that would take the depth below zero. Add the 1,280,943 removed
+no-op string allocations and this slice is negative-cost on both channels.
+
+### 🐛 REFUTATION 3 — MY OWN CHARSTEP HARNESS INSTRUMENTED THE WRONG FUNCTION, and the tell was an IDENTICAL number
+
+The first charstep run reported the home ladder at **14,394,463 iterations on BOTH sides** — byte
+identical — while the invocation counters proved the ship makes **3,689 more calls into it**. Both
+cannot be true. The probe anchored on a loop preamble (`let angOpen = 0 / let i = from / while i <
+name.length { const c = name[i]`) and replaced the FIRST occurrence; `tyTopIndexOf` sits 38 lines
+above `tyGroupEndIndex` in `typecheck.vl` with a **character-identical preamble**, so the probe
+measured `tyTopIndexOf` — whose call count IS identical on both sides (1,438,789), which is exactly
+why the wrong number looked stable. Re-anchored on the FUNCTION HEADER, the true figures are the
+table above. *`IDENTICAL IS NOT CORRECT` caught this; a first-occurrence anchor in a file with two
+copies of a preamble is a harness defect the same shape as the duplication the slice is deleting.*
+
+### Entombment — five sabotages and two positive controls, on the SHIPPED source
+
+Every sabotage was built from the shipped source with a master-built compiler and A/B'd against the
+ship over the full 1,365-file corpus.
+
+| | sabotage | corpus reddened | verdict |
+|---|---|---|---|
+| **P1** | `nameIsWholeSpanShape` returns `false` always | **34** | positive control — the site IS observed |
+| **P2** | `normTypeAtom` returns its argument unchanged | **57** | positive control — the home IS observed |
+| S1 | `nameIsWholeSpanShape` reverts to the deleted brace-only QUOTE-BLIND walk | **0** (and **0** of 86,400 fuzz) | **covered, and unpinnable on either channel** |
+| S2 | `normTypeAtom` drops the wrap PEEL | **57** | the relocated peel is observed |
+| S3 | `unionArmSigKey` stops normalising its arm | **4** | **PINNED by pre-existing fixtures** |
+| S4 | `annRetKind` stops peeling its result | **13** | **PINNED by pre-existing fixtures** |
+| S5 | the no-op-trim guard INVERTED | **0** | inert **BY MEASUREMENT** — the trim fires 0 of 1,280,943 |
+
+S3's four: `closures/nulclosure-null-only-call.vl`, `types/nulclosure-sig-null-only.vl`,
+`types/nullable-closure-return.vl`, `unions/nullable-closure-call-narrowed-list-arm-read.vl`.
+S4's thirteen are `arrays/nullable-closure-element-composite-results.vl` and twelve under
+`closures/`. **Entombment therefore needs NO new fixture: the corpus already fails on a compiler
+that drops either relocation.**
+
+**S1 IS THE ONE THAT NEEDED THE DISCIPLINE.** Five inert readings is the shape of a broken
+comparator, so before calling it inert: P1 reddens 34 files (the site is observed), the inverted
+probe fires on 199,621 of 199,621 invocations (the comparator works), and **six programs were
+hand-built to try to pin it** — a literal-union field carrying `}` through a declared alias, an
+inline field, a function param+return, an array element, a map value, and the `{`-flavoured variant.
+All six are byte-, message- and stdout-identical on both sides. The claim that survives is the
+narrow one: **the divergence class is REACHED (408 quote-carrying names) and its answer-level
+population is measured EMPTY**, so no pin can exist. Said plainly rather than dressed as coverage.
+
+### REFUTATIONS — worth more than the agreements
+
+1. **"5 copies + 2 homes" is what this patch *starts* from, not what it ends at.** The brief said
+   the filed hunk "takes walks to 5 copies + 2 homes"; master is ALREADY 5 + 2 because #1163 —
+   `5d40f22`'s direct parent — deleted `splitUnionArmsAllDepth`. The slice ends at **1 + 2**.
+2. **Two of the brief's seven off-scoreboard census figures are stale by one commit**
+   (`nonNulBaseOf` 22 not 18, `annRetNameOf` 10 not 11); the other five reproduce exactly. Both
+   stale figures went stale across #1165, the PR the brief was written from.
+3. **My own charstep harness measured the wrong function** and the tell was a number that came out
+   IDENTICAL on both sides while another instrument proved a difference. See REFUTATION 3.
+4. **The inherited `lintab.py` still had the denominator bug #1165 reported.** A bug that is fixed
+   in a report and not in the harness is not fixed.
+5. **The CORE −7 is mostly a naming artifact and says so.** Six of the seven are
+   `nameIsSingleShape`'s sites moving to a name the 23-list does not carry. The real work is the
+   four deleted ladders, and **the 23-list cannot see any of them** — an inline walk is not a call.
+6. **`normTypeAtom`'s whitespace trim is dead on every live input** (0 of 1,280,943, inverted wire
+   firing 40,109/40,109). Not deleted — the arm-split spelling that motivates it is plausible and
+   unreached, which is a coverage statement, not a licence.
+7. **The CONSEQUENCE channel in D-ARMPAREN is not independently proved** and is not counted as a
+   second zero.
+
+### Hand-offs, best-measured first
+
+1. **`wasmEmit.vl:4112` — the last hand-written `nonNulBaseOf` fold** (`emit_rewrite`'s and
+   `emit_collect`'s are done; `emit_classify`'s own went in this PR). Exact diff:
+   ```
+   -        let rlen = rlElemName[rslot]
+   -        const rnn = nullablePartOf(rlen)
+   -        if rnn != "" { rlen = rnn }
+   +        const rlen = nonNulBaseOf(rlElemName[rslot])
+   ```
+   plus `nonNulBaseOf,` in the `from "./emit_classify"` import list (alphabetically between
+   `msMemberValKindsOf`'s block and `variantFieldIsLitUnionArray` — the block ends at
+   `wasmEmit.vl:570`). **Check afterwards whether `nullablePartOf` is still used in that file: it
+   has exactly ONE other site (line 129 is the import), so this diff may STRAND the import, which
+   only `lint-self.sh` sees.**
+2. **`typecheck.topLevelArrowIndex` and `emit_base.annArrowAt` are CHARACTER-IDENTICAL** — both are
+   `{ tyTopIndexOf(name, '=', 0, 0) }` (typecheck.vl:4745, emit_base.vl:1992). Re-verified at
+   `5d40f22`. `typecheck` is BELOW `emit_base` in the import graph so it cannot take the emitter's
+   name; the merge is **delete `topLevelArrowIndex` and inline `tyTopIndexOf(name, '=', 0, 0)` at
+   its three sites** (4754, 5360, 6963) — OFF-LIST **−3**, and one fewer spelling of the arrow
+   question. `typecheck.vl` is not this partition's file.
+3. **`emit_query.vl`'s two CORE sites are ONE shape and both are render-then-parse**:
+   `nameIsI32Array(tyNameOf(paramTypeNode(fnIx, name)))` (769) and `nameIsStringArray(…)` (773).
+   The argument is a NODE both times, so the dual is an arena classifier pair on the param's type,
+   not another name test. Taking the file to 0 is two arena predicates, not a home.
+4. **`shapeFieldParse` is the last hand-written ladder in the emitter and is NOT a dedup target.**
+   It is a multi-field SPLITTER (depth-aware over `(),:<>[]{}`, with a `collecting` flag), not a
+   wrap/find question; `tyTopIndexOf`/`tyGroupEndIndex` answer "where does this group end", which is
+   one rung of it. Retiring it needs the field list to come from the TYPE, i.e. the `nodeTyIx`
+   coverage question — not another home.
+5. **`normTypeAtom` is now the emitter's single hottest `emit_base` entry point** (40,109 corpus /
+   1,240,834 fuzz invocations, up 25×), and every call is a question about a WRAPPER on a rendered
+   name. It is the best-instrumented candidate in the partition for a typed-IR answer, and the
+   FIRE data says what such an answer must reproduce: across the 14 sites this slice instrumented
+   (reach 38,503 corpus / 1,192,483 fuzz) the peel actually FIRES 1,996 and 38,178 times —
+   **94.8% and 96.8% of its calls are asking about a name that has no wrapper at all.**
+6. **The fuzz generator still emits no generic applications** (#1165's finding, unchanged): `gae*`
+   coverage rests on the corpus alone. Worth closing before any slice trusts a fuzz zero there.

@@ -141,6 +141,7 @@ import {
   nameIsStringArray,
   nameNamesFunction,
   nonNullMemberCountOf,
+  normTypeAtom,
   nulCloFlag,
   nulLitUnionInnerName,
   nullablePartOf,
@@ -163,6 +164,7 @@ import {
   retStrFlag,
   shapeInnerFieldSplit,
   strContains,
+  tyGroupWrapsWhole,
   tyIsBool,
   tyIsFuncType,
   tyIsNulBool,
@@ -7499,41 +7501,45 @@ export function fnStmtsPosOf(fnIx: i32) {
   -1
 }
 
-// The struct table index a type NAME names: a declared struct name directly, or an
-// INLINE object-shape name (`{x:i32,y:i32}`) matched by field-name SET against the
-// interned shapes (the anonymous literals interned the same sets). -1 if neither.
 // True if `name` is a single INLINE STRUCT shape spanning the WHOLE string (`{f: i32}`,
 // `{f: {f: i32|string}}`) — its first `{`'s matching `}` is the LAST char, and it is not
 // a map spelling (`{[`). A composite (`{…}|null`, `{…}|{…}`, `{…}[]`) is not.
 //
-// The ONE scanner in this file that deliberately does NOT learn the generic-application
-// brackets (D-GENBRACKET's hand-off listed it with the other eight). Its depth alphabet is
-// BRACES ONLY — it asks nothing about `[`, `(` or `<` — and it is looking for the position
-// at which brace depth returns to 0. A `<`/`>` pair cannot change brace balance, so adding
-// it to this counter could not move `closeAt`; the repair would be inert by construction,
-// not merely unmeasurable. The hazard class does reach here (an audit probe counted 777
-// angle-bearing inputs over the corpus and 2,564 over 16,800 fuzz programs, of which 776
-// and 2,564 carry a BARE `>` — `tyToStr`'s `->` and the `$fnsig` key — with just ONE
-// carrying a `<` at all); it simply cannot affect a brace-only span test.
+// THE LAST HAND-WRITTEN TYPE-NAME WALK IN THIS FILE IS GONE, AND EVERY SWEEP THAT MISSED
+// IT MISSED IT FOR THE SAME REASON. This was a brace-only depth ladder whose counter was
+// named `d0`; four successive name-list sweeps (`depth|d|lvl|level|dep|nest`) reproduced
+// the published walk table function-for-function and never matched `\bd\b` against `d0`.
+// A census whose unit says "a DEPTH counter" must not be implemented as a list of the
+// words people use for one — only a STRUCTURAL sweep (some integer both incremented and
+// decremented in a loop that tests a character against a grouper) finds this.
+//
+// The header this replaces defended the BRACE-ONLY alphabet at length and correctly: a
+// `<`/`>` pair cannot change brace balance, so D-GENBRACKET's angle repair would have
+// been inert here by construction. It said nothing about QUOTED literal members, which
+// CAN change it — `{v: "a}b"}` closes the group early to a brace-only reader, exactly the
+// class #1153 retired from `typecheck.isObjShapeName` "in the direction that loses a
+// shape". `tyGroupWrapsWhole` -> `tyGroupEndIndex` -> `skipQuotedName` is quote-aware and
+// escape-aware, and `emit_collect.nameIsSingleShape` has asked this same question through
+// it since #1160.
+//
+// This is a DELETION, not a repair: computing both readings at every live invocation gives
+// **0 disagreements over 199,621 invocations** (10,581 corpus + 189,040 fuzz), with 408
+// quote-carrying names reaching the site, and the inverted comparator firing on 100% of
+// reaches on both channels. The one remaining divergence class — a leading `{` that NEVER
+// closes, where the walk read FALSE and the home reads TRUE — is guarded away by the
+// final-character test (a group that never closes cannot end in `}` unless it is nested,
+// and `P_WSNC` fired 0 times on either channel).
 export function nameIsWholeSpanShape(name: string) {
-  if name.length >= 2 && name[0] == '{' && name[1] != '[' {
-    let d0 = 0
-    let closeAt = -1
-    let q = 0
-    while q < name.length {
-      const cc = name[q]
-      if cc == '{' {
-        d0 = d0 + 1
-      } else if cc == '}' {
-        d0 = d0 - 1
-        if d0 == 0 && closeAt < 0 { closeAt = q }
-      }
-      q = q + 1
-    }
-    if closeAt == name.length - 1 { return true }
+  if name.length < 2 { return false }
+  if name[0] != '{' || name[1] == '[' || name[name.length - 1] != '}' {
+    return false
   }
-  false
+  tyGroupWrapsWhole(name)
 }
+
+// The struct table index a type NAME names: a declared struct name directly, or an
+// INLINE object-shape name (`{x:i32,y:i32}`) matched by field-name SET against the
+// interned shapes (the anonymous literals interned the same sets). -1 if neither.
 
 export function structIndexOfTypeName(name: string) {
   const si = structIndexByName(name)
@@ -9577,8 +9583,10 @@ export function fieldRefElemName(tyIx: i32) {
     // matching declared struct), so every nominal-keyed use site (`structIndexByName`)
     // resolves it like `inner: Inner`.
     if code == 15 {
-      let base = nullablePartOf(ty.tyName)
-      if base == "" { base = ty.tyName }
+      // `nonNulBaseOf` — the fold this file NAMED, hand-written 184 lines below its own
+      // home. The detector that found it matches both spelling directions ("peel, keep if
+      // non-empty" and "peel, restore if empty"); this is the second.
+      const base = nonNulBaseOf(ty.tyName)
       const idx = structIndexOfTypeName(base)
       if idx >= 0 { return sNames[idx] }
       return base
@@ -10495,7 +10503,7 @@ function internShapeArms(arms: string[]) {
     }
     if uCore.length >= 1 && uCore[0] == '{' {
       internShapeDeep(arms[uai])
-    } else if annArrowAt(monoUnwrapParens(uCore)) >= 0 {
+    } else if annArrowAt(normTypeAtom(uCore)) >= 0 {
       // A CLOSURE arm (`((i32) => {a: f64, f: K0, z: string}[]) | f64`): the inline
       // shapes buried in its params/result are otherwise unreachable — the arm is ONE
       // spelling inside the union name, so a narrowed arm's value-call result read found
@@ -10520,7 +10528,7 @@ export function internShapeDeep(nm: string) {
   // own PARAM LIST (`(i32)=>(()=>{a:i64,f:i32,z:f64})`) must NOT be blind-peeled — the garbled
   // remainder (`i32)=>…`) dead-ends every case below, so the shapes buried in its RESULT spine
   // never intern (and a chained value call's struct read then finds no interned shape).
-  const uw = monoUnwrapParens(nm)
+  const uw = normTypeAtom(nm)
   if uw.length != nm.length { return internShapeDeep(uw) }
   // A VALUE UNION leaf (`i32 | null`, `string | i32`) — register its box reps. Do NOT peel its `| null`:
   // here the null is a union ATOM (a tag in a non-null box), NOT a nullable-niche wrapper. Checked AFTER
@@ -10538,7 +10546,7 @@ export function internShapeDeep(nm: string) {
       splitUnionAtoms(nm, vArms)
       let va = 0
       while va < vArms.length {
-        const vc = monoUnwrapParens(vArms[va])
+        const vc = normTypeAtom(vArms[va])
         if annArrowAt(vc) >= 0 { internFuncTypeShapes(vc) }
         va = va + 1
       }
@@ -10682,9 +10690,9 @@ function structElemArrayLowerable(t: string): boolean {
   // Un-admitted, the whole closure-result struct stayed un-interned and the body
   // literal fieldset-collided onto its own ELEMENT row (`{f:…}` on both) —
   // INVALID-WASM at the `struct.new` (fuzz report-only branching leg).
-  let base = monoUnwrapParens(t.slice(0, t.length - 2))
+  let base = normTypeAtom(t.slice(0, t.length - 2))
   const nb = nullablePartOf(base)
-  if nb != "" { base = monoUnwrapParens(nb) }
+  if nb != "" { base = normTypeAtom(nb) }
   if base.length >= 2 && base[0] == '{' && base[1] != '[' {
     return funcTypeShapeLowerable(base)
   }
@@ -10831,7 +10839,7 @@ function internFuncTypeShapes(nm: string): i32 {
   // blind-peeled — that garbles the name (`i32)=>(()=>{f:i32}`) and the shapes buried in a
   // NESTED functype result never intern (a chained value call's struct read then finds no
   // interned shape).
-  const uw = monoUnwrapParens(nm)
+  const uw = normTypeAtom(nm)
   if uw.length != nm.length { return internFuncTypeShapes(uw) }
   // A VALUE-UNION leaf (`f64 | null` as a closure RESULT, `i64 | boolean` as a param) —
   // register its box reps, exactly as `internShapeDeep`'s value-union arm does (and
@@ -11061,7 +11069,7 @@ export function internInlineShape(nm: string) {
         // (or, with a same-fieldset twin in scope, the un-interned closure-result
         // struct fieldset-collided onto its own element row — INVALID-WASM).
         if e5 == "" {
-          const uw5 = monoUnwrapParens(raw5)
+          const uw5 = normTypeAtom(raw5)
           if uw5.length != raw5.length {
             if structIndexByName(uw5) >= 0 { e5 = uw5 }
           }
@@ -11937,7 +11945,7 @@ export function forceCloResultMapTypes(nm: string) {
   splitUnionAtoms(nm, arms)
   let i = 0
   while i < arms.length {
-    const a = monoUnwrapParens(arms[i])
+    const a = normTypeAtom(arms[i])
     // `annRetNameOf` (#1144) IS the `annArrowAt` + `slice(fa + 2, …)` pair, and its `< 1`
     // gate IS this site's `fa >= 1`. The caller keeps its own `a[0] == '('` test — which
     // now runs FIRST, so the one-char reject precedes the depth scan instead of following
@@ -11945,7 +11953,7 @@ export function forceCloResultMapTypes(nm: string) {
     if a.length > 0 && a[0] == '(' {
       const ret0 = annRetNameOf(a)
       if ret0 != "" {
-        let res = monoUnwrapParens(ret0)
+        let res = normTypeAtom(ret0)
         const rn = nulMapInnerName(res)
         if rn != "" { res = rn }
         if nameIsBareMap(res) {
@@ -11983,14 +11991,14 @@ export function forceCloResultListTypes(nm: string) {
   splitUnionAtoms(nm, arms)
   let i = 0
   while i < arms.length {
-    const a = monoUnwrapParens(arms[i])
+    const a = normTypeAtom(arms[i])
     // `annRetNameOf` (#1144), exactly as in `forceCloResultMapTypes` above: its `< 1` gate
     // IS this site's `fa >= 1`, and the caller's own `a[0] == '('` test now runs FIRST so
     // the one-char reject precedes the depth scan.
     if a.length > 0 && a[0] == '(' {
       const ret0 = annRetNameOf(a)
       if ret0 != "" {
-        const res = nonNulBaseOf(monoUnwrapParens(ret0))
+        const res = nonNulBaseOf(normTypeAtom(ret0))
         // The five scalar-element backings via the ONE home (`scalarListKindOfName`).
         // This copy asked them in a THIRD order (string first, i32 last); the five
         // predicates are pairwise disjoint, so the home's order is the same answer —
@@ -14240,7 +14248,7 @@ function unionRetOfFnType(fnTyName: string) {
   if fnTyName.length > 0 && fnTyName[0] == '(' {
     const ret0 = annRetNameOf(fnTyName)
     if ret0 == "" { return "" }
-    const ret = monoUnwrapParens(ret0)
+    const ret = normTypeAtom(ret0)
     if isUName(ret) { return ret }
     if isValueUnionName(ret) { return ret }
     // A value union with a litunion-ALIAS arm (`K0 | i64`): never a registered union
@@ -18138,23 +18146,13 @@ function annRetKind(t: string) {
   // (a curried lambda's `$fnsig` must byte-match, else the value-call `ref.cast` traps). The
   // result often arrives PARENTHESIZED (`((i32) => i32)` — source groups the arrow result),
   // hiding its arrow one paren-depth down, so peel a single fully-wrapping `(...)` first.
-  let tc = t
-  if tc.length >= 2 && tc[0] == '(' {
-    let depth = 0
-    let ci = 0
-    let wraps = true
-    while ci < tc.length {
-      const cch = tc[ci]
-      if cch == '(' {
-        depth = depth + 1
-      } else if cch == ')' {
-        depth = depth - 1
-        if depth == 0 && ci < tc.length - 1 { wraps = false }
-      }
-      ci = ci + 1
-    }
-    if wraps { tc = tc.slice(1, tc.length - 1) }
-  }
+  // The peel is `emit_base.normTypeAtom` — the same wrap grammar `unionArmSigKey` spelled
+  // out one screen down, written here a THIRD time without the whitespace trim. The trim is
+  // the only difference and it cannot matter to the only question asked of the result
+  // (`annArrowAt(tc) >= 0`); measured rather than argued, at 63,655 live invocations (5,582
+  // corpus + 58,073 fuzz) with 0 disagreements on the peeled STRING *and* 0 on the arrow
+  // CONSEQUENCE, comparator firing 100% on both channels.
+  const tc = normTypeAtom(t)
   if annArrowAt(tc) >= 0 { return ">" + repSigTokOfKind("closure") }
   // `structIndexOfTypeName` (not `structIndexByName`) so a struct return the CHECKER rendered as an
   // inline shape (`{x: i32}` — the `cloCallSigKey` `nodeTyName` fallback's form) resolves by field-set
@@ -18305,29 +18303,15 @@ export function sigKeyOfTy(funcTyIx: i32): string {
 // trim, then strip ONE fully-wrapping paren pair — so the key byte-matches the one the
 // narrowed CALL site derives (`narrowedClosureOf` → `annSigKey` on the bare `()=>i64`).
 export function unionArmSigKey(arm: string) {
-  // Trim surrounding ASCII whitespace.
-  let lo = 0
-  let hi = arm.length
-  while lo < hi && (arm[lo] == ' ' || arm[lo] == '\t') { lo = lo + 1 }
-  while hi > lo && (arm[hi - 1] == ' ' || arm[hi - 1] == '\t') { hi = hi - 1 }
-  let t = arm.slice(lo, hi)
-  // Peel a single fully-wrapping `(...)` (the arrow lives one paren-depth down).
-  if t.length >= 2 && t[0] == '(' {
-    let depth = 0
-    let ci = 0
-    let wraps = true
-    while ci < t.length {
-      const cch = t[ci]
-      if cch == '(' {
-        depth = depth + 1
-      } else if cch == ')' {
-        depth = depth - 1
-        if depth == 0 && ci < t.length - 1 { wraps = false }
-      }
-      ci = ci + 1
-    }
-    if wraps { t = t.slice(1, t.length - 1) }
-  }
+  // Trim surrounding ASCII whitespace, then peel a single fully-wrapping `(...)` (the arrow
+  // lives one paren-depth down). That pair of steps IS `emit_base.normTypeAtom` — this
+  // prelude was character-identical to the home's body, and the home's own header has said
+  // so since #1150 ("`emit_classify.vl`'s `unionArmSigKey` prelude was a CHARACTER-IDENTICAL
+  // copy of this"). A comment saying two things must not drift is not a mechanism that stops
+  // them; deleting one of them is. Measured at every live invocation before deletion:
+  // 54,524 (1,916 corpus + 52,608 fuzz), 0 disagreements on the peeled STRING, comparator
+  // firing 100% on both channels. See `annRetKind` for the sibling copy.
+  const t = normTypeAtom(arm)
   if annArrowAt(t) < 0 { return "" }
   annSigKey(t)
 }
@@ -19476,30 +19460,20 @@ export function nominalizeFnType(name: string) {
   out + ")=>" + resolveShapeToNominal(retStr)
 }
 
-// Strip ONE layer of wrapping parens when they enclose the WHOLE string (`((i32,i32)=>i32)` →
-// `(i32,i32)=>i32`, the grouping parens a function type carries as an array element); leaves a name
-// whose leading `(` is not the outermost wrapper (`(i32,i32)=>i32`) untouched.
-export function monoUnwrapParens(s: string) {
-  const n = s.length
-  if n < 2 { return s }
-  if s[0] != '(' { return s }
-  if s[n - 1] != ')' { return s }
-  let depth = 0
-  let i = 0
-  while i < n {
-    if s[i] == '(' {
-      depth = depth + 1
-    } else if s[i] == ')' {
-      depth = depth - 1
-      if depth == 0 {
-        if i == n - 1 { return s.slice(1, n - 1) }
-        return s
-      }
-    }
-    i = i + 1
-  }
-  s
-}
+// `monoUnwrapParens` LIVED HERE and is gone (D-MONOPAREN) — it was the compiler's LAST
+// paren-ONLY wrap walk, and `emit_base.normTypeAtom` is the same peel riding the shared
+// `tyGroupWrapsWhole` ladder. #1150 moved this function's five out-of-file consumers to the
+// home and filed the remaining twelve as a measured hand-off; those twelve now call the
+// home directly and the walk is deleted rather than repaired.
+//
+// The two readings differ in THREE ways and all three were measured rather than argued:
+// the home TRIMS surrounding whitespace, its wrap test is the FULL `{}[]()<>` ladder rather
+// than a paren count, and its `>` is gated by `tyGtIsClose` so a `$fnsig` `ii>i` or a
+// `tyToStr` `->` cannot unbalance it. Computing both at every live invocation of all twelve
+// sites: **0 disagreements over 1,112,807 invocations** (31,005 corpus + 1,081,802 fuzz),
+// with the INVERTED comparator firing on 100% of reaches on both channels AND at every one
+// of the twelve sites individually. `normTypeAtom` carries the trailing-`)` cheap reject
+// this copy had, so the substitution is work-neutral on the guard.
 
 // Does struct `si` carry a CLOSURE-valued field `name` (code 14)?
 export function drwFieldClosure(si: i32, name: string) {
