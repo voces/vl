@@ -5693,13 +5693,47 @@ function tyEmitNameIsString(ix: i32): boolean {
 // programs.
 let emitNameAtoms = 1
 
+// The ANCESTOR stack of the render in progress — `isEquatable`'s `seen` guard, for the
+// renderer. A RECURSIVE type (`type Node = {v: i32, next: Node | null}`) is a CYCLE in
+// the arena, and a structural render of a cycle is an infinite string: every arm below
+// recurses into the field / element / member / result types, so without this the render
+// does not terminate and the COMPILER dies with `wasm trap: call stack exhausted`. That
+// is not hypothetical — two single-file, well-typed programs reach it on a stock build:
+// `const n: Node & {v: i32} = …` (the `&`-fold arm of `canonEmitName`) and
+// `type U = Box<Node> | {w: i32}` (`unionMemberGenAppShape`). A cyclic type simply has
+// no finite emit NAME, which is exactly what "" already means to every caller — the
+// recursive shapes the emitter does lower ride their NOMINAL annotation spelling
+// (`Node`), never a structural render, so declining here takes nothing away.
+//
+// Push/pop balanced around the recursive entry, so it holds ANCESTORS only: a shape that
+// mentions one struct TWICE as siblings (`{a: S, b: S}`) still renders both — `S` is
+// popped when the first field finishes. Not an arena-lifetime sidecar (method note 7):
+// it is empty on entry and on exit of every top-level call, by that balance.
+const emitNameSeen: i32[] = []
+
 // Render a RESOLVED arena type as an emitter-classifiable synthetic name, or
-// "" when it has none (a TyVar, a residual negation, err/never). Only the
+// "" when it has none (a TyVar, a residual negation, err/never, or — see the
+// cycle guard above — a RECURSIVE type). Only the
 // `&`-fold arm of `canonEmitName` consults this — every other arm rewrites the
 // name STRUCTURALLY without resolving it, so a NAMED struct keeps its name.
 // The "does it have one at all?" question has a structural answer
 // (`tyIsEmitRepresentable`) — ask that rather than testing this for "".
 export function tyToEmitName(ix: i32) {
+  let si = 0
+  while si < emitNameSeen.length {
+    if emitNameSeen[si] == ix {
+      emitNameAtoms = 1
+      return ""
+    }
+    si = si + 1
+  }
+  emitNameSeen.push(ix)
+  const r = tyToEmitNameGo(ix)
+  emitNameSeen.pop()
+  r
+}
+
+function tyToEmitNameGo(ix: i32) {
   emitNameAtoms = 1
   if ix < 0 { return "" }
   const t = T.tys[ix]
@@ -6727,6 +6761,29 @@ export function canonEmitTypeNames() {
           if gis != "" { n.isVariant = gis }
         }
       }
+    } else if n is AsExpr {
+      // `x as W` where `W` is a user ALIAS of a numeric scalar (`type W = f64`).
+      // FOUR emit consumers read this string and compare it to the four PRIMITIVE
+      // spellings — `emitAsCast` (`tgt == "f64"` / `"i64"` / `"f32"`, else the i32
+      // arm), `exprIsI64` / `exprIsF32` / `exprIsF64` (`e.asTy == "i64"` …) and the
+      // value-type feature scan in `emitProgram` — so an alias fell through every
+      // one of them and the cast emitted INVALID WASM (`type mismatch: expected
+      // f64, found i32`) for i64/f32/f64 targets. This pass is where the emitter's
+      // vocabulary is minted, and `asTy` was the one type spelling it never swept.
+      //
+      // The canon'd spelling is NOT re-derived from the string: `checkNode` banked
+      // the cast's checked type on this very node (`nodeTyIx[ix] = checkCastNode`),
+      // and `checkCastNode` admits the cast only when the target RESOLVES to one of
+      // i32/i64/f32/f64 (`primNameOf(nameToTyAt(n.asTy, ix))`), so the primitive
+      // name read straight off the typed-IR IS the emitter's vocabulary here — no
+      // parse, and no second answer that could disagree with the checker's. The
+      // four-way gate repeats `checkCastNode`'s admission rule so a REJECTED cast
+      // (`TyErr`, or a non-scalar target) leaves the author's spelling alone for
+      // the diagnostic that already quotes it.
+      const at = primNameOf(nodeTyIxOf(i))
+      if at == "i32" || at == "i64" || at == "f32" || at == "f64" {
+        if at != n.asTy { n.asTy = at }
+      }
     }
     annUnionAtoms.push(atoms)
     i = i + 1
@@ -7116,11 +7173,20 @@ function holeDemandOk(name: string, srcExpr: i32, at: i32) {
   false
 }
 
-// Membership test over a small string list (the rendered-arm dedup below).
-function strArrHas(xs: string[], v: string) {
+// Membership test over a small ARENA-TYPE list, by structural type identity (the
+// alternative-arm dedup below). `tyEq` is the same comparator `noteHoleAlt` /
+// `holeAltIndex` (7080, 7103) already dedup `holeAltTys` with — this list is the
+// SECOND dedup of the same alternatives and was the odd one out, keyed on
+// `tyToStr(m)`: render-equality standing in for type identity. Two ways that is
+// not the same question — `tyToStr` TRUNCATES at depth 8 (`…`), so two arms
+// differing only below it collapse into one; and it renders `Nullable(TyFunc)`
+// and `TyFunc(→ Nullable)` alike. `tyEq` decides the render-equality question
+// STRUCTURALLY, without building either string, and carries a cycle guard the
+// depth cutoff was standing in for.
+function tyArrHasEq(xs: i32[], v: i32) {
   let i = 0
   while i < xs.length {
-    if xs[i] == v { return true }
+    if tyEq(xs[i], v) { return true }
     i = i + 1
   }
   false
@@ -7174,25 +7240,16 @@ function holeAltRenderTy(shape: i32, k: i32) {
 function holeDemandTy(name: string) {
   const shape = holeShapeOf(name)
   const members: i32[] = []
-  const seen: string[] = []
   let k = 0
   while k < holeAltNames.length {
     if holeAltNames[k] == name {
       const m = holeAltRenderTy(shape, k)
-      const key = tyToStr(m)
-      if !strArrHas(seen, key) {
-        seen.push(key)
-        members.push(m)
-      }
+      if !tyArrHasEq(members, m) { members.push(m) }
     }
     k = k + 1
   }
   if shape >= 0 {
-    const sk = tyToStr(shape)
-    if !strArrHas(seen, sk) {
-      seen.push(sk)
-      members.push(shape)
-    }
+    if !tyArrHasEq(members, shape) { members.push(shape) }
   }
   if members.length == 0 { return -1 }
   if members.length == 1 { return members[0] }
