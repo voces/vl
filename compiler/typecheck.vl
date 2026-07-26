@@ -4616,6 +4616,12 @@ export function tyGtIsClose(name: string, i: i32, angOpen: i32) {
 //
 // The two entry points below are the WHOLE grammar. Everything else in this file
 // asks them a question; nothing else counts a bracket.
+//
+// They are EXPORTED because the same grammar is still hand-written out eleven more
+// times, in `emit_base.vl` (7), `emit_classify.vl` (3) and `emit_collect.vl` (1) — all
+// three already import `tyGtIsClose` from here, so the import path is proven and the
+// only thing that stood between those copies and this home was the `export` keyword.
+// The per-consumer diffs are in `docs/internals/destringify-types-program.md`.
 
 // The index of the first TOP-LEVEL occurrence of `a` — or of `b`, when `b` is not
 // 0 — at or after `from`, or -1. Quoted literal members skip whole (escape-aware,
@@ -4632,7 +4638,7 @@ export function tyGtIsClose(name: string, i: i32, angOpen: i32) {
 // name — the scan runs from the previous separator to the next, not from 0 each
 // time — which is what keeps `splitUnionAtoms` (the hottest caller at ~168 K
 // invocations over the corpus) off the O(n²) path its own header warns about.
-function tyTopIndexOf(name: string, a: i32, b: i32, from: i32) {
+export function tyTopIndexOf(name: string, a: i32, b: i32, from: i32) {
   let depth = 0
   let angOpen = 0
   let i = from
@@ -4670,7 +4676,7 @@ function tyTopIndexOf(name: string, a: i32, b: i32, from: i32) {
 // which is what makes `from` meaningful; a `>` cannot be the closer found here
 // because `tyGtIsClose` needs an open `<` that a `from`-relative depth of 0 has
 // not seen.
-function tyGroupEndIndex(name: string, from: i32) {
+export function tyGroupEndIndex(name: string, from: i32) {
   let depth = 0
   let angOpen = 0
   let i = from
@@ -8840,10 +8846,13 @@ function checkCallNode(n: Call, ix: i32) {
         // string` — `≥2` distinct value atoms) has no fixed rep, so emit cannot lower
         // `print(<union>)` (it produced invalid wasm). An emitter-capability rejection,
         // not a type error — the union must be narrowed with `is` first.
-        // `valueUnionRetName` is the exact boxing gate: it stays "" for a same-rep
-        // literal union (`0 | 1` is plain i32) and for `never` (empty), so those still
-        // print.
-        if valueUnionRetName(pt) != "" {
+        // `tyPrintsAsUnionBox` is the exact boxing gate: it stays false for a same-rep
+        // literal union (`0 | 1` is plain i32, `"a" | "b"` plain string) and for `never`
+        // (empty), so those still print. It reads the leaves with the same literal
+        // SOFTENING the emit name gets — without it `const v: "ab" | i32 = 3; print(v)`
+        // walked past this gate and emitted invalid wasm while `string | i32` (the same
+        // type, already softened by the author) was rejected here.
+        if tyPrintsAsUnionBox(pt) {
           tErrUnsupported(
             "print of a union value (" +
               tyToStr(pt) +
@@ -11864,6 +11873,86 @@ function collectRetAtomKinds(er: i32, out: i32[]) {
     out.push(retAtomKindOf(er))
   }
   0
+}
+
+// ── the print gate's boxing question, with the literal SOFTENING applied ──────
+// The value-atom kind of one leaf FOR THE PRINT GATE: `retAtomKindOf`, plus the LITERAL
+// arm it deliberately does not have. A literal member softens to its BASE SCALAR in the
+// name the emitter keys on (`canonEmitName`: `"ab" | i32` canons to `string|i32`, and the
+// emitter BOXES that), so a classifier that answers -1 for a literal says "not boxed"
+// about a union the emitter does box.
+//
+// `retAtomKindOf` itself must NOT learn this arm, and the reason is measured, not
+// theorised: it also feeds `valueUnionRetName`, whose NAME has to keep a litunion ALIAS
+// arm UN-softened — `K0 | i64` registers with the alias atom, and softening it to
+// `string|i64` mis-reps the closure-result box. Exactly one corpus entry proves it
+// (`closures/closure-result-litunion-arm-union.vl`, which goes to `type mismatch:
+// expected i64, found (ref $type)`). Hence a separate walk rather than one shared arm.
+function printAtomKindOf(er: i32) {
+  if er < 0 { return -1 }
+  const t = T.tys[er]
+  if t is TyLit { return retAtomKindOf(litBaseTy(t)) }
+  retAtomKindOf(er)
+}
+
+// Push the print-gate kind of every leaf of `er`, in `collectRetAtomKinds` order, with
+// the SCALAR-PRIM dedup `canonEmitName` performs on the softened name — `"a" | string`
+// is ONE atom (both soften to `string`, so it is not boxed and still prints), `"a" | 1`
+// is TWO (`string|i32`, boxed). Only kinds 0-5 dedup: each scalar-prim NAME maps to
+// exactly one of those codes, so two distinct literal-free scalar members can never
+// collide, whereas the LIST kinds deliberately share one code (7 backs `i32[]`,
+// `boolean[]` and a litunion array at once) and collapsing there would fold a genuine
+// two-arm union into one.
+function collectPrintAtomKinds(er: i32, out: i32[]) {
+  if er < 0 { return 0 }
+  const t = T.tys[er]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      collectPrintAtomKinds(t.uMembers[i], out)
+      i = i + 1
+    }
+  } else if t is TyNullable {
+    collectPrintAtomKinds(t.nInner, out)
+    out.push(6)
+  } else {
+    const k = printAtomKindOf(er)
+    if k >= 0 && k <= 5 {
+      let j = 0
+      while j < out.length {
+        if out[j] == k { return 0 }
+        j = j + 1
+      }
+    }
+    out.push(k)
+  }
+  0
+}
+
+// Scratch for the print-gate leaf scan — module level like `vuAtomKinds`, drained by its
+// only consumer.
+const pgAtomKinds: i32[] = []
+
+// Whether `print(x)` would be handed the emitter's BOXED value-union rep (`uBoxIdx`),
+// which `print` cannot lower — the gate `checkNode`'s `print` builtin arm raises on.
+//
+// STRICTLY WIDER than `valueUnionRetName(pt) != ""`, the test this replaces, and only on
+// literal-bearing unions: with no literal leaf the softening and the dedup are both
+// no-ops (no two distinct scalar prims share a kind), so every union that gate claimed is
+// still claimed. The unions it ADDS are the ones whose members the emitter softens —
+// `"ab" | i32`, `"a" | 1`, `K0 | i32`, `1 | null` — every one of which built a module that
+// failed to parse as WebAssembly while its already-softened sibling (`string | i32`) got a
+// clean diagnostic. Asking the kind walk directly also drops the name build: the gate
+// never wanted the NAME, only the verdict.
+function tyPrintsAsUnionBox(pt: i32) {
+  if pt < 0 { return false }
+  // Decline a union with any composite leaf WITHOUT rendering it, exactly as
+  // `valueUnionRetName` does — the render of a recursive struct leaf is exponential.
+  if !retAtomsCheap(pt) { return false }
+  collectPrintAtomKinds(pt, pgAtomKinds)
+  const ok = valueUnionFromAtomKinds(pgAtomKinds)
+  while pgAtomKinds.length > 0 { pgAtomKinds.pop() }
+  ok
 }
 
 // `isValueUnionName`'s verdict over an already-classified atom-kind sequence: 2+ atoms,

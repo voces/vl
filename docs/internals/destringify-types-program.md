@@ -13670,3 +13670,358 @@ whole corpus (1,326 files × 5 channels) against the shipped build:
     (`generics/recursive-generic-alias-array.vl`) was byte-identical when checked directly. The
     fix is one output FILE per input and `diff -r`. The tell was the same one note 92 records: a
     "difference" whose content was structurally impossible.
+
+## D-LITPRINT — the print gate was blind to a LITERAL member, so a boxed union it could not lower walked past it into invalid wasm; plus the grammar home is opened and its eleven conversions are measured (#PRNUM)
+
+**Shipped, in `compiler/typecheck.vl` only: a user-visible miscompile fixed (4 pins) and the grammar
+home EXPORTED. NET parse count 0 on every unit — at the rebase head `a4fb7c1` the tree reads
+CORE 359 · OFF-LIST 36 · TRUE TOTAL 395, and `typecheck.vl` 49 (20 core + 29 off-list), on BOTH
+sides** (`typecheck.vl` is untouched by #1145/#1146/#1147, so this is a same-file comparison, and the
+counter agrees). Say that first: this slice buys
+correctness and an unblocked hand-off, not deletion. The deletion it enables is *measured here* and
+*filed*, not applied — every remaining site lives in another agent's file. **Re-grepped after the
+rebase onto `a4fb7c1`: #1147 has since taken six of the eleven onto a SECOND home in `emit_base.vl`,
+so the deliverable is now a home MERGE plus five surviving copies — see Part 2.**
+
+### Part 1 — the defect: `const v: "ab" | i32 = 3; print(v)` emitted invalid wasm
+
+Reproduced on a master (`4dadedd`) build: `failed to compile: wasm[0]::function[4]` /
+`type mismatch: expected i32, found (ref $type)`. The already-softened sibling
+`const v: string | i32 = 3` gets a clean diagnostic from the SAME statement
+(`tests/cases/types/print-union-rejected.vl` has pinned it since the print gate landed). Two
+spellings of one type, two different outcomes, one of them a silent miscompile.
+
+**Mechanism, read off the emitted bytes and then off the checker, not theorised.** The `print`
+builtin's arm in `checkNode` gates on `valueUnionRetName(pt) != ""` — "does the emitter BOX this?".
+That verdict is `tyIsValueUnion` over `collectRetAtomKinds`, whose leaf classifier `retAtomKindOf`
+has arms for `TyPrim`, `TyArray` and `TyVar` and **no arm for `TyLit`**, so a literal leaf answers
+`-1` — and `valueUnionFromAtomKinds` rejects the WHOLE union on the first `-1`. Meanwhile
+`canonEmitName` softens a literal member to its base scalar (its own comment says so: *"a mixed-base
+union keeps each softened member — `"a" | 1` stays the boxed `string|i32`"*), so the emitter boxes
+exactly the union the checker declined to call a box.
+
+**Nine cells, all master-verified as invalid wasm, all now clean positioned diagnostics:**
+`"ab" | i32` · `"a" | 1` · `"a" | i64` · `"a" | boolean` · `"a" | f64` · `"a" | i32 | null` ·
+`1 | null` · `K | i32` (alias) · the same through an un-annotated `const w = v`.
+**Eight control cells that RUN keep running:** `"ab" | "cd"` · `1 | 2` · `"a" | string` ·
+`string | "a"` · `1 | i32` · `i32 | 1` · `"a" | null` · a `: "a" | i32`-annotated *parameter* that is
+never printed.
+
+### The fix, and the corpus refutation that RE-SCOPED it
+
+The first version put the literal arm straight into `retAtomKindOf` and the softening dedup into
+`collectRetAtoms`/`collectRetAtomKinds` — the root, where the classifier's own header says it should
+be. **The corpus refuted it with a population of one.**
+`tests/cases/closures/closure-result-litunion-arm-union.vl` went from printing its five lines to
+`type mismatch: expected i64, found (ref $type)`, because `valueUnionRetName` does not only decide,
+it also builds the NAME the emitter registers — and for a closure RESULT `canonEmitName` **keeps a
+litunion ALIAS arm un-softened** (`K0 | i64` registers with the alias atom). Softening at the root
+rewrote that name to `string|i64` and mis-repped the box.
+
+So the softening lives in a **separate leaf walk owned by the print gate** —
+`printAtomKindOf` / `collectPrintAtomKinds` / `tyPrintsAsUnionBox` — and `retAtomKindOf` is left
+exactly as it was. The comment in the code says which corpus entry forbids the other design.
+
+`tyPrintsAsUnionBox` is **strictly wider** than the `valueUnionRetName(pt) != ""` it replaces, and
+only on literal-bearing unions: with no literal leaf both the softening and the dedup are no-ops
+(no two distinct scalar prims share a value-atom kind), so every union the old gate claimed is still
+claimed. It also drops the name build — the gate never wanted the name, only the verdict.
+
+**The dedup is the load-bearing half, not a nicety.** `canonEmitName` collapses duplicate softened
+members, so `"ab" | "cd"` is ONE atom (`string`) and prints, while `"a" | 1` is TWO (`string|i32`)
+and boxes. The gate dedups **only kinds 0-5** (the scalar prims): each scalar-prim NAME maps to
+exactly one code, so two distinct literal-free members can never collide, whereas the LIST kinds
+deliberately share one code (7 backs `i32[]`, `boolean[]` **and** a litunion array at once) and
+collapsing there would fold a genuine two-arm union into one.
+
+### Gate
+
+**Gate run twice: once at the branch base `4dadedd`, and again in full after rebasing onto
+`a4fb7c1`. The table is the REBASE-HEAD run; the defect cell table was re-verified there too
+(identical, nine cells still invalid wasm on `a4fb7c1`).**
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh` | RC=0, 1,029,199 B (master 1,028,392 B, **+807** — the same delta as at the branch base) |
+| `native-fixpoint.sh` | stage3 == stage4 byte-for-byte |
+| `lint-self.sh` | RC=0, fmt clean |
+| suite (`SELFHOST_NATIVE_ALIGN=1 deno task test`) | **2,048 passed / 0 failed / 8 ignored** |
+| suite, master baseline re-measured **at this head, same session, same command** | **2,044 / 0 / 8** — delta **+4 = exactly the 4 new pins**; ignored-test NAME SETS **identical** (8 names, diffed as sets) |
+| corpus A/B (master vs candidate) | **1,330 entries, 3 differing = exactly the 3 new error pins** (`BUILDRC(0/1)`); **1,327 pre-existing entries identical** on build-rc + wasm hash + message + run-rc + stdout |
+| corpus channel populations | 1,128 distinct wasm hashes · 198 build rejects · 212 nonzero run rcs |
+| `rep-fuzz-check.sh` | exact ✅ (1 baselined, 0 new, 0 stale) |
+| fuzz A/B (branch base) | **43,200 programs/side** (12 seeds × 3 depths × 2 modes × 300), **0 divergences** |
+| fuzz A/B (rebase head) | 8 seeds × 3 depths × 2 modes × 300 = **28,800 programs/side**, **0 divergences** |
+
+At the branch base the same table read 1,032,354 B / 2,046 vs 2,042 / **1,324 entries, 0
+differences** — the change was behaviour-preserving there because the pins had not yet been added to
+that run's corpus snapshot; at the rebase head the corpus contains them, so the three error pins are
+the three differing rows. Both readings are of the same change.
+
+The A and B compilers were checksummed before and after every leg; at the branch base the master
+rebuild was byte-identical to the saved baseline (`8aed3156…`), so no pairing was contaminated.
+
+### Entombment — two orthogonal sabotages, and a published FUZZ BLIND SPOT
+
+The change is behaviour-changing, so it carries pins that FAIL on master (verified on a
+master-built compiler: all three error pins are `failed to compile: wasm[0]::function[4]` there).
+The two halves of the fix are then sabotaged independently.
+
+| sabotage | pins reddened | corpus entries reddened | fuzz divergences (14,400/side) |
+|---|---|---|---|
+| **SAB-A** — remove the literal SOFTENING (`printAtomKindOf`'s `TyLit` arm) | the 3 error pins | **3** — exactly the 3 new pins | **0** |
+| **SAB-B** — remove the scalar-prim DEDUP | the 1 run pin | **99** (97 build+run flips, 2 message-only) | **1,182** |
+
+Every pin is fired by exactly one sabotage and the union covers all four — the fire sets partition
+the pin set instead of overlapping it, which is what makes each pin load-bearing rather than
+decorative.
+
+**⚠️ THE FUZZ CHANNEL IS BLIND TO THE SOFTENING LEG, AND THE MAIN RUN'S 0 IS PARTLY BLINDNESS.**
+SAB-A is a class-leaving sabotage of the shipped behaviour and 14,400 fuzz programs read **0**
+divergences, while the corpus read 3. SAB-B, the other half of the very same function, reads
+**1,182** fuzz divergences — so the harness is live, the *vocabulary* is not: `scripts/fuzzgen.vl`
+emits litunion aliases and unions over them, but its oracle is `print(read(build(payload)))` and the
+read is always narrowed, so it never prints an UNNARROWED mixed-base union. This is the third
+recorded instance of the #1125 inversion (fuzz-0 as blindness), and the first where **both
+directions were measured on one function**: the same 14,400-program sweep is blind to one arm and
+saturated on the other. **Never report a fuzz 0 without a sabotage that proves the channel reaches
+the arm.**
+
+**A second methodological note the corpus earned here: the "no behaviour change" corpus A/B is what
+caught the over-reach.** The root-level version passed `lint`, `fmt`, `fixpoint` and built cleanly;
+one corpus entry out of 1,324 said no. A single-entry population is not a weak signal — it is the
+only signal that existed.
+
+### Part 2 — the home is open; and re-grepping at the REBASE HEAD found a SECOND home, not eleven copies
+
+`tyTopIndexOf` and `tyGroupEndIndex` are now `export`ed. The export costs **0 bytes** (measured:
+byte-identical builds with and without it).
+
+**The eleven sites were re-grepped twice — once at the branch base `4dadedd`, where all eleven stood
+exactly at the lines #1143 published, and again after rebasing onto `a4fb7c1`. The second grep
+changed the deliverable, and this section reports the second one.** #1146 (D-CLASSHOME) and #1147
+(D-TYWALK) landed in between; #1147 collapsed **six of the seven `emit_base` sites** —
+`nullablePartOf`, `gaeSplitArgs`, `shapeInnerFieldSplit`, `nameIsStructWithUnionField`'s inner loop,
+`annSplitParams`, `annSplitPipe` — onto a **new home in `emit_base.vl` itself**
+(`tyTopLevelIndexOf` / `tyTopLevelSplit`), with the same reasoning and, site for site, the same
+rewrites this slice had already built and gated. Concurrent slices converged; that is a good
+outcome, and the honest statement is that six of the eleven were taken by someone else.
+
+**⚠️ THE FINDING THAT REPLACES THEM: THE GRAMMAR NOW HAS TWO HOMES, AND THEY DISAGREE.**
+
+| | `typecheck.tyTopIndexOf` / `tyGroupEndIndex` (#1143, exported here) | `emit_base.tyTopLevelIndexOf` / `tyTopLevelSplit` (#1147) |
+|---|---|---|
+| quoted literal member | **skipped whole, escape-aware** (`skipQuotedName`) | **not skipped** |
+| the function ARROW `=>` | a first-class token (`'='` + the `>` lookahead) | inexpressible — `sep` is one code point |
+| resume offset (`from`) | yes — a k-way split costs ONE pass | no — each split is its own full walk |
+| group CLOSER form | `tyGroupEndIndex` | none |
+
+`emit_base` **already imports from `typecheck`** (`tyGtIsClose`, `parenEnclosesWhole`, …), so the
+second home can BE the first one. Two homes for one grammar, differing in their quote policy, is the
+exact shape #1143 found fourteen times inside `typecheck.vl` and #1118/#1120 shipped separate
+repairs for — one module up, at a smaller multiplicity, but the same defect class and the same future
+cost: the next grammar extension has to be taught twice, and one of the two will be missed.
+
+**FIVE copies survive at `a4fb7c1`** (re-grepped; `tyGtIsClose` has 7 non-comment call sites, two of
+which are #1147's own home):
+
+| file:line | function | question | conversion |
+|---|---|---|---|
+| `emit_base.vl:1917` | `annArrowAt` | top-level `=>` | **`tyTopIndexOf(name, '=', 0, 0)`** — and note this one is *only* expressible in the typecheck home: #1147's `sep` is a single code point, so the arrow is why `emit_base` still hand-writes a ladder at all |
+| `emit_collect.vl:3757` | `nameIsSingleShape` | group close | `parenEnclosesWhole(name)` after the existing four-way prefix guard (exported since #1143; its "callers gate on `name[0] == '('`" caveat is satisfied by this function's `name[0] != '{'` reject) |
+| `emit_classify.vl:7604` | `shapeFieldParse` | top-level `,` **and** `:` | **deferred with a reason**: the loop carries a second question *and* strips spaces, so it is `tyTopIndexOf(',')` + `tyTopIndexOf(':')` + a `despace` helper — a real conversion, not a substitution, and it wants its own measurement, exactly as #1143 said |
+| `emit_classify.vl:10433` | `splitUnionArmsAllDepth` | top-level `\|` | **delete the function**, rewire its **four** call sites (now 10509, 10547, 11951, 11991) to `splitUnionAtoms`, which the file already imports |
+| `emit_classify.vl:10704` | `shapeInnerFieldSplit` | top-level `,` | **delete the function**; `emit_base` exports one. It was byte-identical at `4dadedd`; after #1147 rewrote `emit_base`'s onto `tyTopLevelSplit` the two have **diverged**, which makes the deletion more urgent, not less |
+
+**`splitUnionArmsAllDepth`'s name is a lie, and that is why it has survived at least three audits.**
+It splits at **depth 0**, not "all depth", and its body IS `splitUnionAtoms`'s with a `break` instead
+of a loop exit. Its only behavioural difference is that its `inStr` toggle is escape-BLIND where
+`skipQuotedName` is escape-aware — the copy is the strictly worse one. Its own header still claims
+`splitUnionAtoms` has a "brace/bracket-only depth", which stopped being true when that function moved
+onto `tyTopIndexOf`. **A stale comment plus a wrong name kept a duplicate alive; rename it or delete
+it, but do not file it as "deliberately different" again.**
+
+### The measurement — built, gated and counted at `4dadedd`, and it now stands as evidence for both halves
+
+Before the rebase this slice built the whole eleven-site conversion as a throwaway probe (never
+committed — those three files belong to three other agents this cycle). Six of the eleven have since
+been shipped independently by #1147, so this is now **a post-hoc measurement of a merged slice and a
+forecast for the five that remain**. It is reported because #1147's own PR reports no work count, and
+because #1144's rule — *a "no behaviour change" gate CANNOT see a work regression* — is unsatisfied
+without one.
+
+| leg (probe vs this branch's candidate, both at `4dadedd`) | result |
+|---|---|
+| corpus A/B | **1,328 entries, 0 differences** (build-rc + wasm hash + message + run-rc + stdout) |
+| suite | 2,046 / 0 / 8 — identical to the candidate |
+| `native-fixpoint.sh` | stage3 == stage4 byte-for-byte |
+| `lint-self.sh` + fmt | clean |
+| compiler binary | 1,032,354 → **1,028,430 B (−3,924)** |
+| source | **−250 lines** (49 insertions / 299 deletions across three files) |
+
+**The work count, on both sides of the home.** Three instrumented compilers, one shared counter (a
+*function* in `typecheck.vl` — a cross-module `export let` is not a shared counter), one tick per
+scanner loop iteration and one per scanner entry, reported per file and summed over the **1,148 of
+1,328 corpus files that reach emit**:
+
+| build | chars | calls |
+|---|---|---|
+| W1 unconverted, home instrumented only | 6,018,229 | 698,929 |
+| W2 **converted**, home instrumented | 14,714,257 | 1,475,640 |
+| W3 unconverted, home **and the eleven copies** instrumented | 15,475,420 | 1,470,602 |
+
+The eleven sites' own work is W3−W1 before and W2−W1 after:
+
+* **characters examined: 9,457,191 → 8,696,028 = −761,163 (−8.05%)**
+* **scanner calls: 771,673 → 776,711 = +5,038 (+0.65%)**
+* **per file: 606 better, 0 worse, 542 unchanged**
+* whole-grammar (home + copies, tree-wide): chars **−4.92%**, calls **+0.34%**
+
+**This is NOT #1144's work regression, and the reason is structural: none of these sites is a
+resolver with a cheap reject in front of it.** The home replaces the loop BODY at each site, it does
+not sit in front of one, so there is no early exit to lose. Three of the eleven get strictly
+*cheaper*: `nullablePartOf` scanned the whole name after finding its bar and now returns at it, and
+`annSplitParams`/`annSplitPipe` accumulated each atom **per code point** — the O(n²) copy-on-concat
+shape `splitUnionAtoms`'s own header warns about — and now take slices. **Both of those improvements
+are in the shipped #1147 too, so this table is the first published evidence that #1147 pays for
+itself rather than merely breaking even.**
+
+**⚠️ THE SCOREBOARD READS THE DEDUP AS A REGRESSION, AND THAT IS THE METRIC'S FAULT.** Measured with
+`parsercount.py` over both trees at `4dadedd`:
+
+| | CORE | OFF-LIST | TRUE |
+|---|---|---|---|
+| shipped (this PR) | 451 | 40 | 491 |
+| with the eleven conversions applied | **455 (+4)** | **30 (−10)** | **485 (−6)** |
+
+CORE rises by exactly four because `splitUnionArmsAllDepth`'s four call sites become calls to
+`splitUnionAtoms`, which **is** on the 23-resolver list, while the deleted duplicate never was.
+Folding an unnamed copy into a NAMED home inflates the named-subset count. This is the fourth
+instance of #1141's finding and the sharpest: **a slice that deletes two whole scanners and 250
+lines makes the headline number go UP.** Quote TRUE TOTAL, or quote both.
+
+**Behavioural note that belongs in the applying PR's body, not a footnote:** converting a site onto
+the *typecheck* home makes it skip a quoted literal member, which none of the copies did (and which
+`emit_base`'s new home still does not). A type name can contain a quoted `|`, `,` or `:`
+(`const v: "a|b" | null = "a|b"`). The probe's corpus and fuzz runs read 0 differences, so the
+population is empty in both channels — #1143 measured the same scanner class **dead** on both
+channels over eight shapes. Say "measured-dead", not "fixed".
+
+
+### Part 3 — `recordClonedNodeTy`: the handed-off figure does NOT reproduce
+
+Measured at this head, unit stated: **entries to `recordClonedNodeTy`, summed over the 1,148 corpus
+files that reach emit** (a counter in `typecheck.vl`, reported per file, `find tests/cases -name
+'*.vl'` as the denominator):
+
+* **`recordClonedNodeTy` = 1,554** (the hand-off said 1,545 — that part reproduces).
+* **`nameToTy` = 10,508** over the same population, so `recordClonedNodeTy`'s share is
+  **14.79%, not the 31.6% quoted.** The hand-off's percentage names no denominator and does not
+  reproduce against `nameToTy`'s total; the count does. **RE-MEASURE THE HAND-OFF, vindicated a
+  fourth time — and this time it is the RATIO that was wrong while the count was right.**
+* **1,430 of the 1,554 (92.0%) resolve** (`nameToTy >= 0`); the other 124 take the `=>sigkey`
+  `TyFunc` / `#anonN` `TyObj` placeholder arms.
+
+**And the move is not in this partition.** `recordClonedNodeTy` has exactly two callers,
+`emit_classify.synthTypeRef` (the funnel) and `emit_mono.vl:916`, and `synthTypeRef` has **33 call
+sites** — `emit_rewrite` 18, `emit_mono` 14, `emit_collect` 1 (grep count of non-comment
+`synthTypeRef(` occurrences less the definition; **that is a grep count, not a call count**). Not one
+of the 33 passes a `nodeTyName`/`tyToEmitName` expression *at the call*: the render happens one hop
+up, into a local (`ctx`, `pinned[pj]`, `retName`). So #1126's "the caller knows an arena INDEX" is
+true one hop away, and closing it means changing those 33 callers to carry the index — an
+`emit_rewrite`/`emit_mono` slice, not a `typecheck.vl` one. **Nothing speculative was exported for
+it.** The `typecheck.vl` half that WOULD unblock it is a three-line
+`recordNodeTyIx(destNode, tyIx)` beside the existing `recordNodeTyFrom(destNode, srcNode)`; it is
+not shipped here because an export with no importer is a claim, not a measurement.
+
+### Two more live defects found while diagnosing, NEITHER of them mine to fix
+
+Both are emitter-side; both are recorded with the cell tables that locate them, because the last two
+slices' experience is that an undiagnosed repro gets re-found rather than fixed.
+
+**(C) `is` over a LITUNION receiver emits a union-BOX tag compare against an i32 atom.** Verified on
+`4dadedd`:
+```vl
+type P = "x" | "y"
+const z: P = "x"
+if z is P { print(1) }        // -> failed to compile: wasm[0]::function[4]
+```
+The narrowed value is never even read. `wasm-tools print` gives the whole story in four
+instructions: `global.get 1` (the cell is `(mut i32)` — the interned atom id) then
+`struct.get 0 0 / i32.const 2 / i32.eq` — the value-union box's tag field read out of an i32.
+`emitIs` reaches its `armTag` path because `isArmTagOfTy` correctly answers "kind 2" for a litunion
+*arm* (that arm exists for a litunion inside a REAL box) and then `unionNameOfIdent(z)` says the
+RECEIVER is union-typed, because `P` is a registered union name. **The tag arm is right; the
+receiver classification is wrong.** Cells: global / local / param **all** invalid wasm for
+`z: P` + `is P`; for `z: P | null` + `is P` the global is invalid wasm while the **local and param
+silently produce NO OUTPUT — the guard const-folds FALSE.**
+
+**(D) `print` of a `K | null` niche prints NOTHING for a local/param and is invalid wasm for a
+global.** Verified on `4dadedd`:
+
+| program | master |
+|---|---|
+| `const e: "a" \| null = "a"; print(e)` | prints `a` |
+| `const e: "a" \| "b" \| null = "b"; print(e)` | **invalid wasm** |
+| `type P = "a"; const e: P \| null = "a"; print(e)` | **invalid wasm** (one member — so it is not arity) |
+| `function f(e: "a" \| "b" \| null) { print(e) }` | **rc=0, NO OUTPUT** |
+| `function g() { const e: "a" \| "b" \| null = "b"; print(e) }` | **rc=0, NO OUTPUT** |
+| `print(e == null)` / `print(e == "b")` | both correct |
+
+Mechanism located: `print`'s dispatch asks `exprString(arg)` **before** `exprIsLitAtom(arg)`
+(`wasmEmit.vl` ~7933 vs ~7948). For a niche/narrowed litunion the ident classifier claims `string`
+(the softened render), so the atom→member-string widening chain below it never runs and the raw i32
+atom is handed to the string path. **The gate order is the bug; `exprIsLitAtom` already answers
+correctly for the local case, which is why `if z != null { print(z) }` works for a local and not for
+a global.** This is the defect that made one line of a new fixture red on BOTH sides — it was
+removed from the pin with the reason stated in the file, because pinning it green would pin a defect.
+
+### Refutations
+
+1. **"The literal arm belongs in `retAtomKindOf` — it is the leaf classifier's own job."** Refuted by
+   one corpus entry. `retAtomKindOf` also feeds the NAME `valueUnionRetName` builds, and a litunion
+   ALIAS arm must stay un-softened there.
+2. **"`valueUnionRetName(pt) != ""` and `tyPrintsAsUnionBox(pt)` need OR-ing at the call."** Refuted
+   by construction: the second is a strict superset — with no `TyLit` leaf, softening and dedup are
+   both identities, because no two distinct scalar prims share a value-atom kind.
+3. **"A dedup on the atom KIND is fine."** Refuted: kind 7 backs `i32[]`, `boolean[]` and a litunion
+   array simultaneously, so a kind-wide dedup would fold `i32[] | boolean[]` into one atom. The
+   dedup is restricted to kinds 0-5 for exactly that reason.
+4. **"43,200 fuzz programs at 0 divergences means the change is fuzz-covered."** Refuted by SAB-A: a
+   class-leaving sabotage of the shipped arm reads **0** over 14,400 fuzz programs. The channel is
+   blind to this arm and saturated on its sibling.
+5. **"`splitUnionArmsAllDepth` is a deliberate paren-aware variant of `splitUnionAtoms`."** Refuted
+   by reading both: it splits at depth 0, its body is `splitUnionAtoms`'s, and its comment's
+   justification ("whose brace/bracket-only depth…") describes a `splitUnionAtoms` that stopped
+   existing when that function moved onto `tyTopIndexOf`. **The comment is stale, the name is wrong,
+   and together they have kept a duplicate alive across at least two audits.**
+6. **`recordClonedNodeTy` is 31.6% of `nameToTy`.** Refuted: **14.79%** over the corpus. The absolute
+   count (1,545 → measured 1,554) is the part that reproduced.
+7. **"A slice that deletes two scanners and 250 lines must move the scoreboard down."** Refuted: the
+   CORE number goes **UP by 4**.
+
+### Hand-off, best-measured first
+
+1. **MERGE THE TWO HOMES.** `emit_base.tyTopLevelIndexOf`/`tyTopLevelSplit` (#1147) and
+   `typecheck.tyTopIndexOf`/`tyGroupEndIndex` (#1143, exported by this PR) are the same grammar with
+   different capabilities, in two modules where the lower one already imports the upper. The merge
+   direction is forced by `annArrowAt`: only the typecheck home can express the two-code-point `=>`
+   token, which is why `emit_base` still hand-writes one ladder after #1147 took the other six. Do
+   it now, while there are two — this program's whole history says the count only goes up.
+2. **Apply the four remaining conversions** in the Part-2 table (`annArrowAt`,
+   `nameIsSingleShape`, and the two `emit_classify` deletions), and take `shapeFieldParse` as its own
+   measured slice. The equivalent work was built and gated at `4dadedd`: corpus-clean over 1,328
+   entries, suite-clean, fixpoint-clean, and **−8.05% characters at +0.65% calls with 0 files
+   worse**.
+3. **Defect (C)** — `emitIs`'s receiver classification. The fix is a litunion-receiver arm ahead of
+   the `armTag` path in `emitIs` (`wasmEmit.vl` ~1832): for a receiver whose own type is the
+   litunion, `is K` is `true` by construction; for a `K | null` receiver it is the `!= -1` sentinel
+   test the `!= null` narrow already emits. Owner: whoever holds `wasmEmit.vl`.
+4. **Defect (D)** — swap the `exprString` / `exprIsLitAtom` order in `print`'s dispatch (or make
+   `exprString` decline when `exprIsLitAtom` claims the node, which is the same fix stated so it
+   cannot regress the string path). Owner: whoever holds `wasmEmit.vl` + `emit_classify.vl`.
+   A local/param `print` that emits NOTHING is the worst failure mode in this file's list.
+5. **`recordClonedNodeTy`** — the 1,554 calls are real but the move is 33 caller changes in
+   `emit_rewrite`/`emit_mono`; the `typecheck.vl` side is a three-line `recordNodeTyIx`.
+6. **`shapeFieldParse`** — the one grammar copy left standing, with the reason (a second question and
+   a space strip in the same loop) and the shape of its conversion.
