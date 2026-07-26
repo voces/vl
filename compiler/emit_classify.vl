@@ -12381,97 +12381,44 @@ export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
     // (`tyArmPathIsMap` — a `TyMap` leaf) instead of re-resolving the rendered atom to
     // a struct/variant row and consulting its per-field lowering codes.
     const mems: i32[] = []
-    if unionArmTys(un, atoms, mems) {
-      let m = 0
-      while m < mems.length {
-        if atoms[m] != "null" {
-          if tyArmPathIsMap(mems[m], path) { return true }
-        }
-        m = m + 1
+    // D-ARMNAMELEG: the arena declining is answered CONSERVATIVELY, not by a second
+    // walk over the arms' rendered spellings — see `armPathArenaDeclined`.
+    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+    let m = 0
+    while m < mems.length {
+      if atoms[m] != "null" {
+        if tyArmPathIsMap(mems[m], path) { return true }
       }
-      return false
+      m = m + 1
     }
-    let ai = 0
-    while ai < atoms.length {
-      if atoms[ai] != "null" {
-        if unionArmPathIsMap(atoms[ai], path) { return true }
-      }
-      ai = ai + 1
-    }
+    return false
   }
   false
 }
 
-// THE ONE HOME of the union-ARM FIELD-PATH walk: follow field path `path` from union arm
-// `arm` through the arm's own field table, and answer whether the LEAF field is of the
-// kind `want` names.
+// THE ONE ANSWER for "the arena could not give me this union's member TYPES" at the five
+// frame-reservation guards below (`unionStructArmMapFieldMember`,
+// `unionStructArmMapListElemIndex`, `identRebindUnionArmClosureField`,
+// `calleeIsUnionArmClosureMember`, `calleeIsUnionArmCloArrayIndex`).
 //
-// The walk itself — resolve the arm through the struct table OR the variant table, take
-// the first hop from whichever holds it, require every MID hop to be a code-15
-// nested-struct field and follow its target, then test the LAST hop — was hand-written
-// FIVE times in this file, character for character, by `unionArmPathIsMap`,
-// `unionArmPathIsMapList`, `unionArmPathIsClosure`, `unionArmPathHasCloValue` and
-// `unionArmPathIsCloArray`. The five differed ONLY in the leaf test, which is one to five
-// lines out of twenty-seven; everything above it — the two-table first-hop dispatch, the
-// `-1` bail on an unresolvable arm, the code-15 mid-hop rule, and the `structIndexByName`
-// re-resolution of each nested target — was five copies of one rule, and the frame
-// pre-pass reservations that ride on it (`blockHasCallRef`, the mv map scratch) have to
-// agree about that rule or a narrowed read lands on an unreserved local.
+// It is `true`, and that is the ONLY sound answer — every one of those five guards
+// exists to RESERVE a frame slot the narrowing-blind pre-pass would otherwise miss, and
+// each one's own header states the asymmetry: **an over-reservation is a harmless spare
+// local; an under-reservation is invalid wasm.** So a guard that does not KNOW must say
+// yes.
 //
-// `want` names the leaf question, and putting the five side by side is the point — they
-// are a closed set of "what does this arm's field path bottom out in":
-//
-//   0 — a MAP field (code 19)
-//   1 — a LIST-OF-MAPS field (a code-5 reflist whose element name is a map)
-//   2 — a CLOSURE field (code 14, or the nullable-closure niche 22)
-//   3 — a closure VALUE: 2, or a union-BOX field (16) whose member set has a closure arm
-//   4 — a CLOSURE-ELEMENT array (a code-5 reflist whose element name is a function type)
-//
-// Arms 2 and 3 differ by exactly the code-16 line, and arms 1 and 4 by exactly which
-// question the code-5 element is asked — two facts that were invisible while the five
-// walks sat 200 lines apart.
-function unionArmPathLeafIs(arm: string, path: string[], want: i32): boolean {
-  // (code, elem) of the first hop, from whichever table holds the arm.
-  let hop = 0
-  let curSi = structIndexByName(arm)
-  const vi0 = variantIndexOf(arm)
-  while hop < path.length {
-    let code = -1
-    let elem = ""
-    if hop == 0 && curSi < 0 && vi0 >= 0 {
-      const vfi = variantFieldIndex(vi0, path[0])
-      if vfi < 0 { return false }
-      code = variantFieldTypeAt(vi0, vfi)
-      elem = variantFieldElemName(vi0, vfi)
-    } else {
-      if curSi < 0 { return false }
-      const fi = sFieldIndex(curSi, path[hop])
-      if fi < 0 { return false }
-      code = sFieldTypeAt(curSi, fi)
-      elem = sFieldElemNameAt(curSi, fi)
-    }
-    if hop == path.length - 1 {
-      if want == 0 { return code == 19 }
-      if want == 1 { return code == 5 && nameIsMap(elem) }
-      if want == 2 { return code == 14 || code == 22 }
-      if want == 3 {
-        if code == 14 || code == 22 { return true }
-        if code == 16 { return unionHasClosureArm(elem) }
-        return false
-      }
-      return code == 5 && annArrowAt(peelGroupParens(elem)) >= 0
-    }
-    if code != 15 { return false }
-    curSi = structIndexByName(elem)
-    hop = hop + 1
-  }
-  false
-}
-
-// Walk field path `path` from union arm `arm`, leafing at a MAP field (code 19).
-function unionArmPathIsMap(arm: string, path: string[]): boolean {
-  unionArmPathLeafIs(arm, path, 0)
-}
+// What stood here before was a 27-line hand-written walk over the arms' rendered
+// SPELLINGS (`unionArmPathLeafIs` + five `want`-selected leaf tests), re-resolving each
+// atom through the struct table or the variant table and re-reading per-field lowering
+// codes — a second, string-keyed implementation of the walk `tyArmPath*` performs
+// structurally three lines above. It could answer FALSE, which is the unsound direction,
+// and it was never reached: the arena leg covered the row at **175 of 175** reaches of
+// these five guards — 39 over 1,340 corpus entries and 136 over 33,600 fuzz programs —
+// so the fall-through ran zero times on either channel (probe PD; the same counter reads
+// 161 under a build that forces the decline, so the 0 is a measurement, not a blind
+// instrument). Deleting it removes the grammar and moves the unknown case from "guess,
+// possibly wrong, by re-parsing a rendering" to "reserve".
+function armPathArenaDeclined(): boolean { true }
 
 // True if `exprIx` is an INDEX (`t0.f[0]`) whose receiver is a member chain rooted at an
 // IDENT declared as a union, whose field path walks — narrowing-blindly, the
@@ -12531,42 +12478,21 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
     // `TyMap` leaf), and so is the indexed-root hop: `tyArmElem` takes a `TyArray` arm's
     // element in place of `nameIsRefArray` + `refArrElemName` on the rendered atom.
     const mems: i32[] = []
-    if unionArmTys(un, atoms, mems) {
-      let m = 0
-      while m < mems.length {
-        if atoms[m] != "null" {
-          let mem = mems[m]
-          if viaElem { mem = tyArmElem(mem) }
-          if tyArmPathIsMapList(mem, path) { return true }
-        }
-        m = m + 1
+    // D-ARMNAMELEG: the arena declining is answered CONSERVATIVELY, not by a second
+    // walk over the arms' rendered spellings — see `armPathArenaDeclined`.
+    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+    let mi = 0
+    while mi < mems.length {
+      if atoms[mi] != "null" {
+        let mem = mems[mi]
+        if viaElem { mem = tyArmElem(mem) }
+        if tyArmPathIsMapList(mem, path) { return true }
       }
-      return false
+      mi = mi + 1
     }
-    let ai = 0
-    while ai < atoms.length {
-      if atoms[ai] != "null" {
-        let arm = atoms[ai]
-        if viaElem {
-          // The indexed-root form walks from the REF-ARRAY arm's element struct.
-          // `refArrElemNameIf` IS this guarded pair, verbatim (its else-branch "" is
-          // the same "" this line assigned).
-          arm = refArrElemNameIf(arm)
-        }
-        if arm != "" {
-          if unionArmPathIsMapList(arm, path) { return true }
-        }
-      }
-      ai = ai + 1
-    }
+    return false
   }
   false
-}
-
-// Walk field path `path` from union arm `arm`, leafing at a LIST-OF-MAPS field: a code-5
-// reflist field whose element type-name is a map.
-function unionArmPathIsMapList(arm: string, path: string[]): boolean {
-  unionArmPathLeafIs(arm, path, 1)
 }
 
 // True if the union member-set `name` has a CLOSURE-ARRAY arm (`(() => f64)[]`). `p[0]()` on
@@ -12811,31 +12737,19 @@ function identRebindUnionArmClosureField(
     // D-UNION: the arm walk is structural (`tyArmPathHasCloValue` — a `TyFunc` leaf,
     // bare / nullable, or a `TyUnion` with a `TyFunc` member).
     const mems: i32[] = []
-    if unionArmTys(un, atoms, mems) {
-      let m = 0
-      while m < mems.length {
-        if atoms[m] != "null" {
-          if tyArmPathHasCloValue(mems[m], path) { return true }
-        }
-        m = m + 1
+    // D-ARMNAMELEG: the arena declining is answered CONSERVATIVELY, not by a second
+    // walk over the arms' rendered spellings — see `armPathArenaDeclined`.
+    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+    let m = 0
+    while m < mems.length {
+      if atoms[m] != "null" {
+        if tyArmPathHasCloValue(mems[m], path) { return true }
       }
-      return false
+      m = m + 1
     }
-    let ai = 0
-    while ai < atoms.length {
-      if atoms[ai] != "null" {
-        if unionArmPathHasCloValue(atoms[ai], path) { return true }
-      }
-      ai = ai + 1
-    }
+    return false
   }
   false
-}
-
-// Walk field path `path` from union arm `arm`, leafing at a closure field (14/22) OR a
-// union-BOX field (16) whose member set has a closure arm.
-function unionArmPathHasCloValue(arm: string, path: string[]): boolean {
-  unionArmPathLeafIs(arm, path, 3)
 }
 
 // True if `exprIx` is a member CHAIN (`t0.f.f`) rooted at an IDENT declared as a union,
@@ -12885,23 +12799,17 @@ export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
     // D-UNION: the arm walk is structural (`tyArmPathIsClosure` — a `TyFunc` leaf, bare
     // or under the nullable-closure niche's `TyNullable`).
     const mems: i32[] = []
-    if unionArmTys(un, atoms, mems) {
-      let m = 0
-      while m < mems.length {
-        if atoms[m] != "null" {
-          if tyArmPathIsClosure(mems[m], path) { return true }
-        }
-        m = m + 1
+    // D-ARMNAMELEG: the arena declining is answered CONSERVATIVELY, not by a second
+    // walk over the arms' rendered spellings — see `armPathArenaDeclined`.
+    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+    let m = 0
+    while m < mems.length {
+      if atoms[m] != "null" {
+        if tyArmPathIsClosure(mems[m], path) { return true }
       }
-      return false
+      m = m + 1
     }
-    let ai = 0
-    while ai < atoms.length {
-      if atoms[ai] != "null" {
-        if unionArmPathIsClosure(atoms[ai], path) { return true }
-      }
-      ai = ai + 1
-    }
+    return false
   }
   false
 }
@@ -12953,38 +12861,20 @@ export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
       // D-UNION: the arm walk is structural (`tyArmPathIsCloArray` — a `TyArray` over a
       // `TyFunc` leaf).
       const mems: i32[] = []
-      if unionArmTys(un, atoms, mems) {
-        let m = 0
-        while m < mems.length {
-          if atoms[m] != "null" {
-            if tyArmPathIsCloArray(mems[m], path) { return true }
-          }
-          m = m + 1
+      // D-ARMNAMELEG: the arena declining is answered CONSERVATIVELY, not by a second
+      // walk over the arms' rendered spellings — see `armPathArenaDeclined`.
+      if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+      let mi = 0
+      while mi < mems.length {
+        if atoms[mi] != "null" {
+          if tyArmPathIsCloArray(mems[mi], path) { return true }
         }
-        return false
+        mi = mi + 1
       }
-      let ai = 0
-      while ai < atoms.length {
-        if atoms[ai] != "null" {
-          if unionArmPathIsCloArray(atoms[ai], path) { return true }
-        }
-        ai = ai + 1
-      }
+      return false
     }
   }
   false
-}
-
-// Walk field path `path` from union arm `arm`, leafing at a CLOSURE-ELEMENT ARRAY field: a
-// code-5 reflist field whose element name is a function type (`f: ((i32) => K0)[]`).
-function unionArmPathIsCloArray(arm: string, path: string[]): boolean {
-  unionArmPathLeafIs(arm, path, 4)
-}
-
-// Walk field path `path` from union arm `arm`, leafing at a CLOSURE field (14, or the
-// nullable-closure niche 22).
-function unionArmPathIsClosure(arm: string, path: string[]): boolean {
-  unionArmPathLeafIs(arm, path, 2)
 }
 
 // The recorded member TYPES of a member-SET spelling, for the four ref-array ARM
@@ -15437,7 +15327,7 @@ function tyArmElem(m: i32): i32 {
   -1
 }
 
-// `unionArmPathIsMap`'s leaf: a MAP field (code 19). NOT nullable-peeled — a
+// `tyArmPathIsMap`'s leaf: a MAP field (code 19). NOT nullable-peeled — a
 // `{[string]: V} | null` field is code 29, which the code walk does not accept.
 export function tyArmPathIsMap(m: i32, path: string[]): boolean {
   const leaf = tyArmPathLeaf(m, path)
@@ -15447,7 +15337,7 @@ export function tyArmPathIsMap(m: i32, path: string[]): boolean {
   false
 }
 
-// `unionArmPathIsMapList`'s leaf: a LIST-OF-MAPS field (code 5 whose element renders as
+// `tyArmPathIsMapList`'s leaf: a LIST-OF-MAPS field (code 5 whose element renders as
 // a map) — a `TyArray` over a `TyMap`.
 export function tyArmPathIsMapList(m: i32, path: string[]): boolean {
   const leaf = tyArmPathLeaf(m, path)
@@ -15460,7 +15350,7 @@ export function tyArmPathIsMapList(m: i32, path: string[]): boolean {
   false
 }
 
-// `unionArmPathIsClosure`'s leaf: a closure field (code 14) or its nullable niche
+// `tyArmPathIsClosure`'s leaf: a closure field (code 14) or its nullable niche
 // (code 22) — a `TyFunc`, bare or under one `TyNullable`.
 export function tyArmPathIsClosure(m: i32, path: string[]): boolean {
   const leaf = tyArmPathLeaf(m, path)
@@ -15472,7 +15362,7 @@ export function tyArmPathIsClosure(m: i32, path: string[]): boolean {
   false
 }
 
-// `unionArmPathIsCloArray`'s leaf: a CLOSURE-ELEMENT array field (code 5 whose element
+// `tyArmPathIsCloArray`'s leaf: a CLOSURE-ELEMENT array field (code 5 whose element
 // name carries a top-level arrow) — a `TyArray` over a `TyFunc`. A nullable-closure
 // element is a `TyNullable`, excluded here exactly as the arrow scan excludes it (the
 // arrow sits under the element's own parens, never at depth 0).
@@ -15487,7 +15377,7 @@ export function tyArmPathIsCloArray(m: i32, path: string[]): boolean {
   false
 }
 
-// `unionArmPathHasCloValue`'s leaf: a closure field (14/22) OR a union-BOX field (16)
+// `tyArmPathHasCloValue`'s leaf: a closure field (14/22) OR a union-BOX field (16)
 // whose member set has a bare-closure arm — a `TyFunc`, or a `TyUnion` with a `TyFunc`
 // member. Both are nullable-peeled: an `((i32) => i32) | null` field is code 22, and a
 // `(A | B) | null` box field keeps its `null` atom in the member set the code walk
