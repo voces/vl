@@ -14602,11 +14602,12 @@ ARGUMENT**: `gaeSplitArgs` splits the argument list on `,` with the quote-blind 
 `"a,b" | "c" | null` becomes two garbage arguments and the instantiation is built from rubble. A
 `|` or a `:` inside the quotes is inert because that home splits only on `,` there.
 
-Nine further witness shapes (a struct field, a param, an array element, a map value, a closure
-return, a two-field struct, each with a quoted `,` or `|`) read **identical on both sides** — so the
-divergence is narrow, and the eight-shape and corpus-scale zeros that preceded it were not wrong,
-they were **under-sampled at the generic-application position**. *"No witness exists" must name where
-it searched* — this is the second time that rule has paid this arc.
+**TEN further hand-built shapes read identical on both sides** — a struct field, a param, an array
+element, a map value, a closure return and a two-field struct, each carrying a quoted `,` or `|`
+(eight of them compared candidate-vs-merged), plus the `Box<"a|b"|…>` and `Box<"a:b"|…>` controls
+(compared master-vs-merged). So the divergence is narrow, and the eight-shape and corpus-scale zeros
+that preceded it were not wrong — they were **under-sampled at the generic-application position**.
+*"No witness exists" must name where it searched* — the second time that rule has paid this arc.
 
 **The fixture is NOT shipped here, deliberately.** It is red on master and would stay red until the
 `emit_base.vl` merge lands, and pinning the current behaviour green would pin a defect. The fixture
@@ -14687,9 +14688,14 @@ with the arithmetic, and nothing speculative exported** — `tyLitMemberTexts` /
      The clean fix is one scratch i32 local (`local.tee`), which needs the per-function frame
      reservation that `emitAtomToStr` already has for the str-op slots — an `emit_classify` +
      `wasmEmit` pair, not a `wasmEmit` one-liner;
-   * **8 are receivers the emitter does not rep as atoms at all** (an inline `"x"|"y"` field/param
-     reps as a STRING, so `exprIsLitAtom` correctly declines) — those answer `is` WRONGLY today by a
-     different mechanism, and want their own slice.
+   * **8 are SINGLE-member tests where the new arm never fires at all** — with one tested member the
+     Ident restriction is lifted, so the only way to still get master's answer is that the arm's own
+     gate declined: either `exprIsLitAtom(receiver)` or `tyLitMemberTexts(tested)` came back empty.
+     (That is a deduction from the observed answer, not a probe reading — I did not instrument which
+     of the two.) Two sub-shapes are visible in the table: an inline `"x" | "y"` field/param, which
+     the emitter reps as a STRING, so `exprIsLitAtom` is *right* to decline and the wrong `is` answer
+     there is a separate string-rep defect; and a `s.f` / `m[k]` read of a `K | null` field, where
+     `exprNulLitUnion`'s Member/Index arms do not claim the node. Both gates are `emit_classify.vl`.
 3. **`print(m[k])` over a litunion-valued map now REJECTS; the NARROWED spelling still does not
    work.** `const t = m["k"]; if t != null { print(t) }` fails on **both** sides with
    `emitProgram: bare null needs a struct-typed context` — a pre-existing map-read narrowing gap,
