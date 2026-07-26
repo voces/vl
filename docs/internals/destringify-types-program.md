@@ -7549,3 +7549,345 @@ a node.**
     no widening. Reporting "inert, so no pin can exist" (#1114/#1119/#1123's honest form) was
     available and would have been wrong here: the pin did not exist, but it was five lines away.
     Try to WRITE the pin before recording that none can be had.
+## D-ASCANON + D-RECRENDER — the `as` target joins the emitter's vocabulary, the renderer stops looping, and the checker's tree is measured TOTAL and FRESH (#1129)
+
+Branched at `fd411bd`, rebased onto `0d25eaa` (D-CYCTY #1127 + D-ATOMKIND #1128 landed
+underneath). **Every reproduction, pin and gate below is stated against `0d25eaa`**; where a
+measurement was taken at an earlier base it says so.
+
+D-CYCTY landed a `collectU` guard that REJECTS a recursive GENERIC alias with a named emit
+error, and its own summary says it "does not protect a future `tyToEmitName` consumer". That is
+confirmed here from the other direction: **both of this slice's recursion legs still trap the
+compiler on `0d25eaa`** — they reach `tyToEmitName` through `canonEmitName`'s `&`-fold and
+through `unionMemberGenAppShape`, neither of which sits behind that guard, and neither of which
+is a recursive generic INSTANCE (the recursion is in a plain declared struct).
+
+The brief: (1) fix the live `x as <non-i32 alias>` invalid-wasm miscompile #1126 handed off;
+(2) fix or bound `tyToEmitName`'s non-termination on a recursive type, filed as latent;
+(3) retire `nameToTy`, the checker's second recursive-descent type parser, whose stated
+prerequisite was that the canon pass makes the parser's spelling tree stale.
+
+**Two of the three reports are corrected by measurement.** Target 2 is not latent — two
+single-file, well-typed programs make the compiler die today. And target 3's mandatory
+prerequisite does not apply to the consumers that matter for `nameToTy`: at the checker's own
+positioned resolver funnels the tree is **100% present and 0% stale over 333,073 reads**,
+because the canon pass runs *after* checking.
+
+### TARGET 1 — `x as <alias>`, and why the handed-off diff is not the one that ships
+
+Reproduced on `fd411bd` and re-verified on each rebase parent, last on `0d25eaa` (each run against a
+parent-built compiler with `--compiler`):
+
+| program | master |
+|---|---|
+| `type W = f64` · `const x = 5 as W` · `print(x)` | `type mismatch: expected f64, found i32` |
+| `type W = i64` · … | `type mismatch: expected i64, found i32` |
+| `type W = f32` · … | `type mismatch: expected i32, found f32` |
+| `type W = i32` · … | runs (no conversion needed) |
+
+Mechanism, and it is wider than the hand-off said. **Four** emit consumers read `AsExpr.asTy`
+as a STRING and compare it to the four primitive spellings — `emitAsCast` (`wasmEmit.vl`,
+`tgt == "f64"` / `"i64"` / `"f32"`, else the i32 arm), `exprIsI64` / `exprIsF32` / `exprIsF64`
+(`emit_classify.vl:5776, 5938, 6048`, `e.asTy == "i64"` …), and the value-type feature scan in
+`emitProgram` (`emit_sections.vl:2077-2079`, `strContains(pn.asTy, "i64")`). `canonEmitName`
+resolves an alias; `canonEmitTypeNames` swept `TypeRef`, `UnionDecl` and `IsExpr` and **never
+`AsExpr`**. One missing arm, four broken consumers.
+
+**The handed-off diff was `n.asTy = canonEmitName(n.asTy)`. What ships reads the arena
+instead**, and the difference is a parse:
+
+```vl
+    } else if n is AsExpr {
+      const at = primNameOf(nodeTyIxOf(i))
+      if at == "i32" || at == "i64" || at == "f32" || at == "f64" {
+        if at != n.asTy { n.asTy = at }
+      }
+    }
+```
+
+`checkNode` banks the cast's checked type on the node (`nodeTyIx[ix] = checkCastNode(n, ix)`),
+and `checkCastNode` admits the cast **only** when the target RESOLVES to one of
+i32/i64/f32/f64 (`primNameOf(nameToTyAt(n.asTy, ix))`). So the primitive name read straight off
+the typed-IR **is** the emitter's vocabulary here — total by the checker's own admission rule,
+and incapable of disagreeing with the checker. `canonEmitName`, by contrast, is a string
+rewriter whose arms call `nameHasPipe`, `splitTypeName`, `isTopLevelFuncTypeName`, `nameHasSep`
+and `nameToTy`: routing a new consumer through it would have added a parse to a family this
+program is retiring. The four-way gate repeats `checkCastNode`'s rule so a REJECTED cast keeps
+the author's spelling for the diagnostic that already quotes it.
+
+Pins (both FAIL on the parent, verified by running each against a `0d25eaa`-built compiler):
+
+- `tests/cases/numerics/as-cast-alias-target.vl` — the alias mirror of `as-cast-values.vl`:
+  the same 4×4 runtime matrix through `type I32/I64/F32/F64`, every expected line identical to
+  the primitive spelling's, plus three CHAINED aliases (`Wide` → `I64` → i64). Parent:
+  `type mismatch: expected i64, found i32`.
+- `tests/cases/modules/as-cast-alias-nonI32/` — the module leg. The two pre-existing module
+  `as`-cast pins (#1126) both alias **i32**, the one target needing no conversion, so they run
+  even when the emitter mistakes the alias for i32. With `f64`/`i64` the same mistake emits
+  invalid wasm. Parent: `type mismatch: expected f64, found i32` in `half$m1`.
+
+Sixteen further shapes were checked by hand and all now match their primitive spelling exactly:
+`as <alias>` inside an inferred-return function, a lambda, a generic call, a `.map` callback, a
+call argument, an array literal, a struct-field initialiser, and an arithmetic operand.
+
+### TARGET 2 — REFUTED: `tyToEmitName`'s non-termination is not latent, and it is pinnable
+
+The hand-off filed it as reachable only by a probe ("the compiler does not hit this today
+because nothing renders those annotations"). **Two single-file, well-typed programs make the
+COMPILER ITSELF die on the parent**, through two different callers:
+
+```vl
+type Node = { v: i32, next: Node | null }
+const n: Node & { v: i32 } = { v: 1, next: null }   // canonEmitName's `&`-fold arm
+```
+```vl
+type Node = { v: i32, next: Node | null }
+type Box<T> = { b: T }
+type U = Box<Node> | { w: i32 }                     // unionMemberGenAppShape
+```
+
+Both: `wasm trap: call stack exhausted`, a wasm backtrace and no diagnostic. A recursive type
+is a CYCLE in the arena and `tyToEmitName` renders structurally — every arm recurses into the
+field / element / member / result types, so the render of a cycle is an infinite string.
+
+The scale is worth stating plainly: with the pin file in the tree, `vl check tests/cases` on
+the parent **dies on the whole directory** (one wasm trap takes the shared instance down); the
+shipped build reports `Found 204 errors, 119 warnings.`
+
+Fixed with `isEquatable`'s guard, moved to the renderer: `tyToEmitName` becomes a wrapper
+holding an ANCESTOR stack, the 15-arm body becomes `tyToEmitNameGo`, and a type already on the
+stack renders `""` — which is what every caller already does with an unrenderable type. Nothing
+is lost: the recursive shapes the emitter *does* lower ride their NOMINAL annotation spelling
+(`Node`), never a structural render. Both programs now compile and run.
+
+**Ancestors, not "seen".** The stack is pushed and popped around the recursive entry, so a
+shape mentioning one struct TWICE as siblings (`type Pair = {a: S, b: S}`) still renders both.
+The pin carries that as its third leg, so a future "remember every index visited" simplification
+reddens.
+
+Pin: `tests/cases/types/recursive-type-emit-render-cycle.vl` (all three legs in one file).
+Parent: `wasm trap: call stack exhausted`.
+
+### TARGET 3 — REFUTED: the canon-staleness prerequisite does not gate the CHECKER's consumers
+
+The brief made prerequisite 1 mandatory *before reading the tree at all*: `canonEmitTypeNames`
+rewrites `n.tyName` in place without updating `annTsRoot`, so downstream the tree describes the
+pre-canon name.
+
+That is true, and it is an EMIT-time fact. `canonEmitTypeNames` runs at the END of
+`checkProgram`. Every `nameToTy` / `resolveAnnot` call the CHECKER makes has already happened.
+
+Measured, not reasoned. A probe inside the two positioned resolver funnels — `nameToTyAt` and
+`resolveAnnotAt`, which between them carry 8 of the call sites and receive the annotation NODE
+— comparing `tsToName(annTsOf(node))` against the string the checker is about to parse, plus a
+post-canon sweep of every `TypeRef`, reported as a checker diagnostic at the end of
+`checkProgram` (method note 17):
+
+Measured at the `fd411bd` base (the probe builds predate the rebases; the two funnels, the
+canon pass and the bank are byte-identical across all three parents — #1127 touches only
+`emit_collect.vl` and #1128 only `wasmEmit`/`emit_rep`/`emit_state`/`emit_rewrite`):
+
+| | corpus (1,279 files) | fuzz (50,400 programs) |
+|---|---|---|
+| reads at the two funnels | **146,048** | **187,025** |
+| tree present AND renders the exact string | **146,048** | **187,025** |
+| **STALE** (tree renders a different name) | **0** | **0** |
+| **MISSING** (`TypeRef` with no tree) | **0** | **0** |
+| — | | |
+| `TypeRef` nodes swept AFTER canon | 59,193 | 97,473 |
+| STALE after canon | **124** (59 files) | **979** |
+| missing after canon | 0 | 0 |
+
+**333,073 checker-time reads, 0 stale, 0 missing, on both channels.** The tree is TOTAL and
+FRESH for exactly the population `nameToTy` serves. The staleness is real and lands entirely on
+the far side of the pass that causes it.
+
+Two counting notes. (a) The `at` argument is a diagnostic POSITION node, and for a struct FIELD
+that is the `FieldDef`, not its `TypeRef` child; before following that one hop, 3,851 corpus
+reads landed on a node with no row — a probe artifact, not a coverage hole, and worth recording
+because it looks exactly like one. (b) The post-canon figure re-derived at this head is
+**124 / 59 files**, not the 111 / 46 inherited from #1126 — a different sweep point (end of
+CHECK, so files that never reach emit are included) and two more pin files.
+
+**Sabotage.** The probe's 0 is only worth what its wire is worth. A build whose `pbNote` reads
+`annTsOf(at - 1)` — a one-node shift, the off-by-one class, not an injective relabel —
+reclassifies **142,089 of the same 146,048 corpus reads** (97.3%): fresh 146,048 → 3,959, stale
+0 → 452, no-tree 0 → 141,582. (The 3,959 survivors are neighbouring annotations that genuinely
+carry the same spelling — `i32` beside `i32` — which is what an off-by-one on a dense column
+looks like.) #1117's VALUE sabotage on the same bank (the parser stops recording `[]`) is the
+upstream evidence that the bank itself is sensitive.
+
+**What this changes for the next slice.** `tsToTy` — the structural dual of `nameToTy`, arm for
+arm, which #1117 built as a probe and did not ship — is the whole remaining cost of the
+checker-side migration. It does not need the canon fixed first, and it does not need a string
+fall-through: at every checker-time consumer the column is total TODAY. The canon problem is
+real and stays owned by the EMIT-time consumers (`emit_rep.vl`'s 7 `resolveAnnot` calls and
+everything downstream of `TypeRef.tyName` after the sweep), which is where P4 belongs.
+
+**Corrections to the brief's enumeration, counted at this head** (`grep -Hn`, `//` stripped by
+a string-literal-aware scanner, definition headers excluded, per-file sums cross-checked
+against the tree-wide total):
+
+| resolver | brief | this head | where |
+|---|---|---|---|
+| `nameToTy` | 27 | **28** | typecheck 28 |
+| `nameToTyAt` | 4 | 4 | typecheck 4 |
+| `resolveAnnot` | 3 | **8** | typecheck 1 · **`emit_rep.vl` 7** |
+| `resolveAnnotAt` | 4 | 4 | typecheck 4 |
+| `tyGtIsClose` | 14 | 14 in typecheck, **33 tree-wide** | +emit_base 8 · emit_classify 8 · emit_collect 3 |
+| `skipQuotedName` / `splitTypeName` / `topLevelArrowIndex` / `nameHasSep`+`nameHasPipe` / `splitGenArgs` / `splitTopAmp` | 10 / 6 / 3 / 8 / 2 / 1 | 10 / 6 / 3 / 8 / 2 / 1 | typecheck |
+
+`resolveAnnot` is the one that matters: **7 of its 8 call sites are in `emit_rep.vl`**, another
+partition and the far side of the canon pass. A typecheck-only migration reaches 1 of 8.
+
+### `holeDemandTy`'s dedup key — migrated, and measured DEAD
+
+`holeDemandTy` (`typecheck.vl:7240`) deduplicated its alternative arms on `tyToStr(m)` —
+render-equality standing in for type identity, this program's own discredited proxy — while its
+SIBLING (`noteHoleAlt` / `holeAltIndex`, 7080 / 7103) already dedups the same alternatives with
+`tyEq`. Two ways the render key is not the question: `tyToStr` TRUNCATES at depth 8 (`…`), so
+two arms differing only below it collapse into one; and it prints `Nullable(TyFunc)` and
+`TyFunc(→ Nullable)` alike. Migrated to `tyEq` (`tyArrHasEq`), which decides render-equality
+structurally with a cycle guard. `strArrHas` had no other caller and is deleted.
+
+**Stated plainly: no pin can exist for this one, and here is the measurement.** A build whose
+`tyArrHasEq` always returns `false` (dedup removed) is message-identical over the shared-instance
+`vl check tests/cases` channel, and six hand-written duplicate-arm programs are identical on
+parent, ship and sabotage. A reach probe explains why:
+
+| | calls | TRUE returns |
+|---|---|---|
+| corpus, 1,279 files | **6** (all in `soundness/hole-is-guard-alternative-reject.vl`) | **0** |
+| fuzz, 50,400 programs | **0** | **0** |
+
+The dedup never fires, because `noteHoleAlt` already dedups upstream with `tyEq` and no
+duplicate alternative ever reaches this list. It ships anyway: it removes two render-equality
+resolutions from the standing check's first grep and the last string-keyed membership test in
+the file, and if it ever DOES fire the truncating key would be the wrong answer.
+
+### The call arithmetic
+
+**0 parses deleted · 0 laddered · 0 added · NET 0. 2 render-equality resolutions DELETED.**
+Counting method as stated above; the parser list is the SCORECARD CORRECTION's plus #1117's
+four additions.
+
+| | parent `0d25eaa` | now |
+|---|---|---|
+| the 23-parser list, tree-wide | **530** | **530** |
+| `nameToTy` / `nameToTyAt` / `resolveAnnot` / `resolveAnnotAt` | 28 / 4 / 8 / 4 | 28 / 4 / 8 / 4 |
+| `tyToStr` (renderer) | 146 | **144** |
+| `tyEq` | 13 | 14 |
+| `strArrHas` | 1 def + 2 calls | **deleted** |
+| `primNameOf` (an ARENA read) | 17 | 18 |
+
+The `AsExpr` arm is the point: it is a new emit-vocabulary consumer that costs **zero** parses,
+because it reads `nodeTyIx`. The handed-off `canonEmitName` version would have added one.
+
+### Allocation and work (method note 24)
+
+`tyToEmitName`'s guard adds one `i32` push + pop on ONE module-level array per invocation, and
+an O(current-depth) ancestor scan. The array oscillates between empty and the render's depth,
+so its capacity stabilises immediately and it is empty on entry and exit of every top-level
+call (which is also why it is not an arena-lifetime sidecar, method note 7). The `AsExpr` arm
+adds one `nodeTyIxOf` + `primNameOf` per `AsExpr` node — 31 in the whole corpus, **0** in the
+compiler's own 16-module build. `holeDemandTy` loses one `string[]` and every `tyToStr` render
+it used to build.
+
+Binary, like-for-like (ONE compiler, two sources): 1,033,945 → **1,034,041** bytes (**+96**). Self-compile of ONE fixed
+input (the pinned parent snapshot), 3 runs each, at the `fd411bd` base: parent 1604 / 1725 / 1879 ms, ship
+1790 / 1636 / 1687 ms — indistinguishable, and stated as the wall-clock sanity check it is
+rather than a measurement (method note 15).
+
+### Gate
+
+Corpus **byte-, message- AND run-diff**, **1,350 entries** (`tests/cases` + a pinned parent
+snapshot of `compiler/` + `std/` + `scripts/*.vl`, plus every `tests/cases/modules` directory
+built as a unit; compiler stdout/stderr with the out-path normalised, exit codes compared, run
+output + exit code compared): **5 byte-diffs, 5 message-diffs, 5 run-diffs — all 5 are the
+three new pins** (the module pin counted as its directory, as `entry.vl` and as `lib.vl`).
+**0 diffs of any kind on all 1,345 pre-existing entries.**
+
+Shared-INSTANCE channel (note 32), with the three new pins moved aside so the comparison is
+over the pre-existing corpus: `vl check tests/cases` is `Found 204 errors, 119 warnings` on
+both sides, **0 diff lines**; `vl check compiler` and `vl check std` are byte-identical.
+With the recursion pin left IN, master's run dies with `wasm trap: call stack exhausted` and
+produces no summary at all — the target-2 pin, on the shared-instance channel.
+
+Fuzz A/B **50,400 programs/side** (14 seeds × depths 4/5/6 × {plain, `--branching --multiobs
+--declared`} × 300, generated ONCE by the PARENT compiler so both sides see identical
+programs), whole `--out-dir` TREES via `diff -r`, **52,703** output files/side: **0 differing
+paths** (`diff -r` RC=0, 0 output lines).
+
+`refresh-compiler.sh` RC=0 (1,034,041 bytes) · `rep-fuzz-check.sh` RC=0 (exact; 1 baselined
+failure — 0 unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=0 (stage3 == stage4,
+1,034,041 bytes) · `lint-self.sh` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test` RC=0
+(**2,004 passed, 0 failed, 8 ignored** — 2,001 with the three pin entries moved aside,
+measured in this worktree, + 3).
+
+### What did NOT move, and the mechanism
+
+- **`nameToTy` — 0 of 28 sites.** The missing piece is `tsToTy`, and it is the ONLY missing
+  piece for the checker half: #1117 built it as a probe (0 structural disagreement over
+  319,945 comparisons) and shipped the BANK without it. This slice's contribution is that the
+  gating question — "is the tree usable before the canon problem is solved?" — is now answered
+  YES for the checker, with 333,073 reads on two channels behind it. Writing `tsToTy` is a
+  ~150-line structural dual of a 315-line character-surgery function; it was not attempted
+  here rather than attempted unproven.
+- **`canonEmitName`'s own parsing.** It splits, peels parens, finds top-level arrows and folds
+  intersections over the STRING — and it runs DURING the canon pass, so its inputs are the
+  pre-canon spellings the tree describes exactly. It is the natural next consumer after
+  `tsToTy` exists, and a structural `canonEmitTs` is also what P4 needs to rewrite the tree in
+  lockstep. Not attempted: it is the same missing dual.
+- **`tyToEmitName`'s callers still receive a rendered NAME.** The cycle guard makes the
+  renderer total; it does not make the arc `arena → tyToEmitName → parse` go away. That is
+  #1126's method note 51 and it is unchanged.
+
+### Hand-offs
+
+**Hand-off 1 — `emit_rep.vl`'s 7 `resolveAnnot` calls are the post-canon population.** They
+resolve a name AFTER `canonEmitTypeNames`, so they are the consumers prerequisite 1 actually
+gates, and they are 7 of that resolver's 8 sites. Whoever owns `emit_rep.vl` should know that
+the checker-side tree is not their column — theirs needs P4 first.
+
+**Hand-off 2 — P4 is unchanged and still owned by `typecheck.vl`**, with this slice's
+re-derived population: **124 stale `TypeRef` nodes over 59 corpus files** (979 over 50,400 fuzz
+programs), 0 missing. #1126's decomposition still applies: literal → base is a leaf rewrite,
+alias → member can SUBSTITUTE `udTsRoot`, and union-member dedupe after widening is structural.
+
+**Hand-off 3 — the four `asTy` string consumers can now be deleted rather than fixed.**
+`emit_classify.vl:5776 / 5938 / 6048` (`e.asTy == "i64"` / `"f32"` / `"f64"`) and
+`emit_sections.vl:2077-2079` (`strContains(pn.asTy, …)`) are now guaranteed to see one of the
+four primitive spellings, so they are correct as written — but each is a structural decision
+made by comparing a type NAME, and each has `nodeTyIxOf(<the AsExpr node>)` available beside
+it, which is the same answer without the string.
+
+### Method notes earned
+
+58. **"Latent" is a claim about REACHABILITY and it needs a reachability search, not a
+    caller-count** (D-RECRENDER) — a non-terminating renderer was filed as unreachable because
+    "nothing renders those annotations". Two callers do: an INTERSECTION annotation folds
+    through the checker algebra and renders the fold, and a generic APPLICATION as a union
+    member resolves to its structural shape. Both are four-line single-file programs, both kill
+    the compiler with a stack-exhaustion trap on master, and one of them takes the whole
+    shared-instance `vl check` run down with it. Before filing something latent, enumerate its
+    callers and construct an input for each.
+59. **A staleness prerequisite has a PHASE, and the consumers on the near side of it are not
+    blocked** (D-ASCANON) — "the canon pass invalidates the tree" was filed as mandatory before
+    reading the tree at all. The pass runs at the END of `checkProgram`, so it cannot reach a
+    single one of the checker's own resolutions: 146,048 corpus + 187,025 fuzz reads at the two
+    positioned funnels, 0 stale and 0 missing. The prerequisite is real and belongs entirely to
+    the emit-time consumers. Ask WHEN the invalidating pass runs relative to the consumer
+    before inheriting the block.
+60. **When a hand-off ships a diff, check whether the thing it computes is already banked**
+    (D-ASCANON) — the handed-off fix was `n.asTy = canonEmitName(n.asTy)`, a STRING canon that
+    would have added a call to a rewriter whose arms call `nameToTy`. The checker had already
+    banked the cast's resolved type on the node, and `checkCastNode`'s own admission rule makes
+    the arena read total. Same four programs fixed, one parse fewer, and no second answer that
+    could drift from the checker's. A verified hand-off diff is evidence the BUG is real, not
+    that the FIX is the right one.
+61. **A dedup whose upstream already dedups is dead, and the honest output is the reach count**
+    (D-ASCANON) — `holeDemandTy`'s `tyToStr` key is exactly the discredited proxy this program
+    exists to delete, and migrating it to `tyEq` is right. It is also unpinnable: 6 calls over
+    the corpus, 0 over 50,400 fuzz programs, 0 TRUE returns on either, because `noteHoleAlt`
+    dedups the same alternatives with `tyEq` one layer up. Ship it, say the sabotage is inert
+    on every channel, and give the number instead of a pin.
