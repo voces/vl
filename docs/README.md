@@ -24,6 +24,8 @@ Compiler internals, self-hosting, contributor and agent process.
 - [`internals/genesis-design.md`](internals/genesis-design.md) — seed bootstrap and lineage.
 - [`internals/codegen-architecture.md`](internals/codegen-architecture.md) — wasm emitter architecture.
 - [`internals/memory-gc-design.md`](internals/memory-gc-design.md) — WasmGC vs linear memory; collector choice.
+- [`internals/buffer-design.md`](internals/buffer-design.md) — the `Buffer` tier and exported memory (P0.1/P0.2).
+- [`internals/numeric-intrinsics.md`](internals/numeric-intrinsics.md) — single-opcode numeric builtins (P0.3/P0.4).
 - [`internals/codegen-builder-migration-plan.md`](internals/codegen-builder-migration-plan.md) — emitter builder refactor plan.
 - [`internals/monomorphization-design.md`](internals/monomorphization-design.md) — generic instantiation.
 - [`internals/match-design.md`](internals/match-design.md) — `match` exhaustive value/variant dispatch.
