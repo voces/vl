@@ -45,6 +45,13 @@ buf.loadF32(off): f32   buf.storeF32(off, v)
 buf.loadF64(off): f64   buf.storeF64(off, v)
 ```
 
+> Maintainer's note (vl side): "4 store widths" counts *declarations*. Measured,
+> **one** store width and one load width are lowered by the emitter — the other
+> four `__store_*__`/`__memory_*__` names typecheck and then fail at emit. The
+> four-width world was the deleted TS compiler's. See
+> [`internals/buffer-design.md`](internals/buffer-design.md) §A1 for the probe
+> table; the ask below is unchanged, only the baseline is.
+
 - A real allocator (bump is fine — the sim allocates a few large Buffers at
   init and never frees), replacing today's "program picks raw addresses,
   two users collide" scratch page.
