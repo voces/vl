@@ -19693,6 +19693,37 @@ names**, against a whole-tree TRUE TOTAL of 345.
 No new fixture — the pre-existing corpus already pins two of the three conversions, and the third
 is measured unpinnable rather than asserted clean.**
 
+### 🔁 THE BASE MOVED MID-SLICE — EVERY LEG RE-GRADED AT THE REBASED HEAD `e5be130`
+
+#1166 and #1167 landed while this slice's gate was running, so the branch was rebased and **every
+figure above was re-derived at `e5be130`**, with the master baseline rebuilt from source in the same
+session. Nothing was carried across the rebase by assumption.
+
+**The absolute scoreboard did not move at all.** Master at `e5be130` still reads **CORE 312 ·
+OFF-LIST 28 · TRUE 340** with the identical per-file split, still **5 copies + 2 homes**, still
+**1,077** inline character-surgery operations and **1,791** discovered-resolver call sites — #1166
+(docs) and #1167 (`typecheck.vl` + `driver.vl`) moved the parse population by **zero**. So every
+delta, every identity and every A/B verdict in this section holds unchanged; only the populations
+grew with the corpus and the two binaries grew with #1167's checker work.
+
+| leg | at `5d40f22` | at `e5be130` (gating head) |
+|---|---|---|
+| master binary | 1,029,129 B (`0d4c5822…`) | **1,030,511 B** (`ed597a75…`) |
+| ship binary | 1,027,797 B (`c29bcb8c…`) | **1,029,179 B** (`1d1f0f66…`) |
+| **delta** | **−1,332 B** | **−1,332 B — identical** |
+| `native-fixpoint.sh` | RC=0 | **RC=0**, stage3 == stage4 (1,029,179 B) |
+| `lint-self.sh` | RC=0 | **RC=0**, fmt clean |
+| `rep-fuzz-check.sh` | exact ✅ | **exact ✅** (1 baselined, 0 unsound, 0 new, 0 stale) |
+| suite, ship / master, same session | 2,082 / 2,082 · 0 failed · 14 ignored | **2,094 / 2,094 · 0 failed · 14 ignored** — delta **0**, ignored NAME SETS diffed as sets, identical, 14 non-empty names each |
+| corpus A/B | 1,365 files, 0 differing | **1,374 files, 0 differing** on every channel |
+| shared-instance `vl check <dir>` | 7,233 lines, 1,809 diagnostics, 0 differing | **7,277 lines, 1,820 diagnostics, 0 differing** |
+| lint-tier A/B | 1,365 rows / 777 tagged, 0 differing | **1,374 rows / 783 tagged / 782 distinct, 0 differing** |
+| fuzz A/B | 86,400/side, `diff -r` RC=0, 0 paths | **86,400/side, `diff -r` RC=0, 0 paths** |
+| sabotages P1 / P2 / S1 / S2 / S3 / S4 / S5 | 34 / 57 / 0 / 57 / 4 / 13 / 0 | **34 / 57 / 0 / 57 / 4 / 13 / 0 — every verdict identical** |
+
+The doc conflict was append/append and was resolved **keeping BOTH sides whole**, then asserted:
+`git diff --numstat origin/master` on this file reads **369 insertions / 0 deletions**.
+
 ### Base re-measured, not inherited
 
 Branched from **`5d40f22`** (#1165). `parsercount.py` reproduces the brief's **CORE 312 · OFF-LIST
