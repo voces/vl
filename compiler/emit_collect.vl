@@ -3331,6 +3331,20 @@ function gaeCollectDecls(stmts: i32[]) {
   0
 }
 
+// Peel the composition wrappers a generic APPLICATION can sit behind in an annotation
+// spelling — a `| null` nullable and any number of trailing `[]` — leaving the bare name
+// `gaeEnsure` can intern (`Box<i32>[] | null` → `Box<i32>`). A name with no wrapper comes
+// back unchanged.
+function gaePeelWrappers(name: string) {
+  let nm = name
+  const nb = nullablePartOf(nm)
+  if nb != "" { nm = nb }
+  while nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
+    nm = nm.slice(0, nm.length - 2)
+  }
+  nm
+}
+
 // Scan every TypeRef in the arena for generic-alias applications (behind
 // `|null` and `[]` wrappers) and intern each one.
 export function collectGenAliasShapes() {
@@ -3339,17 +3353,15 @@ export function collectGenAliasShapes() {
   while ti < P.nodes.length {
     const tn = P.nodes[ti]
     if tn is TypeRef {
-      let nm = tn.tyName
-      const nb = nullablePartOf(nm)
-      if nb != "" { nm = nb }
-      while (
-        nm.length > 2 &&
-        nm[nm.length - 2] == '[' &&
-        nm[nm.length - 1] == ']'
-      ) {
-        nm = nm.slice(0, nm.length - 2)
-      }
+      const nm = gaePeelWrappers(tn.tyName)
       gaeEnsure(nm)
+      // A MAP annotation's VALUE position (`{[string]: Box<i32>}`): the application is
+      // INTERIOR to the synthetic map name, so the peel above never reaches it and the
+      // instance is interned only when some OTHER annotation happens to spell it bare —
+      // which is exactly what the map-value classifier then fails to find ("unsupported
+      // map value type"). Interning it here makes the map spelling self-sufficient.
+      const mv = mapValNameOf(nm)
+      if mv != "" { gaeEnsure(gaePeelWrappers(mv)) }
     }
     ti = ti + 1
   }
@@ -3649,21 +3661,90 @@ function collectVariantFields(stmts: i32[], name: string) {
   emitFail("emitProgram: union variant names an unknown struct type")
 }
 
+// True if variants `a` and `b` STORE the same thing per field — the field-TYPE half of
+// variant identity, whose name half is `variantSig`. Deliberately the CODE comparison and
+// nothing deeper: this runs inside `collectU`, the FIRST emit pass, so the ref-list / struct
+// / map slot tables `variantFieldLayoutEq` consults do not exist yet. A code difference is
+// therefore a sufficient (not necessary) witness of divergent storage, which is all the
+// reject below needs.
+function variantFieldCodesEq(a: i32, b: i32) {
+  if uFieldCount[a] != uFieldCount[b] { return false }
+  let fi = 0
+  while fi < uFieldCount[a] {
+    if uFieldTypes[uFieldStart[a] + fi] != uFieldTypes[uFieldStart[b] + fi] {
+      return false
+    }
+    if (
+      uFieldElemName[uFieldStart[a] + fi] !=
+      uFieldElemName[uFieldStart[b] + fi]
+    ) {
+      return false
+    }
+    fi = fi + 1
+  }
+  true
+}
+
 // Assign each variant its GLOBAL tag = its rank when the variants are ordered by
 // structural signature (mirroring `toWasm.ts`'s sorted `variantKey` tag assignment).
 // `uTags[i]` is variant i's tag: the number of variants whose sig sorts strictly
 // before variant i's (sigs are distinct, so this is a dense 0..n-1 permutation).
 function assignTags() {
+  // The signatures, computed ONCE (the rank loop below reads each O(n) times, and a
+  // variant-heavy union — the compiler's own `Node` — has dozens of them).
+  const sigs: string[] = []
+  let si = 0
+  while si < uVariants.length {
+    sigs.push(variantSig(si))
+    si = si + 1
+  }
+  // A union whose variants are NOT discriminable: two members of the SAME union sharing a
+  // field-NAME set (`{v:i32} | {v:string}`, or its nominal / generic-application spellings)
+  // collide on `variantSig` — which IS the tag key — so both rank the same and every `is`
+  // test on either answers for both. Worse, the literal → variant resolution matches by
+  // field-name set alone, so the second member's literal builds the FIRST member's struct:
+  // `const b: {v:i32} | {v:string} = { v: "s" }` stored a string ref into an i32 field —
+  // SILENT INVALID WASM. Field names are the discriminator VL's structural unions are built
+  // on (`docs/guide/unions.md`), so such a union has no sound representation; reject it
+  // loudly here rather than emit the bad module. Layout-EQUAL same-name variants (the same
+  // shape reached through two spellings) stay legal — they are one variant, and the twin
+  // machinery already folds them.
+  let ui = 0
+  while ui < unVarStart.length {
+    const vs0 = unVarStart[ui]
+    const vc = unVarCount[ui]
+    let a = 0
+    while a < vc {
+      let b = a + 1
+      while b < vc {
+        if sigs[vs0 + a] == sigs[vs0 + b] {
+          if !variantFieldCodesEq(vs0 + a, vs0 + b) {
+            return emitFail(
+              "emitProgram: union `" +
+                unNames[ui] +
+                "` cannot be discriminated — variants `" +
+                uVariants[vs0 + a] +
+                "` and `" +
+                uVariants[vs0 + b] +
+                "` have the same field names but different field types",
+            )
+          }
+        }
+        b = b + 1
+      }
+      a = a + 1
+    }
+    ui = ui + 1
+  }
   uTags = []
   let i = 0
   while i < uVariants.length {
-    const sigI = variantSig(i)
+    const sigI = sigs[i]
     let rank = 0
     let j = 0
     while j < uVariants.length {
       if j != i {
-        const sigJ = variantSig(j)
-        if strLess(sigJ, sigI) { rank = rank + 1 }
+        if strLess(sigs[j], sigI) { rank = rank + 1 }
       }
       j = j + 1
     }

@@ -5880,3 +5880,164 @@ see this class, because the checker was never the thing that was wrong.
     struct-member alias to its nominal NAME instead of a structural shape is obviously right
     and is wrong here, because a row upstream had already claimed the name. Cost of finding
     out by building: one 40-second self-compile.
+
+## D-UNIONGEN — a generic APPLICATION as a union MEMBER, and a union that cannot be discriminated (#1123)
+
+A bug-fix slice, not a destringify one. #1122 fixed the ONE-member alias
+(`type Y = Box<i32>`) and recorded, as its own top "left unfixed" item, that the
+multi-member union path was untouched. It was: the same defect, one member over.
+
+### TARGET 1 — the reported miscompile, read off the bytes
+
+```vl
+type Box<T> = { v: T }
+type Tag = { t: i32 }
+type U = Box<i32> | Tag
+const u: U = { v: 1 }
+```
+
+`vl check`: one unused-variable WARNING. `vl build`: a 173-byte module. That module does not
+parse as WebAssembly. `wasm-tools print` on it, beside the non-generic control
+(`type Plain = {v:i32}`), is the whole diagnosis:
+
+```wat
+(global (mut (ref 2)) i32.const 1 struct.new 0)                            ;; defective
+(global (mut (ref 2)) i32.const 1 i32.const 1 struct.new 0 struct.new 2)   ;; control, prints 1
+```
+
+Type 2 is the union box `(struct (field i32) (field anyref))`, type 0 the plain `{v:i32}`
+struct: the CELL is the box and the INITIALIZER is the payload alone. `collectU` asks
+`isStructAtom` whether a member is a struct variant; that answers from `TypeDecl` NAMES, and a
+generic alias declares `Box<T>`, never `Box<i32>` — so the member never entered `uVariants`
+while the alias still entered `unNames`. `globalCellKind` then classified the annotation as the
+union box (`letIsUnion` ← `isUName`), and `emitUnionCoerce`'s `ObjLit` arm found no matching
+arm (`unionArmVariantForObj` −1, `objVariantName` "") and fell through to plain `emitExpr`.
+
+The fall-through is the shape of the defect, and it is not confined to a global: a local, an
+argument, a return and a reassignment each reach it through their own ladder, and each emitted
+an invalid module (pinned in `union-member-generic-application.vl`).
+
+### The fix, and why it is STRUCTURAL — for the reason #1122 measured
+
+`canonEmitTypeNames`'s `UnionDecl` arm resolves a generic-application member of a MULTI-member
+union to its instantiated shape (`unionMemberGenAppShape` → `nameToTy` → `tyToEmitName`), so
+`Box<i32> | Tag` reaches the emitter as `{v:i32} | Tag`. That is not a new vocabulary:
+`type U = {v:i32} | Tag` compiles and runs today, and so does `type A = Box<i32>; type U = A |
+Tag`, which arrives at the SAME shape through #1122's one-member rule. The nominal alternative
+is the one #1122 already built and measured as a regression; nothing was re-run blind.
+
+One-member unions are excluded — #1122 already makes them transparent, and expanding the
+variant would additionally hand `unionStructAliasShape` a shape to register as a named struct.
+
+`IsExpr.isVariant` follows for the same population, gated on the OPERAND's checked type being a
+`TyUnion` — read off `nodeTyIx`, the typed-IR bank, with **no new sidecar**. The gate is
+load-bearing: a NULLABLE operand (`b: Box<i32> | null`) carries no `UnionDecl`, keeps the
+application NAME in its annotation, and `is Box<i32>` already resolves there through
+`nullablePartOf`; rewriting it would trade a working spelling for a broken one. Both spellings
+in ONE program is pinned (`x01`, in the report below).
+
+### TARGET 2 — the sweep found a SECOND live miscompile, with no generics in it
+
+Enumerating the type positions turned up `type U = {v:i32} | {v:string}` — two variants with the
+same field NAMES and different field TYPES. On master that emits a module whose global
+initializer pushes a string-array ref into an i32 field and whose two `is` tests both compare
+against tag 0. Silent invalid wasm; `type A = {v:i32}; type B = {v:string}; type U = A | B` does
+the same. `variantSig` — the tag key — IS the field-name join, so the two variants rank
+identically, and the literal → variant resolution matches by field-name set alone.
+
+VL's structural unions discriminate on the field-name set (`docs/guide/unions.md`), so such a
+union has no sound representation. `assignTags` now rejects it loudly, naming the union and both
+variants. Layout-EQUAL same-name variants stay legal (they are one variant; the twin machinery
+folds them). The same reject is what keeps the generic fix honest: `type U = Box<i32> |
+Box<string>` expands into exactly this shape, and without the reject the fix would have turned
+one clean error into invalid wasm.
+
+`assignTags` also stops recomputing `variantSig` inside its O(n²) rank loop (banked once).
+
+### The type-position table (measured on `adbe6f0`, generic application `Box<i32>` in each)
+
+| position | master | shipped |
+|---|---|---|
+| alias RHS `type A = Box<i32>` | works (#1122) | works |
+| **declared union member** `type U = Box<i32> \| Tag` | **INVALID WASM** | works |
+| … + inline-shape / scalar / `null` / second application member | **INVALID WASM** | works |
+| … local / arg / return / reassign / struct-typed ident into the union | **INVALID WASM** | works |
+| **`is` operand** on a union alias | clean error | works |
+| **map value** `{[string]: Box<i32>}` | clean error | works |
+| array element `Box<i32>[]` | works | works |
+| inline-object field `{ b: Box<i32> }` | works | works |
+| param / return / type-arg-to-generic / intersection operand | works | works |
+| nullable `Box<i32> \| null` (INLINE spelling) | works | works |
+| inline union annotation `Box<i32> \| Tag` (no alias) | clean error | clean error |
+| declared struct field `type S = { b: Box<i32> }` | clean error | clean error |
+| generic fn param `function f<T>(b: Box<T>)` | clean error | clean error |
+| `as` operand | checker error — `as` is numeric-only for a NAMED struct too | same |
+| `!= null` after a definite assign | checker error — same for a NAMED struct | same |
+
+Every INVALID-WASM cell is gone, and the two `as` / `!= null` cells are refuted as generics
+gaps by their non-generic controls.
+
+### Channels
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / message / run | 1,263 pre-existing files | **0 / 0 / 0** |
+| corpus, with the 6 new fixtures | 1,269 files | **5 differ** — exactly the 5 behaviour pins (comparator sanity: not vacuous) |
+| fuzz A/B (21 fixed seeds x 4 legs) | **25,200 programs/side** | **tree-identical**, 1,497 findings each side |
+| suite | 1,391 passed / 0 failed | — |
+
+### Left unfixed, with the mechanism for each
+
+- **Inline union spelling** `const u: Box<i32> | Tag` — pinned `@emit-error`. The members live
+  in one `TypeRef` name canonicalized by `canonEmitName`'s union arm, which is deliberately NOT
+  given the rewrite: that same arm canonicalizes `Box<i32> | null`, whose nullable-niche
+  lowering resolves the application through its NAME today.
+- **Declared struct field** `type S = { b: Box<i32> }` — needs BOTH halves, and the split was
+  measured: adding `const w: Box<i32>` to the program (which interns the instance) still fails,
+  so `nameFieldCode`'s missing `structIndexByName(base) >= 0 → 15` rung (`emit_classify.vl`) is
+  independently necessary. The map-value cell needed only the registration half, which is why
+  it moved and this one did not.
+- **`is` through a one-member alias** (`type BoxI = Box<i32>; u is BoxI`) — `isVariant` is
+  rewritten only for a generic APPLICATION, not for a transparent alias NAME. Extending it to
+  `singleMemberAliasName` would also rewrite `is MyCat` where the union's variants are nominal,
+  changing a message without fixing anything.
+- **Generic FUNCTION with a generic-application param** (`function f<T>(b: Box<T>)`) —
+  `emitProgram: monomorphize: unsupported argument type`.
+- **Union cell initialized from another GLOBAL or a CALL** (`const u: U = p` at module scope) —
+  `ref valtype with no interned shape`, and the NON-generic control fails identically. Not a
+  generics gap.
+- **Recursive generic alias** (`type L<T> = { head: T, tail: L<T> | null }`) — the compiler
+  CRASHES (a wasm trap, not a diagnostic) with or without a union, on master and on this build.
+  Because the checker cannot instantiate one at all, the new structural render can never be
+  handed a cyclic object.
+
+### Method notes earned
+
+50. **The sweep is where the second bug is** (#1123) — enumerating the type positions to
+    complete a table turned up a live silent miscompile (`{v:i32} | {v:string}`) that has
+    nothing to do with the construct under repair, and that the fix would otherwise have made
+    REACHABLE from a previously-erroring program. A fix measured only against its own repro
+    would have shipped it.
+51. **Ask which HALF of a two-part gap you actually closed** (#1123) — the interior-position
+    registration gap and the field-code gap look like one bug ("a generic application in an
+    interior position doesn't resolve"). Adding an unrelated `const w: Box<i32>` to each program
+    separates them in one measurement: the map value starts working, the struct field does not.
+
+### D-UNIONGEN addendum — the `is`-gate pin, and a composed program that still fails
+
+The `IsExpr` gate's guard is pinned as its own program
+(`union-member-generic-application-is-gate.vl`): a declared-union operand and a NULLABLE
+operand testing the SAME `is Box<i32>` in one module. An ungated rewrite compiles the first and
+breaks the second, and no other shape can tell them apart.
+
+One composed program still fails on BOTH sides, and the bisect is recorded so the next slice
+does not redo it. Take the mixed pin's five constructed unions (`UShape` / `UScalar` / `UNull` /
+`UTwo` / `UAlias`, each carrying a `{v:i32}` variant, each with its own `const` + narrowed read)
+and append the is-gate pin's two functions: master rejects at `viaUnion`'s `is`, this build
+rejects one line later at `viaNullable`'s (`narrowed receiver names no union variant`). Not a
+regression — the fix moves the failure, it does not create it.
+
+The bisect that narrows it: the same two functions beside ONE, TWO, … FIVE of those union
+DECLARATIONS all compile and run on this build (and all fail on master). So it is not the count
+of `{v:i32}` variant rows in `uVariants`, nor any single member kind — it is the composition
+with the CONSTRUCTED-and-narrowed globals. That is where to start.

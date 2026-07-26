@@ -6391,6 +6391,57 @@ function singleMemberAliasName(name: string) {
   tyToEmitName(m)
 }
 
+// True if `name` is an APPLICATION of a DECLARED generic alias whose argument list closes
+// the whole name (`Box<i32>`, `Pair<i32,string>`) — not `Box<i32>[]` (an array of one) and
+// not `Box<i32>|Tag` (a union carrying one), whose suffix / separator a caller peels first.
+// The head is checked against the generic-alias registry (`gaIndexOf`) rather than being
+// taken on the spelling's word, so an unrelated name that merely ends in `>` never matches.
+function nameIsGenAppOfDecl(name: string) {
+  const n = name.length
+  if n < 3 { return false }
+  if name[n - 1] != '>' { return false }
+  let lt = -1
+  let i = 0
+  let going = i < n
+  while going {
+    if name[i] == '<' {
+      lt = i
+      going = false
+    } else {
+      i = i + 1
+      going = i < n
+    }
+  }
+  if lt <= 0 { return false }
+  gaIndexOf(name.slice(0, lt)) >= 0
+}
+
+// The STRUCTURAL emit name of a generic-alias APPLICATION standing as one member of a
+// MULTI-member declared union (`type U = Box<i32> | Tag` → "{v:i32}"), or "" when `member`
+// is not such an application or its instance is not an object type.
+//
+// Same shape of defect, and same resolution, as the one-member alias above: the emitter has
+// no route to a union MEMBER under an application name. `collectU` asks `isStructAtom`, which
+// answers from the `TypeDecl` names — and a generic alias declares `Box<T>`, never `Box<i32>`
+// — so the member is dropped from `uVariants` while the alias still registers in `unNames`.
+// The annotation then classifies as the union BOX and the initializer lowers the plain
+// struct: silent INVALID WASM, for every construction site of that member (global, local,
+// argument, return, reassignment).
+//
+// STRUCTURAL for the reason #1122 measured: the application's own name resolves nothing
+// downstream (the instance interns under it only when a TypeRef spells it, which a union
+// member is not), whereas the inline shape is the vocabulary `isStructAtom` already accepts —
+// `type U = {v:i32} | Tag` compiles and runs today, and so does the `type A = Box<i32>;
+// type U = A | Tag` spelling, which reaches exactly this shape through `singleMemberAliasName`.
+function unionMemberGenAppShape(member: string) {
+  if !nameIsGenAppOfDecl(member) { return "" }
+  const ti = nameToTy(member)
+  if ti < 0 { return "" }
+  const t = T.tys[ti]
+  if t is TyObj { return tyToEmitName(ti) }
+  ""
+}
+
 // The TOP-LEVEL atom count of the name the LAST `canonEmitName` call returned, and its
 // `nulLitUnionPreserve` sibling. `canonEmitTypeNames` — the pass that PRODUCES every
 // emit-time annotation spelling — reads it instead of re-splitting the string it has just
@@ -6645,9 +6696,36 @@ export function canonEmitTypeNames() {
       const vs = n.udVariants
       let vi = 0
       while vi < vs.length {
-        const c2 = canonEmitName(vs[vi])
+        let c2 = canonEmitName(vs[vi])
+        // A generic-alias APPLICATION member of a MULTI-member union resolves to its
+        // structural shape (`unionMemberGenAppShape`) — the emitter has no route to it
+        // under the application name. A ONE-member union is excluded: that alias is
+        // already transparent on both sides (`singleAliasMemberTyIx`), and expanding its
+        // variant here would additionally make `unionStructAliasShape` claim it as a
+        // named struct — a second registration of a shape the annotation already resolves.
+        if vs.length >= 2 {
+          const gs = unionMemberGenAppShape(c2)
+          if gs != "" { c2 = gs }
+        }
         if c2 != vs[vi] { vs[vi] = c2 }
         vi = vi + 1
+      }
+    } else if n is IsExpr {
+      // `u is Box<i32>` against a UNION operand: the union's own member was rewritten to
+      // its structural shape above, so the tested name must follow or the emitter resolves
+      // no variant. Gated on the OPERAND's checked type being a `TyUnion` — read off the
+      // typed-IR bank, no sidecar of its own — which is exactly the population whose
+      // variants the rewrite above touched. A NULLABLE operand (`b: Box<i32> | null`) is
+      // deliberately excluded: it carries no `UnionDecl`, its annotation keeps the
+      // application NAME (`nullablePartOf` peels straight to it), and `is Box<i32>` already
+      // resolves there — rewriting it would break the one spelling that works.
+      const opTy = nodeTyIxOf(n.isObj)
+      if opTy >= 0 {
+        const ot = T.tys[opTy]
+        if ot is TyUnion {
+          const gis = unionMemberGenAppShape(n.isVariant)
+          if gis != "" { n.isVariant = gis }
+        }
       }
     }
     annUnionAtoms.push(atoms)
