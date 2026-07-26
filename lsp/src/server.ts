@@ -55,9 +55,11 @@ import {
   builtinCompletionsFromWasm,
   type Completion,
   type CompletionKind,
+  displayableType,
   docMarkdown,
   type DocRefResolver,
   inlayHintsFromWasm,
+  isDisplayableType,
   keywordCompletions,
   type LspRange,
   memberCompletionsFromWasm,
@@ -573,17 +575,23 @@ connection.onHover(async (params): Promise<Hover | null> => {
   // builtin list). No checkOnly/parseSymbols/importedScope. Source `///` docs are
   // not rendered — unchanged from the prior wasm-mode behaviour (the native path
   // never carried them; a doc-aware hover needs a separate native export).
+  //
+  // Each rung is filtered through `displayableType`: the body is rendered as a
+  // fenced `vital` code block, i.e. a claim that the text is VL, so a native
+  // rendering carrying an absence-of-a-type sentinel (`<error>` for an annotation
+  // that didn't resolve) is treated as NO ANSWER and falls through to the next
+  // rung rather than printing a type name the language does not have.
   if (wasmChecker === undefined) return null;
   if (!wordForHover) return null;
-  const t = await wasmHoverType();
+  const t = displayableType(await wasmHoverType());
   if (t) return { contents: hoverMarkdown(`${wordForHover}: ${t}`) };
-  const mt = await wasmMemberType();
+  const mt = displayableType(await wasmMemberType());
   if (mt) return { contents: hoverMarkdown(`${wordForHover}: ${mt}`) };
-  const at = await wasmTypeAlias();
+  const at = displayableType(await wasmTypeAlias());
   if (at) return { contents: hoverMarkdown(`${wordForHover}: ${at}`) };
   // Builtin (`print`/`i32`/…): the word in the native builtin set.
   const b = wasmChecker.builtinCompletions?.().find((x) => x.name === wordForHover);
-  if (b && b.detail.length > 0) {
+  if (b && isDisplayableType(b.detail)) {
     return { contents: hoverMarkdown(`${wordForHover}: ${b.detail}`) };
   }
   return null;
