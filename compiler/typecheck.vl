@@ -1206,6 +1206,15 @@ let cUnionTyIxs: i32[] = []
 // resolve back to its alias name — used to pin an anonymous lambda's litunion return as the
 // ALIAS (an inline litunion spelling reps as a string ref, so the alias name is required).
 let cUnionNames: string[] = []
+// The names of one-member `type N = A` aliases whose single variant is spelled as a bare
+// type NAME or a generic APPLICATION (`type MyCat = Cat`, `type Y = Box<i32>`) — recorded
+// SYNTACTICALLY in pass 0a, before any variant resolves. The parser encodes every
+// non-`{`-bodied `type N = …` as a one-member `UnionDecl`, and the arena cannot tell such an
+// alias from a canonicalized object INTERSECTION (`type AB = {a} & {b}`, also a one-member
+// union over one `TyObj`) — only the spelling can. The intersection's merged shape must keep
+// its alias NAME (the emitter interns it as a named struct via `unionStructAliasShape`);
+// a plain alias-reference must be TRANSPARENT instead (see `aliasRefIsPlainName`).
+let cPlainAliasNames: string[] = []
 // Litunion alias PROVENANCE (rep-rewrite Stage B, b1). The narrowing/join/
 // intersection algebra re-mints a declared litunion alias as a fresh arena
 // COPY (`K | null` inferred through `joinTys`, `!= null` through `subtractTy`,
@@ -5179,14 +5188,14 @@ function nameToTy(name: string) {
     if ut >= 0 {
       const utt = T.tys[ut]
       if utt is TyUnion {
-        // Collapse only a PRIMITIVE-scalar single member (the soundness hole). A struct / object /
-        // intersection single-member alias keeps its named union ty — the emitter resolves it through
-        // its named-struct path, and collapsing it would diverge the two sides (see
-        // `singleMemberAliasName`).
-        if utt.uMembers.length == 1 {
-          const m0 = T.tys[utt.uMembers[0]]
-          if m0 is TyPrim { return utt.uMembers[0] }
-        }
+        // Collapse a PRIMITIVE-scalar single member, and an OBJECT member reached through a
+        // plain alias REFERENCE (`type MyCat = Cat`, `type Y = Box<i32>`). The one-member
+        // OBJECT case that stays opaque is the canonicalized intersection (`type AB = {a}&{b}`),
+        // which the emitter DOES intern as a named struct. `singleAliasMemberTyIx` is the single
+        // rule both sides read — collapsing here without the emitter's `singleMemberAliasName`
+        // agreeing (or the reverse) diverges the two.
+        const sm = singleAliasMemberTyIx(ut, name)
+        if sm >= 0 { return sm }
       }
     }
     return ut
@@ -6283,28 +6292,103 @@ function unionAliasMembers(name: string) {
   ""
 }
 
+// True if the one-member alias BODY `spell` is a bare type NAME (`Cat`, `i32`) or a generic
+// APPLICATION (`Box<i32>`, `Pair<i32,string>`) — the two spellings that make `type N = spell`
+// a plain alias REFERENCE. Everything else a one-member `UnionDecl` can carry is excluded, and
+// each exclusion is load-bearing: an inline shape / object INTERSECTION (`{a:i32}&{b:i32}`,
+// `A & B`) must keep its alias name (the emitter interns it as a named struct through
+// `unionStructAliasShape` — expanding it would lose that registration), while a list / map /
+// function-type / literal body (`i32[]`, `(i32) => i32`) is left exactly as master had it
+// (those are rejected in the CHECKER today — a clean error, not a miscompile — so widening
+// them is a separate change with its own evidence).
+function aliasRefIsPlainName(spell: string) {
+  if spell.length == 0 { return false }
+  const c0 = spell[0]
+  const isAlpha0 = (c0 >= 'a' && c0 <= 'z') ||
+    (c0 >= 'A' && c0 <= 'Z') ||
+    c0 == '_'
+  if !isAlpha0 { return false }
+  // The head must be an identifier run; it ends at either the end of the string (a bare
+  // name) or the generic application's `<` (whose argument list must then close the WHOLE
+  // spelling — `Box<i32>[]` ends in `]` and is NOT a plain reference).
+  let i = 1
+  while i < spell.length {
+    const c = spell[i]
+    const identCh = (c >= 'a' && c <= 'z') ||
+      (c >= 'A' && c <= 'Z') ||
+      (c >= '0' && c <= '9') ||
+      c == '_'
+    if !identCh {
+      if c != '<' { return false }
+      return spell[spell.length - 1] == '>'
+    }
+    i = i + 1
+  }
+  true
+}
+
+// True if `name` is a one-member `type N = A` alias whose body is a plain type reference
+// (`aliasRefIsPlainName`, recorded syntactically in pass 0a).
+function isPlainAliasRef(name: string) {
+  let i = 0
+  while i < cPlainAliasNames.length {
+    if cPlainAliasNames[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True if the one-member alias `name` (arena index `ti`, already known to be a `TyUnion`)
+// denotes its member TRANSPARENTLY. Two populations, and the pair below is the WHOLE rule —
+// `nameToTy` and `singleMemberAliasName` must agree exactly or the checker and the emitter
+// diverge on the same annotation:
+//   - a PRIMITIVE member (`type Id = i32`, `type Name = string`) — always transparent;
+//   - an OBJECT member reached through a plain alias REFERENCE (`type MyCat = Cat`,
+//     `type Y = Box<i32>`) — transparent, because the emitter has no named-struct route to
+//     such an alias at all: it registers `N` as a one-variant union row (`unNames`), so
+//     `isUName(N)` claims the annotation for the union BOX while the initializer lowers a
+//     plain struct — silent INVALID WASM for `type Y = Box<i32>`, and a
+//     "field access but no struct type declared" / "ref valtype with no interned shape"
+//     emit reject for `type MyCat = Cat`.
+// An object member whose body is NOT a plain reference is the canonicalized INTERSECTION
+// (`type AB = {a:i32} & {b:i32}`) — that one IS interned as a named struct
+// (`unionStructAliasShape`) and works today, so it is deliberately left opaque.
+function singleAliasMemberTyIx(ti: i32, name: string) {
+  const t = T.tys[ti]
+  if t is TyUnion {
+    if t.uMembers.length == 1 {
+      const m0 = t.uMembers[0]
+      const mt = T.tys[m0]
+      if mt is TyPrim { return m0 }
+      if mt is TyObj {
+        if isPlainAliasRef(name) { return m0 }
+      }
+    }
+  }
+  -1
+}
+
 // The single member's EMIT name of a declared one-member union ALIAS (`type Id = i32` → "i32",
-// `type Name = string` → "string", `type MyCat = Cat` → "Cat"), or "" if `name` is not a declared
-// single-member union. Such an alias is TRANSPARENT — it denotes its member, so the emitter resolves
-// it to the member's own vocabulary rather than registering a one-variant union box.
+// `type Name = string` → "string", `type Y = Box<i32>` → "{v:i32}"), or "" if `name` is not a
+// TRANSPARENT single-member union (`singleAliasMemberTyIx`). Such an alias denotes its member,
+// so the emitter resolves it to the member's own vocabulary rather than registering a
+// one-variant union box.
 function singleMemberAliasName(name: string) {
   if !cUserTypes.has(name) { return "" }
   const ti = cUserTypes[name] ?? -1
   if ti < 0 { return "" }
-  const t = T.tys[ti]
-  if t is TyUnion {
-    if t.uMembers.length == 1 {
-      // Only a PRIMITIVE-SCALAR member is resolved here (the documented soundness hole — `type Id =
-      // i32` / `type Name = string` miscompiling as a one-variant box). A struct / object / inline-
-      // intersection member (`type MyCat = Cat`, `type AB = {a}&{b}`) is left as its alias NAME, which
-      // the emitter already resolves through its named-struct / `unionStructAliasShape` path —
-      // expanding it to an inline shape here would lose that registration (a struct param then reads
-      // as an unrecognized inline-object annotation).
-      const mt = T.tys[t.uMembers[0]]
-      if mt is TyPrim { return tyToEmitName(t.uMembers[0]) }
-    }
-  }
-  ""
+  const m = singleAliasMemberTyIx(ti, name)
+  if m < 0 { return "" }
+  // STRUCTURAL, deliberately — and the alternative was BUILT and MEASURED, not reasoned
+  // about. Resolving a declared-struct member to its declared NAME instead (`type MyCat =
+  // Cat` → "Cat", via `structNameOfTy`) looks strictly better — it keeps nominal identity —
+  // and it REGRESSES both `type MyCat = Cat` and `type Y = B` back to `emitProgram: ref
+  // valtype with no interned shape`. The reason is the very row this fix routes around: the
+  // emitter's `collectU` still registers the one-member alias as a union (its variant `Cat`
+  // is not a `{…}` shape, so `unionStructAliasShape` does not skip it) and PUSHES `Cat` into
+  // `uVariants` — so the name `Cat` classifies as a union VARIANT box, not a plain struct.
+  // The named route is poisoned; the inline shape is the one that resolves.
+  tyToEmitName(m)
 }
 
 // The TOP-LEVEL atom count of the name the LAST `canonEmitName` call returned, and its
@@ -10350,6 +10434,7 @@ function checkProgramNode(n: Program) {
   cVariantMemberTyIxs = []
   cUnionTyIxs = []
   cUnionNames = []
+  cPlainAliasNames = []
   cLitUnionCopyTyIxs = []
   cLitUnionCopyAliasIxs = []
   // Pass 0: register top-level struct `type` declarations BEFORE anything else, so
@@ -10410,6 +10495,16 @@ function checkProgramNode(n: Program) {
         }
       }
     } else if sd0 is UnionDecl {
+      // A one-member alias whose body is a plain type REFERENCE (`type MyCat = Cat`,
+      // `type Y = Box<i32>`) is TRANSPARENT — recorded here, in pass 0a, because the
+      // decision is SYNTACTIC (the arena cannot tell it from a canonicalized `{a} & {b}`
+      // intersection) and both readers run later. A self-cycle (`type D = D`) is excluded:
+      // it is the degenerate never-type pass 0b reports on, and resolving it transparently
+      // would chase its own placeholder.
+      const uvs0 = sd0.udVariants
+      if uvs0.length == 1 && uvs0[0] != sd0.udName {
+        if aliasRefIsPlainName(uvs0[0]) { cPlainAliasNames.push(sd0.udName) }
+      }
       const members0: i32[] = []
       const uIx0 = mkUnionTy(members0)
       cUserTypes[sd0.udName] = uIx0

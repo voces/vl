@@ -5759,3 +5759,124 @@ duplicated.
     with a stale one, 19.1% together). The same sidecar is authoritative in one pass and
     wrong two passes later; a migration's admissibility is a question about WHERE in the
     pipeline the consumer sits, not about the sidecar.
+
+## D-ALIASREF — a one-member alias is TRANSPARENT, and the deferral note was wrong (#1122)
+
+### The bug, at the emitted bytes
+
+```vl
+type Box<T> = { v: T }
+type Y = Box<i32>          // an alias TO a generic application
+const y: Y = { v: 1 }
+print(y.v)
+```
+
+`vl check` accepts it (one redundant-annotation HINT), `vl build` writes 173 bytes, and the
+module **fails to parse as WebAssembly**. `const y: Box<i32> = { v: 1 }` — the same program
+without the alias — prints `1`.
+
+The 173 bytes name the mechanism outright, which is why they were read before anything was
+theorised:
+
+```wat
+(rec (type (;0;) (struct (field (mut i32))))
+     (type (;1;) (struct (field i32) (field anyref))))   ;; the UNION BOX
+(global (;0;) (mut (ref 1)) i32.const 1 struct.new 0)     ;; cell = box, init = struct
+```
+
+The cell is the union box and the initializer is the plain struct. The un-aliased control
+emits ONE struct type and no box at all.
+
+The chain, each link measured with an `emitFail` probe rather than read: the parser encodes
+every non-`{`-bodied `type N = …` as a **one-member `UnionDecl`** (`parser.vl`: "A single bare
+name `type N = A` (no `|`) is also accepted as a one-member union"). `collectU` skips such a
+row only when `unionStructAliasShape` matches — a single **inline `{…}` shape** variant — so a
+variant that is a NAME (`Cat`) or a generic APPLICATION (`Box<i32>`) is registered:
+`unNames.push("Y")`. `isUName("Y")` is then true, `letIsUnion` returns true on the annotation,
+and `globalCellKind` returns kind 4. Probe output on master, at `globalCellKind`:
+
+| program | probe |
+|---|---|
+| `const y: Y = {v:1}` (`type Y = Box<i32>`) | `ann=Y isUName letIsUnion letIsStruct sIdx=0` |
+| `const y: Box<i32> = {v:1}` | `ann=Box<i32> letIsStruct sIdx=0` |
+
+### The deferral note, refuted
+
+`singleMemberAliasName` (`typecheck.vl`) already resolved the SCALAR half and its comment
+deferred the object half:
+
+> A struct / object / inline-intersection member (`type MyCat = Cat`, `type AB = {a}&{b}`) is
+> left as its alias NAME, which **the emitter already resolves through its named-struct /
+> `unionStructAliasShape` path** — expanding it to an inline shape here would lose that
+> registration (a struct param then reads as an unrecognized inline-object annotation).
+
+The claim is **half right, and the two halves are different constructs**:
+
+| one-member alias | on master `2c5e9cd` |
+|---|---|
+| `type AB = {a:i32} & {b:i32}` (variant IS a `{…}` shape) | **works** — `unionStructAliasShape` skips the union row, `collectS` interns `AB` |
+| `type MyCat = Cat` (variant is a NAME) | `emitProgram: field access but no struct type declared` |
+| `type Y = Box<i32>` (variant is an APPLICATION) | **silent invalid wasm** |
+
+Only the intersection has the named-struct route the note credits to all three. The other two
+have no route at all, because the row that would carry it is the union row that breaks them.
+
+### The rule, and why it is STRUCTURAL
+
+A one-member alias whose body is a **plain type reference** (bare name or generic application,
+`aliasRefIsPlainName`, recorded syntactically in pass 0a because the arena cannot tell
+`type MyCat = Cat` from `type AB = {a}&{b}` — both are one `TyUnion` over one `TyObj`) denotes
+its member. `nameToTy` and `canonEmitName` read ONE predicate (`singleAliasMemberTyIx`), because
+a collapse on one side without the other diverges the checker from the emitter.
+
+The member renders **structurally** (`{v:i32}`), and the nominal alternative was BUILT, not
+argued: resolving a declared-struct member to its declared NAME via `structNameOfTy` — which
+looks strictly better, keeping nominal identity — **regresses `type MyCat = Cat` and
+`type Y = B` straight back to `ref valtype with no interned shape`**. `collectU` still pushes
+`Cat` into `uVariants` for the alias row, so the NAME classifies as a union variant box. The
+named route is poisoned; only the inline shape resolves. (Note 33's shape: the better-looking
+derived value was wrong, and only building it said so.)
+
+### Entombment — the gate is load-bearing and the CORPUS already holds its pin
+
+**S-ALIASGATE**: drop `isPlainAliasRef`, so the `TyObj` arm collapses every one-member object
+alias including the intersection; everything else identical.
+
+| build pair | corpus (1,291 pre-existing files) byte / msg / run | suite |
+|---|---|---|
+| shipped vs base `25e3790` | **0 / 0 / 0** | 1,974 passed |
+| shipped vs **S-ALIASGATE** | — | **2 failed**: `types/intersection-object-merge.vl` |
+
+S-ALIASGATE turns `type AB = {a:i32} & {b:i32}` into the inline shape, the named-struct
+registration is lost, and a param typed `AB` fails with `emitProgram: only i32, i64, f64, f32,
+boolean, struct, union, array, or string parameters are supported` — **the exact regression the
+deferral note predicted, for the one construct where the note is right**. No new sabotage
+fixture was needed: the pre-existing corpus already pins it.
+
+### Channels
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / message / run | 1,291 pre-existing files | **0 / 0 / 0** |
+| corpus, with the 4 new fixtures | 1,294 files | **3 differ** — exactly the 3 pins (comparator sanity: not vacuous) |
+| fuzz A/B (32 fixed seeds x 4 legs) | **25,600 programs/side**, 3,519 output files/side | **tree-identical** (2 `.err` lines differ: the compiler's OWN wasm function indices, shifted by 3, inside a pre-existing identical trap backtrace) |
+| `vl check` message stream | 1,294 files | **0 differ** — master's checker accepts all three pins; that IS the bug |
+
+The `check.out` zero is the finding worth restating: the corpus's whole check channel cannot
+see this class, because the checker was never the thing that was wrong.
+
+### Method notes earned
+
+47. **Read the emitted BYTES before theorising about a miscompile** (D-ALIASREF) — "173 bytes
+    suggests a nearly-empty module" was the brief's guess; the module was complete and the
+    disassembly named the defect in two lines (a global typed at the union box, initialized
+    with a plain `struct.new`). One `wasm-tools print` replaced the entire hypothesis stage.
+48. **A deferral comment is a claim about a POPULATION, and populations get lumped** (#1122)
+    — one comment deferred "struct / object / inline-intersection" as a unit on the strength
+    of a route only the intersection has. Two of the three constructs it protected were
+    already broken, one of them into invalid wasm. When a note defers several shapes with one
+    justification, test the justification against EACH shape.
+49. **The strictly-better refinement is a hypothesis; build it** (#1122) — resolving a
+    struct-member alias to its nominal NAME instead of a structural shape is obviously right
+    and is wrong here, because a row upstream had already claimed the name. Cost of finding
+    out by building: one 40-second self-compile.
