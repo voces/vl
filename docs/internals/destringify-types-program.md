@@ -19721,8 +19721,24 @@ grew with the corpus and the two binaries grew with #1167's checker work.
 | fuzz A/B | 86,400/side, `diff -r` RC=0, 0 paths | **86,400/side, `diff -r` RC=0, 0 paths** |
 | sabotages P1 / P2 / S1 / S2 / S3 / S4 / S5 | 34 / 57 / 0 / 57 / 4 / 13 / 0 | **34 / 57 / 0 / 57 / 4 / 13 / 0 — every verdict identical** |
 
+**THE WORK COUNT WAS RE-RUN AT THE REBASED HEAD TOO, because "every identity holds" is a claim and
+this program does not accept claims.** The corpus grew 1,337 → 1,346 cases, so every counter moved a
+little — and every IDENTITY is still residual 0:
+
+| counter | master `e5be130` | ship | Δ | identity |
+|---|---|---|---|---|
+| `tyTopIndexOf` | 1,438,943 | 1,438,943 | **0** | untouched |
+| `nullablePartOf` | 431,297 | 431,297 | **0** | the fold moved, the call did not |
+| `monoUnwrapParens` | 31,011 | **0** | −31,011 | deleted |
+| `nameIsSingleShape` | 20,301 | **0** | −20,301 | deleted |
+| `nameIsWholeSpanShape` | 10,582 | 30,883 | **+20,301** | **= the deleted twin's reach EXACTLY** |
+| `normTypeAtom` | 1,606 | 40,115 | **+38,509** | **= 31,011 + 1,916 + 5,582 EXACTLY** |
+| `tyGroupWrapsWhole` | 1,352 | 5,041 | +3,689 | unchanged from `5d40f22` |
+| `tyGroupEndIndex` | 13,387 | 17,076 | +3,689 | non-`tyGroupWrapsWhole` callers **12,035 on both sides** |
+| `nonNulBaseOf` | 12,402 | 12,449 | **+47** | the adopted fold site's reach |
+
 The doc conflict was append/append and was resolved **keeping BOTH sides whole**, then asserted:
-`git diff --numstat origin/master` on this file reads **369 insertions / 0 deletions**.
+`git diff --numstat origin/master` on this file reads **0 deletions**.
 
 ### Base re-measured, not inherited
 
