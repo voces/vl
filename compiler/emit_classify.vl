@@ -117,6 +117,7 @@ import {
   mapValNameOf,
   memberPathKeyOf,
   nameIsArray,
+  nameIsBareMap,
   nameIsClosureArray,
   nameIsClosureArrayTy,
   nameIsF32Array,
@@ -142,7 +143,6 @@ import {
   nonNullMemberCountOf,
   nulCloFlag,
   nulLitUnionInnerName,
-  nullClosureArrElem,
   nullablePartOf,
   numTextIsFloat,
   objFieldVal,
@@ -8400,8 +8400,9 @@ export function isNulScalarListKind(kind: VKind | null): boolean {
 }
 // The struct / variant FIELD code of a DISTINCT-backing nullable scalar-list spelling —
 // `string[] | null` 31 · `f64[] | null` 32 · `i64[] | null` 33 · `f32[] | null` 34 — or -1.
-// The FIELD-position mirror of the `nulScalarListKind` BINDING niche (and of the
-// `nullArrayArrElem` kind-6/7/8/10 list-ELEMENT position): each leaf keeps its OWN wrapper
+// The FIELD-position mirror of the `nulScalarListKind` BINDING niche (and of
+// `refArrShapeKind`'s nullable-LIST arm, kinds 6/7/8/10, the list-ELEMENT position):
+// each leaf keeps its OWN wrapper
 // heap type, so — unlike the i32-backed leaves, which all fold onto code 18's `$lTypeIdx` —
 // each spelling needs its own `(ref null $wrapper)` field code. One code per wrapper keeps
 // `structFieldCodesEq` splitting same-fieldset twins by their real emitted layout.
@@ -8918,6 +8919,98 @@ export function globalRefListSlot(letIx: i32) {
 // True if the type-name `name` refers to one of the declared struct types.
 export function isSName(name: string) { structIndexByName(name) >= 0 }
 
+// The ref-array SHAPE ladder — the ONE home of the arms `nameIsRefArray` and
+// `refArrElemKind` each carried as its own hand-copied copy (destringify
+// D-REFARRKIND; D-FIELDCODE's move applied to the ref-list layer, which
+// `refArrElemName`'s own header already flagged: "Mirrors `refArrElemKind`", and
+// "Keyed exactly like `nameIsRefArray`'s bridge (the two must agree)"). Returns
+// the ref-list ELEMENT KIND a name's SHAPE decides, or **-1 when no shape arm
+// claims it** — the caller's own BASE arm (the one arm whose EVIDENCE differs
+// between the two entry points: a boolean over four element tables vs a
+// union-vs-struct kind over one) then answers.
+//
+// The five `(…)`-grouped arms are a PROJECTION OF ONE VALUE (method note 2): the
+// paren-union element and its nullable part decide all of nullable-struct /
+// nullable-map / nullable-list / nullable-closure / value-union, and both copies
+// re-derived them per arm — `parenUnionArrElemName` ran **5x** and
+// `nullablePartOf` **4x** on one spelling inside `refArrElemKind` alone (each
+// `parenUnionArrElemName` is itself an `annArrowAt` depth scan plus up to two
+// `unionMemberCount` splits). They are resolved ONCE here.
+function refArrShapeKind(name: string): i32 {
+  // `i32[][]`, `boolean[][]`, and literal-union `K[][]` all carry the i32-list wrapper element
+  // (kind 4) — one i32[] backing (`nameIsI32ListArray`), not three special cases.
+  if nameIsI32ListArray(name) { return 4 }
+  // Nested lists of a NON-i32 scalar/string element — the element is that inner list's
+  // WRAPPER (kinds 6/7/8 → `mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`). Used for a
+  // string[]/f64[]/i64[]-VALUED map's vals ref-list (the value analogue of `i32[][]` kind 4).
+  if nameIsArray(name) && nameIsStringArray(name.slice(0, name.length - 2)) {
+    // `string[][]` AND the niche `(string | null)[][]`: the element is the string-list
+    // wrapper (`$mkListIdx`) either way — the nullable rides INSIDE the inner elements.
+    return 6
+  }
+  if name == "f64[][]" { return 7 }
+  if name == "i64[][]" { return 8 }
+  if name == "f32[][]" {
+    return 10 // f32 inner list (element is the `$fl32TypeIdx` wrapper)
+  }
+  // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
+  // itself a ref array, stored as the inner list's WRAPPER — kind 9. Recurses to any depth via
+  // the interned inner slots. The scalar-leaf 2D names above are NOT ref arrays at the inner
+  // level (a scalar inner list is a singleton wrapper), so they keep their explicit kinds.
+  if nameIsArray(name) && nameIsRefArray(refArrElemName(name)) { return 9 }
+  if nameIsMapArray(name) { return 3 }
+  // === the PAREN-GROUPED element, resolved ONCE ===
+  // A `(…)[]` annotation whose element is a top-level union. Five former arms
+  // (`nullStructArrElem` / `nullMapArrElemOf` / `nullArrayArrElem` /
+  // `nullClosureArrElem` / `parenUnionArrElemName`) each re-derived this element,
+  // and four of them re-derived its `| null` part; every one of the five declines
+  // when the element is not paren-grouped, so ONE lookup gates all of them and the
+  // arm ORDER inside is byte-for-byte the order `refArrElemKind` tested them in.
+  const pun = parenUnionArrElemName(name)
+  if pun != "" {
+    const nn = nullablePartOf(pun)
+    if nn != "" {
+      // A `(P | null)[]` nullable-struct array is a STRUCT ref list (kind 1) — its element is a
+      // `(ref null $P)` niche, not a union box. Checked before the value-union fall-through.
+      if structIndexByName(nn) >= 0 { return 1 }
+      // A `({[string]: V} | null)[]` nullable-MAP array is a MAP ref list (kind 3) — the same
+      // `(ref null $mapStruct)` backing the non-null map element uses; the slot key keeps the
+      // `| null` so the index read stays nullable (`rlElemNullable`) for the `e != null` narrow.
+      // `nameIsBareMap` is #1139's one home for this pair — adopted here rather than
+      // re-inlining the conjunction that slice had just finished collapsing.
+      if nameIsBareMap(nn) { return 3 }
+      // A `(i32[] | null)[]` nullable-LIST array reuses the inner list's OWN rep — kind 4 for an
+      // i32-backed inner, 6/7/8/10 for a distinct-backing scalar/string inner, 9 for a ref inner.
+      // Its element is a `(ref null $wrapper)` niche, not a union box. The inner kind is read by
+      // re-forming the inner ARRAY name once; master reached the same value by running
+      // `nullArrayArrElem` twice (test then value) and then re-running the ladder on its result —
+      // **three** `refArrElemKind` walks and three `elem + "[]"` allocations per hit, for one kind.
+      // The kind-SET gate is kept VERBATIM and is measured DEAD: a probe counting
+      // every reach and every refusal read **2,227 reaches / 0 refusals** (1,621
+      // corpus + 606 fuzz). It is expected to be unreachable — `nameIsArray(nn)`
+      // makes `nn + "[]"` a 2-D array name, and every 2-D array lands on one of
+      // 4/6/7/8/9/10, while kinds 1/2/3/5 all require a NON-array element. Kept
+      // anyway: "measured dead" is not "proven dead", it costs one compare, and
+      // removing it would be a behaviour change no channel can pin (sabotage S6).
+      if nameIsArray(nn) {
+        const ik = refArrElemKind(nn + "[]")
+        if ik == 4 || ik == 6 || ik == 7 || ik == 8 || ik == 9 || ik == 10 {
+          return ik
+        }
+      }
+      // A `(((i32) => boolean) | null)[]` nullable-CLOSURE array is a closure ref list (kind 5)
+      // — its element is a `(ref null $cloStruct)` niche, not a union box. Checked before the
+      // value-union fall-through below (whose kind-2 box has no rep for a niche-nullable closure).
+      if nameIsFuncTypeAtom(nn) { return 5 }
+    }
+    // A `(string|i32)[]` value-union element list is a union-box list (kind 2).
+    return 2
+  }
+  // An `((i32) => i32)[]` array of functions is a closure-element list (kind 5).
+  if nameIsClosureArray(name) { return 5 }
+  -1
+}
+
 // The struct-table index for a ref-list element NAME, stripping a `| null` niche suffix first
 // (a NULLABLE-struct array's slot keys on the full `"P | null"`, but the struct it stores/reads
 // is the bare `P`). Nominal first (`structIndexByName`), then the structural bridge
@@ -8954,52 +9047,13 @@ export function structIdxOfElemName(name: string) {
   structIndexOfTypeName(n)
 }
 
-// The non-null STRUCT name of a NULLABLE-struct array element (`(P | null)[]` → "P"), or "".
-// `P | null` is a nullable-struct NICHE (a `(ref null $P)` slot), NOT a union box — so it is a
-// struct ref-list whose elements legitimately hold null (its backing is already nullable). The
-// SLOT keys on the full `"P | null"` so a read can tell it from a non-null `P[]` (different slot)
-// and skip the `ref.as_non_null` recover. A value-niche element (`(i32 | null)[]`) is excluded —
-// its non-null part is not a declared struct, so it stays the value-union-box path.
-// The inner map of a `({[string]: V} | null)[]` nullable-MAP array element, else "".
-function nullMapArrElemOf(name: string) {
-  const elem = parenUnionArrElemName(name)
-  if elem == "" { return "" }
-  const nn = nullablePartOf(elem)
-  if nn == "" { return "" }
-  if nameIsMap(nn) && !nameIsMapMemberUnion(nn) { return nn }
-  ""
-}
-
-function nullStructArrElem(name: string) {
-  const elem = parenUnionArrElemName(name)
-  if elem == "" { return "" }
-  const nn = nullablePartOf(elem)
-  if nn == "" { return "" }
-  if structIndexByName(nn) >= 0 { return nn }
-  ""
-}
-
-// The inner-list element of a `(<list> | null)[]` nullable-LIST array — `(i32[] | null)[]` → `i32[]`,
-// else "". Such an array reuses the `i32[][]` (kind 4) rep: a ref list over a `(ref null $lTypeIdx)`
-// backing (already nullable, so the `| null` element rides for free). It differs from `i32[][]` ONLY by
-// its slot key keeping the `| null` (so the index READ stays nullable — no `ref.as_non_null` — for the
-// `e != null` narrow). The inner array reuses its NON-nullable rep RECURSIVELY (kind 4 i32-list inner,
-// a DISTINCT-backing scalar/string inner — kinds 6/7/8/10, `(f64[] | null)[]` over the `$fl64` wrapper
-// singleton, the list-position dual of the `nulf64list` binding niche — or kind 9 a nested ref-array
-// inner — `(i32[][]|null)[]`, `({f:i32}[]|null)[]`, …); the structured `rlElemNullable` bit drives the
-// nullable read-skip + null-element generically over the inner kind.
-function nullArrayArrElem(name: string) {
-  const elem = parenUnionArrElemName(name)
-  if elem == "" { return "" }
-  const nn = nullablePartOf(elem)
-  if nn == "" { return "" }
-  if !nameIsArray(nn) { return "" }
-  const ik = refArrElemKind(nn + "[]")
-  if ik == 4 || ik == 6 || ik == 7 || ik == 8 || ik == 9 || ik == 10 {
-    return nn
-  }
-  ""
-}
+// (`nullStructArrElem` / `nullMapArrElemOf` / `nullArrayArrElem` lived here. All
+// three opened with the SAME two lines — `parenUnionArrElemName(name)` then
+// `nullablePartOf(elem)` — and differed only in the one predicate they applied to
+// the result, so each was a projection of one value that its two callers computed
+// separately. They are now the four consecutive arms of `refArrShapeKind`'s
+// paren-grouped block, which derives that value once. Their rep contracts are
+// recorded arm-by-arm there.)
 
 // The DECLARED-struct index an inline-SHAPE element spelling (`{v:i32}` of a
 // `{v:i32}[]` annotation) resolves to via the structural bridge
@@ -9070,50 +9124,21 @@ export function nameIsRefArray(name: string) {
   if annArrowAt(name) >= 0 { return false }
   // A literal-union array (`K[]`) is an i32 ATOM array, NOT a ref list — exclude it before the
   // union-name match below (a literal union registers as a union name, which would otherwise
-  // mis-claim `K[]` as a union-box ref array, the wrong rep).
+  // mis-claim `K[]` as a union-box ref array, the wrong rep). Both guards are THIS entry
+  // point's alone: `refArrElemKind` is specified on a name already known to be a ref array,
+  // so folding them into the shared ladder would change its answers.
   if nameIsLitUnionArray(name) { return false }
-  // A `(P | null)[]` nullable-struct array is a (struct) ref list — checked before the
-  // value/struct-union element test so its niche element is not mis-read as a union box.
-  if nullStructArrElem(name) != "" { return true }
-  // A `(i32[] | null)[]` nullable-LIST array is a ref list (kind-4 i32[][] rep) — likewise checked
-  // before the union test so `i32[] | null` is not mis-read as a value union.
-  if nullArrayArrElem(name) != "" { return true }
-  // A NESTED `i32[][]` (also `boolean[][]` / literal-union `K[][]`) is a ref list whose
-  // elements are the i32-list wrapper (element kind 4) — the existing ref-pair machinery
-  // serves it; only the element heap type differs (`lTypeIdx`). All three share the i32[]
-  // backing (`nameIsI32ListArray`); `nameIsLitUnionArray` above already excluded the 1-D
-  // atom array `K[]`, so this only fires on the 2-D case.
-  if nameIsI32ListArray(name) { return true }
-  // A nested NON-i32 scalar / string 2D array (`i64[][]` / `f64[][]` / `string[][]`): the
-  // element is the inner list's WRAPPER (kinds 8 / 7 / 6 — the same the LIST-valued map vals
-  // ref-list uses). `refArrElemKind` already maps these names; recognize them here so a direct
-  // 2D array (not only a map value) is a supported ref list.
-  if (
-    name == "i64[][]" ||
-    name == "f64[][]" ||
-    name == "f32[][]" ||
-    name == "string[][]"
-  ) {
-    return true
-  }
-  // An array whose ELEMENT is a string-backed list (`(string | null)[][]` — the string
-  // niche list shares the `$mkListIdx` wrapper `string[]` uses, so the outer array is the
-  // same kind-6 ref list as `string[][]`). `nameIsStringArray` admits both spellings.
-  if nameIsArray(name) && nameIsStringArray(name.slice(0, name.length - 2)) {
-    return true
-  }
-  // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
-  // ITSELF a ref array. Recurses to the leaf (a struct / union / closure / scalar-2D ref array),
-  // so any DEPTH and any ref leaf falls out — the outer element's heap is the inner list's
-  // wrapper (`refArrElemKind` → 9), resolved through the recursively-interned inner slot.
-  if nameIsArray(name) && nameIsRefArray(refArrElemName(name)) { return true }
-  // A `(string|i32)[]` annotation — a VALUE-union element list. The element
-  // slots hold the same `{tag, value}` boxes a bare union binding does (the
-  // host stores the coerced union value), so it is a kind-2 ref list.
-  if parenUnionArrElemName(name) != "" { return true }
-  if nameIsMapArray(name) { return true }
-  // An ARRAY OF FUNCTIONS (`((i32) => i32)[]`) — a closure-element ref list (kind 5).
-  if nameIsClosureArray(name) { return true }
+  // Every SHAPE-decided arm — the i32/string/scalar 2D leaves, the nested-ref recursion, the
+  // map list, the five paren-grouped element arms and the closure list — is `refArrShapeKind`
+  // (destringify D-REFARRKIND). This entry point only needs "did any arm claim it", so the
+  // kind is discarded; what it deletes is the SECOND hand-written copy of that ladder, and
+  // with it the two arms (`nullStructArrElem` / `nullArrayArrElem`) that were tested FIRST
+  // here and are strictly SUBSUMED by the `parenUnionArrElemName` arm below them: both
+  // require a paren-grouped element, every arm between them and it returns only `true`, and
+  // `nullArrayArrElem` reached its verdict by running the WHOLE `refArrElemKind` ladder on a
+  // freshly concatenated `elem + "[]"` — an entire second ladder walk, per call, to answer a
+  // boolean the arm five lines down already answered.
+  if refArrShapeKind(name) >= 0 { return true }
   // Otherwise a `<Struct>[]` / `<Union>[]`: strip the trailing `[]` ONCE and match the bare
   // element NAME against the struct/union tables. (The old form compared `name` to
   // `sNames[i] + "[]"` — a fresh string allocation PER struct PER call; on a struct-heavy
@@ -9225,50 +9250,18 @@ export function ensureRefElem(elemName: string) {
 }
 
 export function refArrElemKind(name: string) {
-  // `i32[][]`, `boolean[][]`, and literal-union `K[][]` all carry the i32-list wrapper element
-  // (kind 4) — one i32[] backing (`nameIsI32ListArray`), not three special cases.
-  if nameIsI32ListArray(name) { return 4 }
-  // Nested lists of a NON-i32 scalar/string element — the element is that inner list's
-  // WRAPPER (kinds 6/7/8 → `mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`). Used for a
-  // string[]/f64[]/i64[]-VALUED map's vals ref-list (the value analogue of `i32[][]` kind 4).
-  if nameIsArray(name) && nameIsStringArray(name.slice(0, name.length - 2)) {
-    // `string[][]` AND the niche `(string | null)[][]`: the element is the string-list
-    // wrapper (`$mkListIdx`) either way — the nullable rides INSIDE the inner elements.
-    return 6
-  }
-  if name == "f64[][]" { return 7 }
-  if name == "i64[][]" { return 8 }
-  if name == "f32[][]" {
-    return 10 // f32 inner list (element is the `$fl32TypeIdx` wrapper)
-  }
-  // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
-  // itself a ref array, stored as the inner list's WRAPPER — kind 9. Recurses to any depth via
-  // the interned inner slots. The scalar-leaf 2D names above are NOT ref arrays at the inner
-  // level (a scalar inner list is a singleton wrapper), so they keep their explicit kinds.
-  if nameIsArray(name) && nameIsRefArray(refArrElemName(name)) { return 9 }
-  if nameIsMapArray(name) { return 3 }
-  // A `(P | null)[]` nullable-struct array is a STRUCT ref list (kind 1) — its element is a
-  // `(ref null $P)` niche, not a union box. Checked before the value-union test below.
-  if nullStructArrElem(name) != "" { return 1 }
-  // A `({[string]: V} | null)[]` nullable-MAP array is a MAP ref list (kind 3) — the same
-  // `(ref null $mapStruct)` backing the non-null map element uses; the slot key keeps the
-  // `| null` so the index read stays nullable (`rlElemNullable`) for the `e != null` narrow.
-  if nullMapArrElemOf(name) != "" { return 3 }
-  // A `(i32[] | null)[]` nullable-LIST array is the i32[][] rep (kind 4) — its element is a
-  // `(ref null $lTypeIdx)` i32-list niche, not a union box. Checked before the value-union test.
-  if nullArrayArrElem(name) != "" {
-    return refArrElemKind(nullArrayArrElem(name) + "[]")
-  }
-  // A `(((i32) => boolean) | null)[]` nullable-CLOSURE array is a closure ref list (kind 5)
-  // — its element is a `(ref null $cloStruct)` niche, not a union box. Checked before the
-  // value-union test below (whose kind-2 box has no rep for a niche-nullable closure).
-  if nullClosureArrElem(name) != "" { return 5 }
-  // A `(string|i32)[]` value-union element list is a union-box list (kind 2).
-  if parenUnionArrElemName(name) != "" { return 2 }
-  // An `((i32) => i32)[]` array of functions is a closure-element list (kind 5).
-  if nameIsClosureArray(name) { return 5 }
-  // A `<Union>[]` element list is kind 2 — strip the `[]` once and match the bare union name
-  // (no per-iteration `+ "[]"` concat). Anything else (a struct array) is kind 1.
+  // Every SHAPE-decided arm, in the order this entry point tested them, is
+  // `refArrShapeKind` (destringify D-REFARRKIND) — the ladder `nameIsRefArray`
+  // carried a second hand-written copy of.
+  const sk = refArrShapeKind(name)
+  if sk >= 0 { return sk }
+  // The BASE arm, which is where the two entry points genuinely differ and so
+  // stays local (D-FIELDCODE's rule: keep the arm whose EVIDENCE differs at the
+  // call site): a `<Union>[]` element list is kind 2 — strip the `[]` once and
+  // match the bare union name (no per-iteration `+ "[]"` concat). Anything else
+  // (a struct / inline-shape / variant array, and any name no arm claims) is
+  // kind 1, which is why this entry point needs no struct-table consult at all
+  // while `nameIsRefArray` needs four.
   const n = name.length
   if n >= 3 && name[n - 2] == '[' && name[n - 1] == ']' {
     const base = name.slice(0, n - 2)
