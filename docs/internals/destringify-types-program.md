@@ -20050,7 +20050,7 @@ population is measured EMPTY**, so no pin can exist. Said plainly rather than dr
 
 ### Hand-offs, best-measured first
 
-1. **`wasmEmit.vl:4112` — the last hand-written `nonNulBaseOf` fold** (`emit_rewrite`'s and
+1. **`wasmEmit.vl:4112` — the last hand-written `nonNulBaseOf` fold** (line re-verified at `e5be130`) (`emit_rewrite`'s and
    `emit_collect`'s are done; `emit_classify`'s own went in this PR). Exact diff:
    ```
    -        let rlen = rlElemName[rslot]
@@ -20064,13 +20064,17 @@ population is measured EMPTY**, so no pin can exist. Said plainly rather than dr
    has exactly ONE other site (line 129 is the import), so this diff may STRAND the import, which
    only `lint-self.sh` sees.**
 2. **`typecheck.topLevelArrowIndex` and `emit_base.annArrowAt` are CHARACTER-IDENTICAL** — both are
-   `{ tyTopIndexOf(name, '=', 0, 0) }` (typecheck.vl:4745, emit_base.vl:1992). Re-verified at
-   `5d40f22`. `typecheck` is BELOW `emit_base` in the import graph so it cannot take the emitter's
-   name; the merge is **delete `topLevelArrowIndex` and inline `tyTopIndexOf(name, '=', 0, 0)` at
-   its three sites** (4754, 5360, 6963) — OFF-LIST **−3**, and one fewer spelling of the arrow
-   question. `typecheck.vl` is not this partition's file.
+   `{ tyTopIndexOf(name, '=', 0, 0) }`. **Line numbers re-verified at the GATING head `e5be130`,
+   not at the head they were found on**: typecheck.vl:**4788**, emit_base.vl:**2001** (they were
+   4745 / 1992 at `5d40f22`, and quoting those would have sent the next reader to the wrong lines —
+   the same staleness this section refutes twice above). `typecheck` is BELOW `emit_base` in the
+   import graph so it cannot take the emitter's name; the merge is **delete `topLevelArrowIndex` and
+   inline `tyTopIndexOf(name, '=', 0, 0)` at its three sites** (**4797, 5403, 7006**) — OFF-LIST
+   **−3**, and one fewer spelling of the arrow question. `typecheck.vl` is not this partition's
+   file.
 3. **`emit_query.vl`'s two CORE sites are ONE shape and both are render-then-parse**:
-   `nameIsI32Array(tyNameOf(paramTypeNode(fnIx, name)))` (769) and `nameIsStringArray(…)` (773).
+   `nameIsI32Array(tyNameOf(paramTypeNode(fnIx, name)))` (769) and `nameIsStringArray(…)` (773) —
+   that file is untouched by the rebase, so both line numbers hold at `e5be130`.
    The argument is a NODE both times, so the dual is an arena classifier pair on the param's type,
    not another name test. Taking the file to 0 is two arena predicates, not a home.
 4. **`shapeFieldParse` is the last hand-written ladder in the emitter and is NOT a dedup target.**
