@@ -15622,6 +15622,14 @@ reach emit)** and **43,200 generated fuzz programs (41,084 reach emit)**:
 | H2 arm reaches | 136 | 119 | 255 |
 | … **DISAGREEMENTS** | **0** | **0** | **0** |
 
+**PROVENANCE, so the table is not read as fresher than it is:** the coverage probe ran at
+`5d011ff`. Its CORPUS figures are re-confirmed at `4758935` by the work instrument below — the
+`splitTypeName` delta there is exactly **−9,764** and the `nameIsLitUnionType` delta exactly
+**−136**, i.e. the two reach counts reproduce at the new base. The FUZZ column was measured only at
+`5d011ff`; #1152 touched `emit_base`/`emit_collect`/`emit_mono` and not `typecheck.vl`, and the
+300-cell grade is cell-for-cell identical on both masters, but that column is the older reading and
+is labelled as such rather than silently carried forward.
+
 **The bank-missing population is NOT empty and I am not claiming it is** — 23.5% of reaches take
 the `-1`. What is measured empty is the DISAGREEMENT: the deleted split never answered "union"
 where the bank answers "not". The construction argument behind that: an emitter-SYNTHESIZED
