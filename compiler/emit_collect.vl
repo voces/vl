@@ -369,6 +369,7 @@ import {
   nameFieldCode,
   nameIsNulRefList,
   nameIsRefArray,
+  nonNulBaseOf,
   nulMapInnerName,
   nulMapShapeOf,
   nulRefArrayInnerSlotOfLet,
@@ -2258,9 +2259,7 @@ function rlMapElemValSlot(slot: i32, canon: boolean): i32 {
 // reaches it. A leg that cannot be sabotage-verified is not migrated (method note 6) — the
 // peel stays until a reacher exists, and now it stays in ONE place.
 function rlElemVariantHeap(slot: i32): i32 {
-  let rsen = rlElemName[slot]
-  const rsnn = nullablePartOf(rsen)
-  if rsnn != "" { rsen = rsnn }
+  const rsen = nonNulBaseOf(rlElemName[slot])
   const evi = variantIndexOf(rsen)
   if evi < 0 { return -1 }
   uVarHeap[evi]
@@ -3324,9 +3323,7 @@ function gaeCollectDecls(stmts: i32[]) {
 // `gaeEnsure` can intern (`Box<i32>[] | null` → `Box<i32>`). A name with no wrapper comes
 // back unchanged.
 function gaePeelWrappers(name: string) {
-  let nm = name
-  const nb = nullablePartOf(nm)
-  if nb != "" { nm = nb }
+  let nm = nonNulBaseOf(name)
   while nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
     nm = nm.slice(0, nm.length - 2)
   }
@@ -3591,10 +3588,7 @@ function collectShapeVariantFields(nm: string) {
       // field pass interns the accepted shape, and acceptance is monotone — a field code
       // undecidable now can only IMPROVE by the time `internInlineShape` classifies it
       // (union registration only grows), so the deferred intern never fails.
-      let nsBase = ftxt
-      const nsNul = nullablePartOf(nsBase)
-      if nsNul != "" { nsBase = nsNul }
-      if variantNestedShapeOk(nsBase) { fc = 15 }
+      if variantNestedShapeOk(nonNulBaseOf(ftxt)) { fc = 15 }
     }
     if fc < 0 {
       return emitFail(
@@ -3805,6 +3799,21 @@ function registerMapValUnion(stmts: i32[], mapName: string) {
   registerInlineUnion(stmts, mv)
 }
 
+// THE ONE HOME of "the RESULT ATOM of a closure SPELLING": strip the grouping parens a
+// closure carries in a composite position (`(() => i32 | boolean) | null` splits to the
+// arm `(() => i32 | boolean)`), take the text after its TOP-LEVEL `=>`, and normalize
+// that result the way a union arm is normalized. "" when the spelling carries no
+// top-level arrow — which is also every caller's "not a closure" answer.
+//
+// The three resolvers compose in a fixed ORDER and only in this order: peel BEFORE the
+// arrow scan (an unpeeled `(() => T)` hides its arrow at depth 1), normalize AFTER it
+// (the peel that matters for the RESULT is the result's own, not the closure's).
+// `registerInlineUnion`'s nul-closure arm and `nulCloMixedUnionUnregistered` each wrote
+// the composition out verbatim; they ask the same question of the same kind of name.
+function cloResultAtomOf(name: string) {
+  normTypeAtom(annRetNameOf(peelGroupParens(name)))
+}
+
 // Register the inline union synthetic name `name` (e.g. `"A|B"`) as a union alias in
 // the per-union tables, exactly as `collectU` registers a `UnionDecl`: record the
 // name + its variant-slice range, append each member to the GLOBAL `uVariants` list,
@@ -3936,7 +3945,7 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // registering it would satisfy the CASE-A floor while the box read mis-lowers
   // (verified REJECT→INVALID-WASM).
   if rnp != "" && nameIsNulClosure(name) {
-    const ncRes = normTypeAtom(annRetNameOf(peelGroupParens(rnp)))
+    const ncRes = cloResultAtomOf(rnp)
     if ncRes != "" {
       if isValueUnionName(ncRes) || nameIsMapMemberUnion(ncRes) {
         return registerInlineUnion(stmts, ncRes)
@@ -5067,8 +5076,27 @@ export function collectFnValUse() {
       // the arena's extra `true`s would intern closure machinery this compiler does not
       // intern today — a behavior change, not a destringification. This site retires with
       // the alias-blindness, not before.
-      let fvSb = nullablePartOf(tyNameOf(i))
-      if fvSb == "" { fvSb = tyNameOf(i) }
+      const fvSb = nonNulBaseOf(tyNameOf(i))
+      // A NULLABLE closure ARRAY (`((i32, i32) => f32)[] | null`) — the CROSS of the two
+      // cases above, and the hole neither covers: the annotation node is a `TyNullable`,
+      // not a closure array, so `nameIsClosureArrayTy` declines; and its non-null part is
+      // an ARRAY, not a closure, so `nameIsNulClosure` declines. The narrowed indexed call
+      // (`if p != null { p[0](1, 1, 1) }`) still `call_ref`s through an element
+      // fat-pointer, so the element signature must intern — without it the call finds no
+      // `$fnsig` and the program is rejected ("function-value call arity has no interned
+      // signature") even though every part of it is representable. This is the union-ARM
+      // loop's own closure-array test applied to the `| null`-peeled WHOLE: one rule, the
+      // arm position and the top-level position.
+      //
+      // THE CHEAP REJECT IS PART OF THE CALL. Both of `cloArrElemNameOf`'s legs demand a
+      // trailing `[]` before they can answer, but each opens with a depth SCAN
+      // (`parenUnionArrElemName`'s and `nameIsClosureArray`'s `annArrowAt` guard) — so
+      // without this one-character test every non-array annotation in the program would pay
+      // two whole scans to be told what its last character already said. A name not ending
+      // in `]` cannot be a closure array under either leg, so the guard is answer-exact.
+      if fvSb.length > 0 && fvSb[fvSb.length - 1] == ']' {
+        if cloArrElemNameOf(fvSb) != "" { fnValUsed = true }
+      }
       // D-UNION set ADT — the arms come from the recorded member column when the
       // annotation IS a registered row's member set, and the cardinality gate is
       // that list's length (the counting dual identity, see `shapeHasCloField`).
@@ -5191,13 +5219,7 @@ export function collectMapFilterUse() {
 // `>u` `$fnsig` must NOT be interned for it (see `collectCloSigs`' TypeRef pass) — the
 // call site then rejects loudly instead of cast-trapping at runtime.
 function nulCloMixedUnionUnregistered(arm: string) {
-  // `normTypeAtom`, not `monoUnwrapParens`: THIS FILE ALREADY IMPORTED THE HOME.
-  // `emit_base.normTypeAtom` is the paren-WRAP home (it rides `tyGroupWrapsWhole`
-  // since #1150) and `internCloResultSpine` two thousand lines up already calls it
-  // for the same "peel the closure result's grouping parens" step — while these
-  // three sites reached one module UP for `emit_classify.monoUnwrapParens`, the
-  // last hand-written paren-only wrap walk in the compiler. One grammar, one home.
-  const res = normTypeAtom(annRetNameOf(peelGroupParens(arm)))
+  const res = cloResultAtomOf(arm)
   if res == "" { return false }
   const atoms: string[] = []
   splitUnionAtoms(res, atoms)
