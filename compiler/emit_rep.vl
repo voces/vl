@@ -1168,6 +1168,62 @@ export function msMemberValKindsOf(s: i32, out: i32[]): boolean {
   true
 }
 
+// IS the interned member set `s` a VALUE union — one this emitter boxes into the
+// shared `{tag, payload}` rep? Tri-state: 1 yes · 0 no · -1 the pool or the kind bank
+// does not cover `s`, and the caller keeps its member-NAME path.
+//
+// D-VALUNION: this is `isValueUnionName`'s question asked of the BANK instead of of a
+// rendering. That resolver takes a union SPELLING apart three ways to reach an answer
+// that reads nothing but a vector of ABI codes — `unionMemberCount` (a whole-string
+// all-grouper depth scan), then `splitUnionAtoms` (the same scan again, materializing
+// every atom), then `valueAtomKind` per atom — and those codes are already recorded,
+// one per member, in the row's box-tag ABI order, by `recordUnMemTys`
+// (`unMemValKind`).
+//
+// **Why it is EXACT, not an approximation.** `msSetOfText(text) == s` hands back a set
+// only when `text` IS that set's members joined in recorded order, and those members
+// were split from exactly such a string once, at registration — the contract
+// `msMemberAtomsOf` already runs on in production. So `msMemberValKindsOf(s)` is
+// `[valueAtomKind(a) for a in splitUnionAtoms(text)]` member for member; and
+// `unionMemberCount` is `splitUnionAtoms`' own counting dual (the same scanner, the
+// same arms, separators counted instead of materialized), so the cardinality gate
+// matches too. The predicate below is `isValueUnionName`'s body with the derivation
+// replaced by the column read, arm for arm — including its short-circuit on a member
+// that is not a value atom at all.
+export function msIsValueUnion(s: i32): i32 {
+  const kinds: i32[] = []
+  if !msMemberValKindsOf(s, kinds) { return -1 }
+  if kinds.length < 2 { return 0 }
+  let nonNull = 0
+  let hasNull = false
+  let soloKind = -1
+  let i = 0
+  while i < kinds.length {
+    const k = kinds[i]
+    // A member that is not a value atom (a struct name, an inline shape, a
+    // ref-element array) — not a value union, and the scan stops, exactly as the
+    // spelling ladder's `if k < 0 { return false }` does.
+    if k < 0 { return 0 }
+    if k == nullValKind() {
+      hasNull = true
+    } else {
+      nonNull = nonNull + 1
+      soloKind = k
+    }
+    i = i + 1
+  }
+  if nonNull >= 2 { return 1 }
+  if nonNull == 1 && hasNull {
+    // Only a NUMERIC scalar boxes with null; `boolean | null` / `string | null` keep
+    // their niche encodings, which are not boxes.
+    if soloKind == 0 || soloKind == 3 || soloKind == 4 || soloKind == 5 {
+      return 1
+    }
+    return 0
+  }
+  0
+}
+
 // The globally-stable box TAG of a value atom, from its KIND — the ONE home of the
 // kind→tag table. `emit_classify`'s `scalarTagOf(atom)` delegates here over
 // `valueAtomKind(atom)`. Struct variants take the dense ranks below; atom kinds claim
@@ -1684,9 +1740,19 @@ function renderFaithful(nm: string): string {
 //   -2  the spelling did not resolve through the annotation grammar
 //   -1  resolved to a non-`TyObj` / a shape that participates in no row
 //   >=0 the unique matching row (`repRowOfTyStruct`'s pick, `[0, lim)`)
-// Confirm-only seat (mirrors #1017's `repRowOfTyStruct` landing): no consumer yet,
-// so the whole export is byte-identical — it MINTS arena types via `resolveAnnot`
-// only when called, and nothing calls it.
+// **STALE-COMMENT CORRECTION (D-VALUNION slice).** This header used to read
+// "Confirm-only seat (mirrors #1017's `repRowOfTyStruct` landing): no consumer yet, so
+// the whole export is byte-identical — it MINTS arena types via `resolveAnnot` only
+// when called, and nothing calls it." That was true when it landed and is FALSE now:
+// `repRowOfName` has **six** live call sites in `emit_classify.vl`
+// (`structIndexOfTypeRef`'s nullable arm ×2, `structIdxOfElemName`, and three more),
+// all on hot classification paths. So the `resolveAnnot` below — one of `emit_rep`'s
+// seven, the post-canon P4 population — is not a dormant seat: it is a checker RENDER
+// (`tyToStr`) put through a character-level normalization (`renderFaithful`) and then
+// RE-PARSED by the checker's annotation grammar, at every one of those six sites. That
+// round trip is this module's largest remaining destringify debt; the arena entry
+// (`repRowOfTyStruct`) is right below and already takes the index directly at five
+// other sites. See the hand-off in `docs/internals/destringify-types-program.md`.
 export function repRowOfName(nm: string, lim: i32): i32 {
   if nm == "" { return -2 }
   // The `repNameCanonKey` runaway cap (a render this long is never a legit key and
