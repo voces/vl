@@ -137,7 +137,20 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
   const printChars: number[] = [];
   let exports: WebAssembly.Exports = {};
   try {
-    const { instance } = await WebAssembly.instantiate(wasm, {
+    // The `as BufferSource` picks the BYTES overload of `instantiate`, the one that
+    // resolves to `{ module, instance }`. Without it TS resolves to the `Module`
+    // overload — which returns a bare `Instance`, so destructuring `.instance` off it
+    // is a type error. The cast is needed because a caller's `Uint8Array` is
+    // `Uint8Array<ArrayBufferLike>` while `BufferSource`'s view is pinned to a
+    // non-shared `ArrayBuffer`; that variance gap is invisible to this API, which
+    // accepts either at runtime. The CALL is byte-for-byte what it was before the
+    // exports were returned — no compile/instantiate split, so start-function traps
+    // still surface here and map identically.
+    //
+    // Worth knowing: `deno task test` runs with `--no-check`, so the local gate does
+    // NOT type-check this file. `ci-native`'s `deno test -A tests/cases_wasm_test.ts`
+    // does, and it is what caught this.
+    const { instance } = await WebAssembly.instantiate(wasm as BufferSource, {
       imports: {
         // Direct value sinks for the `print(x)` builtin. A wasm i64 arrives as a
         // JS bigint; the rest as numbers. Booleans render as `true`/`false`.
