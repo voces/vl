@@ -27,8 +27,10 @@ import {
   builtinCompletionsFromWasm,
   type Completion,
   type CompletionKind,
+  displayableType,
   docMarkdown,
   inlayHintsFromWasm,
+  isDisplayableType,
   keywordCompletions,
   type LspRange,
   memberCompletionsFromWasm,
@@ -155,14 +157,19 @@ export const hover = async (
   ): Promise<string | undefined> =>
     await fn(text, entryKey, reader, pos.line, pos.character).catch(() => undefined);
 
-  const t = await at(checker.hoverTypeAt) ??
-    await at(checker.memberTypeAt) ??
-    await at(checker.typeAliasAt);
+  // Each rung is filtered through `displayableType` (same as `server.ts`): the
+  // body renders as a fenced `vital` code block, so a native rendering carrying
+  // an absence-of-a-type sentinel (`<error>` for an annotation that didn't
+  // resolve) counts as NO ANSWER and falls through to the next rung instead of
+  // printing a type name VL does not have.
+  const t = displayableType(await at(checker.hoverTypeAt)) ??
+    displayableType(await at(checker.memberTypeAt)) ??
+    displayableType(await at(checker.typeAliasAt));
   if (t) return { contents: `${word.text}: ${t}`, range: word.range };
 
   // Builtin (`print`/`i32`/…): the word in the native builtin set.
   const b = checker.builtinCompletions().find((x) => x.name === word.text);
-  if (b && b.detail.length > 0) {
+  if (b && isDisplayableType(b.detail)) {
     return { contents: `${word.text}: ${b.detail}`, range: word.range };
   }
   return null;

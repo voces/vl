@@ -20467,6 +20467,304 @@ measured-empty population of the candidate this slice declined.
    coverage rests on the corpus alone. It also emits single files, so the module merge is
    fuzz-unreachable. Both channels were required here for exactly that reason.
 
+## D-BAREMAP + D-CAPCALLEE — the map ANNOTATION classifiers stop splitting a rendered union, and the capture exemption becomes a POSITION instead of a name filter
+
+**Slice: `compiler/emit_base.vl` + `emit_classify.vl` + `emit_collect.vl` (comment only) +
+`emit_query.vl`, plus four fixtures.
+Two independent user-visible bugs FIXED, both pinned red on a master-built compiler by running it.**
+
+### Base re-measured, not inherited — and the shared checkout's seed was stale for it
+
+Branched from **`b4e738c`** (#1169), rebased mid-slice onto **`76d40ae`** (#1171) when master moved
+twice under it. `parsercount.py` reproduces the brief's **CORE 303 · OFF-LIST 27 · TRUE 330** exactly
+at BOTH heads, per file `emit_classify` 175 · `emit_base` 48 · `typecheck` 46 (19 + 27) ·
+`emit_collect` 43 · `emit_mono` 5 · `wasmEmit` 5 · `emit_rewrite` 5 · `emit_rep` 2 ·
+`emit_sections` 1 · `emit_query` **0**. The discovery census reproduces #1169's **2,071** ship figure
+exactly.
+
+**The seed in the shared checkout was 1,029,179 B — the #1168 artifact — while `b4e738c`'s true
+fixpoint is 1,029,637 B and `76d40ae`'s is 1,033,104 B.** Every baseline here was rebuilt from source
+in this session: master `76d40ae` = **1,033,104 B**, SHA-256 `60d0a224…`.
+
+| | master `76d40ae` | this PR |
+|---|---|---|
+| **CORE** (23-resolver list) | 303 | **303** |
+| **OFF-LIST** (#1141's table) | 27 | **27** |
+| **TRUE TOTAL** | 330 | **330** |
+| **discovered call sites** (my vocabulary) | 2,077 | **2,071 (−6)** |
+| **inline surgery ops** (units b+c) | 3,445 | **3,448 (+3)** |
+| `nameIsBareMap` call sites | 21 | **16 (−5)** |
+| binary | 1,033,104 B (`60d0a224…`) | **1,033,398 B** (`437d9261…`), **+294 B** |
+
+### TARGET 1 — D-BAREMAP: the arena classifier was written, exported and IN PRODUCTION, and the annotation-node consumers had never adopted it
+
+`nameIsBareMap(name)` is `nameIsMap(name) && !nameIsMapMemberUnion(name)` — a two-character probe
+(`{` then `[`) that a map-FIRST union `{[string]: i32} | boolean` also passes, followed by a
+top-level union SPLIT to subtract the false positive back out. Its own header (#1139) had already
+written down the answer: *"`ty is TyMap` is true for a bare map and false for a `TyUnion` with a map
+arm, so when the annotation-node consumers get a covered `nodeTyIx` the migration is an edit to THIS
+function"*, and #1169 discharged the coverage blocker.
+
+**What the hand-off did not say is that the classifier already existed.**
+`typecheck.nodeTyIsMap(ix)` — `nodeTyIxOf` then `t is TyMap`, a variant-tag test with no split and
+no substring — has been exported since it was written for map-returning closure VALUE calls, and
+`emit_classify.vl` **already imports it and calls it at three EXPRESSION sites**. This slice does not
+introduce an arena leg; it points the ANNOTATION-node consumers at the one already in production,
+which is the same reading D-PARAMARR applied to `ret*ArrFlag`.
+
+Six annotation-node sites were instrumented as twins against it (a seventh, `retNulMapFlag`, against
+a new `TyNullable`-over-`TyMap` sibling):
+
+| site | reach | arena-COVERED | **disagreements** | **uncovLive** | name-TRUE |
+|---|---|---|---|---|---|
+| `emit_classify.retMapFlag` | 285,915 | 285,915 | **0** | **0** | 51,665 |
+| `emit_classify.retIsMapLocalAnnot` | 40 | 40 | **0** | **0** | 6 |
+| `emit_classify.letIsMap` (REP fall-through) | 18,506 | 18,506 | **0** | **0** | 9,913 |
+| `emit_classify.letMapShapeOf` | 55,818 | 55,818 | **0** | **0** | 55,755 |
+| `emit_query.paramMap` | 354,137 | **48,781 of 48,781 real nodes** | **0** | **0** | 33,865 |
+| `emit_classify.retNulMapFlag` (nullable twin) | 348,214 | 348,214 | **0** | **0** | 7,742 |
+| **migrated total** | **1,062,630** | — | **0** | **0** | **158,946** |
+| `emit_collect.collectA` — **DECLINED** | 260,650 | 260,618 | **0** | **2** | 66,016 |
+
+**1,323,280 twin invocations across corpus (1,363 cases) + fuzz plain (43,200) + fuzz values
+(43,200); 0 disagreements anywhere; the positive population is 224,962 name-TRUE rows, so the zero is
+agreement and not an empty channel.** The INVERTED twin (arena verdict flipped) disagrees at
+**100.0% of covered reaches on both channels** — 59,364/59,364 corpus, 467,609/467,609 fuzz — so the
+comparator is proved to fire.
+
+`paramMap`'s coverage is **16% or 100% depending on the question**, and only one of them is
+decision-relevant: 48,781 of 354,137 reaches are arena-covered, but 48,781 of **48,781** reaches that
+have a parameter annotation node at all are. The other 305,356 are `paramTypeNode` = -1 — the ident
+is not a parameter of this function — where the name leg was asking `nameIsBareMap("")`.
+
+### 🔁 REFUTATION 1 — my own first uncovLive reading was ZERO, and it was measuring NOTHING
+
+The per-file attribution run (`vl build` per case, one process each) reported **0** uncovered-live
+rows against the shared-instance run's **2**, and the obvious reading — "cross-program state, only a
+shared instance can see it" — is the one this program's own rules would predict. It is wrong.
+**`probehost.ts`'s header says why: the Rust host uses an EMPTY import object, so a `print` inside
+the compiler cannot link there.** The per-file log contained **0 lines beginning `PB`** — not zero
+uncovered rows, zero *rows*. Caught by grepping the log for a counter that must always be present,
+not by luck. *A harness that reports through a channel the runner does not provide reports a clean,
+confident, meaningless zero.*
+
+### 🔁 REFUTATION 2 — `collectA` is the one site where annotation coverage is NOT total, and the witness is a single file
+
+Five sibling sites read `uncovLive` 0 over 713,000 invocations. `collectA` reads **2**, and the
+reason is structural rather than statistical: it is the only one that walks **every `TypeRef` in the
+arena** instead of a POSITIONED annotation. The witness is
+`tests/cases/maps/map-value-union-struct-map-field.vl`, whose `{[string]:boolean}` occurs nested
+inside a union member's struct field and inside an `is` pattern — interior nodes the checker records
+no type for. Migrating it would silently drop the map types those nodes force. **Declined, with the
+witness printed rather than counted** (the site list, not the site count); the gap closes when
+interior `TypeRef`s get a `nodeTyIx`, not by adding a fall-through rung.
+
+### TARGET 2 — D-CAPCALLEE: the capture exemption was a NAME filter where it should have been a POSITION
+
+`capRecord` consulted `isBuiltinFnName` at **every identifier in every position**. Two independent
+user-visible bugs fall out of that one line, and both are fixed by moving the question into
+`capScan`'s `Call` arm, for the CALLEE only:
+
+**(a) every memory intrinsic was uncallable from a closure.** Censused here, not inherited — all
+eleven memory intrinsics × four call positions, 44 programs, on a master compiler I built:
+**22 of 44 failed** with `captured variable not found in enclosing frame`, uniformly the two
+positions "inside a lambda body" and "named function in a module that uses a function value". 20 of
+the 22 now run. Since every `Buffer` method is a named function wrapping an intrinsic, this was the
+hard prerequisite for `std:buffer` (`buffer-design.md` §B3/O7, slice S1).
+
+**(b) a local that merely SHARES a builtin's spelling was dropped from the capture list.**
+`const toString = 5` + `() => toString + 1` failed to emit on master with
+`identifier is not a parameter, local, or global`. Nothing to do with memory; it has been latent for
+as long as the filter has sat in `capRecord`.
+
+**The filed one-line alternative — adding the intrinsics to `isBuiltinFnName` and leaving the filter
+where it was — was measured and would have REGRESSED a working program.** #1167's intrinsic-name
+reservation covers `function` / `const` / `let` but **not parameters**, so
+`function go(__load_i32__: i32) { const f = () => __load_i32__ + 1; f() }` is legal VL and prints
+**42** on master. Under a name-list fix it becomes `captured variable not found`. Under the
+positional fix it still prints 42, because the parameter is read as a VALUE and only a CALLEE is
+exempt. Both halves are pinned in one fixture.
+
+Parens are unwrapped for the callee test so `(print)(1)` reads as `print(1)` — master's filter ran
+inside `capRecord` and so could not see the wrapper.
+
+### ⚠ A THIRD, INDEPENDENT INVALID-WASM BUG, FOUND BY THE CENSUS AND **NOT** FIXED HERE
+
+The 44-program census turned up a defect the capture error had been **hiding** in two of its three
+positions. It reproduces byte-identically on master and on this PR, so it is not this slice's:
+
+```vl
+function w(): f32 { __load_f32__(0) }   // → Invalid input WebAssembly code: type mismatch: expected i32, found f32
+const v: f32 = __load_f32__(0)          // → same
+```
+
+Narrowed by running, four points:
+
+| program | verdict |
+|---|---|
+| `print(__load_f32__(0))` at top level | **runs**, 1.5 |
+| `function w(a: i32): f32 { __load_f32__(a) }` (address is a PARAM) | **runs**, 1.5 |
+| `function w(): f32 { __load_f32__(0) }` (address is a LITERAL) | **invalid wasm** |
+| `const v: f32 = __load_f32__(0)` | **invalid wasm** |
+
+`f64`, `i64` and every integer width are unaffected in all four shapes. `load-width-in-named-fn.vl`
+misses it because its address is a parameter. Filed, not taken — the lowering is `wasmEmit.vl`, not
+this partition. **The inverted fixtures deliberately use the parameter form**, which is why they run.
+
+### Gate — every leg, RC checked EXPLICITLY, master baseline rebuilt at MY head in THIS session
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh --prove-fixpoint` | RC=0 — master **1,033,104 B** (`60d0a224…`), ship **1,033,398 B** (`437d9261…`), **+294 B**; both self-reproducing |
+| `native-fixpoint.sh` | RC=0 — stage3 == stage4 byte-for-byte (1,033,398 B) |
+| `lint-self.sh` | RC=0, fmt clean (`vl fmt` re-run on every edited file before every build) |
+| suite (`SELFHOST_NATIVE_ALIGN=1 deno task test`) | **2,130 passed / 0 failed / 8 ignored** |
+| suite, master **re-measured in this session, same command, same tree** | **2,130 / 0 / 8** — and the identical TOTAL is not blindness: the test **NAME SETS** differ by exactly four rows, +2 new pins and −2 `native-align emit-reject` rows the two inverted fences no longer generate. Ignored NAME SETS diffed as SETS: **identical, 8 non-empty names each** |
+| corpus A/B, master vs ship | **1,391 files, 4 differing — every one a pin**, all `BUILDSTATUS(1→0)`; **1,387 pre-existing files byte-, message-, rc- and stdout-identical** |
+| corpus A/B, the D-BAREMAP half ALONE (measured at `b4e738c` before the rebase) | **1,374 files, 0 differing** — the refactor half is byte-neutral and the four diffs are entirely the bug fix |
+| corpus channel populations (side A) | 1,168 produce wasm (1,164 distinct SHAs) · 223 carry a compiler message (221 distinct) · 1,127 produce stdout (962 distinct) · 2 distinct build rcs · 2 distinct run rcs |
+| **`vl check <dir>` SHARED-INSTANCE leg** | RC=1 both sides (the corpus carries deliberate rejects) — **7,313 output lines each, 1,829 diagnostic lines, 0 differing** |
+| lint-tier A/B (`vl check --severity hint`, per file) | **1,391 rows, 788 carrying ≥1 TAGGED diagnostic, 786 distinct texts — 0 differing** |
+| fuzz A/B, master vs ship | 12 seeds × 3 depths × 2 modes = **86,400 programs/side**, 87,196 output files/side, 796 `.err`, 7,157 + 6,980 distinct `.out` contents; whole `--out-dir` trees via `diff -r` — **RC=0, 0 differing paths** |
+| `rep-fuzz-check.sh` | RC=0, exact ✅ (1 baselined, 0 unsound, 0 new, 0 stale) |
+| invocation counts, both sides, both channels | below — **every relocation identity residual 0 on the fuzz channel** |
+| final artifact | `cmp`-checked byte-identical to `SHIP.wasm`, the compiler every leg above was measured with, after **three** source round-trips |
+
+### THE WORK COUNT — the fuzz channel is a PROVABLY IDENTICAL WORKLOAD, so the identities close exactly
+
+The corpus is **not** an identical workload across the two sides: four files that fail early on
+master run to completion on the ship, so every corpus counter carries their extra work. The fuzz
+channel is identical (0 differing paths, and the two control counters — `retNulMapFlag` reaches and
+capture names pushed — read **Δ 0**), so the identities are checked there.
+
+**FUZZ (43,200 programs)** · counters installed identically on master's source and the ship's,
+every anchor a FUNCTION HEADER
+
+| counter | master | ship | Δ | identity |
+|---|---|---|---|---|
+| `nodeTyIsMap` calls | 36,810 | 352,673 | **+315,863** | **= the five migrated sites' reach EXACTLY** (122,660 + 0 + 9,809 + 23,787 + 159,607) — **residual 0** |
+| `tyIsNulBareMap` calls | 0 | 151,927 | **+151,927** | **= `retNulMapFlag`'s reach EXACTLY** — residual 0 |
+| `nulMapInnerName` calls | 296,492 | 147,401 | **−149,091** | **= reach 151,927 − hits 2,836 EXACTLY** — residual 0 |
+| `nullablePartOf` calls | 2,881,198 | 2,732,107 | **−149,091** | **a SECOND INDEPENDENT INSTRUMENT on the same number** — residual 0 |
+| `nameIsMapMemberUnion` calls | 224,685 | 130,513 | **−94,172** | |
+| `splitUnionAtoms` calls | 1,495,453 | 1,401,281 | **−94,172** | **exactly the line above** — residual 0 |
+| `nameIsBareMap` calls | 846,130 | 518,990 | **−327,140** | = −315,863 direct − **11,277** inferred (removed `nulMapInnerName` calls whose `| null` peel was non-empty). **That one term is attributed by arithmetic, not by a second counter, and is recorded as such.** |
+| `nameIsMap` calls | 1,733,337 | 1,312,025 | **−421,312** | **= `nameIsBareMap` Δ + `nameIsMapMemberUnion` Δ EXACTLY** (−327,140 − 94,172) — residual 0 |
+| `capRecord` calls | 182,063 | 123,366 | **−58,697** | the callee idents no longer walked |
+| `isBuiltinFnName` calls | 101,601 | 85,187 | **−16,414** | asked once per Call-callee, not once per identifier |
+| **capture names PUSHED** | 42,904 | 42,904 | **0** | **the capture SET is unchanged on this channel** — the generator emits no shadowing builtin name and no intrinsic, so D-CAPCALLEE is pure work removal here |
+
+**THIS ONE IS A WORK WIN, AND IT IS ON THE AXIS THAT MATTERS.** `splitUnionAtoms` allocates a
+`string[]` per call: **−94,172 list allocations per 43,200 fuzz programs**, plus −149,091
+`nullablePartOf` scans and −421,312 two-character probes, for +294 B of binary. The corpus figures
+are the same shape (−55,020 `nameIsMap`, −5,653 `splitUnionAtoms`, −20,146 `nullablePartOf`) with a
+**+16** residual on `nullablePartOf` that is **not** attributed to a named callee and is recorded as
+open — the four newly-compiling pin files are the likely source, which is exactly why the identities
+are claimed on the fuzz channel and not this one.
+
+### Entombment — two positive controls and seven sabotages, all built from the SHIPPED source
+
+Each was built from the shipped source with a master-built compiler and A/B'd against the ship over
+the full 1,391-file corpus. The ship source was restored and **rebuild-`cmp`-proved** between every
+one.
+
+| | sabotage | corpus reddened | verdict |
+|---|---|---|---|
+| **P1** | all five migrated bare-map arena tests answer false | **65** | positive control — the sites ARE observed |
+| **P2** | the callee-position skip is removed entirely | **280** | positive control — the exemption IS observed |
+| S1 | `retMapFlag` reads the NULLABLE-map classifier | **58** | **PINNED by pre-existing fixtures** |
+| S2 | `letMapShapeOf` drops its bare-map guard | **1** | **PINNED** — `maps/nullable-map-union-value-read.vl` |
+| S3 | `paramMap` reads `nodeTyIsObj` instead of `nodeTyIsMap` | **15** | **PINNED** |
+| S4 | `tyIsNulBareMap` inverts its inner `TyMap` test | **8** | **PINNED** by eight pre-existing `maps/` + `unions/` fixtures |
+| S5 | the callee skip fires in EVERY position (master's filter) | **1** | **PINNED by the NEW fixture** — `closures/capture-local-named-like-builtin.vl`, and by nothing else, which is why that fixture had to be written |
+| S6 | the ten memory intrinsics come back off the inline-lowered list | **3** | **PINNED by the three memory fixtures** |
+| S7 | `letIsMap`'s arena fall-through answers false | **0** corpus **and 0 of 86,400 fuzz** | **INERT ON BOTH CHANNELS — no pin can exist, and that is stated rather than papered over** |
+
+**S7 is the finding, not the gap.** That branch is reached 18,506 times and answers TRUE 9,913 times,
+and turning its answer off changes **not one byte, message, exit code or line of stdout** on either
+channel — because `letIsMap`'s trailing `exprMap(d.letInit)` reclaims every one of them (a map local
+is initialised by `Map()`). So the `nameIsBareMap` call this slice replaced there was, measurably,
+**dead weight**: a `nameIsMap` plus a top-level union split per REP-uncovered map annotation, whose
+answer never reached an output. It was still migrated faithfully rather than deleted — an
+unwitnessed behaviour change is not licensed by an unwitnessed sabotage, the same reading #1169
+applied to its candidate C.
+
+Four pins, each verified RED on a master-built compiler **by running it**, GREEN here:
+
+| pin | master | ship |
+|---|---|---|
+| `memory/load-width-in-named-fn-with-lambda.vl` (was an `@emit-error` fence) | `captured variable not found in enclosing frame` | `2` `1.5` `63` |
+| `run/memory-intrinsic-in-named-fn.vl` (was an `@emit-error` fence) | same | `2` `5` |
+| `memory/intrinsic-inside-lambda-body.vl` (new) | same | `7` `1` |
+| `closures/capture-local-named-like-builtin.vl` (new) | `identifier is not a parameter, local, or global` | `6` `42` |
+
+### FOUR CENSUS COLUMNS, FOUR DIFFERENT VERDICTS ON ONE PATCH — again
+
+| column | base `76d40ae` → ship | verdict |
+|---|---|---|
+| CORE (the 23-resolver list) | 303 → **303** | **0** — none of `nameIsBareMap` / `nodeTyIsMap` / `nulMapInnerName` is on it |
+| OFF-LIST (#1141's table) · TRUE | 27 → 27 · 330 → 330 | **0** |
+| **discovered call sites** | 2,077 → **2,071** | **−6** (`emit_classify` 883→877, `emit_query` 20→19, `emit_base` 124→**125**) |
+| **inline surgery** (units b+c) | 3,445 → **3,448** | **+3** — the four new intrinsic-name equalities in `isBuiltinFnName` |
+| **dynamic** (43,200 fuzz programs) | — | **−421,312** `nameIsMap` · **−94,172** `splitUnionAtoms` · **−149,091** `nullablePartOf` |
+
+The scoreboard the program has tracked for thirteen slices reads **zero** on a patch that deletes
+94,172 union splits per fuzz run. **My discovery census does not reproduce #1169's inline figure
+either** (277 char-literal comparisons tree-wide against its 738); the vocabularies differ, so only
+the deltas are claimed. The resolver SET itself moved by one (468 → 467), so the per-file discovery
+numbers are not a simple sum of the edits, and that is stated rather than smoothed.
+
+### REFUTATIONS — worth more than the agreements
+
+1. **My own "0 uncovered-live" was measured on a log containing 0 probe lines.** The Rust host links
+   an empty import object, so the compiler's `print` goes nowhere. Cross-checked by grepping for a
+   counter that must always be present.
+2. **`collectA` does NOT migrate**, and the reason is structural (it walks every `TypeRef`, not a
+   positioned annotation), with a named single-file witness.
+3. **The filed one-line capture fix would have regressed a working program** — a PARAMETER named
+   after an intrinsic is legal VL today (#1167 reserves `function`/`const`/`let`, not parameters)
+   and prints 42 on master. Measured, not argued. The positional fix keeps it.
+4. **The `nameIsBareMap` hand-off understated its own case**: the arena classifier was not a
+   prospect gated on coverage, it was already written, already exported, and already in production
+   at three expression sites in the very file that needed it.
+5. **A third invalid-wasm bug exists and this slice does not fix it** — `__load_f32__` with a
+   LITERAL address in any consumer position other than `print` — and the capture error was masking
+   it in two of three positions.
+6. **S7 is inert on both channels**, so the leg it protects has no pin and cannot have one. Said
+   plainly, with the mechanism.
+7. **The identical suite totals (2,130 vs 2,130) are not a coincidence and not blindness** — the
+   NAME SET decomposes them as +2 −2.
+
+### Hand-offs, best-measured first
+
+1. **`export function nameIsEmitterIntrinsic` in `typecheck.vl` — a one-word diff that deletes a
+   list.** `emit_base.isBuiltinFnName` now carries a PARTIAL COPY of that private predicate (the four
+   non-load dunder names; the seven load widths already delegate to the exported
+   `nameIsMemLoadIntrinsic` for exactly this reason). `nameIsEmitterIntrinsic`'s own header says the
+   lists *"must be kept in step — a new inline-lowered intrinsic belongs here the same day"*, and
+   #1170 shipped a drift guard for the same hazard one file over. Exporting it collapses the whole
+   dunder block in `isBuiltinFnName` to one delegation. **Not taken because `typecheck.vl` is
+   another partition's file**; the diff is one word.
+2. **`emit_classify.mapValKindLowerable` and `mvShapeOfMapName` are the next rung**, and they are now
+   the ONLY reason four of the migrated sites still touch a spelling: each is
+   `f(mapValNameOf(mapName))` over a name whose `TyMap` the caller has just proved it holds. The
+   arena carries the value type directly (`t.mVal`), and `emit_rep.mvSlotOfTy` already resolves a
+   slot from an arena index. `mapAnnShape` is the same shape a third time
+   (`nulMapInnerName` + `nameIsMap` + `mapValNameOf`, two of them CORE-list calls) — **that one moves
+   the 23-resolver scoreboard, which this slice does not.**
+3. **`collectA`'s interior `TypeRef`s are the coverage frontier**, sized: 2 of 260,650. Anyone
+   extending `nodeTyIx` to interior annotation nodes gets that site and can check the fix with the
+   probe in this PR (`mkprobe.py`, site S4).
+4. **`__load_f32__` with a literal address is live invalid wasm** — four-point narrowing above, both
+   sides identical, `wasmEmit.vl`.
+5. **A `capRecord`-position hole remains and is NOT closed here**: a PARAMETER holding a function
+   value and named after a builtin (`function go(print: (i32) => i32) { … () => print(1) … }`) is
+   still exempt in callee position, on master and here. Closing it needs the callee test to consult
+   the enclosing frame, which `capScan` does not have. Unchanged behaviour, stated because the
+   positional fix makes it look closed.
+6. **`nameIsBareMap` is down to 16 sites and every one of them holds a STRING, not a node** — an atom
+   peeled out of a union, a slice of a bigger spelling, `nameIsMapArray`'s element. They do not move
+   until the thing that produced the substring hands over a type instead.
 ---
 
 ## PR — QUEUED DEFECTS: the numeric-literal-union alias, the two nullable-print niches, the memory-intrinsic operand context, the else-less `if` binding, the `unknown type` component, and the dead-intrinsic census (off master `b57bed0`)
