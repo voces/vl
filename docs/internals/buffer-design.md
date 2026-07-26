@@ -258,9 +258,9 @@ fresh view length: 262144 value survived grow: 11223344
 
 Guest data survives; the *host's view* does not, and an indexed read of a detached typed array
 yields `undefined` rather than throwing. In webcraft's render-publish path that is a silent
-wrong-answer channel. P0.1 (growth) and P0.2 (export) are individually harmless and jointly a trap
-— this is the strongest argument for the allocator reserving up front rather than growing lazily.
-See **O5**.
+wrong-answer channel. P0.1 (growth) and P0.2 (export) are individually harmless and jointly a trap,
+so the allocator's growth policy is not an allocator-internal detail — it is part of the host
+contract. **O5** is where that gets ruled.
 
 ### B6. `imports.memory` is dead in all three hosts
 
