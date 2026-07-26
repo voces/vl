@@ -1,6 +1,7 @@
 import {
   inferRetNameOf,
   isValueUnionName,
+  isVarTyIxOf,
   nameIsLitUnionType,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulBool,
@@ -17,6 +18,7 @@ import {
   nodeTyMapValIsNulLitUnion,
   nodeTyMapValLitUnionTexts,
   splitUnionAtoms,
+  tyIsLitUnion,
   valueAtomKind,
 } from "./typecheck"
 import {
@@ -120,9 +122,7 @@ import {
   inferNicheNullByName,
   isLitVariantName,
   loopStackFind,
-  mapValNameOf,
   memberPathKeyOf,
-  nameIsMap,
   nulCloFlag,
   nullablePartOf,
   numLexIsDecimal,
@@ -229,7 +229,10 @@ import {
   mvValKind,
   mvValName,
   mvValStructIdx,
+  narrowNames,
+  narrowSets,
   narrowTop,
+  narrowTys,
   pendingF32,
   pendingF64,
   pendingI64,
@@ -457,7 +460,6 @@ import {
   mapIsSetExpr,
   mapShapeOfExpr,
   mapSlotTag,
-  mapTagOf,
   memIsNarrowed,
   memNarrowVariantIndex,
   memberUnionFieldName,
@@ -472,14 +474,13 @@ import {
   msMemberAtomsOf,
   msMemberAtomsOfSet,
   msSetOfText,
+  msSoleMemberTy,
   msSubNull,
   mvListValKind,
   mvSlotNullable,
-  mvSlotOfMapValNameOrMono,
   mvSlotOfValNameFind,
   mvValInnerRlSlot,
   mvValUnionHasNull,
-  nameIsRefArray,
   nameIsWholeSpanShape,
   narrowVariantFor,
   narrowedMapOf,
@@ -495,9 +496,7 @@ import {
   paramStructIdxOf,
   pendingLitUnion,
   pushPostGuardNarrow,
-  refArrElemName,
   refArrSlotTag,
-  refArrTagOf,
   refListSlotOfExpr,
   refPushScratchBaseFor,
   removeAtomFromSet,
@@ -539,8 +538,12 @@ import {
   structListPopGetElem,
   tyAnnRefListKind,
   tyAnnRefListSlot,
+  tyRefArrElemOf,
   uFieldElemTyIxAt,
   uFieldTgtStructIdx,
+  unMemAtomKind,
+  unMemIsMap,
+  unMemIsRefElemArray,
   unionArmVariantForObj,
   unionArmVariantForStructExpr,
   unionClosureArmName,
@@ -570,6 +573,7 @@ import {
   msSoloValKind,
   mvSlotOfTy,
   scalarTagOfKind,
+  tyMapValOf,
   vbHeapIdxOfKind,
 } from "./emit_rep"
 import { monoArgTyName } from "./emit_mono"
@@ -1724,6 +1728,64 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
   -1
 }
 
+// ── the `is`-test type, from the CHECKER's bank (destringify D-ISTY) ──────────
+// The union-BOX tag the type `ity` claims as a value-union ARM, or -1 when it claims
+// none (a struct variant, a literal, an un-interned shape — the paths below `emitIs`'s
+// tag compare decide those). `ity` is the arena type `checkIsExprNode` already resolved
+// for the `is` node (`nameToTy(n.isVariant)`, banked as `isVarTyIxOf`), so the four
+// spelling tests this replaces — `valueAtomKind`, `nameIsLitUnionType`, `nameIsMap`
+// (+`mapTagOf`) and `nameIsRefArray` (+`refArrTagOf`) — are all projections of ONE
+// value, exactly the shape #1110 found in the atom algebra.
+//
+// Arm by arm, and why each is the same question the spelling asked:
+//   · a value ATOM tags by its KIND — `unMemAtomKind` is `valueAtomKind`'s arena dual
+//     (same code space, same order of tests) and `scalarTagOfKind` is the tag;
+//   · a LITUNION (`x is K0` over `type K0 = "a" | "b"`, or an inline all-quoted set)
+//     boxes as the STRING ref its members are, so it claims kind 2's tag — the
+//     structural form of the `isAtom = "string"` rewrite this site used to do;
+//   · a MAP arm tags on its VALUE's interned mv slot, `mapTagOf`'s own composition
+//     with the value name sliced out of the arena instead of out of the spelling;
+//   · a REF-ELEMENT array arm tags on its element's reflist slot — `refArrTagOf`'s
+//     composition, with `nameIsRefArray`'s reflist-nameability folded into the slot
+//     lookup, which is what that predicate actually adds over a shape test (#1116).
+// A slot the reflist layer does not claim answers -1 exactly as `refArrTagOf` does.
+function isArmTagOfTy(ity: i32): i32 {
+  if ity < 0 { return -1 }
+  let ak = unMemAtomKind(ity)
+  if ak < 0 {
+    if tyIsLitUnion(ity) { ak = 2 }
+  }
+  if ak >= 0 { return scalarTagOfKind(ak) }
+  if unMemIsMap(ity) { return mapSlotTag(mvSlotOfTy(tyMapValOf(ity))) }
+  if unMemIsRefElemArray(ity) {
+    const sl = rlSlotOfTy(tyRefArrElemOf(ity))
+    if sl >= 0 { return refArrSlotTag(sl) }
+  }
+  -1
+}
+
+// The arena TYPE the active narrowing of `name` binds, or -1 when `name` is not
+// narrowed / the narrowing carries no single type. The narrowing stack banks it at the
+// push (`pushNarrowRep(name, variant, isVarTyIxOf(condIx), setId)`), so a consumer of a
+// narrowed arm can read the STRUCTURE instead of re-classifying the rendered variant
+// the same push stored beside it. A complement push (`x != null`) carries a member SET
+// rather than a type, and its sole surviving member IS the bound type (`msSoleMemberTy`).
+// (A twin of `emit_classify`'s private `narrowSlotOf` + `narrowSlotTy` over the same
+// `emit_state` tables — see the hand-off in the destringify doc: those two want
+// exporting, and this twin then goes.)
+function narrowedArmTyOf(name: string): i32 {
+  let i = narrowTop - 1
+  while i >= 0 {
+    if narrowNames[i] == name {
+      const t = narrowTys[i]
+      if t >= 0 { return t }
+      return msSoleMemberTy(narrowSets[i])
+    }
+    i = i - 1
+  }
+  -1
+}
+
 function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   // `p is null` over a NULLABLE struct ref — `ref.is_null` (no union needed).
   const nd0 = P.nodes[isIx]
@@ -1753,31 +1815,15 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   // compare as a struct variant, against the atom's globally-stable scalar tag.
   const ndv = P.nodes[isIx]
   if ndv is IsExpr {
-    // A litunion-alias variant (`x is K0` where `type K0 = "a" | "b"`) over a value union:
-    // `emitUnionCoerce` boxes a litunion member as a STRING ref (its members are string
-    // literals), so `is K0` is the string-tag compare. A real `string` member would have
-    // absorbed the litunion (`K0 | string` collapses to `string`), so no tag collides.
-    // D-UNION-ATOM-KIND: the tested atom's ABI code, derived once and kept in step
-    // with the litunion rewrite below — `valueAtomKind("string")` is 2 by definition,
-    // so the rewritten atom's code needs no second derivation, and the tag is a
-    // projection of the code (`scalarTagOf` is `uVariants.length + code`).
-    let isAtom = ndv.isVariant
-    let isak = valueAtomKind(isAtom)
-    if isak < 0 {
-      if nameIsLitUnionType(isAtom) {
-        isAtom = "string"
-        isak = 2
-      }
-    }
-    // The box tag the tested atom claims: a value atom's globally-stable `scalarTagOf`, OR a
-    // REF-ELEMENT array arm's `refArrTagOf` (`x is S[]`, `x is (() => f64)[]`). Both discriminate
-    // by the SAME box field-0 tag compare, so the receiver forms below (ident / union field /
-    // optional chain / any union expr) are shared. `armTag < 0` (not a value atom, not an interned
-    // ref-array arm) falls through to the struct-variant / literal paths.
-    let armTag = -1
-    if isak >= 0 { armTag = scalarTagOfKind(isak) }
-    else if nameIsMap(isAtom) { armTag = mapTagOf(isAtom) }
-    else if nameIsRefArray(isAtom) { armTag = refArrTagOf(isAtom) }
+    // The box tag the tested type claims: a value atom's globally-stable
+    // `scalarTagOfKind`, a MAP arm's `mapSlotTag`, or a REF-ELEMENT array arm's
+    // `refArrSlotTag` (`x is S[]`, `x is (() => f64)[]`). All three discriminate by the
+    // SAME box field-0 tag compare, so the receiver forms below (ident / union field /
+    // optional chain / any union expr) are shared. `armTag < 0` (not a value atom, not a
+    // map, not an interned ref-array arm) falls through to the struct-variant / literal
+    // paths. Destringify D-ISTY: derived from the type the CHECKER resolved for this
+    // `is` node, not from re-classifying the tested SPELLING — see `isArmTagOfTy`.
+    const armTag = isArmTagOfTy(isVarTyIxOf(isIx))
     if armTag >= 0 {
       // A union-typed IDENT receiver pushes its RAW box slot directly — even
       // when an outer arm has already narrowed it to a single atom (the last
@@ -2254,15 +2300,13 @@ function emitValueUnionUnboxRead(
 // `ref.cast` it to the arm's reflist wrapper heap. The ref-array analogue of
 // `emitValueUnionUnboxRead`'s list-wrapper cast — the result is a `(ref $rlWrap)` the normal
 // indexing / `.length` machinery consumes (it stored there in `emitUnionCoerce`'s ref-array box).
-function emitRefArrayUnionUnboxRead(
-  body: i32[],
-  name: string,
-  atom: string,
-  fnIx: i32,
-) {
+function emitRefArrayUnionUnboxRead(body: i32[], name: string, fnIx: i32) {
   if emitUnionBoxPush(body, name, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  const slot = rlSlotByName(refArrElemName(atom))
+  // Destringify D-ISTY: the arm's reflist slot comes from the TYPE the narrowing
+  // banked (`is S[]` recorded `S[]`'s arena index), not from slicing the element
+  // spelling back out of the rendered arm name and re-resolving it.
+  const slot = rlSlotOfTy(tyRefArrElemOf(narrowedArmTyOf(name)))
   if slot < 0 {
     return emitFail("emitProgram: narrowed ref-array arm has no reflist slot")
   }
@@ -2275,15 +2319,15 @@ function emitRefArrayUnionUnboxRead(
 // `ref.cast` it to the arm's per-value map struct heap (`mapTypeIdxOf`, the mono `$mStructIdx` for
 // an i32/atom value). The map analogue of `emitRefArrayUnionUnboxRead` — the result is the same
 // `(ref $mapStruct)` a bare map binding pushes, which `emitMapPrep` stores into `mapRef`.
-function emitMapUnionUnboxRead(
-  body: i32[],
-  name: string,
-  atom: string,
-  fnIx: i32,
-) {
+function emitMapUnionUnboxRead(body: i32[], name: string, fnIx: i32) {
   if emitUnionBoxPush(body, name, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  const slot = mvSlotOfMapValNameOrMono(mapValNameOf(atom))
+  // Destringify D-ISTY: the arm's map-value slot comes from the TYPE the narrowing
+  // banked, not from slicing `{[K]: V}`'s value text out of the rendered arm name.
+  // SENTINEL: `mvSlotOfTy` answers -1 for an un-interned value exactly as the name
+  // resolver does for a MONO/atom-valued map, and `mapTypeIdxOf(-1)` is that shared
+  // `$mStructIdx` — so the two legs agree on the miss as well as on the hit.
+  const slot = mvSlotOfTy(tyMapValOf(narrowedArmTyOf(name)))
   fbRefCast(mapTypeIdxOf(slot)) // the payload IS the map struct ref
   0
 }
@@ -5281,12 +5325,21 @@ function emitMapSetValExpr(
     svCtx.listKind = 6
   } else if lvk == "f32list" {
     svCtx.listKind = 7
-  } else if mslot >= 0 && nameIsRefArray(mvValName[mslot]) {
+  } else if mslot >= 0 {
     // A REF-list value (`S[]` / `(C|D)[]` / a nested `S[][]` / a closure list): seed the value's
-    // ref-list slot (keyed by its element name) so the value literal builds as that list — its
-    // inner elements recurse through the literal build. Mirrors the array-binding ref-list seed.
-    svCtx.listKind = 5
-    svCtx.listSlot = mvValInnerRlSlot(mslot)
+    // ref-list slot so the value literal builds as that list — its inner elements recurse
+    // through the literal build. Mirrors the array-binding ref-list seed.
+    // Destringify D-ISTY: the GUARD is the slot the body already resolves, not a second
+    // `nameIsRefArray` reading of the stored value name — the reflist NAMEABILITY that
+    // predicate adds over a shape test IS this slot's existence (#1116), so the pair was
+    // always one question, and resolving it ONCE is strictly less work than the name
+    // guard plus the body's own lookup. A value type that is not an array at all
+    // declines inside `mvValInnerRlSlot` without parsing anything.
+    const rlv = mvValInnerRlSlot(mslot)
+    if rlv >= 0 {
+      svCtx.listKind = 5
+      svCtx.listSlot = rlv
+    }
   }
   // An atom-valued mono map's member-literal value lowers as its interned atom id; a
   // NULLABLE-atom value (`{[string]: K | null}`) stores a bare `null` as the `-1` sentinel.
@@ -11522,7 +11575,7 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
   const raNm = narrowedRefArrayOf(e.identName)
   if raNm != "" {
     if unionNameOfIdent(e.identName, fnIx) != "" {
-      return emitRefArrayUnionUnboxRead(body, e.identName, raNm, fnIx)
+      return emitRefArrayUnionUnboxRead(body, e.identName, fnIx)
     }
     // The typed-IR net behind the syntactic miss (the value-atom arm's discipline,
     // above): a binding off a narrowed nullable-closure param's call (`const t1 =
@@ -11530,7 +11583,7 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
     // unbox pushed the box ref where the list wrapper was expected — INVALID-WASM
     // (fuzz sweep4 declared leg, seed 462516905 case_00383).
     if identChainTyBoxedUnion(e.identName, fnIx, 4) {
-      return emitRefArrayUnionUnboxRead(body, e.identName, raNm, fnIx)
+      return emitRefArrayUnionUnboxRead(body, e.identName, fnIx)
     }
   }
   // A union binding narrowed to a MAP arm reads UNBOXED to the map struct ref (`if x is {[string]:
@@ -11539,7 +11592,7 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
   const mNm = narrowedMapOf(e.identName)
   if mNm != "" {
     if unionNameOfIdent(e.identName, fnIx) != "" {
-      return emitMapUnionUnboxRead(body, e.identName, mNm, fnIx)
+      return emitMapUnionUnboxRead(body, e.identName, fnIx)
     }
     // The typed-IR net behind the syntactic miss (`unionMapArmIdent`'s discipline): a
     // rebind off a narrowed nullable-closure VALUE call (`const t1 = t0(); const t2 =
@@ -11548,7 +11601,7 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
     // box ref into the map-struct frame: INVALID-WASM (fuzz-nightly plain leg, seed
     // 258048495 d6, `(() => {[string]: boolean} | {w: i32} | null) | null`).
     if identChainTyMapArmUnion(e.identName, fnIx, 4) {
-      return emitMapUnionUnboxRead(body, e.identName, mNm, fnIx)
+      return emitMapUnionUnboxRead(body, e.identName, fnIx)
     }
   }
   // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
