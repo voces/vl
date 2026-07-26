@@ -12687,3 +12687,422 @@ alone — SAB1 exists to punish exactly that assumption**, and it fires at ten o
     reaches each) but because their target is *always already* at depth 0, so a depth-blind scanner
     cannot move it. It took a second, orthogonal sabotage (off-by-one) to reach them. **Check the
     fire set against the SITE LIST, not against the total.**
+## D-RETMAPSHAPE — a `return Map()` built the WRONG map struct; and the reported compiler TRAP was the LID on two silent invalid-wasm bugs beneath it
+
+Slice goal was the reported live compiler crash: `vl check` certifies a program, `vl build`
+traps the compiler with `wasm trap: out of bounds array access`. The crash reproduced, was
+re-minimized independently, and its mechanism is exact. Only ONE of the three defects it
+uncovered lies in this slice's partition; the other two are filed below as exact,
+corpus-gated diffs with red-on-master pins.
+
+### The reported crash — mechanism
+
+Repro (4 statements; `vl check` → "Checked 1 file, no errors", exit 0):
+
+```vl
+function f(): {[string]: {f: boolean | {w: i32}} | boolean} | null {
+  return null
+}
+const r = f()
+print(r == null)
+```
+
+Symbolicated backtrace (`vl build compiler/entry.vl --names`, then `vl build repro.vl
+--compiler named.wasm`):
+
+```
+0: vl!variantSig$m15      (emit_classify.vl)
+1: vl!assignTags$m16      (emit_collect.vl)
+2: vl!collectU$m16
+3: vl!runEmitPass$m2      (emit_sections.vl)
+4: vl!emitProgram$m2
+5: vl!compileSrc$m5
+```
+
+The out-of-bounds read is `variantSig`'s `uFieldCount[vi]`: the variant ROW tables are
+**half-written**. A fail-loud probe compiler (a `uVariants.length != uFieldStart.length ||
+uVariants.length != uFieldCount.length` guard at the top of `assignTags`, plus the reject
+message enriched with the failing spelling and the registered union list) printed the state
+at the trap:
+
+```
+emitProgram: only i32 / boolean / string / array union-variant fields are supported
+  nm=<{f:boolean|{w:i32}}>  ftxt=<boolean|{w:i32}>  registered: <{f:boolean|{w:i32}}|boolean>
+```
+
+`emitFail` keeps only the FIRST message — so that reject had ALREADY fired, and the compile
+carried on to trap. The five-step mechanism:
+
+1. `collectTyReachRegister`'s `TyNullable` arm registers the OUTER nullable name
+   (`{[string]:…}|null`) **before** descending `t.nInner`. Its bucket-(c) pre-descent
+   (`collectTyMembersReach`) only fires when the inner type is itself a `TyUnion`; here the
+   inner is a `TyMap`, so the pre-descent no-ops.
+2. `registerInlineUnion` on that outer name reaches its map-ATOM arm and calls
+   `registerInlineUnion(stmts, mapValNameOf(aa))` — a **NAME** recursion with no arm-field
+   pre-descent of its own, **and its return value is discarded** (`emit_collect.vl:3812`;
+   the ref-array-atom arm at `:3800` discards likewise).
+3. That inner call registers the variant-box union `{f:boolean|{w:i32}}|boolean`: it pushes
+   `unNames`/`unVarStart`/`unVarCount`, then `uVariants.push("{f:boolean|{w:i32}}")` and
+   `collectVariantFields` → `collectShapeVariantFields`, which pushes `uFieldStart` **first**
+   and only then classifies the fields. Field `f` spells `boolean|{w:i32}`, which is not yet
+   an `isUName`, so `nameFieldCode` answers -1 and the reject fires — **after** the start
+   push, **before** the `uFieldCount` push.
+4. The -1 reaches the discarding call site and evaporates. `emitFailed` is set; nothing in
+   the collect phase consults it.
+5. `collectU` runs on to `assignTags`, which ranks `si < uVariants.length` through
+   `variantSig` — reading `uFieldCount` past its end. **The compiler traps.**
+
+So the crash is the classic index-identity failure in its purest form: a row was opened in
+one table and never closed in its parallel twin, and the only thing standing between that
+and a compiler trap was a return value nobody read.
+
+### Independent re-minimization — the reported ingredient list is REFUTED
+
+The hand-off named four necessary ingredients (map value · nested union field · boolean arm ·
+outer nullable), "proven by a 17-program sweep". Deleting each and re-running (`vl build`
+against a compiler built at `7cefaa0`) confirms two and **refutes two**:
+
+| ingredient | verdict | witness |
+| --- | --- | --- |
+| the struct arm's field is a UNION carrying a STRUCT | **necessary** | `{f: boolean}` (03) OK · `{f: boolean\|i32}` (05) OK · `{f: {w:i32}}` (09) OK |
+| the collection value/element union has a NON-null SCALAR arm | **necessary** | drop the arm (02) OK · make it `null` (08) OK · `i32` (06) and `string` (07) both crash |
+| **the MAP** | **REFUTED** | `({f: boolean \| {w: i32}} \| boolean)[] \| null` (30) crashes with no map at all |
+| **the outer NULLABLE** | **REFUTED as stated** | it is not the `\| null` that matters but the NAME-recursion entry: a plain `const r: … \| null` (21) crashes with no function, while a `{[string]: …}` PARAM (23) with the identical value union is fine |
+
+Denominator: 39 hand-written programs across six sweeps, each run `vl check` + `vl build` +
+`vl run` against the master-built seed. The crash class is **"a variant-box union whose
+struct arm carries a union field, reached only through a COLLECTION (map value or array
+element) that some `registerInlineUnion` name-recursion registers"** — strictly wider than
+the reported shape.
+
+### THE LID — two silent invalid-wasm bugs were hiding behind the trap
+
+Fixing the registration order let the crashing programs through `collectU` — and they then
+emitted **modules that do not validate**, with `vl check` reporting no errors and `vl build`
+reporting success. Peeling that back twice more:
+
+**Bug 2 — an un-annotated GLOBAL never infers the `nulmap` cell.** Minimal (4 statements):
+
+```vl
+function f(): {[string]: i32} | null {
+  return null
+}
+const r = f()
+print(r == null)
+```
+
+`vl check` → no errors · `vl build` → writes the module · the module → `Invalid input
+WebAssembly code: type mismatch: expected i32, found (ref null $type)`. **`nulmap` is the
+ONLY rep kind in the whole family that fails this way** — an 18-program sweep over
+un-annotated top-level `const r = f()` for map / nulmap / struct / nulstruct / list /
+nullist / strlist / reflist / nulreflist / string / nulstring / f64 / i64 / union / closure /
+f64list found every other kind either correct or LOUD; `nulmap` alone is silent and wrong.
+`globalCellKind`'s un-annotated branch grew a `nulstr` arm and a `union` arm and never a
+`nulmap` one. Annotating the binding, or moving it inside a function, both work — so the
+gap is exactly the global ladder's inference arm.
+
+**Bug 3 — a direct `return Map()` builds the MONO map struct.** Minimal (4 statements):
+
+```vl
+function f(): {[string]: string} {
+  return Map()
+}
+print(f().size)
+```
+
+Same signature: check clean, build clean, module invalid *inside the returning function
+itself*. Every non-mono value type is affected (`string`, `f64`, a struct, a union, `i32[]`,
+a nested map); `i32` and `boolean` ride the shared mono struct and are fine, which is why
+the corpus never saw it. Going through a local (`const m: {…} = Map(); return m`) is fine —
+the value is already built. **This one is in this slice's partition and is FIXED here.**
+
+### The fix that landed here — `emitReturnValue` seeds the map SHAPE for a bare map return
+
+`compiler/wasmEmit.vl`: the return lowering already carried `retNulMap`/`retNulMapShape` and
+threaded `retCtx.mapSlot = retNulMapShape` for the NULLABLE map return. Its bare-map twin
+simply did not exist, so a `Map()` in return position read the ambient `pendingMapSlot`
+(-1 = the mono struct) while the functype result is the value-typed `$mapStruct`. Added
+`retMap`/`retMapShape` off `retMapFlag(fn.fnRet)` + `mapAnnShape(fn.fnRet)` — the same two
+calls the nulmap arm makes, and the same seed the `let` / global / struct-field / variant-field
+constructor sites already thread.
+
+Pin: `tests/cases/maps/return-direct-map-constructor.vl` (five value types + a round-trip
+store/read). **Shown RED on a master-built compiler by running it**: `vl check` → "Checked 1
+file, no errors", `vl run` → `Invalid input WebAssembly code at offset 577: type mismatch:
+expected (ref $type), found (ref $type)` inside `emptyStrMap`.
+
+### Gate for the landed fix — every leg run explicitly
+
+Measured TWICE: first at the branch point `7cefaa0`, then re-run end to end after a rebase
+onto `4dadedd` (#1143 + #1144 landed mid-slice, both touching type-name grammars). Both
+baselines were re-built and re-run in the SAME session as the branch, same commands, with
+every seed md5-checked before use.
+
+| leg | at `7cefaa0` | re-run at `4dadedd` |
+| --- | --- | --- |
+| `refresh-compiler.sh` | ok (1,036,780 B) | ok (1,031,619 B) |
+| `native-fixpoint.sh` | **stage3 == stage4 byte-for-byte** | **stage3 == stage4 byte-for-byte** |
+| `lint-self.sh` | clean | clean |
+| `deno check compiler/*.ts` · `deno lint` | clean (57 files) | — |
+| `deno task test` | **1445 / 0 / 602 ignored** | **1449 / 0 / 602 ignored** |
+| master baseline, same session + command, seeds md5-checked | 1444 / 0 / 602; **ignored NAME-SET diff EMPTY** | 1448 / 0 / 602 (+1 = this slice's fixture) |
+| corpus A/B, `vl build` × every `tests/cases/**/*.vl` | 1320 files: **0 byte · 0 msg · 0 rc** | 1325 files: 1 byte (this slice's own fixture) · 0 msg · 0 rc |
+| lint-tier A/B, `vl check --severity info` × `tests/cases` + `std` + `compiler` | 1350 files, identical | — |
+| fuzz A/B, plain (4 seeds × 200 × depth 4) | 3 = 3, identical shape sets | — |
+| fuzz A/B, `--branching --values --multiobs` | 17 = 17, identical shape sets | — |
+| `rep-fuzz-check.sh` | exact ✅ (1 baselined, 0 unsound, 0 new, 0 stale) | exact ✅ (same) |
+
+**The crash still reproduces on `4dadedd`** — 12 compiler backtraces across the 39-program
+sweep — so neither merged PR touched it.
+
+**Population of the changed arm on the corpus: ZERO.** The A/B is 0-diff because
+`tests/cases` contains no `return Map()` from a non-mono-valued map function. That is not
+reassurance, it is the explanation for the bug's survival.
+
+**PUBLISHED FUZZ BLIND SPOT.** `scripts/fuzzgen.vl` emits the map constructor at exactly one
+site (`fuzzgen.vl:800`, `"…= Map()\n"`), always as an **annotated local** hoisted into a
+`pre` prefix. It never generates a `return Map()`, and it never generates an un-annotated
+module GLOBAL bound to a call. **All three defects in this slice are structurally
+unreachable by the fuzzer**, on every leg — which is why 0 fuzz divergence on the A/B says
+nothing about them either way.
+
+### HAND-OFF — two exact diffs this slice may NOT apply (other agents' partitions)
+
+Both are verified: built, run against all six repro sweeps, and corpus-A/B'd against the
+master seed. Exactly what was measured, per artifact — unit `vl build`, denominator the
+`.vl` files under `tests/cases`:
+
+| compiler under test | files | byte / msg / rc diffs |
+| --- | --- | --- |
+| hunk A2 alone (ordering) | 1320 | **0 / 0 / 0** |
+| diff B alone (`nulmap` global) | 1320 | **0 / 0 / 0** |
+| this PR's `retMap` fix alone | 1320 | **0 / 0 / 0** |
+| `retMap` + hunk A1 (fail-loud floor) | 1321 | 1 / 0 / 0 — the ONE diff is this PR's own new fixture, so **A1 contributes 0 over the 1320 pre-existing files** |
+| all four together | 1321 | 1 / 0 / 0 — same single fixture |
+
+**Hunk A1 alone kills the whole trap class**, measured not assumed: an A1-only compiler run
+over all 39 sweep programs produces **zero** compiler backtraces (every previously-trapping
+shape becomes the loud `emit error`).
+
+**RE-VERIFIED AT `4dadedd` after the rebase.** All three hunks apply by context with no
+edit (anchors moved to `emit_collect.vl:3653` / `:4273` and `emit_classify.vl:8883`); a
+compiler carrying all four fixes, built on the new base, runs the 39-program sweep at
+**zero backtraces AND zero invalid-wasm**, and both pin fixtures below are still RED on a
+`4dadedd`-built seed and GREEN on it.
+
+**(A) `compiler/emit_collect.vl` — the crash. Two hunks.**
+
+Hunk A1, the fail-loud floor (kills the TRAP CLASS, independent of A2). Add `emitFailed` to
+the `./emit_state` import list and guard `assignTags`:
+
+```
+ function assignTags() {
++  // A registration helper's `emitFail` -1 that a caller SWALLOWED (the map-atom and
++  // ref-array-atom `registerInlineUnion` recursions discard theirs) leaves the variant
++  // row tables HALF-WRITTEN: `collectShapeVariantFields` pushes `uFieldStart` before it
++  // can reject a field, so the rejected variant owns a start with no count. Ranking then
++  // reads `uFieldCount`/`uFieldNames` past their end and TRAPS THE COMPILER instead of
++  // reporting the recorded failure. A failed emit has nothing left to rank — bail on the
++  // flag, so the loud message reaches the user (`emitProgram`'s post-`emitModule` catch
++  // is too late; this pass runs first).
++  if emitFailed { return -1 }
+   // The signatures, computed ONCE …
+```
+
+Hunk A2, the ordering fix (makes the programs COMPILE). In `collectTyMembersReach`, replace
+the trailing `0` with:
+
+```
++  // A COLLECTION carrying the union (`{[string]: V} | null`, `V[] | null`): the
++  // caller's own registration of the outer name recurses by NAME into the value /
++  // element union (`registerInlineUnion`'s map-atom and ref-array-atom arms), so
++  // that union's variant rows are pushed from inside the caller's `registerInlineUnion`
++  // — with no arm-field pre-descent of its own. Descend through the collection so the
++  // arms' FIELD unions register first, exactly as a direct union member's do. The
++  // collection itself owns no registration, so this only re-orders, never adds.
++  if t is TyMap {
++    return collectTyMembersReach(stmts, t.mVal, depth - 1, underFunc)
++  }
++  if t is TyArray {
++    return collectTyMembersReach(stmts, t.aElem, depth - 1, underFunc)
++  }
+   0
+ }
+```
+
+A2 preserves the documented registration ORDER the `TyNullable` arm depends on (the outer
+`…|null` name still registers before the bare inner union) — it pre-registers only the arms'
+FIELD unions, never the value union itself. **Take A1 even if A2 is deferred**: A1 alone
+converts every one of the eight crashing shapes into the loud `emit error`, which is the
+difference between a diagnosable reject and a trapped compiler.
+
+**(B) `compiler/emit_classify.vl` — the silent invalid-wasm global. One line + comment**, in
+`globalCellKind`'s UN-ANNOTATED branch, after `letInfStrListByUse` and **before**
+`letIsUnion` (a nullable map is a niche, not the box):
+
+```
+   if letInfStrListByUse(letIx) { return "strlist" }
++  // An un-annotated global bound to a `{[string]: V} | null`-returning call
++  // (`const r = mk()`) carries the `nulmap` cell — a `(ref null $mapStruct)` — as a
++  // local would. BEFORE the union arm (a nullable map is a niche, not the box) and
++  // before the literal-init fallback, whose call-init guess is the i32 cell: an i32
++  // global taking the map ref is INVALID-WASM at the start function's `global.set`.
++  if letIsNulMap(letIx, -1) { return "nulmap" }
+   if letIsUnion(letIx, -1) { return "union" }
+```
+
+Everything downstream of the kind already exists — `emit_sections.vl` has both the const-init
+(`pendingMapSlot` + `pendingNulRefHeap`) and non-const (`nulMapShapeOf`) `nulmap` global arms.
+Only the classifier declined to name the kind.
+
+**Pins for (A) and (B) — verified RED on the master seed, GREEN on a compiler carrying the
+diffs.** Not committed here: they are red until the diffs land, and this slice may not land
+them. Exact content, to ship WITH the fix:
+
+`tests/cases/unions/nullable-collection-of-variant-box-arm-field-union.vl`
+
+```vl
+// @run
+// @log true
+// @log true
+// @log true
+// A VARIANT-BOX union reached only as a NULLABLE COLLECTION's value / element
+// (`{[string]: {f: boolean | {w: i32}} | boolean} | null`) registers its struct arms'
+// FIELD unions BEFORE its own variant rows. The outer `… | null` name registers first
+// and recurses by NAME into the value union, so without the collection pre-descent the
+// arm field `boolean | {w: i32}` is still unregistered when the arm's fields are
+// collected — the variant row is half-written (a field start with no count) and the
+// tag ranking reads past the row tables, TRAPPING the compiler on a program `vl check`
+// certified.
+
+function fMap(): {[string]: {f: boolean | {w: i32}} | boolean} | null {
+  return null
+}
+
+function fMapDeep(): {[string]: {[string]: {f: boolean | {w: i32}} | boolean}} | null {
+  return null
+}
+
+type W = {w: i32}
+type S = {f: boolean | W}
+type V = S | boolean
+
+function fNamed(): {[string]: V} | null {
+  return null
+}
+
+print(fMap() == null)
+print(fMapDeep() == null)
+print(fNamed() == null)
+```
+
+`tests/cases/maps/global-infers-nulmap-from-call.vl`
+
+```vl
+// @run
+// @log true
+// @log 7
+// @log false
+// An UN-ANNOTATED module GLOBAL bound to a `{[string]: V} | null`-returning call infers
+// the `nulmap` cell — a `(ref null $mapStruct)` — exactly as a local does. Every other
+// rep kind already rides the global ladder (`nulstr`, `union`, struct, list, closure …);
+// `nulmap` was the one missing arm, and its absence typed the cell i32 while the start
+// function stored the map ref into it: INVALID WASM, with `vl check` reporting no errors
+// and `vl build` reporting success.
+
+function empty(): {[string]: i32} | null {
+  return null
+}
+
+function filled(): {[string]: i32} | null {
+  const m: {[string]: i32} = Map()
+  m["x"] = 7
+  return m
+}
+
+const e = empty()
+print(e == null) // true
+
+const g = filled()
+if g != null { print(g["x"] ?? -1) } // 7
+print(g == null) // false
+```
+
+### Sibling sweep — which neighbouring shapes crash, and which do not
+
+39 programs, all `vl check`-clean unless noted. Columns: master seed (`7cefaa0`) → all four
+fixes applied. `TRAP` = compiler out-of-bounds; `INVALID` = silent invalid wasm; `REJECT` =
+loud `emit error`.
+
+| shape | master | fixed |
+| --- | --- | --- |
+| `{[string]: {f: boolean\|{w:i32}}\|boolean} \| null` (the report) | TRAP | ok |
+| … with the scalar arm `i32` / `string` | TRAP | ok |
+| … with the scalar arm `null` | INVALID | ok |
+| … with two fields on the struct arm | TRAP | ok |
+| … struct\|struct nested field (`{f: {q:string}\|{w:i32}}`) | TRAP | ok |
+| … nested map value (`{[string]: {[string]: …}}`) | TRAP | ok |
+| … nested field is itself a MAP (`{f: {[string]:i32}\|boolean}`) | TRAP | ok |
+| … three levels deep (`{f: boolean\|{g: boolean\|{w:i32}}}`) | TRAP | ok |
+| `({f: boolean\|{w:i32}} \| boolean)[] \| null` (**no map**) | TRAP | REJECT (`bare null needs a struct-typed context` — pre-existing, loud) |
+| `const r: {[string]: …} \| null = null` (**no function**) | TRAP | ok |
+| the same value union as a bare `X \| boolean \| null` return | ok | ok |
+| the same value union as a PARAM annotation | ok | ok |
+| the same shapes with the map atom in a NON-null 2-member union (`… \| i32`) | ok | ok |
+| `{[string]: {f: {w:i32}[] \| boolean} \| boolean} \| null` | TRAP | ok |
+| `{[string]: {w:i32} \| boolean} \| null` (no nested union at all) | INVALID | ok |
+| `{[string]: i32} \| null` bound to an un-annotated global | INVALID | ok |
+| … annotated, or bound inside a function | ok | ok |
+| every other rep kind bound to an un-annotated global (16 kinds) | ok / REJECT | unchanged |
+| `return Map()` for `string` / `f64` / struct / union / `i32[]` / nested-map values | INVALID | ok |
+| `return Map()` for `i32` / `boolean` values (the mono struct) | ok | ok |
+| `return m` via a local, any value type | ok | ok |
+| `{f: boolean \| i32[]}` variant field | REJECT | REJECT (unchanged, loud) |
+
+Refutations worth more than the agreements: **the map is not necessary** (the array-element
+spelling crashes identically), **the `| null` is not necessary as such** (what matters is
+whether the outer name's `registerInlineUnion` reaches the inner union by NAME recursion
+before the arena walk reaches its arm fields), and **the trap was never the worst thing in
+the program** — under it sat two shapes that compile, report success, and hand the user a
+module that does not validate.
+
+### Method notes earned
+
+82. **A LOUD reject can hide a TRAP, and a TRAP can hide a SILENT MISCOMPILE — check both
+    directions.** #1141's rule was "a checker reject can be the lid on an emitter
+    miscompile". This slice found the two-layer version: the OOB trap was the lid on an
+    emit-time reject (`emitFail` keeps the FIRST message, so the trap's own backtrace named
+    a function that was not the failing one), and the reject was in turn the lid on invalid
+    wasm. **After converting a trap into a reject, run the program — do not stop at the
+    clean error.** All three of this slice's defects were on the same four-line program.
+83. **A discarded return value is a soundness hole when the callee writes shared state.**
+    `registerInlineUnion`'s two atom-recursion call sites drop their -1 by design ("the
+    OUTER union still registers through the dispatch below"), which is fine for a callee
+    that only *registers* — but `collectVariantFields` mutates four parallel tables and can
+    fail halfway. **Audit every discarded status against whether the callee is atomic**; a
+    non-atomic callee needs either propagation or a transactional row push.
+84. **Symbolicate before hypothesising.** The raw backtrace's six anonymous frames named
+    three different modules; `vl build compiler/entry.vl --names` turned them into
+    `variantSig` / `assignTags` / `collectU` in one step, and the trapping table was obvious
+    from the function body. The `--names` build costs one 40-second compile.
+85. **A fail-loud probe can move the trap into the probe.** The first `assignTags` guard
+    checked `uFieldStart[k] + uFieldCount[k]` after only comparing the lengths against
+    `uVariants` — and traps moved one frame up, into the probe's own loop, because
+    `uFieldCount` was the SHORT table. Guard a probe's reads with the same discipline as the
+    code under test, or the probe becomes the finding.
+86. **A `0` on a fuzz leg can be the ARGUMENT PARSER.** One A/B leg reported `A failures: 0,
+    B failures: 0` and "identical". The log's first line was `unknown arg: …` — the harness
+    exited 2 before generating a case. **Read one log per leg before trusting a zero**;
+    "implausible magnitude in either direction" includes an implausibly clean run.
+
+### TARGET 2 (destringify) — not advanced by this slice, and why
+
+The crash consumed the slice. Nothing in this PR touches the resolver population, and no
+number below is re-measured here — recorded so the leads are not lost:
+
+- **`inferRetTyByNode` remains the standing highest-value move**, now named by four
+  independent slices (#1136, #1138, #1142, and this one by omission). Its producer is
+  checker-side; it was out of this slice's partition twice over.
+- The partition's counts as HANDED OVER (`wasmEmit` 6 · `emit_rewrite` 5 · `emit_query` 4 ·
+  `emit_rep` 2 · `emit_mono` 8) are **NOT re-measured here** and must not be quoted as if
+  they were. Per this program's own rule, a handed-off measurement is a lead, not a proof.
