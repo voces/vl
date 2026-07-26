@@ -15497,8 +15497,16 @@ hand-copied private copy". *One home for six copies is still a copy of the gramm
 body → `tyTopIndexOf`) is already **done** — #1150's D-ARROWHOME made `annArrowAt` a one-line
 delegate to `tyTopLevelIndexOf`, so hunk 1 covers it; and no `skipQuotedName` export is needed, because
 `shapeInnerFieldSplit` becomes a resume loop over the already-exported `tyTopIndexOf` rather than an
-inline quote skip. The shipped form is **three hunks in two files**, and it deletes two more
-hand-written walks than the filed one did.
+inline quote skip. The shipped form is **three hunks in two files**, and it retires **three**
+hand-written walks where the filed form retired two.
+
+**A SECOND CORRECTION TO MY OWN WRITE-UP, made in place.** I first wrote "walks 10 → 8" and "two
+more walks than the filed one". Recounted mechanically against a snapshot with the fix applied:
+the copies remaining are `tyGroupWrapsWhole`, `shapeFieldParse`, `splitUnionArmsAllDepth`,
+`annRetKind`, `unionArmSigKey`, `monoUnwrapParens`, `isObjShapeName` — **seven**, so the fix is
+**10 → 7 (−3)**, and it retires **one** more walk than the filed form, not two. Both of my own
+headline arithmetic slips this slice were on the same figure and in the same direction
+(understating the filed fix); *recount, do not subtract in your head.*
 
 **Evidence for the filed fix — measured at `5d011ff` and RE-MEASURED at `4758935` after #1152, with
 identical results** (the quote-blind population is unmoved by #1152: the 300-cell grade is
@@ -15510,7 +15518,7 @@ identical results** (the quote-blind population is unmoved by #1152: the 300-cel
 | regressions · traps | **0** · **0** |
 | corpus A/B | **1,340 entries, 0 differing** (build-rc + wasm SHA + message + run-rc + stdout) |
 | binary | 1,027,238 → **1,026,600 B**, **−638 B** |
-| hand-written walks | **10 → 8** |
+| hand-written walks | **10 → 7** — three retired: `tyTopLevelIndexOf`, `tyTopLevelSplit`, `shapeInnerFieldSplit` |
 | scoreboard | CORE 326 unchanged · **OFF-LIST 35 → 32** · **TRUE 361 → 358** |
 
 **A CORRECTION TO MY OWN FIRST WRITE-UP:** I first recorded this as "OFF-LIST unchanged —
@@ -15735,7 +15743,8 @@ same length, not new work; (c) the fuzz side (the counters were summed over the 
 
 1. **THE QUOTE-BLIND GRAMMAR — three hunks, two files, 24 graded cells, corpus-clean, −638 B.**
    Exact diff in the PR body. Owners: `emit_base.vl` (hunks 1–2) and `emit_classify.vl` (hunk 3).
-   Ship with the fixture above. This retires **two** more hand-written walks (10 → 8).
+   Ship with the fixture above. It retires **three** hand-written walks (**10 → 7**) — one more
+   than the filed two-hunk form, because `shapeInnerFieldSplit` is a walk as well as the residual.
 2. **THE NULLABLE-LITUNION ALIAS MISCOMPILE** — invalid wasm at five construction sites on master,
    mechanism read from the bytes, candidate arm measured. Needs the `emit_classify` companion
    (`exprIsLitAtom` / `exprNulLitUnion` Member+Index arms) landed in the same PR, or the loud
