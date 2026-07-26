@@ -19260,6 +19260,31 @@ master compiler rebuilt in this session from `f9561b8`'s own `compiler/`
 (`fd594009db1ff8a7…` / **1,029,174 B**, `refresh --prove-fixpoint` RC=0, `compile(next) == next`).
 That rule is why this slice found a cell the filed census did not have.
 
+### 🔁 THE BASE MOVED TWICE MID-SLICE — EVERY LEG RE-RUN AT `b89aa99`
+
+**#1165** (D-NULBASE, which touches `emit_collect.vl`) and **#1166** (the Buffer design, which adds
+three corpus cases) landed while this gate was running. Merged both, rebuilt the **master baseline
+from `origin/master`'s OWN `compiler/` in the same session** (`0d4c5822ec02cefa…` / **1,029,129 B**)
+and **proved its fixpoint** (`compile(MASTER2, master-src) == MASTER2` byte-identical), then re-ran
+every leg there. #1156's lesson taken rather than re-learned. **Nothing about the verdict moved**;
+the absolute figures did, and the tables below quote `b89aa99` throughout.
+
+**AND THE FIRST RE-BASELINE WAS A NEAR-MISS WORTH RECORDING.** The master suite at `b89aa99` and the
+branch suite at the `5d40f22` merge both read **2,088 / 0 / 14** — an apparently perfect
+"no change". It was a coincidence: **#1166 adds three corpus files worth ≈6 tests, and this PR adds
+six pins.** The two trees differed by more than this diff, so the comparison was meaningless in
+either direction. Merging `b89aa99` too made it exact — **2,088 → 2,094, +6**. *IDENTICAL IS NOT
+CORRECT, and this is the sharpest instance of it in the program so far: the null reading was
+manufactured by an unrelated PR of exactly the right size.*
+
+**#1166 also independently confirms one of this slice's findings.** Its
+`run/memory-size-declared-not-lowered.vl` says *"The checker declares ten memory intrinsics; the
+emitter lowers three"* — arrived at separately, same census, same 7-of-10 split (below). Its
+`run/memory-intrinsic-in-named-fn.vl` **passes under this PR's intrinsic reservation**: it defines
+`poke`, and only CALLS `__store_i32__`/`__load_i32__`. Calling an intrinsic is untouched; only
+defining one is rejected. Verified by the suite (0 failed) and by the corpus A/B (all three of its
+files in the `same` bucket).
+
 ### TARGET 1 — the owner's `print([])`. WHAT IT DOES NOW
 
 ```
@@ -19504,14 +19529,14 @@ Master baseline **rebuilt at the gating head in this session** and the branch se
 
 | leg | result |
 |---|---|
-| `refresh-compiler.sh --prove-fixpoint` | RC=0, `compile(next) == next` (2 compiles), **1,030,556 B**, sha `2556686057460a50…` |
+| `refresh-compiler.sh --prove-fixpoint` | RC=0, `compile(next) == next` (2 compiles), **1,030,511 B**, sha `ed597a7506893cdd…` |
 | the standalone candidate build vs the refreshed seed | **byte-identical** — the build is deterministic and no throwaway compiler leaked into a measurement |
-| `native-fixpoint.sh` | RC=0, stage3 == stage4 byte-for-byte, 1,030,556 B |
+| `native-fixpoint.sh` | RC=0, stage3 == stage4 byte-for-byte, 1,030,511 B |
 | `lint-self.sh` | RC=0 (self-lint + `vl fmt --check` clean) |
-| `deno task test` `SELFHOST_NATIVE_ALIGN=1` | **2,087 / 0 / 14**; master baseline **same session, same command, 2,081 / 0 / 14**; **+6 = this PR's six new pins**; ignored-test NAME SETS diff **clean, both files asserted non-empty (14 each)** |
-| corpus A/B, **1,370 files**, three channels (`vl check` rc+TEXT, `vl build` BYTES, `vl run` rc+stdout) | **7 differ, EVERY ONE NAMED**: the 6 new pins (`CHECKSTATUS(0/1) BUILDSTATUS(0/1)`, and `error-redefine-intrinsic.vl` also `RUNSTATUS(0/1)` — it printed `0` on master) + `types/unknown-type-in-map-value.vl` (`CHECKTEXT`). **1,363 pre-existing files identical on all three channels.** |
+| `deno task test` `SELFHOST_NATIVE_ALIGN=1` | **2,094 / 0 / 14**; master baseline at `b89aa99` **same session, same command, 2,088 / 0 / 14**; **+6 = this PR's six new pins** (see the near-miss above); ignored-test NAME SETS diff **clean, both files asserted non-empty (14 each)** |
+| corpus A/B, **1,374 files**, three channels (`vl check` rc+TEXT, `vl build` BYTES, `vl run` rc+stdout) | **7 differ, EVERY ONE NAMED**: the 6 new pins (`CHECKSTATUS(0/1) BUILDSTATUS(0/1)`, and `error-redefine-intrinsic.vl` also `RUNSTATUS(0/1)` — it printed `0` on master) + `types/unknown-type-in-map-value.vl` (`CHECKTEXT`). **1,367 pre-existing files identical on all three channels**, #1166's three new memory-intrinsic cases among them. |
 | **shared-instance** `vl check tests/cases` | 231 → 238 errors, 123 warnings unchanged; the diff names **exactly those 7 files** |
-| **shared-instance** probe host (`compileSrc`, ONE `WebAssembly.Instance`, 1,342 cases) | **1,342 compiled / 0 threw on BOTH sides** |
+| **shared-instance** probe host (`compileSrc`, ONE `WebAssembly.Instance`, 1,346 cases) | **1,346 compiled / 0 threw on BOTH sides** |
 | fuzz A/B, **76,800 programs/side** (4 seeds × default/`--values`/`--branching`/`--declared`) | **0 differing paths**; 78,441 outputs and 1,641 `.err` per side, **13,501 distinct `.out` contents** (the non-vacuity assertion) |
 | `rep-fuzz-check.sh` | RC=0, `exact ✅` (1 baselined reject, 0 unsound, 0 new, 0 stale) |
 | lint-tier A/B, 89 files (all of `tests/cases/lint` + 60 more) | identical, 117 lines each side. **Reported with its own weakness stated**: the lint assembly is lexer+ast+parser+lint+harness and contains NEITHER of this slice's files, so what it actually tests is whether the two SEEDS compile that assembly to the same behaviour — a real channel, but not a test of the diff |
@@ -19523,13 +19548,13 @@ no crashed program can silently subtract); the additive probes change no decisio
 
 | counter | master | this PR | reading |
 |---|---|---|---|
-| `W-PRINTARG` — every `print(x)` argument the checker types | **9,117** | **9,117** | **identical** — the instrument-did-not-die control, over 1,342 cases compiled on both sides |
-| `W-PRINTREF` — `tyPrintsAsRef` invocations | 0 | **10,172** | 9,117 top-level + **1,055** recursive descents into nullable/union members |
+| `W-PRINTARG` — every `print(x)` argument the checker types | **9,129** | **9,129** | **identical** — the instrument-did-not-die control, over 1,346 cases compiled on both sides |
+| `W-PRINTREF` — `tyPrintsAsRef` invocations | 0 | **10,184** | 9,129 top-level + **1,055** recursive descents into nullable/union members (the 1,055 is unchanged across the rebase) |
 | `W-PRINTREFT` — TRUE verdicts | 0 | **5** | **exactly the 5 print cells the corpus A/B named** — an independent channel agreeing to the unit |
-| `W-INTRIN` — `checkNotEmitterIntrinsic` invocations | 0 | **12,204** | one whole-string compare per function/binding declaration; **0** hits in the corpus |
+| `W-INTRIN` — `checkNotEmitterIntrinsic` invocations | 0 | **12,217** | one whole-string compare per function/binding declaration; **0** hits in the corpus |
 
 Added work: two arena walks per `print` argument and one string compare per declaration. Binary
-**+1,382 B** (1,029,174 → 1,030,556).
+**+1,382 B** (1,029,129 → 1,030,511) — the same delta as before the rebase, to the byte.
 
 **No per-program STATE is introduced** — both new functions are pure, over the arena and over a
 name, with no module-global array or sidecar. The pairwise-predecessor probe (#1164's poison-class
@@ -19538,12 +19563,16 @@ channel that would show it if it did.
 
 ### THE SCOREBOARD DOES NOT MOVE, AND THAT IS THE HONEST NUMBER
 
-| | master `f9561b8` | this PR |
+| | master `b89aa99` | this PR |
 |---|---|---|
-| **CORE** (23-resolver list) | **317** | **317** |
+| **CORE** (23-resolver list) | **312** | **312** |
 | **OFF-LIST** (#1141's table) | **28** | **28** |
-| **TRUE TOTAL** | **345** | **345** |
-| `emit_classify` · `emit_collect` · `emit_base` · `typecheck` | 176 · 54 · 48 · 19+27 | **identical, file for file** |
+| **TRUE TOTAL** | **340** | **340** |
+| `emit_classify` · `typecheck` | 176 · 19+27 | **identical, file for file** |
+
+(The brief's **317 · 28 · 345** is the figure at `f9561b8` and reproduces there exactly; **#1165
+took CORE down by 5** before this PR was measured. *A scoreboard figure is a statement about a
+TREE — quote the head you measured at.*)
 
 Reproduced by running the same counter over both revs. **This slice deletes no parse and adds
 none**: `tyPrintsAsRef` reads the arena, and `nameIsEmitterIntrinsic` is whole-NAME equality —
@@ -19620,6 +19649,16 @@ names**, against a whole-tree TRUE TOTAL of 345.
    reads **5** print cells and **names them**, and the independent invocation probe reads **5 TRUE
    verdicts** over the same corpus. IDENTICAL IS NOT CORRECT; these two channels agree on a
    non-zero number.
+10. **"Master and branch both read 2,088 tests, so the suite is unchanged."** REFUTED, and it is the
+    best IDENTICAL-IS-NOT-CORRECT specimen this program has produced. The two trees differed by
+    **more than this diff**: #1166 had landed three corpus files worth ≈6 tests, exactly cancelling
+    this PR's six pins. The null was manufactured by an unrelated PR of coincidentally the right
+    size. Merging `b89aa99` made the comparison exact — **2,088 → 2,094**. *Assert what the delta
+    SHOULD be before reading it, and re-baseline onto the same tree.*
+11. **"#1166's `memory-intrinsic-in-named-fn.vl` will break under the intrinsic reservation."**
+    REFUTED by reading it and then by running it: it DEFINES `poke` and only CALLS
+    `__store_i32__`/`__load_i32__`. Defining is rejected; calling is untouched. Suite 0 failed, and
+    all three of its files sit in the corpus A/B's `same` bucket.
 
 ### HAND-OFFS
 
