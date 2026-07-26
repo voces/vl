@@ -59,21 +59,24 @@ rather than re-derived. The forcing date is **M7** (the port begins); M2–M6 ga
 **P0 — gates the port STARTING. The `Buffer` linear-memory tier (our B-mem, "one deliberate escape
 hatch").** All four are prerequisites for each other in practice:
 - 🟨 **P0.1 `Buffer` alloc + the full load/store width matrix** — `Buffer(n)`, `.length`, and
-  u8/i8/u16/i16/i32/i64/f32/f64 both directions. **The LOADS and the growth ops have shipped; the
-  stores, the allocator and the bulk ops have not.** Today: **8 load widths** (`__load_i8__`,
-  `__load_u8__`, `__load_i16__`, `__load_u16__`, `__load_i32__`, `__load_i64__`, `__load_f32__`,
-  `__load_f64__`) plus `__memory_size__`/`__memory_grow__`, all lowered to single instructions and
-  verified by disassembly; **1 store width** (`__store_i32__`).
+  u8/i8/u16/i16/i32/i64/f32/f64 both directions. **The WIDTH MATRIX and the growth ops have shipped;
+  the allocator and the bulk ops have not.** Today: **8 load widths** (`__load_i8__`, `__load_u8__`,
+  `__load_i16__`, `__load_u16__`, `__load_i32__`, `__load_i64__`, `__load_f32__`, `__load_f64__`)
+  and **4 store widths** (`__store_i32__`, `__store_i64__`, `__store_f32__`, `__store_f64__`) plus
+  `__memory_size__`/`__memory_grow__`, all lowered to single instructions and verified by
+  disassembly. Every scalar VL has now round-trips at its own width; what is missing is the NARROW
+  store pair (`i32.store8`/`i32.store16`), whose spelling §O2 leaves unruled.
   *(This line used to read "today: 4 store widths, 1 load width". That was measured false: it counted
-  DECLARATIONS, and described `compiler/wasmBuiltins.ts` — deleted by kill-TS, #466. Before this
+  DECLARATIONS, and described `compiler/wasmBuiltins.ts` — deleted by kill-TS, #466. Before the load
   slice there was exactly one working store width and one working load width. See
-  `docs/internals/buffer-design.md` §A1 for the probe table.)*
+  `docs/internals/buffer-design.md` §A1 for the probe table and §I for the store slice.)*
   Still needed: a real allocator (bump is fine — the sim allocates a few large Buffers at init and
-  never frees), replacing today's "program picks raw addresses, two users collide" scratch page; the
-  seven store widths; and the `Buffer` type itself, which is deliberately NOT shipped while O1/O5/O6
-  are unruled. Blocked on the capture bug (§B3/O7): a named function wrapping a memory intrinsic
-  fails to emit in any module that uses a function value, so every eventual `Buffer` METHOD is
-  unusable until that is fixed. **`Buffer.copy` / `buf.fill` lowering to `memory.copy`/`memory.fill`
+  never frees), replacing today's "program picks raw addresses, two users collide" scratch page; and
+  the `Buffer` type itself, which is deliberately NOT shipped while O1/O5/O6 are unruled.
+  **The capture bug (§B3/O7) that blocked every `Buffer` METHOD is fixed**: `capScan` exempts a
+  builtin/intrinsic in CALLEE POSITION (#1172) and now reads the checker's own reservation list, so
+  a named function wrapping any memory intrinsic emits in a module that uses a function value.
+  **`Buffer.copy` / `buf.fill` lowering to `memory.copy`/`memory.fill`
   are load-bearing, not conveniences** — snapshot and rollback *are* those ops; without them a
   snapshot is a per-word loop. The host flag they need (`--enable-bulk-memory`) has landed ahead of
   them, so `vl build -O` will not break the day the emitter writes `0xfc`.
@@ -575,18 +578,19 @@ in-language GC knobs.
 - 🟡 **B-mem. Linear memory — make it a design, not a scratch page**
   (design: `docs/internals/memory-gc-design.md`). The collector half shipped (`vl run` on the
   engine's tracing collector + the `$VL_GC` knob). REMAINING, in order:
-  - **Audit gaps** (small, mechanical): FIVE of the seventeen memory builtins declared in
-    `typecheck.vl`'s default scope have no emitter lowering — they typecheck, then fail at emit
-    with `call to unknown function` (safe, but the diagnostic reads like a typo). Either lower them
-    or stop declaring them, and say "not implemented". The remaining five are `__store_i64__`,
-    `__store_f32__`, `__store_f64__`, `__store_string__` and `__log_string__`; the last two are
-    bridges for a `__log__` path the native emitter replaced with an in-module decoder, and nothing
-    reaches them (`buffer-design.md` O8 proposes deleting those two declarations outright).
+  - **Audit gaps** — nearly closed. TWO of the seventeen memory builtins declared in
+    `typecheck.vl`'s default scope have no emitter lowering: `__store_string__` and
+    `__log_string__`, bridges for a `__log__` path the native emitter replaced with an in-module
+    decoder, which nothing reaches (`buffer-design.md` O8 proposes deleting both declarations
+    outright). The diagnostic half is done — an unlowered builtin is a positioned CHECKER admission,
+    not `call to unknown function`.
     *(This bullet used to read "SEVEN of the ten … The store/load matrix is also asymmetric — four
     `__store_*__` widths, only `__load_i32__`." The seven was right; the "four store widths" counted
     DECLARATIONS — measured, only `__store_i32__` ever lowered. Seven loads plus
-    `__memory_size__`/`__memory_grow__` have since been lowered, which is what moved the count.)*
-    The matrix is now asymmetric the OTHER way: eight load widths, one store width.
+    `__memory_size__`/`__memory_grow__`, then the three wide stores, have since been lowered, which
+    is what moved the count from seven to five to two. It also said "the matrix is now asymmetric the
+    OTHER way: eight load widths, one store width" — true until the store slice.)*
+    The matrix is now symmetric for every scalar VL has; only the narrow 8/16-bit stores are absent.
   - **Bulk host I/O.** Export `ioMem` and implement the staging ABI `scripts/vl-host` already
     documents and probes for (`<name>Reserve` / `<name>Load`, plus an `rbyte` bulk sibling): today
     source crosses at ONE host call per code point (~3.4M per self-compile) and emitted bytes at one

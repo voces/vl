@@ -21458,3 +21458,212 @@ Closing it needs a producibility argument about `"[]"` from the PARSER side, not
 111. **A WALL-TIME TABLE'S FIRST ROW IS A WARM-UP, AND WHICHEVER SIDE HOLDS IT LOSES BY 34%.** The
      fix is not more runs, it is **swapping the order and watching the outlier move**. One swapped
      rerun turns "a 34% regression" into "a cold page cache", and it costs one command.
+## PR — THE f32 CALL-ARGUMENT LEAK, the WIDE STORE WIDTHS at 14/14, the `Map()` re-assignment shape, and JS float parity in the Rust host (off master `3974381`)
+
+A DEFECT slice, not a destringify slice. **NET parse count 0** on every column — nothing on the
+SCORECARD list moved, no resolver was retired, no new type-name parse was added. Three filed items
+and one live defect were re-verified at this head; **two of the four filed diagnoses were wrong about
+what the defect was**, and finding that out is most of the work below.
+
+### FIXED
+
+**1. A call ARGUMENT inherited the enclosing f32 context → SILENT INVALID WASM at 8 positions.**
+
+```vl
+function g(v: i32): f32 { 1.5 }
+const r: f32 = g(1)          // f32.const 1 ; call $g   where $g is (param i32)
+```
+
+Three lines, `vl check` clean, module fails to parse as WebAssembly. `emitDirectCall`'s argument
+loop reset `pendingStructIdx` / `pendingListKind` / `pendingListSlot` / `pendingI64` per iteration
+and **never `pendingF32`**, so every position that seeds an f32 context leaked it into a bare
+integer-literal argument.
+
+**Censused over the eight sites that set `pendingF32 = true`** — the module-scope f32 global init,
+the f32 `return`, the f32 tail, the f32 binding, the f32 parameter of an OUTER direct call, the f32
+list `.push`, the f32 element assignment, and the two value-union arms (atom coerce and `==`). **All
+eight reproduce.** The leak also reaches a literal nested inside arithmetic, inside a nested call,
+inside an array literal and inside an object literal, and it **beats the i64 parameter's own
+coercion** (`f32.const` into a `(param i64)`). 16 cells go from invalid wasm to the CORRECT VALUE,
+checked by arithmetic rather than by validity.
+
+Unaffected and pinned as controls: a VARIABLE argument (it carries its own rep), an index receiver
+(those arms already clear the flag), a `boolean`/`string` argument (not a `NumLit`), and every f64 /
+i64 / i32 context — `pendingF64` has **no seeding site at all**, which is the whole reason f64
+escaped. `emitCallRef`'s argument spine and `emitMemIntrinArg` already applied exactly this
+discipline, with comments naming this exact failure mode; the DIRECT spine was the one that did not.
+
+**2. The three WIDE store widths, at 14/14.** `docs/internals/buffer-design.md` §I is the record.
+`__store_i64__`/`__store_f32__`/`__store_f64__` → `i64.store`/`f32.store`/`f64.store`, opcodes and
+alignment verified by disassembly, every value checked against python `struct`. The 14th cell — a
+store as a function's implicit TAIL — is the one #1173 filed rather than shipped, correctly, because
+13/14 would have traded a clean reject for a new silent invalid module.
+
+**3. `capScan`'s exemption stops keeping a PARTIAL COPY of the reservation list.** The store widths
+landed on the wrong side of `emit_base.isBuiltinFnName` and failed both lambda positions while every
+other memory intrinsic worked. That file's own header had already filed the repair — *"the one-word
+fix is `export function nameIsEmitterIntrinsic` in `typecheck.vl`"* — declining it only on partition
+grounds. Taken: the capture exemption now reads the authoritative "the emitter rewrites this call
+site" list, so an intrinsic reserved in the checker is exempt in the capture scan the same day.
+
+**4. A `Map()` RE-ASSIGNMENT built the shared MONO map struct.** See the refutation below for what
+this was filed as. `m = Map()` over an existing binding emitted
+`type mismatch: expected (ref null $type), found (ref $type)`, `vl check` clean, for **every non-i32
+value type** — string, i64, f64, f32 — at module-global, top-level, function-local and struct-field
+scope. i32 and boolean escaped because their vals list IS the mono one, and `Set()` escaped for the
+same reason, which is why every existing map test was blind to it. 11 of 21 cells fixed, with
+behaviour checked (the reset really empties the map and the map is usable afterwards).
+
+The entombment that matters: `compiler/typecheck.vl`'s `annotPart` is a `{[string]: string}` map
+again — **the compiler cannot self-compile without this fix**.
+
+**5. The Rust host prints floats as JS `String(v)` does.** Four divergence classes, not the one
+filed; see the refutation. `js_number_to_string` implements the spec's `Number::toString`, A/B'd
+against Deno over **22,532 values driven through the real host sink** by
+`__store_i64__`/`__load_f64__` — which is also the first non-trivial consumer of the store widths
+above.
+
+### REFUTED
+
+1. **THE FILED f32 REPRO DOES NOT REPRODUCE, AND THE MEMORY INTRINSIC IS NOT INVOLVED.** The brief
+   was `function w(): f32 { return __load_f32__(0) }` → invalid wasm, with a PARAMETER address as the
+   working control. Censused **8 load widths × 6 address forms × 18 result positions = 144 cells at
+   master**: **all 144 run**. The defect is real and the brief's symptom axes are exactly right —
+   literal vs variable, f32 vs f64/integer — but the subject is any direct call with a non-f32
+   parameter, and `__load_f32__(0)` was a red herring. It surfaced from the wave-2 census cell
+   `function g<T>(v: T): f32 { __load_f32__(0) }` + `const r: f32 = g(1)`, where **neither the
+   generic nor the intrinsic was the variable** — removing each in turn still failed.
+2. **F2's `??` READ IS NOT INVOLVED.** Filed as `return m[k] ?? ""` over a `{[string]: string}` map
+   emitting invalid wasm, narrowed in three cells to "the string-valued RESULT position". Censused
+   **22 standalone shapes of that read** — global / `let` / param / local receiver, return / tail /
+   paren / concat / argument / push / field / map-value / print / global-init result, a `string|null`
+   value type, a recursive default, a memo shape, two maps — and **21 of 22 run at master** (the 22nd
+   is an unrelated parse limitation on map-type aliases). The report was written from the compiler's
+   own source, where the failing function is `initChecker` — the RESET — and the workaround that
+   unblocked it replaced the map with parallel arrays, deleting the `= Map()` line as a side effect.
+   Reproduced by restoring the natural spelling and self-compiling; func 135 is `initChecker`.
+3. **F1 IS FOUR DIVERGENCE CLASSES, NOT ONE.** Negative zero was filed. Measured against Deno on the
+   same module, Rust `Display` also diverges on magnitudes >= 1e21 (`1000000000000000000000` vs
+   `1e+21`), on magnitudes < 1e-6 (`0.0000001` vs `1e-7`), and on the infinities (`inf` vs
+   `Infinity`). The host's own comment claimed JS parity as the rule; it was true of the corpus and
+   false of the rule.
+4. **THE FILED ONE-LINE DIFF FOR F1 IS REDUNDANT, MEASURED.** `if v == 0.0 { "0" }` is the filed
+   guard and it is kept — but sabotaging it reddens **zero** corpus files, because the general path
+   takes its digits from `format!("{:e}", v.abs())` (`0e0` for -0.0) and its sign from `v < 0.0`
+   (FALSE for -0.0), so `-0.0` renders as `0` with the branch deleted. `main.rs` says so at the
+   branch. The pin that proves negative zero is fixed is the SINK change, not that line.
+5. **`emitCapturedCall` IS ALL-i32-ONLY, and that is NOT this defect.** It emits every argument with
+   a bare `emitExpr` — no parameter coercion and no wide-scalar clear — so it leaks too. But every
+   captured call with any non-i32 parameter OR result is *already* invalid or trapping at master (6
+   cells censused, 1 all-i32 control runs), so clearing the flag there would fix nothing and hide
+   nothing. Filed, not patched, because a hunk that provably changes nothing observable is noise.
+6. **THE 0/16 FUZZ RESULT IS COVERAGE, NOT AGREEMENT.** `scripts/fuzzgen.vl` emits **no memory
+   intrinsic at all** and emits `Map()` only as a `const` BINDING, never as a re-assignment. The
+   corpus channel is where this change is visible, and the comparator was proved live there by
+   eleven named sabotages.
+
+### NEWLY FILED, each with a reproduction
+
+1. **`function g(v: i32): f32 { v * 1.5 }` is invalid wasm** — an i32 x float-literal product in an
+   f32-returning function emits f64 (`type mismatch: expected f64, found f32`, inside `g` itself).
+   Reproduces identically on master and on this head, so it is untouched by this slice; it was found
+   because it was the first callee shape written for the f32 value probes. `(v as f32) * 1.5` works.
+2. **`emitCapturedCall` supports i32 parameters and i32 results only.** Censused: an i32-param/f32-
+   result capturing call is invalid wasm with a literal AND with a variable argument (two distinct
+   faults); an f32 param is invalid in either enclosing context; i64/f64 params TRAP at runtime; the
+   all-i32 control runs. The sink passes arguments with no coercion and calls through the arity
+   signature. Needs the closure-ABI treatment, not a flag clear.
+3. **Rust and V8 break the shortest-representation tie differently.** 3 of 22,532 sweep values
+   (`-1715888522909781.2` vs `.3`) — both decimals round-trip to the identical f64, so neither is
+   wrong. Rust's `{}` and `{:e}` produce the same digits, so this is pre-existing and untouched by
+   the formatter change. Closing it means writing V8's digit generator, not a formatting rule.
+4. **A map-typed ALIAS does not parse.** `type Bank = {[string]: string}` ->
+   `expected an identifier but found '['`. Found as the one non-running cell of the F2 census.
+5. **`sml["k"] == null` over an `f32`-valued map is an emit reject** (`bare null needs a
+   struct-typed context`). Found while writing the map fixture; worked around with `?? 0.0`.
+
+### EVIDENCE
+
+Gate, every RC checked explicitly, at the gating head (`build/vl-compiler.wasm` md5 `a40bbe7a...`,
+1,038,886 B): `refresh-compiler.sh --prove-fixpoint` RC=0 · `native-fixpoint.sh` RC=0 (stage3 ==
+stage4 byte-for-byte) · `lint-self.sh` RC=0 · `rep-fuzz-check.sh` `exact ✅` · the ci.yml commands
+verbatim including `deno test -A tests/cases_wasm_test.ts` **without** `--no-check` (deno-lint, deno
+check compiler/*.ts, `deno task test`, the native suites 609/0, the TYPE-CHECKED corpus oracle
+1371/0, the editor suites 106/0) — all RC=0.
+
+**The master baseline was rebuilt from master's OWN sources in this tree and session**, and is
+byte-identical to the fetched-seed build it is compared against (md5 `6836fffb...`, both 1,036,139 B)
+— i.e. `compile(candidate, master-sources) == compile(seed, master-sources)`, so the baseline is
+master's compiler and not an artifact of who built it.
+
+**Suite A/B, same tree, same session, same command, both seeds:** master seed **2,131 passed / 7
+failed / 14 ignored**, candidate seed **2,138 passed / 0 failed / 14 ignored**. The delta was
+asserted before it was read (2,131 + 7 = 2,138) and the 7 failures are EXACTLY the new fixtures,
+named. **IGNORED NAME SETS IDENTICAL**, both files asserted non-empty (14 each) — and the first
+extraction produced two EMPTY files that diffed clean, which is the failure mode that assertion
+exists to catch.
+
+**Corpus A/B, 1,406 files, every differing file named:** 7 differ, all of them new fixtures.
+**1,399 pre-existing files are byte-, diagnostic- and run-identical** — there are zero bytes-only
+differences and zero behaviour changes outside the new files, because every hunk is gated on a
+construct (a call in f32 context, a wide store, a map re-assignment) that no existing corpus file
+contains.
+
+**HOST A/B, separately:** the same corpus swept under the OLD host and the NEW host with ONE seed —
+**1 file differs**, the fixture written for it. The float-print change reaches no pre-existing corpus
+value, which is expected: `float-opcodes-nan-zero.vl` says in prose that it asserts through
+`f64bits` because "a printed zero does not show its sign".
+
+**Shared-instance `vl check <dir>` leg:** `std` and `compiler` IDENTICAL; `tests/cases` differs in
+exactly the 4 new memory fixtures. **Lint-tier A/B:** `std` and the compiler module graph IDENTICAL;
+`tests/cases` differs in the same 4.
+
+**Fuzz A/B: 25,600 programs per side** (4 seeds x 4 dimension combos x 1,600, whole `--shapes-out`
+failure sets diffed per cell, not counts): **0 of 16 cells differ, 422 failure lines on both sides.**
+See refutation 6 for why that 0 is a coverage statement.
+
+**ENTOMBMENT — eleven named sabotages, A/B'd over the full corpus against the shipped build:**
+
+| # | sabotage | corpus files reddened |
+|---|---|---|
+| S1 | the direct-call arg spine keeps the enclosing f32 context (master's behaviour) | **2** |
+| S2 | the wide store's VALUE operand takes the i32 memory-intrinsic spine | **1** |
+| S3 | `stmtIsTailValue` does not know the wide store names (the 14th cell) | **1** |
+| S4 | `capScan` stops asking the authoritative reservation list | **1** |
+| S5 | `emitAssign` stops seeding the map shape (master's behaviour) | **1** |
+| S6 | the float sinks go back to Rust `Display` (master's behaviour) | **1** |
+| S6b | ONLY the filed negative-zero early return is deleted | **0 — inert, and stated at the branch** |
+| S7 | the host loses the exponential-form rule | **1** |
+| S8 | the memory-usage scan forgets the wide stores | **1**, after its witness was built |
+| S9 | the statement `drop` suppression forgets the wide stores | **3** |
+| S10 | the struct-FIELD write drops the map-shape seed | **1** |
+
+**S8 WAS INERT AND THE RESPONSE WAS TO BUILD ITS POPULATION, NOT TO RECORD IT AS HARMLESS.** Every
+store cell also LOADED, and a load already forces the memory section, so the scan line shipped
+unpinned. `tests/cases/memory/store-only-forces-memory.vl` is a program whose only linear-memory
+contact is a wide store; with it, S8 reddens.
+
+### THE METHOD NOTES THIS SLICE EARNED
+
+108. **A SABOTAGE HARNESS FOR A SELF-HOSTING COMPILER POISONS ITS OWN SEED.** The restore step ran
+     `refresh-compiler.sh`, which SELF-compiles: clean source compiled by the *sabotaged* compiler.
+     S5 breaks `m = Map()`, which `typecheck.vl` itself uses, so the "restored" seed was miscompiled
+     and every later sabotage measured against it — two host-only sabotages reported a corpus file
+     reddening that neither could touch, and the seed then could not compile the compiler at all.
+     **The tell was IMPLAUSIBILITY, not failure**: a Rust float formatter cannot redden a map test.
+     Restore a SAVED PRISTINE artifact; only the sabotage's own build may recompile. Recovery needs
+     the bootstrap ladder run by hand.
+109. **A FILED DIAGNOSIS IS A HYPOTHESIS ABOUT THE SUBJECT, NOT ONLY ABOUT THE LINE NUMBER.** Two of
+     four filed items named the wrong construct entirely — the f32 defect is not about memory
+     intrinsics, F2 is not about `??`. Both were found by censusing the filed shape FIRST and getting
+     144 and 21 clean cells; the honest reading of "it does not reproduce" is not "it is fixed", it
+     is "the report describes a different program". Stale line numbers are the mild form of this.
+110. **A REDUNDANT FIX IS INVISIBLE TO ITS OWN SABOTAGE.** The filed negative-zero guard cannot be
+     pinned because the general path already normalizes -0. That is not a reason to drop the guard,
+     nor to claim the sabotage proves anything — it is a reason to say at the branch which line
+     carries the behaviour. An inert sabotage means "look again", and the two outcomes are "build the
+     population" (S8) or "the code is redundant, say so" (S6b).
+111. **`git stash push -u` DURING A GATE RUN WILL EAT AN UNCOMMITTED FIX, AND A CLEAN `git status`
+     THEN READS AS "COMMITTED".** A fixture repair made mid-gate was stashed by a later
+     tree-cleanliness check, the suite went green *before* the stash, and the same failure returned
+     several hours later. Commit at every stable point — including the ones that only touch tests.

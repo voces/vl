@@ -843,3 +843,128 @@ O5 should be ruled before `Buffer(n)` is allowed to grow the memory implicitly.
 
 Not needed: any host change for the export itself, and any change to the memory section's `min 1`
 (O9's proposal stands — growth covers the rest).
+
+---
+
+## I. What shipped next: the three WIDE store widths (S3's other half)
+
+Appended to §H, which is itself appended to §A–§G; nothing before it is rewritten. Where a number
+here disagrees with one above, this section is the later measurement.
+
+### I1. The slice
+
+`__store_i64__` → `i64.store` (0x37), `__store_f32__` → `f32.store` (0x38), `__store_f64__` →
+`f64.store` (0x39). Alignment exponents 3 / 2 / 3, the natural width in each case, and the same
+memarg encoding the loads use (`fbMemAccess`, renamed from `fbMemLoad` because a store writes the
+identical three bytes). Verified by disassembly, not by reading the table:
+
+```
+0xe0 | 37 03 00 | i64_store memarg:MemArg { align: 3, max_align: 3, offset: 0, memory: 0 }
+0xea | 38 02 00 | f32_store memarg:MemArg { align: 2, max_align: 2, offset: 0, memory: 0 }
+0xf8 | 39 03 00 | f64_store memarg:MemArg { align: 3, max_align: 3, offset: 0, memory: 0 }
+```
+
+**Not in it:** `store8` / `store16`. §O2's naming question is unruled and no `__store_i8__` /
+`__store_i16__` name is declared, so there is nothing to lower. The four bulk/allocator items in
+§H9 are likewise untouched, except that item 2 (S1/O7) is now **done** — see §I4.
+
+The ADDRESS of all fourteen load/store ops is an i32 and takes the same context-clearing operand
+spine every other memory intrinsic uses. The VALUE is the one memory-intrinsic operand that is not
+an i32; it takes its declared width through `emitExprAsI64` / `emitExprAsF32` / `emitExprAsF64` —
+the same helpers the binding / argument / return boundaries use, so an integer literal re-encodes at
+i64, a float literal at f32/f64, and a narrower variable widens exactly where the checker permits.
+`emitMemIntrinArg`'s header, which asserted "EVERY memory-intrinsic operand is an i32 BY
+DECLARATION", is corrected in place.
+
+### I2. 14 of 14, by value, against an independent oracle
+
+#1173 built this lowering, measured **13 of 14** round-trip cells correct, and did not ship it. The
+14th — a store as a function's implicit TAIL statement — needed one line in
+`emit_classify.stmtIsTailValue`, and its report is worth preserving: shipping 13/14 would have
+**traded a clean emit REJECT for a NEW silent invalid module in the most natural shape a user would
+write**. That is the right call, and the line is now here.
+
+Every expectation is the python `struct` encoding of the value, never hand-derived — the load slice
+got two hand-derived expectations wrong (§H6) and the rule since is that none are computed by hand:
+
+| cell | value | read back as | expected |
+| --- | --- | --- | --- |
+| i64 statement / in-fn / **tail** / var / expr / i32-widen | 5000000077 | i64 | 5000000077 |
+| f32 statement / in-fn / **tail** / var / from-load | 1.5, 1.0 | i32 bits | 1069547520, 1065353216 |
+| f64 statement / in-fn / **tail** / var / int-lit / f32-widen | 1.5, −2.25, 3.0 | i64 bits | 4609434218613702656, −4611123068473966592, 4613937818241073152 |
+
+Plus: unaligned at every wide width (f32 at 33, f64 at 51 — the alignment immediate is a hint, and
+the stores inherit that from the loads); the last legal address (65528) and the trap one byte
+further; and three reject controls (arity, binding a void result, a wrong-typed value) whose
+diagnostics are now the REAL ones, because the "declared but has no implementation yet" line that
+used to precede them is gone.
+
+### I3. Acquiring an arm closes the shadowing escape hatch, deliberately
+
+While these three had no lowering, `function __store_f64__(…)` genuinely shadowed the builtin and
+genuinely ran, and `nameIsUnimplementedIntrinsic`'s diagnostic was gated on `fnDeclIx` not holding
+the name precisely to preserve that. An emitter arm rewrites the call site before any declaration is
+looked up, so the body would never run — which is exactly the condition `nameIsEmitterIntrinsic`
+exists to reject at the DEFINITION, where the author can see it. The three names moved from one list
+to the other in the same change. `tests/cases/memory/store-width-user-definition-reserved.vl` pins
+the new behaviour and says why it changed.
+
+`nameIsUnimplementedIntrinsic` is now `__store_string__` and `__log_string__` — the two that are not
+a table entry away (§O8).
+
+### I4. O7 is closed, and the fix was the one already filed in the other file's header
+
+§H5 measured all ten memory intrinsics failing `captured variable not found in enclosing frame` in
+two of four call positions, and named `emit_base.isBuiltinFnName` as the one variable. #1172 fixed
+the mechanism — the exemption became a POSITION (callee only) rather than a name filter — and added
+the then-existing dunder names to that list.
+
+That left a **drift hazard, not a fix**: `isBuiltinFnName` is a PARTIAL COPY of the checker's
+`nameIsEmitterIntrinsic`, and its own header says so, says the two "must be kept in step", and files
+the repair — *"the one-word fix is `export function nameIsEmitterIntrinsic` in `typecheck.vl`, after
+which the whole dunder block here collapses to a single delegation"* — declining it only because
+`typecheck.vl` belonged to another partition. Measured: the three new store widths landed on the
+wrong side of that copy and failed both lambda positions while every other memory intrinsic worked.
+
+`capScan` now asks `nameIsEmitterIntrinsic` directly, at the single site that consumes either list.
+That list is by construction exactly the set of names whose CALL SITE the emitter rewrites before it
+looks up a declaration — which is precisely the condition that makes the exemption sound — so a name
+reserved in the checker is exempt in the capture scan the same day. `isBuiltinFnName` is still asked
+because it also carries `print` / `toString` / `fromCodePoint(s)` / `Map` / `Set`, which are builtins
+rather than dunder intrinsics; its dunder block is now redundant and its deletion belongs to that
+file's owner.
+
+**§H5's cost analysis does not apply and was re-measured rather than inherited.** It warned that a
+name-filter fix would regress `function go(__load_i32__: i32) { const f = () => __load_i32__ + 1; f() }`
+from 42 to a capture failure, because #1167's reservation does not cover PARAMETERS. It still prints
+42 here, and so does the `__store_f64__` spelling of the same shape: the exemption is positional, so
+a parameter read as a VALUE is untouched no matter which list names it.
+
+### I5. Where §H9's list stands now
+
+1. **O1, O5, O6** — still unruled. Nothing below is worth starting first.
+2. ~~S1 / O7, the capture fix~~ — **done** (§I4).
+3. ~~The seven store widths~~ — the three WIDE ones are **done**; the narrow pair is blocked on §O2's
+   naming question, not on any machinery.
+4. **S6 bulk ops** — `memory.copy` / `memory.fill`, needing the emitter's first `0xfc` byte-writer.
+   Their host prerequisite (S0, `--enable-bulk-memory`) is in place and pinned. Unchanged.
+5. **Then S5** — the struct, the bump allocator, the methods, in `std:buffer`. Its two hard
+   prerequisites (S1, S3) are now both satisfied, so this is blocked only on the rulings in item 1.
+
+### I6. A finding this slice did not go looking for: the sabotage harness poisoned its own seed
+
+Not about `Buffer`, but it is about how this tier gets measured, so it is recorded here.
+
+The entombment step applies a named sabotage, rebuilds the seed, sweeps the corpus, then restores.
+`refresh-compiler.sh` is a SELF-compile: the restore step therefore compiled clean source **with the
+sabotaged compiler**. One sabotage in this slice broke `m = Map()` — a construct the compiler's own
+source uses — so the "restored" seed was itself miscompiled, and every later sabotage measured
+against it. Two host-only sabotages reported a corpus file reddening that neither could possibly
+touch; the on-disk seed then failed to compile the compiler at all.
+
+The tell was **implausibility, not failure**: a change to a Rust float formatter cannot redden a map
+test. The fix is that a sabotage harness for a self-hosting compiler must restore a **saved pristine
+artifact**, never rebuild one — only the sabotage's own build may recompile. Recovery needed the
+bootstrap ladder run by hand (a healthy seed compiling a source tree that carries the emitter fix but
+not yet the construct it enables), which is the same ladder any change that the compiler's own source
+depends on will need.
