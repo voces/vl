@@ -8362,9 +8362,10 @@ export function retListKindFlag(tyIx: i32) {
 export function retRefArrElemName(tyIx: i32) {
   if tyIx >= 0 {
     const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if nameIsRefArray(ty.tyName) { return refArrElemName(ty.tyName) }
-    }
+    // `refArrElemNameIf` IS the `nameIsRefArray`-gated `refArrElemName` this arm spelled
+    // out; its "" for a non-ref-array annotation is the same "" this function's tail
+    // returned, so the early return is exact.
+    if ty is TypeRef { return refArrElemNameIf(ty.tyName) }
   }
   ""
 }
@@ -9813,6 +9814,30 @@ export function refArrElemName(name: string) {
     if nameIsRefArray(base) { return base }
   }
   ""
+}
+
+// "GIVE ME THIS NAME'S REF-LIST ELEMENT, OR NOTHING" — the ONE home of the guarded pair
+// SEVEN sites in this file wrote out by hand:
+//
+//     if nameIsRefArray(x) { <use> refArrElemName(x) }      // and "" otherwise
+//
+// The guard is NOT redundant and the pair cannot be collapsed to `refArrElemName` alone.
+// `nameIsRefArray` carries two rejections of its own that `refArrElemName` never learned —
+// a TOP-LEVEL arrow (`(i32) => S[]` is a closure RETURNING an array, not a ref array) and a
+// literal-union array (`K[]`, whose elements are interned i32 ATOMS). MEASURED (D-REFELEM):
+// over 30,970 calls the guard says NO 16,152 times and `refArrElemName` would have answered
+// a NON-EMPTY element on **120** of them (20 corpus / 100 fuzz) — every one the LITUNION
+// case, where `K` is a registered `unNames` row so the trailing base match fires. The ARROW
+// rejection has **zero** witnesses on either channel; it is kept because it is master's
+// behaviour, not because it was seen to fire. Seven copies of the pair are seven places that
+// had to agree about all of that, and the two-call shape is also two ladder walks per name.
+//
+// "" means BOTH "not a ref array" and "a ref array whose element does not resolve"; every
+// caller answered `false`/"" for the second already (it is `refArrElemName`'s own miss value),
+// so the fold is exact at each of them — see the per-site notes.
+export function refArrElemNameIf(name: string) {
+  if !nameIsRefArray(name) { return "" }
+  refArrElemName(name)
 }
 
 // Intern a ref-list element type-NAME into the per-element-type table, returning its
@@ -11530,36 +11555,46 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   false
 }
 
+// The ref-list element KEY of an array spelling, with the DEFERRED fallback the
+// shape-text field recorder needs — the ONE home of the four-line ladder its code-5 and
+// code-28 arms each wrote out:
+//
+//     const e = refArrElemName(x)
+//     if e != "" { return e }
+//     if nameIsArray(x) { return x.slice(0, x.length - 2) }
+//     return ""
+//
+// A NAMED-struct/union or inline-shape element (`S[]`, `{f: f64}[]`) is invisible to
+// `refArrElemName` while the struct/union tables are still empty (`collectU` registers
+// shape-text variants BEFORE `collectS`/`collectAnnShapes` run). The stripped element
+// text IS the canonical slot key for exactly those spellings — the table-INDEPENDENT
+// element sorts (paren-union / closure / map / scalar-2D) have already been answered by
+// `refArrElemName` above — so it is recorded DEFERRED and `collectA`'s variant field
+// pass interns it (`ensureRefElem`) once the tables exist.
+//
+// NB a THIRD copy of this grammar (`unionListElemMapFieldMember`) gates the fallback on
+// `a.length > 2` rather than `nameIsArray(a)`. It is NOT folded in here: the two guards
+// agree only because that copy already sits inside a `nameIsRefArray(a)` arm, and
+// unifying them would be a behaviour change wearing a dedup's clothes.
+function refArrElemKeyDeferred(name: string) {
+  const e = refArrElemName(name)
+  if e != "" { return e }
+  if nameIsArray(name) { return name.slice(0, name.length - 2) }
+  ""
+}
+
 // The ELEMENT/TARGET name a shape-text field records in `uFieldElemName`: a
 // ref-list field its element name, a nested-struct field its (non-null) target
 // name, a value-union field its atom-set name; "" otherwise.
 export function shapeFieldElemName(ftxt: string, code: i32) {
-  if code == 5 {
-    const e5 = refArrElemName(ftxt)
-    if e5 != "" { return e5 }
-    // A NAMED-struct/union or inline-shape element (`S[]`, `{f: f64}[]`) is invisible
-    // to `refArrElemName` while the struct/union tables are still empty (`collectU`
-    // registers shape-text variants BEFORE `collectS`/`collectAnnShapes` run). The
-    // stripped element text IS the canonical slot key for exactly those spellings
-    // (the table-independent element sorts — paren-union / closure / map / scalar-2D
-    // — already resolved above), so record it DEFERRED; `collectA`'s variant field
-    // pass interns the element (`ensureRefElem`) once the tables exist.
-    if nameIsArray(ftxt) { return ftxt.slice(0, ftxt.length - 2) }
-    return ""
-  }
+  if code == 5 { return refArrElemKeyDeferred(ftxt) }
   if code == 15 { return nonNulBaseOf(ftxt) }
   if code == 16 { return ftxt }
   // A NULLABLE REF-LIST field (code 28, `S[] | null`): the ref-array element of the
   // non-null part — the shape-text mirror of `fieldRefElemName`'s code-28 arm, with
   // the same deferred-intern fallback the code-5 arm uses for a not-yet-registered
   // struct/union element (`collectA`'s variant field pass interns it once tables exist).
-  if code == 28 {
-    const b28 = nullablePartOf(ftxt)
-    const e28 = refArrElemName(b28)
-    if e28 != "" { return e28 }
-    if nameIsArray(b28) { return b28.slice(0, b28.length - 2) }
-    return ""
-  }
+  if code == 28 { return refArrElemKeyDeferred(nullablePartOf(ftxt)) }
   // A MAP-typed field (code 19) records its VALUE type-name — the mv-slot key, the
   // shape-text mirror of `fieldRefElemName`'s code-19 arm. Without it a shape-text
   // union VARIANT with a map field (`{f: {[string]: i32}} | i32`) recorded "" and
@@ -11798,9 +11833,8 @@ export function registerValueUnionName(name: string) {
 // legacy name path.
 export function markValueUnionAtoms(name: string) {
   const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
   const mems: i32[] = []
-  const cov = unionMemberTysOf(name, mems) && mems.length == atoms.length
+  const cov = unionSetArmTys(name, atoms, mems)
   let i = 0
   while i < atoms.length {
     let k = -1
@@ -11860,15 +11894,14 @@ export function markValueUnionAtoms(name: string) {
 // owns those) are skipped. A no-op for a union with no ref-array arm; called from BOTH the inline
 // and named registration paths so the two spellings intern identically.
 export function markRefArrayArms(name: string) {
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
   // D-UNION: the arm gate is a `TyArray` over a non-scalar-leaf element
   // (`unMemIsRefElemArray`), not `valueAtomKind(a) < 0 && nameIsArray(a)` over the
   // atom's rendering. The stored atom TEXT is still what the name-keyed reflist layer
   // downstream (`internShapeDeep` / `refArrElemName` / `ensureRefElem`) needs, so it
   // stays; only the classification moves. An uncovered row keeps the legacy gate.
+  const atoms: string[] = []
   const mems: i32[] = []
-  const cov = unionMemberTysOf(name, mems) && mems.length == atoms.length
+  const cov = unionSetArmTys(name, atoms, mems)
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
@@ -11906,13 +11939,12 @@ export function markRefArrayArms(name: string) {
 // with no map arm; called from BOTH the inline and named registration paths so the two spellings
 // intern identically. Runs in `collectA` too (the AUTHORITATIVE re-intern after the mv-table reset).
 export function markMapUnionArms(name: string) {
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
   // D-UNION: a map arm is a `TyMap` member (`unMemIsMap`), not a `{[`-prefixed
   // rendering. The arm's stored atom TEXT still keys the (name-keyed) map-value slot
   // layer below (`mapValNameOf` → `mvShapeOfValName`). Uncovered rows keep the name gate.
+  const atoms: string[] = []
   const mems: i32[] = []
-  const cov = unionMemberTysOf(name, mems) && mems.length == atoms.length
+  const cov = unionSetArmTys(name, atoms, mems)
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
@@ -12045,13 +12077,12 @@ export function forceCloResultListTypes(nm: string) {
 // Arm and carrier compare CANONICALLY (`mvCanonRepOf`): a twin-spelled carrier (a
 // `{[string]: B}` boxed into a `{[string]: {v: i32}} | X`) matches the arm it lowers as.
 export function unionHasMapArmSlot(name: string, slot: i32) {
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
   // D-UNION: the arm SHAPE test is structural (`unMemIsMap` — a `TyMap` member); the
   // SLOT comparison stays where it is, because a slot is a REP question and
   // `mvSlotOfMapValNameOrMono`/`mvCanonRepOf` already answer it canonically.
+  const atoms: string[] = []
   const mems: i32[] = []
-  const cov = unionMemberTysOf(name, mems) && mems.length == atoms.length
+  const cov = unionSetArmTys(name, atoms, mems)
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
@@ -12114,7 +12145,6 @@ export function unionHasMapArm(name: string) { unionMapArmName(name) != "" }
 // pre-pass (where the `is`-narrow that makes `t` a map is not active).
 export function unionMapArmName(name: string) {
   const atoms: string[] = []
-  const nm = unionArmsOf(name, atoms)
   // D-UNION: pick the map arm from the row's recorded ARENA member types
   // (`unMemIsMap` — `T.tys[m] is TyMap`) instead of re-classifying each atom's
   // RENDERED spelling with `nameIsMap`. The recorded member slice is in atom order
@@ -12122,7 +12152,7 @@ export function unionMapArmName(name: string) {
   // what the still-name-keyed map-slot layer downstream (`mapValNameOf`,
   // `mvSlotOfMapValNameOrMono`) needs. An uncovered row keeps the legacy name path.
   const mems: i32[] = []
-  if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+  if unionArmTys(name, atoms, mems) {
     let m = 0
     while m < mems.length {
       if unMemIsMap(mems[m]) { return atoms[m] }
@@ -12277,14 +12307,13 @@ export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
         const un = unionNameOfIdent(arr.identName, fnIx)
         if un != "" {
           const atoms: string[] = []
-          const nm = unionArmsOf(un, atoms)
           // D-UNION (batch 2's `tyArmPathLeaf` walk, applied to an INDEXED root): the
           // arm's element type is `tyArmElem` (a `TyArray` arm's element — the name
           // path's `nameIsRefArray(a)` gate plus its `refArrElemName`/inline-shape
           // re-resolution), and the `.f` leaf's code-19 map test is `tyArmPathIsMap`.
           // An uncovered row keeps the legacy name walk.
           const mems: i32[] = []
-          const cov = unionMemberTysOf(nm, mems) && mems.length == atoms.length
+          const cov = unionArmTys(un, atoms, mems)
           let i = 0
           while i < atoms.length {
             const a = atoms[i]
@@ -12359,12 +12388,11 @@ export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
     const un = unionNameOfIdent(rootName, fnIx)
     if un == "" { return false }
     const atoms: string[] = []
-    const nm = unionArmsOf(un, atoms)
     // D-UNION: the arm's field path is walked over the member's ARENA type
     // (`tyArmPathIsMap` — a `TyMap` leaf) instead of re-resolving the rendered atom to
     // a struct/variant row and consulting its per-field lowering codes.
     const mems: i32[] = []
-    if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+    if unionArmTys(un, atoms, mems) {
       let m = 0
       while m < mems.length {
         if atoms[m] != "null" {
@@ -12470,12 +12498,11 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
     const un = unionNameOfIdent(rootName, fnIx)
     if un == "" { return false }
     const atoms: string[] = []
-    const nm = unionArmsOf(un, atoms)
     // D-UNION: the arm walk is structural (`tyArmPathIsMapList` — a `TyArray` over a
     // `TyMap` leaf), and so is the indexed-root hop: `tyArmElem` takes a `TyArray` arm's
     // element in place of `nameIsRefArray` + `refArrElemName` on the rendered atom.
     const mems: i32[] = []
-    if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+    if unionArmTys(un, atoms, mems) {
       let m = 0
       while m < mems.length {
         if atoms[m] != "null" {
@@ -12493,7 +12520,9 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
         let arm = atoms[ai]
         if viaElem {
           // The indexed-root form walks from the REF-ARRAY arm's element struct.
-          if nameIsRefArray(arm) { arm = refArrElemName(arm) } else { arm = "" }
+          // `refArrElemNameIf` IS this guarded pair, verbatim (its else-branch "" is
+          // the same "" this line assigned).
+          arm = refArrElemNameIf(arm)
         }
         if arm != "" {
           if unionArmPathIsMapList(arm, path) { return true }
@@ -12539,12 +12568,11 @@ function unionArmPathIsMapList(arm: string, path: string[]): boolean {
 // `callRefSlot` for it — see `blockHasCallRef`. Resolves an alias to its member set first.
 export function unionHasClosureArrayArm(name: string) {
   const atoms: string[] = []
-  const nm = unionArmsOf(name, atoms)
   // D-UNION: `unMemIsFuncArray` (a `TyArray` over a `TyFunc`) is the arena dual of
   // `nameIsClosureArray` — including its NULLABLE-element exclusion, which falls out
   // for free (a `(((i32) => boolean) | null)[]` element is a `TyNullable`).
   const mems: i32[] = []
-  if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+  if unionArmTys(name, atoms, mems) {
     let m = 0
     while m < mems.length {
       if unMemIsFuncArray(mems[m]) { return true }
@@ -12590,16 +12618,15 @@ export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
     if ix is Index {
       const arr = P.nodes[unwrapParen(ix.idxArr)]
       if arr is Ident {
-        let un = unionNameOfIdent(arr.identName, fnIx)
+        const un = unionNameOfIdent(arr.identName, fnIx)
         if un != "" {
           const atoms: string[] = []
-          un = unionArmsOf(un, atoms)
           // D-UNION: the deliberately-conservative `strContains(elem, "=>")` arm test
           // is a REACHABILITY question — `unMemIsFuncReachArray` asks it of the arena
           // (a `TyArray` whose element structure reaches a `TyFunc`) instead of of the
           // element's rendered spelling.
           const mems: i32[] = []
-          if unionMemberTysOf(un, mems) && mems.length == atoms.length {
+          if unionArmTys(un, atoms, mems) {
             let m = 0
             while m < mems.length {
               if unMemIsFuncReachArray(mems[m]) { return true }
@@ -12610,8 +12637,11 @@ export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
           let i = 0
           while i < atoms.length {
             const a = atoms[i]
-            if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
-              if strContains(refArrElemName(a), "=>") { return true }
+            // `refArrElemNameIf` IS the `nameIsRefArray` gate plus the element read;
+            // a non-ref-array atom yields "" and `strContains("", "=>")` is false, so
+            // dropping the conjunct is exact.
+            if a != "null" && valueAtomKind(a) < 0 {
+              if strContains(refArrElemNameIf(a), "=>") { return true }
             }
             i = i + 1
           }
@@ -12630,11 +12660,10 @@ export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
 // array arm, a distinct shape whose arrow is nested inside `[]`).
 export function unionHasClosureArm(name: string) {
   const atoms: string[] = []
-  const nm = unionArmsOf(name, atoms)
   // D-UNION: value-atom kind 11 IS "the member is a function type" — ask the arena
   // (`unMemIsFunc`) rather than `valueAtomKind`'s spelling ladder.
   const mems: i32[] = []
-  if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+  if unionArmTys(name, atoms, mems) {
     let m = 0
     while m < mems.length {
       if unMemIsFunc(mems[m]) { return true }
@@ -12656,12 +12685,11 @@ export function unionHasClosureArm(name: string) {
 // limitation, not exercised by the supported single-closure-arm shapes; returns the FIRST here.)
 export function unionClosureArmName(name: string) {
   const atoms: string[] = []
-  const nm = unionArmsOf(name, atoms)
   // D-UNION: the arm SELECTION is structural (`unMemIsFunc`); the returned NAME stays
   // the member's stored spelling, which `emitUnionCoerce` feeds to the still-name-keyed
   // `scalarTagOf` (a D5 residual, not this slice).
   const mems: i32[] = []
-  if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+  if unionArmTys(name, atoms, mems) {
     let m = 0
     while m < mems.length {
       if unMemIsFunc(mems[m]) { return atoms[m] }
@@ -12688,10 +12716,13 @@ export function unionClosureArrElemUnion(name: string) {
   unionArmsOf(name, atoms)
   let i = 0
   while i < atoms.length {
-    if nameIsRefArray(atoms[i]) {
-      const el = refArrElemName(atoms[i])
-      if isValueUnionName(el) && unionHasClosureArm(el) { return el }
-    }
+    // `refArrElemNameIf` IS the `nameIsRefArray` gate plus the element read. The
+    // `el != ""` test KEEPS the short-circuit master's `nameIsRefArray` arm had —
+    // D-GRAMHOME's rule, that a home placed in front of a cheap reject must not cost the
+    // early exit. Without it `isValueUnionName("")` would run once per non-ref-array
+    // atom, which is an `unionMemberCount` scan this loop never used to pay.
+    const el = refArrElemNameIf(atoms[i])
+    if el != "" && isValueUnionName(el) && unionHasClosureArm(el) { return el }
     i = i + 1
   }
   ""
@@ -12771,11 +12802,10 @@ function identRebindUnionArmClosureField(
     const un = unionNameOfIdent(rootName, fnIx)
     if un == "" { return false }
     const atoms: string[] = []
-    const uset = unionArmsOf(un, atoms)
     // D-UNION: the arm walk is structural (`tyArmPathHasCloValue` — a `TyFunc` leaf,
     // bare / nullable, or a `TyUnion` with a `TyFunc` member).
     const mems: i32[] = []
-    if unionMemberTysOf(uset, mems) && mems.length == atoms.length {
+    if unionArmTys(un, atoms, mems) {
       let m = 0
       while m < mems.length {
         if atoms[m] != "null" {
@@ -12873,11 +12903,10 @@ export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
     const un = unionNameOfIdent(rootName, fnIx)
     if un == "" { return false }
     const atoms: string[] = []
-    const uset = unionArmsOf(un, atoms)
     // D-UNION: the arm walk is structural (`tyArmPathIsClosure` — a `TyFunc` leaf, bare
     // or under the nullable-closure niche's `TyNullable`).
     const mems: i32[] = []
-    if unionMemberTysOf(uset, mems) && mems.length == atoms.length {
+    if unionArmTys(un, atoms, mems) {
       let m = 0
       while m < mems.length {
         if atoms[m] != "null" {
@@ -12942,11 +12971,10 @@ export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
       const un = unionNameOfIdent(rootName, fnIx)
       if un == "" { return false }
       const atoms: string[] = []
-      const uset = unionArmsOf(un, atoms)
       // D-UNION: the arm walk is structural (`tyArmPathIsCloArray` — a `TyArray` over a
       // `TyFunc` leaf).
       const mems: i32[] = []
-      if unionMemberTysOf(uset, mems) && mems.length == atoms.length {
+      if unionArmTys(un, atoms, mems) {
         let m = 0
         while m < mems.length {
           if atoms[m] != "null" {
@@ -13199,12 +13227,11 @@ export function unionNestedArrayArmSlot(name: string) {
 // binding's DECLARED union (the map-array twin of `unionHasMapArm`).
 export function unionHasMapArrayArm(name: string) {
   const atoms: string[] = []
-  const nm = unionArmsOf(name, atoms)
   // D-UNION: a `TyArray` over a `TyMap` (`unMemIsMapArray`). The name path's
   // `!nameIsMapMemberUnion(elem)` guard is free structurally — a map-member UNION
   // element is a `TyUnion`, never a `TyMap`, however it renders.
   const mems: i32[] = []
-  if unionMemberTysOf(nm, mems) && mems.length == atoms.length {
+  if unionArmTys(name, atoms, mems) {
     let m = 0
     while m < mems.length {
       if unMemIsMapArray(mems[m]) { return true }
@@ -14759,6 +14786,58 @@ export function unionArmsOf(name: string, out: string[]) {
   nm
 }
 
+// "GIVE ME THIS UNION'S ARMS, BOTH WAYS" — the ONE home of the four-line preamble
+// TWELVE union classifiers in this file each wrote out by hand on top of
+// `unionArmsOf`:
+//
+//     const atoms: string[] = []
+//     const nm = unionArmsOf(name, atoms)                              // arm SPELLINGS
+//     const mems: i32[] = []
+//     const cov = unionMemberTysOf(nm, mems) && mems.length == atoms.length
+//
+// Every one of the twelve then branched on `cov`: an arena loop over `mems[i]` when
+// true, the legacy spelling loop over `atoms[i]` when false. The pairing rule — the two
+// arrays are index-parallel, so `atoms[i]` is `mems[i]`'s stored spelling — and the
+// LENGTH check that establishes it were re-decided at each site, and the resolved set
+// name `nm` was held by every one of them for one use only. Named once, the coverage
+// rule lives in a single place: the day a caller may take the member types WITHOUT a
+// spelling array there is one function to change, not twelve.
+//
+// Returns TRUE when the arena leg covers the row 1:1 (`tys` is then filled, in the
+// row's recorded box-tag ABI order); FALSE leaves `tys` untouched — `unionMemberTysOf`
+// is all-or-nothing — and the caller keeps its spelling loop. `atoms` is filled EITHER
+// WAY, which is what makes the fall-through legal.
+export function unionArmTys(
+  name: string,
+  atoms: string[],
+  tys: i32[],
+): boolean {
+  const nm = unionArmsOf(name, atoms)
+  unionMemberTysOf(nm, tys) && tys.length == atoms.length
+}
+
+// `unionArmTys` for a caller that already HOLDS a member SET and must NOT have it
+// resolved as an alias name — the union REGISTRATION paths (`markValueUnionAtoms`,
+// `markRefArrayArms`, `markMapUnionArms`) and `unionHasMapArmSlot`, which are handed
+// `unMemberSet[u]` / an inline set / a map VALUE spelling by their callers.
+//
+// **THE TWO ARE NOT INTERCHANGEABLE, and that is why there are two.** `unionArmsOf`
+// runs `unionMemberSetOf` first, so a registered ALIAS name `U` (`type U = A | B`)
+// expands to its two arms; `splitUnionAtoms("U")` yields the single atom `"U"`. Both
+// spellings genuinely reach these four: `markMapUnionArms` is called with a map's VALUE
+// name (which may be a declared union alias) and `unionHasMapArmSlot` with whatever
+// `emitUnionCoerce` holds. Expanding there would change which arms are interned /
+// tag-matched, so the alias resolution is deliberately absent — the difference between
+// the two homes is the whole content of this comment.
+export function unionSetArmTys(
+  set: string,
+  atoms: string[],
+  tys: i32[],
+): boolean {
+  splitUnionAtoms(set, atoms)
+  unionMemberTysOf(set, tys) && tys.length == atoms.length
+}
+
 // The `unNames` ROW of the union `name` — matched on the alias NAME or on the
 // pipe-joined member SET (a consumer that already resolved the alias hands us the
 // set), or -1. Nominal identity lookup, not a structural decision.
@@ -16063,9 +16142,9 @@ function paramRefArrayName(fnIx: i32, name: string) {
         if p.parName == name {
           if p.parType >= 0 {
             const ty = P.nodes[p.parType]
-            if ty is TypeRef {
-              if nameIsRefArray(ty.tyName) { return refArrElemName(ty.tyName) }
-            }
+            // `refArrElemNameIf` (the `nameIsRefArray`-gated element read): its "" for a
+            // non-ref-array annotation is the same "" the next line returns.
+            if ty is TypeRef { return refArrElemNameIf(ty.tyName) }
           }
           return ""
         }
@@ -16094,8 +16173,12 @@ function fnRetNulRefArrayName(name: string) {
   const fn = P.nodes[fnStmts[i]]
   if fn is FuncDecl {
     if fn.fnRet >= 0 {
+      // `refArrElemNameIf` (the `nameIsRefArray`-gated element read). The `np != ""`
+      // conjunct is KEPT rather than folded in: it is master's short-circuit, and
+      // `nameIsRefArray("")` is not free (an `annArrowAt` scan, a `nameIsLitUnionArray`
+      // and a whole `refArrShapeKind` ladder) — D-GRAMHOME's rule again.
       const np = nullablePartOf(tyNameOf(fn.fnRet))
-      if np != "" && nameIsRefArray(np) { return refArrElemName(np) }
+      if np != "" { return refArrElemNameIf(np) }
     }
   }
   ""
@@ -16304,7 +16387,18 @@ function letRefListElemName(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
-        if nameIsRefArray(lt.tyName) { return refArrElemName(lt.tyName) }
+        // `refArrElemNameIf` (the `nameIsRefArray`-gated element read). This is the ONE
+        // of the seven sites whose else-branch is not "" but the initializer path, so
+        // the fold merges two answers that master kept apart: "not a ref array" (fall
+        // through) and "a ref array whose element does not resolve" (return ""). That
+        // second cell is measured EMPTY — a probe counting `nameIsRefArray(t) &&
+        // refArrElemName(t) == ""` over every annotation reaching here read 0 on both
+        // channels (see D-REFELEM in the program doc) — and it is expected to be empty
+        // by construction: every arm that makes `nameIsRefArray` true either is a
+        // `refArrShapeKind` arm (each of which `refArrElemName` re-tests, in the same
+        // order) or is the trailing base-name match, whose four rungs are the same four.
+        const en = refArrElemNameIf(lt.tyName)
+        if en != "" { return en }
       }
     }
     return refListElemNameOfExpr(d.letInit, fnIx)
