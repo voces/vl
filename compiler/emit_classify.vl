@@ -128,7 +128,6 @@ import {
   nameIsLitUnionArray,
   nameIsMap,
   nameIsMapArray,
-  nameIsMapMemberUnion,
   nameIsNulBool,
   nameIsNulBoolList,
   nameIsNulClosure,
@@ -1695,11 +1694,11 @@ function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
           if d.letType >= 0 {
             const lt = P.nodes[d.letType]
             if lt is TypeRef {
-              if nameIsMap(lt.tyName) && !nameIsMapMemberUnion(lt.tyName) {
+              if nameIsBareMap(lt.tyName) {
                 // A supported map value type — the same classifier `retMapFlag` gates the
                 // boundary with (`mvValKindOfName`); the return's SHAPE is recovered at the
                 // functype-result site via `mapShapeOfExpr` over this same local.
-                return mvValKindOfName(mapValNameOf(lt.tyName)) != -3
+                return mapValKindLowerable(lt.tyName)
               }
             }
           }
@@ -2478,7 +2477,7 @@ export function nulRefMapValInnerOf(valName: string): string {
   }
   if nonNull != 1 { return "" }
   if inner == "string" { return inner }
-  if nameIsMap(inner) && !nameIsMapMemberUnion(inner) { return inner }
+  if nameIsBareMap(inner) { return inner }
   // A CLOSURE member (`(() => string) | null` — the member keeps its grouping parens, so the
   // arrow sits at paren depth 1): the closure fat-pointer rides the SAME `(ref null
   // $cloStruct)` vals element a non-null closure value uses — the closure niche of the
@@ -2527,6 +2526,17 @@ export function mvUnionIsScalarNull(slot: i32) {
   // against, so it keeps the string surgery (method note 6).
   const ak = valueAtomKind(removeAtomFrom(vn, "null"))
   ak >= 0 && ak != 2 && ak != 6
+}
+
+// True if the BARE MAP spelling `mapName` has a value type the mv layer can lower —
+// `mvValKindOfName` of its VALUE, tested against the `-3` unsupported sentinel. FIVE
+// classifiers (the local / return / nullable-return / field / non-lowerable-field
+// gates) each wrote `mvValKindOfName(mapValNameOf(x)) != -3`: five sites deciding
+// separately that the way to reach a map's value kind is to SLICE the value out of the
+// map's spelling, and five sites that have to be found and changed together if the
+// unsupported sentinel ever moves.
+function mapValKindLowerable(mapName: string) {
+  mvValKindOfName(mapValNameOf(mapName)) != -3
 }
 
 export function mvValKindOfName(valName: string): i32 {
@@ -2614,7 +2624,7 @@ export function mvValKindOfName(valName: string): i32 {
   } else if valName == "f32" {
     // An f32-valued map: the scalar f32 list (`$fl32TypeIdx`/`$fa32TypeIdx`); valStash f32.
     kind = 13
-  } else if nameIsMap(valName) && !nameIsMapMemberUnion(valName) {
+  } else if nameIsBareMap(valName) {
     // A NESTED map (`{[string]: {[string]: V}}`): the value is an INNER map struct ref,
     // stored in a ref list whose element kind is 3 (a map element → the inner map struct).
     // Reuses the SAME ref-value spine as a struct-valued map; only the element heap differs.
@@ -2713,19 +2723,36 @@ export function mvCanonValName(valName: string) {
     return rlCanonLitUnionAtoms(valName)
   }
   if unionMemberCount(valName) < 2 { return valName }
+  canonLitUnionArms(valName)
+}
+
+// THE LITUNION-ARM CANON, WRITTEN ONCE. `mvCanonValName` (above) and
+// `rlCanonLitUnionAtoms` (the ref-list element normalizer) each carried this
+// thirty-line body VERBATIM — same split, same niche guard, same widen-or-descend
+// loop, same "unchanged ⇒ return the original" fall-through — differing only in the
+// name of the parameter. Two copies of a union grammar are two copies of the split
+// inside it, and two places for the R3 boxed-member rule to drift.
+//
+// Widen ONLY a genuine MIX (a non-null, non-litunion sibling exists): a pure
+// `K0 | null` value is the -1-sentinel MONO niche (`nameIsNulLitUnion`), NOT the
+// string-atom box — widening it re-repped the niche as `string|null` and broke the
+// nullable-litunion map values. A non-litunion atom DESCENDS (a nullable struct value
+// `{f: K0|f64} | null` carries its litunion one level down), so the nested spelling
+// keys the same softened slot.
+//
+// Callers keep their own cardinality gate, because they spell it differently for a
+// reason: `mvCanonValName` returns early on a non-union, `rlCanonLitUnionAtoms` falls
+// through to its own tail. Both reach here only with 2+ top-level atoms.
+function canonLitUnionArms(name: string): string {
   const atoms: string[] = []
-  splitUnionAtoms(valName, atoms)
-  // Widen ONLY a genuine MIX (a non-null, non-litunion sibling exists): a pure
-  // `K0 | null` value is the -1-sentinel MONO niche (`nameIsNulLitUnion`), NOT the
-  // string-atom box — widening it re-repped the niche as `string|null` and broke
-  // the nullable-litunion map values.
+  splitUnionAtoms(name, atoms)
   let hasOther = false
   let h = 0
   while h < atoms.length {
     if atoms[h] != "null" && !nameIsLitUnionType(atoms[h]) { hasOther = true }
     h = h + 1
   }
-  if !hasOther { return valName }
+  if !hasOther { return name }
   let changed = false
   let canon = ""
   let i = 0
@@ -2735,8 +2762,6 @@ export function mvCanonValName(valName: string) {
       a = "string"
       changed = true
     } else if a != "null" {
-      // A struct / shape atom carrying a litunion one level down (`{f: K0|f64} | null`):
-      // descend it so the nullable-struct-value spelling keys the same softened slot.
       const ra = rlCanonLitUnionAtoms(a)
       if ra != a {
         a = ra
@@ -2748,7 +2773,7 @@ export function mvCanonValName(valName: string) {
     i = i + 1
   }
   if changed { return canon }
-  valName
+  name
 }
 
 // The mv table's NAME scan — first-match-wins over the recorded canonical value
@@ -2761,6 +2786,15 @@ export function mvSlotByValName(valName: string): i32 {
     i = i + 1
   }
   -1
+}
+
+// The mv shape of a BARE MAP spelling — `mvShapeOfValName` of the map's VALUE. Five call
+// sites composed these two by hand, which meant five sites each deciding, locally, that
+// the way to get from `{[string]: V}` to its value rep is to SLICE `V` out of the
+// spelling. One home: when the map's value comes off the arena instead
+// (`T.tys[m] is TyMap` → the value ty), there is one call to change.
+export function mvShapeOfMapName(mapName: string) {
+  mvShapeOfValName(mapValNameOf(mapName))
 }
 
 export function mvShapeOfValName(valNameIn: string) {
@@ -2805,7 +2839,7 @@ export function mvShapeOfValName(valNameIn: string) {
     aUsed = true
     if nameIsMap(bare) {
       mUsed = true
-      mvShapeOfValName(mapValNameOf(bare))
+      mvShapeOfMapName(bare)
     }
     // A non-i32 LIST value forces its inner list's type so the element wrapper heap exists.
     if nameIsStringArray(bare) { slUsed = true }
@@ -4299,7 +4333,7 @@ export function rlElemCloSigKeyAt(slot: i32): string {
 export function rlElemInnerSlot(slot: i32): i32 {
   const ar = rlInnerSlotOfElem(slot)
   if ar >= 0 { return ar }
-  rlSlotByName(refArrElemName(rlElemName[slot]))
+  rlSlotOfArrName(rlElemName[slot])
 }
 
 // The interned ref-list SLOT of union MEMBER `m`'s ref-ARRAY arm (destringify
@@ -4358,9 +4392,7 @@ export function unMemRefArrArmSlot(m: i32): i32 {
 export function rlElemStructRow(slot: i32): i32 {
   const ar = rlElemStructIdxAt(slot)
   if ar >= 0 { return ar }
-  let ln = rlElemName[slot]
-  const lnn = nullablePartOf(ln)
-  if lnn != "" { ln = lnn }
+  const ln = nonNulBaseOf(rlElemName[slot])
   const bn = structIndexByName(ln)
   if bn >= 0 { return bn }
   repRowOfTyStruct(rlElemNonNulTyAt(slot), sScanLim())
@@ -4376,9 +4408,7 @@ export function rlElemStructRow(slot: i32): i32 {
 export function rlElemLitStructRow(slot: i32): i32 {
   const ar = rlElemStructIdxAt(slot)
   if ar >= 0 { return ar }
-  let ln = rlElemName[slot]
-  const lnn = nullablePartOf(ln)
-  if lnn != "" { ln = lnn }
+  const ln = nonNulBaseOf(rlElemName[slot])
   structIndexByName(ln)
 }
 
@@ -4396,9 +4426,7 @@ export function rlElemIsNulNiche(slot: i32): boolean {
 export function rlElemCloSigKey(slot: i32): string {
   const ar = rlElemCloSigKeyAt(slot)
   if ar != "" { return ar }
-  let nm = rlElemName[slot]
-  const nmp = nullablePartOf(nm)
-  if nmp != "" { nm = nmp }
+  const nm = nonNulBaseOf(rlElemName[slot])
   if nm.length < 2 { return "" }
   if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
   annSigKey(nm.slice(1, nm.length - 1))
@@ -4439,7 +4467,7 @@ export function rlElemMapValMvSlotAt(slot: i32, peelNul: boolean): i32 {
 export function rlElemMapValMvSlot(slot: i32): i32 {
   const ar = rlElemMapValMvSlotAt(slot, false)
   if ar >= 0 { return ar }
-  mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[slot]))
+  mvSlotOfMapName(rlElemName[slot])
 }
 
 // `rlElemMapValMvSlot` for a slot whose element may be a NULLABLE map: the arena leg
@@ -4451,7 +4479,7 @@ export function rlElemNulMapValMvSlot(slot: i32): i32 {
   let cen = rlElemName[slot]
   const cnin = nulMapInnerName(cen)
   if cnin != "" { cen = cnin }
-  mvSlotOfMapValNameOrMono(mapValNameOf(cen))
+  mvSlotOfMapName(cen)
 }
 
 // The ARENA type a map-VALUE slot's stored value name denotes (destringify D5-final
@@ -4634,7 +4662,7 @@ export function mvValUnionScalarNullAt(slot: i32): i32 {
 export function mvValInnerRlSlot(slot: i32): i32 {
   const ar = mvValInnerRlSlotAt(slot)
   if ar >= 0 { return ar }
-  rlSlotByName(refArrElemName(mvValName[slot]))
+  rlSlotOfArrName(mvValName[slot])
 }
 
 // The mv slot of a NESTED-map value's inner value (destringify D5-final (b)). ARENA
@@ -4644,7 +4672,7 @@ export function mvValInnerRlSlot(slot: i32): i32 {
 export function mvValInnerMvSlot(slot: i32): i32 {
   const ar = mvValInnerMvSlotAt(slot)
   if ar >= 0 { return ar }
-  mvSlotOfMapValNameOrMono(mapValNameOf(mvValName[slot]))
+  mvSlotOfMapName(mvValName[slot])
 }
 
 // Does a BOXED-union map value admit `null` (destringify D5-final (b))? ARENA first
@@ -5159,10 +5187,8 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
     if mObj is Ident {
       const mun = unionNameOfIdent(mObj.identName, fnIx)
       if mun != "" {
-        let mset = unionMemberSetOf(mun)
-        if mset == "" { mset = mun }
         const mAtoms: string[] = []
-        if !msMemberAtomsOf(mset, mAtoms) { splitUnionAtoms(mset, mAtoms) }
+        unionArmsOf(mun, mAtoms)
         let mi = 0
         while mi < mAtoms.length {
           const ma = mAtoms[mi]
@@ -6253,8 +6279,7 @@ export function cloArrSlotRetName(slot: i32) {
   let nm = rlElemName[slot]
   // A NULLABLE-closure element slot: peel the `| null` (the call classifies on the
   // narrowed non-null closure), mirroring `cloArrSlotSigKey`.
-  const nmrp = nullablePartOf(nm)
-  if nmrp != "" { nm = nmrp }
+  nm = nonNulBaseOf(nm)
   if nm.length < 2 { return "" }
   if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
   const inner = nm.slice(1, nm.length - 1)
@@ -7111,7 +7136,7 @@ function mapReadMvSlot(exprIx: i32, fnIx: i32) {
       if aun != "" {
         const ma = unionMapArmName(aun)
         if ma != "" {
-          const msl = mvSlotOfMapValNameOrMono(mapValNameOf(ma))
+          const msl = mvSlotOfMapName(ma)
           if msl >= 0 { return msl }
         }
       }
@@ -7647,9 +7672,7 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
     // construct — the code-19 lesson applied to code 15). PROVEN mismatches only:
     // either side unresolvable through the checker stays lenient.
     if code == 15 && elem != "" {
-      let tb = t
-      const tnb = nullablePartOf(tb)
-      if tnb != "" { tb = tnb }
+      const tb = nonNulBaseOf(t)
       return nestedStructNamesCompat(tb, elem)
     }
     // RETIRED (arm 2, #978): a UNION-BOX candidate field (code 16) against a
@@ -7749,9 +7772,7 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
   if want == 15 && elem != "" {
     // A DECLARED-name nested-struct field (`inner: Inner`) against the variant's
     // recorded target: the same canonical-key tightening as the inline spelling.
-    let tb15 = t
-    const tnb15 = nullablePartOf(tb15)
-    if tnb15 != "" { tb15 = tnb15 }
+    const tb15 = nonNulBaseOf(t)
     return nestedStructNamesCompat(tb15, elem)
   }
   true
@@ -8157,15 +8178,26 @@ export function retNulRefIndex(tyIx: i32) {
     }
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
-      const base = nullablePartOf(ty.tyName)
-      if base != "" {
-        const rr = repRowOfName(base, sScanLim())
-        if rr >= 0 { return rr }
-        return structIndexOfTypeName(base)
-      }
+      const nb = nulBaseStructRow(ty.tyName)
+      if nb >= 0 { return nb }
     }
   }
   -1
+}
+
+// The STRUCT/rep ROW of the base of a nullable-struct spelling (`S | null` -> `S`'s
+// row), or -1 — the third writing-out of one grammar (`retNulRefIndex`,
+// `retStructIndex`, `paramStructIndex` each carried this five-line block verbatim,
+// down to the `repRowOfName`-then-`structIndexOfTypeName` order). Not a ladder: the
+// two lookups are one question asked of two tables, and all three call sites already
+// fell through to -1 for both "not nullable" and "nullable but unresolvable", so the
+// single -1 is faithful at each.
+function nulBaseStructRow(name: string): i32 {
+  const base = nullablePartOf(name)
+  if base == "" { return -1 }
+  const rr = repRowOfName(base, sScanLim())
+  if rr >= 0 { return rr }
+  structIndexOfTypeName(base)
 }
 
 // `1` if the type-annotation node at `tyIx` names the struct, else `0` (i32 / none).
@@ -8213,13 +8245,7 @@ export function retStructIndex(tyIx: i32) {
       // A `S | null` annotation resolves to its BASE struct's index — the single
       // chokepoint the param/local/return struct lookups read, so a nullable-struct
       // binding's member layout resolves without separate plumbing.
-      const base = nullablePartOf(ty.tyName)
-      if base != "" {
-        const rr = repRowOfName(base, sScanLim())
-        if rr >= 0 { return rr }
-        return structIndexOfTypeName(base)
-      }
-      return -1
+      return nulBaseStructRow(ty.tyName)
     }
   }
   -1
@@ -8560,8 +8586,8 @@ export function retMapFlag(tyIx: i32) {
       // rides the union box valtype, rather than mis-typing the field as a bare map struct. The
       // param/return paths already catch the union in an earlier branch; this guard makes the
       // classifier consistent everywhere. (The `nameIsMapMemberUnion` twin of the let/field guards.)
-      if nameIsMap(ty.tyName) && !nameIsMapMemberUnion(ty.tyName) {
-        if mvValKindOfName(mapValNameOf(ty.tyName)) != -3 { return 1 }
+      if nameIsBareMap(ty.tyName) {
+        if mapValKindLowerable(ty.tyName) { return 1 }
       }
     }
   }
@@ -8576,7 +8602,7 @@ export function retMapFlag(tyIx: i32) {
 // of the `| null` name would slice).
 export function nulMapInnerName(name: string) {
   const np = nullablePartOf(name)
-  if np != "" && nameIsMap(np) && !nameIsMapMemberUnion(np) { return np }
+  if np != "" && nameIsBareMap(np) { return np }
   ""
 }
 // `1` if the type-annotation node at `tyIx` is a NULLABLE string-keyed map (`{[string]: V} | null`),
@@ -8591,7 +8617,7 @@ export function retNulMapFlag(tyIx: i32) {
     if ty is TypeRef {
       const inner = nulMapInnerName(ty.tyName)
       if inner != "" {
-        if mvValKindOfName(mapValNameOf(inner)) != -3 { return 1 }
+        if mapValKindLowerable(inner) { return 1 }
       }
     }
   }
@@ -9018,9 +9044,7 @@ function refArrShapeKind(name: string): i32 {
 // param) that `collectAnnShapes` deduped onto its declared twin has no `sNames` entry of its
 // own, so only the layout-guarded field-set match resolves it.
 export function structIdxOfElemName(name: string) {
-  let n = name
-  const nn = nullablePartOf(name)
-  if nn != "" { n = nn }
+  const n = nonNulBaseOf(name)
   // Nominal exact-name match first (unambiguous, byte-identical, cheap).
   const sbn = structIndexByName(n)
   if sbn >= 0 { return sbn }
@@ -9182,9 +9206,7 @@ export function ensureRefElem(elemName: string) {
   const enp = nullablePartOf(elemName)
   if (
     enp != "" &&
-    (nameIsArray(enp) ||
-      nameIsFuncTypeAtom(enp) ||
-      (nameIsMap(enp) && !nameIsMapMemberUnion(enp)))
+    (nameIsArray(enp) || nameIsFuncTypeAtom(enp) || nameIsBareMap(enp))
   ) {
     // A nullable-LIST element (`i32[] | null`), a nullable-CLOSURE element
     // (`((i32) => boolean) | null` — the kind-5 niche), and a nullable-MAP element
@@ -9227,7 +9249,7 @@ export function ensureRefElem(elemName: string) {
     let mve = elemName
     const nme = nulMapInnerName(elemName)
     if nme != "" { mve = nme }
-    mvShapeOfValName(mapValNameOf(mve))
+    mvShapeOfMapName(mve)
   }
   // Force the leaf list-type wrapper `Used` flags for a SCALAR inner-list element, so its
   // singleton wrapper (`lTypeIdx` / `mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) is allocated. A
@@ -9306,6 +9328,25 @@ export function forceScalarListField(code: i32) {
   0
 }
 
+// "THE TYPE UNDER THE `| null`" — `name` with a two-part nullable wrapper peeled, or
+// `name` unchanged when it carries none. SEVENTEEN classifiers in this file each wrote
+// this out as the same three lines with a different pair of variable names:
+//
+//     let base = ftxt
+//     const nb = nullablePartOf(base)
+//     if nb != "" { base = nb }
+//
+// `nullablePartOf` answers a QUESTION ("is this `T | null`, and what is T?") by returning
+// "" for no; every one of those seventeen wanted the ANSWER-or-the-original, and hand-wrote
+// the fold. Naming the fold is what makes the population countable: the remaining
+// `nullablePartOf` calls in this file are now the sites that genuinely branch on
+// nullability, not the ones that were only trying to look through it.
+export function nonNulBaseOf(name: string) {
+  const nb = nullablePartOf(name)
+  if nb != "" { return nb }
+  name
+}
+
 // True if `name` is a `<ref-list> | null` — a NULLABLE ref-list field/local (`S[] | null`, `(i32|null)[] |
 // null`, `{g:i32}[] | null`), the ref-list analogue of `nameIsNulI32List`. Its non-null part is a ref array
 // (a struct / union / nested-array element list). NOT an `i32[] | null` (that is code 18, kind 15).
@@ -9365,7 +9406,7 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
   // re-finds it by the value name (`fieldRefElemName`).
   // A map-MEMBER union field (`{[string]: string} | string`) starts with `{[` too, but it is a
   // union BOX field (code 16), not a map — `!nameIsMapMemberUnion` lets it fall to the union test.
-  if nameIsMap(t) && !nameIsMapMemberUnion(t) { return 19 }
+  if nameIsBareMap(t) { return 19 }
   // A NULLABLE map field (`links: {[string]: V} | null`) stores a NULLABLE ref to the value
   // type's map struct — code 29, the field analogue of the `nulmap` local/param/return niche
   // (the map twin of code 28's nullable ref-list field). Gated to the SAME supported value
@@ -9373,7 +9414,7 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
   // unrepresentable value type keeps failing loudly (-1, no interned shape).
   const nmi = nulMapInnerName(t)
   if nmi != "" {
-    if mvValKindOfName(mapValNameOf(nmi)) != -3 { return 29 }
+    if mapValKindLowerable(nmi) { return 29 }
   }
   // A NULLABLE i32-list field (`rest: i32[] | null`) stores a NULLABLE ref to
   // the same wrapper as code 4 — code 18 (`0x63 lTypeIdx`). Checked before the
@@ -9407,9 +9448,7 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
   // (`next: Node|null`) stores a `(ref null $S)` — code 15. Resolved via the
   // DECLARATION scan (not the incrementally-built struct table) so a forward /
   // mutually-recursive reference ties in the shared rec group.
-  let base = t
-  const nb = nullablePartOf(base)
-  if nb != "" { base = nb }
+  const base = nonNulBaseOf(t)
   if nameIsStructDecl(base) { return 15 }
   -1
 }
@@ -9439,9 +9478,7 @@ export function fieldTypeCode(tyIx: i32) {
     // ignores the trailing `[]` and would match the element shape, mis-coding a NULLABLE STRUCT-LIST
     // field as a nullable struct (code 15) — invalid wasm. A nominal `Node[] | null` already falls to
     // -1 (clean reject); this brings the inline form to par until nullable ref-list fields are repped.
-    let base = ty.tyName
-    const nb = nullablePartOf(base)
-    if nb != "" { base = nb }
+    const base = nonNulBaseOf(ty.tyName)
     if !nameIsArray(base) && structIndexOfTypeName(base) >= 0 { return 15 }
     return -1
   }
@@ -9856,37 +9893,7 @@ function rlCanonLitUnionAtoms(name: string): string {
   // when a genuine non-null, non-litunion sibling exists (a real box MIX). A pure
   // `K0 | null` is the -1-sentinel MONO niche — widening it to `string | null` re-reps the
   // niche and breaks the nullable-litunion values; leave it (and any descent) untouched.
-  if unionMemberCount(name) > 1 {
-    const atoms: string[] = []
-    splitUnionAtoms(name, atoms)
-    let hasOther = false
-    let h = 0
-    while h < atoms.length {
-      if atoms[h] != "null" && !nameIsLitUnionType(atoms[h]) { hasOther = true }
-      h = h + 1
-    }
-    if !hasOther { return name }
-    let changed = false
-    let canon = ""
-    let i = 0
-    while i < atoms.length {
-      let a = atoms[i]
-      if nameIsLitUnionType(a) {
-        a = "string"
-        changed = true
-      } else if a != "null" {
-        const ra = rlCanonLitUnionAtoms(a)
-        if ra != a {
-          a = ra
-          changed = true
-        }
-      }
-      if i > 0 { canon = canon + "|" }
-      canon = canon + a
-      i = i + 1
-    }
-    if changed { return canon }
-  }
+  if unionMemberCount(name) > 1 { return canonLitUnionArms(name) }
   name
 }
 
@@ -9965,6 +9972,16 @@ export function rlInternName(name: string, kind: i32) {
 // slot would change the read discipline, not just the heap type). -1 when nothing
 // matches.
 export function rlSlotByName(name: string): i32 { rlSlotByNameTy(name, -1) }
+
+// The ref-list slot of the ELEMENT of the ref-array spelling `arrName` — `rlSlotByName`
+// of `refArrElemName`. Four sites (the two element/value sidecar fall-throughs and the
+// two `$fnsig` result-spine readers) composed these by hand; the file's own comments
+// call the composition out by name in five more places, which is the tell that it was
+// already a concept without being a function. One home is also the one place an arena
+// element type (`tyRefArrElemOf`) has to be threaded when it arrives.
+function rlSlotOfArrName(arrName: string): i32 {
+  rlSlotByName(refArrElemName(arrName))
+}
 
 // `rlSlotByName` with the caller's RECORDED arena element type as a hint for the
 // struct-twin rung (destringify D-TWINROW). Rungs 1 and 2 are untouched and still
@@ -10743,9 +10760,7 @@ export function funcTypeShapeLowerable(nm: string): boolean {
       if fc < 0 {
         // A NESTED inline-shape field (`g:{h:i32}` / `g:{h:i32}|null`): recurse
         // into the base shape — lowerable only if IT is.
-        let base = ftxt
-        const nb = nullablePartOf(base)
-        if nb != "" { base = nb }
+        const base = nonNulBaseOf(ftxt)
         if !funcTypeShapeLowerable(base) { okAll = false }
       } else if !funcTypeFieldCodeSafe(fc) {
         // A code-5 field whose type is a nested SCALAR-LEAF array (`f: boolean[][]`)
@@ -10770,7 +10785,7 @@ export function funcTypeShapeLowerable(nm: string): boolean {
             (nameIsNestedScalarLeafArray(ftxt) ||
             structElemArrayLowerable(ftxt) ||
             nameIsClosureArray(ftxt))) &&
-          !(fc == 19 && mvValKindOfName(mapValNameOf(ftxt)) != -3) &&
+          !(fc == 19 && mapValKindLowerable(ftxt)) &&
           !(fc == 16 && isUName(ftxt)) &&
           fc != 22
         ) {
@@ -10811,9 +10826,7 @@ export function variantNestedShapeOk(nm: string): boolean {
       if nameFieldCode(ftxt) < 0 {
         // A nested inline-shape field (`g: {h: i32}` / `g: {h: i32} | null`):
         // lowerable only if ITS shape is.
-        let base = ftxt
-        const nb = nullablePartOf(base)
-        if nb != "" { base = nb }
+        const base = nonNulBaseOf(ftxt)
         if !variantNestedShapeOk(base) { okAll = false }
       }
       fieldCount = fieldCount + 1
@@ -10920,9 +10933,7 @@ function internNonLowerableFieldShapes(nm: string) {
       } else {
         // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
         // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
-        let base = ftxt
-        const nb = nullablePartOf(base)
-        if nb != "" { base = nb }
+        let base = nonNulBaseOf(ftxt)
         while (
           base.length > 2 &&
           base[base.length - 2] == '[' &&
@@ -11020,9 +11031,7 @@ export function internInlineShape(nm: string) {
         // duplicate struct — and leaves the element `structIndexByName`-
         // UNRESOLVABLE at type-section emit (a -1 `sHeapIdx` read). Store the
         // interned struct's own `sNames` entry so both agree with the literal path.
-        let base = ftxt
-        const fnb = nullablePartOf(base)
-        if fnb != "" { base = fnb }
+        const base = nonNulBaseOf(ftxt)
         const iidx = internInlineShape(base)
         if iidx >= 0 {
           fc = 15
@@ -11187,10 +11196,7 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
           const en = sFieldElemNameAt(si, fi)
           if en != "" {
             let bi = texts[i]
-            if codes[i] == 15 {
-              const nbi = nullablePartOf(bi)
-              if nbi != "" { bi = nbi }
-            }
+            if codes[i] == 15 { bi = nonNulBaseOf(bi) }
             if en != bi { allIn = false }
           } else if codes[i] == 0 && nameIsLitUnionType(texts[i]) {
             // ATOM-IDENTITY split (code 0 is layout-shared): a litunion-ATOM field
@@ -11525,11 +11531,7 @@ export function shapeFieldElemName(ftxt: string, code: i32) {
     if nameIsArray(ftxt) { return ftxt.slice(0, ftxt.length - 2) }
     return ""
   }
-  if code == 15 {
-    const nb = nullablePartOf(ftxt)
-    if nb != "" { return nb }
-    return ftxt
-  }
+  if code == 15 { return nonNulBaseOf(ftxt) }
   if code == 16 { return ftxt }
   // A NULLABLE REF-LIST field (code 28, `S[] | null`): the ref-array element of the
   // non-null part — the shape-text mirror of `fieldRefElemName`'s code-28 arm, with
@@ -11908,7 +11910,7 @@ export function markMapUnionArms(name: string) {
       mUsed = true
       lUsed = true
       aUsed = true
-      mvShapeOfValName(mapValNameOf(a))
+      mvShapeOfMapName(a)
     }
     i = i + 1
   }
@@ -11940,11 +11942,11 @@ export function forceCloResultMapTypes(nm: string) {
       let res = monoUnwrapParens(a.slice(fa + 2, a.length))
       const rn = nulMapInnerName(res)
       if rn != "" { res = rn }
-      if nameIsMap(res) && !nameIsMapMemberUnion(res) {
+      if nameIsBareMap(res) {
         mUsed = true
         lUsed = true
         aUsed = true
-        mvShapeOfValName(mapValNameOf(res))
+        mvShapeOfMapName(res)
       } else if annArrowAt(res) >= 0 {
         // A curried result (`() => () => {[string]: V}`) recurses to ITS result.
         forceCloResultMapTypes(res)
@@ -11977,9 +11979,7 @@ export function forceCloResultListTypes(nm: string) {
     const a = monoUnwrapParens(arms[i])
     const fa = annArrowAt(a)
     if fa >= 1 && a.length > 0 && a[0] == '(' {
-      let res = monoUnwrapParens(a.slice(fa + 2, a.length))
-      const rp = nullablePartOf(res)
-      if rp != "" { res = rp }
+      const res = nonNulBaseOf(monoUnwrapParens(a.slice(fa + 2, a.length)))
       if nameIsStringArray(res) {
         slUsed = true
         aUsed = true
@@ -12035,10 +12035,7 @@ export function unionHasMapArmSlot(name: string, slot: i32) {
       isMap = a != "null" && nameIsMap(a)
     }
     if isMap {
-      if (
-        mvCanonRepOf(mvSlotOfMapValNameOrMono(mapValNameOf(a))) ==
-        mvCanonRepOf(slot)
-      ) {
+      if (mvCanonRepOf(mvSlotOfMapName(a)) == mvCanonRepOf(slot)) {
         return true
       }
     }
@@ -12069,7 +12066,7 @@ export function unionHasCollapsedStringMapArm(name: string) {
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
-    if a != "null" && nameIsMap(a) && !nameIsMapMemberUnion(a) {
+    if a != "null" && nameIsBareMap(a) {
       if mapValNameOf(a) == "string" { return true }
     }
     i = i + 1
@@ -12089,10 +12086,8 @@ export function unionHasMapArm(name: string) { unionMapArmName(name) != "" }
 // arm's VALUE mv slot from it so a `t[k] ?? d` binding classifies its value union in the frame
 // pre-pass (where the `is`-narrow that makes `t` a map is not active).
 export function unionMapArmName(name: string) {
-  let nm = unionMemberSetOf(name)
-  if nm == "" { nm = name }
   const atoms: string[] = []
-  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
+  const nm = unionArmsOf(name, atoms)
   // D-UNION: pick the map arm from the row's recorded ARENA member types
   // (`unMemIsMap` — `T.tys[m] is TyMap`) instead of re-classifying each atom's
   // RENDERED spelling with `nameIsMap`. The recorded member slice is in atom order
@@ -12254,10 +12249,8 @@ export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
       if arr is Ident {
         const un = unionNameOfIdent(arr.identName, fnIx)
         if un != "" {
-          let nm = unionMemberSetOf(un)
-          if nm == "" { nm = un }
           const atoms: string[] = []
-          if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
+          const nm = unionArmsOf(un, atoms)
           // D-UNION (batch 2's `tyArmPathLeaf` walk, applied to an INDEXED root): the
           // arm's element type is `tyArmElem` (a `TyArray` arm's element — the name
           // path's `nameIsRefArray(a)` gate plus its `refArrElemName`/inline-shape
@@ -12338,10 +12331,8 @@ export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
     }
     const un = unionNameOfIdent(rootName, fnIx)
     if un == "" { return false }
-    let nm = unionMemberSetOf(un)
-    if nm == "" { nm = un }
     const atoms: string[] = []
-    if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
+    const nm = unionArmsOf(un, atoms)
     // D-UNION: the arm's field path is walked over the member's ARENA type
     // (`tyArmPathIsMap` — a `TyMap` leaf) instead of re-resolving the rendered atom to
     // a struct/variant row and consulting its per-field lowering codes.
@@ -12451,10 +12442,8 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
     }
     const un = unionNameOfIdent(rootName, fnIx)
     if un == "" { return false }
-    let nm = unionMemberSetOf(un)
-    if nm == "" { nm = un }
     const atoms: string[] = []
-    if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
+    const nm = unionArmsOf(un, atoms)
     // D-UNION: the arm walk is structural (`tyArmPathIsMapList` — a `TyArray` over a
     // `TyMap` leaf), and so is the indexed-root hop: `tyArmElem` takes a `TyArray` arm's
     // element in place of `nameIsRefArray` + `refArrElemName` on the rendered atom.
@@ -12522,10 +12511,8 @@ function unionArmPathIsMapList(arm: string, path: string[]): boolean {
 // such a union (narrowed to the closure array) is a `call_ref`, so the frame pre-pass reserves
 // `callRefSlot` for it — see `blockHasCallRef`. Resolves an alias to its member set first.
 export function unionHasClosureArrayArm(name: string) {
-  let nm = unionMemberSetOf(name)
-  if nm == "" { nm = name }
   const atoms: string[] = []
-  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
+  const nm = unionArmsOf(name, atoms)
   // D-UNION: `unMemIsFuncArray` (a `TyArray` over a `TyFunc`) is the arena dual of
   // `nameIsClosureArray` — including its NULLABLE-element exclusion, which falls out
   // for free (a `(((i32) => boolean) | null)[]` element is a `TyNullable`).
@@ -12578,10 +12565,8 @@ export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
       if arr is Ident {
         let un = unionNameOfIdent(arr.identName, fnIx)
         if un != "" {
-          const ums = unionMemberSetOf(un)
-          if ums != "" { un = ums }
           const atoms: string[] = []
-          if !msMemberAtomsOf(un, atoms) { splitUnionAtoms(un, atoms) }
+          un = unionArmsOf(un, atoms)
           // D-UNION: the deliberately-conservative `strContains(elem, "=>")` arm test
           // is a REACHABILITY question — `unMemIsFuncReachArray` asks it of the arena
           // (a `TyArray` whose element structure reaches a `TyFunc`) instead of of the
@@ -12617,10 +12602,8 @@ export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
 // its member set first, mirroring `unionHasClosureArrayArm` (which tests the closure-ELEMENT
 // array arm, a distinct shape whose arrow is nested inside `[]`).
 export function unionHasClosureArm(name: string) {
-  let nm = unionMemberSetOf(name)
-  if nm == "" { nm = name }
   const atoms: string[] = []
-  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
+  const nm = unionArmsOf(name, atoms)
   // D-UNION: value-atom kind 11 IS "the member is a function type" — ask the arena
   // (`unMemIsFunc`) rather than `valueAtomKind`'s spelling ladder.
   const mems: i32[] = []
@@ -12645,10 +12628,8 @@ export function unionHasClosureArm(name: string) {
 // (A union with two distinct closure arms shares one kind-11 tag — a pre-existing value-atom-scheme
 // limitation, not exercised by the supported single-closure-arm shapes; returns the FIRST here.)
 export function unionClosureArmName(name: string) {
-  let nm = unionMemberSetOf(name)
-  if nm == "" { nm = name }
   const atoms: string[] = []
-  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
+  const nm = unionArmsOf(name, atoms)
   // D-UNION: the arm SELECTION is structural (`unMemIsFunc`); the returned NAME stays
   // the member's stored spelling, which `emitUnionCoerce` feeds to the still-name-keyed
   // `scalarTagOf` (a D5 residual, not this slice).
@@ -12676,10 +12657,8 @@ export function unionClosureArmName(name: string) {
 // cover it. Lets `t0[0]` off a union binding recover its element union narrowing-blindly (the
 // `is`-narrowing that makes `t0` the ref array is not active in the frame pre-pass).
 export function unionClosureArrElemUnion(name: string) {
-  let nm = unionMemberSetOf(name)
-  if nm == "" { nm = name }
   const atoms: string[] = []
-  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
+  unionArmsOf(name, atoms)
   let i = 0
   while i < atoms.length {
     if nameIsRefArray(atoms[i]) {
@@ -12764,10 +12743,8 @@ function identRebindUnionArmClosureField(
     }
     const un = unionNameOfIdent(rootName, fnIx)
     if un == "" { return false }
-    let uset = unionMemberSetOf(un)
-    if uset == "" { uset = un }
     const atoms: string[] = []
-    if !msMemberAtomsOf(uset, atoms) { splitUnionAtoms(uset, atoms) }
+    const uset = unionArmsOf(un, atoms)
     // D-UNION: the arm walk is structural (`tyArmPathHasCloValue` — a `TyFunc` leaf,
     // bare / nullable, or a `TyUnion` with a `TyFunc` member).
     const mems: i32[] = []
@@ -12868,10 +12845,8 @@ export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
     }
     const un = unionNameOfIdent(rootName, fnIx)
     if un == "" { return false }
-    let uset = unionMemberSetOf(un)
-    if uset == "" { uset = un }
     const atoms: string[] = []
-    if !msMemberAtomsOf(uset, atoms) { splitUnionAtoms(uset, atoms) }
+    const uset = unionArmsOf(un, atoms)
     // D-UNION: the arm walk is structural (`tyArmPathIsClosure` — a `TyFunc` leaf, bare
     // or under the nullable-closure niche's `TyNullable`).
     const mems: i32[] = []
@@ -12939,10 +12914,8 @@ export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
       }
       const un = unionNameOfIdent(rootName, fnIx)
       if un == "" { return false }
-      let uset = unionMemberSetOf(un)
-      if uset == "" { uset = un }
       const atoms: string[] = []
-      if !msMemberAtomsOf(uset, atoms) { splitUnionAtoms(uset, atoms) }
+      const uset = unionArmsOf(un, atoms)
       // D-UNION: the arm walk is structural (`tyArmPathIsCloArray` — a `TyArray` over a
       // `TyFunc` leaf).
       const mems: i32[] = []
@@ -13107,10 +13080,8 @@ function unionRefArrayArmSlotForElemAtom(name: string, elemAtom: string) {
     if slot >= 0 && rlElemKindTbl[slot] == 2 {
       if elemAtom == "" { return slot }
       const en = rlElemName[slot]
-      let es = unionMemberSetOf(en)
-      if es == "" { es = en }
       const eAtoms: string[] = []
-      if !msMemberAtomsOf(es, eAtoms) { splitUnionAtoms(es, eAtoms) }
+      unionArmsOf(en, eAtoms)
       let j = 0
       while j < eAtoms.length {
         if eAtoms[j] == elemAtom { return slot }
@@ -13200,10 +13171,8 @@ export function unionNestedArrayArmSlot(name: string) {
 // narrowing is not active in that pass, so the map op must be spotted from the
 // binding's DECLARED union (the map-array twin of `unionHasMapArm`).
 export function unionHasMapArrayArm(name: string) {
-  let nm = unionMemberSetOf(name)
-  if nm == "" { nm = name }
   const atoms: string[] = []
-  if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }
+  const nm = unionArmsOf(name, atoms)
   // D-UNION: a `TyArray` over a `TyMap` (`unMemIsMapArray`). The name path's
   // `!nameIsMapMemberUnion(elem)` guard is free structurally — a map-member UNION
   // element is a `TyUnion`, never a `TyMap`, however it renders.
@@ -13221,7 +13190,7 @@ export function unionHasMapArrayArm(name: string) {
     const a = atoms[i]
     if a != "null" && nameIsArray(a) {
       const en = refArrElemName(a)
-      if nameIsMap(en) && !nameIsMapMemberUnion(en) { return true }
+      if nameIsBareMap(en) { return true }
     }
     i = i + 1
   }
@@ -13556,9 +13525,7 @@ export function letAnnIsUninternedShape(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType < 0 { return false }
-    let nm = tyNameOf(d.letType)
-    const nb = nullablePartOf(nm)
-    if nb != "" { nm = nb }
+    const nm = nonNulBaseOf(tyNameOf(d.letType))
     if nm.length < 2 { return false }
     if nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' { return false }
     return structIndexByName(nm) < 0
@@ -13692,12 +13659,8 @@ function paramStructIndex(fnIx: i32, name: string) {
               // VARIANT index must not leak into the struct tables.)
               const psi = structIndexByName(ty.tyName)
               if psi >= 0 { return psi }
-              const pbase = nullablePartOf(ty.tyName)
-              if pbase != "" {
-                const prr = repRowOfName(pbase, sScanLim())
-                if prr >= 0 { return prr }
-                return structIndexOfTypeName(pbase)
-              }
+              const pnb = nulBaseStructRow(ty.tyName)
+              if pnb >= 0 { return pnb }
             }
           }
           return -1
@@ -14006,8 +13969,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
       // struct `P` — strip the `| null` so a narrowed `xs[i].field` finds P's layout. The
       // structural bridge (`structIndexOfTypeName`) then also resolves an INLINE-SHAPE
       // element (`{v:i32}[]` param) to its declared twin's layout.
-      const nmnn = nullablePartOf(nm)
-      if nmnn != "" { nm = nmnn }
+      nm = nonNulBaseOf(nm)
       // Nominal exact-name match first (byte-identical; AFTER-not-FIRST, #1061).
       const sbn = structIndexByName(nm)
       if sbn >= 0 { return sbn }
@@ -14674,7 +14636,7 @@ export function narrowedMapOf(name: string) {
   // map. Without the member-union guard a rebind under that narrow (`const t1 = t0`)
   // classified as a MONO map local and every read of it emitted the wrong rep — invalid
   // wasm (the same guard every `paramMap` / `retMapFlag` / `nameFieldCode` site carries).
-  if nameIsMap(v) && !nameIsMapMemberUnion(v) { return v }
+  if nameIsBareMap(v) { return v }
   ""
 }
 
@@ -14736,6 +14698,34 @@ export function unionMemberSetOf(name: string) {
     u = u + 1
   }
   name
+}
+
+// "GIVE ME THIS UNION'S TOP-LEVEL ARMS" — the ONE home for the four-line preamble
+// FIFTEEN union classifiers in this file each wrote out by hand:
+//
+//     let nm = unionMemberSetOf(name)        // resolve an alias to its member set
+//     if nm == "" { nm = name }              // an unregistered name is its own set
+//     const atoms: string[] = []
+//     if !msMemberAtomsOf(nm, atoms) { splitUnionAtoms(nm, atoms) }   // memo, else split
+//
+// Fifteen copies of that preamble are fifteen copies of the `|`-splitting GRAMMAR:
+// each one re-decides, in the caller, that a member set is pipe-joined text to be
+// taken apart when the interning tables decline it. Named once, the split survives at
+// exactly ONE site in the whole family, so the day `msMemberAtomsOf` covers every row
+// (or a consumer takes arena member types instead) there is a single line to delete
+// rather than fifteen. Two spellings of the alias fallback were in circulation —
+// `if nm == "" { nm = name }` and `const s = unionMemberSetOf(n); if s != "" { n = s }`
+// — and they are the SAME function, because `unionMemberSetOf` returns its argument on
+// a miss; both are this one.
+//
+// Returns the RESOLVED member-set spelling, which every caller needs afterwards for the
+// arena leg (`unionMemberTysOf(nm, mems)`) — so the atoms go out through `out` and the
+// set name comes back, and no caller has to hold the resolution twice.
+export function unionArmsOf(name: string, out: string[]) {
+  let nm = unionMemberSetOf(name)
+  if nm == "" { nm = name }
+  if !msMemberAtomsOf(nm, out) { splitUnionAtoms(nm, out) }
+  nm
 }
 
 // The `unNames` ROW of the union `name` — matched on the alias NAME or on the
@@ -16479,6 +16469,19 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
   false
 }
 
+// True if `name` is a `(string | null)[]`, ALSO through one `| null` wrapper
+// (`(string | null)[] | null`, the form a `!= null` narrow leaves behind). The one home
+// for a four-line block three sibling classifiers carried verbatim — each asked
+// `nameIsNulStrList`, then peeled with `nullablePartOf`, then asked AGAIN. Written once,
+// the peel is one call, not three, and the three siblings can no longer drift apart on
+// whether the wrapper counts.
+function nameIsNulStrListDeep(name: string) {
+  if nameIsNulStrList(name) { return true }
+  const p = nullablePartOf(name)
+  if p != "" { return nameIsNulStrList(p) }
+  false
+}
+
 // True if the expression at `exprIx` produces a `(string | null)[]` — the string-ref niche list
 // (`nameIsNulStrList`), whose backing IS a plain string list but whose element READ stays `(ref null)`
 // (a `nulstr`, narrowed) instead of recovering non-null. Recognizes the receiver by its recorded array
@@ -16493,15 +16496,11 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
   if e is Ident {
     const pt = paramTypeNode(fnIx, e.identName)
     if pt >= 0 {
-      const ptn = tyNameOf(pt)
-      if nameIsNulStrList(ptn) { return true }
-      // A `(string | null)[] | null` PARAM narrowed with `!= null` — peel the outer
-      // null: the narrowed value is the same nulstr-element list (the read must stay
+      // `…Deep` also admits a `(string | null)[] | null` PARAM narrowed with `!= null`:
+      // the narrowed value is the same nulstr-element list (the read must stay
       // `(ref null)`; the plain-string arm's recover TRAPPED on a null element —
       // fuzz-nightly plain leg, seed 154928295 d6).
-      const ptnul = nullablePartOf(ptn)
-      if ptnul != "" { return nameIsNulStrList(ptnul) }
-      return false
+      return nameIsNulStrListDeep(tyNameOf(pt))
     }
     // A union binding narrowed to the `(string | null)[]` arm reads unboxed as the
     // string list whose ELEMENT stays `(ref null)` — the same nullable read discipline.
@@ -16529,10 +16528,7 @@ function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
     const pt = paramTypeNode(fnIx, name)
     if pt >= 0 {
       const ptn = tyNameOf(pt)
-      if nameIsNulStrList(ptn) { return true }
-      const ptnul = nullablePartOf(ptn)
-      if ptnul != "" { return nameIsNulStrList(ptnul) }
-      return false
+      return nameIsNulStrListDeep(ptn)
     }
     // A module GLOBAL (`const g: (string | null)[] | null = …`) — top-level LetDecls
     // live in `globalStmts` (they emit as wasm globals, not start statements).
@@ -16543,10 +16539,7 @@ function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
   if !(d is LetDecl) { return false }
   if d.letType >= 0 {
     const tn = tyNameOf(d.letType)
-    if nameIsNulStrList(tn) { return true }
-    const tnul = nullablePartOf(tn)
-    if tnul != "" { return nameIsNulStrList(tnul) }
-    return false
+    return nameIsNulStrListDeep(tn)
   }
   if d.letInit >= 0 {
     const init = P.nodes[unwrapParen(d.letInit)]
@@ -17418,7 +17411,7 @@ export function letIsMap(letIx: i32, fnIx: i32) {
         const k = annRepKindOf(d.letType)
         if k != null {
           if k == "map" { return true }
-        } else if nameIsMap(lt.tyName) && !nameIsMapMemberUnion(lt.tyName) {
+        } else if nameIsBareMap(lt.tyName) {
           // A UNION annotation whose FIRST atom is a map (`{[string]: string} | f64`) has a name that
           // STARTS with `{[`, so `nameIsMap` matches the whole union name — but it is a union BOX local,
           // NOT a map (the map arm boxes into the union). A bare map has ONE top-level atom; a union has
@@ -17480,9 +17473,7 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
       if lt is TypeRef {
         // A map-member UNION annotation is NOT a bare map (see `letIsMap`) — skip it so the union
         // box, not a garbled map value shape, is picked.
-        if nameIsMap(lt.tyName) && !nameIsMapMemberUnion(lt.tyName) {
-          return mvShapeOfValName(mapValNameOf(lt.tyName))
-        }
+        if nameIsBareMap(lt.tyName) { return mvShapeOfMapName(lt.tyName) }
       }
     }
     return mapShapeOfExpr(d.letInit, fnIx)
@@ -17532,7 +17523,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     // not the mono i32 assumption a bare -1 would force. Checked FIRST (the declared type is a
     // union, so `declaredMap`/`paramMap`/global below miss it), mirroring `exprMap`.
     const nm = narrowedMapOf(e.identName)
-    if nm != "" { return mvSlotOfMapValNameOrMono(mapValNameOf(nm)) }
+    if nm != "" { return mvSlotOfMapName(nm) }
     if declaredMap(e.identName) {
       const slot = declaredSlotOf(e.identName)
       if slot >= 0 { return localStructIdx[slot] }
@@ -17658,6 +17649,15 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
 // loudly, never the silent mono fallback). A mono-tolerant find (unlike
 // `mvSlotOfValNameFind`, which fails loudly on the mono miss) for the composition
 // read resolvers.
+// The mv slot of the VALUE of the bare-map spelling `mapName` —
+// `mvSlotOfMapValNameOrMono` of `mapValNameOf`. SEVEN sites composed the pair by hand.
+// Same shape as `mvShapeOfMapName` (the intern side) and `mapValKindLowerable` (the
+// support side): three questions about a map's value, each of which was being answered
+// by re-slicing `V` out of `{[string]: V}` at every asking.
+function mvSlotOfMapName(mapName: string): i32 {
+  mvSlotOfMapValNameOrMono(mapValNameOf(mapName))
+}
+
 export function mvSlotOfMapValNameOrMono(ivIn: string): i32 {
   const iv = mvCanonValName(ivIn)
   if mvValKindOfName(iv) == -1 { return -1 }
@@ -18105,7 +18105,7 @@ function annParamKind(t: string) {
   // slot resolves via the element name — the SAME `rlSlotByName(refArrElemName(...))` the
   // AST producer uses.
   if nameIsRefArray(t) {
-    const rs = rlSlotByName(refArrElemName(t))
+    const rs = rlSlotOfArrName(t)
     if rs >= 0 { return repSigSlotTokOfKind("reflist", rs) }
   }
   // A FUNCTION-type param (`(i32) => i32`) is the shared closure fat-pointer, matching
@@ -18158,7 +18158,7 @@ function annRetKind(t: string) {
   // `rlSlotByName(refArrElemName(...))` the AST producer's `cloRetValSlot` uses, so the two
   // producers' keys byte-match (else the value-call `ref.cast` to this `$fnsig` traps).
   if nameIsRefArray(t) {
-    const rs = rlSlotByName(refArrElemName(t))
+    const rs = rlSlotOfArrName(t)
     if rs >= 0 { return ">" + repSigSlotTokOfKind("reflist", rs) }
   }
   // A MAP return — `{[string]: V}`, matching `cloRetKeySuffix`'s map result token so the AST
@@ -18171,9 +18171,8 @@ function annRetKind(t: string) {
   // it falls through to the union arm below (`>u`), byte-matching the lambda's pinned map-union
   // `$fnsig` (`cloRetKeySuffix` reaches the box via `cloRetValKind` → "union"). Without this the
   // value call keyed `>m` while the closure interned `>u` — a "no interned signature" reject.
-  if nameIsMap(t) && !nameIsMapMemberUnion(t) {
-    return ">" +
-      repSigSlotTokOfKind("map", mvSlotOfMapValNameOrMono(mapValNameOf(t)))
+  if nameIsBareMap(t) {
+    return ">" + repSigSlotTokOfKind("map", mvSlotOfMapName(t))
   }
   // A CLOSURE return — a function-type result (`(i32) => ((i32) => i32)`), matching
   // `cloRetKeySuffix`'s closure-result token so the AST and annotation sig producers agree
