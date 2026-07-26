@@ -7,6 +7,7 @@ import {
   nodeArrayElemIsNulBool,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
+  nodeLitMembersWithin,
   nodeLitUnionMemberTexts,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
@@ -19,6 +20,7 @@ import {
   nodeTyMapValLitUnionTexts,
   splitUnionAtoms,
   tyIsLitUnion,
+  tyLitMemberTexts,
   valueAtomKind,
 } from "./typecheck"
 import {
@@ -1815,6 +1817,57 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
         wU8(209)   // 0xd1 ref.is_null
         fbI32Eqz() // 0x45 → non-null
         return 0
+      }
+    }
+  }
+  // `k is K` / `k is "x"` over a LITERAL-UNION receiver — an interned i32 ATOM id, NOT a
+  // union BOX. Every path below reads the box's tag field (`struct.get 0 0`) off the
+  // receiver, and on an i32 atom that is invalid wasm: `unionNameOfIdent` claims the
+  // binding because `K` is a registered union NAME, while the value's REP is a bare id.
+  // Master emitted an unparseable module for every `z: K` binding form (global / local /
+  // param) and for `z is "x"` / `z is <sub-alias>`, and silently const-folded FALSE for
+  // every `z: K | null` form — a guard that never fires.
+  //
+  // The atom's own test is MEMBERSHIP: the id equals one of the TESTED type's interned
+  // member ids. The `K | null` null sentinel is `-1`, which is no member's id, so the
+  // membership chain IS the non-null test for a nullable receiver — one lowering covers
+  // both. Destringify: the receiver's atom-ness is the emitter's own REP question and the
+  // tested member set comes from the type the CHECKER banked for this `is` node
+  // (`isVarTyIxOf`, total for every emitting program — see `isArmTagOfTy`); the fold's
+  // receiver side reads `nodeTyIxOf`. Neither side re-parses a spelling.
+  if nd0 is IsExpr {
+    if exprIsLitAtom(nd0.isObj, fnIx) {
+      const laTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
+      if laTexts.length > 0 {
+        // The receiver's OWN members are all in the tested set: true by construction, and
+        // folded without evaluating the receiver — the same shape as the concrete-variant
+        // receiver fold at the end of this function. A nullable receiver never folds here
+        // (`nodeLitMembersWithin` declines it), so its `-1` still meets a real test.
+        if nodeLitMembersWithin(nd0.isObj, laTexts) {
+          fbI32Const(1)
+          return 0
+        }
+        // Otherwise: `id == m0 || id == m1 || …`. A ONE-member tested type is ONE compare,
+        // so the receiver is evaluated exactly once and ANY receiver expression is safe (a
+        // map read, an element read, a call). Two or more members re-read it, so those
+        // require an IDENT — a re-readable binding with no side effect; any other receiver
+        // keeps the paths below rather than having its call/read silently duplicated.
+        let laOk = laTexts.length == 1
+        const laRecv = P.nodes[unwrapParen(nd0.isObj)]
+        if laRecv is Ident { laOk = true }
+        if laOk {
+          let laI = 0
+          while laI < laTexts.length {
+            if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+            fbI32Const(internAtom(quoteLex(laTexts[laI])))
+            fbI32Bin(70) // 0x46 i32.eq
+            if laI > 0 {
+              fbI32Bin(114) // 0x72 i32.or
+            }
+            laI = laI + 1
+          }
+          return 0
+        }
       }
     }
   }
@@ -7931,23 +7984,29 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         if c.callArgs.length != 1 {
           return emitFail("emitProgram: print takes exactly one argument")
         }
-        if exprString(c.callArgs[0], fnIx) {
-          return emitPrintStrExpr(body, c.callArgs[0], fnIx)
-        }
-        // A NULLABLE-string value (`string | null` — a niche binding, or a fused read over a
-        // `{[string]: string | null}` map, which PRESERVES a stored null) may genuinely hold
-        // null: the fallback ladder below would hand its `(ref null)` to a scalar print
-        // import (invalid wasm). Narrowing is the supported spelling — fail loudly.
-        if exprNullableString(c.callArgs[0], fnIx) {
-          return emitFail(
-            "emitProgram: print of a nullable string — narrow it first (`if v != null { print(v) }`)",
-          )
-        }
         // print(literal-union ATOM): WIDEN it to its member STRING — a per-member `if id == <id> { print
         // "<name>" }` chain (exactly one matches, so at most one prints). The atom→string widening in
         // statement form; the value form (concat / string arg / return) is a follow-up.
+        //
+        // Asked BEFORE `exprString`, and that ORDER is the fix for a live miscompile: for an
+        // atom-repped GLOBAL (`const e: K | null`, or a narrowed `"a" | "b" | null`) `exprString`
+        // also answers true — it reads the SOFTENED render, which says `string` about a cell the
+        // emitter laid out as `(mut i32)` — so the string printer was handed a raw atom id and the
+        // module failed to parse as WebAssembly. The two classifiers disagree only where the value
+        // IS an atom, and there the atom answer is the REP; `exprString` is a rendering.
         if exprIsLitAtom(c.callArgs[0], fnIx) {
           const lpTexts = nodeLitUnionMemberTexts(c.callArgs[0])
+          // An UN-NARROWED `K | null` niche: `exprIsLitAtom` claims it on the standing assumption
+          // that a consuming position has narrowed it non-null (its own comment says so), and the
+          // member texts come from the NARROWED type — so an un-narrowed one yields NO texts and
+          // master emitted an empty chain: rc=0 and NO OUTPUT for a local/param, the quietest
+          // possible wrong answer. There is no member text for the null arm to print, so this is
+          // the same rule the nullable STRING below carries: narrow it first.
+          if lpTexts.length == 0 {
+            return emitFail(
+              "emitProgram: print of a nullable literal union — narrow it first (`if v != null { print(v) }`)",
+            )
+          }
           let lpi = 0
           while lpi < lpTexts.length {
             const lpQ = quoteLex(lpTexts[lpi])
@@ -7963,6 +8022,18 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
             lpi = lpi + 1
           }
           return 0
+        }
+        if exprString(c.callArgs[0], fnIx) {
+          return emitPrintStrExpr(body, c.callArgs[0], fnIx)
+        }
+        // A NULLABLE-string value (`string | null` — a niche binding, or a fused read over a
+        // `{[string]: string | null}` map, which PRESERVES a stored null) may genuinely hold
+        // null: the fallback ladder below would hand its `(ref null)` to a scalar print
+        // import (invalid wasm). Narrowing is the supported spelling — fail loudly.
+        if exprNullableString(c.callArgs[0], fnIx) {
+          return emitFail(
+            "emitProgram: print of a nullable string — narrow it first (`if v != null { print(v) }`)",
+          )
         }
         // An i64-typed argument lowers to `i64.const`/`local.get` of an i64 slot, so it
         // must route to `__print_i64__` (import 4) — its functype is `(i64)->()`, so the
