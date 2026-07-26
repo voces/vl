@@ -21025,3 +21025,251 @@ hunk is pinned by files that predate the slice.
      is not who owns the line — it is that **the 13/14 build introduces a NEW silent invalid module
      in the most natural shape a user would write**, so the incomplete version is worse than the
      clean reject it replaces. File it whole.
+
+## D-SIGHOME — the `$fnsig` INTERN, written out nine times, gets one home (#PRNUM)
+
+The census that picked this target enumerated **by what the CODE is, not by what the ARGUMENT
+is**, and it was run at the slice's own HEAD (`3974381`) rather than inherited — three stale
+leads have shipped this arc from a carried-forward number.
+
+### The counting instrument, and the UNIT
+
+**Unit: CALL SITES.** A textual `NAME(` in non-comment, non-string code where the preceding
+character is not `[A-Za-z0-9_.]`; `//` comments stripped **string-literal-aware**; each
+resolver's own `function NAME(` / `export function NAME(` header excluded; per-file sums
+cross-checked against a tree-wide recount over every `.vl` in `compiler/` + `std/` + `scripts/`.
+The list is the SCORECARD CORRECTION's 19 resolvers plus D-ARROWTY's four (`refArrElemKind` /
+`nameIsI32ListArray` / `nameIsMapArray` / `nullClosureArrElem`) — **23 resolvers**.
+
+**Validated against four published figures at the commits that published them, before it
+produced any new number:** `emit_collect` **98** at `2c5e9cd` (#1121's), `emit_base` **66** at
+`3b1fad4` (#1126's), `emit_classify` **319** at `cd69bd9` (#1130's), and `emit_collect` **99** /
+`emit_base` **66** / tree-wide **523** at `7a714fd` (#1139's). All four reproduce exactly.
+
+At `3974381` it reads **`emit_collect` 43 · `emit_mono` 5 · `emit_rewrite` 5 · `emit_rep` 2 =
+55** over this slice's partition, tree-wide **303** — reproducing the brief's target figure to
+the site.
+
+### THE CENSUS — grammars, not names
+
+Three instruments, run over the four owned files:
+
+**(1) The WALK census** — *a loop that increments AND decrements the same integer while testing a
+character against a grouper* (`<>` `()` `[]` `{}` `|`), which no naming convention can hide.
+**ZERO in this partition**, on two independent channels: a body-extracting detector reads 0, and
+a grep for every grouper CHAR LITERAL in the four files returns only fixed-position character
+tests (`nm[0] == '{'`, `ctx[ctx.length - 2] == '['`) and not one depth loop. The walk grammar has
+already been fully homed OUT of these files, into `emit_base`'s `tyTopLevelIndexOf` /
+`tyTopLevelSplit` / `tyGroupWrapsWhole` (#1147, #1150). *Recorded because a census that finds
+nothing is still a measurement, and the next operator should not re-run it.*
+
+**(2) The character-grammar census**, multi-line-aware (a predicate split across three lines
+counts the same as one written on one), comment-stripped with a stripper that **KEEPS char
+literals** — the harness note #1139 earned, where blanking them scored a real signature 0 on
+both sides:
+
+| grammar | tree-wide | in this partition |
+|---|---|---|
+| `[]`-elem peel `.slice(0, X.length - 2)` | 29 | 5 (`emit_collect` 2 · `emit_rewrite` 2 · `emit_mono` 1) |
+| `[]`-suffix test `X[n-2]=='[' && X[n-1]==']'` | 20 | 5 (`emit_mono` 2 · `emit_rewrite` 2 · `emit_collect` 1) |
+| SHAPE-not-MAP open `X[0]=='{' && X[1]!='['` | 14 | 5 (`emit_collect` 3 · `emit_rep` 2) |
+| PAREN open `X[0]=='('` | 16 | 2 |
+| ARROW prefix `X[0]=='=' && X[1]=='>'` | 4 | 2 (both `emit_mono`) |
+
+None of these is a dominant single grammar here — the mass of every one of them is in
+`emit_classify`, which this slice does not own. They are listed so the next operator inherits
+the numbers rather than re-deriving them.
+
+**(3) The mechanical CLONE detector** — identifier-normalized, every window of N consecutive
+non-blank statements hashed and grouped. Run at N=6 over the four files, with import lists and
+loop epilogues filtered, its **largest non-boilerplate group is seven copies of one six-line
+block**, and it named the same seven lines a hand reading had already flagged:
+
+```
+emit_collect.vl:572-577  internCloResultSpine
+emit_collect.vl:640-645  collectCloSigs
+emit_collect.vl:743-748  collectCloSigs
+emit_collect.vl:766-771  collectCloSigs
+emit_collect.vl:813-818  collectCloSigs
+emit_collect.vl:847-852  collectCloSigs
+emit_collect.vl:4479-84  collectTyReachCloSigs
+```
+
+Widening from "character-identical" to "the same grammar" adds two more (the sites that push a
+CONCRETE lifted-function rep instead of the `-1` synth sentinel), for **NINE hand-written copies
+of the `$fnsig` INTERN**, all in `emit_collect.vl`, all reached from `collectCloSigs`:
+
+| # | line | position | keyed by | mixed-union skip | rep |
+|---|---|---|---|---|---|
+| 1 | 572 | the closure RESULT-SPINE walk | `unionArmSigKey` | no | −1 |
+| 2 | 620 | the concrete lifted-lambda loop | `fnSigKeyOf`/`cloSigKeyExt` | no | `fe` |
+| 3 | 640 | a lifted fn's NULCLOSURE return | `unionArmSigKey` | no | −1 |
+| 4 | 682 | an OBJECT-FIELD closure | `cloSigKeyExt` | no | `ffe` |
+| 5 | 743 | a FUNCTION-TYPE union ARM | `unionArmSigKey` | **yes** | −1 |
+| 6 | 766 | a union arm's CLOSURE-ARRAY element | `unionArmSigKey` | **yes** | −1 |
+| 7 | 813 | a NULCLOSURE annotation's inner type | `unionArmSigKey` | **yes** | −1 |
+| 8 | 847 | a CLOSURE-ARRAY annotation's element | `unionArmSigKey` | **yes** | −1 |
+| 9 | 4479 | the ARENA walk's `TyFunc` render | `unionArmSigKey` | **yes** | −1 |
+
+This is the brief's "spellings banked as keys" pattern in its purest form: `cloSigKeys` /
+`cloSigRepFn` are two PARALLEL columns that must stay the same length or `cloSigRepFn[i]` names
+another key's representative — and that invariant was being upheld in nine separate places.
+
+### THE COLLAPSE — nine copies, two homes
+
+**`internCloSigKey(key, rep)`** — the raw intern: the `""` test, the `cloSigPosOfKey` dedup, and
+the PAIRED push. All nine sites route through it.
+
+**`internCloSigOfAtom(atom)`** — the type-ATOM entry: `unionArmSigKey` → the
+`nulCloMixedUnionUnregistered` skip → `internCloSigKey(·, -1)`. Sites 5–9, character-identical
+modulo variable names (4479 spells the same short-circuit as one `&&`).
+
+Sites 1 and 3 become `internCloSigKey(unionArmSigKey(X), -1)` — they keep master's behaviour
+exactly, **including the absence of the mixed-union skip**, which is not silently harmonized.
+
+The four bug reports the five guarded copies carry in their comments (fuzz seeds 113152631,
+128038938, and the fuzz-nightly nulclosure lead) are **four discoveries of ONE rule at four
+positions** — the same shape #1139 found in `registerMapValUnion`'s four map arms.
+
+### The call arithmetic
+
+| construct in `emit_collect.vl` | master `3974381` | now | delta |
+|---|---|---|---|
+| `cloSigKeys.push` | **9** | **1** | **−8** |
+| `cloSigRepFn.push` | **9** | **1** | **−8** |
+| `cloSigPosOfKey` | 9 | 1 | −8 |
+| `unionArmSigKey` | 7 | 3 | −4 |
+| `nulCloMixedUnionUnregistered` | 5 | 1 | −4 |
+| *(new)* `internCloSigKey` / `internCloSigOfAtom` | 0 / 0 | 5 / 5 | +10 |
+
+**The 23-resolver list is 55 → 55, tree-wide 303 → 303: NET 0, and that is stated up front, not
+buried.** None of the collapsed constructs is on that list. The real deletion here is a GRAMMAR
+— eight copies of a four-line banking invariant — and the scorecard has no column for it, which
+is the same note #1120, #1136 and #1147 each recorded. The binary is the independent witness:
+**1,036,139 → 1,033,923 B (−2,216)**, both artifacts checksummed and both built from the SAME
+master seed, with the baseline rebuilt AT this slice's gating head (`d09de258…`), not reused.
+
+### EVIDENCE
+
+Every RC checked explicitly.
+
+- `refresh-compiler.sh` **RC=0** — and the refreshed seed's sha256 `19aa5268…` / 1,033,923 B is
+  BYTE-IDENTICAL to the `CAND.wasm` every A/B below was run against, so the gated artifact and
+  the shipped artifact are the same object, not two builds assumed equal.
+- `native-fixpoint.sh` **RC=0** — stage3 == stage4 byte-for-byte (1,033,923 B).
+- `lint-self.sh` **RC=0** — the self-lint at `--severity info` AND `vl fmt --check` over
+  `compiler/` + `std/` + `scripts/`.
+- `rep-fuzz-check.sh` — **`exact ✅`** (1 baselined failure: 0 unsound, 1 reject; 0 new, 0 stale).
+- `deno check tests/cases_wasm_test.ts` **RC=0** — the leg `deno task test` cannot see, because
+  it runs `--no-check`.
+- **Suite A/B, same tree, same command, both seeds** (`SELFHOST_NATIVE_ALIGN=1 deno task test`):
+  master seed **2,131 passed / 0 failed / 14 ignored**, candidate seed **2,131 passed / 0 failed /
+  14 ignored**, RC=0 both. **IGNORED NAME SETS IDENTICAL**, both files asserted non-empty (14
+  each) — nothing that ran stopped running, and a collapsed suite would also have returned 0.
+  The new fixture is in the log as `ok`, not `ignored`.
+- **Corpus A/B, all 1,399 files, FIVE fields each** (build rc · wasm sha256 · build diagnostics ·
+  run rc · run stdout+stderr), every temp path normalized out of the compared text:
+  **1,399 / 1,399 IDENTICAL, 0 differing** (the count includes this slice's own new fixture,
+  which is byte-, message- and run-identical under both compilers).
+- **Shared-instance `vl check <dir>` leg** (the sidecar-lifetime channel — one compiler instance
+  across every file in the tree, which `vl run --batch` does not exercise): `std`, `compiler` and
+  `tests/cases` all IDENTICAL, the last over **1,677 diagnostic lines**.
+- **Fuzz A/B: 33,600 programs per side, 48 cells** (4 seeds × 3 depths × 4 dimension combos —
+  plain / declared / branching / multiobs), whole per-case signature compared (stdout, or the
+  first error line): **0 divergent cells, 0 divergences.**
+
+**A 1,398/1,398 zero is worthless until the comparator is shown to fire.** Five named
+sabotages, each breaking an INVARIANT rather than permuting one, A/B'd over the full corpus
+against the shipped candidate:
+
+| # | sabotage | corpus files reddened |
+|---|---|---|
+| S1 | `internCloSigKey` loses the `cloSigPosOfKey` DEDUP (key-uniqueness) | **319** |
+| S2 | `internCloSigKey` always banks the −1 synth rep, discarding the CONCRETE one | **2** |
+| S3 | `internCloSigOfAtom` loses the `nulCloMixedUnionUnregistered` SKIP | **0 — inert, stated** |
+| S4 | `internCloSigOfAtom` interns nothing (does the home get REACHED?) | **23** (3 with RUN failures) |
+| S5 | `internCloSigOfAtom` keys the RAW atom, skipping `unionArmSigKey`'s normalization | **302** |
+
+(The five A/Bs above ran over the 1,398 PRE-EXISTING corpus files, so every one of those counts
+is a pin that predates this slice. This slice's own fixture was checked separately and reddens
+under S4 and S5 too.)
+
+Four of the five fire, S1 and S5 at 300+ files each — the comparator is live on exactly this
+code path, and every hunk of the collapse except S3's guard is pinned by files that predate the
+slice.
+
+**AND THE FUZZ CHANNEL WAS PROVED LIVE THE SAME WAY, because a 0 on either channel can be
+blindness.** S4 re-run through the fuzz A/B on one seed's full grid: **40 divergences across
+12 of 12 cells over 8,400 programs per side** — the identical harness that reads 0 over 33,600
+programs for the shipped change. The zero is agreement, not an inert comparator.
+
+### THE FIXTURE, and what grading it actually found
+
+`tests/cases/closures/closure-sig-intern-five-positions.vl` — the five structural positions that
+reach the atom home, each carrying a closure type NO lifted lambda in the program produces, so
+the narrowed value call resolves only if that position's pass interned the sig from the
+ANNOTATION. **A construction proof is not a regression test**; this is the regression test.
+
+Graded one position per ISOLATED program against the S4 probe: **4 of 5 flip** from the printed
+value to `emitProgram: function-value call arity has no interned signature`. **POSITION 3 DOES
+NOT**, and the fixture says so in its own header rather than claiming five: a nulclosure whose
+result is a plain SCALAR is ALSO interned by the result-SPINE walk, which goes through the raw
+key home and not the atom home. That is a coverage statement about one result shape, not a
+licence to delete the pass — a result outside `cloResultIsPlainScalar` is not taken by the spine.
+
+### NEWLY FILED — two, each with its mechanism
+
+1. **S3 IS INERT ON THE CORPUS AND I COULD NOT BUILD ITS WITNESS — and the reason is a
+   substantive lead, not a shrug.** Method note 103 says do not accept an inert sabotage without
+   first trying to construct its population, so four cells were written from the guards' own
+   comments: `((i32) => K0 | {w:i32}) | boolean` in scalar-valued and lambda-valued form,
+   `(() => K0 | {w:i32} | f64 | null) | null` null-only, and `((i32) => K0 | {w:i32})[]` empty.
+   **All four run identically under master, the candidate and S3.** The mechanism: the guard
+   fires only when the closure's result union is UNREGISTERED, and
+   `collectTyReachRegister`'s structural `TyFunc` → `fnRet` → `TyUnion` descent registers exactly
+   these unions — so `isUName` is true and the guard declines. **The hypothesis this raises is
+   that the arena registration walk has SUBSUMED the guard's population for every spelling
+   reachable from a walk root**, which would make the five skips dead code. It is NOT acted on
+   here: measured-0 is not a licence to delete a guard whose absence was three separate
+   INVALID-WASM/TRAP findings, and the population that matters is fuzz-shaped (all three
+   discoveries came from the fuzzer, none from the corpus). **S3 was then graded on the FUZZ
+   channel too, and is inert there as well: 0 divergences over 16,800 programs per side in 24
+   cells — the same harness, at the same grid, in which S4 diverged in 40 programs across 12 of
+   12 cells.** So the inertness is measured on both channels rather than assumed on one, and the
+   subsumption hypothesis is a lead with two negative results behind it, not a hunch. The next
+   slice can settle it by replaying the three ORIGINAL seeds (113152631, 128038938, and the
+   nulclosure lead) against S3, which is the only population known to have contained a witness.
+2. **Site 3 (line 640, a lifted function's nulclosure RETURN) is the ONE synth site whose missing
+   mixed-union skip is not provably inert.** Site 1's omission IS provably inert — its `takes`
+   gate already restricts the level's result to a nested closure, a plain scalar, or a whole-span
+   shape, never a union, so the guard's mixed scalar+composite test cannot fire. Site 3 has no
+   such gate: `inm` is the nullable part of a lifted function's declared return and its result is
+   unconstrained. Master had no guard there and this slice adds none — **changing it is a
+   behaviour change that needs its own gate, and the collapse's whole value is that the
+   asymmetry is now visible in one line instead of spread across nine.** The one-line fix, if a
+   future slice measures the position reachable, is to route site 3 through
+   `internCloSigOfAtom(inm)` instead of `internCloSigKey(unionArmSigKey(inm), -1)`.
+
+### THE METHOD NOTES THIS SLICE EARNED
+
+108. **A CENSUS THAT FINDS NOTHING IS STILL A MEASUREMENT — WRITE THE ZERO DOWN.** The walk
+     census over this partition reads 0 on two independent channels. Publishing that zero is
+     what stops the next operator spending a slice re-deriving it, and it is also the evidence
+     that #1147/#1150's homing actually finished the job in these files rather than moving it.
+109. **RUN A MECHANICAL CLONE DETECTOR BEFORE TRUSTING A HAND CENSUS — AND FILTER ITS
+     BOILERPLATE FIRST.** The detector agreed with the hand reading on the seven-copy group, but
+     its raw top hit was a 549-copy group of IMPORT-LIST lines and its next three were loop
+     epilogues. An unfiltered clone detector will confidently name `i = i + 1` as the compiler's
+     biggest duplication. The signal is the largest group that survives a boilerplate filter.
+110. **GRADE A MULTI-POSITION FIXTURE POSITION BY POSITION, OR IT CLAIMS MORE THAN IT PINS.**
+     The five-position fixture reddens under the probe — but the reject is fatal at the FIRST
+     position, so the whole-file result cannot distinguish "all five are load-bearing" from "one
+     is". Splitting it into five isolated programs cost one extra harness run and turned an
+     unearned "five" into a measured "four, and here is why the fifth is not". *A fixture that
+     fails for one reason cannot testify about five.*
+111. **A PARALLEL-COLUMN PUSH IS AN INVARIANT LOOKING FOR A HOME.** `cloSigKeys` and
+     `cloSigRepFn` must stay the same length or every later `cloSigRepFn[i]` names another key's
+     representative. That invariant was upheld correctly in nine separate places — nine chances
+     to get it wrong, and the sabotage that discards the concrete rep (S2) reddens only **2**
+     corpus files, so eight of those nine chances were nearly unguarded. **Wherever two columns
+     are pushed together, the push is the home.**

@@ -517,6 +517,53 @@ function cloResultIsPlainScalar(r: string) {
   r == "i32" || r == "boolean" || r == "f64" || r == "f32" || r == "i64"
 }
 
+// THE ONE HOME of the `$fnsig` INTERN. Append `key` to the signature table under
+// representative lifted-function `rep` (a real `fnStmts` index for a concrete lambda,
+// `-1` for a key synthesized from an annotation — `emitSynthCloSig` builds that
+// functype from the key text alone). A "" key is the "not value-ABI" answer of every
+// producer (`fnSigKeyOf` / `cloSigKeyExt` / `unionArmSigKey`) and interns nothing; an
+// already-present key keeps its ORIGINAL slot, which is what makes every pass below
+// idempotent and order-stable.
+//
+// This four-line sequence — the "" test, the `cloSigPosOfKey` dedup, and the PAIRED
+// push into the two parallel columns — was hand-written NINE times in this file, and
+// the two columns must stay the same length or `cloSigRepFn[i]` names another key's
+// representative. That invariant now has one place to hold.
+function internCloSigKey(key: string, rep: i32) {
+  if key == "" { return 0 }
+  if cloSigPosOfKey(key) >= 0 { return 0 }
+  cloSigKeys.push(key)
+  cloSigRepFn.push(rep)
+  0
+}
+
+// THE ONE HOME of "intern the `$fnsig` of this type-ATOM spelling, synthesized". Five
+// passes below reach a closure through a DIFFERENT structural position — a union arm, a
+// union arm's closure-ARRAY element, a nulclosure annotation's inner type, a
+// closure-array annotation's element, and the arena walk's `TyFunc` render — and each
+// spelled out the identical three steps:
+//
+//   1. key the atom with `unionArmSigKey` (which peels the grouping parens a closure
+//      carries in a composite position, yielding exactly the key the value CALL site
+//      derives via `annSigKey` — the two producers must byte-match);
+//   2. SKIP a mixed scalar+composite union RESULT that no registration path admitted
+//      (`nulCloMixedUnionUnregistered`) — synthesizing that sig would satisfy the call
+//      site's floor while the un-pinned producer lambda keeps its self-classified
+//      functype, turning a clean REJECT into a runtime cast TRAP. Three separate
+//      fuzz findings (seeds 113152631, 128038938, and the fuzz-nightly nulclosure
+//      lead) each added this guard at ONE position; they are one rule at five;
+//   3. intern with the -1 synth rep.
+//
+// The guard is evaluated only for an atom that KEYED, exactly as all five copies did —
+// `unionArmSigKey` is the cheap arrow scan and `nulCloMixedUnionUnregistered` re-walks
+// the result union, so the order is load-bearing for work, not just for behaviour.
+function internCloSigOfAtom(atom: string) {
+  const k = unionArmSigKey(atom)
+  if k == "" { return 0 }
+  if nulCloMixedUnionUnregistered(atom) { return 0 }
+  internCloSigKey(k, -1)
+}
+
 // Intern every closure `$fnsig` reachable through the RESULT chain of function-type name
 // `tn` — a closure whose result is ITSELF a closure (`()=>((i32)=>f32)`), to any nesting
 // depth (`()=>(()=>(i32)=>boolean)`). The concrete-lambda loop keys the OUTER sig as a
@@ -566,15 +613,11 @@ function internCloResultSpine(tn: string, wideShape: boolean) {
     // Evaluated ONLY when the two cheap disjuncts declined — the short-circuit the two
     // copies had, kept exactly (`nameIsWholeSpanShape` is the depth scanner, not a char test).
     if !takes && wideShape { takes = nameIsWholeSpanShape(ret) }
-    if takes {
-      const k = unionArmSigKey(cur)
-      if k != "" {
-        if cloSigPosOfKey(k) < 0 {
-          cloSigKeys.push(k)
-          cloSigRepFn.push(-1)
-        }
-      }
-    }
+    // NO `nulCloMixedUnionUnregistered` guard, and it is INERT here rather than missing:
+    // `takes` already restricts this level's RESULT to a nested closure, a plain scalar,
+    // or (annotation entry) a whole-span shape — never a union — so the guard's mixed
+    // scalar+composite test cannot fire on `cur`. Stated, not assumed.
+    if takes { internCloSigKey(unionArmSigKey(cur), -1) }
     // Descend only THROUGH a nested-closure result — a scalar/composite result ends the spine.
     if !retIsClosure { return 0 }
     cur = ret
@@ -616,12 +659,9 @@ export function collectCloSigs() {
     // so those stay unminted; usage-gated by `fnValUsed`, so a program without such a
     // function value emits byte-identical types.
     if key == "" { key = cloSigKeyExt(fe) }
-    if key != "" {
-      if cloSigPosOfKey(key) < 0 {
-        cloSigKeys.push(key)
-        cloSigRepFn.push(fe)
-      }
-    }
+    // The CONCRETE-lambda rep: this key's representative is the lifted function itself,
+    // not the -1 synth sentinel.
+    internCloSigKey(key, fe)
     // A NULLABLE-CLOSURE result (`(i32) => ((i32) => K0) | null`, key `…>C`): intern the INNER
     // closure's `$fnsig` too. The inner closure is never CONSTRUCTED (the result is only ever
     // `null`, or narrowed and called), so a narrowed value-call `t0(1)` would find no interned
@@ -633,16 +673,12 @@ export function collectCloSigs() {
     if cloRetValKind(fe) == "nulclosure" {
       const rfn = P.nodes[fnStmts[fe]]
       if rfn is FuncDecl {
+        // NO `nulCloMixedUnionUnregistered` guard — master had none here either, and
+        // this is the ONE of the seven synth sites where the omission is not provably
+        // inert (`inm`'s result is unconstrained). Kept EXACTLY as master had it and
+        // measured instead of changed: see the hand-off in the destringify doc.
         const inm = nullablePartOf(tyNameOf(rfn.fnRet))
-        if inm != "" {
-          const ik = unionArmSigKey(inm)
-          if ik != "" {
-            if cloSigPosOfKey(ik) < 0 {
-              cloSigKeys.push(ik)
-              cloSigRepFn.push(-1)
-            }
-          }
-        }
+        if inm != "" { internCloSigKey(unionArmSigKey(inm), -1) }
       }
     }
     // CLOSURE-RETURNING-CLOSURE result (`() => ((i32) => f32)`, `(i32) => (() => i64)`): a
@@ -676,15 +712,8 @@ export function collectCloSigs() {
         if f is FieldInit {
           const ffe = fieldValueFeOf(f.fiValue)
           if ffe >= 0 {
-            if fnSigKeyOf(ffe) == "" {
-              const ek = cloSigKeyExt(ffe)
-              if ek != "" {
-                if cloSigPosOfKey(ek) < 0 {
-                  cloSigKeys.push(ek)
-                  cloSigRepFn.push(ffe)
-                }
-              }
-            }
+            // The field closure is CONCRETE, so its rep is the lifted function `ffe`.
+            if fnSigKeyOf(ffe) == "" { internCloSigKey(cloSigKeyExt(ffe), ffe) }
           }
         }
         fi = fi + 1
@@ -729,23 +758,10 @@ export function collectCloSigs() {
     }
     let uj = 0
     while uj < atoms.length {
-      const ak = unionArmSigKey(atoms[uj])
-      if ak != "" {
-        // The union-ARM dual of the nulclosure / closure-array guards: a closure
-        // arm whose RESULT is a MIXED scalar+composite union that no registration
-        // path admitted (`((i32) => K0 | {w: i32}) | boolean` — the arm's result
-        // union) has no pin/box path for a contextual lambda, so the synthetic
-        // `>u` sig satisfied the narrowed call's floor while the un-pinned lambda
-        // kept its self-classified functype — a runtime cast TRAP (fuzz-nightly
-        // seed 113152631 d4). Skip the synth so the call rejects loudly; a
-        // concrete named-fn producer interns the same key via its own loop entry.
-        if !nulCloMixedUnionUnregistered(atoms[uj]) {
-          if cloSigPosOfKey(ak) < 0 {
-            cloSigKeys.push(ak)
-            cloSigRepFn.push(-1)
-          }
-        }
-      }
+      // A FUNCTION-TYPE union arm (`(() => i64) | i64`): the arm's own closure sig.
+      // The mixed-unregistered-result skip that used to be spelled out here is the
+      // home's step 2 — the fuzz-nightly seed 113152631 d4 discovery of it.
+      internCloSigOfAtom(atoms[uj])
       // A CLOSURE-ARRAY ARM (`((i32, i32, i32) => boolean)[] | i32`) — plain or
       // nullable-element (`(((i32) => R) | null)[]`, the kind-5 niche): the arm's
       // ELEMENT closure sig is never interned by the function-arm branch above (a
@@ -759,17 +775,7 @@ export function collectCloSigs() {
       // the top-level closure-array pass (same `unionArmSigKey` element-key
       // normalization the call site derives via `cloArrSlotSigKey`).
       const uCael = cloArrElemNameOf(atoms[uj])
-      if uCael != "" {
-        const uCak = unionArmSigKey(uCael)
-        if uCak != "" {
-          if !nulCloMixedUnionUnregistered(uCael) {
-            if cloSigPosOfKey(uCak) < 0 {
-              cloSigKeys.push(uCak)
-              cloSigRepFn.push(-1)
-            }
-          }
-        }
-      }
+      if uCael != "" { internCloSigOfAtom(uCael) }
       uj = uj + 1
     }
     ui = ui + 1
@@ -798,24 +804,9 @@ export function collectCloSigs() {
         // by construction (unlike D-RAKIND's, which straddled an intern and had to be
         // probed).
         const nInner = nullablePartOf(nm)
-        const nk = unionArmSigKey(nInner)
-        if nk != "" {
-          // A MIXED scalar+composite UNION result that is UNREGISTERED
-          // (`(() => K0 | {w: i32} | f64 | null) | null` — no named-fn annotation
-          // registered the union) has no producer path that pins/boxes it: a
-          // contextual lambda flowing in keeps its self-classified functype, so the
-          // synthetic `>u` sig would satisfy the call-site floor while the narrowed
-          // call's `ref.cast` TRAPS at runtime (fuzz-nightly lead). Skip the synth —
-          // the key stays un-interned and the call REJECTS loudly. A registered union
-          // keeps the synth, and a concrete producer's own `$fnsig` interns the same
-          // key via its `fnStmts` loop entry regardless.
-          if !nulCloMixedUnionUnregistered(nInner) {
-            if cloSigPosOfKey(nk) < 0 {
-              cloSigKeys.push(nk)
-              cloSigRepFn.push(-1)
-            }
-          }
-        }
+        // The nulclosure annotation's INNER closure sig — the home's step 2 is the
+        // fuzz-nightly nulclosure lead's skip, which used to be spelled out here.
+        internCloSigOfAtom(nInner)
         // A nulclosure whose RESULT is ITSELF a closure (`(() => ((i32) => f32)) | null`,
         // `((i32) => (() => {a: i64, f: i32, z: f64})) | null`): the intern above mints only
         // the OUTER sig (result collapsed to the shared `>c` fat-pointer), so the CHAINED
@@ -832,25 +823,9 @@ export function collectCloSigs() {
       // `unionArmSigKey` peels the element's grouping parens to the SAME key the call
       // sites derive (`cloArrSlotSigKey` / `cloNameSigKey`); a live lambda of the same
       // shape dedups onto its key via `cloSigPosOfKey`.
+      // The home's step 2 is this position's own fuzz finding (seed 128038938 d4).
       const cael = cloArrElemNameOf(nm)
-      if cael != "" {
-        const cak = unionArmSigKey(cael)
-        if cak != "" {
-          // The closure-ARRAY dual of the nulclosure guard above: a MIXED
-          // scalar+composite UNION result that no registration path admitted
-          // (`((i32) => K0 | {w: i32})[]`) has no pin/box path for a contextual
-          // element lambda — the synthetic `>u` sig satisfied the indexed call's
-          // floor while the un-pinned lambda kept its self-classified functype,
-          // a runtime cast TRAP (fuzz-nightly seed 128038938 d4). Skip the synth
-          // so the call rejects loudly instead.
-          if !nulCloMixedUnionUnregistered(cael) {
-            if cloSigPosOfKey(cak) < 0 {
-              cloSigKeys.push(cak)
-              cloSigRepFn.push(-1)
-            }
-          }
-        }
-      }
+      if cael != "" { internCloSigOfAtom(cael) }
     }
     ni = ni + 1
   }
@@ -4473,15 +4448,7 @@ function collectTyReachCloSigs(tyIx: i32, depth: i32) {
     // rejects loudly (the name-pass discipline).
     if !funcRetUnrepresentable(t.fnRet) {
       const nm = canonEmitName(tyToNominalName(tyIx))
-      if nm != "" {
-        const ck = unionArmSigKey(nm)
-        if ck != "" && !nulCloMixedUnionUnregistered(nm) {
-          if cloSigPosOfKey(ck) < 0 {
-            cloSigKeys.push(ck)
-            cloSigRepFn.push(-1)
-          }
-        }
-      }
+      if nm != "" { internCloSigOfAtom(nm) }
     }
     // Descend params + result to reach closures nested inside them (a result struct's
     // closure field, a param closure, a closure arm of a field union).
