@@ -15500,10 +15500,24 @@ delegate to `tyTopLevelIndexOf`, so hunk 1 covers it; and no `skipQuotedName` ex
 inline quote skip. The shipped form is **three hunks in two files**, and it deletes two more
 hand-written walks than the filed one did.
 
-**Evidence for the filed fix (all measured by me):** 24/24 cells fixed, **0 regressions, 0 traps**;
-corpus A/B **1,340 entries, 0 differing** on build-rc + wasm SHA + compiler message + run-rc +
-stdout; binary **1,027,758 → 1,027,120 B, −638 B**; walks **10 → 8**; OFF-LIST unchanged
-(`tyGtIsClose` sheds 3 sites, `tyTopIndexOf` is not on the list).
+**Evidence for the filed fix — measured at `5d011ff` and RE-MEASURED at `4758935` after #1152, with
+identical results** (the quote-blind population is unmoved by #1152: the 300-cell grade is
+231 ok / 54 reject / 15 invalid-wasm on both masters, cell for cell):
+
+| | at `4758935` |
+|---|---|
+| cells fixed | **24 of 24** |
+| regressions · traps | **0** · **0** |
+| corpus A/B | **1,340 entries, 0 differing** (build-rc + wasm SHA + message + run-rc + stdout) |
+| binary | 1,027,238 → **1,026,600 B**, **−638 B** |
+| hand-written walks | **10 → 8** |
+| scoreboard | CORE 326 unchanged · **OFF-LIST 35 → 32** · **TRUE 361 → 358** |
+
+**A CORRECTION TO MY OWN FIRST WRITE-UP:** I first recorded this as "OFF-LIST unchanged —
+`tyGtIsClose` sheds 3 sites, `tyTopIndexOf` is not on the list". The second clause is true and the
+conclusion does not follow: **`tyGtIsClose` IS on the off-list table**, so the three ladders it
+loses take OFF-LIST down by exactly 3. Corrected in place rather than quietly — the filed fix is
+worth **−3** on the scoreboard, not 0.
 
 **The exact diff is in the PR body** (`emit_base.vl` hunks 1–2 belong to the `emit_collect`/
 `emit_base`/`emit_mono` owner; the `emit_classify.vl` hunk to the `emit_classify`/`emit_query`
