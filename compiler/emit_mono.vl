@@ -59,6 +59,7 @@ import {
   annArrowAt,
   annFnDecompose,
   annRetNameOf,
+  listElemNameOf,
   monoAnnHasTyParam,
   monoBindFromAnn,
   monoBindOf,
@@ -67,6 +68,7 @@ import {
   monoTyParamOf,
   nameIsClosureArray,
   nodeIsTypeDecl,
+  normTypeAtom,
   parentLetOf,
   tyNameOf,
   unwrapParen,
@@ -114,7 +116,6 @@ import {
   identFnTypeAnnName,
   isSName,
   isUName,
-  monoUnwrapParens,
   nominalizeFnType,
   sFieldElemNameAt,
   sFieldIndex,
@@ -477,15 +478,6 @@ function monoLambdaPreservesElem(argIx: i32) {
     }
   }
   false
-}
-
-// The element type NAME of an array type name (`"f64[]"` → `"f64"`), or "" if not an array.
-function monoArrElemName(name: string) {
-  const n = name.length
-  if n >= 2 {
-    if name[n - 2] == '[' && name[n - 1] == ']' { return name.slice(0, n - 2) }
-  }
-  ""
 }
 
 // The element type of `recvIx` when it is (a paren around) a PARAMETER reference whose pinned
@@ -983,10 +975,17 @@ function monoMakeInstance(
                       // `annRetNameOf` IS this arm's `annArrowAt` + `slice(at + 2, n)` pair
                       // (`emit_base`, the home #1147 named after finding FIVE copies of it in
                       // `emit_collect.vl`); its `at < 1` bail is this arm's `arrowAt > 0` gate
-                      // spelled the other way round, and `monoUnwrapParens("")` is "" — so the
+                      // spelled the other way round, and `normTypeAtom("")` is "" — so the
                       // guarded reading below reaches the same `retName` on every input,
                       // including the arrow-at-the-end name both readings answer "" for.
-                      const retName = monoUnwrapParens(annRetNameOf(pn))
+                      //
+                      // The peel is `emit_base.normTypeAtom` (the paren-WRAP home, riding
+                      // `tyGroupWrapsWhole`), not `emit_classify.monoUnwrapParens` — the last
+                      // hand-written paren-only wrap walk left in the compiler. Both readings
+                      // were measured over every reach of every one of that function's 17 call
+                      // sites (456,003 invocations, 0 disagreements) before this file stopped
+                      // reaching a module UP for a grammar `emit_base` already owns.
+                      const retName = normTypeAtom(annRetNameOf(pn))
                       if retName != "" && annArrowAt(retName) < 0 {
                         nret = synthTypeRef(retName, -1)
                       }
@@ -1013,7 +1012,14 @@ function monoMakeInstance(
                     const ppm = P.nodes[params[pqm]]
                     if ppm is Param {
                       if ppm.parName == mrecv.identName {
-                        const srcElem = monoArrElemName(pinned[pqm])
+                        // `listElemNameOf` (`emit_base`) IS the private `monoArrElemName`
+                        // this file carried: the same `nameIsArray` gate and the same
+                        // trailing-`[]` cut, plus ONE naive grouping-paren strip a pinned
+                        // ELEMENT name cannot carry (a `(…)`-wrapped element is the only
+                        // shape the two can disagree on). Measured at both of the twin's
+                        // call sites: 362 corpus reaches, 0 disagreements, comparator
+                        // firing on 362/362 under inversion.
+                        const srcElem = listElemNameOf(pinned[pqm])
                         if srcElem != "" && srcElem != "i32" {
                           if rcal.memProp == "filter" {
                             nret = synthTypeRef(srcElem + "[]", -1)
@@ -1136,7 +1142,7 @@ function monoMakeInstance(
       } else {
         pElemNames.push("")
       }
-      pElemTypes.push(monoArrElemName(pinned[pe]))
+      pElemTypes.push(listElemNameOf(pinned[pe]))
       pe = pe + 1
     }
     const instBody1 = monoPinMapLambdas(instBody0, pElemNames, pElemTypes)
@@ -1260,7 +1266,11 @@ function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
   const e = P.nodes[exprIx]
   if e is ArrayLit {
     if nameIsClosureArray(tname) {
-      const elemName = monoUnwrapParens(tname.slice(0, tname.length - 2))
+      // The `[]` cut stays RAW here (not `listElemNameOf`): that home strips one
+      // NAIVE paren layer, which would mangle a non-wrapped function-type element
+      // (`(i32)=>(i32)` → `i32)=>(i32`), while `normTypeAtom`'s balanced walk
+      // declines it. The peel question and the cut question are separate.
+      const elemName = normTypeAtom(tname.slice(0, tname.length - 2))
       const es = e.arrElems
       let k = 0
       while k < es.length {
