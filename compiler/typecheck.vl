@@ -1172,11 +1172,11 @@ let bodyChecked: {[string]: boolean} = Map()
 // read back -1 via `nodeTyIxOf`, so a consumer falls back to its syntactic path there.
 let nodeTyIx: i32[] = []
 // `is`-TEST TYPE sidecar: the arena type an `IsExpr`'s CHECK type resolves to, keyed by the
-// `IsExpr` node. `checkIsExprNode` already resolves it (`nameToTy(n.isVariant)`) to enforce
-// the variant-membership rule, so the emitter's narrowing stack banks THE ANSWER instead of
-// re-deriving the narrowed type by picking apart the tested SPELLING. Sized with `nodeTyIx`
-// and read through `isVarTyIxOf`, so an emitter-synthesized (monomorphized) `is` node falls
-// past the end, reads -1, and its consumer keeps the name path.
+// `IsExpr` node. `checkIsExprNode` already resolves it (`isTypeTy`, from the node's own
+// SPELLING TREE) to enforce the variant-membership rule, so the emitter's narrowing stack banks
+// THE ANSWER instead of re-deriving the narrowed type by picking apart the tested SPELLING.
+// Sized with `nodeTyIx` and read through `isVarTyIxOf`, so an emitter-synthesized
+// (monomorphized) `is` node falls past the end, reads -1, and its consumer keeps the name path.
 let isVarTyIx: i32[] = []
 // CONTEXT-RESOLVED type sidecar (rep-twin-matcher phase 0a): parallel to `nodeTyIx`, this table
 // records — at the arena-pure coercion/ADOPTION sites — the DESTINATION (context) type a literal
@@ -2706,7 +2706,7 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
     if cond.isVariant == "null" {
       pushNarrowFact(cond.isObj, TY_NULL, names, tys)
     } else {
-      const tIdx = nameToTy(cond.isVariant)
+      const tIdx = isTypeTy(cond.isVariant, condIx)
       if tIdx >= 0 { pushNarrowFact(cond.isObj, tIdx, names, tys) }
     }
     return 0
@@ -2770,7 +2770,7 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
         pushNarrowFact(cond.isObj, inner, names, tys)
       }
     } else {
-      const tIdx = nameToTy(cond.isVariant)
+      const tIdx = isTypeTy(cond.isVariant, condIx)
       if tIdx >= 0 {
         pushNarrowFact(cond.isObj, subtractTy(cur, tIdx), names, tys)
       }
@@ -4845,6 +4845,31 @@ function nameToTyAnn(name: string, at: i32, ann: i32) {
 // The same, where the diagnostic anchor IS the annotation node.
 function nameToTyAt(name: string, at: i32) { nameToTyAnn(name, at, at) }
 
+// The TYPE on the right of an `is` / `!is` test, and of a `match` TYPE PATTERN
+// (`parseMatchPattern` mints a real `IsExpr` for one, so both are the same node
+// shape and the same channel). Resolved from the parser's SPELLING TREE, which
+// D-PARSETY P2 banks on the `IsExpr` node ITSELF (`parseIsType` → `setAnnTs`,
+// and `driver.vl`'s module merge rewrites that tree rather than the rendering).
+//
+// Five callers, one home: the two narrowing collectors, the if-chain
+// exhaustiveness scan, the `match` arm checker and `checkIsExprNode`. All five
+// already hold the node index, so this is a plain read, not a new sidecar.
+//
+// Diagnostics anchoring is deliberately NOT `nameToTyAt`'s: an `is` type has
+// never set `annotDiagAt`, so a generic-arity error raised inside resolution
+// keeps reporting where it reports today.
+//
+// `annotResolve`'s NAME leg is DEAD here, and structurally so rather than by
+// luck: `mkIsExpr`/`mkIsExprNeg` have exactly three call sites, all three in
+// `parser.vl` (the `is` / `!is` operators and `parseMatchPattern`), and every one
+// banks a root with `setAnnTs` on the line after minting the node — so no `IsExpr`
+// exists without a spelling tree, and `checkProgram` (the only caller of all five
+// sites, from `driver.vl` alone) runs before the emitter can synthesize one.
+// Measured: 0 tree-misses in 228,869 reads over 1,335 corpus files and 50,400 fuzz
+// programs. The fall-through is not deleted because it is `annotResolve`'s shared
+// body, serving the UNpositioned population — not a rung private to this site.
+function isTypeTy(name: string, isIx: i32) { annotResolve(name, annTsOf(isIx)) }
+
 // Apply a generic alias (`Box<i32>`, `Pair<i32,string>`, `Box<T>` under a live
 // type-param env): resolve the arguments in the CURRENT environment, check the
 // arity, bind the declared parameter names to the argument types, and resolve
@@ -6675,6 +6700,7 @@ function isPlainAliasRef(name: string) {
 // `nameToTy` and `singleMemberAliasName` must agree exactly or the checker and the emitter
 // diverge on the same annotation:
 //   - a PRIMITIVE member (`type Id = i32`, `type Name = string`) — always transparent;
+//   - a FUNCTION member (`type F = (i32) => i32`) — always transparent; see below;
 //   - an OBJECT member reached through a plain alias REFERENCE (`type MyCat = Cat`,
 //     `type Y = Box<i32>`) — transparent, because the emitter has no named-struct route to
 //     such an alias at all: it registers `N` as a one-variant union row (`unNames`), so
@@ -6685,6 +6711,21 @@ function isPlainAliasRef(name: string) {
 // An object member whose body is NOT a plain reference is the canonicalized INTERSECTION
 // (`type AB = {a:i32} & {b:i32}`) — that one IS interned as a named struct
 // (`unionStructAliasShape`) and works today, so it is deliberately left opaque.
+//
+// WHY THE FUNCTION MEMBER (D-ALIASFN). An arrow-bodied `type F = (i32) => i32` is a
+// one-member `UnionDecl` like every other non-`{…}` body, so without this arm `F` denotes
+// `TyUnion[TyFunc]` — and a union is not callable. Measured on the parent commit: EVERY
+// call through an alias-spelled function type is a CHECKER error, in every position
+// (global / local / param / return / narrowed-from-nullable), with the message
+// ``called value is not a function ((i32) -> i32)`` — which reads as nonsense precisely
+// because `tyToStr` renders a one-member union as its member. Downstream, the emitter's
+// `nulCloFlag` wants `TyNullable(TyFunc)` and gets `TyNullable(TyUnion[TyFunc])`, so an
+// alias-spelled nullable closure is a clean emit REJECT as a local, a param and a return
+// (#1133's four remaining located cells). Both are one defect: the degenerate wrapper. A
+// function type has no nominal emit route to lose — there is no `unNames`/`sNames` row a
+// declared function type could resolve THROUGH — so the transparency is unconditional
+// (no `isPlainAliasRef` gate, which exists only to keep the canonicalized intersection's
+// named-struct route alive).
 function singleAliasMemberTyIx(ti: i32, name: string) {
   const t = T.tys[ti]
   if t is TyUnion {
@@ -6692,6 +6733,7 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
       const m0 = t.uMembers[0]
       const mt = T.tys[m0]
       if mt is TyPrim { return m0 }
+      if mt is TyFunc { return m0 }
       if mt is TyObj {
         if isPlainAliasRef(name) { return m0 }
       }
@@ -9541,7 +9583,8 @@ function ifChainExhausts(ifIx: i32) {
       // Classify this arm's condition. Only a single `<ident> is T` (not null)
       // contributes to coverage; anything else makes the chain non-coverable.
       // A parenthesized arm (`else if (p is B)`) classifies like the bare one.
-      const cond = P.nodes[condUnderParens(node.ifCond)]
+      const condIx = condUnderParens(node.ifCond)
+      const cond = P.nodes[condIx]
       if cond is IsExpr {
         if cond.isVariant == "null" {
           allIsArms = false
@@ -9554,7 +9597,7 @@ function ifChainExhausts(ifIx: i32) {
             } else if placeName != obj.identName {
               allIsArms = false
             }
-            const tIx = nameToTy(cond.isVariant)
+            const tIx = isTypeTy(cond.isVariant, condIx)
             if tIx < 0 { allIsArms = false } else { testedTys.push(tIx) }
           } else {
             allIsArms = false
@@ -16222,7 +16265,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
         // pattern), so this arm is the wildcard.
         hasWild = true
       } else if pn is IsExpr {
-        const pt = nameToTy(pn.isVariant)
+        const pt = isTypeTy(pn.isVariant, patIx)
         if pt < 0 {
           sawBadPat = true
           tErr("unknown type '" + pn.isVariant + "' in match pattern", patIx)
@@ -17064,7 +17107,7 @@ function checkObjLitNode(n: ObjLit, _ix: i32) {
 // Extracted from `checkNodeReal`'s `IsExpr` arm (C3: thin the dispatcher).
 function checkIsExprNode(n: IsExpr, ix: i32) {
   const objTy = checkNode(n.isObj)
-  const chkTy = nameToTy(n.isVariant)
+  const chkTy = isTypeTy(n.isVariant, ix)
   // BANK the resolved check type on the `is` node: the emitter's narrowing stack
   // carries the narrowed type as an arena index from here, instead of re-classifying
   // the tested spelling at every read of the narrowed binding.
