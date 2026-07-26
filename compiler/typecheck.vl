@@ -8484,6 +8484,215 @@ function guardFactOf(exprIx: i32, paramNames: string[]) {
   -1
 }
 
+// ── numeric-opcode intrinsics ────────────────────────────────────────────────
+// The operations that ARE a single wasm instruction. They are not a library —
+// there is no runtime behind them, only an opcode — so the checker types them here
+// and the emitter writes the byte. Three families:
+//
+//   BITCASTS, width-named because they cross between the float and integer views:
+//     f32bits(x: f32): i32      i32.reinterpret_f32
+//     f64bits(x: f64): i64      i64.reinterpret_f64
+//     f32fromBits(b: i32): f32  f32.reinterpret_i32
+//     f64fromBits(b: i64): f64  f64.reinterpret_i64
+//   FLOAT ops, one name per operation with the WIDTH taken from the operands:
+//     sqrt · abs · floor · ceil · trunc · nearest      (1 argument)
+//     min · max · copysign                             (2 arguments)
+//   INTEGER ops, likewise width-directed:
+//     clz · ctz · popcnt                               (1 argument)
+//     rotl · rotr · divU · remU                        (2, yielding the width)
+//     ltU · leU · gtU · geU                            (2, yielding a boolean)
+//
+// The IEEE ones are bit-exact and fully specified, which is why they can be the whole
+// float vocabulary a deterministic program needs: `nearest` is round-half-to-EVEN,
+// `min`/`max` propagate NaN and order -0 below +0 (they are NOT `<`/`>`), `abs` and
+// `copysign` are sign-bit edits. Transcendentals are deliberately absent — no wasm
+// opcode computes one, so any `sin` would be a library whose last bit is a policy
+// choice, and a program that must match another implementation exactly has to own
+// that choice itself.
+//
+// The UNSIGNED integer ops are operations, not a type: an i32 IS signed in VL (`/` is
+// div_s, `<` is lt_s, `>>` is shr_s) and the unsigned instructions read the identical
+// bit pattern under a different interpretation. VL already settled this shape when it
+// spelled the unsigned shift as the OPERATOR `>>>` rather than introducing a `u32`;
+// `divU`/`ltU` are that decision continued, and they cost no new type, no new widening
+// edge and no second integer rep.
+
+// Is `name` bound by the PROGRAM — a declared function (hoisted, so a forward
+// reference counts) or any in-scope binding? A user definition wins over the
+// intrinsic of the same name, so adding an intrinsic can never capture a call that
+// already resolved to the program's own function. The emitter reads the same rule
+// off its collected function table (`fnIndexOf`), which the same declarations fill.
+function numIntrShadowed(name: string) {
+  if (fnDeclIx[name] ?? -1) >= 0 { return true }
+  lookup(name) >= 0
+}
+
+// The ARGUMENT type of the bitcast named `name`, or -1 when it is not a bitcast.
+function bitcastArgTy(name: string) {
+  if name == "f32bits" { return TY_F32 }
+  if name == "f64bits" { return TY_F64 }
+  if name == "f32fromBits" { return TY_I32 }
+  if name == "f64fromBits" { return TY_I64 }
+  -1
+}
+
+// The RESULT type of the bitcast named `name` — the SAME 32/64 bit width read at the
+// other type, which is the whole point: no value conversion, only a reinterpretation.
+function bitcastRetTy(name: string) {
+  if name == "f32bits" { return TY_I32 }
+  if name == "f64bits" { return TY_I64 }
+  if name == "f32fromBits" { return TY_F32 }
+  if name == "f64fromBits" { return TY_F64 }
+  -1
+}
+
+// Type the bitcast call `name(arg)`, or -1 when `name` is not a bitcast. Arity and the
+// argument type are checked here; `assignableExpr` (not bare `assignable`) so a float
+// LITERAL argument re-encodes into an `f32` parameter, matching every other f32 position.
+function bitcastCallTy(name: string, n: Call, ix: i32) {
+  const want = bitcastArgTy(name)
+  if want < 0 { return -1 }
+  const args = n.callArgs
+  if args.length != 1 {
+    tErr(name + " expects 1 argument, got " + i32ToStr(args.length), ix)
+  } else {
+    const got = checkNode(args[0])
+    if !assignableExpr(args[0], got, want) {
+      tErr(name + " expects " + tyToStr(want) + ", got " + tyToStr(got), ix)
+    }
+  }
+  bitcastRetTy(name)
+}
+
+// Is `name` one of the numeric-opcode intrinsics at all? The emitter's import scan asks
+// this: an intrinsic RESULT type appears nowhere as an annotation (`f64bits(x)` is an
+// i64, `f32fromBits(b)` an f32), so the scan that decides the `__print_*__` imports has
+// to recognize the call itself and read its recorded type.
+export function isNumIntrinsicName(name: string) {
+  if bitcastArgTy(name) >= 0 { return true }
+  if floatIntrArity(name) > 0 { return true }
+  intIntrArity(name) > 0
+}
+
+// How many arguments the FLOAT intrinsic `name` takes, or 0 when it is not one.
+function floatIntrArity(name: string) {
+  if name == "sqrt" { return 1 }
+  if name == "abs" { return 1 }
+  if name == "floor" { return 1 }
+  if name == "ceil" { return 1 }
+  if name == "trunc" { return 1 }
+  if name == "nearest" { return 1 }
+  if name == "min" { return 2 }
+  if name == "max" { return 2 }
+  if name == "copysign" { return 2 }
+  0
+}
+
+// How many arguments the INTEGER intrinsic `name` takes, or 0 when it is not one.
+function intIntrArity(name: string) {
+  if name == "clz" { return 1 }
+  if name == "ctz" { return 1 }
+  if name == "popcnt" { return 1 }
+  if name == "rotl" { return 2 }
+  if name == "rotr" { return 2 }
+  if name == "divU" { return 2 }
+  if name == "remU" { return 2 }
+  if name == "ltU" { return 2 }
+  if name == "leU" { return 2 }
+  if name == "gtU" { return 2 }
+  if name == "geU" { return 2 }
+  0
+}
+
+// Is `name` one of the unsigned COMPARISONS? Those yield a boolean; every other
+// integer intrinsic yields the operand width (the wasm instructions do exactly this —
+// `i64.lt_u` leaves an i32, `i64.clz` an i64).
+function intIntrIsCompare(name: string) {
+  if name == "ltU" { return true }
+  if name == "leU" { return true }
+  if name == "gtU" { return true }
+  name == "geU"
+}
+
+// Does the argument at `argIx`, of type `ty`, make the whole operation f64? A GENUINE
+// f64 does; a bare float LITERAL does not, because it re-encodes exactly at f32 and so
+// adapts DOWN to an f32 operand. This is the rule the binary operators already run on
+// (`f32var + 1.0` stays f32, `f32var + f64var` widens), so an intrinsic and an operator
+// applied to the same operands compute at the same width.
+function argForcesF64(argIx: i32, ty: i32) {
+  if primNameOf(ty) != "f64" { return false }
+  !isFloatLitExpr(argIx)
+}
+
+// The WIDTH a float intrinsic call computes at: f32 when an operand is genuinely f32 and
+// none is genuinely f64, else f64. All-integer operands therefore land on f64, where they
+// widen losslessly — `sqrt(2)` is the f64 square root, as `2 / 1.0` is f64 division.
+function floatIntrWidth(argIxs: i32[], argTys: i32[]) {
+  let sawF32 = false
+  let i = 0
+  while i < argTys.length {
+    if argForcesF64(argIxs[i], argTys[i]) { return TY_F64 }
+    if primNameOf(argTys[i]) == "f32" { sawF32 = true }
+    i = i + 1
+  }
+  if sawF32 { return TY_F32 }
+  TY_F64
+}
+
+// The WIDTH an integer intrinsic call computes at: i64 when an operand is i64 (the i32
+// side widens losslessly), else i32 — the selection rule the i64 binary operators use.
+function intIntrWidth(argTys: i32[]) {
+  let i = 0
+  while i < argTys.length {
+    if primNameOf(argTys[i]) == "i64" { return TY_I64 }
+    i = i + 1
+  }
+  TY_I32
+}
+
+// Type the float / integer intrinsic call `name(args…)`, or -1 when `name` is not one.
+// The operand width is decided from the arguments and every argument is then checked
+// against it, so a mixed call reports the width it actually computes at.
+function numIntrCallTy(name: string, n: Call, ix: i32) {
+  const isFloat = floatIntrArity(name) > 0
+  let arity = intIntrArity(name)
+  if isFloat { arity = floatIntrArity(name) }
+  if arity == 0 { return -1 }
+  const args = n.callArgs
+  if args.length != arity {
+    let want = i32ToStr(arity) + " arguments"
+    if arity == 1 { want = "1 argument" }
+    tErr(name + " expects " + want + ", got " + i32ToStr(args.length), ix)
+    // Still yield a type so the call site does not cascade: the width is unknowable
+    // from a wrong-arity call, so take the family's default.
+    if isFloat { return TY_F64 }
+    if intIntrIsCompare(name) { return TY_BOOL }
+    return TY_I32
+  }
+  const argTys: i32[] = []
+  let i = 0
+  while i < args.length {
+    argTys.push(checkNode(args[i]))
+    i = i + 1
+  }
+  let width = intIntrWidth(argTys)
+  if isFloat { width = floatIntrWidth(args, argTys) }
+  let j = 0
+  while j < args.length {
+    if !assignableExpr(args[j], argTys[j], width) {
+      tErr(
+        name + " expects " + tyToStr(width) + ", got " + tyToStr(argTys[j]),
+        ix,
+      )
+    }
+    j = j + 1
+  }
+  if !isFloat {
+    if intIntrIsCompare(name) { return TY_BOOL }
+  }
+  width
+}
+
 // A call expression: array-method builtins (`xs.push`), string-method builtins
 // (`.slice`/`.indexOf`/`.includes`/`.charCodeAt`), the `print`/`fromCodePoint`
 // builtins, then the generic function-call path (arity + per-arg assignability).
@@ -9036,6 +9245,16 @@ function checkCallNode(n: Call, ix: i32) {
         }
       }
       return TY_VOID
+    }
+    // The NUMERIC-OPCODE intrinsics: each lowers to exactly one wasm instruction, so
+    // the checker only has to type them. A user BINDING of the same name shadows the
+    // intrinsic (`numIntrShadowed`), and the emitter gates on the same rule — the
+    // intrinsic arm is a fallback for a name the program did not define itself.
+    if !numIntrShadowed(cfn.identName) {
+      const bcTy = bitcastCallTy(cfn.identName, n, ix)
+      if bcTy >= 0 { return bcTy }
+      const niTy = numIntrCallTy(cfn.identName, n, ix)
+      if niTy >= 0 { return niTy }
     }
   }
   const fnTy = checkNode(n.callFn)
