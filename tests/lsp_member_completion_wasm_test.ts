@@ -141,17 +141,31 @@ Deno.test({
       throw new Error(`expected \`${f}\` as a function builtin, got ${JSON.stringify(byName.get(f))}`);
     }
   }
-  assertEquals(byName.get("print")?.detail, "(any) -> null", "print signature");
+  // `print`'s rendered signature is the set the pipeline actually admits, not a
+  // placeholder: exactly one argument, of a type with a printable runtime rep, and a
+  // `void` result. `any` is not a VL type (`unknown type 'any'`) and the result is not
+  // `null` (it binds to nothing and compares to nothing) — the two claims the previous
+  // rendering made. This is the compiler's own string (`builtinScan`), so it is what
+  // both the LSP and the playground show.
+  assertEquals(
+    byName.get("print")?.detail,
+    "(i32 | i64 | f32 | f64 | boolean | string) -> void",
+    "print signature",
+  );
 });
 
 Deno.test("builtinCompletionsFromWasm: maps 0/1 kinds to type/function", () => {
   const out = builtinCompletionsFromWasm([
     { name: "i32", kind: 0, detail: "i32" },
-    { name: "print", kind: 1, detail: "(any) -> null" },
+    { name: "print", kind: 1, detail: "(i32 | boolean) -> void" },
     { name: "bare", kind: 0, detail: "" },
   ]);
   assertEquals(out[0], { name: "i32", kind: "type", detail: "i32" });
-  assertEquals(out[1], { name: "print", kind: "function", detail: "(any) -> null" });
+  assertEquals(out[1], {
+    name: "print",
+    kind: "function",
+    detail: "(i32 | boolean) -> void",
+  });
   assertEquals(out[2], { name: "bare", kind: "type", detail: undefined });
 });
 

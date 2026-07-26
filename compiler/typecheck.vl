@@ -5237,16 +5237,25 @@ function tsToTy(ix: i32) {
   // A string-keyed MAP `{[K]: V}`. The key is a bare identifier TOKEN, not a
   // parsed type, so it rides `tsText`; only string keys are supported (the
   // host's map rep), and a non-string key resolves to -1 for "unknown type".
-  // The value is resolved UNCONDITIONALLY into the constructor, and is NOT
-  // poison-checked — as on the string side.
+  // An UNRESOLVED VALUE poisons the annotation, like the array/union arms: a
+  // `mkMapTy(str, -1)` here would be indistinguishable from the empty-`Map()`
+  // INFERENCE hole, so the checker would accept `{[string]: nope}` in silence
+  // and the emitter would lower a value slot it has no type for.
   if k == TS_MAP {
     const mk = tsLeafTy(tsText[ix])
     if mk != TY_STR { return -1 }
-    return mkMapTy(mk, tsToTy(tsKids[start]), 0)
+    const mvTy = tsToTy(tsKids[start])
+    if mvTy < 0 { return -1 }
+    return mkMapTy(mk, mvTy, 0)
   }
   // An INLINE OBJECT type `{x: T, y: U}`. A field whose NAME failed to parse
   // renders `":T"`, whose first top-level colon is at index 0 — the string arm's
   // `colonAt > 0` drops it, so an empty field name drops here too.
+  // An UNRESOLVED FIELD TYPE poisons the annotation (-1, "unknown type
+  // '{bar: nope}'") for the same reason the array arm poisons its element:
+  // storing the -1 sentinel in `objFieldTypes` leaks it to every consumer that
+  // indexes `T.tys` by a field type — a checker CRASH at the ones that assume
+  // resolution succeeded (`unionArmSeedSafe`).
   if k == TS_OBJ {
     const fnames: string[] = []
     const ftys: i32[] = []
@@ -5255,8 +5264,10 @@ function tsToTy(ix: i32) {
       const fdIx = tsKids[start + fi]
       if tsKind[fdIx] == TS_FIELD {
         if tsText[fdIx].length > 0 {
+          const fdTy = tsToTy(tsKids[tsKidStart[fdIx]])
+          if fdTy < 0 { return -1 }
           fnames.push(tsText[fdIx])
-          ftys.push(tsToTy(tsKids[tsKidStart[fdIx]]))
+          ftys.push(fdTy)
         }
       }
       fi = fi + 1
@@ -5397,7 +5408,10 @@ function nameToTy(name: string) {
   // Split at the FIRST "]:" — the key (between "{[" and "]:") cannot contain `]`,
   // so a nested-map VALUE (`{[string]:{[string]:i32}}`) splits correctly. Only
   // string keys are supported (the host's map rep); a non-string key resolves to
-  // -1 so the caller reports "unknown type".
+  // -1 so the caller reports "unknown type". An UNRESOLVED VALUE poisons the
+  // annotation too — the `mkMapTy(str, -1)` it would otherwise build is the
+  // empty-`Map()` INFERENCE hole, which every consumer reads as "not yet known"
+  // rather than "no such type".
   if nlen >= 5 {
     if name[0] == '{' && name[1] == '[' && name[nlen - 1] == '}' {
       let mi = 2
@@ -5405,7 +5419,9 @@ function nameToTy(name: string) {
         if name[mi] == ']' && name[mi + 1] == ':' {
           const mk = nameToTy(name.slice(2, mi))
           if mk != TY_STR { return -1 }
-          return mkMapTy(mk, nameToTy(name.slice(mi + 2, nlen - 1)), 0)
+          const mv = nameToTy(name.slice(mi + 2, nlen - 1))
+          if mv < 0 { return -1 }
+          return mkMapTy(mk, mv, 0)
         }
         mi = mi + 1
       }
@@ -5414,7 +5430,10 @@ function nameToTy(name: string) {
   // An INLINE OBJECT type `{x:T,y:U}` (the parser's synthetic anonymous-struct
   // name — starts `{` but not `{[`). Split the TOP-LEVEL commas (depth-aware: a
   // field's own map/object/array commas don't split), then each field at its first
-  // top-level `:`, and build the structural TyObj.
+  // top-level `:`, and build the structural TyObj. An UNRESOLVED FIELD TYPE
+  // poisons the annotation, like the array arm's element: the -1 sentinel stored
+  // in `objFieldTypes` is read back by every consumer that indexes `T.tys` by a
+  // field type, and the ones that assume resolution succeeded CRASH on it.
   if nlen >= 2 {
     if name[0] == '{' && name[nlen - 1] == '}' {
       const fnames: string[] = []
@@ -5434,8 +5453,10 @@ function nameToTy(name: string) {
         if field.length > 0 {
           const colonAt = tyTopIndexOf(field, ':', 0, 0)
           if colonAt > 0 {
+            const fdTy = nameToTy(field.slice(colonAt + 1, field.length))
+            if fdTy < 0 { return -1 }
             fnames.push(field.slice(0, colonAt))
-            ftys.push(nameToTy(field.slice(colonAt + 1, field.length)))
+            ftys.push(fdTy)
           }
         }
         fstart = fend + 1

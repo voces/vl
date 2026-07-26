@@ -10475,60 +10475,10 @@ export function nameFieldCode(t: string) {
 // `structIndexOfObj`, and `S|null` returns/params resolve their base shape.
 // Idempotent per field-name set; a module with no inline object annotation interns
 // nothing (byte-identical goldens).
-// Split union name `nm` on TOP-LEVEL `|`, tracking ALL grouper depth — braces, brackets, AND
-// parens (plus string-literal atoms, so a quoted litunion member never splits) — appending the
-// arms to `out`. The paren-aware sibling of `splitUnionAtoms` (whose brace/bracket-only depth
-// mis-splits a `(...)`-grouped arm): used ONLY by `internShapeDeep`'s union-arm interning, where
-// a grouped arm must stay whole (`(i32|null)[] | null` → `(i32|null)[]` + `null`; a struct arm
-// with a grouped element list `{f: (boolean|string)[]} | f64` splits at its real top seam). A
-// TOP-LEVEL `=>` absorbs the rest of the name into the current arm, exactly like
-// `splitUnionAtoms`: `(i32) => i32 | {w: i32}` is ONE function-type atom whose `|` binds to the
-// RETURN (splitting it interned a bogus `{w: i32}` struct arm — a shape-order side effect that
-// regressed the pinned net). A name with no top-level `|` appends one arm.
-function splitUnionArmsAllDepth(nm: string, out: string[]) {
-  let depth = 0
-  // The generic-application brackets are a grouper too (D-GENBRACKET), so a union
-  // ARGUMENT (`Box<i32|null>`) stays ONE arm instead of splitting into the garbage
-  // atoms `Box<i32` + `null>`. `>` closes only against an OPEN `<` (`tyGtIsClose`):
-  // `tyToStr`'s `->` and the `$fnsig` key's `ii>i` both spell a `>` that closes
-  // nothing, and counting those runs the depth NEGATIVE.
-  let angOpen = 0
-  let inStr = false
-  let start = 0
-  let i = 0
-  while i < nm.length {
-    const c = nm[i]
-    if inStr {
-      if c == '"' { inStr = false }
-    } else if c == '"' {
-      inStr = true
-    } else if c == '{' || c == '[' || c == '(' {
-      depth = depth + 1
-    } else if c == '<' {
-      depth = depth + 1
-      angOpen = angOpen + 1
-    } else if c == '}' || c == ']' || c == ')' {
-      depth = depth - 1
-    } else if c == '>' && tyGtIsClose(nm, i, angOpen) {
-      depth = depth - 1
-      angOpen = angOpen - 1
-    } else if (
-      c == '=' &&
-      depth == 0 &&
-      i + 1 < nm.length &&
-      nm[i + 1] == '>'
-    ) {
-      // Top-level function arrow: the remainder (its return, `|`s included) is this arm's.
-      break
-    } else if (c == '|' && depth == 0) {
-      out.push(nm.slice(start, i))
-      start = i + 1
-    }
-    i = i + 1
-  }
-  out.push(nm.slice(start, nm.length))
-  0
-}
+// (ORPHAN: this paragraph documents `emit_collect.collectAnnShapes`, which moved out of this
+// file and left its doc behind — `collectAnnShapes` carries none. Left in place because
+// `emit_collect.vl` is not this slice's file; the blank line below keeps it from reading as
+// `internShapeArms`'s header, which is what it looked like once the function between them went.)
 
 // Intern each union arm whose CORE (trailing `[]`s peeled) is an INLINE `{…}` shape (a struct or
 // map arm) via `internShapeDeep` — the shared body of the paren-free and paren-carrying splits.
@@ -10585,7 +10535,7 @@ export function internShapeDeep(nm: string) {
     // unsupported-field shape un-interned — a clean reject, never invalid wasm).
     if strContains(nm, "=>") {
       const vArms: string[] = []
-      splitUnionArmsAllDepth(nm, vArms)
+      splitUnionAtoms(nm, vArms)
       let va = 0
       while va < vArms.length {
         const vc = monoUnwrapParens(vArms[va])
@@ -10604,16 +10554,18 @@ export function internShapeDeep(nm: string) {
   // `collectAnnShapes`, BEFORE the literal that carries it is seen by `collectAnonShapes` (which would
   // otherwise name the same shape `#anonN`, leaving the union-arm's name-based `refArrElemName` /
   // `unionHasRefArrayArmSlot` lookup unable to find the reflist slot the literal interns — a silent
-  // fall-through to scalar-boxing, invalid wasm). A PAREN-FREE name splits via `splitUnionAtoms`
-  // (its legacy brace/bracket-depth behavior, kept byte-identical) and RETURNS — the descent below
-  // is for non-union names. A PAREN-CARRYING name (`{f: (boolean | string)[]} | f64` — a struct arm
-  // whose FIELD groups a union element) previously skipped arm interning entirely (`splitUnionAtoms`
-  // is paren-blind, so a `(...)`-grouped arm mis-splits): its `{`-cored arm then interned only
-  // LAZILY at emit, AFTER `collectA`'s type-index assignment, so the arm's ref-list FIELD element
-  // (`boolean|string`) had no interned slot and `pushFieldStorage` read `rlWrapIdx` out of bounds —
-  // a compiler CRASH (empty table) or a wrong wrapper. Split those on ALL-grouper depth (parens
-  // included, so grouped arms stay whole), intern the `{`-cored arms, then FALL THROUGH to the
-  // legacy paren descent (closure unions etc. keep their existing path).
+  // fall-through to scalar-boxing, invalid wasm). BOTH branches split with the ONE home
+  // `splitUnionAtoms` — it tracks parens, brackets, braces AND `<>` (the D-REFARRKIND-era
+  // "paren-blind" reading of it is stale; its own header now spells the paren rule out). The
+  // PAREN-FREE branch RETURNS after interning — the descent below is for non-union names — while
+  // a PAREN-CARRYING name (`{f: (boolean | string)[]} | f64`, a struct arm whose FIELD groups a
+  // union element) interns its `{`-cored arms and then FALLS THROUGH to the paren descent
+  // (closure unions etc. keep their existing path). That control-flow difference is the whole
+  // difference; the SPLIT is the same query. Before parens were understood, a grouped arm
+  // mis-split here and its `{`-cored arm interned only LAZILY at emit, AFTER `collectA`'s
+  // type-index assignment, so the arm's ref-list FIELD element (`boolean|string`) had no interned
+  // slot and `pushFieldStorage` read `rlWrapIdx` out of bounds — a compiler CRASH (empty table)
+  // or a wrong wrapper.
   if !strContains(nm, "(") {
     const uArms: string[] = []
     splitUnionAtoms(nm, uArms)
@@ -10623,7 +10575,7 @@ export function internShapeDeep(nm: string) {
     }
   } else {
     const pArms: string[] = []
-    splitUnionArmsAllDepth(nm, pArms)
+    splitUnionAtoms(nm, pArms)
     if pArms.length > 1 { internShapeArms(pArms) }
   }
   if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
@@ -11982,7 +11934,7 @@ export function forceCloResultMapTypes(nm: string) {
   // allocation, before the arm split allocates anything.
   if !strContains(nm, "=>") || !strContains(nm, "{[") { return 0 }
   const arms: string[] = []
-  splitUnionArmsAllDepth(nm, arms)
+  splitUnionAtoms(nm, arms)
   let i = 0
   while i < arms.length {
     const a = monoUnwrapParens(arms[i])
@@ -12028,7 +11980,7 @@ export function forceCloResultListTypes(nm: string) {
   // and an array can carry a closure-result list — two substring scans, no allocation.
   if !strContains(nm, "=>") || !strContains(nm, "[]") { return 0 }
   const arms: string[] = []
-  splitUnionArmsAllDepth(nm, arms)
+  splitUnionAtoms(nm, arms)
   let i = 0
   while i < arms.length {
     const a = monoUnwrapParens(arms[i])
