@@ -8927,3 +8927,460 @@ picks the structural route whenever a root exists. P4 only has to make a root ex
     leaf only ever sees a spelling nobody writes). The fixture that closes it pins a STAGE — an
     emit-stage rejection that becomes a checker-stage rejection the moment the arm breaks — which
     is available even though the program cannot run and no message-level pin exists.
+
+## D-COERCEKIND + D-EQOPCODE + D-BLOCKTY + D-RESIDUE — the union CARRIER ladder stops synthesizing a spelling, the box ABI's last two kind tables get ONE home, and the `??` residual render is measured DEAD (#1136)
+
+Branched at `f82263e`, rebased through **`88288c9`** (#1133 D-NULCLOALIAS + #1135 docs) onto
+**`47b98e6`** (#1134 D-TSTY — a 445-line `typecheck.vl` change). The four files this slice owns
+(`wasmEmit` / `emit_rep` / `emit_state` / `emit_rewrite`) are **byte-identical across all three
+bases** — `git diff f82263e 47b98e6 -- <the four>` is empty — so every number below was taken
+at `f82263e` and RE-TAKEN at each rebase, and every one reproduces. Where a channel's
+population changed (the corpus grew by #1133's four fixtures and #1134's one) all readings are
+given. Method note 68: a slice that quotes a number taken at its branch point is quoting a
+stale lead.
+
+Four things, in `compiler/wasmEmit.vl` + `compiler/emit_rep.vl`:
+
+1. **D-COERCEKIND** — `emitUnionCoerce`'s carrier ladder settles the value-atom CODE, not a
+   type SPELLING it then parses back one line later.
+2. **D-EQOPCODE** — the union `==` payload-compare OPCODE joins the kind→ABI tables.
+3. **D-BLOCKTY** — the `??` value BLOCKTYPE and its default-emit dispatch, four hand-copied
+   ladders each, get one home apiece.
+4. **D-RESIDUE** — the rendered `… | null` residual is built only where the bank declines, and
+   the decline is measured at **0 reaches** on both channels.
+
+Plus TARGET 1's residue: `emitNarrowedMem`'s `mAtom == "string"`, which #1128 deliberately left.
+
+### The counting method, and the UNITS
+
+**Unit: CALL SITES** — a textual `name(` in non-comment, non-string-literal code, with the
+resolver's own `function name(` / `export function name(` header excluded. String literals are
+BLANKED (not just `//`-stripped) before matching, so a resolver named inside a diagnostic
+string is never counted. Per-file sums are cross-checked against the tree-wide total.
+
+The counter reproduces **#1130's `emit_classify.vl` = 312** exactly on this head, which is the
+calibration that makes the numbers below comparable to the previous slices'.
+
+Three units appear, and they are NOT interchangeable:
+
+- **the parser list** — the SCORECARD CORRECTION's 19 resolvers plus D-ARROWTY's four
+  (`refArrElemKind` / `nameIsI32ListArray` / `nameIsMapArray` / `nullClosureArrElem`);
+- **the value-atom classifier family** — #1128's six (`valueAtomKind`, `scalarTagOf`,
+  `vbHeapIdxOfAtom`, `atomEqOpcode`, `removeAtomFromSet`, `strContains` over a type spelling)
+  plus `isValueUnionName`;
+- **whole-spelling EQUALITY tests** against a type name (`atom == "f64"`), which are not calls
+  at all.
+
+| unit | scope | master `47b98e6` | now | delta |
+|---|---|---|---|---|
+| parser list | 4 owned files | 13 | **13** | **0** |
+| parser list | tree-wide | 523 | **523** | **0** |
+| value-atom family | 4 owned files | 30 | **27** | **−3** |
+| value-atom family | tree-wide | 124 | **121** | **−3** |
+| whole-spelling equality tests | 4 owned files | — | — | **−7 deleted, 0 added** |
+
+The tree-wide delta equals the partition delta exactly, in both families — nothing outside the
+four owned files changed. That is a cross-check, not a second measurement.
+
+### TARGET 2's census: 83 is not reproducible, 52 is not either, and here is a number that is
+
+The brief quotes **83 operations, 100% consumer** for `wasmEmit.vl`; #1128 could not reproduce
+it and offered **52** as the widest filter it could justify. Neither figure follows from any
+stated resolver list at this head, so this slice states its own filter and its own unit. Every
+figure below is identical at `f82263e`, `88288c9` and `47b98e6`.
+
+**Filter F: a call site in `wasmEmit.vl` whose ARGUMENT is a rendered type SPELLING and whose
+callee decides its answer by taking that spelling apart.** Argument-is-a-NODE queries are
+excluded (they are not consumers of a render); so are resolvers whose body was read and found
+to be arena-only. Membership was decided by a one-hop body audit of every candidate, printed
+per resolver, not by intuition:
+
+| resolver | in Filter F? | evidence in its own body |
+|---|---|---|
+| the parser list (23) | yes | by definition |
+| `valueAtomKind` / `scalarTagOf` / `vbHeapIdxOfAtom` / `atomEqOpcode` | yes | literal-compare ladders over the spelling |
+| `removeAtomFromSet` | yes | `removeAtomFrom` string surgery as its fall-through |
+| `isValueUnionName` | yes | `splitUnionAtoms`, `unionMemberCount`, `valueAtomKind` |
+| `unionHasAtom` / `unionHasValueAtom` | yes | `splitUnionAtoms` (+ `valueAtomKind`) |
+| `unionClosureArmName` | yes | `splitUnionAtoms`, `valueAtomKind` (its fall-through) |
+| `unionHasMapArmSlot` / `unionHasCollapsedStringMapArm` | yes | `splitUnionAtoms`, `mapValNameOf`, `nameIsMap` |
+| `nameIsWholeSpanShape` / `nameIsLitUnionArmValueUnion` | yes | span scan / `splitUnionAtoms` |
+| **`unionHasAtomTy`** | **no** | arena-only since D-UHATOTAL — and it is **27 calls in `wasmEmit`**, by far the biggest single inflator of any naive count |
+| `unionHasRefArrayArmSlot` / `unionNestedArrayArmSlot` / `unionRefArrayArmSlotForElem` / `unionRefArrayArmSlotForMapElem` | no | arena / slot lookups |
+| `msSetOfText` / `msMemberAtomsOf` / `unionMemberSetOf` / `unionRowOf` | no | whole-string RESOLUTIONS (a name is a name) — counted separately as name-keyed resolutions |
+| `narrowVariantFor` / `unionNameOfIdent` / `sFieldElemNameAt` / `unionEqAtomOf` | no | table reads / node queries; the spellings they RETURN are counted at the consumer that parses them |
+| `narrowedValueAtomOf` / `narrowedRefArrayOf` / `narrowedMapOf` | no | argument is a BINDING name, not a type; their internal parses are `emit_classify`'s |
+
+| Filter F | master `47b98e6` | now | delta |
+|---|---|---|---|
+| `wasmEmit.vl` | **39** | **36** | **−3** |
+| the 4 owned files | **51** | **48** | **−3** |
+| tree-wide | 644 | 641 | −3 |
+
+So: **`wasmEmit.vl` holds 39 spelling-consuming call sites, not 83.** The four-file total of
+**51** is within one of #1128's 52, which is the likeliest reading of what that figure counted;
+83 does not correspond to any list this slice could construct without counting `unionHasAtomTy`
+(arena) and the name-keyed resolutions as parses.
+
+### 1. D-COERCEKIND — a SYNTHESIS site that banked a spelling
+
+`emitUnionCoerce` classifies the carrier flowing into a value union with an eleven-arm ladder
+(`exprString` → `"string"`, `exprStringArray` → `"string[]"`, … `exprIsBool` → `"boolean"`,
+default `"i32"`), then ran `valueAtomKind(atom)` — a parse of a string **the ladder had just
+minted**, one line before its first use. Downstream, `atom` decided nothing but projections of
+that code: the box tag (`scalarTagOfKind`), the rides-the-anyref test (`atomIsRefKind`), the
+scalar value box (`vbHeapIdxOfKind`), and six `atom == …` compares (the f64→f32 literal
+re-encode, the i32[]→i64[]/f64[]/f32[] list adoption, the f64[]→f32[] list re-encode, and the
+widened-operand emit ×3).
+
+The ladder now assigns the code. **Why it is EXACT, not a fold:** `valueAtomKind`'s first six
+arms are literal compares against six distinct lexemes, and its list arms give one code per
+backing; the eleven spellings this ladder can produce map to eleven codes injectively
+(`"i32"`→0, `"boolean"`→1, `"string"`→2, `"i64"`→3, `"f64"`→4, `"f32"`→5, `"i32[]"`→7,
+`"f64[]"`→8, `"string[]"`→9, `"i64[]"`→10, `"f32[]"`→12), and the map is a bijection **on this
+ladder's image** in both directions — `"boolean[]"` and a litunion array also code 7, but this
+ladder cannot produce either. So `atom == "i32[]"` ⇔ `cak == 7` here, and likewise for the
+other five compares. The local `atom` is gone: nothing in this function renders a type any more.
+
+- **1 `valueAtomKind` call deleted. 6 whole-spelling equality tests deleted. 11 string literals
+  stop being minted at a synthesis site** (the brief's "do NOT bank spellings at synthesis
+  sites", applied to the one site in this file that did).
+
+### 2. D-EQOPCODE — the fifth projection of the same code
+
+`atomEqOpcode(atom)` (`emit_base`) is `valueAtomKind(atom)` plus a four-arm kind table, and it
+has exactly **two call sites compiler-wide, both in `wasmEmit`, both already holding the code**:
+
+- `emitUnionConcreteEq` derived `eak` for the box tag, the `string` special-cases and the
+  payload unbox — and then handed the callee `atom` to re-derive it for the compare opcode;
+- `emitUnionUnionEq`'s `armK` comes out of `recordUnMemTys`' banked `unMemValKind` column and
+  had already decided **two tag compares and both payload unboxes** — and then handed the
+  callee `arms[k]`.
+
+`atomEqOpcodeOfKind(k)` lives in `emit_rep`, beside `scalarTagOfKind` / `vbHeapIdxOfKind` /
+`nullBoxTag`, because every other kind→ABI projection already does. #1128 filed this as an
+`emit_base` split and declined to move the table unilaterally, on the ground that a moved table
+leaves a hand-kept duplicate. **That hazard is closed by the same slice:** with both call sites
+migrated, `emit_base`'s `atomEqOpcode` has **ZERO callers compiler-wide** (re-verified with the
+dead-scan below), so there is no second live table to drift from. Its one-line deletion is a
+hand-off, exactly as #1125 left `mapTagOf` / `refArrTagOf` for #1130.
+
+- **2 `atomEqOpcode` calls deleted; 2 `valueAtomKind` runs removed from the PATH** (they were
+  inside it).
+
+### 3. D-BLOCKTY — four copies of the box ABI's blocktype column, and four of its emit dispatch
+
+The `??` / map-get residual sites — `emitMapGetOrUnionBox` and `emitCoalesce`'s ident / call /
+struct-field arms — each carried, in place:
+
+```
+let Xbt = 127
+if Xak == 3 { Xbt = 126 } … if Xak == 4 { Xbt = 124 } … if Xak == 5 { Xbt = 125 }
+fbIf(Xbt)
+…
+if Xak == 3 { emitExprAsI64(…) } else if Xak == 4 { emitExprAsF64(…) } else if Xak == 5 { emitExprAsF32(…) } else { emitExpr(…) }
+```
+
+Four copies of each, on the same code, twelve and sixteen arms in all. They are now
+`valBlockTypeOfKind(k)` (`emit_rep`, beside the tag and value-box tables) and
+`emitExprAsKind(body, ix, k, fnIx)` (`wasmEmit`, beside the three widening helpers it
+dispatches). This is D-ELEMHOME's move applied to the box ABI's blocktype column, and it is
+pinned the way method note 67 says a dedup must be: **a one-place edit reddens where the
+pre-refactor edit would have had to be made four times** (S-BLOCKTY, S-ASKIND, S-F32 below).
+
+### 4. D-RESIDUE — the rendered residual, and a decline path measured at ZERO reaches
+
+Four sites ask "what single member survives removing `null`", and each did it twice:
+
+```
+const rest = removeAtomFromSet(unm, "null")     // resolve the set, clear the null bits, RENDER
+let ak = unionResidualSoloKind(unm)             // …and read the SAME answer out of the bank
+if ak == -2 { ak = valueAtomKind(rest) }        // the rendering is used ONLY here
+```
+
+`removeAtomFromSet` ran on **every** call and its result was consumed only in the decline
+branch. It now lives inside that branch. That is code motion, not a migration — so the question
+that decides whether it matters is method note 10's: is the decline path CONSEQUENTIAL?
+
+Three probe builds, each an immediate `emitFail` marker (so a fire is a build-status +
+message + run diff, visible in the same sweep harness the A/B uses):
+
+| probe | fires when | corpus `f82263e` (1,330) | corpus `88288c9` (1,336) | fuzz (50,400 programs/side) |
+|---|---|---|---|---|
+| **P-SITE** (comparator sanity) | the four sites are reached at all | **19 files** | — | — |
+| **P-RCH** | `unionResidualSoloKind` returns −2 | **0** | **0** | **0** (52,708 output files/side, 0 differing paths) |
+| **P-CONS** | −2 AND the fall-through's answer passes the site's gate | **0** | — | — |
+
+**A 0 with a live comparator.** P-SITE is the sanity that method notes 1 and 12 demand: the
+sites ARE reached, on 19 corpus files (`types/null-coalesce.vl`, `types/i64-value-union.vl`,
+`maps/coalesce-stored-null.vl`, `functions/coalesce-call-lhs.vl`, six `soundness/*`, …), and
+the marker mechanism IS visible in this harness. The decline inside them is what never happens.
+
+**And the MECHANISM, not just the measurement.** `unionResidualSoloKind(set)` declines exactly
+when `msSetOfText(set)` does, and `msSetOfText` matches a row's `unMemberSet` TEXT — so the
+declining population is a set spelling no row registered, i.e. an ALIAS name (`msSetOfText`'s
+own comment says an alias "lands here deliberately"). That population is **rejected by the
+CHECKER before emit**: `type N = i32 | null` … `print(x ?? 0)` fails with *"print of a union
+value (i32 | null) is type-valid but not yet supported by codegen"*, where the inline
+`x: i32 | null` spelling of the same program compiles and runs (`types/null-coalesce.vl`). The
+`??` result of an alias-spelled nullable stays union-typed. Written out and re-verified on both
+bases.
+
+**So the fall-through is not deleted.** A path that is unreachable *because a neighbouring layer
+rejects first* is not the same as a path that cannot exist: deleting it would turn the map site
+into a loud reject and the three `??` sites into a silent fall-through to the generic path, on
+the day the checker admits the alias form. The finding is recorded, the render is off the hot
+path, and the deletion is a hand-off gated on the checker question (below). A documented blocker
+with its mechanism beats a premature verdict.
+
+### TARGET 1 — the three items, each closed
+
+1. **`emitNarrowedMem`'s `mAtom == "string"` → `mk == 2`.** Taken. `mk` is
+   `valueAtomKind(mAtom)`, bound one line above; `valueAtomKind` answers 2 for the spelling
+   `string` and for nothing else. It is the VARIANT-field twin of the struct-field read #1128
+   migrated eleven hundred lines down, and it is pinned by the PRE-EXISTING corpus
+   (S-MEMSTR reddens `unions/struct-field-union-arm-nesting.vl` on all three channels).
+2. **Export `narrowSlotTy` — NOT taken, and the reason is a partition boundary, not a doubt.**
+   `narrowSlotTy` and `narrowSlotOf` live in **`emit_classify.vl`**, another agent's file this
+   cycle; `wasmEmit`'s twin is `narrowedArmTyOf`, six lines, and deleting it needs the two
+   exports. The exact diff is filed below. The *interesting* half of #1125's hand-off — "the
+   remaining name-keyed narrow reads take it directly" — is measured here and is **not** a
+   one-line export: the two consumers (`emitIdentNode`'s `valueAtomKind(narrowedValueAtomOf(…))`
+   and `emitNarrowedMem`'s `valueAtomKind(narrowVariantFor(…))`) would ladder, not delete,
+   because `narrowSlotTy` answers −1 for a 2+-member set and for a push the pool does not
+   cover, and `narrowedValueAtomOf` still answers from the SPELLING there. That is a probe-first
+   slice, not a hand-off. Filed with its shape.
+3. **What else went dead behind `vbHeapIdxOfAtom` / `scalarTagOf` 16→1: nothing in this
+   partition, and one thing tree-wide.** A whole-tree dead-export scan (every
+   `function NAME(` in `compiler/` + `std/` + `scripts/` with zero call sites, minus the
+   driver/cli/LSP host-ABI exports the Rust host reaches by name) reports, in the type layer:
+   `vbHeapIdxOfAtom` (`emit_classify`, #1128's hand-off — **still dead, still present**),
+   `atomEqOpcode` (`emit_base` — **newly dead, this slice**), and `nodeTyPrimName` /
+   `tyIxIsStructDecl` / `tyIxIsUnionAliasDecl` / `inferLetIxAt` (`typecheck`) and `slebToArr` /
+   `ulebToArr` (`emit_base`) outside it. In `emit_rep` — this partition — the scan finds only
+   the Stage-A rep-tree accessors `repTreeChildOf` / `repTreeKidCountOf` / `repTreeKidAt` /
+   `repTreeReasonOf`: uncalled by construction, because Stage A (#919/#920) shipped the tree's
+   public surface ahead of Stage B's consumers. Deleting a staging surface is not a destringify
+   deletion, and they are not type-string parses; recorded, not touched.
+
+### Channels
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / message / run, base `f82263e` | **1,332 files** | **0 / 0 / 0** |
+| corpus byte / message / run, base `88288c9` | **1,336 files** | **0 / 0 / 0** |
+| corpus byte / message / run, base `47b98e6` | **1,337 files** | **0 / 0 / 0** |
+| fuzz A/B, whole `--out-dir` trees, base `f82263e` | **50,400 programs/side**, 52,708 output files/side | **0 differing paths** |
+| fuzz A/B, whole `--out-dir` trees, base `88288c9` | **50,400 programs/side**, 52,708 output files/side | **0 differing paths** |
+| fuzz A/B, whole `--out-dir` trees, base `47b98e6` | **50,400 programs/side**, 52,708 output files/side | **0 differing paths** |
+| P-RCH reach probe, corpus | 1,330 / 1,336 / 1,337 files, all three bases | **0 / 0 / 0** |
+| P-RCH reach probe, fuzz | 50,400 programs/side | **0** |
+
+The corpus sweep covers `tests/cases/**.vl` + `compiler/*.vl` + `std/*.vl` + `scripts/*.vl`,
+and diffs the built BYTES, the build MESSAGE (temp paths normalised) and the RUN (stdout +
+status) for each.
+
+### Entombment — nine sabotages redden, one is inert BY CONSTRUCTION, and two holes in the corpus were FILLED
+
+Each sabotage is applied to the SHIPPED source, built, and swept against the shipped build over
+the whole corpus (byte, message AND run). Method note 4: perturb so the value LEAVES the
+equivalence class the consumer distinguishes. Method note 69: the restore is `cp` from a copy
+kept beside the sabotage script, and the restored source was verified to rebuild a
+byte-identical artifact.
+
+| sabotage | what it breaks | byte | msg | run |
+|---|---|---|---|---|
+| **S-COERCE1** — the string-LIST carrier claims code 8 | the coerce's box tag + payload discipline | **3** | 0 | **2** |
+| **S-COERCE2** — the i32-list widening gate never fires | the `i32[]`→`i64[]`/`f64[]`/`f32[]` arm adoption | **2** | **1** | **2** |
+| **S-COERCE3** — an i64 carrier emits at the i32 rep | the widened-operand emit | **21** | 0 | **21** |
+| **S-EQOP** — `atomEqOpcodeOfKind` returns `i32.eq` for kind 4 | the union `==` payload compare | **3** | 0 | **2** |
+| **S-BLOCKTY** — `valBlockTypeOfKind` returns 127 for kind 3 | the `??` value blocktype | **4** | 0 | **4** |
+| **S-ASKIND** — `emitExprAsKind` loses its i64 arm | the `??` default's rep | **4** | **1** | **4** |
+| **S-MEMSTR** — `emitNarrowedMem`'s string arm gates on kind 3 | the narrowed VARIANT-field unbox | **1** | **1** | **1** |
+| **S-F32** — `valBlockTypeOfKind`'s f32 arm returns 127 | the `f32 \| null` `??` blocktype | 0 → **1** | 0 | 0 → **1** |
+| **S-EQF32** — `atomEqOpcodeOfKind` returns `i32.eq` for kind 5 | the `f32` union `==` compare | 0 → **1** | 0 | 0 → **1** |
+| S-RESIDUE — the decline branch's answer is FORCED at every reach | (agreement, see below) | 0 | 0 | 0 |
+
+**S-F32 and S-EQF32 were INERT on the pre-existing corpus, and that is reported before the fix,
+not instead of it** (method note 65, #1128's S-EQOTHER shape). Both f32 legs of the two new kind
+tables changed nothing over 1,330 files: no corpus program coalesces an `f32 | null`, and no
+corpus program `==`-compares an f32 union arm. Master could have shipped either table with its
+f32 row wrong. Two new fixtures are those pins:
+
+| new fixture | pins | vs master | under its sabotage |
+|---|---|---|---|
+| `tests/cases/unions/coalesce-f32-null-blocktype.vl` | the `f32 \| null` `??` blocktype + default rep, over the ident, call and struct-field arms | byte-, message-, run-IDENTICAL | **fails to instantiate** — "type mismatch: expected f32, found i32" |
+| `tests/cases/operators/union-eq-f32-arm-opcode.vl` | the f32 arm of the `==` payload compare, over BOTH `emitUnionConcreteEq` and `emitUnionUnionEq` | byte-, message-, run-IDENTICAL | **fails to instantiate** — "type mismatch: expected i32, found f32" |
+
+Writing the second one turned up why the hole existed: a float LITERAL types f64, so
+`f32 | string == 2.5` is a CHECKER reject ("cannot compare f32 | string with f64"). The
+concrete operand has to be an f32-typed BINDING — which is exactly the spelling nobody reaches
+for, and exactly why #1128's i64 hole and these two f32 holes are the same species.
+
+**S-RESIDUE is inert BY CONSTRUCTION and is stated as such rather than as evidence** (method
+note 8). It deletes the `if ak == -2` guard at the map site, forcing the rendered-residual leg
+to overwrite the bank at every reach. Zero diffs therefore says the two legs AGREE at every
+reach — which is the equality that makes the code motion safe — and says nothing about the
+motion itself, which is byte-invisible by design. The motion's evidence is the 0/0/0 A/B plus
+the P-RCH/P-CONS zeros above.
+
+### The call arithmetic, restated as this doc's four counts
+
+- **Type-string classifier calls DELETED: 3** — `valueAtomKind` ×1 (`emitUnionCoerce`),
+  `atomEqOpcode` ×2. **ADDED: 0.** **NET −3** in the four owned files, and the same −3
+  tree-wide.
+- **Whole-spelling equality tests against a type name DELETED: 7** — `atom == "f64"` ×2,
+  `atom == "i32[]"`, `atom == "f64[]"`, `atom == "i64"`, `atom == "f32"` (all
+  `emitUnionCoerce`), `mAtom == "string"` (`emitNarrowedMem`). **ADDED: 0.**
+- **Type SPELLINGS minted at a synthesis site: 11 → 0** (`emitUnionCoerce`'s ladder).
+- **Consumers laddered: 0. Sidecars added: 0** (`atomEqOpcodeOfKind` / `valBlockTypeOfKind` /
+  `emitExprAsKind` are pure functions of a code — no state, no reset obligation).
+- **Resolutions removed from the PATH, not from the source: 4** — the four
+  `removeAtomFromSet` calls now run **zero** times over 1,330 / 1,336 corpus files and 50,400
+  fuzz programs, where master ran each once per reaching site (19 corpus files reach them).
+  Each such call is an `msSetOfText` resolution (a map probe plus, on a miss, a linear scan of
+  every registered `unMemberSet` row) + a bit-clear + a re-render, or the `removeAtomFrom`
+  string surgery.
+- **Hand-copied ABI ladders retired: 8 → 2 homes** — four 3-arm blocktype ladders and four
+  4-arm emit dispatches.
+- New exports (`emit_rep`): `atomEqOpcodeOfKind`, `valBlockTypeOfKind`. New private helper
+  (`wasmEmit`): `emitExprAsKind`. One import dropped (`atomEqOpcode` from `emit_base`).
+- Cross-file: `typecheck` / `emit_classify` / `emit_collect` / `emit_base` / `emit_sections` /
+  `parser` / `driver` / `ast` UNCHANGED.
+
+Source: **179 insertions, 138 deletions** (`emit_rep` +51 / −0, `wasmEmit` +128 / −138) across the two files. Binary: **1,038,622 → 1,038,163 bytes (−459)** on
+`47b98e6`; 1,035,517 → 1,035,058 on `88288c9`; 1,035,387 → 1,034,928 on `f82263e` — the same
+**−459** on all three.
+
+### Gate
+
+| check | result |
+|---|---|
+| `scripts/refresh-compiler.sh` | **RC=0** |
+| `scripts/rep-fuzz-check.sh` | exact ✅ 1 baselined reject, 0 new / 0 stale — **RC=0** |
+| `scripts/native-fixpoint.sh` | stage3 == stage4 byte-for-byte — **RC=0** |
+| `scripts/lint-self.sh` | self-lint + fmt-check clean — **RC=0** |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | master `47b98e6` **2,016 passed / 0 failed / 14 ignored** → shipped **2,018 / 0 / 14** (+2 = the two new fixtures) |
+
+The suite MAGNITUDE was checked, not just its RC: a first run read **1,417 passed / 0 failed /
+607 ignored**, because a git worktree has no `scripts/vl-host/target/release/vl` and every
+native suite self-ignores on the missing binary. Symlinking the host binary into the worktree
+brings it to the brief's stated worktree figure. **A green RC on a third of the suite is not a
+green suite** — the ignored count is the check.
+
+### What did NOT move, and the mechanism for each
+
+- **`scalarTagOf`'s last caller** (`emitUnionCoerce`'s bare-closure arm,
+  `fbI32Const(scalarTagOf(clArm))`) — unchanged, and this slice adds a sharper reason than
+  #1128's. Folding it to the constant `scalarTagOfKind(11)` would be a behaviour change only in
+  the ALIAS-spelled closure-arm population (`type F = (i32) => i32` … `const u: F | i32 = inc`,
+  where `valueAtomKind("F")` is −1 and the tag is wrong today). **That population cannot be
+  observed**: the program is emit-REJECTED at its own `is` test — "emitProgram: `is` names a
+  type that is not a union variant" — before the mis-tagged box is ever read, and a narrowed
+  call through the alias fails the CHECKER ("called value is not a function"). Both re-verified
+  on `47b98e6`, after #1133 fixed the *nullable* alias family. So the fold is not merely risky,
+  it is **untestable from this partition**; the honest repair remains `unionClosureArmName`
+  returning the arm's INDEX, in `emit_classify`.
+- **`isValueUnionName` (9 calls in `wasmEmit`, 10 in the partition)** — #1128's mechanism holds
+  and is re-measured: it is a property of the whole member SET, its callers hold a rendered
+  union NAME with no row id, and its arena dual needs `msSetOfText` first — a laddering, not a
+  deletion.
+- **`emitUnionLitIs` and `emitUnionConcreteEq` keep their `valueAtomKind(atom)`.** Both settle
+  an atom SPELLING that is still needed for `unionHasAtomTy`'s VERBATIM membership test
+  (a `TyPrim.primName` compare, D-ATOMPAIR's pair). Assigning the code in the ladder and
+  re-deriving the keyword from it would introduce a kind→keyword RENDERER to feed a membership
+  test — relocating the spelling, not deleting it. The deletion needs `unionHasAtomTy`'s `want`
+  to arrive as a KIND, which is `emit_classify`'s `unMemHasAtom`. Filed.
+- **The four `-2` fall-throughs** — measured at 0 reaches on both channels with a live
+  comparator, mechanism above, and deliberately kept. See the hand-off.
+- **`emit_state.vl` and `emit_rewrite.vl` are all but clean already.** The whole partition holds
+  **3** inline character-surgery sites (unit: a `.slice(` / `.indexOf(` / `strContains(` on a
+  type spelling in non-comment code) and all three are in ONE function,
+  `emit_rewrite`'s `synthRetAnnots` — `emit_rep`, `emit_state` and `wasmEmit` hold **zero**.
+  `synthRetAnnots` is D-ARROWTY's single largest consumer (19 sites over a fifteen-arm ladder),
+  and its producer is `irRendered(tyToEmitName(er))` in `typecheck.vl:1103` — a checker that
+  **has the arena index `er` in hand and renders it**. The whole ladder is "should this lambda's
+  return be pinned", answered by classifying that render. It cannot be migrated from this
+  partition: it needs an `inferRetTyByNode` column beside `inferRetNameByNode`. Filed, with the
+  observation that this is the largest single second-arc concentration left anywhere in the
+  emitter.
+
+### Hand-offs, each with a verified diff
+
+1. **`emit_base.vl` — `atomEqOpcode` now has ZERO callers compiler-wide** (verified with the
+   same string-literal-aware scan; only its own definition header remains). It is the
+   atom-spelled entry point whose kind table moved to `emit_rep`:
+   ```
+   -export function atomEqOpcode(atom: string) { const k = valueAtomKind(atom) … }
+   ```
+   Deleting it removes 1 more `valueAtomKind` call from the source. Same shape as #1125's
+   `mapTagOf` / `refArrTagOf` hand-off, which #1130 took.
+2. **`emit_classify.vl` — `vbHeapIdxOfAtom` is STILL dead** (#1128's hand-off 1, unactioned;
+   re-verified at `47b98e6`). Same one-line deletion.
+3. **`emit_classify.vl` — export `narrowSlotTy` and `narrowSlotOf`**, and `wasmEmit`'s private
+   twin goes:
+   ```
+   -function narrowSlotOf(name: string): i32 {          →  +export function narrowSlotOf(…)
+   -function narrowSlotTy(i: i32): i32 {                →  +export function narrowSlotTy(…)
+   ```
+   ```
+   -function narrowedArmTyOf(name: string): i32 { …six lines… }   (wasmEmit, DELETED)
+   +  // callers: rlSlotOfTy(tyRefArrElemOf(narrowSlotTy(narrowSlotOf(name))))
+   ```
+   Pure dedup; both halves already read the same `emit_state` columns.
+4. **`emit_classify.vl` — a `narrowedValueAtomKindOf(name): i32` beside `narrowedValueAtomOf`**,
+   returning `unMemAtomKind(narrowSlotTy(i))` (with `tyIsLitUnion` → 2) and falling through to
+   `valueAtomKind(v)` where the slot carries no single type. That deletes the two remaining
+   `valueAtomKind` calls in `wasmEmit` that parse a narrow's rendered variant
+   (`emitIdentNode`, `emitNarrowedMem`). **It LADDERS** — `narrowSlotTy` answers −1 for a
+   2+-member set and for an uncovered push — so it needs a candidate-beside-authority probe on
+   both channels first, at the CONSUMER's tolerance (the code, not the spelling).
+5. **`emit_classify.vl` — `unMemHasAtom` keyed on a KIND.** `unMemHasAtomKind(name, k)` would be
+   exact for the non-array case (kinds 0–6 are 1:1 with the primitive keywords
+   `unMemHasAtom` compares against `TyPrim.primName`), and it is what `emitUnionLitIs` /
+   `emitUnionConcreteEq` need to stop settling a spelling at all. The array case must stay
+   spelled or gain its own pair — `unMemHasAtom` is deliberately EXACT and the kind folds
+   `boolean[]` / litunion-`K[]` into `i32[]`'s code 7.
+6. **`typecheck.vl` — bank the inferred-return TYPE, not only its render.**
+   `irRendered(tyToEmitName(er))` throws `er` away at ~20 sites; `emit_rewrite`'s
+   `synthRetAnnots` then classifies the render at 19 sites, three of them with raw `.slice(` /
+   `strContains(` character surgery. An `inferRetTyByNode(nodeIx)` column parallel to
+   `inferRetNameByNode` is the producer-side move the SCORECARD CORRECTION's strategy calls for
+   ("kill the SOURCES, not the call sites"), and it is the last one of that size in the emitter.
+7. **The four `-2` residual fall-throughs are deletable the day the checker settles the ALIAS
+   `??`.** Today `type N = i32 | null` … `x ?? 0` is a checker reject while the inline
+   `i32 | null` spelling runs, and that asymmetry is what makes the emit path unreachable. Two
+   outcomes, both fine for the emitter: if the alias form is made to WORK, `msSetOfText` should
+   grow a row-by-NAME rung (`unionRowOf` already resolves an alias name; `msSetOfText` matches
+   only the member-set TEXT) and the fall-through dies with it; if the alias form stays
+   rejected, the fall-through can be deleted outright and each site's decline becomes the loud
+   reject it already is at the map arm. **Do not delete it before that question is answered** —
+   the reachability argument is about a neighbouring layer, not about this one.
+
+### Method notes earned
+
+71. **A census figure is only as good as its EXCLUSIONS, and the biggest inflator is usually a
+    resolver that has already been migrated** (D-COERCEKIND / TARGET 2) — `unionHasAtomTy` is
+    27 of `wasmEmit`'s calls into the union-atom vocabulary and it has been arena-only since
+    D-UHATOTAL. Any filter that counts "operations on union types" rather than "consumers of a
+    RENDER" doubles the file's apparent debt with work this program already finished. Publish
+    the filter's membership table, not just its total: the exclusions carry more information
+    than the inclusions.
+72. **A ladder that MINTS a spelling is a deletion, not a migration** (D-COERCEKIND) — method
+    note 62 said "check whether the ARGUMENT is a literal"; the sibling check is whether the
+    argument was SYNTHESIZED a few lines up by a ladder the same function owns. There is no
+    equivalence argument to make and no bank to build: the ladder simply assigns the code
+    instead of a name, and the six downstream spelling compares become code compares by the
+    injectivity of the ladder's own image. Look for a `let atom = "…"` before designing a dual.
+73. **"Unreachable" has two very different causes, and only one of them licenses a deletion**
+    (D-RESIDUE) — a path can be unreachable because the state it needs cannot be constructed,
+    or because a NEIGHBOURING layer rejects the program first. The `-2` fall-through is the
+    second kind: the emit site is fine, the CHECKER refuses the alias-spelled `??`. Deleting on
+    a 0-reach measurement would have made this slice the owner of a defect the day the checker
+    changed. Ask *why* the reach is 0 before spending it.
+74. **A refactor's inert sabotage names the fixture you owe** (D-BLOCKTY) — collapsing four
+    copies of a table into one makes each ROW of that table separately sabotageable for the
+    first time, and two rows (both f32) turned out to have no corpus pin at all. The dedup did
+    not create the hole; it made the hole VISIBLE, because a per-row perturbation is a one-line
+    edit only after the collapse. A "collapse N copies" slice should sabotage every row, not
+    every copy.
