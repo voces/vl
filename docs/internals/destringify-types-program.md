@@ -6281,3 +6281,358 @@ Exact diff for whoever takes it: `fieldCodeOfSpelling(t: string, litNode: i32)` 
 
 — every other arm is a pure function of the spelling and will need its own arena reading
 before the table can answer without one.
+## D-PARSETY P3 — the emit-authority question, ANSWERED, and the fourth string-only spelling (#1126)
+
+The brief: close the gating item #1121 measured — make the parser's spelling tree
+EMIT-authoritative (0 missing, 0 stale) by (2) giving emitter-SYNTHESIZED `TypeRef` nodes a
+spelling at synthesis and (3) making the canon pass rewrite the tree in lockstep. Enumerate
+both populations first, do not inherit #1121's numbers.
+
+**The enumeration is done and it refutes step 2, extends step 3, and says the partition cannot
+reach either.** What ships instead is the FOURTH string-only type spelling — `x as T` — whose
+deferral note in #1121 was wrong, and whose merge consumer was missing, making `as` unusable
+with any named type in module mode.
+
+### The two populations, enumerated — counting method stated
+
+Corpus: **1,298** `.vl` files — `tests/cases/**/*.vl` (1,267, including this slice's 4 new pin
+files) + a pinned `adbe6f0` snapshot of `compiler/*.vl` (25) + `std/*.vl` (4) + `scripts/*.vl`
+(2). Each built INDIVIDUALLY (`vl build <file> --compiler <probe>`).
+
+Two sweep points, both inside `emitProgram` (`emit_sections.vl`), reported through the emit
+ERROR channel — the compiler wasm is instantiated with an EMPTY linker (`main.rs:279`) and has
+no print imports, so a probe cannot `print`:
+
+- **ENTRY** — immediately before the ordered pass table.
+- **FINAL** — after the last pass, immediately before `emitModule`.
+
+#1121 probed at `collectA`, which is the THIRD pass; `collectA#2`, `synthParamAnnots`,
+`collectMapFilterUse` and the mono clones all mint annotations after it. FINAL is the superset
+and is why these numbers are larger than #1121's 203/43.
+
+**1,120 files reach both sweeps**; 178 never reach emit (144 type errors, 30 parse errors, 4
+emit errors) and are outside every count below.
+
+| | ENTRY | FINAL |
+|---|---|---|
+| `TypeRef` nodes swept | 58,586 | **59,809** |
+| tree present AND `tsToName(root) == tyName` | 58,475 | 58,475 |
+| **NOSPELL** — no recorded spelling | **0** | **1,223** (261 files) |
+| **STALE** — recorded spelling renders a DIFFERENT name | **111** (46 files) | **111** (46 files) |
+| no recorded `nodeTyIx` | 14 (9 files) | **14** (9 files) |
+
+Files carrying either at FINAL: **305 of 1,120 = 27.2%.**
+
+Two structural facts fall straight out of the two-point sweep, and a single-point probe cannot
+see either:
+
+- **Every NOSPELL node is minted by the EMITTER.** `nospell = 0` at ENTRY, on all 1,120 files.
+  The parser + module merge hand emit a 100%-covered tree; the hole is dug afterwards.
+- **Every STALE node is stale before emit STARTS.** ENTRY == FINAL == 111. The canon pass is
+  the sole producer, exactly as the brief said.
+
+### NOSPELL, attributed to its 31 synthesis sites
+
+`mkTypeRef` has **three** call sites in the whole compiler: `parser.vl:379` (`parseType`),
+`parser.vl:1328` (a struct field's type), and `emit_classify.vl:8349` (`synthTypeRef`). So the
+entire NOSPELL population comes through ONE funnel. Instrumented per CALL SITE of that funnel
+(a probe column keyed by node index, 31 sites reached over the 1,294-file pre-pin corpus):
+
+| site | nodes | files |
+|---|---|---|
+| `emit_rewrite:606` — `synthParamAnnots`, `resolveShapeToNominal(nodeTyName(param))` | **466** | 145 |
+| `emit_mono:912` — instance PARAM pin (`pinned[pj]`) | 176 | 39 |
+| `emit_rewrite:421` — `synthRetAnnots`, union-alias return | 150 | 67 |
+| `emit_mono:909` — instance PARAM pin | 134 | 31 |
+| `emit_mono:942` — instance RETURN pin (`rs`) | 70 | 27 |
+| `emit_rewrite:444` — element-value-union list return | 47 | 16 |
+| `emit_rewrite:428` — nullable-ref return | 42 | 20 |
+| 24 further sites (`emit_rewrite` ×11, `emit_mono` ×12, `emit_collect` ×1) | 138 | — |
+
+### REFUTATION 1 — "the synthesizing pass knows the structure" is FALSE, and the structure is ALREADY banked
+
+The brief's step 2 is the bank-at-the-producer move applied to node creation. It does not
+apply, for a reason the attribution makes exact: **the synthesis sites take a RENDERED name.**
+`emit_rewrite:606` is `synthTypeRef(resolveShapeToNominal(nodeTyName(ps[pi])), -1)`, and
+`nodeTyName` (`typecheck.vl:13770`) is `tyToStr` / `tyToEmitName` over `T.tys`. That is
+#1117's **arc 2** — `arena → tyToEmitName → parse` — not the parser arc. What the pass knows
+is an ARENA INDEX, which it renders; deriving a spelling tree from the rendered result is a
+parse, the thing this program exists to delete.
+
+And the arena index is already banked on the node. `synthTypeRef` calls
+`recordClonedNodeTy(n, name)`, which writes `nodeTyIx`. Measured:
+
+- of the **1,217** NOSPELL nodes an arena-reading probe could evaluate, **0** had no recorded
+  arena type;
+- over ALL **59,809** `TypeRef` nodes at FINAL, **14** (9 files) lack one — `i32` ×12,
+  `{[string]:boolean}` ×1, `S[]` ×1. **`nodeTyIx` is 99.977% total at emit time.**
+
+So a spelling on these nodes would be a THIRD encoding of a type that already has two, bought
+with a parse. **The emit-side consumers are not blocked on the spelling tree; the column that
+is total for them is `nodeTyIx`.** That is a redirection of the brief's gating claim, filed
+with its number.
+
+### REFUTATION 2 — the canon pass makes `nodeTyIx` STALE TOO, on 24% of the same rows
+
+Step 3's mechanism is right. Its SCOPE is not: the same rewrite that leaves the tree describing
+the pre-canon name leaves the C1 typed-IR describing it too. Of the 111 STALE nodes,
+`tyToEmitName(nodeTyIxOf(node))` reproduces
+
+| | rows |
+|---|---|
+| the CANON'd name (agrees with `tyName`) | 84 |
+| the PRE-CANON spelling (agrees with the TREE) | **27** |
+| neither | 0 |
+
+and every one of the 27 carries a literal-union ALIAS name: `{f:K0|f64}` vs `{f:string|f64}`,
+`K0|{w:i32}` vs `string|{w:i32}`, `(K0|i64)[]` vs `(string|i64)[]`,
+`{[string]:K0|i64|{q:i64}}` vs `{[string]:string|i64|{q:i64}}`. `tyToEmitName` widens a literal
+union in place but does NOT resolve an alias TO one; `canonEmitName` does both.
+
+So P4 is not "the canon pass rewrites the tree in lockstep". It is **"the canon pass hands its
+result to every derived column"**, and the typed-IR the C1 endgame is built on is one of them.
+Note 46's lifetime statement generalises: the canon pass ends the usable lifetime of every
+sidecar recorded before it, not just the parser's.
+
+The 56 distinct rewrite pairs, for whoever builds the structural canon:
+`0|1|2`→`i32` (7) · `"x"|7`→`string|i32` (6) · `0|1`→`i32` (5) · `"a"|"b"`→`string` (5) ·
+`{f:K0|f64}`→`{f:string|f64}` (5) · `Y`→`{v:i32}` (4) · `"world"`→`string` (4) · `Id`→`i32` (4) ·
+`(0|1|2)&!2`→`i32` (3) · `1.5|2.5`→`f64` (3) · `AB|null`→`{t:i32,a:i32}|{t:i32,b:i32}|null` (2) ·
+`i32|(2|3)&!3`→`i32` (1) · `{tag:"circle"|"square",r:i32}`→`{tag:string,r:i32}` (1) · … .
+Three shapes are needed: literal → base (leaf rewrite), alias → member (SUBSTITUTE the
+alias's recorded tree — `udTsRoot` already holds it for every `type N = …` member, P2), and
+union-member DEDUPE after widening (a structural change, not a leaf rewrite).
+
+### REFUTATION 3 — the partition cannot reach either population, and partial closure is worth nothing
+
+`synthTypeRef` lives in `emit_classify.vl`; its 35 call sites are in `emit_rewrite.vl`,
+`emit_mono.vl` and `emit_collect.vl`; `canonEmitTypeNames` / `canonEmitName` live in
+`typecheck.vl`. Every one is another agent's this cycle. Nothing in `parser.vl` / `ast.vl` /
+`driver.vl` can write a spelling at a synthesis site or rewrite the canon's output.
+
+And the obvious partial move is worth **nothing**, which is worth stating because it looks
+attractive: `emit_mono.vl` is unclaimed and accounts for **433 of the 1,223** NOSPELL nodes
+(35%), and `setAnnTs` is exported from `ast.vl`, so those sites COULD be banked without
+touching a claimed file. But a consumer migrates only when its column is TOTAL for it — a
+`collectA` site over `nd.tyName` cannot read the tree on 65% of the population and the string
+on the rest without keeping the string path alive, which is the fall-through it was supposed
+to delete. Coverage that is not total unblocks no consumer. Not done, deliberately.
+
+### What DID close: `x as T`, the fourth string-only spelling — and a module bug
+
+#1121's P2 recorded three of the four type spellings the parser builds and drops, and deferred
+the fourth with a reason:
+
+> **`x as T`'s spelling stays dropped.** The merge's `AsExpr` arm rewrites only the operand
+> (the cast target is a numeric primitive by the checker's own rule), so there is no consumer
+> and recording it would be dead weight (note 19).
+
+**The reading of the checker's rule is wrong.** `checkCastNode` (`typecheck.vl:16013`) requires
+that the target RESOLVE to a numeric scalar — `primNameOf(nameToTyAt(n.asTy, ix))` ∈
+{i32,i64,f32,f64} — and a user ALIAS resolves. `type Id = i32` + `x as Id` is a legal
+single-file program that has always run. The merge renames the DECLARATION to `Id$mN` and left
+the cast spelling alone, so the consumer was not absent: it was MISSING.
+
+Reproduced on `adbe6f0` and re-verified on the parent `3b1fad4`, every module shape, each
+with its single-file control running:
+
+| program | master |
+|---|---|
+| alias declared in a non-entry module, cast there | ``unknown type `Id` in `as` cast`` |
+| alias EXPORTED and imported, cast in the entry module | ``unknown type `Id` in `as` cast`` |
+| alias declared in the ENTRY module, cast there | ``unknown type `Id` in `as` cast`` |
+| alias reached through a CHAIN (`Count` → `Base` → i32) | ``unknown type `Count` in `as` cast`` |
+| target is the primitive `i32` | runs |
+
+**`as` was unusable with any named type in module mode.** Shipped:
+
+- **`parser.vl`** — `parseAsType` stops dropping its root; it rides `lastTyTsRoot` (P2's
+  one-slot channel) and the `as` loop banks it on the `AsExpr` node the moment it is minted, so
+  `annTsNode` stays strictly increasing.
+- **`driver.vl`** — `modRwExpr`'s `AsExpr` arm reads `annTsOf(ix)`, `modRwTsName`s the tree and
+  renders `n.asTy` back from it; `modTypeRenamed` stays as the fall-through.
+
+Pins (both FAIL on the parent `3b1fad4`, verified by running each against a parent-built
+compiler with `--compiler`): `tests/cases/modules/as-cast-alias/` (module-local + chained +
+entry-module legs) and `tests/cases/modules/as-cast-imported-alias/` (the imported leg).
+
+**Stated plainly: the string scanner alone would also have fixed both pins.** A build with the
+tree leg deleted and only `n.asTy = modTypeRenamed(n.asTy)` runs them both. The checker admits
+only a target that resolves to a numeric scalar, so no field name and no literal lexeme — the
+two things the tree knows and `modTypeRenamed` cannot — can appear in this position. **The
+defect was a MISSING CONSUMER, not a scanner defect.** The tree leg ships anyway because
+routing the new consumer through `modTypeRenamed` would have added a SIXTH live call site to a
+type-string parser this program is retiring, of which three were already arena-first.
+
+### The fall-through is measured DEAD, and the comparator is measured POWERFUL
+
+- **Fall-through.** A build that prefixes `@@POISON@@` onto `n.asTy = modTypeRenamed(n.asTy)`
+  is corpus byte-, message- AND run-identical to the shipped build over **1,331 entries**
+  (1,298 files + 33 module DIRECTORIES built as units; both sabotage measurements were taken
+  at the `adbe6f0` base, before two upstream slices landed): **0 diffs of any kind.** Every
+  `AsExpr` at merge time has a recorded spelling. Total by construction too — `mkAsExpr` has
+  exactly one call site and it now records.
+- **Comparator power at volume, against a known-WRONG build.** `modRwTsName` renames NOTHING
+  (wire sabotage): **47 of the 1,331 entries diverge**, including every module pin and
+  `modules/basic` / `generic-export` / `generic-isolation` / `match-cross-module` /
+  `name-isolation`. The channel that can see the merge sees it.
+- **`annTsNode` monotonicity.** The new rows are interleaved with the `TypeRef` and `IsExpr`
+  rows in one table that `annTsOf` BINARY-SEARCHES, so a single out-of-order push silently
+  corrupts every lookup. A build that counts `nodeIx <= last` at `setAnnTs`: **0 violations**
+  over the 1,298-file corpus AND over the 50,400-program fuzz corpus.
+
+### Allocation, measured (note 24)
+
+**+0 spelling nodes.** `parseAsType` already BUILT its tree on master and threw the root away
+(`tsPop()` pops the stack; the nodes stayed in the arena unreferenced), so keeping it allocates
+nothing new. The cost is **one `annTs` row per `as` expression**: over the whole corpus there
+are **31** `AsExpr` nodes, so **+31 rows** against 91,637 existing ones. The compiler's own
+16-module build contains **0** `as` expressions — **+0 rows**.
+
+Binary, like-for-like (ONE compiler, two sources): 1,031,575 → **1,031,675** bytes (**+100**).
+
+### The call arithmetic
+
+**0 parses added · 0 parses deleted · 1 consumer laddered · NET 0.** Local-aware scan by
+resolver called. **Counting method, stated:** line comments are stripped (`//` outside a string
+literal); a match is `NAME(` with the preceding char not `[A-Za-z0-9_.]`; the `function NAME(`
+definition header is excluded; the parser list is the SCORECARD CORRECTION's plus #1117's four
+additions (`refArrElemKind` / `nameIsI32ListArray` / `nameIsMapArray` / `nullClosureArrElem`).
+**This is a call count, not a grep count.**
+
+| file | parent (`3b1fad4`) | now |
+|---|---|---|
+| `compiler/parser.vl` | 0 | 0 |
+| `compiler/ast.vl` | 0 | 0 |
+| `compiler/driver.vl` | 0 | 0 |
+| `compiler/typecheck.vl` | 20 | 20 (untouched) |
+| `compiler/emit_collect.vl` | 98 | 98 (untouched) |
+| `compiler/emit_base.vl` | 66 | 66 (untouched) |
+| **total** | **184** | **184** |
+
+`modTypeRenamed`, the scanner the scorecard has never counted: **5 sites on master → 6 now** —
+the new one is the `AsExpr` fall-through, measured dead above. Cumulative across P1+P2+P3:
+**4 of the 6 are arena-first with a measured-dead fall-through** (`modRwType`, `udVariants`,
+`isVariant`, `asTy`); the remaining two (`tdName`, `udName`) are DECLARATION names built from
+an identifier token, correctly renamed whole.
+
+### Gate
+
+Corpus **byte-, message- AND run-diff**, **1,338 entries** (1,305 files — `tests/cases` +
+a pinned parent snapshot of `compiler/` + `std/` + `scripts/*.vl` — plus 33 module directories
+built as units; compiler stdout/stderr with the out-path normalised, exit codes compared, run
+output + exit code compared): **4 byte-diffs, 4 message-diffs, 4 run-diffs — all 4 are the two
+new pins** (each counted once as a file and once as a directory), which the parent rejects and
+this build compiles and runs. **0 diffs on all 1,334 pre-existing entries.**
+
+The shared-INSTANCE channel (note 32) agrees and classifies the message delta: `vl check
+tests/cases` goes from `Found 207 errors, 119 warnings` to `Found 204 errors, 119 warnings`,
+and the 3 removed diagnostics are exactly the pins' ``unknown type … in `as` cast``
+rejections — every message change is a fix, none is a regression. `vl check compiler` and
+`vl check std` are byte-identical (0 diff lines).
+
+Fuzz A/B **50,400 programs/side** (14 seeds × depths 4/5/6 × {plain, `--branching --multiobs
+--declared`} × 300, generated ONCE by the PARENT's compiler so both sides see identical
+programs), whole `--out-dir` TREES via `diff -r`, **52,812** output files/side: **0 differing
+paths** (`diff -r` RC=0, 0 output lines). Stated with #1121's caveat: the generator emits
+SINGLE FILES, so this channel cannot reach the module merge at all — its 0 is a regression
+check on the parser-side row addition (which every `as` cast exercises), not evidence for the
+merge leg. The merge leg is carried by
+the corpus + the pins + the two sabotages.
+
+`refresh-compiler.sh` RC=0 (1,031,675 bytes) · `rep-fuzz-check.sh` RC=0 (exact; 1 baselined
+failure — 0 unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=0 (stage3 == stage4,
+1,031,675 bytes) · `lint-self.sh` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test` RC=0
+(**1,991 passed, 0 failed, 8 ignored** — 1,989 with the two pin directories moved aside,
+measured in this worktree, + 2).
+
+### Hand-offs, each with a VERIFIED diff
+
+**Hand-off 1 — a LIVE invalid-wasm miscompile, single-file, no modules: `x as <alias>` for a
+non-i32 numeric.** `typecheck.vl` (a concurrent agent's file).
+
+```vl
+type W = f64
+const x = 5 as W
+print(x)
+```
+→ `failed to compile … WebAssembly translation error … type mismatch: expected f64, found i32`
+on `adbe6f0` AND on the parent `3b1fad4`. Same for `type W = i64` and `type W = f32`;
+`const x = 5 as f64` (the primitive) runs; `type W = i32` runs (no conversion needed).
+
+Mechanism: `emitAsCast` (`wasmEmit.vl:7552`) branches on `tgt == "f64"` / `"i64"` / `"f32"` and
+falls through to the i32 arm — a structural decision made from a type-name string that is a
+nominal ALIAS. The canon pass would have resolved it, but **`canonEmitTypeNames`
+(`typecheck.vl:6622`) sweeps only `TypeRef` and `UnionDecl` nodes; it never touches
+`AsExpr.asTy`.** That is the coverage gap, and it is one arm:
+
+```vl
+    } else if n is AsExpr {                        // ← add, beside the UnionDecl arm
+      const c3 = canonEmitName(n.asTy)
+      if c3 != n.asTy { n.asTy = c3 }
+    } else if n is UnionDecl {
+```
+**Verified in a probe build on this branch, at the parent `3b1fad4`: all four failing
+programs above compile and run.**
+(`AsExpr` is already imported by `typecheck.vl`; the arm banks no atom count, so
+`annUnionAtoms` is untouched.) This slice makes the module case REACHABLE — before it, `x as W`
+in a module was a type error — so the gap is now hit from one more direction. It is
+pre-existing (note 34's control: the single-file form fails identically on `adbe6f0`), which is
+why no pin ships for it here.
+
+**Hand-off 2 — P4, for the `typecheck.vl` owner: the canon pass is the last producer of FOUR
+columns, not one.** Population above: 111 nodes / 46 files / 56 distinct rewrite pairs, of
+which 27 also leave `nodeTyIx` describing the pre-canon type. The lockstep write has to cover
+`TypeRef.tyName` (already), the spelling tree (`annTsOf` → a structural canon), `nodeTyIx`
+(re-`recordClonedNodeTy` with the canon'd name, or better, the canon'd `Ty`), and
+`annUnionAtoms` (already banked by #1113). The alias→member substitution needs no new
+machinery: `udTsRoot` (P2) already holds every `type N = …` member's tree.
+
+**Hand-off 3 — for the `emit_rewrite` / `emit_collect` owners: do NOT bank spellings at the
+synthesis sites.** The attribution table above is the map; the finding is that all 1,223 nodes
+already carry `nodeTyIx` and the names come from `tyToEmitName`/`tyToStr`. The migration these
+sites want is arc 2 — the RENDERER hands over a type index and the consumer stops rendering —
+not a spelling column.
+
+**Hand-off 4 — `tyToEmitName` is NOT TOTAL over the arena: it does not terminate on a
+recursive type.** A probe that renders `nodeTyIxOf(ix)` for every `TypeRef` TRAPS (stack
+exhaustion, `wasm backtrace` from `<wasm function 436>`) on **15 of 1,294** corpus files —
+`recursive-linked-list-sound.vl`, `mutual-recursive-type.vl`, `recursive-binary-tree-sound.vl`,
+`recursive-array-element.vl`, `indirect.vl`, `indirect-polymorphic.vl`, … . The compiler does
+not hit this today because nothing renders those annotations; anyone migrating a consumer to
+"render the arena type and compare" will. `isEquatable`'s `seen` stack is the cycle-guard
+pattern the emit renderer lacks.
+
+### Method notes earned
+
+50. **A sidecar's coverage is a function of WHERE you sweep, and one point is not a
+    measurement** (D-PARSETY P3) — #1121 probed at `collectA` (pass 3 of 25) and reported
+    203 NOSPELL / 43 STALE files. Sweeping at emit ENTRY and at emit FINAL instead gives
+    0 / 111 and 1,223 / 111, and the PAIR is what carries the structure: NOSPELL is 100%
+    emitter-minted (0 at entry) and STALE is 100% pre-emit (identical at both). Neither fact
+    is visible from a single interior point, and both change what the fix has to be.
+51. **"Bank at the producer" fails when the producer is a RENDERER, and the tell is that the
+    thing you want is already banked** (D-PARSETY P3) — the brief's step 2 assumed the
+    synthesis sites know the structure. They know an ARENA INDEX and they render it; the
+    index is already on the node (`recordClonedNodeTy`, 99.977% total at emit). A second
+    structural encoding derived from the first one's RENDER is a parse wearing a sidecar's
+    clothes. When a proposed bank would be the third encoding of one type, the answer is to
+    read the encoding that exists.
+52. **A rewrite that invalidates one derived column invalidates ALL of them — enumerate the
+    columns before calling it a lockstep** (D-PARSETY P3) — the canon pass was filed as
+    "the tree goes stale". It also leaves `nodeTyIx` describing the pre-canon type on 27 of
+    the same 111 rows, all of them literal-union ALIAS names, because `tyToEmitName` widens a
+    literal union but does not resolve an alias to one. The C1 typed-IR is not a refuge from
+    P4; it is a second victim of it.
+53. **Partial coverage of a population unblocks no consumer, so "close 35% of it" is not a
+    down payment** (D-PARSETY P3) — 433 of the 1,223 uncovered nodes are minted in an
+    UNCLAIMED file and could have been banked without touching anyone's partition. A consumer
+    migrates only when its column is total for it; at 65% it keeps the string fall-through it
+    was migrating to delete, and the slice books progress that buys nothing. Declined on the
+    measurement, not on the effort.
+54. **A deferral justified from a checker RULE must quote the rule, not paraphrase it**
+    (D-PARSETY P3) — "the cast target is a numeric primitive by the checker's own rule" versus
+    what `checkCastNode` actually requires, which is that the target RESOLVE to a numeric
+    scalar. The gap between "is" and "resolves to" is the entire alias vocabulary, and it made
+    `as` unusable with any named type in module mode. Three previous slices read that note and
+    inherited it.
