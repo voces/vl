@@ -705,6 +705,15 @@ export function inferNicheNullByName(name: string) {
 // `sep` must not itself be a grouper (every caller separates on `|` or `,`): the
 // grouper arms are tested first, exactly as each copy tested them.
 //
+// `'='` means the function ARROW `=>`, not a bare `=`: it matches only when the NEXT
+// character is `>`, and a lone `=` keeps the scan going. That two-character lookahead
+// is the ONE thing `annArrowAt`'s eighth copy of this ladder added — the copy was
+// otherwise character-identical (same three grouper arms, same `tyGtIsClose` close,
+// same first-hit return), so the token belongs in the home rather than in a private
+// walk that has to be re-taught every grammar repair. The checker's `tyTopIndexOf`
+// spells the same rule one module down, independently; the two remain distinct
+// because the checker's ladder SKIPS quoted literal members and this one never has.
+//
 // It returns at the FIRST hit. `nullablePartOf`'s copy scanned to the END of the name
 // and kept only the first bar, so this is the same answer for strictly less work.
 export function tyTopLevelIndexOf(name: string, sep: i32) {
@@ -724,7 +733,8 @@ export function tyTopLevelIndexOf(name: string, sep: i32) {
       depth = depth - 1
       angOpen = angOpen - 1
     } else if depth == 0 && ch == sep {
-      return i
+      if ch != '=' { return i }
+      if i + 1 < name.length && name[i + 1] == '>' { return i }
     }
     i = i + 1
   }
@@ -779,6 +789,56 @@ export function tyTopLevelSplit(
     i = i + 1
   }
   0
+}
+// THE ONE HOME of the type-name depth walk, "WRAPS" form: does the group opened by
+// `name[0]` run to the END of `name` — i.e. does NO closer bring the depth back to 0
+// before the final character?
+//
+// This is the THIRD form of the same ladder, and it was hand-written FOUR times across
+// the compiler with THREE different ladders and TWO different readings of the same
+// question — a spread that is itself the argument for one home:
+//
+//   * `emit_collect.nameIsSingleShape` — the FULL ladder (`{}` `[]` `()` `<>`), quote-
+//     BLIND, over a `{…}` group. Retired into this home.
+//   * `emit_base.normTypeAtom` — a PAREN-ONLY ladder over a `(…)` group. Retired into
+//     this home; its header claimed the paren-only reading was load-bearing ("a `>` in a
+//     `$fnsig` key or a `tyToStr` render must not be able to unbalance it") and that is
+//     already false of THIS ladder: `tyGtIsClose` makes a `>` with no open `<` inert, so
+//     `ii>i` and `->` cannot unbalance it either. Probe P2 measures the two ladders apart.
+//   * `emit_classify.monoUnwrapParens` — a paren-only ladder, one module UP. Filed as a
+//     hand-off; it is not reachable from here.
+//   * `typecheck.parenEnclosesWhole` — the checker's `tyGroupEndIndex(name, 1) ==
+//     name.length - 1`, which is a DIFFERENT reading, not just a different ladder: on a
+//     group that NEVER closes (`{{x}`, `(((a)`) it answers FALSE where all three emitter
+//     copies answer TRUE. `peelGroupParens` rides the checker's and deliberately keeps
+//     riding it — the two readings are named here so no later slice merges them by
+//     eyeball. (It also skips quoted literal members, which no emitter copy has ever
+//     done; that divergence is #1147's hand-off 1 and is still open.)
+//
+// Callers gate on the OPENER themselves (`name[0] == '{'`, `t[0] == '('`) exactly as the
+// copies did, so the walk starts at index 1 with the opener already counted.
+export function tyGroupWrapsWhole(name: string) {
+  let depth = 0
+  let angOpen = 0
+  let i = 1
+  while i < name.length {
+    const c = name[i]
+    if c == '{' || c == '[' || c == '(' {
+      depth = depth + 1
+    } else if c == '<' {
+      depth = depth + 1
+      angOpen = angOpen + 1
+    } else if c == '}' || c == ']' || c == ')' {
+      if depth == 0 { return i == name.length - 1 }
+      depth = depth - 1
+    } else if c == '>' && tyGtIsClose(name, i, angOpen) {
+      if depth == 0 { return i == name.length - 1 }
+      depth = depth - 1
+      angOpen = angOpen - 1
+    }
+    i = i + 1
+  }
+  true
 }
 // ── nullable struct refs (`S | null`) ─────────────────────────────────────────
 // "S|null" / "null|S" (exactly TWO `|` parts, one of them `null`) → the non-null
@@ -1655,9 +1715,16 @@ export function peelGroupParens(nameIn: string) {
 // possible statement that they must not be allowed to drift. `emit_base` is the lowest
 // module both reach, so the home is here.
 //
-// The paren walk counts `(`/`)` ONLY (no `{}`/`[]`/`<>` arm): a wrapping paren pair is
-// balanced against parens alone, and a `>` in a `$fnsig` key or a `tyToStr` render must
-// not be able to unbalance it.
+// The wrap test is `tyGroupWrapsWhole`'s — the same "does the leading group close EARLY"
+// question `emit_collect.nameIsSingleShape` asked of a `{…}` group, including the reading
+// of a group that never closes at all (both answer "it wraps"; the checker's
+// `parenEnclosesWhole` answers the opposite, which is why `peelGroupParens` is NOT this).
+// The copy here counted `(`/`)` ONLY, and its own header defended that as load-bearing —
+// "a `>` in a `$fnsig` key or a `tyToStr` render must not be able to unbalance it". That
+// defence does not survive contact with the shared ladder: `tyGtIsClose` already makes a
+// `>` with no OPEN `<` inert, so `ii>i` and `->` cannot unbalance the home either. Probe
+// P2 measures the widening (a stray unmatched `}`/`]` inside the parens is the only shape
+// the two ladders can disagree on) at 0 disagreements over the corpus and the fuzz corpus.
 export function normTypeAtom(arm: string) {
   let lo = 0
   let hi = arm.length
@@ -1665,20 +1732,7 @@ export function normTypeAtom(arm: string) {
   while hi > lo && (arm[hi - 1] == ' ' || arm[hi - 1] == '\t') { hi = hi - 1 }
   let t = arm.slice(lo, hi)
   if t.length >= 2 && t[0] == '(' {
-    let depth = 0
-    let ci = 0
-    let wraps = true
-    while ci < t.length {
-      const cch = t[ci]
-      if cch == '(' {
-        depth = depth + 1
-      } else if cch == ')' {
-        depth = depth - 1
-        if depth == 0 && ci < t.length - 1 { wraps = false }
-      }
-      ci = ci + 1
-    }
-    if wraps { t = t.slice(1, t.length - 1) }
+    if tyGroupWrapsWhole(t) { t = t.slice(1, t.length - 1) }
   }
   t
 }
@@ -1786,13 +1840,23 @@ export function isStructAtom(stmts: i32[], a: string) {
 // reflist WRAPPER ref on the anyref, tag-discriminated. A PURE value union (`i32 | string`)
 // has no struct/ref-array, so it is handled earlier by `isValueUnionName`; a single struct +
 // `null` (`A | null`) has one non-null member, so it stays the kind-9 niche nullable ref.
+// ONE walk of `name`, not two. `unionMemberCount` is the COUNTING DUAL of
+// `splitUnionAtoms` — the identical depth ladder, the identical quoted-atom skip, the
+// identical top-level-arrow stop — so asking the count and then asking for the atoms of
+// the SAME name walked it twice for one answer; `atoms.length` IS that count.
 export function isVariantBoxUnion(stmts: i32[], name: string) {
-  // ONE walk of `name`, not two. `unionMemberCount` is the COUNTING DUAL of
-  // `splitUnionAtoms` — the identical depth ladder, the identical quoted-atom skip, the
-  // identical top-level-arrow stop — so asking the count and then asking for the atoms of
-  // the SAME name walked it twice for one answer; `atoms.length` IS that count.
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  isVariantBoxUnionAtoms(stmts, atoms)
+}
+// The ATOM-taking form, for a caller that has ALREADY split the same name. The split is
+// the expensive half of the predicate (a whole depth walk of the name), and it is pure —
+// so `registerInlineUnion`, which splits `name` into `matoms` at its top and then asked
+// this question of that SAME `name` at TWO of its dispatch arms, was paying for THREE
+// walks where one answers. #1147 filed this as hand-off 5 with the count measured but not
+// taken; it is taken here, and the invocation counters show it (`splitUnionAtoms` and
+// `tyTopIndexOf` both fall, with the classifier's own answer unchanged on every file).
+export function isVariantBoxUnionAtoms(stmts: i32[], atoms: string[]) {
   if atoms.length < 2 { return false }
   let structAtoms = 0
   let refArrAtoms = 0
@@ -1901,34 +1965,15 @@ export function callMemProp(exprIx: i32) {
 // `"ii>i"`), or "" when `name` is not such a param of function `fnIx`.
 // Top-level (paren/brace/bracket depth 0) index of `=>` in a synthetic function-type
 // name, or -1.
-export function annArrowAt(name: string) {
-  let depth = 0
-  let angOpen = 0
-  let i = 0
-  while i < name.length {
-    const c = name[i]
-    if c == '(' || c == '{' || c == '[' {
-      depth = depth + 1
-    } else if c == '<' {
-      depth = depth + 1
-      angOpen = angOpen + 1
-    } else if c == ')' || c == '}' || c == ']' {
-      depth = depth - 1
-    } else if c == '>' && tyGtIsClose(name, i, angOpen) {
-      depth = depth - 1
-      angOpen = angOpen - 1
-    } else if (
-      depth == 0 &&
-      c == '=' &&
-      i + 1 < name.length &&
-      name[i + 1] == '>'
-    ) {
-      return i
-    }
-    i = i + 1
-  }
-  -1
-}
+//
+// This was the EIGHTH hand-written copy of the file's bracket ladder, and the last one
+// outside the two homes. It differed from `tyTopLevelIndexOf` in exactly one thing —
+// the arrow's two-character lookahead — so the lookahead moved INTO the home as the
+// `'='` token and the copy became this line. The grouper arms were already
+// character-identical (the `||` chains list the same three pairs in a different order,
+// which the depth counter cannot see), and neither walk skips a quoted literal member,
+// so the substitution is a relocation and not a grammar change.
+export function annArrowAt(name: string) { tyTopLevelIndexOf(name, '=') }
 // THE ONE HOME of "the RETURN of a function-type name": the text after a TOP-LEVEL `=>`
 // (`(i32) => S[]` → `S[]`), or "" when `name` carries no top-level arrow.
 //

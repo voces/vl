@@ -41,7 +41,6 @@ import {
   nodeTyName,
   splitUnionAtoms,
   structNameOfTy,
-  tyGtIsClose,
   tyIsLitUnion,
   tyToNominalName,
   unionAliasDeclNameOfTy,
@@ -89,6 +88,7 @@ import {
   gaeLtAt,
   isStructAtom,
   isVariantBoxUnion,
+  isVariantBoxUnionAtoms,
   mapValNameOf,
   nameIsArray,
   nameIsBareMap,
@@ -115,6 +115,7 @@ import {
   shapeInnerFieldSplit,
   strContains,
   strLess,
+  tyGroupWrapsWhole,
   tyIsFuncType,
   tyNameOf,
   unionStructAliasShape,
@@ -3428,6 +3429,53 @@ function fieldRecElemName(tyIx: i32, code: i32) {
   en
 }
 
+// THE ONE HOME of the FIELD-ROW push: append one field's four parallel-column entries
+// (`*FieldTypes` / `*FieldElemName` / the D5 arena sidecar / `*FieldNames`) to the STRUCT
+// table (`toVariant` false) or the VARIANT table (true), then run the two per-row side
+// effects every recorder ran — the code-16 value-union box intern and the scalar-list
+// wrapper/backing forcing.
+//
+// #1147 named `fieldRecElemName` after finding the ELEMENT-NAME arm hand-written twice.
+// The ROW PUSH around it was hand-written THREE times: `collectS` (struct decls),
+// `collectVariantFields` (named-struct variants) and `collectShapeVariantFields` (inline
+// SHAPE-TEXT variants). The third is why the parameter is the elem NAME rather than the
+// annotation node: the shape-text recorder derives it from a field TYPE TEXT
+// (`shapeFieldElemName(ftxt, fc)`) where the two node recorders derive it from a
+// `FieldDef` node (`fieldRecElemName(fdType, code)`), and those two derivations are
+// genuinely different questions — the ROW is what all three share, character for
+// character, and it is all that is named here.
+//
+// The push ORDER matters and is preserved exactly: the D5 sidecar recorder pads itself
+// against `*FieldElemName.length`, so it must run AFTER that column's push and before the
+// next row's; `registerValueUnionName` must run after the row is complete because it can
+// push rows of its OWN into the union tables.
+function pushFieldRow(
+  toVariant: boolean,
+  code: i32,
+  elemNm: string,
+  fName: string,
+) {
+  if toVariant {
+    uFieldTypes.push(code)
+    uFieldElemName.push(elemNm)
+    recordUFieldElemTyIx(elemNm) // D5
+    uFieldNames.push(fName)
+  } else {
+    sFieldTypes.push(code)
+    sFieldElemName.push(elemNm)
+    recordSFieldElemTyIx(elemNm) // D5
+    sFieldNames.push(fName)
+  }
+  // A value-union field interns its box reps (the three recorders' shared parity rule):
+  // without it the field's per-rep value boxes are never interned, so the construct
+  // `struct.new`s a raw scalar where the box `(ref)` is required — invalid wasm.
+  if code == 16 { registerValueUnionName(elemNm) }
+  // A scalar-list field (`f: i64[]`) forces its backing + wrapper pair: a field may be the
+  // type's ONLY mention, with no standalone `i64[]` TypeRef to set the flag.
+  forceScalarListField(code)
+  0
+}
+
 // ── struct-type collection + struct-typedness of expressions ─────────────────
 // `isSName` tells whether a type-name refers to the declared struct; `collectS`
 // records the program's single struct type; the rest decide whether a given
@@ -3484,16 +3532,15 @@ export function collectS(stmts: i32[]) {
                 "emitProgram: only i32 / boolean / string / array struct fields are supported",
               )
             }
-            sFieldTypes.push(code)
-            const elemNm = fieldRecElemName(fnode.fdType, code)
-            sFieldElemName.push(elemNm)
-            recordSFieldElemTyIx(elemNm) // D5
-            sFieldNames.push(fnode.fdName)
-            // A value-union field interns its box reps (collectAnnShapes parity). The
-            // recorded name IS `fieldRefElemName`'s answer at code 16 (neither of the home's
-            // two arms fires), so this re-derivation is the same value for a third scan.
-            if code == 16 { registerValueUnionName(elemNm) }
-            forceScalarListField(code)
+            // The ROW is `pushFieldRow`'s (the struct table). The recorded elem name IS
+            // `fieldRefElemName`'s answer at code 16 (neither of `fieldRecElemName`'s two
+            // arms fires), so the home's code-16 intern reads the same value it would.
+            pushFieldRow(
+              false,
+              code,
+              fieldRecElemName(fnode.fdType, code),
+              fnode.fdName,
+            )
             cnt = cnt + 1
           } else {
             return emitFail("emitProgram: malformed struct field")
@@ -3555,20 +3602,10 @@ function collectShapeVariantFields(nm: string) {
         "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
       )
     }
-    uFieldTypes.push(fc)
-    const vfen = shapeFieldElemName(ftxt, fc)
-    uFieldElemName.push(vfen)
-    recordUFieldElemTyIx(vfen) // D5
-    uFieldNames.push(fnames[fi])
-    // A VALUE-UNION variant field (`{f: i32 | null}` as an arm of `{f:…} | string`)
-    // interns its box reps — the standalone-struct-field parity (`collectS`). Without
-    // it the field's per-rep value boxes were never interned, so the arm's construction
-    // `struct.new`'d a raw scalar where the box `(ref)` was required (invalid wasm).
-    if fc == 16 { registerValueUnionName(vfen) }
-    // A scalar-list field (`f: i64[]` in `{f: i64[]} | i32`) forces its backing +
-    // wrapper pair, exactly as a struct's field does — a variant may be the type's
-    // ONLY mention (no standalone `i64[]` TypeRef sets the flag).
-    forceScalarListField(fc)
+    // The ROW is `pushFieldRow`'s (the variant table) — the same four columns and the same
+    // two per-row side effects the two NODE recorders push. Only the elem-NAME derivation
+    // is this recorder's own: it reads the field TYPE TEXT, where they read a `FieldDef`.
+    pushFieldRow(true, fc, shapeFieldElemName(ftxt, fc), fnames[fi])
     cnt = cnt + 1
     fi = fi + 1
   }
@@ -3603,21 +3640,19 @@ function collectVariantFields(stmts: i32[], name: string) {
                 "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
               )
             }
-            uFieldTypes.push(code)
-            // The struct twin's ladder exactly (`fieldRecElemName`) — the variant table
-            // records the SAME name for the same code. Its own code-4 (litunion ARRAY) arm
-            // was REDUNDANT: `fieldRefElemName` falls through to
-            // `shapeFieldElemName(name, 4)`, whose `nameIsLitUnionArray` arm returns that
-            // very name, so the copy re-derived what its callee had already returned — which
-            // is exactly why `collectS`'s twin never needed it.
-            const vElemNm = fieldRecElemName(fnode.fdType, code)
-            uFieldElemName.push(vElemNm)
-            recordUFieldElemTyIx(vElemNm) // D5
-            uFieldNames.push(fnode.fdName)
-            // A value-union variant field interns its box reps (standalone-struct parity).
-            if code == 16 { registerValueUnionName(vElemNm) }
-            // Scalar-list variant fields force their list types (see the inline-shape twin).
-            forceScalarListField(code)
+            // The struct twin's ladder exactly (`fieldRecElemName` for the name,
+            // `pushFieldRow` for the row) — the variant table records the SAME name for the
+            // same code. Its own code-4 (litunion ARRAY) arm was REDUNDANT:
+            // `fieldRefElemName` falls through to `shapeFieldElemName(name, 4)`, whose
+            // `nameIsLitUnionArray` arm returns that very name, so the copy re-derived what
+            // its callee had already returned — which is exactly why `collectS`'s twin never
+            // needed it.
+            pushFieldRow(
+              true,
+              code,
+              fieldRecElemName(fnode.fdType, code),
+              fnode.fdName,
+            )
             cnt = cnt + 1
           } else {
             return emitFail("emitProgram: malformed union-variant field")
@@ -3738,32 +3773,20 @@ function assignTags() {
 // True if `name` is a SINGLE inline struct-shape group (`{…}`) — its leading `{` closes at the
 // FINAL char, never at depth 0 earlier. Rejects a union of shapes (`{x:i32}|{y:i32}`, whose first
 // `{` closes mid-string) and a map (`{[string]:V}`), both of which also start `{` and end `}`.
+//
+// The depth walk was this file's LAST hand-written bracket ladder, and the ONE thing it did
+// with the ladder — "no closer returns the depth to 0 before the final character" — is
+// `tyGroupWrapsWhole`'s whole contract, down to the reading of a group that never closes at
+// all (this copy answered TRUE for `{{x}`, and so does the home; the checker's
+// `parenEnclosesWhole`, which LOOKS like the same test, answers FALSE). `emit_base` is the
+// module both this and `normTypeAtom`'s paren-only twin already depend on, so the home is
+// there and the two cannot drift again.
 function nameIsSingleShape(name: string) {
   if name.length < 2 { return false }
   if name[0] != '{' || name[1] == '[' || name[name.length - 1] != '}' {
     return false
   }
-  let depth = 0
-  let angOpen = 0
-  let k = 0
-  while k < name.length {
-    const c = name[k]
-    if c == '{' || c == '[' || c == '(' { depth = depth + 1 }
-    if c == '<' {
-      depth = depth + 1
-      angOpen = angOpen + 1
-    }
-    if c == '}' || c == ']' || c == ')' { depth = depth - 1 }
-    if c == '>' && tyGtIsClose(name, k, angOpen) {
-      depth = depth - 1
-      angOpen = angOpen - 1
-    }
-    // A close returning to depth 0 before the final char means the leading group
-    // ended early — the remainder is a union tail / another shape.
-    if depth == 0 && k < name.length - 1 { return false }
-    k = k + 1
-  }
-  true
+  tyGroupWrapsWhole(name)
 }
 
 // THE ONE HOME of "a bare MAP's VALUE union needs registering too". `registerInlineUnion`
@@ -3830,7 +3853,9 @@ function registerInlineUnion(stmts: i32[], name: string) {
       // Supported ⇒ fall through to the `isVariantBoxUnion` registration below (the `nameIsMap`
       // value-recursion is skipped via its `matoms.length < 2` guard, so this map-FIRST union
       // name is not mis-parsed). Unsupported neighbour ⇒ a LOUD fail, never a silent mis-tag.
-      if !isVariantBoxUnion(stmts, name) {
+      // `matoms` IS `splitUnionAtoms(name)` — the split this predicate would redo — so it
+      // takes the ATOM form (`splitUnionAtoms` is pure in `name` alone).
+      if !isVariantBoxUnionAtoms(stmts, matoms) {
         return emitFail(
           "emitProgram: a map union member is not supported — use a struct member instead",
         )
@@ -3999,7 +4024,9 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // row — the ordering the name split preserved. A single shape has no top-level union to
   // register here, so decline.
   if nameIsSingleShape(name) { return 0 }
-  if !isVariantBoxUnion(stmts, name) { return 0 }
+  // The atom form again: `matoms` is still `splitUnionAtoms(name)` here — nothing between
+  // the split at the top of this function and this line rewrites either `name` or `matoms`.
+  if !isVariantBoxUnionAtoms(stmts, matoms) { return 0 }
   // Field unions of the shape arms must already be registered HERE (they push their
   // own un*/uVariants rows — after this union's rows are pushed, an interleaved
   // registration would corrupt its variant slice). The arm-field pre-registration is
