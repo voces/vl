@@ -13106,3 +13106,268 @@ number below is re-measured here — recorded so the leads are not lost:
 - The partition's counts as HANDED OVER (`wasmEmit` 6 · `emit_rewrite` 5 · `emit_query` 4 ·
   `emit_rep` 2 · `emit_mono` 8) are **NOT re-measured here** and must not be quoted as if
   they were. Per this program's own rule, a handed-off measurement is a lead, not a proof.
+
+
+## D-CLASSHOME — TEN grammars in the biggest file, one home each; `emit_classify` loses 28% of its parser calls (#1146)
+
+Branched at `441102b` (#1141), rebased through `7cefaa0` (#1142) and `c4e1674` (#1144) onto
+**`4dadedd`** (D-TCSCAN, #1143), the PR base. **Every number below was re-taken at `4dadedd` in one
+session** — nothing is
+inherited from an earlier base. Files: `compiler/emit_classify.vl` and this doc. Nothing else; the
+diff against `origin/master` is one source file.
+
+### The unit, the denominator, the command
+
+**Unit: CALL SITES** — a textual `NAME(` in non-comment code, comments stripped with a
+string-literal-aware `//` stripper, the resolver's own `function NAME(` header excluded, per-file
+sums cross-checked against the tree-wide total. Command: `parsercount.py compiler`, the counter the
+operator validated against five previously-published figures; it reproduces master's per-file table
+exactly at this base. **Both scoreboards are reported, because #1141 proved the headline one is a
+named subset and not an inventory:**
+
+| scoreboard | master `4dadedd` | this slice | Δ |
+|---|---|---|---|
+| **CORE** — the 23-resolver SCORECARD list | **451** | **368** | **−83** |
+| **OFF-LIST** — #1141's table (`tyGtIsClose` &c.) | 40 | 40 | 0 |
+| **TRUE TOTAL** | **491** | **408** | **−83** |
+
+Per file after: **`emit_classify` 214 (211 core + 3 off) · `emit_base` 63 · `emit_collect` 56 ·
+`typecheck` 49 · `emit_mono` 8 · `wasmEmit` 6 · `emit_rewrite` 5 · `emit_query` 4 · `emit_rep` 2
+· `emit_sections` 1.** `emit_classify` goes **297 → 214**, a **−28%** cut in the single largest
+concentration in the compiler; its share of the true total falls from **60.5% to 52.5%**. Every
+other file's count is byte-identical on both sides — this slice touches one file.
+
+### Enumerate by what the CODE is, not by what the ARGUMENT is
+
+Enumerating this file by *what each argument is* reproduces every prior verdict: 297 calls, 297
+different strings, 114 different enclosing functions, nothing obviously composable. Re-enumerating
+by **how many times the same grammar is hand-written out** — #1139's method, now three slices old —
+found **76 hand-written copies of TEN grammars**, and all ten collapsed.
+
+| grammar | copies on `4dadedd` | after | calls deleted |
+|---|---|---|---|
+| **"a BARE map"** — `nameIsMap(x) && !nameIsMapMemberUnion(x)` | **14** (+1 already adopted) | 1 (`nameIsBareMap` — **#1139's home, one module DOWN**) | 28 |
+| **"the type under the `\| null`"** — `nullablePartOf` peel-or-keep | **18** | 1 (`nonNulBaseOf`) | 17 |
+| **"this union's top-level ARMS"** — resolve the alias to its member set, memo-probe, else split | **15** | 1 (`unionArmsOf`) | 14 |
+| **the map's VALUE SLOT** — `mvSlotOfMapValNameOrMono ∘ mapValNameOf` | **7** | 1 (`mvSlotOfMapName`) | 6 |
+| **the map's VALUE SHAPE** — `mvShapeOfValName ∘ mapValNameOf` | **5** | 1 (`mvShapeOfMapName`) | 4 |
+| **the map's VALUE-KIND support test** — `mvValKindOfName ∘ mapValNameOf != -3` | **5** | 1 (`mapValKindLowerable`) | 4 |
+| **the ref-array element's SLOT** — `rlSlotByName ∘ refArrElemName` | **4** | 1 (`rlSlotOfArrName`) | 3 |
+| **the LITUNION-ARM CANON** — a **30-line body carried VERBATIM twice** | **2** | 1 (`canonLitUnionArms`) | 3 |
+| **the nullable base's STRUCT ROW** — peel, `repRowOfName`, then `structIndexOfTypeName` | **3** | 1 (`nulBaseStructRow`) | 2 |
+| **`(string\|null)[]` through a `\| null`** | **3** | 1 (`nameIsNulStrListDeep`) | 2 |
+| | **76** | **10** | **83** |
+
+**0 added · 0 laddered · 0 sidecars · 0 new fall-throughs · 0 arena legs.** Nine homes are a
+caller's own expression lifted verbatim. The tenth (`canonLitUnionArms`) is a body that already
+existed twice — same split, same niche guard, same widen-or-descend loop, same "unchanged ⇒ return
+the original" tail, differing only in the parameter's name — moved once, with **both** callers
+keeping their own cardinality gate, because they spell it differently for a reason
+(`mvCanonValName` returns early on a non-union; `rlCanonLitUnionAtoms` falls through to its own
+tail).
+
+The whole delta is accounted for per resolver, with no residue:
+
+| resolver | master | after | Δ | which home took it |
+|---|---|---|---|---|
+| `nullablePartOf` | 50 | 29 | **−21** | `nonNulBaseOf` −17 · `nulBaseStructRow` −2 · `nameIsNulStrListDeep` −2 |
+| `splitUnionAtoms` | 26 | 11 | **−15** | `unionArmsOf` −14 · `canonLitUnionArms` −1 |
+| `mapValNameOf` | 24 | 10 | **−14** | `mvSlotOfMapName` −6 · `mvShapeOfMapName` −4 · `mapValKindLowerable` −4 |
+| `nameIsMap` | 23 | 9 | **−14** | `nameIsBareMap` |
+| `nameIsMapMemberUnion` | 14 | **0** | **−14** | `nameIsBareMap` |
+| `refArrElemName` | 28 | 25 | **−3** | `rlSlotOfArrName` |
+| `nameIsLitUnionType` | 18 | 16 | **−2** | `canonLitUnionArms` |
+| the other 16 resolvers | — | — | **0** | untouched |
+
+**`nameIsMapMemberUnion` now has ZERO call sites in this file, and its import line is gone.** The
+info-gated self-lint found the dead import and three dead bindings — the cheapest possible proof
+that the collapse was total rather than partial.
+
+### The corollary the brief warned about fired THREE times in one session
+
+#1139 built `nameIsBareMap` in `emit_base.vl`, collapsed the five copies in *its* partition, and
+published that grammar as closed. **Fourteen more copies were sitting one module UP in
+`emit_classify.vl` the whole time** — in a file that already *imported* `nameIsBareMap` and called
+it at exactly **one** site (`refArrShapeKind`, adopted by #1140 with a comment saying so). The home
+existed, was reachable, was documented, was in the import list, and 14 of its 15 questions were
+still spelled out by hand. Cost of not sweeping: 28 call sites carried for two extra slices.
+
+**Four slices merged this technique on one day** — #1139 (`emit_collect`+`emit_base`), #1140
+(the ref-array ladder), #1144 (seven more grammars), #1143 (the checker's fourteen copies) — and
+the un-swept-copy failure recurred in three of them.
+
+That is instance one. Instance two: **the sweep is STILL not complete after this slice** — a
+**sixteenth copy lives in `emit_query.vl:835`** (`paramMap`), which is not this partition. Exact
+diff in the hand-offs. Instance three: **#1144 merged `annRetNameOf` into `emit_base.vl` half an
+hour before this PR opened, and `emit_classify.vl` already contains FIVE un-swept copies of that
+same grammar** (measured, listed in the hand-offs). Three independent slices, three grammars, the
+same failure mode: **a home is published as closed while copies of it live one module away.**
+
+### Evidence: a PURE DEDUP, proven by byte-identity
+
+Every channel re-run at `4dadedd`, against a master compiler built in the same session from the
+same bootstrap seed.
+
+* **Independent reproduction (method note 79):** the candidate compiles to the same bytes from the
+  master-built seed AND from an unrelated older seed — `CANDIDATE REPRODUCES byte-for-byte`.
+* **Corpus A/B — 1,324 entries, `DIFFERING FILES: 0`** on wasm SHA + build rc + normalised compiler
+  message + run stdout + run rc. Channel populations, measured on side A so the 0 means something:
+  **1,126 files produce wasm across 1,122 distinct SHAs · 1,324 carry a compiler message across
+  1,028 distinct · 1,086 produce stdout across 928 distinct · 198 build rejects · 209 nonzero run
+  rcs.** By channel: byte 0 · message 0 · stdout 0 · rc 0.
+* **Fuzz A/B — 25,600 programs/side** (32 seeds × 800, depth 5; the cases are generated ONCE per
+  seed by the MASTER compiler so both sides see byte-identical inputs, and each side gets a FRESH
+  `--out-dir` because `--shapes-out` appends), whole trees `diff -r`'d: **0 differing paths**.
+  Population: **25,293 non-empty `.out` and 307 `.err`** across 25,939 output files/side.
+* **Lint-tier A/B — a channel the build/run A/B cannot see** (`vl check --severity info`; `vl build`
+  suppresses warnings/infos): **1,324 files, 236 carrying at least one `[ERROR|WARNING|INFO]`,
+  386 diagnostics in total, 0 differing.**
+* **Suite: 2,042 passed / 0 failed / 8 ignored**, identical on both sides, and the **ignored-test
+  NAME SETS are identical** (empty symmetric difference in both directions) — a test that silently
+  stops running looks exactly like a pass. Both runs used `SELFHOST_NATIVE_ALIGN=1 deno task test`
+  in a worktree wired with the native `vl` binary and `node_modules`, so the magnitude is the FULL
+  suite, not the ~1,4xx a self-ignoring worktree reports.
+* `native-fixpoint.sh` **byte-for-byte** (stage3 == stage4, 1,029,979 B) · `rep-fuzz-check.sh`
+  **exact** (1 baselined, 0 unsound, 0 new, 0 stale) · `lint-self.sh` **RC=0** (info-gated).
+* Compiler binary **1,031,547 → 1,029,979 B (−1,568)**. Source **19,584 → 19,583 lines**
+  (+216/−217) — ten grammars of duplication removed, most of the budget spent on the homes' headers.
+
+### Entombment: ELEVEN sabotages, NINE red, TWO inert — and the inert ones are a finding
+
+A behaviour-preserving refactor cannot have a pin that fails on master; it is entombed by the
+equivalence evidence **plus a pin that fails under the SABOTAGE**. One class-leaving sabotage was
+built per home and corpus-A/B'd **against the candidate**, so red proves that home is both reached
+and consequential. (The table was measured at `7cefaa0` over 1,320 corpus files, two merges before
+the PR base; #1144 touched `emit_collect`/`emit_base` and #1143 `typecheck.vl`, none of them this
+partition, and the whole sweep reproduced **identically** at `7cefaa0` and at `441102b` before it,
+so the base is stated rather than re-spent.)
+
+| # | sabotage (leaves the home's equivalence class) | differing / 1,320 |
+|---|---|---|
+| S6 | `mvShapeOfMapName` passes the MAP name instead of its VALUE | **173** |
+| S10b | `mapValKindLowerable` answers `false` | **60** |
+| S8 | `mvSlotOfMapName` passes the MAP name instead of its VALUE | **53** |
+| S3 | `nonNulBaseOf` never peels (returns `name`) | **42** |
+| S4 | `nulBaseStructRow` inverts its nullability gate | **39** |
+| S1 | `nameIsBareMap` → `nameIsMap` (drop the member-union exclusion) at all 15 sites | **26** |
+| S9 | `rlSlotOfArrName` passes the ARRAY name instead of its element | **21** |
+| S2 | `unionArmsOf` skips the alias → member-set resolution | **1** |
+| S5 | `nameIsNulStrListDeep` drops its `\| null` peel leg | **0** |
+| S7 | `canonLitUnionArms` returns its argument unchanged | **0** |
+| S10 | `mapValKindLowerable` passes the MAP name instead of its VALUE | **0** |
+
+**S10 PERMUTED an invariant instead of breaking one, and S10b proves the home is live.**
+`mvValKindOfName("{[string]: V}")` classifies the whole map spelling as a *nested-map* value — a
+kind that is also `!= -3` — so feeding it the wrong string leaves the predicate's answer unchanged
+at every reach. Answering `false` unconditionally reddens 60 files. The tell was available before
+the build: the consumer compares against a **single sentinel**, so any sabotage that keeps the
+value off that sentinel is inert by arithmetic, not by absence of coverage.
+
+**S5 and S7 are inert on BOTH channels, and that is a finding about the code, not about this
+refactor.** Corpus 1,320: 0. Fuzz 6,400 programs/side (populations 6,301 non-empty `.out`, 99
+`.err`): 0. Both sabotage compilers are distinct binaries from the candidate (1,035,088 and
+1,035,153 B against 1,035,140 at that base), so the sabotage really was compiled in — the 0 is
+"nothing exercises this", not a harness failure. **Both bodies carry a `fuzz-nightly` seed in their
+OWN comments** (`154928295 d6` for the nulstr peel; `658239060 d5` for the litunion mv-slot twin):
+both were originally found by a channel this gate does not reproduce, and neither acquired a corpus
+fixture then. Four fixture attempts for S5 — `(string | null)[] | null` as param, as global,
+through a rebind chain, through a `!= null` narrow — came back identical on both sides, because
+`exprNulStrArray`'s **arena fast path `nodeArrayElemIsNulStr` answers first**, and #1126 measured
+`nodeTyIx` at 99.977% coverage at emit, so the name leg is very nearly dead already. Four attempts
+for S7 (litunion alias in a ref-list element union, in a map value union, reached through an
+annotation, reached through an inferred lambda factory) likewise did not separate the sides. **They
+are filed as owed fixtures with their exact shapes rather than dropped** — see the hand-offs. The
+honest statement: **these two homes are behaviour-identical moves of bodies that no channel in this
+gate can currently witness**, which is a weaker entombment than the other nine, and it is labelled
+as such rather than averaged into the table.
+
+### DECLINED, with the measurement: the three `tyGtIsClose` depth scanners
+
+The brief named these "the tell for where the re-implemented grammar still lives", and it is right
+— `shapeFieldParse`, `splitUnionArmsAllDepth` and `shapeInnerFieldSplit` are three hand-written
+`{}[]()<>` depth machines in one file, and a grammar with a real parser needs no angle heuristic.
+**They were not merged, and the reason is arithmetic, not squeamishness.** The only shared part is
+the four-line bracket-depth update; everything around it differs — one appends to a field
+name/type pair as it scans, one carries string-literal state and breaks at a top-level `=>`, and
+one uses independent `if`s rather than an `else if` chain, which is an **observable** difference:
+in the chained versions a `>` that fails `tyGtIsClose` falls through to the next arm and **is
+appended to the output**, while in the third it is simply ignored. Hoisting the shared part means a
+function call **per character of every type name the emitter classifies** — a work regression in a
+WasmGC-allocation-bound compiler (method note 13, and exactly the regression #1144's own count
+caught at +31.9%) — to buy **−2 off-list call sites**. The right fix for these three is to delete
+the scanners by giving the emitter the parser's tree (D-PARSETY), not to factor their arithmetic;
+until that lands, leaving them and saying so is the honest move.
+
+### Hand-offs, each with its measurement
+
+1. **#1144's `annRetNameOf` has FIVE un-swept copies in `emit_classify.vl`, measured at this PR's
+   own base.** Two are exact (`cloArrSlotRetName:6286`, `calleeCloRetName:7898` —
+   `const at = annArrowAt(x); if at < 0 { return "" }; return x.slice(at + 2, x.length)`; the home
+   gates `at < 1`, and #1144's own header argues that arrow-at-0 means a name beginning `=>`, which
+   no renderer produces). Three are the paren-gated variant
+   (`forceCloResultMapTypes:11940`, `forceCloResultListTypes:11980`, `unionRetOfFnType:14354` —
+   `fa >= 1 && a[0] == '('` then `monoUnwrapParens(a.slice(fa + 2, …))`), where the home's `>= 1`
+   gate matches exactly and the caller keeps its own `a[0] == '('` test and its own
+   `monoUnwrapParens`, which is precisely the split #1144's header specifies. **−5 core.** Three
+   FURTHER sites (`internFuncTypeShapes:10875`, `annSigKey:18269`, `nominalizeFnType:19508`) are
+   copies of #1144's `annFnDecompose` — arrow index, `name[0] == '('` and `name[at-1] == ')'`,
+   param-list slice, `annSplitParams` — and would take `annSplitParams` from 3 to 0 in this file.
+   Not taken here because the slice was fully gated when #1144 landed and re-spending the gate for
+   −5 was the worse trade; **the diff is exact and the sites are line-numbered.**
+2. **`emit_query.vl:835` is the SIXTEENTH copy of the bare-map grammar** and is nobody's partition.
+   Exact diff: in `paramMap`, `nameIsMap(tn) && !nameIsMapMemberUnion(tn)` → `nameIsBareMap(tn)`,
+   plus the import swap. **−2 core**, and it retires `nameIsMapMemberUnion` from a fourth file.
+   Tree-wide after this slice that resolver has **5** call sites left: `emit_base` 1 (inside
+   `nameIsBareMap` itself), `emit_collect` 2 (`3897`, `5166` — #1139 audited these as the residue
+   where the corrective-guard reading does NOT hold; re-verify before touching), `emit_rewrite` 1
+   (`429`, a positive classifier with no paired `nameIsMap`), `emit_query` 1 (migratable today).
+3. **The seventeen map-VALUE call sites are now ONE arena migration, not three sweeps.**
+   `mvSlotOfMapName` (7 callers), `mvShapeOfMapName` (5) and `mapValKindLowerable` (5) are the only
+   three places left in this file that ask a question about a bare map's VALUE, and each is one
+   line. `T.tys[m] is TyMap` gives the value type directly and `emit_rep`'s `tyMapValOf` (#1125)
+   already exists. **A three-line edit where it used to be a seventeen-site sweep.**
+4. **`unionArmsOf` is the single remaining `splitUnionAtoms` in the whole union-classifier family**
+   (15 callers). **12 of the 15 already compute `unionMemberTysOf` in the same function** and read
+   `atoms[m]` only to hand the SPELLING to a still-name-keyed downstream — the arena leg is already
+   the primary and the atoms are the fall-through. The three with no arena leg are
+   `memberUnionFieldName`, `unionClosureArrElemUnion` and `unionRefArrayArmSlotForElemAtom`. When
+   `msMemberAtomsOf` covers every row, there is ONE line to delete. Measure `uncovLive` per site
+   first, and **do not trust fuzz alone for it** (#1127).
+5. **Two owed fixtures, with the shapes that failed to reproduce.** (a) A `(string | null)[]`
+   reached through a `| null` wrapper where `nodeArrayElemIsNulStr` does NOT answer — the remaining
+   name-leg population of `exprNulStrArray` / `identBindingNulStrList`. **Probe the arena coverage
+   at those three sites FIRST: if it is total, the right move is to DELETE the name leg, not to pin
+   it.** (b) A litunion alias in a value union with **two different producers** — an annotation
+   `canonEmitTypeNames` softens to `string|i64` and an inferred lambda return `tyToEmitName` renders
+   as `K0|i64` — that must key ONE mv slot. Four hand-built shapes did not separate the sides; the
+   original witness is `fuzz-nightly` seed `658239060 d5`, so replaying that seed is cheaper than
+   re-deriving the shape.
+6. **`nullablePartOf` is still 29 in this file, and it is now an inventory rather than a fog.** The
+   17 peel-or-keep folds are gone, so what remains are sites that genuinely BRANCH on nullability.
+   The next reduction there is not another home — it is `TyNullable` off `nodeTyIx`.
+
+### Method notes earned
+
+87. **A shared home is not finished when it is written — it is finished when every module that asks
+    its question has been swept, and the sweep must run UPWARD too** (D-CLASSHOME). #1139 created
+    `nameIsBareMap` in `emit_base.vl` and published the grammar closed; 14 more copies lived one
+    module UP, in a file that already imported the home and called it once. **The import list is
+    not evidence of adoption — the call count is.** Grep the tree for the collapsed EXPRESSION, not
+    for the new function's name, and report both numbers. This rule fired **three times in one
+    session** (`nameIsBareMap` up from `emit_base`; a 16th copy in a third module found while
+    writing this hand-off; and #1144's `annRetNameOf` with five copies one module up, thirty
+    minutes after it merged).
+88. **A sabotage that keeps the value on the same side of a sentinel is a PERMUTATION, and its 0 is
+    arithmetic, not evidence** (S10 → S10b). Before believing an inert sabotage, ask what the
+    consumer actually TESTS: against a single sentinel, the sabotage must cross that sentinel.
+89. **An inert sabotage whose code carries a `fuzz-nightly` seed in its own comment is telling you
+    which channel to run — and if that channel is not in your gate, say so** (S5/S7). Both inert
+    homes were introduced to fix bugs the nightly fuzzer found at named seeds; neither got a corpus
+    fixture then, and the 16-seed generator this gate runs reproduces neither. **"No pin exists on
+    my two channels" is not "no pin can exist" — name the channel that found it originally, and
+    grade the entombment down instead of averaging it into the table.**
+90. **Ten one-line composition homes can outweigh the biggest ladder in the file.** Four of this
+    slice's ten grammars are pure compositions `f(g(x))` with no control flow; they look like
+    cosmetics and they are **31 of the 83 deleted calls** — and they are precisely where the arena
+    migration collapses seventeen call sites into three. **Do not skip a grammar because its home
+    would be a one-liner: the metric is the number of COPIES, not the size of the home.**
