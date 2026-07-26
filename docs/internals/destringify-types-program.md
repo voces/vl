@@ -11182,3 +11182,356 @@ moment you publish, not at the moment you first measured.** (See method note 80.
     in hours** — so either re-derive it against `origin/master` immediately before pushing, or do
     not claim it. The mechanical form: every number in a PR body should be reproducible by one
     command against the branch's actual base, and that command should be run last, not first.
+
+
+## D-UDVARTY + D-UDNEVER + D-ALIASARR + D-ISALIAS — the union DECLARATION stops re-parsing its own members, a parser is deleted, and the transparency rule's `is` spelling catches up (#1141)
+
+Branched at `7a714fd` (#1137), rebased onto **`74d6f71`** (#1139 D-COLLHOME + D-RAKIND, #1138
+D-VALUNION + D-LITISKIND + D-SETONCE). Both intervening merges leave `compiler/typecheck.vl`
+**byte-identical**, so the rebase is textually free — but they rewrote four emitter files
+(`emit_base` +189/−151, `emit_collect` +149/−206, `emit_rep` +69/−3, `wasmEmit` +108/−30), and
+two of this slice's four changes are visible to the emitter. **Every number below was re-taken
+at `74d6f71`**; none is carried across the rebase.
+
+Partition: `compiler/typecheck.vl` only, plus five new fixtures. **135 insertions / 35
+deletions**, one file.
+
+### What ships
+
+Four changes, two of them destringify moves and two of them the user-visible defects those
+moves uncovered.
+
+**D-UDVARTY** — the `UnionDecl` variant loop resolves the parser's SPELLING TREE:
+
+```diff
+-              const m = nameToTy(variants[vi])
++              const m = annotResolve(variants[vi], udTsRootAt(stmts[ti], vi))
+```
+
+**D-UDNEVER** — the empty-intersection diagnostic reads the `TS_ISECT` node's KIDS instead of
+re-splitting the name the parser concatenated, and **`splitTopAmp` is deleted**:
+
+```diff
+-              const ops = splitTopAmp(variants[0])
++              const opRoots: i32[] = []
++              const ops: string[] = []
++              const isectRoot = udTsRootAt(stmts[ti], 0)
++              if isectRoot >= 0 {
++                if tsKind[isectRoot] == TS_ISECT { … tsToName(tsKids[opStart + opk]) … }
++              }
+…
+-                      operandKind(nameToTy(ops[0])) +
++                      operandKind(tsToTy(opRoots[0])) +
+```
+
+**D-ALIASARR** — a one-member alias over an array whose spine bottoms out at a primitive is
+TRANSPARENT, like the `TyPrim` and `TyFunc` members before it.
+
+**D-ISALIAS** — `canonEmitTypeNames`' `IsExpr` arm rewrites a TRANSPARENT alias's `is` spelling
+to the same emit name the union-variant arm gave the member, through the same producer.
+
+### The census, at this head
+
+Unit: **dynamic invocations**, over the FROZEN parent corpus — `tests/cases` at `74d6f71` with
+this slice's five pins moved aside, **1,314 files** — swept with `vl check --codegen <dir>`, the
+shared-INSTANCE channel that runs the FULL pipeline (check *and* emit). 1,281 programs reach
+`checkProgram`. The probe reports through a `tErr`, which blocks emit for the program that
+reports; it reports only on programs that already carry a diagnostic plus every 128th, so **8 of
+1,281 (0.6%) did not reach emit**. That distortion is stated because the first version of this
+probe reported on EVERY program and therefore blocked EVERY emit — and read `ntt_clone=0`,
+`ntt_lam=0`, `ntt_annot=0`. Those three zeros were **blindness, not measurement**; the emit-time
+population is in fact the majority of what is left.
+
+| `nameToTy` call site | invocations | share of non-recursive |
+|---|---|---|
+| `annotResolve`'s NAME fall-through (all positioned annotations) | **2,614** | 53.5% |
+| `recordClonedNodeTy` (the monomorphizer's cloned nodes) | **1,545** | 31.6% |
+| **`UnionDecl` variants — this slice** | **548** | **11.2%** |
+| `applyGenAlias` argument names | 81 | 1.7% |
+| lambda `paramTyNames` (2 sites) | 51 | 1.0% |
+| `unionMemberGenAppShape` | 21 | 0.4% |
+| `canonEmitName`'s intersection fold | 18 | 0.4% |
+| `operandKind` pair — this slice | 6 | 0.1% |
+| **non-recursive total** | **4,884** | 100% |
+| `nameToTy`'s own recursion | 6,279 | — |
+| **grand total** | **11,163** | — |
+
+**The hand-off's "2,185 dynamic invocations" does not reproduce and should not be quoted.** It
+is not wrong so much as unlabelled: a CHECK-ONLY sweep of this same corpus reads **774**, of
+which the `UnionDecl` site is 546 — **70.5%** — and the full pipeline reads 11,163. Which number
+is right depends entirely on whether the emitter ran, and the previous slice's figure states
+neither the command nor the denominator. Stated here: **check-only 774 · check+emit 11,163 ·
+1,314 files.**
+
+`singleAliasMemberTyIx`'s member census over the same sweep — the denominator D-ALIASARR needed:
+
+| meets a `TyUnion` | one member | `TyPrim` | `TyFunc` | `TyObj` | `TyLit` | **`TyArray`** | `TyMap` | `TyNullable` |
+|---|---|---|---|---|---|---|---|---|
+| 2,551 | 178 | 67 | 48 | 41 | 18 | **0** | 0 | 0 |
+
+### D-UDVARTY's agreement, and the comparator that makes the 0 mean something
+
+| quantity | value |
+|---|---|
+| reads at the site | **548** |
+| carrying a spelling-tree root | **548** — 0 misses, 100% |
+| both sides answered | 547 (1 row both declined) |
+| distinct rendered types, TREE side / NAME side | **224 / 224** |
+| disagreements, STRICT structural walk | **0** |
+
+The name leg at this site is **dead by construction, not merely measured at 0**: `mkUnionDecl`
+has exactly two call sites, both in `parser.vl`, and each banks its member roots with `setUdTs`
+on the very next line — so no `UnionDecl` exists without a per-member root ROW. The residual is
+narrower than "no row": `setUdTs` may bank a root of **-1** for a member whose producer left
+nothing on the stack (reachable only from a malformed parse), and *that* population measured 0.
+The fall-through stays because `annotResolve` is the shared body serving the unpositioned
+population, not a rung private to this site.
+
+**The comparator, sabotage-proved in one build** (an extra union layer wrapped around the TREE
+side's answer, same corpus, same sweep):
+
+| comparator | sabotage OFF | sabotage ON |
+|---|---|---|
+| **strict structural walk** (no union flattening) | 0 | **547** — every both-answered row |
+| `tyEq` | 0 | **0** |
+| render equality (`tyToStr`) | 0 | **1** |
+
+`tyEq` flattens union layers by design and is **totally blind** to the perturbation; picking it
+would have made "0 disagreements" worthless. The render comparator — the one earlier scorecards
+in this document used — catches **1 of 547**, because `tyToStr` renders a one-member union as its
+member, which is the exact bug family this program exists to delete. Only the strict walk
+separates them.
+
+### REFUTATION: #1137's caution on the array arm is right for ONE element kind and wrong for five
+
+The hand-off said: *"unlike functions, arrays DO have a nominal emit route to lose — establish
+what the emit route actually is before you widen anything."* Measured, both halves need
+correcting, in opposite directions.
+
+The method is #1137's own: a **twin table** — the same program in the ALIAS and the INLINE
+spelling across every position, since "the alias is transparent" IS the claim "the two spellings
+are indistinguishable". 17 positions × 6 alias bodies = **102 cells**, run on both compilers.
+(The harness normalises the one-line offset the `type L = …` declaration adds and the file name
+out of every diagnostic; a **control body** whose arm already exists, `type L = i32`, reads
+**0 of 17 differing**, which is what proves the harness does not manufacture differences.)
+
+**On the parent, the array alias has no working route to lose because it has no working route at
+all.** 17/17 positions differ for every one of the six bodies, and there are **0 cells where the
+alias spelling works and the inline spelling does not**. `xs[0]` reads ``cannot index non-array
+i32[]``; `.length`/`.push` read ``field '…' is not on every member of i32[] — narrow with `is`
+first``; both read as nonsense precisely because `tyToStr` renders the one-member union as its
+member. And a RETURN whose result is never read **builds an invalid module**.
+
+**But the caution is exactly right for a NOMINAL element, and only there.**
+`singleMemberAliasName` hands the emitter `tyToEmitName(m)`, which renders a declared struct
+element structurally — `Cat[]` becomes `{n:i32}[]` — dropping the name the emitter's element
+tables key on. That route is load-bearing and I broke it before I found it: with the arm
+unconditional, `type Cat = {n: i32}; type L = Cat[]` used as a UNION ARM in a parameter
+(`function f(x: L | i32)`) goes from **running on the parent** to an emit reject. So the arm ships
+gated on `arrSpineIsScalar` — peel the array spine, require a `TyPrim` leaf, the condition under
+which the render is name-faithful.
+
+| | parent | shipped |
+|---|---|---|
+| cells where the ALIAS works | 0 / 102 | **74 / 102** |
+| **cells that REGRESSED** | — | **0** |
+| cells still rejected (both spellings, or the gated `Cat[]`) | — | 28 |
+
+The ungated version read 89 FIXED / 6 REGRESSED-MODE — six cells where a **located reject became
+an invalid module**. That is the trade the gate buys, and finding it took a position the twin
+table did not contain (a union-arm parameter never read), which is its own note below.
+
+### The defect D-ALIASARR uncovered, which is older and worse than D-ALIASARR
+
+With the array arm in, two twin positions turned an alias-side type error into an **invalid
+module**. The instinct — narrow the array arm until they go away — was wrong, and one table
+shows why. Taking the `is`-narrowed UNION-ARM position and running it for **every** arm of the
+transparency rule, on the parent:
+
+| alias | arm, and when it landed | parent behaviour |
+|---|---|---|
+| `type Id = i32` | `TyPrim` — the OLDEST arm | **INVALID MODULE** `failed to compile: wasm[0]::function[4]` |
+| `type F = (i32) => i32` | `TyFunc` — #1137 | emit reject |
+| `type MyCat = Cat` | `TyObj` — pre-existing | emit reject ``is` names a type that is not a union variant`` |
+| `type L = i32[]` | `TyArray` — this slice | checker reject (the LID) |
+
+Every inline twin runs. So the defect is not the array arm's: `canonEmitTypeNames` rewrote a
+transparent alias's union MEMBER into the emitter's vocabulary and left the `is` spelling on the
+same annotation alone, and `type Id = i32` in a union narrowed with `is` has been building an
+invalid module for as long as that arm has existed. The array arm's own checker reject was the
+lid — method note 78, third instance.
+
+D-ISALIAS is written against the transparency PREDICATE, not against any arm, so the `is`
+spelling and the variant spelling come from one producer and cannot diverge. **All four rows
+above run after it.** It is deliberately not a blanket `canonEmitName`: that softens a literal
+member to its base scalar (`"a"` → `string`) and would destroy a literal-union `is` test that
+works today.
+
+### The parser deleted — and the list that does not count it
+
+**`splitTopAmp` is gone**: a depth-aware top-level `&` scanner over a rendered type name,
+`<>`-aware since D-CLASSANG, with exactly one call site. Its replacement reads child edges of a
+`TS_ISECT` node. That is a type-string parser removed from the compiler by the SCORECARD
+CORRECTION's own definition.
+
+**It moves the 23-parser list by 0, because the list does not contain it.** Verified with the
+string-literal-blanking, definition-header-excluding counter at both commits:
+
+| unit | parent `74d6f71` | shipped | delta |
+|---|---|---|---|
+| the 23-parser list, tree-wide | **523** | **523** | **0** |
+| the 23-parser list, `typecheck.vl` | 20 | 20 | 0 |
+| **`splitTopAmp`** (call sites / definition) | **1 / present** | **0 / DELETED** | **−1** |
+| `nameToTy` static call sites (tree-wide; all in `typecheck.vl`) | 20 | **17** | **−3** |
+
+So the brief's framing — *"the 23-parser list is 523 and has not moved; no parser has been
+deleted yet"* — is half right. A parser was deleted here and the list still reads 523. **The list
+is not an inventory of the compiler's type-string parsers; it is the inventory the SCORECARD
+CORRECTION happened to enumerate**, and using it as the program's headline metric will keep
+scoring 0 for work that is exactly on-target. A first pass at what it omits, all in
+`typecheck.vl` unless noted, counted the same way:
+
+| off-list type-string scanner | call sites | what it takes apart |
+|---|---|---|
+| `tyGtIsClose` | 27 (13 typecheck, 8 emit_base, 3 emit_classify, 3 emit_collect) | `>` disambiguation inside a spelling |
+| `skipQuotedName` | 10 | quoted literal members in a spelling |
+| `splitTypeName` | 6 | top-level `|`/`&`/`,` split |
+| `nameHasPipe` | 5 | top-level `|` scan |
+| `topLevelArrowIndex` | 3 | top-level `=>` scan |
+| `nameHasSep` | 3 | top-level separator scan |
+| `splitGenArgs` | 2 | top-level `,` in a generic argument list |
+| `canonShapeName` / `nameNeedsCanon` / `unionAliasMembers` / `nameIsGenAppOfDecl` / `litBaseName` / `isPlainAliasRef` | 1 each | shape/canon/application scans |
+| **total** | **62** | — |
+
+`splitTopAmp` was a 24th of these, and it is now a 23rd. Whoever owns the scorecard should
+decide whether the headline number becomes 523 + 62 (and this slice reads −1) or stays as it is
+with a footnote; it should not stay as it is *without* one.
+
+### The channels
+
+Denominators attached, populations shown, both sides of every A/B built at `74d6f71`.
+
+| channel | volume + population | result |
+|---|---|---|
+| corpus A/B — wasm SHA + build rc + compiler message (paths normalised) + run stdout + run rc | **1,319 files**; 1,119 produce wasm with **1,115 distinct SHAs**, 200 carry a compiler message (**198 distinct**), 1,077 produce stdout (**923 distinct**) | **4 differing — all four are this slice's own new pins.** Over the frozen 1,314-file parent corpus: **0**, on every channel (byte 0 · message 0 · stdout 0 · rc 0 after excluding the pins) |
+| corpus LINT tier (`vl check --severity hint`) — a channel build/run cannot see | **1,319 rows**, **756 distinct lint texts** | **2 differing — both this slice's own pins**; 0 over the frozen 1,314 |
+| fuzz A/B, whole `--out-dir` trees via `diff -r` | **12,800 programs/side**, 12,973 output files/side; 12,643 non-empty `.out`, 157 `.err` | **`diff -r` RC=0, 0 output lines, 0 differing paths** |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | parent **2,026 / 0 / 14**, shipped **2,031 / 0 / 14** | **+5 = exactly the five new pins**; ignored NAME SETS byte-identical (`diff` RC=0), so nothing that ran on the parent stopped running |
+| `native-fixpoint.sh` | — | **RC=0**, stage3 == stage4 byte-for-byte, 1,036,629 B |
+| `lint-self.sh` | — | **RC=0** |
+| `rep-fuzz-check.sh` | — | **RC=0**, exact; 1 baselined failure (0 unsound, 1 reject), 0 new, 0 stale |
+
+The fuzz A/B generates each seed's cases ONCE (with the parent compiler) and runs the identical
+case files through both sides — an A/B over differently-generated programs compares nothing.
+
+Binary, like-for-like (ONE compiler, two sources): 1,036,664 → **1,036,629 bytes (−35)**. The
+deleted scanner pays for the four additions.
+
+### Entombment
+
+Five fixtures. Four are red on a parent-built compiler, each for a **different** reason, two of
+them invalid modules:
+
+| pin | parent `74d6f71` | shipped |
+|---|---|---|
+| `types/array-alias-transparent.vl` | type error — `cannot index non-array i32[]` | runs |
+| `types/array-alias-return-unread.vl` | **INVALID MODULE** — `failed to compile: wasm[0]::function[4]::build` | runs |
+| `types/transparent-alias-is-narrow-union-arm.vl` | type error (the array arm's lid, ahead of the real defect) | runs |
+| `types/prim-alias-is-narrow-union-arm.vl` | **INVALID MODULE** — `failed to compile: wasm[0]::function[4]` | runs |
+| `types/array-alias-nominal-element-stays-opaque.vl` | runs | runs — a NO-REGRESSION pin, red only under S2 |
+
+D-UDVARTY and D-UDNEVER are behaviour-preserving and cannot have a fails-on-parent pin. Two
+sabotages of the SHIPPED path (no probe present):
+
+| sabotage | corpus differing | pins red | what it proves |
+|---|---|---|---|
+| **S1** — the TREE leg's answer wrapped in an extra array layer | **204 of 1,319** (byte 189 · message 196 · stdout 174 · rc 185) | 4 of 5 | the tree leg is **live** at the `UnionDecl` site — an inert sabotage here would have meant the ladder never leaves the name path |
+| **S2** — `arrSpineIsScalar` removed (every `TyArray` member transparent) | — | **exactly 1** — `array-alias-nominal-element-stays-opaque.vl`, with the predicted `emitProgram: only i32, i64, … parameters are supported` | the gate is **exactly right**, not lazily narrow |
+
+S2 is the one worth keeping, for the same reason #1137's was: a sabotage that merely removed the
+new arm would only re-prove the pins. Removing the *gate* names the one element kind that must
+stay opaque, and the pin that catches it is a file that passes on both compilers — the only kind
+of pin that can police a no-regression boundary.
+
+D-ISALIAS needs no separate sabotage: the parent IS the build without it, and
+`prim-alias-is-narrow-union-arm.vl` is red there for D-ISALIAS's reason alone, with no array
+involved.
+
+### Hand-offs, each with the measurement
+
+1. **`typecheck.vl` — `annotResolve`'s NAME fall-through is now the whole game: 2,614 of 4,884
+   non-recursive `nameToTy` invocations (53.5%), the single largest population left.** It reads
+   0 at check time and 2,614 with the emitter running, so it is entirely the emitter's
+   re-resolution traffic — `synthTypeRef`-minted nodes and `emit_rep`'s post-canon calls, the
+   two populations `annTsOf` answers -1 for by construction. Neither has a parser spelling to
+   bank, so this is NOT another ladder: it needs the emitter to stop synthesizing names, which
+   is the SCORECARD CORRECTION's "kill the SOURCES" strategy applied to the last big consumer.
+   **Do not attempt it as a `typecheck.vl` slice.**
+2. **`typecheck.vl` — `recordClonedNodeTy`, 1,545 invocations (31.6%), and it is the reachable
+   one.** The monomorphizer clones a generic body and substitutes concrete type-param names into
+   fresh annotation nodes, then re-parses those names. The clone knows the SUBSTITUTION
+   (`TyVar` → arena index) and the source node's recorded type, so the honest fix is to
+   substitute into the recorded TYPE rather than into the NAME — `recordNodeTyFrom` already
+   exists for exactly the sibling case. Unmeasured: whether the cloned node's source type is
+   available at every one of the emit_mono call sites. Probe before wiring.
+3. **`typecheck.vl` — `TyMap` is the last unpopulated transparency arm.** `map=0` in the same
+   census, so it cannot regress anything extant, and `type M = {[string]: i32}` is the same
+   degenerate wrapper. It needs its OWN twin table (the array table's positions do not
+   transfer — a map has no `[0]`/`.length`/`.push`) and its own answer to the nominal-render
+   question this slice found: `tyToEmitName`'s `TyMap` arm renders the VALUE type, so the gate
+   is probably `mapValue` non-nominal, but that is a hypothesis and this slice's whole lesson is
+   that the gate must be found by measurement, not by analogy.
+4. **`emit_*` — the residual 28 twin cells, and the one that is NOT this partition's.** With the
+   gate in, `Cat[]` keeps the parent's behaviour, which means `type Cat = {n:i32}; type L = Cat[]`
+   is still opaque and its 15 broken positions stay broken. The fix is not in the checker: it is
+   that `tyToEmitName` has no name-faithful rendering for an array of a DECLARED struct, so the
+   reflist element-name family (`refArrElemName` / `nameIsRefArray`) cannot key on it. If the
+   element tables learn a nominal element, this slice's gate can be widened and
+   `array-alias-nominal-element-stays-opaque.vl` becomes red-by-design and should be re-pinned.
+   The precise witness is in that fixture's header.
+5. **The SCORECARD's parser list needs an inventory decision** — see the 62-call-site table
+   above. This slice deleted a parser and scored 0 on the headline metric.
+
+### Method notes earned
+
+82. **A probe that reports through a DIAGNOSTIC blocks the phase it reports from, and the zeros
+    it prints for the later phase are BLINDNESS** (D-UDVARTY). The compiler wasm is instantiated
+    with no imports, so a probe cannot `print`; the available channel is `tErr`, and a `tErr`
+    makes the driver skip emit. The first sweep reported on every program and read
+    `ntt_annot=0 · ntt_clone=0 · ntt_lam=0` — three sites that are in fact **4,210 invocations**,
+    86% of the non-recursive population. The fix is to make the probe report only where it costs
+    nothing (programs that already carry a diagnostic) plus a sparse tail sample, and to **state
+    the residual distortion as a count** (8 of 1,281, 0.6%). The tell was available before the
+    measurement: three sites that are structurally emit-time cannot all be 0 in a sweep whose
+    command was chosen for check.
+83. **`vl check --codegen <dir>` is the shared-INSTANCE channel that runs the EMITTER**
+    (D-UDVARTY). #1129 established `vl check <dir>` as the cheap shared-instance channel and
+    method note 16 ruled out `vl run --batch` (fresh Store per case, so counters reset). Neither
+    covers emit. `--codegen` runs `compileSrc()` over a directory in one instance, which is the
+    only way to accumulate emit-time counters across programs — and it is what turns note 82's
+    three zeros into real numbers. (It traps on `compiler/` as a root, on the parent too; that is
+    someone else's defect, not a probe artifact.)
+84. **A twin table's POSITION LIST is itself a hypothesis, and the position it omits is where the
+    regression lives** (D-ALIASARR). The 17-position table said 89 FIXED / 6 REGRESSED-MODE and
+    the six were all `is`-narrowed union arms. Fixing those with D-ISALIAS took the table to
+    89/0 — and the arm was still wrong, because the position that actually regressed
+    (`function f(x: L | i32) { return 0 }` — a union-arm parameter whose value is never touched)
+    was not in the table at all. It was found by hand-reducing a *different* failure. **When a
+    transparency change lands, enumerate positions where the annotation is present and never
+    USED**, not only positions that exercise it; those are the ones where the checker's reject
+    was never going to fire and the emitter's route is the only thing being tested.
+85. **Widening a rule to fix its 74 broken cells can convert a located reject into an invalid
+    module, and the arithmetic must be published in BOTH directions** (D-ALIASARR). The ungated
+    arm was 89 fixed / 6 mode-regressed; it would have been easy to publish "89 fixed" and let
+    the reader assume the rest were unchanged. A cell-by-cell classifier that names
+    `REGRESSED-MODE (located reject -> INVALID MODULE)` as its own class is three lines of
+    harness and it is what forced the gate to exist. **A miscompile is not a smaller version of
+    a reject; classify them apart or the net will read positive while the compiler gets less
+    trustworthy.**
+86. **A headline metric that does not contain your target will score correct work at 0**
+    (D-UDNEVER). The 23-parser list is the program's scoreboard and it omits at least 13 further
+    type-string scanners totalling 62 call sites, including the one this slice deleted. The
+    honest response is not to redefine the metric mid-flight to flatter the slice — it is to
+    report the list unchanged at 523, report the deletion separately, and hand the inventory
+    question over explicitly. **Report the metric you were given AND the thing you actually
+    changed; never quietly substitute one for the other.**
