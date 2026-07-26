@@ -855,9 +855,9 @@ function emitStatement(ix: i32, indent: i32) {
   } else if n is FuncDecl {
     emitFunction(ix, n, indent)
   } else if n is TypeDecl {
-    emitTypeOrUnionDecl(ix, indent)
+    emitTypeOrUnionDecl(ix, indent, true)
   } else if n is UnionDecl {
-    emitTypeOrUnionDecl(ix, indent)
+    emitTypeOrUnionDecl(ix, indent, false)
   } else {
     emitExpressionStatement(ix, indent)
   }
@@ -1001,7 +1001,27 @@ function splitTopLevel(s: string, sep: string) {
 // (the form the parser accepts — a NEWLINE right after `=` does not parse). A
 // struct RECORD (`type N = { a: T, … }`) opens the brace, one field per line with
 // a trailing comma, then a closing `}`.
-function wrapTypeDecl(codeLine: string, indent: i32, suffix: string) {
+//
+// `isRecord` is the PARSER's own verdict, threaded down from the `n is TypeDecl` /
+// `n is UnionDecl` test at the statement dispatch — not re-derived here from the
+// rendered spelling. `parseTypeDecl` emits a `TypeDecl` for exactly one RHS shape,
+// a `{ … }` with NO `&`/`|` continuation, and a `UnionDecl` for every other,
+// INCLUDING `{ … } & { … }` and `{ … } | { … }`, which it re-encodes as a union
+// over synthetic member names. Asking the text instead (`body[0] == '{'`) called
+// both of those re-encoded shapes a record and peeled `body.slice(1, len - 1)` off
+// a body whose first `}` is not its last, producing a decl that does not re-parse:
+// `vl fmt` failed with "formatter produced invalid output — file left unchanged,
+// please report" (rc 3) on valid source. The wrapped shapes it now emits are pinned
+// by `tests/cases/parser/type-decl-brace-{union,intersection}-multiline.vl`, which
+// are the PARSER half; the fmt half has no corpus pin because `tests/` is excluded
+// from the `vl fmt --check` gate by construction (see the D-FMTDECL hand-off).
+// The parser has already decided this; the spelling is not asked a second time.
+function wrapTypeDecl(
+  codeLine: string,
+  indent: i32,
+  suffix: string,
+  isRecord: boolean,
+) {
   let eq = 0
   let found = false
   while eq < codeLine.length && !found {
@@ -1010,8 +1030,8 @@ function wrapTypeDecl(codeLine: string, indent: i32, suffix: string) {
   if !found { return false }
   const head = rstrip(codeLine.slice(0, eq + 1)) // `export type N =`
   const body = rstrip(trimWsStart(codeLine.slice(eq + 1, codeLine.length)))
-  if body.length > 0 && body[0] == '{' {
-    // struct record
+  if isRecord && body.length > 1 {
+    // struct record — the RHS is exactly `{ … }`, so the peel is sound
     const inner = body.slice(1, body.length - 1)
     const rawFields = splitTopLevel(inner, ",")
     const fields: string[] = []
@@ -1046,7 +1066,7 @@ function wrapTypeDecl(codeLine: string, indent: i32, suffix: string) {
   true
 }
 
-function emitTypeOrUnionDecl(ix: i32, indent: i32) {
+function emitTypeOrUnionDecl(ix: i32, indent: i32, isRecord: boolean) {
   const raw = rstripWsAll(sliceNode(ix))
   const lines = splitLines(raw)
   const stopLine = stopLineOf(ix)
@@ -1064,7 +1084,7 @@ function emitTypeOrUnionDecl(ix: i32, indent: i32) {
   if lines.length == 1 {
     const codeLine = exportPrefix(ix) + trimWsStart(lines[0])
     if indent * 2 + codeLine.length > fmtWidth {
-      if wrapTypeDecl(codeLine, indent, suffix) { return 0 }
+      if wrapTypeDecl(codeLine, indent, suffix, isRecord) { return 0 }
     }
   }
   let i = 0
