@@ -21026,7 +21026,7 @@ hunk is pinned by files that predate the slice.
      in the most natural shape a user would write**, so the incomplete version is worse than the
      clean reject it replaces. File it whole.
 
-## D-SIGHOME — the `$fnsig` INTERN, written out nine times, gets one home (#PRNUM)
+## D-SIGHOME — the `$fnsig` INTERN, written out nine times, gets one home (#1174)
 
 The census that picked this target enumerated **by what the CODE is, not by what the ARGUMENT
 is**, and it was run at the slice's own HEAD (`3974381`) rather than inherited — three stale
