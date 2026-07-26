@@ -134,12 +134,16 @@ merged modules):
 // buf.vl
 type Buf = { base: i32, length: i32 }
 let bumpPtr = 16
-export function Buffer(byteLength: i32): Buf { … }              // bump, zero-fill
-export function storeI32(self: Buf, off: i32, v: i32) { __store_i32__(self.base + off, v); 0 }
+export function Buffer(byteLength: i32): Buf { … }   // bump the global, zero-fill, return {base, length}
+export function storeI32(self: Buf, off: i32, v: i32) {
+  __store_i32__(self.base + off, v)
+  0
+}
 export function loadI32(self: Buf, off: i32): i32 { __load_i32__(self.base + off) }
 ```
+
 ```
-$ vl run bufmain.vl        # a.storeI32(0,111); b.storeI32(0,222)
+$ vl run bufmain.vl        # a.storeI32(0, 111) ; b.storeI32(0, 222)
 64
 111
 222
