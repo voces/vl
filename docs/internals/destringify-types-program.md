@@ -16065,3 +16065,412 @@ same length, not new work; (c) the fuzz side (the counters were summed over the 
    `splitUnionAtoms` looks like the same one-value-two-parses shape and is not — it is a
    non-allocating cheap reject in front of an allocating split, so deleting it is a WORK
    REGRESSION (#1138's rule). Left alone.
+
+## D-SCALARLIST + D-ARMPATH + D-FIELDHOME — the scalar-list KIND ladder, the union-ARM field-path walk, and `emit_classify`'s SECOND definition of the shape FIELD scanner (#1155)
+
+**Slice: `compiler/emit_classify.vl` only** (plus this doc). Branched at `4758935` (#1152) and
+**rebased onto `1c8d911`** after #1153 (D-BANKREAD + D-QUOTEWALK) landed mid-slice.
+**Every number below is re-taken at `1c8d911`, in one session**, against a master compiler built in
+that same session. **Nothing is inherited from the hand-off — and re-measuring it overturned its
+headline correction.**
+
+**The rebase mattered and was re-verified rather than assumed.** #1153 rewrote `typecheck.vl` —
+which moves the TREE-WIDE totals (CORE 326 → 325, OFF-LIST 35 → 34, and one hand-written bracket
+walk, `isObjShapeName`, retired) — but **did not touch `emit_classify.vl`**; the code commits
+replayed with no edit, and the scoreboard DELTA is identical either side of the rebase
+(**−8 CORE / −1 off-list / −9 TRUE**), as is the per-file `emit_classify` reading (**186 → 177**).
+Quoting the pre-rebase base here would be wrong by 1 core and 1 off-list.
+
+### Scoreboard at this base, and the delta
+
+Re-measured with `scratchpad/parsercount.py compiler` (unit: **non-comment CALL SITES** of the
+23-resolver CORE list + #1141's off-list table, definition headers excluded):
+
+| | CORE | OFF-LIST | TRUE |
+|---|---|---|---|
+| master `1c8d911` | **325** | **34** | **359** |
+| this PR | **317** | **33** | **350** |
+| delta | **−8** | **−1** | **−9** |
+
+All −9 are in `emit_classify.vl` (**186 → 177**). Per resolver in that file: `nameIsStringArray`
+**12 → 8**, `nameIsI32Array` **9 → 5**, `tyGtIsClose` **3 → 2**. `emit_query.vl` is **unmoved at 2**,
+deliberately — see TARGET 3. **0 added, 0 laddered, 0 sidecars.**
+
+**THE SECOND METRIC, AND IT IS THE BETTER ONE.** Hand-written type-name **bracket-depth walks**
+tree-wide: **12 → 11**. Broken down, because the bare number hides the thing that matters —
+5 of the 12 are the *published homes* (`tyTopLevelIndexOf` / `tyTopLevelSplit` / `tyGroupWrapsWhole`
+in `emit_base`, `tyTopIndexOf` / `tyGroupEndIndex` in `typecheck`) and 1 is the source FORMATTER
+(`format.splitTopLevel`, legitimate residue). The metric that should go to zero is the **COPIES**:
+**6 → 5**, and after this slice **all five live in `emit_classify.vl`** (`shapeFieldParse`,
+`splitUnionArmsAllDepth`, `annRetKind`, `unionArmSigKey`, `monoUnwrapParens`). (#1153 retired
+`typecheck.isObjShapeName` in the same cycle, which is why the tree-wide base reads 12 and not 13.)
+
+Compiler binary **1,026,831 → 1,024,539 = −2,292 B** (the same −2,292 either side of the rebase).
+Source: CODE lines **12,308 → 12,186**
+(**−122**), comment lines **+56** — the three homes carry their own justification, which is the point.
+
+### The technique, again: enumerate by what the CODE is
+
+Three grammars, **thirty-one hand-written copies**, three homes.
+
+**(1) `scalarListKindOfName` — the SCALAR-ELEMENT LIST ladder, 5 copies × 5 predicates = 25 calls.**
+
+```vl
+if nameIsI32Array(t) { … }    // the i32-backed list
+if nameIsStringArray(t) { … }
+if nameIsF64Array(t) { … }
+if nameIsI64Array(t) { … }
+if nameIsF32Array(t) { … }
+```
+
+written out at `mvValKindOfName` (as a five-way `||` disjunction), `fieldCodeOfSpelling` (→ field
+codes 4/6/25/26/27), `forceCloResultListTypes` (→ the `slUsed`/`fa64Used`/`ia64Used`/`fa32Used`/
+`lUsed` type flags), and the two `$fnsig` ABI producers `annParamKind` / `annRetKind` (→ the
+`list`/`strlist`/`f64list`/`i64list`/`f32list` tokens). Five places that each had to re-decide that
+this enumeration is CLOSED and what its members are — and five a sixth scalar backing would have to
+be added to, in agreement. **The `$fnsig` pair is the sharpest case: `annParamKind` and `annRetKind`
+are twenty lines apart and spell the identical five arms, differing only by a `">" +` prefix.**
+
+**The three copies did not even agree on ORDER** (`fieldCodeOfSpelling`/`annParamKind`/`annRetKind`
+ask i32 first; `forceCloResultListTypes` asks string first and i32 LAST), which is only sound if the
+five predicates are pairwise DISJOINT. They are — and **probe P1 measures that instead of asserting
+it** (below).
+
+**Deliberately NOT folded in, each with the reason.** `tyAnnRefListKind` and `nulScalarListKind`
+*look* like this ladder and are not: they SPLIT what it FOLDS, answering `nameIsNulBoolList` /
+`nameIsNulLitUnionList` / `nameIsNulStrList` as their own kinds where arms 0 and 1 here deliberately
+absorb them. `mvShapeOfValName`'s three arms and `rlElemStoredName`'s two are strict PREFIXES that
+never ask the remaining arms — routing them through the home would run predicate calls the sites
+never used to pay. Four copies left standing, on purpose, and filed rather than smuggled.
+
+**(2) `unionArmPathLeafIs` — the union-ARM FIELD-PATH walk, 5 copies of 27 lines.**
+
+`unionArmPathIsMap`, `unionArmPathIsMapList`, `unionArmPathIsClosure`, `unionArmPathHasCloValue` and
+`unionArmPathIsCloArray` are **character-for-character identical** for the whole walk — resolve the
+arm through the struct table OR the variant table, take the first hop from whichever holds it,
+require every MID hop to be a code-15 nested-struct field and follow its target — and differ ONLY in
+the leaf test, one to five lines out of twenty-seven. Two facts that were invisible while the five sat
+200 lines apart: **`unionArmPathIsClosure` and `unionArmPathHasCloValue` differ by exactly the code-16
+line**, and **`unionArmPathIsMapList` and `unionArmPathIsCloArray` differ by exactly which question the
+code-5 element is asked.** The five wrappers are now one line each over a `want`-selected home, and
+the five leaf questions read as the closed set they are.
+
+**(3) `shapeInnerFieldSplit` — a SECOND DEFINITION of one function, in a second module.**
+
+`emit_classify.vl` carried its own `shapeInnerFieldSplit`: same name, same signature, same answer as
+`emit_base.vl`'s **exported** one, and its own `{}` `[]` `()` `<>` depth walk with its own
+`tyGtIsClose` close rule. **The home already existed and was already reachable** — `emit_classify`
+already imports 60-odd names from `emit_base`. Adding one word to the import list deleted a 44-line
+hand-written walk.
+
+**And #1143's filed version of this win is STALE in a way that made it better, not worse.** That
+hand-off said the two were "BYTE-IDENTICAL … differs only by `export`", so publishing the home was
+"a one-word `export`". At `4758935` they are **not** byte-identical: #1147 had already migrated
+`emit_base`'s copy onto `tyTopLevelSplit`, so the two were no longer the same CODE — only the same
+behaviour. The 0-difference corpus + fuzz A/B is what establishes that, not the diff.
+
+### TARGET 1 — the map-VALUE sites are SEVENTEEN. #1152's correction to SIXTEEN is itself wrong.
+
+The hand-off recorded: *"'The SEVENTEEN map-VALUE sites' re-measures at SIXTEEN. At `5d011ff`:
+`mvSlotOfMapName` **6** callers (not 7 — lines 4471, 4483, 4676, 7140, 17648, 18297; 17779 is the
+definition)."*
+
+**Re-derived with a string-literal-aware `//` stripper, at BOTH heads:**
+
+| | `mvSlotOfMapName` | `mvShapeOfMapName` | `mapValKindLowerable` | total |
+|---|---|---|---|---|
+| `5d011ff` (#1152's own base) | **7** | 5 | 5 | **17** |
+| `4758935` (this base) | **7** | 5 | 5 | **17** |
+
+The omitted site is **`mvCanonRepOf(mvSlotOfMapName(a))`** — `5d011ff:12065`, `4758935:12096` — inside
+`unionHasMapArmSlot`. It is live code, not a comment. The enumerated line numbers are also from
+neither head (they sit +91 from `5d011ff` and −3 from `4758935`), so the list was taken from a
+working tree and then attributed to a commit.
+
+**The original count of 17 was RIGHT.** The correction removed a real site. Everything else in that
+hand-off's TARGET 2 survives: all seventeen are in `emit_classify.vl`, each one line, and the blocker
+is unchanged — `mvSlotOfMapName` / `mvShapeOfMapName` / `mapValKindLowerable` all take a NAME and all
+three are `X(mapValNameOf(mapName))`, one slice of the map's spelling; their callers hold `lt.tyName`
+or an atom spelling, not a node. **This slice did not take it** (it is a bank-at-the-intern-site
+problem, not a sweep), and the count is now correct for whoever does.
+
+**METHOD NOTE: a re-measurement is not automatically the better number.** "Re-measure the hand-off"
+has been vindicated eleven times in this file; this is the first time the *correction* was the error.
+Two heads, one stripper, and printing the SITES rather than the count is what caught it.
+
+### TARGET 3 — `emit_query`'s arena leg: the module-graph move is AVAILABLE and PROVED, and the migration is DECLINED on its own measurement
+
+**The graph fact, verified to the transitive closure rather than one hop.** `annRepKindOf` is four
+lines over `repOfNode`; `repOfNode` lives in `emit_rep.vl`; `emit_classify.vl` **imports**
+`emit_query.vl`, so calling `annRepKindOf` there is a cycle. The hand-off said the leg is available
+because "`emit_rep` does not import `emit_query`". That is true but not sufficient — the question is
+whether `emit_query` is in `emit_rep`'s transitive closure. It is not:
+
+```
+emit_rep  → ast, emit_base, emit_state, typecheck
+emit_base → ast, typecheck        typecheck → ast, check_state, emit_bignum
+emit_state→ (nothing)             closure = {ast, emit_base, emit_state, typecheck,
+                                             check_state, emit_bignum}   ∌ emit_query
+```
+
+**And it is proved by construction, not by reading**: probe P3 adds `import { repOfNode } from
+"./emit_rep"` to `emit_query.vl` and **the compiler builds** (1,026,534 B). No relocation of
+`annRepKindOf` is needed at all — importing `repOfNode` directly is enough.
+
+**Then the measurement kills the migration.** P3 instruments five of the six siblings and counts, per
+site, reach · YES (the name predicate answers true) · covered (`rdCovered == 1`) · agree · disagree ·
+`uncovLive` (arena declines AND the name answers true). Corpus, 1,137 programs:
+
+| site | reach | YES | covered | agree | DISAGREE | uncovLive |
+|---|---|---|---|---|---|---|
+| `paramArray` (i32-backed) | 6,136 | 267 | 1,945 | 1,945 | **0** | **0** |
+| `paramStringArray` | 8,899 | 94 | 1,323 | 1,323 | **0** | **0** |
+| `paramF64Array` | 8,960 | 55 | 1,222 | 1,222 | **0** | **0** |
+| `paramF32Array` | 6,324 | 10 | 650 | 650 | **0** | **0** |
+| `paramI64Array` | 6,296 | **0** | 607 | 607 | **0** | **0** |
+| **TOTAL** | **36,615** | **426** | **5,747** | **5,747** | **0** | **0** |
+
+- **Agreement is TOTAL where covered — 5,747/5,747, 0 disagreements.** The arena leg is *correct*.
+- **Coverage is 15.7%** (5,747/36,615). An arena-first ladder therefore keeps the name predicate,
+  which is exactly the shape that is **CORE-neutral** — the call site stays — and a **work
+  regression**: a `repOfNode` descriptor build in front of a predicate whose body is `name ==
+  "f64[]"`, paid on all 36,615 reaches to be useful on 5,747. **DECLINED, with the arithmetic.**
+- **`uncovLive = 0` is the real finding, and it is NOT vacuous.** The first version of this probe had
+  no `YES` column, so `agree == covered` could have been both sides answering *false* every time; the
+  column was added for exactly that reason. There are **426** positive answers and **every one is
+  arena-covered**. So the arena leg is **TOTAL for the positive population (426/426)** while covering
+  only 15.7% overall.
+
+**⇒ The hand-off's own framing ("it is a LADDER, CORE-neutral unless total") is confirmed, and the
+route past it is now named:** the name leg is not needed as a *fall-through*, it is needed only to
+answer NO. A slice that establishes **`rdCovered == 0 ⇒ not a scalar-element list` BY CONSTRUCTION**
+can DELETE the name leg rather than ladder in front of it, taking `emit_query` to **CORE 0**. That is
+a construction argument about `repOfNode`'s coverage rule — not another measurement.
+
+**Also re-verified at this head:** `paramI64Array` answers TRUE **zero times** across the whole
+corpus. Recorded as an observation, not a deletion argument — a per-consumer 0 has two explanations
+and this measurement separates neither.
+
+### Probes — every claim measured, every 0 comparator-proved
+
+**Base note, stated rather than glossed:** the four gate legs whose *absolute* numbers can move under
+a `typecheck.vl` change (suite, corpus A/B, lint-tier A/B, fuzz A/B, invocation counts) were all
+**re-run at the gating head `1c8d911`** and are reported from that run. The probe and sabotage
+figures in this section and the next were taken on the pre-rebase pair (`4758935` ↔ the identical
+code diff); they measure `emit_classify.vl` behaviour that #1153 does not touch, the code commits
+replayed with no edit, and the scoreboard delta, binary delta and every invocation delta are
+identical either side of the rebase.
+
+**P1 — DISJOINTNESS of the five scalar-list predicates.** `scalarListKindOfName` evaluates all five
+on every call and counts how many fire.
+
+| | reaches | **two or more fire** | exactly one | none |
+|---|---|---|---|---|
+| corpus (1,137 programs, 313 files reach it) | **15,757** | **0** | 963 | 14,794 |
+
+**Comparator PROVED in one build:** a deliberate-overlap build (`nameIsF32Array(t) || nameIsArray(t)`
+in the fifth slot) reads **multi = 841 on 39 files**. The 0 is a measurement, not blindness. The
+predicates are pairwise disjoint over 15,757 reaches, so the copies' three different orders are one
+answer and the home's order is behaviour-free.
+
+**⚠️ HARNESS DEFECT, caught by implausible magnitude.** The first P1 corpus run reported **182
+programs** where 1,137 build clean. Cause: `emitFail`'s message is emitted with a `file:line:col:`
+prefix, and the aggregator anchored its `grep` at `^`. **A low or zero count on a probe leg can be
+the harness's pattern, not the program's behaviour** — the same class as "a `0` on a fuzz leg can be
+the ARGUMENT PARSER". Fixed to `grep -o`, the count is exactly 1,137.
+
+**P2 — reach of the union-arm field-path home.** Instrumented for per-`want` reach, multi-hop reach,
+mid-hop rule fires and leaf hits. Result over 1,137 corpus programs: **reach = 0 on every counter**,
+including on `tests/cases/maps/union-arm-map-list-elem-read.vl`, the corpus file named for the path.
+
+### Entombment — and one home has NO pin, on either channel
+
+This slice is a **behaviour-preserving refactor**, so by the standing rule it cannot have a pin that
+fails on master; it is entombed by the equivalence evidence plus pins that fail under sabotage.
+
+| sabotage | corpus files differing |
+|---|---|
+| **SAB-S1** — `scalarListKindOfName` stops classifying (returns `-1` for every name) | **37** |
+| **SAB-S3** — the imported `shapeInnerFieldSplit` drops its LAST field | **305** |
+| **SAB-S2** — the walk's code-15 mid-hop rule inverts | **0** |
+| **SAB-S4** — `unionArmPathLeafIs` answers `true` unconditionally | **0** (and **0** of 33,600 fuzz programs) |
+
+**S1 and S3 are the pins**: the pre-existing corpus already covers the converted sites, so neither
+merge is over-merged.
+
+**S2 AND S4 ARE INERT, AND THAT IS A FINDING ABOUT THE CORPUS, NOT A FOOTNOTE.** S4 is the strongest
+sabotage available — the home stops walking anything and answers `true` for every arm, every path,
+every `want` — and **nothing changes on 1,340 corpus entries or 33,600 fuzz programs.** It agrees with
+P2's independent `reach = 0`. So: **five classifier functions, ~135 lines, whose headers name the
+specific invalid-wasm bugs they were added to prevent** ("the narrowed `call_ref`'s closure spill
+landed on an UNRESERVED index — shared with the next frame … invalid wasm"; "the narrowed map read's
+scratch stores landed on UNRESERVED indices … an i32 local receiving the map struct ref, invalid
+wasm") **have NO regression coverage whatsoever on either channel.** No pin can exist for this home
+and entombment is graded DOWN accordingly.
+
+**What stands in for the missing pin is a CONSTRUCTION argument, mechanically checked rather than
+eyeballed.** A script lifts each of the five master bodies, excises the block under
+`if hop == path.length - 1 {`, normalises the function name out of the signature, and compares what
+is left: **all five skeletons are byte-identical, at 26 code lines each.** The five excised leaves
+are exactly, and only:
+
+```
+unionArmPathIsMap        code == 19
+unionArmPathIsMapList    code == 5 && nameIsMap(elem)
+unionArmPathIsClosure    code == 14 || code == 22
+unionArmPathHasCloValue  code == 14 || code == 22 → true; code == 16 → unionHasClosureArm(elem); else false
+unionArmPathIsCloArray   code == 5 && annArrowAt(peelGroupParens(elem)) >= 0
+```
+
+The home is that common skeleton verbatim and the `want` switch is those five leaves verbatim, so the
+transformation is answer-preserving **by construction** — which is the right kind of evidence for a
+merge no channel can witness. What the measurement actually argues for is a *fixture*, filed below.
+
+### The work check — a "no behaviour change" gate CANNOT see a work regression
+
+Both sides instrumented with per-function EXECUTION counters (`emit_base.vl` 20, `emit_classify.vl`
+10, `typecheck.vl` 4 — reset at the top of `emitProgram`, so this is emit-phase work), over the same
+1,137 corpus programs. **34 counters; 28 read exactly 0 delta.** The six that move, and why:
+
+| counter | master | this PR | delta |
+|---|---|---|---|
+| `nameIsStringArray` | 125,815 | 125,789 | **−26** |
+| `nameIsNulStrList` | 147,962 | 147,936 | **−26** |
+| `nameIsI32Array` | 102,115 | 102,131 | +16 |
+| `nameIsLitUnionArray` / `nameIsNulBoolList` / `nameIsNulLitUnionList` / `splitUnionAtoms` / `nameIsLitUnionType` | (each) | (each) | +16 |
+| `nameIsArray` / `listElemNameOf` | 869,214 / 532,931 | 869,236 / 532,953 | +22 |
+| `tyTopLevelIndexOf` / `nullablePartOf` | 733,969 / 426,313 | 733,975 / 426,319 | +6 |
+| `shapeInnerFieldSplit` (`emit_base`'s) | 964 | 4,509 | **+3,545** |
+| `tyTopLevelSplit` | 12,809 | 16,354 | **+3,545** |
+
+**Attributed exactly, in two independent parts** (co-filed hunks measured SEPARATELY):
+
+- **H1 alone reads +100 on a base of 4.64M — +0.0022%** — and every one of it is
+  `forceCloResultListTypes`, the single site whose own order was string-first. 26 calls that master
+  answered with one `nameIsStringArray` now pay a `nameIsI32Array` (itself a four-predicate ladder)
+  first. **The alternative was built and REFUTED**: reordering the home to string-first to erase
+  those 26 reads **+2,686** — 27× worse — because four other sites are i32-dominated. The copies'
+  majority order is the cheap one; the home keeps it, and the +100 is the priced cost of the fifth
+  copy's deletion.
+- **H3's +7,090 is a RENAME, and the relocation identity is exact.** P1 measured `emit_classify`'s
+  deleted local `shapeInnerFieldSplit` at **3,545** executions; `emit_base`'s went **964 → 4,509**,
+  and 964 + 3,545 = **4,509** exactly. `tyTopLevelSplit` rises by the same 3,545 because
+  `emit_base`'s implementation delegates to it. The 3,545 character walks did not appear — they moved
+  to a counter that was not watching them before. (Cross-check, on the pre-rebase pair where both
+  probe generations were run: they differ only by which module's `shapeInnerFieldSplit` is counted,
+  and 4,640,246 − 3,545 + 964 = 4,637,665 reproduces the second run's master total to the unit.)
+
+**WHAT THIS INSTRUMENT DOES NOT COVER.** It counts CALLS, not allocations. H3's real price is one
+intermediate `string[]` per call — `emit_base`'s version materialises `parts` where the deleted copy
+split in one pass. That is **3,545 arrays over 1,137 programs = 3.1 per program**, stated rather than
+hidden, and far under the threshold that made "do not chase the parse count into an allocation
+regression" a rule. It also does not count the `want` dispatch H2 adds: at most four i32 compares at
+the leaf, against a walk whose every rung is a struct/variant TABLE NAME SCAN.
+
+### Gate — every RC checked explicitly
+
+| leg | result |
+|---|---|
+| `refresh-compiler.sh` | **RC=0**, 1,024,539 B |
+| `native-fixpoint.sh` | **RC=0** — stage3 == stage4 byte-for-byte (1,024,539 B) |
+| `lint-self.sh` (after `vl fmt f > tmp && mv tmp f`; fmt made no change) | **RC=0**, self-lint + fmt-check clean |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **RC=0 — 2,060 passed / 0 failed / 8 ignored**; the master baseline re-measured in the SAME session with the SAME command reads **2,060 / 0 / 8**, and the ignored-test **NAME SETS are identical** (diffed, 8 names) |
+| corpus A/B (build rc + wasm sha256 + normalized message + run rc + stdout + stderr, one output FILE per input, `diff -r`) | **1,340 rows, 0 differences** |
+| lint-tier A/B (`vl check` over the same 1,340 files) | **1,340 rows, 0 differences** |
+| fuzz A/B (14 seeds × 3 depths × {plain, declared} × 200) | **33,600 programs/side, 0 differences** |
+| `rep-fuzz-check.sh` | **RC=0** — `exact ✅ (1 baselined failure — 0 unsound, 1 reject; 0 new, 0 stale)` |
+| invocation counts on both sides | **34 counters, 4,638,257 → 4,645,447 (+7,190)**, every delta attributed above; **re-taken at the gating head `1c8d911`, where every per-counter delta is IDENTICAL to the pre-rebase measurement** (#1153 shifts the absolute totals — it deletes a `nameIsLitUnionType` call site — and moves no delta) |
+
+**Channel populations, so no 0 is an empty run.** Corpus (side A): **1,137** build clean · 203 build
+rejects · **1,133 distinct wasm hashes** · 1,084 rows carry a `@run` · 4 non-zero run rcs · all 1,340
+carry a message. Lint tier: **192** rows carry an `[ERROR]/[WARN]/[INFO]`, 180 have a non-zero
+`CHECK_RC`. Fuzz (side A): **32,060** build clean · 1,540 build rejects · **22,374 distinct wasm
+hashes** · 1,541 non-zero run rcs. The A/B candidate is **byte-identical** (md5
+`ce543fa868a42f1b39f75fbd61029934`) to the `refresh-compiler.sh` output the fixpoint gate proved, so
+every leg tested the shipped artefact.
+
+**PUBLISHED FUZZ BLIND SPOT.** `scripts/fuzzgen.vl` emits SINGLE FILES, so the module-merge paths are
+corpus-and-pin-only; it emits the map constructor at exactly one site, always as an annotated local,
+never `return Map()` nor an un-annotated global bound to a call. **The union-arm field-path family
+(H2) is a population the generator cannot reach** — which is half of why SAB-S4 is inert on that
+channel; the other half is that the corpus cannot reach it either. **P1's disjointness counter was
+run on the CORPUS only**; the fuzz channel covers H1 through the 33,600-program A/B (a behavioural
+check), not through the counter — stated rather than claimed as two independent zeros.
+
+### Refutations (worth more than the agreement)
+
+1. **#1152's "seventeen re-measures at SIXTEEN" is WRONG — it is SEVENTEEN**, at its own base and at
+   this one. `mvSlotOfMapName` has **7** callers; the enumeration omitted
+   `mvCanonRepOf(mvSlotOfMapName(a))` in `unionHasMapArmSlot`, and its line numbers match neither
+   commit. The count it "corrected" was right. **Print the SITES, not the count.**
+2. **My own first choice of home ORDER was wrong, and the invocation counter caught it.** String-first
+   reads **+2,686** where i32-first reads **+100**. The order is behaviour-free (P1) but *not*
+   work-free, and reasoning about which is cheaper was not possible from the source.
+3. **#1143's "`shapeInnerFieldSplit` is BYTE-IDENTICAL in the two modules — publishing the home is a
+   one-word `export`" is STALE.** `emit_base`'s copy was migrated onto `tyTopLevelSplit` by #1147;
+   they share behaviour, not code, and `emit_base`'s was already exported. The win is real and larger
+   than filed (a 44-line walk, not an `export` keyword) but the stated reason for it no longer holds.
+4. **`tyAnnRefListKind` / `nulScalarListKind` are NOT copies of the scalar-list ladder** — they split
+   the nullable-niche list forms that arms 0 and 1 deliberately fold. Merging them would be a
+   behaviour change wearing a dedup's clothes.
+5. **My own `agree == covered` was not evidence until the `YES` column existed.** P3's first
+   generation could have been reporting "both sides answer false 5,747 times". It is 426 real
+   positives, all covered — but that had to be measured, not argued.
+6. **"No pin exists" is stated with WHERE it searched** (#1128's rule): SAB-S4 over 1,340 corpus
+   entries and 33,600 fuzz programs, plus P2's direct `reach = 0` counter, plus a hand check of the
+   one corpus file named for the path.
+
+### Hand-offs, each with its measurement
+
+1. **The map-VALUE sites are SEVENTEEN, not sixteen** (TARGET 1 above). All in `emit_classify.vl`,
+   each one line, blocker unchanged and re-verified: the three homes take a NAME, their callers hold
+   `lt.tyName` or an atom spelling. `mvValTyIx` exists and `mvValTyIxAt` already serves six arena
+   duals off it; the missing piece is a node index at the three homes — bank-at-the-intern-site.
+2. **`emit_query` can reach the arena, the edge is PROVED acyclic and PROVED to compile, and the
+   ladder is DECLINED on its numbers** (TARGET 3 above). The next move there is not the ladder: it is
+   the construction argument **`rdCovered == 0 ⇒ not a scalar-element list`**, which would let the
+   name leg be DELETED rather than fallen through to, taking `emit_query` from CORE 2 to **0**.
+   Measured inputs for whoever takes it: 36,615 reaches, 426 positives, **426/426 arena-covered**,
+   0 disagreements, 15.7% overall coverage.
+3. **THE HIGHEST-VALUE ITEM IN THIS SECTION IS A MISSING FIXTURE, NOT A DELETION.** The five
+   `unionArmPath*` classifiers guard frame-slot reservations against documented invalid-wasm bugs and
+   are **unreachable on both channels** — a compiler home whose failure mode is silent invalid wasm
+   and whose regression coverage is empty. The shape needed is named in their own headers: a union
+   ident whose narrowed member CHAIN (`t0.f.g`) bottoms out in a closure / map / list-of-maps /
+   closure-array field, reached through a `call_ref` or a map read, in a frame the pre-pass must
+   reserve for. `unionStructArmMapListElemIndex` additionally wants the INDEXED-root form
+   (`t0[i].f[0][k]`). **Write the fixture first, then the home has a pin.**
+4. **Four copies of the scalar-list enumeration remain, deliberately** — `tyAnnRefListKind`,
+   `nulScalarListKind` (both split what the home folds; a real behaviour difference),
+   `mvShapeOfValName` and `rlElemStoredName` (both strict PREFIXES; routing them through the home
+   adds predicate calls they never paid). The first two are a *latent-bug* question — do the nullable
+   niche forms belong in the fold? — needing their own fixture; the last two are a work question that
+   an inlined `scalarListKindOfName` would dissolve.
+5. **`emit_classify` now holds ALL FIVE remaining hand-written bracket-depth COPIES tree-wide**
+   (`shapeFieldParse`, `splitUnionArmsAllDepth`, `annRetKind`, `unionArmSigKey`, `monoUnwrapParens`)
+   — the whole residue is in one file, which is the best position this metric has been in.
+   `monoUnwrapParens` is #1147's filed "not reachable from here" item and is now reachable in the
+   other direction — it is a paren-only `tyGroupWrapsWhole`, one module up.
+
+### Method notes earned
+
+109. **A RE-MEASUREMENT IS NOT AUTOMATICALLY THE BETTER NUMBER.** "Re-measure the hand-off" has been
+     vindicated eleven times in this file; TARGET 1 is the first time the *correction* was the error
+     (17 → "16" → 17). What separated them was measuring at **two heads with one stripper** and
+     **printing the sites rather than the count** — an enumeration can be checked, a scalar cannot.
+110. **A LOW COUNT ON A PROBE LEG IS AS SUSPECT AS A ZERO, AND FOR THE SAME REASON.** P1's first
+     corpus run read 182 of 1,137 because `emitFail`'s message carries a `file:line:col:` prefix and
+     the aggregator anchored its `grep` at `^`. Neither a 0 nor a 13% is a measurement until the
+     denominator is reproduced.
+111. **AN "AGREE" COLUMN IS NOT EVIDENCE WITHOUT A "POSITIVE" COLUMN.** `agree == covered` is
+     satisfied trivially when both the arena and the name answer *false* every time. P3 needed a
+     `YES` count before its `uncovLive = 0` meant anything; it turned out to rest on 426 real
+     positives, but that was a fact to establish, not to assume.
+112. **THE INERT SABOTAGE IS THE RESULT WHEN IT AGREES WITH AN INDEPENDENT COUNTER.** SAB-S4 (0 diffs
+     on 1,340 + 33,600) on its own is ambiguous — weak sabotage or dead code. Paired with P2's direct
+     `reach = 0`, it is a measurement: five invalid-wasm guards with zero regression coverage. **Two
+     instruments disagreeing about a 0 is a harness bug; two agreeing is a finding.**
+113. **A HOME'S ARM ORDER IS BEHAVIOUR-FREE AND WORK-EXPENSIVE.** Disjointness (P1) makes the order
+     of a collapsed ladder unobservable, which is exactly what makes it easy to pick wrong: the two
+     candidate orders here differ by **27×** in helper executions (+100 vs +2,686) with byte-identical
+     output. Measure the order, do not argue it.
