@@ -779,13 +779,8 @@ export function nameIsNulBool(name: string) {
 // against 2). A nested `(boolean|null)[][]` / nullable `(boolean|null)[] | null` is NOT
 // this (their element is a LIST, not the scalar niche) — only the single-level list.
 export function nameIsNulBoolList(name: string) {
-  if !nameIsArray(name) { return false }
-  let elem = name.slice(0, name.length - 2)
-  if elem.length > 1 {
-    if elem[0] == '(' {
-      if elem[elem.length - 1] == ')' { elem = elem.slice(1, elem.length - 1) }
-    }
-  }
+  const elem = listElemNameOf(name)
+  if elem == "" { return false }
   nameIsNulBool(elem)
 }
 // True if `name` is a 1-D `(string | null)[]` list — a LIST of the string ref made nullable.
@@ -796,13 +791,8 @@ export function nameIsNulBoolList(name: string) {
 // (`retStrArrFlag`, via `nodeTyArrayElemRepName` → "string"), NOT the union-box ref list. A nested
 // `(string|null)[][]` / nullable `(string|null)[] | null` is NOT this (their element is a LIST).
 export function nameIsNulStrList(name: string) {
-  if !nameIsArray(name) { return false }
-  let elem = name.slice(0, name.length - 2)
-  if elem.length > 1 {
-    if elem[0] == '(' {
-      if elem[elem.length - 1] == ')' { elem = elem.slice(1, elem.length - 1) }
-    }
-  }
+  const elem = listElemNameOf(name)
+  if elem == "" { return false }
   nameIsNulString(elem)
 }
 // True if `name` is a 1-D `(K | null)[]` list — a LIST of the literal-union atom made nullable via
@@ -813,13 +803,8 @@ export function nameIsNulStrList(name: string) {
 // read compares against `-1` for the narrow. A nested `(K|null)[][]` / nullable `(K|null)[] | null` is
 // NOT this (their element is a LIST, not the scalar niche) — only the single-level list.
 export function nameIsNulLitUnionList(name: string) {
-  if !nameIsArray(name) { return false }
-  let elem = name.slice(0, name.length - 2)
-  if elem.length > 1 {
-    if elem[0] == '(' {
-      if elem[elem.length - 1] == ')' { elem = elem.slice(1, elem.length - 1) }
-    }
-  }
+  const elem = listElemNameOf(name)
+  if elem == "" { return false }
   nameIsNulLitUnion(elem)
 }
 // A NULLABLE LITERAL-UNION type name — `K | null` / `"a" | "b" | null` (the i32 atom NICHE): the
@@ -1154,6 +1139,32 @@ export function nameIsArray(name: string) {
   if name[n - 1] != ']' { return false }
   true
 }
+// THE ONE HOME of the 1-D LIST-ELEMENT peel: the trailing `[]` cut plus the ONE layer of
+// disambiguating grouping parens a composite element carries (`(boolean|null)[]` →
+// `boolean|null`, `K[]` → `K`). "" when `name` is not an array name.
+//
+// Four `nameIsX[]` classifiers here wrote this same five-line peel out by hand
+// (`nameIsNulBoolList` / `nameIsNulStrList` / `nameIsNulLitUnionList` /
+// `nameIsLitUnionArray`) — each with its own `nameIsArray` gate and its own paren strip —
+// and each then asked ONE question of the result. Named once, the four become one-liners
+// and the family cannot drift on what an element IS.
+//
+// The paren strip is deliberately the NAIVE one the four copies carried (first char `(`,
+// last char `)`, no balance walk), NOT `monoUnwrapParens`/`peelGroupParens`: every element
+// reaching here is a single canonical atom, and widening the strip to a balanced one would
+// change what `(a)|(b)`-shaped elements classify as. `""` doubles as "not an array" and as
+// the element of the degenerate `"[]"` — every consumer answers `false` for both, exactly
+// as the four copies did.
+export function listElemNameOf(name: string) {
+  if !nameIsArray(name) { return "" }
+  let elem = name.slice(0, name.length - 2)
+  if elem.length > 1 {
+    if elem[0] == '(' {
+      if elem[elem.length - 1] == ')' { elem = elem.slice(1, elem.length - 1) }
+    }
+  }
+  elem
+}
 // True if the array type-name `name` is `i32[]` (the value-element list whose backing
 // is the raw `(array (mut i32))`). A `boolean[]` shares this exact rep (a boolean is an
 // i32 0/1 at the wasm level), so it rides the same i32-list machinery — only the element
@@ -1179,15 +1190,9 @@ export function nameIsI32Array(name: string) {
 // name is `name` minus the trailing `[]` (a parenthesized inline union keeps its parens, which
 // `nameIsLitUnionType` -> `nameIsInlineLitUnion` tolerates via the union split).
 export function nameIsLitUnionArray(name: string) {
-  if !nameIsArray(name) { return false }
-  let elem = name.slice(0, name.length - 2)
-  if elem.length > 1 {
-    if elem[0] == '(' {
-      if elem[elem.length - 1] == ')' { elem = elem.slice(1, elem.length - 1) }
-    }
-  }
-  const r = nameIsLitUnionType(elem)
-  r
+  const elem = listElemNameOf(name)
+  if elem == "" { return false }
+  nameIsLitUnionType(elem)
 }
 // True if `name` is a 2-D array whose ELEMENT is an i32-backed scalar list — `i32[][]`,
 // `boolean[][]`, or a literal-union `K[][]`. All three share the `i32[][]` rep EXACTLY: the
@@ -1587,6 +1592,46 @@ export function peelGroupParens(nameIn: string) {
   }
   name
 }
+// THE ONE HOME of the union-ARM normalization: trim ASCII whitespace, then peel ONE
+// fully-wrapping `(...)` pair. A closure member arrives from `splitUnionAtoms` WRAPPED
+// (`(()=>i64)` — an unwrapped top-level arrow would bind the trailing `|` into its
+// RETURN) and may carry the `| `-split's spaces; the bare annotation spelling has
+// neither, so a key derived from an arm must be normalized to byte-match the one derived
+// from the annotation.
+//
+// `emit_collect.vl`'s `peelWrapType` and `emit_classify.vl`'s `unionArmSigKey` prelude
+// were CHARACTER-IDENTICAL copies of this — the former's own header said so ("Shares the
+// exact normalization `unionArmSigKey` applies before keying"), which is the strongest
+// possible statement that they must not be allowed to drift. `emit_base` is the lowest
+// module both reach, so the home is here.
+//
+// The paren walk counts `(`/`)` ONLY (no `{}`/`[]`/`<>` arm): a wrapping paren pair is
+// balanced against parens alone, and a `>` in a `$fnsig` key or a `tyToStr` render must
+// not be able to unbalance it.
+export function normTypeAtom(arm: string) {
+  let lo = 0
+  let hi = arm.length
+  while lo < hi && (arm[lo] == ' ' || arm[lo] == '\t') { lo = lo + 1 }
+  while hi > lo && (arm[hi - 1] == ' ' || arm[hi - 1] == '\t') { hi = hi - 1 }
+  let t = arm.slice(lo, hi)
+  if t.length >= 2 && t[0] == '(' {
+    let depth = 0
+    let ci = 0
+    let wraps = true
+    while ci < t.length {
+      const cch = t[ci]
+      if cch == '(' {
+        depth = depth + 1
+      } else if cch == ')' {
+        depth = depth - 1
+        if depth == 0 && ci < t.length - 1 { wraps = false }
+      }
+      ci = ci + 1
+    }
+    if wraps { t = t.slice(1, t.length - 1) }
+  }
+  t
+}
 // The pipe-joined complement of `set` (a union name / narrowed sub-set string)
 // with the atom `removed` taken out — the ELSE-branch narrowing of `is removed`. The
 // equality is grouping-paren-insensitive (`peelGroupParens`), so `is () => i64` strips the
@@ -1829,6 +1874,66 @@ export function annArrowAt(name: string) {
     i = i + 1
   }
   -1
+}
+// THE ONE HOME of "the RETURN of a function-type name": the text after a TOP-LEVEL `=>`
+// (`(i32) => S[]` → `S[]`), or "" when `name` carries no top-level arrow.
+//
+// Five sites in `emit_collect.vl` spelled this out as `annArrowAt(n)` followed by
+// `n.slice(at + 2, n.length)` — two of them calling `annArrowAt` TWICE on the same name
+// for one answer (`collectA`'s TypeRef arm). The arrow index itself is never what those
+// callers wanted; the RESULT NAME is, and holding the index in a local is what let the
+// duplicate scans hide. A caller that also needs the result's grouping parens peeled
+// wraps this in `monoUnwrapParens` — the peel is a SEPARATE question and stays at the
+// call site, so this home cannot silently widen a raw-slice consumer.
+//
+// The gate is `>= 1`, matching the `fa >= 1` the function-type consumers use: an arrow at
+// index 0 would mean a name beginning `=>`, which no renderer produces.
+export function annRetNameOf(name: string) {
+  const at = annArrowAt(name)
+  if at < 1 { return "" }
+  const ret = name.slice(at + 2, name.length)
+  ret
+}
+// THE ONE HOME of the FUNCTION-TYPE decomposition `(p1, p2) => ret`: fills `outParams`
+// with the top-level parameter annotations and returns the RETURN annotation, or "" when
+// `ann` is not a fully-parenthesized function type (no top-level arrow, or the arrow is
+// not preceded by the param list's own `(`…`)`).
+//
+// The generic-instantiation trio in this file — `monoAnnHasTyParam`, `monoSubstAnn` and
+// `monoBindFromAnn` (which decomposes BOTH the pattern and the actual) — carried FOUR
+// copies of this same three-part test plus its two slices. They are the same grammar by
+// construction: each exists to walk the other's output.
+//
+// The empty param list is NOT split (`() => R` yields no params). `annSplitParams` pushes
+// one EMPTY part for an empty input, so the two copies that guarded on
+// `innerFn.length > 0` are the correct reading — `monoSubstAnn` would otherwise
+// substitute the empty part, get "" back and report the whole annotation unbindable. The
+// third copy (`monoBindFromAnn`) omitted the guard and so paired a one-element `[""]`
+// against another; that recursion binds nothing (`monoTyParamOf("")` is "" and
+// `annArrowAt("")` is -1), which is why unifying on the guarded reading is byte-inert.
+export function annFnDecompose(ann: string, outParams: string[]) {
+  const fa = annArrowAt(ann)
+  if fa < 1 { return "" }
+  if ann[0] != '(' { return "" }
+  if ann[fa - 1] != ')' { return "" }
+  const inner = ann.slice(1, fa - 1)
+  if inner.length > 0 { annSplitParams(inner, outParams) }
+  const ret = ann.slice(fa + 2, ann.length)
+  ret
+}
+// THE ONE HOME of the GENERIC-APPLICATION decomposition `Head<a1, a2>`: fills `outArgs`
+// with the top-level type arguments and returns the HEAD name, or "" when `ann` is not an
+// application. The same generic-instantiation trio carried FOUR copies of the
+// `ann[n-1] == '>'` + `gaeLtAt` + `gaeSplitArgs(ann.slice(lt+1, n-1))` triple.
+export function annGenAppDecompose(ann: string, outArgs: string[]) {
+  const n = ann.length
+  if n < 3 { return "" }
+  if ann[n - 1] != '>' { return "" }
+  const lt = gaeLtAt(ann)
+  if lt <= 0 { return "" }
+  gaeSplitArgs(ann.slice(lt + 1, n - 1), outArgs)
+  const head = ann.slice(0, lt)
+  head
 }
 // Split the INNER text of an inline object shape (`{…}`'s contents — `a:i32,b:{c:f64}`)
 // into PARALLEL field-NAME / field-TYPE-TEXT lists at depth 0.
@@ -2190,18 +2295,14 @@ export function monoBindOf(tvN: string[], tvV: string[], tp: string) {
 export function monoAnnHasTyParam(ann: string, typarams: string[]) {
   if monoTyParamOf(ann, typarams) != "" { return true }
   const n = ann.length
-  if n >= 3 && ann[n - 1] == '>' {
-    const lt = gaeLtAt(ann)
-    if lt > 0 {
-      const parts: string[] = []
-      gaeSplitArgs(ann.slice(lt + 1, n - 1), parts)
-      let i = 0
-      while i < parts.length {
-        if monoAnnHasTyParam(parts[i], typarams) { return true }
-        i = i + 1
-      }
-      return false
+  const parts: string[] = []
+  if annGenAppDecompose(ann, parts) != "" {
+    let i = 0
+    while i < parts.length {
+      if monoAnnHasTyParam(parts[i], typarams) { return true }
+      i = i + 1
     }
+    return false
   }
   if n >= 2 && ann[0] == '{' && ann[n - 1] == '}' {
     if n >= 3 && ann[1] == '[' { return false }
@@ -2224,21 +2325,15 @@ export function monoAnnHasTyParam(ann: string, typarams: string[]) {
   // param may ride any parameter or the result, so recurse into each (parallel to
   // `monoSubstAnn`'s function-type branch). Without this, a generic closure param
   // `f: (A, T) => A` reads as concrete and keeps its un-substituted annotation.
-  const fa = annArrowAt(ann)
-  if fa >= 1 && ann[0] == '(' && ann[fa - 1] == ')' {
-    const innerFn = ann.slice(1, fa - 1)
-    if innerFn.length > 0 {
-      const fparts: string[] = []
-      annSplitParams(innerFn, fparts)
-      let fi = 0
-      while fi < fparts.length {
-        if monoAnnHasTyParam(fparts[fi], typarams) { return true }
-        fi = fi + 1
-      }
+  const fparts: string[] = []
+  const fret = annFnDecompose(ann, fparts)
+  if fret != "" {
+    let fi = 0
+    while fi < fparts.length {
+      if monoAnnHasTyParam(fparts[fi], typarams) { return true }
+      fi = fi + 1
     }
-    if monoAnnHasTyParam(ann.slice(fa + 2, ann.length), typarams) {
-      return true
-    }
+    if monoAnnHasTyParam(fret, typarams) { return true }
   }
   false
 }
@@ -2261,22 +2356,19 @@ export function monoSubstAnn(
     return b + "[]"
   }
   const n = ann.length
-  if n >= 3 && ann[n - 1] == '>' {
-    const lt = gaeLtAt(ann)
-    if lt > 0 {
-      const parts: string[] = []
-      gaeSplitArgs(ann.slice(lt + 1, n - 1), parts)
-      let outAnn = ann.slice(0, lt) + "<"
-      let i = 0
-      while i < parts.length {
-        const s = monoSubstAnn(parts[i], typarams, tvN, tvV)
-        if s == "" { return "" }
-        if i > 0 { outAnn = outAnn + "," }
-        outAnn = outAnn + s
-        i = i + 1
-      }
-      return outAnn + ">"
+  const parts: string[] = []
+  const gHead = annGenAppDecompose(ann, parts)
+  if gHead != "" {
+    let outAnn = gHead + "<"
+    let i = 0
+    while i < parts.length {
+      const s = monoSubstAnn(parts[i], typarams, tvN, tvV)
+      if s == "" { return "" }
+      if i > 0 { outAnn = outAnn + "," }
+      outAnn = outAnn + s
+      i = i + 1
     }
+    return outAnn + ">"
   }
   if n >= 2 && ann[0] == '{' && ann[n - 1] == '}' {
     if n >= 3 && ann[1] == '[' { return ann }
@@ -2305,23 +2397,19 @@ export function monoSubstAnn(
   // closure param `f: (A, T) => A` pins to `(string, string) => string` for the instance.
   // Without it the instance body's `f(…)` call resolves no interned `$fnsig` (the param
   // kept the un-substituted `(A, T) => A`) and the value call mis-lowers.
-  const fa = annArrowAt(ann)
-  if fa >= 1 && ann[0] == '(' && ann[fa - 1] == ')' {
+  const fparts: string[] = []
+  const fret = annFnDecompose(ann, fparts)
+  if fret != "" {
     let outFn = "("
-    const innerFn = ann.slice(1, fa - 1)
-    if innerFn.length > 0 {
-      const fparts: string[] = []
-      annSplitParams(innerFn, fparts)
-      let fi = 0
-      while fi < fparts.length {
-        const fs2 = monoSubstAnn(fparts[fi], typarams, tvN, tvV)
-        if fs2 == "" { return "" }
-        if fi > 0 { outFn = outFn + "," }
-        outFn = outFn + fs2
-        fi = fi + 1
-      }
+    let fi = 0
+    while fi < fparts.length {
+      const fs2 = monoSubstAnn(fparts[fi], typarams, tvN, tvV)
+      if fs2 == "" { return "" }
+      if fi > 0 { outFn = outFn + "," }
+      outFn = outFn + fs2
+      fi = fi + 1
     }
-    const rs2 = monoSubstAnn(ann.slice(fa + 2, ann.length), typarams, tvN, tvV)
+    const rs2 = monoSubstAnn(fret, typarams, tvN, tvV)
     if rs2 == "" { return "" }
     return outFn + ")=>" + rs2
   }
@@ -2355,28 +2443,17 @@ export function monoBindFromAnn(
     }
     return 0
   }
-  const n = pat.length
-  if n >= 3 && pat[n - 1] == '>' {
-    const lt = gaeLtAt(pat)
-    const alt = gaeLtAt(actual)
-    if (
-      lt > 0 &&
-      alt > 0 &&
-      actual.length >= 3 &&
-      actual[actual.length - 1] == '>'
-    ) {
-      if pat.slice(0, lt) == actual.slice(0, alt) {
-        const pparts: string[] = []
-        gaeSplitArgs(pat.slice(lt + 1, n - 1), pparts)
-        const aparts: string[] = []
-        gaeSplitArgs(actual.slice(alt + 1, actual.length - 1), aparts)
-        let i = 0
-        while i < pparts.length {
-          if i < aparts.length {
-            monoBindFromAnn(pparts[i], aparts[i], typarams, tvN, tvV)
-          }
-          i = i + 1
+  const pparts: string[] = []
+  const pHead = annGenAppDecompose(pat, pparts)
+  if pHead != "" {
+    const aparts: string[] = []
+    if pHead == annGenAppDecompose(actual, aparts) {
+      let i = 0
+      while i < pparts.length {
+        if i < aparts.length {
+          monoBindFromAnn(pparts[i], aparts[i], typarams, tvN, tvV)
         }
+        i = i + 1
       }
     }
   }
@@ -2384,32 +2461,21 @@ export function monoBindFromAnn(
   // `(i32, i32) => i32`: bind type params pairwise across the parameters and the
   // return (parallel to `monoSubstAnn` / `monoAnnHasTyParam`). Binds `reduce`'s
   // `f: (A, T) => A` from the lambda argument's concrete `(i32, i32) => i32`.
-  const pfa = annArrowAt(pat)
-  const afa = annArrowAt(actual)
-  if (
-    pfa >= 1 &&
-    afa >= 1 &&
-    pat[0] == '(' &&
-    pat[pfa - 1] == ')' &&
-    actual[0] == '(' &&
-    actual[afa - 1] == ')'
-  ) {
-    const pp: string[] = []
+  const pp: string[] = []
+  const pRet = annFnDecompose(pat, pp)
+  if pRet != "" {
     const ap: string[] = []
-    annSplitParams(pat.slice(1, pfa - 1), pp)
-    annSplitParams(actual.slice(1, afa - 1), ap)
-    let fi = 0
-    while fi < pp.length {
-      if fi < ap.length { monoBindFromAnn(pp[fi], ap[fi], typarams, tvN, tvV) }
-      fi = fi + 1
+    const aRet = annFnDecompose(actual, ap)
+    if aRet != "" {
+      let fi = 0
+      while fi < pp.length {
+        if fi < ap.length {
+          monoBindFromAnn(pp[fi], ap[fi], typarams, tvN, tvV)
+        }
+        fi = fi + 1
+      }
+      monoBindFromAnn(pRet, aRet, typarams, tvN, tvV)
     }
-    monoBindFromAnn(
-      pat.slice(pfa + 2, pat.length),
-      actual.slice(afa + 2, actual.length),
-      typarams,
-      tvN,
-      tvV,
-    )
   }
   0
 }

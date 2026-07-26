@@ -12026,3 +12026,379 @@ equality: index identity is not type identity) can settle in one build.
     reach and short-circuits. Per-STATEMENT counting would have reported that pair as
     covered. **Count each CALL, not each statement, or the second operand of every
     short-circuit is an unmeasured arm.**
+
+## D-GRAMHOME — seven more hand-copied grammars get one home each, and #1139's C2 debt is REFUTED (#1144)
+
+Branched at **`74d6f71`** (D-VALUNION, #1138), rebased onto **`441102b`** (#1141) and then onto
+**`7cefaa0`** (D-VALKIND, #1142), the PR base.
+**Every count is re-taken at the head it is quoted against**, and every base is named at the number
+— #1140/#1141 moved `emit_classify` and `typecheck`, so the tree-wide totals differ between the two
+bases even though this slice's two files are byte-identical at both.
+
+Files: `compiler/emit_collect.vl` + `compiler/emit_base.vl` + **1 new fixture**. Nothing else.
+
+### The unit, and the counter
+
+**Unit: CALL SITES.** A textual `NAME(` in non-comment code where the preceding character is not
+`[A-Za-z0-9_.$]`; string literals blanked first, then `//` comments; the resolver's own
+`function NAME(` header excluded. The list is #1139's **23-resolver** parser list (the SCORECARD
+CORRECTION's list plus #1117's four additions). The counter is #1139's, unmodified, and it
+reproduces #1139's closing figures exactly at `74d6f71` — `emit_collect` **71**, `emit_base`
+**64**, tree-wide **493** — which is the validation that licenses everything below.
+
+### The duplicate-GRAMMAR census, with its signatures
+
+#1139's inheritance is a METHOD, not a list: *enumerate by what the CODE is, not by what the
+ARGUMENT is.* Re-run over the 111 remaining sites in these two files, it finds **seven more
+grammars hand-written more than once** — including one written out **nineteen times tree-wide**.
+
+Every row is counted by an EXACT textual signature over comment-stripped source, tree-wide over
+`compiler/*.vl`, at the PR base `7cefaa0` (identical at `441102b`):
+
+| grammar | signature counted | `7cefaa0` | now |
+|---|---|---|---|
+| **the arrow-INDEX-then-slice** (`v = annArrowAt(N)`, then `N.slice(v + 2, N.length)`) | that pair, same `N` | **19** — emit_base 4 · emit_classify 9 · **emit_collect 5** · emit_mono 1 | **12** — emit_base **2 (the two homes)** · emit_classify 9 · emit_mono 1 |
+| **the naive one-layer paren strip** (`if v[0] == '('` then `v[v.length-1] == ')'` within 2 lines) | that pair, same `v` | **7** — **emit_base 4** · typecheck 3 | **4** — emit_base **1 (the home)** · typecheck 3 |
+| the function-type PARAM split (`annSplitParams(`, definition included) | textual call | **9** — emit_base 5 · emit_classify 3 · emit_mono 1 | **6** — emit_base **2** |
+| the generic-ARGUMENT split (`gaeSplitArgs(`, definition included) | textual call | **9** — emit_base 7 · emit_classify 2 | **6** — emit_base **4** |
+| the `[]` element peel (`.slice(0, X.length - 2)`) | textual | **33** — emit_classify 19 · **emit_base 8** · emit_collect 2 · emit_rewrite 2 · emit_mono 1 · typecheck 1 | **30** — emit_base **5** |
+| the set-ADT member read (`msMemberAtomsOf(`) | textual call | **18** — emit_classify 16 · **emit_collect 2** | **17** — emit_collect **1** |
+| the trim + inline wrap-walk atom normalization | the both-ends ASCII trim, and the `wraps = false` walk | 2 — **emit_collect 1** · emit_classify 1 | 2 — **emit_base 1 (the home)** · emit_classify 1 |
+
+**A harness note that cost a wrong number first:** the shared comment stripper BLANKS char
+literals, so the paren-strip signature (which contains `'('`) counted **0 on both sides** until the
+stripper was replaced with one that keeps char literals. The tell was a signature I had *read in
+the source* scoring 0 — a comparator that cannot fire, wearing a new hat.
+
+### Seven grammars, one home each
+
+| grammar | copies in this partition | home |
+|---|---|---|
+| the 1-D LIST-ELEMENT peel (`[]` cut + the naive grouping-paren strip) | **4** (`nameIsNulBoolList` / `nameIsNulStrList` / `nameIsNulLitUnionList` / `nameIsLitUnionArray`) | `listElemNameOf` (`emit_base`) |
+| the FUNCTION-TYPE RETURN (`annArrowAt`, then slice) | **5** (`collectA` asked it TWICE for one answer, `registerInlineUnion` ×2, `nulCloMixedUnionUnregistered`, `internCloResultSpine`) | `annRetNameOf` (`emit_base`) |
+| the FUNCTION-TYPE decomposition (param list + return) | **4** (`monoAnnHasTyParam`, `monoSubstAnn`, `monoBindFromAnn` ×2 — pattern and actual) | `annFnDecompose` (`emit_base`) |
+| the GENERIC-APPLICATION decomposition (head + args) | **4** (the same three functions) | `annGenAppDecompose` (`emit_base`) |
+| "a bare MAP's VALUE union needs registering too" | **4** (map ATOM of a union · NULLABLE map · nul-closure RESULT map · bare top-level map) | `registerMapValUnion` (`emit_collect`) |
+| the set-ADT member read WITH its cardinality gate | **2** (`shapeHasCloField`, `collectFnValUse`) | `unionMemberAtomsIfMulti` (`emit_collect`) |
+| the union-ARM normalization (trim + peel one wrapping paren) | **2**, one module apart — `peelWrapType` here and `unionArmSigKey`'s prelude in `emit_classify`, **character-identical**, and `peelWrapType`'s own header SAID SO ("Shares the exact normalization `unionArmSigKey` applies before keying") | `normTypeAtom`, moved **DOWN** into `emit_base` |
+
+Plus three single-question repeats: `collectCloSigs` asked `nullablePartOf(nm)` **three times** for
+one answer; `collectA` asked `refArrElemName(ran)` twice — the second call UNCONDITIONAL, so the
+hoist strictly REMOVES work — and spelled the conjunction `ranp != "" && nameIsRefArray(ranp)` out
+twice.
+
+`emit_base` is again the module a home has to move DOWN into, exactly as #1139 found: it is the
+lowest module `emit_collect`, `emit_classify`, `emit_mono` and `emit_rewrite` all already import.
+The four `registerMapValUnion` call sites are the four separate bug reports in their own comments
+— four fuzz seeds, four positions, ONE rule ("the map needs no registration, its VALUE does").
+
+### The call arithmetic
+
+| file | `7cefaa0` | now | delta |
+|---|---|---|---|
+| `compiler/emit_collect.vl` | **71** | **55** | **−16** |
+| `compiler/emit_base.vl` | **64** | **56** | **−8** |
+| every other module | 340 | 340 | 0 |
+| **tree-wide, 23-resolver list** | **475** | **451** | **NET −24** |
+
+(At `441102b` the same measurement reads **475 → 451** — identical, #1142 moved no site on this
+list; at the original branch point `74d6f71` it reads **493 → 469**, the 18-site difference in
+`emit_classify` being #1140/#1141's, not this slice's.)
+
+Per resolver across the two files: `annArrowAt` 19 → 11 (emit_collect 8 → 2, emit_base 11 → 9) ·
+`nameIsArray` 13 → 10 · `mapValNameOf` 9 → 6 · `annSplitParams` 4 → 1 · `nullablePartOf` 21 → 18 ·
+`splitUnionAtoms` 14 → 13 · `unionMemberCount` 6 → 5 · `nameIsRefArray` 7 → 6 · `refArrElemName`
+3 → 2.
+
+- **Type-string parses DELETED: 24. Laddered: 0. Parses ADDED: 0.** Every call inside a new home is
+  a RELOCATION of one that already existed (`annRetNameOf` holds one of the five arrow scans,
+  `annFnDecompose` one of the four param splits, `listElemNameOf` one of the four array gates,
+  `registerMapValUnion` one of the four map-value reads, `unionMemberAtomsIfMulti` one of the two
+  count/split pairs).
+- **Name-keyed resolutions deleted: 0. Sidecars added: 0. Arena legs added: 0.**
+- **Off the parser list: 3 more `gaeSplitArgs` copies and 3 naive paren strips deleted, and one
+  inline paren-DEPTH walk + one whitespace trim moved out of `emit_collect` entirely.**
+- Source: **296 insertions / 215 deletions** across the two compiler files.
+  Binary at the PR base: **1,036,708** → shipped **1,033,897** bytes (**−2,811**), both built by
+  the same seed, the base build verified a fixpoint under itself. The **−2,811** is identical at
+  all three bases this slice was measured at.
+
+### Channels — corpus and fuzz, both, on the whole change
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / message / run stdout / build rc / run rc, at the PR base `7cefaa0` | **1,321 files × 5 observations** | **0 differing** |
+| the same at `441102b` | **1,320 files × 5** | **0 differing** |
+| the same at the branch point `74d6f71` | **1,314 files × 5** | **0 differing** |
+| fuzz A/B, whole `--out-dir` trees, 2 legs × 14 seeds × 3 depths, at `441102b` | **67,200 programs/side**, 70,325 output files/side | **0 differing paths** |
+
+Channel populations on side A at the PR base (a 0 means nothing without them): **1,123 files
+produce wasm across 1,119 distinct SHAs · 198 files carry a compiler message across 196 distinct
+texts · 1,083 files produce run output across 926 distinct texts · 2 distinct build rcs · 2
+distinct run rcs.**
+
+### THE WORK REGRESSION THE COUNT CAUGHT — and it was a 32% one
+
+The first shipped-shape build read **+296,973 scanner invocations (+31.9%)** against master, with
+**1,080 of 1,116 reporting files doing MORE work.** The cause is exactly the failure mode the
+standing brief names: **a home in front of a resolver that already cheap-rejects loses the EARLY
+EXIT.** Master's four list-element classifiers each opened with
+`if !nameIsArray(name) { return false }` and RETURNED; the first collapse spelled them
+`nameIsNulBool(listElemNameOf(name))`, so every non-array name reaching `nameIsI32Array` (which
+calls three of the four) started paying a `nullablePartOf("")` / `nameIsLitUnionType("")` call it
+used to skip.
+
+The fix keeps the home AND the short-circuit — `const elem = listElemNameOf(name); if elem == ""
+{ return false }` — which is the same predicate exactly (`elem == ""` holds precisely when
+`nameIsArray` is false or the name is the degenerate `"[]"`, and every consumer already answered
+`false` for `""`). Re-counted at the PR base, both probe compilers differing ONLY in this slice's two files:
+
+| counter | `7cefaa0` | shipped | delta |
+|---|---|---|---|
+| `annArrowAt` invocations | 318,029 | 316,108 | **−1,921** |
+| `nullablePartOf` invocations | 423,035 | 422,225 | **−810** |
+| `refArrElemName` invocations | 35,256 | 35,080 | **−176** |
+| `annSplitParams` invocations | 9,166 | 9,162 | **−4** |
+| `gaeSplitArgs` invocations | 151 | 151 | **0** |
+| **TOTAL** | **785,637** | **782,726** | **−2,911 (−0.37%)** |
+
+**233 files do LESS work, 888 the same, 2 more.** (The same measurement at the branch point
+`74d6f71` reads **930,326 → 927,193, −3,133**, 232 better / 882 equal / 2 worse — the same shape.)
+The two files that do more are `tests/cases/functions/indirect.vl` (+15) and
+`tests/cases/functions/indirect-polymorphic.vl` (+40), **entirely inside `nullablePartOf`** with
+every other counter identical on both. Both are polymorphic-call fixtures, so the change is in the
+monomorphizer's evaluation ORDER (`annFnDecompose` decomposes the PATTERN before the ACTUAL, where
+master evaluated both arrow scans up front and then conjoined). **The mechanism is NOT isolated
+below that; the size is +55 invocations, 0.007% of the corpus total, against −2,966 elsewhere** —
+recorded rather than rounded away. The two decomposition homes are exactly
+work-NEUTRAL (`annSplitParams` and `gaeSplitArgs` both 0), which is the check that they are
+relocations and not extra passes; the three deltas that move are the three hoists, each in the
+direction its mechanism predicts.
+
+Both probes were built identically — five counters behind an exported `wpTick` FUNCTION (method
+note 84: a cross-module `export let` is not a shared counter) reported by an `emitFail` immediately
+after `emitModule` returns (method note 85: fail where the pass manager already checks).
+
+**The correction is worth more than the collapse.** The shipped source carries one MORE line per
+classifier than the naive collapse; without the count, a 32% regression in the compiler's hottest
+scanner family would have shipped with **every output channel reading 0**.
+
+### Entombment — eight sabotages, a PROBE with its inverted comparator, one fixture WRITTEN
+
+Each sabotage is applied to the shipped source, rebuilt with the same seed, and swept over the
+corpus (byte + message + run stdout + both rcs) at `74d6f71`; the corpus-inert ones are then swept
+over a **33,600-program/side, 35,105-file/side** fuzz A/B against the shipped build.
+
+| sabotage | corpus byte/msg/run | fuzz tree-diff |
+|---|---|---|
+| **S1 `listElemNameOf` drops the grouping-paren strip** | **13 / 12 / 13** | — |
+| **S3 `annRetNameOf` slices one char early (keeps the `>`)** | **11 / 0 / 0** | — |
+| **S5 `annFnDecompose` drops the empty-param guard** | 0 / 0 / 0 | **0 / 33,600** |
+| **S7 `registerMapValUnion` never fires** | 0 / 0 / 0 | **0 / 33,600** |
+| **S9 `normTypeAtom` drops the whitespace trim** | 0 / 0 / 0 | **0 / 33,600** |
+| S12 `collectCloSigs`' hoisted nullable inner replaced by the whole name | 0 / 0 / 0 | **0 / 33,600** |
+| S8 `unionMemberAtomsIfMulti` drops the cardinality gate | 0 / 0 / 0 | inert **BY CONSTRUCTION** |
+| S11 `collectA`'s hoisted element name uses the un-peeled annotation | 0 / 0 / 0 | inert **BY CONSTRUCTION** |
+| **P_REN** — fail-loud re-derivation of the hoisted `refArrElemName(ran)` after the flag writes | **0 disagreements / 1,314** | — |
+| **P_RENINV** — the same probe INVERTED (fires when they AGREE) | **173 of 1,314** | — |
+
+- **S3 changes 11 files' BYTES and 0 files' output** — the same shape as #1139's S6: live in the
+  type section, inert at the observable output on today's corpus. A run-only gate would have called
+  the whole `annRetNameOf` collapse free.
+- **The `refArrElemName` hoist is measured, not argued** (D-RAKIND's precedent, at a second site):
+  the probe re-derives the value at master's original call position and fails loudly on
+  disagreement — **0 over 1,314 files** — and its INVERTED twin reddens **173**, the same reach
+  #1139 measured for the sibling `refArrElemKind` hoist. The 0 is wired, not blind.
+- **S8 and S11 are inert BY CONSTRUCTION, which is a different claim from "measured at 0".** S8:
+  without the cardinality gate the splitter pushes ONE atom for a non-union name, and both
+  consumers gate on `length > 1`, so the gate is an allocation saving with no semantic content.
+  S11: `refArrElemName` **peels the `| null` itself** at its own first statement
+  (`emit_classify.vl:9717`), so handing it the un-peeled name cannot change
+  its answer. Neither
+  needs a fixture.
+- **S5 was inert on BOTH channels, so THE FIXTURE WAS WRITTEN** (#1128's practice, preferred over a
+  passive "no pin can exist"): `tests/cases/generics/zero-param-closure-type-param.vl` — a generic
+  function whose parameter is a **zero-parameter** closure (`f: () => T`), instantiated at two
+  distinct result reps (i32 and i64, so the binding really comes from the RETURN). Every generic
+  closure parameter already in the tree takes at least one argument, and the fuzz generator emits
+  no generic declarations at all, which is exactly why both channels read 0. Being a refactor pin
+  it must pass on master too, and it does — **master-built compiler `7` / `9`; shipped `7` / `9`,
+  byte-identical; under S5: `emitProgram: monomorphize: unsupported argument type for 'f' in a call
+  to 'callIt'`.** The mechanism: `annSplitParams("")` pushes ONE EMPTY part, so a decomposition
+  that splits an empty param list hands `monoSubstAnn` a `""` parameter, which reports the whole
+  annotation unbindable. Two of the three copies guarded on `innerFn.length > 0` and the third did
+  not; the home carries the guard, and the third copy's `[""] `-against-`[""]` recursion binds
+  nothing (`monoTyParamOf("")` is "" and `annArrowAt("")` is -1), which is why unifying on the
+  guarded reading is byte-inert.
+- **S7 and S9 are inert on BOTH channels and NO fixture is claimed for either, with the reason
+  stated.** S7 (`registerMapValUnion` never fires): the four call sites each cite a specific
+  fuzz-nightly seed in their own comments, so the population demonstrably EXISTS — this sweep's
+  sample (33,600 programs at depths 4–6) simply does not contain it, and the thing emptying the
+  population is SAMPLING, not the code. Not a licence to delete. S9 (`normTypeAtom` drops the
+  trim): the trim is load-bearing for the OTHER consumer of this grammar — `unionArmSigKey`'s
+  arm keys, where `splitUnionAtoms` leaves ` | `-split whitespace — and that consumer is
+  `emit_classify`'s copy, which this slice did NOT rewire. The one consumer that moved
+  (`internCloResultSpine`) is fed canonical space-free renders on both channels, so its half of
+  the home is inert by input.
+
+### #1139's C2 debt — RE-MEASURED, and REFUTED rather than paid
+
+#1139 filed `nameIsStructWithLitUnionField` as "the fixture this slice owes": its per-consumer
+sabotage read 0 on 1,312 corpus files and 50,400 fuzz programs, and the note reasoned that
+reproducing the shape "needs the fuzzer's nesting depth rather than a hand-written case".
+**Re-measured here, all three parts of that are wrong.**
+
+1. **A fixture for exactly that shape has been in the tree since #956.**
+   `tests/cases/closures/nested-lambda-union-arm-litunion-struct-result.vl` IS
+   `() => ((i32) => {f: K0}) | i32` — the fuzz-nightly seed 26306770 d4 shape the function's own
+   header names — and it was inside the corpus the sabotage swept.
+2. **The classifier is REACHED and answers TRUE.** A fail-loud reach probe on its `return true`
+   reddens **6 corpus files**: `arrays/nullable-closure-element-composite-results`,
+   `closures/lambda-return-struct-litunion-field`,
+   `closures/nested-lambda-union-arm-litunion-struct-result`,
+   `closures/twin-fieldset-closure-field-sig-split`,
+   `closures/twin-fieldset-deep-composite-narrowed-call`,
+   `structs/declared-twin-inline-closure-field-elem-param`. The population is not empty.
+3. **The arm is inert because it is DOUBLY PINNED, and a two-variable sabotage proves it.**
+   `synthRetAnnots`' `nameIsStructWithLitUnionField` arm (`emit_rewrite.vl:497`) is subsumed by the
+   LATER, more general plain-struct arm (`nameIsWholeSpanShape(ctx) && !strContains(ctx, " ")`,
+   `emit_rewrite.vl:560`), which pins the same name through `resolveShapeToNominal`:
+
+   | build | the 6 reachers |
+   |---|---|
+   | arm 497 neutered alone | **0 differ** |
+   | arm 560 neutered alone | **0 differ** |
+   | **BOTH neutered** | **3 differ** — `nested-lambda-union-arm-litunion-struct-result` → **`wasm trap: cast failure`** (the exact failure its own header describes), and `twin-fieldset-closure-field-sig-split` + `twin-fieldset-deep-composite-narrowed-call` → **invalid wasm** (`type mismatch: expected i32, found (ref $type)`) |
+
+   So the per-consumer 0 was never a coverage hole: **each arm is masked by the other.** The fixture
+   #1139 owed cannot exist as a single-arm pin, and writing one would have been writing a test that
+   passes for the wrong reason. The correct deliverable is the DELETION of the redundant arm — filed
+   as hand-off 4, because `emit_rewrite.vl` is another partition.
+
+### Gate — every step, exit code checked explicitly, at the rebased head
+
+```
+bash scripts/refresh-compiler.sh            REFRESH_RC=0   (1,033,897 bytes)
+bash scripts/lint-self.sh                   LINT_RC=0      self-lint + fmt-check clean
+bash scripts/native-fixpoint.sh             FIXPOINT_RC=0  stage3 == stage4, 1,033,897 bytes
+bash scripts/rep-fuzz-check.sh              REPFUZZ_RC=0   exact (1 baselined, 0 unsound, 0 new, 0 stale)
+SELFHOST_NATIVE_ALIGN=1 deno task test      2039 passed | 0 failed | 8 ignored
+```
+
+The baseline was re-measured **in the same session, with the same command, at the same head** (my
+two compiler files reverted to `origin/master`, my fixture held out, the seed refreshed): **2,038
+passed / 0 failed / 8 ignored.** Delta = exactly the one new fixture, and the **ignored-test NAME
+SET** diff over the two 8-line captures is **EMPTY** — no test stopped running. The magnitude check
+matters as much as the rc: a worktree without `scripts/vl-host/target/release/vl` silently
+self-ignores every native suite and reads a *green* ~1,417/607, so **2,039/8** (not 1,4xx/6xx) is
+what says the whole suite ran.
+
+### What did NOT move, and the mechanism for each
+
+- **`registerInlineUnion` stands exactly as #1127 measured it.** 17 of its sites remain and its
+  recursion is untouched: the parameter is a NAME the function peels and recurses on, so it cannot
+  become an arena index until the arena carries a node for every peeled sub-name. This slice moved
+  only what was DUPLICATED inside it — the four map-value registrations and the two arrow-return
+  slices — and re-measuring the recursion was deliberately out of scope without evidence that
+  refutes #1127.
+- **`nameIsNestedUnionElemArray`'s three `nameIsArray` calls do NOT collapse into
+  `listElemNameOf`.** Its loop condition is "is the NEXT peel still an array", which is not the same
+  predicate as "this name has a non-empty element": a `listElemNameOf`-shaped rewrite changes the
+  leaf it stops on for a `"[]"`-suffixed degenerate. Named, not taken.
+- **`nameIsMapArray` and `nameIsClosureArray` keep their hand-rolled `[`/`]` tests.** Routing them
+  through `nameIsArray` would delete two inline scanners and ADD two parser-list calls — the wrong
+  direction for this program's scorecard, the same call #1139 made for
+  `nameIsStructWithUnionField`'s inner bar scanner.
+- **The `{…}`-field split inside `monoAnnHasTyParam` / `monoSubstAnn` is still 2 copies.** It rides
+  `gaeSplitArgs` + `indexOf(":")`, a third collapse with its own shape — filed as hand-off 3 rather
+  than taken, because it buys 0 on the 23-resolver list and this slice's gate was already measured
+  (shipping it would have meant an ungated edit or a second 33,600-program sweep).
+- **`peelWrapType`'s twin in `emit_classify` stays until its owner imports the home.**
+
+### Hand-offs, each with a verified diff
+
+1. **`emit_classify.vl` — delete `unionArmSigKey`'s inline prelude and call `normTypeAtom`.**
+   `emit_classify.vl:18353` onward is character-identical to the new `emit_base` home; the function
+   becomes
+   ```
+   export function unionArmSigKey(arm: string) {
+     const t = normTypeAtom(arm)
+     if annArrowAt(t) < 0 { return "" }
+     annSigKey(t)
+   }
+   ```
+   plus `normTypeAtom,` in the `from "./emit_base"` import list. Takes that grammar's
+   compiler-wide copy count from 2 to 1.
+2. **`emit_classify.vl` (9 copies) + `emit_mono.vl` (1) — adopt `annRetNameOf`.** The
+   arrow-index-then-slice grammar is written out **19 times tree-wide** and this slice retired 7;
+   the remaining 10 are at `emit_classify.vl:6263, 7723, 7879, 10874, 11940, 11980, 14394, 18275,
+   19514` and `emit_mono.vl:985`. Both modules already import
+   `emit_base`. Each is a one-line substitution; the sites that wrap the result in
+   `monoUnwrapParens` keep doing so — the peel is a separate question and deliberately stays at the
+   call site, so the home can never silently widen a raw-slice consumer.
+3. **`emit_base.vl` — the `{…}` field split inside the mono trio is 2 copies.** An
+   `annObjFieldSplit(ann, outNames, outTexts)` home using `shapeInnerFieldSplit`'s
+   empty-name-for-malformed convention serves both (`monoAnnHasTyParam`'s `ci > 0` skip and
+   `monoSubstAnn`'s `ci <= 0` bail are the same test), and takes one more `gaeSplitArgs` and one
+   more `indexOf(":")` out.
+4. **`emit_rewrite.vl` — arm 497 (`nameIsStructWithLitUnionField`) is REDUNDANT: delete it.**
+   Evidence is the two-variable experiment above. Deleting it also retires
+   `nameIsStructWithLitUnionField`'s last consumer, which takes `emit_base` down one more shape
+   scanner and one more `nameIsLitUnionType` call. The test that must stay green through it is
+   `tests/cases/closures/nested-lambda-union-arm-litunion-struct-result.vl`, which under a
+   both-arms sabotage TRAPS with `wasm trap: cast failure`.
+5. **`typecheck.vl` — 3 of the 4 remaining naive one-layer paren strips live there**
+   (`typecheck.vl:5305, 15433, 15509`). `typecheck` is BELOW `emit_base` in the import
+   graph, so `listElemNameOf` cannot be imported there; their home has to be local.
+
+### Method notes earned
+
+(Numbering continues from #1139's 89; note #1140/#1141 independently used 82–86, so the 82–89 range
+is doubly occupied in this document — read the slice tag, not the number.)
+
+90. **A per-consumer sabotage that reads 0 has TWO explanations, and only a TWO-VARIABLE sabotage
+    separates them** (D-GRAMHOME, extending note 89) — "no reacher" and "a REDUNDANT SIBLING" are
+    indistinguishable from a single-consumer 0. #1139 read 0 for
+    `nameIsStructWithLitUnionField` and concluded the shape was unreachable without the fuzzer;
+    in fact a fixture written FOR it had been in the corpus for 180 PRs, the classifier answers
+    TRUE on 6 files, and a second `synthRetAnnots` arm pins the identical name. Neutering either
+    arm alone is inert; neutering BOTH reddens 3 files with a runtime cast TRAP and two
+    invalid-wasm modules. **When a per-consumer sabotage is inert, look for the sibling that
+    covers it BEFORE concluding the population is empty — and when you find one, the deliverable
+    is the deletion, not the fixture.**
+91. **A one-call home in front of a resolver that already CHEAP-REJECTS loses the early exit, and
+    the loss is invisible on every output channel** (D-GRAMHOME) — collapsing four
+    `if !nameIsArray(name) { return false }` preludes into `nameIsX(listElemNameOf(name))` cost
+    **+296,973 scanner invocations (+31.9%)**, 1,080 of 1,116 files worse, with corpus byte /
+    message / run and the fuzz tree all reading 0 in both states. The home is still right; the
+    short-circuit has to be kept at the CONSUMER (`const e = home(n); if e == "" { return false }`).
+    This is the concrete form of "a bank-first ladder in front of a cheap reject is a work
+    regression": it applies to a pure-text home just as much as to an arena leg.
+92. **A grammar census must be counted by an exact SIGNATURE, and a char-literal-blanking comment
+    stripper reads 0 for every signature containing one** (D-GRAMHOME, harness) — the paren-strip
+    census scored 0 tree-wide on BOTH sides because the shared blanker treats `'('` as a string
+    literal. The tell was that a signature I had *read in the source* counted 0; the fix is a
+    blanker that keeps char literals. Any census over VL source that mentions a character has this
+    hazard.
+93. **A slice whose base moves must name the base at every number, not just at the top**
+    (D-GRAMHOME) — this slice's own tree-wide totals are 493 → 469 at its branch point and
+    475 → 451 at its rebase base, and BOTH are correct: `emit_classify` lost 18 sites to #1140 in
+    between. A single "tree-wide" figure without its head is unreproducible a merge later, which is
+    the same failure as the stale-lead incidents, seen from the other side.
+94. **The fuzz `.err` channel carries the COMPILER's OWN wasm backtrace ADDRESSES, and they shift
+    with any binary change** (D-GRAMHOME, harness) — three unrelated sabotages each reported
+    exactly **2 differing paths** out of 35,105 files. The two paths were the same two cases in one
+    leg, both of them programs that TRAP THE COMPILER (a pre-existing baselined failure), and the
+    only difference between the sides was `0xae4b3` vs `0xae4be` in the backtrace. Any build whose
+    binary differs at all reproduces the identical count, so the number is a property of the
+    harness, not of the sabotage — note 87's "two unrelated sabotages producing the IDENTICAL count"
+    tell, from a new direction. A tree-diff harness must normalise `0x[0-9a-f]+` out of `.err`
+    before diffing (or exclude the compiler-trap cases), the same way it already normalises the
+    random temp path.
+95. **Never edit a shell script while it is running** (D-GRAMHOME, operational) — bash reads a
+    script incrementally from the file, so patching the harness mid-sweep shifted the byte offsets
+    under the interpreter and it died with `syntax error near unexpected token 'done'` after ~30
+    minutes of a 100,800-program fuzz A/B, losing the whole run. Copy the script to a new name and
+    edit the copy, or wait. (The same class as note 88's `git checkout HEAD -- <file>`: an edit
+    whose blast radius is a process you are not looking at.)
+
