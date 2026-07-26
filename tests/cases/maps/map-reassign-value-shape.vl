@@ -1,0 +1,83 @@
+// @run
+// @log x
+// @log gone
+// @log y
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// RE-INITIALIZING an existing map binding with a fresh `Map()`.
+//
+// The constructor has no type of its own — it takes the SHAPE of the position it
+// lands in, and five boundaries seed that shape: a `let`/`const` binding, a
+// `return`, an object-literal field, a global INIT, and a nullable-map binding.
+// ASSIGNMENT was the sixth and did not, so `m = Map()` built the shared MONO
+// (i32-valued) map struct whatever the target's value type was:
+//
+//   type mismatch: expected (ref null $type), found (ref $type)
+//
+// `vl check` clean. Only i32- and boolean-valued maps escaped, because their vals
+// list IS the mono one — which is also why `Set()` (a `{[string]: boolean}`)
+// escaped, and why the defect was invisible to every map test that used i32 values.
+// Censused across the value type (string / i64 / f64 / f32 all failed; i32 /
+// boolean ran), the scope (module global, top level, function local, struct field —
+// all failed) and the RHS form (a bare constructor failed; assigning another map
+// value ran, because that value already carries its own shape).
+//
+// This was filed as `return m[k] ?? ""` emitting invalid wasm over a
+// `{[string]: string}` map. THE `??` READ IS NOT INVOLVED — 21 standalone shapes of
+// that read, in every result position, run correctly on the compiler that carried
+// the report. It was found in the compiler's own source, where the failing function
+// was `initChecker` (the reset), not the reader; the workaround that unblocked it
+// replaced the map with parallel arrays and so deleted the `= Map()` line too.
+// `compiler/typecheck.vl`'s `annotPart` is the map again, which is the entombment
+// that matters: the compiler cannot self-compile without this fix.
+
+// The behaviour, not just the validity: the reset must really empty the map, and
+// the map must still be usable afterwards.
+let names: {[string]: string} = Map()
+names["a"] = "x"
+print(names["a"] ?? "gone")
+function reset() {
+  names = Map()
+  0
+}
+reset()
+print(names["a"] ?? "gone")
+names["b"] = "y"
+print(names["b"] ?? "gone")
+
+// The other three value types that share the defect, each reassigned and reused.
+let wide: {[string]: i64} = Map()
+wide = Map()
+wide["k"] = 5000000077
+print(if (wide["k"] ?? 0) == 5000000077 { 1 } else { 0 })
+
+let dbl: {[string]: f64} = Map()
+dbl = Map()
+dbl["k"] = 1.5
+print(if (dbl["k"] ?? 0.0) == 1.5 { 1 } else { 0 })
+
+let sml: {[string]: f32} = Map()
+sml = Map()
+sml["k"] = 0.5
+print(if (sml["k"] ?? 0.0) == 0.5 { 1 } else { 0 })
+
+// A FUNCTION-LOCAL map reassigned in place.
+function localReset(): i32 {
+  let m: {[string]: string} = Map()
+  m["a"] = "x"
+  m = Map()
+  m["b"] = "z"
+  if (m["a"] ?? "") == "" { 1 } else { 0 }
+}
+print(localReset())
+
+// A map-typed struct FIELD reassigned through the receiver.
+type Bank = { entries: {[string]: string} }
+const b: Bank = { entries: Map() }
+b.entries["a"] = "x"
+b.entries = Map()
+b.entries["c"] = "w"
+print(if (b.entries["a"] ?? "") == "" { 1 } else { 0 })

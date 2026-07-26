@@ -779,6 +779,78 @@ fn report_rep_shadow(inst: &Instance, store: &mut Store<()>, path: &str) -> Resu
     Ok(())
 }
 
+/// Render an f64 exactly as JS `String(v)` does (ECMA-262 `Number::toString`, radix
+/// 10) — the rule this host's float print sinks have always CLAIMED to follow, since
+/// `tests/support/runWasm.ts` and `playground/src/runtime.ts` both sink through
+/// `String(v)` and a corpus `@log` line has to match under either host.
+///
+/// Rust's `{}` Display already produces the SHORTEST round-tripping digit string,
+/// which is the same digit string JS produces — the two disagree only on FORMATTING,
+/// in four places. Each was measured against Deno on the same wasm module, not
+/// inferred:
+///
+/// | value           | Rust `{}`                | JS `String(v)` |
+/// | --------------- | ------------------------ | -------------- |
+/// | `-0.0`          | `-0`                      | `0`            |
+/// | `1e21`          | `1000000000000000000000`  | `1e+21`        |
+/// | `1e-7`          | `0.0000001`               | `1e-7`         |
+/// | `f64::INFINITY` | `inf`                     | `Infinity`     |
+///
+/// Only the first was filed; the census that verified it found the other three. The
+/// old comment here said Display "matches JS `String(v)` for the corpus values",
+/// which was true of the corpus and false of the rule.
+///
+/// The digits come from `{:e}` (`<d>[.<ddd>]e<exp>`), whose mantissa is that same
+/// shortest representation and whose exponent is the spec's `n - 1`.
+fn js_number_to_string(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // `v == 0.0` holds for BOTH signs of zero, which is exactly the spec's rule:
+    // `Number::toString` returns "0" for -0 as well as +0.
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let neg = v < 0.0;
+    let sci = format!("{:e}", v.abs());
+    let (mant, exp) = sci
+        .split_once('e')
+        .expect("Rust's {:e} always emits an exponent");
+    // `s` in the spec's terms: the shortest digit string, no radix point.
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32;
+    let n = exp.parse::<i32>().expect("{:e} exponent is an integer") + 1;
+    let body = if k <= n && n <= 21 {
+        // Integral, no exponent needed: the digits then `n - k` zeros.
+        format!("{}{}", digits, "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        // A radix point inside the digits.
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        // Leading "0." then `-n` zeros. The `-6` boundary is the spec's, and is why
+        // `1e-6` prints positionally (`0.000001`) while `1e-7` does not.
+        format!("0.{}{}", "0".repeat((-n) as usize), digits)
+    } else {
+        // Exponential form. The exponent is always signed, and the radix point
+        // appears only when there is more than one digit (`1e+21`, not `1.e+21`).
+        let e = n - 1;
+        let head = if k == 1 {
+            digits.clone()
+        } else {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        };
+        format!("{}e{}{}", head, if e >= 0 { "+" } else { "-" }, e.abs())
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
 /// Instantiate an emitted VL program with the host print-import family and run it
 /// (top-level statements run via the wasm start function). Print output streams to
 /// stdout as it arrives.
@@ -804,18 +876,21 @@ fn run_program_with(
     linker.func_wrap("imports", "__print_i32__", move |v: i32| s(&v.to_string()))?;
     let s = sink.clone();
     linker.func_wrap("imports", "__print_i64__", move |v: i64| s(&v.to_string()))?;
-    // f64: Rust's `{}` Display matches JS `String(v)` for the corpus values (whole
-    // numbers print without a trailing `.0`, e.g. 4.0 → "4"), mirroring the host's
-    // `__print_f64__` (`String(v)`) so emitted output matches `@log`. (Slice 3.)
+    // f64: rendered through `js_number_to_string`, which IS JS `String(v)` — the JS
+    // hosts (`tests/support/runWasm.ts`, `playground/src/runtime.ts`) sink through
+    // `String(v)`, so a corpus `@log` line has to read the same under either. Display
+    // alone diverges on negative zero, on magnitudes outside 1e-7..1e21, and on the
+    // infinities; see that function. (Slice 3.)
     let s = sink.clone();
-    linker.func_wrap("imports", "__print_f64__", move |v: f64| s(&v.to_string()))?;
-    // f32: widen to f64 before Display so the printed decimal matches JS `String(v)`
-    // (where a wasm f32 arrives as a JS number, i.e. its exact f64 value), mirroring the
-    // host's `__print_f32__` (`String(v)`). Whole f32 values print without `.0` (e.g.
-    // 6.5→"6.5", 10.0→"10"). (Slice 5.)
+    linker.func_wrap("imports", "__print_f64__", move |v: f64| {
+        s(&js_number_to_string(v))
+    })?;
+    // f32: widen to f64 first, because that is what the JS hosts see — a wasm f32
+    // arrives as a JS number, i.e. its exact f64 value — then render by the same rule.
+    // (Slice 5.)
     let s = sink.clone();
     linker.func_wrap("imports", "__print_f32__", move |v: f32| {
-        s(&(v as f64).to_string())
+        s(&js_number_to_string(v as f64))
     })?;
     let s = sink.clone();
     linker.func_wrap("imports", "__print_bool__", move |v: i32| {

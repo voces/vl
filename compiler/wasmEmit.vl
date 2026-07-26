@@ -8860,6 +8860,17 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           }
           pendingListKind = letAnnRefListKind(gLet)
           pendingListSlot = letAnnRefListSlot(gLet)
+          // A MAP-typed global seeds the map SHAPE, so a bare `Map()` RHS constructs THIS
+          // binding's map struct instead of the shared mono (i32-valued) one. The let /
+          // return / struct-field / global-INIT boundaries all seed it already; ASSIGNMENT
+          // did not, and a re-initializing `m = Map()` over a `{[string]: string}` (or
+          // i64/f64/f32-valued) binding therefore `struct.new`'d the wrong map type —
+          // `type mismatch: expected (ref null $type), found (ref $type)`, `vl check` clean.
+          // Only i32- and boolean-valued maps escaped, because their vals list IS the mono
+          // one. `Set()` escaped for the same reason.
+          if exprMap(a.binLeft, fnIx) {
+            pendingMapSlot = mapShapeOfExpr(a.binLeft, fnIx)
+          }
           // A UNION-typed global (kind 4) coerces a raw assigned value into the
           // box (`w = 5` over `let w: string | i32` boxes the 5).
           const gUNm = letUnionNameOf(gLet, -1)
@@ -8883,12 +8894,18 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           }
           pendingListKind = 0
           pendingListSlot = 0
+          pendingMapSlot = -1
           fbGlobalSet(userGlobalIdx(gIdx)) // 0x24 global.set
           return 0
         }
         return emitFail(
           "emitProgram: assignment target is not a parameter, local, or global",
         )
+      }
+      // A MAP-typed LOCAL seeds the map SHAPE for a bare `Map()` RHS, exactly as the
+      // global arm above does and for the same defect.
+      if exprMap(a.binLeft, fnIx) {
+        pendingMapSlot = mapShapeOfExpr(a.binLeft, fnIx)
       }
       // A UNION-typed local (kind 4) coerces a raw assigned value into the box
       // (`u = 3.5` over `let u: i32 | f64` boxes the f64); a union-valued RHS
@@ -8943,6 +8960,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         if exprIsLitAtom(a.binLeft, fnIx) { asCtx.litUnion = 1 }
         if emitExprExpect(body, a.binRight, fnIx, asCtx) < 0 { return -1 }
       }
+      pendingMapSlot = -1
       fbLocalSet(idx) // 0x21 local.set
       return 0
     }
@@ -9239,6 +9257,12 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       } else if fscode == 6 {
         pendingListKind = 3
       }
+      // A MAP-typed field (code 19) seeds the map SHAPE so a bare `Map()` RHS builds THIS
+      // field's map struct — the write twin of `emitObj`'s construct-side seed, and the
+      // same defect the ident arms above carry: without it `s.m = Map()` over a
+      // `{[string]: string}` field `struct.new`'d the mono i32-valued map.
+      pendingMapSlot = -1
+      if fscode == 19 { pendingMapSlot = sFieldMapValSlot(si, fieldIdx) }
       // A BOX-union field (code 16) coerces a raw scalar/struct/null RHS into the box; the
       // niche fields seed the null rep for a bare `null` RHS (`string | null` → `ref.null
       // $aTypeIdx`, `boolean | null` → the i32 sentinel 2). A non-null value passes through.
@@ -9290,6 +9314,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         if emitExprExpect(body, a.binRight, fnIx, fwCtx) < 0 { return -1 }
       }
       pendingListKind = 0
+      pendingMapSlot = -1
       fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
       return 0
     }
