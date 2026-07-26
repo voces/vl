@@ -21273,3 +21273,188 @@ licence to delete the pass — a result outside `cloResultIsPlainScalar` is not 
      to get it wrong, and the sabotage that discards the concrete rep (S2) reddens only **2**
      corpus files, so eight of those nine chances were nearly unguarded. **Wherever two columns
      are pushed together, the push is the home.**
+## D-ARRELEM — the ARRAY-NAME grammar had fourteen hand-written copies in one file and only half a home; the CUT half now has one, and the census that found it is structural
+
+### The census, and its unit
+
+**UNIT (state it or the number means nothing): one IDIOM OCCURRENCE** = one textual match of a
+normalized character-surgery signature in non-comment code. String literals are blanked, `//`
+comments cut — and the stripper **keeps single-quoted CHAR literals verbatim**, because the first
+version of it blanked them as strings and every character-comparison pattern read **0**. That is the
+census's own version of the counting caveat: *a stripper written for a call-site count is the wrong
+instrument for a character-surgery count.*
+
+The counter is separately validated before any new number is quoted. The 23-resolver CALL-SITE
+counter reproduces three published figures at `3974381` exactly — `emit_base` **48**,
+`emit_classify` **175**, tree-wide **303** (#1169's closing scoreboard, unchanged by #1170–#1173).
+
+Enumerating **by what the CODE is, not by what the ARGUMENT is**, over `emit_base.vl` at `3974381`:
+
+| grammar | signature counted | copies | home? |
+|---|---|---|---|
+| **the ARRAY-NAME grammar** | `X[<len>-2] ?? '['` **7** · `X[<len>-1] ?? ']'` **7** · `X.slice(0,<len>-2)` **9** | **23** | TEST half only (`nameIsArray`); **CUT half had none** |
+| the BRACE-SHAPE grammar | `X[0] ?? '{'` 7 · `X[<len>-1] ?? '}'` 6 · `X[1] ?? '['` 5 | 18 | partial (`canonBareShapeName`, 3 callers) |
+| the PAREN-WRAP grammar | `X[0] ?? '('` 6 · `X[<len>-1] ?? ')'` 4 | 10 | 2 (`peelGroupParens`, `normTypeAtom`) |
+| union split-then-loop | `splitUnionAtoms(X, out)` | 7 | yes — each loop asks a *different* question |
+| top-level split | `tyTopLevelSplit(...)` | 5 | yes (the #1147 home) |
+| depth FIND | `tyTopIndexOf(...)` | 4 | yes (the checker's home) |
+| the `name:type` field cut | `X.indexOf(":")` + 2 slices | 2 | no — `annObjFieldSplit`/`shapeInnerFieldSplit` bodies are character-identical |
+
+**The array-name grammar is the largest, and it is the one that was only HALF homed.** The rule has
+two halves — *a name ending in `[]` is a 1-D list, and its element is that name minus those two
+characters* — and only the TEST had a name. Tree-wide the pair reads **104 occurrences**:
+emit_classify **49** · emit_base **23** · typecheck **12** · emit_mono **9** · emit_rewrite **6** ·
+emit_collect **5**.
+
+**A CALLER HAD ALREADY WRITTEN THE HAND-OFF, IN A COMMENT, AND NOBODY READ IT.** `emit_mono.vl:1271`
+says at its own hand-written copy: *"The `[]` cut stays RAW here (not `listElemNameOf`): that home
+strips one …"*. That is a consumer explaining that the home it was offered is the wrong one and the
+one it wants does not exist. It exists now.
+
+### What shipped
+
+`arrElemNameRaw(name)` — the RAW trailing-`[]` cut, `""` when `name` is not an array name — beside
+`nameIsArray`, the TEST it was always the other half of. `listElemNameOf` is re-expressed as *this
+cut plus the naive paren strip*, so the paren-stripping form is a LAYER on the raw one rather than a
+second copy of it. Ten call sites move; `emit_base` keeps **zero** hand-written copies of either half.
+
+**The three sites that keep an explicit `nameIsArray` in front of the cut do so for a stated reason,
+not by oversight.** `arrElemNameRaw`'s `""` means both "not an array name" and "the element of the
+degenerate `[]`" — the convention `listElemNameOf` already documents and its four callers already
+read as `false`. At `nameIsClosureArray`, `monoTyParamOf` and `monoBindFromAnn` those two answers are
+**not** interchangeable (each does something other than decline on an empty element: gate an
+`annArrowAt` walk, compare against type-param names, push a binding), so the test stays in front and
+**this merge asserts nothing about whether `"[]"` is a producible type name.**
+
+### Counts — four columns, and they do not all move the same way
+
+| column | unit | before | after |
+|---|---|---|---|
+| **array-name grammar, `emit_base`** | idiom occurrences | **23** | **3** (the two homes' own definitions) |
+| **hand-written copies, `emit_base`** | idiom occurrences | **14** | **0** |
+| **CORE 23-resolver list, `emit_base`** | call sites | **48** | **51** |
+| **CORE 23-resolver list, tree-wide** | call sites | **303** | **306** |
+
+**THE CORE COLUMN GOES UP, AND THAT IS THE HONEST READING, NOT A REGRESSION TO EXPLAIN AWAY.**
+`nameIsArray` is *on* the 23-resolver list, so naming a grammar that was previously spelled out in
+raw character compares converts invisible inline surgery into a counted call. #1169 recorded the same
+phenomenon in the opposite direction and stated the rule: **a deleted INLINE ladder is not a call.**
+The +3 decomposes exactly: **+5** new `nameIsArray` calls at the five sites that need the TEST
+(`nameIsMap`, `nameIsClosureArray`, `parenUnionArrElemName`, `monoTyParamOf`, `monoBindFromAnn`),
+**−3** removed where the cut now subsumes the test (`listElemNameOf`, `nameIsI32ListArray`,
+`nameIsNestedUnionElemArray`), **+1** inside `arrElemNameRaw` itself — the single call that now
+stands for all nine former hand-written cuts. **The seed vocabulary cannot see the 20 occurrences
+that left; report both columns or the motion reads backwards.**
+
+### Evidence
+
+Gate at `3974381`, baseline rebuilt and checksummed at the gating head FIRST
+(**1,036,139 B**, `d09de258…`) — candidate **1,034,945 B**, `67823cbe…`, **−1,194 B**.
+
+- refresh + `--prove-fixpoint` RC=0 · `native-fixpoint.sh` RC=0 (stage3 == stage4) ·
+  `rep-fuzz-check.sh` RC=0 (`exact ✅`) · `lint-self.sh` RC=0 · `vl fmt --check compiler/` RC=0 ·
+  `deno check tests/cases_wasm_test.ts` RC=0.
+- Suite, `SELFHOST_NATIVE_ALIGN=1`, **both sides in the same tree in the same session**:
+  **2,136 passed / 0 failed / 8 ignored** on the candidate and **2,136 / 0 / 8** on master.
+  *The delta was asserted before it was read* (this PR adds no fixture, so it must be 0) and 8
+  ignored — not 613 — confirms the native-align leg actually ran.
+- **Corpus A/B over ALL 1,398 `tests/cases/**.vl`, five channels** (build rc · wasm **sha256** ·
+  diagnostic message · run rc · run output): **0 differing**. One output FILE per input per side and
+  `diff -r`, never a TSV — a payload containing a TAB silently mis-joins a TSV harness. Every `/tmp`
+  path and the worktree path are normalized out of the compared fields.
+- **Fuzz A/B: 38,400 programs/side** (4 seeds × {plain, `--values`, `--branching`,
+  `--declared --branching`} × depth {3,5}), whole `--out-dir` trees diffed: **39,379 outputs, 5,859
+  distinct `.out` contents, 979 `.err` both sides, 0 differing paths.**
+- **Sidecar lifetime** on the shared-instance channel (`vl check tests/cases`, NOT `vl run --batch`,
+  which re-instantiates per file): 7,425 lines both sides, **0 differing**.
+- **Work.** A "no behaviour change" gate cannot see a work regression. Binary **−1,194 B**.
+  Self-compile wall-time, interleaved, ten runs/side: master mean **1,537 ms**, candidate
+  **1,556 ms** — **+1.2%, inside master's own 1,424–1,668 ms spread**. The first raw table read
+  "CAND +34%"; **that was the script's FIRST invocation** (cold page cache over the 9.3 MB `.cwasm`),
+  and swapping the run order moved the 4,132 ms outlier onto the other side, which is what proved it.
+  *Implausible magnitude is the tell — check it before believing a number in either direction.*
+
+### Entombment — no new fixture, and four of the seven relocations CANNOT be pinned
+
+Seven named sabotages on the SHIPPED source, each rebuilt to a fixpoint and A/B'd over the full
+corpus AND the full 38,400-program fuzz set:
+
+| sabotage | corpus | fuzz |
+|---|---|---|
+| **P1** the home yields nothing (positive control) | **134** | **4,161** |
+| **P2** the home cuts ONE character, not two | **108** | **2,392** |
+| **S1** `nameIsMap` loses the trailing-`[]` rejection | **3** | **564** |
+| S2 `nameIsClosureArray` loses the array test | 0 | 0 |
+| S3 `parenUnionArrElemName` loses the array test | 0 | 0 |
+| S4 **the declined one-call candidate, installed** | 0 | 0 |
+| S5 `nameIsMapArray` takes the paren-STRIPPING cut | 0 | 0 |
+| S6 `nameIsClosureArray` takes the paren-STRIPPING cut | 0 | 0 |
+
+**Entombment therefore needs NO new fixture** — the pre-existing corpus already fails on any compiler
+that breaks the home's cut (P1, P2) or the relocated test at `nameIsMap` (S1), on both channels.
+P1/P2 are also the comparator proof: a 0 from a harness that has never been shown to fire is not a
+measurement, and this one reddens 134 corpus files and 4,161 fuzz paths on demand.
+
+**S2/S3/S5/S6 are inert on BOTH channels, so no pin can exist for those four, and this says so rather
+than implying seven relocations were pinned.** Their populations are empty because every caller hands
+those two functions an already-canonical name.
+
+**A HEADER OF MINE WAS CORRECTED BY MY OWN SABOTAGE BEFORE IT SHIPPED.** The first draft of
+`nameIsMapArray`'s comment asserted that the RAW cut is load-bearing there — *"stripping the
+element's grouping parens is exactly what would let that union-box element in"*. **S5 measures that
+claim at 0 and 0.** The header now states the faithful reading and the measured-empty population
+instead of a mechanism no channel supports. Writing the sentence is what prompted the check; the
+claim was plausible and unverified, which is exactly the shape of every header this program has had
+to correct three times.
+
+### The candidate that was built, measured and DECLINED
+
+The one-call form at `monoTyParamOf`/`monoBindFromAnn` — read `arrElemNameRaw`'s `""` instead of
+testing first — collapses those two sites to a single call each and would take `emit_base` CORE from
+**51 to 49**. It is **S4**, and it reddens **0 of 1,398 corpus files and 0 of 38,400 fuzz programs**.
+That is not agreement: the divergence population (an annotation spelled exactly `"[]"` reaching
+either site) is **empty**, so no channel can witness either answer. Per #1169's rule — *unreached ≠
+licenced* — the faithful two-call form ships and the one-call form is filed with its measurement.
+Closing it needs a producibility argument about `"[]"` from the PARSER side, not another A/B.
+
+### Hand-offs, measured, with exact sites (all outside this partition)
+
+1. **`emit_classify.vl` holds 49 occurrences of this same grammar — the largest remaining
+   concentration, twice `emit_base`'s.** `arrElemNameRaw` is exported for it. The named starting
+   point is **`emit_classify.vl:9886`**, `if nameIsClosureArray(name) { return name.slice(0,
+   name.length - 2) }` — character-identical to `emit_base.cloArrElemNameOf`, which this PR moved.
+2. **`emit_mono.vl:1270-1271` is a caller that already asked for this home in a comment.** Its RAW
+   cut beside `nameIsClosureArray(tname)` is the same two lines; `emit_mono` already imports
+   `listElemNameOf` and `nameIsClosureArray` from `emit_base`, so the import line is a one-word edit.
+   `typecheck.vl` **12**, `emit_rewrite.vl` **6**, `emit_collect.vl` **5** are the remainder.
+3. **`nameIsArray` is quote-blind AND arrow-blind, and three of its callers already know it.**
+   `nameIsArray("(i32) => i32[]")` is **TRUE** — a function returning a list, not a list — which is
+   why `nameIsClosureArray`, `parenUnionArrElemName` and `nameIsNestedUnionElemArray` each carry
+   their own `annArrowAt(name) >= 0` guard beside it. `nameIsMapArray`, `nameIsI32ListArray`,
+   `monoTyParamOf` and `monoBindFromAnn` carry **no** such guard. Now that the grammar has one home
+   this is a single-site question for the first time; it is a behaviour CHANGE needing its own graded
+   population, so it is filed rather than taken.
+4. `annObjFieldSplit` and `shapeInnerFieldSplit` have **character-identical** `name:type` cut bodies
+   (`indexOf(":")`, `ci <= 0` → push two empties, else two slices). They differ only in their
+   splitter's `dropEmpty`, which is already a parameter of the shared walk — so the cut is a
+   third home waiting, worth 2 occurrences here and more in `emit_collect`/`emit_classify`.
+
+### Method notes earned
+
+108. **A COMMENT-STRIPPER BUILT FOR CALL-SITE COUNTING IS BLIND TO CHARACTER SURGERY.** Blanking
+     single-quoted char literals as "strings" is correct for `NAME(` counting and destroys the entire
+     signal for a `'['`/`'{'`/`'('` census — it read **0** for every character pattern, which looked
+     like a clean file rather than a broken instrument. **A 0 from a reused harness is a question
+     about the harness first.**
+109. **HALF A GRAMMAR CAN HAVE A HOME WHILE THE OTHER HALF HAS NONE, AND THE NAMED HALF HIDES IT.**
+     `nameIsArray` has been the array-name home for the whole program; a name-based census sees it
+     called and files the grammar as homed. The CUT half — nine hand-written copies in one file, 104
+     tree-wide — is invisible to that census because a slice has no name. **Census both halves of a
+     rule: the FIND and the CUT, the TEST and the PEEL.**
+110. **A CONSUMER'S COMMENT EXPLAINING WHY IT CANNOT USE A HOME IS A HAND-OFF NOBODY FILED.**
+     `emit_mono.vl:1271`'s "the `[]` cut stays RAW here (not `listElemNameOf`): that home strips one"
+     is a precise statement of a missing home, sitting in the tree, unread. **Grep for comments that
+     NAME a home in order to decline it — they are where the next home is specified.**
+111. **A WALL-TIME TABLE'S FIRST ROW IS A WARM-UP, AND WHICHEVER SIDE HOLDS IT LOSES BY 34%.** The
+     fix is not more runs, it is **swapping the order and watching the outlier move**. One swapped
+     rerun turns "a 34% regression" into "a cold page cache", and it costs one command.
