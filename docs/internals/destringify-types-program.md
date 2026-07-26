@@ -19039,9 +19039,28 @@ and a `TyVar`.
 `compiler/driver.vl` — `builtinScan`'s comment beside the published
 `(i32 | i64 | f32 | f64 | boolean | string) -> void` said the checker *admits* these shapes and the
 emitter mis-lowers them. It no longer does, so the comment now says the gate and the string are one
-statement. **The published type and the rejections agree** — verified cell by cell: every rejected
-shape is outside that union, every accepted shape inside it (plus the two the union already
-covers implicitly, a literal union and a nullable string).
+statement.
+
+**Do the published type and the rejections agree? In ONE direction exactly, and the other direction
+is where a 7th defect lives.** Checked shape by shape rather than asserted:
+
+* **Every rejected shape is outside the published union.** Exact, all 24.
+* **The ACCEPTED set is still slightly WIDER than the published union**, in four ways, and only two
+  of them are benign: a LITERAL union (`"a"|"b"`, `0|1` inline) widens to a member's rep, so it is
+  `string`/`i32` and inside; a generic `T` is decided at the call site and the concrete argument is
+  gated there. The other two are not: **`print(<void call>)` is the still-open 25th cell**, and —
+  found while checking this very claim —
+
+  ```vl
+  const s: string | null = if c then "v" else null
+  print(s)        // c == false: vl check CLEAN, `wasm trap: null reference` at runtime
+  ```
+
+  A nullable string **that actually holds null** traps. The non-null case prints (and is pinned by
+  the shipped fence), so `tyPrintsAsRef` correctly does NOT claim `string | null` — the gate is
+  right and the LADDER's nullable-string arm is what has no null path. Pre-existing, identical on
+  both sides of this PR, **filed**. *The honest form of "the published type is now true" is: true
+  for everything it rejects, and three shapes wider than it claims for what it accepts.*
 
 Four reject pins, plus the FALSE-side fence #1163 shipped:
 `types/print-array-rejected.vl`, `types/print-struct-rejected.vl`, `maps/print-map-rejected.vl`,
@@ -19227,6 +19246,12 @@ names**, against a whole-tree TRUE TOTAL of 345.
 
 ### REFUTATIONS
 
+0. **"The published `print` type and the new rejections agree."** REFUTED IN ONE DIRECTION, by
+   checking my own claim instead of asserting it. Exact for everything REJECTED; the ACCEPTED set is
+   three shapes wider — `print(<void call>)`, a generic `T`, and `string | null`, the last of which
+   **traps with `wasm trap: null reference` when the value is actually null**, `vl check` clean.
+   Found while writing the sentence that claimed agreement. MY OWN CENSUS CAN BE WRONG IN BOTH
+   DIRECTIONS.
 1. **"The filed census's 20 controls all print."** REFUTED, and it is the finding of this slice.
    **`type Z = 0 | 1` + `print(z)` is CHECK-CLEAN + invalid wasm on master** — a 26th silently-invalid
    cell, in the control column. It is not a `print` bug (`z + 1` and `toString(z)` fail too) and the
@@ -19275,5 +19300,10 @@ names**, against a whole-tree TRUE TOTAL of 345.
 6. **Negative zero renders `-0` under the Rust host** for both `f64` and `f32` (confirmed here),
    against `main.rs`'s stated JS-parity intent — the Deno test host prints `0`. A host-side
    formatting divergence, no VL-side change.
+7. **`print(<string | null>)` traps when the value is actually null** — `wasm trap: null reference`,
+   `vl check` clean, pre-existing and unchanged by this PR. The print ladder's nullable-string arm
+   has no null path. The non-null case prints and is pinned by
+   `types/print-scalar-boundary-controls.vl`, so this is a missing arm, not a gate question:
+   `tyPrintsAsRef` must keep declining `string | null`.
 7. `types/unknown-type-in-map-value.vl` now carries two `@error`s. If the first one's cause is ever
    fixed, the second stays — it pins the function-value print cell.
