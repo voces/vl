@@ -9826,3 +9826,470 @@ carrying `caad41a`'s `typecheck.vl`):
     whether a change moved a diagnostic that only `vl check --severity` prints. A separate
     1,335-row `--severity hint` sweep (689 rows carrying at least one lint) is one more cheap
     channel, and the population count is what makes its 0 mean something.
+## D-VALUNION + D-LITISKIND + D-SETONCE — the VALUE-UNION predicate stops re-splitting a rendering, the literal-`is` ladder stops parsing its own output, and each union set is resolved ONCE (#1138)
+
+Branched at **`caad41a`** (#1136 D-COERCEKIND). Partition:
+`compiler/wasmEmit.vl` + `compiler/emit_rep.vl` + `compiler/emit_state.vl` +
+`compiler/emit_rewrite.vl`. Only the first two changed; `emit_state` and `emit_rewrite`
+are untouched.
+
+1. **D-VALUNION** — `isValueUnionName`, the emitter's most-called union-spelling
+   consumer, becomes a projection of the banked member-KIND column at **eight of its ten
+   sites in this partition**. Two sites are *measured* not migratable and keep the
+   spelling, with the mechanism and the numbers.
+2. **D-LITISKIND** — `emitUnionLitIs`'s literal-rep ladder settles the ABI **code**
+   alongside the spelling it mints, instead of parsing that spelling back four lines
+   later. #1136's D-COERCEKIND move, applied to the second minting ladder in this file.
+3. **D-SETONCE** — a union's interned member set is resolved once per site and threaded;
+   the text-taking `unionResidualSoloKind` wrapper is DELETED.
+
+### The counter was validated against SIX published figures before producing a new one
+
+Unit and filter are #1136's, unchanged so the numbers compose. **UNIT: one CALL SITE** =
+a textual `name(` in code that is neither a `//` comment nor inside a string literal
+(literals are BLANKED to same-length space runs *first*, so a `//` inside a literal never
+truncates a line and a resolver named in a diagnostic string is never counted), with the
+resolver's own `function name(` / `export function name(` header excluded. Per-file sums
+are cross-checked against the tree-wide total.
+
+Every figure below reproduced exactly, all measured at `caad41a` — **the commit that
+published them**, which is the calibration the brief asks for:
+
+| published figure | published by | reproduced |
+|---|---|---|
+| parser list, 4 owned files = **13** | #1136 | ✅ |
+| parser list, tree-wide = **523** | #1136 | ✅ |
+| `emit_classify.vl` parser list = **312** | #1130 | ✅ |
+| value-atom family, 4 owned files = **27** | #1136 | ✅ |
+| value-atom family, tree-wide = **121** | #1136 | ✅ |
+| Filter F: `wasmEmit` **36** · 4 files **48** · tree **641** | #1136 | ✅ |
+
+**THE DENOMINATOR, restated so this slice's delta has a base: Filter F at `caad41a` is
+`wasmEmit.vl` = 36 · the four owned files = 48 · tree-wide = 641.** The census's 83 for
+`wasmEmit` still does not reproduce, for #1136's stated reason — `unionHasAtomTy` is
+**27** calls in this file (re-counted here, exactly 27) and has been arena-only since
+D-UHATOTAL.
+
+| unit | scope | master `caad41a` | now | delta |
+|---|---|---|---|---|
+| parser list | 4 owned files | 13 | **13** | **0** |
+| parser list | tree-wide | 523 | **523** | **0** |
+| value-atom family | 4 owned files | 27 | **19** | **−8** |
+| value-atom family | tree-wide | 121 | **113** | **−8** |
+| **Filter F** | **`wasmEmit.vl`** | **36** | **28** | **−8 (−22%)** |
+| **Filter F** | **4 owned files** | **48** | **40** | **−8** |
+| **Filter F** | **tree-wide** | **641** | **633** | **−8** |
+
+`isValueUnionName` **9 → 2** in `wasmEmit` (10 → 3 in the partition, **43 → 36**
+tree-wide — the eight migrated sites minus the one the new private ladder keeps);
+`valueAtomKind` **10 → 9**. The tree-wide delta equals the partition delta exactly in
+both families — nothing outside the two edited files moved. That is a cross-check, not a
+second measurement.
+
+### 1. D-VALUNION — a predicate that is a function of a vector of ABI codes
+
+`isValueUnionName(name)` (`typecheck.vl`) answers "does this union box into the shared
+`{tag, payload}` rep". To do so it takes the RENDERING apart three times:
+
+```
+if unionMemberCount(name) < 2 { return false }   // whole-string all-grouper depth scan
+splitUnionAtoms(name, atoms)                     // the SAME scan again, materializing every atom
+… valueAtomKind(atoms[i]) …                      // classify each materialized atom
+```
+
+and then reads nothing but the vector of codes: 2+ non-null codes ⇒ box; exactly one
+non-null NUMERIC code plus `null` ⇒ box; anything else ⇒ not a box. **Those codes are
+already recorded**, one per member, in the row's box-tag ABI order, by `recordUnMemTys`
+(`unMemValKind`) — the column #1128 added and #1136 read for the `==` arms.
+
+New in `emit_rep.vl`, beside `msSoloValKind` / `msMemberValKindsOf`:
+
+```
+export function msIsValueUnion(s: i32): i32     // 1 yes · 0 no · -1 uncovered
+```
+
+**Why it is EXACT and not an approximation.** `msSetOfText(text) == s` hands back a set
+only when `text` IS that set's members joined in recorded order, and those members were
+split from exactly such a string once, at registration — the contract `msMemberAtomsOf`
+already runs on in production. So `msMemberValKindsOf(s)` is
+`[valueAtomKind(a) for a in splitUnionAtoms(text)]` member for member; and
+`unionMemberCount` is `splitUnionAtoms`' own counting DUAL (the same scanner, the same
+arms, separators counted instead of materialized), so the cardinality gate matches too.
+The body is `isValueUnionName`'s, arm for arm, with the derivation replaced by the column
+read — including its short-circuit on a member that is not a value atom at all.
+
+`wasmEmit` gets ONE private ladder, `isValueUnionOfSet(s, nm)`; the set id is threaded in
+rather than resolved inside, deliberately (see the two declines below).
+
+### The candidate-beside-authority probe, and what it said about EACH site
+
+Every site computes both answers and reports through the emit-error channel; the
+aggregate is per SITE, not per file, so a site cannot hide inside another's volume.
+`reach` = calls · `cov` = the pool covers the set · `DIS` = the two answers differ ·
+`covT`/`covF` = both answers' populations · `uncT`/`uncF` = the decline's answers.
+
+| # | site | corpus reach | cov | **DIS** | covT | covF | uncT | fuzz reach | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `emitUnionConcreteEq` | 15 | 15 | **0** | 15 | 0 | 0 | 0 | **migrated** |
+| 2 | `emitUnionUnionEq` (left) | 8 | 8 | **0** | 8 | 0 | 0 | 0 | **migrated** |
+| 3 | `emitUnionUnionEq` (right) | 8 | 8 | **0** | 8 | 0 | 0 | 0 | **migrated** |
+| 4 | `emitUnionLitIs` | 9 | 9 | **0** | 9 | 0 | 0 | 0 | **migrated** |
+| 5 | `emitFn`'s `retUNm` pin | **79,912** | **47** | 0 | 18 | 29 | 0 | 3,484 (0 cov) | **DECLINED** |
+| 6 | `emitNullForRet` | 17 | 13 | **0** | 13 | 0 | 0 | 0 | **migrated** |
+| 7 | `??` over an ident | 26 | 26 | **0** | 26 | 0 | 0 | 0 | **migrated** |
+| 8 | `??` over a call | 16 | 16 | **0** | 16 | 0 | 0 | 0 | **migrated** |
+| 9 | `??` over a struct field | 6 | 6 | **0** | 6 | 0 | 0 | 0 | **migrated** |
+| 10 | `emit_rewrite`'s `synthRetAnnots` | 643 | **0** | 0 | 0 | 0 | 0 | 4,017 (0 cov) | **DECLINED** |
+| | **total** | **80,660** | **148** | **0** | **119** | **29** | **0** | 7,501 | |
+
+Corpus: 1,337 files, 455 of them reaching at least one site. Fuzz: 16,800 generated
+programs. **Both answers are populated on the covered side (119 TRUE / 29 FALSE), so the
+0 is not a constant-`false` artifact.**
+
+**THE TWO DECLINES ARE THE REAL FINDING, and they are the SAME producer.** Sites 5 and 10
+both classify a checker RENDER of an *inferred* return (`inferRetNameOf` /
+`inferRetNameByNode`). The pool covers **47 of 79,912** (0.06%) and **0 of 643**. A
+bank-first ladder at site 5 would add a text→set RESOLUTION ahead of a path whose own
+first act (`unionMemberCount < 2`) already cheap-rejects the 79,865 non-union spellings —
+a **work regression**, and the brief's "do not chase the parse count into an allocation
+regression" says not to take it. The mechanism is that the inferred-return render is a
+spelling the union REGISTRY never interned: it is a third encoding of a type, produced by
+`irRendered(tyToEmitName(er))` in `typecheck.vl` from an arena index it holds and throws
+away. **Its retirement is the `inferRetTyByNode` hand-off (#1136's hand-off 6), not a
+consumer-side ladder** — and this slice is the second independent measurement pointing at
+that one producer.
+
+Also refuted, by measurement, a guess made while planning this slice: "`synthRetAnnots`
+runs before `collectU`, so the bank cannot cover it BY CONSTRUCTION." **False** — the pass
+table says `synthRetAnnots > collectU buildFnMap`, so the registry IS populated when it
+runs; the 0 is a property of the SPELLING, not of the pass order. (Method note: check the
+pass table, do not infer it from the call site's neighbourhood.)
+
+### THE COMPARATOR IS PROVEN LIVE AT EVERY MIGRATED SITE — with two sabotages, not one
+
+A 0 with a comparator that cannot fire is worth nothing. The first sanity build
+(**SANITY-A**, `msIsValueUnion` loses the `nonNull == 1 && hasNull` numeric arm) read 72
+disagreements over the same 148 covered reaches — but **0 at sites 1–4**, because those
+unions take the *other* arm. That partial fire is exactly the trap the brief warns about,
+so a second build (**SANITY-A2**, the `nonNull >= 2` arm inverted) was run:
+
+| sanity build | s1 | s2 | s3 | s4 | s5 | s6 | s7 | s8 | s9 | total DIS |
+|---|---|---|---|---|---|---|---|---|---|---|
+| SANITY-A (`scalar\|null` arm) | 0 | 0 | 0 | 0 | 11/47 | **13/13** | **26/26** | **16/16** | **6/6** | 72/148 |
+| SANITY-A2 (`2+ non-null` arm) | **15/15** | **8/8** | **8/8** | **9/9** | 7/47 | 0 | 0 | 0 | 0 | 47/148 |
+
+**Every covered reach at every migrated site is separated by one of the two.** The union
+of the two sanities covers 101/101 of the migrated sites' covered reaches at 100%.
+
+### 2. D-LITISKIND — the second minting ladder in this file
+
+`emitUnionLitIs` settled the literal's rep atom with a four-arm ladder and then parsed the
+string it had just minted:
+
+```
+let atom = "i32"
+if lit[0] == '"' { atom = "string" } else if numTextIsFloat(lit) { atom = "f64" }
+else if !numLexFitsI32(lit) { atom = "i64" } else if …i32-absent-and-i64-present… { atom = "i64" }
+…
+const lak = valueAtomKind(atom)        // ← a parse of the ladder's own output
+```
+
+The ladder now assigns `lak` alongside `atom`. **Why it is exact, not a fold** (method
+note 72's bijection check, done rather than asserted): `valueAtomKind`'s first six arms
+are literal compares against six distinct lexemes, and this ladder's image is exactly
+`{"i32","string","f64","i64"}` → `{0, 2, 4, 3}`, injective in both directions ON THIS
+LADDER'S IMAGE. The spelling survives only for `unionHasAtomTy`'s membership test, which
+is *deliberately* exact (a `TyPrim.primName` compare — see its header) and whose
+structural twin is filed as a hand-off below, pre-measured.
+
+**1 `valueAtomKind` call deleted.**
+
+### 3. D-SETONCE — and a wrapper that is now dead
+
+`unionResidualSoloKind(set)` was literally `unionResidualSoloKindOfSet(msSetOfText(set))`,
+and each of its three callers resolves the SAME set one line earlier for the value-union
+gate. All three take the id; the wrapper is **deleted** (its `msSetOfText` with it).
+`emitUnionUnionEq` now binds `lsid`/`rsid` at the gate, so `msMemberAtomsOf(rname, …)` —
+which is *by definition* `msMemberAtomsOfSet(msSetOfText(rname), …)` — becomes the set-id
+form; `emitMapGetOrUnionBox` likewise resolves its map-value set once for both the member
+walk and the residual code. `msMemberAtomsOf` now has **zero** callers in `wasmEmit` (the
+import was dropped; the lint caught it, which is why the gate is run, not asserted).
+
+### Work, COUNTED not timed (a second instrument, and it agrees with the first)
+
+A counter build (throwaway; counters in `ast.vl`, bumped in the four resolvers' entries)
+swept the whole corpus on both sides. 1,161 reporting programs per side:
+
+| counter | master | this slice | delta |
+|---|---|---|---|
+| `isValueUnionName` entries | 562,553 | 562,446 | **−107** |
+| `unionMemberCount` entries | 777,424 | 777,317 | **−107** |
+| `splitUnionAtoms` entries | 547,621 | 547,514 | **−107** |
+| `valueAtomKind` entries | 662,534 | 662,287 | **−247** |
+| `msSetOfText` entries | 118,043 | 118,108 | **+65** |
+| `msIsValueUnion` entries | 0 | 111 | +111 |
+
+Each deleted `isValueUnionName` entry is **two** full-string all-grouper depth scans plus
+one `slice` allocation per atom. **−107 exactly cross-checks the agreement probe**: that
+probe read 101 covered reaches at the eight migrated sites over 1,337 files, and this
+sweep ran over 1,339 (the two new fixtures below reach `emitUnionLitIs` three times each)
+— 101 + 6 = **107**, two independent instruments agreeing to the unit.
+
+The price is stated too: **+65 `msSetOfText` resolutions** (a map probe, or a memoized
+miss) at the four sites that did not already resolve one, and **+383 bytes** of compiler
+binary (1,038,163 → 1,038,546).
+
+### Channels
+
+| channel | volume | result |
+|---|---|---|
+| corpus byte / message / run, base `caad41a` | **1,337 files** (pre-fixture) | **0 / 0 / 0** |
+| corpus byte / message / run, with the 2 new fixtures | **1,339 files** | **0 / 0 / 0** |
+| fuzz A/B, whole `--out-dir` trees | **50,400 programs/side**, 52,746 output files/side | **0 differing paths** |
+| agreement probe, corpus | 1,337 files / 80,660 reaches / 148 covered | **0 disagreements** |
+| agreement probe, fuzz | 16,800 programs / 7,501 reaches | **0 covered — a stated blind spot** |
+
+**Channel populations, shown rather than claimed:** 1,134 distinct wasm hashes, 201 build
+rejects, 212 nonzero run rcs across the corpus sweep; 119 TRUE / 29 FALSE on the probe's
+covered side.
+
+**THE FUZZ CHANNEL IS BLIND TO THIS CHANGE, and that is reported, not glossed.** Over
+16,800 generated programs the eight migrated sites are reached **zero** times — the
+generator emits no value-union `==`, no literal `is` over a mixed-rep union, and no `??`
+over a boxed value union. Fuzz reaches only sites 5 and 10, the two NOT migrated, and
+covers 0 of those. So D-VALUNION's agreement evidence is **corpus-only**; the fuzz A/B's
+50,400-program 0 is a regression net over the compiler as a whole, not a second
+confirmation of this predicate. This is #1125's finding in its second direction (that one
+was 224 corpus disagreements against 0 across 50,400 fuzz programs): **neither channel is
+a superset, and a 0 must be labelled with which channel could have seen it.**
+
+### Entombment — 9 sabotages against the SHIPPED build, and TWO holes in the corpus FILLED
+
+Each sabotage is applied to the shipped source, built, and swept against the shipped build
+over the whole corpus (byte, message AND run). The restore is a `cp` from a copy kept
+beside the runner, and the restored source rebuilds a byte-identical artifact (verified).
+
+| sabotage | what it breaks | byte | msg | run |
+|---|---|---|---|---|
+| **S-VUSOLO** — `msIsValueUnion` loses the numeric-`scalar\|null` arm | every `??` over a boxed value union | **28** | **28** | **28** |
+| **S-VUMULTI** — `msIsValueUnion` loses the 2+-non-null arm | union `==` and literal `is` | **10** | **10** | **9** |
+| **S-LITISSTR** — the literal ladder's STRING arm gets the i32 code | the mixed-rep string-literal `is` | **3** | **3** | **3** |
+| **S-LITISF64** — the literal ladder's f64 arm gets the i64 code | the float-literal `is` | 0 → **1** | 0 → **1** | 0 → **1** |
+| **S-LITISI64** — the literal ladder's i64 arm gets the i32 code | the wide-integer-literal `is` | 0 → **1** | 0 | 0 → **1** |
+| S-VUFORCE — the ladder's DECLINE leg answers `false` instead of falling through | (coverage, see below) | 0 | 0 | 0 |
+| S-VUCARD — `msIsValueUnion` accepts a ONE-member set | (guard both legs share) | 0 | 0 | 0 |
+| S-SETONCER — the right operand's member walk takes the LEFT set id | (inert by construction) | 0 | 0 | 0 |
+| S-MAPSET — the map-value residual is forced onto the render leg | (D-RESIDUE's agreement) | 0 | 0 | 0 |
+
+**S-VUFORCE's 0 is the coverage statement, not a hole.** It makes the ladder answer
+`false` wherever the bank declines instead of consulting the spelling. Zero diffs over
+1,337 files says the bank covers **100%** of the eight migrated sites' reaches on this
+corpus — independently confirming the probe's `cov` column and its `uncT = 0`.
+
+**S-VUCARD is inert because the arm is a guard BOTH legs share** (`isValueUnionName` opens
+with the same `< 2` reject), and no one-member interned set reaches a migrated site: every
+one of them is gated on "this value is a union BOX", and a box has 2+ members by
+construction. Stated as the mirrored guard it is, not as evidence.
+
+**S-SETONCER is inert BY CONSTRUCTION, and the reason is a neighbouring layer** (method
+note 73). `msMemberAtomsOf(set, out)` *is* `msMemberAtomsOfSet(msSetOfText(set), out)` —
+textual identity, so the threading cannot change an answer. The sabotage that would expose
+a difference needs two operands with DIFFERENT member sets, and the CHECKER refuses to
+build one: `const a: i32 | string; const b: i32 | f64; a == b` is rejected with
+``cannot compare i32 | string with i32 | f64`` (verified on this build), while an
+alias-spelled operand is emit-REJECTED before `emitUnionUnionEq`
+(``==`` over a struct union is not supported yet` — verified both sides). **S-MAPSET** is
+#1136's S-RESIDUE restated: it forces the rendered-residual leg, which that slice measured
+to agree at every reach.
+
+**S-LITISF64 and S-LITISI64 came back INERT, and the missing fixtures were WRITTEN**
+(method note 74, #1128/#1136's shape). Two rows of the literal-rep ladder changed nothing
+over 1,337 files: no corpus program does `is <float literal>` or
+`is <out-of-i32-range integer literal>` over a mixed-rep value union. Master could have
+shipped either arm's code wrong.
+
+| new fixture | pins | vs master | under its sabotage |
+|---|---|---|---|
+| `tests/cases/unions/literal-is-f64-arm-kind.vl` | the f64 arm of the literal-`is` rep ladder over `f64 \| string` | byte-, message-, run-IDENTICAL | **fails to compile** — "type mismatch: expected i64, found i32" |
+| `tests/cases/unions/literal-is-i64-arm-kind.vl` | the i64 arm, over `i64 \| string` with a wide literal | byte-, message-, run-IDENTICAL | **SILENTLY prints `no` where the answer is `yes`** |
+
+The second is the more valuable of the two: its sabotage produces no diagnostic at all,
+only a wrong `is` answer. **D-LITISKIND is what made those rows separately perturbable** —
+before it, the code came from re-parsing the arm's own spelling, so an arm and its code
+could not disagree and neither could be pinned alone. That is method note 74 in its second
+instance: a mint-then-reparse deletion, like a table collapse, makes each row testable for
+the first time.
+
+### Gate
+
+| check | result |
+|---|---|
+| `scripts/refresh-compiler.sh` | **RC=0** |
+| `scripts/native-fixpoint.sh` | stage3 == stage4 byte-for-byte (1,038,546 B) — **RC=0** |
+| `scripts/lint-self.sh` | self-lint + fmt-check clean — **RC=0** |
+| `scripts/rep-fuzz-check.sh` | exact ✅ 1 baselined reject, 0 new / 0 stale — **RC=0** |
+| `deno task test` | master `caad41a` **1,430 / 0 / 602** → **1,432 / 0 / 602** (+2 = the new fixtures) |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | master `caad41a` **2,024 / 0 / 8** → **2,026 / 0 / 8** (+2) |
+
+**Both the MAGNITUDE and the ignored NAME SET were checked**, in one session, master and
+branch with the same commands. A plain `deno task test` in this worktree self-ignores
+**602** tests; only `SELFHOST_NATIVE_ALIGN=1` runs the native suites (2,026 vs 1,432).
+A green RC over 70% of the suite is not a green suite. The ignored-test **name sets** are
+IDENTICAL on both invocations (601 vs 601 named, 8 vs 8) — 0 tests newly ignored, 0 that
+stopped being ignored, so nothing silently stopped running. The worktree was given the
+host binary and `node_modules` so the native and binaryen suites actually execute.
+
+Source: `emit_rep` +69 / −3, `wasmEmit` +108 / −30. Binary **1,038,163 → 1,038,546
+(+383 B)**.
+
+### Refutations — things in the brief or in the code that this slice found WRONG
+
+1. **`repRowOfName`'s header comment in `emit_rep.vl` was STALE and materially
+   misleading.** It read "Confirm-only seat … no consumer yet, so the whole export is
+   byte-identical — it MINTS arena types via `resolveAnnot` only when called, and nothing
+   calls it." It has **six** live call sites in `emit_classify.vl` today
+   (`structIndexOfTypeRef`'s nullable arm ×2, `structIdxOfElemName`, and three more), all
+   on hot classification paths. The comment is corrected in place. **This matters for the
+   brief's headline lead**: it means the most expensive of `emit_rep`'s seven
+   `resolveAnnot` calls is not dormant — it is a checker RENDER put through a
+   character-level rewrite (`renderFaithful`) and RE-PARSED, six times over.
+2. **"`synthRetAnnots` runs before `collectU`, so the union bank cannot cover it."** False
+   — the pass table declares `synthRetAnnots > collectU buildFnMap`. Its 0% coverage is a
+   property of the inferred-return SPELLING, not of pass order.
+3. **#1136's "`isValueUnionName` … its arena dual needs `msSetOfText` first — a laddering,
+   not a deletion"** is right about the shape and wrong about the value: the laddering is
+   9 → 2 with a measured −107 whole-string splits and −247 atom classifications, and it
+   was worth taking at eight sites and NOT at two. The interesting content was never
+   "ladder or delete" — it was *which* sites, and only a per-site probe could say.
+4. **The census's 83 operations for `wasmEmit.vl` remains unreproducible** at this head
+   under any stated resolver list, and this slice re-confirms #1136's decisive exclusion by
+   re-counting it: `unionHasAtomTy` is **27** calls in this one file.
+
+### Hand-offs, each with its evidence already spent
+
+1. **`emit_classify.vl` — `msHasValKind(s, k)` is BUILT, PROBED and NOT SHIPPED.** The
+   structural twin of `unionHasAtomTy(name, kw, false)` for the seven SCALAR keywords: a
+   membership test over the banked kind column, `msHasNull`'s generalization from the
+   `null` keyword to the whole scalar row. It is EXACT for kinds 0–6 (the kind map is a
+   bijection there — `valueAtomKind` answers 0 for `i32` and nothing else, …) and MUST
+   decline above them (kind 7 folds `i32[]`/`boolean[]`/litunion-`K[]` into one code,
+   which is precisely the fold `unMemHasAtom`'s header forbids, and a list member's arena
+   type is a `TyArray` so the primitive test answers NO where a kind test would answer
+   YES). **Measured, with its comparator proven:**
+   - corpus **480 reaches / 480 covered / 0 disagreements** (424 TRUE, 56 FALSE) across
+     ten sites — `emitUnionLitIs` ×3, `emitUnionConcreteEq`, the three `??` null tests,
+     `emitUnionUnionEq`'s two `string` tests, the struct-field null test, and
+     `emitUnionCoerce`'s four scalar arms;
+   - fuzz **2,141 reaches / 2,141 covered / 0 disagreements** (1,729 TRUE, 412 FALSE) at
+     `emitUnionCoerce` — **so this one IS confirmed on both channels**, unlike D-VALUNION;
+   - comparator sanity (`msHasValKind` matches `k + 1`): **400 of 480** corpus reaches
+     disagree, every site fires.
+   It was not shipped because it deletes no Filter-F call (`unionHasAtomTy` is already
+   arena-only) and would have enlarged the diff; what it buys is **name-keyed whole-string
+   resolutions** — `unionHasAtomTy` resolves its union by NAME on every call, so
+   `emitUnionCoerce`'s four consecutive tests are four resolutions where one set id would
+   do. **The body is written out here rather than left in a throwaway build, because a
+   hand-off that points at a history nobody can reach is exactly the stale lead this
+   program keeps re-learning about:**
+   ```
+   // MEMBERSHIP of a SCALAR value atom, by its ABI KIND — `msHasNull`'s generalization
+   // from the `null` keyword to the whole scalar keyword row, answered from the banked
+   // kind column with no spelling anywhere. 1 present · 0 absent · -1 uncovered.
+   // Restricted to kinds 0-6 BY CONSTRUCTION: `unMemHasAtom` is deliberately EXACT (a
+   // `TyPrim` spelled exactly `want`), and only across the seven scalar keywords is the
+   // kind map a bijection. Kind 7 folds `i32[]` / `boolean[]` / litunion-`K[]` into one
+   // code — the fold `unMemHasAtom`'s header forbids — and every list member's arena
+   // type is a `TyArray`, so the primitive test answers NO for a list spelling where a
+   // kind test would answer YES. -1 makes that structural, not a convention.
+   export function msHasValKind(s: i32, k: i32): i32 {
+     if k < 0 || k > 6 { return -1 }
+     const kinds: i32[] = []
+     if !msMemberValKindsOf(s, kinds) { return -1 }
+     let i = 0
+     while i < kinds.length {
+       if kinds[i] == k { return 1 }
+       i = i + 1
+     }
+     0
+   }
+   ```
+   The consumer shape that avoids introducing a kind→keyword RENDERER (which would
+   relocate the spelling rather than delete it, #1136's objection) is to pass the keyword
+   the caller ALREADY writes as the decline argument:
+   `unionHasAtomK(s, nm, "i32", 0)` = `msHasValKind(s, 0)`, falling through to
+   `unionHasAtomTy(nm, "i32", false)`. Take it with the numbers above rather than
+   re-measuring.
+2. **`typecheck.vl` — bank the inferred-return TYPE (`inferRetTyByNode`).** #1136 filed
+   this off `synthRetAnnots`' 19-site ladder; this slice is the SECOND independent
+   measurement of the same producer, from the other side: sites 5 and 10 here are 80,555
+   reaches whose spelling the union registry covers 0.06% and 0% of the time. One producer
+   (`irRendered(tyToEmitName(er))`, `typecheck.vl:1103`) throwing away an arena index it
+   holds is now measured to be blocking **both** the emitter's largest remaining
+   character-surgery concentration AND its most-called union predicate. This is the
+   highest-value single move left in the emitter's second arc.
+3. **`emit_rep.vl`'s `resolveAnnot` population, re-scoped by the stale-comment finding.**
+   Seven calls: `repElemKeyOfName`, `sTyIxOfName`, `fieldElemTyIxOfName`, `unMemAtomTyIx`,
+   `slotCanonKey`, `repNameCanonKey`, `repRowOfName`. The last is the one to take first
+   and the brief did not know it: it is a `tyToStr` RENDER → `renderFaithful` character
+   rewrite → checker re-parse, on six hot `emit_classify` paths, and the arena entry point
+   (`repRowOfTyStruct(di, lim)`) sits directly below it and is already called with an index
+   at five other sites. The first consumer
+   (`structIndexOfTypeRef`) even reads `nodeRepTyIxOf(tyIx)` a few lines above and uses it
+   only for the `TyNullable` case. `slotCanonKey` is the second: its `resolveAnnot` leg
+   duplicates what `sTyIxOfName` already recorded into the `sTyIx` sidecar at every row
+   mint, but the sidecar is consulted LAST — an ordering question a
+   `repCanonKey`-tolerance probe (NOT index equality: index identity is not type identity)
+   can settle in one build.
+4. **`emit_rewrite.vl` is still all but clean.** Its single `isValueUnionName` is site 10
+   above (0% coverage, mechanism in hand-off 2); its three inline character-surgery sites
+   remain `synthRetAnnots`', unchanged, gated on the same hand-off.
+
+### RE-TAKEN at the rebase base `7a714fd` (#1137 D-ISVARTY + D-ALIASFN) — every figure reproduces
+
+This slice was measured at `caad41a` and rebased onto **`7a714fd`**, a 65-line
+`typecheck.vl` change plus four fixtures. The four owned files are **byte-identical across
+both bases** (`git diff caad41a 7a714fd -- <the four>` is empty), so every number above was
+re-taken rather than assumed. All of them reproduce:
+
+| figure | at `caad41a` | at `7a714fd` |
+|---|---|---|
+| parser list, tree-wide | 523 | **523** |
+| value-atom family, tree-wide (this slice applied) | 113 | **113** |
+| Filter F, tree-wide (this slice applied) | 633 | **633** |
+| corpus byte / message / run | 1,339 files, **0 / 0 / 0** | **1,343 files, 0 / 0 / 0** (1,138 distinct wasm hashes, 201 rejects, 212 nonzero run rcs) |
+| fuzz A/B, whole `--out-dir` trees | 50,400/side, 52,746 files/side, **0** | **50,400/side, 52,746 files/side, 0** |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | master 2,024/0/8 → 2,026/0/8 | **master 2,028/0/8 → 2,030/0/8** (+2 = this slice's fixtures), ignored NAME SETS identical |
+| `native-fixpoint.sh` | byte-for-byte, 1,038,546 B | **byte-for-byte, 1,038,599 B** |
+| binary delta | 1,038,163 → 1,038,546 (**+383 B**) | 1,038,216 → 1,038,599 (**+383 B**) |
+
+The agreement probe, the two comparator sanities, the nine sabotages and the work counters
+were measured at `caad41a` and are NOT re-taken: they instrument the four owned files
+only, which #1137 did not touch. The corpus and fuzz A/Bs — the channels that CAN see a
+cross-file interaction — were both re-run in full.
+
+**One correction found while re-taking:** the tree-wide `isValueUnionName` figure first
+written here was 44 → 36. It is **43 → 36**. The partition figure (10 → 3) and the Filter F
+deltas (−8, because `valueAtomKind` also loses one) were right; the tree-wide base was not.
+
+### Method notes earned
+
+75. **A per-SITE probe is not a luxury for a multi-site migration — it is the only thing
+    that can find the sites you must NOT take** (D-VALUNION). The aggregate for this
+    resolver reads "80,660 reaches, 148 covered, 0.18%", which looks like a dead end; per
+    site it reads "eight sites at 100% coverage and two at ~0%", which is a slice. And the
+    two low-coverage sites were not merely unprofitable, they were a **work regression** —
+    a bank-first ladder in front of a resolver that already cheap-rejects adds a
+    resolution and removes nothing. Aggregate coverage hid both facts.
+76. **One sabotage can be 100%-effective and still prove nothing about half your sites**
+    (SANITY-A). It fired at 5 of 9 sites and read 0 at the other 4 — not because the
+    comparator was dead there, but because those unions take a different arm of the same
+    predicate. **Sabotage each ARM of a multi-arm predicate, then take the union of the
+    fire sets and check it covers every site.** A single sabotage's "72 of 148" would have
+    been quoted as proof and would have been half a proof.
+77. **Label every 0 with the channel that could have seen it.** The fuzz A/B here is
+    50,400 programs and 0 differences, and it is *worthless as agreement evidence for this
+    predicate*: the generator reaches the eight migrated sites zero times. Reporting "0
+    fuzz differences" without "the generator emits no value-union `==`, no literal `is`
+    over a mixed union, no `??` over a boxed value union" would have been a true sentence
+    doing false work. #1125 found this in one direction and #1127 in the other; the rule is
+    to publish the REACH count per channel next to every 0.

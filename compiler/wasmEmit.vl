@@ -469,7 +469,6 @@ import {
   mfResultSlotOf,
   mfSrcLocalFor,
   monoIsRowMatch,
-  msMemberAtomsOf,
   msMemberAtomsOfSet,
   msSetOfText,
   msSoleMemberTy,
@@ -567,6 +566,7 @@ import {
 } from "./emit_classify"
 import {
   atomEqOpcodeOfKind,
+  msIsValueUnion,
   msMemberValKindsOf,
   msSoloValKind,
   mvSlotOfTy,
@@ -2241,7 +2241,7 @@ function listWrapHeapOfKind(k: i32) {
 }
 
 // The BANKED value-atom kind of the single member left when `null` is removed from the
-// member set `set` — the structural form of `valueAtomKind(removeAtomFromSet(set,
+// member set `s` — the structural form of `valueAtomKind(removeAtomFromSet(set,
 // "null"))`, which four `… | null` peeling sites ask (`x ?? d` over an ident / a call /
 // a union field, and a `scalar | null` map value read with a default).
 //
@@ -2250,20 +2250,53 @@ function listWrapHeapOfKind(k: i32) {
 // that rendering to recover the ABI code. Here the residual set keeps its identity: a
 // singleton yields the member's kind straight out of the bank `recordUnMemTys` filled,
 // and a non-singleton yields -1 — the same answer `valueAtomKind` gives the rendered
-// `""` / `"a|b"`. -2 = the pool does not cover `set` (a narrowed subset spelling the
+// `""` / `"a|b"`. -2 = the pool does not cover the set (a narrowed subset spelling the
 // pool never interned) and the caller keeps its rendered-atom path, exactly as
 // `removeAtomFromSet` itself falls through to the string surgery there.
-function unionResidualSoloKind(set: string) {
-  unionResidualSoloKindOfSet(msSetOfText(set))
-}
-
-// `unionResidualSoloKind` for a caller that already HOLDS the set id (destringify
-// D-SETID). `msSetOfText` is a text→set RESOLUTION — a map probe and, on a miss, a
-// linear scan of every registered `unMemberSet` row — so a caller whose set came out
-// of the narrowing table has no reason to render it and resolve the rendering back.
+//
+// D-SETONCE: this takes only a set ID now. Its text-taking wrapper
+// (`unionResidualSoloKind(set)` = `…OfSet(msSetOfText(set))`) is DELETED — each of its
+// three callers already resolves the same set a line earlier for the value-union gate,
+// so the wrapper's `msSetOfText` was a second resolution of a text the caller had
+// already resolved.
 function unionResidualSoloKindOfSet(s: i32) {
   if s < 0 { return -2 }
   msSoloValKind(msSubNull(s))
+}
+
+// IS this union a VALUE union — the box question, asked of the interned member set the
+// caller already resolved, and of the SPELLING only where the pool declines.
+//
+// D-VALUNION. This file asked `isValueUnionName(nm)` at nine sites; that resolver
+// scans the whole rendering twice (`unionMemberCount` then `splitUnionAtoms`) and
+// classifies every atom it materializes (`valueAtomKind`), to compute a predicate over
+// nothing but the member ABI codes the emitter banked at registration. `msIsValueUnion`
+// reads them. This is the ONE place the rendering is still taken apart, and it runs
+// only where the pool never interned the set.
+//
+// **The set id is not resolved here, on purpose.** `msSetOfText` is a text→set
+// RESOLUTION (two map probes and, on a first miss, a linear scan of every registered
+// row), so resolving inside would charge every caller for it — including the two that
+// this slice measured must NOT pay it (see below). Every caller here either already
+// holds a set id for another reason or resolves one it then reuses; the id is threaded,
+// never re-derived.
+//
+// **The two sites that keep the spelling path, and why** — measured over 1,337 corpus
+// files and 16,800 fuzz programs, not reasoned:
+//   · `emitReturnValue` / the inferred-return `retUNm` pin classify
+//     `inferRetNameOf(fn.fnName)`, a checker RENDER of an inferred return. That is
+//     79,912 reaches of which the pool covers **47** (0.06%): the render is a spelling
+//     the union registry never interned, so a bank-first ladder there would add a
+//     resolution ahead of a path whose own first act (`unionMemberCount < 2`) already
+//     cheap-rejects. Migrating it is a work REGRESSION, and it is left alone.
+//   · `emit_rewrite`'s `synthRetAnnots` asks the same question of the same producer
+//     (`inferRetNameByNode`) and the pool covers **0** of its 643 reaches.
+// Both are the SAME producer — the inferred-return render — and its retirement is the
+// `inferRetTyByNode` hand-off, not a consumer-side ladder.
+function isValueUnionOfSet(s: i32, nm: string): boolean {
+  const v = msIsValueUnion(s)
+  if v >= 0 { return v == 1 }
+  isValueUnionName(nm)
 }
 
 // True if a value-union atom of KIND `k` is a REF that rides the box's anyref `value`
@@ -3100,7 +3133,11 @@ function emitUnionConcreteEq(
     )
   }
   const uname = unionNameOfExpr(boxIx, fnIx)
-  if uname == "" || !isValueUnionName(uname) {
+  // D-VALUNION / D-SETONCE: the union's interned member set, resolved ONCE — the
+  // value-union gate below reads its banked member codes instead of re-splitting the
+  // rendering.
+  const usid = msSetOfText(uname)
+  if uname == "" || !isValueUnionOfSet(usid, uname) {
     return emitFail(
       "emitProgram: `==` over a struct union is not supported yet",
     )
@@ -3174,7 +3211,13 @@ function emitUnionUnionEq(
   }
   const lname = unionNameOfExpr(lIx, fnIx)
   const rname = unionNameOfExpr(rIx, fnIx)
-  if !isValueUnionName(lname) || !isValueUnionName(rname) {
+  // D-SETONCE: BOTH operands' member sets are resolved ONCE, here, and every later
+  // reader takes the id. Master resolved `lname` twice (this gate re-split the
+  // rendering, then `msSetOfText` below) and `rname` twice (the gate, then
+  // `msMemberAtomsOf`'s internal resolution).
+  const lsid = msSetOfText(lname)
+  const rsid = msSetOfText(rname)
+  if !isValueUnionOfSet(lsid, lname) || !isValueUnionOfSet(rsid, rname) {
     return emitFail(
       "emitProgram: `==` over a struct union is not supported yet",
     )
@@ -3204,14 +3247,15 @@ function emitUnionUnionEq(
   // `msSetOfText` and the one that fed `msMemberValKindsOf` — was a duplicated
   // whole-string resolution, not two questions. (It wants a SET id, not a row id:
   // `msMemberValKindsOf` derives the row from the set itself.)
-  const lsid = msSetOfText(lname)
+  // D-SETONCE extends that to the RIGHT operand and moves BOTH resolutions up to the
+  // value-union gate, which needs them anyway: `lsid` / `rsid` are bound there.
   const lAtoms: string[] = []
   if !msMemberAtomsOfSet(lsid, lAtoms) { splitUnionAtoms(lname, lAtoms) }
   const lKinds: i32[] = []
   let lKindsOk = msMemberValKindsOf(lsid, lKinds)
   if lKinds.length != lAtoms.length { lKindsOk = false }
   const rAtoms: string[] = []
-  const rOk = msMemberAtomsOf(rname, rAtoms)
+  const rOk = msMemberAtomsOfSet(rsid, rAtoms)
   const arms: string[] = []
   const armKinds: i32[] = []
   let ai = 0
@@ -3309,7 +3353,9 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
     )
   }
   const uname = unionNameOfExpr(objIx, fnIx)
-  if uname == "" || !isValueUnionName(uname) {
+  // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
+  const usid = msSetOfText(uname)
+  if uname == "" || !isValueUnionOfSet(usid, uname) {
     return emitFail(
       "emitProgram: literal `is` over a struct union is not supported",
     )
@@ -3317,18 +3363,32 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   // The literal's rep atom (a quoted lexeme is a string; a float f64; an
   // integer i32, widening to i64 when out of range or when the union's only
   // integer arm is i64 — the `emitUnionCoerce` default).
+  //
+  // D-LITISKIND: the ladder settles the ABI CODE alongside the spelling, instead of
+  // minting a spelling and parsing it back four lines later (`valueAtomKind(atom)`,
+  // now gone). The map is a bijection ON THIS LADDER'S IMAGE — `valueAtomKind` answers
+  // 0 for `i32` and nothing else, 2 for `string`, 4 for `f64`, 3 for `i64` — so the
+  // code the ladder assigns IS the code the parse returned, arm for arm. The spelling
+  // survives ONLY for `unionHasAtomTy`'s verbatim membership test, which is
+  // deliberately exact (a `TyPrim.primName` compare, not a rep question); its
+  // structural twin is the `msHasValKind` hand-off in the destringify doc.
   let atom = "i32"
+  let lak = 0
   if lit[0] == '"' {
     atom = "string"
+    lak = 2
   } else if numTextIsFloat(lit) {
     atom = "f64"
+    lak = 4
   } else if !numLexFitsI32(lit) {
     atom = "i64"
+    lak = 3
   } else if (
     !unionHasAtomTy(uname, "i32", false) &&
     unionHasAtomTy(uname, "i64", false)
   ) {
     atom = "i64"
+    lak = 3
   }
   if !unionHasAtomTy(uname, atom, false) {
     if emitExpr(body, objIx, fnIx) < 0 { return -1 }
@@ -3336,12 +3396,11 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
     fbI32Const(0)
     return 0
   }
-  // D-UNION-ATOM-KIND: the literal's rep CODE, derived once from the atom the ladder
-  // above settled — the tag, the payload unbox and the three constant-emit arms are
-  // projections of it (`scalarTagOf` and `vbHeapIdxOfAtom` each re-derived it, and
-  // three more `atom == …` compares asked it a fourth and fifth time). The spelling
-  // survives only for `unionHasAtomTy`'s verbatim membership test above.
-  const lak = valueAtomKind(atom)
+  // D-UNION-ATOM-KIND: the literal's rep CODE decides the tag, the payload unbox and
+  // the three constant-emit arms (`scalarTagOf` and `vbHeapIdxOfAtom` each re-derived
+  // it, and three more `atom == …` compares asked it a fourth and fifth time).
+  // D-LITISKIND: it now arrives FROM the ladder that settled the atom, not from a
+  // re-parse of the ladder's own output.
   if lak == 2 && !aUsed {
     return emitFail(
       "emitProgram: string `is` test but array type not collected",
@@ -4644,8 +4703,12 @@ function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
   const uvn = mvValName[mslot]
   // D-UNION set ADT — the map value union's members from the recorded member
   // columns; an un-interned value spelling re-splits (the ladder fall-through).
+  // D-SETONCE: one resolution of the map value's member set feeds BOTH the member
+  // walk and the residual code below (master resolved it twice — once inside
+  // `msMemberAtomsOf`, once inside `unionResidualSoloKind`).
+  const uvsid = msSetOfText(uvn)
   const atoms: string[] = []
-  if !msMemberAtomsOf(uvn, atoms) { splitUnionAtoms(uvn, atoms) }
+  if !msMemberAtomsOfSet(uvsid, atoms) { splitUnionAtoms(uvn, atoms) }
   const stashL = fnMvValStashLocal(mslot)
   // raw box: hit → stored (ref null $uBox); miss → the null-tagged box.
   pushMapScr(body, 5)          // entry
@@ -4677,7 +4740,7 @@ function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
     // destringify doc). It is kept because the population it serves — an ALIAS-spelled
     // nullable value union — is rejected by the CHECKER before emit, not because it
     // cannot exist.
-    let ak = unionResidualSoloKind(uvn)
+    let ak = unionResidualSoloKindOfSet(uvsid)
     if ak == -2 { ak = valueAtomKind(removeAtomFromSet(uvn, "null")) }
     const vb = vbHeapIdxOfKind(ak)
     if vb < 0 {
@@ -10203,7 +10266,8 @@ export function emitNullForRet(_body: i32[], fnIx: i32) {
   let isU = false
   if retUnionFlag(r) == 1 { isU = true }
   if r < 0 {
-    if isValueUnionName(inferRetNameOf(fn.fnName)) { isU = true }
+    const inm = inferRetNameOf(fn.fnName)
+    if isValueUnionOfSet(msSetOfText(inm), inm) { isU = true }
   }
   if isU {
     fbI32Const(nullBoxTag())
@@ -13052,7 +13116,12 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
     // only (the value-typed `if` blocktype carries the unboxed rep).
     const cunm = unionNameOfIdent(lhs.identName, fnIx)
     if cunm != "" {
-      if isValueUnionName(cunm) && unionHasAtomTy(cunm, "null", false) {
+      // D-VALUNION: the DECLARED union's set. (The narrowing table's id below answers
+      // a different question — the set SURVIVING the narrow — so both are resolved.)
+      if (
+        isValueUnionOfSet(msSetOfText(cunm), cunm) &&
+        unionHasAtomTy(cunm, "null", false)
+      ) {
         // D-UNION-ATOM-KIND: the residual member's banked ABI code (see
         // `unionResidualSoloKind`); the rendered residual is re-parsed only where the
         // set pool declines — a narrowed subset spelling it never interned.
@@ -13118,9 +13187,13 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
   if lhs is Call {
     const kunm = unionNameOfExpr(e.binLeft, fnIx)
     if kunm != "" {
-      if isValueUnionName(kunm) && unionHasAtomTy(kunm, "null", false) {
+      // D-VALUNION + D-SETONCE: one resolution feeds the value-union gate AND the
+      // residual code below, which master resolved a second time inside
+      // `unionResidualSoloKind`.
+      const ksid = msSetOfText(kunm)
+      if isValueUnionOfSet(ksid, kunm) && unionHasAtomTy(kunm, "null", false) {
         // D-UNION-ATOM-KIND — see `unionResidualSoloKind`.
-        let kak = unionResidualSoloKind(kunm)
+        let kak = unionResidualSoloKindOfSet(ksid)
         if kak == -2 {
           kak = valueAtomKind(removeAtomFromSet(kunm, "null")) // D-RESIDUE
         }
@@ -13213,9 +13286,14 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
       if mfi >= 0 {
         if sFieldTypeAt(msi, mfi) == 16 {
           const munm = sFieldElemNameAt(msi, mfi)
-          if isValueUnionName(munm) && unionHasAtomTy(munm, "null", false) {
+          // D-VALUNION + D-SETONCE — see the call arm above.
+          const msid = msSetOfText(munm)
+          if (
+            isValueUnionOfSet(msid, munm) &&
+            unionHasAtomTy(munm, "null", false)
+          ) {
             // D-UNION-ATOM-KIND — see `unionResidualSoloKind`.
-            let mak = unionResidualSoloKind(munm)
+            let mak = unionResidualSoloKindOfSet(msid)
             if mak == -2 {
               mak = valueAtomKind(removeAtomFromSet(munm, "null")) // D-RESIDUE
             }
