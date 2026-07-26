@@ -8259,3 +8259,322 @@ Two findings:
     MINTING AN EXISTING NODE rather than by adding a channel, the program's terminal condition
     is holding for that shape. The one place a spelling was still needed — rendering the pattern
     back in `vl fmt` — is the node's own source SPAN, not a re-derivation.
+
+## D-TSTY — `nameToTy` stops being the compiler's SECOND type parser at every positioned annotation (#1132)
+
+Branched at `f82263e` (D-MATCHTY #1131). Every number below is measured **at that head**; where a
+figure the brief inherited disagrees, the disagreement is recorded rather than reconciled.
+
+The brief: retire `nameToTy`, the checker's second recursive-descent type parser, using the bank
+#1117 shipped and #1129 proved total. `tsToTy` — the structural dual #1117 built as a probe and
+did not ship — was the whole remaining cost. **It is now written and shipped**, and every
+annotation the checker resolves through a POSITIONED funnel resolves from the parser's spelling
+tree. The character-surgery resolver stays for the un-positioned population, so this is a
+**ladder**, and the ladder's two rungs are one function (`annotResolve`) so they cannot drift.
+
+### Three leads in the brief were stale at this head — re-grepped, counted, corrected
+
+| lead | brief | this head | why |
+|---|---|---|---|
+| `holeDemandTy` uses `tyToStr(m)` as a dedup key — "cheap, also in your file" | present at `:7020`/`:7029` | **DOES NOT EXIST** | #1129 already migrated it to `tyEq`/`tyArrHasEq` and deleted `strArrHas`. The file's only `holeDemandTy` dedup is `tyArrHasEq` (`:7247`/`:7252`). The item was done one slice before the brief was written. |
+| the 23-parser list, tree-wide | 530 | **523** | #1130 (`bc48776`) deleted 7. The counting method here reproduces **530 exactly at `cd69bd9`** (#1129's own commit) and **523** at both `bc48776` and `f82263e` — two intervening merges, not a method divergence. |
+| `nameToTy` call sites | 28 ("not 27") | **29** | #1131 added one (`checkMatchTypeArms`, the `match`-over-value-unions arm). |
+
+`resolveAnnot`'s 8 (1 typecheck + 7 `emit_rep.vl`), `resolveAnnotAt`'s 4 and `nameToTyAt`'s 4 all
+re-derive exactly.
+
+**Counting method and UNIT.** Resolver CALLS — not grep hits, not inline character surgery, not
+whole-spelling equality. A string-literal-aware `//` stripper (a `//` inside `"…"` or a `'/'`
+char literal is not a comment), `<name>(` as the call form, `function <name>(` headers excluded,
+per-file rows printed and their sum cross-checked against the tree-wide total on every run.
+
+### What ships
+
+`tsToTy(root)` — `nameToTy`'s structural dual, arm for arm, in `nameToTy`'s order, with the same
+constructors in the same sequence. **The arena is not hash-consed, so a dual that allocates a
+different number of entries in a different order is not a dual**; that constraint, not the
+answer alone, is what makes the corpus byte-identical. Each of `nameToTy`'s character scans
+becomes a child edge:
+
+| `nameToTy` scans | `tsToTy` reads |
+|---|---|
+| `nameHasPipe` + `splitTypeName(name, '\|')` | `TS_UNION`'s kids |
+| `nameHasSep(name, '&')` + `splitTypeName` | `TS_ISECT`'s kids |
+| the `wraps` depth scan | `TS_PAREN`'s single kid |
+| `topLevelArrowIndex` + the param split | `TS_FUNC`'s kids (return LAST) |
+| the trailing `[]` test | `TS_ARR` |
+| the `"]:"` search | `TS_MAP`'s key text + value kid |
+| the field / colon depth scans | `TS_OBJ`'s `TS_FIELD` kids |
+| the `<`-scan + two `slice`s | `TS_APP`'s head text + kids |
+
+Three leaf rungs (`primTyOfName` / `tpEnvTyOfName` / `declaredTyOfName`) are **extracted from
+`nameToTy`, not copied** — both resolvers call the one copy, so the nominal tail cannot diverge.
+`applyGenAlias` grows one body (`applyGenAliasArgs`) taking its arguments from either the tree's
+kids or a `splitGenArgs` of the rendered inner text; arity, the resolved memo key, the
+placeholder registration and the field substitution stay shared for the same reason.
+
+**Where the tree is read:** `nameToTyAnn` (3 `nameToTyAt` sites + the struct-field site),
+`resolveAnnotTs` (4 `resolveAnnotAt` sites), and `applyGenAlias`'s declaration-field loop.
+
+**The struct-field HOP.** #1129 recorded 3,851 corpus reads landing on a node with no row and
+called it a probe artifact. It is a real API defect and it is fixed here: the field's "unknown
+type" diagnostic anchors on the `FieldDef` (so the message points at the field) while the
+spelling is banked on the `TypeRef` CHILD. `nameToTyAnn(name, at, ann)` names the two jobs
+separately; `nameToTyAt(name, at)` is `nameToTyAnn(name, at, at)`.
+
+**The MEMO is untouched and stays keyed on the name** — deliberately. It is the one index per
+spelling per program that closed the arena runaway, and a memo HIT must return the index it
+minted whichever route minted it. Only the MISS path resolves, so only the miss path reads the
+tree. (The probe compared the tree against the memo anyway: 157,318 rows, 0 disagreements.)
+
+### The measurement — totality, freshness, and agreement, at this head
+
+The probe is ADDITIVE: it returns the string route's answer, so the probe build's own compiles
+are unaffected by it and no sabotage can suppress its report by rejecting early (method note 17).
+Reported as a checker diagnostic at the end of `checkProgram`, swept on the shared-INSTANCE
+`vl check <dir>` channel (note 32) where the counters accumulate, so a per-root maximum is that
+root's cumulative total.
+
+| | corpus (1,330 files, 1,300 reaching `checkProgram`) | fuzz (50,400 programs) |
+|---|---|---|
+| resolutions at the migrated funnels | **30,922** | **146,510** |
+| tree PRESENT | 30,922 | 146,510 |
+| tree renders the EXACT name (fresh) | 30,922 | 146,510 |
+| **STALE** | **0** | **0** |
+| **MISSING** | **0** | **0** |
+| — | | |
+| both resolvers answered | 30,909 | 146,510 |
+| both declined (vacuous) | 13 | 0 |
+| exactly one declined | **0** | **0** |
+| **STRUCTURAL disagreement** | **0** | **0** |
+| the same rows under RENDER-equality (`tyEq`) | 0 | 0 |
+| — | | |
+| memo-hit rows also carrying a tree | 116,645 | 40,673 |
+| of those, structural disagreement | **0** | **0** |
+
+**334,737 structural comparisons, 0 disagreements, on both channels**, and **177,432
+checker-time reads with the tree present and fresh every single time.** #1129's measurement
+re-verified at this head, at the CONSUMER's own position rather than at the funnel entry.
+
+`TS_ERR` — the parser's recovery leaf — reaches the resolver **0** times on either channel: a
+parse diagnostic aborts before `checkProgram`. The three `""`-render skips `tsToTy` mirrors
+(union members, generic arguments, a lone function parameter) are therefore defensive, and are
+documented as such at each site rather than left to look load-bearing.
+
+**The comparator is `pbDeepEq`, a STRICT structural walk — no union-layer flattening, no
+`?`-hole folding — not `tyEq`.** That choice is measured, not asserted: see S3.
+
+### Sabotage — a 0 is worth what its wire is worth
+
+| build | corpus `dis` | corpus `disstr` | corpus `memodis` | fuzz `dis` | fuzz `memodis` |
+|---|---|---|---|---|---|
+| shipped | **0** | **0** | **0** | **0** | **0** |
+| **S1 — WIRE**: the probe compares against `tsToTy(root - 1)` | **28,190** (+950 one-declined) | 28,180 | — | — | — |
+| **S2 — VALUE**: `tsToTy`'s `TS_ARR` drops the `[]` (+ the memo wire shifted) | **20,082** | 20,082 | **67,682** | **25,016** | **40,673** |
+| **S3 — an extra UNION LAYER** in `tsToTy` | **1,120** | **0** | 558 | — | — |
+
+S1 is the off-by-one class, not an injective relabel: it reclassifies **29,140 of 30,914** reads
+(94.3%). S2 perturbs the recorded STRUCTURE rather than the comparison and lights **both**
+channels and **both** legs at five figures.
+
+**S3 is the one worth keeping.** It makes `tsToTy` return `Union([Union([a,b])])` where the
+string route returns `Union([a,b])` — a genuinely different type — and `tyEq`'s
+`unionMembersInto` flattens both to the same member sequence. The strict comparator reads
+**1,120**; render-equality reads **0**. Method note 31's measurement twin, reproduced inside this
+slice's own probe: had `tyEq` been the comparator, the whole `dis=0` above would have been
+worthless.
+
+**The GATE channel, sabotaged separately** (method note 4 — a sabotage of the SHIPPED path, no
+probe present): `tsToTy`'s `TS_ARR` arm dropping the array wrapper produces **395 byte-diffs,
+411 message-diffs and 411 run-diffs** over the 1,366-entry corpus, and **455 suite failures**.
+The byte-identical A/B below is therefore a real 0.
+
+### Arm reach — and the one arm with no witness anywhere
+
+Every arm of the dual, instrumented and swept over both channels:
+
+| arm | corpus | fuzz | arm | corpus | fuzz |
+|---|---|---|---|---|---|
+| leaf (`TS_NAME`) | 151,836 | 327,635 | `TS_LITNUM` | 232 | 0 |
+| `TS_ARR` | 33,877 | 36,555 | `TS_LITSTR` | 168 | 0 |
+| `TS_OBJ` | 2,267 | 73,800 | `TS_APP` | 99 | 0 |
+| `TS_UNION` | 4,207 | 62,831 | `TS_ISECT` | 19 | 0 |
+| `TS_MAP` | 2,226 | 57,863 | `TS_NEG` | 13 | 0 |
+| `TS_FUNC` | 1,774 | 36,341 | **`TS_NULL`** | **0** | **0** |
+| `TS_PAREN` | 1,152 | 16,509 | `TS_ERR` / `TS_FIELD` as a ROOT | 0 | 0 |
+
+**`TS_NULL` fires zero times on either channel**, and the mechanism is not "dead code": `null` is
+overwhelmingly written as a union MEMBER, and the union arm recognises `TS_NULL` kids IN PLACE
+(`hasNull`) without ever calling the leaf. Only a STANDALONE `null` spelling reaches it, and
+nothing in the 1,330 corpus files or 50,400 fuzz programs swept writes one. (The reach sweep
+predates the fixture below, which is why the corpus is 1,330 here and 1,331 in the A/B.)
+
+**A fixture was written rather than the arm recorded as unpinnable** (#1128's move):
+`tests/cases/types/bare-null-annotation.vl` — `const xs: null[] = []`, which reaches the leaf
+through the resolver's RECURSION (array-of), not only at a root. What it pins is a **STAGE**:
+`null[]` is type-VALID and has no array representation, so the compile must fail at EMIT (rc 3).
+Under the `TS_NULL` sabotage the element poisons the array, the annotation becomes
+`unknown type 'null[]'`, the CHECKER rejects, and `@emit-error`'s own rc check reports
+"failed earlier (rc 2 = type)". Verified against a purpose-built sabotage compiler:
+
+```
+ship:     [ERROR]: emitProgram: only i32[] arrays and struct/union element arrays are supported
+sabotage: [ERROR]: unknown type 'null[]'
+```
+
+### The call arithmetic
+
+**0 type-string parsers DELETED · 5 resolution sites LADDERED onto the structural dual ·
+1 fall-through ADDED · NET −4 `nameToTy` call sites.** The parser FUNCTION and all eight of its
+character scanners remain, because the un-positioned population still needs them — this is a
+ladder, and saying otherwise would be the over-claim.
+
+| | master `f82263e` | now |
+|---|---|---|
+| the 23-parser list, tree-wide | 523 | **523** |
+| `nameToTy` | 29 | **25** |
+| `nameToTyAt` / `nameToTyAnn` | 4 / — | **3 / 2** |
+| `resolveAnnot` (typecheck 1 + `emit_rep` 7) | 8 | **7** (all `emit_rep`) |
+| `resolveAnnotAt` / `resolveAnnotTs` | 4 / — | 4 / **2** |
+| `tsToTy` / `annotResolve` / `applyGenAliasArgs` | 0 / 0 / 0 | **11 / 5 / 2** |
+| `skipQuotedName` · `tyGtIsClose` · `splitTypeName` · `topLevelArrowIndex` · `nameHasSep` · `nameHasPipe` · `splitGenArgs` | 10 · 14 · 6 · 3 · 3 · 5 · 2 | unchanged |
+
+**The static count is the wrong unit for this slice, and here is the right one** (method note 15
+— count the work, do not time it). Two identically-instrumented compilers, invocation counters on
+the resolver and every scanner beneath it, compiling the SAME fixed inputs (the 1,300-file
+`tests/cases` tree and the pinned 31-file `compiler/`+`std/`+`scripts/` snapshot):
+
+| invocations | master | ship | Δ |
+|---|---|---|---|
+| **`nameToTy`** | **257,325** | **192,591** | **−64,734 (−25.2%)** |
+| `nameHasSep` (the `\|` and `&` depth scans) | 566,860 | 439,871 | −126,989 |
+| `topLevelArrowIndex` | 295,168 | 230,949 | −64,219 |
+| `tyGtIsClose` | 16,393 | 8,333 | −8,060 |
+| `splitTypeName` | 5,789 | 2,549 | −3,240 |
+| `isTopLevelFuncTypeName` | 42,234 | 39,403 | −2,831 |
+| `skipQuotedName` | 6,399 | 5,760 | −639 |
+| `splitGenArgs` | 360 | 269 | −91 |
+| `applyGenAlias`, string route | 184 | 89 | −95 |
+| **`tsToTy`** (structural) | 0 | **62,820** | +62,820 |
+
+**206,069 whole-string depth scans deleted.** On `tests/cases` alone `nameToTy` drops 60.5%
+(32,753 → 12,937); on the compiler+std+scripts snapshot, 20.0% (224,572 → 179,654).
+
+### Allocation and binary
+
+`tsToTy` allocates nothing per annotation beyond what `nameToTy` allocated — the same
+constructors, the same order — and reads four flat `i32` columns the parser already built. It
+removes, per resolution, the `string[]` part lists `splitTypeName` filled and every `slice`
+`nameToTy` took. Binary, like-for-like (ONE compiler, two sources): 1,035,387 → **1,038,492
+bytes (+3,105)**.
+
+### Gate
+
+Corpus **byte-, message- AND run-diff**, **1,366 entries** (`tests/cases` + a pinned parent
+snapshot of `compiler/` + `std/` + `scripts/*.vl`, plus every `tests/cases/modules` directory
+built through its `entry.vl`; compiler stdout/stderr with the out-path normalised, exit codes
+compared, run output + exit code compared): **0 byte-diffs, 0 message-diffs, 0 run-diffs.**
+
+Fuzz A/B **50,400 programs/side** (14 seeds × depths 4/5/6 × {plain, `--branching --multiobs
+--declared`}, generated ONCE by the PARENT compiler so both sides see identical programs), whole
+`--out-dir` TREES via `diff -r`, **52,801** output files/side: **`diff -r` RC=0, 0 output lines,
+0 differing paths.**
+
+`refresh-compiler.sh` RC=0 (1,038,492 bytes) · `rep-fuzz-check.sh` RC=0 (exact; 1 baselined
+failure — 0 unsound, 1 reject; 0 new, 0 stale) · `native-fixpoint.sh` RC=0 (stage3 == stage4,
+1,038,492 bytes) · `lint-self.sh` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test` RC=0
+(**2,018 passed, 0 failed, 8 ignored** — 2,016 before the new fixture, measured in this worktree
+with `node_modules` symlinked so the 6 binaryen `native-opt` tests run rather than self-ignore).
+
+### Entombment
+
+A behaviour-preserving migration has no fails-on-master test, and this one does not pretend
+otherwise. What entombs it: the 334,737-comparison equivalence above with three
+perturbation-verified wires, plus a SHIPPED-path sabotage that reddens **455 suite cases, 395
+corpus byte-diffs and 411 run-diffs** — so the existing suite is the pin for twelve of the dual's
+thirteen reachable arms. The thirteenth (`TS_NULL`) had no witness anywhere and now has a
+written one.
+
+### What did NOT move, and the mechanism
+
+- **`nameToTy` survives with 25 call sites**, and they are enumerable rather than a residue:
+  **10 are its own recursion**; 1 is `annotResolve`'s fall-through and 1 `applyGenAliasArgs`'s
+  string route (the two ladder rungs); **5 are the `is`-test spelling** (see hand-off 1); 3 are
+  `UnionDecl` variant/operand names; 1 `canonEmitName`; 1 `unionMemberGenAppShape`; 1
+  `recordClonedNodeTy`; 2 the `paramTyNames[]` mono columns. Plus `emit_rep.vl` 1 and
+  `wasmEmit.vl` 1, other partitions.
+- **`emit_rep.vl`'s 7 `resolveAnnot` calls** are untouched and are the population #1129's
+  prerequisite actually gates: they resolve AFTER `canonEmitTypeNames`, so the checker's tree is
+  not their column. They need P4. Another partition.
+- **`canonEmitName`'s own parsing** — it runs DURING the canon pass, so its inputs are the
+  pre-canon spellings the tree describes exactly, and it is the natural next consumer. Not
+  attempted here: it needs a structural `canonEmitTs` that rewrites the tree in lockstep, which
+  is P4's core, not this slice's.
+- **`recordClonedNodeTy` and the `paramTyNames[]` mono sites** cannot use the tree by
+  construction: an emit-time CLONED node was never parsed, so `annTsOf` answers -1 for it. That
+  is the C1 endgame's population, not P3's.
+
+### Hand-offs
+
+**Hand-off 1 — the `is`-test spelling is ready, MEASURED, and it is the next slice.** The five
+`nameToTy(… .isVariant)` sites (`collectThenNarrows`, `collectElseNarrows`, `ifChainExhausts`,
+`checkMatchTypeArms`, `checkIsExprNode`) each hold the `IsExpr` NODE INDEX already, and
+D-PARSETY P2 banked the `is` spelling tree on that same node (`driver.vl:2642`). Probed at
+`checkIsExprNode` and `checkMatchTypeArms`:
+
+| | corpus | fuzz |
+|---|---|---|
+| reads | **61,200** | **15,142** |
+| tree present / fresh | 61,200 | 15,142 |
+| stale / missing | **0 / 0** | **0 / 0** |
+| structural disagreement | **0** | **0** |
+
+The diff is `nameToTy(n.isVariant)` → `annotResolve(n.isVariant, annTsOf(ix))` at each site,
+which is exactly the ladder this slice already ships. **76,342 reads behind it, both channels,
+0 disagreements.** Method note 66's check applied first: every one of the five callers holds a
+node it can key on — this is not a hand-off addressed to a caller that cannot call it.
+
+**Hand-off 2 — `UnionDecl`'s variant names (3 sites in `checkProgramNode`).** P2 banked
+`udTsNode`/`udTsRoot` for these (`ast.vl`), a per-DECLARATION root LIST rather than the
+single-root `annTs` table, so the read is `udTsRoot`-keyed and not `annTsOf`. Unmeasured here:
+the column's shape differs and it deserves its own probe rather than an assumed transfer
+(method note 11 — a 0 does not transfer between sibling sites).
+
+**Hand-off 3 — `annotResolve` is the seam P4 needs.** Whoever rewrites the canon pass to update
+the tree in lockstep gets the checker-side consumer for free: it already takes `(name, root)` and
+picks the structural route whenever a root exists. P4 only has to make a root exist post-canon.
+
+### Method notes earned
+
+71. **A brief's "cheap, also in your file" item can already be DONE** (D-TSTY) — the
+    `holeDemandTy` `tyToStr` dedup key the brief filed as a cheap second target was migrated by
+    the slice immediately before it, with its own measurement (6 corpus calls, 0 fuzz, 0 TRUE
+    returns) written into the doc the brief cites. Three of this brief's leads were stale and
+    this was the largest: an item that no longer exists costs a full re-grep to disprove. The
+    re-grep rule applies to the *presence* of a target, not only to its count.
+72. **A per-INVOCATION count is a different measurement from a per-SITE count, and for a LADDER
+    it is the only honest one** (D-TSTY) — the static arithmetic here is "−4 call sites", which
+    understates the slice by three orders of magnitude and would also be a fair description of a
+    no-op. The resolver still exists, so no parser was deleted; what changed is that **64,734 of
+    257,325 invocations no longer happen**, along with 206,069 whole-string depth scans beneath
+    them. When a migration ladders rather than deletes, report the work removed and say plainly
+    that the static count did not move.
+73. **Extract the shared TAIL instead of writing a second copy of it** (D-TSTY) — the dual's leaf
+    (primitive / type-param binding / declared name) is `nameToTy`'s leaf, and a hand-written
+    second copy is a twin-producer of exactly the kind this program exists to delete. Three
+    extracted rungs (`primTyOfName` / `tpEnvTyOfName` / `declaredTyOfName`) make the nominal tail
+    literally the same code on both routes, so no probe is needed to prove that half agrees — and
+    the same move on `applyGenAlias` reduced its dual to the argument list alone.
+74. **The strict comparator must be shown strictly stronger, with a sabotage only IT catches**
+    (D-TSTY) — every slice since #1117 has repeated "compare structurally, never diff two
+    renders", but repeating it is not evidence for the comparator you actually wrote. An extra
+    UNION LAYER in `tsToTy` — a real type difference — reads **1,120** on the strict walk and
+    **0** on `tyEq`, which flattens union layers by design. Run one perturbation that separates
+    your comparator from the rejected one, in the same build, or the choice is still an
+    assertion.
+75. **An arm with no witness is a request for a FIXTURE, not a caveat** (D-TSTY) — a per-arm
+    reach sweep found the standalone-`null` leaf firing 0 times across 1,330 corpus files and
+    50,400 fuzz programs, with a mechanism (a union member is consumed by the union arm, so the
+    leaf only ever sees a spelling nobody writes). The fixture that closes it pins a STAGE — an
+    emit-stage rejection that becomes a checker-stage rejection the moment the arm breaks — which
+    is available even though the program cannot run and no message-level pin exists.
