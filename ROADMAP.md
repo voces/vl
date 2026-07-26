@@ -58,15 +58,39 @@ rather than re-derived. The forcing date is **M7** (the port begins); M2–M6 ga
 
 **P0 — gates the port STARTING. The `Buffer` linear-memory tier (our B-mem, "one deliberate escape
 hatch").** All four are prerequisites for each other in practice:
-- ⬜ **P0.1 `Buffer` alloc + the full load/store width matrix** — `Buffer(n)`, `.length`, and
-  u8/i8/u16/i16/i32/i64/f32/f64 both directions (today: 4 store widths, 1 load width). Needs a real
-  allocator (bump is fine — the sim allocates a few large Buffers at init and never frees), replacing
-  today's "program picks raw addresses, two users collide" scratch page. **`Buffer.copy` / `buf.fill`
-  lowering to `memory.copy`/`memory.fill` are load-bearing, not conveniences** — snapshot and rollback
-  *are* those ops; without them a snapshot is a per-word loop.
-- ⬜ **P0.2 Exported memory** — export the module's linear memory (`--export-memory`, or automatic
-  when `Buffer` is used). Replaces the per-scalar host-call ABI for bulk data; the host overlays
-  `Float32Array`/`DataView` in place. Nothing else in the export contract changes.
+- 🟨 **P0.1 `Buffer` alloc + the full load/store width matrix** — `Buffer(n)`, `.length`, and
+  u8/i8/u16/i16/i32/i64/f32/f64 both directions. **The LOADS and the growth ops have shipped; the
+  stores, the allocator and the bulk ops have not.** Today: **8 load widths** (`__load_i8__`,
+  `__load_u8__`, `__load_i16__`, `__load_u16__`, `__load_i32__`, `__load_i64__`, `__load_f32__`,
+  `__load_f64__`) plus `__memory_size__`/`__memory_grow__`, all lowered to single instructions and
+  verified by disassembly; **1 store width** (`__store_i32__`).
+  *(This line used to read "today: 4 store widths, 1 load width". That was measured false: it counted
+  DECLARATIONS, and described `compiler/wasmBuiltins.ts` — deleted by kill-TS, #466. Before this
+  slice there was exactly one working store width and one working load width. See
+  `docs/internals/buffer-design.md` §A1 for the probe table.)*
+  Still needed: a real allocator (bump is fine — the sim allocates a few large Buffers at init and
+  never frees), replacing today's "program picks raw addresses, two users collide" scratch page; the
+  seven store widths; and the `Buffer` type itself, which is deliberately NOT shipped while O1/O5/O6
+  are unruled. Blocked on the capture bug (§B3/O7): a named function wrapping a memory intrinsic
+  fails to emit in any module that uses a function value, so every eventual `Buffer` METHOD is
+  unusable until that is fixed. **`Buffer.copy` / `buf.fill` lowering to `memory.copy`/`memory.fill`
+  are load-bearing, not conveniences** — snapshot and rollback *are* those ops; without them a
+  snapshot is a per-word loop. The host flag they need (`--enable-bulk-memory`) has landed ahead of
+  them, so `vl build -O` will not break the day the emitter writes `0xfc`.
+- ✅ **P0.2 Exported memory** — replaces the per-scalar host-call ABI for bulk data; the host
+  overlays `Float32Array`/`DataView` in place, and nothing else in the export contract changes.
+  The module's linear memory is exported as `memory`, automatically,
+  gated on the memory existing at all (the same `memUsed` flag that emits the memory section), so a
+  program that never touches linear memory is byte-identical to before. A memory-only module now
+  emits an export section, which it previously skipped entirely. A user function exported as
+  `memory` in a memory-using program is a loud compile error (O4 ruled (i)). No host change was
+  required — wasmtime, the JS import shape, `wasm-opt` and `wasm-dis` all already tolerated an
+  exported memory; proved from both hosts (`tests/vl_exported_memory_test.ts` overlays
+  `Float32Array`/`DataView` on `instance.exports.memory.buffer` and reads guest bytes in place).
+  **A `memory.grow` DETACHES every host view**: `byteLength` goes to 0 and an indexed read returns
+  `undefined` rather than throwing, so a JS host must re-read `.buffer` after any call that can grow.
+  That contract is asserted by test, not merely documented. (In a Rust/wasmtime host the same hazard
+  is a borrow-check error instead — measured.)
 - ✅ **P0.3 Reinterpret casts** — `f32bits`/`f32fromBits`/`f64bits`/`f64fromBits`, one opcode each.
 - ✅ **P0.4 Float/int opcode intrinsics** — f32/f64 `sqrt abs floor ceil trunc nearest min max
   copysign`; i32/i64 `clz ctz popcnt rotl rotr` + unsigned `divU remU ltU leU gtU geU`. Free
@@ -551,11 +575,18 @@ in-language GC knobs.
 - 🟡 **B-mem. Linear memory — make it a design, not a scratch page**
   (design: `docs/internals/memory-gc-design.md`). The collector half shipped (`vl run` on the
   engine's tracing collector + the `$VL_GC` knob). REMAINING, in order:
-  - **Audit gaps** (small, mechanical): SEVEN of the ten memory builtins declared in
+  - **Audit gaps** (small, mechanical): FIVE of the seventeen memory builtins declared in
     `typecheck.vl`'s default scope have no emitter lowering — they typecheck, then fail at emit
     with `call to unknown function` (safe, but the diagnostic reads like a typo). Either lower them
-    or stop declaring them, and say "not implemented". The store/load matrix is also asymmetric —
-    four `__store_*__` widths, only `__load_i32__`.
+    or stop declaring them, and say "not implemented". The remaining five are `__store_i64__`,
+    `__store_f32__`, `__store_f64__`, `__store_string__` and `__log_string__`; the last two are
+    bridges for a `__log__` path the native emitter replaced with an in-module decoder, and nothing
+    reaches them (`buffer-design.md` O8 proposes deleting those two declarations outright).
+    *(This bullet used to read "SEVEN of the ten … The store/load matrix is also asymmetric — four
+    `__store_*__` widths, only `__load_i32__`." The seven was right; the "four store widths" counted
+    DECLARATIONS — measured, only `__store_i32__` ever lowered. Seven loads plus
+    `__memory_size__`/`__memory_grow__` have since been lowered, which is what moved the count.)*
+    The matrix is now asymmetric the OTHER way: eight load widths, one store width.
   - **Bulk host I/O.** Export `ioMem` and implement the staging ABI `scripts/vl-host` already
     documents and probes for (`<name>Reserve` / `<name>Load`, plus an `rbyte` bulk sibling): today
     source crosses at ONE host call per code point (~3.4M per self-compile) and emitted bytes at one

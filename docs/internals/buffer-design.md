@@ -616,3 +616,200 @@ inside a `Buffer`, which is orthogonal to everything above. Neither is designed 
 - `tests/cases/run/load-roundtrip.vl`, `log-i32.vl` — the two positive corpus tests for the tier;
   `memory-intrinsic-declared-not-lowered.vl`, `memory-size-declared-not-lowered.vl`,
   `memory-intrinsic-in-named-fn.vl` — the fences added with this doc.
+
+---
+
+## H. What shipped: S0 + S2 + S3(loads) + S4
+
+This section is APPENDED to the design above; nothing before it is rewritten. §A–§G record what was
+measured **before** any of this landed and stay as the baseline they were. Where a number here
+disagrees with one there, this section is the later measurement.
+
+Every claim below was re-measured on the implementing tree, not inherited from §A–§G. The §A–§G
+claims that this slice's own critical path depended on were re-verified from scratch and **all
+held** — see §H6 for the ones that did not survive contact, which were mine.
+
+### H1. The slice, and what it deliberately excludes
+
+`Buffer` **is not in it**. O1 (std-VL methods vs a compiler-known type), O5 (grow-lazily vs
+reserve-up-front) and O6 (does `Buffer` need `free`) are unruled, and the name is hard to change once
+shipped. What shipped is the raw intrinsic floor those questions sit above:
+
+| | shipped | not shipped |
+| --- | --- | --- |
+| **S0** host flag | `--enable-bulk-memory` on `wasm-opt` + `wasm-dis` | — |
+| **S2** exported memory | the whole item | — |
+| **S3** width matrix | the 7 missing **loads** | the 7 **stores** |
+| **S4** grow/size | the whole item | — |
+| **S1** capture fix (O7) | — | all of it — the file is owned elsewhere |
+| **S5** `std:buffer` | — | all of it — blocked on O1/O5/O6 **and** on S1 |
+| **S6** bulk ops | — | all of it — S0 is its prerequisite and is now in place |
+
+### H2. The opcode table, verified by disassembly
+
+Each built as a one-call module and read back with `wasm-tools` — the WAT instruction, the opcode
+byte, and the raw immediates. The align-exponent is the **natural** alignment (log2 of the access
+width in bytes); it is a hint, not a constraint, and §H4 pins that.
+
+| VL intrinsic | wasm | opcode | raw bytes | result |
+| --- | --- | --- | --- | --- |
+| `__load_i8__(a)` | `i32.load8_s` | `0x2c` | `2c 00 00` | i32, sign-extended |
+| `__load_u8__(a)` | `i32.load8_u` | `0x2d` | `2d 00 00` | i32, zero-extended |
+| `__load_i16__(a)` | `i32.load16_s` | `0x2e` | `2e 01 00` | i32, sign-extended |
+| `__load_u16__(a)` | `i32.load16_u` | `0x2f` | `2f 01 00` | i32, zero-extended |
+| `__load_i64__(a)` | `i64.load` | `0x29` | `29 03 00` | i64 |
+| `__load_f32__(a)` | `f32.load` | `0x2a` | `2a 02 00` | f32 |
+| `__load_f64__(a)` | `f64.load` | `0x2b` | `2b 03 00` | f64 |
+| `__memory_size__()` | `memory.size` | `0x3f` | `3f 00` | i32, pages |
+| `__memory_grow__(n)` | `memory.grow` | `0x40` | `40 00` | i32, PREVIOUS pages, or -1 |
+| *(control)* `__load_i32__` | `i32.load` | `0x28` | `28 02 00` | unchanged |
+| *(control)* `__store_i32__` | `i32.store` | `0x36` | `36 02 00` | unchanged |
+
+The trailing byte of `memory.size`/`memory.grow` is the memory **index** immediate, not a flags byte.
+Every module built for this table passes `wasm-tools validate`, and the wide trio's function
+signatures come out as `(param i32) (result i64|f32|f64)` — i.e. the checker's declared return types
+reach the wasm type section, which is what makes `print(__load_f64__(0))` route to `__print_f64__` in
+a program that spells `f64` nowhere.
+
+### H3. Exported memory, and its gate
+
+`memory`, kind 2, index 0, appended LAST so every function export keeps its index:
+
+```
+(memory (;0;) 1)
+(export "poke" (func 0))
+(export "peek" (func 1))
+(export "memory" (memory 0))
+```
+
+Three measurements that matter more than the entry itself:
+
+- **A memory-only module now emits section 7 at all.** Master returned early whenever there were no
+  function exports, which would have dropped the memory export in exactly the program that wants it
+  most. Sections before: `types imports functions memories start code`. After: the same plus
+  `exports` (10 bytes, count 1).
+- **A program that never touches linear memory is BYTE-IDENTICAL to master.** Not "equivalent" —
+  `cmp` clean. The export rides `memUsed`, the same flag as the memory section.
+- **O4 is ruled (i)**: automatic, always `memory`, and a user `export function memory` in a
+  memory-using program is a loud reject. The control — the same function name in a program with no
+  linear memory — still compiles and still exports `memory` as a function.
+
+`wasm-opt -O` with the host's flags preserves the exported memory and the module still validates.
+
+### H4. What the corpus now pins
+
+`tests/cases/memory/`, expectations derived from an independent oracle (python `struct`) rather than
+by hand:
+
+- every load width read off ONE known byte pattern, so the widths check each other;
+- sign vs zero extension at `0xFF`, `0x80`, `0xFFFF`, `0x8000`, **plus `0x7F` as the control** where
+  the two spellings must AGREE — without it, "they differ" is not evidence they differ for the right
+  reason;
+- **unaligned reads at every width**, including f32 at address 33 and f64 at address 51;
+- the last legal address of every width (65535/65534/65532/65528) and the trap one byte further;
+- `memory.size`/`memory.grow` against the spec's return values, including `grow(0)`, the **-1**
+  failure, and that a failed grow leaves the memory and its bytes untouched;
+- growth past the old ceiling — addresses 65536 and 262140, both of which trap on one page;
+- freshly grown pages are zero;
+- the O7 limitation, and its no-lambda control.
+
+### H5. The limitation this slice does not remove (O7)
+
+Censused across **all ten** memory intrinsic names in **four** call positions — not one shape per
+name, because a previous bug in this area hid by being silent in only one position:
+
+| position | all 10 memory intrinsics | `__log__` (control) |
+| --- | --- | --- |
+| top level | ✅ | ✅ |
+| named function, no function value in the module | ✅ | ✅ |
+| named function, module uses a lambda anywhere | ❌ `captured variable not found in enclosing frame` | ✅ |
+| inside a lambda body | ❌ same | ✅ |
+
+Uniform: 10/10 work in the first two positions, 10/10 fail in the last two. The one variable is
+`isBuiltinFnName`'s exemption list (`compiler/emit_base.vl`), which this change does not own.
+
+**What that costs:** the raw-address port is unaffected — it writes `__load_f32__(base + (i << 2))`
+at top level or in plain named functions. A `Buffer` **method** is a named function wrapping an
+intrinsic, so a std-VL `Buffer` remains unusable in any program with one lambda. **S1 is a hard
+prerequisite for S5, not a nicety**, and O7 should be ruled before `std:buffer` is attempted.
+
+Two cells of this census were initially UNDECIDABLE and were nearly recorded as passes: the
+`__load_i64__` and `__load_f32__` in-lambda probes failed for unrelated reasons (an i64-list
+collection gap; an `f32 + i32` type error), which the first harness reported as blank rather than as
+"not measured". Re-asked with a shape that isolates capture — the value consumed by `print` inside
+the lambda, the lambda still returning i32 — both are the same capture failure, and two controls
+(`__log__` in that shape; the shape with no intrinsic at all) confirm the shape itself compiles.
+
+### H6. Refutations, and things this slice got wrong before it got them right
+
+- **`ROADMAP.md` / `webcraft-requirements.md` / `memory-gc-design.md` "4 store widths, 1 load
+  width" — re-confirmed FALSE**, independently of §A1, by running all ten declared intrinsics in
+  every call position. One store width, one load width lowered. All three documents are corrected in
+  place, each keeping the old sentence visibly as the thing it replaced.
+- **A hand-derived i64 expectation was wrong** (`0x5566778811223344` claimed as
+  `6152530560731906884`; it is `6153737367135073092`). The compiler was right. Every corpus
+  expectation was re-derived from python `struct` afterwards.
+- **A second hand-derived expectation was wrong** — byte 3 of `0x3FC00000` is `0x3F` = 63, not 4;
+  the test suite caught it. Two for two: no expectation in this slice is hand-computed.
+- **A probe's `rc=$?` read the exit code of `head`, not of `wasm-opt`**, through a pipe. The
+  conclusion happened to survive (the definitive signal was "no output file written"), but the
+  instrument was re-run without the pipe before anything was claimed from it.
+- **The `--enable-bulk-memory` flag was verified to REACH the tool**, by an argv-recording shim on
+  `$VL_WASM_OPT`/`$VL_WASM_DIS`, not merely to be present in the source.
+- **`imports.memory` was censused, not assumed, dead**: 0 of the 1,149 corpus modules that build
+  import a memory, and 0 import `__log__`/`__log_string__`. Only then was it deleted from the JS
+  host, together with the two sinks that existed to decode bytes out of it.
+- **A CI-coverage guard refuted the new test's placement.** `tests/ci_seed_coverage_test.ts` failed
+  because a seed-backed test named `exported_memory_test.ts` matches neither `ci-native` glob and so
+  would have run NOWHERE in CI while passing locally by self-ignoring. Renamed to
+  `vl_exported_memory_test.ts`.
+
+### H7. Two findings this slice did not go looking for
+
+- **The JS host reported a linear-memory fault as "array index out of bounds".** V8 distinguishes
+  them precisely — `memory access out of bounds` vs `array element access out of bounds` — and
+  `trapReason`'s first branch matched any "out of bounds" text. The mislabel was near-unreachable
+  while the one page was barely addressable; with the load matrix and `memory.grow` it is the
+  ordinary way a raw address goes wrong. Fixed, with the memory branch ahead of the array branch;
+  array cases are untouched.
+- **A VL integer literal with the top bit set is an i64.** `0xC0100000` — an ordinary f32 bit
+  pattern — cannot be passed to `__store_i32__`, because an integer literal takes the narrowest type
+  that holds it EXACTLY. It must be spelled as the signed i32 (`-1072693248`). This will hit every
+  consumer laying down float bit patterns and is worth knowing before `Buffer` ships a store surface.
+
+### H8. The detachment contract (B5), ruled for the hosts
+
+S2 and S4 are individually harmless and jointly a silent-wrong-answer channel: a `memory.grow`
+detaches every host view, and a detached typed array yields `undefined` on an indexed read **rather
+than throwing**. What the hosts do about it:
+
+- **`tests/support/runWasm.ts`** now returns the instance's `exports`, and its doc comment states the
+  contract: re-read `.buffer` after any guest call that can grow; never cache a view across one.
+- **The behaviour is asserted by test, not described.** `tests/vl_exported_memory_test.ts` takes a
+  view, grows from the guest, and pins `byteLength === 0` and `view[0] === undefined`, then pins that
+  a re-derived view sees the surviving data. A failed grow is pinned NOT to detach.
+- **`imports.memory` is gone** from the JS host, so there is no longer a second memory to read by
+  mistake — the trap §B6 names, which exporting the real memory would otherwise have made easier to
+  fall into.
+- **A Rust/wasmtime host gets this for free**: `Memory::data` borrows the `Store`, and growing needs
+  it mutably, so a stale slice is a borrow-check ERROR rather than a silent `undefined`. Measured
+  against a wasmtime 47 embedding reading a VL module.
+
+This does not rule **O5** (lazy growth + an epoch export vs reserve-up-front). It makes the hazard
+loud in the two hosts we own and states the contract; the allocator-side answer is still open, and
+O5 should be ruled before `Buffer(n)` is allowed to grow the memory implicitly.
+
+### H9. What remains before `Buffer` itself can ship
+
+1. **O1, O5, O6 ruled.** Where the method surface lives, whether the allocator grows lazily, whether
+   there is a `free`. Nothing below is worth starting first.
+2. **S1 / O7** — the capture fix. Hard prerequisite: every `Buffer` method is a named function
+   wrapping an intrinsic (§H5).
+3. **The seven store widths.** Mechanically identical to the loads that shipped; the only reason they
+   are not here is that the slice was kept to what makes the loads measurable.
+4. **S6 bulk ops** — `memory.copy`/`memory.fill`, needing the emitter's first `0xfc` byte-writer.
+   Their host prerequisite (S0) is in place and pinned.
+5. **Then S5** — the struct, the bump allocator, the methods, in `std:buffer`.
+
+Not needed: any host change for the export itself, and any change to the memory section's `min 1`
+(O9's proposal stands — growth covers the rest).

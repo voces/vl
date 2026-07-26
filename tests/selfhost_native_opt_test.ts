@@ -5,9 +5,14 @@
 // the optimized output is (a) SMALLER-or-equal, (b) a valid wasm module wasmtime
 // loads, and (c) BEHAVIOR-PRESERVING — `vl run <opt.wasm>` (the prebuilt-module
 // passthrough) reproduces the file's `@log` lines exactly. The optimizer runs
-// with EXACTLY `--enable-reference-types --enable-gc` (VL output is WasmGC; `-all`
-// would enable post-3.0 features wasmtime refuses), wired here via `$VL_WASM_OPT`
-// so the test is self-contained against the repo's binaryen (`node_modules/.bin`).
+// with EXACTLY `--enable-reference-types --enable-gc --enable-bulk-memory` (VL
+// output is WasmGC; `-all` would enable post-3.0 features wasmtime refuses). Bulk
+// memory is wasm 2.0 core and on by default in both engines VL targets, but
+// binaryen 130 HARD-FAILS validation on `memory.copy`/`memory.fill` without the
+// flag — rc=1 and no output file — so it is pinned ahead of the emitter ever
+// writing those opcodes (`docs/internals/buffer-design.md` §B4). Wired here via
+// `$VL_WASM_OPT` so the test is self-contained against the repo's binaryen
+// (`node_modules/.bin`).
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`, shared with the alignment suite)
 // AND requires the vl binary + seed wasm + a `wasm-opt`; absent any, every case

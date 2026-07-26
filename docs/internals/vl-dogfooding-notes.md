@@ -13,11 +13,18 @@ is open backlog — triage as you like.
 ### External (wasmtime / binaryen)
 
 - **binaryen ↔ wasmtime feature-set mismatch.** `wasm-opt` on VL's WasmGC output
-  needs EXACTLY `--enable-reference-types --enable-gc`: binaryen's defaults reject
-  `struct.get`, and `-all` turns on post-3.0 features wasmtime 45 then refuses to
-  load. So the "obvious" `wasm-opt -all` is a trap on both ends. Baked into
-  `vl build -O` so users don't have to know — but anyone shelling to binaryen
-  directly will hit it. (`wasm-dis` needs the same two flags to disassemble.)
+  needs EXACTLY `--enable-reference-types --enable-gc --enable-bulk-memory`:
+  binaryen's defaults reject `struct.get`, and `-all` turns on post-3.0 features
+  wasmtime 45 then refuses to load. So the "obvious" `wasm-opt -all` is a trap on
+  both ends. Baked into `vl build -O` so users don't have to know — but anyone
+  shelling to binaryen directly will hit it. (`wasm-dis` gets the same flags.)
+  **`--enable-bulk-memory` is the newest of the three and the least obvious**: bulk
+  memory is wasm 2.0 CORE and on by default in wasmtime 47 and V8, so an engine
+  never asks for it — but binaryen 130 still gates it behind a flag and, measured,
+  `-O` on a module using `memory.copy`/`memory.fill` exits rc=1 and writes NO output
+  file. It is enabled ahead of the emitter emitting those opcodes so that day is not
+  a `vl build -O` outage. `wasm-dis` tolerates them either way. Two ends, two
+  different defaults, in the same direction as the first mismatch.
 - **Anonymous trap backtraces.** A wasm trap printed `0xa2 - <unknown>!<wasm
   function 4>` — no names. `[FIXED #285]` — the emitter now writes a `name`
   custom section (gated off by default for goldens; `vl run` enables it), so traps

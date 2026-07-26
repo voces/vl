@@ -114,6 +114,16 @@ A generic function whose body calls one, instantiated at **two** types, is rejec
 This is the whole declared-intrinsic family's pre-existing shape — `__load_i32__` fails identically
 on master in all three — but it is a real limit and worth fixing.
 
+> **Census (webcraft P0.2 slice).** The memory half of that family has since been measured
+> exhaustively: all **ten** lowered memory intrinsics (`__store_i32__`, `__load_i32__`, the seven
+> load widths, `__memory_size__`/`__memory_grow__`) in **four** call positions. The result is
+> uniform — 10/10 work at top level and in a plain named function, 10/10 fail in the two positions
+> above — and `__log__` passes all four as the control, because it is on `isBuiltinFnName`'s list
+> and these are not. So "the whole declared-intrinsic family's shape" is exact, not approximate,
+> and the one variable really is that list. What changed is the STAKES: every `Buffer` method would
+> be a named function wrapping one of these, so `buffer-design.md` O7 is now on the critical path
+> for `std:buffer` rather than being a curiosity. See `buffer-design.md` §H5.
+
 **The naive fix is wrong.** `capRecord` has a builtin-name exemption (`isBuiltinFnName`,
 `compiler/emit_base.vl`) and adding these names to it would work for calls — but that list is
 consulted *by name*, after only `capIsBound` (names bound inside the lambda), `globalIndexOf` and

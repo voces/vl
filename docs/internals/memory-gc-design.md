@@ -11,11 +11,15 @@ choice belongs. Companion to `DECISIONS.md` ("Allocation = WasmGC") and
   heap itself — costs a hand-written tracing collector *plus* a shadow stack on every
   call (wasm exposes no way to scan a frame's locals), and it discards the wasm
   validator as VL's memory-safety proof. That is a bad trade for the common case.
-- **Linear memory today is not a design, it is three intrinsics and a scratch page.**
-  Ten memory builtins are declared in the checker; three are lowered. There is no
-  allocator, no data section, no export, no free. It predates the GC decision and
-  never caught up. It should become one deliberate *tier* (buffers/FFI/bulk I/O),
-  not a second object model.
+- **Linear memory is becoming a design, but is not one yet.** Seventeen memory
+  builtins are declared in the checker; twelve are lowered. Since the webcraft P0.2
+  slice it has a full LOAD width matrix, `memory.grow`/`memory.size`, and an exported
+  memory — so it is no longer a fixed 64 KiB scratch page a host cannot see. There is
+  still no allocator, no data section, no free, and one store width. It should become
+  one deliberate *tier* (buffers/FFI/bulk I/O), not a second object model. *(Was:
+  "not a design, it is three intrinsics and a scratch page. Ten memory builtins are
+  declared in the checker; three are lowered. There is no allocator, no data section,
+  no export, no free.")*
 - **The collector is a real, measurable, workload-dependent choice, and it is the
   single largest performance lever VL has today.** `vl run` was pinned to wasmtime's
   deferred-reference-counting collector. On an allocation-heavy program that is
@@ -56,26 +60,41 @@ Linear memory in VL predates the WasmGC decision and was never revisited. Curren
 state, verified against `compiler/typecheck.vl`, `compiler/wasmEmit.vl` and
 `compiler/emit_sections.vl`:
 
-- **Ten builtins are declared** in the checker's default scope: `__store_i32__`,
+- **Seventeen builtins are declared** in the checker's default scope: `__store_i32__`,
   `__store_i64__`, `__store_f32__`, `__store_f64__`, `__load_i32__`,
   `__store_string__`, `__log_string__`, `__log__`, `__memory_grow__`,
-  `__memory_size__`.
-- **Three are lowered** by the emitter: `__store_i32__`, `__load_i32__`, `__log__`.
-  The other **seven typecheck and then fail at emit** with
+  `__memory_size__`, and the seven load widths `__load_i8__`, `__load_u8__`,
+  `__load_i16__`, `__load_u16__`, `__load_i64__`, `__load_f32__`, `__load_f64__`.
+- **Twelve are lowered** by the emitter: `__store_i32__`, `__load_i32__`, `__log__`,
+  the seven load widths, `__memory_size__` and `__memory_grow__`.
+  The other **five typecheck and then fail at emit** with
   `emitProgram: call to unknown function` — safe (no wrong bytes) but the
   diagnostic reads like a typo'd identifier, not "this builtin has no
-  implementation."
-- **The store/load matrix is asymmetric.** There are four `__store_*__` widths and
-  exactly one `__load_i32__`. You can write an `f64` into memory and have no way to
-  read it back.
+  implementation." They are `__store_i64__`, `__store_f32__`, `__store_f64__`,
+  `__store_string__` and `__log_string__`.
+  *(This bullet read "Ten builtins … Three are lowered … the other seven" before the
+  P0.2/load-width slice, and the ten/three/seven counts were right at the time. The
+  numbers moved because seven load widths and the two memory-size ops acquired
+  emitter arms — see `buffer-design.md`.)*
+- **The store/load matrix is asymmetric**, and now in the other direction. There are
+  **eight** load widths and exactly **one** store width (`__store_i32__`). You can
+  read an `f64` out of memory at its own width, but you write one by assembling two
+  i32 words. *(This bullet previously said the reverse — "four `__store_*__` widths
+  and exactly one `__load_i32__`. You can write an `f64` into memory and have no way
+  to read it back." The "four" counted DECLARATIONS; only `__store_i32__` ever
+  lowered, so the true starting point was one width each way.)*
 - **There is no allocator.** No bump pointer, no `__heap_base`, no free list, no
   free. Addresses are raw i32 constants the program picks. Two pieces of code using
   memory in the same module silently collide.
 - **There is no data section.** String and array literals cannot be placed in
   memory; `array.new_data` is therefore unreachable.
-- **The memory is one page, unexported, and conditional.** `emit_sections.vl` emits
-  `min 1` page, no max, and only when one of the three lowered intrinsics appears.
-  A program calling `__store_f64__` would not even force a memory section.
+- **The memory is one page to start, EXPORTED, and conditional.** `emit_sections.vl`
+  emits `min 1` page and no max, and only when a lowered memory intrinsic appears —
+  a program calling `__store_f64__` (still unlowered) would not force a memory
+  section. It is now also **exported as `memory`** (webcraft P0.2), gated on the same
+  flag, and `__memory_grow__` makes `min 1` a starting size rather than a ceiling.
+  *(Was: "one page, unexported, and conditional … one of the three lowered
+  intrinsics".)*
 - **Nothing is bulk.** No `memory.copy` / `memory.fill`, no i64 memory, no
   multi-memory, no atomics, no SIMD.
 
@@ -398,10 +417,13 @@ byte-for-byte, and all three collectors emit byte-identical modules.
    `VL_GC=auto|tracing|refcount|none` as a documented runtime knob. Largest
    measured win available, and it removes the cyclic-garbage leak.
 2. **Close the linear-memory audit gaps** (small, mechanical): either lower the
-   seven declared-but-unimplemented builtins or stop declaring them, and give the
+   declared-but-unimplemented builtins or stop declaring them, and give the
    rejection a diagnostic that says "not implemented" rather than "unknown
-   function". Add the missing `__load_*__` widths so the store/load matrix is
-   symmetric.
+   function". *Partly done:* the seven missing `__load_*__` widths and
+   `__memory_size__`/`__memory_grow__` were lowered by the webcraft P0.2 slice, so
+   five remain (`__store_i64__`, `__store_f32__`, `__store_f64__`,
+   `__store_string__`, `__log_string__`) and the matrix is symmetric in the load
+   direction only. The diagnostic is unchanged and still reads like a typo.
 3. **Export `ioMem` and implement the bulk staging ABI** the host already
    documents (`<name>Reserve`, `<name>Load`, and a `rbyte` bulk sibling). Removes
    ~3.4M host calls in, ~1M out, per self-compile.
