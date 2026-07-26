@@ -25,6 +25,7 @@ import {
   parenEnclosesWhole,
   splitUnionAtoms,
   tyGtIsClose,
+  tyTopIndexOf,
   unionMemberCount,
   valueAtomKind,
 } from "./typecheck"
@@ -689,58 +690,40 @@ export function inferNicheNullByName(name: string) {
   if im == "string|null" { return "string|null" }
   ""
 }
-// ── the type-name DEPTH WALK: one home for the bracket ladder ─────────────────
-// THE ONE HOME of the type-name depth walk, "FIND" form: the index of the first
-// TOP-LEVEL (grouper depth 0) occurrence of the single-code-point separator `sep` in
-// `name`, or -1.
-//
-// SEVEN functions in this file hand-wrote the identical bracket ladder — `{`/`[`/`(`
+// ── the type-name DEPTH WALK: the checker's `tyTopIndexOf` IS the home ────────
+// EIGHT functions in this file hand-wrote the identical bracket ladder — `{`/`[`/`(`
 // open, `}`/`]`/`)` close, `<` open, and a `>` that closes only an OPEN `<`
 // (`tyGtIsClose`) — and differed ONLY in what they do when the depth is 0. The rules
-// are one thing, and this program has already paid for their being seven: the `<>`
+// are one thing, and this program has already paid for their being eight: the `<>`
 // repairs #1118 / #1120 / D-CLASSANG shipped had to be applied to each copy
 // separately, one PR at a time, because a copy that had not been visited yet ran its
-// depth NEGATIVE on a generic argument list.
+// depth NEGATIVE on a generic argument list. #1146 folded the eight into two local
+// homes (`tyTopLevelIndexOf` "FIND" + `tyTopLevelSplit` "SPLIT"); THIS slice folds the
+// FIND form into the checker's `tyTopIndexOf`, one module down, and deletes it — its
+// three call sites (`nullablePartOf`, `annArrowAt`, `nameIsStructWithUnionField`) now
+// spell the home directly rather than paying a frame to permute two arguments.
 //
-// `sep` must not itself be a grouper (every caller separates on `|` or `,`): the
-// grouper arms are tested first, exactly as each copy tested them.
+// AND THAT IS A BUG FIX, NOT TIDYING. The emitter's ladder was quote-BLIND where the
+// checker's has skipped quoted literal members (escape-aware, via `skipQuotedName`)
+// since #1143 — so a separator INSIDE a literal member (`Box<"a,b" | "c" | null>`) read
+// as top-level here and the annotation was rebuilt from the rubble. Graded over a
+// 15-text x 10-position x {plain, nullable} matrix, the two ladders disagreed on a
+// population of 24 cells spanning NINE characters (`, { } [ ] ( ) <` and `=>`) and six
+// positions; this merge closes 15, and `emit_classify`'s private `shapeInnerFieldSplit`
+// — the last quote-blind copy in the chain — owns the other 9. Two of the 24 were not
+// even loud: they emitted a module the runtime could not parse. See
+// `docs/internals/destringify-types-program.md`.
 //
-// `'='` means the function ARROW `=>`, not a bare `=`: it matches only when the NEXT
-// character is `>`, and a lone `=` keeps the scan going. That two-character lookahead
-// is the ONE thing `annArrowAt`'s eighth copy of this ladder added — the copy was
-// otherwise character-identical (same three grouper arms, same `tyGtIsClose` close,
-// same first-hit return), so the token belongs in the home rather than in a private
-// walk that has to be re-taught every grammar repair. The checker's `tyTopIndexOf`
-// spells the same rule one module down, independently; the two remain distinct
-// because the checker's ladder SKIPS quoted literal members and this one never has.
-//
-// It returns at the FIRST hit. `nullablePartOf`'s copy scanned to the END of the name
-// and kept only the first bar, so this is the same answer for strictly less work.
-export function tyTopLevelIndexOf(name: string, sep: i32) {
-  let depth = 0
-  let angOpen = 0
-  let i = 0
-  while i < name.length {
-    const ch = name[i]
-    if ch == '{' || ch == '[' || ch == '(' {
-      depth = depth + 1
-    } else if ch == '<' {
-      depth = depth + 1
-      angOpen = angOpen + 1
-    } else if ch == '}' || ch == ']' || ch == ')' {
-      depth = depth - 1
-    } else if ch == '>' && tyGtIsClose(name, i, angOpen) {
-      depth = depth - 1
-      angOpen = angOpen - 1
-    } else if depth == 0 && ch == sep {
-      if ch != '=' { return i }
-      if i + 1 < name.length && name[i + 1] == '>' { return i }
-    }
-    i = i + 1
-  }
-  -1
-}
-// THE ONE HOME of the type-name depth walk, "SPLIT" form: append the TOP-LEVEL
+// The home's `'='` means the function ARROW `=>`, not a bare `=`: it matches only when
+// the NEXT character is `>`. That two-character lookahead is the ONE thing `annArrowAt`'s
+// copy of this ladder ever added, and it now lives at the home, not in a private walk
+// that has to be re-taught every grammar repair. `sep` must not itself be a grouper
+// (every caller separates on `|` or `,`): the grouper arms are tested first, exactly as
+// each copy tested them. The home returns at the FIRST hit — `nullablePartOf`'s original
+// copy scanned to the END of the name and kept only the first bar, so this is the same
+// answer for strictly less work.
+
+// THE LOCAL HOME of the type-name depth walk, "SPLIT" form: append the TOP-LEVEL
 // (grouper depth 0) `sep`-separated parts of `s` to `out`.
 //
 // `dropEmpty` is the ONE axis its four callers differed on: `gaeSplitArgs` drops an
@@ -753,40 +736,31 @@ export function tyTopLevelIndexOf(name: string, sep: i32) {
 // code point at a time (`cur = cur + fromCodePoint(c)`), the copy-on-concat shape
 // `splitUnionAtoms` was already repaired for; slicing makes the home strictly cheaper
 // than the copies it replaces, not merely equal.
+//
+// It is a RESUME LOOP over the checker's `tyTopIndexOf` rather than its own ladder, for
+// the same reason (and with the same quote fix) as the FIND form the section header above
+// describes. Resuming the scan at `end + 1` costs ONE pass over `s`, not one per part: the home
+// counts depth FROM `from`, and a resume point is always a position where the depth was
+// 0 by the split's own condition, so restarting the count there reproduces it. That
+// property is the home's, documented at its definition, and it is what keeps this off
+// the O(n^2) path.
 export function tyTopLevelSplit(
   s: string,
   sep: i32,
   dropEmpty: boolean,
   out: string[],
 ) {
-  let depth = 0
-  let angOpen = 0
   let start = 0
-  let i = 0
-  while i <= s.length {
-    let brk = i == s.length
-    if !brk {
-      const c = s[i]
-      if c == '{' || c == '[' || c == '(' {
-        depth = depth + 1
-      } else if c == '<' {
-        depth = depth + 1
-        angOpen = angOpen + 1
-      } else if c == '}' || c == ']' || c == ')' {
-        depth = depth - 1
-      } else if c == '>' && tyGtIsClose(s, i, angOpen) {
-        depth = depth - 1
-        angOpen = angOpen - 1
-      } else if depth == 0 && c == sep {
-        brk = true
-      }
+  let going = true
+  while going {
+    let end = tyTopIndexOf(s, sep, 0, start)
+    if end < 0 {
+      end = s.length
+      going = false
     }
-    if brk {
-      const part = s.slice(start, i)
-      if part.length > 0 || !dropEmpty { out.push(part) }
-      start = i + 1
-    }
-    i = i + 1
+    const part = s.slice(start, end)
+    if part.length > 0 || !dropEmpty { out.push(part) }
+    start = end + 1
   }
   0
 }
@@ -853,8 +827,9 @@ export function tyGroupWrapsWhole(name: string) {
 // part's name, or "" when the name is not a two-part nullable.
 export function nullablePartOf(name: string) {
   // Depth-aware: a `|` INSIDE an inline shape (`{y:string|i32}|null`) is part of
-  // the FIELD's union, not the nullable wrapper — only a depth-0 bar splits.
-  const bar = tyTopLevelIndexOf(name, '|')
+  // the FIELD's union, not the nullable wrapper — only a depth-0 bar splits. And a `|`
+  // inside a quoted literal member is part of the member's TEXT: the home skips it.
+  const bar = tyTopIndexOf(name, '|', 0, 0)
   if bar < 0 { return "" }
   const a = name.slice(0, bar)
   const b = name.slice(bar + 1, name.length)
@@ -1987,13 +1962,13 @@ export function callMemProp(exprIx: i32) {
 // name, or -1.
 //
 // This was the EIGHTH hand-written copy of the file's bracket ladder, and the last one
-// outside the two homes. It differed from `tyTopLevelIndexOf` in exactly one thing —
-// the arrow's two-character lookahead — so the lookahead moved INTO the home as the
-// `'='` token and the copy became this line. The grouper arms were already
-// character-identical (the `||` chains list the same three pairs in a different order,
-// which the depth counter cannot see), and neither walk skips a quoted literal member,
-// so the substitution is a relocation and not a grammar change.
-export function annArrowAt(name: string) { tyTopLevelIndexOf(name, '=') }
+// outside the two homes. It differed from the FIND walk in exactly one thing — the
+// arrow's two-character lookahead — so the lookahead moved INTO the home as the `'='`
+// token and the copy became this line. The grouper arms were already character-identical
+// (the `||` chains list the same three pairs in a different order, which the depth
+// counter cannot see). It now names the checker's home directly: the local FIND wrapper
+// it used to go through was a frame that only permuted arguments.
+export function annArrowAt(name: string) { tyTopIndexOf(name, '=', 0, 0) }
 // THE ONE HOME of "the RETURN of a function-type name": the text after a TOP-LEVEL `=>`
 // (`(i32) => S[]` → `S[]`), or "" when `name` carries no top-level arrow.
 //
@@ -2111,11 +2086,21 @@ export function annObjFieldSplit(
 // **`emit_classify.vl` still defines a PRIVATE `shapeInnerFieldSplit` with SIX callers,
 // and that copy never even shared this walk** — it carries its own inline `{}[]()<>`
 // depth ladder with its own `angOpen`/`tyGtIsClose` arms, where the body below delegates
-// to `tyTopLevelSplit`. So the duplicate is worth a whole hand-written bracket ladder:
-// 14 tree-wide today, of which 5 are declared homes (3 here, 2 in `typecheck.vl`).
-// The fix is a ONE-WORD import in a file that already names ~20 functions from this
-// module; it is filed as a hand-off because `emit_classify.vl` is another slice's file.
+// to `tyTopLevelSplit`. So the duplicate is worth a whole hand-written bracket ladder.
 // A HEADER COMMENT IS NOT EVIDENCE — this one was wrong for two slices.
+//
+// AND AS OF THIS SLICE THAT ONE-WORD IMPORT IS ALSO A BUG FIX, which is new and is
+// MEASURED, not argued. `tyTopLevelSplit` now rides the checker's quote-aware home, so
+// this function skips a separator inside a quoted literal member and the private copy
+// still does not. On the 300-cell graded matrix (see the depth-walk header above), the
+// `emit_base` merge alone closes 15 of the 24 quote-blind cells and the residual NINE
+// are exactly the inline-object-SHAPE positions this scanner owns. A build with the
+// private copy DELETED and this one imported — nothing else — closes **24 of 24, with 0
+// regressions and 0 traps**, which is one hand-written ladder retired and nine cells
+// fixed for one word. (The separately filed alternative, rewriting the private copy into
+// its own resume loop, reaches the same 24 while KEEPING the duplicate; prefer the
+// deletion.) Still filed rather than done, because `emit_classify.vl` is another slice's
+// file.
 //
 // The depth walk itself is `tyTopLevelSplit`'s, shared with every other top-level split
 // in this file. Depth-aware over `{}` `[]` `()` AND the generic-application brackets: a
@@ -2195,9 +2180,9 @@ export function nameIsStructWithUnionField(name: string) {
       const ftype = ftexts[fi]
       // A CLOSURE field (top-level `=>`) binds any `|` to its RESULT — skip it. Only a field
       // type that is itself a top-level UNION (`|` at depth 0) is a boxed field slot. The
-      // depth-0 bar scan is `tyTopLevelIndexOf`'s, the same walk `nullablePartOf` asks.
+      // depth-0 bar scan is the checker's home, the same walk `nullablePartOf` asks.
       if annArrowAt(ftype) < 0 {
-        if tyTopLevelIndexOf(ftype, '|') >= 0 { return true }
+        if tyTopIndexOf(ftype, '|', 0, 0) >= 0 { return true }
         // A NESTED bare-shape field (`{f:{f:i32|string}}`): the boxed slot may sit one
         // level down — RECURSE, so the `synthRetAnnots` pin fires for a lambda whose
         // NESTED literal field adopted a union-field shape (`objLitWidenFields`'
