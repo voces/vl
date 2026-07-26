@@ -9631,10 +9631,17 @@ declared function type could resolve through — so there is nothing for transpa
 `singleMemberAliasName` reads the same predicate, so the checker and the emitter cannot diverge
 on the same annotation, which is the invariant that function's header has always asserted.
 
-**The wrapper population, measured.** Over the frozen corpus plus the new fixtures, master's
-`declaredTyOfName` meets a `TyUnion` **5,822** times; **58** of those are a one-member union over
-a `TyFunc` — the exact population `emit_rep`'s `tyDenotesFunc` peel exists for, and the exact
-population this arm collapses at the source.
+**The wrapper population, measured.** Over the 1,337-file `caad41a` corpus with this slice's four
+pins EXCLUDED, master's `declaredTyOfName` meets a `TyUnion` **5,364** times; **17** of those are a
+one-member union over a `TyFunc` — the exact population `emit_rep`'s `tyDenotesFunc` peel exists
+for, and the exact population this arm collapses at the source.
+
+*(Self-correction: this slice first published 58 / 5,822 for the same quantity. That reading swept
+three roots of which two OVERLAPPED — `tests/cases/closures` was counted a second time on top of
+`corpus/cases`, and it carried this slice's own four pins. The inflation is ~8% on the denominator
+and 3.4x on the numerator, because the double-counted directory is precisely the one where
+arrow-bodied aliases live. **A multi-root accumulate sweep must assert its roots are disjoint** —
+the max-per-root-then-sum trick is correct only then.)*
 
 ### The channels
 
@@ -9760,7 +9767,7 @@ carrying `caad41a`'s `typecheck.vl`):
    #1133 declined it for the same reason this slice does: they must move together, in one
    partition. The pin that would go red is
    `function mk(): ((i32) => i32) | null { null }` + a `!= null` read of the result.
-3. **`emit_rep.vl` — `tyDenotesFunc`'s peel has lost its checker-side producer.** 58 of 5,822
+3. **`emit_rep.vl` — `tyDenotesFunc`'s peel has lost its checker-side producer.** 17 of 5,364
    declared-name `TyUnion` resolutions on master were a one-member union over a `TyFunc`; with
    D-ALIASFN `declaredTyOfName` collapses all 58 at the source, so the peel is unreachable from
    an annotation. **Do NOT delete it on that alone** — the measurement covers the checker's
@@ -9806,7 +9813,15 @@ carrying `caad41a`'s `typecheck.vl`):
     strongest refutation for free — the one position that still rejects rejects for BOTH
     spellings, which is how it was identified as somebody else's defect rather than a residual
     hole in this one.
-80. **The build/run A/B cannot see the LINT tier** (D-ISVARTY) — `vl build` and `vl run` emit no
+80. **A multi-root ACCUMULATE sweep must assert its roots are DISJOINT** (D-ALIASFN) — the
+    shared-instance `vl check <dir>` trick (counters accumulate, so the per-root maximum is that
+    root's total, and roots are summed) is correct only if no file is under two roots. This slice
+    published 58 / 5,822 for the wrapper census — the true figures are **17 / 5,364** — off a
+    three-root sweep whose third root (`tests/cases/closures`) sat inside its first, and which is
+    exactly where the arrow-bodied aliases live: 3.4x on the numerator, ~8% on the denominator. The check is one line — assert the file
+    sets are disjoint before summing — and the tell is that the numerator moved far more than the
+    denominator, which is what an overlap concentrated in one directory looks like.
+81. **The build/run A/B cannot see the LINT tier** (D-ISVARTY) — `vl build` and `vl run` emit no
     hints, warnings or infos, so a byte-, message- and run-identical corpus says nothing about
     whether a change moved a diagnostic that only `vl check --severity` prints. A separate
     1,335-row `--severity hint` sweep (689 rows carrying at least one lint) is one more cheap
