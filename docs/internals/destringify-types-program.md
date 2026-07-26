@@ -21667,3 +21667,60 @@ contact is a wide store; with it, S8 reddens.
      THEN READS AS "COMMITTED".** A fixture repair made mid-gate was stashed by a later
      tree-cleanliness check, the suite went green *before* the stash, and the same failure returned
      several hours later. Commit at every stable point — including the ones that only touch tests.
+
+### LANDING-ORDER CORRECTION to the slice above — the `annotPart` map SPELLING is split out
+
+Appended, not edited (this doc is append-only). The section above states, under FIXED item 4:
+
+> The entombment that matters: `compiler/typecheck.vl`'s `annotPart` is a `{[string]: string}` map
+> again — **the compiler cannot self-compile without this fix**.
+
+That sentence is TRUE and it is exactly why the spelling could not ship in the same PR as the fix.
+It is corrected here: **what ships in this PR is the fix; `annotPart` stays parallel arrays.**
+
+**THE GATE THAT MISSED IT, AND WHY.** Every leg above was run against a seed built from MY OWN
+sources — which is the rule this program has paid for, and it is not sufficient by itself. CI
+bootstraps from the published `seed-latest`, which is **master's compiler**, and master's compiler
+still carries the `m = Map()` miscompile. Source that uses the construct a fix ENABLES cannot be
+compiled by a seed that LACKS the fix. Reproduced by moving the seed aside and fetching:
+
+```
+$ mv build/vl-compiler.wasm … ; bash scripts/fetch-seed.sh     # 1,032,729 B, md5 3d54d028…
+$ bash scripts/refresh-compiler.sh --prove-fixpoint
+wrote next.wasm (1035476 bytes)
+Error: failed to compile: wasm[0]::function[135]
+  Invalid input WebAssembly code at offset 170454: type mismatch: expected (ref null $type), found (ref $type)
+```
+
+`function[135]` is `initChecker` — read off a `--names` build, not inferred — which is the
+`annotPart = Map()` reset and nothing else.
+
+**BISECTED, ONE VARIABLE, RATHER THAN REASONED ABOUT.** The hypothesis handed over was "it is
+`annotPart`", with the explicit caveat that it might instead be the capture/reservation change or an
+f32 path. Reverting ONLY the map spelling — with the emitter's assignment-boundary fix, the f32
+argument fix, the three store widths, the capture/reservation change and the host formatter ALL
+still present — makes the published-seed ladder hold at 2 compiles (1,034,330 B, byte-for-byte). So
+that one hunk is both sufficient and, since everything else passes with it gone, the only blocker.
+
+**WHAT THIS COSTS THE EVIDENCE, STATED PLAINLY.** "The compiler cannot self-compile without this
+fix" was the strongest entombment the map fix had, and this PR does not carry it. What remains is
+`tests/cases/maps/map-reassign-value-shape.vl` (11 cells, behaviour-checked) and sabotage S5, which
+reddens it — a corpus pin, which is the ordinary form. The self-compile entombment returns with the
+follow-up.
+
+**THE RULE THIS EARNS.** A fix whose own enabling construct the COMPILER wants to use is always two
+changes: the fix, then the use, separated by a seed republish. The gate leg that detects it is
+`refresh-compiler.sh --prove-fixpoint` **from a freshly FETCHED seed** — `mv build/vl-compiler.wasm`
+aside, `scripts/fetch-seed.sh`, then gate. A seed you built yourself already contains your fix and
+can never fail this way, so a green local ladder is evidence about your seed, not about CI's.
+
+112. **"REBUILD THE SEED FROM YOUR OWN SOURCES" IS NECESSARY AND NOT SUFFICIENT.** It catches a
+     STALE seed. It cannot catch a seed that is too OLD to compile source relying on the fix the
+     source ships — because the seed you built has the fix. Both legs are needed: rebuild from your
+     own sources (proves the seed matches the source), and rebuild from the FETCHED seed (proves the
+     source can be bootstrapped by master's compiler, which is what CI does). The second leg is
+     cheap and had never been run in this program.
+113. **A SELF-HOSTING ENTOMBMENT CAN BE UNSHIPPABLE WITH THE THING IT ENTOMBS.** "The compiler
+     cannot self-compile without this fix" is the most convincing evidence a compiler fix can have,
+     and it is precisely the evidence that cannot ride in the same PR. Take the corpus pin for the
+     fix, and land the self-compile use as the follow-up that also re-proves it.
