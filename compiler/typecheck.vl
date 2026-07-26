@@ -1970,6 +1970,49 @@ export function initChecker() {
   0
 }
 
+// The intrinsic names the EMITTER dispatches on at the CALL SITE, by name, before it
+// ever looks up a declaration: each lowers to instructions inline
+// (`wasmEmit.emitCallExpr`'s `__store_i32__`/`__load_i32__`/`__log__` arms and the
+// array-intrinsic floor `__array_new__`/`__array_new_default__`/`__array_copy__`/
+// `__trap__`). A user function of one of these names therefore NEVER RUNS — the call
+// site is rewritten and the body is silently discarded.
+//
+// Measured, one shape per name: `function __load_i32__(a: i32) { return 7 }` +
+// `print(__load_i32__(1))` printed **0** (an `i32.load` of address 1), `vl check` clean;
+// in STATEMENT position `__store_i32__` and `__log__` discarded the body just as
+// silently. The others only failed LOUDLY by accident of stack shape (an `i32.store`
+// leaves nothing where an i32 was wanted) or because the checker happens to carry an
+// arity arm for them — not by design, and a differently-shaped user signature loses that
+// accident. So the rule is the NAME, not the symptom: reject the DEFINITION, where the
+// author can see it, instead of letting a call site quietly mean something else.
+//
+// This list is the reservation; the emitter's per-name arms stay where they are because
+// each picks a DIFFERENT lowering (a dispatch, not a classification). The two must be
+// kept in step — a new inline-lowered intrinsic belongs here the same day.
+function nameIsEmitterIntrinsic(name: string) {
+  if name == "__store_i32__" { return true }
+  if name == "__load_i32__" { return true }
+  if name == "__log__" { return true }
+  if name == "__trap__" { return true }
+  if name == "__array_new__" { return true }
+  if name == "__array_new_default__" { return true }
+  if name == "__array_copy__" { return true }
+  false
+}
+
+// The shared rejection for a definition that binds an emitter-intrinsic name.
+function checkNotEmitterIntrinsic(name: string, at: i32) {
+  if nameIsEmitterIntrinsic(name) {
+    tErr(
+      "'" +
+        name +
+        "' is a compiler intrinsic and cannot be redefined — every call to it lowers to instructions inline, so this definition would never run",
+      at,
+    )
+  }
+  0
+}
+
 // ── scope chain ──────────────────────────────────────────────────────────────
 
 // ── flow narrowing (condition collectors) ────────────────────────────────────
@@ -9104,6 +9147,19 @@ function checkCallNode(n: Call, ix: i32) {
             pargs[pj],
           )
         }
+        // The SAME rule for the other reps `print` has no import for: an array, a
+        // struct, a map/set, a function value, and any of those behind `| null`.
+        // The emitter's print ladder ends in an unguarded `call __print_i32__`, so
+        // each of these handed a `(ref $t)` to an `(i32) -> ()` import and the module
+        // failed to VALIDATE — while `vl check` reported the program clean.
+        if tyPrintsAsRef(pt, 24) {
+          tErrUnsupported(
+            "print of " +
+              tyToStr(pt) +
+              " is type-valid but not yet supported by codegen — `print` renders one scalar or string; print the elements/fields individually, e.g. `print(xs[0])`",
+            pargs[pj],
+          )
+        }
         pj = pj + 1
       }
       return TY_VOID
@@ -9908,6 +9964,11 @@ function ifChainExhausts(ifIx: i32) {
 // base-case-less cycle (`ping(){return pong()}` / `pong(){return ping()}`) has
 // nothing concrete to latch onto and reports "cannot infer a return type".
 function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
+  // A `function` (top-level OR nested) whose name the emitter dispatches on inline is a
+  // definition that can never run — reject it at the definition, not at the call site
+  // that silently means something else. Anchored on the decl node, so the pass-1 hoist
+  // and this pass report the SAME (message, anchor) pair and `tErrCoded` dedups them.
+  checkNotEmitterIntrinsic(n.fnName, fnIx)
   const inferring = n.fnRet < 0
   // The infer-stack KEY: a named function uses its name (so self-recursion is detected); an
   // ANONYMOUS lambda has no name, so key it by NODE INDEX — else two nested anonymous lambdas
@@ -12207,6 +12268,45 @@ function tyPrintsAsUnionBox(pt: i32) {
   const ok = valueUnionFromAtomKinds(pgAtomKinds)
   while pgAtomKinds.length > 0 { pgAtomKinds.pop() }
   ok
+}
+
+// Whether `print(x)` would be handed a WasmGC REFERENCE the scalar print imports cannot
+// take. `print` renders ONE scalar/string rep (the union gate above says the same thing
+// about a box); the emitter's print ladder is a run of POSITIVE tests ending in an
+// unguarded `call __print_i32__`, so every value whose rep is a reference — an array, a
+// struct, a map/set, a function value, a union carrying one of those, and any of them
+// behind `| null` — was handed to an `(i32) -> ()` import with a `(ref $t)` on the stack.
+// The module then failed to VALIDATE ("expected i32, found (ref $type)") while `vl check`
+// reported the program clean. `driver.builtinScan` publishes `print`'s accepted set as
+// `(i32 | i64 | f32 | f64 | boolean | string) -> void`; this is the gate that makes that
+// string true.
+//
+// `string` is deliberately NOT here: it is a reference too, but the ladder routes it to
+// the string streaming printer. Nor is a LITERAL union (i32/string atoms widened to their
+// member text), nor a `TyVar` (a generic body's `T` — monomorphization decides its rep at
+// the call site, and the concrete argument is gated there).
+//
+// Depth-bounded like `tyReachesUnion`: a self-referential alias reached through a union or
+// nullable member would otherwise not terminate.
+function tyPrintsAsRef(pt: i32, depth: i32) {
+  if pt < 0 { return false }
+  if depth <= 0 { return false }
+  const t = T.tys[pt]
+  if t is TyArray { return true }
+  if t is TyObj { return true }
+  if t is TyMap { return true }
+  if t is TyFunc { return true }
+  if t is TyNullable { return tyPrintsAsRef(t.nInner, depth - 1) }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      if tyPrintsAsRef(ms[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
 }
 
 // `isValueUnionName`'s verdict over an already-classified atom-kind sequence: 2+ atoms,
@@ -16470,6 +16570,10 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   if !preHoisted && T.scopes[dtop].has(n.letName) {
     tErr("redeclared " + n.letName, ix)
   }
+  // The same reservation the `function` path enforces: `const __load_i32__ = (x: i32) => 7`
+  // is called through the emitter's inline arm exactly like the `function` spelling, so the
+  // lambda never runs. A PARAMETER of that name is untouched — it is never a callee.
+  checkNotEmitterIntrinsic(n.letName, ix)
   declare(n.letName, bound)
   if symEnabled != 0 { symDecl(n.letName, ix, bound, 0) }
   if n.letKw == "const" {
