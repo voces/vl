@@ -1,0 +1,82 @@
+// @run
+// @log N
+// @log N
+// @log V
+// @log V
+// @log N
+// @log N
+// @log V
+// @log 5
+// The kind-18 NULLABLE REF-ARRAY global (`i32[][] | null`, `S[] | null`) — three
+// separate gaps that only compose into a working cell together.
+//
+// 1. The start function never seeded the kind-18 null rep, so `= null` rejected the
+//    module (`emitProgram: bare null needs a struct-typed context`), exactly as the
+//    leaf list cells did.
+// 2. `emitAssign`'s GLOBAL arm never seeded it either, so `g = null` rejected too —
+//    the sixth niche, missed when the other five landed.
+// 3. `emitIdentNode`'s global read EAGERLY RECOVERED the cell to non-null: every other
+//    nullable cell kind is exempt from that `ref.as_non_null`, kind 18 was not. That
+//    was unreachable while nothing could put a null into such a cell; with (1) and (2)
+//    fixed it becomes a `wasm trap: null reference` the moment the global is READ, so
+//    all three ship together. The `f()`-initialized rows below are the ones that
+//    trapped on master (the un-annotated binding infers kind 18 from the return).
+//
+// The value is observed through a `T | null` PARAMETER rather than `g != null`: the
+// direct compare over a kind-18 GLOBAL is a separate live defect (`exprNullableRefArray`
+// resolves an `Ident` through the local tables and the param list only, with no global
+// arm — filed), and it would mask every row here behind that one hole.
+
+type S = { v: i32 }
+
+function obL(x: i32[][] | null) {
+  if x != null { print("V") } else { print("N") }
+}
+function obS(x: S[] | null) {
+  if x != null { print("V") } else { print("N") }
+}
+function obN(x: (S | null)[] | null) {
+  if x != null { print("V") } else { print("N") }
+}
+
+// (1) the initializer, both element shapes
+const gL: i32[][] | null = null
+obL(gL)
+
+const gS: S[] | null = null
+obS(gS)
+
+// CONTROL — a real ref array in the same cells still reads back non-null.
+const vL: i32[][] | null = [[1]]
+obL(vL)
+
+const vS: S[] | null = [{ v: 1 }]
+obS(vS)
+
+// (2) the re-assignment
+let aL: i32[][] | null = [[1]]
+aL = null
+obL(aL)
+
+let aS: S[] | null = [{ v: 1 }]
+aS = null
+obS(aS)
+
+// SEED-LEAK guard (#964, at both new sites): a LIST-literal whose ELEMENT is null must
+// lower that element as `ref.null $S`, NOT as the cell's wrapper — so both kind-18 seeds
+// are armed only when the initializer / RHS IS a bare `null`. The INIT direction is
+// pinned by `nullable-array-nullable-struct-union-field.vl`; this is the ASSIGN twin,
+// which nothing pinned (it was a clean reject on master, and an un-gated seed makes it
+// `array.new_fixed[0] expected (ref null $S), found ref.null $rlWrap` — invalid wasm).
+let eS: (S | null)[] | null = null
+eS = [null]
+obN(eS)
+
+// (3) the READ of a live element through the recovered cell — the row that proves the
+// dropped `ref.as_non_null` did not cost the non-null path anything.
+const rS: S[] | null = [{ v: 5 }]
+function firstV(x: S[] | null): i32 {
+  if x != null { return x[0].v }
+  return -1
+}
+print(firstV(rS))

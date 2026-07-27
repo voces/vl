@@ -234,3 +234,171 @@ Deno.test({
     }
   },
 });
+
+// ── WHICH FILE a diagnostic is labelled with (multi-module) ──────────────────
+//
+// A positioned diagnostic's line and column belong to the module that OWNS it,
+// so labelling every one with the ENTRY's path prints a real location against the
+// wrong file. `vl check` has always resolved the owner (`compiler/cli.vl` reads
+// `diagModule`); `vl run` / `vl build` did not, and the two disagreed — an error
+// on line 2 of `dep.vl` printed as `entry.vl:2:20`, which points at whatever
+// happens to be on line 2 of the entry.
+//
+// `vl check --concise` is the ORACLE here: same front end, same diagnostics, and
+// it has been right all along. The two channels are compared on the FILE and the
+// LINE only — the COLUMN differs by design (`render_diags` prints the front end's
+// 0-based column, the concise formatter shifts to 1-based for display), which the
+// header of this file states.
+
+/** Write a `{relative path: source}` tree into a fresh temp dir. */
+const writeTree = async (files: Record<string, string>): Promise<string> => {
+  const dir = await Deno.makeTempDir({ prefix: "vl_diag_mod_" });
+  for (const [rel, body] of Object.entries(files)) {
+    const path = `${dir}/${rel}`;
+    const slash = path.lastIndexOf("/");
+    await Deno.mkdir(path.slice(0, slash), { recursive: true });
+    await Deno.writeTextFile(path, body);
+  }
+  return dir;
+};
+
+/** `vl run` on `dir/entry.vl` — the host-driven channel (`--concise` does not
+ * reach it; `vl build` shares the same `render_diags` formatting). */
+const runIn = async (dir: string): Promise<{ code: number; err: string }> => {
+  const { code, stderr } = await new Deno.Command(VL, {
+    args: ["run", `${dir}/entry.vl`, "--compiler", COMPILER],
+    stdout: "piped",
+    stderr: "piped",
+    env: { RUST_BACKTRACE: "0" },
+  }).output();
+  return { code, err: new TextDecoder().decode(stderr) };
+};
+
+const buildIn = async (dir: string): Promise<{ code: number; err: string }> => {
+  const { code, stderr } = await new Deno.Command(VL, {
+    args: ["build", `${dir}/entry.vl`, "-o", `${dir}/out.wasm`, "--compiler", COMPILER],
+    stdout: "piped",
+    stderr: "piped",
+    env: { RUST_BACKTRACE: "0" },
+  }).output();
+  return { code, err: new TextDecoder().decode(stderr) };
+};
+
+/** The `file:line` pairs `vl run`/`vl build` printed (`file:line:col: message`). */
+const runLocs = (err: string): string[] =>
+  err.split("\n")
+    .map((l) => /^(.*?):(\d+):(\d+): /.exec(l.trim()))
+    .filter((m): m is RegExpExecArray => m !== null)
+    .map((m) => `${m[1]}:${m[2]}`);
+
+/** The ERROR-tier `file:line` pairs `vl check --concise` printed
+ * (`file: error [line:col] message`); warnings are not comparable — the run
+ * channel emits none. */
+const checkLocs = (err: string): string[] =>
+  err.split("\n")
+    .map((l) => /^(.*?): error \[(\d+):(\d+)\] /.exec(l.trim()))
+    .filter((m): m is RegExpExecArray => m !== null)
+    .map((m) => `${m[1]}:${m[2]}`);
+
+/** Assert `vl run`, `vl build` and `vl check --concise` name the same files and
+ * lines, and that the set is exactly `want`. */
+const assertOwnerAgreement = async (
+  files: Record<string, string>,
+  want: (dir: string) => string[],
+): Promise<void> => {
+  const dir = await writeTree(files);
+  try {
+    const [r, b, c] = [await runIn(dir), await buildIn(dir), await check(`${dir}/entry.vl`)];
+    const expect = want(dir).slice().sort();
+    const got = runLocs(r.err).slice().sort();
+    const gotB = runLocs(b.err).slice().sort();
+    const oracle = checkLocs(c.err).slice().sort();
+    if (JSON.stringify(got) !== JSON.stringify(expect)) {
+      throw new Error(`vl run: expected ${JSON.stringify(expect)}, got ${JSON.stringify(got)}\n${r.err}`);
+    }
+    if (JSON.stringify(gotB) !== JSON.stringify(expect)) {
+      throw new Error(`vl build: expected ${JSON.stringify(expect)}, got ${JSON.stringify(gotB)}\n${b.err}`);
+    }
+    if (JSON.stringify(oracle) !== JSON.stringify(expect)) {
+      throw new Error(
+        `vl check (the oracle) disagrees: expected ${JSON.stringify(expect)}, got ${JSON.stringify(oracle)}\n${c.err}`,
+      );
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
+Deno.test({
+  name: "native-diag-owner: a type error in a DEPENDENCY is labelled with the dependency's path",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Before the fix `vl run` printed `entry.vl:2:20` — the dependency's line and
+    // column against the entry's name.
+    await assertOwnerAgreement({
+      "entry.vl": 'import { bad } from "./dep"\nprint(bad())\n',
+      "dep.vl": "export function bad(): i32 {\n  const s: string = 42\n  return 1\n}\n",
+    }, (d) => [`${d}/dep.vl:2`]);
+  },
+});
+
+Deno.test({
+  name: "native-diag-owner: a PARSE error in a dependency is labelled with the dependency's path",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The parse tier resolves its owner through a TOKEN index (`modOfTok`), the
+    // type tier through `nodeToks` — two different anchor paths in `diagModule`.
+    await assertOwnerAgreement({
+      "entry.vl": 'import { bad } from "./dep"\nprint(bad())\n',
+      "dep.vl": "export function bad(): i32 {\n  const s: = 42\n  return 1\n}\n",
+    }, (d) => [`${d}/dep.vl:2`]);
+  },
+});
+
+Deno.test({
+  name: "native-diag-owner: a TRANSITIVE dependency's error names that file, not the entry or the middle",
+  ignore: !ENABLED,
+  fn: async () => {
+    await assertOwnerAgreement({
+      "entry.vl": 'import { a } from "./mid"\nprint(a())\n',
+      "mid.vl": 'import { deep } from "./deep"\nexport function a(): i32 { return deep() }\n',
+      "deep.vl": "export function deep(): i32 {\n  const s: string = 42\n  return 1\n}\n",
+    }, (d) => [`${d}/deep.vl:2`]);
+  },
+});
+
+Deno.test({
+  name: "native-diag-owner: two errors in two files are labelled per-diagnostic",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The decisive shape: one label for the whole run cannot be right for both.
+    await assertOwnerAgreement({
+      "entry.vl": 'import { bad } from "./dep"\nconst t: string = 7\nprint(bad())\n',
+      "dep.vl": "export function bad(): i32 {\n  const s: string = 42\n  return 1\n}\n",
+    }, (d) => [`${d}/dep.vl:2`, `${d}/entry.vl:2`]);
+  },
+});
+
+Deno.test({
+  name: "native-diag-owner: a subdirectory dependency keeps its `sub/dep.vl` key",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The module KEY is the path the host was asked to read, slashes and all.
+    await assertOwnerAgreement({
+      "entry.vl": 'import { bad } from "./sub/dep"\nprint(bad())\n',
+      "sub/dep.vl": "export function bad(): i32 {\n  const s: string = 42\n  return 1\n}\n",
+    }, (d) => [`${d}/sub/dep.vl:2`]);
+  },
+});
+
+Deno.test({
+  name: "native-diag-owner: CONTROL — an error in the ENTRY of a multi-module program is unchanged",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Module 0's key IS the entry path, so this row must read exactly as before.
+    await assertOwnerAgreement({
+      "entry.vl": 'import { ok } from "./dep"\nconst s: string = 42\nprint(ok())\n',
+      "dep.vl": "export function ok(): i32 { return 1 }\n",
+    }, (d) => [`${d}/entry.vl:2`]);
+  },
+});

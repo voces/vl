@@ -95,6 +95,62 @@ fn run_collector() -> Result<Collector> {
     }
 }
 
+/// Which FILE each diagnostic belongs to, for a multi-module compile. A
+/// positioned diagnostic carries a line and column that are the OWNING module's,
+/// so labelling every one with the entry path prints a real location against the
+/// wrong file — `vl run`/`vl build` said `entry.vl:2:20` for an error inside
+/// `dep.vl`, while `vl check` (which resolves the owner in `compiler/cli.vl`) said
+/// `dep.vl:2:21`. This is the same mapping `cli.vl` uses: `diagModule(i)` is the
+/// driver's module-table index, and `modKeyCount`/`modKeyAtLen`/`modKeyAtCharAt`
+/// read that table's keys — which the host itself committed, so they are exactly
+/// the paths it was asked to read.
+///
+/// `None` (a compiler module without `diagModule`, or a single-file compile whose
+/// module table was never filled) means "label with the entry path", byte-identical
+/// to before. The key table is read ONCE — strings cross the no-import boundary one
+/// code point at a time, and a diagnostic burst would otherwise re-read it per line.
+struct DiagPaths {
+    module_of: TypedFunc<i32, i32>,
+    keys: Vec<String>,
+}
+
+impl DiagPaths {
+    fn probe(store: &mut Store<()>, inst: &Instance) -> Option<Self> {
+        let module_of = inst
+            .get_typed_func::<i32, i32>(&mut *store, "diagModule")
+            .ok()?;
+        let count = inst
+            .get_typed_func::<(), i32>(&mut *store, "modKeyCount")
+            .ok()?;
+        let key_len = inst
+            .get_typed_func::<i32, i32>(&mut *store, "modKeyAtLen")
+            .ok()?;
+        let key_at = inst
+            .get_typed_func::<(i32, i32), i32>(&mut *store, "modKeyAtCharAt")
+            .ok()?;
+        let n = count.call(&mut *store, ()).ok()?;
+        let mut keys = Vec::with_capacity(n.max(0) as usize);
+        for m in 0..n {
+            let len = key_len.call(&mut *store, m).ok()?;
+            let mut key = String::with_capacity(len as usize);
+            for j in 0..len {
+                if let Some(c) = char::from_u32(key_at.call(&mut *store, (m, j)).ok()? as u32) {
+                    key.push(c);
+                }
+            }
+            keys.push(key);
+        }
+        Some(DiagPaths { module_of, keys })
+    }
+
+    /// The owning module's key for diagnostic `i`, or `None` when the anchor
+    /// resolved to no module in range (the entry path is the caller's fallback).
+    fn path_for(&self, store: &mut Store<()>, i: i32) -> Option<&str> {
+        let m = self.module_of.call(&mut *store, i).ok()?;
+        self.keys.get(usize::try_from(m).ok()?).map(String::as_str)
+    }
+}
+
 /// Render the compiler's accumulated diagnostics, one per line. A compiler
 /// module with the structured per-diagnostic exports (`diagCount` /
 /// `diagMsgLen` / `diagMsgAt` / `diagLine` / `diagCol`) renders a positioned
@@ -103,6 +159,11 @@ fn run_collector() -> Result<Collector> {
 /// `diagLine(i) == 0` means "no position" and the message prints bare. An older
 /// module without those exports degrades to the legacy newline-joined
 /// `diagLen`/`diagAt` text (bare messages), byte-identical to before.
+///
+/// `path` is the ENTRY's path and is only the FALLBACK label: a multi-module
+/// compile asks `DiagPaths` which file each diagnostic actually belongs to. The
+/// entry's own diagnostics resolve to module 0, whose key IS `path`, so a
+/// single-file program's output is unchanged to the byte.
 fn render_diags(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<String> {
     if let (Ok(count), Ok(mlen), Ok(mat), Ok(dline), Ok(dcol)) = (
         inst.get_typed_func::<(), i32>(&mut *store, "diagCount"),
@@ -111,6 +172,7 @@ fn render_diags(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<St
         inst.get_typed_func::<i32, i32>(&mut *store, "diagLine"),
         inst.get_typed_func::<i32, i32>(&mut *store, "diagCol"),
     ) {
+        let owners = DiagPaths::probe(&mut *store, inst);
         let n = count.call(&mut *store, ())?;
         let mut out = String::new();
         for i in 0..n {
@@ -124,7 +186,11 @@ fn render_diags(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<St
             let line = dline.call(&mut *store, i)?;
             if line > 0 {
                 let col = dcol.call(&mut *store, i)?;
-                out.push_str(&format!("{path}:{line}:{col}: {msg}\n"));
+                let file = owners
+                    .as_ref()
+                    .and_then(|o| o.path_for(&mut *store, i))
+                    .unwrap_or(path);
+                out.push_str(&format!("{file}:{line}:{col}: {msg}\n"));
             } else {
                 out.push_str(&msg);
                 out.push('\n');

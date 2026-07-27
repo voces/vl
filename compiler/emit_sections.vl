@@ -39,6 +39,7 @@ import {
   IfStmt,
   LetDecl,
   Member,
+  NullLit,
   NumLit,
   P,
   Param,
@@ -65,6 +66,7 @@ import {
   tyIsFuncType,
   tyIsNulBool,
   tyNameOf,
+  unwrapParen,
 } from "./emit_base"
 import {
   blockHasArrNew,
@@ -179,6 +181,7 @@ import {
   pendingMapSlot,
   pendingNulBool,
   pendingNulClosure,
+  pendingNulList,
   pendingNulLitUnion,
   pendingNulRefHeap,
   pendingNulString,
@@ -191,6 +194,7 @@ import {
   rlElemName,
   rlElemTyIx,
   rlTwin,
+  rlWrapIdx,
   sDeclared,
   sFieldCount,
   sFieldElemTyIx,
@@ -255,6 +259,7 @@ import {
   fbValtype,
   fbValtypeNullable,
   mapTypeIdxOf,
+  nulScalarListWrapHeap,
   wBytes,
   wName,
   wSLEB,
@@ -1128,6 +1133,45 @@ function emitStartFnCode(out: i32[]) {
             // mismatches the cell's (`const xs: f64[] = [-2]`, non-const via the negation).
             pendingListKind = letAnnRefListKind(globalStmts[gi])
             pendingListSlot = letAnnRefListSlot(globalStmts[gi])
+            // THE THREE NULLABLE-LIST CELL SEEDS. A bare `null` is never a WasmGC
+            // constexpr (`isConstInit` has no `NullLit` arm), so EVERY `= null` global
+            // routes here — this block, not the global section's constexpr arm, is the
+            // one place a global cell's null rep is decided. The kinds above (map /
+            // struct / bool / string / litunion / closure) were each seeded as they were
+            // added; the three LIST cells never were, and a plain
+            // `const g: i32[] | null = null` therefore reached `emitNullLitNode` with an
+            // empty context and rejected the whole module — while the same annotation on
+            // a LOCAL lowered fine (`emitLetDeclStmt`'s kind ladder seeds all three).
+            // Each mirrors that ladder exactly.
+            //
+            // Kind 15, the i32-backed `i32[] | null`: `ref.null $lTypeIdx`.
+            const savedSNL = pendingNulList
+            if gck == "nullist" { pendingNulList = true }
+            // The DISTINCT-backing nullable scalar lists (`string[]|null`, `f64[]|null`,
+            // `i64[]|null`, `f32[]|null`): `ref.null $wrapper` for a bare `null`, and the
+            // leaf build code so a LIST-valued init builds that same wrapper rather than
+            // the i32 list. `nulScalarListWrapHeap` is -1 / `nulScalarListBuildKind` 0 for
+            // every other kind, so both are inert elsewhere.
+            const gSLK = nulScalarListBuildKind(gck)
+            if gSLK != 0 { pendingListKind = gSLK }
+            const gSLH = nulScalarListWrapHeap(gck)
+            if gSLH >= 0 { pendingNulRefHeap = gSLH }
+            // Kind 18, a nullable REF array (`i32[][] | null`, `S[] | null`): the null is
+            // THIS global's element wrapper (`rlWrapIdx[slot]`), the same slot the cell's
+            // valtype selects at `emitGlobalSection`. Armed ONLY when the initializer IS a
+            // bare `null` — the #964 SEED-LEAK gate the local ladder and the call-argument
+            // boundary both spell, and it is load-bearing here: a LIST-literal init whose
+            // ELEMENT is null (`const g: (S | null)[] | null = [null]`) must lower that
+            // element as `ref.null $S`, and an un-gated seed retypes it to the wrapper —
+            // `array.new_fixed[0] expected (ref null $S), found ref.null $rlWrap`.
+            if gck == "nulreflist" {
+              if pendingListSlot >= 0 && pendingListSlot < rlWrapIdx.length {
+                const gnraInit = P.nodes[unwrapParen(g.letInit)]
+                if gnraInit is NullLit {
+                  pendingNulRefHeap = rlWrapIdx[pendingListSlot]
+                }
+              }
+            }
             // A nullable-CLOSURE global (kind 19) lowers a bare `null` init as
             // `ref.null $cloStruct`; a function init builds the (non-null) closure value.
             const savedSNC = pendingNulClosure
@@ -1162,12 +1206,18 @@ function emitStartFnCode(out: i32[]) {
             pendingNulBool = false
             pendingNulString = false
             pendingNulClosure = savedSNC
+            pendingNulList = savedSNL
             pendingMapSlot = -1
             pendingStructIdx = -1
             pendingListKind = 0
             pendingListSlot = 0
             pendingLitUnion = 0
             pendingNulLitUnion = false
+            // The ref-heap seed is consumed-and-cleared by `emitNullLitNode`, but a
+            // NON-null init leaves it armed — so clear it here too, else the next
+            // global's bare `null` would take THIS global's wrapper. (The `nulmap` arm
+            // above has always seeded it; the two list arms added here do too.)
+            pendingNulRefHeap = -1
           }
           const setPrev = wTarget(bodyExpr)
           fbGlobalSet(userGlobalIdx(gi))
