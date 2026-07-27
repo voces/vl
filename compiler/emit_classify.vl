@@ -10165,19 +10165,83 @@ export function checkArrName(name: string) {
   )
 }
 
-// True when `name` is `T[]` for some declared FuncDecl type parameter `T`.
+// True when `name` is `T[]` for some declared type PARAMETER `T`. VL binds a type
+// parameter at TWO declaration kinds and this predicate must know both: a FuncDecl
+// (`function at<T>(xs: T[])`, whose names `collectA`'s pre-pass gathers into
+// `genTyParamNames`) and a generic type ALIAS (`type Box<T> = { v: T[] }`, whose names
+// the parser folds into the declared name and `gaeCollectDecls` splits back out into
+// `gaeParams`).
+//
+// Knowing only the FuncDecl half is what made `type Box<T> = { v: T[] }` an emit error
+// (`"only i32[] arrays and struct/union element arrays are supported"`) for EVERY element
+// type including the i32 the message names as supported — the alias body's `T[]`
+// annotation node fell past this arm to `collectA`'s `checkArrName`, which sees the
+// UNSUBSTITUTED `T[]`. The reject fires on the DECLARATION, so it needs no application at
+// all. Same asymmetry shape as #1218 (`monoArgTyName`'s array cascade knowing two of the
+// six reps while the scalar cascade below it named them all): one classifier taught half
+// of a set its sibling already had whole.
+//
+// Skipping is right for both halves for the same reason. A generic alias declares NO
+// concrete struct — `collectS` skips it (`gaeLtAt(tdName) < 0`) and each APPLICATION
+// interns its own substituted shape through `gaeEnsure` — exactly as a generic original
+// FuncDecl is replaced by its instances and never emitted. So neither declaration's
+// annotations should force or validate a heap type; the instances' pinned names do.
+//
+// A parameter name that ALSO names a REAL type is not a parameter, and the SHADOW GUARD
+// below is what says so. The checker already rules this way: given
+// `type Box<i32> = { v: i32 }` it resolves the field to the BUILTIN and reports
+// `Box<string>` as `{v: i32}` — the shadowing "parameter" binds nothing. Without the guard
+// this arm would swallow a genuine `i32[]`/`boolean[]` annotation elsewhere in such a
+// program, leaving `lUsed`/`aUsed` unforced and the list valtype dangling — invalid wasm
+// that `vl check` passes. That hole is PRE-EXISTING on the FuncDecl half
+// (`function id<i32>(v: i32)` alongside an `i32[]` param is invalid wasm on master); the
+// guard closes it for both halves at once rather than extending it to a second one.
+//
+// The guard is `checkArrName`'s own accept set, read as a predicate — which is exactly the
+// right bound: this arm exists ONLY to spare the next arm's `checkArrName` a name it would
+// wrongly reject, so any name that call would ACCEPT must stay with it (it is the arm that
+// forces the list's heap types). Earlier arms already claimed the `string[]` / ref-array /
+// `f64[]` / `i64[]` / `f32[]` spellings, so those need no mention here.
 export function genTyParamArr(name: string) {
-  if genTyParamNames.length == 0 { return false }
+  if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
   // The array-name grammar at its two homes. The TEST stays in front of the CUT exactly as
   // the inline compares did (`nameIsArray` IS the `n < 2` bound plus those two compares),
   // and the `""` a non-array cut yields never matches a declared type-parameter name — so
   // the guard is kept rather than folded, per `arrElemNameRaw`'s own rule about `"[]"`.
   if !nameIsArray(name) { return false }
-  const base = arrElemNameRaw(name)
+  if nameIsI32Array(name) { return false }
+  if nameIsRefArray(name) { return false }
+  // The array grammar's cut, taken to the LEAF (`arrLeafNameOf`) rather than one level:
+  // `T[][]` is as much a type-parameter array as `T[]` is, and the one-level cut left
+  // `"T[]"`, which matches no parameter name — so a NESTED parameter array reached
+  // `checkArrName` and was rejected by a message about i32 element types, on BOTH halves
+  // (`type Box<T> = { v: T[][] }` and `function n<T>(xs: T[][])`), while the concrete
+  // `i32[][]` lowered fine. The peel does NOT make the nested case work: it is still an
+  // emit error, now raised by the passes that actually own the gap (the array-literal
+  // lowering's "nested arrays are not supported" for the alias, `monoArgTyName`'s
+  // documented one-level `[]` scope for the FuncDecl). What it removes is this arm
+  // ANSWERING WRONG about a name that is plainly a type-parameter array. Every name the
+  // peel newly claims was a hard emit error before it, so no working program moves.
+  const base = arrLeafNameOf(name)
   let i = 0
   while i < genTyParamNames.length {
     if genTyParamNames[i] == base { return true }
     i = i + 1
+  }
+  // The generic-ALIAS half. `gaeParams` stores the RAW parameter text per declaration
+  // ("T", "A,B"), so the split is `gaeSplitArgs` — the same cut `gaeEnsure` makes on the
+  // same column, not a second grammar. A program with no generic alias has an empty
+  // registry and this loop never runs.
+  let gi = 0
+  while gi < gaeBases.length {
+    const pnames: string[] = []
+    gaeSplitArgs(gaeParams[gi], pnames)
+    let pj = 0
+    while pj < pnames.length {
+      if pnames[pj] == base { return true }
+      pj = pj + 1
+    }
+    gi = gi + 1
   }
   false
 }
