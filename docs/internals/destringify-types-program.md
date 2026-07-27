@@ -22026,7 +22026,7 @@ the measured zeros are published rather than read as agreement.
 The follow-up #1176 filed (D-SIGSKIP landed in between, so it is no longer the section directly
 above). **NET parse count 0**; no resolver retired, no type-name
 parse added, and **zero observable behaviour change** — the corpus A/B is byte-, diagnostic- and
-run-identical on all 1,407 files. What lands is `compiler/typecheck.vl`'s `annotPart` as a
+run-identical on all 1,408 files. What lands is `compiler/typecheck.vl`'s `annotPart` as a
 `{[string]: string}` map instead of two parallel `string[]`s, which is the SELF-COMPILE entombment
 for the assignment-boundary map-shape fix that shipped in #1176.
 
@@ -22034,6 +22034,10 @@ for the assignment-boundary map-shape fix that shipped in #1176.
 
 The claim was that master's compiler miscompiled this spelling and the fix's own compiler does not.
 It is now closed at both ends, from the PUBLISHED seed each time:
+
+Both rows below were taken with this branch based on **`59fc905`**, so the two `next.wasm` figures
+are directly comparable — that pairing is the whole argument and it does not survive a rebase, so it
+is recorded at the base it was measured on:
 
 | seed | `next.wasm` | ladder |
 | --- | --- | --- |
@@ -22043,6 +22047,20 @@ It is now closed at both ends, from the PUBLISHED seed each time:
 **The same source, the same byte count, opposite verdicts.** The only variable was whether the seed
 carried the fix — which is what makes this a bootstrap ordering constraint rather than a defect in
 either revision.
+
+**REBASED THREE TIMES MID-REVIEW, AND RE-MEASURED FROM SCRATCH EACH TIME RATHER THAN CARRIED OVER.**
+Master moved under this branch while it was in flight (a `$fnsig`/array-name slice, then two
+comment-cleanup slices). Any slice that edits `compiler/*.vl` moves every artifact size, so **the
+1,035,476 pairing above is not reproducible at HEAD and must not be re-derived** — it is the record
+of a measurement taken at `59fc905`, which is where the two rows were comparable. The reproducible
+claim at any later base is the weaker but sufficient one: **the ladder holds from the published
+seed**, in 2 compiles, with `stage3 == stage4` byte-for-byte.
+
+Two things worth keeping from those rebases. The seed cross-check was re-run at every base and held
+every time, which is what keeps "`seed-latest` tracks master" from being an assumption. And the two
+comment-only slices produced a **byte-identical compiler** — the fetched seed's hash did not move
+across them — so "the hash is unchanged" is NOT by itself evidence that a republish has not landed;
+only the rebuild-and-`cmp` cross-check separates those two cases.
 
 **THE REPUBLISH WAS VERIFIED, NOT INFERRED.** `seed-latest` republishes on a master push and that
 job's completion is not observable from the branch. Three checks before any gate leg was believed:
@@ -22094,17 +22112,25 @@ This doc is append-only, so the earlier text stands and the correction is made h
 
 ### GATE — every leg from the FRESHLY FETCHED published seed
 
-`refresh-compiler.sh --prove-fixpoint` RC=0 (2 compiles, 1,035,476 B) · `native-fixpoint.sh` RC=0
+Re-run in full at each rebase base, never carried over:
+`refresh-compiler.sh --prove-fixpoint` RC=0 (2 compiles) · `native-fixpoint.sh` RC=0
 (stage3 == stage4 byte-for-byte) · `lint-self.sh` RC=0 · `rep-fuzz-check.sh` `exact ✅` ·
 `deno check tests/cases_wasm_test.ts` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test`
-**2,145 / 0 / 8**, equal to the `59fc905` baseline.
+**2,146 / 0 / 8**, equal to the master baseline at the same head.
 
-**Suite A/B, same tree, same session, both seeds: 2,145 / 0 / 8 on each.** Matching totals hide
+**Suite A/B, same tree, same session, both seeds: 2,146 / 0 / 8 on each.** Matching totals hide
 movement in both directions in general, but not here: with **zero failures on both sides** no test
 can have swapped verdicts. **IGNORED NAME SETS IDENTICAL**, both files asserted non-empty (8 each) —
 and 8 rather than 14, i.e. the six `selfhost_native_opt` (`vl build -O`) tests actually ran.
 
-**Corpus A/B, 1,407 files, file sets identical: ZERO differing records.** Every emitted module is
+**A FLAKY TIMING TEST SURFACED, ON MASTER'S OWN SEED.** The first master-seed run failed
+`vl_check_hygiene_test.ts`'s "adversarial `--exclude` glob completes (no exponential backtrack)" at
+**32,907 ms** against its threshold. Run alone the whole file takes **331 ms**. It is a wall-clock
+threshold inside a `--parallel` suite on a machine that had corpus sweeps running, and it was
+measuring MASTER's compiler — so it is load sensitivity, not a regression. Recorded rather than
+silently re-run: a timing assertion in a parallel suite reports the scheduler as often as the code.
+
+**Corpus A/B, 1,408 files, file sets identical: ZERO differing records.** Every emitted module is
 byte-identical, every diagnostic identical, every run output and rc identical. That is the expected
 shape for this change and it is the strongest available statement of it: the map spelling is an
 internal data-structure choice inside the checker with no reachable consequence for any program.

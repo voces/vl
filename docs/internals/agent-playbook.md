@@ -70,12 +70,12 @@ validator message alone — the disassembly is the debugging view of `vl build` 
 - **`npm ci` is load-bearing for the gate, not just the build.** The six
   `selfhost_native_opt` (`vl build -O`) tests gate on
   `node_modules/.bin/wasm-opt` and SELF-IGNORE when it is absent — silently, as
-  6 extra "ignored" rather than any failure. With `SELFHOST_NATIVE_ALIGN=1` the
-  suite reads 2145/0/**8** with binaryen present and 2145/0/**14** without, and a
-  whole slice of new opcodes shipped having never once been through `-O`. **If
-  you see 14 ignored, fix the environment before reading any number.** Compare
-  the ignored NAME SET, both files asserted non-empty — an empty-vs-empty diff is
-  clean and means nothing.
+  **six extra "ignored"** rather than any failure. A whole slice of new store
+  opcodes shipped having never once been through `-O` for exactly this reason.
+  **Read the ignored COUNT before reading the pass count**: six more than the
+  branch's baseline means binaryen is missing, not that anything changed. Diff the
+  ignored NAME SET against the baseline with both files asserted non-empty — an
+  empty-vs-empty diff is clean and means nothing, which has happened here.
 - Per commit: `git status tests/golden/` empty (+ the REJECT_CASES loop if
   the checker got more permissive).
 - Before finishing: `deno test -A --no-check tests/selfhost_emit_fixpoint_test.ts`
