@@ -26796,3 +26796,311 @@ quoting "12 left" should quote **7** as the removable figure.
   faithful, now with their reach measured and the blocking defect pinned.
 * **The f32 inferred-return-binding fix** — filed with a witness, not attempted; it is an
   `emit_classify`/`emit_base` type-forcing question, outside this partition.
+
+## D-GRAMPRED — the tier BELOW whole-spelling equality: thirteen sites that ask a GRAMMAR question by indexing characters; twelve close, and two of the record's own declines are refuted (off master `2583f02`)
+
+D-WHOLESPELL closed the tier where a composite type is decided by matching its whole rendered
+spelling (`nm == "f64[]"`). The tier underneath is **character surgery that asks a GRAMMAR
+question** — *is this a shape? a generic application? a map? a list?* — by indexing and slicing.
+It is closer to the thing the rule forbids than the equality tier was, because an equality at
+least names a type; a character index names nothing at all.
+
+Thirteen sites, ten in `emit_base.vl` and three in `emit_collect.vl`. **Twelve close. One
+declines, with the measurement.** A fourteenth site of the same family, not on the brief's list,
+closes with them.
+
+### THE CENSUS — RE-DERIVED, AND THE INSTRUMENT
+
+**UNIT A — GRAMMAR-PREDICATE CHARACTER TESTS.** One textual comparison of a type-name character
+against a character literal, in non-comment code, where the index is a POSITION EXPRESSION
+(`0`, `1`, `len - 1`, `len - 3`, `i + 1`) rather than a bare walk cursor. A bare cursor
+(`name[i] == '<'`) is a SCANNER, not a name-shape predicate, and is excluded — the same boundary
+#1186 drew when it excluded `lexer.peek2() == '{'`. The stripper is string-literal aware (a `//`
+inside a `"…"` cannot truncate a line) and keeps CHAR literals verbatim: a stripper that blanks
+`'{'` as a string makes every character census read 0.
+
+| file | master `2583f02` | this PR | Δ |
+|---|---:|---:|---:|
+| `emit_base.vl` | 19 | **9** | −10 |
+| `emit_collect.vl` | 4 | **0** | −4 |
+| **both** | **23** | **9** | **−14** |
+
+The instrument reproduces the brief's thirteen sites exactly and finds three more occurrences in
+these files that are NOT this grammar, named here so a later census does not chase them:
+`raw[i + 2] == '{'` (string-ESCAPE lexing, not a type name at all), `ann[fa - 1] != ')'` (the
+ARROW grammar) and `name[sp + 1] == '['` (`nameIsStructWithMapField`'s `{[`-ANYWHERE substring
+search, a `strContains` in disguise). It also finds a **fourteenth site of this family that the
+brief did not list** — `annGenAppDecompose`'s own `ann[n - 1] != '>'`, which is the exact
+predicate `emit_collect:3453` spells out — and that one closes with the rest.
+
+So the debt figure, stated exactly: **20 hand-written grammar-predicate character tests → 1**,
+with **5** of them now living in **3 named homes** and 3 non-members untouched.
+
+### THE FOUR PREDICATES, AND THE THREE HOMES THAT WERE MISSING
+
+The thirteen sites are four grammar questions — `{`…`}` is a shape, `{[` is a map, `<`…`>` is a
+generic application, trailing `[]` is a list — and the striking thing about the census is **how
+much of the answer already existed**. `nameIsShapeOpen`, `nameIsShapeSpanEnds`, `nameIsParenOpen`,
+`nameIsParenSpanEnds`, `nameIsArray` and `arrElemNameRaw` are all homes already, several of them
+already imported by the files spelling their bodies out by hand. What was missing was three
+predicates that no home covered:
+
+| home | predicate | callers |
+|---|---|---:|
+| `nameIsMapOpen` | `len >= 2 · '{' at 0 · '[' at 1` | 3 |
+| `nameIsBraceSpanEnds` | `len >= 2 · '{' at 0 · '}' at last` (NO map exclusion) | 2 |
+| `annGenAppSpanEnds` | `len >= 3 · '>' at last · gaeLtAt > 0` | 2 |
+
+With those three, the brace family closes into a lattice rather than a list:
+
+* `nameIsShapeOpen` = `len >= 2 · OPEN · NOT2ND` (lives in `typecheck.vl` since D-SHAPEDOWN)
+* `nameIsMapOpen` = `len >= 2 · OPEN · 2ND` — **the shape opener's exact complement**
+* `nameIsBraceSpanEnds` = `len >= 2 · OPEN · CLOSE`
+* `nameIsShapeSpanEnds` = the SPAN home ANDed with the OPEN home
+
+and every brace question the emitter asks is one of those four or a conjunction of them.
+`nameIsMap` becomes `nameIsMapOpen ∧ ¬nameIsArray`; `annObjFieldSplit`'s tri-state becomes
+`nameIsBraceSpanEnds` (is it a group at all) then `nameIsMapOpen` (which kind).
+
+**#1186 measured the wider brace predicate and left it un-homed** — correctly refusing to route
+its sites to `nameIsShapeSpanEnds`, which would have blinded the emitter to map-valued shapes.
+But *leaving a predicate un-homed* and *leaving it hand-copied* are different decisions, and only
+the first was forced.
+
+### TWO SITES DO NOT GET A HOME — THEY GET DELETED
+
+`nameIsStructWithUnionField` and `nameIsStructWithLitUnionField` each guarded their RECURSION with
+`ftype.length >= 2 && ftype[0] == '{' && ftype[ftype.length - 1] == '}'`. The recursion's own first
+line is `canonBareShapeName(ftype)`, whose first two tests are `length < 2` and that identical
+endpoint pair. **The guard was redundant, not un-homed.** Both functions are pure, so the guard
+answers `false` on exactly the inputs the call already answers `false` on. Four character tests
+delete rather than move. (D-QUOTEWALK/A's precedent: deleted rather than aliased.)
+
+### PROVABLY EQUIVALENT, NOT MERELY MEASURED
+
+Every route is an identity over ALL inputs, not over the inputs tried:
+
+* `nameIsMap`: `len >= 2 ∧ ¬array ∧ [0]=='{' ∧ [1]=='['` reassociates to
+  `nameIsMapOpen ∧ ¬nameIsArray`; `nameIsArray` is pure so its position does not matter.
+* `annObjFieldSplit`: the `n >= 3` conjunct on its map test was **inert** — at `n == 2` the
+  character at index 1 IS the closing `}` the line above just demanded, so it can never be `[`.
+* `canonBareShapeName`: its first three lines are `nameIsShapeSpanEnds` character for character.
+* `parenUnionArrElemName`: with `nameIsArray` established one line above, `arrElemNameRaw(name)`
+  is `name` minus exactly two characters, so `elem[0] == name[0]` and
+  `elem[len-1] == name[len-3]` — the OPEN + `length - 3` CLOSE pair IS
+  `nameIsParenSpanEnds(elem)`.
+* `emit_collect`'s closure-array cheap reject: `nameIsArray` is STRICTLY NARROWER than the
+  hand-written trailing-`]` test, and both of `cloArrElemNameOf`'s legs open with `nameIsArray`
+  themselves — so every name the narrower gate now skips is one the call would have answered
+  `""` for. Fewer scans, identical answers.
+
+### THE STRONGEST PROOF, TAKEN
+
+**This branch's compiler compiles master's FROZEN source into a module byte-identical to master's
+own compiler's output** — `5be620aa…`, which is also the freshly fetched published seed
+byte-for-byte, so master is at its own fixpoint and the comparison is against master's real
+output rather than a rebuild of it. `cmp` rc=0.
+
+### SABOTAGE — NINE COMPILERS, TWO CHANNELS FINER THAN THE SUITE
+
+Each sabotage is a one-line edit at exactly one closed site, rebuilt into a whole compiler (all
+nine source trees distinct from the branch's and from each other). Graded on wasm sha256 over the
+1,261 emitting corpus files and on the corpus run-stdout tree (1,627 entries) — the two channels
+the record names as finer than pass/fail.
+
+| sabotage | site | wasm sha diffs | run stdout diff lines |
+|---|---|---:|---:|
+| **S0 control** | branch source, unmodified | **0** | **0** |
+| **S5** | `parenUnionArrElemName` paren CLOSE dropped | **18** | **165** |
+| **S7** | closure-array cheap reject made wrong | **1** | **5** |
+| S1 | `annObjFieldSplit` MAP arm deleted | 0 | 0 |
+| S2 | `canonBareShapeName` routed to the WIDE brace home | 0 | 0 |
+| S3 | union-field RECURSION deleted | 0 | 0 |
+| S4 | litunion-field RECURSION deleted | 0 | 0 |
+| S6 | the DECLINED narrowing taken (`nameIsMap` for `nameIsMapOpen`) | 0 | 0 |
+| S8 | generic-decl trailing-`>` half dropped | 0 | 0 |
+
+The comparator is live in BOTH directions inside the same harness: S0 reads 0/0 and S5 reads
+18/165.
+
+### GRADING THE SIX ZEROS — AND THE INSTRUMENT THAT WAS DEAD FIRST
+
+Fourteen DIVERGENCE POISONS, each an `emitFail` on exactly the input set where the sabotaged
+spelling and the shipped one disagree, each shipped with an INVERTED CONTROL that must fire.
+
+**Take 1 used `print` inside the compiler and all fourteen read 0 — controls included.** `vl
+build` does not wire `__print_i32__`, so every poisoned compiler failed to INSTANTIATE and the
+probe read 0 for the wrong reason. **A `print` inside the compiler is not a channel.** Only the
+controls caught it; a poison suite without inverted controls would have shipped six confident
+zeros that measured nothing.
+
+| poison | measures | fires on |
+|---|---|---:|
+| P1 | `annObjFieldSplit`'s MAP arm taken (S1's divergence) | **0** |
+| P1c | `annObjFieldSplit` reached at all — CONTROL | 2 |
+| P2 | `canonBareShapeName` sees a MAP name (S2's divergence) | **25** |
+| P2c | the gate passes — CONTROL | 72 |
+| P3 | union-field recursion returns true (S3's divergence) | 5 |
+| P3r | the DELETED guard consulted positively | **14** |
+| P3e | the enclosing loop body reached — CONTROL | 27 |
+| P4 | litunion recursion returns true (S4's divergence) | **0** |
+| P4r | the DELETED guard consulted positively | **10** |
+| P4e | the enclosing loop body reached — CONTROL | 27 |
+| P6 | the DECLINED narrowing's divergence set | **5** |
+| P6c | a bare-map arm — CONTROL | 53 |
+| P8 | a decl name with `<` and no trailing `>` (S8's divergence) | **0** |
+| P8c | a well-formed generic decl — CONTROL | 38 |
+
+**The two deletions are EXERCISED, not untested.** The characters deleted from the two recursion
+guards were consulted positively on **14** and **10** corpus files, and the corpus A/B says every
+answer is unchanged. That is the difference between "provably redundant" and "never reached", and
+only the poison can tell them apart.
+
+**P2 = 25 with S2 = 0 is the slice's most interesting pair.** `canonBareShapeName` really is
+handed map names, on 25 corpus files — so the population #1186 was protecting is live. Dropping
+its map reject STILL changes nothing, because `shapeInnerFieldSplit` on `[string]:i32` yields no
+top-level-union field and the function rejects one layer down anyway. So the conjunct is REACHED
+and NOT LOAD-BEARING: #1186's decline cost nothing, and this slice's route is faithful without
+depending on that.
+
+**P1 = 0 and P8 = 0 are measured-empty populations, not coverage gaps.** `annObjFieldSplit` is
+reached on 2 corpus files (`generics/nested-generic-call.vl`, `generics/swap.vl`) and never with a
+map; and a hand-written witness for the map arm — a generic alias with a map-typed field,
+`type MapBox<T> = { m: {[string]: T} }` — is an **EMIT REJECT on master and on this branch alike**
+(`emitProgram: map value type has no interned slot`). The tri-state's `0` arm is therefore
+unreachable BEHIND a defect, not merely untested — the distinction #1219 drew for its f32 arm.
+A decl name carrying a `<` but no trailing `>` is likewise not producible by the parser.
+
+### THE WIDTH DECISION, AND ITS POPULATION IS NOT EMPTY
+
+#1219's sharpest finding was "check the home's WIDTH, not just its name". This slice had one such
+call and it went the other way: `emit_collect`'s union-arm map test could route to the EXISTING
+`nameIsMap`, and must not. `nameIsMap` is `nameIsMapOpen` MINUS the arrays, so an arm that is a
+LIST of maps (`{[string]:i32}[] | f64`) is rejected by it — while the WHOLE union name still opens
+`{[`, so `nameIsMap` matches the union and the map-VALUE recursion swallows it.
+
+**P6 measures that divergence set at 5 files, not zero** — `maps/array-of-map-union-arm.vl`,
+`maps/nested-map-array-union-arm-read.vl`, `unions/variant-nullable-list-field.vl`,
+`closures/error-nullable-closure-map-array-union-result.vl`, plus a hand-written
+`{[string]:i32}[] | f64` probe that compiles and runs correctly. S6 then measures the downstream
+consequence at 0. **Live population, no graded consequence** — which is exactly when a narrowing
+must NOT ship: it would be a silent behaviour change dressed as a dedup, and the fact that today's
+corpus does not observe it is not a licence.
+
+### NO NEW FIXTURE, AND THAT IS A MEASUREMENT
+
+Every shape this slice's routes touch already has a NAMED corpus witness, established by the
+poison hit sets rather than by reading test names: the paren-array span (18 files), the
+closure-array reject (`closures/nullable-closure-array-param-null-only.vl`, the file the code
+comment cites), the union-field recursion (4 files), the litunion recursion (10 files reaching
+it), the map-arm width (4 files). Two hand-written probes were built and then discarded as
+DUPLICATE coverage once the poisons named their corpus twins. The suite therefore lands at
+master's magnitude exactly — 3,182 / 0 / 8 — which for a provably-equivalent refactor is the
+cleanest signal available.
+
+### TWO OF THE RECORD'S OWN CLAIMS ARE REFUTED, BY LOOKING RATHER THAN REASONING
+
+1. **`canonBareShapeName` was never one of the "four `emit_base` sites lacking the `[1] != '['`
+   conjunct".** #1186's Class-2 list names it, and that claim is live today in a code comment in
+   `emit_base.vl`. `git show fa5a6bb:compiler/emit_base.vl` shows
+   `if name[1] == '[' { return false }` on the line after its endpoint test **at #1186's own
+   commit**. It IS `nameIsShapeSpanEnds` exactly, and it now says so by calling it. **The wider
+   predicate's tree-wide population is 8, not 9, and the `emit_base` four is three.** The comment
+   is corrected in place.
+
+2. **D-PARENHOME's in-code decline at `parenUnionArrElemName` is wrong about which object the
+   question is about.** It reads: *"`nameIsParenSpanEnds` asks about the LAST character and would
+   answer for the `]`, so routing this line would be a different question, not a shorter one."*
+   True of the WHOLE NAME; false of its ELEMENT, which is the object the `length - 3` spelling was
+   always talking about. `nameIsParenSpanEnds(arrElemNameRaw(name))` is the OPEN + CLOSE pair
+   character for character, and it subsumes the `nameIsParenOpen` line above it as well.
+
+3. **And a claim in this slice's own brief.** It frames the thirteen sites as "each answering a
+   question the Ty arena already knows structurally", and instructs measuring `nodeTyIx` coverage
+   before migrating. Measured per site: **ten of the thirteen sit in functions whose only
+   parameter is a rendered string** — `nameIsMap(name: string)`, `annObjFieldSplit(ann: string)`,
+   `canonBareShapeName(name: string)`, the two `ftype` field texts. There is no node, no `tyIx`,
+   and nothing to ask the arena. Of the three with a handle: `emit_collect:3453` holds a
+   `TypeDecl` node, but a generic DECLARATION (`Box<T>`, `T` unbound) has no arena type at all;
+   `emit_collect:3988` reads a `splitUnionAtoms` output; and `emit_collect:5178` reads
+   `nonNulBaseOf(tyNameOf(i))`, whose sibling scan four lines above carries an explicit
+   MEASURED-AND-REFUTED note (the arena reading is alias-AWARE where the name walk is
+   alias-BLIND, disagreeing on 15 corpus files in the widening direction). **`nodeTyIx` coverage
+   was not the blocker at this tier; the absence of any node in scope was.** The available and
+   correct move is the grammar home, and it is the same move the arena migration will want
+   later — a single named predicate is one thing to re-point at the arena, thirteen inlined
+   character tests are thirteen.
+
+### COUNTS — ALL THREE UNITS
+
+* **UNIT A, grammar-predicate character tests (my two files): 23 → 9.** Hand-written members of
+  this grammar **20 → 1**; 5 now live in 3 named homes; 3 non-members untouched.
+* **UNIT B, the TRACKED metric — CORE 23-resolver call sites (my two files): 95 → 96 (+1).**
+  Decomposed exactly: `nameIsArray` in `emit_collect` 5 → 6, the closure-array cheap reject
+  becoming the array grammar's TEST half at its home. **`emit_base` is FLAT at 51**, every other
+  resolver flat. The metric rises by one because exactly one route lands on an ON-LIST resolver;
+  the other eleven land on homes that are not on the list — the same reading #1186 reported when
+  its CORE column did not move at all. **The rising-CORE effect is a property of WHICH grammar is
+  homed, not a law of the program.**
+* **UNIT C, named calls to the 11 grammar homes this slice touches, tree-wide: 128 → 138 (+10).**
+  `nameIsMapOpen` +3, `nameIsBraceSpanEnds` +2, `annGenAppSpanEnds` +2, `nameIsShapeSpanEnds` +1,
+  `nameIsParenSpanEnds` +1, `arrElemNameRaw` +1, `nameIsArray` +1, `nameIsParenOpen` **−1**
+  (`parenUnionArrElemName` stopped asking the opener separately). `nameIsShapeOpen` is FLAT at 10:
+  `nameIsShapeSpanEnds` still asks it once, just after the span home rather than before it.
+* **Binary 1,034,883 → 1,034,648 B (−235)**, attributed by rebuilding each file's change alone:
+  `emit_base.vl` **−143 B**; `emit_collect.vl` **−92 B** by subtraction, exactly additive. The
+  `emit_collect`-only tree cannot be built in isolation (it imports exports `emit_base` does not
+  yet have) — recorded rather than papered over, and the exact additivity is what stands in for it.
+
+### GATE — EVERY LEG, EXIT CODE TAKEN WITHOUT A PIPE
+
+| leg | rc | result |
+|---|---:|---|
+| `fetch-seed.sh` (freshly fetched, published) | 0 | 1,034,883 B; **verified to be master's own fixpoint** — it compiles frozen master source to itself byte-for-byte |
+| `refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint at 2 compiles, 1,034,648 B |
+| `native-fixpoint.sh` | 0 | stage3 == stage4, 1,034,648 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,182 passed / 0 failed / 8 ignored** — master's magnitude exactly, ignored-name set identical |
+| `lint-self.sh` (incl. `vl fmt --check`) | 0 | clean |
+| `rep-fuzz-check.sh` | 0 | exact, 1 baselined (0 unsound / 1 reject), 0 new / 0 stale |
+| corpus A/B, 5 channels, 1,494 files | 0 | **0 build-status, 0 wasm-sha256, 0 diagnostic-text, 0 run-status, 0 run-stdout diffs** |
+| fuzz A/B, pinned seeds 1–14 × depths 4–6 × 300 × {plain, declared} | 0 | **25,200 programs/side; out-dir trees byte-identical** (`diff -r` = 0 lines once the per-run `mktemp -d` name is normalised — the raw 9,394-line diff was that path and nothing else). Failure-class totals identical: 1 INVALID-WASM + 2,238 REJECT, 2,239 kept cases each side |
+| strongest proof: candidate compiles FROZEN master source | 0 | `5be620aa…` — byte-identical to master's own output |
+
+### METHOD NOTES
+
+* **A poison suite without INVERTED CONTROLS is not a measurement.** Take 1's fourteen zeros were
+  a dead instrument, and nothing but the controls distinguished that from fourteen real
+  measured-empty populations. Budget a control per poison, and read the controls FIRST.
+* **"Look for the existing home" has a third part, after "does it exist" and "is it the right
+  WIDTH": is it needed at all?** Two of the thirteen sites wanted neither a home nor a route —
+  the predicate was already re-asked by the function on the next line. A census that only ever
+  routes will never find those.
+* **A `0` on the corpus and a `0` on the divergence poison are different facts.** S3/S4 read 0 on
+  both output channels while P3r/P4r fire on 14 and 10 files: the code is REACHED and the change
+  is EQUIVALENT. Reporting only the first would have read as "untested".
+* **A home's LOCATION follows its callers, not the import graph's aesthetics.** All three new
+  homes sit in `emit_base.vl` beside the family they layer over, and each header names the copies
+  that live outside this partition (`typecheck` ×3 + `emit_classify` ×2 for the brace span,
+  `typecheck` ×2 for the map opener, `emit_classify.gaeEnsure` for the generic span) so the next
+  slice to own those files has the list already made.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **`mapValNameOf`'s `]:` scan (`emit_base:301`)** — the one declined site, and the measurement
+  that justifies it. It is not a hand-written copy of anything in this partition: it IS the
+  emitter's home for the map-value cut, and its twins (`typecheck.nameToTyReal`'s map arm and
+  `typecheck.mapShapeKeyName`) are both PRIVATE and both in a file this slice may not edit. The
+  arena answer already exists — `emit_rep.tyMapValOf`, whose header names itself "the structural
+  form of `mapValNameOf(name)`" — but of `mapValNameOf`'s ~24 call sites across three files,
+  only two have a node in scope at all; the rest read a rendered name out of a string COLUMN
+  (`rlElemName`, `mvValName`) or a field TEXT. Retiring it is a SOURCES problem in the
+  SCORECARD CORRECTION's sense, not a site problem, and it is not a thirteen-site slice's work.
+* **Moving `nameIsBraceSpanEnds` and `nameIsMapOpen` down into `typecheck.vl`** beside
+  `nameIsShapeOpen`, which is where D-SHAPEDOWN's inversion would eventually put them so the
+  checker's five copies can route too. `typecheck.vl` is another slice's partition here.
+* **Narrowing the union-arm map test to `nameIsMap`.** Population measured live at 5 files;
+  consequence measured at 0. Faithful ships.
+* **The generic-alias map-field EMIT REJECT** (`emitProgram: map value type has no interned
+  slot`) — reproduced on master and on this branch, filed with a witness, not attempted. It is
+  what makes `annObjFieldSplit`'s map arm unreachable, and it is an `emit_classify` interning
+  question, outside this partition.

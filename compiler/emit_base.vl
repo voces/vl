@@ -1506,6 +1506,31 @@ export function nameIsI32ListArray(name: string) {
   if elem == "" { return false }
   return nameIsI32Array(elem)
 }
+// THE ONE HOME of the MAP-NAME OPENER: a `{` at index 0 whose NEXT character is `[` — the
+// `{[K]:V}` index-signature spelling the parser synthesizes. Over the `length >= 2` names
+// that open with `{` this is the exact COMPLEMENT of `typecheck.nameIsShapeOpen` (`{` NOT
+// followed by `[`), and it is the half of the brace grammar #1186 left un-homed: that slice
+// censused the index-1 `'['` test at 27 sites tree-wide and gave a home only to the 20 that
+// spell it `!= '['`.
+//
+// **THIS IS NOT `nameIsMap`, AND THE TWO MUST NOT BE MERGED BY EYEBALL.** `nameIsMap` is
+// this predicate MINUS the arrays: a list-of-maps `{[string]:i32}[]` opens `{[` but is a
+// REF ARRAY, not a bare map, so `nameIsMap` rejects it while this home accepts it. A caller
+// asking "does this name START a map" — a union ARM that must not be swallowed by the
+// map-VALUE recursion, whose whole union name also opens `{[` — wants THIS one; a caller
+// asking "is this name a bare map" wants `nameIsMap`. Routing an arm test to `nameIsMap`
+// would silently narrow it to the non-array arms and re-open the garbled-map-value bug the
+// arm test exists to prevent.
+//
+// Two more copies live OUTSIDE this partition and are named here so a later census does not
+// have to re-derive them: `typecheck.nameToTyReal`'s map arm and `typecheck.mapShapeKeyName`
+// (both private, both in a file this slice may not edit). A third occurrence,
+// `nameIsStructWithMapField`'s `{[`-anywhere scan below, is a SUBSTRING search rather than a
+// name-shape predicate and is not this.
+export function nameIsMapOpen(name: string) {
+  if name.length < 2 { return false }
+  name[0] == '{' && name[1] == '['
+}
 // True if the type-name `name` is a string-keyed MAP `{[string]: i32}` (G8) — the
 // synthetic name `parseType` builds for an index-signature type, which starts with
 // `"{["`. Only `{[string]: i32}` is emittable in this slice (the self-host checker's
@@ -1513,14 +1538,13 @@ export function nameIsI32ListArray(name: string) {
 // map lowering assumes string keys + i32 values. A trailing `[]` (a list-of-maps
 // `{[string]:i32}[]`) is NOT a bare map — that is handled by the ref-array path.
 export function nameIsMap(name: string) {
-  if name.length < 2 { return false }
+  // The MAP-NAME OPENER at its home, carrying its own `length >= 2` bound (this spelled the
+  // same two character compares out inline behind the same bound).
+  if !nameIsMapOpen(name) { return false }
   // A trailing `[]` makes it a LIST of maps, not a bare map — the array-name grammar's
   // TEST half, at its home. (This spelled the same two character compares out inline; at
   // length >= 2 the two readings accept exactly the same names.)
-  if nameIsArray(name) { return false }
-  if name[0] != '{' { return false }
-  if name[1] != '[' { return false }
-  true
+  !nameIsArray(name)
 }
 // True if `name` is a UNION whose FIRST atom is a map (`{[string]: V} | …`) — a name that both
 // STARTS with `{[` (so `nameIsMap` matches it) AND has 2+ top-level atoms. Such a name is a
@@ -1680,12 +1704,19 @@ export function parenUnionArrElemName(name: string) {
   // The array-name grammar's TEST half, at its home (this spelled the same two character
   // compares out inline; `name.length >= 5` is already established above).
   if !nameIsArray(name) { return "" }
-  // The PAREN grammar's OPEN half at its home. The CLOSE test does NOT go with it: this is
-  // the ARRAY-relative spelling, closing at `length - 3` because the last two characters are
-  // the `[]`. `nameIsParenSpanEnds` asks about the LAST character and would answer for the
-  // `]`, so routing this line would be a different question, not a shorter one.
-  if !nameIsParenOpen(name) { return "" }
-  if name[name.length - 3] != ')' { return "" }
+  // The PAREN grammar's SPAN, asked of the ELEMENT rather than of the whole name — the whole
+  // of the OPEN + `length - 3` CLOSE pair this spelled out inline.
+  //
+  // D-PARENHOME declined to route these two lines, on the reasoning that "`nameIsParenSpanEnds`
+  // asks about the LAST character and would answer for the `]`". That is true of the WHOLE
+  // name and false of its ELEMENT, which is the object the `length - 3` spelling was always
+  // talking about: `nameIsArray` is established one line above, so `arrElemNameRaw(name)` is
+  // `name` minus exactly its final two characters, giving `elem[0] == name[0]` and
+  // `elem[elem.length - 1] == name[name.length - 3]`. The pair is therefore
+  // `nameIsParenSpanEnds(elem)` character for character, on every input rather than on every
+  // input tried — and the home's own `length >= 1` bound is covered by `name.length >= 5`
+  // above, which makes `elem` at least 3 characters long.
+  if !nameIsParenSpanEnds(arrElemNameRaw(name)) { return "" }
   // The whole name must be ONE atom — a multi-arm union that merely STARTS with a paren
   // group and ENDS with `[]` (`(boolean|string)[] | (i32|f64)[]`) would otherwise slice an
   // UNBALANCED "inner" (`boolean|string)[]|(i32|f64`) and mis-classify the whole union as
@@ -1805,6 +1836,33 @@ export function nameNamesFunction(name: string) {
 // the span home. This split is the same shape the ARRAY family takes: the character grammar
 // lives one module down, the layers that only the emitter asks for stay here and call it.
 //
+// THE ONE HOME of the BRACE ENDPOINT span: `length >= 2`, a `{` at index 0, and a `}` as the
+// final character — WITHOUT the `name[1] != '['` conjunct, so it accepts a map name as well
+// as a shape. This is the THIRD predicate of the brace family, and the one #1186 measured but
+// did not home: it found the wider spelling written out by hand at every site that needs it
+// and left them alone (correctly — routing them to `nameIsShapeSpanEnds` would have blinded
+// the emitter to map-valued shapes), but leaving a predicate un-homed and leaving it
+// hand-copied are different decisions. The three brace predicates are now
+//
+//   * `typecheck.nameIsShapeOpen`  — `len >= 2 · OPEN · NOT2ND`
+//   * `nameIsBraceSpanEnds`        — `len >= 2 · OPEN · CLOSE`      (this home)
+//   * `nameIsShapeSpanEnds`        — the two of them ANDed, below
+//
+// and `nameIsMapOpen` above is `len >= 2 · OPEN · 2ND`, the shape opener's complement. Every
+// brace question the emitter asks is one of those four or a conjunction of them.
+//
+// **THIS IS NOT `nameIsShapeSpanEnds` AND NOT `emit_classify.nameIsWholeSpanShape`.** It is
+// the WIDEST of the three: it accepts `{[string]:i32}`, which the other two reject, and it
+// accepts `{a:{b:i32}}|{c:i32}`, which `nameIsWholeSpanShape`'s balance walk rejects.
+// Tightening a caller from this home to either of the others is a behaviour change owing its
+// own graded population, not a refactor. Its callers are exactly the sites that must see a map
+// — `annObjFieldSplit`'s tri-state (which then asks `nameIsMapOpen` to tell the two apart) and
+// `nameIsShapeSpanEnds` itself. FIVE more copies live outside this partition
+// (`emit_classify` ×2, `typecheck` ×3) and route here when a slice owns those files.
+export function nameIsBraceSpanEnds(name: string) {
+  if name.length < 2 { return false }
+  name[0] == '{' && name[name.length - 1] == '}'
+}
 // THE ONE HOME of the inline-shape ENDPOINT span: `nameIsShapeOpen` AND the final character
 // is `}`. This is a LAYER over the opener, not a second copy of it — the character compares
 // live once, above.
@@ -1824,14 +1882,19 @@ export function nameNamesFunction(name: string) {
 // The SECOND non-merge, and the one that bites in THIS file: `length >= 2 && name[0] == '{'
 // && name[name.length - 1] == '}'` WITHOUT the `name[1] != '['` conjunct is a DIFFERENT
 // predicate — it accepts a map name, since `{[string]:i32}` opens with `{` and ends with
-// `}`. It is written out **9** times tree-wide (`emit_base` `annObjFieldSplit` /
-// `canonBareShapeName` / `nameIsStructWithUnionField` / `nameIsStructWithLitUnionField`,
-// `emit_classify` ×2, `typecheck` ×3). Routing those four here would silently stop the
-// emitter seeing map-valued shapes, so they are deliberately left alone and named here so a
-// later census does not read them as copies of this home.
+// `}`. That one now has a home of its own, `nameIsBraceSpanEnds` directly above, and this
+// function is written in terms of it: the two are `BRACE-SPAN · NOT2ND` and `BRACE-SPAN`,
+// which is why one can delegate to the other without either widening.
+//
+// #1186 named FOUR `emit_base` functions as carrying the wider predicate — `annObjFieldSplit`,
+// `canonBareShapeName`, `nameIsStructWithUnionField`, `nameIsStructWithLitUnionField` — for a
+// tree-wide count of 9. **`canonBareShapeName` was NOT one of them and never was**: it carried
+// `if name[1] == '[' { return false }` on the line after its endpoint test at `fa5a6bb` itself,
+// making it this predicate EXACTLY, and it now says so by calling this function. The wider
+// predicate's real population is **8**, and the four-in-`emit_base` is three.
 export function nameIsShapeSpanEnds(name: string) {
-  if !nameIsShapeOpen(name) { return false }
-  name[name.length - 1] == '}'
+  if !nameIsBraceSpanEnds(name) { return false }
+  nameIsShapeOpen(name)
 }
 // The inline-shape synthetic name of a STRUCT-ALIAS union decl — a `UnionDecl`
 // with exactly ONE variant that is an inline object shape (`{a:i32,b:i32}`,
@@ -2276,16 +2339,39 @@ export function annFnDecompose(ann: string, outParams: string[]) {
   const ret = ann.slice(fa + 2, ann.length)
   ret
 }
+// THE ONE HOME of the GENERIC-APPLICATION SPAN test: a name whose FINAL character is `>` and
+// which has a `<` at a positive index — `Box<i32>`, `Pair<K, V>`. The TEST half of the
+// `Head<…>` grammar, split out from the decomposition below because two callers want only the
+// boolean and the RAW argument text, not the split argument list.
+//
+// The `>` compare stays in FRONT of `gaeLtAt`'s scan, exactly as the inline spellings had it:
+// running a whole-name scan on every annotation that plainly does not end in `>` would be a
+// work regression. `gaeLtAt(ann) > 0` implies `ann.length >= 2`, so the final-character read
+// below is in bounds for every name that reaches it, and the `n < 3` cheap reject is kept as
+// the fast path it always was — `lt > 0` plus a trailing `>` already forces `n >= 3`, so it
+// decides nothing.
+//
+// `emit_classify.gaeEnsure` carries the identical `length < 3` / `[len-1] != '>'` / `gaeLtAt`
+// triple over the head + RAW-argument-text slices, and is the third caller this home wants; it
+// lives outside this partition and is named here so a later census does not re-derive it.
+export function annGenAppSpanEnds(ann: string) {
+  const n = ann.length
+  if n < 3 { return false }
+  if ann[n - 1] != '>' { return false }
+  gaeLtAt(ann) > 0
+}
 // THE ONE HOME of the GENERIC-APPLICATION decomposition `Head<a1, a2>`: fills `outArgs`
 // with the top-level type arguments and returns the HEAD name, or "" when `ann` is not an
 // application. The same generic-instantiation trio carried FOUR copies of the
 // `ann[n-1] == '>'` + `gaeLtAt` + `gaeSplitArgs(ann.slice(lt+1, n-1))` triple.
+//
+// The three-part TEST is `annGenAppSpanEnds` at its home above; `gaeLtAt` is re-asked here
+// rather than threaded out, and that costs a second scan only on a name that already ends in
+// `>` — every other name is rejected by the character compare before either scan runs.
 export function annGenAppDecompose(ann: string, outArgs: string[]) {
+  if !annGenAppSpanEnds(ann) { return "" }
   const n = ann.length
-  if n < 3 { return "" }
-  if ann[n - 1] != '>' { return "" }
   const lt = gaeLtAt(ann)
-  if lt <= 0 { return "" }
   gaeSplitArgs(ann.slice(lt + 1, n - 1), outArgs)
   const head = ann.slice(0, lt)
   head
@@ -2314,9 +2400,15 @@ export function annObjFieldSplit(
   outTexts: string[],
 ) {
   const n = ann.length
-  if n < 2 { return -1 }
-  if ann[0] != '{' || ann[n - 1] != '}' { return -1 }
-  if n >= 3 && ann[1] == '[' { return 0 }
+  // The BRACE-SPAN home decides "is this a `{…}` group at all", and the MAP-OPEN home tells
+  // the two positive answers apart — the tri-state's whole character surgery, at two homes.
+  // Both spellings are exact: the endpoint pair plus its `n < 2` bound IS `nameIsBraceSpanEnds`,
+  // and once that holds, `ann[1] == '['` IS `nameIsMapOpen` (the length bound and the `ann[0]`
+  // compare are already established). The `n >= 3` conjunct the map test carried was inert —
+  // at `n == 2` the character at index 1 is the closing `}` the line above just demanded, so it
+  // can never be `[`.
+  if !nameIsBraceSpanEnds(ann) { return -1 }
+  if nameIsMapOpen(ann) { return 0 }
   const fields: string[] = []
   gaeSplitArgs(ann.slice(1, n - 1), fields)
   let j = 0
@@ -2406,9 +2498,14 @@ export function shapeInnerFieldSplit(
 // `sNames` key, and its `->` hides a closure field from `annArrowAt`, so any space marks
 // a non-canonical name and rejects it.
 export function canonBareShapeName(name: string) {
-  if name.length < 2 { return false }
-  if name[0] != '{' || name[name.length - 1] != '}' { return false }
-  if name[1] == '[' { return false }
+  // The inline-shape ENDPOINT span at its home. The three lines this replaces —
+  // `length < 2`, the `{`/`}` endpoint pair, and the `name[1] == '['` map reject — are
+  // `nameIsShapeSpanEnds` character for character, on every input rather than on every input
+  // tried. #1186 listed this function among the FOUR `emit_base` sites carrying the WIDER
+  // endpoint predicate (the one without the map reject) and left it alone on that basis; the
+  // map reject was already on the line below the endpoint pair at #1186's own commit, so the
+  // decline was reasoning about a spelling this function did not have.
+  if !nameIsShapeSpanEnds(name) { return false }
   if annArrowAt(name) >= 0 { return false }
   let sp = 0
   while sp < name.length {
@@ -2449,13 +2546,14 @@ export function nameIsStructWithUnionField(name: string) {
         // descent; without the pin its `$fnsig` kept the self-inferred plain layout —
         // INVALID-WASM, fuzz-nightly run 29808029476 seed 78530533 d5). A nested map
         // (`{[`) declines inside the recursion's own gate.
-        if (
-          ftype.length >= 2 &&
-          ftype[0] == '{' &&
-          ftype[ftype.length - 1] == '}'
-        ) {
-          if nameIsStructWithUnionField(ftype) { return true }
-        }
+        //
+        // The endpoint pre-filter this guard spelled out is DELETED rather than routed to
+        // `nameIsBraceSpanEnds`: it was REDUNDANT. The recursion's own first line is
+        // `canonBareShapeName(ftype)`, whose first two tests are `length < 2` and the same
+        // `{`/`}` endpoint pair, so the call already answers `false` on exactly the names the
+        // guard was rejecting. Both functions are pure, so removing it changes no answer and
+        // costs one call on a field type that is about to be rejected by three compares.
+        if nameIsStructWithUnionField(ftype) { return true }
       }
     }
     fi = fi + 1
@@ -2483,13 +2581,10 @@ export function nameIsStructWithLitUnionField(name: string) {
     if fnames[fi] != "" {
       const ftype = ftexts[fi]
       if nameIsLitUnionType(ftype) { return true }
-      if (
-        ftype.length >= 2 &&
-        ftype[0] == '{' &&
-        ftype[ftype.length - 1] == '}'
-      ) {
-        if nameIsStructWithLitUnionField(ftype) { return true }
-      }
+      // The endpoint pre-filter, DELETED as redundant for the same reason as the sibling's:
+      // the recursion opens with `canonBareShapeName(ftype)`, which begins with the identical
+      // `length < 2` + `{`/`}` endpoint rejects.
+      if nameIsStructWithLitUnionField(ftype) { return true }
     }
     fi = fi + 1
   }

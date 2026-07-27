@@ -87,6 +87,7 @@ import {
 } from "./ast"
 import {
   annArrowAt,
+  annGenAppSpanEnds,
   annRetNameOf,
   arrElemNameRaw,
   cloArrElemNameOf,
@@ -104,6 +105,7 @@ import {
   nameIsMap,
   nameIsMapArray,
   nameIsMapMemberUnion,
+  nameIsMapOpen,
   nameIsNulClosure,
   nameIsNulI32List,
   nameIsNulString,
@@ -3449,8 +3451,13 @@ function gaeCollectDecls(stmts: i32[]) {
   while i < stmts.length {
     const s = P.nodes[stmts[i]]
     if s is TypeDecl {
-      const lt = gaeLtAt(s.tdName)
-      if lt > 0 && s.tdName[s.tdName.length - 1] == '>' {
+      // The generic-application SPAN test at its home. The `lt > 0` + trailing-`>` pair this
+      // spelled out IS `annGenAppSpanEnds`: the home adds an `n < 3` cheap reject that `lt > 0`
+      // with a final `>` already forces, and re-asks the same pure `gaeLtAt`. The CUT stays
+      // here — this declaration site stores the RAW parameter TEXT (`gaeSplitArgs` runs later,
+      // at `gaeEnsure`), which is not what `annGenAppDecompose` returns.
+      if annGenAppSpanEnds(s.tdName) {
+        const lt = gaeLtAt(s.tdName)
         gaeBases.push(s.tdName.slice(0, lt))
         gaeParams.push(s.tdName.slice(lt + 1, s.tdName.length - 1))
         gaeFieldStart.push(gaeFieldNames.length)
@@ -3985,7 +3992,13 @@ function registerInlineUnion(stmts: i32[], name: string) {
       const ma = matoms[mk]
       if ma != "null" {
         mNonNull = mNonNull + 1
-        if ma.length >= 2 && ma[0] == '{' && ma[1] == '[' { mHasMap = true }
+        // The MAP-NAME OPENER at its home — the three compares this spelled out, character
+        // for character including the bound. It is deliberately NOT `nameIsMap`, which is
+        // this predicate minus the arrays: an arm that is a LIST of maps
+        // (`{[string]:i32}[] | f64`) still makes the WHOLE union name open `{[`, so it must
+        // still set this flag or the map-VALUE recursion below swallows the union name. That
+        // is the narrowing `nameIsMapOpen`'s header warns about, seen from its one caller.
+        if nameIsMapOpen(ma) { mHasMap = true }
       }
       mk = mk + 1
     }
@@ -5173,9 +5186,16 @@ export function collectFnValUse() {
       // trailing `[]` before they can answer, but each opens with a depth SCAN
       // (`parenUnionArrElemName`'s and `nameIsClosureArray`'s `annArrowAt` guard) — so
       // without this one-character test every non-array annotation in the program would pay
-      // two whole scans to be told what its last character already said. A name not ending
-      // in `]` cannot be a closure array under either leg, so the guard is answer-exact.
-      if fvSb.length > 0 && fvSb[fvSb.length - 1] == ']' {
+      // two whole scans to be told what its last character already said.
+      //
+      // It is the ARRAY-NAME grammar's TEST half, so it is asked at its home rather than by
+      // hand — and the home is the STRICTER reading, which is what makes the reject
+      // answer-exact rather than merely close. The hand-written version accepted any name
+      // ending in `]`; `nameIsArray` demands the `[]` PAIR. Both of `cloArrElemNameOf`'s legs
+      // (`nullClosureArrElem` → `parenUnionArrElemName`, and `nameIsClosureArray`) open with
+      // `nameIsArray` themselves, so every name the narrower gate now skips is one the call
+      // would have answered `""` for. Strictly fewer scans, identical answers.
+      if nameIsArray(fvSb) {
         if cloArrElemNameOf(fvSb) != "" { fnValUsed = true }
       }
       // D-UNION set ADT — the arms come from the recorded member column when the
