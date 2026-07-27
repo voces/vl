@@ -1,0 +1,86 @@
+// @run
+// @log V
+// @log N
+// @log 2
+// @log 1
+// @log 7
+// @log 2
+// @log N
+// THE KIND-18 GLOBAL's READ side. `nullable-refarray-global-null.vl` (#1208) pinned the
+// three WRITE-side gaps — the start-fn null seed, the `g = null` assign seed and the
+// dropped eager recover — and had to observe every one of its values through a
+// `T | null` PARAMETER, because the direct read of such a global was still broken and
+// would have masked all of them. This is that read.
+//
+// `exprNullableRefArray` resolved an `Ident` through the declared-local table and the
+// parameter list ONLY. It never had a global arm, so for a kind-18 MODULE GLOBAL every
+// consumer below fell through to the non-nullable path:
+//
+//   * `g != null` / `g == null` — the compare never reached the `ref.is_null` lowering,
+//     so the bare `null` was emitted as a VALUE and hit `emitNullLitNode` with an empty
+//     context: `emitProgram: bare null needs a struct-typed context`, the whole module
+//     rejected.
+//   * `g[i]` — no `ref.as_non_null` before the `array.get` unwrap.
+//   * `g.length`.
+//   * an un-annotated `const t = g` — `letIsNulRefArray`'s init leg asks the same
+//     question, so the binding took a non-kind-18 slot.
+//
+// Seven of seven global census cells rejected while their LOCAL and PARAM twins (which
+// this file also carries, as the control that the ladder was only ever missing the third
+// storage class) ran and printed.
+//
+// The global arm is keyed on `globalCellKind` — the CELL's own answer — rather than on
+// `letIsNulRefArray`, so the read and the cell can never disagree. That keying
+// deliberately rules OUT the UN-ANNOTATED kind-18 global (`const g = mk()` with
+// `mk(): S[] | null`): the cell's inner-wrapper slot comes from `letAnnRefListSlot`,
+// which has no annotation to read, so widening the read alone would turn today's loud
+// reject into invalid wasm. It stays a reject, and is filed.
+
+type S = { v: i32 }
+
+// (1) the `!= null` compare over a LIVE kind-18 global
+const gLive: i32[][] | null = [[1, 2]]
+if gLive != null { print("V") } else { print("N") }
+
+// (2) the `== null` compare over a NULL kind-18 global. Under a NON-constexpr init the
+// cell is nullable and `emitIdentNode` recovers it eagerly unless the kind is exempt —
+// kind 18 was the ninth and last kind added to that exemption (#1208), and without it
+// this row is a `wasm trap: null reference` rather than a print.
+const gNull: i32[][] | null = null
+if gNull == null { print("N") } else { print("V") }
+
+// (3) the narrowed INDEX read, and (4) `.length`
+const gIdx: i32[][] | null = [[1, 2]]
+function readIdx() {
+  if gIdx != null {
+    print(gIdx[0][1])
+    print(gIdx.length)
+  }
+}
+readIdx()
+
+// (5) a STRUCT-element ref array — the other kind-18 element shape
+const gS: S[] | null = [{ v: 7 }]
+function readS() {
+  if gS != null { print(gS[0].v) }
+}
+readS()
+
+// (6) the UN-ANNOTATED re-binding. `const t = g` infers kind 18 from the global, and its
+// inner ref-list ROW must be the one the CELL holds — resolved from the same
+// `letAnnRefListSlot` `emitGlobalSection` gives the cell its valtype from.
+const gBind: i32[][] | null = [[1, 2]]
+function readBind() {
+  const t = gBind
+  if t != null { print(t[0][1]) }
+}
+readBind()
+
+// (7) a MUTABLE kind-18 global re-assigned to null and then compared — #1208 seeded the
+// assign, this reads the result back through the compare it seeded it for.
+let gMut: i32[][] | null = [[1, 2]]
+function mutate() {
+  gMut = null
+  if gMut == null { print("N") } else { print("V") }
+}
+mutate()
