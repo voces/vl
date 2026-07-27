@@ -1,9 +1,17 @@
 // The native `vl` tool — a single binary with deno-style subcommands:
 //
-//   vl build <in.vl> -o <out.wasm>   compile a file to a wasm module
-//   vl check <in.vl>                 typecheck (and emit-validate); print diagnostics
+//   vl build <in.vl> -o <out.wasm>   compile a file to a wasm module, then VALIDATE it
+//   vl check <in.vl>                 typecheck; print diagnostics (`--codegen` also emits)
 //   vl run   <in.vl>                 compile in-memory, then instantiate + run
 //   vl fmt   [path] [-w|--check]     format source (stdout / write / CI gate); stdin when no path
+//
+// Only `build` and `run` ever hand the emitted bytes to the ENGINE, so only they can
+// tell a valid module from an invalid one — the validator lives in wasmtime, and the
+// compiler is a VL program inside the guest with no engine of its own. `check
+// --codegen` runs the emitter but never leaves the guest with the bytes, so it
+// reports the emitter's own errors and nothing about the module's validity. (This
+// header used to claim `check` did "emit-validate"; measured false — see
+// `validate_written_module`.)
 //
 // This is a THIN host adapter: all compiler logic (lex/parse/typecheck/emit) lives
 // in the self-hosted compiler wasm (`build/vl-compiler.wasm`, self-compiled from
@@ -20,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
 fn usage() -> ! {
-    eprintln!("usage: vl <build|check|run|fmt> <file.vl> [-o out.wasm] [-w|--check] [--compiler vl-compiler.wasm]");
+    eprintln!("usage: vl <build|check|run|fmt> <file.vl> [-o out.wasm] [--no-validate] [-w|--check] [--compiler vl-compiler.wasm]");
     std::process::exit(2);
 }
 
@@ -1120,6 +1128,50 @@ fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// `vl build`: prove the module we just wrote is one the engine will ACCEPT.
+///
+/// The compiler's `compileSrc` returning 0 means "the emitter ran to completion",
+/// NOT "the bytes are a valid module" — nothing in the guest can decide the latter,
+/// because the wasm validator lives in the engine and the guest is a VL program with
+/// no engine. So before this existed, an emitter bug that lowered the wrong type
+/// produced a module `vl build` wrote and reported `wrote x.wasm (92 bytes)` for,
+/// exiting 0, which `vl run` then rejected outright. Measured on master `08469b0`
+/// with `function mk<T>(_x: T): ((i32) => i32) | null { return null }` +
+/// `const a = mk(1)`: `vl run` exited 1 ("expected i32, found (ref null $type)")
+/// while `vl build -o x.wasm` exited 0, and `vl run x.wasm` on the artifact it
+/// blessed exited 1 with the same error.
+///
+/// `Module::validate` is EXACTLY the check `vl run` fails on — `Module::new`
+/// (`run_program_with`) validates before it translates — minus the Cranelift
+/// codegen `Module::new` also does. Measured (interleaved A/B, n=21, medians):
+/// the 1,031,680-byte compiler self-build pays +18.2 ms on 1,431 ms (+1.3%), a
+/// small corpus program +2.25 ms on 5.7 ms. So the cost is a scan, not a compile,
+/// and it is invisible on the build that dominates every gate.
+///
+/// It does NOT over-reject: swept over all 1,411 tests/cases files, the 1,188 that
+/// build produced 0 validation failures, and the 12 that build-then-fail-to-run are
+/// all deliberate TRAP fixtures — a trap is a runtime failure of a VALID module.
+///
+/// It reads the module back OFF DISK rather than validating the in-memory `bytes`
+/// so that `-O` is covered too: with `-O` the artifact is binaryen's output, not
+/// the emitter's, and the artifact is what the caller will run.
+///
+/// The file is left in place on failure, and this runs after `--wat`, because a
+/// module that fails to validate is precisely the one a compiler dev needs to
+/// disassemble. The exit code — not the artifact's absence — is what tells a
+/// caller not to use it. `--no-validate` restores the old write-and-bless path
+/// for anyone who wants the artifact without the gate.
+fn validate_written_module(engine: &Engine, path: &str) -> Result<()> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::from(e).context(format!("reading back `{path}` to validate it")))?;
+    Module::validate(engine, &bytes).map_err(|e| {
+        Error::from(e).context(format!(
+            "`{path}` is not a valid WebAssembly module — it was written, but it cannot \
+             instantiate (this is a compiler emit bug; `--no-validate` skips this check)"
+        ))
+    })
+}
+
 /// Compile `source` through the seed (names enabled, for legible trap traces) and
 /// run the emitted module on the user-program engine.
 fn compile_and_run(
@@ -1448,6 +1500,12 @@ fn main() -> Result<()> {
             if args.iter().any(|a| a == "--wat") {
                 let wat = format!("{}.wat", out.strip_suffix(".wasm").unwrap_or(&out));
                 disassemble_to_wat(&out, &wat)?;
+            }
+            // The written module must be a module the engine will ACCEPT — see
+            // `validate_written_module`. Runs LAST so `--wat` still dumps a broken
+            // module (that dump is how an emit bug gets diagnosed).
+            if !args.iter().any(|a| a == "--no-validate") {
+                validate_written_module(&compile_engine, &out)?;
             }
         }
         _ => usage(),
