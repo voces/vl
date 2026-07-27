@@ -23726,6 +23726,239 @@ reliable number is the −669 B.
 | `scripts/fetch-seed.sh` — fresh `seed-latest`, 1,031,524 B | **0** |
 | `scripts/refresh-compiler.sh --prove-fixpoint` — the published seed IS master's fixpoint (1 compile); candidate reaches its own at 1,030,855 B | **0** |
 | `scripts/native-fixpoint.sh` — stage3 == stage4 byte-for-byte, 1,030,855 B | **0** |
+## D-PARENHOME — the PAREN grammar gets the two homes it needs, and the SPAN home's closing test is measured UNOBSERVABLE (#1189)
+
+Base `e255dd8`. The slice #1186 deliberately deferred: it built the SHAPE-NAME homes and left
+PAREN alone, "one well-proven collapse beat two speculative ones", handing over a re-measured
+census (`'('` 27 + `')'` 20 = 47 raw) and one instruction — **collect dominating block guards
+before classifying spellings**. That instruction was worth the whole slice: it is the reason the
+answer below is TWO predicates and not one, and the reason six sites were not silently tightened.
+
+### The instruments, and what licenses them
+
+**Two units, stated separately, never mixed.**
+
+* **Grammar OCCURRENCES** — one per `'('` / `')'` CHARACTER LITERAL in non-comment code. The
+  stripper blanks double-quoted STRINGS, KEEPS char literals (method note 92 — a stripper that
+  treats `'('` as a string opener makes every character census read 0), and handles `'"'`, of
+  which `compiler/*.vl` holds **29**: a stripper blind to those inverts string tracking for the
+  rest of the line. Graded on a constructed trap file — comment, string containing `( ) '('`,
+  bare char literals, `'"'`, `'\\'` — and it scores **4/4**.
+* **CALL SITES** — #1139's 23-resolver CORE list plus #1141's 13 off-list scanners, `NAME(` in
+  non-comment code, definition headers excluded.
+
+Both were validated against published figures BEFORE being used to claim anything. The call-site
+counter reproduces all seven of the standing brief's figures at `e255dd8` exactly — CORE **312**
+tree-wide, `emit_classify` **175**, `emit_base` **52**, `typecheck` **46 TRUE = 19 CORE + 27
+OFF-LIST**, `emit_collect` **44**, `emit_mono` **7**, `emit_rewrite` **7**. The character census,
+written independently of #1186's, reproduces ITS numbers exactly too: `'('` **27**, `')'` **20**,
+47 raw, `typecheck` 20 · `emit_classify` 10 · `emit_base` 11 · `format` 2 · `lexer` 2 ·
+`emit_collect` 1 · `emit_mono` 1. Two independently-written strippers agreeing to the site is a
+stronger licence than either alone.
+
+### The 47, decomposed — SIX spellings, and only 38 are even the same question
+
+`lexer` (2) and `format` (2) are source-TEXT scanners, excluded by file. A further **5** in
+`typecheck` are the bracket-CLASS depth ladders (`c == '{' || c == '[' || c == '('` in
+`tyTopIndexOf` / `tyGroupEndIndex`, plus `nameNeedsCanon`'s contains-scan) — membership tests
+inside a character walk, not a name-shape predicate, and not this grammar. **38 occurrences over
+type names, at 23 sites, in six spellings** (this 38 is the BEFORE count in the six-spelling
+frame; the 38 in the units table below is the AFTER count of raw occurrences tree-wide — the
+collision is a coincidence of arithmetic, and the two are not the same set). Where the LENGTH
+BOUND sits is recorded because four of the sites hide it one scope up:
+
+| # | spelling | sites | occ | where the length bound sits |
+|---|---|---:|---:|---|
+| P-OPEN | `name[0] == '('`, no close test | 7 | 7 | same expression ×6; **enclosing block ×1** (`emit_mono` `pn.length > 2`) |
+| P-SPAN | `[0] == '('` AND `[len-1] == ')'`, **no walk** | 7 | 14 | early return ×4; **enclosing block ×3** (`elem.length > 1`) |
+| P-SPAN+WALK | P-SPAN plus a balance walk | 4 | 8 | same expression ×3; enclosing block ×1 |
+| P-ARROW | `[0] == '('` AND `[arrowAt-1] == ')'` | 3 | 6 | implied by `arrowAt >= 1` |
+| P-ARRAY | `[0] == '('` AND `[len-3] == ')'` | 1 | 2 | early return `length >= 5` |
+| P-CLOSEONLY | `[len-1] == ')'`, no opener test | 1 | 1 | — |
+
+**They reduce to TWO predicates**, and the layering is the SHAPE family's exactly:
+
+* **`nameIsParenOpen(name)`** — `length >= 1 && name[0] == '('`. It is P-OPEN entire, and it is
+  the FIRST HALF of all five other spellings.
+* **`nameIsParenSpanEnds(name)`** — that plus `name[name.length - 1] == ')'`. P-SPAN entire, and
+  the endpoint half of P-SPAN+WALK.
+
+P-ARROW and P-ARRAY close the group somewhere that is **not the last character** — before the
+`=>`, and before the trailing `[]`. Their OPEN half is the same question and routes; their CLOSE
+test is a different question and stays inline. P-CLOSEONLY has no opener at all.
+
+### THE NAIVE HOME IS THE HOME FOR NONE OF THEM — seven sites it would have tightened
+
+"A parenthesized type name" most obviously means the endpoints PLUS a balance walk, and the tree
+already contains two functions that do exactly that. Building that as the home and routing P-SPAN
+to it would have silently TIGHTENED **7 sites / 14 occurrences that carry no walk today**:
+`emit_base.listElemNameOf`, `emit_classify` 4510 / 6363 / 10046, `typecheck` 16117 / 16206, and
+`typecheck.canonEmitName` 7304 — whose extra conjunct is `!isTopLevelFuncTypeName`, an ARROW test
+and not a balance walk, so it peels `(a)|(b)` to `a)|(b` exactly as the others would.
+`listElemNameOf`'s own header already said so in as many words — "the paren strip is deliberately
+the NAIVE one … NOT `normTypeAtom`/`peelGroupParens` … widening the strip to a balanced one would
+change what `(a)|(b)`-shaped elements classify as." **None was tightened.** The home carries no
+walk, precisely as `nameIsShapeSpanEnds` carries none, and the two walking sites keep their walk
+as a separate conjunct.
+
+**AND THE TWO WALKS ARE NOT ONE.** `peelGroupParens` rides `typecheck.parenEnclosesWhole`
+(`tyGroupEndIndex(name,1) == name.length - 1`); `normTypeAtom` rides `emit_base.tyGroupWrapsWhole`
+(the same, EXCEPT `e < 0` answers **true**). They disagree on a group that never closes. A third
+"obvious collapse" — merging the walks — is therefore also wrong, and is named in the home's
+header so a later census does not read them as copies.
+
+### What was routed — 8 sites in the three files this slice owns
+
+To **`nameIsParenOpen`** (5): `emit_base.nameIsClosureArray` 1570 (its separate `elem.length < 1`
+reject IS the home's bound) · `emit_base.parenUnionArrElemName` 1631 (OPEN half only — its close
+is P-ARRAY) · `emit_base.annFnDecompose` 2245 (OPEN half only — its close is P-ARROW) ·
+`emit_collect` 3972 (bound `length > 0`, spelling-for-spelling the home's) · `emit_mono` 973
+(bound `pn.length > 2` on an ENCLOSING block — the #1186 artifact, collected).
+
+To **`nameIsParenSpanEnds`** (3): `emit_base.listElemNameOf` 1410/1411 (three nested `if`s with the
+bound one scope up) · `peelGroupParens` 1902/1903 · `normTypeAtom` 1966.
+
+Every routing is equivalence-preserving on every input, including the length-1 name: the explicit
+`length >= 2` five of the six span sites spell is IMPLIED, because on a one-character name `[0]`
+and `[len-1]` are the SAME character and no character is both `(` and `)`.
+
+### Both units, before and after
+
+| unit | `e255dd8` | shipped | delta |
+|---|---:|---:|---:|
+| PAREN grammar occurrences, tree-wide | **47** | **38** | **−9** |
+| … over type names (excl. `lexer`/`format`) | 43 | 34 | −9 |
+| … `emit_base` | 11 | **4** | −7 |
+| … `emit_collect` | 1 | **0** | −1 |
+| … `emit_mono` | 1 | **0** | −1 |
+| **CORE call sites** (23-resolver list, tree-wide) | **312** | **312** | **0** |
+| OFF-LIST (#1141's 13) | 27 | 27 | 0 |
+| TRUE TOTAL | 339 | 339 | 0 |
+
+**CORE Δ0 was PREDICTED before it was measured, and for method note 133's stated reason**: the
+rising-CORE effect needs the homed grammar's body to call an on-list resolver, and
+`nameIsParenOpen` / `nameIsParenSpanEnds` are pure character surgery over two new off-list names.
+Every per-file CORE figure is also unchanged. Binary **1,031,524 → 1,031,439 B, −85 B**.
+
+### Channels, every one graded with a sabotage before its zero was believed
+
+Master's source compiles to a wasm **byte-identical to the published seed** (sha
+`017f24f0…`), so the A side of every A/B below is the seed itself.
+
+| channel | **B (candidate)** | S1 (`nameIsParenOpen` inverted) | S4 (`nameIsParenSpanEnds` always false) | S2 (SPAN home drops its `)` test) |
+| --- | ---: | ---: | ---: | ---: |
+| corpus, 1,414 files × {build rc, wasm sha256, build diagnostic, run rc, run stdout} | **0** | **233 red** | **82 red** | **0** |
+| fuzz, 33,600 programs / 84 dirs, `vl check --codegen <dir>` | **0/84** | **84/84 red** | **81/84 red** | **0/84** |
+| the new fixture | **PASS** | **FAIL** | **FAIL** | pass |
+
+Both live channels move hard under both real sabotages, so neither zero in the B column is
+blindness. The fuzz leg used `--codegen` throughout (method note 131).
+
+### S2 — A ZERO THAT SURVIVED EVERY ATTEMPT TO BREAK IT, AND THE GUARD STAYS ANYWAY
+
+**S2 — the SPAN home dropping its closing `)` test — is INERT on every channel: 0 of 1,414 corpus
+files, 0 of 84 fuzz dirs, 0 on both fixtures, and 0 on four hand-constructed candidate
+populations.** That is not a licence to delete the test, and it was not deleted (#1182's
+precedent). It IS a measurement worth recording, because it explains itself completely:
+
+* `peelGroupParens` — **fully masked**. S2 widens the span, but `parenEnclosesWhole` then demands
+  the group close at the last character, which a name that opens `(` without ending `)` cannot do.
+* `normTypeAtom` — masked EXCEPT on a group that never closes, where `tyGroupWrapsWhole` answers
+  true. #1144 measured that population empty (0 of 1,280,943 invocations); it is still empty.
+* `listElemNameOf` — **not masked**, but answer-invariant: S2's peel corrupts a name
+  (`(boolean|null)[]` → `boolean|null)[`) that its consumers were already going to reject, so
+  both readings answer `false` and nothing downstream moves.
+
+The four constructed populations: a 2-D union array `(string|i32)[][]` and a 2-D niche-nullable
+list `(boolean|null)[][]` (both compile and both AGREE — the corrupted element matched nothing
+either way), and two spellings of a nullable-CLOSURE array, which would have discriminated but are
+rejected identically by master, candidate and S2 — `emitProgram: bare null needs a struct-typed
+context`. **The population that separates S2 requires a language feature VL does not have.**
+
+### S3 — proving a routed site is REACHED when no sabotage of the home reddens its test
+
+`emit_mono` 973's routing was covered by nothing the slice had built: S1 left the candidate
+fixture green there. Rather than assume, a third sabotage made that branch unreachable
+(`} else if false {`). It reddens **exactly one corpus file of 1,414** —
+`tests/cases/closures/hof-inferred-return-through-callback.vl` — which is therefore that site's
+dedicated, measured-load-bearing regression test, and is ALSO in S1's 233. The site is reached; the
+coverage already existed; no new fixture was needed for it.
+
+The reason the first attempt missed it is worth keeping: the pin arrives from MONOMORPHIZATION, so
+the HOF must be **generic**. A non-generic `hof(g: (i32) => string | null, x: i32)` never reaches
+the branch. A fixture that exercises a code path only in the author's head is the thing this
+program keeps re-learning to distrust.
+
+### The fixture, and what entombs it
+
+`tests/cases/unions/paren-open-span-homes.vl` exercises seven of the eight routed sites in one
+program (the eighth is the `emit_mono` site above, which keeps its existing test). A
+behaviour-preserving refactor cannot have a pin that fails on master, so it is entombed by pins
+that fail under the sabotages:
+
+| compiler | result |
+| --- | --- |
+| master (`A`) / candidate (`B`) | **PASS** (identical stdout) |
+| S1 — OPEN home inverted | **FAIL** — `emitProgram: only i32[] arrays and struct/union element arrays are supported` |
+| S4 — SPAN home always declines | **FAIL** — same |
+
+A second fixture was written for the `emit_mono` site and then **deleted**: S3 proved it did not
+reach the branch it claimed to cover. Shipping it would have been a green test asserting nothing.
+
+### A PRE-EXISTING INVALID-WASM DEFECT, FILED NOT FIXED
+
+Building the fixture surfaced a real master-side bug, which cost an hour of "is this my
+regression?" before it was pinned down. **A generic with a function-type param and an un-annotated
+HOF pinned through an annotated function-type param, in ONE program, emit invalid wasm ON MASTER:**
+
+```vl
+function ap<T>(f: (T) => T, x: T): T { return f(x) }
+function addFive(n: i32): i32 { return n + 5 }
+function nulOrStr(n: i32): string | null { if n > 0 { return "yes" } return null }
+function hof(g: (i32) => string | null, x: i32) { return g(x) }
+print(ap(addFive, 2))
+print(hof(nulOrStr, 1) ?? "none")
+```
+
+`Invalid input WebAssembly code … type mismatch: expected i32, found (ref null $type)` in `hof`.
+**Each construct is fine alone**; only the pair fails, on master and candidate identically. Filed
+here; not fixed (a behaviour change owing its own slice). Note `vl build` now exits 1 on this
+(#1188), so a corpus sweep sees it.
+
+### FILED ROUTING — the 13 sites in files this slice does not own
+
+Both homes are exported from `emit_base`, which `emit_classify` already imports.
+
+* → **`nameIsParenOpen`** (4, all `emit_classify`, all exact — bound already implied or identical):
+  `internShapeDeep` 10712 (`annArrowAt(nm) >= 1` implies the bound) · `forceCloResultMapTypes`
+  12037 · `forceCloResultArrTypes` 12082 · `unionRetOfFnType` 14332 (the last three spell
+  `length > 0 && [0] == '('`, which IS the home).
+* → **`nameIsParenSpanEnds`** (3, all `emit_classify`): `rlElemCloSigKey` 4510 ·
+  `cloArrSlotRetName` 6363 (both gate `length < 2` then test both endpoints) ·
+  `rlCanonLitUnionAtoms` 10046 (bounds only `length >= 1`; equivalent for the reason above — a
+  one-character name cannot be both `(` and `)`).
+* **DO NOT route the CLOSE test** at `typecheck.isTopLevelFuncTypeName` 4956, `nameToTy` 5632
+  (P-ARROW) or `canonEmitName` 7314 (P-CLOSEONLY): different questions at different offsets.
+* **`typecheck.vl`'s 20 occurrences are BLOCKED by module direction, not by policy** — the same
+  wall #1186 hit at `nullableRetName`. `emit_base` IMPORTS `typecheck` (`tyTopIndexOf`,
+  `tyGroupEndIndex`, `parenEnclosesWhole`), so the checker cannot import the emitter's homes.
+  `typecheck` 16082/16083 (`nameIsFuncTypeAtom`) is a CHARACTER-IDENTICAL copy of
+  `peelGroupParens`'s loop, and `typecheck` 16206/16207 (`litUnionArrayElemOf`) of
+  `listElemNameOf`'s peel — the two clearest duplicate pairs left in the grammar, and both
+  unreachable without a shared lower module. **That is now the binding constraint on this
+  grammar: `typecheck` holds 20 of the 34 occurrences that remain outside `lexer`/`format`**
+  (15 of them in the six spellings, 5 in the bracket-class ladders). It needs a mechanism
+  decision, not a routing.
+
+### GATE — every leg, exit code explicit
+
+Gated from a **freshly fetched published seed** (`seed-latest`, 1,031,524 B).
+
+| leg | RC |
+| --- | ---: |
+| `scripts/fetch-seed.sh` (fresh, after moving the local seed aside) | **0** |
+| `scripts/refresh-compiler.sh --prove-fixpoint` — fixpoint holds, 2 compiles | **0** |
+| `scripts/native-fixpoint.sh` — stage3 == stage4 byte-for-byte | **0** |
 | `npm ci` | **0** |
 | `SELFHOST_NATIVE_ALIGN=1 deno task test` — **2155 passed / 0 failed / 8 ignored** | **0** |
 | `deno check tests/cases_wasm_test.ts` | **0** |
@@ -23805,3 +24038,80 @@ slice's one fixture.
      counts (8 ignored / ~608 / 14 / ~620) diagnose the env var, `npm ci` and a MISSING
      host; they do not diagnose a PRESENT but STALE one, which fails a test instead of
      ignoring one. Verify the baseline, and when it is red, suspect the host before the source.
+| corpus A/B, 1,414 files × 5 fields | **0 differ** |
+| fuzz A/B, 33,600 programs / 84 dirs, `--codegen` | **0/84 differ** |
+
+**The suite baseline was verified in this worktree, not inherited: 2154 / 0 / 8 at `e255dd8`.**
+2155 is that plus exactly the one new fixture. The standing brief said to expect 2148 — that was
+#1186's number and #1187/#1188 have since added tests; re-deriving it rather than quoting it is
+what made 2155 checkable.
+
+**The ignored count is 8 only after a native-host REBUILD.** This worktree's prebuilt
+`scripts/vl-host/target/release/vl` predated `e255dd8` by two days, and #1188's fix is IN THE
+HOST — so `tests/vl_build_validate_test.ts` failed on a worktree defect that looks exactly like a
+source regression. `touch scripts/vl-host/src/main.rs && cargo build --release` fixed it; the
+same failure will greet the next agent whose worktree symlinks a stale cargo target.
+
+### Wall time — below the noise floor on this box, and reported as such
+
+Interleaved self-compiles, warm-up discarded, n=7 per side, two full runs. Run 1 medians: A
+4.712s / B 4.807s. Run 2 medians: **A 2.102s / B 1.878s — the sign FLIPPED**, with a within-run
+spread of 1.78–4.46s. The box is shared with parallel agents; the change is character compares
+becoming calls, with no algorithmic difference, and the binary SHRANK. **No wall-time claim is
+made in either direction**, which is the honest reading of a 2.5× spread — quoting run 1 alone
+would have manufactured a 2% regression.
+
+### WHAT THIS SLICE DID NOT DO
+
+* **It did not delete the SPAN home's closing test on a measured 0.** See S2 above.
+* **It did not tighten the six walk-free span sites**, and did not merge the two balance walks.
+* **It did not fix the generic-plus-HOF invalid-wasm defect** it found, or the nullable-closure-
+  array literal gap that blocked S2's discriminating population. Both are filed above.
+* **It did not route `typecheck`'s 20 occurrences** — module cycle, mechanism decision needed.
+* **It shipped one fixture, not two**: the second was deleted once S3 proved it inert.
+
+### Method notes
+
+135. **COLLECTING THE ENCLOSING GUARD IS WHAT TURNS ONE GRAMMAR INTO TWO PREDICATES — AND IT PAID
+     OFF A SECOND TIME.** #1186's note 130 said to collect dominating block guards before
+     classifying spellings. Done here, 4 of 21 sites had their length bound one scope up, and —
+     more importantly — reading each site's CLOSE test by OFFSET rather than by eye separated
+     `[len-1]` from `[len-3]` and `[arrowAt-1]`. Those look identical in a grep and are three
+     different questions. A census that greps `!= ')'` would have "found" one grammar at 20 sites
+     and homed a predicate that is wrong at 4 of them.
+136. **A SABOTAGE THAT CANNOT BE MADE TO FIRE IS A RESULT, NOT A FAILURE — BUT ONLY AFTER YOU TRY
+     TO CONSTRUCT ITS POPULATION.** S2 read 0 on corpus, fuzz and both fixtures. Four constructed
+     programs later it still reads 0, and the reason is now known exactly: masked by a downstream
+     walk at two sites, answer-invariant at the third, and the one input that WOULD separate it
+     needs a language feature VL lacks. "0 with an explanation" is shippable; "0" is not.
+137. **WHEN NO SABOTAGE OF THE HOME REDDENS A SITE, SABOTAGE THE SITE.** Inverting the home left
+     one routed call site green, which reads either as "unreached" or as "uncovered". Replacing
+     that branch's condition with `false` distinguished them in one build: it reddened exactly one
+     corpus file, naming both the site's real coverage and the fact that it IS reached. Do this
+     before writing a new fixture — the fixture written first here reached nothing, because the
+     pin it targeted arrives from monomorphization and its HOF was not generic.
+138. **`git stash` IS SHARED ACROSS WORKTREES AND WILL SWAP TWO AGENTS' WORK.** The standing gate
+     says to verify the suite baseline by stashing your diff. In a repo where several agents hold
+     parallel worktrees, `refs/stash` is COMMON: this slice pushed a stash, a concurrent slice
+     pushed one, and `git stash pop` returned *the other agent's* `emit_classify.vl` +
+     `emit_rep.vl` while this slice's three files went to a third worktree. Both were recovered
+     (the other agent had independently restored one), but the near-miss is total: `git stash
+     list` read EMPTY afterwards, and `git fsck --unreachable` could not find this slice's commit.
+     **Verify a baseline by saving `git diff` to a FILE and `git checkout` -ing the paths back,
+     never by stashing** — and if you must drop a stash, resolve every index to a SHA and drop the
+     matching one by verified name, never by position and never through a grep.
+139. **A STALE NATIVE HOST FAILS LIKE A SOURCE REGRESSION.** `tests/vl_build_validate_test.ts`
+     failed red on an untouched worktree because the prebuilt `vl` binary predated the base commit
+     whose fix lives in the RUST host, not the VL compiler. The tell is the commit message
+     ("THE FIX is in the host"), not the test name. Check the binary's mtime against
+     `scripts/vl-host/src/main.rs` before believing any host-behaviour failure, and rebuild with a
+     `touch` first — `cp` over that path writes through cargo's hard link.
+140. **SUM THE ROWS OF EVERY TABLE YOU PUBLISH — THIS ONE WAS WRONG TWICE, IN OPPOSITE
+     DIRECTIONS.** The spelling table above first read "38 occurrences at 21 sites", while its own
+     six rows summed to **36 occurrences at 22 sites**. Neither figure was right: one site
+     (`typecheck.canonEmitName` 7304/7305) had been classified during enumeration as "P-SPAN plus
+     a functype exclusion" and then never carried into any row, so the total and the rows were
+     each wrong by a different amount and the error could not be seen from either alone. Summing
+     the rows found it, and it MATTERED: 7304 is a walk-free span site that PEELS, so the
+     "sites the naive home would have tightened" figure was understated too (6/12 → **7/14**).
+     A census total and a census breakdown are two measurements; publish neither until they agree.
