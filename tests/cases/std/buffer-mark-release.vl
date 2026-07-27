@@ -1,0 +1,72 @@
+// @run
+// @log 1024
+// @log 1024
+// @log 1040
+// @log 1040
+// @log 1040
+// @log true
+// @log 777
+// @log 999
+// @log 1024
+// @log 111
+// @log true
+// RECLAMATION IS MARK/RELEASE (O6), AND IT DANGLES. There is no per-object
+// `free`: `bufferMark()` reads the one bump pointer and `bufferRelease(mark)`
+// restores it, so reclamation is LIFO, costs two instructions, and needs no free
+// list (which is the `DECISIONS.md` line that a real `free` would reopen).
+//
+// The last two behaviours here are HAZARDS, pinned deliberately rather than
+// described in a footnote, because this is the first way a VL program can hold a
+// DANGLING REFERENCE at all:
+//
+//   - a released region is handed out again with the PREVIOUS OWNER'S BYTES
+//     still in it — `Buffer`'s zero-fill guarantee comes from wasm zeroing fresh
+//     memory, and it ends at the first release;
+//   - a `Buf` held across a `bufferRelease` that undoes its allocation still
+//     points at live, in-bounds memory that now belongs to someone else. Reads
+//     through it return the new owner's bytes and writes through it corrupt
+//     them, SILENTLY — nothing is out of bounds, so nothing traps.
+//
+// Both are the price of the bump allocator, and both are stated at the API
+// surface in `std/buffer.vl`'s header.
+import { Buffer, bufferMark, bufferRelease, loadI32, storeI32 } from "std:buffer"
+
+// A mark is just the bump pointer, so the first one is the heap base.
+const m0 = bufferMark()
+print(m0)
+
+const a = Buffer(16)
+a.storeI32(0, 111)
+print(a.base)
+
+const m1 = bufferMark()
+print(m1) // 1024 + 16
+
+const c = Buffer(16)
+print(c.base)
+c.storeI32(0, 777)
+
+// Release back to `m1`: everything allocated after it is reclaimed in one move.
+bufferRelease(m1)
+const d = Buffer(16)
+print(d.base)
+print(d.base == c.base) // the same bytes, handed out a second time
+
+// HAZARD 1 — the reused region carries the previous owner's bytes.
+print(d.loadI32(0))
+
+// HAZARD 2 — `c` is now a dangling `Buf` aliasing `d`. No trap, no diagnostic.
+d.storeI32(0, 999)
+print(c.loadI32(0))
+
+// LIFO all the way back: releasing to the first mark undoes both allocations.
+bufferRelease(m0)
+const e = Buffer(4)
+print(e.base)
+print(e.loadI32(0)) // `a`'s bytes, still there
+
+// Releasing to the CURRENT mark is a no-op, so a release path that allocated
+// nothing costs nothing.
+const m2 = bufferMark()
+bufferRelease(m2)
+print(bufferMark() == m2)

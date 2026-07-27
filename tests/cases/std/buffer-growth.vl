@@ -1,0 +1,60 @@
+// @run
+// @log 1
+// @log 1
+// @log 4
+// @log 2024
+// @log 200000
+// @log 55
+// @log 111
+// @log 222
+// @log 0
+// @log 4
+// @log 333
+// LAZY GROWTH (O5 = (i), and §B2's 64 KiB ceiling gone). `Buffer(n)` grows the
+// memory when — and only when — the reservation runs past it. There is NO
+// growth-counter export: the host contract is that a caller re-takes its typed
+// array views after any guest call that may allocate, and detects a stale one by
+// `byteLength === 0` (what Emscripten, wasm-bindgen and Go's `wasm_exec.js` all
+// do). `tests/vl_exported_memory_test.ts` pins the detachment itself.
+//
+// The 200000-byte buffer is the point: before `memory.grow` was reachable, two
+// 32 KiB buffers already trapped (§A3), and webcraft's "a few large Buffers at
+// init" fit none of them. Its last i32 lives at byte address 202020 — more than
+// three pages past the old ceiling.
+import { Buffer, loadI32, storeI32 } from "std:buffer"
+
+print(__memory_size__()) // the default one page
+
+// An allocation that FITS does not grow.
+const small = Buffer(1000)
+small.storeI32(0, 55)
+print(__memory_size__())
+
+// One that does not fit grows by exactly the pages it needs: 1024 + 1000 +
+// 200000 = 202024 bytes, which is ceil(202024 / 65536) = 4 pages.
+const big = Buffer(200000)
+print(__memory_size__())
+print(big.base) // 1024 + 1000 — no gap, no over-reservation
+print(big.length)
+
+// GROWTH DOES NOT MOVE GUEST DATA. A `memory.grow` detaches every HOST view
+// (§B5/§H8) but the bytes themselves stay exactly where they were, so a `Buf`
+// allocated before the growth is still valid afterwards — the guest-side half of
+// the contract, and the reason `Buf` needs no relocation hook.
+print(small.loadI32(0))
+
+// BOTH ENDS of the extent, the far one three pages past the old ceiling.
+big.storeI32(0, 111)
+big.storeI32(199996, 222)
+print(big.loadI32(0))
+print(big.loadI32(199996))
+
+// FRESHLY GROWN PAGES ARE ZERO, so `Buffer` runs no fill loop — this offset is
+// inside the pages that did not exist a moment ago and was never written.
+print(big.loadI32(100000))
+
+// A later allocation that fits inside the grown memory does not grow again.
+const tail = Buffer(8)
+print(__memory_size__())
+tail.storeI32(0, 333)
+print(tail.loadI32(0))
