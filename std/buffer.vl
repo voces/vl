@@ -1,0 +1,322 @@
+// `std:buffer` — the linear-memory tier's allocator and access surface, in pure
+// VL over the `__load_*__` / `__store_*__` / `__memory_*__` intrinsic floor
+// (`docs/internals/buffer-design.md` §C, sequencing item S5). The compiler owns
+// exactly what an INSTRUCTION is; allocation POLICY is ordinary code and lives
+// here (O1 = (c): `Buffer` is std VL, not a compiler-known type).
+//
+// TWO HEAPS. A `Buf` VALUE is an ordinary WasmGC struct with ordinary VL value
+// semantics; a `Buf`'s CONTENTS live in linear memory, which the host can read
+// directly through the module's exported `memory`. `.length` is a plain field
+// read — no call, no side table.
+//
+// BOUNDS: there are none here, by design (§A4). An access past the end of the
+// memory traps in the ENGINE — that trap is the memory-safety proof, and adding
+// a VL-level check would only make it quieter. An access past the end of a
+// `Buf` but still inside the memory is NOT caught: `Buf` describes an extent,
+// it does not fence it.
+//
+// HOST CONTRACT (O5 = lazy growth, no epoch export). `Buffer(n)` grows the
+// memory when it must, and a `memory.grow` DETACHES every host view of
+// `exports.memory.buffer`. A host must therefore re-take its typed-array views
+// after any guest call that may allocate; a stale view is detectable by
+// `view.byteLength === 0` (a detached view yields `undefined` on an indexed
+// read rather than throwing). This is what Emscripten's `updateMemoryViews()`,
+// wasm-bindgen's `byteLength === 0` probe and Go's `wasm_exec.js` buffer-
+// identity check all do; none of them exports a growth counter, and neither
+// does this module.
+//
+// RECLAMATION IS MARK/RELEASE, AND IT CAN DANGLE (O6). There is no per-object
+// `free`; `bufferMark()` / `bufferRelease(mark)` move the one bump pointer, so
+// reclamation is LIFO and costs nothing. The hazard is stated here rather than
+// in a footnote because it is the FIRST way a VL program can hold a dangling
+// reference at all: a `Buf` held across a `bufferRelease` that undoes its
+// allocation still points at live, in-bounds, since-reused linear memory. Reads
+// through it return another buffer's bytes and writes through it corrupt them —
+// SILENTLY. No trap fires, because nothing is out of bounds. Treat a released
+// mark as invalidating every `Buf` allocated after it.
+//
+// PERFORMANCE. Every access below is a real wasm `call`; `wasm-opt -O` (what
+// `vl build -O` runs) does NOT inline these wrappers, `-O3 --closed-world`
+// does (§O1). `store8` / `store16` are read-modify-write emulations and `fill` /
+// `copyFrom` are byte loops — see their headers for the instructions that will
+// replace them.
+
+// A `Buf` is a linear-memory extent: the byte address of its first byte, and
+// the number of bytes the caller ASKED for (the allocator may reserve a few
+// more for alignment; those are invisible here).
+export type Buf = { base: i32, length: i32 }
+
+// A wasm page is 64 KiB; `__memory_size__` / `__memory_grow__` count pages.
+const PAGE_SHIFT = 16
+const PAGE_MASK = 65535
+
+// POLICY 1 — the reserved low region. Byte addresses below `HEAP_BASE` are
+// never handed out. Three reasons, none of them cosmetic:
+//   - address 0 stays outside every allocation, so `base == 0` cannot be a
+//     legitimate `Buf` and a zeroed/garbage descriptor is distinguishable;
+//   - a program may still poke raw addresses through the bare intrinsics
+//     (that is the §A3 "two users collide" hazard), and this leaves it a
+//     documented kilobyte that `std:buffer` promises never to touch;
+//   - the host's staging ABI probe (`ioMem`, `scripts/vl-host/src/main.rs`)
+//     wants a fixed low window it can own later without moving the heap.
+// 1 KiB, not one page: reserving a whole page would force a `memory.grow`
+// during init for programs that fit comfortably in the default one.
+const HEAP_BASE = 1024
+
+// POLICY 2 — alignment. Every allocation's SIZE is rounded up to 8 bytes, and
+// `HEAP_BASE` is a multiple of 8, so every `Buf` starts 8-byte aligned and each
+// width's natural alignment is satisfied at offset 0 and at every 8-multiple
+// offset. This is a PERFORMANCE choice, not a correctness one — wasm's
+// alignment immediate is a hint and every load/store here is legal at any
+// address (pinned by the unaligned cases in `tests/cases/memory/`). 8 is the
+// widest scalar VL can store (i64 / f64).
+const ALIGN = 8
+
+// The bump pointer: the address one past the last byte handed out. Module-level
+// mutable state, which is exactly what makes the allocator's policy ordinary
+// VL code (§C4).
+let bumpPtr = HEAP_BASE
+
+// `n` rounded up to the next multiple of `ALIGN`.
+function alignUp(n: i32): i32 {
+  const slack = n & (ALIGN - 1)
+  if slack == 0 { return n }
+  return n + (ALIGN - slack)
+}
+
+// Grow the memory until byte `end` (exclusive) is addressable. Page arithmetic
+// throughout — computing `pages * 65536` would itself overflow i32 at 2 GiB,
+// which is inside the range this can be asked about.
+function ensureCapacity(end: i32) {
+  let needPages = end >> PAGE_SHIFT
+  if (end & PAGE_MASK) != 0 { needPages = needPages + 1 }
+  const havePages = __memory_size__()
+  if needPages > havePages {
+    // `memory.grow` answers with the size BEFORE the growth, or -1 on failure.
+    // A refused allocation cannot be papered over — the caller is about to write
+    // through a `Buf` that has no memory behind it.
+    //
+    // MEASURED, this branch is defensive rather than routine: `Buffer`'s i32
+    // overflow guard caps `end` at 2^31, i.e. at most 32768 pages, and wasm32's
+    // own ceiling is 65536 — so the SPEC limit is unreachable from here and only
+    // host resource exhaustion can produce the -1. Both hosts grow a 2 GiB
+    // request without complaint (wasmtime 47 and V8 alike, measured), which is
+    // why no corpus fixture pins this line: there is no request that fails
+    // deterministically on every host.
+    if __memory_grow__(needPages - havePages) < 0 { __trap__() }
+  }
+}
+
+// `Buffer(n)` — reserve `n` zero-filled bytes and describe them.
+//
+// ZERO-FILL: a wasm memory starts zeroed and freshly grown pages are zeroed, so
+// bytes that have never been handed out before are zero for free — no fill loop
+// runs here. That guarantee ends at the first `bufferRelease`: addresses handed
+// out a SECOND time carry whatever the previous owner wrote. Call
+// `buf.fill(0, buf.length, 0)` when reusing a released region and zeros matter.
+//
+// Traps on a negative length and on an allocation that would carry the bump
+// pointer past 2 GiB (where an i32 byte address stops being orderable), because
+// either would silently corrupt every later allocation.
+export function Buffer(byteLength: i32): Buf {
+  if byteLength < 0 { __trap__() }
+  const base = bumpPtr
+  const next = base + alignUp(byteLength)
+  if next < base { __trap__() }
+  ensureCapacity(next)
+  bumpPtr = next
+  return { base: base, length: byteLength }
+}
+
+// `bufferMark()` — the current bump pointer, to hand back to `bufferRelease`.
+export function bufferMark(): i32 { return bumpPtr }
+
+// `bufferRelease(mark)` — reclaim everything allocated since `mark` in one
+// move. LIFO, no free list, no fragmentation, and NO liveness check: see this
+// module's header for the dangling-`Buf` hazard this opens, which is silent
+// corruption rather than a trap.
+//
+// Traps on a mark outside `[HEAP_BASE, bumpPtr]` — below the base it would let
+// allocations walk into the reserved region, above the pointer it re-reserves
+// bytes that are already free. Both are bugs at the call site, not recoverable
+// states.
+export function bufferRelease(mark: i32) {
+  if mark < HEAP_BASE { __trap__() }
+  if mark > bumpPtr { __trap__() }
+  bumpPtr = mark
+}
+
+// ── Loads: eight widths, four of them signed/unsigned pairs. ──
+//
+// The signed/unsigned split is REAL here and is kept: `i32.load8_s` and
+// `i32.load8_u` are two different instructions, and of the byte 0xFF the first
+// answers -1 while the second answers 255. (The stores below have no such
+// split — see `store8`.)
+
+// The byte at `off`, sign-extended into an i32 (0xFF → -1).
+export function loadI8(self: Buf, off: i32): i32 {
+  return __load_i8__(self.base + off)
+}
+
+// The byte at `off`, zero-extended into an i32 (0xFF → 255).
+export function loadU8(self: Buf, off: i32): i32 {
+  return __load_u8__(self.base + off)
+}
+
+// The 16-bit halfword at `off`, sign-extended (0xFFFF → -1).
+export function loadI16(self: Buf, off: i32): i32 {
+  return __load_i16__(self.base + off)
+}
+
+// The 16-bit halfword at `off`, zero-extended (0xFFFF → 65535).
+export function loadU16(self: Buf, off: i32): i32 {
+  return __load_u16__(self.base + off)
+}
+
+// The 32-bit word at `off`.
+export function loadI32(self: Buf, off: i32): i32 {
+  return __load_i32__(self.base + off)
+}
+
+// The 64-bit word at `off`.
+export function loadI64(self: Buf, off: i32): i64 {
+  return __load_i64__(self.base + off)
+}
+
+// The 32-bit float at `off`.
+export function loadF32(self: Buf, off: i32): f32 {
+  return __load_f32__(self.base + off)
+}
+
+// The 64-bit float at `off`.
+export function loadF64(self: Buf, off: i32): f64 {
+  return __load_f64__(self.base + off)
+}
+
+// ── Stores: six widths, and no signed/unsigned split (O2). ──
+//
+// A store is sign-AGNOSTIC. There is exactly one instruction per width and it
+// TRUNCATES — `i32.store8` cannot tell a signed byte from an unsigned one — so
+// naming these `storeU8`/`storeI8` would falsely imply a signed twin exists.
+// Hence `store8` / `store16` against the loads' `loadI8` / `loadU8`: the
+// asymmetry is the instruction set's, and it is deliberate.
+
+// The 32-bit word at `off`.
+export function storeI32(self: Buf, off: i32, v: i32) {
+  __store_i32__(self.base + off, v)
+}
+
+// The 64-bit word at `off`.
+export function storeI64(self: Buf, off: i32, v: i64) {
+  __store_i64__(self.base + off, v)
+}
+
+// The 32-bit float at `off`.
+export function storeF32(self: Buf, off: i32, v: f32) {
+  __store_f32__(self.base + off, v)
+}
+
+// The 64-bit float at `off`.
+export function storeF64(self: Buf, off: i32, v: f64) {
+  __store_f64__(self.base + off, v)
+}
+
+// Write the low byte of `v` at byte address `addr`, by READ-MODIFY-WRITE over
+// the containing 32-bit word: linear memory is little-endian, so the byte at
+// `addr` occupies bits [8*lane, 8*lane+8) of the word at `addr - lane`.
+//
+// TEMPORARY. `i32.store8` (0x3a) is one instruction; it is not reachable from
+// VL because `__store_i8__` is not declared — S3's unshipped half. When it
+// lands, this whole function collapses to `__store_i8__(addr, v)`.
+//
+// Two properties this emulation preserves, and one it does not:
+//   - it traps exactly where the real instruction would. A memory's size is a
+//     multiple of 4, so the word containing an in-bounds byte is itself wholly
+//     in bounds, and the word containing an out-of-bounds byte is not.
+//   - it is safe under overlap and aliasing in a single-threaded program: the
+//     other three bytes are read and written back unchanged in the same
+//     expression, so anything sharing the word sees no change. (And nothing in
+//     ANOTHER `Buf` shares the word anyway — POLICY 2's 8-byte rounding puts
+//     every allocation in its own pair of words.)
+//   - what it does NOT preserve is the access WIDTH: this touches 4 bytes where
+//     the instruction touches 1. Nothing in VL can observe that today (no
+//     threads, no shared memory), which is why the emulation is admissible.
+function poke8(addr: i32, v: i32) {
+  const lane = addr & 3
+  const wordAddr = addr - lane
+  const shift = lane * 8
+  const old = __load_i32__(wordAddr)
+  const keep = old & ~(255 << shift)
+  __store_i32__(wordAddr, keep | ((v & 255) << shift))
+}
+
+// The low 8 bits of `v` at `off`. Higher bits are discarded, exactly as
+// `i32.store8` would discard them.
+export function store8(self: Buf, off: i32, v: i32) {
+  poke8(self.base + off, v)
+}
+
+// The low 16 bits of `v` at `off`, little-endian. Written as two byte stores
+// rather than one word-level read-modify-write because a halfword at an address
+// congruent to 3 mod 4 STRADDLES two words; going byte at a time is correct at
+// every alignment, straddling included. Replaced by `i32.store16` (0x3b) when
+// `__store_i16__` is declared.
+export function store16(self: Buf, off: i32, v: i32) {
+  const addr = self.base + off
+  poke8(addr, v)
+  poke8(addr + 1, v >> 8)
+}
+
+// ── Bulk ops: correct now, one instruction later (S6). ──
+
+// Set `len` bytes starting at `off` to the low 8 bits of `byte`.
+//
+// TEMPORARY: `memory.fill` (0xfc 11) is one instruction, and needs the
+// emitter's first `0xfc` byte-writer — sequencing item S6. This byte loop is
+// its stand-in: same result, one `call` plus a read-modify-write per byte.
+// A non-positive `len` writes nothing.
+export function fill(self: Buf, off: i32, len: i32, byte: i32) {
+  const addr = self.base + off
+  let i = 0
+  while i < len {
+    poke8(addr + i, byte)
+    i = i + 1
+  }
+}
+
+// Copy `len` bytes from `src` at `srcOff` into `self` at `dstOff` — the
+// DESTINATION is the receiver (O3), matching `dst.fill(...)` and the
+// self-first UFCS shape `std:array` / `std:fmt` already establish. (`Buffer.copy`
+// is not spellable: VL has no static methods.)
+//
+// OVERLAP IS HANDLED. `memory.copy` is defined to behave as if the bytes went
+// through a temporary, so an overlapping copy must not read a byte it has
+// already overwritten. A naive forward loop is wrong exactly when the
+// destination is ABOVE the source and the ranges overlap; the direction is
+// chosen on the absolute addresses to match the instruction's semantics.
+// `self` and `src` may be the same `Buf`.
+//
+// TEMPORARY: replaced by `memory.copy` (0xfc 10) in S6.
+export function copyFrom(
+  self: Buf,
+  dstOff: i32,
+  src: Buf,
+  srcOff: i32,
+  len: i32,
+) {
+  const dst = self.base + dstOff
+  const from = src.base + srcOff
+  if dst < from {
+    let i = 0
+    while i < len {
+      poke8(dst + i, __load_u8__(from + i))
+      i = i + 1
+    }
+  } else {
+    let i = len - 1
+    while i >= 0 {
+      poke8(dst + i, __load_u8__(from + i))
+      i = i - 1
+    }
+  }
+}

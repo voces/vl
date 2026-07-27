@@ -434,10 +434,21 @@ change, not a language change.
 **Recommendation: (c).** It is what P0.3/P0.4 did (free functions first, method sugar explicitly not
 foreclosed), and it is the only option whose first slice is small.
 
+> **RULED (c) — shipped in S5, §J.** `Buffer` lives in `std/buffer.vl`, not the compiler: *"I don't
+> want buffer built into the compiler; I want it in std."* The compiler owns exactly what an
+> instruction is; allocation policy is ordinary code. Measured cost of the ruling: S5 needed **zero**
+> compiler lines.
+
 **O2 — `store8`/`store16`, or the consumer's `storeU8`/`store16`?**
 Stores have no signedness — `i32.store8` truncates and cannot distinguish. The ask spells `storeU8`
 but `store16`, which is inconsistent with itself. Proposal: `store8`/`store16`, and say why in the
 docs so the asymmetry with `loadU8`/`loadI8` reads as intentional. Cheap to overrule.
+
+> **RULED `store8` / `store16` — shipped in S5, §J.** There is exactly ONE instruction per store
+> width and it truncates, so a `storeU8`/`storeI8` pair would falsely imply a signed twin exists.
+> The LOADS keep their split (`loadI8`/`loadU8`/`loadI16`/`loadU16`) because there genuinely are two
+> instructions there. `tests/cases/std/buffer-narrow-stores.vl` pins both halves — `store8` of -1 and
+> of 255 write the same byte, and that byte reads back as -1 or 255 depending on which load asks.
 
 **O3 — `Buffer.copy(dst, dstOff, src, srcOff, len)` — what is the VL spelling?**
 VL has no static methods and no namespaced calls. Options: a free function `bufferCopy(...)` exported
@@ -445,6 +456,11 @@ from `std:buffer`; a UFCS method `dst.copyFrom(dstOff, src, srcOff, len)`; or ad
 `Buffer.copy` as a new syntactic form. Proposal: **UFCS `dst.copyFrom(...)`**, because it needs no
 new syntax and puts the mutated operand in receiver position, matching `dst.fill(...)`. The consumer
 wrote `Buffer.copy` illustratively, not as a spelling requirement.
+
+> **RULED UFCS with the DESTINATION as receiver — shipped in S5, §J.**
+> `dst.copyFrom(dstOff, src, srcOff, len)`. `std:array` and `std:fmt` already establish self-first
+> free functions that read as UFCS methods, and VL has no static methods, so `Buffer.copy` is not
+> spellable at all.
 
 **O4 — What is the exported memory called, and is the export automatic or a flag?**
 `memory` is what webcraft's host expects (`instance.exports.memory.buffer`), and is the universal
@@ -468,11 +484,26 @@ allocator cannot know the total in advance, and a cheap monotonic epoch so a hos
 staleness instead of reading `undefined`. (ii) is attractive for webcraft specifically (it allocates
 at init and never frees) but makes the general case worse.
 
+> **RULED (i), lazy growth, and NO epoch export — shipped in S5, §J.** `Buffer(n)` grows the memory
+> when it must and exports no growth counter. The host contract, stated in `std/buffer.vl`'s header:
+> re-take your typed-array views after any call that may allocate, and detect staleness with
+> `byteLength === 0`. That is what Emscripten (`updateMemoryViews()`), wasm-bindgen
+> (`byteLength === 0`) and Go (`wasm_exec.js` buffer identity) all do; none of them exports a
+> counter, so (iii) would be VL inventing a convention no host expects.
+
 **O6 — Does `Buffer` need `free`?**
 The consumer explicitly does not need it ("allocates a few large Buffers at init and never frees").
 Proposal: **no free, and say so** — bump only. This is the decision that keeps §C4 out of "a second,
 self-managed object model" territory, and it is the one worth being loudest about, because adding
 `free` later means adding a free list, which means the DECISIONS.md line gets renegotiated.
+
+> **RULED reclamation YES, via MARK/RELEASE — shipped in S5, §J.** No per-object `free`, and no free
+> list: `bufferMark(): i32` reads the one bump pointer and `bufferRelease(mark: i32)` restores it.
+> LIFO, no fragmentation, two instructions. The cost is stated at the API surface rather than in a
+> footnote, because it is the first way a VL program can hold a DANGLING REFERENCE at all: a `Buf`
+> held across a `bufferRelease` still points at live, in-bounds, since-reused linear memory, so
+> reads return someone else's bytes and writes corrupt them **silently — no trap**.
+> `tests/cases/std/buffer-mark-release.vl` pins that behaviour by value.
 
 **O7 — Fix §B3 narrowly or properly?**
 Narrow: add `__store_i32__`/`__load_i32__` (and each new width) to `isBuiltinFnName`. One line per
@@ -948,8 +979,11 @@ a parameter read as a VALUE is untouched no matter which list names it.
    naming question, not on any machinery.
 4. **S6 bulk ops** — `memory.copy` / `memory.fill`, needing the emitter's first `0xfc` byte-writer.
    Their host prerequisite (S0, `--enable-bulk-memory`) is in place and pinned. Unchanged.
-5. **Then S5** — the struct, the bump allocator, the methods, in `std:buffer`. Its two hard
-   prerequisites (S1, S3) are now both satisfied, so this is blocked only on the rulings in item 1.
+5. ~~**Then S5** — the struct, the bump allocator, the methods, in `std:buffer`. Its two hard
+   prerequisites (S1, S3) are now both satisfied, so this is blocked only on the rulings in item 1.~~
+   — **done** (§J). O1/O2/O3/O5/O6 were ruled and S5 shipped in the same change; it needed no
+   compiler line and did not wait on item 4 (S6 is an optimization of two `std:buffer` bodies, not a
+   prerequisite of the module). §J4 corrects what this row and §C4 still claimed was missing.
 
 ### I6. A finding this slice did not go looking for: the sabotage harness poisoned its own seed
 
@@ -968,3 +1002,242 @@ artifact**, never rebuild one — only the sabotage's own build may recompile. R
 bootstrap ladder run by hand (a healthy seed compiling a source tree that carries the emitter fix but
 not yet the construct it enables), which is the same ladder any change that the compiler's own source
 depends on will need.
+
+---
+
+## J. What shipped: S5 — `std:buffer`, and the five rulings it implements
+
+Appended to §I, which is appended to §H, which is appended to §A–§G; nothing before it is rewritten
+except the five `> **RULED**` blocks added inline in §D (which record a ruling, not a measurement)
+and §I5's item 5. Where a number here disagrees with one above, this section is the later
+measurement.
+
+Measured on a tree rebased onto master `a9e4995`, against a seed FETCHED from the published
+`seed-latest` release and then proven a fixpoint — `sha256 e9ab9100…` before and after
+`refresh-compiler.sh --prove-fixpoint`, i.e. **this slice's compiler is byte-identical to master's**.
+That equality is what makes §J8's zero-grading possible at all.
+
+### J1. The slice: `Buffer` itself, and ZERO compiler lines
+
+`std/buffer.vl`, ~300 lines of ordinary VL. No `compiler/*.vl` file is touched — which is O1(c)'s
+whole claim, now measured rather than argued.
+
+| | shipped | not shipped |
+| --- | --- | --- |
+| the `Buf` descriptor | `export type Buf = { base: i32, length: i32 }` | — |
+| the allocator | `Buffer(n)`, lazy growth, alignment, the reserved low region | a free list; a second arena |
+| reclamation | `bufferMark()` / `bufferRelease(mark)` | per-object `free` (ruled out, O6) |
+| loads | all 8 widths | — |
+| stores | 4 native + `store8` / `store16` **emulated** | the `__store_i8__` / `__store_i16__` intrinsics (S3's other half, an emitter change) |
+| bulk | `fill` / `copyFrom` as VL **loops** | `memory.fill` / `memory.copy` (S6, an emitter change) |
+| `.length` | a plain `struct.get` field read | — |
+
+The API, in the order §C2's table names it:
+
+```
+Buffer(byteLength: i32): Buf          bufferMark(): i32      bufferRelease(mark: i32)
+buf.length                            buf.base
+buf.loadI8/loadU8/loadI16/loadU16/loadI32/loadI64/loadF32/loadF64 (off)
+buf.store8/store16/storeI32/storeI64/storeF32/storeF64 (off, v)
+buf.fill(off, len, byte)              dst.copyFrom(dstOff, src, srcOff, len)
+```
+
+### J2. The five rulings, and where each one lives in the code
+
+- **O1 = (c)** — `std:buffer` is VL. The compiler owns what an instruction is; policy is code. The
+  measured consequence is the table above: 0 compiler lines, 11 corpus fixtures, one std file.
+- **O2 = `store8` / `store16`** — no `storeU8`/`storeI8` twins. One instruction per store width, and
+  it truncates. The loads keep their split because there really are two instructions.
+- **O3 = `dst.copyFrom(dstOff, src, srcOff, len)`** — the destination is the receiver.
+- **O5 = (i)** — lazy growth, NO epoch export. The host contract is stated in the module header.
+- **O6 = MARK/RELEASE** — reclamation yes, per-object `free` no, and the dangling hazard is stated
+  at the API surface (§D O6's ruling block, and the module header's third paragraph).
+
+### J3. The policy the ruling put in std's hands, and why each way
+
+These are the decisions O1(c) says are "ordinary code". Each is pinned by value in
+`tests/cases/std/buffer-alloc.vl`, so changing one has to redden a test rather than drift.
+
+- **`HEAP_BASE = 1024` — a reserved low region.** Three reasons: address 0 stays outside every
+  allocation, so `base == 0` cannot be a legitimate `Buf`; a program may still poke raw addresses
+  through the bare intrinsics (§A3's collision hazard) and this leaves it a documented kilobyte
+  `std:buffer` promises never to touch; and the host's already-written `ioMem` staging probe wants a
+  fixed low window it can own later without moving the heap. **1 KiB and not one page** — reserving
+  a whole page would force a `memory.grow`, and therefore a host view detachment, during the init of
+  a program that otherwise fits in the default page.
+- **`ALIGN = 8` — sizes round up, bases are 8-aligned.** 8 is the widest scalar VL can store
+  (i64/f64), so every width's natural alignment is satisfied at offset 0 and every 8-multiple offset.
+  This is a PERFORMANCE choice, not a correctness one — the wasm alignment immediate is a hint and
+  §H4/§I2 already pin that every width is legal at every address. A second, free consequence: no two
+  `Buf`s ever share a 32-bit word, which is what makes `store8`'s read-modify-write unable to reach
+  a neighbouring allocation even in principle.
+- **`.length` is what the caller ASKED for**, never the rounded reservation. The padding is the
+  allocator's business and is invisible.
+- **No zero-fill loop.** A wasm memory starts zeroed and freshly grown pages are zeroed (§A2), so
+  bytes that have never been handed out are zero for free. **That guarantee ends at the first
+  `bufferRelease`** — the reused region carries the previous owner's bytes — and that is pinned, not
+  merely documented (`buffer-mark-release.vl` reads 777 out of a freshly allocated `Buf`).
+- **Three traps, all at allocation time, none per access.** A negative length (the bump pointer
+  would walk backwards and hand out overlapping extents); an i32 overflow (past 2 GiB a byte address
+  stops being orderable, so `next > base` silently stops working); and a `bufferRelease` mark outside
+  `[HEAP_BASE, bumpPtr]`. §A4's bounds policy is untouched: there is no per-access check, because the
+  engine's own trap is the memory-safety proof.
+
+### J4. What was re-measured, and the three claims that were STALE
+
+The §A5 probe — a `{base,length}` struct, a mutable module global, lazy growth 1→2 pages, UFCS
+accessors, stores at both ends of a 100 KB extent — was re-run from scratch at master `1863e87` and
+again after the rebase onto `a9e4995`. It prints `100000 / 4242 / 777 / 2` at rc=0 with `vl check`
+clean. Everything §A5 claims holds.
+
+What did NOT hold is the doc's own account of what S5 was still waiting for:
+
+1. **§C4: "The one thing the allocator cannot express today is growth … `__memory_grow__` /
+   `__memory_size__` stop being dead declarations."** Stale since S4 (§H). Both are lowered, and
+   `ensureCapacity` calls them directly. Re-measured here: a 200000-byte `Buffer` grows the memory
+   from 1 page to 4 and addresses byte 202020.
+2. **§B2's 64 KiB hard ceiling.** Gone with the same slice. `buffer-growth.vl` writes three pages
+   past where §A3's two-32-KiB-buffer probe used to trap.
+3. **§I5 item 5: "blocked only on the rulings in item 1", with S6 listed ahead of it.** The rulings
+   came with this change, and S6 is not a prerequisite at all — `fill` and `copyFrom` are VL loops
+   with the right semantics, and S6 replaces two bodies with one instruction each without changing a
+   signature or an expectation.
+
+Two §A–§G claims that this slice's critical path DID depend on were re-verified and held: §A2's
+zero-filled fresh memory (no fill loop is needed, measured through a grow) and §A4's engine trap
+(`buffer-store8-past-memory-traps.vl`).
+
+### J5. The two emulations, and the argument that they are admissible
+
+`__store_i8__` / `__store_i16__` are not declared (§I1 — S3's unshipped half), so `store8` is a
+READ-MODIFY-WRITE over `__load_i32__` / `__store_i32__`, and `store16` is two of those. Memory is
+little-endian, so the byte at `addr` is bits `[8*lane, 8*lane+8)` of the word at `addr - lane`.
+
+Three properties, the third of which is the one that makes this shippable rather than a hack:
+
+- **It traps exactly where `i32.store8` would.** A memory's size is a multiple of 4, so the word
+  containing an in-bounds byte is itself wholly in bounds, and the word containing an out-of-bounds
+  byte is not. Pinned by `buffer-store8-past-memory-traps.vl`; the sabotage that clamps the word
+  address into page 0 is the one that reddens it.
+- **It is safe under aliasing and overlap.** The other three bytes are read and written back
+  unchanged in one expression, and (§J3) no other `Buf` shares the word anyway. That is why
+  `copyFrom` can build an overlapping byte copy on top of it.
+- **What it does NOT preserve is the access WIDTH** — 4 bytes touched where the instruction touches
+  1. Nothing in VL can observe that today: no threads, no shared memory, no host that reads
+  concurrently. When the narrow intrinsics land, `poke8` collapses to one line and every expectation
+  in `buffer-narrow-stores.vl` stays exactly as written.
+
+`store16` deliberately does NOT do one word-level read-modify-write: a halfword at an offset
+congruent to 3 mod 4 STRADDLES two words. Going byte at a time is correct at every alignment, and
+offset 27 in `buffer-narrow-stores.vl` is that case.
+
+`copyFrom` picks its direction from the absolute addresses because `memory.copy` is defined to
+behave as if the bytes went through a temporary. Both wrong directions are distinguishable by value,
+and both are pinned: a naive forward loop turns `1,2,1,2,3,4,5,6` into `1,2,1,2,1,2,1,2`, and a naive
+backward loop turns `3,4,5,6,7,8,7,8` into `7,8,7,8,7,8,7,8`.
+
+### J6. What the corpus pins
+
+`tests/cases/std/`, 11 files — 6 `@run` carrying 108 `@log` lines, 5 `@trap`. Every numeric
+expectation is the python `struct` encoding of the value, never hand-derived (§H6's rule).
+
+- **`buffer-alloc.vl`** — the allocator policy BY VALUE: `.length` is the requested length, the first
+  base is 1024, 3 bytes advance the pointer to 1032 and 1 byte to 1040, fresh bytes are zero, two
+  `Buf`s do not collide, and none of it grows the memory.
+- **`buffer-widths.vl`** — the four native store widths and the eight loads, each round-tripped
+  against a DIFFERENT width so the store and the load check each other: an i32 read back byte by
+  byte, an i64 read back as its two i32 halves, f32/f64 read back as their integer bit patterns, plus
+  unaligned f32 at 41 and f64 at 51.
+- **`buffer-narrow-stores.vl`** — 28 pins on the emulation: every lane of a word, neighbour survival,
+  truncation, `store8(-1) == store8(255)`, sign vs zero extension with the 127 / 32767 CONTROLS where
+  the two spellings must AGREE, and `store16` at lanes 0, 1 and 3 (the straddle).
+- **`buffer-bulk.vl`** — `fill` (aligned, unaligned, zero length, negative length, truncated byte),
+  `copyFrom` between two buffers and at length 0, and both overlap directions.
+- **`buffer-growth.vl`** — 1 page → 4, both ends of a 200000-byte extent, freshly grown pages are
+  zero, a later allocation that fits does not grow again, and **growth does not move guest data** (a
+  `Buf` allocated before the grow still reads back what it wrote).
+- **`buffer-mark-release.vl`** — LIFO reuse, nested marks, a no-op release, and the two HAZARDS
+  pinned as behaviour: the reused region carries the previous owner's bytes, and a `Buf` held across
+  the release silently aliases its successor.
+- **the five traps** — a `store8` a megabyte past a one-page memory (`memory access out of bounds`,
+  i.e. §A4 through the `Buf` surface), a negative length, an i32-overflowing size, and a release mark
+  on each side of the legal range.
+
+### J7. Two findings this slice did not go looking for
+
+- **`Buffer`'s `memory.grow`-returned-`-1` branch is not corpus-testable, and it is not for the
+  reason one would guess.** The i32 overflow guard caps a reservation at 2^31, i.e. at most 32768
+  pages, while wasm32's own ceiling is 65536 — so the SPEC limit is unreachable from `Buffer` and
+  only host resource exhaustion can produce the sentinel. Measured: **both** hosts satisfy a 2 GiB
+  request without complaint (`vl run` under wasmtime 47 reports `__memory_size__() == 30518`; a bare
+  V8 `WebAssembly.Memory.grow(30517)` succeeds identically). There is therefore no request that fails
+  deterministically on every host, and the branch stays defensive and unpinned — said out loud in the
+  code beside it, so the next reader does not mistake it for covered. The guard that IS reachable and
+  cheap — `Buffer(2147483647)`, which traps BEFORE attempting any growth — is pinned instead.
+- **The `std:buffer` fixtures reach the corpus oracle but not the NATIVE alignment suite.**
+  `tests/cases_wasm_test.ts` walks `tests/cases/**` and picked all 11 up automatically;
+  `tests/selfhost_native_align_test.ts` carries EXPLICIT whitelists (deliberately, so it does not
+  regress when a parallel PR grows another list), so new cases are invisible to it until someone adds
+  them. All 11 were adjudicated natively by hand for this change — `vl run` stdout equal to the
+  `@log` lines and `vl check` clean for the 6 run cases, nonzero exit for the 5 traps — but promoting
+  them into that file's `RUN_CASES`/`TRAP_CASES` belongs to its owner and is the obvious follow-up.
+
+### J8. Grading the zeros: which instrument was live, and which was only coverage
+
+The corpus A/B and the fuzz A/B both came back **clean, and neither is evidence of anything about
+this slice**. Said plainly:
+
+- the compiler is byte-identical on both sides (`sha256 e9ab9100…`), because no `compiler/*.vl` line
+  changed;
+- no pre-existing corpus case and no generated fuzz program imports `std:buffer`, so there is no path
+  by which a defect in it could reach either sweep.
+
+Those two sweeps therefore prove **the absence of collateral damage** — 1471 pre-existing cases
+identical across build status, emitted-wasm sha256, diagnostic text, run status, run stdout and run
+stderr; 5 pinned fuzz seeds × 200 programs identical class-for-class — and nothing else. The A/B
+delta is exactly 11 added lines and zero changed ones.
+
+The live instrument is the 11 fixtures, and that was proven by **sabotage**: 17 defects applied one
+at a time to `std/buffer.vl`, each reverted before the next.
+
+| sabotage | fixtures that redden |
+| --- | --- |
+| `HEAP_BASE` 1024 → 512 | alloc, growth, mark-release |
+| `ALIGN` 8 → 4 | alloc |
+| `poke8` drops the lane shift | bulk, narrow-stores |
+| `poke8` forgets to clear the old byte | bulk |
+| `poke8` wraps the address into page 0 | store8-past-memory-traps |
+| `store16` writes only the low byte | narrow-stores |
+| `loadI8` zero-extends | narrow-stores |
+| `loadI64` reads one byte high | widths |
+| `copyFrom` always forward | bulk |
+| `copyFrom` always backward | bulk |
+| `fill` runs one byte long | bulk |
+| `ensureCapacity` drops the page round-up | growth |
+| `Buffer` accepts a negative length | negative-length-traps |
+| `Buffer` drops the i32 overflow guard | size-overflow-traps |
+| `bufferRelease` accepts a mark above the pointer | release-above-pointer-traps |
+| `bufferRelease` accepts a mark below the heap base | release-below-base-traps |
+| `bufferRelease` does not move the pointer | mark-release |
+
+**17 of 17 sabotages reddened something, and 11 of 11 fixtures were reddened by at least one** — no
+fixture is decoration and no pin is asleep. §I6's hazard does not apply here and was checked rather
+than assumed: `std/buffer.vl` is not part of `compiler/*.vl` and nothing in the compiler imports it,
+so no sabotage could reach the seed, and the seed's sha256 is unchanged across the whole harness.
+
+### J9. Where §I5's list stands now
+
+1. ~~O1, O5, O6~~ — **ruled**, together with O2 and O3 (§J2, and the `> RULED` blocks in §D).
+2. ~~S1 / O7, the capture fix~~ — done (§I4).
+3. **The two NARROW store widths** — `__store_i8__` / `__store_i16__`. No longer blocked on O2 (which
+   is ruled): they are a table entry each, mechanically identical to the three wide ones §I1 shipped.
+   `std:buffer` emulates them today, so this is now a pure optimization that deletes `poke8` and must
+   leave `buffer-narrow-stores.vl` passing unchanged.
+4. **S6 bulk ops** — `memory.copy` / `memory.fill`, the emitter's first `0xfc` byte-writer. Same
+   shape: `fill` and `copyFrom` already have the right semantics and the right expectations, so S6
+   replaces two bodies and changes no signature.
+5. ~~S5 `std:buffer`~~ — **done**, this section.
+6. **New, and now measurable for the first time:** §G's open question "the real cost of the
+   per-access call under a hot loop", which it said "can only be taken after S5". There is now a
+   kernel to write it against, and it is the number that decides O1(b) (compiler-known `Buffer`
+   methods) versus leaving O1(c) as the permanent answer.
