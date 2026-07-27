@@ -8818,9 +8818,33 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           }
           // A UNION-typed global (kind 4) coerces a raw assigned value into the
           // box (`w = 5` over `let w: string | i32` boxes the 5).
+          //
+          // A LITERAL-union global is NOT a value-union box — its cell is a plain
+          // `(mut i32)` interned ATOM — so it must NOT reach `emitUnionCoerce`, which
+          // `struct.new`s the `{tag, payload}` box into that i32 cell (`type mismatch:
+          // expected i32, found (ref $type)`, `vl check` clean, EVERY member RHS and
+          // every arity). The LOCAL arm below has carried this exclusion since it was
+          // written; the global arm never did, so `type K = "a" | "b"` + `let v: K = "a"`
+          // + `v = "b"` emitted an invalid module while the same three lines inside a
+          // function ran. Falls through to the seed block below, where `litUnion` lowers
+          // the member RHS as its interned id — exactly the local arm's shape.
           const gUNm = letUnionNameOf(gLet, -1)
-          if gUNm != "" {
+          if gUNm != "" && !nameIsLitUnionType(gUNm) {
             if emitUnionCoerce(body, gUNm, a.binRight, fnIx) < 0 { return -1 }
+          } else if exprIsI64(a.binLeft, fnIx) {
+            // An i64 GLOBAL target (`a = 7` over `let a: i64`) widens an i32 RHS to i64 — the
+            // LOCAL arm's own words: "without this the bare `i32.const` clashes with the i64
+            // slot (the checker accepts the assignment, so it is a soundness hole)". The global
+            // arm never had it, so `let a: i64 = 0` + `a = 7` emitted `i32.const 7` into a
+            // `(mut i64)` cell — invalid wasm from two ordinary lines, `vl check` clean, at TOP
+            // LEVEL as much as inside a function. An already-i64 RHS (`a = b`, `a = a + 1`)
+            // makes `emitExprAsI64` a no-op, which is why those two spellings escaped.
+            if emitExprAsI64(body, a.binRight, fnIx) < 0 { return -1 }
+          } else if exprIsF64(a.binLeft, fnIx) {
+            // The f64 twin, same rationale and the same LOCAL-arm mirror: `let a: f64 = 0.0` +
+            // `a = 7` pushed an i32 into the `(mut f64)` cell. An f64-literal RHS (`a = 1.5`)
+            // needs no widening, which is why only the INTEGER-literal spelling was broken.
+            if emitExprAsF64(body, a.binRight, fnIx) < 0 { return -1 }
           } else if (
             exprString(a.binLeft, fnIx) &&
             exprIsLitAtom(a.binRight, fnIx)
@@ -8869,6 +8893,12 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
                 }
               }
             }
+            // A LITERAL-union global (`v = "b"` over `let v: K`): the member RHS lowers
+            // as its interned i32 id, not as a heap string. The twin of the local arm's
+            // `exprIsLitAtom(a.binLeft, …)` seed, and the other half of the litunion
+            // exclusion above — without it the union-coerce reject becomes a `(ref
+            // $array)` string stored into the `(mut i32)` atom cell.
+            if exprIsLitAtom(a.binLeft, fnIx) { gsCtx.litUnion = 1 }
             if emitExprExpect(body, a.binRight, fnIx, gsCtx) < 0 { return -1 }
           }
           pendingListKind = 0
