@@ -27104,3 +27104,318 @@ cleanest signal available.
   slot`) — reproduced on master and on this branch, filed with a witness, not attempted. It is
   what makes `annObjFieldSplit`'s map arm unreachable, and it is an `emit_classify` interning
   question, outside this partition.
+
+## D-CLASSGRAM — `emit_classify.vl` holds the LAST of both closed tiers; the whole-spelling tier reaches ZERO tree-wide, and grading one of its zeros finds an f32 defect four slices had walked past (off master `a571a02`)
+
+D-WHOLESPELL closed the whole-type-spelling-equality tier in `typecheck.vl` and
+`emit_collect.vl`; D-GRAMPRED closed the character-surgery tier in `emit_base.vl` and
+`emit_collect.vl`. Both left their remainder in ONE file. This slice takes it.
+
+**Tier 1 (whole-spelling equality): my file 8 → 1, tree-wide 12 → 5, and every one of the 5
+survivors is a FALSE POSITIVE — so the removable figure is 7 → 0 and the tier is CLOSED.**
+**Tier 2 (grammar predicates by character index): my file 8 sites → 5 closed, 2 reclassified
+as non-members, 1 declined with the measurement.**
+
+### THE TWO CENSUSES — RE-DERIVED INDEPENDENTLY, AND BOTH BRIEFS' FIGURES ARE EXACT
+
+**TIER 1.** `(?:!=|==)\s*"((?:\\.|[^"\\])*)"` over comment-stripped source (string-literal-aware
+stripper that PRESERVES the literals, since they are the object of the census), keeping a literal
+that contains one of `[]{}|<>` **and** at least one alphanumeric; a match spanning a newline is
+FLAGGED rather than counted.
+
+| file | master `a571a02` | this PR |
+|---|---:|---:|
+| `emit_classify.vl` | 8 | **1** |
+| `wasmEmit.vl` | 4 | 4 (other partition) |
+| `typecheck.vl` | 0 (+1 multiline FP) | 0 |
+| `emit_collect.vl` / `emit_base.vl` / `std` / `scripts` | 0 | 0 |
+| **tree-wide** | **12** | **5** |
+
+The one multi-line false positive at `typecheck:12571` reproduces exactly. And the record's
+reclassification is confirmed by reading every site: **the 5 survivors are all
+`inferNicheNullByName`'s published 3-valued protocol return** (`""` / `"boolean|null"` /
+`"string|null"`) — one in this file, four in `wasmEmit.vl`. That function's body asks the grammar
+homes and then TAGS its answer; the compared value is the tag. **The removable tree-wide figure
+was 7 and is now 0.** My site now carries an in-code note saying so, because this false-positive
+shape is not detectable from the regex — it needs the compared expression's provenance.
+
+**TIER 2.** #1222's instrument verbatim: one textual comparison of a type-name character against a
+character literal, in non-comment code, where the index is a POSITION EXPRESSION rather than a bare
+walk cursor.
+
+| unit | master | this PR |
+|---|---:|---:|
+| UNIT A character comparisons, `emit_classify.vl` | 8 | **2** |
+| — of which HAND-WRITTEN at a use site | 8 | **1** (the declined site) |
+| — of which living at a NAMED HOME | 0 | **1** (`sigKeyPinPayload`) |
+
+The brief's eight SITES are 5 closed, 2 reclassified, 1 declined. The two the instrument already
+excludes by design (`sigParamCoerceKind`'s `c == '>'`, `sigKeyRetTokIx`'s `k[i] == '>'`) turn out
+to be excluded for the RIGHT reason and a stronger one than "bare cursor" — see below.
+
+### THE SEVEN TIER-1 SITES, AND WHAT EACH BECAME
+
+| site | became | width check |
+|---|---|---|
+| `listElemIsBool` `lt.tyName == "boolean[]"` | `arrElemNameRaw(lt.tyName) == "boolean"` | **declined `nameIsI32Array`** — REP-wide (also `i32[]`, `K[]`, `(boolean\|null)[]`, `(K\|null)[]`); this site is about PRINT formatting, which only a real `boolean` leaf recovers |
+| `refArrShapeKind` `== "f64[][]"` / `"i64[][]"` / `"f32[][]"` | one hoisted `const inner2 = arrElemNameRaw(name)` + `nameIsF64Array` / `nameIsI64Array` / `nameIsF32Array` | the three homes ARE `arrElemNameRaw(n) == "<leaf>"`, spelling-EXACT — unlike `nameIsStringArray` one line above, which the arm's own comment already flags as also accepting `(string\|null)[]` |
+| `refArrElemName` `== "i64[][]"` → `"i64[]"` (×3) | one hoisted `const raElem` + the same three homes, **returning `raElem`** | the cut is also the ANSWER, so three string literals leave the data section |
+
+**Provably equivalent over all inputs, not merely over the inputs tried.** `arrElemNameRaw` returns
+`""` for a non-array name and otherwise `name` minus its final two characters, so
+`nameIsF64Array(arrElemNameRaw(n))` holds on exactly `n == "f64[][]"`; and where `n == "i64[][]"`,
+`arrElemNameRaw(n)` IS `"i64[]"`. Both hoists are pure and the arm ORDER is untouched.
+
+### THE FIVE TIER-2 ROUTES, AND THE THREE THAT DO NOT GET ONE
+
+| site | became |
+|---|---|
+| `mvCanonValName` `vn > 1 && [0]=='{' && [vn-1]=='}'` | `nameIsBraceSpanEnds` — and the now-readerless `const vn` **deletes** |
+| `rlCanonLitUnionAtoms` `[0]=='{' && [n-1]=='}'` | `nameIsBraceSpanEnds` |
+| `rlCanonLitUnionAtoms` `n >= 2 && [1]=='['` | `nameIsMapOpen` — the exact "is it a group at all, then which kind" two-step #1222 rewrote `annObjFieldSplit`'s tri-state as |
+| `gaeEnsure` `len<3` + `[len-1]!='>'` + `gaeLtAt<=0` | `annGenAppSpanEnds` — whose own header names `emit_classify.gaeEnsure` as the third caller it wants |
+| `paramCloSigKey` `nm[0]=='=' && nm[1]=='>'` + `slice(2,…)` | **a new home, `sigKeyPinPayload`** |
+
+Bounds, each checked rather than assumed: `vn > 1` IS the home's `length >= 2`;
+`rlCanonLitUnionAtoms` carries only `n >= 1`, and at `n == 1` both readings are false because one
+character cannot be both `{` and `}`; the map arm's own `n >= 2` conjunct IS the map home's bound,
+now asked once. `gaeEnsure` keeps `const ltAt = gaeLtAt(name)` for its slices rather than threading
+it out of the home — the identical trade `annGenAppDecompose` takes, and it costs a second scan only
+on a name that already ended in `>`. Decomposing through `annGenAppDecompose` instead would split the
+argument list BEFORE `gaeEnsure`'s `structIndexByName` early-out, which is work it does not do today.
+
+### THE `=>` QUESTION IS NOT THE QUESTION THE BRIEF NAMED
+
+The brief lists the four grammar questions as *shape · map · generic application · **function
+type***, with `paramCloSigKey`'s `nm[0]=='=' && nm[1]=='>'` as the function-type one. Read at the
+site, it is not. **A source function type is `(i32) => string` — its arrow sits at a POSITIVE index
+behind a parenthesized parameter list**, which is what `annArrowAt` / `nameIsFuncTypeAtom` / the
+`strContains(nm, "=>")` arm three lines below all ask about. The test here is `starts with "=>"`,
+the marker `monoInstantiate` stamps on a closure-pinned parameter whose `TypeRef.tyName` slot holds
+an interned `$fnsig` ABI key instead of a type spelling (`"=>i>d"`). It is a PROVENANCE test on an
+overloaded column, not a grammar test — and reading it as "is a function type" would classify every
+annotated closure param as a pin and slice two characters off its annotation. `sigKeyPinPayload` is
+named for what it is, and its header names the **two more copies in `emit_mono.vl`** (the
+`fnValUsed` flip and the un-annotated closure param's result pin) so the slice that owns that file
+has the list already made.
+
+### TWO SITES ARE NOT THIS GRAMMAR AT ALL, AND SAYING SO IN CODE IS THE DELIVERABLE
+
+`sigParamCoerceKind`'s `c == '>'` and `sigKeyRetTokIx`'s `k[i] == '>'` walk a `$fnsig` ABI KEY — a
+string the compiler MINTED, over a token alphabet `emit_rep.repKindOfSigTok` owns — not a rendered
+type. #1222's instrument already excludes them as bare cursors; the stronger reason is that there is
+no type there to destringify. Both are also **not routable**, which is worth recording so nobody
+tries: `repKindOfSigTok('>')` is `null`, but so is every digit and `;` inside a slot token, so that
+compare would WIDEN; and `sigKeyRetTokIx` finds the LAST `>` with a whole-key scan, which inside
+`sigParamCoerceKind`'s per-character loop would make the walk quadratic. Both now carry the note.
+
+### THE ONE DECLINE, WITH ITS MEASUREMENT
+
+`internShapeArms` asks the BARE brace opener — `{` at index 0, no second-character conjunct, no
+closing test — under a `length >= 1` bound. The brace family has four homes
+(`nameIsShapeOpen` = `len>=2·OPEN·NOT2ND`, `nameIsMapOpen` = `len>=2·OPEN·2ND`,
+`nameIsBraceSpanEnds` = `len>=2·OPEN·CLOSE`, `nameIsShapeSpanEnds` = the first ∧ the third) and this
+is a **fifth member none of them covers**. The available spelling
+`nameIsShapeOpen(uCore) || nameIsMapOpen(uCore)` is that disjunction exactly — but only above
+`length >= 2`, so it NARROWS the site at the single input `uCore == "{"`.
+
+Both halves measured: **poison P1** (`emitFail` when `uCore` is exactly one `{`) fires on **0** of
+1,501 corpus files while its inverted control P1c — the same arm reached at all — fires on **160**;
+**sabotage S9**, which TAKES the narrowing, reddens **0** wasm sha256 and **0** run-stdout lines.
+Live arm, measured-EMPTY divergence set, no graded consequence. An empty population is the ABSENCE
+of a witness, not agreement, so the faithful bound ships. The move the site wants is a
+`nameIsBraceOpen` home beside its four siblings in `emit_base.vl` — **a SOURCES problem, not a site
+problem**, and that file is not this slice's.
+
+### SABOTAGE — SEVENTEEN COMPILERS, AND THE COMPARATOR PROBE THE BRIEF TOLD ME NOT TO QUOTE
+
+Every sabotage is a one-line edit at exactly one site, rebuilt into a whole compiler; all 17 source
+trees distinct from each other, and **S0 (the branch source, unmodified) rebuilds byte-identical to
+the branch's own fixpoint**. Graded on wasm sha256 over the corpus and on the run-stdout out-dir
+tree.
+
+| sabotage | site | wasm sha diffs | run stdout diff lines |
+|---|---|---:|---:|
+| **S0 control** | branch source, unmodified | **0** | **0** |
+| S2 / S2b / S2c | `refArrShapeKind` f64 / i64 / f32 kinds | 10 / 10 / 4 | 96 / 96 / 43 |
+| S3 / S3b / S3c | `refArrElemName` i64 / f64 / f32 arms | 6 / 5 / 2 | 55 / 49 / 24 |
+| S7 | `gaeEnsure`'s generic-span gate dropped | 1 | 4 |
+| S1 | `listElemIsBool`'s `boolean` leaf | **0** | **0** |
+| S4 | `mvCanonValName` routed to the NARROW brace home | **0** | **0** |
+| S5 | `rlCanonLitUnionAtoms` routed to the NARROW brace home | **0** | **0** |
+| S6 | its MAP arm deleted | **0** | **0** |
+| S8 | `sigKeyPinPayload`'s payload off by one | **0** | **0** |
+| S9 | the DECLINED narrowing taken | **0** | **0** |
+
+**AND THE REP-SEAM PROBE, WHICH REFUTES THE FIGURE I WAS HANDED.** The brief says to grade with both
+rep sabotages and reports that #1221 "measured the TREE authoritative and narrowed it to the
+`ek == "atom"` arm". Re-measured at `a571a02`:
+
+| probe | reddens |
+|---|---:|
+| RFLAT — `emit_rep.repOfArray`'s f64 arm broken | **0 / 0** |
+| RTREE — `emit_rep.rtListVKind`'s f64 arm broken | **21 wasm sha / 209 run lines** |
+| RTREEATOM — `rtListVKind`'s `ek == "atom"` arm broken | **0 / 0** |
+
+The TREE is still the authoritative seam — but **the `atom` arm is now inert and the `f64` arm is
+the live one.** The seam moved between slices exactly as the brief warned, and the ARM moved with
+it. Quoting `atom` would have shipped a dead comparator.
+
+### GRADING THE SIX ZEROS — FIVE POISONS, EVERY CONTROL FIRING
+
+Ten poison compilers, each an `emitFail` on exactly the divergence set of a zero, each paired with
+an INVERTED CONTROL (the take-1 lesson: a suite whose controls read 0 measured nothing).
+
+| poison | measures | fires |
+|---|---|---:|
+| P1 | S9's divergence — `uCore` is exactly `"{"` | **0** |
+| P1c | the `{`-open arm reached at all — CONTROL | 160 |
+| P2 | S4's divergence — `mvCanonValName` sees a MAP value name | **20** |
+| P2c | its brace arm taken — CONTROL | 41 |
+| P3 | S5/S6's divergence — `rlCanonLitUnionAtoms` sees a MAP name | **48** |
+| P3c | its brace arm taken — CONTROL | 151 |
+| P4 | S8's divergence — a `=>`-prefixed mono PIN reaches `paramCloSigKey` | **0** |
+| P4c | an arrow-carrying param annotation reaches it — CONTROL | 104 |
+| P5 | S1's divergence — `listElemIsBool`'s annotation arm sees a `boolean[]` | **0** |
+| P5c | that arm reached at all — CONTROL | 32 |
+
+**P2 = 20 and P3 = 48 are the slice's most consequential pair.** They say the WIDTH choice was live:
+had those two sites been "deduped" to `nameIsShapeSpanEnds` — the narrower home, sitting right next
+to the right one, with a nearly identical name — 68 corpus files' worth of MAP-valued names would
+have stopped being canon-softened. S4/S5 then measure the downstream consequence at 0. Reached, not
+load-bearing on today's corpus, and emphatically **not a licence** — which is what #1219's "check the
+home's WIDTH" looks like when the population is actually counted.
+
+**P5 = 0 with P5c = 32, and a hand-built probe finishes the grading.** The corpus reaches
+`listElemIsBool`'s annotation arm on 32 files but never with a `boolean[]`. Twenty hand-written
+candidates against S1 found **one shape that REACHES the arm with a `boolean[]`** — `const bs:
+boolean[] = [true,false]` then `bs.pop()` — and it still prints identically under the sabotage,
+because when the annotation arm answers false the initializer arm three lines below answers true
+anyway. Where the initializer CANNOT decide (`= []`), the arm is not reached at all; some earlier
+classifier owns the index/for-in reads. So the arm is **REACHED and NOT LOAD-BEARING** — the same
+structure #1222 found at `canonBareShapeName`, and a fact no corpus zero alone could produce.
+
+### GRADING A ZERO FOUND A DEFECT AGAIN — AND THE BRIEF'S DESCRIPTION OF IT IS WRONG
+
+D-WHOLESPELL filed `f32[]` inferred list return as an emit reject and framed it as an
+INFERRED-return problem, pinned by `tests/cases/arrays/error-inferred-f32-list-return.vl`. Re-taken
+here against master `a571a02`, per shape:
+
+| shape | master | this PR |
+|---|---|---|
+| `function mk(): f32[]` + `mk()[0]` | **REJECT** | runs |
+| `function mk(): f32[]` + `const xs = mk()` + `xs[0]` | **REJECT** | runs |
+| `function mk(): f32[]` + `mk().length` | **REJECT** | runs |
+| `function mk(): f32[]` + `const xs: f32[] = mk()` + `xs[0]` | runs | runs |
+| `function mk()` (inferred) + `mk()[0]` | REJECT | REJECT (unchanged) |
+| every `f64` / `i64` / `i32` sibling of all of the above | runs | runs |
+
+**It is not an inferred-return defect. An ANNOTATED `f32[]` return was broken too**, and had been
+since f32 lists existed, because f32 has NEITHER of the two channels its siblings use:
+`retAnnKindChain`'s producer set carries no f32-list arm — its own header says so deliberately, "an
+i64/f32 LIST annotation never flagged here… an annotated `i64[]` return rides the typed-IR path" —
+and there IS no typed-IR path for f32, because `tyKindOf` carries no f32-array kind on purpose (a
+float LITERAL types f64, so a general typed claim would mis-claim a literal-built f64 list). The
+callee's own result valtype was right the whole time (`cloRetValKind` reads `vtKindOfType(fn.fnRet)`
+straight off the annotation); only the CALLER's classifier disagreed with it, so the read fell
+through to the i32-array arm and rejected over a program with no i32 array.
+
+`exprF32Array` now reads the annotation node (`fnRetAnnF32Array` → `retF32ArrFlag`), the one channel
+f32 does have. Pinned by the new `tests/cases/arrays/f32-array-return.vl`, the f32 twin of the
+existing `f64-array-return.vl` — **it fails on master and passes here.**
+
+**The UN-annotated sibling is deliberately NOT fixed, and that decision is measured too.** The
+ungated one-liner was built and run first: it makes the inferred case emit INVALID WASM
+(`type mismatch: expected i32, found (ref $type)`) because `emit_collect`'s A20 chain never stores
+`"f32list"` for it, so the function's result valtype really is i32 and claiming the call site is an
+f32 list is a lie. Turning a loud reject into invalid wasm is strictly worse; the fix is gated on
+`fn.fnRet >= 0` and `error-inferred-f32-list-return.vl` stays an `@emit-error`. **A second,
+pre-existing invalid-wasm shape is filed rather than fixed**: an INFERRED `f32[]` return bound to an
+ANNOTATED let (`const r: f32[] = mk()`) emits an invalid module **on master too**, verified.
+
+### THE PERFORMANCE RESIDUAL — RE-MEASURED, FILED AT THE SITE, AND UNTAKEABLE FROM HERE
+
+`emit_collect.fnIndexOfInScopeChain` files the compiler's last super-linear scope-chain term against
+`fnStmtsPosOf`, in this file. Re-measured on a generated frame ladder (whole `vl build`, best of 3):
+**N = 100 / 200 / 400 / 800 → 31 / 36 / 83 / 227 ms** — the 400→800 step costs 2.7x for 2x the input.
+The diagnosis holds.
+
+**The fix still cannot be written from this file.** `fnStmts`'s five writers are `emit_collect`'s two
+`.push` and `emit_mono`'s two `.push` plus its IN-PLACE `fnStmts[origFe] = nfn`, every one outside
+this partition. A last-answer memo is equal to the scan only if no LOWER position can ever come to
+hold an already-memoized node — a property of `emit_mono`'s replacement writer (its `nfn` is a fresh
+clone, so its arena index is new), true today, **unpinnable from here**, and a silent miscompile the
+day it stops being true. The honest fix is an index built AT the writers or an invalidation signal
+minted by them. A SOURCES problem, filed at the site with the witness.
+
+### COUNTS — ALL THREE UNITS
+
+* **TIER 1, whole-type-spelling equality: my file 8 → 1; tree-wide 12 → 5, all 5 false positives.
+  Removable population 7 → 0 — the tier is CLOSED.**
+* **TIER 2, grammar-predicate character tests: my file 8 → 2**, of which 1 is the measured decline
+  and 1 is the character compare now living at a NAMED HOME. Hand-written at a use site: **8 → 1.**
+* **UNIT B, the TRACKED metric — CORE 23-resolver call sites in `emit_classify.vl`: 176 → 176,
+  FLAT.** Every home routed to is off the CORE list — the same reading #1186 reported, and further
+  confirmation of #1222's note that the rising-CORE effect is a property of WHICH grammar is homed,
+  not a law of the program.
+* **UNIT C, named calls to the 14 grammar homes this slice touches, tree-wide: 159 → 174 (+15).**
+  Decomposed exactly: `arrElemNameRaw` +3, `nameIsF64Array` +2, `nameIsI64Array` +2,
+  `nameIsF32Array` +2, `nameIsBraceSpanEnds` +2, `nameIsMapOpen` +1, `annGenAppSpanEnds` +1,
+  `sigKeyPinPayload` +1 (a new home), `retF32ArrFlag` +1 (the f32 fix). FLAT: `nameIsShapeSpanEnds`
+  12, `nameIsShapeOpen` 10, `nameIsArray` 36, `nameIsMap` 14, `gaeLtAt` 6. The destringify routes
+  are +14 of the +15.
+* **Binary 1,039,202 → 1,039,251 B (+49)**, attributed by building each change alone and exactly
+  additive: the destringify routes are **−159 B** (1,039,043) and the f32 fix **+208 B**. The
+  routes shrink the file — three `"i64[][]"`-class literals leave the data section and a `const`
+  dies — while the fix adds a function, its comment-free body, and a call.
+
+### GATE — EVERY LEG, EXIT CODE TAKEN WITHOUT A PIPE
+
+| leg | rc | result |
+|---|---:|---|
+| `fetch-seed.sh` (freshly fetched, published) | 0 | 1,039,202 B, sha `ad2e3c4e…` — **verified to be master's own fixpoint** (`refresh --prove-fixpoint` on unmodified master takes the ONE-compile rung) |
+| `refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint at 2 compiles, 1,039,251 B |
+| `native-fixpoint.sh` | 0 | stage3 == stage4, 1,039,251 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,196 passed / 0 failed / 8 ignored** — master's 3,194 + 2 for the new fixture; **8** ignored, not 14, so the six `vl build -O` tests really ran |
+| `lint-self.sh` (incl. `vl fmt --check`) | 0 | clean |
+| `rep-fuzz-check.sh` | 0 | exact, 1 baselined (0 unsound / 1 reject), 0 new / 0 stale |
+| corpus A/B, 5 channels, 1,501 files | 0 | **exactly ONE moved row of 1,501, and it is the new fixture.** 1,267 of 1,268 emitting files byte-identical at wasm sha256; the diagnostic diff (5 lines) and the run-tree diff (8 lines) are that same file and nothing else |
+| corpus A/B of the DESTRINGIFY ROUTES ALONE, 1,500 files | 0 | **0 build-status, 0 wasm-sha256, 0 diagnostic-text, 0 run-status, 0 run-stdout diffs** |
+| fuzz A/B, pinned seeds 1–14 × depths 4–6 × 300 × {plain, declared} | 0 | **25,200 programs/side; out-dir trees byte-identical** (`diff -r` = 0 lines once the per-run `mktemp -d` name is normalised — the raw 9,394-line diff was that path and nothing else). Failure-class totals identical: 1 INVALID-WASM + 2,238 REJECT, 2,239 kept cases each side |
+| strongest proof: candidate compiles FROZEN master source | 0 | `ad2e3c4e…` — byte-identical to master's own output AND to the published seed |
+
+### METHOD NOTES
+
+* **"Check the home's WIDTH" is worth a POISON, not a paragraph.** The two brace-span sites had a
+  narrower home one line away in the same file with a nearly identical name. The sabotage that takes
+  the narrowing reads 0 on every output channel — and the poison says the population is 20 and 48
+  corpus files. Without the poison the decision reads as taste; with it, it reads as 68 files.
+* **A comparator probe has a shelf life.** The rep-seam sabotage the brief handed me (`atom` arm,
+  tree side) is INERT at this base; the `f64` arm of the same function fires 21/209. The seam was
+  still right and the arm was still wrong, so "re-measure, do not quote" bought a working comparator
+  rather than a confident zero.
+* **A census that only ever ROUTES will misclassify.** Three of my eight tier-2 sites wanted no home
+  at all: two are `$fnsig` ABI-key walks with no type in them, and one wants a home in a file I may
+  not edit. Naming that in code — with the reason each is not routable — is the deliverable for
+  those three, and it is what stops the next census from re-deriving them.
+* **A defect's FILED description is a claim like any other, and worth re-taking.** "`f32[]` INFERRED
+  list return is an emit reject" understated it by half: the ANNOTATED return was broken too, on
+  three of the four shapes, and the annotated half is a two-line fix while the inferred half is not
+  fixable without turning a reject into invalid wasm. Re-running a filed repro across its
+  neighbourhood — annotated/inferred × direct-index/bound/`.length` — is what separated them.
+* **Build the ungated fix FIRST and read what it breaks.** The ungated one-liner looked strictly
+  better (it fixed one more shape) and was strictly worse (that shape became invalid wasm). Only
+  building it showed which.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **`wasmEmit.vl`'s four tier-1 sites** — all four are the `inferNicheNullByName` protocol-return
+  false positive, so there is nothing to remove; they want a census reclassification, not a change.
+* **The `nameIsBraceOpen` home** `internShapeArms` wants, beside its four siblings in
+  `emit_base.vl` — another slice's file. Declined WITH the measurement (P1 = 0 divergence on a
+  160-file live arm, S9 = 0 consequence).
+* **The UN-annotated `f32[]` list return**, and the `const r: f32[] = mk()` invalid-wasm shape that
+  sits behind it — both reproduced, both filed with witnesses, both rooted in `emit_collect`'s A20
+  chain storing no `"f32list"` for an inferred return.
+* **`fnStmtsPosOf`'s memo.** Re-measured at 31/36/83/227 ms; untakeable from this file because every
+  writer of `fnStmts` is outside the partition. Filed at the site.

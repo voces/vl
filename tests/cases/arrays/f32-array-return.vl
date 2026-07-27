@@ -1,0 +1,57 @@
+// @run
+// @log 2.5
+// @log 1.5
+// @log 1.5
+// @log 9.5
+// @log 2
+// The f32 SIBLING of `f64-array-return.vl`, and it stayed broken for four years' worth of
+// slices because f32 has neither of the two channels that fixed the f64 case:
+//
+//   * the typed-IR fast path — `tyKindOf` carries NO f32-array kind on purpose (a float
+//     LITERAL types f64, so a general typed claim would mis-claim a literal-built f64
+//     list as f32), which is why `exprF64Array`/`exprI64Array` open with `tyIsF64Array`/
+//     `tyIsI64Array` and `exprF32Array` has no such arm; and
+//   * `fRetKind` — `retAnnKindChain`'s producer set carries no f32-list arm, and its
+//     header says so deliberately ("an i64/f32 LIST annotation never flagged here — those
+//     codes were only ever inferred; an annotated `i64[]` return rides the typed-IR path").
+//
+// So an ANNOTATED `f32[]` return had no reader at all on the CALLER side, while the
+// callee's own result valtype was right the whole time (`cloRetValKind` reads
+// `vtKindOfType(fn.fnRet)` straight off the annotation). `mk()[0]` therefore fell through
+// to the i32-array arm and rejected — "index access but array type not collected" — over a
+// program that has no i32 array. `exprF32Array` now reads the annotation node
+// (`fnRetAnnF32Array` -> `retF32ArrFlag`), the one channel f32 does have.
+//
+// The UN-ANNOTATED sibling is a DIFFERENT and still-open defect and is deliberately NOT
+// fixed here: `emit_collect`'s A20 chain never stores `"f32list"` for it, so the
+// function's result valtype really is i32 and claiming the call site is an f32 list would
+// turn a loud reject into invalid wasm (measured). It keeps its own pin,
+// `error-inferred-f32-list-return.vl`.
+
+function mk(): f32[] {
+  return [1.5, 2.5]
+}
+
+// Index the call result directly.
+print(mk()[1]) // 2.5
+
+// And through an ANNOTATED binding — the one shape that already worked, kept so a
+// regression in it is caught here too.
+const xs: f32[] = mk()
+print(xs[0]) // 1.5
+
+// And through an UN-annotated binding, which takes its type from the call.
+const ys = mk()
+print(ys[0]) // 1.5
+
+// A `let`-bound f32 list returned by name (the shape the inferred-return pin uses, but
+// with the annotation present) still reads back.
+function mk2(): f32[] {
+  const zs: f32[] = [9.5, 8.5]
+  return zs
+}
+print(mk2()[0]) // 9.5
+
+// `.length` over the call result — the same classifier drives the struct field read of
+// the list wrapper, and it rejected with "field access but no struct type declared".
+print(mk2().length) // 2

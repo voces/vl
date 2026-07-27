@@ -108,6 +108,7 @@ import { numLexFitsI32, numLexIs2Pow31 } from "./emit_bignum"
 import {
   annArrowAt,
   annFnDecompose,
+  annGenAppSpanEnds,
   annRetNameOf,
   annSplitPipe,
   arrElemNameRaw,
@@ -124,6 +125,7 @@ import {
   memberPathKeyOf,
   nameIsArray,
   nameIsBareMap,
+  nameIsBraceSpanEnds,
   nameIsClosureArray,
   nameIsClosureArrayTy,
   nameIsElemArray,
@@ -135,6 +137,7 @@ import {
   nameIsLitUnionArray,
   nameIsMap,
   nameIsMapArray,
+  nameIsMapOpen,
   nameIsNulBool,
   nameIsNulBoolList,
   nameIsNulClosure,
@@ -2938,16 +2941,19 @@ export function mvCanonValName(valName: string) {
   // `rlInternName` keys the vals ref-list slot on. Without this the annotation spelling and
   // a self-inferred factory-return lambda (`() => (h0)`) minted twin mv/map structs, a cast
   // TRAP at the returned-map read. (Func-type element arrays are left untouched inside.)
-  const vn = valName.length
   if nameIsElemArray(valName) { return rlCanonLitUnionAtoms(valName) }
   // A STRUCT / nested-MAP value (`{f: K0 | f64}` — the value of `{[string]: {f: K0|f64}}`):
   // soften its field / value litunion aliases THROUGH the shape, the struct sibling of the
   // ref-list `[]` arm above. Without this the annotation (`canonEmitTypeNames`-softened to
   // `{f:string|f64}`) and a self-inferred factory-return lambda (`{f:K0|f64}`) minted twin
   // mv slots → twin map/functypes → a `$fnsig` cast TRAP at the returned-map read.
-  if vn > 1 && valName[0] == '{' && valName[vn - 1] == '}' {
-    return rlCanonLitUnionAtoms(valName)
-  }
+  //
+  // The WIDE brace-endpoint span at its home (`emit_base.nameIsBraceSpanEnds`): this arm
+  // must see a MAP value as well as a struct one, so it is deliberately NOT
+  // `nameIsShapeSpanEnds` (which excludes `{[`) and NOT `nameIsWholeSpanShape` (which adds
+  // a balance walk). The hand-written bound was `vn > 1`, i.e. the home's `length >= 2`
+  // exactly, and `vn` had no other reader — so the local dies with the character compares.
+  if nameIsBraceSpanEnds(valName) { return rlCanonLitUnionAtoms(valName) }
   if unionMemberCount(valName) < 2 { return valName }
   canonLitUnionArms(valName)
 }
@@ -6530,6 +6536,16 @@ export function cloArrSlotRetName(slot: i32) {
 // table's own slot predicate (`repSigTokHasSlot`). Lets a value CALL widen an i32-literal
 // argument into an i64 / f32 / f64 parameter, exactly as a direct call does — without it
 // the `call_ref` pushes an i32 and traps.
+//
+// NOT A TYPE-NAME GRAMMAR (D-CLASSGRAM census note). The `'>'` below and the one
+// `sigKeyRetTokIx` scans for are the `$fnsig` KEY's param/result SEPARATOR — a character
+// in the ABI token alphabet `repKindOfSigTok` owns, on a string the compiler MINTED, not
+// a rendered type. A destringify census looking for hand-written type grammar should skip
+// both, the same way #1222 skipped `emit_base`'s `raw[i + 2] == '{'` string-escape lexing.
+// It is also NOT routable to that table: `repKindOfSigTok('>')` is `null`, but so is every
+// digit and `;` in a slot token, so the compare would WIDEN. And it is not routable to
+// `sigKeyRetTokIx` either — that home finds the LAST `>` with a whole-key scan, which
+// inside this per-character loop would make the walk quadratic.
 export function sigParamCoerceKind(key: string, idx: i32): VKind | null {
   let i = 0
   let p = 0
@@ -6751,7 +6767,15 @@ export function listElemIsBool(arrIx: i32, fnIx: i32) {
         if d.letType >= 0 {
           const lt = P.nodes[d.letType]
           if lt is TypeRef {
-            if lt.tyName == "boolean[]" { return true }
+            // The ARRAY grammar's ONE CUT (`emit_base.arrElemNameRaw`) plus the bare
+            // LEAF name, which is what the whole-spelling compare `== "boolean[]"` was
+            // saying — the D-WHOLESPELL pattern, no new helper. Deliberately NOT
+            // `nameIsI32Array`: that home is REP-wide (it also accepts `i32[]`, a
+            // litunion `K[]`, `(boolean|null)[]` and `(K|null)[]`, all of which share the
+            // one i32 backing), and this site is about the element's PRINT formatting,
+            // which only a genuine `boolean` leaf recovers. Same file, same family, and
+            // the right home differs per arm.
+            if arrElemNameRaw(lt.tyName) == "boolean" { return true }
           }
         }
         if d.letInit >= 0 {
@@ -7729,6 +7753,28 @@ function mapValuesResultKind(exprIx: i32, fnIx: i32) {
 }
 
 // The fnStmts POSITION of the FuncDecl at arena index `fnIx`, or -1.
+//
+// THE COMPILER'S LAST SUPER-LINEAR TERM ON THE SCOPE-CHAIN WALK LIVES HERE, AND THE FIX
+// THIS FILE WAS NAMED FOR CANNOT BE WRITTEN FROM THIS FILE. `emit_collect`'s
+// `fnIndexOfInScopeChain` files it against this function ("the fix belongs in
+// `fnStmtsPosOf`'s own file, as a per-program node -> position index built where `fnStmts`
+// is"), and the diagnosis is right: the scan below is O(functions) and runs once per gated
+// call, so a frame ladder of N functions that each call their own nested function pays
+// O(N^2). Re-measured at this commit on a generated ladder (best of 3, whole `vl build`
+// wall time): **N = 100 / 200 / 400 / 800 → 31 / 36 / 83 / 227 ms** — the 400→800 step
+// costs 2.7x for 2x the input, which is the quadratic term and not measurement noise.
+//
+// **But `fnStmts` is not written here.** Its five writers are `emit_collect.collectFns` /
+// `collectLifted` (two `.push`) and `emit_mono` (two `.push` plus the IN-PLACE
+// `fnStmts[origFe] = nfn` a count-0 instance does) — every one of them outside this
+// partition. A memo that merely caches the last answer is only equal to the scan if no
+// LOWER position can ever come to hold an already-memoized node, which is a property of
+// `emit_mono`'s replacement writer (its `nfn` is a fresh clone, so its arena index is new)
+// — true today, unpinnable from here, and a silent miscompile the day it stops being true.
+// The honest form of the fix is an index built AT the writers, or an invalidation signal
+// minted by them; both are a SOURCES problem, not a site problem. FILED with a witness,
+// not attempted. (The `monoOrigNode` fall-through below is a second reason no index of
+// `fnStmts` alone can answer — it deliberately resolves nodes `fnStmts` no longer holds.)
 export function fnStmtsPosOf(fnIx: i32) {
   let i = 0
   while i < fnStmts.length {
@@ -8235,6 +8281,19 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
         if cfn is FuncDecl {
           if tyIsNulBool(cfn.fnRet) { return true }
           // ...or an UN-ANNOTATED function whose return INFERS to `boolean | null`.
+          //
+          // NOT A TYPE SPELLING (D-CLASSGRAM census note), even though the literal looks
+          // like one. `inferNicheNullByName` publishes a THREE-VALUED PROTOCOL RETURN —
+          // `""` / `"boolean|null"` / `"string|null"` — and its header (written by #1213)
+          // says exactly that its returned strings stay literal because they are a RENDER
+          // of the answer, which is the one use of a type spelling the rule allows: the
+          // function's own body asks the grammar homes and then TAGS the result. The value
+          // compared here is that tag, not a rendering of any arena type. A whole-spelling
+          // census counts it because the literal holds a `|` and an alphanumeric, so it
+          // needs the compared expression's PROVENANCE, not the literal's shape. Four more
+          // sites of this exact shape live in `wasmEmit.vl` (2 in the return-flag pair, 2 in
+          // the niche-result classifier) — the tier-1 census's whole remaining tree-wide
+          // population, and every one of them a false positive.
           if cfn.fnRet < 0 {
             if inferNicheNullByName(callee.identName) == "boolean|null" {
               return true
@@ -9439,9 +9498,17 @@ function refArrShapeKind(name: string): i32 {
     // wrapper (`$mkListIdx`) either way — the nullable rides INSIDE the inner elements.
     return 6
   }
-  if name == "f64[][]" { return 7 }
-  if name == "i64[][]" { return 8 }
-  if name == "f32[][]" {
+  // The three NON-i32 scalar leaves, asked the way the `string[][]` arm above already
+  // asks its own: the array grammar's ONE CUT (`arrElemNameRaw`), taken ONCE for the
+  // whole arm set, then each inner list named by the one-line home that IS that leaf
+  // (`nameIsF64Array` is `arrElemNameRaw(n) == "f64"`, so the pair is `name == "f64[][]"`
+  // over every input, not merely over the inputs tried). Unlike `nameIsStringArray`
+  // directly above, these three homes are SPELLING-EXACT, not rep-wide — the `(f64 |
+  // null)[]` niche has no shared backing to widen them.
+  const inner2 = arrElemNameRaw(name)
+  if nameIsF64Array(inner2) { return 7 }
+  if nameIsI64Array(inner2) { return 8 }
+  if nameIsF32Array(inner2) {
     return 10 // f32 inner list (element is the `$fl32TypeIdx` wrapper)
   }
   // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
@@ -10259,9 +10326,16 @@ export function refArrElemName(name: string) {
   if nameIsI32ListArray(name) { return arrElemNameRaw(name) }
   // A nested NON-i32 scalar / string 2D array — the inner list's name is the slot key (kind
   // 8 / 7 / 6 element), mirroring `i32[][]` → `i32[]`.
-  if name == "i64[][]" { return "i64[]" }
-  if name == "f64[][]" { return "f64[]" }
-  if name == "f32[][]" { return "f32[]" }
+  //
+  // The three scalar leaves take the array grammar's ONE CUT once for the whole arm set and
+  // then name the inner list by its one-line home (`nameIsI64Array` IS `arrElemNameRaw(n) ==
+  // "i64"`), so the test is `name == "i64[][]"` over EVERY input. The cut is also the ANSWER
+  // — `arrElemNameRaw("i64[][]")` is `"i64[]"` — so the three literal spellings go on both
+  // sides of the arm, mirroring the `string[][]` / map arms below, which already return it.
+  const raElem = arrElemNameRaw(name)
+  if nameIsI64Array(raElem) { return raElem }
+  if nameIsF64Array(raElem) { return raElem }
+  if nameIsF32Array(raElem) { return raElem }
   if nameIsArray(name) && nameIsStringArray(arrElemNameRaw(name)) {
     return arrElemNameRaw(name)
   }
@@ -10385,9 +10459,17 @@ function rlCanonLitUnionAtoms(name: string): string {
   // lambda (`tyToEmitName` preserves litunion aliases) — two mv-slot KEYS, twin map/
   // functypes, a `$fnsig` cast TRAP at the returned-map read. Descending here keys every
   // producer on ONE slot.
-  if name[0] == '{' && name[n - 1] == '}' {
+  // The BRACE-SPAN home (`emit_base.nameIsBraceSpanEnds`) then the MAP OPENER
+  // (`emit_base.nameIsMapOpen`) — "is it a `{…}` group at all", then "which kind of
+  // group", the exact two-step `emit_base.annObjFieldSplit`'s tri-state was rewritten as
+  // in #1222. The span home must stay the WIDE one: the map arm immediately below is
+  // reached only through it, and `nameIsShapeSpanEnds` would reject every `{[` name.
+  // Bounds: this site carried only `n >= 1` (the `n == 0` early return above) and the home
+  // asks `>= 2`, which agree because one character cannot be both `{` and `}`; the map
+  // arm's own `n >= 2` conjunct is the home's bound, now asked once.
+  if nameIsBraceSpanEnds(name) {
     // A map `{[K]:V}`: soften the VALUE (a nested map / struct value); leave the key text.
-    if n >= 2 && name[1] == '[' {
+    if nameIsMapOpen(name) {
       const mv = mapValNameOf(name)
       if mv == "" { return name }
       const cmv = rlCanonLitUnionAtoms(mv)
@@ -10930,6 +11012,28 @@ export function nameFieldCode(t: string) {
 
 // Intern each union arm whose CORE (trailing `[]`s peeled) is an INLINE `{…}` shape (a struct or
 // map arm) via `internShapeDeep` — the shared body of the paren-free and paren-carrying splits.
+//
+// THE ONE GRAMMAR-PREDICATE CHARACTER TEST THIS FILE KEEPS, AND WHY (D-CLASSGRAM). The arm
+// below asks the BARE brace OPENER — `{` at index 0, with NO second-character conjunct and
+// NO closing test — under a `length >= 1` bound. The brace family's four homes are
+//
+//   `typecheck.nameIsShapeOpen`     len >= 2 · OPEN · NOT2ND
+//   `emit_base.nameIsMapOpen`       len >= 2 · OPEN · 2ND      (the opener's complement)
+//   `emit_base.nameIsBraceSpanEnds` len >= 2 · OPEN · CLOSE
+//   `emit_base.nameIsShapeSpanEnds` the first ANDed with the third
+//
+// and the bare `len >= 1 · OPEN` this site wants is a FIFTH member none of them covers. The
+// available spelling, `nameIsShapeOpen(uCore) || nameIsMapOpen(uCore)`, is that disjunction
+// exactly — but only above `length >= 2`, so it NARROWS this site at the single input
+// `uCore == "{"`. Both halves of that were measured rather than argued: a divergence poison
+// (`emitFail` when `uCore` is exactly one `{`) fires on **0** of 1,501 corpus files while its
+// inverted control — the same arm reached at all — fires on **160**, and a sabotage that TAKES
+// the narrowing reddens 0 wasm sha256 and 0 run-stdout lines. Live arm, measured-EMPTY
+// divergence set, no graded consequence: an empty population is the ABSENCE of a witness, not
+// agreement, so the faithful `>= 1` bound ships (D-SHAPEFIELD — unreached is not licenced).
+//
+// The move this site actually wants is a `nameIsBraceOpen` home beside its four siblings in
+// `emit_base.vl`, which is not this slice's file. A SOURCES problem, not a site problem.
 function internShapeArms(arms: string[]) {
   let uai = 0
   while uai < arms.length {
@@ -11638,10 +11742,18 @@ function gaeIndexOf(name: string) {
 // the emitter cannot type (an unbound param, an unsupported shape) leaves the
 // application un-interned — its use then fails loudly downstream, never a trap.
 export function gaeEnsure(name: string) {
-  if name.length < 3 { return 0 }
-  if name[name.length - 1] != '>' { return 0 }
+  // The GENERIC-APPLICATION SPAN test at its home (`emit_base.annGenAppSpanEnds`), whose
+  // own header names this function as the third caller it wants: the home IS the `length <
+  // 3` cheap reject, the trailing-`>` compare and the `gaeLtAt(name) > 0` scan, in that
+  // order, so the routing keeps the character compare in FRONT of the scan exactly as this
+  // site had it. `gaeLtAt` is re-asked below for the head/argument slices rather than
+  // threaded out — the same trade `annGenAppSpanEnds`' own caller
+  // `emit_base.annGenAppDecompose` takes, and it costs a second scan only on a name that
+  // already ended in `>`. Decomposing through `annGenAppDecompose` instead would split the
+  // argument list BEFORE the `structIndexByName` early-out below, which is work this
+  // per-field-per-application call does not do today.
+  if !annGenAppSpanEnds(name) { return 0 }
   const ltAt = gaeLtAt(name)
-  if ltAt <= 0 { return 0 }
   if structIndexByName(name) >= 0 { return 0 }
   const gi = gaeIndexOf(name.slice(0, ltAt))
   if gi < 0 { return 0 }
@@ -17206,6 +17318,41 @@ function fnRetF32Array(name: string) {
   fRetKind[i] == "f32list"
 }
 
+// True if function `name` carries an ANNOTATED `f32[]` return — read STRAIGHT OFF the
+// annotation node, because neither of the two channels its i64/f64 siblings use can
+// answer for f32:
+//
+//   * `fRetKind` cannot. `retAnnKindChain`'s producer set has no f32-list arm and its
+//     header says so deliberately — "an i64/f32 LIST annotation never flagged here (those
+//     codes were only ever inferred — an annotated `i64[]` return rides the typed-IR
+//     path)". `retListKindFlag` accordingly folds only 2/5/7/12.
+//   * The typed-IR fast path cannot. `tyKindOf` carries NO f32-array kind on purpose (a
+//     float LITERAL types f64, so a general typed claim would mis-claim a literal-built
+//     f64 list as f32) — which is exactly why `exprI64Array`'s annotated case rides
+//     `tyIsI64Array` and `exprF32Array` has no such arm.
+//
+// So an annotated `f32[]` return had NO reader at all, and `function mk(): f32[] { … }`
+// followed by `mk()[0]` was an EMIT REJECT ("index access but array type not collected")
+// while the identical three lines with an `f64`/`i64`/`i32` leaf all run. The function's
+// own RESULT VALTYPE was never wrong — `cloRetValKind` reads `vtKindOfType(fn.fnRet)` from
+// the annotation — only the CALLER's classifier disagreed with it.
+//
+// Deliberately gated on `fn.fnRet >= 0`: an UN-annotated `f32[]` return is a DIFFERENT and
+// still-open defect (`emit_collect`'s A20 arm never stores `"f32list"` for it, so the
+// function's result valtype really is i32 and claiming the call site is an f32 list turns
+// a loud reject into invalid wasm — measured). Pinned by
+// `tests/cases/arrays/error-inferred-f32-list-return.vl`, which stays an `@emit-error`.
+function fnRetAnnF32Array(name: string) {
+  const i = fnIndexOf(name)
+  if i < 0 || i >= fnStmts.length { return false }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    if fn.fnRet < 0 { return false }
+    return retF32ArrFlag(fn.fnRet) == 1
+  }
+  false
+}
+
 export function letIsF32Array(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -17270,6 +17417,12 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       if fnRetF32Array(callee.identName) { return true }
+      // A NAMED function with an ANNOTATED `f32[]` return — the annotation node read
+      // directly, because f32 has neither of the two channels the i64/f64 siblings use
+      // (see `fnRetAnnF32Array`). Without it the callee emitted the f32-list wrapper as
+      // its result while every caller-side classifier said "not a list", and the read
+      // `mk()[0]` fell through to the array arm's loud reject.
+      if fnRetAnnF32Array(callee.identName) { return true }
       // A closure-VALUE call (`g()` with `g: () => f32[]`) whose resolved sig result is
       // the f32 list (`>F`) — the f32 dual of the i64/f64-list callee arms.
       return calleeRetKind(callee.identName, fnIx) == "f32list"
@@ -19054,6 +19207,11 @@ function calleeReturnsStructIdx(name: string, fnIx: i32) {
 // result-less key. The ONE last-`>` scan: every result-side reader (`sigKeyRetKind` /
 // `sigKeyRetIsVoid` / `sigKeyRetSlot`) decodes through it instead of re-scanning the
 // key string per site.
+//
+// NOT A TYPE-NAME GRAMMAR (D-CLASSGRAM census note) — the `$fnsig` ABI alphabet, exactly
+// as at `sigParamCoerceKind`; `i` here is a bare walk CURSOR, which is the boundary #1186
+// drew and #1222 kept. This IS the home of the last-`>` scan: the three result-side
+// readers already route through it rather than re-scanning.
 function sigKeyRetTokIx(k: string) {
   const n = k.length
   let gt = -1
@@ -19064,6 +19222,36 @@ function sigKeyRetTokIx(k: string) {
   }
   if gt < 0 || gt + 1 >= n { return -1 }
   gt + 1
+}
+
+// THE ONE HOME of the MONOMORPHIZED CLOSURE PIN's marker: the `$fnsig` key a
+// closure-pinned parameter carries in its `TypeRef.tyName` slot behind a bare `"=>"`
+// prefix (`"=>i>d"`), or "" when `nm` is not a pin.
+//
+// **THE `"=>"` HERE IS NOT THE FUNCTION-TYPE ARROW, AND THE TWO MUST NOT BE MERGED BY
+// EYEBALL.** A source function-type annotation is `(i32) => string` — its arrow sits at a
+// POSITIVE index behind a parenthesized parameter list, which is what `annArrowAt` /
+// `nameIsFuncTypeAtom` / `strContains(nm, "=>")` ask about. This predicate asks whether the
+// tyName column holds a type SPELLING at all: a pin's payload is an interned ABI key, not a
+// renderable type, and the two-character marker is how `monoInstantiate` stamps that
+// PROVENANCE onto the column. Reading it as "is a function type" would classify every
+// annotated closure param as a pin and slice two characters off its annotation.
+//
+// The `length > 2` bound is the copies' own and is load-bearing on BOTH sides: it keeps
+// the index-1 read in bounds and it guarantees a non-empty payload, so "" is unambiguously
+// "not a pin". TWO more copies live in `emit_mono.vl` (`monoInstantiate`'s `fnValUsed`
+// flip, and the un-annotated closure param's result-kind pin, which already decodes the
+// payload through `sigKeyRetKind` above) — outside this partition, named here so the slice
+// that owns that file has the list already made.
+export function sigKeyPinPayload(nm: string) {
+  if nm.length <= 2 { return "" }
+  if nm[0] != '=' { return "" }
+  if nm[1] != '>' { return "" }
+  // BOUND rather than left as the trailing expression: a bare member-call statement is
+  // not a lowerable form (`emitProgram: unsupported member-call statement`) — the same
+  // reason `emit_base.arrElemNameRaw` and `annRetNameOf` bind their slices.
+  const payload = nm.slice(2, nm.length)
+  payload
 }
 
 // The `cloRetValKind`-style RESULT kind of a function-VALUE callee `name` (in scope of
@@ -19497,10 +19685,14 @@ function paramCloSigKey(fnIx: i32, name: string) {
             if ty is TypeRef {
               const nm = ty.tyName
               if nm.length > 2 {
-                // A MONOMORPHIZED closure-pinned param carries the bare `"=>sigkey"`.
-                if nm[0] == '=' && nm[1] == '>' {
-                  return nm.slice(2, nm.length)
-                }
+                // A MONOMORPHIZED closure-pinned param carries the bare `"=>sigkey"` — the
+                // PIN MARKER and its payload at their home (`sigKeyPinPayload`), which
+                // carries this site's own `length > 2` bound, so a non-empty answer is
+                // exactly the two character compares this line spelled out. The `strContains`
+                // arm below keeps the bound because it asks a DIFFERENT question of the same
+                // two characters (an arrow ANYWHERE, i.e. a real function-type spelling).
+                const pin = sigKeyPinPayload(nm)
+                if pin != "" { return pin }
                 // A NULLABLE-closure param (`((i32) => string) | null`, kind 19) OR a SOURCE
                 // function-type annotation `(params)=>ret`: derive its sig key so a non-i32 (e.g.
                 // f64) signature casts to the right functype, and — for a nullable closure whose
