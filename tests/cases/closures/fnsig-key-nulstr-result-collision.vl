@@ -1,0 +1,100 @@
+// @run
+// @log 2
+// @log yes
+// @log none
+// @log 5
+// @log hit
+// @log 2
+// @log 2
+// @log 3
+// @log miss
+// @log big
+// @log some
+// @log none
+// @log 10
+// An UN-ANNOTATED `string | null` return made the `$fnsig` interning KEY COARSER than
+// the functype BYTES, so two functions with different result reps shared one slot and
+// the second was DECLARED with the first's functype — invalid wasm, from ordinary code.
+//
+// The key came from `fnSigKeyOf` -> `cloRetKindOf`, whose un-annotated ladder folded the
+// `"nulstr"` niche into the `"i32"` result token (`>i`). The BYTES come from the key's
+// REPRESENTATIVE function via `cloRetValKind` (emit_sections' type-section rep path),
+// which classifies the same return as `"nulstr"` -> `(ref null $str)`. `internCloSigKey`
+// keeps the FIRST rep for a key, so `inc` and `maybe` below interned ONE `$fnsig` and
+// `emitFunctionSection` declared both with it:
+//
+//     (type 2 (func (param structref i32) (result i32)))     <- the shared $fnsig
+//     (func 4 (type 2) ...)   ;; inc    -- correct
+//     (func 5 (type 2) ...)   ;; maybe  -- body yields (ref null $str). INVALID.
+//     (type 4 (func (param structref i32) (result (ref null 0))))  ;; maybe's own
+//                                                                  ;; functype: emitted,
+//                                                                  ;; never referenced.
+//
+// and SWAPPING the two declarations produced the MIRRORED error (`expected (ref null
+// $type), found i32` instead of the converse) — first-interner-wins, not a fixed
+// direction. `fnSigKeyOf` now mints the value-ABI key only when `cloRetKindOf` and
+// `cloRetValKind` AGREE on the result kind, so a disagreeing function falls through to
+// `cloSigKeyExt`'s extended spine and keys the honest `>N` token off the SAME
+// `cloRetValKind` the bytes read. Every group below was invalid wasm (or, for the
+// closure-value binding, a runtime cast trap) before that interlock.
+
+// ── 1. the minimal shape: an i32-result function BEFORE a nullable-string one ──
+// Failed at `maybe` with "expected i32, found (ref $type)".
+function inc(n: i32) { return n + 1 }
+function maybe(n: i32) {
+  if n > 0 { return "yes" }
+  return null
+}
+const incVal: (i32) => i32 = inc
+print(incVal(1))          // 2
+print(maybe(1) ?? "none") // yes
+print(maybe(0) ?? "none") // none
+
+// ── 2. the MIRROR: the nullable-string function declared FIRST ──
+// Failed at `plus4` with "expected (ref null $type), found i32" — the converse
+// message, which is what proves the shared slot takes whoever interned first.
+function tag(n: i32) {
+  if n > 0 { return "hit" }
+  return null
+}
+function plus4(n: i32) { return n + 4 }
+const plusVal: (i32) => i32 = plus4
+print(plusVal(1))       // 5
+print(tag(1) ?? "miss") // hit
+
+// ── 3. the in-the-wild shape: a `.map` beside a nullable-string function ──
+// No generics, no higher-order function — just a list `.map` whose lambda keys the
+// same `(i32) -> i32` spine. Failed inside `__lambda_0`.
+const xs: i32[] = [1, 2]
+const ys = xs.map((n: i32) => n + 1)
+print(ys.length) // 2
+print(ys[0])     // 2
+print(ys[1])     // 3
+print(tag(0) ?? "miss") // miss
+
+// ── 4. a nullable-string function used as a CLOSURE VALUE ──
+// The ANNOTATION producer (`annRetKind`) already keyed `string | null` as `>N`, so the
+// un-annotated lambda's `>i` disagreed with the call site's cast target: this trapped at
+// runtime ("cast failure") rather than emitting invalid wasm. The interlock makes the two
+// producers agree.
+function label(n: i32) {
+  if n > 3 { return "big" }
+  return null
+}
+const labelVal: (i32) => string | null = label
+print(labelVal(9) ?? "small") // big
+
+// ── 5. HIGHER-ORDER: the two callbacks passed as typed PARAMS ──
+// The shape most likely to appear in real code. `pick` and `bump` share the `(i32)`
+// spine; `pick`'s un-annotated `string | null` return keyed `>i` beside `bump`'s
+// genuine i32, so this failed at `bump` with "expected (ref null $type), found i32".
+function pick(n: i32) {
+  if n > 0 { return "some" }
+  return null
+}
+function bump(n: i32) { return n + 6 }
+function applyStr(f: (i32) => string | null, x: i32) { return f(x) ?? "none" }
+function applyInt(f: (i32) => i32, x: i32) { return f(x) }
+print(applyStr(pick, 1)) // some
+print(applyStr(pick, 0)) // none
+print(applyInt(bump, 4)) // 10
