@@ -1,0 +1,115 @@
+// @run
+// @log 2
+// @log N
+// @log 2
+// @log 2
+// @log 6
+// @log N
+// @log 6
+// @log 6
+// @log 7
+// THE UN-ANNOTATED GLOBAL CELL's two missing nullable kinds.
+//
+// `globalCellKind` runs two ladders. The ANNOTATED one opens with `nulclosure` and
+// carries `nullist` in its middle; the UN-ANNOTATED one had neither, so a global whose
+// INIT produces one of those two values fell through to `globalKind`, whose expression
+// family answers `"closure"` (kind 14, a NON-null fat pointer) and `"i32"` for exactly
+// those cases. The cell then disagreed with the value the start function stores into it:
+//
+//   * most spellings rejected loudly at the `!= null` compare — the read side
+//     (`globalIsNulList`, which asked the annotation-only `letIsNulList`) did not see the
+//     cell either, so the bare `null` reached `emitNullLitNode` with no context;
+//   * the FIELD-read init (`const g = s.rest` over a `rest: i32[] | null` field) was
+//     INVALID WASM: `type mismatch: expected i32, found (ref null $type)`.
+//
+// Eight of eight census cells over the four init shapes `exprNullableList` /
+// `exprNulClosure` recognize at module scope. The LOCAL twin of every row below is green
+// on master — `buildLocals` has both kinds — which is what makes these a global-cell gap
+// rather than a language one.
+//
+// The `= null` rows additionally cover the read-side TRAP: a non-constexpr init makes the
+// cell nullable, and `emitIdentNode` eagerly `ref.as_non_null`s a nullable cell unless the
+// kind is on its exemption list. `nullist` and `nulclosure` are both on it — removing
+// either turns these two rows into `wasm trap: null reference` (measured).
+
+type S = { rest: i32[] | null }
+type H = { op: ((i32) => i32) | null }
+
+function mkList(): i32[] | null { return [1, 2] }
+function mkListNull(): i32[] | null { return null }
+function inc(x: i32): i32 { return x + 1 }
+function mkClo(): ((i32) => i32) | null { return inc }
+function mkCloNull(): ((i32) => i32) | null { return null }
+
+// ---- kind 15, `i32[] | null` ----
+// (a) CALL init
+const gLC = mkList()
+function rLC() {
+  if gLC != null { print(gLC[1]) }
+}
+rLC()
+
+// (b) CALL init that IS null
+const gLN = mkListNull()
+function rLN() {
+  if gLN == null { print("N") } else { print("V") }
+}
+rLN()
+
+// (c) FIELD-read init — the row that was invalid wasm, not a reject
+const sRest: S = { rest: [1, 2] }
+const gLF = sRest.rest
+function rLF() {
+  if gLF != null { print(gLF[1]) }
+}
+rLF()
+
+// (d) another GLOBAL as the init
+const aL: i32[] | null = [1, 2]
+const gLI = aL
+function rLI() {
+  if gLI != null { print(gLI[1]) }
+}
+rLI()
+
+// ---- kind 19, `((i32) => i32) | null` ----
+// (a) CALL init
+const gCC = mkClo()
+function rCC() {
+  if gCC != null { print(gCC(5)) }
+}
+rCC()
+
+// (b) CALL init that IS null
+const gCN = mkCloNull()
+function rCN() {
+  if gCN == null { print("N") } else { print("V") }
+}
+rCN()
+
+// (c) FIELD-read init (code-22 nullable-closure field)
+const hOp: H = { op: inc }
+const gCF = hOp.op
+function rCF() {
+  if gCF != null { print(gCF(5)) }
+}
+rCF()
+
+// (d) another GLOBAL as the init
+const aC: ((i32) => i32) | null = inc
+const gCI = aC
+function rCI() {
+  if gCI != null { print(gCI(5)) }
+}
+rCI()
+
+// CONTROL — the un-annotated nullable-STRUCT cell, which `globalKind`'s expression
+// family has always answered (`exprNullableStruct`). Green before and after; it is here
+// so a regression in the shared fall-through shows up beside the two new arms.
+type P = { v: i32 }
+function mkP(): P | null { return { v: 7 } }
+const gP = mkP()
+function rP() {
+  if gP != null { print(gP.v) }
+}
+rP()

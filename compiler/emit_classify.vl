@@ -1076,7 +1076,13 @@ function globalIsNulRef(name: string) {
 function globalIsNulList(name: string) {
   const li = globalLetOf(name)
   if li < 0 { return false }
-  letIsNulList(li, -1)
+  // `letIsNulListInfer`, not the annotation-only `letIsNulList`: an UN-annotated global
+  // bound to a nullable-list producer (`const g = mk()` with `mk(): i32[] | null`, a
+  // code-18 field read `const g = s.rest`, another kind-15 global) carries the kind-15
+  // cell too — `globalCellKind`'s un-annotated arm uses the SAME predicate, so the read
+  // and the cell agree by construction. (Master's read side saw only the annotation, so
+  // `g != null` over such a global rejected the module and `g[i]` mistyped it.)
+  letIsNulListInfer(li, -1)
 }
 
 // True if the parameter `name` of function `fnIx` is a nullable struct (`S | null`).
@@ -1238,7 +1244,22 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
     if declaredKind(e.identName) == "nulreflist" { return true }
     // A nulreflist PARAM (`p: i32[][] | null`) — its `!= null` narrow reads the `(ref null $wrapper)`
     // niche exactly like the local. (#877 wired the param signature but left this body-side arm.)
-    return paramNulRefArray(fnIx, e.identName)
+    if paramNulRefArray(fnIx, e.identName) { return true }
+    // A module-GLOBAL kind-18 cell (`const g: S[] | null = …`) — the third storage class, and
+    // the one arm this function never grew: every consumer (`g != null`, `g[i]`, an
+    // un-annotated `const t = g`) fell through to the non-nullable path and the bare `null`
+    // of the compare reached `emitNullLitNode` with no context, rejecting the module.
+    //
+    // Keyed on `globalCellKind` — the CELL's own answer — not on `letIsNulRefArray`, so the
+    // read and the cell can never disagree. The distinction is load-bearing for an
+    // UN-ANNOTATED global (`const g = mk()` with `mk(): S[] | null`): `letIsNulRefArray`
+    // would claim it through its initializer while `globalCellKind`'s un-annotated arm still
+    // hands the cell a different kind (the inner-wrapper slot `emitGlobalSection` needs comes
+    // from `letAnnRefListSlot`, which has no annotation to read), and that disagreement turns
+    // today's loud reject into INVALID WASM. Filed instead; see the PR body.
+    const gnra = globalLetOf(e.identName)
+    if gnra >= 0 { return globalCellKind(gnra) == "nulreflist" }
+    return false
   }
   // A `recv.f` read of a NULLABLE ref-list FIELD (`f: S[] | null`, code 28) yields a nullable ref array.
   if e is Member { return memberFieldCode(exprIx, fnIx) == 28 }
@@ -1279,6 +1300,17 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
       // `nulRefArrayInnerSlotOfLet`'s local store, so a `p[i]` read and a `const t = p`
       // binding keep resolving the same row.
       return annNulRefArrSlot(paramTypeNode(fnIx, e.identName))
+    }
+    // A kind-18 module GLOBAL has no local slot either — resolve its inner ref-list row from
+    // the SAME place `emitGlobalSection` gives the cell its `(ref null …)` valtype and the
+    // start fn seeds its null with (`letAnnRefListSlot`), so an un-annotated `const t = g`
+    // binding stores the wrapper the cell actually holds. Without it the binding took slot
+    // -1 and the read-back mismatched the cell.
+    const gnris = globalLetOf(e.identName)
+    if gnris >= 0 {
+      if globalCellKind(gnris) == "nulreflist" {
+        return letAnnRefListSlot(gnris)
+      }
     }
     return -1
   }
@@ -9262,6 +9294,22 @@ export function globalCellKind(letIx: i32): VKind {
     // out of scope (no annotation to derive from) and `globalKind` returns its best guess.
     // An empty `[]` whose PUSHES infer a string element is the string list (kind 7).
     if letInfStrListByUse(letIx) { return "strlist" }
+    // THE TWO NULLABLE CELLS THE UN-ANNOTATED ARM NEVER GREW. The annotated arm above
+    // opens with `nulclosure` and carries `nullist` in the middle of its ladder; the
+    // un-annotated arm had neither, so `const g = mk()` with a `((i32) => i32) | null` /
+    // `i32[] | null` return fell through to `globalKind`, whose expression family answers
+    // `"closure"` / `"i32"` for exactly those two. The cell then disagreed with the value
+    // the start fn stores into it — a loud reject at the `!= null` compare in most
+    // spellings, and INVALID WASM (`expected i32, found (ref null $type)`) for the
+    // field-read init, which is the same class the annotated `nulScalarList` arm below
+    // was added to close. Their ORDER mirrors the annotated ladder exactly (nulclosure
+    // first, nullist before the distinct-backing scalar lists).
+    //
+    // The read sides need no separate widening: `exprNulClosure`'s global arm already
+    // asks `globalCellKind`, and `globalIsNulList` now asks `letIsNulListInfer` — the
+    // same predicate this arm uses.
+    if letInfersNulClosure(letIx, -1) { return "nulclosure" }
+    if letIsNulListInfer(letIx, -1) { return "nullist" }
     // A DISTINCT-backing nullable scalar list (`string[]|null`, `f64[]|null`, `i64[]|null`,
     // `f32[]|null`) bound to a CALL (`const r = mk()`): its own `(ref null $wrapper)` cell,
     // exactly as the ANNOTATED arm above spells it — but resolved through the BINDING
