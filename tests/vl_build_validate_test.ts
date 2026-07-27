@@ -20,8 +20,8 @@
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
 // to disassemble. The exit code, not the artifact's absence, is the signal.
 //
-// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE emitter bug (an unread binding of
-// a generic function's nullable-closure return). If that bug is fixed the fixture
+// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE emitter bug (a `.map` callback
+// PARAMETER spelled as an inline literal union). If that bug is fixed the fixture
 // stops producing an invalid module and this pin would silently go inert — so the
 // first assertion checks the PRECONDITION (`vl run` on the source still fails) and
 // fails loudly with a swap instruction rather than passing vacuously. Swap in any
@@ -48,11 +48,29 @@ if (GATED && !ENABLED) {
   console.warn("[vl-build-validate] skipped — missing vl binary or seed wasm.");
 }
 
-// Type-checks clean, emits invalid wasm: `mk` returns a nullable closure, the
-// binding is never read, and the generic's monomorphized body lowers a
-// `(ref null $type)` where the module's type says i32.
-const INVALID_SRC = `function mk<T>(_x: T): ((i32) => i32) | null { return null }\n` +
-  `const a = mk(1)\n`;
+// Type-checks clean, emits invalid wasm: a `.map` over a literal-union list whose
+// CALLBACK PARAMETER is spelled as the inline member union rather than the alias.
+// The receiver's element reps as the interned i32 atom, the callback's parameter
+// slot reps as a `string` (the canon pass softens an inline litunion at
+// `RC_FN_PARAM`), and the loop hands the atom to the string slot:
+// `type mismatch: expected (ref $type), found i32`. Filed as OPEN in
+// `docs/internals/destringify-types-program.md` ("THE `.map` CALLBACK-PARAM
+// FAMILY"), whose measurement says closing it needs an inline-litunion arm in the
+// PARAM and DECLARED-FIELD valtype ladders; two independent candidates
+// (#1205's `vtKindOfType` flip, #1206's alias-convergence refinement) each traded
+// cells instead of healing, so the fixture is stable.
+//
+// It REPLACES the previous fixture — an unread global binding of a generic
+// function's nullable-closure return — which stopped emitting an invalid module
+// once `globalCellKind`'s un-annotated arm learned the `nulclosure` cell. The
+// precondition assertion below is what caught that, exactly as designed.
+const INVALID_SRC = `type K = "a" | "b"\n` +
+  `const xs: K[] = ["a", "b"]\n` +
+  `const ys = xs.map((v: ("a" | "b")) => {\n` +
+  `  if v == "a" { return 1 }\n` +
+  `  return 2\n` +
+  `})\n` +
+  `print(ys[0])\n`;
 
 // The over-rejection control: an ordinary valid program must still build clean.
 const VALID_SRC = `print(6 * 7)\n`;
