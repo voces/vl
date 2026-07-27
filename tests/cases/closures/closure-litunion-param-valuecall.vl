@@ -1,0 +1,125 @@
+// @run
+// @log 2
+// @log b
+// @log 2
+// @log b
+// @log 2
+// @log 2
+// @log 15
+// @log 1
+// @log 2
+// @log a
+// A literal-union PARAMETER in a function-VALUE signature. `type K = "a" | "b"` is the
+// whole repro — no generics, no nesting:
+//
+//     type K = "a" | "b"
+//     function pick(v: K): i32 { if v == "a" { return 1 } return 2 }
+//     const f: (K) => i32 = pick
+//     const k: K = "b"
+//     print(f(k))
+//   → vl check rc=0, clean; vl run → "failed to compile: wasm[0]::function[5] …
+//     type mismatch: expected (ref $type), found (ref $type)"
+//
+// A function VALUE lowers to a fat pointer `{code, env, id}` and a value CALL `ref.cast`s
+// its code to an interned env-leading `$fnsig`, keyed by a STRING that THREE producers must
+// agree on byte-for-byte: `cloSigKeyExt` (from the AST FuncDecl), `annParamKind`/`annRetKind`
+// (from the annotation type NAME) and `paramCloSigKey` (the monomorphized pin). A literal
+// union's runtime rep is the interned i32 ATOM, not a `{tag, value}` box — and only the
+// RESULT-token producer knew that. `annRetKind` has carried the litunion arm since #613;
+// `annParamKind` never got it, so `isUName` claimed the alias first and keyed the box `u`.
+// The callee was declared `(structref, i32) -> i32` while the call site cast to
+// `(structref, (ref $uBox)) -> i32`.
+//
+// The SOUNDNESS FLOOR cannot catch this shape, which is why it reached invalid wasm rather
+// than a clean reject: the floor rejects a key that is "" (a param/return kind outside the
+// value ABI). Here BOTH producers yield a non-empty key and BOTH keys intern — the failure
+// is a DISAGREEMENT between two supported kinds, not an unsupported one, so there is nothing
+// un-interned to refuse.
+//
+// The last two lines are the INLINE spelling, and they are the GATE's pin, not decoration.
+// The new arm is nested inside `isUName` because only a DECLARED alias registers a union
+// name: `canonEmitName` softens a bare inline literal union in PARAM position to `string`
+// (the param context is outside `litUnionPreserve`'s ELEM/FIELD/MAP_VAL/FN_RES set), so an
+// inline param really IS a string and its value call already resolved the honest `S` token
+// through `cloCallSigKey`'s arena fallback. Keying the ungated `nameIsLitUnionType` here
+// claims the inline name too and turns these two WORKING lines into
+// "function-value call arity has no interned signature" — measured, not argued.
+//
+// STILL BROKEN, deliberately absent from this fixture: the ARGUMENT half. A member-STRING
+// LITERAL argument to a value call (`f("a")`, as opposed to the atom-typed `k` below) still
+// lowers as a string, because `emitCallRef` never seeds `pendingLitUnion` for a literal-union
+// parameter the way the direct-call twin `emitCall` does. That half lives in `wasmEmit.vl`
+// and is filed with its patch; this fixture graduates to cover `f("a")` when it lands.
+
+type K = "a" | "b"
+
+function pick(v: K): i32 {
+  if v == "a" { return 1 }
+  return 2
+}
+
+function echo(v: K): K { return v }
+
+// A litunion param on a closure passed INTO a higher-order function.
+function callIt(g: (K) => i32, k: K): i32 { return g(k) }
+
+// The litunion is the SECOND parameter, so the whole param spine has to line up.
+function tagged(n: i32, v: K): i32 {
+  if v == "a" { return n }
+  return n + 10
+}
+
+// The INLINE param spelling — a string param, and it must STAY one.
+function inl(v: "a" | "b"): i32 {
+  if v == "a" { return 1 }
+  return 2
+}
+
+const k: K = "b"
+
+// A NAMED function reached as a value.
+const f1: (K) => i32 = pick
+print(f1(k)) // 2
+
+// A litunion PARAM and a litunion RESULT through one value.
+const f2: (K) => K = echo
+print(f2(k)) // b
+
+// A LAMBDA with a contextually-typed litunion param.
+const f3: (K) => i32 = (v) => {
+  if v == "a" { return 1 }
+  return 2
+}
+print(f3(k)) // 2
+
+const f4: (K) => K = (v) => v
+print(f4(k)) // b
+
+// Into a HOF, both as a named function and as a lambda literal.
+print(callIt(pick, k)) // 2
+print(
+  callIt(
+    (v) => {
+      if v == "a" { return 1 }
+      return 2
+    },
+    k,
+  ),
+) // 2
+
+const f5: (i32, K) => i32 = tagged
+print(f5(5, k)) // 15
+
+// The inline spelling, through a function value, both argument forms.
+const f6: ("a" | "b") => i32 = inl
+print(f6("a")) // 1
+const ik: "a" | "b" = "b"
+print(f6(ik)) // 2
+
+// The RETURN side was never broken — the control that says so.
+function mk(n: i32): K {
+  if n > 0 { return "b" }
+  return "a"
+}
+const f7: (i32) => K = mk
+print(f7(0)) // a
