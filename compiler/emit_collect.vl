@@ -1168,24 +1168,88 @@ export function buildFnMap(_stmts: i32[]) {
     }
     i = i + 1
   }
+  // The scope-chain child index is derived from `fnParent`, which `collectFns` has just
+  // rebuilt — drop the previous program's copy so the lazy build below cannot read it.
+  fnChildHead = []
+  fnChildNext = []
   fnStmts.length
 }
 
 // ── scope-aware callee resolution ────────────────────────────────────────────
-// The `fnStmts` position of a lifted function named `name` whose PARENT frame is the
-// `fnStmts` position `pp` — i.e. the function `pp`'s body DECLARES under that name — or
-// -1 when that frame declares no such function. Scans in `fnStmts` order, so the first
-// declaration wins; a frame declaring one name twice is a checker error already.
-function nestedFnDeclaredIn(name: string, pp: i32) {
+// `fnParent` INVERTED — the child list of each frame, as two intrusive i32 columns:
+// `fnChildHead[p]` is the `fnStmts` position of the FIRST function declared in frame
+// `p` (-1 for a frame that declares none) and `fnChildNext[i]` the next sibling of `i`.
+// A DERIVED index of `fnParent`, private to the one function below that reads it — it
+// is not emitter state, so it does not belong in `emit_state.vl`; it is a cache of a
+// column that file already owns.
+//
+// WHY IT EXISTS: `nestedFnDeclaredIn` answered "which function does frame `pp` declare
+// under `name`?" by scanning ALL of `fnStmts` — so the scope-chain walk cost
+// O(depth x functions) per resolved call, and the emitter resolves one per call site.
+// #1207 shipped that walk and reported the cost honestly: QUADRATIC in the frame count.
+// The remedy is to index by the pair the query is actually keyed on. Indexing by NAME
+// alone does not fix it: the pathological shape is N frames that each declare the SAME
+// nested name, so a name bucket holds N entries and the scan is quadratic again. The
+// PARENT is the discriminating axis — a frame declares a handful of functions, and in
+// the ladder exactly one.
+//
+// The two columns are RESET (not rebuilt) by `buildFnMap`, and rebuilt on first use
+// below. The reset is load-bearing for the shared-instance host: without it a second
+// program in the same `WebAssembly.Instance` could read the first program's parents
+// whenever the two happen to agree on `fnStmts.length`.
+let fnChildHead: i32[] = []
+let fnChildNext: i32[] = []
+
+// Rebuild both columns from `fnParent`. Walks DESCENDING so each head-push lands the
+// LOWER position first: the list comes out in ascending `fnStmts` order, which is what
+// keeps "the first declaration wins" byte-identical to the scan this replaces.
+function buildFnChildIndex() {
+  fnChildHead = []
+  fnChildNext = []
   let i = 0
   while i < fnStmts.length {
-    const s = P.nodes[fnStmts[i]]
-    if s is FuncDecl {
-      if s.fnName == name {
-        if i < fnParent.length && fnParent[i] == pp { return i }
+    fnChildHead.push(-1)
+    fnChildNext.push(-1)
+    i = i + 1
+  }
+  let j = fnStmts.length - 1
+  while j >= 0 {
+    if j < fnParent.length {
+      const p = fnParent[j]
+      // A parent is always a `fnStmts` position captured before the child was pushed
+      // (`liftFnsInExpr`'s `wi`), or -1 for a top-level / mono-cloned function; the
+      // bound is a guard, not a filter.
+      if p >= 0 && p < fnChildHead.length {
+        fnChildNext[j] = fnChildHead[p]
+        fnChildHead[p] = j
       }
     }
-    i = i + 1
+    j = j - 1
+  }
+  fnChildHead.length
+}
+
+// The `fnStmts` position of a lifted function named `name` whose PARENT frame is the
+// `fnStmts` position `pp` — i.e. the function `pp`'s body DECLARES under that name — or
+// -1 when that frame declares no such function. Visits `pp`'s children in `fnStmts`
+// order, so the first declaration wins; a frame declaring one name twice is a checker
+// error already.
+//
+// The length compare is the lazy build: the index is reset per program and minted on
+// the first scope-aware resolution, so a module with no nested functions — every module
+// the compiler itself compiles — never pays for it. It also re-mints after a late
+// `fnStmts` push (`monomorphize` clones functions), which is why the freshness test is
+// a LENGTH and not a flag.
+function nestedFnDeclaredIn(name: string, pp: i32) {
+  if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
+  if pp < 0 || pp >= fnChildHead.length { return -1 }
+  let i = fnChildHead[pp]
+  while i >= 0 {
+    const s = P.nodes[fnStmts[i]]
+    if s is FuncDecl {
+      if s.fnName == name { return i }
+    }
+    i = fnChildNext[i]
   }
   -1
 }
@@ -1209,14 +1273,30 @@ function nestedFnDeclaredIn(name: string, pp: i32) {
 // nested binding is in scope, and the flat map's answer — a top-level function — is then
 // the correct one.
 //
-// `fnIndexOfInScope` (emit_classify) is the ONE-LEVEL form of this, wired to the
-// function-VALUE path. It agrees here wherever the binding is declared directly in the
-// calling frame, and differs only on the ancestor rungs this walk adds (a sibling nested
-// function's call, a lambda's call into its enclosing frame, and self-recursion).
+// `fnIndexOfInScope` (emit_classify) is the DELIBERATE TWIN of this walk, wired to the
+// function-VALUE path. It cannot delegate here: `emit_collect.vl` already imports 144
+// names from `emit_classify.vl` and the reverse edge makes the compiler refuse to build
+// itself. The dedup is one line — `fnIndexOfInScopeChain(name, fnIx)` in place of its
+// body — for whoever moves one of the two files. FILED, not taken: its own frame scan is
+// still the O(functions) one this file just retired, so the twin carries the quadratic
+// cost on the function-VALUE path even now that the CALL path does not.
 //
 // Cost: gated on `nestedNameSet`, so a callee that is not a nested function name
 // anywhere — every call in a module without nested functions, and nearly all of them in
 // a module with some — costs exactly the one `fnIndexOf` map lookup it cost before.
+// Past the gate the walk is O(chain depth) with a bounded probe per rung
+// (`nestedFnDeclaredIn` visits one frame's children, not every function), where it used
+// to be O(depth x functions) — the quadratic #1207 measured and filed rather than fixed.
+//
+// ONE QUADRATIC TERM SURVIVES AND IT IS NOT THIS WALK: `fnStmtsPosOf` (emit_classify) is
+// an O(functions) linear scan, run once per gated call, so a module of N frames that each
+// call their own nested function still pays O(N^2) — in a frame ladder at N = 100 / 200 /
+// 400 / 800 this file's remaining time is 62 / 118 / 242 / 551 ms against 60 / 108 / 211 /
+// 423 for a build that merely memoizes `fnStmtsPosOf`'s last answer: the memo's saving
+// QUADRUPLES as N doubles and its curve is the linear one. FILED, not taken — the fix
+// belongs in `fnStmtsPosOf`'s own file, as a per-program node -> position index built
+// where `fnStmts` is (it also owns the `monoOrigNode` fall-through, which no index of
+// `fnStmts` alone can answer).
 export function fnIndexOfInScopeChain(name: string, fnIx: i32) {
   if fnIx >= 0 && (nestedNameSet[name] ?? false) {
     let pp = fnStmtsPosOf(fnIx)
