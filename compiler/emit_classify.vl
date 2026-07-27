@@ -2006,29 +2006,65 @@ function criWalkStmt(stmtIx: i32, i: i32) {
 // exists (an undefined callee — the caller fails loudly).
 export function fnIndexOf(name: string) { fnNameMap[name] ?? -1 }
 
-// `fnIndexOf` but SCOPE-AWARE for a name referenced as a VALUE inside function `fnIx`
-// (a node index): when two lifted functions share a name (each `makeX` declaring its
-// own nested `add`), the flat `fnIndexOf` always returns the FIRST — wrong for the
-// SECOND maker's body, whose `add` captures a different frame. Prefer a lifted function
-// named `name` whose PARENT is `fnIx`'s own `fnStmts` position; fall back to the flat
-// lookup (a top-level function, or no nested match). Only consulted on the function-
-// VALUE path (gated by `fnValUsed`), so by-name resolution elsewhere is unchanged.
+// The `fnStmts` position of a lifted function named `name` whose PARENT frame is the
+// `fnStmts` position `pp`, or -1 — ONE rung of the scope-chain walk below. (Twin of
+// `emit_collect.nestedFnDeclaredIn`; see `fnIndexOfInScope`'s note on the duplication.)
+function nestedFnDeclaredInFrame(name: string, pp: i32) {
+  let i = 0
+  while i < fnStmts.length {
+    const s = P.nodes[fnStmts[i]]
+    if s is FuncDecl {
+      if s.fnName == name {
+        if i < fnParent.length && fnParent[i] == pp { return i }
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// `fnIndexOf` but SCOPE-AWARE for a name referenced as a VALUE (or as a `.map`/`.filter`
+// CALLBACK) inside function `fnIx` (a node index): when two lifted functions share a
+// name (each `makeX` declaring its own nested `add`), the flat `fnIndexOf` always returns
+// the FIRST — wrong for the SECOND maker's body, whose `add` captures a different frame.
+//
+// Resolution is the language's own rule: the INNERMOST enclosing scope that declares
+// `name` wins, so walk OUTWARD from the calling frame and stop at the first hit — the
+// frame's own nested declarations first, then each enclosing frame in turn. Running off
+// the chain (`-1` = top level) means no nested binding is in scope and the flat map's
+// answer — a top-level function — is the correct one.
+//
+// This used to match only a function whose parent IS the calling frame, which missed
+// three rungs and left each a SILENT WRONG ANSWER on the value path: a SIBLING nested
+// function taken as a value, a nested function referring to ITSELF (its declaring frame
+// is its PARENT, one step out — which rewired the recursion to another frame's twin, so
+// `10+10+10` printed `12`), and a nested function SHADOWING a top-level one as seen from
+// a sibling frame.
+//
+// DUPLICATION, deliberate and filed: this is the twin of `emit_collect.
+// fnIndexOfInScopeChain`, which `emitCall` uses for the by-name CALL path. The two are
+// one function in two homes because `emit_classify` cannot import `emit_collect` — the
+// module graph already runs `emit_collect -> emit_classify` and the loader rejects the
+// cycle ("Import cycle detected"). The dedup is a ONE-LINE change in `emit_collect`
+// (`fnIndexOfInScopeChain` becomes `fnIndexOfInScope(name, fnIx)`; that direction of the
+// import already exists), and belongs to whoever owns that file.
+//
+// Cost: gated on `nestedNameSet`, so a name that is not a nested function's anywhere —
+// every callee in a module with no nested functions, including this compiler — costs
+// exactly the one `fnIndexOf` map lookup it cost before.
 export function fnIndexOfInScope(name: string, fnIx: i32) {
   // The parent-matching scan can only succeed for a NESTED function named `name`; skip
   // it entirely (→ O(1) `fnIndexOf`) when no lifted function carries this name.
   if fnIx >= 0 && (nestedNameSet[name] ?? false) {
-    const pp = fnStmtsPosOf(fnIx)
-    if pp >= 0 {
-      let i = 0
-      while i < fnStmts.length {
-        const s = P.nodes[fnStmts[i]]
-        if s is FuncDecl {
-          if s.fnName == name {
-            if i < fnParent.length && fnParent[i] == pp { return i }
-          }
-        }
-        i = i + 1
-      }
+    let pp = fnStmtsPosOf(fnIx)
+    // `fnStmts.length` bounds the walk: a parent chain cannot be longer than the
+    // function count, so this terminates even were `fnParent` ever to contain a cycle.
+    let steps = 0
+    while pp >= 0 && steps <= fnStmts.length {
+      const hit = nestedFnDeclaredInFrame(name, pp)
+      if hit >= 0 { return hit }
+      if pp < fnParent.length { pp = fnParent[pp] } else { pp = -1 }
+      steps = steps + 1
     }
   }
   fnIndexOf(name)
@@ -19611,27 +19647,45 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32) {
 // function reference, or a let-bound function value whose binding initializer is one
 // of those (a local `let` in the enclosing function, else a module global). -1 when
 // the callback's target function cannot be statically resolved.
+//
+// The named-reference rung resolves through `fnIndexOfInScope` — the language's own
+// innermost-declaring-scope rule — not the flat first-occurrence-wins `fnIndexOf`.
+// With the flat map, `xs.map(inner)` in EVERY frame reached the module's FIRST `inner`,
+// so a second maker declaring its own same-named callback silently mapped with the
+// first maker's function: rc=0 and a wrong list. That was the one shape #1204's
+// 28-shape census left wrong (`.map(inner)` printing `4 / 4` for `4 / 103`), and the
+// chain walk extends the repair to the callback taken from a sibling frame, from a
+// lambda, from a deeper frame that shadows an outer callback, and to `.filter`.
 export function mfCallbackFe(cbIx: i32, fnIx: i32) {
   if cbIx < 0 { return -1 }
   const inner = unwrapParen(cbIx)
   const e = P.nodes[inner]
   if e is FuncDecl { return fnStmtsPosOf(inner) }
   if e is Ident {
-    const t = fnIndexOf(e.identName)
+    const t = fnIndexOfInScope(e.identName, fnIx)
     if t >= 0 { return t }
     let li = -1
+    // The frame whose scope the BINDING's initializer is elaborated in. A local `let`
+    // keeps the current frame; a MODULE GLOBAL's initializer is elaborated at top
+    // level, where no frame's nested declarations are in scope — resolving it against
+    // the calling frame would let a nested same-named function hijack a global binding
+    // that can only ever denote the top-level one.
+    let initFn = fnIx
     if fnIx >= 0 {
       const fn = P.nodes[fnIx]
       if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
     }
-    if li < 0 { li = globalLetOf(e.identName) }
+    if li < 0 {
+      li = globalLetOf(e.identName)
+      if li >= 0 { initFn = -1 }
+    }
     if li >= 0 {
       const d = P.nodes[li]
       if d is LetDecl {
         if d.letInit >= 0 {
           // Guard the degenerate self-referential binding against infinite recursion.
           if unwrapParen(d.letInit) != inner {
-            return mfCallbackFe(d.letInit, fnIx)
+            return mfCallbackFe(d.letInit, initFn)
           }
         }
       }
