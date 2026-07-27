@@ -26516,7 +26516,7 @@ The corpus zero is **AGREEMENT**, and it is graded by five sabotages, each BUILT
 
 | # | sabotage | corpus rows moved (1,469 files x 6 fields) |
 | --- | --- | ---: |
-| **S1** | `tyLitBaseName` answers `i32` for every literal | **20** — 9 RUNSTATUS, 3 CHECKSTATUS, 8 BYTEDIFF |
+| **S1** | `tyLitBaseName` answers `i32` for every literal | **20 rows** — build field 8 BUILDSTATUS(0/1) + 12 BYTEDIFF, check field 3 CHECKSTATUS(0/1), run field 9 RUNSTATUS(0/1) |
 | **S2** | `litMemberTy` stops telling `flt` from `int` | **2** — `literal-unions/single-literal-type`, `soundness/literal-is-runtime-value` |
 | **S3** | the child index never answers | **4** — the four `functions/nested-same-name-*.vl` pins, every one a **STDOUTDIFF** (a silent wrong answer, which is the family's own failure mode) |
 | **S4** | build the child list ASCENDING (LAST declaration wins) | **0 — INERT, and it is inert BY CONSTRUCTION**: a frame declaring one name twice is already a checker error, so the order is unobservable. Recorded as the measured equivalence, not as evidence. |
@@ -26577,7 +26577,7 @@ smaller ones.
 | `scripts/rep-fuzz-check.sh` | **RC=0** — exact, 1 baselined reject, 0 new / 0 stale |
 | corpus A/B, **1,469 files x 6 fields** (build rc · build BYTES · `check --codegen` rc · `check --codegen` message · run rc · run stdout) | **0 moved rows**, graded by S1/S2/S3 above |
 | shared-instance `vl check --codegen tests/cases` | **identical**, 8,419 lines each side, same rc |
-| fuzz A/B, PINNED seeds 1209–1222 x 3 depths x 2 modes | see the fuzz row recorded with the PR |
+| fuzz A/B, **50,400 programs/side**, PINNED seeds 1209–1222 x depths 4/5/6 x plain/declared, `--branching --multiobs` | **0 divergences**. Graded: the identical harness over seeds 1209–1210 against the S1 sabotage reads **13 divergences / 7,200**, so the zero is AGREEMENT for TARGET 1 (sample: `type K0 = "tf" \| "882"` in a `{f: K0 \| i32}` field — `882 / 77` on both sides here, `failed to parse WebAssembly module` under S1) |
 | master's FROZEN source compiled by this head | **`cmp` clean against master's own compiler**, 1,033,394 B |
 
 ### METHOD NOTES
