@@ -22700,3 +22700,332 @@ Reported as such:
    With one home, `nameIsArray("(i32) => i32[]") == true` is a question that can be asked once.
    Three callers guard it with `annArrowAt`, four do not. Whoever takes it: it is a BEHAVIOUR
    change, it needs a pin that fails on master, and it must not ride along with a routing.
+
+## D-INLAYUNION — the inlay guard reads a union as a data structure; and the canon/`annTs` staleness is MEASURED and SETTLED
+
+Branched from **`6397e49`** (#1184). This slice was briefed to kill `nameToTy`, the checker's second
+recursive-descent type parser, by routing its consumers to the parser's shipped `annTs` spelling tree.
+**The brief's central premise was already false at its own stated head, and the first job was proving
+that rather than acting on it.**
+
+### THE BRIEF'S PREMISE, CHECKED FIRST AND FOUND STALE
+
+The brief stated: *"`typecheck.vl` does not contain the string `annTs` anywhere — verify that
+yourself first; if it is now false, re-scope and say so."*
+
+It is false. `grep -c annTs compiler/typecheck.vl` = **6**. More than the string is present: the
+whole mechanism is. `tsToTy` — the file's own header calls it *"the structural dual of `nameToTy`"* —
+is shipped, and it is ROUTED:
+
+```vl
+function annotResolve(name: string, root: i32) {
+  if root >= 0 { return tsToTy(root) }
+  nameToTy(name)
+}
+```
+
+That is D-ASCANON (#1129), and its comment already records the measurement the brief asked for
+(*"at the two POSITIONED funnels the tree is present on 333,073 of 333,073 reads"*). **The briefed
+slice — "route a proven subset of `nameToTy`'s consumers to the tree" — is done for every consumer
+that HAS a tree.** So the slice was re-scoped to the two things still worth doing: measure what is
+actually LEFT of `nameToTy`, and settle the canon/`annTs` staleness the brief correctly identifies as
+the blocker that has stopped this program twice.
+
+### THE CENSUS, WITH ITS UNIT ON EVERY NUMBER
+
+Instrument validated before use: `parsercount.py` reproduces the tracked scoreboard at `6397e49`
+exactly — **CORE 311 · OFF-LIST 27 · TRUE 338**, per-file sums cross-checked against the tree-wide
+total. UNIT throughout: **non-comment call sites**, string-literal-aware `//` stripping, definition
+headers excluded.
+
+`nameToTy` has **17 call sites, every one of them inside `typecheck.vl`**, and it decomposes
+exhaustively:
+
+| population | sites | what it is |
+|---|---|---|
+| ladder fall-through | 1 | `annotResolve`'s NAME leg — taken only when `annTsOf` answers -1 |
+| internal recursion | 10 | `nameToTyReal`'s own arms: union member, `&` operand, `!` operand, paren group, function-type param + return, array element, map key + value, object field |
+| generic-alias args | 1 | `applyGenAliasArgs`'s NAME leg (its tree dual, `tsToTy`, sits 11 lines above it) |
+| canon-time | 2 | `unionMemberGenAppShape`, `canonEmitName`'s intersection arm |
+| emitter-supplied names | 3 | `recordClonedNodeTy`, and the two inferred-return re-check probes' `paramTyNames` |
+
+**`nameToTy` is not exported, and neither is any of `tsToTy` / `annotResolve` / `isTypeTy` /
+`nameToTyAt` / `nameToTyAnn` / `resolveAnnotTs`.** Every `nameToTy` mention in an `emit_*.vl` or
+`wasmEmit.vl` file is a COMMENT. The compiler's second type parser is now entirely checker-internal.
+
+**This is why the remaining population cannot simply be routed.** What is left is precisely the set
+of names with NO parse tree to route to: strings the EMITTER computed (`#anonN`, `=>sigkey`,
+monomorphic param pins), and strings canon is mid-way through producing. A union VARIANT is the same
+story from the other side — `UnionDecl.udVariants` is a `string[]`, not a node list, so
+`unionMemberGenAppShape` has no node to ask. Routing those requires giving those producers trees,
+not re-pointing a consumer.
+
+**The scoreboard did not move: CORE is 311 on both sides of this PR.** No resolver was retired and no
+new type-name parse was added. Stated plainly rather than dressed up — this slice ships a measurement
+and a defect fix, not a destringification.
+
+### THE CANON/`annTs` STALENESS: MEASURED, AND THE NUMBERS ARE NOT THE FILED ONES
+
+The brief filed this as the prerequisite and "the actual hard part": `canonEmitTypeNames` rewrites
+`TypeRef.tyName` **in place** without updating `annTsRoot`, so the shipped tree goes stale exactly
+where a future consumer would read it. The mechanism is real — confirmed by reading the pass, whose
+TypeRef arm is `const c = canonEmitName(n.tyName); if c != n.tyName { n.tyName = c }` and touches no
+tree.
+
+It was measured rather than argued, with a throwaway instrumented compiler reporting through the
+DIAGNOSTIC channel (the compiler module cannot import `print`: a first attempt died on
+`unknown import: imports::__print_i32__`). Counters reset at the top of `checkProgram` and report at
+its bottom, so the post-canon window is the whole tail of the pass and a shared instance cannot smear
+one program's counts into the next. Over **1,378 corpus programs** — UNIT: `TypeRef` node visits
+inside `canonEmitTypeNames`, and tree-read events at the two typecheck funnels:
+
+| measurement | count |
+|---|---|
+| `TypeRef` visits at canon | 5,239 |
+| …carrying an `annTs` tree | **5,239 (100%)** |
+| …whose tree reproduces the PRE-canon `tyName` character for character | **5,239 (100%)** |
+| `tyName` REWRITTEN by canon | **167** (3.2%) |
+| …of those, left STALE (tree renders the pre-canon spelling) | **167 / 167 (100%)** |
+| **tree reads occurring AFTER canon** | **0** |
+
+Three things follow, and the third is the one that matters.
+
+1. **The tree/string agreement is TOTAL up to canon** — 5,239 of 5,239, character for character.
+   `ast.vl`'s claim that `tsToName(annTsOf(ix))` reproduces `TypeRef.tyName` is not a header comment
+   here, it is a measurement. This is the CONTROL that makes the staleness attributable: the two
+   agree perfectly before canon, so canon is what breaks them.
+2. **The staleness is TOTAL on its population** — every one of the 167 rewrites leaves a stale tree,
+   not some of them. The filed figure, "27 of 111 stale nodes", does not reproduce under any reading
+   I could construct; publish 167/167 of 5,239 and the definition used.
+3. **It is inert today: ZERO post-canon tree reads.** The staleness is DEFENDED BY ORDERING, not by
+   correctness. Every one of the seven `annTsOf` read sites executes before `canonEmitTypeNames`:
+   the four in `typecheck.vl` are inside annotation resolution (during `checkNode`), and the three in
+   `driver.vl` are the module MERGE, which runs before `checkProgram(merged)`. No `emit_*.vl` file
+   references `annTsOf` at all.
+
+**So this blocker is a LATENT TRAP, not a live bug — and that is a worse thing to leave undocumented
+than a live bug.** It costs nothing today and silently corrupts the FIRST consumer added after canon,
+which is exactly what the next routing slice would add. The one pass that already rewrites `tyName`
+and got this right is the module merge, whose `modRwType` rewrites the TREE and renders the name from
+it — with a comment citing the identical lesson (*"an in-place string rewrite between producer and
+consumer is exactly what left the spelling tree describing the PRE-merge name"*). `canonEmitTypeNames`
+is the same shape of pass that never learned it.
+
+**THE MECHANISM, AND THE THREE WAYS OUT — filed, not taken.** The reason this is filed rather than
+fixed is that all three need a file outside this slice's partition, and the cheap-looking one is a
+trap:
+
+- **(a) Re-parse the canon'd name into a tree.** This is ADDING a type-string parser to close a
+  destringify blocker. It would satisfy the invariant and betray the program. Named here only so the
+  next agent rejects it deliberately.
+- **(b) Make `canonEmitName` produce a TREE rather than a string** — destringify canon itself, so the
+  name is rendered FROM the tree exactly as `modRwType` does. This is the RIGHT fix and it is a
+  slice of its own: `canonEmitName` is a name→name transformation used by several callers.
+- **(c) INVALIDATE the tree where canon rewrote it** — set `annTsRoot` to -1 for those 167 nodes so a
+  future consumer falls through to the NAME leg instead of reading a stale tree. Small, safe, and
+  provably behaviour-free TODAY (0 post-canon reads), and it converts a future silent-wrong into a
+  correct-but-unrouted. It needs a new overwrite entry point in `ast.vl`: the existing `setAnnTs`
+  PUSHES and depends on `annTsNode` staying strictly increasing, so it cannot be reused to overwrite
+  a row.
+
+**(c) is the recommended next step, and it is ~10 lines in `ast.vl` plus one line in the canon arm.**
+
+### THE FILED FIX THAT SHIPPED: `inlayHole` WAS SHALLOW
+
+`inlayHole` answered "is this type an unresolved hole?" by testing only the TOP constructor —
+`TyVar`, `TyErr`. A `TyUnion` whose members are all holes therefore slipped its own guard, and the
+result was an INCONSISTENCY rather than a mere omission: a bare hole rendered `: any` and was
+suppressed, while the same hole in a one-arm-per-hole union rendered `: any | any` and was SHOWN. An
+inlay hint is formatted `: T` — a suggestion of the annotation to write — and `any` is not a type VL
+can spell.
+
+The fix reads the union as a data structure: a union is a hole iff EVERY member is. Depth-bounded at
+the arena's established budget (`tyDeeperThan`'s 16) because a recursive type is cyclic in the arena;
+exhausting the budget answers "not a hole", the answer that KEEPS the hint.
+
+Measured over the corpus (UNIT: inlay-hint CANDIDATES from `inlayHintsAt`, 1,345 files):
+
+| | baseline | fixed |
+|---|---|---|
+| candidate hints | 8,504 | **8,468** |
+| `any`-bearing ("unspellable") | 110 | **74** |
+| host-filter drops on diagnostic-free files | 1 | 1 |
+
+**The 36 that went are exactly `any | any` (35) and `any | any | any` (1) — and the diff is
+REMOVAL-ONLY: 0 hints added, 0 surviving hints changed.** The filed figures (110 → 74) reproduce
+exactly; the filed "4,249 → 4,207" does not, because that unit is post-`inlayHintsFromWasm` labels
+rather than candidates — the DELTA is the reproducible part, and the delta is 36.
+
+Deliberately NOT extended to `TyNullable`: `let x = null` renders `<none>?`, and that type IS
+determined (VL spells it `null`) — `tests/cases/types/infer-null-unconstrained.vl` exists to say so.
+Extending there would also have taken the corpus-sweep test's `dropsOnClean` assertion from 1 to 0.
+The all-members test, not an any-member one, is what keeps `any | string` and
+`{foo: string} | {bar: any}` — types that carry real structure — offered.
+
+**`inlayHole` has two consumers that are NOT the editor surface**, and both were checked rather than
+assumed: the redundant-`let`-annotation and redundant-RETURN-annotation lint guards. The change makes
+both strictly MORE conservative, and in a population where firing was already dubious — a
+`function f<T, U>(...): T | U` whose natural return is the same all-hole union would previously have
+been told its annotation was redundant, which is wrong advice. Zero corpus files reach it.
+
+### GATE, AND WHAT EACH CHANNEL CAN AND CANNOT SEE
+
+Every leg from a FRESHLY FETCHED published seed (the fetched seed had moved to 1,034,417 B — master
+advanced mid-slice — and the fixpoint was re-proven against it):
+
+`fetch-seed.sh` RC=0 · `refresh-compiler.sh --prove-fixpoint` RC=0 (2 compiles, fixpoint holds) ·
+`native-fixpoint.sh` RC=0 (stage3 == stage4 byte-for-byte) · `npm ci` RC=0 ·
+`SELFHOST_NATIVE_ALIGN=1 deno task test` RC=0 **2,146 / 0 / 8** · `deno check
+tests/cases_wasm_test.ts` RC=0 · `lint-self.sh` RC=0 (incl. `vl fmt --check`) · `rep-fuzz-check.sh`
+RC=0 (`exact ✅`).
+
+**The suite baseline the brief supplied (2,148) was stale AT THE HEAD IT NAMED; the measured baseline
+at `6397e49` is 2,146 / 0 / 8**, re-derived by running master's own tree in this worktree before
+touching anything. The 8 ignored confirms the environment (`npm ci` done, `SELFHOST_NATIVE_ALIGN=1`
+set, and the `vl-host` binary staged into the worktree — a worktree that lacks it silently
+self-ignores ~620).
+
+**Corpus A/B, 1,408 files, 8 fields per record (build rc, wasm sha256, build output, check rc,
+diagnostic text, run rc, run stdout; temp paths normalized): ZERO differing records.** Well-formedness
+asserted — every line exactly 8 fields on both sides — with one output file per worker.
+
+**Binary +161 B** (1,034,394 → 1,034,555), and the fixed build is byte-reproducible from two
+DIFFERENT seeds (the earlier fetch and the advanced one) — `cmp` RC=0.
+
+**RE-GATED AFTER REBASE ONTO `9a60901` (#1181 + #1182 landed mid-slice), because master's compiler
+changed underneath this one** — #1182 is a large `emit_classify` refactor and #1181 changed
+`format.vl`/`parser.vl`. Every leg re-run from a newly fetched seed (1,031,388 B):
+`refresh-compiler.sh --prove-fixpoint` RC=0 · `native-fixpoint.sh` RC=0 (1,031,549 B) ·
+`SELFHOST_NATIVE_ALIGN=1 deno task test` RC=0 **2,148 / 0 / 8** (2,146 + the two corpus files #1181
+added — which is where the brief's 2,148 came from: it was a FUTURE head's number, not a stale one) ·
+`lint-self.sh` / `deno check` / `deno lint` RC=0 · `rep-fuzz-check.sh` `exact ✅` · **corpus A/B
+1,410 files ZERO differing records** · hint census **8,507 → 8,471**, `any`-bearing **110 → 74**,
+36 removals all `any | any`, 0 additions. **Binary delta +161 B, identical to pre-rebase.** The
+program doc conflict was append/append and was resolved by keeping both sides whole — master's 542
+lines and this slice's 315 both asserted byte-intact against their originals, 0 deletions.
+
+**BOTH COMPARATORS WERE SANITY-CHECKED AGAINST KNOWN-WRONG BUILDS, AND ONE OF THEM IS BLIND.**
+
+- **Sabotage B** — the guard's ALL-members test inverted to an any-member test (over-suppression).
+  The hint census SEES it: 8,468 → 8,460, and the 8 extra removals are exactly `any | string` (7) and
+  `any | i32` (1). The updated control test FAILS on it, on the precise assertion added for it
+  (`expected the mixed hole union to survive`). **The corpus A/B does NOT see it: 0 differing records
+  against a build that is definitely wrong.**
+- **Sabotage C** — a diagnostic message string altered. The corpus A/B reddens exactly 1 record.
+
+So the corpus channel is not broken, it is **structurally blind to this change class**, and saying
+"corpus A/B clean" about an inlay fix would have been a 0 that means nothing. The corpus A/B here
+proves NO COLLATERAL DAMAGE to compile/check/run; the hint behaviour is proven by the census
+(exact 36-record removal-only diff) and by the control test that a wrong build fails.
+
+**Shared-instance `vl check tests/cases` A/B: identical**, 7,537 lines, 247 errors / 135 warnings on
+both sides.
+
+### AN INSTRUMENT TRAP IN THE FUZZ HARNESS, WORTH MORE THAN THE FUZZ RESULT
+
+The first fuzz A/B ran `fuzz-sweep.sh` once per compiler and diffed the two `--out-dir` trees. It
+reported **2,567 differing lines** — and every one of them was the instrument. `fuzz-nightly.sh`
+picks **fresh random seeds on every run** (`s=$((RANDOM * RANDOM + RANDOM))`, its comment: *"Fresh,
+unpinned seeds every run"*), so the two sides were never given the same programs. A tree-level
+`diff -r` of two sweeps reports the GENERATOR, not the compiler, and it reports it as a large and
+convincing-looking regression.
+
+Re-run with the seeds PINNED (8 seeds × 3 depths × 4 dimension combos, `--count 200`), so both sides
+compile the identical population, and the whole `--shapes-out` failure set diffed per cell:
+**19,200 programs per side, 96 cells per side, 0 of 96 cells differ, 1,221 failure lines on both
+sides.**
+
+**And that 0 is COVERAGE, not agreement — measured, not assumed.** The same sabotage B build was run
+through one pinned cell (seed 7, depth 4, plain) and its failure set is IDENTICAL to baseline's: the
+fuzz channel cannot see this change class either, for the same reason the corpus cannot — the
+generator compiles and runs programs, and never asks for an inlay hint. **Both large 0s in this PR
+mean "no collateral damage to compile/check/run"; neither is evidence that the hint behaviour is
+right.** That evidence is the 36-record removal-only census diff and a control test that a wrong
+build fails. Reporting the two 0s without this paragraph would have been the exact error method note
+133 exists to prevent.
+
+### THE SECOND FILED FIX IS NOT IN THIS PARTITION — REPRODUCED AND HANDED OFF
+
+The brief filed *"a `capRecord` hole for a parameter holding a function value named after a builtin"*
+as being "in your files". **It is not: `capRecord` lives in `emit_classify.vl`, which this slice is
+forbidden to touch (PR #1182 holds it).** It was reproduced rather than taken on trust, so the hand-off
+carries a witness instead of a description.
+
+```vl
+function apply(print: (i32) => i32) {
+  const f = () => print(7)
+  return f()
+}
+function double(x: i32) { return x * 2 }
+print(apply(double))
+```
+
+**Checker-clean; the emitted module FAILS TO TRANSLATE** — `Invalid input WebAssembly code at
+offset 236: type mismatch: expected i32 but nothing on stack`. Identical on master's own compiler, so
+it is pre-existing and not this slice's.
+
+The mechanism is one line, `emit_classify.vl:2186`:
+
+```vl
+if isBuiltinFnName(cal.identName) { skipCallee = true }
+```
+
+The exemption is keyed on the SPELLING alone. D-CAPCALLEE correctly moved it out of `capRecord`
+(where it suppressed genuine captures at every position) into the `Call` arm — but at the call
+position it still fires for a name that is a LOCAL BINDING, so a param or local shadowing `print` /
+`toString` / `Map` / `Set` / `fromCodePoint` is not recorded as a capture and the closure's env is
+built without it. The neighbouring comment already states the correct rule — *"A callee that is NOT
+on the list (a closure local, a param holding a function value) still falls through to the scan
+below"* — the code just cannot tell the two apart, because it asks the name and not the scope.
+
+**The sharp form of the severity, which is what makes it worth a PR of its own:** calling a captured
+function value is not supported in general right now — the same program with the param renamed `cb`
+is a CLEAN, LOCATED reject (`emitProgram: call to unknown function`). The builtin-shadow path turns
+that clean reject into an unlocated INVALID MODULE. **The fix is to gate the exemption on the name
+not being bound in scope** (`capIsBound(bound, …)`, already in this file and already `capRecord`'s
+first question) rather than to widen or narrow either list.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+- **No routing, and no `nameToTy` arm deleted.** The 17 sites decompose into 12 that are the resolver
+  talking to itself and 5 whose names have no tree; both `annotResolve` and `recordClonedNodeTy` can
+  still receive an arbitrary spelling, so no arm is provably dead and deleting one on corpus silence
+  would be exactly the "a 0 can be blindness" error. CORE stays 311, stated rather than dressed up.
+- **The canon/`annTs` fix (option (c)) is filed, not taken** — it needs an overwrite entry point in
+  `ast.vl`, outside this partition, and it is provably inert today (0 post-canon reads), so shipping
+  it across a partition boundary would buy nothing measurable.
+- **No new `tests/cases/**.vl`.** That corpus asserts compile/run behaviour and has no inlay-hint
+  channel, so a file there would assert nothing about this change. The population is already present
+  (35 corpus sites render `any | any`) and the guard is asserted where it is observable.
+
+### METHOD NOTES
+
+130. **CHECK THE BRIEF'S PREMISE BEFORE ITS TASK, AND BUDGET FOR IT BEING FALSE.** This brief's
+     headline claim — "`typecheck.vl` does not contain the string `annTs` anywhere" — was refuted by
+     the first command run in the repo, and the work it asked for had shipped in #1129. It also
+     carried a suite baseline that did not match the head it named (2,148 vs the measured 2,146 — it
+     was a FUTURE head's number, and matched again after the rebase) and mis-filed a defect's location
+     (`capRecord` as "in your files"; it is in another agent's). Three stale facts in one brief is
+     not carelessness, it is what a fast-moving program's briefs look like — the defence is to spend
+     the first 20 minutes re-deriving, and to treat "re-scope and say so" as the expected outcome
+     rather than the exceptional one.
+131. **AN INERT BLOCKER IS WORSE THAN A LIVE ONE, AND MUST BE MEASURED ON BOTH AXES.** The canon
+     staleness is 167/167 on its population AND 0 on live consumers. Either number alone is
+     misleading: 167/167 alone reads as a shipping bug, 0 alone reads as a non-issue. It is a trap
+     armed for the next person, and the pair of numbers is the only honest statement of it.
+132. **A GENERATOR THAT PICKS FRESH SEEDS MAKES `diff -r` OF TWO RUNS A LIE.** `fuzz-sweep.sh`
+     reported 2,567 differing lines between two compilers that had never been given the same
+     programs. The failure is silent and looks exactly like a large regression. Before diffing any
+     harness A/B, run the SAME side twice, or read the harness for `$RANDOM` — and if the seeds are
+     unpinned, pin them and diff the failure sets per cell.
+133. **SANITY-CHECK EVERY COMPARATOR SEPARATELY; ONE OF THEM IS USUALLY BLIND TO YOUR CHANGE.** The
+     corpus A/B was 0 for the real fix AND 0 for a definitely-wrong build, while the hint census
+     separated them cleanly and the control test failed on the wrong build. Reporting "corpus clean"
+     for an editor-surface change would have been a meaningless 0 dressed as evidence. Name, per
+     channel, what it can see.
+134. **A FIX THAT MAKES A GUARD CONSISTENT WILL FAIL THE TEST THAT PINNED THE INCONSISTENCY, AND
+     THAT TEST IS USUALLY WHERE THE FIX WAS FILED.** `inlayHole`'s shallow-union defect was filed in
+     the header of the very test whose control asserted `: any | any` survives. The failing control
+     is the change landing, not a regression — but it must be REWRITTEN to assert the new invariant
+     (an all-hole union offers nothing; a hole-BEARING structured type still does), never deleted,
+     or the fix ships with its guard removed.
