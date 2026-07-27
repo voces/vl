@@ -84,6 +84,7 @@ import {
 import {
   annArrowAt,
   annRetNameOf,
+  arrElemNameRaw,
   cloArrElemNameOf,
   gaeLtAt,
   isStructAtom,
@@ -673,12 +674,34 @@ export function collectCloSigs() {
     if cloRetValKind(fe) == "nulclosure" {
       const rfn = P.nodes[fnStmts[fe]]
       if rfn is FuncDecl {
-        // NO `nulCloMixedUnionUnregistered` guard — master had none here either, and
-        // this is the ONE of the seven synth sites where the omission is not provably
-        // inert (`inm`'s result is unconstrained). Kept EXACTLY as master had it and
-        // measured instead of changed: see the hand-off in the destringify doc.
+        // THE MIXED-UNION SKIP BELONGS HERE TOO, and this is the one synth site where
+        // its absence was NOT inert. #1174 filed it as "not provably inert" without a
+        // witness; the witness exists and its population is exactly one shape — an
+        // UN-INSTANTIATED GENERIC TEMPLATE. `inm` is the nullable part of a lifted
+        // function's declared return, and for a template that spelling still carries the
+        // TYPE PARAMETER (`((i32) => i32 | T)`). `T` is not a value atom and not a
+        // litunion, so it counts as the COMPOSITE side of the guard's mix test while a
+        // concrete `i32` supplies the scalar side — and NO registration pass ever
+        // registers it, because `collectU` (which owns `collectTyReachRegister`) is
+        // emit pass #1 while `monomorphize`/`synthRetAnnots` run later and there is no
+        // `collectU#2`. So all four registration predicates decline and the guard fires.
+        // That is why every cell #1174 built was inert: all four were CONCRETE, and a
+        // concrete mixed union always registers (measured: 20 of 20 spellings answer
+        // `isUName`). Unguarded, this site banks the key `i>u` — derived from a spelling
+        // that mentions a TYPE PARAMETER, so it describes no value — and because
+        // `internCloSigKey` keeps the FIRST rep for a key, a template reached before a
+        // concrete lambda of the same key also STEALS that key's representative,
+        // replacing the lambda's own functype with the `-1` synth one — the same
+        // failure #1174's sabotage S2 named.
+        //
+        // HONEST BOUND: no program was found on which this changes RUN OUTPUT. The
+        // divergence is in the emitted BYTES, measured two ways (a spurious 7-byte
+        // functype, and a same-size rep swap), over 44 constructed programs, the full
+        // corpus and the fuzz grid. It is a tightening, not a bug fix, and the pin for
+        // it is a wasm-SHA pin (`generic-nulclosure-return-sig-skip.vl`), not a `@log`
+        // one — `deno task test` compares OUTPUT and therefore cannot see it.
         const inm = nullablePartOf(tyNameOf(rfn.fnRet))
-        if inm != "" { internCloSigKey(unionArmSigKey(inm), -1) }
+        if inm != "" { internCloSigOfAtom(inm) }
       }
     }
     // CLOSURE-RETURNING-CLOSURE result (`() => ((i32) => f32)`, `(i32) => (() => i64)`): a
@@ -3308,11 +3331,15 @@ function gaeCollectDecls(stmts: i32[]) {
 // spelling — a `| null` nullable and any number of trailing `[]` — leaving the bare name
 // `gaeEnsure` can intern (`Box<i32>[] | null` → `Box<i32>`). A name with no wrapper comes
 // back unchanged.
+//
+// The `[]` half is the ARRAY-NAME grammar's two homes (`emit_base.nameIsArray` TESTS it,
+// `arrElemNameRaw` CUTS it, #1175) — this loop is a resume over them, not a third copy.
+// The `nm.length > 2` guard is kept IN FRONT of the test rather than folded into it: it
+// excludes the degenerate `"[]"`, which `nameIsArray` accepts and whose raw cut is "" —
+// exactly the `-1`/`""` ambiguity the home's own header says it asserts nothing about.
 function gaePeelWrappers(name: string) {
   let nm = nonNulBaseOf(name)
-  while nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
-    nm = nm.slice(0, nm.length - 2)
-  }
+  while nm.length > 2 && nameIsArray(nm) { nm = arrElemNameRaw(nm) }
   nm
 }
 
@@ -3967,7 +3994,9 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // reaching the inner union at any depth — the registration dual of the recursive ref-array
   // interning. Bottoms out at the 1D `(…)[]` (the `pun` path above).
   if nameIsArray(name) {
-    const inner = name.slice(0, name.length - 2)
+    // The cut is `arrElemNameRaw`'s (#1175) — the TEST half was already the home's, and
+    // the CUT half was the hand-written other half of the same one rule.
+    const inner = arrElemNameRaw(name)
     if nameIsArray(inner) { return registerInlineUnion(stmts, inner) }
     // A 1D ARRAY-OF-INLINE-SHAPE element (`{a: f64, f: K0 | {w: i32}, z: string}[]` — a struct FIELD
     // that is an array of a struct carrying a value-union FIELD): stripping one `[]` yields a SINGLE
