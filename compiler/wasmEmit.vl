@@ -432,6 +432,7 @@ import {
   globalIndexOf,
   globalLetOf,
   globalNameIsNonConst,
+  globalNulListCellRead,
   identChainTyBoxedUnion,
   identChainTyMapArmUnion,
   identNullableBoolPop,
@@ -8863,20 +8864,18 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           }
           pendingListKind = letAnnRefListKind(gLet)
           pendingListSlot = letAnnRefListSlot(gLet)
-          // FILED, NOT FIXED — the one GLOBAL cell these two seeds do not rescue. A
-          // `S[] | null` global INITIALIZED to the empty literal and then assigned a NON-empty
-          // ref-list literal emits invalid wasm (`expected (ref null $type), found (ref null
-          // $type)`), `vl check` clean:
-          //     type S = { n: i32 }
-          //     let xs: S[] | null = []
-          //     xs = [{ n: 1 }, { n: 2 }]
-          //     print(xs.length)
-          // Narrowed against its neighbours, all of which RUN: the same cell initialized to a
-          // non-empty literal is a CHECKER error, the `= null` initializer is a clean EMIT
-          // error, the LOCAL twin of this exact program runs, and the same global assigned the
-          // EMPTY literal runs. So the trigger is the empty-`[]` INITIALIZER deciding the
-          // global CELL, not this arm's seeds — it is the global-cell kind, one layer up, and
-          // wants the `globalCellKind` / `emitGlobalSection` owner rather than a patch here.
+          // FIXED (was FILED here) — the GLOBAL cell these two seeds do not rescue was never
+          // an assignment gap at all: an empty-`[]`-initialized `S[] | null` global was
+          // MIS-READ, in `exprArray` / `exprRefArray`, as the mono i32 list. The filing's
+          // diagnosis (the global CELL kind, `globalCellKind` / `emitGlobalSection`) is
+          // REFUTED by the emitted bytes: the cell and this arm's seeds were both already
+          // correct — `(mut (ref null $rlWrap))` holding a `struct.new $rlWrap` — and it was
+          // `xs.length` that addressed the WRONG wrapper. Two of the filing's four
+          // neighbours were wrong too: the same global assigned the EMPTY literal was
+          // invalid wasm (not "runs"), and the non-empty INITIALIZER is a checker error only
+          // without an assignment (`.length` on an un-narrowed nullable) — with one, it ran.
+          // The fix is `exprRefArray`'s third storage class in `emit_classify.vl`; see
+          // `tests/cases/globals/nullable-refarray-global-empty-init.vl`.
           // A MAP-typed global seeds the map SHAPE, so a bare `Map()` RHS constructs THIS
           // binding's map struct instead of the shared mono (i32-valued) one. The let /
           // return / struct-field / global-INIT boundaries all seed it already; ASSIGNMENT
@@ -9526,6 +9525,32 @@ function rlElemIsNestedList(rslot: i32) {
   k == 4 || k == 6 || k == 7 || k == 8 || k == 9 || k == 10
 }
 
+// Stage a list-op RECEIVER that is not a bare local — a module GLOBAL, a struct FIELD, an
+// INDEX — into the op frame's `recvRef` scratch slot (`base + 3`). The ONE home for the
+// evaluate-once rule `.push` / `.pop` / `.clear` / `.pop() ?? d` each spelled inline.
+//
+// `emitExpr` runs the receiver read (for a global: `global.get`, plus the non-const cell's
+// own `ref.as_non_null`). A NULLABLE LIST cell needs the recover that read deliberately
+// WITHHOLDS: kinds 15 / 18 and the four distinct-backing scalar niches stay raw so a
+// `g != null` compare can test the cell, while this scratch slot is a NON-null wrapper
+// ref. Without it a `let g: i32[] | null = []` / `let g: S[] | null = []` global rejected
+// the module at the stash — `type mismatch: expected (ref $type), found (ref null $type)`,
+// `vl check` clean — while the same lines over a LOCAL ran (a local receiver IS the frame
+// slot and is never staged). The receiver of a list op is non-null by the checker's own
+// narrowing (an un-narrowed `g.push(x)` over `g: T[] | null` is a type error), so the
+// recover never traps.
+function stageListRecv(body: i32[], objIx: i32, fnIx: i32, base: i32) {
+  if emitExpr(body, objIx, fnIx) < 0 { return -1 }
+  const r = P.nodes[unwrapParen(objIx)]
+  if r is Ident {
+    if globalNulListCellRead(r.identName) {
+      fbRefAsNonNull() // 0xd4
+    }
+  }
+  fbLocalSet(base + 3) // local.set recvRef
+  0
+}
+
 // Lower a `recv.push(x)` member-call statement onto `body` — the growable-list append
 // (mirroring `toWasm.ts`'s `__list_grow__`/`__list_push__`, but INLINED). `recv` must be
 // a bare `Ident` naming a LIST local/param (so its `local.get` is side-effect-free and
@@ -9677,20 +9702,17 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
           if globalIndexOf(recv.identName) < 0 {
             return emitFail("emitProgram: .push receiver is not a list local")
           }
-          if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-          fbLocalSet(base + 3) // local.set recvRef
+          if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
           lIdx = base + 3
         }
       } else if recv is Member {
-        if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-        fbLocalSet(base + 3) // local.set recvRef
+        if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
         lIdx = base + 3
       } else if recv is Index {
         // An INDEXED receiver (`g[0].push(x)` — push onto an INNER list of a nested array, or
         // onto a list read from a list-valued map). The classifiers above already recognize a
         // nested `g[i]` read as its inner list, so `lTy`/`aTy`/`base` are the inner list's.
-        if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-        fbLocalSet(base + 3) // local.set recvRef
+        if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
         lIdx = base + 3
       } else {
         return emitFail(
@@ -9863,13 +9885,11 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32) {
           if globalIndexOf(recv.identName) < 0 {
             return emitFail("emitProgram: .pop receiver is not a list local")
           }
-          if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-          fbLocalSet(base + 3) // local.set recvRef
+          if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
           lIdx = base + 3
         }
       } else if recv is Member {
-        if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-        fbLocalSet(base + 3) // local.set recvRef
+        if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
         lIdx = base + 3
       } else {
         return emitFail(
@@ -9967,13 +9987,11 @@ function emitClear(body: i32[], callIx: i32, fnIx: i32) {
           if globalIndexOf(recv.identName) < 0 {
             return emitFail("emitProgram: .clear receiver is not a list local")
           }
-          if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-          fbLocalSet(base + 3) // local.set recvRef
+          if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
           lIdx = base + 3
         }
       } else if recv is Member {
-        if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-        fbLocalSet(base + 3) // local.set recvRef
+        if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
         lIdx = base + 3
       } else {
         return emitFail(
@@ -10144,13 +10162,11 @@ function emitPopOr(body: i32[], popIx: i32, defIx: i32, fnIx: i32) {
           if globalIndexOf(recv.identName) < 0 {
             return emitFail("emitProgram: .pop receiver is not a list local")
           }
-          if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-          fbLocalSet(base + 3) // local.set recvRef
+          if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
           lIdx = base + 3
         }
       } else if recv is Member {
-        if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-        fbLocalSet(base + 3) // local.set recvRef
+        if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
         lIdx = base + 3
       } else {
         return emitFail(
