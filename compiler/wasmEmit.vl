@@ -356,6 +356,7 @@ import {
   captureCountOf,
   captureNamesOf,
   cbRetVariantIdx,
+  cloCallParamLitUnion,
   cloCallReflistElemTwin,
   cloCallSigKey,
   cloCallUnionResultUnrepresentable,
@@ -389,6 +390,8 @@ import {
   exprIsStrIndexOf,
   exprIsStrOrder,
   exprIsStrSlice,
+  exprListCellBuildKind,
+  exprListCellBuildSlot,
   exprMap,
   exprNulBool,
   exprNulClosure,
@@ -8767,7 +8770,27 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
       } else if pck == "f32" {
         if emitExprAsF32(body, args[i], fnIx) < 0 { return -1 }
       } else {
-        if emitExpr(body, args[i], fnIx) < 0 { return -1 }
+        // The LITERAL-UNION param positions, the two seeds this arm has never had while its
+        // direct-call twin `emitCall` has carried both (`cParamLitUnion` /
+        // `cParamNulLitUnion`): a member-literal argument lowers as its interned i32 ATOM id,
+        // and a `null` argument into a `K | null` param as the i32 sentinel `-1`. Without
+        // them `const f: (K) => i32 = pick` + `f("a")` pushed a string REF into the i32 param
+        // the `call_ref` functype declares — invalid wasm with `vl check` clean, from two
+        // ordinary lines, in EVERY function-value shape (annotated binding, lambda, HOF param,
+        // struct field, closure array, local binding). The VARIABLE-argument spelling `f(k)`
+        // escaped because the atom local already holds the i32 id; only a LITERAL had to be
+        // told which rep to take. The `$fnsig` key cannot supply this (a litunion param's
+        // token is `i`, identical to a plain i32's — measured), so it comes from the callee's
+        // checker type: `cloCallParamLitUnion`.
+        const clu = cloCallParamLitUnion(callIx, i)
+        if clu == 0 {
+          if emitExpr(body, args[i], fnIx) < 0 { return -1 }
+        } else {
+          const cluCtx = expCtxHere()
+          cluCtx.litUnion = 1
+          if clu == 2 { cluCtx.nulLitUnion = true }
+          if emitExprExpect(body, args[i], fnIx, cluCtx) < 0 { return -1 }
+        }
       }
       i = i + 1
     }
@@ -8840,6 +8863,20 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           }
           pendingListKind = letAnnRefListKind(gLet)
           pendingListSlot = letAnnRefListSlot(gLet)
+          // FILED, NOT FIXED — the one GLOBAL cell these two seeds do not rescue. A
+          // `S[] | null` global INITIALIZED to the empty literal and then assigned a NON-empty
+          // ref-list literal emits invalid wasm (`expected (ref null $type), found (ref null
+          // $type)`), `vl check` clean:
+          //     type S = { n: i32 }
+          //     let xs: S[] | null = []
+          //     xs = [{ n: 1 }, { n: 2 }]
+          //     print(xs.length)
+          // Narrowed against its neighbours, all of which RUN: the same cell initialized to a
+          // non-empty literal is a CHECKER error, the `= null` initializer is a clean EMIT
+          // error, the LOCAL twin of this exact program runs, and the same global assigned the
+          // EMPTY literal runs. So the trigger is the empty-`[]` INITIALIZER deciding the
+          // global CELL, not this arm's seeds — it is the global-cell kind, one layer up, and
+          // wants the `globalCellKind` / `emitGlobalSection` owner rather than a patch here.
           // A MAP-typed global seeds the map SHAPE, so a bare `Map()` RHS constructs THIS
           // binding's map struct instead of the shared mono (i32-valued) one. The let /
           // return / struct-field / global-INIT boundaries all seed it already; ASSIGNMENT
@@ -8963,18 +9000,27 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       if exprMap(a.binLeft, fnIx) {
         pendingMapSlot = mapShapeOfExpr(a.binLeft, fnIx)
       }
-      // FILED, NOT FIXED — the LIST seeds this arm still lacks. The global arm above sets
-      // `pendingListKind`/`pendingListSlot` from the cell's annotation before emitting the
-      // RHS, and `emitLetDeclStmt` does the same for the declaration; the local arm sets
-      // NEITHER. So a list-literal RHS builds the DEFAULT i32 list into a non-i32 slot:
-      // `xs = []` over a `S[]` / `string[]` / `i32[][]` / `f64[]` LOCAL is invalid wasm
-      // with `vl check` clean (the i32-list local escapes because the default IS its slot),
-      // and `g = [null]` over a `(S | null)[]` local rejects the module. The global twins
-      // of both run. The fix is those two seeds keyed off the TARGET expression rather than
-      // a `LetDecl` (`refListSlotOfExpr` + `rlElemKindTbl` for the ref lists, the
-      // `exprStrArray`/`exprF64Array`/`exprI64Array`/`exprF32Array` build kinds for the
-      // scalar ones) — it changes what EVERY list-literal assignment builds, so it wants
-      // its own corpus grading rather than a ride-along.
+      // The LIST seeds this arm lacked, filed at this exact site by #1215 and graded on its
+      // own here. The global arm above sets `pendingListKind`/`pendingListSlot` from the
+      // cell's annotation before emitting the RHS, and `emitLetDeclStmt` does the same for
+      // the DECLARATION; the local arm set NEITHER, so a list-LITERAL right-hand side built
+      // the DEFAULT i32 list into a non-i32 slot. `xs = []` over a `string[]` / `f64[]` /
+      // `i64[]` / `f32[]` / `S[]` / `i32[][]` / `(S|null)[]` / `S[]|null` LOCAL or PARAM was
+      // invalid wasm with `vl check` clean — clearing a list, the most ordinary thing there
+      // is — while the `i32[]` local escaped (the default IS its slot) and every GLOBAL twin
+      // ran. Two spellings were broken with a NON-empty literal too (`xs = [1, 2]` over
+      // `i64[]`, `xs = [1.5]` over `f32[]`): neither literal self-identifies as its backing,
+      // so both need the seed exactly as the annotated declaration does.
+      //
+      // Keyed off the TARGET EXPRESSION (`exprListCellBuildKind`), because a declared local
+      // has no `LetDecl` left to read — `buildLocals` compiles its annotation into the slot
+      // tables — and a param never had one. Saved and restored around the whole arm: these
+      // are the ambient `pending*` transport, and this arm's tail (`fbLocalSet`) is not a
+      // reset point.
+      const savedAsLK = pendingListKind
+      const savedAsLS = pendingListSlot
+      pendingListKind = exprListCellBuildKind(a.binLeft, fnIx)
+      pendingListSlot = exprListCellBuildSlot(a.binLeft, fnIx)
       // A UNION-typed local (kind 4) coerces a raw assigned value into the box
       // (`u = 3.5` over `let u: i32 | f64` boxes the f64); a union-valued RHS
       // passes through unchanged. Value first, then store it into the slot.
@@ -9070,6 +9116,8 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         if emitExprExpect(body, a.binRight, fnIx, asCtx) < 0 { return -1 }
       }
       pendingMapSlot = -1
+      pendingListKind = savedAsLK
+      pendingListSlot = savedAsLS
       fbLocalSet(idx) // 0x21 local.set
       return 0
     }

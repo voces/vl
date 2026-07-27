@@ -65,7 +65,9 @@ import {
   splitUnionAtoms,
   tyIsLitUnion,
   tyIsLitUnionArray,
+  tyIsNullableLitUnion,
   tyToEmitName,
+  unionAliasDeclNameOfTy,
   unionMemberCount,
   valueAtomKind,
 } from "./typecheck"
@@ -6627,6 +6629,50 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     if ck != "" { return ck }
   }
   ""
+}
+
+// The literal-union PARAMETER flavour of value call `callIx`'s parameter `idx`: `1` a `K`
+// ATOM param, `2` a `K | null` NICHE param, `0` neither. The `emitCallRef` twin of the two
+// seeds `emitCall` reads off a DECLARED callee's `Param` node (`nodeTyIsLitUnionAlias` →
+// `cParamLitUnion`, `nodeTyIsNulLitUnion` → `cParamNulLitUnion`), which a function VALUE has
+// no `Param` node to reach.
+//
+// IT CANNOT COME FROM THE `$fnsig` KEY, and that is by design rather than by omission: a
+// litunion param's token is `i`, deliberately IDENTICAL to a plain `i32` param's, because the
+// two valtypes are identical and the key's whole job is to make two functions share one
+// `$fnsig` exactly when their functypes byte-match. MEASURED, not assumed — a probe printing
+// `cloCallSigKey` over the whole function-value grid reads `i>i` for BOTH `const f: (K) => i32
+// = pick` and `const f: (i32) => i32 = inc`. So the distinction can only come from the CHECKER
+// type, which is what this reads (`nodeTyIxOf(c.callFn)` → the `TyFunc` spine — the same
+// arena walk `cloCallSigKey`'s general fallback already makes).
+export function cloCallParamLitUnion(callIx: i32, idx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const ft = nodeTyIxOf(c.callFn)
+    if ft < 0 { return 0 }
+    const t = T.tys[ft]
+    if t is TyFunc {
+      if idx < 0 || idx >= t.fnParamTypes.length { return 0 }
+      const pty = t.fnParamTypes[idx]
+      // ALIAS-ONLY for the non-null form, by arena-index identity — the SAME subtraction
+      // `nodeTyIsLitUnionAlias` makes for the declared-callee twin, and for the same measured
+      // reason: an INLINE `"a" | "b"` param really IS a string (`canonEmitName` softens it,
+      // the param context being outside `litUnionPreserve`'s ELEM/FIELD/MAP_VAL/FN_RES set),
+      // and its call sites work today by pushing the string. `unionAliasDeclNameOfTy`, NOT
+      // `litUnionAliasNameOfTy` — the latter falls back to a member-literal SET match and so
+      // names the inline spelling "K" in any program that also declares `type K = "a" | "b"`.
+      if tyIsLitUnion(pty) {
+        if unionAliasDeclNameOfTy(pty) != "" { return 1 }
+        return 0
+      }
+      // The NICHE claims BOTH spellings, exactly as `nodeTyIsNulLitUnion` does:
+      // `canonEmitTypeNames` PRESERVES a nullable litunion's members
+      // (`nulLitUnionPreserve`), so inline and aliased alike rep as the i32 atom with the
+      // `-1` null sentinel.
+      if tyIsNullableLitUnion(pty) { return 2 }
+    }
+  }
+  0
 }
 
 // The PRODUCER (concrete-lambda) `$fnsig` key of a function-VALUE binding `name` — the
@@ -16546,6 +16592,53 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   s
 }
 
+// The `pendingListKind` an EXPRESSION's list CELL demands — the same 0/1/2/3/4/5/6/7
+// vocabulary `tyAnnRefListKind` produces from an ANNOTATION node, for the positions that
+// have no annotation node left to read. A declared LOCAL's annotation is compiled away by
+// `buildLocals` into the slot tables, and a PARAM's lives on the `FuncDecl`, so an
+// ASSIGNMENT whose target is either one cannot use the `LetDecl`-keyed `letAnnRefListKind`
+// the global arm and `emitLetDeclStmt` share. Every leg answers off the SAME classifiers the
+// rest of the assignment arm already consults, so the seed agrees with the cell's own valtype
+// by construction.
+//
+// ORDER MATTERS and mirrors `tyAnnRefListKind`'s: the ref-list row first (its `rlElemKindTbl`
+// entry distinguishes 1 struct/map, 2 union box, 5 closure), then the nullable scalar
+// backings through their one home (`nulScalarListBuildKind`), then the non-null scalars. A
+// LITERAL-UNION array (`K[]`) deliberately reaches the trailing `0`: its backing IS the
+// default i32 list of interned atom ids, exactly as `tyAnnRefListKind`'s own
+// `tyIsLitUnionArray` subtraction arranges — pinned by `L-litunion-empty` in the fixture.
+export function exprListCellBuildKind(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  if exprRefArray(exprIx, fnIx) || exprNullableRefArray(exprIx, fnIx) {
+    const s = refListSlotOfExpr(exprIx, fnIx)
+    if s >= 0 && s < rlElemKindTbl.length {
+      if rlElemKindTbl[s] == 2 { return 2 }
+      if rlElemKindTbl[s] == 5 { return 5 }
+    }
+    return 1
+  }
+  // `string[] | null`, `f64[] | null`, `i64[] | null`, `f32[] | null` — the DISTINCT-backing
+  // niches, mapped by the one home the call-argument and global-assign boundaries also read.
+  const nsk = exprNulScalarListKind(exprIx, fnIx)
+  if nsk != null { return nulScalarListBuildKind(nsk) }
+  if exprStringArray(exprIx, fnIx) { return 3 }
+  if exprF64Array(exprIx, fnIx) { return 4 }
+  if exprI64Array(exprIx, fnIx) { return 6 }
+  if exprF32Array(exprIx, fnIx) { return 7 }
+  0
+}
+
+// The `pendingListSlot` twin of `exprListCellBuildKind` — WHICH ref-list element row the
+// cell holds. `0` (the slot fallback `refListSlotOfExpr` itself returns) for a non-ref list,
+// matching `tyAnnRefListSlot`'s `0` for a non-ref-array annotation.
+export function exprListCellBuildSlot(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  if exprRefArray(exprIx, fnIx) || exprNullableRefArray(exprIx, fnIx) {
+    return refListSlotOfExpr(exprIx, fnIx)
+  }
+  0
+}
+
 // True if the `LetDecl` at `letIx` declares a ref-list local: its annotation is a ref
 // array (`S[]`/`N[]`), OR its initializer produces a ref list. Picks the local's valtype
 // (`(ref $rlTypeIdx)`) and the code-`5` flag in `collectLocals`.
@@ -18658,7 +18751,27 @@ export function sigKeyOfTy(funcTyIx: i32): string {
   let key = ""
   let i = 0
   while i < t.fnParamTypes.length {
-    const pnm = tyToEmitName(t.fnParamTypes[i])
+    // A litunion ALIAS parameter is PRESERVED, exactly as the RETURN leg below preserves it
+    // (and for the same reason): `tyToEmitName` renders `K` as `string` — the print-widening
+    // name — so a raw render keys the string token `S` while the two OTHER `$fnsig` producers
+    // (`cloParamTok` → `vtKindOfType` → `nodeTyIsLitUnionAlias`, and `annSigKey` →
+    // `annParamKind` → `isUName`) both key the i32 ATOM `i`. Three producers, one ABI: this
+    // was the third one disagreeing. Witness: `function mk(): (K) => i32` + `const g = mk()` +
+    // `g(k)` keyed `S>i`, so the `call_ref`'s `ref.cast` demanded a `(structref, stringref)`
+    // functype over a callee declared `(structref, i32)` — INVALID WASM with `vl check` clean.
+    //
+    // ALIAS-ONLY, by arena-index identity (`unionAliasDeclNameOfTy`), NOT by
+    // `litUnionAliasNameOfTy`: that one falls back to matching the member-literal SET, so in a
+    // program that ALSO declares `type K = "a" | "b"` it names the INLINE spelling `"a" | "b"`
+    // "K" too — and an inline litunion param really IS a string (`canonEmitName` softens it;
+    // the param context is outside `litUnionPreserve`'s ELEM/FIELD/MAP_VAL/FN_RES set). Keying
+    // the atom for it turns WORKING programs into invalid wasm; measured, both spellings, at
+    // `tests/cases/literal-unions/fn-value-litunion-arg.vl`'s inline controls.
+    let pnm = ""
+    if tyIsLitUnion(t.fnParamTypes[i]) {
+      pnm = unionAliasDeclNameOfTy(t.fnParamTypes[i])
+    }
+    if pnm == "" { pnm = tyToEmitName(t.fnParamTypes[i]) }
     if pnm == "" { return "" }
     const pc = annParamKind(pnm)
     if pc == "" { return "" }
