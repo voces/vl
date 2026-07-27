@@ -24115,3 +24115,372 @@ would have manufactured a 2% regression.
      the rows found it, and it MATTERED: 7304 is a walk-free span site that PEELS, so the
      "sites the naive home would have tightened" figure was understated too (6/12 → **7/14**).
      A census total and a census breakdown are two measurements; publish neither until they agree.
+## D-GAPARAM + D-ARROWBANK + D-ELEMWIDTH — the OFF-LIST column moves for the first time since it was first measured, and the CENSUS of what is left says which of the remainder can ever move
+
+Branched from **`e255dd8`** (#1188). Partition: `compiler/typecheck.vl`, one new fixture, this
+append. `check_query.vl` / `check_state.vl` were in the partition and are **untouched** — nothing
+this slice needed lives in them.
+
+**Scoreboard, both units, measured with `ac42/score.py` at the base and with an independent
+per-scanner counter on the shipped tree:**
+
+| | CORE | OFF-LIST | TRUE | `typecheck.vl` |
+|---|---|---|---|---|
+| `e255dd8` | 312 | **27** | 339 | 19 core + 27 off = **46** |
+| this PR | 312 | **25** | 337 | 19 core + 25 off = **44** |
+
+The brief's figures reproduce EXACTLY at the base, including the 19+27 split (a brief earlier in the
+week conflated CORE with TRUE TOTAL for this file; 19+27=46 is the correct reading and it is what the
+instrument says). **CORE is flat at 312 and this PR says so up front** — nothing it touches is on the
+23-resolver list, so predicting a CORE move from the last three slices' rising-CORE effect would have
+been wrong here (method note 133 applies in the other direction too).
+
+UNIT everywhere below: **static non-comment CALL SITES**, string-literal-aware `//` stripping (string
+AND char-literal content blanked, newlines preserved so line numbers stay exact), each resolver's own
+`function NAME(` header excluded, and per-file sums asserted equal to the tree-wide total.
+
+### `tyGtIsClose` RE-DERIVED — the program's original tell is at TWO, and two is its floor
+
+The census's founding sentence was *"`tyGtIsClose`'s 33 calls … ARE the proof: a grammar with a real
+parser never needs an angle-bracket heuristic."* Re-derived at `e255dd8`, comment-stripped, not
+grepped:
+
+| | count |
+|---|---|
+| raw occurrences of the string, tree-wide | **17** |
+| …inside `//` comments | **14** (`emit_base` 7 · `emit_classify` 4 · `typecheck` 3) |
+| …the definition header `export function tyGtIsClose(` | 1 |
+| **CALL SITES** | **2** |
+
+Both live in `typecheck.vl`, one in `tyTopIndexOf` and one in `tyGroupEndIndex` — the compiler's two
+grammar-home entry points. **33 → 2 is not "almost done", it is DONE for that scanner**: what remains
+is the `>`-rule of the compiler's one type-name depth walk, written once per entry point. It cannot go
+below 2 without deleting a home, and the homes are what every other copy was collapsed INTO
+(#1143/#1147/#1169). This PR leaves it at 2 and does not pretend otherwise. **Every one of the other 15
+occurrences is prose, which is exactly why a grep count is not a call count.**
+
+### WHAT THE 27 ACTUALLY ARE — a per-site classification, since the column had never had one
+
+All 27 are in `typecheck.vl`; no other file holds one. Classified by what the site IS, not by what its
+argument is:
+
+| class | sites | which |
+|---|---|---|
+| **A. The grammar HOME's own internals** | 4 | `skipQuotedName` ×2, `tyGtIsClose` ×2 — inside `tyTopIndexOf` / `tyGroupEndIndex` |
+| **B. One-line delegators over the home** | 2 | `nameHasSep` inside `nameHasPipe`; `topLevelArrowIndex` inside `isTopLevelFuncTypeName` |
+| **C. The checker's ANNOTATION parser (`nameToTyReal`)** | 6 | `nameHasPipe`, `splitTypeName` ×3, `nameHasSep`, `topLevelArrowIndex` |
+| **D. Generic-alias application** | 2 | `splitGenArgs` ×2 |
+| **E. The CANON pass (`canonEmitName` + helpers)** | 11 | `nameHasPipe` ×2, `splitTypeName` ×2, `nameHasSep`, `topLevelArrowIndex`, `nameNeedsCanon`, `litBaseName`, `canonShapeName`, `unionAliasMembers`, `nameIsGenAppOfDecl` |
+| **F. A RENDERER asking about the string it just built** | 1 | `nameHasPipe(el)` in `arrElemRender` |
+| **G. Genuinely NOMINAL, mis-filed by the vocabulary** | 1 | `isPlainAliasRef` |
+
+And the verdicts, which are the point of the table:
+
+* **A is terminal.** These are the home. The rule says "outside the actual parser"; a compiler that
+  must classify a name it did not parse needs exactly one place that reads brackets, and this is it.
+* **B is metric-only.** #1169's hand-off 3 proposed deleting `topLevelArrowIndex` and inlining
+  `tyTopIndexOf(name, '=', 0, 0)` at its call sites for **OFF −3**. **DECLINED WITH ARITHMETIC:** the
+  operation count is unchanged, the grammar occurrence count is unchanged, and the only thing that
+  moves is the scoreboard — which is the exact artifact #1148 published in the other direction.
+  Suppressing a number without doing work is worse than leaving the number alone.
+* **C is LEGITIMATE — the checker is allowed to parse annotations, that is its job.** The rule's
+  carve-out is "outside the actual parser", and `nameToTyReal` serves precisely the population with
+  **no parse tree to route to**: `annotResolve`'s NAME fall-through, the emitter-computed names
+  (`#anonN`, `=>sigkey`, monomorphic param pins) and canon's own intermediate strings. Re-derived
+  here: **`nameToTy` has 17 call sites, every one inside `typecheck.vl`, and it is not exported** —
+  every mention in an `emit_*.vl` / `wasmEmit.vl` / `driver.vl` file is a COMMENT (verified with the
+  stripper, not a grep). The decomposition matches #1184's exactly: 1 ladder fall-through · 10
+  internal recursions · 1 generic-alias NAME leg · 2 canon-time · 3 emitter-supplied. It is **not
+  dead**: 10,773 entries over 1,356 corpus programs and 289,955 over 57,600 fuzz programs, with
+  **every arm reached** (union 979/18,976 · `&` 20/0 · `!` 6/0 · paren 432/6,461 · func 437/9,517 ·
+  array 876/10,894 · map 290/9,656 · object field 1,998/72,841 · generic application 53/0). A poison
+  probe was not needed to refute deadness — the arm census does it directly.
+* **E is the file's real remaining debt and it is ONE object, not eleven sites.** `canonEmitName` is a
+  200-line **string → string** rewriter: it takes the annotation spelling apart and reassembles it in
+  the emitter's vocabulary. Retiring it is #1184's option (b) — make canon produce a TREE and render
+  the name from it, the way `driver.modRwType` already does — and the census's step 3 is the gate
+  (`canonEmitName` is NOT `tyToEmitName ∘ nameToTy`: it softens a litunion alias inside a direct union
+  where the renderers preserve it, so a re-render is not a drop-in). **That is a slice of its own and
+  this one did not attempt it.** Two of the eleven are also mis-filed by the vocabulary and should be
+  read with that in mind: `unionAliasMembers` is a `cUserTypes` lookup by WHOLE NAME plus a render,
+  and it inspects no character.
+* **F was the brief's most attractive lead and it is REFUTED — with the mechanism.** `arrElemRender`
+  already holds `elTy`, the element's ARENA type, so `nameHasPipe(el)` looks like a free structural
+  conversion. It is not: **both** callers compute `el` as `litUnionAliasNameOfTy(t.aElem)` FIRST, and
+  that returns an ALIAS NAME (`K0`) for a `TyUnion`. A structural `elTy is TyUnion` test therefore
+  parenthesizes `(K0)[]` where the render is `K0[]` — a changed emit name, which moves `sNames` /
+  `isUName` / `$fnsig` keys. The exact dual is the element render's own ATOM WIDTH, and it is
+  available on one caller (`tyToEmitName` banks `emitNameAtoms`) and **not** on the other
+  (`tyToNominalName` has no bank at all). **Filed, not shipped**: adding a second width bank is a
+  behaviour-relevant change to a renderer and belongs with the one-agreed-emit-renderer work, not
+  smuggled into this slice. This is the third independent confirmation that "the two renderers
+  disagree" is the load-bearing obstacle in this file.
+* **G is not debt at all. A name is allowed to be a name.** `isPlainAliasRef(name)` walks
+  `cPlainAliasNames` comparing WHOLE STRINGS for equality and inspects no character of its argument —
+  a whole-name table lookup, which the census's own "legitimate residue" section excludes by rule. The
+  character surgery in that family is `aliasRefIsPlainName`, which classifies the alias BODY's
+  spelling at the RECORDING site in pass 0a, and which is not on the off-list. **The column has been
+  carrying this site as debt since it was first measured.** Not silently removed from the list here —
+  redefining the scoreboard mid-programme is what #1141 refused to do — but recorded so the terminal
+  number is not chased below its floor.
+
+**So the honest floor for this column, with today's architecture, is A (4) + B (2) + G (1) = 7, plus
+whatever of C survives once every producer has a tree.** Everything above that is E (canon, 11) and
+what is left of C and D.
+
+### WHAT SHIPPED
+
+**D-ELEMWIDTH — `canonEmitName`'s array arm stops re-reading the element name it just produced.
+OFF-LIST −1.** The arm was:
+
+```vl
+const core = canonEmitName(name.slice(0, name.length - 2))
+canonAtoms = 1
+if nameHasPipe(core) { return "(" + core + ")[]" }
+if isTopLevelFuncTypeName(core) { return "(" + core + ")[]" }
+```
+
+`canonEmitName` already **reports the width of the name it built** in `canonAtoms` (#1113) — the same
+bank the pass one level up reads to fill `annUnionAtoms`. Asking `nameHasPipe` is a whole-name
+depth scan to recover a number the build already knew, at the same site, one line later. It is the
+program's disease in miniature and it is now `coreAtoms > 1`.
+
+**THE TWO TESTS ARE NOT A PARTITION, AND THAT IS THE WHOLE ARGUMENT.** Measured at the site with an
+instrumented compiler over both channels — **29,108 reaches (1,419 corpus + 27,689 fuzz)**:
+
+| | corpus | fuzz |
+|---|---|---|
+| reaches | 1,419 | 27,689 |
+| `nameHasPipe(core)` TRUE | 307 | 3,933 |
+| **disagreements** | **20** | **267** |
+| …direction A (`nameHasPipe` true, width 1) | 20 | 267 |
+| …direction B (width > 1, no top-level `\|`) | **0** | **0** |
+| …of the direction-A cells, `isTopLevelFuncTypeName(core)` | **20 / 20** | **267 / 267** |
+
+Every disagreement is one shape: a top-level FUNCTION type whose RESULT is a union
+(`(i32)=>f64|boolean`, `()=>K0|null`, `(i32,i32,i32)=>{f:{[string]:string}}|boolean`, …). It carries a
+top-level `|` and it is ONE atom, because the function arm sets `canonAtoms = 1` and the `|` sits
+behind the top-level `=>`. **Every such name is claimed by the SECOND test, whose returned expression
+is character-for-character the first's** — so the reclassification cannot reach an output. Direction B
+is empty by construction as well as by measurement: `canonAtoms` exceeds 1 only at the union arm's
+join and `nulLitUnionPreserve`'s `|null` suffix, both of which literally write the separator.
+
+**Both comparators proved before either 0 was believed** (a 0 on either channel is a coverage question
+until the instrument is shown to fire):
+
+* direction A: threshold sabotaged to `> 2` → disagreements **20 → 290** corpus, **267 → 2,921** fuzz.
+* direction B: threshold sabotaged to `> 0` → **1,112** corpus and **23,756** fuzz, which is exactly
+  `reaches − TRUE` on both channels (1,419−307, 27,689−3,933). The counter fires; the 0 is wired.
+
+**D-ARROWBANK — `isTopLevelFuncTypeName` hands over the arrow position it scanned for. OFF-LIST −1.**
+`canonEmitName`'s nested-function-result arm read `if isTopLevelFuncTypeName(name) && … { const fa =
+topLevelArrowIndex(name) }` — two full top-level scans of the same name for the same index, the
+predicate throwing away the number the caller then goes and recomputes. `funcArrowAt` is the same
+scalar-bank pattern the file already blesses for `canonAtoms` / `nluAtoms` / `emitNameAtoms`: written
+on the way out of the predicate, read by the IMMEDIATE caller, with **nothing between the write and
+the read** (the `&&`'s right operand is a plain index compare, so no other
+`isTopLevelFuncTypeName` call can intervene). Probed: **70 corpus + 3,443 fuzz reaches, 0
+disagreements on both channels**, and the comparator (`funcArrowAt = arrowAt + 1`) takes
+disagreements to **131/131** and **6,249/6,249** — 100% of reaches.
+
+**D-GAPARAM — the generic-alias PARAMETER list is split once at the declaration instead of at every
+application. OFF-LIST delta ZERO, and the PR says so.** `parser.vl`'s `parseTypeDecl` folds the type
+parameters into the declared NAME (`name = name + ","` per parameter) and its own comment says *"the
+checker splits them back out"*. It did — twice: a `<`-scan and slice at registration, and then
+`splitGenArgs(gaParamLists[gi], pnames)` on **every application**, allocating a fresh `string[]` each
+time. The joined column is now flat `gaParamNames` / `gaParamStart` / `gaParamCount`, the same shape
+the spelling arena uses for its kids.
+
+**This does NOT move the static call-site count** — the split moved from `applyGenAliasArgs` to the
+registration site, 2 sites before and 2 after. It moves the DYNAMIC count, and exactly:
+**`splitGenArgs` 275 → 103 over the corpus, −172 (−62.6%)**, which is precisely the
+`applications − declarations` the reach probe predicted independently (**222 applications from 50
+declarations**). Reporting a scoreboard-neutral change as a win on that scoreboard would be the lie;
+the win is 172 deleted parses and 172 deleted array allocations per corpus pass.
+
+**The fuzz channel is BLIND to D-GAPARAM** — `scripts/fuzzgen.vl` emits no generic alias at all
+(applications 0, declarations 0 over 57,600 programs). Its evidence is corpus + fixtures only, and
+that is stated rather than covered by an identical fuzz set.
+
+### WORK, COUNTED NOT TIMED — and decomposed to the unit
+
+Identical instrument on BOTH sides (master's `typecheck.vl` and the candidate's, instrumented by one
+script), driven through `probehost.ts`; counters cumulative across the shared instance, LAST report
+taken, monotonicity asserted (0 violations on all four runs).
+
+| counter | corpus master | corpus PR | Δ | fuzz master | fuzz PR | Δ |
+|---|---|---|---|---|---|---|
+| `tyTopIndexOf` calls | 1,439,523 | 1,437,847 | **−1,676** | 21,645,803 | 21,614,938 | **−30,865** |
+| `tyTopIndexOf` CHARSTEPS | 14,297,757 | 14,287,852 | −9,905 (−0.07%) | 242,875,927 | 242,598,129 | −277,798 (−0.11%) |
+| `tyGroupEndIndex` calls / steps | 17,731 / 255,868 | same | **0 / 0** | 270,144 / 4,433,311 | same | **0 / 0** |
+| `splitGenArgs` calls | 275 | 103 | **−172** | 0 | 0 | 0 (blind) |
+| `nameHasPipe` calls | 30,273 | 28,853 | **−1,420** | 673,517 | 645,828 | **−27,689** |
+| `splitTypeName` calls | 9,924 | same | **0** | 107,697 | same | **0** |
+
+**The one aggregate that does not close trivially is decomposed exactly.** Corpus `tyTopIndexOf`
+−1,676 is NOT `−1,420 − 70 − 172`; the residual is real and attributable:
+
+* array arm: master pays `nameHasPipe` on all 1,419 reaches plus `isTopLevelFuncTypeName` on the 1,112
+  that decline = **2,531**; the PR pays 0 for the width test and `isTopLevelFuncTypeName` on
+  `1,419 − 287` = **1,132**. **−1,399**, not −1,419: the 287 reclassified names now pay a call they
+  did not pay before, and that +20 (corpus) is the price of the reclassification, stated.
+* arrow bank: **−70** = `ARROW_REACH` exactly.
+* `splitGenArgs`: **−207** = the loop-iteration delta (`342 → 135`), not the call delta.
+* −1,399 − 70 − 207 = **−1,676**. Exact.
+
+`nameHasPipe` −1,420 corpus is `PIPE_REACH` + 1 (the new fixture, present in both probe runs), and
+−27,689 fuzz is `PIPE_REACH` to the unit. **No counter went up.**
+
+**Binary +434 B** (1,031,524 → 1,031,958). Not a size win: three flat columns cost more code than one
+joined string, and the honest trade is 434 bytes for 172 fewer parses per corpus pass and two fewer
+whole-name scans per array/function annotation. Source +94 / −21 lines, most of it the comments above.
+
+### ENTOMBMENT — five sabotages on the SHIPPED source, each A/B'd against it over the whole corpus
+
+No new fixture was needed for four of the five; the fifth is why a fixture ships.
+
+| sabotage | build-channel rows red | run rows red |
+|---|---|---|
+| **S1** `gaParamCount.push(gps.length - 1)` (declared ARITY) | **42** (34 BUILDRC + 8 BUILDMSG) | 32 |
+| **S2** `gaParamStart.push(… + 1)` (the parameter-name SLICE) | **41** (34 + 7) | 32 |
+| **S3** `funcArrowAt = arrowAt + 1` (the arrow bank's wire) | **12** | 12 |
+| **S4** width test loosened to `coreAtoms > 2` | **52** (46 + 6 WASMSHA) | 47 |
+| **S5** the FUNCTION-type test deleted | **44** (23 + 20 WASMSHA + 1 BUILDMSG) | 23 |
+
+`tests/cases/closures/closure-union-result-list-element.vl` is the new fixture and it exists for **S5**
+— the population D-ELEMWIDTH reclassifies. Its binding cells are byte-only witnesses (they keep
+running under S5 and only their bytes change); the **PARAMETER** cell is the loud one, failing
+`emitProgram: callee is not a function name` under S5 and running on both master and the PR. That
+distinction was found by trying, not assumed: the first two shapes written for this fixture were both
+byte-only, and the fixture was rewritten until it had a cell the suite can see. **A construction proof
+is not a regression test, and neither is a byte diff the suite never compares.**
+
+### GATE — every leg from a FRESHLY FETCHED published seed, exit code explicit
+
+| leg | RC | result |
+|---|---|---|
+| `scripts/fetch-seed.sh` (`build/` removed first) | **0** | 1,031,524 B, published `seed-latest` |
+| `refresh-compiler.sh --prove-fixpoint` | **0** | fixpoint at 2 compiles, **1,031,958 B** |
+| `native-fixpoint.sh` | **0** | stage3 == stage4 byte-for-byte |
+| `npm ci` | **0** | |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **0** | **2,155 / 0 / 8** |
+| `deno check tests/cases_wasm_test.ts` | **0** | |
+| `lint-self.sh` (incl. `vl fmt --check`) | **0** | |
+| `rep-fuzz-check.sh` | **0** | `exact ✅` (1 baselined, 0 new / 0 stale) |
+
+**The suite baseline was re-derived in THIS worktree, in THIS session, with the SAME command, on the
+SAME tree** — master's `compiler/typecheck.vl` checked out and the new fixture moved aside, the
+compiler rebuilt from the pristine seed: **2,154 / 0 / 8**. Delta **+1**, asserted BEFORE it was read
+and equal to the one new corpus file. **Ignored NAME SETS diffed and identical**, both 8 — which also
+confirms the environment (`npm ci` done, flag set, `scripts/vl-host/target` symlinked into the
+worktree; a worktree missing that reads ~620 ignored).
+
+**Corpus A/B, 1,413 files, SEVEN compared channels — build rc · wasm sha256 · build message · CHECK
+rc · DIAGNOSTIC TEXT · run rc · run stdout, temp paths normalized: 0 differing records.** The
+diagnostic channel is in this harness because **this partition changes the checker**, and messages are
+where a checker regression shows while the byte channel cannot see them. Populations, so the zeros
+mean something: **1,187 distinct wasm hashes · 223 build rejects · 1,413 non-empty diagnostic texts**;
+row count asserted (1,413 = 1,413), 0 malformed rows, one output file per worker.
+
+**Fuzz A/B, 57,600 programs in 96 directories (16 seeds × 3 depths × {plain, declared}, with
+`--branching` and `--multiobs`, generated by the PRISTINE MASTER compiler for both sides so the
+population is byte-identical across every comparison), on TWO channels:**
+
+* **BYTE channel** (build rc + wasm sha256 + build message, every program): **0 differing**;
+  **33,043 distinct wasm hashes**, 2,783 build rejects, 57,600 / 57,600 rows.
+* **SHARED-INSTANCE channel** — `vl check --codegen <dir>`, 96 whole directories, ONE
+  `WebAssembly.Instance` per directory, which is the shape that can observe a missing per-program
+  sidecar reset: **0 differing**, 22,934,212 output characters of channel population. `--codegen`
+  because a plain `vl check` skips codegen entirely (method note 131). **Never `vl run --batch`** —
+  that re-instantiates per file.
+* Shared-instance over `tests/cases` as well: 7,679 output lines both sides, **0 differing**, and the
+  channel is comparator-proved — S1 takes it to **410 differing diff lines** and +138 output lines.
+
+### HARNESS DEFECTS HIT (both of them ones this doc had already published, which is the point)
+
+1. **`cat "$OUT"/rows/*.tsv` hit `Argument list too long`** on the 57,600-program fuzz byte A/B — one
+   result file per worker PID, 29,108 files — and the script's summary then printed
+   **`rows=0`, `distinct wasm sha: 0`, `build rejects: 0`** beside a real `!!! ROW COUNT MISMATCH`.
+   This is verbatim the failure #1158 published ("a 0 next to a 0 is where a harness failure hides").
+   It was caught because the row count is asserted against the file count; re-joined with
+   `find … -exec cat {} +` the real answer is 57,600 / 57,600. **A summary that reads all-zeros is a
+   dead harness until the denominator is computed by a different mechanism from the answer.**
+2. **`git checkout -- compiler/typecheck.vl` destroyed an uncommitted hunk** — the D-ELEMWIDTH edit,
+   made after the previous commit and before the next one, while restoring the file after a probe
+   build. Recovered from a copy the work-probe step happened to have taken, and then **verified by
+   rebuilding: the restored source produces the gated artifact byte-for-byte (`cmp` RC=0)**. The
+   standing rule ("`git checkout HEAD -- <file>` destroys uncommitted work like `git checkout --`")
+   was in the notes and was still walked into. **Commit before every probe build, not after.**
+   `cmp` the rebuild against the artifact the gate measured with — done 3 times here, all identical.
+
+### METHOD NOTES
+
+135. **A PRODUCER BANK AND THE PREDICATE IT REPLACES NEED NOT AGREE — THEY NEED THE CONSUMER TO NOT
+     CARE, AND THAT IS A DIFFERENT MEASUREMENT.** D-ELEMWIDTH's `canonAtoms > 1` disagrees with
+     `nameHasPipe` on **287 of 29,108** names. It ships anyway, because the site's next line returns
+     the **character-for-character identical expression** for every disagreeing name — so the two
+     tests are not a partition and the overlap is load-bearing. The measurement that licences the
+     change is not "0 disagreements" (false), it is "0 disagreements the consumer can distinguish"
+     (true, and provable from the two return expressions being the same string). **Report the raw
+     disagreement count anyway; a slice that quietly reported 0 here would have been reporting a
+     number it did not measure.**
+136. **MEASURE BOTH DIRECTIONS OF A DISAGREEMENT SEPARATELY, AND PROVE EACH DIRECTION'S COUNTER
+     SEPARATELY.** Splitting `PIPE_DIS` into A and B is what turned "20 disagreements" into "20
+     absorbable ones and zero dangerous ones". And direction B's **0** would have been worthless
+     without its own positive control: the `> 2` sabotage fires only direction A, so it says nothing
+     about B. A second sabotage (`> 0`) drives B to exactly `reaches − TRUE` on both channels. **One
+     sabotage per direction, and check that the union of the fire sets covers every branch you claim.**
+137. **A SCOREBOARD-NEUTRAL CHANGE CAN BE THE REAL WORK, AND A SCOREBOARD-POSITIVE ONE CAN BE
+     NOTHING.** In one PR: D-GAPARAM deletes 172 parses per corpus pass and moves the OFF-LIST column
+     by **0** (the split relocated, it did not disappear); #1169's filed `topLevelArrowIndex` inlining
+     would move the column by **−3** and delete **no** operation at all, so it was declined. Both
+     halves of that asymmetry have to be published or the column stops measuring anything.
+138. **THE FIXTURE HAS TO BE RED ON A CHANNEL THE SUITE RUNS.** The first `closure-union-result-list-
+     element` went **WASMSHA** under its own sabotage — visible to the corpus A/B, invisible to
+     `deno task test`, which compares stdout. Two more shapes were tried before one failed loudly
+     (`emitProgram: callee is not a function name`): the difference was putting the annotation on a
+     function **PARAMETER** rather than only on a binding. **Sabotage the fixture you just wrote and
+     check WHICH channel notices; "the corpus A/B names it" is not the same as "CI would catch it".**
+139. **AN OFF-LIST/CORE VOCABULARY CAN CARRY A SITE THAT DOES NO CHARACTER SURGERY AT ALL.**
+     `isPlainAliasRef` is a whole-name equality scan over a recorded list — the census's own
+     "legitimate residue" by rule — and it has been counted as a type-string parse since the column
+     was first measured. So has `unionAliasMembers` (a map lookup by whole name plus a render).
+     **The terminal number for a named-subset column is not 0; derive its FLOOR and publish it, or the
+     next slice will try to chase it below what the architecture allows.** Floor for this column
+     today: **7** (4 home internals + 2 delegators + 1 nominal).
+
+### FILED, NOT SHIPPED — with the measurement that makes each one a decision rather than a shrug
+
+1. **`arrElemRender`'s `nameHasPipe(el)` (OFF −1) needs a width bank on `tyToNominalName`.** The
+   structural dual is REFUTED with a mechanism (a litunion-ALIAS element is a `TyUnion` that renders
+   as a one-atom NAME, so `elTy is TyUnion` over-parenthesizes and moves `sNames`/`isUName`/`$fnsig`
+   keys). The exact dual is the element render's atom WIDTH; `tyToEmitName` already banks it in
+   `emitNameAtoms`, `tyToNominalName` banks nothing. Adding the second bank is one function's worth of
+   work and belongs with the one-agreed-emit-renderer item, whose absence is now the named obstacle in
+   **three** independent places in this file.
+2. **`parser.vl` + `ast.vl`: bank the generic alias's type-PARAMETER NAMES on the `TypeDecl` node.**
+   The parser holds them as tokens and joins them into `tdName` (`parseTypeDecl`, the `LT` arm), and
+   its own comment says the checker splits them back out. D-GAPARAM removed the per-application
+   half; the per-declaration `<`-scan-and-slice plus the `splitGenArgs` at registration are the other
+   half and they need the node column. `gaParamNames`/`gaParamStart`/`gaParamCount` is already the
+   shape to fill. **OFF −1 and the last `splitGenArgs` on the declaration side disappears.**
+3. **The canon/`annTs` staleness (#1184's option (c)) is still the right next step and is still
+   OUT of every checker-only partition.** Re-derived here: `annTsRoot` is `export let` in `ast.vl`,
+   `setAnnTs` PUSHES and depends on `annTsNode` staying strictly increasing, so it cannot overwrite a
+   row; and this doc's own standing warning that **a cross-module `export let` is not a shared
+   binding** makes mutating the column directly from `typecheck.vl` a trap rather than a shortcut.
+   An in-partition alternative was designed and **declined**: a `annTsFrozen` flag in `check_state.vl`
+   plus a `annTsAt()` accessor in front of the four checker-side reads would make the invariant
+   explicit, but it defends only the readers that opt in — a future consumer importing `annTsOf`
+   from `ast.vl` bypasses it — so it buys a convention, not an enforcement. **The enforcement lives in
+   `ast.vl` or nowhere.**
+4. **#1186's `typecheck.nullableRetName` blocker is NOT a module cycle — the home is on the wrong side
+   of the edge.** `emit_base.vl` **imports** `typecheck.vl`, and already imports four of the grammar
+   names from it (`tyTopIndexOf`, `tyGroupEndIndex`, `parenEnclosesWhole`, `splitUnionAtoms`) —
+   `typecheck.vl` imports only `emit_bignum` and `ast`. So a predicate both files need must be
+   **DEFINED IN `typecheck.vl` AND IMPORTED BY `emit_base.vl`**, which is the direction the tree
+   already uses and which has no cycle in it. #1139's corollary said this in general ("the home may
+   have to move DOWN into it, since it is the only module both importers reach"); #1186 read the edge
+   in the wrong direction and filed a blocker that does not exist. The move needs both files and so
+   needs a partition that owns both — but it needs **no new mechanism**, and it should not be filed
+   again as one.
