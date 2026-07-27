@@ -26405,3 +26405,213 @@ lexeme operation on a literal, not type-grammar parsing. The structural G1–G9 
   and there is nothing green to pin.
 * **`annTsRoot` staleness**, untouched and still defended purely by ordering; and P3/P4 of the
   renderEmit design, which this slice's canon arm is a down payment on but does not begin.
+
+## renderEmit P3 + THE SCOPE-CHAIN WALK'S QUADRATIC — the literal arm RENDERS instead of spelling, and `fnParent` gets its inverse (off master `1863e87`)
+
+Two targets, both taken. **TARGET 1** is `renderEmit` P3 — *"route transformation (1), literal-member
+softening; canon's literal arms call `renderEmit` for that arm only"*. **TARGET 2** is the quadratic
+#1207 measured, filed and did not fix.
+
+### TARGET 1 — WHAT P3 REQUIRED VERSUS WHAT THE DESIGN ASSUMED
+
+The design named the arm exactly right and got its SIZE wrong in both directions.
+
+**It named three producers of the emit vocabulary and there are FOUR copies of the rule this arm
+turns on.** `canonEmitName`'s two character tests plus `litBaseName`; the checker's own `litBaseTy`;
+**and BOTH renderers' `TyLit` arms** (`tyToEmitNameGo` and `tyToNominalNameGo`, five lines each,
+character-for-character the same four-way decision). Two of the four re-derived `str` vs `flt` from
+the characters of a lexeme the arena had already classified into `litKind`. One home now —
+`tyLitBaseName`, `litBaseTy` rendered — and `litBaseName` is deleted.
+
+**And the leaf had no arena type to render.** `renderEmit(ty, ctx)` takes an arena index; canon at a
+literal LEAF has a lexeme and nothing else. The missing piece was not in the renderer, it was a
+second copy of the literal-member LEXEME grammar: `nameToTyReal` and `canonEmitNameAt` each wrote
+out "quote → `str`, leading digit → `flt`/`int` by the dot". That is now `litMemberTy`, one home,
+shared. The arm reads:
+
+```vl
+const lmt = litMemberTy(name)
+if lmt >= 0 {
+  const lbn = tyToEmitNameAt(softenLitTy(lmt), ctx)
+  canonAtoms = 1
+  return lbn
+}
+```
+
+`softenLitTy` is the dual the design named, and it is the CHECKER's own rule — the same one
+`numLitUnionBaseName` has projected for the ALIAS spelling since #1198. The arm is now
+*build the type, widen it, render it AT THIS POSITION*, which is what P1 threaded `ctx` for.
+
+**THE PREREQUISITE THE DESIGN IMPLIES DOES NOT EXIST, AND I NEARLY SHIPPED A FIX FOR IT.** Routing
+canon through `mkLitTy` moves the magnitude test off the raw lexeme and onto the CANONICALIZED one
+(`mkLitTy` calls `canonIntLexeme`). A standalone replica of `canonIntLexeme` said `9999999999`
+canonicalizes to `1410065407`, which *fits* i32 — so canon's `i64` looked like it was about to
+become `i32`, and I had written up "P3 requires a checker fix" before reading the function. **Its
+FIRST LINE is `if !intLexemeFitsI32(t) { return t }`** — an i32-overflowing lexeme is never
+canonicalized, so `litBaseTy` and `litBaseName` already agreed and nothing was needed. My replica
+had been copied from a `grep` window that started one line too late. Verified both ways afterwards:
+`const b: 9999999999 = 9999999999` prints `9999999999` at both bases, as do `type Big = 3000000000`
+and `const h: 0xFF = 0xFF`.
+
+**P3 IS NOT A ROUTING THAT MOVES THE ANSWER, AND THAT IS THE PHASE, NOT A SHORTFALL.** The
+transformation is unchanged; what changes is WHO decides it. The design's own ordering says so —
+P5 is the phase where `canonEmitTypeNames`'s body becomes one line and the string rewriter goes;
+P3 hands one arm over.
+
+### TARGET 2 — THE REMEDY THE BRIEF NAMED IS THE WRONG AXIS
+
+#1207 filed the remedy as *"index `fnParent` by name"*. **Measured, that does not fix it.** The
+pathological shape is N frames that EACH DECLARE THE SAME nested name — it is the shape of the
+defect #1204 fixed — so a name bucket holds N entries and the scan is quadratic again. The
+discriminating column is the PARENT: a frame declares a handful of functions, and in the ladder
+exactly one.
+
+`nestedFnDeclaredIn` now walks ONE frame's children, through a two-column intrusive child list
+(`fnChildHead`/`fnChildNext`) built by inverting `fnParent`. Descending build order, so the list
+comes out ascending and "the first declaration wins" is byte-identical to the scan it replaces.
+Lazy: reset per program by `buildFnMap`, minted on first use, freshness-tested by LENGTH so a late
+`monomorphize` push re-mints it. A module with no nested functions — every module the compiler
+itself compiles — never builds it.
+
+**COMPLEXITY, MEASURED ON BOTH AXES.** Ladder of N sibling frames x 16 nested calls each, median of
+9 INTERLEAVED `vl build` runs per cell, all rc=0 and all checksums equal:
+
+| N | master | this head | saved | saving vs previous N |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 69 ms | 66 ms | 3 ms | — |
+| 200 | 136 ms | 122 ms | 14 ms | **x4.67** |
+| 400 | 320 ms | 266 ms | 54 ms | **x3.86** |
+| 800 | 856 ms | 577 ms | 279 ms | **x5.17** |
+
+The saving QUADRUPLES as N doubles: the term removed is quadratic. A deep-CHAIN ladder (N frames
+nested one inside the next, innermost calling a name declared at the outermost) reads 14 / 23 / 55 ms
+against 14 / 23 / 57 — the chain walk was never the expensive half, the per-rung scan was.
+
+**IT IS STILL SUPER-LINEAR AFTER THE FIX, AND THE RESIDUAL IS NAMED.** `fnStmtsPosOf`
+(`emit_classify.vl`) is an O(functions) linear scan run once per gated call, and it is outside this
+partition. A THROWAWAY build that merely memoizes its last answer — never committed, built only to
+attribute the term — reads **60 / 108 / 211 / 423 ms** where this head reads 62 / 118 / 242 / 551:
+per-doubling growth **1.80 / 1.95 / 2.00**, the linear curve, and the memo's own saving quadruples
+(10 / 31 / 128). So the surviving quadratic is `fnStmtsPosOf`, not the walk. **FILED at the site, not
+reached across for** — the fix belongs in `fnStmtsPosOf`'s own file as a per-program node→position
+index, because it also owns a `monoOrigNode` fall-through that no index of `fnStmts` alone can
+answer.
+
+**The `fnIndexOfInScope` twin is still a twin.** `emit_collect.vl` imports 144 names from
+`emit_classify.vl` and the reverse edge makes the compiler refuse to build itself. Its own frame scan
+is the O(functions) one this file just retired, so the function-VALUE path carries the quadratic even
+now that the CALL path does not. One line, filed at the site.
+
+### REAL INPUT — THE STRONGEST PROOF AVAILABLE, AND IT IS THE SAME ONE FOR BOTH TARGETS
+
+**Both compilers reproduce master's own compiler byte-for-byte on master's FROZEN source**
+(`git archive 1863e87 compiler std`, 29 `.vl` files): 1,033,394 B, `cmp` clean — TARGET 2 alone, and
+TARGET 2 + TARGET 1 together. Byte-identity of this head's OWN build is not available (the compiler's
+source changed), so reproducing master's artifact exactly is the available equivalent, and it is
+stronger than a corpus A/B: it covers every path the compiler's own 29 modules exercise.
+
+### CHANNEL GRADING — WHICH ZEROS ARE AGREEMENT
+
+The corpus zero is **AGREEMENT**, and it is graded by five sabotages, each BUILT:
+
+| # | sabotage | corpus rows moved (1,469 files x 6 fields) |
+| --- | --- | ---: |
+| **S1** | `tyLitBaseName` answers `i32` for every literal | **20 rows** — build field 8 BUILDSTATUS(0/1) + 12 BYTEDIFF, check field 3 CHECKSTATUS(0/1), run field 9 RUNSTATUS(0/1) |
+| **S2** | `litMemberTy` stops telling `flt` from `int` | **2** — `literal-unions/single-literal-type`, `soundness/literal-is-runtime-value` |
+| **S3** | the child index never answers | **4** — the four `functions/nested-same-name-*.vl` pins, every one a **STDOUTDIFF** (a silent wrong answer, which is the family's own failure mode) |
+| **S4** | build the child list ASCENDING (LAST declaration wins) | **0 — INERT, and it is inert BY CONSTRUCTION**: a frame declaring one name twice is already a checker error, so the order is unobservable. Recorded as the measured equivalence, not as evidence. |
+| **S5** | drop the per-program reset | **0 on the corpus — and that zero is COVERAGE, not agreement**: the corpus A/B is one process per file, which rebuilds the index every time. See below. |
+
+**S5 IS THE ONE THAT NEEDED A DIFFERENT CHANNEL, AND THEN A NEW FIXTURE.** The freshness test is a
+LENGTH, so the reset only matters where two programs share one `WebAssembly.Instance` — the
+`deno task test` corpus tier and `vl check <dir>`. Run there, S5 was **still inert over the existing
+1,469 files**: nothing in the corpus happened to pair a nested-name resolution with a preceding
+program of the same `fnStmts.length`. So the pair was CONSTRUCTED —
+`functions/scope-index-reset-{a,b}.vl`, four functions each, parents `[-1,-1,0,1]` then
+`[-1,-1,-1,2]` — and under S5 `-b`'s two logs **SWAP**: `21 / 1001` for `1001 / 21`, rc=0. The suite
+goes 2,205/0 to 2,204/1.
+
+Fuzz is **COVERAGE for TARGET 2**, verified in the generator at this head rather than assumed.
+`scripts/fuzzgen.vl` emits no nested NAMED function at any seed or dimension; it does emit lambdas,
+which lambda-lifting pushes into `fnStmts` with a parent, so `nestedNameSet` is not empty — but the
+only names it holds are the synthesized `__lambda_N`, and no generated call spells one. The gated
+path is therefore never entered and the 50,400-program zero says nothing about the walk. The graded
+channel for TARGET 2 is the corpus, where S3 moves four rows.
+It is **AGREEMENT for TARGET 1** — the generator's literal-union leaf mints a fresh
+`type K<n> = "w1" | "w2"` alias at every depth, so literal members reach canon on every seed.
+
+### COUNTS — BOTH UNITS, DECOMPOSED
+
+**CALL SITES.** CORE **315 → 315 (0)** · OFF-LIST **24 → 23 (−1)** · TRUE **339 → 338 (−1)**. Per
+file, master → head: `emit_classify` 175 → 175 · `emit_base` 51 → 51 · **`typecheck` 47 → 46 (23
+core unchanged, 24 → 23 off)** · `emit_collect` 44 → 44 · `emit_mono` 7 · `emit_rewrite` 7 ·
+`wasmEmit` 5 · `emit_rep` 2 · `emit_sections` 1. Instrument: #1139's 23-resolver CORE list plus the
+off-list scanner table, `NAME(` in `//`-stripped string-literal-aware code, each resolver's own
+header excluded, per-file sums asserted against the tree-wide total — validated by reproducing the
+brief's 315 / 24 / 339 exactly, per file, before it was used for anything.
+
+**The −1 decomposes to one site**: `litBaseName`'s single call, in `canonEmitNameAt`. The function
+itself is deleted; its `part[0] == '"'` arm was already DEAD at that one call site, because canon
+tested the quote itself one line above. Nothing new joins either list — `litMemberTy`,
+`tyLitBaseName`, `softenLitTy`, `litBaseTy` and `buildFnChildIndex` are arena/table queries.
+
+**INLINE SURGERY (census unit (b)): −4.** Removed 8 — three char compares in `canonEmitNameAt`, one
+in `litBaseName`'s body, and four in `nameToTyReal` (three compares plus the quote-strip slice).
+Added 4, all inside the one new home. The two renderers' `TyLit` arms contributed no unit-(b)
+operations either way (`t.litKind == "str"` is a field equality, not character surgery) but they did
+carry two whole-rule duplications, which is what `tyLitBaseName` retires.
+
+**Binary: 1,033,394 → 1,034,081 B, +687 B.** A cost, reported as one, and decomposed: TARGET 2 is
++679 (two i32 columns and their builder), TARGET 1 is **+8** — P3 deletes a function and adds two
+smaller ones.
+
+### GATE — EVERY LEG, EXIT CODE TAKEN WITHOUT A PIPE
+
+| leg | result |
+| --- | --- |
+| fresh published `seed-latest` → `refresh-compiler.sh --prove-fixpoint` | **RC=0** — the *published* seed compiles this source (no self-dependency), fixpoint in 2 compiles, 1,034,081 B |
+| `scripts/native-fixpoint.sh` | **RC=0** — stage3 == stage4 byte-for-byte |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **RC=0** — **2,205 passed / 0 failed / 8 ignored**; baseline derived in place at `1863e87` = **2,203 / 0 / 8**, and the +2 are the two new fixtures |
+| `deno check tests/cases_wasm_test.ts` | **RC=0** |
+| `scripts/lint-self.sh` | **RC=0** — self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | **RC=0** — exact, 1 baselined reject, 0 new / 0 stale |
+| corpus A/B, **1,469 files x 6 fields** (build rc · build BYTES · `check --codegen` rc · `check --codegen` message · run rc · run stdout) | **0 moved rows**, graded by S1/S2/S3 above |
+| shared-instance `vl check --codegen tests/cases` | **identical**, 8,419 lines each side, same rc |
+| fuzz A/B, **50,400 programs/side**, PINNED seeds 1209–1222 x depths 4/5/6 x plain/declared, `--branching --multiobs` | **0 divergences**. Graded: the identical harness over seeds 1209–1210 against the S1 sabotage reads **13 divergences / 7,200**, so the zero is AGREEMENT for TARGET 1 (sample: `type K0 = "tf" \| "882"` in a `{f: K0 \| i32}` field — `882 / 77` on both sides here, `failed to parse WebAssembly module` under S1) |
+| master's FROZEN source compiled by this head | **`cmp` clean against master's own compiler**, 1,033,394 B |
+
+### METHOD NOTES
+
+* **A brief's remedy can name the wrong AXIS while naming the right site.** "Index `fnParent` by
+  name" is the natural phrasing and it leaves the complexity where it was, because the pathological
+  population is same-NAME. Ask what the query is KEYED on, not what it is looking FOR.
+* **A replica of a function is not the function.** I built a standalone VL replica of
+  `canonIntLexeme` to test an overflow hypothesis, copied it out of a `grep` window that began one
+  line below the guard, and reached a confident wrong conclusion — a "required prerequisite fix" for
+  a bug that does not exist. The replica faithfully reproduced the code I had READ, which is exactly
+  what makes it useless as evidence about the code that RUNS.
+* **A sabotage that is inert on every channel you already have may be a missing FIXTURE, not a
+  missing witness.** S5 needed both a different channel (shared instance) and a constructed pair
+  before it could redden. The corpus's own 1,469 files were not enough, and their zero was coverage.
+* **Grade a "quadratic removed" claim by building the NEXT fix and measuring it too.** "Still
+  super-linear" is a weak report; "still super-linear, and here is the throwaway build whose only
+  change is `fnStmtsPosOf`, and it is linear" names the residual exactly and hands the next slice a
+  measured target rather than a suspicion.
+* **Count the copies before designing the dedup.** The renderEmit design's "three producers" is right
+  about the vocabulary and wrong about the RULE: the four-way literal-base decision had four homes,
+  and two of them belonged to the two producers the design was going to keep.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **The `fnStmtsPosOf` index** — measured, attributed, and left in `emit_classify.vl`, which this
+  partition excludes. The throwaway memo build exists only as the attribution and was never
+  committed.
+* **The `fnIndexOfInScope` dedup** — one line, blocked by the import cycle, filed at the site as
+  #1207 filed it, now with the note that the twin still carries the O(functions) scan.
+* **P4 of the renderEmit design** (alias transparency, intersection folding, and the rest). P3 routes
+  ONE arm; four of the six transformations still rewrite strings.
+* **Any edit to `emit_classify.vl`, `emit_rep.vl`, `emit_sections.vl`, `wasmEmit.vl`, `emit_mono.vl`,
+  `emit_rewrite.vl`, `emit_state.vl`, `driver.vl`, `parser.vl`, `ast.vl` or `cli.vl`.** The child
+  index lives as a module-local pair in `emit_collect.vl` rather than in `emit_state.vl` for exactly
+  that reason, and its header says so: it is a derived cache of a column that file owns, read by one
+  function in this one.

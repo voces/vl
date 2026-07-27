@@ -1049,6 +1049,32 @@ function mkLitTy(kind: string, text: string) {
   addTy(t)
 }
 
+// The ARENA type of one LITERAL-MEMBER LEXEME — `"a"` → the `str` literal type, `1.5` →
+// `flt`, `0x10` → `int` — or -1 when `name` does not begin a literal member at all.
+//
+// THE one home for that lexeme grammar. `nameToTy`'s annotation resolver and
+// `canonEmitName`'s literal arm each wrote it out, and because canon had no arena type to
+// hand back, the emit-name side carried a SECOND copy of the base-scalar rule as well
+// (`litBaseName`, the spelling twin of `litBaseTy`). Routing canon here retires both
+// copies: the arm asks for the TYPE and lets the renderer name it.
+//
+// This is a LEXEME operation, not type-grammar parsing — the quote / leading-digit test is
+// what decides the name is a literal at all, and the slice that follows recovers the member
+// TEXT, the exact inverse of the `"\"" + litText + "\""` every literal render writes.
+function litMemberTy(name: string) {
+  if name.length == 0 { return -1 }
+  // A STRING-LITERAL type `"a"` — the quoted lexeme is the member; keep the RAW inner
+  // text (the literal expression side keeps its raw lexeme too, so membership compares
+  // the same characters).
+  if name[0] == '"' { return mkLitTy("str", name.slice(1, name.length - 1)) }
+  // A NUMERIC-LITERAL type (`0`, `1.5`): int vs float by the `.`.
+  if name[0] >= '0' && name[0] <= '9' {
+    if hasDot(name) { return mkLitTy("flt", name) }
+    return mkLitTy("int", name)
+  }
+  -1
+}
+
 function mkNegTy(inner: i32) {
   const t: Ty = { negTy: inner }
   addTy(t)
@@ -2572,6 +2598,17 @@ function litBaseTy(t: TyLit) {
   if t.litKind == "flt" { return TY_F64 }
   if intLexemeFitsI32(t.litText) { return TY_I32 }
   TY_I64
+}
+
+// The EMIT NAME of that base scalar — `litBaseTy` rendered. The four-way rule above had
+// been written out THREE more times: once per renderer's `TyLit` arm, and once over the
+// SPELLING (`canonEmitName`'s `litBaseName`, now gone with P3's routing). All three said
+// the same thing, and one of them had to re-derive `str`/`flt` from the characters. The
+// prim test is total by `litBaseTy`'s own arms — every one of them returns a `TyPrim`.
+function tyLitBaseName(t: TyLit) {
+  const bt = T.tys[litBaseTy(t)]
+  if bt is TyPrim { return bt.primName }
+  ""
 }
 
 // Whether `ty` carries LITERAL members (a literal type, or a union/nullable
@@ -5707,15 +5744,10 @@ function nameToTyReal(name: string) {
       if rty < 0 { return -1 }
       return mkFuncTy(ptys, rty)
     }
-    // A STRING-LITERAL type `"a"` — the quoted lexeme is the member; keep the
-    // RAW inner text (the literal expression side keeps its raw lexeme too, so
-    // membership compares the same characters).
-    if name[0] == '"' { return mkLitTy("str", name.slice(1, name.length - 1)) }
-    // A NUMERIC-LITERAL type (`0`, `1.5`): int vs float by the `.`.
-    if name[0] >= '0' && name[0] <= '9' {
-      if hasDot(name) { return mkLitTy("flt", name) }
-      return mkLitTy("int", name)
-    }
+    // A STRING- or NUMERIC-LITERAL type (`"a"`, `0`, `1.5`), at the lexeme grammar's
+    // home — shared with `canonEmitName`'s literal arm, which used to spell it out again.
+    const lmt = litMemberTy(name)
+    if lmt >= 0 { return lmt }
   }
   const pv = primTyOfName(name)
   if pv >= 0 { return pv }
@@ -6164,16 +6196,6 @@ function nameNeedsCanon(name: string) {
   false
 }
 
-// The base-scalar emit name of one LITERAL member lexeme (`"a"` → string,
-// `0` → i32, `1.5` → f64, an i32-overflowing integer → i64 — the same
-// magnitude rule as `litBaseTy`).
-function litBaseName(part: string) {
-  if part[0] == '"' { return "string" }
-  if hasDot(part) { return "f64" }
-  if intLexemeFitsI32(part) { return "i32" }
-  "i64"
-}
-
 // Whether `ix` HAS an emitter-classifiable synthetic name — i.e. `tyToEmitName(ix)
 // != ""`, decided STRUCTURALLY without building the name. The callers that ask this
 // are asking a genuine CAPABILITY question ("can the emitter name this type?");
@@ -6417,12 +6439,10 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
     if t.primName == "never" { return "" }
     return t.primName
   }
-  if t is TyLit {
-    if t.litKind == "str" { return "string" }
-    if t.litKind == "flt" { return "f64" }
-    if intLexemeFitsI32(t.litText) { return "i32" }
-    return "i64"
-  }
+  // A LITERAL renders as its base scalar, at the ONE home that answers that (see
+  // `tyLitBaseName`) — this arm and its twin in the other renderer were two of the three
+  // hand-written copies of `litBaseTy`'s four-way rule.
+  if t is TyLit { return tyLitBaseName(t) }
   if t is TyUnion {
     const members = t.uMembers
     // FLATTENED-alias regroup: a litunion-ALIAS member's literals flatten into sibling
@@ -6810,12 +6830,10 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
     if t.primName == "never" { return "" }
     return t.primName
   }
-  if t is TyLit {
-    if t.litKind == "str" { return "string" }
-    if t.litKind == "flt" { return "f64" }
-    if intLexemeFitsI32(t.litText) { return "i32" }
-    return "i64"
-  }
+  // A LITERAL renders as its base scalar, at the ONE home that answers that (see
+  // `tyLitBaseName`) — this arm and its twin in the other renderer were two of the three
+  // hand-written copies of `litBaseTy`'s four-way rule.
+  if t is TyLit { return tyLitBaseName(t) }
   if t is TyUnion {
     const members = t.uMembers
     // SOURCE-FAITHFUL (alias-preserving) render, mirroring `tyToEmitName`'s union arm: a
@@ -7569,8 +7587,9 @@ function canonEmitNameAt(name: string, ctx: i32) {
   if sma != "" { return canonEmitNameAt(sma, ctx) }
   // A declared alias for a NUMERIC literal union (`type Z = 0 | 1`, and the one-member
   // `type Z = 1`) denotes its BASE SCALAR here — the identical name the INLINE spelling
-  // produces (the union arm below canons `0` and `1` to `i32` through `litBaseName` and
-  // dedups them to one atom). Before the `nameNeedsCanon` early-out, which sees a bare
+  // produces (the union arm below canons `0` and `1` to `i32` through the literal arm's
+  // `softenLitTy` and dedups them to one atom). Before the `nameNeedsCanon` early-out,
+  // which sees a bare
   // alias name with no digit/pipe/quote in it and returns it untouched.
   //
   // Untouched, the emitter received the ALIAS NAME, `collectU` had registered it in
@@ -7791,9 +7810,28 @@ function canonEmitNameAt(name: string, ctx: i32) {
     canonAtoms = 1
     return out + ")=>" + rc
   }
-  // A literal member → its base scalar.
-  if name[0] == '"' { return "string" }
-  if name[0] >= '0' && name[0] <= '9' { return litBaseName(name) }
+  // A literal member → its base scalar, RENDERED FROM THE ARENA. This is P3 of the
+  // one-agreed-renderer design: transformation (1) of the six #1199 measured — the
+  // LARGEST group of canon's 81 rewrite shapes — stops being a second spelling rule and
+  // becomes "build the type, widen it, render it AT THIS POSITION".
+  //
+  // Its dual was already the checker's: `softenLitTy` IS the widening rule (host: "a
+  // numeric-literal union is its base type for ARITHMETIC and ordering"), and
+  // `numLitUnionBaseName` one arm above has projected it for the ALIAS spelling since
+  // #1198. What was missing was a way for canon to get an arena type at a LEAF, which
+  // `litMemberTy` now supplies at the grammar's home.
+  //
+  // TOTAL here, so no fall-through is needed: `softenLitTy` of a `TyLit` is `litBaseTy`,
+  // which returns one of exactly four prims (`string`/`f64`/`i32`/`i64`) — never `never`,
+  // the only prim the renderer has no name for.
+  const lmt = litMemberTy(name)
+  if lmt >= 0 {
+    const lbn = tyToEmitNameAt(softenLitTy(lmt), ctx)
+    // A softened literal is a base SCALAR — ONE atom. Set rather than inherited: the
+    // render left its own width behind in `emitNameAtoms`.
+    canonAtoms = 1
+    return lbn
+  }
   // A residual negation (only meaningful under `&`) — leave for the emitter.
   if name[0] == '!' { return name }
   // An inline `{…}` shape: canon its field/value types.
@@ -15080,7 +15118,8 @@ export function nodeTyWidenedRepName(ix: i32) {
   // A SINGLE literal type (`: "world"`, `: 1.5`, `: 7`) or a HOMOGENEOUS NUMERIC
   // literal union (`1.5 | 2.5`, `0 | 1`) has no `TyPrim` of its own but reps as its
   // base scalar — EXACTLY the softening `canonEmitName` applies to the annotation NAME
-  // (`litBaseName`: `"…"` → "string", a float → "f64", an int → "i32"/"i64"). Since C1
+  // (`softenLitTy` then `tyLitBaseName`: `"…"` → "string", a float → "f64", an int →
+  // "i32"/"i64"). Since C1
   // the arena is the primary classifier, so this MUST agree with the softened name: the
   // annotation node's functype/let/param/field rep is the widened scalar, matching the
   // widened VALUE it constrains (a `"world"` return is a string ref, a `1.5` return an
