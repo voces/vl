@@ -3244,11 +3244,53 @@ function symUse(useNode: i32, name: string) {
 
 // Whether `ty` is an unresolved hole the host's `isHole` would skip (an
 // `Infer`/`Unknown` analogue): a generic type variable or an error placeholder.
-export function inlayHole(ty: i32) {
+//
+// A UNION IS A DATA STRUCTURE, and this guard reads it as one rather than as the
+// string it would render to. A union whose members are ALL holes is itself a
+// hole: `tyToStr` renders it `any | any`, an inlay hint is formatted `: T` — a
+// suggestion of the annotation to WRITE — and `any` is not a type VL can spell.
+// The BARE hole was already suppressed here (`t is TyVar`); the same hole inside
+// a one-arm-per-hole union slipped the guard only because the test never looked
+// past the top constructor. The defect was the INCONSISTENCY that produced:
+// `: any` hidden, `: any | any` shown, for the same unresolved thing.
+//
+// A union with ANY resolved member (`any | string`) is NOT a hole and keeps its
+// hint — it carries real information, and deleting an informative hint from
+// correct code is the failure mode this surface guards against elsewhere (the
+// `…` depth-cap rendering is deliberately kept for exactly that reason). That is
+// why this is an ALL-members test and not an any-member one.
+//
+// Deliberately NOT extended to `TyNullable`: `let x = null` renders `<none>?`,
+// and that type IS determined (VL spells it `null`) — see
+// `tests/cases/types/infer-null-unconstrained.vl`, whose whole point is that the
+// lone null is fully resolved. Suppressing it is a separate question about the
+// RENDERER, not about holes.
+//
+// Depth-bounded at the arena's established budget (`tyDeeperThan`'s 16): a
+// recursive type is CYCLIC in the arena (`type L = {next: L | null}` reaches its
+// own index), so an unbounded member walk would not terminate. Exhausting the
+// budget answers "not a hole" — the answer that KEEPS the hint.
+export function inlayHole(ty: i32) { inlayHoleDeep(ty, 16) }
+
+function inlayHoleDeep(ty: i32, depth: i32): boolean {
   if ty < 0 { return true }
+  if depth <= 0 { return false }
   const t = T.tys[ty]
   if t is TyVar { return true }
   if t is TyErr { return true }
+  if t is TyUnion {
+    const ms = t.uMembers
+    // An EMPTY member list is not a union of holes — it is a degenerate arena
+    // entry, and answering "hole" for it would suppress on a shape this rule has
+    // nothing to say about.
+    if ms.length == 0 { return false }
+    let i = 0
+    while i < ms.length {
+      if !inlayHoleDeep(ms[i], depth - 1) { return false }
+      i = i + 1
+    }
+    return true
+  }
   false
 }
 

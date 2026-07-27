@@ -29,6 +29,13 @@
 //     a non-VL name, and the two holes are DISTINCT types (`?f.0`/`?f.1`) whose
 //     distinctness `tyToStr` has already destroyed. That half is a producer fix,
 //     filed against `typecheck.vl`; the host cannot do it correctly.
+//     UPDATE — that producer fix has landed. `inlayHole` (typecheck.vl) now reads
+//     a union as a DATA STRUCTURE: a union whose members are ALL holes is itself a
+//     hole and is never offered as a hint, matching the answer the BARE hole always
+//     got. The host filter below is UNCHANGED and still does not suppress `any` —
+//     a hole-BEARING type that carries real structure (`{foo: string} | {bar: any}`,
+//     `any | string`) is still shown, because deleting an informative hint from
+//     correct code is the failure mode this file exists to prevent.
 //   * `…` (the depth cap) says a type is PRESENT but ELIDED — measured firing 45
 //     times on CLEAN corpus files (deep recursive types). Suppressing on it would
 //     delete informative hints from correct programs, so it is excluded.
@@ -252,12 +259,21 @@ Deno.test({
   );
 });
 
-// The `any` half is deliberately NOT suppressed: this is the idiom the owner was
-// really looking at (their annotation was an attempted FIX), it is healthy code,
-// and the display cannot correct it. If a later producer-side change renames the
-// holes, this test says what must change with it.
+// The `any` half is the PRODUCER's, and the producer fix this file filed against
+// `typecheck.vl` (see the header) has now landed: `inlayHole` reads a union as a
+// DATA STRUCTURE instead of stopping at its top constructor, so a union whose
+// members are ALL holes is a hole and offers no hint — the same answer the BARE
+// hole already got. The defect was the inconsistency, `: any` hidden while
+// `: any | any` was shown for the same unresolved thing.
+//
+// The host filter is unchanged and still does NOT suppress `any`: that is
+// deliberate, and the two assertions below are what keeps the fix honest — a
+// hole-bearing type that carries REAL structure must still be offered.
+// Measured over the 1,345-file corpus: candidate hints 8,504 → 8,468, and the
+// 36 that went are exactly `any | any` (35) and `any | any | any` (1). No hint
+// was added and no surviving hint changed.
 Deno.test({
-  name: "control: an inference hole still renders — `any` is NOT suppressed here",
+  name: "control: an all-hole union offers no hint, but a hole-BEARING type still does",
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
@@ -271,9 +287,39 @@ Deno.test({
     "the un-annotated idiom is clean code",
   );
   const labels = await inlayLabels(checker, src);
-  if (!labels.includes(": any | any")) {
+  // The all-hole return union is no longer offered...
+  if (labels.includes(": any | any")) {
     throw new Error(
-      `expected the inference-hole hint to survive; got ${JSON.stringify(labels)}`,
+      `the all-hole union should offer no hint; got ${JSON.stringify(labels)}`,
+    );
+  }
+  // ...while the parameter's hole-BEARING but structured type still is. This is
+  // the half that must never regress: suppressing it would delete an informative
+  // hint from correct code.
+  if (!labels.includes(": {foo: string} | {bar: any}")) {
+    throw new Error(
+      `expected the structured hole-bearing hint to survive; got ${
+        JSON.stringify(labels)
+      }`,
+    );
+  }
+
+  // A MIXED hole union — one hole member, one resolved member — is NOT an
+  // all-hole union and keeps its hint. The ALL-members test is the whole
+  // difference between this fix and deleting every `any`.
+  const mixed =
+    `function describe<T>(x: T) {\n  if x is i32 { return "num" }\n  return "str"\n}\nprint(describe(5))\nprint(describe("hi"))\n`;
+  assertEquals(
+    (await checker.check(mixed, "/tmp/x.vl", noSiblings)).length,
+    0,
+    "the mixed-union idiom is clean code",
+  );
+  const mixedLabels = await inlayLabels(checker, mixed);
+  if (!mixedLabels.includes(": any | string")) {
+    throw new Error(
+      `expected the mixed hole union to survive; got ${
+        JSON.stringify(mixedLabels)
+      }`,
     );
   }
 });
