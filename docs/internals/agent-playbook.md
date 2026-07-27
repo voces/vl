@@ -116,6 +116,29 @@ validator message alone — the disassembly is the debugging view of `vl build` 
   this turns master red the moment the case merges (the slice-0 intrinsics
   corpus did exactly this — 5 cases red on master until #358). Run
   `deno test -A tests/cases_wasm_test.ts` before opening any corpus-adding PR.
+- **A `$fnsig` interning KEY that is coarser than the `$fnsig` BYTES is a
+  miscompile, not a missed dedup.** The bytes for a `$fnsig` slot come from the
+  key's REPRESENTATIVE function (`cloSigRepFn` → `cloRetValKind`), not from the
+  key, so two functions sharing a key get one slot whose result type is whichever
+  of them interned it FIRST — and `emitFunctionSection` declares the loser with the
+  winner's functype while its body emits its own. Declaration ORDER decides which
+  one is invalid, and the two victims report MIRRORED errors, which is the cheapest
+  way to confirm the mechanism. A live instance: `cloRetKindOf` folds an
+  un-annotated `string | null` (`nulstr`) return into the i32 result token, so any
+  i32/boolean-result function sharing its param spine collides (6 of 272 ordered
+  result-kind pairs; the annotated spelling is always clean). Whenever a key
+  producer and a byte producer for the same table are separate functions, the
+  invariant "every function sharing the key has byte-identical kinds" has to be
+  MEASURED, not asserted in a comment.
+- **The fuzzer's grammar never emits a nested named function that captures**, so a
+  fuzz A/B is structurally blind to `emitCapturedCall` — a sabotage there is inert
+  across 25,200 programs. The corpus reaches it in exactly 2 of ~1,417 files
+  (`functions/closure.vl`, `numerics/error-intrinsic-with-fn-value.vl`), and only
+  the first can move a row. For anything on that path, construct the population.
+- **Capture analysis is name-keyed module-wide.** Two nested functions with the
+  SAME name in different outer frames report `emitProgram: captured variable not
+  found in enclosing frame`; renaming one fixes it. Give nested functions distinct
+  names in fixtures or this masks whatever the fixture is actually pinning.
 
 ## Final report
 Files promoted / files advanced-but-not-promoted with the blocking stage /
