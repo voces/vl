@@ -6296,6 +6296,56 @@ function tyEmitNameIsString(ix: i32): boolean {
   false
 }
 
+// THE RENDER-CONTEXT VOCABULARY — the `ctx` half of the one agreed emit renderer
+// (`renderEmit(ty, ctx)`), threaded here in phase P1 with NO consumer reading it for a
+// decision yet.
+//
+// WHY A PARAMETER AT ALL. The three producers of the emitter's type vocabulary
+// (`canonEmitName`, `tyToEmitName`, `tyToNominalName`) disagree with each other on 853 of
+// 5,172 resolvable corpus annotations, and the disagreement is TWO-DIRECTIONAL: 41 where
+// canon rewrites and the renderer does not, 108 the other way, 5 where both move
+// differently. Both answers are already right SOMEWHERE — #1124 shipped the STRUCTURAL
+// expansion for a generic application standing as a multi-member union member, while
+// #1122 measured the NOMINAL route and found it regresses `type MyCat = Cat`. The same
+// construct family sits on both sides: a litunion alias `K0` SOFTENS to `string` in a
+// direct union and is PRESERVED inside a closure result, a map value, an array element and
+// a struct field (four distinct fuzz-nightly invalid-wasm seeds are cited in
+// `tyToEmitNameGo`'s arms for exactly that), and a NULLABLE litunion is preserved by canon
+// and softened by the renderer. So the policy cannot be global — the POSITION decides, and
+// a renderer that cannot say where it is cannot state the rule. See the `renderEmit`
+// design in `docs/internals/destringify-types-program.md`.
+//
+// THE ENCODING. Powers of two, and a render carries EXACTLY ONE position bit — the
+// IMMEDIATE position it occupies in its parent — plus the sticky `RC_NULLABLE` below.
+// Bits rather than an enum because the rules these will state quantify over SETS of
+// positions ("preserved in a field, an element, a map value or a closure result"), which
+// is one `&` against a bit union.
+const RC_ROOT = 0      // a top-level render: no enclosing position at all
+const RC_UNION_MEM = 1 // a member of a union
+const RC_NULLABLE = 2  // under a nullable — see the STICKY note below
+const RC_FIELD = 4     // an object field's type
+const RC_ELEM = 8      // an array element's type
+const RC_MAP_KEY = 16  // a map key's type
+const RC_MAP_VAL = 32  // a map value's type
+const RC_FN_PARAM = 64 // a function type's parameter
+const RC_FN_RES = 128  // a function type's result
+
+// `RC_NULLABLE` IS STICKY ACROSS A UNION JOIN, AND IT HAS TO BE, BECAUSE THE TWO
+// SPELLINGS PUT THE NULLABLE AT DIFFERENT DEPTHS. Structurally `A | B | null` is a
+// `TyNullable` OVER a `TyUnion`, so `A` sits two levels down; in the STRING spelling
+// `canonEmitName` splits one flat top-level `|` and `A` and `null` are siblings. A rule
+// that reads "am I under a nullable" must get the same answer from both or the one agreed
+// renderer is not one renderer. So the union arm of every producer below passes
+// `RC_UNION_MEM | (ctx & RC_NULLABLE)`, and canon's flat split re-derives the bit from a
+// `null` sibling (`partsHaveNull`). Every other bit is REPLACED at each descent: a field
+// of a struct that is itself an array element is a field, not both.
+//
+// ANCESTRY BEYOND ONE STICKY BIT IS NOT MODELLED HERE, deliberately. `emit_collect.vl`'s
+// `underFunc` is the accumulating shape, and no measured disagreement needs it at the
+// producer: every case in the design's six transformations is decided at the node whose
+// own immediate position is one of the bits above. If a later phase needs true ancestry it
+// gets a second field rather than a re-reading of these bits.
+
 // The TOP-LEVEL atom count of the name the LAST `tyToEmitName` call returned — the
 // number `unionMemberCount` would report for it, produced BY THE RENDERER instead of
 // re-derived by scanning the finished string (#1113). A rendered name gains a top-level
@@ -6334,7 +6384,17 @@ const emitNameSeen: i32[] = []
 // name STRUCTURALLY without resolving it, so a NAMED struct keeps its name.
 // The "does it have one at all?" question has a structural answer
 // (`tyIsEmitRepresentable`) — ask that rather than testing this for "".
-export function tyToEmitName(ix: i32) {
+//
+// THE POSITION-FREE ENTRY. Every caller outside this renderer asks about a type standing
+// on its own, so this is `RC_ROOT` by definition and the arity stays one — which is also
+// what keeps the emitter's own call sites (`emit_classify.vl`'s `annSigKey` twins) out of
+// this phase entirely.
+export function tyToEmitName(ix: i32) { tyToEmitNameAt(ix, RC_ROOT) }
+
+// The same render, told the POSITION it occupies in its parent. The cycle guard lives here
+// rather than on the entry above so the RECURSIVE calls below — which are the only ones
+// that can close a cycle — keep passing through it.
+function tyToEmitNameAt(ix: i32, ctx: i32) {
   let si = 0
   while si < emitNameSeen.length {
     if emitNameSeen[si] == ix {
@@ -6344,12 +6404,12 @@ export function tyToEmitName(ix: i32) {
     si = si + 1
   }
   emitNameSeen.push(ix)
-  const r = tyToEmitNameGo(ix)
+  const r = tyToEmitNameGo(ix, ctx)
   emitNameSeen.pop()
   r
 }
 
-function tyToEmitNameGo(ix: i32) {
+function tyToEmitNameGo(ix: i32, ctx: i32) {
   emitNameAtoms = 1
   if ix < 0 { return "" }
   const t = T.tys[ix]
@@ -6427,7 +6487,9 @@ function tyToEmitNameGo(ix: i32) {
       let sc = 1
       let s = litUnionAliasNameOfTy(members[i])
       if s == "" {
-        s = tyToEmitName(members[i])
+        // A union MEMBER, carrying the sticky nullable bit down so this arm agrees with
+        // canon's flat `A|B|null` split about what "under a nullable" means.
+        s = tyToEmitNameAt(members[i], RC_UNION_MEM | (ctx & RC_NULLABLE))
         sc = emitNameAtoms
       }
       if s == "" { return "" }
@@ -6478,7 +6540,7 @@ function tyToEmitNameGo(ix: i32) {
       emitNameAtoms = 2
       return nal + "|null"
     }
-    const inner = tyToEmitName(t.nInner)
+    const inner = tyToEmitNameAt(t.nInner, RC_NULLABLE)
     const innerAtoms = emitNameAtoms
     if inner == "" { return "" }
     // A NULLABLE FUNCTION type keeps the kind-19 grouping parens (`((i32)=>string)|null`)
@@ -6519,7 +6581,7 @@ function tyToEmitNameGo(ix: i32) {
         const fbal = litUnionAliasNameOfTy(ftys[fi])
         if fbal != "" { fs = fbal }
       }
-      if fs == "" { fs = tyToEmitName(ftys[fi]) }
+      if fs == "" { fs = tyToEmitNameAt(ftys[fi], RC_FIELD) }
       if fs == "" { return "" }
       if fi > 0 { out = out + "," }
       out = out + names[fi] + ":" + fs
@@ -6543,7 +6605,7 @@ function tyToEmitNameGo(ix: i32) {
     // identifier is one atom, the render leg reports its own (D-ARRWIDTH).
     let elw = 1
     if el == "" {
-      el = tyToEmitName(t.aElem)
+      el = tyToEmitNameAt(t.aElem, RC_ELEM)
       elw = emitNameAtoms
     }
     if el == "" { return "" }
@@ -6555,7 +6617,7 @@ function tyToEmitNameGo(ix: i32) {
     return arrElemRender(el, t.aElem, elw)
   }
   if t is TyMap {
-    const mk = tyToEmitName(t.mKey)
+    const mk = tyToEmitNameAt(t.mKey, RC_MAP_KEY)
     // A litunion-ALIAS map VALUE (`{[string]: K0}`) keeps its alias name rather than
     // softening to `string` — an atom-valued map is the MONO i32 map, and every
     // `$fnsig`/mv-slot key derived from this render must agree with the annotation
@@ -6565,7 +6627,7 @@ function tyToEmitNameGo(ix: i32) {
     // (fuzz seed 113148886 d6). The map-value sibling of the TyUnion-member /
     // TyObj-field / TyFunc-result alias preservation around it.
     let mv = litUnionAliasNameOfTy(t.mVal)
-    if mv == "" { mv = tyToEmitName(t.mVal) }
+    if mv == "" { mv = tyToEmitNameAt(t.mVal, RC_MAP_VAL) }
     if mk == "" || mv == "" { return "" }
     // The key/value separators sit inside the braces — one atom.
     emitNameAtoms = 1
@@ -6579,7 +6641,7 @@ function tyToEmitNameGo(ix: i32) {
     let out = "("
     let i = 0
     while i < ps.length {
-      const ps1 = tyToEmitName(ps[i])
+      const ps1 = tyToEmitNameAt(ps[i], RC_FN_PARAM)
       if ps1 == "" { return "" }
       if i > 0 { out = out + "," }
       out = out + ps1
@@ -6602,7 +6664,7 @@ function tyToEmitNameGo(ix: i32) {
       const bal = litUnionAliasNameOfTy(t.fnRet)
       if bal != "" { rs = bal }
     }
-    if rs == "" { rs = tyToEmitName(t.fnRet) }
+    if rs == "" { rs = tyToEmitNameAt(t.fnRet, RC_FN_RES) }
     if rs == "" { return "" }
     // A function-type RESULT keeps grouping parens so the outer `$fnsig` producers see a
     // single result token (`(i32)=>((i32)=>i32)`), matching the source-annotation form.
@@ -6677,7 +6739,23 @@ export function unionAliasDeclNameOfTy(ty: i32): string {
 // non-empty return and read by the immediate caller, never carried between programs.
 let nomNameAtoms = 1
 
+// THE POSITION-FREE ENTRY, exactly as on the structural sibling: every caller outside this
+// renderer (`emit_collect.vl`'s registration walk) asks about a type standing on its own.
 export function tyToNominalName(ix: i32): string {
+  tyToNominalNameAt(ix, RC_ROOT)
+}
+
+// NOTE FOR O1, filed and NOT discharged here. This renderer has no ancestor stack — its
+// structural sibling carries `emitNameSeen` and it carries nothing, because nominal-first
+// tames a DECLARED recursive struct by short-circuiting to its name. It does NOT tame a
+// recursive GENERIC alias, whose instance is anonymous and so in neither `cStructTyIxs` nor
+// `cUnionTyIxs`; a guard added for measurement fired 10 times over 3 corpus files
+// (`tests/cases/generics/recursive-generic-alias-{array,mutual,nullable}.vl`). It is
+// unreachable today only because `emitProgram`'s finiteness reject runs before any of this
+// function's emit-side callers. P1 threads a parameter and changes no control flow, so it
+// neither opens that path nor closes it; the guard ships with the phase that first gives it
+// a reachable caller.
+function tyToNominalNameAt(ix: i32, ctx: i32): string {
   nomNameAtoms = 1
   if ix < 0 { return "" }
   // NOMINAL-FIRST: a declared struct or union alias renders as its NAME — one identifier,
@@ -6750,7 +6828,9 @@ export function tyToNominalName(ix: i32): string {
       let sc = 1
       let s = litUnionAliasNameOfTy(members[i])
       if s == "" {
-        s = tyToNominalName(members[i])
+        // The union-member position, with the sticky nullable bit — the same rule the
+        // structural sibling applies, so the two agree about `A|B|null`.
+        s = tyToNominalNameAt(members[i], RC_UNION_MEM | (ctx & RC_NULLABLE))
         sc = nomNameAtoms
       }
       if s == "" { return "" }
@@ -6789,7 +6869,7 @@ export function tyToNominalName(ix: i32): string {
       return nal + "|null"
     }
     // A nullable DECLARED struct/union keeps its nominal name (`S|null`, `U|null`).
-    const nsn = tyToNominalName(t.nInner)
+    const nsn = tyToNominalNameAt(t.nInner, RC_NULLABLE)
     const nsnAtoms = nomNameAtoms
     if nsn == "" { return "" }
     const nfn = T.tys[t.nInner]
@@ -6819,7 +6899,7 @@ export function tyToNominalName(ix: i32): string {
         const fbal = litUnionAliasNameOfTy(ftys[fi])
         if fbal != "" { fs = fbal }
       }
-      if fs == "" { fs = tyToNominalName(ftys[fi]) }
+      if fs == "" { fs = tyToNominalNameAt(ftys[fi], RC_FIELD) }
       if fs == "" { return "" }
       if fi > 0 { out = out + "," }
       out = out + names[fi] + ":" + fs
@@ -6836,7 +6916,7 @@ export function tyToNominalName(ix: i32): string {
     // identifier is one atom, the render leg reports its own.
     let elw = 1
     if el == "" {
-      el = tyToNominalName(t.aElem)
+      el = tyToNominalNameAt(t.aElem, RC_ELEM)
       elw = nomNameAtoms
     }
     if el == "" { return "" }
@@ -6847,9 +6927,9 @@ export function tyToNominalName(ix: i32): string {
     return arrElemRender(el, t.aElem, elw)
   }
   if t is TyMap {
-    const mk = tyToNominalName(t.mKey)
+    const mk = tyToNominalNameAt(t.mKey, RC_MAP_KEY)
     let mv = litUnionAliasNameOfTy(t.mVal)
-    if mv == "" { mv = tyToNominalName(t.mVal) }
+    if mv == "" { mv = tyToNominalNameAt(t.mVal, RC_MAP_VAL) }
     if mk == "" || mv == "" { return "" }
     // The key/value separators sit inside the braces — one atom.
     nomNameAtoms = 1
@@ -6860,7 +6940,7 @@ export function tyToNominalName(ix: i32): string {
     let out = "("
     let i = 0
     while i < ps.length {
-      const ps1 = tyToNominalName(ps[i])
+      const ps1 = tyToNominalNameAt(ps[i], RC_FN_PARAM)
       if ps1 == "" { return "" }
       if i > 0 { out = out + "," }
       out = out + ps1
@@ -6876,7 +6956,7 @@ export function tyToNominalName(ix: i32): string {
       const bal = litUnionAliasNameOfTy(t.fnRet)
       if bal != "" { rs = bal }
     }
-    if rs == "" { rs = tyToNominalName(t.fnRet) }
+    if rs == "" { rs = tyToNominalNameAt(t.fnRet, RC_FN_RES) }
     if rs == "" { return "" }
     const rt = T.tys[t.fnRet]
     if rt is TyFunc { rs = "(" + rs + ")" }
@@ -6893,6 +6973,10 @@ export function tyToNominalName(ix: i32): string {
 // `{[K]:V}`): each field/key/value type recurses through `canonEmitName`, the
 // surrounding structure is rebuilt with the parser's exact conventions (no
 // spaces), so a shape with no literal field is reproduced byte-identical.
+//
+// Takes no `ctx` of its own and needs none: it OVERRIDES the position for everything it
+// recurses into. A field is a field and a map value is a map value whatever the shape
+// itself is standing in, so the shape's own position never reaches a child.
 function canonShapeName(name: string) {
   const inner = name.slice(1, name.length - 1)
   if inner.length > 0 && inner[0] == '[' {
@@ -6901,7 +6985,11 @@ function canonShapeName(name: string) {
     if kend >= 0 {
       const key = inner.slice(1, kend)
       const val = inner.slice(kend + 2, inner.length)
-      return "{[" + canonEmitName(key) + "]:" + canonEmitName(val) + "}"
+      return "{[" +
+        canonEmitNameAt(key, RC_MAP_KEY) +
+        "]:" +
+        canonEmitNameAt(val, RC_MAP_VAL) +
+        "}"
     }
     return name
   }
@@ -6922,7 +7010,7 @@ function canonShapeName(name: string) {
     if colonAt >= 0 {
       out = out +
         field.slice(0, colonAt + 1) +
-        canonEmitName(field.slice(colonAt + 1, field.length))
+        canonEmitNameAt(field.slice(colonAt + 1, field.length), RC_FIELD)
     } else {
       out = out + field
     }
@@ -7289,14 +7377,36 @@ function nulLitUnionPreserve(parts: string[]) {
   ""
 }
 
-export function canonEmitName(name: string) {
+// True if any top-level member of a `|`-split union spelling is the bare `null` arm. The
+// STRING side's only way to ask the question `TyNullable` answers structurally: canon
+// splits `A|B|null` into three flat siblings, so "this union is nullable" has to be read
+// off a sibling rather than off an enclosing node. Feeds the sticky `RC_NULLABLE` bit, so
+// the members of `A|B|null` reach their renders carrying the same position the structural
+// renderers give the members of `TyNullable(TyUnion(A,B))`.
+function partsHaveNull(parts: string[]) {
+  let i = 0
+  while i < parts.length {
+    if parts[i] == "null" { return true }
+    i = i + 1
+  }
+  false
+}
+
+// THE POSITION-FREE ENTRY — see `tyToEmitName`. `canonEmitTypeNames` canons a whole
+// annotation and `emit_collect.vl` canons a whole render, both of which are `RC_ROOT`.
+export function canonEmitName(name: string) { canonEmitNameAt(name, RC_ROOT) }
+
+// The same rewrite, told the POSITION the name occupies in the annotation around it.
+function canonEmitNameAt(name: string, ctx: i32) {
   canonAtoms = 1
   if name.length == 0 { return name }
   // A single-member union alias is transparent — resolve it to its member's emit name FIRST (before
   // the `nameNeedsCanon` early-out, which would otherwise return a bare alias name unchanged). The
   // member is itself canon'd, so `type Id = i32` → "i32" and `type Ids = Id[]`-style nesting resolves.
+  // Transparency does not MOVE the name — the member stands exactly where the alias stood,
+  // so the position passes through unchanged.
   const sma = singleMemberAliasName(name)
-  if sma != "" { return canonEmitName(sma) }
+  if sma != "" { return canonEmitNameAt(sma, ctx) }
   // A declared alias for a NUMERIC literal union (`type Z = 0 | 1`, and the one-member
   // `type Z = 1`) denotes its BASE SCALAR here — the identical name the INLINE spelling
   // produces (the union arm below canons `0` and `1` to `i32` through `litBaseName` and
@@ -7338,6 +7448,12 @@ export function canonEmitName(name: string) {
       return nlu
     }
     const kept: string[] = []
+    // The position every member below is rendered AT. `RC_NULLABLE` is re-derived from a
+    // `null` SIBLING here because the flat split has no enclosing nullable node to inherit
+    // it from, and it is OR'd with (not substituted for) the inherited bit so a nullable
+    // union nested inside a nullable stays one.
+    let memCtx = RC_UNION_MEM | (ctx & RC_NULLABLE)
+    if partsHaveNull(parts) { memCtx = memCtx | RC_NULLABLE }
     // The kept members' atom counts, SUMMED — not `kept.length`. A kept member is
     // normally one atom, but the union-ALIAS expansion below substitutes a whole rendered
     // member SET for one member (`AB` → `A|B`), so `AB | null` keeps TWO entries and
@@ -7345,7 +7461,7 @@ export function canonEmitName(name: string) {
     let atoms = 0
     let i = 0
     while i < parts.length {
-      let c = canonEmitName(parts[i])
+      let c = canonEmitNameAt(parts[i], memCtx)
       let ca = canonAtoms
       // A union-ALIAS member flattens into this outer union (`AB | null` → `A | B | null`):
       // a union of unions is one union, so expand the alias to its members — matching the
@@ -7393,7 +7509,11 @@ export function canonEmitName(name: string) {
   if (nameHasSep(name, '&')) {
     const folded = nameToTy(name)
     if folded >= 0 {
-      const r = tyToEmitName(folded)
+      // The FOLD stands exactly where the intersection spelling stood, so the position
+      // passes straight through. This arm is already `nameToTy` then render — the design's
+      // P4 note that it converts by DELETING a string round-trip rather than by inventing
+      // anything is visible right here, and the `ctx` it will need is now arriving.
+      const r = tyToEmitNameAt(folded, ctx)
       // The FOLD's render carries its own width — `(0|1|2) & !2` folds to the one-atom
       // `i32`, but a fold that stays a union renders as one.
       const ra = emitNameAtoms
@@ -7420,7 +7540,7 @@ export function canonEmitName(name: string) {
   // after `nameIsArray` — so the hot fall-through pays a call, not an allocation.
   const arrCore = arrElemNameRaw(name)
   if arrCore != "" && !isTopLevelFuncTypeName(name) {
-    const core = canonEmitName(arrCore)
+    const core = canonEmitNameAt(arrCore, RC_ELEM)
     // The ELEMENT's own atom WIDTH, as the element's producer reported it. D-ELEMWIDTH:
     // master asked `nameHasPipe(core)` — a whole-name depth scan of a string this very
     // function had just finished building, to recover a number the build already knew.
@@ -7459,7 +7579,10 @@ export function canonEmitName(name: string) {
   // returned at the top of this function, so the home's `length < 1` guard is never the
   // deciding conjunct here and the routing is exact on every reachable input.
   if nameIsParenSpanEnds(name) && !isTopLevelFuncTypeName(name) {
-    return canonEmitName(name.slice(1, name.length - 1))
+    // A GROUPER is not a position: `(X)` stands wherever `X` would, so the ctx rides
+    // through the strip. (O4 will decide whether the parens come back — that is a
+    // question about the render, not about where it sits.)
+    return canonEmitNameAt(name.slice(1, name.length - 1), ctx)
   }
   // A TOP-LEVEL function type with a parenthesized result (`(i32) => ((i32) => i32)`): canon
   // the param list and the (paren-stripped) result, re-render with the result's grouping
@@ -7479,11 +7602,11 @@ export function canonEmitName(name: string) {
       let pi = 0
       while pi < parts.length {
         if pi > 0 { out = out + "," }
-        out = out + canonEmitName(parts[pi])
+        out = out + canonEmitNameAt(parts[pi], RC_FN_PARAM)
         pi = pi + 1
       }
     }
-    let rc = canonEmitName(name.slice(fa + 2, name.length))
+    let rc = canonEmitNameAt(name.slice(fa + 2, name.length), RC_FN_RES)
     if isTopLevelFuncTypeName(rc) { rc = "(" + rc + ")" }
     // A function type is ONE atom (the params are parenthesized, the result sits behind
     // the top-level `=>` where `unionMemberCount` stops). Set rather than inherited: the
