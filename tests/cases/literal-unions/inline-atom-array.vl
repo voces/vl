@@ -1,0 +1,101 @@
+// @run
+// @log 2
+// @log a
+// @log 3
+// @log 0
+// @log 1
+// @log 2
+// @log b
+// @log 1
+// @log 2
+// @log 1
+// An INLINE (un-aliased) literal-union ARRAY — `("a" | "b")[]` written straight at the
+// annotation. The ALIAS spelling (`type K = "a" | "b"`, `K[]`) has always worked;
+// the inline one produced a module that did not even PARSE:
+//
+//     const xs: ("a" | "b")[] = ["a", "b"]
+//     print(xs.length)
+//   → vl check rc=0, clean; vl run → "failed to parse WebAssembly module:
+//     type mismatch: expected (ref $type), found (ref $type) (at offset 0xe4)"
+//
+// The global's CELL was declared `(ref $strListWrapper)` while its init constexpr built
+// `array.new_fixed $i32Arr` + `struct.new $i32ListWrapper` — a type mismatch inside a
+// GLOBAL's constant expression, which wasmtime reports at module-parse time rather than
+// as a function-body validation error.
+//
+// Mechanism: `canonEmitName` SOFTENS a bare inline literal union to its base scalar
+// (`"a" | "b"` -> `string`), so the annotation's rendered name is `string[]` and every
+// NAME-driven classifier (`nameIsStringArray` -> the `letIs*` ladder, `tyAnnRefListKind`,
+// `fieldCodeOfSpelling`) coded the binding a STRING list — while every ARENA-driven path
+// (`nodeArrayElemIsLitUnion`, which reads the recorded `TyArray(TyUnion[TyLit…])` and is
+// blind to the softening) built interned i32 ATOM ids. `repOfArray` leaves an inline
+// litunion element uncovered on purpose ("position-decided by the canon pass"), so the
+// two sides disagreed and WHICH one won depended on the binding position.
+//
+// The softening also made two structurally identical types carry DIFFERENT reps, which
+// is unsound in a structural language — `f(ys)` at the end of this fixture (a `K[]`
+// parameter taking an inline-annotated value) was invalid wasm for that reason alone.
+//
+// Three arena-first checks (`annRepKindOf`, `tyAnnRefListKind`, `fieldCodeOfSpelling`)
+// now give the inline spelling the SAME atom i32 list the alias spelling has.
+//
+// Graded population before the fix, over spelling x binding-position x initializer x
+// operation: the inline spelling was 15 of 40 cells OK — a non-empty initializer broke
+// the global / local / struct-field positions (UNPARSEABLE or INVALID-WASM) and an EMPTY
+// `[]` broke the param / return positions. The alias, `(K | null)[]`, `("a"|"b"|null)[]`,
+// `(string|null)[]` and `string[]` spellings were 40/40 in both directions. Now 40/40.
+
+type K = "a" | "b"
+
+function count(xs: K[], want: K): i32 {
+  let n = 0
+  let i = 0
+  while i < xs.length {
+    if xs[i] == want { n = n + 1 }
+    i = i + 1
+  }
+  return n
+}
+
+// A struct FIELD spelled inline — its field code was 6 (a string-ref list) while the
+// object literal built the i32 atom-list wrapper.
+type Box = { xs: ("a" | "b")[] }
+
+// A PARAM spelled inline, taking an EMPTY literal — the position where the string-list
+// cell won and the i32 build lost (the mirror of the global case).
+function len(xs: ("a" | "b")[]): i32 { xs.length }
+
+// A RETURN spelled inline.
+function mk(): ("a" | "b")[] { return ["a"] }
+
+// A module GLOBAL with a NON-EMPTY initializer — the originally reported repro.
+const g: ("a" | "b")[] = ["a", "b"]
+
+function go() {
+  print(g.length) // 2
+  print(g[0])     // a (the atom widens to its member string in `print`)
+
+  // A LOCAL, empty-then-`push` — the empty `[]` must build the i32 wrapper, not the
+  // string one.
+  const xs: ("a" | "b")[] = []
+  xs.push("a")
+  xs.push("b")
+  xs.push("a")
+  print(xs.length) // 3
+
+  print(len([]))         // 0
+  print(len(["a"]))      // 1
+  print(len(["a", "b"])) // 2
+
+  const b: Box = { xs: ["a", "b"] }
+  print(b.xs[1])     // b
+  print(mk().length) // 1
+}
+
+// A `K[]` parameter fed an inline-annotated value: the alias and the inline spelling
+// must share ONE rep.
+function f(xs: K[]) { print(xs.length) }
+
+go()
+f(g)                 // 2
+print(count(g, "a")) // 1
