@@ -24484,3 +24484,283 @@ population is byte-identical across every comparison), on TWO channels:**
    in the wrong direction and filed a blocker that does not exist. The move needs both files and so
    needs a partition that owns both — but it needs **no new mechanism**, and it should not be filed
    again as one.
+
+## D-PARENCLASSIFY — the seven PAREN sites #1190 filed are routed, and one of `repRowOfName`'s four consumers is measured DEAD (#1192)
+
+Base `f16b04f` (#1191). #1190 built the two PAREN homes in `emit_base` — `nameIsParenOpen` and
+`nameIsParenSpanEnds` — routed 8 sites in its own three files, and filed **7 mechanical routings
+into `emit_classify.vl`**, the largest single file on the CORE list and the one file untouched by
+five slices of this arc. This slice takes those 7, and takes the `repRowOfName` round trip the two
+slices before it filed twice.
+
+### The instruments, validated before use
+
+**Two units, never mixed.**
+
+* **CALL SITES** — #1139's 23-resolver CORE list plus #1141's off-list scanners, `NAME(` in
+  non-comment code, each resolver's own `function NAME(` header excluded. Written **twice,
+  independently**: a line-based stripper and a whole-FILE character scanner that also understands
+  VL char literals, cross-checked against a recount over the CONCATENATION of every file. Both
+  reproduce every published figure at `f16b04f` **exactly** — CORE **312** · OFF-LIST **25** ·
+  TRUE **337**, `emit_classify` **175**, `emit_base` **52**, `emit_collect` 44, `typecheck` 44 (19
+  core + 25 off), `emit_mono` 7, `emit_rewrite` 7, `wasmEmit` 5, `emit_rep` 2, `emit_sections` 1.
+* **PAREN grammar OCCURRENCES** — one per `'('` / `')'` CHARACTER LITERAL in non-comment code. The
+  stripper blanks double-quoted strings and **KEEPS** char literals (method note 92), and parses
+  `'"'` / `'\\'` as char literals so string tracking cannot invert. Graded on a constructed trap
+  file (comment, string containing `( ) '('`, bare char literals, `'"'`, `'\\'`, trailing comment):
+  **3/3, no false positives**. Tree-wide it reads **38 raw** at `f16b04f` — `typecheck` 20 ·
+  `emit_classify` 10 · `emit_base` 4 · `format` 2 · `lexer` 2 — reproducing #1190's AFTER state to
+  the file.
+
+### THE SEVEN, RE-DERIVED — every line number had moved, and one NAME was wrong
+
+The brief said to assume its own leads contain an error. They did. Re-derived by anchor text at
+this HEAD:
+
+| filed by #1190 | actual at `f16b04f` | Δ |
+|---|---|---:|
+| `rlElemCloSigKey` 4510 | **4512** | +2 |
+| `cloArrSlotRetName` 6363 | **6365** | +2 |
+| `rlCanonLitUnionAtoms` 10046 | **10049** | +3 |
+| `internShapeDeep` 10712 | **10715** | +3 |
+| `forceCloResultMapTypes` 12037 | **12029** | **−8** |
+| `forceCloResultArrTypes` 12082 | **`forceCloResultListTypes` 12074** | −8, **and the name is wrong** |
+| `unionRetOfFnType` 14332 | **14323** | −9 |
+
+The offsets are not uniform and **change sign** mid-file, so a single global shift would have
+mis-landed four of the seven. There is no `forceCloResultArrTypes` in the tree and there never
+was; the function is `forceCloResultListTypes`. A routing driven off the filed name would have
+found nothing and been reported as "already done".
+
+**And the brief's first warning does not apply to this file — measured, not assumed.** P-ARROW
+(`[arrowAt - 1]`), P-ARRAY (`[length - 3]`) and P-CLOSEONLY close the group somewhere that is not
+the last character, and their CLOSE test must stay inline. `emit_classify` holds **7 `'('` and 3
+`')'`**, and the character census places all three `')'` on the same lines as a `'('` — i.e. all
+three are P-SPAN and the other four are P-OPEN with **no close test at all**. There is no
+`[arrowAt - 1]` / `[length - 3]` / close-only spelling in this file; those live in `emit_base` and
+`typecheck`, where #1190 left their close tests inline. Nothing was routed that should not have
+been, because the file was counted rather than eyeballed.
+
+### What was routed
+
+To **`nameIsParenSpanEnds`** (3 sites, 6 occurrences) — the endpoint span, **no balance walk**:
+
+* `rlElemCloSigKey` — `nm.length < 2` early return + both endpoint compares → the home. The bound
+  is IMPLIED, not dropped: on a one-character name `nm[0]` and `nm[nm.length - 1]` are the SAME
+  character and no character is both `(` and `)`.
+* `cloArrSlotRetName` — character-for-character the same pair.
+* `rlCanonLitUnionAtoms` — bounds only `n >= 1` (its `n == 0` early return), which IS the home's
+  own bound.
+
+To **`nameIsParenOpen`** (4 sites, 4 occurrences) — the OPEN half only:
+
+* `internShapeDeep` — `annArrowAt(nm) >= 1 && nm[0] == '('`. The arrow index supplies the length
+  bound; the group closes before the `=>`, so there is no last-character question to ask.
+* `forceCloResultMapTypes`, `forceCloResultListTypes`, `unionRetOfFnType` — all three spell
+  `length > 0 && [0] == '('`, which IS the home.
+
+**These three span sites are three of the seven #1190 measured that endpoints-plus-a-balance-walk
+would have TIGHTENED.** They are routed to the walk-FREE home, and the walk is not adopted at any
+of them. `emit_classify`'s PAREN occurrences go **10 → 0**; tree-wide **38 → 28**.
+
+### REACH, ANSWER and CONSEQUENCE — three numbers per site, and four of the seven separate them
+
+Every site was probed twice against the whole corpus, from separate builds:
+
+* **REACH** — a poison probe (`emitFail` when the routed predicate answers TRUE).
+* **CONSEQUENCE** — an `&& false` sabotage making that one site decline unconditionally, A/B'd over
+  all five corpus columns.
+* **ANSWERS** — for the sites whose consequence read 0, a third probe firing only when the routed
+  branch produces a value the DECLINING path would not have produced.
+
+| site | REACH (of 1,416) | ANSWERS | CONSEQUENCE (files reddened) | fixture reaches |
+|---|---:|---:|---:|:--:|
+| `rlElemCloSigKey` | **2** | **0** | 0 | ✅ |
+| `cloArrSlotRetName` | 19 | 19 | 0 | ✅ |
+| `rlCanonLitUnionAtoms` | 95 | 23 | 0 | ✅ |
+| `internShapeDeep` | 291 | — | **41** | ✅ |
+| `forceCloResultMapTypes` | 42 | — | **2** | ✅ |
+| `forceCloResultListTypes` | 117 | — | **6** | ✅ |
+| `unionRetOfFnType` | 58 | 28 | 0 | ✅ |
+
+**All seven are REACHED. Only three are OBSERVABLE.** Quoting reach alone would claim seven
+covered sites; quoting consequence alone would read as four unreached ones. The pair is the
+finding (method note 137), and the ANSWERS column is what makes the four zeros explainable rather
+than merely small:
+
+* `rlElemCloSigKey` — reached twice and **answers zero times**: on both files `annSigKey` of the
+  paren-stripped element returns `""`, which is exactly what declining returns. One of those two
+  files is `tests/cases/closures/map-value-nullable-closure-list-elem-sigkey.vl`, the case pinned
+  by #1106 as the ONE shape in 49,422 programs reaching this fall-through — and it is now measured
+  to reach a leg that produces nothing on it. **Filed, not acted on**: an unreached-or-inert rung
+  is not a wrong rung, and #1182's precedent stands.
+* `cloArrSlotRetName` / `rlCanonLitUnionAtoms` / `unionRetOfFnType` — the branch produces a value
+  DIFFERENT from declining on 19 / 23 / 28 corpus files, and **not one of those differences reaches
+  the emitted bytes**. The answers are computed and then masked downstream. Verified by hand as
+  well as by harness: the fixture's own module is byte-identical (sha `202a4bc1…`) under the
+  `unionRetOfFnType` sabotage.
+
+### The fixture, and the probe that graded it
+
+`tests/cases/closures/paren-classify-homes.vl` — eight cells, eleven `@log` pins, and it is the
+only new file. It was **graded by a coverage probe, not by reading it** (method note 136): the
+first draft reached **5 of 7**.
+
+* `unionRetOfFnType` was missed because the draft spelled the callee as a fn-type-annotated
+  BINDING (`const f: (i32) => i32 | string = classify`), which `unionNameOfExpr` claims one arm
+  EARLIER via `identClosureFe`. The reaching spelling is a HOF **parameter** (`paramUnionRetName`).
+* `rlElemCloSigKey` was missed because the arena leg answers for a plain `((i32) => i32)[]`. The
+  reaching spelling routes the closure list through a **map value**, where `rlElemTyIx` does not
+  resolve the stored element.
+
+Both were fixed by SPELLING, not by meaning — the same lesson #1189 recorded, in a second place.
+The fixture PASSES identically on master and candidate (it is a pin, not a graduation), and it
+FAILS under the `internShapeDeep`, `forceCloResultMapTypes` and `forceCloResultListTypes`
+sabotages. For the other four sites it is reach-proven and output-inert, which is the honest
+claim and is stated as such rather than dressed up.
+
+### TARGET 2 — the `repRowOfName` consumers, and a REACH CENSUS that retires one of them
+
+`repRowOfName` still has exactly **four** call sites, all in `emit_classify` (re-derived:
+`nulBaseStructRow` 8362 · `structIdxOfElemName` 9255 · `monoIsRowMatch` 9288 ·
+`shapeElemDeclaredStructIdx` 9314 — every one moved from the line #1187 recorded). The tri-state is
+still dead: all four test `>= 0` / `< 0`, re-read site by site.
+
+Nobody had ever asked how often each one RUNS. A poison probe at each call site in turn:
+
+| consumer | corpus files (of 1,416) | fuzz dirs / programs (of 84 / 50,400) |
+|---|---:|---:|
+| `nulBaseStructRow` | 105 | 84 / 2,003 |
+| **`structIdxOfElemName`** | **0** | **0 / 0** |
+| `monoIsRowMatch` | 6 | 0 / 0 |
+| `shapeElemDeclaredStructIdx` | 44 | 79 / 633 |
+
+**The zeros are graded.** Consumers 1 and 4 fire on BOTH channels from the same probe mechanism, so
+neither the probe nor either population is blind.
+
+**`structIdxOfElemName`'s round trip is DEAD, and the reason is not the one on file.** #1187 filed
+its blocker as "a name from `refListElemNameOfExpr`, a multi-arm resolver with no slot behind it".
+Measured instead:
+
+1. The function is called from exactly ONE site, `forInRefArrayStructIdx`, on **8 of 1,416** corpus
+   files and **0 of 50,400** fuzz programs (a positive control firing on ENTRY reads 0/84 too, so
+   the fuzz leg is blindness and only the corpus number is evidence).
+2. On **all 8**, the nominal `structIndexByName` consult one rung above ANSWERS — so control never
+   reaches `repRowOfName` or the fieldset scan beneath it.
+3. **The node the filed blocker says is missing is right there.** The caller holds the iterable
+   expression index, and `tyRefArrElemOf(nodeRepTyIxOf(iterIx))` — peel a `TyNullable` on the
+   array, take `TyArray.aElem` — resolves a ref-array element type on **8 of 8**. The arena route
+   is one line, the same shape D-NULBASEROW used for the annotation node.
+
+So the routing is **not blocked; it is pointless**. A rung inserted above a call that never
+executes buys no skipped parse and can be graded by nothing — there is no population to A/B it
+against and no fixture that would fail without it. It is NOT built, and both headers now carry the
+census so the next slice re-measures instead of re-filing. The other two are unchanged and
+re-verified by reading: `shapeElemDeclaredStructIdx`'s two callers (`nameIsRefArray`,
+`refArrElemName`) each take a `name: string` with no node anywhere on the path;
+`monoIsRowMatch`'s single caller is still `wasmEmit.vl:1731`, outside this partition, and
+`isVarTyIxOf` still banks the arena type — that hand-off holds verbatim.
+
+### Both units, before and after
+
+| unit | `f16b04f` | shipped | delta |
+|---|---:|---:|---:|
+| PAREN grammar occurrences, tree-wide | **38** | **28** | **−10** |
+| … `emit_classify` | 10 | **0** | −10 |
+| … `typecheck` (blocked by module direction) | 20 | 20 | 0 |
+| … `emit_base` / `format` / `lexer` | 4 / 2 / 2 | 4 / 2 / 2 | 0 |
+| **CORE call sites** (23-resolver list, tree-wide) | **312** | **312** | **0** |
+| OFF-LIST (#1141's table) | **25** | **25** | **0** |
+| TRUE TOTAL | **337** | **337** | **0** |
+| `emit_classify` CORE | 175 | 175 | 0 |
+| binary (`build/vl-compiler.wasm`, fixpoint) | 1,031,204 B | **1,031,045 B** | **−159 B** |
+| suite | 2,157 / 0 / 8 | **2,158 / 0 / 8** | +1 (this slice's fixture) |
+
+**CORE Δ0 was PREDICTED before it was measured**, for method note 133's reason: the rising-CORE
+effect needs the homed grammar's BODY to call an on-list resolver, and `nameIsParenOpen` /
+`nameIsParenSpanEnds` are pure character surgery over two off-list names. Every per-file CORE
+figure is unchanged too. The unit that moved is the character census; the binary is the
+independent witness.
+
+### GATE — every leg, exit code taken WITHOUT a pipe
+
+| leg | RC |
+| --- | ---: |
+| `scripts/fetch-seed.sh` (fresh, local seed removed first — 1,031,204 B) | **0** |
+| `scripts/refresh-compiler.sh --prove-fixpoint` — fixpoint at 2 compiles | **0** |
+| `scripts/native-fixpoint.sh` — stage3 == stage4 byte-for-byte | **0** |
+| `npm ci` | **0** |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` — **2158 passed / 0 failed / 8 ignored** | **0** |
+| `deno check tests/cases_wasm_test.ts` | **0** |
+| `scripts/lint-self.sh` (incl. `vl fmt --check`) | **0** |
+| `scripts/rep-fuzz-check.sh` — exact, 1 baselined, 0 new / 0 stale | **0** |
+| corpus A/B, **1,416 files** × {build rc, wasm sha256, diagnostic, run rc, run stdout} | **0 divergences** |
+| fuzz A/B, **50,400 programs / 84 dirs**, `vl check --codegen` | **0/84 divergences** |
+
+**The suite baseline was DERIVED in this worktree, not quoted: 2157 / 0 / 8 on unmodified
+`f16b04f` source** (checked out detached, master's own seed installed, then restored). 2158 is that
+plus exactly one fixture. 8 ignored on both sides confirms the env var, `npm ci` and a
+NON-STALE native host — the host was rebuilt from this worktree's own `scripts/vl-host` before any
+measurement, per #1190's method note 139.
+
+**Both A/B zeros are graded, not believed.** The `internShapeDeep` sabotage reddens **41 of 1,416
+corpus files** and **58 of 84 fuzz dirs** — the same channels, the same populations, the same
+harness. Neither zero is blindness.
+
+Sweeps used per-worker output files (never one shared append target) with a row-count and
+field-count assertion on every run: 1,416/1,416 and 84/84, 0 malformed, on every sweep in this
+slice — 7 reach sabotages, 7 coverage probes, 4 answer probes, 6 `repRowOfName` probes and the
+final A/B pair.
+
+### Wall time — no claim made
+
+Interleaved self-compiles, warm-up discarded, n=7 per side: **A median 1.716 s** (1.670–2.163),
+**B median 1.741 s** (1.695–1.795). The 0.025 s gap is a fifth of A's own within-run spread on a
+box shared with parallel agents, and the change is character compares becoming calls with no
+algorithmic difference. **No wall-time claim is made in either direction**; the binary SHRANK by
+159 B and that is the measurement worth quoting.
+
+### What this slice deliberately did NOT ship
+
+* **It did not adopt a balance walk at any of the three span sites**, and did not merge the two
+  walks. They remain the pair #1190 proved disagree on a group that never closes.
+* **It did not delete a rung on a measured 0** — not `rlElemCloSigKey`'s name fall-through (REACH 2,
+  ANSWERS 0), not `structIdxOfElemName`'s `repRowOfName` (REACH 0 on both channels), not
+  `renderFaithful`. #1189's and #1182's precedent, applied three more times.
+* **It did not build the `structIdxOfElemName` arena route** even though the measurement showed the
+  node is available at 8 of 8 — an ungradeable improvement is not an improvement.
+* **It did not touch `emit_base.vl`, `typecheck.vl`, `wasmEmit.vl` or `emit_sections.vl`**, so
+  `typecheck`'s 20 remaining PAREN occurrences (the module-direction wall) are untouched, and
+  `monoIsRowMatch`'s routing stays a hand-off.
+* It shipped ONE fixture, and says out loud that it is output-load-bearing for 3 of the 7 sites it
+  reaches.
+
+### Method notes
+
+141. **A FILED SITE LIST CAN BE WRONG IN THE NAME, NOT JUST THE LINE.** Every one of the seven
+     filed line numbers had moved, by +2 to −9, and **the offsets changed sign inside one file** —
+     so no global shift recovers them and a bulk re-anchor would have mis-landed four. Worse, one
+     entry named a function that does not exist and never did (`forceCloResultArrTypes` for
+     `forceCloResultListTypes`). Re-derive a filed list by ANCHOR TEXT and by counting the
+     character census per file; a name in a hand-off is exactly as much evidence as a line number,
+     which is none.
+142. **REACH, ANSWERS AND CONSEQUENCE ARE THREE PROBES, AND THE MIDDLE ONE IS THE ONE NOBODY
+     BUILDS.** #1190's note 137 named reach and consequence. A site can be reached thousands of
+     times, produce a value that DIFFERS from declining on dozens of programs, and still be
+     output-invariant — `unionRetOfFnType` is 58 / 28 / 0. Without the middle number, "reached but
+     0 reddened" reads as "probably unreached" and invites the deletion; with it, the site is
+     visibly live and visibly masked. Build the ANSWERS probe before publishing any inert zero.
+143. **ASK HOW OFTEN A CONSUMER RUNS BEFORE COSTING ITS ROUTING.** Two slices filed
+     `structIdxOfElemName`'s round trip as blocked by its producer. It is not blocked — the caller
+     holds the node and the arena resolves it 8 times out of 8. It is **dead**: the rung above it
+     answers on every reaching program, so the round trip executes 0 times in 1,416 corpus files
+     and 50,400 fuzz programs. A reach census is one probe build per call site and it retires more
+     work than a mechanism argument does. And when a channel reads 0, run the POSITIVE CONTROL on
+     the same channel: fuzz's 0 here is blindness (the function is never entered), corpus's 0 is
+     agreement (it is entered 8 times), and only one of those two numbers is evidence.
+144. **`npm ci` THROUGH A SYMLINKED `node_modules` EMPTIES THE SHARED ONE.** The gate requires
+     `npm ci`; agent worktrees symlink `node_modules` to the main checkout. `npm ci` deletes the
+     tree THROUGH the symlink and then creates a real directory in the worktree — leaving every
+     sibling worktree pointing at an empty directory. Restore it (`cp -a node_modules/.
+     <main>/node_modules/`) immediately, and check `ls -la node_modules` after any `npm ci` in a
+     worktree.

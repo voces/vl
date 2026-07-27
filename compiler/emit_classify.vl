@@ -141,6 +141,8 @@ import {
   nameIsNulLitUnionList,
   nameIsNulStrList,
   nameIsNulString,
+  nameIsParenOpen,
+  nameIsParenSpanEnds,
   nameIsShapeOpen,
   nameIsShapeSpanEnds,
   nameIsString,
@@ -4508,8 +4510,15 @@ export function rlElemCloSigKey(slot: i32): string {
   const ar = rlElemCloSigKeyAt(slot)
   if ar != "" { return ar }
   const nm = nonNulBaseOf(rlElemName[slot])
-  if nm.length < 2 { return "" }
-  if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
+  // The grouping-paren SPAN is `emit_base.nameIsParenSpanEnds` (first char `(`, last char
+  // `)`, NO balance walk). The `nm.length < 2` early return this replaced is IMPLIED by the
+  // home, not dropped: on a one-character name `nm[0]` and `nm[nm.length - 1]` are the SAME
+  // character and no character is both `(` and `)`, so both readings decline — and the
+  // `slice(1, nm.length - 1)` below is unreachable for any name the home admits.
+  // Deliberately NOT the balanced walk (`peelGroupParens` / `normTypeAtom`): widening the
+  // span here would re-key a `(a)|(b)`-shaped element, which the home's header records as
+  // the reason it carries none.
+  if !nameIsParenSpanEnds(nm) { return "" }
   annSigKey(nm.slice(1, nm.length - 1))
 }
 
@@ -6361,8 +6370,10 @@ export function cloArrSlotRetName(slot: i32) {
   // A NULLABLE-closure element slot: peel the `| null` (the call classifies on the
   // narrowed non-null closure), mirroring `cloArrSlotSigKey`.
   nm = nonNulBaseOf(nm)
-  if nm.length < 2 { return "" }
-  if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
+  // The grouping-paren SPAN home (`emit_base.nameIsParenSpanEnds`), exactly as in
+  // `rlElemCloSigKey` above — same two endpoint compares, same implied `length >= 2`, and
+  // the same deliberate absence of a balance walk.
+  if !nameIsParenSpanEnds(nm) { return "" }
   // `annRetNameOf` (#1144) IS this `annArrowAt`-then-slice pair. Its gate is `< 1` where
   // this copy spelled `< 0`; the two differ only for an arrow at index 0, i.e. a name
   // BEGINNING `=>`, which no renderer produces (the home's own header argues this).
@@ -9218,6 +9229,18 @@ function refArrShapeKind(name: string): i32 {
 // (`structIndexOfTypeName`): an INLINE-SHAPE element spelling (`{v:i32}` of a `{v:i32}[]`
 // param) that `collectAnnShapes` deduped onto its declared twin has no `sNames` entry of its
 // own, so only the layout-guarded field-set match resolves it.
+//
+// MEASURED DEAD BELOW THE FIRST RUNG (D-PARENCLASSIFY). This function is called from ONE
+// place, `forInRefArrayStructIdx`, on **8 of 1,416** corpus files and on **0 of 50,400** fuzz
+// programs — and on all 8, the nominal `structIndexByName` consult ANSWERS, so neither the
+// `repRowOfName` round trip nor the fieldset scan below it ever executes. A poison probe at
+// the `repRowOfName` call reads 0 on both channels; the same probe mechanism fires 105 corpus
+// / 2,003 fuzz at `nulBaseStructRow` and 44 / 633 at `shapeElemDeclaredStructIdx`, so the
+// zero is agreement on the corpus and blindness in fuzz (where this function is never
+// entered at all — a positive control on ENTRY reads 0/84 too). Neither rung is deleted on
+// that: an unreached rung is not a wrong one, and the population that reaches it is exactly
+// the population no test writes yet. See `emit_rep.repRowOfName`'s header for the census and
+// for the arena route this caller could take the day it matters.
 export function structIdxOfElemName(name: string) {
   const n = nonNulBaseOf(name)
   // Nominal exact-name match first (unambiguous, byte-identical, cheap).
@@ -10046,7 +10069,10 @@ function rlCanonLitUnionAtoms(name: string): string {
   // inner is a function type (`((i32) => K0)` — a GROUPED closure element, whose grouping
   // parens are part of its ref-list slot key; stripping them re-keys the slot, and its
   // `=>`-result litunion is not a slot-key union anyway). Leave such a name untouched.
-  if name[0] == '(' && name[n - 1] == ')' {
+  // (`emit_base.nameIsParenSpanEnds` — the endpoint span, no balance walk. This site
+  // bounds only `n >= 1` (the `n == 0` early return above); the home's `length >= 1` IS
+  // that bound, so the routing is exact on every input including the one-character name.)
+  if nameIsParenSpanEnds(name) {
     const inner = name.slice(1, n - 1)
     if isTopLevelFuncTypeName(inner) { return name }
     return rlCanonLitUnionAtoms(inner)
@@ -10712,7 +10738,12 @@ export function internShapeDeep(nm: string) {
   // match, and the closure functype result fails loudly ("ref valtype with no
   // interned shape"). `internFuncTypeShapes` interns each PLAINLY-LOWERABLE shape
   // reached — see the soundness note there.
-  if annArrowAt(nm) >= 1 && nm[0] == '(' { return internFuncTypeShapes(nm) }
+  // (`emit_base.nameIsParenOpen` — the OPEN half only. There is no close test here: the
+  // group closes before the `=>`, not at the last character, and `annArrowAt(nm) >= 1`
+  // both supplies the home's length bound and stands in for it.)
+  if annArrowAt(nm) >= 1 && nameIsParenOpen(nm) {
+    return internFuncTypeShapes(nm)
+  }
   // A GENERIC-APPLICATION leaf (`Pair<i32,string>`): `collectGenAliasShapes` interns an
   // application only where a TypeRef spells it BARE (behind `| null` / `[]`), so one
   // buried INSIDE another annotation's field text — the list element of
@@ -12023,10 +12054,13 @@ export function forceCloResultMapTypes(nm: string) {
   while i < arms.length {
     const a = normTypeAtom(arms[i])
     // `annRetNameOf` (#1144) IS the `annArrowAt` + `slice(fa + 2, …)` pair, and its `< 1`
-    // gate IS this site's `fa >= 1`. The caller keeps its own `a[0] == '('` test — which
-    // now runs FIRST, so the one-char reject precedes the depth scan instead of following
-    // it (a strict work REDUCTION: `annArrowAt` no longer runs on an arm that cannot pass).
-    if a.length > 0 && a[0] == '(' {
+    // gate IS this site's `fa >= 1`. The caller keeps its own opener test — which now runs
+    // FIRST, so the one-char reject precedes the depth scan instead of following it (a
+    // strict work REDUCTION: `annArrowAt` no longer runs on an arm that cannot pass). That
+    // opener test is `emit_base.nameIsParenOpen`, whose `length >= 1` bound IS this site's
+    // `a.length > 0`; the OPEN half only — the group closes before the `=>`, so there is
+    // no last-character question to ask.
+    if nameIsParenOpen(a) {
       const ret0 = annRetNameOf(a)
       if ret0 != "" {
         let res = normTypeAtom(ret0)
@@ -12069,9 +12103,10 @@ export function forceCloResultListTypes(nm: string) {
   while i < arms.length {
     const a = normTypeAtom(arms[i])
     // `annRetNameOf` (#1144), exactly as in `forceCloResultMapTypes` above: its `< 1` gate
-    // IS this site's `fa >= 1`, and the caller's own `a[0] == '('` test now runs FIRST so
-    // the one-char reject precedes the depth scan.
-    if a.length > 0 && a[0] == '(' {
+    // IS this site's `fa >= 1`, and the caller's own opener test (`emit_base
+    // .nameIsParenOpen`, the OPEN half only) now runs FIRST so the one-char reject
+    // precedes the depth scan.
+    if nameIsParenOpen(a) {
       const ret0 = annRetNameOf(a)
       if ret0 != "" {
         const res = nonNulBaseOf(normTypeAtom(ret0))
@@ -14318,9 +14353,10 @@ export function letUnionNameOf(letIx: i32, fnIx: i32) {
 // member set via `isUName`), or "" when the name is not a function type returning a multi-member union.
 function unionRetOfFnType(fnTyName: string) {
   // `annRetNameOf` (#1144): its `< 1` gate IS this site's `arrowAt >= 1`, and the caller
-  // keeps its own `[0] == '('` test — hoisted AHEAD of the scan, as in the two
-  // `forceCloResult*` twins.
-  if fnTyName.length > 0 && fnTyName[0] == '(' {
+  // keeps its own opener test (`emit_base.nameIsParenOpen`, the OPEN half only — its
+  // `length >= 1` bound IS this site's `length > 0`) — hoisted AHEAD of the scan, as in
+  // the two `forceCloResult*` twins.
+  if nameIsParenOpen(fnTyName) {
     const ret0 = annRetNameOf(fnTyName)
     if ret0 == "" { return "" }
     const ret = normTypeAtom(ret0)
