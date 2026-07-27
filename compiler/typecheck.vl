@@ -4951,14 +4951,24 @@ function nameHasPipe(name: string) { nameHasSep(name, '|') }
 // `tyToEmitNameGo` and `tyToNominalName` each carried this as a private four-line copy.
 // They are the two renderers the SCORECARD CORRECTION's "kill the SOURCES" strategy points
 // at, and a renderer asking `nameHasPipe` about a string it has just built is the disease
-// in miniature — but the two DUALS analysed in #1153's hand-off item 5 (the `emitNameAtoms`
-// BANK, and a structural `ae is TyUnion || ae is TyNullable` test) each have a stated hazard
-// and only one of them covers `tyToNominalName`, which has no bank at all. Merging the copies
-// is the part that is provable today; it leaves ONE site to convert instead of two, and the
-// conversion is then a one-line change inside a single home.
-function arrElemRender(el: string, elTy: i32): string {
+// in miniature. #1153's hand-off item 5 analysed two DUALS — the `emitNameAtoms` BANK and a
+// structural `ae is TyUnion || ae is TyNullable` test — and #1191 declined both, because the
+// structural test mis-parenthesizes a union whose members DEDUP to one part and only the bank
+// was exact, while the bank existed on one renderer and not the other. Merging the copies
+// left ONE site to convert; giving `tyToNominalName` its own `nomNameAtoms` bank supplied the
+// missing half, and the conversion is the `elAtoms` parameter below.
+//
+// D-ARRWIDTH: the element's WIDTH is supplied BY ITS PRODUCER, not recovered by scanning the
+// element name for a top-level `|`. A WIDE element (more than one top-level atom) is exactly
+// a union element, because a render's width exceeds 1 only where the render itself wrote a
+// top-level `|` (the union arm's join and the nullable arm's `|null` suffix). The one shape
+// where a top-level `|` and a width of 1 coexist — a function type whose RESULT is a union,
+// `(i32)=>f64|boolean` — is claimed by the TyFunc test ABOVE the width test and never
+// reaches it. Measured at this site on both channels: see the D-ARRWIDTH section of
+// `docs/internals/destringify-types-program.md`.
+function arrElemRender(el: string, elTy: i32, elAtoms: i32): string {
   if T.tys[elTy] is TyFunc { return "(" + el + ")[]" }
-  if nameHasPipe(el) { return "(" + el + ")[]" }
+  if elAtoms > 1 { return "(" + el + ")[]" }
   el + "[]"
 }
 
@@ -6529,14 +6539,20 @@ function tyToEmitNameGo(ix: i32) {
     // other twin's struct (INVALID-WASM; fuzz-nightly seed 210853359 d6). The array
     // sibling of the TyUnion-member / TyObj-field / TyMap-value alias preservation.
     let el = litUnionAliasNameOfTy(t.aElem)
-    if el == "" { el = tyToEmitName(t.aElem) }
+    // The ELEMENT's own atom WIDTH, as the element's producer reported it — an alias
+    // identifier is one atom, the render leg reports its own (D-ARRWIDTH).
+    let elw = 1
+    if el == "" {
+      el = tyToEmitName(t.aElem)
+      elw = emitNameAtoms
+    }
     if el == "" { return "" }
     // A list name is ONE atom in every form — a union element is parenthesized precisely
     // so its `|`s stop being top-level. Set rather than inherited (the element render
     // left its own width behind). The grouping itself is `arrElemRender`'s (D-ARRGROUP),
     // which also carries the CLOSURE-element rationale this arm used to state twice.
     emitNameAtoms = 1
-    return arrElemRender(el, t.aElem)
+    return arrElemRender(el, t.aElem, elw)
   }
   if t is TyMap {
     const mk = tyToEmitName(t.mKey)
@@ -6644,9 +6660,28 @@ export function unionAliasDeclNameOfTy(ty: i32): string {
 // named recursive struct (`type Tree = {children: Tree[]}`) short-circuits to "Tree" before its
 // self-referential field re-enters. NOTHING consumes this in emitted output yet — it is a
 // byte-identical foundation for the (deferred) arena registration walk.
+// The TOP-LEVEL atom width of the name the LAST `tyToNominalName` call returned — the
+// nominal renderer's `emitNameAtoms`, produced BY the renderer instead of re-derived by
+// scanning the finished string. Same invariant as its structural sibling: a rendered name
+// gains a top-level `|` at exactly two places (the union arm's join and the nullable arm's
+// `|null` suffix), and every other arm builds a name whose separators sit inside a grouper
+// or behind a top-level `=>` — ONE atom.
+//
+// It exists so `arrElemRender` — the ONE array-grouping home BOTH renderers share — can be
+// told the element's width instead of scanning the element name for a top-level `|`. That
+// site could not convert while only ONE of the two renderers banked a width (#1191's
+// hand-off names exactly this gap: "only one of them covers `tyToNominalName`, which has no
+// bank at all").
+//
+// Not an arena-lifetime sidecar (method note 7): a scalar written on the way out of every
+// non-empty return and read by the immediate caller, never carried between programs.
+let nomNameAtoms = 1
+
 export function tyToNominalName(ix: i32): string {
+  nomNameAtoms = 1
   if ix < 0 { return "" }
-  // NOMINAL-FIRST: a declared struct or union alias renders as its NAME.
+  // NOMINAL-FIRST: a declared struct or union alias renders as its NAME — one identifier,
+  // so one atom (the reset above).
   const sdn = structNameOfTy(ix)
   if sdn != "" { return sdn }
   const udn = unionAliasDeclNameOfTy(ix)
@@ -6693,6 +6728,10 @@ export function tyToNominalName(ix: i32): string {
       rgAlias = litUnionAliasOfLitTexts(rgTexts)
     }
     const parts: string[] = []
+    // The KEPT parts' widths, SUMMED — not `parts.length`. The join below writes exactly one
+    // top-level `|` per part boundary, but a PART is not always one atom (a nullable member
+    // renders `X|null`), and a DUPLICATE part contributes nothing at all.
+    let psum = 0
     let rgDone = false
     let i = 0
     while i < members.length {
@@ -6701,21 +6740,35 @@ export function tyToNominalName(ix: i32): string {
         if !rgDone {
           rgDone = true
           parts.push(rgAlias)
+          psum = psum + 1
         }
         i = i + 1
         continue
       }
+      // An ALIAS name is one identifier — one atom. Only the RENDER leg can be wider, and
+      // it reports its own width in `nomNameAtoms`.
+      let sc = 1
       let s = litUnionAliasNameOfTy(members[i])
-      if s == "" { s = tyToNominalName(members[i]) }
+      if s == "" {
+        s = tyToNominalName(members[i])
+        sc = nomNameAtoms
+      }
       if s == "" { return "" }
-      if rgm is TyFunc { s = "(" + s + ")" }
+      // The grouping parens put every separator inside a grouper — one atom again.
+      if rgm is TyFunc {
+        s = "(" + s + ")"
+        sc = 1
+      }
       let dup = false
       let j = 0
       while j < parts.length {
         if parts[j] == s { dup = true }
         j = j + 1
       }
-      if !dup { parts.push(s) }
+      if !dup {
+        parts.push(s)
+        psum = psum + sc
+      }
       i = i + 1
     }
     if parts.length == 0 { return "" }
@@ -6725,16 +6778,29 @@ export function tyToNominalName(ix: i32): string {
       out = out + "|" + parts[k]
       k = k + 1
     }
+    nomNameAtoms = psum
     return out
   }
   if t is TyNullable {
     const nal = litUnionAliasNameOfTy(t.nInner)
-    if nal != "" { return nal + "|null" }
+    if nal != "" {
+      // An alias identifier plus the `null` arm — two atoms.
+      nomNameAtoms = 2
+      return nal + "|null"
+    }
     // A nullable DECLARED struct/union keeps its nominal name (`S|null`, `U|null`).
     const nsn = tyToNominalName(t.nInner)
+    const nsnAtoms = nomNameAtoms
     if nsn == "" { return "" }
     const nfn = T.tys[t.nInner]
-    if nfn is TyFunc { return "(" + nsn + ")|null" }
+    if nfn is TyFunc {
+      // The grouped closure is one atom; `null` is the second.
+      nomNameAtoms = 2
+      return "(" + nsn + ")|null"
+    }
+    // A union INNER keeps its own top-level `|`s (`A|B|null`), so the `null` arm ADDS to the
+    // inner render's width rather than making the whole name two atoms.
+    nomNameAtoms = nsnAtoms + 1
     return nsn + "|null"
   }
   if t is TyObj {
@@ -6759,19 +6825,34 @@ export function tyToNominalName(ix: i32): string {
       out = out + names[fi] + ":" + fs
       fi = fi + 1
     }
+    // Every field separator sits inside the braces — ONE atom. Set rather than inherited:
+    // the field renders above left `nomNameAtoms` holding the last field's width.
+    nomNameAtoms = 1
     return out + "}"
   }
   if t is TyArray {
     let el = litUnionAliasNameOfTy(t.aElem)
-    if el == "" { el = tyToNominalName(t.aElem) }
+    // The ELEMENT's own atom WIDTH, as the element's producer reported it — an alias
+    // identifier is one atom, the render leg reports its own.
+    let elw = 1
+    if el == "" {
+      el = tyToNominalName(t.aElem)
+      elw = nomNameAtoms
+    }
     if el == "" { return "" }
-    return arrElemRender(el, t.aElem)
+    // A list name is ONE atom in every form — a union element is parenthesized precisely so
+    // its `|`s stop being top-level. Set rather than inherited: the element recursion left
+    // the ELEMENT's width in `nomNameAtoms`.
+    nomNameAtoms = 1
+    return arrElemRender(el, t.aElem, elw)
   }
   if t is TyMap {
     const mk = tyToNominalName(t.mKey)
     let mv = litUnionAliasNameOfTy(t.mVal)
     if mv == "" { mv = tyToNominalName(t.mVal) }
     if mk == "" || mv == "" { return "" }
+    // The key/value separators sit inside the braces — one atom.
+    nomNameAtoms = 1
     return "{[" + mk + "]:" + mv + "}"
   }
   if t is TyFunc {
@@ -6799,6 +6880,10 @@ export function tyToNominalName(ix: i32): string {
     if rs == "" { return "" }
     const rt = T.tys[t.fnRet]
     if rt is TyFunc { rs = "(" + rs + ")" }
+    // A function type is ONE atom: the params are parenthesized and everything after the
+    // top-level `=>` belongs to the RESULT. Set rather than inherited: the param/result
+    // renders above left their own widths behind.
+    nomNameAtoms = 1
     return out + ")=>" + rs
   }
   ""
