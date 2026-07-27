@@ -1,0 +1,182 @@
+// @run
+// A literal-union ARGUMENT through a FUNCTION VALUE. `emitCallRef` — the `call_ref` twin of
+// `emitCall` — never had the two literal-union argument seeds its direct-call sibling has
+// carried for as long as it has had a `Param` node to read (`cParamLitUnion` /
+// `cParamNulLitUnion`). A `K` param's runtime rep is the INTERNED i32 ATOM, so a member-literal
+// argument must lower as its id; with no seed it lowered as a heap string and the `call_ref`
+// pushed `(ref $string)` into the i32 parameter its own functype declares — INVALID WASM, from
+// two ordinary lines, `vl check` clean, in EVERY function-value shape below. Only the VARIABLE
+// spelling `f(k)` escaped (an atom local already holds the id), which is why #1217 — which
+// fixed the PARAMETER-token half of the same family — left this half live.
+//
+// The seed cannot come from the `$fnsig` KEY: a litunion param's token is `i`, DELIBERATELY
+// identical to a plain `i32` param's, because their valtypes are identical and the key exists
+// to make two functions share a `$fnsig` exactly when their functypes byte-match. Measured, not
+// assumed — `(K) => i32` and `(i32) => i32` both key `i>i`. So it comes from the callee's
+// CHECKER type (`cloCallParamLitUnion`).
+//
+// The FACTORY-RETURN rows are the opposite polarity of the same disagreement and needed the
+// THIRD `$fnsig` producer fixed: `sigKeyOfTy` rendered a litunion-alias PARAM with
+// `tyToEmitName`, which softens `K` to `string` (the print-widening name), so the key read
+// `S>i` while the callee interned `i>i` — the `ref.cast` demanded a string-parameter functype
+// over an i32-parameter callee. Its own RETURN leg had preserved the alias since it was
+// written; the param leg never did.
+//
+// THE INLINE CONTROLS AT THE END ARE LOad-BEARING. An inline `"a" | "b"` param really IS a
+// string (`canonEmitName` softens it — the param position is outside `litUnionPreserve`'s
+// ELEM/FIELD/MAP_VAL/FN_RES set), and those programs work by pushing the string. Both fixes are
+// therefore gated on ARENA-INDEX identity (`unionAliasDeclNameOfTy`), never on
+// `litUnionAliasNameOfTy` — that one falls back to matching the member-literal SET, so in a
+// program that also declares `type K = "a" | "b"` it names the inline spelling "K" as well and
+// would turn these two working rows into invalid wasm.
+
+// @log 1
+// @log 2
+// @log b
+// @log 1
+// @log a
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 0
+// @log 2
+// @log 2
+// @log 12
+// @log 1
+// @log 4
+// @log 1
+// @log 4
+// @log 1
+
+type K = "a" | "b"
+type J = "x" | "y"
+
+function pick(v: K): i32 {
+  if v == "a" { return 1 }
+  return 2
+}
+function idk(v: K): K {
+  return v
+}
+function pickN(v: K | null): i32 {
+  if v == null { return 0 }
+  if v == "a" { return 1 }
+  return 2
+}
+
+// (1) an annotated binding over a NAMED callee — the headline cell
+const f1: (K) => i32 = pick
+print(f1("a")) // 1
+print(f1("b")) // 2
+
+// (2) a litunion RESULT as well as parameter
+const f2: (K) => K = idk
+print(f2("b")) // b
+
+// (3) a LAMBDA rather than a named function
+const f3: (K) => i32 = (v) => {
+  if v == "a" { return 1 }
+  return 2
+}
+print(f3("a")) // 1
+
+const f3r: (K) => K = (v) => {
+  return v
+}
+print(f3r("a")) // a
+
+// (4) through a higher-order PARAM position
+function use(g: (K) => i32) {
+  print(g("a")) // 1
+}
+use(pick)
+
+// (5) a struct FIELD closure
+type H = { h: (K) => i32 }
+const hh: H = { h: pick }
+print(hh.h("a")) // 1
+
+// (6) a closure-ARRAY element
+const fs: ((K) => i32)[] = [pick]
+print(fs[0]("a")) // 1
+
+// (7) a LOCAL binding
+function localBinding() {
+  const f: (K) => i32 = pick
+  print(f("a")) // 1
+}
+localBinding()
+
+// (8) the FACTORY RETURN — the third `$fnsig` producer. BOTH argument spellings were broken
+// here on master: the literal trapped on the `ref.cast`, the variable failed validation.
+function mk(): (K) => i32 {
+  return pick
+}
+const g = mk()
+const kv: K = "a"
+print(g(kv))  // 1
+print(g("a")) // 1
+
+// (9) the `K | null` NICHE param — the atom id for a member, the `-1` sentinel for null
+const fn1: (K | null) => i32 = pickN
+print(fn1(null)) // 0
+print(fn1("b"))  // 2
+const kn: K | null = "b"
+print(fn1(kn))   // 2
+
+// (10) a litunion beside OTHER param kinds, in both orders, and two DISTINCT litunions
+function both(s: string, v: K): i32 {
+  if v == "a" { return s.length }
+  return s.length + 10
+}
+const f4: (string, K) => i32 = both
+print(f4("xy", "b")) // 12
+
+function bothRev(v: K, s: string): i32 {
+  if v == "a" { return s.length }
+  return s.length + 10
+}
+const f5: (K, string) => i32 = bothRev
+print(f5("a", "z")) // 1
+
+function two(v: K, w: J): i32 {
+  if v == "a" {
+    if w == "x" { return 1 }
+    return 2
+  }
+  if w == "x" { return 3 }
+  return 4
+}
+const f6: (K, J) => i32 = two
+print(f6("b", "y")) // 4
+
+// ── CONTROLS: these worked on master and MUST keep working ──────────────────────────────
+// An INLINE litunion param reached through the arena route (a factory return). Its param is a
+// STRING; keying the atom for it is the over-claim the index-identity gate exists to refuse.
+function pick2(v: "a" | "b"): i32 {
+  if v == "a" { return 1 }
+  return 2
+}
+function mk2(): ("a" | "b") => i32 {
+  return pick2
+}
+const g2 = mk2()
+print(g2("a")) // 1
+
+// A plain-i32 closure call whose argument merely CONTAINS a string literal — the seed must not
+// leak into it.
+function lenOf(s: string): i32 {
+  return s.length
+}
+function inc(v: i32): i32 {
+  return v + 1
+}
+const gi: (i32) => i32 = inc
+print(gi(lenOf("xyz"))) // 4
+
+// A `string` param taking a literal that is ALSO a member of `K`.
+const gs: (string) => i32 = lenOf
+print(gs("a")) // 1
