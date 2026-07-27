@@ -5795,35 +5795,40 @@ function nameToTyReal(name: string) {
   // poisons the annotation, like the array arm's element: the -1 sentinel stored
   // in `objFieldTypes` is read back by every consumer that indexes `T.tys` by a
   // field type, and the ones that assume resolution succeeded CRASH on it.
-  if nlen >= 2 {
-    if name[0] == '{' && name[nlen - 1] == '}' {
-      const fnames: string[] = []
-      const ftys: i32[] = []
-      // The fields are the top-level commas of the brace's INTERIOR — scanned from
-      // index 1, so the opening `{` is not counted and the field commas sit at depth
-      // 0; the run ends at the closing brace rather than at the end of the name.
-      let fstart = 1
-      let fgoing = true
-      while fgoing {
-        let fend = tyTopIndexOf(name, ',', 0, fstart)
-        if fend < 0 {
-          fend = nlen - 1
-          fgoing = false
-        }
-        const field = name.slice(fstart, fend)
-        if field.length > 0 {
-          const colonAt = tyTopIndexOf(field, ':', 0, 0)
-          if colonAt > 0 {
-            const fdTy = nameToTy(field.slice(colonAt + 1, field.length))
-            if fdTy < 0 { return -1 }
-            fnames.push(field.slice(0, colonAt))
-            ftys.push(fdTy)
-          }
-        }
-        fstart = fend + 1
+  //
+  // The WIDE brace-endpoint span at its home below (`nameIsBraceSpanEnds`): the `nlen >= 2`
+  // bound this arm hoisted to an enclosing block IS that home's own first line, so the two
+  // nested `if`s collapse into one call. The WIDTH is what this arm needs and the reason it
+  // is not `nameIsShapeOpen`: a map name also opens `{` and ends `}`, and reaches here only
+  // when the map arm ABOVE has already declined it (a non-string key, or a key that never
+  // closes) — at which point falling into the field split is exactly master's behaviour.
+  if nameIsBraceSpanEnds(name) {
+    const fnames: string[] = []
+    const ftys: i32[] = []
+    // The fields are the top-level commas of the brace's INTERIOR — scanned from
+    // index 1, so the opening `{` is not counted and the field commas sit at depth
+    // 0; the run ends at the closing brace rather than at the end of the name.
+    let fstart = 1
+    let fgoing = true
+    while fgoing {
+      let fend = tyTopIndexOf(name, ',', 0, fstart)
+      if fend < 0 {
+        fend = nlen - 1
+        fgoing = false
       }
-      return mkObjTy(fnames, ftys)
+      const field = name.slice(fstart, fend)
+      if field.length > 0 {
+        const colonAt = tyTopIndexOf(field, ':', 0, 0)
+        if colonAt > 0 {
+          const fdTy = nameToTy(field.slice(colonAt + 1, field.length))
+          if fdTy < 0 { return -1 }
+          fnames.push(field.slice(0, colonAt))
+          ftys.push(fdTy)
+        }
+      }
+      fstart = fend + 1
     }
+    return mkObjTy(fnames, ftys)
   }
   // A live type-parameter BINDING (a generic function's `<T>` while its
   // annotations resolve via `resolveAnnot`, or a generic alias application's
@@ -5833,27 +5838,15 @@ function nameToTyReal(name: string) {
   // A generic alias APPLICATION `Box<i32>` / `Pair<i32,string>` — the parser
   // folds the arguments into the synthetic name; substitute them into the
   // declared body (A10 stage 3).
-  if nlen >= 3 {
-    if name[nlen - 1] == '>' {
-      let ltAt = -1
-      let gj = 0
-      let ggoing = gj < nlen
-      while ggoing {
-        if name[gj] == '<' {
-          ltAt = gj
-          ggoing = false
-        } else {
-          gj = gj + 1
-          ggoing = gj < nlen
-        }
-      }
-      if ltAt > 0 {
-        return applyGenAlias(
-          name.slice(0, ltAt),
-          name.slice(ltAt + 1, nlen - 1),
-        )
-      }
-    }
+  //
+  // The GENERIC-APPLICATION SPAN at its home below (`annGenAppSpanEnds`) — the `nlen >= 3`
+  // cheap reject, the trailing-`>` compare and the `lt > 0` scan, in that order, which is the
+  // order this arm's three nested `if`s already ran them in. A name failing ANY of the three
+  // fell through to `declaredTyOfName` before and still does; the arm's hand-rolled
+  // first-`<` loop is `gaeLtAt`, re-asked here for the two slices.
+  if annGenAppSpanEnds(name) {
+    const ltAt = gaeLtAt(name)
+    return applyGenAlias(name.slice(0, ltAt), name.slice(ltAt + 1, nlen - 1))
   }
   declaredTyOfName(name)
 }
@@ -7105,8 +7098,17 @@ function aliasRefIsPlainName(spell: string) {
       (c >= '0' && c <= '9') ||
       c == '_'
     if !identCh {
+      // The run ended on something other than an identifier character: only a `<` can
+      // continue a plain reference, and then the GENERIC-APPLICATION SPAN at its home below
+      // decides whether its argument list closes the WHOLE spelling. Routing the tail test
+      // there is exact, not merely similar: everything before `i` is an identifier character
+      // and so cannot be a `<`, which makes `gaeLtAt(spell) == i`, and `i >= 1` makes it
+      // positive — so the home's two extra conjuncts are already established here, and its
+      // `n < 3` reject only fires where this test's own `spell[1] == '<' != '>'` already
+      // answered false. It re-scans for the `<` this loop just found; that costs one bounded
+      // pass, on an alias body that already ended in `>`.
       if c != '<' { return false }
-      return spell[spell.length - 1] == '>'
+      return annGenAppSpanEnds(spell)
     }
     i = i + 1
   }
@@ -7362,23 +7364,11 @@ function numLitUnionAliasName(name: string) {
 // The head is checked against the generic-alias registry (`gaIndexOf`) rather than being
 // taken on the spelling's word, so an unrelated name that merely ends in `>` never matches.
 function nameIsGenAppOfDecl(name: string) {
-  const n = name.length
-  if n < 3 { return false }
-  if name[n - 1] != '>' { return false }
-  let lt = -1
-  let i = 0
-  let going = i < n
-  while going {
-    if name[i] == '<' {
-      lt = i
-      going = false
-    } else {
-      i = i + 1
-      going = i < n
-    }
-  }
-  if lt <= 0 { return false }
-  gaIndexOf(name.slice(0, lt)) >= 0
+  // The whole spelling test — `n < 3`, the trailing `>`, the hand-rolled first-`<` loop and
+  // its `lt <= 0` reject — is `annGenAppSpanEnds` at its home below, in that same order. Only
+  // the REGISTRY lookup is this function's own, and it takes the head cut from `gaeLtAt`.
+  if !annGenAppSpanEnds(name) { return false }
+  gaIndexOf(name.slice(0, gaeLtAt(name))) >= 0
 }
 
 // The STRUCTURAL emit name of a generic-alias APPLICATION standing as one member of a
@@ -7816,8 +7806,14 @@ function canonEmitNameAt(name: string, ctx: i32) {
   }
   // A residual negation (only meaningful under `&`) — leave for the emitter.
   if name[0] == '!' { return name }
-  // An inline `{…}` shape: canon its field/value types.
-  if name[0] == '{' && name[name.length - 1] == '}' {
+  // An inline `{…}` shape: canon its field/value types. The WIDE brace-endpoint span at its
+  // home below (`nameIsBraceSpanEnds`) — WIDE deliberately, because `canonShapeName` handles
+  // a MAP name too (it takes the map branch on `{[`), so tightening to `nameIsShapeOpen`
+  // would leave every `{[string]:V}` annotation's VALUE type un-canonicalized. The home's
+  // `length >= 2` bound is implied, not added: the `name[0]` reads above already require a
+  // character, and on a ONE-character name `name[0]` and `name[length - 1]` are the same
+  // character, which cannot be both `{` and `}`.
+  if nameIsBraceSpanEnds(name) {
     const shp = canonShapeName(name)
     // Every separator sits inside the braces — one atom. Set rather than inherited: the
     // field recursions inside `canonShapeName` left their own widths behind.
@@ -12065,18 +12061,12 @@ function checkProgramNode(n: Program) {
       // skips it (its `cUserTypes` lookup misses); each application resolves
       // its fields under the param→argument bindings (`applyGenAlias`).
       const gname = sd0.tdName
-      let gLt = -1
-      let gk = 0
-      let gGoing = gk < gname.length
-      while gGoing {
-        if gname[gk] == '<' {
-          gLt = gk
-          gGoing = false
-        } else {
-          gk = gk + 1
-          gGoing = gk < gname.length
-        }
-      }
+      // The GENERIC-APPLICATION grammar's `<`-SCAN at its home below, and ONLY the scan:
+      // this is a DECLARATION, so there is no span to test — the closing `>` is the
+      // parameter-list cut's business two lines down, and asking `annGenAppSpanEnds` here
+      // would be a tightening (it would also demand a trailing `>` before the registry
+      // entry exists).
+      const gLt = gaeLtAt(gname)
       if gLt > 0 {
         gaNames.push(gname.slice(0, gLt))
         gaDeclIxs.push(stmts[t0])
@@ -14768,8 +14758,13 @@ function isScalarListRetName(nm: string) {
 // `TyObj`. The emitter resolves it to a concrete union variant (a collapsed `.map` callback
 // return) via field-set match. A nullable `{…}?` / union `{…} | {…}` is NOT a single shape.
 function isObjShapeName(nm: string) {
-  if nm.length < 2 { return false }
-  if nm[0] != '{' || nm[nm.length - 1] != '}' { return false }
+  // The WIDE brace-endpoint span at its home below (`nameIsBraceSpanEnds`) — the fully
+  // De-Morganed `nm.length < 2 || nm[0] != '{' || nm[len - 1] != '}'` guard is that home
+  // negated, conjunct for conjunct, over the two `if`s master spread it across. It must
+  // stay WIDE: a `TyMap` renders `{[string]:i32}`, which this function accepts today (the
+  // `|` walk below does not reject it either), and tightening to `nameIsShapeOpen` would
+  // change that answer — a behaviour change owing its own evidence, not this refactor's.
+  if !nameIsBraceSpanEnds(nm) { return false }
   // Reject a brace that is actually part of a larger composite (`{…} | {…}`, `{…}?`): a
   // single shape has no TOP-LEVEL `|`.
   //
@@ -16774,13 +16769,13 @@ export function listElemNameOf(name: string) {
   elem
 }
 
-// ── the SHAPE-NAME grammar: `nameIsShapeOpen` OPENS it ────────────────────────────────
+// ── the BRACE grammar: `nameIsShapeOpen` OPENS a shape, `nameIsBraceSpanEnds` SPANS ANY ──
 //
-// **THE OPENER MOVED DOWN HERE FROM `emit_base.vl` (D-SHAPEDOWN);** its SPAN layer
-// (`nameIsShapeSpanEnds`) stays up there because no site in this file asks it. THE ONE HOME
-// of the inline-object-shape OPENER: does `name` start an inline struct shape (`{x:i32}`)
-// rather than a map shape (`{[string]:i32}`) — the `length >= 2 && name[0] == '{' &&
-// name[1] != '['` triple.
+// **THE OPENER MOVED DOWN HERE FROM `emit_base.vl` (D-SHAPEDOWN);** the WIDE SPAN followed
+// it (D-BRACEDOWN, below), and only the CONJUNCTION of the two (`nameIsShapeSpanEnds`) stays
+// up there, because no site in this file asks for it. THE ONE HOME of the inline-object-shape
+// OPENER: does `name` start an inline struct shape (`{x:i32}`) rather than a map shape
+// (`{[string]:i32}`) — the `length >= 2 && name[0] == '{' && name[1] != '['` triple.
 //
 // Censused STRUCTURALLY over comment-stripped source (char bindings resolved — every real
 // scanner binds the char first, so a detector anchored on `name[0] == '{'` alone reads
@@ -16807,15 +16802,49 @@ export function listElemNameOf(name: string) {
 // that spelling is not a wider predicate — it is the same predicate plus a latent trap, and
 // routing it here is equivalence-preserving on every input that does not already crash.
 //
-// **THIS FILE'S OTHER THREE `{`…`}` TESTS ARE NOT THIS PREDICATE AND ARE DELIBERATELY LEFT
-// ALONE** (`nameToTyReal`'s inline-object arm, `canonEmitName`'s shape arm,
-// `isObjShapeName`): each is `name[0] == '{' && name[len - 1] == '}'` WITHOUT the
-// `name[1] != '['` conjunct, so each ACCEPTS a map name. Routing them here would blind the
-// checker to map-valued shapes. The two that REQUIRE `name[1] == '['` — the complement, not
-// this — are the MAP-NAME grammar's, and they now have the home below.
+// **THIS FILE'S OTHER THREE `{`…`}` TESTS ARE NOT THIS PREDICATE** (`nameToTyReal`'s
+// inline-object arm, `canonEmitName`'s shape arm, `isObjShapeName`): each is
+// `name[0] == '{' && name[len - 1] == '}'` WITHOUT the `name[1] != '['` conjunct, so each
+// ACCEPTS a map name, and routing them HERE would blind the checker to map-valued shapes.
+// D-MAPSPELL left them alone for exactly that reason; they are the WIDE span's, and it is
+// now directly below. The two that REQUIRE `name[1] == '['` — the complement, not this —
+// are the MAP-NAME grammar's, further down.
 export function nameIsShapeOpen(name: string) {
   if name.length < 2 { return false }
   name[0] == '{' && name[1] != '['
+}
+// THE ONE HOME of the WIDE BRACE ENDPOINT span: `length >= 2`, a `{` at index 0, and a `}` as
+// the final character — WITHOUT the `name[1] != '['` conjunct, so it accepts a MAP name as
+// well as a shape. Carved out in `emit_base.vl` by D-GRAMPRED (#1222) and **moved down here
+// (D-BRACEDOWN) for the reason its own header predicted and #1224 then proved impossible to
+// discharge from above**: that header offered the three copies in THIS file a route to
+// `emit_base`, and `emit_base.vl` imports THIS module, so the route would have cycled the
+// module graph. Inverting the home's LOCATION is what makes the route legal — the same move
+// the PAREN / ARRAY / SHAPE-OPEN grammars already took. `emit_base.vl` keeps publishing the
+// name (one `export … from` line), so `emit_classify`'s two callers compile untouched.
+//
+// The brace family is now four predicates over `length >= 2` names opening with `{`:
+//
+//   * `nameIsShapeOpen`             — OPEN · NOT2ND                        (above)
+//   * `nameIsMapOpen`               — OPEN · 2ND       — the complement    (below)
+//   * `nameIsBraceSpanEnds`         — OPEN · CLOSE     — this home
+//   * `emit_base.nameIsShapeSpanEnds` — the first ANDed with this one
+//
+// **THIS IS NOT `nameIsShapeSpanEnds` AND NOT `emit_classify.nameIsWholeSpanShape`.** It is
+// the WIDEST of them: it accepts `{[string]:i32}`, which the other two reject, and
+// `{a:{b:i32}}|{c:i32}`, which `nameIsWholeSpanShape`'s balance walk rejects. Tightening a
+// caller from this home to either of the others is a behaviour change owing its own graded
+// population, not a refactor — and all three of this file's routed sites WANT the width:
+// `nameToTyReal`'s arm is reached only after the map arm above it has declined, and
+// `canonEmitName` / `isObjShapeName` both hand a map name on to a shape walk deliberately.
+//
+// #1222's header named FIVE copies outside its partition (`emit_classify` ×2, `typecheck`
+// ×3). **The `emit_classify` two were routed by #1223** and the file no longer contains a
+// `'}'` character literal at all; the three here are the whole remainder, and this move takes
+// them. The predicate reaches ZERO hand-written copies tree-wide with this slice.
+export function nameIsBraceSpanEnds(name: string) {
+  if name.length < 2 { return false }
+  name[0] == '{' && name[name.length - 1] == '}'
 }
 
 // ── the MAP-NAME grammar: `{[K]:V}` — OPEN, SPAN, and the KEY/VALUE CUT ───────────────
@@ -16836,20 +16865,16 @@ export function nameIsShapeOpen(name: string) {
 // depth home instead. (`mapShapeKeyName` is gone: it WAS `mapSpellKeyName`, character for
 // character, and its one caller now says so.)
 //
-// **A FOURTH COPY LIVES IN `emit_base.vl` AND IS NOT DELETABLE FROM HERE.** `nameIsMapOpen`
-// there is this file's `nameIsMapOpen`, and `mapValNameOf` there is `mapSpellValName` with a
-// DIFFERENT span rule — it gates on `nameIsMap` (opens `{[`, does not end `[]`) where this
-// one gates on a closing `}`, so it ACCEPTS `{[string]:i32}|null` and returns the garbled
+// **THE FOURTH COPY IN `emit_base.vl` IS NOW GONE TOO (D-MAPOPENDOWN).** Its `nameIsMapOpen`
+// was this file's `nameIsMapOpen`, line for line, so D-MAPSPELL's own hand-off — recorded here
+// as a checklist for whoever next owned that file — has been discharged: the definition is
+// deleted and `emit_base.vl` republishes THIS one, which is what makes `emit_classify` and
+// `emit_collect` compile untouched. `mapValNameOf` there STAYS: it is `mapSpellValName` with a
+// DIFFERENT span rule — it gates on `nameIsMap` (opens `{[`, does not end `[]`) where this one
+// gates on a closing `}`, so it ACCEPTS `{[string]:i32}|null` and returns the garbled
 // `"i32}|nul"` that its own callers strip for (see `emit_collect.vl:2535`). The two are NOT
-// interchangeable and must not be merged by eyeball. `emit_base.vl` imports from this
-// module, so the down-move that deletes its pair (the D-ARRDOWN / D-SHAPEDOWN move, applied
-// to the map grammar) is a one-line-per-site edit in a file this slice may not touch.
-// TWO COMMENTS THERE GO STALE WITH THIS CHANGE and are the down-move's checklist:
-// `nameIsMapOpen`'s header names "`typecheck.nameToTyReal`'s map arm and
-// `typecheck.mapShapeKeyName`" as the copies to re-derive — both are gone, and this family
-// is what they became; and `mapValNameOf`'s header cites a `typecheck.vl parseMapName` that
-// has not existed for many merges. Neither can reach codegen; both are recorded here so the
-// next slice to own `emit_base.vl` does not have to find them.
+// interchangeable and must not be merged by eyeball; its header, which used to cite a
+// `typecheck.vl parseMapName` that has not existed for many merges, now says so.
 //
 // THE ONE HOME of the MAP-NAME OPENER: a `{` at index 0 whose NEXT character is `[`. Over
 // the `length >= 2` names that open with `{` this is the exact COMPLEMENT of
@@ -16914,6 +16939,65 @@ export function mapSpellValName(name: string) {
   if ke < 0 { return "" }
   const v = name.slice(ke + 2, name.length - 1)
   v
+}
+
+// ── the GENERIC-APPLICATION grammar: `gaeLtAt` FINDS the `<`, `annGenAppSpanEnds` SPANS ──
+//
+// **BOTH HOMES MOVED DOWN HERE FROM `emit_base.vl` (D-GENAPPDOWN)**, the same inversion the
+// PAREN / ARRAY / SHAPE / BRACE grammars took and for the same reason: the CHECKER asks both
+// questions, `emit_base.vl` imports THIS module, and a route upward would cycle the module
+// graph. `emit_base.vl` keeps publishing both names, so `emit_collect`'s four call sites and
+// `emit_classify`'s two compile untouched.
+//
+// The spelling is the parser's: `parseTypeName` folds a generic's arguments into the declared
+// name, so a DECLARATION is `Box<T>` / `Pair<A,B>` and an APPLICATION is `Box<i32>` — one
+// concatenation, and every property this family relies on is a property of it. The head is an
+// identifier run, so the FIRST `<` is the head's right edge; the argument list is the rest,
+// and it closes the name.
+//
+// **THE `<`-SCAN AND THE SPAN ARE TWO PREDICATES, NOT ONE, AND THIS FILE ASKED FOR BOTH
+// SEPARATELY.** Censused structurally over the `'<'` / `'>'` character literals (13 and 12
+// tree-wide), this file carried the `<`-scan written out as a hand-rolled `let/while/flag`
+// loop THREE times — `nameToTyReal`'s application arm, `nameIsGenAppOfDecl`, and pass 0a's
+// generic-declaration registration — and TWO of those three wrapped it in the full span
+// triple (`length >= 3`, a final `>`, `lt > 0`). Pass 0a is the site that proves the split is
+// real: it registers a DECLARATION, where the `<` is all it wants and the trailing `>` is
+// re-read later by the parameter-list cut, so routing it to the span would have been a
+// tightening, not a dedup.
+//
+// THE ONE HOME of the `<`-scan: the position of the first `<` in `name`, or -1. A positive
+// result marks a generic declaration or application name; index 0 does not (a name whose
+// FIRST character is `<` has no head, so every caller gates on `> 0`, never `>= 0`).
+export function gaeLtAt(name: string) {
+  let i = 0
+  while i < name.length {
+    if name[i] == '<' { return i }
+    i = i + 1
+  }
+  -1
+}
+// THE ONE HOME of the GENERIC-APPLICATION SPAN test: a name whose FINAL character is `>` and
+// which has a `<` at a positive index — `Box<i32>`, `Pair<K, V>`. The TEST half of the
+// `Head<…>` grammar, split out from `emit_base.annGenAppDecompose` because callers want only
+// the boolean and their own cut, not the split argument list.
+//
+// The `>` compare stays in FRONT of `gaeLtAt`'s scan, exactly as the inline spellings had it:
+// running a whole-name scan on every annotation that plainly does not end in `>` would be a
+// work regression. `gaeLtAt(ann) > 0` implies `ann.length >= 2`, so the final-character read
+// below is in bounds for every name that reaches it, and the `n < 3` cheap reject is kept as
+// the fast path it always was — `lt > 0` plus a trailing `>` already forces `n >= 3`, so it
+// decides nothing.
+//
+// The two routed sites in this file re-ask `gaeLtAt` for their own head/argument slices
+// rather than threading the index out of the test. That is the trade `annGenAppDecompose` and
+// `emit_classify.gaeEnsure` already take, and it costs a second scan only on a name that
+// already ended in `>` — every other name is rejected by the character compare before either
+// scan runs.
+export function annGenAppSpanEnds(ann: string) {
+  const n = ann.length
+  if n < 3 { return false }
+  if ann[n - 1] != '>' { return false }
+  gaeLtAt(ann) > 0
 }
 
 // The value-atom kind of a NICHE-nullable scalar-element LIST member name —

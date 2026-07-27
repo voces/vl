@@ -27667,3 +27667,197 @@ two files.
   `{[string]:i32}|null`, for which it returns the garbled `"i32}|nul"` its own callers strip
   around; `mapSpellValName` gates on a closing `}`. Merging them by eyeball is a behaviour
   change in the emitter, and the emitter is not this partition.
+
+---
+
+## D-BRACEDOWN + D-GENAPPDOWN + D-MAPOPENDOWN — the down-move D-MAPSPELL proved was the only legal route: three grammars change MODULE, seven checker copies die, and the emitter's last complete duplicate home goes with them (off master `47f72d2`)
+
+D-MAPSPELL's closing finding was a location one: `typecheck.vl` hand-writes grammars that
+already have perfectly-shaped homes in `emit_base.vl`, and **not one of those homes can ever be
+called from there**, because `emit_base.vl` imports `typecheck.vl` and the edge is one-way. It
+filed the consequence as two groups it declined to ship. This slice ships them, by the route
+that record named: **invert the home's LOCATION**, exactly as D-PARENDOWN, D-ARRDOWN and
+D-SHAPEDOWN already had for the paren, array and shape-opener grammars.
+
+### The census, re-derived structurally
+
+Comment-stripped, over the CHARACTER LITERALS rather than over names, tree-wide at `47f72d2`:
+
+| character test | tree-wide | of which a name-shape question outside a home |
+|---|---|---|
+| `== '}'` / `!= '}'` | 16 | **3**, all in `typecheck.vl` |
+| `== '<'` / `!= '<'` | 13 | **4** (3 in `typecheck.vl`, 1 in `driver.vl`) |
+| `== '>'` / `!= '>'` | 12 | **3** (2 in `typecheck.vl`, 1 the `driver`/`emit_sections` scans) |
+
+The rest are lexer/format source-TEXT scanners, this program's own depth ladders
+(`c == '{' || c == '[' || c == '('` — membership in a walk, not a name-shape question), and the
+`=>` arrow grammar, which is a different family.
+
+**THE BRIEF'S TWO SITE COUNTS ARE BOTH REFUTED, IN OPPOSITE DIRECTIONS.** It carried
+"`nameIsBraceSpanEnds`, ~6 sites" and "`annGenAppSpanEnds` and friends, ~7 sites". The brace-span
+endpoint predicate is written out **3** times, not 6 — and the reason is worth recording, because
+it is a stale hand-off of exactly the kind this program keeps finding: **`nameIsBraceSpanEnds`'s
+own header still named five copies (`emit_classify` ×2, `typecheck` ×3), and #1223 routed the
+`emit_classify` two.** That file no longer contains a `'}'` character literal at all. The
+generic-application family is **3 sites** carrying **5** occurrences of two DIFFERENT predicates,
+plus a fourth site whose tail test is the span asked of an identifier run — 4 in total, not 7.
+
+### The two predicates the generic-application family turns out to be
+
+The `<`-scan and the span are not one question, and the site that proves it is the one a
+name-based census would never have looked at twice:
+
+* **`gaeLtAt`** — the position of the first `<`, or -1. Written out as a hand-rolled
+  `let lt = -1 / let i = 0 / let going = i < n / while going { … }` loop **3 times**
+  (`nameToTyReal`'s application arm, `nameIsGenAppOfDecl`, and pass 0a's generic-DECLARATION
+  registration). ~11 lines each, character for character the same loop.
+* **`annGenAppSpanEnds`** — that plus `length >= 3` and a final `>`. Two of the three sites wrap
+  the scan in it; **pass 0a does not, and must not.** It registers a DECLARATION, where the `<`
+  is the whole question and the closing `>` is the parameter-list cut's business two lines later.
+  Routing it to the span would have been a tightening dressed as a dedup.
+
+### Where the homes went, and why not somewhere else
+
+`typecheck.vl`. The alternatives were measured, not assumed:
+
+* **`ast.vl`** is the semantically "right" home — these grammars are properties of ONE
+  concatenation in `parser.vl`, and `ast.vl` is a leaf. But the grammars are built on
+  `tyGroupEndIndex` / `tyTopIndexOf` / `tyGtIsClose`, which live in `typecheck.vl`; moving two
+  grammars to `ast.vl` without the walks splits the family across two modules, and moving the
+  walks too churns six emitter modules' import lists — files three other slices hold.
+* **`check_state.vl`** is a declarations-only LSP state sidecar. Wrong semantics, and `emit_base`
+  does not import it.
+* **A NEW shared module** (`tyname.vl`) is where this family eventually belongs, and this slice
+  says so rather than pretending otherwise. It is not shippable as a one-slice change for the same
+  reason: it is only an improvement if it takes ALL ELEVEN grammars and the three walks at once,
+  which is a cross-partition edit. **Filed as the family's endgame, with the precondition stated:
+  one slice must own `typecheck.vl` + the six emitter modules simultaneously.**
+
+So the home lands where the other eight already are. "A name-grammar predicate in the CHECKER" is
+an odd layering read alone; read as "the checker is the lowest module both sides can reach", it is
+the only DAG-preserving answer available today, and the file already says so in eight headers.
+
+### What shipped
+
+Seven hand-written copies deleted, three homes relocated, one COMPLETE duplicate home deleted:
+
+| # | site | was | now |
+|---|---|---|---|
+| 1 | `nameToTyReal` inline-object arm | `if nlen >= 2 { if name[0] == '{' && name[nlen-1] == '}' {` | `if nameIsBraceSpanEnds(name) {` |
+| 2 | `canonEmitName` shape arm | the same conjunction, bound implied | one call |
+| 3 | `isObjShapeName` | the fully De-Morganed two-`if` guard | one call |
+| 4 | `nameToTyReal` application arm | `nlen >= 3` + final `>` + 11-line scan + `ltAt > 0` | `annGenAppSpanEnds` + `gaeLtAt` |
+| 5 | `nameIsGenAppOfDecl` | the same triple, 18 lines | 2 lines |
+| 6 | pass 0a generic registration | the 11-line scan alone | `gaeLtAt` alone |
+| 7 | `aliasRefIsPlainName` tail | `return spell[spell.length-1] == '>'` | `annGenAppSpanEnds(spell)` |
+
+Site 7 is the one that needed an argument rather than a diff. At that point the walk has proved
+every character before `i` is an identifier character — none of which is `<` — so
+`gaeLtAt(spell) == i`, and `i >= 1` makes it positive. Both of the home's extra conjuncts are
+already established, and its `n < 3` reject only fires where the site's own compare
+(`spell[1] == '<'`, which is not `'>'`) already answered false. The routing is exact, not similar;
+it costs one bounded re-scan on an alias body that already ended in `>`.
+
+**And the emitter's `nameIsMapOpen` went too (D-MAPOPENDOWN).** D-MAPSPELL gave the checker its
+own map grammar and recorded, at the new home, that this left `emit_base.vl` holding a SECOND
+complete home of an identical two-line predicate. That is the duplication rule's clearest case —
+never a complete home — and the fix is one deletion plus one name on the re-export line. Both
+stale comments that record named are corrected: `nameIsMapOpen`'s header (which named two
+`typecheck.vl` copies #1224 deleted) and `mapValNameOf`'s (which cited a `parseMapName` that has
+not existed for many merges, and which now states the SPAN difference that makes it a genuine
+second predicate rather than a copy).
+
+`emit_base.vl` republishes all four names on its existing `export … from "./typecheck"` line, so
+`emit_classify`'s and `emit_collect`'s ten call sites compile untouched. Eleven grammars now live
+one module down; seven did before.
+
+### Counts
+
+**−7 hand-written copies (6 sites + 1 complete duplicate home) · named resolver calls 20 → 29
+(+9) · −428 B.** The binary shrinks because three ~11-line scan loops become three calls.
+
+### Grading — every zero, and two thin margins turned into fixtures
+
+Twelve compilers were built, each with ONE sabotage, and each swept over all 1,502 corpus files
+comparing check rc + diagnostic, build rc, **wasm sha256**, run rc and **run stdout**. The
+inverted control (`CONTROL`, pristine) reads 0/1502, which is what makes the rest readable.
+
+| sabotage | corpus files changed |
+|---|---|
+| CONTROL (pristine) | **0** / 1502 |
+| `nameToTyReal` brace arm inverted | 259 |
+| `canonEmitName` brace arm inverted | 183 |
+| `isObjShapeName` inverted | 38 |
+| `nameToTyReal` genapp arm inverted | 118 |
+| `nameIsGenAppOfDecl` inverted | 4 |
+| pass 0a `gaeLtAt` negated | 323 |
+| `aliasRefIsPlainName` tail inverted | 3 |
+| **W1** `nameIsBraceSpanEnds` TIGHTENED to the shape opener | 3 |
+| **W2** `nameIsBraceSpanEnds` loses its closing-`}` conjunct | 31 |
+| **W3** `gaeLtAt` returns the LAST `<` | 2 |
+| **W4** `annGenAppSpanEnds` loses its trailing-`>` conjunct | **1** |
+
+Every routed site is live; no zero to grade. W1 is the WIDTH claim measured rather than asserted —
+tightening the brace span to `nameIsShapeOpen` is a live behaviour change on 3 corpus inputs, so
+the three routed sites keep the WIDE reading on evidence.
+
+**W4 at 1 and W3 at 2 are the finding.** A conjunct this slice concentrates into a single home
+was decided by one corpus file. Two fixtures were built to raise those margins, and **built
+empirically, because the obvious ones read SAME**: `Box<Pair<i32,string>>` does NOT catch the
+last-`<` reading (a nested application with no separator inside the brackets resolves through
+either cut), and `Box<i32>[]` does NOT catch the trailing-`>` reading (the ARRAY arm intercepts it
+before the application arm is reached). What does:
+
+* `Box<Box<i32 | null>>` — a nested application whose ARGUMENT is a union. **Catches W3.**
+* `type L<T> = { head: T, tail: L<T> | null }` — a recursive generic alias naming itself inside a
+  union member: a `<` at a positive index and no closing `>`. **Catches W4.**
+* `{[string]: Lit}` where `Lit` is a literal-union alias — a map value that actually
+  canonicalizes. **Catches W1**, where an `i32`-valued map does not: with a no-op canon every
+  reading agrees, so the first draft of that fixture was INSENSITIVE to the very sabotage it was
+  written for.
+
+The two fixtures together catch 6 of the 11 sabotages (B, F, G, W1, W3, W4); the other five are
+covered by 259 / 38 / 118 / 4 / 31 corpus files.
+
+### Refuted
+
+1. **"`nameIsBraceSpanEnds`, ~6 sites."** Three. Its own header's five-copy hand-off was two
+   merges stale: #1223 routed the `emit_classify` pair.
+2. **"`annGenAppSpanEnds` and friends, ~7 sites."** Three sites carrying five occurrences of TWO
+   predicates, plus one identifier-run tail. The `<`-scan and the span had to be separated before
+   any of them could be routed.
+3. **A `typecheck.vl` function reached from an annotation is not therefore reached through
+   `nameToTyReal`.** `Box<Pair<i32,string>>` survives a `gaeLtAt` that returns the LAST `<` —
+   D-PARSETY's spelling tree resolves an annotation from structure, so the application arm's live
+   population is not the one the source reads as obvious. Any future grading of that arm should
+   start from the sabotage, not from the annotations in the corpus.
+4. **A fixture written for a sabotage is not therefore sensitive to it.** The map fixture's first
+   draft used an `i32` map value and read SAME against the tightening it existed to catch. **Every
+   new fixture in this program should be run against the sabotage it claims to pin, before it is
+   committed** — the same discipline as an inverted control, applied to the fixture instead of to
+   the probe.
+
+### Hand-offs
+
+* **`driver.vl:modGenBase`** is a FOURTH `gaeLtAt` — the identical first-`<` scan with the head
+  slice folded in (`if name[i] == '<' { return name.slice(0, i) }`), plus `modGenParams` beside it,
+  which re-scans for the same `<` to start its ident-run walk. `driver.vl` imports `typecheck.vl`,
+  so the route is legal today and is a two-line edit; it was outside this slice's partition.
+* **`tyname.vl`**, the new shared module this family actually wants, with its precondition: one
+  slice owning `typecheck.vl` plus the six emitter modules at once. Nothing smaller improves on
+  the current arrangement, because anything smaller SPLITS the family.
+* **`emit_base.mapValNameOf` stays put** and now says why: it is `mapSpellValName` with a different
+  SPAN rule (`nameIsMap` vs a closing `}`), so it accepts `{[string]:i32}|null` and returns the
+  garbled `"i32}|nul"` its own callers strip around. Not a copy; not mergeable by eyeball.
+
+### Lessons
+
+* **A hand-off comment offering a route UP the import graph is never actionable as written.** Read
+  it as naming a DOWN-MOVE. `emit_base.vl`'s re-export header now says this in the file itself, so
+  the next reader does not have to re-derive the graph to find out the offer was void.
+* **A stale hand-off inflates the next slice's census.** Two of the three counts in this slice's
+  brief came from headers that were true when written and had been discharged since. Re-deriving
+  structurally cost ten minutes and moved both numbers.
+* **Build the fixture, then sabotage it.** An insensitive regression test is worse than none: it
+  reads green for the wrong reason forever. Two of this slice's three pinning shapes had to be
+  found by experiment after the obvious ones were measured and rejected.
