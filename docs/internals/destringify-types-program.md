@@ -25484,3 +25484,292 @@ as well. No fixture added, so a delta would have been a defect.
 * **`nameNeedsCanon`'s early-out was not touched.** It rejects 50.5% of the population and it is a
   character CLASS test, not a name-shape question — the same verdict #1193 recorded for its three
   `nameNeedsCanon` occurrences. Half the pass's speed lives there and none of its debt does.
+
+## P1 — the render POSITION is threaded through all three producers, and the phase is proved INERT (off master `eb1eb75`)
+
+Base `eb1eb75` (#1199). Partition: `compiler/typecheck.vl`, `compiler/check_query.vl`,
+`compiler/check_state.vl`, new fixtures, this append. `check_query.vl` / `check_state.vl` are
+**untouched** — nothing this phase needs lives in them. **No fixture was added**; the reason is
+measured below rather than asserted.
+
+This is P1 of the `renderEmit(ty, ctx)` design published one slice ago: *"add the position parameter
+to both renderers and to `canonEmitName`'s recursion, defaulted so every existing call site keeps its
+exact answer."* Nothing else was implemented — no arm routed, no policy read, no guard shipped. What
+follows is what P1 actually turned out to require (three things the design did not anticipate), and
+the proof that it changed nothing.
+
+### THE DESIGN SAID "ADD A PARAMETER". THE LANGUAGE AND THE PARTITION BOTH SAY OTHERWISE.
+
+**(1) VL HAS NO DEFAULT PARAMETERS, AND THE THREE PRODUCERS ARE CALLED FROM OUTSIDE THE PARTITION.**
+`function f(a: i32, b: i32 = 3)` is a **parse error** — `expected ) but found =` — verified, not
+assumed. And the three producers have callers this phase may not touch: `tyToEmitName` from
+`emit_classify.vl` (2), `tyToNominalName` from `emit_collect.vl` (3), `canonEmitName` from
+`emit_collect.vl` (3). So "defaulted so every existing call site keeps its exact answer" cannot be a
+default value; it has to be a **position-free ENTRY** that supplies `RC_ROOT` and delegates to a
+positioned body. P1 is therefore not one edit but three splits —
+`tyToEmitName` → `tyToEmitNameAt`, `tyToNominalName` → `tyToNominalNameAt`,
+`canonEmitName` → `canonEmitNameAt` — each entry a one-liner, each body carrying `ctx`. Every
+out-of-partition call site is untouched, which is also why the phase can be graded at all.
+
+**(2) A FULLY INERT PARAMETER CANNOT SHIP — THE COMPILER'S OWN SELF-LINT REJECTS IT.** `vl check`
+emits `Unused parameter \`ctx\` (prefix with \`_\` to suppress, or remove it)` as a **WARNING**, and
+`scripts/lint-self.sh` gates the compiler's source at `--severity info`. So the literal reading of
+"threaded but no consumer reads it" — a parameter that is passed and never mentioned — **fails the
+gate**. The `_ctx` escape exists and was refused: it declares the parameter *genuinely* unused, which
+is false, and P2 would have to rename every site back. The shape that does pass is the one the design
+actually wants: every `ctx` is READ, and read only to forward it or to compose the next position.
+**"Inert" here means no consumer reads `ctx` for a DECISION, not that `ctx` is unmentioned** — and
+that distinction is enforced by the compiler, not by taste.
+
+**(3) `canonShapeName` MUST NOT BE SPLIT, AND SPLITTING IT WOULD HAVE PRINTED A PHANTOM −1.**
+`canonShapeName` is one of #1141's 13 off-list scanners and has exactly one call site. Renaming it to
+`canonShapeNameAt` would have moved OFF-LIST **24 → 23** in the counter while deleting nothing at
+all. It keeps its name and its arity: it takes **no `ctx`**, because it OVERRIDES the position for
+everything it recurses into — a field is a field and a map value is a map value whatever the shape
+itself stands in — so the shape's own position never reaches a child.
+
+### THE VOCABULARY, AND THE ONE JUDGEMENT CALL IN IT
+
+Nine constants, powers of two, exactly one position bit per render plus one sticky bit:
+`RC_ROOT` 0 · `RC_UNION_MEM` 1 · `RC_NULLABLE` 2 · `RC_FIELD` 4 · `RC_ELEM` 8 · `RC_MAP_KEY` 16 ·
+`RC_MAP_VAL` 32 · `RC_FN_PARAM` 64 · `RC_FN_RES` 128. Bits rather than an enum because the rules
+these will state quantify over SETS of positions — O3's litunion is preserved in *a field, an
+element, a map value or a closure result*, which is one `&` against a bit union.
+
+**THE JUDGEMENT CALL: `RC_NULLABLE` IS STICKY ACROSS A UNION JOIN.** Structurally `A|B|null` is a
+`TyNullable` OVER a `TyUnion`, so `A` sits two levels below the nullable; in the STRING spelling
+`canonEmitName` splits one flat top-level `|` and `A` and `null` are siblings. A rule that reads "am I
+under a nullable" — which is exactly what O3 demands, since canon PRESERVES a nullable litunion and
+the renderer SOFTENS it — must get the same answer from both spellings or the one agreed renderer is
+not one renderer. So each union arm passes `RC_UNION_MEM | (ctx & RC_NULLABLE)`, and canon's flat
+split re-derives the bit from a `null` sibling (`partsHaveNull`). **Every other bit is REPLACED at
+each descent**: a field of a struct that is itself an array element is a field, not both.
+
+Ancestry beyond that one bit is deliberately not modelled. `emit_collect.vl`'s `underFunc` is the
+accumulating shape and no measured disagreement needs it AT THE PRODUCER: every case in the design's
+six transformations is decided at the node whose own immediate position is one of the bits above. A
+later phase that needs true ancestry gets a second field rather than a re-reading of these.
+
+**`partsHaveNull` IS NOT A NEW SCANNER, and the distinction is #1199's own.** It walks an
+already-split member list comparing WHOLE STRINGS against `"null"` and inspects no character —
+the same class as `isPlainAliasRef`, filed in #1199's class G on the rule *a name is allowed to be a
+name*. It is not added to the off-list, and the counter below confirms the column did not move.
+
+### BYTE-IDENTITY IS STRUCTURALLY IMPOSSIBLE FOR THIS PHASE — WITH THE MECHANISM, AND WITH THE PROOF THAT REPLACES IT
+
+The brief named a byte-identical compiler as the strongest available proof: build master's compiler
+and this one from a freshly fetched published seed and `cmp`. **It cannot hold, and not for a subtle
+reason: the artifact under comparison IS the compilation of the source being changed.** Adding a
+parameter to `tyToEmitNameGo` / `tyToEmitNameAt` / `tyToNominalNameAt` / `canonEmitNameAt` changes
+each one's wasm functype, adds an argument at every call site, and adds four functions — so every
+later type and function index shifts. Measured: **1,030,663 → 1,031,009 B, `cmp` differs at byte 10**
+(the size field of the type section). No parameter threading of any kind, defaulted or not, can be
+byte-identical here.
+
+**THE PROOF THAT REPLACES IT IS STRICTLY STRONGER THAN THE CORPUS FALLBACK, AND IT IS AVAILABLE FOR
+FREE.** The compiler's OUTPUT can be byte-identical, and the hardest input available is the compiler
+itself — a single 1.03 MB VL program, by a wide margin the largest in existence:
+
+| leg | result |
+| --- | --- |
+| the freshly fetched `seed-latest` compiles master's source to **itself** (1 compile) | fixpoint, 1,030,663 B |
+| `compile(M, frozen master source)` vs `M` | **`cmp` RC 0** — the control |
+| **`compile(P, frozen master source)` vs `M`** | **`cmp` RC 0** — P1's compiler reproduces master's compiler, byte for byte |
+
+`M` is master's compiler, `P` is this phase's. The third row is the inertness statement in its
+sharpest form: **the two compilers disagree about nothing on a 1.03 MB program that exercises every
+arm of all three producers**, including the recursive-generic-alias pins, the litunion-alias
+preservation arms and the whole `$fnsig` vocabulary. The frozen source is `git archive eb1eb75`, so
+neither leg can drift.
+
+### THE CHANNEL GRADING — AND THE BRIEF'S NAMED CHANNEL IS BLIND TO THIS PARTITION
+
+The brief said *"for your partition `vl check <dir>` is the right channel; it is BLIND to emitter
+changes."* **Measured, it is the other way round for the code P1 touches.** The canon pass lives in
+`typecheck.vl` but produces the EMITTER's vocabulary, and a plain `vl check` never emits. Every
+channel below was graded with a real sabotage BEFORE any zero was believed — a build, no comparator,
+compared against the master snapshot:
+
+| sabotage (all read `ctx`, all reverted) | corpus RECORDS moved | `vl check` lines | `vl check --codegen` lines |
+| --- | ---: | ---: | ---: |
+| canon: identity at any non-root `ctx` | **32** | **0 — BLIND** | **89** |
+| structural renderer: `""` at `RC_MAP_VAL` | **21** | 33 | **123** |
+| structural renderer: `""` at `RC_NULLABLE` ∧ `RC_UNION_MEM` (the sticky rule) | **2** | 13 | **22** |
+| nominal renderer: `""` at `RC_FIELD` | **126** | **0 — BLIND** | **350** |
+| canon: identity at `RC_FN_RES` | **0** | **0** | **0** |
+| canon: `"ZZPROBE"` at `RC_FN_RES` (REACH probe) | **9** | — | **42** |
+
+Two rows read **0 on the plain checker channel while moving 32 and 126 corpus records**. Anyone who
+graded this partition on `vl check <dir>` alone would have published a zero that meant nothing. The
+shared-instance channel that DOES see it is **`vl check --codegen <dir>`**, which runs the emitter;
+it is used for every checker-channel number below.
+
+**AND ONE MEASURED 0 INVERTED UNDER A SHARPER PROBE.** Canon at `RC_FN_RES` moved **nothing** on all
+three channels — which reads as "the bit never arrives" and is wrong. Re-probed with a marker canon
+could never produce, the same position moves **9 corpus records and 42 codegen lines**. The bit
+arrives; it arrives only where canon was **already the identity**, which is precisely #1199's
+96.91% finding seen from one arm. *An identity-shaped sabotage measures a rewriter's IDENTITY RATE,
+not its REACH; only a marker measures reach.*
+
+### THE VOCABULARY IS LIVE, NOT DECORATIVE — EVERY BIT'S REACH MEASURED
+
+The failure mode of an inert threading is that it is **vacuous**: a parameter that is always
+`RC_ROOT` would pass every A/B above and buy nothing. One marker probe per bit on canon, graded on
+the codegen channel over `tests/cases`:
+
+| bit | codegen lines moved |
+| --- | ---: |
+| `RC_ELEM` | **7,928** |
+| `RC_UNION_MEM` | **1,247** |
+| `RC_FIELD` | **812** |
+| `RC_MAP_VAL` | **714** |
+| `RC_NULLABLE` | **699** |
+| `RC_MAP_KEY` | **103** |
+| `RC_FN_RES` | **42** |
+| `RC_FN_PARAM` | **29** |
+
+**Not one is 0.** Every position in the vocabulary is reached by real corpus programs, and
+`RC_NULLABLE`'s 699 is `partsHaveNull` firing — the sticky rule's STRING half — with the structural
+half separately witnessed at 2 corpus records / 22 codegen lines by the `RC_NULLABLE` ∧
+`RC_UNION_MEM` sabotage. The one judgement call in P1 is the one that carries a measured population.
+
+### EQUIVALENCE — TOTAL, ON EVERY CHANNEL, WITH DENOMINATORS ATTACHED
+
+* **corpus five-field A/B, 1,448 / 1,448 identical** — build rc + wasm **sha256** + diagnostic text +
+  run rc + run stdout, one record per file compared with `diff -r`: **RC 0, 0 differing paths**.
+  Population: 1,216 build clean and emit wasm (**1,206 distinct SHAs**), 232 reject, 1,204 run rc 0,
+  1,448 non-empty diagnostic blocks (**1,104 distinct**), 1,403 non-empty stdout blocks
+  (**1,227 distinct**). Records are written one file per case, never through a shared pipe — a first
+  attempt streamed them through `xargs -P` and a record longer than `PIPE_BUF` interleaved, printing
+  a 1,495-line "difference" that was pure scheduling.
+* **`vl check tests/cases`** — **7,817 lines byte-identical** (`diff` RC 0), and
+  **`vl check --codegen tests/cases`** — **7,903 lines byte-identical** (`diff` RC 0). Both run from
+  the same cwd with the same RELATIVE path as their baseline: an absolute-path invocation printed a
+  7,836-line delta that was entirely `at /workspace/.../tests/...` vs `at tests/...`.
+* **fuzz A/B, 28,800 generated programs** — 72 generator runs (2 legs × 3 depths × 12 seeds at
+  `--count 200`, `plain` and `branching+multiobs+declared`), generated ONCE with master's compiler so
+  both sides see byte-identical inputs. `vl check` **161,929 lines identical**;
+  `vl check --codegen` **166,118 lines identical**, RC 0. The codegen leg is sharded 48 × 600 because
+  **one shared instance cannot hold 28,800 programs' emit state — it traps `allocation size too
+  large`, on MASTER's compiler as well**, so the shard is a pre-existing property and not a finding
+  of this phase. The codegen fuzz channel was graded too: the canon sabotage moves **279 lines**
+  there, so its zero is a zero.
+* **`SELFHOST_NATIVE_ALIGN=1 deno task test`: 2,176 passed / 0 failed / 8 ignored** — **derived, not
+  assumed**: master's source on this same tree gives **2,176 / 0 / 8** as well. No fixture added, so
+  a delta would have been a defect.
+
+**ENTOMBMENT — no new fixture, and the sabotage table is the argument.** A behaviour-free phase has
+nothing to pin: a fixture would assert what master already asserts, and would show up as a suite
+delta that then has to be explained away. What has to be true instead is that the sites P1 touched
+are ALREADY pinned totally, and the table above measures exactly that — deliberate perturbations at
+four distinct positions redden **32 / 21 / 2 / 126** corpus records on the byte channel with no new
+file added. Same call #1199 and #1125 made, for the same reason, now with the numbers.
+
+### COUNTS — BOTH UNITS, AND BOTH WERE PREDICTED TO BE 0 BEFORE THEY WERE MEASURED
+
+**CALL SITES.** CORE **314 → 314 (0)** · OFF-LIST **24 → 24 (0)** · TRUE **338 → 338 (0)**. Per file
+identical throughout: `emit_classify` 175 · `emit_base` 51 · `typecheck` 46 (**22 core + 24 off**) ·
+`emit_collect` 44 · `emit_mono` 7 · `emit_rewrite` 7 · `wasmEmit` 5 · `emit_rep` 2 ·
+`emit_sections` 1. The instrument is #1139's 23-resolver CORE list plus #1141's 13 off-list scanners,
+`NAME(` in `//`-stripped, string-literal-aware code (char literals KEPT), each resolver's own
+`function NAME(` header excluded, per-file sums asserted against the tree-wide total; it reproduces
+#1199's published after-state **exactly** at `eb1eb75` before it was used for anything.
+
+**GRAMMAR OCCURRENCES.** Tree-wide **89 → 89 (0)**; `typecheck.vl` **38 → 38 (0)**. The census was
+graded on a constructed file — brackets in a comment, brackets in a string, bare `'('`/`')'`/`'['`,
+plus `'"'` and `'\'` so string tracking cannot invert — **3/3, no false positives** — and reproduces
+#1199's per-file column exactly.
+
+**Both zeros were stated in advance and are structural, not lucky.** P1 adds a parameter and three
+delegators; it deletes no scanner call, writes no character literal, and — because `canonShapeName`
+kept its name — moves no off-list row. The unit that DID move is the binary.
+
+**BINARY: +346 B** (1,030,663 → 1,031,009) — a cost, reported as one. It buys nine constants, one
+new predicate, three one-line entries, four positioned bodies each carrying an extra wasm parameter,
+and the `|`/`&` composition at the union descents. There is no offsetting deletion — P1 deletes
+nothing, and the site it adds is a PARAMETER, not a loop. The
+fixpoint ladder went from 1 compile (master's source reproduces the published seed exactly) to **2**,
+which is the expected consequence of the seed no longer being the answer.
+
+### GATE — EVERY LEG, EXIT CODE TAKEN WITHOUT A PIPE
+
+| leg | RC |
+| --- | ---: |
+| `scripts/fetch-seed.sh` (fresh; 1,030,663 B) | **0** |
+| `scripts/refresh-compiler.sh --prove-fixpoint` — fixpoint at 2 compiles | **0** |
+| `scripts/native-fixpoint.sh` — stage3 == stage4, 1,031,009 B | **0** |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` — 2,176 / 0 / 8 (baseline re-derived: 2,176 / 0 / 8) | **0** |
+| `deno check tests/cases_wasm_test.ts` | **0** |
+| `scripts/lint-self.sh` | **0** |
+| `scripts/rep-fuzz-check.sh` — 1 baselined REJECT, 0 new, 0 stale | **0** |
+| corpus A/B `diff -r`, 1,448 records, five fields | **0** |
+| `vl check tests/cases` A/B · `vl check --codegen tests/cases` A/B | **0** · **0** |
+| fuzz A/B, 28,800 programs: `vl check` · `vl check --codegen` (48 shards) | **0** · **0** |
+| `compile(P, frozen master source)` vs `M` | **0** |
+
+**THE SEED COMPILED THIS SOURCE ON THE FIRST RUNG** — no A/B split was needed. `typecheck.vl` is
+where that bit before (#1176/#1178); it did not bite here because P1 uses no construct the published
+seed's emitter cannot already lower (`|`/`&` on `i32` have been lowered since `binOpcodeI32`).
+
+### METHOD NOTES
+
+153. **A PHASE THAT PLANS TO "ADD A PARAMETER NOBODY READS" MUST FIRST ASK WHETHER THE LANGUAGE
+     ALLOWS IT.** VL's own lint rejects an unused parameter, and `lint-self.sh` gates the compiler
+     at `--severity info` — so the literal design is unshippable and the `_`-prefix escape is a lie
+     about intent. The shape that survives is the honest one: `ctx` is READ everywhere, but only to
+     forward or compose it. **"Inert" is a statement about DECISIONS, not about mentions**, and it is
+     worth writing the distinction into the plan before a phase discovers it at the gate.
+154. **WHEN THE PROOF ARTIFACT IS THE COMPILATION OF THE DIFF, BYTE-IDENTITY IS NOT A HIGH BAR — IT
+     IS AN IMPOSSIBLE ONE.** Any real source change moves the compiler's own bytes. The question to
+     ask instead is *what is the largest program whose COMPILED OUTPUT should be unchanged*, and for
+     a self-hosted compiler the answer is sitting in the repo: `compile(P, frozen master source)`
+     vs `M`. It costs one build, it is a byte comparison, and it exercises more of the changed code
+     than the whole fixture corpus does.
+155. **THE CHANNEL A BRIEF NAMES CAN BE THE BLIND ONE — GRADE IT, DO NOT INHERIT IT.** "For a
+     checker-side partition `vl check <dir>` is the right channel" is right about where the CODE
+     lives and wrong about where its EFFECT lands: the canon pass sits in `typecheck.vl` and produces
+     the emitter's vocabulary, so two sabotages moving 32 and 126 corpus records moved **0** plain
+     checker lines. `--codegen` is the shared-instance channel that sees this partition.
+156. **AN IDENTITY-SHAPED SABOTAGE MEASURES A REWRITER'S IDENTITY RATE, NOT ITS REACH.** "Return the
+     input at position X" scored 0/0/0 at `RC_FN_RES` and reads as *the bit never arrives*. A marker
+     the rewriter could never produce scores 9 corpus records and 42 codegen lines at the SAME
+     position. On a pass that is the identity 96.9% of the time, the two probes answer different
+     questions and only one of them answers "is this threaded".
+157. **A SPLIT THAT RENAMES A COUNTED FUNCTION PRINTS A PHANTOM DELTA.** Splitting `canonShapeName`
+     into a `…At` body would have read as OFF-LIST 24 → 23 while deleting nothing. It keeps its name
+     — and it also needs no `ctx`, because a helper that OVERRIDES the position for all its children
+     never consults its own. **Before splitting a function, check whether the scorecard knows its
+     name.**
+158. **TWO A/B HARNESS BUGS, BOTH OF WHICH PRINT DIFFERENCES THAT ARE NOT DIFFERENCES.** A record
+     longer than `PIPE_BUF` streamed through `xargs -P` interleaves — 1,495 phantom diff lines, fixed
+     by one file per record. And an A/B whose two sides invoke the tool with a DIFFERENT path
+     spelling compares path text — 7,836 phantom lines, fixed by the same cwd and the same relative
+     argument on both sides. Both were caught because the number was implausibly large; a harness bug
+     that prints a plausibly SMALL number would not have been.
+
+### WHAT THIS PHASE DELIBERATELY DID NOT SHIP
+
+* **Any consumer of `ctx`.** Not one arm routes, not one policy reads a bit. That is P3 onward, and
+  the design's own warning — *"routing one without `ctx` would bake a global policy into the renderer
+  and then have to be un-baked"* — cuts the other way too: reading `ctx` before it is threaded
+  everywhere would have made this phase unprovable. The proof on offer is a byte-for-byte one, and it
+  exists only because nothing decides.
+* **O1's cycle guard on `tyToNominalName`.** Reachable population is still **zero**, exactly as #1199
+  measured, and P1 changes no control flow, so it neither opens the path nor closes it. What shipped
+  is a NOTE at the function, naming the 10-hit / 3-file measurement and the `emitProgram` finiteness
+  reject that hides it, so the next phase to give it a caller cannot miss it. A guard nothing can
+  enter is still not entombable.
+* **`ctx` for canon's three ALIAS helpers.** `singleMemberAliasName`, `singleAliasMemberTyIx` and
+  `unionAliasMembers` still enter the renderers position-free at `RC_ROOT`. They are canon's helpers,
+  not canon's recursion, and they are exactly the machinery P4 owns (routes (3) alias transparency
+  and (4) union-alias flattening). Threading them now would widen P1's blast radius for a phase that
+  cannot yet state what it would do with the answer. **Named here so the boundary is a decision and
+  not an oversight.**
+* **Accumulated ancestry.** One sticky bit, because one is what the measured disagreements need. The
+  `underFunc`-shaped accumulating mask is a second field when something needs it, not a re-reading of
+  these eight.
+* **A fixture.** Nothing to pin — and the sabotage table is the evidence that the sites are already
+  pinned, at 32 / 21 / 2 / 126 corpus records.
+* **The sabotages themselves.** Thirteen distinct sabotage builds, every one built from a COPY of the
+  source tree and never from the worktree, all discarded; the shipped source contains no `ZZPROBE`,
+  no early return and no marker.
