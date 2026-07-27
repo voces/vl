@@ -24764,3 +24764,333 @@ algorithmic difference. **No wall-time claim is made in either direction**; the 
      sibling worktree pointing at an empty directory. Restore it (`cp -a node_modules/.
      <main>/node_modules/`) immediately, and check `ls -la node_modules` after any `npm ci` in a
      worktree.
+## D-PARENDOWN + D-ARRDOWN + D-SHAPEDOWN — the home's LOCATION is inverted, not the import graph: four grammars move DOWN into `typecheck.vl` and the checker's twenty-two hand-written copies route to them (off master `f16b04f`)
+
+**The charter is the filed item at the end of the previous section, and its central claim is upheld:
+there is no module cycle.** `emit_base.vl` **imports** `typecheck.vl`; `typecheck.vl` imports `ast`,
+`emit_bignum` and `check_state` and nothing from the emitter. So a predicate both files need is
+**defined in `typecheck.vl` and imported by `emit_base.vl`**, and that is the direction this slice
+took for four grammars.
+
+**TWO CORRECTIONS TO THE FILED ITEM, both re-measured at `f16b04f`.** It says `emit_base.vl` "already
+imports four of the grammar names" — the import list is **26 names**, of which four
+(`tyTopIndexOf`, `tyGroupEndIndex`, `parenEnclosesWhole`, `splitUnionAtoms`) are the grammar homes it
+meant. And it says `typecheck.vl` "imports only `emit_bignum` and `ast`" — it imports `check_state`
+too. Neither changes the conclusion; both matter because the 26-name list is the **precedent** that
+makes this relocation ordinary rather than novel. The type-NAME grammar homes have lived in
+`typecheck.vl` for several slices already (`splitUnionAtoms`, `unionMemberCount`, `valueAtomKind`,
+`nameIsFuncTypeAtom`, `nameIsLitUnionType`, both depth walks); four more joined them.
+
+### THE CENSUS — two instruments, two units, both validated before publishing a number
+
+**Instrument 1 — CALL SITES** (`parsercount.py`): one per `NAME(` in `//`-stripped,
+string-literal-aware code, the resolver's own definition header excluded, per-file sums cross-checked
+against the tree-wide total. At `f16b04f` it reproduces the brief's published figures **exactly**:
+**CORE 312 · OFF-LIST 25 · TRUE 337**; `emit_classify` 175 · `emit_base` 52 · `typecheck` 19 core +
+25 off · `emit_collect` 44 · `emit_rewrite` 7 · `emit_mono` 7 · `wasmEmit` 5 · `emit_rep` 2 ·
+`emit_sections` 1. Validated instrument, published numbers unchanged.
+
+**Instrument 2 — GRAMMAR OCCURRENCES** (`charcensus.py`): one per `(`/`)`/`[`/`]`/`{`/`}` **character
+literal** in live code. Double-quoted strings are blanked; **char literals are KEPT** (the trap the
+program has recorded twice — a char-literal-blanking stripper makes every character census read 0),
+and `'"'` is understood so string tracking does not invert for the rest of the line. Tree-wide at
+`f16b04f`: **121**. Per file: **typecheck 54** · emit_base 27 · emit_classify 16 · lexer 10 ·
+format 6 · emit_collect 3 · cli 2 · cli_util 1 · emit_mono 1 · fmt_util 1.
+
+**MY NUMBER, WITH ITS UNIT: `typecheck.vl` carried 54 bracket-grammar OCCURRENCES, of which 22 were
+hand-written copies of grammars that had homes in `emit_base.vl`.** Not the brief's 23 and not the
+prior agent's 35 — both were inherited figures in units neither stated, and the brief itself said to
+re-derive. The 54 decompose, exhaustively:
+
+| bucket | occ | verdict |
+| --- | --- | --- |
+| the two depth-walk homes' bracket-CLASS membership (`tyTopIndexOf`, `tyGroupEndIndex`) | 12 | LEGITIMATE — this *is* the walk's home, and it is a membership test in a walk, not a name-shape question |
+| hand-written copies of four `emit_base` homes | **22** | **ROUTED by this slice** |
+| genuinely different questions | 20 | **LEFT, each named below** |
+
+### THE 22 THAT ROUTED
+
+| # | site | occ | home it took |
+| --- | --- | --- | --- |
+| 1 | `isTopLevelFuncTypeName` — `name[0] != '('` | 1 | `nameIsParenOpen` |
+| 2 | `nameToTyReal` paren-group arm | 2 | `nameIsParenSpanEnds` |
+| 3 | `nameToTyReal` function-type arm — the OPEN half | 1 | `nameIsParenOpen` |
+| 4 | `nameToTyReal` array arm | 2 | `nameIsArray` + `arrElemNameRaw` |
+| 5 | `canonEmitName` array arm | 2 | `arrElemNameRaw` |
+| 6 | `canonEmitName` paren-group arm | 2 | `nameIsParenSpanEnds` |
+| 7 | `nullableRetName` inline-shape test | 2 | `nameIsShapeOpen` |
+| 8 | `nameIsFuncTypeAtom` — the whole peel LOOP | 2 | `peelGroupParens` |
+| 9 | `nulElemListAtomKind` — test + cut + paren strip | 4 | `listElemNameOf` |
+| 10 | `litUnionArrayElemOf` — test + cut + paren strip | 4 | `listElemNameOf` |
+
+Sites 8–10 are the ones worth naming twice: each was a *whole home* written out by hand.
+`nameIsFuncTypeAtom`'s four-conjunct `while` is `peelGroupParens` character for character — the
+function `peelGroupParens` was originally carved out of — and it could not call it because the home
+sat one module UP. Sites 9 and 10 are `listElemNameOf` twice.
+
+### THE 20 THAT DID NOT, AND WHY — each one named
+
+| site | occ | why it is a different question |
+| --- | --- | --- |
+| `isTopLevelFuncTypeName` `name[arrowAt - 1] == ')'` | 1 | **ARROW-relative close** — the param list closes before the `=>`, so the last character of the name belongs to the RETURN |
+| `nameToTyReal` function-type arm `name[arrowAt - 1] == ')'` | 1 | same |
+| `nameToTyReal` map arm `name[0]=='{' && name[1]=='[' && name[n-1]=='}'` | 3 | the **MAP** grammar — it REQUIRES `[1] == '['`, the exact **complement** of `nameIsShapeOpen` |
+| `nameToTyReal` map-key scan `name[mi] == ']'` | 1 | the `]:` key terminator, an interior scan |
+| `nameToTyReal` inline-object arm `name[0]=='{' && name[n-1]=='}'` | 2 | **map-ACCEPTING** endpoints (no `[1] != '['`) — routing it to `nameIsShapeOpen` would blind the checker to map-valued shapes |
+| `mapShapeKeyName` `name[0]!='{' \|\| name[1]!='['` | 2 | MAP grammar |
+| `mapShapeKeyName` `name[mi] == ']'` | 1 | key terminator |
+| `nameNeedsCanon` `c == '('` | 1 | a char **CLASS** ("does this name need canon at all"), not a position test |
+| `nameNeedsCanon` `c == '[' \|\| c == '{'` | 2 | same |
+| `canonShapeName` `inner[0] == '['` | 1 | a map probe on an already-stripped INTERIOR, not on a whole name |
+| `canonEmitName` `isTopLevelFuncTypeName(name) && name[n-1] == ')'` | 1 | **CLOSE-ONLY** — no opener test at this site at all |
+| `canonEmitName` shape arm `name[0]=='{' && name[n-1]=='}'` | 2 | map-accepting |
+| `isObjShapeName` `nm[0]!='{' \|\| nm[nm.length-1]!='}'` | 2 | map-accepting |
+
+The three map-accepting endpoint pairs are exactly the population `emit_base.nameIsShapeSpanEnds`'s
+header already warned about ("written out 9 times tree-wide … routing those here would silently stop
+the emitter seeing map-valued shapes"); this slice found its three `typecheck` instances and left
+all three, as that header asks. The two arrow-relative and one close-only spellings are the
+population `nameIsParenOpen`'s header names; their OPEN halves routed and their CLOSE tests stayed,
+exactly as it asks.
+
+### WHAT MOVED, AND THE MECHANISM THE LANGUAGE ACTUALLY OFFERS
+
+Seven definitions moved from `emit_base.vl` into `typecheck.vl`, headers and all:
+`nameIsParenOpen`, `nameIsParenSpanEnds`, `peelGroupParens` (D-PARENDOWN); `nameIsArray`,
+`arrElemNameRaw`, `listElemNameOf` (D-ARRDOWN); `nameIsShapeOpen` (D-SHAPEDOWN). **No second copy of
+any grammar exists** — every character compare lives exactly once, and it lives in `typecheck.vl`.
+
+The layers that only the emitter asks for stayed in `emit_base.vl` and now call down:
+`nameIsElemArray`, `arrLeafNameOf`, `nameIsShapeSpanEnds`. `parenEnclosesWhole` is no longer imported
+by `emit_base.vl` at all — it went down with `peelGroupParens`, its only emitter-side caller.
+
+**VL'S `export … from` DOES NOT WORK FOR A SIBLING IMPORTER, AND THAT DECIDED THE MECHANISM.**
+`modScan` (`driver.vl` ~1756) recognises `export { a, b as c } from "./x"`, creates the import edge
+and records a public re-export — but `modExportsHas` (`driver.vl` 1905) answers only from
+`expMod`/`expName`, which the re-export path never writes. Measured with a three-module program
+(`low.vl` exports `homeFn`; `mid.vl` re-exports it; `top.vl` imports it from `./mid`):
+**`parse error: "homeFn" is not exported by "./mid"`**, rc=1. `docs/internals/modules-design.md` files
+re-export as "deferred"; it is HALF implemented, and the half that exists is the wasm-ABI half
+(`reExpName`/`reExpTarget`, root module only). **The re-export this language has is
+`import { x as y }` + `export function x(a) { y(a) }`** — verified working in the same three-module
+harness — and that is what shipped: six one-line delegations in `emit_base.vl`, so every caller in
+`emit_classify` / `emit_collect` / `emit_mono` / `emit_rep` / `emit_rewrite` / `emit_sections`
+compiles untouched, with not one of those files edited.
+
+**CONSEQUENCE FOR THE PROOF, STATED PLAINLY: the move-only step CANNOT be byte-identical.** A
+delegation is a real wasm function. The brief expected byte-identity from a true re-export; the
+language does not have one. What is available instead is a **total** corpus proof, and it was run on
+every step separately (see below), not just at the end.
+
+### COUNTS — BOTH UNITS, EVERY DELTA DECOMPOSED
+
+**GRAMMAR OCCURRENCES (the unit that measures the deletion).** Tree-wide **121 → 99 (−22)**.
+`typecheck.vl` **54 → 38 (−16)**. `emit_base.vl` **27 → 21 (−6)**. The arithmetic closes three ways
+and each way is a different check:
+* typecheck −16 = **−22 routed away** **+6 relocated INTO the file** (the four moved homes' own
+  compares: `nameIsParenOpen` 1, `nameIsParenSpanEnds` 1, `nameIsArray` 2, `nameIsShapeOpen` 2);
+* emit_base −6 = **exactly those same 6**, which is what makes it a relocation and not a copy;
+* tree −22 = the deletions alone, because the relocation nets to zero tree-wide.
+
+`typecheck.vl`'s remaining 38 = 12 walk-home membership + 20 named-and-left + 6 that are now the
+compiler's ONE copy of four grammars.
+
+**CALL SITES (the SCORECARD column). CORE 312 → 314 (+2) · OFF-LIST 25 → 25 (0) · TRUE 337 → 339
+(+2).** Per file: `typecheck` 19 → 22 core (+3), `emit_base` 52 → 51 (−1), every other file
+unchanged. **The +2 is the column doing what this doc has said for six slices it does: inline
+character surgery that becomes a named call is counted for the first time.** Decomposed exactly —
+only two of the seven moved homes are on the 23-name CORE list:
+* `nameIsArray` **+1** = typecheck **+2** (the moved `arrElemNameRaw`'s internal call, which
+  RELOCATED with it, plus `nameToTyReal`'s routed test) and emit_base **−1** (that same internal call
+  leaving);
+* `peelGroupParens` **+1** = typecheck **+1** (`nameIsFuncTypeAtom`'s hand-written loop, now one call).
+
+The other five moved homes are invisible to the column (`arrElemNameRaw`, `listElemNameOf`,
+`nameIsShapeOpen`, `nameIsParenOpen`, `nameIsParenSpanEnds` are not on the 23-name list), so the
+column reports +2 for a patch whose full home-family call-site table moves **118 → 128 (+10)**:
+emit_base **36 → 30 (−6)**, typecheck **13 → 29 (+16)**. Both readings are published because
+neither alone says what happened.
+
+**BINARY: 1,031,204 → 1,030,023 = −1,181 B.** Measured like-for-like — every candidate compiled from
+the SAME freshly-fetched published seed, never from its own predecessor (one intermediate build was
+discarded and redone for exactly that reason). The two halves separately, because the net would hide
+both:
+
+| step | bytes | Δ |
+| --- | --- | --- |
+| master `f16b04f` | 1,031,204 | — |
+| PAREN move + 2 delegations, **no routing** | 1,031,239 | **+35** |
+| PAREN routing | 1,030,966 | −273 |
+| ARRAY move + 3 delegations, **no routing** | 1,031,019 | **+53** |
+| ARRAY routing | 1,030,042 | −977 |
+| SHAPE move + delegation + routing | 1,030,023 | −19 |
+
+**Six delegations cost 88 bytes; the routing they unlocked returned 1,269.**
+
+### EVIDENCE
+
+**Corpus A/B, FIVE fields (build rc · build diagnostic TEXT · wasm sha256 · run rc · run stdout),
+over ALL 1,415 files — run FOUR TIMES, once per step, not only at the end:**
+
+| step | files | build differing | run differing |
+| --- | --- | --- | --- |
+| PAREN move only (the "is it byte-identical" step) | 1,415 | **0** | 0 of 1,138 `@run` |
+| + PAREN routing | 1,415 | **0** | **0** |
+| + ARRAY move | 1,415 | **0** | **0** |
+| + ARRAY routing | 1,415 | **0** | **0** |
+| final (all three grammars) | 1,415 | **0** | **0** |
+
+**Fuzz A/B: 50,400 programs/side (14 seeds × 3 depths × 2 modes × 600 cases), 0 divergences.**
+**Its comparator was proved live too, on a seed the main run does not use**: the identical harness
+against sabotage S1 reads **81 divergences of 1,200** (seed 101). Both A/B channels therefore report
+a 0 that an instrument has been shown to be capable of breaking.
+
+**Shared-instance `vl check tests/cases`** (ONE `WebAssembly.Instance` for the whole directory — the
+channel a sidecar-lifetime skew shows up on, and the reason `vl run --batch` is NOT it): **7,649
+lines each side, 0 differing, rc=1 both** (the corpus carries deliberate error cases). **The
+comparator was proved live on the same run rather than assumed**: against sabotage S1 the identical
+harness reads **7,649 vs 7,645 — 4 lines differing** and names the file. A 0 from an instrument that
+has just been shown to fire is a measurement; a 0 from one that has not is a guess.
+
+### ENTOMBMENT — a behaviour-preserving refactor has no pin that fails on master, so it needs sabotages
+
+Nine sabotages built from the SHIPPED source and A/B'd against it over the whole corpus. The routed
+sites and the delegation wire are pinned by the **pre-existing** corpus — no new fixture was needed
+or added.
+
+| # | sabotage | corpus files reddened |
+| --- | --- | --- |
+| T1 | `nameToTyReal`'s array test answers false (the checker stops resolving `T[]`) | **113** |
+| T2 | `nameIsFuncTypeAtom` stops peeling grouping parens | **103** |
+| T3 | `nulElemListAtomKind` takes the RAW cut — the paren strip the peel carries is dropped | **1** |
+| T4 | `litUnionArrayElemOf` takes the RAW cut | **0** — see below |
+| T5 | `nullableRetName`'s shape test drops the map exclusion (`inm[1] != '['`) | **0** — INERT BY CONSTRUCTION, see below |
+| T6 | `canonEmitName`'s array arm accepts the degenerate `"[]"` | **0** — see below |
+| S1 | the shared PAREN OPEN home answers about `[` instead of `(` | **268** |
+| S2 | the shared ARRAY CUT home is off by one | **392** |
+| S3 | `emit_base`'s `nameIsArray` **delegation is wired to the wrong home** | **481** |
+
+**S3 is the one that pins the mechanism this slice invented.** Rewiring one delegation to a different
+home reddens 481 of 1,415 files — so the six delegations are load-bearing wire, not decoration, and a
+future edit that mismatches one cannot pass the gate.
+
+**T3's single-file result is the sharpest.** A whole grammar's worth of routing is pinned by exactly
+**one** pre-existing corpus file — `tests/cases/unions/nullable-elem-list-union-arm.vl`, which goes
+`BUILDDIFF` + `RUNSTATUS(0/1)`. That is precisely why the routing was A/B'd over all 1,415 files
+rather than sampled: a sample of 100 would very likely have read 0 and called it agreement.
+
+**THE THREE ZEROS ARE GRADED, NOT SHRUGGED — a 0 is a coverage question until the population is
+named.**
+
+* **T5 is inert BY CONSTRUCTION and the conjunct it removes was already DEAD at that site.**
+  `nullableRetName` reaches the test only inside `if it is TyObj`, and a map is a `TyMap`, so
+  `tyToEmitName` can never hand it a `{[`-opening name. The `inm[1] != '['` half of `nameIsShapeOpen`
+  is therefore unreachable *there* — which makes the routing exactly equivalent for a stronger reason
+  than the corpus A/B alone gives. Recorded as the measured equivalence, not as evidence of coverage.
+* **T4's divergence population is REACHABLE BUT ALREADY BROKEN.** The only spelling that exercises
+  `litUnionArrayElemOf`'s paren strip is the INLINE parenthesized litunion array `("a"|"b")[]`; the
+  declared-alias spelling `type K = "a"|"b"; const xs: K[]` never carries parens, so the raw cut and
+  the peel agree on it (probe: both print `2|a`). And the inline spelling **does not work on master**
+  — see the defect filed below. So the leg is genuinely unpinnable today, and it will become pinnable
+  the moment that defect is fixed.
+* **T6's population is the degenerate name `"[]"`**, which the parser will not produce from source
+  (`const x: [] = []` → ``parse error: expected an identifier but found `[` ``, verified by hand on
+  the master build) — so the population is empty at the source level, not merely uncovered.
+  `canonEmitName`
+  is the one site where the ONE-call and TWO-call array forms could differ, and this slice took the
+  one-call form there deliberately (`arrElemNameRaw(name) != ""` excludes `"[]"`, exactly as the
+  hand-written `length > 2` bound did) while `nameToTyReal` keeps the two-call form because ITS arm
+  must still enter for `"[]"`. Two sites, two forms, one measured reason each.
+
+### A PRE-EXISTING SILENT INVALID-WASM CELL, FOUND BY GRADING A SABOTAGE'S ZERO
+
+Narrowing T4's empty population turned one up. **On master `f16b04f` and on this candidate alike:**
+
+```vl
+const xs: ("a" | "b")[] = ["a", "b"]
+print(xs[0])
+```
+
+`vl check` → **rc=0, "Checked 1 file, no errors"**. `vl run` → **`failed to parse WebAssembly
+module`**. Four-cell narrowing, all verified by hand on the MASTER build:
+
+| program | verdict |
+| --- | --- |
+| `const xs: ("a"\|"b")[] = ["a","b"]` + `print(xs[0])` | **invalid wasm**, check-clean |
+| the same with `print(xs.length)` (no element read) | **invalid wasm**, check-clean |
+| `const xs: ("a"\|"b")[] = []` (EMPTY initializer) | prints `0` |
+| `type K = "a"\|"b"` + `const xs: K[] = ["a","b"]` | prints `2` / `a` |
+| `const xs: (boolean\|null)[] = [true, null]` (the OTHER parenthesized element form) | prints `2` |
+
+So the trigger is **an INLINE parenthesized literal-union array with a non-empty element list**, and
+the declared-alias spelling of the same type is correct. This is the mirror image of the `type Z = 0
+| 1` cell filed earlier in this document (there the ALIAS was wrong and the inline spelling right).
+**Not introduced by this slice** — identical on both compilers — and out of its partition to fix
+(the element construction is `emit_classify`/`emit_rep` territory). Filed with its narrowing so the
+next slice does not have to re-find it.
+
+### METHOD NOTES
+
+140. **VL HAS `export … from`, THE DRIVER PARSES IT, AND IT DOES NOT REACH A SIBLING IMPORTER.**
+     `modScan` records the re-export into `reExpPublic`/`reExpTarget` (the ROOT module's wasm ABI);
+     `modExportsHas` reads `expMod`/`expName`, which that path never writes — so `import { X } from
+     "./mid"` fails `"X" is not exported by "./mid"` even though `mid.vl` re-exports `X`. **Measured
+     with a three-module program, not read off the parser.** The design doc calls re-export
+     "deferred"; it is half-implemented, and the half that exists is not the half a compiler-internal
+     home relocation needs. **The re-export VL has is an alias import plus a same-named delegation.**
+     Corollary for this program: **a home relocation across the `emit_base` → `typecheck` edge can
+     never be byte-identical.** Do not promise that proof; promise the corpus.
+141. **WHEN THE PROOF THE BRIEF ASKED FOR IS UNAVAILABLE, RUN THE STRONGER ONE YOU CAN AND SAY WHICH
+     YOU RAN.** "Move + re-export with no routing is byte-identical" was unavailable. What replaced
+     it — the full 1,415-file five-field A/B on the move-only step ALONE, before any routing existed
+     to confound it — is a **total** proof over the corpus rather than a sampled one, and it is
+     weaker than compiler byte-identity in exactly one way (it cannot see a difference no corpus
+     program elicits). Both halves of that have to be said.
+142. **MEASURE THE MECHANISM'S COST AND THE WORK'S PAYOFF SEPARATELY, ALWAYS.** Delegations
+     cost **+88 B** across two steps; routing returned **−1,269 B**. The net (−1,181 B) is the
+     honest headline but it hides both facts, and a slice that shipped only the moves would have
+     looked like a pure regression while being the whole prerequisite.
+143. **A BUILD MEASURED AGAINST ITS OWN PREDECESSOR IS NOT A LIKE-FOR-LIKE SIZE.** `refresh-compiler.sh`
+     overwrites `build/vl-compiler.wasm` with what it just built, so the NEXT refresh self-compiles
+     with the candidate. One intermediate figure here was produced that way, spotted, and re-measured
+     from the pristine seed (it happened to agree — the two compilers are behaviour-identical — but
+     agreeing by luck is not a method). **Restore the seed before every size measurement.**
+144. **THE DOC'S OWN FILED ITEM UNDERSTATED THE EDGE IT DESCRIBED, IN THE DIRECTION THAT MATTERS.**
+     "already imports four of the grammar names" → **26 names**; "typecheck imports only
+     `emit_bignum` and `ast`" → **plus `check_state`**. The conclusion (no cycle) survives, but the
+     26-name list is the *precedent* that makes this move ordinary, and a brief built on "four" reads
+     it as novel. **A filed item is a measurement with a date on it; re-run it at the head you are
+     working from — including one you wrote yourself.**
+145. **GRADE A SABOTAGE'S ZERO BY NAMING THE POPULATION, AND THE GRADING ITSELF FINDS BUGS.** Three
+     of nine sabotages read 0 on the corpus. Grading them cost three hand-written probes and produced:
+     one **inert-BY-CONSTRUCTION** verdict stronger than the A/B (T5 — the conjunct removed is
+     unreachable at that site because an enclosing `is TyObj` already excludes maps), one
+     **reachable-but-already-broken** verdict, and — from the second — **a previously unrecorded
+     silent invalid-wasm cell on master**. "0 differing" plus "here is the population and why it is
+     empty/unreachable" is a finding; "0 differing" alone is a shrug.
+146. **A SABOTAGE OF THE WIRE, NOT ONLY OF THE LOGIC.** When a refactor's whole mechanism is a
+     delegation, the delegation itself needs an entombment: S3 points one `emit_base` export at the
+     wrong home and reddens **481 of 1,415** files. Without it the evidence would say the grammars are
+     correct and say nothing at all about whether they are still CONNECTED to their callers.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **`nameIsShapeSpanEnds` did not move.** Zero `typecheck` sites ask it — all three `{`…`}` endpoint
+  tests in that file are the map-ACCEPTING predicate, which is a different question. Moving it would
+  have bought a seventh delegation for no routing.
+* **`nameIsElemArray` did not move, and `canonEmitName` does not use it.** Its one candidate site is
+  `arrElemNameRaw(name) != ""` instead, which is the same predicate with no extra home and no
+  allocation on the reject path (`arrElemNameRaw` slices only after `nameIsArray`).
+* **`nameToTyReal`'s array arm keeps the FAITHFUL two-call form** (`nameIsArray` then
+  `arrElemNameRaw`) rather than collapsing to `arrElemNameRaw(name) != ""`. The degenerate `"[]"` is
+  an array name whose element is `""`, and master's arm ENTERS for it; the one-call form would skip
+  it. That is the same faithful-form decision `arrElemNameRaw`'s header records for the two `mono*`
+  sites, taken for the same reason.
+* **No new fixture.** The pre-existing corpus pins every routed site under sabotage; adding a
+  fixture that only re-pins what is already pinned would inflate the suite for nothing.
+* **`modExportsHas` was NOT fixed.** `driver.vl` is outside this slice's partition, and the fix
+  (write the re-export into `expMod`/`expName`, or teach `modExportsHas` to consult
+  `reExpMod`/`reExpPublic`) is a module-system change owing its own fixtures — a re-export that
+  shadows a local declaration, a re-export cycle, a re-export of a name the target does not export.
+  **Filed here with its measurement so the next slice does not re-discover it.** Doing it would let
+  all six delegations become one-line `export … from` and would take the +88 B back.
