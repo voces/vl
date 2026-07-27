@@ -8290,23 +8290,60 @@ export function retNulRefIndex(tyIx: i32) {
     }
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
-      const nb = nulBaseStructRow(ty.tyName)
+      const nb = nulBaseStructRow(tyIx, ty.tyName)
       if nb >= 0 { return nb }
     }
   }
   -1
 }
 
-// The STRUCT/rep ROW of the base of a nullable-struct spelling (`S | null` -> `S`'s
+// The STRUCT/rep ROW of the base of a nullable-struct annotation (`S | null` -> `S`'s
 // row), or -1 — the third writing-out of one grammar (`retNulRefIndex`,
 // `retStructIndex`, `paramStructIndex` each carried this five-line block verbatim,
-// down to the `repRowOfName`-then-`structIndexOfTypeName` order). Not a ladder: the
-// two lookups are one question asked of two tables, and all three call sites already
-// fell through to -1 for both "not nullable" and "nullable but unresolvable", so the
-// single -1 is faithful at each.
-function nulBaseStructRow(name: string): i32 {
+// down to the `repRowOfName`-then-`structIndexOfTypeName` order).
+//
+// THREE rungs now, in resolution order (method note 26: a resolver is a LADDER, and a
+// dual of one rung is not a dual of the resolver):
+//
+//   1. ARENA (destringify D-NULBASEROW) — the checker recorded this ANNOTATION NODE's
+//      type; a `TyNullable`'s peeled `nInner` IS what `nullablePartOf` spells, so the
+//      row comes straight off `repRowOfTyStruct` with no render in the loop. All three
+//      call sites hold the type-annotation node index and simply threw it away at this
+//      boundary, which is why the rung could never be written before.
+//   2. `repRowOfName` — the SAME `repRowOfTyStruct` question, reached through
+//      `renderFaithful` + a `resolveAnnot` RE-PARSE of the spelling. Kept, not deleted:
+//      it is the ANSWERING rung on exactly 1 corpus file and 0 fuzz programs —
+//      `structs/nullable-wrapper-literal-widen.vl`, an INLINE-SHAPE nullable
+//      `{f: f32} | null` whose recorded `nInner` resolves to no row while the spelling
+//      does. ONE witness is enough: deleting this rung would newly decline a row that
+//      resolves today. INDEX IDENTITY IS NOT TYPE IDENTITY.
+//   3. `structIndexOfTypeName` — the legacy fieldset scan, untouched.
+//
+// Ladder-faithful (D1 leg C): rung 1 only CONFIRMS — an uncovered node, a node whose
+// recorded type is not a `TyNullable`, or a `repRowOfTyStruct` decline all fall through
+// to exactly the rungs that ran before, in the same order. Rung 1 sits AFTER the
+// `base == ""` guard on purpose: a node recorded `TyNullable` whose SPELLING is not a
+// depth-0 `X | null` must keep answering -1, as it always has.
+//
+// MEASURED over 1,410 corpus files and 7,200 fuzz programs: rung 1 ANSWERS in 42 + 99;
+// rung 2 answers where rung 1 declined in 1 + 0 (the witness above); and rung 1's answer
+// never differs from what the ladder below would have returned — **0 + 0 divergences**.
+// That zero is graded, not assumed: the same rung made deliberately wrong (its row shifted
+// down one) reddens 19 corpus files and 20 fuzz programs, so the channel can see this
+// resolver. All three call sites collapse -1 and -2, so `repRowOfName`'s tri-state is not
+// consulted here. Pinned by `tests/cases/structs/nullable-base-row-arena-node.vl`, which
+// fails under that same sabotage.
+function nulBaseStructRow(tyIx: i32, name: string): i32 {
   const base = nullablePartOf(name)
   if base == "" { return -1 }
+  const nt = nodeRepTyIxOf(tyIx)
+  if nt >= 0 {
+    const t = T.tys[nt]
+    if t is TyNullable {
+      const ar = repRowOfTyStruct(t.nInner, sScanLim())
+      if ar >= 0 { return ar }
+    }
+  }
   const rr = repRowOfName(base, sScanLim())
   if rr >= 0 { return rr }
   structIndexOfTypeName(base)
@@ -8357,7 +8394,7 @@ export function retStructIndex(tyIx: i32) {
       // A `S | null` annotation resolves to its BASE struct's index — the single
       // chokepoint the param/local/return struct lookups read, so a nullable-struct
       // binding's member layout resolves without separate plumbing.
-      return nulBaseStructRow(ty.tyName)
+      return nulBaseStructRow(tyIx, ty.tyName)
     }
   }
   -1
@@ -13558,7 +13595,7 @@ function paramStructIndex(fnIx: i32, name: string) {
               // VARIANT index must not leak into the struct tables.)
               const psi = structIndexByName(ty.tyName)
               if psi >= 0 { return psi }
-              const pnb = nulBaseStructRow(ty.tyName)
+              const pnb = nulBaseStructRow(p.parType, ty.tyName)
               if pnb >= 0 { return pnb }
             }
           }
