@@ -491,6 +491,7 @@ import {
   narrowedValueAtomOf,
   nliNameOf,
   nulMapShapeOf,
+  nulRefStructIdxOfLet,
   nulScalarListBuildKind,
   nulScalarListCodeKind,
   nulScalarListKindOfNode,
@@ -8791,8 +8792,18 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           // wrapper, not the default i32-list; a struct global gets its annotated struct) —
           // mirroring the global-INIT seeding in the global section.
           const gLet = globalStmts[gIdx]
-          if globalCellKind(gLet) == "struct" {
+          const gaKind = globalCellKind(gLet)
+          if gaKind == "struct" {
             pendingStructIdx = globalCellStructIdx(gLet)
+          }
+          // A NULLABLE-struct global (`g = null` / `g = { … }` over `let g: S | null`):
+          // the cell is `(ref null $S)`, so a bare `null` RHS needs the SAME struct seed
+          // the kind-1 line above gives a non-null cell — `globalCellStructIdx` reads the
+          // annotation, which for `S | null` names no `sNames` entry, so the base comes
+          // from `nulRefStructIdxOfLet` (the `| null` peel). Without it the `null` reached
+          // `emitNullLitNode` with no context at all and the whole module was rejected.
+          if gaKind == "nulstruct" {
+            pendingStructIdx = nulRefStructIdxOfLet(gLet, -1)
           }
           pendingListKind = letAnnRefListKind(gLet)
           pendingListSlot = letAnnRefListSlot(gLet)
@@ -8825,6 +8836,24 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
             if exprNulBool(a.binLeft, fnIx) { gsCtx.nulBool = true }
             if exprNullableString(a.binLeft, fnIx) { gsCtx.nulString = true }
             if exprNulClosure(a.binLeft, fnIx) { gsCtx.nulClosure = true }
+            // The REMAINING niches, which this arm never seeded — every one of them
+            // reached `emitNullLitNode` with an empty context and rejected the module on a
+            // plain `g = null`. Each mirrors the seed the global's own INITIALIZER already
+            // gets, so re-assigning a global now lowers `null` exactly as initializing it
+            // to `null` does.
+            if exprNullableList(a.binLeft, fnIx) { gsCtx.nulList = true }
+            if exprNulLitUnion(a.binLeft, fnIx) {
+              gsCtx.nulLitUnion = true
+              gsCtx.litUnion = 1
+            }
+            const gaNSK = exprNulScalarListKind(a.binLeft, fnIx)
+            if gaNSK != null {
+              gsCtx.listKind = nulScalarListBuildKind(gaNSK)
+              gsCtx.nulRefHeap = nulScalarListWrapHeap(gaNSK)
+            }
+            if exprNullableMap(a.binLeft, fnIx) {
+              gsCtx.nulRefHeap = mapTypeIdxOf(mapShapeOfExpr(a.binLeft, fnIx))
+            }
             if emitExprExpect(body, a.binRight, fnIx, gsCtx) < 0 { return -1 }
           }
           pendingListKind = 0
@@ -8888,6 +8917,25 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         if exprNullableString(a.binLeft, fnIx) { asCtx.nulString = true }
         if exprNulClosure(a.binLeft, fnIx) { asCtx.nulClosure = true }
         if exprNullableList(a.binLeft, fnIx) { asCtx.nulList = true }
+        // The three niches this arm never seeded — a nullable STRUCT, a
+        // DISTINCT-backing nullable scalar list (`string[]`/`f64[]`/`i64[]`/`f32[]`,
+        // which `exprNullableList` deliberately excludes: it is the i32-backed
+        // `i32[] | null` only) and a nullable MAP. Each one reached
+        // `emitNullLitNode` with no context and rejected the module on a plain
+        // `a = null`, while the same binding INITIALIZED to `null` lowered fine.
+        // Mirrors the `let` seeds at `emitLetDeclStmt`'s kind ladder exactly.
+        if exprNullableStruct(a.binLeft, fnIx) {
+          const asSi = structIndexOfExpr(a.binLeft, fnIx)
+          if asSi >= 0 { asCtx.structIdx = asSi }
+        }
+        const asNSK = exprNulScalarListKind(a.binLeft, fnIx)
+        if asNSK != null {
+          asCtx.listKind = nulScalarListBuildKind(asNSK)
+          asCtx.nulRefHeap = nulScalarListWrapHeap(asNSK)
+        }
+        if exprNullableMap(a.binLeft, fnIx) {
+          asCtx.nulRefHeap = mapTypeIdxOf(mapShapeOfExpr(a.binLeft, fnIx))
+        }
         // A literal-union local (`k = "b"`): the member RHS lowers as its interned i32 id.
         if exprIsLitAtom(a.binLeft, fnIx) { asCtx.litUnion = 1 }
         if emitExprExpect(body, a.binRight, fnIx, asCtx) < 0 { return -1 }
