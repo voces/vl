@@ -1,0 +1,58 @@
+// @run
+// @log p
+// @log 8
+// @log 14
+// @log 4
+// @log 6
+// @log 3
+// @log 5
+// The monomorphizer REVISITS a call whose callee `Ident` an earlier walk already renamed to an
+// APPENDED instance slot (`at$1`, `hof$cb0`) — and `monoFnParamTypeAt` answered for such a name by
+// indexing `monoOrigNode`, which the pre-pass sizes to the DECLARATION count. Past its end that was
+// an out-of-bounds arena read: the whole compiler trapped (`wasm trap: out of bounds array access`)
+// with no diagnostic, on programs `vl check` accepts.
+//
+// Three ways a rename gets revisited, one per group below; each needs a count>0 instance, which is
+// why the FIRST statement pre-instantiates `at` at another element type. The COUNT is the axis, not
+// the type: `pickAt` below is pinned at `i32[]` in both its instances (the baked-callback identity
+// alone extends the mono key), and it reproduced identically.
+//
+// The concrete HOF's own rename is NOT divergent the way a generic's was (#1220): a concrete
+// declaration's parameters are all annotated, so every specialization of it walks the same body
+// against the same pins and instantiates the same shapes. Only the REVISIT was the defect.
+
+function at<T>(xs: T[], i: i32): T { return xs[i] }
+
+function inc(a: i32): i32 { return a + 1 }
+function dbl(a: i32): i32 { return a * 2 }
+
+// (1) A concrete HOF's body is walked TWICE — once by `monoSpecializeConcrete` under the new
+// specialization, once by the main loop over non-generic declarations.
+function applyAt(f: (i32) => i32, xs: i32[]): i32 { return f(at(xs, 0)) }
+
+// (2) The call-SITE rename (`hof` → `hof$cb0`) lands on a `Call` node SHARED by the instances of a
+// generic caller: the per-instance call-spine copy covers calls to GENERIC callees, and `hof` is
+// concrete, so the second instance re-reads the first instance's rename.
+function hof(f: (i32) => i32, v: i32): i32 { return f(v) }
+function outer<T>(xs: T[], n: i32): i32 { return hof(inc, n) + xs.length }
+
+// (3) The COUNT axis with the element TYPE held fixed at `i32[]`.
+function pickAt<T>(xs: T[], i: i32, f: (i32) => i32): i32 {
+  return f(xs.length + i)
+}
+function useDbl(g: (i32) => i32, xs: i32[]): i32 {
+  return pickAt(xs, 0, dbl) + g(0)
+}
+
+const s: string[] = ["p", "q"]
+const a: i32[] = [7, 8]
+const ia: i32[] = [1, 2]
+const sa: string[] = ["x", "y", "z"]
+
+print(at(s, 0)) // p — `at` takes count 0 at string, so the calls below land on `at$1`
+print(applyAt(inc, a)) // 8
+print(applyAt(dbl, a)) // 14
+print(outer(ia, 1)) // 4
+print(outer(sa, 2)) // 6
+print(pickAt(a, 0, inc)) // 3
+print(useDbl(inc, a)) // 5

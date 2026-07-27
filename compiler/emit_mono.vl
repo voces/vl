@@ -61,6 +61,7 @@ import {
   mkOptMember,
   mkParam,
   mkParen,
+  mkPreIncr,
   mkReturn,
   mkUnary,
   mkWhile,
@@ -931,15 +932,27 @@ function monoCloneGenericCalls(ix: i32) {
   if n is BinExpr {
     // A COMPOUND assignment (`acc += at(xs, 1)`) desugars to `target = (target op value)` with the
     // TARGET node SHARED between the read and the write, so its limbs cannot be rebuilt
-    // independently — re-synthesize the whole form from its parts, cloning only the VALUE limb (the
-    // one a generic call can reach; `++`/`--` carry a literal `1`, so they are left alone).
+    // independently — re-synthesize the whole form from its parts through the maker that
+    // re-establishes that sharing, cloning the TARGET once and (for `op=`) the VALUE limb.
+    //
+    // The target carries a generic call whenever it is not a bare local: `vals[idx(xs, 0)] += 5`,
+    // `++vals[idx(xs, 0)]`. Leaving it shared handed ONE callee `Ident` to every instance, so the
+    // last element type to instantiate won and the earlier instances called the wrong shape — the
+    // same aliasing `monoCloneGenericCalls` exists to break, in the two positions its first pass
+    // did not reach. The PREFIX `++`/`--` form (`mkPreIncr`, `binCompound` `"++"`/`"--"`) has no
+    // value limb — its `1` is synthesized — but it does have a target, so it is rebuilt too.
+    // (POSTFIX `x++` is a different shape and cannot carry one; see the `Unary` arm.)
     if n.binCompound != "" {
-      if n.binCompound == "++" || n.binCompound == "--" { return ix }
+      const ct = monoCloneGenericCalls(n.binLeft)
+      if n.binCompound == "++" || n.binCompound == "--" {
+        if ct == n.binLeft { return ix }
+        return mkPreIncr(n.binCompound, ct, n.pos)
+      }
       const inner = P.nodes[n.binRight]
       if inner is BinExpr {
         const iv = monoCloneGenericCalls(inner.binRight)
-        if iv == inner.binRight { return ix }
-        return mkCompoundAssign(n.binCompound, n.binLeft, iv, n.pos)
+        if iv == inner.binRight && ct == n.binLeft { return ix }
+        return mkCompoundAssign(n.binCompound, ct, iv, n.pos)
       }
       return ix
     }
@@ -950,7 +963,9 @@ function monoCloneGenericCalls(ix: i32) {
   }
   if n is Unary {
     // A POSTFIX `x++`/`x--` rides a `Unary` over the assignment whose operand IS the mutated
-    // target — leave it whole for the same reason the compound form is re-synthesized.
+    // target — leave it whole for the same reason the compound form is re-synthesized. Nothing to
+    // clone inside it either way: the parser accepts a postfix target only when it is an
+    // IDENTIFIER ("postfix `++` target must be an identifier"), and an `Ident` holds no call.
     if n.unOp == "p+" || n.unOp == "p-" { return ix }
     const ua = monoCloneGenericCalls(n.unArg)
     if ua == n.unArg { return ix }
@@ -1542,10 +1557,21 @@ function monoCoerceFnValue(exprIx: i32, expectedTyIx: i32, ctx: i32) {
 // The written type-annotation node of parameter `i` of the named function `name` (its ORIGINAL
 // declaration, before monomorphization may replace the slot), or -1. Lets a call site read the
 // concrete function type a callback parameter declares, to coerce a generic function argument.
+//
+// `monoOrigNode` is captured in the PRE-pass and is only as long as the declaration count, while
+// `fnIndexOf` reads the name map `monoRebuild` refreshes — which DOES carry the appended instance
+// slots (`at$1`, `apply$cb0`). A name that resolves past `monoOrigNode`'s end read out of bounds,
+// trapping the whole compiler with no diagnostic (`wasm trap: out of bounds array access`) — the
+// crash `monoWalk` reaches whenever it revisits a `Call` whose callee `Ident` an earlier walk
+// already renamed to a count>0 instance. An appended slot has no separate "original": its
+// declaration IS `fnStmts[fe]`, and its params carry the PINNED annotations, which is exactly the
+// concrete function type this answer is for.
 function monoFnParamTypeAt(name: string, i: i32) {
   const fe = fnIndexOf(name)
   if fe < 0 { return -1 }
-  const fn = P.nodes[monoOrigNode[fe]]
+  let declIx = fnStmts[fe]
+  if fe < monoOrigNode.length { declIx = monoOrigNode[fe] }
+  const fn = P.nodes[declIx]
   if fn is FuncDecl {
     const ps = fn.fnParams
     if i < ps.length {
@@ -1885,6 +1911,20 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       fnParent.push(-1)
       fnDispNames.push("")
       const instFe = fnStmts.length - 1
+      // The in-place rename below is the same write `monoMakeInstance` performs, and it lands on
+      // nodes this specialization may SHARE — with the original declaration, with a sibling
+      // specialization of it, and (for the call site) with every instance of a generic caller, since
+      // the per-instance call-spine copy only copies calls to GENERIC callees. Unlike the generic
+      // case (#1220) that sharing is NOT divergent: a concrete declaration is one whose type params
+      // are absent and whose parameters are ALL annotated (`monoIsGenericDecl` is exactly the
+      // negation), so every specialization of it walks the same body against the same pins and
+      // reaches the same instantiation for each nested generic call — the name written is the same
+      // name each time. What the sharing DID cost is the REVISIT: the body below is walked once per
+      // specialization AND once by the main loop, so a nested generic that landed on a count>0
+      // instance was re-read under its instance name, which used to index `monoOrigNode` out of
+      // bounds (see `monoFnParamTypeAt`). Pinned by the `mono-concrete-hof-instance-revisit`
+      // generics case; no shape was found where the name diverges, and a per-instance copy of the
+      // call spine here would be bytes spent on nothing.
       const cal2 = P.nodes[c.callFn]
       if cal2 is Ident { cal2.identName = specName }
       monoKeys.push(key)
@@ -2047,6 +2087,14 @@ function monoWalk(ix: i32, ctx: i32) {
   }
   // A nested FuncDecl's body is walked through its own `fnStmts` slot (it was
   // lambda-lifted); every other node kind has no call-bearing children.
+  //
+  // `MatchExpr` is the one kind that LOOKS like an exception — its arm bodies are ordinary
+  // expressions, and neither this walk nor the per-instance call-spine copy has a limb for it. It
+  // never reaches here: the checker lowers every exhaustive `match` to an if/else chain and
+  // OVERWRITES the arena slot in place (`typecheck.desugarMatchAt`), so by emit time a generic
+  // call in an arm sits in an `IfStmt` limb both traversals do cover. Measured: a generic called ONLY
+  // from a match arm instantiates (it would otherwise be pruned to a no-op stub and emit an
+  // arity-mismatched call), and the same arm at two element types gets two instances.
   0
 }
 
