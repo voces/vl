@@ -1902,13 +1902,80 @@ function modDiag(m: i32, line: i32, col: i32, msg: string): i32 {
   modDiagMod.push(m)
   0
 }
+// Is `name` part of module `m`'s PUBLIC surface? The surface is the UNION of two
+// tables, and reading only the first was the whole of the `export … from` gap: a
+// declaration marked `export` lands in `expName`, but a RE-EXPORT
+// (`export { name } from "dep"`) lands in `reExpPublic` and NOTHING ever writes it
+// to `expName` — so a sibling importing a re-exported name was told `"name" is not
+// exported by "./mid"` even though `modScan` had recorded the re-export correctly.
+//
+// The two tables stay SEPARATE rather than merging at the scan: `expName` doubles as
+// "declarations that carry the keyword HERE" for the LSP's cross-file
+// go-to-definition (it publishes each entry's decl line/col) and its
+// redundant-export-keyword hint, and a re-export declares nothing in this module —
+// folding it into `expName` would make go-to-definition land on the re-export line
+// and make the hint fire on every re-export. Visibility is the union; provenance is
+// not.
 function modExportsHas(m: i32, name: string): boolean {
   let i = 0
   while i < expMod.length {
     if expMod[i] == m && expName[i] == name { return true }
     i = i + 1
   }
+  // A re-export publishes its PUBLIC name (`reExpPublic` — the `as` alias, else the
+  // source name), so `export { a as b } from "dep"` surfaces `b` and NOT `a`.
+  let r = 0
+  while r < reExpMod.length {
+    if reExpMod[r] == m && reExpPublic[r] == name { return true }
+    r = r + 1
+  }
   false
+}
+// The MERGED (mangled) name of the declaration that module `m`'s public `name`
+// ultimately denotes. Normally `m` DECLARES it and the answer is the `name$mM` the
+// merge rename gave it. When `m` only RE-EXPORTS it, the declaration lives further
+// down — follow the re-export to the module it pulls from and ask again, so a CHAIN
+// (A declares, B re-exports from A, C re-exports from B) resolves to A's mangled
+// name instead of to a `name$mC` that nothing ever defines. Both consumers need
+// this walk: the merge rename (an importer's reference must rewrite to the real
+// declaration) and the emitter's re-export alias table (the wasm export must point
+// at a function that exists).
+//
+// Each hop reads the import edge the re-export ALSO created (`modScan` pushes both,
+// always paired): its `impName` is the SOURCE name in the module it came from, which
+// is what `as` renaming makes different from the public name. Bounded by
+// MOD_DEPTH_MAX for the same reason `modVisit` is — though a re-export cycle is
+// already an import cycle and is diagnosed before this ever runs.
+function modMergedTargetOf(m: i32, name: string): string {
+  let cm = m
+  let cn = name
+  let hops = 0
+  while hops < MOD_DEPTH_MAX {
+    let nextMod = -1
+    let nextName = ""
+    let r = 0
+    while r < reExpMod.length && nextMod < 0 {
+      if reExpMod[r] == cm && reExpPublic[r] == cn {
+        let ii = 0
+        while ii < impMod.length && nextMod < 0 {
+          if impMod[ii] == cm && impLocal[ii] == reExpLocal[r] && impName[ii] != "" {
+            const dd = modIndexOfKey(impKey[ii])
+            if dd >= 0 {
+              nextMod = dd
+              nextName = impName[ii]
+            }
+          }
+          ii = ii + 1
+        }
+      }
+      r = r + 1
+    }
+    if nextMod < 0 { return cn + "$m" + i32ToStr(cm) }
+    cm = nextMod
+    cn = nextName
+    hops = hops + 1
+  }
+  cn + "$m" + i32ToStr(cm)
 }
 // Visit module `m`: resolve + validate its imports (unsupported specifier,
 // unresolvable key, cycle back-edge, name-not-exported), recursing into deps
@@ -2110,7 +2177,9 @@ function modCompile(emit: i32): i32 {
         const dd = modIndexOfKey(impKey[ii2])
         if dd >= 0 {
           reExpName.push(reExpPublic[re])
-          reExpTarget.push(impName[ii2] + "$m" + i32ToStr(dd))
+          // NOT `impName[ii2]$mdd`: `dd` may itself only RE-EXPORT the name, in
+          // which case that target names nothing. Chase to the declaring module.
+          reExpTarget.push(modMergedTargetOf(dd, impName[ii2]))
         }
         done = true
       }
@@ -2288,7 +2357,10 @@ function modBuildRename(m: i32, root: i32): i32 {
       const dd = modIndexOfKey(impKey[ij])
       if dd >= 0 {
         modRenameFrom.push(impLocal[ij])
-        modRenameTo.push(impName[ij] + "$m" + i32ToStr(dd))
+        // The dep may only RE-EXPORT this name rather than declare it, so the
+        // target is the chased declaration, not the flat `impName[ij]$mdd` (which
+        // would rewrite every reference onto a name the merge never defines).
+        modRenameTo.push(modMergedTargetOf(dd, impName[ij]))
       }
     }
     ij = ij + 1
