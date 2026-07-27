@@ -1,0 +1,88 @@
+// @run
+// @log 5
+// @log 41
+// @log 10
+// @log 6
+// @log 8
+// @log hi!
+// @log v-y
+// A DIRECT call to a NESTED NAMED function that CAPTURES (`emitCapturedCall`, the
+// path `add(10)` inside `makeAdder` takes — the closure value is synthesized on the
+// spot and `call_ref`ed, because a plain `call` would pass a null env and lose the
+// captures). That lowering used to cast the synthesized funcref to
+// `fnSigIdxForArity(nargs)` — the ALL-i32 `$fnsig` `(structref, i32 * ar) -> i32` —
+// so it was correct only when every parameter AND the result were i32/boolean:
+//   - a non-i32 PARAM (string / f64 / i32[] / struct) was cast to an i32 param and
+//     the module FAILED TO VALIDATE ("type mismatch: expected i32, found ...");
+//   - a non-i32 RESULT (string / f64 / i32[] / struct / void) found no `i * ar > i`
+//     key at all and was rejected with "captured call arity has no interned
+//     signature" — a program that lowers fine.
+// It now casts to the TARGET's OWN interned `$fnsig` (`fnSigIdxOfFn`, the same seam
+// `.map`/`.filter` resolves a named-function callback through), which is the
+// functype `ref.func <target>` actually carries. Every line below is a cell that
+// was invalid wasm or a spurious reject before.
+
+type Pt = { px: i32 }
+
+// Every nested function below has a DISTINCT name: capture analysis is name-keyed
+// module-wide, so two same-named nested functions in different outer frames report
+// "captured variable not found in enclosing frame" — a separate, pre-existing defect
+// (it reproduces identically without this change) that would otherwise mask these cells.
+
+// non-i32 PARAMS, i32 result — each was INVALID WASM.
+function strParam(n: i32): i32 {
+  function innerStr(x: string): i32 { return x.length + n }
+  return innerStr("abcd")
+}
+
+function f64Param(n: i32): i32 {
+  function innerF64(x: f64): i32 {
+    if x > 2.0 { return 40 + n }
+    return n
+  }
+  return innerF64(2.5)
+}
+
+function listParam(n: i32): i32 {
+  function innerList(x: i32[]): i32 { return x[0] + n }
+  return innerList([9, 8])
+}
+
+function structParam(n: i32): i32 {
+  function innerStruct(x: Pt): i32 { return x.px + n }
+  return innerStruct({ px: 5 })
+}
+
+// a STRUCT capture with a non-i32 param — was a clean reject.
+function structCapture(): i32 {
+  const p = { px: 5 }
+  function innerCap(s: string): i32 { return p.px + s.length }
+  return innerCap("abc")
+}
+
+// a STRING result over mixed params — was a clean reject.
+function strResult(n: i32): string {
+  function innerRet(a: string, b: f64, c: i32): string {
+    if b > 1.0 {
+      if n + c > 4 { return a + "!" }
+    }
+    return a
+  }
+  return innerRet("hi", 2.0, 4)
+}
+
+// a VOID result — was a clean reject.
+function voidResult(n: i32) {
+  function innerVoid(s: string) {
+    if n > 0 { print(s + "-y") }
+  }
+  innerVoid("v")
+}
+
+print(strParam(1))     // 5
+print(f64Param(1))     // 41
+print(listParam(1))    // 10
+print(structParam(1))  // 6
+print(structCapture()) // 8
+print(strResult(1))    // hi!
+voidResult(1)          // v-y

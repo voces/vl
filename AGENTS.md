@@ -38,7 +38,11 @@ file; the lexer/parser are the grammar.
   `cd scripts/vl-host && cargo build --release`): `vl run <file.vl>` (also `-e "<src>"` / stdin /
   a prebuilt `.wasm`) · `vl build <file> [-o out.wasm]` · `vl check <path>` · `vl fmt <file> [-w|--check]`.
   `vl build` also takes `-O` (optimize) and `--wat` (text dump) — both shell out to binaryen
-  (`wasm-opt`/`wasm-dis`; `brew install binaryen`), soft no-op when absent. `vl check` reports errors
+  (`wasm-opt`/`wasm-dis`; `brew install binaryen`), soft no-op when absent — and `--no-validate`.
+  **`vl build` validates the module it wrote and exits 1 when the engine rejects it**, so it is a
+  channel that SEES an emit bug (`vl check`, even `--codegen`, does not — only channels that
+  INSTANTIATE do). `--no-validate` skips that check and restores the old write-and-bless path;
+  it is an exact-string match, so a misspelled flag still validates (fail-safe). `vl check` reports errors
   + lint (warnings/hints), `--severity <level>` (gate + display floor), `--concise`, `--codegen`,
   `--fix` (the `prefer-const` lint fix), and takes a file OR a
   directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>`). `vl` is a command-queue
