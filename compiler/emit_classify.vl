@@ -141,6 +141,8 @@ import {
   nameIsNulLitUnionList,
   nameIsNulStrList,
   nameIsNulString,
+  nameIsShapeOpen,
+  nameIsShapeSpanEnds,
   nameIsString,
   nameIsStringArray,
   nameNamesFunction,
@@ -7576,10 +7578,12 @@ export function fnStmtsPosOf(fnIx: i32) {
 // final-character test (a group that never closes cannot end in `}` unless it is nested,
 // and `P_WSNC` fired 0 times on either channel).
 export function nameIsWholeSpanShape(name: string) {
-  if name.length < 2 { return false }
-  if name[0] != '{' || name[1] == '[' || name[name.length - 1] != '}' {
-    return false
-  }
+  // The endpoint span is `emit_base.nameIsShapeSpanEnds` (`len >= 2` · `'{'` at 0 ·
+  // NOT `'['` at 1 · `'}'` at the end); this function is that predicate PLUS the walk.
+  // Keeping the walk as the only difference is the point: the sites that carry the
+  // endpoint span ALONE must NOT be routed here — `{a:{b:i32}}|{c:i32}` passes the
+  // endpoints and fails the walk, so this is a strictly TIGHTER answer, not a synonym.
+  if !nameIsShapeSpanEnds(name) { return false }
   tyGroupWrapsWhole(name)
 }
 
@@ -7719,7 +7723,7 @@ function spacelessName(name: string) {
 //     that population is EMPTY on every channel (0 of 89,166). An unreached difference is
 //     a coverage statement, not a licence, so the faithful form ships.
 function shapeFieldParse(name: string, outNames: string[], outTypes: string[]) {
-  if name.length >= 2 && name[0] == '{' && name[1] != '[' {
+  if nameIsShapeOpen(name) {
     const flat = spacelessName(name)
     const parts: string[] = []
     tyTopLevelSplit(flat.slice(1, flat.length - 1), ',', false, parts)
@@ -7907,7 +7911,7 @@ function nestedStructNamesCompat(ta: string, elem: string): boolean {
 function variantIndexOfTypeName(name: string) {
   const direct = variantIndexOf(name)
   if direct >= 0 { return direct }
-  if name.length >= 2 && name[0] == '{' && name[1] != '[' {
+  if nameIsShapeOpen(name) {
     const fnames: string[] = []
     const ftypes: string[] = []
     shapeFieldParse(name, fnames, ftypes)
@@ -9284,8 +9288,7 @@ export function monoIsRowMatch(sk: string, want: string) {
 // mis-lowers that flow (the pre-existing nominal `T[]`-arm hole), so the loud
 // REJECT must hold until that path is fixed. A non-`{...}` base fast-rejects.
 function shapeElemDeclaredStructIdx(base: string) {
-  if base.length < 2 { return -1 }
-  if base[0] != '{' || base[1] == '[' { return -1 }
+  if !nameIsShapeOpen(base) { return -1 }
   // NODE-LESS caller (rep-intern P2): `base` is an INLINE SHAPE `{…}` element
   // spelling — route it through the canonical-key vocabulary (`repRowOfName` →
   // `resolveAnnot(renderFaithful)` → `repRowOfTyStruct`, the `slotCanonKey ==
@@ -10792,9 +10795,7 @@ function structElemArrayLowerable(t: string): boolean {
   let base = normTypeAtom(arrElemNameRaw(t))
   const nb = nullablePartOf(base)
   if nb != "" { base = normTypeAtom(nb) }
-  if base.length >= 2 && base[0] == '{' && base[1] != '[' {
-    return funcTypeShapeLowerable(base)
-  }
+  if nameIsShapeOpen(base) { return funcTypeShapeLowerable(base) }
   nameIsStructDecl(base) && variantIndexOf(base) < 0
 }
 
@@ -10835,9 +10836,7 @@ function structElemArrayLowerable(t: string): boolean {
 // when its element is (`structElemArrayLowerable`) — the element shape pre-interns in
 // `internFuncTypeShapes` and the slot rides the same code-5 field pass.
 export function funcTypeShapeLowerable(nm: string): boolean {
-  if nm.length < 2 || nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' {
-    return false
-  }
+  if !nameIsShapeSpanEnds(nm) { return false }
   const fnames: string[] = []
   const ftexts: string[] = []
   shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
@@ -10902,9 +10901,7 @@ export function funcTypeShapeLowerable(nm: string): boolean {
 // (idempotent), and is monotone-safe: union registration only grows between the two
 // phases, so a field code can only improve from -1 — never the reverse.
 export function variantNestedShapeOk(nm: string): boolean {
-  if nm.length < 2 || nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' {
-    return false
-  }
+  if !nameIsShapeSpanEnds(nm) { return false }
   const fnames: string[] = []
   const ftexts: string[] = []
   shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
@@ -10981,7 +10978,7 @@ function internFuncTypeShapes(nm: string): i32 {
   const np = nullablePartOf(nm)
   if np != "" { return internFuncTypeShapes(np) }
   if nameIsElemArray(nm) { return internFuncTypeShapes(arrElemNameRaw(nm)) }
-  if nm[0] == '{' && nm[1] != '[' && nm[nm.length - 1] == '}' {
+  if nameIsShapeSpanEnds(nm) {
     if funcTypeShapeLowerable(nm) {
       internShapeFieldElems(nm)
       internInlineShape(nm)
@@ -11024,9 +11021,7 @@ function internNonLowerableFieldShapes(nm: string) {
         // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
         // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
         const base = arrLeafNameOf(nonNulBaseOf(ftxt))
-        if base.length >= 2 && base[0] == '{' && base[1] != '[' {
-          internShapeDeep(base)
-        }
+        if nameIsShapeOpen(base) { internShapeDeep(base) }
       }
     }
     fi = fi + 1
@@ -11052,9 +11047,7 @@ function internShapeFieldElems(nm: string) {
       // `peeled` — "the loop ran at least once" — IS `leaf != name`: every iteration
       // shortens by exactly two characters, so the peel is the identity iff nothing peeled.
       const peeled = ftxt != ftexts[fi]
-      if peeled && ftxt.length >= 2 && ftxt[0] == '{' && ftxt[1] != '[' {
-        internInlineShape(ftxt)
-      }
+      if peeled && nameIsShapeOpen(ftxt) { internInlineShape(ftxt) }
     }
     fi = fi + 1
   }
@@ -11070,8 +11063,7 @@ function internShapeFieldElems(nm: string) {
 // Idempotent per field-name+code set (`annShapeIndexOf`), so a literal-interned
 // twin (`collectAnonShapes`) and a re-visited annotation share one entry.
 export function internInlineShape(nm: string) {
-  if nm.length < 2 { return -1 }
-  if nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' { return -1 }
+  if !nameIsShapeSpanEnds(nm) { return -1 }
   // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
   // the shape layer's ONE field scanner). `texts` keeps each field's type TEXT (a
   // code-16 union field interns its union and records the name in `sFieldElemName`;
@@ -13462,8 +13454,7 @@ export function letAnnIsUninternedShape(letIx: i32) {
   if d is LetDecl {
     if d.letType < 0 { return false }
     const nm = nonNulBaseOf(tyNameOf(d.letType))
-    if nm.length < 2 { return false }
-    if nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' { return false }
+    if !nameIsShapeSpanEnds(nm) { return false }
     return structIndexByName(nm) < 0
   }
   false
