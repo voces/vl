@@ -23029,3 +23029,211 @@ first question) rather than to widen or narrow either list.
      is the change landing, not a regression — but it must be REWRITTEN to assert the new invariant
      (an all-hole union offers nothing; a hole-BEARING structured type still does), never deleted,
      or the fix ships with its guard removed.
+
+## D-NULBASEROW — the nullable-struct ROW comes off the annotation NODE; and two headers in `emit_rep` were measurably FALSE (#1187)
+
+**Base `9a60901`, re-measured here, not inherited: CORE 312 · OFF-LIST 27 · TRUE TOTAL 339**
+(`parsercount.py`, the 23-resolver SCORECARD list + #1141's off-list table, comment-stripped
+non-comment call sites, each resolver's own `function NAME(` header excluded, per-file sums
+cross-checked against a tree-wide concat recount — asserted equal by the harness). The brief's
+three published figures reproduce EXACTLY: `emit_classify` **175**, `emit_base` **52**,
+`emit_collect` **44**, tree-wide **312**.
+
+**The brief's fourth figure needed decomposing, not accepting.** It gave `typecheck` **46**; this
+instrument reads **19**. Both are right: 19 is CORE, and 19 + 27 OFF-LIST = **46 TRUE TOTAL**.
+Say the UNIT or the number is meaningless — the fourth figure was a different unit from the
+first three, in the same list.
+
+### The target, and the first thing measurement overturned
+
+`repRowOfName(nm, lim)` is the render→normalize→re-parse round trip: `renderFaithful(nm)` then
+`resolveAnnot`, then the arena entry `repRowOfTyStruct(di, lim)`. Its own header called it
+*"HOT, not a dormant seat: **six** live call sites in `emit_classify.vl`."*
+
+**It has FOUR, and has had four since #1146.** `git log -S` puts the change at `2fae030` (#1146,
+"TEN hand-copied grammars in the biggest file get ONE home each"), which collapsed
+`structIndexOfTypeRef`'s duplicated nullable arm (two sites → one) and dropped a fifth site at
+`emit_classify:13697`. Counted at `2fae030~1`: **6**. At `2fae030`: **4**. At `9a60901`: **4**.
+The header has been wrong for four merges and the hand-off inherited it verbatim.
+
+| the four consumers (all `emit_classify.vl`) | what it HOLDS | routable? |
+|---|---|---|
+| `nulBaseStructRow` (8310) | **a NODE** — all three callers (`retNulRefIndex`, `retStructIndex`, `paramStructIndex`) hold the type-annotation node index (`tyIx` / `p.parType`) and threw it away at this boundary | **ROUTED HERE** |
+| `structIdxOfElemName` (9203) | a name from `refListElemNameOfExpr` — a MULTI-ARM resolver (ArrayLit / map value / `$fnsig` result slot / `fnRetRefArrayName` / …), no single slot behind it | filed, see below |
+| `monoIsRowMatch` (9236) | `nd.isVariant`, a raw string field of `IsExpr` — but its caller is `wasmEmit.vl:1731`, **outside this partition** | filed, mechanism exact |
+| `shapeElemDeclaredStructIdx` (9263) | a spelling, and only ever a spelling — its own header already says "NODE-LESS caller" | filed, outcome #3 |
+
+The brief's other structural claim DOES hold: `repRowOfTyStruct` already took the index directly
+at **five** sites (four in `emit_classify` — 4477, 5074, 5114, 13883 — plus `repRowOfName`'s own
+tail call). It is **six** now.
+
+### THE TRI-STATE IS DEAD, AND THAT RETIRES THE HAND-OFF'S "HARD PART"
+
+The brief flagged `repRowOfName`'s three-valued result (-2 "did not resolve" vs -1 "resolved, no
+row" vs >=0) as a hard part an arena replacement must reproduce, "a real distinction consumers
+may branch on."
+
+**No consumer branches on it.** All four test `>= 0` / `< 0` and collapse -1 with -2 — verified
+site by site. The -2 STATE is reachable (a poison probe fires on 1 of 1,410 corpus files,
+`closures/generic-nulclosure-return-sig-skip.vl`, and 0 of 7,200 fuzz programs); it is the
+DISTINCTION that is dead. An arena-index replacement therefore does not have to reproduce it.
+
+**METHOD NOTE 112 — a documented tri-state is not a consumed tri-state.** The header wrote the
+contract, four call sites ignored it, and a hand-off promoted it to a blocker. Grep the
+consumers' branch conditions before costing a contract you have only read.
+
+### AND `renderFaithful` NORMALIZES NOTHING
+
+Its header says the input is a checker RENDER (`tyToStr`, "which spaces fields `{f: T}` and
+spells a nullable with a `?` suffix") and names two fidelity gaps it exists to close.
+
+Poison probe (`if renderFaithful(nm) != nm { emitFail(...) }`, at the one call site, so it covers
+all four consumers):
+
+| population | denominator | NORM hits | graded by sabotage (`renderFaithful(nm) + " "`) |
+|---|---|---|---|
+| corpus | 1,410 files | **0** | **178 files redden** |
+| fuzz | 7,200 programs | **0** | **460 programs redden** |
+
+**0 of 8,610, with the channel graded live at 638.** Every live caller hands in an
+already-canonical annotation spelling; none hands in a `tyToStr` render. The normalization is
+RETAINED (it is cheap, and 8,610 programs are not a proof of a total) but it is not what makes
+this a round trip — **the `resolveAnnot` re-parse is**. Both headers are corrected in place.
+
+**METHOD NOTE 113 — grade the normalizer, not just the resolver.** A normalization step whose
+input never needs normalizing is invisible to every A/B: it changes nothing, so nothing diverges.
+The only instrument that finds it is a probe on the STEP, sabotage-graded. `renderFaithful` sat
+in front of this program's largest named debt for its whole life and no slice had ever asked
+whether it fires.
+
+### What was routed
+
+`nulBaseStructRow` is the one home the three nullable-struct row lookups already shared. It took
+a `string` — so all three callers, each holding the type-annotation NODE, rendered it away at the
+call. It now takes `(tyIx, name)` and opens with an ARENA rung: the node's recorded type, when it
+is a `TyNullable`, has a peeled `nInner` that IS what `nullablePartOf` spells, so the row comes
+off `repRowOfTyStruct` with no render in the loop.
+
+**Ladder-faithful (D1 leg C), and it is a LADDER of three now:**
+
+1. ARENA — `nodeRepTyIxOf` → `TyNullable.nInner` → `repRowOfTyStruct`. **Confirm-only.**
+2. `repRowOfName` — the same `repRowOfTyStruct` question via the re-parse. **KEPT.**
+3. `structIndexOfTypeName` — the legacy fieldset scan. Untouched.
+
+Rung 1 sits AFTER the `base == ""` guard deliberately: a node recorded `TyNullable` whose
+SPELLING is not a depth-0 `X | null` must keep answering -1, as it always has.
+
+### Why rung 2 was NOT deleted — the measurement that stopped a wider slice
+
+The D-ELEMROW precedent (#1116) deletes a rung that answers 0 times. This one answers:
+
+| probe | corpus (1,410) | fuzz (7,200) |
+|---|---|---|
+| rung 1 ANSWERS (`ar >= 0`) — coverage | **42** | **99** |
+| rung 2 answers where rung 1 declined (`ar < 0 && rr >= 0`) | **1** | **0** |
+| rung 1 DISAGREES with the ladder's answer (`ar >= 0 && ar != cur`) | **0** | **0** |
+
+The single witness is `tests/cases/structs/nullable-wrapper-literal-widen.vl` — an INLINE-SHAPE
+nullable (`{f: f32} | null`) whose recorded `nInner` resolves to no row while the spelling does.
+**INDEX IDENTITY IS NOT TYPE IDENTITY**, on one corpus file, exactly as the hand-off warned.
+Deleting rung 2 would newly decline a row that resolves today, so it stays.
+
+**METHOD NOTE 114 — one witness is enough to keep a rung, and finding it is the deliverable.**
+The 0/0 disagreement column is what licenses the routing; the 1 in the middle column is what
+bounds it. A slice that reported only the first would have shipped a deletion that breaks one
+corpus file.
+
+### Channels, with denominators, populations, and every zero graded
+
+| channel | population | result |
+|---|---|---|
+| corpus A/B — build rc · wasm sha256 · diagnostic · run rc · run stdout | **1,411 files** (1,410 + this slice's fixture) | **0 divergences** |
+| fuzz A/B — build rc · wasm sha256 · diagnostic | **7,200 programs** (6 generator dimension sets × 3 seeds, depth 5) | **0 divergences** |
+| shared-instance `vl check <dir>` (never `run --batch`) | 7,200 programs, 39,429 output lines | **0 diff lines** |
+| **GRADING: wrong-row sabotage** (`ar` shifted one row down) | 1,410 corpus · 7,200 fuzz | **19 corpus files · 20 fuzz programs redden** |
+
+Every probe/sabotage figure above is over the **1,410-file** pre-fixture corpus (they were taken
+before the fixture existed); the A/B rows are over **1,411**. Denominators stated per row because
+they differ by one, and a slice that silently mixed them would be reporting two populations as one.
+
+**RE-BASED MID-SLICE, AND EVERY CHANNEL RE-TAKEN, NOT CARRIED.** #1185 landed during this slice and
+touched `typecheck.vl`, so the base moved `9a60901` → `ecd8a4f` and the whole A/B was re-run against
+a compiler built from the new base: corpus 0, fuzz 0, shared-instance 0, at both bases. CORE reads
+**312** at `9a60901`, at `ecd8a4f`, and with this patch — #1185 moved no site on the list.
+
+**Both A/B zeros are AGREEMENT, not blindness** — the same change made deliberately wrong is
+visible on both. And the routing is invisible on run-output AND on the wasm-SHA channel, which is
+the correct outcome for a confirm-only rung that returns the row the ladder below it would have:
+**this slice buys the structural route and the skipped parse, not a behaviour change.**
+
+Sweeps used per-worker output files (never one shared append target) with a line-count and
+field-count assertion on every run — 1,410/1,410 and 7,200/7,200, 0 malformed, on all eight.
+
+### The fixture, and the proof that it discriminates
+
+`tests/cases/structs/nullable-base-row-arena-node.vl` pins all three call-site positions
+(nullable-struct PARAM · RETURN · LOCAL annotation), the STRUCTURAL-TWIN pair whose row pick is
+observable in which field is read, the code-15 nested nullable-struct field, and the inline-shape
+nullable that must keep falling through to rung 2.
+
+A construction proof would stop there. This one is graded:
+
+* it PASSES identically on baseline `9a60901` and on the candidate (it is a pin, not a graduation);
+* a poison build proves it REACHES the new rung (it trips `PROBE-COVER`);
+* under the wrong-row sabotage it **FAILS** — `emitProgram: unknown struct field in field access`,
+  rc=1. It discriminates.
+
+### The counts, in both units, and the one that does not move
+
+| unit | before | after | delta |
+|---|---|---|---|
+| **CORE** (23-resolver SCORECARD list, tree-wide) | **312** | **312** | **0** |
+| **OFF-LIST** (#1141's 13, tree-wide) | **27** | **27** | **0** |
+| `repRowOfName` CALL SITES (the round trip) | **4** | **4** | **0** — rung 2 kept |
+| `repRowOfTyStruct` DIRECT arena sites | **5** | **6** | **+1** |
+| `resolveAnnot` call sites, `emit_rep` | 7 | 7 | 0 |
+| binary (`build/vl-compiler.wasm`, fixpoint) | 1,031,388 B | 1,031,519 B | **+131 B** |
+| self-compile wall-time (median, n=11 interleaved) | 1.428 s | 1.417 s | **−0.011 s (noise)** |
+
+**THE CORE COLUMN MOVES BY ZERO AND THAT IS THE HONEST HEADLINE.** Neither `repRowOfName` nor
+`repRowOfTyStruct` is on the 23-name list, so the scoreboard cannot see this slice at all — the
+same blind spot #1141 and #1182 recorded, in a third place. The unit that moved is DYNAMIC: the
+round trip is now bypassed on **42 of 1,410 corpus files and 99 of 7,200 fuzz programs**. Report
+the static and the dynamic unit, and say which is which.
+
+`resolveAnnot` MINTS arena types per call, so a routing that changes how often it runs changes
+allocation; this one strictly REMOVES calls (rung 1 short-circuits before rung 2), and both the
+binary (+131 B, the new rung's code) and the wall-time (unchanged within noise) are reported
+rather than assumed. The `nm.length > 4096` runaway cap is untouched — rung 1 does not mint, it
+reads a type the checker already recorded, so the >1GB crash family is not reachable through it.
+
+### Filed, not built — the three consumers this slice did not route
+
+1. **`monoIsRowMatch` — one line, in another agent's file, and the arena value already exists.**
+   `IsExpr` stores its RHS as a raw `isVariant: string`, but `checkIsExprNode` already banks the
+   resolved arena type as **`isVarTyIxOf(isIx)`** (the D-ISTY bank, already read four times in
+   `wasmEmit`). The whole mechanism is: change `monoIsRowMatch(sk, want)` to take an arena index
+   and call `repRowOfTyStruct` instead of `repRowOfName`, and change its ONE caller,
+   `monoStaticIsResult` (`wasmEmit.vl:1731`), to pass `isVarTyIxOf(isIx)`. **`wasmEmit.vl` is
+   outside this partition, so this is a hand-off, not a verdict.** Whoever takes it must re-measure:
+   `nd.isVariant` is a SOURCE spelling and `isVarTyIxOf` is `nameToTy` of it, so index identity
+   still is not type identity.
+2. **`structIdxOfElemName` — the producer is the blocker, and it is not a slot.**
+   `rlElemStructRow(slot)` (emit_classify:4472) is ALREADY the destringified 3-rung chokepoint for
+   exactly this question. But its caller here, `forInRefArrayStructIdx`, reaches the element only
+   through `refListElemNameOfExpr` — a multi-arm resolver producing a NAME from ArrayLit literals,
+   map-value slots, `$fnsig` result slots and function-return names. There is no single slot behind
+   it. `refListSlotOfExpr` is not the bridge either: it is BUILT ON `refListElemNameOfExpr` (name →
+   `rlSlotByName`), so routing through it swaps one name lookup for another **and** inherits its
+   `return 0`-on-miss sentinel, which collides with real slot 0. The debt relocates to
+   `refListElemNameOfExpr`: it needs an arena-typed sibling before this consumer can move.
+3. **`shapeElemDeclaredStructIdx` — outcome #3, it only ever HAS a spelling.** Both callers
+   (`nameIsRefArray`, and the ref-array element-key resolver at 9927) take a `name: string` and
+   derive `base = arrElemNameRaw(name)`. There is no node anywhere on the path. The debt belongs
+   to whoever produces the array type-NAME these two classify.
+
+**METHOD NOTE 115 — "the replacement is in the same file" is not "the consumer can reach it."**
+All four consumers and both resolvers were in this partition, which is why the slice was scheduled.
+Three of the four still could not move, and in each case the blocker is one edge further out: a
+caller in another file, a producer with no arena sibling, a call path with no node at all. Check
+what the consumer HOLDS before costing a routing, not what the file contains.
