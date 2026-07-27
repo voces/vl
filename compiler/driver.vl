@@ -78,7 +78,7 @@ import {
   ufcsAliasReset,
 } from "./ast"
 import { parseProgram } from "./parser"
-import { T, checkProgram, demangleMsg, initChecker } from "./typecheck"
+import { T, checkProgram, demangleMsg, gaeLtAt, initChecker } from "./typecheck"
 import {
   redunTokAt,
   symDefAt,
@@ -2260,40 +2260,59 @@ function modCompile(emit: i32): i32 {
 // every application (`Box<i32>` → `Box$mN<i32>`) rewrite consistently through
 // the segment rewriter. Generic FUNCTIONS carry their parameters out-of-name
 // (`fnTyParams`) and rename like any value.
+// Both cuts below take the head/argument split from the ONE `<`-scan
+// (`typecheck.gaeLtAt`, D-GENAPPDOWN) rather than re-rolling it. This file held the
+// FOURTH and FIFTH hand-written copies of that loop — the pair D-GENAPPDOWN filed
+// when it moved the home down and could not reach them; `driver.vl` imports
+// `typecheck.vl`, so the route is DOWN the graph and legal (D-MODGENLT).
+//
+// Neither site wants the generic-application SPAN (`annGenAppSpanEnds`). Both are
+// asked about a DECLARED name in the merge rename map, where a non-generic name is
+// the common case and must fall through to "no cut"; the span's trailing-`>` compare
+// would answer false for exactly the names that need the `<` found. Same split pass 0a
+// established at the home: the `<`-scan and the span are two predicates, not one.
+//
 // The base segment of a declared name (`Box` of `Box<T>`); a non-generic name
-// is its own base.
+// is its own base. `gaeLtAt`'s -1 IS the non-generic answer; index 0 keeps the
+// copies' own reading (a leading `<` cuts to ""), since `slice(0, 0)` is what the
+// hand-rolled loop returned there.
+//
+// The cut is BOUND rather than left as the trailing expression: a bare member-call
+// STATEMENT is not a lowerable form (`emitProgram: unsupported member-call statement`),
+// and routing turned this tail from a bare identifier into a `.slice` — the same reason
+// `typecheck.arrElemNameRaw` and `emit_base.annRetNameOf` bind theirs.
 function modGenBase(name: string): string {
-  let i = 0
-  while i < name.length {
-    if name[i] == '<' { return name.slice(0, i) }
-    i = i + 1
-  }
-  name
+  const lt = gaeLtAt(name)
+  if lt < 0 { return name }
+  const base = name.slice(0, lt)
+  base
 }
 // The type-parameter names folded into a generic declared name (`Pair<A,B>` →
 // A, B); empty for a non-generic name. Declaration-position parameters are
 // plain identifiers, so ident runs after the `<` are exactly the names.
+//
+// The `<` is now FOUND rather than walked past, which retires the `started` flag: the
+// copy's flag was only ever "have I passed the first `<` yet", and starting the walk at
+// `lt + 1` answers that positionally. A trailing run is flushed by the closing `>`, as
+// in the copy — every declared generic name ends in one.
 function modGenParams(name: string): string[] {
   const out: string[] = []
+  const lt = gaeLtAt(name)
+  if lt < 0 { return out }
   let run: i32[] = []
-  let started = false
-  let i = 0
+  let i = lt + 1
   while i < name.length {
     const c = name[i]
-    if started {
-      let isIdent = false
-      if c >= 'a' && c <= 'z' { isIdent = true }
-      if c >= 'A' && c <= 'Z' { isIdent = true }
-      if c >= '0' && c <= '9' { isIdent = true }
-      if c == '_' { isIdent = true }
-      if isIdent {
-        run.push(c)
-      } else if run.length > 0 {
-        out.push(fromCodePoints(run))
-        run = []
-      }
-    } else if c == '<' {
-      started = true
+    let isIdent = false
+    if c >= 'a' && c <= 'z' { isIdent = true }
+    if c >= 'A' && c <= 'Z' { isIdent = true }
+    if c >= '0' && c <= '9' { isIdent = true }
+    if c == '_' { isIdent = true }
+    if isIdent {
+      run.push(c)
+    } else if run.length > 0 {
+      out.push(fromCodePoints(run))
+      run = []
     }
     i = i + 1
   }

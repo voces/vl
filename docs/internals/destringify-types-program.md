@@ -27861,3 +27861,146 @@ covered by 259 / 38 / 118 / 4 / 31 corpus files.
 * **Build the fixture, then sabotage it.** An insensitive regression test is worse than none: it
   reads green for the wrong reason forever. Two of this slice's three pinning shapes had to be
   found by experiment after the obvious ones were measured and rejected.
+
+## D-MODGENLT — the merge rename map's two `<`-scans route to the home D-GENAPPDOWN built; the `$fnsig` `>` is DECLINED with a liveness number, and the `tyname.vl` precondition is REFUTED by a working spike (off master `fe4e256`)
+
+D-GENAPPDOWN moved `gaeLtAt` / `annGenAppSpanEnds` down into `typecheck.vl` and filed one copy it
+could not reach: `driver.vl:modGenBase`, "legally routable today since `driver.vl` imports
+`typecheck.vl`". That hand-off is the rare one that was **exactly right** — verified, not assumed:
+
+```
+$ grep -oP 'from "\./\K[a-z_]+' compiler/driver.vl | sort -u
+ast check_query emit_base emit_sections emit_state format home lexer lint parser typecheck
+```
+
+`driver.vl` imports `typecheck.vl`, so the route is DOWN the graph. (`emit_sections.vl` imports it
+too — its site is declined on GRAMMAR, below, not on the graph.)
+
+### The census was re-derived structurally, and it found a FIFTH copy the hand-off did not name
+
+Counting the `'<'` / `'>'` character literals rather than trusting the filed list:
+
+| file | `'<'` | `'>'` |
+|---|---:|---:|
+| `driver.vl` | **2** | 0 |
+| `emit_sections.vl` | 0 | **1** |
+
+The hand-off named `modGenBase`. The second `<` is **`modGenParams`**, immediately below it, which
+re-scanned for the same `<` only to know where its ident-run walk should begin. Both route.
+
+### What shipped
+
+| # | site | was | now |
+|---|---|---|---|
+| 1 | `modGenBase` | `while … if name[i] == '<' { return name.slice(0, i) }` | `gaeLtAt` + a bounds-checked cut |
+| 2 | `modGenParams` | the same loop as a `started` flag threaded through the walk | `gaeLtAt` + `i = lt + 1` |
+
+Neither routes to `annGenAppSpanEnds`. Both are asked about a **declared** name in the merge rename
+map, where a non-generic name is the common case and must fall through to "no cut" — the span's
+trailing-`>` conjunct would answer false for exactly the names that need the `<` found. This is
+pass 0a's split (the `<`-scan and the span are two predicates) landing a second time, in a second
+module, for the same reason.
+
+Routing turned `modGenBase`'s tail from a bare identifier into a `.slice`, which does not lower —
+`emitProgram: unsupported member-call statement`. The cut is bound to a `const`, as
+`typecheck.arrElemNameRaw` and `emit_base.annRetNameOf` already do. **A pure-refactor routing can
+change which LOWERING FORMS a function uses**; the seed rejected the first build, which is the
+cheapest possible way to find out.
+
+### The declined site, with its liveness measured
+
+`emit_sections.emitSynthCloSig` scans a `$fnsig` **ABI key** for the param/result separator. Same
+call #1223 made twice (`sigParamCoerceKind`, `sigKeyRetTokIx`): the alphabet is
+`repSigTokOfKind`/`repKindOfSigTok`'s (`i I d f S a A D L F u N c C s n V r m o`, plus digits and
+`;`), minted token by token by the compiler — not a rendered type. Routing it to the
+generic-application home would be a category error: **that home scans for `<`, which this alphabet
+never emits.**
+
+It is not routable to the ABI family's own home either. `emit_classify.sigKeyRetTokIx` is
+un-exported, spans the **LAST** `>` where this walk wants the **FIRST**, and returns the position
+just past the marker (or -1) where both passes here need the marker's own index.
+
+Declines are cheap to assert and worthless unless measured, so both halves were:
+
+* **S5** — the scan never finds its marker: **49 / 1508**. The site is live; the decline is not vacuous.
+* **S4** — the scan switched to last-`>`: **0 / 1508**. The two readings are indistinguishable on
+  today's corpus, which is precisely what would make merging them a SILENT behaviour change (#1219's
+  rule). Both numbers are now in the file, so the next census does not re-litigate it.
+
+### Counts
+
+**−2 hand-written copies · angle-bracket literals in compiler CODE 26 → 24 (the `<` side 10 → 8) ·
+named grammar calls 190 → 192 (+2) · −21 B.**
+
+### Grading — and a routed site with NO witness anywhere
+
+Every sabotage is ONE edit, built by the good compiler and swept over all 1,508 corpus files
+comparing check rc + diagnostic, build rc, **wasm sha256**, run rc and **run stdout**.
+
+| sabotage | corpus files changed |
+|---|---|
+| CONTROL (pristine) | **0** / 1508 |
+| S1 `modGenBase` never cuts | 2 |
+| S2 `modGenParams` always empty | **0** |
+| S4 `emitSynthCloSig` last-`>` (declined site) | 0 |
+| S5 `emitSynthCloSig` never finds `>` (declined site) | 49 |
+| W3 `gaeLtAt` returns the LAST `<` | 3 |
+
+**S2 at zero is the finding.** `modGenParams` can be stubbed to return nothing and the entire
+corpus — *and the compiler's own 25k-line multi-module source* — still compiles **byte-identically**.
+The reason is structural: the segment rewriter (`modTypeRenamed`) rewrites identifier runs *inside*
+`<>` too, so with an empty shadow a generic alias's parameter renames consistently on BOTH sides of
+its declaration and the two readings agree. Seven candidate witnesses were built and measured before
+one moved.
+
+Two fixtures, each built and then run against the sabotage it claims to pin:
+
+* `modules/generic-alias-base-shadows-import` — a generic alias colliding with an import local.
+  The duplicate-binding check only sees the collision after the name is cut at its `<`.
+  **Catches S1** (rc 1 → 0, the diagnostic disappears); inert under S2.
+* `modules/generic-alias-param-shadows-type` — a generic alias whose PARAMETER collides with a
+  top-level type. **Catches S2**, and it is the ONLY witness that exists; inert under S1.
+  `generic-shadow` does not cover this: its generic is a FUNCTION, whose parameters are carried
+  out-of-name in `fnTyParams` and never reach `modGenParams`.
+
+Both read identically under master and under this branch, so they pin master's behaviour rather
+than this change.
+
+### Refuted
+
+1. **"W3's margin rises because the driver now routes through the home."** It does not. W3 reads
+   **3 on this branch and 3 on MASTER's source over the same 1,508 files** — the move from #1226's 2
+   is corpus growth, not this routing. A declared name (`Box<T>`, `Pair<A,B>`) contains exactly ONE
+   `<`, so first-`<` and last-`<` cannot disagree on anything the merge path sees. The routing is
+   exact but adds **zero** grading weight to the shared home; the fixtures, not the dedup, are what
+   raise its floor.
+2. **"`tyname.vl` needs one slice owning `typecheck.vl` + six emitter modules at once."** Wrong on
+   both halves. It is **seven** emitter modules, not six (`emit_rep` imports `peelGroupParens` from
+   `emit_base` on a single line — a shape that a multi-line import-list census misses), and with
+   `driver.vl` and the home that is **nine** modules, 192 call sites, 38 import-list entries. But the
+   precondition itself is void: **every one of the 16 grammar bodies is a pure string function** — no
+   `T.`, no `P.`, no arena, no diags — so `tyname.vl` is a LEAF with zero imports, and
+   `typecheck.vl` can re-export it exactly as `emit_base.vl` already re-exports 11 of these names
+   today. **Measured, not argued**: a spike that moves `gaeLtAt` + `annGenAppSpanEnds` into a new
+   `tyname.vl` behind a depth-3 re-export chain (`emit_classify` ← `emit_base` ← `typecheck` ←
+   `tyname`) **builds, runs, and is corpus-identical to master: 0 / 1508.** Phase 0 is a
+   `typecheck.vl` + `tyname.vl` slice that touches no emitter module and splits nothing; re-pointing
+   consumers is cosmetic and can follow one module at a time.
+3. **A generic alias's parameter shadow is not observable by any working program.** Its only
+   witness is a diagnostic on a generic UNION alias, a construct the language does not support. Two
+   pre-existing bugs were found while hunting for a better one and are NOT this slice's:
+   `type Box<T> = { v: T[] }` used across modules is rejected (`only i32[] arrays …`) where the
+   single-file spelling works, and `type Box<Wrap>` colliding with a top-level `Wrap` emits a module
+   that traps. Both reproduce identically on master.
+
+### Lessons
+
+* **Verify the hand-off, then re-derive the census anyway.** The route this one offered was sound
+  (the first in several slices), and the count still moved: the filed site had an unnamed twin one
+  line below it, found by counting characters rather than reading the list.
+* **A decline needs a liveness number, not just a classification.** "Not a type grammar" and "dead
+  code" are both reasons to leave a site alone, and they call for opposite follow-ups. S5's 49
+  separates them in one build.
+* **Zero is a result, and it is the one worth chasing.** S2's zero says the routed function has no
+  test anywhere in the repo — a far more useful thing to learn than a green sweep, and the only
+  reason a fixture got written for it.
