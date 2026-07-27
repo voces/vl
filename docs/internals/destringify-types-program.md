@@ -23530,7 +23530,7 @@ remove) or a shared lower module. **Do not route it by adding an import; that is
 
 ---
 
-## D-SHAPEROUTE — the fourteen sites #1186 FILED are routed, and the "routing to the walk would narrow them" claim gets its three numbers (#PRNUM)
+## D-SHAPEROUTE — the fourteen sites #1186 FILED are routed, and the "routing to the walk would narrow them" claim gets its three numbers (#1189)
 
 Base `e255dd8`, every figure re-derived HERE, none inherited. #1186 built
 `emit_base.nameIsShapeOpen` / `nameIsShapeSpanEnds`, routed the five sites in its own
