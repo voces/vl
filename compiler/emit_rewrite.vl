@@ -395,6 +395,11 @@ export function dispatchRewrite(stmts: i32[]) {
 // shape passes (the union's box + variants intern for the return). A non-union recorded return / an
 // already-annotated lambda is left untouched → byte-identical (the compiler has no union-returning
 // lambdas, so the native fixpoint is unaffected).
+//
+// EVERY ARM BELOW READS THE SAME WAY: the checker proved/adopted shape X at the lambda's boundary,
+// and pinning `fnRet` routes the lambda through the lowering the ANNOTATED named-function spelling
+// already has. Each arm states only what is its own — the recorder, the witness, and the failure the
+// pin prevents.
 export function synthRetAnnots() {
   if !fnValUsed { return 0 }
   let fe = 0
@@ -429,95 +434,79 @@ export function synthRetAnnots() {
             // the union pin.)
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if nameIsMapMemberUnion(ctx) {
-            // A MAP-MEMBER-UNION return (`{[string]:f32} | {w:i32}`) the checker proved at the
-            // lambda's boundary — pin it so the lambda's `$fnsig` result keys the union box (`>u`)
-            // and `emitReturnValue` boxes the struct/map arm through the #865/#868 map-union rep,
-            // matching the value call's key. The annotated form (`: {[string]:f32}|{w:i32}`) already
-            // interns + lowers this box; the pin routes the anonymous lambda through it. (Map-union
-            // dual of the value-union pin.)
+            // A MAP-MEMBER-UNION return (`{[string]:f32} | {w:i32}`): the `$fnsig` result keys the
+            // union box (`>u`) and `emitReturnValue` boxes the struct/map arm through the #865/#868
+            // map-union rep, matching the value call's key. (Map-union dual of the value-union pin.)
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if parenUnionArrElemName(ctx) != "" {
             // An ELEMENT-VALUE-UNION list return (`(f64|null)[]`, `(i32|null)[]`, `(i64|boolean)[]`,
-            // `(i64|string)[]`) the checker proved at the lambda's boundary — pin it so
-            // `emitReturnValue` seeds each element through the value-union-box list rep
-            // (`refArrElemKind == 2`), exactly as the annotated `(…)[]` return does.
-            // `parenUnionArrElemName` extracts the box element (a `<v>|null` nullable value union OR a
-            // plain value union `i64|boolean`), the distinguishing mark of the niche/box list shape.
+            // `(i64|string)[]`): `emitReturnValue` seeds each element through the value-union-box
+            // list rep (`refArrElemKind == 2`). `parenUnionArrElemName` extracts the box element (a
+            // `<v>|null` nullable value union OR a plain value union `i64|boolean`), the
+            // distinguishing mark of the niche/box list shape.
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if nameIsNestedUnionElemArray(ctx) {
             // A NESTED (2-D+) union-element array return (`({f: (…) => boolean} | i32)[][]`,
-            // `(i64 | boolean)[][]`) the checker adopted/recorded at the lambda's boundary
-            // (`nestedElemUnionListRetName`) — pin it so `emitReturnValue`'s
-            // `tyAnnRefListKind`/`tyAnnRefListSlot` thread the OUTER ref-list slot into the
-            // body's nested array literal (each inner list builds the kind-2 box element),
-            // exactly as the annotated NAMED-function `(): (…)[][]` value spelling lowers
-            // today. Un-pinned, `fnRet < 0` gave no thread and the outer array self-classified
-            // `i32[][]` from its first inner list's leaf, storing a union-list element into the
-            // i32-list backing — INVALID-WASM (fuzz sweep wo7cNe declared, seed 174529790).
-            // The 1-D `parenUnionArrElemName` arm above rejects it (its `][]`-suffix guard).
+            // `(i64 | boolean)[][]`, recorded by `nestedElemUnionListRetName`): `emitReturnValue`'s
+            // `tyAnnRefListKind`/`tyAnnRefListSlot` thread the OUTER ref-list slot into the body's
+            // nested array literal (each inner list builds the kind-2 box element). Un-pinned,
+            // `fnRet < 0` gave no thread and the outer array self-classified `i32[][]` from its
+            // first inner list's leaf, storing a union-list element into the i32-list backing —
+            // INVALID-WASM (fuzz sweep wo7cNe declared, seed 174529790). The 1-D
+            // `parenUnionArrElemName` arm above rejects it (its `][]`-suffix guard).
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if nameIsNestedScalarLeafArray(ctx) {
-            // A NESTED scalar/string-leaf array return (`() => i64[][]`, `(i32) =>
-            // f64[][]`) the checker proved at the lambda's boundary — pin it so the
-            // body literal builds under the RETURN-position seed (`tyAnnRefListKind`
-            // → the arm's slot: `() => ([[100]])` under `() => i64[][]` builds i64
-            // inner lists, not the self-classified i32 default) and the lambda's
-            // `$fnsig` result keys the SAME reflist slot the annotation-side
-            // `annRetKind` resolves — the two producers must byte-match, else the
-            // value call finds no interned signature (or, pre-pin, the mismatched
-            // self-classified build emitted a wrapper-heap INVALID-WASM for an
+            // A NESTED scalar/string-leaf array return (`() => i64[][]`, `(i32) => f64[][]`):
+            // the body literal builds under the RETURN-position seed (`tyAnnRefListKind` →
+            // the arm's slot: `() => ([[100]])` under `() => i64[][]` builds i64 inner lists,
+            // not the self-classified i32 default), and the `$fnsig` result keys the SAME
+            // reflist slot the annotation-side `annRetKind` resolves — the two producers must
+            // byte-match, else the value call finds no interned signature (or, pre-pin, the
+            // mismatched self-classified build emitted a wrapper-heap INVALID-WASM for an
             // i64-magnitude leaf). (Nested-array dual of the union pin.)
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if nameIsLitUnionArray(ctx) {
-            // A LITUNION-ALIAS-element array return (`(i32) => K0[] = (q0) =>
-            // (["4664"])`) the checker adopted/recorded at the lambda's boundary — pin
-            // it so the body member literals build the i32 ATOM list under the
-            // annotated return's threading (un-pinned they self-classify a STRING list
-            // into the i32-list functype result — invalid wasm), exactly as the
-            // annotated named-function return (`mk(q0: i32): K0[]`) lowers.
+            // A LITUNION-ALIAS-element array return (`(i32) => K0[] = (q0) => (["4664"])`):
+            // the body member literals build the i32 ATOM list under the annotated return's
+            // threading. Un-pinned they self-classify a STRING list into the i32-list
+            // functype result — invalid wasm.
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if nameIsMapArray(ctx) {
-            // A MAP-ELEMENT array return (`(i32) => {[string]: f32}[] = (q1) => ([h0])`)
-            // the checker recorded at the lambda's boundary — pin it so the lambda's
-            // `$fnsig` result keys the SAME `>r<slot>;` the annotation-side `annRetKind`
+            // A MAP-ELEMENT array return (`(i32) => {[string]: f32}[] = (q1) => ([h0])`):
+            // the `$fnsig` result keys the SAME `>r<slot>;` the annotation-side `annRetKind`
             // resolves (`tyAnnRefListSlot` — the kind-3 map-element slot `ensureRefElem`
-            // interns); un-pinned, the literal-side element spelling diverged and the
-            // value call found no interned signature. The named-function spelling
-            // (`mk(q1: i32): {[string]: f32}[]`) lowers this already.
+            // interns). Un-pinned, the literal-side element spelling diverged and the value
+            // call found no interned signature.
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if ctx == "i64[]" || ctx == "f64[]" || ctx == "f32[]" {
-            // A DISTINCT-BACKING SCALAR-LEAF list return (`(i32) => f32[] = (q0) =>
-            // ([97.5])`, `() => i64[] = () => ([5])`) the checker proved/adopted at the
-            // lambda's boundary (`isScalarListRetName`'s recordable set) — pin it so the
-            // body literal builds the leaf's wrapper under the RETURN-position seed and
-            // the pinned TypeRef collects its list types (the value-call index read
-            // requires them; un-pinned, the read fails "list type not collected"),
-            // exactly as the annotated named-function return lowers. An i32-backed list
-            // (`i32[]`, `boolean[]`, `K0[]`) is never recorded here (self-classification
-            // already agrees with the annotation), so it never reaches this arm.
+            // A DISTINCT-BACKING SCALAR-LEAF list return (`(i32) => f32[] = (q0) => ([97.5])`,
+            // `() => i64[] = () => ([5])`, `isScalarListRetName`'s recordable set): the body
+            // literal builds the leaf's wrapper under the RETURN-position seed and the pinned
+            // TypeRef collects its list types — the value-call index read requires them;
+            // un-pinned, the read fails "list type not collected". An i32-backed list (`i32[]`,
+            // `boolean[]`, `K0[]`) is never recorded here (self-classification already agrees
+            // with the annotation), so it never reaches this arm.
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if nameIsStructWithLitUnionField(ctx) {
-            // A STRUCT-with-LITUNION-field return (`{f:K0}`) the checker adopted at the lambda
-            // boundary (`objLitWidenFields`' litunion arm) — pin it so the body literal builds
-            // the i32-ATOM struct and the `$fnsig` result keys the SAME struct every annotated
-            // consumer codes. Reached only where NO annotation threads into the lambda (nested
-            // through a union's closure arm inside another lambda's expression body — fuzz
-            // seed 26306770 d4); the direct-arg spelling already built the atom struct via the
-            // param-annotation seed, and the pin emits it identically (the annotated inner
-            // spelling `(q0): {f: K0} => …` lowers today).
+            // A STRUCT-with-LITUNION-field return (`{f:K0}`, recorded by `objLitWidenFields`'
+            // litunion arm): the body literal builds the i32-ATOM struct and the `$fnsig`
+            // result keys the SAME struct every annotated consumer codes. Reached only where
+            // NO annotation threads into the lambda (nested through a union's closure arm
+            // inside another lambda's expression body — fuzz seed 26306770 d4); the direct-arg
+            // spelling already built the atom struct via the param-annotation seed.
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if (
             ctx.length > 2 &&
             nameIsArray(ctx) &&
             nameIsStructWithUnionField(arrElemNameRaw(ctx))
           ) {
-            // A UNION-FIELD-STRUCT-element LIST return (`{f:{f:f64}|boolean}[]`) the checker
-            // adopted at the lambda boundary (`structFieldBoxElemListRetName`) — pin it so the
-            // body array literal builds boxed-field elements and the `$fnsig` result keys the
-            // SAME reflist slot the annotated `(): {f:…|boolean}[]` spelling (which lowers
-            // already) resolves. Un-pinned, the self-inferred plain-element list stored a
-            // struct ref into the boxed field's i32 tag slot — INVALID-WASM (fuzz-nightly run
-            // 29874629450, seed 214588500 d6). (Element-list sibling of the struct arm below.)
+            // A UNION-FIELD-STRUCT-element LIST return (`{f:{f:f64}|boolean}[]`, recorded by
+            // `structFieldBoxElemListRetName`): the body array literal builds boxed-field
+            // elements and the `$fnsig` result keys the SAME reflist slot the annotated
+            // `(): {f:…|boolean}[]` spelling resolves. Un-pinned, the self-inferred
+            // plain-element list stored a struct ref into the boxed field's i32 tag slot —
+            // INVALID-WASM (fuzz-nightly run 29874629450, seed 214588500 d6).
+            // (Element-list sibling of the struct arm below.)
             //
             // The guard's `[]` TEST and `[]` CUT are `emit_base`'s two homes (`nameIsArray` /
             // `arrElemNameRaw`, #1175) — this arm and the next spelled both halves out by
@@ -543,25 +532,23 @@ export function synthRetAnnots() {
             fn.fnRet = synthTypeRef(resolveShapeToNominal(ctx), -1)
           } else if nameIsStructWithUnionField(ctx) {
             // A STRUCT-with-UNION/NULLABLE-field return (`{f: boolean | {w: i32}}`,
-            // `{f: i64 | string}`) the checker adopted at the lambda boundary
-            // (`objRetWidenAdopt`'s boxing-widen arm) — pin it so the lambda's `$fnsig` result
-            // is the union-FIELD struct (`retStructIndex` → the boxed-field shape) and
-            // `emitReturnValue` coerces the body ObjLit into the boxed field slot, matching the
-            // value call. Without the pin the lambda's result was the plain body-inferred struct
-            // (`{f: boolean}` / `{f: i32}`), so the value call mis-recovered the boxed field —
-            // a MISMATCH (`t0(1).f is boolean` read the wrong tag) or INVALID-WASM (an i64 field
-            // read where an i32 was stored). (Struct-field dual of the map-member-union pin.)
+            // `{f: i64 | string}`, recorded by `objRetWidenAdopt`'s boxing-widen arm): the
+            // `$fnsig` result is the union-FIELD struct (`retStructIndex` → the boxed-field
+            // shape) and `emitReturnValue` coerces the body ObjLit into the boxed field slot,
+            // matching the value call. Un-pinned, the lambda's result was the plain
+            // body-inferred struct (`{f: boolean}` / `{f: i32}`), so the value call
+            // mis-recovered the boxed field — a MISMATCH (`t0(1).f is boolean` read the wrong
+            // tag) or INVALID-WASM (an i64 field read where an i32 was stored). (Struct-field
+            // dual of the map-member-union pin.)
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if nameIsStructWithMapField(ctx) {
             // A MAP-carrying STRUCT return (`{a:string,f:{f:{[string]:{f:i64}}},z:f32}`,
-            // recorded canonically by `structMapFieldRetName`) — pin it so the body
-            // ObjLit's NESTED literals thread the annotation's per-field struct indices.
-            // Un-pinned, the inner `{f: h0}` resolved by first-field-name-set match onto
-            // the map's own VALUE struct `{f: i64}` (interned first), the map ref took the
-            // i64 field widen, and the outer literal minted a WRONG-layout twin row —
-            // INVALID-WASM (`i64.extend_i32_s` on a map ref; fuzz-nightly seed 184510897
-            // d6). The annotated named-function spelling lowers this already; the pin
-            // routes the anonymous lambda through it. (Map-field sibling of the
+            // recorded canonically by `structMapFieldRetName`): the body ObjLit's NESTED
+            // literals thread the annotation's per-field struct indices. Un-pinned, the inner
+            // `{f: h0}` resolved by first-field-name-set match onto the map's own VALUE struct
+            // `{f: i64}` (interned first), the map ref took the i64 field widen, and the outer
+            // literal minted a WRONG-layout twin row — INVALID-WASM (`i64.extend_i32_s` on a
+            // map ref; fuzz-nightly seed 184510897 d6). (Map-field sibling of the
             // union-field-struct pin above.)
             fn.fnRet = synthTypeRef(ctx, -1)
           } else if nameIsWholeSpanShape(ctx) && !strContains(ctx, " ") {

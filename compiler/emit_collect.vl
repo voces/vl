@@ -7,6 +7,11 @@
 // index assignment (`mAssignTypeIndices`). Consults the classifiers
 // (`emit_classify.vl`); writes no bytes. Carved out of `wasmEmit.vl`
 // (review N18).
+//
+// ADDITIVE GATING runs through every pass here (the convention is stated once, in
+// `emit_state.vl`'s header): a table slot / heap type is interned only when the program uses
+// the feature, so a program that does not emits exactly the bytes it did before the feature
+// existed. Each pass below states only its own gate, not that consequence.
 
 import {
   T,
@@ -582,10 +587,8 @@ function internCloSigOfAtom(atom: string) {
 //
 // BOUNDED to results that ROUND-TRIP through a value call: a level's key is interned only
 // when its RESULT is a nested closure (the shared fat-pointer, always valid) or a plain
-// numeric/boolean SCALAR (`cloResultIsPlainScalar`). A composite result (struct / union /
-// litunion / map / string) is deliberately left un-interned so the value call stays a clean
-// REJECT — synthesizing its sig would let a mis-lowering nested body reach INVALID-WASM /
-// TRAP (the recovery of a boxed/atom result through a CHAINED closure call is a later slice).
+// numeric/boolean SCALAR — `cloResultIsPlainScalar`, whose header carries the reason a
+// composite result must stay a clean REJECT instead.
 function internCloResultChain(tn: string) { internCloResultSpine(tn, false) }
 // THE ONE HOME of the closure RESULT-SPINE walk. `internCloResultChain` (the CHECKER-type
 // entry, off a closure-returning lambda's `nodeTyName`) and `internNulCloResultSpine` (the
@@ -631,12 +634,9 @@ function internCloResultSpine(tn: string, wideShape: boolean) {
 // (`(() => ((i32) => f32)) | null` → the inner `(i32) => f32`; `((i32) => (() =>
 // {a: i64, f: i32, z: f64})) | null` → the inner `() => {a: …}`). The annotation may be the
 // program's ONLY spelling of these types (the value only ever `null`, narrowed and called),
-// so no concrete lambda ever mints them. Same spine walk and scalar/closure bound as
-// `internCloResultChain`, WIDENED to a single-shape STRUCT result: a `>sN;` result round-trips
-// through a chained value call (the struct is a plain ref read off the `call_ref` result), and
-// `unionArmSigKey` keys "" for a shape that never interned — that level then stays a clean
-// reject. The litunion / union-box / map / string results stay excluded (their recovery
-// through a CHAINED closure call is the same unfinished slice `internCloResultChain` bounds).
+// so no concrete lambda ever mints them. `wideShape` true — see `internCloResultSpine` for
+// what the single-shape STRUCT widening buys and why litunion / union-box / map / string
+// results stay excluded.
 function internNulCloResultSpine(tn: string) { internCloResultSpine(tn, true) }
 
 // Collect the distinct `$fnsig` env-leading functypes — one per distinct eligible
@@ -657,8 +657,7 @@ export function collectCloSigs() {
     // above excludes both. Mirrors the object-field-closure pass below, but for a
     // function reached through a binding / param rather than a struct field.
     // `cloSigKeyExt` yields "" for the kinds still outside the value ABI (string, i64),
-    // so those stay unminted; usage-gated by `fnValUsed`, so a program without such a
-    // function value emits byte-identical types.
+    // so those stay unminted.
     if key == "" { key = cloSigKeyExt(fe) }
     // The CONCRETE-lambda rep: this key's representative is the lifted function itself,
     // not the -1 synth sentinel.
@@ -721,9 +720,8 @@ export function collectCloSigs() {
   // struct-returning (`"[]": function(i) row(i)`, an operator field returning a
   // struct) — sigs the value ABI above excludes. Intern each such field
   // closure's extended key (`>v` / `>sN;` results) so the member-call site can
-  // `ref.cast` to the callee's REAL functype. Usage-gated: only fires for a
-  // field closure whose sig is NOT already value-eligible, so a program without
-  // one emits byte-identical types.
+  // `ref.cast` to the callee's REAL functype. Only fires for a field closure whose
+  // sig is NOT already value-eligible.
   let ai = 0
   while ai < P.nodes.length {
     const an = P.nodes[ai]
@@ -752,8 +750,8 @@ export function collectCloSigs() {
   // arms; for each function-type arm intern its annotation key (`unionArmSigKey`, which
   // normalizes the wrapped/spaced atom to the SAME key `narrowedClosureOf` → `annSigKey`
   // yields at the call site) with the -1 rep sentinel — the type-section emitter
-  // (`emitSynthCloSig`) synthesizes its functype from the key. Usage-gated by `fnValUsed`
-  // (a closure union arm flips it), so a program without one emits byte-identical types.
+  // (`emitSynthCloSig`) synthesizes its functype from the key. Gated by `fnValUsed`, which a
+  // closure union arm flips.
   let ui = 0
   while ui < unMemberSet.length {
     // D-UNION set ADT — this walk iterates the ROW, so it reads the row's own
@@ -781,9 +779,8 @@ export function collectCloSigs() {
     }
     let uj = 0
     while uj < atoms.length {
-      // A FUNCTION-TYPE union arm (`(() => i64) | i64`): the arm's own closure sig.
-      // The mixed-unregistered-result skip that used to be spelled out here is the
-      // home's step 2 — the fuzz-nightly seed 113152631 d4 discovery of it.
+      // A FUNCTION-TYPE union arm (`(() => i64) | i64`): the arm's own closure sig. The
+      // home's step-2 skip is this position's fuzz finding (fuzz-nightly seed 113152631 d4).
       internCloSigOfAtom(atoms[uj])
       // A CLOSURE-ARRAY ARM (`((i32, i32, i32) => boolean)[] | i32`) — plain or
       // nullable-element (`(((i32) => R) | null)[]`, the kind-5 niche): the arm's
@@ -813,8 +810,7 @@ export function collectCloSigs() {
   // trim+paren-peel+`annSigKey` normalization the call site uses, so the keys byte-match;
   // a result outside the value ABI keys "" and stays a loud reject) with the -1 synth rep
   // (`emitSynthCloSig`). Idempotent via `cloSigPosOfKey` — a live lambda of the same shape
-  // dedups onto its key; a program without a nulclosure TypeRef pushes nothing (and the
-  // `fnValUsed` gate above keeps everything else byte-identical).
+  // dedups onto its key; a program without a nulclosure TypeRef pushes nothing.
   let ni = 0
   while ni < P.nodes.length {
     const nn = P.nodes[ni]
@@ -863,8 +859,8 @@ export function collectCloSigs() {
   // union-arm field, or a closure FIELD of a CLOSURE-RESULT struct (`(i32) => {f: () => i32}` —
   // the TypeRef's whole name is the outer closure, no spelling-descent enumerates it) is
   // reachable in the arena regardless of nesting. Idempotent + order-stable via `cloSigPosOfKey`;
-  // the `fnValUsed` gate at the top keeps a program without function values byte-identical (this
-  // loop is unreachable when `fnValUsed` false).
+  // the `fnValUsed` gate at the top makes this loop unreachable for a program with no function
+  // values.
   let ri = 0
   while ri < cloSigWalkRoots.length {
     if collectTyReachCloSigs(cloSigWalkRoots[ri], 16) < 0 { return -1 }
@@ -1067,19 +1063,13 @@ function liftFnsInExpr(ix: i32, parent: i32) {
 }
 
 // ── function-index map ───────────────────────────────────────────────────────
-// A module has N top-level functions. Each is assigned a wasm function index by
-// its position in `progStmts` (the 0th `FuncDecl` is func 0, the 1st is func 1, …),
-// and every function shares the SAME type index (all are `(i32 * n) -> i32`, but
-// arities differ, so each gets its own type — see `emitModule`). A `call` lowers a
-// callee NAME to its function index, so the name→index map is built over ALL
-// top-level functions BEFORE any body is emitted: that makes forward references and
-// (since a function's own name is already mapped) recursion resolve for free.
-//
-// The map is two parallel top-level `let` arrays (they lower to wasm globals): the
-// i-th name maps to the i-th function index. `fnNames[i]`'s function index is
-// `fnIndices[i]`, which equals `i` here but is kept explicit for clarity.
-// Map each function NAME to its wasm function index (its position in `fnStmts`), and
-// record whether it returns the struct. Returns the function count.
+// Map each function NAME to its wasm function index — its position in `fnStmts` — and record
+// its return facts (voidness, struct index, ref-array element, boolean, kind). A `call` lowers
+// a callee NAME through this map, so it is built over ALL top-level functions BEFORE any body
+// is emitted: that makes forward references and (a function's own name being already mapped)
+// recursion resolve for free. Two parallel module-global arrays — `fnNames[i]`'s function index
+// is `fnIndices[i]`, which equals `i` here but is kept explicit. Arities differ, so each
+// function gets its own functype (`emitModule`). Returns the function count.
 export function buildFnMap(_stmts: i32[]) {
   fnNames = []
   fnNameMap = Map()
@@ -2628,9 +2618,15 @@ export function mAssignTypeIndices(_n: i32) {
   mNextType
 }
 
+// Scan the whole arena for every use of a collection heap type, setting the PRESENCE flags
+// (`aUsed`/`lUsed`/`raUsed`/`rlUsed`/`mUsed`/`slUsed`/the wide-scalar `*Used` trio — see the
+// type tables in `emit_state.vl`) and re-minting the ref-list / map-value / annotation-node
+// rows keyed against them. A VL string IS the same `(array (mut i32))` an array is, so a
+// string literal / `string` annotation forces `aUsed` just as an array literal does. A single
+// linear pass over `P.nodes` is exhaustive (every node, reachable or not, is checked) and
 // stable: it fixes whether the program needs the array heap type BEFORE the type
-// section is emitted. Each `[]` annotation is validated as `i32[]` here, so a non-i32
-// element array (e.g. `string[]`) fails loudly up-front. Returns 0, or -1 (via
+// section is emitted. An array annotation no earlier arm claimed is validated by
+// `checkArrName`, so an unsupported element type fails loudly up-front. Returns 0, or -1 (via
 // `emitFail`).
 export function collectA(_stmts: i32[]) {
   // Gather every FuncDecl TYPE-PARAMETER name first (a separate cheap pass — a
@@ -2829,11 +2825,8 @@ export function collectA(_stmts: i32[]) {
       // NESTED arrow — an array OF functions) is NOT caught here; it falls through to
       // the array branches below. Checked FIRST so the trailing `[]` of a list-returning
       // function type (`(i32) => i32[]`) is never mis-read as an array name.
-      //
-      // Master asked `annArrowAt(nd.tyName)` TWICE for this one answer — once as the
-      // branch GATE and once to slice the return out. `annRetNameOf` is that pair, and
-      // its "" is the gate: a name with a top-level arrow always has a return spelling
-      // after it.
+      // `annRetNameOf` is the arrow-scan + return-slice pair, and its "" IS the gate: a
+      // name with a top-level arrow always has a return spelling after it.
       const frRet = annRetNameOf(nd.tyName)
       if frRet != "" {
         if frRet == "i32[]" {
@@ -2895,26 +2888,22 @@ export function collectA(_stmts: i32[]) {
         // still emits the element's ref-list type.
         let ran = nd.tyName
         const ranp = nullablePartOf(ran)
-        // "Is this the NULLABLE ref-list spelling" — asked ONCE. Master spelled the
-        // identical `ranp != "" && nameIsRefArray(ranp)` conjunction out twice, once to
-        // peel `ran` and once (twenty lines down) to set the banked row's null flag; the
-        // second read is by construction the same answer, since `ranp` is never rewritten
-        // and `nameIsRefArray` is not called across an intern here.
+        // "Is this the NULLABLE ref-list spelling" — asked ONCE, and read again twenty
+        // lines down to set the banked row's null flag. The second read is by construction
+        // the same answer: `ranp` is never rewritten and no intern runs between them.
         const ranIsNul = ranp != "" && nameIsRefArray(ranp)
         if ranIsNul { ran = ranp }
-        // The element KIND, classified ONCE. Master asked `refArrElemKind(ran)` SEVEN
-        // times in this arm for one answer, straddling the `ensureRefElem` intern — the
-        // only call between them that mutates any table the classifier reads. Measured
-        // (D-RAKIND probe): over the whole corpus and 25,200 fuzz programs the hoisted
-        // value and a re-derivation after the intern NEVER disagree, and the probe's
-        // comparator is sane (inverting the hoist reddens it on the first reaching file).
-        // `ran` is final here — the `| null` peel two lines up is its last write.
+        // The element KIND, classified ONCE for the seven reads in this arm — which
+        // straddle the `ensureRefElem` intern, the only call between them that mutates a
+        // table the classifier reads. Measured (D-RAKIND probe): over the whole corpus and
+        // 25,200 fuzz programs the hoisted value and a re-derivation after the intern NEVER
+        // disagree, and the comparator is sane (inverting the hoist reddens it on the first
+        // reaching file). `ran` is final here — the `| null` peel two lines up is its last
+        // write.
         const raKind = refArrElemKind(ran)
-        // The element NAME, resolved ONCE for the same reason the kind is: master asked
-        // `refArrElemName(ran)` in the kind-2 reject AND again in the `recordAnnRlSlot`
-        // bank below, and the bank's call is UNCONDITIONAL — so hoisting it here strictly
-        // REMOVES work (one resolution instead of two on every kind-2 element) rather
-        // than adding a speculative one.
+        // The element NAME, resolved ONCE for the same reason: the kind-2 reject and the
+        // UNCONDITIONAL `recordAnnRlSlot` bank below both need it, so hoisting strictly
+        // REMOVES work (one resolution instead of two on every kind-2 element).
         const ren = refArrElemName(ran)
         // A kind-2 (union-box) element that is a NICHE nullable (`(boolean | null)[]`,
         // `(string | null)[]` — one non-null member + null, deliberately NOT a value
@@ -3022,10 +3011,9 @@ export function collectA(_stmts: i32[]) {
       // A MAP reached only as a CLOSURE RESULT inside this annotation — a union arm
       // (`(() => {[string]: f64}) | {w: i32}`), the nullable-closure niche, or a
       // curried result — is invisible to every branch above (the whole spelling is
-      // ONE name). Force its machinery + intern its value slot; self-gating, so this
-      // is byte-identical for any annotation without a map-resulted closure arm.
-      // Runs OUTSIDE the chain: an arm-position closure result composes with
-      // whatever branch claimed the name.
+      // ONE name). Force its machinery + intern its value slot; self-gating. Runs
+      // OUTSIDE the chain: an arm-position closure result composes with whatever
+      // branch claimed the name.
       forceCloResultMapTypes(nd.tyName)
       // The LIST dual: a scalar-leaf/string list reached only as a CLOSURE RESULT inside
       // this annotation (`((i32) => f32[]) | null`, `(() => i32[]) | null`) — force its
@@ -3064,61 +3052,56 @@ export function collectA(_stmts: i32[]) {
     }
     ufn = ufn + 1
   }
+  // ── FIELD-TABLE RE-DERIVATION (struct table, then the variant table below) ──
+  // TWO RULES run through every arm of both loops, so neither is restated per arm:
+  //  (1) a field's own type is NEVER a standalone TypeRef the arena scan above sees — the
+  //      whole `{m:{[string]:V}}` shape / whole union spelling is ONE name — so an
+  //      inline-shape or variant field's needs are re-derived from the field TABLE here,
+  //      after the resets, where the interned slot persists;
+  //  (2) the field may be the module's ONLY mention of its rep, so the flags are forced
+  //      even when nothing else does: a `{f: null}`-only construct never builds a literal,
+  //      and a closure-result shape `() => {f: {[string]: V}}` is reached only through a
+  //      union arm yet still emits the map read path.
+  // Every intern below is idempotent (`mvShapeOfValName` / `ensureRefElem` dedupe), so a
+  // NOMINAL field already interned via its own TypeRef is a no-op.
+  //
   // Inline-struct MAP FIELDS (`const s: { m: {[string]: V} }`): `collectAnnShapes` registered
-  // them as code-19 fields with the value name in `sFieldElemName`, but their inner map is
-  // not a standalone TypeRef the scan above sees (the whole `{m:{[string]:V}}` is ONE name).
-  // Intern each code-19 field's mv slot here so emit resolves it. Idempotent (mvShapeOfValName
-  // dedupes), so a named struct's already-interned field is a no-op — byte-identical for any
-  // program without an inline map-valued field.
+  // them as code-19 fields with the value name in `sFieldElemName`; intern each one's mv slot.
   let sfi = 0
   while sfi < sFieldTypes.length {
-    // A code-19 map field forces the shared map machinery like its nullable twin
-    // below: the field may be the module's only map mention (a closure-result shape
-    // `() => {f: {[string]: V}}` reached only through a union arm still emits the
-    // map read path).
     if sFieldTypes[sfi] == 19 {
       mUsed = true
       lUsed = true
       aUsed = true
       mvShapeOfValName(sFieldElemName[sfi])
     }
-    // A NULLABLE map field (code 29) interns the same mv value slot as its non-null
-    // twin, and forces the shared map machinery types — the field may be the module's
-    // only map mention (a `{f: null}`-only construct still emits `(ref null $mapStruct)`).
+    // A NULLABLE map field (code 29) interns the same mv value slot as its non-null twin.
     if sFieldTypes[sfi] == 29 {
       mUsed = true
       lUsed = true
       aUsed = true
       mvShapeOfValName(sFieldElemName[sfi])
     }
-    // A REF-LIST field (code 5): intern its element so `sFieldRefSlot` (`rlSlotByName`) resolves. An
-    // INLINE-shape ref-list field's element is NEVER a standalone TypeRef the scan above sees (only the
-    // whole `{f:N[]}`), so intern it from the struct table here — this runs after the rl-table reset, so
-    // the slot persists. A NOMINAL field's element is already interned via its own TypeRef; `ensureRefElem`
-    // dedupes, so this is byte-identical for programs with no inline ref-list field.
+    // A REF-LIST field (code 5) and its nullable twin (28): intern the element so
+    // `sFieldRefSlot` (`rlSlotByName`) resolves.
     if sFieldTypes[sfi] == 5 || sFieldTypes[sfi] == 28 {
       rlUsed = true
       raUsed = true
       ensureRefElem(sFieldElemName[sfi])
     }
-    // A `string | null` FIELD (code 20) is a `(ref null $aTypeIdx)` slot — force the string backing, like
-    // the standalone `string | null` annotation above. An inline `{ f: string | null }` field's inner type
-    // is never a standalone TypeRef the scan sees, so without this a `{ f: null }` (no other string in the
-    // module) left `$aTypeIdx` unallocated and the field read referenced a stale type → invalid wasm.
+    // A `string | null` FIELD (code 20) is a `(ref null $aTypeIdx)` slot — force the string
+    // backing. Without this a `{ f: null }` (no other string in the module) left `$aTypeIdx`
+    // unallocated and the field read referenced a stale type → invalid wasm.
     if sFieldTypes[sfi] == 20 { aUsed = true }
     // An i32/boolean-LIST field (code 4, atom-array elem name or plain) and its NULLABLE twin
-    // (code 18, `i32[] | null`): the field IS (or holds) the i32 list, but an inline-shape field
-    // type is never a standalone TypeRef the scan sees — and the field may be the module's only
-    // list mention (a null-carrying construct never builds a literal). Force the wrapper/backing
-    // here so the field valtype and any narrowed read resolve.
+    // (code 18, `i32[] | null`): force the wrapper/backing so the field valtype and any
+    // narrowed read resolve.
     if sFieldTypes[sfi] == 4 || sFieldTypes[sfi] == 18 {
       lUsed = true
       aUsed = true
     }
-    // A STRING-list field (code 6) forces its own wrapper/backing pair, same reasoning —
-    // as does its NULLABLE twin (code 31, `string[] | null`), which rides the SAME
-    // `$mkListIdx` wrapper and may be the module's only string-list mention (a field that
-    // only ever holds `null` never builds a literal).
+    // A STRING-list field (code 6) and its NULLABLE twin (31, `string[] | null`), which rides
+    // the SAME `$mkListIdx` wrapper: force that wrapper/backing pair.
     if sFieldTypes[sfi] == 6 || sFieldTypes[sfi] == 31 {
       slUsed = true
       aUsed = true
@@ -3128,19 +3111,11 @@ export function collectA(_stmts: i32[]) {
     forceScalarListField(sFieldTypes[sfi])
     sfi = sfi + 1
   }
-  // Union-VARIANT map fields (`{f: {[string]: V}} | i32`): the variant-table twin of the
-  // code-19 struct-field intern above. A shape-text variant records the map's value name
-  // (`shapeFieldElemName`), but the whole union spelling is ONE TypeRef the map branch of
-  // the scan never matches — intern each variant map field's mv slot here so the variant
-  // struct emission + the narrowed field-read op sites resolve it. Idempotent, and a mono
-  // value (i32 / boolean / atom) is a no-op (`mvShapeOfValName` returns -1, no intern) —
-  // byte-identical for any program without a map-valued union-variant field.
+  // The variant-table twins of the same arms (a shape-text variant records its map value name
+  // via `shapeFieldElemName`); a mono map value (i32 / boolean / atom) is a no-op
+  // (`mvShapeOfValName` returns -1, no intern).
   let ufi = 0
   while ufi < uFieldTypes.length {
-    // The variant-table twins of the struct-field re-derivations above: a variant field's
-    // type is never a standalone TypeRef the scan sees (the whole union spelling is ONE
-    // name), and the registration-time forcing predates this pass's resets — re-derive
-    // each list-ish field's wrapper/backing needs from the surviving tables.
     if uFieldTypes[ufi] == 4 || uFieldTypes[ufi] == 18 {
       lUsed = true
       aUsed = true
@@ -3158,10 +3133,9 @@ export function collectA(_stmts: i32[]) {
       ensureRefElem(uFieldElemName[ufi])
     }
     if uFieldTypes[ufi] == 19 {
-      // Force the shared map machinery types too: the variant's map field may be the
-      // program's ONLY map mention (a `({f: {[string]: string}} | string)[]` param whose
-      // caller only ever passes the string arm) — without the flags the narrowed field's
-      // map ops rejected "map type not collected" even though the field names a map.
+      // Rule (2)'s witness on this side: a `({f: {[string]: string}} | string)[]` param whose
+      // caller only ever passes the string arm. Without the flags the narrowed field's map
+      // ops rejected "map type not collected" even though the field names a map.
       mUsed = true
       lUsed = true
       aUsed = true
@@ -3250,15 +3224,12 @@ function collectAnonShapes() {
           // A synthetic UNIQUE name (the `#` prefix can never collide with a user
           // identifier or annotation) — a real key, so a ref LIST of this element
           // shape interns a per-element-type slot (`rlInternName` treats the empty
-          // string as its "not a ref element" sentinel).
-          // ARENA-INDEX SIDECAR (D0/D1): an `#anon` name never resolves through
-          // the checker's annotation grammar, so `slotCanonKey` cannot key it off
-          // the name. Record the literal's CONTEXT-RESOLVED arena type index; the
-          // key is then derived at QUERY time, so it follows later arena mutation
-          // instead of freezing the render at intern time (which is what the
-          // previous key-string sidecar did.
+          // string as its "not a ref element" sentinel). An `#anon` name never resolves
+          // through the checker's annotation grammar, so `slotCanonKey` cannot key it
+          // off the name: the D0 arena-index sidecar records the literal's
+          // CONTEXT-RESOLVED type index instead, and the key is derived at QUERY time so
+          // it follows later arena mutation rather than freezing a render at intern time.
           sNames.push("#anon" + i32ToStr(sNames.length))
-          // D0: the literal's CONTEXT-RESOLVED arena type — the same node
           recordSTyIx(anonRowTyIx(ai))
           sFieldStart.push(sFieldNames.length)
           sFieldCount.push(codes.length)
@@ -3366,11 +3337,6 @@ export function collectGenAliasShapes() {
   0
 }
 
-// Scan the top-level statements for EVERY struct `type` declaration and record each
-// into the flat multi-struct table (name + field names in declaration order, plus a
-// per-field wasm-type code: `0` = i32 / boolean, `3` = string). Each `type X = {…}`
-// interns its own WasmGC struct heap type. A field whose type is neither i32/boolean
-// nor string fails loudly. Returns 0 on success, or -1 (via `emitFail`).
 // Intern every INLINE-SHAPE struct field type (`type Box = { inner: {x:i32} }`) depth-first BEFORE the
 // struct decls that reference it, so `collectS`'s main loop resolves the nested shape (it can't be
 // interned mid-loop — `internInlineShape` shares the flat `sField*` arrays). `internInlineShape` is a
@@ -3413,16 +3379,14 @@ function collectNestedFieldShapes(stmts: i32[]) {
 // `sFieldElemName` / `uFieldElemName` column.
 //
 // `collectS`'s struct loop and `collectVariantFields`'s variant loop are the SAME ladder —
-// same codes, same order, same column, differing only in which table they push to — and
-// each carried this patch on top of `fieldRefElemName` by hand. Being two copies, they had
-// already DRIFTED: the variant copy re-derived the code-4 (litunion ARRAY) recording that
-// `fieldRefElemName` performs itself, and the struct copy did not. The two are now one
-// reading, and the redundant arm is gone rather than mirrored.
+// same codes, same order, same column, differing only in which table they push to — and had
+// DRIFTED as two hand-written copies (the variant one re-derived a code-4 litunion-ARRAY
+// recording `fieldRefElemName` performs itself; the struct one did not).
 //
-// `fieldRefElemName` answers every code but 0 and 30 — for those two it returns "" BY
-// CONSTRUCTION (`emit_classify.vl`'s `fieldRefElemName`, whose comment says so: "the ATOM
-// codes the shape-text recorder keys and the NODE recorder does not"), and the atom name
-// comes from the annotation's own spelling, which is what these two arms supply.
+// `fieldRefElemName` answers every code but 0 and 30, for which it returns "" BY CONSTRUCTION
+// ("the ATOM codes the shape-text recorder keys and the NODE recorder does not", its own header
+// in `emit_classify.vl`); the atom name then comes from the annotation's own spelling, which is
+// what these two arms supply.
 function fieldRecElemName(tyIx: i32, code: i32) {
   const en = fieldRefElemName(tyIx)
   // A literal-union atom field (code 0) records its union NAME (not the ref-elem name,
@@ -3444,15 +3408,12 @@ function fieldRecElemName(tyIx: i32, code: i32) {
 // effects every recorder ran — the code-16 value-union box intern and the scalar-list
 // wrapper/backing forcing.
 //
-// #1147 named `fieldRecElemName` after finding the ELEMENT-NAME arm hand-written twice.
-// The ROW PUSH around it was hand-written THREE times: `collectS` (struct decls),
-// `collectVariantFields` (named-struct variants) and `collectShapeVariantFields` (inline
-// SHAPE-TEXT variants). The third is why the parameter is the elem NAME rather than the
-// annotation node: the shape-text recorder derives it from a field TYPE TEXT
-// (`shapeFieldElemName(ftxt, fc)`) where the two node recorders derive it from a
-// `FieldDef` node (`fieldRecElemName(fdType, code)`), and those two derivations are
-// genuinely different questions — the ROW is what all three share, character for
-// character, and it is all that is named here.
+// Three recorders share it: `collectS` (struct decls), `collectVariantFields` (named-struct
+// variants) and `collectShapeVariantFields` (inline SHAPE-TEXT variants). The third is why
+// the parameter is the elem NAME rather than the annotation node — it derives that name from
+// a field TYPE TEXT (`shapeFieldElemName(ftxt, fc)`) where the two node recorders derive it
+// from a `FieldDef` (`fieldRecElemName(fdType, code)`, #1147), genuinely different questions.
+// The ROW is what all three share, character for character, and all that is named here.
 //
 // The push ORDER matters and is preserved exactly: the D5 sidecar recorder pads itself
 // against `*FieldElemName.length`, so it must run AFTER that column's push and before the
@@ -3485,10 +3446,13 @@ function pushFieldRow(
   0
 }
 
-// ── struct-type collection + struct-typedness of expressions ─────────────────
-// `isSName` tells whether a type-name refers to the declared struct; `collectS`
-// records the program's single struct type; the rest decide whether a given
-// expression / param / local PRODUCES the struct (a `(ref $0)`) rather than an i32.
+// ── struct-type collection ───────────────────────────────────────────────────
+// Scan the top-level statements for EVERY struct `type` declaration and record each into the
+// flat multi-struct table (name + field names in declaration order, plus a per-field wasm-type
+// code from `fieldTypeCode`); each `type X = {…}` interns its own WasmGC struct heap type, and
+// a field whose type has no code fails loudly. Then the shape passes, in order: nested inline
+// field shapes, generic-alias applications, inline object-TYPE annotations, and anonymous
+// object literals. Returns 0, or -1 (via `emitFail`).
 export function collectS(stmts: i32[]) {
   sDeclared = false
   // The per-program literal-resolution memo keys node indices against THIS table —
@@ -3573,11 +3537,6 @@ export function collectS(stmts: i32[]) {
 }
 
 // ── union collection (G1) ─────────────────────────────────────────────────────
-// The struct field names + per-field wasm-type codes (`0` i32/boolean, `3` string) of
-// the `TypeDecl` named `name` are recorded into the flat
-// `uFieldNames`/`uFieldStart`/`uFieldCount`/`uFieldTypes` table (declaration order =
-// wasm field index). The struct must exist among the top-level statements and carry
-// only i32/boolean/string fields, else fails loudly. Returns 0, or -1 (via `emitFail`).
 // Parse the inline-shape variant `nm` (`{x:i32,y:string}`) into the flat
 // union-variant field tables — the variant-table twin of `collectAnnShapes`'s
 // field split (same depth-aware `,`/`:` grammar).
@@ -3619,6 +3578,10 @@ function collectShapeVariantFields(nm: string) {
   0
 }
 
+// Record the field names + per-field wasm-type codes of the `TypeDecl` named `name` into the
+// flat `uFieldNames`/`uFieldStart`/`uFieldCount`/`uFieldTypes` table (declaration order = wasm
+// field index). The struct must exist among the top-level statements and every field must
+// carry a code, else fails loudly. Returns 0, or -1 (via `emitFail`).
 function collectVariantFields(stmts: i32[], name: string) {
   // An INLINE-SHAPE variant (`{x:i32}` inside `{x:i32}|{y:i32}`) carries its
   // fields in its own text — parse them (the annotation-shape field grammar)
@@ -3647,12 +3610,7 @@ function collectVariantFields(stmts: i32[], name: string) {
               )
             }
             // The struct twin's ladder exactly (`fieldRecElemName` for the name,
-            // `pushFieldRow` for the row) — the variant table records the SAME name for the
-            // same code. Its own code-4 (litunion ARRAY) arm was REDUNDANT:
-            // `fieldRefElemName` falls through to `shapeFieldElemName(name, 4)`, whose
-            // `nameIsLitUnionArray` arm returns that very name, so the copy re-derived what
-            // its callee had already returned — which is exactly why `collectS`'s twin never
-            // needed it.
+            // `pushFieldRow` for the row) — the variant table records the SAME name per code.
             pushFieldRow(
               true,
               code,
@@ -3776,18 +3734,11 @@ function assignTags() {
   0
 }
 
-// `nameIsSingleShape` LIVED HERE and is gone: once `emit_classify.nameIsWholeSpanShape`
-// stopped hand-walking the braces itself (D-SPANHOME) the two bodies were CHARACTER-
-// IDENTICAL — same cheap rejects, same `tyGroupWrapsWhole` tail, same reading of a group
-// that never closes. Two modules asking one question under two names is the shape this
-// program deletes, and the survivor is the one that is already exported and already reached
-// from three other modules. The six sites below now call it directly.
-//
-// The CORE move this produces (−6 on the 23-resolver list) is a NAMING ARTIFACT and is
-// reported as one: `nameIsSingleShape` was on that list and `nameIsWholeSpanShape` is not,
-// so the same six questions are asked the same number of times under a name the list does
-// not count. The real deletion in this slice is the WALK, and the walk was never on either
-// list.
+// The six single-shape tests below call `emit_classify.nameIsWholeSpanShape` directly: the
+// local `nameIsSingleShape` it replaced was CHARACTER-IDENTICAL to it once D-SPANHOME stopped
+// that resolver hand-walking the braces. Its −6 on the 23-resolver list is a NAMING ARTIFACT —
+// the same six questions, under a name the list does not count; the real deletion was the WALK,
+// which was never on either list.
 
 // THE ONE HOME of "a bare MAP's VALUE union needs registering too". `registerInlineUnion`
 // reaches a map from FOUR positions — a map ATOM of a multi-member union, a NULLABLE map,
@@ -3994,8 +3945,7 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // reaching the inner union at any depth — the registration dual of the recursive ref-array
   // interning. Bottoms out at the 1D `(…)[]` (the `pun` path above).
   if nameIsArray(name) {
-    // The cut is `arrElemNameRaw`'s (#1175) — the TEST half was already the home's, and
-    // the CUT half was the hand-written other half of the same one rule.
+    // The cut is `arrElemNameRaw`'s (#1175); the TEST half was already the home's.
     const inner = arrElemNameRaw(name)
     if nameIsArray(inner) { return registerInlineUnion(stmts, inner) }
     // A 1D ARRAY-OF-INLINE-SHAPE element (`{a: f64, f: K0 | {w: i32}, z: string}[]` — a struct FIELD
@@ -4568,20 +4518,19 @@ function registerCollapsedUnionName(stmts: i32[], node: i32) {
 // is `isUName` after the walk (skip). Fires exactly on the anonymous-nominal struct-union /
 // variant-box residual (the disable-then-diff probe pinned it to 6 corpus shapes). Returns 0,
 // or -1 (a `registerInlineUnion` `emitFail`).
-// The #1057 hand-off is TAKEN, at the RECORDER rather than at the arena. The first attempt
-// ("decide on the RECORDED member count", `retMemCountOf`) was measured here and REFUTED:
-// that column walked the recorded arena type's union/nullable SPINE, and a litunion
-// member's spine leaf count is not the rendered name's atom count. An additive probe over
-// the corpus disagreed on **4** files at this decision — all of them the name `K0 | null`,
-// where the renderer emits the litunion ALIAS as ONE atom (2) and the spine walk counts its
-// literal members (3, 4). The dual is unsound in the other direction too, and that
-// population is real: 13 corpus files and 833 of 50,400 fuzz programs record a name of ONE
-// atom whose spine walk counts >= 2 (a bare inferred litunion / closure-result alias), i.e.
-// the walk would vote to register a union this compiler does not register — they are only
-// saved by the `isUName` gate above. The faithful dual is a count recorded by the NAME
-// PRODUCER (how many atoms it JOINED), not by a walk of the type it rendered.
-// `recordInferRet` is the single funnel every inferred-return name producer lands in, so the
-// count is banked there on the very string this function would have split; `row` reads it.
+// The #1057 hand-off is TAKEN, at the RECORDER rather than at the arena: the faithful count is
+// the one the NAME PRODUCER records (how many atoms it JOINED), not a walk of the type it
+// rendered. `recordInferRet` is the single funnel every inferred-return name producer lands in,
+// so the count is banked there on the very string this function would have split; `row` reads
+// it. The arena dual ("decide on the RECORDED member count", `retMemCountOf`) was measured here
+// and REFUTED — that column walked the recorded type's union/nullable SPINE, and a litunion
+// member's spine leaf count is not the rendered name's atom count. An additive probe over the
+// corpus disagreed on **4** files at this decision, all of them the name `K0 | null`, where the
+// renderer emits the litunion ALIAS as ONE atom (2) and the spine walk counts its literal
+// members (3, 4). It is unsound the other way too, over a real population: 13 corpus files and
+// 833 of 50,400 fuzz programs record a ONE-atom name whose spine walk counts >= 2 (a bare
+// inferred litunion / closure-result alias) — the walk would vote to register a union this
+// compiler does not register, and only the `isUName` gate above saves them.
 function registerInferRetNominalUnion(stmts: i32[], nm: string, row: i32) {
   if isUName(nm) { return 0 }
   // A genuine union spelling (`Cat|Dog`, `Cat|i32`, `{w:i32}|i32|null`) the arena walk left
