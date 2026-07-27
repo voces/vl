@@ -1037,7 +1037,41 @@ function globalIsStruct(name: string) {
 function globalIsArray(name: string) {
   const li = globalLetOf(name)
   if li < 0 { return false }
+  // A kind-18 NULLABLE REF-ARRAY cell is never the i32 list, whatever `letIsArray`
+  // says. `letIsArray` falls through to the INITIALIZER when the annotation is not
+  // an i32 array, and an EMPTY `[]` initializer answers "i32 list" (it has no
+  // element to classify) — so `let g: S[] | null = []` read as an i32 list while
+  // its cell was the ref-list wrapper. A LOCAL never hits this: `buildLocals` files
+  // it under `declaredKind == "nulreflist"` once and the init is never re-consulted;
+  // only a global re-derives its kind per read, which is where the init leaks in.
+  if globalIsNulRefArray(name) { return false }
   letIsArray(li, -1)
+}
+
+// True if the module global `name` holds a kind-18 NULLABLE REF-ARRAY cell
+// (`let g: S[] | null`) — the storage-class twin of `declaredKind(name) ==
+// "nulreflist"` (local) and `paramNulRefArray` (param). Keyed on `globalCellKind`
+// — the CELL's own answer — so a read can never disagree with the cell, exactly as
+// `exprNullableRefArray`'s global arm is keyed.
+function globalIsNulRefArray(name: string) {
+  const li = globalLetOf(name)
+  if li < 0 { return false }
+  globalCellKind(li) == "nulreflist"
+}
+
+// True if a READ of the module global `name` leaves a NULLABLE list ref on the stack:
+// its cell is one of the nullable LIST kinds — 15 (`i32[] | null`), 18 (`S[] | null`,
+// `i32[][] | null`) and the four distinct-backing scalar niches. The Ident→global read
+// deliberately withholds the eager `ref.as_non_null` for exactly these kinds (the
+// `!= null` compare has to see the raw cell), so a consumer that stages the receiver
+// into a NON-null frame slot must recover it itself.
+export function globalNulListCellRead(name: string) {
+  const li = globalLetOf(name)
+  if li < 0 { return false }
+  const k = globalCellKind(li)
+  if k == "nullist" { return true }
+  if k == "nulreflist" { return true }
+  isNulScalarListKind(k)
 }
 
 function globalIsString(name: string) {
@@ -16466,6 +16500,16 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
     if paramRefArray(fnIx, e.identName) { return true }
     if declaredRefArray(e.identName) { return true }
     if identShadowedByFrame(fnIx, e.identName) { return false }
+    // A kind-18 nullable ref-array GLOBAL is a ref array too — the third storage
+    // class, and the one this arm never grew (the local reads `declaredKind`, the
+    // param `paramNulRefArray`, and both sit above). Without it every ref-list op
+    // over `let g: S[] | null` missed the ref-list machinery: with an EMPTY `[]`
+    // initializer `exprArray`'s init fallback claimed the read as an i32 list and
+    // `.length` / `.push` / a call argument addressed the MONO i32-list wrapper
+    // against the cell's ref-list wrapper (invalid wasm, `vl check` clean); with a
+    // `= null` initializer no classifier claimed it at all and the read fell out of
+    // the list family entirely (a loud emit error).
+    if globalIsNulRefArray(e.identName) { return true }
     return globalIsRefArray(e.identName)
   }
   // A field read `p.items` whose struct field is a `T[]`/`N[]` (code `5`) yields the ref
@@ -16665,6 +16709,18 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     if pn != "" { return pn }
     const dn = declaredRefArrayName(e.identName)
     if dn != "" { return dn }
+    // A kind-18 nullable ref-array GLOBAL keeps its inner ref-list ROW on the
+    // ANNOTATION (there is no local slot to read) — the SAME place `emitGlobalSection`
+    // takes the cell's `(ref null $wrapper)` from, so the read resolves the wrapper the
+    // cell actually holds. `globalRefArrayName` below cannot: its `letRefListElemName`
+    // reads a BARE ref-array annotation and then falls through to the initializer, which
+    // for the `[]` / `null` spellings names no element at all (slot 0 — whatever row that
+    // happens to be).
+    if globalIsNulRefArray(e.identName) {
+      const g18 = globalLetOf(e.identName)
+      const gs18 = letAnnRefListSlot(g18)
+      if gs18 >= 0 && gs18 < rlElemName.length { return rlElemName[gs18] }
+    }
     return globalRefArrayName(e.identName)
   }
   if e is Member {
