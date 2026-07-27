@@ -83,13 +83,22 @@ the host build.)
 | Command | What it does |
 |---|---|
 | `vl run <file.vl>` | Compile and run; program output goes to stdout. Also `vl run -e "<src>"`, `… \| vl run` (stdin), or `vl run <prebuilt.wasm>`. |
-| `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`; `-O` optimize, `--wat` also dump text). |
+| `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`; `-O` optimize, `--wat` also dump text, `--no-validate` skip the instantiability check). |
 | `vl check <path>` | Type-check + lint (errors + warnings/hints) a file, or every `*.vl` under a directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>` prunes paths). Pretty output (carets, TTY color) or `--concise`. `--severity <hint\|info\|warning\|error>` gates the exit code + display floor; `--codegen` also runs the emitter; `--fix` writes the safe lint fixes in place — `prefer-const` (`let`→`const`) and `redundant-type` (removes an explicit annotation the initializer already infers, e.g. `let x: i32 = 5` → `let x = 5`). |
 | `vl fmt <path>` | Format (AST-driven, via `format.vl`): stdout, `-w` write in place, `--check` CI gate, dirs recurse. |
 
 `-O` (optimize) and `--wat` (text dump) shell out to **binaryen** (`wasm-opt` / `wasm-dis`) on the
 PATH — `brew install binaryen`, or the [prebuilt releases](https://github.com/WebAssembly/binaryen/releases)
 (or point `$VL_WASM_OPT` / `$VL_WASM_DIS` at them). Absent, each is a soft no-op with a note.
+
+`vl build` **validates the module it wrote** and exits non-zero if the engine will not accept
+it — a module that cannot instantiate is a compiler emit bug, and blessing the artifact anyway
+sent callers off with a `.wasm` that only fails later, at `vl run`. The check reads the file back
+off disk (so `-O` output is covered too), runs after `--wat` (a broken module is exactly the one
+worth disassembling), and leaves the file in place — the *exit code*, not a missing artifact,
+is the signal. `--no-validate` opts out and restores the old write-and-bless path, for when you
+want the bytes regardless. The opt-out is an exact-string match, so a **misspelled flag still
+validates**: the fail-safe direction is to check.
 
 The brains live in VL (the seed); `vl` is a thin host (a command-queue pump — all
 CLI policy is VL, see [`docs/cli-design.md`](./docs/internals/cli-design.md)). A `test`
