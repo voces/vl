@@ -1,0 +1,662 @@
+// `compiler/tyname.vl` — THE TYPE-NAME GRAMMAR, AND NOTHING ELSE.
+//
+// A rendered type NAME is a little bracket language the parser writes and five later
+// passes read back: `{x:i32}` inline shape, `{[K]:V}` map, `T[]` array, `(…)` group and
+// param list, `Head<A,B>` generic application, `"a"` quoted literal member, the
+// separators `|` `&` `,` `:` and the function arrow `=>`. Every question anyone asks OF
+// that language — does it open here, does it span the whole name, where does this group
+// close, what is the element / key / value — lives in this file, and only here.
+//
+// **THIS MODULE IS A LEAF: IT HAS ZERO IMPORTS, AND THAT IS ITS WHOLE CONTRACT.** Every
+// body below is a pure function of a STRING. No `T.` type arena, no `P.` node arena, no
+// diagnostics, no module-level mutable state, no `emit_*`. Nothing here can observe the
+// program being compiled, so nothing here can be reached by an import cycle — which is
+// exactly why the family can finally live in one place.
+//
+// ── WHY THE HOME MOVED HERE, AND WHY IT COULD NOT BEFORE ─────────────────────────────
+// These grammars were carved out in `emit_base.vl` (#1190, #1222, D-ARRELEM, D-SHAPEOPEN
+// …), which is where the emitter needed them. The CHECKER asks the same questions and
+// `emit_base.vl` imports `typecheck.vl`, so the edge is one-way and no copy in the
+// checker could ever call a home up there: the checker hand-wrote 22 of its own instead.
+// D-PARENDOWN / D-ARRDOWN / D-SHAPEDOWN / D-BRACEDOWN / D-GENAPPDOWN / D-MAPOPENDOWN
+// answered that by INVERTING the home's location — the homes moved DOWN into
+// `typecheck.vl`, the lowest module both sides could reach, and `emit_base.vl`
+// republished the names so no emitter call site changed.
+//
+// "A name-grammar predicate in the CHECKER" was always the wrong layering read alone,
+// and eight headers said so. The record filed a new shared module as the family's
+// endgame with a precondition — one slice owning `typecheck.vl` plus six emitter modules
+// at once — and #1228 REFUTED it by measurement: the bodies are pure, so the module is a
+// LEAF, so `typecheck.vl` can re-export it exactly as `emit_base.vl` already re-exports
+// eleven of these names. **No emitter module changes.** The graph after this slice:
+//
+//     tyname  ←  typecheck  ←  emit_base  ←  emit_classify / emit_collect / emit_mono /
+//        ↑                                   emit_rep / emit_rewrite / emit_sections
+//        └── typecheck also re-exports to driver.vl, which imports `gaeLtAt` directly
+//
+// A consumer reaches a home through up to THREE re-export hops and pays nothing for it:
+// `emit_classify` ← `emit_base` ← `typecheck` ← `tyname` was built, run and measured
+// corpus-identical before this slice was written.
+//
+// ── WHAT IS IN, AND WHAT IS DELIBERATELY OUT ─────────────────────────────────────────
+// IN — 21 bodies, in six families, in dependency order:
+//   the WALK      `skipQuotedName` (private) · `tyGtIsClose` · `tyTopIndexOf` ·
+//                 `tyGroupEndIndex`
+//   PAREN         `nameIsFuncTypeAtom` · `parenEnclosesWhole` · `nameIsParenOpen` ·
+//                 `nameIsParenSpanEnds` · `peelGroupParens`
+//   ARRAY         `nameIsArray` · `arrElemNameRaw` · `listElemNameOf`
+//   BRACE         `nameIsShapeOpen` · `nameIsBraceSpanEnds`
+//   MAP           `nameIsMapOpen` · `nameIsMapSpanEnds` · `mapSpellKeyEnd` ·
+//                 `mapSpellKeyName` · `mapSpellValName`
+//   GENERIC APP   `gaeLtAt` · `annGenAppSpanEnds`
+//
+// OUT, with the reason each time — the boundary is "pure function of a string", tested
+// rather than eyeballed:
+//   * **`isTopLevelFuncTypeName` STAYS IN `typecheck.vl`.** It is a string predicate that
+//     also WRITES a module-level bank (`funcArrowAt`, D-ARROWBANK) which two call sites
+//     read immediately after it returns. A body that reaches module state is not a leaf,
+//     and publishing the bank through an accessor would put a CALL between the
+//     predicate's return and the read — the one thing its own contract asks callers not
+//     to do. Its private helper `topLevelArrowIndex` stays with it.
+//   * **`splitUnionAtoms` / `unionMemberCount` STAY.** They are pure and cross-module,
+//     and they are the obvious phase-2 candidates — but they are SPLITTERS that
+//     materialise atoms, not endpoint tests / spans / cuts, and no D-* slice ever homed
+//     them as part of this family. Moving them here would also drag the compiler's
+//     hottest name function (~168 K corpus invocations) across a module boundary in a
+//     slice whose claim is byte-identity.
+//   * **`nameHasSep` / `nameHasPipe` STAY.** Pure, but private to the checker with no
+//     consumer anywhere else: moving them buys a name, not a deduplication.
+//   * **`emit_base.mapValNameOf` and `emit_base.nameIsShapeSpanEnds` STAY WHERE THEY
+//     ARE.** They are LAYERS on these homes, not copies of them (the first has a
+//     different SPAN rule and returns a deliberately garbled tail its callers strip
+//     around), and `emit_base.vl` is outside this slice's partition.
+//
+// **THE FULL HEADER FOR EACH GRAMMAR IS BELOW, AT ITS BODY, VERBATIM FROM ITS HOME.**
+// Nothing in this file is new logic: this slice is a MOVE, and the frozen-source rebuild
+// is byte-identical to master's own output. Two present-tense claims in the walk's
+// section header were measurably false and are corrected in place, marked where they sit.
+
+// Skip a QUOTED string-literal segment inside a synthetic type name (the
+// cursor is ON the opening `"`): returns the index just past the closing
+// quote. A `\` escape skips the next char, so an escaped quote stays inside.
+// Every depth-aware name scanner calls this so a literal member's characters
+// (`"a|b"`) never count as separators or depth.
+function skipQuotedName(name: string, start: i32) {
+  let i = start + 1
+  while i < name.length {
+    const c = name[i]
+    if c == '\\' { i = i + 2 }
+    else if c == '"' { return i + 1 }
+    else { i = i + 1 }
+  }
+  i
+}
+
+// `>` at index `i` is a generic-application CLOSER exactly when an earlier `<` is still
+// OPEN (`angOpen` — the caller's running count of unclosed `<`) and it is not the second
+// character of the function arrow `=>`.
+//
+// WHERE `<`/`>` IS A BRACKET, AND WHERE IT PROVABLY IS NOT. The only producer of a `<` in
+// any string these scanners see is `parseTypeAtom`'s generic-APPLICATION arm
+// (`name + "<" + parseTypeName()`, `compiler/parser.vl`), whose own comment records why the
+// token is unambiguous there — "in TYPE position the `<` is unambiguous (no comparison can
+// appear here)". A parser-built type name never contains an EXPRESSION, so the RELATIONAL
+// `<`/`>` cannot reach here.
+//
+// A bare `>` is a different matter, and the `angOpen` gate is there because MEASUREMENT
+// refuted the simpler "a `>` always closes" rule. These scanners are shared by three
+// string languages, and two of them spell a `>` that closes nothing:
+//   * `tyToStr`'s DIAGNOSTIC render spells the arrow `->` (`() -> i64 | f64`);
+//   * the `$fnsig` closure-signature KEY spells the param/return split `>`
+//     (`"=>ii>i"` — `emit_base.annArrowAt`, `emit_mono`).
+// Over the 1,274-file corpus an audit probe counted **657** `<` against **927** bare `>`,
+// with **263** inputs driven to a NEGATIVE depth by exactly those two spellings — so a
+// rule keyed on the character alone is wrong, and a `>` that closes nothing must stay
+// inert. `angOpen > 0` is the total condition: no `<` open, no closer.
+//
+// The `=` exemption sits INSIDE the gate, for the one case where both hold — an arrow
+// nested in a generic argument, `Box<(i32)=>i32>`. (Counting that `>` would close the
+// application one bracket early.)
+export function tyGtIsClose(name: string, i: i32, angOpen: i32) {
+  if angOpen <= 0 { return false }
+  if i > 0 { return name[i - 1] != '=' }
+  true
+}
+
+// ── THE ONE TYPE-NAME SCANNER ────────────────────────────────────────────────
+// A rendered type name is a bracket language: `{}` object / map, `[]` array,
+// `()` group and param list, `<>` generic application, `"…"` literal member, plus
+// the separators `|` `&` `,` `:` and the function arrow `=>`. Walking it at TOP
+// LEVEL — the same `depth`/`angOpen`/quote-skip ladder — was hand-written out
+// FOURTEEN times in this file alone, and eleven more times across `emit_base`,
+// `emit_collect` and `emit_classify`.
+//
+// That is not a style problem, it is the compiler's most-repeated BUG SHAPE: every
+// extension of the grammar has had to be re-taught to each copy, and the copies
+// have twice been caught disagreeing — #1118/#1120 taught `<…>` to the scanners
+// that had never heard of it, #1140 collapsed three copies of the ref-array
+// ladder. FOUR DIVERGENCES WERE NAMED HERE AND ALL FOUR ARE NOW CLOSED — recorded
+// as history rather than as a live warning, because the next census must not
+// re-derive them: `parenEnclosesWhole` and `nameIsFuncTypeAtom` ride the home below
+// and so skip quoted members; `splitUnionAtoms` and `unionMemberCount` lost the naked
+// `inStr` toggle an escaped quote (`"a\"b"`) walked straight through, and ask
+// `tyTopIndexOf` instead (the token `inStr` no longer occurs in the tree outside this
+// sentence); and `canonShapeName`'s map-key scan is `mapSpellKeyEnd`, which is
+// `tyGroupEndIndex`. One home ended the class.
+//
+// The two entry points below are the WHOLE grammar. Everything else that counts a
+// bracket asks them a question; nothing else counts one.
+//
+// **THE "ELEVEN MORE TIMES" ABOVE IS DISCHARGED, AND SAYING SO IS THE POINT** — a
+// stale hand-off is what inflates the next census. It was true when this home was
+// minted and has been false since D-SHAPEFIELD/D-PARAMARR closed the last copy.
+// Measured structurally over `angOpen`, the ladder's one unmistakable marker: **14
+// occurrences in this module and ZERO in executable code anywhere else in the tree**
+// (`emit_base` 1, `emit_classify` 2 — all three inside comments that name this home).
+// No module imports `tyGtIsClose` today either; it stays exported because the close
+// rule is part of the two entry points' contract, not because a copy needs it.
+// The per-consumer diffs are in `docs/internals/destringify-types-program.md`.
+
+// The index of the first TOP-LEVEL occurrence of `a` — or of `b`, when `b` is not
+// 0 — at or after `from`, or -1. Quoted literal members skip whole (escape-aware,
+// via `skipQuotedName`); `{}`/`[]`/`()`/`<>` nest; a `>` closes only against an
+// OPEN `<` (`tyGtIsClose`), so the arrow's own `>` and `tyToStr`'s `->` stay inert.
+//
+// `'='` means the function ARROW: it matches only when the next character is `>`.
+// The four callers that hand-rolled that two-character lookahead now share it.
+//
+// DEPTH IS COUNTED FROM `from`, and that is exact rather than approximate: a
+// caller resuming a split at the character after a top-level separator resumes at
+// a point where the depth was 0 by the split's own condition, so restarting the
+// count there reproduces it. A whole split therefore still costs ONE pass over the
+// name — the scan runs from the previous separator to the next, not from 0 each
+// time — which is what keeps `splitUnionAtoms` (the hottest caller at ~168 K
+// invocations over the corpus) off the O(n²) path its own header warns about.
+export function tyTopIndexOf(name: string, a: i32, b: i32, from: i32) {
+  let depth = 0
+  let angOpen = 0
+  let i = from
+  while i < name.length {
+    const c = name[i]
+    if c == '"' {
+      i = skipQuotedName(name, i)
+    } else {
+      if c == '{' || c == '[' || c == '(' {
+        depth = depth + 1
+      } else if c == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      } else if c == '}' || c == ']' || c == ')' {
+        depth = depth - 1
+      } else if c == '>' && tyGtIsClose(name, i, angOpen) {
+        depth = depth - 1
+        angOpen = angOpen - 1
+      } else if depth == 0 && (c == a || c == b) {
+        if c != '=' { return i }
+        if i + 1 < name.length && name[i + 1] == '>' { return i }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// The index at which the group opened by `name[from - 1]` CLOSES — the first
+// closer that would take the depth (counted from `from`) below zero — or -1 when
+// the group never closes. The same ladder as `tyTopIndexOf`, with the closer as
+// the target instead of a separator.
+//
+// Callers gate on the OPENER themselves (`name[0] == '('`, `inner[0] == '['`),
+// which is what makes `from` meaningful; a `>` cannot be the closer found here
+// because `tyGtIsClose` needs an open `<` that a `from`-relative depth of 0 has
+// not seen.
+export function tyGroupEndIndex(name: string, from: i32) {
+  let depth = 0
+  let angOpen = 0
+  let i = from
+  while i < name.length {
+    const c = name[i]
+    if c == '"' {
+      i = skipQuotedName(name, i)
+    } else {
+      if c == '{' || c == '[' || c == '(' {
+        depth = depth + 1
+      } else if c == '<' {
+        depth = depth + 1
+        angOpen = angOpen + 1
+      } else if c == '}' || c == ']' || c == ')' {
+        if depth == 0 { return i }
+        depth = depth - 1
+      } else if c == '>' && tyGtIsClose(name, i, angOpen) {
+        if depth == 0 { return i }
+        depth = depth - 1
+        angOpen = angOpen - 1
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// True if the type-name `name` is a FUNCTION type (`() => i64`, `(i32) => i32`) — a
+// TOP-LEVEL `=>` (parens/braces/brackets balanced). A value-union member that is a
+// closure rides the box's anyref `value` as the closure fat-pointer struct (a
+// `structref` subtype), exactly as a string/list member rides its wrapper ref — so it
+// is a REF atom (kind 11), with no per-rep scalar value box. Local to typecheck (the
+// emitter's `annArrowAt` lives in `emit_base`, which imports THIS module).
+export function nameIsFuncTypeAtom(nameIn: string) {
+  // A union member keeps its GROUPING parens (`(() => i64) | i64` splits to the atom
+  // `(() => i64)`), so peel every fully-enclosing balanced paren layer before the
+  // top-level `=>` scan — otherwise the arrow reads as nested (depth 1) and misses.
+  // THIS LOOP WAS THE HAND-WRITTEN COPY `peelGroupParens` was carved out of: character
+  // for character the same span test, the same walk conjunct, the same slice. It could
+  // not call the home while the home lived in `emit_base.vl` (which imports THIS file);
+  // now the home lives below and this is one call. The `length >= 2` conjunct is IMPLIED
+  // by the span test, not dropped — a one-character name cannot be both `(` and `)`.
+  const name = peelGroupParens(nameIn)
+  tyTopIndexOf(name, '=', 0, 0) >= 0
+}
+
+// True when the LEADING bracket of `name` closes only at the FINAL char — i.e. the outer
+// group encloses the whole string (`(()=>i64)` yes; `(i32)=>(i32)` no, the first `)`
+// closes mid-string). Lets `nameIsFuncTypeAtom` strip only genuine grouping parens.
+// Both callers (`nameIsFuncTypeAtom`, `peelGroupParens`) gate on `name.length >= 2` and
+// `name[0] == '('` before calling, so the `<…>` arm only ever runs on a group NESTED
+// inside those parens; a bare `Box<i32>` reaching here would answer true, which is
+// correct for "the leading bracket closes at the end" but is not a paren peel — do not
+// drop those guards. The LENGTH guard is load-bearing too, and differently: on the EMPTY
+// name this answers true (`tyGroupEndIndex` returns -1, and `"".length - 1` is also -1)
+// where the hand-written scan it replaces answered false. No caller can reach it — both
+// require two characters — but a third caller must gate, or add the guard here.
+export function parenEnclosesWhole(name: string) {
+  tyGroupEndIndex(name, 1) == name.length - 1
+}
+
+// ── the PAREN grammar: `nameIsParenOpen` OPENS it, `nameIsParenSpanEnds` SPANS it ──────
+//
+// THE HOMES LIVE HERE, ONE MODULE BELOW THE EMITTER, AND THAT IS THE WHOLE POINT.
+// They were carved out in `emit_base.vl` (#1190), which imports THIS module — so the
+// checker, which hand-wrote the same three character compares at six sites of its own,
+// could not reach them. Relocating them here (D-PARENDOWN) inverts the home's LOCATION
+// without touching the import graph: `emit_base.vl` keeps exporting both names as
+// one-line delegations, so every caller in `emit_collect`/`emit_mono` compiles untouched.
+// The grammar exists ONCE, in this file. Nothing here is a second copy.
+//
+// A census of the `'('` / `')'` CHARACTER literals reads 47 tree-wide (27 open, 20 close),
+// of which 4 are `lexer`/`format` source-TEXT scanners and 5 are this file's bracket-CLASS
+// depth ladders (`c == '{' || c == '[' || c == '('` — membership in a walk, not a name-shape
+// question). The remaining 38 over type names are SIX syntactic spellings, and — exactly as
+// the SHAPE-NAME family turned out to be six spellings of THREE predicates — they reduce to
+// **TWO**:
+//
+//   * **`nameIsParenOpen`** — "the name starts a paren group". Written out ALONE at 7 sites
+//     (`emit_base.nameIsClosureArray`, `emit_collect` 3972, `emit_mono` 973,
+//     `emit_classify` ×4), and as the FIRST HALF of every one of the other spellings.
+//   * **`nameIsParenSpanEnds`** below — the same plus a final `)`, at 6 sites.
+//
+// THE OTHER FOUR SPELLINGS ARE NOT THIS PREDICATE AND MUST NOT BE ROUTED HERE. Three of
+// them close the group somewhere that is NOT the last character:
+//
+//   * ARROW-relative (`name[arrowAt - 1] == ')'`) — `emit_base.annFnDecompose`,
+//     `isTopLevelFuncTypeName` above, `nameToTyReal`'s function-type arm. The param list
+//     closes before the `=>`, so the last character belongs to the RETURN.
+//   * ARRAY-relative (`name[name.length - 3] == ')'`) — `emit_base.parenUnionArrElemName`.
+//     The last two characters are the `[]`.
+//   * CLOSE-ONLY (`canonEmitName`'s paren-result arm) — no opener test at all.
+//
+// Their OPEN half is still this predicate and is routed; their CLOSE test stays inline.
+//
+// **AND THE NAIVE HOME IS THE HOME FOR NONE OF THEM.** "A parenthesized type name" most
+// obviously means the endpoints PLUS a balance walk proving the group opened at index 0 is
+// still open at the last character — `parenEnclosesWhole` above does exactly that. Building
+// THAT as the home and routing the span sites to it would have silently TIGHTENED 6 sites /
+// 12 occurrences that carry no walk today (`emit_base.listElemNameOf`, `emit_classify`
+// 4510 / 6363 / 10046, and this file's `nulElemListAtomKind` / `litUnionArrayElemOf`).
+// So this home carries NO walk, precisely as `emit_base.nameIsShapeSpanEnds` carries none,
+// and the two sites that DO walk keep their walk as a separate conjunct at the call site.
+export function nameIsParenOpen(name: string) {
+  if name.length < 1 { return false }
+  name[0] == '('
+}
+// THE ONE HOME of the paren-group ENDPOINT span: `nameIsParenOpen` AND the final character
+// is `)`. A LAYER over the opener, not a second copy of it — the `'('` compare lives once,
+// above.
+//
+// The `length >= 2` bound five of the six routed sites spell (as `< 2` early returns, or as
+// enclosing `length > 1` blocks one scope up) is IMPLIED, not dropped: on a one-character
+// name `name[0]` and `name[name.length - 1]` are the SAME character, and no character is
+// both `(` and `)`, so the explicit bound and this opener-gated form agree on every input.
+// The sixth (`emit_classify.rlCanonLitUnionAtoms` 10046) bounds only `length >= 1` and is
+// the same argument read the other way round.
+export function nameIsParenSpanEnds(name: string) {
+  if !nameIsParenOpen(name) { return false }
+  name[name.length - 1] == ')'
+}
+// Peel every fully-enclosing balanced grouping-paren layer from `name` (`(() => i64)` →
+// `() => i64`), returning a non-parenthesized name unchanged. `splitUnionAtoms` KEEPS a closure
+// member's grouping parens (`(() => i64) | i32` → atom `(() => i64)`), but the bare `is`-test /
+// annotation spelling drops them (`() => i64`) — so an atom-equality compare must peel first.
+// (A ref-array / closure-array element ends in `]`, a struct in `}`, so only a BARE closure atom
+// is affected; the paren-peel is the `nameIsFuncTypeAtom` prelude, shared to stay in lockstep.)
+export function peelGroupParens(nameIn: string) {
+  let name = nameIn
+  // The PAREN grammar's SPAN half at its home, then the walk. `parenEnclosesWhole`'s header
+  // requires both its callers to gate on `length >= 2` and a leading `(` before calling: the
+  // home enforces both — it can only answer true when two distinct characters are `(` and
+  // `)` — so the contract survives the routing intact. The walk stays a separate conjunct
+  // because the OTHER walk-carrying site (`emit_base.normTypeAtom`) rides a DIFFERENT walk.
+  while nameIsParenSpanEnds(name) && parenEnclosesWhole(name) {
+    name = name.slice(1, name.length - 1)
+  }
+  name
+}
+
+// ── the ARRAY-NAME grammar: `nameIsArray` TESTS it, `arrElemNameRaw` CUTS it ───────────
+//
+// **BOTH HOMES MOVED DOWN HERE FROM `emit_base.vl` (D-ARRDOWN), for the same reason the
+// PAREN pair above did:** they are pure character grammar over a type-name STRING, and
+// living above the checker meant the checker re-wrote them. `nameToTyReal`, `canonEmitName`,
+// `nulElemListAtomKind` and `litUnionArrayElemOf` each carried their own copy of the
+// two-character suffix test, and three of them their own copy of the cut.
+//
+// True if the type-name `name` is an ARRAY type — its lexeme ends in `[]` (the suffix
+// `parseType` appends for every `T[]` annotation).
+export function nameIsArray(name: string) {
+  const n = name.length
+  if n < 2 { return false }
+  if name[n - 2] != '[' { return false }
+  if name[n - 1] != ']' { return false }
+  true
+}
+// THE ONE HOME of the trailing-`[]` CUT: the RAW 1-D element name of an array type name
+// — `name` minus its final two characters — or "" when `name` is not an array name.
+//
+// The grammar is one rule with two halves ("a name ending in `[]` is a 1-D list, and its
+// element is that name minus those two characters"), and only the TEST half had a home.
+// Censused over comment-stripped source at `3974381`, the CUT half was hand-written
+// **nine** times in `emit_base.vl` alone and the TEST half **seven**, in ten functions.
+//
+// It is RAW deliberately — `listElemNameOf` below is this cut PLUS the naive
+// grouping-paren strip, and the two are not interchangeable. `emit_mono.vl`'s own comment
+// at its hand-written copy says exactly that ("The `[]` cut stays RAW here (not
+// `listElemNameOf`): that home strips one …"), which is a caller asking for a home that
+// did not exist.
+//
+// `""` doubles as "not an array name" and as the element of the degenerate `"[]"`, the
+// convention `listElemNameOf` already documents and its four callers already read as
+// `false`. The three sites where those two answers are NOT interchangeable
+// (`emit_base.nameIsClosureArray`, `monoTyParamOf`, `monoBindFromAnn` — each of which does
+// something other than decline on an empty element) keep an explicit `nameIsArray` test in
+// front, so this merge asserts nothing about whether `"[]"` is a producible type name.
+// That candidate WAS built and measured: sabotage S4 installs the one-call form at the two
+// `mono*` sites and reddens 0 of 1,398 corpus files and 0 of 38,400 fuzz programs. A 0 is
+// not agreement when the divergence population is empty — it is the absence of a witness,
+// so the faithful two-call form ships and the one-call form is filed with its measurement.
+// (The cut is BOUND rather than left as the trailing expression: a bare member-call
+// statement is not a lowerable form — `emitProgram: unsupported member-call statement` —
+// which is why `emit_base.annRetNameOf` binds its slice the same way.)
+export function arrElemNameRaw(name: string) {
+  if !nameIsArray(name) { return "" }
+  const elem = name.slice(0, name.length - 2)
+  elem
+}
+// THE ONE HOME of the 1-D LIST-ELEMENT peel: the trailing `[]` cut plus the ONE layer of
+// disambiguating grouping parens a composite element carries (`(boolean|null)[]` →
+// `boolean|null`, `K[]` → `K`). "" when `name` is not an array name.
+//
+// Four `nameIsX[]` classifiers in `emit_base.vl` wrote this same five-line peel out by hand
+// (`nameIsNulBoolList` / `nameIsNulStrList` / `nameIsNulLitUnionList` /
+// `nameIsLitUnionArray`) — each with its own `nameIsArray` gate and its own paren strip —
+// and so did this file's `nulElemListAtomKind` and `litUnionArrayElemOf`, which could not
+// reach the home until it moved here. Named once, the family cannot drift on what an
+// element IS.
+//
+// The `[]` cut itself is `arrElemNameRaw`'s, above: this function is the RAW cut plus the
+// paren strip, not a second copy of the cut. The paren strip is deliberately the NAIVE one
+// the copies carried (`nameIsParenSpanEnds` — first char `(`, last char `)`, no balance
+// walk), NOT `peelGroupParens`: every element reaching here is a single canonical atom, and
+// widening the strip to a balanced one would change what `(a)|(b)`-shaped elements classify
+// as. THIS IS THE SITE THE WALK-CARRYING HOME WOULD HAVE TIGHTENED, and the reason the span
+// home above carries no walk. `""` doubles as "not an array" and as the element of the
+// degenerate `"[]"` — every consumer answers `false` for both, exactly as the copies did.
+//
+// The nested `if`s this replaced put their length bound (`elem.length > 1`) one scope UP
+// from the character compares; the home's bound is `>= 1`, and the two agree because a
+// one-character name cannot be both `(` and `)` (see the span home's header).
+export function listElemNameOf(name: string) {
+  let elem = arrElemNameRaw(name)
+  if elem == "" { return "" }
+  if nameIsParenSpanEnds(elem) { elem = elem.slice(1, elem.length - 1) }
+  elem
+}
+
+// ── the BRACE grammar: `nameIsShapeOpen` OPENS a shape, `nameIsBraceSpanEnds` SPANS ANY ──
+//
+// **THE OPENER MOVED DOWN HERE FROM `emit_base.vl` (D-SHAPEDOWN);** the WIDE SPAN followed
+// it (D-BRACEDOWN, below), and only the CONJUNCTION of the two (`nameIsShapeSpanEnds`) stays
+// up there, because no site in this file asks for it. THE ONE HOME of the inline-object-shape
+// OPENER: does `name` start an inline struct shape (`{x:i32}`) rather than a map shape
+// (`{[string]:i32}`) — the `length >= 2 && name[0] == '{' && name[1] != '['` triple.
+//
+// Censused STRUCTURALLY over comment-stripped source (char bindings resolved — every real
+// scanner binds the char first, so a detector anchored on `name[0] == '{'` alone reads
+// almost nothing), the index-0 `'{'` test is written out **35** times tree-wide
+// (`emit_classify` 15 · `emit_base` 7 · `typecheck` 6 · `emit_collect` 4 · `emit_rep` 2 ·
+// `format` 1) and the index-1 `'['` test **27** times. **20** of those sites carry BOTH and
+// so belong to this grammar.
+//
+// THE 20 ARE SIX SYNTACTIC SPELLINGS OF ONLY **THREE** PREDICATES, and that is the whole
+// reason this needed measuring rather than eyeballing. Counted by form, including WHERE the
+// length bound sits: positive same-line conjunction (8); the same conjunction with the bound
+// hoisted to an ENCLOSING `if name.length >= 2 {` block (2); with the bound hoisted to an
+// EARLY-RETURN guard (1); the fully De-Morganed guard `if nm.length < 2 || nm[0] != '{' ||
+// nm[1] == '[' … { return … }` (6); the multi-line parenthesised conjunction (2); and one
+// `length > 0` outlier. Reduced to predicates they are only:
+//
+//   * **this home** — `len >= 2 · OPEN · NOT2ND`;
+//   * **`emit_base.nameIsShapeSpanEnds`** — the same plus a final `}`, at 10 sites;
+//   * **`emit_classify.nameIsWholeSpanShape`** — the same plus `tyGroupWrapsWhole`, at 1.
+//
+// Only ONE of the 20 sites lacks `length >= 2`: `emit_collect.funcRetUnrepresentable` gates
+// on `length > 0`, which on the single name `"{"` reads `nm[1]` OUT OF BOUNDS. VL string
+// indexing **TRAPS** there (`wasm trap: out of bounds array access`, verified by hand), so
+// that spelling is not a wider predicate — it is the same predicate plus a latent trap, and
+// routing it here is equivalence-preserving on every input that does not already crash.
+//
+// **THIS FILE'S OTHER THREE `{`…`}` TESTS ARE NOT THIS PREDICATE** (`nameToTyReal`'s
+// inline-object arm, `canonEmitName`'s shape arm, `isObjShapeName`): each is
+// `name[0] == '{' && name[len - 1] == '}'` WITHOUT the `name[1] != '['` conjunct, so each
+// ACCEPTS a map name, and routing them HERE would blind the checker to map-valued shapes.
+// D-MAPSPELL left them alone for exactly that reason; they are the WIDE span's, and it is
+// now directly below. The two that REQUIRE `name[1] == '['` — the complement, not this —
+// are the MAP-NAME grammar's, further down.
+export function nameIsShapeOpen(name: string) {
+  if name.length < 2 { return false }
+  name[0] == '{' && name[1] != '['
+}
+// THE ONE HOME of the WIDE BRACE ENDPOINT span: `length >= 2`, a `{` at index 0, and a `}` as
+// the final character — WITHOUT the `name[1] != '['` conjunct, so it accepts a MAP name as
+// well as a shape. Carved out in `emit_base.vl` by D-GRAMPRED (#1222) and **moved down here
+// (D-BRACEDOWN) for the reason its own header predicted and #1224 then proved impossible to
+// discharge from above**: that header offered the three copies in THIS file a route to
+// `emit_base`, and `emit_base.vl` imports THIS module, so the route would have cycled the
+// module graph. Inverting the home's LOCATION is what makes the route legal — the same move
+// the PAREN / ARRAY / SHAPE-OPEN grammars already took. `emit_base.vl` keeps publishing the
+// name (one `export … from` line), so `emit_classify`'s two callers compile untouched.
+//
+// The brace family is now four predicates over `length >= 2` names opening with `{`:
+//
+//   * `nameIsShapeOpen`             — OPEN · NOT2ND                        (above)
+//   * `nameIsMapOpen`               — OPEN · 2ND       — the complement    (below)
+//   * `nameIsBraceSpanEnds`         — OPEN · CLOSE     — this home
+//   * `emit_base.nameIsShapeSpanEnds` — the first ANDed with this one
+//
+// **THIS IS NOT `nameIsShapeSpanEnds` AND NOT `emit_classify.nameIsWholeSpanShape`.** It is
+// the WIDEST of them: it accepts `{[string]:i32}`, which the other two reject, and
+// `{a:{b:i32}}|{c:i32}`, which `nameIsWholeSpanShape`'s balance walk rejects. Tightening a
+// caller from this home to either of the others is a behaviour change owing its own graded
+// population, not a refactor — and all three of this file's routed sites WANT the width:
+// `nameToTyReal`'s arm is reached only after the map arm above it has declined, and
+// `canonEmitName` / `isObjShapeName` both hand a map name on to a shape walk deliberately.
+//
+// #1222's header named FIVE copies outside its partition (`emit_classify` ×2, `typecheck`
+// ×3). **The `emit_classify` two were routed by #1223** and the file no longer contains a
+// `'}'` character literal at all; the three here are the whole remainder, and this move takes
+// them. The predicate reaches ZERO hand-written copies tree-wide with this slice.
+export function nameIsBraceSpanEnds(name: string) {
+  if name.length < 2 { return false }
+  name[0] == '{' && name[name.length - 1] == '}'
+}
+
+// ── the MAP-NAME grammar: `{[K]:V}` — OPEN, SPAN, and the KEY/VALUE CUT ───────────────
+//
+// The parser's index-signature spelling. It is not assembled character by character by the
+// thing that reads it, it is assembled character by character by the thing that WRITES it:
+// `parser.vl:538` is literally `name = "{[" + keyName + "]:" + valName + "}"`, and the KEY
+// is a bare `IDENT` token ("The KEY is a bare identifier token, not a parsed type, so it
+// stays text on the node"). Every property this family relies on is a property of that one
+// concatenation, which is why the grammar can be stated once instead of re-derived.
+//
+// **THREE COPIES OF IT LIVED IN THIS FILE**, and they did not even agree on how to find the
+// key's end: `nameToTyReal`'s map arm and `mapShapeKeyName` scanned for the first `]:` pair,
+// while `canonShapeName` ran the compiler's depth walk (`tyGroupEndIndex`) over the shape's
+// interior. On a parser-produced name the two agree for the reason above — the key holds no
+// bracket, so its `]` is both the first `]` and the depth-0 closer — and this home keeps the
+// WALK, so the map grammar stops hand-rolling a scan of its own and asks the compiler's one
+// depth home instead. (`mapShapeKeyName` is gone: it WAS `mapSpellKeyName`, character for
+// character, and its one caller now says so.)
+//
+// **THE FOURTH COPY IN `emit_base.vl` IS NOW GONE TOO (D-MAPOPENDOWN).** Its `nameIsMapOpen`
+// was this file's `nameIsMapOpen`, line for line, so D-MAPSPELL's own hand-off — recorded here
+// as a checklist for whoever next owned that file — has been discharged: the definition is
+// deleted and `emit_base.vl` republishes THIS one, which is what makes `emit_classify` and
+// `emit_collect` compile untouched. `mapValNameOf` there STAYS: it is `mapSpellValName` with a
+// DIFFERENT span rule — it gates on `nameIsMap` (opens `{[`, does not end `[]`) where this one
+// gates on a closing `}`, so it ACCEPTS `{[string]:i32}|null` and returns the garbled
+// `"i32}|nul"` that its own callers strip for (see `emit_collect.vl:2535`). The two are NOT
+// interchangeable and must not be merged by eyeball; its header, which used to cite a
+// `typecheck.vl parseMapName` that has not existed for many merges, now says so.
+//
+// THE ONE HOME of the MAP-NAME OPENER: a `{` at index 0 whose NEXT character is `[`. Over
+// the `length >= 2` names that open with `{` this is the exact COMPLEMENT of
+// `nameIsShapeOpen` above.
+export function nameIsMapOpen(name: string) {
+  if name.length < 2 { return false }
+  name[0] == '{' && name[1] == '['
+}
+// THE ONE HOME of the map-name SPAN: the opener AND a final `}`, so the whole name is the
+// map and not something carrying one (`{[string]:i32}[]` is a LIST of maps and
+// `{[string]:i32}|null` a union with one — both open `{[` and neither ends `}`). A LAYER
+// over the opener, not a second copy of it. This is the map twin of
+// `emit_base.nameIsShapeSpanEnds`, which cannot serve because it carries the
+// `name[1] != '['` conjunct that makes it reject every map name.
+export function nameIsMapSpanEnds(name: string) {
+  if !nameIsMapOpen(name) { return false }
+  name[name.length - 1] == '}'
+}
+// THE ONE HOME of the KEY CUT's scan: the index of the `]` that closes the KEY of a
+// `{[`-opening name, or -1 when `name` does not open a map spelling or its key never closes
+// into a `]:` pair.
+//
+// The walk is `tyGroupEndIndex`, entered at index 2 — the character after the `[` this
+// function has just proved is at index 1, which is exactly the `from`-gating contract that
+// home documents ("Callers gate on the OPENER themselves"). The `]:` pair is then confirmed
+// at the site the walk stopped: the walk answers "where does the key's bracket close", the
+// grammar additionally requires a `:` to follow it, and a closer that is not `]` at all
+// (reachable only on a name no producer writes) is rejected rather than sliced around.
+//
+// The `length >= 5` bound the two scanning copies spelled is IMPLIED and dropped: a name
+// passing this function has `{`, `[`, a `]` at index >= 2 and a `:` after it, so it is at
+// least the 4 characters of `{[]:` — and every consumer that also asks `nameIsMapSpanEnds`
+// gets the 5th from the `}`.
+export function mapSpellKeyEnd(name: string) {
+  if !nameIsMapOpen(name) { return -1 }
+  const ke = tyGroupEndIndex(name, 2)
+  if ke < 0 { return -1 }
+  if ke + 1 >= name.length { return -1 }
+  if name[ke] != ']' { return -1 }
+  if name[ke + 1] != ':' { return -1 }
+  ke
+}
+// THE ONE HOME of the KEY CUT: the key type-name `K` of a `{[K]:V}` spelling — the text
+// between the `{[` and the key's closing `]` — or "" when `name` does not open one. Used to
+// give an actionable diagnostic for an unsupported (non-`string`) map key instead of a bare
+// "unknown type '{[i32]:i32}'", which is why it deliberately does NOT ask for the closing
+// `}`: a LIST of i32-keyed maps (`{[i32]:i32}[]`) is the same user mistake and gets the same
+// message.
+export function mapSpellKeyName(name: string) {
+  const ke = mapSpellKeyEnd(name)
+  if ke < 0 { return "" }
+  const k = name.slice(2, ke)
+  k
+}
+// THE ONE HOME of the VALUE CUT: the value type-name `V` of a `{[K]:V}` spelling — the text
+// after the `]:` and before the closing `}` — or "" when `name` is not a WHOLE map spelling.
+// Unlike the key cut this one takes the SPAN, because the closing `}` is the value's right
+// edge: without it there is no value text to cut, only a suffix of a bigger name.
+export function mapSpellValName(name: string) {
+  if !nameIsMapSpanEnds(name) { return "" }
+  const ke = mapSpellKeyEnd(name)
+  if ke < 0 { return "" }
+  const v = name.slice(ke + 2, name.length - 1)
+  v
+}
+
+// ── the GENERIC-APPLICATION grammar: `gaeLtAt` FINDS the `<`, `annGenAppSpanEnds` SPANS ──
+//
+// **BOTH HOMES MOVED DOWN HERE FROM `emit_base.vl` (D-GENAPPDOWN)**, the same inversion the
+// PAREN / ARRAY / SHAPE / BRACE grammars took and for the same reason: the CHECKER asks both
+// questions, `emit_base.vl` imports THIS module, and a route upward would cycle the module
+// graph. `emit_base.vl` keeps publishing both names, so `emit_collect`'s four call sites and
+// `emit_classify`'s two compile untouched.
+//
+// The spelling is the parser's: `parseTypeName` folds a generic's arguments into the declared
+// name, so a DECLARATION is `Box<T>` / `Pair<A,B>` and an APPLICATION is `Box<i32>` — one
+// concatenation, and every property this family relies on is a property of it. The head is an
+// identifier run, so the FIRST `<` is the head's right edge; the argument list is the rest,
+// and it closes the name.
+//
+// **THE `<`-SCAN AND THE SPAN ARE TWO PREDICATES, NOT ONE, AND THIS FILE ASKED FOR BOTH
+// SEPARATELY.** Censused structurally over the `'<'` / `'>'` character literals (13 and 12
+// tree-wide), this file carried the `<`-scan written out as a hand-rolled `let/while/flag`
+// loop THREE times — `nameToTyReal`'s application arm, `nameIsGenAppOfDecl`, and pass 0a's
+// generic-declaration registration — and TWO of those three wrapped it in the full span
+// triple (`length >= 3`, a final `>`, `lt > 0`). Pass 0a is the site that proves the split is
+// real: it registers a DECLARATION, where the `<` is all it wants and the trailing `>` is
+// re-read later by the parameter-list cut, so routing it to the span would have been a
+// tightening, not a dedup.
+//
+// THE ONE HOME of the `<`-scan: the position of the first `<` in `name`, or -1. A positive
+// result marks a generic declaration or application name; index 0 does not (a name whose
+// FIRST character is `<` has no head, so every caller gates on `> 0`, never `>= 0`).
+export function gaeLtAt(name: string) {
+  let i = 0
+  while i < name.length {
+    if name[i] == '<' { return i }
+    i = i + 1
+  }
+  -1
+}
+// THE ONE HOME of the GENERIC-APPLICATION SPAN test: a name whose FINAL character is `>` and
+// which has a `<` at a positive index — `Box<i32>`, `Pair<K, V>`. The TEST half of the
+// `Head<…>` grammar, split out from `emit_base.annGenAppDecompose` because callers want only
+// the boolean and their own cut, not the split argument list.
+//
+// The `>` compare stays in FRONT of `gaeLtAt`'s scan, exactly as the inline spellings had it:
+// running a whole-name scan on every annotation that plainly does not end in `>` would be a
+// work regression. `gaeLtAt(ann) > 0` implies `ann.length >= 2`, so the final-character read
+// below is in bounds for every name that reaches it, and the `n < 3` cheap reject is kept as
+// the fast path it always was — `lt > 0` plus a trailing `>` already forces `n >= 3`, so it
+// decides nothing.
+//
+// The two routed sites in this file re-ask `gaeLtAt` for their own head/argument slices
+// rather than threading the index out of the test. That is the trade `annGenAppDecompose` and
+// `emit_classify.gaeEnsure` already take, and it costs a second scan only on a name that
+// already ended in `>` — every other name is rejected by the character compare before either
+// scan runs.
+export function annGenAppSpanEnds(ann: string) {
+  const n = ann.length
+  if n < 3 { return false }
+  if ann[n - 1] != '>' { return false }
+  gaeLtAt(ann) > 0
+}

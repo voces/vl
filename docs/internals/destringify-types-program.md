@@ -28343,3 +28343,236 @@ every gate leg above was re-run on the rebased tree.
 * **Grade a zero by trying to break it, not by looking at it.** Four sabotages read 0/1,508. One was
   a soundness conjunct whose absence traps at runtime, one was observable across sibling scopes, one
   was genuinely unreachable, and one was a thin arm. Only building the witness told them apart.
+
+---
+
+## D-TYNAMEHOME (phase 0) — the type-name grammar gets its OWN MODULE: a leaf with zero imports, 21 bodies, and not one call site touched; plus the strongest instrument in the program measured BLIND to the code it was pointed at (off master `5a1f30d`)
+
+Eight slices consolidated the type-NAME grammars onto homes, and every one of them had to
+put the home in `compiler/typecheck.vl` — not because that is where a character grammar
+belongs, but because `emit_base.vl` imports `typecheck.vl` and the edge is one-way, so the
+checker could not reach a home above it. Eight headers say so in the file itself.
+D-BRACEDOWN filed the endgame — a shared `tyname.vl` — with a precondition: *"one slice
+must own `typecheck.vl` + the six emitter modules simultaneously."* #1228 refuted the
+precondition with a spike. **This slice ships it.**
+
+### THE CENSUS, RE-DERIVED — AND ALL THREE OF #1228's NUMBERS MOVE
+
+Instrument: comment-stripped, string- and char-literal-aware, `import`/`export … from` lines
+excluded (a module line is not a CALL), definition lines subtracted (`function X(` is not a
+call to `X`). Over `compiler/*.vl` at `5a1f30d`:
+
+| | #1228 | re-derived here |
+|---|---:|---:|
+| grammar BODIES | 16 | **21** |
+| CALL sites | 192 | **206** |
+| MODULES involved | 9 | **9** ✓ |
+| import-list ENTRIES | 38 | **44** |
+
+The **9 modules is exact** and worth keeping: `driver` · `emit_base` · `emit_classify` ·
+`emit_collect` · `emit_mono` · `emit_rep` · `emit_rewrite` · `emit_sections` · `typecheck`.
+**`emit_rep.vl:49` is confirmed to be the single-line import** #1228 said a multi-line census
+misses — `import { nameIsShapeSpanEnds, peelGroupParens } from "./emit_base"`, one line, one
+grammar name. A census that reads import BLOCKS and not import LINES scores that module 0.
+
+The body and call counts are higher because the boundary is drawn one notch wider: the 21
+include the four bodies of the bracket-depth WALK (`skipQuotedName`, `tyGtIsClose`,
+`tyTopIndexOf`, `tyGroupEndIndex`) and `parenEnclosesWhole`, which the grammars are built on
+and which cannot be left behind — `mapSpellKeyEnd` IS `tyGroupEndIndex`, `nameIsFuncTypeAtom`
+IS `tyTopIndexOf`. Splitting the walk from the grammars is the one arrangement that is worse
+than either home.
+
+| family | bodies | calls |
+|---|---:|---:|
+| the WALK — `skipQuotedName`* · `tyGtIsClose` · `tyTopIndexOf` · `tyGroupEndIndex` | 4 | 24 |
+| PAREN — `nameIsFuncTypeAtom` · `parenEnclosesWhole` · `nameIsParenOpen` · `nameIsParenSpanEnds` · `peelGroupParens` | 5 | 38 |
+| ARRAY — `nameIsArray` · `arrElemNameRaw` · `listElemNameOf` | 3 | 93 |
+| BRACE — `nameIsShapeOpen` · `nameIsBraceSpanEnds` | 2 | 17 |
+| MAP — `nameIsMapOpen` · `nameIsMapSpanEnds` · `mapSpellKeyEnd` · `mapSpellKeyName` · `mapSpellValName` | 5 | 18 |
+| GENERIC APPLICATION — `gaeLtAt` · `annGenAppSpanEnds` | 2 | 16 |
+| **total** | **21** | **206** |
+
+(*`skipQuotedName` is private and stays private — both its callers move with it.)
+
+### WHAT MOVED, WHAT STAYED, AND THE ONE THAT IS NOT A LEAF
+
+**Moved: all 21.** `compiler/tyname.vl` is a **LEAF with zero imports** — no `T.` arena, no
+`P.` node arena, no diagnostics, no module-level mutable state. `typecheck.vl` republishes the
+20 exported names on one `export … from "./tyname"` line, which is an import that also
+publishes, so **every one of the 206 call sites compiles untouched and no emitter module
+changes.** The move is machine-verified: 162 code lines leave `typecheck.vl`, all 162 appear
+verbatim in `tyname.vl`, and the only insertions into `typecheck.vl` are the 22 lines of the
+re-export block.
+
+**Stayed, each with its reason:**
+
+* **`isTopLevelFuncTypeName` — the boundary case, and the only one.** It is a string predicate
+  that also WRITES a module-level bank (`funcArrowAt`, D-ARROWBANK) which two call sites read
+  immediately after it returns. A body that reaches module state is not a leaf; publishing the
+  bank through an accessor would put a CALL between the predicate's return and the read, which
+  is precisely what its own contract asks callers not to do. Its private helper
+  `topLevelArrowIndex` stays with it. **13 calls, 2 modules — the largest thing left behind.**
+* **`splitUnionAtoms` (28 calls) / `unionMemberCount` (9)** — pure and cross-module, the
+  obvious phase-1 candidates, but SPLITTERS that materialise atoms rather than endpoint tests /
+  spans / cuts, and no D-* slice ever homed them in this family. Moving the compiler's hottest
+  name function (~168 K corpus invocations) inside a slice whose whole claim is byte-identity
+  is not a trade phase 0 should take.
+* **`nameHasSep` / `nameHasPipe`** — pure, but private to the checker with no consumer
+  anywhere else. A home for a caller in one file buys a name, not a deduplication.
+* **`emit_base.mapValNameOf` / `nameIsShapeSpanEnds`** — LAYERS on these homes, not copies
+  (D-MAPOPENDOWN measured the first as a genuinely different SPAN rule), and `emit_base.vl` is
+  outside this partition.
+
+### THE IMPORT GRAPH AFTER
+
+```
+tyname  ←  typecheck  ←  emit_base  ←  emit_classify · emit_collect · emit_mono ·
+   (leaf)      ↑                        emit_rep · emit_rewrite · emit_sections
+               └── driver (gaeLtAt, direct) · emit_classify (isTopLevelFuncTypeName, direct)
+```
+
+A grammar name now crosses up to **three** republishing boundaries to reach `emit_classify`,
+and the `compiler/*.vl` module count goes 25 → 26. Import-list entries 44 → 64 (the new
+20-name line).
+
+### THE FROZEN-SOURCE REBUILD — AND THE FINDING THAT IT IS BLIND HERE
+
+The candidate compiler was pointed at a FROZEN copy of master's own 25 K-line multi-module
+source, and its output compared with what master's compiler produces from the same input:
+
+| | bytes | sha256 |
+|---|---:|---|
+| master's compiler over frozen master source | 1,039,984 | `ff98302e…` |
+| **the candidate compiler over frozen master source** | **1,039,984** | **`ff98302e…`** |
+
+**Byte-identical**, which is the result a pure module move must produce. The two compilers
+also agree on the CANDIDATE source (both reach 1,039,957 B), so they are byte-identical
+producers on two independent 25 K-line programs.
+
+**AND THE BRIEF'S SENSITIVITY RANKING IS REFUTED FOR THIS CODE REGION.** The standing rule —
+seed byte-delta + fixpoint (1) is stronger than the corpus (3), earned by #1225 and #1229,
+where a corpus A/B read 0/1,508 for changes that moved the compiler's own codegen — does not
+hold where THIS slice lives. Three sabotages, each one edit inside `tyname.vl`, were built and
+run through both instruments:
+
+| sabotage | corpus A/B (5 channels, 1,517 files) | frozen rebuild |
+|---|---:|---|
+| CONTROL (pristine candidate) | **0** | **byte-identical** |
+| W2 `nameIsBraceSpanEnds` loses its closing-`}` conjunct | **31** | byte-identical |
+| W3 `gaeLtAt` returns the LAST `<` | **3** | byte-identical |
+| W5 `tyTopIndexOf` stops skipping quoted members | **1** | byte-identical |
+
+**The frozen rebuild is blind to all three**, including the one the corpus scores at 31 files.
+The compiler's own source writes no quoted literal-union member, no generic application whose
+argument is a union, and no brace-span name these readings disagree about — so the one program
+with 19,000 annotations has nothing to say about the grammar. The two instruments are not
+ordered; they are ORTHOGONAL. The corpus carries the weight for the grammar BODIES (calibrated
+here at 31 / 3 / 1, reproducing D-BRACEDOWN's 31 and D-MODGENLT's 3 on a corpus that has grown
+since), and the frozen rebuild carries the weight for the MODULE SPLIT — which is the thing
+the corpus samples badly and the compiler's own build exercises 206 times.
+
+Both channels reading their expected value is what makes phase 0 inert; neither alone would
+have been enough, and the brief said one of them would be.
+
+### COUNTS — BOTH UNITS
+
+* **UNIT A, bodies:** 21 relocated · 1 module created · 0 hand-written copies added or removed.
+  Hand-written copies of the family tree-wide stays at **0**.
+* **UNIT B, named grammar calls: 206 → 206.** The tracked metric is FLAT BY CONSTRUCTION and
+  saying so is the honest report — a MOVE cannot route a call. What moves is the per-module
+  distribution: `typecheck.vl` 63 → 43, with 20 now inside `tyname.vl` (the bodies calling each
+  other), and the other eight modules unchanged to the call.
+* **Binary 1,039,984 → 1,039,957 B (−27).** Localised: the `function`, `global`, `export` and
+  `start` sections are **byte-identical**; the whole delta is in `code`, with the `type` section
+  permuted at the same size. The merge concatenates modules dependency-first, so a new leaf
+  permutes the merged function and type order and a handful of call-target LEB128 indices
+  re-encode narrower. Same 2,613 function bodies on both sides.
+
+### GATE — every rc taken BARE
+
+| leg | rc | result |
+|---|---:|---|
+| `fetch-seed.sh` (freshly fetched, published) | 0 | 1,039,984 B, `ff98302e…` — and NOT stale: it self-compiles to itself, so **master's own fixpoint at `5a1f30d` IS the published seed** |
+| the published seed compiles this source | 0 | no A/B split needed — `tyname.vl` uses nothing the seed lacks |
+| `refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint at 2 compiles, 1,039,957 B |
+| `native-fixpoint.sh` | 0 | stage3 == stage4, 1,039,957 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,224 passed / 0 failed / 8 ignored** — master's 3,222 + 2 for the new case; **8** ignored, not 14, so the six `vl build -O` tests really ran |
+| `lint-self.sh` (incl. `vl fmt --check`) | 0 | clean |
+| `deno check` · `deno lint` · `lsp deno task build` | 0 | clean |
+| `rep-fuzz-check.sh` | 0 | exact — 1 baselined (0 unsound / 1 reject), 0 new / 0 stale |
+| corpus A/B vs master, 5 channels, 1,517 files | 0 | **0 check-rc, 0 diagnostic-text, 0 build-rc, 0 wasm-sha256, 0 run-rc, 0 run-stdout** |
+| fuzz A/B, PINNED seeds 1–7 × depths 4–6 × 200 × {plain, declared} | 0 | 16,800 programs/side, 1,618 out-dir files/side, byte-identical after normalising the `mktemp` path |
+| **strongest available proof: the candidate compiles FROZEN master source** | 0 | `ff98302e…` — **byte-identical to master's own output** |
+
+### THE FIXTURE, AND ITS GRADE — WHICH IS NOT WHAT IT WAS WRITTEN FOR
+
+`tests/cases/modules/reexport-two-calling-hops/` pins the shape phase 0 introduces: TWO
+consecutive republishing hops where **each hop also CALLS what it republishes**, plus an entry
+that reaches past the top hop for a name only the middle declares. `reexport-chain` pins a
+three-link chase whose middle links only forward; `reexport-alongside-import` pins ONE module
+that republishes what it also calls. The compiler now does both at once, twice.
+
+Graded rather than asserted, with a real sabotage: a compiler whose `modMergedTargetOf` chase
+stops after ONE hop reddens the new case (rc 0 → 1) — **and reddens `reexport-chain` too.** No
+sabotage was found that the new case catches ALONE. It ships as the corpus-level statement of
+the compiler's own module shape with **its marginal grading value measured at zero**, not
+claimed as new coverage. Reporting that is cheaper than letting the next census discover it.
+
+### REFUTED
+
+1. **"`tyname.vl` needs one slice owning `typecheck.vl` + six emitter modules at once."**
+   Confirmed void, and shipped: phase 0 touches `typecheck.vl` + one new file. #1228's own
+   restatement ("seven emitter modules, nine total, 192 calls, 38 import entries") is right
+   about the nine and about `emit_rep`'s single-line import, and off on the other three:
+   **21 bodies, 206 calls, 44 import entries.**
+2. **The brief's sensitivity ranking, for this code region.** The frozen-source rebuild — rank
+   (2), above the corpus — reads BYTE-IDENTICAL under three deliberate grammar sabotages the
+   corpus scores at 31, 3 and 1 files. It is the right instrument for the module split and the
+   wrong one for the bodies. Run both; rank neither.
+3. **The walk's own section header, twice.** *"The same grammar is still hand-written out
+   eleven more times, in `emit_base` (7), `emit_classify` (3), `emit_collect` (1) — all three
+   already import `tyGtIsClose` from here."* Measured over `angOpen`, the ladder's one
+   unmistakable marker: **14 occurrences in the home module and ZERO in executable code
+   anywhere else** (three more, all inside comments). No module imports `tyGtIsClose` today.
+   And *"the copies in THIS file still disagree today"* names four divergences —
+   `parenEnclosesWhole`, `nameIsFuncTypeAtom`, the `inStr` toggle in `splitUnionAtoms` /
+   `unionMemberCount`, and `canonShapeName`'s map-key scan — and **all four are closed**; the
+   token `inStr` no longer occurs in the tree. Both paragraphs are corrected in place.
+4. **A "pure move" does not imply a byte-identical BINARY.** It implies a byte-identical
+   COMPILER OUTPUT for a fixed input. The candidate's own binary is 27 B smaller because the
+   merge order changed; the frozen rebuild is what says the behaviour did not.
+
+### HAND-OFFS
+
+* **`emit_base.vl`'s re-export header still says these grammars live "one module DOWN, in
+  `typecheck.vl`".** One hop short as of this slice; comment-only, and that file was outside
+  this partition. `typecheck.vl`'s new re-export header says so at the seam.
+* **PHASE 1 is cosmetic and can go one module at a time**, which is the whole point of a leaf:
+  re-point each consumer's import from `emit_base` / `typecheck` to `./tyname` directly and
+  drop the republishing lines as they empty. Order by size — `emit_classify` (58 calls),
+  `emit_base` (49), `emit_collect` (20), `emit_mono` (8), `emit_rewrite` (4), `driver` (2),
+  `emit_rep` (1), `emit_sections` (1). None of them changes a call site, only an import line.
+* **PHASE 2 is the boundary re-litigated with evidence**, not more moves: `splitUnionAtoms` /
+  `unionMemberCount` (37 calls, 5 modules) belong in a leaf if anything does, and
+  `isTopLevelFuncTypeName` follows only if D-ARROWBANK's bank is retired or published.
+* **A stale orphan header sits at `typecheck.vl`'s old cut point** — a four-line comment
+  describing `nameToTy` (declared ~670 lines below) that was glued to `skipQuotedName`'s
+  header. It is left byte-for-byte where it is, now separated by a blank line.
+
+### LESSONS
+
+* **"Pure function of a string" is a boundary you can TEST, and it decides the whole design.**
+  21 bodies passed it and one did not, and the one that did not (`isTopLevelFuncTypeName`, a
+  string predicate with a bank) is the only judgement call in the slice. A criterion that a
+  grep can adjudicate is worth more than a taxonomy that reads well.
+* **A precondition that was never measured costs more than a slice that was.** "Six emitter
+  modules simultaneously" stood for eight slices and was void; #1228 spent one spike on it and
+  this slice spent one afternoon. Nobody had asked whether the bodies were pure.
+* **Instrument rankings are per-REGION, not global.** The fixpoint sees what the corpus cannot
+  (#1229) and the corpus sees what the fixpoint cannot (here, 31 files to 0 bytes). A slice that
+  had trusted the ranking and skipped the corpus would have shipped an unmeasured grammar; a
+  slice that had trusted the corpus and skipped the fixpoint would have shipped an unmeasured
+  module split.
+* **Verify the move mechanically, not by reading the diff.** 162 deleted code lines, all 162
+  present verbatim in the new file, 22 insertions and all of them the re-export block — a
+  fifteen-line script, and it is a stronger claim than any amount of careful reading.
