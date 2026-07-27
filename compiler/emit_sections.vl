@@ -498,17 +498,16 @@ function checkParams(fnIx: i32) {
           } else if retNulStringFlag(p.parType) == 1 {
             // accepted — a `string | null` param (`(ref null $aTypeIdx)`, kind 16)
           } else if retMapFlag(p.parType) == 1 {
-            // accepted — a string-keyed map param (kind 6, `(ref $mapStruct)`). Mono i32/boolean
-            // rides shape -1; a `string`-valued map carries its mv slot (`mapAnnShape`) across the
-            // boundary. The body's map ops resolve the param via `exprMap`/`paramMap`/
-            // `mapShapeOfExpr` (which now reads the param annotation's shape). A struct/f64/i64-
-            // valued map is NOT yet supported (`retMapFlag` returns 0) → rejected below.
+            // accepted — a string-keyed map param (kind 6, `(ref $mapStruct)`). The mv
+            // SHAPE crosses the boundary (`paramStructIdxOf` → `mapAnnShape`): -1 for a
+            // mono i32/boolean map, its slot for a `string`-valued one. A struct/f64/
+            // i64-valued map is NOT yet supported — `retMapFlag` returns 0, so it falls
+            // through to the reject below.
           } else if retNulMapFlag(p.parType) == 1 {
-            // accepted — a NULLABLE map param (`{[string]: V} | null`, kind `nulmap`): a
-            // `(ref null $mapStruct)` cell that is null or the map. The `!= null` narrow (`ref.is_null`)
-            // and the narrowed map ops (`t["k"]` / `t["k"] ?? d`) recover the non-null map ref
-            // (`ref.as_non_null`) at the receiver — the checker proved every such read guarded. The
-            // shape (`paramStructIdxOf` → `mapAnnShape`) selects THIS map's `$mapStruct`.
+            // accepted — a NULLABLE map param (`{[string]: V} | null`, kind `nulmap`): the
+            // same shape over a `(ref null $mapStruct)` cell. The `!= null` narrow
+            // (`ref.is_null`) and the narrowed ops (`t["k"]` / `t["k"] ?? d`) recover the
+            // non-null ref at the receiver — the checker proved every such read guarded.
           } else if nodeTyIsLitUnionAlias(p.parType) {
             // accepted — a literal-union param is an i32-backed interned atom (kind 0).
           } else if nodeTyIsNulLitUnion(p.parType) {
@@ -715,16 +714,6 @@ function emitFuncCode(out: i32[], fnIx: i32) {
   emitFail("emitProgram: not a function declaration")
 }
 
-// Detect, over the SET of non-const global init expressions, the scratch frames the
-// start function's body needs — the start-fn analogue of `emitFuncCode`'s per-function
-// `fnHas*` detection. A `.push` is a statement-level void call (never in an init VALUE
-// position), so the i32/ref/string-push frames are driven by Member-receiver `.pop`s
-// (which DO appear in value position, `let x = T.scopes.pop()` shape) via
-// `exprPopBits`; string ops and map ops are detected over the same exprs. Sets
-// the `fnUses*` flags + `fnRefPushSlots`/`refPushBaseBySlot` exactly as `emitFuncCode`
-// does, so the shared `fbBeginFunc`/`fbEmitLocalsVec` lay out an identical frame. For
-// the common `curBuf = W.bytes` shape (a plain `global.get`+`struct.get`) every flag is
-// false and the locals vector is empty.
 // Record the ref-list slot of a bare top-level `recv.push(x)` statement (the
 // block-level collector handles pushes nested in loop/if bodies).
 function recordStartRefPushSlot(stmtIx: i32) {
@@ -786,6 +775,16 @@ function startScanIf(ifIx: i32) {
   0
 }
 
+// Detect, over the non-const global inits AND the top-level statements, the scratch
+// frames the start function's body needs — the start-fn analogue of `emitFuncCode`'s
+// per-function `fnHas*` detection. A `.push` is a statement-level void call (never in
+// an init VALUE position), so an init's push frames are driven by Member-receiver
+// `.pop`s instead (`let x = T.scopes.pop()`, via `exprPopBits`); string and map ops
+// are detected over the same exprs. Sets the `fnUses*` flags +
+// `fnRefPushSlots`/`refPushBaseBySlot` exactly as `emitFuncCode` does, so the shared
+// `fbBeginFunc`/`fbEmitLocalsVec` lay out an identical frame. For the common `curBuf =
+// W.bytes` shape (a plain `global.get`+`struct.get`) every flag is false and the
+// locals vector is empty.
 function startFnDetectScratch() {
   fnUsesPush = false
   fnUsesRefPush = false
@@ -927,13 +926,6 @@ function startFnDetectScratch() {
   0
 }
 
-// Emit the synthetic start function's size-prefixed code entry onto `out` (the code
-// section payload). The body runs every NON-const global initializer in declaration
-// order — `emitExpr(body, letInit, -1)` (module scope, `fnIx = -1`) then `global.set gi`
-// — so each cell holds its real value before any other code runs. Mirrors
-// `emitFuncCode`'s framing: detect scratch frames, lay out locals via `fbBeginFunc`,
-// emit the locals vector (`fbEmitLocalsVec`) with NO declared locals, then the body and
-// the `end`, size-prefixed. Returns 0, or -1 (via `emitFail`).
 // Collect the start function's DECLARED locals from the top-level statements: a
 // `for` range loop's var+bound pair (and any `let`s nested in loop/if bodies, via
 // the same collectLocals walkers user functions use, with the module-level
@@ -1017,6 +1009,13 @@ function collectStartLocals() {
   localNames.length
 }
 
+// Emit the synthetic start function's size-prefixed code entry onto `out` (the code
+// section payload). The body runs every NON-const global initializer in declaration
+// order — `emitExpr(body, letInit, -1)` at module scope, then `global.set gi` — so
+// each cell holds its real value before any other code runs. Frames exactly as
+// `emitFuncCode` does: collect locals, detect scratch frames, lay them out with
+// `fbBeginFunc`, emit the locals vector (`fbEmitLocalsVec`), then the body and the
+// `end`, size-prefixed. Returns 0, or -1 (via `emitFail`).
 function emitStartFnCode(out: i32[]) {
   // Locals FIRST, detection SECOND: the scratch detectors classify expressions
   // through the declared-locals registry (`declaredString(k)` for a `print(k)` over
@@ -1709,13 +1708,6 @@ function emitNameSection(n: i32) {
   0
 }
 
-// Emit the complete module for the top-level functions in `fnStmts` (each a FuncDecl,
-// validated by `collectFns`/`buildFnMap`/`checkParams`). If a struct `type` was
-// declared, its WasmGC struct type is emitted FIRST (type index 0) and the functypes
-// follow (1..N); otherwise functypes start at 0. Struct-typed params/results encode
-// as `(ref $0)`. The function section binds func i to its functype, an export per
-// function under its own name, and one code body per function — every section framed
-// through the SAME LEB/section helpers the fixed builders use.
 // Collect the STRING-LITERAL POOL: every distinct `StrLit` lexeme in the arena
 // (first-seen arena order — deterministic per program) whose decoded length fits
 // one `array.new_fixed` (a constexpr admits no locals, so an over-cap literal
@@ -1743,6 +1735,12 @@ function collectStrPool() {
   0
 }
 
+// Assemble the whole module: the header, then each section through its own emitter in
+// wasm's mandated section-id order. Before any section bytes go out, this fixes the
+// module-wide index spaces every one of them then references — the start-function and
+// `__log__` decoder function indices, the shared-helper function indices, the string-
+// literal pool, and (via `mAssignTypeIndices`) every heap type — so no section emitter
+// has to re-derive an index another already chose. Returns 0, or -1 on a failed body.
 function emitModule(_stmts: i32[]) {
   emitReset()
   emitHeader()
@@ -1825,30 +1823,14 @@ function emitModule(_stmts: i32[]) {
   // `(ref $aTypeIdx)`).
   const typeOffset = mAssignTypeIndices(n)
 
-  // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
-  // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
-  // the raw i32 array type (if used) next — `0x5e` array form, `0x7f` i32 storagetype,
-  // `0x01` mutable (derived from binaryen: `5e 7f 01`); the growable-list wrapper struct
-  // (if used) next — `0x5f` struct of three mutable fields `{ backing: (ref $aTypeIdx),
-  // len: i32, cap: i32 }` (verified against binaryen's `listType`); then one functype
-  // per function (`(i32|ref)* -> i32|ref`).
-  // The type section is a vector of rectypes. We emit ALL types inside ONE recursion
-  // group (`0x4e <count>`), so every type index is mutually visible — a struct field
-  // can reference the raw array type that lands AFTER it (a string field's `(ref
-  // $aTypeIdx)`), which a non-grouped section's strictly-earlier-only index rule would
-  // reject. (binaryen emits the same single rec group; functypes inside it are valid.)
-  // So the section's rectype count is 1 (the rec group), and the rec group holds the
-  // `n + typeOffset` actual type definitions.
-  // The print-import functypes are emitted as STANDALONE rectypes AFTER the rec group,
-  // NOT inside it: a rec-group-member functype carries nominal rec-group identity that
-  // a strict WasmGC host (wasmtime) refuses to match against a host-provided function,
-  // so `__print_i32__` & co. fail to instantiate. A standalone functype matches
-  // structurally. (V8 accepted either; this makes the emitted output portable.) The
-  // print functype INDICES are unchanged — they still trail every rec-group type — so
-  // the import-section references and the print-FREE goldens/fixpoint (nPrintTypes == 0,
-  // section rectype count stays 1, rec-group count unchanged) are byte-identical. Counted
-  // here in the coordinator because both the type section and the function section (the
-  // `__log__` functype index) need it.
+  // Each type's byte form lives at its emit site in `emitTypeSection`; the struct,
+  // array and wrapper encodings were derived from binaryen's output (`5e 7f 01` for
+  // the raw i32 array, its `listType` for the `{backing, len, cap}` wrapper), and that
+  // is also where the standalone-vs-rec-group split for the print functypes is
+  // explained. `nPrintTypes` is counted HERE, in the coordinator, because TWO sections
+  // need it: the type section (its rec-group count EXCLUDES the standalone print
+  // functypes) and the function section (whose `__log__` functype index sits past
+  // them). A print-free program counts 0, leaving the rectype count at 1.
   let nPrintTypes = 0
   if gImports > 0 {
     nPrintTypes = 2 // (i32)->() and ()->() for the print imports
@@ -2208,58 +2190,37 @@ function runEmitPass(name: string, stmts: i32[]) {
 }
 
 export function emitProgram(rootIx: i32) {
-  // The map-value ARENA sidecar is per-PROGRAM: its rows are indices into the
-  // checker's `T.tys`, which a fresh program rebuilds from scratch. A compiler
-  // instance that lowers several programs (the test/batch drivers) would else let
-  // program N-1's rows answer a query issued before `collectA`'s reset — a stale
-  // index into a re-built arena. Emptied HERE, ahead of every collect pass, so the
-  // window resolves to "uncovered" and every consumer keeps its name path; the
-  // NAME column's own reset stays where it has always been (`collectA`).
-  mvValTyIx = []
-  // The ref-list ELEMENT arena sidecar is per-PROGRAM for the same reason (method
-  // note 7): its rows are `T.tys` indices, and the NAME column's reset lives in
-  // `collectA` — which runs THIRD, after `collectU`/`collectS`. Emptied HERE so a
-  // query issued before `collectA` sees an UNCOVERED row and every consumer keeps
-  // its element-NAME path, instead of dereferencing program N-1's index into
-  // program N's re-minted arena (a stale index TRAPS; a stale name is wrong text).
-  rlElemTyIx = []
-  // The per-annotation-node ref-list ROW sidecar names rows of THIS program's ref-list
-  // table and is keyed by node index, both re-minted per program — cleared here for the
-  // same reason, so a query issued before `collectA` reads "uncovered" rather than the
-  // previous program's row.
-  annRlSlot = []
-  annRlNul = []
-  // The STRUCT-table arena sidecars complete the same rule. `sTyIx` (the arena type a
-  // struct row was minted from) and `sFieldElemTyIx` (a field's ref-list element type)
-  // are emptied by `collectS`, which runs SECOND — so `collectU`'s inline-union
-  // registration, the FIRST pass, resolves rows against program N-1's indices.
-  // `slotCanonKey` then dereferences one into program N's re-minted arena and TRAPS
-  // ("array element access out of bounds"), which is only reachable when one compiler
-  // instance lowers several programs — the test/batch drivers. Emptied HERE so those
-  // pre-`collectS` queries read UNCOVERED and fall back to their name path, exactly as
-  // they do for the first program an instance ever compiles.
-  sTyIx = []
-  sFieldElemTyIx = []
-  // The VARIANT-field element sidecar is the `sFieldElemTyIx` twin and resets inside
-  // `collectU`, after that pass's own earlier queries could have read it.
-  uFieldElemTyIx = []
-  // The union MEMBER-TYPE sidecar is per-PROGRAM for the same reason (method note 7):
-  // its rows are `T.tys` indices, and `collectU`'s reset — where the NAME columns are
-  // cleared — runs after the first collect pass could already have queried it. Emptied
-  // HERE, ahead of every pass, so a query issued before `collectU` sees an UNCOVERED row
-  // (`unionMemberTysOf` → false) and every consumer keeps its member-NAME scan, instead
-  // of dereferencing program N-1's index into program N's re-minted arena.
-  unMemTyStart = []
+  // ── the ARENA-INDEX SIDECAR reset (method note 7) ───────────────────────────
+  // Every column below holds indices into the checker's `T.tys`, which a fresh
+  // program rebuilds from scratch. Each ALSO has its own reset inside the collect
+  // pass that clears the NAME column it parallels — but those passes run in order
+  // (collectU, collectS, collectA), so a query issued by an EARLIER pass would read
+  // program N-1's rows. `slotCanonKey` then dereferences one into program N's
+  // re-minted arena and TRAPS ("array element access out of bounds"): a stale index
+  // traps where a stale NAME is merely wrong text. Only reachable when one compiler
+  // instance lowers several programs — the test/batch drivers.
+  //
+  // So they are emptied HERE, ahead of every pass: the pre-collect window then reads
+  // UNCOVERED and every consumer keeps its name path, exactly as it does for the
+  // first program an instance ever compiles. Each name column's own reset stays where
+  // it has always been — the pass named in brackets below. An uncovered union-member
+  // row makes `unionMemberTysOf` false, so its consumer falls back to the member-NAME
+  // scan; and a member SET id names a union ROW plus a mask over that row's members,
+  // so `msPoolReset`'s generation bump is what retires an id outliving its program.
+  mvValTyIx = []      // map-VALUE type per mv slot        [collectA]
+  rlElemTyIx = []     // ref-list ELEMENT type per slot    [collectA]
+  annRlSlot = []      // ref-list ROW per annotation node  [collectA] — node ixs are
+  annRlNul = []       // ...and that row's `| null` flag              stable, ROWS are not
+  sTyIx = []          // arena type a struct ROW came from [collectS]
+  sFieldElemTyIx = [] // a struct FIELD's element type     [collectS]
+  uFieldElemTyIx = [] // a VARIANT field's element type    [collectU]
+  unMemTyStart = []   // union MEMBER types per row        [collectU]
   unMemTyCount = []
   unMemTys = []
-  // Its member-REFERENCE columns and the interned member SETS built over them (the
-  // D-UNION set ADT) are per-program for the same reason — a set id names a union ROW
-  // and a mask over that row's members, both re-minted by a fresh program. The
-  // generation bump makes any set id that outlives its program read as uncovered.
-  unMemAtoms = []
+  unMemAtoms = []     // the member-REFERENCE columns      [collectU]
   unMemAtomIds = []
   unMemKinds = []
-  msPoolReset()
+  msPoolReset()       // the member SETS interned over those columns
   emitFailed = false
   emitErr = ""
   // Fresh per program: the diagnostic anchor + the "function being lowered"
@@ -2495,9 +2456,8 @@ function emitSynthCloSig(key: string) {
 }
 
 // Type section (id 1): all WasmGC types in ONE recursion group, followed by the
-// standalone print/(log) functypes. Extracted verbatim from emitModule (C3); see the
-// inline comments below for the per-type framing. The rec-group count excludes the
-// `nPrintTypes` standalone print functypes (and the `memFn` __log__ functype).
+// standalone print/(log) functypes — the rec-group count excludes those. The inline
+// comments below carry the per-type framing.
 function emitTypeSection(
   n: i32,
   typeOffset: i32,
@@ -2514,6 +2474,11 @@ function emitTypeSection(
   wULEB(1 + nPrintTypes + memFn + nHelpers) // rectypes: the rec group + the standalone print/(log)/helper functypes
   wU8(78)                                   // 0x4e rec group
   wULEB(n + typeOffset + hasStart)          // types inside the rec group (print functypes excluded)
+  // TWIN SKIP, used by four of the loops below (struct / variant / ref-list pair /
+  // ref-valued map): a slot whose `*Twin[i] < i` shares an EARLIER slot's heap type,
+  // which was already emitted — so skip it, in lock-step with the
+  // `mAssignTypeIndices` allocation that reused that earlier index. Emitting it
+  // anyway would desync every heap-type index from here on.
   if sDeclared {
     // One `0x5f` struct per declared type (declaration order = heap-type index),
     // each a struct of its fields in declaration order. A field is `0x7f` i32
@@ -2521,9 +2486,7 @@ function emitTypeSection(
     // $aTypeIdx)` (`0x64 <aTypeIdx>` — the raw `(array i32)` string rep); both mutable.
     let si = 0
     while si < sNames.length {
-      // A structural twin (`sTwin[si] < si`) shares an earlier slot's heap type —
-      // its struct was already emitted, so skip it here (in lock-step with the
-      // `mAssignTypeIndices` allocation, which reused that earlier index).
+      // twin skip
       if sTwin[si] < si {
         si = si + 1
       } else {
@@ -2558,9 +2521,7 @@ function emitTypeSection(
     // 6e 00` (verified against `toWasm.ts`'s `unionStruct`).
     let vi = 0
     while vi < uVariants.length {
-      // A variant layout twin (`uVarTwin[vi] < vi`) shares an earlier slot's heap
-      // type — already emitted, so skip it (lock-step with the `mAssignTypeIndices`
-      // allocation, which reused that earlier index).
+      // twin skip
       if uVarTwin[vi] < vi {
         vi = vi + 1
         continue
@@ -2642,9 +2603,7 @@ function emitTypeSection(
   // (struct heap idx / union box); each wrapper is `{ backing: (ref $back), len, cap }`.
   let rti = 0
   while rti < rlElemName.length {
-    // A structural twin (`rlTwin[rti] < rti`) shares an earlier slot's (backing,
-    // wrapper) pair — already emitted, so skip it (lock-step with the
-    // `mAssignTypeIndices` allocation, which reused that earlier pair).
+    // twin skip — the whole (backing, wrapper) PAIR
     if rlTwin[rti] < rti {
       rti = rti + 1
     } else {
@@ -2686,16 +2645,10 @@ function emitTypeSection(
     wU8(1)   // mutable
   }
   if mUsed {
-    // The MAP struct `{ keys: (ref $mkListIdx), vals: (ref $lTypeIdx), live: (ref
-    // $aTypeIdx), index: (ref $aTypeIdx), count, size, hashes: (ref $aTypeIdx) }` — two
-    // non-null list refs (the keys string-list + the i32 vals list), the i32 `live`
-    // tombstone array, the i32 `index` hash-slot array, the `count`/`size` counters, and
-    // the i32 `hashes` per-entry FNV cache. FIELD ORDER + COUNT now match the host's
-    // 7-field general-purpose rep EXACTLY (`compiler/builtins/maps.ts`, `MAP_HASHES = 6`):
-    // the cached per-entry hash lets resize/compact RE-PLACE entries without re-hashing
-    // keys and gates the (string) key comparison on a hash mismatch — justified for
-    // large/long-key maps, not a compiler-symbol-table-narrow optimization. live is at
-    // index 2, index/count/size at 3/4/5, hashes at 6.
+    // The MAP struct — the 7-field open-addressing rep documented at `mUsed` in
+    // emit_state. FIELD ORDER + COUNT match the host's general-purpose rep EXACTLY
+    // (`compiler/builtins/maps.ts`, `MAP_HASHES = 6`): keys 0, vals 1, live 2,
+    // index 3, count 4, size 5, hashes 6.
     wU8(95)  // 0x5f struct (map)
     wU8(7)   // 7 fields (open-addressing hash map, host-aligned)
     wU8(100) // field 0 keys: 0x64 (ref $mkListIdx) — non-null
@@ -2865,11 +2818,10 @@ function emitTypeSection(
   // referencing this slot's ref-list wrapper (the string-list pair for string
   // values, the element's `rlWrapIdx` for struct values). Keys/live/index/count/
   // size/hashes are identical across all map structs, so the shared probe/rehash/
-  // compact bytes apply as-is. A layout twin (`mvTwin[mvs] < mvs`) shares an
-  // earlier slot's heap type — already emitted, so skip it (lock-step with the
-  // `mAssignTypeIndices` allocation, which reused that earlier index).
+  // compact bytes apply as-is.
   let mvs = 0
   while mvs < mvValName.length {
+    // twin skip
     if mvTwin[mvs] < mvs {
       mvs = mvs + 1
       continue
@@ -2978,19 +2930,29 @@ function emitTypeSection(
     }
     ti = ti + 1
   }
-  // The synthetic start function's `()->()` functype (lands at index `typeOffset + n`,
-  // AFTER every user functype — so no user type index shifts and the Phase-G assert is
-  // untouched). `0x60` func, 0 params, 0 results.
+  // ── the TAIL functypes, in emit order ───────────────────────────────────────
+  // Everything from here down is APPENDED after the user functypes, each group after
+  // the last, so no earlier functype index ever shifts and the Phase-G assert stays
+  // untouched. Each is a `0x60` func rectype; the indices run:
+  //   start fn `()->()`     `typeOffset + n`         (only when hasStart)
+  //   print `(i32)->()`     +1   shared by __print_i32__ / __print_bool__ / _char__
+  //   print `()->()`        +1   __print_str_flush__
+  //   `(i64)->()` then `(f64)->()` then `(f32)->()`  one per WIDE scalar the program
+  //                              prints, in that order (Slices 1 / 3 / 5)
+  //   `(i32,i32)->()`       `typeOffset + n + hasStart + nPrintTypes`  the __log__ decoder
+  //   the helper functypes  + memFn + <helper order>  (see `emitFunctionSection`)
+  //
+  // The PRINT functypes are STANDALONE rectypes, outside the rec group whose count was
+  // written above: a strict-GC host (wasmtime) refuses to match a rec-group-member
+  // functype — which carries nominal rec-group identity — against a host-provided
+  // function, so `__print_i32__` & co. would fail to instantiate. A HELPER functype may
+  // still reference an earlier rec-group type (`$aTypeIdx` / `$mkArrIdx`): a later
+  // rectype referencing an earlier type index is always valid.
   if hasStart == 1 {
     wU8(96) // 0x60 func
     wU8(0)  // 0 params
     wU8(0)  // 0 results
   }
-  // The print-import functypes (only when a `print` exists): `(i32)->()` at index
-  // `typeOffset + n + hasStart` (shared by __print_i32__/__print_bool__/__print_char__)
-  // and `()->()` at +1 (__print_str_flush__). Emitted LAST and as STANDALONE rectypes
-  // (the rec-group count above excludes them) so a strict-GC host can match the import
-  // against a host function; no user/start functype index shifts.
   if gImports > 0 {
     wU8(96)  // 0x60 func
     wU8(1)   // 1 param
@@ -3000,47 +2962,32 @@ function emitTypeSection(
     wU8(0)   // 0 params
     wU8(0)   // 0 results
   }
-  // The `(i64)->()` functype for `__print_i64__` (only when an i64 program prints),
-  // standalone AFTER the two existing print functypes — its index is `ftVoid + 1`,
-  // so no existing functype index shifts.
   if gNeedsI64Print {
     wU8(96)  // 0x60 func
     wU8(1)   // 1 param
     wU8(126) // 0x7e i64
     wU8(0)   // 0 results
   }
-  // The `(f64)->()` functype for `__print_f64__`, standalone AFTER the i64 one (if any),
-  // so no existing functype index shifts. (Slice 3.)
   if gNeedsF64Print {
     wU8(96)  // 0x60 func
     wU8(1)   // 1 param
     wU8(124) // 0x7c f64
     wU8(0)   // 0 results
   }
-  // The `(f32)->()` functype for `__print_f32__`, standalone AFTER the i64/f64 ones (if
-  // any), so no existing functype index shifts. (Slice 5.)
   if gNeedsF32Print {
     wU8(96)  // 0x60 func
     wU8(1)   // 1 param
     wU8(125) // 0x7d f32
     wU8(0)   // 0 results
   }
-  // The `(i32, i32) -> ()` functype for the synthetic `__log__` decoder, standalone
-  // LAST (after every print functype) so no existing functype index shifts. Its
-  // index is `typeOffset + n + hasStart + nPrintTypes`.
   if memLogUsed {
-    wU8(96)  // 0x60 func
+    wU8(96)  // 0x60 func — the `__log__` decoder
     wU8(2)   // 2 params
     wU8(127) // 0x7f i32 (offset)
     wU8(127) // 0x7f i32 (length)
     wU8(0)   // 0 results
   }
-  // The shared-runtime-helper functypes, standalone LAST (after every print/(log)
-  // functype) in helper-index order, so no existing functype index shifts. Each may
-  // reference earlier rec-group types (`$aTypeIdx` / `$mkArrIdx`) — a later rectype
-  // referencing an earlier type index is always valid. A helper's functype index is
-  // `typeOffset + n + hasStart + nPrintTypes + memFn + <its order>` (see
-  // `emitFunctionSection`).
+  // The shared runtime helpers, in helper-index order.
   if gHelpStrHash >= 0 {
     helpFuncType("a", "i")  // __str_hash__: (str) -> i32
     helpFuncType("aa", "i") // __str_eq__: (str, str) -> i32
@@ -3055,7 +3002,6 @@ function emitTypeSection(
   0
 }
 
-// Import section (id 2), extracted verbatim from emitModule (C3).
 function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
   // Import section (id 2, between type and function): the 4-entry print family from
   // the host's `"imports"` module, occupying function indices 0..3 in this exact
@@ -3124,7 +3070,6 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
   0
 }
 
-// Function section (id 3), extracted verbatim from emitModule (C3).
 function emitFunctionSection(
   n: i32,
   typeOffset: i32,
@@ -3174,7 +3119,6 @@ function emitFunctionSection(
   0
 }
 
-// Global section (id 6), extracted verbatim from emitModule (C3).
 function emitGlobalSection() {
   // Global section (id 6): one mutable global per top-level `let`/`const`, in
   // declaration order (that order IS the global index `global.get`/`global.set` use).
@@ -3358,7 +3302,6 @@ function emitGlobalSection() {
   0
 }
 
-// Export section (id 7), extracted verbatim from emitModule (C3).
 function emitExportSection(_n: i32) {
   // Export section (id 7): the module's ABI is EXACTLY the alias tables the
   // driver staged — re-export entries (`export { name } from "dep"` → the
@@ -3450,8 +3393,7 @@ function emitExportSection(_n: i32) {
   0
 }
 
-// Code section (id 10), extracted verbatim from emitModule (C3). Returns -1 if any
-// function body fails to emit (propagated by the caller), else 0.
+// Returns -1 if any function body fails to emit (propagated by the caller), else 0.
 function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   // Code section (id 10): one size-prefixed body per function, in index order, then
   // (if any) the synthetic start function's body, the `__log__` decoder's, and the
