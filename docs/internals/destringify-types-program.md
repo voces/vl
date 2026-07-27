@@ -22158,3 +22158,281 @@ in this log, because the next agent reads the playbook and not a 21,000-line pro
    been through `-O`**; run afterwards, they pass, but that was luck rather than coverage. A suite
    whose absent dependency degrades to "ignored" is a gate that reports success for work it did not
    do.
+## D-FMTDECL — the census of the scoreboard's BLIND SPOT, and the two bugs living in it (#1181)
+
+Branched at `e5d3130` (#1174), rebased through `63cdb61` (#1175) and `59fc905` (#1176) onto
+**`339ed9a`** (#1177). **Every channel was re-run at that final head in one session** — see "the
+numbers that MOVED across the rebases" below; none is inherited. Files: `compiler/format.vl` +
+`compiler/parser.vl` + **2 new fixtures**. Nothing else. The brief was to census the six files the tracked scoreboard reports
+**ZERO** for — `check_query` / `format` / `parser` / `cli` / `emit_bytes` / `lexer` — and to decide
+whether that zero is real.
+
+**It is real for the two things the scoreboard counts, and false for the thing it does not.** The
+partition holds **0** tracked-resolver calls and **0** off-list-scanner calls, exactly as reported.
+It also holds a hand-written type-string bracket-depth parser, a whole-spelling structure test, and
+**two user-visible defects that the structure test caused** — none of which any name-based census
+can see, because *the surgery is spelled in single characters, not in identifiers*.
+
+### The instrument, validated before it quoted anything
+
+**UNIT: static CALL SITES** for the resolver lists — a textual `NAME(` in non-comment code where
+the preceding character is not `[A-Za-z0-9_.$]`; `"…"` bodies blanked, **`'…'` char literals kept
+verbatim** (method note 92); the resolver's own `function NAME(` header excluded; scanned over
+`compiler/*.vl` + `std/*.vl` + `scripts/*.vl`; per-file sums cross-checked against a tree-wide
+recount.
+
+Validated against three published figures at this slice's original base `e5d3130`:
+
+| figure | published | this instrument |
+|---|---|---|
+| `emit_classify.vl`, CORE | 175 | **175** |
+| `emit_base.vl`, CORE | 48 | **48** |
+| tree-wide, CORE | 303 | **303** |
+
+All three reproduce exactly. Off-list reads **27**, all in `typecheck.vl`.
+
+**THE NUMBERS THAT MOVED ACROSS THE REBASES.** Three merges landed mid-slice, which is why the
+denominator is re-taken at each rather than carried. The same instrument reads tree-wide CORE
+**303** (`e5d3130`) → **306** (`63cdb61`) → **306** (`59fc905`) → **311** (`339ed9a`), with
+`emit_classify` **175** unmoved throughout and `emit_base` **48 → 51**. Both increases come from
+destringify slices: #1175's new homes (`arrElemNameRaw` / `listElemNameOf`) and #1177's routing
+call the tracked list's members, so **a slice that deletes 14 hand-written copies moves the CORE
+count UP** — exactly the scoreboard pathology #1141 first demonstrated, observed twice more here.
+**Every partition figure below is a property of the six files, which no merge touched and which
+read the same at every head: 0 and 0.**
+
+### The census — six files, four categories, UNITS stated
+
+Categories 1 and 2 are CALL SITES. Category 3 is static **SITES** (C5 is **FUNCTIONS**).
+Category 4 is comparison **SITES**. Partition rows measured at `e5d3130` (pre-change) and
+**re-taken identical at the gating head** — neither #1175 nor #1176 touched any of the six files.
+The tree-wide row is given at both heads, because those files did move.
+
+| file | ① CORE (23) | ② OFF-LIST (13) | ③ C1 char-lit tests | C2 `.slice(` | C3 `.length ±` | C5 depth-walk fns | ④ whole-spelling struct `==` |
+|---|---|---|---|---|---|---|---|
+| `check_query.vl` | 0 | 0 | **0** | 0 | 0 | 0 | 0 |
+| `emit_bytes.vl` | 0 | 0 | **0** | 0 | 1 | 0 | 0 |
+| `lexer.vl` | 0 | 0 | **135** | 6 | 1 | 0 | 0 |
+| `parser.vl` | 0 | 0 | 2 | 3 | 6 | 1 | 0 |
+| `cli.vl` | 0 | 0 | 9 | 9 | 7 | 0 | 0 |
+| `format.vl` | 0 | 0 | **17** | 13 | 20 | **1** | 0 |
+| **partition** | **0** | **0** | **163** | **31** | **35** | **2** | **0** |
+| tree-wide (`compiler/`+`std/`), `e5d3130` | 303 | 27 | 728 | 204 | 291 | 7 | — |
+| tree-wide, gating head `339ed9a` | 311 | 27 | 706 | 189 | 272 | 7 | — |
+
+**The triage — by OPERAND, after enumerating by CODE.** Structural enumeration is the *discovery*
+method (no naming convention can hide from it); classification is by hand, and it matters:
+
+- `lexer.vl` **135 / 135 are the lexer lexing** its own source buffer. Exempt by the owner's rule
+  and by definition. **0 type-string operations.**
+- `cli.vl` **25 / 25 are filesystem paths, CLI flags and source offsets.** **0 type-string operations.**
+- `parser.vl` — 3 of the 6 `.length ±` are TOKEN-ARRAY bounds, not string surgery; the rest strip
+  quotes off a string-literal or import-path lexeme. Its one "depth walk", `parseImport`, counts
+  `{ … }` nesting over **TOKENS** (`peekKind()`), not characters. **0 type-string operations. The
+  parser is parsing, which is its job.** Its 6 "structural" string equalities are the operator
+  lexemes `"||"` / `"&&"`. Its other 321 string equalities are token KINDS (`peekKind() == "IDENT"`)
+  — nominal, exempt.
+- `emit_bytes.vl` — its single `.length +` is array arithmetic. But it carries **74 equalities
+  against a closed vocabulary of ~24 REP-KIND tags** (`"struct"`, `"reflist"`, `"nulreflist"`,
+  `"f64list"`, …). That is a **string-encoded ENUM**, not a parse: no decomposition, no structure
+  extracted. It is filed below rather than counted here, because its producer is in `emit_rep` /
+  `emit_classify` and the fix is a hand-off, not a rewrite of the consumer.
+- `check_query.vl` — the LSP query layer reads the checker's types and never touches a spelling.
+  **A genuine, total zero across all four categories.** (Method note 108: write the zero down.)
+- `format.vl` — **the whole of the partition's type-string surgery lives here**, in two functions.
+
+### What is actually in `format.vl` — a THIRD type-string parser, uncounted
+
+`splitTopLevel(s, sep)` + `wrapTypeDecl(codeLine, …)` are a complete hand-written type-name
+grammar, and every piece of it already has a HOME elsewhere in the compiler:
+
+| what the code is | where the home already is |
+|---|---|
+| bracket-DEPTH walk, `{[(<` open / `)]}` close | `emit_base.tyTopIndexOf` / `tyTopLevelSplit` |
+| `>` closes only a real open `<` (spelled here as `s[i - 1] != '='`) | `tyGtIsClose` — the off-list scanner, hand-written a THIRD time |
+| skip a `"…"` literal while walking | `skipQuotedName` |
+| split at every top-level separator | `tyTopLevelSplit` |
+| "does the body start with `{`" ⇒ it is a record | **nothing — and it was WRONG** |
+| peel the outer braces, `body.slice(1, body.length - 1)` | the standard peel |
+
+The scoreboard scores this **0** on both of its lists. It is **11 character-test sites of pure
+type-string grammar** (`976`–`984`) plus the `=`-scan and the brace test.
+
+### The two bugs the blind spot was hiding — both verified by hand, both fixed here
+
+**BUG 1 — `vl fmt` fails on valid source, because a whole-spelling test overrules the parser.**
+`wrapTypeDecl` asked `body[0] == '{'` to decide "is this RHS a struct record". `parseTypeDecl`
+emits a `TypeDecl` for **exactly one** RHS shape — a `{ … }` with **no** `&`/`|` continuation — and
+a `UnionDecl` for every other, *including* `{ … } & { … }` and `{ … } | { … }`, which it re-encodes
+as a union over synthetic member names. So the text test called both re-encoded shapes a record and
+peeled `slice(1, length - 1)` off a body whose first `}` is not its last. On an over-width one-line
+decl:
+
+```
+export type IntersectionOfTwoRecordsWithLongNames = { alphaFieldName: i32, betaFieldName: i32 } & { gammaFieldName: i32 }
+```
+`vl fmt` → **rc=3, "formatter produced invalid output — file left unchanged, please report."**
+
+**The fix is not a better string test — it is to stop asking the string.** The statement dispatch
+already ran `n is TypeDecl` / `n is UnionDecl` and threw the answer away into one shared
+`emitTypeOrUnionDecl`. That verdict is now threaded down as `isRecord`. **This is the SCORECARD
+CORRECTION's "kill the SOURCES" strategy applied to a producer that was already correct**: the
+parser had decided; the formatter re-derived and got it wrong.
+
+**BUG 2 — a brace-leading union is the ONE union that cannot be wrapped across lines.** With bug 1
+fixed the intersection formats, but `{ … } | { … }` still failed — a *second, independent* defect.
+`parseTypeDecl`'s bare-name union path deliberately skips newlines before testing for the next `|`
+(so a multi-line union parses); the `{ … }` continuation test at the same function's other end does
+**not**. Measured with one variable changed:
+
+| program | `e5d3130` |
+|---|---|
+| `type A = Alias1` ⏎ `  \| B` (name-leading, multiline) | **parses** |
+| `type A = { a: i32 } \| { b: i32 }` (brace-leading, one line) | **parses** |
+| `type A = { a: i32 }` ⏎ `  \| { b: i32 }` (brace-leading, multiline) | **`expected an expression but found PIPE`** |
+
+Fixed by the same speculative skip-and-restore its sibling path uses. **The widening is total and
+provably safe: `|` and `&` cannot begin a statement, so every token sequence this newly accepts was
+previously a hard parse error.** That is why the corpus cannot move.
+
+### The population problem — and why an inert sabotage was not accepted
+
+A sabotage that disables record wrapping entirely (`isRecord` → `false`) is **INERT over all 1,432
+`.vl` files in the repo**: it changes exactly one file's formatted output, and that file is
+`format.vl` itself, only because its own source text was edited. **No file in the corpus, the
+compiler, `std/` or `scripts/` contains an over-width single-line type declaration.** So the
+corpus A/B, on either channel, can testify about `wrapTypeDecl` *not at all* — a 0 there was pure
+coverage, not agreement.
+
+Per method note 103, the population was **constructed** rather than shrugged at: 88 programs over
+every RHS shape the grammar admits (records 1–6 fields; a record per field-type spelling including
+maps, arrows, generics and nullables; unions of names at arity 2–7; brace-leading unions and
+intersections at every arity; the mixed `{…} & {…} | Name`; unions carrying `<>`, `=>`, `[]`,
+`{[K]:V}`, string literals, and a `|` **inside** a quoted literal type; exported and non-exported).
+
+| build | `vl fmt` rc=3 | output differs vs candidate | non-idempotent | fmt output re-`check`s to the same verdict |
+|---|---|---|---|---|
+| baseline (**re-taken at the gating head `339ed9a`**) | **16 / 88** | 16 | 0 | 66 agree / 2 pre-existing diverge |
+| **this slice** | **0 / 88** | — | 0 | **82 agree** / the same 2 |
+| sabotage (control) | 0 | **44 / 88** | 0 | 82 / same 2 |
+
+**The comparator is validated at volume against a known-WRONG build**: 44 of 88 redden under the
+sabotage. The 2 residual divergences are **identical on the baseline** — a pre-existing diagnostic
+detail (the `within '…'` clause drops when an arrow-union wraps), untouched by this slice and owned
+by `typecheck.vl`.
+
+### The gate — every leg re-run at the GATING head `339ed9a`, none inherited from an earlier base
+
+`refresh-compiler.sh` rc=0 · `native-fixpoint.sh` **stage3 == stage4 byte-for-byte** ·
+`deno check` rc=0 · `lint-self.sh` rc=0 (**`vl fmt --check` is load-bearing for a `format.vl`
+change and the whole tree is still fmt-clean — the formatter did not reformat the world**) ·
+`rep-fuzz-check.sh` exact ✅.
+
+Suite, **both sides in the SAME environment** (method: worktrees ignore 6 tests `/workspace` runs;
+compare within one environment, don't accuse): baseline **2140 passed / 0 failed / 14 ignored** →
+this slice **2142 / 0 / 14**. **+2, 0 failed, ignored set identical** — exactly the two new fixtures.
+(The host binary was rebuilt from `scripts/vl-host/src/main.rs` first: #1176 changed it, and a stale
+host would have graded #1176's own tests, not this slice's.)
+
+**Corpus A/B, all 1,410 files, five channels** (build rc · wasm sha256 · diagnostic text · run rc ·
+run stdout, temp paths normalized): **2 files differ, both the new fixtures**, each parse-error →
+clean build+run. All 1,408 pre-existing files **byte-identical on every channel**.
+
+**FMT A/B, 1,441 files** (corpus + `compiler/` + `std/` + `scripts/`) — the channel the build/run
+A/B is blind to for a formatter change: **2 files differ, both the new fixtures**, rc=2 "not
+formatted" → rc=0 idempotent. The other 1,439 format **byte-identically**; 0 non-idempotent on
+either side.
+
+**Fuzz A/B: 50,400 programs per side**, 84 cells (depths 2–4 × 7 seeds × {plain, `--values`,
+`--branching`, `--declared`}). **Zero divergences**; identical 60-finding sets, all pre-existing
+REJECTs.
+
+Binary, at the gating head, **1,034,330 → 1,034,353 B (+23)** — the same +23 measured at all three
+bases. Self-build wall time, both sides warmed first, and the CANDIDATE run first so the ordering
+effect works *against* it (method note 111 — swap the order and watch the outlier move): this slice
+**min 2.179 s / median 2.283 s**, baseline **min 2.222 s / median 2.342 s**. **No allocation
+regression** — this slice adds one bool parameter and deletes a character test.
+
+### The fixtures
+
+`tests/cases/parser/type-decl-brace-union-multiline.vl` and
+`…/type-decl-brace-intersection-multiline.vl`. **Graded position by position** (method note 110):
+they redden on a pristine baseline artifact — re-verified at **`339ed9a`**, not inherited — with
+*distinct* messages, `expected an expression but found PIPE` (12:2) and `… found AMPERSAND` (8:2),
+so each pins its own arm of the continuation test rather than one fixture claiming both.
+
+### The answer to the brief's question, as a number
+
+The tracked scoreboard reports **0 of 0** for this partition on its own two lists, and that is
+**correct**. Measured against what the partition actually contains, it is blind to:
+
+- **229 character-surgery sites** in the partition (163 char-literal tests + 31 `.slice(` +
+  35 `.length ±`), of which **~21 are genuine type-string operations** — all in `format.vl`, all
+  in two functions, and **all scored 0** by both tracked lists;
+- **1 hand-written type-string bracket-depth walk**, including a third copy of `tyGtIsClose`'s
+  `=>`-vs-`>` rule, in a file the scoreboard reads 0 for;
+- **74 string-encoded rep-kind enum comparisons** in `emit_bytes.vl`;
+- and **2 user-visible bugs** that the uncounted category directly caused.
+
+**Category 4 as the brief defines it — a whole-SPELLING equality `x == "…"` — is a true 0 here, and
+that is the sharpest finding of the census: in this partition the structural decision is spelled as
+a SINGLE-CHARACTER test (`body[0] == '{'`), not as a string equality.** A census built on string
+literals scores it 0; a census built on identifier names scores it 0; only the structural
+enumeration finds it. **Net movement on the published scoreboard, at the gating head `339ed9a`:
+CORE 311 → 311, OFF-LIST 27 → 27, Δ 0** — and that zero is the point. `format.vl` C1 char-tests
+**17 → 16** is the whole scoreboard delta this slice is able to express, for a change that fixes
+two bugs.
+
+### NEWLY FILED — three, each with its mechanism
+
+1. **`format.splitTopLevel` should route to `emit_base.tyTopLevelSplit`** (its FIND half is
+   `tyTopIndexOf`, already quote-aware, already `tyGtIsClose`-correct). **Blocked: `emit_base.vl` is
+   another agent's partition.** Two real differences must be handled, not assumed away: the home
+   takes `sep` as an **i32 char code** and does **not trim**, while the formatter needs each part
+   `rstrip(trimWsStart(…))`-trimmed to preserve source spelling. The wrapper is ~4 lines in
+   `format.vl`; the equivalence is checkable on the 88-program population above, which is the only
+   population that reaches it.
+2. **The formatter's record path still splits SOURCE TEXT the AST already holds.** `TypeDecl`
+   carries `tdFields: i32[]` (a `FieldDef` per field, each with a source `pos`) and `UnionDecl`
+   carries `udVariants: string[]` **plus `udTsRoot` spelling trees** (D-PARSETY P2). The formatter
+   cannot use `udVariants` directly — those are canonical spellings (`(i32)=>i32`) and the formatter
+   must reproduce the user's spacing — so the collapse needs **per-member source SPANS** recorded by
+   the parser. **Blocked: that is a new column on the node, i.e. `ast.vl`, outside this partition.**
+   With spans, `splitTopLevel` and both of its call sites delete outright.
+3. **`emit_bytes.vl` compares a rep-kind against a string 74 times** over a closed ~24-atom
+   vocabulary. Not a parse, so not on this program's count — but it is a string standing in for an
+   enum, and the fix is at the **producer** (`emit_rep` / `emit_classify`), not at these 74
+   consumers. **Blocked: both producers are other partitions.**
+
+**And one gap this slice could not close:** the fmt fix has **no regression pin in the suite**.
+`tests/` is excluded from `lint-self.sh`'s `vl fmt --check` **by construction**, `cases_wasm_test.ts`
+has no `@fmt` directive, and `tests/vl_fmt_test.ts` uses inline strings — so a `tests/cases/`
+fixture (this partition's only test allowance) cannot express it. The pin is ~15 lines in
+`tests/vl_fmt_test.ts`: format the over-width `{…} & {…}` decl, assert rc=0 and that the output
+re-`check`s. The *parser* half IS pinned, by both fixtures.
+
+### THE METHOD NOTES THIS SLICE EARNED
+
+112. **A STRUCTURAL CENSUS MUST NOT ANCHOR ON THE BOUND NAME.** The first character-surgery
+     detector required the char to be compared *at its index* (`X[i] == 'c'`). Every serious
+     scanner in this compiler binds it first (`const c = s[i]`), so the detector read `lexer.vl`
+     as **0** — a file that is 135 character tests. Widening to *any* comparison against a char
+     literal moved the tree-wide count **348 → 728**. A structural census that reads 0 on the
+     lexer is measuring its own regex, not the code.
+113. **THE STRUCTURAL DECISION MAY BE ONE CHARACTER WIDE.** The bug this slice fixes is
+     `body[0] == '{'`. It is not a resolver call, not a scanner call, not a whole-spelling
+     equality, and contains no identifier a name list could match. **It is invisible to every
+     census this program has ever published, and it was miscompiling `vl fmt`.**
+114. **AN INERT SABOTAGE OVER THE CORPUS CAN MEAN THE CORPUS HAS NO POPULATION — CONSTRUCT ONE
+     BEFORE BELIEVING THE ZERO.** Disabling record wrapping changes **1** of 1,432 repo files
+     (and that one only because its own source was edited). Over 88 constructed programs the same
+     sabotage changes **44**. The corpus-wide 0 was a coverage fact wearing an agreement fact's
+     clothes.
+115. **WHEN THE PARSER HAS ALREADY DECIDED, THE ONLY CORRECT NUMBER OF SECOND OPINIONS IS ZERO.**
+     `n is TypeDecl` was computed at the dispatch and discarded; twelve lines later the same
+     question was re-answered from the rendered text, differently, and wrongly. **A verdict thrown
+     away is a verdict about to be re-derived.**
+116. **A FORMATTER CHANGE IS INVISIBLE TO A BUILD/RUN A/B.** The corpus A/B this program runs
+     compiles and executes every fixture; `format.vl` is on neither path. The channel that can see
+     it is a fmt sweep with an idempotence leg. *Pick the channel by what the change touches, not
+     by what the harness already does.*
