@@ -5769,28 +5769,24 @@ function nameToTyReal(name: string) {
     if aeTy < 0 { return -1 }
     return mkArrayTy(aeTy)
   }
-  // A string-keyed MAP `{[K]:V}` (the parser's synthetic index-signature name).
-  // Split at the FIRST "]:" — the key (between "{[" and "]:") cannot contain `]`,
-  // so a nested-map VALUE (`{[string]:{[string]:i32}}`) splits correctly. Only
+  // A string-keyed MAP `{[K]:V}` (the parser's synthetic index-signature name) —
+  // the MAP-NAME grammar's SPAN and its two CUTS, each at its home below. Only
   // string keys are supported (the host's map rep); a non-string key resolves to
   // -1 so the caller reports "unknown type". An UNRESOLVED VALUE poisons the
   // annotation too — the `mkMapTy(str, -1)` it would otherwise build is the
   // empty-`Map()` INFERENCE hole, which every consumer reads as "not yet known"
   // rather than "no such type".
-  if nlen >= 5 {
-    if name[0] == '{' && name[1] == '[' && name[nlen - 1] == '}' {
-      let mi = 2
-      while mi < nlen - 1 {
-        if name[mi] == ']' && name[mi + 1] == ':' {
-          const mk = nameToTy(name.slice(2, mi))
-          if mk != TY_STR { return -1 }
-          const mv = nameToTy(name.slice(mi + 2, nlen - 1))
-          if mv < 0 { return -1 }
-          return mkMapTy(mk, mv, 0)
-        }
-        mi = mi + 1
-      }
-    }
+  //
+  // The `nlen >= 5` bound this arm carried is implied by the two gates (see
+  // `mapSpellKeyEnd`), and the key-end test is what the arm's own `]:` scan was:
+  // when it finds nothing the arm falls through to the inline-object arm below,
+  // exactly as the un-taken `while` did.
+  if nameIsMapSpanEnds(name) && mapSpellKeyEnd(name) >= 0 {
+    const mk = nameToTy(mapSpellKeyName(name))
+    if mk != TY_STR { return -1 }
+    const mv = nameToTy(mapSpellValName(name))
+    if mv < 0 { return -1 }
+    return mkMapTy(mk, mv, 0)
   }
   // An INLINE OBJECT type `{x:T,y:U}` (the parser's synthetic anonymous-struct
   // name — starts `{` but not `{[`). Split the TOP-LEVEL commas (depth-aware: a
@@ -5860,22 +5856,6 @@ function nameToTyReal(name: string) {
     }
   }
   declaredTyOfName(name)
-}
-
-// If `name` is a synthetic map shape `{[K]:V}` (the parser's index-signature
-// name), return the KEY type name `K`; otherwise "". Used to give an actionable
-// diagnostic for an unsupported (non-`string`) map key instead of a bare
-// "unknown type '{[i32]:i32}'".
-function mapShapeKeyName(name: string) {
-  const nlen = name.length
-  if nlen < 5 { return "" }
-  if name[0] != '{' || name[1] != '[' { return "" }
-  let mi = 2
-  while mi < nlen - 1 {
-    if name[mi] == ']' && name[mi + 1] == ':' { return name.slice(2, mi) }
-    mi = mi + 1
-  }
-  return ""
 }
 
 // The collection FLAVOR of a binding initializer: "Set" when the init is a
@@ -7037,21 +7017,23 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
 // recurses into. A field is a field and a map value is a map value whatever the shape
 // itself is standing in, so the shape's own position never reaches a child.
 function canonShapeName(name: string) {
-  const inner = name.slice(1, name.length - 1)
-  if inner.length > 0 && inner[0] == '[' {
-    // A map `{[K]:V}` — the key ends where its own `[` closes.
-    const kend = tyGroupEndIndex(inner, 1)
-    if kend >= 0 {
-      const key = inner.slice(1, kend)
-      const val = inner.slice(kend + 2, inner.length)
-      return "{[" +
-        canonEmitNameAt(key, RC_MAP_KEY) +
-        "]:" +
-        canonEmitNameAt(val, RC_MAP_VAL) +
-        "}"
-    }
-    return name
+  // A map `{[K]:V}` — the OPEN, the key-end WALK and the two CUTS are the MAP-NAME
+  // grammar's, at its home. This ran the same `tyGroupEndIndex` walk over the shape's
+  // INTERIOR and then re-derived both slices from the interior's coordinates; the home
+  // walks the whole name, so the `± 1` bookkeeping goes with the copy. The caller has
+  // already established the closing `}` this shape needs (`canonEmitNameAt`'s brace arm),
+  // which is what makes `mapSpellValName`'s span gate a no-op here rather than a narrowing.
+  if mapSpellKeyEnd(name) >= 0 {
+    return "{[" +
+      canonEmitNameAt(mapSpellKeyName(name), RC_MAP_KEY) +
+      "]:" +
+      canonEmitNameAt(mapSpellValName(name), RC_MAP_VAL) +
+      "}"
   }
+  const inner = name.slice(1, name.length - 1)
+  // A `{[`-opening name whose key never closes into a `]:` is not a map and not an object
+  // shape either — returned untouched, exactly as the copy's inner `kend < 0` arm did.
+  if nameIsMapOpen(name) { return name }
   // An object shape `{f:T,…}`: split the interior at its top-level commas, canon
   // each field's type past its first top-level `:`.
   let out = "{"
@@ -16829,12 +16811,109 @@ export function listElemNameOf(name: string) {
 // ALONE** (`nameToTyReal`'s inline-object arm, `canonEmitName`'s shape arm,
 // `isObjShapeName`): each is `name[0] == '{' && name[len - 1] == '}'` WITHOUT the
 // `name[1] != '['` conjunct, so each ACCEPTS a map name. Routing them here would blind the
-// checker to map-valued shapes. Two more (`nameToTyReal`'s map arm, `mapShapeKeyName`)
-// REQUIRE `name[1] == '['` — the complement, not this. Named here so a later census does
-// not read any of the five as a copy of this home.
+// checker to map-valued shapes. The two that REQUIRE `name[1] == '['` — the complement, not
+// this — are the MAP-NAME grammar's, and they now have the home below.
 export function nameIsShapeOpen(name: string) {
   if name.length < 2 { return false }
   name[0] == '{' && name[1] != '['
+}
+
+// ── the MAP-NAME grammar: `{[K]:V}` — OPEN, SPAN, and the KEY/VALUE CUT ───────────────
+//
+// The parser's index-signature spelling. It is not assembled character by character by the
+// thing that reads it, it is assembled character by character by the thing that WRITES it:
+// `parser.vl:538` is literally `name = "{[" + keyName + "]:" + valName + "}"`, and the KEY
+// is a bare `IDENT` token ("The KEY is a bare identifier token, not a parsed type, so it
+// stays text on the node"). Every property this family relies on is a property of that one
+// concatenation, which is why the grammar can be stated once instead of re-derived.
+//
+// **THREE COPIES OF IT LIVED IN THIS FILE**, and they did not even agree on how to find the
+// key's end: `nameToTyReal`'s map arm and `mapShapeKeyName` scanned for the first `]:` pair,
+// while `canonShapeName` ran the compiler's depth walk (`tyGroupEndIndex`) over the shape's
+// interior. On a parser-produced name the two agree for the reason above — the key holds no
+// bracket, so its `]` is both the first `]` and the depth-0 closer — and this home keeps the
+// WALK, so the map grammar stops hand-rolling a scan of its own and asks the compiler's one
+// depth home instead. (`mapShapeKeyName` is gone: it WAS `mapSpellKeyName`, character for
+// character, and its one caller now says so.)
+//
+// **A FOURTH COPY LIVES IN `emit_base.vl` AND IS NOT DELETABLE FROM HERE.** `nameIsMapOpen`
+// there is this file's `nameIsMapOpen`, and `mapValNameOf` there is `mapSpellValName` with a
+// DIFFERENT span rule — it gates on `nameIsMap` (opens `{[`, does not end `[]`) where this
+// one gates on a closing `}`, so it ACCEPTS `{[string]:i32}|null` and returns the garbled
+// `"i32}|nul"` that its own callers strip for (see `emit_collect.vl:2535`). The two are NOT
+// interchangeable and must not be merged by eyeball. `emit_base.vl` imports from this
+// module, so the down-move that deletes its pair (the D-ARRDOWN / D-SHAPEDOWN move, applied
+// to the map grammar) is a one-line-per-site edit in a file this slice may not touch.
+// TWO COMMENTS THERE GO STALE WITH THIS CHANGE and are the down-move's checklist:
+// `nameIsMapOpen`'s header names "`typecheck.nameToTyReal`'s map arm and
+// `typecheck.mapShapeKeyName`" as the copies to re-derive — both are gone, and this family
+// is what they became; and `mapValNameOf`'s header cites a `typecheck.vl parseMapName` that
+// has not existed for many merges. Neither can reach codegen; both are recorded here so the
+// next slice to own `emit_base.vl` does not have to find them.
+//
+// THE ONE HOME of the MAP-NAME OPENER: a `{` at index 0 whose NEXT character is `[`. Over
+// the `length >= 2` names that open with `{` this is the exact COMPLEMENT of
+// `nameIsShapeOpen` above.
+export function nameIsMapOpen(name: string) {
+  if name.length < 2 { return false }
+  name[0] == '{' && name[1] == '['
+}
+// THE ONE HOME of the map-name SPAN: the opener AND a final `}`, so the whole name is the
+// map and not something carrying one (`{[string]:i32}[]` is a LIST of maps and
+// `{[string]:i32}|null` a union with one — both open `{[` and neither ends `}`). A LAYER
+// over the opener, not a second copy of it. This is the map twin of
+// `emit_base.nameIsShapeSpanEnds`, which cannot serve because it carries the
+// `name[1] != '['` conjunct that makes it reject every map name.
+export function nameIsMapSpanEnds(name: string) {
+  if !nameIsMapOpen(name) { return false }
+  name[name.length - 1] == '}'
+}
+// THE ONE HOME of the KEY CUT's scan: the index of the `]` that closes the KEY of a
+// `{[`-opening name, or -1 when `name` does not open a map spelling or its key never closes
+// into a `]:` pair.
+//
+// The walk is `tyGroupEndIndex`, entered at index 2 — the character after the `[` this
+// function has just proved is at index 1, which is exactly the `from`-gating contract that
+// home documents ("Callers gate on the OPENER themselves"). The `]:` pair is then confirmed
+// at the site the walk stopped: the walk answers "where does the key's bracket close", the
+// grammar additionally requires a `:` to follow it, and a closer that is not `]` at all
+// (reachable only on a name no producer writes) is rejected rather than sliced around.
+//
+// The `length >= 5` bound the two scanning copies spelled is IMPLIED and dropped: a name
+// passing this function has `{`, `[`, a `]` at index >= 2 and a `:` after it, so it is at
+// least the 4 characters of `{[]:` — and every consumer that also asks `nameIsMapSpanEnds`
+// gets the 5th from the `}`.
+export function mapSpellKeyEnd(name: string) {
+  if !nameIsMapOpen(name) { return -1 }
+  const ke = tyGroupEndIndex(name, 2)
+  if ke < 0 { return -1 }
+  if ke + 1 >= name.length { return -1 }
+  if name[ke] != ']' { return -1 }
+  if name[ke + 1] != ':' { return -1 }
+  ke
+}
+// THE ONE HOME of the KEY CUT: the key type-name `K` of a `{[K]:V}` spelling — the text
+// between the `{[` and the key's closing `]` — or "" when `name` does not open one. Used to
+// give an actionable diagnostic for an unsupported (non-`string`) map key instead of a bare
+// "unknown type '{[i32]:i32}'", which is why it deliberately does NOT ask for the closing
+// `}`: a LIST of i32-keyed maps (`{[i32]:i32}[]`) is the same user mistake and gets the same
+// message.
+export function mapSpellKeyName(name: string) {
+  const ke = mapSpellKeyEnd(name)
+  if ke < 0 { return "" }
+  const k = name.slice(2, ke)
+  k
+}
+// THE ONE HOME of the VALUE CUT: the value type-name `V` of a `{[K]:V}` spelling — the text
+// after the `]:` and before the closing `}` — or "" when `name` is not a WHOLE map spelling.
+// Unlike the key cut this one takes the SPAN, because the closing `}` is the value's right
+// edge: without it there is no value text to cut, only a suffix of a bigger name.
+export function mapSpellValName(name: string) {
+  if !nameIsMapSpanEnds(name) { return "" }
+  const ke = mapSpellKeyEnd(name)
+  if ke < 0 { return "" }
+  const v = name.slice(ke + 2, name.length - 1)
+  v
 }
 
 // The value-atom kind of a NICHE-nullable scalar-element LIST member name —
@@ -17476,8 +17555,10 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
         // not the string-keyed hash map — report that directly (with the fix)
         // instead of a bare "unknown type", naming the constructor in play.
         // An emitter/runtime-capability rejection (the map rep is string-keyed),
-        // not a type error — the unsupported-lowering channel.
-        if mapShapeKeyName(tn.tyName) == "i32" {
+        // not a type error — the unsupported-lowering channel. The KEY CUT is the
+        // MAP-NAME grammar's, at its home (this read the private `mapShapeKeyName`,
+        // which WAS that home's body written out a second time).
+        if mapSpellKeyName(tn.tyName) == "i32" {
           tErrUnsupported(
             "An i32-keyed " +
               initMapCtorName(n.letInit) +

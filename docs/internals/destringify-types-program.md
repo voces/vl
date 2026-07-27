@@ -27368,6 +27368,207 @@ minted by them. A SOURCES problem, filed at the site with the witness.
   additive: the destringify routes are **−159 B** (1,039,043) and the f32 fix **+208 B**. The
   routes shrink the file — three `"i64[][]"`-class literals leave the data section and a `const`
   dies — while the fix adds a function, its comment-free body, and a call.
+## D-MAPSPELL — the checker's THIRD copy of the `{[K]:V}` parser, and the copies did not agree on the algorithm; the census that found it also refutes the brief's grouping and one of the record's own hand-offs (off master `a571a02`)
+
+The owner's rule names one thing as the sharpest violation: *"if we're ever parsing strings for
+types (outside the actual parser), we're doing it wrong."* `compiler/typecheck.vl` holds the
+compiler's SECOND recursive-descent type parser (`nameToTyReal`), and the map arm of it is a
+genuine sub-parser: it takes `{[K]:V}` apart by hand into a key and a value. **It was written
+out three times in this one file, and the three did not agree on how to find the key's end.**
+
+### THE CENSUS — RE-DERIVED, AND THE BRIEF'S GROUPING IS WRONG IN FOUR PLACES
+
+Instrument: comment-stripped, string-literal-aware, counting **character-grammar TESTS** (an
+indexed read compared against a char literal, plus the bound-char relational compares a
+punctuation-only filter is blind to — the caveat the census section of this doc already records).
+Attributed to the ENCLOSING function, which is what makes the grouping derivable instead of
+asserted. `compiler/typecheck.vl` at `a571a02`: **142 tests in 38 functions.**
+
+| column | tests | why |
+|---|---:|---|
+| numeric / value LEXEMES (`canonIntLexeme`, `intLexemeFitsI32`, `intLexemeIs2Pow31`, `decValOf`, `dotIndexFrom`, `hasDot`, `litMemberTy`) | 40 | legitimate residue by rule |
+| NAME mangling (`demangleName`, `demangleMsg`) | 7 | a name is a name |
+| emitter SENTINEL prefixes (`recordClonedNodeTy`'s `=>sigkey` / `#anonN`) | 7 | not type spellings |
+| inference-HOLE sentinels (`holeDeriveDepth`, `substHoleByName`) | 2 | `?fld.` / `?galt.` keys |
+| `TyVar` hole-name `'?'` (`tyToStrGo`, `tyEqGo`, `retAtomKindOf`, `checkMemberNode`) | 5 | a sentinel, not a grammar |
+| quoted-LEAF tests (`skipQuotedName`, `nameIsInlineLitUnion`, `nulElemListAtomKind`) | 5 | "is this atom a string literal" |
+| **the DEPTH-WALK home** (`tyTopIndexOf`, `tyGroupEndIndex`, `tyGtIsClose`, + the `name[at] == '='` arrow guard in `splitUnionAtoms` / `unionMemberCount`) | **23** | **the HOME, not debt** |
+| the four grammar HOMES already in this file (`nameIsParenOpen`, `nameIsParenSpanEnds`, `nameIsArray`, `nameIsShapeOpen`) | 6 | terminal by construction |
+| **the actual debt** | **47** | below |
+
+The 47, by grammar:
+
+| grammar | tests | functions |
+|---|---:|---|
+| **(A) the MAP spelling `{[K]:V}`** | **10** | `nameToTyReal` 5 · `mapShapeKeyName` 4 · `canonShapeName` 1 |
+| (B) the GENERIC APPLICATION `Head<…>` | 7 | `nameToTyReal` 2 · `aliasRefIsPlainName` 2 · `nameIsGenAppOfDecl` 2 · `checkProgramNode` 1 |
+| (C) the BRACE SPAN `{`…`}` (map-INCLUSIVE) | 6 | `nameToTyReal` 2 · `canonEmitNameAt` 2 · `isObjShapeName` 2 |
+| (D) `nameNeedsCanon`'s CONTAINS-scan | 12 | one function |
+| (E) the ARROW-relative close | 3 | `isTopLevelFuncTypeName` · `nameToTyReal` · `canonEmitNameAt` |
+| (F) the `!` NEGATION prefix | 2 | `nameToTyReal` · `canonEmitNameAt` |
+| (G) `aliasRefIsPlainName`'s IDENTIFIER-run | 7 | one function |
+
+**Four corrections to the brief that commissioned this slice, all by looking rather than
+reasoning.** (1) Its group (A) is four lines; the map grammar's third copy — `canonShapeName` —
+it filed under (C) as a "shape/list endpoint test", and that copy is the one that matters most,
+because it runs a DIFFERENT algorithm. (2) Its group (C) mixes real debt (`nameToTyReal` 5803,
+`canonEmitNameAt` 7838, `isObjShapeName` 14790) with the BODIES of two homes this file already
+owns (`nameIsArray` 16729-16730, `nameIsShapeOpen` 16837) — home internals are terminal, exactly
+as the brief itself says of the depth walk. (3) Its group (D) lists three of `nameNeedsCanon`'s
+five lines and adds `recordClonedNodeTy` 15044, which tests the emitter's `=>sigkey` / `#anonN`
+SENTINEL prefixes — a name, not a parsable type. (4) It names 22 lines under a headline of "31
+sites", and does not name (E), (F) or (G) at all. **The brief was right about the one thing it
+insisted on: 4911-4957 is the HOME, and it stays.**
+
+### WHAT SHIPPED — ONE HOME FAMILY, THREE COPIES ROUTED, ONE FUNCTION DELETED
+
+`{[K]:V}` is not assembled character by character by the thing that READS it; it is assembled
+character by character by the thing that WRITES it — `parser.vl:538` is literally
+`name = "{[" + keyName + "]:" + valName + "}"`, and `keyName` is a bare `IDENT` token, which the
+parser's own comment says out loud. Every property the family needs follows from that one
+concatenation. Stating it once is the whole change:
+
+| home | is | replaces |
+|---|---|---|
+| `nameIsMapOpen` | `len >= 2 · '{' · '['` | the opener, written 3x |
+| `nameIsMapSpanEnds` | the opener AND a final `}` | `nameToTyReal`'s 3-conjunct gate |
+| `mapSpellKeyEnd` | `tyGroupEndIndex(name, 2)` + the `]:` confirm | two hand-rolled `]:` scans and one interior walk |
+| `mapSpellKeyName` | `name.slice(2, ke)` | `mapShapeKeyName` **in full — the function is deleted** |
+| `mapSpellValName` | span + `name.slice(ke + 2, len - 1)` | two value slices |
+
+**The key-end home keeps the WALK, not the scan.** Two copies scanned for the first `]:`; the
+third ran `tyGroupEndIndex` over the shape's interior. On a name a producer writes they agree —
+the key holds no bracket — so the choice is free, and the walk is the one that stops the map
+grammar hand-rolling a scanner beside the compiler's single depth home.
+
+**`mapShapeKeyName` WAS `mapSpellKeyName`, character for character**, including the `nlen < 5`
+bound (`{[]:`, the only name the bound and the home disagree about, returns `""` from both).
+
+### THE ZEROS, GRADED — AND ONE OF THEM IS THE SLICE'S SHARPEST FINDING
+
+Twelve probes, each an inverted-control pair where a control exists, run over the whole corpus
+(1,500 files) on **both** channels. The channel split is the finding:
+
+| probe | measures | `vl check` | `vl check --codegen` |
+|---|---|---:|---:|
+| P1 | the KEY CUT answers a non-empty key | 204 | 210 |
+| P1c | the KEY CUT called at all — CONTROL | 207 | 213 |
+| **P2** | **`nameToTyReal`'s map arm TAKEN** | **0** | **113** |
+| **P2c** | **its SPAN conjunct alone — CONTROL** | **0** | **113** |
+| P3 | `canonShapeName`'s MAP arm taken | 204 | 208 |
+| P3c | `canonShapeName` called at all — CONTROL | 416 | 468 |
+| P4 | the `{[`-open-but-no-`]:` fall-through | **0** | **0** |
+| P5 | the VALUE CUT reached failing its SPAN gate | **0** | **0** |
+| P6 | the KEY CUT's LOOSER gate is load-bearing | **0** | **0** |
+| P7 | the depth walk disagrees with the first-`]:` scan | **0** | **0** |
+| P7c / P9c | the walk / the `]:` pair answered — CONTROLS | 204 / 205 | 210 / 211 |
+| P8 | the whole-name walk disagrees with the INTERIOR walk | **0** | **0** |
+| P9 | the `]:` pair's `:` half decided NEGATIVELY (S3's set) | **0** | **0** |
+| P10 | a map OPENER on a name not ending `}` (S4's set) | **0** | **0** |
+| P10c | the SPAN home consulted with a map opener — CONTROL | 205 | 211 |
+
+**`nameToTyReal`'s map arm is 0 on `vl check` and 113 with `--codegen`.** The checker's second
+parser is not what resolves a map ANNOTATION any more — D-PARSETY's spelling tree is
+(`tsToTyReal`'s `TS_MAP` arm), and the name path survives only for the emitter's re-resolutions
+of names that never had a tree. A slice grading this arm on `vl check` alone would have called a
+live, 113-file population dead. This is the memory note "`vl check` is blind to the emitter" in
+its LEAST expected place: the site is in `typecheck.vl` and the reach is emit-only.
+
+**P6 = 0 was worth one more question, and the answer became the slice's only fixture.** The key
+cut deliberately does NOT require the closing `}`, because `{[i32]:i32}[]` and
+`{[i32]:i32}|null` are the same user mistake as `{[i32]:i32}` and get the same actionable
+message. No corpus file exercises that width. Built by hand, both spellings DO reach the
+friendly diagnostic on master and on this branch — so the width protects a **live population with
+no witness**, which is what `tests/cases/maps/error-i32-keyed-not-whole-span.vl` now is.
+
+**P4 / P5 / P7 / P8 / P9 / P10 are measured-empty because the producer is a concatenation.** A
+`{[`-opening name always carries `]:` and always ends `}`; a key never holds a bracket. Each is
+unreachable BY THE GRAMMAR, not merely untested — the distinction #1219 drew, here with the
+producer line quotable.
+
+### ENTOMBMENT — SIX SABOTAGES, EACH A WHOLE COMPILER, ALL SEVEN TREES DISTINCT
+
+Graded against the branch compiler on the corpus at five channels (build status, wasm sha256,
+diagnostic text, run status, run stdout), 1,501 files.
+
+| sabotage | site | build | wasm sha | diag | run | stdout |
+|---|---|---:|---:|---:|---:|---:|
+| **S0** | branch, unmodified — CONTROL | 0 | 0 | 0 | 0 | 0 |
+| **S1** | the DECLINED narrowing: KEY cut gated on the SPAN | 0 | 0 | **1** | 0 | 0 |
+| **S2** | the VALUE cut off by one (`ke+1`) | **186** | **188** | 0 | **186** | **186** |
+| S3 | the `]:` pair's `:` half dropped | 0 | 0 | 0 | 0 | 0 |
+| S4 | the map SPAN's closing `}` dropped | 0 | 0 | 0 | 0 | 0 |
+| **S5** | the OPENER's second character dropped | **5** | **7** | 0 | **5** | **5** |
+| **S6** | `canonShapeName`'s MAP arm deleted | **3** | **3** | 0 | **3** | **3** |
+
+The comparator is live in both directions inside one harness: S0 reads 0/0/0/0/0 and S2 reads
+186/188/0/186/186. **S1's single diagnostic diff IS the new fixture** — the width decision has a
+pin that fails under the sabotage, which is what entombs a decision a corpus of 1,500 files
+could not otherwise see. S3 and S4 read 0 and their divergence poisons (P9, P10) read 0 against
+controls of 211 each: **the code is REACHED on 211 files and the characters decide nothing**,
+because no producer can write the names they would decide about.
+
+Note S2 / S5 / S6 read **0 on the diagnostic channel while breaking 186 / 5 / 3 builds**. Same
+channel separation as P2: a checker function whose reach is emit-time is invisible to `vl check`.
+
+### THE DECLINES, WITH THE MEASUREMENT — AND THE RULE THEY FOLLOW
+
+**A one-way import edge is the blocker at this tier, and it is not the same blocker #1222
+found.** `typecheck.vl` imports from `emit_bignum`, `ast` and `check_state` — and from nothing
+else. `emit_base.vl` imports 30+ names FROM `typecheck.vl`. So a grammar home in `emit_base.vl`
+is **unreachable from every checker site, permanently**, and the only fix is the D-ARRDOWN /
+D-SHAPEDOWN / D-PARENDOWN inversion: move the definition DOWN and import it back up. That edits
+two files.
+
+* **(B) the GENERIC APPLICATION, 7 tests DECLINED.** The home already exists and is COMPLETE:
+  `emit_base.annGenAppSpanEnds` (the span), `annGenAppDecompose` (the head + args), `gaeLtAt`
+  (the `<` index). Building them here would duplicate **3 of 3** functions of a family that
+  already has a home. Callers that would have to change for the down-move: the three definitions
+  in `emit_base.vl`, `emit_base.vl`'s import list, and `emit_classify.gaeEnsure` (the fourth
+  copy, named by `annGenAppSpanEnds`'s own header).
+* **(C) the BRACE SPAN, 6 tests DECLINED.** `emit_base.nameIsBraceSpanEnds` is these three sites
+  EXACTLY (all three are `len >= 2 · '{' · '}'`, one of them De-Morganed) — **1 of 1** function
+  duplicated if built here. Callers for the down-move: its definition, `nameIsShapeSpanEnds`
+  (which delegates to it), `annObjFieldSplit`, and `emit_base.vl`'s import list.
+* **THE RULE, stated so the asymmetry with `nameIsMapOpen` is not a double standard:
+  duplicate across the edge only what is unavoidable to create something NEW; never duplicate a
+  COMPLETE home.** The map family is five functions of which four have no twin anywhere, and
+  four of the five need an opener — 1 of 5 duplicated, and the family cannot exist without it.
+  (B) and (C) are 3 of 3 and 1 of 1, buying nothing the one-line down-move will not buy.
+* **AND A HAND-OFF IN THIS DOC IS REFUTED BY THAT EDGE.** `nameIsBraceSpanEnds`'s header (#1222)
+  says five copies "route here when a slice owns those files", naming `typecheck` ×3. A slice
+  owning `typecheck.vl` **cannot route there** — the import does not exist and cannot be added
+  without a cycle. The work is a two-partition DOWN-move, not a one-file routing, which is the
+  same shape #1203 found for renderEmit P2 and the same shape #1222 found for `mapValNameOf`.
+* **(D) `nameNeedsCanon`'s 12 DECLINED, and no home can ever serve it.** Every home in this
+  program is an ENDPOINT test or a CUT; this is a CONTAINS-scan ("does any character anywhere in
+  this name start a construct canon rewrites"). Its terminal form is not a grammar home at all —
+  it is the parser's spelling tree, i.e. D-PARSETY.
+* **(E) the ARROW-relative close, 3 DECLINED** — already declined in place by D-PARENHOME
+  (`nameIsParenSpanEnds` asks about the LAST character; the param list closes before the `=>`).
+  The decline is recorded at the home and re-confirmed here, not re-litigated.
+* **(F) 2 and (G) 7 DECLINED** — a one-character `!` prefix and an identifier-run scan. Neither
+  decomposes a composite type; both are the "a name is a name" residue.
+
+### COUNTS — ALL THREE UNITS, AND THE TRACKED METRIC IS FLAT
+
+* **UNIT A, character-grammar tests in `typecheck.vl`: 142 → 137.** The MAP grammar's own share
+  goes **10 → 5**, and every one of the 5 is now a HOME body; **hand-written copies 3 → 0**. The
+  debt column (the 47 above) drops to **42**.
+* **UNIT B, the TRACKED metric (`parsercount.py`, the 23-resolver CORE list + #1141's off-list
+  table): FLAT — CORE 318, OFF 23, TRUE 341, tree-wide and per file, on both sides.** Not one of
+  the three copies was a named call, so the metric that has been this program's scoreboard for
+  twenty slices cannot see this change at all. It rose when a grammar was homed onto an ON-LIST
+  resolver (#1175, #1222) and it is flat when the homed grammar is net-new; **neither reading is
+  progress or regression, which is why this doc's counting caveat asks for all three units.**
+* **UNIT C, named calls to the MAP-NAME grammar's homes, tree-wide: 4 → 17 (+13)**, decomposed
+  exactly: `nameIsMapOpen` 3 → 6 (+3, all in `typecheck.vl`: one each in `nameIsMapSpanEnds`,
+  `mapSpellKeyEnd`, `canonShapeName`), `nameIsMapSpanEnds` 0 → 2, `mapSpellKeyEnd` 0 → 4,
+  `mapSpellKeyName` 0 → 3, `mapSpellValName` 0 → 2, `mapShapeKeyName` **1 → 0 (deleted)**.
+  `nameIsMap` (14) and `mapValNameOf` (16) are untouched — this slice adds nothing to and
+  removes nothing from the emitter's map family.
+* **Binary 1,039,202 → 1,038,888 B (−314)**, one file changed, so the delta needs no attribution.
+  Source `compiler/typecheck.vl` +127 / −52 (of which the home block's headers are 66 lines).
 
 ### GATE — EVERY LEG, EXIT CODE TAKEN WITHOUT A PIPE
 
@@ -27419,3 +27620,50 @@ minted by them. A SOURCES problem, filed at the site with the witness.
   chain storing no `"f32list"` for an inferred return.
 * **`fnStmtsPosOf`'s memo.** Re-measured at 31/36/83/227 ms; untakeable from this file because every
   writer of `fnStmts` is outside the partition. Filed at the site.
+| `fetch-seed.sh` (freshly fetched, published) | 0 | 1,039,202 B; **verified to be master's own fixpoint** |
+| `refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint at 1 compile, 1,038,888 B |
+| `native-fixpoint.sh` | 0 | stage3 == stage4, 1,038,888 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,196 passed / 0 failed / 8 ignored** (master 3,194 + 2 for the new fixture; ignored set identical, `node_modules` symlinked so the six `-O` tests do NOT self-ignore) |
+| `lint-self.sh` (incl. `vl fmt --check`) | 0 | clean |
+| `rep-fuzz-check.sh` | 0 | exact, 1 baselined (0 unsound / 1 reject), 0 new / 0 stale |
+| corpus A/B vs master, 5 channels, 1,500 files | 0 | **0 build-status, 0 wasm-sha256, 0 diagnostic-text, 0 run-status, 0 run-stdout diffs** |
+| fuzz A/B, PINNED seeds 1–14 × depths 4–6 × 300 × {plain, declared} | 0 | **25,200 programs/side; out-dir trees byte-identical** after normalising the per-run `mktemp -d` path (`diff -r` = 0 lines; the only residual file is my harness's own completion-ORDER log, whose sorted contents are identical). Failure-class totals identical: **1 INVALID-WASM + 2,238 REJECT, 2,239 kept cases each side** |
+| strongest proof: candidate compiles FROZEN master source | 0 | `ad2e3c4e…` — **byte-identical to master's own output, and to the published seed** |
+
+### METHOD NOTES
+
+* **A checker function's reach can be entirely emit-time, and `vl check` will report 0 for it.**
+  The record already knows `vl check` is blind to the emitter and blind to the canon pass; the
+  new corner is a function that lives in `typecheck.vl`, is called by the checker's own name
+  resolver, and is nonetheless reached only through `--codegen`. Run every checker probe on BOTH
+  channels and report both columns; a single-channel 0 here would have been wrong by 113 files.
+* **When copies of one grammar disagree on ALGORITHM, the disagreement is the finding.** Two
+  `]:` scans and one depth walk answering the same question is not three spellings of one
+  predicate — it is one predicate and two chances to drift. Reaching for the home that already
+  exists (`tyGroupEndIndex`) rather than blessing the majority spelling is what keeps the family
+  from needing a third repair the next time a bracket is added to the type language.
+* **"Check the home's WIDTH" has a location half: check which SIDE of the import graph it is
+  on.** Three of this file's grammars have a perfectly-shaped home that no site in this file can
+  ever call. That is not a width problem and not a `nodeTyIx` problem — it is the SOURCES problem
+  #1222 named, in the module dimension, and it makes a one-file slice impossible by construction.
+* **A cross-edge duplicate needs a stated rule or it becomes a double standard.** This slice
+  duplicated exactly one function across the edge and declined two more; the rule that separates
+  them — duplicate only what is unavoidable to create something new, never a complete home — is
+  the reviewable part, not the count.
+* **Grep the producer, not the consumer.** The whole equivalence argument for this family is one
+  line of `parser.vl` and one comment beside it. Six probes read 0 because of that line; reading
+  it first would have been cheaper than measuring it, and measuring it is what proved the reading.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **The `emit_base.vl` down-move** for `nameIsMapOpen` + `mapValNameOf`, and the two stale
+  comments there that this change creates (`nameIsMapOpen`'s header names two `typecheck.vl`
+  copies that no longer exist; `mapValNameOf`'s cites a `parseMapName` that has not existed for
+  many merges). Both are recorded in the new home's header as the next slice's checklist. Neither
+  can reach codegen.
+* **Groups (B) and (C)**, with the import-graph measurement above and the callers named.
+* **`mapValNameOf` and `mapSpellValName` unified.** They are NOT the same predicate:
+  `mapValNameOf` gates on `nameIsMap` (opens `{[`, does not end `[]`) and therefore accepts
+  `{[string]:i32}|null`, for which it returns the garbled `"i32}|nul"` its own callers strip
+  around; `mapSpellValName` gates on a closing `}`. Merging them by eyeball is a behaviour
+  change in the emitter, and the emitter is not this partition.
