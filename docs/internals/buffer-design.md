@@ -406,16 +406,53 @@ so an automatic `memory` export plus a user function called `memory` is an inval
 Numbered so they can be ruled on one at a time.
 
 **O1 — Where does the method surface live: `std:buffer` VL functions, or compiler-known `Buffer`
-methods?**
-Three options.
-*(a) Widen the dunder floor, `Buffer` is std VL.* The compiler gains 18 generic `__load_*__`/
-`__store_*__`/`__memory_*__` intrinsics; `std:buffer` defines the struct, the allocator and 14 UFCS
-methods over them. Smallest compiler change, entirely in the existing idiom, and every piece is
-measured working except §B3. Cost: each `buf.loadF32(i)` is a real wasm `call` — the compiler does
-no inlining of its own, and **`wasm-opt -O` (what `vl build -O` runs) does not inline these
-wrappers; `-O3 --closed-world` does.** Measured on the §A5 program, where the wrapper calls vanish
-while the load/store instruction counts *rise* — which is what distinguishes inlining from the
-whole thing being constant-folded away:
+methods?** — ✅ **RULED (owner): (c), and `Buffer` lives in `std`. Shipped in S5, §J.**
+
+> The owner's words: *"I don't want buffer built into the compiler; I want it in std."* The compiler
+> owns exactly what an instruction is; allocation policy is ordinary code. **Measured cost of the
+> ruling: S5 needed ZERO compiler lines.**
+>
+> (b) is **not** foreclosed at the ABI level — the surface is identical, so it stays a pure codegen
+> option — but it is **foreclosed as a matter of taste**. It may be reopened only if a real measured
+> kernel after S5 shows the per-access call costs something that matters. "It would be faster in
+> principle" is not a reason to reopen it; a benchmark is. And note §G's caveat that the
+> `-O3 --closed-world` profile which inlines the wrappers is itself unverified against VL's GC type
+> graph — so that measurement must be taken on the profile the consumer will actually ship.
+
+**The three options, stated once:**
+
+- **(a) std VL.** The compiler gains 18 generic `__load_*__` / `__store_*__` / `__memory_*__`
+  intrinsics. `std:buffer` — ordinary VL — defines the struct, the allocator, and the UFCS methods
+  over those intrinsics. `buf.loadF32(i)` is a normal VL function call.
+- **(b) Compiler-known.** `Buffer` becomes a nominal type the compiler knows by name; its member
+  calls lower directly to single wasm instructions with no VL function in between.
+- **(c) (a) now, (b) later.** Ship (a); revisit (b) as a pure codegen change if measurement
+  justifies it. **The user-visible surface is identical either way** — that is what makes (b) a
+  later optimization rather than a later migration.
+
+**How they compare:**
+
+| | (a) std VL | (b) compiler-known | (c) (a) then maybe (b) |
+| --- | --- | --- | --- |
+| compiler change | 18 intrinsics, existing idiom | new nominal-type machinery | 18 intrinsics now |
+| codegen, default profile | a real `call` per access | single instruction | a real `call` per access |
+| codegen, `-O3 --closed-world` | inlined (measured below) | single instruction | inlined |
+| blocked on O7 / §B3 | **yes** | no | **yes** |
+| needs machinery that exists | yes — all measured working | **no** — arena has no nominal kinds (`c1-nominal-classifiers`) | yes |
+| a program may define its own `Buffer` | yes | **no — forecloses it** | yes |
+| first slice | small | large | small |
+| reversible | — | hard | **yes, by construction** |
+
+**The decisive fact is that the number which should settle (a)-vs-(b) could not be taken at ruling
+time.** Per §G: the real cost of the per-access call under a hot loop was unmeasured, because there
+was no kernel to run and a synthetic one would measure binaryen rather than VL. **That measurement
+can only be taken after S5 ships — i.e. after (a) exists.** So (b) could not be chosen on evidence;
+it could only be chosen on prediction. S5 has now shipped, so the measurement is finally available to
+anyone who wants to reopen (b) on evidence.
+
+**Supporting measurement** — the calls do survive `-O` and are inlined at `-O3 --closed-world`. Taken
+on the §A5 program. The wrapper calls vanish *while the load/store instruction counts rise*, which is
+what distinguishes real inlining from the whole computation being constant-folded away:
 
 | | direct calls | `i32.store` | `i32.load` | output |
 | --- | --- | --- | --- | --- |
@@ -423,21 +460,21 @@ whole thing being constant-folded away:
 | `-O` (host flags) | 2×`$0`, 2×`$1`, 2×`$2` | 2 | 1 | `64 111 222` |
 | `-O3 --closed-world` | 2×`$0` | **3** | **2** | `64 111 222` |
 
-So (a)'s codegen is acceptable only on the release profile P1.3 asks for, which is not today's
-default.
-*(b) `Buffer` is a compiler-known nominal type* whose member calls lower to single instructions. Best
-codegen unconditionally, no dependency on §B3, but it is the first builtin method family on a
-non-container receiver, it needs nominal-type machinery the arena does not have (see
-`c1-nominal-classifiers`), and it forecloses a program defining its own `Buffer`.
-*(c) (a) now, (b) later as pure optimization* — the surface is identical, so this is a codegen
-change, not a language change.
-**Recommendation: (c).** It is what P0.3/P0.4 did (free functions first, method sugar explicitly not
-foreclosed), and it is the only option whose first slice is small.
+So (a)'s codegen is acceptable on the release profile P1.3 asks for, and not on today's default.
+Note this cuts both ways: it is (a)'s main cost, *and* it is why (b)'s advantage may be worth
+nothing once the release profile is adopted — which is itself unsettled (§G: nothing here verified
+`--closed-world` is safe for VL's GC type graph).
 
-> **RULED (c) — shipped in S5, §J.** `Buffer` lives in `std/buffer.vl`, not the compiler: *"I don't
-> want buffer built into the compiler; I want it in std."* The compiler owns exactly what an
-> instruction is; allocation policy is ordinary code. Measured cost of the ruling: S5 needed **zero**
-> compiler lines.
+**The case that was made for (c)**, in order of weight:
+1. It is the only option that lets the deciding measurement be taken before the decision is made.
+2. It forecloses nothing — the surface is identical, so (b) stays available as pure codegen work
+   (see §E).
+3. It is what P0.3/P0.4 already did: free functions first, method sugar explicitly not foreclosed.
+
+**The case that was available for (b)**, recorded so the ruling is legible: it needs no O7 ruling and
+its codegen is unconditional. The cost is that it would be the first builtin method family on a
+non-container receiver, it needs nominal machinery the arena does not have, and it would permanently
+take the name `Buffer` from user programs.
 
 **O2 — `store8`/`store16`, or the consumer's `storeU8`/`store16`?**
 Stores have no signedness — `i32.store8` truncates and cannot distinguish. The ask spells `storeU8`
