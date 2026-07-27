@@ -1,0 +1,99 @@
+// @run
+// @log 11
+// @log 11
+// @log 11
+// @log -L
+// @log 16
+// @log 11
+// A closure captures an enclosing frame's LOCAL whose name ALSO names a module global.
+// Every one of these printed the GLOBAL's value instead — `11` came out as `100` — with
+// exit code 0 and no diagnostic at any tier. A SILENT WRONG ANSWER in code that reads
+// completely ordinary.
+//
+// MECHANISM, read off the two sides that disagreed. `capRecord` (`emit_classify.vl`) drops
+// a name from the capture list when `globalIndexOf(name) >= 0`, on the reasoning that a
+// global is addressable directly from inside a lifted function and so is not a capture.
+// True — unless an ENCLOSING FRAME binds the same name, and the test never asked. So the
+// name never entered the env struct, and on the read side `emitIdentNode` (which consults
+// the env FIRST, precisely so a capture shadows nothing) missed and fell through to
+// `global.get`. The maker side was already correct on its own: `emitCaptureRead` resolves a
+// capture with `localIndexOf` BEFORE `globalIndexOf`, so the local would have been read had
+// the name been recorded at all.
+//
+// The fix asks `parentBindingFrameOf` — the emitter's existing "which ancestor frame owns
+// this captured name" resolver, already used to TYPE a transitive capture — so the two
+// sides now consult one answer instead of two rules.
+//
+// THE SAME LINE CARRIED A SECOND, LOUDER HALF: the identical unconditional exemption for a
+// top-level FUNCTION name (`fnIndexOf(name) >= 0`), which produced INVALID WASM rather than
+// a wrong answer. `compiler/lint.vl` names it in a comment on `stmtDiverges` — that helper
+// is spelled uniquely on purpose, because a bare `diverges` would collide with a LOCAL of
+// that name in `typecheck.vl` and the seed's capture analysis then reported "captured
+// variable not found in enclosing frame". One guard closes both;
+// `capture-local-shadowing-fn-name.vl` next door is that half's pin.
+//
+// CENSUS at the fix: 15 programs (9 global-name + 6 function-name) over `const`/`let`/param
+// bindings, i32 and string, a nested named function and a lambda, at top level and one
+// frame down. On master 11 are wrong — 7 silently wrong, 4 invalid wasm. All 15 are right
+// here, and the 4 controls (distinct names; the shadowed local read DIRECTLY rather than
+// through a closure; the function name actually CALLED) are unchanged in both directions.
+//
+// WHY EVERY CLOSURE BELOW HAS A DIFFERENT NAME. A first draft called all six `inner` and
+// failed on the FIX for an unrelated reason: `buildFnMap` keys lifted functions by NAME,
+// FIRST-WINS, so `nestedFn`'s `function inner` claimed the name and every other frame's
+// `const inner = …` call resolved to IT. That is a separate live defect — same-named nested
+// functions in different frames collide — and it is filed with its anchors, not fixed here.
+// The unique names sidestep it, exactly as `lint.vl`'s `stmtDiverges` sidesteps the defect
+// THIS case pins.
+const a = 99
+const b = 5
+
+// 1 — a lambda over a `const` that shadows a global.
+function viaLambda(): i32 {
+  const a = 10
+  const addA = (x: i32) => x + a
+  return addA(1)
+}
+print(viaLambda()) // 11, not 100
+
+// 2 — a nested NAMED function, same shape.
+function viaNested(): i32 {
+  const a = 10
+  function nestedAddA(x: i32): i32 { return x + a }
+  return nestedAddA(1)
+}
+print(viaNested()) // 11
+
+// 3 — the shadowing binding is a PARAM, not a `const`.
+function viaParam(a: i32): i32 {
+  const paramAddA = (x: i32) => x + a
+  return paramAddA(1)
+}
+print(viaParam(10)) // 11
+
+// 4 — a string-typed shadow, so the wrong read is a ref and not just a wrong number.
+const s = "G"
+function viaString(): string {
+  const s = "L"
+  const appendS = (x: string) => x + s
+  return appendS("-")
+}
+print(viaString()) // -L
+
+// 5 — a lambda reading BOTH a shadowed name and a genuinely global one in the same
+// expression: `a` must come from the frame, `b` must stay a `global.get`.
+function mixed(): i32 {
+  const a = 10
+  const addAB = (x: i32) => x + a + b
+  return addAB(1)
+}
+print(mixed()) // 1 + 10 + 5 = 16
+
+// 6 — one frame DOWN: the shadowing local lives in a function that is itself not the
+// top level, so the capture rides `nestedFrame`'s frame rather than the start function's.
+function nestedFrame() {
+  const a = 10
+  const deepAddA = (x: i32) => x + a
+  print(deepAddA(1)) // 11
+}
+nestedFrame()
