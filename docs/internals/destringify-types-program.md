@@ -26107,3 +26107,301 @@ fetched seed compiled the source directly.
   is unchanged.
 * **The sabotages.** Two builds, both from a copy of the tree, both discarded; the shipped source
   contains no marker, no early return and no probe.
+
+## D-LITKEEP + renderEmit P2 — the canon pass stops SOFTENING an inline literal union, three of the four filed miscompile families close, and O1's guard finally gets a caller (off master `2a11045`)
+
+Two things ship. **TARGET 1** is the root the four filed families share — and the brief's naming of
+it is *half right*: it named `tyToEmitNameAt`'s `TyArray` arm, and the arm that decides every one of
+the four is **`canonEmitName`'s literal-member softening** (transformation (1) of the six #1199
+measured). The structural renderer's arm is the same policy one position over, and it is measured
+UNREACHABLE — see "the renderer mirror, built and declined". **TARGET 2** is `renderEmit` P2,
+actionable for the first time because both halves are in one partition this cycle.
+
+### THE CENSUS — RE-DERIVED AT THIS HEAD, 164 CELLS OVER THREE GRIDS
+
+Built from scratch rather than inherited (`gen.py`/`gen2.py`/`gen3.py`), every cell a whole program
+with an EXPECTED stdout, graded on VALUES, every inline cell paired with its `K` alias control:
+
+| grid | what it varies | cells |
+| --- | --- | ---: |
+| **grid** — shape × position × operation | bare · `L[]` · `L[][]` · `L\|null` · `L[]\|null` · `(L\|null)[]` · map value · `.map`/`.filter` · deeper nests, each over global / local / param / return / declared field / inline-shape field / element read / empty / push | **120** |
+| **grid2** — CROSS-SPELLING | an inline-annotated value MEETING an alias-annotated binding in ONE program (and the reverse) | **20** |
+| **grid3** — INFERRED | the positions whose emit name comes from the RENDERER, not from a canon'd annotation (inferred returns, `const v = xs[0]`, lambda returns, map reads) | **24** |
+
+**master `2a11045`: 119 / 164 OK. This head: 150 / 164 OK. 31 cells move broken → OK; NONE moves
+the other way**, on any of the three grids, at any intermediate candidate.
+
+Failing on master, by family (26 of the 45 are inline-only in grid alone):
+
+* **nested `("a"|"b")[][]` — 10 cells** (global · local · param · return · declared field ·
+  inline-shape field · inner `.length` · element read · 3-D · cross-spelling param). **CLOSED.**
+* **map value — 9 cells** (`{[string]: ("a"|"b")}` bare and `{[string]: ("a"|"b")[]}`, over global ·
+  local · param · return · declared field · read · nested-array value · cross-spelling param).
+  **CLOSED.**
+* **inline-SHAPE field — 3 cells** (local · global · shape-as-array-element). **CLOSED.**
+* **inferred/rendered — 7 cells** (inferred return of a nested list / a shape / a map, the inferred
+  inner binding, the inferred field read, the `??`-defaulted map read, push into a nested list).
+  **CLOSED** — these follow the annotation, not the renderer.
+* **cross-spelling shape-field and map-value — 2 cells.** **CLOSED.**
+* **`.map`/`.filter` with an inline-litunion callback PARAM — 4 cells.** **NOT closed; filed below
+  with the measurement that says what it needs.**
+* **bare-position cross-spelling — 4 cells** (an inline `("a"|"b")` VALUE flowing into a `K`-typed
+  param / return / declared field / local). **NOT closed** — same blocker as the `.map` family.
+
+Out of family, both columns identical, so not an inline-vs-alias split: `const v = m["k"]` over an
+atom-valued map (`emitProgram: bare null needs a struct-typed context`), and an un-annotated function
+returning a litunion array (`field access but no struct type declared`).
+
+### THE FIX — `litUnionPreserve`, the non-null sibling of a preserve that was already there
+
+`canonEmitNameAt`'s union arm split `"a" | "b"`, canon'd each member to `string` and deduped to ONE
+atom. So the INLINE spelling reached the emitter naming a STRING while `type K = "a" | "b"` kept the
+litunion name and the interned-i32 ATOM rep: **two spellings of one type carrying two reps**, which
+is unsound in a structural language and is the split every one of the families above is a face of.
+
+The repair is three lines of policy, and the machinery for it was already in the file:
+
+1. **`litUnionPreserve(parts, keepMembers)`** — the exact non-null twin of `nulLitUnionPreserve`,
+   which has kept `"a" | "b" | null` intact since it was written, for this same reason. The
+   emitter's name grammar was already ready: **`nameIsLitUnionType` accepts the inline member
+   spelling** (`nameIsInlineLitUnion`) beside the alias name.
+2. **A DECLARED alias with the same member set WINS the spelling** (`litUnionAliasOfLitTexts`, the
+   preference `litUnionAliasNameOfTy` already gives the structural renderer). One type, one name —
+   without it a `{[string]: ("a"|"b")[]}` value handed to a `{[string]: K[]}` parameter is *still*
+   invalid wasm, because a map's shape slot is keyed by the value SPELLING and a second spelling is a
+   second row whether it is softened or preserved. **That one line is worth exactly one cell (J5),
+   and it is measured**: candidate without it 113/120 on grid, with it 114/120, nothing else moves.
+3. **`ctxKeepsLitUnion(ctx)`** gates the member spelling to the four positions the structural
+   renderer already preserves a litunion ALIAS at — `RC_ELEM`, `RC_FIELD`, `RC_MAP_VAL`, `RC_FN_RES`
+   — i.e. O3 of the one-agreed-renderer design, stated positively. `canonShapeName` already
+   overrides the position for map values and object fields, so the gate reaches them for free.
+
+### THE GATE IS `ctx`, AND THAT IS MEASURED — the ungated candidate REDDENS FOUR GREEN CELLS
+
+The first candidate preserved at every position. It healed more (109/120 vs master's 92) **and broke
+four cells that are green on master**, with two distinct emitter messages:
+
+| shape | position | message on the ungated candidate |
+| --- | --- | --- |
+| `function f(v: ("a"\|"b"))` | param | `emitProgram: only i32, i64, f64, f32, boolean, struct, union, array, or string parameters are supported` |
+| `type S = { v: ("a"\|"b") }` | declared struct field | `emitProgram: only i32 / boolean / string / array struct fields are supported` |
+| `type S = { v: ("a"\|"b") }` + `S[]` | ditto, one construct out | same |
+| `function show(v: ("a"\|"b"))` fed `g[0]` | param | same |
+
+**The PARAM and DECLARED-FIELD valtype ladders have an arm for the litunion ALIAS name and none for
+the inline member spelling.** That is the whole reason the renderer softens at `RC_ROOT` and
+`RC_FN_PARAM` too, and it is the concrete blocker for the two families that stay open.
+
+A SECOND candidate then tried the obvious refinement — keep the *alias convergence* position-free
+(the alias name IS a spelling those ladders support) while keeping the member spelling gated. It
+heals **nothing** on any grid and **REGRESSES one cell**: `function f(v: ("a"|"b"))` fed an element
+of a `K[]` becomes invalid wasm. The reason is a name/node disagreement, not a name problem —
+`nodeTyIsLitUnionAlias` requires the node's arena index to be a REGISTERED alias
+(`cTyIxListHas(cUnionTyIxs, ty)`), and an inline annotation rebuilds its member union at a fresh
+arena index. **Refuted and not shipped.** This is the same wall #1205 hit from the other side when it
+flipped `vtKindOfType`; both experiments now say the same thing, from opposite directions.
+
+### THE `.map` CALLBACK-PARAM FAMILY, AND THE BARE CROSS-SPELLING FAMILY — FILED, WITH THE FIX'S SHAPE
+
+Eight cells, one root, and it is **not** in `typecheck.vl`. A bare inline literal union reps as a
+STRING at `RC_ROOT`; its alias reps as the i32 atom. Every cell that stays red is a place where a
+bare-position value of one spelling meets a binding of the other. The complete fix is to move the
+bare inline litunion onto the atom rep everywhere — which requires **an inline-litunion arm in the
+PARAM and DECLARED-FIELD valtype ladders** (`emit_sections.vl` / `wasmEmit.vl`, both outside this
+partition), whose absence is exactly the two messages tabulated above. With those two arms in place,
+dropping `ctxKeepsLitUnion`'s gate is a one-line follow-up and the family closes; without them, every
+attempt trades cells, as #1205's `vtKindOfType` experiment and this slice's second candidate both
+measured.
+
+### THE RENDERER MIRROR — BUILT, POISONED, AND DECLINED ON THE MEASUREMENT
+
+`tyToEmitNameGo`'s `TyUnion` arm softens a pure litunion the same way canon did, and its
+alias-preserving parents (`TyArray`/`TyObj`/`TyMap`/`TyFunc`) only cover the case where a registered
+alias EXISTS. So an alias-less inline litunion reached through the RENDERER — an inferred type — was
+the obvious asymmetry to close, and `litUnionMemberRender` was written to close it.
+
+* It moves **0 of 164 grid cells** and **0 of 1,461 corpus files** on all six fields.
+* POISONED (an extra `"__poison__"` member forced into every render it produces) it *still* moves
+  0/1,461 and 0/164. **The arm has no witness on either channel**, so it cannot be entombed —
+  #1199's rule, applied to an ADDITION instead of a guard. It costs +551 B and ships nothing.
+* **Reverted.** The asymmetry is real and is filed here: an alias-less inline litunion at a keeping
+  position, reached through the structural renderer, has an EMPTY population in both channels.
+  Grid3's one surviving inline-only cell (`R6`, a lambda returning a locally-annotated
+  `("a"|"b")[]`) is red with and without the mirror, so it is decided elsewhere again — an inferred
+  RETURN name producer, not this renderer.
+
+### THREE FILED DELETIONS, EACH WITH `FIX − check ≡ FIX` AND A SABOTAGE THAT REDDENS
+
+None is in this partition. Each was BUILT and measured both ways.
+
+| # | check | file | with THIS fix, removed | on MASTER, removed |
+| --- | --- | --- | --- | --- |
+| **D1** | `tyAnnRefListKind`'s `if tyIsLitUnionArray(nodeTyIxOf(tyIx)) { return 0 }` (#1198) | `emit_classify.vl:8516` | 164/164 verdict-identical · **1,461 corpus files identical on all six fields** | **reddens 2 grid cells** — the empty-initializer global and the empty-then-`push` local |
+| **D2** | `fieldCodeOfSpelling`'s `if tyIsLitUnionArray(nodeTyIxOf(litNode)) { return 4 }` (#1198) | `emit_classify.vl:9737` | 164/164 verdict-identical · **1,461 corpus files identical** | **reddens 1 grid cell** — the declared struct field |
+| **D3** | `repOfArray`'s inline litunion element arm (#1200) | `emit_rep.vl:2193` | 164/164 verdict-identical · **1,464 corpus files identical** · all 10 committed litunion pins green | **reddens 11 grid cells and 2 committed pins** |
+
+**RECOMMENDATION, AND IT IS NOT "DELETE".** All three are *arena-first* checks; they are redundant
+now only because the NAME agrees, which is the weaker of the two guarantees and the one this program
+is trying to stop relying on. Deleting them trades an arena decision for a name decision — the wrong
+direction. What the measurement licenses is **retiring their comments' rationale**, each of which
+now points at a softening that no longer happens (D1's "the canon pass softens the bare inline union
+to `string`, so the spelling reads `string[]`" is simply false at this head), not retiring the arms.
+
+### WHICH REP SABOTAGE FIRES — BOTH GRADED, AT BOTH BASES, AND THE ANSWER MOVED AGAIN
+
+The hand-off says to grade with BOTH sabotages every time because #1200 and #1205 measured opposite
+seams at different bases. Done, four builds:
+
+| sabotage | at master `2a11045` | at THIS head |
+| --- | --- | --- |
+| **FLAT** — `repOfArray`'s inline litunion element arm reverted to `repUncovered()` | **FIRES: 119 → 108 / 164**, and reddens 2 committed pins | **INERT: 150 → 150 / 164**, 10/10 pins green, 1,464 corpus files identical |
+| **TREE** — `rtListVKind`'s `litunion:noalias` arm removed | **INERT: 119 → 119 / 164** | **INERT: 150 → 150 / 164** |
+
+So at master the FLAT arm is the live channel and the TREE arm is redundant — #1205's correction of
+#1200 reproduces at this base, on an independently built grid. **At this head NEITHER fires: the
+deciding channel for this construct has moved off the rep layer entirely and onto the annotation
+NAME.** The comparator is proved on a known-WRONG build rather than assumed — the identical FLAT
+patch applied to master's source moves 11 cells.
+
+### CHANNEL GRADING — WHICH ZEROS ARE AGREEMENT AND WHICH ARE COVERAGE
+
+* **Corpus, the 1,456 unmoved pre-existing files — COVERAGE.** They contain no inline literal union
+  at a keeping position. The five that DO move (below) are the whole reached population.
+* **Fuzz, 0 divergences over 50,400 programs/side — COVERAGE, verified in the generator at this
+  head, not quoted.** `scripts/fuzzgen.vl`'s literal-union leaf mints a fresh named alias
+  (`ALIASES = ALIASES + "type " + name + " = " + mems`) and spells the annotation `s.tyname = name`.
+  There is **no inline production at any seed or dimension**, so the 50,400-program zero says
+  nothing about this family. That is why the 164-cell population was constructed.
+* **The grid — AGREEMENT, and it is the graded channel.** 31 cells move, all in one direction, and
+  the two rep sabotages above prove the harness fires on a wrong build.
+* **D1/D2/D3's corpus zeros — AGREEMENT.** Each reddens on master under the same patch.
+* **P2's zeros — AGREEMENT.** The three recursive-generic pins go from a clean message to a COMPILER
+  TRAP under the guard sabotage.
+
+### CORPUS — 8 MOVED ROWS OF 1,464, EVERY ONE ENUMERATED
+
+| row | build | check | run | why |
+| --- | --- | --- | --- | --- |
+| `literal-unions/inline-nested-atom-array.vl` | `BUILDSTATUS(1/0)` | same | `RUNSTATUS(1/0)` | new fixture, red on master |
+| `literal-unions/inline-atom-map-value.vl` | `BUILDSTATUS(1/0)` | same | `RUNSTATUS(1/0)` | new fixture, red on master |
+| `literal-unions/inline-atom-shape-field.vl` | `BUILDSTATUS(1/0)` | same | `RUNSTATUS(1/0)` | new fixture, red on master |
+| `lists/litunion-inline-array-positions.vl` | BYTEDIFF | same | same | `("a"\|"b")[]` at element positions — the annotation now names the litunion |
+| `lists/litunion-inline-nullable-array.vl` | BYTEDIFF | same | same | the same, under `\| null` |
+| `lists/litunion-nullable-list.vl` | BYTEDIFF | same | same | `("x"\|"y")[] \| null` |
+| `structs/nullable-wrapper-literal-widen.vl` | BYTEDIFF | same | same | `{f: "x" \| "y"}` — an inline SHAPE FIELD (`RC_FIELD`) |
+| `types/literal-union.vl` | BYTEDIFF | same | same | `{tag: "circle" \| "square", r: i32}` — an inline SHAPE FIELD |
+
+**1,456 pre-existing files identical on build rc, build BYTES, check rc, check message, run rc and
+run stdout.** The five BYTEDIFF rows all keep their exact check message, run rc and run stdout: the
+behaviour is unchanged and the module differs because those fields/elements now carry the atom rep
+the `K` spelling always had.
+
+### TARGET 2 — renderEmit P2, TAKEN, AND WHAT IT ACTUALLY COST
+
+P2 is *"O1, WITH A REACHABLE CALLER — ship the nominal ancestor guard together with the first
+consumer that can reach a cyclic type."* #1199 and #1202 both refused the guard alone because nothing
+could reach it; #1203 measured that the reachable caller lives in `emit_collect.vl`, which this
+partition owns for the first time.
+
+**The caller was already there, and it was a second copy of the walk.** `guardFiniteUserTypes` — the
+reject that HIDES O1 — was driven by `tyNomRenderLoopsGo`, 63 lines whose own header said it
+*"mirrors `tyToNominalName`'s descent exactly, minus the string building"*: the same nominal
+short-circuits, the same composite arms, a path stack in place of the concatenation. Two walks kept
+in step by hand, for one question.
+
+`tyToNominalNameAt` now carries `nomNameSeen` — `emitNameSeen`'s twin — and BANKS the cut in
+`nomNameCycle`, read through `tyNomNameCycled()`. `tyNomRenderLoops` is three lines: render, read the
+bank. **The BANK is load-bearing and the "" return could not replace it**: this renderer also returns
+"" for a TyVar, for `never` and for any arm it has no name for, and a generic alias's own
+`cUserTypes` entry (`type Box<T> = {v: T}`) is exactly such a type — a caller testing the string
+would reject every generic program in the corpus.
+
+* **INERT, by P1's own artifact:** the P2 compiler reproduces the TARGET-1 compiler **byte-for-byte
+  on master's frozen compiler source** (1,032,411 B — which is also byte-identical to master's own
+  published compiler, so TARGET 1 changes nothing in the compiler's own compilation either).
+  1,464-file corpus identical on all six fields; 164 grid cells verdict-identical.
+* **ENTOMBED:** `recursive-generic-alias-{array,mutual,nullable}` keep their exact
+  `emitProgram: recursive generic type \`L<i32>\` is not supported — its expansion has no finite type
+  name` and the compiler does not trap — while with the ancestor stack removed **all three TRAP the
+  compiler** (`wasm backtrace`, stack exhaustion). The pin fails under the sabotage, which is what
+  #1199 said no version of this guard could yet do.
+* Cost: **−612 B** and −63 lines. Rendering per declared type is not a new cost: a declared
+  struct/union alias short-circuits to its own NAME at the renderer's first line, exactly as the
+  deleted walk did, so only the anonymous generic instances — the ones that can carry a cycle at all
+  — descend.
+
+### COUNTS — BOTH UNITS, DECOMPOSED EXACTLY
+
+**CALL SITES.** CORE **314 → 315 (+1)** · OFF-LIST **24 → 24 (0)** · TRUE **338 → 339 (+1)**. Per
+file, master → head: `emit_classify` 175 → 175 · `emit_base` 51 → 51 · **`typecheck` 46 → 47
+(22 core → 23 core, 24 off unchanged)** · `emit_collect` 44 → 44 · `emit_mono` 7 · `emit_rewrite` 7 ·
+`wasmEmit` 5 · `emit_rep` 2 · `emit_sections` 1. Instrument: #1139's 23-resolver CORE list plus
+#1141's 13 off-list scanners, `NAME(` in `//`-stripped string-literal-aware code (char literals
+kept), each resolver's own header excluded, per-file sums asserted against the tree-wide total —
+validated by reproducing master's 314 / 24 / 338 exactly, per file, from a frozen `git archive` of
+`2a11045`, before it was used for anything.
+
+**The +1 decomposes to one site**: `litUnionPreserve`'s `nameIsLitUnionType(core)`. It is the same
+question `nulLitUnionPreserve` asks one arm above, at the same home, and it is the *cheap* half of
+this change — the other new calls (`litUnionAliasOfLitTexts`, `tyIsLitUnion`, `tyLitMemberTexts`) are
+arena queries and on neither list, and P2's deletion removed only `structNameOfTy` /
+`unionAliasDeclNameOfTy` calls, which are arena→name reverse lookups and likewise on neither.
+
+**INLINE SURGERY (census unit (b)): +1**, and it is named rather than buried:
+`kept[q].slice(1, kept[q].length - 1)`, the quote-strip that recovers a member TEXT from a member
+SPELLING. It is the exact inverse of the `"\"" + litText + "\""` every literal render writes
+(`tyToStr`), performed on a member `nameIsLitUnionType` has just confirmed is a quoted literal — a
+lexeme operation on a literal, not type-grammar parsing. The structural G1–G9 grammar census
+(9 signatures, 19 occurrences tree-wide) is **identical at both bases**, per file.
+
+**Binary: 1,032,411 → 1,032,824 B, +413 B** (TARGET 1 +1,025, P2 −612). A cost, reported as one.
+
+### GATE — EVERY LEG, EXIT CODE TAKEN WITHOUT A PIPE
+
+| leg | result |
+| --- | --- |
+| fresh published `seed-latest` → `refresh-compiler.sh --prove-fixpoint` | **RC=0** — the *published* seed compiles this source (no self-dependency), fixpoint in 2 compiles, 1,032,824 B |
+| `scripts/native-fixpoint.sh` | **RC=0** — stage3 == stage4 byte-for-byte |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **RC=0** — **2,192 passed / 0 failed / 8 ignored**; baseline DERIVED in place (master's seed, the three new fixtures moved aside) = **2,189 / 0 / 8**, and the three new tests are the three new fixtures |
+| `deno check tests/cases_wasm_test.ts` | **RC=0** |
+| `scripts/lint-self.sh` | **RC=0** — self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | **RC=0** — exact, 1 baselined reject, 0 new / 0 stale |
+| corpus A/B, **1,464 files × 6 fields** | **8 moved rows**, all enumerated above; 1,456 pre-existing files identical |
+| fuzz A/B, **50,400 programs/side**, PINNED seeds 1101–1163 × 2 legs (plain, `--branching --multiobs --declared`) | **0 divergences** — 2,401 findings each side, per-seed class+shape TSVs identical for all 126 runs, class histograms identical (2,397 REJECT / 3 INVALID-WASM / 1 TRAP), and **4,802 kept artifacts semantically identical** once the per-run `mktemp` path is normalised out |
+
+### METHOD NOTES
+
+* **The brief's root was half the story, and the half it named is the unreachable half.** The four
+  families are decided by the CANON'd annotation name; the structural renderer's identical softening
+  has an empty population on both channels. Naming a root from reading the code picked the arm that
+  *looks* like the decision.
+* **A second spelling is a second row even when both spellings are correct.** Preserving the inline
+  members fixed 21 cells and left one — the map-value parameter — because a map's shape slot is keyed
+  by the value SPELLING. Only converging the two spellings onto ONE name closed it. "Make the name
+  truthful" and "make the name unique" are different obligations.
+* **Grade a position-gated policy by REMOVING the gate, not only by adding the arm.** The ungated
+  candidate is what produced the two emitter messages that name the exact blocker for the two
+  families still open. A gate justified by "it seemed safer" is a guess; this one has a table.
+* **A poison probe grades an ADDITION the way a sabotage grades a guard.** The renderer mirror looked
+  obviously right and reads 0 both channels — and a version that deliberately corrupts its output
+  also reads 0, which is what says "unreachable" rather than "agrees".
+* **Report which sabotage fires at YOUR base, and prove the harness on a wrong build.** Both rep
+  sabotages are inert here; the flat one moves 11 cells on master under the identical patch. Without
+  that second build, "both inert" is indistinguishable from a broken harness.
+* **`FIX − check ≡ FIX` and `BASE − check ≢ BASE` are the two halves of a deletion proof**, and the
+  second one is the one that says the channel is alive. Three checks, six builds, both halves each.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **The renderer mirror** (`litUnionMemberRender` on `tyToEmitNameGo`'s `TyUnion` arm) — built,
+  poisoned, measured witness-free, reverted. Filed above.
+* **The position-free alias convergence** at `RC_ROOT`/`RC_FN_PARAM` — built, heals nothing,
+  regresses one cell, reverted with the mechanism (`nodeTyIsLitUnionAlias` requires a REGISTERED
+  arena index).
+* **Any edit to `emit_classify.vl`, `emit_rep.vl`, `emit_sections.vl` or `wasmEmit.vl`** — the two
+  open families and all three filed deletions live there. Deletions are FILED with both halves of
+  their proof and an explicit recommendation NOT to take them yet.
+* **A fixture for the `.map` callback-param family** — a construction proof is not a regression test,
+  and there is nothing green to pin.
+* **`annTsRoot` staleness**, untouched and still defended purely by ordering; and P3/P4 of the
+  renderEmit design, which this slice's canon arm is a down payment on but does not begin.

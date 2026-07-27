@@ -45,10 +45,9 @@ import {
   nodeTyIxOf,
   nodeTyName,
   splitUnionAtoms,
-  structNameOfTy,
   tyIsLitUnion,
+  tyNomNameCycled,
   tyToNominalName,
-  unionAliasDeclNameOfTy,
   unionMemberCount,
   valueAtomKind,
 } from "./typecheck"
@@ -4752,76 +4751,26 @@ function collectInlineUnionsBlock(stmts: i32[], blockIx: i32) {
 // pass. All three exhaust the call stack and TRAP the compiler, which gives the user
 // nothing to act on. The emitter rejects such a program by name instead.
 //
-// The test mirrors `tyToNominalName`'s descent exactly, minus the string building:
-// the same nominal short-circuits (a declared struct / declared union alias renders
-// as its NAME and the walk stops), the same composite arms, and a path stack in place
-// of the concatenation. The renderer additionally short-circuits a litunion ALIAS
-// (`litUnionAliasNameOfTy`) at several arms; a litunion is an all-`TyLit` member set
-// and cannot carry a cycle, so descending it here can only find what the renderer
-// would also have found — no arm is over-reported.
-
-// The arena indices on the current descent path. Module-level so a deep type costs
-// no per-call allocation. Emptied by every entry and popped to empty on the way out,
-// so it holds nothing between programs (no arena-lifetime obligation — note 7).
-const nomPath: i32[] = []
-
-function nomPathHas(ix: i32): boolean {
-  let i = 0
-  while i < nomPath.length {
-    if nomPath[i] == ix { return true }
-    i = i + 1
-  }
-  false
-}
-
-function tyNomRenderLoopsGo(ix: i32): boolean {
-  if ix < 0 { return false }
-  // NOMINAL-FIRST, exactly as the renderer: a declared struct or union alias IS its
-  // name, and the descent stops there.
-  if structNameOfTy(ix) != "" { return false }
-  if unionAliasDeclNameOfTy(ix) != "" { return false }
-  if nomPathHas(ix) { return true }
-  nomPath.push(ix)
-  let loops = false
-  const t = T.tys[ix]
-  if t is TyUnion {
-    const ms = t.uMembers
-    let mi = 0
-    while mi < ms.length {
-      if tyNomRenderLoopsGo(ms[mi]) { loops = true }
-      mi = mi + 1
-    }
-  } else if t is TyNullable {
-    if tyNomRenderLoopsGo(t.nInner) { loops = true }
-  } else if t is TyObj {
-    const ftys = t.objFieldTypes
-    let fi = 0
-    while fi < ftys.length {
-      if tyNomRenderLoopsGo(ftys[fi]) { loops = true }
-      fi = fi + 1
-    }
-  } else if t is TyArray {
-    if tyNomRenderLoopsGo(t.aElem) { loops = true }
-  } else if t is TyMap {
-    if tyNomRenderLoopsGo(t.mKey) { loops = true }
-    if tyNomRenderLoopsGo(t.mVal) { loops = true }
-  } else if t is TyFunc {
-    const ps = t.fnParamTypes
-    let pi = 0
-    while pi < ps.length {
-      if tyNomRenderLoopsGo(ps[pi]) { loops = true }
-      pi = pi + 1
-    }
-    if tyNomRenderLoopsGo(t.fnRet) { loops = true }
-  }
-  nomPath.pop()
-  loops
-}
+// THE TEST IS THE RENDER ITSELF (renderEmit P2 / O1). It used to be a hand-written
+// SECOND COPY of `tyToNominalName`'s descent — "the same nominal short-circuits, the
+// same composite arms, and a path stack in place of the concatenation", as its own
+// header put it — which is two walks to keep in step for one question. The renderer
+// now carries the ancestor stack its structural sibling has always had
+// (`emitNameSeen`'s twin) and BANKS the cut in `tyNomNameCycled`, so asking "does
+// this type have a finite nominal name?" is running the renderer and reading the
+// bank. Rendering per DECLARED type costs nothing extra in the common case: a
+// declared struct / union alias short-circuits to its own NAME at the first line, and
+// only the anonymous generic INSTANCES — the ones that can carry a cycle at all —
+// descend.
+//
+// The bank, not the "" return, is the answer: this renderer also returns "" for a
+// TyVar, for `never` and for any arm it has no name for, and a generic alias's own
+// `cUserTypes` entry (`type Box<T> = {v: T}`) is exactly such a type.
 
 // Would a name-faithful render of arena type `ix` fail to terminate?
 function tyNomRenderLoops(ix: i32): boolean {
-  while nomPath.length > 0 { nomPath.pop() }
-  tyNomRenderLoopsGo(ix)
+  tyToNominalName(ix)
+  tyNomNameCycled()
 }
 
 // The SOURCE spelling of the first annotation whose resolved type is `ix` (`L<i32>`),

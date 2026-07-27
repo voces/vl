@@ -6739,23 +6739,64 @@ export function unionAliasDeclNameOfTy(ty: i32): string {
 // non-empty return and read by the immediate caller, never carried between programs.
 let nomNameAtoms = 1
 
+// The ANCESTOR stack of the nominal render in progress — `emitNameSeen`'s twin, O1 of the
+// one-agreed-renderer design. Nominal-first tames a DECLARED recursive struct by
+// short-circuiting to its name, but NOT a recursive GENERIC alias: `applyGenAlias` memoizes
+// each instance under a key and registers a placeholder before resolving the fields, so
+// `type L<T> = { head: T, tail: L<T> | null }` resolves to a genuinely CYCLIC arena entry
+// that is anonymous — in neither `cStructTyIxs` nor `cUnionTyIxs` — and nothing stops the
+// descent. Without this the render exhausts the call stack and TRAPS the compiler.
+//
+// Push/pop balanced around the recursive entry, so it holds ANCESTORS only: a type that
+// mentions one shape TWICE as siblings still renders both. Not an arena-lifetime sidecar
+// (method note 7): empty on entry and on exit of every top-level call, by that balance.
+const nomNameSeen: i32[] = []
+
+// TRUE when the last top-level `tyToNominalName` was CUT by the ancestor stack above — the
+// producer-supplied bank that makes the cut observable, in the shape `nomNameAtoms` and
+// `emitNameAtoms` already use. "" alone cannot carry it: this renderer returns "" for a
+// TyVar, for `never` and for any arm it has no name for, none of which is a cycle, so a
+// caller testing the string would reject every generic alias in the program.
+let nomNameCycle = false
+
 // THE POSITION-FREE ENTRY, exactly as on the structural sibling: every caller outside this
 // renderer (`emit_collect.vl`'s registration walk) asks about a type standing on its own.
+// The cycle bank is per top-level render, so it resets here rather than in the recursion.
 export function tyToNominalName(ix: i32): string {
+  nomNameCycle = false
   tyToNominalNameAt(ix, RC_ROOT)
 }
 
-// NOTE FOR O1, filed and NOT discharged here. This renderer has no ancestor stack — its
-// structural sibling carries `emitNameSeen` and it carries nothing, because nominal-first
-// tames a DECLARED recursive struct by short-circuiting to its name. It does NOT tame a
-// recursive GENERIC alias, whose instance is anonymous and so in neither `cStructTyIxs` nor
-// `cUnionTyIxs`; a guard added for measurement fired 10 times over 3 corpus files
-// (`tests/cases/generics/recursive-generic-alias-{array,mutual,nullable}.vl`). It is
-// unreachable today only because `emitProgram`'s finiteness reject runs before any of this
-// function's emit-side callers. P1 threads a parameter and changes no control flow, so it
-// neither opens that path nor closes it; the guard ships with the phase that first gives it
-// a reachable caller.
+// Did the LAST `tyToNominalName` hit a cycle — i.e. does that type have no finite nominal
+// name at all? Read by `emit_collect.vl`'s `guardFiniteUserTypes`, which rejects such a
+// program by name instead of letting any renderer trap on it.
+export function tyNomNameCycled(): boolean { nomNameCycle }
+
+// O1 IS DISCHARGED HERE, with the caller that makes it reachable in the same change
+// (`guardFiniteUserTypes`). The reject that used to hide this guard was driven by a
+// hand-written SECOND COPY of this function's descent — same nominal short-circuits, same
+// composite arms, a path stack in place of the concatenation — whose own header said it
+// "mirrors `tyToNominalName`'s descent exactly, minus the string building". Two copies of a
+// walk are two things to keep in step; the walk now answers the question itself.
 function tyToNominalNameAt(ix: i32, ctx: i32): string {
+  nomNameAtoms = 1
+  if ix < 0 { return "" }
+  let si = 0
+  while si < nomNameSeen.length {
+    if nomNameSeen[si] == ix {
+      nomNameAtoms = 1
+      nomNameCycle = true
+      return ""
+    }
+    si = si + 1
+  }
+  nomNameSeen.push(ix)
+  const r = tyToNominalNameGo(ix, ctx)
+  nomNameSeen.pop()
+  r
+}
+
+function tyToNominalNameGo(ix: i32, ctx: i32): string {
   nomNameAtoms = 1
   if ix < 0 { return "" }
   // NOMINAL-FIRST: a declared struct or union alias renders as its NAME — one identifier,
@@ -7383,6 +7424,7 @@ function unionMemberGenAppShape(member: string) {
 // way out of a call and read by the immediate caller, never carried between programs.
 let canonAtoms = 1
 let nluAtoms = 1
+let lupAtoms = 1
 
 // A NULLABLE LITERAL-UNION's preserved canonical name, or "" if `parts` (the top-level `|`-split
 // members of a union annotation) are not one. `K | null` / `"a" | "b" | null` must keep the litunion
@@ -7413,6 +7455,84 @@ function nulLitUnionPreserve(parts: string[]) {
     // single suffix, which is why this is `rest.length + 1` and not `parts.length`.
     nluAtoms = rest.length + 1
     return core + "|null"
+  }
+  ""
+}
+
+// True at the render POSITIONS where a literal union keeps its members — the four the
+// structural renderer already preserves a litunion ALIAS at (`tyToEmitNameGo`'s `TyArray`
+// element, `TyObj` field, `TyMap` value and `TyFunc` result arms each call
+// `litUnionAliasNameOfTy` before recursing). O3 of the one-agreed-renderer design states the
+// policy as position-dependent in BOTH directions, and this is its positive half.
+//
+// FALSE at `RC_ROOT` and `RC_FN_PARAM`, and that is MEASURED, not stylistic: an ungated
+// preserve reddens four cells that are green on master — a bare inline litunion as a
+// function PARAM (`emitProgram: only i32, i64, f64, f32, boolean, struct, union, array, or
+// string parameters are supported`) and as a DECLARED struct field (`emitProgram: only i32 /
+// boolean / string / array struct fields are supported`), because those two valtype ladders
+// have an arm for the litunion ALIAS name and none for the inline member spelling. The
+// renderer softens at exactly those two positions too, for the same reason.
+function ctxKeepsLitUnion(ctx: i32) {
+  if (ctx & RC_ELEM) != 0 { return true }
+  if (ctx & RC_FIELD) != 0 { return true }
+  if (ctx & RC_MAP_VAL) != 0 { return true }
+  if (ctx & RC_FN_RES) != 0 { return true }
+  false
+}
+
+// A PURE literal union's preserved canonical name, or "" if `parts` (the top-level `|`-split
+// members of a union annotation) are not one. The non-null sibling of `nulLitUnionPreserve`:
+// `"a" | "b"` must keep its members intact, because softening each to `string` and deduping
+// erases the litunion identity and reps the annotation as a STRING REF where its `K` alias
+// spelling reps as the interned i32 ATOM. Duplicate members collapse (`"a" | "a"` is one atom),
+// which is what the softening path's own `kept` dedup did and what the arena does.
+function litUnionPreserve(parts: string[]) {
+  const kept: string[] = []
+  let i = 0
+  while i < parts.length {
+    let dup = false
+    let j = 0
+    while j < kept.length {
+      if kept[j] == parts[i] { dup = true }
+      j = j + 1
+    }
+    if !dup { kept.push(parts[i]) }
+    i = i + 1
+  }
+  if kept.length < 2 { return "" }
+  let core = kept[0]
+  let k = 1
+  while k < kept.length {
+    core = core + "|" + kept[k]
+    k = k + 1
+  }
+  if nameIsLitUnionType(core) {
+    // A DECLARED alias with exactly these members WINS the spelling — the same preference
+    // `litUnionAliasNameOfTy` gives the structural renderer, for the same reason: a name
+    // that is an intern KEY must be one name per type. Without it the two spellings of one
+    // litunion map type mint TWO `{[string]:…}` shape slots, so a `{[string]: ("a"|"b")[]}`
+    // value handed to a `{[string]: K[]}` parameter is still invalid wasm — preserved or
+    // softened, a second spelling is a second row.
+    //
+    // The member texts are recovered by dropping each kept member's surrounding quotes —
+    // the exact inverse of the `"\"" + litText + "\""` every literal RENDER writes
+    // (`tyToStr`), on a member `nameIsLitUnionType` has just confirmed is a quoted literal.
+    const texts: string[] = []
+    let q = 0
+    while q < kept.length {
+      texts.push(kept[q].slice(1, kept[q].length - 1))
+      q = q + 1
+    }
+    const al = litUnionAliasOfLitTexts(texts)
+    if al != "" {
+      // An alias name is ONE identifier — one atom.
+      lupAtoms = 1
+      return al
+    }
+    // Each kept member is a TOP-LEVEL member of the original split, so none carries a
+    // top-level `|` of its own and the join writes exactly `kept.length - 1` separators.
+    lupAtoms = kept.length
+    return core
   }
   ""
 }
@@ -7486,6 +7606,23 @@ function canonEmitNameAt(name: string, ctx: i32) {
     if nlu != "" {
       canonAtoms = nluAtoms
       return nlu
+    }
+    // A PURE literal union (`"a" | "b"`) keeps its members too, exactly as the `| null`
+    // sibling above already does. Without this, every member softened to `string` and
+    // deduped to the ONE base scalar, so an INLINE spelling reached the emitter naming a
+    // STRING while its `K` ALIAS spelling kept the litunion name — two spellings of ONE
+    // type carrying two reps, which is the split behind four filed miscompile families
+    // (nested `("a"|"b")[][]`, an inline litunion map VALUE, an inline-SHAPE field, and a
+    // `.map` callback PARAM). The emitter's name grammar was already ready for it:
+    // `nameIsLitUnionType` accepts the inline member spelling (`nameIsInlineLitUnion`)
+    // beside the alias name, and the `| null` form has been arriving here preserved since
+    // `nulLitUnionPreserve` was written.
+    if ctxKeepsLitUnion(ctx) {
+      const lup = litUnionPreserve(parts)
+      if lup != "" {
+        canonAtoms = lupAtoms
+        return lup
+      }
     }
     const kept: string[] = []
     // The position every member below is rendered AT. `RC_NULLABLE` is re-derived from a
