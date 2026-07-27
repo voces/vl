@@ -2163,11 +2163,28 @@ function modCompile(emit: i32): i32 {
     modRwStmt(roots[o2])
     o2 = o2 + 1
   }
-  // 4b. Resolve each RE-EXPORT's public name to its merged (mangled) target — the
-  // exporting module renamed its `name` to `name$mDD`, so a re-export `export { name }
+  // 4b. Resolve each of the ROOT module's RE-EXPORTS to its merged (mangled) target —
+  // the exporting module renamed its `name` to `name$mDD`, so a re-export `export { name }
   // from "dep"` aliases the bare `name` onto that target in the emitter's export
   // section. The re-export rode in as an import (same module + local binding), so the
   // target is its `impName$m<depIndex>`.
+  //
+  // ONLY module 0's rows. A DEPENDENCY's re-export is that dependency's public surface,
+  // not the program's: `mid.vl` saying `export { fn } from "./home"` publishes `fn` to the
+  // modules that import `mid`, and nothing more. Without the `rm == 0` guard every such row
+  // aliased a bare name into the ENTRY's wasm ABI — measured with a three-module program
+  // whose entry exports NOTHING and whose wasm still exported `fn`. That contradicts 4c's
+  // rule right below ("an internal function … never leaks into the wasm ABI") and it is not
+  // inert: the compiler's own `emit_base.vl` republishes seven type-name grammars from
+  // `typecheck.vl` for its siblings, and each one bought an export-section entry (+97 B of
+  // names) in a binary no host reaches them through.
+  //
+  // The root's own row does not need the dependency rows. Before #1196 it did — a one-hop
+  // target named nothing when `dd` merely re-exported, and the deepest dependency row (the
+  // one adjacent to the declaration) covered for it, which is why an UNRENAMED chain looked
+  // healthy. `modMergedTargetOf` now chases to the declaring module from the root's row
+  // alone, so removing the crutch removes only the leak (`tests/vl_reexport_abi_test.ts`
+  // pins both halves: the renaming chain still resolves, the dependency name is absent).
   reExpName = []
   reExpTarget = []
   let re = 0
@@ -2175,7 +2192,10 @@ function modCompile(emit: i32): i32 {
     const rm = reExpMod[re]
     const rloc = reExpLocal[re]
     let ii2 = 0
-    let done = false
+    // A dependency's re-export (`rm != 0`) publishes to its importers, not to the ABI:
+    // start the scan already `done` so its row contributes no alias.
+    let done = true
+    if rm == 0 { done = false }
     while ii2 < impMod.length && !done {
       if impMod[ii2] == rm && impLocal[ii2] == rloc && impName[ii2] != "" {
         const dd = modIndexOfKey(impKey[ii2])
