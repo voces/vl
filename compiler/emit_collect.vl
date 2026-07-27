@@ -308,8 +308,10 @@ import {
   fieldRefElemName,
   fieldTypeCode,
   fieldValueFeOf,
+  fnIndexOf,
   fnReturnsClosure,
   fnSigKeyOf,
+  fnStmtsPosOf,
   forInElemKind,
   forInMapValsSlot,
   forInRefArrayStructIdx,
@@ -1168,6 +1170,72 @@ export function buildFnMap(_stmts: i32[]) {
     i = i + 1
   }
   fnStmts.length
+}
+
+// ── scope-aware callee resolution ────────────────────────────────────────────
+// The `fnStmts` position of a lifted function named `name` whose PARENT frame is the
+// `fnStmts` position `pp` — i.e. the function `pp`'s body DECLARES under that name — or
+// -1 when that frame declares no such function. Scans in `fnStmts` order, so the first
+// declaration wins; a frame declaring one name twice is a checker error already.
+function nestedFnDeclaredIn(name: string, pp: i32) {
+  let i = 0
+  while i < fnStmts.length {
+    const s = P.nodes[fnStmts[i]]
+    if s is FuncDecl {
+      if s.fnName == name {
+        if i < fnParent.length && fnParent[i] == pp { return i }
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Resolve a CALLEE name to its wasm function index through the calling frame's LEXICAL
+// SCOPE CHAIN, instead of `fnIndexOf`'s flat first-occurrence-wins map.
+//
+// `buildFnMap` above keys lifted functions by NAME and keeps the FIRST — so the flat
+// lookup hands EVERY frame the module's first function of that name. Two makers that
+// each declare their own nested `inner` therefore both call the first maker's, which is
+// a SILENT WRONG ANSWER whenever the two bodies happen to agree in shape and invalid
+// wasm when they do not. The same first-wins rule also makes a TOP-LEVEL function beat a
+// nested one unconditionally, because `collectFns` pushes every top-level function into
+// `fnStmts` BEFORE it lifts anything.
+//
+// The lexical rule is: the INNERMOST enclosing scope that declares `name` wins. So walk
+// outward from the calling frame and stop at the first hit — the calling frame's own
+// nested declarations first (which is also what lands a nested function's RECURSIVE
+// self-call on itself: the frame that declares it is its parent, exactly one step out),
+// then each enclosing frame in turn. Running off the chain (`-1` = top level) means no
+// nested binding is in scope, and the flat map's answer — a top-level function — is then
+// the correct one.
+//
+// `fnIndexOfInScope` (emit_classify) is the ONE-LEVEL form of this, wired to the
+// function-VALUE path. It agrees here wherever the binding is declared directly in the
+// calling frame, and differs only on the ancestor rungs this walk adds (a sibling nested
+// function's call, a lambda's call into its enclosing frame, and self-recursion).
+//
+// Cost: gated on `nestedNameSet`, so a callee that is not a nested function name
+// anywhere — every call in a module without nested functions, and nearly all of them in
+// a module with some — costs exactly the one `fnIndexOf` map lookup it cost before.
+export function fnIndexOfInScopeChain(name: string, fnIx: i32) {
+  if fnIx >= 0 && (nestedNameSet[name] ?? false) {
+    let pp = fnStmtsPosOf(fnIx)
+    // `fnStmts.length` bounds the walk: a parent chain cannot be longer than the
+    // function count, so this terminates even were `fnParent` ever to contain a cycle.
+    let steps = 0
+    while pp >= 0 && steps <= fnStmts.length {
+      const hit = nestedFnDeclaredIn(name, pp)
+      if hit >= 0 { return hit }
+      if pp < fnParent.length {
+        pp = fnParent[pp]
+      } else {
+        pp = -1
+      }
+      steps = steps + 1
+    }
+  }
+  fnIndexOf(name)
 }
 
 // Classify each function's VOIDNESS as a monotone fixed point: a candidate (no
