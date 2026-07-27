@@ -40,19 +40,29 @@ import {
   UnionDecl,
   WhileStmt,
   i32ToStr,
+  mkArrayLit,
+  mkAsExpr,
   mkBinary,
   mkBlock,
   mkCallN,
+  mkCompoundAssign,
+  mkFieldInit,
   mkForIn,
   mkForRange,
   mkFunc,
   mkIdent,
   mkIf,
+  mkIndex,
+  mkIsExpr,
+  mkIsExprNeg,
   mkLet,
   mkMember,
+  mkObjLit,
+  mkOptMember,
   mkParam,
   mkParen,
   mkReturn,
+  mkUnary,
   mkWhile,
 } from "./ast"
 import {
@@ -813,6 +823,207 @@ function monoBakeCallback(
   ix
 }
 
+// Whether `name` resolves to a lifted slot the pre-pass flagged GENERIC — exactly the condition
+// under which `monoWalk` reaches `monoInstantiate` and a callee `Ident` gets renamed IN PLACE to an
+// instance name. An appended instance slot (`at$1`, past the frozen `monoGen` length) is concrete.
+function monoCalleeIsGeneric(name: string) {
+  const fe = fnIndexOf(name)
+  if fe < 0 { return false }
+  if fe >= monoGen.length { return false }
+  monoGen[fe] == 1
+}
+
+// Give an instance its OWN copy of every direct call to a generic — the `Call` node and its callee
+// `Ident` — so the per-instance rename `monoWalk`/`monoMakeInstance` perform (`cal.identName =
+// "at$1"`) lands on nodes no sibling instance can see.
+//
+// Instances otherwise SHARE the original's body arena nodes (only the `LetDecl` spine is rebuilt,
+// per `monoCloneBody`), so a body containing `at(xs, 0)` handed that one `Ident` to every instance:
+// the LAST shape to instantiate `at` won, and the earlier instances called the wrong element type's
+// `at` — a `vl check`-clean invalid module. The same aliasing is what the file header flagged for a
+// RECURSIVE generic used at multiple shapes; both are fixed here, since a self-call is just the case
+// where the generic callee IS the enclosing decl.
+//
+// Clone-if-changed, mirroring `monoBakeCallback`'s spine: the traversal is `monoWalk`'s EXACTLY, so
+// every position a rename can reach is covered, and a body with no generic call returns the SAME
+// node index — zero new arena nodes, byte-identical output. Cloning happens for the FIRST instance
+// too, which is what keeps `monoOrigNode`'s body pristine for the shapes that come after it.
+// Leaves (the arguments' own expression leaves, a nested lambda) stay shared, so no function node is
+// created behind `collectFns`' back. A COMPOUND assignment (`acc += first(xs)`) is left intact, as
+// in `monoBakeCallback` — rebuilding through `mkBinary` would drop its surface tag.
+function monoCloneGenericCalls(ix: i32) {
+  if ix < 0 { return ix }
+  const n = P.nodes[ix]
+  if n is Call {
+    let newCallee = n.callFn
+    const callee = P.nodes[n.callFn]
+    if callee is Ident {
+      if monoCalleeIsGeneric(callee.identName) {
+        newCallee = mkIdent(callee.identName, callee.pos)
+      }
+    } else {
+      newCallee = monoCloneGenericCalls(n.callFn)
+    }
+    let changed = newCallee != n.callFn
+    const nargs: i32[] = []
+    let ai = 0
+    while ai < n.callArgs.length {
+      const ca = monoCloneGenericCalls(n.callArgs[ai])
+      nargs.push(ca)
+      if ca != n.callArgs[ai] { changed = true }
+      ai = ai + 1
+    }
+    if !changed { return ix }
+    return mkCallN(newCallee, nargs, n.callArgNames, n.pos)
+  }
+  if n is Block {
+    const ns: i32[] = []
+    let bchanged = false
+    let i = 0
+    while i < n.blkStmts.length {
+      const cs = monoCloneGenericCalls(n.blkStmts[i])
+      ns.push(cs)
+      if cs != n.blkStmts[i] { bchanged = true }
+      i = i + 1
+    }
+    if !bchanged { return ix }
+    return mkBlock(ns, n.pos)
+  }
+  if n is LetDecl {
+    const ci = monoCloneGenericCalls(n.letInit)
+    if ci == n.letInit { return ix }
+    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+  }
+  if n is RetStmt {
+    const ca2 = monoCloneGenericCalls(n.retArg)
+    if ca2 == n.retArg { return ix }
+    return mkReturn(ca2, n.pos)
+  }
+  if n is IfStmt {
+    const cc = monoCloneGenericCalls(n.ifCond)
+    const ct = monoCloneGenericCalls(n.ifThen)
+    const ce = monoCloneGenericCalls(n.ifElse)
+    if cc == n.ifCond && ct == n.ifThen && ce == n.ifElse { return ix }
+    return mkIf(cc, ct, ce, n.pos)
+  }
+  if n is WhileStmt {
+    const wc = monoCloneGenericCalls(n.whileCond)
+    const wb = monoCloneGenericCalls(n.whileBody)
+    if wc == n.whileCond && wb == n.whileBody { return ix }
+    return mkWhile(wc, wb, n.whileLabel, n.pos)
+  }
+  if n is ForRange {
+    const ff = monoCloneGenericCalls(n.frFrom)
+    const ft = monoCloneGenericCalls(n.frTo)
+    const fs = monoCloneGenericCalls(n.frStep)
+    const fb = monoCloneGenericCalls(n.frBody)
+    if ff == n.frFrom && ft == n.frTo && fs == n.frStep && fb == n.frBody {
+      return ix
+    }
+    return mkForRange(n.frVar, ff, ft, fs, fb, n.frLabel, n.pos)
+  }
+  if n is ForIn {
+    const fi = monoCloneGenericCalls(n.fiIter)
+    const fbi = monoCloneGenericCalls(n.fiBody)
+    if fi == n.fiIter && fbi == n.fiBody { return ix }
+    return mkForIn(n.fiVar, fi, fbi, n.fiLabel, n.pos)
+  }
+  if n is BinExpr {
+    // A COMPOUND assignment (`acc += at(xs, 1)`) desugars to `target = (target op value)` with the
+    // TARGET node SHARED between the read and the write, so its limbs cannot be rebuilt
+    // independently — re-synthesize the whole form from its parts, cloning only the VALUE limb (the
+    // one a generic call can reach; `++`/`--` carry a literal `1`, so they are left alone).
+    if n.binCompound != "" {
+      if n.binCompound == "++" || n.binCompound == "--" { return ix }
+      const inner = P.nodes[n.binRight]
+      if inner is BinExpr {
+        const iv = monoCloneGenericCalls(inner.binRight)
+        if iv == inner.binRight { return ix }
+        return mkCompoundAssign(n.binCompound, n.binLeft, iv, n.pos)
+      }
+      return ix
+    }
+    const bl = monoCloneGenericCalls(n.binLeft)
+    const br = monoCloneGenericCalls(n.binRight)
+    if bl == n.binLeft && br == n.binRight { return ix }
+    return mkBinary(n.binOp, bl, br, n.pos)
+  }
+  if n is Unary {
+    // A POSTFIX `x++`/`x--` rides a `Unary` over the assignment whose operand IS the mutated
+    // target — leave it whole for the same reason the compound form is re-synthesized.
+    if n.unOp == "p+" || n.unOp == "p-" { return ix }
+    const ua = monoCloneGenericCalls(n.unArg)
+    if ua == n.unArg { return ix }
+    return mkUnary(n.unOp, ua, n.pos)
+  }
+  if n is Paren {
+    const pi = monoCloneGenericCalls(n.parInner)
+    if pi == n.parInner { return ix }
+    return mkParen(pi, n.pos)
+  }
+  if n is Member {
+    const mo = monoCloneGenericCalls(n.memObj)
+    if mo == n.memObj { return ix }
+    return mkMember(mo, n.memProp, n.pos)
+  }
+  if n is OptMember {
+    const oo = monoCloneGenericCalls(n.omObj)
+    if oo == n.omObj { return ix }
+    return mkOptMember(oo, n.omProp, n.pos)
+  }
+  if n is Index {
+    const xa = monoCloneGenericCalls(n.idxArr)
+    const xi = monoCloneGenericCalls(n.idxIndex)
+    if xa == n.idxArr && xi == n.idxIndex { return ix }
+    return mkIndex(xa, xi, n.pos)
+  }
+  if n is IsExpr {
+    const io = monoCloneGenericCalls(n.isObj)
+    if io == n.isObj { return ix }
+    if n.isNeg == 1 { return mkIsExprNeg(io, n.isVariant, n.pos) }
+    return mkIsExpr(io, n.isVariant, n.pos)
+  }
+  if n is AsExpr {
+    const ao = monoCloneGenericCalls(n.asObj)
+    if ao == n.asObj { return ix }
+    return mkAsExpr(ao, n.asTy, n.pos)
+  }
+  if n is ArrayLit {
+    const es: i32[] = []
+    let echanged = false
+    let ei = 0
+    while ei < n.arrElems.length {
+      const ce = monoCloneGenericCalls(n.arrElems[ei])
+      es.push(ce)
+      if ce != n.arrElems[ei] { echanged = true }
+      ei = ei + 1
+    }
+    if !echanged { return ix }
+    return mkArrayLit(es, n.pos)
+  }
+  if n is ObjLit {
+    const fl: i32[] = []
+    let ochanged = false
+    let oi = 0
+    while oi < n.objFields.length {
+      let nf = n.objFields[oi]
+      const f = P.nodes[nf]
+      if f is FieldInit {
+        const cv = monoCloneGenericCalls(f.fiValue)
+        if cv != f.fiValue {
+          nf = mkFieldInit(f.fiName, cv, f.pos)
+          ochanged = true
+        }
+      }
+      fl.push(nf)
+      oi = oi + 1
+    }
+    if !ochanged { return ix }
+    return mkObjLit(fl, n.pos)
+  }
+  ix
+}
+
 // Whether a specialization callback was baked for ANY param (the instance has at least one
 // `cbFnNames[k] != ""`) — gates the body rewrite + key extension below.
 function monoAnyBakedCallback(cbFnNames: string[]) {
@@ -1169,10 +1380,14 @@ function monoMakeInstance(
     // Bake any non-capturing concrete callback into a DIRECT call (`pElemNames` already holds the
     // per-position param NAMES, parallel to `cbFnNames`). No baked callback → no rewrite → the body
     // is the same node `monoPinMapLambdas` produced (byte-identical to the pre-specialization path).
-    let instBody = instBody1
+    let instBody2 = instBody1
     if monoAnyBakedCallback(cbFnNames) {
-      instBody = monoBakeCallback(instBody1, pElemNames, cbFnNames)
+      instBody2 = monoBakeCallback(instBody1, pElemNames, cbFnNames)
     }
+    // Per-instance copies of the direct generic calls this body makes, so instantiating THEM
+    // rewrites only this instance's callee `Ident`s (a shared one made the last shape win for
+    // every instance — see `monoCloneGenericCalls`). No generic call → the same node → no change.
+    const instBody = monoCloneGenericCalls(instBody2)
     const nfn = mkFunc(instName, noTyParams, nps, nret, instBody, -1)
     if count == 0 {
       // First instance: keep the bare name and the original's wasm index.
@@ -1203,9 +1418,10 @@ function monoMakeInstance(
     monoInstName.push(instName)
     monoInstFe.push(instFe)
     if monoRebuild() < 0 { return -1 }
-    // Walk the instance's body — a nested generic call instantiates its own
-    // callee against THIS instance's concrete annotations.
-    if monoWalk(fn.fnBody, nfn) < 0 { return -1 }
+    // Walk THIS INSTANCE's body — a nested generic call instantiates its own callee against this
+    // instance's concrete annotations, and the callee rename lands on the instance's own `Call`
+    // spine (`monoCloneGenericCalls`) rather than on nodes its siblings share.
+    if monoWalk(instBody, nfn) < 0 { return -1 }
     if monoRebuild() < 0 { return -1 }
     return 0
   }

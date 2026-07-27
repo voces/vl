@@ -1,0 +1,59 @@
+// @run
+// @log q
+// @log 1
+// @log x
+// @log 1.5
+// @log 10000000000
+// @log true
+// @log 1
+// @log 1
+// @log 2
+// @log y
+// A generic whose BODY calls another generic, instantiated at more than one element type.
+// `first(a)` alone printed `1`; adding `first(b)` at a second element type emitted an INVALID
+// module (`vl check` clean, `vl run` "type mismatch: expected (ref $type), found (ref $type)")
+// — 28 of the 30 ordered type pairs over {i32, i64, f32, f64, string, boolean}, the two
+// survivors being i32/boolean, which share the i32 wasm rep so the mis-shared callee happened to
+// be the right one anyway. Three distinct element types crashed the COMPILER outright (an
+// out-of-bounds array access mid-monomorphization).
+//
+// Instances SHARE the original declaration's body arena nodes, so the single `at(xs, 0)` callee
+// `Ident` was handed to every instance of `first` — and instantiating `at` at the second element
+// type renames that `Ident` IN PLACE to `at$1`, retargeting the FIRST instance too. Each instance
+// now gets its own copy of the generic-call spine (`monoCloneGenericCalls`) and is walked through
+// it, so the rename is per-instance.
+
+function at<T>(xs: T[], i: i32) { return xs[i] }
+function first<T>(xs: T[]) { return at(xs, 0) }
+function mid<T>(xs: T[]) { return at(xs, 1) }
+function outer<T>(xs: T[]) { return mid(xs) }
+
+// The inner generic already carries an instance at ANOTHER shape by the time the outer generic's
+// FIRST instance is minted, so that first instance has to rename its own callee (`at` → `at$1`).
+// Cloning only for the second and later instances is therefore not enough: the first instance
+// would write that rename into the captured original, and every later shape would inherit a
+// callee pinned to i32. Hence the clone happens for the first instance too — this line is what
+// makes that load-bearing.
+const s: string[] = ["p", "q"]
+print(at(s, 1)) // q
+
+const a: i32[] = [1, 2]
+const b: string[] = ["x", "y"]
+const c: f64[] = [1.5, 2.5]
+const d: i64[] = [10000000000, 8]
+const e: boolean[] = [true, false]
+
+print(first(a)) // 1
+print(first(b)) // x
+print(first(c)) // 1.5
+print(first(d)) // 10000000000
+print(first(e)) // true
+
+// CONTROL: the discriminator is the number of DISTINCT instances, not the number of call sites —
+// repeated calls at ONE element type were always fine, and still are.
+print(first(a)) // 1
+print(first(a)) // 1
+
+// A three-deep chain: the middle generic is itself instantiated per shape through the outer one.
+print(outer(a)) // 2
+print(outer(b)) // y
