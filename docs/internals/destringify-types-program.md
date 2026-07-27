@@ -28004,3 +28004,342 @@ than this change.
 * **Zero is a result, and it is the one worth chasing.** S2's zero says the routed function has no
   test anywhere in the repo — a far more useful thing to learn than a green sweep, and the only
   reason a fixture got written for it.
+
+---
+
+## D-ALIASREF — the checker's largest remaining character scanner asks the PARSER instead, and the routing turns out to FIX two multi-module defects; plus #1225's narrow-after-assignment defect, whose answer is neither horn of the question (censused and graded off `fe4e256`, rebased and re-gated on `e3d8786`, which does not touch `typecheck.vl`)
+
+Two halves, one file. The destringify half retires `compiler/typecheck.vl`'s biggest single block of
+character grammar by asking D-PARSETY's spelling tree instead of re-scanning the string the parser
+had just built — and the answer the tree gives is **not the same answer**, because the module merge
+writes a character the hand-written scanner rejects. The defect half re-derives #1225's
+narrow-after-assignment reject and lands on a third answer.
+
+### THE CENSUS, RE-DERIVED — AND THE HOME, CONFIRMED
+
+Instrument as D-MAPSPELL's: comment-stripped, string-literal-aware, counting character-grammar
+TESTS (an indexed read compared against a char literal, with each `>=`/`<=` range compare counted as
+the two tests it is), attributed to the ENCLOSING function. `compiler/typecheck.vl` at `fe4e256`:
+**134 tests in 39 functions.**
+
+| column | tests | why |
+|---|---:|---|
+| numeric / value LEXEMES | 40 | legitimate residue by rule |
+| NAME mangling (`demangleName`, `demangleMsg`) | 7 | a name is a name |
+| emitter SENTINEL prefixes (`recordClonedNodeTy`) | 7 | not type spellings |
+| inference-HOLE sentinels, `TyVar` `'?'`, quoted-LEAF tests | 12 | sentinels, not grammars |
+| **the DEPTH-WALK home** (`tyTopIndexOf`, `tyGroupEndIndex`, `tyGtIsClose`, + the two `name[at] == '='` arrow guards) | **23** | **the HOME** |
+| the grammar HOMES this file already owns (paren ×2, array, shape, brace span, map ×3, `gaeLtAt`, `annGenAppSpanEnds`) | 15 | terminal by construction |
+| **the actual debt** | **30** | below |
+
+**THE BRIEF WAS RIGHT ABOUT THE HOME AND I DID NOT TOUCH IT.** `tyTopIndexOf` + `tyGroupEndIndex`
+(master 4911-4957) are the bracket-depth walk eight `emit_base` copies were consolidated onto,
+precisely so the `<>` repairs (#1118, #1120, D-CLASSANG) landed once. Nine bracket-character lines
+there, 20 tests by this instrument, 23 with the walk's satellites. Not debt.
+
+**I could not reproduce the brief's raw "23", by any instrument I tried** — bracket characters only,
+lines rather than tests, with and without the home — and say so rather than quoting a number I
+cannot derive. The four groups it named are all real; two of them are not what it called them.
+
+The 30, by grammar:
+
+| grammar | tests | functions |
+|---|---:|---|
+| **(G) the one-member alias BODY: an IDENTIFIER-RUN scan + its `<` tail** | **13** | `aliasRefIsPlainName` |
+| (D) `nameNeedsCanon`'s CONTAINS-scan | 12 | one function |
+| (E) the ARROW-relative close | 3 | `isTopLevelFuncTypeName` · `nameToTyReal` · `canonEmitNameAt` |
+| (F) the `!` NEGATION prefix | 2 | `nameToTyReal` · `canonEmitNameAt` |
+
+### (G) — THE HAND-WRITTEN SCANNER DIES, AND ITS ANSWER WAS WRONG
+
+`aliasRefIsPlainName(spell)` asked "is this one-member alias body a bare type NAME or a generic
+APPLICATION?" by walking the member's rendered spelling for an identifier run and then testing the
+tail. Thirteen character tests — the largest block left in the file — re-deriving from characters
+what `parseVariantName` had recorded four passes earlier: **`setUdTs` banks every `UnionDecl`
+member's spelling ROOT on the node (D-PARSETY P2), and `udTsRootAt(node, 0)` hands it back.** The
+question is one array read of `tsKind`. The whole function is deleted; `aliasRefIsPlainRoot(root)`
+replaces it.
+
+**THE TWO ANSWERS DIVERGE, AND THE STRING'S IS THE WRONG ONE.** A divergence probe (both answers
+computed, `tErr` on disagreement, with an inverted CONTROL firing on every reaching call) over the
+corpus on both channels:
+
+| probe | `vl check` | `--codegen` |
+|---|---:|---:|
+| the site reached — CONTROL | 50 | 50 |
+| **the tree and the string DISAGREE** | **1** | **1** |
+| the root is -1 (`tsPop` on an empty stack) | 0 | 0 |
+
+The one file is `tests/cases/modules/as-cast-alias/`, and the reason is the finding: **the module
+merge renames a non-entry module's declarations to `Name$mN`, and `$` is not an identifier
+character.** `type Count = Base` became `type Count$m1 = Base$m1`, the scanner's identifier run hit
+`$`, and the alias stopped being a plain reference. The tree's `TS_NAME` does not care — a rename
+edits a node's TEXT, not its KIND.
+
+That divergence is inert on that file. It is not inert in general, and hand-built witnesses show
+what it cost:
+
+| shape, declared in a NON-ENTRY module | master | this branch |
+|---|---|---|
+| `type MyCat = Cat` (a struct alias) | **`emitProgram: ref valtype with no interned shape`** | runs |
+| `type BoxI = Box<i32>` (a generic application) | **same emit error** | runs |
+| `type Both = {a:i32} & {b:i32}` (the EXCLUSION) | runs, opaque | runs, opaque |
+| the identical two aliases in the ENTRY module | runs | runs |
+
+`declaredTyOfName` needs `cPlainAliasNames` for exactly one population — *an OBJECT member reached
+through a plain alias REFERENCE* — so the transparency collapse #1122 established for single files
+was silently lost at every module boundary. The primitive-member case (`type Id = i32`) collapses by
+a different rule and hid it. **A destringify route that is advertised as a refactor turned out to be
+the fix for two multi-module defects, because a hand-written scanner did not know about a name the
+compiler's own merge produces.** Pinned by `tests/cases/modules/plain-alias-ref-renamed/`, which
+carries the entry-module control that makes it a RENAME finding rather than an alias one.
+
+**`TS_NULL` is in the accepted set on purpose.** `type X = null` renders as four identifier
+characters, so the scanner answered true; the tree can tell. Dropping it would be a tightening
+dressed as a dedup — the pass-0a lesson of D-BRACEDOWN, in the other direction. Its consequence is
+**measured inert** and graded below rather than assumed.
+
+### (E) — TWO OF THE RECORD'S THREE DECLINES ARE MISCLASSIFIED, AND ONE OF THEM IS A COMPLETE HOME
+
+D-MAPSPELL declined group (E) as "the ARROW-relative close, already declined in place by
+D-PARENHOME". Reading the whole conjunction rather than the character the census matched:
+
+* **`nameToTyReal`'s function-type arm was `isTopLevelFuncTypeName` WRITTEN OUT.**
+  `arrowAt >= 1 && nameIsParenOpen(name) && name[arrowAt - 1] == ')'` is that predicate's body,
+  character for character, same order, same short-circuits — thirty lines below the home, in the
+  same file, which the same function already calls twice. Not a grammar site wanting a paren home;
+  a **complete home duplicated**, which is the duplication rule's clearest case. Routed; the arm
+  reads the predicate's own `funcArrowAt` bank (D-ARROWBANK), so the arrow walk still runs once.
+* **`canonEmitNameAt`'s paren-result tail is not "CLOSE-ONLY".** `nameIsParenOpen`'s header lists it
+  among the four spellings that must never route to the span, on the grounds that it has "no opener
+  test at all". It has had one since #1190: its other conjunct is `isTopLevelFuncTypeName`, whose
+  second line IS `nameIsParenOpen`. Routed to `nameIsParenSpanEnds`, with the span placed FIRST —
+  the order is load-bearing for the bank, not for the answer, because putting a CALL between
+  `isTopLevelFuncTypeName`'s return and the `funcArrowAt` read is exactly what the bank's contract
+  asks callers not to do.
+* Only `isTopLevelFuncTypeName`'s own line survives, and it is a HOME body. **Group (E) is 3 → 0.**
+
+**And the mis-route was measured, not assumed.** Routing the `nameToTyReal` arm to
+`nameIsParenSpanEnds` — the plausible reading, and the one the home's header exists to forbid —
+**moves 55 corpus files**. The ARROW-relative/SPAN distinction is worth 55 files, not a paragraph.
+
+### THE DECLINES, WITH THEIR MEASUREMENTS
+
+* **(D) `nameNeedsCanon`'s 12 — DECLINED, accepting #1224's argument with a citation.** Re-derived
+  and it holds: this is a CONTAINS-scan ("does any character anywhere start a construct canon
+  rewrites"), every home in this program is an ENDPOINT test or a CUT, and its single caller is
+  canon's own fast path over names canon itself synthesises — so there is no spelling ROOT to ask
+  either. Its terminal form is D-PARSETY, not a grammar home. The brief filed lines 6157/6161/6165
+  as "leading/trailing char classification"; they are the interior of this scan.
+* **(F) the `!` NEGATION prefix, 2 — DECLINED, with the measurement and a sharper reason than the
+  record's.** Tree-wide there are exactly **two** name-shape `'!'` tests, both in this file
+  (`nameToTyReal`'s arm, which also CUTS with `name.slice(1, …)`, and `canonEmitNameAt`'s bail).
+  D-MAPSPELL called them "a name is a name" residue; that is not right — `!A` is a composite type
+  and one of the two sites decomposes it. The honest decline is the POPULATION: a home for two
+  callers in one file buys a name, not a deduplication. It is the smallest remaining candidate in
+  the file and worth a home the moment a third site appears.
+* **`recordClonedNodeTy`'s `name[0] == '=' && name[1] == '>'` — NOT a route, and the brief's warning
+  is confirmed.** A source function type has its arrow at a POSITIVE index; index 0 is the
+  monomorphized-closure pin whose `tyName` column holds an ABI key. Already classified as an emitter
+  SENTINEL by #1224's census, and it stays there.
+
+### THE DEFECT — WHY NEITHER HORN OF THE QUESTION IS THE ANSWER
+
+#1225 filed: assigning to a nullable global permanently narrows it, so the guarded spelling then
+fails. **The home claim is CONFIRMED** — `typecheck.vl`, one line:
+`declare(asgTgt.identName, nonNullTy(asgCur))`. **The scope claim is REFUTED.** Eight witnesses,
+built before anything was changed:
+
+| witness | master |
+|---|---|
+| the filed repro, module scope | `cannot compare {n: i32}[] with null` |
+| **the identical shape inside a FUNCTION BODY** | **the same error** |
+| `xs = null` after the narrowing | `cannot assign null to {n: i32}[]` |
+| a FUNCTION declared later assigning null to the global | the same |
+| assignment inside a BRANCH, guard after | **works** — the branch scope unwinds |
+| `i32 \| null`, `S \| null` | the same error — not array-specific |
+| `let xs: S[] = []` then `xs != null`, no narrowing anywhere | **the same error** |
+
+The narrowing is a bare-NAME narrowing, and in this checker those are a shadowing `declare` into a
+scope the caller PUSHED for the branch (`applyNarrows`) which `popScope` takes away. The assignment
+narrowing uses the same `declare` with **no scope of its own** — so in the scope that holds the
+declaration it does not shadow the binding, it REPLACES it. That is the whole defect, and it is
+neither of the two answers offered:
+
+1. **"Post-assignment narrowing is correct; the bug is that `!= null` on a non-nullable is an error
+   rather than warning-plus-true."** The rule is right and its INPUT was wrong. Witness 7 fires that
+   rule with no narrowing anywhere, on a binding declared `S[]`, where rejecting a guard that can
+   never be false is a defensible rule the corpus relies on — so relaxing it universally is a
+   different, larger change. And it does not fix witnesses 3 and 4 at all: reaching those through
+   this horn would require making `null` assignable to a non-nullable type, which is a soundness
+   hole, not a diagnostic change.
+2. **"Module-scope assignment should not narrow at all, since any later statement could reassign."**
+   Witness 2 kills the scope carve-out (a function body has the identical failure), witness 5 shows
+   the branch discipline is already right, and dropping the narrowing loses the pattern it exists
+   for — `let x: T | null = null` / `x = mk()` / `x.f`, which is straight-line and same-scope by
+   construction.
+
+**The answer is that the narrowing is correct as a FACT and wrong as a DECLARATION.** The declared
+type is the binding's STORAGE contract, and exactly two questions must keep asking it: what the
+binding ACCEPTS, and whether a null TEST is meaningful. Reads keep the narrowed type. A per-scope
+sidecar (`asgDeclKeys`/`asgDeclTys`, unwound by `popScope` like the two overlays beside it) banks the
+declared type; the null test is legal when the operand is a name that sidecar knows, and a null
+write is checked against the declaration and then **un-narrows** the binding, because a path fact
+must not outlive its path.
+
+**THE UN-GATED FORM WAS BUILT FIRST AND THE FIXPOINT CAUGHT IT.** Asking the declaration for EVERY
+assignment (not only null-bearing ones) accepts the same programs and **re-compiled the compiler's
+own frozen source 12 bytes smaller** — same verdicts, different contextual coercions inside
+`assignableExpr`. The 1,508-file corpus A/B read 0 against it. Gating on a null-bearing right-hand
+side — which is exactly the set the narrowing refused, since the narrowed type is
+`nonNullTy(declared)` — restores byte-identity and leaves every program that compiles today on its
+exact current path.
+
+**What the fix does NOT reach, filed with witnesses.** A `T[] | null` global started as `[]` gets a
+LIST rep (#1225), so a nested function storing null into it emits invalid wasm — **on master too,
+reachable there without any narrowing at all** (`let xs: S[] | null = []` + `function c() { xs = null }`,
+identical failure both sides). The checker's rejection was accidental cover, not a guard. And a
+SCALAR nullable narrowed then guarded (`i32 | null`, `f64 | null`) now reaches
+`emitProgram: bare null needs a struct-typed context` where master said `cannot compare i32 with
+null`: both reject, rc 1 either way, and master's message named a type the user did not write. The
+REF families (`S[] | null`, `i32[] | null`, `string | null`, `S | null`) compile and run.
+
+### ENTOMBMENT — THIRTEEN SABOTAGES, EACH A WHOLE COMPILER
+
+Each swept over all 1,508 master corpus files at five channels (check rc + diagnostic text, build
+rc, **wasm sha256**, run rc, **run stdout**), with this slice's four new fixtures counted separately.
+
+| sabotage | corpus | fixtures |
+|---|---:|---:|
+| **CONTROL** (pristine branch) | **0** | **0** |
+| S1 `aliasRefIsPlainRoot` always false | 6 | 2 |
+| S2 drops `TS_APP` | 4 | 2 |
+| S3 drops `TS_NULL` | **0** | **0** |
+| S4 accepts every kind but `TS_ERR` | 2 | 2 |
+| S5 pass 0a reads member 1 instead of 0 | 6 | 2 |
+| **S6 the func-type arm routed to the SPAN instead of the home** | **55** | 0 |
+| S7 `canonEmitNameAt`'s tail conjunct dropped | **0** | **0** |
+| S8 the declared-type sidecar always answers -1 | 0 | 1 |
+| S9 the null-TEST half removed | 0 | 1 |
+| S10 the null-WRITE half removed | 0 | 1 |
+| S11 the un-narrow restore removed | **0** | **0** |
+| S12 the bank's idempotence guard removed | **0** | **0** |
+| S13 the sidecar's scope unwind removed | **0** | **0** |
+
+S8/S9/S10 read 0 on the corpus **by construction**: this fix only changes programs master rejected,
+so the corpus cannot witness it and the fixtures are the entombment. S8's fixture output is the
+defect in full — four `cannot compare … with null` and one `cannot assign null to {n: i32}[]` from
+one file.
+
+**FOUR ZEROS, GRADED, AND TWO OF THEM BECAME FIXTURES.**
+
+* **S11 (the un-narrow restore) is a SOUNDNESS conjunct with no corpus witness.** Built by hand:
+  `v = {n:7}` / `v = null` / `v.n` type-checks **clean** without it and **traps at runtime**
+  (`wasm trap: null reference`); with it, a clean `member access '.n' on non-object`. That is the
+  difference between a diagnostic and a miscompile, decided by nothing in 1,508 files →
+  `tests/cases/types/assign-narrow-restore-on-null-write.vl`.
+* **S13 (the scope unwind) is observable across SIBLING scopes.** A narrowed `v` in one function and
+  a non-nullable `v` in the next: without the unwind the bank leaks, the second guard is silently
+  accepted, and the file compiles clean and dies in the emitter → folded into
+  `null-guard-on-non-nullable-rejects.vl`, which now pins two decisions.
+* **S12 (the bank's idempotence guard) is defensive and cannot currently fire**, and the reason is
+  recorded at the site rather than left as a zero: its only caller runs under `asgCt is TyNullable`,
+  which the narrowing itself falsifies, and the one path that re-enters would re-bank an identical
+  value.
+* **S3 (`TS_NULL`) has no witness on any channel.** Three shapes were built (`type Nul = null` bound
+  directly, as a union member, as a parameter) and all three read IDENTICAL between the control and
+  the sabotage — because every program that would exercise it dies first in an unrelated emit gap
+  (`bare null needs a struct-typed context`). The conjunct is exactness-preserving by construction
+  (master's scanner answered true for the four characters `null`), costs one compare, and dropping
+  it would be a tightening with no evidence either way. Recorded, not asserted.
+* **S7 reads 0 and two hand-built curried-function-type annotations** (`(i32) => ((i32) => i32)`,
+  and the same with a literal-union parameter) **also read 0.** The zero is about that ARM's
+  population, not about the routing, which is exact by argument. Reported rather than dressed up.
+
+### COUNTS — ALL THREE UNITS
+
+* **UNIT A, character-grammar tests in `typecheck.vl`: 134 → 119 (−15).** The debt column goes
+  **30 → 15**, and of the 15 that remain, 12 are the CONTAINS-scan no home can serve, 2 are the `!`
+  prefix, and 1 is a home body. **Hand-written copies: 1 function DELETED, 2 sites routed.**
+* **UNIT B, named calls, tree-wide and comment-stripped:** `isTopLevelFuncTypeName` 12 → 13,
+  `nameIsParenSpanEnds` 9 → 10, `udTsRootAt` 3 → 4, `tsKind` 8 → 9, `aliasRefIsPlainRoot` 0 → 1;
+  `nameIsParenOpen` 11 → 10, `topLevelArrowIndex` 2 → 1, `annGenAppSpanEnds` 6 → 5,
+  `aliasRefIsPlainName` 1 → **0 (deleted)**. Net **+1**, and the flatness is the point: the
+  headline route replaces a resolver call with an ARENA READ, so a metric that counts named
+  resolver calls cannot see the largest change in the slice. (`scripts/parsercount.py` is not in
+  the tree, so the CORE-list number could not be taken; this is the same caveat D-MAPSPELL
+  recorded when it homed a net-new grammar.)
+* **Binary 1,038,973 → 1,039,984 B (+1,011).** Split: the destringify half alone is **−197 B** (a
+  13-test scanner becomes a three-line arena read), the defect fix **+1,208 B** (a third per-scope
+  sidecar and two checks). One file changed, so the delta needs no attribution.
+
+### GATE
+
+Every exit code taken bare (`cmd > log 2>&1; rc=$?`), never after a pipe.
+
+| leg | rc | result |
+|---|---:|---|
+| `fetch-seed.sh` (freshly fetched, published) | 0 | 1,038,994 B, sha `a699ea1a…` — one push STALE (it predates #1228), which the script documents as fine. Master's own fixpoint at `e3d8786` was computed FROM it and verified self-reproducing: **1,038,973 B, sha `89ae234f…`** |
+| `refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint at 2 compiles, 1,039,984 B |
+| `native-fixpoint.sh` | 0 | stage3 == stage4, 1,039,984 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,222 passed / 0 failed / 8 ignored** — master's 3,214 + 2 per new case × 4; **8** ignored, not 14, so the six `vl build -O` tests really ran |
+| `lint-self.sh` (incl. `vl fmt --check`) | 0 | clean |
+| `rep-fuzz-check.sh` | 0 | exact — 1 baselined (0 unsound / 1 reject), 0 new / 0 stale |
+| corpus A/B vs master, 5 channels, 1,512 files | 0 | **0 build-status, 0 wasm-sha256, 0 diagnostic-text, 0 run-status, 0 run-stdout diffs** |
+| fuzz A/B, PINNED seeds 1–7 × depths 4–6 × 200 × {plain, declared} | 0 | 8,400 programs/side; out-dir trees byte-identical |
+| strongest proof: candidate compiles FROZEN master source | 0 | `89ae234f…` — **byte-identical to master's own output** |
+
+The sabotage matrix and the census were taken at `fe4e256`; #1228 does not touch `typecheck.vl`, and
+every gate leg above was re-run on the rebased tree.
+
+### REFUTED
+
+1. **"`6157`/`6161`/`6165` — leading/trailing char classification."** They are the interior of
+   `nameNeedsCanon`'s CONTAINS-scan, group (D), which #1224 declined with an argument that survives
+   re-derivation.
+2. **"`7110` (`c != '<'`)" is not a site of its own.** It is inside `aliasRefIsPlainName`, and it
+   closes because the whole function does.
+3. **D-MAPSPELL's group (E), "the ARROW-relative close, 3 DECLINED", misclassified 2 of its 3.** One
+   is a complete home written out twice; the other's opener is established by its own left conjunct.
+4. **`nameIsParenOpen`'s header, "CLOSE-ONLY … no opener test at all"** — stale since #1190.
+5. **#1225's "mutually exclusive at MODULE SCOPE"** — the identical failure occurs inside a function
+   body. Its home claim (`typecheck.vl`) is confirmed.
+6. **"A destringify route is a refactor."** This one is a WIDENING that fixes two multi-module
+   defects, because the merge writes `$` into a name and the scanner's identifier run rejects it.
+7. **My own first fix.** Asking the declaration for every assignment, not only null-bearing ones,
+   read 0 against a 1,508-file five-channel corpus A/B and still moved the compiler's own codegen by
+   12 bytes.
+
+### HAND-OFFS
+
+* **`emit_rep.vl:1299`'s comment still names `aliasRefIsPlainName`** (deleted here). Comment-only,
+  and that file was outside this partition.
+* **A nested function storing null into a `T[] | null` global started as `[]` emits invalid wasm**,
+  on master and here. Witness: `let xs: S[] | null = []` + `function c() { xs = null }`. Emit-side,
+  #1225's storage-class family.
+* **A SCALAR nullable narrowed then guarded** (`i32 | null`, `f64 | null`) reaches
+  `emitProgram: bare null needs a struct-typed context`. The un-narrowed spelling of the same
+  program runs, so the emitter's global-storage choice is following the CHECKER's narrowed type.
+* **`type Nul = null` as a union member does not narrow.** `function f(x: S | Nul)` rejects
+  `if x != null { return x.n }` with "field 'n' is not on every member", while the identical
+  `S | null` runs. Both sides of this branch; unrelated to it.
+
+### LESSONS
+
+* **A route that changes an ANSWER is not a refactor, and the probe is how you find out.** The
+  divergence probe cost one build and read 1/1,502 — a single corpus file, inert on every output
+  channel. Chasing that one row to a hand-built witness turned "a tidy dedup" into "two
+  multi-module defects fixed". A slice that had only run the corpus A/B (0 diffs, both halves)
+  would have shipped the fix without knowing it had one.
+* **Grep the PRODUCER of the name, not just the consumer.** Everything above follows from
+  `driver.vl` writing `Name$mN`. A character scanner over type names is only as correct as its
+  model of who writes those names, and the compiler writes some of them itself.
+* **The fixpoint sees what the corpus cannot.** A five-channel A/B over 1,508 files read 0 for a
+  checker change that moved the compiler's own output by 12 bytes. The corpus samples programs; the
+  fixpoint samples the one program with 19,000 lines of annotations.
+* **Read the whole conjunction, not the character the census matched.** Two of this file's three
+  "ARROW-relative" declines were a complete-home duplicate and a conjunct-established close. A
+  census keyed on characters will keep filing both under the character.
+* **Grade a zero by trying to break it, not by looking at it.** Four sabotages read 0/1,508. One was
+  a soundness conjunct whose absence traps at runtime, one was observable across sibling scopes, one
+  was genuinely unreachable, and one was a thin arm. Only building the witness told them apart.
