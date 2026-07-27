@@ -111,6 +111,7 @@ import {
   TS_LITNUM,
   TS_LITSTR,
   TS_MAP,
+  TS_NAME,
   TS_NEG,
   TS_NULL,
   TS_OBJ,
@@ -547,6 +548,73 @@ let tyToStrDepth = 0
 // the IfStmt arm), with per-scope frame marks like the path overlay's.
 let pgKeys: string[] = []
 let pgFrames: i32[] = []
+
+// ASSIGNMENT-NARROWED bindings: name → the type it was DECLARED with, before a
+// straight-line `x = e` narrowed it. Per-scope frame marks like the two overlays
+// above, so `popScope` unwinds a scope's entries with the narrowings themselves.
+//
+// WHY THIS EXISTS AT ALL (#1225's defect, re-derived). A bare-NAME narrowing in
+// this checker is a shadowing `declare` into a scope the caller PUSHED for the
+// branch (`applyNarrows`), and `popScope` takes it away again. The assignment
+// narrowing uses the same `declare` with NO scope of its own — so it does not
+// shadow the declaration, it OVERWRITES it, in the very scope that holds it. The
+// narrowing is a correct FLOW fact and the overwrite is what is wrong with it:
+// the declared type is the binding's STORAGE contract, and two questions must
+// keep asking it after a narrowing, or a legal program stops compiling —
+//
+//   * what the binding ACCEPTS. `let xs: S[] | null = []` / `xs = [{n:1}]` /
+//     `xs = null` rejected "cannot assign null to {n: i32}[]", and a FUNCTION
+//     declared afterwards could not assign null to the global either: the
+//     narrowed type was what its body's `lookup` found.
+//   * whether a null TEST is meaningful. `if xs != null` rejected "cannot
+//     compare {n: i32}[] with null", which is how the defect was filed.
+//
+// Reads keep the narrowed type — that is the whole point of narrowing, and the
+// straight-line `let x: T | null = null` / `x = mk()` / `x.f` pattern depends on
+// it. Only the two questions above are re-pointed at the declaration.
+let asgDeclKeys: string[] = []
+let asgDeclTys: i32[] = []
+let asgDeclFrames: i32[] = []
+
+// The DECLARED type of an assignment-narrowed name, or -1 when the name has not
+// been narrowed by an assignment in any live scope (innermost-last wins, matching
+// the scope chain the narrowing itself rides).
+function asgDeclaredTy(name: string) {
+  let i = asgDeclKeys.length - 1
+  while i >= 0 {
+    if asgDeclKeys[i] == name { return asgDeclTys[i] }
+    i = i - 1
+  }
+  -1
+}
+
+// Bank `name`'s declared type before an assignment narrowing shadows it. Idempotent
+// within a scope: a second `x = e` must not re-bank the ALREADY-NARROWED type as
+// the declaration.
+//
+// THE GUARD IS DEFENSIVE AND MEASURED INERT — 0 corpus rows and 0 fixture movement
+// when it is removed — and the reason is worth stating so the next reader does not
+// take the zero for coverage. The only caller runs under `asgCt is TyNullable`, and
+// the narrowing it is banking for makes the binding NON-nullable, so a second
+// straight-line assignment cannot re-enter. The one path that can is a null write
+// restoring the declaration and another `x = e` after it, and there the value
+// re-banked would be identical to the one already held. Both readings agree today;
+// the guard is what keeps them agreeing if that gate ever widens.
+function noteAsgNarrow(name: string, declTy: i32) {
+  if asgDeclaredTy(name) >= 0 { return 0 }
+  asgDeclKeys.push(name)
+  asgDeclTys.push(declTy)
+  0
+}
+
+// True when `ix` is a bare NAME that an assignment narrowed away from a declared
+// type — i.e. a place whose STORAGE can still hold null even though its current
+// flow type cannot. The null-TEST legality question, and nothing else.
+function isAsgNarrowedName(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Ident { return asgDeclaredTy(n.identName) >= 0 }
+  false
+}
 
 // INFERRED TYPE-GUARD functions (A6b, host `guards`): a named function whose
 // body is exactly `return <null-test-on-a-param>` becomes a guard — calling it
@@ -1289,7 +1357,7 @@ let cUnionNames: string[] = []
 // alias from a canonicalized object INTERSECTION (`type AB = {a} & {b}`, also a one-member
 // union over one `TyObj`) — only the spelling can. The intersection's merged shape must keep
 // its alias NAME (the emitter interns it as a named struct via `unionStructAliasShape`);
-// a plain alias-reference must be TRANSPARENT instead (see `aliasRefIsPlainName`).
+// a plain alias-reference must be TRANSPARENT instead (see `aliasRefIsPlainRoot`).
 let cPlainAliasNames: string[] = []
 // Litunion alias PROVENANCE (rep-rewrite Stage B, b1). The narrowing/join/
 // intersection algebra re-mints a declared litunion alias as a fresh arena
@@ -1971,6 +2039,9 @@ export function initChecker() {
   tyToStrDepth = 0
   pgKeys = []
   pgFrames = []
+  asgDeclKeys = []
+  asgDeclTys = []
+  asgDeclFrames = []
   guardNames = []
   guardParamIdxs = []
   guardThens = []
@@ -3107,6 +3178,7 @@ function pushScope(owner: i32) {
   constScopes.push(Map())
   npFrames.push(npKeys.length)
   pgFrames.push(pgKeys.length)
+  asgDeclFrames.push(asgDeclKeys.length)
   if symEnabled != 0 {
     symDeclScope.push(Map())
     pushScopeSpan(owner)
@@ -3133,6 +3205,14 @@ function popScope() {
     const pbase = pgFrames[pgFrames.length - 1]
     pgFrames.pop()
     while pgKeys.length > pbase { pgKeys.pop() }
+  }
+  if asgDeclFrames.length > 0 {
+    const abase = asgDeclFrames[asgDeclFrames.length - 1]
+    asgDeclFrames.pop()
+    while asgDeclKeys.length > abase {
+      asgDeclKeys.pop()
+      asgDeclTys.pop()
+    }
   }
   if symEnabled != 0 {
     if symDeclScope.length > 0 { symDeclScope.pop() }
@@ -5722,10 +5802,23 @@ function nameToTyReal(name: string) {
     // A FUNCTION TYPE `(params)=>ret` (the parser's synthetic name for `(i32) => i32`):
     // the leading `(...)` is the param list, then `=>`, then the return atom. Build a
     // `TyFunc` so a function-typed binding/param/field type-checks (call arity + types).
-    const arrowAt = topLevelArrowIndex(name)
-    // OPEN half routed to the home; the CLOSE test is ARROW-relative and stays inline
-    // (see `isTopLevelFuncTypeName` above — the last character belongs to the RETURN).
-    if arrowAt >= 1 && nameIsParenOpen(name) && name[arrowAt - 1] == ')' {
+    // THE WHOLE PREDICATE, at the home 700 lines above (D-ALIASREF). This was
+    // `arrowAt >= 1 && nameIsParenOpen(name) && name[arrowAt - 1] == ')'` — an
+    // arrow scan, a routed OPEN half and an inline ARROW-relative CLOSE, which is
+    // `isTopLevelFuncTypeName`'s body character for character, in the same order,
+    // with the same short-circuits. The census that reached this site through the
+    // `')'` character classified it as the ARROW-relative close family and declined
+    // it beside `emit_base.annFnDecompose`; it is not a grammar site wanting a
+    // paren home at all, it is a COMPLETE home written out twice in one file — the
+    // duplication rule's clearest case, and the reason to look at the whole
+    // conjunction rather than at the character the census matched.
+    //
+    // `funcArrowAt` is the predicate's own bank (D-ARROWBANK), read IMMEDIATELY:
+    // the recursion below is `nameToTy`, which reaches `isTopLevelFuncTypeName`
+    // again and overwrites it. One `topLevelArrowIndex` walk still runs, exactly as
+    // before — it moved inside the predicate.
+    if isTopLevelFuncTypeName(name) {
+      const arrowAt = funcArrowAt
       const paramsStr = name.slice(1, arrowAt - 1)
       const retStr = name.slice(arrowAt + 2, name.length)
       const ptys: i32[] = []
@@ -7071,52 +7164,48 @@ function unionAliasMembers(name: string) {
   ""
 }
 
-// True if the one-member alias BODY `spell` is a bare type NAME (`Cat`, `i32`) or a generic
-// APPLICATION (`Box<i32>`, `Pair<i32,string>`) — the two spellings that make `type N = spell`
-// a plain alias REFERENCE. Everything else a one-member `UnionDecl` can carry is excluded, and
-// each exclusion is load-bearing: an inline shape / object INTERSECTION (`{a:i32}&{b:i32}`,
-// `A & B`) must keep its alias name (the emitter interns it as a named struct through
-// `unionStructAliasShape` — expanding it would lose that registration), while a list / map /
-// function-type / literal body (`i32[]`, `(i32) => i32`) is left exactly as master had it
-// (those are rejected in the CHECKER today — a clean error, not a miscompile — so widening
-// them is a separate change with its own evidence).
-function aliasRefIsPlainName(spell: string) {
-  if spell.length == 0 { return false }
-  const c0 = spell[0]
-  const isAlpha0 = (c0 >= 'a' && c0 <= 'z') ||
-    (c0 >= 'A' && c0 <= 'Z') ||
-    c0 == '_'
-  if !isAlpha0 { return false }
-  // The head must be an identifier run; it ends at either the end of the string (a bare
-  // name) or the generic application's `<` (whose argument list must then close the WHOLE
-  // spelling — `Box<i32>[]` ends in `]` and is NOT a plain reference).
-  let i = 1
-  while i < spell.length {
-    const c = spell[i]
-    const identCh = (c >= 'a' && c <= 'z') ||
-      (c >= 'A' && c <= 'Z') ||
-      (c >= '0' && c <= '9') ||
-      c == '_'
-    if !identCh {
-      // The run ended on something other than an identifier character: only a `<` can
-      // continue a plain reference, and then the GENERIC-APPLICATION SPAN at its home below
-      // decides whether its argument list closes the WHOLE spelling. Routing the tail test
-      // there is exact, not merely similar: everything before `i` is an identifier character
-      // and so cannot be a `<`, which makes `gaeLtAt(spell) == i`, and `i >= 1` makes it
-      // positive — so the home's two extra conjuncts are already established here, and its
-      // `n < 3` reject only fires where this test's own `spell[1] == '<' != '>'` already
-      // answered false. It re-scans for the `<` this loop just found; that costs one bounded
-      // pass, on an alias body that already ended in `>`.
-      if c != '<' { return false }
-      return annGenAppSpanEnds(spell)
-    }
-    i = i + 1
-  }
-  true
+// True if the one-member alias BODY at SPELLING ROOT `root` is a bare type NAME (`Cat`,
+// `i32`, `null`) or a generic APPLICATION (`Box<i32>`, `Pair<i32,string>`) — the two
+// spellings that make `type N = …` a plain alias REFERENCE. Everything else a one-member
+// `UnionDecl` can carry is excluded, and each exclusion is load-bearing: an inline shape /
+// object INTERSECTION (`{a:i32}&{b:i32}`, `A & B`) must keep its alias name (the emitter
+// interns it as a named struct through `unionStructAliasShape` — expanding it would lose
+// that registration), while a list / map / function-type / literal body (`i32[]`,
+// `(i32) => i32`) is left exactly as master had it (those are rejected in the CHECKER
+// today — a clean error, not a miscompile — so widening them is a separate change with its
+// own evidence).
+//
+// **THIS ASKS THE PARSER, NOT THE STRING (D-ALIASREF).** It was a hand-written
+// identifier-RUN scanner over the member's rendered spelling — 13 character-grammar tests,
+// the largest single block of them left in this file — that re-derived "bare identifier, or
+// identifier then `<…>` closing the whole spelling" from characters the parser had just
+// concatenated. `parseVariantName` banks each member's spelling ROOT on the `UnionDecl`
+// (D-PARSETY P2, `udTsRootAt`), so the question is one array read of what the parser
+// actually saw. The owner's rule names this exact shape: *a name is a name, but a parsable
+// type? no.*
+//
+// **`TS_NULL` is in the accepted set, and that is the routing being EXACT rather than a
+// tightening dressed as a dedup.** `type X = null` renders as the four identifier
+// characters `null`, so the character scanner could not tell it from a type NAME and
+// answered true; the tree can, and answers `TS_NULL`. Dropping it here would silently make
+// one alias shape opaque — the pass-0a lesson from D-BRACEDOWN, in the other direction.
+// (`TS_ERR` is NOT accepted: its spelling is `""`, which the scanner's `length == 0` guard
+// already rejected, so the two agree.)
+//
+// A root of -1 (`tsPop` on an empty stack) answers false. Every arm of `parseTypeAtom`
+// finishes a node — including its `expect("IDENT")` recovery arm, which pushes `TS_ERR`
+// precisely so a malformed annotation still leaves exactly one root — so this is
+// unreachable from the parser as written, and measured 0/1,502 on the corpus; false is the
+// conservative answer either way (an alias that is not transparent is the pre-D-PARSETY
+// default and cannot mis-resolve a program that compiles).
+function aliasRefIsPlainRoot(root: i32) {
+  if root < 0 { return false }
+  const k = tsKind[root]
+  k == TS_NAME || k == TS_APP || k == TS_NULL
 }
 
 // True if `name` is a one-member `type N = A` alias whose body is a plain type reference
-// (`aliasRefIsPlainName`, recorded syntactically in pass 0a).
+// (`aliasRefIsPlainRoot`, recorded syntactically in pass 0a).
 function isPlainAliasRef(name: string) {
   let i = 0
   while i < cPlainAliasNames.length {
@@ -7756,11 +7845,26 @@ function canonEmitNameAt(name: string, ctx: i32) {
   // the param list and the (paren-stripped) result, re-render with the result's grouping
   // parens. A simple `(i32) => i32` ends in its return type (not `)`), so it never reached the
   // strip above and falls through unchanged — this only re-canonicalizes the nested form.
-  if isTopLevelFuncTypeName(name) && name[name.length - 1] == ')' {
+  //
+  // The tail test is the PAREN grammar's SPAN half at its home, and THAT ROUTING REFUTES
+  // THE HOME'S OWN CLASSIFICATION of this site (D-ALIASREF). `nameIsParenOpen`'s header
+  // lists "CLOSE-ONLY (`canonEmitName`'s paren-result arm) — no opener test at all" as one
+  // of the four spellings that must NOT route to the span. It has had one since #1190: the
+  // OTHER conjunct is `isTopLevelFuncTypeName`, whose second line is `nameIsParenOpen`, so
+  // the span's opener half is not an added test — the conjunction is exactly what the
+  // hand-written `isTopLevelFuncTypeName(name) && name[name.length - 1] == ')'` decided, on
+  // every input, and the routing is exact rather than similar.
+  //
+  // THE SPAN GOES FIRST, and the order is load-bearing for the BANK below, not for the
+  // answer (both operands are pure). The span is two character reads and rejects every
+  // non-parenthesized name before the arrow WALK runs; putting it second would also put a
+  // CALL between `isTopLevelFuncTypeName`'s return and the `funcArrowAt` read, which is
+  // exactly what the bank's contract asks callers not to do.
+  if nameIsParenSpanEnds(name) && isTopLevelFuncTypeName(name) {
     // The arrow index the guard above just scanned for, not a second scan of the same
     // name for the same position (D-ARROWBANK). Nothing runs between the predicate's
-    // return and this read: the `&&` right operand is a plain index compare, so the
-    // bank cannot have been overwritten by another `isTopLevelFuncTypeName` call.
+    // return and this read — it is the LAST conjunct of the guard — so the bank cannot
+    // have been overwritten by another `isTopLevelFuncTypeName` call.
     const fa = funcArrowAt
     const psStr = name.slice(1, fa - 1)
     let out = "("
@@ -12110,9 +12214,16 @@ function checkProgramNode(n: Program) {
       // intersection) and both readers run later. A self-cycle (`type D = D`) is excluded:
       // it is the degenerate never-type pass 0b reports on, and resolving it transparently
       // would chase its own placeholder.
+      //
+      // SYNTACTIC is now literal: the shape question goes to the member's SPELLING ROOT
+      // (D-PARSETY P2's `udTsRootAt`), not to a re-scan of the member's rendered name. The
+      // self-cycle exclusion stays a NAME compare — `type D = D` is about the identifier,
+      // which is what `TS_NAME`'s text holds and what the declaration is keyed by.
       const uvs0 = sd0.udVariants
       if uvs0.length == 1 && uvs0[0] != sd0.udName {
-        if aliasRefIsPlainName(uvs0[0]) { cPlainAliasNames.push(sd0.udName) }
+        if aliasRefIsPlainRoot(udTsRootAt(stmts[t0], 0)) {
+          cPlainAliasNames.push(sd0.udName)
+        }
       }
       const members0: i32[] = []
       const uIx0 = mkUnionTy(members0)
@@ -17305,8 +17416,39 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
         }
       }
     }
-    if !assignableExpr(n.binRight, rt, lt) {
-      tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(lt), ix)
+    // WHAT A BINDING ACCEPTS IS ITS DECLARED TYPE, NOT ITS CURRENT FLOW TYPE.
+    // An earlier assignment may have NARROWED this name (the block below), and a
+    // narrowing must never shrink what the storage can hold — `let xs: S[] | null`
+    // / `xs = [{n:1}]` / `xs = null` rejected the third line as "cannot assign null
+    // to {n: i32}[]", and a function declared after the narrowing could not assign
+    // null to the global either. `asgDeclaredTy` is -1 for every binding no
+    // assignment narrowed, which is every binding on master, so this is exactly the
+    // set of programs that used to be rejected for a narrowing's sake.
+    //
+    // A MEMBER / INDEX target is unaffected: only a bare name can be narrowed.
+    //
+    // GATED ON A NULL-BEARING RIGHT-HAND SIDE, and the gate is not cosmetic. The
+    // narrowed type is `nonNullTy(declared)`, so the ONLY writes it refuses that
+    // the declaration allows are the ones carrying null — and gating on that keeps
+    // every assignment that type-checks today on its EXACT current path, including
+    // whatever contextual coercion `assignableExpr` performs against the target
+    // (an object literal coerces field-wise, a bare lambda infers its params). The
+    // un-gated form — always ask the declaration — is strictly wider, still accepts
+    // everything, and MOVED CODEGEN: it re-compiled the compiler's own frozen
+    // source 12 bytes smaller. Same verdicts, different coercions; the fixpoint is
+    // what noticed.
+    let asgLt = lt
+    if tgt is Ident {
+      const rtN = T.tys[rt]
+      let rhsNullBearing = isNullTy(rt)
+      if rtN is TyNullable { rhsNullBearing = true }
+      if rhsNullBearing {
+        const asgDcl = asgDeclaredTy(tgt.identName)
+        if asgDcl >= 0 { asgLt = asgDcl }
+      }
+    }
+    if !assignableExpr(n.binRight, rt, asgLt) {
+      tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(asgLt), ix)
     }
     // A-infer-null: a nullable binding's open inner HOLE (`let x = null`)
     // fills from the first non-null assignment (in place, so the binding
@@ -17318,18 +17460,30 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
     if asgTgt is Ident {
       const asgCur = lookup(asgTgt.identName)
       if asgCur >= 0 {
+        const rtT = T.tys[rt]
+        let rhsNullable = false
+        if rtT is TyNullable { rhsNullable = true }
+        const rhsNonNull = !rhsNullable && !isNullTy(rt) && rt >= 0
         const asgCt = T.tys[asgCur]
         if asgCt is TyNullable {
-          const rtT = T.tys[rt]
-          let rhsNullable = false
-          if rtT is TyNullable { rhsNullable = true }
-          if !rhsNullable && !isNullTy(rt) && rt >= 0 {
+          if rhsNonNull {
             if asgCt.nInner < 0 {
               asgCt.nInner = rt
               tyMutEpoch = tyMutEpoch + 1 // nullable inner pinned in place
             }
+            // Bank the DECLARED type before shadowing it. The narrowing itself is
+            // unchanged — reads still see the non-null type, which is what the
+            // `let x: T | null = null` / `x = mk()` / `x.f` pattern rides.
+            noteAsgNarrow(asgTgt.identName, asgCur)
             declare(asgTgt.identName, nonNullTy(asgCur))
           }
+        } else if !rhsNonNull {
+          // THE NARROWING IS A PATH FACT, AND THIS WRITE ENDS THE PATH. Storing
+          // null (or a nullable) back into a name an earlier assignment narrowed
+          // restores its declared type for the rest of the scope — otherwise the
+          // binding would stay non-null for reads that can now see a null.
+          const asgDcl2 = asgDeclaredTy(asgTgt.identName)
+          if asgDcl2 >= 0 { declare(asgTgt.identName, asgDcl2) }
         }
       }
     }
@@ -17400,6 +17554,26 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
   }
   // Equality: result bool; requires mutual compatibility.
   if op == "==" || op == "!=" {
+    // A NULL TEST ASKS ABOUT THE STORAGE, AND AN ASSIGNMENT NARROWING DOES NOT
+    // CHANGE THE STORAGE. `let xs: S[] | null = []` / `xs = [{n:1}]` /
+    // `if xs != null { … }` rejected the guard with "cannot compare {n: i32}[]
+    // with null": the narrowing had made `xs`'s flow type non-nullable, and a null
+    // test against a non-nullable type is a hard error here — deliberately, because
+    // a guard that can never be false is a bug worth naming. The rule is right and
+    // its INPUT was wrong. The declared type still admits null, the emitter's slot
+    // still holds a nullable rep, and a later `xs = null` (accepted again, above)
+    // makes the test genuinely two-valued, so the guard is meaningful and the
+    // narrowed and guarded spellings stop being mutually exclusive.
+    //
+    // Deliberately NOT "a null test on any non-nullable is fine": `let xs: S[] = []`
+    // / `xs != null` stays the error it is, because nothing about THAT binding can
+    // ever be null. `asgDeclaredTy` is the exact difference between the two, and it
+    // is -1 for every binding no assignment narrowed.
+    if isNullTy(lt) || isNullTy(rt) {
+      if isAsgNarrowedName(n.binLeft) || isAsgNarrowedName(n.binRight) {
+        return TY_BOOL
+      }
+    }
     // CLOSED SET (literal unions): comparing a literal-union place against a
     // literal OUTSIDE its set can never be true — reject rather than compile
     // an always-false test (host: discrimination is total over the union;
