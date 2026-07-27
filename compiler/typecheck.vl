@@ -1989,15 +1989,18 @@ export function initChecker() {
   // and the difference is the whole reason both spellings exist (`__load_i8__` of the
   // byte 0xFF is -1; `__load_u8__` of the same byte is 255).
   //
-  // STORES ARE NOT DECLARED HERE and are deliberately not part of this slice — the
-  // four dead `__store_*__` declarations above stay dead (see `docs/internals/
-  // buffer-design.md` §"the smallest first slice"). A program stores i32s and reads
-  // them back at every width, which is what makes the widths measurable.
+  // THE WIDE STORE WIDTHS were declared above long before they lowered; they now do,
+  // as the exact duals of the three wide loads (`nameIsMemStoreIntrinsic`):
   //
-  // "Stay dead" no longer means SILENT, though: those four and `__log_string__` are the
-  // five names `nameIsUnimplementedIntrinsic` lists, and calling one is now a positioned
-  // CHECKER diagnostic instead of an `emitProgram: call to unknown function` that reads
-  // like a typo'd identifier.
+  //   __store_i64__ → i64.store   __store_f32__ → f32.store   __store_f64__ → f64.store
+  //
+  // The VALUE operand takes the declared width (an integer literal re-encodes at i64, a
+  // float literal at f32/f64) — unlike the ADDRESS, which is an i32 in all fourteen.
+  //
+  // `__store_string__` and `__log_string__` stay dead: they are the two names
+  // `nameIsUnimplementedIntrinsic` lists, and calling one is a positioned CHECKER
+  // diagnostic rather than an `emitProgram: call to unknown function` that reads like a
+  // typo'd identifier. Neither is a table entry away — see that comment.
   declare("__load_i8__", mkFuncTy([TY_I32], TY_I32))
   declare("__load_u8__", mkFuncTy([TY_I32], TY_I32))
   declare("__load_i16__", mkFuncTy([TY_I32], TY_I32))
@@ -2027,7 +2030,15 @@ export function initChecker() {
 // This list is the reservation; the emitter's per-name arms stay where they are because
 // each picks a DIFFERENT lowering (a dispatch, not a classification). The two must be
 // kept in step — a new inline-lowered intrinsic belongs here the same day.
-function nameIsEmitterIntrinsic(name: string) {
+//
+// EXPORTED because it is also the exact soundness condition for `capScan`'s callee-position
+// capture exemption (`emit_classify.vl`): a name whose CALL SITE the emitter rewrites before
+// looking up a declaration denotes instructions, not a value, so there is nothing to read out
+// of an enclosing frame. `emit_base.isBuiltinFnName` had been keeping a PARTIAL COPY of this
+// set for that purpose and its header filed the export as the fix; `capScan` now asks this
+// predicate directly, so a new intrinsic reserved here is exempt there the same day and the
+// two cannot drift.
+export function nameIsEmitterIntrinsic(name: string) {
   if name == "__store_i32__" { return true }
   if name == "__load_i32__" { return true }
   if name == "__log__" { return true }
@@ -2038,6 +2049,8 @@ function nameIsEmitterIntrinsic(name: string) {
   // The load-width matrix and the two memory-size ops, lowered inline the same way —
   // reserved the same DAY they acquired an emitter arm, per this comment's own rule.
   if nameIsMemLoadIntrinsic(name) { return true }
+  // The three WIDE store widths, likewise reserved the day they acquired their arm.
+  if nameIsMemStoreIntrinsic(name) { return true }
   if name == "__memory_size__" { return true }
   if name == "__memory_grow__" { return true }
   false
@@ -2058,13 +2071,33 @@ export function nameIsMemLoadIntrinsic(name: string) {
   false
 }
 
-// THE DECLARED-BUT-UNLOWERED MEMORY INTRINSICS — the five that pass `vl check` and then
-// die at emit with `emitProgram: call to unknown function`. Re-censused at this head, in
-// three call POSITIONS each (statement / value / binding), against the seventeen names
-// `defaultScope` declares: after #1170 gave the load-width matrix and `memory.size`/
-// `memory.grow` their arms, TWELVE lower and these FIVE do not.
+// The three WIDE store widths — the exact duals of `__load_i64__`/`__load_f32__`/
+// `__load_f64__`. `__store_i32__` predates them and keeps its own arm at every call
+// site, so it is deliberately NOT in this set, exactly as `__load_i32__` is not in
+// `nameIsMemLoadIntrinsic`.
 //
-//   `__store_i64__`  `__store_f32__`  `__store_f64__`   — the wide store widths
+// The narrow stores (`i32.store8` / `i32.store16`) are NOT here: `buffer-design.md`
+// §C2 spells them `store8`/`store16` because a store has no signedness, and no
+// `__store_i8__`/`__store_i16__` name is declared to lower. That is a naming decision
+// (§O2) this change does not take.
+//
+// One list, consulted by the checker's definition reservation, the emitter's dispatch,
+// the tail-value classifier, the statement `drop` suppression and the memory-usage scan
+// — so the five cannot drift.
+export function nameIsMemStoreIntrinsic(name: string) {
+  if name == "__store_i64__" { return true }
+  if name == "__store_f32__" { return true }
+  if name == "__store_f64__" { return true }
+  false
+}
+
+// THE DECLARED-BUT-UNLOWERED MEMORY INTRINSICS — the ones that pass `vl check` and then
+// die at emit with `emitProgram: call to unknown function`. Re-censused at each head, in
+// three call POSITIONS each (statement / value / binding), against the seventeen names
+// `defaultScope` declares: #1170 gave the load-width matrix and `memory.size`/
+// `memory.grow` their arms (twelve lowering, five not), and THIS change gives the three
+// wide store widths theirs. TWO remain:
+//
 //   `__store_string__`  `__log_string__`                — host-boundary string sinks
 //
 // Named here so the CHECKER says that, positioned and in the author's terms, instead of
@@ -2073,23 +2106,10 @@ export function nameIsMemLoadIntrinsic(name: string) {
 // IMPLEMENTATION is what is missing. `docs/internals/memory-gc-design.md` §1.2 filed
 // exactly that as "the half worth fixing first"; this is that half.
 //
-// The three store widths are a table entry away from working — the exact duals of
-// `__load_i64__`/`__load_f32__`/`__load_f64__` — and the lowering WAS built and measured
-// this slice (13 of 14 round-trip cells correct by VALUE). It is not shipped because one
-// shape stays broken without a line in a file this slice does not own: a wide store as a
-// function's implicit TAIL statement (`function put(a: i32, v: f64) { __store_f64__(a, v) }`)
-// emits an invalid module, because `emit_classify.stmtIsTailValue` hard-codes the void
-// intrinsics by name and does not know these three. Shipping the lowering without that
-// line would trade a clean emit REJECT for a silent invalid module, which is the wrong
-// direction. The exact diffs are filed with the PR.
-//
 // The two string sinks are NOT a table entry away: `__store_string__` would have to copy
 // a GC `(array i32)` into linear memory with no byte encoding decided, and `__log_string__`
 // is a host import the native runner does not provide. Each needs a design.
 export function nameIsUnimplementedIntrinsic(name: string) {
-  if name == "__store_i64__" { return true }
-  if name == "__store_f32__" { return true }
-  if name == "__store_f64__" { return true }
   if name == "__store_string__" { return true }
   if name == "__log_string__" { return true }
   false
@@ -9368,17 +9388,22 @@ function checkCallNode(n: Call, ix: i32) {
     }
   }
   // A memory intrinsic that is DECLARED in the default scope but has no emitter arm
-  // (`nameIsUnimplementedIntrinsic` — the five re-censused there). Reported HERE rather
+  // (`nameIsUnimplementedIntrinsic` — the two re-censused there). Reported HERE rather
   // than left to the emitter, which answers `emitProgram: call to unknown function`: a
   // message that reads like a typo'd identifier when the identifier is real and the
   // IMPLEMENTATION is what is missing. Same channel `print` of a reference uses — an
   // emitter-capability admission, positioned in the source, not a type error.
   //
-  // Gated on the program NOT declaring a function of that name. Unlike the seven names
-  // #1167 reserved, these five are NOT emitter-intercepted — the emitter has no arm for
-  // them, so `function __store_f64__(a: i32, v: f64) { … }` genuinely SHADOWS the
-  // builtin and genuinely runs today (measured). A diagnostic that fired on a user's own
-  // function would delete a working escape hatch to fix a message.
+  // Gated on the program NOT declaring a function of that name. Unlike the names
+  // `nameIsEmitterIntrinsic` reserves, these two are NOT emitter-intercepted — the
+  // emitter has no arm for them, so `function __store_string__(a: i32, s: string) { … }`
+  // genuinely SHADOWS the builtin and genuinely runs (measured). A diagnostic that fired
+  // on a user's own function would delete a working escape hatch to fix a message.
+  //
+  // The three WIDE store widths used to be here and are not any more: they acquired
+  // emitter arms, so they moved to the reservation list, and their escape hatch closed
+  // with the same motion — a `function __store_f64__(…)` definition would now never run,
+  // which is exactly what `checkNotEmitterIntrinsic` exists to say out loud.
   if cfn is Ident {
     if (
       nameIsUnimplementedIntrinsic(cfn.identName) &&
@@ -9851,11 +9876,28 @@ let annotNameMemoNegVer: {[string]: i32} = Map()
 // `a(v: nope[][])` then `b(v: bad[])`, and `a` reported `unknown type 'bad' within
 // 'nope[][]'` — the checker hoists every top-level signature in pass 1 (silently, priming
 // the negative memo) and reports in pass 2, so EVERY reported name is a memo hit.
-// Parallel ARRAYS, not a `{[string]: string}` map, and not by preference: a
-// string-valued map read coalesced with `??` AS A FUNCTION RESULT emits invalid wasm on
-// this compiler (`return m[k] ?? ""` — filed with its repro; the same read bound to a
-// local inside a function is fine, and the i32-valued sibling is fine). The list is only
-// walked on an ERROR path and holds one entry per distinct unresolvable spelling.
+// Parallel ARRAYS, not a `{[string]: string}` map, and the reason is now a SEED LADDER
+// constraint rather than a compiler defect.
+//
+// The defect is fixed: the re-initializing `annotPart = Map()` in `initChecker` used to
+// `struct.new` the shared MONO (i32-valued) map struct instead of this binding's
+// string-valued one, and the module failed to validate (`type mismatch: expected
+// (ref null $type), found (ref $type)`). The assignment boundary was the only one of six
+// that did not seed the map SHAPE; it does now. Filed as a `return m[k] ?? ""` defect —
+// the `??` read was never involved. Pinned by
+// `tests/cases/maps/map-reassign-value-shape.vl`.
+//
+// WHY THE SPELLING STILL WAITS. The compiler bootstraps from the published `seed-latest`,
+// which is MASTER's compiler — and master's compiler still carries the miscompile. Source
+// that uses the construct the fix enables cannot be compiled by a seed that lacks the fix:
+// `refresh-compiler.sh --prove-fixpoint` from a freshly fetched seed dies at
+// `function[135]` (`initChecker`) with exactly that message. Measured, one variable:
+// reverting THIS spelling alone — with the emitter fix, the f32 argument fix, the store
+// widths and the capture change all present — makes the published-seed ladder hold.
+//
+// So the map spelling lands in a FOLLOW-UP, after the seed carrying the emitter fix is
+// republished. That is the ordering rule for every fix whose own enabling construct the
+// compiler wants to use, not a fact about this binding.
 let annotPartNames: string[] = []
 let annotPartVals: string[] = []
 

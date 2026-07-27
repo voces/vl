@@ -146,3 +146,22 @@ position** is a lowering target, not a value, so skip that callee `Ident` rather
 name everywhere. (A callee that is a captured closure *variable* of the same name still needs the
 enclosing-frame check, so the arm should skip only where no binding could resolve it.) That also
 fixes the `toString` case above.
+
+> **SHIPPED, in two steps.** #1172 (D-CAPCALLEE) made the exemption exactly that: consulted at ONE
+> place, `capScan`'s `Call` arm, for the CALLEE only — so `const toString = 5` + `() => toString + 1`
+> compiles, and the ten memory intrinsics work in all four positions. **The numeric bare names above
+> (`sqrt`/`min`/`max`/`abs`) are still not on the consulted list**, so shapes 1 and 2 remain for
+> them; the positional mechanism they need now exists and adding them is a list entry, not a design.
+>
+> The second step closed a hazard the first left behind. `emit_base.isBuiltinFnName` — the list that
+> arm consults — is a PARTIAL COPY of `typecheck.nameIsEmitterIntrinsic`, and its own header says so
+> and files the repair. Measured when the three wide store widths landed: they were reserved in the
+> checker and still capturing in the emitter, failing both lambda positions while every other memory
+> intrinsic worked. `capScan` now asks `nameIsEmitterIntrinsic` directly — by construction the set of
+> names whose call site the emitter rewrites before looking up a declaration, which is precisely the
+> soundness condition for the exemption — so the two lists cannot drift again.
+>
+> The `go(__load_i32__: i32)` PARAMETER hazard that `buffer-design.md` §H5 raised against a
+> name-filter fix does not apply and was re-measured, not inherited: it still prints 42, for the
+> intrinsic names and for the new store names, because the exemption is positional and a parameter
+> read as a VALUE is never on the callee path.

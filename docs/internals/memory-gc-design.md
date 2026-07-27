@@ -12,14 +12,16 @@ choice belongs. Companion to `DECISIONS.md` ("Allocation = WasmGC") and
   call (wasm exposes no way to scan a frame's locals), and it discards the wasm
   validator as VL's memory-safety proof. That is a bad trade for the common case.
 - **Linear memory is becoming a design, but is not one yet.** Seventeen memory
-  builtins are declared in the checker; twelve are lowered. Since the webcraft P0.2
+  builtins are declared in the checker; fifteen are lowered. Since the webcraft P0.2
   slice it has a full LOAD width matrix, `memory.grow`/`memory.size`, and an exported
-  memory — so it is no longer a fixed 64 KiB scratch page a host cannot see. There is
-  still no allocator, no data section, no free, and one store width. It should become
-  one deliberate *tier* (buffers/FFI/bulk I/O), not a second object model. *(Was:
-  "not a design, it is three intrinsics and a scratch page. Ten memory builtins are
-  declared in the checker; three are lowered. There is no allocator, no data section,
-  no export, no free.")*
+  memory — so it is no longer a fixed 64 KiB scratch page a host cannot see — and the
+  three WIDE store widths have since landed, so every scalar VL has round-trips at its
+  own width. There is still no allocator, no data section, no free, no bulk ops, and
+  no narrow (8/16-bit) store. It should become one deliberate *tier* (buffers/FFI/bulk
+  I/O), not a second object model. *(Was: "not a design, it is three intrinsics and a
+  scratch page. Ten memory builtins are declared in the checker; three are lowered.
+  There is no allocator, no data section, no export, no free.", then "twelve are
+  lowered … and one store width".)*
 - **The collector is a real, measurable, workload-dependent choice, and it is the
   single largest performance lever VL has today.** `vl run` was pinned to wasmtime's
   deferred-reference-counting collector. On an allocation-heavy program that is
@@ -65,33 +67,45 @@ state, verified against `compiler/typecheck.vl`, `compiler/wasmEmit.vl` and
   `__store_string__`, `__log_string__`, `__log__`, `__memory_grow__`,
   `__memory_size__`, and the seven load widths `__load_i8__`, `__load_u8__`,
   `__load_i16__`, `__load_u16__`, `__load_i64__`, `__load_f32__`, `__load_f64__`.
-- **Twelve are lowered** by the emitter: `__store_i32__`, `__load_i32__`, `__log__`,
-  the seven load widths, `__memory_size__` and `__memory_grow__`.
-  The other **five have no emitter arm**: `__store_i64__`, `__store_f32__`,
-  `__store_f64__`, `__store_string__` and `__log_string__`.
-  *(Re-censused independently in three call POSITIONS each — statement, value and
-  binding — which reproduced this five exactly, a third instrument after this
-  bullet and #1166.)*
+- **Fifteen are lowered** by the emitter: `__store_i32__`, `__load_i32__`, `__log__`,
+  the seven load widths, the three WIDE store widths (`__store_i64__` → `i64.store`,
+  `__store_f32__` → `f32.store`, `__store_f64__` → `f64.store`), `__memory_size__` and
+  `__memory_grow__`.
+  The other **two have no emitter arm**: `__store_string__` and `__log_string__`.
+  Neither is a table entry away — `__store_string__` would have to copy a GC
+  `(array i32)` into linear memory with no byte encoding decided, and `__log_string__`
+  is a host import the native runner does not provide.
+  *(This bullet read "Twelve are lowered … the other five" until the wide store widths
+  landed; the five were re-censused independently in three call POSITIONS each —
+  statement, value and binding — and reproduced exactly at the time.)*
   **THE DIAGNOSTIC HALF IS DONE.** They used to typecheck and then fail at emit
   with `emitProgram: call to unknown function` — safe (no wrong bytes) but reading
   like a typo'd identifier rather than "this builtin has no implementation", which
   this bullet called the half worth fixing first (§B1). The CHECKER now says it
   itself, positioned at the call, on the `unsupported-lowering` channel
   (`nameIsUnimplementedIntrinsic` in `typecheck.vl`). A program that DECLARES one of
-  these names still shadows the builtin and still runs — unlike the seven
-  emitter-intercepted names #1167 reserved, these five are not intercepted, so the
-  diagnostic is gated on the program not declaring a function of the name.
+  these two names still shadows the builtin and still runs — unlike the
+  emitter-intercepted names `nameIsEmitterIntrinsic` reserves, these two are not
+  intercepted, so the diagnostic is gated on the program not declaring a function of
+  the name. The three store widths LEFT this set by acquiring arms, and their
+  shadowing escape hatch closed with the same motion: a `function __store_f64__(…)`
+  definition is now a reject, because the call site is rewritten before any
+  declaration is looked up and the body would never run.
   *(This bullet read "Ten builtins … Three are lowered … the other seven" before the
   P0.2/load-width slice, and the ten/three/seven counts were right at the time. The
   numbers moved because seven load widths and the two memory-size ops acquired
   emitter arms — see `buffer-design.md`.)*
-- **The store/load matrix is asymmetric**, and now in the other direction. There are
-  **eight** load widths and exactly **one** store width (`__store_i32__`). You can
-  read an `f64` out of memory at its own width, but you write one by assembling two
-  i32 words. *(This bullet previously said the reverse — "four `__store_*__` widths
-  and exactly one `__load_i32__`. You can write an `f64` into memory and have no way
-  to read it back." The "four" counted DECLARATIONS; only `__store_i32__` ever
-  lowered, so the true starting point was one width each way.)*
+- **The store/load matrix is asymmetric only at the NARROW end now.** There are
+  **eight** load widths (i8/u8/i16/u16 signed+unsigned narrow, i32, i64, f32, f64) and
+  **four** store widths (i32, i64, f32, f64). Every scalar VL has can be written at its
+  own width and read back at its own width; what is missing is `i32.store8` /
+  `i32.store16`, which `buffer-design.md` §C2 spells `store8`/`store16` and §O2 leaves
+  as an unruled naming question — no `__store_i8__`/`__store_i16__` name is declared.
+  *(This bullet has now said three different things. It first said "four `__store_*__`
+  widths and exactly one `__load_i32__` — you can write an `f64` into memory and have
+  no way to read it back", which counted DECLARATIONS and was measured false; then
+  "eight load widths and exactly one store width", which was true between the load
+  slice and this one.)*
 - **There is no allocator.** No bump pointer, no `__heap_base`, no free list, no
   free. Addresses are raw i32 constants the program picks. Two pieces of code using
   memory in the same module silently collide.
@@ -428,11 +442,13 @@ byte-for-byte, and all three collectors emit byte-identical modules.
 2. **Close the linear-memory audit gaps** (small, mechanical): either lower the
    declared-but-unimplemented builtins or stop declaring them, and give the
    rejection a diagnostic that says "not implemented" rather than "unknown
-   function". *Partly done:* the seven missing `__load_*__` widths and
-   `__memory_size__`/`__memory_grow__` were lowered by the webcraft P0.2 slice, so
-   five remain (`__store_i64__`, `__store_f32__`, `__store_f64__`,
-   `__store_string__`, `__log_string__`) and the matrix is symmetric in the load
-   direction only. The diagnostic is unchanged and still reads like a typo.
+   function". *Nearly done:* the seven missing `__load_*__` widths and
+   `__memory_size__`/`__memory_grow__` were lowered by the webcraft P0.2 slice, then
+   the three WIDE store widths, so **two** remain (`__store_string__`,
+   `__log_string__`) and the matrix is symmetric for every scalar VL has. Both halves
+   of the diagnostic ask are now closed: an unlowered builtin is a positioned CHECKER
+   admission (`nameIsUnimplementedIntrinsic`) rather than `call to unknown function`,
+   and the remaining two are the ones that need a design rather than a table row.
 3. **Export `ioMem` and implement the bulk staging ABI** the host already
    documents (`<name>Reserve`, `<name>Load`, and a `rbyte` bulk sibling). Removes
    ~3.4M host calls in, ~1M out, per self-compile.
