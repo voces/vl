@@ -1,30 +1,65 @@
-// @emit-error a map value is not a supported union member
-// THE SECOND HALF of the map-alias defect, pinned where it now lands. The sibling case
-// `alias-declaration-parses.vl` removed the PARSE gate; this is what the gate was hiding.
+// @run
+// @log 2
+// @log 7
+// @log 1
+// @log 3
+// @log 5
+// @log 9
+// THE SECOND HALF of the map-alias defect, landed. This file was
+// `error-alias-annotation-not-transparent.vl` — an `@emit-error` pin on
+// `emitProgram: a map value is not a supported union member` — and its header said in as
+// many words what would retire it: *"adding `if mt is TyMap { return m0 }` to the arm ladder
+// in `typecheck.singleAliasMemberTyIx` … when that arm lands, this case becomes `@run`"*.
+// It has landed, so here it is.
 //
-// The parser encodes every non-`{`-bodied `type N = …` as a ONE-MEMBER `UnionDecl`, and a
-// map body now takes that same path. `typecheck.singleAliasMemberTyIx` is what decides
-// whether such a degenerate wrapper is TRANSPARENT — it is for a `TyPrim` member
-// (`type Id = i32`), for a `TyFunc` member (D-ALIASFN), and for a `TyArray` member over a
-// scalar spine (D-ALIASARR) — and its header states in as many words that `TyMap` is
-// deliberately NOT included, "the same shape of hole … but it has its own twin table to
-// build and its own value-name family to check". That deferral was unobservable while the
-// construct could not be spelled at all; now it can, so here is its pin.
+// The parser encodes every non-`{…}`-bodied `type N = …` as a ONE-MEMBER `UnionDecl`, and
+// since #1201 a map body takes that same path — so `type M = {[string]: i32}` denoted
+// `TyUnion[TyMap]`, not `TyMap`, and every USE of the alias hit the union machinery instead
+// of the map machinery. `singleAliasMemberTyIx` is the one rule the checker and the emitter
+// both read for "is this degenerate wrapper transparent?"; it already answered yes for a
+// `TyPrim` member (`type Id = i32`), a `TyFunc` member (D-ALIASFN) and a `TyArray` member
+// over a scalar spine (D-ALIASARR). The map arm is the fourth, and — unlike the array's — it
+// carries NO gate: `tyToEmitName`'s map arm renders `{[K]:V}` for every value kind there is,
+// so a map alias has no nominal emit route to lose. Measured, not assumed: a
+// `{[string]: Cat}` alias over a DECLARED struct works in six of eight positions and its two
+// failures reproduce with no alias in the program at all.
 //
-// So `Counts` denotes `TyUnion[TyMap]`, not `TyMap`, and the emitter's union machinery
-// rejects it cleanly and by name. The failure is loud at EVERY use, never a miscompile:
-// censused over 41 cells, a map alias in annotation position gives this emit error or a
-// positioned checker error ("cannot index non-array {[string]: i32}"), and 0 cells emit an
-// invalid module.
-//
-// FILED, with the probe that proves it: adding `if mt is TyMap { return m0 }` to the arm
-// ladder in `typecheck.singleAliasMemberTyIx` moves 35 of those 41 cells to OK — measured on
-// a probe build, not shipped, because `typecheck.vl` is another partition's file. The 2 cells
-// that still fail under that probe are an array OF maps (`M[]`) with an f64 or string value,
-// and that one is NOT the alias's doing: the alias-free inline control
-// `const xs: {[string]: f64}[] = []` emits an invalid module on master too.
-//
-// When that arm lands, this case becomes `@run` — print `1`.
+// Every operation below was a CHECKER or EMIT reject on the parent commit, and every one of
+// them runs on the alias-free INLINE spelling there — which is the whole claim: the alias
+// stops being a dialect of its own.
 type Counts = {[string]: i32}
-const _m: Counts = Map()
-print(1)
+type Names = {[string]: string}
+type Nested = {[string]: Counts}
+type Holder = { c: Counts, n: i32 }
+
+// GLOBAL annotation — `emitProgram: a map value is not a supported union member` before.
+const m: Counts = Map()
+m["a"] = 1
+m["b"] = 2
+print(m.length) // 2
+
+// INDEX READ through the alias — `cannot index non-array {[string]: i32}` before.
+m["c"] = 7
+print(m["c"] ?? 0) // 7
+
+// A STRING-valued alias, and `.has` through it.
+const s: Names = Map()
+s["k"] = "v"
+if s.has("k") { print(1) } else { print(0) } // 1
+
+// STRUCT FIELD position, and a read+write through the field.
+const h: Holder = { c: Map(), n: 3 }
+print(h.n) // 3
+h.c["z"] = 5
+print(h.c["z"] ?? 0) // 5
+
+// A map alias as ANOTHER map alias's VALUE — the value type is itself spelled by alias.
+const outer: Nested = Map()
+const box: Counts = Map()
+box["q"] = 9
+outer["x"] = box
+// (No annotation on `got`: with the alias transparent the checker now INFERS
+// `{[string]: i32}` here, and annotating it `Counts` draws a redundant-annotation
+// hint — itself a small witness that the alias denotes the map and not a box.)
+const got = outer["x"] ?? Map()
+print(got["q"] ?? 0) // 9
