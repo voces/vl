@@ -8731,8 +8731,10 @@ export function isNulScalarListFieldCode(c: i32): boolean {
 // backing is the `$mkListIdx` string wrapper rather than the i32 one. The rep layer cannot
 // answer it either (`repOfArray` leaves a nullable ELEMENT to the legacy layer), so the
 // question is put to the recorded type directly.
-function annIsNulLitUnionArray(tyIx: i32) {
-  const ty = nodeTyIxOf(tyIx)
+function annIsNulLitUnionArray(tyIx: i32) { tyIsNulLitUnionArr(nodeTyIxOf(tyIx)) }
+
+// The arena-level predicate `annIsNulLitUnionArray` is the node-level spelling of.
+function tyIsNulLitUnionArr(ty: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyArray {
@@ -8740,6 +8742,24 @@ function annIsNulLitUnionArray(tyIx: i32) {
     if e is TyNullable { return tyIsLitUnion(e.nInner) }
   }
   false
+}
+
+// `nameIsNulStrListDeep` asked of a type-ANNOTATION NODE, with the atom-niche element
+// ruled out STRUCTURALLY first. The name predicate cannot do it: an inline
+// `(("a" | "b") | null)[]` renders `(string | null)[]` after the canon pass, and it
+// admits that spelling — so the element read took the `(ref null $aTypeIdx)` STRING
+// backing of an i32 atom list (invalid wasm), which is the one thing this predicate
+// exists to route. The outer `| null` the name side peels is peeled here too, so a
+// narrowed `(K | null)[] | null` binding gets the same structural reject.
+function annIsNulStrListDeep(tyIx: i32) {
+  if tyIx < 0 { return false }
+  let ty = nodeTyIxOf(tyIx)
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyNullable { ty = t.nInner }
+  }
+  if tyIsNulLitUnionArr(ty) { return false }
+  nameIsNulStrListDeep(tyNameOf(tyIx))
 }
 
 // The wasm rep KIND the checker's ARENA assigns to the type-ANNOTATION node `tyNodeIx`,
@@ -16721,7 +16741,7 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
       // the narrowed value is the same nulstr-element list (the read must stay
       // `(ref null)`; the plain-string arm's recover TRAPPED on a null element —
       // fuzz-nightly plain leg, seed 154928295 d6).
-      return nameIsNulStrListDeep(tyNameOf(pt))
+      return annIsNulStrListDeep(pt)
     }
     // A union binding narrowed to the `(string | null)[]` arm reads unboxed as the
     // string list whose ELEMENT stays `(ref null)` — the same nullable read discipline.
@@ -16747,10 +16767,7 @@ function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
   if li < 0 {
     // A rebind chain ending at a PARAM of the enclosing function (`const t0 = p`).
     const pt = paramTypeNode(fnIx, name)
-    if pt >= 0 {
-      const ptn = tyNameOf(pt)
-      return nameIsNulStrListDeep(ptn)
-    }
+    if pt >= 0 { return annIsNulStrListDeep(pt) }
     // A module GLOBAL (`const g: (string | null)[] | null = …`) — top-level LetDecls
     // live in `globalStmts` (they emit as wasm globals, not start statements).
     li = globalLetOf(name)
@@ -16758,10 +16775,7 @@ function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
   if li < 0 { return false }
   const d = P.nodes[li]
   if !(d is LetDecl) { return false }
-  if d.letType >= 0 {
-    const tn = tyNameOf(d.letType)
-    return nameIsNulStrListDeep(tn)
-  }
+  if d.letType >= 0 { return annIsNulStrListDeep(d.letType) }
   if d.letInit >= 0 {
     const init = P.nodes[unwrapParen(d.letInit)]
     if init is Ident {
