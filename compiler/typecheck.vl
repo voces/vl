@@ -7383,6 +7383,7 @@ function unionMemberGenAppShape(member: string) {
 // way out of a call and read by the immediate caller, never carried between programs.
 let canonAtoms = 1
 let nluAtoms = 1
+let lupAtoms = 1
 
 // A NULLABLE LITERAL-UNION's preserved canonical name, or "" if `parts` (the top-level `|`-split
 // members of a union annotation) are not one. `K | null` / `"a" | "b" | null` must keep the litunion
@@ -7413,6 +7414,84 @@ function nulLitUnionPreserve(parts: string[]) {
     // single suffix, which is why this is `rest.length + 1` and not `parts.length`.
     nluAtoms = rest.length + 1
     return core + "|null"
+  }
+  ""
+}
+
+// True at the render POSITIONS where a literal union keeps its members — the four the
+// structural renderer already preserves a litunion ALIAS at (`tyToEmitNameGo`'s `TyArray`
+// element, `TyObj` field, `TyMap` value and `TyFunc` result arms each call
+// `litUnionAliasNameOfTy` before recursing). O3 of the one-agreed-renderer design states the
+// policy as position-dependent in BOTH directions, and this is its positive half.
+//
+// FALSE at `RC_ROOT` and `RC_FN_PARAM`, and that is MEASURED, not stylistic: an ungated
+// preserve reddens four cells that are green on master — a bare inline litunion as a
+// function PARAM (`emitProgram: only i32, i64, f64, f32, boolean, struct, union, array, or
+// string parameters are supported`) and as a DECLARED struct field (`emitProgram: only i32 /
+// boolean / string / array struct fields are supported`), because those two valtype ladders
+// have an arm for the litunion ALIAS name and none for the inline member spelling. The
+// renderer softens at exactly those two positions too, for the same reason.
+function ctxKeepsLitUnion(ctx: i32) {
+  if (ctx & RC_ELEM) != 0 { return true }
+  if (ctx & RC_FIELD) != 0 { return true }
+  if (ctx & RC_MAP_VAL) != 0 { return true }
+  if (ctx & RC_FN_RES) != 0 { return true }
+  false
+}
+
+// A PURE literal union's preserved canonical name, or "" if `parts` (the top-level `|`-split
+// members of a union annotation) are not one. The non-null sibling of `nulLitUnionPreserve`:
+// `"a" | "b"` must keep its members intact, because softening each to `string` and deduping
+// erases the litunion identity and reps the annotation as a STRING REF where its `K` alias
+// spelling reps as the interned i32 ATOM. Duplicate members collapse (`"a" | "a"` is one atom),
+// which is what the softening path's own `kept` dedup did and what the arena does.
+function litUnionPreserve(parts: string[]) {
+  const kept: string[] = []
+  let i = 0
+  while i < parts.length {
+    let dup = false
+    let j = 0
+    while j < kept.length {
+      if kept[j] == parts[i] { dup = true }
+      j = j + 1
+    }
+    if !dup { kept.push(parts[i]) }
+    i = i + 1
+  }
+  if kept.length < 2 { return "" }
+  let core = kept[0]
+  let k = 1
+  while k < kept.length {
+    core = core + "|" + kept[k]
+    k = k + 1
+  }
+  if nameIsLitUnionType(core) {
+    // A DECLARED alias with exactly these members WINS the spelling — the same preference
+    // `litUnionAliasNameOfTy` gives the structural renderer, for the same reason: a name
+    // that is an intern KEY must be one name per type. Without it the two spellings of one
+    // litunion map type mint TWO `{[string]:…}` shape slots, so a `{[string]: ("a"|"b")[]}`
+    // value handed to a `{[string]: K[]}` parameter is still invalid wasm — preserved or
+    // softened, a second spelling is a second row.
+    //
+    // The member texts are recovered by dropping each kept member's surrounding quotes —
+    // the exact inverse of the `"\"" + litText + "\""` every literal RENDER writes
+    // (`tyToStr`), on a member `nameIsLitUnionType` has just confirmed is a quoted literal.
+    const texts: string[] = []
+    let q = 0
+    while q < kept.length {
+      texts.push(kept[q].slice(1, kept[q].length - 1))
+      q = q + 1
+    }
+    const al = litUnionAliasOfLitTexts(texts)
+    if al != "" {
+      // An alias name is ONE identifier — one atom.
+      lupAtoms = 1
+      return al
+    }
+    // Each kept member is a TOP-LEVEL member of the original split, so none carries a
+    // top-level `|` of its own and the join writes exactly `kept.length - 1` separators.
+    lupAtoms = kept.length
+    return core
   }
   ""
 }
@@ -7486,6 +7565,23 @@ function canonEmitNameAt(name: string, ctx: i32) {
     if nlu != "" {
       canonAtoms = nluAtoms
       return nlu
+    }
+    // A PURE literal union (`"a" | "b"`) keeps its members too, exactly as the `| null`
+    // sibling above already does. Without this, every member softened to `string` and
+    // deduped to the ONE base scalar, so an INLINE spelling reached the emitter naming a
+    // STRING while its `K` ALIAS spelling kept the litunion name — two spellings of ONE
+    // type carrying two reps, which is the split behind four filed miscompile families
+    // (nested `("a"|"b")[][]`, an inline litunion map VALUE, an inline-SHAPE field, and a
+    // `.map` callback PARAM). The emitter's name grammar was already ready for it:
+    // `nameIsLitUnionType` accepts the inline member spelling (`nameIsInlineLitUnion`)
+    // beside the alias name, and the `| null` form has been arriving here preserved since
+    // `nulLitUnionPreserve` was written.
+    if ctxKeepsLitUnion(ctx) {
+      const lup = litUnionPreserve(parts)
+      if lup != "" {
+        canonAtoms = lupAtoms
+        return lup
+      }
     }
     const kept: string[] = []
     // The position every member below is rendered AT. `RC_NULLABLE` is re-derived from a
