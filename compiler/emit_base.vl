@@ -738,10 +738,40 @@ export function directArgsBad(args: i32[], callIx: i32) {
 // or "string|null" (canonicalized), or "" otherwise. A niche nullable lowers via its
 // sentinel / `ref.null $array` rep (not the value box), so it is recognized by NAME from
 // the A20 inferred-return table rather than by a `fn.fnRet` annotation node.
+//
+// The two TESTS are `nameIsNulBool` / `nameIsNulString` — the compiler's one home for each
+// niche's spelling (`nullablePartOf(im) == "boolean"` / `== "string"`, the depth- and
+// quote-aware `|` split plus a LEAF-name compare). This function used to spell them as
+// WHOLE-SPELLING equalities (`im == "boolean|null"`), a THIRD hand-written copy of the same
+// niche predicate — the copy `tyIsNulBool`'s header already names as the second ("this arm
+// hand-wrote its body eight lines above the definition, so the niche's spelling had two
+// homes"). A whole-spelling compare decides a COMPOSITE type by matching rendered
+// characters; the home decides it by splitting the nullable and comparing only the leaf.
+//
+// The RETURNED strings stay literal: they are this function's published protocol (its four
+// callers in `emit_classify`/`wasmEmit` compare against them), i.e. a RENDER, which is the
+// one use of a type spelling the rule allows.
+//
+// The homes accept `null|boolean` / `null|string` too, where the whole-spelling compares
+// did not. That widening's divergence population measured EMPTY — but say WHICH channel:
+// the CORPUS only, over the 5 files that consequentially reach this function (a sabotage
+// answering wrong on exactly the newly-accepted inputs reddens 0 of 1,471, while the same
+// wrong answer on the WHOLE set reddens 5, so the instrument was live and the widened-in
+// inputs never occurred). The FUZZ channel cannot grade it at all: `scripts/fuzzgen.vl`
+// always annotates returns, so it never populates the inferred-return table this reads.
+// It is also the correct reading — both orderings denote the same type — and
+// `inferRetNameOf`'s niche names are minted as canonical LITERALS by `recordInferRet`'s
+// `ert is TyNullable` arm (`typecheck.vl`), so the order can only ever be the canonical one.
+//
+// NOT ROUTED TO THE ARENA, and that is a MEASURED decline rather than an omission:
+// `recordInferRet` stores the spelling the checker CHOSE and the type it was choosing ABOUT
+// in one row — a decision and its input, not two encodings of one type. #1120 measured the
+// recorded-tyIx reading to differ from the recorded NAME on 14.5% of a fully-covered column.
+// Asking the arena here would answer a different question.
 export function inferNicheNullByName(name: string) {
   const im = inferRetNameOf(name)
-  if im == "boolean|null" { return "boolean|null" }
-  if im == "string|null" { return "string|null" }
+  if nameIsNulBool(im) { return "boolean|null" }
+  if nameIsNulString(im) { return "string|null" }
   ""
 }
 // ── the type-name DEPTH WALK: the checker's `tyTopIndexOf` IS the home ────────
@@ -1395,13 +1425,51 @@ export function arrLeafNameOf(name: string) {
 // difference is load-bearing and documented at `peelGroupParens`. Merging them by eyeball is
 // the mistake this comment exists to prevent.
 //
+// ── the SCALAR-ARRAY classifiers: an ELEMENT-name compare, not a whole-spelling one ────
+//
+// **THE FAMILY-WIDE NOTE, written once here and pointed at from the four siblings below**
+// (`nameIsStringArray`, `nameIsF64Array`, `nameIsF32Array`, `nameIsI64Array`).
+//
+// Each of these five used to ask a WHOLE-TYPE-SPELLING structural equality — `name ==
+// "f64[]"`, `name == "i32[]" || name == "boolean[]"` — which decides a COMPOSITE type by
+// matching its rendered characters. That is the destringify rule's clearest violation: the
+// `[]` is STRUCTURE and the `f64` is a NAME, and a whole-spelling compare fuses the two into
+// one opaque character match, so neither half can be seen, shared, or repaired.
+//
+// Split at that seam they are `arrElemNameRaw(name) == "<elem>"`: the ARRAY grammar's ONE
+// CUT (`typecheck.vl`, D-ARRDOWN/#1175 — the trailing-`[]` cut whose nine hand-written
+// copies in THIS file are what buying it a home cost) followed by a BARE PRIM-NAME equality
+// on the leaf, which the rule explicitly allows — a name is a name.
+//
+// EXACTLY EQUIVALENT, provably and totally: `arrElemNameRaw` returns "" for a non-array
+// name (and "" is none of the six leaf spellings), else `name` minus its final two
+// characters — so `arrElemNameRaw(n) == "f64"` holds iff `n` is 5 characters that are
+// `f64` then `[` then `]`, i.e. iff `n == "f64[]"`. No input distinguishes the two forms.
+//
+// AND IT PUTS THE NAME SIDE IN THE SHAPE THE ARENA SIDE ALREADY SHIPS. `arrElemRep(tyIx)`
+// (above) is the arena's element-rep query, and the whole `ret*ArrFlag` family is already
+// written as `arrElemRep(tyIx) == "f64"`. These five were its NAME-side twins, surviving
+// only because their callers hold a spelling rather than a node. Written this way the two
+// halves of one classifier read identically and can no longer drift on what an f64 array IS.
+//
+// DECLINED, measured: `listElemNameOf` (the cut PLUS one naive grouping-paren strip) would
+// additionally accept `(f64)[]`. Its divergence population is EMPTY — `(f64)[]`, `(f32)[]`,
+// `(i64)[]` and `(string)[]` already lower correctly WITHOUT the wider cut, in binding,
+// param and return position, so the widening has no witness to license it. That is the
+// measured BEHAVIOUR; where exactly the parenthesized element stops being visible to these
+// classifiers was NOT traced, so do not quote a mechanism here. Per the D-SHAPEFIELD
+// precedent (unreached is not licenced), the FAITHFUL cut ships and the widening is filed.
+// The measurement itself is pinned by `tests/cases/arrays/paren-wrapped-scalar-elem.vl`.
+//
 // True if the array type-name `name` is `i32[]` (the value-element list whose backing
 // is the raw `(array (mut i32))`). A `boolean[]` shares this exact rep (a boolean is an
 // i32 0/1 at the wasm level), so it rides the same i32-list machinery — only the element
 // PRINT formatting recovers boolean-ness (`listElemIsBool`). A `T[]`/`N[]` (struct/union
 // element) is NOT this.
 export function nameIsI32Array(name: string) {
-  if name == "i32[]" || name == "boolean[]" { return true }
+  // The two i32-backed leaf spellings share one cut — the family note above.
+  const elem = arrElemNameRaw(name)
+  if elem == "i32" || elem == "boolean" { return true }
   // `(boolean | null)[]` shares the exact i32-list backing: each element is an i32 0/1
   // with the spare value 2 = `null` (the sentinel niche). Only the `null → 2` element
   // coercion + the sentinel-aware read/print differ (see `nameIsNulBoolList`).
@@ -1681,7 +1749,9 @@ export function nameIsString(name: string) { name == "string" }
 // are string refs. It reuses the map keys list types (the `{backing,len,cap}` wrapper
 // over a `(ref null $aTypeIdx)` string backing); field code `6`.
 export function nameIsStringArray(name: string) {
-  if name == "string[]" { return true }
+  // Element-name compare over the array grammar's one cut — see the family note at
+  // `nameIsI32Array`.
+  if arrElemNameRaw(name) == "string" { return true }
   // `(string | null)[]` shares the EXACT string-list backing (`$mkListIdx` wrapper, `(ref null
   // $aTypeIdx)` string backing — a `string[]` element is already a nullable ref). So it rides the
   // string-list machinery (param slot / `.length` / construct / arg-coerce) uniformly; only the
@@ -1693,11 +1763,15 @@ export function nameIsStringArray(name: string) {
 // scalar f64 (Slice 4). Its backing is `(array (mut f64))` (`fa64TypeIdx`); its wrapper
 // is the `{backing,len,cap}` triple over that f64 backing (`fl64TypeIdx`). Distinct from
 // `i32[]` so element reads/writes use the f64 element store.
-export function nameIsF64Array(name: string) { name == "f64[]" }
-export function nameIsF32Array(name: string) { name == "f32[]" }
+// These three are the family note's purest form: one cut, one leaf name. They are also the
+// three `emit_rewrite.vl`'s scalar-leaf-list return arm used to hand-write inline as
+// `ctx == "i64[]" || ctx == "f64[]" || ctx == "f32[]"` — three copies of three one-line
+// homes, in a file that already imported this one.
+export function nameIsF64Array(name: string) { arrElemNameRaw(name) == "f64" }
+export function nameIsF32Array(name: string) { arrElemNameRaw(name) == "f32" }
 // The i64 sibling of `nameIsF64Array`: an `i64[]` annotation (backing `ia64TypeIdx`,
 // wrapper `il64TypeIdx` — the i64 element store).
-export function nameIsI64Array(name: string) { name == "i64[]" }
+export function nameIsI64Array(name: string) { arrElemNameRaw(name) == "i64" }
 // True if the node at `ix` is a struct `type` declaration (a single-level narrowing
 // helper, so callers avoid an inline `is TypeDecl` on the wide `Node` union).
 export function nodeIsTypeDecl(ix: i32) {
