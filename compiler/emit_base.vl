@@ -1734,6 +1734,74 @@ export function nameNamesFunction(name: string) {
   }
   false
 }
+// ── the SHAPE-NAME grammar: `nameIsShapeOpen` OPENS it, `nameIsShapeSpanEnds` SPANS it ──
+// THE ONE HOME of the inline-object-shape OPENER: does `name` start an inline struct shape
+// (`{x:i32}`) rather than a map shape (`{[string]:i32}`) — the `length >= 2 && name[0] ==
+// '{' && name[1] != '['` triple.
+//
+// Censused STRUCTURALLY over comment-stripped source (char bindings resolved — every real
+// scanner binds the char first, so a detector anchored on `name[0] == '{'` alone reads
+// almost nothing), the index-0 `'{'` test is written out **35** times tree-wide
+// (`emit_classify` 15 · `emit_base` 7 · `typecheck` 6 · `emit_collect` 4 · `emit_rep` 2 ·
+// `format` 1) and the index-1 `'['` test **27** times. **20** of those sites carry BOTH and
+// so belong to this grammar.
+//
+// THE 20 ARE SIX SYNTACTIC SPELLINGS OF ONLY **THREE** PREDICATES, and that is the whole
+// reason this needed measuring rather than eyeballing. Counted by form, including WHERE the
+// length bound sits: positive same-line conjunction (8); the same conjunction with the bound
+// hoisted to an ENCLOSING `if name.length >= 2 {` block (2); with the bound hoisted to an
+// EARLY-RETURN guard (1); the fully De-Morganed guard `if nm.length < 2 || nm[0] != '{' ||
+// nm[1] == '[' … { return … }` (6); the multi-line parenthesised conjunction (2); and one
+// `length > 0` outlier. (A prior slice counted FIVE by ignoring the bound's placement — the
+// bucket boundary is a matter of taste and the predicate count is not.) Reduced to
+// predicates they are only:
+//
+//   * **this home** — `len >= 2 · OPEN · NOT2ND`, at 8 sites;
+//   * **`nameIsShapeSpanEnds`** below — the same plus a final `}`, at 10 sites;
+//   * **`emit_classify.nameIsWholeSpanShape`** — the same plus `tyGroupWrapsWhole`, at 1.
+//
+// A prior slice's honest hand-off called for "two homes plus a measured decision about the
+// walk" and that is exactly right; what it read as a length-guard difference is not one.
+// Only ONE of the 20 sites lacks `length >= 2`: `emit_collect.funcRetUnrepresentable` gates
+// on `length > 0`, which on the single name `"{"` reads `nm[1]` OUT OF BOUNDS. VL string
+// indexing **TRAPS** there (`wasm trap: out of bounds array access`, verified by hand), so
+// that spelling is not a wider predicate — it is the same predicate plus a latent trap, and
+// routing it here is equivalence-preserving on every input that does not already crash.
+//
+// `arrLeafNameOf`'s header above already recorded this grammar as the "SAME next question"
+// three of its four peel-loop copies ask of the leaf. This is that question, named.
+export function nameIsShapeOpen(name: string) {
+  if name.length < 2 { return false }
+  name[0] == '{' && name[1] != '['
+}
+// THE ONE HOME of the inline-shape ENDPOINT span: `nameIsShapeOpen` AND the final character
+// is `}`. This is a LAYER over the opener, not a second copy of it — the character compares
+// live once, above.
+//
+// **THIS IS NOT `emit_classify.nameIsWholeSpanShape`, AND THE TWO MUST NOT BE MERGED BY
+// EYEBALL.** That function is this predicate PLUS `tyGroupWrapsWhole(name)`, a depth walk
+// proving the group opened at index 0 is still open at the last character. The endpoints
+// alone do not prove that: `{a:{b:i32}}|{c:i32}` opens with `{`, is not a map, and ends
+// with `}`, yet the leading group closes early — this home answers TRUE and
+// `nameIsWholeSpanShape` answers FALSE. **10 sites carry this exact endpoint predicate and
+// every one of them would be TIGHTENED by routing to the walk instead** (`emit_base`
+// `unionStructAliasShape`/`isStructAtom`, `emit_collect.collectVariantFields`,
+// `emit_classify` ×5, `emit_rep` ×2). None was tightened; the walk keeps its one caller and
+// this home takes the ten. Narrowing any of them is a behaviour change owing its own graded
+// population, not a refactor.
+//
+// The SECOND non-merge, and the one that bites in THIS file: `length >= 2 && name[0] == '{'
+// && name[name.length - 1] == '}'` WITHOUT the `name[1] != '['` conjunct is a DIFFERENT
+// predicate — it accepts a map name, since `{[string]:i32}` opens with `{` and ends with
+// `}`. It is written out **9** times tree-wide (`emit_base` `annObjFieldSplit` /
+// `canonBareShapeName` / `nameIsStructWithUnionField` / `nameIsStructWithLitUnionField`,
+// `emit_classify` ×2, `typecheck` ×3). Routing those four here would silently stop the
+// emitter seeing map-valued shapes, so they are deliberately left alone and named here so a
+// later census does not read them as copies of this home.
+export function nameIsShapeSpanEnds(name: string) {
+  if !nameIsShapeOpen(name) { return false }
+  name[name.length - 1] == '}'
+}
 // The inline-shape synthetic name of a STRUCT-ALIAS union decl — a `UnionDecl`
 // with exactly ONE variant that is an inline object shape (`{a:i32,b:i32}`,
 // not a map `{[…]}`) — or "". The shape a canonicalized object intersection
@@ -1743,9 +1811,7 @@ export function nameNamesFunction(name: string) {
 export function unionStructAliasShape(variants: string[]) {
   if variants.length == 1 {
     const v = variants[0]
-    if v.length >= 2 && v[0] == '{' && v[1] != '[' && v[v.length - 1] == '}' {
-      return v
-    }
+    if nameIsShapeSpanEnds(v) { return v }
   }
   ""
 }
@@ -1991,10 +2057,7 @@ export function isDeclaredStructName(stmts: i32[], name: string) {
 // not). The per-member test shared by `isVariantBoxUnion` and the registration loop.
 export function isStructAtom(stmts: i32[], a: string) {
   if isDeclaredStructName(stmts, a) { return true }
-  if a.length >= 2 {
-    if a[0] == '{' && a[1] != '[' && a[a.length - 1] == '}' { return true }
-  }
-  false
+  nameIsShapeSpanEnds(a)
 }
 // True if `name` is a VARIANT-BOX union this emitter interns: two+ non-null members,
 // every member a struct variant OR a value-atom (`i32`/`string`/…) OR a REF-ELEMENT array
