@@ -108,6 +108,8 @@ import {
   annFnDecompose,
   annRetNameOf,
   annSplitPipe,
+  arrElemNameRaw,
+  arrLeafNameOf,
   callMemProp,
   capHas,
   capIsBound,
@@ -122,6 +124,7 @@ import {
   nameIsBareMap,
   nameIsClosureArray,
   nameIsClosureArrayTy,
+  nameIsElemArray,
   nameIsF32Array,
   nameIsF64Array,
   nameIsI32Array,
@@ -2789,9 +2792,7 @@ export function mvCanonValName(valName: string) {
   // a self-inferred factory-return lambda (`() => (h0)`) minted twin mv/map structs, a cast
   // TRAP at the returned-map read. (Func-type element arrays are left untouched inside.)
   const vn = valName.length
-  if vn > 2 && valName[vn - 2] == '[' && valName[vn - 1] == ']' {
-    return rlCanonLitUnionAtoms(valName)
-  }
+  if nameIsElemArray(valName) { return rlCanonLitUnionAtoms(valName) }
   // A STRUCT / nested-MAP value (`{f: K0 | f64}` — the value of `{[string]: {f: K0|f64}}`):
   // soften its field / value litunion aliases THROUGH the shape, the struct sibling of the
   // ref-list `[]` arm above. Without this the annotation (`canonEmitTypeNames`-softened to
@@ -9102,7 +9103,7 @@ function refArrShapeKind(name: string): i32 {
   // Nested lists of a NON-i32 scalar/string element — the element is that inner list's
   // WRAPPER (kinds 6/7/8 → `mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`). Used for a
   // string[]/f64[]/i64[]-VALUED map's vals ref-list (the value analogue of `i32[][]` kind 4).
-  if nameIsArray(name) && nameIsStringArray(name.slice(0, name.length - 2)) {
+  if nameIsArray(name) && nameIsStringArray(arrElemNameRaw(name)) {
     // `string[][]` AND the niche `(string | null)[][]`: the element is the string-list
     // wrapper (`$mkListIdx`) either way — the nullable rides INSIDE the inner elements.
     return 6
@@ -9301,9 +9302,8 @@ export function nameIsRefArray(name: string) {
   // `sNames[i] + "[]"` — a fresh string allocation PER struct PER call; on a struct-heavy
   // program this `O(structs)` garbage dominated emit time + GC. The strip-once form does the
   // same match with no per-iteration allocation.)
-  const n = name.length
-  if n >= 3 && name[n - 2] == '[' && name[n - 1] == ']' {
-    const base = name.slice(0, n - 2)
+  if nameIsElemArray(name) {
+    const base = arrElemNameRaw(name)
     if structIndexByName(base) >= 0 { return true }
     // An INLINE-SHAPE element (`{v:i32}[]`) whose shape deduped onto a DECLARED
     // struct at intern time (so the spelling has no `sNames` entry): the
@@ -9417,9 +9417,8 @@ export function refArrElemKind(name: string) {
   // (a struct / inline-shape / variant array, and any name no arm claims) is
   // kind 1, which is why this entry point needs no struct-table consult at all
   // while `nameIsRefArray` needs four.
-  const n = name.length
-  if n >= 3 && name[n - 2] == '[' && name[n - 1] == ']' {
-    const base = name.slice(0, n - 2)
+  if nameIsElemArray(name) {
+    const base = arrElemNameRaw(name)
     let u = 0
     while u < unNames.length {
       if base == unNames[u] { return 2 }
@@ -9704,11 +9703,12 @@ export function checkArrName(name: string) {
 // True when `name` is `T[]` for some declared FuncDecl type parameter `T`.
 export function genTyParamArr(name: string) {
   if genTyParamNames.length == 0 { return false }
-  const n = name.length
-  if n < 2 { return false }
-  if name[n - 2] != '[' { return false }
-  if name[n - 1] != ']' { return false }
-  const base = name.slice(0, n - 2)
+  // The array-name grammar at its two homes. The TEST stays in front of the CUT exactly as
+  // the inline compares did (`nameIsArray` IS the `n < 2` bound plus those two compares),
+  // and the `""` a non-array cut yields never matches a declared type-parameter name — so
+  // the guard is kept rather than folded, per `arrElemNameRaw`'s own rule about `"[]"`.
+  if !nameIsArray(name) { return false }
+  const base = arrElemNameRaw(name)
   let i = 0
   while i < genTyParamNames.length {
     if genTyParamNames[i] == base { return true }
@@ -9892,29 +9892,28 @@ export function refArrElemName(name: string) {
   if ranp != "" && nameIsArray(ranp) { return refArrElemName(ranp) }
   // `i32[][]` -> `i32[]`, `boolean[][]` -> `boolean[]`, `K[][]` -> `K[]`: the immediate i32-backed
   // inner list is the slot key (all kind-4 `lTypeIdx` elements), mirroring the `i32[][]` case.
-  if nameIsI32ListArray(name) { return name.slice(0, name.length - 2) }
+  if nameIsI32ListArray(name) { return arrElemNameRaw(name) }
   // A nested NON-i32 scalar / string 2D array — the inner list's name is the slot key (kind
   // 8 / 7 / 6 element), mirroring `i32[][]` → `i32[]`.
   if name == "i64[][]" { return "i64[]" }
   if name == "f64[][]" { return "f64[]" }
   if name == "f32[][]" { return "f32[]" }
-  if nameIsArray(name) && nameIsStringArray(name.slice(0, name.length - 2)) {
-    return name.slice(0, name.length - 2)
+  if nameIsArray(name) && nameIsStringArray(arrElemNameRaw(name)) {
+    return arrElemNameRaw(name)
   }
-  if nameIsMapArray(name) { return name.slice(0, name.length - 2) }
+  if nameIsMapArray(name) { return arrElemNameRaw(name) }
   // `(string|i32)[]` → `string|i32` (the parens are annotation grouping only —
   // the TABLE key is the bare atom-set name every other union position uses).
   const pun = parenUnionArrElemName(name)
   if pun != "" { return pun }
   // `((i32) => i32)[]` → `((i32) => i32)` (the parenthesized function-type element, the
   // table key for the closure-element slot — all such slots share `cloStructIdx`).
-  if nameIsClosureArray(name) { return name.slice(0, name.length - 2) }
+  if nameIsClosureArray(name) { return arrElemNameRaw(name) }
   // A `<Union>[]` / `<Struct>[]`: strip the trailing `[]` ONCE and confirm the bare name is a
   // registered union/struct (the stripped base IS the table key — no per-iteration `+ "[]"`
   // concat, which allocated a string per struct/union per call).
-  const n = name.length
-  if n >= 3 && name[n - 2] == '[' && name[n - 1] == ']' {
-    const base = name.slice(0, n - 2)
+  if nameIsElemArray(name) {
+    const base = arrElemNameRaw(name)
     let u = 0
     while u < unNames.length {
       if base == unNames[u] { return base }
@@ -9997,8 +9996,8 @@ function rlCanonLitUnionAtoms(name: string): string {
   if isTopLevelFuncTypeName(name) { return name }
   // A trailing `[]`: canon the element, re-grouping a union element with parens
   // (`(K0|i32)[]`), exactly as `canonEmitName` re-wraps.
-  if n > 2 && name[n - 2] == '[' && name[n - 1] == ']' {
-    const core = rlCanonLitUnionAtoms(name.slice(0, n - 2))
+  if nameIsElemArray(name) {
+    const core = rlCanonLitUnionAtoms(arrElemNameRaw(name))
     if unionMemberCount(core) > 1 { return "(" + core + ")[]" }
     if isTopLevelFuncTypeName(core) { return "(" + core + ")[]" }
     return core + "[]"
@@ -10567,14 +10566,7 @@ export function nameFieldCode(t: string) {
 function internShapeArms(arms: string[]) {
   let uai = 0
   while uai < arms.length {
-    let uCore = arms[uai]
-    while (
-      uCore.length > 2 &&
-      uCore[uCore.length - 2] == '[' &&
-      uCore[uCore.length - 1] == ']'
-    ) {
-      uCore = uCore.slice(0, uCore.length - 2)
-    }
+    const uCore = arrLeafNameOf(arms[uai])
     if uCore.length >= 1 && uCore[0] == '{' {
       internShapeDeep(arms[uai])
     } else if annArrowAt(normTypeAtom(uCore)) >= 0 {
@@ -10660,9 +10652,7 @@ export function internShapeDeep(nm: string) {
     splitUnionAtoms(nm, pArms)
     if pArms.length > 1 { internShapeArms(pArms) }
   }
-  if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
-    return internShapeDeep(nm.slice(0, nm.length - 2))
-  }
+  if nameIsElemArray(nm) { return internShapeDeep(arrElemNameRaw(nm)) }
   // A MAP name (`{[string]: V}`): the inline shapes buried in the VALUE position are
   // otherwise unreachable — the whole map is ONE TypeRef name, so a struct-valued map
   // (`{[string]: {f:f32}}`), a nested-map value (`{[string]: {[string]: i64}}`), a
@@ -10750,9 +10740,7 @@ export function nameIsNestedScalarLeafArray(nm: string): boolean {
 // SAME ref-list wrapper (see the peel below). A union / map / closure element stays
 // un-admitted (their reps carry the R1/R3/R5 seams).
 function structElemArrayLowerable(t: string): boolean {
-  if t.length < 3 || t[t.length - 2] != '[' || t[t.length - 1] != ']' {
-    return false
-  }
+  if !nameIsElemArray(t) { return false }
   // The element text as WRITTEN carries any grouping parens the source spelled
   // (`({g: i32})[]` — pure grouping, `({f: i32} | null)[]` — the nullable-struct
   // NICHE element). Peel the grouping pair, then a `| null` wrapper, so both reach
@@ -10764,7 +10752,7 @@ function structElemArrayLowerable(t: string): boolean {
   // Un-admitted, the whole closure-result struct stayed un-interned and the body
   // literal fieldset-collided onto its own ELEMENT row (`{f:…}` on both) —
   // INVALID-WASM at the `struct.new` (fuzz report-only branching leg).
-  let base = normTypeAtom(t.slice(0, t.length - 2))
+  let base = normTypeAtom(arrElemNameRaw(t))
   const nb = nullablePartOf(base)
   if nb != "" { base = normTypeAtom(nb) }
   if base.length >= 2 && base[0] == '{' && base[1] != '[' {
@@ -10955,9 +10943,7 @@ function internFuncTypeShapes(nm: string): i32 {
   }
   const np = nullablePartOf(nm)
   if np != "" { return internFuncTypeShapes(np) }
-  if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
-    return internFuncTypeShapes(nm.slice(0, nm.length - 2))
-  }
+  if nameIsElemArray(nm) { return internFuncTypeShapes(arrElemNameRaw(nm)) }
   if nm[0] == '{' && nm[1] != '[' && nm[nm.length - 1] == '}' {
     if funcTypeShapeLowerable(nm) {
       internShapeFieldElems(nm)
@@ -11000,14 +10986,7 @@ function internNonLowerableFieldShapes(nm: string) {
       } else {
         // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
         // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
-        let base = nonNulBaseOf(ftxt)
-        while (
-          base.length > 2 &&
-          base[base.length - 2] == '[' &&
-          base[base.length - 1] == ']'
-        ) {
-          base = base.slice(0, base.length - 2)
-        }
+        const base = arrLeafNameOf(nonNulBaseOf(ftxt))
         if base.length >= 2 && base[0] == '{' && base[1] != '[' {
           internShapeDeep(base)
         }
@@ -11032,16 +11011,10 @@ function internShapeFieldElems(nm: string) {
   let fi = 0
   while fi < fnames.length {
     if fnames[fi] != "" {
-      let ftxt = ftexts[fi]
-      let peeled = false
-      while (
-        ftxt.length > 2 &&
-        ftxt[ftxt.length - 2] == '[' &&
-        ftxt[ftxt.length - 1] == ']'
-      ) {
-        ftxt = ftxt.slice(0, ftxt.length - 2)
-        peeled = true
-      }
+      const ftxt = arrLeafNameOf(ftexts[fi])
+      // `peeled` — "the loop ran at least once" — IS `leaf != name`: every iteration
+      // shortens by exactly two characters, so the peel is the identity iff nothing peeled.
+      const peeled = ftxt != ftexts[fi]
       if peeled && ftxt.length >= 2 && ftxt[0] == '{' && ftxt[1] != '[' {
         internInlineShape(ftxt)
       }
@@ -11327,15 +11300,7 @@ export function gaeEnsure(name: string) {
     const tn = gaeApplyFieldTy(gaeFieldTyNames[fs + fi], pnames, args)
     // A field that is ITSELF an application (or an array of one) interns
     // depth-first, so the ref/elem lookups below resolve.
-    let base = tn
-    while (
-      base.length > 2 &&
-      base[base.length - 2] == '[' &&
-      base[base.length - 1] == ']'
-    ) {
-      base = base.slice(0, base.length - 2)
-    }
-    gaeEnsure(base)
+    gaeEnsure(arrLeafNameOf(tn))
     let code = nameFieldCode(tn)
     let elem = ""
     if code < 0 {
@@ -11621,8 +11586,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
 function refArrElemKeyDeferred(name: string) {
   const e = refArrElemName(name)
   if e != "" { return e }
-  if nameIsArray(name) { return name.slice(0, name.length - 2) }
-  ""
+  // This IS `arrElemNameRaw` character-for-character (guard, cut, `""` otherwise) — it
+  // predates the home and is now the home's call.
+  arrElemNameRaw(name)
 }
 
 // The ELEMENT/TARGET name a shape-text field records in `uFieldElemName`: a
@@ -19581,7 +19547,7 @@ export function drwFieldClosure(si: i32, name: string) {
 export function resolveShapeToNominal(name: string) {
   if name == "" { return "" }
   if nameIsArray(name) {
-    const inner = resolveShapeToNominal(name.slice(0, name.length - 2))
+    const inner = resolveShapeToNominal(arrElemNameRaw(name))
     if inner == "" { return "" }
     return inner + "[]"
   }

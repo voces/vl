@@ -22436,3 +22436,267 @@ re-`check`s. The *parser* half IS pinned, by both fixtures.
      compiles and executes every fixture; `format.vl` is on neither path. The channel that can see
      it is a fmt sweep with an idempotence leg. *Pick the channel by what the change touches, not
      by what the harness already does.*
+## D-ARRCLASSIFY — the ARRAY-NAME grammar leaves the compiler's LARGEST file: 49 hand-written copies in `emit_classify.vl` go to 3, and the peel loop gets the home it never had (#PRNUM)
+
+Branched from **`339ed9a`** (#1177), rebased onto **`563b9e7`** (#1180 — comment-only, and it does
+not touch this partition). Partition: `compiler/emit_classify.vl` + `compiler/emit_base.vl` + this
+doc. `emit_classify.vl` is 19,559 lines and holds **175** of the 23-resolver list's 311 tree-wide
+call sites — **56% of everything tracked** — and until this slice it had never been sliced.
+
+### THE INSTRUMENT, VALIDATED AGAINST THREE PUBLISHED FIGURES BEFORE PRODUCING A NEW ONE
+
+Two counters, two UNITS, and neither is a grep count.
+
+1. **CALL SITES** (`parsercount.py`, unchanged from #1174/#1175): a textual `NAME(` in
+   non-comment, non-string code; `//` stripped string-literal-aware; each resolver's own
+   `function NAME(` header excluded; per-file sums cross-checked against a tree-wide recount.
+   At `59fc905` it reads `emit_classify` **175** · `emit_base` **51** · tree-wide **306** —
+   reproducing the brief's target figure to the site.
+2. **GRAMMAR OCCURRENCES** (new): one hand-written instance of a character-level type-name
+   grammar. Enumerated by *what the CODE is*, not what the argument is — a suffix test is
+   `X[n-2]=='[' && X[n-1]==']'`, a peel is `.slice(0, X.length-2)`, a walk is a loop that
+   increments AND decrements an integer against a grouper.
+
+**THE INSTRUMENT WARNING WAS REAL AND WAS HONOURED.** A comment-stripper that blanks
+single-quoted char literals as strings makes every character-pattern census read **0**. This
+stripper treats a single quote as ORDINARY CODE and only double quotes as string delimiters,
+so `name[n - 2] == '['` survives verbatim. The proof that it works is that it reproduces two
+figures published by two other parties: **#1175's "`emit_classify` holds 49 occurrences of the
+ARRAY-NAME grammar"** (13 + 13 + 23 = 49, exact) and **#1177's "SHAPE-open, 14 tree-wide"**
+(`emit_classify` 6 · `emit_collect` 3 · `emit_rep` 2 · `emit_base` 2 · `typecheck` 1 = 14,
+exact, including the per-file split). Three reproductions across two instruments before any
+new number was quoted.
+
+### THE CENSUS — the largest file in the compiler, by GRAMMAR
+
+Comment-stripped, at this slice's own HEAD (`339ed9a`), not inherited:
+
+| grammar (hand-written occurrences) | emit_classify | typecheck | emit_base | emit_collect | emit_mono | emit_rep | format | TOT |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ARRAY suffix TEST-open `X[n-2]=='['` | **13** | 4 | 1 | 0 | 1 | 0 | 0 | 19 |
+| ARRAY suffix TEST-close `X[n-1]==']'` | **13** | 4 | 1 | 1 | 0 | 0 | 0 | 19 |
+| ARRAY CUT `.slice(0, len-2)` | **23** | 4 | 1 | 0 | 1 | 0 | 0 | 29 |
+| SHAPE-open `X[0]=='{'` | 15 | 6 | 7 | 4 | 0 | 2 | 1 | 35 |
+| SHAPE-2nd `X[1]=='['` | 13 | 3 | 5 | 4 | 0 | 2 | 0 | 27 |
+| PAREN-open `X[0]=='('` | 7 | 7 | 6 | 1 | 1 | 0 | 0 | 22 |
+| PAREN-close `X[len-1]==')'` | 3 | 8 | 4 | 0 | 0 | 0 | 0 | 15 |
+| ARROW-prefix `X[0]=='='` / `X[1]=='>'` | 2 | 2 | 0 | 0 | 4 | 0 | 0 | 8 |
+| **TOTAL** | **89** | 38 | 25 | 10 | 7 | 4 | 1 | 174 |
+
+**The ARRAY-NAME grammar is 49 of `emit_classify`'s 89 — 55% of all character surgery in the
+compiler's largest file is ONE rule**, and #1175 had already given both its halves a home in
+`emit_base.vl` (`nameIsArray` tests, `arrElemNameRaw` cuts, `listElemNameOf` = cut + paren
+strip). This slice ROUTES to those homes; it does not build a second one.
+
+### WHAT THE 49 ACTUALLY WERE — four idioms, not 49 decisions
+
+The census's payoff is that the 49 collapse into **four spellings of one rule**, and the four
+plus the three deliberate declines account for all 49 exactly: **23 + 6 + 5 + 12 + 3 = 49**.
+
+**IDIOM A — the guarded cut, `n >= 3` flavour (8 sites, 23 occurrences).**
+`if n >= 3 && name[n-2]=='[' && name[n-1]==']' { const base = name.slice(0, n-2); … }`.
+`n > 2` and `n >= 3` are the same integer predicate, and the whole triple is **`nameIsArray`
+MINUS exactly one name** — the degenerate `"[]"`. It is also, exactly, the guard half of
+`arrElemNameRaw(name) != ""`: the raw cut yields `""` for a shorter name and for a non-array
+alike, so the two agree by construction. Sites: `nameIsRefArray`, `refArrElemKind`,
+`refArrElemName`, `rlCanonLitUnionAtoms`, `internShapeDeep`, `internFuncTypeShapes`,
+`structElemArrayLowerable` (the negated form), `mvCanonValName` (test only, no cut).
+
+**IDIOM B — a `nameIsX` predicate that ALREADY implies the array test, followed by the raw cut
+(6 sites, 6 occurrences).** `if nameIsI32ListArray(name) { return name.slice(0, name.length - 2) }` and its
+four siblings, plus `refArrShapeKind`'s `nameIsArray(name) && nameIsStringArray(<cut>)`.
+Four of these are the cluster the brief filed (at `9870/9877/9879/9886` when it
+was filed; **`9895/9901/9902/9904/9911` at this HEAD** — re-derived by anchor text, since three
+stale leads have shipped this arc). Each predicate is itself already routed through the homes,
+so the raw cut beside it was the last hand-written copy in the expression.
+
+**IDIOM C — `nameIsArray(name)` guard + raw cut (3 sites, 5 occurrences).** `refArrElemKeyDeferred` is
+`arrElemNameRaw` **character-for-character** — guard, cut, `""` otherwise. (The brief predicted
+this at line 11599; it is at **11624** on this HEAD. Re-derived, not trusted.)
+
+**IDIOM D — the PEEL LOOP (4 sites, 12 occurrences), which had NO home at all.**
+`while (X.length > 2 && X[len-2]=='[' && X[len-1]==']') { X = X.slice(0, len-2) }` — six or
+seven lines, four times: `internShapeArms`, `internNonLowerableFieldShapes`,
+`internShapeFieldElems`, `gaeEnsure` (plus one more in `emit_collect.vl`, not this partition).
+**Three of the four then ask the SAME next question of the leaf** (`leaf[0]=='{' &&
+leaf[1]!='['`), which is why the drift risk is real rather than theoretical: a peel that stops
+one level short hands a `{…}[]` to a test that only accepts `{…}`.
+
+### WHAT SHIPPED — two LAYERS in `emit_base.vl`, then routing
+
+Neither new function re-writes a character compare; each is the existing home applied once more.
+
+- **`nameIsElemArray(name)`** = `name.length >= 3 && nameIsArray(name)`. The IDIOM-A triple, at
+  one place. It is a layer over `nameIsArray` exactly as `listElemNameOf` is a layer over
+  `arrElemNameRaw`. It exists rather than routing to `arrElemNameRaw(name) != ""` because that
+  spelling **allocates a slice to answer a boolean**, and several asking sites are per-struct
+  inner loops the program has already paid an allocation regression to once (`nameIsRefArray`'s
+  own header records the `sNames[i] + "[]"` concat it deleted for that reason).
+- **`arrLeafNameOf(name)`** = `arrElemNameRaw` to fixpoint. IDIOM D's home. It is the CUT home
+  applied repeatedly, not a second copy of the cut: the loop body is a call, and it advances
+  only while that call yields a non-empty element — so the degenerate `"[]"` terminates the peel
+  rather than looping, exactly as the `length > 2` bound in every copy did.
+  `nameIsNestedUnionElemArray` runs a similar shape by hand for a *different* reason (it needs
+  the last array-name RUNG, not the leaf) and is deliberately NOT folded in.
+
+`internShapeFieldElems`' `peeled` flag needed one identity to route: **"the loop ran at least
+once" IS `leaf != name`**, because every iteration shortens by exactly two characters.
+
+### BEFORE / AFTER IN BOTH UNITS — AND THE TRACKED NUMBER GOES UP
+
+| unit | master `339ed9a` | this PR | Δ |
+| --- | ---: | ---: | ---: |
+| ARRAY-NAME grammar occurrences, `emit_classify` | **49** | **3** | **−46** |
+| ARRAY-NAME grammar occurrences, tree-wide | 67 | 21 | −46 |
+| All character grammars, `emit_classify` | 89 | 43 | −46 |
+| ARRAY-NAME HOME calls, `emit_classify` | 14 | 42 | **+28** |
+| ARRAY-NAME HOME calls, tree-wide | 55 | 85 | +30 |
+| **CORE (23-resolver list), `emit_classify`** | **175** | **175** | **0** |
+| **CORE (23-resolver list), `emit_base`** | **51** | **52** | **+1** |
+| **CORE (23-resolver list), tree-wide** | **311** | **312** | **+1** |
+
+**THE CORE COLUMN RISES BY ONE AND THAT IS THE HONEST READING, NOT A REGRESSION TO EXPLAIN
+AWAY** — the same effect #1175 recorded when it drove 14 copies to 0 and CORE went 303 → 306.
+Naming inline character surgery converts an INVISIBLE operation into a COUNTED call. Decomposed
+exactly, to the call:
+
+- `emit_base` **+1**: the single `nameIsArray(name)` call inside the new `nameIsElemArray` body.
+  (`arrLeafNameOf`'s call to `arrElemNameRaw` is +1 on the home-call unit but **0** on CORE —
+  `arrElemNameRaw` is not on the 23-resolver list.)
+- `emit_classify` **net 0**: **−1** (`refArrElemKeyDeferred`'s `nameIsArray` guard is subsumed
+  into `arrElemNameRaw`) **+1** (`genTyParamArr`'s inline `n < 2` + two char compares become the
+  `nameIsArray` call they always were).
+- Nothing else moved: 175 on both sides, per file, cross-checked against the tree-wide total.
+
+**The two units move in opposite directions and both are true.** −46 grammar occurrences is the
+deletion; +30 home calls is where they went; +1 CORE is the accounting artifact of naming them.
+
+Binary **1,033,248 → 1,030,219 B (−3,029)**. Source: `emit_classify` −34 net lines (39 added,
+73 removed), `emit_base` +45 (all but 8 of them the two headers). Wall-time self-compile A/B
+(each side warmed FIRST, discarded): 2,015 vs 2,044 ms and 2,949 vs 2,037 ms across two runs —
+**the noise band exceeds the difference**, measured with a fuzz sweep running concurrently, so
+the honest statement is *no measurable time change*, and the reliable number is the −3,029 B.
+
+### THE THREE SITES DELIBERATELY NOT ROUTED — and the comment that already said so
+
+`emit_classify`'s ARRAY-CUT count is 3, not 0, and each survivor is a **behaviour difference
+wearing a dedup's clothes**:
+
+| site | code | why not |
+| --- | --- | --- |
+| `11141` (`collectS` code-28 arm) | `if raw28.length > 2 { raw28 = raw28.slice(0, raw28.length - 2) }` | an **unguarded** 2-char cut — no `[]` test at all. Routing it to `arrElemNameRaw` would change the answer for any non-`[]`-terminated name. |
+| `11318` (`gaeEnsure` code-5 arm) | `elem = tn.slice(0, tn.length - 2)` | equivalent **only under the invariant** "code 5 is assigned only under `nameIsArray`". That is an invariant, not a local syntactic fact; a routing that depends on one is not a no-behaviour-change refactor. |
+| `12341` (`unionListElemMapFieldMember`) | `if en == "" && a.length > 2 { en = a.slice(0, a.length - 2) }` | **the code already says not to.** `refArrElemKeyDeferred`'s header calls this "a THIRD copy of this grammar" that "gates the fallback on `a.length > 2` rather than `nameIsArray(a)`. It is NOT folded in here: the two guards agree only because that copy already sits inside a `nameIsRefArray(a)` arm, and unifying them would be a behaviour change wearing a dedup's clothes." That reasoning is upheld, at its own site, unchanged. |
+
+### THE `nameIsArray` ARROW-BLINDNESS QUESTION — MEASURED, AND DELIBERATELY NOT TOUCHED
+
+#1175 filed that `nameIsArray` is arrow-blind: `nameIsArray("(i32) => i32[]")` is TRUE, three
+callers carry their own `annArrowAt` guard and four carry none. **This slice did not change it,
+and says so loudly.** It is a BEHAVIOUR change: it needs its own graded population, its own
+sabotage and its own entombment, measured separately. Folding it into a routing whose entire
+claim is "no behaviour change" would break the one-variable rule and would make every zero in
+the section below uninterpretable. Filed forward intact.
+
+### ENTOMBMENT — five sabotages, and TWO OF THEM ARE ZERO, WHICH IS A DIFFERENT CLAIM
+
+A behaviour-preserving refactor cannot have a pin that fails on master (method note 11); it is
+entombed by equivalence evidence plus a pin that fails under the SABOTAGE. Every sabotage was
+compiled with the **pristine fetched master seed**, never with a self-compiled one (the
+self-poisoning rule), and all eight artifacts were sha-checked as distinct before any number was
+read — S1 and S1b are the same SIZE and would have looked like one build.
+
+| # | sabotage (breaks an invariant, never permutes one) | corpus /1,407 | fuzz |
+| --- | --- | ---: | ---: |
+| **S2** | `nameIsElemArray` always false — kills all 8 routed IDIOM-A guards | **158 build / 139 run** | **290 / 7,200** |
+| **S4** | one routed IDIOM-B cut becomes the paren-STRIPPING `listElemNameOf` | **42 build / 41 run** | **286 / 21,600** |
+| **POISON** | `emitFail` at all four `arrLeafNameOf` call sites when the argument is an array name | **56 build / 56 run** | — |
+| S1 | `arrLeafNameOf` peels ONE level instead of to fixpoint | 0 | — |
+| S1b | `arrLeafNameOf` peels ZERO levels (the identity) | 0 | **0 / 21,600** |
+| S3 | `nameIsElemArray` drops its `length >= 3` bound (becomes `nameIsArray`) | 0 | **0 / 21,600** |
+
+**S2 and S4 are the entombment**, and they need NO new fixture — the pre-existing corpus already
+reddens on both channels for both. **BOTH CHANNELS ARE GRADED LIVE**: the fuzz harness that
+reads 0 for the real change reads 290 and 286 against sabotages known live on the corpus, so
+this fuzz zero is agreement, not blindness (#1125's and #1127's inverse failure, twice).
+
+**S1b AND S3 ARE ZERO ON BOTH CHANNELS, AND THAT IS THE ABSENCE OF A WITNESS, NOT AGREEMENT.**
+Reported as such:
+
+- **S3** isolates the ONE name where `nameIsElemArray` differs from `nameIsArray` — the
+  degenerate `"[]"`. 1,407 corpus files and 21,600 fuzz programs produce none. The FAITHFUL
+  form (with the bound) ships anyway, exactly as #1175 shipped its faithful two-call form
+  against an identical empty population. Unreached is not the same claim as licenced.
+- **S1b is the sharper one, and it is a FINDING, not a footnote.** The POISON probe proves the
+  four peel sites are reached with array names on **56 corpus files** and that the channel sees
+  them — yet making the peel the IDENTITY changes **nothing** on 1,407 corpus files, 21,600
+  fuzz programs, and six purpose-built probes (1-D / 2-D / 3-D inline-shape list fields in
+  closure-result, union-arm and generic-application position, f64 / string / `Box<T>` elements;
+  all six agree on master, on this build, and under S1b). Traced: at `internShapeArms` the leaf
+  only feeds a `[0]=='{'` test that `{…}[]` passes anyway; at `internNonLowerableFieldShapes`
+  the callee `internShapeDeep` peels again, so the peel is idempotent; the `gaeEnsure` and
+  `internShapeFieldElems` legs produced no witness at all. **So the peel DEPTH at all four sites
+  is consequential nowhere this program can currently see.** The faithful peel-to-fixpoint
+  ships — a routing may not change what it routes — but the population is filed below as a
+  deletion candidate for a slice that can grade it, and it must NOT be deleted on this zero.
+
+### METHOD NOTES
+
+117. **A GRAMMAR CENSUS AND A NAME CENSUS ARE DIFFERENT INSTRUMENTS AND MUST BOTH BE
+     REPORTED.** This slice deleted 46 grammar occurrences and the 23-resolver CORE went **UP
+     by 1**. Neither number is wrong and neither alone is honest. Publish the delta in the
+     unit the WORK moved *and* in the unit the scoreboard tracks, decompose the scoreboard
+     delta to the individual call, and say which is which. A slice that reports only CORE
+     reads as "+1, a regression"; one that reports only grammar reads as "−46, done".
+
+118. **VALIDATE A NEW INSTRUMENT AGAINST A FIGURE PUBLISHED BY SOMEONE ELSE, INCLUDING ITS
+     PER-FILE SPLIT.** This census reproduced #1175's 49 and #1177's 14 — the latter across
+     five files, each exact — before producing one new number. A total can agree by accident;
+     a five-way split cannot.
+
+119. **A PREDICATE THAT IMPLIES THE GUARD IS STILL A HAND-WRITTEN COPY OF IT.** Five of the 49
+     were `if nameIsX(name) { return name.slice(0, name.length - 2) }` — a fully-routed
+     classifier standing immediately beside the raw character surgery it makes redundant. The
+     name census cannot see these (the line contains a legitimate resolver CALL); only the
+     grammar census finds them. **Look for surgery ADJACENT to a home call, not just surgery
+     alone.**
+
+120. **"THE SITES ARE REACHED" AND "THE COMPUTATION MATTERS" ARE TWO DIFFERENT MEASUREMENTS,
+     AND A ROUTING NEEDS ONLY THE FIRST.** The peel loops are provably live (56 corpus files
+     under an `emitFail` poison) and provably inconsequential (identity peel, 0 diffs on both
+     channels). Had only the second been measured, the routing would have looked unentombed;
+     had only the first, the peel would have looked load-bearing. **Run the reach probe and the
+     semantic sabotage separately — a zero from one does not transfer to the other.**
+
+### HAND-OFFS
+
+1. **SHAPE-open now has a NAMED shape and still no home — and the home belongs in `emit_base`,
+   which this slice owned and deliberately did not extend.** #1177 filed it as "14 tree-wide".
+   Reproduced exactly, but the 14 are **five distinct spellings** in `emit_classify` alone and
+   they are NOT interchangeable:
+   - whole-span `X[0]=='{' && X[1]!='[' && X[len-1]=='}'` — 6 sites (7580, 10801, 10868, 10947,
+     11037, 13429)
+   - open-only `X[0]=='{' && X[1]!='['` — 5 sites (7722, 7910, 10758, 10990, 11018)
+   - map-open `X[0]=='{' && X[1]=='['` — 1 (9251)
+   - brace-span with no map exclusion `X[0]=='{' && X[len-1]=='}'` — 2 (2801, 10021)
+   - bare `X[0]=='{'` — 1 (10570)
+
+   **`nameIsWholeSpanShape` (emit_classify:7578) is NOT the home for any of them**: it adds a
+   `tyGroupWrapsWhole` balance walk on top of the three-character test, so routing the six
+   whole-span sites to it TIGHTENS them. That is a behaviour change needing its own population.
+   The honest shape of this hand-off is **two** homes (an open test and a whole-span test),
+   both plain, plus a measured decision about the balance walk — not one.
+2. **PAREN-open is 13 in this partition (`emit_classify` 7 · `emit_base` 6) and ARROW-prefix 2**,
+   both un-homed, both smaller and both entangled with `peelGroupParens` /
+   `parenEnclosesWhole` / `annFnDecompose`, which already exist. Whoever takes these should
+   check first whether the site wants the naive strip or the balanced one — #1175's
+   `listElemNameOf` header records that widening a naive strip to a balanced one CHANGES what
+   `(a)|(b)`-shaped elements classify as.
+3. **The peel loops may be deletable outright.** S1b makes `arrLeafNameOf` the identity with 0
+   diffs on 1,407 corpus files and 21,600 fuzz programs, while the poison proves 56 files reach
+   it. That is a real deletion candidate worth 12 grammar occurrences and four call sites, and
+   it needs a channel that can grade it — the corpus and this generator both come up empty.
+   **Do not delete it on the zero above**; the zero is the absence of a witness.
+4. **`nameIsArray`'s arrow-blindness is still open, still unmeasured, and now single-site.**
+   With one home, `nameIsArray("(i32) => i32[]") == true` is a question that can be asked once.
+   Three callers guard it with `annArrowAt`, four do not. Whoever takes it: it is a BEHAVIOUR
+   change, it needs a pin that fails on master, and it must not ride along with a routing.
