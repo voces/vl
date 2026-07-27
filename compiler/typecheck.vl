@@ -333,14 +333,37 @@ export let cUserTypesVer = 0
 
 // GENERIC TYPE ALIASES (A10 stage 3, host `instantiateAlias`): a parameterized
 // `type Box<T> = { value: T }` registers here (NOT in `cUserTypes` — it has no
-// concrete type until applied). Three parallel arrays: the base name ("Box"),
-// the comma-joined parameter names ("T" / "A,B"), and the `TypeDecl` node index
-// whose fields are re-resolved per APPLICATION (`Box<i32>`) under a type-param
-// binding environment. Applications memoize into `cUserTypes` under their full
-// synthetic name ("Box<i32>"), which also closes recursive applications.
+// concrete type until applied). Parallel per-alias arrays: the base name ("Box"),
+// the parameter-name SLICE (see below), and the `TypeDecl` node index whose fields
+// are re-resolved per APPLICATION (`Box<i32>`) under a type-param binding
+// environment. Applications memoize into `cUserTypes` under their full synthetic
+// name ("Box<i32>"), which also closes recursive applications.
 let gaNames: string[] = []
-let gaParamLists: string[] = []
 let gaDeclIxs: i32[] = []
+
+// D-GAPARAM — the declared type-PARAMETER NAMES, as a flat column plus a
+// (start, count) slice per alias, the same shape the spelling arena uses for its
+// kids (`tsKids`/`tsKidStart`/`tsKidCount`).
+//
+// This column used to be `gaParamLists: string[]`, ONE COMMA-JOINED STRING per
+// alias ("T", "A,B") that `applyGenAliasArgs` split back apart with
+// `splitGenArgs` on EVERY APPLICATION. The joining is not this file's doing:
+// `parser.vl`'s `parseTypeDecl` folds the parameter TOKENS into the declared
+// name (`name = name + ","` per parameter) and its own comment says "the checker
+// splits them back out" — so a list the parser held as tokens was joined into a
+// string, sliced back out of that string here at registration, and then
+// re-split at every use. Splitting ONCE at registration removes the per-
+// application parse and the per-application `string[]` it allocated; the arity
+// check and the binding loop read `gaParamCount` / `gaParamNames[start + k]`
+// directly.
+//
+// The remaining half is a HAND-OFF to whoever owns `parser.vl` + `ast.vl`: bank
+// the parameter names on the `TypeDecl` node (a `string[]` beside `tdFields`, or
+// the same flat-column shape) and the `<`-scan-and-slice at registration goes
+// too — a name is then only ever a name, never a list the checker takes apart.
+let gaParamNames: string[] = []
+let gaParamStart: i32[] = []
+let gaParamCount: i32[] = []
 
 // The TYPE-PARAM BINDING ENVIRONMENT consulted by `nameToTy` (innermost LAST):
 // a generic function's `<T>` names bind to their TyVars while its annotations
@@ -1833,8 +1856,10 @@ export function initChecker() {
   tyMutEpoch = tyMutEpoch + 1
   cUserTypesVer = cUserTypesVer + 1
   gaNames = []
-  gaParamLists = []
   gaDeclIxs = []
+  gaParamNames = []
+  gaParamStart = []
+  gaParamCount = []
   annotNameMemo = Map()
   annotNameMemoNegVer = Map()
   annotPart = Map()
@@ -4943,6 +4968,17 @@ function arrElemRender(el: string, elTy: i32): string {
 // top one; `'='` is the scanner's arrow token, so the `>` lookahead lives in the home.
 function topLevelArrowIndex(name: string) { tyTopIndexOf(name, '=', 0, 0) }
 
+// The TOP-LEVEL arrow index the LAST `isTopLevelFuncTypeName` call scanned for —
+// produced BY the predicate instead of re-derived by a caller that needs the index as
+// well as the answer (#1113's `canonAtoms` / `emitNameAtoms` pattern, applied to a
+// POSITION rather than a width). Meaningful only when that call returned TRUE; a FALSE
+// answer can come from any of the three conjuncts and leaves whatever the scan found.
+//
+// Not an arena-lifetime sidecar (method note 7): a scalar written on the way out of the
+// predicate and read by the IMMEDIATE caller, with no call between the write and the
+// read, never carried between programs.
+let funcArrowAt = -1
+
 // True if `name` is a top-level FUNCTION TYPE `(params)=>ret` — a top-level `=>` with the
 // leading `(...)` param group closing right before it. The `=>` binds LOOSER than `|`/`&`,
 // so `(i32) => A | B` is `(i32) => (A | B)` (a function returning a union), NOT
@@ -4951,6 +4987,7 @@ function topLevelArrowIndex(name: string) { tyTopIndexOf(name, '=', 0, 0) }
 // parens (depth 1), so `topLevelArrowIndex` returns -1 and it still splits as a union.
 export function isTopLevelFuncTypeName(name: string) {
   const arrowAt = topLevelArrowIndex(name)
+  funcArrowAt = arrowAt
   if arrowAt < 1 { return false }
   if name[0] != '(' { return false }
   if name[arrowAt - 1] != ')' { return false }
@@ -5102,8 +5139,11 @@ export function applyGenAlias(head: string, inner: string) {
 function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   const gi = gaIndexOf(head)
   if gi < 0 { return -1 }
-  const pnames: string[] = []
-  splitGenArgs(gaParamLists[gi], pnames)
+  // The declared parameter names, read as a SLICE of the flat column — split
+  // once when the alias registered (D-GAPARAM), not re-split here per
+  // application. `pcount` is the declared ARITY.
+  const pstart = gaParamStart[gi]
+  const pcount = gaParamCount[gi]
   const argTys: i32[] = []
   if appIx >= 0 {
     const astart = tsKidStart[appIx]
@@ -5131,12 +5171,12 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
       ai = ai + 1
     }
   }
-  if argTys.length != pnames.length {
+  if argTys.length != pcount {
     tErr(
       "`" +
         head +
         "` expects " +
-        i32ToStr(pnames.length) +
+        i32ToStr(pcount) +
         " type arguments but got " +
         i32ToStr(argTys.length),
       annotDiagAt,
@@ -5156,8 +5196,8 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   cUserTypes[memoKey] = resIx
   cUserTypesVer = cUserTypesVer + 1 // new declared-name resolution registered
   let bi = 0
-  while bi < pnames.length {
-    tpEnvNames.push(pnames[bi])
+  while bi < pcount {
+    tpEnvNames.push(gaParamNames[pstart + bi])
     tpEnvTys.push(argTys[bi])
     bi = bi + 1
   }
@@ -5201,7 +5241,7 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   // are `fnames`/`ftys`) — an existing arena entry changed shape.
   tyMutEpoch = tyMutEpoch + 1
   let pj = 0
-  while pj < pnames.length {
+  while pj < pcount {
     tpEnvNames.pop()
     tpEnvTys.pop()
     pj = pj + 1
@@ -7283,15 +7323,32 @@ export function canonEmitName(name: string) {
     !isTopLevelFuncTypeName(name)
   ) {
     const core = canonEmitName(name.slice(0, name.length - 2))
+    // The ELEMENT's own atom WIDTH, as the element's producer reported it. D-ELEMWIDTH:
+    // master asked `nameHasPipe(core)` — a whole-name depth scan of a string this very
+    // function had just finished building, to recover a number the build already knew.
+    // A WIDE element (more than one top-level atom) is exactly a union element.
+    const coreAtoms = canonAtoms
     // A list name is ONE atom in every form below — a union element is parenthesized
     // precisely so its `|`s stop being top-level. Set rather than inherited: the element
     // recursion left the ELEMENT's width in `canonAtoms`.
     canonAtoms = 1
-    if nameHasPipe(core) { return "(" + core + ")[]" }
-    // A FUNCTION-type element keeps grouping parens (`((i32) => i32)[]` — an ARRAY OF
-    // functions), so the name stays distinct from `(i32) => i32[]` (a function RETURNING
-    // a list). `canonEmitName` strips the element's own wrapping parens (the bare
-    // top-level `(i32) => i32`), so re-add them — mirroring the union-member rule above.
+    // A UNION element (`(A|B)[]`) or a FUNCTION-type element (`((i32) => i32)[]` — an
+    // ARRAY OF functions, distinct from `(i32) => i32[]`, a function RETURNING a list)
+    // keeps grouping parens; `canonEmitName` strips a member's own wrapping parens, so
+    // re-add them — mirroring the union-member rule above.
+    //
+    // THE TWO TESTS ARE NOT A PARTITION AND THE OVERLAP IS THE POINT. Width and
+    // `nameHasPipe` disagree on exactly one shape — a top-level FUNCTION type whose
+    // RESULT is a union (`(i32) => f64|boolean`), which has a top-level `|` and is ONE
+    // atom, because the function arm sets `canonAtoms = 1` and its `|` sits behind the
+    // top-level `=>`. Every such name is claimed by the SECOND test, whose returned
+    // expression is character-for-character the first's — so the reclassification cannot
+    // reach an output. Measured both directions on both channels: 29,108 reaches
+    // (1,419 corpus + 27,689 fuzz), 287 disagreements, 287/287 in that direction and
+    // 287/287 `isTopLevelFuncTypeName`, and ZERO in the other direction (a wide element
+    // with no top-level `|` does not exist — `canonAtoms` exceeds 1 only at the union
+    // join and the `|null` suffix, both of which write the separator).
+    if coreAtoms > 1 { return "(" + core + ")[]" }
     if isTopLevelFuncTypeName(core) { return "(" + core + ")[]" }
     return core + "[]"
   }
@@ -7312,7 +7369,11 @@ export function canonEmitName(name: string) {
   // parens. A simple `(i32) => i32` ends in its return type (not `)`), so it never reached the
   // strip above and falls through unchanged — this only re-canonicalizes the nested form.
   if isTopLevelFuncTypeName(name) && name[name.length - 1] == ')' {
-    const fa = topLevelArrowIndex(name)
+    // The arrow index the guard above just scanned for, not a second scan of the same
+    // name for the same position (D-ARROWBANK). Nothing runs between the predicate's
+    // return and this read: the `&&` right operand is a plain index compare, so the
+    // bank cannot have been overwritten by another `isTopLevelFuncTypeName` call.
+    const fa = funcArrowAt
     const psStr = name.slice(1, fa - 1)
     let out = "("
     if psStr.length > 0 {
@@ -11601,8 +11662,20 @@ function checkProgramNode(n: Program) {
       }
       if gLt > 0 {
         gaNames.push(gname.slice(0, gLt))
-        gaParamLists.push(gname.slice(gLt + 1, gname.length - 1))
         gaDeclIxs.push(stmts[t0])
+        // D-GAPARAM: split the folded parameter list ONCE, here, into the flat
+        // column. Master re-split the joined string inside `applyGenAliasArgs`,
+        // i.e. once per APPLICATION of the alias; the list is a property of the
+        // DECLARATION and cannot change between applications.
+        const gps: string[] = []
+        splitGenArgs(gname.slice(gLt + 1, gname.length - 1), gps)
+        gaParamStart.push(gaParamNames.length)
+        gaParamCount.push(gps.length)
+        let gpi = 0
+        while gpi < gps.length {
+          gaParamNames.push(gps[gpi])
+          gpi = gpi + 1
+        }
       } else {
         // A bodyless alias (parser sentinel `tdFields == [-1]`) registers as the
         // error type — the parser already reported it, and the error type
