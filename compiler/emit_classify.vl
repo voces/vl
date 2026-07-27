@@ -8510,8 +8510,14 @@ export function tyAnnRefListKind(tyIx: i32) {
     // default i32 wrapper, exactly as the `K[]` alias spelling does. Ahead of the name arm:
     // the canon pass softens the bare inline union to `string`, so the spelling reads
     // `string[]` and `nameIsStringArray` would seed the string-list build (kind 3) for an
-    // empty `[]` while the cell is the atom i32 list. See `annRepKindOf`.
+    // empty `[]` while the cell is the atom i32 list. This function has NO `repOf` leg — it
+    // answers a literal-BUILD seed, not a cell rep — so the rep layer cannot subsume it and
+    // the check has to stand here.
     if tyIsLitUnionArray(nodeTyIxOf(tyIx)) { return 0 }
+    // The nullable-ELEMENT twin (`(("a" | "b") | null)[]`, kind 9), ahead of the name arms
+    // for the same reason: the softened `(string | null)[]` spelling would seed the
+    // string-list build (kind 3) for a cell that is the i32 atom-niche list.
+    if annIsNulLitUnionArray(tyIx) { return 9 }
     const lt = P.nodes[tyIx]
     if lt is TypeRef {
       if nameIsStringArray(lt.tyName) { return 3 }
@@ -8644,8 +8650,23 @@ export function nulScalarListKind(name: string): VKind | null {
   null
 }
 // The nullable-scalar-list VKind of annotation node `tyIx`, or `null`.
+//
+// ARENA-FIRST, and the arena's answer is TOTAL where it covers: the four spellings this
+// picks out are exactly the nullable lists whose leaf has its OWN wrapper heap type, and
+// `repOfNode` names that leaf directly. It has to lead, because the SPELLING can no longer
+// tell them apart: `canonEmitName` softens a bare inline literal union to its base scalar,
+// so `("a" | "b")[] | null` arrives here rendered `string[] | null` and the name ladder
+// codes it `nulstrlist` — a `(ref null $strListWrapper)` — while every construct/read path
+// builds the interned-atom i32 list its `K[] | null` alias spelling gets. A covered
+// annotation that is NOT one of the four therefore answers `null` outright rather than
+// falling through to a name that has lost the distinction.
 export function nulScalarListKindOfNode(tyIx: i32): VKind | null {
   if tyIx < 0 { return null }
+  const rk = annRepKindOf(tyIx)
+  if rk != null {
+    if isNulScalarListKind(rk) { return rk }
+    return null
+  }
   const ty = P.nodes[tyIx]
   if ty is TypeRef { return nulScalarListKind(ty.tyName) }
   null
@@ -8701,6 +8722,49 @@ export function isNulScalarListFieldCode(c: i32): boolean {
   c == 31 || c == 32 || c == 33 || c == 34
 }
 
+// True if the type-ANNOTATION node `tyIx` denotes an ARRAY whose ELEMENT is a NULLABLE
+// literal union (`(K | null)[]`, inline `(("a" | "b") | null)[]`) — the atom-NICHE list
+// whose elements are interned i32 ids with `-1` for `null`. `nameIsNulLitUnionList`'s
+// STRUCTURAL dual, and the reason one is needed: `canonEmitName` preserves the members of
+// a nullable ALIAS litunion but softens an inline one, so the inline spelling arrives
+// rendered `(string | null)[]` — indistinguishable from a real nullable-string list, whose
+// backing is the `$mkListIdx` string wrapper rather than the i32 one. The rep layer cannot
+// answer it either (`repOfArray` leaves a nullable ELEMENT to the legacy layer), so the
+// question is put to the recorded type directly.
+function annIsNulLitUnionArray(tyIx: i32) {
+  tyIsNulLitUnionArr(nodeTyIxOf(tyIx))
+}
+
+// The same question asked of an ARENA index rather than an annotation node — the form the
+// `| null`-peeling `annIsNulStrListDeep` needs, since after the peel there is no node left.
+function tyIsNulLitUnionArr(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    const e = T.tys[t.aElem]
+    if e is TyNullable { return tyIsLitUnion(e.nInner) }
+  }
+  false
+}
+
+// `nameIsNulStrListDeep` asked of a type-ANNOTATION NODE, with the atom-niche element
+// ruled out STRUCTURALLY first. The name predicate cannot do it: an inline
+// `(("a" | "b") | null)[]` renders `(string | null)[]` after the canon pass, and it
+// admits that spelling — so the element read took the `(ref null $aTypeIdx)` STRING
+// backing of an i32 atom list (invalid wasm), which is the one thing this predicate
+// exists to route. The outer `| null` the name side peels is peeled here too, so a
+// narrowed `(K | null)[] | null` binding gets the same structural reject.
+function annIsNulStrListDeep(tyIx: i32) {
+  if tyIx < 0 { return false }
+  let ty = nodeTyIxOf(tyIx)
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyNullable { ty = t.nInner }
+  }
+  if tyIsNulLitUnionArr(ty) { return false }
+  nameIsNulStrListDeep(tyNameOf(tyIx))
+}
+
 // The wasm rep KIND the checker's ARENA assigns to the type-ANNOTATION node `tyNodeIx`,
 // or `null` where the arena does not decide it. This is `vtKindOfType`'s `repOf`-first
 // leg on its own: when it answers, the annotation's rep is settled STRUCTURALLY and no
@@ -8709,11 +8773,16 @@ export function isNulScalarListFieldCode(c: i32): boolean {
 // type rather than a character-by-character re-parse of the annotation's rendering — the
 // name-CLASSIFIER layer's hot path (`nameIsRefArray` recursing through `splitUnionAtoms` /
 // `refArrElemName` / `structIndexByName` on every ladder rung, per binding, per query).
+//
+// It is EXACTLY `repOfNode`'s covered answer and holds no spelling-shaped special case of
+// its own. An element vocabulary the arena knows — an INLINE `("a" | "b")[]` as much as the
+// `K[]` alias — reaches here through the rep tree's list projection (`rtListVKind`), which is
+// where a new element kind belongs; a second arm here would be a rep decision taken outside
+// the rep layer, and the two would drift.
 function annRepKindOf(tyNodeIx: i32): VKind | null {
   if tyNodeIx < 0 { return null }
   const rd = repOfNode(tyNodeIx)
   if rd.rdCovered == 1 { return rd.rdKind }
-  if tyIsLitUnionArray(nodeTyIxOf(tyNodeIx)) { return "list" }
   null
 }
 
@@ -9663,8 +9732,23 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
     // softens the bare inline union to `string`, so `t` arrives as `"string[]"` and the array
     // arm below would code it 6 (a string-ref list) while every element/construct path reads
     // the arena and builds atom ids. Structural, off the recorded type, ahead of the softened
-    // name — see `annRepKindOf`.
+    // name. Like `tyAnnRefListKind`, this ladder has no `repOf` leg — a field CODE is not a
+    // rep kind — so the rep layer cannot subsume this arm either.
     if tyIsLitUnionArray(nodeTyIxOf(litNode)) { return 4 }
+    // The `| null` twin, one construct further out: `xs: ("a" | "b")[] | null` is the
+    // NULLABLE i32 atom list — code 18, the same code its `K[] | null` alias spelling gets
+    // from `nameIsNulI32List` below. Same softening, so the same blindness: `t` arrives
+    // `"string[] | null"` and the nullable-scalar-list arm would code it 31, a
+    // `(ref null $strListWrapper)` field, while the object literal stores the atom wrapper.
+    // Asked of the REP rather than re-derived from the type: `repOfNullable`'s list arm
+    // already covers a litunion element ungated, and `nullist` is code 18 for every
+    // spelling that reaches it (`i32[] | null` included), so this is the arena stating the
+    // arm the name states below, not a second policy.
+    if annRepKindOf(litNode) == "nullist" { return 18 }
+    // The nullable-ELEMENT twin, which folds onto the SAME code 4: `nameIsI32Array` admits
+    // `(K | null)[]` into the i32 backing (one `$lTypeIdx` wrapper for the whole atom-niche
+    // family), so the alias spelling already codes 4 here and the inline one must too.
+    if annIsNulLitUnionArray(litNode) { return 4 }
   } else {
     if nameIsLitUnionType(t) { return 0 }
   }
@@ -16660,7 +16744,7 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
       // the narrowed value is the same nulstr-element list (the read must stay
       // `(ref null)`; the plain-string arm's recover TRAPPED on a null element —
       // fuzz-nightly plain leg, seed 154928295 d6).
-      return nameIsNulStrListDeep(tyNameOf(pt))
+      return annIsNulStrListDeep(pt)
     }
     // A union binding narrowed to the `(string | null)[]` arm reads unboxed as the
     // string list whose ELEMENT stays `(ref null)` — the same nullable read discipline.
@@ -16686,10 +16770,7 @@ function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
   if li < 0 {
     // A rebind chain ending at a PARAM of the enclosing function (`const t0 = p`).
     const pt = paramTypeNode(fnIx, name)
-    if pt >= 0 {
-      const ptn = tyNameOf(pt)
-      return nameIsNulStrListDeep(ptn)
-    }
+    if pt >= 0 { return annIsNulStrListDeep(pt) }
     // A module GLOBAL (`const g: (string | null)[] | null = …`) — top-level LetDecls
     // live in `globalStmts` (they emit as wasm globals, not start statements).
     li = globalLetOf(name)
@@ -16697,10 +16778,7 @@ function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
   if li < 0 { return false }
   const d = P.nodes[li]
   if !(d is LetDecl) { return false }
-  if d.letType >= 0 {
-    const tn = tyNameOf(d.letType)
-    return nameIsNulStrListDeep(tn)
-  }
+  if d.letType >= 0 { return annIsNulStrListDeep(d.letType) }
   if d.letInit >= 0 {
     const init = P.nodes[unwrapParen(d.letInit)]
     if init is Ident {
@@ -16777,6 +16855,12 @@ export function letIsStringArray(letIx: i32, fnIx: i32) {
         if k == "strlist" { return true }
         if k == "reflist" { return false }
       } else {
+        // The `(K | null)[]` reject, STRUCTURALLY — and it must lead the name arms, not
+        // sit beside them: the INLINE spelling of the same type renders `(string | null)[]`
+        // after the canon pass, which `nameIsStringArray` accepts as its own niche. The
+        // alias spelling survives to `nameIsNulLitUnionList` below; the inline one has
+        // nothing left in the name to survive with.
+        if annIsNulLitUnionArray(d.letType) { return false }
         const lt = P.nodes[d.letType]
         if lt is TypeRef {
           if nameIsStringArray(lt.tyName) { return true }
