@@ -1386,6 +1386,66 @@ export function arrLeafNameOf(name: string) {
   }
   leaf
 }
+// ── the PAREN grammar: `nameIsParenOpen` OPENS it, `nameIsParenSpanEnds` SPANS it ──────
+//
+// A census of the `'('` / `')'` CHARACTER literals reads 47 tree-wide (27 open, 20 close),
+// of which 4 are `lexer`/`format` source-TEXT scanners and 5 are `typecheck`'s bracket-CLASS
+// depth ladders (`c == '{' || c == '[' || c == '('` — membership in a walk, not a name-shape
+// question). The remaining 38 over type names are SIX syntactic spellings, and — exactly as
+// the SHAPE-NAME family two hundred lines below turned out to be six spellings of THREE
+// predicates — they reduce to **TWO**:
+//
+//   * **`nameIsParenOpen`** — "the name starts a paren group". Written out ALONE at 7 sites
+//     (`emit_base.nameIsClosureArray`, `emit_collect` 3972, `emit_mono` 973,
+//     `emit_classify` ×4), and as the FIRST HALF of every one of the other spellings.
+//   * **`nameIsParenSpanEnds`** below — the same plus a final `)`, at 6 sites.
+//
+// THE OTHER FOUR SPELLINGS ARE NOT THIS PREDICATE AND MUST NOT BE ROUTED HERE. Three of
+// them close the group somewhere that is NOT the last character:
+//
+//   * ARROW-relative (`name[arrowAt - 1] == ')'`) — `annFnDecompose` below,
+//     `typecheck.isTopLevelFuncTypeName` / `nameToTy`. The param list closes before the
+//     `=>`, so the last character belongs to the RETURN.
+//   * ARRAY-relative (`name[name.length - 3] == ')'`) — `parenUnionArrElemName` below. The
+//     last two characters are the `[]`.
+//   * CLOSE-ONLY (`typecheck` 7314) — no opener test at all.
+//
+// Their OPEN half is still this predicate and is routed; their CLOSE test stays inline.
+//
+// **AND THE NAIVE HOME IS THE HOME FOR NONE OF THEM.** "A parenthesized type name" most
+// obviously means the endpoints PLUS a balance walk proving the group opened at index 0 is
+// still open at the last character — the compiler already has two functions that do exactly
+// that. Building THAT as the home and routing the span sites to it would have silently
+// TIGHTENED **6 sites / 12 occurrences** that carry no walk today (`listElemNameOf` below,
+// `emit_classify` 4510 / 6363 / 10046, `typecheck` 16117 / 16206). `listElemNameOf`'s own
+// header states the naive strip is DELIBERATE and names the two walk-carrying functions as
+// the things it must not become. So this home carries NO walk, precisely as
+// `nameIsShapeSpanEnds` carries none, and the two sites that DO walk keep their walk as a
+// separate conjunct at the call site.
+//
+// THE TWO WALKS ARE ALSO NOT ONE. `peelGroupParens` rides `typecheck.parenEnclosesWhole`
+// and `normTypeAtom` rides `tyGroupWrapsWhole`; they differ on a group that NEVER CLOSES
+// (`tyGroupEndIndex` returns -1), where the former answers FALSE and the latter TRUE. That
+// difference is load-bearing and documented at `peelGroupParens`. Merging them by eyeball is
+// the mistake this comment exists to prevent.
+export function nameIsParenOpen(name: string) {
+  if name.length < 1 { return false }
+  name[0] == '('
+}
+// THE ONE HOME of the paren-group ENDPOINT span: `nameIsParenOpen` AND the final character
+// is `)`. A LAYER over the opener, not a second copy of it — the `'('` compare lives once,
+// above.
+//
+// The `length >= 2` bound five of the six routed sites spell (as `< 2` early returns, or as
+// enclosing `length > 1` blocks one scope up) is IMPLIED, not dropped: on a one-character
+// name `name[0]` and `name[name.length - 1]` are the SAME character, and no character is
+// both `(` and `)`, so the explicit bound and this opener-gated form agree on every input.
+// The sixth (`emit_classify.rlCanonLitUnionAtoms` 10046) bounds only `length >= 1` and is
+// the same argument read the other way round.
+export function nameIsParenSpanEnds(name: string) {
+  if !nameIsParenOpen(name) { return false }
+  name[name.length - 1] == ')'
+}
 // THE ONE HOME of the 1-D LIST-ELEMENT peel: the trailing `[]` cut plus the ONE layer of
 // disambiguating grouping parens a composite element carries (`(boolean|null)[]` →
 // `boolean|null`, `K[]` → `K`). "" when `name` is not an array name.
@@ -1398,19 +1458,21 @@ export function arrLeafNameOf(name: string) {
 //
 // The `[]` cut itself is `arrElemNameRaw`'s, above: this function is the RAW cut plus the
 // paren strip, not a second copy of the cut. The paren strip is deliberately the NAIVE one
-// the four copies carried (first char `(`, last char `)`, no balance walk), NOT
-// `normTypeAtom`/`peelGroupParens`: every element reaching here is a single canonical atom,
-// and widening the strip to a balanced one would change what `(a)|(b)`-shaped elements
-// classify as. `""` doubles as "not an array" and as the element of the degenerate `"[]"`
-// — every consumer answers `false` for both, exactly as the four copies did.
+// the four copies carried (`nameIsParenSpanEnds` — first char `(`, last char `)`, no balance
+// walk), NOT `normTypeAtom`/`peelGroupParens`: every element reaching here is a single
+// canonical atom, and widening the strip to a balanced one would change what `(a)|(b)`-shaped
+// elements classify as. THIS IS THE SITE THE WALK-CARRYING HOME WOULD HAVE TIGHTENED, and the
+// reason the span home above carries no walk. `""` doubles as "not an array" and as the
+// element of the degenerate `"[]"` — every consumer answers `false` for both, exactly as the
+// four copies did.
+//
+// The three nested `if`s this replaced put their length bound (`elem.length > 1`) one scope
+// UP from the character compares; the home's bound is `>= 1`, and the two agree because a
+// one-character name cannot be both `(` and `)` (see the home's header).
 export function listElemNameOf(name: string) {
   let elem = arrElemNameRaw(name)
   if elem == "" { return "" }
-  if elem.length > 1 {
-    if elem[0] == '(' {
-      if elem[elem.length - 1] == ')' { elem = elem.slice(1, elem.length - 1) }
-    }
-  }
+  if nameIsParenSpanEnds(elem) { elem = elem.slice(1, elem.length - 1) }
   elem
 }
 // True if the array type-name `name` is `i32[]` (the value-element list whose backing
@@ -1566,8 +1628,10 @@ export function nameIsClosureArray(name: string) {
   if !nameIsArray(name) { return false }
   if annArrowAt(name) >= 0 { return false }
   const elem = arrElemNameRaw(name)
-  if elem.length < 1 { return false }
-  if elem[0] != '(' { return false }
+  // The PAREN grammar's OPEN half at its home. The separate `elem.length < 1` reject this
+  // replaced is the home's own bound, so the empty element still declines before the
+  // `nameIsFuncTypeAtom` walk below rather than indexing out of bounds.
+  if !nameIsParenOpen(elem) { return false }
   // The element must be a genuine FUNCTION type — a TOP-LEVEL arrow (paren-aware, after
   // peeling grouping parens). A `strContains(elem, "=>")` test also matched a UNION whose
   // FIRST member is a closure (`(() => i64) | i64`, whose `|` sits at the top level with the
@@ -1628,7 +1692,11 @@ export function parenUnionArrElemName(name: string) {
   // The array-name grammar's TEST half, at its home (this spelled the same two character
   // compares out inline; `name.length >= 5` is already established above).
   if !nameIsArray(name) { return "" }
-  if name[0] != '(' { return "" }
+  // The PAREN grammar's OPEN half at its home. The CLOSE test does NOT go with it: this is
+  // the ARRAY-relative spelling, closing at `length - 3` because the last two characters are
+  // the `[]`. `nameIsParenSpanEnds` asks about the LAST character and would answer for the
+  // `]`, so routing this line would be a different question, not a shorter one.
+  if !nameIsParenOpen(name) { return "" }
   if name[name.length - 3] != ')' { return "" }
   // The whole name must be ONE atom — a multi-arm union that merely STARTS with a paren
   // group and ENDS with `[]` (`(boolean|string)[] | (i32|f64)[]`) would otherwise slice an
@@ -1897,12 +1965,12 @@ export function unionHasAtom(name: string, atom: string) {
 // is affected; the paren-peel is the `nameIsFuncTypeAtom` prelude, shared to stay in lockstep.)
 export function peelGroupParens(nameIn: string) {
   let name = nameIn
-  while (
-    name.length >= 2 &&
-    name[0] == '(' &&
-    name[name.length - 1] == ')' &&
-    parenEnclosesWhole(name)
-  ) {
+  // The PAREN grammar's SPAN half at its home, then the walk. `parenEnclosesWhole`'s header
+  // requires both its callers to gate on `length >= 2` and a leading `(` before calling: the
+  // home enforces both — it can only answer true when two distinct characters are `(` and
+  // `)` — so the contract survives the routing intact. The walk stays a separate conjunct
+  // because the OTHER walk-carrying site (`normTypeAtom`) rides a DIFFERENT walk.
+  while nameIsParenSpanEnds(name) && parenEnclosesWhole(name) {
     name = name.slice(1, name.length - 1)
   }
   name
@@ -1963,7 +2031,11 @@ export function normTypeAtom(arm: string) {
   while hi > lo && (arm[hi - 1] == ' ' || arm[hi - 1] == '\t') { hi = hi - 1 }
   let t = arm
   if lo != 0 || hi != arm.length { t = arm.slice(lo, hi) }
-  if t.length >= 2 && t[0] == '(' && t[t.length - 1] == ')' {
+  // The PAREN grammar's SPAN half at its home — the CHEAP REJECT the paragraph above argues
+  // for, now named. The walk stays here and stays `tyGroupWrapsWhole`: it is NOT
+  // `peelGroupParens`'s `parenEnclosesWhole` (they disagree on a never-closing group), which
+  // is exactly why the home carries the endpoints and neither walk.
+  if nameIsParenSpanEnds(t) {
     if tyGroupWrapsWhole(t) { t = t.slice(1, t.length - 1) }
   }
   t
@@ -2242,7 +2314,10 @@ export function annRetNameOf(name: string) {
 export function annFnDecompose(ann: string, outParams: string[]) {
   const fa = annArrowAt(ann)
   if fa < 1 { return "" }
-  if ann[0] != '(' { return "" }
+  // The PAREN grammar's OPEN half at its home; `fa >= 1` above already implies the bound.
+  // The CLOSE test stays inline — this is the ARROW-relative spelling, closing the param
+  // list at `fa - 1`, where the LAST character belongs to the return annotation.
+  if !nameIsParenOpen(ann) { return "" }
   if ann[fa - 1] != ')' { return "" }
   const inner = ann.slice(1, fa - 1)
   if inner.length > 0 { annSplitParams(inner, outParams) }
