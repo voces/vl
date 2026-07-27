@@ -26531,9 +26531,14 @@ program of the same `fnStmts.length`. So the pair was CONSTRUCTED —
 `[-1,-1,-1,2]` — and under S5 `-b`'s two logs **SWAP**: `21 / 1001` for `1001 / 21`, rc=0. The suite
 goes 2,205/0 to 2,204/1.
 
-Fuzz is **COVERAGE for TARGET 2** and stated as such: `scripts/fuzzgen.vl` emits no nested function
-declarations at any seed or dimension, so no generated program can reach the scope-chain walk. It is
-AGREEMENT for TARGET 1 — the generator's literal-union leaf mints literal members at every depth.
+Fuzz is **COVERAGE for TARGET 2**, verified in the generator at this head rather than assumed.
+`scripts/fuzzgen.vl` emits no nested NAMED function at any seed or dimension; it does emit lambdas,
+which lambda-lifting pushes into `fnStmts` with a parent, so `nestedNameSet` is not empty — but the
+only names it holds are the synthesized `__lambda_N`, and no generated call spells one. The gated
+path is therefore never entered and the 50,400-program zero says nothing about the walk. The graded
+channel for TARGET 2 is the corpus, where S3 moves four rows.
+It is **AGREEMENT for TARGET 1** — the generator's literal-union leaf mints a fresh
+`type K<n> = "w1" | "w2"` alias at every depth, so literal members reach canon on every seed.
 
 ### COUNTS — BOTH UNITS, DECOMPOSED
 
