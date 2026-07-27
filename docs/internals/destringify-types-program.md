@@ -25773,3 +25773,337 @@ seed's emitter cannot already lower (`|`/`&` on `i32` have been lowered since `b
 * **The sabotages themselves.** Thirteen distinct sabotage builds, every one built from a COPY of the
   source tree and never from the worktree, all discarded; the shipped source contains no `ZZPROBE`,
   no early return and no marker.
+
+## D-ALIASMAP — the map-typed alias becomes TRANSPARENT, the gate its hand-off predicted does not exist, and P2 of the renderEmit design is measured UNREACHABLE from this partition (off master `b68244d`)
+
+Base `b68244d` (#1202, P1). Partition: `compiler/typecheck.vl`, `compiler/check_query.vl`,
+`compiler/check_state.vl`, fixtures under `tests/cases/`, this append. `check_query.vl` /
+`check_state.vl` are **untouched** — nothing this slice needs lives in them.
+
+Two targets were briefed. TARGET 1 (the checker half of the map-typed alias) ships, fully proved.
+TARGET 2 (`renderEmit` P2) does not ship, and the reason is a measurement rather than a judgement:
+**P2's own definition puts it outside this partition.** Both are below.
+
+### THE CHANGE — one arm, no gate
+
+```diff
+       if mt is TyPrim { return m0 }
+       if mt is TyFunc { return m0 }
+       if mt is TyArray {
+         if arrSpineIsScalar(m0) { return m0 }
+       }
++      if mt is TyMap { return m0 }
+```
+
+That is the whole behaviour change. `singleAliasMemberTyIx` is the ONE rule the checker
+(`declaredTyOfName`) and the emitter (`singleMemberAliasName`) both read for "is this degenerate
+one-member `UnionDecl` transparent?". The parser encodes every non-`{…}`-bodied `type N = …` as a
+one-member union; since #1201 taught `parseTypeDecl` that a `{` followed by `[` opens a MAP body,
+`type M = {[string]: i32}` takes that same path — so `M` denoted `TyUnion[TyMap]`, not `TyMap`, and
+every USE of the alias met the union machinery instead of the map machinery. The arm's own header
+had deferred `TyMap` in as many words, naming its price: *"it has its own twin table to build and
+its own value-name family to check"*. Both were built. **Both came back different from the array
+arm's.**
+
+### THE CENSUS — RE-DERIVED AT THIS HEAD, AND THE BRIEF'S FIGURES ARE OFF IN THREE PLACES
+
+The brief carried #1201's filing: *"adding `if mt is TyMap { return m0 }` moves 35 of 41 cells from
+clean reject to fully working. The 2 that still fail are … an array of f64-/string-valued maps."*
+Re-derived from scratch — my own 41 cells, my own grader, graded on the RUN VALUE and not on an
+exit code — **the 35 is right as a total and wrong as a delta, and the 2 is wrong.**
+
+**TWIN TABLE A — 41 cells.** Four map VALUE kinds (`i32`, `string`, `f64`, `boolean`) x eight
+annotation POSITIONS (global, function param, function return, struct field, array element,
+`| null`, map value, function-local) **plus** nine shape variants (index read, `.has`,
+map-of-map-alias, alias-of-alias, `{[i32]: …}` key, closure param, closure result, union member,
+struct-field read+write). Every cell exists TWICE: once spelled through the alias and once with the
+alias-free INLINE spelling, the two programs identical character for character apart from the
+annotation.
+
+| leg / compiler | OK | CHECKER reject | EMIT reject | INVALID WASM |
+| --- | ---: | ---: | ---: | ---: |
+| ALIAS on `b68244d` | **1** | 24 | 16 | 0 |
+| **ALIAS with the arm** | **35** | 1 | 1 | 4 |
+| alias-free INLINE control on `b68244d` | 35 | 1 | 1 | 4 |
+| alias-free INLINE control with the arm | 35 | 1 | 1 | 4 |
+
+**39 of 41 cells move. 34 of them reach OK** (the 35th, a union member, already ran). The other
+five move between failure CLASSES: four EMIT → INVALID-WASM and one CHECK → EMIT. So *"35 of 41 to
+fully working"* is the right AFTER-count read as a delta, and the delta is 34.
+
+**THE TWO ROWS THAT MATTER ARE THE LAST TWO.** The inline control is **verdict-identical before and
+after** (`diff` RC 0) — the arm does not touch the alias-free spelling — and the alias leg WITH the
+arm is **verdict-identical to the inline control**, cell for cell, all 41 (`diff` RC 0). The alias
+stops being a dialect of its own; it does not acquire one.
+
+**TWIN TABLE B — 32 cells, and it REFUTES the gate the hand-off predicted.** #1137 handed this arm
+on with *"the gate is probably `mapValue` non-nominal"*, by analogy with D-ALIASARR's
+`arrSpineIsScalar`. Table B is four value kinds chosen to ask exactly that question — a DECLARED
+struct `Cat`, a literal-union alias `K0`, an inline `{n:i32}` shape, and `i32 | null` — across the
+same eight positions.
+
+| leg / compiler | OK | CHECKER | EMIT | INVALID WASM |
+| --- | ---: | ---: | ---: | ---: |
+| ALIAS on `b68244d` | 4 | 12 | 16 | 0 |
+| **ALIAS with the arm** | **26** | 0 | 0 | 6 |
+| alias-free INLINE control on `b68244d` | 26 | 0 | 0 | 6 |
+
+Again `diff` RC 0 on both comparisons. **A `{[string]: Cat}` alias works in six of eight positions
+with the arm, and its two failures reproduce with no alias in the program at all.** The analogy
+fails at the RENDER, and the mechanism is one line of `tyToEmitName`: its ARRAY arm re-renders the
+element, so `Cat[]` becomes `{n:i32}[]` and a declared element's NAME — the key the emitter's
+element tables use — is dropped; its MAP arm emits `{[K]:V}` for every value there is (and
+deliberately PRESERVES a litunion-alias value). **A map name is never an emit route, so a map alias
+has no nominal route to lose.** No gate.
+
+**ZERO REGRESSIONS, stated as a count rather than as a hope:** across both tables, five cells ran on
+the alias spelling at `b68244d` (four union-member cells in table B, one in table A). All five still
+run.
+
+**ONE OF MY OWN CELLS WAS BLIND, AND THE BRIEF'S "2" IS WHY I FOUND IT.** My first table A used
+`const xs: M[] = []` for the array-element position and read OK on master for all four value kinds
+— which contradicted the brief's claim that an array of f64-valued maps fails. **An empty array
+literal never lowers its element type at all**, so the cell was measuring nothing while printing a
+pass. Re-cut as `= []` + `xs.push(Map())` (and cross-checked against `= [Map()]`), the position
+behaves exactly as the brief said. *A cell whose value the compiler can produce without consulting
+the type under test is not a cell.*
+
+### THE RESIDUAL — ONE PRE-EXISTING EMITTER DEFECT, TEN CELLS, AND IT IS A COST
+
+The arm converts **10 cells** from a clean EMIT REJECT to INVALID WASM, and that is reported as a
+cost, not buried. The failing set is exactly two POSITIONS x five VALUE KINDS:
+
+* positions: **array element** and **map value** (the two positions where the map itself becomes a
+  stored element rather than a binding);
+* value kinds that fail: `f64`, `string`, a declared struct, an inline shape, `i32 | null`;
+* value kinds that work: `i32`, `boolean`, a literal-union alias — i.e. exactly the mono-i32 map.
+
+**All ten fail identically with NO alias anywhere in the program, on `b68244d`.** The emit reject
+the alias used to get was not a considered rejection of the construct — it was
+`emitProgram: a map value is not a supported union member`, an artifact of the union BOX the alias
+was wrongly wearing. Remove the box and the program meets the inline spelling's own miscompile.
+Gating the arm around it would buy two cells per value kind by re-breaking six, and would put the
+alias back into a dialect of its own; the emitter is where the fix belongs and `emit_*` is not this
+partition. Not silent, which materially lowers the cost: `vl build` exits 1 with
+``is not a valid WebAssembly module — it was written, but it cannot instantiate (this is a compiler
+emit bug)``, and the underlying validator error is
+`type mismatch: expected (ref null $type), found (ref $type)`.
+
+**FILED, with the minimal repro (no alias in it):**
+```vl
+const xs: {[string]: f64}[] = []
+xs.push(Map())
+print(xs.length)
+```
+
+**ALSO FILED — a diagnostic-quality gap the arm does NOT close.** `type K = {[i32]: i32}` still
+rejects as ``unknown type '{[i32]:i32}' in union 'K'`` plus two cascades, where the inline spelling
+gives the deliberate ``An i32-keyed Map isn't supported yet — i32 keys use a list/array``. Same
+verdict CLASS on both spellings (a clean checker reject, which is why the cell does not move), but
+the i32-key rejection fires while the `UnionDecl` member is still being resolved, so the body never
+becomes a `TyMap` and this arm never sees it. `tests/cases/maps/error-i32-keyed.vl` is the inline
+pin; the alias spelling has none.
+
+### CHANNEL GRADING — AND THE FUZZ ZERO IS BLINDNESS, BY CONSTRUCTION
+
+Every channel graded with a real sabotage before any zero was believed. Both sabotages were built
+from a COPY of the tree, never from the worktree, and both are discarded.
+
+| sabotage | corpus `vl check` | corpus `vl check --codegen` | fuzz `--codegen`, 4,800 programs |
+| --- | ---: | ---: | ---: |
+| **S-MAPVAL** — this slice's arm answers with the map's VALUE (`mt.mVal`) instead of the map | **226** | **226** | **0** |
+| **S-OBJ** — the SIBLING `TyObj` arm never fires (`isPlainAliasRef` → `false`) | **0 — BLIND** | **10** | **0** |
+
+* **S-OBJ reproduces #1202's method note 155 on a different arm**: a perturbation inside
+  `typecheck.vl` that moves 10 codegen lines moves **0** plain-checker lines. `--codegen` is the
+  shared-instance channel for this partition and it is the one used for every number here.
+* **THE FUZZ 0 IS NOT EVIDENCE FOR THIS ARM AND I WILL NOT PRESENT IT AS ANY.** `fuzzgen.vl`'s only
+  `type Tn = <body>` declarations take `body` from `structBody(P)`, which is always a
+  `{field: …}` struct body — the generator cannot emit a map-typed alias at any depth, seed or
+  flavour. Verified on the generated corpus itself: **0 of 28,800 programs** match
+  `type T[0-9]* = *{\[`. S-OBJ's 0 says the same thing about the whole helper: a `{`-bodied
+  `type N = {…}` is a struct declaration, not a one-member union, so `singleAliasMemberTyIx`'s
+  object and map arms are both unreachable from the fuzz vocabulary. The fuzz A/B below is a
+  no-collateral-damage statement about the shapes the generator DOES reach, and nothing more.
+
+### EQUIVALENCE AND ENTOMBMENT
+
+* **Corpus five-field A/B, 1,455 files** — build rc + emitted-wasm **sha256** + diagnostic text +
+  run rc + run stdout, one FILE per record (never a shared pipe), the mktemp path scrubbed out of
+  the diagnostic. **3 differing records, and the corpus contains exactly 3 files that declare a
+  map-typed alias — reach and population are equal.** Population: 1,221 build clean (1,212 distinct
+  SHAs), 1,209 run rc 0. The three, each justified:
+  1. `maps/alias-annotation-is-transparent.vl` — build rc 1 → 0. The renamed `@emit-error` pin,
+     now `@run`.
+  2. `maps/alias-positions-and-value-kinds.vl` — build rc 1 → 0. The new pin.
+  3. `maps/alias-declaration-parses.vl` — **BYTES ONLY**, 3,833 → 3,826 (**−7 B**); run rc 0 and
+     stdout `2/7/1/3` identical on both sides. #1201's own pin declares four map aliases and merely
+     mentions them; with the arm they stop being registered as one-variant union rows, so the
+     module is smaller and behaves the same. **1,452 pre-existing files byte + message + run
+     identical.**
+* **`vl check tests/cases`** and **`vl check --codegen tests/cases`** — **194 differing lines on
+  each channel**, decomposing exactly: 193 master-only (48 four-line diagnostic blocks, every one
+  anchored `at` one of the two new fixtures, plus the `Found N errors` summary) + 1 branch-only
+  (the new summary). Both sides run from the same cwd with the same RELATIVE argument.
+* **Fuzz A/B, 28,800 generated programs** — 72 generator runs (3 depths x 12 seeds x 2 flavours at
+  `--count 200`, plain and `branching+multiobs+declared`), generated ONCE with master's compiler so
+  both legs see byte-identical inputs, then swept as whole directories on the shared-instance
+  channel, sharded per generator run. `vl check` **158,920 lines** and `vl check --codegen`
+  **162,898 lines**, `diff -r` **RC 0, 0 differing files**. Blind to this arm — see above.
+* **ENTOMBMENT.** A behaviour CHANGE needs a pin that FAILS on the parent, and both new fixtures do:
+
+| fixture | `b68244d` | this branch | S-MAPVAL | S-OBJ |
+| --- | --- | --- | --- | --- |
+| `maps/alias-annotation-is-transparent.vl` | rc 1, `type error` | rc 0, `2 7 1 3 5 9` | **rc 1 — RED** | rc 0 |
+| `maps/alias-positions-and-value-kinds.vl` | rc 1, `type error` | rc 0, `1…9` | **rc 1 — RED** | rc 0 |
+| `maps/alias-declaration-parses.vl` (#1201's) | rc 0, `2 7 1 3` | rc 0, same | rc 0 | rc 0 |
+
+  The S-OBJ column is the part worth keeping: the pins redden under a perturbation of the arm this
+  slice adds and stay GREEN under a perturbation of its sibling, so they pin the map arm and not
+  merely the existence of `singleAliasMemberTyIx`.
+
+### TARGET 2 — `renderEmit` P2 IS OUTSIDE THIS PARTITION, MEASURED RATHER THAN JUDGED
+
+P2 is defined as *"O1, WITH A REACHABLE CALLER — ship the nominal ancestor guard together with the
+first consumer that can reach a cyclic type, so the guard is entombed by something rather than by
+nothing."* Re-derived at this head:
+
+* **`tyToNominalName` has exactly three call sites and all three are in `emit_collect.vl`** (4182,
+  4338, 4430; the fourth textual hit is its own `export function` header). Creating "the first
+  consumer that can reach a cyclic type" means editing `emit_collect.vl`, which this partition
+  excludes.
+* **The reject that hides O1 still runs first.** All three recursive-generic-alias fixtures still
+  exit 1 with `emitProgram: recursive generic type \`L<i32>\` is not supported — its expansion has
+  no finite type name`; the compiler does not trap. O1's reachable population is still **zero**,
+  exactly as #1199 measured and #1202 re-confirmed.
+* The only in-partition route to a reachable caller would be to ROUTE an arm of `canonEmitName`
+  through the nominal renderer — which is P3/P4, and the design's own ordering says routing comes
+  after P2. **The phase is circular from inside this partition**, and the honest move is to say so
+  rather than to invent a consumer for the guard's benefit. The brief's instruction — *"prefer one
+  phase fully proved over two half-proved"* — is taken literally: nothing of P2 ships, not even the
+  guard.
+
+**A note for whoever owns `emit_collect.vl` next:** P2 is a two-partition phase or it is nothing.
+The guard belongs in `typecheck.vl` (`tyToNominalNameAt`, where #1202 left the NOTE) and its first
+reachable caller belongs in `emit_collect.vl`. Splitting it A/B across two cycles buys nothing —
+the A half is the unentombable guard #1199 and #1202 both refused to ship.
+
+### COUNTS — BOTH UNITS, BOTH PREDICTED 0 BEFORE MEASUREMENT
+
+**CALL SITES.** CORE **314 → 314 (0)** · OFF-LIST **24 → 24 (0)** · TRUE **338 → 338 (0)**. Per file
+identical: `emit_classify` 175 · `emit_base` 51 · `typecheck` 46 (**22 core + 24 off**) ·
+`emit_collect` 44 · `emit_mono` 7 · `emit_rewrite` 7 · `wasmEmit` 5 · `emit_rep` 2 ·
+`emit_sections` 1. Instrument: #1139's 23-resolver CORE list plus #1141's 13 off-list scanners,
+`NAME(` in `//`-stripped, string-literal-aware code (char literals KEPT), each resolver's own
+`function NAME(` header excluded, per-file sums asserted against the tree-wide total. Validated
+against the brief's tracked figure at `b68244d` — **314 / 24 / 338, reproduced exactly, per file** —
+before it was used for anything.
+
+**GRAMMAR OCCURRENCES.** Tree-wide **89 → 89 (0)**; `typecheck.vl` **38 → 38 (0)**, reproducing
+#1199's and #1202's per-file column exactly.
+
+**Both zeros are structural, not lucky.** The change is a variant-tag test (`mt is TyMap`): it calls
+no resolver, writes no character literal, deletes nothing and renames nothing. **The scorecard is
+the wrong instrument for this slice and says so by not moving** — what moved is a construct that did
+not compile and now does.
+
+**BINARY: +15 B** (1,031,123 → 1,031,138) — reported as a cost. One `if` with a variant-tag test and
+a return. The fixpoint ladder went 1 compile → **2**, the expected consequence of the published seed
+no longer being the answer.
+
+### GATE — EVERY LEG, EXIT CODE TAKEN WITHOUT A PIPE
+
+| leg | RC |
+| --- | ---: |
+| `scripts/fetch-seed.sh` (fresh `seed-latest`, 1,031,123 B = master's own compiler) | **0** |
+| `scripts/refresh-compiler.sh --prove-fixpoint` — fixpoint at 2 compiles, 1,031,138 B | **0** |
+| `scripts/native-fixpoint.sh` — stage3 == stage4, 1,031,138 B | **0** |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` — **2,183 / 0 / 8** (baseline re-derived below) | **0** |
+| `deno check tests/cases_wasm_test.ts` | **0** |
+| `scripts/lint-self.sh` | **0** |
+| `scripts/rep-fuzz-check.sh` — 1 baselined REJECT, 0 new, 0 stale | **0** |
+| corpus five-field A/B, 1,455 records, 3 differing (all enumerated above) | **1**, justified |
+| `vl check tests/cases` A/B · `vl check --codegen tests/cases` A/B (194 lines each, all attributed) | **1** · **1**, justified |
+| fuzz A/B, 28,800 programs, `vl check` + `vl check --codegen`, `diff -r` | **0** |
+
+**THE SUITE BASELINE IS DERIVED, AND ITS TOTAL IS A COINCIDENCE THAT HAD TO BE DECOMPOSED.**
+Master's frozen source (`git archive b68244d`) run in this same environment with master's own
+compiler gives **2,183 / 0 / 8** — the same total as this branch. That is not "no change": the
+composition moved by four names and they cancel.
+
+| | master | branch |
+| --- | ---: | ---: |
+| `cases_wasm_test.ts` | 1,408 | **1,409** |
+| `selfhost_native_align_test.ts` | 495 | **494** |
+| tree-wide | 2,191 (2,183 + 8 ignored) | 2,191 |
+
+Only in master: `maps/error-alias-annotation-not-transparent.vl` and its
+`native-align emit-reject:` twin. Only in branch: `maps/alias-annotation-is-transparent.vl` and
+`maps/alias-positions-and-value-kinds.vl`. The native-align tier lost one because that tier pins
+`@emit-error` cases and the renamed case is now `@run`. **An unchanged total across a fixture rename
+is exactly the shape that hides a lost test; it has to be decomposed, not accepted.**
+
+**THE SEED COMPILED THIS SOURCE ON THE FIRST RUNG — no A/B split was needed.** The bootstrap
+constraint was checked rather than assumed: this change makes previously-rejected programs compile,
+so a compiler source that then used a map-typed alias could not be built by the published seed.
+`compiler/*.vl` and `std/*.vl` contain **zero** map-typed alias declarations (the two textual hits
+are both inside comments), so nothing in the compiler relies on the new capability and the freshly
+fetched seed compiled the source directly.
+
+### METHOD NOTES
+
+159. **A CELL WHOSE VALUE THE COMPILER CAN PRODUCE WITHOUT CONSULTING THE TYPE UNDER TEST IS NOT A
+     CELL.** `const xs: M[] = []` reads OK for every map value kind on both compilers because an
+     empty array literal never lowers its element type. Four of my 41 cells were measuring nothing
+     while printing a pass, and the only reason I caught it is that a brief-supplied figure
+     DISAGREED with them. **When a re-derivation says a filed defect is absent, suspect the
+     re-derivation first** — the construct was real and my probe was blind.
+160. **PARITY WITH THE UNSUGARED SPELLING IS A STRONGER CLAIM THAN "N CELLS NOW PASS", AND IT IS
+     CHEAPER TO STATE.** Generating each cell twice — once through the alias, once with the
+     annotation written out — turns a table of 41 verdicts into two `diff` RCs: *the control is
+     unmoved* and *the alias now equals the control*. It also converts the four invalid-wasm
+     residuals from an embarrassment into an attribution, because the control fails on them too, on
+     the parent.
+161. **A "35 of 41 move" AND A "35 of 41 pass" ARE DIFFERENT CLAIMS AND THE FILED ONE WAS THE
+     SECOND.** 39 cells move; 34 reach OK; 35 are OK afterwards. Five cells move between FAILURE
+     classes and are invisible to a pass-count. **State the after-count and the delta separately, or
+     a reader will read whichever one is wrong.**
+162. **A GATE INHERITED BY ANALOGY IS A HYPOTHESIS, AND THIS ONE WAS FALSE.** D-ALIASARR gated its
+     member on `arrSpineIsScalar` for a measured reason — `tyToEmitName` re-renders an array's
+     element and drops a declared name. The hand-off transferred the shape of that reason to maps.
+     The map arm's render is `{[K]:V}` for every value, so there is nothing to lose and the gate
+     would have been pure cost. **Check whether the RENDERER treats the two constructs the same
+     before transferring a gate between arms.**
+163. **A FUZZ ZERO NEEDS A VOCABULARY CHECK, NOT A SABOTAGE, WHEN THE GENERATOR CANNOT SPELL THE
+     CONSTRUCT.** 28,800 programs produced 0 differing lines, and grepping the generated corpus for
+     `type T[0-9]* = *{\[` explains why in one line: 0 matches, because `fuzzgen`'s declared bodies
+     all come from `structBody`. A sabotage would have measured the same 0 and told me less. **The
+     cheapest grading of a channel is often to ask whether its GENERATOR can produce the input.**
+164. **A PHASE CAN BE BLOCKED BY ITS OWN DEFINITION RATHER THAN BY ITS DIFFICULTY.** `renderEmit` P2
+     is "the guard plus its first reachable caller"; every caller of `tyToNominalName` is in
+     `emit_collect.vl`. No amount of work inside `typecheck.vl` reaches it, and the A/B split that
+     would normally rescue a two-partition change fails here because the A half is precisely the
+     unentombable guard two previous slices refused to ship. **Before planning a phase, check that
+     its PROOF is reachable from the partition, not just its diff.**
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **A gate on the map arm.** Table B measured the question and answered no. Recorded in the
+  function header with the mechanism, so a later slice adding one has to refute a measurement rather
+  than a preference.
+* **Any fix for the array-element / map-value invalid wasm.** Ten cells, characterized to the
+  position x value-kind, reproduced with no alias in the program, minimal repro filed above. The
+  home is the emitter and `emit_*` is another slice's file this cycle. **A measured-0 does not
+  license deleting a guard and a measured-10 does not license editing someone else's partition.**
+* **A checker-side reject for that construct.** It would fix both spellings and it is in this
+  partition — and it is still wrong here: the emitter already owns exactly this rejection
+  (`emitProgram: unsupported map value type (only i32 / boolean / string / struct values)`), and
+  adding a second, differently-scoped copy in the checker is the duplication this program exists to
+  remove.
+* **Anything of `renderEmit` P2**, including O1's guard on its own. See above.
+* **`ctx` for canon's three alias helpers.** `singleMemberAliasName`, `singleAliasMemberTyIx` and
+  `unionAliasMembers` still enter the renderers position-free at `RC_ROOT`, exactly as #1202 left
+  them. This slice adds an arm to one of them and reads no position; the boundary #1202 drew for P4
+  is unchanged.
+* **The sabotages.** Two builds, both from a copy of the tree, both discarded; the shipped source
+  contains no marker, no early return and no probe.
