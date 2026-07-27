@@ -25094,3 +25094,393 @@ next slice does not have to re-find it.
   shadows a local declaration, a re-export cycle, a re-export of a name the target does not export.
   **Filed here with its measurement so the next slice does not re-discover it.** Doing it would let
   all six delegations become one-line `export … from` and would take the +88 B back.
+
+## D-ARRWIDTH + THE CANON PASS MEASURED + THE ONE-AGREED-RENDERER DESIGN — what `canonEmitName` actually does (96.9% of the time: nothing), and why the two renderers cannot replace it in EITHER direction
+
+Base `5db5588` (#1196). Partition: `compiler/typecheck.vl`, `compiler/check_query.vl`,
+`compiler/check_state.vl`, new fixtures, this append. `check_query.vl` / `check_state.vl` were in the
+partition and are **untouched** — nothing this slice needed lives in them. No fixture was added
+either; the reason is measured below.
+
+The brief set `canonEmitName` — "the last large named item" — as the target, quoting #1191's verdict
+that retiring it is *"gated on one agreed emit renderer"*, and asked for that verdict to be TESTED
+rather than accepted. It is tested here, at volume, and it survives — but the reason it survives is
+not the reason #1191 gave, and the object it protects is a great deal smaller than eleven slices of
+prose have implied.
+
+### THE INSTRUMENTS, VALIDATED BEFORE ANY NUMBER WAS PUBLISHED
+
+Two units, never mixed.
+
+* **CALL SITES** (`parsercount.py`) — #1139's 23-resolver CORE list plus #1141's off-list scanners,
+  one per `NAME(` in `//`-stripped, string-literal-aware code, each resolver's own
+  `function NAME(` header excluded, per-file sums asserted equal to the tree-wide total. At
+  `5db5588` it reproduces the brief's tracked figures **exactly**: **CORE 314 · OFF-LIST 25 ·
+  TRUE 339**, per file `emit_classify` 175 · `emit_base` 51 · `typecheck` 47 (22 core + 25 off) ·
+  `emit_collect` 44 · `emit_mono` 7 · `emit_rewrite` 7 · `wasmEmit` 5 · `emit_rep` 2 ·
+  `emit_sections` 1. The brief quoted those figures as of `2cc7d28`; #1196 is a `driver.vl`-only
+  change, so the column did not move across it — **re-derived, not inherited.**
+* **GRAMMAR OCCURRENCES** (`charcensus.py`) — one per `(`/`)`/`[`/`]`/`{`/`}` **character literal**
+  in live code. Double-quoted strings blanked, char literals KEPT (the trap this doc has recorded
+  twice), `'"'` and `'\'` understood so string tracking cannot invert. Graded on a constructed file
+  (comment containing brackets, string containing brackets, bare `'('` / `')'` / `'['`, plus `'"'`
+  and `'\'`, plus a trailing comment): **3/3, no false positives.** Tree-wide at `5db5588`:
+  **89** — `typecheck` **38** · `emit_base` 21 · `lexer` 10 · `emit_classify` 6 · `format` 6 ·
+  `emit_collect` 3 · `cli` 2 · `cli_util` 1 · `emit_mono` 1 · `fmt_util` 1. The `typecheck` 38
+  reproduces #1193's published AFTER state to the file.
+
+### THE 25 RE-DERIVED PER SITE — AND THE BRIEF'S ARITHMETIC IS OFF BY TWO
+
+The brief says *"Of the 25 remaining, **11** are the CANON pass"*. Re-derived at `5db5588`, by line,
+with the enclosing function resolved rather than eyeballed, **it is 9**:
+
+| class | sites | where (typecheck.vl line : scanner) |
+| --- | ---: | --- |
+| **A. The grammar HOME's own internals** | 4 | 4872 `skipQuotedName`, 4881 `tyGtIsClose` (in `tyTopIndexOf`); 4910 `skipQuotedName`, 4920 `tyGtIsClose` (in `tyGroupEndIndex`) |
+| **B. One-line delegators over the home** | 2 | 4937 `nameHasSep` (in `nameHasPipe`); 4989 `topLevelArrowIndex` (in `isTopLevelFuncTypeName`) |
+| **C. The checker's ANNOTATION parser (`nameToTyReal`)** | 6 | 5607, 5609, 5644, 5646, 5678, 5687 |
+| **D. Generic-alias application** | 2 | 5169, 11683 `splitGenArgs` |
+| **E. The CANON pass** | **9** | 7148 `nameIsGenAppOfDecl` (in `unionMemberGenAppShape`); 7239 `nameNeedsCanon`, 7246 `nameHasPipe`, 7248 `splitTypeName`, 7269 `unionAliasMembers`, 7308 `nameHasSep`, 7393 `splitTypeName`, 7411 `litBaseName`, 7416 `canonShapeName` (all in `canonEmitName`) |
+| **F. A RENDERER asking about the string it just built** | 1 | 4961 `nameHasPipe(el)` in `arrElemRender` — **this slice's target** |
+| **G. Genuinely NOMINAL, mis-filed by the vocabulary** | 1 | 6991 `isPlainAliasRef` |
+
+4 + 2 + 6 + 2 + 9 + 1 + 1 = **25**.
+
+**Where the 11 came from, and why it survived review.** #1191's class table was measured at its own
+BASE `e255dd8`, and #1191 then shipped **D-ELEMWIDTH** (deleting `nameHasPipe` from canon's array
+arm) and **D-ARROWBANK** (deleting `topLevelArrowIndex` from canon's nested-function arm) — **both
+of them E rows**. 27 → 25 is entirely E: 11 → 9. The brief read the table from the PR body and the
+total from the PR's own after-state, which are two different heads. **The floor is unaffected**
+(A 4 + B 2 + G 1 = **7**, exactly as #1191 derived), which is why a wrong summand hid inside a right
+total.
+
+One honest overlap to record, since it cuts against the class boundary: **G is REACHED from canon**
+(`isPlainAliasRef` ← `singleAliasMemberTyIx` ← `singleMemberAliasName` ← `canonEmitName`). It stays
+in G because the classes are by what the site IS, not by who calls it, and `isPlainAliasRef` walks
+`cPlainAliasNames` comparing WHOLE STRINGS and inspects no character. A name is allowed to be a name.
+
+### WHAT `canonEmitName` ACTUALLY DOES — measured, and it is not what the prose says
+
+Instrumented build, `vl check tests/cases` (shared instance), **1,405 programs reporting,
+5,445 `TypeRef` annotations**:
+
+| | count | of reach |
+| --- | ---: | ---: |
+| annotations canon SAW | 5,445 | 100% |
+| …returned **byte-identical** | **5,277** | **96.91%** |
+| …never entered the rewriter at all (`!nameNeedsCanon` early-out) | 2,749 | 50.49% |
+| …entered the recursive rewriter | 2,696 | 49.51% |
+| …**of those**, rebuilt the name character-for-character | **2,528** | **93.77% of 2,696** |
+| …**actually rewritten** | **168** | **3.09%** |
+| distinct `(pre → post)` shapes among the 168 | **81** | — |
+
+**A ~200-line string→string rewriter that changes 168 of 5,445 names.** Half the population is
+rejected by one predicate; of the half that recurses, fourteen out of fifteen names come out
+identical. That is the single most important fact about this object and no slice had measured it.
+
+The 81 distinct rewrites decompose exhaustively into **six** transformations:
+
+1. **literal member → base scalar** — `"a"|"b"` → `string`, `0|1|2` → `i32`, `1.5` → `f64`,
+   `"a"|1` → `string|i32`, `{tag:"circle"|"square",r:i32}` → `{tag:string,r:i32}` (the largest group);
+2. **intersection folding** — `(0|1|2)&!2` → `i32`, `i32|(2|3)&!3` → `i32`,
+   `Pair&{a:S}` → `{a:{k:i32},b:{k:i32}}`;
+3. **one-member alias transparency** — `Id` → `i32`, `Name` → `string`, `Big` → `i64`,
+   `L` → `i32[]`, `F` → `(i32)=>i32`, `MyCat` → `{meow:i32}`, `Y` → `{v:i32}`;
+4. **union-alias flattening** — `AB|null` → `{t:i32,a:i32}|{t:i32,b:i32}|null`;
+5. **litunion-alias softening INSIDE a union** — `K0|i32` → `string|i32`,
+   `{[string]:K0|i64|null}` → `{[string]:string|i64|null}` (position-dependent: the same `K0` is
+   PRESERVED as a bare annotation and inside a closure result);
+6. **grouping-paren maintenance** — `F|i32` → `((i32)=>i32)|i32`, `F|null` → `((i32)=>i32)|null`.
+
+### THE THREE REPLACEMENT CANDIDATES, MEASURED AT THE SAME SITE
+
+For every one of the 5,445 annotations the same probe computed what each candidate replacement would
+have produced, and compared it to canon's answer. **`nameToTy` is run in a SECOND pass over the saved
+pre-names, after canon has finished, so the probe cannot perturb the value it is measuring.**
+
+| candidate | agrees | renders "" | disagrees | annotation unresolvable |
+| --- | ---: | ---: | ---: | ---: |
+| **B3** `tyToNominalName(nodeTyIxOf(node))` — no parse at all | 5,047 / 5,415 = **93.20%** | 214 | **154** | 30 nodes carry no `nodeTyIx` |
+| **B2** `tyToNominalName(nameToTy(pre))` | 5,072 / 5,172 = **98.07%** | 5 | **95** | 273 |
+| **B1** `tyToEmitName(nameToTy(pre))` | 4,319 / 5,172 = **83.51%** | 72 | **781** | 273 |
+
+**B1 IS #1191'S STEP-3 CLAIM, NOW WITH A NUMBER.** "`canonEmitName` is NOT `tyToEmitName ∘ nameToTy`"
+was argued from one construct (litunion softening in a direct union). It is wrong on **853 of 5,172**
+resolvable annotations — **16.5%** — plus 273 it cannot resolve at all. The claim was right and it
+was under-stated by an order of magnitude.
+
+**AND THE GAP IS TWO-DIRECTIONAL, WHICH NOBODY HAD MEASURED.** Splitting each disagreement by WHICH
+SIDE moved away from the author's spelling:
+
+| | canon rewrote, renderer did NOT | renderer rewrote, canon did NOT | both rewrote, differently |
+| --- | ---: | ---: | ---: |
+| **B3** (154) | 41 | **108** | 5 |
+| **B2** (95) | 41 | **49** | 5 |
+
+Named, in each direction (deduped samples, all from the corpus):
+
+* **canon-only** — `K0|i32` → `string|i32` (the renderer preserves the alias, by design and with
+  four fuzz-nightly invalid-wasm seeds cited in its own arms); `Z` → `i32`; `WFlt` → `f64`;
+  `AB|null` → its members; `MyCat` → `{meow:i32}`; `L|i32` → `{n:i32}[]|i32`.
+* **renderer-only** — `Box<i32>` → `{v:i32}`, `Pair<i32|null,string>[][]` →
+  `{a:i32|null,b:string}[][]` (canon keeps the APPLICATION name; the renderer expands it);
+  `T` → `i32` (the renderer answers with the monomorphic instance, canon with the parameter);
+  `A|B` → `A` and `Cat|Dog` → `Cat` (the ARENA deduped two same-shape declared structs, the
+  SPELLING did not); `{v:"a,b"|"zz"|null,w:i32}` → `{v:string|null,w:i32}` — **canon PRESERVES the
+  nullable litunion and the renderer SOFTENS it, the exact mirror of the `K0` case above.**
+* **both** — `Pair&{a:S}`: canon `{a:{k:i32},b:{k:i32}}`, renderer `{a:{k:i32},b:S}`.
+* **grouping** — `()=>(()=>(i32)=>boolean)`: the renderer writes `((i32)=>boolean)`;
+  `()=>{f:({f:i32})[]}`: the renderer writes `{f:i32}[]`. **The two do not agree on the grouping
+  convention either.**
+
+**So "one agreed renderer" is not "pick whichever of the two we already have".** The renderer would
+have to GAIN canon's six normalizations AND LOSE its own nominal/structural expansions, and the same
+construct family (literal unions) appears on BOTH sides of the ledger. #1191's verdict stands; its
+mechanism was one construct and the real mechanism is a two-directional policy gap.
+
+### A NEW BLOCKER THE PROBE FOUND: `tyToNominalName` DOES NOT TERMINATE ON A CYCLIC ARENA TYPE
+
+`tyToEmitName` carries the `emitNameSeen` ancestor stack (added after two well-typed single-file
+programs killed the compiler with `call stack exhausted`). **Its nominal sibling has no guard at
+all.** Nominal-first tames a DECLARED recursive struct — `type Tree = {children: Tree[]}`
+short-circuits to `"Tree"` before the field re-enters — but it does **not** tame a recursive GENERIC
+alias, whose instance is anonymous and therefore in neither `cStructTyIxs` nor `cUnionTyIxs`. The
+first version of the probe died on exactly that; with an ancestor guard added for measurement, the
+guard fires **10 times over the corpus, on 3 files**, every one of them
+`tests/cases/generics/recursive-generic-alias-{array,mutual,nullable}.vl`
+(`type L<T> = { head: T, tail: L<T>[] }`).
+
+**IT IS NOT REACHABLE TODAY, AND WHY IT IS NOT IS LOAD-BEARING FOR THE PLAN.** Those three files are
+`@emit-error` pins — `emitProgram` rejects ``recursive generic type `L<i32>` is not supported`` —
+and that reject runs BEFORE any of `tyToNominalName`'s three emit-side callers
+(`reachRegisterName`, `funcRetUnrepresentable`, `collectTyReachCloSigs`, all in `emit_collect.vl`).
+The checker builds the cyclic arena; canon walks past it unharmed **because canon is a STRING pass
+and a string is finite**; only a consumer that RENDERS the arena traps. **The moment canon becomes
+"render the type", the renderer must be total, and today it is not.**
+
+**The guard was NOT shipped.** Its population in the reachable set is zero, and this program's rule
+runs in both directions: a measured-0 does not license deleting a guard, and it does not license
+adding one either. It is filed here as obligation O1 below, to be shipped by the phase that first
+gives it a reachable caller.
+
+### THE DESIGN — what the ONE agreed emit renderer has to be
+
+`renderEmit(ty: i32, ctx: i32) -> string`: the single function that maps an ARENA TYPE to the
+emitter's vocabulary. Today's three producers of that vocabulary collapse into it —
+`canonEmitName` (string → string), `tyToEmitName` (structural), `tyToNominalName` (nominal-first).
+
+Six obligations, each with the measurement that establishes it:
+
+* **O1 — TOTAL ON A CYCLIC ARENA.** An ancestor stack on the nominal side too. Established by the
+  10-hit/3-file measurement above. Proof: the three recursive-generic pins keep their exact
+  `@emit-error` message and the compiler does not trap.
+* **O2 — NOMINAL WHERE THE EMITTER HAS A NOMINAL ROUTE, STRUCTURAL WHERE IT DOES NOT, AND THE
+  POSITION DECIDES WHICH.** This is the whole content of the 108 renderer-only disagreements. Both
+  answers are already known to be right somewhere: #1124 shipped the STRUCTURAL expansion for a
+  generic application standing as a MULTI-member union member (because `collectU`'s `isStructAtom`
+  answers from `TypeDecl` NAMES and a generic alias declares `Box<T>`, never `Box<i32>`), while
+  #1122 BUILT AND MEASURED the nominal route and found it REGRESSES `type MyCat = Cat` to
+  `ref valtype with no interned shape`. Hence `ctx`, not a global policy.
+* **O3 — POSITION-DEPENDENT LITUNION POLICY, IN BOTH DIRECTIONS.** `K0` softens to `string` in a
+  DIRECT union and is PRESERVED inside a closure result, a map value, an array element and a struct
+  field (four distinct fuzz-nightly invalid-wasm seeds are cited in `tyToEmitNameGo`'s arms for
+  exactly this). And a NULLABLE litunion (`"a,b"|"zz"|null`) is PRESERVED by canon
+  (`nulLitUnionPreserve`) and SOFTENED by the renderer. `ctx` must carry "am I a direct union
+  member" and "am I under a nullable".
+* **O4 — ONE GROUPING CONVENTION.** The measured paren disagreements are not incidental: canon and
+  the renderers differ on nested function results and on array-of-shape elements. `arrElemRender`
+  is the precedent for the fix — ONE home, told what it needs by its producer instead of scanning.
+  The closure-result and union-member parens need the same treatment.
+* **O5 — THE ARENA DEDUPS AND THE SPELLING DOES NOT.** `A|B` over two same-shape declared structs
+  renders as `A`, because `sameVariantTy` collapsed the union to a plain `TyObj`. `annUnionAtoms`
+  exists precisely because "the source spelled a union" survives only in the spelling, and its
+  header says so. **The atom WIDTH therefore has to stay a producer-supplied bank** — which is what
+  this slice extends to the second renderer.
+* **O6 — A TOTAL COLUMN, OR AN EXPLICIT FALL-THROUGH.** 30 of 5,445 `TypeRef` nodes carry no
+  `nodeTyIx` at canon time and 214 more render "". #1126's rule applies: a consumer migrates when
+  its column is TOTAL for it, not at 93%.
+
+### THE PHASED PLAN — each phase is a slice, each with its proof named
+
+* **P0 — SHIPPED HERE.** Make the ONE shared grouping home producer-supplied, and give the second
+  renderer the width bank that made that possible. Proof: site comparator at volume on both
+  channels, both comparator directions shown firing, corpus + fuzz A/B identical. (Details below.)
+* **P1 — `ctx` THREADED, BEHAVIOUR UNCHANGED.** Add the position parameter to both renderers and to
+  `canonEmitName`'s recursion, defaulted so every existing call site keeps its exact answer. Proof:
+  **compiler byte-identity** if VL's defaulting allows it, else the full corpus five-field A/B.
+  This is the phase that makes O2/O3 expressible; nothing else can start until it lands.
+* **P2 — O1, WITH A REACHABLE CALLER.** Ship the nominal ancestor guard together with the first
+  consumer that can reach a cyclic type, so the guard is entombed by something rather than by
+  nothing.
+* **P3 — ROUTE TRANSFORMATION (1), literal-member softening.** Largest population, context-free at
+  the leaf, and its dual is `softenLitTy`, which the checker already owns and which
+  `numLitUnionBaseName` already projects. Canon's literal arms call `renderEmit` for that arm only.
+  Proof: arm comparator at volume + corpus/fuzz A/B.
+* **P4 — ROUTE (3) alias transparency** (dual: `singleAliasMemberTyIx`, already structural), then
+  **(2) intersection folding** — note that arm is ALREADY the design (`nameToTy` then
+  `tyToEmitName`), so it converts by deleting the string round-trip rather than by inventing
+  anything — then **(4)**, **(5)**, **(6)**.
+* **P5 — DELETE.** When every arm routes, `canonEmitTypeNames`'s body is
+  `n.tyName = renderEmit(nodeTyIxOf(i), ctxOf(n))` and the string rewriter goes. **Only then does
+  the E column go 9 → 0**, and the floor becomes A 4 + B 2 + G 1 + whatever of C survives.
+
+**The order is forced, and P3 before P1 is the trap.** Every transformation except (2) needs `ctx`
+to state its rule; routing one without `ctx` would bake a global policy into the renderer and then
+have to be un-baked. That is the shape of mistake #1120 recorded as "coverage is not agreement".
+
+### THE `annTsRoot` STALENESS LANDMINE — re-derived, and still correctly declined
+
+#1185 measured **167 rewritten / 167/167 stale / 0 post-canon tree reads** over 1,378 programs:
+`canonEmitTypeNames` writes `n.tyName = c` in place and never touches `annTsRoot`. Measured from the
+other side here — **canon rewrites 168 `tyName`s over 1,405 programs** — the same population, the
+same order, two different corpora. The defect is real, inert, and defended purely by ordering.
+
+**Nothing was shipped for it, and the reason is #1191's, upheld.** An in-partition `annTsFrozen`
+flag defends only readers that opt in, which is a convention wearing enforcement's clothes; the
+enforcement lives in `ast.vl` (make `tyName` private and force every write through a setter that
+invalidates the tree) **or nowhere**, and `ast.vl` is outside this partition. #1185's cheap fix —
+re-parse the canon'd name into a fresh tree — is refused on the program's founding rule: it would
+**ADD a type-string parser** to remove a staleness.
+
+**The design above dissolves the landmine rather than guarding it.** At P5 canon no longer rewrites
+a string, so there is no stale tree to defend and no guard to maintain. That is the argument for
+paying the phased cost instead of buying a cheap flag.
+
+### WHAT SHIPPED — D-ARRWIDTH
+
+`arrElemRender` is the ONE home both renderers share for the array-element grouping rule (D-ARRGROUP
+merged the two private copies). It decided "is this element a union?" by calling `nameHasPipe` — a
+whole-name top-level depth scan — **over a string its own caller had finished building one line
+earlier**. Its own header called that "the disease in miniature" and then explained why it could not
+be fixed: #1153 named two duals and #1191 declined both.
+
+* the STRUCTURAL dual (`ae is TyUnion || ae is TyNullable`) mis-parenthesizes a union whose members
+  **dedup to one part** — the render has no `|` and the structural test says union;
+* the EXACT dual — the element's rendered ATOM WIDTH — existed on `tyToEmitName` (`emitNameAtoms`)
+  and **not** on `tyToNominalName`, *"which has no bank at all"*.
+
+This slice supplies the missing half. `tyToNominalName` gains **`nomNameAtoms`**, the mirror of
+`emitNameAtoms`: the width is accumulated **at the joins that write the `|`s** — the union arm sums
+its KEPT parts (so a duplicate part contributes nothing, which is exactly the dedup case the
+structural test gets wrong), the nullable arm adds one to its inner's width (2 for the alias and
+grouped-closure forms), and every arm whose separators sit inside a grouper or behind a top-level
+`=>` reports 1. `arrElemRender` then takes `elAtoms` and asks `elAtoms > 1`.
+
+**THE TWO TESTS ARE NOT A PARTITION AND THE OVERLAP IS HANDLED BY POSITION, NOT BY LUCK.** Width and
+`nameHasPipe` can disagree on exactly one shape — a top-level FUNCTION type whose RESULT is a union
+(`(i32)=>f64|boolean`), which carries a top-level `|` and is ONE atom. At this site that shape is
+claimed by the `T.tys[elTy] is TyFunc` test ABOVE the width test and never reaches it. The other
+direction is empty by construction: a render's width exceeds 1 only where the render itself wrote a
+top-level `|`.
+
+**MEASURED AT THE SITE, BOTH CHANNELS, WITH THE OLD DECIDER STILL IN CHARGE:**
+
+| | corpus | fuzz | total |
+| --- | ---: | ---: | ---: |
+| reaches | 339 | 624 | **963** |
+| `nameHasPipe(el)` TRUE | 179 | 94 | 273 |
+| **disagreements** | **0** | **0** | **0** |
+
+Fuzz channel = **28,800 generated programs** — 72 generator runs (3 depths × 12 seeds × 2 legs,
+`plain` and `branching+multiobs+declared`) at `--count 200`, each emitting 400 `===CASE` files —
+run through the shared-instance `vl check <dir>`, the channel that can see a checker-side change.
+
+**BOTH COMPARATOR DIRECTIONS PROVEN WIRED BEFORE EITHER 0 WAS BELIEVED:**
+
+| sabotage | corpus disagreements | fuzz disagreements | what it proves |
+| --- | ---: | ---: | --- |
+| threshold `> 0` | **160** = 339 − 179 | **530** = 624 − 94 | direction B fires on 100% of the non-TRUE reaches |
+| threshold `> 2` | **153** of 179 | **90** of 94 | direction A fires on the width-2 population |
+
+Both numbers are exactly the arithmetic the population predicts, on both channels independently.
+
+**ENTOMBMENT — no new fixture, because the corpus already pins the site TOTALLY.** Sabotaging the
+SHIPPED threshold to `> 2` (a real build, no comparator) reddens **39 corpus files on the byte
+channel** — 26 `BUILDSTATUS(0/1)` and 13 `SHA256DIFF` — and **28 on the run channel**
+(`RUNSTATUS(0/1)`), across `unions/`, `closures/`, `lists/`, `structs/`, `globals/`. Adding a fixture
+that only re-pins what is already pinned would inflate the suite for nothing (the same call #1125
+made, for the same reason).
+
+**EQUIVALENCE, TOTAL ON BOTH CHANNELS:**
+
+* corpus **1,443 / 1,443** identical on build rc + wasm **sha256** + run rc + run stdout — every
+  file in `tests/cases`, not only the `@run` ones;
+* whole-corpus `vl check tests/cases` **diagnostic text byte-identical** (7,785 lines, `diff` rc 0);
+* fuzz **28,800 / side**: `vl run --batch --out-dir` trees compared as whole trees with `diff -r` —
+  **30,145 outputs per side, 0 differing paths**, rc 0 — and the shared-instance `vl check` over the
+  same directory byte-identical.
+
+### COUNTS — BOTH UNITS, THE DELTA DECOMPOSED
+
+**CALL SITES.** CORE **314 → 314 (0)** · OFF-LIST **25 → 24 (−1)** · TRUE **339 → 338 (−1)**.
+Per file: `typecheck` 47 → 46 (22 core + 24 off). Every other file unchanged. The −1 is class F,
+which is now **empty**: `nameHasPipe` goes **3 → 2 call sites**, and both survivors are inside the
+checker's own annotation resolver (`nameToTyReal`, class C — legitimate) and the canon pass
+(class E). **No renderer in this compiler now asks a character question about a string it produced.**
+
+**GRAMMAR OCCURRENCES.** Tree-wide **89 → 89 (0)**. `typecheck.vl` **38 → 38 (0)**.
+`arrElemRender` inspected **no character of its own** — it delegated the entire scan to
+`nameHasPipe` — so its deletion is invisible to the character census by construction. Stated
+explicitly because the two units are not redundant and this slice moves exactly one of them.
+
+**BINARY: +122 B** (1,030,578 → 1,030,700) — a cost, reported as one. It buys five width
+assignments, a third parameter and a second bank; the site removed is a CALL, not a loop, so there
+is no size win to offset it. The win is dynamic and it is real: **339 top-level depth walks deleted
+per corpus pass** (963 counting the fuzz corpus), each traded for a scalar read.
+
+**Suite: 2,170 passed / 0 failed / 8 ignored** with `SELFHOST_NATIVE_ALIGN=1` — **derived, not
+assumed**: master's `typecheck.vl` with master's compiler on this same tree gives **2,170 / 0 / 8**
+as well. No fixture added, so a delta would have been a defect.
+
+### METHOD NOTES
+
+147. **A BRIEF THAT QUOTES A PER-SITE TABLE MUST QUOTE THE TABLE'S BASE, NOT THE PR THAT PUBLISHED
+     IT.** #1191's class table was measured at `e255dd8`; the same PR then deleted two of its own E
+     rows. "11 of 25 are canon" is arithmetic across two heads — at every head since it has been
+     **9**. The FLOOR (A + B + G = 7) is unaffected, which is exactly why the error survived:
+     **a wrong summand hides inside a right total.** Re-derive the summands, not only the sum.
+148. **THE IDENTITY RATE IS THE MOST IMPORTANT NUMBER ABOUT A REWRITER, AND NOBODY HAD MEASURED IT.**
+     Eleven slices called `canonEmitName` "a 200-line string→string rewriter" — true, and it
+     rewrites **168 of 5,445** annotations; half the population never enters it and 93.8% of the
+     half that does comes out character-identical. That reframes the target from "delete a big pass"
+     to "route six named transformations", which is a plan rather than an ambition. **Before
+     planning to delete a pass, measure how often it is the identity.**
+149. **MEASURE A REPLACEMENT'S GAP IN BOTH DIRECTIONS OR YOU WILL MIS-SIZE IT.** The natural probe
+     is "how often does the candidate differ" (154 / 5,415). The useful probe is "which side moved":
+     41 canon-only, **108 renderer-only**, 5 both. A one-directional reading concludes "teach the
+     renderer canon's rules"; the two-directional reading shows the renderer must also STOP doing
+     things — and that the SAME construct family (literal unions) sits on both sides, softened by
+     one side in a direct union and preserved by the other under a nullable.
+150. **A RENDERER THAT SHORT-CIRCUITS ON NAMES IS NOT THEREBY TOTAL.** `tyToNominalName` has no
+     cycle guard because nominal-first tames a declared recursive struct. It does not tame a
+     recursive GENERIC alias, whose instance is anonymous — 10 hits over 3 corpus files. It is
+     unreachable today only because an emit-time finiteness reject runs before its callers.
+     **A guard's absence justified by a short-circuit needs the short-circuit's COVERAGE measured,
+     not asserted** — and "unreachable" is a reason to file the obligation, not to ship a guard
+     nothing can enter.
+151. **A PROBE THAT RESOLVES NAMES MUST RUN IN A SECOND PASS.** `nameToTy` can register arena
+     entries. Computing the candidate answers inside canon's own loop would have let the probe
+     perturb the value it was measuring. Saving `(node, pre, post)` and resolving afterwards costs
+     three arrays and removes the whole question.
+152. **AN OFF-LIST CALL SITE CAN BE INVISIBLE TO THE CHARACTER CENSUS, AND THE CONVERSE.** This
+     slice deletes ONE call site and ZERO grammar occurrences, because the site delegated its scan
+     rather than writing it out. Scoring it on the character unit alone reads as a zero; #1193's
+     home relocation scored **+2** on the call unit while deleting 22 occurrences. **Both units,
+     every time, and name the one that moved.**
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **The canon pass itself.** Tested, not accepted: the replacement gap is **two-directional**
+  (41 / 108 / 5) and the best candidate that involves no parse at all (`tyToNominalName ∘ nodeTyIx`)
+  is wrong on 154 and blank on 214 of 5,415. Routing one arm without `ctx` would bake a global
+  policy that P1 then has to un-bake. The plan above is the deliverable; the deletion is P5.
+* **The `tyToNominalName` cycle guard.** Reachable population **zero** — filed as O1, to ship with
+  the phase that gives it a caller. A guard nothing can enter is not entombable and is not evidence.
+* **Any `annTsFrozen`-shaped convention.** #1191 declined it for the right reason and that reason
+  has not changed; a convention that looks like enforcement is worse than the documented hazard.
+  Not re-litigated, and deliberately not softened into a weaker version.
+* **The `> 0` / `> 2` thresholds as anything but sabotages.** They exist to prove the comparator
+  fires; both were reverted, and the shipped source contains neither.
+* **`nameNeedsCanon`'s early-out was not touched.** It rejects 50.5% of the population and it is a
+  character CLASS test, not a name-shape question — the same verdict #1193 recorded for its three
+  `nameNeedsCanon` occurrences. Half the pass's speed lives there and none of its debt does.
