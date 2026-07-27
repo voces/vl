@@ -23237,3 +23237,293 @@ All four consumers and both resolvers were in this partition, which is why the s
 Three of the four still could not move, and in each case the blocker is one edge further out: a
 caller in another file, a producer with no arena sibling, a call path with no node at all. Check
 what the consumer HOLDS before costing a routing, not what the file contains.
+---
+
+## D-SHAPEOPEN (#1186) — the SHAPE-NAME grammar gets the two homes it needs, and the "five spellings" turn out to be SIX spellings of THREE predicates
+
+Measured at `9a60901`, **rebased onto `ecd8a4f` (#1185) and every figure below re-derived there
+before shipping** — CORE 312, SHAPE-open 35, SHAPE-2nd 27 and the per-file split are IDENTICAL at
+both bases, and the corpus and fuzz A/Bs were re-run against a baseline compiler built from
+`ecd8a4f` (1,031,549 B, byte-equal to the published seed, so master is at its own fixpoint). #1185
+did not touch this grammar. Files: `compiler/emit_base.vl` + `compiler/emit_collect.vl` + **1 new
+fixture**. Nothing else. Two prior slices (#1177, #1182) found this grammar and declined to home it, each for
+a reason that was correct at the time; #1182's decline came with an explicit honest hand-off —
+*"the honest hand-off is **two** homes plus a measured decision about the walk, not one"* — and
+that hand-off is exactly right. What follows re-derives it, corrects its premise, and lands it.
+
+### The instrument, and the two UNITS
+
+**UNIT A — GRAMMAR OCCURRENCES.** One textual test of a type NAME's character against a literal,
+in non-comment code, **with char BINDINGS RESOLVED**. Resolution is the whole instrument: every
+real scanner binds the char first (`const c0 = name[0]` … `c0 == '{'`), so a detector anchored on
+`name[0] == '{'` alone sees only the sites that inline the index. Char literals are kept VERBATIM
+and only `"…"` bodies are blanked — a stripper that blanks `'{'` as a string makes every character
+census read 0.
+
+**UNIT B — CALL SITES**, the 23-resolver CORE scorecard, counted with #1139's unmodified counter.
+
+**Validated before producing any new number.** CORE at `9a60901` reads **312** tree-wide —
+`emit_classify` **175** · `emit_base` **52** · `emit_collect` **44** · `emit_mono` **7** ·
+`emit_rewrite` **7** · `wasmEmit` 5 · `emit_rep` 2 · `emit_sections` 1, plus `typecheck` 19 core /
+27 off-list. Every figure the brief quoted reproduces exactly. The grammar census then reproduces
+the two published grammar figures at the same head: **SHAPE-open 35** (`emit_classify` 15 ·
+`emit_base` 7 · `typecheck` 6 · `emit_collect` 4 · `emit_rep` 2 · `format` 1) and **SHAPE-2nd
+(`X[1]` against `'['`) 27**. Cross-checked against a raw per-occurrence count of `'{'` over
+comment-stripped source (43 tree-wide): the structural census accounts for **42 of 43**, the one
+miss being `lexer.peek2() == '{'`, a source-TEXT scanner excluded by file. No blindness on any
+file that matters.
+
+### MY OWN INSTRUMENT WAS WRONG FIRST, AND THE CORRECTION IS THE FINDING
+
+The first pass extracted each site's boolean expression and read off its predicate set. It
+reported a spelling with **no length guard at all** at five sites, including
+`emit_base.isStructAtom`. That was an artifact: the extractor read only the expression on the
+line and **never looked at the ENCLOSING BLOCK GUARD**. `isStructAtom` is
+
+```vl
+if a.length >= 2 {
+  if a[0] == '{' && a[1] != '[' && a[a.length - 1] == '}' { return true }
+}
+```
+
+— the length bound is a line above, on a block that is still open. Re-run with dominating guards
+collected (enclosing `if` blocks whose brace depth has not returned to 0, plus same-function
+early-return guards), the "no length guard" spelling **does not exist**: 19 of the 20 family sites
+carry `length >= 2`, and the twentieth carries `length > 0`.
+
+**A predicate census that reads one expression is not a predicate census.** The guard that decides
+a scanner's domain is routinely one scope up.
+
+### THE 20 SITES, THE FIVE SPELLINGS, AND THE THREE PREDICATES
+
+**20** of the 35 SHAPE-open sites carry BOTH conjuncts (`[0] == '{'` and an `[1]` test against
+`'['`) and so belong to this grammar. Counted by syntactic form — **including where the length
+bound sits**, which is the axis the corrected instrument exposed — they are written **six** ways:
+
+| # | spelling | sites |
+|---|---|---:|
+| 1 | positive same-line conjunction — `n.length >= 2 && n[0] == '{' && n[1] != '['` (± `&& n[n.length-1] == '}'`) | **8** |
+| 2 | the same conjunction with the bound hoisted to an ENCLOSING `if n.length >= 2 {` block | **2** |
+| 3 | the same conjunction with the bound hoisted to an EARLY-RETURN guard | **1** |
+| 4 | fully De-Morganed guard — `if nm.length < 2 \|\| nm[0] != '{' \|\| nm[1] == '[' … { return … }` | **6** |
+| 5 | multi-line parenthesised conjunction | **2** |
+| 6 | the `length > 0` outlier — `nm.length > 0 && nm[0] == '{' && nm[1] != '['` | **1** |
+
+The prior slice's count of **five** comes from folding rows 2 and 3 together (ignoring the
+bound's placement). That bucket boundary is a matter of taste; the PREDICATE count below is not,
+and it is the one that decides how many homes exist.
+
+Reduced to PREDICATES those five collapse to **three**:
+
+* **P1** `len >= 2 · OPEN · NOT2ND` — **8** sites
+* **P2** `P1 · CLOSE` (final char `}`) — **10** sites
+* **P2 + BALANCE** (`tyGroupWrapsWhole`) — **1** site, the existing `nameIsWholeSpanShape`
+
+So the answer to "how many homes" is **TWO**, `P2` layered on `P1`, with the walk left alone —
+#1182's hand-off confirmed. But its stated *reason* was that `nameIsWholeSpanShape` "adds a
+`tyGroupWrapsWhole` balance walk, so routing to it would tighten six sites", implying the length
+guards also differed. **They do not.** The only thing separating the family from the walk is the
+walk. That matters because it means the two homes are pure factoring, not a normalisation with a
+domain decision hidden in it.
+
+### THE `length > 0` OUTLIER IS NOT A WIDER PREDICATE — IT IS A LATENT TRAP
+
+`emit_collect.funcRetUnrepresentable` gated on `nm.length > 0`. On the single name `"{"` that
+passes, `nm[0] == '{'` passes, and `nm[1]` is read **out of bounds**. Measured by hand rather than
+assumed: VL string indexing **TRAPS** there —
+
+```
+--- len1 '{' ---
+idx0-is-brace
+Error: … wasm trap: out of bounds array access
+```
+
+So routing it to a `length >= 2` home cannot narrow anything reachable: it converts a crash into
+`false`. The population was then MEASURED rather than argued. An `emitFail` poison at that site
+firing on `nm.length == 1 && nm[0] == '{'` reads **0 over 1,410 corpus files and 0 over 50,400
+fuzz programs**; the same poison with the bound relaxed to `length >= 1` fires on **54 corpus
+files**. The zero is a measured-empty population, not a blind probe.
+
+### WHAT WAS ROUTED — 5 SITES, ALL IN THIS PARTITION
+
+`nameIsShapeOpen` ← `emit_collect.collectA`, `emit_collect.funcRetUnrepresentable`.
+`nameIsShapeSpanEnds` ← `emit_base.unionStructAliasShape`, `emit_base.isStructAtom`,
+`emit_collect.collectVariantFields`.
+
+Four of the five are **predicate-identical** to what they replaced. The fifth is the `length > 0`
+outlier above.
+
+### THE SITES A NAIVE HOME WOULD HAVE TIGHTENED, AND WHICH WERE NOT TIGHTENED
+
+**Class 1 — the walk.** **10** sites carry P2 exactly. Routing any of them to
+`nameIsWholeSpanShape` adds `tyGroupWrapsWhole` and NARROWS them: `{a:{b:i32}}|{c:i32}` opens with
+`{`, is not a map, ends with `}`, and its leading group closes early — endpoints say TRUE, the
+walk says FALSE. Three of the ten are in this partition (`unionStructAliasShape`, `isStructAtom`,
+`collectVariantFields`). **None was tightened.** The walk keeps its one caller.
+
+**Class 2 — the missing `NOT2ND`, and this is the one that bites in `emit_base`.** `len >= 2 &&
+n[0] == '{' && n[n.length-1] == '}'` WITHOUT the `n[1] != '['` conjunct is a **different
+predicate**: it accepts a map name, since `{[string]:i32}` opens `{` and ends `}`. It is written
+out **9** times tree-wide — **4 of them in `emit_base` itself** (`annObjFieldSplit`,
+`canonBareShapeName`, `nameIsStructWithUnionField`, `nameIsStructWithLitUnionField`), plus
+`emit_classify` ×2 and `typecheck` ×3. A census that grouped by "tests `{` at 0 and `}` at the
+end" would route all nine into `nameIsShapeSpanEnds` and silently stop the emitter seeing
+map-valued shapes. **They are deliberately left alone**, and both homes' headers name them so a
+later census does not read them as copies.
+
+### BOTH UNITS, BEFORE AND AFTER — AND THE TRACKED NUMBER DOES NOT MOVE
+
+| unit | `9a60901` | this PR | Δ |
+| --- | ---: | ---: | ---: |
+| SHAPE-open grammar occurrences, `emit_base` | 7 | **6** | −1 |
+| SHAPE-open grammar occurrences, `emit_collect` | 4 | **1** | −3 |
+| SHAPE-open grammar occurrences, tree-wide | **35** | **31** | **−4** |
+| SHAPE-2nd (`X[1]` vs `'['`), tree-wide | **27** | **23** | **−4** |
+| the FAMILY (both conjuncts), tree-wide | **20** | **16** | **−4** |
+| **CORE (23-resolver list), `emit_base`** | **52** | **52** | **0** |
+| **CORE (23-resolver list), `emit_collect`** | **44** | **44** | **0** |
+| **CORE (23-resolver list), tree-wide** | **312** | **312** | **0** |
+
+Each grammar unit moves −4, not −5, and the decomposition is exact: **−5** routed sites **+1** for
+the single `name[0] == '{'` / `name[1] != '['` pair that now lives in `nameIsShapeOpen`.
+`nameIsShapeSpanEnds` contributes **0** because it delegates rather than re-testing.
+
+**THE CORE COLUMN IS FLAT, AND THAT IS A DIFFERENT RESULT FROM THE LAST THREE MERGES — REPORT IT,
+DO NOT ASSUME THE PATTERN.** #1175 (303→306), #1177 (→311) and #1182 (→312) each saw CORE RISE
+while hand-written copies fell, because the grammar they homed contained a call to an ON-LIST
+resolver (`nameIsArray`), so naming it converted an invisible op into a counted one. **This
+grammar contains no on-list resolver call at all** — it is pure character surgery — and neither
+new home is on the 23-resolver list. So the honest reading is Δ0 on CORE, −4 on each grammar unit.
+The rising-CORE effect is a property of WHICH grammar is homed, not a law of the program.
+
+Binary **1,031,388 → 1,031,232 B (−156)**. Self-compile wall time, each side warmed FIRST and
+discarded, three timed runs each: BASE 1500/1566/1683 ms, candidate 1557/1490/1517 ms — the spread
+WITHIN a side (183 ms) exceeds the gap between the medians (49 ms), so the honest statement is
+**no measurable time change** and the reliable number is the −156 B.
+
+### EQUIVALENCE EVIDENCE, AND EVERY ZERO GRADED
+
+Behaviour-preserving, so every channel is expected to read 0; the question is whether each 0 is
+agreement or blindness, and each was graded with a sabotage built from the **pristine** published
+seed in ONE stage (never a self-compile, which would let a sabotage poison its own witness).
+
+| channel | candidate | S1 (`nameIsShapeOpen`'s `!=` → `==`) | S2 (`nameIsShapeSpanEnds` drops `CLOSE`) |
+| --- | ---: | ---: | ---: |
+| corpus, 1,411 files × {build rc, wasm sha256, build msg, run rc, run stdout} | **0** | **167 files red** | **10 files red** |
+| fuzz, 50,400 programs / 84 dirs, shared-instance `vl check --codegen <dir>` | **0** | **84/84 dirs red** | **45/84 dirs red** |
+
+Both candidate columns were re-run after the rebase against a compiler built from `ecd8a4f` and
+read **0** again (corpus 1,411/1,411, fuzz 84/84). Binary delta is **−156 B** at both bases
+(1,031,388 → 1,031,232 at `9a60901`; 1,031,549 → 1,031,393 at `ecd8a4f`).
+
+### A ZERO THAT WAS PURE BLINDNESS, AND THE GATE SHAPE THAT CAUSED IT
+
+The fuzz channel was first run as plain **`vl check <dir>`**, the shared-instance form the standing
+gate names. **S1 — a sabotage that reddens 167 corpus files — was INERT on it: 84/84 dirs OK.**
+`vl check` **skips codegen entirely** (`tests/selfhost_native_align_test.ts:745` says so in as many
+words), and every consumer of these homes is an EMITTER pass, so the checker-only channel cannot
+reach them. Adding `--codegen` — which keeps the one-instance-per-directory property — took the
+same sabotage from 0/84 to **84/84**. Any slice whose change lives in `emit_*` must use
+`vl check --codegen <dir>`; a green `vl check <dir>` is evidence of nothing.
+
+### THE FIXTURE, AND WHAT ENTOMBS IT
+
+`tests/cases/unions/inline-shape-open-span-homes.vl` exercises all five routed sites in one
+program. A behaviour-preserving refactor cannot have a pin that fails on master, so it is entombed
+by a pin that fails under the SABOTAGE:
+
+| compiler | result |
+| --- | --- |
+| master (`BASE`) | **PASS** |
+| candidate | **PASS** |
+| S1 | **FAIL** — `emitProgram: ref valtype with no interned shape` |
+| S2 | **FAIL** — `emitProgram: only i32 / boolean / string / array union-variant fields are supported` |
+
+Separating the two homes needed a specific arm: `{g: f64}[] | f64`. `{g: f64}[]` opens with `{`,
+is not a map, and does **not** end in `}` — an inline shape to the OPEN home and not one to the
+SPAN home. Without it the fixture passed under S2. A map-valued twin (`i32 | {[string]: i32}`)
+rides alongside so a home that dropped `NOT2ND` mis-sorts the two rather than agreeing.
+
+### GATE — every leg, exit code explicit
+
+Gated from a **freshly fetched published seed**, which had ADVANCED past this PR's base during the
+work (1,031,388 → 1,031,549 B) — so this also proves the source against a newer master's seed.
+
+| leg | RC |
+| --- | ---: |
+| `scripts/fetch-seed.sh` (fresh `seed-latest`) | **0** |
+| `scripts/refresh-compiler.sh --prove-fixpoint` — fixpoint holds, 2 compiles | **0** |
+| `scripts/native-fixpoint.sh` — stage3 == stage4 byte-for-byte | **0** |
+| `npm ci` then `SELFHOST_NATIVE_ALIGN=1 deno task test` — **2149 passed / 0 failed / 8 ignored** | **0** |
+| `deno check tests/cases_wasm_test.ts` | **0** |
+| `scripts/lint-self.sh` (incl. `vl fmt --check`) | **0** |
+| `scripts/rep-fuzz-check.sh` — exact, 1 baselined, 0 new / 0 stale | **0** |
+
+The suite baseline was verified in this worktree before the diff: **2148 / 0 / 8** at `9a60901`.
+2149 is that plus exactly the one new fixture.
+
+### FILED ROUTING — the 15 sites in files this slice does not own
+
+Both homes are exported. **12 sites in `emit_classify.vl`** and **2 in `emit_rep.vl`** are
+mechanical routings; both files already `import … from "./emit_base"`.
+
+* → `nameIsShapeOpen` (6): `shapeFieldParse` 7722 · `variantIndexOfTypeName` 7910 ·
+  `shapeElemDeclaredStructIdx` 9251 · `structElemArrayLowerable` 10758 ·
+  `internNonLowerableFieldShapes` 10990 · `internShapeFieldElems` 11018.
+* → `nameIsShapeSpanEnds` (7): `funcTypeShapeLowerable` 10801 · `variantNestedShapeOk` 10868 ·
+  `internFuncTypeShapes` 10947 · `internInlineShape` 11037 · `letAnnIsUninternedShape` 13429 ·
+  `emit_rep.sTyIxOfName` 955 · `emit_rep.slotCanonKey` 1480.
+* `emit_classify.nameIsWholeSpanShape` 7580 itself: its first four conjuncts ARE
+  `nameIsShapeSpanEnds`, so it becomes that call plus `tyGroupWrapsWhole(name)` — a routing that
+  preserves behaviour exactly and leaves the walk where it is.
+* **DO NOT** route `emit_classify.mvCanonValName` 2801 or `rlCanonLitUnionAtoms` 10021: they are
+  Class-2 above (no `NOT2ND`), and routing them TIGHTENS. Same for `internShapeArms` 10570, which
+  is `OPEN` only.
+
+**`typecheck.nullableRetName` 12886 is BLOCKED by module direction, not by policy.** It is a clean
+P1 site, but `emit_base.vl` **imports** `typecheck.vl` (`tyTopIndexOf`, `tyGroupEndIndex`), so the
+checker cannot import the emitter's homes — `typecheck.vl:16032` states the direction explicitly.
+Homing it needs either a copy in `typecheck.vl` (a second home, which this program exists to
+remove) or a shared lower module. **Do not route it by adding an import; that is a cycle.**
+
+### WHAT THIS SLICE DID NOT DO
+
+* **PAREN-open/close** was in scope and is NOT done. One well-proven collapse beat two
+  speculative ones, and the SHAPE work consumed the measurement budget — most of it on the
+  enclosing-guard correction above, which would have applied to PAREN identically.
+  **Re-measured here rather than relayed** (the brief carried "~37 tree-wide; `emit_base` 10 ·
+  `emit_collect` 1 · `emit_mono` 1", which is close but not this instrument's answer): `'('`
+  reads **27** and `')'` **20**, so **47** raw tree-wide — `typecheck` 20 · `emit_classify` 10 ·
+  **`emit_base` 11** (6 open · 5 close) · `format` 2 · `lexer` 2 · **`emit_collect` 1** ·
+  **`emit_mono` 1**. Dropping `lexer`/`format` (source-TEXT scanners, excluded by file) leaves
+  **43** over type names. Whoever takes PAREN: **collect dominating block guards before
+  classifying spellings**, or the same artifact will appear.
+* `emit_mono.vl` and `emit_rewrite.vl` were opened and censused and hold **ZERO** sites of this
+  grammar — the partition's SHAPE mass is entirely in `emit_base` + `emit_collect`.
+* No guard was deleted on a measured 0. The P_LEN1 population is empty on both channels and the
+  bound was still ADDED rather than the site left unbounded.
+
+### Method notes
+
+130. **A PREDICATE CENSUS THAT READS ONE EXPRESSION IS NOT A PREDICATE CENSUS — COLLECT THE
+     DOMINATING BLOCK GUARDS.** The first pass here invented a whole spelling ("no length guard",
+     5 sites) because `isStructAtom`'s `length >= 2` sits one scope up, on an enclosing `if` block.
+     Re-run with enclosing-block and early-return guards collected, that spelling has **0**
+     members and 19 of 20 sites are uniform. A slice that had trusted the first reading would have
+     shipped a home justified by a difference that does not exist.
+131. **`vl check <dir>` IS BLIND TO EVERY EMITTER CHANGE — IT SKIPS CODEGEN.** A sabotage that
+     reddens 167 corpus files read **84/84 dirs OK** on it. `vl check --codegen <dir>` keeps the
+     shared-instance property and takes the same sabotage to **84/84 red**. The standing gate's
+     wording should be read as `--codegen`; a plain `vl check` zero on an `emit_*` change is the
+     absence of a channel, not the absence of a difference.
+132. **A "WIDER" GUARD CAN BE A LATENT TRAP RATHER THAN A WIDER DOMAIN.** `length > 0` in front of
+     an `n[1]` test does not admit more names than `length >= 2` — it admits a crash. VL string
+     indexing traps out of bounds (verified by hand, not inferred), so on the one name that
+     separates them master already dies. Tightening such a guard is not a behaviour change owing a
+     graded population; it is a bug fix owing a measurement that the population is empty (it is:
+     0 of 1,410 corpus, 0 of 50,400 fuzz, against a positive control firing on 54 files).
+133. **THE RISING-CORE EFFECT IS A PROPERTY OF THE GRAMMAR BEING HOMED, NOT A LAW.** Three merges
+     running saw CORE go UP as copies went down, because the homed grammar's body called an
+     on-list resolver. This one contains no on-list call, so CORE is exactly flat at 312 while the
+     grammar units drop 4. Predicting the direction from the last three slices would have produced
+     a wrong number in the brief; decompose it every time.
