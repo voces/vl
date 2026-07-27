@@ -75,8 +75,10 @@ const buildGraph = async (
   }
 };
 
+// `.slice()` re-backs the bytes with a plain `ArrayBuffer` — `Deno.readFile`'s
+// `ArrayBufferLike` does not satisfy `BufferSource` under `deno check`.
 const exportNames = (bytes: Uint8Array): string[] =>
-  WebAssembly.Module.exports(new WebAssembly.Module(bytes))
+  WebAssembly.Module.exports(new WebAssembly.Module(bytes.slice().buffer))
     .map((e) => e.name)
     .sort();
 
