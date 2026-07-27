@@ -22018,3 +22018,117 @@ the measured zeros are published rather than read as agreement.
    generic template contributes `$fnsig` entries keyed on spellings containing type
    parameters* — is broader than one guard and was not taken on without a witness for the
    wider claim.
+
+---
+
+## PR B — `annotPart` becomes a real map, the two-stage landing closes, and the METHOD-NOTE NUMBERING is found to be systemically colliding (off master `59fc905`)
+
+The follow-up #1176 filed (D-SIGSKIP landed in between, so it is no longer the section directly
+above). **NET parse count 0**; no resolver retired, no type-name
+parse added, and **zero observable behaviour change** — the corpus A/B is byte-, diagnostic- and
+run-identical on all 1,407 files. What lands is `compiler/typecheck.vl`'s `annotPart` as a
+`{[string]: string}` map instead of two parallel `string[]`s, which is the SELF-COMPILE entombment
+for the assignment-boundary map-shape fix that shipped in #1176.
+
+### THE TWO-STAGE ARGUMENT, CLOSED BY A BYTE COUNT
+
+The claim was that master's compiler miscompiled this spelling and the fix's own compiler does not.
+It is now closed at both ends, from the PUBLISHED seed each time:
+
+| seed | `next.wasm` | ladder |
+| --- | --- | --- |
+| `seed-latest` BEFORE #1176 (1,032,729 B, sha256 `3fd9c4fc…`) | **1,035,476 B** | ✗ `function[135]` (`initChecker`) — `type mismatch: expected (ref null $type), found (ref $type)` |
+| `seed-latest` AFTER #1176 (1,034,330 B, sha256 `a49322be…`) | **1,035,476 B** | ✓ fixpoint at 2 compiles |
+
+**The same source, the same byte count, opposite verdicts.** The only variable was whether the seed
+carried the fix — which is what makes this a bootstrap ordering constraint rather than a defect in
+either revision.
+
+**THE REPUBLISH WAS VERIFIED, NOT INFERRED.** `seed-latest` republishes on a master push and that
+job's completion is not observable from the branch. Three checks before any gate leg was believed:
+the fetched hash is not the old one; it equals the artifact built from #1176's sources locally; and
+— the one that matters — it is byte-identical to a rebuild of **master `59fc905`'s own `compiler/`
+tree**, extracted with `git archive`. That last is what licenses "`seed-latest` tracks master", and
+it is the assumption the whole two-stage plan rests on.
+
+### METHOD-NOTE NUMBERING — THE SEQUENCE HAS BEEN COLLIDING FOR SEVERAL SLICES
+
+Notes **112** and **113** appended by #1176 collide with an existing pair (the inert-sabotage/
+independent-counter note and the arm-order note). Checking the WHOLE file rather than the adjacent
+slice, the collision is neither mine alone nor new — and it is still happening: this census was
+re-run after a mid-review rebase onto #1177, which had itself added a colliding **112–116** while
+this branch was in flight.
+
+| number | occurrences at this head |
+| --- | --- |
+| 106, 107 | 2 each |
+| 108, 109, 110, 111 | **4 each** |
+| 112, 113 | **3 each** |
+| 114, 115, 116 | 2 each |
+| 117 – 126 | 1 each |
+
+Two numbering ERAS exist: a continuous run up to **126** earlier in the file, and a later stretch in
+which five separate slices each restarted around 106/108 and overwrote one another. **The true
+maximum in use is 126**, and every number a slice has "taken" since then was already occupied.
+
+This doc is append-only, so the earlier text stands and the correction is made here:
+
+- #1176's **112** ("REBUILD THE SEED FROM YOUR OWN SOURCES" IS NECESSARY AND NOT SUFFICIENT) is
+  renumbered **127**.
+- #1176's **113** (A SELF-HOSTING ENTOMBMENT CAN BE UNSHIPPABLE WITH THE THING IT ENTOMBS) is
+  renumbered **128**.
+- This slice takes **129**, below.
+- **#1177's five notes (112–116) also need renumbering, to 130–134**, but they are another
+  partition's text and renaming them is that owner's call, not a thing to do to someone else's
+  section while rebasing past it. Flagged rather than taken.
+- **A slice adding a note must** `grep -oE '^1[0-9][0-9]\. \*\*' docs/internals/destringify-types-program.md`
+  **and take max+1**, rather than continuing from whatever the previous section happened to use —
+  which is the mistake five consecutive slices have now made, this one included.
+
+129. **AN APPEND-ONLY LOG NEEDS ITS COUNTER READ FROM THE WHOLE FILE, NOT THE LAST SECTION.**
+     Numbering assigned per-slice by looking at the nearest preceding note collides silently the
+     moment slices land out of order or in parallel — 108–111 exist four times each here and nobody
+     noticed, because a duplicate number breaks no gate and no test. The counter is a property of
+     the document; derive it from the document. **Re-derive it after a rebase, too:** this very
+     census went stale mid-review when a concurrent slice landed five more collisions.
+
+### GATE — every leg from the FRESHLY FETCHED published seed
+
+`refresh-compiler.sh --prove-fixpoint` RC=0 (2 compiles, 1,035,476 B) · `native-fixpoint.sh` RC=0
+(stage3 == stage4 byte-for-byte) · `lint-self.sh` RC=0 · `rep-fuzz-check.sh` `exact ✅` ·
+`deno check tests/cases_wasm_test.ts` RC=0 · `SELFHOST_NATIVE_ALIGN=1 deno task test`
+**2,145 / 0 / 8**, equal to the `59fc905` baseline.
+
+**Suite A/B, same tree, same session, both seeds: 2,145 / 0 / 8 on each.** Matching totals hide
+movement in both directions in general, but not here: with **zero failures on both sides** no test
+can have swapped verdicts. **IGNORED NAME SETS IDENTICAL**, both files asserted non-empty (8 each) —
+and 8 rather than 14, i.e. the six `selfhost_native_opt` (`vl build -O`) tests actually ran.
+
+**Corpus A/B, 1,407 files, file sets identical: ZERO differing records.** Every emitted module is
+byte-identical, every diagnostic identical, every run output and rc identical. That is the expected
+shape for this change and it is the strongest available statement of it: the map spelling is an
+internal data-structure choice inside the checker with no reachable consequence for any program.
+
+**Fuzz A/B: 25,600 programs per side** (4 seeds × 4 dimension combos × 1,600, whole `--shapes-out`
+failure sets diffed per cell rather than counts): **0 of 16 cells differ, 422 failure lines on both
+sides.** Unlike the previous slice, this 0 is agreement rather than a coverage statement — the
+generator does exercise the checker's annotation resolver on every program it emits.
+
+Both sweeps used the REWRITTEN instrument (one file per worker plus a well-formedness assertion),
+after the shared-append version tore a record during the previous slice. A torn record hides a real
+difference as easily as it invents one, so the earlier instrument's numbers are not comparable and
+were re-measured, not carried over.
+
+### THE GATE HOLE THIS PAIR LEAVES BEHIND, STATED PLAINLY
+
+Two findings outlived their PRs and are now in `docs/internals/agent-playbook.md` rather than only
+in this log, because the next agent reads the playbook and not a 21,000-line program record:
+
+1. **The seed ladder has two legs and a self-built seed satisfies only one.** The fetched-seed leg is
+   three commands and had never been run in this program.
+2. **`npm ci` is load-bearing for the GATE, not just the build.** The six `vl build -O` tests gate on
+   `node_modules/.bin/wasm-opt` and self-ignore silently when it is missing — appearing as 14 ignored
+   instead of 8, never as a failure. The three wide store widths shipped in #1176 having **never once
+   been through `-O`**; run afterwards, they pass, but that was luck rather than coverage. A suite
+   whose absent dependency degrades to "ignored" is a gate that reports success for work it did not
+   do.

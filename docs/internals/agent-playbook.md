@@ -51,6 +51,31 @@ WAT of the value's write path vs read path. Don't debug codegen blind against th
 validator message alone — the disassembly is the debugging view of `vl build` output.
 
 ## Trimmed gates (CI covers the full battery)
+- **The seed ladder has TWO legs, and a self-built seed only satisfies one.**
+  `scripts/refresh-compiler.sh` rebuilds from your own sources, which proves the
+  seed matches the source and catches a STALE seed. It cannot catch a seed too
+  OLD to compile source that relies on a fix the source ships — because the seed
+  you built already contains that fix. CI bootstraps from the published
+  `seed-latest`, which is MASTER's compiler, so the second leg is:
+
+      mv build/vl-compiler.wasm /tmp/keep.wasm
+      bash scripts/fetch-seed.sh
+      bash scripts/refresh-compiler.sh --prove-fixpoint
+
+  Run it before opening any PR that touches `compiler/*.vl`. When it fails and
+  the self-built ladder passes, the change is a BOOTSTRAP ORDERING problem, not a
+  defect: split it into the fix, and the use of what the fix enables, separated by
+  a seed republish (`seed-latest` republishes on every master push — verify the
+  hash changed, never assume the job finished).
+- **`npm ci` is load-bearing for the gate, not just the build.** The six
+  `selfhost_native_opt` (`vl build -O`) tests gate on
+  `node_modules/.bin/wasm-opt` and SELF-IGNORE when it is absent — silently, as
+  6 extra "ignored" rather than any failure. With `SELFHOST_NATIVE_ALIGN=1` the
+  suite reads 2145/0/**8** with binaryen present and 2145/0/**14** without, and a
+  whole slice of new opcodes shipped having never once been through `-O`. **If
+  you see 14 ignored, fix the environment before reading any number.** Compare
+  the ignored NAME SET, both files asserted non-empty — an empty-vs-empty diff is
+  clean and means nothing.
 - Per commit: `git status tests/golden/` empty (+ the REJECT_CASES loop if
   the checker got more permissive).
 - Before finishing: `deno test -A --no-check tests/selfhost_emit_fixpoint_test.ts`
@@ -64,6 +89,20 @@ validator message alone — the disassembly is the debugging view of `vl build` 
 - When a slice makes something START WORKING, grep the test suites for stale
   negative tests asserting it fails (`fails loudly`, `err:`, REJECT lists) and
   flip them — two CI failures came from obsoleted expectations.
+- **A parallel sweep must not append to one shared file.** A single-line `>>` is
+  atomic only up to `PIPE_BUF`; a record carrying a long multi-line diagnostic
+  exceeds it and TEARS, which drops a file from one side of an A/B and invents a
+  fragment on the other. A torn record hides a real difference as easily as it
+  invents one. Write one file per worker and concatenate, and assert
+  well-formedness (line count == records matching the expected leading field) so
+  a tear is loud instead of an A/B artifact.
+- **A sabotage harness for a self-hosting compiler must restore a SAVED artifact,
+  never rebuild one.** `refresh-compiler.sh` self-compiles, so restoring after a
+  sabotage compiles clean source WITH the sabotaged compiler. If the sabotage
+  breaks a construct `compiler/*.vl` itself uses, the "restored" seed is
+  miscompiled and every later run measures against it. The tell is
+  IMPLAUSIBILITY, not failure — a sabotage of a host-side float formatter cannot
+  redden a map test. Only the sabotage's own build may recompile.
 - The FNV constant `0 - 2128831035` in wasmEmit.vl is deliberately
   hand-wrapped for i32 hash semantics — not a bug.
 - The type-index oracle formulas (`mAssignTypeIndices` + `*OffsetOf`) are a
