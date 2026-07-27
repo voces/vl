@@ -26615,3 +26615,184 @@ smaller ones.
   index lives as a module-local pair in `emit_collect.vl` rather than in `emit_state.vl` for exactly
   that reason, and its header says so: it is a derived cache of a column that file owns, read by one
   function in this one.
+
+## D-WHOLESPELL — the checker's and the collector's LAST 18 whole-type-spelling equalities; five of them turn out to guard code NOTHING can reach (off master `a17ccaa`)
+
+`typecheck.vl` and `emit_collect.vl` held 18 sites deciding a COMPOSITE type by matching its
+rendered characters — `nm == "f64[]"`, `inm == "string|null"`. Closed by #1213's pattern with no
+new helper: the grammar's ONE CUT plus a bare leaf name, which the rule allows.
+
+### THE CENSUS — RE-DERIVED, AND THE BRIEF'S FIGURES ARE EXACT
+
+Instrument: `(?:!=|==)\s*"((?:\\.|[^"\\])*)"` over comment-stripped source (a string-literal-aware
+stripper, so a `//` inside a literal cannot truncate a line), keeping a literal that contains one of
+`[]{}|<>` **and** at least one alphanumeric. The alphanumeric conjunct is the whole instrument: without
+it the list is ~2/3 **operator** spellings (`== "<<"`, `== ">>>"`, `== "&&"`), which are names and are
+legitimate. Scanned `compiler/`, `std/`, `lsp/`, `scripts/`.
+
+| file | at `a17ccaa` | after |
+|---|---:|---:|
+| `typecheck.vl` | 11 | **0** |
+| `emit_collect.vl` | 7 | **0** |
+| `emit_classify.vl` | 8 | 8 (other partition) |
+| `wasmEmit.vl` | 4 | 4 (other partition) |
+| **tree-wide** | **30** | **12** |
+
+The raw match count is 31/13; the extra is the ONE known false positive the brief predicted — a
+multi-line string at `typecheck.vl:12571` lets the regex run from `== "` to a quote several lines
+later. The detector now flags any match spanning a newline, so it is visible rather than silently
+counted. `std/`, `lsp/` and `scripts/` hold **zero** on this unit.
+
+### THE 18, AND WHAT EACH BECAME
+
+`typecheck.vl` (11) — the file OWNS `arrElemNameRaw` since D-ARRDOWN, so all three route to the
+local home and each takes the cut **once** for its whole arm set:
+
+| function | sites | became |
+|---|---:|---|
+| `isClassifiableRetName` | 2 | `elem == "i32" \|\| elem == "string"` after one cut |
+| `isScalarListRetName` | 3 | `elem == "i64" \|\| elem == "f32" \|\| elem == "f64"` |
+| `valueAtomKind` | 6 | one hoisted `const elem`, five leaf compares, arm order untouched |
+
+`emit_collect.vl` (7) — a CONSUMER file, and it was **hand-writing the bodies of functions it
+already imports** (the same finding #1213 made in two of its three files; no import line changed):
+
+| site | became | why |
+|---|---|---|
+| A20 `inm == "f64[]"` / `"i64[]"` / `"f32[]"` | `nameIsF64Array` / `nameIsI64Array` / `nameIsF32Array` | each home IS `arrElemNameRaw(name) == "f64"`, one line, already imported |
+| A20 `inm == "i32[]"` / `"string[]"` | one shared `ielem` cut + leaf | **declined the homes**: `nameIsI32Array` / `nameIsStringArray` are REP-wide |
+| A20 `inm == "string|null"` | `nameIsNulString(inm)` | the NULLABLE grammar's cut + leaf, already imported, already called 4 lines below |
+| `TypeRef` fn-return `frRet == "i32[]"` | `arrElemNameRaw(frRet) == "i32"` | its three siblings in the same chain were already named classifiers |
+
+**The two declines are the slice's one real judgement call and they are not stylistic.**
+`nameIsI32Array` also accepts `boolean[]`, a litunion `K[]`, `(boolean|null)[]` and `(K|null)[]`;
+`nameIsStringArray` also accepts `(string|null)[]`. Those share a **backing**, not a `fRetKind` —
+D2's correction ("the slot layers are keyed on REPRESENTATION, not on type") read from the other
+end. Routing to them would widen what the A20 chain stores, so the faithful cut ships (D-SHAPEFIELD:
+unreached is not licensed).
+
+The one widening that DID ship is `nameIsNulString`, which additionally accepts `null|string`. It
+cannot fire: every producer of a nullable inferred-return name (`nullableRetName`,
+`nulLitUnionRetName`, the `TyNullable` arms) mints `<part> + "|null"`, so the reversed order is not
+a producible spelling of that column. `inferNicheNullByName` took the identical widening in #1213
+**reading the identical `inferRetNameOf` value**.
+
+### PROVABLY EQUIVALENT, NOT MERELY MEASURED
+
+`arrElemNameRaw` returns `""` for a non-array name and otherwise `name` minus its final two
+characters. So `arrElemNameRaw(n) == "f64"` holds on exactly the inputs `n == "f64[]"` holds on —
+for every input, not for every input tried. Hoisting the binding above `litUnionArrayElemOf` decides
+nothing: the function is pure and the arm ORDER is unchanged.
+
+### THE STRONGEST PROOF, TAKEN
+
+**This branch's compiler compiles master's FROZEN source into a module byte-identical to master's
+own compiler's output** — `74fe4672…`, which is also the published seed byte-for-byte. Byte-identity
+of the branch's OWN build is impossible (the source changed); this is the substitute #1213 used.
+
+### FIVE OF THE 18 GUARD CODE NOTHING CAN REACH — the zeros, graded
+
+Nine per-site sabotages, each rebuilt into a whole compiler (all nine distinct from the branch's and
+from each other — comparator sanity). Four fire; five are inert on **every** channel this compiler has.
+
+| sabotage | site | reddens |
+|---|---|---:|
+| S1a | `valueAtomKind` i32/boolean | 7 cases |
+| S1 | `valueAtomKind` f64 | 4 cases |
+| S1c | `valueAtomKind` string | 2 cases |
+| S1d | `valueAtomKind` i64 | 3 cases |
+| S1e | `valueAtomKind` f32 | 2 cases |
+| S2 (string[] half) | `isClassifiableRetName` | 1 case (the redundant-return lint) |
+| S3 (i64/f32 arms) | `isScalarListRetName` | 2 cases |
+| S5 | A20 `nulstr` | 6 cases |
+| **S2a** | `isClassifiableRetName` **i32[]** | **0** |
+| **S3a** | `isScalarListRetName` **f64** | **0** |
+| **S7** | A20 **i32[] / string[]** | **0** |
+| **S4** | A20 **f64[]** home routing | **0** |
+| **S6** | `TypeRef` fn-return **i32[]** | **0** |
+
+The five zeros were pushed on three independent channels before being called coverage: the suite
+(3,178 tests), **the whole corpus at wasm-sha256 + build-status + diagnostic granularity** (1,492
+files — far finer than pass/fail), and a purpose-built 24-shape candidate sweep. The sweep's
+comparator is live throughout: the same harness fires S1a and S5 on their controls.
+
+**And grading one of the zeros found a real defect.** `function mk() { const xs: f32[] = [1.5]; return xs }`
+is an EMIT REJECT (`index access but array type not collected`) while the `f64[]` and `i64[]`
+siblings — the identical three lines with one leaf changed — both run. The A20 `f32[]` arm is
+therefore **unreachable BEHIND a defect, not merely untested**, which is the distinction a coverage
+zero alone cannot make. Pinned as `tests/cases/arrays/error-inferred-f32-list-return.vl`; it
+graduates to `@run` when the f32 wrapper/backing are forced for an inferred-return binding.
+
+### COUNTS — BOTH UNITS, AND THE TRACKED METRIC RISES
+
+* **Whole-type-spelling equality: my 2 files 18 → 0; tree-wide 30 → 12.**
+* **Named calls to the 10 grammar homes: 170 → 179 (+9)**, decomposed exactly —
+  `arrElemNameRaw` +5 (typecheck 3→6, emit_collect 2→4), `nameIsF64Array` +1, `nameIsI64Array` +1,
+  `nameIsF32Array` +1, `nameIsNulString` +1. 18 sites become 9 calls because each function takes the
+  cut ONCE for its whole arm set: `valueAtomKind`'s six share one binding, `isScalarListRetName`'s
+  three and `isClassifiableRetName`'s two share one each, and the A20 chain's `i32[]`/`string[]`
+  pair shares one.
+* **Binary +18 B**, attributed by rebuilding each file's change alone and exactly additive:
+  `typecheck.vl` **+20 B**, `emit_collect.vl` **−2 B**. #1213 measured −19 B on the same move; the
+  difference is that its sites were in `emit_base.vl`, where the routing DELETED nine-line function
+  bodies, while these are single conditions — three new `const` locals and nine calls replace 18
+  inline string compares, and the six array spellings stay in the data section because other
+  producers still emit them.
+
+### GATE — EVERY LEG, EXIT CODE TAKEN WITHOUT A PIPE
+
+| leg | rc | result |
+|---|---:|---|
+| `fetch-seed.sh` (freshly fetched, published) | 0 | 1,034,837 B |
+| `refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint holds, 1,034,855 B |
+| `native-fixpoint.sh` | 0 | stage3 == stage4 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,178 passed / 0 failed / 8 ignored** (master 3,176 + 2 for the new fixture — master's count re-measured by removing it; ignored set identical) |
+| `lint-self.sh` (incl. `vl fmt --check`) | 0 | clean |
+| `rep-fuzz-check.sh` | 0 | exact, 0 new / 0 stale |
+| corpus A/B, 5 channels | 0 | **1,492/1,492 identical** on build status, wasm sha256, diagnostic text, run status, run stdout |
+| fuzz A/B, pinned seeds 1–14 × depths 4–6 × 300 × {plain, declared} | 0 | **25,200 programs/side, out-dir trees byte-identical** (`diff -r` = 0 lines); failure-class totals identical on both sides — 2,238 REJECT + 1 INVALID-WASM |
+
+The published seed was republished mid-run and master gained #1215/#1217, so the WHOLE gate was
+re-taken on the rebased base and every figure above is the rebased one. Neither merge touched any
+of the ten grammar homes, so the census (30 → 12), the named-call delta (+9) and the binary delta
+(+18 B) are identical at both bases — which is itself the check that the rebase changed nothing.
+
+### METHOD NOTES
+
+* **The suite is not the finest channel it looks like, now that it discovers the whole corpus.**
+  3,178 tests over 1,492 files still only grade pass/fail; a sabotage can change thousands of
+  emitted bytes without moving one. Every "inert" verdict here was re-taken at **wasm sha256**, and
+  that is what makes "no witness" a measurement rather than an absence of failure.
+* **A `0` that survives three channels is a lead, not a conclusion.** The A20 f32 arm's zero was
+  worth one more question — *why* can nothing reach it — and the answer was a reproducible compiler
+  defect two lines long. Grade the zero by asking what would have to be TRUE for it to be non-zero.
+* **"Look for the existing home" has a second half: check the home's WIDTH.** Three of the five A20
+  list arms had an exact one-line home already imported; the other two had a home that was
+  rep-wide, and routing to it would have been a silent behaviour change dressed as a dedup. The
+  same file, the same family, the same import line — and the right answer differs per arm.
+* **A binary delta can be attributed exactly for a two-file change** by rebuilding each file's
+  change alone; +20/−2 summing to +18 also proves the two changes do not interact.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **The 12 remaining sites in `emit_classify.vl` (8) and `wasmEmit.vl` (4)** — a different partition.
+
+**AND A CLAIM OF MINE ABOUT THEM, CORRECTED BY LOOKING RATHER THAN REASONING.** I first wrote that
+those 12 "are the same two grammars this slice used". Read per site, they are not: **5 of the 12 are
+not type spellings at all.** `emit_classify:8193` and all four `wasmEmit.vl` sites compare against
+`inferNicheNullByName`'s **published 3-valued protocol return** (`""` / `"boolean|null"` /
+`"string|null"`) — the function whose header, written by #1213, says exactly that its returned
+strings stay literal because they are a RENDER, which is the one use of a type spelling the rule
+allows. The detector counts them because the literal holds a `|` and an alphanumeric; the VALUE
+being compared is an enum, not a rendering of any arena type. The other **7** — `lt.tyName ==
+"boolean[]"` at `emit_classify:6708` and the two `f64[][]`/`i64[][]`/`f32[][]` triples — ARE the
+array grammar, and want one DOUBLE cut.
+
+**So the tree-wide 12 is 7 array-grammar sites plus 5 that a future census should reclassify.** That
+is this instrument's second systematic false-positive shape, and unlike the multi-line string it is
+not detectable from the regex alone — it needs the compared expression's *provenance*. Anyone
+quoting "12 left" should quote **7** as the removable figure.
+* **Deleting the five unreachable arms.** Unreached is not licensed (D-SHAPEFIELD). They ship
+  faithful, now with their reach measured and the blocking defect pinned.
+* **The f32 inferred-return-binding fix** — filed with a witness, not attempted; it is an
+  `emit_classify`/`emit_base` type-forcing question, outside this partition.
