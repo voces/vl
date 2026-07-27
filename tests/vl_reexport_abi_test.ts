@@ -144,3 +144,65 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    "reexport-abi: a DEPENDENCY's re-export is not part of the entry's ABI",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The other half of the alias rule. `mid` republishes `passed` for its own
+    // importers; the ENTRY exports nothing at all, so the module's ABI must be
+    // empty. Aliasing every module's re-export row — not just the root's — put a
+    // dependency's bare name in the wasm export section of a program that never
+    // asked to publish it, which is the same leak 4c's "an internal function …
+    // never leaks into the wasm ABI" rules out for every other kind of name.
+    //
+    // The entry still IMPORTS through the re-export, so this cannot pass by the
+    // re-export failing to resolve: the program has to run and print.
+    const bytes = await buildGraph({
+      "home.vl": `export function passed(n: i32): i32 { return n * 2 }\n`,
+      "mid.vl": `export { passed } from "./home"\n`,
+      "entry.vl": `import { passed } from "./mid"\n\nprint(passed(21))\n`,
+    });
+
+    const names = exportNames(bytes);
+    if (names.length !== 0) {
+      throw new Error(
+        `the entry exports nothing, but the wasm ABI carries ${
+          JSON.stringify(names)
+        } — a dependency's re-export leaked`,
+      );
+    }
+    const { logs } = await runWasm(bytes);
+    if (JSON.stringify(logs) !== JSON.stringify(["42"])) {
+      throw new Error(`top level logs = ${JSON.stringify(logs)}, want ["42"]`);
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "reexport-abi: the root's rename resolves without the dependency rows to lean on",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The renaming chain of the first test, with the entry's own public name the
+    // ONLY thing the ABI may carry. Before the root-only alias rule, `b`'s and
+    // `c`'s rows contributed `base` and `doubled` entries of their own; the entry's
+    // row had to be correct anyway (it renames), but nothing measured the dependency
+    // rows' ABSENCE. This does, and it is the pin that would catch a regression to
+    // one-hop resolution masquerading as "the name is exported".
+    const bytes = await buildGraph({
+      "a.vl": `export function base(n: i32): i32 { return n * 2 }\n`,
+      "b.vl": `export { base } from "./a"\n`,
+      "c.vl": `export { base as doubled } from "./b"\n`,
+      "entry.vl": `export { doubled } from "./c"\n\nprint(doubled(21))\n`,
+    });
+
+    const names = exportNames(bytes);
+    if (JSON.stringify(names) !== JSON.stringify(["doubled"])) {
+      throw new Error(
+        `exports = ${JSON.stringify(names)}, want exactly ["doubled"]`,
+      );
+    }
+  },
+});
