@@ -1062,3 +1062,60 @@ Deno.test({
     }
   },
 });
+
+// ── the D-FMTDECL pin (#1181) ────────────────────────────────────────────────
+// An OVER-WIDTH one-line type decl whose RHS is a `{ … } | { … }` union. The
+// parser makes that a `UnionDecl`, not a `TypeDecl` — but `wrapTypeDecl` used to
+// re-derive "is this a struct record?" from the rendered text (`body[0] == '{'`),
+// said yes, and peeled `body.slice(1, len - 1)` off a body whose first `}` is not
+// its last. The result did not re-parse, so `vl fmt` exited 3 ("formatter produced
+// invalid output — file left unchanged, please report") on source that `vl check`s
+// clean and runs. #1181 threads the parser's own verdict down as `isRecord`.
+//
+// This is the FORMATTER half of that fix. Its parser half is pinned by
+// tests/cases/parser/type-decl-brace-{union,intersection}-multiline.vl, but the
+// formatter half cannot live in tests/cases: `tests/` is excluded from the
+// `vl fmt --check` gate by construction (scripts/lint-self.sh never passes it in)
+// and tests/cases_wasm_test.ts has no `@fmt` directive, so no corpus file can
+// express "this must FORMAT clean". Hence the pin belongs here, driving `vl fmt`
+// end to end. Filed as a hand-off by #1181; this closes it.
+//
+// The decl must stay over `fmtWidth` (80) on one line or `wrapTypeDecl` is never
+// reached and the pin goes inert — the length is asserted, not assumed.
+Deno.test({
+  name:
+    "vl-fmt: an over-width brace-leading union/intersection type decl formats (does not corrupt)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const decl =
+      `type Shape = { kind: string, width: i32, height: i32 } | { kind: string, radius: i32, colour: string }`;
+    if (decl.length <= 80) {
+      throw new Error(
+        `the fixture is ${decl.length} cols — under fmtWidth, so wrapTypeDecl is never reached and this pin is inert`,
+      );
+    }
+    for (const src of [`${decl}\nprint("ok")\n`, `${decl.replace(" | ", " & ")}\nprint("ok")\n`]) {
+      const r = await run([], src);
+      if (r.code !== 0) {
+        throw new Error(
+          `vl fmt rejected valid source (rc ${r.code}) — the brace-leading decl was corrupted:\n${r.err}`,
+        );
+      }
+      // The formatter's own round-trip guard is what exited 3, so a clean rc
+      // already means "re-parses". Assert the decl SURVIVED too: a silently
+      // dropped or truncated RHS would also be rc 0.
+      const flat = r.out.replace(/\s+/g, " ");
+      for (const want of ["type Shape =", "kind: string", "colour: string"]) {
+        if (!flat.includes(want)) {
+          throw new Error(`fmt lost \`${want}\` from the decl:\n${r.out}`);
+        }
+      }
+      const r2 = await run([], r.out);
+      if (r2.code !== 0 || r2.out !== r.out) {
+        throw new Error(
+          `not idempotent (rc ${r2.code}):\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`,
+        );
+      }
+    }
+  },
+});
