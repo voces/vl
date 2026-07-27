@@ -2035,11 +2035,23 @@ export function fnIndexOfInScope(name: string, fnIx: i32) {
 }
 
 // ── capture analysis (closures) ───────────────────────────────────────────────
+// The `fnStmts` position of the lifted function whose capture list is being computed
+// right now. `capRecord` needs it to ask whether an ENCLOSING frame binds a name, and
+// `capScan` is a 30-site recursion, so the frame rides here rather than through every
+// call. Sound because there is exactly ONE entry point (`capComputeNamesOf`, the only
+// caller of `capScan` in the compiler — every other reference to it is a comment) and no
+// re-entrancy: the nested-`FuncDecl` arm's transitive pass is still part of the SAME
+// frame's computation, and that is the frame whose ancestors decide the question. -1 (the
+// initial value, and the value outside any computation) reproduces the old behaviour
+// exactly, because `parentBindingFrameOf(-1, …)` is -1.
+let capFrame: i32 = -1
+
 // The captured-variable NAMES of the lifted function at `fnStmts[fe]`, in
 // encounter (= env field) order, by DIRECT WALK. A capture is a free variable: an
 // identifier read in the body that is NOT one of the function's own params, NOT a
 // `let`/`const` declared in the body, NOT a module global, and NOT a top-level/
-// lifted function name (those are addressable directly). The walk threads a
+// lifted function name (those are addressable directly) — the last two UNLESS an
+// enclosing frame binds the same name, see `capRecord`. The walk threads a
 // growable `bound` set (params, then each `let` as it is declared) and
 // accumulates free names into `caps` (deduped). Mirrors the host's
 // `captureCollector`. Callers go through `captureNamesOf`, which serves the
@@ -2047,6 +2059,7 @@ export function fnIndexOfInScope(name: string, fnIx: i32) {
 export function capComputeNamesOf(fe: i32) {
   const caps: string[] = []
   if fe < 0 || fe >= fnStmts.length { return caps }
+  capFrame = fe
   const fn = P.nodes[fnStmts[fe]]
   if fn is FuncDecl {
     const bound: string[] = []
@@ -2089,10 +2102,47 @@ export function captureCountOf(fe: i32) {
   caps.length
 }
 
+// A module GLOBAL and a top-level/lifted FUNCTION name are addressable directly from
+// inside a lifted function, so neither is a capture — UNLESS AN ENCLOSING FRAME BINDS THE
+// SAME NAME. Then the identifier denotes that binding, and dropping it here left the
+// lifted body with nothing to read it from: `emitIdentNode` consults the env FIRST, misses
+// (the name never entered the env), and falls through to `global.get` — a SILENT WRONG
+// ANSWER, no diagnostic at any tier.
+//
+//   const a = 99
+//   function outer(): i32 {
+//     const a = 10                            // shadows the global
+//     const inner = (x: i32) => x + a         // reads 99, prints 100, not 11
+//     return inner(1)
+//   }
+//
+// Censused at the fix: 9 programs over `const`/`let`/param bindings, i32 and string, a
+// nested named function and a lambda, at top level and one frame down — 7 wrong, both
+// alias-free controls (distinct names; the same local read DIRECTLY rather than through a
+// closure) right, and every wrong cell exits 0. The FUNCTION-name half is the same defect
+// one line over and was already filed from the other side: `lint.vl`'s `stmtDiverges`
+// carries a comment saying it is spelled uniquely to dodge exactly this, because a bare
+// `diverges` would collide with a LOCAL of that name in `typecheck.vl` and the seed's
+// capture analysis then mis-resolved it into "captured variable not found in enclosing
+// frame". Both halves are one guard.
+//
+// `parentBindingFrameOf` is the existing resolver for "which ancestor frame owns this
+// captured name" — the emitter already uses it to type a transitive capture — so this asks
+// the question the env-building side will answer, rather than a second copy of it. It is
+// consulted ONLY for a name that is already a global or a function name (the test it
+// guards), and it returns -1 immediately when the frame has no parent, which is the
+// overwhelming majority of reaches.
+//
+// WHERE THIS DELIBERATELY BINDS THE LOCAL: a closure written BEFORE the shadowing `let`
+// now captures that `let` (reading its pre-initialization zero) instead of the global.
+// That matches what the SAME function body already does for a DIRECT read — wasm locals
+// are function-scoped and `parentLetOf` sees the whole body, so `const r = 1 + a` before
+// `const a = 10` reads the local today. The closure path was the one that disagreed.
 function capRecord(name: string, bound: string[], caps: string[]) {
   if capIsBound(bound, name) { return 0 }
-  if globalIndexOf(name) >= 0 { return 0 }
-  if fnIndexOf(name) >= 0 { return 0 }
+  if globalIndexOf(name) >= 0 || fnIndexOf(name) >= 0 {
+    if parentBindingFrameOf(capFrame, name) < 0 { return 0 }
+  }
   // D-CAPCALLEE: the `isBuiltinFnName` exemption used to sit HERE — at every identifier in
   // every position — and it is POSITIONAL, so it moved to `capScan`'s `Call` arm. A builtin
   // name denotes instructions where it is CALLED and nothing anywhere else, so filtering it
@@ -2196,22 +2246,20 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     // Parens are unwrapped so `(print)(1)` reads the same as `print(1)` — the master
     // behaviour, whose filter ran inside `capRecord` and so could not see the wrapper.
     //
-    // TWO lists are asked, and the second is the one that ends the drift.
-    // `emit_base.isBuiltinFnName` is a PARTIAL COPY of `typecheck.nameIsEmitterIntrinsic`
-    // — its own header says so, and says the one-word fix is to export the authoritative
-    // predicate so "the whole dunder block here collapses to a single delegation", filed
-    // as a hand-off only because `typecheck.vl` was another partition's file. It is
-    // exported now, and asked HERE, at the single site that consumes either. The
-    // authoritative list is by construction exactly the set of names whose CALL SITE the
-    // emitter rewrites before it looks up a declaration — which is precisely the
-    // condition that makes the exemption sound — so a new inline-lowered intrinsic can no
-    // longer be reserved in one file and left capturing in the other. (The three wide
-    // store widths are the first names to arrive through it.)
+    // TWO lists are asked, and they PARTITION the exempt names — no name is on both.
+    // `typecheck.nameIsEmitterIntrinsic` is the authoritative one: by construction exactly
+    // the set of names whose CALL SITE the emitter rewrites before it looks up a
+    // declaration, which is precisely the condition that makes the exemption sound. It
+    // used to be private, so `emit_base.isBuiltinFnName` kept a PARTIAL COPY of it (which
+    // had already drifted — the three wide store widths were missing); #1176 exported it
+    // and asked it HERE, and the copy has since been deleted from `emit_base.vl`, so a new
+    // inline-lowered intrinsic can no longer be reserved in one file and left capturing in
+    // the other.
     //
-    // `isBuiltinFnName` is still asked because it also carries `print` / `toString` /
-    // `fromCodePoint(s)` / `Map` / `Set`, which are builtins rather than dunder
-    // intrinsics and are not on the reservation list. Its dunder block is now redundant;
-    // deleting it belongs to that file's owner.
+    // `isBuiltinFnName` is still asked because it carries the six BUILTINS — `print` /
+    // `toString` / `fromCodePoint(s)` / `Map` / `Set` — which are deliberately NOT on the
+    // reservation list (a program may define its own `print`, so the checker does not
+    // reserve the name) and therefore cannot be folded into it.
     let skipCallee = false
     const cal = P.nodes[unwrapParen(n.callFn)]
     if cal is Ident {
