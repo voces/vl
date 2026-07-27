@@ -1,0 +1,168 @@
+// @run
+// @log 9
+// @log 7
+// @log 5.5
+// @log 3
+// @log 12
+// @log 4
+// @log 2.5
+// @log 8
+// @log 11
+// @log 55
+// @log 30
+// @log 17
+// @log 6000000000
+// @log 0
+// @log 20
+// The emitter sites that ask the INLINE-SHAPE grammar (`{…}` that is NOT a map `{[…]}`)
+// through `emit_base.nameIsShapeOpen` / `nameIsShapeSpanEnds`, exercised in one program.
+// D-SHAPEOPEN (#1186) built the two homes and routed the five sites in its own partition;
+// this is the witness for the fourteen it FILED — twelve in `emit_classify.vl`, two in
+// `emit_rep.vl` — each of which carried its own hand-written copy of the same characters.
+//
+// The two predicates differ by ONE conjunct and the difference is load-bearing:
+//   * `nameIsShapeOpen`      — `len >= 2` · `'{'` at 0 · NOT `'['` at 1
+//   * `nameIsShapeSpanEnds`  — that, plus `'}'` as the LAST character
+// so `{g: f64}[]` is an inline shape to the OPEN home and is NOT one to the SPAN home.
+// A map-valued twin (`{[string]: i32}`) rides alongside: it opens with `{` and ends with
+// `}`, so a home that dropped the `[1] != '['` conjunct would mis-sort it as a struct.
+//
+// The routed sites this reaches, by the question each asks:
+//   * `internInlineShape` / `letAnnIsUninternedShape` — an inline-shape LET annotation
+//   * `nameIsWholeSpanShape` -> `shapeFieldParse`      — a field read through such a name
+//   * `variantIndexOfTypeName`                         — an inline-shape UNION variant
+//   * `variantNestedShapeOk`                           — a variant field that is itself a shape
+//   * `internFuncTypeShapes` / `funcTypeShapeLowerable`— a CLOSURE whose result is a shape
+//   * `structElemArrayLowerable`                       — a `{…}[]` field of such a result
+//   * `internShapeFieldElems` / `internNonLowerableFieldShapes` — nested/peeled shape fields
+//   * `shapeElemDeclaredStructIdx`                     — a ref-ARRAY of an inline shape
+//   * `emit_rep.sTyIxOfName` / `slotCanonKey`          — the arena row + dedup key of a
+//     shape-named struct row; the TWIN pair below is where a wrong row pick is observable.
+
+// STRUCTURAL TWINS — same fieldset, same field codes, distinct spellings. They share one
+// WasmGC heap type, so the row/dedup key pick must still read the right FIELD.
+type PairA = { u: i32, w: i32 }
+type PairB = { u: i32, w: i32 }
+
+// A union whose variants are INLINE SHAPES (`variantIndexOfTypeName`), one of which has a
+// nested inline-shape field (`variantNestedShapeOk`).
+type ShapeArm = { k: { d: i32 } } | { m: i32 } | i32
+
+// A struct whose field is a `{…}[]` — opens `{`, not a map, does NOT end `}`.
+type ListOfShape = { items: { g: f64 }[] }
+
+// A DECLARED struct whose fieldset an INLINE spelling below also names: the inline
+// `{ h: i32 }` dedups onto this row at intern time, so the spelling itself never gains
+// an `sNames` entry and the ref-ARRAY element resolvers reach the structural bridge
+// (`shapeElemDeclaredStructIdx`) instead of the plain name lookup.
+type H = { h: i32 }
+
+// THE MAP TWIN. `{[string]: i32}` opens with `{` and ends with `}` — the two characters
+// the SPAN home's outer conjuncts test — and is NOT an inline struct shape. Only the
+// `[1] != '['` conjunct separates them, so a home that dropped it mis-sorts this against
+// the struct shapes above rather than agreeing with them. Carried as a shape FIELD so the
+// same intern paths that classify the structs above also see it.
+type WithMap = { mv: { [string]: i32 } }
+
+function twinU(p: PairA): i32 { return p.u }
+
+function twinW(q: PairB): i32 { return q.w }
+
+function armK(v: ShapeArm): i32 {
+  if v is { k: { d: i32 } } { return v.k.d }
+  if v is { m: i32 } { return v.m }
+  if v is i32 { return v }
+  return 0
+}
+
+// A CLOSURE whose RESULT is an inline shape carrying a struct-element list field —
+// `internFuncTypeShapes` interns the result, `funcTypeShapeLowerable` decides it is
+// lowerable, and `structElemArrayLowerable` decides its `{g: f64}[]` field is.
+// The result type is spelled INLINE, not through the `ListOfShape` alias: a declared
+// NAME never reaches this grammar, so the alias form would leave every one of these
+// four sites unreached (measured — the first draft of this fixture did exactly that).
+function listMaker(): () => { items: { g: f64 }[] } {
+  return () => { items: [{ g: 5.5 }, { g: 6.5 }] }
+}
+
+// A closure result that is NOT lowerable as a whole (it carries a closure field, code
+// 14), so `internFuncTypeShapes` takes its OTHER arm and descends the nested
+// inline-shape field through `internNonLowerableFieldShapes`.
+function nonLowMaker(): () => { cb: () => i32, nest: { c: i32 } } {
+  return () => { cb: () => 42, nest: { c: 13 } }
+}
+
+// A ref-ARRAY whose ELEMENT is spelled inline (`{h: i32}[]`) while the same fieldset is
+// also DECLARED as `H` — the element spelling has no struct-table row of its own, so
+// `nameIsRefArray` / `refArrElemName` fall to `shapeElemDeclaredStructIdx`.
+function sumH(rows: { h: i32 }[]): i32 {
+  let t = 0
+  let i = 0
+  while i < rows.length {
+    t = t + rows[i].h
+    i = i + 1
+  }
+  return t
+}
+
+// A shape field that is itself a nullable inline shape (the code-15 nested layer) and one
+// that is a shape ARRAY — both reach the peel in `internShapeFieldElems`.
+type Nest = { inner: { c: i32 } | null, list: { e: i32 }[] }
+
+// THE ARM THAT SEPARATES THE TWO HOMES. `{q: i64}[]` opens with `{`, is not a map, and
+// does NOT end in `}` — an inline shape to `nameIsShapeOpen` and NOT one to
+// `nameIsShapeSpanEnds`. Spelled inline in the signature (an array-arm ALIAS is a
+// separate pre-existing limitation). Without this arm the fixture passes under a SPAN
+// home that dropped its closing-`}` conjunct — measured, not assumed.
+function readQArm(v: { q: i64 }[] | f64): i64 {
+  if v is { q: i64 }[] { return v[0].q }
+  return 0
+}
+
+function nestC(n: Nest): i32 {
+  const q = n.inner
+  if q != null { return q.c }
+  return -1
+}
+
+function go() {
+  // inline-shape LET annotation -> internInlineShape / letAnnIsUninternedShape
+  const s: { a: i32, b: i32 } = { a: 4, b: 5 }
+  print(s.a + s.b) // 9
+
+  // the TWINS: one reads `u`, the other `w` — a wrong row pick surfaces here.
+  print(twinU({ u: 7, w: 8 })) // 7
+
+  const mk = listMaker()
+  print(mk().items[0].g) // 5.5
+
+  print(armK({ k: { d: 3 } })) // 3
+  print(armK({ m: 12 })) // 12
+  print(armK(4)) // 4
+
+  const lv: ListOfShape = { items: [{ g: 2.5 }] }
+  print(lv.items[0].g) // 2.5
+
+  print(sumH([{ h: 3 }, { h: 5 }])) // 8
+
+  const n: Nest = { inner: { c: 11 }, list: [{ e: 1 }] }
+  print(nestC(n)) // 11
+
+  const nl = nonLowMaker()
+  print(nl().nest.c + nl().cb()) // 55
+
+  const hd: H = { h: 30 }
+  print(hd.h) // 30
+
+  const wm: WithMap = { mv: Map() }
+  wm.mv["k"] = 17
+  print(wm.mv["k"] ?? -1) // 17
+
+  const qa: { q: i64 }[] | f64 = [{ q: 6000000000 }]
+  print(readQArm(qa)) // 6000000000
+  print(readQArm(1.5)) // 0
+
+  print(twinW({ u: 1, w: 20 })) // 20
+}
+
+go()

@@ -23527,3 +23527,281 @@ remove) or a shared lower module. **Do not route it by adding an import; that is
      on-list resolver. This one contains no on-list call, so CORE is exactly flat at 312 while the
      grammar units drop 4. Predicting the direction from the last three slices would have produced
      a wrong number in the brief; decompose it every time.
+
+---
+
+## D-SHAPEROUTE — the fourteen sites #1186 FILED are routed, and the "routing to the walk would narrow them" claim gets its three numbers (#1189)
+
+Base `e255dd8`, every figure re-derived HERE, none inherited. #1186 built
+`emit_base.nameIsShapeOpen` / `nameIsShapeSpanEnds`, routed the five sites in its own
+partition, and filed **12 sites in `emit_classify.vl` + 2 in `emit_rep.vl`** with a
+site-by-site home assignment and two explicit warnings. **All fourteen reproduced.** Files:
+`compiler/emit_classify.vl` · `compiler/emit_rep.vl` · **1 new fixture**. Nothing else.
+
+### Both instruments validated before producing a new number
+
+**UNIT B — CORE call sites** (the 23-resolver SCORECARD list, `//`-stripped non-comment
+code, each resolver's own `function NAME(` header excluded, per-file sums cross-checked
+against a single concatenated recount — asserted equal). At `e255dd8`:
+
+| file | CORE |
+|---|---:|
+| `emit_classify` | **175** |
+| `emit_base` | **52** |
+| `emit_collect` | **44** |
+| `typecheck` | **19** CORE (+ **27** OFF-LIST = **46** TRUE TOTAL) |
+| `emit_mono` · `emit_rewrite` | 7 · 7 |
+| `wasmEmit` · `emit_rep` · `emit_sections` | 5 · 2 · 1 |
+| **tree-wide** | **312** |
+
+All four of the brief's published figures reproduce exactly, **including the fourth one,
+which is a different unit from the other three** — `typecheck` 46 is TRUE TOTAL, and it
+decomposes 19 CORE + 27 OFF-LIST (#1141's 13 scanners, all 27 now in `typecheck` alone).
+
+**UNIT A — GRAMMAR OCCURRENCES**, restated tighter than #1186's: one test of a type NAME's
+character **at index 0** against `'{'` (SHAPE-open), or **at index 1** against `'['`
+(SHAPE-2nd), in non-comment code, **with char BINDINGS RESOLVED**; `'…'` literals kept
+VERBATIM and only `"…"` bodies blanked; `lexer.vl` / `cli_util.vl` excluded as source-TEXT
+scanners. At `e255dd8`: SHAPE-open **30** (`emit_classify` 15 · `emit_base` 6 · `typecheck`
+6 · `emit_rep` 2 · `emit_collect` 1), SHAPE-2nd **23** (`emit_classify` 13 · `emit_base` 4 ·
+`typecheck` 3 · `emit_rep` 2 · `emit_collect` 1).
+
+**The one place this reads differently from #1186's published post-PR figure, decomposed
+rather than waved at:** it published SHAPE-open **31**; this reads **30**, and every
+per-file figure is identical except `format.vl` (1 vs 0). The site is `format.vl:979`,
+`c == '(' || c == '[' || c == '{' || c == '<'` — a bracket-CLASS membership test on a LOOP
+index inside `splitTopLevel`, not an index-0 test of a name. A strict idx-0 unit excludes
+it; #1186's did not. **Neither is wrong; only an unstated unit is.**
+
+### The fourteen filed sites, re-derived at HEAD — all present, all as described
+
+Line numbers had moved +37 in the `emit_classify` 9200–13500 band (#1187 inserted there);
+`emit_rep`'s two had not moved. The predicate at every site is exactly what was filed,
+with the **dominating block guards collected** (method note 130 — five of the fourteen carry
+their length bound on an enclosing `if` or an early return, one scope up from the character
+test):
+
+**→ `nameIsShapeOpen` (P1 = `len >= 2 · OPEN · NOT2ND`), 6 sites**
+`shapeFieldParse` 7722 · `variantIndexOfTypeName` 7910 · `shapeElemDeclaredStructIdx`
+9287-9288 · `structElemArrayLowerable` 10795 · `internNonLowerableFieldShapes` 11027 ·
+`internShapeFieldElems` 11055.
+
+**→ `nameIsShapeSpanEnds` (P2 = P1 · CLOSE), 7 sites**
+`funcTypeShapeLowerable` 10838 · `variantNestedShapeOk` 10905 · `internFuncTypeShapes`
+10942+10984 · `internInlineShape` 11073-11074 · `letAnnIsUninternedShape` 13465-13466 ·
+`emit_rep.sTyIxOfName` 953-957 · `emit_rep.slotCanonKey` 1478-1482.
+
+**→ the walk-carrying one**, `nameIsWholeSpanShape` 7578-7584: its first four conjuncts ARE
+`nameIsShapeSpanEnds`, so it becomes that call plus `tyGroupWrapsWhole(name)` and the walk
+keeps its one caller.
+
+### The three sites deliberately NOT routed — and the one that would have gone silently wrong
+
+`emit_classify` keeps **3** SHAPE-open occurrences and **1** SHAPE-2nd, and every one is a
+DIFFERENT predicate:
+
+* **`mvCanonValName` 2801** — `vn > 1 && valName[0] == '{' && valName[vn - 1] == '}'`, with
+  **no `[1] != '['`**. Class 2: it accepts a map name by design.
+* **`rlCanonLitUnionAtoms` 10058** — the same endpoints-without-NOT2ND, and **two lines
+  later it DESCENDS INTO THE MAP ARM** (`if n >= 2 && name[1] == '[' { … mapValNameOf(name)
+  … }`). Routing this one to `nameIsShapeSpanEnds` would not merely tighten it, it would
+  make the map-value litunion softening **unreachable code** — the exact "silently blind the
+  emitter to map-valued shapes" outcome #1186 warned about, in the one place where the
+  consequence is visible in the next four lines.
+* **`internShapeArms` 10607** — `uCore.length >= 1 && uCore[0] == '{'`, OPEN only.
+
+`emit_rep` keeps **0** of either: both its sites were the full P2 conjunction.
+
+### THE WALK QUESTION, MEASURED — REACH, DISAGREEMENT AND CONSEQUENCE ARE THREE NUMBERS
+
+#1186 stated that routing the P2 sites to `nameIsWholeSpanShape` "adds `tyGroupWrapsWhole`
+and NARROWS them", with `{a:{b:i32}}|{c:i32}` as the witness. That is an argument. This
+slice built it and measured it, three ways, all against the SAME populations the A/B uses:
+
+| question | instrument | corpus | fuzz |
+|---|---|---:|---:|
+| are these SPAN sites REACHED at all? | positive control: the same poison with the walk conjunct forced true | **327 / 1,413 files** | **2,276 / 7,200 programs** |
+| does the walk DISAGREE with the endpoints on a name that reaches them? | `P_WALKDIFF`: `emitFail` when `nameIsShapeSpanEnds(nm) && !tyGroupWrapsWhole(nm)` at all 7 routed SPAN sites | **9 / 1,413** | **6 / 7,200** |
+| does routing to the walk CHANGE ANY OUTPUT? | **S3** — a real build with every routed SPAN site re-pointed at `nameIsShapeSpanEnds(x) && tyGroupWrapsWhole(x)` | **0 / 1,413** | **0 / 84 dirs** |
+
+**So the narrowing is REAL and REACHED — 15 programs — and CONSEQUENTIAL on none of them.**
+#1186's claim is CONFIRMED at the answer layer and REFUTED at the output layer, and neither
+half was knowable from the other. The endpoints still ship: a predicate change whose
+consequences measure 0 on two populations is not thereby licensed (the standing rule —
+*measured-0 is not a licence*), and the routing this slice exists to perform is the
+equivalence-preserving one. The number is recorded so the next slice that considers merging
+the two knows the size of what it would be betting.
+
+### The fixture, and the proof it reaches all fourteen
+
+`tests/cases/structs/inline-shape-grammar-routed-sites.vl`. A behaviour-preserving refactor
+cannot have a pin that fails on master, so it is a PIN (identical output on `BASE` and the
+candidate) entombed by sabotages — and, separately, by a **coverage probe that names every
+site it reaches in ONE build**:
+
+> `PROBECOVER variantNestedShapeOk nameIsWholeSpanShape internInlineShape sTyIxOfName
+> shapeFieldParse internFuncTypeShapes funcTypeShapeLowerable structElemArrayLowerable
+> internShapeFieldElems internNonLowerableFieldShapes slotCanonKey
+> shapeElemDeclaredStructIdx variantIndexOfTypeName letAnnIsUninternedShape`
+
+**14 of 14.** The probe is worth more than the pass: **its first run read 8 of 14**, because
+the fixture spelled the closure result through a declared alias (`(): () => ListOfShape`).
+A declared NAME never reaches a name-SHAPE grammar, so four sites were unreached and two
+more depended on them. Spelling the same type INLINE took it to 14. Three arms exist purely
+to reach a site the obvious spelling misses:
+
+* the closure result spelled **inline** (`() => { items: { g: f64 }[] }`) —
+  `internFuncTypeShapes` → `funcTypeShapeLowerable` → `structElemArrayLowerable` →
+  `internShapeFieldElems`;
+* a closure result that is **not lowerable as a whole** (it carries a code-14 closure field)
+  so `internFuncTypeShapes` takes its OTHER arm — `internNonLowerableFieldShapes`;
+* an inline element spelling (`{ h: i32 }[]`) whose fieldset is **also declared** (`type H`),
+  so the element dedups onto `H`'s row, the spelling gains no `sNames` entry, and
+  `nameIsRefArray` / `refArrElemName` fall through to `shapeElemDeclaredStructIdx`.
+
+Plus the two arms that separate the homes: `{ q: i64 }[] | f64` (opens `{`, not a map,
+does NOT end `}` — an OPEN shape and not a SPAN one) and a map-valued field
+(`{ mv: { [string]: i32 } }`, which opens `{` and ends `}` but is not a struct shape).
+
+| compiler | fixture |
+|---|---|
+| BASE (`e255dd8`) | **PASS**, 15 lines |
+| candidate | **PASS**, byte-identical output |
+| **S1** — `nameIsShapeOpen`'s `[1] != '['` inverted | **FAIL** rc=1, `emitProgram: only i32 / boolean / string / array struct fields are supported` |
+| **S2** — `nameIsShapeSpanEnds` drops its closing `}` | **FAIL** rc=1, `emitProgram: only i32 / boolean / string / array union-variant fields are supported` |
+| **S3** — every routed SPAN site re-pointed at the walk | **PASS** (consistent with the 0/0 above) |
+
+Without the `{ q: i64 }[] | f64` arm the fixture passed under S2 — measured, then fixed.
+
+### Channels, every zero graded, denominators stated
+
+Every sabotage built in ONE stage from the **pristine freshly-fetched seed** (never a
+self-compile, which would let a sabotage poison its own witness).
+
+| channel | population | candidate | S1 | S2 | S3 |
+|---|---|---:|---:|---:|---:|
+| corpus A/B — build rc · wasm sha256 · build message · run rc · run stdout, temp paths normalized | **1,413 files** | **0** | **352 red** | **13 red** | **0** |
+| fuzz A/B — shared-instance `vl check --codegen <dir>` | **50,400 programs / 84 dirs** | **0** | **84/84 red** | **48/84 red** | **0/84** |
+
+Both candidate zeros are AGREEMENT, not blindness: the same populations, the same harness,
+redden at 352/84 and 13/48 under a deliberately wrong home. Per-worker output files
+throughout (never one shared append target — a record above `PIPE_BUF` tears), with a
+row-count and field-count assertion on every run: 1,413/1,413 and 84/84, 0 malformed, on all
+six sweeps.
+
+### Both units, before and after — and CORE is flat again
+
+| unit | `e255dd8` | this PR | Δ |
+|---|---:|---:|---:|
+| SHAPE-open, `emit_classify` | 15 | **3** | **−12** |
+| SHAPE-open, `emit_rep` | 2 | **0** | **−2** |
+| SHAPE-open, tree-wide | **30** | **16** | **−14** |
+| SHAPE-2nd, `emit_classify` | 13 | **1** | **−12** |
+| SHAPE-2nd, `emit_rep` | 2 | **0** | **−2** |
+| SHAPE-2nd, tree-wide | **23** | **9** | **−14** |
+| **CORE (23-resolver), `emit_classify`** | **175** | **175** | **0** |
+| **CORE (23-resolver), tree-wide** | **312** | **312** | **0** |
+| **OFF-LIST (#1141's 13), tree-wide** | **27** | **27** | **0** |
+| binary (`build/vl-compiler.wasm`, at its fixpoint) | 1,031,524 B | **1,030,855 B** | **−669 B** |
+
+The **−14** on each grammar unit decomposes exactly: 14 routed sites × 1 idx-0 `'{'` test
+and × 1 idx-1 `'['` test each, minus **0** added — both homes already existed in
+`emit_base`, and `nameIsShapeSpanEnds` delegates rather than re-testing.
+
+**CORE is flat at 312 for the second merge running, and for the same reason #1186 gave:
+this grammar contains no call to an on-list resolver at all, and neither home is on the
+list.** The rising-CORE effect of #1175/#1177/#1182 is a property of WHICH grammar is homed,
+not a law — predicted flat here, measured flat.
+
+Self-compile wall time, interleaved, each side warmed FIRST and discarded, n=7 per side:
+BASE 1920–9031 ms (median 4318), candidate 1934–4954 ms (median 3036). **The spread WITHIN
+a side (7,111 ms) is five times the gap between the medians**, on a machine running three
+concurrent agents — so the honest statement is **no measurable time change**, and the
+reliable number is the −669 B.
+
+### Gate — every leg, from a FRESHLY FETCHED published seed, exit code explicit
+
+| leg | RC |
+|---|---:|
+| `scripts/fetch-seed.sh` — fresh `seed-latest`, 1,031,524 B | **0** |
+| `scripts/refresh-compiler.sh --prove-fixpoint` — the published seed IS master's fixpoint (1 compile); candidate reaches its own at 1,030,855 B | **0** |
+| `scripts/native-fixpoint.sh` — stage3 == stage4 byte-for-byte, 1,030,855 B | **0** |
+| `npm ci` | **0** |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` — **2155 passed / 0 failed / 8 ignored** | **0** |
+| `deno check tests/cases_wasm_test.ts` | **0** |
+| `scripts/lint-self.sh` (incl. `vl fmt --check`) | **0** |
+| `scripts/rep-fuzz-check.sh` — exact, 1 baselined, 0 new / 0 stale | **0** |
+| corpus A/B, 1,413 files, five columns | **0 divergences** |
+| fuzz A/B, 50,400 programs / 84 dirs | **0 divergences** |
+
+**The suite baseline was verified IN THIS WORKTREE before the diff, and the first reading was
+wrong for a reason worth recording: 2153 passed / 1 FAILED / 8 ignored on UNMODIFIED master
+source.** The failure was `vl-build-validate: a module that cannot instantiate fails the
+build`, the test #1188 shipped — against a native `vl` binary copied from a checkout that
+predated #1188. `cargo build --release` on the worktree's own `scripts/vl-host` took the
+baseline to **2154 / 0 / 8**; the candidate reads 2155, which is that plus exactly this
+slice's one fixture.
+
+### FILED, NOT BUILT — re-derived at HEAD, not relayed
+
+1. **`typecheck.nullableRetName`, now line 12928** (filed at 12886; #1187 moved it). Still a
+   clean P1 site — `inm.length >= 2 && inm[0] == '{' && inm[1] != '['` — and still BLOCKED by
+   module direction, not policy: `emit_base.vl` **imports** `typecheck.vl`, so routing it by
+   adding an import is a cycle. Needs a shared lower module or it stays.
+2. **The three `repRowOfName` consumers #1187 filed are all still unroutable, and this slice
+   touching one of them did not change that.** `repRowOfName` still has exactly **4** call
+   sites (`emit_classify` 8351 `nulBaseStructRow` · 9244 `structIdxOfElemName` · 9277
+   `monoIsRowMatch` · 9303 `shapeElemDeclaredStructIdx`). This slice routed
+   `shapeElemDeclaredStructIdx`'s SHAPE-OPEN predicate; the `resolveAnnot(renderFaithful(nm))`
+   round trip inside it is untouched and its blocker (it only ever HOLDS a spelling) is
+   unchanged. `monoIsRowMatch`'s only caller is still `wasmEmit.vl:1731`, outside this
+   partition, and `isVarTyIxOf` is still banked — the filed mechanism holds verbatim.
+3. **PAREN-open/close**, still not done, and now being worked by a sibling slice
+   (`destringify-paren-grammar`). Not touched here.
+
+### What this slice deliberately did NOT ship
+
+* **No guard was deleted on a measured 0.** S3 reads 0 on both channels and the walk was
+  still NOT adopted at any of the seven SPAN sites.
+* **No Class-2 site was routed**, including the one (`rlCanonLitUnionAtoms`) where the map
+  arm it would have killed is four lines below the test.
+* No arena work. This is character-surgery routing only; `repRowOfName`'s round trip, the
+  `sTyIx` sidecar, and the rep resolvers are untouched.
+
+### Method notes
+
+135. **A COVERAGE PROBE CAN BE ONE BUILD, AND IT MUST BE, OR IT WILL NOT BE RUN.** Fourteen
+     `emitFail` poisons means fourteen ~60 s compiler builds and a bisect. Accumulating a
+     de-duplicated tag list in a module-level array and dumping it through `emitFail` at
+     `emitProgram`'s success tail reports every reached site from ONE build of ONE program.
+     (`print` is not available: the compiler's host imports have no `__print_i32__`, so a
+     print-based probe fails to instantiate — verified, not assumed. And `probeDump()` must
+     be `return`ed, not called for effect: `emitFail` only sets the flag, and a discarded
+     -1 leaves the driver reporting success over an emptied byte buffer.)
+136. **A FIXTURE WRITTEN FROM THE TYPE'S MEANING MISSES SITES THE GRAMMAR KEYS ON THE
+     SPELLING.** `function f(): () => ListOfShape` and `function f(): () => { items: { g:
+     f64 }[] }` denote the same type and reach a DIFFERENT SET OF EMITTER SITES: the alias is
+     a declared NAME, and a name-shape grammar never looks at it. The first draft covered
+     **8 of 14**; the only thing that changed to reach 14 was spelling. Any fixture for a
+     grammar over type NAMES must be graded by a coverage probe, not by reading it.
+137. **REACH, DISAGREEMENT AND CONSEQUENCE ARE THREE DIFFERENT NUMBERS — QUOTE ALL THREE OR
+     NONE.** "Routing these sites to the walk would narrow them" was true (9 corpus + 6 fuzz
+     programs where the two predicates disagree at a live site) AND produced 0 observable
+     difference in a real build of both channels. Reporting only the disagreement overstates
+     the risk; reporting only the 0 understates it and invites the merge. The pair is the
+     finding; a positive control (327 / 2,276 reaches) is what makes the small number
+     readable as small rather than as blindness.
+138. **`git stash` IS SHARED ACROSS WORKTREES — DO NOT USE IT WHEN AGENTS RUN CONCURRENTLY.**
+     Sibling worktrees share one `.git`, so `refs/stash` is ONE stack. Mid-slice, `git stash
+     pop` here popped a DIFFERENT agent's entry (`WIP on destringify-paren-grammar`) into this
+     worktree and dropped it from theirs; by the time it was noticed the stash list was
+     EMPTY, both entries gone. Recovery: `git stash store <sha>` from the dropped commit
+     printed by the pop, `git checkout --` the foreign files, and re-apply your own work from
+     a patch. **Keep in-flight work as a patch file outside the repo** (`git diff > …`), and
+     re-apply it with a script that asserts each hunk matches exactly once.
+139. **A WORKTREE'S SUITE BASELINE MUST BE TAKEN WITH A HOST BUILT FROM ITS OWN SOURCE.**
+     A native `vl` copied from a sibling checkout was three commits stale and failed exactly
+     the one test #1188 added — 2153/1/8 on UNMODIFIED master source. The brief's expected
+     counts (8 ignored / ~608 / 14 / ~620) diagnose the env var, `npm ci` and a MISSING
+     host; they do not diagnose a PRESENT but STALE one, which fails a test instead of
+     ignoring one. Verify the baseline, and when it is red, suspect the host before the source.
