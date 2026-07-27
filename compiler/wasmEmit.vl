@@ -1071,9 +1071,8 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         // the non-null codes 6/25/26/27 seed, so `{f: [1, 2]}` of `{f: i64[] | null}` widens
         // its bare ints to i64), and its non-null wrapper ref subtypes the nullable slot.
         pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(scode))
-        // GATED on the field VALUE being a bare `null` (the #964 SEED-LEAK discipline, as
-        // code 28 above): un-gated, this whole-value wrapper seed would leak into the array
-        // literal's ELEMENT context and type a `{f: [null]}` element as `ref.null $wrapper`.
+        // The #964 SEED-LEAK gate — stated in full at the code-28 arm just below. Witness
+        // here: `{f: [null]}`, whose element would type as `ref.null $wrapper`.
         const nslV = P.nodes[unwrapParen(valIx)]
         if nslV is NullLit {
           pendingNulRefHeap = nulScalarListFieldWrapHeap(scode)
@@ -1087,14 +1086,16 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         if rlElemKindTbl[fslot28] == 2 { pendingListKind = 2 }
         else if rlElemKindTbl[fslot28] == 1 { pendingListKind = 1 }
         else { pendingListKind = 5 }
-        // GATED on the field VALUE being a bare `null` (the #964 SEED-LEAK discipline): the wrapper
-        // heap seed types a `{f: null}` whole-field null as `ref.null $wrapper`, but a `{f: [null]}`
-        // LIST-literal value's null ELEMENTS take the per-element seed (`ref.null $S` via the
-        // element's `pendingStructIdx` / nullable-element arm in `emitArr`). Un-gated, this
-        // whole-value wrapper seed leaked through the array literal's element context and stored
-        // `ref.null $wrapper` into the nullable-struct element backing — INVALID-WASM (`{f: [null]}`
-        // of `{f: (S | null)[] | null}`; the struct-FIELD twin of the kind-18 binding seed at
-        // `localIsRef[slot] == "nulreflist"` (#964) and the return seed (#1020)).
+        // THE #964 SEED-LEAK DISCIPLINE — every nullable-ref-array boundary in this file
+        // (field here, binding, return, argument, and the array-ELEMENT seeds in `emitArr`)
+        // repeats this gate, and each one was a separate INVALID-WASM bug before it did.
+        // A WHOLE-VALUE wrapper-heap seed must be GATED on the value being a bare `null`.
+        // Un-gated it survives into the array literal's ELEMENT context, where the null
+        // elements CONSUME it and store `ref.null $wrapper` into an element backing that
+        // holds `ref.null $elem` — invalid wasm. A `{f: null}` whole-field null is the
+        // wrapper; a `{f: [null]}` list literal's nulls take the per-element seed
+        // (`pendingStructIdx` / the nullable-element arm in `emitArr`) instead.
+        // Witness here: `{f: [null]}` of `{f: (S | null)[] | null}` (#964, #1020).
         if fslot28 < rlWrapIdx.length {
           const nraF = P.nodes[unwrapParen(valIx)]
           if nraF is NullLit { pendingNulRefHeap = rlWrapIdx[fslot28] }
@@ -1133,33 +1134,30 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         // An f32 field re-encodes its float value at the construction boundary.
         if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
       } else if scode == 20 {
-        // A `string | null` niche field: a `null` value lowers as `ref.null $aTypeIdx`
-        // (`pendingNulString`); a non-null string ref passes through.
+        // The NICHE `X | null` fields (20 string, 21 boolean, 30 `K`, 22 closure) seed the
+        // null rep their kind demands — the table at `emitNullLitNode` — and pass a non-null
+        // value through untouched.
         const svNS = pendingNulString
         pendingNulString = true
         const rcNS = emitExpr(body, valIx, fnIx)
         pendingNulString = svNS
         if rcNS < 0 { return -1 }
       } else if scode == 21 {
-        // A `boolean | null` niche field: a `null` value lowers as the i32 sentinel 2
-        // (`pendingNulBool`); a boolean rides its i32 0/1.
         const svNB = pendingNulBool
         pendingNulBool = true
         const rcNB = emitExpr(body, valIx, fnIx)
         pendingNulBool = svNB
         if rcNB < 0 { return -1 }
       } else if scode == 30 {
-        // A `K | null` niche field: a member literal lowers as its interned atom id
-        // (the atom context) and a `null` value as the i32 sentinel `-1`
-        // (`pendingNulLitUnion`) — the litunion twin of the code-21 arm.
+        // Code 30 is DUAL-natured: a member literal lowers as its interned atom id (the
+        // atom context) and only a `null` takes the sentinel — so it seeds BOTH.
         const nluCtx = expCtxHere()
         nluCtx.litUnion = 1
         nluCtx.nulLitUnion = true
         if emitExprExpect(body, valIx, fnIx, nluCtx) < 0 { return -1 }
       } else if scode == 22 {
-        // A nullable-closure field (`op: ((i32) => i32) | null`): a `null` value lowers
-        // as `ref.null $cloStruct` (`pendingNulClosure`); a function value passes through
-        // as the non-null fat pointer (widened to the nullable storage on `struct.new`).
+        // A function value passes through as the non-null fat pointer (widened to the
+        // nullable storage on `struct.new`).
         const svNC = pendingNulClosure
         pendingNulClosure = true
         const rcNC = emitExpr(body, valIx, fnIx)
@@ -1544,43 +1542,35 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
     } else if vcode == 24 {
       if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
     } else if vcode == 20 {
-      // A `string | null` niche variant field: a `null` value lowers as `ref.null
-      // $aTypeIdx` (`pendingNulString`), exactly as the plain struct-literal path seeds it —
-      // without it a `{f: null}` variant hit the bare-null error. A non-null string passes through.
+      // The NICHE `X | null` variant fields (20/21/30/22) seed exactly as the plain
+      // struct-literal path does — the `emitObj` discipline, same codes, same reps (the
+      // table at `emitNullLitNode`). Without the seeds a `{f: null}` variant hit the
+      // bare-null error.
       const svNS = pendingNulString
       pendingNulString = true
       const rcNS = emitExpr(body, valIx, fnIx)
       pendingNulString = svNS
       if rcNS < 0 { return -1 }
     } else if vcode == 21 {
-      // A `boolean | null` niche variant field: a `null` value lowers as the i32 sentinel 2.
       const svNB = pendingNulBool
       pendingNulBool = true
       const rcNB = emitExpr(body, valIx, fnIx)
       pendingNulBool = svNB
       if rcNB < 0 { return -1 }
     } else if vcode == 30 {
-      // A `K | null` niche variant field: a member literal lowers as its interned
-      // atom id and a `null` value as the i32 sentinel `-1` — the variant twin of
-      // the plain struct-literal path's code-30 arm.
       const vnluCtx = expCtxHere()
       vnluCtx.litUnion = 1
       vnluCtx.nulLitUnion = true
       if emitExprExpect(body, valIx, fnIx, vnluCtx) < 0 { return -1 }
     } else if vcode == 22 {
-      // A `((i32) => i32) | null` niche variant field: a `null` value lowers as `ref.null
-      // $cloStruct`; a function value passes through as the non-null fat pointer.
       const svNC = pendingNulClosure
       pendingNulClosure = true
       const rcNC = emitExpr(body, valIx, fnIx)
       pendingNulClosure = svNC
       if rcNC < 0 { return -1 }
     } else if variantFieldIsLitUnionArray(vi, fj) {
-      // An ATOM-ARRAY variant field (`{f: K0[]}` as an arm of `{f: K0[]} | string`): the
-      // value is the i32 LIST of atom ids — the atom context routes the literal to the
-      // i32-list build (its member elements are string exprs syntactically, which would
-      // else build a string list whose wrapper ref mismatches the field's `$lTypeIdx`) —
-      // the `sFieldIsLitUnionArray` discipline at the variant payload boundary.
+      // An ATOM-ARRAY variant field (`{f: K0[]}` as an arm of `{f: K0[]} | string`) — the
+      // `sFieldIsLitUnionArray` discipline (see `emitObj`) at the variant payload boundary.
       const vlaCtx = expCtxHere()
       vlaCtx.litUnion = 1
       if emitExprExpect(body, valIx, fnIx, vlaCtx) < 0 { return -1 }
@@ -2329,11 +2319,8 @@ function listWrapHeapOfKind(k: i32) {
 // pool never interned) and the caller keeps its rendered-atom path, exactly as
 // `removeAtomFromSet` itself falls through to the string surgery there.
 //
-// D-SETONCE: this takes only a set ID now. Its text-taking wrapper
-// (`unionResidualSoloKind(set)` = `…OfSet(msSetOfText(set))`) is DELETED — each of its
-// three callers already resolves the same set a line earlier for the value-union gate,
-// so the wrapper's `msSetOfText` was a second resolution of a text the caller had
-// already resolved.
+// D-SETONCE: takes a set ID, never a text — every caller already resolves the same set a
+// line earlier for the value-union gate.
 function unionResidualSoloKindOfSet(s: i32) {
   if s < 0 { return -2 }
   msSoloValKind(msSubNull(s))
@@ -2394,12 +2381,9 @@ function emitValueUnionUnboxRead(
   if emitUnionBoxPush(body, name, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   // D-UNION-ATOM-KIND: the atom's ABI code decides all four arms below (the `string`
-  // compare, the closure test, the list-wrapper ladder and `vbHeapIdxOfAtom`'s own
-  // re-derivation), so it arrives AS the code. It used to be re-derived here from the
-  // rendered atom the caller passed — which threw away `emitCoalesce`'s work: that
-  // caller had already read the residual member's code out of the BANK
-  // (`unionResidualSoloKindOfSet`), rendered the residual set for this parameter, and
-  // this line parsed the rendering straight back into the code it already held.
+  // compare, the closure test, the list-wrapper ladder, `vbHeapIdxOfAtom`), so `ak`
+  // ARRIVES as the code — `emitCoalesce` already holds it out of the bank
+  // (`unionResidualSoloKindOfSet`) and no longer renders a set just to be re-parsed here.
   if ak == 2 {
     fbRefCast(aTypeIdx) // the payload IS the string array ref
     return 0
@@ -2822,18 +2806,14 @@ export function emitUnionCoerce(
   // default is i32 unless the union has no `i32` member but does have `i64` (an
   // integer flowing into `i64 | …`), or the literal exceeds the i32 range.
   //
-  // D-COERCEKIND: the ladder settles the value-atom CODE (`valueAtomKind`'s code
-  // space), not a SPELLING. Every consumer below it — the box TAG, the
-  // rides-the-anyref test, the scalar value box, and the six `atom == …` compares
-  // that pick the widened emit and the two list re-encodes — is a projection of
-  // that one code, and master re-derived it from a spelling this very ladder had
-  // just synthesized (`valueAtomKind(atom)` one line before the first use). A
-  // synthesis site that banks a rendering is the shape #1110 / #1128 found in the
-  // atom algebra, one layer further out: the code is the primary and the spelling
-  // was never needed. Each arm's comment names the atom it stands for; the map is
-  // `valueAtomKind`'s own first-match ladder, which is a bijection over exactly
-  // these eleven lexemes (nothing below its literal compares can produce 0–5, and
-  // codes 7 / 8 / 9 / 10 / 12 name one list backing each).
+  // D-COERCEKIND (#1110 / #1128): the ladder settles the value-atom CODE, not a
+  // SPELLING. Every consumer below — the box TAG, the rides-the-anyref test, the scalar
+  // value box, the six `atom == …` compares picking the widened emit, the two list
+  // re-encodes — is a projection of that one code.
+  // FAITHFUL because the map IS `valueAtomKind`'s own first-match ladder, a bijection
+  // over exactly these eleven lexemes: nothing below its literal compares can produce
+  // 0–5, and codes 7 / 8 / 9 / 10 / 12 name one list backing each. Each arm's comment
+  // names the atom it stands for.
   let cak = 0 // "i32"
   if exprString(exprIx, fnIx) {
     cak = 2 // "string"
@@ -2922,7 +2902,7 @@ export function emitUnionCoerce(
   }
   // `cak` is final at this point: every arm of the ladder above assigns before the
   // tag is emitted, and the box TAG, the rides-the-anyref test and the scalar value
-  // box below are all projections of it (`scalarTagOf` / `atomIsRef` /
+  // box below are all projections of it (`scalarTagOf` / `atomIsRefKind` /
   // `vbHeapIdxOfAtom` each re-derived it from the spelling).
   fbI32Const(scalarTagOfKind(cak))
   if cak == 3 {
@@ -3247,19 +3227,13 @@ function emitUnionConcreteEq(
     )
   }
   const atom = unionEqAtomOf(otherIx, uname, fnIx)
-  // D-UNION-ATOM-KIND: the other operand's rep CODE, derived once. The box tag, the
-  // `string` special-cases, the payload unbox and the widened operand emit are all
-  // projections of it — master re-derived it from the spelling at each of them
-  // (`scalarTagOf`, `vbHeapIdxOfAtom` inside the unbox, and five `atom == …` compares).
-  // The payload-compare opcode took the code in D-EQOPCODE; D-VALKIND took the
-  // membership test below, so the spelling now survives only as that test's DECLINE
-  // argument (a kind outside the seven scalar keywords keeps the exact
-  // `TyPrim.primName` path, which is what a list / closure atom needs).
+  // D-UNION-ATOM-KIND / D-EQOPCODE / D-VALKIND: the other operand's rep CODE, derived
+  // ONCE. The box tag, the `string` special-cases, the payload unbox, the widened operand
+  // emit, the payload-compare opcode and the membership test below are all projections of
+  // it. The SPELLING survives only as the membership test's DECLINE argument — a kind
+  // outside the seven scalar keywords (a LIST / closure atom) keeps the exact
+  // `TyPrim.primName` path, which is what those need.
   const eak = valueAtomKind(atom)
-  // D-VALKIND: the membership test takes the CODE the line above already settled,
-  // over the set id resolved at the gate; the spelling is the decline argument only
-  // (a LIST / closure atom's kind is outside 0-6, so those keep the exact
-  // `TyPrim.primName` path unchanged).
   if !unionHasAtomK(usid, uname, atom, eak) {
     // No arm has the other operand's rep: the box can never hold such a value.
     if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
@@ -3350,14 +3324,10 @@ function emitUnionUnionEq(
   // very member whose spelling was pushed; a row the kind bank does not cover marks
   // its arms -2 and the tag falls back to the per-atom derivation, arm by arm.
   //
-  // D-SETID: `lname` is resolved to its set id ONCE and both readers take the id.
-  // The member SPELLINGS and the member KINDS are two columns of the same (row,
-  // mask), so resolving the same text twice — `msMemberAtomsOf`'s internal
-  // `msSetOfText` and the one that fed `msMemberValKindsOf` — was a duplicated
-  // whole-string resolution, not two questions. (It wants a SET id, not a row id:
+  // D-SETID / D-SETONCE: the member SPELLINGS and the member KINDS are two columns of
+  // the same (row, mask), so ONE set id serves both readers. `lsid` / `rsid` are resolved
+  // at the value-union gate, which needs them anyway. (A SET id, not a row id —
   // `msMemberValKindsOf` derives the row from the set itself.)
-  // D-SETONCE extends that to the RIGHT operand and moves BOTH resolutions up to the
-  // value-union gate, which needs them anyway: `lsid` / `rsid` are bound there.
   const lAtoms: string[] = []
   if !msMemberAtomsOfSet(lsid, lAtoms) { splitUnionAtoms(lname, lAtoms) }
   const lKinds: i32[] = []
@@ -3473,13 +3443,12 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   // integer i32, widening to i64 when out of range or when the union's only
   // integer arm is i64 — the `emitUnionCoerce` default).
   //
-  // D-LITISKIND: the ladder settles the ABI CODE alongside the spelling, instead of
-  // minting a spelling and parsing it back four lines later (`valueAtomKind(atom)`,
-  // now gone). The map is a bijection ON THIS LADDER'S IMAGE — `valueAtomKind` answers
-  // 0 for `i32` and nothing else, 2 for `string`, 4 for `f64`, 3 for `i64` — so the
-  // code the ladder assigns IS the code the parse returned, arm for arm. D-VALKIND
-  // then took the membership test itself (`msHasValKind` over the banked kind
-  // column), so the spelling survives only as that test's DECLINE argument.
+  // D-LITISKIND: the ladder settles the ABI CODE alongside the spelling. FAITHFUL
+  // because the map is a bijection ON THIS LADDER'S IMAGE — `valueAtomKind` answers 0 for
+  // `i32` and nothing else, 2 for `string`, 4 for `f64`, 3 for `i64` — so the code the
+  // ladder assigns IS the code a parse of its own output would return, arm for arm.
+  // D-VALKIND then took the membership test (`msHasValKind` over the banked kind column),
+  // leaving the spelling as that test's DECLINE argument only.
   let atom = "i32"
   let lak = 0
   if lit[0] == '"' {
@@ -3498,19 +3467,14 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
     atom = "i64"
     lak = 3
   }
-  // D-VALKIND: the ladder's own code decides the membership test — the round trip
-  // "mint a spelling, hand it over, re-derive the code from it" is gone on this path.
   if !unionHasAtomK(usid, uname, atom, lak) {
     if emitExpr(body, objIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
     fbI32Const(0)
     return 0
   }
-  // D-UNION-ATOM-KIND: the literal's rep CODE decides the tag, the payload unbox and
-  // the three constant-emit arms (`scalarTagOf` and `vbHeapIdxOfAtom` each re-derived
-  // it, and three more `atom == …` compares asked it a fourth and fifth time).
-  // D-LITISKIND: it now arrives FROM the ladder that settled the atom, not from a
-  // re-parse of the ladder's own output.
+  // D-UNION-ATOM-KIND: `lak` decides the tag, the payload unbox and the three
+  // constant-emit arms below — one code, five projections.
   if lak == 2 && !aUsed {
     return emitFail(
       "emitProgram: string `is` test but array type not collected",
@@ -3672,14 +3636,16 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
       wU8(212) // 0xd4 ref.as_non_null
     }
     fbStructGet(sHeapIdx[si], idx) // 0xfb 0x02 <struct ht> <field index>
-    // A `string | null` field (code 20) read AS A VALUE recovers the non-null string ref
-    // (`ref.as_non_null` — the checker narrowed it non-null at every value read). The `!=
-    // null` / `??` null-check sets `pendingRawNullRead` to keep the raw nullable ref. A
-    // `boolean | null` field (code 21) needs no recovery (its i32 sentinel reads as-is).
+    // THE `string | null` READ RULE (field code 20 / slot kind 16) — shared verbatim by
+    // this field read and the global / param / local ident reads in `emitIdentNode`. A
+    // VALUE read recovers the non-null string ref (`ref.as_non_null`; the checker narrowed
+    // it non-null at every value read). Exactly two contexts suppress the recovery and keep
+    // the RAW nullable ref: `pendingRawNullRead` (a `!= null` / `??` null test, which needs
+    // `ref.is_null`) and `pendingNulString` (a nullable-string TARGET — `const g = r.f`
+    // binding a `string | null`, a nullable arg/return), where recovering would
+    // `ref.as_non_null` a legitimately-null value and TRAP. A `boolean | null` field (code
+    // 21) needs no recovery at all: its i32 sentinel reads as-is.
     if sFieldTypeAt(si, idx) == 20 {
-      // A nullable-string TARGET (`pendingNulString` — `const g = r.f` binding a `string | null`, or a
-      // nullable arg/return) keeps the raw nullable ref, like the kind-16 ident read: recovering would
-      // `ref.as_non_null` a possibly-null field value and trap.
       if !pendingRawNullRead && !pendingNulString {
         wU8(212) // 0xd4 ref.as_non_null
       }
@@ -3794,40 +3760,37 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     const elems = a.arrElems
-    // A REF list literal — ref ELEMENTS, OR an empty `[]` whose binding annotation is a
-    // ref array (`pendingListKind` 1/2). The element store is `(ref null $elem)`; each
-    // element lowers via `emitExpr` (an objlit → struct.new / union box). Otherwise the
-    // i32 list path.
+    // WHICH (backing, wrapper) PAIR the literal builds. Two signals answer it: the
+    // literal's OWN elements (`arrLitIs*`) and a THREADED annotation from the binding /
+    // field / param that seeded `pendingListKind`:
+    //   1/2 ref    `(ref null $elem)` backing — each element via `emitExpr` (an objlit →
+    //              struct.new, a union box)
+    //   3   string `(ref null $aTypeIdx)` refs in the `$mkListIdx` wrapper. Checked before
+    //              the i32/ref paths: a string element is neither
+    //   4   f64    `(array (mut f64))`  (Slice 4)
+    //   6   i64    `(array (mut i64))`  — bare-integer elements widen at the store
+    //   7   f32    `(array (mut f32))`  — only ever reached through an annotation; a bare
+    //              float literal stays f64, and `[1.5]` elements re-encode at f32
+    //   else i32   the default `$lTypeIdx` list
+    // A THREADED kind is AUTHORITATIVE and clears the kinds it displaces (the overrides
+    // below), because a literal does not always self-identify: `const xs: f64[] = [2]` has
+    // only int elements, so `arrLitIsF64` said no and it built the i32 backing against the
+    // f64-list slot — invalid wasm. Each element then coerces at the store
+    // (`emitExprAsF64` → `f64.convert_i32_s` for an i32 operand, and so on per kind).
     let isRefLit = arrLitIsRef(arrIx)
-    // A `string[]` literal — string ELEMENTS, OR an empty `[]` whose binding/field is a
-    // `string[]` (`pendingListKind == 3`). Its backing is `(ref null $aTypeIdx)` (string
-    // refs) wrapped in the string-list wrapper (`mkListIdx`). Checked before the i32/ref
-    // paths since a string element is neither i32 nor a struct/union ref.
     let isStrLit = arrLitIsStr(arrIx, fnIx)
-    // An f64-element literal — float ELEMENTS, OR an empty `[]` whose binding is an
-    // `f64[]` (`pendingListKind == 4`). Its backing is `(array (mut f64))` (Slice 4).
     let isF64Lit = arrLitIsF64(arrIx, fnIx)
-    // An i64-element literal — an i64-typed first element, OR (the common case) a literal
-    // under an `i64[]` annotation (`pendingListKind == 6`), whose bare-integer elements
-    // are i32 literals widened to i64 at the store. Its backing is `(array (mut i64))`.
     let isI64Lit = arrLitIsI64(arrIx, fnIx)
     if pendingListKind == 6 {
       isI64Lit = true
       isF64Lit = false
       isStrLit = false
     }
-    // An `f64[]` annotation (kind 4) is authoritative for a NON-empty literal too,
-    // mirroring kinds 6/7: a literal of bare INT elements (`const xs: f64[] = [2]`) does
-    // not self-identify as f64 (`arrLitIsF64` keys off float elements), so it built the
-    // i32-backed wrapper against the f64-list slot — invalid wasm. Each element coerces
-    // at the store (`emitExprAsF64` — `f64.convert_i32_s` for an i32 operand).
     if pendingListKind == 4 {
       isF64Lit = true
       isI64Lit = false
       isStrLit = false
     }
-    // An f32-element literal is set ONLY by an `f32[]` binding/annotation (`pendingListKind ==
-    // 7`) — a bare float literal stays f64. The same `[1.5]` elements re-encode at f32.
     let isF32Lit = false
     if pendingListKind == 7 {
       isF32Lit = true
@@ -4199,10 +4162,10 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
           // $lTypeIdx`; a `(<ref-array> | null)[]` element (kind 9 nullable niche) → `ref.null
           // $innerWrapper`; a distinct-backing `(f64[] | null)[]` / `(string[] | null)[]` element
           // (kinds 6/7/8/10 nullable niches) → `ref.null` of the leaf-list wrapper SINGLETON.
-          // These are WHOLE-VALUE null seeds — GATED on the element BEING a bare `null` (the #964
-          // discipline): a nested LIST literal element (`[[null]]` of `((S|null)[]|null)[]`) rebuilds
-          // its own inner list whose OWN null elements would otherwise CONSUME the leaked wrapper heap
-          // (`ref.null $wrapper` into the inner struct backing — INVALID-WASM, seed 205425905).
+          // These are WHOLE-VALUE null seeds, so the #964 SEED-LEAK gate applies (stated in
+          // full at `emitObj`'s code-28 arm) — here one level down: a nested LIST literal
+          // element (`[[null]]` of `((S|null)[]|null)[]`) rebuilds its own inner list, whose
+          // OWN nulls would consume the leaked heap (seed 205425905).
           const elIsBareNull = P.nodes[unwrapParen(elems[i])] is NullLit
           if elIsBareNull {
             if elemNest == 4 && rlElemNullable[rslot] == 1 {
@@ -4257,26 +4220,21 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
     if !lUsed {
       return emitFail("emitProgram: array literal but list type not collected")
     }
-    // A LITERAL-UNION array (`K[]`) shares the i32 backing, but its member-literal elements must
-    // lower as their interned ATOM ids, not as strings — seed `pendingLitUnion` for the element
-    // emits. (Detected from the checker's recorded element type, robust to inference.)
+    // THREE element types share the i32 backing but do NOT lower like i32s, so each seeds
+    // the element emits (reps per the table at `emitNullLitNode`):
+    //   `K[]`             member literals → interned ATOM ids, not strings
+    //   `(boolean|null)[]` a `null` → the sentinel 2 (true/false already emit 0/1)
+    //   `(K|null)[]`      DUAL-natured — a member literal → its atom id AND a `null` → the
+    //                     `-1` sentinel, so both are seeded and `["a", null]` lowers
+    // The element type comes from the checker's recorded type (robust to inference); the
+    // `pendingListKind == 8` / `== 9` legs catch an all-`null` `[null]`, which self-infers
+    // as `null[]` and so is invisible to the node-type probe.
     const litArr = nodeArrayElemIsLitUnion(arrIx)
     const savedArrLU = pendingLitUnion
     if litArr { pendingLitUnion = 1 }
-    // A `(boolean | null)[]` literal shares the i32 backing, but a `null` element must
-    // lower as the sentinel 2 (a `true`/`false` element already emits its i32 0/1) —
-    // seed `pendingNulBool` for the element emits, the niche analogue of `litArr`. The
-    // `pendingListKind == 8` arm catches an all-`null` `[null]` (which self-infers as
-    // `null[]`, so the node-type probe alone misses it) via the threaded annotation.
     const nbArr = nodeArrayElemIsNulBool(arrIx) || pendingListKind == 8
     const savedArrNB = pendingNulBool
     if nbArr { pendingNulBool = true }
-    // A `(K | null)[]` literal shares the i32 backing, but its elements are DUAL-natured: a
-    // member-literal element must lower as its interned ATOM id (`pendingLitUnion`, like `litArr`),
-    // while a `null` element must lower as the sentinel `-1` (`pendingNulLitUnion`). Seed BOTH so a
-    // mixed `["a", null]` lowers correctly. The `pendingListKind == 9` arm catches an all-`null`
-    // `[null]` (which self-infers as `null[]`, so the node-type probe alone misses it) via the
-    // threaded annotation — the atom-niche analogue of the boolean `pendingListKind == 8` arm.
     const nlluArr = nodeArrayElemIsNulLitUnion(arrIx) || pendingListKind == 9
     const savedArrNLLU = pendingNulLitUnion
     if nlluArr {
@@ -4815,7 +4773,7 @@ function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
   // columns; an un-interned value spelling re-splits (the ladder fall-through).
   // D-SETONCE: one resolution of the map value's member set feeds BOTH the member
   // walk and the residual code below (master resolved it twice — once inside
-  // `msMemberAtomsOf`, once inside `unionResidualSoloKind`).
+  // `msMemberAtomsOf`, once inside the residual-kind resolution).
   const uvsid = msSetOfText(uvn)
   const atoms: string[] = []
   if !msMemberAtomsOfSet(uvsid, atoms) { splitUnionAtoms(uvn, atoms) }
@@ -5793,18 +5751,10 @@ function emitMapPushKey(body: i32[]) {
   // newBacking on stack: array.new_default $mkArrIdx newCap
   pushMapScr(body, 4) // newCap
   fbArrayNewDefault(mkArrIdx)
-  // stash newBacking into curRef? curRef is a (ref $aTypeIdx) string ref — WRONG type.
-  // Instead copy directly: keep newBacking on stack, but array.copy needs it as an
-  // operand twice (dest for copy, then store into keys.backing). Use the keys list:
-  // 1) set keys.backing = newBacking, 2) array.copy newBacking 0 (re-read old via a
-  // saved ref). Simpler: array.copy first (dest = newBacking on stack is consumed),
-  // so duplicate by storing into keys.backing FIRST, then copy from a SECOND fresh
-  // read of the (now-updated) backing — but the old elements are gone. So we must
-  // copy BEFORE swapping. We therefore need a ref local for newBacking.
-  // Store newBacking into keys.backing AFTER copying from the OLD backing. To do that
-  // without a typed ref local, we copy old→new while new is still only on the stack is
-  // impossible (copy consumes operands). Fall back: set keys.backing, copy old→new is
-  // lost. ==> use the dedicated newKeysBacking local (slot 6).
+  // newBacking needs a TYPED ref local (slot 6, `newKeysBacking`): the copy must run
+  // BEFORE the swap (swapping first loses the old elements), and `array.copy` CONSUMES
+  // its dest operand, so the stack alone cannot supply it twice. `curRef` cannot hold it
+  // either — that slot is a `(ref $aTypeIdx)` string ref, the wrong type.
   setMapScrKB(body) // newKeysBacking (slot 6)
   // array.copy newBacking 0 oldBacking 0 len
   pushMapScrKB(body)              // dest
@@ -6149,9 +6099,10 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       if exprNullableRefArray(nd.idxArr, fnIx) {
         wU8(212) // 0xd4 ref.as_non_null
       }
-      // The INDEX is always i32 — clear any `pendingF32` an enclosing f32 context set, else a
-      // bare index literal emits as `f32.const` (matters for an INNER read `g[i][j]` over an
-      // `f32[][]`: the outer f32 read leaves `pendingF32` set while it emits this receiver).
+      // THE INDEX IS ALWAYS i32 — every index arm here clears `pendingF32` around it, else
+      // a bare index literal emits as `f32.const`. It bites on an INNER read `g[i][j]` over
+      // an `f32[][]`: the outer f32 read leaves `pendingF32` set while it emits this
+      // receiver, so the inner `[j]` inherits a context that was never its own.
       const savedRlIxF32 = pendingF32
       pendingF32 = false
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
@@ -6209,8 +6160,7 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
         return emitFail("emitProgram: index access but list type not collected")
       }
       if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
-      // The INDEX is always i32 — clear any f32 coercion signal an enclosing `f32` context
-      // set (`pendingF32`), else a bare index literal `xs[0]` would emit as `f32.const`.
+      // The index is always i32 (see the ref-array arm above).
       const savedIxF32 = pendingF32
       pendingF32 = false
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
@@ -8215,7 +8165,7 @@ function emitIntIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
 // scalar an ENCLOSING position wants may reach it. The three WIDE stores' second
 // operand is the one memory-intrinsic operand that is NOT an i32; it takes its declared
 // width through `emitExprAsI64`/`emitExprAsF32`/`emitExprAsF64` instead, and only their
-// ADDRESS comes here. `emitLetDecl`'s `letIsF32` arm and
+// ADDRESS comes here. `emitLetDeclStmt`'s `letIsF32` arm and
 // `emitReturnValue`'s f32 arm seed `pendingF32` across the WHOLE init/result subtree,
 // and an address literal then lowers as `f32.const` — `f32.const 0` followed by
 // `f32.load`, which is an UNPARSEABLE MODULE with `vl check` clean.
@@ -8379,8 +8329,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         // `(ref null $a)`), so master streamed a possibly-null ref straight into
         // `array.len`: a runtime `wasm trap: null reference` with `vl check` clean. The two
         // classifiers disagree only where the value IS the niche, and there the niche answer
-        // is the REP. (The dead `emitFail` that used to sit here was UNREACHABLE for exactly
-        // this reason — every nullable string reached `exprString` first.)
+        // is the REP.
         if exprNullableString(c.callArgs[0], fnIx) {
           return emitPrintNulString(body, c.callArgs[0], fnIx)
         }
@@ -8458,7 +8407,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // VARIABLE widens exactly where the checker permits it.
       //
       // The f32 arm seeds `pendingF32` across the value subtree, as every other f32
-      // coercion boundary does (`emitLetDecl`'s `letIsF32`, `emitDirectCall`'s f32 param,
+      // coercion boundary does (`emitLetDeclStmt`'s `letIsF32`, `emitDirectCall`'s f32 param,
       // the f32 push): without it a float literal nested inside the value expression
       // lowers at f64 and the store's operand is the wrong width.
       if nameIsMemStoreIntrinsic(callee.identName) {
@@ -8883,9 +8832,8 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
             // A literal-union atom assigned to a `string` global widens to its member string.
             if emitAtomToStr(body, a.binRight, fnIx) < 0 { return -1 }
           } else {
-            // A `boolean | null` NICHE global: seed the sentinel for a `null` RHS; a
-            // `string | null` global seeds the nullable-array ref; a nullable-CLOSURE
-            // global (kind 19) seeds `ref.null $cloStruct` for a `null` RHS.
+            // A NICHE `X | null` global seeds its null rep for a bare `null` RHS (the table
+            // at `emitNullLitNode`); a non-null RHS ignores the seed.
             const gsCtx = expCtxHere()
             if exprNulBool(a.binLeft, fnIx) { gsCtx.nulBool = true }
             if exprNullableString(a.binLeft, fnIx) { gsCtx.nulString = true }
@@ -8945,12 +8893,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         // A literal-union atom assigned to a `string` local widens to its member string.
         if emitAtomToStr(body, a.binRight, fnIx) < 0 { return -1 }
       } else {
-        // A `boolean | null` NICHE local (`x = null` / `x = b`): the i32 cell holds
-        // 0/1 or the sentinel 2 — seed `pendingNulBool` so a `null` RHS emits the
-        // sentinel (a boolean RHS is a `BoolLit`, untouched). A `string | null` local
-        // seeds `pendingNulString` so a `null` RHS is `ref.null $aTypeIdx`. A nullable-
-        // CLOSURE local (kind 19) seeds `pendingNulClosure` so a `null` RHS is
-        // `ref.null $cloStruct` (a function RHS builds the non-null closure value).
+        // A NICHE `X | null` local seeds its null rep for a bare `null` RHS, as the global
+        // arm above does. A non-null RHS ignores the seed (a boolean is a `BoolLit`, a
+        // function RHS builds the non-null closure value).
         const asCtx = expCtxHere()
         if exprNulBool(a.binLeft, fnIx) { asCtx.nulBool = true }
         if exprNullableString(a.binLeft, fnIx) { asCtx.nulString = true }
@@ -8995,15 +8940,13 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       // the write guards `i u< len` exactly like the read path.
       let idxKind: MfKind = "i32"
       let idxSlot = 0
-      // A ref list of STRUCT elements (kind 1) types the stored value literal as the
-      // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
-      // so `xs[i] = { … }` builds the element struct over a first-field-name match.
+      // The ELEMENT-VALUE seeds, exactly as `emitArr` seeds a literal's elements (see
+      // there): kind 1 hints the list's declared element STRUCT so `xs[i] = { … }` beats a
+      // first-field-name match; kind 2 boxes the value into the shared `{tag, payload}`
+      // rep; a NESTED-list element (kinds 4/6/7/8/9/10) emits under the INNER list's
+      // context (`refElemValueCtx`), so `b[i] = [7, 8]` over `i64[][]` builds an i64 list.
       let storeStructIdx = -1
-      // A UNION-box element list (`(C | S)[]`, kind 2): the stored value boxes into the
-      // shared `{tag, payload}` rep (`emitUnionBoxArg`), a variant widening like a call arg.
       let storeUnionNm = ""
-      // A NESTED-list element (`b[i] = [7, 8]` over `i64[][]`, kinds 4/6/7/8/9/10): the
-      // stored value emits under the INNER list's context (`refElemValueCtx`).
       let storeNestSlot = -1
       if isRef {
         if !rlUsed {
@@ -9257,15 +9200,13 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       } else if fscode == 6 {
         pendingListKind = 3
       }
-      // A MAP-typed field (code 19) seeds the map SHAPE so a bare `Map()` RHS builds THIS
-      // field's map struct — the write twin of `emitObj`'s construct-side seed, and the
-      // same defect the ident arms above carry: without it `s.m = Map()` over a
-      // `{[string]: string}` field `struct.new`'d the mono i32-valued map.
+      // A MAP-typed field (code 19) seeds the map SHAPE — the write twin of `emitObj`'s
+      // construct-side seed, carrying the same defect the ident arms above describe.
       pendingMapSlot = -1
       if fscode == 19 { pendingMapSlot = sFieldMapValSlot(si, fieldIdx) }
       // A BOX-union field (code 16) coerces a raw scalar/struct/null RHS into the box; the
-      // niche fields seed the null rep for a bare `null` RHS (`string | null` → `ref.null
-      // $aTypeIdx`, `boolean | null` → the i32 sentinel 2). A non-null value passes through.
+      // NICHE fields seed their null rep for a bare `null` RHS (the table at
+      // `emitNullLitNode`). A non-null value passes through.
       if fscode == 16 {
         if (
           emitUnionCoerce(
@@ -9439,16 +9380,12 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
       let lTy = lTypeIdx
       let aTy = aTypeIdx
       let base = pushScratchBase
-      // A ref list of STRUCT elements (kind 1) types the pushed value literal as the
-      // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
-      // so `xs.push({ … })` builds the element struct over a first-field-name match.
+      // The ELEMENT-VALUE seeds — the indexed-store block's exact set (see `emitArr` for
+      // the statement of the rule): kind 1 the declared element STRUCT, kind 2 the union
+      // box ("" for a non-union element), kinds 4/6/7/8/9/10 the INNER list's context, so
+      // `xs.push({ … })` / `i64[][].push([300])` build what the slot declares.
       let pushStructIdx = -1
-      // A UNION-box element list (`(C | S)[]`, kind 2): the pushed value is boxed into the
-      // shared `{tag, payload}` rep (`emitUnionBoxArg`) — a concrete variant widens like a
-      // call arg, a literal boxes via `emitUnionBox`. "" for a non-union element.
       let pushUnionNm = ""
-      // A NESTED-list element (`i64[][].push([300])`, kinds 4/6/7/8/9/10): the pushed value
-      // emits under the INNER list's context (`refElemValueCtx`), like a literal element.
       let pushNestSlot = -1
       if isRef {
         if !rlUsed {
@@ -9479,8 +9416,9 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         aTy = mkArrIdx
         base = strPushScratchBase
       } else if isF64 {
-        // An f64-list push runs the SAME grow/append over the f64 wrapper/backing,
-        // staged in the f64-typed push quad (`pushF64Val` is an f64 local).
+        // The three non-i32 SCALAR kinds run the IDENTICAL grow/append sequence over their
+        // own wrapper/backing, staged in their own typed push quad (`pushF64Val` is an f64
+        // local, and so on) — only the three type indices below differ.
         if !fa64Used {
           return emitFail(
             "emitProgram: f64 .push but f64 list type not collected",
@@ -9490,8 +9428,6 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         aTy = fa64TypeIdx
         base = f64PushScratchBase
       } else if isI64 {
-        // An i64-list push: the SAME grow/append over the i64 wrapper/backing, staged in
-        // the i64-typed push quad (`pushI64Val` is an i64 local).
         if !ia64Used {
           return emitFail(
             "emitProgram: i64 .push but i64 list type not collected",
@@ -9501,8 +9437,6 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         aTy = ia64TypeIdx
         base = i64PushScratchBase
       } else if isF32 {
-        // An f32-list push: the SAME grow/append over the f32 wrapper/backing, staged in
-        // the f32-typed push quad (`pushF32Val` is an f32 local).
         if !fa32Used {
           return emitFail(
             "emitProgram: f32 .push but f32 list type not collected",
@@ -9514,22 +9448,20 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
       } else if !lUsed {
         return emitFail("emitProgram: .push but list type not collected")
       }
+      // RECEIVER RESOLUTION (the shared rule — `emitPop`/`emitClear`/`emitPopOr` mirror it).
       // Resolve the receiver to a wasm local index holding the list-wrapper ref. A bare
-      // identifier IS such a local. A struct-FIELD receiver (`P.nodes`) is evaluated once
-      // into the `recvRef` scratch slot (`base + 3`); because the wrapper is mutated IN
-      // PLACE by reference, pushing through the scratch local also mutates the field's
-      // list — no write-back needed.
+      // identifier IS such a local. Every OTHER form — a struct FIELD (`P.nodes`), a module
+      // GLOBAL, an INDEX (`g[0].push(x)`) — is evaluated ONCE through `emitExpr` into the
+      // `recvRef` scratch slot (`base + 3`) and pushed through that. NO WRITE-BACK is needed
+      // in any of them: the wrapper is mutated IN PLACE by reference, and a growth swaps the
+      // backing on that same shared wrapper, so the mutation is visible through the field /
+      // global / outer array / map.
       let lIdx = -1
       if recv is Ident {
         lIdx = localIndexOf(fnIx, recv.identName)
         if lIdx < 0 {
-          // Not a local — a module-GLOBAL list ident? Materialize its wrapper ref into
-          // the `recvRef` scratch slot (`base + 3`), IDENTICALLY to the Member path:
-          // `emitExpr` on the receiver runs the existing Ident→global read (`global.get`
-          // + `ref.as_non_null` for a non-const ref cell). Because the list wrapper is
-          // mutated IN PLACE by reference, pushing through the scratch local also mutates
-          // the global's list — and growth swaps the backing on the shared wrapper — so
-          // no write-back to the global is needed.
+          // A module-GLOBAL list ident: `emitExpr` runs the existing Ident→global read
+          // (`global.get` + `ref.as_non_null` for a non-const ref cell).
           if globalIndexOf(recv.identName) < 0 {
             return emitFail("emitProgram: .push receiver is not a list local")
           }
@@ -9542,12 +9474,9 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         fbLocalSet(base + 3) // local.set recvRef
         lIdx = base + 3
       } else if recv is Index {
-        // An INDEXED receiver (`g[0].push(x)` — push onto an INNER list of a nested array, or onto a
-        // list read from a list-valued map). Evaluate the indexed wrapper ref once into the `recvRef`
-        // scratch slot, exactly like the struct-field path: the wrapper is mutated IN PLACE (and a
-        // growth swaps the backing on that same shared wrapper), so the mutation is visible through
-        // the outer array / map with no write-back. The classifiers above already recognize a nested
-        // `g[i]` read as its inner list, so `lTy`/`aTy`/`base` are the inner list's.
+        // An INDEXED receiver (`g[0].push(x)` — push onto an INNER list of a nested array, or
+        // onto a list read from a list-valued map). The classifiers above already recognize a
+        // nested `g[i]` read as its inner list, so `lTy`/`aTy`/`base` are the inner list's.
         if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
         fbLocalSet(base + 3) // local.set recvRef
         lIdx = base + 3
@@ -9713,18 +9642,12 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32) {
       } else if !lUsed {
         return emitFail("emitProgram: .pop but list type not collected")
       }
-      // Resolve the receiver to a wasm local holding the list-wrapper ref. A bare local IS
-      // that local; a struct-FIELD receiver (`T.scopes`) is evaluated ONCE into the frame's
-      // `recvRef` scratch (`base + 3`) — the wrapper is mutated in place by reference, so no
-      // write-back is needed (mirrors `emitPush`).
+      // Receiver resolution — `emitPush`'s rule (see there): a bare local IS the local, a
+      // struct FIELD (`T.scopes`) or a global stages into `recvRef` (`base + 3`), no write-back.
       let lIdx = -1
       if recv is Ident {
         lIdx = localIndexOf(fnIx, recv.identName)
         if lIdx < 0 {
-          // Not a local — a module-GLOBAL list ident? Materialize its wrapper ref into
-          // the `recvRef` scratch slot (`base + 3`), IDENTICALLY to the Member path (and
-          // to `emitPush`): `emitExpr` runs the existing Ident→global read; the wrapper is
-          // mutated in place by reference, so no write-back to the global is needed.
           if globalIndexOf(recv.identName) < 0 {
             return emitFail("emitProgram: .pop receiver is not a list local")
           }
@@ -10802,13 +10725,8 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if retNulString { retCtx.nulString = true }
     if retNulClosure { retCtx.nulClosure = true }
     if retNulList { retCtx.nulList = true }
-    // GATED on the return VALUE being a bare `null` (the #964 discipline): a `return null`
-    // lowers as `ref.null $wrapper`, but a `return [null]` LIST literal's null ELEMENTS take
-    // the per-element seed (`ref.null $elem` via `pendingStructIdx` / the element-nullable
-    // arm). Un-gated, this whole-value wrapper seed was captured by the array literal's
-    // element context and stored `ref.null $wrapper` into the struct-element backing —
-    // INVALID-WASM (`return [null]` of `({f: boolean | null} | null)[] | null`; the return
-    // twin of the kind-18 binding seed at `localIsRef[slot] == "nulreflist"`).
+    // The #964 SEED-LEAK gate (stated in full at `emitObj`'s code-28 arm), at the RETURN
+    // boundary. Witness: `return [null]` of `({f: boolean | null} | null)[] | null`.
     if retNulRefArr && retNulRefArrHeap >= 0 {
       if P.nodes[unwrapParen(retArg)] is NullLit {
         retCtx.nulRefHeap = retNulRefArrHeap
@@ -11047,12 +10965,10 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // the element kind to pick the ref-list construction — record it for `emitArr`.
   pendingListKind = letAnnRefListKind(stmtIx)
   pendingListSlot = letAnnRefListSlot(stmtIx)
-  // A kind-18 nullable ref-array binding: a bare `null` init lowers as `ref.null $innerWrapper`. The list
-  // value seeds above (`pendingListKind`/`Slot`) build a non-null list; this seeds the null arm.
-  // GATED on the init actually BEING a bare `null`: a LIST-literal init's null ELEMENTS take the
-  // per-element seed (`rlElemNullable` → `ref.null $elem`) — un-gated, the wrapper seed leaked into
-  // the literal and stored `ref.null $wrapper` into the element backing: INVALID-WASM
-  // (`const g: (S | null)[] | null = [null]`; fuzz-nightly bm leg, seed 160804094 d5).
+  // A kind-18 nullable ref-array binding: the list seeds above build the NON-null list,
+  // this seeds the null arm. The #964 SEED-LEAK gate (stated in full at `emitObj`'s code-28
+  // arm) at the BINDING boundary — witness `const g: (S | null)[] | null = [null]`
+  // (fuzz-nightly bm leg, seed 160804094 d5).
   if localIsRef[slot] == "nulreflist" {
     if pendingListSlot >= 0 && pendingListSlot < rlWrapIdx.length {
       const nraInit = P.nodes[unwrapParen(s.letInit)]
@@ -11230,16 +11146,16 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     // A literal-union atom initializing a `string` local widens to its member string.
     if emitAtomToStr(body, s.letInit, fnIx) < 0 { return -1 }
   } else {
-    // A `boolean|null` NICHE binding lowers a bare `null` init as the sentinel 2; a
-    // `string|null` binding lowers it as `ref.null $aTypeIdx`. `letNulBool` (not just
-    // the annotation) so an INFERRED niche binding (`const r = f()` where `f` returns
-    // `boolean | null`) seeds the sentinel too.
+    // A NICHE `X | null` binding seeds its null rep for a bare `null` init (the table at
+    // `emitNullLitNode`). Keyed on `letNulBool`/`letIsNulString` rather than the annotation
+    // alone, so an INFERRED niche binding (`const r = f()` where `f` returns `boolean |
+    // null`) seeds it too.
     pendingNulBool = letNulBool(stmtIx, fnIx)
     pendingNulString = letIsNulString(stmtIx, fnIx)
     if s.letType >= 0 {
       if nodeTyIsLitUnionAlias(s.letType) { pendingLitUnion = 1 }
-      // A `K | null` NICHE binding: a member init lowers as its atom id, a bare `null` init as the
-      // i32 sentinel `-1` — seed both, like the param-arg / return boundaries.
+      // `K | null` is dual-natured — a member init is an atom id, only a `null` is the
+      // sentinel — so seed BOTH, as the param-arg / return boundaries do.
       if nodeTyIsNulLitUnion(s.letType) {
         pendingLitUnion = 1
         pendingNulLitUnion = true
@@ -12387,7 +12303,6 @@ function emitStrValue(body: i32[], ix: i32, fnIx: i32) {
   re
 }
 
-// Extracted from `emitExpr`'s `NumLit` arm (C3: thin the dispatcher).
 function emitNumLitNode(_body: i32[], e: NumLit, exprIx: i32, fnIx: i32) {
   // A FLOAT literal (lexeme carries a `.`) in f32 CONTEXT (`pendingF32` — an `: f32`
   // binding/param/return) lowers as `f32.const`. Checked before the default f64 path
@@ -12451,7 +12366,6 @@ function emitNumLitNode(_body: i32[], e: NumLit, exprIx: i32, fnIx: i32) {
   return 0
 }
 
-// Extracted from `emitExpr`'s `CharLit` arm (C3: thin the dispatcher).
 function emitCharLitNode(_body: i32[], e: CharLit, _exprIx: i32, _fnIx: i32) {
   // A char literal IS its single Unicode code point as an i32. `charText` is the RAW
   // lexeme (quotes kept, escapes unresolved), so decode it the SAME way string
@@ -12467,7 +12381,6 @@ function emitCharLitNode(_body: i32[], e: CharLit, _exprIx: i32, _fnIx: i32) {
   return 0
 }
 
-// Extracted from `emitExpr`'s `Ident` arm (C3: thin the dispatcher).
 function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
   // A CAPTURED variable (a free var of a capturing lifted function): read it from the
   // env struct threaded as the leading param (local 0) —
@@ -12486,12 +12399,14 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
     if unionNameOfIdent(e.identName, fnIx) != "" {
       return emitValueUnionUnboxRead(body, e.identName, vak, fnIx)
     }
-    // The typed-IR net behind the syntactic miss (the map arm's discipline, below): a
-    // binding off an INDEX-callee closure call (`const t0 = v[0](1)` over a
-    // `((…) => {f: {[string]: V}} | boolean)[]`) has no `unionNameOfIdent` render, but
-    // the checker typed its origin as the boxed union — the read holds the BOX, and
-    // skipping the unbox pushed the box ref where the raw narrowed atom was expected
-    // (INVALID-WASM; fuzz sweep2 multiobs seed 655720167 case_00209).
+    // THE TYPED-IR NET behind the syntactic miss — all three narrowed-arm reads in this
+    // function carry it. Some bindings hold the BOX without producing a `unionNameOfIdent`
+    // render (a binding off a call whose callee is an INDEX or a narrowed nullable-closure
+    // value), so the syntactic gate above misses and the unbox is SKIPPED — pushing the box
+    // ref where the arm's rep was expected: INVALID WASM, every time. The checker did type
+    // the chain's ORIGIN as the boxed union, so the net asks the typed IR instead.
+    // This arm: `const t0 = v[0](1)` over `((…) => {f: {[string]: V}} | boolean)[]` — the
+    // box reached a raw narrowed atom (fuzz sweep2 multiobs seed 655720167 case_00209).
     if identChainTyBoxedUnion(e.identName, fnIx, 4) {
       return emitValueUnionUnboxRead(body, e.identName, vak, fnIx)
     }
@@ -12504,10 +12419,8 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
     if unionNameOfIdent(e.identName, fnIx) != "" {
       return emitRefArrayUnionUnboxRead(body, e.identName, fnIx)
     }
-    // The typed-IR net behind the syntactic miss (the value-atom arm's discipline,
-    // above): a binding off a narrowed nullable-closure param's call (`const t1 =
-    // t0(1,1,1)` — no `unionNameOfIdent` render) still holds the BOX; skipping the
-    // unbox pushed the box ref where the list wrapper was expected — INVALID-WASM
+    // The typed-IR net (see the value-atom arm above). This arm: `const t1 = t0(1,1,1)`
+    // off a narrowed nullable-closure param — the box reached the list wrapper
     // (fuzz sweep4 declared leg, seed 462516905 case_00383).
     if identChainTyBoxedUnion(e.identName, fnIx, 4) {
       return emitRefArrayUnionUnboxRead(body, e.identName, fnIx)
@@ -12521,11 +12434,9 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
     if unionNameOfIdent(e.identName, fnIx) != "" {
       return emitMapUnionUnboxRead(body, e.identName, fnIx)
     }
-    // The typed-IR net behind the syntactic miss (`unionMapArmIdent`'s discipline): a
-    // rebind off a narrowed nullable-closure VALUE call (`const t1 = t0(); const t2 =
-    // t1`) has no `unionNameOfIdent` render, but the checker typed the chain's ORIGIN
-    // as the map-arm union — the read holds the BOX and skipping the unbox stored the
-    // box ref into the map-struct frame: INVALID-WASM (fuzz-nightly plain leg, seed
+    // The typed-IR net (see the value-atom arm above), over the MAP-arm chain. This arm:
+    // the rebind `const t1 = t0(); const t2 = t1` off a narrowed nullable-closure VALUE
+    // call — the box reached the map-struct frame (fuzz-nightly plain leg, seed
     // 258048495 d6, `(() => {[string]: boolean} | {w: i32} | null) | null`).
     if identChainTyMapArmUnion(e.identName, fnIx, 4) {
       return emitMapUnionUnboxRead(body, e.identName, fnIx)
@@ -12547,17 +12458,11 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
     if gIdx >= 0 {
       fbGlobalGet(userGlobalIdx(gIdx))
       const gck0 = globalCellKind(globalLetOf(e.identName))
-      // A `string | null` cell (kind 16) is ALWAYS a NULLABLE ref — const OR not (a
-      // const can still be initialized to `null`). So a VALUE read recovers the non-null
-      // string ref (`ref.as_non_null`, 0xd4 — the checker narrowed it non-null at every
-      // value read) INDEPENDENTLY of const-ness; the `!= null` null-check keeps the raw
-      // nullable ref (`pendingRawNullRead`). Without this a top-level `string | null`
+      // The `string | null` READ RULE (stated at `emitMem`'s field read) applies here
+      // INDEPENDENTLY of const-ness: a kind-16 cell is ALWAYS a nullable ref, because a
+      // const can still be initialized to `null`. Without this a top-level `string | null`
       // value read (`x ?? d`, `!= null`) left a `(ref null $array)` where a `(ref $array)`
       // is expected (a function-scope local already recovers via the local path below).
-      // A nullable-string TARGET (`pendingNulString` — `const t = g` binding `string |
-      // null`, `t = g`, a `string | null` arg/return) keeps the raw nullable ref, exactly
-      // like the local read below: recovering it would `ref.as_non_null` a value that may
-      // legitimately be null (`const g: string | null = null`) and trap.
       if gck0 == "nulstr" {
         if !pendingRawNullRead && !pendingNulString {
           wU8(212) // 0xd4 ref.as_non_null
@@ -12602,13 +12507,8 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
     )
   }
   fbLocalGet(idx)
-  // A `string | null` (kind 16) param/local read AS A VALUE recovers the non-null
-  // string ref — the checker narrowed it non-null at every such read. The `!= null`
-  // null-check sets `pendingRawNullRead` to keep the raw nullable ref for `ref.is_null`.
-  // A NULLABLE-string TARGET (`pendingNulString` — `const t: string | null = s`, `t = s`,
-  // a `string | null` arg/return) likewise keeps the raw nullable ref: recovering it would
-  // `ref.as_non_null` a value that may legitimately be null and trap. Mirrors the kind-15
-  // list read, which never eagerly recovers.
+  // The `string | null` (kind 16) READ RULE for a param/local — stated at `emitMem`'s
+  // field read. Mirrors the kind-15 list read, which never eagerly recovers.
   if !pendingRawNullRead && !pendingNulString {
     if paramNulString(fnIx, e.identName) || declaredNulString(e.identName) {
       fbRefAsNonNull() // 0xd4
@@ -12617,7 +12517,6 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
   return 0
 }
 
-// Extracted from `emitExpr`'s `Unary` arm (C3: thin the dispatcher).
 function emitUnaryNode(body: i32[], e: Unary, _exprIx: i32, fnIx: i32) {
   // Logical not `!a`: a boolean rides in an i32 (0/1), so `i32.eqz` (0x45) maps
   // 0→1 and any non-zero→0 — exactly `a == 0`. Push the operand, then eqz.
@@ -12705,7 +12604,6 @@ function emitUnaryNode(body: i32[], e: Unary, _exprIx: i32, fnIx: i32) {
   return 0
 }
 
-// Extracted from `emitExpr`'s `Call` arm (C3: thin the dispatcher).
 function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
   // G6: `s.slice(start, end)` over a string receiver is an intrinsic — a new
   // `(array i32)` over the clamped half-open range. Other member-calls in value
@@ -12791,44 +12689,45 @@ function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
   return emitCall(body, exprIx, fnIx)
 }
 
-// Extracted from `emitExpr`'s `NullLit` arm (C3: thin the dispatcher).
+// THE NULL-REP TABLE. A bare `null` has no rep of its own — it takes the one the
+// enclosing position seeded. Every `X | null` boundary in this file (field / variant-field
+// / array element / param / return / let / assign / `??`) seeds one of these flags and
+// then names only what is site-specific; the rep itself is decided here, once:
+//   pendingNulBool      `boolean | null`   → the i32 sentinel 2      (0/1 are the booleans)
+//   pendingNulLitUnion  `K | null`         → the i32 sentinel -1     (atom ids are >= 0)
+//   pendingNulString    `string | null`    → `ref.null $aTypeIdx`    (the raw string array)
+//   pendingNulClosure   `fn | null`        → `ref.null $cloStruct`   (the fat pointer)
+//   pendingNulList      `(i32[] | null)[]` → `ref.null $lTypeIdx`
+//   pendingNulRefHeap   any other nullable ref → `ref.null <seeded heap>`
+//   pendingStructIdx    `S | null`         → `ref.null $S`
+// ORDER is load-bearing: the four NICHE arms come first because a niche `null` is an i32
+// or a non-struct ref, and the struct seed at the bottom would type it `ref.null $S`.
 function emitNullLitNode(_body: i32[], _e: NullLit, _exprIx: i32, _fnIx: i32) {
-  // `null` in a `boolean|null` NICHE context is the scalar sentinel 2 (an i32,
-  // not a ref) — checked before the struct seed.
   if pendingNulBool {
     fbI32Const(2)
     return 0
   }
-  // `null` in a `K | null` NICHE context is the i32 sentinel `-1` (atom ids are ≥ 0) — an i32,
-  // not a ref. Checked before the struct seed (a litunion atom is not a struct).
   if pendingNulLitUnion {
     fbI32Const(-1)
     return 0
   }
-  // `null` in a `string | null` (kind 16) context — `ref.null $aTypeIdx` (the raw
-  // string array made nullable). Checked before the struct seed (a string is not a
-  // struct). Seeded at the param-arg / assignment / return boundaries.
   if pendingNulString {
     wU8(208) // 0xd0 ref.null
     wSLEB(aTypeIdx)
     return 0
   }
-  // `null` in a nullable FUNCTION-VALUE (`fn | null`, kind 19) context — `ref.null
-  // $cloStruct` (the closure fat-pointer made nullable). Checked before the struct seed.
   if pendingNulClosure {
     wU8(208) // 0xd0 ref.null
     wSLEB(cloStructIdx)
     return 0
   }
-  // `null` as a NULLABLE-i32-LIST element of a `(i32[] | null)[]` literal — `ref.null $lTypeIdx`.
   if pendingNulList {
     wU8(208) // 0xd0 ref.null
     wSLEB(lTypeIdx)
     return 0
   }
-  // `null` as a NULLABLE-REF-ARRAY element of a `(<ref-array> | null)[]` literal — `ref.null
-  // $innerWrapper` (the seeded inner ref-list wrapper heap type). Reset the seed after consuming it so it
-  // never persists past this `null` (a stray non-(-1) value would mis-type a later bare `null`).
+  // Reset the seed after CONSUMING it, so it never persists past this `null` (a stray
+  // non-(-1) value would mis-type a later bare `null`).
   if pendingNulRefHeap >= 0 {
     const nrh = pendingNulRefHeap
     pendingNulRefHeap = -1
@@ -12849,7 +12748,6 @@ function emitNullLitNode(_body: i32[], _e: NullLit, _exprIx: i32, _fnIx: i32) {
   return emitFail("emitProgram: bare null needs a struct-typed context")
 }
 
-// Extracted from `emitExpr`'s `ObjLit` arm (C3: thin the dispatcher).
 function emitObjLitNode(body: i32[], _e: ObjLit, exprIx: i32, fnIx: i32) {
   // A CONTEXT that expects a CONCRETE variant (`const c: Cat = { … }`, a `Cat[]`
   // element) constructs the BARE variant struct `(ref $(uVarHeap[vi]))` — NOT a union
@@ -12868,7 +12766,6 @@ function emitObjLitNode(body: i32[], _e: ObjLit, exprIx: i32, fnIx: i32) {
   return emitObj(body, exprIx, fnIx)
 }
 
-// Extracted from `emitExpr`'s `Member` arm (C3: thin the dispatcher).
 function emitMemberNode(body: i32[], e: Member, exprIx: i32, fnIx: i32) {
   // `a.length` on an array OR string receiver is `array.len` (a string is the SAME
   // `array i32` of code points, so `.length` is the code-point count); every other
@@ -12911,7 +12808,6 @@ function emitMemberNode(body: i32[], e: Member, exprIx: i32, fnIx: i32) {
   return emitMem(body, exprIx, fnIx)
 }
 
-// Extracted from `emitExpr`'s `BinExpr` arm (C3: thin the dispatcher).
 function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Assignment (`=`) is a STATEMENT, not a value expression in this slice: it has
   // no result on the stack (it `local.set`s). It is lowered by `emitAssign` from
@@ -13233,12 +13129,18 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       return 0
     }
   }
-  // Slice 5 — f32 operators. If EITHER operand is f32, emit the f32 instruction
-  // variant and coerce the other operand (an i32 or a float LITERAL) to f32 first
-  // (`emitExprAsF32`). Covers arithmetic (f32 result) AND comparisons (i32 bool
-  // result, COMPARE consumes two f32). Checked BEFORE f64 because a float literal is
-  // `exprIsF64` too — so `x + 4.0` with `x: f32` must route here, not to f64. Keyed on
-  // operand kind, so an i32-only program never enters it (i32 path stays byte-identical).
+  // THE WIDE-SCALAR SLICES (f32, then f64, then i64 — one shape, three widths). If
+  // EITHER operand is of the width, emit that width's instruction variant and coerce the
+  // other operand to it first (`emitExprAsF32`/`AsF64`/`AsI64`); this covers arithmetic
+  // (a wide result) AND comparisons (an i32 bool result, but the COMPARE consumes two
+  // wide operands). Each is keyed on OPERAND KIND, so an i32-only program never enters
+  // any of them and the i32 path at the bottom stays byte-identical.
+  //
+  // The ORDER is the only thing that differs, and it is load-bearing: f32 first because a
+  // float literal is `exprIsF64` too, so `x + 4.0` with `x: f32` must route to f32; then
+  // f64 (a float operand is never i64); then i64.
+  //
+  // Slice 5 — f32.
   const lF32 = exprIsF32(e.binLeft, fnIx)
   const rF32 = exprIsF32(e.binRight, fnIx)
   // A GENUINE (non-literal) f64 operand makes the op f64 — the f32 side widens (`f32 + f64var`),
@@ -13253,11 +13155,7 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       return 0
     }
   }
-  // Slice 3 — f64 operators. If EITHER operand is f64, emit the f64 instruction
-  // variant and widen the i32 operand (if any) to f64 first (`emitExprAsF64`). Covers
-  // arithmetic (f64 result) AND comparisons (i32 bool result, COMPARE consumes two
-  // f64). Checked BEFORE i64 since a float operand is never i64. Keyed on operand kind,
-  // so an i32-only program never enters it — the i32 path below is byte-identical.
+  // Slice 3 — f64.
   const lF64 = exprIsF64(e.binLeft, fnIx)
   const rF64 = exprIsF64(e.binRight, fnIx)
   if lF64 || rF64 {
@@ -13269,11 +13167,7 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       return 0
     }
   }
-  // Slice 2 — i64 operators. If EITHER operand is i64, emit the i64 instruction
-  // variant and widen the i32 operand (if any) to i64 first (`emitExprAsI64`). This
-  // covers arithmetic/bitwise/shift (i64 result) AND comparisons (i32 bool result,
-  // but the COMPARE consumes two i64). The whole branch is keyed on operand kind, so
-  // an i32-only program never enters it — the i32 path below is byte-identical.
+  // Slice 2 — i64 (also bitwise / shift).
   const lI64 = exprIsI64(e.binLeft, fnIx)
   const rI64 = exprIsI64(e.binRight, fnIx)
   if lI64 || rI64 {
@@ -13298,7 +13192,6 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
 // `target` (env-leading when `fnValUsed`): arguments reordered into parameter
 // order and emitted per-parameter with the full coercion suite (struct/variant
 // hints, union boxing, nullable bridging, float/i64 widening), then `call`.
-// Extracted verbatim from emitCall (C3) — pure code-move.
 function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
   // The callee's FuncDecl lives at `fnStmts[target]` (the function index IS the
   // fnStmts position). Its parameter list lets a struct-literal argument construct as
@@ -13362,21 +13255,17 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     // (`emitUnionCoerce` — the host's call-boundary `coerceUnion`). The param's
     // union NAME carries the atom set for the tag choice.
     let cUNm = ""
-    // A `boolean | null` NICHE param position: a `null` argument is the i32
-    // sentinel 2 (seed `pendingNulBool`); a boolean argument is untouched.
+    // The NICHE `X | null` param positions. Each seeds the null rep its kind demands (the
+    // table lives at `emitNullLitNode`) and leaves a NON-null argument untouched; the two
+    // list niches additionally let a list-value/literal argument build the wrapper it
+    // subtypes. Kinds: 21 boolean, 16 string, 19 fn, 15 `i32[]`, 18 ref-array, and the
+    // distinct-backing scalar lists (`i64[] | null` etc.).
     let cParamNulBool = false
-    // A `string | null` param position: a `null` argument is `ref.null $aTypeIdx`.
     let cParamNulString = false
-    // A `fn | null` param position (kind 19): a `null` argument is `ref.null $cloStruct`.
     let cParamNulClosure = false
-    // An `i32[] | null` param position (kind 15): a `null` argument is `ref.null $lTypeIdx`.
     let cParamNulList = false
-    // A `<ref-array> | null` param position (kind 18): a list-value argument builds the ref list
-    // (subtypes the nullable wrapper), a `null` argument is `ref.null $wrapper` (`cParamNulRefArrHeap`).
     let cParamNulRefArr = false
     let cParamNulRefArrHeap = -1
-    // A DISTINCT-backing nullable scalar-list param position (`i64[] | null` etc.): a list-literal
-    // argument builds the leaf wrapper (the build code), a `null` argument is `ref.null $wrapper`.
     let cParamNulSLKind: VKind | null = null
     // A literal-union param position: a member-literal argument lowers as its interned i32 id.
     let cParamLitUnion = false
@@ -13499,10 +13388,9 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
         if cParamNulClosure { argCtx.nulClosure = true }
         if cParamNulList { argCtx.nulList = true }
         if cParamNulRefArr && cParamNulRefArrHeap >= 0 {
-          // Bare-`null` arguments ONLY (the local-binding discipline): a LIST-literal
-          // argument's null ELEMENTS take the per-element seed — the leaked wrapper
-          // seed stored `ref.null $wrapper` into the element backing (INVALID-WASM;
-          // `useIt([null])` on a `(S | null)[] | null` param, fuzz seed 160804094 d5).
+          // The #964 SEED-LEAK gate (stated in full at `emitObj`'s code-28 arm) at the
+          // ARGUMENT boundary. Witness: `useIt([null])` on a `(S | null)[] | null` param
+          // (fuzz seed 160804094 d5).
           const nraArg = P.nodes[unwrapParen(args[i])]
           if nraArg is NullLit { argCtx.nulRefHeap = cParamNulRefArrHeap }
         }
@@ -13559,7 +13447,6 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
 // The captured-call lowering for an `Ident` callee resolved to a CAPTURING lifted
 // function at index `target`: build its closure value live (reading captures) and
 // `call_ref` it (a plain `call` would pass a null env and lose the captures).
-// Extracted verbatim from emitCall (C3) — pure code-move.
 function emitCapturedCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
   // Stash the freshly-built closure, then call_ref it (same shape as emitCallRef
   // but the callee is a value we synthesize here, not an existing binding).
@@ -13591,7 +13478,6 @@ function emitCapturedCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
 }
 
 // The `__array_new__(n, fill)` / `__array_new_default__(n)` intrinsic lowering.
-// Extracted verbatim from emitCall (C3) — pure code-move.
 function emitArrayNewIntr(body: i32[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
@@ -13703,7 +13589,6 @@ function emitArrayNewIntr(body: i32[], callIx: i32, fnIx: i32) {
 }
 
 // The `__array_copy__(dst, dstAt, src, srcAt, count)` intrinsic lowering.
-// Extracted verbatim from emitCall (C3) — pure code-move.
 function emitArrayCopyIntr(body: i32[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
@@ -13770,8 +13655,7 @@ function emitArrayCopyIntr(body: i32[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: emitArrayCopyIntr expected an __array_copy__ call")
 }
 
-// Extracted from `emitBinExprNode`'s `??` arm — the fused map/list/struct nullish-coalescing
-// lowering (C3: thin the binOp sub-dispatcher).
+// The fused map/list/struct nullish-coalescing lowering (`emitBinExprNode`'s `??` arm).
 function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized LHS so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -13930,7 +13814,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
         unionHasAtomK(csid, cunm, "null", nullValKind())
       ) {
         // D-UNION-ATOM-KIND: the residual member's banked ABI code (see
-        // `unionResidualSoloKind`); the rendered residual is re-parsed only where the
+        // `unionResidualSoloKindOfSet`); the rendered residual is re-parsed only where the
         // set pool declines — a narrowed subset spelling it never interned.
         //
         // D-SETID: the set arrives as the narrowing table's BANKED (row, mask) id
@@ -13996,13 +13880,13 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
     if kunm != "" {
       // D-VALUNION + D-SETONCE: one resolution feeds the value-union gate AND the
       // residual code below, which master resolved a second time inside
-      // `unionResidualSoloKind`.
+      // `unionResidualSoloKindOfSet`.
       const ksid = msSetOfText(kunm)
       if (
         isValueUnionOfSet(ksid, kunm) &&
         unionHasAtomK(ksid, kunm, "null", nullValKind())
       ) {
-        // D-UNION-ATOM-KIND — see `unionResidualSoloKind`.
+        // D-UNION-ATOM-KIND — see `unionResidualSoloKindOfSet`.
         let kak = unionResidualSoloKindOfSet(ksid)
         if kak == -2 {
           kak = valueAtomKind(removeAtomFromSet(kunm, "null")) // D-RESIDUE
@@ -14102,7 +13986,7 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
             isValueUnionOfSet(msid, munm) &&
             unionHasAtomK(msid, munm, "null", nullValKind())
           ) {
-            // D-UNION-ATOM-KIND — see `unionResidualSoloKind`.
+            // D-UNION-ATOM-KIND — see `unionResidualSoloKindOfSet`.
             let mak = unionResidualSoloKindOfSet(msid)
             if mak == -2 {
               mak = valueAtomKind(removeAtomFromSet(munm, "null")) // D-RESIDUE
