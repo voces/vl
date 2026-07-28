@@ -33157,6 +33157,35 @@ head. Filed here rather than pinned: the corpus has no `@`-tier for "writes inva
 the shape is a ref-list/union-arm interaction, not a naming one. The multiarg fixture's header
 records the exclusion and its reason.
 
+### THE SIDECAR'S TWO MEMOS HAVE DIFFERENT LIFETIMES — investigated, and the difference is UNMEASURABLE
+
+The REACH probe's records do not add up, and the discrepancy is worth recording because a
+future reader will hit it. `genAppNameOfTy` answers on **927** programs, but **876 of those hold
+ZERO sidecar rows** by the time `emitProgram` ends — a table that was non-empty during the walk
+and empty at the end.
+
+The mechanism is real. `applyGenAliasArgs` guards its expansion with `cUserTypes`, emptied by
+**`initChecker`**; the nominal sidecar is emptied by **`checkProgramNode`**, beside its
+`cStructTyIxs`/`cUnionTyIxs` siblings. Those are different functions with different call sites,
+so a program re-checked without a re-init returns its index from the surviving `cUserTypes` memo
+and takes the early return **before** the bank, leaving the sidecar empty.
+
+**A candidate that banks on the memo HIT as well as the miss** (an idempotent `bankGenApp`
+called from both arms) was built and measured on both instruments:
+
+| | this head | + memo-hit bank |
+| --- | ---: | ---: |
+| B2 disagreements | 95 | **95 — unchanged** |
+| corpus A/B, six channels, 1,603 files | — | **0 rows differ** |
+
+**Not shipped.** The rows-at-zero reading is an artifact of WHERE the counter is read, not a lost
+answer: the shape-registration walk consults the sidecar earlier in `emitProgram` than the probe
+reports, so everything that needed a nominal name already had one. The candidate buys no
+measured coverage and puts an O(rows) scan on every generic-alias resolution. *An unobservable
+robustness improvement is a code change with no witness, and this document's own rule is that
+those do not ship.* Recorded here rather than discarded, because the lifetime mismatch is real
+and a future slice that moves either reset needs to know the two are not in step.
+
 ### WHAT P2 NEEDS
 
 1. **The 9 T-class rows.** Distinguishing `Y` from `Box<i32>` needs the ALIAS's own identity at
