@@ -27,21 +27,31 @@
 // and eight headers said so. The record filed a new shared module as the family's
 // endgame with a precondition — one slice owning `typecheck.vl` plus six emitter modules
 // at once — and #1228 REFUTED it by measurement: the bodies are pure, so the module is a
-// LEAF, so `typecheck.vl` can re-export it exactly as `emit_base.vl` already re-exports
-// eleven of these names. **No emitter module changes.** The graph after this slice:
+// LEAF, so `typecheck.vl` could re-export it exactly as `emit_base.vl` re-exported eleven
+// of these names.
 //
-//     tyname  ←  typecheck  ←  emit_base  ←  emit_classify / emit_collect / emit_mono /
-//        ↑                                   emit_rep / emit_rewrite / emit_sections
-//        └── typecheck also re-exports to driver.vl, which imports `gaeLtAt` directly
+// **THAT RE-EXPORT CHAIN IS GONE, AND THIS PARAGRAPH USED TO DRAW IT AS IF IT WERE STILL
+// THERE.** D-TYNAMEHOME phases 1a-1c re-pointed every consumer at this file and #1236
+// deleted BOTH republishing lines (`typecheck.vl`'s and `emit_base.vl`'s), so the "up to
+// THREE re-export hops" this header described is not a cost anyone pays any more — it is
+// not a path that exists. **Zero hops. Nine direct importers, each exactly one:**
 //
-// A consumer reaches a home through up to THREE re-export hops and pays nothing for it:
-// `emit_classify` ← `emit_base` ← `typecheck` ← `tyname` was built, run and measured
-// corpus-identical before this slice was written.
+//     tyname (leaf, 0 imports)
+//        ↑── typecheck · emit_base · emit_classify · emit_collect · emit_mono
+//        ↑── emit_rep · emit_rewrite · emit_sections · driver
+//
+// **AND NINE IS THE IMPORT SET, NOT THE SET THAT NEEDS THE GRAMMAR.** `wasmEmit.vl` does
+// type-name character work — the quoted-leaf test in `emitIs` / `emitUnionLitIs`, and three
+// `splitUnionAtoms` calls — and does NOT import this file. Adding the edge cannot cycle (a
+// zero-import leaf is reachable from everywhere), so the tenth consumer is a decision no
+// one has taken rather than a layering problem; a census that reads "nine consumers, all
+// one hop" as "every module that needs the grammar has it" is reading the wrong set.
 //
 // ── WHAT IS IN, AND WHAT IS DELIBERATELY OUT ─────────────────────────────────────────
-// IN — 21 bodies, in six families, in dependency order:
+// IN — 22 bodies, in seven families, in dependency order:
 //   the WALK      `skipQuotedName` (private) · `tyGtIsClose` · `tyTopIndexOf` ·
 //                 `tyGroupEndIndex`
+//   GROUP INNER   `groupInnerOf` — the ONE cut every delimiter shares
 //   PAREN         `nameIsFuncTypeAtom` · `parenEnclosesWhole` · `nameIsParenOpen` ·
 //                 `nameIsParenSpanEnds` · `peelGroupParens`
 //   ARRAY         `nameIsArray` · `arrElemNameRaw` · `listElemNameOf`
@@ -238,6 +248,50 @@ export function tyGroupEndIndex(name: string, from: i32) {
   -1
 }
 
+// ── the GROUP-INTERIOR cut: ONE cut, and it is deliberately DELIMITER-BLIND ────────────
+//
+// THE ONE HOME of the group-interior peel: `name` minus its FIRST and LAST characters —
+// the body of a one-character-delimited group. `{x:i32}` → `x:i32`, `(i32|null)` →
+// `i32|null`, `"a"` → `a`. `""` for a name too short to have an interior.
+//
+// **THIS IS THE "TEST HALF HOMED, CUT HALF NOT" SHAPE, FOR THE THIRD TIME.** The array
+// grammar had it (D-ARRELEM: `nameIsArray` was homed, the `[]` cut was written out nine
+// times), the map grammar had it (D-MAPSPELL), and this file already owns every SPAN TEST
+// of the group family — `nameIsParenSpanEnds`, `nameIsBraceSpanEnds`, `nameIsMapSpanEnds`
+// — and, until this line, no interior CUT at all. Censused structurally over
+// comment-stripped source, `X.slice(1, X.length - 1)` is written out **18 times tree-wide**
+// (`emit_base` 3, `emit_classify` 10, `emit_collect` 2, `typecheck` 4 — including this
+// file's own `peelGroupParens` and `listElemNameOf`, which are routed below), which makes
+// it the largest single duplicated operation in the compiler's type-name work.
+//
+// **IT CARRIES NO ENDPOINT TEST, AND THAT IS THE DESIGN, NOT AN OMISSION.** The array cut
+// could fold its test in (`arrElemNameRaw` gates on `nameIsArray`) because the array
+// grammar has exactly ONE test. This cut serves THREE delimiters and the routed sites do
+// not agree on which one they want in front of it: three ask `nameIsParenSpanEnds`, four
+// ask `nameIsShapeSpanEnds`, one asks the bare `nameIsShapeOpen` — and three are gated by
+// their CALLER instead. A cut that folded in any one of those would be wrong for the other
+// two, and a cut that folded in the DISJUNCTION would be wider than every site. So the
+// test stays at the call site, exactly as `nameIsParenSpanEnds` carries no balance walk
+// for the same reason (its header records the six sites such a widening would have
+// tightened).
+//
+// **THE `< 2` BOUND IS NOT A NARROWING — IT IS THE SLICE'S OWN ANSWER, MEASURED.** VL's
+// `.slice` clamps rather than traps, so `"{".slice(1, 0)` and `"".slice(1, -1)` both
+// evaluate to `""` (verified by running both). This home therefore agrees with the raw
+// expression on EVERY input, not merely on every input reachable at the routed sites —
+// which is what lets the routing be justified by the operation instead of by eighteen
+// separate reachability arguments. The bound is kept anyway: it states the contract, and
+// it is the same `length >= 2` all three span tests above already spell.
+//
+// (The cut is BOUND rather than left as the trailing expression: a bare member-call
+// statement is not a lowerable form — `emitProgram: unsupported member-call statement` —
+// the same reason `arrElemNameRaw` binds its slice.)
+export function groupInnerOf(name: string) {
+  if name.length < 2 { return "" }
+  const inner = name.slice(1, name.length - 1)
+  inner
+}
+
 // True if the type-name `name` is a FUNCTION type (`() => i64`, `(i32) => i32`) — a
 // TOP-LEVEL `=>` (parens/braces/brackets balanced). A value-union member that is a
 // closure rides the box's anyref `value` as the closure fat-pointer struct (a
@@ -345,8 +399,10 @@ export function peelGroupParens(nameIn: string) {
   // home enforces both — it can only answer true when two distinct characters are `(` and
   // `)` — so the contract survives the routing intact. The walk stays a separate conjunct
   // because the OTHER walk-carrying site (`emit_base.normTypeAtom`) rides a DIFFERENT walk.
+  // The GROUP-INTERIOR cut at its home (`groupInnerOf`) — the SPAN test above is the guard
+  // this cut deliberately does not carry, so the pair reads exactly as it did inline.
   while nameIsParenSpanEnds(name) && parenEnclosesWhole(name) {
-    name = name.slice(1, name.length - 1)
+    name = groupInnerOf(name)
   }
   name
 }
@@ -426,7 +482,7 @@ export function arrElemNameRaw(name: string) {
 export function listElemNameOf(name: string) {
   let elem = arrElemNameRaw(name)
   if elem == "" { return "" }
-  if nameIsParenSpanEnds(elem) { elem = elem.slice(1, elem.length - 1) }
+  if nameIsParenSpanEnds(elem) { elem = groupInnerOf(elem) }
   elem
 }
 

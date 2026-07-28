@@ -29506,3 +29506,224 @@ The HEAD is deliberately not canon'd: it names a generic alias DECLARATION and t
 registry is keyed by that declared name. Corpus A/B on six channels: 2 of 1,544 files differ, both
 on emitted BYTES only with identical check/build/run outcomes — and both got SMALLER, which is the
 expected shape of two spellings of one type collapsing onto one intern key.
+## D-GROUPINNER + D-ARRRAWCLASS — the group-interior CUT gets a home and `emit_classify`'s ten copies route to it; and the `arrElemNameRaw` copies in that file are FOUR, not the census's two (off master `381cd51`)
+
+Two families from the #1239 discovery census, both restricted to `compiler/emit_classify.vl` (the
+`emit_base` / `emit_collect` / `typecheck` shares are a follow-up slice — those files were owned by
+other agents while this ran):
+
+* **W1, the GROUP-INTERIOR peel** — `X.slice(1, X.length - 1)`, the census's largest family.
+  Diagnosis to verify: `tyname.vl` owns every SPAN TEST of the group family
+  (`nameIsParenSpanEnds`, `nameIsBraceSpanEnds`, `nameIsMapSpanEnds`) and **no interior CUT** — the
+  "test half homed, cut half not" shape D-ARRELEM found for the array grammar and D-MAPSPELL for
+  the map one. Answer: a new `groupInnerOf(name)` in the leaf, and `emit_classify`'s share routed.
+* **W5, `arrElemNameRaw` written out by hand** — `X.slice(0, X.length - 2)`, "literally the body of
+  a home the file already imports".
+
+Plus a correction to `tyname.vl`'s own header, which still drew the re-export chain #1236 deleted.
+
+### THE SITE LISTS, RE-DERIVED — AND BOTH DISAGREE WITH THE CENSUS
+
+**W1 is TEN sites in `emit_classify`, not nine.** The census's list —
+`rlElemCloSigKey` · `cloArrSlotRetName` · `shapeFieldParse` · `funcTypeShapeLowerable` ·
+`variantNestedShapeOk` · `internNonLowerableFieldShapes` · `internShapeFieldElems` ·
+`internInlineShape` · `internShapeAs` — is right as far as it goes and **misses
+`rlCanonLitUnionAtoms`**, which spells the identical operation against a HOISTED length
+(`const n = name.length` four lines up, then `name.slice(1, n - 1)`). The census's own COPIES table
+shows why and is self-consistent about it: it normalises the RECEIVER but not the length
+EXPRESSION, so that writing landed in a separate two-copy row (`X.slice(1, n - 1)`, `emit_base` +
+`emit_classify`) instead of in W1's eighteen. **The 38-copies headline is unaffected — both rows
+are counted — but the per-family worklist under-states W1 by two, and a routing slice reads the
+worklist.**
+
+**W5 is FOUR sites in `emit_classify`, not two.** The census names `gaeEnsure` and
+`unionListElemMapFieldMember`. `internInlineShape` writes the same cut twice more — once in its
+code-5 (ref-list field) arm and once in its code-28 (nullable-ref-list field) arm. The miss is
+explainable rather than random, and the explanation is a limit of the instrument worth recording:
+the establishment fixpoint is **variable-rooted**, and
+
+* the code-5 receiver is an ARRAY-ELEMENT READ (`texts[pi].slice(0, texts[pi].length - 2)`), not a
+  variable; and
+* the code-28 operand is bound from `nullablePartOf(...)`, and `nullablePartOf` is not in seed rule
+  **S3**'s list of CUT homes (`arrElemNameRaw`, `peelGroupParens`, `listElemNameOf`,
+  `mapSpellKeyName`, `mapSpellValName`, `mapValNameOf`). It is a cut of a spelling by S3's own
+  definition and would establish its result if it were listed.
+
+`emit_classify`'s W5 debt was therefore 100% under-counted, and the fix to the instrument is one
+entry in one list plus an index-expression root.
+
+### W5 — THE PER-SITE EQUIVALENCE ARGUMENT, WHICH IS THE WHOLE JOB
+
+`arrElemNameRaw` is not the same expression as the copies: it **guards on `nameIsArray` and answers
+`""`** where the copies slice blind or fall through with the name intact. Substituting it is
+behaviour-preserving only where that guard is discharged. All four discharge, and the prediction
+made BEFORE building was "behaviour-preserving at all four; expect corpus-inert".
+
+| site | guard the copy carried | discharge |
+|---|---|---|
+| `gaeEnsure`, code-5 arm | **none at all** | `code == 5` comes only from `nameFieldCode` → `fieldCodeOfSpelling`, whose **single** `return 5` sits inside `if nameIsArray(t) { … }` (the scalar-element kinds 4/6/25/26/27 take that same block's other exits). `nameIsArray(tn)` HOLDS. |
+| `internInlineShape`, code-5 arm | none | same ladder. `codes[pi] == 5` implies `nameFieldCode(texts[pi]) == 5`; code and text are pushed in the same loop iteration, and the only reassignment of either is the `fc < 0` → 15 arm above. |
+| `internInlineShape`, code-28 arm | `raw28.length > 2` | `return 28` is `if nameIsNulRefList(t)`, which IS `nameIsRefArray(nullablePartOf(t))` — the very value the site binds — and `nameIsRefArray` implies `nameIsArray`. |
+| `unionListElemMapFieldMember` | `a.length > 2` | the enclosing arm is `nameIsRefArray(a)`, and **every** path by which it answers true establishes `nameIsArray(a)`: the `nameIsElemArray` leg spells it; inside `refArrShapeKind` the `string[][]` and nested-ref arms spell it, the f64/i64/f32 arms gate on a non-empty `arrElemNameRaw`, and `nameIsI32ListArray` / `nameIsMapArray` / `nameIsClosureArray` / `parenUnionArrElemName` each spell it or gate on it. |
+
+**`nameIsArray` is `length >= 2`, so the two `length > 2` conjuncts differ from it on exactly one
+name — the degenerate `"[]"` — and `nameIsRefArray("[]")` is false** (every arm either needs a
+non-empty raw element or a length the name does not have). The conjuncts are IMPLIED, not weakened.
+And even where they were not, the two forms would still agree: `arrElemNameRaw` answers `""` for a
+non-array and for `"[]"` alike, which is exactly what the guarded `if` left the variable as at
+three of the four sites.
+
+**The fourth is the one that WOULD have diverged, and naming it is the reason this is not a textual
+substitution.** `internInlineShape`'s code-28 arm did not leave its variable empty when the cut
+declined — it left it at the FULL nullable-part name and looked THAT up in `structIndexByName`. Had
+the guard not been dischargeable, routing it would have turned a `structIndexByName("S[]")` into a
+`structIndexByName("")`. The discharge is what makes the routing legal there; the shape of the
+expression is not.
+
+**Verdict: all four are ROUTINGS. None is a latent bug fix, none is a regression, and no fixture is
+warranted** — a fixture pins a behaviour change, and the behaviour change here is empty by proof
+rather than by sampling.
+
+### W1 — THE CUT IS DELIMITER-BLIND, AND THE CALL SITES ARE WHY
+
+The obvious design — fold the span test into the cut, as `arrElemNameRaw` folds in `nameIsArray` —
+is wrong here, and the SITES say so rather than a style argument. Over the ten routed sites the
+guard in front of the cut is:
+
+| guard | sites |
+|---|---|
+| `nameIsParenSpanEnds`, in the body | `rlElemCloSigKey` · `cloArrSlotRetName` · `rlCanonLitUnionAtoms` |
+| `nameIsShapeSpanEnds`, in the body | `funcTypeShapeLowerable` · `variantNestedShapeOk` · `internInlineShape` |
+| `nameIsShapeOpen` — an OPEN test, **no closing character at all** | `shapeFieldParse` |
+| gated by the CALLER, not in the body | `internNonLowerableFieldShapes` · `internShapeFieldElems` (both under `internFuncTypeShapes`' `nameIsShapeSpanEnds`) · `internShapeAs` (under `emit_collect`'s `unionStructAliasShape`, which returns only names that passed `nameIsShapeSpanEnds`) |
+
+and one hop outside the partition `emit_base.normTypeAtom` gates on the balance WALK
+`tyGroupWrapsWhole` — a fourth shape again. **A cut folding in any one of those is wrong for the
+others; a cut folding in the disjunction is wider than every site.** So the home carries the
+`length >= 2` bound and nothing else, exactly as `nameIsParenSpanEnds` carries no balance walk for
+the reason its own header records.
+
+**AND THE `< 2` BOUND IS NOT EVEN A NARROWING — MEASURED, NOT ASSUMED.** VL's `.slice` CLAMPS
+rather than traps: `"{".slice(1, 0)` and `"".slice(1, -1)` both evaluate to `""` (run, not
+reasoned). So `groupInnerOf` agrees with the raw expression on **every** input, not merely on every
+input the routed sites can reach. That matters at exactly one site: `shapeFieldParse` guards on
+`nameIsShapeOpen(name)` but CUTS `spacelessName(name)`, so a hypothetical `"{ "` would arrive with
+the operand one character long. It is the one place a reachability argument would have been needed,
+and it is not needed.
+
+The home's own module was routed too: `peelGroupParens` and `listElemNameOf` each wrote the cut out
+inline, so the file that DECLARES the grammar no longer spells it twice more.
+
+**Tree-wide re-census of the family, counting only TYPE operands** (a string-LITERAL lexeme peel in
+`parser.vl` / `format.vl` / `typecheck`'s `mkLitTy` calls is the same three characters of arithmetic
+on a different language and is NOT this): **22 writings before this slice** — `emit_classify` 10,
+`emit_base` 4, `typecheck` 4, `emit_collect` 2, `tyname` 2. That reconciles with the census exactly:
+18 (its W1 row) + 2 (its `slice(1, n - 1)` row) + 2 HOME-column writings inside the leaf.
+
+### THE ROUTE LIST IS RESOLVER-ENFORCED, NOT GREPPED
+
+`grep` finds what it is asked for, and the census's own miss is the argument for not trusting it.
+Two resolver runs, both taken bare:
+
+1. **Unexport `groupInnerOf` in `tyname.vl`, rebuild.** `refresh-compiler.sh` exits 1 naming
+   `emit_classify.vl:29` — the ONE consumer module. No other module had silently started depending
+   on it.
+2. **Restore the export, DELETE the import entry from `emit_classify.vl`, rebuild.** The build names
+   **exactly ten call sites**: `4901 · 6760 · 8214 · 10761 · 11605 · 11670 · 11774 · 11805 · 11836 ·
+   11989`. That is the re-derived list, enumerated by the compiler rather than by a pattern — and it
+   is the instrument that turns the census's nine into ten.
+
+**The two runs answer different questions and only the second is a census.** Unexporting names the
+consuming MODULES; un-IMPORTING names the consuming CALL SITES.
+
+### INERTNESS — TWO ORTHOGONAL INSTRUMENTS, BOTH RUN
+
+The record has observed corpus-0-while-codegen-moved AND frozen-identical-while-corpus-moved, so
+neither dominates and both are run.
+
+| instrument | reading |
+|---|---|
+| **frozen-source rebuild** — master's `compiler/*.vl` compiled by THIS branch's compiler | **BYTE-IDENTICAL to master's own output**, 1,042,874 B, sha256 `bc125959faccf530c195b7917523c163f252bfdbd4838e85bc989af46cef56b9`. The candidate compiler and master's compiler are the same function on the largest program in the tree. |
+| **six-channel corpus A/B**, 1,543 files (`tests/cases` + `std` + `scripts`) | **0 diffs on all six channels** (CHECKRC · CHECKMSG · BUILDRC · BUILDMSG · BYTES · RUN). |
+| **six-channel fuzz A/B**, 115,200 generated programs | **0 diffs on all six channels.** |
+
+**The compiler's own binary is 1,040,963 B against master's 1,042,874 — a delta of −1,911 B.** That
+is an order of magnitude larger than this programme's usual de-duplication deltas (−19, +18, −235,
++49, −314, −428, −21, −197, −26, −27) for fourteen routed sites, and the extra is not in the routing
+arithmetic. **Split by building the W1-only intermediate** (the state of the second commit):
+1,042,874 → 1,041,520 → 1,040,963, i.e. **−1,354 for W1's ten sites and −557 for W5's four** — 135 B
+and 139 B per site, which is far more than the routing arithmetic and is remarkably even across two
+unrelated families. Candidate cause, offered as an observation and not as a claim: replacing an
+inline `.slice` with a CALL removes a string-valued temporary from the enclosing function, and a
+function that loses its last one loses a scratch-frame reservation as well — the same accounting
+#1240 was working in. The number carrying the correctness weight is the frozen rebuild, and it is 0.
+
+### THE CALIBRATION — TWO SABOTAGES OF DIFFERENT SHAPES, BOTH NON-EMPTY
+
+One sabotage is not a calibration: the record holds a `tyname.vl` sabotage that moved the compiler
+20 bytes and reddened **0 of 1,532** corpus files on all six channels — an empty witness set, not a
+blind harness. Two were built here, deliberately at different layers.
+
+| # | shape | what it changes | corpus reading (of 1,543) |
+|---|---|---|---|
+| **S1** | **the HOME** | `groupInnerOf` keeps the final character (`slice(1, name.length)`) | **243 BUILDRC(0/1) · 311 BUILDMSG · 65 BYTES · 242 RUNRC** |
+| **S2** | **the CALL SITES**, a different family | all four routed W5 sites append `"#"` to the element name | **6 BUILDRC(0/1) · 6 BUILDMSG · 0 BYTES · 6 RUNRC** — five `tests/cases/generics/*` plus `closures/nulstruct-elem-array-field-closure-result.vl` |
+
+Both non-empty, so **both routed regions have a live witness population** and the 0/1,543 above is
+agreement rather than blindness. S2 is the more informative: it says W5's four sites are reached by
+only SIX corpus files, which is exactly the thin population that would make a "0 diffs" reading on
+W5 alone uninformative — and is why the W5 case above is carried by the discharge proof rather than
+by the A/B.
+
+**S1 moved BYTES on 65 files where S2 moved 0**, which is the six-channel design paying off in
+miniature: field 5 is not reached by a call-site poison that only changes a NAME (and so a
+clean-reject verdict), while a home break that changes emitted structure lights it up. Two
+sabotages, different channels.
+
+### GATE — every exit code taken BARE (`cmd > log 2>&1; rc=$?`), from a FRESHLY FETCHED seed
+
+| leg | rc | reading |
+|---|---:|---|
+| `rm -f build/vl-compiler.wasm && fetch-seed.sh` | 0 | 1,042,874 B published seed |
+| `refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint in 2 compiles, **1,040,963 B** |
+| `native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,254 passed / 0 failed / 8 ignored** — master's exact reading. The 8: `lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/README` · `soundness/literal-is-union-param-dispatch` · `soundness/xfail-array-element-recursion` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`. (14 would have meant a missing `node_modules`.) |
+| `lint-self.sh` (incl. `vl fmt --check`) | 0 | clean |
+| `rep-fuzz-check.sh` | 0 | exact — 1 baselined failure, 0 new, 0 stale |
+| corpus A/B (6 channels, 1,543 files) | 0 | 0 diffs |
+| fuzz A/B (6 channels, 115,200 programs) | 0 | 0 diffs |
+| **frozen-source rebuild `cmp`** | **0** | **byte-identical to master's own output** |
+
+### WHAT THIS SLICE FOUND WRONG
+
+1. **W1's `emit_classify` share is 10 sites, not 9** — `rlCanonLitUnionAtoms` hoists the length and
+   fell into a different normalised-operation row. Resolver-confirmed.
+2. **W5 is 4 sites in `emit_classify`, not 2** — `internInlineShape` writes the cut twice more, in
+   its code-5 and code-28 arms. The instrument's establishment fixpoint is variable-rooted (so an
+   `a[i].slice(…)` receiver never seeds) and its S3 cut-home list omits `nullablePartOf`.
+3. **`tyname.vl`'s header was stale in the way headers go stale — it described a COST that no longer
+   exists.** It drew `tyname ← typecheck ← emit_base ← emit_classify` and said consumers pay "up to
+   THREE re-export hops"; #1236 deleted both republishing lines. Zero hops, nine direct importers.
+   Corrected in place, together with the point the census makes and the header did not: **nine is
+   the IMPORT set, not the set that needs the grammar** — `wasmEmit.vl` does type-name character
+   work and does not import the leaf.
+4. **A one-character-delimited-group cut is NOT the same shape as the array cut, and the difference
+   is the guard.** The array grammar has ONE test, so its cut can own it; this one serves three
+   delimiters over four distinct guard spellings, so its cut can own none. The generalisation "a
+   grammar's TEST and CUT belong together" — true for D-ARRELEM and D-MAPSPELL — does not survive
+   contact with a family whose test is polymorphic. Stated so the next slice designing a cut asks
+   the sites first.
+
+### LESSONS
+
+* **A census's normalisation is a measurement instrument and it has a RESOLUTION.** Abstracting the
+  receiver but not the length expression split one operation across two rows. The overlap-free
+  COPIES total survived intact; the per-family worklist did not — and the worklist is what a routing
+  slice reads.
+* **Unexport, then un-IMPORT.** Two different censuses out of the same resolver: modules, then call
+  sites. The second found the site the pattern-match and the published census both missed.
+* **When a cut is behaviourally identical to the expression it replaces on EVERY input, say so and
+  stop arguing reachability.** The `.slice`-clamp check cost one two-line program and retired ten
+  separate "can this operand be short here" questions. The W5 sites still needed their reachability
+  arguments, because `arrElemNameRaw`'s guard genuinely changes the answer — which is exactly the
+  line between the two families in this slice.

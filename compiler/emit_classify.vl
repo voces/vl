@@ -26,6 +26,7 @@ import {
   annGenAppSpanEnds,
   arrElemNameRaw,
   gaeLtAt,
+  groupInnerOf,
   nameIsArray,
   nameIsBraceSpanEnds,
   nameIsFuncTypeAtom,
@@ -4886,16 +4887,19 @@ export function rlElemCloSigKey(slot: i32): string {
   const ar = rlElemCloSigKeyAt(slot)
   if ar != "" { return ar }
   const nm = nonNulBaseOf(rlElemName[slot])
-  // The grouping-paren SPAN is `emit_base.nameIsParenSpanEnds` (first char `(`, last char
+  // The grouping-paren SPAN is `tyname.nameIsParenSpanEnds` (first char `(`, last char
   // `)`, NO balance walk). The `nm.length < 2` early return this replaced is IMPLIED by the
   // home, not dropped: on a one-character name `nm[0]` and `nm[nm.length - 1]` are the SAME
   // character and no character is both `(` and `)`, so both readings decline — and the
-  // `slice(1, nm.length - 1)` below is unreachable for any name the home admits.
+  // interior cut below is unreachable for any name the home admits.
   // Deliberately NOT the balanced walk (`peelGroupParens` / `normTypeAtom`): widening the
   // span here would re-key a `(a)|(b)`-shaped element, which the home's header records as
   // the reason it carries none.
   if !nameIsParenSpanEnds(nm) { return "" }
-  annSigKey(nm.slice(1, nm.length - 1))
+  // …and the CUT that pairs with it is `tyname.groupInnerOf`, the delimiter-blind home
+  // (W1). The span test stays in FRONT of it because the cut carries no endpoint test —
+  // this site wants the PAREN span and the shape sites below want the BRACE one.
+  annSigKey(groupInnerOf(nm))
 }
 
 // The mv slot of a MAP-element ref-list slot's inner VALUE — the arena reading of
@@ -6746,14 +6750,15 @@ export function cloArrSlotRetName(slot: i32) {
   // A NULLABLE-closure element slot: peel the `| null` (the call classifies on the
   // narrowed non-null closure), mirroring `cloArrSlotSigKey`.
   nm = nonNulBaseOf(nm)
-  // The grouping-paren SPAN home (`emit_base.nameIsParenSpanEnds`), exactly as in
-  // `rlElemCloSigKey` above — same two endpoint compares, same implied `length >= 2`, and
-  // the same deliberate absence of a balance walk.
+  // The grouping-paren SPAN home (`tyname.nameIsParenSpanEnds`) then the GROUP-INTERIOR cut
+  // home (`tyname.groupInnerOf`), exactly as in `rlElemCloSigKey` above — same two endpoint
+  // compares, same implied `length >= 2`, the same deliberate absence of a balance walk,
+  // and the same test-in-front-of-cut pairing.
   if !nameIsParenSpanEnds(nm) { return "" }
   // `annRetNameOf` (#1144) IS this `annArrowAt`-then-slice pair. Its gate is `< 1` where
   // this copy spelled `< 0`; the two differ only for an arrow at index 0, i.e. a name
   // BEGINNING `=>`, which no renderer produces (the home's own header argues this).
-  return annRetNameOf(nm.slice(1, nm.length - 1))
+  return annRetNameOf(groupInnerOf(nm))
 }
 
 // The wide-SCALAR coercion kind of parameter `idx` read from a `$fnsig` KEY's param-token
@@ -8200,7 +8205,14 @@ function shapeFieldParse(name: string, outNames: string[], outTypes: string[]) {
   if nameIsShapeOpen(name) {
     const flat = spacelessName(name)
     const parts: string[] = []
-    tyTopLevelSplit(flat.slice(1, flat.length - 1), ',', false, parts)
+    // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1). This is the ONE routed
+    // site whose span test does NOT establish the home's `length >= 2` bound on the cut's
+    // own operand: the guard is `nameIsShapeOpen(name)` (an OPEN test, no closing `}`), and
+    // the cut runs on `flat`, the DESPACED name — so a hypothetical `"{ "` reaches here with
+    // `flat == "{"`. It does not matter: VL's `.slice` clamps, so `"{".slice(1, 0)` is `""`
+    // and the home returns `""` too. Same answer, and it is the same answer on every input
+    // rather than on every input this site can reach.
+    tyTopLevelSplit(groupInnerOf(flat), ',', false, parts)
     let k = 0
     while k < parts.length {
       const part = parts[k]
@@ -10738,11 +10750,16 @@ function rlCanonLitUnionAtoms(name: string): string {
   // inner is a function type (`((i32) => K0)` — a GROUPED closure element, whose grouping
   // parens are part of its ref-list slot key; stripping them re-keys the slot, and its
   // `=>`-result litunion is not a slot-key union anyway). Leave such a name untouched.
-  // (`emit_base.nameIsParenSpanEnds` — the endpoint span, no balance walk. This site
+  // (`tyname.nameIsParenSpanEnds` — the endpoint span, no balance walk. This site
   // bounds only `n >= 1` (the `n == 0` early return above); the home's `length >= 1` IS
   // that bound, so the routing is exact on every input including the one-character name.)
+  // The interior is `tyname.groupInnerOf` (W1). This site spelled the cut `slice(1, n - 1)`
+  // against a HOISTED length rather than `slice(1, name.length - 1)`, which is why the
+  // #1239 census scored it as a different normalised operation and left it out of W1's
+  // `emit_classify` list — `n` is `name.length`, bound four lines up and never reassigned,
+  // so it is the same operation and the same eighteen-copy family.
   if nameIsParenSpanEnds(name) {
-    const inner = name.slice(1, n - 1)
+    const inner = groupInnerOf(name)
     if isTopLevelFuncTypeName(inner) { return name }
     return rlCanonLitUnionAtoms(inner)
   }
@@ -11565,11 +11582,28 @@ function structElemArrayLowerable(t: string): boolean {
 // A STRUCT-element list field (`{f: {g: f64}[]}` / `{f: S[]}`) is likewise lowerable
 // when its element is (`structElemArrayLowerable`) — the element shape pre-interns in
 // `internFuncTypeShapes` and the slot rides the same code-5 field pass.
+//
+// ── THE SHAPE-BODY CUT, ONCE, FOR ALL SIX SPLITTERS BELOW (W1) ───────────────────────
+// This function and the five under it (`variantNestedShapeOk`,
+// `internNonLowerableFieldShapes`, `internShapeFieldElems`, `internInlineShape`,
+// `internShapeAs`) each opened with the SAME three lines: two out-arrays and
+// `shapeInnerFieldSplit(nm.slice(1, nm.length - 1), …)`. The split has had a home since
+// #1147; the CUT it is fed did not, and six identical spellings of it is how a grammar
+// drifts. The cut is now `tyname.groupInnerOf`.
+//
+// THE SIX DO NOT AGREE ON THE GUARD, WHICH IS WHY THE CUT CARRIES NONE. Three test
+// `nameIsShapeSpanEnds(nm)` themselves (here, `variantNestedShapeOk`, `internInlineShape`);
+// `internNonLowerableFieldShapes` and `internShapeFieldElems` are reached only under
+// `internFuncTypeShapes`' own `nameIsShapeSpanEnds` gate; and `internShapeAs` is gated by
+// its ONE caller (`emit_collect`'s `unionStructAliasShape`, which returns only names that
+// passed `nameIsShapeSpanEnds`). All six therefore establish `length >= 2` — but they
+// establish it in three different places, so folding the test into the cut would put it
+// where two of the six cannot see it and would double it for the other four.
 export function funcTypeShapeLowerable(nm: string): boolean {
   if !nameIsShapeSpanEnds(nm) { return false }
   const fnames: string[] = []
   const ftexts: string[] = []
-  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
   let okAll = true
   let fieldCount = 0
   let fi = 0
@@ -11634,7 +11668,7 @@ export function variantNestedShapeOk(nm: string): boolean {
   if !nameIsShapeSpanEnds(nm) { return false }
   const fnames: string[] = []
   const ftexts: string[] = []
-  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
   let okAll = true
   let fieldCount = 0
   let fi = 0
@@ -11738,7 +11772,7 @@ function internFuncTypeShapes(nm: string): i32 {
 function internNonLowerableFieldShapes(nm: string) {
   const fnames: string[] = []
   const ftexts: string[] = []
-  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
   let fi = 0
   while fi < fnames.length {
     if fnames[fi] != "" {
@@ -11769,7 +11803,7 @@ function internNonLowerableFieldShapes(nm: string) {
 function internShapeFieldElems(nm: string) {
   const fnames: string[] = []
   const ftexts: string[] = []
-  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), fnames, ftexts)
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
   let fi = 0
   while fi < fnames.length {
     if fnames[fi] != "" {
@@ -11800,7 +11834,7 @@ export function internInlineShape(nm: string) {
   // a code-15 nested field records its base shape).
   const rawNames: string[] = []
   const rawTexts: string[] = []
-  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), rawNames, rawTexts)
+  shapeInnerFieldSplit(groupInnerOf(nm), rawNames, rawTexts)
   const names: string[] = []
   const codes: i32[] = []
   const texts: string[] = []
@@ -11872,7 +11906,17 @@ export function internInlineShape(nm: string) {
       // `collectNestedFieldShapes` (interning mid-field-loop would corrupt the flat `sField*` arrays), so
       // here just key it by its stripped text. A nominal / union / scalar element keeps `refArrElemName`.
       if e5 == "" {
-        const raw5 = texts[pi].slice(0, texts[pi].length - 2)
+        // The trailing-`[]` CUT at its home (`tyname.arrElemNameRaw`, W5). **THE #1239
+        // CENSUS SCORED THIS FILE AT TWO HAND-WRITTEN COPIES OF THIS HOME AND THERE ARE
+        // FOUR** — this one and the code-28 arm below are the two it missed, and the miss
+        // is explainable rather than random: its establishment fixpoint roots at a
+        // VARIABLE, and this receiver is an array-element read (`texts[pi]`) while the
+        // other is bound from `nullablePartOf`, a cut that is not in the seed rule's home
+        // list. Same guard argument as the `gaeEnsure` site: `codes[pi] == 5` implies
+        // `nameFieldCode(texts[pi]) == 5` (the code and the text are pushed in the same
+        // iteration, and the only reassignment of either is the `fc < 0` → 15 arm above),
+        // and `fieldCodeOfSpelling`'s single `return 5` is inside `if nameIsArray(t)`.
+        const raw5 = arrElemNameRaw(texts[pi])
         if structIndexByName(raw5) >= 0 { e5 = raw5 }
         // A GROUPING-PAREN element spelling (`f: ({g: i32})[]` — the parens carry no
         // meaning; the source is free to write them). `refArrElemName` keys the
@@ -11896,8 +11940,19 @@ export function internInlineShape(nm: string) {
       // non-null part; the element shape/union was pre-interned in the parse loop (`internShapeDeep`).
       let e28 = refArrElemName(nullablePartOf(texts[pi]))
       if e28 == "" {
-        let raw28 = nullablePartOf(texts[pi])
-        if raw28.length > 2 { raw28 = raw28.slice(0, raw28.length - 2) }
+        // The same CUT home (`tyname.arrElemNameRaw`, W5), and the same discharge as the
+        // `unionListElemMapFieldMember` site: `codes[pi] == 28` is reachable only through
+        // `fieldCodeOfSpelling`'s single `return 28`, `if nameIsNulRefList(t)`, which IS
+        // `nameIsRefArray(nullablePartOf(t))` — the very value bound below — and
+        // `nameIsRefArray` implies `nameIsArray`. So the `raw28.length > 2` conjunct is
+        // implied and the guarded `if` collapses.
+        //
+        // THIS SITE'S FALL-THROUGH IS THE ONE THAT WOULD HAVE DIVERGED had the guard not
+        // been dischargeable: where the `[]` cut declines, master left `raw28` at its FULL
+        // value and looked THAT up in `structIndexByName`, whereas the home answers "".
+        // Recorded because the discharge is what makes the routing legal here, not the
+        // shape of the expression.
+        const raw28 = arrElemNameRaw(nullablePartOf(texts[pi]))
         if structIndexByName(raw28) >= 0 { e28 = raw28 }
       }
       sFieldElemName.push(e28)
@@ -11932,7 +11987,7 @@ export function internInlineShape(nm: string) {
 export function internShapeAs(key: string, nm: string) {
   const rawNames: string[] = []
   const rawTexts: string[] = []
-  shapeInnerFieldSplit(nm.slice(1, nm.length - 1), rawNames, rawTexts)
+  shapeInnerFieldSplit(groupInnerOf(nm), rawNames, rawTexts)
   const names: string[] = []
   const codes: i32[] = []
   let fi = 0
@@ -12082,7 +12137,16 @@ export function gaeEnsure(name: string) {
       // by `gaeApplyFieldTy`'s substitution (`Box<i32>[]` → element `Box<i32>`), a
       // name the canonicalizing recorder (`refArrElemName`) does not key. The one arm
       // this path does not share with the shape-text table.
-      elem = tn.slice(0, tn.length - 2)
+      //
+      // The trailing-`[]` CUT at its home (`tyname.arrElemNameRaw`, W5) — this line was
+      // the home's body, hand-written, in a file that already imports it. The home GUARDS
+      // on `nameIsArray` and answers "" where this spelling sliced blind, and that guard
+      // is DISCHARGED rather than assumed: `code == 5` is reachable only through
+      // `nameFieldCode` → `fieldCodeOfSpelling`, whose single `return 5` sits inside
+      // `if nameIsArray(t) { … }` (the scalar-element kinds 4/6/25/26/27 take the arm's
+      // other exits). So `nameIsArray(tn)` HOLDS at this line and the two forms compute
+      // the identical slice — a routing, not a widening.
+      elem = arrElemNameRaw(tn)
     } else if code >= 0 {
       // Codes 15 / 16 / 4 are recorded IDENTICALLY from the field's spelling, so the
       // shape-text table answers (D-ELEMHOME): the `| null`-stripped nested target,
@@ -13107,9 +13171,23 @@ export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
               if tyArmPathIsMap(tyArmElem(mems[i]), path) { return true }
             } else if nameIsRefArray(a) {
               // The arm's element struct: `refArrElemName` for a nominal element, the raw
-              // `[]`-stripped text for an inline shape it cannot see (the interner's key).
+              // `[]`-stripped text for an inline shape it cannot see (the interner's key) —
+              // the trailing-`[]` CUT at its home (`tyname.arrElemNameRaw`, W5).
+              //
+              // The `a.length > 2` conjunct this drops is NOT the home's `nameIsArray`
+              // guard, and it is discharged twice over. `nameIsRefArray(a)` is the enclosing
+              // arm, and EVERY path by which it answers true establishes `nameIsArray(a)`:
+              // its `nameIsElemArray` leg spells it, and every `refArrShapeKind` arm either
+              // spells it (`{…}[]` string / nested-ref) or gates on a home that does
+              // (`nameIsI32ListArray` / `nameIsMapArray` via a non-empty `arrElemNameRaw`;
+              // `nameIsClosureArray` / `parenUnionArrElemName` spell it outright). The only
+              // 2-character array name is the degenerate `"[]"`, and `nameIsRefArray("[]")`
+              // is false — so `a.length > 2` is IMPLIED here, not weakened. And even where
+              // it is not, the two forms still agree: `arrElemNameRaw` answers "" for a
+              // non-array and for `"[]"` alike, which is exactly what the guarded spelling
+              // left `en` as.
               let en = refArrElemName(a)
-              if en == "" && a.length > 2 { en = a.slice(0, a.length - 2) }
+              if en == "" { en = arrElemNameRaw(a) }
               const si = structIndexByName(en)
               if si >= 0 {
                 const fi = sFieldIndex(si, e.memProp)
