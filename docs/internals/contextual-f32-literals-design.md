@@ -189,11 +189,11 @@ nearest-even, exactly what `f32.convert_i32_s` computes.
 
 ---
 
-## 5. Two PRE-EXISTING defects the sweep turned up
+## 5. Three PRE-EXISTING defects the sweep turned up
 
-Both reproduced on master before being fixed here. Neither is caused by the feature;
-both were found by widening the grid, and both had to be fixed because the new grant
-routes far more literals through the affected code.
+All three reproduced on master before being fixed here. None is caused by the feature; all
+were found by widening the grid, and each had to be fixed because the new grant routes far
+more literals through the affected code.
 
 ### (i) A radix literal in a FLOAT context was a silent wrong value
 
@@ -231,6 +231,32 @@ The two spellings that WORKED localize it exactly: `i64 | null = 1` took the tau
 and `f64 | null = 1.0` classifies as a float up the ladder and never reaches the default.
 Both are controls in the pin: `tests/cases/unions/nullable-float-integer-literal.vl`.
 
+### (iii) A doubly-signed literal in an f32 context was invalid wasm
+
+```vl
+const x: f32 = -(-1.5)      // WebAssembly translation error
+const x: f32 = -(-(-1.5))   // the same
+```
+
+`vl check` clean; the f64 twins ran fine.
+
+This is the defect shape the whole family keeps taking: **the checker granted more shapes
+than the emitter could lower.** `isFloatLitExpr` recurses through unary minus when deciding
+that an expression is a literal eligible for the f32 context; `emitExprAsF32` matched
+exactly ONE minus. So a doubly-signed literal was admitted by the checker, not recognized as
+a literal by the emitter, and lowered through the f64 path into an f32 slot.
+
+It was found by an **edge sweep run after the main grids were already green** — worth
+recording, because the three position grids all passed while this sat one syntactic step
+outside every one of them.
+
+The integer twin is why it had to be fixed rather than noted: without it the P2 grant would
+have turned `const x: f32 = -(-1)` from a clean type-error reject on master into invalid
+wasm — a regression in failure MODE, which is not shippable even for a program that was
+never valid. Both sides now share one peel, `signedNumLitText`, which folds any number of
+signs into the literal's text. Pin:
+`tests/cases/numerics/f32-nested-sign-literal.vl`.
+
 ---
 
 ## 6. Evidence
@@ -239,24 +265,36 @@ Both are controls in the pin: `tests/cases/unions/nullable-float-integer-literal
 | --- | --- |
 | fixpoint | `compile(next) == next` at 2 compiles, from a freshly fetched published seed |
 | native-fixpoint | stage3 == stage4 byte-for-byte |
-| suite (`SELFHOST_NATIVE_ALIGN=1`) | **3478 / 0 / 8** (master 3466 / 0 / 8; +12 = 6 new fixtures × 2 tiers), ignored SET unchanged |
+| suite (`SELFHOST_NATIVE_ALIGN=1`) | **3480 / 0 / 8** (master 3466 / 0 / 8; +14 = 7 new fixtures × 2 tiers), ignored SET unchanged |
 | lint-self + fmt-check | clean |
 | rep-fuzz-check | exact, 1 baselined failure, 0 new / 0 stale |
-| corpus A/B (6 channels, 1,656 files) | **1 pre-existing file** differs, +2 bytes, all 18 of its logged values identical — the `i32.const 7; f32.convert_i32_s` → `f32.const 7.0` swap, confirmed at the byte level |
-| compiler byte delta | +1,155 B |
+| corpus A/B (6 channels, 1,657 files) | **1 pre-existing file** differs, +2 bytes, all 18 of its logged values identical — the `i32.const 7; f32.convert_i32_s` → `f32.const 7.0` swap, confirmed at the byte level |
+| compiler byte delta | +1,126 B |
 
 ### The fuzz channel reads zero, and that zero is VACUOUS — do not bank it
 
-25,200 programs/side, shapes identical, zero `.vl` divergences (the only `.err`
-differences are the mktemp path). A **sabotage reach probe** establishes why: corrupting
-the changed `emitExprAsF32` literal arm so it emits a wrong constant moves **0** fuzz
-programs, because `scripts/fuzzgen.vl` builds float leaves from half-representable
-`.` literals and never puts a bare INTEGER literal in an f32 position. The generator
-cannot reach this code.
+25,200 programs/side, shapes identical in both batches, zero `.vl` divergences (the only
+`.err` differences are the mktemp path).
 
-So the fuzz zero is an empty divergence population, not evidence of inertness — exactly the
-null calibration recorded in the project's method notes. The load-bearing channels for this
-change are the three grids, the corpus A/B and the pins.
+That zero means nothing on its own, so it was calibrated with **two** sabotages on the same
+harness — one calibration is not a calibration:
+
+| probe | sabotage | grid witnesses | fuzz vs baseline |
+| --- | --- | --- | --- |
+| **P1** (null) | `intLexemeIsExactF32` always false — the P2 grant switched OFF | **40** | **IDENTICAL** (36 shapes / 3,600, same set) |
+| **P2** (positive control) | `emitExprAsF32` emits `f32.const 99` for every literal | 30 | **405** shapes / 3,600 — **369 new MISMATCHes**, every one f32-shaped |
+
+P2 proves the harness is live and reaches `emitExprAsF32`'s literal arm heavily, so P1's
+zero is not a broken instrument. P1 proves the fuzz still cannot see the feature even with
+it fully disabled and 40 grid cells visibly moving.
+
+The mechanism is structural and checkable in the generator: `scripts/fuzzgen.vl`'s f32 leaf
+always builds `d + ".0"` or `d + ".5"` — a `.` literal — and never a bare INTEGER in an f32
+position, nor more than one leading sign. So the generator cannot produce a program this
+change affects.
+
+**The fuzz zero is an empty divergence population, not evidence of inertness.** The
+load-bearing channels here are the three grids, the edge sweep, the corpus A/B and the pins.
 
 ---
 
