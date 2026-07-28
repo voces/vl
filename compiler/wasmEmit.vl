@@ -356,6 +356,7 @@ import {
   captureNamesOf,
   cbRetVariantIdx,
   cloCallParamLitUnion,
+  cloCallParamUnionName,
   cloCallReflistElemTwin,
   cloCallSigKey,
   cloCallUnionResultUnrepresentable,
@@ -540,6 +541,7 @@ import {
   setNarrowFromCond,
   setNarrowFromCondElse,
   sigParamCoerceKind,
+  sigParamKindAt,
   stmtIsTailValue,
   structIndexOfExpr,
   structIndexOfObj,
@@ -8928,7 +8930,40 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
         // token is `i`, identical to a plain i32's — measured), so it comes from the callee's
         // checker type: `cloCallParamLitUnion`.
         const clu = cloCallParamLitUnion(callIx, i)
-        if clu == 0 {
+        // The value-UNION param position — the box (`u`), and the third seed this arm never
+        // had while `emitCall` has carried it (`cUNm` → `emitUnionBoxArg`). The KIND is read
+        // off the resolved `$fnsig` KEY (`sigParamKindAt`), which is the byte the `ref.cast`
+        // functype actually declares for this parameter, so the coercion cannot disagree with
+        // the bytes; the union's IDENTITY — slot-free in the ABI on purpose, since all boxes
+        // share one valtype — comes from the checker type (`cloCallParamUnionName`). Without
+        // it `const f: (string | i64) => i32 = mk` + `f("a")` pushed a raw string ref into a
+        // `(ref $uBox)` param: `vl check` rc 0, INVALID WASM, in every function-value shape
+        // and for every value-union spelling INCLUDING the `i32 | null` niche (which reps as
+        // the box). A union-VALUE argument was already fine — it IS the box — which is why
+        // only the raw-member spellings failed, and why `emitUnionBoxArg` (whose first act is
+        // an `exprUnion` passthrough) keeps them byte-identical.
+        let cuNm = ""
+        if sigParamKindAt(ckey, i) == "union" {
+          cuNm = cloCallParamUnionName(callIx, i)
+          if cuNm == "" {
+            // The key says box and no registered name resolves: a producer DISAGREEMENT, not
+            // a shape the rep declines. Refuse LOUDLY rather than push the un-boxed operand —
+            // invalid wasm is the one outcome this arm must never reach.
+            //
+            // MEASURED INERT: zero firings over 1,595 corpus files, 1,800 fuzz cases and the
+            // 116-cell param grid. It is kept rather than degraded to the historical raw
+            // `emitExpr` because it EARNED its keep during development — its one firing was
+            // `closures/closure-param-union-arena-walk.vl`, and it was right: the resolver was
+            // asking `tyToEmitName` (structural) for a union the registry holds under its
+            // NOMINAL spelling. A silent fallback would have shipped that gap.
+            return emitFail(
+              "emitProgram: value-call union parameter has no resolvable union name",
+            )
+          }
+        }
+        if cuNm != "" {
+          if emitUnionBoxArg(body, cuNm, args[i], fnIx) < 0 { return -1 }
+        } else if clu == 0 {
           if emitExpr(body, args[i], fnIx) < 0 { return -1 }
         } else {
           const cluCtx = expCtxHere()
@@ -13951,9 +13986,57 @@ function emitCapturedCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
   if directArgsBad(cargs, callIx) {
     return emitFail("emitProgram: named argument does not match a parameter")
   }
+  // PER-PARAMETER ARGUMENT COERCION — the spine pushed every argument RAW, and the
+  // callee's own declared functype is what receives it. This is the FOURTH `call_ref`
+  // reach (a nested CAPTURING function called by NAME), and unlike `emitCallRef` it needs
+  // no `$fnsig`/arena pair to decide anything: it resolved `target` to build the closure,
+  // so it holds the callee's `Param` nodes and can read `vtKindOfParam` exactly as the
+  // DIRECT twin `emitCall` does. Four kinds, each `vl check`-clean INVALID WASM before:
+  //
+  //   union box   `function inner(k: string | i64)` + `inner("a")` — the raw member ref
+  //               pushed into the `(ref $uBox)` the functype declares.
+  //   i64/f64/f32 `function inner(k: i64)` + `inner(7)` — "expected i64, found i32". NOT a
+  //               union shape at all: the plainest possible captured call, and the cell
+  //               that shows this spine's gap was never about unions.
+  //   litunion    `function inner(k: K)` + `inner("a")` — a string ref into the interned
+  //               i32 ATOM param (the captured-call twin of #1170's value-call half).
+  //
+  // BYTE-SAFE BY CONSTRUCTION on everything that worked before: each arm fires only where
+  // the raw push was already the wrong valtype. A union argument that already HOLDS the
+  // box passes through (`emitUnionCoerce`'s first act), an i64-typed variable through
+  // `emitExprAsI64` is the same load, and a litunion ATOM variable already holds its id.
+  const cfn = P.nodes[fnStmts[target]]
+  let cps: i32[] = []
+  if cfn is FuncDecl { cps = cfn.fnParams }
   let cai = 0
   while cai < cargs.length {
-    if emitExpr(body, cargs[cai], fnIx) < 0 { return -1 }
+    let cuNm = ""
+    let cpKind: VKind = "i32"
+    let cpLit = false
+    if cai < cps.length {
+      cpKind = vtKindOfParam(cps[cai])
+      const cpn = P.nodes[cps[cai]]
+      if cpn is Param {
+        if cpKind == "union" { cuNm = tyNameOf(cpn.parType) }
+        if nodeTyIsLitUnionAlias(cpn.parType) { cpLit = true }
+        if nodeTyIsNulLitUnion(cpn.parType) { cpLit = true }
+      }
+    }
+    if cuNm != "" {
+      if emitUnionBoxArg(body, cuNm, cargs[cai], fnIx) < 0 { return -1 }
+    } else if cpKind == "i64" {
+      if emitExprAsI64(body, cargs[cai], fnIx) < 0 { return -1 }
+    } else if cpKind == "f64" {
+      if emitExprAsF64(body, cargs[cai], fnIx) < 0 { return -1 }
+    } else if cpKind == "f32" {
+      if emitExprAsF32(body, cargs[cai], fnIx) < 0 { return -1 }
+    } else if cpLit {
+      const cluCtx = expCtxHere()
+      cluCtx.litUnion = 1
+      if emitExprExpect(body, cargs[cai], fnIx, cluCtx) < 0 { return -1 }
+    } else {
+      if emitExpr(body, cargs[cai], fnIx) < 0 { return -1 }
+    }
     cai = cai + 1
   }
   // The TARGET's OWN interned `$fnsig` — the functype `ref.func <target>` actually

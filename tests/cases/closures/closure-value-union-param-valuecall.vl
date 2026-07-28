@@ -1,0 +1,228 @@
+// @run
+// @log 1
+// @log 2
+// @log 2
+// @log 1
+// @log 1
+// @log 2
+// @log 1
+// @log 2
+// @log 1
+// @log 1
+// @log 2
+// @log 7
+// @log 8
+// @log 3
+// @log 4
+// @log 5
+// @log 5
+// @log 9
+// @log a
+// @log 9
+// A VALUE UNION in the PARAMETER position of a function TYPE, reached through a function
+// VALUE. `type U = string | i64` is the whole repro — no generics, no nesting:
+//
+//     function mk(k: string | i64): i32 { return 1 }
+//     const f: (string | i64) => i32 = mk
+//     print(f("a"))
+//   → vl check rc=0, clean; vl build → "wrote … Error: … is not a valid WebAssembly
+//     module … type mismatch: expected (ref $type), found (ref $type)"
+//
+// A boxed union's wasm rep is the shared `{tag, payload}` struct, so a `(U) => i32`
+// functype declares `(structref, (ref $uBox)) -> i32` and a member ARGUMENT has to be
+// COERCED into the box at the boundary. The DIRECT-call twin has always done that
+// (`emitCall` reads `vtKindOfParam(...) == "union"` off the callee's `Param` node and
+// routes the argument through `emitUnionBoxArg`); `emitCallRef` — the `call_ref` spine a
+// function VALUE takes — never did, and pushed the RAW string / i64 / struct ref straight
+// into the box-typed parameter.
+//
+// The ARGUMENT is the axis, not the union: a union-VALUE argument (`f(u)` below) already
+// IS the box and worked before this fixture existed. Only a raw member — a literal or a
+// concrete-arm variable — had to be told which rep to take, which is why `vl check` stays
+// clean: the CHECKER is right about the type, and only the lowering disagrees.
+//
+// TWO SIDES, TWO SOURCES, and that split is the design rather than an accident. The
+// KIND ("is this parameter the box?") is read off the resolved `$fnsig` KEY
+// (`sigParamKindAt`) — the key is what the `ref.cast` functype is built from, so a
+// coercion decided from it cannot disagree with the bytes it feeds. The union's IDENTITY
+// ("which box, for the tag") CANNOT come from the key: the `u` token is deliberately
+// SLOT-FREE (`repSigTokHasSlot` excludes it) because every boxed union shares ONE `$uBox`
+// valtype and two functions taking different unions MUST share a `$fnsig` — so it comes
+// from the checker type instead (`cloCallParamUnionName`). Kind from the key, identity
+// from the arena; each from the only side that has it.
+//
+// Nominal-FIRST on that identity leg, and measured: a DECLARED alias (`type U = A | B`)
+// registers under its NAME, so the structural render `A|B` is a name `isUName` does not
+// know — keying the render alone turned nine WORKING cells into a loud "no resolvable
+// union name". `U` is also exactly what the direct twin passes (`tyNameOf(parType)`), so
+// both boundaries hand `emitUnionCoerce` the same string.
+//
+// THE GRID, all four spellings that rep as the box (`string | i64` inline and aliased,
+// the mixed `{w: i32} | i64`, and the `i32 | null` scalar niche — which reps as the box
+// too) crossed with the three function-value reaches (annotated binding, lambda, HOF
+// param) and the two raw-argument spellings (member literal, arm-typed variable): 24
+// cells, every one of them `vl check`-clean INVALID WASM before this. The direct-call
+// twins, the union-VALUE argument, the literal-union alias (whose rep is the interned i32
+// ATOM, NOT the box — subtracted first here exactly as `cloCallParamLitUnion` claims it)
+// and the plain non-union params are the controls, and they were all already correct.
+//
+// A FOURTH `call_ref` REACH, off that grid and found by sweeping the SPINES rather than
+// the spellings: a nested CAPTURING function called by NAME (`captured` below) goes
+// through `emitCapturedCall`, not `emitCallRef` — a spine that pushed EVERY argument raw.
+// It needs none of the machinery above, because it resolved its target to build the
+// closure and therefore holds the callee's `Param` nodes: it takes the direct twin's
+// per-parameter reads (`vtKindOfParam` / `tyNameOf`) verbatim. And sweeping it turned up
+// the reading that says the spine was never about unions at all — a plain `i64` parameter
+// (`wide` below) called with an integer literal was invalid wasm on the same line, as was
+// a literal-union parameter. Both are in here as the union arm's siblings, because a
+// spine fixed for one kind of argument and left broken for the next two is not fixed.
+//
+// STILL BROKEN, deliberately absent above: an UN-ANNOTATED lambda parameter whose
+// contextual type is a NULLABLE. `emit_rewrite.synthParamAnnots` pins such a param only
+// when `nodeTyIsUnion` holds, which is FALSE for a `TyNullable`, so `(_k) => 1` under a
+// `(i32 | null) => i32` annotation declares a plain i32 parameter while the annotation
+// keys the box — a cast-failure TRAP. The `string | null` / `{w: i32} | null` NICHE
+// spellings land worse (the pinned i32 makes the value's own key non-empty, so
+// `emitClosureValueCore`'s "not yet supported" floor never fires and the raw ref reaches
+// an i32 parameter — invalid wasm). ANNOTATE the lambda param and all three are correct
+// or cleanly rejected today; the pin is a separate root in a separate file.
+
+type U = string | i64
+type A = { a: i32 }
+type B = { b: i32 }
+type AB = A | B
+type K = "a" | "b"
+
+function mk(k: U): i32 {
+  if k is string { return 1 }
+  return 2
+}
+
+// The INLINE spelling of the same union — it registers under its member set, not a name.
+function inl(k: string | i64): i32 {
+  if k is string { return 1 }
+  return 2
+}
+
+// A MIXED union: one struct arm, one scalar arm.
+function mixed(k: { w: i32 } | i64): i32 {
+  if k is i64 { return 8 }
+  return 7
+}
+
+// The `i32 | null` niche, which reps as the box.
+function nul(k: i32 | null): i32 {
+  if k == null { return 4 }
+  return 3
+}
+
+// A struct-only union — the control that was already correct.
+function shape(k: AB): i32 {
+  if k is A { return 5 }
+  return 6
+}
+
+// A LITERAL union stays the interned i32 ATOM, not a box — the control that says the
+// subtraction in `cloCallParamUnionName` is load-bearing.
+function lit(k: K): string { return k }
+
+// The union is the SECOND parameter, so the whole param spine has to line up.
+function tagged(n: i32, k: U): i32 {
+  if k is string { return n }
+  return n + 1
+}
+
+// A union param on a closure passed INTO a higher-order function.
+function callIt(g: (U) => i32, k: U): i32 {
+  const r = g(k)
+  return r
+}
+
+// A NAMED function reached as a value: the member LITERAL and the arm-typed VARIABLE are
+// the two raw-argument spellings that failed.
+const f1: (U) => i32 = mk
+print(f1("a")) // 1
+print(f1(7)) // 2
+const nv: i64 = 9
+print(f1(nv)) // 2
+const sv: string = "s"
+print(f1(sv)) // 1
+// A union-VALUE argument — already the box, and already correct before the fix.
+const uv: U = "z"
+print(f1(uv)) // 1
+
+// A LAMBDA with an ANNOTATED union param.
+const f2: (U) => i32 = (k: U) => {
+  if k is i64 { return 2 }
+  return 1
+}
+print(f2(7)) // 2
+print(f2("a")) // 1
+
+// Into a HOF, both as a named function and as a lambda literal.
+print(callIt(mk, 7)) // 2
+print(
+  callIt(
+    (k: U) => {
+      if k is string { return 1 }
+      return 2
+    },
+    "a",
+  ),
+) // 1
+
+// The INLINE union spelling, through a value.
+const f3: (string | i64) => i32 = inl
+print(f3("a")) // 1
+print(f3(7)) // 2
+
+// The MIXED union — a struct-literal argument and a scalar argument through one value.
+const f4: ({ w: i32 } | i64) => i32 = mixed
+print(f4({ w: 1 })) // 7
+print(f4(7)) // 8
+
+// The `i32 | null` niche through a value, both arms.
+const f5: (i32 | null) => i32 = nul
+print(f5(1)) // 3
+print(f5(null)) // 4
+
+// The struct-only union control.
+const f6: (AB) => i32 = shape
+print(f6({ a: 1 })) // 5
+print(shape({ a: 1 })) // 5
+
+// The second-parameter spine.
+const f7: (i32, U) => i32 = tagged
+print(f7(9, "a")) // 9
+
+// The litunion control: still the i32 atom, still a string on the way out.
+const f8: (K) => string = lit
+print(f8("a")) // a
+
+// The CAPTURED-call spine: `inner` captures `n`, so calling it BY NAME is a `call_ref`
+// (`emitCapturedCall`), not a plain `call`. The i64 and litunion callees are the two
+// NON-union cells that showed this spine's gap was never about unions — an `inner(k: i64)`
+// called `inner(7)` read "expected i64, found i32", and a `K` param took a string ref.
+function captured(n: i32): i32 {
+  function inner(k: U): i32 {
+    if k is string { return n }
+    return n + 1
+  }
+  function wide(k: i64): i32 {
+    if k > 5 { return n }
+    return n + 1
+  }
+  function atom(k: K): i32 {
+    if k == "a" { return n }
+    return n + 1
+  }
+  const a = inner("a")
+  const b = inner(7)
+  const c = wide(7)
+  const d = wide(1)
+  const e = atom("a")
+  const g = atom("b")
+  return a + b + c + d + e + g
+}
+
+print(captured(1)) // 9
