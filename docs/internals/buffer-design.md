@@ -1463,3 +1463,329 @@ Said out loud here so the next reader does not mistake unreddened for asleep.
    `std:buffer` fixtures (§J7) or this slice's seven. All were adjudicated natively by hand here —
    `vl run` stdout equal to the `@log` lines, `vl check` clean, nonzero exit for the traps — but
    promoting them belongs to that file's owner.
+
+---
+
+## L. What shipped: typed views (webcraft P1.1) — and the per-access call cost, finally measured
+
+### L1. The slice: `F32View` / `I32View`, and ZERO compiler lines again
+
+`std:buffer` grows a view tier:
+
+```vl
+export type F32View = { f32base: i32, length: i32 }
+export type I32View = { i32base: i32, length: i32 }
+
+export function f32view(self: Buf, off: i32, count: i32): F32View
+export function i32view(self: Buf, off: i32, count: i32): I32View
+export function getF32(self: F32View, i: i32): f32      // and setF32
+export function getI32(self: I32View, i: i32): i32      // and setI32
+export function byteAddrF32(self: F32View, i: i32): i32 // and byteAddrI32
+```
+
+`buf.f32view(off, count)` re-describes a `Buf` byte range in ELEMENTS. `.length` is the element
+count and is a plain struct field — no call, no side table, exactly as `Buf.length` is. Every body
+is one instruction plus its address arithmetic, plus the bounds check §L3 rules.
+
+**No compiler file was touched, and the seed is byte-identical.** `refresh-compiler.sh
+--prove-fixpoint` reports `compile(seed) == seed` and `build/vl-compiler.wasm` stays at 1054554
+bytes — the same number §K6 recorded. That is the strongest available form of "zero compiler
+lines": not "the diff has none", but "the compiler binary did not move by one byte". S5's lesson
+(§J1) held a second time.
+
+What the surface does NOT include is the spec's `x[i]` / `x[i] = v` sugar. §L5 is the measured
+reason, and it is not "it was hard".
+
+### L2. The finding that chose the field names: two views are the SAME TYPE
+
+The obvious spelling is `{ base: i32, length: i32 }` for both. It does not work, and the reason is
+not a detail:
+
+> VL is STRUCTURALLY typed. `type X = {…}` names a shape; it does not mint an identity. Two
+> declarations with the same field names and types **are the same type**.
+
+Measured before the names were chosen, single-file, no std involved:
+
+```vl
+type F32View = { base: i32, count: i32 }
+type I32View = { base: i32, count: i32 }
+function readF(self: F32View, i: i32): f32 { return __load_f32__(self.base + (i << 2)) }
+__store_i32__(1024, 1065353216)          // the f32 1.0 bit pattern, written as an INTEGER
+const iv: I32View = { base: 1024, count: 1 }
+print(readF(iv, 0))                      // → 1
+```
+
+`vl check` is clean. An `I32View` satisfies every `F32View` parameter and the integer bytes come
+back reinterpreted as a float, silently. Spelled that way the element type is not part of the type
+at all — the two views are one type with two names, and the whole point of a *typed* view is gone.
+
+So the discriminator is put where a structural checker can see it: `f32base` and `i32base`. The
+awkwardness is real and it is bought back exactly once, by
+`tests/cases/std/buffer-view-element-type-mismatch.vl`:
+
+```
+no field 'getF32' on {i32base: i32, length: i32}
+```
+
+Note what the message renders: the STRUCTURE, not the alias. `tyToStr`'s `TyObj` arm
+(`typecheck.vl:6065`) has no name to print, which is itself the evidence that no nominal identity
+exists to lean on.
+
+**This is a hidden dependency of P1.1 on P1.5.** The requirements doc orders nominal/opaque types
+(P1.5, "cheap, high-value") after typed views (P1.1) and presents them as unrelated. They are not:
+P1.1's surface as literally spec'd — two view types over the same `{base, count}` shape — is not
+expressible soundly without P1.5. A zero-cost newtype would let both fields go back to `base` and
+would delete this section. Until then the field name IS the element type.
+
+The same argument says `Buf` itself (`{base, length}`) is distinct from both views only by luck of
+field naming, and that a third same-shaped user struct would be interchangeable with whichever it
+matched. That is pre-existing and unchanged by this slice; it is worth knowing that the tier's type
+safety rests on it.
+
+### L3. The bounds policy, ruled and STATED (P1.4's actual ask)
+
+**Ruled: a view is FENCED, and it is the only thing in `std:buffer` that is.**
+
+Everything else in the tier obeys §A4 — no VL-level check anywhere, the engine's own trap is the
+memory-safety proof, and a `Buf` describes an extent without fencing it. Views deliberately break
+that symmetry, because their failure mode is the one the engine cannot see:
+
+| access | where it lands | engine's opinion | consequence unfenced |
+|---|---|---|---|
+| `buf.loadF32(1000000)` past the memory | outside linear memory | **traps** | caught, loud |
+| `view[length]` — one element past a column | inside the memory, inside the `Buf`, inside the NEXT COLUMN | **fine** | a neighbour's bytes, silently |
+
+The second row is the entire SoA kernel's bug class. `tests/cases/std/buffer-view-bounds-control.vl`
+pins it as a measurement rather than an argument: it computes the exact addresses the trap fixtures
+reach for, reads them through `Buf`'s unfenced accessors, and every read SUCCEEDS and returns a live
+neighbour (99.5 one element past, 4242 one element before). The engine has no objection to any of
+them. So the engine's trap is not the mechanism protecting a view, and the VL-level check is not
+redundant with it.
+
+The policy, in full, so kernel code can be written to it deliberately:
+
+1. **Per access: `0 <= i < length`, trapping via `__trap__` (`unreachable`).** Loud, deterministic,
+   unrecoverable — the same class of stop as the engine's own bounds trap, and the same one
+   `Buffer(-1)` already takes. Two signed compares, not one unsigned: VL has no unsigned comparison
+   operator, so the single `i u< len` trick the emitter uses for native arrays
+   (`wasmEmit.emitListIdxGuard`) is not spellable in std VL.
+2. **Per view, once: the extent check.** `f32view(off, count)` traps unless `[off, off + count*4)`
+   lies inside the `Buf`. This is what lets (1) be just `0 <= i < length` — an extent validated at
+   construction means an in-range index cannot leave the `Buf`. It also moves the diagnosis to the
+   line that got the arithmetic wrong instead of to an access arbitrarily later. Same layering as
+   `Buffer(n)`, which validates at allocation time and then never again (§J3).
+3. **The bound is NOT hoisted out of the canonical loop.** There is no LICM in VL, and binaryen at
+   `-O3 --closed-world --gufa` does not remove the check either — measured, §L4, it survives and
+   costs 0.34 ns per element-update. P1.4 asks that the loop "either hoists the bound or relies on
+   the memory trap, and that this is *stated*". It does neither: it checks, every time, and here is
+   the number.
+4. **The deliberate fast pattern, for a kernel that has proved its own bounds**, is to take the base
+   ONCE and run the bare intrinsics inside:
+   ```vl
+   const xb = x.byteAddrF32(0)
+   const n = x.length
+   let i = 0
+   while i < n { __store_f32__(xb + (i << 2), …) ; i = i + 1 }
+   ```
+   Measured identical to the hand-written raw kernel at every optimization level (§L4, the `hoist`
+   row). `byteAddrF32` is unchecked on purpose — it computes an address, it does not dereference
+   one, and the one-past-the-end address is the useful answer for a range rather than an error.
+   `Buf`'s `loadF32`/`storeF32` are also still there, still unfenced, still byte-offset.
+5. **A view cannot protect against outliving its bytes.** `bufferRelease` still dangles (O6), and a
+   stale view passes both its own check and the engine's — `buffer-view-release-dangles.vl` pins the
+   silent corruption. Documented, not fixed.
+
+### L4. The per-access call cost under a hot loop — §G's open question, closed
+
+§G filed this as undeterminable ("there is no such kernel to run yet and a synthetic one would
+measure binaryen, not VL") and §K7 item 6 kept it open as "the number that should decide O1(b)
+versus leaving O1(c) permanent". It is now takeable, because `std:buffer` exists and every body is
+one instruction.
+
+The kernel is P1.1's own canonical loop, `x[i] += vx[i]`, over N=1,000,000 f32 elements × R=500
+trips = **500,000,000 element-updates** (three accesses each: two loads and a store). Four spellings
+of the *same* loop, built to `.wasm` once and then run — so no compile time is in any timing — each
+against an **R=0 build of the identical file as the inverted control** (same module, same 8 MiB of
+allocation, zero trips), which is subtracted. Every build's stdout is asserted to equal R, so a loop
+that was optimized away is reported as wrong rather than as fast. Medians of 5, wasmtime via the
+Rust host, ns per element-update:
+
+| spelling | what it is | (none) | `-O` | `-O3 --closed-world --gufa` |
+|---|---|---|---|---|
+| `raw`   | bare `__load_f32__`/`__store_f32__`, hand-computed addresses | 0.426 | 0.452 | 0.434 |
+| `hoist` | view for the extent, base taken ONCE, bare intrinsics inside | 0.426 | 0.436 | 0.418 |
+| `buf`   | `Buf.loadF32`/`storeF32` — a call per access, NO check | 2.436 | 2.504 | 0.700 |
+| `view`  | `F32View.getF32`/`setF32` — a call per access AND the check | 2.734 | 2.530 | 1.044 |
+
+Five things fall out, in order of how much they should change behaviour:
+
+- **`-O` does not inline the wrappers; `-O3 --closed-world` does.** `buf` moves 2.44 → 0.70 ns, a
+  3.5× swing on one flag choice. §O1 asserted this from binaryen's behaviour on the wrappers; this
+  is the first time it has been priced on a kernel. **The release profile is not optional** — a sim
+  built at `-O` runs its columns at a quarter speed. P1.3 already asks for `--closed-world` in the
+  blessed pipeline; this is the number behind that ask.
+- **The CALL is the cost. The CHECK is not.** Unoptimized, the wrapper call is 2.01 ns/element and
+  the bounds check is 0.30 — the check is 11% of the view's total and 13% of the wrapper overhead.
+  Per access the check is ~0.10 ns, i.e. under a third of a cycle: two well-predicted compares
+  costing issue slots and nothing else. **Nobody should trade the bounds policy away for speed
+  before trading the call away**, and the call is free to trade (`hoist`).
+- **The escape hatch is genuinely free.** `hoist` is `raw` to within noise at all three levels — the
+  view's `byteAddrF32` and `.length` cost nothing once out of the loop. So the fenced surface and
+  the raw speed are both available in the same program without leaving `std:buffer`, which is what
+  makes the strict per-access policy affordable to rule.
+- **O1(c) stands.** The std-VL lowering costs 5.7× the raw kernel unoptimized and **1.6× at
+  `-O3 --closed-world`**, with a free escape hatch for the loops that care. That is not a case for
+  moving `Buffer` into the compiler (O1(b)); it is a case for documenting the release profile, which
+  §L3(4) and this section now do. §K7 item 6 is closed.
+- **Inlining does not close the gap completely, and the residue is attributable.** At `-O3
+  --closed-world` `buf` is still 0.27 ns/element above `raw` with no call left in it. The difference
+  between the two spellings at that point is that `buf` does a `struct.get` of `self.base` per
+  access where `raw` and `hoist` hold the base in a local — i.e. the loop-invariant load is not
+  hoisted. That is ROADMAP B6b's "backing-pointer hoisting (LICM)" showing up with a price tag for
+  the first time. Attributed, not proven: the two spellings differ in that one respect and the
+  `hoist` row isolates it, but no disassembly was read.
+
+Caveat on the middle column: `-O` and unoptimized differ by up to 8% in both directions across
+these rows (`buf` 2.436 → 2.504 but `view` 2.734 → 2.530). That is this harness's noise floor, and
+it is why the load-bearing claims above are all drawn from the ~4× and ~6× gaps rather than from
+anything inside 10%.
+
+### L5. `x[i]`: four routes, all measured, none taken — and why that is not a punt
+
+P1.1 spells the surface `x[i]` / `x[i] = v`, and calls raw addressing "the thing most worth
+absorbing into the language". This slice ships `x.getF32(i)` / `x.setF32(i, v)` instead. The
+routes to the bracket form were enumerated and probed first; here is what each is blocked on.
+
+**The framing that decides it: the sugar is PURELY SYNTACTIC.** Under every dispatch route that
+exists or is planned, `x[i]` lowers to exactly the call that `x.getF32(i)` already lowers to —
+`emitIndex` is not reached at all, the rewriter turns the bracket into a call before the emitter
+sees it (`emit_rewrite.vl:312-323`). Only a built-in nominal arm inside `emitIndex` would emit a
+bare `f32.load`, and §L4 prices that whole prize at the 0.34 ns/element check plus the 0.27
+un-hoisted `struct.get` — both of which the free `hoist` spelling already recovers today. So the
+bracket buys spelling, and spelling only.
+
+- **Route 1 — the existing B13 `"[]"` / `"[]="` closure-field trap.** Zero compiler lines: a view
+  would carry its accessors as closure fields. **Refuted on three counts, two of them defects
+  (§L7).** An f32-returning `"[]"` emits an INVALID MODULE; a `"[]="` closure whose body is a memory
+  store writes nothing; and even repaired it is an INDIRECT call through a per-view closure
+  allocation — strictly worse than the direct call the UFCS spelling already gets, and pointed the
+  wrong way for the hot loop this whole tier exists for.
+- **Route 2 — a free `self`-function named `"[]"`.** This is the right long-term answer and it is
+  already on the roadmap as B14's remaining item ("route operator dispatch (B13) through
+  self-methods"): a DIRECT call, general over any user type, nothing nominal. Three real blockers,
+  and the first is the interesting one:
+  - `function "[]"(self: V, i: i32)` **does not parse** — `expected an identifier but found "[]"`.
+    Which means `drwSelfFnOf(n.binOp, 2)` at `emit_rewrite.vl:281`, the binary-operator arm of
+    exactly this mechanism, **is unreachable dead code today**: no function can be *named* an
+    operator, so the lookup can never hit.
+  - `checkIndexNode` (`typecheck.vl:19154-19175`) has no arm for it; its `TyObj` case consults a
+    `"[]"` FIELD and nothing else.
+  - **Module-merge mangling.** The UFCS path launders the property through `ufcsAliasOf`
+    (`emit_rewrite.vl:165`) *precisely because* a merged free `self`-function becomes `shout$m1`.
+    The operator arm at :281 uses the RAW name with no such laundering — so a `"[]"` provided by
+    **std** would not be found across the merge, which is exactly and only the case P1.1 needs. This
+    is why route 2 is a language feature to design, not a views feature to bolt on.
+- **Route 3 — a nominal hook keyed on the type name `F32View`.** It would be the first nominal thing
+  in the language, and it does not survive its own first question: `structNameOfTy`
+  (`typecheck.vl:6890`) maps ANY declared struct to its name and knows nothing about std, so a
+  user's own `type F32View = {…}` is captured by the hook. Namespacing std type names in the arena
+  is a much larger change than the sugar it would buy.
+- **Route 4 — a structural hook keyed on the `f32base` field.** Rejected on sight: it promotes §L2's
+  naming workaround — which exists only because P1.5 has not shipped — into load-bearing compiler
+  surface, and any user struct with a field named `f32base` silently acquires view indexing.
+
+**Filed, with the design:** take route 2, as B14, generally — parser support for a string-literal
+function name, a `checkIndexNode` arm, a merge-safe operator lookup (`ufcsAliasOf` applied at
+`emit_rewrite.vl:281` and at a new Index arm), and the `"[]="` write form. That lands `x[i]` for
+every user type at once, makes the dead operator arm reachable, and costs `std:buffer` four more
+tiny functions. It is not on P1.1's critical path, because the kernel ergonomics P1.1 is actually
+after are available today at `x.getF32(i)` with identical codegen.
+
+One consequence to design in when it is taken: `x[i] += vx[i]` desugars in the PARSER to
+`x[i] = x[i] + vx[i]` sharing one target node (`ast.vl:716-735`), so the receiver and index are
+evaluated TWICE under any dispatch route. Harmless for a local and an induction variable; not
+harmless for `x[f()] += 1`.
+
+### L6. What the corpus pins
+
+Ten fixtures, all under `tests/cases/std/`:
+
+- `buffer-views.vl` — the round-trip and aliasing grid. Address arithmetic is cross-checked against
+  `Buf.loadF32`/`loadI32` **rather than against another view**: a view and its own reader agreeing
+  proves nothing. Both directions (view write → raw read, raw write → view read), the f32 bit
+  pattern (so a view is shown to store no tag and no header), a disjoint i32 view, two views
+  aliasing the same bytes, a partially-overlapping offset view, and `byteAddrF32` deltas.
+- `buffer-view-index-past-end-traps.vl`, `-negative-index-traps.vl`, `-write-past-end-traps.vl` —
+  the three bounds traps. **They carry no `@log`**, deliberately: the harness ignores `@log` when
+  `@trap` is set (`cases_wasm_test.ts:453`), so log lines on a trap case are decoration that
+  asserts nothing. Their inverted controls are separate `@run` files.
+- `buffer-view-bounds-control.vl` — the inverted control for all three, and the §L3 measurement:
+  every address those cases reach for is read here through `Buf`'s unfenced accessors and every read
+  succeeds against a live neighbour.
+- `buffer-view-extent-traps.vl` / `-extent-control.vl` — the construction check, and its three legal
+  boundaries (a view exactly filling the `Buf`, an empty view, an empty view at the one-past-the-end
+  offset). A check that trapped on everything would satisfy the trap case alone.
+- `buffer-view-element-type-mismatch.vl` — §L2's reject, the entire return on the `f32base` naming.
+- `buffer-view-release-dangles.vl` — the mark/release hazard reaching views, pinned as behaviour.
+
+Not pinned, and out of this change's file partition: **host visibility through the exported memory**.
+A view writes with the same `f32.store` into the same exported memory as every other accessor, and
+`byteAddrF32` hands a host the exact byte address, so `tests/vl_exported_memory_test.ts` needs
+nothing new to stay true — but that file was not touched and the claim is by construction rather
+than by assertion.
+
+### L7. Two defects this slice did not go looking for
+
+Both are in the B13 index-trap path (route 1 above), both pre-date this slice, and neither is
+touched by it — `std:buffer` uses no closure fields.
+
+1. **An f32-returning `"[]"` closure field emits an invalid module.**
+   ```vl
+   function mkview(base: i32) { { "[]": (i: i32) => __load_f32__(base + (i << 2)) } }
+   const v = mkview(1024)
+   const a = v[0]
+   ```
+   → `Invalid input WebAssembly code: type mismatch: expected i32, found f32`. The i32 twin of the
+   same program runs. **Inverted control:** the identical closure stored under an ORDINARY field
+   name and called directly (`m.get(0)`) returns 1.5 correctly — so the defect is in the trap
+   rewrite's result typing, not in f32 closures.
+2. **A `"[]="` closure field whose body is a memory-store intrinsic stores nothing.**
+   ```vl
+   function mkview(base: i32) {
+     { "[]": (i: i32) => __load_i32__(base + (i << 2)),
+       "[]=": (i: i32, v: i32) => { __store_i32__(base + (i << 2), v) } }
+   }
+   const v = mkview(1024)
+   v[0] = 11
+   print(__load_i32__(1024))   // 0 — the raw read, not the trap's
+   ```
+   Both the raw read and the read back through `"[]"` answer 0. The write dispatches (or does not)
+   silently; no diagnostic, no trap.
+
+Neither was narrowed further — they are outside this slice's partition and outside its surface.
+They matter to record because route 1 is the obvious "zero compiler lines" way to reach for `x[i]`,
+and it is the one route that looks free and is not.
+
+### L8. Where §K7's list stands now
+
+1. ~~O1, O5, O6, O2, O3~~ — ruled (§J2). **O1(c) now has its number** (§L4) and stands.
+2. ~~S1 / O7~~, ~~narrow stores~~, ~~S6 bulk ops~~, ~~S5 `std:buffer`~~ — done (§I4, §K, §J).
+3. ~~**§G's per-access call cost under a hot loop**~~ — **closed** (§L4): 5.7× raw unoptimized,
+   1.6× at `-O3 --closed-world`, with the bounds check only 11% of it and a free hoisted escape
+   hatch. The actionable half is that `-O` is not enough and the release profile must be stated.
+4. **P1.1's `x[i]` sugar** — not shipped, filed with four measured routes and a design (§L5). Wants
+   ROADMAP B14 done generally, not a views hook.
+5. **P1.1 depends on P1.5** — new, and the most useful thing here for sequencing (§L2). Two typed
+   views are not soundly expressible over one structural shape; the `f32base`/`i32base` naming is a
+   workaround that a zero-cost newtype would delete.
+6. **`driver.vl`'s `builtinScan` LSP completion list** (§B7) still carries none of the 20 memory
+   dunders. Unchanged, still out of partition.
+7. **`tests/selfhost_native_align_test.ts`'s whitelists** still do not carry the `std:buffer`
+   fixtures (§J7, §K7) or this slice's ten. All ten were adjudicated natively by hand here — `vl run`
+   stdout equal to the `@log` lines, `vl check` clean, nonzero exit for the four traps — but
+   promoting them belongs to that file's owner.
+8. **New, small:** `byteAddrF32`/`byteAddrI32` are the only unchecked things in the view tier. They
+   return an address rather than a value, which is why they are safe to leave unchecked, but they
+   are also the escape hatch §L3(4) recommends — so they are the one place a kernel can reintroduce
+   the unfenced behaviour the rest of the tier now prevents. That is deliberate and stated, not an
+   oversight.
