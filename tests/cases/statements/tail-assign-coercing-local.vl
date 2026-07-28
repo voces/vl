@@ -1,0 +1,207 @@
+// @run
+// @log 3
+// @log 3
+// @log 1
+// @log 3
+// @log 3
+// @log 1
+// @log 3
+// @log 3
+// @log 1
+// A function body's LAST statement may be an ASSIGNMENT, which makes it the implicit
+// RETURN (DECISIONS: assignment-as-expression). `tail-assign-inferred-return.vl` and
+// `tail-assign-local-param-agreeing.vl` pin the cells on which the two independent
+// answers already AGREED; `tail-assign-coercing-global.vl` pins the coercing GLOBAL
+// cells (#1235). THIS FILE pins the coercing / weaker-RHS cells whose target is a
+// LOCAL or a PARAMETER — every one of them INVALID WASM on a `vl check`-clean program
+// (rc 0) until `criClassify` started asking those cells too.
+//
+// The lowering is STORE-then-RE-READ (`emitBinExprNode`'s `=` arm, `wasmEmit.vl`), so
+// the value the body pushes is the target CELL's rep. `fnAssignRetKind`
+// (`emit_classify.vl`) now dispatches over the target's STORAGE CLASS in the order the
+// emitter resolves an assignment target — a body `let` (`letCellKind`), then a
+// parameter (`vtKindOfParam`), then a module global (`globalCellKind`) — so each class
+// asks the very resolver that decides its own valtype and the two answers cannot drift.
+//
+// TWO WAYS THE RHS ANSWER WENT WRONG. It COERCES (an i32 literal into an `i64` / `f64`
+// cell, a member literal into a literal-union atom, a value into a nullable cell, a
+// variant literal into a union box); or it is merely WEAKER — a float literal list into
+// an `f32[]` cell, small integer literals into an `i64[]` cell, and above all an EMPTY
+// `[]`, which classifies as the DEFAULT i32 list whatever list cell it is stored into.
+//
+// THE EMPTY-`[]` ROWS ARE FIXED BUT NOT PINNABLE HERE, and the reason is the OTHER half
+// of this family. `vl run` over `function f() { let v: string[] = ["x"]  v = [] }` works
+// on this build and is invalid wasm on master — but the CHECKER types `v = []` as the
+// empty literal's OWN type, so `f`'s inferred return renders `<none>[]`, and
+// `tests/lsp_undisplayable_type_test.ts`'s corpus control (rightly) fails any
+// diagnostic-free corpus file carrying an undisplayable inferred type. That control is
+// an INDEPENDENT detector of the checker-side half filed at `fnAssignRetTargetName`
+// (`typecheck.vl`'s assignment-expression typing, outside this partition); the empty-`[]`
+// rows graduate into this file the moment it lands. Measured live at the time of writing:
+// `string[]` · `f64[]` · `i64[]` · `S[]` · `i32[][]` · `(S | null)[]`, local and param.
+type S = { n: i32 }
+type K = "a" | "b"
+type Cat = { legs: i32 }
+type Dog = { tail: i32 }
+type U = Cat | Dog
+
+// ── LOCAL targets, value-READ (the functype's claim is observable) ───────────────────
+// A WIDENING store: an i32 literal into an i64 cell.
+function locI64() {
+  let v: i64 = 1
+  v = 3
+}
+
+print(locI64())
+
+function locF64() {
+  let v: f64 = 1.5
+  v = 3
+}
+
+print(locF64())
+
+// A NON-EMPTY literal into an `f32[]` cell — the RHS reads as the f64-list wrapper, so
+// the functype promised `(ref $fl64TypeIdx)` over a body pushing the f32 one.
+function locF32List() {
+  let v: f32[] = [1.5]
+  v = [2.5]
+}
+
+print(locF32List().length)
+
+// ── PARAM targets — the third storage class, the same rows ───────────────────────────
+function parI64(v: i64) { v = 3 }
+
+print(parI64(1))
+
+function parF64(v: f64) { v = 3 }
+
+print(parF64(1.5))
+
+function parF32List(v: f32[]) { v = [2.5] }
+
+print(parF32List([1.5]).length)
+
+// ── UN-ANNOTATED locals — the cell's kind comes from the INITIALIZER ─────────────────
+// `letCellKind`'s second arm (`letInitCellKind`), the ladder `captureValKind` already
+// carried and which is now one home for both.
+function locInferF64() {
+  let v = 1.5
+  v = 3
+}
+
+print(locInferF64())
+
+function locInferI64() {
+  let v = 5000000000
+  v = 3
+}
+
+print(locInferI64())
+
+// The EXPLICIT `return (v = e)` spelling reaches the same `=` arm and takes the same
+// cell — `fnAssignRetTargetName` unwraps the `RetStmt` before reading the target.
+function locReturnParen() {
+  let v: f64 = 1.5
+  return (v = 1)
+}
+
+print(locReturnParen())
+
+// ── VALIDITY-ONLY rows: the result has no bare printable spelling (or its consuming
+//    spelling is the checker's half of the family), so the pin is that the module
+//    VALIDATES and RUNS at all — each of these was invalid wasm on master.
+// A LITERAL-UNION cell is an i32-backed interned ATOM; the RHS answer was `str`.
+function locLitUnion() {
+  let v: K = "a"
+  v = "b"
+}
+
+locLitUnion()
+
+function parLitUnion(v: K) { v = "b" }
+
+parLitUnion("a")
+
+// A `K | null` NICHE cell — the i32 atom with `-1` for null.
+function locNulLitUnion() {
+  let v: K | null = "a"
+  v = "b"
+}
+
+locNulLitUnion()
+
+// An `i32 | null` cell, both directions.
+function locNulI32() {
+  let v: i32 | null = 1
+  v = 6
+}
+
+locNulI32()
+
+function locNulI32Null() {
+  let v: i32 | null = 1
+  v = null
+}
+
+locNulI32Null()
+
+// A NULLABLE-STRUCT cell, both directions.
+function locNulStruct() {
+  let v: S | null = { n: 1 }
+  v = { n: 2 }
+}
+
+locNulStruct()
+
+function parNulStructNull(v: S | null) { v = null }
+
+parNulStructNull({ n: 1 })
+
+// The NULLABLE LIST cells: `i32[] | null` (kind 15) and `string[] | null` (its own
+// wrapper), each assigned a value and `null`.
+function locNulList() {
+  let v: i32[] | null = [1]
+  v = [3]
+}
+
+locNulList()
+
+function locNulListNull() {
+  let v: i32[] | null = [1]
+  v = null
+}
+
+locNulListNull()
+
+function parNulStrList(v: string[] | null) { v = ["a"] }
+
+parNulStrList(["z"])
+
+// SMALL integer literals into an `i64[]` cell — the second weaker-RHS shape (the RHS
+// reads as the i32-list wrapper), pinned by a bare call rather than by `.length`
+// because the consuming spelling is still the checker's half of the family.
+function locI64List() {
+  let v: i64[] = [1]
+  v = [2, 3]
+}
+
+locI64List()
+
+function parI64List(v: i64[]) { v = [2, 3] }
+
+parI64List([1])
+
+// A UNION cell: the store BOXES the variant literal, so the body pushes the box while
+// the RHS answer named the bare variant shape.
+function locUnion() {
+  let v: U = { legs: 4 }
+  v = { tail: 5 }
+}
+
+locUnion()
+
+function parUnion(v: U) { v = { tail: 5 } }
+
+parUnion({ legs: 4 })

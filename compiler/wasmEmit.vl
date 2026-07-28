@@ -13231,64 +13231,84 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     // Ident targets only (a local or module global); an Index/Member assignment
     // in VALUE position is out of this slice.
     //
-    // FILED by #1229's hand-off, re-derived and widened here, and the GLOBAL half is now
-    // CLOSED by #1235 — this paragraph is that filing rewritten to its measured residue.
-    // The re-read below is the value a function's TAIL assignment returns, and the
-    // FUNCTYPE that promises that value is decided somewhere else, from the OTHER
+    // FILED by #1229's hand-off, widened by #1235 (the GLOBAL half) and CLOSED for the
+    // LOCAL/PARAM half here — this paragraph is that filing rewritten to its measured
+    // residue. The re-read below is the value a function's TAIL assignment returns, and
+    // the FUNCTYPE that promises that value is decided somewhere else, from the OTHER
     // operand: `criClassify` (`emit_classify.vl`) used to open with
     //
     //     if rxe.binOp == "=" { rx = rxe.binRight }
     //
     // so `fRetKind` — read by `emitTypeSection`'s un-annotated-return arm, and by
     // `cloRetValKind` for the `$fnsig` bytes — described the RIGHT-HAND SIDE while this
-    // line pushes the TARGET. The two agree exactly when storing the RHS needed no
-    // coercion; whenever `emitAssign` COERCES (an i64 widen, a nullable cell, a
-    // literal-union atom, a union box) they disagreed and the module was INVALID WASM on
-    // a program `vl check` accepts, rc 0. #1235 gave `criClassify` the target's cell kind
-    // through `globalCellKind` — the resolver the global section and `emitIdentNode`
-    // already share — for GLOBAL targets only.
+    // line pushes the TARGET. The two agree exactly when storing the RHS needs no coercion
+    // AND the RHS's own classifier answer is as strong as the cell's. `criClassify` now
+    // asks the TARGET CELL at all three storage classes (`fnAssignRetKind`, dispatched
+    // over a body `let` → `letCellKind`, a parameter → `vtKindOfParam`, a module global →
+    // `globalCellKind`), so the functype and this line are minted from one fact.
     //
-    // WHAT IS STILL OPEN, re-derived at `63a73d7` against a build of `55a2b04` (the commit
-    // before #1235) over 18 cells, one MINIMAL prelude per target — a shared header is not
-    // usable here, since a spare `type U = S | T2` in it changes how `S | null` classifies:
+    // MEASURED at `4411fbf3` over a 652-cell grid — storage class (global / local / param /
+    // local-in-a-lambda / local-in-a-nested-fn / captured local / tail-of-an-if-arm) ×
+    // 41 cell-type-and-RHS rows × position (tail / non-tail control) × form (`f()`, which
+    // isolates the functype-vs-body disagreement / `print(f())`, which adds the checker's
+    // assignment-expression typing). 108 cells FORWARD, 0 backward, 0 output changed;
+    // INVALID-WASM cells 147 -> 43. LOCAL, PARAM and NESTED each went 24 invalid -> 1, and
+    // that 1 is `string | null` (below). The non-tail control is green on every row, at
+    // every storage class — the defect is POSITIONAL, and that is what puts the assignment
+    // in front of the functype.
     //
-    //   GLOBAL  i64 · f64 · `S | null` · `i32 | string`   invalid wasm -> RUNS   (#1235)
-    //   GLOBAL  `S[] | null`                              invalid wasm -> emit error
-    //   GLOBAL  literal union · `i32[] | null`            invalid wasm, UNCHANGED
-    //   LOCAL   i64 · f64 · litunion · `i32[] | null` ·
-    //           `S[] | null` · `S | null` · `i32 | string`  invalid wasm, UNCHANGED (7)
-    //   PARAM   i64                                      invalid wasm, UNCHANGED
-    //   ANY     `string | null` (global, local and param)  runtime TRAP, UNCHANGED (3)
+    // WHAT IS STILL OPEN, from that same grid (all 43):
     //
-    // Two things that A/B settles and a head-only reading would get wrong: the three
-    // `string | null` TRAPs are PRE-EXISTING — they trap identically on `55a2b04`, so they
-    // are not #1235's bycatch, and they remain the one cell class where this family is
-    // WORSE than a reject — and PARAM is a third storage class, filed by neither report.
+    //   IF-ARM (29)   The tail statement is an `if` whose ARMS end in the assignment
+    //                 (`if c { v = 3 } else { v = 4 }`). NOT this family's global/local
+    //                 split — a GLOBAL if-arm target is invalid too, measured — because
+    //                 `fnAssignRetTargetName` only reads the body's last statement, so no
+    //                 storage class gets the cell. Filed by neither #1235 nor #1254.
+    //   `string|null` A `string | null` cell assigned `null`, at global / local / param /
+    //   (5)           nested / lambda-local alike. DECLINED ON PURPOSE in
+    //                 `fnAssignKindGuard`: `emitIdentNode`'s kind-16 arm recovers non-null
+    //                 UNCONDITIONALLY, so naming the cell turns the loud reject into a
+    //                 runtime TRAP. The root is that recover (~12740), not the classifier.
+    //                 (#1235's residue table called this class a TRAP at all three storage
+    //                 classes; measured on the un-consumed `f()` spelling it is INVALID
+    //                 WASM, and only the value-CONSUMING spelling traps.)
+    //   CHECKER (6)   `print(f())` over an `i64[]` or literal-union cell, at global as well
+    //                 as local and param — the checker types `x = e` as `e`'s own type
+    //                 UN-coerced. `typecheck.vl`'s assignment-expression typing, filed at
+    //                 `fnAssignRetTargetName`.
+    //   CAPTURE (2)   A literal-union CAPTURED local. Invalid in the NON-TAIL control too,
+    //                 so it is not this family at all.
+    //   LAMBDA (1)    An `f32[]` local in a lambda: the `$fnsig` result wrapper and the
+    //                 local's wrapper are two `(ref $type)`s. Byte-identical A/B — this
+    //                 change does not reach it.
     //
-    // THE LOCAL HALF IS NOT REACHABLE FROM THIS FILE, and the import direction does not
-    // change that (measured, since the obvious hope is that it does). A local target's
-    // cell kind is decided by `collectLocals` (`emit_collect.vl`), and `wasmEmit.vl`
-    // imports BOTH `emit_collect` and `emit_classify`, so the resolver IS in scope here.
-    // The consumer is not: `criClassify` runs inside `computeRetInference`, before any
-    // body is emitted, and lives in `emit_classify.vl`, which cannot call into this file —
-    // `emit_classify` -> `wasmEmit` is exactly the cycle the loader rejects, because
-    // `wasmEmit` imports `emit_classify` (and only `emit_sections` imports `wasmEmit`).
-    // The fix stays where #1235 filed it: `criClassify` needs a local-cell resolver in
-    // `emit_classify`'s own storage class, proved equal to `collectLocals`'s ladder first.
-    // The agreeing set is pinned by `tests/cases/functions/tail-assign-inferred-return.vl`.
+    // THE IMPORT DIRECTION IS STILL WHAT IT WAS, and it is not what blocked this. A local
+    // target's SLOT kind is decided by `collectLocals` (`emit_collect.vl`); `wasmEmit.vl`
+    // imports both `emit_collect` and `emit_classify`, but `criClassify` runs inside
+    // `computeRetInference` in `emit_classify.vl`, which cannot call into this file
+    // (`emit_classify` -> `wasmEmit` is the cycle the loader rejects). The resolver
+    // therefore lives in `emit_classify`'s own storage class, as #1235 filed — it is
+    // `letCellKind`, whose annotated arm is `vtKindOfType` (the same ladder
+    // `collectLocals`' annotation arms ride) and whose un-annotated arm is
+    // `letInitCellKind` (the ladder `captureValKind` already carried, now one home for
+    // both). The agreeing set is pinned by
+    // `tests/cases/functions/tail-assign-inferred-return.vl` and
+    // `tail-assign-local-param-agreeing.vl`; the coercing LOCAL/PARAM set by
+    // `tests/cases/statements/tail-assign-coercing-local.vl`.
     //
-    // TWO MEASUREMENTS FROM THE ORIGINAL FILING, KEPT because they still bound the local
-    // half. (1) The axis is the assignment being the body's LAST statement — which is what
-    // makes it the implicit RETURN, and therefore what puts it in front of the functype.
-    // Adding one statement after it (`s = 7` then `print(9)`) runs, and ANNOTATING the
-    // return (`function c(): i64 { … }`) runs; both re-checked at `cf24c6e`. (Its third
-    // claim — that a lambda body and a doubly-nested function fail like a top-level
-    // `function` — is now FALSE: both spellings there target a GLOBAL, so #1235 fixed
-    // them, and both print 7.) (2) The one-line repair is REFUTED, built and swept:
-    // reading `binLeft` instead of `binRight` in `criClassify` leaves the LOCAL cells
-    // invalid either way (a local's declaration is not visible during that pass) and turns
-    // `string | null` from invalid wasm into a runtime TRAP, since it classifies "str" and
-    // the functype then promises a non-null `(ref $array)` over a body returning null.
+    // TWO MEASUREMENTS FROM THE ORIGINAL FILING, both re-checked here. (1) The axis is the
+    // assignment being the body's LAST statement. Adding one statement after it runs, and
+    // ANNOTATING the return runs — still true, on all 41 rows × 7 storage classes.
+    // (2) The one-line repair — reading `binLeft` instead of `binRight` in `criClassify` —
+    // is REFUTED, and its STATED REASON WAS WRONG. It fails because `binLeft` is an
+    // EXPRESSION fed to the same expression classifiers, which answer the RHS's question
+    // about it ("what does reading this ident produce"), not the cell's ("what valtype is
+    // this slot"); and because `string | null` then classifies "str" and turns invalid wasm
+    // into a trap. It does NOT fail because "a local's declaration is not visible during
+    // that pass" — that parenthetical is FALSE and was the stated reason this repair was
+    // abandoned. `retIsMapLocalAnnot` and `criRetLocalLet`, both in `criClassify`'s own
+    // file and both reached from `computeRetInference`, resolve a local declaration with
+    // `parentLetOf` on exactly this pass, and `fnAssignRetKind` now does the same.
     const tgt = P.nodes[e.binLeft]
     if tgt is Ident {
       if emitAssign(body, exprIx, fnIx) < 0 { return -1 }
