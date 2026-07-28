@@ -20,9 +20,11 @@ import {
   gaeHeadNameOf,
   gaeLtAt,
   groupInnerOf,
+  mapSpellValName,
   nameIsArray,
   nameIsFuncTypeAtom,
   nameIsMapOpen,
+  nameIsMapSpanEnds,
   nameIsParenOpen,
   nameIsShapeOpen,
   peelGroupParens,
@@ -59,6 +61,7 @@ import {
   nodeArrayElemName,
   nodeTyIsLitUnionAlias,
   nodeTyIxOf,
+  nodeTyMapKeyIsI32,
   nodeTyName,
   tyIsLitUnion,
   tyNomNameCycled,
@@ -115,6 +118,7 @@ import {
   nameIsClosureArrayTy,
   nameIsF32Array,
   nameIsF64Array,
+  nameIsI32KeyedMap,
   nameIsI64Array,
   nameIsMap,
   nameIsMapArray,
@@ -204,7 +208,9 @@ import {
   lUsed,
   lambdaCtr,
   localLitUnion,
+  mI32Used,
   mNextType,
+  mStructI32Idx,
   mStructIdx,
   mUsed,
   mkArrIdx,
@@ -387,6 +393,7 @@ import {
   mvCanonValName,
   mvShapeOfValName,
   mvSlotByValName,
+  mvValKindOfName,
   nameFieldCode,
   nameIsNulRefList,
   nameIsRefArray,
@@ -2353,6 +2360,23 @@ export function mfScan(ix: i32, fnIx: i32) {
           const vsh = mapShapeOfExpr(callee.memObj, fnIx)
           if vsh == -1 {
             fnUsesMapVals = true
+          } else if vsh == -4 {
+            // The i32-keyed MAP's values are the mono i32 list — the same
+            // self-contained `mapValsBase` frame the string-keyed mono map uses.
+            fnUsesMapVals = true
+          } else if vsh == -5 {
+            // An i32-keyed SET's `.values()` ARE its keys, so the BOUND form
+            // (`const xs = s.values()`) is built by the key-list path and needs THAT
+            // frame. A Set's shape is neither the mono `-1` nor an mv slot, so the two
+            // arms around this one both miss it — which is why the STRING-keyed Set's
+            // bound `.values()` is a loud reject ("`.keys()` but string list type not
+            // collected") and this arm is the i32-keyed twin's improvement rather than
+            // its mirror. The string half is deliberately NOT taught here: this scan
+            // fires on every `.values()` Call node including a `for v in s.values()`
+            // iterable, which needs no frame, so teaching it would grow two existing
+            // corpus modules (`sets/basics.vl`, `sets/infer-from-add.vl`) for no
+            // behavior change — measured, +2 BYTES rows, run output identical.
+            fnUsesMapKeys = true
           } else if vsh >= 0 {
             fnUsesMapVals = true
             fnUsesMapKeys = true
@@ -2744,6 +2768,15 @@ export function mAssignTypeIndices(_n: i32) {
   // The map struct (present only when `mUsed`); `mStructIdxPre` is this counter
   // position, precomputed above for the ref-pair loop.
   if mUsed { mStructIdx = mAllocType() } else { mStructIdx = mStructIdxPre }
+  // The i32-KEYED map struct, immediately after its string-keyed twin (present only
+  // when `mI32Used`, so no index moves in a program without one). Identical 7 fields
+  // with `keys` re-typed to the i32 list wrapper — both of whose heap types are
+  // already assigned above, so it needs no forward reference.
+  if mI32Used {
+    mStructI32Idx = mAllocType()
+  } else {
+    mStructI32Idx = mStructIdx
+  }
   // The f64 array + list-wrapper pair (Slice 4), interned LAST among the heap types so no
   // existing index shifts. The `(array (mut f64))` backing first, then its `{backing,len,
   // cap}` wrapper struct (which references the backing). Present only when `fa64Used`.
@@ -2908,6 +2941,36 @@ export function mAssignTypeIndices(_n: i32) {
 // FUTURE ROUTE: the two sibling forcers live in `emit_classify.vl` next to
 // `forceScalarListField`. This one stays here because it is `collectA`'s own reservation
 // concern and because that file is held by a concurrent slice; moving it is a pure relocation.
+// Whether an annotation spelling that MENTIONS an i32-keyed map is one the emitter can
+// lower: 0 when it is, else the loud reject (-1) naming which half failed. Two spellings
+// pass — a BARE `{[i32]: V}` and its `| null` twin — with a VALUE that rides the MONO
+// rep. "Rides the mono rep" is not re-decided here: it is `mvValKindOfName == -1`, the
+// interner's OWN classifier (i32 / boolean / a literal-union atom / a nullable atom),
+// which is exactly the set whose values live in the shared i32 `vals` list. A value that
+// would intern an mv slot needs a per-value i32-keyed map struct, and none is minted.
+function i32MapSpellingLowerable(name: string) {
+  let bare = name
+  const inner = nulMapInnerName(name)
+  if inner != "" { bare = inner }
+  if !nameIsMapSpanEnds(bare) || !nameIsI32KeyedMap(bare) {
+    return emitFail(
+      "emitProgram: an i32-keyed Map/Set is supported as a binding / parameter / " +
+        "return / `| null` only — not inside '" +
+        name +
+        "'",
+    )
+  }
+  const vn = mapSpellValName(bare)
+  if mvValKindOfName(mvCanonValName(vn)) != -1 {
+    return emitFail(
+      "emitProgram: unsupported i32-keyed map value type '" +
+        vn +
+        "' (i32-keyed Map/Set values are i32 / boolean / literal-union atoms)",
+    )
+  }
+  0
+}
+
 function forceGenAppArgTypes(name: string): i32 {
   if !annGenAppSpanEnds(name) { return 0 }
   const args: string[] = []
@@ -3004,6 +3067,7 @@ export function collectA(_stmts: i32[]) {
   rlElemNullable = []
   pendingNulRefHeap = -1
   mUsed = false
+  mI32Used = false
   slUsed = false
   fa64Used = false
   mvValName = []
@@ -3110,6 +3174,11 @@ export function collectA(_stmts: i32[]) {
           mUsed = true
           lUsed = true
           aUsed = true
+          // An UN-annotated `Map()`/`Set()` whose key the checker inferred as i32
+          // (`const m = Map()` then `m.set(1, 2)`) has no map spelling anywhere in the
+          // arena for the `TypeRef` walk below to read, so the KEY comes off the
+          // constructor call's own recorded type.
+          if nodeTyMapKeyIsI32(i) { mI32Used = true }
         }
         // The array-intrinsic allocators (std-design D1) construct a list even
         // with no literal/annotation in sight: an f64 FILL forces the f64
@@ -3153,6 +3222,19 @@ export function collectA(_stmts: i32[]) {
         }
       }
     } else if nd is TypeRef {
+      // THE i32-KEYED MAP's CAPABILITY GATE, asked of EVERY annotation name before the
+      // type-forcing chain below reads it. The i32-keyed rep is the MONO map (`-4`/`-5`
+      // shapes): its `vals` is the i32 list, and it has no per-value-type map struct and
+      // no ref-list/field/element plumbing minted for it. So exactly two spellings lower
+      // — a BARE `{[i32]: i32}` / `{[i32]: boolean}` and its `| null` twin — and every
+      // other position an i32-keyed map could occupy (an ARRAY element, a STRUCT or
+      // VARIANT field, a UNION member, a MAP VALUE, a closure result) is a LOUD reject
+      // here rather than a mono-shaped lowering against the string-keyed struct, which is
+      // invalid wasm that `vl check` cannot see. The parser writes the spelling with no
+      // spaces (`"{[" + key + "]:" + val + "}"`), so the containment test is exact.
+      if strContains(nd.tyName, "{[i32]:") {
+        if i32MapSpellingLowerable(nd.tyName) < 0 { return -1 }
+      }
       // A TOP-LEVEL function-type annotation (`(i32) => R`): the function-type name
       // itself needs no array/list type, but its RETURN `R` may (an `i32[]`/`string[]`/
       // `f64[]` result list, or a `string`). Force the return's backing types so the
@@ -3202,6 +3284,12 @@ export function collectA(_stmts: i32[]) {
         mUsed = true
         lUsed = true
         aUsed = true
+        // An i32-KEYED map (`{[i32]: V}`) additionally forces its own map struct (the
+        // `keys` field is the i32 list, not the string-ref list) and the i32-keyed
+        // probe helper. This walk sees EVERY `TypeRef`, so every annotated i32-keyed
+        // map — local, param, return, global, nested — contributes the flag here,
+        // before `mAssignTypeIndices` mints the type.
+        if nameIsI32KeyedMap(nd.tyName) { mI32Used = true }
         // A REF value type (`{[string]: string}` / `{[string]: {x:i32}}`) interns a
         // per-value-type map slot (its own map struct over a ref vals list). All mv
         // interning happens HERE (collect scans every TypeRef), so the type-index
@@ -3217,6 +3305,7 @@ export function collectA(_stmts: i32[]) {
         mUsed = true
         lUsed = true
         aUsed = true
+        if nameIsI32KeyedMap(nd.tyName) { mI32Used = true }
         mvShapeOfValName(mapValNameOf(nulMapInnerName(nd.tyName)))
       } else if nameIsStringArray(nd.tyName) {
         // A `string[]` annotation is a string-ref list — the SAME wrapper/backing as
@@ -3865,6 +3954,19 @@ function collectNestedFieldShapes(stmts: i32[]) {
 // in `emit_classify.vl`); the atom name then comes from the annotation's own spelling, which is
 // what these two arms supply.
 function fieldRecElemName(tyIx: i32, code: i32) {
+  // An i32-KEYED map FIELD (code 19, or 29 nullable). `collectA`'s capability gate
+  // cannot see this position — the field's own annotation node IS a bare map, which is
+  // a supported spelling — so the FIELD asks here. Without it the field's cell resolves
+  // the STRING-keyed struct (the mv-slot layer the i32-keyed rep does not join) and the
+  // reject lands much later, at the first key op, with a message about the KEY.
+  if code == 19 || code == 29 {
+    if strContains(tyNameOf(tyIx), "{[i32]:") {
+      emitFail(
+        "emitProgram: an i32-keyed Map/Set cannot be a struct / variant FIELD — " +
+          "supported as a binding / parameter / return / `| null` only",
+      )
+    }
+  }
   const en = fieldRefElemName(tyIx)
   // A literal-union atom field (code 0) records its union NAME (not the ref-elem name,
   // which is "" for it) so `sFieldIsLitUnion` recovers the atom rep + membership.

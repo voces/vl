@@ -140,8 +140,8 @@ hatch").** All four are prerequisites for each other in practice:
   half (`describe`/`it`/`itSkip`/`beforeEach`/`afterEach`) beside the matchers.
   Shipped shape + the three divergences from the charter: `docs/internals/vl-test-design.md`.
 
-**P2 — wanted, not gating:** i32-keyed Map/Set + `for k in map` (B6a); contextual f32 literals (sim
-code is f32-saturated and today every constant needs a cast); **`match` phase 2 — variant payload
+**P2 — wanted, not gating:** ~~i32-keyed Map/Set + `for k in map` (B6a)~~ **DONE** for the mono value
+rep (i32 / boolean / atom values); ~~contextual f32 literals~~ **DONE**; **`match` phase 2 — variant payload
 binding** (`match cmd { Move{x,y} => … }`); literal-union compact representation (A16); readonly
 fields / A9 variance; default params (B15a); SIMD over Buffer (unlocked by P0, not requested yet);
 keep emitting a names section on non-`-O` builds.
@@ -403,8 +403,9 @@ in-language GC knobs.
     hybrid delivery, the two-primitive intrinsic floor + `__trap__`, slices 0–6 with gates; six
     open decisions flagged for the maintainer). Doubles as the demand-driven discovery engine
     for the remaining emitter long tail (each gap fails loudly).
-  - The `.vl` compiler is now the spec, so the parked soundness xfails (arith-hole-operand — A13;
-    array-element-recursion — i32-keyed maps) are fixable bugs, not parity constraints.
+  - The `.vl` compiler is now the spec, so the parked soundness xfails (arith-hole-operand — A13)
+    are fixable bugs, not parity constraints. (array-element-recursion was one until B6a's i32-keyed
+    `Map` retired its premise that `{[i32]: T}` spells `T[]`; it is now a passing case.)
 - ✅ **`vl test`.** SHIPPED — see `docs/internals/vl-test-design.md` for the built protocol and the
   three divergences from the charter (brain in `compiler/cli.vl` not `std/test/runner.vl`;
   compilation stays VL-side and only EXECUTION crosses; `.only` is not spellable in VL, so
@@ -530,8 +531,11 @@ in-language GC knobs.
   `xs.push(...ys)` once variadics land); representation inference (§VL.7 — lower never-grown
   values to a header-less fixed array); `map`/`filter` build-side generics for `Map`/`Set` (A10);
   `.vl`-std migration once a module system exists. (design: `docs/guide/collections-design.md`)
-- 🟡 **B6a. `Map` + `Set`.** REMAINING: **i32-keyed Map/Set** (clean diagnostic for now — i32 keys
-  use `T[]`); `for k in map` direct iteration (parser; use `.keys()` today); `map`/`filter` over
+- 🟡 **B6a. `Map` + `Set`.** REMAINING: **i32-keyed Map/Set beyond the MONO value rep** — `{[i32]: V}`
+  ships for `i32` / `boolean` / literal-union-atom values as a binding / parameter / return / `| null`
+  (every other value type and every other position is a loud emit-tier reject); a ref/wide value
+  (`string`, struct, list, `f64`/`i64`/`f32`) needs a per-value i32-keyed map struct + its mv-slot
+  plumbing, and a FIELD / array-element / map-value position needs the same. Also: `map`/`filter` over
   Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`. (Self-host native parity:
   string-keyed maps, delete, `Set`/`.add`/`.get`, and ref-valued maps (string/struct values, #319)
   landed; map-typed params are the remaining native map gap.)

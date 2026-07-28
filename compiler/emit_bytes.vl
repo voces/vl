@@ -61,7 +61,10 @@ import {
   listIdxScratchBase,
   localIsRef,
   localStructIdx,
+  mI32Used,
+  mStructI32Idx,
   mStructIdx,
+  mapI32Base,
   mapKeysBase,
   mapScratchBase,
   mapValsBase,
@@ -505,6 +508,48 @@ export function fbI32Bin(op: i32) {
   wU8(op)
   0
 }
+// THE ONE HOME of the i32-KEYED map's KEY HASH — the murmur3 32-bit finalizer, masked
+// non-negative to match `__str_hash__`'s contract (the stored `hashes` array and the
+// `i32.rem_u` slot pick are shared with the string-keyed rep, so the two hashes must
+// agree on their range). Reads the key from `srcLocal`, uses `tmpLocal` as its
+// accumulator, and leaves the hash on the stack.
+//
+// The identity hash a fourCC table would otherwise get (`key % cap`) clusters badly on
+// exactly the workload that motivates i32 keys — four-character codes share their high
+// bytes — and a clustered open-addressing table degrades to a linear scan, so the mix
+// is not optional. Emitted at TWO sites (the probe helper's body and the append-side
+// `emitMapHashOf`); one generator, so they cannot drift.
+export function fbI32HashMix(srcLocal: i32, tmpLocal: i32) {
+  fbLocalGet(srcLocal)
+  fbLocalSet(tmpLocal)
+  // h = (h ^ (h >>> 16)) * 0x85ebca6b
+  fbLocalGet(tmpLocal)
+  fbLocalGet(tmpLocal)
+  fbI32Const(16)
+  fbI32Bin(118)              // 0x76 i32.shr_u
+  fbI32Bin(115)              // 0x73 i32.xor
+  fbI32Const(0 - 2048144789) // 0x85ebca6b
+  fbI32Bin(108)              // 0x6c i32.mul
+  fbLocalSet(tmpLocal)
+  // h = (h ^ (h >>> 13)) * 0xc2b2ae35
+  fbLocalGet(tmpLocal)
+  fbLocalGet(tmpLocal)
+  fbI32Const(13)
+  fbI32Bin(118)
+  fbI32Bin(115)
+  fbI32Const(0 - 1028477387) // 0xc2b2ae35
+  fbI32Bin(108)
+  fbLocalSet(tmpLocal)
+  // h = (h ^ (h >>> 16)) & 0x7fffffff — non-negative, like `__str_hash__`
+  fbLocalGet(tmpLocal)
+  fbLocalGet(tmpLocal)
+  fbI32Const(16)
+  fbI32Bin(118)
+  fbI32Bin(115)
+  fbI32Const(2147483647)
+  fbI32Bin(113) // 0x71 i32.and
+  0
+}
 // i32.store: 0x36 <align-exp> <offset> — fixed align=4 bytes (exponent 2), offset 0,
 // matching the host's `__store_i32__` builtin body (`m.i32.store(0, 4, addr, v)`).
 export function fbI32Store() {
@@ -666,6 +711,19 @@ export function emitFail(msg: string) {
 // Each guards its parallel-table read (the `fbValtype` discipline): a slot whose
 // vals ref-list / struct index never resolved fails loudly, never traps the compiler.
 export function mapTypeIdxOf(slot: i32) {
+  // The i32-KEYED shapes (`-4` map, `-5` Set) select the i32-keyed struct. Guarded
+  // rather than assumed: reaching here with the flag unset means the collect walk
+  // never saw this map's spelling, so the heap type was never minted — fail loudly
+  // instead of emitting a `struct.get` against the string-keyed twin (invalid wasm).
+  if slot == -4 || slot == -5 {
+    if !mI32Used {
+      emitFail(
+        "emitProgram: i32-keyed map but its map struct was not collected",
+      )
+      return 0
+    }
+    return mStructI32Idx
+  }
   if slot < 0 { return mStructIdx }
   if slot >= mvMapTypeIdx.length {
     emitFail("emitProgram: map value slot has no minted map struct type")
@@ -763,6 +821,10 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   // G8 map scratch frame (15 slots).
   mapScratchBase = fbScratchCur
   if fnUsesMap { fbReserve(15) }
+  // The i32-KEYED map's extra slots (5), reserved only in a module that has one — so
+  // every frame after it is byte-identical in a string-keyed-only program.
+  mapI32Base = fbScratchCur
+  if fnUsesMap && mI32Used { fbReserve(5) }
   // `m.keys()` / `for k in m` key-list builder frame (6 slots).
   mapKeysBase = fbScratchCur
   if fnUsesMapKeys { fbReserve(6) }
@@ -912,6 +974,7 @@ export function fbLocalsCount(nLocals: i32) {
   if fnUsesF32Push { n = n + 4 }
   if fnUsesStrOp { n = n + 7 }
   if fnUsesMap { n = n + 15 + mvValName.length * 3 }
+  if fnUsesMap && mI32Used { n = n + 5 }
   if fnUsesMapKeys { n = n + 6 }
   if fnUsesMapVals { n = n + 6 + mvValName.length }
   if fnUsesCallRef { n = n + 1 }
@@ -1037,6 +1100,16 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(aTypeIdx)
     fbRefRun(aTypeIdx)
     fbI32Run()
+  }
+  // The i32-KEYED map's extra slots, in `fbBeginFunc`'s reservation order:
+  //   0 keyI32 i32, 1 keysBk (ref $aTypeIdx), 2 kOut (ref $aTypeIdx),
+  //   3 kSrc (ref $aTypeIdx), 4 mapRef (ref $mStructI32Idx).
+  if fnUsesMap && mI32Used {
+    fbI32Run()
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbRefRun(mStructI32Idx)
   }
   // `m.keys()` / `for k in m` key-list builder frame (6 slots): outBack (ref $mkArrIdx),
   // keysBack (ref $mkArrIdx), live (ref $aTypeIdx), i, j, count (3 i32).

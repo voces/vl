@@ -149,8 +149,6 @@ const tiersOf = (s: string): Tier[] => {
 // below re-runs every entry and FAILS when one starts agreeing — an exclusion
 // that has been fixed must be deleted, not left to rot.
 const EXCLUSIONS: Record<string, string> = {
-  "soundness/xfail-array-element-recursion.vl":
-    "parked soundness xfail — the checker rejects the i32-keyed-map element recursion this case builds (`unknown type '{[i32]:Tree}'`), so it never reaches the emitter and cannot produce its @log lines",
   "soundness/README.vl":
     "the soundness directory's INDEX, not a case — its prose explanation of the directive vocabulary contains a line-leading `@run`, which the scan reads as a directive; the file's real directive is `@check` and it declares no top-level statement for the emitter to lower",
   "lint/generic-intersection-no-warn.vl":

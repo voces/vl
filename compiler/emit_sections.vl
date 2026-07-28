@@ -130,6 +130,7 @@ import {
   gF32PrintIdx,
   gF64PrintIdx,
   gHelpMapProbe,
+  gHelpMapProbeI32,
   gHelpMapResize,
   gHelpStrConcat,
   gHelpStrEq,
@@ -155,6 +156,7 @@ import {
   loopBrkLabel,
   loopContDepth,
   loopContLabel,
+  mI32Used,
   mUsed,
   memLogUsed,
   memUsed,
@@ -247,6 +249,7 @@ import {
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
+  fbI32HashMix,
   fbI32Load,
   fbI64Const,
   fbIf,
@@ -1587,6 +1590,88 @@ function emitMapProbeFnCode(out: i32[]) {
   helpFrameBody(out, body)
 }
 
+// `__map_probe_i32__(index, hashes, live, keysBacking, key) -> i32`: the i32-KEYED
+// twin of `__map_probe__`, line for line, with two substitutions — the key is hashed
+// by the integer mix (`fbI32HashMix`) instead of `__str_hash__`, and the stored-hash
+// gate falls through to an `i32.eq` on the key instead of a call into `__str_eq__`.
+// Everything else (the wrapping linear probe, the free-slot break, the tombstone
+// skip, the entry+1 encoding) is IDENTICAL, which is what lets both key kinds share
+// `__map_resize__`, the rehash and the compaction. Params: index(0), hashes(1),
+// live(2), keysBack(3), key(4). Locals: cap(5), keyHash(6), slot(7), entry(8).
+function emitMapProbeI32FnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(1) // 1 locals run
+  wULEB(4) // count 4
+  wU8(127) // 0x7f i32
+  // cap = array.len(index)
+  fbLocalGet(0)
+  fbArrayLen()
+  fbLocalSet(5)
+  // keyHash = mix(key)
+  fbI32HashMix(4, 6)
+  fbLocalSet(6)
+  // slot = keyHash % cap
+  fbLocalGet(6)
+  fbLocalGet(5)
+  fbI32Bin(112) // 0x70 i32.rem_u
+  fbLocalSet(7)
+  fbBlock(64)   // block (probe break target), void
+  fbLoop(64)    // loop, void
+  // entry = index[slot] ; if entry == 0 { br out (miss) }
+  fbLocalGet(0)
+  fbLocalGet(7)
+  fbArrayGet(aTypeIdx)
+  fbLocalSet(8)
+  fbLocalGet(8)
+  fbI32Eqz()
+  fbBrIf(1) // → out of the probe block
+  // hashes[entry-1] == keyHash && live[entry-1] != 0
+  //   ? keysBack[entry-1] == key : 0
+  fbLocalGet(1)
+  fbLocalGet(8)
+  fbI32Const(1)
+  fbI32Bin(107)        // i32.sub (entry - 1)
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(6)
+  fbI32Bin(70)         // 0x46 i32.eq
+  fbLocalGet(2)
+  fbLocalGet(8)
+  fbI32Const(1)
+  fbI32Bin(107)
+  fbArrayGet(aTypeIdx)
+  fbI32Const(0)
+  fbI32Bin(71)         // 0x47 i32.ne (live != 0)
+  fbI32Bin(113)        // 0x71 i32.and
+  fbIf(127)            // if, i32 blocktype
+  fbLocalGet(3)
+  fbLocalGet(8)
+  fbI32Const(1)
+  fbI32Bin(107)
+  fbArrayGet(aTypeIdx) // keysBack[entry-1] — a raw i32
+  fbLocalGet(4)
+  fbI32Bin(70)         // 0x46 i32.eq
+  fbElse()
+  fbI32Const(0)        // hash/live mismatch → not a hit
+  fbEnd()
+  // if match { br out (hit) }
+  fbBrIf(1)
+  // slot = (slot + 1) % cap  (collision OR a tombstone marker: keep probing)
+  fbLocalGet(7)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalGet(5)
+  fbI32Bin(112) // i32.rem_u
+  fbLocalSet(7)
+  fbBr(0)       // → loop header
+  fbEnd()       // end (loop)
+  fbEnd()       // end (probe block)
+  fbLocalGet(7) // the probe slot
+  fbEnd()       // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // `__map_resize__(index, hashes, live, count, size) -> (ref $aTypeIdx)`: when the
 // load factor crosses 1/2 (`size*2 >= len(index)`) allocate a doubled index and
 // RE-PLACE every LIVE entry from its STORED hash (no key re-hashing — mirrors
@@ -1713,6 +1798,7 @@ function emitNameSection(n: i32) {
   let count = gImports + n
   if gHelpStrHash >= 0 { count = count + 3 }
   if gHelpMapProbe >= 0 { count = count + 2 }
+  if gHelpMapProbeI32 >= 0 { count = count + 1 }
   wULEB(count)
   if gImports > 0 {
     wULEB(0)
@@ -1766,6 +1852,10 @@ function emitNameSection(n: i32) {
     wName("__map_probe__")
     wULEB(gHelpMapResize)
     wName("__map_resize__")
+  }
+  if gHelpMapProbeI32 >= 0 {
+    wULEB(gHelpMapProbeI32)
+    wName("__map_probe_i32__")
   }
   wTarget(mapPrev)
 
@@ -1872,6 +1962,7 @@ function emitModule(_stmts: i32[]) {
   gHelpStrEq = -1
   gHelpStrConcat = -1
   gHelpMapProbe = -1
+  gHelpMapProbeI32 = -1
   gHelpMapResize = -1
   let nHelpers = 0
   const helpBase = gImports + n + hasStart + memFn
@@ -1887,6 +1978,13 @@ function emitModule(_stmts: i32[]) {
     gHelpMapProbe = helpBase + nHelpers
     nHelpers = nHelpers + 1
     gHelpMapResize = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  // The i32-KEYED probe, LAST so no existing helper index moves in a program without
+  // one (`__map_resize__` is key-agnostic — it re-places from the STORED hashes — so
+  // the i32-keyed map shares it and only the probe needs a twin).
+  if mI32Used {
+    gHelpMapProbeI32 = helpBase + nHelpers
     nHelpers = nHelpers + 1
   }
 
@@ -2905,6 +3003,33 @@ function emitTypeSection(
     wSLEB(aTypeIdx)
     wU8(1)   // mutable
   }
+  if mI32Used {
+    // The i32-KEYED map struct — the same 7 fields in the same order, with field 0
+    // `keys` re-typed to the i32 list wrapper (`$lTypeIdx` over `$aTypeIdx`) instead
+    // of the string-ref list. Every other field is byte-identical to the twin above,
+    // which is why the probe/rehash/compact machinery is shared.
+    wU8(95)  // 0x5f struct (i32-keyed map)
+    wU8(7)   // 7 fields
+    wU8(100) // field 0 keys: 0x64 (ref $lTypeIdx) — non-null i32 list
+    wSLEB(lTypeIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
+    wSLEB(lTypeIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(127) // field 4 count: 0x7f i32
+    wU8(1)   // mutable
+    wU8(127) // field 5 size: 0x7f i32
+    wU8(1)   // mutable
+    wU8(100) // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+  }
   if fa64Used {
     // The f64 array `(array (mut f64))` (Slice 4): `0x5e` array form, `0x7c` f64
     // storagetype, `0x01` mutable — the f64 analogue of the `5e 7f 01` i32 array.
@@ -3157,6 +3282,11 @@ function emitTypeSection(
   if gHelpMapProbe >= 0 {
     helpFuncType("aaama", "i") // __map_probe__: (index, hashes, live, keysBacking, key) -> slot
     helpFuncType("aaaii", "a") // __map_resize__: (index, hashes, live, count, size) -> index'
+  }
+  if gHelpMapProbeI32 >= 0 {
+    // __map_probe_i32__: (index, hashes, live, keysBacking, key i32) -> slot — the same
+    // five operands with an i32 keys backing (`a`) and an i32 KEY (`i`).
+    helpFuncType("aaaai", "i")
   }
   // The EXPORT-WRAPPER functypes LAST (#1265), one per export entry, each the target's
   // own signature emitted with `withEnv` FALSE — the clean ABI shape, produced by the
@@ -3696,6 +3826,9 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   if gHelpMapProbe >= 0 {
     if emitMapProbeFnCode(codePayload) < 0 { return -1 }
     if emitMapResizeFnCode(codePayload) < 0 { return -1 }
+  }
+  if gHelpMapProbeI32 >= 0 {
+    if emitMapProbeI32FnCode(codePayload) < 0 { return -1 }
   }
   // The export-wrapper bodies LAST, in the same order the function section declared them.
   let wci = 0

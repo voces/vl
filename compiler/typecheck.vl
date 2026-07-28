@@ -1205,6 +1205,13 @@ function mkMapTy(key: i32, val: i32, isSet: i32) {
   addTy(t)
 }
 
+// THE ONE HOME of "which key types does a `Map`/`Set` support" — `string` (hashed
+// element-wise, `__str_hash__`) and `i32` (hashed by the integer mix). Both annotation
+// gates (`tsToTy`'s `TS_MAP`, `nameToTyReal`'s map arm) ask it, so a third key type is
+// admitted in one place; any other key resolves to -1 and the caller reports the
+// unsupported-key diagnostic (`checkLetDeclNode`).
+export function mapKeyTySupported(k: i32) { k == TY_STR || k == TY_I32 }
+
 function mkTyVar(name: string) {
   const t: Ty = { tvName: name }
   addTy(t)
@@ -5943,16 +5950,16 @@ function tsToTyReal(ix: i32) {
     if aeTy < 0 { return -1 }
     return mkArrayTy(aeTy)
   }
-  // A string-keyed MAP `{[K]: V}`. The key is a bare identifier TOKEN, not a
-  // parsed type, so it rides `tsText`; only string keys are supported (the
-  // host's map rep), and a non-string key resolves to -1 for "unknown type".
+  // A MAP `{[K]: V}`. The key is a bare identifier TOKEN, not a parsed type, so it
+  // rides `tsText`; `string` and `i32` keys are supported (`mapKeyTySupported` — the
+  // two the map rep hashes), and any other key resolves to -1 for "unknown type".
   // An UNRESOLVED VALUE poisons the annotation, like the array/union arms: a
   // `mkMapTy(str, -1)` here would be indistinguishable from the empty-`Map()`
   // INFERENCE hole, so the checker would accept `{[string]: nope}` in silence
   // and the emitter would lower a value slot it has no type for.
   if k == TS_MAP {
     const mk = tsLeafTy(tsText[ix])
-    if mk != TY_STR { return -1 }
+    if !mapKeyTySupported(mk) { return -1 }
     const mvTy = tsToTy(tsKids[start])
     if mvTy < 0 { return -1 }
     return mkMapTy(mk, mvTy, 0)
@@ -6137,10 +6144,10 @@ function nameToTyReal(name: string) {
     if aeTy < 0 { return -1 }
     return mkArrayTy(aeTy)
   }
-  // A string-keyed MAP `{[K]:V}` (the parser's synthetic index-signature name) —
-  // the MAP-NAME grammar's SPAN and its two CUTS, each at its home in `tyname.vl`. Only
-  // string keys are supported (the host's map rep); a non-string key resolves to
-  // -1 so the caller reports "unknown type". An UNRESOLVED VALUE poisons the
+  // A MAP `{[K]:V}` (the parser's synthetic index-signature name) —
+  // the MAP-NAME grammar's SPAN and its two CUTS, each at its home in `tyname.vl`. The
+  // supported keys are `string` and `i32` (`mapKeyTySupported`); any other key resolves
+  // to -1 so the caller reports "unknown type". An UNRESOLVED VALUE poisons the
   // annotation too — the `mkMapTy(str, -1)` it would otherwise build is the
   // empty-`Map()` INFERENCE hole, which every consumer reads as "not yet known"
   // rather than "no such type".
@@ -6151,7 +6158,7 @@ function nameToTyReal(name: string) {
   // exactly as the un-taken `while` did.
   if nameIsMapSpanEnds(name) && mapSpellKeyEnd(name) >= 0 {
     const mk = nameToTy(mapSpellKeyName(name))
-    if mk != TY_STR { return -1 }
+    if !mapKeyTySupported(mk) { return -1 }
     const mv = nameToTy(mapSpellValName(name))
     if mv < 0 { return -1 }
     return mkMapTy(mk, mv, 0)
@@ -17817,6 +17824,23 @@ export function nodeTyMapValName(ix: i32) {
   ""
 }
 
+// True if node `ix`'s recorded type is an i32-KEYED map (`{[i32]: V}`), one `| null`
+// wrapper tolerated — the KEY twin of `nodeTyMapValName`, and a NO-RENDER variant-tag
+// walk. The emitter's shape resolvers (`mapShapeOfExpr`'s arena fall-through) ask it to
+// pick the i32-keyed map struct for a receiver whose syntactic arms carry no type NAME.
+export function nodeTyMapKeyIsI32(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const it = T.tys[t.nInner]
+    if it is TyMap { return it.mKey == TY_I32 }
+    return false
+  }
+  if t is TyMap { return t.mKey == TY_I32 }
+  false
+}
+
 // True if node `ix` has a recorded NULLABLE-STRUCT type (`P | null`) — a cheap NO-RENDER check (a
 // `TyNullable` wrapping a `TyObj`). The nullable dual of `nodeTyIsObj`: gates the emitter's nullable
 // consumer classifiers (`exprNullableStruct`) so a nullable-struct-returning closure value call whose
@@ -19043,19 +19067,25 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
     if tn is TypeRef {
       annot = nameToTyAt(tn.tyName, n.letType)
       if annot < 0 {
-        // An i32-keyed map shape (`{[i32]: V}`) is the native list/array path,
-        // not the string-keyed hash map — report that directly (with the fix)
-        // instead of a bare "unknown type", naming the constructor in play.
-        // An emitter/runtime-capability rejection (the map rep is string-keyed),
-        // not a type error — the unsupported-lowering channel. The KEY CUT is the
-        // MAP-NAME grammar's, at its home (this read the private `mapShapeKeyName`,
-        // which WAS that home's body written out a second time).
-        if mapSpellKeyName(tn.tyName) == "i32" {
+        // A map shape whose KEY is neither `string` nor `i32` (`{[boolean]: V}`,
+        // `{[f64]: V}`) has no hash in the map rep — report that directly (with the
+        // supported set) instead of a bare "unknown type", naming the constructor in
+        // play. An emitter/runtime-capability rejection, not a type error — the
+        // unsupported-lowering channel. The KEY CUT is the MAP-NAME grammar's, at its
+        // home (this read the private `mapShapeKeyName`, which WAS that home's body
+        // written out a second time).
+        // A SUPPORTED key with an unresolvable VALUE (`{[string]: nope}`) is not a
+        // key problem — it keeps the bare "unknown type", so this arm asks the key
+        // gate itself rather than "is there a key text at all".
+        const badKey = mapSpellKeyName(tn.tyName)
+        if badKey != "" && !mapKeyTySupported(nameToTy(badKey)) {
           tErrUnsupported(
-            "An i32-keyed " +
+            "A " +
+              badKey +
+              "-keyed " +
               initMapCtorName(n.letInit) +
-              " isn't supported yet — i32 keys use a list/array (`T[]`); " +
-              "`Map`/`Set` keys must be `string` for now",
+              " isn't supported yet — `Map`/`Set` keys must be " +
+              "`string` or `i32`",
             n.letType,
           )
         } else {

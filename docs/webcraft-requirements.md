@@ -544,9 +544,29 @@ and needs nothing from vl beyond scalar exports.
 
 ## P2 — wanted, not gating
 
-- **i32-keyed Map/Set** (B6a remaining): rule tables keyed by fourCC. Until
+- ~~**i32-keyed Map/Set** (B6a remaining): rule tables keyed by fourCC. Until
   then webcraft uses sorted arrays/views; string keys would mean formatting
-  fourCCs, which is silly. Also `for k in map` iteration.
+  fourCCs, which is silly. Also `for k in map` iteration.~~ **DONE** for the ask;
+  one half deferred and measured.
+  > **`for k in map` was already shipped** — measured before anything was built:
+  > a bare `for k in m` over a string-keyed map runs today in every receiver ×
+  > scope cell (its reservation is pinned by
+  > `tests/cases/maps/map-scratch-frame-reservation.vl`, taught in #1249). Only
+  > the roadmap row still listed it as remaining. The i32 twin ships at parity.
+  >
+  > **The i32-keyed half ships for the value types a fourCC rule table needs** —
+  > `{[i32]: i32}` / `{[i32]: boolean}` / atom values, and the `{[i32]: boolean}`
+  > `Set` — as a binding, parameter, return or `| null`, with the full string-keyed
+  > surface (`m[k]` / `m[k] = v` / `.set` / `.get` / `.has` / `.delete` / `.length`
+  > / `.keys()` / `.values()` / bare `for k in m`) and the SAME insertion-ordered
+  > iteration. A mirror-parity grid of every operation × value type × scope reads
+  > PARITY with its string-keyed twin in every cell whose value rides the mono rep.
+  >
+  > **Deferred, and a loud emit-tier reject until it lands:** a REF or WIDE value
+  > (`{[i32]: string}`, struct, list, `f64`/`i64`/`f32`) and the composition
+  > positions (a struct/variant FIELD, an array ELEMENT, a map VALUE). Both need a
+  > per-value i32-keyed map struct and the mv-slot plumbing around it; neither is
+  > silent — `vl build` exits 1 naming the value type or the position.
 - ~~**Contextual f32 literals**: `let x: f32 = 0.5` and `f32-typed` call sites
   accepting bare literals without `as f32` noise. Sim code is f32-saturated;
   today's `.`-literal-defaults-to-f64 + lossy-rejection rules make every
