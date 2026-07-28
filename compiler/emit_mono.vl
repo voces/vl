@@ -107,6 +107,8 @@ import {
   monoKeys,
   monoOrigNode,
   monoProgStmts,
+  reExpName,
+  reExpTarget,
   sNames,
 } from "./emit_state"
 import { emitFail } from "./emit_bytes"
@@ -2214,6 +2216,84 @@ function monoWalk(ix: i32, ctx: i32) {
   0
 }
 
+// Is `name` part of the module's wasm ABI — the public name or the internal target of a
+// staged export alias? The driver fills `reExpName`/`reExpTarget` BEFORE `emitProgram` runs
+// (single-source: an `EXPORT FUNCTION IDENT` token scan; module mode: the merged, mangled
+// targets), so both tables are populated by the time the monomorphizer's prune reads them.
+// The comparison is by NAME because `emitExportSection` resolves the export section the same
+// way. Both tables are consulted: the single-source path pushes the same string into each,
+// and the module path's public name may differ from its mangled target.
+function monoNameIsExported(name: string) {
+  let i = 0
+  while i < reExpTarget.length {
+    if reExpTarget[i] == name { return true }
+    i = i + 1
+  }
+  let j = 0
+  while j < reExpName.length {
+    if reExpName[j] == name { return true }
+    j = j + 1
+  }
+  false
+}
+
+// Which of `names` is referenced as a function VALUE — i.e. appears as an `Ident` that is NOT
+// some `Call`'s callee — anywhere in the node arena. Returns an `i32[]` parallel to `names`
+// (1 = value-referenced). ONE arena pass regardless of how many names are asked about: the
+// callee positions are marked first (a `Call` names its callee by NODE, `callFn`), then every
+// remaining `Ident` is compared against the (small) candidate list.
+//
+// This is the soundness gate the un-annotated-param prune below needs and the `<T>` prune does
+// not. A `<T>` decl is only ever reached by instantiation, but a NAMED un-annotated-param
+// function is an ordinary first-class value: `const g = f`, `hof(f, 3)`, `return f` all hand a
+// funcref out WITHOUT going through `monoInstantiate` for some of those spellings, so its slot
+// can still equal its captured original while the program very much uses it. Measured on
+// `231e137c`: `function pick(): (i32) => i32 { return inc }` over an un-annotated `inc` runs
+// and prints, and `const g = exclaim` (never called) is a clean emit-error reject — stubbing
+// either would have moved a cell BACKWARD.
+//
+// Conservative by construction: a same-named LOCAL (`const exclaim = 5`) also matches and
+// merely declines the prune, which is the status quo, never a regression.
+function monoNamesUsedAsValue(names: string[]): i32[] {
+  const hit: i32[] = []
+  let h = 0
+  while h < names.length {
+    hit.push(0)
+    h = h + 1
+  }
+  if names.length == 0 { return hit }
+  const isCallee: i32[] = []
+  let i = 0
+  while i < P.nodes.length {
+    isCallee.push(0)
+    i = i + 1
+  }
+  let j = 0
+  while j < P.nodes.length {
+    const cn = P.nodes[j]
+    if cn is Call {
+      const cf = cn.callFn
+      if cf >= 0 && cf < isCallee.length { isCallee[cf] = 1 }
+    }
+    j = j + 1
+  }
+  let k = 0
+  while k < P.nodes.length {
+    if isCallee[k] == 0 {
+      const idn = P.nodes[k]
+      if idn is Ident {
+        let m = 0
+        while m < names.length {
+          if names[m] == idn.identName { hit[m] = 1 }
+          m = m + 1
+        }
+      }
+    }
+    k = k + 1
+  }
+  hit
+}
+
 // The monomorphization pass: snapshot which lifted functions are generic, then
 // walk every top-level statement (program order — a `const ys = get([…])` pins
 // `get` before a later `first(ys)` reads its return kind) and every NON-generic
@@ -2289,18 +2369,83 @@ export function monomorphize(stmts: i32[]) {
   // Replace each with a concrete no-op STUB (same name, no params, void body) — valid dead
   // code; nothing references it (any reference would have instantiated it).
   //
-  // GATED on type params (`<T>`), NOT the broader `monoGen` (which also flags un-annotated-
-  // param functions): a lifted lambda (`(x) => x * 2`) has an un-annotated param but is
-  // invoked as a function VALUE through `call_ref`, never via `monoInstantiate`, so its slot
-  // also stays un-replaced — stubbing it would silently no-op the callback. A `<T>` decl
+  // A `<T>` decl takes this treatment UNCONDITIONALLY (master's behavior, byte-identical): it
   // cannot be a lambda (anonymous literals take no type params) and is only ever reached by
-  // instantiation, so this gate prunes exactly the dead templates.
+  // instantiation.
+  //
+  // #1254 MECHANISM B — THE UN-ANNOTATED-PARAM HALF OF THE SAME SET. The gate used to be
+  // `<T>`-only, so a NAMED function with an un-annotated parameter and no call site was emitted
+  // as its TEMPLATE: the hole takes the default i32 valtype while the body's operator lowering
+  // picks its type from the other operand, so `function exclaim(s) { return s + "!" }` emitted a
+  // string-concat helper call over an i32 param — `vl check` rc 0, INVALID WASM. `monoIsGenericDecl`
+  // already flags the whole family (that is what makes it `monoGen == 1`); only the PRUNE declined
+  // it. Measured on `231e137c`, 12 distinct invalid-wasm shapes: 1 and 2 params, `+ "!"` and
+  // `== "a"`, module scope and nested (with the outer called AND uncalled), recursive, a mixed
+  // annotated+hole signature, an uncalled caller of an uncalled callee, and two same-named nested
+  // `inner`s of which only one is called.
+  //
+  // The membership is narrowed by THREE gates, each of which a measured cell demands:
+  //
+  //   (1) NOT an anonymous lambda (`criFnIsAnonLambda`). This is master's stated reason for the
+  //       narrow `<T>` gate and it survives intact: a lifted `(x) => x * 2` has un-annotated params
+  //       and is invoked through `call_ref`, never via `monoInstantiate`, so its slot also stays
+  //       un-replaced. It is a NAMED decl that the reason never covered.
+  //
+  //   (2) NOT part of the module ABI (`monoNameIsExported`). An exported uncalled hole is NOT
+  //       fixed here and the brief that asked for it was wrong: an export has no in-module call
+  //       site by design, but `export function add(a, b) { return a + b }` LOWERS TODAY — both
+  //       operands are unpinned so the i32 default agrees at both ends, and it builds, runs, and
+  //       exports `(i32, i32) -> i32` (measured, 172 bytes). Stubbing it would replace a working
+  //       export with a silently-wrong `() -> void` ABI — a cell moving BACKWARD past even
+  //       "runtime trap", since nothing traps and nothing is reported. `export function exclaim(s)
+  //       { return s + "!" }` therefore keeps master's invalid wasm. The right treatment for that
+  //       one is a LOUD reject naming the un-inferable export, which needs the emitter's own
+  //       knowledge of whether the body lowers (this pass cannot tell `exclaim` from `add`), so it
+  //       is filed rather than guessed at. NOTE: the pre-existing `<T>` arm above already stubs an
+  //       EXPORTED uncalled `<T>` generic into that same `() -> void` ABI — measured, not
+  //       introduced here, and filed alongside.
+  //
+  //   (3) NOT referenced as a function VALUE (`monoNamesUsedAsValue`) — see that helper.
+  //
+  // Candidates are collected FIRST so the arena scan runs once for the whole program, and not at
+  // all when there is no candidate (every golden, and the compiler itself, which never reaches
+  // this pass anyway — the `!any` gate above returns early for it).
+  const cndFe: i32[] = []
+  const cndNm: string[] = []
+  let gc = 0
+  while gc < nDecl {
+    if fnStmts[gc] == monoOrigNode[gc] {
+      const cfn = P.nodes[fnStmts[gc]]
+      if cfn is FuncDecl {
+        if cfn.fnTyParams.length == 0 && monoGen[gc] == 1 && cfn.fnName != "" {
+          if !criFnIsAnonLambda(gc) {
+            if !monoNameIsExported(cfn.fnName) {
+              cndFe.push(gc)
+              cndNm.push(cfn.fnName)
+            }
+          }
+        }
+      }
+    }
+    gc = gc + 1
+  }
+  const cndVal = monoNamesUsedAsValue(cndNm)
   let gp = 0
   while gp < nDecl {
     if fnStmts[gp] == monoOrigNode[gp] {
       const gfn = P.nodes[fnStmts[gp]]
       if gfn is FuncDecl {
+        let prune = false
         if gfn.fnTyParams.length > 0 {
+          prune = true
+        } else {
+          let ci = 0
+          while ci < cndFe.length {
+            if cndFe[ci] == gp && cndVal[ci] == 0 { prune = true }
+            ci = ci + 1
+          }
+        }
+        if prune {
           const noTP: string[] = []
           const noPs: i32[] = []
           fnStmts[gp] = mkFunc(

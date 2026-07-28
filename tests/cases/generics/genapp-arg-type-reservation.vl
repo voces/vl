@@ -1,0 +1,82 @@
+// @run
+// @log 3
+// @hint Intentionally-unused function `_boxLen`
+// @hint Intentionally-unused function `_pairLen`
+// @hint Intentionally-unused function `_boxShow`
+// @hint Intentionally-unused function `_boxNested`
+// @hint Intentionally-unused function `_boxGen`
+// @hint Intentionally-unused function `_pairFlat`
+// THE GENERIC APPLICATION'S TYPE ARGUMENTS ARE A RESERVATION HOLE (#1254 mechanism C).
+//
+// `collectA`'s `TypeRef` ladder walks every annotation node in the arena and sets the
+// collection PRESENCE flags from the name's shape. A generic application is ONE name — every
+// classifier in that chain asks "is this spelling an array / a map / a string / a ref list",
+// and `Box<string>` is none of them — so the ladder fell off the end and reserved nothing.
+// `mAssignTypeIndices` then leaves `aTypeIdx = mNextType`, an index that is never allocated
+// but is usually still IN RANGE, so the struct's string field silently named whatever heap
+// type happened to sit there. Measured on `231e137c`, `Box<string>`'s field came out as
+// `(ref 1)` — a FUNC type — and the module VALIDATED, because nothing in it ever operated on
+// the field.
+//
+// THAT IS WHY EVERY ROW BELOW OPERATES ON THE FIELD. `return b.v` alone re-types a bogus
+// `(ref 1)` into the function's own result and validates; `b.v.length` emits `array.len` OVER
+// it and does not. The three rows that MOVED (invalid wasm -> correct) are (1), (2) and (3);
+// the filing's own spelling `function _showPair(p: Pair<i32, string>) { return p.b }` is NOT
+// one of them — it is the latent form, check-clean AND run-clean with a wrong type inside.
+//
+// BYSTANDER TWINS, the family-membership test: adding ANY other string to the program
+// (`print("live")`, a `string[]` local) makes `aUsed` true by another route and every row
+// below passes on master too. That is what makes this a RESERVATION miss rather than a
+// lowering one, and it is why the rows here are written with NO other string in the module —
+// the only strings are the ones the annotations mention.
+//
+// THE FIX IS FLAG-ONLY AND SITS OUTSIDE THE LADDER (`emit_collect.forceGenAppArgTypes`), so
+// its swallow claim is provably empty: it is not an `else if`, it steals no name from any arm,
+// and every write is an OR into a `*Used` presence flag.
+//
+// THE HALF THIS DOES NOT FIX, measured and filed: the INLINE spelling of the same struct,
+// `function _len(b: { v: string }) { return b.v.length }`, is invalid wasm on master AND
+// after this change. The root there is one rung further in — `collectA`'s struct-FIELD table
+// pass forces the backing for a `string[]` field (code 6), a `string | null` field (code 20),
+// an i32/scalar list field, and a map field, but has no arm for a PLAIN `string` field
+// (code 3). The generic application reaches the string through its type ARGUMENT, which is
+// why this arm closes the `Head<…>` spelling and not its inline twin.
+type Box<T> = { v: T }
+type Pair<A, B> = { a: A, b: B }
+
+// (1) the headline cell — the argument IS the module's only string.
+function _boxLen(b: Box<string>) { return b.v.length }
+
+// (2) the two-parameter alias, with the string in the SECOND argument slot.
+function _pairLen(p: Pair<i32, string>) { return p.b.length }
+
+// (3) the same reservation reached through `print` rather than `.length`.
+function _boxShow(b: Box<string>) {
+  print(b.v)
+  return 1
+}
+
+// (4) NESTED — `Box<Pair<i32, string>>`. The argument is itself an application, so the arm
+//     recurses one rung before classifying the leaves.
+function _boxNested(b: Box<Pair<i32, string>>) { return b.v.b.length }
+
+// (5) the application sitting inside a `<X>` GENERIC function's parameter, where one argument
+//     is the type parameter and the other is the concrete string.
+function _boxGen<X>(p: Pair<X, string>) { return p.b.length }
+
+// (6) the FLAT form the filing named — check-clean and run-clean on master because the body
+//     never operates on the field. It is here as the latent row, not as a moved cell.
+function _pairFlat(p: Pair<i32, string>) { return p.b }
+
+// CONTROL — an application whose arguments need NO reserved type. Byte-identical across the
+// change: the arm classifies `i32` into none of its arms and writes no flag.
+function pairSum(p: Pair<i32, i32>) { return p.a + p.b }
+const pi = { a: 1, b: 2 }
+print(pairSum(pi)) // 3
+// THE STRING-LITERAL CONTROL IS DELIBERATELY ABSENT FROM THIS FILE. `const bx = { v: "abc" }`
+// + `print(bxLen(bx))` is the natural control — the same alias CALLED at a string argument,
+// which forces `aUsed` through the literal and always worked — and adding it here makes EVERY
+// row above pass on master, because that one literal is the bystander. Measured: with it, the
+// whole file runs clean on the pre-fix compiler; without it, the pre-fix compiler emits
+// invalid wasm. It lives in `uncalled-inference-hole-param.vl`'s `_showPair` row instead,
+// where the module has other strings BY DESIGN and the row is explicitly the bystander leg.

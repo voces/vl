@@ -99,6 +99,7 @@ import {
 } from "./ast"
 import {
   annArrowAt,
+  annGenAppDecompose,
   annRetNameOf,
   cloArrElemNameOf,
   gaeAnnHasParam,
@@ -2875,6 +2876,82 @@ export function mAssignTypeIndices(_n: i32) {
   mNextType
 }
 
+// A generic APPLICATION's type ARGUMENTS are invisible to every branch of `collectA`'s
+// `TypeRef` ladder: the whole spelling `Box<string>` is ONE name, and every classifier in that
+// chain asks about the name's OWN shape (is it an array, a map, a string, a ref list) — none of
+// which a `Head<…>` matches. So a `Box<string>` carrying the module's only string reserved no
+// `aUsed`, and `mAssignTypeIndices` then leaves `aTypeIdx = mNextType`: a type index that is
+// never allocated but is usually still IN RANGE, so it silently names whatever heap type
+// happens to sit there. Measured on `231e137c`: `function _len(b: Box<string>) { return
+// b.v.length }` emits the struct's string field as `(ref 1)` — a FUNC type — and `array.len`
+// over it is INVALID WASM at `vl check` rc 0. Adding any other string to the program rescues
+// the row (its bystander twin), which is what makes this a RESERVATION miss rather than a
+// lowering one.
+//
+// FLAG-ONLY AND OUTSIDE THE LADDER, both deliberately.
+//   · OUTSIDE — so the SWALLOW CLAIM IS PROVABLY EMPTY. It is not an `else if`, so it bypasses
+//     no arm and steals no name; a spelling a branch already claimed (`Box<string>[]` is a ref
+//     array) composes with whatever that branch forced. Same placement, and same reason, as
+//     the two closure-result forcers that end the ladder.
+//   · FLAG-ONLY — every write is an OR into a `*Used` PRESENCE flag; never an intern, a
+//     table row, or a reject. The worst it can do is allocate a heap type the program did not
+//     need, so no cell can move backward past "a few bytes larger", and the arms that would
+//     need an intern to be useful (a map's mv slot, a ref-list element) are left to the
+//     branches that already reach them.
+// The per-argument arms mirror the ladder's own FLAG writes for the same leaf spellings; the
+// i32/boolean array arm is the one-cut leaf compare its sibling arm (the top-level function
+// type's RETURN, `arrElemNameRaw(frRet) == "i32"`) already uses, widened by `boolean` because
+// that spelling rides the identical `lUsed`/`aUsed` pair.
+//
+// FUTURE ROUTE: the two sibling forcers live in `emit_classify.vl` next to
+// `forceScalarListField`. This one stays here because it is `collectA`'s own reservation
+// concern and because that file is held by a concurrent slice; moving it is a pure relocation.
+function forceGenAppArgTypes(name: string): i32 {
+  if !annGenAppSpanEnds(name) { return 0 }
+  const args: string[] = []
+  const head = annGenAppDecompose(name, args)
+  if head == "" { return 0 }
+  let i = 0
+  while i < args.length {
+    const a = args[i]
+    // A NESTED application (`Box<Pair<i32, string>>`) is the same reservation one rung in.
+    forceGenAppArgTypes(a)
+    if nameIsStringArray(a) {
+      slUsed = true
+      aUsed = true
+    } else if nameIsF64Array(a) {
+      fa64Used = true
+    } else if nameIsI64Array(a) {
+      ia64Used = true
+    } else if nameIsF32Array(a) {
+      fa32Used = true
+    } else if nameIsBareMap(a) {
+      mUsed = true
+      lUsed = true
+      aUsed = true
+    } else if nameIsNulI32List(a) {
+      lUsed = true
+      aUsed = true
+    } else if arrElemNameRaw(a) == "i32" || arrElemNameRaw(a) == "boolean" {
+      lUsed = true
+      aUsed = true
+    } else if nameIsString(a) || nameIsNulString(a) {
+      aUsed = true
+    } else if nulScalarListKind(a) != null {
+      const nsk = nulScalarListKind(a)
+      if nsk == "nulstrlist" {
+        slUsed = true
+        aUsed = true
+      }
+      if nsk == "nulf64list" { fa64Used = true }
+      if nsk == "nuli64list" { ia64Used = true }
+      if nsk == "nulf32list" { fa32Used = true }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Scan the whole arena for every use of a collection heap type, setting the PRESENCE flags
 // (`aUsed`/`lUsed`/`raUsed`/`rlUsed`/`mUsed`/`slUsed`/the wide-scalar `*Used` trio — see the
 // type tables in `emit_state.vl`) and re-minting the ref-list / map-value / annotation-node
@@ -3285,6 +3362,11 @@ export function collectA(_stmts: i32[]) {
       // the program never constructs such a list. Same self-gating placement as the map
       // forcer above.
       forceCloResultListTypes(nd.tyName)
+      // The GENERIC-APPLICATION dual of the two forcers above: a type ARGUMENT
+      // (`Box<string>`, `Pair<i32, string[]>`) that no branch of the chain can see, because
+      // the whole `Head<…>` is one name. Same self-gating placement and the same flag-only
+      // contract — see the helper's header for the measured cell and the empty-swallow proof.
+      forceGenAppArgTypes(nd.tyName)
     }
     i = i + 1
   }
@@ -3354,7 +3436,19 @@ export function collectA(_stmts: i32[]) {
     // A `string | null` FIELD (code 20) is a `(ref null $aTypeIdx)` slot — force the string
     // backing. Without this a `{ f: null }` (no other string in the module) left `$aTypeIdx`
     // unallocated and the field read referenced a stale type → invalid wasm.
-    if sFieldTypes[sfi] == 20 { aUsed = true }
+    //
+    // AND ITS NON-NULL TWIN, code 3 — the PLAIN `string` field, which this arm was taught
+    // WITHOUT. Every other string-carrying field code in this loop forces `aUsed` (20 here,
+    // 6/31 the string list, 4/18 the i32 list's shared backing, 19/29 the map's keys), and the
+    // one that names a string DIRECTLY did not. It is the same defect the `string | null` note
+    // above describes, one nullable-marker away: `function _len(b: { v: string }) { return
+    // b.v.length }` with no other string in the module left `$aTypeIdx` unallocated, so
+    // `aTypeIdx = mNextType` named whatever heap type sat at that index — measured on
+    // `231e137c` as a FUNC type — and `array.len` over it is INVALID WASM at `vl check` rc 0.
+    // The bystander twin (add any other string) passes on master, so this is a RESERVATION
+    // miss. Flag-only, so its swallow is provably empty: it is a separate `if`, not an arm of
+    // any chain, and the write is an OR into a presence flag.
+    if sFieldTypes[sfi] == 3 || sFieldTypes[sfi] == 20 { aUsed = true }
     // An i32/boolean-LIST field (code 4, atom-array elem name or plain) and its NULLABLE twin
     // (code 18, `i32[] | null`): force the wrapper/backing so the field valtype and any
     // narrowed read resolve.
@@ -3386,6 +3480,10 @@ export function collectA(_stmts: i32[]) {
       slUsed = true
       aUsed = true
     }
+    // The variant-table twin of the struct pass's code-3 / code-20 string-backing arm: a
+    // union VARIANT whose field is a plain `string` (or a `string | null`) is the module's
+    // only mention of the string rep just as often as a struct field is.
+    if uFieldTypes[ufi] == 3 || uFieldTypes[ufi] == 20 { aUsed = true }
     forceScalarListField(uFieldTypes[ufi])
     // A NULLABLE ref-list variant field (code 28): re-intern its element so the field's
     // storage type + narrowed reads resolve the wrapper slot (`rlSlotByName`).
