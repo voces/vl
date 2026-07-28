@@ -32738,7 +32738,8 @@ thread plus one gated call. The fixpoint ladder held at **2 compiles**.
   producer: it is that `canonEmitName`'s function-type pass-through leaves the region
   verbatim, so BOTH spellings would have to learn the softening together. Adjacent to
   #1267's already-filed "canon's paren-result parameter asymmetry", and probably the same
-  item.
+  item. **↑ TAKEN, AND IT WAS THE SAME ITEM** — see the FUNC-NESTED section at the end of
+  this document. One conjunct; `RC_UNDER_FUNC` came back out with the region it gated.
 * **Lsoft (31 rows)** — still the owner's call, untouched, exactly as #1266 and #1267 left
   it. Both of its exclusion gates are now load-bearing in a shipped rule and are documented
   as such.
@@ -32759,3 +32760,183 @@ thread plus one gated call. The fixpoint ladder held at **2 compiles**.
 **G + Lsoft is now 145 of 176 = 82.4% of what is left, and both are decisions already made
 and recorded** — the typed-IR item and the owner's. The whole of the rest is 31 rows in
 seven classes.
+
+## The FUNC-NESTED alias family — canon's VERBATIM region comes out, and `RC_UNDER_FUNC` goes with it (off master `63d0c3f6`)
+
+#1271 filed eight witnesses as *"the FUNC-NESTED numeric-alias miscompile family — invalid
+wasm on master today"* and named the root itself: *"`canonEmitName`'s function-type
+pass-through leaves the region verbatim, so BOTH spellings must learn the softening
+together."* #1267 had already filed the same rule's other edge as *"canon's paren-result
+parameter asymmetry"*. They are one item, and it is **one conjunct**:
+
+```vl
+-  if nameIsParenSpanEnds(name) && isTopLevelFuncTypeName(name) {
++  if isTopLevelFuncTypeName(name) {
+```
+
+### WHY THE REGION WAS NEVER A REGION
+
+`canonEmitNameAt`'s function-type arm canons the param list at `RC_FN_PARAM` and the result
+at `RC_FN_RES`. With the span conjunct it claimed only names that END in `)` — the ones
+whose RESULT is a parenthesized function — so `(i32) => ((i32) => i32)` canon'd its params
+and `(i32) => i32` did not. "Canon leaves a function type verbatim" was therefore never a
+rule; it was the default behaviour of a fall-through, with one accidental exception that
+#1267 measured and filed.
+
+**The interior of a function TYPE is the signature of some function DECLARATION**, and that
+declaration's own parameter and return annotations are canon'd by this very pass, at
+`RC_ROOT`. So a spelling rule that fires at `RC_ROOT` and not inside a function type puts
+the two `$fnsig` producers on opposite sides of every closure:
+
+```vl
+type Z = 0 | 1
+function mk(x: i32): Z { 1 }                                   // annotation canons -> i32
+function run(m: (i32) => Z): i32 { const v = m(1); return v }   // annotation stayed  -> Z
+print(run(mk))    // master: INVALID MODULE
+                  // type mismatch: expected i32, found (ref $type)
+```
+
+`annRetKind` reads the func type's result text, sees `Z` — which `collectU` has registered
+in `unNames` — and keys the `{tag,value}` UNION BOX, while `mk` is declared returning a
+plain i32.
+
+**#1271's `RC_UNDER_FUNC` gate is the same fork solved from the other end, and it can only
+ever solve one end.** Gating `tyToNominalNameGo`'s numeric-alias arm makes both sides keep
+`Z`, which is right when the fork's far side is another function type (`(Z) => i32` reached
+through a HOF) and wrong when it is a declaration (`(i32) => Z`). That is exactly the
+partition #1271 measured — *"under SAB-FN not one of them turns green; only the two that
+work today turn red"* — and the reason no producer-side gate could close the family.
+
+Canon'ing the interior makes both sides SOFTEN, which is right in **both** cases, because
+the other side of a `$fnsig` fork is always a declaration canon'd at `RC_ROOT`. With that,
+nothing under a function type needs to know it is under one: `RC_UNDER_FUNC`, `RC_INHERIT`
+and their eight `| (ctx & …)` descent sites come back out, and the position-bit note goes
+back to one sticky bit.
+
+### THE GRID — 408 cells, and the axes are not decoration
+
+11 shapes (the 8 filed witnesses + #1271's own two fixture cells + `(Z) => Z`) and 6 green
+controls × 3 bases (**N** numeric `0|1`, **S** string `"a"|"b"`, **A** scalar alias
+`type Z = i32`) × 4 call forms (**D** direct — NO function type on the call path, the
+CONFOUND control; **P** parameter; **V** `const` value; **L** lambda) × 2 result shapes
+(**B** bare, **R** curried/parenthesized). Outcome classes, worst → best:
+`INVWASM` (check-clean, module does not validate) → `RUNBAD` (validates, traps) →
+`EMITREJ` (clean emit refusal) → `CHECKREJ` → `OK`.
+
+| build | INVWASM | RUNBAD | EMITREJ | CHECKREJ | OK |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| master `63d0c3f6` | **42** | 8 | 28 | 6 | 324 |
+| **this head** | **13** | 12 | 22 | 6 | **355** |
+| candidate B (`annSigKey` canons its leaves) | 20 | 19 | 23 | 6 | 340 |
+| SAB-UF (`RC_UNDER_FUNC` gate removed, canon NOT fixed) | 36 | 16 | 28 | 6 | 322 |
+
+| | forward | backward |
+| --- | ---: | ---: |
+| master → **this head** | **38** | 3 |
+| master → candidate B | 31 | **7** |
+| master → SAB-UF | 12 | **6** |
+| **this head** → the same head with the `RC_UNDER_FUNC` gate RESTORED | 0 | 0 |
+
+**Candidate B was built, not argued.** Routing `annSigKey`'s param and result spellings
+through `canonEmitName` — "the `$fnsig` interning learns to canon its spellings" — fixes
+`(i32) => Z` and `(i32) => {a:Z}` and **breaks `({a:Z}) => i32`, which is #1271's own
+shipped fixture cell** (OK → INVWASM), because it moves only the annotation producer and
+leaves the arena producer (`sigKeyOfTy`, `cloParamTok`) where it was. It also leaves the
+whole `A` base — `type Z = i32` under a function type, 7 cells — invalid. A patch at the
+consumers is N patches; the fork is at the one place that decides the spelling.
+
+**The three backward cells are named, and all three land on a defect master already has for
+the byte-identical canon'd spelling.** Each has a standalone witness that fails on master
+today with no alias-under-a-function-type anywhere:
+
+| cell | master → head | master's own witness for the landing site |
+| --- | --- | --- |
+| `W2-N-V-B` `(i32) => Z[]` | OK → INVWASM | `function mk(x: i32): Z[]` + `const m: (i32) => i32[] = mk` — INVALID MODULE on master |
+| `W3-N-V-B` `(i32) => Z\|null` | EMITREJ → RUNBAD | `function mk(x: i32): Z\|null` + `const m: (i32) => i32\|null = mk` — `wasm trap: cast failure` on master |
+| `W8-N-V-B` `() => Z\|null` | EMITREJ → RUNBAD | `function mk(): Z\|null` + `const m: () => i32\|null = mk` — `wasm trap: cast failure` on master |
+
+The numeric-litunion **composite** (`Z[]`, `Z|null`) is broken on master independent of any
+function type — the `D` column proves it: `W2-N-D-B` and `W3-N-D-B` are `EMITREJ` on master
+and on this head alike. What moves is only which of master's two spellings a program lands
+on. **Filed as a separate family below, with the three witnesses.**
+
+### THE INVERTED CONTROL, AND WHY THE GRID NEEDED SIX MORE CELLS
+
+The first version of this grid had eight shapes — the eight filed witnesses — and SAB-UF
+(`RC_UNDER_FUNC` removed, canon untouched: #1271's own first candidate, the one it proved
+breaks fourteen programs) read **0 backward on it**. The grid was blind in exactly the
+region under test, for the reason #1271's four channels were: *the witnesses of the rule
+you are removing are not the witnesses of the rule you are adding.* Adding `(Z) => i32` and
+`({a:Z}) => i32` — the two cells #1271 shipped a fixture for — makes SAB-UF red **6 cells**,
+which is what licenses reading this head's `0 / 0` against the gate-restored twin as a
+measurement rather than as coverage.
+
+### REACH — 943 bare-result reaches, 41 rewrites
+
+An instrumented head banks one `tErr` per bare-result reach and one per name that MOVES:
+
+| channel | bare-result reaches | rewrites |
+| --- | ---: | ---: |
+| corpus (`tests/cases std scripts`, 1,600 files) | **943** | **41** |
+| fuzz (9,600 generated programs) | **3,686** | **41** |
+| the compiler's own source (`compiler/entry.vl`) | **0** | **0** |
+
+The corpus's 41 are five rules and nothing else: **27** a string-litunion alias inside a
+union under the function type softening (`(i32)=>K0|i64` → `(i32)=>string|i64`), **7** the
+numeric alias (`(Z)=>i32` → `(i32)=>i32`, `({a:Z})=>i32` → `({a:i32})=>i32` and the
+fixture's five new cells), **4** the inline `("a"|"b")=>i32` → `(string)=>i32` (the `S`
+token its value call already resolved through `cloCallSigKey`'s arena fallback —
+`closures/closure-litunion-param-valuecall.vl`'s two inline controls are the pin, and they
+stay green), **2** a function-typed result gaining its grouping parens
+(`()=>(i32)=>boolean` → `()=>((i32)=>boolean)`), **1** a redundant grouping paren dropped
+from an array element. Corpus A/B moves **one file**, so 40 of the 41 rewrites are
+outcome-neutral — *live, and measured to be neutral*, which is a different reading from a
+channel that read zero.
+
+### THE FIXTURE IS RED IN BOTH DIRECTIONS, AT DIFFERENT FUNCTIONS
+
+`tests/cases/types/numlitunion-alias-under-closure-type.vl` — #1271's fixture, rewritten
+(its prose asserted the rule this slice deletes, so it could not be left) with six more
+cells. That it fails on master AND on SAB-UF, in different functions, is what makes it a
+pin rather than a regression test for one edit:
+
+| build | fixture |
+| --- | --- |
+| this head | ok — `3 1 1 1 1 1 1 7` |
+| master `63d0c3f6` | **invalid module at `retBare`** — `expected i32, found (ref $type)` |
+| SAB-UF (the gate out, canon untouched) | **invalid module at `first`** |
+
+### WHAT THIS SLICE DID NOT SHIP
+
+* **The numeric-litunion COMPOSITE family** — `Z[]` and `Z|null` where `type Z = 0|1`,
+  reached as a function VALUE. Three witnesses above, all `vl check`-clean and all failing
+  on master today with the softened spelling written out by hand. The fork is between the
+  NAME (which canons to `i32[]` / `i32|null`) and the ARENA (`vtKindOfType` over a
+  `TyNullable(TyUnion(TyLit 0, TyLit 1))`), i.e. a `cloRetKeySuffix` / `annRetKind`
+  disagreement, not a canon one. `nulLitUnionPreserve`'s `nameIsLitUnionType` gate is
+  string-only, which is the classifier-taught-half-a-set shape this family keeps producing.
+* **`(Z) => i32` through a function VALUE was ALSO broken on master** (`wasm trap: cast
+  failure`) while the same type through a PARAMETER built and ran — two routes, one type.
+  This head closes it, and `asValue` in the fixture is the pin. Worth recording because
+  #1271's fixture covered only the parameter route and read the shape as green.
+* **Lsoft / G** — untouched, exactly as #1266/#1267/#1271 left them. B1/B2/B3 are not
+  re-derived here: this is a canon-side behaviour change, not a census slice.
+
+### METHOD NOTES
+
+* **A GRID BUILT FROM A FILING'S WITNESS LIST TESTS THE FILING, NOT THE FIX.** Eight
+  shapes, three call forms, three bases, two result shapes — 336 cells — and the one
+  sabotage that is *known* to break real programs moved zero of them backward. The six
+  cells it does move are the two shapes the previous slice shipped a fixture for, and
+  neither was in the filed family. *Seed the grid from what the CURRENT code protects as
+  well as from what it breaks.*
+* **A "DIRECT" COLUMN IS THE CHEAPEST CONFOUND CONTROL THERE IS.** Twelve of master's 36
+  invalid cells reproduce with NO function type anywhere on the call path, so they were
+  never evidence about this region. Two of the eight filed witnesses (`(Z[]) => i32`,
+  `(Z|null) => i32`) are entirely accounted for by that column: they are the
+  numeric-litunion composite defect, reached through a function type rather than caused by
+  one. *Add the form that removes the feature under test before reading any cell.*
+* **AN OUTCOME LADDER WITH FOUR NON-OK CLASSES SEPARATES "FIXED" FROM "MOVED".** Half of
+  candidate B's forward cells are `INVWASM → RUNBAD` — still broken, just louder. A
+  two-valued pass/fail column would have scored it 31-forward and shipped the one that
+  breaks the previous slice's fixture.

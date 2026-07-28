@@ -1,41 +1,71 @@
 // @run
 // @log 3
 // @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
 // @log 7
-// A NUMERIC literal-union ALIAS (`type Z = 0 | 1`) standing INSIDE a FUNCTION TYPE keeps
-// its alias NAME in every producer of an emit-time type spelling. The GATE on
-// `RC_UNDER_FUNC`, pinned from the side that breaks if it is removed or narrowed.
+// @hint Intentionally-unused parameter `_x`
+// @hint Intentionally-unused parameter `_x`
+// @hint Intentionally-unused parameter `_x`
+// A NUMERIC literal-union ALIAS (`type Z = 0 | 1`) standing INSIDE a FUNCTION TYPE. The
+// alias denotes its BASE SCALAR here exactly as it does everywhere else — and the reason
+// that is not a special case is the point of this fixture.
 //
-// Outside a function type the alias denotes its BASE SCALAR — `numLitUnionAliasName` /
-// `numLitUnionBaseName`, the rule `tests/cases/literal-unions/numeric-litunion-alias.vl`
-// exists for: untouched, `Z` reaches the emitter, `collectU` has registered it in
-// `unNames` (a `UnionDecl` whose single variant is not a `{…}` shape is not skipped), and
-// `isUName` claims the annotation for the `{tag, value}` UNION BOX while every read lowers
-// as the plain i32 the checker's algebra says it is. Silent invalid wasm.
+// THE INTERIOR OF A FUNCTION TYPE IS THE SIGNATURE OF SOME DECLARATION. `(i32) => Z` is a
+// type for `function mk(x: i32): Z`, whose OWN return annotation is a top-level `Z` and
+// canons to `i32` (`numLitUnionAliasName` — the rule
+// `tests/cases/literal-unions/numeric-litunion-alias.vl` exists for: untouched, `Z` reaches
+// the emitter, `collectU` has registered it in `unNames`, and `isUName` claims the
+// annotation for the `{tag, value}` UNION BOX while every read lowers as the plain i32 the
+// checker's algebra says it is). So the two `$fnsig` spellings of one closure agree only if
+// the function TYPE canons its params and result the same way. `canonEmitNameAt`'s
+// function-type arm does exactly that, for a bare result and a parenthesized one alike.
 //
-// INSIDE a function type the same softening is the DEFECT, because `canonEmitName` leaves
-// a top-level function type VERBATIM (it recurses into the params only when the RESULT is
-// parenthesized). So the annotation pipeline's `$fnsig` key for `run`'s parameter is
-// `(Z)=>i32`, alias name and all, and a second producer that answers `(i32)=>i32` forks
-// the two spellings of ONE closure: `type mismatch: expected i32, found (ref $type)`, an
-// invalid module for a program that builds and runs. `emit_collect.reachRegisterName`
-// states this rule from the consumer side ("everything inside a function type is the
-// `canonEmitName` VERBATIM region"); `RC_UNDER_FUNC` is that rule at the producer.
+// IT USED TO CANON NEITHER (bar an accident), AND BOTH DIRECTIONS OF THE FORK WERE FILED.
+// The arm carried a `nameIsParenSpanEnds(name) &&` conjunct, so it claimed only a name that
+// happens to END in `)` — one whose RESULT is a parenthesized function. Everything else was
+// left VERBATIM:
 //
-// THE TWO CELLS BELOW ARE NOT THE SAME PIN, and the second is why the bit ACCUMULATES
-// rather than naming an immediate position:
+//   * #1271 hit the fork from the PARAM side (`first` below). `annParamKind` saw the raw
+//     `Z`, keyed the union box, and the callee was declared `(structref, i32)`. It fixed
+//     that by gating the OTHER producer — `tyToNominalNameGo`'s numeric-alias arm — on a new
+//     `RC_UNDER_FUNC` ancestry bit, so both sides kept `Z`.
+//   * that gate could not close the eight shapes that fork the other way (`(i32) => Z`,
+//     `(i32) => Z[]`, `(i32) => Z|null`, `(i32) => {a:Z}`, `(i32) => {a:Z}[]`,
+//     `(Z[]) => i32`, `(Z|null) => i32`, `() => Z|null`), because on THEIR far side is a
+//     declaration canon'd at `RC_ROOT`, which softens. #1271 filed them, measured: under
+//     its own sabotage "not one turns green".
 //
-//   `first`  — `(Z) => i32`. The alias is the function's own PARAMETER, so its immediate
-//              render position IS `RC_FN_PARAM`. An immediate-position gate catches it.
-//   `second` — `({ a: Z }) => i32`. The alias is a FIELD of an inline shape that is the
-//              parameter, so its immediate position is `RC_FIELD`, which says nothing
-//              about the function overhead. Only an ANCESTRY bit catches it, and this
-//              cell is exactly the one-character difference between the two designs.
+// One rule closes both: canon the function type's interior like the declaration it
+// describes. `RC_UNDER_FUNC` came back out with the verbatim region it was gating against.
 //
-// The near-miss that is NOT a witness, and is worth recording so it is not mistaken for
-// one: `(i32) => Row` with `type Row = { a: Z }` never renders the field at all — the
-// declared struct short-circuits to `Row` first — so a DECLARED shape cannot pin this and
-// the INLINE one must.
+// THE CELLS, and what each one pins:
+//
+//   `first`    — `(Z) => i32`. The alias is the function type's PARAMETER. GREEN on master;
+//                it is what `RC_UNDER_FUNC` bought, and it must stay green now that the bit
+//                is gone. Restoring the gate WITHOUT the canon arm is the inverted control:
+//                this cell and `second` are two of the six grid cells it reddens.
+//   `second`   — `({ a: Z }) => i32`. The alias is a FIELD of an inline shape that is the
+//                parameter, so its own render position is `RC_FIELD`. The pair
+//                `first`/`second` is why an immediate-position gate was never the right
+//                shape.
+//   `retBare`  — `(i32) => Z`. #1271's filed family, head of the list. INVALID WASM on
+//                master: `type mismatch: expected i32, found (ref $type)`.
+//   `retObj`   — `(i32) => { a: Z }`. Invalid wasm on master. The alias is a field of an
+//                INLINE shape in the RESULT — the near-miss that is NOT a witness is
+//                `(i32) => Row` with `type Row = { a: Z }`, because the declared struct
+//                short-circuits before the field is ever rendered.
+//   `retList`  — `(i32) => { a: Z }[]`. Invalid wasm on master.
+//   `roundBoth`— `(Z) => Z`. Invalid wasm on master: the param half was right and the
+//                result half was not, in ONE type.
+//   `asValue`  — `(Z) => i32` reached as a function VALUE rather than as a parameter. A
+//                `wasm trap: cast failure` on master, while the parameter form above builds
+//                and runs — the same type, two routes, one of them wrong.
+//   `plain`    — `Z` outside any function type. The base-scalar rule itself, so the two
+//                halves are pinned against each other in one program.
 type Z = 0 | 1
 
 function first(m: (Z) => i32): i32 {
@@ -52,10 +82,44 @@ function second(m: ({ a: Z }) => i32): i32 {
 
 function secondImpl(r: { a: Z }): i32 { r.a }
 
-// The base-scalar rule itself, in the same program, so the two halves are pinned against
-// each other: OUTSIDE any function type `Z` is plain i32 and arithmetic on it lowers.
+function retBare(m: (i32) => Z): i32 {
+  const v = m(0)
+  v + 0
+}
+
+function retBareImpl(_x: i32): Z { 1 }
+
+function retObj(m: (i32) => { a: Z }): i32 {
+  const v = m(0)
+  v.a + 0
+}
+
+function retObjImpl(_x: i32): { a: Z } { { a: 1 } }
+
+function retList(m: (i32) => { a: Z }[]): i32 {
+  const v = m(0)
+  v.length
+}
+
+function retListImpl(_x: i32): { a: Z }[] { [{ a: 1 }] }
+
+function roundBoth(m: (Z) => Z): i32 {
+  const v = m(1)
+  v + 0
+}
+
+function roundBothImpl(z: Z): Z { z }
+
+// The base-scalar rule itself, in the same program: OUTSIDE any function type `Z` is plain
+// i32 and arithmetic on it lowers.
 function plain(z: Z): i32 { z + 6 }
 
 print(first(firstImpl))
 print(second(secondImpl))
+print(retBare(retBareImpl))
+print(retObj(retObjImpl))
+print(retList(retListImpl))
+print(roundBoth(roundBothImpl))
+const asValue: (Z) => i32 = firstImpl
+print(asValue(1) - 2)
 print(plain(1))

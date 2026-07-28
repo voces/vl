@@ -6405,12 +6405,6 @@ const RC_MAP_KEY = 16  // a map key's type
 const RC_MAP_VAL = 32  // a map value's type
 const RC_FN_PARAM = 64 // a function type's parameter
 const RC_FN_RES = 128  // a function type's result
-// ANCESTRY: anywhere INSIDE a function type, at any depth — see the note below.
-const RC_UNDER_FUNC = 256
-// The bits an inner render INHERITS from its parent instead of replacing. Both are
-// ancestry, not immediate position, and both exist because a rule that reads them must
-// get the same answer from the string spelling and the arena walk.
-const RC_INHERIT = RC_NULLABLE | RC_UNDER_FUNC
 
 // `RC_NULLABLE` IS STICKY ACROSS A UNION JOIN, AND IT HAS TO BE, BECAUSE THE TWO
 // SPELLINGS PUT THE NULLABLE AT DIFFERENT DEPTHS. Structurally `A | B | null` is a
@@ -6422,35 +6416,42 @@ const RC_INHERIT = RC_NULLABLE | RC_UNDER_FUNC
 // `null` sibling (`partsHaveNull`). Every other bit is REPLACED at each descent: a field
 // of a struct that is itself an array element is a field, not both.
 //
-// `RC_UNDER_FUNC` IS THE SECOND ANCESTRY BIT, AND IT IS HERE BECAUSE THE DISAGREEMENT
-// THIS NOTE SAID DID NOT EXIST WAS MEASURED. The note used to read "ancestry beyond one
-// sticky bit is not modelled here, deliberately — `emit_collect.vl`'s `underFunc` is the
-// accumulating shape, and no measured disagreement needs it at the producer". The
-// numeric-litunion-alias rule below needs it, on a three-line program:
+// ANCESTRY BEYOND THAT ONE STICKY BIT IS NOT MODELLED HERE, AND THE SECOND ONE THAT WAS
+// ADDED CAME BACK OUT. #1271 gave this file `RC_UNDER_FUNC` (256) — "anywhere inside a
+// function type, at any depth" — because the numeric-litunion-alias rule below could not
+// fire under a function type without breaking `(Z) => i32`:
 //
 //   type Z = 0 | 1
 //   function run(m: (Z) => i32): i32 { const v = m(1); return v }
+//   function mk(x: Z): i32 { x + 2 }
+//   print(run(mk))
 //
-// `canonEmitName` leaves a top-level FUNCTION type VERBATIM — it recurses into the params
-// only when the RESULT is parenthesized — so the annotation pipeline's key for that
-// parameter is `(Z)=>i32`, alias name and all. A producer that softens `Z` to `i32`
-// ANYWHERE inside a function type keys `(i32)=>i32` instead and the two `$fnsig` spellings
-// of ONE closure fork: measured as `type mismatch: expected i32, found (ref $type)`, an
-// INVALID MODULE for a program that builds and runs on master. `emit_collect.vl`'s
-// `reachRegisterName` states the same rule from the consumer side ("everything inside a
-// function type is the `canonEmitName` VERBATIM region"); this is that rule at the
-// producer, which is where a render decides what it is about to spell.
+// The DEFECT that bit worked around was not in this renderer. `canonEmitName` left a
+// top-level function type VERBATIM unless its result happened to be parenthesized, so the
+// annotation pipeline's key for that parameter was `(Z)=>i32` — alias name and all — while
+// `mk`'s OWN parameter annotation, an `RC_ROOT` `Z`, canon'd to `i32`. The two `$fnsig`
+// spellings of one closure forked, and a producer that softened anywhere inside a function
+// type simply moved WHICH spelling was the odd one out. Gating this renderer against
+// softening made the two AGREE on the un-softened spelling and left eight other shapes
+// (`(i32) => Z`, `(i32) => {a:Z}`, …) invalid: they fork the other way, because the thing
+// on their side of the fork is a DECLARATION whose annotations canon at `RC_ROOT`.
 //
-// ONE IMMEDIATE-POSITION BIT IS NOT ENOUGH AND THE WITNESS IS ONE CHARACTER AWAY. Gating
-// on `RC_FN_PARAM | RC_FN_RES` alone still forks on `(i32) => {a: Z}` — the field renders
-// at `RC_FIELD`, which says nothing about the function overhead — while
-// `(i32) => Row` with `type Row = {a: Z}` does NOT, because the declared struct
-// short-circuits before the field is ever reached. So the accumulating form is the rule
-// and the immediate form is a same-shaped near-miss; both are pinned by fixtures
-// (`tests/cases/types/numlitunion-alias-under-closure-type.vl`).
+// So the rule is now stated once, at the place that decides it: the interior of a function
+// TYPE is CANON'D — params and result, bare result or parenthesized
+// (`canonEmitNameAt`'s function-type arm), at `RC_FN_PARAM` and `RC_FN_RES`. Those two
+// positions agree with the `RC_ROOT` a DECLARATION's annotations canon at on every rule
+// this file states except one: `ctxKeepsLitUnion` holds at `RC_FN_RES` and not at
+// `RC_ROOT`, so an INLINE `() => "a"|"b"` keeps its members while `function mk(): "a"|"b"`
+// softens to `string`. That asymmetry is untouched here and is not reachable as a
+// miscompile — the soundness floor refuses the shape ("function-value call arity has no
+// interned signature") identically before and after, measured both ways. With that,
+// nothing under a function type needs to know it is under one — the alias softens on both
+// sides and the spellings meet. Measured: removing the bit ALONE reddens six grid cells
+// (`(Z) => i32` and `({a:Z}) => i32` through all three call forms); removing it WITH the
+// canon fix moves zero, and the canon fix takes 38 cells forward.
 //
-// Every OTHER bit is still REPLACED at each descent: a field of a struct that is itself an
-// array element is a field, not both. Only `RC_INHERIT` rides through.
+// Every OTHER bit is REPLACED at each descent: a field of a struct that is itself an array
+// element is a field, not both. Only `RC_NULLABLE` rides through.
 
 // The TOP-LEVEL atom count of the name the LAST `tyToEmitName` call returned — the
 // number `unionMemberCount` would report for it, produced BY THE RENDERER instead of
@@ -6930,14 +6931,14 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
     // numeric alias never reaches those legs and a string alias never reaches this one. The
     // owner-pending mixed-union softening decision is untouched on both sides.
     //
-    // NOT INSIDE A FUNCTION TYPE, at any depth: that whole region is `canonEmitName`'s
-    // VERBATIM region, so softening there forks the two `$fnsig` spellings of one closure
-    // into an invalid module. See `RC_UNDER_FUNC`'s note above for the measured witness and
-    // for why the immediate `RC_FN_PARAM | RC_FN_RES` position is not the right test.
-    if (ctx & RC_UNDER_FUNC) == 0 {
-      const nlb = numLitUnionBaseName(ix)
-      if nlb != "" { return nlb }
-    }
+    // UNCONDITIONAL IN THE POSITION, INCLUDING INSIDE A FUNCTION TYPE, and #1271's
+    // `RC_UNDER_FUNC` gate on exactly this arm is the thing that came out to make it so.
+    // The gate said "not under a function type — that region is `canonEmitName`'s VERBATIM
+    // region"; `canonEmitNameAt`'s function-type arm no longer HAS a verbatim region, so
+    // the alias softens on both sides of every `$fnsig` fork instead of on neither. See
+    // the position-bit note above for the measurement.
+    const nlb = numLitUnionBaseName(ix)
+    if nlb != "" { return nlb }
     return udn
   }
   const t = T.tys[ix]
@@ -7004,7 +7005,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
       if s == "" {
         // The union-member position, with the sticky nullable bit — the same rule the
         // structural sibling applies, so the two agree about `A|B|null`.
-        s = tyToNominalNameAt(members[i], RC_UNION_MEM | (ctx & RC_INHERIT))
+        s = tyToNominalNameAt(members[i], RC_UNION_MEM | (ctx & RC_NULLABLE))
         sc = nomNameAtoms
       }
       if s == "" { return "" }
@@ -7043,7 +7044,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
       return nal + "|null"
     }
     // A nullable DECLARED struct/union keeps its nominal name (`S|null`, `U|null`).
-    const nsn = tyToNominalNameAt(t.nInner, RC_NULLABLE | (ctx & RC_UNDER_FUNC))
+    const nsn = tyToNominalNameAt(t.nInner, RC_NULLABLE)
     const nsnAtoms = nomNameAtoms
     if nsn == "" { return "" }
     const nfn = T.tys[t.nInner]
@@ -7073,9 +7074,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
         const fbal = litUnionAliasNameOfTy(ftys[fi])
         if fbal != "" { fs = fbal }
       }
-      if fs == "" {
-        fs = tyToNominalNameAt(ftys[fi], RC_FIELD | (ctx & RC_UNDER_FUNC))
-      }
+      if fs == "" { fs = tyToNominalNameAt(ftys[fi], RC_FIELD) }
       if fs == "" { return "" }
       if fi > 0 { out = out + "," }
       out = out + names[fi] + ":" + fs
@@ -7092,7 +7091,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
     // identifier is one atom, the render leg reports its own.
     let elw = 1
     if el == "" {
-      el = tyToNominalNameAt(t.aElem, RC_ELEM | (ctx & RC_UNDER_FUNC))
+      el = tyToNominalNameAt(t.aElem, RC_ELEM)
       elw = nomNameAtoms
     }
     if el == "" { return "" }
@@ -7103,11 +7102,9 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
     return arrElemRender(el, t.aElem, elw)
   }
   if t is TyMap {
-    const mk = tyToNominalNameAt(t.mKey, RC_MAP_KEY | (ctx & RC_UNDER_FUNC))
+    const mk = tyToNominalNameAt(t.mKey, RC_MAP_KEY)
     let mv = litUnionAliasNameOfTy(t.mVal)
-    if mv == "" {
-      mv = tyToNominalNameAt(t.mVal, RC_MAP_VAL | (ctx & RC_UNDER_FUNC))
-    }
+    if mv == "" { mv = tyToNominalNameAt(t.mVal, RC_MAP_VAL) }
     if mk == "" || mv == "" { return "" }
     // The key/value separators sit inside the braces — one atom.
     nomNameAtoms = 1
@@ -7118,7 +7115,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
     let out = "("
     let i = 0
     while i < ps.length {
-      const ps1 = tyToNominalNameAt(ps[i], RC_FN_PARAM | RC_UNDER_FUNC)
+      const ps1 = tyToNominalNameAt(ps[i], RC_FN_PARAM)
       if ps1 == "" { return "" }
       if i > 0 { out = out + "," }
       out = out + ps1
@@ -7134,7 +7131,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
       const bal = litUnionAliasNameOfTy(t.fnRet)
       if bal != "" { rs = bal }
     }
-    if rs == "" { rs = tyToNominalNameAt(t.fnRet, RC_FN_RES | RC_UNDER_FUNC) }
+    if rs == "" { rs = tyToNominalNameAt(t.fnRet, RC_FN_RES) }
     if rs == "" { return "" }
     const rt = T.tys[t.fnRet]
     if rt is TyFunc { rs = "(" + rs + ")" }
@@ -8018,29 +8015,53 @@ function canonEmitNameAt(name: string, ctx: i32) {
     // question about the render, not about where it sits.)
     return canonEmitNameAt(groupInnerOf(name), ctx)
   }
-  // A TOP-LEVEL function type with a parenthesized result (`(i32) => ((i32) => i32)`): canon
-  // the param list and the (paren-stripped) result, re-render with the result's grouping
-  // parens. A simple `(i32) => i32` ends in its return type (not `)`), so it never reached the
-  // strip above and falls through unchanged — this only re-canonicalizes the nested form.
+  // A TOP-LEVEL function type — ANY top-level function type: canon the param list and the
+  // result, re-render with the result's grouping parens when it is itself a function.
   //
-  // The tail test is the PAREN grammar's SPAN half at its home, and THAT ROUTING REFUTES
-  // THE HOME'S OWN CLASSIFICATION of this site (D-ALIASREF). `nameIsParenOpen`'s header
-  // lists "CLOSE-ONLY (`canonEmitName`'s paren-result arm) — no opener test at all" as one
-  // of the four spellings that must NOT route to the span. It has had one since #1190: the
-  // OTHER conjunct is `isTopLevelFuncTypeName`, whose second line is `nameIsParenOpen`, so
-  // the span's opener half is not an added test — the conjunction is exactly what the
-  // hand-written `isTopLevelFuncTypeName(name) && name[name.length - 1] == ')'` decided, on
-  // every input, and the routing is exact rather than similar.
+  // THIS ARM USED TO CARRY A `nameIsParenSpanEnds(name) &&` CONJUNCT, so it claimed only
+  // `(i32) => ((i32) => i32)` — a name that happens to END in `)` because its RESULT is a
+  // parenthesized function — and `(i32) => Z` fell through to the bottom UNCHANGED. That
+  // made "canon leaves a function type verbatim" the de-facto rule, with one accidental
+  // exception; #1267 filed the exception as an asymmetry (the paren-result arm canons its
+  // PARAMS at `RC_FN_PARAM`, so `(K0|i64) => ((i32)=>i32)` softened and `(K0|i64) => i32`
+  // did not) and #1271 filed the rule itself as the root of a miscompile FAMILY.
   //
-  // THE SPAN GOES FIRST, and the order is load-bearing for the BANK below, not for the
-  // answer (both operands are pure). The span is two character reads and rejects every
-  // non-parenthesized name before the arrow WALK runs; putting it second would also put a
-  // CALL between `isTopLevelFuncTypeName`'s return and the `funcArrowAt` read, which is
-  // exactly what the bank's contract asks callers not to do.
-  if nameIsParenSpanEnds(name) && isTopLevelFuncTypeName(name) {
+  // THE INTERIOR OF A FUNCTION TYPE IS NOT A REGION WITH ITS OWN SPELLING RULES — it is the
+  // signature of some function DECLARATION, whose own parameter and return annotations this
+  // very pass canons. Leave it verbatim and the two spellings of one closure fork:
+  //
+  //   type Z = 0 | 1
+  //   function mk(x: i32): Z { 1 }        // return annotation canons at RC_ROOT → `i32`
+  //   function run(m: (i32) => Z): i32 { const v = m(1); return v }
+  //   print(run(mk))                      // master: INVALID MODULE
+  //                                       // type mismatch: expected i32, found (ref $type)
+  //
+  // `annRetKind` reads the func type's result text and sees `Z`, which `collectU` has
+  // registered in `unNames`, so the `$fnsig` result token is the `{tag,value}` UNION BOX
+  // while `mk` — whose own annotation softened — is declared returning a plain i32. Eight
+  // shapes fork that way (`(i32) => Z`, `(i32) => Z[]`, `(i32) => Z|null`, `(i32) => {a:Z}`,
+  // `(i32) => {a:Z}[]`, `(Z[]) => i32`, `(Z|null) => i32`, `() => Z|null`), and #1271's
+  // producer-side gate could not close one of them: gating the OTHER producer makes both
+  // sides keep `Z`, which is only right when the fork's other side is a func type too.
+  // Canon'ing here makes both sides SOFTEN, which is right in every position, because the
+  // other side of a `$fnsig` fork is always a declaration canon'd at `RC_ROOT`.
+  //
+  // The rule this does NOT change is `ctxKeepsLitUnion`: a param is canon'd at
+  // `RC_FN_PARAM` and a result at `RC_FN_RES`, exactly as the paren-result form already
+  // was, so an inline `("a"|"b") => i32` still softens to `(string) => i32` (the honest `S`
+  // token its value call already resolved through `cloCallSigKey`'s arena fallback) and a
+  // DECLARED `type K = "a"|"b"` still rides through untouched — `nameNeedsCanon` sees no
+  // digit, pipe or quote in a bare alias name and returns it. Both are pinned by
+  // `tests/cases/closures/closure-litunion-param-valuecall.vl`.
+  //
+  // The `isTopLevelFuncTypeName` walk is the guard's whole content now; the PAREN-grammar
+  // SPAN test that used to lead it is gone with the arm it selected. (D-ALIASREF's reading
+  // of this site — "CLOSE-ONLY, no opener test at all" — is settled by deletion rather than
+  // by routing.)
+  if isTopLevelFuncTypeName(name) {
     // The arrow index the guard above just scanned for, not a second scan of the same
     // name for the same position (D-ARROWBANK). Nothing runs between the predicate's
-    // return and this read — it is the LAST conjunct of the guard — so the bank cannot
+    // return and this read — it is the guard's only conjunct — so the bank cannot
     // have been overwritten by another `isTopLevelFuncTypeName` call.
     // Both CUTS are `tyname.fnParamsTextOf` / `fnRetTextOf` (W4), given that banked index
     // — the pure half of a grammar whose FINDER is stuck here by the bank it writes.
