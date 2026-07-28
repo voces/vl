@@ -31854,3 +31854,283 @@ Every rc taken BARE, never through a pipe.
    is recorded WITH the command that produced it is falsifiable by the next slice at the cost
    of one build. The counts in finding 1 and 2 were recorded WITHOUT one, and all three
    drifted.
+
+## renderEmit P4 + THE DISAGREEMENT CENSUS RE-DERIVED — the alias arm stops re-parsing its own render, and the canon-only class turns out to be ONE rule (off master `b907f2ad`)
+
+Base `b907f2ad`. Partition: `compiler/typecheck.vl` and this append. Nothing else was touched
+— no fixture, no second module, no import.
+
+Two things. **TARGET 1** is the re-measurement the brief demanded before any code moved: the
+853-of-5,172 disagreement that has blocked W9 since #1199 is many merges old, and W1/W2/W4/W14
+plus #1247's hole work could have moved it in either direction. **TARGET 2** is P4 itself,
+sized by what TARGET 1 found: *"route (3) alias transparency"*, both of its round-trips.
+
+### TARGET 1 — THE CENSUS RE-DERIVED, WITH THE COMMAND
+
+The instrument is #1199's, rebuilt from its description rather than inherited: an instrumented
+compiler banks every `TypeRef`'s PRE name, its POST name and its node index inside
+`canonEmitTypeNames`'s rewrite loop, and a SECOND pass after the loop computes each replacement
+candidate over the saved pre-names — so the probe cannot perturb the value it is measuring.
+Each record is emitted as one diagnostic and read off `vl check`'s stderr:
+
+```
+build:  cd <probe tree> && vl build compiler/entry.vl -o probe-canon.wasm --compiler build/vl-compiler.wasm
+run:    vl check tests/cases --compiler probe-canon.wasm            # 1,548 programs, rc 1 (the probe raises)
+count:  grep '^\[ERROR\]: ZZP' probe.out | sed 's/^\[ERROR\]: ZZP\t//' > probe.tsv   # 7,531 records
+```
+
+**THE PROBE'S FIRST VERSION UNDER-COUNTED BY 22% AND LOOKED FINE.** `tErrCoded` drops an EXACT
+repeat (same message, same anchor) — a deliberate de-noising, three lines above where the
+diagnostic is pushed — so every annotation whose `(pre, post, candidates)` tuple matched another
+in the same program vanished. The first run read **3,865** records where the second, with a
+per-record index in the message, reads **7,531**. A count that is 3,865 is not obviously wrong;
+it is only obviously wrong once you know the answer. *Any probe that reports through a
+diagnostic channel must first ask what that channel de-duplicates.*
+
+| | count | of reach |
+| --- | ---: | ---: |
+| annotations canon SAW (1,548 programs, 1,367 with at least one) | 7,531 | 100% |
+| …returned **byte-identical** | **7,234** | **96.06%** |
+| …**actually rewritten** | **297** | **3.94%** |
+
+**THE HEADLINE: THE DISAGREEMENT HAS NOT SHRUNK. IT GREW, IN BOTH THE ABSOLUTE AND THE RATE.**
+
+| candidate | agrees | renders "" | disagrees | unresolvable | #1199 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **B1** `tyToEmitName(nameToTy(pre))` | 5,833 / 7,063 = **82.59%** | 72 | **1,230 (17.41%)** | 396 | 853 / 5,172 = 16.5% |
+| **B2** `tyToNominalName(nameToTy(pre))` | 6,936 / 7,130 = **97.28%** | 5 | **194 (2.72%)** | 396 | 95 / 5,172 = 1.84% |
+| **B3** `tyToNominalName(nodeTyIxOf(node))` | 6,878 / 7,150 = **96.20%** | 346 | **272 (3.80%)** | 35 no `nodeTyIx` | 154 / 5,415 = 2.84% |
+
+**AND THE #1239 CENSUS'S W9 ROW STAPLES TWO DIFFERENT ROWS' NUMBERS TOGETHER.** It reads
+*"they disagree on 853 of 5,172 annotations (16.5%), 41 canon-only / 108 renderer-only / 5
+both"*. 853 is **B1**'s disagreement; 41/108/5 is **B3**'s decomposition (41+108+5 = 154, which
+is B3's total, not B1's). B1's own #1199 decomposition was never published. Re-derived here,
+both are:
+
+| | canon rewrote, renderer did NOT | renderer rewrote, canon did NOT | both rewrote, differently |
+| --- | ---: | ---: | ---: |
+| **B1** (1,230) | **29** | **1,179** | 22 |
+| **B3** (272) | 43 | 191 | 38 |
+
+Two numbers matter and they point in opposite directions.
+
+**(a) THE RENDERER-ONLY CLASS IS 1,179 AND IT IS THE WHOLE BLOCKER.** 301 distinct pre-names.
+Ranked: `Buf` → `{base:i32,length:i32}` (198), `K` → `string` (53), `K0` → `string` (19),
+`P|null` → `{x:i32}|null` (14), `Expectation` → its shape (14), `P[]` → `{x:i32}[]` (13),
+`AB` → `{v:i32}|{w:string}` (12) … Every one is the SAME thing: canon keeps a declared NAME and
+the structural renderer expands it. That is O2 — *nominal where the emitter has a nominal route,
+structural where it does not, and the POSITION decides which* — and it is untouched by anything
+that has landed. A wholesale `n.tyName = tyToEmitName(…)` would rewrite 1,179 annotations that
+are correct today.
+
+**(b) THE CANON-ONLY CLASS COLLAPSED TO 29, AND ALL 29 ARE ONE RULE.** #1199 measured 41 for B3
+and did not publish B1's. Today B1's canon-only class is **29 of 29 the same construct**: a
+STRING-litunion ALIAS standing inside a union, which canon softens to `string` and the renderer
+preserves.
+
+```
+{f:K0|f64}          canon {f:string|f64}          renderer {f:K0|f64}        (5)
+K0|{w:i32}          canon string|{w:i32}          renderer K0|{w:i32}        (3)
+{[string]:K0|i64|{q:i64}}  canon …string…          renderer …K0…             (2)
+(K0|i64)[]          canon (string|i64)[]          renderer (K0|i64)[]        (2)
+… 15 more singletons, every one of the same shape
+```
+
+**AND THE MECHANISM IS A LOST POSITION, WHICH MAKES IT A P4 FINDING RATHER THAN A CURIOSITY.**
+Canon reaches it through `unionAliasMembers`, whose body is `tyToEmitName(ix)` — a render of the
+alias's own type **at `RC_ROOT`**, i.e. of a PURE litunion, which softens to `string` and dedups
+to one atom. The structural renderer never sees a pure litunion there: it renders the arena type
+of the WHOLE union, whose members are the flattened lits *plus* `f64`, so its mixed-union
+regroup (`rgAlias`) puts the alias name back. **The two producers do not disagree about the
+rule; they disagree about what the alias is a member OF**, because one of them threw the
+position away.
+
+**IT IS FILED, NOT FIXED, AND THE REASON IS IN THE CORPUS.**
+`tests/cases/types/declared-vs-inline-mixed-union-field-twin.vl`'s own header records that the
+EMITTER already reconciles this by widening in the other direction: *"repCanonKey's union arm
+now mix-widens litunion members to `string`"*. So the softening is not merely canon's habit —
+there is a keying rule downstream that was written against it, and four fuzz-nightly
+invalid-wasm seeds are cited in `tyToEmitNameGo`'s arms for the PRESERVING side. Changing either
+producer without the other is how this family produced miscompiles in the first place. The
+decision this needs — *does the emitter's vocabulary spell a mixed union's litunion member by
+its alias or by its base?* — is an owner's call, it is now measured at **29 corpus annotations
+on 15 files**, and it is the last single-rule item standing between canon and the renderer on
+the B1 axis.
+
+### TARGET 2 — WHAT P4 SHIPS
+
+The design's P4 is *"route (3) alias transparency (dual: `singleAliasMemberTyIx`, already
+structural)"*. The arm had **two** round-trips, not one, and both are W9's thesis verbatim —
+*the checker re-parsing a name it had just rendered*:
+
+```vl
+// canonEmitNameAt, the transparency arm
+const sma = singleMemberAliasName(name)     // = tyToEmitName(m)  — A RENDER
+if sma != "" { return canonEmitNameAt(sma, ctx) }   // …fed back into the string rewriter
+
+// canonEmitTypeNames, the IsExpr arm
+const sis = singleMemberAliasName(n.isVariant)      // = tyToEmitName(m)  — A RENDER
+if sis != "" { n.isVariant = canonEmitName(sis) }   // …fed back into the string rewriter
+```
+
+`singleMemberAliasName` is replaced by `singleMemberAliasTyIx`, which returns the ARENA INDEX
+and renders nothing. Canon's arm renders it once, **at the position it stands in**
+(`tyToEmitNameAt(smt, ctx)`), banks the render's own width (`canonAtoms = emitNameAtoms`) and
+returns. The `is`-variant arm renders it once at `RC_ROOT` and stores it. `singleMemberAliasName`
+is deleted. The emptiness guard both sites carried implicitly (`sma != ""`) survives as
+`smr != ""`, so an unnameable member still falls through to the rest of the rewriter.
+
+**P4, LIKE P3, DOES NOT MOVE AN ANSWER — IT MOVES WHO DECIDES IT.** That is the phase, not a
+shortfall, and it is what makes it provable.
+
+### THE SITE COMPARATOR — BOTH LEGS AT EVERY REACH, AND THE ZERO IS GRADED
+
+A comparator build computes the OLD leg and the NEW leg at every reach and reports each
+disagreement (value or atom width) as its own diagnostic:
+
+```
+vl check tests/cases --compiler probe3.wasm     # cumulative counters, monotone across the shared instance
+```
+
+| channel | alias-arm reaches | `is`-arm reaches | disagreements |
+| --- | ---: | ---: | ---: |
+| `tests/cases` (1,548 programs) | **124** | **5** | **0** |
+| `tests/cases --codegen` (the emitter runs) | 124 | 5 | **0** — *identical, so `emit_collect`'s three `canonEmitName` calls never reach this arm: they canon a RENDER, and a render holds no alias name* |
+| **9,600 generated fuzz programs** (seeds 1209-1212 x depths 4/5/6 x plain/declared, `--branching --multiobs`) | **0** | **0** | — **COVERAGE, not agreement** |
+| the compiler's own 29 modules, `std`, `scripts` | **0** | **0** | — coverage |
+
+Position histogram of the 124: `RC_ROOT` 87 · `RC_UNION_MEM|RC_NULLABLE` 16 · `RC_UNION_MEM` 6 ·
+`RC_MAP_VAL` 6 · `RC_ELEM` 5 · `RC_FIELD` 4. **Six of the nine positions P1 threaded, so the
+`ctx` this arm now renders at is live and not decorative.**
+
+**THE FUZZ ZERO IS A COVERAGE ZERO AND IT WAS CHECKED, NOT ASSUMED.** `scripts/fuzzgen.vl`'s
+`--declared` dimension hoists a struct to `type Tn = {…}`, which the parser makes a `TypeDecl`,
+not the one-member `UnionDecl` this arm reads. 9,600 programs, 0 reaches. #1207 had to draw the
+same line for its own second target; the same discipline applies in the other direction here.
+**And the compiler's own source is in the same bucket** — which is why the frozen-rebuild
+instrument below is vacuous for this family rather than green.
+
+### CHANNEL GRADING — THREE SABOTAGES, EACH BUILT, ALL DISCARDED
+
+| # | sabotage | corpus rows moved (1,594 files x 6 fields) |
+| --- | --- | ---: |
+| **S1** | the transparency arm never fires (`smt = -1`) | **21** — every one an alias-transparency pin: `types/{primitive,struct,array}-alias-*`, `maps/alias-*`, `generics/alias-to-generic-application*`, `generics/type-param-shadows-*`, `modules/plain-alias-ref-renamed/*`, `closures/fn-type-alias-call-positions`. Fields: BUILDRC(0/1) + BUILDMSG + RUNRC on 16, BYTES on 5 |
+| **S2** | the width bank is 1 instead of `emitNameAtoms` | **0 — INERT BY CONSTRUCTION, not by coverage.** `singleAliasMemberTyIx` admits exactly `TyPrim` / `TyFunc` / scalar-spine `TyArray` / `TyMap` / plain-alias-ref `TyObj`, and every one of those renders as ONE top-level atom (`i32`, `(i32)=>i32`, `i32[]`, `{[string]:i32}`, `{v:i32}`). The bank cannot be wrong here because it cannot be anything but 1 — and the comparator agrees, 0 width disagreements in 129 reaches. Recorded as the measured equivalence, not as evidence |
+| **S3** | the `is`-variant arm stops writing | **2** — `types/prim-alias-is-narrow-union-arm`, `types/transparent-alias-is-narrow-union-arm`, both BUILDRC(0/1) + BUILDMSG + RUNRC |
+
+**S1's 21 and S3's 2 are the two non-empty witnesses this slice's zero rests on.** Both were
+built from a COPY of the tree, never from the worktree; the shipped source contains no marker,
+no early return, no probe.
+
+### EQUIVALENCE
+
+* **corpus A/B, 1,594 files x 6 fields** (`vl check` rc · `vl check` message · `vl build` rc ·
+  `vl build` message · emitted BYTES · run rc+stdout) vs `base82.wasm` (master `b907f2ad`,
+  1,047,751 B): **0 rows moved on every field.** Graded by S1/S3 above.
+* **fuzz A/B, 9,600 programs/side**, generated ONCE with master's compiler so both legs see
+  byte-identical inputs, 24 shards: `vl check` **identical** (61,836 lines/side), `vl check --codegen`
+  **identical** (63,348 lines/side). It is **COVERAGE for this arm** (0 reaches) and is reported as such.
+* **`SELFHOST_NATIVE_ALIGN=1 deno task test`: 3348 / 0 / 8** — master `b907f2ad`'s own reading,
+  as the brief recorded it. No fixture added, so a delta would have been a defect.
+* **master's FROZEN source compiled by this head** (`git archive master compiler std`, 31 files):
+  `cmp` **RC 0** against `base82.wasm`, 1,047,751 B. **This is VACUOUS for this family and it is
+  reported as vacuous.** The instrument is the strongest one this programme has — P1 and P3 both
+  leaned on it — and the comparator measured **0 alias-arm reaches over the compiler's own
+  source**, so the byte-identity is guaranteed by construction rather than earned. *An
+  instrument's strength is a property of the code it is pointed at, not of the instrument.*
+
+### NO FIXTURE, AND THE SABOTAGE TABLE IS THE ARGUMENT
+
+Same call P1 made, for the same reason and now with this family's numbers: a behaviour-free
+phase has nothing to pin, and a fixture asserting what master already asserts shows up as a
+suite delta that then has to be explained away. What has to be true instead is that the sites
+P4 touched are ALREADY pinned totally — and S1 reddens 21 corpus rows, S3 reddens 2, with no
+new file added.
+
+### COUNTS — WITH THE COMMANDS, AND ONE OF THEM MOVED FOR THE FIRST TIME
+
+**STATIC CALL SITES (`scripts`-free python census: `NAME(` in `//`-stripped, string-literal-aware
+code, each function's own `function NAME(` header excluded; run over `git show master:…` and the
+head side by side).** Every scanner on #1141's off-list table is **0-delta**: `tyGtIsClose` 0,
+`skipQuotedName` 0, `splitTypeName` 0, `nameHasPipe` 2→2, `topLevelArrowIndex` 1→1, `nameHasSep`
+3→3, `splitGenArgs` 0, `canonShapeName` 1→1, `nameNeedsCanon` 1→1, `unionAliasMembers` 1→1,
+`nameIsGenAppOfDecl` 1→1, `isPlainAliasRef` 1→1. **The CORE and OFF-LIST counters do not move,
+and that is structural** — P4 deletes no grammar call; it deletes a RE-ENTRY.
+
+What moved is exactly the re-entry: `canonEmitName` **3 → 2**, `canonEmitNameAt` **11 → 10**,
+`singleMemberAliasName` **2 → 0**, `singleMemberAliasTyIx` **0 → 2**, `tyToEmitNameAt`
+**11 → 12**, `tyToEmitName` 45 → 45.
+
+**RUNTIME CALLS — the number the deletion actually buys.** Two counter builds (master's source
+and this head's, both instrumented identically, `vl check tests/cases`, cumulative counters read
+off the last report):
+
+| | master | this head | delta |
+| --- | ---: | ---: | ---: |
+| `canonEmitNameAt` ENTRIES | 16,602 | 16,395 | **−207** |
+| `nameNeedsCanon` calls | 16,298 | 16,091 | **−207** |
+
+*(Both figures are the corpus-wide cumulative totals over 1,548 programs; the two deltas are
+equal because every deleted re-entry was one whole rewriter pass, and the first thing a rewriter
+pass does is run the trigger scan.)* 129 top-level reaches cost 207 rewriter entries — the
+re-canon of a render averaged 1.6 entries each, and produced a byte-identical answer every time.
+
+**BINARY: 1,047,751 → 1,047,770 B, +19 B.** A cost, reported as one: the arm gains an emptiness
+guard and a bank write, and loses a tail call. The fixpoint ladder held at **2 compiles** on the
+first refresh and at **1** thereafter.
+
+### GATE — EVERY RC TAKEN BARE, NEVER THROUGH A PIPE
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,047,751 B**, sha256 `a2a99ce2…` — byte-identical to the `base82.wasm` baseline, so the A/B baseline IS master's published compiler |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | log reads *"compile(next) == next — next is the fixpoint (2 compiles)"*, **1,047,770 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,047,770 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3348 / 0 / 8** |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
+| corpus A/B vs `base82.wasm`, 1,594 files x 6 fields | 0 | **0 rows moved** |
+| fuzz A/B, 9,600 programs, `check` (61,836 lines) and `check --codegen` (63,348 lines) | 0 | identical — coverage, 0 reaches |
+| master's frozen source compiled by this head, `cmp` vs `base82.wasm` | 0 | byte-identical (vacuous — see above) |
+
+### METHOD NOTES
+
+* **A DIAGNOSTIC CHANNEL THAT DE-DUPLICATES IS A COUNTING CHANNEL THAT LIES.** `tErrCoded` drops
+  an exact repeat at the same anchor — three lines of deliberate de-noising — and the first
+  census read 3,865 where the truth is 7,531. The tell was not the number (3,865 is perfectly
+  plausible); it was that the number came from a channel whose contract had not been read.
+  *Before counting through any reporting channel, read what that channel throws away.*
+* **A CENSUS ROW THAT STAPLES TWO CANDIDATES' NUMBERS TOGETHER SURVIVES BECAUSE BOTH HALVES ARE
+  TRUE.** #1239's W9 row — "853 of 5,172 … 41 canon-only / 108 renderer-only / 5 both" — is B1's
+  total with B3's decomposition, and it has been quoted forward through four slices and two
+  residue tables. Each half is a real measurement of a real candidate; only the JOIN is fiction.
+  *When a row carries a total and a breakdown, check that the breakdown sums to the total* —
+  41+108+5 = 154, and 154 is not 853.
+* **RE-MEASURE BEFORE ROUTING, EVEN WHEN THE DESIGN IS SETTLED.** The brief's hypothesis was that
+  the disagreement might have shrunk toward zero. It grew — 16.5% → 17.41% — and the growth is
+  entirely the renderer-only class (O2), which nothing that has landed since #1199 was aimed at.
+  The measurement changed the SIZE of this slice, not its direction.
+* **THE CANON-ONLY CLASS IS THE ONE WORTH WATCHING, AND IT IS DOWN TO A SINGLE RULE.** 41 → 29
+  on B3's axis and 29-of-29 one construct on B1's. When a disagreement class reduces to one
+  rule, the question stops being *"can these two producers agree"* and becomes *"which of them
+  is right"* — which is an owner's decision, not a refactor's.
+* **AN INSTRUMENT'S STRENGTH IS A PROPERTY OF THE CODE IT IS POINTED AT.** The frozen-rebuild
+  byte-identity is this programme's sharpest proof and it is worth nothing here, because the
+  comparator measured 0 reaches over the compiler's own source. Reporting it as a green tick
+  would have been the same mistake as reporting the fuzz zero as agreement.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **The mixed-union litunion-alias decision** — measured at 29 corpus annotations on 15 files,
+  mechanism named (`unionAliasMembers` renders at `RC_ROOT`), both sides' evidence cited
+  (`repCanonKey`'s mix-widening on canon's side, four fuzz-nightly invalid-wasm seeds on the
+  renderer's). Filed above as the decision P5 cannot start without.
+* **Routes (2), (4), (5), (6).** Route (2) — intersection folding — is ALREADY `nameToTy` then
+  `tyToEmitNameAt(folded, ctx)`, so the design's *"it converts by deleting a string round-trip"*
+  is measured **empty**: there is no round-trip left in that arm to delete. Route (4)'s
+  `unionAliasMembers` is the filed decision above. Routes (5) and (6) still rewrite strings.
+* **`ctx` for canon's remaining alias helpers.** `unionAliasMembers` still enters the renderer
+  position-free at `RC_ROOT`, and that is now known to be the mechanism of the whole canon-only
+  class rather than a tidiness gap. Threading it is half the fix and the other half is the
+  decision.
+* **Any fixture, any second module, any import.** The partition was one file.
