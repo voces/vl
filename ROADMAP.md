@@ -114,8 +114,10 @@ hatch").** All four are prerequisites for each other in practice:
 - ⬜ **P1.4 Bounds-check ergonomics** — not asking for unsafe access; asking that the canonical
   view loop either hoists the bound or relies on the memory trap, **and that this is stated** so
   kernel code can be written to the fast pattern deliberately.
-- ⬜ **P1.5 Nominal/opaque types (= our A14)** — `EntityId`/`PlayerSlot`/`AbilityHandle` are all i32
-  and interchange silently today. Zero-cost newtype. Cheap, high-value for engine code.
+- ✅ **P1.5 Nominal/opaque types (= our A14)** — `type EntityId = new i32` mints an identity a
+  structural checker cannot; `new` is a contextual keyword, the type is erased before emit, and
+  `std:buffer`'s two views are now `new { base, length }` (the `f32base`/`i32base` hack deleted,
+  and the module 12 bytes SMALLER because the two shapes collapse to one heap type).
 - ⬜ **P1.6 `vl test`** — already designed and already slated (see Track H); webcraft needs it to
   *exist* by M7 for thousands of table-driven cases. **See the promotion note below.**
 
@@ -426,7 +428,13 @@ in-language GC knobs.
 - 🟡 **A13. Operator-constraint inference.** REMAINING: the hole-operand rule is permissive (doesn't
   reject `i32 + string` yet); the *stored-closure* operator case (`vec + vec` via a `"+"` field)
   still hits the WasmGC width wall (B13).
-- 🟡 **A14. Named/opaque types.** REMAINING: real **nominal/opaque types** (decision: clean-error-for-now → `DECISIONS.md`).
+- ✅ **A14. Named/opaque types.** Zero-cost nominal newtypes ship: `type EntityId = new i32` /
+  `type F32View = new { base: i32, length: i32 }`. Distinct in the checker in every position,
+  ERASED before the emitter (no emitter file changed), literals brand-polymorphic, `as` for both
+  construction and unwrap. `docs/internals/newtype-design.md`. REMAINING: generic newtypes
+  (`type Handle<T> = new …`), an OPAQUE type with runtime identity (`x is EntityId` — a newtype
+  has no tag by construction), and a newtype as a MAP KEY (a pre-existing map-key-grammar gap a
+  plain alias hits too).
 - 🟡 **A15. Equality.** REMAINING: a referential-identity operator (`===` / `identical`, O(1) `ref.eq`);
   `boolean`→i32 coercion when storing a comparison result; SELF-HOST struct/function-value equality
   (guarded loudly today — and note the `call_ref`-ABI wrinkle: funcrefs admit no `ref.eq`, so

@@ -254,16 +254,17 @@ ring and for the differential harness to diff columns.
 >
 > Three things to design around, one of them a sequencing correction:
 >
-> - **P1.1 depends on P1.5, and the dependency is not optional.** VL is
->   structurally typed: `type X = {…}` names a shape, it does not mint an
->   identity. Spelled as the ask has them — both views as `{base, count}` —
->   `F32View` and `I32View` **are the same type**, an `I32View` satisfies every
->   `F32View` parameter, and reading integer bytes as floats type-checks
->   silently. Measured, not feared. So the shipped types spell their address
->   field `f32base` / `i32base`: the element width is put in the field NAME,
->   which is the only place a structural checker can see it. That is the
->   workaround, it is ugly, and **P1.5's zero-cost newtype deletes it** — which
->   makes P1.5 worth pulling forward rather than leaving below P1.2/P1.3.
+> - **P1.1 depended on P1.5, the dependency was not optional, and P1.5 has since
+>   SHIPPED and closed it.** VL is structurally typed: `type X = {…}` names a
+>   shape, it does not mint an identity. Spelled as the ask has them — both views
+>   as `{base, count}` — `F32View` and `I32View` **are the same type**, an
+>   `I32View` satisfies every `F32View` parameter, and reading integer bytes as
+>   floats type-checks silently. Measured, not feared. The interim put the
+>   element width in the field NAME (`f32base` / `i32base`), the only place a
+>   structural checker could see it. Both views are now
+>   `new { base: i32, length: i32 }`; the mismatch is a checker reject, the
+>   emitted bytes are unchanged by the `new`, and collapsing the two shapes back
+>   into one took a wasm heap type OUT (−12 bytes per view program). §P1.5.
 > - **`x[i]` is purely syntactic, and it is a language feature, not a views
 >   feature.** Under every dispatch route VL has or plans, `x[i]` lowers to
 >   exactly the call `x.getF32(i)` already lowers to. Four routes were probed;
@@ -386,16 +387,44 @@ entity id passed where a player index goes is exactly the bug class the TS
 twin catches with branded types. A zero-cost newtype (`type EntityId = new
 i32` or similar) closes it. Cheap, high-value for engine code.
 
-> Maintainer's note (vl side): **P1.1 already needed this, which argues for
-> pulling it above P1.2/P1.3.** The bug class is not hypothetical and it is not
-> confined to i32 ids — it bit the typed views on their first day. `F32View` and
-> `I32View` over the same `{base, count}` shape are ONE type to a structural
-> checker, so an integer column flows into a float accessor with no diagnostic
-> (measured; `buffer-design.md` §L2). The shipped workaround puts the element
-> width in the field NAME (`f32base` / `i32base`) because that is the only
-> discriminator a structural checker can see. A newtype deletes the workaround
-> and lets both fields go back to `base`. Every further width the view family
-> grows (i64, f64, the narrow widths) multiplies the same hack.
+> Maintainer's note (vl side): **SHIPPED, both customers, and the views hack is
+> deleted.** `docs/internals/newtype-design.md` is the design record.
+>
+> ```vl
+> type EntityId = new i32                       // and PlayerSlot, AbilityHandle
+> type F32View  = new { base: i32, length: i32 } // std:buffer, back to `base`
+> ```
+>
+> - **`new` is a CONTEXTUAL keyword**, recognized only after a `type`
+>   declaration's `=`. It is still a legal identifier everywhere else, so no
+>   existing program can break on the addition.
+> - **Distinct in every position** — let, global, param, return, struct field,
+>   array element, map value, nullable, union member. A newtype does not flow to
+>   its base, from its base, or to a sibling. 72 reject cells, each with an
+>   inverted control (the same program with `new` deleted) that checks clean.
+> - **A LITERAL is brand-polymorphic** and adopts the destination's brand, so
+>   `const e: EntityId = 0`, `e + 1` and `e == 0` all work while `e + someI32`
+>   rejects. Same-brand arithmetic keeps the brand.
+> - **Construction and unwrap are both `as`** (`x as EntityId` / `e as i32`).
+>   The spec's `EntityId(x)` call form was not taken: VL has no call-a-type
+>   syntax and adding one would have put newtype knowledge in the EMITTER, which
+>   is exactly what the zero-cost design avoids.
+> - **Zero-cost is proven, not asserted.** A newtype is erased before the emitter
+>   runs — the canon pass already rewrites a one-member alias annotation to its
+>   member — so **no emitter file changed**. 46 of 47 positive grid cells emit
+>   byte-identically to the same program with `new` deleted; the 47th is a
+>   pre-existing f32-map-value gap that fails without any newtype in the program.
+>   Across the whole 1,625-file corpus the branch is **byte-identical on every
+>   file** to the compiler before it.
+> - **The views migration made the module SMALLER.** `f32base`/`i32base` made the
+>   two views two shapes needing two wasm heap types; `base`/`base` + `new` makes
+>   them one shape (one heap type) and two TYPES. −12 bytes per view program.
+>
+> Not in this phase, filed with reasoning in the design doc: generic newtypes
+> (`type Handle<T> = new …`), `x is EntityId` narrowing (a newtype has no runtime
+> tag by construction), and opting a newtype OUT of struct dedup for runtime
+> identity. Also worth knowing: a newtype cannot be a MAP KEY — but neither can a
+> plain alias, which is a pre-existing map-key-grammar gap, not this feature's.
 
 ### P1.6 `vl test` (already designed)
 
