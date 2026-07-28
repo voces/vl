@@ -14222,6 +14222,41 @@ function matchBlockOf(bodyIx: i32) {
   mkBlock(one, -1)
 }
 
+// The arm's block WITH its payload bindings (phase 2b) — `matchBlockOf` plus the clause's
+// `const x = scrut.x` decls PREPENDED, which is the whole of the phase-2b lowering. The arm is
+// already `if scrut is Move { <block> }`, so the result is node-for-node the hand-written
+// `if cmd is Move { const x = cmd.x; … }` twin: no new chain, no new narrowing, no new emitter path.
+//
+// A Block body is rewritten IN PLACE (`P.nodes[bodyIx] = …`, the same arena overwrite
+// `desugarMatchAt` ends with) rather than replaced by a fresh index: the body already carries a
+// checked `nodeTyIx` row, and a new node minted here would read back -1 forever. A bare-expression
+// body has no such row to preserve — it is wrapped, exactly as `matchBlockOf` wraps it today.
+function matchArmBlockOf(bodyIx: i32, bindIx: i32) {
+  if bindIx < 0 { return matchBlockOf(bodyIx) }
+  const stmts: i32[] = []
+  const bn = P.nodes[bindIx]
+  if bn is Block {
+    let i = 0
+    while i < bn.blkStmts.length {
+      stmts.push(bn.blkStmts[i])
+      i = i + 1
+    }
+  }
+  const b = P.nodes[bodyIx]
+  if b is Block {
+    let j = 0
+    while j < b.blkStmts.length {
+      stmts.push(b.blkStmts[j])
+      j = j + 1
+    }
+    const spliced = mkBlock(stmts, b.pos)
+    P.nodes[bodyIx] = P.nodes[spliced]
+    return bodyIx
+  }
+  stmts.push(bodyIx)
+  mkBlock(stmts, -1)
+}
+
 // `scrut == p0 [|| scrut == p1 …]` over match arm `k`'s OR-patterns.
 //
 // A TYPE pattern is ALREADY the test: the parser minted it as an `IsExpr` over this very
@@ -14322,12 +14357,12 @@ function desugarMatchAt(ix: i32) {
     const nArms = armStart.length
     if nArms > 0 {
       const elseArm = matchElseArmOf(pats, armStart, armCount)
-      let chain = matchBlockOf(bodies[elseArm])
+      let chain = matchArmBlockOf(bodies[elseArm], matchArmBindsOf(n, elseArm))
       let k = nArms - 1
       while k >= 0 {
         if k != elseArm {
           const cond = matchArmCond(scrut, pats, armStart, armCount, k, mpos)
-          const thenB = matchBlockOf(bodies[k])
+          const thenB = matchArmBlockOf(bodies[k], matchArmBindsOf(n, k))
           chain = mkIf(cond, thenB, chain, mpos)
         }
         k = k - 1
