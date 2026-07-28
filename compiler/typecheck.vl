@@ -469,6 +469,49 @@ let holeAltNames: string[] = []
 let holeAltTys: i32[] = []
 let holeAltPreN: i32[] = []
 let holeAltTailN: i32[] = []
+// The arena index of the HOLE each alternative constrains — the same hole
+// `holeAltNames[k]` names. `mkGuardedRetTy` needs a HANDLE on that hole (not just
+// its name) to build a guarded-member DERIVATION whose base points at it; the row
+// is the only place the two are already paired.
+let holeAltHoleIx: i32[] = []
+
+// ── DERIVED-HOLE DERIVATIONS (W6: "a union is a data structure") ─────────────
+//
+// A DERIVED hole is a hole that names a READ off another hole — field-of,
+// return-of, element-of, guarded-alternative-of. The derivation used to live in
+// the hole's NAME, as a dotted path (`?fld.x.?ret.?f.0`) that four functions
+// decoded again by prefix-match plus recursive slicing, with the guarded form
+// round-tripping two arena indices through DECIMAL TEXT. That is a type held as
+// a parsable string, and it is now a DATA STRUCTURE: one row per derivation, in
+// the parallel-array style every other side table here uses.
+//
+//   hdKind[r]   HD_FLD | HD_RET | HD_ELEM | HD_GALT
+//   hdField[r]  HD_FLD: the property read. "" otherwise.
+//   hdInner[r]  HD_GALT: the type the guarded branch contributes (arena ix). -1 otherwise.
+//   hdAlt[r]    HD_GALT: the guard's tested type (arena ix). -1 otherwise.
+//   hdBase[r]   the hole this derivation READS FROM (arena ix) — itself possibly derived.
+//   hdDepth[r]  how many derivation layers stack here, so the re-basing budget
+//               (`HOLE_REBASE_MAX`) is a stored count instead of a `?`-census of the name.
+//
+// The NAME is still minted, and still identical byte-for-byte (`hdRenderName`),
+// because it remains the hole's IDENTITY: generic bindings (`bNames`), demanded
+// shapes, array demands and the alternative rows are all keyed by it. Rendering a
+// type is allowed; parsing one back is what this retires. Nothing reads a `?fld.`
+// prefix any more — the structure is authoritative from the moment it is minted.
+const HD_FLD = 0
+const HD_RET = 1
+const HD_ELEM = 2
+const HD_GALT = 3
+let hdKind: i32[] = []
+let hdField: string[] = []
+let hdInner: i32[] = []
+let hdAlt: i32[] = []
+let hdBase: i32[] = []
+let hdDepth: i32[] = []
+// Arena index -> derivation row, grown on demand (a derived hole's arena index is
+// dense enough in practice that a sparse i32 sidecar beats a scan). -1 / past the
+// end = NOT a derived hole, which is exactly the old "no prefix matched" answer.
+let hdRowOfTy: i32[] = []
 
 // The `is`-guard ALTERNATIVE rows (indices into `holeAlt*`) whose THEN-branch is
 // currently being checked. A `return` inside one is reached ONLY by an argument
@@ -2019,6 +2062,17 @@ export function initChecker() {
   holeAltTys = []
   holeAltPreN = []
   holeAltTailN = []
+  holeAltHoleIx = []
+  // The derivation rows are ARENA-PARALLEL, so they are reset exactly where the
+  // arena is (`T.tys = []` above) — a row surviving the re-mint would describe a
+  // type index that no longer exists.
+  hdKind = []
+  hdField = []
+  hdInner = []
+  hdAlt = []
+  hdBase = []
+  hdDepth = []
+  hdRowOfTy = []
   guardAltStack = []
   joinHoleUnions = []
   dJoinNode = []
@@ -4106,28 +4160,28 @@ function tyIsDeferredJoin(tyIx: i32) {
   false
 }
 
-// The BASE hole a DERIVED member-read hole reads from: `?fld.<prop>.<h>` and
-// `?galt.<inner>.<alt>.<h>` both bottom out at `<h>` (and nest — `?fld.b.?fld.a.?h`).
-// Any other name (including a plain param hole, `?ret.` and `?elem.`) is returned
-// unchanged, which is how `holeMemberDeadAt` tells "this member is a read off a
-// pinned argument" from "this member IS an argument".
-function holeBaseName(name: string) {
-  if name.length > 5 {
-    if name.slice(0, 5) == "?fld." {
-      const rest = name.slice(5, name.length)
-      const d = dotIndexFrom(rest, 0)
-      if d > 0 { return holeBaseName(rest.slice(d + 1, rest.length)) }
-    }
-    if name.slice(0, 6) == "?galt." {
-      const restG = name.slice(6, name.length)
-      const g1 = dotIndexFrom(restG, 0)
-      if g1 >= 0 {
-        const g2 = dotIndexFrom(restG, g1 + 1)
-        if g2 >= 0 { return holeBaseName(restG.slice(g2 + 1, restG.length)) }
-      }
-    }
+// The BASE hole a DERIVED member-read hole reads from: a FIELD read and a GUARDED
+// alternative both bottom out at the hole they read (and nest — a field of a field).
+// Any other hole (a plain param hole, and a `HD_RET` / `HD_ELEM` derivation) is
+// returned unchanged, which is how `holeMemberDeadAt` tells "this member is a read
+// off a pinned argument" from "this member IS an argument".
+//
+// Walks `hdBase` — the derivation the hole was MINTED with. The string form
+// prefix-matched `?fld.` / `?galt.` and re-sliced the tail; a hole with no row is
+// the old "no prefix matched, return the name unchanged".
+function holeBaseTy(tyIx: i32) {
+  const row = hdRowOf(tyIx)
+  if row < 0 { return tyIx }
+  const k = hdKind[row]
+  if k == HD_FLD {
+    // An EMPTY property name never bottoms out — the string form's `d > 0` guard
+    // (a `?fld..<h>` from a parser error-recovery `""` member name has no first
+    // dot to cut at, so it read as a non-derived name). Kept verbatim.
+    if hdField[row].length == 0 { return tyIx }
+    return holeBaseTy(hdBase[row])
   }
-  name
+  if k == HD_GALT { return holeBaseTy(hdBase[row]) }
+  tyIx
 }
 
 // SOUNDNESS GATE on the re-fold. Is deferred-join member `mIx` PROVABLY dead under
@@ -4148,11 +4202,11 @@ function holeMemberDeadAt(mIx: i32, bNames: string[], bTys: i32[]) {
   if mIx < 0 { return false }
   const t = T.tys[mIx]
   if !(t is TyVar) { return false }
-  const base = holeBaseName(t.tvName)
-  if base == t.tvName {
+  const base = holeBaseTy(mIx)
+  if base == mIx {
     return false // not a derived read — never provably dead
   }
-  const pin = substHoleByName(base, bNames, bTys)
+  const pin = substHoleTy(base, bNames, bTys)
   if pin < 0 {
     return false // the base is not pinned here — defer
   }
@@ -4161,7 +4215,7 @@ function holeMemberDeadAt(mIx: i32, bNames: string[], bTys: i32[]) {
   }
   // The base IS concrete, yet the derived read does not resolve: this branch cannot
   // be reached by this argument.
-  substHoleByName(t.tvName, bNames, bTys) < 0
+  substHoleTy(mIx, bNames, bTys) < 0
 }
 
 // Re-fold a deferred join under a call's bindings: drop every PROVABLY DEAD member
@@ -4208,30 +4262,10 @@ function refoldJoinUnion(
   res
 }
 
-// Index of the first '.' in `s` at or after `from`, or -1. (Derived-hole names
-// pack integer fields ahead of the base hole name, which may itself contain dots.)
-function dotIndexFrom(s: string, from: i32) {
-  let i = from
-  while i < s.length {
-    if s[i] == '.' { return i }
-    i = i + 1
-  }
-  -1
-}
-
-// The non-negative decimal value of an ALL-DIGIT string, or -1 for anything else.
-function decValOf(s: string) {
-  if s.length == 0 { return -1 }
-  let v = 0
-  let i = 0
-  while i < s.length {
-    const c = s[i]
-    if c < '0' || c > '9' { return -1 }
-    v = v * 10 + (c - '0')
-    i = i + 1
-  }
-  v
-}
+// (`dotIndexFrom` and `decValOf` lived here. They existed ONLY to cut a derived
+// hole's dotted path apart and to read the two arena indices a guarded member
+// packed into it as DECIMAL TEXT. The derivation is a data structure now — see
+// `hdKind` & co. — so both decoders are gone with their one caller.)
 
 // Whether the expression is a bare `true`/`false` literal (through parens) —
 // excluded from the A7 boolean→i32 value coercion (a literal in an i32 slot is
@@ -8408,7 +8442,7 @@ function holeAltRowOf(name: string, ty: i32) {
 // Returns the new row's index so the guard can patch `holeAltTailN` once its arms
 // are checked, or -1 when there is nothing to patch (an unusable `ty`, or a row
 // this alternative already has — see below).
-function noteHoleAlt(name: string, ty: i32) {
+function noteHoleAlt(holeIx: i32, name: string, ty: i32) {
   if ty < 0 { return -1 }
   // A body is checked more than once (the return-inference pre-pass, then the real
   // pass) and the demanded shape ACCUMULATES across them — it is never cleared — so
@@ -8428,6 +8462,7 @@ function noteHoleAlt(name: string, ty: i32) {
   holeAltTys.push(ty)
   holeAltPreN.push(pre)
   holeAltTailN.push(-1)
+  holeAltHoleIx.push(holeIx)
   holeAltNames.length - 1
 }
 
@@ -8859,7 +8894,12 @@ function tyIsNonIndexableScalar(tyIx: i32) {
 // Member access on an inference hole (host `getChildType` on `Infer<Unknown>`):
 // record the field on the hole's demanded shape — creating the shape on first
 // access, the field on first read — and return the field's DERIVED hole.
-function holeMemberTy(holeName: string, prop: string) {
+// Takes the hole BOTH ways on purpose: `holeName` is its IDENTITY (the key of
+// every hole side table here), `holeIx` its arena HANDLE (the base a field
+// derivation points at). The caller has already narrowed the receiver, so it has
+// both — re-deriving the name here from the index would only re-do that narrowing.
+function holeMemberTy(holeIx: i32, holeName: string, prop: string) {
+  if holeIx < 0 { return TY_ERR }
   let shape = holeShapeOf(holeName)
   if shape < 0 {
     const fnames: string[] = []
@@ -8872,7 +8912,8 @@ function holeMemberTy(holeName: string, prop: string) {
   if st is TyObj {
     const f = objFieldType(st, prop)
     if f >= 0 { return f }
-    const d = mkTyVar("?fld." + prop + "." + holeName)
+    const d = mkDerivedHole(HD_FLD, prop, -1, -1, holeIx)
+    if d < 0 { return TY_ERR }
     st.objFieldNames.push(prop)
     st.objFieldTypes.push(d)
     tyMutEpoch = tyMutEpoch + 1 // hole shape gained a field in place
@@ -8881,11 +8922,13 @@ function holeMemberTy(holeName: string, prop: string) {
   TY_ERR
 }
 
-// A GUARDED return member: `?galt.<innerTyIx>.<altTyIx>.<hole>` — the type a
-// `return` inside an `is`-guard's then-branch contributes, reachable ONLY by an
-// argument that satisfies the guard's tested type. Both fields are stable arena
-// indices, so the name survives the `holeAlt*` table being truncated. Minted only
-// for a CONCRETE branch type (a hole one needs no wrapper: it already defers).
+// A GUARDED return member (`HD_GALT`) — the type a `return` inside an `is`-guard's
+// then-branch contributes, reachable ONLY by an argument that satisfies the guard's
+// tested type. The branch type and the tested type are carried as stable arena
+// indices on the derivation ROW, so the member survives the `holeAlt*` table being
+// truncated (they used to ride the name as decimal text for the same reason).
+// Minted only for a CONCRETE branch type (a hole one needs no wrapper: it already
+// defers).
 function mkGuardedRetTy(t: i32) {
   if t < 0 { return t }
   if tyIsHole(t) { return t }
@@ -8895,24 +8938,69 @@ function mkGuardedRetTy(t: i32) {
   if row >= holeAltNames.length { return t }
   const altTy = holeAltTys[row]
   if altTy < 0 { return t }
-  mkTyVar(
-    "?galt." + i32ToStr(t) + "." + i32ToStr(altTy) + "." + holeAltNames[row],
-  )
+  const g = mkDerivedHole(HD_GALT, "", t, altTy, holeAltHoleIx[row])
+  if g < 0 { return t }
+  g
 }
 
-// How many DERIVED-read layers (`?fld.` / `?elem.` / `?ret.` / `?galt.`) a hole
-// name stacks over its base param hole. Every layer mints exactly one leading
-// `?`, and the base hole (`?<fn>.<i>`) one more, so the `?` count less one is the
-// depth. Used only to CAP the re-basing below.
-function holeDeriveDepth(name: string) {
-  let n = 0
-  let i = 0
-  while i < name.length {
-    if name[i] == '?' { n = n + 1 }
-    i = i + 1
-  }
-  if n < 1 { return 0 }
-  n - 1
+// The derivation row of an arena type, or -1 when it is not a derived hole.
+function hdRowOf(tyIx: i32) {
+  if tyIx < 0 { return -1 }
+  if tyIx >= hdRowOfTy.length { return -1 }
+  hdRowOfTy[tyIx]
+}
+
+// How many DERIVED-read layers a hole stacks over its base param hole — a STORED
+// count, computed once per mint. (It used to be a census of `?` characters in the
+// name, which worked only because every layer minted exactly one.) Used only to
+// CAP the re-basing below.
+function hdDepthOf(tyIx: i32) {
+  const r = hdRowOf(tyIx)
+  if r < 0 { return 0 }
+  hdDepth[r]
+}
+
+// The hole NAME a derivation renders to. This is the one direction that stays
+// stringly: the name is the hole's IDENTITY — generic bindings, demanded shapes,
+// array demands and alternative rows are all keyed by it — and rendering a type is
+// allowed. Nothing parses it back.
+function hdRenderName(
+  kind: i32,
+  field: string,
+  inner: i32,
+  alt: i32,
+  baseName: string,
+) {
+  if kind == HD_FLD { return "?fld." + field + "." + baseName }
+  if kind == HD_RET { return "?ret." + baseName }
+  if kind == HD_ELEM { return "?elem." + baseName }
+  "?galt." + i32ToStr(inner) + "." + i32ToStr(alt) + "." + baseName
+}
+
+// MINT a derived hole: a fresh `TyVar` plus the derivation row that says what it
+// derives. `base` must be a hole (every derivation reads off one); -1 when it is
+// not, which every caller treats as "no derived hole here".
+function mkDerivedHole(
+  kind: i32,
+  field: string,
+  inner: i32,
+  alt: i32,
+  base: i32,
+) {
+  if base < 0 { return -1 }
+  const bt = T.tys[base]
+  if !(bt is TyVar) { return -1 }
+  const ix = mkTyVar(hdRenderName(kind, field, inner, alt, bt.tvName))
+  const row = hdKind.length
+  hdKind.push(kind)
+  hdField.push(field)
+  hdInner.push(inner)
+  hdAlt.push(alt)
+  hdBase.push(base)
+  hdDepth.push(hdDepthOf(base) + 1)
+  while hdRowOfTy.length <= ix { hdRowOfTy.push(-1) }
+  hdRowOfTy[ix] = row
+  ix
 }
 
 // Re-basing budget. A derived hole re-based onto an OUTER hole at every call hop
@@ -8924,116 +9012,104 @@ function holeDeriveDepth(name: string) {
 // still blocks nothing).
 const HOLE_REBASE_MAX = 8
 
-// RE-BASE a derived hole onto the hole its base resolved to. `?fld.bar.<hInner>`
-// under a binding `<hInner> := <hOuter>` IS `?fld.bar.<hOuter>` — the read is on
-// the SAME value, now named by the caller's hole. Returning the re-based name
-// (rather than -1, "unresolved") is what lets an argument constraint recorded
-// inside a generic body SURVIVE the hop out to the caller and be re-validated
-// when the OUTER call finally pins `<hOuter>` to a concrete argument. -1 when
-// the inner resolution is not a hole, or the depth cap is hit.
-function rebaseDerivedHole(prefix: string, innerTy: i32) {
+// RE-BASE derivation `row` onto the hole its base resolved to. "field `bar` of
+// `<hInner>`" under a binding `<hInner> := <hOuter>` IS "field `bar` of `<hOuter>`"
+// — the read is on the SAME value, now named by the caller's hole. Returning the
+// re-based hole (rather than -1, "unresolved") is what lets an argument constraint
+// recorded inside a generic body SURVIVE the hop out to the caller and be
+// re-validated when the OUTER call finally pins `<hOuter>` to a concrete argument.
+// -1 when the inner resolution is not a hole, or the depth cap is hit.
+//
+// Re-basing is now a COPY OF THE ROW with a new base, where it used to be a string
+// prefix (re-cut from the very name being decoded) concatenated onto the inner name.
+function rebaseDerivedHole(row: i32, innerTy: i32) {
   if innerTy < 0 { return -1 }
   const it = T.tys[innerTy]
   if it is TyVar {
-    if holeDeriveDepth(it.tvName) >= HOLE_REBASE_MAX { return -1 }
-    return mkTyVar(prefix + it.tvName)
+    if hdDepthOf(innerTy) >= HOLE_REBASE_MAX { return -1 }
+    return mkDerivedHole(
+      hdKind[row],
+      hdField[row],
+      hdInner[row],
+      hdAlt[row],
+      innerTy,
+    )
   }
   -1
 }
 
-// Resolve a (possibly DERIVED) hole NAME against a call's bindings: a direct
-// binding wins; `?ret.<h>` collapses to the pinned function's return (the
-// host's instantiate-and-collapse — keeps `inferred-return-soundness`
-// rejecting); `?fld.<prop>.<h>` to the pinned object's field (the structural
-// A13 read `self.x` concretized per call site). A base that resolves to ANOTHER
-// HOLE re-bases onto it (`rebaseDerivedHole`) instead of going unresolved — the
-// TWO-LEVEL chain `go` → `gb(w)` → `w.bar`, where dropping the link let an i32
-// reach a `string` param with no diagnostic. -1 = unresolved.
-function substHoleByName(name: string, bNames: string[], bTys: i32[]) {
-  const b = bindOf(bNames, bTys, name)
+// Resolve a (possibly DERIVED) hole against a call's bindings: a direct binding on
+// its name wins; a RETURN derivation collapses to the pinned function's return (the
+// host's instantiate-and-collapse — keeps `inferred-return-soundness` rejecting); a
+// FIELD derivation to the pinned object's field (the structural A13 read `self.x`
+// concretized per call site). A base that resolves to ANOTHER HOLE re-bases onto it
+// (`rebaseDerivedHole`) instead of going unresolved — the TWO-LEVEL chain `go` →
+// `gb(w)` → `w.bar`, where dropping the link let an i32 reach a `string` param with
+// no diagnostic. -1 = unresolved.
+//
+// Takes the hole's ARENA INDEX, not its name: the derivation row hangs off the
+// index, and each layer's base is a row field rather than a suffix of a string.
+// (This function was the compiler's clearest case of a type held as a parsable
+// string — four prefix matches and fifteen slices, decoding what the mint knew.)
+function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
+  if tyIx < 0 { return -1 }
+  const t = T.tys[tyIx]
+  if !(t is TyVar) { return -1 }
+  const b = bindOf(bNames, bTys, t.tvName)
   if b >= 0 { return b }
-  if name.length > 5 {
-    // `?galt.<inner>.<alt>.<hole>` — a guarded return member (`mkGuardedRetTy`).
-    // The pinned argument decides REACHABILITY: it satisfies the guard's tested
-    // type, so the branch's type is this member's value; it cannot, so the branch
-    // is dead here and the member stays unresolved (the deferred-join re-fold then
-    // drops it). An unpinned hole defers, exactly like every other derived hole.
-    if name.slice(0, 6) == "?galt." {
-      const restG = name.slice(6, name.length)
-      const g1 = dotIndexFrom(restG, 0)
-      if g1 < 0 { return -1 }
-      const gInner = decValOf(restG.slice(0, g1))
-      const g2 = dotIndexFrom(restG, g1 + 1)
-      if g2 < 0 { return -1 }
-      const gAlt = decValOf(restG.slice(g1 + 1, g2))
-      if gInner < 0 || gAlt < 0 { return -1 }
-      const gPin = substHoleByName(
-        restG.slice(g2 + 1, restG.length),
-        bNames,
-        bTys,
-      )
-      if gPin < 0 { return -1 }
-      if tyIsHole(gPin) {
-        return rebaseDerivedHole("?galt." + restG.slice(0, g2 + 1), gPin)
-      }
-      if holeAssignOk(-1, gPin, gAlt) { return gInner }
-      return -1
+  const row = hdRowOf(tyIx)
+  if row < 0 { return -1 }
+  const kind = hdKind[row]
+  // A GUARDED return member (`mkGuardedRetTy`). The pinned argument decides
+  // REACHABILITY: it satisfies the guard's tested type, so the branch's type is
+  // this member's value; it cannot, so the branch is dead here and the member stays
+  // unresolved (the deferred-join re-fold then drops it). An unpinned hole defers,
+  // exactly like every other derived hole.
+  if kind == HD_GALT {
+    const gInner = hdInner[row]
+    const gAlt = hdAlt[row]
+    if gInner < 0 || gAlt < 0 { return -1 }
+    const gPin = substHoleTy(hdBase[row], bNames, bTys)
+    if gPin < 0 { return -1 }
+    if tyIsHole(gPin) { return rebaseDerivedHole(row, gPin) }
+    if holeAssignOk(-1, gPin, gAlt) { return gInner }
+    return -1
+  }
+  if kind == HD_RET {
+    const inner = substHoleTy(hdBase[row], bNames, bTys)
+    if inner >= 0 {
+      const it = T.tys[inner]
+      if it is TyFunc { return it.fnRet }
+      return rebaseDerivedHole(row, inner)
     }
-    if name.slice(0, 5) == "?ret." {
-      const inner = substHoleByName(name.slice(5, name.length), bNames, bTys)
-      if inner >= 0 {
-        const it = T.tys[inner]
-        if it is TyFunc { return it.fnRet }
-        return rebaseDerivedHole("?ret.", inner)
+    return -1
+  }
+  // The element of an indexed hole (`self[i]`): resolve the hole to its pinned
+  // argument; an array yields its element, a string an i32 code point. Mirrors the
+  // FIELD read for indexing.
+  if kind == HD_ELEM {
+    const innerE = substHoleTy(hdBase[row], bNames, bTys)
+    if innerE >= 0 {
+      const itE = T.tys[innerE]
+      if itE is TyArray { return itE.aElem }
+      if itE is TyPrim {
+        if itE.primName == "string" { return TY_I32 }
       }
-      return -1
+      return rebaseDerivedHole(row, innerE)
     }
-    // `?elem.<hole>` — the element of an indexed hole (`self[i]`): resolve the hole to its
-    // pinned argument; an array yields its element, a string an i32 code point. Mirrors the
-    // `?fld.` field read for indexing.
-    if name.slice(0, 6) == "?elem." {
-      const innerE = substHoleByName(name.slice(6, name.length), bNames, bTys)
-      if innerE >= 0 {
-        const itE = T.tys[innerE]
-        if itE is TyArray { return itE.aElem }
-        if itE is TyPrim {
-          if itE.primName == "string" { return TY_I32 }
-        }
-        return rebaseDerivedHole("?elem.", innerE)
-      }
-      return -1
+    return -1
+  }
+  // HD_FLD. An empty property name never resolves — the string form's `dot > 0`
+  // guard, kept verbatim (see `holeBaseTy`).
+  if hdField[row].length == 0 { return -1 }
+  const inner2 = substHoleTy(hdBase[row], bNames, bTys)
+  if inner2 >= 0 {
+    const it2 = T.tys[inner2]
+    if it2 is TyObj {
+      const f = objFieldType(it2, hdField[row])
+      if f >= 0 { return f }
     }
-    if name.slice(0, 5) == "?fld." {
-      const rest = name.slice(5, name.length)
-      let dot = -1
-      let i = 0
-      let going = i < rest.length
-      while going {
-        if rest[i] == '.' {
-          dot = i
-          going = false
-        } else {
-          i = i + 1
-          going = i < rest.length
-        }
-      }
-      if dot > 0 {
-        const inner2 = substHoleByName(
-          rest.slice(dot + 1, rest.length),
-          bNames,
-          bTys,
-        )
-        if inner2 >= 0 {
-          const it2 = T.tys[inner2]
-          if it2 is TyObj {
-            const f = objFieldType(it2, rest.slice(0, dot))
-            if f >= 0 { return f }
-          }
-          return rebaseDerivedHole("?fld." + rest.slice(0, dot + 1), inner2)
-        }
-      }
-      return -1
-    }
+    return rebaseDerivedHole(row, inner2)
   }
   -1
 }
@@ -9116,7 +9192,7 @@ function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   if tyIx < 0 || bNames.length == 0 { return tyIx }
   const t = T.tys[tyIx]
   if t is TyVar {
-    const b = substHoleByName(t.tvName, bNames, bTys)
+    const b = substHoleTy(tyIx, bNames, bTys)
     if b >= 0 { return b }
     return tyIx
   }
@@ -9743,7 +9819,8 @@ function checkCallNode(n: Call, ix: i32) {
     if rt is TyVar {
       if holeArrMethod(cfn.memProp) {
         noteArrayDemand(rt.tvName)
-        recvTy = mkArrayTy(mkTyVar("?elem." + rt.tvName))
+        const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, recvTy)
+        recvTy = mkArrayTy(elemHole)
       }
     }
     rt = T.tys[recvTy]
@@ -10525,7 +10602,7 @@ function checkCallNode(n: Call, ix: i32) {
       checkNode(hargs[hj])
       hj = hj + 1
     }
-    return mkTyVar("?ret." + ft.tvName)
+    return mkDerivedHole(HD_RET, "", -1, -1, fnTy)
   }
   tErr("called value is not a function (" + tyToStr(fnTy) + ")", ix)
   TY_ERR
@@ -10677,7 +10754,7 @@ function noteInferredRet(t: i32) {
   // string flow through an i32 result and crash codegen.
   // A return reached only through an `is`-guard over a HOLE param contributes a
   // GUARDED member, so the call site can tell whether its pinned argument reaches
-  // this branch at all (`mkGuardedRetTy` / `substHoleByName`'s `?galt.` arm).
+  // this branch at all (`mkGuardedRetTy` / `substHoleTy`'s `HD_GALT` arm).
   const g = mkGuardedRetTy(t)
   if inferObserved < 0 {
     inferObserved = g
@@ -16536,6 +16613,7 @@ export function monoInferListElem(
     holeAltTys.pop()
     holeAltPreN.pop()
     holeAltTailN.pop()
+    holeAltHoleIx.pop()
   }
   while binCstrOp.length > sBinC {
     binCstrOp.pop()
@@ -16638,6 +16716,7 @@ export function monoInferLocalScalar(
     holeAltTys.pop()
     holeAltPreN.pop()
     holeAltTailN.pop()
+    holeAltHoleIx.pop()
   }
   while binCstrOp.length > sBinC {
     binCstrOp.pop()
@@ -18219,7 +18298,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
       if curIx >= 0 {
         const cur = T.tys[curIx]
         if cur is TyVar {
-          const row = noteHoleAlt(cur.tvName, tnTys[ai])
+          const row = noteHoleAlt(curIx, cur.tvName, tnTys[ai])
           if row >= 0 {
             altRows.push(row)
             guardRows.push(row)
@@ -18551,7 +18630,7 @@ function checkMemberNode(n: Member, ix: i32) {
         // `self.length`) infers without growing a bogus `{length}` shape that an array
         // argument can't satisfy. A NON-length field still grows the hole's struct shape.
         if n.memProp == "length" { return symMem(ix, TY_I32) }
-        return symMem(ix, holeMemberTy(ot.tvName, n.memProp))
+        return symMem(ix, holeMemberTy(objTy, ot.tvName, n.memProp))
       }
     }
   }
@@ -18602,15 +18681,15 @@ function checkIndexNode(n: Index, ix: i32) {
     return mkNullableTy(at.mVal)
   }
   // Indexing an un-annotated-param HOLE (`self[i]`) constrains it to an array: demand an
-  // i32 index and return the element as a DERIVED hole (`?elem.<hole>`), resolved per call
-  // site against the pinned array's element (`substHoleByName`). Mirrors `holeMemberTy`
+  // i32 index and return the element as a DERIVED hole (`HD_ELEM`), resolved per call
+  // site against the pinned array's element (`substHoleTy`). Mirrors `holeMemberTy`
   // for `self.x`, so an un-annotated `function head(self) { return self[0] }` infers.
   if at is TyVar {
     if !assignable(idxTy, TY_I32) {
       tErr("array index must be i32, got " + tyToStr(idxTy), ix)
     }
     noteArrayDemand(at.tvName)
-    return mkTyVar("?elem." + at.tvName)
+    return mkDerivedHole(HD_ELEM, "", -1, -1, arrTy)
   }
   // Index TRAP (B13, host parser `indexTrap`): a user object that declares a
   // `"[]"` method handles `o[k]` itself — the key checks against the
