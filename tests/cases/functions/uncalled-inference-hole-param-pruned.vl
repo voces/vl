@@ -1,0 +1,119 @@
+// @run
+// @log 7
+// @log a!
+// @log 3
+// @log hi!
+// @log 6
+// @log 5
+// @hint Intentionally-unused function `_exclaim`
+// @hint Intentionally-unused function `_isA`
+// @hint Intentionally-unused function `_join2`
+// @hint Intentionally-unused function `_tag`
+// @hint Intentionally-unused parameter `_n`
+// @hint Intentionally-unused function `_len1`
+// @hint Intentionally-unused function `_firstOf`
+// @hint Intentionally-unused function `_outerDead`
+// @hint Intentionally-unused variable `_z`
+// @hint Intentionally-unused function `_loud`
+// THE UNCALLED UN-ANNOTATED-PARAM FUNCTION, PRUNED (#1254 mechanism B).
+//
+// An un-annotated parameter is an inference hole the CALL SITE fills: `monoIsGenericDecl`
+// flags such a decl generic and `monoInstantiate` REPLACES its `fnStmts` slot with a
+// per-call-site instance. With NO call site nothing replaced the slot, so the emitter lowered
+// the TEMPLATE — the hole took the default i32 valtype while the body's operator lowering
+// picked its type from the other operand, and `s + "!"` emitted the string-concat helper call
+// over an i32 param. `vl check` rc 0, INVALID WASM. `monomorphize`'s tail prune loop already
+// replaced every un-instantiated decl with a no-op STUB, but only for an explicit `<T>`; the
+// un-annotated half is now in the same set, behind three gates (`emit_mono.vl`, see the loop's
+// header). Every row below is a cell that MOVED, measured whole-program on `231e137c`.
+//
+// Rows 1-8 were INVALID WASM; rows 9-11 were a clean emit-error REJECT (better, still wrong).
+// Both are now correct: the function is genuinely dead, so a no-op stub is observationally
+// identical to the source program.
+
+// (1) module scope, one param, string concat — the headline cell.
+function _exclaim(s) { return s + "!" }
+
+// (2) the comparison spelling: the literal, not the concat, is what pins the operand.
+function _isA(s) { return s == "a" }
+
+// (3) TWO holes.
+function _join2(a, b) { return a + b + "!" }
+
+// (4) a MIXED signature — one annotation, one hole. One hole is enough.
+function _tag(s, _n: i32) { return s + "!" }
+
+// (5) RECURSIVE. Its own `shoutN(...)` is a CALL, so the value-reference gate does not spare
+//     it, and the self-call is dead with it. (No `_` prefix and no unused-function hint: the
+//     self-call is what the lint counts as a use.)
+function shoutN(s, n) {
+  if n <= 0 { return s }
+  return shoutN(s + "!", n - 1)
+}
+
+// (6) nested, with the OUTER function CALLED — the outer lowers, the inner never did.
+function outerLive() {
+  function inner(s) { return s + "!" }
+  return 7
+}
+print(outerLive()) // 7
+
+// (7) nested, with the outer UNCALLED too.
+function _outerDead() {
+  function inner2(s) { return s + "!" }
+  const _z = 1
+}
+
+// (8) TWO same-named nested functions, only one of them called. The called `pick`
+//     instantiates and the dead one is stubbed — the flat first-wins name map does not
+//     confuse them, because the prune is keyed on the `fnStmts` SLOT, not the name.
+function m1() {
+  function pick(s) { return s + "!" }
+  return pick("a")
+}
+function m2() {
+  function pick(s) { return s + "?" }
+  return 3
+}
+print(m1()) // a!
+print(m2()) // 3
+
+// (9)-(11) the three shapes that were a clean emit-error REJECT rather than invalid wasm —
+// a hole whose body reaches for a member/index the i32 default has no lowering for.
+function _len1(a) { return a.length }
+function _firstOf(xs) { return xs[0] }
+
+// (12) an uncalled CALLER of a called callee: `bang` still lowers from its own call site.
+function bang(s) { return s + "!" }
+function _loud(s) { return bang(s) }
+print(bang("hi")) // hi!
+
+// ── THE THREE GATES, each with the control that demands it ────────────────────────────────
+//
+// GATE 1 — NOT AN ANONYMOUS LAMBDA. A lifted `(x) => x * 2` also has un-annotated params and
+// also keeps its slot (it is invoked through `call_ref`, never `monoInstantiate`), so stubbing
+// it would silently no-op a live callback. This is master's stated reason for the narrow gate
+// and it survives intact; what it never covered is a NAMED decl.
+const dbl = (x) => x * 2
+print(dbl(3)) // 6
+
+// GATE 2 — NOT PART OF THE MODULE ABI. An export has no in-module call site BY DESIGN, so it
+// looks exactly like a dead template — but `export function addPub(a, b)` LOWERS TODAY: both
+// operands are unpinned, so the i32 default agrees at both ends and the module exports a real
+// `(i32, i32) -> i32`. Stubbing it would swap a working export for a silently-wrong
+// `() -> void`. `export function exclaim(s) { return s + "!" }` therefore KEEPS master's
+// invalid wasm — it is not pinnable here for the same reason #1254 could not pin the private
+// form (`vl check --codegen` exits 0 on invalid wasm and `vl build` writes the module before
+// failing), and its right treatment is a loud reject that needs emitter knowledge this pass
+// does not have. Filed, not guessed at.
+export function addPub(a, b) { return a + b }
+
+// GATE 3 — NOT REFERENCED AS A FUNCTION VALUE. `incv` is never CALLED by name; it escapes as a
+// funcref through a return annotation, and the slot stays equal to its original all the same.
+// Stubbing it would take this row from 5 to a no-op. (`const g = incv` with `g` never called is
+// the same gate from the other side — that one is a clean emit-error reject on master and
+// stays one, so it is not pinnable in a `@run` file either.)
+function incv(x) { return x + 1 }
+function pickInc(): (i32) => i32 { return incv }
+const hv = pickInc()
+print(hv(4)) // 5
