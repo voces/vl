@@ -31335,3 +31335,172 @@ code. Note also that these two are NOT the same operation as `tyTopLevelSplit` a
 not have ridden it even if the partition allowed: they pass a SECOND target character to
 `tyTopIndexOf` (`'='`) and stop the split on it, an arrow STOP the home has no parameter
 for. The phase-2 move is a RELOCATION of two distinct bodies, not a further merge.
+
+## W14's LAST TWO — the held-file residue closes, the FIELD-COLON cut reaches ZERO copies, and the routing programme's TERMINAL RESIDUE is stated (same branch, off master `11de7dfe`)
+
+#1259 routed eight of W14's ten writings and FILED the other two because `emit_classify.vl`
+was held by a concurrent slice. Its filing was a prediction — "it already imports this
+module and already holds the index, so it is a two-line substitution for whoever owns the
+file next" — and the prediction was exact.
+
+### THE TWO WRITINGS, EQUIVALENCE DISCHARGED PER SITE
+
+Both live in `emit_classify.shapeFieldParse`'s `else` arm, on `part` (one element of the
+comma-split shape body) with `ci = part.indexOf(":")`:
+
+| writing | routed to | discharge |
+|---|---|---|
+| `part.slice(0, ci)` | `fieldNameOf(part, ci)` | The home's body is `const fname = field.slice(0, ci); fname`. Substituting `field := part` gives `part.slice(0, ci)` — the site's own expression, character for character. There is no bound to discharge because the index is the site's own `ci`, passed through. |
+| `part.slice(ci + 1, part.length)` | `fieldTypeTextOf(part, ci)` | The home's body is `const ftext = field.slice(ci + 1, field.length); ftext`. Substituting `field := part` gives `part.slice(ci + 1, part.length)` — again the site's own expression. The `field.length` vs `part.length` step is an identity, not an approximation: the home reads the length OF ITS OWN OPERAND, which is what the site passed. |
+
+**THE `ci < 0` GUARD STAYS AT THE SITE, AND THAT IS THE FAMILY'S DESIGN, NOT AN OVERSIGHT.**
+This site keeps the WHOLE part as the field name when there is no colon; `annObjFieldSplit`
+and `shapeInnerFieldSplit` gate `ci <= 0` and push two empties; `nameToTyReal` gates
+`colonAt > 0` and `canonShapeName` `colonAt >= 0`. Four different guards in front of one
+operation is exactly the evidence W14's home cited for taking the index as an ARGUMENT.
+Nothing about the guard moved.
+
+### THE RESOLVER IS THE SITE CENSUS — ten consuming expressions, five functions, three modules
+
+Delete both import entries from `typecheck.vl`, `emit_base.vl` and `emit_classify.vl`,
+rebuild, read the names: **5 `undeclared identifier 'fieldNameOf'` + 5
+`undeclared identifier 'fieldTypeTextOf'`** — `emit_base.annObjFieldSplit`,
+`emit_base.shapeInnerFieldSplit`, `typecheck.nameToTyReal`, `typecheck.canonShapeName`
+(which spells the NAME half as `fieldNameOf(field, colonAt + 1)`, the sixth spelling that
+keeps its delimiter), and `emit_classify.shapeFieldParse`. That is all ten writings from
+#1259's re-derived census, and no eleventh.
+
+**THE STRUCTURAL CENSUS CONFIRMS ZERO COPIES.**
+`grep -nE '\.slice\(0, *(ci|colonAt)\)|\.slice\((ci|colonAt) \+ 1,' compiler/*.vl` returns
+**three lines: the two home bodies in `tyname.vl` and one comment**. And the ladder marker
+`angOpen`, which the SPLIT family's own census uses, is at **0 executable occurrences
+outside `tyname.vl`** (three comment mentions).
+
+### MEASUREMENT
+
+| instrument | reading |
+|---|---|
+| bytes | 1,044,170 → **1,043,929 (−241)**; cumulative vs `base77.wasm` **−1,200** |
+| corpus A/B, branch head vs `base77` (1,575 files × 6 channels) | **0 / 0 / 0 / 0 / 0 / 0** |
+| frozen-source rebuild at the branch head | byte-identical to master's own output, 1,045,129 B |
+
+**−241 B FOR TWO WRITINGS IN ONE FUNCTION IS ABOVE W14's OWN −164 B/fn BAND, AND THE BAND
+IS THE THING TO DISTRUST.** #1259 established that `.slice`-cut routings scale per FUNCTION
+(−658 for 8 writings in 4 functions). This slice is 2 writings in 1 function and reads −241,
+47% above that per-function figure. Stated as measured; no mechanism is offered, because the
+last two byte PREDICTIONS in this programme (#1256's for W14, and W14's own for the SPLIT
+family) were both wrong and both were wrong by picking a denominator and trusting it.
+
+### CALIBRATION — two sabotages, and the SITE-SPECIFIC one has 14 witnesses nothing else lights
+
+| sabotage | shape | set | CHECKRC | CHECKMSG | BUILDRC | BUILDMSG | BYTES | RUN | frozen |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| **S4** `shapeFieldParse`'s NAME half asks `fieldNameOf(part, ci + 1)` | SITE ARGUMENT | 1 site (this slice's) | 0 | 0 | 27 | **32** | 4 | 28 | **byte-identical** |
+| **S5** `fieldTypeTextOf`'s body keeps one character too many | HOME BODY | all 5 consumers | 0 | 0 | 318 | **337** | 12 | 317 | **byte-identical** |
+
+1. **THE SITE-LOCAL SABOTAGE IS NOT SUBSUMED BY THE HOME-BODY ONE.** S4's 32 files and S5's
+   337 share only 18; **14 files change their build outcome under S4 and not under S5.**
+   A calibration that had only poisoned the home would have been a claim about the family,
+   not about the two lines this slice actually wrote.
+2. **AND THE HOME-BODY SABOTAGE IS SATURATED AT ONE HALF.** S5 poisons only
+   `fieldTypeTextOf`; #1259's S3 poisoned BOTH homes and read the same **337** on field 4.
+   The NAME half contributes no file the TYPE half has not already broken, which is why the
+   number to quote for the pair is not additive.
+3. **THE FROZEN REBUILD IS BLIND HERE TOO — five of five sabotages across two families.**
+   S1, S3, S4 and S5 all leave master's frozen `compiler/*.vl` compiling to a byte-identical
+   1,045,129 B, including S5 with its 337 corpus witnesses. The one-grep mechanism for W14 is
+   the companion of the SPLIT family's:
+   `grep -nE ': *\{[a-zA-Z_]' compiler/*.vl` outside comments returns **nothing** — the
+   compiler's own source contains ZERO inline shape annotations. Every `{` it writes in a
+   type position is `{[string]: T}`, which every W14 consumer gates away as a MAP before the
+   field walk begins. **Two families, four live sabotages, 491 distinct corpus witness files,
+   and the frozen rebuild reads zero on all of them.** For the type-name grammar families
+   this instrument is not weak, it is null; the corpus A/B carries the entire burden.
+
+### NO NEW FIXTURE, AND THE REASON IS MEASURED
+
+Both writings already carry a committed regression pin with a DEMONSTRATED witness — which
+is the standard #1259 set, and the check is the same one: run the poison and look for the
+fixture in its witness set.
+
+* **S4** (this slice's exact site, name half) is a HARD FAILURE on
+  `tests/cases/structs/inline-shape-grammar-routed-sites.vl`.
+* **S5** (the type half) is a HARD FAILURE on
+  `tests/cases/types/inline-shape-field-colon-depth.vl` — #1259's own pin, doing the job it
+  was minted for.
+
+A third fixture would add a test-count delta and no coverage, so none is added: the suite
+reads **3318 / 0 / 8**, master's own figure, on a branch that changes 15 call sites.
+
+### THE TERMINAL RESIDUE — the routing programme, stated exactly
+
+**Every family in the #1239 census that has a home is now at ZERO hand-written copies.**
+W1 (group-interior peel), W2 (generic-application cut), W3 (quoted leaf), W4 (function-arrow
+cut), W5 (`arrElemNameRaw`), W7 (space-free), W8 (identifier run, less one site), W13's
+three-writing SPLIT entry and W14 (field-colon cut) are closed. What remains, in full:
+
+| # | residue | count | kind of block | anchor (find by CONTENT — line numbers expire) |
+|---|---|---:|---|---|
+| 1 | **W9** the CANON pass | **10** | DESIGN — `canonEmitName` is not `tyToEmitName ∘ nameToTy` (853 of 5,172 annotations disagree); the answer is the `renderEmit(ty, ctx)` design, P1-P3 landed | `typecheck.canonEmitNameAt` (4) · `canonShapeName` (4) · `nameNeedsCanon` (2) |
+| 2 | **W10** `nameToTyReal` | **9** | DESIGN — a SOURCES problem; the answer is the parser's `annTs` spelling tree (D-PARSETY / D-TSTY), partly banked | `typecheck.nameToTyReal` |
+| 3 | **W11** the PIN / SENTINEL markers | **10** | DESIGN — not a grammar; retired by giving the pin its own COLUMN | `emit_mono.monoMakeInstance` (3) · `typecheck.recordClonedNodeTy` (7) |
+| 4 | **W12** the `$fnsig` ABI | **13** | DESIGN — a minted encoding, ruled out of scope by two in-code notes; each scan already has a single home | `emit_classify.sigKey*` / `sigParamCoerceKind` · `emit_sections.synthSigIdxAt` / `emitSynthCloSig` |
+| 5 | **W8's last site** — the module-merge rename walk | **1** | BEHAVIOUR DIFFERENCE — its naive quote skip and `skipQuotedName` disagree on `type T = "a\"b"`, which the compiler accepts and runs. **Unifying them is a FIX, not a routing** | `driver.modTypeRenamed`; pinned by `tests/cases/types/litunion-escaped-quote-member.vl` |
+| 6 | **REFUTED / a different operation** | **3** | NOT THE SAME QUESTION — re-derived and rejected, so no later census re-opens them | `typecheck.nameNeedsCanon` (a MEMBER-START digit rule, not a run-start one; `Box<0>` separates them) · `emit_base.normTypeAtom` (a two-sided trim over `' '` AND `'\t'`) · `emit_classify.mvValKindOfName` (skip a run at an index, then slice FROM it) |
+| 7 | **PHASE 2** — `splitUnionAtoms` / `unionMemberCount` move to `tyname.vl` | **2 bodies** | PARTITION ONLY — legal, pure, depends only on `tyTopIndexOf` which is already in the leaf. Costs **six import lines in three files** (`emit_rep.vl`, `wasmEmit.vl`, `emit_collect.vl`), all of which already import `tyname`. **A LOCATION change; it removes no copy** | `typecheck.splitUnionAtoms` / `unionMemberCount` |
+
+**THE TERMINAL RESIDUE IS 42 DESIGN-BLOCKED SITES + 4 NON-ROUTINGS (1 behaviour fix, 3
+refuted) + 1 PARTITION-BLOCKED LOCATION MOVE (2 bodies).** Zero routable copies remain.
+
+**AND THE "~60 SINGLE-WRITING FLOOR" IS NOW REFUTED TWICE FROM ITS OWN TABLE.** #1259 found
+the W13 row's first three entries were one operation; this branch merged them, so the floor
+was over-counted by 2 there. The row's remaining entries have NOT been re-derived
+argument-for-argument, and the lesson of finding 1 is that "each is the ONE body for its
+grammar" was an assumption in a table, never a measurement. **The next census of that row
+should re-derive it the way #1259 did — by reading the bodies, not by counting the names.**
+
+### GATE (branch head — both commits)
+
+Every rc taken BARE, never through a pipe.
+
+| gate | rc | reading |
+|---|---:|---|
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint at the 2-compile rung, **1,043,929 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4, 1,043,929 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3318 / 0 / 8** — master's own reading |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined failure, 0 new, 0 stale |
+| corpus A/B | 0 | 1,575 files, 0 diffs × 6 channels, calibrated by S4 + S5 |
+| fuzz A/B | 0 | **0 divergences.** 7 seeds × 3 depths × {plain, `--declared`} = 42 legs, 200 programs each — **8,400 programs/side**, 690 kept cases and 1,424 artefacts per side, the two out-dirs `diff -r` EQUAL after the mktemp path is normalised out of every file (not just the `.log`s — the `.err`s carry it too, which reads as 2,373 phantom diff lines if you skip them), and the 42-entry per-leg rc vector `cmp`s identical |
+| frozen-source rebuild | 0 | byte-identical — and measured BLIND to all four live sabotages |
+
+### WHAT THIS BRANCH FOUND WRONG
+
+1. **THE SPIKE-TO-MOVE BYTE RATIO IS ONE FUNCTION BODY, NOT A SCALE FACTOR.** #1259's spike
+   read −532 B; the real move reads −959. The difference is exactly the second body the
+   spike could not delete (it copied the home into `typecheck.vl` rather than relocating it),
+   and the per-body figure that falls out — 427 B for a 14-line resume loop — is 2.6× W14's
+   −164 B/fn for a two-line cut. **Byte predictions in this programme have now failed three
+   times in a row by choosing a denominator (writings, functions, sites) and trusting it.**
+2. **A `dropEmpty`-FLIP SABOTAGE AT ALL EIGHT NEWLY-ROUTED CHECKER SITES IS INERT** —
+   a compiler that differs in BYTES from the candidate, reading 0 diffs on all six channels
+   over 1,575 files. The one behavioural axis the `splitTypeName` routing had to get right is
+   invisible to the strongest instrument this programme has. Its discharge is the case
+   analysis, and saying so is the point: a 0 from an instrument that cannot see the axis is
+   not evidence about the axis.
+3. **TWO SABOTAGES CAN BE NEARLY DISJOINT IN FILES AND IDENTICAL IN CHANNELS.** S1 (67 files)
+   and S3 (55 files) share **7**. They light the same four channels in the same proportions.
+   #1259's finding 3 said disjointness is a property of where the poisoned code sits; this
+   measures the other half — the channel PROFILE is a property of the instrument, and it does
+   not distinguish two poisons whose witness populations barely intersect.
+4. **A HOME-BODY SABOTAGE DOES NOT SUBSUME A SITE-LOCAL ONE.** S4 poisons one call site of a
+   home that has five; 14 of its 32 witnesses are not in S5's 337. A calibration is only
+   evidence for the lines it can actually reach.
+5. **THE `tyname.vl` HEADER'S OWN PHASE-2 DECLINE IS REFUTED ON BOTH ITS STATED GROUNDS.** It
+   says `splitUnionAtoms` / `unionMemberCount` stay because they are "SPLITTERS that
+   materialise atoms, not endpoint tests / spans / cuts" and because "no D-\* slice ever
+   homed them as part of this family" — and this slice moved a splitter that materialises
+   parts, as a D-\* slice of exactly that family. The hot-path ground fails too:
+   `tyTopIndexOf`, which every one of those ~168 K invocations already calls, has been across
+   that module boundary since phase 0. What actually blocks the move is a partition, and the
+   header should say so; it is corrected in place.
