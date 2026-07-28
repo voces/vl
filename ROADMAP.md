@@ -428,7 +428,7 @@ in-language GC knobs.
 - 🟡 **A13. Operator-constraint inference.** REMAINING: the hole-operand rule is permissive (doesn't
   reject `i32 + string` yet); the *stored-closure* operator case (`vec + vec` via a `"+"` field)
   still hits the WasmGC width wall (B13).
-- ✅ **A14. Named/opaque types.** Zero-cost nominal newtypes ship: `type EntityId = new i32` /
+- 🟡 **A14. Named/opaque types.** Zero-cost nominal NEWTYPES ship: `type EntityId = new i32` /
   `type F32View = new { base: i32, length: i32 }`. Distinct in the checker in every position,
   ERASED before the emitter (no emitter file changed), literals brand-polymorphic, `as` for both
   construction and unwrap. `docs/internals/newtype-design.md`. REMAINING: generic newtypes
