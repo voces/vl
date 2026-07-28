@@ -3649,8 +3649,12 @@ export function exprPopBits(exprIx: i32, fnIx: i32) {
 // receiver kinds and the Member-receiver `.pop` kinds in every let-init / return /
 // while-cond / for-header / expression-statement position. Replaces the twelve
 // per-kind walks (six push + six pop) with a single pass that classifies each
-// site once. `if` CONDITIONS are deliberately not scanned here (matching the
-// per-kind walkers this folds); the start-fn if-scan handles its conditions.
+// site once. `if` CONDITIONS are scanned too, by `ifChainPushPopBits` — the
+// header here used to claim they were "deliberately" skipped because the
+// start-fn if-scan handles conditions. It handles the START FUNCTION's
+// conditions (`startScanIf` walks `st.ifCond`); nothing walked a regular
+// function's or a lambda's, and a `.pop()` there is invalid wasm (see the note
+// on `ifChainPushPopBits`).
 export function blockPushPopBits(blockIx: i32, fnIx: i32) {
   let bits = 0
   const b = P.nodes[blockIx]
@@ -3694,11 +3698,23 @@ export function blockPushPopBits(blockIx: i32, fnIx: i32) {
 // `collectLocalsIf`'s recursion so a push buried under several `else if` arms (the
 // `parseProgram` / `parseStmt` recursive-descent dispatch shape) is detected, not just
 // the first one level (the prior hand-unrolled form missed 2+-deep chains).
+//
+// The CONDITION is walked too. It was not, and this walker's own header used to
+// justify the omission with "the start-fn if-scan handles its conditions" — which
+// is true only of the START FUNCTION: `startScanIf` (emit_sections.vl) does walk
+// `st.ifCond`, but nothing walked the condition of an `if` inside a regular
+// function or a lambda. Three of the four condition positions were scanned (a
+// `while` condition here, an `if` condition at module scope) and the fourth was
+// not, so `if (xs.pop() ?? -1) == 1 { … }` in a function staged the receiver's
+// wrapper ref into a push frame `fbBeginFunc` never reserved — `emitPop` /
+// `emitPopOr` test no `fnUses*Push` flag, so it was INVALID WASM with `vl check`
+// rc 0. `ifChainHasMapOp`, the same-shape sibling in this file, has had the
+// condition arm all along.
 function ifChainPushPopBits(ifIx: i32, fnIx: i32) {
   let bits = 0
   const s = P.nodes[ifIx]
   if s is IfStmt {
-    bits = blockPushPopBits(s.ifThen, fnIx)
+    bits = exprPopBits(s.ifCond, fnIx) | blockPushPopBits(s.ifThen, fnIx)
     if s.ifElse >= 0 {
       const els = P.nodes[s.ifElse]
       if els is Block { bits = bits | blockPushPopBits(s.ifElse, fnIx) }
