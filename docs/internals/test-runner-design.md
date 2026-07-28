@@ -1,5 +1,14 @@
 # `vl test` — the test runner design
 
+> **STATUS: v1 shipped.** This document remains the CHARTER — the direction, the
+> cross-language reasoning, and the follow-up backlog. What v1 actually built,
+> and the three places the implementation diverges from the architecture below
+> (the brain lives in `compiler/cli.vl` rather than a separate
+> `std/test/runner.vl`, because the CLI command-queue pump landed in between and
+> already owns the walk; compilation stays VL-side and only EXECUTION crosses to
+> the host; `.only` is not spellable in VL), is recorded in
+> **`docs/internals/vl-test-design.md`**. Read that one for the shipped protocol.
+
 The in-language testing story that eventually replaces the corpus's
 `@run`/`@log` directive fixtures for BEHAVIORAL tests (the `@check`/`@error`
 family stays — compile-time verdicts are the language's spec corpus, not user

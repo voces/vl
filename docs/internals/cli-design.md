@@ -1,6 +1,6 @@
 # `vl` CLI design — the brain is VL, the host is a pump
 
-The native `vl` tool (`build`/`check`/`run`/`fmt`, later `test`) follows the same
+The native `vl` tool (`build`/`check`/`run`/`fmt`/`test`) follows the same
 charter as the compiler and the test runner (`docs/internals/test-runner-design.md`):
 
 > **The brain is VL; Rust is the mechanism pump.** The Rust host owns only the
@@ -221,6 +221,23 @@ command-queue the CLI is a *state machine* (it returns the next command and is
 resumed with the result): sync semantics, structured as a yield loop rather than
 straight-line `readFile()` calls. Under WASI the same operations become
 straight-line sync imports. No async is introduced either way.
+
+## `test`
+
+Landed on this pump, as this document predicted ("New subcommands (`test`) reuse
+the same pump unchanged"). Three commands were added — the `CMD_RUN_WASM`-shaped
+capability the protocol was missing, split into the three steps a runner actually
+needs:
+
+| code | command | host mechanism |
+| ---- | ------- | -------------- |
+| 7 | `CMD_TEST_STASH` | keep the module the brain just emitted (`rbyteLen`/`rbyteAt`) |
+| 8 | `CMD_TEST_COLLECT` | instantiate each stashed module across a thread pool, read its `vlt*` registry back |
+| 9 | `CMD_TEST_RUN` | run the brain's plan across the pool, catching a trap per test |
+
+Everything else — discovery (the same walk with a `*.test.vl` predicate),
+compilation, the plan, `-t` filtering, the report and the exit code — is VL in
+`cli.vl`. Shipped shape: `docs/internals/vl-test-design.md`.
 
 ## `run` and `build`
 
