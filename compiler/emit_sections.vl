@@ -297,6 +297,7 @@ import {
   fnSigIsClosure,
   fnStmtsPosOf,
   forInElemKind,
+  forInMapRecv,
   forInRefArrayStructIdx,
   globalCellKind,
   globalCellStructIdx,
@@ -750,16 +751,35 @@ function startScanBlock(blockIx: i32) {
   0
 }
 
+// Run every EXPRESSION-level scratch-detection walker over one start-fn HEADER
+// expression — a `while` condition, a `for`-range bound, a `for`-in iterable, an
+// `if` condition. `startScanBlock`'s counterpart for the parts of a compound
+// statement that are NOT a block: those expressions are lowered into the start
+// function's body exactly as a bare top-level statement is, so they need exactly
+// the same frames, and every handler they reach (`emitCoalesce`'s call stash,
+// `emitArrayNew`'s length slot, the map lowering, the string-op frame,
+// `emitPop`) writes its frame with no "frame not reserved" floor. The four
+// headers used to be scanned inconsistently: `if` got five of the six walkers,
+// `for`-in got four, and `while` / `for`-range got NONE. (A `for`-range `step`
+// is not scanned because it cannot hold one of these: a non-constant step is a
+// clean emit reject, "for-range step must be a constant integer".)
+function startScanHeaderExpr(exprIx: i32) {
+  if exprIx < 0 { return 0 }
+  if exprHasStrOp(exprIx, -1) { fnUsesStrOp = true }
+  if exprHasArrNew(exprIx) { fnUsesArrNew = true }
+  if exprHasCoalesceCall(exprIx) { fnUsesCoalesceCall = true }
+  if exprHasMapOp(exprIx, -1) { fnUsesMap = true }
+  applyPushPopBits(exprPopBits(exprIx, -1))
+  collectMemberPopRefSlotsExpr(exprIx, -1)
+  0
+}
+
 // Scan a TOP-LEVEL `if` chain: the condition expression plus every arm's block
 // (an `else if` recurses through this function).
 function startScanIf(ifIx: i32) {
   const st = P.nodes[ifIx]
   if st is IfStmt {
-    if exprHasStrOp(st.ifCond, -1) { fnUsesStrOp = true }
-    if exprHasArrNew(st.ifCond) { fnUsesArrNew = true }
-    if exprHasCoalesceCall(st.ifCond) { fnUsesCoalesceCall = true }
-    if exprHasMapOp(st.ifCond, -1) { fnUsesMap = true }
-    applyPushPopBits(exprPopBits(st.ifCond, -1))
+    startScanHeaderExpr(st.ifCond)
     // Narrow across each arm (mirroring `ifChainHasStrOp` / `emitStmt`): the
     // then-branch sees the guard's narrowing, the else-branch sees a VALUE
     // union's complement — so a top-level `if w is string { print(w) }`
@@ -862,14 +882,26 @@ function startFnDetectScratch() {
       if blockHasCallRef(startStmts[si], -1) { fnUsesCallRef = true }
     }
     if st is ForRange {
+      // The BOUNDS are part of the start function's body — they were handed to
+      // nobody, so a `for i in 0 to (g(2) ?? 0) { }` at module scope emitted
+      // `fbLocalSet(coalesceCallSlot)` against a local the vector never
+      // declared. The in-function twins ARE covered (`blockHasCoalesceCall` /
+      // `blockHasArrNew` / `blockHasMapOp` / `blockPushPopBits` all walk
+      // `frFrom` / `frTo`), which is why this hid.
+      startScanHeaderExpr(st.frFrom)
+      startScanHeaderExpr(st.frTo)
       startScanBlock(st.frBody)
     } else if st is ForIn {
       startScanBlock(st.fiBody)
-      if exprHasStrOp(st.fiIter, -1) { fnUsesStrOp = true }
-      if exprHasArrNew(st.fiIter) { fnUsesArrNew = true }
-      if exprHasCoalesceCall(st.fiIter) { fnUsesCoalesceCall = true }
-      if exprHasMapOp(st.fiIter, -1) { fnUsesMap = true }
+      startScanHeaderExpr(st.fiIter)
+      // A BARE map iterable (`for k in m` at module scope) — asked through the
+      // emitter's own header predicate, exactly as `blockHasMapOp`'s ForIn arm
+      // does for the in-function twin. `exprHasMapOp` claims only the
+      // `m.keys()` / `m.values()` Call spellings.
+      if forInMapRecv(st.fiIter, -1) >= 0 { fnUsesMap = true }
     } else if st is WhileStmt {
+      // The CONDITION, likewise: `startScanBlock` was given only the body.
+      startScanHeaderExpr(st.whileCond)
       startScanBlock(st.whileBody)
     } else if st is IfStmt {
       startScanIf(startStmts[si])

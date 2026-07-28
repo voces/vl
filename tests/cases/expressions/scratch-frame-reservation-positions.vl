@@ -6,56 +6,63 @@
 // @log true
 // @log 4
 // @log 7
-// THE TAUGHT HALF of three more scratch-frame reservations, by POSITION — the
+// @log 0
+// @log 3
+// @log 3
+// @log 2
+// @log 3
+// @log 3
+// @log 2
+// @log 3
+// @log 0
+// THE START FUNCTION'S SCRATCH-FRAME RESERVATION, pinned by POSITION — the
 // call-LHS `??` stash (`coalesceCallSlot`/`StrSlot`/`BoolSlot`), the array-intrinsic
-// length slot (`arrNewScratchBase`) and the list `==`/`+` frames
-// (`leqIScratchBase`/`leqSScratchBase`) — plus the positions that are NOT taught,
-// named in prose because they cannot be pinned without failing the suite.
+// length slot (`arrNewScratchBase`), the string-op frame (`strScratchBase`), the
+// map frame and the push/pop quad — plus the position family that used to be
+// missing and is now taught.
 //
-// None of these three handlers has a "frame not reserved" floor (only the ref-list
-// compare arm does, wasmEmit.vl:13353), so a position the scan does not walk emits
-// `local.set` against a local the locals vector never declared: INVALID WASM with
+// None of these handlers has a "frame not reserved" floor (only the ref-list
+// compare arm does), so a position the scan does not walk emits `local.set`
+// against a local the locals vector never declared: INVALID WASM with
 // `vl check` rc 0.
 //
-// NOT WALKED — measured on 5394f3b, `vl check` rc 0, `vl build` rc 1, each cell
-// CORRECT the moment one more use of the same frame is added to the same function:
+// NOW TAUGHT — a TOP-LEVEL `while` CONDITION or `for`-RANGE BOUND.
+// `startFnDetectScratch` handed a `WhileStmt` and a `ForRange` only their BODY to
+// `startScanBlock`; `whileCond`, `frFrom` and `frTo` were scanned by nobody. The
+// `ForIn` arm beside them compensated by hand-scanning `st.fiIter` with four of
+// the walkers and the `IfStmt` arm hand-scanned `st.ifCond` with five — so of the
+// four header positions one got five walkers, one got four, and two got none. The
+// in-function twins ARE covered (`blockHasArrNew` / `blockHasCoalesceCall` /
+// `blockHasMapOp` / `blockPushPopBits` / `blockHasStrOp` all walk `whileCond` /
+// `frFrom` / `frTo`), which is why this hid.
+//
+// All four headers now run through ONE helper, `startScanHeaderExpr`, with the
+// full walker set — which also adds `exprPopBits` + `collectMemberPopRefSlotsExpr`
+// to the `for`-in iterable and `collectMemberPopRefSlotsExpr` to the `if`
+// condition. A `for`-range `step` is deliberately not scanned: a non-constant step
+// is a clean emit reject ("for-range step must be a constant integer").
+//
+// 13 cells measured over position {`while` cond, `for`-range `from`, `for`-range
+// `to`} x frame {call-LHS `??`, `__array_new__`, map, string-op, push/pop}, each
+// invalid wasm alone and correct with one more use of the same frame beside it.
+//
+// STILL NOT WALKED — measured on 6746f12:
 //
 //   1. AN if-EXPRESSION ARM. An if-expression is an `IfStmt` node sitting in a
-//      value slot (`exprIsIfStmt`, emit_query.vl:462); `emitExpr` lowers its arms
-//      through the ordinary path. `exprHasArrNew` (emit_query.vl:227),
-//      `exprHasCoalesceCall` (emit_query.vl:348) and `leqScanExpr`
-//      (emit_collect.vl:2132) have no `IfStmt` arm and fall off the end of their
-//      dispatch. `blockHasCallRef` (emit_classify.vl:5880) HAS one — same family,
-//      one member taught.
+//      value slot (`exprIsIfStmt`); `emitExpr` lowers its arms through the
+//      ordinary path. `exprHasArrNew`, `exprHasCoalesceCall` and `leqScanExpr`
+//      have no `IfStmt` arm and fall off the end of their dispatch.
+//      `blockHasCallRef` HAS one — same family, one member taught.
 //
 //          const v = if c then g(n) ?? 0 else 0      // g(): i32 | null
-//          const a = if c then __array_new__(n, 0) else __array_new__(1, 0)
-//          const b = if c then xs == ys else false
 //
-//   2. A TOP-LEVEL `while` CONDITION or `for`-RANGE BOUND. `startFnDetectScratch`
-//      (emit_sections.vl:864-895) hands a `WhileStmt` and a `ForRange` only their
-//      BODY to `startScanBlock`; `whileCond`, `frFrom` and `frTo` are scanned by
-//      nobody. The `ForIn` arm right beside them compensates by hand-scanning
-//      `st.fiIter`, and the `IfStmt` arm hand-scans `st.ifCond` — two of the four
-//      headers are covered and two are not. The in-function twins ARE covered
-//      (`blockHasArrNew`/`blockHasCoalesceCall`/`blockHasMapOp` all walk
-//      `whileCond`/`frFrom`/`frTo`), which is why this hid.
-//
-//          while (g(n) ?? 0) > 0 { n = n - 1 }       // at module scope
-//          for i in 0 to (g(2) ?? 0) { }             // at module scope
-//
-//   3. THE MIDDLE OPERAND OF A `??` CHAIN. `a ?? b ?? d` parses as `(a ?? b) ?? d`
-//      and `emitCoalesce` (wasmEmit.vl:14077-14090) RE-ASSOCIATES it to
-//      `a ?? (b ?? d)`, minting a new `BinExpr` in which `b` is a `??` LHS.
-//      `exprHasCoalesceCall` only ever asks whether a `??`'s `binLeft` is a Call —
-//      it never asks about `binRight`, and the re-associated node does not exist
-//      when the scan runs. So `x ?? f() ?? d` reserves nothing and then
-//      `fbLocalSet(coalesceCallSlot)` runs. The rewrite is the scan's blind spot,
-//      not a member of any enumeration it could have been taught.
-//
-// Measured: 22 cells over these three shapes x {named function, lambda, module
-// scope, return position, call-argument position} x {i32, string, boolean, list}
-// reps — every one invalid wasm alone, every one correct with a bystander.
+//   2. THE MIDDLE OPERAND OF A `??` CHAIN. `a ?? b ?? d` parses as `(a ?? b) ?? d`
+//      and `emitCoalesce` RE-ASSOCIATES it to `a ?? (b ?? d)`, minting a new
+//      `BinExpr` in which `b` is a `??` LHS. `exprHasCoalesceCall` only ever asks
+//      whether a `??`'s `binLeft` is a Call — it never asks about `binRight`, and
+//      the re-associated node does not exist when the scan runs. The rewrite is
+//      the scan's blind spot, not a member of any enumeration it could have been
+//      taught.
 function maybe(n: i32): i32 | null {
   if n > 0 { return n }
   null
@@ -65,6 +72,7 @@ function maybeS(n: i32): string | null {
   null
 }
 
+// ── THE TAUGHT HALF: the in-function twins ───────────────────────────────────
 // call-LHS `??` in a LetDecl init — walked (`blockHasCoalesceCall`'s `LetDecl` arm).
 function coalInLet(n: i32) {
   const v = maybe(n) ?? -1
@@ -73,8 +81,7 @@ function coalInLet(n: i32) {
 print(coalInLet(3)) // 3
 
 // call-LHS `??` in a while CONDITION inside a FUNCTION — walked
-// (`blockHasCoalesceCall`'s `WhileStmt` arm scans `whileCond`). Its module-scope
-// twin is gap 2 above.
+// (`blockHasCoalesceCall`'s `WhileStmt` arm scans `whileCond`).
 function coalInWhileCond(n: i32) {
   let k = n
   while (maybe(k) ?? 0) > 2 {
@@ -117,8 +124,7 @@ function arrNewInLet(n: i32) {
 print(arrNewInLet(4)) // 4
 
 // A TOP-LEVEL for-in ITERABLE holding the frame's only use — walked, because the
-// `ForIn` arm of `startFnDetectScratch` hand-scans `st.fiIter`. This is the half of
-// the loop-header pair that HAS the arm; `while`/`for`-range are gap 2.
+// `ForIn` arm of `startFnDetectScratch` hand-scans `st.fiIter`.
 const src = [3, 4]
 let total = 0
 for v in __array_new__(2, 0) {
@@ -126,3 +132,70 @@ for v in __array_new__(2, 0) {
 }
 total = total + src[0] + src[1]
 print(total) // 7
+
+// ── NOW TAUGHT: the TOP-LEVEL `while` condition ──────────────────────────────
+// Each header below holds the ONLY use of its frame in the start function, so
+// each is a real regression pin — and because they all share the start function's
+// ONE frame set, each frame appears exactly once across the whole file.
+let wc = 3
+while (maybe(wc) ?? 0) > 0 {
+  wc = wc - 1
+}
+print(wc) // 0 — the call-LHS `??` stash
+
+let wa = 3
+while __array_new__(wa, 0).length > 3 {
+  wa = wa - 1
+}
+print(wa) // 3 — the `__array_new__` length slot
+
+const wm: {[string]: i32} = Map()
+let wn = 3
+while (wm["a"] ?? 0) > 0 {
+  wn = wn - 1
+}
+print(wn) // 3 — the map frame
+
+const wp = [1, 2]
+let wq = 0
+while (wp.pop() ?? -1) > 0 {
+  wq = wq + 1
+}
+print(wq) // 2 — the push/pop quad; the loop drains `wp`
+
+// ── NOW TAUGHT: the TOP-LEVEL `for`-range bounds ─────────────────────────────
+let fa = 0
+for i in (maybe(1) ?? 0) to 3 {
+  fa = fa + 1
+}
+print(fa) // 3 — `frFrom`, the `??` stash again
+
+let fb = 0
+for i in 0 to __array_new__(2, 0).length {
+  fb = fb + 1
+}
+print(fb) // 3 — `frTo`, the `__array_new__` slot
+
+const fm: {[string]: i32} = Map()
+let fc = 0
+for i in 0 to (fm["a"] ?? 1) {
+  fc = fc + 1
+}
+print(fc) // 2 — `frTo`, the map frame
+
+const fp = [1, 2]
+let fd = 0
+for i in 0 to (fp.pop() ?? 0) {
+  fd = fd + 1
+}
+print(fd) // 3 — `frTo`, the pop frame
+
+// The string-op frame, reached through `.slice` — a `+`-then-`.length` shape does
+// NOT need it (the concat's length folds and the string never materialises), so
+// `.slice` is the honest probe for this frame in a header.
+const fs = "abcd"
+let fe = 0
+while fs.slice(0, 2) == "zz" {
+  fe = fe + 1
+}
+print(fe) // 0 — the string-op frame

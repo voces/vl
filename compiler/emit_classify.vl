@@ -3641,6 +3641,36 @@ export function exprPopBits(exprIx: i32, fnIx: i32) {
   }
   if e is Unary { return exprPopBits(e.unArg, fnIx) }
   if e is Paren { return exprPopBits(e.parInner, fnIx) }
+  // The four remaining VALUE positions, taught from this file's own sibling
+  // walker: `exprHasMapOp` carries `AsExpr` / `IsExpr` / `ObjLit` / `ArrayLit`
+  // arms and this one stopped at `Paren`. `emitExpr` lowers all four positions
+  // normally into `emitPop` / `emitPopOr`, which test no `fnUses*Push` flag, so
+  // a `.pop()` in an array-literal element, an object-literal field value or an
+  // `as`-cast operand staged its receiver into a frame `fbBeginFunc` never
+  // reserved: INVALID WASM with `vl check` rc 0.
+  if e is AsExpr { return exprPopBits(e.asObj, fnIx) }
+  if e is IsExpr { return exprPopBits(e.isObj, fnIx) }
+  if e is ObjLit {
+    let bits = 0
+    const fields = e.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit { bits = bits | exprPopBits(f.fiValue, fnIx) }
+      i = i + 1
+    }
+    return bits
+  }
+  if e is ArrayLit {
+    let bits = 0
+    const elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      bits = bits | exprPopBits(elems[i], fnIx)
+      i = i + 1
+    }
+    return bits
+  }
   0
 }
 
@@ -3649,8 +3679,12 @@ export function exprPopBits(exprIx: i32, fnIx: i32) {
 // receiver kinds and the Member-receiver `.pop` kinds in every let-init / return /
 // while-cond / for-header / expression-statement position. Replaces the twelve
 // per-kind walks (six push + six pop) with a single pass that classifies each
-// site once. `if` CONDITIONS are deliberately not scanned here (matching the
-// per-kind walkers this folds); the start-fn if-scan handles its conditions.
+// site once. `if` CONDITIONS are scanned too, by `ifChainPushPopBits` — the
+// header here used to claim they were "deliberately" skipped because the
+// start-fn if-scan handles conditions. It handles the START FUNCTION's
+// conditions (`startScanIf` walks `st.ifCond`); nothing walked a regular
+// function's or a lambda's, and a `.pop()` there is invalid wasm (see the note
+// on `ifChainPushPopBits`).
 export function blockPushPopBits(blockIx: i32, fnIx: i32) {
   let bits = 0
   const b = P.nodes[blockIx]
@@ -3694,11 +3728,23 @@ export function blockPushPopBits(blockIx: i32, fnIx: i32) {
 // `collectLocalsIf`'s recursion so a push buried under several `else if` arms (the
 // `parseProgram` / `parseStmt` recursive-descent dispatch shape) is detected, not just
 // the first one level (the prior hand-unrolled form missed 2+-deep chains).
+//
+// The CONDITION is walked too. It was not, and this walker's own header used to
+// justify the omission with "the start-fn if-scan handles its conditions" — which
+// is true only of the START FUNCTION: `startScanIf` (emit_sections.vl) does walk
+// `st.ifCond`, but nothing walked the condition of an `if` inside a regular
+// function or a lambda. Three of the four condition positions were scanned (a
+// `while` condition here, an `if` condition at module scope) and the fourth was
+// not, so `if (xs.pop() ?? -1) == 1 { … }` in a function staged the receiver's
+// wrapper ref into a push frame `fbBeginFunc` never reserved — `emitPop` /
+// `emitPopOr` test no `fnUses*Push` flag, so it was INVALID WASM with `vl check`
+// rc 0. `ifChainHasMapOp`, the same-shape sibling in this file, has had the
+// condition arm all along.
 function ifChainPushPopBits(ifIx: i32, fnIx: i32) {
   let bits = 0
   const s = P.nodes[ifIx]
   if s is IfStmt {
-    bits = blockPushPopBits(s.ifThen, fnIx)
+    bits = exprPopBits(s.ifCond, fnIx) | blockPushPopBits(s.ifThen, fnIx)
     if s.ifElse >= 0 {
       const els = P.nodes[s.ifElse]
       if els is Block { bits = bits | blockPushPopBits(s.ifElse, fnIx) }
@@ -18257,6 +18303,22 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
         if unionMapArmIdent(callee.memObj, fnIx) { return true }
         if nodeTyUnionHasMapArm(callee.memObj) { return true }
       }
+      // The METHOD map SET `recv.set(k, v)` and its Set twin `recv.add(x)` — the
+      // same store the `recv[k] = v` arm above claims, spelled as a member call.
+      // `emitMapSet` / `emitMapSetV` gate on `exprMap(callee.memObj)` and stage the
+      // key/value in `mapScratchBase + k` with no "frame not reserved" floor, so a
+      // receiver this arm did not claim emitted `local.set` against locals that do
+      // not exist (INVALID WASM at `vl check` rc 0) whenever NO other map op in the
+      // same function happened to reserve the frame. A map LOCAL / PARAM receiver
+      // hid it: `fnHasMap`'s declaration scan covers those whatever the body does.
+      // Gated on the SAME predicate the handlers use, so this claims exactly the
+      // shapes that write the frame — it can never over-reserve.
+      if callee.memProp == "set" || callee.memProp == "add" {
+        if exprMap(callee.memObj, fnIx) { return true }
+        if unionMapArmIdent(callee.memObj, fnIx) { return true }
+        if unionMapArrayElemIndex(callee.memObj, fnIx) { return true }
+        if nodeTyUnionHasMapArm(callee.memObj) { return true }
+      }
     }
     if exprHasMapOp(e.callFn, fnIx) { return true }
     const args = e.callArgs
@@ -18320,6 +18382,16 @@ export function blockHasMapOp(blockIx: i32, fnIx: i32) {
         if exprHasMapOp(s.whileCond, fnIx) { return true }
         if blockHasMapOp(s.whileBody, fnIx) { return true }
       } else if s is ForIn {
+        // The ITERABLE is asked through `forInMapRecv` — the emitter's OWN
+        // receiver predicate for a for-in header — not through `exprHasMapOp`.
+        // `exprHasMapOp` claims the `m.keys()` / `m.values()` Call spellings but
+        // has no arm for a BARE map iterable (`for k in m`), because a bare map
+        // Ident in an ordinary expression position is not a map op; only this
+        // header position makes one. The bare form walks the map's live/keys
+        // arrays out of `mapScratchBase`, so a header the scan did not claim
+        // emitted `local.set` against locals that do not exist. `for k in
+        // m.keys()` IS covered, which is why this hid.
+        if forInMapRecv(s.fiIter, fnIx) >= 0 { return true }
         if exprHasMapOp(s.fiIter, fnIx) { return true }
         if blockHasMapOp(s.fiBody, fnIx) { return true }
       } else if s is ForRange {
