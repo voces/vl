@@ -24,6 +24,18 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 - **Bare literals default to their base type.** `let x = 0` is `i32`, not the
   singleton `0`; the literal type survives only via an explicit annotation
   (`let x: 0 | 1`). (A16)
+- **A literal in an f32 context is admitted when f32 holds the best
+  representation of what was WRITTEN** — which means the two literal kinds take
+  different rules, by force rather than for symmetry. A `.` literal is
+  *context-typed*: it is f32 from birth and rounds ONCE at 24 bits (never
+  decimal→f64→f32; the two differ, and
+  `tests/cases/numerics/f32-literal-single-round.vl` is the witness). Gating it on
+  exactness instead would reject `0.1`/`3.14` and leave nothing to admit. An
+  INTEGER literal is *exactness-gated*: it denotes an exact integer, so admitting
+  one f32 cannot hold would be the silent lossy conversion the lossless-only rule
+  exists to forbid. Escape hatches stay one token (`16777217.0`, or `as f32`), so
+  the gate removes silence, not reach. Chosen over C/Rust's uniform
+  context-typing, which loses the digit without a word. (webcraft P2)
 - **`let x = null` is a nullable hole, not the `null` type.** `null` is
   hole-bearing like `[]` (it inhabits every `T | null`), so its `T` is inferred
   from later usage and the initializer contributes the `| null`: `let x = null;

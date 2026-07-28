@@ -46,7 +46,11 @@
 // `P.nodes` arena the checker walks), the int→string helper, and every `Node`
 // variant type the single `checkNode` visitor `is`-narrows. The checker's own
 // `Ty` type algebra stays PRIVATE to this module.
-import { f32LitOverflows, f64LitOverflows } from "./emit_bignum"
+import {
+  f32LitOverflows,
+  f64LitOverflows,
+  intLexemeIsExactF32,
+} from "./emit_bignum"
 import {
   ArrayLit,
   AsExpr,
@@ -1809,11 +1813,11 @@ function objLitWidenFields(
       } else {
         return false
       }
-    } else if primNameOf(dty) == "f32" && isFloatLitExpr(fv) {
-      // FLOAT-LITERAL → f32 field (`() => ({a: 3.5, …})` against `{a: f32, …}`): the field
-      // infers f64 but the literal re-encodes exactly at f32 (the field dual of the scalar
-      // arm above). Record f32 on the value node so `anonFieldCode` interns the f32 field
-      // slot (it would else code the float literal's default f64).
+    } else if primNameOf(dty) == "f32" && isF32AdoptingLitExpr(fv) {
+      // LITERAL → f32 field (`() => ({a: 3.5, …})` against `{a: f32, …}`): the field
+      // infers f64 (or i32) but the literal re-encodes exactly at f32 (the field dual of
+      // the scalar arm above). Record f32 on the value node so `anonFieldCode` interns the
+      // f32 field slot (it would else code the literal's default f64/i32).
       recNodes.push(fv)
       recTys.push(dty)
     } else if assignable(sty, dty) && !assignable(dty, sty) {
@@ -4229,6 +4233,62 @@ function isFloatLitExpr(ix: i32) {
   false
 }
 
+// Is the EXPRESSION at `ix` (peeling parens / a unary sign) an INTEGER literal whose
+// value f32 holds EXACTLY (`intLexemeIsExactF32`)? The integer half of the contextual-
+// f32-literal rule, and it takes the OTHER of the two principled designs on purpose:
+//
+//   - a `.` literal is CONTEXT-TYPED (`isFloatLitExpr`) — it is f32 from birth and
+//     rounds ONCE, because an exactness gate would reject `0.1`, `0.2`, `3.14` and
+//     every other useful constant, leaving the feature with nothing to admit;
+//   - an integer literal is EXACTNESS-GATED — it denotes an exact integer, so silently
+//     turning `16777217` into `16777216` would be precisely the lossy implicit
+//     conversion VL's lossless-only posture exists to forbid.
+//
+// The unifying rule is one sentence: a literal is admitted into an f32 context exactly
+// when f32 holds the best representation of what the author WROTE. Writing the `.` is
+// the author asking for a real number (so rounding is the contract); writing an integer
+// is not. An inexact integer constant keeps both escape hatches — `16777217.0` (one
+// rounding, at f32) or `16777217 as f32` (an explicit convert) — so nothing is
+// unreachable, only unsilent.
+//
+// Negation is exact in IEEE-754, so the sign peels exactly as it does for a float
+// literal. A CHAR literal is NOT admitted: `'a'` is an i32 code point, and a code point
+// in a float slot is a category confusion, not a numeric one.
+function isExactF32IntLitExpr(ix: i32) {
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is Paren { return isExactF32IntLitExpr(e.parInner) }
+  if e is Unary {
+    if e.unOp == "-" { return isExactF32IntLitExpr(e.unArg) }
+  }
+  if e is NumLit {
+    if hasDot(e.numText) { return false }
+    return intLexemeIsExactF32(e.numText)
+  }
+  false
+}
+
+// Does the EXPRESSION at `ix` adopt an f32 context as a LITERAL — either half of the
+// contextual-f32-literal rule? The single predicate every f32 grant site asks, so the
+// float and integer halves can never drift apart position by position (the defect the
+// float half itself shipped through: it reached bindings before arguments, and
+// arguments before returns).
+function isF32AdoptingLitExpr(ix: i32) {
+  if isFloatLitExpr(ix) { return true }
+  isExactF32IntLitExpr(ix)
+}
+
+// Is this ordering comparison an f32 operand against an f32-adopting LITERAL? The
+// comparison twin of `binOpType`'s literal-adopt arm: `fv > 1` / `1 > fv` compare at f32
+// exactly as `fv + 1` computes at f32. Comparison needs its own site because it yields
+// `TY_BOOL` and never consults `widerNumeric`, so the arithmetic arm cannot cover it.
+function cmpF32LitAdopts(n: BinExpr, olt: i32, ort: i32) {
+  if primNameOf(olt) == "f32" && isF32AdoptingLitExpr(n.binRight) {
+    return true
+  }
+  primNameOf(ort) == "f32" && isF32AdoptingLitExpr(n.binLeft)
+}
+
 // The least upper bound used by `??` (host: `flatten(Union(nonNull(l), r))`):
 // mutually-assignable types collapse to the wider; otherwise a two-member union.
 function joinTys(a: i32, b: i32) {
@@ -4922,11 +4982,21 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // recurses through `assignableExpr` per field, which re-applies the brand rule to
   // every field value. A wrongly-branded variable inside a literal still rejects.
   if nomLitAdopts(srcExpr, srcTy, dstTy) { return true }
-  // A float literal re-encodes EXACTLY at f32, so it flows into any destination whose f32
+  // A LITERAL re-encodes EXACTLY at f32, so it flows into any destination whose f32
   // position it fits: a bare `f32`, a nullable `f32?` (a map value / niche), or an f32 MEMBER
-  // of a union (`f32 | string`). An arbitrary f64 VALUE is NOT covered (that is a lossy demote).
-  if isFloatLitExpr(srcExpr) {
-    if dstAdmitsF32(dstTy) { return true }
+  // of a union (`f32 | string`). A `.` literal is context-typed and rounds once; an integer
+  // literal must be exactly representable (`isF32AdoptingLitExpr`). An arbitrary f64 or i32
+  // VALUE is NOT covered (that is a lossy demote — the rule is about literals, not values).
+  //
+  // DESTINATION FIRST, and that order is load-bearing for COMPILE TIME, not style: the
+  // integer half of `isF32AdoptingLitExpr` folds the lexeme into a BIGNUM, and this is the
+  // seam every binding / argument / return / field / element / store / push flows through.
+  // Asking the literal first would pay that allocation for every integer literal in the
+  // program, nearly all of which have an i32 destination; `dstAdmitsF32` is a short arena
+  // walk that answers false immediately for them. Both predicates are pure, so the swap is
+  // an evaluation-order change only. (This compiler is WasmGC-allocation-bound.)
+  if dstAdmitsF32(dstTy) {
+    if isF32AdoptingLitExpr(srcExpr) { return true }
   }
   // (A float-literal array → `f32[]`, and any literal array adapting element-wise, is handled by
   // the `ArrayLit` recursion in the literal-aware block below — the array dual of the ObjLit case.)
@@ -12754,14 +12824,17 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       const expRet = cbExpectedRetFor(fnIx)
       if expRet >= 0 {
         if numWidens(inferred, expRet) { inferred = expRet }
-        // FLOAT-LITERAL → f32 dual of the numeric widen: a float-literal-bodied lambda
-        // whose contextual return is f32 (`(i32) => f32 = (x) => 5.5`) infers f64 (a float
-        // literal's default), but the literal re-encodes EXACTLY at f32 — the same grant
-        // `isFloatLitExpr`/`assignableExpr` make at a direct `const v: f32 = 5.5` binding.
-        // Adopt f32 so the lambda's functype result is f32 and `emitReturnValue` encodes the
-        // literal at f32 in the body (the named-function-value spelling `= mk` already lowers).
+        // LITERAL → f32 dual of the numeric widen: a literal-bodied lambda whose contextual
+        // return is f32 (`(i32) => f32 = (x) => 5.5`) infers f64 (a float literal's default)
+        // or i32 (an integer literal's), but the literal re-encodes EXACTLY at f32 — the same
+        // grant `isF32AdoptingLitExpr`/`assignableExpr` make at a direct `const v: f32 = 5.5`
+        // binding. Adopt f32 so the lambda's functype result is f32 and `emitReturnValue`
+        // encodes the literal at f32 in the body (the named-function-value spelling `= mk`
+        // already lowers).
         if inferred != expRet && primNameOf(expRet) == "f32" {
-          if isFloatLitExpr(lambdaBodyTail(n.fnBody)) { inferred = expRet }
+          if isF32AdoptingLitExpr(lambdaBodyTail(n.fnBody)) {
+            inferred = expRet
+          }
         }
         // Object-shaped dual: `() => ({f: 5})` against `() => {f: i64}` — adopt the
         // expected shape when every widening field is a re-encodable literal
@@ -18632,9 +18705,10 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
     const lt2 = T.tys[lt]
     if lt2 is TyNullable {
       const innerFull = nonNullTy(lt)
-      // A float-literal default re-encodes at an inner `f32`, so keep the result f32 — else
-      // `joinTys` widens `f32 + f64` to f64 and a downstream `f32` slot rejects the demote.
-      if primNameOf(innerFull) == "f32" && isFloatLitExpr(n.binRight) {
+      // A LITERAL default re-encodes at an inner `f32`, so keep the result f32 — else
+      // `joinTys` widens `f32 + f64` (or `f32 + i32`) and a downstream `f32` slot rejects
+      // the demote.
+      if primNameOf(innerFull) == "f32" && isF32AdoptingLitExpr(n.binRight) {
         return innerFull
       }
       // A literal-union inner with a MEMBER-LITERAL default stays the union (`m[k] ?? "aa"`
@@ -18823,9 +18897,17 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
           tyToStr(ort),
         ix,
       )
-    } else if !sameNumeric(olt, ort) && !mixesNumeric(olt, ort) {
+    } else if (
+      !sameNumeric(olt, ort) &&
+      !mixesNumeric(olt, ort) &&
+      !cmpF32LitAdopts(n, olt, ort)
+    ) {
       // Mixed numerics may be compared when one side widens to the other
       // (i32/i64, i32/f64, f32/f64, …); the narrower side widens. Other mixes error.
+      // The f32-with-a-LITERAL pair is admitted by `cmpF32LitAdopts` instead — the
+      // comparison twin of the arithmetic arm in `binOpType`, so `fv > 1` and `fv + 1`
+      // agree about which operands an f32 accepts (they did not: arithmetic took the
+      // literal and the comparison rejected it).
       tErr("comparison mixes " + tyToStr(olt) + " and " + tyToStr(ort), ix)
     }
     return TY_BOOL
@@ -18926,12 +19008,16 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
       return TY_ERR
     }
   }
-  // A FLOAT LITERAL operand adopts the OTHER side's f32 type (the literal re-encodes
-  // exactly at f32, so `x + 4.0` with `x: f32` stays f32 — the `4.0` is NOT demoted
-  // f64). Checked before the general mixed rule so the result is f32, not the wider
-  // f64. (One side is the f32 variable; the other the float literal typed f64.)
-  if primNameOf(lt) == "f32" && isFloatLitExpr(n.binRight) { return lt }
-  if primNameOf(rt) == "f32" && isFloatLitExpr(n.binLeft) { return rt }
+  // A LITERAL operand adopts the OTHER side's f32 type (the literal re-encodes exactly at
+  // f32, so `x + 4.0` with `x: f32` stays f32 — the `4.0` is NOT demoted f64, and `x + 1`
+  // stays f32 rather than being the `mixes f32 and i32` error it is without this). Checked
+  // before the general mixed rule so the result is f32, not the wider f64. This RETYPES THE
+  // LITERAL and does not touch the mixed-arithmetic lattice underneath: `mixesNumeric` /
+  // `widerNumeric` / `binMixHardF64` still see exactly the pairs they saw before, because
+  // the only pairs this arm intercepts (f32 with a LITERAL other side) were an f32-typed
+  // result already (float literal) or a hard error (integer literal).
+  if primNameOf(lt) == "f32" && isF32AdoptingLitExpr(n.binRight) { return lt }
+  if primNameOf(rt) == "f32" && isF32AdoptingLitExpr(n.binLeft) { return rt }
   // A mixed-numeric op widens the narrower operand to the wider one and yields the
   // wider type (`i32 op i64`→i64, `f64 op i32`→f64, `f32 op f64`→f64, …). Done BEFORE
   // the same-type check so a compatible mixed pair is accepted (B2). i32-only programs

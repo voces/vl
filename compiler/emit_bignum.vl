@@ -420,6 +420,29 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
       i = 1
     }
   }
+  // RADIX PREFIX (`0x1f` / `0b101` / `0o17`). A NumLit lexeme is the RAW source text, so a
+  // non-decimal integer reaches here whenever a float context wants it as a constexpr
+  // (`const x: f64 = 0x10`, and every integer literal in an f32 context under the P2
+  // contextual-literal rule). Without this the digit fold below ran base-10 over the prefix
+  // itself and `0x10` encoded as SEVEN THOUSAND TWO HUNDRED TEN — 0, then `'x' - '0'` = 72,
+  // then 721, then 7210 — a SILENT WRONG VALUE with `vl check` clean (`0b101` gave 50101).
+  // Verified on master before the fix; the call-ARGUMENT spelling `f(0x10)` was always right
+  // because it converts from i32 rather than taking this constexpr path, which is why it hid.
+  // A radix lexeme is an INTEGER: it carries no `.`, so `frac` stays 0 either way.
+  let base = 10
+  if text.length >= i + 2 && text[i] == '0' {
+    const p = text[i + 1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = i + 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = i + 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = i + 2
+    }
+  }
   // Parse mantissa digits (ignoring `.` and `_`), counting fractional digits.
   let mant: i32[] = []
   mant.push(0)
@@ -433,8 +456,12 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
       dot = true
       i = i + 1
     } else {
-      mant = bigMulSmall(mant, 10)
-      mant = bigAddSmall(mant, c - '0')
+      let d = 0
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else { d = c - 'A' + 10 }
+      mant = bigMulSmall(mant, base)
+      mant = bigAddSmall(mant, d)
       if dot { frac = frac + 1 }
       i = i + 1
     }
@@ -644,4 +671,72 @@ export function f32LitOverflows(text: string) {
   if decIntDigits(text) < 39 { return false }
   f32Bytes(text)
   gIeeeOverflow
+}
+
+// Is the non-negative INTEGER lexeme `t` (decimal / `0x` hex / `0b` binary / `0o`
+// octal, `_` separators skipped) EXACTLY representable as a finite f32? THE ONE HOME
+// of the integer half of the contextual-f32-literal rule (P2): a `.`-literal in an f32
+// context is CONTEXT-TYPED and rounds once (`isFloatLitExpr` — writing the `.` is the
+// author asking for a real number), but an integer literal denotes an EXACT integer, so
+// it is admitted only when f32 keeps that value — the exact-representability gate. This
+// is `intLexemeFitsI32`'s rule ("default to the narrowest type that holds it EXACTLY")
+// carried to f32, not a new principle.
+//
+// A closed-form BIT test, not a re-encode: an integer v != 0 is exactly an f32 iff its
+// significand fits the 24-bit format (`bitlen - trailingZeros <= 24`) and it is not past
+// the largest finite f32. The magnitude bound is `bitlen <= 128` and that is EXACT, not a
+// slack prescreen: the largest finite f32 is (2 - 2^-23) * 2^127 = 2^128 - 2^104, and the
+// largest 128-bit integer with <= 24 significant bits is (2^24 - 1) * 2^104 — the same
+// number. So the two conditions together admit precisely the finite f32 integers.
+//
+// Deliberately NOT routed through `ieeeBytes`: that encoder folds decimal digits with a
+// hard-coded `* 10`, so it cannot read a radix-prefixed lexeme at all, and the question
+// here (does an exact integer survive?) is not the question it answers (how does a
+// decimal FRACTION round?). Digits fold at the lexeme's own base through the same bignum
+// helpers the encoder uses, so `0x1000` and `4096` get one answer.
+export function intLexemeIsExactF32(t: string) {
+  let base = 10
+  let i = 0
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  let v: i32[] = []
+  v.push(0)
+  while i < t.length {
+    const c = t[i]
+    if c == '_' {
+      i = i + 1
+    } else {
+      let d = 0
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else { d = c - 'A' + 10 }
+      v = bigMulSmall(v, base)
+      v = bigAddSmall(v, d)
+      i = i + 1
+    }
+  }
+  // Zero is exact in every format (and has no significant bits to strip).
+  if bigIsZero(v) { return true }
+  const width = bigBitLen(v)
+  if width > 128 { return false }
+  // Strip trailing zero bits: they are carried by the EXPONENT, not the significand,
+  // so `2^100` needs one significand bit, not 101.
+  let sig = v
+  let low = bigGetBit(sig, 0)
+  while low == 0 {
+    sig = bigShr1(sig)
+    low = bigGetBit(sig, 0)
+  }
+  bigBitLen(sig) <= 24
 }

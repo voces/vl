@@ -2869,6 +2869,23 @@ export function emitUnionCoerce(
         cak = 3 // "i64"
       }
     }
+    // THE MISSING HALF OF THIS LADDER'S OWN LIST TWIN. The i32 default above promotes to
+    // `i64` when the union has no i32 atom — but the LIST arm below (`cak == 7`) promotes
+    // an i32-element list to i64[] / f64[] / f32[], THREE targets, on exactly the same
+    // reasoning. The scalar arm was taught only the first, so an integer flowing into a
+    // union whose only numeric atom is a FLOAT stayed `cak = 0` and boxed an i32 into the
+    // f64/f32 value box: `const x: f64 | null = 1` is `vl check`-clean INVALID WASM on
+    // master ("expected anyref, found i32") in the global, local AND argument positions,
+    // while `const x: i64 | null = 1` (the taught half) and `const x: f64 | null = 1.0`
+    // (a float literal, which classifies `cak = 4` up the ladder) both run. Verified
+    // against master before the fix. Ordered f64-before-f32 to match the list arm.
+    if cak == 0 && !unionHasAtomK(usid, unionName, "i32", 0) {
+      if unionHasAtomK(usid, unionName, "f64", 4) {
+        cak = 4 // "f64"
+      } else if unionHasAtomK(usid, unionName, "f32", 5) {
+        cak = 5 // "f32"
+      }
+    }
   }
   // A float literal types f64 by default, but if the union's float atom is f32 (`f32 | string`,
   // no f64) the literal re-encodes at f32 — pick the f32 atom so it boxes into the f32 value box.
@@ -7806,13 +7823,49 @@ export function emitExprAsF64(body: i32[], exprIx: i32, fnIx: i32) {
   0
 }
 
+// The DECIMAL TEXT of a (possibly signed) numeric literal at `exprIx`, with the sign FOLDED
+// into the text — `""` when the expression is not a literal. Peels grouping parens and ANY
+// NUMBER of unary minuses, which is exactly what the checker's `isFloatLitExpr` /
+// `isExactF32IntLitExpr` peel when they grant a literal the f32 flow.
+//
+// The recursion matters. Those predicates recurse; the emitter used to handle exactly ONE
+// minus, so the checker admitted a literal the emitter then failed to recognize as one and
+// lowered through the f64 path instead: `const x: f32 = -(-1.5)` was `vl check`-clean
+// INVALID WASM on master, and `-(-(-1.5))` with it, while the f64 twin ran. A checker that
+// grants more shapes than the emitter can lower is the shape of that whole defect family,
+// so the two peels are now the same peel. `f32Bytes` parses a leading `-`, so the folded
+// sign costs no `f32.neg` and no lossy f64 round-trip.
+//
+// The iteration bound is a guard, not a semantic limit — 64 nested signs is far past any
+// real source and keeps a malformed arena from spinning.
+function signedNumLitText(exprIx: i32) {
+  let ix = unwrapParen(exprIx)
+  let neg = false
+  let guard = 0
+  while guard < 64 {
+    const nd = P.nodes[ix]
+    if nd is Unary {
+      if nd.unOp != "-" { return "" }
+      neg = !neg
+      ix = unwrapParen(nd.unArg)
+    } else if nd is NumLit {
+      if neg { return "-" + nd.numText }
+      return nd.numText
+    } else {
+      return ""
+    }
+    guard = guard + 1
+  }
+  ""
+}
+
 // Emit the expression at `exprIx` as an f32 value (Slice 5). If it already yields f32
-// (`exprIsF32`) it is emitted as-is. A bare float LITERAL is lowered directly as
-// `f32.const` (re-encoded at single precision, never demoted from f64). Otherwise it is
-// an i32 LITERAL flowing into an f32 op: evaluate as i32, then convert with
-// `f32.convert_i32_s` (0xb2). An i32 *variable* never reaches here — the checker
-// rejects i32→f32 as lossy (above 2^24 the i32 would round to the nearest f32), so
-// only a literal (exact by construction within the op's value range) takes this path.
+// (`exprIsF32`) it is emitted as-is. A bare (possibly signed) numeric LITERAL — float or
+// integer — is lowered directly as `f32.const`, re-encoded at single precision and never
+// demoted from f64. Otherwise it is an i32 expression flowing into an f32 op: evaluate as
+// i32, then convert with `f32.convert_i32_s` (0xb2). An i32 *variable* never reaches here —
+// the checker rejects i32→f32 as lossy (above 2^24 the i32 would round to the nearest f32),
+// so only a literal (exactness-gated by the checker) takes the direct path.
 export function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
   // Peel parens to find a bare (possibly negated) numeric literal — a literal lowers
   // DIRECTLY as `f32.const`, checked BEFORE the `exprIsF32` delegation. `emitExpr` lowers
@@ -7820,34 +7873,22 @@ export function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
   // context-ADOPTED f32 field literal (`objRetWidenAdopt` records f32 on the value node,
   // so `exprIsF32` is now true for it) would else delegate to `emitExpr` and emit an
   // `f64.const` into an f32 field — invalid wasm at `struct.new`.
-  const inner = unwrapParen(exprIx)
-  const innerNode = P.nodes[inner]
-  if innerNode is NumLit {
-    if numTextIsFloat(innerNode.numText) {
-      fbF32Const(innerNode.numText)
-      return 0
-    }
-    // A bare INTEGER literal in f32 context: push it as i32, then convert to f32.
-    fbI32Const(parseI32(innerNode.numText))
-    fbF32ConvertI32S()
+  // A (possibly signed) numeric literal — float OR integer — lowers DIRECTLY as `f32.const`,
+  // its sign folded into the text by `signedNumLitText`. Both literal kinds take the same
+  // re-encode; an integer one is what `emitNumLitNode`'s `pendingF32` arm already did for
+  // this class. Direct `f32.const` beats the `i32.const` + `f32.convert_i32_s` pair the
+  // integer case used to emit on three counts:
+  //   - it is a CONSTEXPR, so an integer literal reaches an f32 field / element of a
+  //     `const` global (`const s: S = {v: 1}`, `const xs: f32[] = [1]`) — the convert
+  //     pair made those "constant expression required: non-constant";
+  //   - it survives past the i32 range, where `parseI32` silently WRAPPED;
+  //   - it is two bytes shorter.
+  // The VALUE is identical wherever the old path was correct: `f32Bytes` rounds the decimal
+  // to nearest-even, which is exactly what `f32.convert_i32_s` computes.
+  const litText = signedNumLitText(exprIx)
+  if litText != "" {
+    fbF32Const(litText)
     return 0
-  }
-  // A unary-minus over a literal (`-1.5` / `-3`) in f32 context: `f32Bytes` parses the
-  // leading `-` so a negated float re-encodes directly as `f32.const -1.5` (no `f32.neg`
-  // op, no lossy f64 round-trip); a negated integer converts the negated i32.
-  if innerNode is Unary {
-    if innerNode.unOp == "-" {
-      const negArg = P.nodes[unwrapParen(innerNode.unArg)]
-      if negArg is NumLit {
-        if numTextIsFloat(negArg.numText) {
-          fbF32Const("-" + negArg.numText)
-          return 0
-        }
-        fbI32Const(0 - parseI32(negArg.numText))
-        fbF32ConvertI32S()
-        return 0
-      }
-    }
   }
   // An already-f32-valued expression (a variable, an f32 arithmetic / call result) emits
   // directly; only a bare numeric literal needed the direct-`f32.const` handling above.

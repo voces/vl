@@ -547,10 +547,45 @@ and needs nothing from vl beyond scalar exports.
 - **i32-keyed Map/Set** (B6a remaining): rule tables keyed by fourCC. Until
   then webcraft uses sorted arrays/views; string keys would mean formatting
   fourCCs, which is silly. Also `for k in map` iteration.
-- **Contextual f32 literals**: `let x: f32 = 0.5` and `f32-typed` call sites
+- ~~**Contextual f32 literals**: `let x: f32 = 0.5` and `f32-typed` call sites
   accepting bare literals without `as f32` noise. Sim code is f32-saturated;
   today's `.`-literal-defaults-to-f64 + lossy-rejection rules make every
-  constant a cast.
+  constant a cast.~~ **DONE.**
+  > Measuring the ask first split it in two. The **`.`-literal half was already
+  > shipped** — a 32-position grid found bindings, arguments, returns, fields,
+  > array elements, stores, pushes, binary ops, negatives, nullables and the
+  > `"[]="` operator all already accepting `0.5` on master. The **integer half
+  > was missing in 18 of 18 positions** (`let x: f32 = 0`, `f(1)`,
+  > `return 2`, `{v: 1}`, `[1]`, `fv + 1`, …), every one of which the f64 twin
+  > already compiled.
+  >
+  > The two halves take DIFFERENT rules, and the split is forced rather than
+  > chosen: a `.` literal is **context-typed** (it is f32 from birth and rounds
+  > ONCE at 24-bit precision), because an exactness gate there would reject
+  > `0.1`, `0.2` and `3.14` and leave nothing to admit. An integer literal is
+  > **exactness-gated** (`intLexemeIsExactF32`), because it denotes an exact
+  > integer and silently turning `16777217` into `16777216` is the lossy
+  > implicit conversion the language forbids. `16777216` and `33554432` are
+  > admitted; `16777217` and `9000000000` still reject, with both one-token
+  > escape hatches (`16777217.0`, or `as f32`) intact.
+  >
+  > **`as f32` is not the oracle for what the sugar must lower to**, and this
+  > is measured: for `1.00000017881393432617187` the bare literal encodes
+  > `0x3F800001` (one rounding) and the cast encodes `0x3F800002` (rounded to
+  > f64, then ties-to-even on the demote) — *different numbers*. The cast is
+  > also a runtime `f64.const` + `f32.demote_f64`, so it cannot sit in a
+  > `const` global initializer at all. The literal is strictly better on both
+  > counts.
+  >
+  > Two PRE-EXISTING defects fell out of widening the grid, both `vl check`
+  > clean on master: `const x: f64 = 0x10` printed **7210** (the IEEE encoder
+  > folded radix lexemes base-10 over their own prefix), and
+  > `const x: f64 | null = 1` emitted **invalid wasm** in the global, local and
+  > argument positions (the union value-atom ladder's scalar arm knew the i64
+  > promotion its own list arm knew for i64/f64/f32). Both fixed.
+  > (`docs/internals/contextual-f32-literals-design.md`,
+  > `tests/cases/numerics/f32-contextual-integer-literal.vl` + 4 siblings,
+  > `tests/cases/unions/nullable-float-integer-literal.vl`)
 - **`match` phase 2** (variant payload binding): command dispatch
   (`match cmd { Move{x,y} => …, Attack{target} => … }`) is the natural shape
   for the order pipeline; if-chains work meanwhile.
