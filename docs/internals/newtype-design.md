@@ -304,7 +304,157 @@ passing any `i32`.
 
 ---
 
-## 6. Measurements
+## 6. What it cost, in code
 
-(Filled in below by the implementation slice — the distinctness grid, the
-erasure grid, the views acceptance cell, corpus/fuzz A/B and the gate.)
+| file | what changed |
+|---|---|
+| `compiler/parser.vl` | the contextual `new` peek in `parseTypeDecl`, passed to the two decl constructors |
+| `compiler/ast.vl` | `tdNew` / `udNew` on the two existing decl nodes |
+| `compiler/typecheck.vl` | the sidecar, five helpers, and **six** consultation points |
+| **every `compiler/emit_*.vl`, `wasmEmit.vl`** | **nothing** |
+
+The six consultation points, and why each is where it is:
+
+| site | rule |
+|---|---|
+| `assignableGo` | the brand test — ONE line, placed after the err/var/never/nullable/union/literal/negation arms so it compares at the level the brand sits on. This is the whole distinctness guarantee: `assignable` is the chokepoint every position goes through, so no position can be taught half the rule. |
+| `assignableExpr` | the literal-adoption escape (§2.3). |
+| map `.set` (key and value) | the one binding position checked with the bare structural `assignable` rather than `assignableExpr`; without it a map slot would be the single position a literal could not reach. Gated on the destination reaching a brand, so nothing else about `.set` moves. |
+| `checkBinExprNode` | the mixed-brand reject. Cannot be left to the structural rules — `sameNumeric` compares `primName`, and the ordering operators never consult `assignable` at all. |
+| `+` string concat | a `new string` joins with a same-brand value or a literal and keeps the brand. Without it a `new string` would be the one newtype whose values could not be combined, since `as` is numeric-only. |
+| `tyToStr` / `tyEqGo` | render and compare by the name. The emit renderers (`tyToEmitName`, `canonEmitName`) deliberately do NOT get this arm — their output is the emitter's vocabulary. |
+
+**Inert by construction on a program with no `new`.** The sidecar is empty, so
+`nomNameOfTy` answers `""` without doing any work and nothing else in the checker
+can observe the rules. That is the claim the corpus A/B tests, below.
+
+---
+
+## 7. Measurements
+
+### 7.1 The grid — 119 cells
+
+`{i32, i64, f32, f64, string, struct}` × `{let, global, param, return, struct
+field, array element, map value, nullable, arithmetic, cast round-trip}` ×
+`{same-brand OK, base→newtype REJECT, newtype→base REJECT, sibling→sibling
+REJECT}`. Every cell exists twice — once spelled with `new` and once with `new`
+deleted — and the second is the **inverted control**.
+
+| | count | result |
+|---|---|---|
+| REJECT cells | **72 / 72** | reject with `new`, and the inverted control **checks clean** — so every reject is attributable to the newtype and to nothing else in the program |
+| positive cells, checker | **47 / 47** | check clean and run correctly |
+| positive cells, ERASURE (`cmp` vs the same program with `new` deleted) | **46 / 46** | **byte-identical** |
+
+The erasure column is 46, not 47, and the missing cell is the honest one to state:
+`{[string]: f32}` with a float-literal `.set` **builds and runs with `new` and
+does not without it** (`type Id = f32` still reports `set: expected f32, got
+f64`). That f32 gap is pre-existing — reproduced on `d0a13651` with no newtype in
+the program — and the branded slot picks up `assignableExpr`'s float-literal arm
+on the way past the `nomSlotAccepts` retry. It is a widening, in one cell, in the
+direction of MORE working code, with no soundness consequence. It was left rather
+than special-cased around, because the special case would have no principle
+behind it.
+
+REJECT coverage, by flow, per base type:
+
+| flow | i32 | i64 | f32 | f64 | string | struct |
+|---|---|---|---|---|---|---|
+| base value → newtype (let / arg / field / element / map value) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| newtype → base (let / arg / return) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| sibling → sibling (let / arg / field / element) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| mixed-brand `+` / `==` / `<` | ✔ | ✔ | ✔ | ✔ | n/a | n/a |
+
+### 7.2 Zero cost
+
+Two different twins, and they answer different questions:
+
+- **vs the same program with `new` deleted** (a plain alias): **byte-identical,
+  46/46.** This is the erasure proof — the marker reaches no byte of codegen.
+- **vs the same program with the alias removed entirely** (raw `i32` everywhere):
+  8 cells identical, 38 differ by exactly **10 bytes**. Those 10 bytes are a
+  **pre-existing alias tax**, not the newtype's: `type Id = i32; const a: Id = 1`
+  emits 165 bytes and the alias-free program 155 **on master (`d0a13651`) as
+  well** — a one-member `type N = …` declaration registers in `unNames`, which
+  flips `uDeclared` and emits two never-used union-box heap types. Measured both
+  ways with the same command. `-O3 --closed-world` removes them.
+
+### 7.3 The views acceptance cell
+
+Three legs, all built with the SAME compiler so the std source is the only
+variable (`git show HEAD:std/*.vl` for the pre-migration side):
+
+| leg | result |
+|---|---|
+| the confusion cell | `vl check` rc **1** with `new`, rc **0** with `new` deleted from both declarations |
+| erasure | **8 / 8** correct view programs byte-identical against the same std with `new` deleted |
+| size vs the `f32base`/`i32base` std | **−12 bytes** on every one of the 8, run output unchanged |
+
+The size result is the interesting one and it is the opposite of a cost. The
+field-name workaround made the two views two different SHAPES, needing two wasm
+heap types. `base`/`base` makes them one shape — the structural slot dedup
+collapses them (`sTwin`) — while `new` keeps them two TYPES. **The safety came
+back and a heap type went away.**
+
+The diagnostic improved with it:
+`no field 'getF32' on {i32base: i32, length: i32}` → `no field 'getF32' on I32View`.
+
+### 7.4 No regression
+
+**Corpus six-channel A/B**, `d0a13651` vs this branch, over `tests/cases` + `std`
++ `scripts`, **1,625 files**:
+
+| channel | result |
+|---|---|
+| 1 CHECKRC | 1,602 same / 23 `(1/0)` |
+| 2 CHECKMSG | 1,598 same / 27 |
+| 3 BUILDRC | 1,602 same / 23 `(1/0)` |
+| 4 BUILDMSG | 1,598 same / 27 |
+| **5 BYTES** | **1,625 same** |
+| 6 RUN | 1,611 same / 14 `(1/0)` |
+
+**Field 5 all-same is the swallow**: new syntax must leave old programs untouched,
+and it does. All 27 moving rows are accounted for exactly — the 6 new/changed
+fixtures, `std/buffer.vl` itself, and the 20 corpus files that IMPORT `std:buffer`
+(they reject on the `d0a13651` side because that compiler cannot parse `new`).
+**Zero pre-existing files moved on any channel.**
+
+**Fuzz A/B** — and the reach statement matters more than the number:
+`scripts/fuzzgen.vl` contains the token `new` exactly once, **in a comment**, so
+the generated population contains **zero** newtype declarations by construction.
+The fuzz channel is therefore a NO-REGRESSION instrument for this change (does
+the machinery perturb programs that contain no newtype), never an agreement
+instrument for the feature. Its verdict has to be read that way or a green reads
+as coverage it does not have.
+
+**Gate** (all rc read bare): fresh published seed → `refresh-compiler.sh
+--prove-fixpoint` 0 (fixpoint at 2 compiles, as expected for a compiler that
+changed) · `native-fixpoint.sh` 0 · `lint-self.sh` 0 (includes `vl fmt --check`
+over `compiler/`, `std/`, `scripts/`) · `rep-fuzz-check.sh` 0 · full suite
+**3411 passed / 0 failed / 8 ignored** (master `d0a13651`: 3399 / 0 / 8) with the
+ignored NAME SET diffed against master's and identical, both sides non-empty.
+
+Compiler size: 1,054,554 → 1,058,013 bytes (**+3,459**).
+
+One method note worth keeping, because it cost a run: `scripts/fuzz-vl.sh` reads
+`build/vl-compiler.wasm`, so a fuzz A/B **swaps that file while it runs**. A
+`refresh-compiler.sh` issued concurrently silently contaminates the side that is
+mid-flight — half the batch is measured against the other compiler, and the
+result looks like a plausible small diff rather than a broken harness. Run the
+fuzz leg alone.
+
+---
+
+## 8. Rough edges found, and where each one lives
+
+Each of these was measured, not predicted, and each is stated with whether it is
+this feature's or pre-existing:
+
+| shape | verdict |
+|---|---|
+| `type Id = new i32` used as a MAP KEY (`{[Id]: i32}`) | `unknown type '{[Id]:i32}'`. **Pre-existing** — a plain `type Id = i32` alias gets the identical error on `d0a13651`. The map-key name grammar admits only the literal spellings; nothing to do with brands. |
+| `{[string]: f32}` + a float-literal `.set` | `set: expected f32, got f64`. **Pre-existing**, reproduced on `d0a13651` with no newtype present. The BRANDED spelling accidentally works (§7.1). |
+| a struct-valued map in a composite program (`{[string]: V}` beside a `V[]` and a `V \| null`) | `emitProgram: unsupported map value type`. **Pre-existing** — identical on `d0a13651` with `new` deleted. The newtype spelling matches the plain spelling exactly. |
+| `type Handle<T> = new i32` | the marker is accepted and ignored — a generic alias registers in a separate table that this phase does not brand. Silent, which is the wrong shape for a rejection; filed, §5. |
+| `x is EntityId` | works when the union's arms are distinguishable by REP (`EntityId \| string`); a newtype has no runtime tag, so it cannot discriminate against its own base. §5. |
+| `Buf` itself (`{base, length}`) | still a plain struct, so still interchangeable with a same-shaped user struct. Pre-existing and unchanged — but the fix is now a one-word edit. |
