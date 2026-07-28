@@ -99,6 +99,8 @@ import {
   orderArgsByParamNames,
   ufcsAliasOf,
 } from "./ast"
+// The free INDEX-OPERATOR declaration-name encoding (B14).
+import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
 // The parser's SPELLING TREE (D-PARSETY, #1117) — what `parseTypeName` saw,
 // before it concatenated it into a name. `tsToTy` resolves from this instead of
 // re-parsing the concatenation.
@@ -1294,6 +1296,26 @@ function mkNegTy(inner: i32) {
 // `inferSawErr` accumulate what a pending body's `return`s / trailing expression
 // yielded (first concrete type wins; an in-cycle call contributes only "err").
 let fnDeclIx: {[string]: i32} = Map()
+// ── free index operators (B14) ───────────────────────────────────────────────
+// Every `function "[]"(self: T, …)` / `function "[]="(self: T, …)` the program
+// declares, as the operator it implements and the (receiver-carrying, possibly
+// merge-mangled) name it declared under — collected by the top-level hoist, so
+// the registry describes the MERGED program and needs no cross-module alias.
+//
+// DISPATCH IS BY THE RECEIVER'S TYPE, not by its spelling: a candidate wins when
+// the receiver is `assignable` to its `self` parameter, the same test UFCS
+// resolution uses. That is what makes two views over one structural shape
+// dispatch apart — their nominal brands are the only difference, and `assignable`
+// is where the brand rule lives.
+let opIdxOps: string[] = []
+let opIdxFns: string[] = []
+// The RESOLVED operator function for one index SITE, keyed by the node the
+// checker resolved it at (an `Index` for a read, the assignment `BinExpr` for a
+// write) and read back by the emitter's dispatch rewrite, so the two never
+// re-derive the choice independently. SPARSE — a program that declares no index
+// operator banks nothing, which is this feature's inertness statement.
+let opIdxSiteNode: i32[] = []
+let opIdxSiteFn: string[] = []
 let inferStack: string[] = []
 let inferObserved = -1
 let inferSawErr = false
@@ -2218,6 +2240,10 @@ export function initChecker() {
   argCstrExp = []
   argCstrWho = []
   fnDeclIx = Map()
+  opIdxOps = []
+  opIdxFns = []
+  opIdxSiteNode = []
+  opIdxSiteFn = []
   moduleGlobals = Map()
   topUnannotFns = []
   gRootStmts = []
@@ -3885,7 +3911,7 @@ function recordRedundantRet(n: FuncDecl, fnIx: i32, ret: i32) {
   redunSCol.push(P.toks[colonTok].col)
   redunELine.push(P.toks[braceTok].line)
   redunECol.push(P.toks[braceTok].col)
-  redunName.push(demangleName(n.fnName))
+  redunName.push(opDeclLabel(demangleName(n.fnName)))
   redunType.push(tyToStr(ret))
   redunTok.push(nameTok)
   0
@@ -10420,6 +10446,135 @@ function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   res
 }
 
+// ── free index-operator resolution (B14) ─────────────────────────────────────
+
+// The tail of the parameter list an index operator wants, for the arity error.
+function opIdxArityTail(op: string) {
+  if op == OP_INDEX_SET { return ", value" }
+  ""
+}
+
+// Does the program declare ANY index operator? The single inertness gate: false
+// for every program that declares none, and then no index expression anywhere
+// does any extra work and nothing is banked.
+function opIdxDeclared() { opIdxFns.length > 0 }
+
+// A type whose indexing is the LANGUAGE's, never a user operator's: arrays,
+// maps, strings, an un-pinned inference hole, and the error type. The swallow
+// lives here — a receiver that answers true reaches the built-in arms exactly as
+// it does with no operator declared anywhere.
+//
+// A newtype over one of these is deliberately INCLUDED (a `new i32[]` still
+// indexes as an array): the brand renames a type, it does not re-open a
+// primitive's syntax.
+function tyBuiltinIndexable(ty: i32) {
+  if ty < 0 { return true }
+  const t = T.tys[ty]
+  if t is TyArray { return true }
+  if t is TyMap { return true }
+  if t is TyVar { return true }
+  if t is TyErr { return true }
+  if t is TyPrim { return t.primName == "string" }
+  false
+}
+
+// The index-operator function `op` dispatches to for a receiver of type
+// `recvTy` — the FIRST declaration whose `self` parameter accepts it — or "" when
+// the program declares none that fits.
+//
+// FIRST-DECLARED WINS, and it is only reachable when two declarations' receivers
+// both accept one value, which for two DECLARED types means one is structurally
+// assignable to the other. Nominal newtypes (the shape `std:buffer`'s views use)
+// are never in that position, since a brand accepts only itself.
+function opIdxFnFor(op: string, recvTy: i32) {
+  if recvTy < 0 { return "" }
+  let i = 0
+  while i < opIdxFns.length {
+    if opIdxOps[i] == op {
+      const nm = opIdxFns[i]
+      const fnTy = lookup(nm)
+      if fnTy >= 0 {
+        // An un-annotated return is still the PENDING sentinel until its body is
+        // checked; force it here, exactly as the UFCS and `a op b` resolutions do,
+        // so a call site ahead of the declaration reads a real return type.
+        const preFt = T.tys[fnTy]
+        if preFt is TyFunc {
+          if preFt.fnRet == -2 {
+            if !onInferStack(nm) {
+              const dIx = fnDeclIx[nm] ?? -1
+              if dIx >= 0 { checkNode(dIx) }
+            }
+          }
+        }
+        const ft = T.tys[fnTy]
+        if ft is TyFunc {
+          const ps = ft.fnParamTypes
+          if ps.length > 0 {
+            if assignable(recvTy, ps[0]) { return nm }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// BANK the resolved operator function on its site node, for the emitter's
+// dispatch rewrite to read back. Only on the REAL pass — a quiet inference probe
+// may resolve against a hole that later pins elsewhere.
+function opIdxBank(siteIx: i32, fn: string) {
+  if inferQuiet { return 0 }
+  if siteIx < 0 { return 0 }
+  let i = 0
+  while i < opIdxSiteNode.length {
+    if opIdxSiteNode[i] == siteIx {
+      opIdxSiteFn[i] = fn
+      return 0
+    }
+    i = i + 1
+  }
+  opIdxSiteNode.push(siteIx)
+  opIdxSiteFn.push(fn)
+  0
+}
+
+// The operator function the checker resolved at index site `ix`, or "" — the
+// emitter's read of the bank above.
+export function opIdxFnAtNode(ix: i32) {
+  if ix < 0 { return "" }
+  let i = 0
+  while i < opIdxSiteNode.length {
+    if opIdxSiteNode[i] == ix { return opIdxSiteFn[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// The declared type of parameter `pi` of the operator function `fn`, or -1.
+function opIdxParamTy(fn: string, pi: i32) {
+  const fnTy = lookup(fn)
+  if fnTy < 0 { return -1 }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    const ps = ft.fnParamTypes
+    if pi < ps.length { return ps[pi] }
+  }
+  -1
+}
+
+// The declared RETURN type of the operator function `fn` (TY_ERR while pending).
+function opIdxRetTy(fn: string) {
+  const fnTy = lookup(fn)
+  if fnTy < 0 { return TY_ERR }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    if ft.fnRet == -2 { return TY_ERR }
+    return ft.fnRet
+  }
+  TY_ERR
+}
+
 // Operator dispatch `a op b` over a STRUCT left operand through the free
 // `self`-function named for the operator (`function +(self, b)` — host parser
 // B13+B14): the function must exist, take exactly (self, right), and its FIRST
@@ -13798,7 +13953,9 @@ function checkProgramNode(n: Program) {
       // exactly like a duplicate `let`/`const` (B16). Without this the later
       // hoist silently overwrites the earlier one and the last body wins.
       if (fnDeclIx[s.fnName] ?? -1) >= 0 {
-        tErr("redeclared " + s.fnName, stmts[hi])
+        // `opDeclLabel` is the identity on an ordinary name; an index operator
+        // reads back as `"[]" for F32View` rather than as its minted spelling.
+        tErr("redeclared " + opDeclLabel(s.fnName), stmts[hi])
       }
       const hp = s.fnParams
       const hpt: i32[] = []
@@ -13836,6 +13993,31 @@ function checkProgramNode(n: Program) {
       }
       declare(s.fnName, mkFuncTy(hpt, hret))
       fnDeclIx[s.fnName] = stmts[hi]
+      // REGISTER a free index operator (B14). Its ARITY is fixed by the operator
+      // — `"[]"` is (self, index), `"[]="` is (self, index, value) — and checking
+      // it here means a malformed declaration is reported once, at itself, rather
+      // than at every use site that fails to resolve.
+      const opk = opDeclOpOf(s.fnName)
+      if opk != "" {
+        let want = 2
+        if opk == OP_INDEX_SET { want = 3 }
+        if hp.length != want {
+          tErr(
+            "operator " +
+              opDeclLabel(s.fnName) +
+              " takes " +
+              i32ToStr(want) +
+              " parameters (self, index" +
+              opIdxArityTail(opk) +
+              "), got " +
+              i32ToStr(hp.length),
+            stmts[hi],
+          )
+        } else {
+          opIdxOps.push(opk)
+          opIdxFns.push(s.fnName)
+        }
+      }
       // Collect un-annotated returns (hoisted as the `-2` pending sentinel) for the
       // return-inference pre-pass.
       if hret == (-2) { topUnannotFns.push(stmts[hi]) }
@@ -18293,6 +18475,42 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
           tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
         }
       }
+      // FREE INDEX-WRITE OPERATOR (B14): `x[i] = v` resolves to a
+      // `function "[]="(self: T, i: I, v: V)` by the receiver's TYPE. Banked on
+      // THIS assignment node, not on the target `Index` — the target keeps the
+      // READ resolution it was checked with, which is what `x[i] += v` needs
+      // (its desugaring reads through the very same `Index` node).
+      if opIdxDeclared() {
+        if !tyBuiltinIndexable(arrTy0) {
+          const wfn = opIdxFnFor(OP_INDEX_SET, arrTy0)
+          if wfn != "" {
+            const vt = opIdxParamTy(wfn, 2)
+            if vt >= 0 {
+              if !assignableExpr(n.binRight, rt, vt) {
+                tErr(
+                  "index write: expected " + tyToStr(vt) + ", got " + tyToStr(rt),
+                  ix,
+                )
+              }
+            }
+            opIdxBank(ix, wfn)
+            return rt
+          }
+          // A READ operator with no WRITE one: name the missing half, exactly as
+          // the closure-FIELD trap does below.
+          const rOnly = opIdxFnFor(OP_INDEX_GET, arrTy0)
+          if rOnly != "" {
+            tErr(
+              "no \"" +
+                OP_INDEX_SET +
+                "\" operator for index assignment on " +
+                tyToStr(arrTy0),
+              ix,
+            )
+            return TY_ERR
+          }
+        }
+      }
       // Index WRITE trap (B13, host `indexTrap` "[]="): `o[k] = v` on an
       // object that declares `"[]="` checks the value against the method's
       // VALUE parameter (index/wrong-value-type.vl rejects); an object with
@@ -19909,6 +20127,44 @@ function checkIndexNode(n: Index, ix: i32) {
     }
     noteArrayDemand(at.tvName)
     return mkDerivedHole(HD_ELEM, "", -1, -1, arrTy)
+  }
+  // FREE INDEX OPERATOR (B14): `x[i]` on a receiver the LANGUAGE does not index
+  // resolves to a `function "[]"(self: T, i: I)` by the receiver's TYPE. Checked
+  // before the closure-FIELD trap below, mirroring the `a op b` arm's order (a
+  // free operator function outranks an operator field).
+  if opIdxDeclared() {
+    if !tyBuiltinIndexable(arrTy) {
+      const rfn = opIdxFnFor(OP_INDEX_GET, arrTy)
+      if rfn != "" {
+        const kt = opIdxParamTy(rfn, 1)
+        if kt >= 0 {
+          if !assignableExpr(n.idxIndex, idxTy, kt) {
+            tErr(
+              "index: expected " + tyToStr(kt) + ", got " + tyToStr(idxTy),
+              ix,
+            )
+          }
+        }
+        opIdxBank(ix, rfn)
+        return opIdxRetTy(rfn)
+      }
+      // A WRITE operator with no READ operator is not a usable type: the
+      // assignment form checks its target as an ordinary index expression, so
+      // `x[i] = v` would report "cannot index" and name the wrong half. Say
+      // which half is missing instead.
+      const wOnly = opIdxFnFor(OP_INDEX_SET, arrTy)
+      if wOnly != "" {
+        tErr(
+          "operator " +
+            opDeclLabel(wOnly) +
+            " needs a matching \"" +
+            OP_INDEX_GET +
+            "\" operator — an index that cannot be READ cannot be written either",
+          ix,
+        )
+        return TY_ERR
+      }
+    }
   }
   // Index TRAP (B13, host parser `indexTrap`): a user object that declares a
   // `"[]"` method handles `o[k]` itself — the key checks against the

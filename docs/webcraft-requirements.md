@@ -225,7 +225,7 @@ unsigned variants `divU`, `remU`, `ltU/leU/gtU/geU` (`>>>` already exists).
 
 ## P1 — gates the port being good (perf + core ergonomics)
 
-### P1.1 Typed views over Buffer  🟡 SHIPPED, minus the bracket sugar
+### P1.1 Typed views over Buffer  ✅ SHIPPED, bracket included
 
 ```vl
 const x  = buf.f32view(offset, count)   // F32View
@@ -241,14 +241,17 @@ experience — workable, error-prone, and the thing most worth absorbing into
 the language. Views are also the natural unit for aliasing the render-publish
 ring and for the differential harness to diff columns.
 
-> Maintainer's note (vl side): **the views ship; `x[i]` does not.** In `std:buffer`,
-> pure VL, **zero compiler lines** — `refresh-compiler.sh --prove-fixpoint` reports
-> the compiler binary byte-identical. `buffer-design.md` §L.
+> Maintainer's note (vl side): **the views ship, and so does the bracket.** The
+> views are `std:buffer`, pure VL, zero compiler lines; `x[i]` / `x[i] = v` are
+> ROADMAP B14's free INDEX OPERATORS, which are compiler lines and are general —
+> they land the bracket for every user type at once, not for views.
+> `buffer-design.md` §L, `index-operator-design.md`.
 >
 > ```vl
 > const x = buf.f32view(off, count)     // F32View
-> x.setF32(i, v) ; const a = x.getF32(i) ; x.length
-> const id = buf.i32view(off, count)    // I32View: getI32 / setI32
+> x[i] = v ; const a = x[i] ; x.length  // the spec's spelling
+> x.setF32(i, v) ; const b = x.getF32(i)  // the accessor spelling, still there
+> const id = buf.i32view(off, count)    // I32View: the same two spellings
 > const addr = x.byteAddrF32(i)         // the absolute byte address, unchecked
 > ```
 >
@@ -266,18 +269,21 @@ ring and for the differential harness to diff columns.
 >   emitted bytes are unchanged by the `new`, and collapsing the two shapes back
 >   into one took a wasm heap type OUT (−12 bytes per view program). §P1.5.
 > - **`x[i]` is purely syntactic, and it is a language feature, not a views
->   feature.** Under every dispatch route VL has or plans, `x[i]` lowers to
->   exactly the call `x.getF32(i)` already lowers to. Four routes were probed;
->   all four are blocked or wrong (§L5), and the right one — ROADMAP B14,
->   free `self`-functions named for an operator — is blocked on the parser
->   (`function "[]"(self: V, i: i32)` does not parse today) and on operator
->   lookup surviving the module merge. Filed with the design. **The kernel
->   ergonomics P1.1 is after are available now**, at the same codegen; what is
->   missing is the bracket.
-> - **`x[i] += vx[i]` re-evaluates its receiver and index** under any bracket
->   route, because the parser desugars a compound assignment to
->   `x[i] = x[i] + vx[i]` over one shared target node. Harmless for a local and
->   an induction variable; not harmless for `x[f()] += 1`.
+>   feature.** It lowers to exactly the call `x.getF32(i)` already lowers to.
+>   `std:buffer` declares four one-line operators
+>   (`function "[]"(self: F32View, i: i32): f32 { return getF32(self, i) }`) and
+>   the compiler resolves the bracket by the receiver's TYPE, which is what lets
+>   the two views — structurally identical, distinguished only by P1.5's brand —
+>   carry different operators. Measured, `x[i]` and `getF32(x, i)` build modules
+>   that differ in TWO bytes: the `call` immediate, because the bracket goes
+>   through the one-line forward. That extra call is what `-O3 --closed-world`
+>   removes (§P1.3's flag, same as everything else in this tier).
+> - **`x[i] += vx[i]` re-evaluates its receiver and index**, because the parser
+>   desugars a compound assignment to `x[i] = x[i] + vx[i]` over one shared target
+>   node. Measured: this is already true of a NATIVE array (`a[idx()] += 10` calls
+>   `idx()` twice), so the bracket inherits the rule rather than adding one.
+>   Harmless for a local and an induction variable; not harmless for
+>   `x[f()] += 1`.
 >
 > **Bounds, and the price** (this is also P1.4's answer, below): a view IS fenced
 > — the only fenced thing in the tier — because its failure mode is the one the
@@ -365,11 +371,14 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 >   type PARAMETER at each instantiation, which needs generic `flat` types (a type
 >   parameter has no width, so they reject today) and a fold that runs after
 >   monomorphization. Filed with the design.
-> - **`stack[i].tt` is NOT here, and it is blocked on exactly what P1.1's `x[i]` is
->   blocked on** — B14's free `self`-functions named for an operator, where
->   `function "[]"(self: V, i: i32)` does not parse and the emitter's operator arm
->   is unreachable dead code. It is additionally harder, because it must FUSE an
->   index and a field into one load rather than materializing a row.
+> - **`stack[i].tt` is NOT here, but its blocker is gone.** B14's free INDEX
+>   OPERATORS now ship (`index-operator-design.md`), so `stack[i]` is writable the
+>   moment `Stack` has a `function "[]"(self: Stack, i: i32): Row`. What remains is
+>   the SECOND half, and it is the interesting one: `.tt` on that row must be an
+>   offset add rather than a materialized value. With `flat` constants that looks
+>   natural — have the operator return a row-ADDRESS newtype and give the field
+>   accessors offsets off it — and it is now a design question rather than a
+>   blocked one.
 >
 > **What that leaves you with today is the whole Lua accessor set, hand-written
 > once per record**, with every address derived from the declaration — pinned as

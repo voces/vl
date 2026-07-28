@@ -43,6 +43,9 @@
 // cursor primitives stay PRIVATE to this module.
 import { mkMatch } from "./ast"
 import { BinExpr, Ident, P, Tok, mkDeclNameTok } from "./ast"
+// The free INDEX-OPERATOR declaration-name encoding (B14) — the parser is where
+// `function "[]"(self: T, …)` gets the receiver-carrying name it declares under.
+import { OP_INDEX_GET, OP_INDEX_SET, Param, TypeRef, opDeclName } from "./ast"
 // The type-SPELLING side arena — the structure `parseTypeName` builds while it
 // recurses, recorded instead of being thrown away with the string it returns.
 import {
@@ -1624,9 +1627,48 @@ function parseFuncTail(
   funcPos: i32,
 ) {
   const params = parseParamList()
+  // An INDEX-OPERATOR declaration is named for its RECEIVER as well as its
+  // operator, so several may coexist (`ast.vl`'s `opDeclName`). The receiver is
+  // the `self` parameter, which is why the mint waits for the parameter list.
+  let dname = name
+  if name == OP_INDEX_GET || name == OP_INDEX_SET {
+    dname = indexOpDeclName(name, params, nameTok)
+  }
   let ret = -1
   if accept("COLON") { ret = parseType() }
-  parseFuncBodyAndBuild(name, typarams, params, ret, nameTok, funcPos)
+  parseFuncBodyAndBuild(dname, typarams, params, ret, nameTok, funcPos)
+}
+
+// The minted declaration name for an index-operator function — the operator
+// plus the `self` parameter's ANNOTATION SPELLING. The annotation is REQUIRED:
+// the operator dispatches on the receiver's type, and an un-annotated `self` is
+// an inference hole that would accept every receiver, which is both an
+// un-mintable name and a dispatch nobody could predict.
+function indexOpDeclName(op: string, params: i32[], nameTok: i32) {
+  let recv = ""
+  if params.length > 0 {
+    const p0 = P.nodes[params[0]]
+    if p0 is Param {
+      if p0.parName == "self" {
+        if p0.parType >= 0 {
+          const tr = P.nodes[p0.parType]
+          if tr is TypeRef { recv = tr.tyName }
+        }
+      }
+    }
+  }
+  if recv == "" {
+    P.diags.push(
+      {
+        msg: "an index operator needs an annotated `self` parameter — write `function \"" +
+          op +
+          "\"(self: T, …)` (the receiver TYPE is what it dispatches on)",
+        at: nameTok,
+      },
+    )
+    return op
+  }
+  opDeclName(op, recv)
 }
 
 // Lookahead from a `(` in expression position: is this an arrow-lambda parameter
@@ -1693,10 +1735,29 @@ function isOpFuncName(kind: string) {
     kind == "NE"
 }
 
+// The operator names a QUOTED function name may spell — the symbol-token set
+// above plus the two BRACKET operators, which have no token spelling at all.
+function isStrFuncName(name: string) {
+  name == OP_INDEX_GET ||
+    name == OP_INDEX_SET ||
+    name == "+" ||
+    name == "-" ||
+    name == "*" ||
+    name == "/" ||
+    name == "%" ||
+    name == "^" ||
+    name == ">" ||
+    name == ">=" ||
+    name == "<" ||
+    name == "<=" ||
+    name == "==" ||
+    name == "!="
+}
+
 // `"function" IDENT? "<" typarams? ">" …tail` — the shared head of the two
-// `function`-keyword forms: an optional name (an identifier or an operator
-// symbol; required for a declaration, optional for an expression), optional
-// generic type parameters, then the common `parseFuncTail`.
+// `function`-keyword forms: an optional name (an identifier, an operator symbol,
+// or a quoted operator; required for a declaration, optional for an expression),
+// optional generic type parameters, then the common `parseFuncTail`.
 function parseFuncHead(requireName: boolean) {
   const p0 = peekTok().start // the `function` keyword
   advance()                  // "function"
@@ -1710,6 +1771,33 @@ function parseFuncHead(requireName: boolean) {
     // case, so `function <(a, b)` reads the `<` as the name (host order).
     nameTok = P.pos
     name = advance().text
+  } else if peekKind() == "STRING" {
+    // A STRING-LITERAL operator name (`function "[]"(self: V, i: i32)`). This is
+    // the ONLY spelling the bracket operators have — `[` and `]` open an index
+    // expression everywhere else, so they cannot be a name TOKEN — and it is the
+    // same spelling their closure-FIELD form already uses (`{ "[]": … }`). The
+    // symbol-token operators accept it too, so `function "+"(self, b)` and
+    // `function +(self, b)` name the same function.
+    nameTok = P.pos
+    // A token's `text` is its RAW source span, so strip the quotes — the same
+    // equivalence the STRING object-literal KEY relies on (an operator lexeme
+    // carries no escapes).
+    const rawName = advance().text
+    name = rawName.slice(1, rawName.length - 1)
+    if !isStrFuncName(name) {
+      P.diags.push(
+        {
+          msg: "a quoted function name must be an operator (" +
+            OP_INDEX_GET +
+            ", " +
+            OP_INDEX_SET +
+            ", +, -, *, /, %, ^, ==, !=, <, <=, >, >=), not \"" +
+            name +
+            "\"",
+          at: nameTok,
+        },
+      )
+    }
   } else if requireName {
     expect("IDENT")
   }

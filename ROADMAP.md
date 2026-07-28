@@ -102,11 +102,11 @@ hatch").** All four are prerequisites for each other in practice:
   be a policy choice in its last bit, i.e. a determinism trap.
 
 **P1 — gates the port being GOOD.**
-- 🟡 **P1.1 Typed views over Buffer** (`buf.f32view(off, count)`, `.length`) — the kernel is
-  structure-of-arrays; this is "the thing most worth absorbing into the language". SHIPPED in
-  `std:buffer` with **zero compiler lines**; the `x[i]` BRACKET is filed, blocked on the same B14
-  operator route below (`function "[]"(self, i)` does not parse and `emit_rewrite.vl`'s operator arm
-  is unreachable dead code). `buffer-design.md` §L.
+- ✅ **P1.1 Typed views over Buffer** (`buf.f32view(off, count)`, `.length`, `x[i]`, `x[i] = v`) —
+  the kernel is structure-of-arrays; this was "the thing most worth absorbing into the language".
+  The views are `std:buffer` with **zero compiler lines**; the BRACKET is B14's free index
+  operators, which land it for every user type at once. `buffer-design.md` §L,
+  `index-operator-design.md`.
 - 🟡 **P1.2 `flat` record layouts (AoS)** — declared field order = layout, fixed sizes, no reordering,
   scalars and nested `flat` only. The C-struct tier **WasmGC structurally cannot provide**. Forcing
   customer is a Lua 5.3 VM needing bit-exact `pairs()` order. The DECLARATION half ships:
@@ -116,9 +116,11 @@ hatch").** All four are prerequisites for each other in practice:
   emits byte-identically to the same one without it. **No implicit padding**: offsets are the
   running sum of declared widths (the spec's own explicit `pad` field is the argument, and
   unaligned access is legal in wasm). REMAINING: `buf.rows<T>(off, count)` (needs `T.size` for a
-  type PARAMETER, which needs generic `flat` types) and the `stack[i].tt` sugar (the same blocked
-  B14 route as P1.1's bracket). Both are boilerplate rather than expressiveness — the accessor set
-  is writable today. `docs/internals/flat-records-design.md`.
+  type PARAMETER, which needs generic `flat` types) and the `stack[i].tt` sugar — whose B14 blocker
+  is GONE (`stack[i]` is writable now, via a free `"[]"`), leaving only the FUSION half: `.tt` on the
+  indexed row must be an offset add rather than a materialized row, which a row-ADDRESS newtype plus
+  `flat`'s folded field offsets should give naturally. Both are boilerplate rather than
+  expressiveness — the accessor set is writable today. `docs/internals/flat-records-design.md`.
 - ⬜ **P1.3 Optimization defaults** — Heap2Local in the blessed pipeline + a documented release
   profile (`--closed-world -O3 --gufa`). Our union boxes and `{backing,len,cap}` wrappers **must melt**
   in per-tick scratch code or alloc-free-steady-state becomes "avoid half the language".
@@ -574,9 +576,17 @@ in-language GC knobs.
 - ⬜ **B12. `async`/`await`.** Keywords lexed; no semantics/codegen. Large; likely last.
 - 🟡 **B13. Well-known-symbol dispatch.** REMAINING: callable objects (`"()"`).
 - ⬜ **B13a. Multi-index matrix idiom** (low priority). Single-bracket `m[i, j]` → multi-arg
-  `"[]"`/`"[]="` + flat-backed `Matrix`/`Grid` type. Nested `m[i][j]` already composes today.
-- 🟡 **B14. Methods via explicit `self` + UFCS.** REMAINING: route operator dispatch (B13) through
-  self-methods; `c.area` (no `()`) as a bound value; mutation/variance (A9).
+  `"[]"`/`"[]="` + flat-backed `Matrix`/`Grid` type. Nested `m[i][j]` already composes today —
+  including over B14's free index operators, where the outer receiver is the inner operator's return
+  type (`tests/cases/index/operator-overload-by-receiver.vl`).
+- 🟡 **B14. Methods via explicit `self` + UFCS.** Free INDEX OPERATORS ship — `function "[]"(self: T,
+  i: I)` / `function "[]="(self: T, i: I, v: V)` make `x[i]` / `x[i] = v` a direct call, dispatched
+  by the receiver's TYPE (so two receivers with the identical structure dispatch apart on their
+  nominal brands), overloadable per receiver, and merge-safe across modules.
+  `docs/internals/index-operator-design.md`. REMAINING: route the ARITHMETIC/comparison operator
+  dispatch (B13) through the same registry — a free `function +(self, b)` works single-file but is
+  NOT found across the module merge (`lookup(op)` uses the raw name; measured); `c.area` (no `()`)
+  as a bound value; mutation/variance (A9).
 - 🟡 **B15. Lambdas + declaration-vs-value.** SELF-HOST function-value ABI shipped (#306: `call_ref`
   + closure struct, non-capturing + capturing; design `docs/internals/selfhost-lambdas-design.md`); escaping
   closures + function-valued struct fields shipped (#310); `.map`/`.filter` EMIT is the next slice

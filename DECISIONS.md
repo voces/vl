@@ -248,6 +248,15 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 - **Operator / call / index dispatch via well-known methods**, resolved
   statically (no runtime `Proxy`): `"+"`, `"()"`, `"[]"`/`"[]="` are typed
   methods in a shape's contract. (B13)
+- **Index operators are FREE functions dispatched by receiver type, and are the
+  one place ad-hoc overloading is allowed.** `function "[]"(self: T, i: I)` beats
+  a closure FIELD because it is a direct call rather than an indirect one through
+  a per-value allocation. Several may share an operator — one per receiver — which
+  the general no-overloading rule above forbids for named functions; the exception
+  is bounded by there being no name to overload (a bracket names nothing, so the
+  receiver type is the only possible key) and it is what lets two nominal newtypes
+  over one structure carry different operators. The `self` annotation is required:
+  it IS the dispatch key. (B14)
 - **Size members follow the uniform-access principle.** `length` is a contract
   member via property syntax, dispatched to a native lowering (not a structural
   field — that broke index-sig subtyping). Property syntax (no parens) is
