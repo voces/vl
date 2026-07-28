@@ -1,0 +1,161 @@
+// @run
+// @hint Intentionally-unused parameter
+// THE NUMERIC HALF of the un-annotated union-callback PIN, which two predicates cannot see.
+// Three lines are the whole repro, and the type declared on the first one is never used:
+//
+//     type Z = 0 | 1
+//     function apply(f: (i32 | string) => i32): i32 { return f(1) }
+//     print(apply((_k) => 7))
+//   → vl check rc=0, clean; vl build rc=0; vl run → "wasm trap: cast failure"
+//
+// Move that `type Z` line BELOW a `type V = i32 | string` and the identical program is
+// correct. This is `#1270`'s defect verbatim — the pin picked by DECLARATION ORDER, reading
+// as a curse on the file rather than on the program — reproduced on the axis its 140-cell
+// grid did not carry. `unionParamPinName` skipped a litunion `unNames` row when choosing the
+// BOXED pin, and its skip is `nameIsLitUnionType`, which is STRING-ONLY: `tyIsLitUnion`
+// rejects any member whose `litKind != "str"`, so every NUMERIC literal union answers "not a
+// litunion" and a `type Z = 0 | 1` row was offered as a box it is not.
+//
+// A NUMERIC litunion is a THIRD rep, not a spelling of either of the other two: a boxed union
+// is the shared `{tag, value}` `$uBox`, a STRING litunion is an interned i32 ATOM, and
+// `type Z = 0 | 1` is its plain BASE SCALAR (`numLitUnionBaseName` — `i32` / `i64` / `f64`).
+// So the selector needs the numeric answer in BOTH of its directions, and the file mirrors
+// `#1270`'s pair exactly: this file is the litunion-row-FIRST half, and
+// `closure-numeric-litunion-param-pin-boxed-first.vl` is the boxed-row-first half, where the
+// numeric PARAM is the one mis-pinned.
+//
+// WHAT `#1273` ALREADY CLOSED, and why the pin is not covered by it. `#1273` made
+// `canonEmitName` canon the INTERIOR of a function type, so `(Z) => i32` reaches the emitter
+// as `(i32) => i32` and the two annotation-side `$fnsig` producers (`annParamKind`,
+// `annRetKind`) never see the alias at all. That closed the whole FUNC-NESTED family: the
+// five-line `run(m: (Z) => i32)` / `print(run((z) => 3))` trap, its `const zf: (Z) => i32`
+// value-binding twin, and the `(i32) => Z` result direction. It does NOT reach this selector,
+// because canon rewrites the NAMES in annotations and `unionParamPinName` reads neither — it
+// reads the registered `unNames` ROWS and the type ARENA. Numeric-litunion arms added to
+// `annParamKind` and `annRetKind` were built and MEASURED INERT on top of `#1273`
+// (byte-identical on 1,602 corpus files x six channels and on the 120-cell grid below), so
+// they were removed rather than shipped; the notes at both sites say so, with the witness.
+//
+// TWO OUTCOME CLASSES off the one selector, chosen by the lambda BODY: the param UNUSED is a
+// cast-failure TRAP (the value call's `ref.cast` finds a scalar where the box was declared),
+// and the param USED is INVALID WASM ("type mismatch: expected i32, found (ref $type)", and
+// "expected i32, found f64" on the float base, where the mis-pinned lambda feeds a callee that
+// took the softened scalar).
+//
+// THE ANNOTATED TWIN IS A WEAK CONTROL AND MUST NOT BE READ AS A STRONG ONE. It is correct on
+// master in every cell below — but for the un-annotated PARAM cells it is correct because the
+// annotation lets the HOF specialize to a DIRECT call, which never reaches the value-call ABI
+// at all. On the pre-`#1273` master the annotated `(z: Z) => 3` printed 3 while the same
+// lambda bound to a `const` first trapped, one type and two routes. `zf` below is kept as the
+// binding form for that reason even though `#1273` made it green.
+//
+// THE GRID, 120 cells: litunion BASE (`0|1` / `1.5|2.5` / `"a"|"b"` / `0|1|null` / `0|"a"`) x
+// SPELLING (declared alias / inline members) x DECLARATION ORDER (litunion alone / a boxed
+// alias above it / a boxed alias below it) x LAMBDA FORM (param unused / param used) x
+// annotated-vs-bare. Master `5770d913` has 12 wrong; all 12 are numeric, all 12 are bare, and
+// all 12 are correct now with NO cell backward. They are exactly the two directions of the
+// selector that survive `#1273`:
+//   · the 4 `boxfirst` `0|1` cells — the numeric PARAM pinned to the first BOXED row.
+//   · the 8 `1.5|2.5` cells — the float base, wrong in EVERY declaration order, because the
+//     un-pinned param defaults to i32 and the base is f64. (`alone` needs no boxed row to go
+//     wrong, which is why the float base is the cell that proves the pin carries the BASE and
+//     not merely "not the box".)
+// Unchanged: the 24 string cells, the 24 mixed `0|"a"` cells, the 12 nullable-litunion ALIAS
+// cells, and every one of the 60 annotated cells.
+//
+// STILL OPEN, measured and deliberately absent below:
+//   · a numeric litunion ARRAY (`type Z = 0 | 1` then `(Z[]) => i32`) is invalid wasm — but
+//     `Z[]` does not work in its DIRECT form either (`function take(a: Z[])` is a loud emit
+//     error), so it is the element rep that is missing, not this ABI.
+//   · an INLINE nullable numeric litunion (`(0 | 1 | null) => i32`) traps, in every
+//     declaration order and on master alike. It never reaches this selector — a `TyNullable`
+//     is not a `TyUnion`, so it takes the nullable arm one arm down — and it is the numeric
+//     twin of the nullable-litunion ALIAS row `#1270` left open.
+type Z = 0 | 1
+type W = 1.5 | 2.5
+type V = i32 | string
+
+function sinkZ(_v: Z) { 2 }
+
+function sinkW(_v: W) { 4 }
+
+function sinkV(_v: i32 | string) { 6 }
+
+// ── THE POISONED BYSTANDER: a genuinely BOXED callback, broken by the numeric row alone ────
+// `unNames[0]` is `Z`, and the boxed pin loop skipped only STRING litunion rows — so the
+// `(i32 | string)` param was pinned to the numeric alias, whose rep is a plain i32. Delete
+// `type Z` from this file, or move it below `type V`, and the identical program is correct on
+// master: the input was the declaration order, not the program. (`#1270`'s defect verbatim.)
+function applyV(f: (i32 | string) => i32): i32 { return f(1) }
+
+// @log 1
+print(applyV((_k) => 1))
+// @log 6
+print(applyV((k) => sinkV(k)))
+
+// ── the numeric litunion param itself, both bases and both lambda forms ─────────────────────
+// The `0|1` cells are GREEN on master in THIS declaration order (`#1273` canons the function
+// type's interior, and with no boxed row above it the un-pinned i32 default already agrees
+// with the canon'd annotation) — they are here as the order half of the pair, and the mirror
+// file carries the order where they red. The `1.5|2.5` cells are NOT: the un-pinned default is
+// i32 and the base is f64, so the float base reds here with no boxed row in sight.
+function applyZ(f: (Z) => i32): i32 { return f(1) }
+
+// @log 3
+print(applyZ((_z) => 3))
+// @log 2
+print(applyZ((z) => sinkZ(z)))
+
+function applyW(f: (W) => i32): i32 { return f(1.5) }
+
+// @log 7
+print(applyW((_z) => 7))
+// @log 4
+print(applyW((z) => sinkW(z)))
+
+// The INLINE spelling needs no split from the alias one, unlike the string half: both soften
+// to the SAME base scalar (an alias name that is not an atom identity has nothing to
+// preserve), so `numLitUnionBaseName` answers once for both.
+function applyI(f: (0 | 1) => i32): i32 { return f(1) }
+
+// @log 9
+print(applyI((_z) => 9))
+
+// ── THE VALUE BINDING and THE RESULT TWIN — both `#1273`'s, both kept as CONTROLS ──────────
+// Neither reds on `5770d913`, and both are recorded here rather than dropped because each was
+// a live invalid module one commit ago and each is the shape a future change to this selector
+// would break first. The binding is what forces the value call that HOF specialization hides
+// from the annotated form; the result direction is reachable ONLY through a NAMED function,
+// because every LAMBDA spelling of a `(i32) => Z` callback is rejected by the CHECKER
+// ("expected (i32) -> 0 | 1, got (i32) -> i32") — which is exactly what made that position
+// look unreachable when it was not. Checking a twin is not the same as checking one SPELLING
+// of the twin.
+const zf: (Z) => i32 = (_z: Z) => 11
+
+// @log 11
+print(applyZ(zf))
+
+function mkZ(_n: i32): Z { 1 }
+
+function runR(m: (i32) => Z): i32 {
+  const r = m(1)
+  const s = r + 4
+  return s
+}
+
+// @log 5
+print(runR(mkZ))
+
+// ── HIGHER ORDER: the callback's own callback carries the alias ─────────────────────────────
+function passZ(g: ((Z) => i32) => i32): i32 { return g((_z) => 13) }
+
+// @log 13
+print(passZ(applyZ))
+
+// ── CONTROLS: the specialized annotated twins, correct on master and unchanged ─────────────
+// @log 3
+print(applyZ((_z: Z) => 3))
+// @log 1
+print(applyV((_k: i32 | string) => 1))
+// @log 7
+print(applyW((_z: W) => 7))
