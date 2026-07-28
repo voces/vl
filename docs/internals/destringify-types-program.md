@@ -29099,7 +29099,7 @@ inflated by naming an inline operation. The 14 duplicated operations, in size or
 | 3 | `X[0] == '"'` (quoted-leaf test) | `typecheck`, `wasmEmit` x2 |
 | 2 | `X.slice(1, fa - 1)` (function-type PARAM list) | `emit_base`, `typecheck` |
 | 2 | `X.slice(fa + 2, X.length)` (function-type RETURN) | `emit_base`, `typecheck` |
-| 2 | `X.slice(1, n - 1)` | `emit_base`, `emit_classify` |
+| 2 | `X.slice(1, n - 1)` — **NOT a separate operation: this IS W1 with a hoisted length, and BOTH members are W1 sites the worklist below therefore under-counted.** Closed by #1243 (`emit_classify.rlCanonLitUnionAtoms`) and #1245 (`emit_base.annObjFieldSplit`), one slice each, both found by hand after the worklist sent them looking for one site too few. **A future census must normalise the LENGTH EXPRESSION as well as the receiver.** | `emit_base`, `emit_classify` |
 | 2 | `X.slice(0, ltAt)` (generic HEAD again, other spelling) | `emit_classify`, `typecheck` |
 | 2 | `X.slice(0, X.length - 2)` (**this IS `arrElemNameRaw`**) | `emit_classify` x2 |
 | 2 | `X.slice(colonAt + 1, X.length)` (field TYPE after `:`) | `typecheck` x2 |
@@ -29133,7 +29133,7 @@ grammar has it".
 
 | # | family | sites | file · function | what it parses | home it should ask | legal? |
 |---|---|---:|---|---|---|---|
-| **W1** | **the GROUP-INTERIOR peel** | **18** | `emit_base.normTypeAtom` / `nameIsStructWithUnionField` / `nameIsStructWithLitUnionField` · `emit_classify.rlElemCloSigKey` / `cloArrSlotRetName` / `shapeFieldParse` / `funcTypeShapeLowerable` / `variantNestedShapeOk` / `internNonLowerableFieldShapes` / `internShapeFieldElems` / `internInlineShape` / `internShapeAs` · `emit_collect.shapeHasCloField` / `collectShapeVariantFields` · `typecheck.litMemberTy` / `nameToTyReal` / `canonShapeName` / `canonEmitNameAt` | the interior of a one-character-delimited group — a `{…}` shape body, a `(…)` group, a `"…"` quoted member | a new CUT `groupInnerOf(name)` in **`tyname.vl`**. The leaf already owns every SPAN TEST (`nameIsBraceSpanEnds`, `nameIsParenSpanEnds`, `nameIsMapSpanEnds`) and no interior CUT — the exact "test half homed, cut half not" shape D-ARRELEM found for the array grammar | **LEGAL** — all four modules import `tyname` |
+| **W1** ✅ **CLOSED** (#1243 / #1245 / this slice) | **the GROUP-INTERIOR peel** | **18 as censused; 22 as built** — `emit_classify` 10 (not 9) · `emit_base` 4 (not 3) · `typecheck` **6** (not 4, and not #1245's 5) · `emit_collect` 2, **plus** 2 home-column writings inside `tyname` itself | `emit_base.normTypeAtom` / `nameIsStructWithUnionField` / `nameIsStructWithLitUnionField` / **`annObjFieldSplit`** · `emit_classify.rlElemCloSigKey` / `cloArrSlotRetName` / `shapeFieldParse` / `funcTypeShapeLowerable` / `variantNestedShapeOk` / `internNonLowerableFieldShapes` / `internShapeFieldElems` / `internInlineShape` / `internShapeAs` / **`rlCanonLitUnionAtoms`** · `emit_collect.shapeHasCloField` / `collectShapeVariantFields` · `typecheck.litMemberTy` / `nameToTyReal` / `canonShapeName` / `canonEmitNameAt` / **`litUnionPreserve`** / **`tsToTyReal`** | the interior of a one-character-delimited group — a `{…}` shape body, a `(…)` group, a `"…"` quoted member. **MEMBERSHIP IS BY THE OPERAND'S LANGUAGE**: a peel off a TYPE NAME is in (including a quoted literal member, whether it arrives as a rendered name or as `tsText` at a `TS_LITSTR` node — `ast.tsToName` returns that field verbatim); a peel off an EXPRESSION lexeme (`StrLit.strText` in `typecheck.litTyOfExpr` / `checkMatchExprNode`, and the same writings in `parser.vl` / `format.vl`) is out, because routing it would owe `tyname` an import those modules have no other reason to hold | the CUT `groupInnerOf(name)` in **`tyname.vl`**, built by #1243. The leaf already owned every SPAN TEST (`nameIsBraceSpanEnds`, `nameIsParenSpanEnds`, `nameIsMapSpanEnds`) and no interior CUT — the exact "test half homed, cut half not" shape D-ARRELEM found for the array grammar | **LEGAL** — all four modules import `tyname` |
 | **W2** | the GENERIC-APPLICATION cut | 11 | `driver.modGenBase` · `emit_base.annGenAppDecompose` · `emit_collect.gaeCollectDecls` · `emit_classify.gaeEnsure` · `typecheck.nameToTyReal` / `nameIsGenAppOfDecl` / `checkProgramNode` | `Head<A,B>` into head name and argument text | `gaeHeadNameOf` / `gaeArgsTextOf` in **`tyname.vl`**, beside the `gaeLtAt` index that is already there | **LEGAL** — driver / emit_base / emit_collect / emit_classify / typecheck all import `tyname` |
 | **W3** | the QUOTED-LEAF test | 8 | `emit_base.isLitVariantName` / `nulLitUnionInnerName` · `typecheck.litMemberTy` / `nameIsInlineLitUnion` · `wasmEmit.emitIs` / `emitUnionLitIs` · `driver.modTypeRenamed` | "is this atom a string-literal member" (`name[0] == '"'`) | `nameIsQuotedLeaf(name)` in **`tyname.vl`** — the leaf already owns the `"` alphabet via its private `skipQuotedName` | **LEGAL, with one new import**: `wasmEmit.vl` does not import `tyname` today. Adding it cannot cycle — `tyname` has zero imports |
 | **W4** | the FUNCTION-ARROW cut | 7 | `emit_base.annFnDecompose` / `annRetNameOf` · `emit_classify.shapeFieldTypeCompat` · `typecheck.canonEmitNameAt` x2 | `(p…) => ret` into the param list and the return, given the arrow index | the CUT pair in **`tyname.vl`** | **the obvious route is ILLEGAL, the correct one is legal.** Routing `typecheck` to `emit_base.annArrowAt` is an UP-move (`emit_base` imports `typecheck`). Moving `isTopLevelFuncTypeName` down is blocked — it writes the `funcArrowAt` module bank. But the CUT *given an index* is pure, so **the cut moves to `tyname` and the index stays where it is** |
@@ -30156,3 +30156,217 @@ only instrument that could see it**, which is why a behaviour change is not meas
 * **The census's normalisation has a resolution, and it has now cost two consecutive slices the same
   site-shape.** #1243 said so and recorded the fix (one entry in one list plus an index-expression
   root). The fix was not made, and the next slice reading the same worklist lost the same way.
+
+## W1's LAST SHARE + the NARROWED-GUARD BINDING miscompile — `typecheck`'s six route (the census split one operand's two spellings), and #1247's in-source note becomes a 440-cell grid with an anchor (off master `ea1767d`)
+
+Two slices, two commits, two burdens of proof: a routing whose burden is **inertness**, and a
+defect investigation whose burden is a **grid with controls**. Measured separately. The task-2
+commit touches no compiler source, so the whole byte delta belongs to task 1.
+
+### TASK 1 — `typecheck`'s W1 share, and it is SIX
+
+`tyname.groupInnerOf` (#1243) is the home for the group-interior cut `X.slice(1, X.length - 1)` —
+the `{…}` shape body, the `(…)` group, the `"…"` quoted member. #1243 routed `emit_classify`'s ten,
+#1245 `emit_base`/`emit_collect`'s six. This routes `typecheck`'s, the last share in the partition.
+
+**THE COUNT IS SIX. #1239's census said four, #1245's correction said five, and both are wrong in
+the same direction.** The derivation, taken structurally rather than from either list — every
+`.slice(` in the file, classified by START and then by ENDPOINT:
+
+| bucket | count | verdict |
+|---:|---:|---|
+| all `.slice(` in `typecheck.vl` | 33 | — |
+| … with START `1` | 11 | the only bucket W1 can be in |
+| … and ENDPOINT `X.length - 1` | 8 | the group-interior operation, all eight |
+| … and a TYPE-NAME operand | **6** | **routed** |
+| … and an EXPRESSION-lexeme operand | 2 | `litTyOfExpr`, `checkMatchExprNode` — stay |
+
+The three `start = 1` writings that are NOT W1 are excluded by their endpoint, not by argument:
+`name.slice(1, name.length)` (a drop-first-char in `nameToTyReal`'s `!A` arm) and two
+`slice(1, fa - 1)` function-type PARAM cuts. No hoisted-length spelling exists in this file — the
+trap that cost #1243 and #1245 one site each has no instance here, which is itself worth recording:
+the shape to look for was checked and found absent, rather than assumed absent.
+
+**THE SIXTH SITE IS `tsToTyReal`'s `TS_LITSTR` ARM, AND #1245 RULED IT OUT ON THE FIELD'S NAME
+RATHER THAN ON WHAT THE FIELD HOLDS.** Its reason was "a lexeme peel off `strText` / `tsText`". But
+`ast.tsToName` returns `tsText[ix]` **verbatim** for a `TS_LITSTR` node (`if k == TS_LITSTR { return
+tsText[ix] }`), and `parser.parseTypeAtom` stores into `tsText` the very string it also concatenates
+into `TypeRef.tyName`. So that operand IS a type name — it is `litMemberTy`'s quoted-member peel
+reached through the spelling tree instead of through the rendered name, character for character on
+the same value. Grouping it with `StrLit.strText` is the receiver-normalisation failure this family
+keeps producing, one level up: the census normalised the RECEIVER but not the LENGTH expression,
+and the correction normalised the FIELD NAME but not the field's CONTENTS.
+
+**THE RULING #1245 LEFT OPEN, SETTLED.** #1245 posed it correctly — "either both quoted-type-member
+sites are in the family or neither is; they cannot be split" — and this slice answers *both, and a
+third*. The operative boundary is **the OPERAND'S LANGUAGE**, and it is chosen because it is the one
+that costs a module edge: `tyname.vl` is the TYPE-NAME grammar's leaf and publishes `groupInnerOf`
+as one of that grammar's operations, so routing an expression lexeme through it would make the
+identical peels in `parser.vl` and `format.vl` owe `tyname` an import they have no other reason to
+hold. #1243's exclusion sentence ("`typecheck`'s `mkLitTy` calls … is NOT this") named the CALLEE,
+which is why it contradicted its own inclusion of `litMemberTy` — a `mkLitTy` call site. The rule is
+now recorded in-source on `litTyOfExpr`, with the two out-of-family sites cross-referencing it.
+
+| site | line | operand | guard in front of the cut |
+|---|---:|---|---|
+| `litMemberTy` | 1233 | type name, `"…"` member | `name[0] == '"'` (a bare OPEN test) |
+| `tsToTyReal` | 5610 | `tsText` at `TS_LITSTR` = a type name | `k == TS_LITSTR` — gated by the KIND, no character test at all |
+| `nameToTyReal` | 5750 | type name, `(…)` group | `nameIsParenSpanEnds` **and** the `tyGroupEndIndex` balance walk |
+| `canonShapeName` | 7073 | type name, `{…}` body | the CALLER's (`canonEmitNameAt`'s brace arm) |
+| `litUnionPreserve` | 7596 | one top-level atom of a litunion type name | `nameIsLitUnionType(core)` — and the only receiver in the family that is an INDEX expression |
+| `canonEmitNameAt` | 7874 | type name, `(…)` group | `nameIsParenSpanEnds && !isTopLevelFuncTypeName` |
+
+**Three of those guard shapes are new to the family's tally** (SPAN+WALK, kind-dispatch with no
+character test, and the litunion test over an index expression). #1243's header argued the cut must
+stay delimiter-blind because its ten sites wanted four different guards; at 22 routed sites the
+count of distinct guards is now seven. The argument gets stronger with every share, which is the
+useful form of a design claim: it is falsifiable by the next slice and has not been falsified.
+
+**RESOLVER-ENFORCED, NOT GREPPED.** With the import entry deleted from `typecheck.vl` the build
+exits 1 naming exactly six call sites — `1233 · 5610 · 5750 · 7073 · 7596 · 7874`. That is the
+re-derived list enumerated by the compiler. It confirms the routing; the *completeness* claim is
+carried by the endpoint census above, because un-importing can only name sites that already call.
+
+#### INERTNESS — both orthogonal instruments, and the calibration is TWO DISJOINT HALVES
+
+| instrument | reading |
+|---|---|
+| **frozen-source rebuild** — master's `compiler/entry.vl` compiled by this branch's compiler | **BYTE-IDENTICAL to master's own output**, 1,042,594 B, sha256 `58e2e2eeed0300fb080c552f2589f38dc9054c2ca38a3751c21612475ca5abb5`. **INVERTED CONTROL:** the two compilers themselves `cmp` as differing (rc 1). |
+| **six-channel corpus A/B**, 1,557 files (`tests/cases` + `std` + `scripts`) | **0 diffs on all six channels.** |
+| **fuzz A/B**, 50,400 generated programs (14 seeds × 3 depths × {plain, declared} × 600) | **0 divergences.** |
+
+The calibration is deliberately shaped differently from #1243's home-vs-call-site pair. Here the two
+sabotages are the **two disjoint halves of the routed set**, so between them every one of the six
+sites is poisoned exactly once — which turns "the corpus is not blind" into "each routed site has a
+live witness population", a strictly stronger statement for a six-site slice.
+
+| # | half | poison | corpus reading (of 1,557) |
+|---|---|---|---|
+| **S1** | the three NAME-GRAMMAR sites (`nameToTyReal`, `canonShapeName`, `canonEmitNameAt`) | keep one character too many (`slice(1, X.length)`) | **0 CHECKRC · 0 CHECKMSG · 366 BUILDRC(0/1) + 1 BUILDRC(1/0) · 384 BUILDMSG · 18 BYTES · 367 RUNRC(0/1) + 1 RUNRC(1/0)** |
+| **S2** | the three QUOTED-MEMBER sites (`litMemberTy`, `tsToTyReal`, `litUnionPreserve`) | keep the closing quote | **149 CHECKRC · 168 CHECKMSG · 145 BUILDRC · 170 BUILDMSG · 4 BYTES · 145 RUNRC · 2 RUNOUT** |
+
+**The two profiles are disjoint at the top of the table and that is the finding.** S1 is invisible on
+both CHECK channels — an emit-structure break, 18 files moving BYTES. S2 lights CHECK first (a
+literal member that keeps its quote stops matching a litunion) and moves BYTES on only 4. A
+calibration that had run S1 alone would have concluded the CHECK channels are dead weight for this
+region; a calibration that had run S2 alone would have concluded BYTES is. Both channels earn their
+place, and neither sabotage alone would have shown it. S1's single `BUILDRC(1/0)` — a file the
+poison makes *build* — is the reminder that a sabotage's witness set is not always one-directional.
+
+**−815 B** (1,042,594 → 1,041,779) for six sites = **136 B/site**, against #1243's 135 B (W1's ten)
+and 139 B (W5's four). Three independent families, three shares, 135/136/139 — the per-site figure
+for a `.slice`→call routing is now a predictable constant, which is worth stating because it means a
+future share's delta is a checkable prediction rather than a post-hoc observation.
+
+### TASK 2 — the NARROWED-GUARD BINDING miscompile: reproduced, gridded, anchored, FILED
+
+#1247 recorded in `typecheck.holeMemberTy`'s header that binding a field of a union narrowed by a
+negated `is` + early return to a `const` emits invalid wasm, and declined to add a fixture. This
+slice reproduces it, measures it, finds the anchor, and files it. **The fix is in `emit_collect.vl`,
+outside this slice's partition, and was deliberately not taken.**
+
+**MINIMAL REPRO** (`vl check` rc 0, zero diagnostics; `vl build` writes a module that fails to
+validate with `type mismatch: expected i32, found (ref $type)`):
+
+```vl
+function go(t: {aName: string} | {zz: boolean}) {
+  if !(t is {aName: string}) { return "" }
+  const nm = t.aName        // <- the miscompile
+  return nm
+}
+```
+
+**THE ANCHOR, read off the disassembly rather than inferred.** In the bad module `nm`'s slot is
+declared `(local i32)` while the body correctly emits `struct.get 4 1 ; ref.cast (ref 2) ;
+struct.get 2 0` — a string ref stored into an i32 cell. Under the POSITIVE narrow the same function
+declares `(local (ref 5))`. So `wasmEmit` sees the narrowing and the LOCAL-COLLECTION pass does not.
+`emit_collect.collectLocals` / `collectLocalsIf` are missing **both** narrow propagations their own
+siblings carry:
+
+* `collectLocals`'s statement loop never calls `pushPostGuardNarrow` — `wasmEmit` calls it at three
+  sites, `emit_classify` at two, `emit_sections` at one, the collector at none;
+* `collectLocalsIf` narrows only `s.ifThen` (`setNarrowFromCond` + `restoreNarrow`) and walks
+  `s.ifElse` with the stack untouched — no `setNarrowFromCondElse`.
+
+`emit_classify.blockHasStrOp` / `ifChainHasStrOp` are the exact structural siblings — same walk,
+same save/restore idiom, headers that say they "mirror the emit loops" — and they carry BOTH. **The
+collector is the one walker of the three that was never brought along**, and its own `collectLocalsIf`
+header explains why the then-branch narrowing is there without ever asking about the other two arms.
+
+**THE GRID — 440 cells, narrow form × binding form × field type × scope, every red paired with its
+positive-narrow twin and its direct-use twin.**
+
+| axis | levels |
+|---|---|
+| narrow | negated guard `if !(t is S) { return }` · complement guard `if t is Other { return }` · **positive block `if t is S { … }` (CONTROL)** · negated-else · plain-else (no divergence at all) |
+| binding | `const nm = …` · `let nm = …` · `const nm: T = …` · **direct use, no binding (CONTROL)** |
+| field | `string` · `i32` · `f64` · `f32` · `i64` · `boolean` · `i32[]` · `string[]` · `{b: i32}` · `string \| null` |
+| scope | function body · nested `if` block · `while` body |
+
+| verdict | cells | which |
+|---|---:|---|
+| **INVALID WASM, `expected i32, found (ref $type)`** | **20** | field `string`, binding `const`/`let`, all four non-positive narrow forms, all three scopes |
+| **INVALID WASM, `expected (ref $type), found (ref null $type)`** | **4** | field `{b: i32}`, binding `const nm: {b: i32} = …`, all four non-positive narrows |
+| **LOUD REJECT — same root cause, different face** | **16** | field `{b: i32}` (`field access receiver is not a struct`) and `string \| null` (`` `??` is only supported on a map index get ``) at `const`/`let` |
+| **GREEN** | rest | every positive-narrow cell · every direct-use cell · every `i32`/`f64`/`f32`/`i64`/`boolean`/`i32[]`/`string[]` field |
+| **RED WITH A RED CONTROL — excluded** | 5 | `direct` + `string \| null`, red under the POSITIVE narrow too: a pre-existing coalesce gap, not this defect |
+
+Four readings of that grid that a smaller probe would have missed:
+
+1. **The `!` is not the cause.** The complement spelling `if t is Other { return … }` — no negation
+   anywhere — is red in every cell the negated one is. It is the DIVERGENT GUARD.
+2. **There are TWO gaps, not one, and the second is invisible without a non-diverging narrow form.**
+   The `plain-else` row (`if t is Other { print(9) } else { … }`, no `return` at all) is red, which
+   post-guard narrowing cannot explain: it is the missing else-arm narrowing. A grid whose narrow
+   axis had only guard forms would have found one bug and shipped half a fix.
+3. **The scalars are green by ACCIDENT, and that is why the field axis had to be wide.** An i32
+   default is the RIGHT slot for `i32`/`boolean`; `letIsArray`/`letIsF64` resolve without the
+   narrowing stack. Only the field types whose slot the classifier must DERIVE are red. A grid run
+   on `i32` alone reads a clean 0.
+4. **The annotation flips sign across field types.** `const nm: string = …` is GREEN (the annotation
+   pins the slot); `const nm: {b: i32} = …` is RED (the annotation selects a struct slot the
+   un-narrowed init classification disagrees with). "Annotate it" is not a workaround.
+
+**FIX-OR-FILE: FILED, and the diagnosis is verified rather than asserted.** The two edits above were
+applied experimentally, the compiler rebuilt, and both grids re-run: **all 440 cells go green** apart
+from the five whose controls were already red, and `SELFHOST_NATIVE_ALIGN=1 deno task test` reads
+master's exact **3282 / 0 / 8**. The patch was then reverted and is NOT in this branch — it edits
+`emit_collect.vl`, which this cycle's partition assigns elsewhere. What ships is the fixture pair,
+the anchor, and this measurement, so the owning slice starts from a graded diagnosis.
+
+**THE DIRECTIVE GAP — why #1247's "it would fail the native-align gate" is right for a reason worth
+writing down.** `@emit-error` asserts `vl check --codegen` exits NON-ZERO at the emit stage. Measured
+on the repro: `vl check --codegen` exits **0** and prints "no errors". The emitter *believes it
+succeeded*; only wasm validation disagrees, and no corpus directive has a verdict channel that can
+see that. `@run` fails both harnesses for real. So the only truthful directive is `@check` (ACCEPT
+tier), and the two fixtures carry in their headers what the directive cannot:
+
+* `tests/cases/unions/xfail-narrowed-guard-binding-string-field.vl` — the three red narrow forms
+  beside both green controls, in one file, so a partial fix cannot pass it.
+* `tests/cases/unions/xfail-narrowed-guard-binding-shape-field.vl` — the ANNOTATED nested-shape
+  twin, pinned separately because its validation message is a different one. One root cause, three
+  symptoms; a fix graded on the string message alone would report two thirds of a result.
+
+### WHAT THESE SLICES FOUND WRONG
+
+1. **`typecheck`'s W1 share is SIX** — #1239's census said four, #1245's correction said five. The
+   sixth (`tsToTyReal`'s `TS_LITSTR` arm) was excluded by the NAME of the field its operand comes
+   from rather than by what that field holds, and `ast.tsToName` settles it in one line. **Three
+   consecutive slices have now under-counted this one family, each by a different normalisation
+   failure** — the receiver (#1243), the length expression (#1245), the operand's source field
+   (this one). The through-line is that the census's abstraction is applied to the SPELLING and the
+   family is defined by the VALUE.
+2. **`mkLitTy` is not a family boundary and never was.** All four of its call sites peel quotes; two
+   are type names and two are expression lexemes. Naming the callee put the boundary in a place that
+   cuts across the actual distinction, which is the operand's language.
+3. **The narrowed-guard binding defect is two gaps, not one**, and the second (the else arm) is not
+   reachable by any guard-shaped repro — including the one #1247 recorded.
+4. **`vl check --codegen` reads 0 on a program that writes an invalid module.** The corpus's
+   `@emit-error` tier therefore cannot pin an invalid-wasm case at all; the vocabulary has a hole
+   exactly where the emitter's most dangerous failures live, and every such case in the tree is
+   pinned at the check tier with the real verdict in prose. Recorded because a future slice looking
+   for "why is this only `@check`" should find the measurement, not re-derive it.
+5. **A named struct alias as a union arm is a separate live gap.** The first repro attempt —
+   `type A = {aName: string}; type B = {bNum: i32}; function go(t: A | B)` — is `emitProgram: ref
+   valtype with no interned shape` on master for the DEFECT cell and for BOTH controls, so it is not
+   this defect. It is why the fixtures spell their arms inline. Not investigated further here.

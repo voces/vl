@@ -230,6 +230,7 @@ import {
   annGenAppSpanEnds,
   arrElemNameRaw,
   gaeLtAt,
+  groupInnerOf,
   listElemNameOf,
   mapSpellKeyEnd,
   mapSpellKeyName,
@@ -1227,7 +1228,10 @@ function litMemberTy(name: string) {
   // A STRING-LITERAL type `"a"` — the quoted lexeme is the member; keep the RAW inner
   // text (the literal expression side keeps its raw lexeme too, so membership compares
   // the same characters).
-  if name[0] == '"' { return mkLitTy("str", name.slice(1, name.length - 1)) }
+  // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1) — the `"…"` quoted
+  // member is one of the three delimiters that family names, and the quote TEST stays
+  // here because the home is delimiter-blind by design (its header records why).
+  if name[0] == '"' { return mkLitTy("str", groupInnerOf(name)) }
   // A NUMERIC-LITERAL type (`0`, `1.5`): int vs float by the `.`.
   if name[0] >= '0' && name[0] <= '9' {
     if hasDot(name) { return mkLitTy("flt", name) }
@@ -2840,6 +2844,16 @@ function softenLitTy(ty: i32) {
 // when the expression isn't a bare literal. Peels parens. The string text is
 // the RAW lexeme between the quotes — the same characters a literal-type
 // annotation keeps — so membership compares consistently.
+//
+// THE QUOTE PEEL BELOW IS **NOT** `tyname.groupInnerOf` (W1), and the boundary is the
+// OPERAND'S LANGUAGE, not the three characters of arithmetic. `StrLit.strText` is a
+// string in the EXPRESSION language; `tyname.vl` is the TYPE-NAME grammar's leaf, and
+// its cut is published as one of that grammar's operations. Routing an expression
+// lexeme through it would make the identical peels in `parser.vl` / `format.vl` owe
+// `tyname` an import they have no other reason to hold. The line is drawn where it
+// costs a module edge, not where the characters happen to match — which is why
+// `litMemberTy` and `tsToTyReal` (type NAMES that happen to be quoted lexemes) ARE
+// routed and this and `checkMatchExprNode`'s pattern peel are not.
 function litTyOfExpr(ix: i32) {
   if ix < 0 { return -1 }
   const e = P.nodes[ix]
@@ -5587,9 +5601,14 @@ function tsToTyReal(ix: i32) {
   // A STRING-LITERAL type `"a"` — `tsText` keeps the QUOTED lexeme (that is what
   // makes `tsToName` reproduce the annotation exactly), and the member is the RAW
   // inner text, as on the literal-expression side.
+  // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1), and THE OPERAND IS
+  // A TYPE NAME, not a lexeme: `ast.tsToName` returns `tsText[ix]` VERBATIM for a
+  // `TS_LITSTR` node, and the parser stores the very string it also concatenates into
+  // `TypeRef.tyName` — so this is `litMemberTy`'s quoted-member peel reached through
+  // the spelling tree instead of through the rendered name, character for character.
   if k == TS_LITSTR {
     const lex = tsText[ix]
-    return mkLitTy("str", lex.slice(1, lex.length - 1))
+    return mkLitTy("str", groupInnerOf(lex))
   }
   // A NUMERIC-LITERAL type (`0`, `1.5`): int vs float by the `.` in the LEXEME.
   if k == TS_LITNUM {
@@ -5723,10 +5742,13 @@ function nameToTyReal(name: string) {
     // the final character (`parenEnclosesWhole`'s question, asked of the home).
     // The endpoint test is the PAREN grammar's SPAN half at its home; the walk stays a
     // separate conjunct exactly as `peelGroupParens` keeps it, because the recursion
-    // below is `nameToTy` and not a plain slice.
+    // below is `nameToTy` and not a plain slice. The CUT that pairs with the test is
+    // `tyname.groupInnerOf` (W1) — the SPAN + WALK pair above is this site's guard, a
+    // fourth shape again among the family's call sites, which is why the home carries
+    // none of them.
     if nameIsParenSpanEnds(name) {
       if tyGroupEndIndex(name, 1) == name.length - 1 {
-        return nameToTy(name.slice(1, name.length - 1))
+        return nameToTy(groupInnerOf(name))
       }
     }
     // A FUNCTION TYPE `(params)=>ret` (the parser's synthetic name for `(i32) => i32`):
@@ -7046,7 +7068,10 @@ function canonShapeName(name: string) {
       canonEmitNameAt(mapSpellValName(name), RC_MAP_VAL) +
       "}"
   }
-  const inner = name.slice(1, name.length - 1)
+  // The `{…}` SHAPE BODY, cut at the group-interior home (`tyname.groupInnerOf`, W1).
+  // The guard is the CALLER's (`canonEmitNameAt`'s brace arm has already established the
+  // closing `}`) — a fifth guard shape among the family's sites.
+  const inner = groupInnerOf(name)
   // A `{[`-opening name whose key never closes into a `]:` is not a map and not an object
   // shape either — returned untouched, exactly as the copy's inner `kend < 0` arm did.
   if nameIsMapOpen(name) { return name }
@@ -7562,10 +7587,14 @@ function litUnionPreserve(parts: string[]) {
     // The member texts are recovered by dropping each kept member's surrounding quotes —
     // the exact inverse of the `"\"" + litText + "\""` every literal RENDER writes
     // (`tyToStr`), on a member `nameIsLitUnionType` has just confirmed is a quoted literal.
+    // That drop is the GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1): the
+    // operand is one top-level atom of a litunion type NAME, and the guard is the
+    // `nameIsLitUnionType(core)` test on the line above — a SIXTH guard shape, and the
+    // only one in the family whose receiver is an INDEX expression rather than a name.
     const texts: string[] = []
     let q = 0
     while q < kept.length {
-      texts.push(kept[q].slice(1, kept[q].length - 1))
+      texts.push(groupInnerOf(kept[q]))
       q = q + 1
     }
     const al = litUnionAliasOfLitTexts(texts)
@@ -7833,14 +7862,18 @@ function canonEmitNameAt(name: string, ctx: i32) {
   // parenthesized (`(i32) => ((i32) => i32)` — a curried/closure-returning function): its
   // leading `(` wraps only the PARAM list, so a blind first/last strip corrupts it to
   // `i32)=>((i32)=>i32`. Such a name keeps its top-level arrow (handled below).
-  // The endpoint pair is the PAREN grammar's SPAN half at its home. The empty name
-  // returned at the top of this function, so the home's `length < 1` guard is never the
-  // deciding conjunct here and the routing is exact on every reachable input.
+  // The endpoint pair is the PAREN grammar's SPAN half at its home, and the CUT is the
+  // GROUP-INTERIOR home `tyname.groupInnerOf` (W1) — a SPAN + arrow-reject guard, a
+  // seventh shape. The empty name returned at the top of this function, so the home's
+  // `length < 2` guard is never the deciding conjunct here; it would not matter if it
+  // were, because `.slice` CLAMPS and the home agrees with the raw expression on EVERY
+  // input — `"{".slice(1, 0)` and `"".slice(1, -1)` both evaluate to `""` (run, not
+  // reasoned; #1243 measured it and the home's own header records the reading).
   if nameIsParenSpanEnds(name) && !isTopLevelFuncTypeName(name) {
     // A GROUPER is not a position: `(X)` stands wherever `X` would, so the ctx rides
     // through the strip. (O4 will decide whether the parens come back — that is a
     // question about the render, not about where it sits.)
-    return canonEmitNameAt(name.slice(1, name.length - 1), ctx)
+    return canonEmitNameAt(groupInnerOf(name), ctx)
   }
   // A TOP-LEVEL function type with a parenthesized result (`(i32) => ((i32) => i32)`): canon
   // the param list and the (paren-stripped) result, re-render with the result's grouping
@@ -18150,6 +18183,9 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
         )
       } else if pn is StrLit {
         // The member name is the pattern's inner text (strip the surrounding quotes).
+        // NOT `tyname.groupInnerOf` (W1) — `strText` is an EXPRESSION lexeme; see the
+        // language boundary recorded on `litTyOfExpr`. (The `>= 2` gate here is also NOT
+        // the home's bound: it keeps a degenerate lexeme WHOLE where the home returns "".)
         const raw = pn.strText
         let inner = raw
         if raw.length >= 2 { inner = raw.slice(1, raw.length - 1) }
