@@ -37,7 +37,7 @@ import {
   annUnionAtomsOf,
   cUserTypes,
   canonEmitName,
-  genAliasFieldRawTyName,
+  declAnnRawTyName,
   inferLetCount,
   inferLetNameOf,
   inferLetTyAt,
@@ -99,9 +99,9 @@ import {
 import {
   annArrowAt,
   annRetNameOf,
-  arrLeafNameOf,
   cloArrElemNameOf,
-  gaeParamSlotOf,
+  gaeAnnHasParam,
+  gaeApplyFieldTy,
   gaeSplitArgs,
   isStructAtom,
   isVariantBoxUnion,
@@ -3454,19 +3454,26 @@ function collectAnonShapes() {
 // the parameter — `tsLeafTy` asks the live binding before the registry, and reports
 // `Box<string>` as `{v: string}`. The emitter then substituted nothing, because the name it
 // had to match on was already gone. The pre-canon spelling is banked per annotation node at
-// `typecheck.genAliasFieldRawTyName`; the ARENA is untouched, because the substitution is
+// `typecheck.declAnnRawTyName`; the ARENA is untouched, because the substitution is
 // the only consumer that wants the parameter name back and a parameter name left standing
 // in the arena is a NAME `collectU` may already have claimed (`type Id = i32` is a
 // one-member `UnionDecl`, so an `Id[][]` field interned a ref-list of union BOXES and the
 // no-op instantiation `Box<i32>` stopped lowering).
 //
-// The `gaeParamSlotOf` gate is what keeps this narrow: the declared spelling is taken only
+// The `gaeAnnHasParam` gate is what keeps this narrow: the declared spelling is taken only
 // where the substitution would land, so `type Box<T> = { v: 0 | 1 }` still records the
 // canon'd `i32` and `type Box<i32> = { v: i32 }` still substitutes nothing.
+//
+// That gate USED to be `gaeParamSlotOf(arrLeafNameOf(raw), pnames)` — the array grammar and
+// nothing else — so it agreed with the substitution only on the constructors a `[]` peel can
+// see. A parameter behind a `| null`, an inline `{…}` or a nested application was reported
+// as "not substituted here", the canon'd body type was recorded, and the field interned at
+// the ALIAS's type while the checker had bound it to the ARGUMENT. Both sides now ask the
+// same published question.
 function gaeDeclFieldTyName(nodeIx: i32, canoned: string, pnames: string[]) {
-  const raw = genAliasFieldRawTyName(nodeIx)
+  const raw = declAnnRawTyName(nodeIx)
   if raw == "" { return canoned }
-  if gaeParamSlotOf(arrLeafNameOf(raw), pnames) < 0 { return canoned }
+  if !gaeAnnHasParam(raw, pnames) { return canoned }
   raw
 }
 
@@ -3539,6 +3546,66 @@ function gaePeelWrappers(name: string) {
   nm
 }
 
+// The registry SLOT of generic-alias base `name`, or -1. THE HOME IS HERE — this file
+// WRITES the registry (`gaeCollectDecls` twenty lines up), and it is the lowest module
+// that can see `gaeBases` at all. `emit_classify.gaeIndexOf` is a second copy of this
+// loop; routing it here is a filed hand-off, not done in this change because that file is
+// owned by a concurrent slice at this commit.
+function gaeBaseSlot(name: string) {
+  let i = 0
+  while i < gaeBases.length {
+    if gaeBases[i] == name { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Intern the inline SHAPES an APPLICATION's substituted field types NAME, before
+// `gaeEnsure` codes those fields.
+//
+// A monomorphized generic-alias field is the one field kind no arena scan can reach. A
+// DECLARED struct's nested shape is interned from its own `FieldDef`
+// (`collectNestedFieldShapes`), and an inline annotation's from its own `TypeRef`
+// (`collectAnnShapes`) — but `type Box<T> = {v: {a: T}}` at `Box<string>` names the target
+// `{a:string}`, a text that appears NOWHERE in the program. `gaeEnsure` asks
+// `structIndexByName` for it, gets -1, codes the field -1 and declines to intern the
+// INSTANCE at all; the literal then lowered against the alias's own canon'd `{a:i32}` and
+// the module was `vl check` rc=0 with "expected i32, found (ref $type)".
+//
+// That this is the INTERN and not the substitution was measured, not inferred: adding a
+// `const w: {a: string}` elsewhere in the very same program — which changes nothing about
+// the substitution and only makes the shape reachable by `collectAnnShapes` — turns the
+// cell CORRECT.
+//
+// It does NOT recurse into a field that is itself an application. `gaeEnsure` does that
+// depth-first under a `structIndexByName` early-out that has already interned the outer
+// instance; this pass runs BEFORE any of that, so the same recursion here would not
+// terminate on a recursive alias (`type L<T> = {next: L<T> | null}`). A nested
+// application's own inline-shape fields are therefore still uncovered — filed, with the
+// grid, in `docs/internals/destringify-types-program.md`.
+function gaeInternAppFieldShapes(name: string) {
+  if !annGenAppSpanEnds(name) { return 0 }
+  const ltAt = gaeLtAt(name)
+  const gi = gaeBaseSlot(name.slice(0, ltAt))
+  if gi < 0 { return 0 }
+  const pnames: string[] = []
+  gaeSplitArgs(gaeParams[gi], pnames)
+  const args: string[] = []
+  gaeSplitArgs(name.slice(ltAt + 1, name.length - 1), args)
+  if args.length != pnames.length { return 0 }
+  const fs = gaeFieldStart[gi]
+  const fc = gaeFieldCount[gi]
+  let fi = 0
+  while fi < fc {
+    // `internShapeDeep` peels the composition wrappers itself (nullable, `[]` runs,
+    // grouping) and descends a map VALUE, so `{a: T}[]` and `{a: T[]}` are covered by the
+    // same call, and a non-shape substitution (`i32`, `Box<i32>`) is a no-op.
+    internShapeDeep(gaeApplyFieldTy(gaeFieldTyNames[fs + fi], pnames, args))
+    fi = fi + 1
+  }
+  0
+}
+
 // Scan every TypeRef in the arena for generic-alias applications (behind
 // `|null` and `[]` wrappers) and intern each one.
 export function collectGenAliasShapes() {
@@ -3548,6 +3615,9 @@ export function collectGenAliasShapes() {
     const tn = P.nodes[ti]
     if tn is TypeRef {
       const nm = gaePeelWrappers(tn.tyName)
+      // The instance's own inline-SHAPE field targets first — `gaeEnsure` codes a field
+      // from the struct table and declines the whole instance when the target is not in it.
+      gaeInternAppFieldShapes(nm)
       gaeEnsure(nm)
       // A MAP annotation's VALUE position (`{[string]: Box<i32>}`): the application is
       // INTERIOR to the synthetic map name, so the peel above never reaches it and the

@@ -29324,3 +29324,185 @@ wrong answer; they differ only in what they leave in the arena for the other twe
 read. The 8 reddened cells were invisible to every channel except a swept grid that included the
 cells the defect did *not* break — the diagonal `A == B` no-op instantiations, which are the
 boring rows one is most tempted to drop from a grid.
+
+## D-GAESTRUCT — the shadow residue closed by ONE structural walk, and the SECOND half nobody was looking for (#TBD)
+
+Follow-up to D-GAERAWFIELD (#1238), whose residue table above listed the first two rows as LIVE
+shadow defects with green controls. They are, and so are three more the table did not have.
+
+### THE SUBSTITUTION WAS THE `[]` LADDER AND NOTHING ELSE
+
+`gaeApplyFieldTy` peeled the array run and matched the leaf against the parameter list. Every
+OTHER constructor the annotation grammar has — `Id | null`, `{a: Id}`, `Inner<Id>`, `Id | i32`,
+and any of those under a `[]` run — reported "the substitution does not land here", so
+`gaeDeclFieldTyName` recorded the CANON'd alias body and the field interned at the alias's own
+type while the checker had bound it to the ARGUMENT.
+
+Swept as a 15 × 8 grid — the shadowed declaration's KIND (i32/i64/f64/f32/boolean/string,
+`i32[]`, `0|1`, `1`, `"a"|"b"`, alias-of-alias, declared struct, alias-of-struct, map, function
+type) × the CONSTRUCTOR the parameter sits behind (`Id`, `Id[]`, `Id[][]`, `Id|null`, `{a:Id}`,
+`(Id|null)[]`, `{a:Id}[]`, `{a:Id[]}`) — each cell paired with the identical program at a
+non-shadowing `<T>`:
+
+| | master | after |
+|---|---|---|
+| CORRECT | 126 | **195** |
+| INVALID WASM | 66 | **0** |
+| silently WRONG output | 3 | **0** |
+| compiler CRASH (`vl build` traps) | 15 | **0** |
+| clean emit reject | 30 | 45 |
+
+All 120 SHADOW cells are correct; 0 cells moved backward. The 45 remaining rejects are all
+CONTROL cells at `(T|null)[]` / `{a:T}[]` / `{a:T[]}`, where an un-canon'd parameter NAME survives
+in the arena and a later scan chokes on it — a different, un-shadowed defect, and 15 of those 45
+were a compiler crash on master. Two more axes moved with it: a nested application field
+(`Inner<Id>`, 5 cells invalid wasm → correct) and a non-nullable union arm (`Id | i32`).
+
+The fix is not a third ladder. `monoSubstAnn` / `monoAnnHasTyParam` — the walk this same file
+already owns for the FuncDecl half — gained the two arms they were missing (a top-level UNION via
+`splitUnionAtoms`, and a grouping PAREN via `peelGroupParens`), and `gaeApplyFieldTy` now calls
+them with the alias's LIVE parameters as the bindings. The shadow rule stays where it was: the
+parameter list is filtered by `gaeParamShadowed` at the gae entry, not inside the shared walk,
+because the FuncDecl half's shadow question is a different arm at a different site.
+
+### THE MERGE THAT LOOKED OBVIOUS AND IS MEASURED WORSE
+
+`monoTyParamOf` reads ONE `[]` rung; `gaeApplyFieldTy` has read the full leaf peel since #1234.
+That is the "classifier taught HALF a set" shape exactly, and unifying it on the leaf peel was
+built and swept: **14 cells move `clean emit reject → invalid wasm`** (`function id<T>(v: T[][])`
+at every shadowed-name row, plus one shadow cell that was CORRECT), and nothing moves forward — a
+`T[][]` FuncDecl parameter is a nested list with no rep, so recognising it only replaces a loud
+reject with a written invalid module. The `[]` run therefore stays OUTSIDE the shared walk, in
+`gaeApplyFieldTy`, which is what lets the alias half carry a depth the FuncDecl half must not.
+
+### THE SECOND HALF: THE SUBSTITUTED SHAPE IS INTERNED BY NOBODY
+
+With the substitution correct, every inline-shape row was STILL invalid wasm. The substituted
+target `{a:string}` is a text that appears NOWHERE in the program: a declared struct's nested
+shape is interned from its own `FieldDef` (`collectNestedFieldShapes`) and an inline annotation's
+from its own `TypeRef` (`collectAnnShapes`), and a monomorphized generic-alias field has neither.
+`gaeEnsure` asked `structIndexByName`, got -1, coded the field -1 and declined to intern the
+INSTANCE at all.
+
+What told the two halves apart was a one-line probe: adding `const w: {a: string}` elsewhere in
+the very same program — which changes nothing about the substitution and only makes the shape
+reachable by an arena scan — turns the cell CORRECT on the substitution-only build and leaves it
+invalid on master. `emit_collect.collectGenAliasShapes` now interns an application's substituted
+field shapes before `gaeEnsure` codes them.
+
+### CORRECTIONS TO D-GAERAWFIELD'S RESIDUE TABLE
+
+* **`Box<Nm>` where `type Nm = string` — the control is CORRECT, not invalid wasm.** Swept over 9
+  alias-body kinds: 8 of 9 are invalid wasm with a green concrete-argument control (only a
+  DECLARED struct body runs). It is a LIVE defect, not a symmetric pre-existing gap, and the
+  anchor is that `canonEmitNameAt` has no generic-APPLICATION arm at all — the argument inside
+  `Head<…>` is never canon'd. Still open.
+* **`type Outer<Id> = { o: Inner<Id> }` is a LIVE shadow defect, not a symmetric gap** — 5 cells
+  invalid wasm against a CORRECT control. Closed here.
+* **A STRING literal union DOES fail** — not at the bare/`[]` depths the earlier grid swept, but
+  at `Id|null` / `{a:Id}` it produced silently WRONG OUTPUT (`0` instead of the string), the worst
+  class in the ordering. Closed here.
+
+### STILL OPEN, WITH ITS CONTROL
+
+| cell | shadowed | control | verdict |
+|---|---|---|---|
+| `Box<Nm>`, `type Nm = string` | invalid wasm | **correct** | LIVE — `canonEmitNameAt` has no gen-app arm, so the ARGUMENT is never canon'd |
+| `function ident<Id>(v: Id): Id`, `type Id = i32` | invalid wasm | **correct** | LIVE — 49 of 66 cells on an 11 × 6 shadowed-name × ARGUMENT-TYPE grid. The axis is the ARGUMENT's type, not the rep |
+| `function ident<i64>(v: i64)` at an i32 argument | invalid wasm | **correct** | LIVE — `monoTyParamOf` lacks the `gaeParamShadowed` guard its `gae` sibling carries. 2 cells |
+| `type Box<T> = { v: (T\|null)[] }` (no shadow) | — | emit reject | pre-existing: an un-canon'd `T` survives in the arena. 45 control cells; 15 were a compiler CRASH on master and are now clean rejects |
+| a NESTED application's own inline-shape fields | — | — | `gaeInternAppFieldShapes` does not recurse (a recursive alias would not terminate) |
+
+### D-MONOPRIM — the FuncDecl half of the PRIMITIVE-shadow rule (#TBD)
+
+`gaeParamShadowed` is the checker's `primTyOfName -> tpEnvTyOfName -> declaredTyOfName` order read
+as a predicate: a parameter named for a primitive binds NOTHING. `gaeApplyFieldTy` has carried it
+since #1234; `monoTyParamOf`, eight hundred lines down the SAME FILE, did not. It claimed `i64` as
+a type parameter, `monoBindFromAnn` bound it to whatever the CALL passed, and the instance's
+parameter was rewritten to the argument's type while the RETURN kept the checker's `i64` —
+`(param i32) (result i64)`, `vl check` rc=0, invalid wasm.
+
+**The axis is the ARGUMENT'S TYPE, not the rep, and the earlier filing said the opposite.** Swept
+as a 6 × 6 parameter-NAME × ARGUMENT-TYPE grid against a `<T>`-named control:
+
+* master: 3 of 36 cells disagree with their control. Two are the defect (`<i64>` and `<f64>` handed
+  an `i32`-typed argument, invalid wasm against a CORRECT control); the third is the shadow arm
+  accidentally producing the RIGHT answer by erasing to the argument's own type.
+* after: **0 of 36 disagree.** The two invalid-wasm cells run; the third converges on its control,
+  whose residual `1`-for-`true` is a separate pre-existing checker hole (a `boolean` accepted for
+  an `i32` parameter) present in the control on master.
+
+Everything else in the grid is either the DIAGONAL — the argument's type equals the shadowed name,
+so the erasure is a no-op — or a checker reject. **A single argument literal per row measures the
+diagonal and reports it as the answer**, which is how "i32 / f64 / string / boolean all run" and
+"the anchor is the inferred RETURN classification" both got written down. The return is the half
+that was RIGHT.
+
+Corpus A/B on six channels: 0 of 1,542 files differ on any channel, including bytes.
+
+### D-MONORAWANN — the FuncDecl half of the canon-scope defect (#TBD)
+
+The sidecar D-GAERAWFIELD built for a generic ALIAS's field annotations, extended to a generic
+FUNCTION's parameter and return annotations. Same defect, same bank, same gate — a different
+declaration kind.
+
+`type Id = i32` + `function ident<Id>(v: Id): Id` was `vl check` rc=0 and invalid wasm: canon
+resolved the signature to `i32` before `emit_mono` read it, so `monoTyParamOf` matched nothing and
+the instance pinned the ALIAS's body type while the call passed something else.
+
+Swept as an 11 × 6 grid (what the shadowed name is DECLARED as × the CALL ARGUMENT's type), each
+cell against a `<T>`-named control: **49 of 66 invalid wasm or silently WRONG on master, 0 after,
+with a CORRECT control in all 66.** The 17 that were green are the DIAGONAL (the argument's type
+equals what the alias names, so the erasure is a no-op) plus the two rows canon does not rewrite —
+a declared struct, and a STRING literal union whose alias name canon deliberately keeps.
+
+`declAnnRawTyName` is the reader (renamed from `genAliasFieldRawTyName`: one bank, one question,
+two substitutions that must not disagree about the answer). `emit_mono` reads it at the parameter
+pin, the return pin, and the nested-call return probe.
+
+**THE GATE IS DELIBERATELY NARROWER THAN THE ALIAS HALF'S, AND THE WIDE ONE IS MEASURED.** The
+alias half restores the declared spelling wherever `monoAnnHasTyParam` says the substitution
+lands; this half restores it only where `monoTyParamOf` does — a BARE or `T[]` annotation. Built
+and swept both ways over a 13 × 5 shadowed-name × constructor grid:
+
+| gate | IW → correct | IW → clean reject | backward |
+|---|---|---|---|
+| `monoTyParamOf` (shipped) | 22 | 0 | **0** |
+| `monoAnnHasTyParam` (filed) | 22 | 21 | 1 |
+
+The wide gate's single backward cell is `type Id = string` + `function ident<Id>(v: {a: Id})` at a
+string argument, which moves `correct → clean reject`. It is not a real capability: the control
+`function ident<T>(v: {a: T})` is a clean reject on master too, so an inline-SHAPE parameter of a
+generic function is a pre-existing gap, and the shadow arm compiled only because canon happened
+to erase `Id` to the very type the call passed. The wide gate is a one-line change
+(`monoTyParamOf(raw, typarams) == ""` → `!monoAnnHasTyParam(raw, typarams)` in
+`emit_base.monoDeclAnnName`) and buys 21 invalid-wasm cells for that one; it is left to the owner
+because "no cell moves backward" is the standing rule and the trade is a judgement, not a
+measurement.
+
+**STILL OPEN on this route:** a `LetDecl` inside a generic function body carries the same hazard
+and is not banked (`monoSubstLetType` reads the arena directly). No consumer needed it yet, and a
+bank entry with no consumer is a claim the checker cannot check.
+
+### D-CANONGENAPP — the argument position canon never reached (#TBD)
+
+`canonEmitNameAt` had a union arm, an intersection arm, an array arm, a paren arm, a
+function-type arm, a literal arm and an inline-shape arm. It had **no generic-APPLICATION arm**,
+so the argument position was the one place in an annotation the emitter's vocabulary never
+reached. `type Nm = string` + `type Box<T> = {v: T}` + `Box<Nm>` was `vl check` rc=0 — the checker
+resolves `Nm` through its own registry and reports `{v: string}` — and invalid wasm: the name
+arrived at `gaeEnsure` still spelling `Nm`, `gaeApplyFieldTy` substituted that TEXT verbatim, and
+the field was recorded as `Nm`, a name `collectU` had registered as a one-member `UnionDecl`. The
+field interned as a union BOX while every read lowered as the string it is.
+
+Swept over 9 alias-body kinds (string / i32 / i64 / f64 / f32 / boolean / `i32[]` / `0|1` /
+declared struct) against the identical program with the argument written CONCRETELY: **8 of 9
+invalid wasm, all 9 controls CORRECT.** The one green row is the declared struct — a name canon
+does not rewrite. **D-GAERAWFIELD's residue table recorded the control as also invalid wasm; it is
+not, and that mis-sorting is what kept this filed as a symmetric pre-existing gap rather than as a
+live defect.**
+
+The HEAD is deliberately not canon'd: it names a generic alias DECLARATION and the emitter's
+registry is keyed by that declared name. Corpus A/B on six channels: 2 of 1,544 files differ, both
+on emitted BYTES only with identical check/build/run outcomes — and both got SMALLER, which is the
+expected shape of two spellings of one type collapsing onto one intern key.
