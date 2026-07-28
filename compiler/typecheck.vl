@@ -88,6 +88,7 @@ import {
   mkBinary,
   mkBlock,
   mkIf,
+  mkNum,
 } from "./ast"
 import {
   P,
@@ -1546,6 +1547,37 @@ let nwDeclNames: string[] = []
 let nwTyIxs: i32[] = []
 let nwNames: string[] = []
 let nwBaseTyIxs: i32[] = []
+// FLAT RECORD sidecar (webcraft P1.2) — the measured layout of every
+// `flat type N = { … }` in the program, built once by `resolveFlatLayouts` after
+// the declaration passes have resolved field types, and read by exactly one
+// consumer: the `N.size` / `N.field` constant fold in `checkMemberNode`.
+//
+// The layout rule is the whole design in one line: **offsets are the running sum
+// of the declared field widths and the compiler never inserts a byte.** No
+// alignment, no trailing pad, no reordering. `docs/internals/flat-records-design.md`
+// §2 records why (the requirements doc's own example carries an explicit `pad`
+// field, which is only necessary if nothing pads implicitly; and unaligned access
+// is legal in wasm, so there is no correctness argument for the alternative).
+//
+// PER DECLARATION: `flSizes[d]` is the total byte size, or `FL_UNRESOLVED` while
+// the nested-record fixpoint is still running, or `FL_INVALID` when the
+// declaration was rejected (which suppresses the cycle report — an invalid
+// declaration is not a recursive one).
+let flNames: string[] = []
+let flSizes: i32[] = []
+let flFStart: i32[] = []
+let flFCount: i32[] = []
+// The declaration's arena node, so the CYCLE report — which is discovered in the
+// fixpoint, long after the statement walk that found the declaration — can still
+// anchor its diagnostic on the right line.
+let flDeclNodes: i32[] = []
+// PER FIELD, in declaration order: the name, the width (or `-1` when the field is
+// a NESTED flat record, in which case `flFNest` is that record's index here), and
+// the byte offset once the declaration resolves.
+let flFNames: string[] = []
+let flFWidth: i32[] = []
+let flFNest: i32[] = []
+let flFOff: i32[] = []
 // Depth counter for the LITERAL-adoption window (`nomLitAdopts`): while positive,
 // `assignableGo`'s brand test stands down. Only ever raised around a walk whose
 // SOURCE is a scalar literal, which is what makes waiving the whole walk equivalent
@@ -7604,6 +7636,389 @@ function aliasRefIsPlainRoot(root: i32) {
   k == TS_NAME || k == TS_APP || k == TS_NULL
 }
 
+// ── flat record layouts (webcraft P1.2) ─────────────────────────────────────
+// The whole feature is these functions plus one interception at the top of
+// `checkMemberNode`. Nothing in `emit_*.vl` changes: a `flat` type is an ORDINARY
+// record that has additionally been validated and measured (the marker subtracts
+// nothing), and the layout constants are folded into `NumLit` nodes IN THE ARENA
+// before the emitter runs — so there is no `Member` node left to lower and no flat
+// type left to recognize. `docs/internals/flat-records-design.md`.
+
+// `flSizes[d]` sentinels. Negative so they can never collide with a real size
+// (which is a sum of non-negative widths).
+const FL_UNRESOLVED = -1
+const FL_INVALID = -2
+
+// The index of `name` in the flat-layout sidecar, or -1 if it was not declared
+// `flat type name = { … }`.
+function flatIndexOf(name: string) {
+  let i = 0
+  while i < flNames.length {
+    if flNames[i] == name { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// The byte width of a SCALAR flat field type, or -1 for anything else.
+//
+// This reads the RESOLVED arena type rather than the field's spelling, which is
+// what makes a nominal newtype over a scalar (`type EntityId = new i32`) work with
+// no code for it: a brand is a second index over the SAME `Ty` payload, so
+// `is TyPrim` and `primName` answer exactly as the base answers
+// (`newtype-design.md` §3.1).
+//
+// `boolean` is deliberately ABSENT. It is an i32 at the wasm level, so 4 would be
+// the consistent answer — but C's `bool` is 1 byte, and this tier exists to match
+// foreign layouts byte-for-byte, so a `boolean` field silently occupying 4 is a
+// 3-byte drift in exactly the code whose value is byte-comparability. `flag: i32`
+// is a one-word fix and the reject says so. Widening a reject later is
+// backward-compatible; narrowing an accept is not.
+function flatScalarWidth(tyIx: i32) {
+  if tyIx < 0 { return -1 }
+  const t = T.tys[tyIx]
+  if t is TyPrim {
+    if t.primName == "i32" { return 4 }
+    if t.primName == "f32" { return 4 }
+    if t.primName == "i64" { return 8 }
+    if t.primName == "f64" { return 8 }
+  }
+  -1
+}
+
+// The declared type SPELLING of a `FieldDef`'s annotation, or "" when it has none.
+// The nested-record test is the one question that must be asked of the spelling
+// rather than the arena: a resolved `TyObj` does not carry the name it was declared
+// under, so it cannot say whether the record it describes was declared `flat`.
+function flatFieldTyName(fdIx: i32) {
+  if fdIx < 0 { return "" }
+  const fd = P.nodes[fdIx]
+  if fd is FieldDef {
+    if fd.fdType >= 0 {
+      const tr = P.nodes[fd.fdType]
+      if tr is TypeRef { return tr.tyName }
+    }
+  }
+  ""
+}
+
+// Measure every `flat type` in the program. Runs after the declaration passes have
+// filled each record's field types, so scalars can be read off the arena.
+//
+// TWO PHASES, and they are separate so that an INVALID declaration is never also
+// reported as a RECURSIVE one:
+//   A. validate + stage each declaration's fields (scalars get a width now, a
+//      nested flat record is deferred);
+//   B. a fixpoint over the staged declarations, resolving a record once every
+//      nested record it contains has resolved. Anything still unresolved when the
+//      fixpoint stops making progress is part of a CYCLE — an infinite layout —
+//      and is reported by name rather than hung on.
+function resolveFlatLayouts(stmts: i32[]) {
+  // ── phase A: validate and stage ───────────────────────────────────────────
+  // Two sweeps, because a flat record may nest one DECLARED LATER in the source:
+  // register every flat name first, then validate fields against the full set.
+  let ri = 0
+  while ri < stmts.length {
+    const sd = P.nodes[stmts[ri]]
+    if sd is TypeDecl {
+      if sd.tdFlat == 1 {
+        // A GENERIC flat type has no layout: a type parameter has no width, and
+        // there is no instantiation to measure at a declaration. Rejected here
+        // rather than staged, so it never enters the sidecar and `Box<T>.size`
+        // stays an ordinary undeclared-identifier error.
+        if gaeLtAt(sd.tdName) > 0 {
+          tErr(
+            "a `flat` type cannot be generic — `" +
+              sd.tdName +
+              "` has type parameters, which have no byte width",
+            stmts[ri],
+          )
+        } else if flatIndexOf(sd.tdName) < 0 {
+          flNames.push(sd.tdName)
+          flSizes.push(FL_UNRESOLVED)
+          flFStart.push(0)
+          flFCount.push(0)
+          flDeclNodes.push(stmts[ri])
+        }
+      }
+    }
+    ri = ri + 1
+  }
+  let si = 0
+  while si < stmts.length {
+    const sd2 = P.nodes[stmts[si]]
+    if sd2 is TypeDecl {
+      if sd2.tdFlat == 1 {
+        const d = flatIndexOf(sd2.tdName)
+        if d >= 0 && flFCount[d] == 0 { flatStageDecl(d, sd2) }
+      }
+    }
+    si = si + 1
+  }
+  // ── phase B: size the nest, by fixpoint ───────────────────────────────────
+  let progress = true
+  while progress {
+    progress = false
+    let d2 = 0
+    while d2 < flNames.length {
+      if flSizes[d2] == FL_UNRESOLVED {
+        if flatTrySize(d2) { progress = true }
+      }
+      d2 = d2 + 1
+    }
+  }
+  // Whatever is still unresolved cannot be sized at any depth: every remaining
+  // declaration is waiting on another remaining declaration, which is a cycle.
+  let d3 = 0
+  while d3 < flNames.length {
+    if flSizes[d3] == FL_UNRESOLVED {
+      tErr(
+        "`flat type " +
+          flNames[d3] +
+          "` is recursive — a flat record is stored INLINE, so a cycle has no " +
+          "finite size",
+        flDeclNodes[d3],
+      )
+      flSizes[d3] = FL_INVALID
+    }
+    d3 = d3 + 1
+  }
+  0
+}
+
+// Validate one flat declaration's fields and stage their widths. Every rejected
+// field marks the whole declaration INVALID, so a later `N.size` reports nothing
+// (the field error is the actionable one) and phase B never reports a cycle for it.
+function flatStageDecl(d: i32, sd: TypeDecl) {
+  const declTyIx = cUserTypes[sd.tdName] ?? -1
+  const dfields = sd.tdFields
+  flFStart[d] = flFNames.length
+  let bad = false
+  let fi = 0
+  while fi < dfields.length {
+    const fd = P.nodes[dfields[fi]]
+    if fd is FieldDef {
+      const fname = fd.fdName
+      // `N.size` is the record's TOTAL SIZE, so a field of that name makes the
+      // spelling ambiguous. Rejected rather than resolved either way: "field
+      // wins" hides the record's size behind a field, "size wins" hides a
+      // field's offset, and both are silent wrong answers in address arithmetic.
+      if fname == "size" {
+        tErr(
+          "a `flat` type cannot have a field named 'size' — that spelling is " +
+            "the record's total byte size (`" +
+            sd.tdName +
+            ".size`); rename the field",
+          dfields[fi],
+        )
+        bad = true
+      }
+      const fty = flatFieldTyOf(declTyIx, fi)
+      const w = flatScalarWidth(fty)
+      if w > 0 {
+        flFNames.push(fname)
+        flFWidth.push(w)
+        flFNest.push(-1)
+        flFOff.push(0)
+      } else {
+        const nest = flatIndexOf(flatFieldTyName(dfields[fi]))
+        if nest >= 0 {
+          // A nested flat record INLINES: its bytes sit at the offset the running
+          // sum has reached, and reaching one of ITS fields is `Outer.k + Inner.a`
+          // — which is why the constant surface needs only one level of access.
+          flFNames.push(fname)
+          flFWidth.push(-1)
+          flFNest.push(nest)
+          flFOff.push(0)
+        } else {
+          // A field whose type failed to resolve at all was already reported by
+          // the declaration pass; do not cascade a second message onto it.
+          if !flatTyAlreadyErrored(fty) {
+            tErr(
+              "field '" +
+                fname +
+                "' cannot be in a `flat` type: " +
+                flatWhyNot(fty, flatFieldTyName(dfields[fi])) +
+                " — a flat field must be i32/i64/f32/f64, a newtype over one of " +
+                "those, or another `flat` type",
+              dfields[fi],
+            )
+          }
+          bad = true
+        }
+      }
+    }
+    fi = fi + 1
+  }
+  flFCount[d] = flFNames.length - flFStart[d]
+  if bad { flSizes[d] = FL_INVALID }
+  0
+}
+
+// The resolved arena type of field `fi` of the record registered at `declTyIx`.
+// The declaration pass pushed field types in declaration order into the SAME
+// arrays the placeholder holds, so the index lines up with `tdFields`.
+function flatFieldTyOf(declTyIx: i32, fi: i32) {
+  if declTyIx < 0 { return -1 }
+  const pt = T.tys[declTyIx]
+  if pt is TyObj {
+    const ftys = pt.objFieldTypes
+    if fi < ftys.length { return ftys[fi] }
+  }
+  -1
+}
+
+// Whether an unusable field type is one the declaration pass ALREADY reported
+// (an unresolvable annotation lands as the error type). Suppresses a second
+// message on the same field.
+function flatTyAlreadyErrored(tyIx: i32) {
+  if tyIx < 0 { return true }
+  const t = T.tys[tyIx]
+  if t is TyErr { return true }
+  false
+}
+
+// The clause naming WHY a field type has no place in a flat record. Every arm
+// names a representation fact, because that is the thing the programmer has to
+// work around.
+function flatWhyNot(tyIx: i32, spelling: string) {
+  if tyIx < 0 { return "its type has no byte width" }
+  const t = T.tys[tyIx]
+  if t is TyPrim {
+    if t.primName == "boolean" {
+      return "`boolean` has no declared byte width (use i32 — C's `bool` is 1 " +
+        "byte and VL's is 4, so this tier will not guess)"
+    }
+    if t.primName == "string" { return "a string is a heap reference" }
+    return "`" + t.primName + "` has no byte width"
+  }
+  if t is TyArray { return "an array is a heap reference" }
+  if t is TyMap { return "a map/set is a heap reference" }
+  if t is TyFunc { return "a function value is a reference" }
+  if t is TyNullable {
+    return "a nullable has no in-memory discriminant in this tier"
+  }
+  if t is TyUnion { return "a union is boxed on the heap" }
+  if t is TyObj {
+    if spelling == "" { return "an inline record is not a `flat` type" }
+    return "`" + spelling + "` is a record but is not declared `flat`"
+  }
+  "its type has no byte width"
+}
+
+// Try to size declaration `d`: succeeds once every nested record it holds has a
+// size. Fills the per-field byte offsets as a RUNNING SUM — no alignment, no
+// padding, no reordering (§2).
+function flatTrySize(d: i32) {
+  const start = flFStart[d]
+  const count = flFCount[d]
+  let k = 0
+  while k < count {
+    if flFWidth[start + k] < 0 {
+      const nest = flFNest[start + k]
+      if nest < 0 { return false }
+      if flSizes[nest] == FL_UNRESOLVED { return false }
+      // A nested record that is INVALID makes this one unsizeable too, but the
+      // error is already on the page — take the declaration out of the fixpoint
+      // silently rather than reporting a cycle for it.
+      if flSizes[nest] == FL_INVALID {
+        flSizes[d] = FL_INVALID
+        return true
+      }
+    }
+    k = k + 1
+  }
+  let off = 0
+  let j = 0
+  while j < count {
+    flFOff[start + j] = off
+    let w = flFWidth[start + j]
+    if w < 0 { w = flSizes[flFNest[start + j]] }
+    off = off + w
+    j = j + 1
+  }
+  flSizes[d] = off
+  true
+}
+
+// The i32 value of the layout constant `name.prop`, or -1 when `prop` names
+// neither the record's size nor one of its fields. Only ever asked about a name
+// that is already known to be a sized flat type.
+function flatConstOf(d: i32, prop: string) {
+  if prop == "size" { return flSizes[d] }
+  const start = flFStart[d]
+  const count = flFCount[d]
+  let k = 0
+  while k < count {
+    if flFNames[start + k] == prop { return flFOff[start + k] }
+    k = k + 1
+  }
+  -1
+}
+
+// The `N.size` / `N.field` interception at the top of `checkMemberNode`, and the
+// only place the layout sidecar is READ. Answers 0 for an ordinary field access
+// (which the rest of `checkMemberNode` then handles), 1 when the node was FOLDED
+// to its constant, and 2 when it reported an error.
+//
+// THREE GUARDS, and together they make this unreachable from any program that
+// compiles today:
+//   1. the receiver is a BARE IDENTIFIER — `TValue.size`, never `f().size`;
+//   2. the identifier does NOT resolve as a value. A local named `TValue` shadows
+//      the layout constants, and every `x.f` in an existing program has a value
+//      `x` by construction, so no existing access can be diverted;
+//   3. the identifier names a FLAT type. A declared NON-flat type gets a targeted
+//      message naming `flat` — master answers `undeclared identifier 'N'` here,
+//      which teaches nothing, and that message is the feature's discoverability
+//      path.
+//
+// The FOLD is an in-place arena rewrite to a `NumLit`, the technique
+// `desugarMatchAt` already uses for `match`. It is what keeps the emitter at zero
+// lines: by the time emit runs there is no `Member` node left to lower. It is also
+// idempotent — a second visit sees a `NumLit` and never reaches here — which
+// matters because the checker re-walks nodes in its speculative windows.
+function flatMemberFold(n: Member, ix: i32) {
+  const obj = P.nodes[n.memObj]
+  if obj is Ident {
+    const nm = obj.identName
+    if lookup(nm) >= 0 { return 0 }
+    const d = flatIndexOf(nm)
+    if d < 0 {
+      if (cUserTypes[nm] ?? -1) >= 0 {
+        tErr(
+          "`" +
+            nm +
+            "` is not a `flat` type, so it has no byte layout — only a " +
+            "`flat type " +
+            nm +
+            " = { … }` has `.size` and per-field offsets",
+          ix,
+        )
+        return 2
+      }
+      return 0
+    }
+    // The declaration was rejected or is part of a cycle; its error is already on
+    // the page, so fail quietly rather than cascade onto every use site.
+    if flSizes[d] < 0 { return 2 }
+    const v = flatConstOf(d, n.memProp)
+    if v < 0 {
+      tErr(
+        "`flat type " +
+          nm +
+          "` has no field '" +
+          n.memProp +
+          "' — its layout members are `.size` and one offset per declared field",
+        ix,
+      )
+      return 2
+    }
+    P.nodes[ix] = P.nodes[mkNum(i32ToStr(v), n.pos)]
+    return 1
+  }
+  0
+}
+
 // ── nominal newtypes (webcraft P1.5 / A14) ──────────────────────────────────
 // The whole feature is these five functions plus one test in `assignableGo`, one
 // in `tyEqGo` and one in `checkBinExprNode`. Nothing in `emit_*.vl` changes: by
@@ -13036,6 +13451,15 @@ function checkProgramNode(n: Program) {
   nwTyIxs = []
   nwNames = []
   nwBaseTyIxs = []
+  flNames = []
+  flSizes = []
+  flFStart = []
+  flFCount = []
+  flDeclNodes = []
+  flFNames = []
+  flFWidth = []
+  flFNest = []
+  flFOff = []
   cLitUnionCopyTyIxs = []
   cLitUnionCopyAliasIxs = []
   // Pass 0: register top-level struct `type` declarations BEFORE anything else, so
@@ -13359,6 +13783,11 @@ function checkProgramNode(n: Program) {
     }
     ti = ti + 1
   }
+  // Pass 0c: MEASURE every `flat type` (webcraft P1.2). Runs here because it needs
+  // pass 0b's resolved field types (a scalar's width is read off the arena, which
+  // is what makes a newtype over a scalar work for free) and must precede any
+  // expression checking, since `N.size` / `N.field` fold against this sidecar.
+  resolveFlatLayouts(stmts)
   // Pass 1: hoist top-level function signatures so call-before-decl and mutual
   // recursion type-check.
   let hi = 0
@@ -19335,6 +19764,15 @@ function checkUnaryNode(n: Unary, ix: i32) {
 
 // Extracted from `checkNodeReal`'s `Member` arm (C3: thin the dispatcher).
 function checkMemberNode(n: Member, ix: i32) {
+  // FLAT LAYOUT CONSTANT (webcraft P1.2): `TValue.size` / `TValue.tt`. Answered
+  // BEFORE the receiver is checked, because the receiver is a TYPE name and
+  // checking it as an expression is `undeclared identifier` — which is exactly
+  // what master answers here, so this interception cannot change an existing
+  // program. `flatMemberFold` is guarded three ways (bare identifier / names a
+  // FLAT type / does not resolve as a value) and rewrites the node in place.
+  const fl = flatMemberFold(n, ix)
+  if fl == 1 { return TY_I32 }
+  if fl == 2 { return TY_ERR }
   // A flow-narrowed property path (`if o.v is T { … }`) overrides the stored
   // field type within the branch (the host's `narrowedPaths` overlay).
   const mKey = placeKeyOf(ix)
