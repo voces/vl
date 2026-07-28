@@ -1900,6 +1900,11 @@ function parseMatch(): i32 {
   expect("LBRACE")
   skipNewlines()
   const pats: i32[] = []
+  // Parallel to `pats`: each pattern's payload-binding clause (a `Block` of `const` decls) or -1.
+  // `parseMatchPattern` pushes exactly one entry per pattern, on EVERY exit including its error
+  // arm — the two columns are indexed by the same `armStart`/`armCount`, so a missed push would
+  // silently shift every later arm's bindings onto the wrong pattern.
+  const binds: i32[] = []
   const armStart: i32[] = []
   const armCount: i32[] = []
   const bodies: i32[] = []
@@ -1909,7 +1914,7 @@ function parseMatch(): i32 {
     let cnt = 0
     let morePat = true
     while morePat {
-      pats.push(parseMatchPattern(scrut))
+      pats.push(parseMatchPattern(scrut, binds))
       cnt = cnt + 1
       if peekKind() == "PIPE" {
         advance() // "|"  (an OR-pattern)
@@ -1937,7 +1942,7 @@ function parseMatch(): i32 {
     going = peekKind() != "RBRACE" && peekKind() != "EOF"
   }
   expectClose("RBRACE")
-  mkMatch(scrut, pats, armStart, armCount, bodies, p0)
+  mkMatch(scrut, pats, binds, armStart, armCount, bodies, p0)
 }
 
 // Whether the token at the cursor can START a match arm's TYPE pattern: a name
@@ -1979,10 +1984,14 @@ function matchPatStartsType() {
 //
 // `(` is likewise not a pattern starter: `(A|B) =>` would be eaten by `parseTypeAtom`'s
 // FUNCTION-type arm (`(params) => ret`), silently swallowing the arrow and the arm body.
-function parseMatchPattern(scrut: i32): i32 {
+function parseMatchPattern(scrut: i32, binds: i32[]): i32 {
   const pp = peekTok().start
-  if peekKind() == "STRING" { return mkStr(advance().text, pp) }
+  if peekKind() == "STRING" {
+    binds.push(-1)
+    return mkStr(advance().text, pp)
+  }
   if peekKind() == "IDENT" && peekTok().text == "_" {
+    binds.push(-1)
     return mkIdent(advance().text, pp)
   }
   if matchPatStartsType() {
@@ -1993,13 +2002,61 @@ function parseMatchPattern(scrut: i32): i32 {
     const root = tsPop()
     const isIx = mkIsExpr(scrut, nm, pp)
     setAnnTs(isIx, root)
+    // The PAYLOAD clause is parsed after the pattern node is minted and banked, so it mints no
+    // type spelling of its own and `annTsNode` stays strictly increasing.
+    binds.push(parseMatchPayload(scrut))
     return isIx
   }
+  binds.push(-1)
   P.diags.push(
     { msg: "match pattern must be a type, a string literal, or `_`", at: P.pos },
   )
   advance()
   mkErr("pat", P.pos, pp)
+}
+
+// The optional PAYLOAD clause of a variant pattern (phase 2b): `Move{x, y}` binds one arm-local
+// `const x = <scrut>.x` per named field. Returns a `Block` holding those `LetDecl`s, or -1 when the
+// pattern carries no clause. Punned field names only — `{x: a}` (renaming) and `{p: {x, y}}`
+// (nested) are recorded as deferred in docs/internals/match-design.md.
+//
+// The clause is unambiguous exactly where it is legal: after a pattern's type atom the only tokens
+// the arm grammar allows are `|`, `=` (of `=>`) and this `{`. The arm BODY's own `{` is on the far
+// side of the `=>`, and an inline object TYPE pattern (`{c: i32} => …`) is consumed WHOLE by
+// `parseTypeAtom` before this ever peeks, so it cannot be mistaken for a payload clause on an
+// empty pattern.
+//
+// The initializer reads the SHARED scrutinee node — the same node every arm's `IsExpr` tests, so
+// the binding narrows through that arm's `is` fact exactly like the hand-written
+// `if cmd is Move { const x = cmd.x … }` this lowers to.
+function parseMatchPayload(scrut: i32): i32 {
+  if peekKind() != "LBRACE" { return -1 }
+  const bp = peekTok().start
+  advance() // "{"
+  skipNewlines()
+  const lets: i32[] = []
+  let going = peekKind() != "RBRACE" && peekKind() != "EOF"
+  while going {
+    const fp = peekTok().start
+    if peekKind() == "IDENT" {
+      const fname = advance().text
+      const mem = mkMember(scrut, fname, fp)
+      lets.push(mkLet("const", fname, -1, mem, fp))
+    } else {
+      P.diags.push(
+        { msg: "match payload binding must be a field name", at: P.pos },
+      )
+      advance()
+    }
+    skipNewlines()
+    if peekKind() == "COMMA" {
+      advance()
+      skipNewlines()
+    }
+    going = peekKind() != "RBRACE" && peekKind() != "EOF"
+  }
+  expectClose("RBRACE")
+  mkBlock(lets, bp)
 }
 
 // `"while" expr block` — `label` is the loop's label when dispatched from the
