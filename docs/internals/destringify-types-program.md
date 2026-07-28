@@ -28771,3 +28771,188 @@ blind instrument.
   slice's 63 differ by exactly `isTopLevelFuncTypeName`, the one body that deliberately stayed — and
   the same +1 explains its "44" for the pre-phase-0 tree. A one-line explanation retires the
   discrepancy for every later census; "roughly 63" would have re-opened it every time.
+
+## D-TYNAMEHOME (phases 1b + 1c) — the last seven consumers re-point, BOTH republishing lines empty, and the three-hop chase leaves the tree; the binary is byte-identical again (off master `63a73d7`)
+
+Phase 1a re-pointed the two largest consumers and left `emit_base.vl` republishing nine names for
+five emitter modules and `typecheck.vl` republishing twenty for two. **This slice is the rest:**
+`emit_collect` + `emit_mono` (1b), then `emit_rewrite` + `driver` + `emit_rep` + `emit_sections`
+(1c). Both republishing lines empty and are deleted.
+
+### THE CENSUS, RE-DERIVED — AND #1232's 205 RECONCILED TO THE CALL
+
+Instrument: comment-stripped, string- and char-literal-aware, **newline-preserving** so
+index → line stays exact; import/export ENTRIES found by brace-MATCHING from the keyword, never by
+reading a "block" and never by global depth tracking. Over `compiler/*.vl` at `63a73d7`:
+
+| | #1232 | re-derived here | reconciliation |
+|---|---:|---:|---|
+| grammar CALL sites | 205 | **203** | the ONLY module that disagrees is `tyname.vl`'s own internal self-calls (20 vs **18**); one of the two is the `gaeLtAt(ann)` mention inside a COMMENT at `tyname.vl:647`. **The nine CONSUMER modules match to the call: 205 − 20 = 185 = 203 − 18.** |
+| import ENTRIES | 63 | **63** | exact |
+
+**A first pass of this census mis-attributed `emit_mono`'s and `emit_rewrite`'s imports to
+`./emit_query` and `./emit_state`.** The statement splitter tracked bracket depth globally, went
+negative once, and never re-closed a statement — so the "source module" scan ran past the import's
+own `} from "./emit_base"` and picked up the NEXT statement's. Brace-matching from the keyword
+fixed it. Recorded because the wrong answer looked entirely plausible: it named real modules that
+really are imported by those files, and only reading the raw lines refuted it.
+
+### WHAT WAS RE-POINTED, AND WHAT EMPTIED
+
+**1b — `emit_collect.vl` (9 entries) and `emit_mono.vl` (4).** `emit_collect` is the one consumer
+whose nine arrive on TWO lines: eight from `emit_base` and `nameIsFuncTypeAtom` straight from
+`typecheck`. All nine now come from `./tyname`.
+
+**1c — `emit_rewrite.vl` (2), `driver.vl` (1, direct to `typecheck`), `emit_rep.vl` (1),
+`emit_sections.vl` (1).** `emit_rep.vl:49` is the single-line import a block-reading census scores
+0; it keeps `nameIsShapeSpanEnds` from `emit_base` (a LAYER, not a grammar) and takes
+`peelGroupParens` from the home.
+
+**`emit_base.vl`'s re-export EMPTIED and is deleted.** Its nine names merged into its own plain
+`./tyname` import: 5 + 9 = **14**, which is exactly the 14 grammars it calls. It now publishes none.
+
+**`typecheck.vl`'s re-export EMPTIED of outside consumers and DEMOTED to a plain `import`, 20 → 17.**
+`emit_collect`'s `nameIsFuncTypeAtom` and `driver`'s `gaeLtAt` were the last two; the three names
+dropped are `parenEnclosesWhole` and `tyGtIsClose` (no consumer through here since phase 0 published
+all twenty uniformly) and `peelGroupParens` (last one lost in 1a). The 17 kept are exactly the
+grammars the checker itself calls.
+
+Entries go **63 → 60** — the only slice in phase 1 where the total moves, because it is the only one
+that unpublishes. Calls stay **203 → 203 and are FLAT BY CONSTRUCTION**: a re-point cannot route a
+call.
+
+### THE IMPORT GRAPH AFTER — EVERY CONSUMER IS EXACTLY ONE HOP
+
+```
+                          tyname (leaf, 0 imports)
+   ┌────────┬────────┬────────┬────┴───┬────────┬────────┬────────┬────────┐
+typecheck emit_base emit_    emit_   emit_    emit_    emit_    driver
+  (17)      (14)    classify collect  mono    rewrite  rep/sections
+                      (11)     (9)     (4)      (2)      (1)/(1)
+```
+
+Nothing republishes the grammars any more. The three-hop chase
+(`tyname` → `typecheck` → `emit_base` → an emitter module) is gone.
+
+### THE TRIM IS RESOLVER-ENFORCED, NOT GREPPED — WITH AN INVERTED CONTROL
+
+Five probes, each a scratch COPY of the candidate tree, every rc taken bare:
+
+| probe | rc | resolver output |
+|---|---:|---|
+| **P0 CONTROL** — the shipped candidate | **0** | **0 "is not exported by" errors.** This IS the proof both lines emptied: the compiler builds itself with neither republication present. |
+| P1 — `tyname.vl` stops exporting `nameIsArray` | 1 | names **all seven** live consumers: `typecheck` `emit_base` `emit_sections` `emit_classify` `emit_collect` `emit_rewrite` `emit_mono` — **exactly the seven modules the per-name census says call it, derived independently** |
+| P2 — all five former `emit_base` consumers ask it again | 1 | 17 errors across all five modules by name and column |
+| P3 — `driver` asks `gaeLtAt` of `./typecheck` again | 1 | `driver.vl:81:9: "gaeLtAt" is not exported by "./typecheck"` |
+| P4 — `emit_rep` asks `peelGroupParens` of `./typecheck` | 1 | `emit_rep.vl:50:9: "peelGroupParens" is not exported by "./typecheck"` — one of the three the 20 → 17 trim dropped |
+
+P1 is worth more than the trim it grades: **the resolver enumerates consumers, so it is a second,
+independent census instrument.** It agreed with the comment-stripped scanner exactly, which is a
+stronger reconciliation than two greps agreeing.
+
+(P2's 17 include `emit_collect`'s `nameIsFuncTypeAtom`, which `emit_base` never published — the
+probe over-points it. The re-export's real load was **16** entries: 8 + 4 + 2 + 1 + 1.)
+
+### INERTNESS — THE BINARY IS BYTE-IDENTICAL, SO THREE INSTRUMENTS ARE VACUOUS
+
+| instrument | reading |
+|---|---|
+| **the candidate compiler's OWN BINARY** | 1,041,412 B, sha256 `65f06850…` — **`cmp` against master's own build returns 0. BYTE-IDENTICAL.** Both also equal the freshly fetched published seed. |
+| corpus A/B vs master, 6 readings, **1,532** files | 0 check-rc · 0 diagnostic-text · 0 build-rc · 0 wasm-sha256 · 0 run-rc · 0 run-stdout |
+| fuzz A/B, pinned seeds 1–7 × depths 4–6 × 200 × {plain, declared}, 42 runs/side | 0 lines differing |
+
+Phase 1a's rule holds and this slice is its second confirmation: **a re-point that does not change
+the module SET cannot change the program, so `cmp` subsumes the behavioural instruments.** Note this
+slice *unpublishes* three names and *deletes two module lines* and the bytes still do not move —
+publication is a resolve-time fact with no runtime residue.
+
+### THE CALIBRATION — AND A NULL RESULT WORTH MORE THAN THE ONE THAT WORKED
+
+A zero is worth what the instrument would have shown had something been wrong, so two sabotages were
+built on top of the candidate, each ONE edit inside `tyname.vl`:
+
+| | build | corpus A/B (1,532 files), by channel |
+|---|---|---|
+| CONTROL (shipped candidate) | 1,041,412 B, identical | 0 · 0 · 0 · 0 · 0 · 0 |
+| **W3** `nameIsArray` loses `name[n-2] != '['` | 1,041,3**92** B — **the compiler really changed** | **0 · 0 · 0 · 0 · 0 · 0** |
+| **W2** `nameIsBraceSpanEnds` loses `&& name[len-1] == '}'` | 1,041,3**90** B | 0 check-rc · 0 diagnostic-text · **27** build-rc · **29** wasm-sha256 · **29** run-rc · **29** run-stdout |
+
+**W3 is a NULL CALIBRATION and it is the finding.** The sabotage is real — it moved the compiler 20
+bytes — and 1,532 corpus files, six channels, could not see it. The reason is that its divergence
+population is empty: a type name ending in `]` whose previous character is not `[` does not occur, so
+dropping the opening-bracket conjunct changes the answer on no input the corpus contains. This is
+precisely the trap `arrElemNameRaw`'s own header records for sabotage S4 ("a 0 is not agreement when
+the divergence population is empty — it is the absence of a witness"), reproduced here by accident
+while calibrating something else. **Had W3 been the only calibration run, this slice would have
+concluded "the corpus is blind to the grammars I re-pointed" — which is false.** W2, on the same
+corpus and the same harness, reads 29.
+
+W2 also reproduces #1231/#1232's finding that a grammar sabotage is **invisible to `vl check`** —
+check-rc and diagnostic-text both 0 while the emitter produces different bytes for 29 files.
+
+**One decomposition that does NOT reproduce #1232's.** Its W2 row reads run-stdout **31** against its
+own wasm-sha256 of 29. Here the three emit/run channels are **set-identical** — the same 29 files,
+`comm` returns empty in both directions — and 31 > 29 is not reachable that way unless two files
+diverged in stdout while emitting identical bytes. Filed as unreconciled: the corpus grew 1,524 →
+1,532 between the slices, so the two readings are not over the same population, and this slice does
+not claim #1232's number was wrong — only that its own harness cannot produce that shape.
+
+### GATE — every rc taken BARE (`cmd > log 2>&1; rc=$?`)
+
+| leg | rc | result |
+|---|---:|---|
+| `fetch-seed.sh` (freshly fetched, published) | 0 | 1,041,412 B |
+| `refresh-compiler.sh --prove-fixpoint` | 0 | **`compile(seed) == seed` at the ONE-compile rung — the published seed IS the fixpoint of THIS source**, which is the byte-identity result arriving early |
+| `native-fixpoint.sh` | 0 | stage3 == stage4, 1,041,412 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,246 passed / 0 failed / 8 ignored** — master's numbers to the test; **8** ignored, not 14, so the six `vl build -O` tests really ran |
+| `lint-self.sh` (incl. `vl fmt --check`) | 0 | clean — after `vl fmt` expanded `emit_mono.vl`'s new import, which shipped over-width on the first write |
+| `deno check compiler/*.ts` · `deno lint` · `lsp deno task build` | 0 · 0 · 0 | clean |
+| `rep-fuzz-check.sh` | 0 | exact — 1 baselined (0 unsound / 1 reject), 0 new / 0 stale |
+| `native-corpus-sweep.sh` | 0 | PASS=1209 CHECKFAIL=3 RUNFAIL=0 LOGDIFF=0 (the 3 are the documented `// @run`-in-prose noise) |
+| corpus A/B vs master, 6 readings, 1,532 files | 0 | 0 on all six |
+| fuzz A/B, PINNED seeds 1–7 × depths 4–6 × 200 × {plain, declared} | 0 | 42 runs/side, 0 lines differing |
+| **`cmp` the two COMPILERS** | **0** | **byte-identical, sha256 `65f06850…`** |
+
+### REFUTED
+
+1. **"`emit_mono` and `emit_rewrite` take their grammars from `emit_query` / `emit_state`."** My own
+   first census said so, from a depth-tracking statement splitter that had gone negative. They come
+   from `emit_base`, as #1232's hand-off said. A census instrument needs its OWN control; this one
+   got it by reading the raw lines it claimed to have parsed.
+2. **"A behavioural sabotage that changes the compiler's bytes will show up in the corpus."** W3
+   changed the binary by 20 B and moved 0 of 1,532 files on 6 channels. Bytes-moved and
+   corpus-moved are independent; neither implies the other.
+3. **#1232's "the interesting gate for phase 1b/1c is *does it build*, not *does it differ*."**
+   Correct, and this slice is the case that proves it: it is the only phase-1 slice that unpublishes
+   anything, so it is the only one where a wrong answer was reachable at all — and the resolver
+   caught every planted wrong answer by name and column while all three behavioural instruments sat
+   at zero throughout.
+
+### HAND-OFFS
+
+* **`tyname.vl`'s own header graph is now stale, and it is outside this slice's partition.** Lines
+  31–35 draw `tyname ← typecheck ← emit_base ← {six emitter modules}` plus "typecheck also
+  re-exports to driver.vl", and say "A consumer reaches a home through up to THREE re-export hops".
+  After this slice there are NO re-export hops: nine modules import the leaf directly. Comment-only.
+  The nearby "21 bodies" is still right — 20 exported plus the private `skipQuotedName`.
+* **PHASE 2 is `splitUnionAtoms` / `unionMemberCount`**, deliberately left in `typecheck.vl` by
+  phases 0–1c. Phase 1 is DONE: no import re-point work remains, so phase 2 is a body MOVE, not a
+  re-point — which means it changes the module SET, and therefore **it does not inherit this slice's
+  free instrument.** It will need the frozen-source rebuild that #1231 used, and it should budget for
+  the merge order permuting the binary (#1231 moved −27 B for exactly that reason).
+* **A phase-2 census must not reuse the 20-name grammar list.** These two are checker bodies that
+  reach beyond a string; the boundary test is `tyname.vl`'s own "pure function of a string", and
+  `isTopLevelFuncTypeName` stays put for the recorded reason (it writes the `funcArrowAt` bank).
+
+### LESSONS
+
+* **Run two calibrations, not one, and prefer one with a KNOWN reading.** W3 was the natural choice
+  for this slice — it targets the grammar most of the re-pointed modules call — and it reads zero for
+  a reason that has nothing to do with the corpus's coverage. W2's 29 is only interpretable because
+  #1231 and #1232 had already published 31 and 29 for it.
+* **The resolver is a census instrument, not just a gate.** Unpublish a name and it prints every live
+  consumer, by file and column, derived from the real module graph rather than from a regex over
+  text. Any slice re-deriving a call/import census can grade its own scanner against it for free.
+* **An import re-point's only real risk is the one the compiler already refuses to compile.** Three
+  behavioural instruments read zero across this slice and none of them could have read anything else;
+  the five that found something were all resolver errors from deliberately planted mistakes.
