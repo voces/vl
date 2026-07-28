@@ -1,0 +1,60 @@
+// @emit-error emitProgram: nested arrays are not supported
+// A generic type ALIAS whose body puts the type PARAMETER under TWO arrays
+// (`type Box<T> = { v: T[][] }`). `vl check` is rc=0; every instantiation is an emit
+// error. The sibling `type-param-list-field.vl` (ONE array) runs, and so does the
+// concrete twin `type Box = { v: i32[][] }` — nested arrays are supported, so the
+// message names a construct that is not the problem.
+//
+// THE ANSWER IS NOT "NESTED ARRAYS", AND NOT THE RESULTING TYPE. The decisive probe
+// is the neighbour `type-param-list-field-nested-arg.vl`: `type Box<T> = { v: T[] }`
+// applied at `Box<i32[]>` produces the SAME `{v: i32[][]}` shape and RUNS. What
+// separates them is the DEPTH the parameter sits at IN THE ALIAS BODY, nothing about
+// the type that comes out.
+//
+// MECHANISM, read from the emitter's own tables (an instrumented build dumping the
+// ref-list rows at the reject):
+//
+//   ROWS: [0] i32[] /kind 4   [1] T[] /kind 1
+//   FLD  si=0 fi=0 elemName=T[] elemTyIx=-1 arenaLeg=-1 nameLeg=1
+//
+// The substituted shape's field `v` records its ref-list ELEMENT as `T[]` — the
+// UN-substituted parameter. Row 0 is the row this literal needs (`i32[]`, element
+// kind 4 = a nested i32 list) and it is already interned; nothing points at it.
+// `emitObj`'s code-5 arm threads `sFieldRefSlot` = row 1, whose element kind is 1
+// (a STRUCT element), so `emitArr`'s ref-list branch reaches the guard that forbids
+// an array element and raises the message above.
+//
+// ANCHOR — `gaeApplyFieldTy` (`compiler/emit_base.vl`), whose whole body is:
+//
+//     if tn == pnames[i] { return args[i] }
+//     if tn == pnames[i] + "[]" { return args[i] + "[]" }
+//
+// Two depths, and its own header says so ("a declared param name (or its `T[]` array
+// form)"). `T[][]` matches neither, so it is returned unchanged. This is the THIRD
+// appearance of the shape #1218 and #1230 each found — a classifier taught half a set
+// its sibling has whole — and it is the SIBLING of the one #1230 fixed: #1230 taught
+// `genTyParamArr` to peel to the LEAF (`arrLeafNameOf`) so the DECLARATION stopped
+// drawing a wrong message; the APPLICATION's substitution kept its two-depth ladder.
+//
+// THE REMEDY IS MEASURED, NOT SKETCHED. Peeling `tn` to its leaf, matching the leaf
+// against the parameter and re-attaching the same `[]` depth turns 8 cells green
+// (`T[][]` at i32 / string / struct leaves, a second field beside it, `T[][][]`, an
+// array-typed argument, and one of two parameters nested) and breaks 1: with no
+// SHADOW GUARD it swallows `type Box<i32> = { v: i32[][] }` applied at `Box<string>`,
+// which master lowers correctly today. That guard is #1230's own bycatch, and
+// building it found a LIVE invalid-wasm hole on master at the depths that DO
+// substitute — `type Box<i32> = { v: i32 }` + `const b: Box<string> = { v: 1 }` is
+// `vl check`-clean and emits a module that does not parse. `gaeApplyFieldTy` has no
+// shadow guard at any depth. Both are filed; `compiler/emit_base.vl` was outside this
+// slice's partition.
+//
+// Refuted along the way: "nested arrays as such" (the concrete twin runs), "the
+// element type" (i32 / string / struct leaves read the same cell), "the resulting
+// type" (the same `{v: i32[][]}` runs when it is spelled `Box<i32[]>` over `T[]`),
+// and "the declaration" (`type-param-list-field-uninstantiated.vl`'s axis — the
+// declaration ALONE compiles here; only the APPLICATION rejects).
+type Box<T> = { v: T[][] }
+
+const b: Box<i32> = { v: [[1, 2]] }
+
+print(b.v.length)
