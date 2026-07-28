@@ -178,6 +178,61 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: a `match` arm's payload clause round-trips and canonicalizes its spacing",
+  ignore: !ENABLED,
+  fn: async () => {
+    // A payload-binding clause (`Move{x, y}`, phase 2b) is NOT part of the pattern node's source
+    // span — the pattern's `IsExpr` is minted before the clause is parsed — so a formatter that
+    // renders the pattern from its verbatim slice DELETES every binding from the file. That is a
+    // silent miscompile of the user's source, not a cosmetic drift, which is why this asserts the
+    // clause SURVIVES before it asserts anything about spacing.
+    const src = "type Move = { x: i32, y: i32 }\n" +
+      "type Attack = { target: string }\n" +
+      "type Cmd = Move | Attack\n" +
+      "function f(c: Cmd) {\n" +
+      "  match c {\n" +
+      "    Move{x,y} => x + y\n" +
+      "    Attack{ target , } => target.length\n" +
+      "  }\n" +
+      "}\n" +
+      "print(f({ x: 1, y: 2 }))\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!/ {4}Move\{x, y\} => x \+ y\n/.test(r.out)) {
+      throw new Error(`payload clause dropped or not canonicalized:\n${r.out}`);
+    }
+    if (!/ {4}Attack\{target\} => target\.length\n/.test(r.out)) {
+      throw new Error(`trailing-comma payload clause not canonicalized:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) {
+      throw new Error(`payload clause formatting not idempotent:\n${r2.out}`);
+    }
+    // The formatted source must still MEAN the same thing: re-checking it is what catches a
+    // clause that round-tripped as text but lost a binding.
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_bind_" });
+    try {
+      const f = `${dir}/a.vl`;
+      await Deno.writeTextFile(f, r.out);
+      const chk = new Deno.Command(VL, {
+        args: ["check", f, "--compiler", COMPILER],
+        stdout: "piped",
+        stderr: "piped",
+        env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+      });
+      const { code, stdout } = await chk.output();
+      if (code !== 0) {
+        throw new Error(
+          `formatted output no longer checks:\n${new TextDecoder().decode(stdout)}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: -w rewrites a drifted file in place (idempotent)",
   ignore: !ENABLED,
   fn: async () => {
