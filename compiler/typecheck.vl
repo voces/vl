@@ -7671,6 +7671,49 @@ function nomLitAdopts(srcExpr: i32, srcTy: i32, dstTy: i32) {
   ok
 }
 
+// Does `dstTy` carry a nominal brand at or under its wrappers? The GATE for the
+// expression-aware retry below: shallow on purpose — a brand is a property of a
+// declared type, and the destination shapes a slot check meets are the type
+// itself or one or two wrappers over it (`V?`, `V[]`, `V | null`).
+function tyReachesBrand(ty: i32, d: i32) {
+  if ty < 0 { return false }
+  if d <= 0 { return false }
+  if nomNameOfTy(ty) != "" { return true }
+  const t = T.tys[ty]
+  if t is TyNullable { return tyReachesBrand(t.nInner, d - 1) }
+  if t is TyArray { return tyReachesBrand(t.aElem, d - 1) }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    let any = false
+    while i < ms.length {
+      if tyReachesBrand(ms[i], d - 1) { any = true }
+      i = i + 1
+    }
+    return any
+  }
+  false
+}
+
+// The expression-aware retry for a slot checked with the BARE structural
+// `assignable` (the map `.set` pair). `assignableExpr` is where every contextual
+// coercion lives — the scalar-literal brand adoption AND the object-literal
+// field-wise adaptation, which is the one a nominal STRUCT slot needs and which
+// `nomLitAdopts` deliberately cannot supply (relaxing a whole walk under an
+// object literal would waive the brands of its field VALUES too).
+//
+// Gated on the destination actually carrying a brand, so a program with no `new`
+// — and a newtype program's brand-free slots — keep the bare structural check
+// they have today, byte for byte. Without the gate this would widen every map
+// slot to `assignableExpr`'s coercions, which is a real behaviour change and an
+// unrelated one.
+function nomSlotAccepts(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if nwTyIxs.length == 0 { return false }
+  if srcExpr < 0 { return false }
+  if !tyReachesBrand(dstTy, 6) { return false }
+  assignableExpr(srcExpr, srcTy, dstTy)
+}
+
 // The branded arena index for newtype `name` over base `base` — minted once per
 // (name, base) pair and reused, so `assignable`'s `src == dst` fast path still
 // fires and `resolveAnnot`'s name-keyed memo stays stable across resolutions.
@@ -10674,7 +10717,7 @@ function checkCallNode(n: Call, ix: i32) {
             tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the key in place
           } else if (
             !assignable(k0, rt.mKey) &&
-            !nomLitAdopts(margs2[0], k0, rt.mKey)
+            !nomSlotAccepts(margs2[0], k0, rt.mKey)
           ) {
             tErr(
               "set: expected " + tyToStr(rt.mKey) + ", got " + tyToStr(k0),
@@ -10686,7 +10729,7 @@ function checkCallNode(n: Call, ix: i32) {
             tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
           } else if (
             !assignable(v0, rt.mVal) &&
-            !nomLitAdopts(margs2[1], v0, rt.mVal)
+            !nomSlotAccepts(margs2[1], v0, rt.mVal)
           ) {
             // A map slot is one of the positions checked with the bare structural
             // `assignable` rather than `assignableExpr`, so the newtype's
