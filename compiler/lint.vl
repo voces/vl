@@ -93,6 +93,8 @@ import {
   WhileStmt,
 } from "./ast"
 import { P, declNameTokOf, nodeToks } from "./ast"
+// The free INDEX-OPERATOR declaration-name encoding (B14).
+import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
 import {
   ArrayLit,
   AsExpr,
@@ -554,6 +556,16 @@ let lintRefNames: {[string]: i32} = Map()
 
 function refNamesHas(name: string) { (lintRefNames[name] ?? 0) != 0 }
 
+// Did the file use a bracket at all — a READ `x[i]`, a WRITE `x[i] = v`? An
+// INDEX OPERATOR (B14) has no callable name, so the reference-NAME set above
+// structurally cannot see it referenced: its only use spelling is the bracket,
+// which resolves to a declaration by the receiver's TYPE, and lint runs on the
+// parse tree with no types. These two flags are the whole signal this walk can
+// honestly give — enough to keep flagging an operator in a file that brackets
+// nothing, and never enough to flag one that might be the bracket's target.
+let lintSawIndexRead = false
+let lintSawIndexWrite = false
+
 function refNamesAdd(name: string) {
   lintRefNames[name] = 1
   0
@@ -746,6 +758,8 @@ function nameVisit(ix: i32) {
     // An operator method (`-x` → `function -(self)`) dispatches by operator name;
     // the TS reference walk records it as a `FunctionCall` callee, so mirror it.
     refNamesAdd(n.unOp)
+  } else if n is Index {
+    lintSawIndexRead = true
   } else if n is BinExpr {
     // An assignment `x = e` (the parser desugars `x += e` / `x++` to this shape)
     // whose LHS is a bare name marks that BINDING written — prefer-const
@@ -754,6 +768,7 @@ function nameVisit(ix: i32) {
       if n.binLeft >= 0 && n.binLeft < P.nodes.length {
         const lhs = P.nodes[n.binLeft]
         if lhs is Ident { bindMark(lhs.identName, 1) }
+        if lhs is Index { lintSawIndexWrite = true }
       }
     } else {
       // An operator (`a + b` → `function +(self, b)`) dispatches by operator
@@ -874,6 +889,8 @@ function bindScan(ix: i32) {
 
 function collectBindingsAndRefs(progRoot: i32) {
   lintRefNames = Map()
+  lintSawIndexRead = false
+  lintSawIndexWrite = false
   lintPropNames = Map()
   lintTypeNames = Map()
   declNodes = []
@@ -1071,16 +1088,25 @@ function unusedFunctions(stmts: i32[]) {
       const s = P.nodes[ix]
       if s is FuncDecl {
         // A referenced function (called, passed as a value, method/operator
-        // dispatch) is not dead. Exported functions are public surface.
-        if !refNamesHas(s.fnName) && !declIsExported(ix) {
+        // dispatch) is not dead. Exported functions are public surface. An
+        // INDEX OPERATOR is spared by the bracket's mere presence — the walk
+        // cannot say which declaration a bracket resolves to.
+        let opUsed = false
+        const opk = opDeclOpOf(s.fnName)
+        if opk == OP_INDEX_GET { opUsed = lintSawIndexRead }
+        if opk == OP_INDEX_SET { opUsed = lintSawIndexWrite }
+        if !refNamesHas(s.fnName) && !declIsExported(ix) && !opUsed {
+          // The declaration reads back in its SOURCE spelling (`"[]" for V`),
+          // never as the name the parser minted for it.
+          const label = opDeclLabel(s.fnName)
           let sev = "warning"
           let msg = "Unused function `" +
-            s.fnName +
+            label +
             "` (prefix with `_` to suppress, remove it, or `export` it)"
           if startsUnderscore(s.fnName) {
             sev = "hint"
             msg = "Intentionally-unused function `" +
-              s.fnName +
+              label +
               "` (leading `_` marks it unused)"
           }
           // Anchor at the declaration's NAME token (like unused-variable /
