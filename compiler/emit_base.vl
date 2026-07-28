@@ -61,6 +61,7 @@ import {
   annGenAppSpanEnds,
   arrElemNameRaw,
   gaeLtAt,
+  groupInnerOf,
   listElemNameOf,
   nameIsArray,
   nameIsBraceSpanEnds,
@@ -2163,8 +2164,13 @@ export function normTypeAtom(arm: string) {
   // for, now named. The walk stays here and stays `tyGroupWrapsWhole`: it is NOT
   // `peelGroupParens`'s `parenEnclosesWhole` (they disagree on a never-closing group), which
   // is exactly why the home carries the endpoints and neither walk.
+  // …and the CUT is `tyname.groupInnerOf`, the delimiter-blind home (W1). The BALANCE WALK
+  // stays out of it on purpose: this is the FOURTH distinct guard the home's call sites put
+  // in front of the same three characters of arithmetic (the other three being
+  // `nameIsParenSpanEnds`, `nameIsShapeSpanEnds` and the OPEN-only `nameIsShapeOpen`), so a
+  // cut that folded in any one of them would be wrong for the rest.
   if nameIsParenSpanEnds(t) {
-    if tyGroupWrapsWhole(t) { t = t.slice(1, t.length - 1) }
+    if tyGroupWrapsWhole(t) { t = groupInnerOf(t) }
   }
   t
 }
@@ -2492,18 +2498,22 @@ export function annObjFieldSplit(
   outNames: string[],
   outTexts: string[],
 ) {
-  const n = ann.length
   // The BRACE-SPAN home decides "is this a `{…}` group at all", and the MAP-OPEN home tells
   // the two positive answers apart — the tri-state's whole character surgery, at two homes.
-  // Both spellings are exact: the endpoint pair plus its `n < 2` bound IS `nameIsBraceSpanEnds`,
+  // Both spellings are exact: the endpoint pair plus its length bound IS `nameIsBraceSpanEnds`,
   // and once that holds, `ann[1] == '['` IS `nameIsMapOpen` (the length bound and the `ann[0]`
-  // compare are already established). The `n >= 3` conjunct the map test carried was inert —
-  // at `n == 2` the character at index 1 is the closing `}` the line above just demanded, so it
-  // can never be `[`.
+  // compare are already established). The `>= 3` conjunct the map test carried was inert —
+  // at length 2 the character at index 1 is the closing `}` the line above just demanded, so
+  // it can never be `[`.
   if !nameIsBraceSpanEnds(ann) { return -1 }
   if nameIsMapOpen(ann) { return 0 }
   const fields: string[] = []
-  gaeSplitArgs(ann.slice(1, n - 1), fields)
+  // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1). This site spelled it
+  // against a HOISTED length — `const n = ann.length` at the top, then `ann.slice(1, n - 1)`
+  // — which is why the #1239 census scored it in a separate row from the eighteen it filed
+  // under W1: the census normalises the RECEIVER but not the length EXPRESSION. Routing it
+  // retires the hoist, which had no other reader.
+  gaeSplitArgs(groupInnerOf(ann), fields)
   let j = 0
   while j < fields.length {
     const ci = fields[j].indexOf(":")
@@ -2623,7 +2633,10 @@ export function nameIsStructWithUnionField(name: string) {
   if !canonBareShapeName(name) { return false }
   const fnames: string[] = []
   const ftexts: string[] = []
-  shapeInnerFieldSplit(name.slice(1, name.length - 1), fnames, ftexts)
+  // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1) — the gate above is the
+  // guard, and `canonBareShapeName` opens with `nameIsShapeSpanEnds`, so the home's bound is
+  // already discharged here.
+  shapeInnerFieldSplit(groupInnerOf(name), fnames, ftexts)
   let fi = 0
   while fi < fnames.length {
     if fnames[fi] != "" {
@@ -2668,7 +2681,8 @@ export function nameIsStructWithLitUnionField(name: string) {
   if !canonBareShapeName(name) { return false }
   const fnames: string[] = []
   const ftexts: string[] = []
-  shapeInnerFieldSplit(name.slice(1, name.length - 1), fnames, ftexts)
+  // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1), same guard as the sibling.
+  shapeInnerFieldSplit(groupInnerOf(name), fnames, ftexts)
   let fi = 0
   while fi < fnames.length {
     if fnames[fi] != "" {
@@ -2919,6 +2933,27 @@ export function monoAnnHasTyParam(ann: string, typarams: string[]) {
 // decision (and carries the primitive-shadow guard through `monoTyParamOf`), so a
 // non-parametric annotation in the same signature — `function f<T>(v: T, w: Nm)` — keeps
 // the canon'd `string` it has always had.
+//
+// #1242 SHIPPED THIS SENTENCE WITH `monoTyParamOf` UNDER IT, and the two do not say the
+// same thing: `monoTyParamOf` matches a BARE parameter and one `[]` level, so a parameter
+// behind ANY other constructor — `Id | null`, `{a: Id}`, `Inner<Id>`, `Id[][]`,
+// `(Id | null)[]` — was reported as "not parametric", the canon'd spelling was taken, and
+// the instance pinned the shadowed alias's BODY while the checker had bound the ARGUMENT.
+// That is the identical narrow-gate defect #1238 closed on the generic-ALIAS half, where
+// the gate that shipped read the array grammar and nothing else. The two halves are now
+// the same predicate: `emit_collect.gaeDeclFieldTyName` asks `gaeAnnHasParam`, which IS
+// `monoAnnHasTyParam` over the live parameters.
+//
+// THE WIDENING IS NOT FREE AND THE COST IS NAMED. It moves 21 cells from invalid wasm to a
+// loud reject and ONE cell backward — `function fnv<Id>(v: {a: Id}): Id` with
+// `type Id = string` at a string argument, which built and ran. That accept was never a
+// promise the language makes: its NON-SHADOWING control `function fnv<T>(v: {a: T}): T` is
+// `emitProgram: monomorphize: unsupported argument type for `v`` on master, so the cell
+// only ever compiled because the canon pass erased `Id` to the very type the call happened
+// to pass. An inline-shape parameter annotation on a generic FuncDecl is unsupported; the
+// shadowed spelling was reaching the supported path by accident, and it now rejects the
+// way its control always did. Measured as a 192-cell CONSTRUCTOR x DECLARATION x ARGUMENT x
+// RETURN grid, every shadow cell against its own `<T>` control.
 export function monoDeclAnnName(
   nodeIx: i32,
   canoned: string,
@@ -2926,7 +2961,7 @@ export function monoDeclAnnName(
 ) {
   const raw = declAnnRawTyName(nodeIx)
   if raw == "" { return canoned }
-  if monoTyParamOf(raw, typarams) == "" { return canoned }
+  if !monoAnnHasTyParam(raw, typarams) { return canoned }
   raw
 }
 // Substitute the per-call type-param bindings through an annotation NAME —

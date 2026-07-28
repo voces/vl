@@ -29927,3 +29927,232 @@ type Color = "red" | "green" | "blue"
 function f() { const c: Color = "blue"  const m: {[string]: string} = Map()  m["k"] = c  return 0 }
 f()                              # a literal-union atom widened into a map VALUE
 ```
+
+## W1's REMAINDER + the FuncDecl shadow gate — the group-interior cut's last six copies route, and `monoDeclAnnName` widens to the gate its own header already claimed (off master `f425023`)
+
+Two independent slices, two commits, two different burdens of proof: a routing whose burden is
+INERTNESS, and a behaviour change whose burden is a GRID WITH CONTROLS. They are measured
+separately and the byte delta is split between them.
+
+### TASK 1 — W1's `emit_base` / `emit_collect` share
+
+#1243 built `tyname.groupInnerOf` and routed `emit_classify`'s ten copies. This takes the rest of
+the partition. `typecheck`'s share was owned by another slice this cycle and is untouched — see
+the census correction at the end, which says that share is FIVE and not the census's four.
+
+**THE SITE LIST IS SIX, AND THE CENSUS'S WORKLIST SAYS FIVE.** The #1239 census named
+`emit_base.normTypeAtom` / `nameIsStructWithUnionField` / `nameIsStructWithLitUnionField` plus
+`emit_collect.shapeHasCloField` / `collectShapeVariantFields`. It misses
+**`emit_base.annObjFieldSplit`**, which writes the identical operation against a HOISTED length
+(`const n = ann.length` eleven lines up, then `ann.slice(1, n - 1)`).
+
+**That is the SAME miss shape #1243 found, in the SAME family, one file over** — `emit_classify`'s
+`rlCanonLitUnionAtoms` was missed for the identical reason. The census normalises the RECEIVER but
+not the length EXPRESSION, so both writings scored in a separate `X.slice(1, n - 1)` row (which had
+exactly two members: `emit_base` + `emit_classify`) instead of in W1's worklist. **Both members of
+that row have now been found by hand, one slice each, after the worklist sent each slice looking
+for one fewer site than it had.** #1243's tree-wide re-census already said `emit_base` 4; the
+per-family worklist a routing slice actually reads still said 3, and nothing reconciled them.
+
+Resolver-enforced rather than grepped, the #1243 instrument re-run: with the import entry deleted
+from both files the build names exactly six call sites — `emit_base` 2172 · 2515 · 2638 · 2684,
+`emit_collect` 909 · 3845. A separate exhaustive scan of every `.slice(1, …)` in both files
+classifies the other three hits out of the family by their ENDPOINT (`name.length - 3`; the
+arrow-relative `fa - 1` in `annFnDecompose`; `lt + 1`-rooted generic-application cuts), and neither
+file spells the interior any other way — no `substring`, no hand loop.
+
+**THE `< 2` BOUND VERIFIED RATHER THAN INHERITED.** #1243's finding that VL's `.slice` CLAMPS was
+re-run here as its own program: `"{"`, `""` and an explicit `slice(1, 0)` all answer `""`, with a
+non-empty fifth read in the same program as the INVERTED control proving the channel was live (a
+`print` suite that reads empty everywhere is not evidence — see the "`print` is not a measurement
+channel" record). So the home agrees with the raw expression on every input and none of the six
+sites owes a reachability argument.
+
+**AND THE CUT STAYS DELIMITER-BLIND — this slice supplies the fourth guard shape.** `normTypeAtom`
+gates the cut on a balance WALK (`tyGroupWrapsWhole`), where #1243's ten carry
+`nameIsParenSpanEnds`, `nameIsShapeSpanEnds`, the OPEN-only `nameIsShapeOpen`, or nothing at all
+because the CALLER holds the gate. Over sixteen call sites the guard is now four distinct shapes
+plus "none", which is the measured form of #1243's ruling that a polymorphic-test grammar cannot
+fold its test into its cut. The walk itself was checked for the duplication the brief suspected and
+has none: one home in `emit_base`, two consumers, and a header that already records why it must not
+be merged with `peelGroupParens`'s `parenEnclosesWhole`.
+
+#### INERTNESS — both orthogonal instruments, neither of which ranks
+
+| instrument | reading |
+|---|---|
+| **frozen-source rebuild** — master's `compiler/entry.vl` compiled by this branch's compiler | **BYTE-IDENTICAL to master's own output**, 1,044,093 B. INVERTED CONTROL: the two compilers themselves `cmp` as differing. |
+| **six-channel corpus A/B**, 1,549 files | **0 diffs on all six channels.** |
+
+#### THE CALIBRATION — TWO SABOTAGES, DIFFERENT SHAPES, DIFFERENT CHANNEL PROFILES
+
+One sabotage is not a calibration; the record holds a `tyname.vl` poison that moved the compiler 20
+bytes and 0 corpus files, which was an empty witness set rather than a blind harness.
+
+| # | shape | what it changes | corpus reading (of 1,549) |
+|---|---|---|---|
+| **S1** | the four routed **`emit_base`** sites, the CUT's arithmetic | the cut keeps the closing character (`slice(1, X.length)`) | **13 BUILDRC(0/1) · 33 BUILDMSG · 36 BYTES · 13 RUNRC** |
+| **S2** | the two routed **`emit_collect`** sites, a NAME poison | the interior is passed with `"#"` appended, corrupting the last field's type text | **138 BUILDRC(0/1) · 143 BUILDMSG · 0 BYTES · 138 RUNRC** |
+
+Both non-empty, so both routed regions have a live witness population and the 0/1,549 above is
+agreement rather than blindness. **The two profiles differ in the way #1243's pair did and for the
+same reason**: S1 moves 36 files on BYTES, S2 moves ZERO — a poison that only changes a NAME reaches
+a clean-reject verdict and never an emitted-structure difference, while a broken cut lights field 5
+up. Two sabotages, two channels, and the six-channel design paying off in miniature a second time.
+
+**−756 B for six sites** (1,044,093 → 1,043,337), i.e. 126 B/site against #1243's 135 and 139 — a
+third independent measurement of the same per-site figure, and consistent with its candidate cause
+(an inline `.slice` replaced by a CALL drops a string temporary; a function that loses its last one
+loses a scratch-frame reservation).
+
+### TASK 2 — the FuncDecl shadow gate, and a trade the owner priced at −1 that is really −10
+
+#1242 shipped `monoDeclAnnName` with a header that reads "**The GATE is `monoAnnHasTyParam` on the
+RAW spelling**" and `monoTyParamOf` on the line under it. The two are not the same predicate.
+`monoTyParamOf` matches a BARE parameter and ONE `[]` level, so a generic FuncDecl parameter behind
+`Inner<Id>`, `Id | null`, `{a: Id}`, `Id[][]` or `(Id | null)[]` was reported "not parametric", the
+canon'd spelling was taken, and the instance pinned the shadowed alias's BODY while the checker had
+bound the ARGUMENT. **It is the identical narrow-gate defect #1238 closed on the generic-ALIAS
+half**, whose shipped gate read the array grammar and nothing else — and #1242's own note says the
+alias half's gate "REPLACES the `gaeParamSlotOf(arrLeafNameOf(raw), …)` gate that shipped with the
+sidecar", which is word-for-word the situation it then left on the FuncDecl side.
+
+#### THE GRID — 192 CELLS, EVERY SHADOW CELL AGAINST ITS OWN NON-SHADOWING CONTROL
+
+Axes: the CONSTRUCTOR the parameter sits behind (8) × what the shadowed name is DECLARED as (3) ×
+the call ARGUMENT's type (3) × whether the RETURN also carries the parameter (2), plus one `<T>`
+control per (constructor, return, argument). Each cell sorted into OK / WRONG / **BADWASM** /
+EMITREJ / CHECKREJ, where BADWASM is read off the BUILD MESSAGE and not the rc — the host maps
+"wrote an invalid module" and "clean emit reject" to the same rc 1, and a sorter that reads only the
+rc collapses the two outcome classes this whole measurement is about. **A first pass did exactly
+that and reported 0 invalid-wasm cells on master.**
+
+| | master | widened |
+|---|---:|---:|
+| OK | 78 | 83 |
+| EMITREJ (loud reject) | 63 | 90 |
+| **BADWASM (invalid module, `vl check` rc=0)** | **51** | **19** |
+
+51 cells move: **26 invalid wasm → loud reject**, **6 invalid wasm → CORRECT**, **9 loud reject →
+CORRECT**, **10 CORRECT → loud reject**, and **0 controls moved**.
+
+#### THE RETURN AXIS IS WHY THE OWNER'S MEASUREMENT PRICED THIS AT +21 / −1
+
+When the return annotation ALSO carries the parameter, the erased signature leaves it unbound and
+the monomorphizer already said so out loud ("a return type parameter of `fnv` is not bound by any
+parameter"). **It is the CONCRETE-return arm that has nothing to trip that reject and writes the
+module** — and it is also where 9 of the 10 backward cells live. One return spelling per row
+measures only the half that was already loud, which is the same defect shape as
+`type-param-shadows-alias-funcdecl.vl`'s "one argument literal per row measures only the diagonal",
+one axis further out.
+
+#### THE TEN BACKWARD CELLS ARE ACCIDENTAL ACCEPTS, AND THE CONTROL IS THE PROOF
+
+The owner authorised this trade on the condition that the backward cell's non-shadowing control be
+re-measured and found REJECTING on master — and ruled that if the control were CORRECT the trade
+must not be taken. Re-measured, not inherited:
+
+| backward cell | master | widened | its NON-SHADOWING control, on MASTER |
+|---|---|---|---|
+| `fnv<Id>(v: {a: Id}): boolean`, `type Id = string`, `{a: string}` arg | **OK** (prints `true`) | `emitProgram: monomorphize: unsupported argument type for `v`` | `fnv<T>(v: {a: T}): boolean` — **the same diagnostic, character for character** |
+| `fnv<Id>(v: Id \| null): boolean`, `type Id = i32`, `i32\|null` arg | **OK** | same reject | `fnv<T>(v: T \| null): boolean` — **same diagnostic** |
+| the other 8 (`{a: Id}` ×1, `Id \| null` ×7, across the three alias bodies and three argument types) | OK | same reject | same diagnostic in every one |
+
+**All ten pass the owner's condition, so the ruling stands — but it was priced at one cell and the
+population is ten.** The reasoning generalises exactly (each of the ten is the same accidental
+accept, licensed by the same control), which is why the trade is still the right one; the number is
+not the number that was authorised, and a rule of the form "no cell moves backward" is worth ten
+times less when the cell count is measured on a grid one axis short.
+
+The mechanism is worth stating because it is what makes "accidental" a proof and not a judgement:
+an inline-shape or `| null` parameter annotation on a generic FuncDecl is **unsupported**, and the
+shadowed spelling reached the supported path only because `canonEmitTypeNames` — a name rewrite with
+no scope — erased `Id` to the very type the call happened to pass, turning the signature into a
+concrete one that never reached the monomorphizer's parameter path at all. Hand the same signature a
+DIFFERENT argument type and master writes an invalid module with `vl check` rc=0. The accept was the
+diagonal of a defect. Pinned as
+`tests/cases/generics/error-type-param-shadows-alias-inline-shape-param.vl`, with the control
+spelled out in the fixture so the cost cannot be silently un-priced.
+
+#### CORPUS: TASK 2 MOVES ZERO PRE-EXISTING FILES
+
+The six-channel A/B against master over 1,551 files reports exactly two differing rows, and both are
+the fixtures this commit adds. The widening is surgical: no corpus program spells a generic FuncDecl
+parameter behind a non-`[]` constructor with a shadowed name. The frozen-source rebuild is
+byte-identical for the FINAL compiler too, for the same reason — the compiler's own source has no
+such spelling. **Neither reading is evidence the change is inert; they are evidence the grid was the
+only instrument that could see it**, which is why a behaviour change is not measured on a corpus.
+
+**−4 B for this commit** (1,043,337 → 1,043,333); −760 B for the branch.
+
+### WHAT THIS SLICE FOUND WRONG
+
+1. **W1's `emit_base` share is 4 sites, not the worklist's 3** — `annObjFieldSplit`, missed by the
+   hoisted-length normalisation, the second and last member of the row that also hid
+   `rlCanonLitUnionAtoms` from #1243. The instrument's resolution limit has now cost two slices one
+   site each, in the same family.
+2. **The `typecheck` share is 5, not the census's 4, and #1243's exclusion rule contradicts its own
+   inclusion.** #1243 ruled that "a string-LITERAL lexeme peel in `parser.vl` / `format.vl` /
+   `typecheck`'s `mkLitTy` calls … is NOT this" while counting `typecheck.litMemberTy` — which IS a
+   `mkLitTy` call — among its four. `litMemberTy`'s operand is a type NAME whose `"…"` quoted member
+   is being peeled, so by the family's own definition ("a `{…}` shape body, a `(…)` group, a `"…"`
+   quoted member") it belongs; and so does **`typecheck.litUnionPreserve`** at line 7534, which
+   peels the quotes off each member of a litunion type NAME split by `splitUnionAtoms` and is in
+   neither list. The other three `typecheck` writings (`litTyOfExpr`, `tsToTyReal`,
+   `checkMatchExprNode`) really are lexeme peels off `strText` / `tsText` and stay out. Either both
+   quoted-type-member sites are in the family or neither is; they cannot be split. **Left for the
+   `typecheck` slice — that file is another agent's this cycle.**
+3. **`monoDeclAnnName`'s header described the WIDE gate for a slice and a half while the code
+   spelled the narrow one.** The prose was not stale, it was aspirational, and nothing compared the
+   two. A header that names a predicate is a claim the resolver can be made to check.
+4. **The backward population of the shadow-gate trade is 10 cells, not 1** — see above. Found only
+   because the grid carried a RETURN axis.
+5. **A NEW `vl check`-clean invalid-wasm hole, not fixed here and not a shadow defect**:
+   `function fnv<T>(v: T[][]): boolean { return true }` at `const x: i32[][] = [[4]]` — **no
+   shadowing at all** — is `vl check` rc=0 and writes a module that fails validation with "expected
+   i32, found (ref $type)", on master and after. 9 grid cells, and the CONTROL is as red as the
+   shadow cell, which is exactly what tells a nested-list generic-parameter gap in the mono layer
+   apart from a shadow residue.
+6. **TEN shadow cells survive the widening, and the diagnosis is a THIRD header that claims more
+   than its code.** `(Id | null)[]` ×4 and `{a: Id}[]` ×6, all at a CONCRETE return, stay invalid
+   wasm while their controls are clean rejects. `monoAnnHasTyParam`'s header says it answers for "a
+   type param … behind a `[]` run (`(T | null)[]`, `{a: T}[]`)" and **it does not**: past
+   `monoTyParamOf`'s single `arrElemNameRaw` level its arms are union / application / object-shape /
+   function-type / grouping-paren, and `{a: Id}[]` fails every one (`annObjFieldSplit` rejects it —
+   the name ends in `]`, not `}`). The ALIAS half supplies the missing run EXTERNALLY —
+   `gaeAnnHasParam(tn)` is `monoAnnHasTyParam(arrLeafNameOf(tn), lp)`, which is why
+   `type ShapeArrOne<One> = { v: { a: One }[] }` has passed since #1238 — and `monoDeclAnnName` does
+   not strip. **The follow-up is one line and is deliberately NOT taken here**: this slice's
+   authorisation was for a specific gate swap with a specific re-measurement condition, and a second
+   widening owes its own grid rather than a ride on this one. Recorded with its site so the next
+   slice does not have to re-derive it.
+
+### LESSONS
+
+* **A classifier that reads the exit code sorts two outcome classes into one bucket, and this
+  programme has now been bitten by it on the corpus (#1237, which added BUILDMSG as field 4) and on
+  a grid (here, where the first pass read 0 invalid-wasm cells on master).** The fix is the same
+  both times: read the MESSAGE. "Wrote an invalid module" and "cleanly rejected" are the two ends of
+  the axis an emitter change is measured on; a harness that cannot tell them apart reports the
+  measurement as empty.
+* **A priced trade needs the grid that priced it re-run, not just the named cell re-checked.** The
+  owner's condition was about ONE cell's control and it was satisfied — and the same re-measurement
+  turned up nine more cells paying the same price, every one of them licensed by the same argument.
+  Checking the named cell would have confirmed the ruling and under-reported the bill by an order of
+  magnitude.
+* **When a header names the predicate a gate should use, that is a checkable claim, and this
+  neighbourhood breaks it THREE times.** `monoDeclAnnName`'s header named `monoAnnHasTyParam` over
+  `monoTyParamOf`; `monoAnnHasTyParam`'s header claims a `[]`-run arm it does not have (the alias
+  half supplies it externally, which is what hid the discrepancy); and `annObjFieldSplit`'s header
+  described a length bound whose hoist had no other reader. **Every one of the three is mechanically
+  checkable and none was checked.** A header that names a function is the cheapest assertion in the
+  file to test and the easiest to leave aspirational.
+* **THE RESIDUE LIST IS A MEASUREMENT AND IT NEEDS THE SAME DISCIPLINE AS THE MOVED CELLS.** This
+  slice's first write-up said "two shadow residues survive" from a truncated read of its own residual
+  table; the number is TEN, and the six `{a: Id}[]` cells were not mentioned at all. It is the
+  identical failure to the one being criticised two bullets up — reading a sample of the output
+  instead of the output — committed while writing the sentence that criticises it. **What caught it
+  was re-running the analysis and reading the tail, not re-reading the prose.**
+* **The census's normalisation has a resolution, and it has now cost two consecutive slices the same
+  site-shape.** #1243 said so and recorded the fix (one entry in one list plus an index-expression
+  root). The fix was not made, and the next slice reading the same worklist lost the same way.
