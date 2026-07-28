@@ -1525,6 +1525,32 @@ let gaAppFinite: i32[] = []
 // its alias NAME (the emitter interns it as a named struct via `unionStructAliasShape`);
 // a plain alias-reference must be TRANSPARENT instead (see `aliasRefIsPlainRoot`).
 let cPlainAliasNames: string[] = []
+// NOMINAL NEWTYPE sidecar (webcraft P1.5 / A14) — the fourth member of the
+// `cStructTyIxs` / `cUnionTyIxs` / `gaAppTyIxs` family, and built to the same rule:
+// the arena stays STRUCTURAL and nominal-ness is a column beside it.
+//
+// `nwDeclNames` is the DECLARATION fact — the names written `type N = new …`,
+// recorded in pass 0a. `nwTyIxs`/`nwNames`/`nwBaseTyIxs` are the arena-index
+// sidecar: index `nwTyIxs[i]` carries the brand `nwNames[i]` and is structurally
+// the type at `nwBaseTyIxs[i]`.
+//
+// A BRAND IS A NAME, and that is the whole representation: a branded index is a
+// second index over the SAME `Ty` payload (`addTy(T.tys[base])`), so every
+// structural question — rep, width, field lookup, `is TyPrim` — answers exactly
+// as the base answers, and only `assignable`/`tyEq`/the binary-operator mixing
+// rule consult the column. That is what makes the type ZERO-COST: there is no
+// wrapper for the emitter to unwrap, and the emitter never learns the name at all
+// (canon's alias-transparency arm has already rewritten the annotation).
+// `docs/internals/newtype-design.md` is the design record.
+let nwDeclNames: string[] = []
+let nwTyIxs: i32[] = []
+let nwNames: string[] = []
+let nwBaseTyIxs: i32[] = []
+// Depth counter for the LITERAL-adoption window (`nomLitAdopts`): while positive,
+// `assignableGo`'s brand test stands down. Only ever raised around a walk whose
+// SOURCE is a scalar literal, which is what makes waiving the whole walk equivalent
+// to waiving the destination's own brand.
+let nomLitRelax = 0
 // Litunion alias PROVENANCE (rep-rewrite Stage B, b1). The narrowing/join/
 // intersection algebra re-mints a declared litunion alias as a fresh arena
 // COPY (`K | null` inferred through `joinTys`, `!= null` through `subtractTy`,
@@ -4092,6 +4118,31 @@ export function sameNumeric(a: i32, b: i32) {
   false
 }
 
+// Is the EXPRESSION at `ix` a bare SCALAR literal — a number, a string, a boolean,
+// or one of those behind parens / a unary sign? These are the expressions a NOMINAL
+// NEWTYPE destination adopts without an explicit conversion (P1.5, §2.3 of
+// `docs/internals/newtype-design.md`): a literal carries no prior identity, so it is
+// not a candidate for the brand confusion the type exists to prevent.
+//
+// Deliberately SYNTACTIC, and deliberately not the same question as `litTyOfExpr`:
+// the rule is about how the value was WRITTEN, not about whether its type happens to
+// be a literal type. An object / array literal is absent because it needs no arm —
+// both already adapt element-wise through `assignableExpr`, which re-applies the
+// brand rule one level down.
+function exprIsBrandAdoptingLiteral(ix: i32) {
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is Paren { return exprIsBrandAdoptingLiteral(e.parInner) }
+  if e is Unary {
+    if e.unOp == "-" { return exprIsBrandAdoptingLiteral(e.unArg) }
+    return false
+  }
+  if e is NumLit { return true }
+  if e is StrLit { return true }
+  if e is BoolLit { return true }
+  false
+}
+
 // Is the EXPRESSION at `ix` (peeling parens) a float `.` NUMBER literal? A float
 // literal is polymorphic across the float types: it types f64 by default but
 // re-encodes EXACTLY into an f32 slot, so a float literal flowing into an `f32`
@@ -4800,6 +4851,19 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     recordRepTyAdopt(srcExpr, dstTy, 6)
   }
   if assignable(srcTy, dstTy) { return true }
+  // NOMINAL NEWTYPE (P1.5): a SYNTACTIC literal is brand-polymorphic — it adopts the
+  // destination's brand (`const e: EntityId = 1`, `xs: EntityId[] = [1, 2]`). A literal
+  // has no prior identity, so it cannot be the confusion a newtype exists to catch:
+  // that bug class is entirely about a VARIABLE carrying the wrong brand. Rejecting it
+  // would buy no safety and would cost every sentinel constant in engine code.
+  //
+  // Only the destination's OWN brand is waived, by retrying against the base index; the
+  // structural check underneath is unchanged, so nothing else is relaxed. An OBJECT
+  // literal needs no arm here at all — the field-wise block below reads `T.tys[dstTy]`
+  // (a branded index is a second index over the SAME `Ty`, so it IS the `TyObj`) and
+  // recurses through `assignableExpr` per field, which re-applies the brand rule to
+  // every field value. A wrongly-branded variable inside a literal still rejects.
+  if nomLitAdopts(srcExpr, srcTy, dstTy) { return true }
   // A float literal re-encodes EXACTLY at f32, so it flows into any destination whose f32
   // position it fits: a bare `f32`, a nullable `f32?` (a map value / niche), or an f32 MEMBER
   // of a union (`f32 | string`). An arbitrary f64 VALUE is NOT covered (that is a lossy demote).
@@ -5502,10 +5566,15 @@ function declaredTyOfName(name: string) {
         // rule both sides read — collapsing here without the emitter's `singleMemberAliasTyIx`
         // agreeing (or the reverse) diverges the two.
         const sm = singleAliasMemberTyIx(ut, name)
-        if sm >= 0 { return sm }
+        // A NOMINAL NEWTYPE keeps the collapse and adds a brand on top of it
+        // (`nwBrand` is the identity for every name not declared `new`). The
+        // collapse must stay: it is what the EMITTER's `singleMemberAliasTyIx`
+        // twin does with the same annotation, and the brand is invisible to it —
+        // which is precisely why the newtype costs nothing to emit.
+        if sm >= 0 { return nwBrand(name, sm) }
       }
     }
-    return ut
+    return nwBrand(name, ut)
   }
   // A BARE reference to a generic alias has no concrete type — its parameters
   // were never supplied (host: `Generic type … was used without any`).
@@ -6057,6 +6126,14 @@ export function tyToStr(ix: i32) {
 }
 
 function tyToStrGo(ix: i32) {
+  // A NOMINAL NEWTYPE renders as its NAME. This is the only renderer that must —
+  // a diagnostic reading "cannot assign i32 to i32" for `const e: EntityId = n`
+  // names the distinction the type exists to draw and then hides it. The EMIT
+  // renderers (`tyToEmitName`, `canonEmitName`) deliberately do NOT get this arm:
+  // their output is the emitter's vocabulary and a newtype must be erased there
+  // (`docs/internals/newtype-design.md` §3).
+  const nwn = nomNameOfTy(ix)
+  if nwn != "" { return nwn }
   const t = T.tys[ix]
   if t is TyPrim {
     return t.primName
@@ -6213,6 +6290,10 @@ function unionEq(a: i32, b: i32) {
 }
 
 function tyEqGo(a: i32, b: i32) {
+  // `tyEq` answers "do these RENDER identically", and a NOMINAL NEWTYPE renders as
+  // its name — so two brands, or a brand and its base, are not equal here either.
+  // Keeps the predicate consistent with `tyToStr`, which is its stated contract.
+  if nomNameOfTy(a) != nomNameOfTy(b) { return false }
   const ta = T.tys[a]
   const tb = T.tys[b]
   if ta is TyUnion { return unionEq(a, b) }
@@ -7523,6 +7604,152 @@ function aliasRefIsPlainRoot(root: i32) {
   k == TS_NAME || k == TS_APP || k == TS_NULL
 }
 
+// ── nominal newtypes (webcraft P1.5 / A14) ──────────────────────────────────
+// The whole feature is these five functions plus one test in `assignableGo`, one
+// in `tyEqGo` and one in `checkBinExprNode`. Nothing in `emit_*.vl` changes: by
+// the time the emitter runs, `canonEmitTypeNames` has rewritten every newtype
+// annotation to its base's spelling, exactly as it already does for a plain
+// `type MyInt = i32` alias. See `docs/internals/newtype-design.md` §3.
+
+// True if `name` was declared `type N = new …`.
+function isNewtypeName(name: string) {
+  let i = 0
+  while i < nwDeclNames.length {
+    if nwDeclNames[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The BRAND arena index `ix` carries, or "" when it is an ordinary structural type.
+// The single reader of the sidecar; every nominal decision in the checker asks it.
+export function nomNameOfTy(ix: i32) {
+  if ix < 0 { return "" }
+  let i = 0
+  while i < nwTyIxs.length {
+    if nwTyIxs[i] == ix { return nwNames[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// The UN-branded arena index a branded index stands for (itself, when unbranded).
+// Read by the literal-adoption arm, which needs a destination whose own brand is
+// waived while everything below it still checks.
+function nomBaseTyIx(ix: i32) {
+  if ix < 0 { return ix }
+  let i = 0
+  while i < nwTyIxs.length {
+    if nwTyIxs[i] == ix { return nwBaseTyIxs[i] }
+    i = i + 1
+  }
+  ix
+}
+
+// Would the assignment `srcExpr : srcTy -> dstTy` succeed if the NOMINAL brands in
+// `dstTy` were ignored? True only for a syntactic scalar LITERAL source (§2.3 of
+// the design doc): a literal carries no prior identity, so it adopts whatever brand
+// the destination asks for, at whatever depth the destination wears it — a bare
+// `EntityId`, an `EntityId?` map read, an `EntityId` map value slot.
+//
+// Relaxing the WHOLE walk is safe precisely because the source is a scalar literal:
+// there is no nested value under it whose own brand could be waived along with the
+// destination's. An object / array literal is deliberately NOT admitted here — it
+// adapts element-wise through `assignableExpr`, which re-applies the brand rule to
+// every component.
+//
+// The first line is the feature's INERTNESS statement: a program with no `new`
+// declaration has an empty sidecar, so this answers `false` without doing any work
+// and nothing anywhere else in the checker can observe the newtype rules at all.
+function nomLitAdopts(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if nwTyIxs.length == 0 { return false }
+  if srcExpr < 0 { return false }
+  if !exprIsBrandAdoptingLiteral(srcExpr) { return false }
+  nomLitRelax = nomLitRelax + 1
+  const ok = assignable(srcTy, dstTy)
+  nomLitRelax = nomLitRelax - 1
+  ok
+}
+
+// Does `dstTy` carry a nominal brand at or under its wrappers? The GATE for the
+// expression-aware retry below: shallow on purpose — a brand is a property of a
+// declared type, and the destination shapes a slot check meets are the type
+// itself or one or two wrappers over it (`V?`, `V[]`, `V | null`).
+function tyReachesBrand(ty: i32, d: i32) {
+  if ty < 0 { return false }
+  if d <= 0 { return false }
+  if nomNameOfTy(ty) != "" { return true }
+  const t = T.tys[ty]
+  if t is TyNullable { return tyReachesBrand(t.nInner, d - 1) }
+  if t is TyArray { return tyReachesBrand(t.aElem, d - 1) }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    let any = false
+    while i < ms.length {
+      if tyReachesBrand(ms[i], d - 1) { any = true }
+      i = i + 1
+    }
+    return any
+  }
+  false
+}
+
+// The expression-aware retry for a slot checked with the BARE structural
+// `assignable` (the map `.set` pair). `assignableExpr` is where every contextual
+// coercion lives — the scalar-literal brand adoption AND the object-literal
+// field-wise adaptation, which is the one a nominal STRUCT slot needs and which
+// `nomLitAdopts` deliberately cannot supply (relaxing a whole walk under an
+// object literal would waive the brands of its field VALUES too).
+//
+// Gated on the destination actually carrying a brand, so a program with no `new`
+// — and a newtype program's brand-free slots — keep the bare structural check
+// they have today, byte for byte. Without the gate this would widen every map
+// slot to `assignableExpr`'s coercions, which is a real behaviour change and an
+// unrelated one.
+function nomSlotAccepts(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if nwTyIxs.length == 0 { return false }
+  if srcExpr < 0 { return false }
+  if !tyReachesBrand(dstTy, 6) { return false }
+  assignableExpr(srcExpr, srcTy, dstTy)
+}
+
+// The branded arena index for newtype `name` over base `base` — minted once per
+// (name, base) pair and reused, so `assignable`'s `src == dst` fast path still
+// fires and `resolveAnnot`'s name-keyed memo stays stable across resolutions.
+//
+// The branded index is a SECOND index over the SAME `Ty` value, not a deep copy:
+// a `TyObj` placeholder filled in pass 0b pushes into the very field arrays the
+// brand shares, so a forward reference through the newtype name sees the finished
+// shape. The NOMINAL sidecars are mirrored onto the new index for the same reason
+// — `structNameOfTy` / `unionAliasDeclNameOfTy` must answer about the brand
+// exactly as they answer about its base, or a declared struct reached through its
+// newtype name would lose its declared name in the renderers.
+function nwBrand(name: string, base: i32) {
+  if base < 0 { return base }
+  if !isNewtypeName(name) { return base }
+  let i = 0
+  while i < nwTyIxs.length {
+    if nwNames[i] == name && nwBaseTyIxs[i] == base { return nwTyIxs[i] }
+    i = i + 1
+  }
+  const ix = addTy(T.tys[base])
+  nwTyIxs.push(ix)
+  nwNames.push(name)
+  nwBaseTyIxs.push(base)
+  const sdn = structNameOfTy(base)
+  if sdn != "" {
+    cStructTyIxs.push(ix)
+    cStructNames.push(sdn)
+  }
+  const udn = unionAliasDeclNameOfTy(base)
+  if udn != "" {
+    cUnionTyIxs.push(ix)
+    cUnionNames.push(udn)
+  }
+  ix
+}
+
 // True if `name` is a one-member `type N = A` alias whose body is a plain type reference
 // (`aliasRefIsPlainRoot`, recorded syntactically in pass 0a).
 function isPlainAliasRef(name: string) {
@@ -8788,6 +9015,23 @@ function assignableGo(src: i32, dst: i32) {
   // `intersectTy`): accepts a source NOT assignable to the negated type.
   if d is TyNeg { return !assignable(src, d.negTy) }
   if s is TyNeg { return false }
+  // NOMINAL NEWTYPE (P1.5): a brand and its base — or two different brands — do not
+  // flow into each other, though every structural rule below would accept them.
+  // This ONE test is the whole distinctness guarantee: `assignable` is the single
+  // chokepoint every position goes through (let init, assignment, argument, return,
+  // struct field, array element, map key/value, union member, comparison), so no
+  // position can be taught half the rule.
+  //
+  // PLACEMENT IS LOAD-BEARING. It sits AFTER the `TyErr`/`TyVar` holes (an errored
+  // or un-inferred operand must not acquire a second diagnostic), after `never`
+  // (the bottom type flows anywhere), and after the nullable / union / literal /
+  // negation arms — every one of which DESTRUCTURES and recurses, so the brand is
+  // compared at the level it actually sits on. `EntityId | null` accepting an
+  // `EntityId` works because the nullable arm peels first and this test then runs
+  // on the inner pair.
+  if nomLitRelax == 0 {
+    if nomNameOfTy(src) != nomNameOfTy(dst) { return false }
+  }
   if s is TyPrim {
     if d is TyPrim {
       // Lossless numeric WIDENING (B2): a narrower numeric value flows into a wider
@@ -10471,7 +10715,10 @@ function checkCallNode(n: Call, ix: i32) {
           if rt.mKey < 0 {
             rt.mKey = k0
             tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the key in place
-          } else if !assignable(k0, rt.mKey) {
+          } else if (
+            !assignable(k0, rt.mKey) &&
+            !nomSlotAccepts(margs2[0], k0, rt.mKey)
+          ) {
             tErr(
               "set: expected " + tyToStr(rt.mKey) + ", got " + tyToStr(k0),
               ix,
@@ -10480,7 +10727,15 @@ function checkCallNode(n: Call, ix: i32) {
           if rt.mVal < 0 {
             rt.mVal = v0
             tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
-          } else if !assignable(v0, rt.mVal) {
+          } else if (
+            !assignable(v0, rt.mVal) &&
+            !nomSlotAccepts(margs2[1], v0, rt.mVal)
+          ) {
+            // A map slot is one of the positions checked with the bare structural
+            // `assignable` rather than `assignableExpr`, so the newtype's
+            // literal-adoption rule has to be asked for explicitly here — otherwise
+            // `m.set("k", 1)` over a `{[string]: EntityId}` would be the one binding
+            // position a literal could not reach.
             tErr(
               "set: expected " + tyToStr(rt.mVal) + ", got " + tyToStr(v0),
               ix,
@@ -12777,6 +13032,10 @@ function checkProgramNode(n: Program) {
   gaAppArgFlat = []
   gaAppFinite = []
   cPlainAliasNames = []
+  nwDeclNames = []
+  nwTyIxs = []
+  nwNames = []
+  nwBaseTyIxs = []
   cLitUnionCopyTyIxs = []
   cLitUnionCopyAliasIxs = []
   // Pass 0: register top-level struct `type` declarations BEFORE anything else, so
@@ -12799,6 +13058,11 @@ function checkProgramNode(n: Program) {
       // NOT in `cUserTypes`: it has no concrete type until applied. Pass 0b
       // skips it (its `cUserTypes` lookup misses); each application resolves
       // its fields under the param→argument bindings (`applyGenAlias`).
+      // NOMINAL NEWTYPE (P1.5): record the DECLARATION fact before anything
+      // resolves. A generic newtype (`type Handle<T> = new …`) is not in this
+      // phase — the generic-alias registry memo-keys applications by a
+      // synthesized name and branding that is a separate design — so the marker
+      // is only honoured on the concrete arm below.
       const gname = sd0.tdName
       // The GENERIC-APPLICATION grammar's `<`-SCAN at its home in `tyname.vl`, and ONLY the scan:
       // this is a DECLARATION, so there is no span to test — the closing `>` is the
@@ -12844,6 +13108,7 @@ function checkProgramNode(n: Program) {
           cUserTypesVer = cUserTypesVer + 1
           cStructTyIxs.push(sIx0)
           cStructNames.push(sd0.tdName)
+          if sd0.tdNew == 1 { nwDeclNames.push(sd0.tdName) }
         }
       }
     } else if sd0 is UnionDecl {
@@ -12870,6 +13135,7 @@ function checkProgramNode(n: Program) {
       cUserTypesVer = cUserTypesVer + 1
       cUnionTyIxs.push(uIx0)
       cUnionNames.push(sd0.udName)
+      if sd0.udNew == 1 { nwDeclNames.push(sd0.udName) }
     }
     t0 = t0 + 1
   }
@@ -17472,6 +17738,23 @@ export function isValueUnionName(name: string) {
   false
 }
 
+// True when a binary operator's two operands carry INCOMPATIBLE nominal brands
+// (P1.5). Equal brands — including two un-branded operands, the overwhelming case —
+// are compatible. A syntactic LITERAL on the un-branded side adopts, so only a
+// branded operand meeting a base-typed or differently-branded VALUE reports.
+function nomBinMixes(lt: i32, rt: i32, lx: i32, rx: i32) {
+  const ln = nomNameOfTy(lt)
+  const rn = nomNameOfTy(rt)
+  if ln == rn { return false }
+  if ln == "" {
+    if exprIsBrandAdoptingLiteral(lx) { return false }
+  }
+  if rn == "" {
+    if exprIsBrandAdoptingLiteral(rx) { return false }
+  }
+  true
+}
+
 // Extracted from `checkNodeReal`'s `BinExpr` arm (C3: thin the dispatcher).
 function checkBinExprNode(n: BinExpr, ix: i32) {
   const op = n.binOp
@@ -17528,6 +17811,29 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
   // A binary op with a HOLE operand can't decide its form until the hole is bound at the call —
   // record the deferred constraint (skipping assignment / logical, handled by their own arms).
   if op != "=" && op != "&&" && op != "||" { noteBinCstr(lt, op, rt) }
+  // NOMINAL NEWTYPE (P1.5): the operands of every non-assignment binary operator must
+  // carry the SAME brand. Same-brand ops are ALLOWED and the result keeps the brand —
+  // that half needs no code, because the arithmetic tail already ends in `return lt`.
+  // A literal adopts the other side's brand (`id + 1`, `id == 0`, `"id=" + id`), which
+  // is the same rule the assignment positions use.
+  //
+  // The reject cannot be left to the structural rules: `sameNumeric` compares
+  // `primName`, so `EntityId + i32` is invisible to it, and the ordering operators
+  // (`<`, `>`) never consult `assignable` at all. Raised HERE, before the operator
+  // arms, so one rule covers arithmetic, bitwise, ordering and equality alike.
+  if op != "=" && op != "&&" && op != "||" && op != "??" {
+    if nomBinMixes(lt, rt, n.binLeft, n.binRight) {
+      if op == "==" || op == "!=" {
+        tErr("cannot compare " + tyToStr(lt) + " and " + tyToStr(rt), ix)
+        return TY_BOOL
+      }
+      tErr(
+        "operator '" + op + "' mixes " + tyToStr(lt) + " and " + tyToStr(rt),
+        ix,
+      )
+      return TY_ERR
+    }
+  }
   // Assignment: RHS must be assignable to the LHS's (already-bound) type.
   if op == "=" {
     // A `const` NAME cannot be rebound (`x = …`, and the `x++`/`x += …`
@@ -17786,7 +18092,14 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
         return TY_BOOL
       }
     }
-    if !assignable(lt, rt) && !assignable(rt, lt) {
+    // A NOMINAL NEWTYPE compared with a LITERAL is compatible (`id == 0`) — the
+    // literal adopts the brand, as it does in every other position. Both directions
+    // of `assignable` fail on a brand/base pair, so without this the sentinel test
+    // would be the one shape a newtype makes unwritable. The MIXING reject for two
+    // genuine values already fired above, before the equality arms.
+    const nomEqLit = nomNameOfTy(lt) != nomNameOfTy(rt) &&
+      !nomBinMixes(lt, rt, n.binLeft, n.binRight)
+    if !assignable(lt, rt) && !assignable(rt, lt) && !nomEqLit {
       tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
     } else {
       // SOUNDNESS: a STRUCTURAL `==`/`!=` on a plain object (or array) defaults
@@ -17882,6 +18195,21 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
     // assignability test (so the other side may be a hole that pins to string).
     if isStringTy(lt) || isStringTy(rt) {
       if assignable(lt, TY_STR) && assignable(rt, TY_STR) { return TY_STR }
+      // A `new string` NEWTYPE concatenates — with a same-brand value or with a
+      // string LITERAL — and the result KEEPS the brand, which is the string form
+      // of the rule the arithmetic tail follows. `nomBinMixes` has already rejected
+      // a genuine mix above, so reaching here means the brands agree or the other
+      // side is a literal. Without this arm a `new string` would be the one newtype
+      // whose values could not be joined at all: `as` is numeric-only, so there is
+      // no unwrap to fall back on.
+      if nomNameOfTy(lt) != "" || nomNameOfTy(rt) != "" {
+        if assignable(nomBaseTyIx(lt), TY_STR) {
+          if assignable(nomBaseTyIx(rt), TY_STR) {
+            if nomNameOfTy(lt) != "" { return lt }
+            return rt
+          }
+        }
+      }
     }
     // List concat `a + b` → a new `T[]` (collections-design §VL.4); the two
     // element types must agree (an empty `[]` adopts the other side's).

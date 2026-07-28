@@ -54,9 +54,22 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 - **`?.` is null-only.** Optional chaining guards `null`, not a union variant —
   a value-union arm (`foo: i32 | {x}`) is discriminated with `is`. So a `null`
   result always means "the receiver was null," never "wrong variant." (A5)
-- **Bodyless `type Point` is a clean error for now.** Real nominal/opaque types
-  come later; today a bodyless `type` decl is a diagnostic, not a silent
-  self-referential alias. (A14)
+- **Bodyless `type Point` is a clean error.** A bodyless `type` decl is a
+  diagnostic, not a silent self-referential alias. (A14)
+- **A nominal type is `type N = new B`, and it is ERASED.** `new` is a
+  CONTEXTUAL keyword (only after a `type` declaration's `=`), so it stays a legal
+  identifier everywhere else. The brand is a checker-side arena-index sidecar —
+  the arena stays structural — and the emitter never learns the name, because
+  canon's alias-transparency arm has already rewritten the annotation to its base
+  by the time it runs. So a newtype has NO wrapper, NO private heap type, and no
+  emitter file knows it exists. A syntactic LITERAL is brand-polymorphic (it has
+  no prior identity to confuse); a VARIABLE needs `as` in either direction;
+  same-brand arithmetic keeps the brand and a mixed pair rejects. This
+  deliberately does NOT take the forward-compat seam below: injecting nominal
+  identity into `repCanonKey` would cost a wasm type per declaration and break
+  the byte-identity that IS the zero-cost claim. That seam stays right for a
+  future OPAQUE type that needs runtime identity.
+  (A14 / webcraft P1.5 → `docs/internals/newtype-design.md`)
 - **Object-literal field-value mismatches are errors, except behind an alias
   leaf.** `ensureType`'s `Object` case raises on a wrong-typed field value
   (`{ value: i32 }` given `"x"`). It stays lenient _only_ when the

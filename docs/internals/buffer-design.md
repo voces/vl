@@ -1473,8 +1473,8 @@ Said out loud here so the next reader does not mistake unreddened for asleep.
 `std:buffer` grows a view tier:
 
 ```vl
-export type F32View = { f32base: i32, length: i32 }
-export type I32View = { i32base: i32, length: i32 }
+export type F32View = new { base: i32, length: i32 }
+export type I32View = new { base: i32, length: i32 }
 
 export function f32view(self: Buf, off: i32, count: i32): F32View
 export function i32view(self: Buf, off: i32, count: i32): I32View
@@ -1519,28 +1519,52 @@ print(readF(iv, 0))                      // → 1
 back reinterpreted as a float, silently. Spelled that way the element type is not part of the type
 at all — the two views are one type with two names, and the whole point of a *typed* view is gone.
 
-So the discriminator is put where a structural checker can see it: `f32base` and `i32base`. The
-awkwardness is real and it is bought back exactly once, by
-`tests/cases/std/buffer-view-element-type-mismatch.vl`:
+**This was a hidden dependency of P1.1 on P1.5**, and it is the reason P1.5 was pulled forward. The
+requirements doc ordered nominal/opaque types after typed views and presented them as unrelated;
+P1.1's surface as literally spec'd — two view types over the same `{base, count}` shape — is not
+expressible soundly without P1.5.
+
+#### L2a. What it was, for the interim: the width in the FIELD NAME
+
+The tier first shipped with the discriminator put where a structural checker could see it:
+`f32base` and `i32base`. That bought exactly one reject, and its message named the STRUCTURE
+because `tyToStr`'s `TyObj` arm has no name to print — itself the evidence that no nominal identity
+existed to lean on:
 
 ```
 no field 'getF32' on {i32base: i32, length: i32}
 ```
 
-Note what the message renders: the STRUCTURE, not the alias. `tyToStr`'s `TyObj` arm
-(`typecheck.vl:6065`) has no name to print, which is itself the evidence that no nominal identity
-exists to lean on.
+#### L2b. What it is now: `new`, and it made the module SMALLER
 
-**This is a hidden dependency of P1.1 on P1.5.** The requirements doc orders nominal/opaque types
-(P1.5, "cheap, high-value") after typed views (P1.1) and presents them as unrelated. They are not:
-P1.1's surface as literally spec'd — two view types over the same `{base, count}` shape — is not
-expressible soundly without P1.5. A zero-cost newtype would let both fields go back to `base` and
-would delete this section. Until then the field name IS the element type.
+Both views are declared with a zero-cost nominal newtype (`docs/internals/newtype-design.md`), and
+both address fields are plainly `base`:
 
-The same argument says `Buf` itself (`{base, length}`) is distinct from both views only by luck of
-field naming, and that a third same-shaped user struct would be interchangeable with whichever it
-matched. That is pre-existing and unchanged by this slice; it is worth knowing that the tier's type
-safety rests on it.
+```vl
+export type F32View = new { base: i32, length: i32 }
+export type I32View = new { base: i32, length: i32 }
+```
+
+The same pin now reads `no field 'getF32' on I32View` — the alias, because a newtype gives the
+renderer a name. Three measurements decide whether this was worth doing, all against the same
+compiler so the std source is the only variable:
+
+| leg | result |
+|---|---|
+| the confusion cell | `vl check` rc **1** with `new`, rc **0** with `new` deleted from the two declarations — the reject is the newtype's doing, not an artifact |
+| erasure | all **8** correct view programs in `tests/cases/std/` emit **byte-identically** to the same std with `new` deleted |
+| size vs the `f32base`/`i32base` std | **−12 bytes on every one of them** |
+
+The size result is the one worth stating plainly: putting the width in the field name made the two
+views two DIFFERENT shapes, so they needed two wasm heap types. Restoring `base`/`base` makes them
+one shape again — the structural slot dedup collapses them to one heap type — while `new` keeps
+them two TYPES. **The safety came back and a heap type went away.** Every further width this family
+grows (i64, f64, the narrow widths) is one more `new`, not one more name hack.
+
+The same argument still says `Buf` itself (`{base, length}`) is distinct from the views only by luck
+of field naming — `Buf` is not a newtype. That is pre-existing and unchanged; it is worth knowing
+that this one corner of the tier's type safety still rests on it, and that the fix is now a
+one-word edit whenever it is wanted.
 
 ### L3. The bounds policy, ruled and STATED (P1.4's actual ask)
 
