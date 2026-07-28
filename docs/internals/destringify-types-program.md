@@ -29439,3 +29439,47 @@ diagonal and reports it as the answer**, which is how "i32 / f64 / string / bool
 that was RIGHT.
 
 Corpus A/B on six channels: 0 of 1,542 files differ on any channel, including bytes.
+
+### D-MONORAWANN — the FuncDecl half of the canon-scope defect (#TBD)
+
+The sidecar D-GAERAWFIELD built for a generic ALIAS's field annotations, extended to a generic
+FUNCTION's parameter and return annotations. Same defect, same bank, same gate — a different
+declaration kind.
+
+`type Id = i32` + `function ident<Id>(v: Id): Id` was `vl check` rc=0 and invalid wasm: canon
+resolved the signature to `i32` before `emit_mono` read it, so `monoTyParamOf` matched nothing and
+the instance pinned the ALIAS's body type while the call passed something else.
+
+Swept as an 11 × 6 grid (what the shadowed name is DECLARED as × the CALL ARGUMENT's type), each
+cell against a `<T>`-named control: **49 of 66 invalid wasm or silently WRONG on master, 0 after,
+with a CORRECT control in all 66.** The 17 that were green are the DIAGONAL (the argument's type
+equals what the alias names, so the erasure is a no-op) plus the two rows canon does not rewrite —
+a declared struct, and a STRING literal union whose alias name canon deliberately keeps.
+
+`declAnnRawTyName` is the reader (renamed from `genAliasFieldRawTyName`: one bank, one question,
+two substitutions that must not disagree about the answer). `emit_mono` reads it at the parameter
+pin, the return pin, and the nested-call return probe.
+
+**THE GATE IS DELIBERATELY NARROWER THAN THE ALIAS HALF'S, AND THE WIDE ONE IS MEASURED.** The
+alias half restores the declared spelling wherever `monoAnnHasTyParam` says the substitution
+lands; this half restores it only where `monoTyParamOf` does — a BARE or `T[]` annotation. Built
+and swept both ways over a 13 × 5 shadowed-name × constructor grid:
+
+| gate | IW → correct | IW → clean reject | backward |
+|---|---|---|---|
+| `monoTyParamOf` (shipped) | 22 | 0 | **0** |
+| `monoAnnHasTyParam` (filed) | 22 | 21 | 1 |
+
+The wide gate's single backward cell is `type Id = string` + `function ident<Id>(v: {a: Id})` at a
+string argument, which moves `correct → clean reject`. It is not a real capability: the control
+`function ident<T>(v: {a: T})` is a clean reject on master too, so an inline-SHAPE parameter of a
+generic function is a pre-existing gap, and the shadow arm compiled only because canon happened
+to erase `Id` to the very type the call passed. The wide gate is a one-line change
+(`monoTyParamOf(raw, typarams) == ""` → `!monoAnnHasTyParam(raw, typarams)` in
+`emit_base.monoDeclAnnName`) and buys 21 invalid-wasm cells for that one; it is left to the owner
+because "no cell moves backward" is the standing rule and the trade is a judgement, not a
+measurement.
+
+**STILL OPEN on this route:** a `LetDecl` inside a generic function body carries the same hazard
+and is not banked (`monoSubstLetType` reads the arena directly). No consumer needed it yet, and a
+bank entry with no consumer is a claim the checker cannot check.
