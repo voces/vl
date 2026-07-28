@@ -9595,6 +9595,21 @@ function globalKind(initIx: i32): VKind {
   if exprUnion(initIx, -1) { return "union" }
   if exprStruct(initIx, -1) { return "struct" }
   if exprArray(initIx, -1) { return "list" }
+  // A SCALAR f32 non-literal init (an f32 map-`??` read, f32 arithmetic, an f32-returning
+  // call) — kind 13, the module-scope analogue of the local `letIsF32` inference. Without
+  // this arm the cell stays i32 while the start-fn stores an f32 — invalid wasm.
+  //
+  // Asked BEFORE the f64 arm, which is the ORDER `exprIsF32`'s own header states ("checked
+  // BEFORE `exprIsF64` at every dispatch") and `emitExprAsF64`'s opening comment restates —
+  // and which this ladder alone did not obey. `exprIsF64` OVER-CLAIMS a mixed f32/float-
+  // literal init: `fv * 1.0` is `exprIsF32` (the literal adapts down) AND `exprIsF64` (the
+  // literal is a genuine `.` literal), so the f64 arm took the cell while the start-fn init
+  // (`emitExprAsF64` → its own f32-first arm) emitted `f32.mul` and every READ of the cell
+  // (`print`, `f32bits`, an f32 argument) classified it f32 off the checker's `nodeTyIx`.
+  // `vl check` clean, INVALID WASM. A bare float literal is NOT `exprIsF32`, so `const g =
+  // 1.5` still takes the f64 arm below, and a GENUINE f64 operand (`fv + dv`, `dv * 1.0`)
+  // makes `exprIsF32` false through `binMixHardF64` — so the f64 cells are untouched.
+  if exprIsF32(initIx, -1) { return "f32" }
   // A SCALAR f64 / i64 non-literal init (f64 / i64 ARITHMETIC `2.0 + 4.5`, or an
   // f64-returning call `dbl(2.0)`) — kind 11 / 10, the module-scope analogue of the local
   // `letIsF64` / `letIsI64` inference (which is gated to inside a function). A single
@@ -9603,10 +9618,6 @@ function globalKind(initIx: i32): VKind {
   // same shape the `exprString` / `exprStruct` cases above already rely on.)
   if exprIsF64(initIx, -1) { return "f64" }
   if exprIsI64(initIx, -1) { return "i64" }
-  // A SCALAR f32 non-literal init (an f32 map-`??` read, f32 arithmetic, an f32-returning
-  // call) — kind 13, the module-scope analogue of the local `letIsF32` inference. Without
-  // this arm the cell stays i32 while the start-fn stores an f32 — invalid wasm.
-  if exprIsF32(initIx, -1) { return "f32" }
   "i32"
 }
 
@@ -18990,6 +19001,15 @@ export function letIsF64(letIx: i32, fnIx: i32) {
     if d.letInit >= 0 {
       const ie = P.nodes[d.letInit]
       if ie is NumLit { return numTextIsFloat(ie.numText) }
+      // An f32 init is NOT an f64 binding — the f32-before-f64 order the whole family
+      // obeys, stated here because this predicate is the BINDING-level answer every READ
+      // site reaches (`globalIsF64` is one line of delegation to it). `exprIsF64`
+      // over-claims a mixed f32/float-literal init (`fv * 1.0`), so without this an
+      // un-annotated inferred-f32 global answered "f64" to `exprIsF64` while its CELL was
+      // f32 — and `x = 2.5` / `x = fv` over it emitted `emitExprAsF64` into an `(mut f32)`
+      // cell. The slot ladders (`collectLocals`, `globalCellKind`) all ask their f32 arm
+      // first, so no site that reaches here after an f32 arm changes.
+      if exprIsF32(d.letInit, fnIx) { return false }
       // Un-annotated: infer f64 from the initializer (`const r = 1.5 + 2.5` / `const m =
       // x` where `x: f64` / a float-returning call). At MODULE scope (`fnIx < 0`) this
       // recurses through `globalIsF64` for a global-ident operand, which terminates for an
