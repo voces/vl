@@ -129,8 +129,14 @@ hatch").** All four are prerequisites for each other in practice:
   structural checker cannot; `new` is a contextual keyword, the type is erased before emit, and
   `std:buffer`'s two views are now `new { base, length }` (the `f32base`/`i32base` hack deleted,
   and the module 12 bytes SMALLER because the two shapes collapse to one heap type).
-- ⬜ **P1.6 `vl test`** — already designed and already slated (see Track H); webcraft needs it to
-  *exist* by M7 for thousands of table-driven cases. **See the promotion note below.**
+- ✅ **P1.6 `vl test`** — SHIPPED. `vl test [path]` discovers `*.test.vl`, compiles each module-aware,
+  and runs them one wasm instance per file across a host thread pool. Trap isolation is real (a
+  trapping test fails alone; the host re-instantiates and the file keeps going), a non-compiling test
+  file is one failing entry with the compiler's own diagnostics, failure messages are read back
+  structurally off the instance (`expected 7 to equal 8`, not `wasm trap: unreachable`), and four
+  CPU-bound files measured 1.11 s serial → 0.31 s at `--jobs 4`. `std:test` grew the registration
+  half (`describe`/`it`/`itSkip`/`beforeEach`/`afterEach`) beside the matchers.
+  Shipped shape + the three divergences from the charter: `docs/internals/vl-test-design.md`.
 
 **P2 — wanted, not gating:** i32-keyed Map/Set + `for k in map` (B6a); contextual f32 literals (sim
 code is f32-saturated and today every constant needs a cast); **`match` phase 2 — variant payload
@@ -142,7 +148,22 @@ keep emitting a names section on non-`-O` builds.
 *preferred*), separate compilation / wasm linking, UTF-8 strings (B7), WASI, a std math/trig library,
 in-language GC knobs.
 
-- ⬜ **PROMOTE `vl test` ahead of the std expansion.** (Owner's ordering: *"before we expand the std
+- ✅ **PROMOTE `vl test` ahead of the std expansion — DONE, and two of this note's premises were
+  wrong.** Recorded because both were load-bearing for the sequencing argument:
+  1. **`std:fs` was NOT the gate.** This note calls the failable-IO story "the critical-path item":
+     the VL walk needs fs primitives, `std:fs` needs `T | E`, so `vl test` waits on the
+     error-handling review. That reasoning assumed the runner would be a standalone VL PROGRAM.
+     It is not — the brain landed in `compiler/cli.vl`, which already walks directories for
+     `vl check`/`vl fmt` over `CMD_LIST_DIR`, with the skip-list and glob matching already in VL.
+     Zero `std:fs`, zero error-handling dependency. The error-handling review is still worth doing;
+     it was never blocking this.
+  2. **"The linker stays EMPTY — no host-function imports at all" is false**, and was already false
+     before this work: every VL program that prints imports `imports.__print_*__`, so a test module
+     does too. The browser-execution property survives — a browser driver supplies exactly the seven
+     print imports `playground/src/runtime.ts` already supplies — but it is "the same small shim the
+     playground already has", not "nothing to shim".
+  Original note follows.
+  (Owner's ordering: *"before we expand the std
   library, I'd prefer we get our own test runner and assertion library"*.) It is **already designed** —
   `docs/internals/test-runner-design.md` — and the design **already encodes the owner's "as much code
   as possible in VL, Rust is a thin wrapper" direction**: *"the brain is VL; Rust is the mechanism
@@ -382,7 +403,13 @@ in-language GC knobs.
     for the remaining emitter long tail (each gap fails loudly).
   - The `.vl` compiler is now the spec, so the parked soundness xfails (arith-hole-operand — A13;
     array-element-recursion — i32-keyed maps) are fixable bugs, not parity constraints.
-- ⬜ **`vl test`.** DESIGNED: `docs/internals/test-runner-design.md` (jest-shaped `describe`/`it`/`expect`
+- ✅ **`vl test`.** SHIPPED — see `docs/internals/vl-test-design.md` for the built protocol and the
+  three divergences from the charter (brain in `compiler/cli.vl` not `std/test/runner.vl`;
+  compilation stays VL-side and only EXECUTION crosses; `.only` is not spellable in VL, so
+  runner-side `-t` + `itSkip` are the selection story). Chartered follow-ups below still stand,
+  plus: void-return covariance on function values (the `done()` wart), f64 failure rendering,
+  per-test timings/timeouts, `--no-capture`, `dot`/`json` reporters.
+  Original charter entry: `docs/internals/test-runner-design.md` (jest-shaped `describe`/`it`/`expect`
   over `std:testing`; two-phase registration, host-driven `vlt*` protocol; `*.test.vl` discovery
   + configurable globs; files parallel by default / in-file serial, opt-in fresh-instance
   `it.concurrent`; per-test capture, failure-first reporting). **v1 lands BEFORE the std expansion,

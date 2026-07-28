@@ -1,17 +1,158 @@
-// `std:test` v1 — a pure-VL assertion library over the intrinsic floor
-// (docs/std-design.md D5). The matcher surface reads jest-shaped through
-// STRUCT-RECEIVER UFCS: `expect(x).toEqual(y)` builds an `Expectation` and
-// `.toEqual` is a free `self`-function resolved by self+arity. A failed
-// assertion calls `__trap__()` (jest's "a test stops at its first failed
-// expectation"); a passing one is a no-op. Under bare `vl run` a green file
-// exits 0 and a red one aborts; the runner half (`vl test`, per-test trap
-// isolation, reporting — docs/test-runner-design.md) drives these from the host.
+// `std:test` v1 — the in-language testing surface (docs/std-design.md D5), in two
+// halves over the intrinsic floor:
 //
-// `expect` takes a VALUE UNION over the comparable atoms, so ONE entry point
-// covers every value kind — the value boxes into the union and `is`-narrows
-// back out. (`toBe` referential identity is reserved for the future `===`,
-// ROADMAP A15; `toThrow`/`toBeNull` wait on the error model / `null` in the
-// value union — std-design OD6.)
+//   1. REGISTRATION — jest-shaped `describe`/`it`/`beforeEach`/`afterEach`. Calling
+//      them at a file's top level REGISTERS into the module-level parallel arrays
+//      below and does nothing else; the wasm start function runs that top level at
+//      instantiation, after which the registry is complete (two-phase collection —
+//      `describe` bodies are REGISTRATION-ONLY, the Deno-steps lesson).
+//   2. ASSERTION — `expect(...)` matchers, read jest-shaped through STRUCT-RECEIVER
+//      UFCS: `expect(x).toEqual(y)` builds an `Expectation` and `.toEqual` is a free
+//      `self`-function resolved by self+arity. A failed assertion records its
+//      rendered message and calls `__trap__()` (jest's "a test stops at its first
+//      failed expectation"); a passing one is a no-op.
+//
+// The `vlt*` exports at the bottom are the RUNNER PROTOCOL — the host reads the
+// registry through them and drives one test per call, which is what buys per-test
+// trap isolation, output attribution and filtering
+// (docs/internals/test-runner-design.md). `vl test` APPENDS
+// `export { … } from "std:test"` to each `*.test.vl` it compiles, so a test file
+// never writes the protocol line itself.
+//
+// Under bare `vl run` a green file exits 0 and a red one aborts, with no runner.
+//
+// `expect` takes a VALUE UNION over the comparable atoms, so ONE entry point covers
+// every value kind — the value boxes into the union and `is`-narrows back out.
+// (`toBe` referential identity is reserved for the future `===`, ROADMAP A15;
+// `toThrow`/`toBeNull` wait on the error model / `null` in the value union —
+// std-design OD6.)
+//
+// ── ONE VL RULE GOVERNS THIS FILE'S SHAPE ──────────────────────────────────────
+// A function's result type is its TAIL statement's, and a test BODY is typed
+// `() => void`, so every function a body can end with must itself be void. The
+// statements that yield NOTHING are few — a call to a void function, a `while`, a
+// `const` declaration, an `if` whose branches are void — while an assignment and a
+// `.push` both yield a value. That is why the registration functions close with
+// `vltDone()` and the matchers close with a call rather than an `if`: without it,
+// `it("x", () => { expect(1).toEqual(1) })` fails to typecheck with
+// `expected () -> void, got () -> i32`.
+
+// ── the registry ────────────────────────────────────────────────────────────────
+// PARALLEL ARRAYS, the compiler driver's own idiom (`modKeys`/`modPending`/…): one
+// entry per registered test, index `i` is the protocol's test id.
+const vltNames: string[] = []        // the test's full path (scope > … > name)
+const vltBodies: (() => void)[] = [] // its body
+const vltSkips: i32[] = []           // 1 = registered by `itSkip`
+const vltScopes: string[] = []       // the enclosing `describe` path (hook matching)
+
+// The `describe` path currently being registered into ("" at file scope). Saved and
+// restored around each `describe` body, so nesting composes.
+let vltScope = ""
+
+// Hooks, also parallel: each records the `describe` scope it was declared in, and
+// runs around every test at or beneath that scope.
+const vltBeforeScopes: string[] = []
+const vltBeforeFns: (() => void)[] = []
+const vltAfterScopes: string[] = []
+const vltAfterFns: (() => void)[] = []
+
+// The rendered message of the assertion that just aborted the running test. The
+// runner reads it AFTER catching the trap (`vltFailLen`/`vltFailAt`) — a trap
+// unwinds the call but leaves the instance readable — so a failure reports its
+// message structurally instead of being scraped out of print output.
+let vltFailMsg = ""
+
+// A VOID no-op — the tail that makes a function whose real work ends in an
+// assignment or a `.push` still type as `() -> void`. See the rule above.
+function vltDone() {}
+
+// The same no-op, EXPORTED, for closing a test body whose last real statement
+// yields a value:
+//
+//   beforeEach(() => { hits = hits + 1  done() })
+//
+// Without it that body types as `() => i32` and the registration call rejects it
+// with `expected () -> void, got () -> i32`. A body ending in an `expect(…)`
+// matcher — the overwhelming majority — needs nothing. (The language-level fix is
+// void-return covariance on function values, which is not free: the array's
+// element type IS the interned `$fnsig`, so it needs a real coercion, not a
+// relaxed check. Filed in docs/internals/vl-test-design.md §Known gaps.)
+export function done() {}
+
+// ── registration ────────────────────────────────────────────────────────────────
+
+// Group the tests registered by `body` under `name`. REGISTRATION ONLY: the body
+// runs at collect time, so it must do nothing but declare tests and hooks (any
+// real work would run once, at the wrong time, for every test in the file).
+export function describe(name: string, body: () => void) {
+  const saved = vltScope
+  if vltScope.length > 0 {
+    vltScope = vltScope + " > " + name
+  } else {
+    vltScope = name
+  }
+  body()
+  vltScope = saved
+  vltDone()
+}
+
+// The shared registration path. `path` is the scope-qualified name the report and
+// the `-t` filter both match against.
+function vltRegister(name: string, body: () => void, skip: i32) {
+  let path = name
+  if vltScope.length > 0 { path = vltScope + " > " + name }
+  vltNames.push(path)
+  vltBodies.push(body)
+  vltSkips.push(skip)
+  vltScopes.push(vltScope)
+  vltDone()
+}
+
+// Register one test.
+export function it(name: string, body: () => void) {
+  vltRegister(name, body, 0)
+}
+
+// Register one test as SKIPPED — it is collected, reported, and never run (the
+// `#[ignore]`/`@Disabled` analog; `.skip` is not spellable because VL has no
+// property access on a function value).
+export function itSkip(name: string, body: () => void) {
+  vltRegister(name, body, 1)
+}
+
+// Run `body` before each test at or beneath the enclosing `describe` scope.
+export function beforeEach(body: () => void) {
+  vltBeforeScopes.push(vltScope)
+  vltBeforeFns.push(body)
+  vltDone()
+}
+
+// Run `body` after each test at or beneath the enclosing `describe` scope.
+// Registration order is preserved; `vltRun` fires them in REVERSE, so hooks nest
+// like scopes do (outermost `before` first, outermost `after` last).
+export function afterEach(body: () => void) {
+  vltAfterScopes.push(vltScope)
+  vltAfterFns.push(body)
+  vltDone()
+}
+
+// Does a hook declared at scope `hook` apply to a test whose scope is `test`? The
+// file scope ("") applies to everything; otherwise `test` must be `hook` itself or
+// one of its descendants — a PATH-SEGMENT prefix test, so a `describe("list")`
+// hook does not leak into `describe("listener")`.
+function vltInScope(hook: string, test: string) {
+  if hook.length == 0 { return 1 }
+  if hook == test { return 1 }
+  const sep = hook + " > "
+  if test.length >= sep.length {
+    const head = test.slice(0, sep.length)
+    if head == sep { return 1 }
+  }
+  0
+}
+
+// ── assertion ───────────────────────────────────────────────────────────────────
+
 type Expectation = {
   actual: i32 | i64 | f64 | boolean | string,
   negated: boolean
@@ -28,20 +169,115 @@ export function not(self: Expectation): Expectation {
   return { actual: self.actual, negated: !self.negated }
 }
 
-// Aborts unless `ok` agrees with the current sense (`negated`). Factored so
-// every matcher shares one pass/fail/`__trap__` decision. (No `: void`
-// annotation — an explicit `void` return is mis-lowered on the current seed;
-// the inferred void is correct.)
-function adjudicate(self: Expectation, ok: boolean) {
+// Record the rendered message and abort the test. The runner catches the trap,
+// reads `vltFailMsg` back, and continues with the next test. Void: its tail is
+// `__trap__()`, which yields nothing (and never returns).
+function vltAbort(msg: string) {
+  vltFailMsg = msg
+  __trap__()
+}
+
+// One decimal digit as its character. i64 so both integer widths share the
+// renderer (i64 cannot narrow to i32, so a string-index lookup is not expressible
+// for the wide path). Mirrors `std:fmt`'s technique rather than importing it: no
+// std module imports another today, and the assertion surface is not the place to
+// make std's own module graph load-bearing for the first time.
+function vltDigit(d: i64) {
+  if d == 0 { return "0" }
+  if d == 1 { return "1" }
+  if d == 2 { return "2" }
+  if d == 3 { return "3" }
+  if d == 4 { return "4" }
+  if d == 5 { return "5" }
+  if d == 6 { return "6" }
+  if d == 7 { return "7" }
+  if d == 8 { return "8" }
+  "9"
+}
+
+// Decimal rendering of any i64, i64 min included: the accumulator works in the
+// NEGATIVE range (positive inputs are negated first) because the negative range
+// covers i64 min, whose magnitude overflows when negated.
+function vltI64Str(v: i64) {
+  if v == 0 { return "0" }
+  let n = v
+  let neg = false
+  if v > 0 { n = 0 - v } else { neg = true }
+  let out = ""
+  while n < 0 {
+    const d = 0 - (n % 10)
+    out = vltDigit(d) + out
+    n = n / 10
+  }
+  if neg { return "-" + out }
+  out
+}
+
+// How a value reads in a failure message. Strings are quoted so `"4"` and `4` are
+// distinguishable at a glance (they are unequal — a cross-variant `==` is false).
+// f64 has no pure-VL renderer yet (std-design D4 defers shortest-round-trip
+// f64→string), so it renders as its type and `vltEcho` streams the real value
+// through `print` instead — the runner captures that as the test's output.
+function vltShow(v: i32 | i64 | f64 | boolean | string): string {
+  if v is string { return "\"" + v + "\"" }
+  if v is boolean {
+    if v { return "true" }
+    return "false"
+  }
+  if v is i32 {
+    const wide = v as i64
+    return vltI64Str(wide)
+  }
+  if v is i64 { return vltI64Str(v) }
+  "<f64>"
+}
+
+// The f64 half of the rendering story: print the value so the captured output
+// carries the digits the message cannot. A no-op for every other variant.
+function vltEcho(v: i32 | i64 | f64 | boolean | string) {
+  if v is f64 { print(v) }
+}
+
+// Render + abort. Reached ONLY on failure, which is why the matchers hand over
+// their operands instead of a pre-built string: a passing assertion must not pay
+// for a message nobody reads (a table-driven suite runs millions of them).
+// `kind`: 0 = toEqual, 1 = toBeTrue, 2 = toBeFalse.
+function vltReport(
+  self: Expectation,
+  kind: i32,
+  expected: i32 | i64 | f64 | boolean | string,
+) {
+  const a = self.actual
+  let tail = "be true"
+  if kind == 0 {
+    vltEcho(a)
+    vltEcho(expected)
+    tail = "equal " + vltShow(expected)
+  }
+  if kind == 2 { tail = "be false" }
+  let sense = "to "
+  if self.negated { sense = "not to " }
+  vltAbort("expected " + vltShow(a) + " " + sense + tail)
+}
+
+// Aborts unless `ok` agrees with the current sense (`negated`). Factored so every
+// matcher shares one pass/fail decision — and so each matcher's TAIL is this void
+// call, which is what types a test body as `() => void`.
+function vltAdjudicate(
+  self: Expectation,
+  ok: boolean,
+  kind: i32,
+  expected: i32 | i64 | f64 | boolean | string,
+) {
   if self.negated {
-    if ok { __trap__() }
+    if ok { vltReport(self, kind, expected) }
   } else {
-    if !ok { __trap__() }
+    if !ok { vltReport(self, kind, expected) }
   }
 }
 
-// `.toEqual` — structural equality, jest semantics. The union `==` compares the
-// two values' live variants (a cross-variant pair, `expect(4).toEqual("4")`, is
+// `.toEqual` — structural equality, jest semantics. The union `==` compares the two
+// values' live variants (a cross-variant pair, `expect(4).toEqual("4")`, is
 // unequal). `self.actual` binds to a local first: union `==` requires binding
 // operands, not a raw field read.
 export function toEqual(
@@ -49,7 +285,8 @@ export function toEqual(
   expected: i32 | i64 | f64 | boolean | string,
 ) {
   const a = self.actual
-  adjudicate(self, a == expected)
+  const ok = a == expected
+  vltAdjudicate(self, ok, 0, expected)
 }
 
 // `.toBeTrue` — the receiver holds boolean `true`. A non-boolean receiver is
@@ -58,7 +295,7 @@ export function toBeTrue(self: Expectation) {
   const a = self.actual
   let ok = false
   if a is boolean { ok = a }
-  adjudicate(self, ok)
+  vltAdjudicate(self, ok, 1, a)
 }
 
 // `.toBeFalse` — the receiver holds boolean `false`.
@@ -66,5 +303,61 @@ export function toBeFalse(self: Expectation) {
   const a = self.actual
   let ok = false
   if a is boolean { ok = !a }
-  adjudicate(self, ok)
+  vltAdjudicate(self, ok, 2, a)
 }
+
+// Fail the running test outright with `msg` — the escape hatch for a condition no
+// matcher expresses (`if !reachedTheBranch { fail("unreachable") }`).
+export function fail(msg: string) { vltAbort(msg) }
+
+// ── the runner protocol ─────────────────────────────────────────────────────────
+// Read by the host after instantiation (the start function has just registered
+// everything). Strings cross one code point at a time — the driver's
+// `modPendingCount`/`modPendingLen`/`modPendingAt` idiom, which the host already
+// speaks. `vl test` re-exports these into each `*.test.vl` module it compiles.
+
+// How many tests this file registered.
+export function vltCount(): i32 { vltNames.length }
+
+// Code-point length of test `i`'s scope-qualified name.
+export function vltNameLen(i: i32): i32 { vltNames[i].length }
+
+// Code point `j` of test `i`'s name.
+export function vltNameAt(i: i32, j: i32): i32 { vltNames[i][j] }
+
+// 1 when test `i` was registered by `itSkip`.
+export function vltSkipped(i: i32): i32 { vltSkips[i] }
+
+// Run test `i` with its hook chain. 0 = passed, 1 = skipped; a FAILURE does not
+// return — the assertion traps, and the host reads `vltFail*` for the message.
+export function vltRun(i: i32): i32 {
+  vltFailMsg = ""
+  if vltSkips[i] != 0 { return 1 }
+  const scope = vltScopes[i]
+  let h = 0
+  while h < vltBeforeScopes.length {
+    if vltInScope(vltBeforeScopes[h], scope) != 0 {
+      const before = vltBeforeFns[h]
+      before()
+    }
+    h = h + 1
+  }
+  const body = vltBodies[i]
+  body()
+  let a = vltAfterScopes.length - 1
+  while a >= 0 {
+    if vltInScope(vltAfterScopes[a], scope) != 0 {
+      const after = vltAfterFns[a]
+      after()
+    }
+    a = a - 1
+  }
+  0
+}
+
+// Code-point length of the last failure message (0 = the trap carried none, e.g. a
+// raw `__trap__()` or an out-of-bounds index rather than a failed expectation).
+export function vltFailLen(): i32 { vltFailMsg.length }
+
+// Code point `j` of the last failure message.
+export function vltFailAt(j: i32): i32 { vltFailMsg[j] }

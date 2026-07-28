@@ -4,6 +4,7 @@
 //   vl check <in.vl>                 typecheck; print diagnostics (`--codegen` also emits)
 //   vl run   <in.vl>                 compile in-memory, then instantiate + run
 //   vl fmt   [path] [-w|--check]     format source (stdout / write / CI gate); stdin when no path
+//   vl test  [path] [-t <name>]      discover `*.test.vl`, run them in parallel, report
 //
 // Only `build` and `run` ever hand the emitted bytes to the ENGINE, so only they can
 // tell a valid module from an invalid one — the validator lives in wasmtime, and the
@@ -28,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
 fn usage() -> ! {
-    eprintln!("usage: vl <build|check|run|fmt> <file.vl> [-o out.wasm] [--no-validate] [-w|--check] [--compiler vl-compiler.wasm]");
+    eprintln!("usage: vl <build|check|run|fmt|test> <file.vl> [-o out.wasm] [--no-validate] [-w|--check] [-t name] [--jobs N] [--compiler vl-compiler.wasm]");
     std::process::exit(2);
 }
 
@@ -942,6 +943,26 @@ fn run_program_with(
     sink: impl Fn(&str) + Send + Sync + Clone + 'static,
 ) -> Result<()> {
     let module = Module::new(engine, bytes)?;
+    // The instance is dropped: `vl run` runs the start function (the program's top
+    // level) and exits. `vl test` needs the instance back to call exports on it, so
+    // it goes through `instantiate_program` directly.
+    let _ = instantiate_program(engine, &module, sink)?;
+    Ok(())
+}
+
+/// Instantiate an already-loaded program module with the host print-import family,
+/// returning the live store + instance. Instantiation RUNS the start function (the
+/// VL program's top level), which for a `*.test.vl` module is the registration pass.
+///
+/// Every print import emits one LINE through `sink`; the sink is `Send + Sync +
+/// Clone + 'static` so a test worker can point it at that worker's own capture
+/// buffer, which is what makes per-test output attribution structural rather than
+/// console-patching (each instance runs one test at a time).
+fn instantiate_program(
+    engine: &Engine,
+    module: &Module,
+    sink: impl Fn(&str) + Send + Sync + Clone + 'static,
+) -> Result<(Store<()>, Instance)> {
     let chars: Arc<Mutex<Vec<u32>>> = Arc::default();
     let mut store = Store::new(engine, ());
     let mut linker = Linker::new(engine);
@@ -984,8 +1005,8 @@ fn run_program_with(
     })?;
 
     // Instantiation runs the start function — the VL program's top level.
-    let _instance = linker.instantiate(&mut store, &module)?;
-    Ok(())
+    let instance = linker.instantiate(&mut store, module)?;
+    Ok((store, instance))
 }
 
 /// `vl run --batch --out-dir DIR <file.vl>... [--compiler seed]` — run MANY
@@ -1323,6 +1344,353 @@ fn run_cmd(args: &[String]) -> Result<()> {
     compile_and_run(&compiler, &source, "source.vl", &run_engine)
 }
 
+// ── `vl test` — the runner's MECHANISM half (docs/internals/vl-test-design.md) ──
+// All runner POLICY (discovery, compilation, the plan, the report, the exit code)
+// is VL, in `compiler/cli.vl`. What lands here is exactly what a wasm program
+// cannot do for itself: instantiate modules, schedule them across OS threads, and
+// catch a trap without dying. Three commands cross the boundary — stash a compiled
+// module, collect the registries, run the plan.
+
+/// One test file the brain compiled and handed over: its path (for messages) and
+/// the module bytes the emitter produced.
+struct TestFile {
+    path: String,
+    bytes: Vec<u8>,
+}
+
+/// What COLLECTION learned about one file. The `Module` is kept so the run phase
+/// does not pay Cranelift a second time — collection is where that cost lands, and
+/// it is paid in parallel.
+struct TestRegistry {
+    module: Option<Module>,
+    names: Vec<String>,
+    skips: Vec<i32>,
+    /// "" unless the module failed to load or its top level trapped during
+    /// registration — then this file contributes no tests and one failure.
+    error: String,
+}
+
+/// The outcome of one planned test. `status`: 0 passed, 1 failed, 2 skipped.
+struct TestOutcome {
+    status: i32,
+    message: String,
+    output: String,
+}
+
+/// Run `job` over `0..n` across `jobs` OS threads and return the results IN INDEX
+/// ORDER, so the report is deterministic however the work was scheduled.
+///
+/// Hand-rolled over `std::thread::scope` + an atomic cursor rather than pulling in
+/// rayon: the host's whole dependency list is wasmtime + anyhow, and at this
+/// granularity (one unit of work = one wasm module) a work-stealing scheduler buys
+/// nothing a shared cursor does not.
+fn parallel_map<T: Send>(n: usize, jobs: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    if n == 0 {
+        return Vec::new();
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let workers = jobs.max(1).min(n);
+    let cursor = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let slots_ref = &slots;
+    let job_ref = &job;
+    let cursor_ref = &cursor;
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(move || loop {
+                let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let value = job_ref(i);
+                *slots_ref[i].lock().unwrap() = Some(value);
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap()
+                .expect("every index is assigned exactly once")
+        })
+        .collect()
+}
+
+/// The one-line form of an execution failure, for a test report. wasmtime renders a
+/// trap with a multi-line wasm backtrace naming mangled internal functions; the
+/// report wants the CAUSE, so a real `Trap` reports as itself and anything else
+/// reports as its first line.
+fn trap_text(e: &Error) -> String {
+    if let Some(trap) = e.downcast_ref::<Trap>() {
+        return trap.to_string();
+    }
+    format!("{e}")
+        .lines()
+        .next()
+        .unwrap_or("execution failed")
+        .trim()
+        .to_string()
+}
+
+/// Read a `<len>(i)` / `<at>(i, j)` indexed string off a test instance — the same
+/// per-code-point crossing the module fetch loop and `render_diags` use.
+fn read_test_str(
+    store: &mut Store<()>,
+    len: &TypedFunc<i32, i32>,
+    at: &TypedFunc<(i32, i32), i32>,
+    i: i32,
+) -> Result<String> {
+    let n = len.call(&mut *store, i)?;
+    let mut s = String::with_capacity(n.max(0) as usize);
+    for j in 0..n {
+        if let Some(c) = char::from_u32(at.call(&mut *store, (i, j))? as u32) {
+            s.push(c);
+        }
+    }
+    Ok(s)
+}
+
+/// Collect one file's registry: load the module, instantiate it (which RUNS the
+/// registrations), and read the `vlt*` exports back.
+///
+/// Registration output is discarded — a test file's top level is meant to declare
+/// tests and nothing else, and anything it prints belongs to no test.
+fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
+    let failed = |error: String| TestRegistry {
+        module: None,
+        names: Vec::new(),
+        skips: Vec::new(),
+        error,
+    };
+    let module = match Module::new(engine, &file.bytes) {
+        Ok(m) => m,
+        // The emitter produced bytes the engine will not load — a compiler bug, not
+        // a test failure, so name the file the host was given.
+        Err(e) => {
+            return failed(format!(
+                "`{}` emitted a module the engine rejected: {}",
+                file.path,
+                trap_text(&e)
+            ))
+        }
+    };
+    let (mut store, inst) = match instantiate_program(engine, &module, |_| {}) {
+        Ok(pair) => pair,
+        Err(e) => return failed(trap_text(&e)),
+    };
+    // A module without the protocol exports registered nothing runnable. That is
+    // not an error (an empty `*.test.vl` is legal) — it reports as "no tests".
+    let (count, name_len, name_at, skipped) = match (
+        inst.get_typed_func::<(), i32>(&mut store, "vltCount"),
+        inst.get_typed_func::<i32, i32>(&mut store, "vltNameLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut store, "vltNameAt"),
+        inst.get_typed_func::<i32, i32>(&mut store, "vltSkipped"),
+    ) {
+        (Ok(c), Ok(l), Ok(a), Ok(s)) => (c, l, a, s),
+        _ => {
+            return TestRegistry {
+                module: Some(module),
+                names: Vec::new(),
+                skips: Vec::new(),
+                error: String::new(),
+            }
+        }
+    };
+    let read = (|| -> Result<(Vec<String>, Vec<i32>)> {
+        let n = count.call(&mut store, ())?;
+        let mut names = Vec::with_capacity(n.max(0) as usize);
+        let mut skips = Vec::with_capacity(n.max(0) as usize);
+        for i in 0..n {
+            names.push(read_test_str(&mut store, &name_len, &name_at, i)?);
+            skips.push(skipped.call(&mut store, i)?);
+        }
+        Ok((names, skips))
+    })();
+    match read {
+        Ok((names, skips)) => TestRegistry {
+            module: Some(module),
+            names,
+            skips,
+            error: String::new(),
+        },
+        Err(e) => failed(format!("reading the test registry: {}", trap_text(&e))),
+    }
+}
+
+/// Run one file's selected tests, in one instance, one at a time — the design's
+/// "files parallel, tests within a file serial", which is what lets a file's tests
+/// share `beforeAll`-style setup and closure-captured state.
+///
+/// A TRAP fails that test and nothing else: the call unwinds, `vltFail*` still
+/// reads the message the matcher recorded, and the module is RE-INSTANTIATED so the
+/// next test starts from the registered-but-untouched state (registration replays
+/// deterministically). That re-instantiation is the isolation guarantee.
+///
+/// `selected` is (plan index, the test's index within this file); the returned
+/// outcomes carry the plan index back so the caller can scatter them.
+fn run_test_file(
+    engine: &Engine,
+    reg: &TestRegistry,
+    selected: &[(usize, i32)],
+) -> Vec<(usize, TestOutcome)> {
+    let bail_all = |msg: &str| -> Vec<(usize, TestOutcome)> {
+        selected
+            .iter()
+            .map(|&(k, _)| {
+                (
+                    k,
+                    TestOutcome {
+                        status: 1,
+                        message: msg.to_string(),
+                        output: String::new(),
+                    },
+                )
+            })
+            .collect()
+    };
+    let Some(module) = &reg.module else {
+        return bail_all(&reg.error);
+    };
+    let captured: Arc<Mutex<String>> = Arc::default();
+    let sink = {
+        let buf = captured.clone();
+        move |line: &str| {
+            let mut b = buf.lock().unwrap();
+            b.push_str(line);
+            b.push('\n');
+        }
+    };
+    let mut live = match instantiate_program(engine, module, sink.clone()) {
+        Ok(pair) => pair,
+        Err(e) => return bail_all(&trap_text(&e)),
+    };
+    let mut out = Vec::with_capacity(selected.len());
+    for &(plan_idx, local) in selected {
+        captured.lock().unwrap().clear();
+        let (store, inst) = &mut live;
+        let run = match inst.get_typed_func::<i32, i32>(&mut *store, "vltRun") {
+            Ok(f) => f,
+            Err(e) => {
+                out.push((
+                    plan_idx,
+                    TestOutcome {
+                        status: 1,
+                        message: format!("no `vltRun` export: {}", trap_text(&e)),
+                        output: String::new(),
+                    },
+                ));
+                continue;
+            }
+        };
+        let result = run.call(&mut *store, local);
+        let text = captured.lock().unwrap().clone();
+        match result {
+            Ok(1) => out.push((
+                plan_idx,
+                TestOutcome {
+                    status: 2,
+                    message: String::new(),
+                    output: String::new(),
+                },
+            )),
+            Ok(0) => out.push((
+                plan_idx,
+                TestOutcome {
+                    status: 0,
+                    message: String::new(),
+                    output: text,
+                },
+            )),
+            Ok(other) => out.push((
+                plan_idx,
+                TestOutcome {
+                    status: 1,
+                    message: format!("`vltRun` returned {other} (expected 0 or 1)"),
+                    output: text,
+                },
+            )),
+            Err(e) => {
+                // The matcher recorded its message before trapping; read it back off
+                // the (unwound but intact) instance. An empty one means the trap came
+                // from somewhere else — a raw `__trap__()`, a bad index — so the
+                // engine's own trap text is the message.
+                let mut message = String::new();
+                if let (Ok(len), Ok(at)) = (
+                    inst.get_typed_func::<(), i32>(&mut *store, "vltFailLen"),
+                    inst.get_typed_func::<i32, i32>(&mut *store, "vltFailAt"),
+                ) {
+                    if let Ok(s) = read_cli_str(&mut *store, &len, &at) {
+                        message = s;
+                    }
+                }
+                if message.is_empty() {
+                    message = trap_text(&e);
+                }
+                out.push((
+                    plan_idx,
+                    TestOutcome {
+                        status: 1,
+                        message,
+                        output: text,
+                    },
+                ));
+                // Re-instantiate for the next test. A failure here is terminal for
+                // the rest of THIS file only.
+                match instantiate_program(engine, module, sink.clone()) {
+                    Ok(pair) => live = pair,
+                    Err(e) => {
+                        let msg = format!("re-instantiating after a trap: {}", trap_text(&e));
+                        let done: Vec<usize> = out.iter().map(|(k, _)| *k).collect();
+                        for &(k, _) in selected {
+                            if !done.contains(&k) {
+                                out.push((
+                                    k,
+                                    TestOutcome {
+                                        status: 1,
+                                        message: msg.clone(),
+                                        output: String::new(),
+                                    },
+                                ));
+                            }
+                        }
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The engine test programs load and run on, built once per `vl test` and shared
+/// by BOTH phases. It must be one engine: a `Module` belongs to the engine that
+/// compiled it, and instantiating a collect-phase module in a run-phase store built
+/// on a second engine fails as `incompatible import type for imports::__print_i32__`
+/// — the import types are structurally identical but engine-local, so the mismatch
+/// reads as a print-ABI bug and is nothing of the sort. Built lazily so `vl check`
+/// and `vl fmt`, which share this pump, never pay for an engine they do not use.
+fn test_engine(slot: &mut Option<Engine>) -> Result<Engine> {
+    if let Some(engine) = slot {
+        return Ok(engine.clone());
+    }
+    let engine = gc_engine(run_collector()?)?;
+    *slot = Some(engine.clone());
+    Ok(engine)
+}
+
+/// How many workers to use: the brain's `--jobs` when it asked for one, else one
+/// per available core. (`--jobs` is POLICY the VL side parses; the ncpu default is
+/// mechanism only the host can see.)
+fn test_worker_count(requested: i32) -> usize {
+    if requested > 0 {
+        return requested as usize;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 // ── `vl check` — driven by the in-wasm CLI command-queue (docs/cli-design.md) ──
 // The host is a thin PUMP: push argv, then call `cliNext()` until CMD_DONE,
 // servicing each raw I/O command (read a file, print a line) and committing the
@@ -1337,6 +1705,9 @@ const CMD_WRITE_FILE: i32 = 3;
 const CMD_PRINT_OUT: i32 = 4;
 const CMD_PRINT_ERR: i32 = 5;
 const CMD_READ_STDIN: i32 = 6;
+const CMD_TEST_STASH: i32 = 7;
+const CMD_TEST_COLLECT: i32 = 8;
+const CMD_TEST_RUN: i32 = 9;
 
 /// Read the current command's string payload via a `<prefix>Len()` / `<prefix>At(j)`
 /// accessor pair (one UTF-32 code point per `At`, the seed's string-out idiom).
@@ -1412,6 +1783,12 @@ fn cli_pump(args: &[String]) -> Result<()> {
     let dir_entry_push = inst.get_typed_func::<i32, i32>(&mut store, "cliDirEntryPush")?;
     let dir_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliDirCommit")?;
     let exit_code = inst.get_typed_func::<(), i32>(&mut store, "cliExitCode")?;
+
+    // `vl test` state: the modules the brain has handed over (CMD_TEST_STASH), then
+    // what collection learned about each (CMD_TEST_COLLECT), reused by the run.
+    let mut test_files: Vec<TestFile> = Vec::new();
+    let mut test_regs: Vec<TestRegistry> = Vec::new();
+    let mut test_engine_slot: Option<Engine> = None;
 
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
@@ -1490,6 +1867,99 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 let line = read_cli_str(&mut store, &data_len, &data_at)?;
                 writeln!(err, "{line}")?;
             }
+            CMD_TEST_STASH => {
+                // The brain just emitted a test module; keep its bytes. They come
+                // back off the driver's own readback exports — the same `rbyteLen`
+                // / `rbyteAt` pair `vl build` reads — so nothing new crosses.
+                let path = read_cli_str(&mut store, &path_len, &path_at)?;
+                let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
+                let rat = inst.get_typed_func::<i32, i32>(&mut store, "rbyteAt")?;
+                let n = rlen.call(&mut store, ())?;
+                let mut bytes = Vec::with_capacity(n.max(0) as usize);
+                for i in 0..n {
+                    bytes.push(rat.call(&mut store, i)? as u8);
+                }
+                test_files.push(TestFile { path, bytes });
+            }
+            CMD_TEST_COLLECT => {
+                // Instantiate every stashed module in parallel (this is where the
+                // Cranelift compile lands) and commit each registry back IN STASH
+                // ORDER — the brain attributes names to files by commit order.
+                let jobs = inst.get_typed_func::<(), i32>(&mut store, "cliTestJobsWanted")?;
+                let workers = test_worker_count(jobs.call(&mut store, ())?);
+                let name_push = inst.get_typed_func::<i32, i32>(&mut store, "cliTestNamePush")?;
+                let name_commit =
+                    inst.get_typed_func::<i32, i32>(&mut store, "cliTestNameCommit")?;
+                let file_commit =
+                    inst.get_typed_func::<i32, i32>(&mut store, "cliTestFileCommit")?;
+                let engine_t = test_engine(&mut test_engine_slot)?;
+                test_regs = parallel_map(test_files.len(), workers, |i| {
+                    collect_test_file(&engine_t, &test_files[i])
+                });
+                for reg in &test_regs {
+                    for (name, skip) in reg.names.iter().zip(reg.skips.iter()) {
+                        for ch in name.chars() {
+                            name_push.call(&mut store, ch as i32)?;
+                        }
+                        name_commit.call(&mut store, *skip)?;
+                    }
+                    let status = if reg.error.is_empty() { 0 } else { 1 };
+                    if status != 0 {
+                        result_in.send(&mut store, &reg.error)?;
+                    }
+                    file_commit.call(&mut store, status)?;
+                }
+            }
+            CMD_TEST_RUN => {
+                // Read the plan the brain built, group it by file (one instance per
+                // file), run the files across the pool, and commit the outcomes back
+                // in PLAN order so the report is deterministic.
+                let jobs = inst.get_typed_func::<(), i32>(&mut store, "cliTestJobsWanted")?;
+                let workers = test_worker_count(jobs.call(&mut store, ())?);
+                let plan_count = inst.get_typed_func::<(), i32>(&mut store, "cliTestPlanCount")?;
+                let plan_file = inst.get_typed_func::<i32, i32>(&mut store, "cliTestPlanFile")?;
+                let plan_test = inst.get_typed_func::<i32, i32>(&mut store, "cliTestPlanTest")?;
+                let out_push = inst.get_typed_func::<i32, i32>(&mut store, "cliTestOutPush")?;
+                let res_commit =
+                    inst.get_typed_func::<(i32, i32), i32>(&mut store, "cliTestResultCommit")?;
+                let n = plan_count.call(&mut store, ())?;
+                let mut per_file: Vec<Vec<(usize, i32)>> =
+                    (0..test_regs.len()).map(|_| Vec::new()).collect();
+                for k in 0..n {
+                    let f = plan_file.call(&mut store, k)? as usize;
+                    let t = plan_test.call(&mut store, k)?;
+                    if f < per_file.len() {
+                        per_file[f].push((k as usize, t));
+                    }
+                }
+                let engine_t = test_engine(&mut test_engine_slot)?;
+                let batches = parallel_map(per_file.len(), workers, |i| {
+                    run_test_file(&engine_t, &test_regs[i], &per_file[i])
+                });
+                let mut outcomes: Vec<Option<TestOutcome>> =
+                    (0..n as usize).map(|_| None).collect();
+                for batch in batches {
+                    for (k, outcome) in batch {
+                        if k < outcomes.len() {
+                            outcomes[k] = Some(outcome);
+                        }
+                    }
+                }
+                for (k, slot) in outcomes.into_iter().enumerate() {
+                    let outcome = slot.unwrap_or(TestOutcome {
+                        status: 1,
+                        message: "the runner produced no result for this test".to_string(),
+                        output: String::new(),
+                    });
+                    if !outcome.message.is_empty() {
+                        result_in.send(&mut store, &outcome.message)?;
+                    }
+                    for ch in outcome.output.chars() {
+                        out_push.call(&mut store, ch as i32)?;
+                    }
+                    res_commit.call(&mut store, (k as i32, outcome.status))?;
+                }
+            }
             other => bail!("vl: unknown CLI command {other} from the wasm pump"),
         }
     }
@@ -1512,6 +1982,10 @@ fn main() -> Result<()> {
     }
     if args.get(1).map(|s| s == "check").unwrap_or(false) {
         // The subcommand rides as argv[0] so the VL program dispatches on it.
+        return cli_pump(&args[1..]);
+    }
+    if args.get(1).map(|s| s == "test").unwrap_or(false) {
+        // `vl test [path]` — same pump, three more commands (docs/internals/vl-test-design.md).
         return cli_pump(&args[1..]);
     }
     if args.len() < 3 {

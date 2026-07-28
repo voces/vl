@@ -43,7 +43,9 @@ import {
 } from "./driver"
 import {
   cliAnsi,
+  cliContains,
   cliDetab,
+  cliEndsTestVl,
   cliEndsVl,
   cliFormatNow,
   cliGlob,
@@ -85,20 +87,33 @@ const CMD_WRITE_FILE = 3
 const CMD_PRINT_OUT = 4
 const CMD_PRINT_ERR = 5
 const CMD_READ_STDIN = 6
+// `vl test` (docs/internals/vl-test-design.md). Wasm EXECUTION is the one thing a
+// VL program cannot do for itself — instances, threads and trap catching are the
+// engine's, and the engine lives in the host — so the runner's policy (discovery,
+// the plan, the report, the exit code) stays here and exactly three raw mechanisms
+// cross to Rust. cli-design.md anticipated this as `CMD_RUN_WASM`.
+const CMD_TEST_STASH = 7   // keep the module now in rbyte* as test file `cliCmdPath`
+const CMD_TEST_COLLECT = 8 // instantiate every stashed module; report its registry
+const CMD_TEST_RUN = 9     // run the pushed plan (in parallel); report each result
 
 // The state-machine states (cliState). `*_RECV` states resume after the host has
 // committed the result of the command the previous `cliNext` returned.
-const ST_INIT = 0        // parse argv, classify the target
-const ST_CLASSIFY = 1    // got the LIST_DIR result for the target (dir vs file)
-const ST_WALK = 2        // got a LIST_DIR result for a pending directory
-const ST_PRINT = 3       // draining cliOut to stderr
-const ST_CHECK_READ = 4  // got a check file's source
-const ST_CHECK_FETCH = 5 // got a pending module's source
-const ST_DONE = 6        // finished
-const ST_FMT_STDIN = 7   // got stdin for `fmt`
-const ST_FMT_READ = 8    // got a fmt file's source
-const ST_FMT_AFTER = 9   // a fmt write/print was serviced; advance
-const ST_FIX_WROTE = 10  // a `check --fix` write was serviced; run the check
+const ST_INIT = 0          // parse argv, classify the target
+const ST_CLASSIFY = 1      // got the LIST_DIR result for the target (dir vs file)
+const ST_WALK = 2          // got a LIST_DIR result for a pending directory
+const ST_PRINT = 3         // draining cliOut to stderr
+const ST_CHECK_READ = 4    // got a check file's source
+const ST_CHECK_FETCH = 5   // got a pending module's source
+const ST_DONE = 6          // finished
+const ST_FMT_STDIN = 7     // got stdin for `fmt`
+const ST_FMT_READ = 8      // got a fmt file's source
+const ST_FMT_AFTER = 9     // a fmt write/print was serviced; advance
+const ST_FIX_WROTE = 10    // a `check --fix` write was serviced; run the check
+const ST_TEST_READ = 11    // got a test file's source
+const ST_TEST_FETCH = 12   // got a test file dependency's source
+const ST_TEST_STASH = 13   // the host stashed the compiled test module
+const ST_TEST_COLLECT = 14 // the host reported every stashed file's registry
+const ST_TEST_RUN = 15     // the host reported every planned test's result
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []   // committed argv (cliArgs[0] = the subcommand)
@@ -163,6 +178,45 @@ let cliLintGraphed = 0 // 1 = the current file's lint ran module-aware (lintGrap
 let cliFileFixed = 0   // 1 once the current file's fixes were applied — so
 // the module-aware re-check (for the report) doesn't
 // re-fix. Reset per file in cliStartFile.
+// ── `vl test` (cliCmd == 2) ────────────────────────────────────────────────────
+// Flags.
+let cliTestFilter = "" // -t <substring>: keep tests whose scope-path contains it
+let cliTestJobs = 0    // --jobs N (0 = let the host pick, one worker per core)
+// Per collected FILE (parallel to cliFiles): the compile error text, "" when the
+// file compiled. A file that fails to compile is one FAILING entry in the report
+// and does not stop the run — the design's "compile failure of a test file = that
+// file FAILs and the run continues".
+let cliTestFileErr: string[] = []
+// The files whose modules the host holds, in stash order. Not every entry of
+// cliFiles is here (a compile failure stashes nothing), so this is the index space
+// the collect/run protocol speaks in; cliTestStashOf maps back to cliFiles.
+let cliTestStash: string[] = []
+let cliTestStashOf: i32[] = []
+// Per STASHED file, from CMD_TEST_COLLECT: 0 = instantiated and its registry read,
+// 1 = instantiation failed (the file's top level trapped) — message in ...Msg.
+let cliTestFileStatus: i32[] = []
+let cliTestFileMsg: string[] = []
+// The collected registry, flattened across files (parallel arrays).
+let cliTestOwner: i32[] = [] // stash index
+let cliTestLocal: i32[] = [] // the test's index WITHIN its file (what vltRun takes)
+let cliTestName: string[] = []
+let cliTestSkip: i32[] = []
+// The plan: the entries selected to run, in report order. Read by the host.
+let cliPlanEntry: i32[] = [] // index into the cliTest* registry
+// Per plan entry, from CMD_TEST_RUN: 0 = passed, 1 = failed, 2 = skipped.
+let cliResStatus: i32[] = []
+let cliResMsg: string[] = []
+let cliResOut: string[] = []
+// In-flight accumulators the host pushes into.
+let cliTestNameAcc: i32[] = []
+let cliTestOutAcc: i32[] = []
+// The index WITHIN the file currently being collected — what `vltRun(i)` takes.
+let cliTestLocalNext = 0
+// Tallies for the summary line.
+let cliTestPassed = 0
+let cliTestFailed = 0
+let cliTestSkipped = 0
+
 // One committed directory listing (parallel arrays), refilled per CMD_LIST_DIR.
 let cliDirNames: string[] = []
 let cliDirIsDirs: i32[] = []
@@ -286,6 +340,27 @@ export function cliArgReset() {
   cliDirIsDirs = []
   cliDirNameAcc = []
   cliDirWasDir = 0
+  cliTestFilter = ""
+  cliTestJobs = 0
+  cliTestFileErr = []
+  cliTestStash = []
+  cliTestStashOf = []
+  cliTestFileStatus = []
+  cliTestFileMsg = []
+  cliTestOwner = []
+  cliTestLocal = []
+  cliTestName = []
+  cliTestSkip = []
+  cliPlanEntry = []
+  cliResStatus = []
+  cliResMsg = []
+  cliResOut = []
+  cliTestNameAcc = []
+  cliTestOutAcc = []
+  cliTestLocalNext = 0
+  cliTestPassed = 0
+  cliTestFailed = 0
+  cliTestSkipped = 0
   dgSev = []
   dgLine = []
   dgCol = []
@@ -559,6 +634,21 @@ function cliExcluded(relPath: string, basename: string) {
 // A flag-shaped argument (so a value-taking flag never swallows one — e.g. the
 // host-injected trailing `--color=<v>` after a bare `--severity`).
 function cliIsFlag(a: string) { a.length > 0 && a[0] == '-' }
+// `--jobs` value → a positive worker count, or -1 for "not a positive count"
+// (the caller turns that into a usage error rather than silently running serially).
+function cliParseJobs(s: string) {
+  if s.length == 0 { return -1 }
+  let n = 0
+  let i = 0
+  while i < s.length {
+    const c = s[i]
+    if c < '0' || c > '9' { return -1 }
+    n = n * 10 + ((c as i32) - ('0' as i32))
+    i = i + 1
+  }
+  if n < 1 { return -1 }
+  n
+}
 // Record a usage error (first one wins; printed at exit tier 2).
 function cliUsageErr(msg: string) {
   if cliArgErr == "" { cliArgErr = msg }
@@ -571,6 +661,7 @@ function cliUsageErr(msg: string) {
 function cliParseArgs() {
   let sub = "check"
   if cliArgs.length > 0 && cliArgs[0] == "fmt" { sub = "fmt" }
+  if cliArgs.length > 0 && cliArgs[0] == "test" { sub = "test" }
   let i = 1
   while i < cliArgs.length {
     const a = cliArgs[i]
@@ -621,6 +712,33 @@ function cliParseArgs() {
       cliFmtCheck = 1
     } else if sub == "check" && a == "--fix" {
       cliFix = 1
+    } else if sub == "test" && a == "-t" {
+      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
+        cliTestFilter = cliArgs[i + 1]
+        i = i + 1
+      } else {
+        cliUsageErr("test: -t requires a substring to match test names against")
+      }
+    } else if sub == "test" && a.length > 3 && a.slice(0, 3) == "-t=" {
+      cliTestFilter = a.slice(3, a.length)
+    } else if sub == "test" && a == "--jobs" {
+      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
+        cliTestJobs = cliParseJobs(cliArgs[i + 1])
+        i = i + 1
+      } else {
+        cliUsageErr("test: --jobs requires a positive count")
+      }
+    } else if sub == "test" && a.length > 7 && a.slice(0, 7) == "--jobs=" {
+      cliTestJobs = cliParseJobs(a.slice(7, a.length))
+    } else if sub == "test" && a == "--exclude" {
+      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
+        cliAddExclude(cliArgs[i + 1])
+        i = i + 1
+      } else {
+        cliUsageErr("test: --exclude requires a glob pattern")
+      }
+    } else if sub == "test" && a.length > 10 && a.slice(0, 10) == "--exclude=" {
+      cliAddExclude(a.slice(10, a.length))
     } else if cliIsFlag(a) {
       cliUsageErr(sub + ": unknown flag `" + a + "`")
     } else if a.length > 0 && cliFile.length == 0 {
@@ -631,6 +749,9 @@ function cliParseArgs() {
       )
     }
     i = i + 1
+  }
+  if cliArgErr == "" && cliTestJobs < 0 {
+    cliArgErr = "test: --jobs expects a positive count"
   }
   if cliArgErr == "" && cliSeverityGiven != 0 && !cliSevValid(cliSeverity) {
     cliArgErr = "check: invalid --severity `" +
@@ -687,7 +808,11 @@ function cliIngestEntries(base: string, relBase: string) {
         cliWalkRel.push(rel)
       }
     } else {
-      if cliEndsVl(name) && !cliExcluded(rel, name) { cliFiles.push(child) }
+      // `check`/`fmt` collect every `.vl`; `test` collects only `*.test.vl` — the
+      // discovery predicate is the ONLY thing the walk does differently.
+      let wanted = cliEndsVl(name)
+      if cliCmd == 2 { wanted = cliEndsTestVl(name) }
+      if wanted && !cliExcluded(rel, name) { cliFiles.push(child) }
     }
     i = i + 1
   }
@@ -927,6 +1052,318 @@ function cliFinishSummary() {
   0
 }
 
+// ── `vl test` — the runner brain (docs/internals/vl-test-design.md) ─────────────
+// The whole runner is policy EXCEPT wasm execution, so this is where all of it
+// lives: discovery reuses the `check`/`fmt` walk with a `*.test.vl` predicate,
+// compilation reuses the module fetch loop, and only three commands cross to the
+// host — stash a compiled module, collect the registries, run the plan.
+//
+// Phases, in order:
+//   1. per file: read → resolve imports → `compileSrc()` → CMD_TEST_STASH
+//      (a compile failure records its diagnostics and the run CONTINUES)
+//   2. CMD_TEST_COLLECT — the host instantiates each module; its start function
+//      runs the file's top level, which is the registration pass; the host reads
+//      the registry back through the `vlt*` exports and commits it here
+//   3. plan — apply `-t`; drop `itSkip` entries into the skipped tally
+//   4. CMD_TEST_RUN — the host runs the plan across its worker pool
+//   5. report + exit code
+
+// The line `vl test` APPENDS to every test file before compiling it: the runner
+// protocol, re-exported so the host can find it on the test module itself. It is
+// appended (never prepended) so every diagnostic position in the user's file is
+// unchanged. This is why a `*.test.vl` never writes the boilerplate — and why a
+// file that defines its own `vltCount` gets a duplicate-export error, which
+// reports as that file's failure like any other compile error.
+function cliTestProtocol() {
+  "\nexport { vltCount, vltNameLen, vltNameAt, vltSkipped, vltRun, vltFailLen, vltFailAt } from \"std:test\"\n"
+}
+
+// Begin the next test file, or — work-list exhausted — move on to collection.
+function cliStartTestFile() {
+  if cliFileIdx >= cliFiles.length { return cliTestBeginCollect() }
+  cliCurFile = cliFiles[cliFileIdx]
+  cliTestFileErr.push("")
+  const ci = cliSrcCacheGet(cliCurFile)
+  if ci >= 0 && cliSrcCacheFound[ci] != 0 {
+    cliEntrySrc = cliSrcCacheSrcs[ci] + cliTestProtocol()
+    return cliTestBeginCompile()
+  }
+  cliCmdPath = cliCurFile
+  cliState = ST_TEST_READ
+  CMD_READ_FILE // — the test file's source
+}
+
+// Record why the current file produced no tests and move to the next one. The
+// message IS the file's report entry; the run never stops for it.
+function cliTestFileFailed(msg: string) {
+  cliTestFileErr[cliFileIdx] = msg
+  cliFileIdx = cliFileIdx + 1
+  cliStartTestFile()
+}
+
+// Set up the module table for the current test file and drive its fetch loop. A
+// test file ALWAYS imports (the appended protocol re-export is one), so module
+// mode is unconditional — no `cliHasImports` gate.
+function cliTestBeginCompile() {
+  modReset()
+  cliModMode = 1
+  cliModKeys = [cliCurFile]
+  cliModSrcs = [cliEntrySrc]
+  cliDiagLineCacheMod = -1
+  cliModCommitOne(cliCurFile, cliEntrySrc, 1)
+  cliTestFetchOrCompile()
+}
+
+// Fetch the current file's remaining imports (from the per-run cache when we have
+// them), then compile.
+function cliTestFetchOrCompile() {
+  while modPendingCount() > 0 {
+    const key = cliPendingKey(0)
+    const ci = cliSrcCacheGet(key)
+    if ci < 0 {
+      cliFetchKey = key
+      cliCmdPath = key
+      cliState = ST_TEST_FETCH
+      return CMD_READ_FILE
+    }
+    cliModKeys.push(key)
+    cliModSrcs.push(cliSrcCacheSrcs[ci])
+    cliModCommitOne(key, cliSrcCacheSrcs[ci], cliSrcCacheFound[ci])
+  }
+  cliTestCompileNow()
+}
+
+// Emit the current test file's module. Success hands the bytes to the host to
+// hold (CMD_TEST_STASH reads them straight out of the driver's `rbyte*` buffer);
+// failure becomes this file's one report line.
+function cliTestCompileNow() {
+  const rc = compileSrc()
+  if rc != 0 {
+    dgSev = []
+    dgLine = []
+    dgCol = []
+    dgEnd = []
+    dgMsg = []
+    dgMod = []
+    dgCode = []
+    const n = diagCount()
+    let i = 0
+    while i < n {
+      cliAddDiag(
+        "error",
+        "",
+        diagLine(i),
+        diagCol(i),
+        diagEndCol(i),
+        vcDiagMsg(i),
+        diagModule(i),
+      )
+      i = i + 1
+    }
+    let stage = "emit"
+    if rc == 1 { stage = "parse" }
+    if rc == 2 { stage = "type" }
+    let msg = stage + " error"
+    let d = 0
+    while d < dgMsg.length {
+      msg = msg + "\n" + cliFmtConcise(d)
+      d = d + 1
+    }
+    return cliTestFileFailed(msg)
+  }
+  cliTestStash.push(cliCurFile)
+  cliTestStashOf.push(cliFileIdx)
+  cliCmdPath = cliCurFile
+  cliState = ST_TEST_STASH
+  CMD_TEST_STASH // — the host keeps the module now in rbyte*
+}
+
+// Every file compiled: ask the host to instantiate the stashed modules and read
+// their registries back. Nothing stashed (every file failed to compile, or there
+// were none) skips straight to the report.
+function cliTestBeginCollect() {
+  if cliTestStash.length == 0 { return cliTestReport() }
+  cliState = ST_TEST_COLLECT
+  CMD_TEST_COLLECT
+}
+
+// The plan: every collected test, in collection order, minus the ones `-t`
+// filters out. `itSkip` entries STAY in the plan — the host reports them skipped
+// off `vltRun`'s return value, so the skip decision has exactly one owner
+// (`std:test`) instead of two that can disagree.
+function cliTestPlanRun() {
+  cliPlanEntry = []
+  let i = 0
+  while i < cliTestName.length {
+    if cliContains(cliTestName[i], cliTestFilter) { cliPlanEntry.push(i) }
+    i = i + 1
+  }
+  if cliPlanEntry.length == 0 { return cliTestReport() }
+  cliState = ST_TEST_RUN
+  CMD_TEST_RUN
+}
+
+// One report line for a test, `<status> <name>`, with the failure message and any
+// captured output indented beneath it.
+function cliTestEmitResult(k: i32) {
+  const e = cliPlanEntry[k]
+  const status = cliResStatus[k]
+  if status == 2 {
+    cliTestSkipped = cliTestSkipped + 1
+    cliOut.push("  " + cliAnsi(cliColor, "2", "skip") + " " + cliTestName[e])
+    return 0
+  }
+  if status == 0 {
+    cliTestPassed = cliTestPassed + 1
+    cliOut.push("  " + cliAnsi(cliColor, "32", "ok  ") + " " + cliTestName[e])
+    return 0
+  }
+  cliTestFailed = cliTestFailed + 1
+  cliOut.push("  " + cliAnsi(cliColor, "31", "FAIL") + " " + cliTestName[e])
+  cliTestEmitIndented(cliResMsg[k])
+  if cliResOut[k].length > 0 {
+    cliOut.push("       " + cliAnsi(cliColor, "2", "--- captured output ---"))
+    cliTestEmitIndented(cliResOut[k])
+  }
+  0
+}
+
+// Push `text` into the report indented under a failing test, one line per line —
+// a compiler diagnostic block and a captured-output block are both multi-line.
+function cliTestEmitIndented(text: string) {
+  if text.length == 0 { return 0 }
+  const lines = cliSplitLines(text)
+  let i = 0
+  while i < lines.length {
+    if !(i == lines.length - 1 && lines[i].length == 0) {
+      cliOut.push("       " + lines[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The whole report: one block per file, then the summary. Deterministic — files
+// in sorted order, tests in registration order — however the host scheduled them.
+function cliTestReport() {
+  let f = 0
+  while f < cliFiles.length {
+    cliOut.push(cliAnsi(cliColor, "1", cliFiles[f]))
+    if cliTestFileErr[f].length > 0 {
+      cliTestFailed = cliTestFailed + 1
+      cliOut.push("  " + cliAnsi(cliColor, "31", "FAIL") + " <compile>")
+      cliTestEmitIndented(cliTestFileErr[f])
+    } else {
+      cliTestEmitFileTests(f)
+    }
+    f = f + 1
+  }
+  const noun = cliPlural(cliFiles.length, "file")
+  let text = noun +
+    " · " +
+    i32ToStr(cliTestPassed) +
+    " passed · " +
+    i32ToStr(cliTestFailed) +
+    " failed"
+  if cliTestSkipped > 0 {
+    text = text + " · " + i32ToStr(cliTestSkipped) + " skipped"
+  }
+  let code = "32"
+  if cliTestFailed > 0 { code = "31" }
+  cliOut.push(cliAnsi(cliColor, code, text))
+  cliExit = 0
+  if cliTestFailed > 0 { cliExit = 1 }
+  cliBeginPrint()
+}
+
+// The per-test lines of file `f` (a cliFiles index): every plan entry that
+// belongs to it, plus the two file-level outcomes that produce no tests at all.
+function cliTestEmitFileTests(f: i32) {
+  let stash = -1
+  let s = 0
+  while s < cliTestStashOf.length {
+    if cliTestStashOf[s] == f { stash = s }
+    s = s + 1
+  }
+  if stash < 0 { return 0 }
+  if cliTestFileStatus[stash] != 0 {
+    cliTestFailed = cliTestFailed + 1
+    cliOut.push("  " + cliAnsi(cliColor, "31", "FAIL") + " <file top level>")
+    cliTestEmitIndented(cliTestFileMsg[stash])
+    return 0
+  }
+  let shown = 0
+  let k = 0
+  while k < cliPlanEntry.length {
+    if cliTestOwner[cliPlanEntry[k]] == stash {
+      cliTestEmitResult(k)
+      shown = shown + 1
+    }
+    k = k + 1
+  }
+  if shown == 0 { cliOut.push("  " + cliAnsi(cliColor, "2", "no tests") + "") }
+  0
+}
+
+// ── the `vl test` protocol: what the host READS ────────────────────────────────
+// The plan, as (stashed file, test index within that file) pairs, plus the worker
+// count. `cliTestJobsWanted() == 0` means "host's choice" (one per core).
+export function cliTestPlanCount(): i32 { cliPlanEntry.length }
+export function cliTestPlanFile(k: i32): i32 { cliTestOwner[cliPlanEntry[k]] }
+export function cliTestPlanTest(k: i32): i32 { cliTestLocal[cliPlanEntry[k]] }
+export function cliTestJobsWanted(): i32 { cliTestJobs }
+
+// ── the `vl test` protocol: what the host COMMITS ──────────────────────────────
+// A test name, one code point at a time (the `cliDirNamePush` idiom).
+export function cliTestNamePush(c: i32) {
+  cliTestNameAcc.push(c)
+  0
+}
+// End of one test's name, for the file currently being collected. `skip` is the
+// registry's own `vltSkipped(i)`.
+export function cliTestNameCommit(skip: i32) {
+  cliTestOwner.push(cliTestFileStatus.length)
+  cliTestLocal.push(cliTestLocalNext)
+  cliTestName.push(fromCodePoints(cliTestNameAcc))
+  cliTestSkip.push(skip)
+  cliTestLocalNext = cliTestLocalNext + 1
+  cliTestNameAcc = []
+  0
+}
+// End of one stashed file's registry. `status` 0 = instantiated and read, 1 = its
+// top level trapped (the message rides in on the shared `cliResult` channel).
+// Files commit IN STASH ORDER, so `cliTestFileStatus.length` is the stash index
+// being collected — that is what the names above were attributed to.
+export function cliTestFileCommit(status: i32) {
+  cliTestFileStatus.push(status)
+  cliTestFileMsg.push(fromCodePoints(cliResultAcc))
+  cliTestLocalNext = 0
+  cliResultAcc = []
+  0
+}
+// Captured output of the test result being committed.
+export function cliTestOutPush(c: i32) {
+  cliTestOutAcc.push(c)
+  0
+}
+// One plan entry's outcome: 0 = passed, 1 = failed, 2 = skipped. The failure
+// message rides the shared `cliResult` channel; the captured output rides
+// `cliTestOutPush`. `k` is the plan index, asserted rather than assumed so a
+// mis-ordered host commit cannot silently attribute a failure to another test.
+export function cliTestResultCommit(k: i32, status: i32) {
+  while cliResStatus.length < k {
+    cliResStatus.push(0)
+    cliResMsg.push("")
+    cliResOut.push("")
+  }
+  cliResStatus.push(status)
+  cliResMsg.push(fromCodePoints(cliResultAcc))
+  cliResOut.push(fromCodePoints(cliTestOutAcc))
+  cliResultAcc = []
+  cliTestOutAcc = []
+  0
+}
+
 // ── the state machine ──────────────────────────────────────────────────────────
 // Transition into the print phase and return the first output command. A pending
 // `--json` payload goes FIRST, to stdout (machine output; the stderr lines —
@@ -965,6 +1402,11 @@ function cliWalkStep() {
     return CMD_LIST_DIR
   }
   cliSortFiles()
+  if cliFiles.length == 0 && cliCmd == 2 {
+    cliOut = ["test: no *.test.vl files found under " + cliFile]
+    cliExit = 0
+    return cliBeginPrint()
+  }
   if cliFiles.length == 0 && cliCmd == 0 {
     cliOut = ["check: no .vl files found under " + cliFile]
     // --json still delivers a parseable (empty) array on stdout.
@@ -979,6 +1421,7 @@ function cliWalkStep() {
 // reformats.
 function cliStartWork() {
   if cliCmd == 1 { return cliStartFmtFile() }
+  if cliCmd == 2 { return cliStartTestFile() }
   cliStartFile()
 }
 // Begin checking cliFiles[cliFileIdx] (read its source), or — work-list done —
@@ -1250,8 +1693,10 @@ export function cliNext() {
       cliCmd = 1
     } else if sub == "check" {
       cliCmd = 0
+    } else if sub == "test" {
+      cliCmd = 2
     } else {
-      cliOut = ["vl: this build's pump implements `check` and `fmt`"]
+      cliOut = ["vl: this build's pump implements `check`, `fmt` and `test`"]
       cliExit = 2
       return cliBeginPrint()
     }
@@ -1405,6 +1850,34 @@ export function cliNext() {
     cliFileIdx = cliFileIdx + 1
     return cliStartFmtFile()
   }
+  if st == ST_TEST_READ {
+    if cliFileFound == 0 {
+      // A named target that does not exist is a usage error; a file that vanished
+      // between the walk and the read is one failing entry.
+      if cliDirMode == 0 {
+        cliOut = ["test: cannot read " + cliFile]
+        cliExit = 2
+        return cliBeginPrint()
+      }
+      return cliTestFileFailed("cannot read " + cliCurFile)
+    }
+    cliSrcCachePut(cliCurFile, cliFileSrc, 1)
+    cliEntrySrc = cliFileSrc + cliTestProtocol()
+    return cliTestBeginCompile()
+  }
+  if st == ST_TEST_FETCH {
+    cliSrcCachePut(cliFetchKey, cliFileSrc, cliFileFound)
+    cliModKeys.push(cliFetchKey)
+    cliModSrcs.push(cliFileSrc)
+    cliModCommitOne(cliFetchKey, cliFileSrc, cliFileFound)
+    return cliTestFetchOrCompile()
+  }
+  if st == ST_TEST_STASH {
+    cliFileIdx = cliFileIdx + 1
+    return cliStartTestFile()
+  }
+  if st == ST_TEST_COLLECT { return cliTestPlanRun() }
+  if st == ST_TEST_RUN { return cliTestReport() }
   if st == ST_PRINT { return cliEmitNextOut() }
   CMD_DONE
 }

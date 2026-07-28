@@ -493,13 +493,45 @@ i32` or similar) closes it. Cheap, high-value for engine code.
 > identity. Also worth knowing: a newtype cannot be a MAP KEY — but neither can a
 > plain alias, which is a pre-existing map-key-grammar gap, not this feature's.
 
-### P1.6 `vl test` (already designed)
+### P1.6 `vl test` (already designed) — ✅ SHIPPED
 
 The kernel/wc3 port arrives with thousands of table-driven cases (the
 corpus-derived suites). The designed runner (`*.test.vl`, host thread pool,
 trap isolation) is exactly right — webcraft just needs it to exist by M7.
 The differential twin harness itself is host-side (compares TS vs vl hashes)
 and needs nothing from vl beyond scalar exports.
+
+> **Shipped.** `vl test [path]` discovers `*.test.vl`, compiles each (module-aware,
+> so `std:` and relative imports resolve), and runs them one wasm instance per
+> file across a host thread pool. What webcraft can rely on:
+>
+> - **The surface is jest-shaped**: `describe`/`it`/`itSkip`/`beforeEach`/
+>   `afterEach` and `expect(x).toEqual(y)` / `.toBeTrue()` / `.toBeFalse()` /
+>   `.not()` / `fail(msg)`, all from `std:test`. A test file writes no protocol
+>   boilerplate — the runner appends the re-export line itself.
+> - **Trap isolation is real, not aspirational**: a test that traps (a failed
+>   expectation, a raw `__trap__()`, an out-of-bounds index) fails ALONE. The host
+>   catches the trap and re-instantiates, so the tests after it in the same file
+>   still run. Proven by a fixture that traps twice and still passes the test
+>   declared after them.
+> - **A test file that does not COMPILE is one failing entry** with the compiler's
+>   own positioned diagnostics, and the rest of the run is unaffected — which is
+>   the behaviour a thousands-of-cases port actually needs while it is in motion.
+> - **Failure messages are structural**: the matcher records `expected 7 to equal
+>   8` and the host reads it back off the instance after the trap. A failing test's
+>   captured output is shown beneath it; a passing test's is hidden.
+> - **Parallel**: measured 3.6x on four CPU-bound files (1.11 s serial → 0.31 s at
+>   `--jobs 4`). `--jobs N` overrides; the default is one worker per core.
+> - **Selection**: `-t <substring>` matches the scope-qualified name
+>   (`strings > nested > reports its full path`). `--exclude <glob>` prunes the walk.
+> - **Exit codes**: 0 all green, 1 any failure, 2 usage.
+>
+> Two things to design around, both recorded in
+> `docs/internals/vl-test-design.md` §Known gaps: a test body whose last statement
+> is an ASSIGNMENT needs a trailing `done()` (VL types a function by its tail, and
+> an assignment yields a value — the `() => void` body then does not match), and an
+> f64 operand renders as `<f64>` in the message with the real values printed into
+> the captured output, until `std:fmt` grows f64→string.
 
 ## P2 — wanted, not gating
 
