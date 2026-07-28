@@ -308,19 +308,24 @@ export function copyFrom(
 // at every access, which is the DataView experience webcraft already has and
 // wants absorbed.
 //
-// WHY THE BASE FIELD CARRIES THE WIDTH IN ITS NAME (`f32base`, not `base`).
-// This is the one surprising thing in this section, and it is forced. VL is
-// STRUCTURALLY typed: `type X = {…}` is an alias for a shape, not a new nominal
-// identity, so two declarations with the same field names and types ARE THE SAME
-// TYPE and are silently interchangeable. Spelled the obvious way — both views as
-// `{ base: i32, length: i32 }` — an `I32View` would satisfy every `F32View`
-// parameter in this module, and `iv.getF32(0)` would type-check and REINTERPRET
-// the bits with no diagnostic. Measured, not feared: with both spelled `{base,
-// length}` a value built as one view type flows into the other's accessor and
-// prints the reinterpreted float. Distinct field NAMES are what make the two
-// types distinct to a structural checker, so the discriminator is spelled where
-// the checker can see it. A nominal newtype (webcraft P1.5) would let both go
-// back to `base`; until then this is the type safety, not a decoration.
+// WHY THE TWO VIEWS ARE `new` (webcraft P1.5, `docs/internals/newtype-design.md`).
+// VL is STRUCTURALLY typed: a plain `type X = {…}` names a shape, not an identity,
+// so two declarations with the same field names and types ARE THE SAME TYPE and
+// are silently interchangeable. Spelled plainly — both views as
+// `{ base: i32, length: i32 }` — an `I32View` satisfies every `F32View` parameter
+// in this module and `iv.getF32(0)` type-checks while REINTERPRETING four integer
+// bytes as a float, with no diagnostic. Measured, not feared.
+//
+// `new` mints the identity the shape does not: the two declarations are now
+// distinct to the checker even though the shape is identical, and the mismatch is
+// a named reject (`tests/cases/std/buffer-view-element-type-mismatch.vl`). It is
+// ZERO-COST — a newtype is erased before the emitter runs, so the two views still
+// share one wasm heap type and the module is byte-identical to the one this
+// section shipped with `f32base`/`i32base` field names.
+//
+// THE ELEMENT WIDTH IS IN THE TYPE, NOT IN A FIELD NAME. That is the whole point:
+// every further width this family grows (i64, f64, the narrow widths) is one more
+// `new`, not one more name hack.
 //
 // `.length` is the ELEMENT count, per the P1.1 spec's `x.length`. It is a plain
 // struct field — no call, no side table, exactly as `Buf.length` is.
@@ -352,13 +357,13 @@ export function copyFrom(
 // the shift rather than after it.
 const MAX_COUNT_4 = 536870911
 
-// A view of 4-byte floats. `f32base` is the byte address of element 0; `length`
-// is the element count. See this section's header for why the field is not
-// called `base`.
-export type F32View = { f32base: i32, length: i32 }
+// A view of 4-byte floats. `base` is the byte address of element 0; `length` is
+// the element count. `new` is what keeps this distinct from `I32View`, which has
+// the identical shape — see this section's header.
+export type F32View = new { base: i32, length: i32 }
 
 // A view of 4-byte signed integers.
-export type I32View = { i32base: i32, length: i32 }
+export type I32View = new { base: i32, length: i32 }
 
 // Shared construction check for a 4-byte-element view over `self`: `off` is a
 // BYTE offset into the `Buf` and `count` is an ELEMENT count. Traps unless the
@@ -386,41 +391,41 @@ function view4Base(self: Buf, off: i32, count: i32): i32 {
 // `buf.f32view(off, count)` — `count` f32 elements starting at byte `off`.
 export function f32view(self: Buf, off: i32, count: i32): F32View {
   const b = view4Base(self, off, count)
-  return { f32base: b, length: count }
+  return { base: b, length: count }
 }
 
 // `buf.i32view(off, count)` — `count` i32 elements starting at byte `off`.
 export function i32view(self: Buf, off: i32, count: i32): I32View {
   const b = view4Base(self, off, count)
-  return { i32base: b, length: count }
+  return { base: b, length: count }
 }
 
 // Element `i` of an f32 view. Traps on an index outside `[0, length)`.
 export function getF32(self: F32View, i: i32): f32 {
   if i < 0 { __trap__() }
   if i >= self.length { __trap__() }
-  return __load_f32__(self.f32base + (i << 2))
+  return __load_f32__(self.base + (i << 2))
 }
 
 // Write element `i` of an f32 view. Traps on an index outside `[0, length)`.
 export function setF32(self: F32View, i: i32, v: f32) {
   if i < 0 { __trap__() }
   if i >= self.length { __trap__() }
-  __store_f32__(self.f32base + (i << 2), v)
+  __store_f32__(self.base + (i << 2), v)
 }
 
 // Element `i` of an i32 view. Traps on an index outside `[0, length)`.
 export function getI32(self: I32View, i: i32): i32 {
   if i < 0 { __trap__() }
   if i >= self.length { __trap__() }
-  return __load_i32__(self.i32base + (i << 2))
+  return __load_i32__(self.base + (i << 2))
 }
 
 // Write element `i` of an i32 view. Traps on an index outside `[0, length)`.
 export function setI32(self: I32View, i: i32, v: i32) {
   if i < 0 { __trap__() }
   if i >= self.length { __trap__() }
-  __store_i32__(self.i32base + (i << 2), v)
+  __store_i32__(self.base + (i << 2), v)
 }
 
 // The byte offset of element `i` RELATIVE TO the `Buf` the view was cut from is
@@ -431,9 +436,9 @@ export function setI32(self: I32View, i: i32, v: i32) {
 // dereference one, and `byteAddrF32(v, v.length)` — the one-past-the-end address
 // — is the useful answer for a range, not an error.
 export function byteAddrF32(self: F32View, i: i32): i32 {
-  return self.f32base + (i << 2)
+  return self.base + (i << 2)
 }
 
 export function byteAddrI32(self: I32View, i: i32): i32 {
-  return self.i32base + (i << 2)
+  return self.base + (i << 2)
 }
