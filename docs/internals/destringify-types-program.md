@@ -29142,7 +29142,7 @@ grammar has it".
 | **W7** | the SPACE-FREE normalisation family | 7 (+4 declined) | `emit_base.normTypeAtom` / `canonBareShapeName` · `emit_classify.spacelessName` / `mvValKindOfName` · `emit_rep.renderFaithful` | six bodies each asserting or enforcing "a canonical type name has no spaces" | `nameIsSpaceFree` + `nameStripSpaces` in **`tyname.vl`** | **LEGAL** — emit_base / emit_classify / emit_rep all import `tyname` |
 | **W8** | the type-name IDENTIFIER-RUN walk | 5 | `driver.modGenParams` / `modTypeRenamed` · `typecheck.nameNeedsCanon` | walks a rendered type name character by character classifying identifier runs (the module-merge rename, and the canon trigger scan) | a run tokenizer `nameIdentRuns(name, outStart, outEnd)` in **`tyname.vl`** | **LEGAL** — driver and typecheck both import `tyname` |
 | **W9** | the CANON pass | 10 | `typecheck.canonEmitNameAt` (4) · `canonShapeName` (4) · `nameNeedsCanon` (2) | the checker re-parsing names it rendered | **DESIGN-BLOCKED.** `canonEmitName` is not `tyToEmitName ∘ nameToTy` — they disagree on 853 of 5,172 annotations (16.5%), 41 canon-only / 108 renderer-only / 5 both. The `renderEmit(ty, ctx)` six-phase design is the answer; P1-P3 have landed | n/a — not a routing problem |
-| | ↑ **SUPERSEDED — read the P4 and P5 sections at the end of this document.** #1266 re-derived the census (the row above staples B1's TOTAL to B3's decomposition; 41+108+5 = 154 ≠ 853). Current: **B1** 1,230 / 7,063 = 17.41%, 29 canon-only / 1,179 renderer-only / 22 both. **B2** (`tyToNominalName ∘ nameToTy`) 194 / 7,130 = 2.72%, 52 / 112 / 30, decomposed by P5 into nine classes of which **114 (58.8%) is the generic APPLICATION the arena cannot spell**. **B3** 272 / 7,150 = 3.80%, 43 / 191 / 38. `emit_collect.vl`'s three render-then-re-canon sites are **one** since P5, and the outer canon there is measured LOAD-BEARING (its deletion moves 13 corpus rows, one of them a wrong answer) | |
+| | ↑ **SUPERSEDED — read the P4 and P5 sections at the end of this document.** #1266 re-derived the census (the row above staples B1's TOTAL to B3's decomposition; 41+108+5 = 154 ≠ 853). Current: **B1** 1,230 / 7,063 = 17.41%, 29 canon-only / 1,179 renderer-only / 22 both. **B2** (`tyToNominalName ∘ nameToTy`) **176 / 7,201 = 2.44% since P6** (was 194 / 7,130 = 2.72%), 34 / 112 / 30, decomposed by P5 into nine classes of which **114 (58.8%) is the generic APPLICATION the arena cannot spell**. **B3** 272 / 7,150 = 3.80%, 43 / 191 / 38. `emit_collect.vl`'s three render-then-re-canon sites are **one** since P5, and the outer canon there is measured LOAD-BEARING (its deletion moves 13 corpus rows, one of them a wrong answer) | |
 | **W10** | `nameToTyReal` | 9 | `typecheck.nameToTyReal` | the compiler's SECOND recursive-descent type parser | **a SOURCES problem**, not a site problem: the answer is the parser's `annTs` spelling tree (D-PARSETY / D-TSTY). Partly banked at positioned annotations; the residue is the positions the parser still `tsPop()`s | n/a |
 | **W11** | the PIN / SENTINEL markers | 10 | `emit_mono.monoMakeInstance` (3) · `typecheck.recordClonedNodeTy` (7) | `=>sigkey` and `#anonN` PROVENANCE prefixes riding a `TypeRef.tyName` column | not a grammar. Retired by giving the pin its **own column**, not by a home | n/a |
 | **W12** | the `$fnsig` ABI | 9 (+4) | `emit_classify.sigKeyRetTokIx` / `sigKeyRetKind` / `sigKeyRetIsVoid` / `sigKeyRetSlot` / `sigKeyPinPayload` / `sigParamCoerceKind` · `emit_sections.synthSigIdxAt` / `emitSynthCloSig` | a minted representation-kind encoding | ruled out of scope by two in-code notes; each scan already has a single home | n/a |
@@ -31442,7 +31442,7 @@ three-writing SPLIT entry and W14 (field-colon cut) are closed. What remains, in
 
 | # | residue | count | kind of block | anchor (find by CONTENT — line numbers expire) |
 |---|---|---:|---|---|
-| 1 | **W9** the CANON pass | **10** | DESIGN — `canonEmitName` is not `tyToEmitName ∘ nameToTy`. **The 853/5,172 figure is superseded** (see the P4/P5 sections at the end): B1 is 1,230 / 7,063 = 17.41%, B2 is 194 / 7,130 = 2.72%. P1-P5 landed; `emit_collect`'s three render-then-re-canon sites are one, and the canon there is measured load-bearing | `typecheck.canonEmitNameAt` (4) · `canonShapeName` (4) · `nameNeedsCanon` (2) |
+| 1 | **W9** the CANON pass | **10** | DESIGN — `canonEmitName` is not `tyToEmitName ∘ nameToTy`. **The 853/5,172 figure is superseded** (see the P4/P5 sections at the end): B1 is 1,247 / 7,134 = 17.48%, B2 is **176 / 7,201 = 2.44%** (P6 closed T's 18 numeric-litunion-alias rows). P1-P6 landed; `emit_collect`'s three render-then-re-canon sites are one, the canon there is measured load-bearing, and 145 of B2's remaining 176 is G (typed-IR) + Lsoft (owner) | `typecheck.canonEmitNameAt` (4) · `canonShapeName` (4) · `nameNeedsCanon` (2) |
 | 2 | **W10** `nameToTyReal` | **9** | DESIGN — a SOURCES problem; the answer is the parser's `annTs` spelling tree (D-PARSETY / D-TSTY), partly banked | `typecheck.nameToTyReal` |
 | 3 | **W11** the PIN / SENTINEL markers | **10** | DESIGN — not a grammar; retired by giving the pin its own COLUMN | `emit_mono.monoMakeInstance` (3) · `typecheck.recordClonedNodeTy` (7) |
 | 4 | **W12** the `$fnsig` ABI | **13** | DESIGN — a minted encoding, ruled out of scope by two in-code notes; each scan already has a single home | `emit_classify.sigKey*` / `sigParamCoerceKind` · `emit_sections.synthSigIdxAt` / `emitSynthCloSig` |
@@ -32432,10 +32432,330 @@ compositions become three calls to one function. The fixpoint ladder held at **2
 * **T's canon-only half (19 rows)** — the one uncontroversially canon-matching class. Taking it
   edits `tyToNominalName` (`typecheck.vl`) and changes the `underFunc` leg's keys; it is P6's
   first item, with T's `both` half explicitly NOT included (that half is O2, and #1122 already
-  measured the nominal route regressing).
+  measured the nominal route regressing). **↑ TAKEN BY P6, AND IT WAS 18 OF THE 19** — see the
+  P6 section at the end of this document. The 19th (`L|i32`) is the `both` half's rule wearing a
+  different direction and is unconvertible on the nominal axis; and the `underFunc` warning was
+  right in a sharper way than filed — the keys must NOT change there, which cost a second
+  ancestry bit (`RC_UNDER_FUNC`).
 * **The value-union function-VALUE PARAMETER miscompile** — 12 of 36 cells, three-line repro,
   `emit_classify.vl`'s `$fnsig` columns, outside this partition.
 * **Canon's paren-result parameter asymmetry** — whether a function type's PARAM is
   canonicalized should not depend on whether its RESULT is parenthesized. Witness above.
 * **The mixed-union litunion-alias decision (Lsoft, 31 rows on B2's axis / 29 on B1's)** —
   still the owner's call, untouched, exactly as #1266 left it.
+
+## renderEmit P6 — T's canon-only half converts, and it is 18 of 19 plus a SECOND ANCESTRY BIT the design said nothing needed (off master `2a7a2d85`)
+
+Base `2a7a2d85`. Partition: `compiler/typecheck.vl`, one new fixture under
+`tests/cases/types/`, and this append. No import moved — `numLitUnionBaseName`,
+`structNameOfTy` and `unionAliasDeclNameOfTy` are all already in `typecheck.vl`, so the
+resolver census is empty by construction.
+
+#1267 filed **P6's first item: T's canon-only half, 19 rows** — *"the one uncontroversially
+canon-matching class"* — with the warning that T's `both` half is the OPPOSITE ruling and
+that #1122 measured the nominal route there REGRESSING, so the class must be split
+precisely rather than taken whole. That warning is right about the `both` half and **wrong
+about the canon-only half being one rule**.
+
+### TARGET 0 — THE CENSUS REPRODUCED AT `2a7a2d85`, AND ITS TWO NUMBERS THAT MOVED
+
+The instrument is #1266's, rebuilt from the published description again (banks pre/post/node
+in `canonEmitTypeNames`'s loop; a SECOND pass after the loop computes each candidate over
+the SAVED pre-names; one `tErr` per record **with a per-record index**, because `tErrCoded`
+drops an exact repeat and #1266's first version under-counted 22% without it).
+
+```
+build:    (probe tree) vl build compiler/entry.vl -o T19-probeM.wasm --compiler build/vl-compiler.wasm
+run:      vl check tests/cases --compiler T19-probeM.wasm > T19-cenM.out      # rc 1, the probe raises
+extract:  bash P5-cen-an.sh T19-cenM        # -> pre/post/b1/b2/b3 TSV + the 3 candidate tables
+classify: bash P5-b2.sh T19-cenM && python3 P5-b2class.py T19-cenM.b2   # #1267's classifier, unchanged
+```
+
+| | `8c22fa06` (#1267) | `2a7a2d85` (here) |
+| --- | ---: | ---: |
+| annotations canon saw | 7,531 | **7,602** |
+| byte-identical / rewritten | 7,234 / 297 | **7,305 / 297** |
+| **B1** `tyToEmitName ∘ nameToTy` | 1,230 — 29 / 1,179 / 22 | **1,247 — 29 / 1,196 / 22** |
+| **B2** `tyToNominalName ∘ nameToTy` | **194** — 52 / 112 / 30 | **194 — 52 / 112 / 30** |
+| **B3** `tyToNominalName ∘ nodeTyIxOf` | 272 — 43 / 191 / 38 | **272 — 43 / 191 / 38** |
+
+**B2 and B3 are unchanged to the unit across five merges**, and B1's +17 is entirely
+renderer-only rows from #1268/#1269's new fixtures. The nine-class decomposition reproduces
+exactly: G 114 · Lsoft 31 · **T 28 (19 canon-only / 9 both)** · Lin-alias 8 · U 4 ·
+Lin-soft 3 · P 2 · X 2 · I 2. The 19/9 split is confirmed.
+
+### TARGET 1 — T's CANON-ONLY HALF IS NOT ONE RULE. IT IS 18 + 1, AND THE 1 IS THE `both` HALF WEARING A DIFFERENT DIRECTION
+
+#1267 named class T *"alias TRANSPARENCY: canon resolves a one-member alias (`Z`→`i32`,
+`MyCat`→`{meow:i32}`), the renderer keeps the declared NAME"*. Reading the 19 rows against
+their source declarations says otherwise:
+
+| the rule | rows | the declarations |
+| --- | ---: | --- |
+| a declared alias for a **NUMERIC** literal union, softened by canon to its BASE SCALAR | **18** | `type Z = 0 \| 1` (13, incl. `Z[]`, `Z[][]`, `(Z\|null)[]`), `type T = 0\|1\|2`, `type N = 0\|1\|2`, `type Y = Z`, `type One = 1` (2, incl. `{a:One}[]`), `type WFlt = 1.5` |
+| one-member alias TRANSPARENCY inside a union | **1** | `L\|i32` where `type L = Cat[]`, `type Cat = {n:i32}` |
+
+`type Z = i32` — the example #1267's prose leads with — **does not occur in the class at
+all**: a scalar alias resolves through `nameToTy` to the primitive itself and both producers
+answer `i32`. What the classifier's stage 2 actually bucketed into T was *"an identifier on
+the nominal side, a non-`string` answer on canon's"*, and canon's non-`string` answer here
+is `numLitUnionAliasName` — the **numeric** twin of the STRING rule that is class Lsoft.
+The classifier separated the numeric case from the string case on the literal token
+`string`; the split is real, but the NAME "alias transparency" was attached to the wrong
+majority.
+
+**AND THE 19th ROW IS NOT CONVERTIBLE ON THE NOMINAL AXIS AT ALL — BY CONSTRUCTION, NOT BY
+POLICY.** Canon's answer for `L|i32` is `{n:i32}[]|i32`: the transparency arm renders the
+member through `tyToEmitNameAt`, the STRUCTURAL renderer. The nominal renderer reaches
+`Cat` for that element and can only ever reach `Cat` — `structNameOfTy` short-circuits
+before the shape is expanded. So `L|i32` can be closed only by dropping the nominal
+short-circuit, which is the O2 wholesale move, which is **exactly the 9 `both` rows'
+disagreement** (`MyCat` canon `{meow:i32}` / nominal `Cat`). The direction split and the
+RULE split cut across each other, and one canon-only row sits on the `both` half's side of
+the rule boundary.
+
+That was measured, not argued: **SAB-NOM** below is that exact move, and it moves 145
+corpus cells.
+
+### TARGET 2 — WHAT SHIPPED
+
+`tyToNominalNameGo`'s declared-alias short-circuit gains one exception:
+
+```
+  const udn = unionAliasDeclNameOfTy(ix)
+  if udn != "" {
+    if (ctx & RC_UNDER_FUNC) == 0 {
+      const nlb = numLitUnionBaseName(ix)
+      if nlb != "" { return nlb }
+    }
+    return udn
+  }
+```
+
+**ONE RULE, ONE HOME, TWO ENTRIES.** `numLitUnionBaseName(ty)` was already the arena-keyed
+home; `canonEmitName` reaches it through the NAME-keyed wrapper `numLitUnionAliasName`
+(a `cUserTypes` lookup, then this). The renderer now reaches the same home through the
+arena index it is already holding — **no name, no second parse**, which is what a
+destringify phase is for. The two producers cannot drift because there is one body.
+
+**THE OWNER-BLOCKED RULE IS OUT, AND TWO INDEPENDENT GATES KEEP IT OUT.**
+`numLitUnionBaseName` returns "" for a string base by its own header (*"the STRING base is
+excluded on purpose … its alias name IS the atom identity"*), and `tyIsLitUnion` — the gate
+on the five `litUnionAliasNameOfTy` legs in this same renderer — is string-only, so a
+numeric alias never reaches those legs and a string alias never reaches this one. Lsoft's
+31 rows are byte-identical before and after.
+
+### THE COMPARATOR — 20 RECORDS OF 7,602 MOVED, AND EVERY ONE IS NAMED
+
+| | master `2a7a2d85` | this head |
+| --- | ---: | ---: |
+| **B2 disagreements** | **194** (52 / 112 / 30) | **176** (34 / 112 / 30) |
+| class **T** | 28 = **19** canon-only + 9 both | **10 = 1 canon-only + 9 both** |
+| class **Lsoft** (owner-blocked) | 31 / 0 / 0 | **31 / 0 / 0** |
+| classes G · Lin-alias · U · Lin-soft · P · X · I | 114 · 8 · 4 · 3 · 2 · 2 · 2 | **identical** |
+| **B1** | 1,247 (29 / 1,196 / 22) | **identical** — canon's own axis is untouched |
+| **B3** | 272 (43 / 191 / 38) | **263** (34 / 191 / 38) — the same 9, closed on the node axis too |
+| canon's own column (pre → post) | 7,305 / 297 | **byte-identical, record for record** |
+
+The per-record diff of the two TSVs reads **20 records with a changed nominal render**:
+
+* **18** are the T canon-only rows, each now EQUAL to canon (`Z`→`i32` ×13, `T`, `Y`, `N`,
+  `One`, `WFlt`, and the `Z[]` / `Z[][]` / `(Z|null)[]` / `{a:One}[]` composites).
+* **2** are class-**G** `both` rows — `Box<Zs>` nominal `{v:Zs}` → `{v:i32}` and `Inner<Z>`
+  nominal `{w:Z}` → `{w:i32}`. They stay disagreements (canon spells `Box<i32>`, the
+  application head the arena cannot name — the typed-IR item), but their ARGUMENT now
+  matches canon's. G's count and direction split are unchanged.
+* **0** anywhere else. The 9 `both` rows and Lsoft's 31 are untouched, which is the
+  #1122 boundary, held.
+
+### THE THING THIS SLICE FOUND BY BUILDING THE WITNESS IT WAS TOLD TO LOOK FOR
+
+The corpus A/B read **0 rows on 1,597 files × 6 fields** for the first candidate, and a
+reach probe read the new arm firing **24 times** over the same corpus. That is #1267's
+"reach is not consequentiality" again — but the method note says *before writing "inert",
+name the input that would break it and try to build one*. Fourteen were built. **One of
+them was a REGRESSION THE CORPUS COULD NOT SEE:**
+
+```
+type Z = 0 | 1
+function run(m: (Z) => i32): i32 { const v = m(1); v }
+function mk(x: Z): i32 { x + 2 }
+print(run(mk))        # master: builds, prints 3.   first candidate: INVALID MODULE
+                      # type mismatch: expected i32, found (ref $type)
+```
+
+**`canonEmitName` LEAVES A TOP-LEVEL FUNCTION TYPE VERBATIM** — it recurses into the params
+only when the RESULT is parenthesized — so the annotation pipeline's `$fnsig` key for that
+parameter is `(Z)=>i32`, alias name and all. A producer that softens `Z` anywhere inside a
+function type keys `(i32)=>i32` and the two spellings of ONE closure fork.
+`emit_collect.vl`'s `reachRegisterName` already states this rule from the CONSUMER side
+(*"everything inside a function type is the `canonEmitName` VERBATIM region"* — that is what
+its `underFunc` parameter buys). It had no counterpart at the PRODUCER, and the renderer's
+own context header said so in as many words:
+
+> ANCESTRY BEYOND ONE STICKY BIT IS NOT MODELLED HERE, deliberately. `emit_collect.vl`'s
+> `underFunc` is the accumulating shape, and **no measured disagreement needs it at the
+> producer** … If a later phase needs true ancestry it gets a second field rather than a
+> re-reading of these bits.
+
+So: **`RC_UNDER_FUNC` (256), the second ANCESTRY bit**, set by the `TyFunc` arm on its
+params and result and inherited by every descent of the nominal renderer (`RC_INHERIT =
+RC_NULLABLE | RC_UNDER_FUNC`). Every other bit is still REPLACED at each descent.
+
+**AND ONE IMMEDIATE-POSITION BIT IS NOT ENOUGH — THE WITNESS IS ONE CHARACTER AWAY.**
+Gating on `RC_FN_PARAM | RC_FN_RES` alone still forks on `({a: Z}) => i32`: the field
+renders at `RC_FIELD`, which says nothing about the function overhead. The near-miss that
+looks identical and is NOT a witness is `(i32) => Row` with `type Row = {a: Z}` — the
+declared struct short-circuits to `Row` before the field is ever rendered, so a DECLARED
+shape cannot pin this and the INLINE one must. Both cells are in the fixture, and the two
+sabotages below turn on exactly one cell each.
+
+### THE FIXTURE, AND WHAT EACH SABOTAGE DOES TO IT
+
+`tests/cases/types/numlitunion-alias-under-closure-type.vl` — `@run`, three cells, green on
+master and byte-identical (469 B) on this head.
+
+| build | `first` = `(Z) => i32` | `second` = `({a:Z}) => i32` | `plain` = `Z` outside a func |
+| --- | --- | --- | --- |
+| master `2a7a2d85` | ok (3) | ok (1) | ok (7) |
+| **this head** | ok (3) | ok (1) | ok (7) |
+| **SAB-FN** — the `RC_UNDER_FUNC` gate DELETED | **INVALID MODULE** | ok | ok |
+| **SAB-IMM** — gate NARROWED to `RC_FN_PARAM\|RC_FN_RES` | ok | **INVALID MODULE** | ok |
+| SAB-STR — the rule widened to string aliases | ok | ok | ok |
+| SAB-NOM — `structNameOfTy`'s short-circuit dropped | ok | ok | ok |
+
+The two gates are pinned separately and disjointly, which is the whole point of writing the
+near-miss cell down.
+
+### CHANNEL GRADING — FOUR SABOTAGES, ALL BUILT FROM A COPY, AND A PER-CHANNEL PROFILE THAT IS NOT UNIFORM
+
+| sabotage | corpus A/B (1,598 × 6) | census B2 (7,612 records) | the fixture |
+| --- | ---: | ---: | --- |
+| **SAB-NOM** `structNameOfTy` short-circuit dropped — the O2 move that closing T's `both` half + `L\|i32` requires | **145 cells / 54 files** (BUILDRC 44, BUILDMSG 47, BYTES 10, RUNRC 44) | — | green |
+| **SAB-STR** the rule widened from numeric to EVERY litunion alias — the OWNER-BLOCKED mixed-union rule on the renderer's axis | **0** | **176 → 285, +109 rows / 54 files** | green |
+| **SAB-FN** the `RC_UNDER_FUNC` gate deleted | 0 | 0 | **red at `first`** |
+| **SAB-IMM** the gate narrowed to the immediate position | 0 | 0 | **red at `second`** |
+
+**NO SINGLE CHANNEL GRADES THIS SLICE AND THE PROFILE IS THE FINDING.** SAB-NOM says the
+corpus A/B channel does see `tyToNominalNameGo`'s nominal-first block — 44 programs that
+build and run today stop building. SAB-STR says it does NOT see a change confined to the
+declared-alias leg, and the reason is mechanical: both consumers absorb it.
+`arenaEmitName` is `canonEmitName(tyToNominalName(ix))`, and canon maps `Z` and `i32` to
+the same `i32`; `reachRegisterName`'s raw `underFunc` leg hands the name to
+`registerInlineUnion`, whose first line is `if isUName(name) { return 0 }` — and `collectU`
+has registered the alias, so the divergent key lands on an early return. That is why the
+census, not the corpus, is this family's primary instrument, and why the two gate sabotages
+needed a FIXTURE to be graded at all.
+
+### EQUIVALENCE
+
+* **corpus A/B, 1,598 files × 6 fields** (`vl check` rc · msg · `vl build` rc · msg ·
+  emitted BYTES · run rc+stdout) vs `base86.wasm` (master `2a7a2d85`, 1,049,443 B):
+  **0 rows moved on every field.** Graded by SAB-NOM (145 cells / 54 files).
+* **consumer key-stream A/B** — every `reachRegisterName` answer with its `underFunc` bit,
+  master vs candidate, `vl check tests/cases --codegen`: **8,516 records per side, 584 on
+  the `underFunc` leg, byte-identical.** Measured at the consumer, per the method note,
+  and it is what turned "24 reaches" into "0 consequences on this corpus".
+* **fuzz A/B, 19,200 programs/side** (seeds 1401-1404 × depths 4/5/6 × plain/declared,
+  `--branching --multiobs`, generated ONCE with master's compiler so both legs read
+  byte-identical inputs): `vl check` identical (128,444 lines/side), `vl check --codegen`
+  identical (131,232 lines/side). **THIS CHANNEL IS A COVERAGE ZERO FOR THIS ARM AND SAYS
+  SO OUT LOUD**: the reach probe reads the arm firing **0** times over all 19,200 while the
+  surrounding declared-alias leg is reached **10,472** times — `scripts/fuzzgen.vl` emits
+  declared union aliases but never a numeric-literal one.
+* **master's FROZEN source compiled by this head** (`git archive 2a7a2d85 compiler std`,
+  31 files): `cmp` **rc 0** against `base86.wasm`, 1,049,443 B — **and VACUOUS, proved
+  twice.** (a) The arm fires **0** times over `compiler/entry.vl`, `std` and `scripts`
+  while the leg around it is reached 173 times, so the DIVERGENCE population is not in the
+  compiler's own source even though the leg is. (b) The inverted control: **SAB-NOM, which
+  moves 145 corpus cells and breaks 44 programs, ALSO leaves master's frozen rebuild
+  byte-identical.** Reach is not consequentiality, and a frozen rebuild that cannot see a
+  145-cell sabotage cannot see anything in this code region.
+* **`SELFHOST_NATIVE_ALIGN=1 deno task test`: 3356 / 0 / 8**, against master `2a7a2d85`'s
+  own **3354 / 0 / 8** — +2 for the one new fixture (its own case plus its native-align
+  case), which is the arithmetic a single added `@run` fixture is supposed to produce.
+
+**BINARY: 1,049,443 → 1,049,543 B, +100 B.** A cost, reported as one: an eight-site context
+thread plus one gated call. The fixpoint ladder held at **2 compiles**.
+
+### GATE — EVERY RC TAKEN BARE, NEVER THROUGH A PIPE
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,049,443 B**, sha256 `0318a249…`, `cmp` clean against `base86.wasm` — the A/B baseline IS master's published compiler |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next — next is the fixpoint (2 compiles)"*, **1,049,543 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,049,543 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3356 / 0 / 8** (master 3354 / 0 / 8) |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
+| corpus A/B vs `base86.wasm`, 1,598 × 6 | 0 | **0 rows moved**, graded 145 / 0 / 0 / 0 |
+| fuzz A/B, 19,200 programs, `check` + `check --codegen` | 0 | identical — **coverage zero, stated** |
+| master's frozen source compiled by this head, `cmp` | 0 | byte-identical — **vacuous, proved by an inverted control** |
+
+### METHOD NOTES
+
+* **A DIRECTION SPLIT IS NOT A RULE SPLIT, AND FILING ONE AS THE OTHER HIDES A ROW ON THE
+  WRONG SIDE OF A BOUNDARY.** #1267 filed "T's canon-only half, 19 rows" as uncontroversial
+  and "T's `both` half, 9 rows" as the #1122 boundary. 18 of the 19 are a rule with no
+  `both` rows at all; the 19th is the `both` half's rule, sorted into canon-only only
+  because the nominal renderer's answer for that one member happens to spell the same
+  identifier the source did. *Before taking a class, read its rows against their
+  DECLARATIONS — the classifier buckets renders, and a render is not a rule.*
+* **A DESIGN NOTE THAT SAYS "NO MEASURED DISAGREEMENT NEEDS THIS" IS A STANDING INVITATION
+  TO MEASURE.** The renderer's context header explained, correctly and for good reasons,
+  why one sticky bit was enough. It stopped being enough the moment a rule was added whose
+  answer depends on being inside a function type — and the note had already written down
+  what to do about it ("a second field"), so the design change cost one constant and eight
+  `| (ctx & …)`s. *The note that documents a limit is the cheapest place to discover you
+  have hit it.*
+* **THE WITNESS HUNT THE METHOD NOTE DEMANDS IS NOT A FORMALITY; IT FOUND THE ONE
+  REGRESSION.** Corpus A/B 0, consumer key-stream diff 0, fuzz 0, frozen rebuild
+  byte-identical — four channels agreeing that the first candidate was inert. It was not:
+  a four-line program went from `run` prints 3 to an invalid module. *Every channel that
+  reads zero is reporting its own coverage until you have tried to build the input that
+  breaks it.*
+* **A SABOTAGE THAT READS ZERO IS STILL EVIDENCE — ABOUT THE CHANNEL.** SAB-STR moves 109
+  census rows and 0 corpus cells, and chasing WHY produced the mechanism: canon idempotently
+  re-softens the render on one consumer leg, and `registerInlineUnion`'s `isUName` early-out
+  swallows it on the other. That is a durable statement about which instrument to reach for
+  in this family, worth more than a second sabotage that also moved corpus rows.
+* **SOFTENING UNDER A FUNCTION TYPE IS NOT A LATENT FIX EITHER.** Of fourteen witness
+  programs, EIGHT are invalid wasm on master — `(i32) => Z`, `(i32) => Z[]`,
+  `(i32) => Z|null`, `(i32) => {a:Z}`, `(i32) => {a:Z}[]`, `(Z[]) => i32`,
+  `(Z|null) => i32`, `() => Z|null`. Under SAB-FN (the ungated arm) **not one of them turns
+  green**; only the two that work today turn red. The func-nested numeric-alias family is
+  a separate defect of the VERBATIM region itself, filed below, and this slice's gate
+  preserves master's behaviour there exactly — including master's bugs.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **T's 19th canon-only row (`L|i32`)** — proved unconvertible on the nominal axis above:
+  canon's `{n:i32}[]` is the STRUCTURAL render and `structNameOfTy` reaches `Cat` first.
+  It belongs with T's `both` half, and that whole group is the O2 / #1122 decision, whose
+  cost is now re-measured on today's master at **145 corpus cells across 54 files**.
+* **The FUNC-NESTED numeric-litunion-alias miscompile family** — eight witnesses above,
+  invalid wasm on master today, untouched by anything here. The fix is not at this
+  producer: it is that `canonEmitName`'s function-type pass-through leaves the region
+  verbatim, so BOTH spellings would have to learn the softening together. Adjacent to
+  #1267's already-filed "canon's paren-result parameter asymmetry", and probably the same
+  item.
+* **Lsoft (31 rows)** — still the owner's call, untouched, exactly as #1266 and #1267 left
+  it. Both of its exclusion gates are now load-bearing in a shipped rule and are documented
+  as such.
+* **G (114 rows, 58.8% of the residue)** — the generic APPLICATION the arena cannot spell;
+  the typed-IR item, unchanged. Two of its rows moved CLOSER (their arguments now match
+  canon) without changing its count.
+
+### W9 LEDGER
+
+| | before P6 | after P6 |
+| --- | ---: | ---: |
+| B2 disagreements | 194 / 7,130 = 2.72% | **176 / 7,201 = 2.44%** |
+| B2 canon-only | 52 | **34** |
+| class T | 28 (19 / 0 / 9) | **10 (1 / 0 / 9)** |
+| B3 disagreements | 272 | **263** |
+| the residue's composition | G 114 · Lsoft 31 · **T 28** · other 21 | G 114 · Lsoft 31 · **T 10** · other 21 |
+
+**G + Lsoft is now 145 of 176 = 82.4% of what is left, and both are decisions already made
+and recorded** — the typed-IR item and the owner's. The whole of the rest is 31 rows in
+seven classes.

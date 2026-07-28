@@ -6405,6 +6405,12 @@ const RC_MAP_KEY = 16  // a map key's type
 const RC_MAP_VAL = 32  // a map value's type
 const RC_FN_PARAM = 64 // a function type's parameter
 const RC_FN_RES = 128  // a function type's result
+// ANCESTRY: anywhere INSIDE a function type, at any depth — see the note below.
+const RC_UNDER_FUNC = 256
+// The bits an inner render INHERITS from its parent instead of replacing. Both are
+// ancestry, not immediate position, and both exist because a rule that reads them must
+// get the same answer from the string spelling and the arena walk.
+const RC_INHERIT = RC_NULLABLE | RC_UNDER_FUNC
 
 // `RC_NULLABLE` IS STICKY ACROSS A UNION JOIN, AND IT HAS TO BE, BECAUSE THE TWO
 // SPELLINGS PUT THE NULLABLE AT DIFFERENT DEPTHS. Structurally `A | B | null` is a
@@ -6416,11 +6422,35 @@ const RC_FN_RES = 128  // a function type's result
 // `null` sibling (`partsHaveNull`). Every other bit is REPLACED at each descent: a field
 // of a struct that is itself an array element is a field, not both.
 //
-// ANCESTRY BEYOND ONE STICKY BIT IS NOT MODELLED HERE, deliberately. `emit_collect.vl`'s
-// `underFunc` is the accumulating shape, and no measured disagreement needs it at the
-// producer: every case in the design's six transformations is decided at the node whose
-// own immediate position is one of the bits above. If a later phase needs true ancestry it
-// gets a second field rather than a re-reading of these bits.
+// `RC_UNDER_FUNC` IS THE SECOND ANCESTRY BIT, AND IT IS HERE BECAUSE THE DISAGREEMENT
+// THIS NOTE SAID DID NOT EXIST WAS MEASURED. The note used to read "ancestry beyond one
+// sticky bit is not modelled here, deliberately — `emit_collect.vl`'s `underFunc` is the
+// accumulating shape, and no measured disagreement needs it at the producer". The
+// numeric-litunion-alias rule below needs it, on a three-line program:
+//
+//   type Z = 0 | 1
+//   function run(m: (Z) => i32): i32 { const v = m(1); return v }
+//
+// `canonEmitName` leaves a top-level FUNCTION type VERBATIM — it recurses into the params
+// only when the RESULT is parenthesized — so the annotation pipeline's key for that
+// parameter is `(Z)=>i32`, alias name and all. A producer that softens `Z` to `i32`
+// ANYWHERE inside a function type keys `(i32)=>i32` instead and the two `$fnsig` spellings
+// of ONE closure fork: measured as `type mismatch: expected i32, found (ref $type)`, an
+// INVALID MODULE for a program that builds and runs on master. `emit_collect.vl`'s
+// `reachRegisterName` states the same rule from the consumer side ("everything inside a
+// function type is the `canonEmitName` VERBATIM region"); this is that rule at the
+// producer, which is where a render decides what it is about to spell.
+//
+// ONE IMMEDIATE-POSITION BIT IS NOT ENOUGH AND THE WITNESS IS ONE CHARACTER AWAY. Gating
+// on `RC_FN_PARAM | RC_FN_RES` alone still forks on `(i32) => {a: Z}` — the field renders
+// at `RC_FIELD`, which says nothing about the function overhead — while
+// `(i32) => Row` with `type Row = {a: Z}` does NOT, because the declared struct
+// short-circuits before the field is ever reached. So the accumulating form is the rule
+// and the immediate form is a same-shaped near-miss; both are pinned by fixtures
+// (`tests/cases/types/numlitunion-alias-under-closure-type.vl`).
+//
+// Every OTHER bit is still REPLACED at each descent: a field of a struct that is itself an
+// array element is a field, not both. Only `RC_INHERIT` rides through.
 
 // The TOP-LEVEL atom count of the name the LAST `tyToEmitName` call returned — the
 // number `unionMemberCount` would report for it, produced BY THE RENDERER instead of
@@ -6878,7 +6908,38 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
   const sdn = structNameOfTy(ix)
   if sdn != "" { return sdn }
   const udn = unionAliasDeclNameOfTy(ix)
-  if udn != "" { return udn }
+  if udn != "" {
+    // …EXCEPT a declared alias for a NUMERIC literal union (`type Z = 0 | 1`, the
+    // one-member `type One = 1`, the alias-of-an-alias `type Y = Z`), which denotes its
+    // BASE SCALAR — `i32` / `i64` / `f64`, never the alias name. The name is not a
+    // spelling the emitter's vocabulary can classify: `collectU` registers such a decl in
+    // `unNames` (a `UnionDecl` whose single variant is not a `{…}` shape is not skipped),
+    // so `isUName` claims the annotation for the `{tag, value}` UNION BOX while every READ
+    // of the value lowers as the plain scalar the checker's algebra says it is — the silent
+    // invalid wasm `numLitUnionAliasName` was written against
+    // (`tests/cases/literal-unions/numeric-litunion-alias.vl`).
+    //
+    // ONE RULE, ONE HOME, TWO ENTRIES. `canonEmitName` reaches it through the NAME-keyed
+    // `numLitUnionAliasName` (a `cUserTypes` lookup, then this); the renderer reaches it
+    // through the arena index it is already holding. So the two producers cannot drift, and
+    // the renderer takes the destringified route — no name, no second parse.
+    //
+    // The STRING-litunion alias is NOT this rule and is deliberately out: `numLitUnionBaseName`
+    // returns "" for a string base (its alias name IS the atom identity), and `tyIsLitUnion`
+    // — the gate on the five `litUnionAliasNameOfTy` legs below — is string-only, so a
+    // numeric alias never reaches those legs and a string alias never reaches this one. The
+    // owner-pending mixed-union softening decision is untouched on both sides.
+    //
+    // NOT INSIDE A FUNCTION TYPE, at any depth: that whole region is `canonEmitName`'s
+    // VERBATIM region, so softening there forks the two `$fnsig` spellings of one closure
+    // into an invalid module. See `RC_UNDER_FUNC`'s note above for the measured witness and
+    // for why the immediate `RC_FN_PARAM | RC_FN_RES` position is not the right test.
+    if (ctx & RC_UNDER_FUNC) == 0 {
+      const nlb = numLitUnionBaseName(ix)
+      if nlb != "" { return nlb }
+    }
+    return udn
+  }
   const t = T.tys[ix]
   if t is TyPrim {
     if t.primName == "never" { return "" }
@@ -6943,7 +7004,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
       if s == "" {
         // The union-member position, with the sticky nullable bit — the same rule the
         // structural sibling applies, so the two agree about `A|B|null`.
-        s = tyToNominalNameAt(members[i], RC_UNION_MEM | (ctx & RC_NULLABLE))
+        s = tyToNominalNameAt(members[i], RC_UNION_MEM | (ctx & RC_INHERIT))
         sc = nomNameAtoms
       }
       if s == "" { return "" }
@@ -6982,7 +7043,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
       return nal + "|null"
     }
     // A nullable DECLARED struct/union keeps its nominal name (`S|null`, `U|null`).
-    const nsn = tyToNominalNameAt(t.nInner, RC_NULLABLE)
+    const nsn = tyToNominalNameAt(t.nInner, RC_NULLABLE | (ctx & RC_UNDER_FUNC))
     const nsnAtoms = nomNameAtoms
     if nsn == "" { return "" }
     const nfn = T.tys[t.nInner]
@@ -7012,7 +7073,9 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
         const fbal = litUnionAliasNameOfTy(ftys[fi])
         if fbal != "" { fs = fbal }
       }
-      if fs == "" { fs = tyToNominalNameAt(ftys[fi], RC_FIELD) }
+      if fs == "" {
+        fs = tyToNominalNameAt(ftys[fi], RC_FIELD | (ctx & RC_UNDER_FUNC))
+      }
       if fs == "" { return "" }
       if fi > 0 { out = out + "," }
       out = out + names[fi] + ":" + fs
@@ -7029,7 +7092,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
     // identifier is one atom, the render leg reports its own.
     let elw = 1
     if el == "" {
-      el = tyToNominalNameAt(t.aElem, RC_ELEM)
+      el = tyToNominalNameAt(t.aElem, RC_ELEM | (ctx & RC_UNDER_FUNC))
       elw = nomNameAtoms
     }
     if el == "" { return "" }
@@ -7040,9 +7103,11 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
     return arrElemRender(el, t.aElem, elw)
   }
   if t is TyMap {
-    const mk = tyToNominalNameAt(t.mKey, RC_MAP_KEY)
+    const mk = tyToNominalNameAt(t.mKey, RC_MAP_KEY | (ctx & RC_UNDER_FUNC))
     let mv = litUnionAliasNameOfTy(t.mVal)
-    if mv == "" { mv = tyToNominalNameAt(t.mVal, RC_MAP_VAL) }
+    if mv == "" {
+      mv = tyToNominalNameAt(t.mVal, RC_MAP_VAL | (ctx & RC_UNDER_FUNC))
+    }
     if mk == "" || mv == "" { return "" }
     // The key/value separators sit inside the braces — one atom.
     nomNameAtoms = 1
@@ -7053,7 +7118,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
     let out = "("
     let i = 0
     while i < ps.length {
-      const ps1 = tyToNominalNameAt(ps[i], RC_FN_PARAM)
+      const ps1 = tyToNominalNameAt(ps[i], RC_FN_PARAM | RC_UNDER_FUNC)
       if ps1 == "" { return "" }
       if i > 0 { out = out + "," }
       out = out + ps1
@@ -7069,7 +7134,7 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
       const bal = litUnionAliasNameOfTy(t.fnRet)
       if bal != "" { rs = bal }
     }
-    if rs == "" { rs = tyToNominalNameAt(t.fnRet, RC_FN_RES) }
+    if rs == "" { rs = tyToNominalNameAt(t.fnRet, RC_FN_RES | RC_UNDER_FUNC) }
     if rs == "" { return "" }
     const rt = T.tys[t.fnRet]
     if rt is TyFunc { rs = "(" + rs + ")" }
