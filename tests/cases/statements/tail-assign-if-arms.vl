@@ -1,0 +1,297 @@
+// @run
+// A function's implicit return may be a tail `if` whose ARMS each end in an ASSIGNMENT.
+// `emitIfTail` lowers every arm through `emitStmtTail` -> `emitReturnValue`, i.e. through
+// the very same store-then-re-read `=` arm (`emitBinExprNode`, `wasmEmit.vl`) the
+// straight-line tail takes, so each arm pushes ITS TARGET CELL's rep — while the functype
+// was still minted from the checker's RHS-typed join. Every row below was INVALID WASM on a
+// `vl check`-clean program (rc 0) until `fnAssignRetTargetName` learned to see through the
+// tail `if`. `tail-assign-coercing-local.vl` pins the straight-line half (#1258); this file
+// is its IF-ARM sibling, which #1258 left open on the two-arms-two-cells JOIN question.
+//
+// THE JOIN RULE (`ifTailAssignName`, `emit_classify.vl`): the arms join iff every arm's
+// target cell has the same RESULT IDENTITY — the same guarded `VKind`, the same struct-table
+// slot, the same ref-list element name, and the same declared type spelling. The arms may
+// then be resolved through ONE representative name, so the three `fnAssignRet*` columns are
+// read off a tail `if` exactly as they are off a straight-line tail and cannot drift. The
+// NAMES need not match: the cross-cell and cross-storage-class rows below all join.
+//
+// WHY IDENTITY AND NOT A WIDENING JOIN — the divergence from `ifExprValtype`. The if-VALUE
+// join widens (f64 > f32 > i64 > i32) because its arms are EXPRESSIONS emitted into a known
+// blocktype, and `emitIfExprAs` coerces each arm into it. An assignment arm has no such
+// coercion site: the value is a RE-READ of a cell that was already stored, so a join
+// answering anything but "the arms already agree" would declare a result one arm does not
+// produce — the very invalid wasm this replaces. Where the arms disagree the classifier
+// DECLINES and the master outcome stands (see the residue notes at the end).
+type S = { n: i32 }
+type K = "a" | "b"
+type Cat = { legs: i32 }
+type Dog = { tail: i32 }
+type U = Cat | Dog
+
+// ── LOCAL / LOCAL, the same cell in both arms — value-READ, so the functype's claim is
+//    observable. A widening store (i32 literal into an `i64` / `f64` cell).
+// @log 3
+function locI64(c: boolean) {
+  let v: i64 = 1
+  if c { v = 3 } else { v = 4 }
+}
+
+print(locI64(true))
+
+// @log 4
+function locF64(c: boolean) {
+  let v: f64 = 1.5
+  if c { v = 3 } else { v = 4 }
+}
+
+print(locF64(false))
+
+// A merely WEAKER RHS: a non-empty float-literal list reads as the f64-list wrapper, so the
+// functype promised `(ref $fl64TypeIdx)` over arms pushing the f32 one.
+// @log 1
+function locF32List(c: boolean) {
+  let v: f32[] = [1.5]
+  if c { v = [2.5] } else { v = [3.5] }
+}
+
+print(locF32List(true).length)
+
+// ── TWO DIFFERENT LOCAL cells of the same declared type — the join's whole point: the arms
+//    name different cells and still agree, because the identity is the CELL's, not the name's.
+// @log 3
+function twoLocals(c: boolean) {
+  let v: i64 = 1
+  let w: i64 = 2
+  if c { v = 3 } else { w = 4 }
+}
+
+print(twoLocals(true))
+
+// ── the OTHER TWO STORAGE CLASSES, and every mixed pair. `fnAssignCellKind` asks the same
+//    three resolvers in the same order for each arm (`letCellKind` / `vtKindOfParam` /
+//    `globalCellKind`), so a cross-class join cannot drift from either cell.
+let gI64: i64 = 1
+
+// @log 3
+function glbI64(c: boolean) {
+  if c { gI64 = 3 } else { gI64 = 4 }
+}
+
+print(glbI64(true))
+
+// @log 3
+function parI64(c: boolean, v: i64) {
+  if c { v = 3 } else { v = 4 }
+}
+
+print(parI64(true, 1))
+
+// @log 3
+function locAndGlb(c: boolean) {
+  let v: i64 = 1
+  if c { v = 3 } else { gI64 = 4 }
+}
+
+print(locAndGlb(true))
+
+// @log 3
+function locAndPar(c: boolean, p: i64) {
+  let v: i64 = 1
+  if c { v = 3 } else { p = 4 }
+}
+
+print(locAndPar(true, 1))
+
+// @log 4
+function parAndGlb(c: boolean, p: i64) {
+  if c { p = 3 } else { gI64 = 4 }
+}
+
+print(parAndGlb(false, 1))
+
+// ── a local SHADOWING a same-named global resolves to the local, exactly as the
+//    straight-line dispatch does — the shadowed global here is an `i32`, so reading the
+//    wrong cell would be visible as a mismatched functype, not merely a wrong value.
+const shadowed: i32 = 9
+
+// @log 3
+function shadowLocal(c: boolean) {
+  let shadowed: i64 = 1
+  if c { shadowed = 3 } else { shadowed = 4 }
+}
+
+print(shadowLocal(true))
+
+// @log 9
+print(shadowed)
+
+// ── ARM SHAPES. An `else if` CHAIN (three arms, every one measured); a NESTED tail `if`
+//    inside an arm; an arm whose `let` is declared INSIDE it (wasm locals are
+//    function-scoped, so `parentLetOf` finds it); and an arm with statements BEFORE its tail.
+// @log 4
+function chain(n: i32) {
+  let v: i64 = 1
+  if n > 1 { v = 3 }
+  else if n > 0 { v = 4 }
+  else { v = 5 }
+}
+
+print(chain(1))
+
+// @log 5
+function nested(c: boolean, d: boolean) {
+  let v: i64 = 1
+  if c {
+    if d { v = 3 } else { v = 4 }
+  } else {
+    v = 5
+  }
+}
+
+print(nested(false, true))
+
+// @log 4
+function armLocal(c: boolean) {
+  if c {
+    let v: i64 = 1
+    v = 3
+  } else {
+    let w: i64 = 2
+    w = 4
+  }
+}
+
+print(armLocal(false))
+
+// @log 3
+function preStmt(c: boolean) {
+  let v: i64 = 1
+  let t: i32 = 0
+  if c {
+    t = 1
+    v = 3
+  } else {
+    t = 2
+    v = 4
+  }
+}
+
+print(preStmt(true))
+
+// ── SCOPES. A lambda (its own `fnStmts` entry, reached through the anonymous-lambda arm of
+//    `criWalkBlock` as well as `computeRetInference`'s tail-`if` call) and a NESTED function.
+const lam = (c: boolean) => {
+  let v: i64 = 1
+  if c { v = 3 } else { v = 4 }
+}
+
+// @log 3
+print(lam(true))
+
+// @log 4
+function outerFn(c: boolean) {
+  function innerFn(d: boolean) {
+    let v: i64 = 1
+    if d { v = 3 } else { v = 4 }
+  }
+  print(innerFn(c))
+}
+
+outerFn(false)
+
+// ── VALIDITY-ONLY rows: the result has no bare printable spelling (or its consuming
+//    spelling is the CHECKER's half of this family — `typecheck.vl` types `x = e` as `e`'s
+//    OWN type, un-coerced), so the pin is that the module VALIDATES and RUNS at all. Each of
+//    these was invalid wasm on master.
+// A LITERAL-UNION cell is an i32-backed interned ATOM; the arms' answer was `str`.
+function locLitUnion(c: boolean) {
+  let v: K = "a"
+  if c { v = "b" } else { v = "a" }
+}
+
+locLitUnion(true)
+
+// A `K | null` NICHE cell — the i32 atom with `-1` for null.
+function locNulLitUnion(c: boolean) {
+  let v: K | null = "a"
+  if c { v = "b" } else { v = "a" }
+}
+
+locNulLitUnion(true)
+
+// An `i32 | null` cell. The `null`-VALUED arm is residue, not a row — see the end.
+function locNulI32(c: boolean) {
+  let v: i32 | null = 1
+  if c { v = 6 } else { v = 7 }
+}
+
+locNulI32(true)
+
+// SMALL integer literals into an `i64[]` cell — the arms read as the i32-list wrapper.
+function locI64List(c: boolean) {
+  let v: i64[] = [1]
+  if c { v = [2, 3] } else { v = [4, 5] }
+}
+
+locI64List(true)
+
+// A STRUCT cell: the arms' object literals have no self-derivable layout, so the slot comes
+// from the same binding the kind did (`fnAssignCellSlot`).
+function locStruct(c: boolean) {
+  let v: S = { n: 1 }
+  if c { v = { n: 2 } } else { v = { n: 3 } }
+}
+
+locStruct(true)
+
+// A REF-LIST cell: the wrapper slot rides `fnAssignCellElem` -> `rlSlotByName`. On master
+// this was a loud emit error (`field access receiver is not a struct`) at the `.length`.
+// @log 1
+function locRefList(c: boolean) {
+  let v: S[] = [{ n: 1 }]
+  if c { v = [{ n: 2 }] } else { v = [{ n: 3 }] }
+}
+
+print(locRefList(true).length)
+
+// A UNION cell: the store BOXES the variant literal, so each arm pushes the box.
+function locUnion(c: boolean) {
+  let v: U = { legs: 4 }
+  if c { v = { tail: 5 } } else { v = { legs: 6 } }
+}
+
+locUnion(true)
+// ── RESIDUE — what the join deliberately DECLINES, each keeping its master outcome. Every
+//    one of these is INVALID WASM today; a decline is not a fix, it is the promise that this
+//    change moved no cell backward.
+//
+//   NO ELSE. `function f(c) { let v: i64 = 1  if c { v = 3 } }` falls through with no value,
+//     so the result is the CHECKER's nullable join (`i32?`, from its RHS typing) and not the
+//     cell's — measured, not assumed. `ifTailArmsAgree` requires `ifElse >= 0`, and an
+//     `else if` chain with no final `else` declines for the same reason. Invalid wasm at
+//     `i64` / `f64` / literal-union / `i32 | null` cells; a CHECK reject (the nullable
+//     inferred-return gate) at every ref cell.
+//
+//   ARMS THAT DISAGREE. `if c { v = 3 } else { w = 4 }` over an `i64` and an `f64` cell:
+//     no result valtype exists that both arms produce, so a KIND answer cannot help and only
+//     a loud reject could. It is NOT taken here, and the measurement is why: the checker
+//     joins some disagreeing pairs into a value-union BOX which the emitter then lowers
+//     CORRECTLY (`i64[]`/`string[]`, and `K`/`i32` — 4 of 24 measured disagree cells), so a
+//     reject keyed on the cells alone takes working programs backward. Keying it on the
+//     boxed join instead means racing `buildFnMap`'s seed, which this classifier must beat
+//     (see `criClassify`). Filed, with `fnAssignCellEq` as the anchor.
+//
+//   MIXED ARMS. `if c { v = 3 } else { 4 }` — one arm assigns, the other is a bare value.
+//     `armAssignTargetName` answers "" for the value arm and the join declines.
+//
+//   AN ARM WHOSE VALUE IS `null`. `let v: i32 | null = 1  if c { v = null } else { v = 6 }`
+//     joins fine (one cell, one identity) and is STILL invalid wasm — the join is not the
+//     defect there. Such a cell lowers as a value-union BOX, and the store-then-re-read
+//     pushes the already-boxed local into a return context that boxes it AGAIN
+//     (`local.get; struct.new 4; struct.new 3` in both arms). The straight-line twin
+//     `SL-nuli32n` is correct, so this is the RE-BOX, not the cell dispatch; it is the same
+//     shape as the `nulstr` decline's root — the return-context coercion applied to a value
+//     that already carries the target's rep. Untouched here, both directions of the arm.
+//
+//   THE KINDS `fnAssignKindGuard` ALREADY DECLINES (`nulstr`, closure, map, `nulmap`,
+//     variant) decline here too, through the very same guard — one home, both spellings.
