@@ -1,0 +1,110 @@
+// @check
+// KNOWN-BAD — xfail (emitter completeness, NOT a soundness hole). This program is sound,
+// `vl check` accepts it with zero diagnostics, and `vl build` then WRITES A MODULE THAT
+// DOES NOT VALIDATE: `type mismatch: expected i32, found (ref $type)`. It is pinned at the
+// CHECK tier because no directive can express its actual verdict — see THE DIRECTIVE GAP.
+//
+// THE GAP. A union narrowed by a DIVERGENT GUARD (`if !(t is S) { return … }`, or the
+// complement spelling `if t is Other { return … }`) narrows the FALL-THROUGH, and a union
+// narrowed by any `is` narrows the ELSE arm. `wasmEmit` lowers both correctly — it emits the
+// `ref.cast` + `struct.get` for the narrowed read. But `emit_collect.collectLocals` /
+// `collectLocalsIf`, which pick each local's WASM VALTYPE, apply NEITHER narrowing:
+//   * `collectLocals`'s statement loop never calls `pushPostGuardNarrow` (`wasmEmit` calls it
+//     at three sites, `emit_classify` at two, `emit_sections` at one — the collector at none);
+//   * `collectLocalsIf` narrows only `s.ifThen` (`setNarrowFromCond`) and walks `s.ifElse`
+//     with the stack untouched — no `setNarrowFromCondElse`.
+// So `letIsString` -> `exprString` -> `memberFieldCode` cannot resolve the narrowed variant's
+// field type, every classifier declines, and the binding falls through to the i32 default.
+// The body then stores a `(ref $string)` into that i32 cell.
+//
+// The exact SIBLING pair in `emit_classify` — `blockHasStrOp` / `ifChainHasStrOp` — carries
+// BOTH propagations, in a body whose header says it "mirrors the emit loops". The collector
+// is the one walker of the three that was never brought along.
+//
+// MEASURED, 440 cells with controls (narrow form x binding form x field type x scope):
+//   * RED, invalid wasm: field `string`, binding `const`/`let`, narrow negated-guard /
+//     complement-guard / negated-else / plain-else, scope function / nested block / loop
+//     body = 20 cells. Scope is inert; all three behave identically.
+//   * RED, invalid wasm: field `{b: i32}`, binding `const nm: {b: i32} = …` = 4 cells, and
+//     with a DIFFERENT validation message (`expected (ref $type), found (ref null $type)`)
+//     — pinned separately in `xfail-narrowed-guard-binding-shape-field.vl`.
+//   * RED, loud reject (same root cause, different flavour — the i32 cell reaches an
+//     operator that rejects it): field `{b: i32}` or `string | null` at `const`/`let` =
+//     16 cells ("field access receiver is not a struct" / "`??` is only supported on a map
+//     index get").
+//   * GREEN CONTROLS: every `posblock` cell (the positive narrow), every `direct` cell (the
+//     unbound field read), and every `i32` / `f64` / `f32` / `i64` / `boolean` / `i32[]` /
+//     `string[]` field — an i32 default is accidentally RIGHT for the scalars, and
+//     `letIsArray` / `letIsF64` resolve their element types without the narrowing stack.
+//   * The one red cell whose control is ALSO red — `direct` + `string | null` — is a
+//     pre-existing coalesce gap, unrelated: it is red under the positive narrow too.
+//
+// THE DIRECTIVE GAP, measured rather than assumed. `@emit-error` asserts `vl check --codegen`
+// exits NON-ZERO at the emit stage; on this program it exits **0** and prints "no errors" —
+// the emitter believes it succeeded, and only wasm VALIDATION disagrees. `@run` would fail
+// both harnesses for real. So the check tier is the only truthful verdict available, and this
+// header carries what the directive cannot.
+//
+// TODO(emit-completeness): add `pushPostGuardNarrow(stmts[i], fnIx)` to `collectLocals`'s
+// statement loop (with a `narrowTop` save at block entry and a `restoreNarrow` at exit) and
+// the `setNarrowFromCondElse` save/restore pair to `collectLocalsIf`'s else arm. VERIFIED as
+// a diagnosis, not a guess: with those two edits applied experimentally, all 440 grid cells
+// go green except the pre-existing coalesce five, and `SELFHOST_NATIVE_ALIGN=1 deno task test`
+// reads master's exact 3282 / 0 / 8. When it lands, flip this to `// @run` + four `// @log hi`
+// and drop this note.
+
+function mkA(): {aName: string} { return { aName: "hi" } }
+
+// THE DEFECT: a divergent guard on the negated `is`, then a `const` binding of the narrowed
+// variant's string field. `nm`'s slot is declared i32; the body stores a string ref into it.
+function guardBind(t: {aName: string} | {zz: boolean}) {
+  if !(t is {aName: string}) { return "" }
+  const nm = t.aName
+  return nm
+}
+
+// SAME DEFECT, complement spelling — no `!` anywhere. This is what rules the `!` out as the
+// cause: it is the divergent guard, not the negation.
+function compBind(t: {aName: string} | {zz: boolean}) {
+  if t is {zz: boolean} { return "" }
+  const nm = t.aName
+  return nm
+}
+
+// SAME DEFECT, the ELSE arm — the second of the two missing propagations.
+function elseBind(t: {aName: string} | {zz: boolean}) {
+  if t is {zz: boolean} {
+    return ""
+  } else {
+    const nm = t.aName
+    return nm
+  }
+}
+
+// CONTROL 1 — the POSITIVE narrow with the identical binding. Lowers correctly today:
+// `collectLocalsIf` DOES narrow the then-branch, so `nm` gets the string slot.
+function posBind(t: {aName: string} | {zz: boolean}) {
+  if t is {aName: string} {
+    const nm = t.aName
+    return nm
+  }
+  return ""
+}
+
+// CONTROL 2 — the same guard with the field used DIRECTLY, no binding. Lowers correctly
+// today: `wasmEmit` sees the post-guard narrowing even though the collector does not, so
+// the read is a correct `ref.cast` + `struct.get` and no local is involved.
+function guardDirect(t: {aName: string} | {zz: boolean}) {
+  if !(t is {aName: string}) { return "" }
+  return t.aName
+}
+
+function go() {
+  const v: {aName: string} | {zz: boolean} = mkA()
+  print(guardBind(v))
+  print(compBind(v))
+  print(elseBind(v))
+  print(posBind(v))
+  print(guardDirect(v))
+}
+go()
