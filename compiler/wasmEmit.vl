@@ -4103,57 +4103,44 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
         // through `emitUnionBoxArg` → `emitUnionCoerce` below, which carries its own loud rejects
         // for a list the union cannot box.
         //
-        // FILED (#1230's hand-off — "the nested case is still an emit error, now raised by
-        // the passes that actually own the gap"). THIS is that pass, and the message it
-        // raises is FALSE for the case that reaches it: `type Box<T> = { v: T[][] }`
-        // applied at `Box<i32>` lands here, while the concrete twin `type Box = {v: i32[][]}`
-        // and the bare `const v: i32[][]` both lower fine. Nested arrays ARE supported.
+        // CLOSED — this guard drew a FALSE message until #1234, and the paragraph that
+        // filed it (#1233) is replaced by its re-derivation. The filed case was
+        // `type Box<T> = { v: T[][] }` applied at `Box<i32>`: it landed here and was told
+        // "nested arrays are not supported" while the concrete twin
+        // `type Box = { v: i32[][] }` and the bare `const v: i32[][]` both lowered fine.
         //
-        // Instrumented build, dumping the ref-list rows and the field coding at this reject:
+        // The lie was never in this guard — it was upstream, in the field's recorded
+        // element type. An instrumented build dumped the ref-list rows and the field
+        // coding at the reject:
         //
         //     ROWS: [0] i32[] /kind 4    [1] T[] /kind 1
         //     FLD  si=0 fi=0 elemName=T[] elemTyIx=-1 arenaLeg=-1 nameLeg=1
         //
-        // Row 0 is the row the literal needs — `i32[]`, element kind 4, a nested i32 list —
-        // and it is ALREADY interned. Nothing points at it: the substituted shape's field
-        // records its ref-list element as the UN-substituted `T[]`, `emitObj`'s code-5 arm
-        // threads that row (element kind 1, a STRUCT element), and this guard then correctly
-        // refuses an array element in a struct-element list. The lie is upstream of the
-        // guard, in the field's recorded element type.
+        // Row 0 is the row the literal needs and it was ALREADY interned; nothing pointed
+        // at it, because the substituted shape recorded its ref-list element as the
+        // UN-substituted `T[]` — a STRUCT element, kind 1 — and this guard then correctly
+        // refused an array element in a struct-element list. `gaeApplyFieldTy`
+        // (`emit_base.vl`) substituted a type PARAMETER at exactly two depths, `T` and
+        // `T[]`, a hand-written ladder, so `T[][]` matched neither and came back unchanged.
         //
-        // ANCHOR — `gaeApplyFieldTy` (`compiler/emit_base.vl`), whose entire body is
+        // #1234 replaced that ladder with the ARRAY-NAME grammar's leaf peel
+        // (`arrLeafNameOf`) plus a re-attachment of the same `[]` run, and gave it the
+        // SHADOW guard (`gaeParamShadowed`) the filing's own remedy was missing — the
+        // second defect that paragraph recorded, where a declaration shadows a builtin
+        // (`type Box<i32> = { v: i32 }` + `const b: Box<string> = { v: 1 }`) and the
+        // checker resolved the parameter to the BUILTIN while the substitution rewrote the
+        // field to the ARGUMENT, emitting a module that did not even parse.
         //
-        //     if tn == pnames[i] { return args[i] }
-        //     if tn == pnames[i] + "[]" { return args[i] + "[]" }
-        //
-        // Two depths, exactly as its header admits ("a declared param name (or its `T[]`
-        // array form)"). `T[][]` matches neither and is returned unchanged. Same shape as
-        // #1218 and #1230 — a classifier taught half a set its sibling has whole — and the
-        // SIBLING of the one #1230 fixed: #1230 gave `genTyParamArr` the leaf peel
-        // (`arrLeafNameOf`) so the DECLARATION stopped drawing a wrong message; the
-        // APPLICATION's substitution kept its two-depth ladder.
-        //
-        // The DECISIVE probe is not the reject, it is the neighbour that runs:
-        // `type Box<T> = { v: T[] }` applied at `Box<i32[]>` yields the SAME `{v: i32[][]}`
-        // shape and works — so the axis is the depth the parameter sits at IN THE ALIAS
-        // BODY, not nesting, not the element type, and not the type the application yields.
-        // Pinned at `tests/cases/generics/type-param-nested-list-field.vl` and its control
+        // Re-derived at `63a73d7` over the filing's own cells, one minimal program each:
+        // `T[][]` at i32 and string leaves, `T[][][]`, the array-typed argument
+        // `Box<i32[]>`, the concrete twin, and all five shadow spellings (i32 / string /
+        // f64 / boolean / nested, plus applying at the shadow name itself) — **11 of 11
+        // run**, against 3 emit errors + 3 unparseable modules on `e16e658`, the commit
+        // before #1234. BOTH defects the filing recorded are gone. Pinned by
+        // `tests/cases/generics/type-param-nested-list-field.vl` and its control
         // `type-param-list-field-nested-arg.vl`.
         //
-        // REMEDY, BUILT AND MEASURED (peel `tn` to its leaf, match the leaf, re-attach the
-        // same `[]` depth): 8 cells go green — `T[][]` at i32/string/struct leaves, a second
-        // field beside it, `T[][][]`, an array-typed argument, one of two parameters nested —
-        // and 1 breaks. It swallows `type Box<i32> = { v: i32[][] }` applied at `Box<string>`,
-        // which master lowers correctly, because `gaeApplyFieldTy` has NO SHADOW GUARD. That
-        // is #1230's own bycatch, and writing it exposed a SEPARATE LIVE DEFECT on master at
-        // the depths that DO substitute: `type Box<i32> = { v: i32 }` +
-        // `const b: Box<string> = { v: 1 }` is `vl check`-clean and emits a module that does
-        // not parse ("expected (ref $type), found i32"). The checker resolves the shadowing
-        // parameter to the BUILTIN (#1230 measured this) while this substitution rewrites the
-        // field to the ARGUMENT — two answers, one field. `string`/`f64`/`i32[]` shadows fail
-        // the same way; `boolean` escapes only because it shares i32's rep, and applying at
-        // the shadow name itself is the identity. `emit_base.vl` was outside this slice's
-        // partition, so both are filed rather than fixed.
+        // What survives here is the guard, and its message is now true of what reaches it.
         if (
           elemNest != 4 &&
           elemNest != 6 &&
@@ -8402,6 +8389,38 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         // `string` about a cell whose rep is `(ref null $a)`), so master streamed a
         // possibly-null ref straight into `array.len` — a runtime `wasm trap: null
         // reference` with `vl check` clean.
+        //
+        // FILED, NOT FIXED (found 2026-07-27 by sweeping the map axis, verified on
+        // `63a73d7`). `exprString` claiming this value is exactly what RESERVES the
+        // scratch frame the arm below writes into — and where it does NOT claim it, the
+        // frame is absent and this arm emits INVALID WASM with `vl check` rc 0:
+        //
+        //     const m: {[string]: string} = Map()
+        //     m["k"] = "a"
+        //     print(m["k"])          // "type mismatch: expected (ref $type), found (ref $type)"
+        //
+        // The reservation scan is `exprHasStrOp`'s `print` arm (`emit_classify.vl`), which
+        // asks `exprString(arg)` and `exprIsLitAtom(arg)`. This handler asks
+        // `exprNullableString` FIRST and that predicate is strictly WIDER — a fused map
+        // read over a `{[string]: string}` (or `{[string]: string | null}`) map is claimed
+        // here and not there. `emitPrintNulString` then `local.set`s the recovered ref into
+        // `strScratchBase + 0`, which without the reservation is not the string scratch at
+        // all: disassembled, the failing module writes a `(ref $strArray)` into local 0,
+        // declared `(ref $mapStruct)`.
+        //
+        // THE PROBE IS DECISIVE, not circumstantial: adding ONE unrelated string op to the
+        // same function (`print("x" + "y")` before it) reserves the frame and the identical
+        // print then runs — `a` for a hit, `null` for a miss, at module scope and inside a
+        // function. Nothing about the lowering here is wrong; only the frame was missing.
+        // Binding first (`const v: string | null = m["k"]; print(v)`) also runs, because a
+        // niche BINDING is claimed by `exprString` and does reserve.
+        //
+        // The one-line fix is `exprHasStrOp`'s print arm gaining `exprNullableString`
+        // beside its `exprString` — the two ends of one decision, currently spelled with
+        // two different predicates — in `emit_classify.vl`, outside this partition. The
+        // i32/f64-valued map twins are CLEAN CHECKER REJECTS ("print of a union value
+        // (i32?) is type-valid but not yet supported by codegen"), so the string leaf is
+        // the only one that reaches emit at all, which is why this hid.
         if exprNullableString(c.callArgs[0], fnIx) {
           return emitPrintNulString(body, c.callArgs[0], fnIx)
         }
@@ -10887,6 +10906,40 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
         // the body clashes with it ("return expected f32, got f64"). `return x` (a bare f32) was
         // already f32; only a literal-bearing f32 expression needed the coercion.
         if fRetKind[rfe] == "f32" { retF32 = true }
+        // AN INFERRED `f32[]` RETURN HAS NO PRODUCER, and until this guard the function
+        // emitted INVALID WASM with `vl check` rc 0 — the worst class in the ordering, on a
+        // callee that need not even be CALLED (`function mk() { const xs: f32[] = [1.5];
+        // return xs }` beside a bare `print(1)` is enough). The functype result stays at the
+        // `"i32"` default (`retAnnKindChain`'s seed, read by `emitTypeSection`'s
+        // un-annotated arm through `inferredRetKindCore`) while the emitted `return` pushes
+        // the f32 list's `(ref $array)`.
+        //
+        // BOTH channels that fill the slot decline this shape, and each says so at its own
+        // site: the checker's A20 record admits only `i32[]`/`string[]` among arrays
+        // (`isClassifiableRetName`, `typecheck.vl`) so `emit_collect`'s `nameIsF32Array` arm
+        // never sees this function, and `criClassify`'s `exprF32Array` arm
+        // (`emit_classify.vl`) cannot classify a returned LOCAL during a pass that runs
+        // before any local table exists — the same gap `retIsMapLocalAnnot` was added to
+        // close for a returned map local. HERE the local table DOES exist, which is why the
+        // disagreement is detectable at this site and repairable at neither.
+        //
+        // The reject is a CLASS improvement, not the fix: invalid wasm becomes a loud error
+        // that names the remedy, because the ANNOTATED spelling lowers correctly today
+        // (#1223 gave it `fnRetAnnF32Array`; `tests/cases/arrays/f32-array-return.vl` pins
+        // it). Measured at `63a73d7` over 18 cells: the 6 that were invalid wasm — an
+        // annotated/`let`/local binding, a call ARGUMENT, an UNREAD binding, and the
+        // never-called callee — all become this error; the 3 that already rejected at the
+        // caller (`mk()[0]`, `mk().length`, a bare binding) now reject here instead, one
+        // function earlier and with the actionable message; the `f64`/`i64`/`i32`/`string`
+        // twins of the same three lines and the f32 SCALAR are untouched and still run.
+        // `function mk(a: f32[]) { return a }` also still runs: a returned PARAM is exactly
+        // what `criClassify`'s arm CAN see, so its slot holds `"f32list"` and this guard —
+        // keyed on the `"i32"` default, not on the expression alone — never fires for it.
+        if fRetKind[rfe] == "i32" && exprF32Array(retArg, fnIx) {
+          return emitFail(
+            "emitProgram: an f32[] return must be annotated (`: f32[]`) — the inferred form has no result type",
+          )
+        }
       }
     }
     // A literal-union return reads as a union NAME but is an i32 ATOM — exclude it from the value-union
@@ -13102,45 +13155,64 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     // Ident targets only (a local or module global); an Index/Member assignment
     // in VALUE position is out of this slice.
     //
-    // FILED (#1229's hand-off, re-derived and WIDENED here). The re-read below is the
-    // value a function's TAIL assignment returns — and the FUNCTYPE that promises that
-    // value is decided somewhere else, from the OTHER operand. `criClassify`
-    // (`emit_classify.vl`) opens with
+    // FILED by #1229's hand-off, re-derived and widened here, and the GLOBAL half is now
+    // CLOSED by #1235 — this paragraph is that filing rewritten to its measured residue.
+    // The re-read below is the value a function's TAIL assignment returns, and the
+    // FUNCTYPE that promises that value is decided somewhere else, from the OTHER
+    // operand: `criClassify` (`emit_classify.vl`) used to open with
     //
     //     if rxe.binOp == "=" { rx = rxe.binRight }
     //
     // so `fRetKind` — read by `emitTypeSection`'s un-annotated-return arm, and by
-    // `cloRetValKind` for the `$fnsig` bytes — describes the RIGHT-HAND SIDE, while this
+    // `cloRetValKind` for the `$fnsig` bytes — described the RIGHT-HAND SIDE while this
     // line pushes the TARGET. The two agree exactly when storing the RHS needed no
-    // coercion. Whenever `emitAssign` COERCES (an i64 widen, a nullable cell, a
-    // literal-union atom) they disagree and the module is INVALID WASM on a program
-    // `vl check` accepts, rc 0.
+    // coercion; whenever `emitAssign` COERCES (an i64 widen, a nullable cell, a
+    // literal-union atom, a union box) they disagreed and the module was INVALID WASM on
+    // a program `vl check` accepts, rc 0. #1235 gave `criClassify` the target's cell kind
+    // through `globalCellKind` — the resolver the global section and `emitIdentNode`
+    // already share — for GLOBAL targets only.
     //
-    // THE FILING THIS RE-DERIVES WAS TOO NARROW ON EVERY AXIS. It was recorded as "a
-    // nested function storing null into a `T[] | null` global started as `[]`, #1225's
-    // storage-class family". Measured, single-file, 48 + 13 + 15 + 12 probes: the LIST
-    // rep is not the axis (`S | null`, `string | null`, `i64` all fail), `null` is not
-    // the axis (`xs = [{n: 2}]` into an `S[] | null` global fails with the MIRRORED
-    // "expected (ref $type), found (ref null $type)"), the `[]` initializer is not the
-    // axis (`= null` and a non-empty literal fail identically), and GLOBAL is not the
-    // axis (a `S | null` LOCAL fails the same way). Nor is "nested function" the axis in
-    // the sense filed — the reject follows the assignment being the body's LAST
-    // statement, which is what makes it the implicit RETURN. Adding one statement after
-    // it (`xs = null` then `print(9)`) compiles and runs; ANNOTATING the return
-    // (`function c(): S | null { s = null }`) compiles and runs. A lambda body and a
-    // doubly-nested function fail exactly as a top-level `function` does.
+    // WHAT IS STILL OPEN, re-derived at `63a73d7` against a build of `55a2b04` (the commit
+    // before #1235) over 18 cells, one MINIMAL prelude per target — a shared header is not
+    // usable here, since a spare `type U = S | T2` in it changes how `S | null` classifies:
     //
-    // THE ONE-LINE FIX IS REFUTED — built, self-compiled and swept. Reading `binLeft`
-    // instead of `binRight` repairs the `S | null` and `i64` cells and then: leaves
-    // `S[] | null` and a `S | null` LOCAL still invalid (no `nulreflist` arm; a local's
-    // declaration is not visible during that GLOBAL pass), and turns `string | null` from
-    // invalid wasm into a RUNTIME TRAP — it classifies "str", so the functype promises a
-    // non-null `(ref $array)` over a body that returns null. It also moves the compiler's
-    // own codegen (same length, differing byte at 482885), so it is not inert. The honest
-    // repair is `criClassify` gaining the nullable-aware arms keyed on the ASSIGNMENT
-    // TARGET's declared rep — `emit_classify.vl`, outside this slice's partition, and not
-    // a one-liner. The agreeing set is pinned by
-    // `tests/cases/functions/tail-assign-inferred-return.vl`.
+    //   GLOBAL  i64 · f64 · `S | null` · `i32 | string`   invalid wasm -> RUNS   (#1235)
+    //   GLOBAL  `S[] | null`                              invalid wasm -> emit error
+    //   GLOBAL  literal union · `i32[] | null`            invalid wasm, UNCHANGED
+    //   LOCAL   i64 · f64 · litunion · `i32[] | null` ·
+    //           `S[] | null` · `S | null` · `i32 | string`  invalid wasm, UNCHANGED (7)
+    //   PARAM   i64                                      invalid wasm, UNCHANGED
+    //   ANY     `string | null` (global, local and param)  runtime TRAP, UNCHANGED (3)
+    //
+    // Two things that A/B settles and a head-only reading would get wrong: the three
+    // `string | null` TRAPs are PRE-EXISTING — they trap identically on `55a2b04`, so they
+    // are not #1235's bycatch, and they remain the one cell class where this family is
+    // WORSE than a reject — and PARAM is a third storage class, filed by neither report.
+    //
+    // THE LOCAL HALF IS NOT REACHABLE FROM THIS FILE, and the import direction does not
+    // change that (measured, since the obvious hope is that it does). A local target's
+    // cell kind is decided by `collectLocals` (`emit_collect.vl`), and `wasmEmit.vl`
+    // imports BOTH `emit_collect` and `emit_classify`, so the resolver IS in scope here.
+    // The consumer is not: `criClassify` runs inside `computeRetInference`, before any
+    // body is emitted, and lives in `emit_classify.vl`, which cannot call into this file —
+    // `emit_classify` -> `wasmEmit` is exactly the cycle the loader rejects, because
+    // `wasmEmit` imports `emit_classify` (and only `emit_sections` imports `wasmEmit`).
+    // The fix stays where #1235 filed it: `criClassify` needs a local-cell resolver in
+    // `emit_classify`'s own storage class, proved equal to `collectLocals`'s ladder first.
+    // The agreeing set is pinned by `tests/cases/functions/tail-assign-inferred-return.vl`.
+    //
+    // TWO MEASUREMENTS FROM THE ORIGINAL FILING, KEPT because they still bound the local
+    // half. (1) The axis is the assignment being the body's LAST statement — which is what
+    // makes it the implicit RETURN, and therefore what puts it in front of the functype.
+    // Adding one statement after it (`s = 7` then `print(9)`) runs, and ANNOTATING the
+    // return (`function c(): i64 { … }`) runs; both re-checked at `cf24c6e`. (Its third
+    // claim — that a lambda body and a doubly-nested function fail like a top-level
+    // `function` — is now FALSE: both spellings there target a GLOBAL, so #1235 fixed
+    // them, and both print 7.) (2) The one-line repair is REFUTED, built and swept:
+    // reading `binLeft` instead of `binRight` in `criClassify` leaves the LOCAL cells
+    // invalid either way (a local's declaration is not visible during that pass) and turns
+    // `string | null` from invalid wasm into a runtime TRAP, since it classifies "str" and
+    // the functype then promises a non-null `(ref $array)` over a body returning null.
     const tgt = P.nodes[e.binLeft]
     if tgt is Ident {
       if emitAssign(body, exprIx, fnIx) < 0 { return -1 }
