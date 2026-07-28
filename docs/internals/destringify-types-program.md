@@ -30740,7 +30740,13 @@ compile). None of master's three commits touches a file in this partition.
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined, 0 new, 0 stale |
 | corpus A/B vs the new baseline | 0 | **1,569 files, 0 diffs × 6 channels** |
 | frozen-source rebuild of `231e137c`'s own source | 0 | **byte-identical**, 1,044,778 B, sha256 `42e12ff28960d19216068bf98c8165653297a8dafa81d18602afe6e7bf0f102a`; inverted control rc 1 |
-| fuzz A/B vs the new baseline | 0 | 100,800 programs/side, 0 divergences (`*.err` normalised) |
+
+**The fuzz A/B in this table is the PRE-rebase pair**, and it is the one that measures this
+slice's delta in isolation: 100,800 programs/side against master `17eb646`'s compiler, 0
+divergences. A post-rebase re-run against the `231e137c` baseline is a re-confirmation rather
+than a new claim — the source delta is identical and none of master's three commits touches
+this partition — and it is deliberately NOT asserted here until it has actually landed. A gate
+table is a record of readings taken, not of runs started.
 
 **1,044,778 → 1,042,817 is −1,961 B — the SAME total as before the rebase**, on a baseline 90
 bytes larger. The per-family deltas are therefore additive with master's own work rather than
