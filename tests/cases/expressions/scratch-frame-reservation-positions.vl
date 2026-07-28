@@ -15,6 +15,10 @@
 // @log true
 // @log true
 // @log 3
+// @log 9
+// @log 4
+// @log true
+// @log 2
 // THE TAUGHT HALF of three more scratch-frame reservations, by POSITION — the
 // call-LHS `??` stash (`coalesceCallSlot`/`StrSlot`/`BoolSlot`), the array-intrinsic
 // length slot (`arrNewScratchBase`) and the list `==`/`+` frames
@@ -50,18 +54,22 @@
 //          while (g(n) ?? 0) > 0 { n = n - 1 }       // at module scope
 //          for i in 0 to (g(2) ?? 0) { }             // at module scope
 //
-//   3. THE MIDDLE OPERAND OF A `??` CHAIN. `a ?? b ?? d` parses as `(a ?? b) ?? d`
-//      and `emitCoalesce` (wasmEmit.vl:14077-14090) RE-ASSOCIATES it to
-//      `a ?? (b ?? d)`, minting a new `BinExpr` in which `b` is a `??` LHS.
-//      `exprHasCoalesceCall` only ever asks whether a `??`'s `binLeft` is a Call —
-//      it never asks about `binRight`, and the re-associated node does not exist
-//      when the scan runs. So `x ?? f() ?? d` reserves nothing and then
-//      `fbLocalSet(coalesceCallSlot)` runs. The rewrite is the scan's blind spot,
-//      not a member of any enumeration it could have been taught.
+//   3. (CLOSED.) THE MIDDLE OPERAND OF A `??` CHAIN. `a ?? b ?? d` parses as
+//      `(a ?? b) ?? d` and `emitCoalesce` (wasmEmit.vl) RE-ASSOCIATES it to
+//      `a ?? (b ?? d)`, minting a new `BinExpr` in which `b` is a `??` LHS. The
+//      scan used to ask only whether a `??`'s `binLeft` is a Call — never about
+//      `binRight` — and the re-associated node does not exist when the scan runs,
+//      so `x ?? f() ?? d` reserved nothing and then ran
+//      `fbLocalSet(coalesceCallSlot)`. `coalChainHasCallLhs` now walks the chain's
+//      LEFT SPINE, mirroring the rewrite: every operand except the outermost
+//      `binRight` (the final default, which the rewrite never moves into an LHS
+//      position) can become one. The exclusion is deliberate and measured — a
+//      call in the LAST operand emits a byte-identical module.
 //
-// Measured: 22 cells over these three shapes x {named function, lambda, module
-// scope, return position, call-argument position} x {i32, string, boolean, list}
-// reps — every one invalid wasm alone, every one correct with a bystander.
+// Measured after the three closures above: 48 cells over these shapes x {named
+// function, lambda, module scope, return position, call-argument position} x
+// {i32, string, boolean, list} reps — every one invalid wasm alone, every one
+// correct with a bystander, every one correct now.
 function maybe(n: i32): i32 | null {
   if n > 0 { return n }
   null
@@ -210,3 +218,41 @@ function listConcatInIfExprArm(c: boolean) {
   zs.length
 }
 print(listConcatInIfExprArm(true)) // 3
+
+// ── the MIDDLE OPERAND of a `??` chain, now WALKED ───────────────────────────
+// `x ?? f() ?? d` parses `(x ?? f()) ?? d`; `emitCoalesce` re-associates it to
+// `x ?? (f() ?? d)`, so `f()` BECOMES a `??` LHS and stashes. The leftmost
+// operand is not a call here, so the old scan reserved nothing at all.
+function coalChainMiddle(x: i32 | null, n: i32) {
+  const v = x ?? maybe(n) ?? -1
+  v
+}
+print(coalChainMiddle(null, 9)) // 9
+
+// A 4-long chain with the call THIRD: the spine walk recurses, so chain length
+// and the call's position along it do not matter.
+function coalChainMiddleDeep(x: i32 | null, y: i32 | null, n: i32) {
+  const v = x ?? y ?? maybe(n) ?? -1
+  v
+}
+print(coalChainMiddleDeep(null, null, 4)) // 4
+
+// The string rep of the same stash (`coalesceCallStrSlot`) in a middle operand.
+function coalChainMiddleStr(x: string | null, n: i32) {
+  const v = x ?? maybeS(n) ?? "z"
+  return v == "s"
+}
+print(coalChainMiddleStr(null, 1)) // true
+
+// PRECISION, not reach: the chain's FINAL default is never re-associated into an
+// LHS position, so a call THERE must not reserve. This was correct before and
+// still compiles to a byte-identical module — the spine walk stops one operand
+// short on purpose.
+function plainTwice(n: i32): i32 {
+  return n * 2
+}
+function coalLastOperandIsCall(x: i32 | null, n: i32) {
+  const v = x ?? plainTwice(n)
+  v
+}
+print(coalLastOperandIsCall(null, 1)) // 2

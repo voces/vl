@@ -352,13 +352,41 @@ export function fnHasArrNew(fnIx: i32) {
 // containing such a `??`; a function without one keeps a byte-identical layout.
 // Over-approximates to ANY call-LHS `??` (the emit path uses the slot only for a
 // value-union-box result; an unhandled rep reserves-but-skips, still valid).
+//
+// True if any operand of the `??` CHAIN at `binIx` that BECOMES a `??` LHS is a
+// Call. `a ?? b ?? d` parses LEFT-associative as `(a ?? b) ?? d`, and
+// `emitCoalesce` (wasmEmit.vl) RE-ASSOCIATES it to `a ?? (b ?? d)` — minting a
+// fresh `BinExpr` in which the MIDDLE operand `b` is an LHS. That node does not
+// exist when this scan runs, and the parsed shape carries `b` in a `binRight`, so
+// asking only "is `binLeft` a Call?" missed it: `x ?? f() ?? d` reserved nothing
+// and then ran `fbLocalSet(coalesceCallSlot)` against an undeclared local.
+//
+// Walk the LEFT SPINE, mirroring the rewrite exactly: every operand of the chain
+// except the outermost `binRight` — the chain's final default, which the rewrite
+// never moves into an LHS position — can become one. Deliberately NOT widened to
+// "any operand": `x ?? f()` must keep a byte-identical layout.
+function coalChainHasCallLhs(binIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const lIx = unwrapParen(e.binLeft)
+    const l = P.nodes[lIx]
+    if l is Call { return true }
+    if l is BinExpr {
+      if l.binOp == "??" {
+        const m = P.nodes[unwrapParen(l.binRight)]
+        if m is Call { return true }
+        return coalChainHasCallLhs(lIx)
+      }
+    }
+  }
+  false
+}
 export function exprHasCoalesceCall(exprIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is BinExpr {
     if e.binOp == "??" {
-      const l = P.nodes[unwrapParen(e.binLeft)]
-      if l is Call { return true }
+      if coalChainHasCallLhs(exprIx) { return true }
     }
     if exprHasCoalesceCall(e.binLeft) { return true }
     return exprHasCoalesceCall(e.binRight)
