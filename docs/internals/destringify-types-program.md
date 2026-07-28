@@ -29412,3 +29412,30 @@ field shapes before `gaeEnsure` codes them.
 | `function ident<i64>(v: i64)` at an i32 argument | invalid wasm | **correct** | LIVE — `monoTyParamOf` lacks the `gaeParamShadowed` guard its `gae` sibling carries. 2 cells |
 | `type Box<T> = { v: (T\|null)[] }` (no shadow) | — | emit reject | pre-existing: an un-canon'd `T` survives in the arena. 45 control cells; 15 were a compiler CRASH on master and are now clean rejects |
 | a NESTED application's own inline-shape fields | — | — | `gaeInternAppFieldShapes` does not recurse (a recursive alias would not terminate) |
+
+### D-MONOPRIM — the FuncDecl half of the PRIMITIVE-shadow rule (#TBD)
+
+`gaeParamShadowed` is the checker's `primTyOfName -> tpEnvTyOfName -> declaredTyOfName` order read
+as a predicate: a parameter named for a primitive binds NOTHING. `gaeApplyFieldTy` has carried it
+since #1234; `monoTyParamOf`, eight hundred lines down the SAME FILE, did not. It claimed `i64` as
+a type parameter, `monoBindFromAnn` bound it to whatever the CALL passed, and the instance's
+parameter was rewritten to the argument's type while the RETURN kept the checker's `i64` —
+`(param i32) (result i64)`, `vl check` rc=0, invalid wasm.
+
+**The axis is the ARGUMENT'S TYPE, not the rep, and the earlier filing said the opposite.** Swept
+as a 6 × 6 parameter-NAME × ARGUMENT-TYPE grid against a `<T>`-named control:
+
+* master: 3 of 36 cells disagree with their control. Two are the defect (`<i64>` and `<f64>` handed
+  an `i32`-typed argument, invalid wasm against a CORRECT control); the third is the shadow arm
+  accidentally producing the RIGHT answer by erasing to the argument's own type.
+* after: **0 of 36 disagree.** The two invalid-wasm cells run; the third converges on its control,
+  whose residual `1`-for-`true` is a separate pre-existing checker hole (a `boolean` accepted for
+  an `i32` parameter) present in the control on master.
+
+Everything else in the grid is either the DIAGONAL — the argument's type equals the shadowed name,
+so the erasure is a no-op — or a checker reject. **A single argument literal per row measures the
+diagonal and reports it as the answer**, which is how "i32 / f64 / string / boolean all run" and
+"the anchor is the inferred RETURN classification" both got written down. The return is the half
+that was RIGHT.
+
+Corpus A/B on six channels: 0 of 1,542 files differ on any channel, including bytes.
