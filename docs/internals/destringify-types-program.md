@@ -32207,10 +32207,14 @@ whether a function type's PARAM is canonicalized is decided by whether its RESUL
 be parenthesized.** Filed here, not fixed — it is a canon policy question, and the arena-side
 mirror is correct either way precisely because it applies the same `canonEmitName`.
 
-**AND THE CORPUS'S ZERO HAS A CAUSE.** Every shape that makes the arm rewrite needs a
-canon-rewritable PARAM, i.e. a union / litunion-alias parameter, on a function VALUE — and
-*that* is a live silent miscompile (next section), so no green program can exercise this
-site's canon on master at all. A scalar-alias param does not work as a substitute:
+**AND THE CORPUS'S ZERO HAS A PARTIAL CAUSE — stated as partial, because it is.** The arm
+canons the params at `RC_FN_PARAM` and the result at `RC_FN_RES`, so either side could in
+principle supply the rewrite. The PARAM route is the one I found and it is closed by a
+compiler defect: the only param spelling canon rewrites is a union / litunion-alias one, and
+a value-union param on a function VALUE is a live silent miscompile (next section), so no
+green program can reach the arm that way. The RESULT route was NOT swept and no claim is made
+about it — `RC_FN_RES` keeps literal unions, which removes the obvious candidate, but that is
+an argument and not a measurement. A scalar-alias param does not work as a substitute:
 `type Z = i32` with `(Z) => ((i32) => i32)` renders `(i32)=>((i32)=>i32)` — the arena
 resolved the alias before the renderer saw it — and canon has nothing to do (verified, the
 program prints 15 and the comparator reads three `SAME` reaches).
