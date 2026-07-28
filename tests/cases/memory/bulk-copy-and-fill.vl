@@ -1,0 +1,187 @@
+// @run
+// @log 117901063
+// @log 0
+// @log 0
+// @log 0
+// @log 255
+// @log 255
+// @log 255
+// @log 0
+// @log 66
+// @log 255
+// @log 67305985
+// @log 134678021
+// @log 1
+// @log 2
+// @log 1
+// @log 2
+// @log 3
+// @log 4
+// @log 5
+// @log 6
+// @log 3
+// @log 4
+// @log 5
+// @log 6
+// @log 7
+// @log 8
+// @log 7
+// @log 8
+// @log 67305985
+// @log 5
+// @log 1
+// @log 2
+// @log 3
+// @log 4
+// @log 173
+// @log 173
+// @log 0
+// @log 2
+// @log 67305985
+// @log 222
+// @log 222
+// @log 2
+// @log 17
+// @log 17
+// @log 0
+// THE BULK PAIR (`buffer-design.md` §C3) — the emitter's first `0xfc` opcodes:
+//
+//   __memory_copy__(dst, src, len)   → memory.copy   (fc 0a 00 00)
+//   __memory_fill__(dst, byte, len)  → memory.fill   (fc 0b 00)
+//
+// Verified by disassembly, not by reading the table. The trailing zero bytes are
+// memory INDEX immediates — one for `fill` (its destination), two for `copy`
+// (destination first, then source) — not flags.
+//
+// webcraft calls these load-bearing rather than convenient: snapshot and rollback
+// ARE these two instructions, and without them a snapshot is a per-word loop.
+//
+// `len` is UNSIGNED in both, so a negative one is ~4 GiB and traps — pinned by
+// `bulk-negative-length-traps.vl`, and the reason `std:buffer` guards rather than
+// passing a caller's length straight through. Every expectation below is python's
+// byte model, and the overlap ones use the spec's own "as if through a temporary".
+// ── memory.fill ──────────────────────────────────────────────────────────
+// An aligned whole word, and the two words on either side left alone.
+__memory_fill__(4, 7, 4)
+print(__load_i32__(4))
+print(__load_i32__(0))
+print(__load_i32__(8))
+
+// UNALIGNED start and unaligned length — bytes 18,19,20 and nothing else. The
+// instruction has no alignment immediate at all, so there is no hint to get
+// wrong; this pins that the range is exactly [d, d+n).
+__memory_fill__(18, 255, 3)
+print(__load_u8__(17))
+print(__load_u8__(18))
+print(__load_u8__(19))
+print(__load_u8__(20))
+print(__load_u8__(21))
+
+// A ZERO length writes nothing — and is not a trap even at an address that
+// would be out of bounds for any positive length. The spec makes a zero-length
+// bulk op at an in-bounds-or-one-past address a no-op.
+__store_i8__(32, 66)
+__memory_fill__(32, 9, 0)
+print(__load_u8__(32))
+
+// The fill BYTE truncates to its low 8 bits, exactly as the instruction does.
+__memory_fill__(40, 511, 1)
+print(__load_u8__(40))
+
+// ── memory.copy ──────────────────────────────────────────────────────────
+// A plain non-overlapping copy of two words.
+__store_i32__(64, 67305985)
+__store_i32__(68, 134678021)
+__memory_copy__(80, 64, 8)
+print(__load_i32__(80))
+print(__load_i32__(84))
+
+// OVERLAP IS THE LOAD-BEARING PROPERTY, and it is the INSTRUCTION's, not a
+// loop's: `memory.copy` is defined to behave as if the bytes went through a
+// temporary — memmove semantics, not memcpy. The `std:buffer` byte loop this
+// replaces had to pick its direction from the addresses by hand; this does not,
+// and BOTH directions are pinned because each one is where a naive loop breaks.
+//
+// Destination ABOVE source: a naive FORWARD loop turns 1,2,3,4,5,6,7,8 into
+// 1,2,1,2,1,2,1,2 by re-reading bytes it has already written.
+__store_i32__(96, 67305985)
+__store_i32__(100, 134678021)
+__memory_copy__(98, 96, 6)
+print(__load_u8__(96))
+print(__load_u8__(97))
+print(__load_u8__(98))
+print(__load_u8__(99))
+print(__load_u8__(100))
+print(__load_u8__(101))
+print(__load_u8__(102))
+print(__load_u8__(103))
+
+// Destination BELOW source: the mirror, where a naive BACKWARD loop is the
+// wrong one — it would turn 1,2,3,4,5,6,7,8 into 7,8,7,8,7,8,7,8.
+__store_i32__(112, 67305985)
+__store_i32__(116, 134678021)
+__memory_copy__(112, 114, 6)
+print(__load_u8__(112))
+print(__load_u8__(113))
+print(__load_u8__(114))
+print(__load_u8__(115))
+print(__load_u8__(116))
+print(__load_u8__(117))
+print(__load_u8__(118))
+print(__load_u8__(119))
+
+// A FULLY OVERLAPPING self-copy (dst == src) is the identity.
+__store_i32__(128, 67305985)
+__memory_copy__(128, 128, 4)
+print(__load_i32__(128))
+
+// A ZERO-length copy leaves the destination alone.
+__store_i8__(144, 5)
+__store_i8__(148, 9)
+__memory_copy__(144, 148, 0)
+print(__load_u8__(144))
+
+// ── the PAGE BOUNDARY, and a whole page ──────────────────────────────────
+// A copy that STRADDLES the 64 KiB line, into memory that only exists because
+// of the grow. Linear memory is flat — the page boundary is not a barrier to a
+// bulk op — and this is the cell that says so.
+__memory_grow__(1)
+__store_i32__(160, 67305985)
+__memory_copy__(65534, 160, 4)
+print(__load_u8__(65534))
+print(__load_u8__(65535))
+print(__load_u8__(65536))
+print(__load_u8__(65537))
+
+// A FULL PAGE fill: 65536 bytes in one instruction, both ends read back, and
+// the byte one BELOW the range still zero.
+__memory_fill__(65536, 173, 65536)
+print(__load_u8__(65536))
+print(__load_u8__(131071))
+print(__load_u8__(65533))
+print(__memory_size__())
+
+// ── the scope axis (B3/O7) ───────────────────────────────────────────────
+// A bulk op in a named function, as a function's implicit TAIL statement, and
+// in a module that uses a FUNCTION VALUE — the three positions where a void
+// intrinsic can be misclassified as a body's value or fail the capture scan.
+const bump = (x: i32) => x + 1
+function blit(d: i32, s: i32, n: i32) { __memory_copy__(d, s, n) }
+function paint(d: i32, b: i32, n: i32) { __memory_fill__(d, b, n) }
+__store_i32__(176, 67305985)
+blit(184, 176, 4)
+paint(192, 222, 2)
+print(__load_i32__(184))
+print(__load_u8__(192))
+print(__load_u8__(193))
+print(bump(1))
+
+// …and from inside a lambda body.
+const wipe = (a: i32) => {
+  __memory_fill__(a, 17, 3)
+  a
+}
+wipe(200)
+print(__load_u8__(200))
+print(__load_u8__(202))
+print(__load_u8__(203))

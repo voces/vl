@@ -4,6 +4,7 @@ import {
   isValueUnionName,
   isVarTyIxOf,
   nameIsLitUnionType,
+  nameIsMemBulkIntrinsic,
   nameIsMemLoadIntrinsic,
   nameIsMemStoreIntrinsic,
   nodeArrayElemIsLitUnion,
@@ -7979,6 +7980,20 @@ const OP_I32_STORE16 = 0x3b
 const OP_MEMORY_SIZE = 0x3f
 const OP_MEMORY_GROW = 0x40
 
+// The MISC prefix (0xfc) and the two bulk-memory sub-opcodes behind it. This is the
+// emitter's FIRST 0xfc — every prefixed instruction it wrote until now was 0xfb, the
+// GC prefix (`emit_bytes.GC_PREFIX`). The two prefixes are unrelated opcode spaces
+// that happen to be adjacent bytes, so they get separate constants rather than one
+// shared "prefix" notion.
+//
+// The sub-opcode is a u32 LEB immediate, not a byte — 10 and 11 both encode as a
+// single byte (`0x0a` / `0x0b`) because they are below 128, which is why `wU8` is
+// enough here and why that is worth saying out loud before someone adds sub-opcode
+// 128 (`i32.trunc_sat_f32_s` is 0, `memory.init` 8; the space is small today).
+const OP_MISC_PREFIX = 0xfc
+const MISC_MEMORY_COPY = 10
+const MISC_MEMORY_FILL = 11
+
 // The opcode byte for load width `name`, or -1 for a name that is not one. Paired with
 // `memLoadAlignExp` below — the two are read together at the single call site.
 function memLoadOpcode(name: string) {
@@ -8059,6 +8074,27 @@ function memStoreValueIsI32(name: string) {
   if name == "__store_i8__" { return true }
   if name == "__store_i16__" { return true }
   false
+}
+
+// One bulk-memory instruction: the 0xfc prefix, the sub-opcode, then ONE memory index
+// immediate per memory the instruction names — `memory.fill` names one (its
+// destination), `memory.copy` names two (destination FIRST, then source). Both are 0:
+// VL emits a single memory and multi-memory is not proposed (§C3).
+//
+// The operand order the caller must already have arranged on the stack is the
+// instruction's, and it is NOT the same shape as the memarg ops above:
+//   memory.copy  d s n   — destination address, source address, byte count
+//   memory.fill  d val n — destination address, fill byte, byte count
+// `n` is unsigned in both, so a negative VL length is ~4 GiB and traps in the engine.
+function fbMemBulk(sub: i32, memIndexCount: i32) {
+  wU8(OP_MISC_PREFIX) // 0xfc misc prefix
+  wU8(sub)            // the sub-opcode (a u32 LEB; 10 and 11 are one byte each)
+  let mi = 0
+  while mi < memIndexCount {
+    wU8(0) // memory index 0
+    mi = mi + 1
+  }
+  0
 }
 
 // `memory.size` → 0x3f 0x00 and `memory.grow` → 0x40 0x00. The trailing byte is the
@@ -8320,8 +8356,8 @@ function emitIntIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
 //
 // Every operand ROUTED HERE is an i32 BY DECLARATION (`typecheck.vl`'s default scope:
 // `__store_i32__(i32,i32)`, `__load_*__(i32)`, `__memory_grow__(i32)`, `__log__(i32,i32)`)
-// — a byte address, a stored i32 word, a page count — so no wide scalar an ENCLOSING
-// position wants may reach it. The three WIDE stores' second
+// — a byte address, a stored i32 word, a page count, a fill byte, a bulk length — so no
+// wide scalar an ENCLOSING position wants may reach it. The three WIDE stores' second
 // operand is the ONLY memory-intrinsic operand that is not an i32; it takes its declared
 // width through `emitExprAsI64`/`emitExprAsF32`/`emitExprAsF64`, and only its ADDRESS
 // comes here. The two NARROW stores are back on this side of the line: `i32.store8`
@@ -8637,6 +8673,38 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           )
         }
         fbMemAccess(msOp, msAlign)
+        return 0
+      }
+      // THE BULK PAIR (`buffer-design.md` §C3). One arm for both, because the shape is
+      // identical: three i32 operands pushed in the instruction's own order, then the
+      // prefixed opcode. Every operand is an i32 BY DECLARATION, so all three take the
+      // same context-clearing `emitMemIntrinArg` spine the addresses take — there is no
+      // width dispatch here at all, which is the whole difference from the store arm.
+      //
+      // The operand ORDER is the instruction's, and VL's argument order was chosen to
+      // match it exactly so this arm is a straight walk: `__memory_copy__(dst, src, len)`
+      // is `memory.copy d s n`, and `__memory_fill__(dst, byte, len)` is
+      // `memory.fill d val n`. Had the VL spelling put `len` first, this arm would have
+      // to reorder the operand emissions, which for arbitrary expressions means
+      // reordering their SIDE EFFECTS — so the order is a signature decision, not a
+      // formatting one.
+      if nameIsMemBulkIntrinsic(callee.identName) {
+        if c.callArgs.length != 3 {
+          return emitFail(
+            "emitProgram: " +
+              callee.identName +
+              " takes exactly three arguments (the byte count is the last)",
+          )
+        }
+        if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
+        if emitMemIntrinArg(body, c.callArgs[1], fnIx) < 0 { return -1 }
+        if emitMemIntrinArg(body, c.callArgs[2], fnIx) < 0 { return -1 }
+        if callee.identName == "__memory_copy__" {
+          // Two memory indices: destination first, then source.
+          fbMemBulk(MISC_MEMORY_COPY, 2)
+        } else {
+          fbMemBulk(MISC_MEMORY_FILL, 1)
+        }
         return 0
       }
       // The seven OTHER load widths (`buffer-design.md` §C2). One arm, because the
@@ -11753,6 +11821,7 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
     // The void memory intrinsics leave nothing on the stack.
     if callee.identName == "__store_i32__" { dropIt = false }
     if nameIsMemStoreIntrinsic(callee.identName) { dropIt = false }
+    if nameIsMemBulkIntrinsic(callee.identName) { dropIt = false }
     if callee.identName == "__log__" { dropIt = false }
     // The void array intrinsics: `__array_copy__` leaves nothing; `__trap__`
     // is `unreachable` (no value reaches the drop).
