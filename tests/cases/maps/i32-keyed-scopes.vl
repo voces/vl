@@ -1,0 +1,89 @@
+// @run
+// @log 70
+// @log 90
+// @log 90
+// @log -7
+// @log 99
+// @log 150
+// @log 80
+// @log 15
+// @log 2
+// @log 70
+// THE i32-KEYED MAP ACROSS EVERY SCOPE ITS SHAPE HAS TO CROSS — the receiver ×
+// scope grid the string-keyed rep is pinned on (`map-scratch-frame-reservation.vl`),
+// mirrored for the i32 key. Each cell resolves the map SHAPE through a different
+// resolver, and each resolver has to answer with the i32-keyed sentinel (`-4`/`-5`)
+// rather than the string-keyed mono `-1`:
+//
+//   global            `letMapShapeOf` (the module-scope `LetDecl`)
+//   local             `letMapShapeOf` → `localStructIdx` (the local's CELL type)
+//   param             `mapAnnShape` via `paramMapShape` (the param VALTYPE too)
+//   return            `mapAnnShape` via `fnRetMapShape` (the result valtype)
+//   `| null` return   `mapAnnShape`'s `| null` peel + the null heap
+//   lambda capture    `letMapShapeOf` on the PARENT frame's binding
+//   un-annotated      the arena (`nodeTyMapKeyIsI32` on the `Map()` call node)
+//
+// A cell that answered the string-keyed shape would `struct.get` the wrong map
+// struct — invalid wasm, which `vl check` cannot see — so every cell here is a
+// build-tier pin as much as a behavior one.
+const g: {[i32]: i32} = Map()
+g[7] = 70
+
+function readIt(mm: {[i32]: i32}): i32 {
+  return mm[7] ?? -1
+}
+function mk(): {[i32]: i32} {
+  const r: {[i32]: i32} = Map()
+  r[9] = 90
+  return r
+}
+function maybe(b: boolean): {[i32]: i32} | null {
+  if b { return mk() }
+  return null
+}
+function capIt(): i32 {
+  const c: {[i32]: i32} = Map()
+  c[3] = 33
+  const f = (n: i32) => {
+    c.set(n, 99)
+    0
+  }
+  const z = f(4)
+  return (c[4] ?? -1) + z
+}
+// An UN-annotated binding: the key is pinned by the first `.set`, so the only
+// place the emitter can read it is the checker's recorded type on `Map()`.
+function inferred(): i32 {
+  const u = Map()
+  u.set(5, 50)
+  u.set(6, 100)
+  return (u[5] ?? 0) + (u[6] ?? 0)
+}
+
+print(readIt(g))        // 70 — a map PARAM
+print(mk()[9] ?? -1)    // 90 — a map RETURN, read off the call
+const nm = maybe(true)
+if nm != null {
+  print(nm[9] ?? -1)    // 90 — a `| null` return, narrowed
+}
+const nm2 = maybe(false)
+if nm2 == null { print(-7) }
+print(capIt())          // 99 — a lambda CAPTURE writing the parent's map
+print(inferred())       // 150 — the un-annotated binding
+
+// A module GLOBAL written from a lambda: neither `fnHasMap`'s local scan nor its
+// param scan sees a map here, so only the body walk reserves the frame.
+const setOnGlobal = () => {
+  g.set(8, 80)
+  0
+}
+const zz = setOnGlobal()
+print((g[8] ?? -1) + zz) // 80
+let n2 = 0
+for k in g {
+  n2 = n2 + k
+}
+print(n2)               // 15 — 7 + 8, the bare `for k in m` over a GLOBAL
+const vs = g.values()
+print(vs.length)        // 2
+print(vs[0])            // 70

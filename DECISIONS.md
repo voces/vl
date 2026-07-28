@@ -329,8 +329,17 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   (rebuild from live entries, index sized to the live count, not unconditionally
   doubled) — the first cut doubled on every delete and OOM-trapped under
   add/delete churn. Spelled with the index-sig syntax (`{[string]:V}` map,
-  `{[T]:boolean}` set), `string` keys only for now (i32 keys stay the native
-  `T[]` path). (B6a)
+  `{[T]:boolean}` set). (B6a)
+- **An i32 KEY re-types one field, it does not fork the map.** `{[i32]: V}` is the
+  same 7-field rep with `keys` re-typed to the i32 list, a different hash (an
+  integer mix, not FNV over code points) and an `i32.eq` compare — everything else,
+  including the ordered entry arrays, the tombstones and `__map_resize__`, is
+  literally shared. Chosen over hashing i32 keys as formatted strings (the ask is
+  fourCC tables — formatting them is the thing the ask exists to avoid) and over an
+  identity hash (fourCCs share their high bytes, so an identity hash clusters an
+  open-addressing table into a linear scan). Insertion-ordered iteration is the
+  contract for BOTH keys — replay depends on it, so no scheme that reorders on
+  rehash is admissible. (B6a)
 - **A typed-value map has ONE struct heap type per value type, resolved
   position-independently.** `{[string]:f32}` mints its own `mvMapTypeIdx` struct
   (its `vals` field differs from the mono `$mStructIdx`); a map in COMPOSITION (a

@@ -99,6 +99,7 @@ import {
   nodeTyIsUnionAlias,
   nodeTyIsVariant,
   nodeTyIxOf,
+  nodeTyMapKeyIsI32,
   nodeTyMapValIsLitUnion,
   nodeTyMapValIsNulBool,
   nodeTyMapValIsNulLitUnion,
@@ -171,6 +172,7 @@ import {
   nameIsF32Array,
   nameIsF64Array,
   nameIsI32Array,
+  nameIsI32KeyedMap,
   nameIsI32ListArray,
   nameIsI64Array,
   nameIsLitUnionArray,
@@ -3562,6 +3564,10 @@ export function mvSlotByValName(valName: string): i32 {
 // spelling. One home: when the map's value comes off the arena instead
 // (`T.tys[m] is TyMap` → the value ty), there is one call to change.
 export function mvShapeOfMapName(mapName: string) {
+  // An i32-KEYED map rides its OWN map struct, never an mv slot: its supported values
+  // are exactly the mono ones (`collectA`'s capability gate rejects the rest), so the
+  // shape is the i32-keyed mono sentinel and no slot is interned for it.
+  if nameIsI32KeyedMap(mapName) { return -4 }
   mvShapeOfValName(mapValNameOf(mapName))
 }
 
@@ -8044,8 +8050,16 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
     const callee = P.nodes[e.callFn]
     if callee is Member {
       if exprMap(callee.memObj, fnIx) {
-        if callee.memProp == "keys" { return "str" }
+        // A map's KEYS bind at the KEY's kind: string for the string-keyed rep, i32 for
+        // the i32-keyed one. A Set's `.values()` yields its ELEMENTS, so it asks the same
+        // question — the two `"str"` answers below are the string-keyed half of a pair.
+        const kk = mapShapeOfExpr(callee.memObj, fnIx)
+        if callee.memProp == "keys" {
+          if kk == -4 || kk == -5 { return "i32" }
+          return "str"
+        }
         if callee.memProp == "values" {
+          if kk == -5 { return "i32" }
           // A SET's `.values()` yields its ELEMENTS — the string keys (kind 3),
           // not the i32 membership booleans. A map's yields its VALUES: i32 for
           // the mono map, the value's kind for a ref-valued map (string 3 /
@@ -8080,8 +8094,13 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
       }
     }
   }
-  // A bare MAP iterable (`for k in m`) iterates its KEYS — like `m.keys()` (kind 3).
-  if exprMap(iterIx, fnIx) { return "str" }
+  // A bare MAP iterable (`for k in m`) iterates its KEYS — like `m.keys()`: string for
+  // the string-keyed rep (kind 3), i32 for the i32-keyed one.
+  if exprMap(iterIx, fnIx) {
+    const bk = mapShapeOfExpr(iterIx, fnIx)
+    if bk == -4 || bk == -5 { return "i32" }
+    return "str"
+  }
   if exprStringArray(iterIx, fnIx) { return "str" }
   // A STRUCT-element ref list (`S[]`): the element is a struct ref, so bind the loop
   // var as a code-`1` struct local. (Union-box (`2`) / map-array ref lists are not
@@ -8522,6 +8541,11 @@ function mapValuesResultKind(exprIx: i32, fnIx: i32) {
           }
           if sh == -2 {
             return 7 // a Set's values() ARE its string keys
+          }
+          if sh == -4 || sh == -5 {
+            // The i32-keyed rep: a map's values are the mono i32 list, and a Set's
+            // values ARE its i32 keys — the same i32 list either way.
+            return 2
           }
           if sh >= 0 {
             const vk = mvValKind[sh]
@@ -9918,6 +9942,9 @@ export function mapAnnShape(tyIx: i32) {
       const nim = nulMapInnerName(mn)
       if nim != "" { mn = nim }
       if nameIsMap(mn) {
+        // An i32-KEYED annotation selects the i32-keyed struct, whatever its (mono)
+        // value — the param/return/nulmap valtype and the body shape must agree.
+        if nameIsI32KeyedMap(mn) { return -4 }
         const vn = mapValNameOf(mn)
         if vn == "i32" || vn == "boolean" { return -1 }
         const aAn = mvSlotOfValNameTy(vn)
@@ -17215,6 +17242,17 @@ export function exprArray(exprIx: i32, fnIx: i32) {
     }
     // `m.values()` over an i32-valued map yields an i32 list.
     if mapValuesResultKind(exprIx, fnIx) == 2 { return true }
+    // `m.keys()` over the i32-KEYED rep yields an i32 list of its keys — the twin of
+    // the string-keyed `.keys()` claimed by the string-list classifier.
+    const kc32 = P.nodes[e.callFn]
+    if kc32 is Member {
+      if kc32.memProp == "keys" {
+        if exprMap(kc32.memObj, fnIx) {
+          const k32 = mapShapeOfExpr(kc32.memObj, fnIx)
+          if k32 == -4 || k32 == -5 { return true }
+        }
+      }
+    }
     return false
   }
   if e is Ident {
@@ -17910,11 +17948,15 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
     if callIsArrSlice(exprIx, fnIx) {
       return mfResultKindOf(exprIx, fnIx) == "str"
     }
-    // `m.keys()` over a string-keyed map yields a string list of its keys.
+    // `m.keys()` over a STRING-keyed map yields a string list of its keys; over the
+    // i32-keyed rep it yields an i32 list, which is not this classifier's answer.
     const kcallee = P.nodes[e.callFn]
     if kcallee is Member {
       if kcallee.memProp == "keys" {
-        if exprMap(kcallee.memObj, fnIx) { return true }
+        if exprMap(kcallee.memObj, fnIx) {
+          const ksh = mapShapeOfExpr(kcallee.memObj, fnIx)
+          return ksh != -4 && ksh != -5
+        }
       }
     }
     // `m.values()` over a string-valued map (or a Set) yields a string list.
@@ -19018,8 +19060,32 @@ export function nulMapShapeOf(letIx: i32, fnIx: i32) {
 // ref-valued map (from the annotation's value type-name), `-1` the mono i32 map,
 // `-3` an unsupported value type (op sites fail loudly). Annotation-first, else the
 // initializer's shape (a `Map()`/`Set()` constructor, or a map-typed passthrough).
+// True if the `LetDecl` at `letIx` declares an i32-KEYED map/set. Annotation-first (the
+// spelling, `| null` tolerated by the KEY CUT's width), else the checker's recorded type
+// on the initializer — which is the only answer for an un-annotated `const s = Set()`
+// whose key the first `.add(1)` pinned.
+function letI32KeyedMap(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      const lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if nameIsI32KeyedMap(lt.tyName) { return true }
+      }
+      if nodeTyMapKeyIsI32(d.letType) { return true }
+    }
+    return nodeTyMapKeyIsI32(d.letInit)
+  }
+  false
+}
+
 export function letMapShapeOf(letIx: i32, fnIx: i32) {
-  if letIsSet(letIx) { return -2 }
+  if letIsSet(letIx) {
+    // The Set flavor of the i32-keyed rep (`-5`): a Set is a boolean-valued map, so it
+    // is mono either way — the sentinel is what keeps `.values()` yielding ELEMENTS.
+    if letI32KeyedMap(letIx) { return -5 }
+    return -2
+  }
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
@@ -19049,12 +19115,19 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if callee.identName == "Set" { return -2 }
+      if callee.identName == "Set" {
+        if nodeTyMapKeyIsI32(exprIx) { return -5 }
+        return -2
+      }
       // A map-returning function yields its declared map SHAPE (mono ⇒ -1, or a `string`-valued
       // map's mv slot); a `Map()` constructor is the mono map (-1).
       const fe = fnIndexOf(callee.identName)
       if fe >= 0 { return fnRetMapShape(callee.identName) }
     }
+    // An i32-KEYED constructor / factory result: the key comes off the CALL's own
+    // recorded type, since a bare `Map()` carries no spelling. Asked before the value
+    // fall-through below, which resolves an mv slot the i32-keyed rep never uses.
+    if nodeTyMapKeyIsI32(exprIx) { return -4 }
     // FALLBACK: a map-returning CLOSURE-VALUE / factory call whose callee the syntactic path misses (a
     // closure local `v()`, an indexed closure `arr[i]()`) — resolve the shape from the checker's recorded
     // map VALUE type (mono/atom ⇒ -1, else the value name's mv slot). Mirrors the `exprMap` fallback and
@@ -19210,6 +19283,8 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
 // support side): three questions about a map's value, each of which was being answered
 // by re-slicing `V` out of `{[string]: V}` at every asking.
 function mvSlotOfMapName(mapName: string): i32 {
+  // The i32-keyed rep has no mv slot — its shape is the sentinel (see `mvShapeOfMapName`).
+  if nameIsI32KeyedMap(mapName) { return -4 }
   mvSlotOfMapValNameOrMono(mapValNameOf(mapName))
 }
 

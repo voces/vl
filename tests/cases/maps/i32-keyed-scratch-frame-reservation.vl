@@ -1,0 +1,128 @@
+// @run
+// @log 1
+// @log 2
+// @log 3
+// @log 11
+// @log true
+// @log 2
+// @log 2
+// @log 2
+// THE MAP SCRATCH-FRAME RESERVATION FOR THE i32-KEYED REP — the twin of
+// `map-scratch-frame-reservation.vl`, restricted to the receiver forms an
+// i32-keyed map may take (a struct-field / map-array-element receiver is a loud
+// capability reject for this key, see `error-i32-keyed-position-*.vl`).
+//
+// The reservation SCANS are deliberately key-BLIND: `fnHasMap` asks
+// `localIsRef == "map"` / `nameIsMap(<param annotation>)`, and `exprHasMapOp` /
+// `blockHasMapOp` / `forInMapRecv` enumerate map OPERATIONS (`set` / `add` /
+// `has` / `delete` / `keys` / `values` / the index forms / the bare `for k in m`)
+// through `exprMap` on the receiver. None of them reads the key type, and the
+// i32-keyed rep changes no op name and no receiver form — so the whole scan half
+// answers for both keys with nothing added. That is the claim; this file is what
+// makes it a measured one rather than an argument, because a scan that MISSED an
+// i32-keyed receiver would write `local.set mapI32Base + k` against locals that
+// were never reserved: INVALID WASM with `vl check` rc 0.
+//
+// EVERY function below holds exactly ONE map op, so each stays a real regression
+// pin — nothing in the file lends its frame to anything else.
+function readIt(mm: {[i32]: i32}) {
+  mm[1] ?? -1
+}
+function hasIt(ss: {[i32]: boolean}) {
+  return ss.has(1)
+}
+
+// A map LOCAL: `fnHasMap`'s local scan reserves the frame regardless of the body.
+function viaLocal() {
+  const m: {[i32]: i32} = Map()
+  m.set(1, 1)
+  m[1] ?? 0
+}
+print(viaLocal()) // 1
+
+// A map PARAM: `fnHasMap`'s param arm (`nameIsMap` on the annotation).
+function viaParam(m: {[i32]: i32}) {
+  m.set(2, 2)
+  m[2] ?? 0
+}
+const p: {[i32]: i32} = Map()
+print(viaParam(p)) // 2
+
+// A Set LOCAL — `.add` rides the same frame and the same local-scan backstop.
+function viaSetLocal() {
+  const s: {[i32]: boolean} = Set()
+  s.add(1)
+  s.add(2)
+  s.add(3)
+  s.length
+}
+print(viaSetLocal()) // 3
+
+// A module GLOBAL map. `fnHasMap` sees no map declaration in this frame, so the
+// BODY walk (`fnHasGlobalMapOp` → `blockHasMapOp` → `exprHasMapOp`'s `set` arm)
+// is the only thing that can reserve it.
+const gm: {[i32]: i32} = Map()
+function setOnGlobal(): i32 {
+  gm.set(1, 11)
+  // The read runs in `readIt`'s frame, not this one, so the `.set` above is
+  // still this frame's only map op.
+  return readIt(gm)
+}
+print(setOnGlobal()) // 11
+
+// A global Set — `.add`, the `.set` twin. A Set has no `.keys()`, so nothing
+// else in this shape could ever have reserved the frame for it.
+const gset: {[i32]: boolean} = Set()
+function addOnGlobalSet(): boolean {
+  gset.add(1)
+  return hasIt(gset)
+}
+print(addOnGlobalSet()) // true
+
+// The BARE `for k in m` over a GLOBAL: `blockHasMapOp`'s ForIn arm asks
+// `forInMapRecv`, whose bare-map half is the only thing that claims this header.
+function forInGlobal(): i32 {
+  let n = 0
+  for k in gm2 {
+    n = n + 1
+  }
+  return n
+}
+const gm2: {[i32]: i32} = Map()
+const z7 = seed2(gm2)
+print(forInGlobal() + z7) // 2
+
+// The bare `for k in m` over a map PARAM (covered by `fnHasMap`, not the walk).
+function forInParam(m: {[i32]: i32}) {
+  let n = 0
+  for k in m {
+    n = n + 1
+  }
+  return n
+}
+const q: {[i32]: i32} = Map()
+const z8 = seed2(q)
+print(forInParam(q) + z8) // 2
+
+// A global SET: the bare form is the ONLY form (`.keys()` is not on a Set).
+function forInGlobalSet(): i32 {
+  let n = 0
+  for k in gset2 {
+    n = n + 1
+  }
+  return n
+}
+const gset2: {[i32]: boolean} = Set()
+// Seeded at MODULE scope: `.add` has no PARAM surface, so this pair is the only
+// map op in the start function.
+gset2.add(1)
+gset2.add(2)
+print(forInGlobalSet()) // 2
+
+// The seeder takes a map PARAM, so its own frame comes from `fnHasMap` and it
+// never lends one to the readers above.
+function seed2(mm: {[i32]: i32}): i32 {
+  mm[1] = 1
+  mm[2] = 2
+  return 0
+}

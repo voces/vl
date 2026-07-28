@@ -25901,7 +25901,7 @@ rejects as ``unknown type '{[i32]:i32}' in union 'K'`` plus two cascades, where 
 gives the deliberate ``An i32-keyed Map isn't supported yet — i32 keys use a list/array``. Same
 verdict CLASS on both spellings (a clean checker reject, which is why the cell does not move), but
 the i32-key rejection fires while the `UnionDecl` member is still being resolved, so the body never
-becomes a `TyMap` and this arm never sees it. `tests/cases/maps/error-i32-keyed.vl` is the inline
+becomes a `TyMap` and this arm never sees it. `tests/cases/maps/error-unsupported-key.vl` is the inline
 pin; the alias spelling has none.
 
 ### CHANNEL GRADING — AND THE FUZZ ZERO IS BLINDNESS, BY CONSTRUCTION
@@ -27479,7 +27479,7 @@ cut deliberately does NOT require the closing `}`, because `{[i32]:i32}[]` and
 `{[i32]:i32}|null` are the same user mistake as `{[i32]:i32}` and get the same actionable
 message. No corpus file exercises that width. Built by hand, both spellings DO reach the
 friendly diagnostic on master and on this branch — so the width protects a **live population with
-no witness**, which is what `tests/cases/maps/error-i32-keyed-not-whole-span.vl` now is.
+no witness**, which is what `tests/cases/maps/error-unsupported-key-not-whole-span.vl` now is.
 
 **P4 / P5 / P7 / P8 / P9 / P10 are measured-empty because the producer is a concatenation.** A
 `{[`-opening name always carries `]:` and always ends `}`; a key never holds a bracket. Each is
