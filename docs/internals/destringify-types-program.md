@@ -31187,3 +31187,151 @@ Every rc taken BARE, never through a pipe.
    family:** an inline shape with a MAP field cannot narrow the nullable index read
    (`emitProgram: bare null needs a struct-typed context`), reproducing identically on master
    `f84fa8b7`.
+
+## D-SPLITDOWN — the census's W13 "single-writing" row held ONE operation written THREE times; the SPLIT home moves to the leaf and all thirteen sites reach it (off master `11de7dfe`)
+
+#1259 read the census's own floor row and found that `emit_base.tyTopLevelSplit`,
+`typecheck.splitTypeName` and `typecheck.splitGenArgs` — three separate entries in a row
+DEFINED as "each is the ONE body for its grammar" — are one operation. It could not route
+them: the home lived in `emit_base.vl`, which imports `typecheck.vl`, so the checker could
+never call it, and the legal down-move to `tyname.vl` needed an edit to a file that slice
+did not hold. It measured the merge with a working spike (**0 diffs × 6 channels, −532 B**,
+with the duplicate body still present) and reverted. This slice takes the move.
+
+### THE EQUIVALENCE, RE-DERIVED PER WRITING — argument for argument
+
+The home is `tyTopLevelSplit(s, sep, dropEmpty, out)`: a resume loop over `tyTopIndexOf`
+that pushes `s.slice(start, end)` for each top-level `sep`, gated by
+`part.length > 0 || !dropEmpty`.
+
+| writing | home call | how they differ | discharge |
+|---|---|---|---|
+| `typecheck.splitGenArgs(s, out)` | `tyTopLevelSplit(s, ',', true, out)` | **nothing** | Statement for statement: same `let end = tyTopIndexOf(s, ',', 0, start)`, same `if end < 0 { end = s.length; going = false }` fall-through, same `const part = s.slice(start, end)`, same `start = end + 1`. Its push gate is `if part.length > 0` and the home's is `part.length > 0 \|\| !dropEmpty`, which at `dropEmpty = true` reduces to it. |
+| `typecheck.splitTypeName(name, sep, out)` | `tyTopLevelSplit(name, sep, false, out)` | the `at < 0` arm is spelled as an inline push instead of an assignment + fall-through | Case analysis over the ONE branch, on every input rather than every reachable one. `at < 0`: this pushes `name.slice(start, name.length)` and stops; the home sets `end = s.length`, pushes `s.slice(start, s.length)` and stops — the same slice, the same stop. `at >= 0`: this pushes `name.slice(start, at)` and resumes at `at + 1`; the home pushes `s.slice(start, end)` with `end == at` and resumes at `end + 1`. Its push is UNGUARDED; the home's gate at `dropEmpty = false` is `part.length > 0 \|\| true` — unconditionally true. No input is left. |
+| `emit_base.tyTopLevelSplit` | itself | — | The body MOVES; its four in-file call sites and `emit_classify`'s one are unchanged text, only the import line moves from `./emit_base` to `./tyname`. |
+
+**`emit_base.gaeSplitArgs` was the tell and it STAYS.** It is a one-line delegation
+`tyTopLevelSplit(s, ',', true, out)` — the same reading as the checker's `splitGenArgs`
+COPY, in a different module. A delegation and a copy of the same call, one module apart, is
+exactly the shape a home in the wrong place produces: only one of the two could reach it.
+It keeps its name for the reason `fieldNameOf` and `gaeHeadNameOf` keep theirs — the unit
+this programme homes is the QUESTION, not the arithmetic — and its seven callers are
+untouched.
+
+### THE RESOLVER IS THE SITE CENSUS — thirteen consuming expressions, no others
+
+Delete the import entry in all three modules, rebuild, read the names the compiler prints:
+**13 `undeclared identifier 'tyTopLevelSplit'` errors — `emit_base.vl` 4, `typecheck.vl` 8,
+`emit_classify.vl` 1.** That is the whole consumer set, and it matches the hand census
+exactly. (`emit_base`'s four are `gaeSplitArgs`, `shapeInnerFieldSplit`, `annSplitParams`,
+`annSplitPipe`; the checker's eight are the union / intersection / param-list arms of
+`nameToTyReal`, the generic-application re-render, the canon pass's union and param splits,
+and the two generic-argument splits.)
+
+### THE MOVE IS LEGAL FOR THE SAME REASON THE OTHER FIVE WERE
+
+`tyTopLevelSplit`'s body depends on exactly one thing, `tyTopIndexOf`, which has been in
+`tyname.vl` since D-TYNAMEHOME phase 0. `tyname.vl` still has **zero imports** after the
+move (verified before and after). The route is the one D-PARENDOWN / D-ARRDOWN /
+D-BRACEDOWN / D-GENAPPDOWN / D-MAPOPENDOWN each took; what was new here is that the
+BLOCKER #1259 recorded — `emit_classify.vl` importing the home from `emit_base.vl` — is a
+one-line import re-point, not a republication, so the `export … from "./tyname"` hop #1236
+deleted stays deleted.
+
+### MEASUREMENT
+
+| instrument | reading |
+|---|---|
+| bytes vs `base77.wasm` (master `11de7dfe`, 1,045,129 B) | **1,044,170 B — −959** |
+| corpus A/B (1,575 files × 6 channels) | **0 / 0 / 0 / 0 / 0 / 0** |
+| frozen-source rebuild (master's `compiler/*.vl` compiled by THIS branch's compiler) | byte-identical, 1,045,129 B |
+
+**THE SPIKE'S −532 AND THE MOVE'S −959 ARE THE SAME NUMBER PLUS ONE FUNCTION BODY.** The
+spike copied `tyTopLevelSplit`'s body into `typecheck.vl` and deleted the two writings,
+leaving `emit_base`'s original in place — net −1 body. The move RELOCATES, so it is net −2
+bodies for the same call-site delta. The difference, 427 B, is one body of this shape, and
+it sits above W14's −164 B/fn for the same reason W14's own prediction failed: the figure
+scales with what the FUNCTION is, and this one is a 14-line resume loop where W14's was a
+two-line cut.
+
+### CALIBRATION — and the frozen rebuild is measured BLIND to this family, with a one-grep mechanism
+
+Three sabotages, built by the seed from the candidate source and read against `base77`:
+
+| sabotage | shape | set | CHECKRC | CHECKMSG | BUILDRC | BUILDMSG | BYTES | RUN | frozen rebuild |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| **S1** `tyTopLevelSplit`'s `tyTopIndexOf` replaced by a depth-BLIND first-occurrence scan | HOME BODY | all 13 sites, 3 modules | 0 | 0 | **64** | **67** | **3** | **64** | **byte-identical** |
+| **S2** `dropEmpty` flipped `false` → `true` at all 8 checker sites | SITE ARGUMENT | checker half | 0 | 0 | 0 | 0 | 0 | 0 | not run |
+| **S3** `annSplitPipe`'s separator `'\|'` → `','` | SITE ARGUMENT | 1 site, emitter half | 0 | 0 | **53** | **55** | **1** | **53** | **byte-identical** |
+
+1. **THE TWO LIVE SABOTAGES PARTITION THE ROUTED SET AND LIGHT THE SAME FOUR CHANNELS**,
+   differing 1.2× in magnitude — a third confirmation of #1259's finding 3 that
+   "disjointness is a property of where the poisoned code sits, not of partitioning the
+   set". Neither moves a CHECK channel, even though S1 poisons a body the checker calls at
+   eight sites: #1259's finding 4 (the channels split by where the ANSWER is consumed) is
+   reproduced from the other direction, on a body that lives BELOW the checker.
+2. **THE FROZEN-SOURCE REBUILD IS BLIND TO THIS FAMILY, AND THE REASON IS ONE GREP.** A
+   compiler whose top-level split ignores brackets entirely still compiles master's frozen
+   `compiler/*.vl` to a byte-identical 1,045,129 B. The compiler's own source never spells
+   a separator inside a bracket group in a type position: all 11 `X<…>` spellings in
+   `compiler/*.vl` are inside COMMENTS, and
+   `grep -nE ': *\{[^}]*,[^}]*\}| \([a-z0-9]+ *, *[a-z0-9]+\) *=>' compiler/*.vl` returns
+   **nothing**. Every composite annotation the compiler writes about itself is
+   `{[string]: T}`, `T[]` or a bare name — none of which has a top-level separator to
+   mis-split. The brief's question ("verify which instrument is live rather than assuming")
+   has a measured answer: **the corpus A/B carries the whole burden for the SPLIT family;
+   the frozen rebuild is a null instrument here**, exactly as it was for the families #1256
+   pointed it at.
+3. **S2 IS A NULL SABOTAGE, AND THAT IS A FINDING ABOUT THE EQUIVALENCE, NOT ABOUT THE
+   INSTRUMENT.** Flipping `dropEmpty` at all eight of the checker's newly-routed sites
+   produces a compiler that DIFFERS IN BYTES from the candidate (first difference at offset
+   228,676) and yet reads **0 diffs on all six channels over 1,575 files**. The `dropEmpty`
+   axis — the one behavioural axis the `splitTypeName` → `tyTopLevelSplit` routing has to
+   get right — is UNOBSERVABLE on the corpus at every one of those sites, which corroborates
+   #1259's own S2 ("always drops empty parts — 0 of 1,326, INERT BY CONSTRUCTION") from the
+   argument side rather than the body side. **So the corpus's 0/6 is not what discharges
+   that axis; the case analysis in the table above is.** Recorded because the inverse error
+   — reading a 0 as evidence for a claim the instrument cannot see — is the one this
+   programme keeps having to correct.
+
+### GATE
+
+Every rc taken BARE, never through a pipe.
+
+| gate | rc | reading |
+|---|---:|---|
+| `rm -f build/vl-compiler.wasm && bash scripts/fetch-seed.sh` | 0 | 1,045,129 B, sha256 `915f4ed1…` — `cmp`s EQUAL to the brief's `base77.wasm`, so that artifact IS master `11de7dfe` |
+| `scripts/refresh-compiler.sh --prove-fixpoint` (baseline) | 0 | seed IS the fixpoint (1 compile), 1,045,129 B |
+| `scripts/refresh-compiler.sh --prove-fixpoint` (candidate) | 0 | fixpoint at the 2-compile rung, **1,044,170 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4, 1,044,170 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3318 / 0 / 8** — master's own reading, unchanged (this slice adds no fixture) |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined failure, 0 new, 0 stale |
+| corpus A/B | 0 | 1,575 files, 0 diffs × 6 channels, calibrated by S1 + S3 |
+| frozen-source rebuild | 0 | byte-identical — and measured BLIND to both live sabotages |
+
+### PHASE 2 (`splitUnionAtoms` / `unionMemberCount`) — DECLINED, and the cause is the PARTITION, not the code
+
+The tyname header lists these two as "the obvious phase-2 candidates". Re-derived here:
+
+* **They are legal.** Both bodies call exactly one thing, `tyTopIndexOf`, which is already
+  in the leaf. Both are pure functions of a string. The two reasons that header gives for
+  their staying are **refuted by this slice**: "they are SPLITTERS that materialise atoms,
+  not endpoint tests / spans / cuts" — `tyTopLevelSplit` is a splitter that materialises
+  parts, and it just moved; "no D-\* slice ever homed them as part of this family" — this
+  IS the D-\* slice that homes splitters. The hot-path objection ("~168 K corpus
+  invocations across a module boundary") does not survive either: `tyTopIndexOf`, which
+  every one of those invocations already calls, has been across that boundary since phase 0.
+* **The blocker is arithmetic, not architectural.** Five modules import them FROM
+  `typecheck.vl` — `emit_base.vl:26/27`, `emit_rep.vl:106`, `wasmEmit.vl:24`,
+  `emit_collect.vl:61/65`, `emit_classify.vl:100/106`. Three of the five (`emit_rep.vl`,
+  `wasmEmit.vl`, `emit_collect.vl`) are outside this slice's partition, and all three
+  already import `tyname.vl`, so the whole remaining move is **six import lines in three
+  files plus the two bodies**. It needs no new republication hop and no behaviour argument.
+
+**FILED, sized, and unblocked for the next slice that holds those three files.** Declining
+it here is a partition decision with a line-numbered cost, not a risk judgement about the
+code. Note also that these two are NOT the same operation as `tyTopLevelSplit` and could
+not have ridden it even if the partition allowed: they pass a SECOND target character to
+`tyTopIndexOf` (`'='`) and stop the split on it, an arrow STOP the home has no parameter
+for. The phase-2 move is a RELOCATION of two distinct bodies, not a further merge.
