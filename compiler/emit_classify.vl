@@ -1871,50 +1871,41 @@ function criRetLocalLet(rx: i32, i: i32) {
   -1
 }
 
-// The `LetDecl` arena index of the module GLOBAL that function `fe`'s IMPLICIT RETURN
-// assigns to, or -1. That is: `fe` is un-annotated, and its body's LAST statement is
-// `<globalName> = <rhs>` — the shape `emitBinExprNode` lowers as an assignment-as-
-// expression and the trailing-expression rule then makes the function's result.
+// The IDENT NAME that function `fe`'s IMPLICIT RETURN assigns to, or "". That is: `fe` is
+// un-annotated, and its body's LAST statement is `<name> = <rhs>` — the shape
+// `emitBinExprNode` lowers as an assignment-as-expression and the trailing-expression rule
+// then makes the function's result. WHICH CELL that name denotes is the storage-class
+// dispatch in `fnAssignRetKind` below; this is the one place that decides which assignment
+// is the implicit return, so the kind and its payload columns can never disagree about it.
 //
 // WHY THE TARGET AND NOT THE RHS. `emitBinExprNode`'s `=` arm (`wasmEmit.vl`) lowers an
 // assignment-as-expression as STORE-then-RE-READ: `emitAssign` stores, then the TARGET
 // is re-read through the normal Ident path. The value left on the stack is therefore the
-// TARGET CELL's rep — the RHS *coerced to the target's declared type* — and
-// `globalCellKind` is the very resolver that decides that cell's valtype in the global
-// section, so this answer cannot drift from the cell. The read side agrees by
-// construction too: `emitIdentNode`'s global arm keys on `globalCellKind`.
+// TARGET CELL's rep — the RHS *coerced to the target's declared type*.
 //
 // The RHS answer that used to be taken here is only ever right by COINCIDENCE: `g = "x"`
 // into a `string` cell needs no coercion, so the RHS's `"str"` IS the cell's kind. It
-// goes wrong exactly when `emitAssign` COERCES — an i32 literal widened into an `i64`
-// cell, a member literal interned into a literal-union cell's i32 atom, a value stored
-// into a NULLABLE cell — and every one of those was INVALID WASM on a program `vl check`
-// accepts, rc 0. Measured over a 504-cell matrix (41 target cell kinds × global/local ×
-// 7 statement shapes): 100 cells improved, 0 regressed, no cell left a TRAP.
-//
-// GLOBAL TARGETS ONLY, and the boundary is a MISSING RESOLVER, not a judgement. A LOCAL
-// target's cell kind is decided by `collectLocals` (`emit_collect.vl`), a ladder this
-// pass cannot reach — it runs per function at EMIT time, long after
-// `computeRetInference`, and `emit_classify` cannot import `emit_collect` (the module
-// graph already runs the other way; the loader rejects the cycle). `globalCellKind`
-// below is the same ladder in this file's storage class and would generalize over an
-// `fnIx`, but making it the local answer needs the two ladders proved equal first —
-// they are near-parallel, not identical. Until then the coercing LOCAL cells keep the
-// RHS answer and stay invalid wasm (~50 cells of the matrix), unchanged from master.
+// goes wrong when `emitAssign` COERCES — an i32 literal widened into an `i64` cell, a
+// member literal interned into a literal-union cell's i32 atom, a value stored into a
+// NULLABLE cell — and ALSO when the RHS's own classifier answer is merely WEAKER than the
+// cell's: an empty `[]` classifies as the DEFAULT i32 list whatever list cell it is stored
+// into. Every one of those was INVALID WASM on a program `vl check` accepts, rc 0.
 //
 // THE OTHER SIDE OF THE DISAGREEMENT IS FILED, NOT FIXED. The CHECKER types `x = e` as
 // `e`'s own type UN-coerced — `let g: i64 = 0; function c() { g = 7 }` has `const r =
 // c()` inferred `i32`, and `g: string | null; g = null` inferred `null` — while both the
-// lowering and now the functype use the target's coerced type. The two differ only where
-// the value is CONSUMED, and consuming it is what `vl check` will mis-type; the fix is in
-// `typecheck.vl`'s assignment-expression typing, outside this partition.
-function fnAssignRetTargetLet(fe: i32) {
-  if fe < 0 || fe >= fnStmts.length { return -1 }
+// lowering and the functype use the target's coerced type. The two differ only where the
+// value is CONSUMED, and consuming it is what `vl check` will mis-type; the fix is in
+// `typecheck.vl`'s assignment-expression typing, outside this partition. Measured at
+// `4411fbf3`: `let g: K = "a"; function f() { g = "b" }` is clean as `f()` and INVALID
+// WASM as `print(f())`, on the GLOBAL target #1235 already fixed.
+function fnAssignRetTargetName(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return "" }
   const fn = P.nodes[fnStmts[fe]]
   if fn is FuncDecl {
     // An ANNOTATED return already drives the functype from its annotation (and the
     // annotated spellings of every cell below run today) — leave it alone.
-    if fn.fnRet >= 0 { return -1 }
+    if fn.fnRet >= 0 { return "" }
     const b = P.nodes[fn.fnBody]
     if b is Block {
       const st = b.blkStmts
@@ -1925,62 +1916,199 @@ function fnAssignRetTargetLet(fe: i32) {
         let tailx = st[st.length - 1]
         const ts = P.nodes[tailx]
         if ts is RetStmt {
-          if ts.retArg < 0 { return -1 }
+          if ts.retArg < 0 { return "" }
           tailx = ts.retArg
         }
         const a = P.nodes[unwrapParen(tailx)]
         if a is BinExpr {
           if a.binOp == "=" {
             const t = P.nodes[unwrapParen(a.binLeft)]
-            if t is Ident { return globalLetOf(t.identName) }
+            if t is Ident { return t.identName }
           }
         }
       }
     }
   }
+  ""
+}
+
+// The `Param` node of function `fnIx` named `name`, or -1. The eleventh hand-copy of this
+// scan in this file; the other ten each inline it inside a bigger predicate.
+function fnParamNodeOf(fnIx: i32, name: string) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const ps = fn.fnParams
+    let i = 0
+    while i < ps.length {
+      const p = P.nodes[ps[i]]
+      if p is Param {
+        if p.parName == name { return ps[i] }
+      }
+      i = i + 1
+    }
+  }
   -1
 }
 
-// The authoritative result `VKind` of function `fe` when its implicit return is an
-// assignment to a module global (`fnAssignRetTargetLet`), else `null` — `null` meaning
-// "no answer, leave every classifier exactly as it was".
+// The `fbValtype` kind an UN-ANNOTATED binding's INITIALIZER decides, classified through the
+// same per-`let` predicates `collectLocals` types the binding with, in the same order —
+// the ONE home of that ladder, shared by the captured-variable resolver
+// (`captureValKind`) and the implicit-return assignment target (`letCellKind`). `"i32"`
+// when no arm claims it, which is also the ladder's own trailing default.
+function letInitCellKind(letIx: i32, fnIx: i32): VKind {
+  if letIsMap(letIx, fnIx) { return "map" }
+  if letIsNulRef(letIx, fnIx) { return "nulstruct" }
+  // A value union wins over a scalar-list INIT (`f64[] | string = [1.5]`) — see the
+  // local-decl chain. Checked before the scalar-list cases for that reason.
+  if letIsUnion(letIx, fnIx) { return "union" }
+  if letIsStringArray(letIx, fnIx) { return "strlist" }
+  if letIsF32Array(letIx, fnIx) { return "f32list" }
+  if letIsF64Array(letIx, fnIx) { return "f64list" }
+  if letIsI64Array(letIx, fnIx) { return "i64list" }
+  if letIsRefArray(letIx, fnIx) { return "reflist" }
+  if letIsStruct(letIx, fnIx) { return "struct" }
+  if letIsArray(letIx, fnIx) { return "list" }
+  if letIsString(letIx, fnIx) { return "str" }
+  if letIsI64(letIx, fnIx) { return "i64" }
+  if letIsF32(letIx) || letInfersF32(letIx, fnIx) { return "f32" }
+  if letIsF64(letIx, fnIx) { return "f64" }
+  if letIsClosure(letIx, fnIx) { return "closure" }
+  "i32"
+}
+
+// The `fbValtype` kind of the CELL a `LetDecl` binds inside function `fnIx` — its
+// ANNOTATION's kind through the shared annotation ladder, else the initializer's
+// (`letInitCellKind`). The LOCAL storage class's answer to the question `globalCellKind`
+// answers for a module global, in `emit_classify`'s own storage class, so the
+// implicit-return classifier can reach it (`collectLocals`, the emitter's own local
+// ladder, lives in `emit_collect.vl`, which this file cannot import — the module graph
+// already runs the other way and the loader rejects the cycle).
+function letCellKind(letIx: i32, fnIx: i32): VKind {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return vtKindOfType(d.letType) }
+    if d.letInit >= 0 { return letInitCellKind(letIx, fnIx) }
+  }
+  "i32"
+}
+
+// The kinds an implicit-return assignment DECLINES to name, whatever storage class the
+// target cell lives in — `null` meaning "no answer, leave every classifier exactly as it
+// was". Each declines because naming it makes the outcome WORSE than what it replaces:
 //
-// TWO CELL KINDS DELIBERATELY DECLINE, each because naming them makes the outcome WORSE
-// than the reject they replace:
-//
-//   `nulstr` — a `string | null` GLOBAL does not read back as its cell. `emitIdentNode`'s
+//   `nulstr` — a `string | null` cell does not read back as its cell. `emitIdentNode`'s
 //     kind-16 arm applies `ref.as_non_null` UNCONDITIONALLY (the "`string | null` READ
 //     RULE", stated at `emitMem`'s field read), so the re-read pushes `(ref $array)` over
 //     a cell that may hold null. Answering `"nulstr"` makes the module VALID and it then
 //     TRAPS (`wasm trap: null reference`) on `g = null`; answering `"str"` is the same
 //     trap. A trap is worse than a reject, so this stays the loud invalid-wasm reject it
-//     is on master. THE ROOT IS THE UNCONDITIONAL RECOVER IN `wasmEmit.emitIdentNode`
-//     (~12740), not here — a store-then-re-read cannot be sound while the re-read
-//     force-recovers non-null.
+//     is on master, at ALL THREE storage classes. THE ROOT IS THE UNCONDITIONAL RECOVER IN
+//     `wasmEmit.emitIdentNode` (~12740), not here — a store-then-re-read cannot be sound
+//     while the re-read force-recovers non-null.
 //
 //   `closure` / `nulclosure` — `fnReturnsClosure` already owns the closure result at both
 //     functype producers, ahead of every kind this could supply; naming it here would only
 //     race that owner.
-function fnAssignRetKind(fe: i32): VKind | null {
-  const li = fnAssignRetTargetLet(fe)
-  if li < 0 { return null }
-  const k = globalCellKind(li)
+//
+//   `map` / `nulmap` / `variant` — `emit_sections`' INFERRED-return arm resolves an
+//     `infSlot` for `struct` / `nulstruct` / `reflist` / `map` only, and its `map` arm
+//     reads the SHAPE off the return EXPRESSION (`mapRetExprShape` over `fnRetExprOf`),
+//     which for this shape is the assignment node, not a map expression. A named kind
+//     whose companion slot cannot be minted from the same binding would declare a result
+//     valtype over the wrong heap type; `null` keeps the master outcome instead.
+//     (`nulreflist` is NOT in this list on purpose: `emit_sections` rejects it at
+//     `fbValtype` with a loud emit error, which is strictly better than invalid wasm —
+//     the outcome `tests/cases/functions/tail-assign-nullable-reflist-reject.vl` pins.)
+function fnAssignKindGuard(k: VKind): VKind | null {
   if k == "nulstr" { return null }
   if k == "closure" || k == "nulclosure" { return null }
+  if k == "map" || k == "nulmap" || k == "variant" { return null }
   k
 }
 
+// The authoritative result `VKind` of function `fe` when its implicit return is an
+// ASSIGNMENT, else `null`. Dispatched over the target's STORAGE CLASS in the order the
+// emitter resolves an assignment target — a body `let`, then a parameter, then a module
+// global — so a binding SHADOWING a same-named global answers for the cell that is
+// actually stored into. Each class asks the resolver that decides that cell's own valtype:
+// `letCellKind` for a local (the mirror of `collectLocals`), `vtKindOfParam` for a
+// parameter (the very function `emitTypeSection` writes the param valtype with), and
+// `globalCellKind` for a global (the very function the global section writes the cell
+// with) — so this answer cannot drift from the cell at any of the three.
+//
+// #1235 gave the GLOBAL class its cell; this is the LOCAL/PARAM half. Its filing said the
+// local answer "needs the two ladders proved equal first"; the proof is that the two
+// ladders now have ONE ANNOTATED HOME (`vtKindOfType`, which `collectLocals`' annotation
+// arms and this one both ride) and ONE UN-ANNOTATED HOME (`letInitCellKind`), plus the
+// per-kind DECLINES in `fnAssignKindGuard` for every kind whose payload column
+// `emit_sections` cannot mint from the same binding.
+function fnAssignRetKind(fe: i32): VKind | null {
+  const nm = fnAssignRetTargetName(fe)
+  if nm == "" { return null }
+  const fnIx = fnStmts[fe]
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const li = parentLetOf(fn.fnBody, nm)
+    if li >= 0 { return fnAssignKindGuard(letCellKind(li, fnIx)) }
+    const pi = fnParamNodeOf(fnIx, nm)
+    if pi >= 0 { return fnAssignKindGuard(vtKindOfParam(pi)) }
+  }
+  const gi = globalLetOf(nm)
+  if gi < 0 { return null }
+  fnAssignKindGuard(globalCellKind(gi))
+}
+
 // The result-valtype SLOT that goes beside `fnAssignRetKind`'s answer — the struct table
-// index for a struct / nullable-struct cell, the ref-list slot for a ref-list cell, -1 for
-// every kind that needs none. Read from the SAME cell the kind came from, so the two can
-// never be minted from different facts.
+// index for a struct / nullable-struct cell, the ref-list wrapper slot for a ref-list cell,
+// -1 for every kind that needs none. GATED ON THE KIND, and read from the SAME binding the
+// kind came from, so the two can never be minted from different facts and no non-struct
+// cell is asked for a struct index it would answer wrongly.
+//
+// BOTH ARMS ARE LOAD-BEARING and the ref-list one is reached only through the CLOSURE
+// producer: `criClassify` consults this for `struct` / `nulstruct` and fills
+// `fRetRArrElem` for `reflist` separately, but `cloRetValSlot` routes the WHOLE
+// assignment-cell answer here — so dropping the ref-list arm turns a `$fnsig` result
+// suffix into "" and rejects an otherwise-fine `const h = () => { v = [{n: 3}] }` over an
+// `S[]` local. (Measured: exactly 2 cells of the 652-cell grid, both `lamlocal`.)
 function fnAssignRetSlot(fe: i32) {
-  const li = fnAssignRetTargetLet(fe)
-  if li < 0 { return -1 }
-  const k = globalCellKind(li)
-  if k == "struct" || k == "nulstruct" { return globalCellStructIdx(li) }
-  if k == "reflist" { return rlSlotByName(letRefListElemName(li, -1)) }
-  -1
+  const k = fnAssignRetKind(fe)
+  if k == null { return -1 }
+  if k == "reflist" { return rlSlotByName(fnAssignRetElemName(fe)) }
+  if k != "struct" && k != "nulstruct" { return -1 }
+  const nm = fnAssignRetTargetName(fe)
+  const fnIx = fnStmts[fe]
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const li = parentLetOf(fn.fnBody, nm)
+    if li >= 0 { return structIndexOfLet(li, fnIx) }
+    const pi = fnParamNodeOf(fnIx, nm)
+    if pi >= 0 { return paramStructIdxOf(pi) }
+  }
+  const gi = globalLetOf(nm)
+  if gi < 0 { return -1 }
+  globalCellStructIdx(gi)
+}
+
+// The ref-list ELEMENT TYPE-NAME beside `fnAssignRetKind`'s `reflist` answer — the column
+// `emit_sections`' inferred-return arm turns into the result's wrapper slot
+// (`rlSlotByName`). Same binding, same three storage classes, same order.
+function fnAssignRetElemName(fe: i32) {
+  const nm = fnAssignRetTargetName(fe)
+  if nm == "" { return "" }
+  const fnIx = fnStmts[fe]
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const li = parentLetOf(fn.fnBody, nm)
+    if li >= 0 { return letRefListElemName(li, fnIx) }
+    const pi = fnParamNodeOf(fnIx, nm)
+    if pi >= 0 {
+      const p = P.nodes[pi]
+      if p is Param { return refArrElemNameIf(tyNameOf(p.parType)) }
+    }
+  }
+  const gi = globalLetOf(nm)
+  if gi < 0 { return "" }
+  letRefListElemName(gi, -1)
 }
 
 // Classify ONE valued return expression at `rx0` of the function at `fnStmts`
@@ -2008,7 +2136,7 @@ export function criClassify(rx0: i32, i: i32) {
     }
     if ark == "reflist" {
       if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
-        fRetRArrElem[i] = letRefListElemName(fnAssignRetTargetLet(i), -1)
+        fRetRArrElem[i] = fnAssignRetElemName(i)
       }
     }
     return 0
@@ -2692,26 +2820,17 @@ export function captureValKind(fe: i32, name: string): VKind {
     // `collectLocals` types the binding with (resolved in the OWNING frame), so
     // a captured list/string/struct env field carries its real ref valtype —
     // `const store = [a, b]` captured by a closure is the i32-list wrapper ref
-    // (kind 2), not an i32 cell. Order mirrors `collectLocals`.
+    // (kind 2), not an i32 cell. Order mirrors `collectLocals`; the ladder itself
+    // is `letInitCellKind`, shared with the implicit-return assignment target.
+    //
+    // `pf` IS AN `fnStmts` POSITION, and the `letIs*` family's second argument is an
+    // ARENA index (each one indexes `P.nodes[fnIx]` / forwards it to `exprIs*`). Kept
+    // exactly as master passes it — the two number spaces coincide only at the small
+    // indices, so the frame-dependent arms of the ladder read a non-`FuncDecl` node and
+    // decline; every capture the corpus has resolves through an arm that does not need
+    // the frame. Changing it here would move bytes, so it is FILED, not fixed.
     if bn.letInit >= 0 {
-      const pf = parentBindingFrameOf(fe, name)
-      if letIsMap(b, pf) { return "map" }
-      if letIsNulRef(b, pf) { return "nulstruct" }
-      // A value union wins over a scalar-list INIT (`f64[] | string = [1.5]`) — see the
-      // local-decl chain. Checked before the scalar-list cases for that reason.
-      if letIsUnion(b, pf) { return "union" }
-      if letIsStringArray(b, pf) { return "strlist" }
-      if letIsF32Array(b, pf) { return "f32list" }
-      if letIsF64Array(b, pf) { return "f64list" }
-      if letIsI64Array(b, pf) { return "i64list" }
-      if letIsRefArray(b, pf) { return "reflist" }
-      if letIsStruct(b, pf) { return "struct" }
-      if letIsArray(b, pf) { return "list" }
-      if letIsString(b, pf) { return "str" }
-      if letIsI64(b, pf) { return "i64" }
-      if letIsF32(b) || letInfersF32(b, pf) { return "f32" }
-      if letIsF64(b, pf) { return "f64" }
-      if letIsClosure(b, pf) { return "closure" }
+      return letInitCellKind(b, parentBindingFrameOf(fe, name))
     }
   }
   "i32"
