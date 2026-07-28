@@ -37,9 +37,10 @@
 //
 // PERFORMANCE. Every access below is a real wasm `call`; `wasm-opt -O` (what
 // `vl build -O` runs) does NOT inline these wrappers, `-O3 --closed-world`
-// does (§O1). `store8` / `store16` are read-modify-write emulations and `fill` /
-// `copyFrom` are byte loops — see their headers for the instructions that will
-// replace them.
+// does (§O1). Every body is now ONE instruction plus its address arithmetic —
+// `store8`/`store16` were read-modify-write emulations and `fill`/`copyFrom`
+// were byte loops until the narrow-store and bulk intrinsics landed, and the
+// swap changed no signature and no expectation.
 
 // A `Buf` is a linear-memory extent: the byte address of its first byte, and
 // the number of bytes the caller ASKED for (the allocator may reserve a few
@@ -221,67 +222,54 @@ export function storeF64(self: Buf, off: i32, v: f64) {
   __store_f64__(self.base + off, v)
 }
 
-// Write the low byte of `v` at byte address `addr`, by READ-MODIFY-WRITE over
-// the containing 32-bit word: linear memory is little-endian, so the byte at
-// `addr` occupies bits [8*lane, 8*lane+8) of the word at `addr - lane`.
-//
-// TEMPORARY. `i32.store8` (0x3a) is one instruction; it is not reachable from
-// VL because `__store_i8__` is not declared — S3's unshipped half. When it
-// lands, this whole function collapses to `__store_i8__(addr, v)`.
-//
-// Two properties this emulation preserves, and one it does not:
-//   - it traps exactly where the real instruction would. A memory's size is a
-//     multiple of 4, so the word containing an in-bounds byte is itself wholly
-//     in bounds, and the word containing an out-of-bounds byte is not.
-//   - it is safe under overlap and aliasing in a single-threaded program: the
-//     other three bytes are read and written back unchanged in the same
-//     expression, so anything sharing the word sees no change. (And nothing in
-//     ANOTHER `Buf` shares the word anyway — POLICY 2's 8-byte rounding puts
-//     every allocation in its own pair of words.)
-//   - what it does NOT preserve is the access WIDTH: this touches 4 bytes where
-//     the instruction touches 1. Nothing in VL can observe that today (no
-//     threads, no shared memory), which is why the emulation is admissible.
-function poke8(addr: i32, v: i32) {
-  const lane = addr & 3
-  const wordAddr = addr - lane
-  const shift = lane * 8
-  const old = __load_i32__(wordAddr)
-  const keep = old & ~(255 << shift)
-  __store_i32__(wordAddr, keep | ((v & 255) << shift))
-}
-
 // The low 8 bits of `v` at `off`. Higher bits are discarded, exactly as
-// `i32.store8` would discard them.
-export function store8(self: Buf, off: i32, v: i32) {
-  poke8(self.base + off, v)
-}
-
-// The low 16 bits of `v` at `off`, little-endian. Written as two byte stores
-// rather than one word-level read-modify-write because a halfword at an address
-// congruent to 3 mod 4 STRADDLES two words; going byte at a time is correct at
-// every alignment, straddling included. Replaced by `i32.store16` (0x3b) when
-// `__store_i16__` is declared.
-export function store16(self: Buf, off: i32, v: i32) {
-  const addr = self.base + off
-  poke8(addr, v)
-  poke8(addr + 1, v >> 8)
-}
-
-// ── Bulk ops: correct now, one instruction later (S6). ──
-
-// Set `len` bytes starting at `off` to the low 8 bits of `byte`.
+// `i32.store8` discards them — because this IS `i32.store8` (0x3a).
 //
-// TEMPORARY: `memory.fill` (0xfc 11) is one instruction, and needs the
-// emitter's first `0xfc` byte-writer — sequencing item S6. This byte loop is
-// its stand-in: same result, one `call` plus a read-modify-write per byte.
-// A non-positive `len` writes nothing.
+// This body used to be a READ-MODIFY-WRITE over the containing 32-bit word, and
+// its whole expectation set survived the swap unchanged, which is the evidence
+// that the emulation was faithful. What the emulation could not preserve was the
+// access WIDTH — it touched 4 bytes where the instruction touches 1 — and that
+// difference was unobservable from VL (no threads, no shared memory) but NOT
+// from the host: `tests/vl_exported_memory_test.ts` reads the untouched
+// neighbours through the exported memory, which is the assertion the emulation
+// would have failed.
+export function store8(self: Buf, off: i32, v: i32) {
+  __store_i8__(self.base + off, v)
+}
+
+// The low 16 bits of `v` at `off`, little-endian — `i32.store16` (0x3b).
+//
+// This was two byte-wide read-modify-writes rather than one word-level one,
+// because a halfword at an address congruent to 3 mod 4 STRADDLES two words. The
+// instruction has no such difficulty: wasm's alignment immediate is a hint, and
+// a 16-bit store is legal and correct at every address, straddle included.
+export function store16(self: Buf, off: i32, v: i32) {
+  __store_i16__(self.base + off, v)
+}
+
+// ── Bulk ops: one instruction each. ──
+//
+// THE ONE PLACE THIS MODULE DOES NOT PASS ITS ARGUMENT STRAIGHT THROUGH. Both
+// instructions take an UNSIGNED byte count, and VL has no unsigned i32, so a
+// negative `len` is ~4 GiB and traps in the engine. The byte loops these bodies
+// replaced treated a non-positive `len` as "write nothing", and that behaviour
+// is pinned (`tests/cases/std/buffer-bulk.vl`), so the guard stays. Which is the
+// right layering anyway: the intrinsic IS the instruction (`__memory_fill__`
+// traps on -5, pinned by `tests/cases/memory/bulk-negative-length-traps.vl`),
+// and softening it is POLICY, which is std's job (O1 = (c)).
+//
+// Nothing else is guarded. There is still no per-access bounds check — a range
+// that leaves the memory traps in the engine, and a range that leaves the `Buf`
+// but stays inside the memory is not caught, exactly as for every load and store
+// above. `Buf` describes an extent; it does not fence it.
+
+// Set `len` bytes starting at `off` to the low 8 bits of `byte` — `memory.fill`
+// (0xfc 11). A non-positive `len` writes nothing.
+// (Spelled as a positive `if` rather than an early `return`: a BARE `return` in a
+// void function type-checks and then fails at emit — `emitProgram: bare return is
+// not supported`. Worth knowing before reaching for a guard clause here.)
 export function fill(self: Buf, off: i32, len: i32, byte: i32) {
-  const addr = self.base + off
-  let i = 0
-  while i < len {
-    poke8(addr + i, byte)
-    i = i + 1
-  }
+  if len > 0 { __memory_fill__(self.base + off, byte, len) }
 }
 
 // Copy `len` bytes from `src` at `srcOff` into `self` at `dstOff` — the
@@ -289,14 +277,18 @@ export function fill(self: Buf, off: i32, len: i32, byte: i32) {
 // self-first UFCS shape `std:array` / `std:fmt` already establish. (`Buffer.copy`
 // is not spellable: VL has no static methods.)
 //
-// OVERLAP IS HANDLED. `memory.copy` is defined to behave as if the bytes went
-// through a temporary, so an overlapping copy must not read a byte it has
-// already overwritten. A naive forward loop is wrong exactly when the
-// destination is ABOVE the source and the ranges overlap; the direction is
-// chosen on the absolute addresses to match the instruction's semantics.
-// `self` and `src` may be the same `Buf`.
+// OVERLAP IS HANDLED, and it is now handled by the INSTRUCTION. `memory.copy`
+// (0xfc 10) is defined to behave as if the bytes went through a temporary —
+// memmove semantics, not memcpy — so an overlapping copy never reads a byte it
+// has already overwritten, in either direction. `self` and `src` may be the same
+// `Buf`, and may overlap partially either way.
 //
-// TEMPORARY: replaced by `memory.copy` (0xfc 10) in S6.
+// This body used to CHOOSE its loop direction from the absolute addresses,
+// because a naive forward loop is wrong exactly when the destination is above
+// the source. That choice is gone, not merely optimized: both directions were
+// pinned by value in `buffer-bulk.vl` before the swap and both still pass, which
+// is what makes "the instruction has the semantics the loop was imitating" a
+// measurement rather than a claim about the spec.
 export function copyFrom(
   self: Buf,
   dstOff: i32,
@@ -304,19 +296,5 @@ export function copyFrom(
   srcOff: i32,
   len: i32,
 ) {
-  const dst = self.base + dstOff
-  const from = src.base + srcOff
-  if dst < from {
-    let i = 0
-    while i < len {
-      poke8(dst + i, __load_u8__(from + i))
-      i = i + 1
-    }
-  } else {
-    let i = len - 1
-    while i >= 0 {
-      poke8(dst + i, __load_u8__(from + i))
-      i = i - 1
-    }
-  }
+  if len > 0 { __memory_copy__(self.base + dstOff, src.base + srcOff, len) }
 }

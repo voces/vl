@@ -2267,6 +2267,8 @@ export function initChecker() {
   declare("__store_i64__", mkFuncTy([TY_I32, TY_I64], TY_VOID))
   declare("__store_f32__", mkFuncTy([TY_I32, TY_F32], TY_VOID))
   declare("__store_f64__", mkFuncTy([TY_I32, TY_F64], TY_VOID))
+  declare("__store_i8__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__store_i16__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
   declare("__load_i32__", mkFuncTy([TY_I32], TY_I32))
   declare("__store_string__", mkFuncTy([TY_I32, TY_STR], TY_I32))
   declare("__log_string__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
@@ -2274,6 +2276,8 @@ export function initChecker() {
   declare("__memory_grow__", mkFuncTy([TY_I32], TY_I32))
   const noParams: i32[] = []
   declare("__memory_size__", mkFuncTy(noParams, TY_I32))
+  declare("__memory_copy__", mkFuncTy([TY_I32, TY_I32, TY_I32], TY_VOID))
+  declare("__memory_fill__", mkFuncTy([TY_I32, TY_I32, TY_I32], TY_VOID))
   // THE LOAD-WIDTH MATRIX (webcraft P0.1, `buffer-design.md` §C2). Each VL signature
   // IS the wasm instruction's signature — the same rule P0.3/P0.4's numeric intrinsics
   // follow — so there is nothing to choose here beyond the name:
@@ -2294,6 +2298,17 @@ export function initChecker() {
   //
   // The VALUE operand takes the declared width (an integer literal re-encodes at i64, a
   // float literal at f32/f64) — unlike the ADDRESS, which is an i32 in all fourteen.
+  //
+  // THE NARROW STORE WIDTHS complete §C2's matrix:
+  //
+  //   __store_i8__ → i32.store8 (0x3a)     __store_i16__ → i32.store16 (0x3b)
+  //
+  // Both take an i32 VALUE and TRUNCATE it — there is one instruction per width and it
+  // cannot tell a signed byte from an unsigned one, which is why there is no
+  // `__store_u8__`/`__store_u16__` twin (§O2, ruled). That asymmetry against the loads,
+  // which really do have two instructions each, is the instruction set's and is
+  // deliberate: `__store_i8__(a, 255)` and `__store_i8__(a, -1)` write the same byte,
+  // and `__load_i8__` reads it back as -1 while `__load_u8__` reads 255.
   //
   // `__store_string__` and `__log_string__` stay dead: they are the two names
   // `nameIsUnimplementedIntrinsic` lists, and calling one is a positioned CHECKER
@@ -2347,10 +2362,45 @@ export function nameIsEmitterIntrinsic(name: string) {
   // The load-width matrix and the two memory-size ops, lowered inline the same way —
   // reserved the same DAY they acquired an emitter arm, per this comment's own rule.
   if nameIsMemLoadIntrinsic(name) { return true }
-  // The three WIDE store widths, likewise reserved the day they acquired their arm.
+  // The five other store widths (three wide, two narrow), likewise reserved the day
+  // each acquired its arm.
   if nameIsMemStoreIntrinsic(name) { return true }
   if name == "__memory_size__" { return true }
   if name == "__memory_grow__" { return true }
+  // The bulk pair, reserved the day they acquired their arm.
+  if nameIsMemBulkIntrinsic(name) { return true }
+  false
+}
+
+// THE BULK PAIR (`buffer-design.md` §C3) — the two ops webcraft calls load-bearing
+// rather than convenient, because snapshot and rollback ARE these instructions and
+// without them a snapshot is a per-word loop:
+//
+//   __memory_copy__(dst, src, len)   → memory.copy   (0xfc 10 0x00 0x00)
+//   __memory_fill__(dst, byte, len)  → memory.fill   (0xfc 11 0x00)
+//
+// All six operands are i32 and both results are void, so unlike the store widths there
+// is no width dispatch: every operand takes the ordinary `emitMemIntrinArg` spine.
+//
+// TWO SEMANTICS THE SIGNATURE DOES NOT SHOW, both of them the instruction's and
+// therefore not this layer's to soften (the VL signature IS the wasm signature, the
+// same rule the load matrix and P0.3/P0.4's numeric intrinsics follow):
+//
+//   - `len` is UNSIGNED. A negative length is ~4 GiB and traps. A caller that wants
+//     "a non-positive length writes nothing" must say so itself — `std:buffer`'s
+//     `fill`/`copyFrom` do, because that is POLICY and policy is std's (O1 = (c)).
+//   - `memory.copy` is defined to behave as if the bytes went through a temporary, so
+//     it is OVERLAP-SAFE IN BOTH DIRECTIONS — memmove, not memcpy. That is a property
+//     of the instruction, which is exactly why it is worth reaching: the `std:buffer`
+//     loop it replaces had to choose its direction from the addresses by hand.
+//
+// Neither needs an import and neither needs a data segment: these are the `memory.init`
+// family's siblings, but only the two that operate on already-mapped bytes. What they
+// DO need is the `0xfc` misc prefix, which this emitter had no writer for until they
+// landed — see `fbMemBulk`.
+export function nameIsMemBulkIntrinsic(name: string) {
+  if name == "__memory_copy__" { return true }
+  if name == "__memory_fill__" { return true }
   false
 }
 
@@ -2369,15 +2419,17 @@ export function nameIsMemLoadIntrinsic(name: string) {
   false
 }
 
-// The three WIDE store widths — the exact duals of `__load_i64__`/`__load_f32__`/
-// `__load_f64__`. `__store_i32__` predates them and keeps its own arm at every call
-// site, so it is deliberately NOT in this set, exactly as `__load_i32__` is not in
-// `nameIsMemLoadIntrinsic`.
+// The five store widths that are not `__store_i32__` — the three WIDE ones (the exact
+// duals of `__load_i64__`/`__load_f32__`/`__load_f64__`) and the two NARROW ones that
+// complete §C2's matrix. `__store_i32__` predates them all and keeps its own arm at
+// every call site, so it is deliberately NOT in this set, exactly as `__load_i32__` is
+// not in `nameIsMemLoadIntrinsic`.
 //
-// The narrow stores (`i32.store8` / `i32.store16`) are NOT here: `buffer-design.md`
-// §C2 spells them `store8`/`store16` because a store has no signedness, and no
-// `__store_i8__`/`__store_i16__` name is declared to lower. That is a naming decision
-// (§O2) this change does not take.
+// The narrow pair has no signed/unsigned split because there is one instruction per
+// width and it truncates (§O2, ruled `store8`/`store16` at the `std:buffer` surface).
+// They differ from the wide three in exactly one respect the emitter must honour: their
+// VALUE operand is an i32, so it takes the ordinary `emitMemIntrinArg` spine rather
+// than an `emitExprAs{I64,F32,F64}` widening — see the arm.
 //
 // One list, consulted by the checker's definition reservation, the emitter's dispatch,
 // the tail-value classifier, the statement `drop` suppression and the memory-usage scan
@@ -2386,15 +2438,18 @@ export function nameIsMemStoreIntrinsic(name: string) {
   if name == "__store_i64__" { return true }
   if name == "__store_f32__" { return true }
   if name == "__store_f64__" { return true }
+  if name == "__store_i8__" { return true }
+  if name == "__store_i16__" { return true }
   false
 }
 
 // THE DECLARED-BUT-UNLOWERED MEMORY INTRINSICS — the ones that pass `vl check` and then
 // die at emit with `emitProgram: call to unknown function`. Re-censused at each head, in
-// three call POSITIONS each (statement / value / binding), against the seventeen names
+// three call POSITIONS each (statement / value / binding), against the names
 // `defaultScope` declares: #1170 gave the load-width matrix and `memory.size`/
-// `memory.grow` their arms (twelve lowering, five not), and THIS change gives the three
-// wide store widths theirs. TWO remain:
+// `memory.grow` their arms (twelve lowering, five not), the wide store widths got
+// theirs next, and THIS change adds the narrow store pair and the bulk pair — declared
+// and lowered in the same commit, so they never spend a day on this list. TWO remain:
 //
 //   `__store_string__`  `__log_string__`                — host-boundary string sinks
 //
