@@ -19,6 +19,8 @@ import {
   nodeTyIsUnion,
   nodeTyIxOf,
   nodeTyName,
+  numLitUnionAliasName,
+  numLitUnionBaseName,
   recordNodeTyFrom,
   tyIsLitUnion,
   tyToEmitName,
@@ -606,12 +608,13 @@ export function synthRetAnnots() {
 // THE PIN an un-annotated UNION param takes — chosen by the param's OWN union REP, never by
 // `unNames` DECLARATION ORDER.
 //
-// Two reps answer to one `nodeTyIsUnion`: a BOXED union (`i32 | string`, `Cat | Dog`) is the
-// shared `{tag, value}` `$uBox`, and a LITUNION (`"a" | "b"`, `type K = "a" | "b"`) is an
-// interned i32 ATOM. `unNames` holds BOTH — `collectU` pushes every declared `type … = … | …`
-// alias in source order, litunion aliases included — so `unNames[0]` picked the pin by which
-// alias the FILE happened to declare first, and the two reps do not substitute for each other
-// in EITHER direction:
+// THREE reps answer to one `nodeTyIsUnion`: a BOXED union (`i32 | string`, `Cat | Dog`) is the
+// shared `{tag, value}` `$uBox`, a STRING LITUNION (`"a" | "b"`, `type K = "a" | "b"`) is an
+// interned i32 ATOM, and a NUMERIC litunion (`0 | 1`, `type Z = 0 | 1`) is its plain BASE
+// SCALAR. `unNames` holds ALL THREE — `collectU` pushes every declared `type … = … | …`
+// alias in source order, litunion aliases of either flavour included — so `unNames[0]` picked
+// the pin by which alias the FILE happened to declare first, and no two of the reps substitute
+// for each other in EITHER direction:
 //   · `type K = "a"|"b"` declared ahead of an `(i32|string)` callback param pinned the param to
 //     the ATOM, so the value call's `ref.cast` found an i32 where the box was declared — TRAP
 //     (and INVALID WASM, `expected (ref $type), found i32`, once the lambda body USES the
@@ -619,6 +622,8 @@ export function synthRetAnnots() {
 //     program correct — the defect was the ORDER, not the program.
 //   · the mirror: a litunion-ALIAS param (`(K) => i32`) behind ANY declared boxed union pinned
 //     the atom param to the box — the same trap, the same invalid wasm when the body uses it.
+//   · and BOTH again on the numeric axis (`type Z = 0 | 1` for `type K`), which the string-only
+//     `nameIsLitUnionType` / `tyIsLitUnion` predicates could not see at all.
 //
 // The BOXED half keeps the arm's shortcut and states its bound: every boxed union shares
 // `$uBox` and program-global variant tags, so ANY declared BOXED alias routes emission
@@ -649,10 +654,37 @@ function unionParamPinName(ix: i32) {
     // The inline spelling's own emit name: `string`, by that same soften.
     return tyToEmitName(ty)
   }
+  // A NUMERIC literal union (`0 | 1`, `1.5 | 2.5`, the alias-of-an-alias `type Y = Z`) is
+  // the SECOND HALF of the arm above, and `tyIsLitUnion` cannot see it: that predicate
+  // rejects any member whose `litKind != "str"`, so every numeric litunion falls past it
+  // into the boxed loop below — a rep it does not have. Its rep is the BASE SCALAR
+  // (`i32` / `i64` / `f64`), and `numLitUnionBaseName` is that rule's home. So the pin is
+  // the base name, which is byte-for-byte the name the ANNOTATION side now carries too:
+  // #1273 made `canonEmitName` canon the interior of a function type, so `(Z) => i32`
+  // reaches the `$fnsig` producers as `(i32) => i32`. That is what makes this arm a pin
+  // rather than a second answer — canon rewrites the annotation's NAMES, and this selector
+  // reads the type ARENA, which canon never touches. The FLOAT base is the witness that the
+  // arm is load-bearing at all: `1.5 | 2.5` is wrong in every declaration order, including
+  // with no boxed row declared, because the un-pinned param defaults to i32.
+  //
+  // NO SPELLING SPLIT, unlike the string half: an alias `Z` and an inline `0 | 1` soften
+  // to the SAME base scalar (the alias name is not an atom identity to preserve — the
+  // members ARE i32s), so one answer serves both and `nodeTyIsLitUnionAlias` is not asked.
+  const nb = numLitUnionBaseName(ty)
+  if nb != "" { return nb }
   let u = 0
   while u < unNames.length {
     const nm = unNames[u]
-    if !nameIsLitUnionType(nm) { return nm }
+    // …AND THE SAME BLIND SPOT ON THE OTHER SIDE OF THE SELECTOR. `nameIsLitUnionType` is
+    // the string-only reject, so a `type Z = 0 | 1` row was offered as a BOXED pin to an
+    // unrelated `(i32 | string)` callback — and being row 0 it won, which reproduces #1270's
+    // defect verbatim on the numeric axis: one numeric litunion alias declared ABOVE a union
+    // callback trapped it, and moving the same line BELOW a boxed alias made the identical
+    // program correct. A numeric row does not rep as the box any more than a string one
+    // does; skip both, and declaration order stops being an input here too.
+    if !nameIsLitUnionType(nm) {
+      if numLitUnionAliasName(nm) == "" { return nm }
+    }
     u = u + 1
   }
   ""
