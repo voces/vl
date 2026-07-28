@@ -13,9 +13,12 @@ import {
   isValueUnionName,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
+  nodeTyIsNullable,
   nodeTyIsUnion,
+  nodeTyIxOf,
   nodeTyName,
   recordNodeTyFrom,
+  tyToEmitName,
 } from "./typecheck"
 import {
   ArrayLit,
@@ -614,6 +617,72 @@ export function synthParamAnnots() {
             // unions share `$uBox` and program-global variant tags, so any declared alias
             // routes emission identically; the checker already validated the precise type.
             p.parType = synthTypeRef(unNames[0], -1)
+          } else if p.parType < 0 && nodeTyIsNullable(ps[pi]) {
+            // An un-annotated NULLABLE callback param (`const f: (i32 | null) => i32 =
+            // (_k) => 1`). THE OTHER HALF OF THE ARM ABOVE: a `T | null` is a
+            // `TyNullable`, NOT a `TyUnion`, so `nodeTyIsUnion` is false for it and
+            // `nodeTyName` renders "" for it too — the param fell through BOTH arms to
+            // the i32 default while the annotation keyed the nullable.
+            //
+            // The union arm's shortcut (pin ANY declared alias) is unavailable here and
+            // must not be imitated: every boxed union shares one `$uBox`, but nullables
+            // do NOT share a rep — `i32|null` boxes, `string|null`/`S|null`/`i32[]|null`
+            // are NICHE refs, `boolean|null` is the 0/1/2 i32 sentinel. So the pin is the
+            // param's OWN type, rendered by the arena (`tyToEmitName`) and resolved to the
+            // emitter's nominal spelling exactly as the general arm below does — which is
+            // also what makes the pinned name identical to the one an explicit annotation
+            // would produce, and that identity is the whole fix.
+            //
+            // Three outcomes, all measured, all reached by ONE pin because the rep the
+            // name selects IS the difference between them (the annotated twin is the
+            // control in every case):
+            //   · `i32|null`, `i64|null`, `f64|null`, `f32|null` (boxed): the plain i32
+            //     param declared a functype the value call's `ref.cast` did not — a
+            //     cast-failure TRAP. Pinned, both sides key the box: CORRECT.
+            //   · `f64|null` / `f32|null` whose lambda USES the param (`(k) => useN(k)`):
+            //     the i32 param fed the callee's box coercion an i32 where the wide
+            //     scalar was stored — INVALID WASM. Pinned: CORRECT.
+            //   · `string|null`, `S|null`, `i32[]|null` (niche refs): the pinned-i32 param
+            //     made the value's own `$fnsig` key NON-EMPTY, so `emitClosureValueCore`'s
+            //     `cloSigKeyExt(fe) == ""` floor never fired and the raw ref reached an
+            //     i32 param — INVALID WASM. Pinned with the real nullable, the key is ""
+            //     and the floor fires: the same CLEAN REJECT ("a function value may not
+            //     take a nullable parameter") the annotated twin has always produced.
+            // `boolean|null` was already correct un-annotated (its niche IS an i32, so the
+            // default happened to agree) and stays correct — the pin makes it agree by
+            // construction rather than by coincidence.
+            const nty = tyToEmitName(nodeTyIxOf(ps[pi]))
+            if nty != "" {
+              // Resolve the SHAPE under the null, not the whole spelling — the SAME rule
+              // the general arm below applies, asked through the `|null` suffix that
+              // `resolveShapeToNominal` (a field-set / element match) does not look
+              // through on its own. `nullablePartOf` is the depth-aware split, so a
+              // `{y:string|i32}|null` keeps its FIELD union intact rather than splitting
+              // on the inner bar.
+              //
+              // MEASURED INERT TODAY, and recorded as such rather than claimed
+              // load-bearing: `{w:i32}|null` and `W|null` produce the same outcome on
+              // every shape reachable now — 288 grid cells plus the nullable-STRUCT and
+              // nullable-LIST `.map`/`.filter` callbacks, which are the only routes where
+              // a nominal-keyed consumer could see the difference. They agree because
+              // every composite nullable reaches the "not yet supported" floor BEFORE any
+              // nominal-keyed consumer runs. It stays because it is one rule spelled the
+              // same way in both arms: were the general arm's `resolveShapeToNominal`
+              // absent here, a reader would have to explain the asymmetry, and whoever
+              // graduates the floor would have to rediscover it.
+              let pinned = nty
+              const nbase = nullablePartOf(nty)
+              if nbase != "" {
+                const nnom = resolveShapeToNominal(nbase)
+                if nnom != "" { pinned = nnom + "|null" }
+              }
+              const nn = synthTypeRef(pinned, -1)
+              // Same arena-type copy the general arm makes: the pinned name may be an
+              // interned shape name `nameToTy` cannot resolve, and the param node carries
+              // the type the classifiers need.
+              recordNodeTyFrom(nn, ps[pi])
+              p.parType = nn
+            }
           } else if p.parType < 0 {
             const tn = nodeTyName(ps[pi])
             if tn != "" {
