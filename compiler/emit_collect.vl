@@ -395,6 +395,7 @@ import {
   nulRefStructIdxOfLet,
   nulScalarListKind,
   objVariantName,
+  pushPostGuardNarrow,
   recordAnnRlSlot,
   recordRefPushSlot,
   refArrElemKind,
@@ -416,6 +417,7 @@ import {
   scopePush,
   scopeUnbind,
   setNarrowFromCond,
+  setNarrowFromCondElse,
   shapeFieldElemName,
   sioMemoReset,
   stmtIsPushKind,
@@ -1468,6 +1470,14 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
     // a same-named init expr to the RIGHT slot) only within it, and are dropped on exit.
     scopePush()
     const stmts = b.blkStmts
+    // Post-guard complement narrowing, pushed at the foot of the loop below and rewound
+    // here on exit — the same save/restore `emitStmts` and `blockHasStrOpScan` carry.
+    // Without it a binding BELOW a divergent guard (`if !(t is S) { return … }` /
+    // `if t is Other { return … }`) classifies its init with the union UN-narrowed, so
+    // every `letIs*` declines and the slot falls through to the i32 default — while
+    // `wasmEmit`, which does push it, stores the narrowed variant's field into that
+    // cell. That disagreement is a module that does not validate.
+    const savedGuardTop = narrowTop
     let i = 0
     while i < stmts.length {
       const s = P.nodes[stmts[i]]
@@ -1855,8 +1865,14 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
         // The loop variable's scope is the loop (see `scopeUnbind`).
         scopeUnbind()
       }
+      // Post-guard complement narrowing (mirrors `emitStmts` / `blockHasStrOpScan`):
+      // a guard `if` with no else whose then-branch always returns narrows the REST of
+      // this block, so the bindings below it are classified under the SAME narrowing
+      // the emit applies. The save above restores the depth at block exit.
+      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
+    restoreNarrow(savedGuardTop)
     scopePop()
     return 0
   }
@@ -1884,13 +1900,23 @@ export function collectLocalsIf(ifIx: i32, fnIx: i32) {
     if narrowed { restoreNarrow(savedTop) }
     if trc < 0 { return -1 }
     if s.ifElse >= 0 {
+      // A union narrows to the COMPLEMENT set in the ELSE arm (mirroring `emitStmt`'s
+      // else lowering and `ifChainHasStrOp`), so a binding of the narrowed variant's
+      // field inside `else { … }` is classified under the narrowing the emit applies.
+      // The then-arm has had this since the branch was first walked; the else arm had
+      // the stack untouched, which is the second half of the same gap. Save/restore.
+      const savedElseTop = narrowTop
+      const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
       const els = P.nodes[s.ifElse]
+      let erc = 0
       if els is Block {
-        if collectLocals(s.ifElse, fnIx) < 0 { return -1 }
+        erc = collectLocals(s.ifElse, fnIx)
       } else if els is IfStmt {
         // `else if …` — walk the nested if (and its own else chain) recursively.
-        if collectLocalsIf(s.ifElse, fnIx) < 0 { return -1 }
+        erc = collectLocalsIf(s.ifElse, fnIx)
       }
+      if narrowedElse { restoreNarrow(savedElseTop) }
+      if erc < 0 { return -1 }
     }
     return 0
   }

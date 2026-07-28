@@ -1,0 +1,102 @@
+// @run
+// @log hi
+// @log hi
+// @log hi
+// @log hi
+// @log hi
+// @log hi
+// A union narrowed by a DIVERGENT GUARD (`if !(t is S) { return … }`, or the complement
+// spelling `if t is Other { return … }`) narrows the FALL-THROUGH, and a union narrowed by
+// any `is` narrows the ELSE arm. `wasmEmit` lowered both correctly — it emits the `ref.cast`
+// + `struct.get` for the narrowed read — but `emit_collect.collectLocals` / `collectLocalsIf`,
+// which pick each local's WASM VALTYPE, applied NEITHER narrowing, so a binding of the
+// narrowed variant's string field got the i32 default and the body stored a `(ref $string)`
+// into it. `vl check` was clean and `vl build` wrote a module that does not validate
+// (`type mismatch: expected i32, found (ref $type)`).
+//
+// TWO gaps, one root, and each of the three defect functions below separates them:
+//   * `collectLocals`'s statement loop never called `pushPostGuardNarrow` (`wasmEmit` calls
+//     it at three sites, `emit_classify` at two, `emit_sections` at one, the collector at
+//     none) — `guardBind` / `compBind` need this half;
+//   * `collectLocalsIf` narrowed only `s.ifThen` (`setNarrowFromCond`) and walked `s.ifElse`
+//     with the stack untouched — no `setNarrowFromCondElse`. `elseBind` (a DIVERGENT else,
+//     which `pushPostGuardNarrow` cannot see because `ifElse >= 0`) and `plainElseBind` (no
+//     `return` anywhere in the then arm, so no guard narrowing exists at all) need this half.
+// A fix that ships only one propagation fails this file.
+//
+// `emit_classify.blockHasStrOp` / `ifChainHasStrOp` are the exact structural siblings — same
+// walk, same save/restore idiom — and carried BOTH already. The collector was the one walker
+// of the three that was never brought along.
+//
+// The two green CONTROLS are kept beside the defects so the file also witnesses that the
+// positive narrow and the unbound read did not move.
+
+function mkA(): {aName: string} { return { aName: "hi" } }
+
+// THE DEFECT: a divergent guard on the negated `is`, then a `const` binding of the narrowed
+// variant's string field.
+function guardBind(t: {aName: string} | {zz: boolean}) {
+  if !(t is {aName: string}) { return "" }
+  const nm = t.aName
+  return nm
+}
+
+// SAME DEFECT, complement spelling — no `!` anywhere. This is what rules the `!` out as the
+// cause: it is the divergent guard, not the negation.
+function compBind(t: {aName: string} | {zz: boolean}) {
+  if t is {zz: boolean} { return "" }
+  const nm = t.aName
+  return nm
+}
+
+// SAME DEFECT, a DIVERGENT else arm — the second of the two propagations. `pushPostGuardNarrow`
+// declines here (the `if` HAS an else), so only the else-arm narrowing can lower it.
+function elseBind(t: {aName: string} | {zz: boolean}) {
+  if t is {zz: boolean} {
+    return ""
+  } else {
+    const nm = t.aName
+    return nm
+  }
+}
+
+// SAME DEFECT, a PLAIN else — no divergence anywhere. No guard narrowing exists to inherit,
+// so this cell is reachable by the else-arm propagation ALONE.
+function plainElseBind(t: {aName: string} | {zz: boolean}) {
+  if t is {zz: boolean} {
+    print(9)
+  } else {
+    const nm = t.aName
+    return nm
+  }
+  return ""
+}
+
+// CONTROL 1 — the POSITIVE narrow with the identical binding. Lowered correctly before the
+// fix too: `collectLocalsIf` always narrowed the then-branch.
+function posBind(t: {aName: string} | {zz: boolean}) {
+  if t is {aName: string} {
+    const nm = t.aName
+    return nm
+  }
+  return ""
+}
+
+// CONTROL 2 — the same guard with the field used DIRECTLY, no binding. Lowered correctly
+// before the fix too: `wasmEmit` saw the post-guard narrowing even though the collector did
+// not, so the read was a correct `ref.cast` + `struct.get` and no local was involved.
+function guardDirect(t: {aName: string} | {zz: boolean}) {
+  if !(t is {aName: string}) { return "" }
+  return t.aName
+}
+
+function go() {
+  const v: {aName: string} | {zz: boolean} = mkA()
+  print(guardBind(v))
+  print(compBind(v))
+  print(elseBind(v))
+  print(plainElseBind(v))
+  print(posBind(v))
+  print(guardDirect(v))
+}
+go()
