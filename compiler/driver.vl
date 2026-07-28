@@ -78,7 +78,7 @@ import {
   ufcsAliasReset,
 } from "./ast"
 import { parseProgram } from "./parser"
-import { gaeLtAt } from "./tyname"
+import { gaeHeadNameOf, gaeLtAt, nameIdentChar } from "./tyname"
 import { T, checkProgram, demangleMsg, initChecker } from "./typecheck"
 import {
   redunTokAt,
@@ -2278,24 +2278,36 @@ function modCompile(emit: i32): i32 {
 // copies' own reading (a leading `<` cuts to ""), since `slice(0, 0)` is what the
 // hand-rolled loop returned there.
 //
-// The cut is BOUND rather than left as the trailing expression: a bare member-call
-// STATEMENT is not a lowerable form (`emitProgram: unsupported member-call statement`),
-// and routing turned this tail from a bare identifier into a `.slice` — the same reason
-// `typecheck.arrElemNameRaw` and `emit_base.annRetNameOf` bind theirs.
+// The HEAD cut itself is `tyname.gaeHeadNameOf`, the delimiter-blind home (W2), which
+// takes the index this function already holds rather than re-scanning for it. The `lt < 0`
+// fall-through STAYS here: it is this site's own reading (a non-generic name is its own
+// base) and one of the three disagreeing guards that keep the cut blind. Index 0 keeps the
+// copies' reading too (a leading `<` cuts to ""), since `slice(0, 0)` is what the
+// hand-rolled loop returned there. The tail is a plain CALL, which lowers — it is a bare
+// member-call statement that does not (`emitProgram: unsupported member-call statement`),
+// which is why the home binds its slice and this site no longer has to.
 function modGenBase(name: string): string {
   const lt = gaeLtAt(name)
   if lt < 0 { return name }
-  const base = name.slice(0, lt)
-  base
+  gaeHeadNameOf(name, lt)
 }
 // The type-parameter names folded into a generic declared name (`Pair<A,B>` →
 // A, B); empty for a non-generic name. Declaration-position parameters are
 // plain identifiers, so ident runs after the `<` are exactly the names.
 //
-// The `<` is now FOUND rather than walked past, which retires the `started` flag: the
-// copy's flag was only ever "have I passed the first `<` yet", and starting the walk at
-// `lt + 1` answers that positionally. A trailing run is flushed by the closing `>`, as
-// in the copy — every declared generic name ends in one.
+// The identifier CHARACTER CLASS is `tyname.nameIdentChar` (W8), shared with
+// `modTypeRenamed` below. The RUN WALK stays here, and that is a MEASUREMENT rather than a
+// preference: the census's proposed home was a run TOKENIZER
+// (`nameIdentRuns(name, outStart, outEnd)`), it was built, this site was routed to it, and
+// the compiler grew **608 bytes** — two materialised `i32[]` index columns and their push
+// loops, to serve the tokenizer's ONE legal consumer (`modTypeRenamed` cannot take it; see
+// its header). The classifier is the operation that is actually written twice; the walk is
+// written once, and moving a single writing changes its location, not the count.
+//
+// The `<` is FOUND rather than walked past, which retires the copy's `started` flag: that
+// flag was only ever "have I passed the first `<` yet", and starting at `lt + 1` answers it
+// positionally. A trailing run is flushed by the closing `>`, as in the copy — every
+// declared generic name ends in one.
 function modGenParams(name: string): string[] {
   const out: string[] = []
   const lt = gaeLtAt(name)
@@ -2304,12 +2316,7 @@ function modGenParams(name: string): string[] {
   let i = lt + 1
   while i < name.length {
     const c = name[i]
-    let isIdent = false
-    if c >= 'a' && c <= 'z' { isIdent = true }
-    if c >= 'A' && c <= 'Z' { isIdent = true }
-    if c >= '0' && c <= '9' { isIdent = true }
-    if c == '_' { isIdent = true }
-    if isIdent {
+    if nameIdentChar(c) {
       run.push(c)
     } else if run.length > 0 {
       out.push(fromCodePoints(run))
@@ -2480,6 +2487,14 @@ function modRenamed(name: string): string {
 // "Box<i32>"), so rewrite identifier SEGMENTS through the rename map (types are
 // never shadowed by locals — VL has no local type declarations). Quoted
 // string-literal segments (`"a"|"b"`) are copied verbatim.
+//
+// The identifier CHARACTER CLASS is `tyname.nameIdentChar` (W8) — the half this body shares
+// with `modGenParams` above, character for character. The RUN WALK is not routed and the
+// reason is measured: the quoted-segment skip below is the NAIVE one ("no escapes in type
+// names") while the leaf's is `skipQuotedName`, which honours `\`, and they disagree on a
+// literal member carrying an escaped quote (`type T = "a\"b"`, which the compiler accepts
+// and runs). Adopting the leaf's rule would rename inside a quoted member differently —
+// arguably better, certainly a BEHAVIOUR change — so it is filed rather than taken here.
 function modTypeRenamed(tn: string): string {
   const out: i32[] = []
   let run: i32[] = []
@@ -2489,12 +2504,7 @@ function modTypeRenamed(tn: string): string {
     let c = 0
     if !atEnd { c = tn[i] }
     let isIdent = false
-    if !atEnd {
-      if c >= 'a' && c <= 'z' { isIdent = true }
-      if c >= 'A' && c <= 'Z' { isIdent = true }
-      if c >= '0' && c <= '9' { isIdent = true }
-      if c == '_' { isIdent = true }
-    }
+    if !atEnd { isIdent = nameIdentChar(c) }
     if isIdent {
       run.push(c)
     } else {

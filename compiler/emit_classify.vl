@@ -25,6 +25,9 @@
 import {
   annGenAppSpanEnds,
   arrElemNameRaw,
+  fnRetTextOf,
+  gaeArgsTextOf,
+  gaeHeadNameOf,
   gaeLtAt,
   groupInnerOf,
   nameIsArray,
@@ -33,7 +36,9 @@ import {
   nameIsMapOpen,
   nameIsParenOpen,
   nameIsParenSpanEnds,
+  nameIsQuotedLeaf,
   nameIsShapeOpen,
+  nameStripSpaces,
   peelGroupParens,
 } from "./tyname"
 import {
@@ -4225,7 +4230,9 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
   if e is IsExpr {
     // A string-LITERAL `is` (`s is "a"`) lowers through `emitStrEqCore`, so it
     // stages operands in the string scratch frame like a string `==`.
-    if e.isVariant.length > 0 && e.isVariant[0] == '"' { return true }
+    // The QUOTED-LEAF test at its home (`tyname.nameIsQuotedLeaf`, W3) — the census's W3
+    // list did not carry this site. The `length > 0` bound stays in front of it.
+    if e.isVariant.length > 0 && nameIsQuotedLeaf(e.isVariant) { return true }
     return exprHasStrOp(e.isObj, fnIx)
   }
   if e is AsExpr { return exprHasStrOp(e.asObj, fnIx) }
@@ -8245,36 +8252,12 @@ export function structIndexOfTypeName(name: string) {
 // collapsed `.map` callback return the checker rendered structurally) — the variant
 // analogue of `structIndexOfTypeName`. -1 if no variant matches. A NAME that is already a
 // variant alias resolves directly. Field-name parsing mirrors `structIndexOfTypeName`.
-// `name` with every SPACE dropped, or `name` itself when it carries none.
+// `spacelessName` — "`name` with every SPACE dropped, or `name` itself when it carries none"
+// — MOVED TO `tyname.nameStripSpaces` (W7), header and 21%-of-names measurement with it.
+// It was one of two ENFORCEMENTS of the same rule (`emit_rep.renderFaithful` is the other)
+// and one of six bodies stating it; the wrapper had exactly one caller and is gone rather
+// than re-pointed, so the file names the home directly.
 //
-// This is the ONE thing `shapeFieldParse`'s ladder did that is not the type
-// grammar: `tyToStr` renders an object shape SPACED (`{a: i32, b: string}`) and
-// `tyToEmitName` renders it tight, and the field-set resolvers must read both as the
-// same shape. The ladder could fold the normalisation into its walk because it
-// accumulated character by character; the split home works in SLICES, so it happens
-// once, up front. Measured over corpus + fuzz: **18,666 of 89,166 shape names carry a
-// space (21%)** — the normalisation is LIVE, not a dead defensive branch, and the
-// other 79% must not pay an allocation for it, which is why the scan returns `name`
-// itself when there is nothing to drop.
-//
-// It is NOT a depth ladder: it counts no brackets and asks nothing about structure,
-// so it does not reintroduce the grammar copy this function's rewrite deletes.
-function spacelessName(name: string) {
-  let i = 0
-  while i < name.length {
-    if name[i] == ' ' {
-      let out = name.slice(0, i)
-      let j = i
-      while j < name.length {
-        if name[j] != ' ' { out = out + fromCodePoint(name[j]) }
-        j = j + 1
-      }
-      return out
-    }
-    i = i + 1
-  }
-  name
-}
 // Parse a canonical inline SHAPE name `{a:T,b:U}` into PARALLEL field-name / field-type
 // string lists (appended to `outNames` / `outTypes`). A non-`{…}` name appends nothing.
 // Shared by the variant / struct field-set resolvers so a field-NAME match can be
@@ -8312,7 +8295,7 @@ function spacelessName(name: string) {
 //     a coverage statement, not a licence, so the faithful form ships.
 function shapeFieldParse(name: string, outNames: string[], outTypes: string[]) {
   if nameIsShapeOpen(name) {
-    const flat = spacelessName(name)
+    const flat = nameStripSpaces(name)
     const parts: string[] = []
     // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1). This is the ONE routed
     // site whose span test does NOT establish the home's `length >= 2` bound on the cut's
@@ -8453,10 +8436,12 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
     // RESULT carries a depth-0 `| null` tail. A genuine closure field with a non-nullable
     // result (`f: () => i64`) keeps the proven-mismatch reject.
     if code == 22 && want == 14 {
+      // The RETURN cut at its home (`tyname.fnRetTextOf`, W4). The `aa >= 0` gate is WIDER
+      // than every other routed site's (the rest want `>= 1` or a full function-type
+      // predicate), which is why the home folds no bound in — and `.slice` clamps rather
+      // than traps, so the two agree at `aa == 0` as they do everywhere else.
       const aa = annArrowAt(t)
-      if aa >= 0 && nullablePartOf(t.slice(aa + 2, t.length)) != "" {
-        return true
-      }
+      if aa >= 0 && nullablePartOf(fnRetTextOf(t, aa)) != "" { return true }
     }
     return false
   }
@@ -12220,16 +12205,18 @@ export function gaeEnsure(name: string) {
   // `emit_base.annGenAppDecompose` takes, and it costs a second scan only on a name that
   // already ended in `>`. Decomposing through `annGenAppDecompose` instead would split the
   // argument list BEFORE the `structIndexByName` early-out below, which is work this
-  // per-field-per-application call does not do today.
+  // per-field-per-application call does not do today — and the two CUTS route to
+  // `tyname.gaeHeadNameOf` / `gaeArgsTextOf` (W2) instead, which is exactly the part of
+  // `annGenAppDecompose` this site can take without taking its split.
   if !annGenAppSpanEnds(name) { return 0 }
   const ltAt = gaeLtAt(name)
   if structIndexByName(name) >= 0 { return 0 }
-  const gi = gaeIndexOf(name.slice(0, ltAt))
+  const gi = gaeIndexOf(gaeHeadNameOf(name, ltAt))
   if gi < 0 { return 0 }
   const pnames: string[] = []
   gaeSplitArgs(gaeParams[gi], pnames)
   const args: string[] = []
-  gaeSplitArgs(name.slice(ltAt + 1, name.length - 1), args)
+  gaeSplitArgs(gaeArgsTextOf(name, ltAt), args)
   if args.length != pnames.length { return 0 }
   const names: string[] = []
   const codes: i32[] = []

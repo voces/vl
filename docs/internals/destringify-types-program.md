@@ -30520,3 +30520,329 @@ agree with:
    nothing at all on any of the six channels. Two emitter fixes of the same size in the same week
    with opposite corpus profiles — the instrument ranks nothing, which is why the fixture is the
    inverted control every time.
+## THE ROUTING ENDGAME — W2 / W3 / W4 / W7 / W8, the leaf's TENTH consumer, and the DECISIVE INSTRUMENT measured BLIND to every family it was pointed at (off master `17eb646`)
+
+Five families, five commits, one burden: **INERTNESS**. #1239's census listed W1-W8 as the
+routable set; #1243/#1245/#1250 closed W1, #1247 W6, and the run before this one closed W5.
+This slice takes the remainder that the file partition allows — **34 writings in 22 functions
+across six modules** — and it also takes two of the census's proposals apart.
+
+### THE RE-DERIVED SITE LISTS — the census undercounts 5 for 5, and it did it again
+
+Every list below was re-derived STRUCTURALLY (the operation, with receiver AND length
+expression normalised) and then confirmed by the RESOLVER: delete the import entry, rebuild,
+and the compiler names every consuming site. The census's own numbers are in the last column.
+
+| family | operation | re-derived | census | what the census missed |
+|---|---|---:|---:|---|
+| **W2** GENERIC-APPLICATION cut | `X.slice(0, lt)` + `X.slice(lt+1, len-1)` | **16 writings / 9 fns** (12 / 7 routable) | 11 / 7 | `typecheck.canonEmitNameAt`'s generic arm (BOTH halves) · `emit_collect.gaeInternAppFieldShapes` |
+| **W3** QUOTED-LEAF test | `X[0] == '"'` | **9 writings / 8 fns** | 8 / 7 | `emit_classify.exprHasStrOp` · `typecheck.nulElemListAtomKind`; and it wrongly listed `driver.modTypeRenamed` |
+| **W4** FUNCTION-ARROW cut | `X.slice(1, fa-1)` + `X.slice(fa+2, len)` | **8 writings / 5 fns** | 7 / 4 | `typecheck.nameToTyReal` (BOTH halves) |
+| **W7** SPACE-FREE family | `X[i] == ' '` (+ `strContains(X, " ")`) | **6 bodies / 8 char-ops** (3 routable) | 7 char-ops | `emit_rewrite.synthRetAnnots` — spelled `!strContains(ctx, " ")`, a spelling no character-level scan sees |
+| **W8** IDENTIFIER-RUN walk | `[A-Za-z0-9_]` run walk | **2 shared / 1 blocked / 1 refuted** | 5 | — it OVER-counted here (see below) |
+
+**FIVE FOR FIVE, AND THE MECHANISM IS THE SAME EVERY TIME.** #1250 recorded three consecutive
+normalisation failures in one family — the receiver, the length expression, the operand's
+source field. This slice adds two more kinds: **the SPELLING** (`strContains(x, " ")` is the
+space test written as a call, and no `' '`-anchored scan can see it) and **the POSITION**
+(`driver.modTypeRenamed`'s `c == '"'` is a mid-scan quote OPEN, not an index-0 leaf test — the
+census put it in W3 on the character alone). A census that abstracts the SPELLING will keep
+missing a family that is defined by the VALUE.
+
+Routed, per family, resolver-enumerated:
+
+* **W2** (12) — `driver.modGenBase` · `emit_base.annGenAppDecompose` ·
+  `emit_classify.gaeEnsure` · `typecheck.nameToTyReal` / `nameIsGenAppOfDecl` /
+  `canonEmitNameAt` / `checkProgramNode`. Homes: `gaeHeadNameOf` / `gaeArgsTextOf`.
+* **W3** (9) — `emit_base.isLitVariantName` / `nulLitUnionInnerName` ·
+  `emit_classify.exprHasStrOp` · `typecheck.litMemberTy` / `nameIsInlineLitUnion` (x2) /
+  `nulElemListAtomKind` · `wasmEmit.emitIs` / `emitUnionLitIs`. Home: `nameIsQuotedLeaf`.
+* **W4** (8) — `emit_base.annRetNameOf` / `annFnDecompose` · `typecheck.nameToTyReal` /
+  `canonEmitNameAt` · `emit_classify.shapeFieldTypeCompat`. Homes: `fnParamsTextOf` /
+  `fnRetTextOf`.
+* **W7** (3) — `emit_base.canonBareShapeName` · `emit_classify.spacelessName` (body MOVED,
+  the one-caller wrapper deleted) · `emit_rep.renderFaithful`. Homes: `nameIsSpaceFree` /
+  `nameStripSpaces`.
+* **W8** (2) — `driver.modGenParams` / `modTypeRenamed`. Home: `nameIdentChar`.
+
+`tyname.vl` goes from 22 bodies to 30 and stays a zero-import leaf (`grep -c '^import'` = 0,
+before and after).
+
+### THE LEAF'S TENTH CONSUMER — the edge the phase-1 record never had
+
+`wasmEmit.vl` did not import `tyname.vl`. Two of W3's nine writings are its
+(`emitIs`, `emitUnionLitIs`), and the leaf's own header has said since phase 1 that its nine
+importers are the **import set**, not the set that **needs the grammar**, naming this file
+explicitly. **W3 takes the edge.** A zero-import leaf is reachable from everywhere, so it
+cannot cycle; the missing consumer was a decision no one had taken, not a layering problem.
+The leaf's header now reads TEN importers and keeps the warning in its general form.
+
+```
+tyname (leaf, 0 imports)
+   ↑── typecheck · emit_base · emit_classify · emit_collect · emit_mono
+   ↑── emit_rep · emit_rewrite · emit_sections · driver · wasmEmit   ← NEW
+```
+
+### THE W2 SITES THIS CYCLE CANNOT REACH — `emit_collect.vl` IS HALF-ROUTED
+
+`emit_collect.vl` is held by another agent this cycle. It carries **four** W2 writings, not
+the census's one:
+
+* `gaeCollectDecls:3546/3547` — HEAD + ARGUMENT TEXT (the census's site);
+* `gaeInternAppFieldShapes:3636/3641` — HEAD + ARGUMENT TEXT (the census never listed it).
+
+Both functions already import `tyname` and both already call `annGenAppSpanEnds` + `gaeLtAt`
+immediately above their cuts, so each is a two-line substitution — `gaeHeadNameOf(s.tdName,
+lt)` and `gaeArgsTextOf(s.tdName, lt)`. **The W2 family is explicitly HALF-ROUTED at
+`emit_collect.vl`, and closing it is the next slice's cheapest item.** No other family has a
+held-file residue: W3/W4/W7/W8's remaining sites are outside the partition for architectural
+reasons, not scheduling ones.
+
+### TWO OF THE CENSUS'S PROPOSALS TAKEN APART
+
+**W8's run TOKENIZER was built, routed, measured and DECLINED — with a number.** The census
+asked for `nameIdentRuns(name, outStart, outEnd)` serving five sites. Building it produced two
+findings:
+
+1. **It has ONE legal consumer, not two.** `modTypeRenamed` must not rename inside a quoted
+   literal member and skips those with a NAIVE scan ("no escapes in type names"), while the
+   leaf's rule is `skipQuotedName`, which honours `\`. They disagree on a literal member
+   carrying an escaped quote — `type T = "a\"b"`, which the compiler **accepts and runs**
+   (pinned now by `tests/cases/types/litunion-escaped-quote-member.vl`). A quote-aware
+   tokenizer would silently change that site's behaviour; a quote-blind one is wrong for it in
+   the other direction. Either way the site cannot take the walk.
+2. **Serving the remaining consumer costs 686 bytes.** Three compilers off otherwise identical
+   source: **1,042,805 B** before the family · **1,043,413 B** with `modGenParams` routed to
+   the tokenizer (**+608**) · **1,042,727 B** with the classifier-only form that ships
+   (**−78**). Two materialised `i32[]` index columns cost more than the one accumulating run
+   they replace. A single-writing home changes a body's LOCATION, not the count — here it
+   changed the size too, in the wrong direction.
+
+**`typecheck.nameNeedsCanon` is REFUTED as a W8 site, by a witness rather than an opinion.**
+Its digit rule is "a digit at a MEMBER-START position" (index 0, or after `|` / `:` / `,`), not
+"a digit that starts an identifier run". **`Box<0>` separates them**: the digit starts a run
+and its predecessor `<` is not a member separator, so a run tokenizer answers TRUE where the
+site answers false — widening which names the canon pass rewrites.
+
+So the census's W8 "5 sites" is really **2 sharing the classifier · 1 that cannot take the walk
+(measured) · 1 that is a different predicate (refuted)**.
+
+Two more declines, both in W7, both with the reason:
+
+* `emit_base.normTypeAtom` is a two-sided TRIM whose alphabet is `' '` **and** `'\t'` — a
+  different operation, not a narrower one.
+* `emit_classify.mvValKindOfName` SKIPS a run of spaces at an index and slices from it;
+  stripping instead would also drop the result's INTERIOR spaces.
+
+And one **outside the partition**: `emit_rewrite.synthRetAnnots`'s `!strContains(ctx, " ")` is
+`nameIsSpaceFree` exactly (`strContains` with a one-character needle reduces to it, by
+construction). `emit_rewrite.vl` already imports `tyname`, so it is a one-line route for
+whoever owns that file next.
+
+### INERTNESS — and the DECISIVE INSTRUMENT is measured BLIND
+
+| instrument | reading |
+|---|---|
+| **frozen-source rebuild** — master's own `compiler/entry.vl` compiled by this branch's compiler | **BYTE-IDENTICAL**, 1,044,688 B, sha256 `1b55fcbb4209130a423dbfb1a9b6ab2670a846b3ca6807f2a439a37a3e027ec3`. Re-run after EVERY family commit; identical five times. **INVERTED CONTROL:** the two compilers `cmp` as differing (rc 1), every time. |
+| **six-channel corpus A/B**, 1,565 files (`tests/cases` + `std` + `scripts`) | **0 diffs on all six channels.** |
+| **fuzz A/B**, 100,800 generated programs per side (14 seeds × 3 depths × {plain, declared}, 1,200 emitted per batch), 8,784 kept files per side | **0 divergences** — raw `diff -r` reads 15,052 lines and every one of them is the mktemp path; see the harness note below. |
+
+**A HARNESS BUG THE PREVIOUS RUNS OF THIS INSTRUMENT CARRIED.** The inherited fuzz A/B script
+normalises the `mktemp` directory out of `*.log` and NOT out of `*.err`, so every case that
+produces an emit ERROR reads as a divergence on its path alone. A raw `diff -r` of the two
+out-dirs is therefore not the answer — un-normalised it names hundreds of `case_*.err` files
+whose only difference is `/tmp/tmp.5B2rpZAIaC/` vs `/tmp/tmp.IVLq2sPKMX/`. **The reading above
+is after normalising BOTH.** Anyone re-running this instrument should apply the same `sed` to
+`*.err`, or read a "divergence" count that is entirely the temp path.
+
+**AND HERE IS THE FINDING THAT MATTERS MORE THAN ANY OF THEM: THE FROZEN-SOURCE REBUILD IS A
+NULL CALIBRATION FOR ALL FIVE FAMILIES.** The brief that commissioned this slice names it "the
+decisive instrument". It is not, here. Both sabotages below poison the homes at every routed
+site, both move the corpus by hundreds of files, and **both leave the frozen rebuild
+BYTE-IDENTICAL** — same 1,044,688 B, same sha256, with the inverted control still reading rc 1,
+so the sabotaged compilers are demonstrably different binaries.
+
+| what | corpus (of 1,565) | frozen rebuild |
+|---|---|---|
+| the clean candidate | 0 · 0 · 0 · 0 · 0 · 0 | byte-identical |
+| **S1** — the five CUT homes each keep one character too many | **52 CHECKRC · 57 CHECKMSG · 174 BUILDRC · 204 BUILDMSG · 31 BYTES · 174 RUNRC** | **byte-identical** |
+| **S2** — the three TEST homes weakened (`nameIsQuotedLeaf` never fires, `nameIsSpaceFree` always does, `nameIdentChar` loses its digits) | **0 CHECKRC · 0 CHECKMSG · 31 BUILDRC · 34 BUILDMSG · 2 BYTES · 31 RUNRC · 1 RUNOUT** | **byte-identical** |
+
+The reason is structural and checkable in one grep: **the compiler's own source declares ZERO
+generic type aliases (`type X<T> = …`) and ZERO literal-union types.**
+`grep '^type [A-Za-z_]*<' compiler/*.vl std/*.vl` returns nothing. So the frozen rebuild cannot
+reach W2's generic-application grammar or W3's quoted-leaf grammar AT ALL, and reaches
+W4/W7/W8 only through the compiler's own annotation spellings, which the poisons do not
+disturb. Its zero is the **absence of a witness**, not agreement — the same shape #1232's W3
+row had, at a different instrument, and exactly what
+[[vl-corpus-can-read-zero-while-codegen-moved]] says about ranking inertness instruments: they
+are ORTHOGONAL, and none of them ranks.
+
+**What carries the burden for this slice is the corpus A/B**, and the calibration proves it
+does: S1 and S2 partition the routed set so every one of the 34 writings is poisoned exactly
+once, and each half has a live witness population. Their profiles are DISJOINT at the top of
+the table — S1 lights both CHECK channels (52 / 57) where S2 reads zero on both, and S2's only
+exclusive signal is a RUNOUT the byte channel nearly misses (2 BYTES). A calibration that had
+run either alone would have mis-graded which channels matter, which is #1250's finding
+reproduced with a different pair.
+
+### BYTE DELTAS — and the "126–139 B/site constant" does NOT reproduce
+
+| family | writings | fns | compiler size after | Δ | Δ/writing | Δ/fn |
+|---|---:|---:|---:|---:|---:|---:|
+| (master `17eb646`) | | | 1,044,688 | | | |
+| **W2** generic-app cut | 12 | 7 | 1,043,486 | **−1,202** | −100 | −172 |
+| **W3** quoted-leaf test | 9 | 8 | 1,043,466 | **−20** | −2 | −2.5 |
+| **W4** function-arrow cut | 8 | 5 | 1,042,784 | **−682** | −85 | −136 |
+| **W7** space-free family | 3 | 3 | 1,042,805 | **+21** | +7 | +7 |
+| **W8** identifier-run class | 2 | 2 | 1,042,727 | **−78** | −39 | −39 |
+| **total** | **34** | **22** | **1,042,727** | **−1,961** | −58 | −89 |
+
+#1250 called 135/136/139 B/site "a predictable constant … a checkable prediction rather than a
+post-hoc observation". **Checked, and it holds for exactly one of five families.** W4 reads
+−136 B/function and W2 beats it at −172; W3, W7 and W8 are nowhere near. The constant is a
+property of **`.slice`-CUT routings**, where a multi-token arithmetic expression collapses to a
+call — not of routing in general. A TEST routing (W3) swaps a one-line compare for a one-line
+call and moves 2 bytes per function; a small-LOOP routing (W7, W8) can go POSITIVE, because a
+new function frame costs more than the loop it deduplicates. Stated so the next slice predicts
+from the operation's SHAPE rather than from the family count.
+
+### GATE
+
+Every rc taken BARE, never through a pipe.
+
+| gate | rc | reading |
+|---|---:|---|
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | 1,044,688 B |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | seed IS the fixpoint (1 compile), 1,042,727 B |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4, 1,042,727 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3300 passed / 0 failed / 8 ignored** — master reads 3298/0/8 and the one new fixture adds exactly 2 (its corpus run and its native-align tier). Measured at 3298/0/8 before the fixture landed, so the +2 is accounted for rather than assumed. |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined failure, 0 new, 0 stale |
+| corpus A/B | 0 | 1,565 files, 0 diffs × 6 channels, calibrated by S1 + S2 |
+| fuzz A/B | 0 | 100,800 programs/side, 0 divergences (after normalising `*.err` — see the harness note) |
+| frozen-source rebuild | 0 | byte-identical + inverted control rc 1 — **and measured BLIND to both sabotages** |
+
+#### RE-GATED ON `231e137c` — every reading reproduced, and the byte delta is IDENTICAL
+
+Master moved three commits (#1253 `emit_collect`, #1254 docs+fixtures, #1255 `emit_mono`) while
+this slice ran. Rebased — the only conflict is the doc's append/append, resolved by deleting the
+three markers so both section headers survive — and the whole gate re-run against a rebuilt,
+fixpoint-proved `231e137c` baseline (1,044,778 B, `compile(X) == X` verified in one extra
+compile). None of master's three commits touches a file in this partition.
+
+| gate | rc | reading on `231e137c` |
+|---|---:|---|
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint at the 2-compile rung, **1,042,817 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4, 1,042,817 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3306 / 0 / 8** (3300 + master's 3 new fixtures × 2 tiers) |
+| `scripts/lint-self.sh` | 0 | clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined, 0 new, 0 stale |
+| corpus A/B vs the new baseline | 0 | **1,569 files, 0 diffs × 6 channels** |
+| frozen-source rebuild of `231e137c`'s own source | 0 | **byte-identical**, 1,044,778 B, sha256 `42e12ff28960d19216068bf98c8165653297a8dafa81d18602afe6e7bf0f102a`; inverted control rc 1 |
+
+**The fuzz A/B in this table is the PRE-rebase pair**, and it is the one that measures this
+slice's delta in isolation: 100,800 programs/side against master `17eb646`'s compiler, 0
+divergences. A post-rebase re-run against the `231e137c` baseline is a re-confirmation rather
+than a new claim — the source delta is identical and none of master's three commits touches
+this partition — and it is deliberately NOT asserted here until it has actually landed. A gate
+table is a record of readings taken, not of runs started.
+
+**1,044,778 → 1,042,817 is −1,961 B — the SAME total as before the rebase**, on a baseline 90
+bytes larger. The per-family deltas are therefore additive with master's own work rather than
+entangled with it, which is the useful form of a byte claim: it survived its base changing
+underneath it.
+
+### WHAT REMAINS UN-ROUTED, WITH THE REASON
+
+1. **`emit_collect.vl`'s four W2 writings** — file partition only. Two-line substitutions; both
+   functions already import `tyname` and already hold the index. **The cheapest item on the
+   whole list.**
+2. **`emit_rewrite.synthRetAnnots`'s W7 assertion** — file partition only. One line.
+3. **`driver.modTypeRenamed`'s run WALK** (W8) — blocked by a real behaviour difference between
+   two quote rules, with a witness and a fixture. Unifying them is a FIX, not a refactor, and
+   wants its own slice.
+4. **`typecheck.nameNeedsCanon`** — refuted, not deferred. It is not this grammar.
+5. **`emit_base.normTypeAtom` / `emit_classify.mvValKindOfName`** — different operations (a
+   `' '`+`'\t'` trim; a skip-run-at-index), each with one writing.
+6. **W9-W12, 42 sites** — design-blocked exactly as #1239 recorded: `renderEmit` (10), the
+   parser's `annTs` coverage (9), the overloaded `tyName` pin column (10), the `$fnsig` ABI
+   (13).
+7. **The ~60 single-writing floor** — irreducible under routing, and #1239's measurement says
+   why: 96 of the 98 PARSE sites sit in a function all of whose parameters are scalars, so
+   there is nothing to ask. Zero comes from the SOURCES change (hand the consumer a `tyIx`),
+   not from another home.
+
+**With W1-W8 now closed or explicitly filed, the ROUTING phase of this programme is DONE** for
+the families #1239 enumerated. It found one more.
+
+### **W14 — the FIELD-COLON cut. A NEW family, ten writings, and the census scored it TWO.**
+
+Turned up while re-verifying that no W2/W4-shaped `.slice` remained in the partition. Every
+inline-shape parser splits a field `name:type` at its colon INDEX, and five functions write
+that pair out by hand:
+
+| file · function | NAME half | TYPE half | guard |
+|---|---|---|---|
+| `emit_base.annObjFieldSplit:2544` | `X.slice(0, ci)` | `X.slice(ci + 1, X.length)` | `ci <= 0` |
+| `emit_base.vl:2610` | `X.slice(0, ci)` | `X.slice(ci + 1, X.length)` | `ci <= 0` |
+| `emit_classify.shapeFieldParse:8316` | `X.slice(0, ci)` | `X.slice(ci + 1, X.length)` | `ci < 0` |
+| `typecheck.nameToTyReal:5881` | `X.slice(0, colonAt)` | `X.slice(colonAt + 1, X.length)` | `colonAt > 0` |
+| `typecheck.canonShapeName:7110` | **`X.slice(0, colonAt + 1)`** — keeps the colon | `X.slice(colonAt + 1, X.length)` | `colonAt >= 0` |
+
+**Ten writings in five functions across three modules — all three in this cycle's partition,
+all three already importing `tyname`.** The census's copies table scored this "2 |
+`X.slice(colonAt + 1, X.length)` (field TYPE after `:`) | typecheck x2": it saw one half, in
+one module, because the other three modules spell the index `ci` instead of `colonAt` and its
+normalisation abstracted the receiver but not the INDEX VARIABLE's name.
+
+Two properties make it a textbook member of this programme's shape:
+
+* **The NAME half has a sixth spelling that keeps the delimiter** (`slice(0, colonAt + 1)`),
+  which is the endpoint-normalisation trap #1250 recorded costing W1 a site twice, now at a
+  family the census had not opened.
+* **Four different guards** in front of one operation (`ci <= 0`, `ci < 0`, `colonAt > 0`,
+  `colonAt >= 0`), so the cut must be delimiter-blind exactly as `groupInnerOf`,
+  `gaeArgsTextOf` and `fnRetTextOf` are.
+
+**FILED, NOT ROUTED.** The commissioning brief scoped this slice to W2/W3/W4/W7/W8, and taking
+an unrequested sixth family would put a un-briefed change under the same gate. The route is
+two homes (`fieldNameOf(field, ci)` / `fieldTypeTextOf(field, ci)`, index passed in, guards
+left at the sites), ten one-line substitutions, and by W2's and W4's measured rate it should
+read roughly **−1,000 to −1,400 B** — a prediction the next slice can check rather than a
+promise. It is the largest routable family left anywhere in the census.
+
+What is otherwise left is 42 design-blocked sites and a ~60-site floor that only the typed-IR
+endgame moves.
+
+### WHAT THIS SLICE FOUND WRONG
+
+1. **The frozen-source rebuild is NOT the decisive instrument for this code region** — it is a
+   null calibration for all five families, proved by two sabotages that move the corpus by
+   hundreds of files and leave it byte-identical. The commissioning brief said it was. The
+   reason is one grep: the compiler's own source has no generic type alias and no literal-union
+   type.
+2. **The "126–139 B/site" constant is a property of `.slice`-cut routings, not of routing.**
+   One of five families reproduces it; one is POSITIVE.
+3. **The census undercounts 5 for 5 again, by two NEW normalisation failures** — the SPELLING
+   (`strContains(x, " ")` for the space test) and the POSITION (a mid-scan `c == '"'` scored as
+   an index-0 leaf test). Neither is visible to a character-anchored scan.
+4. **The census's W8 home (`nameIdentRuns`) is the wrong home**, and this is the first item in
+   the programme where building the proposal and measuring it REFUTED the proposal on SIZE:
+   686 B to serve one consumer.
+5. **The census OVER-counts as well as under-counts.** Every previous correction in this family
+   moved the number up. W8 moves it down (5 → 2 routable), and `driver.modTypeRenamed` is
+   double-counted across W3 and W8 on two different characters of the same walk.
+6. **There is a family the census never opened: W14, the FIELD-COLON cut, 10 writings in 5
+   functions.** It scored 2, in one module, because its normalisation abstracted the receiver
+   but not the INDEX VARIABLE's name — `ci` in three modules, `colonAt` in the fourth. It is
+   now the largest routable family left, and it was found by re-verifying a NEGATIVE (that no
+   W2/W4-shaped slice remained), not by running the census again.
+7. **`base71.wasm`, the baseline the brief named, is not master `17eb646`.** It is 1,044,088 B;
+   master's compiler is 1,044,688 B, and they differ by far more than the transposed digits
+   suggest (sha256 `48dcbe26…` vs `1b55fcbb…`). Every A/B here is against a baseline rebuilt
+   from master's own source. A shared-scratchpad artifact is not a substitute for rebuilding
+   the baseline.
+8. **`vl fmt <file>` prints to stdout; it does not rewrite the file.** There is no `--write` and
+   no `--stdout`, and `vl fmt --check` takes exactly one path per run. `scripts/lint-self.sh` is
+   the only in-repo record of the calling convention.
