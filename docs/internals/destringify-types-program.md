@@ -32156,7 +32156,7 @@ the lesson #1266 paid for):
 ```
 build:  vl build compiler/entry.vl -o p5probe1.wasm --compiler build/vl-compiler.wasm
 corpus: vl check tests/cases --codegen --compiler p5probe1.wasm   # 1,548 programs, 9,501 reaches
-fuzz:   vl check <shard>     --codegen --compiler p5probe1.wasm   # 19,200 programs, 31,164 reaches
+fuzz:   vl check <shard>     --codegen --compiler p5probe1.wasm   # 19,200 programs, 32,052 reaches
 record: [ERROR]: ZZC \t <idx> \t <site> \t SAME|DIFF \t <nominal render> \t <canon of it>
 ```
 
@@ -32367,7 +32367,7 @@ so the one-member render is the language's rule, not a lost member.
   `--branching --multiobs`), generated ONCE with master's compiler so both legs read
   byte-identical inputs: `vl check` **identical** (124,836 lines/side), `vl check --codegen`
   **identical** (127,386 lines/side). **This channel is LIVE, not coverage** — the same shards
-  under the comparator read 31,164 reaches with 881 + 8 canon rewrites.
+  under the comparator read 32,052 reaches with 881 + 8 canon rewrites.
 * **master's FROZEN source compiled by this head** (`git archive 8c22fa06 compiler std`, 31
   files): `cmp` **RC 0** against `base83.wasm`, 1,047,770 B — **and it is VACUOUS, proved by an
   INVERTED CONTROL rather than assumed.** See the method note below.
@@ -32388,7 +32388,7 @@ compositions become three calls to one function. The fixpoint ladder held at **2
 | `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
 | corpus A/B vs `base83.wasm`, 1,594 files × 6 fields | 0 | **0 rows moved**, graded 13 / 4 |
-| fuzz A/B, 19,200 programs, `check` + `check --codegen` | 0 | identical on both channels — LIVE (31,164 reaches) |
+| fuzz A/B, 19,200 programs, `check` + `check --codegen` | 0 | identical on both channels — LIVE (32,052 reaches) |
 | master's frozen source compiled by this head, `cmp` vs `base83.wasm` | 0 | byte-identical — **vacuous**, see below |
 
 ### METHOD NOTES
