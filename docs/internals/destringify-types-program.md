@@ -29142,6 +29142,7 @@ grammar has it".
 | **W7** | the SPACE-FREE normalisation family | 7 (+4 declined) | `emit_base.normTypeAtom` / `canonBareShapeName` · `emit_classify.spacelessName` / `mvValKindOfName` · `emit_rep.renderFaithful` | six bodies each asserting or enforcing "a canonical type name has no spaces" | `nameIsSpaceFree` + `nameStripSpaces` in **`tyname.vl`** | **LEGAL** — emit_base / emit_classify / emit_rep all import `tyname` |
 | **W8** | the type-name IDENTIFIER-RUN walk | 5 | `driver.modGenParams` / `modTypeRenamed` · `typecheck.nameNeedsCanon` | walks a rendered type name character by character classifying identifier runs (the module-merge rename, and the canon trigger scan) | a run tokenizer `nameIdentRuns(name, outStart, outEnd)` in **`tyname.vl`** | **LEGAL** — driver and typecheck both import `tyname` |
 | **W9** | the CANON pass | 10 | `typecheck.canonEmitNameAt` (4) · `canonShapeName` (4) · `nameNeedsCanon` (2) | the checker re-parsing names it rendered | **DESIGN-BLOCKED.** `canonEmitName` is not `tyToEmitName ∘ nameToTy` — they disagree on 853 of 5,172 annotations (16.5%), 41 canon-only / 108 renderer-only / 5 both. The `renderEmit(ty, ctx)` six-phase design is the answer; P1-P3 have landed | n/a — not a routing problem |
+| | ↑ **SUPERSEDED — read the P4 and P5 sections at the end of this document.** #1266 re-derived the census (the row above staples B1's TOTAL to B3's decomposition; 41+108+5 = 154 ≠ 853). Current: **B1** 1,230 / 7,063 = 17.41%, 29 canon-only / 1,179 renderer-only / 22 both. **B2** (`tyToNominalName ∘ nameToTy`) 194 / 7,130 = 2.72%, 52 / 112 / 30, decomposed by P5 into nine classes of which **114 (58.8%) is the generic APPLICATION the arena cannot spell**. **B3** 272 / 7,150 = 3.80%, 43 / 191 / 38. `emit_collect.vl`'s three render-then-re-canon sites are **one** since P5, and the outer canon there is measured LOAD-BEARING (its deletion moves 13 corpus rows, one of them a wrong answer) | |
 | **W10** | `nameToTyReal` | 9 | `typecheck.nameToTyReal` | the compiler's SECOND recursive-descent type parser | **a SOURCES problem**, not a site problem: the answer is the parser's `annTs` spelling tree (D-PARSETY / D-TSTY). Partly banked at positioned annotations; the residue is the positions the parser still `tsPop()`s | n/a |
 | **W11** | the PIN / SENTINEL markers | 10 | `emit_mono.monoMakeInstance` (3) · `typecheck.recordClonedNodeTy` (7) | `=>sigkey` and `#anonN` PROVENANCE prefixes riding a `TypeRef.tyName` column | not a grammar. Retired by giving the pin its **own column**, not by a home | n/a |
 | **W12** | the `$fnsig` ABI | 9 (+4) | `emit_classify.sigKeyRetTokIx` / `sigKeyRetKind` / `sigKeyRetIsVoid` / `sigKeyRetSlot` / `sigKeyPinPayload` / `sigParamCoerceKind` · `emit_sections.synthSigIdxAt` / `emitSynthCloSig` | a minted representation-kind encoding | ruled out of scope by two in-code notes; each scan already has a single home | n/a |
@@ -31441,7 +31442,7 @@ three-writing SPLIT entry and W14 (field-colon cut) are closed. What remains, in
 
 | # | residue | count | kind of block | anchor (find by CONTENT — line numbers expire) |
 |---|---|---:|---|---|
-| 1 | **W9** the CANON pass | **10** | DESIGN — `canonEmitName` is not `tyToEmitName ∘ nameToTy` (853 of 5,172 annotations disagree); the answer is the `renderEmit(ty, ctx)` design, P1-P3 landed | `typecheck.canonEmitNameAt` (4) · `canonShapeName` (4) · `nameNeedsCanon` (2) |
+| 1 | **W9** the CANON pass | **10** | DESIGN — `canonEmitName` is not `tyToEmitName ∘ nameToTy`. **The 853/5,172 figure is superseded** (see the P4/P5 sections at the end): B1 is 1,230 / 7,063 = 17.41%, B2 is 194 / 7,130 = 2.72%. P1-P5 landed; `emit_collect`'s three render-then-re-canon sites are one, and the canon there is measured load-bearing | `typecheck.canonEmitNameAt` (4) · `canonShapeName` (4) · `nameNeedsCanon` (2) |
 | 2 | **W10** `nameToTyReal` | **9** | DESIGN — a SOURCES problem; the answer is the parser's `annTs` spelling tree (D-PARSETY / D-TSTY), partly banked | `typecheck.nameToTyReal` |
 | 3 | **W11** the PIN / SENTINEL markers | **10** | DESIGN — not a grammar; retired by giving the pin its own COLUMN | `emit_mono.monoMakeInstance` (3) · `typecheck.recordClonedNodeTy` (7) |
 | 4 | **W12** the `$fnsig` ABI | **13** | DESIGN — a minted encoding, ruled out of scope by two in-code notes; each scan already has a single home | `emit_classify.sigKey*` / `sigParamCoerceKind` · `emit_sections.synthSigIdxAt` / `emitSynthCloSig` |
@@ -32134,3 +32135,307 @@ first refresh and at **1** thereafter.
   class rather than a tidiness gap. Threading it is half the fix and the other half is the
   decision.
 * **Any fixture, any second module, any import.** The partition was one file.
+
+## renderEmit P5 — the THREE render-then-re-canon sites become ONE, the outer canon is proved LOAD-BEARING at all three, and B2's 194 is decomposed (off master `8c22fa06`)
+
+Base `8c22fa06`. Partition: `compiler/emit_collect.vl` and this append. No fixture, no
+second module, no import, no `typecheck.vl` edit.
+
+#1266 filed three `canonEmitName(tyToNominalName(…))` sites in `emit_collect.vl` as "W9's
+shape" and left the question open: **B2 (`tyToNominalName ∘ nameToTy`) agrees with canon
+97.28%, so is the outer canon at those sites a near-no-op re-parse that can be deleted?**
+This slice answers it per site, with a comparator, and the answer is **NO at all three** —
+one of them for a reason an 8,516-reach zero completely hides.
+
+### TARGET 1 — THE PER-SITE COMPARATOR, AND WHAT THE OUTER CANON ACTUALLY BUYS
+
+An instrumented compiler computes BOTH legs at every reach of all three sites and reports
+each as one diagnostic (with a per-record index — `tErrCoded` de-duplicates exact repeats,
+the lesson #1266 paid for):
+
+```
+build:  vl build compiler/entry.vl -o p5probe1.wasm --compiler build/vl-compiler.wasm
+corpus: vl check tests/cases --codegen --compiler p5probe1.wasm   # 1,548 programs, 9,501 reaches
+fuzz:   vl check <shard>     --codegen --compiler p5probe1.wasm   # 19,200 programs, 32,052 reaches
+record: [ERROR]: ZZC \t <idx> \t <site> \t SAME|DIFF \t <nominal render> \t <canon of it>
+```
+
+| site | corpus reaches | corpus rewrites | fuzz reaches | fuzz rewrites |
+| --- | ---: | ---: | ---: | ---: |
+| `reachRegisterName`, canon leg | 7,914 | **72** (0.91%) | 20,839 | **881** (4.23%) |
+| `reachRegisterName`, `underFunc` leg | 558 | — (canon not applied) | 2,524 | — |
+| `funcRetUnrepresentable` | 134 | **4** (2.99%) | 1,068 | **8** (0.75%) |
+| `collectTyReachCloSigs` | 895 | **0** | 7,621 | **0** |
+
+**THE 72 ARE THREE RULES AND NOTHING ELSE**, and every one is a key the emitter uses:
+
+| rule | rows | example |
+| --- | ---: | --- |
+| a string-litunion ALIAS inside a union softened to `string` | **58** | `K0\|f64` → `string\|f64`, `(S\|K)[]` → `(S\|string)[]` |
+| alias TRANSPARENCY | **12** | `Z` → `i32`, `L\|i32` → `{n:i32}[]\|i32` |
+| a union-ALIAS flattened into its members | **2** | `AB\|null` → `{t:i32,a:i32}\|{t:i32,b:i32}\|null` |
+
+These are the same rules B2's residue is made of (below), restricted to what an arena render
+can even spell — a render never writes a generic APPLICATION and never writes a raw literal,
+so B2's two largest classes cannot occur here at all.
+
+**AND THE DELETION COUNTERFACTUAL IS MEASURED, NOT ARGUED.** Sabotage **SAB-A** is exactly the
+proposed deletion — `arenaEmitName` computes the canon and returns the raw render instead.
+It moves **13 corpus rows**: 6 programs go BUILDRC 0→1, 7 change BUILDMSG, 7 change BYTES,
+6 change RUNRC, and `tests/cases/unions/litunion-value-union-is.vl` changes its **stdout**
+(a silent wrong answer, not a reject). Deleting the outer canon is not a cleanup; it is a
+13-program regression with a miscompile in it.
+
+### THE `collectTyReachCloSigs` ZERO IS A COVERAGE ZERO, AND THE SHAPE THAT BREAKS IT IS ITSELF A MISCOMPILE
+
+8,516 reaches over two independent channels, 0 rewrites. That is exactly the shape of an
+"inert by construction" claim, and it is false. `canonEmitName` leaves a top-level function
+type verbatim **except** when the render ends in `)` — the paren-result arm — where it
+recurses into the PARAMS at `RC_FN_PARAM`, which `ctxKeepsLitUnion` does **not** admit. Two
+lines make it fire, and the control isolates the paren:
+
+```vl
+type K0 = "a" | "b"
+const f: (K0 | i64) => ((i32) => i32) = mk    // renders (K0|i64)=>((i32)=>i32)
+                                              // canons  (string|i64)=>((i32)=>i32)   DIFF
+const g: (K0 | i64) => i32              = mk2 // renders (K0|i64)=>i32 — left VERBATIM  SAME
+```
+
+Both were run through the comparator; the records are `ZZC 5 S3 DIFF` and `ZZC 11 S3 SAME`.
+**So canon's own "a top-level function type is verbatim" rule is not true of its parameters:
+whether a function type's PARAM is canonicalized is decided by whether its RESULT happens to
+be parenthesized.** Filed here, not fixed — it is a canon policy question, and the arena-side
+mirror is correct either way precisely because it applies the same `canonEmitName`.
+
+**AND THE CORPUS'S ZERO HAS A PARTIAL CAUSE — stated as partial, because it is.** The arm
+canons the params at `RC_FN_PARAM` and the result at `RC_FN_RES`, so either side could in
+principle supply the rewrite. The PARAM route is the one I found and it is closed by a
+compiler defect: the only param spelling canon rewrites is a union / litunion-alias one, and
+a value-union param on a function VALUE is a live silent miscompile (next section), so no
+green program can reach the arm that way. The RESULT route was NOT swept and no claim is made
+about it — `RC_FN_RES` keeps literal unions, which removes the obvious candidate, but that is
+an argument and not a measurement. A scalar-alias param does not work as a substitute:
+`type Z = i32` with `(Z) => ((i32) => i32)` renders `(i32)=>((i32)=>i32)` — the arena
+resolved the alias before the renderer saw it — and canon has nothing to do (verified, the
+program prints 15 and the comparator reads three `SAME` reaches).
+
+### A LIVE SILENT MISCOMPILE FOUND BY THAT WITNESS HUNT — a value UNION as a function-VALUE PARAMETER
+
+Three lines, `vl check` **rc 0** (one unused-parameter warning), `vl build` writes 514 bytes
+and the module does not validate:
+
+```vl
+function mk(k: string | i64): i32 { return 1 }
+const f: (string | i64) => i32 = mk
+print(f("a"))
+```
+```
+Error: … is not a valid WebAssembly module — it was written, but it cannot instantiate
+Caused by: type mismatch: expected (ref $type), found (ref $type) (at offset 0x131)
+```
+
+Narrowed on a 9-param × 4-form grid (36 programs, all run against master `8c22fa06`):
+
+| param type | direct call | fn VALUE | fn value, paren result | inline lambda |
+| --- | --- | --- | --- | --- |
+| `K0` (a litunion alias) | ok | ok | ok | ok |
+| `"a" \| "b"` (inline litunion) | ok | ok | ok | ok |
+| `string`, `i64`, `i32` | ok | ok | ok | ok |
+| **`K0 \| i64`** | ok | **INVALID** | **INVALID** | **INVALID** |
+| **`K0 \| i32`** | ok | **INVALID** | **INVALID** | **INVALID** |
+| **`("a"\|"b") \| i64`** | ok | **INVALID** | **INVALID** | **INVALID** |
+| **`string \| i64`** | ok | **INVALID** | **INVALID** | **INVALID** |
+
+**12 of 36 cells, and literal unions are incidental** — the trigger is a value UNION in the
+PARAMETER position of a function TYPE, reached through a function value / lambda rather than
+a direct call. `funcRetUnrepresentable` is the floor for an unrepresentable RESULT; there is
+no parameter twin, so a `$fnsig` is minted for a param the value ABI cannot carry.
+**Not fixed here** — the fix lives in the `$fnsig` kind/slot columns (`cloRetKindOf`'s param
+sibling), which is `emit_classify.vl` and a three-producer ABI, outside this partition.
+
+### `funcRetUnrepresentable`: 12 STRING REWRITES, ZERO CONSUMER DECISIONS — MEASURED, AND I NEARLY SHIPPED THE OPPOSITE FROM READING THE CODE
+
+This site's consumer is not the string; it is `nameIsShapeOpen(nm)` then
+`funcTypeShapeLowerable(nm)`, and `funcTypeShapeLowerable` chains into `nameFieldCode` and
+`isUName` — both NAME-keyed, so a rewritten field type (`{a:K0|boolean,…}` →
+`{a:string|boolean,…}`) looked certain to flip it. A second probe reporting the consumer's
+BOOLEAN on both legs says otherwise:
+
+| | corpus | fuzz |
+| --- | --- | --- |
+| both legs lowerable | 107 + 4 rewritten | 932 + 4 rewritten |
+| both legs NOT lowerable | 16 | 128 + 4 rewritten |
+| not a shape-open name on either leg | 7 | 0 |
+| **consumer-decision disagreements** | **0** | **0** |
+
+1,202 reaches, 12 string rewrites, **0 decision changes**. That makes this the strongest
+remaining deletion candidate in the family — and it is still only a COVERAGE zero (the
+`isUName` leg is a registry lookup, so a construction argument, not a bigger sample, is what
+would close it). Filed, not taken. *Measure at the consumer's tolerance — and measure it,
+because the code reads like it must disagree.*
+
+### WHAT P5 SHIPS — the body that existed three times
+
+```vl
+function arenaEmitName(tyIx: i32): string {
+  const nom = tyToNominalName(tyIx)
+  if nom == "" { return "" }
+  canonEmitName(nom)
+}
+```
+
+`reachRegisterName`'s canon leg, `funcRetUnrepresentable` and `collectTyReachCloSigs` all
+call it. The `""` guard is equivalent at each: `canonEmitName("")` returns `""` at its first
+line, `nameIsShapeOpen("")` is false, and the sig site's own `nm != ""` still decides. The
+`underFunc` leg keeps its raw render and is unchanged.
+
+**`emit_collect.vl`'s W9 site count goes 3 → 1**, which is the whole point: the outer canon
+cannot be deleted (measured, twice), so what can be removed is the *duplication of the hop*.
+Static call sites (string-literal-aware `//` stripper, `NAME(` in code, each function's own
+header excluded, run over `git show master:` and the head side by side):
+`canonEmitName` **3 → 1**, `tyToNominalName` **4 → 3**, `arenaEmitName` **0 → 3**,
+`reachRegisterName` 2 → 2. No scanner on the off-list table moves.
+
+### TARGET 2 — B2's 194 DISAGREEMENTS, DECOMPOSED
+
+The census was RE-DERIVED at `8c22fa06` before anything was decomposed, and it reproduces
+#1266's every figure to the unit — 7,531 records, 7,234 byte-identical / 297 rewritten,
+B1 5,833/7,063 = 82.59% with 29 / 1,179 / 22, B2 6,936/7,130 = **97.28%** with **194**,
+B3 6,878/7,150 = 96.20% with 272. **P4 moved the base by zero, as a behaviour-preserving
+phase must.** B2's own direction split, which #1266 did not publish, is
+**52 canon-only / 112 renderer-only / 30 both-differently**.
+
+```
+build:    (the probe banks pre/post/node in canonEmitTypeNames' loop and reports after it)
+          vl build compiler/entry.vl -o p5cen1.wasm --compiler build/vl-compiler.wasm
+run:      vl check tests/cases --compiler p5cen1.wasm > P5-cen.out    # rc 1, the probe raises
+extract:  bash P5-cen-an.sh P5-cen      # ZZP records -> pre/post/b1/b2/b3 TSV + the 3 candidate tables
+classify: bash P5-b2.sh P5-cen && python3 P5-b2class.py P5-cen.b2
+```
+
+The classifier is mechanical: stage 1 buckets by a construct present in the SOURCE spelling
+(`<` application, `"` inline literal, `&` intersection); stage 2 runs a difflib token diff of
+canon's answer against the nominal render and buckets by what each replacement run looks like
+on the two sides. **Zero rows fall through.**
+
+| class | what it is | canon-only | rend-only | both | total | files |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **G** | a generic APPLICATION: the nominal renderer has no nominal route to `Box<i32>` and expands the instantiated shape; canon keeps the head (`gaeBases` is keyed by the DECLARED name) and canons the ARGUMENTS only | 0 | 98 | 16 | **114** | 43 |
+| **Lsoft** | a string-litunion ALIAS inside a union, softened by canon, preserved by the renderer — **the owner-pending rule, seen on B2's axis** | 31 | 0 | 0 | **31** | 16 |
+| **T** | alias TRANSPARENCY: canon resolves a one-member alias (`Z`→`i32`, `MyCat`→`{meow:i32}`), the renderer keeps the declared NAME | 19 | 0 | 9 | **28** | 15 |
+| **Lin-alias** | an INLINE literal union canon PRESERVES (`litUnionPreserve`) that the renderer regroups into a declared alias (`(("a"\|"b")\|null)[]` → `(K\|null)[]`) | 0 | 4 | 4 | **8** | 4 |
+| **U** | same-shape union members COLLAPSE under a nominal render (`A\|B` → `A`) | 0 | 4 | 0 | **4** | 3 |
+| **Lin-soft** | the same inline literal union, softened by the renderer to `string` | 0 | 3 | 0 | **3** | 3 |
+| **P** | grouping parens only (`()=>(()=>(i32)=>boolean)` vs `()=>(()=>((i32)=>boolean))`) | 0 | 2 | 0 | **2** | 2 |
+| **X** | a union-ALIAS expanded into its members by canon | 2 | 0 | 0 | **2** | 1 |
+| **I** | an INTERSECTION whose fold one side renders and the other does not | 0 | 1 | 1 | **2** | 1 |
+| | **TOTAL** | **52** | **112** | **30** | **194** | |
+
+**THE HEADLINE IS G: 114 of 194 (58.8%) IS ONE MISSING CAPABILITY, NOT A POLICY
+DISAGREEMENT.** `tyToNominalName` cannot spell `Box<i32>` because **no `TypeDecl` is named
+`Box<i32>`** — `structNameOfTy` and `unionAliasDeclNameOfTy` both miss, and the arena type of
+the application is the substituted `{v:i32}` with no record that it came from an application.
+Neither producer is wrong; the ARENA does not carry what canon's answer needs. That is the
+C1-endgame typed-IR item (`nodeTyIx` for emit-time-cloned monomorphized nodes), not a
+renderEmit phase. **G + T + Lsoft is 173 of 194 (89.2%)**, and T and Lsoft are the two rules
+`arenaEmitName`'s canon is already applying at the emitter sites.
+
+**THE ONE CLASS THAT IS UNCONTROVERSIALLY CANON-MATCHING IS T's CANON-ONLY HALF (19 rows).**
+`type Z = i32` used at a root position renders `Z` — a name the emitter's vocabulary cannot
+classify at all — while #1122 already ruled a one-member alias TRANSPARENT. Its `both` half
+(9 rows, `MyCat` → canon `{meow:i32}` / nominal `Cat`) is the OPPOSITE ruling and is O2
+verbatim, and #1122's record says the nominal route there was built, measured and REGRESSED.
+**So T cannot be converted as a class** — only its scalar half, and doing so edits
+`tyToNominalName`, which is `typecheck.vl` and changes the `underFunc` leg's keys. Filed as
+P6's first item with that boundary attached, not taken here.
+
+**U IS NOT A DEFECT, AND IT IS WORTH SAYING SO.** `A|B` where `A` and `B` have the identical
+shape renders `A`: `structNameOfTy` answers with the first declared name for that shape and
+the union arm dedups. VL is structurally typed and its own fixture
+(`tests/cases/types/struct-union-same-shape.vl`) says *"a `B` value genuinely IS an `A`"* —
+so the one-member render is the language's rule, not a lost member.
+
+### CHANNEL GRADING — TWO SABOTAGES, BOTH BUILT FROM A COPY, BOTH WITH NON-EMPTY WITNESSES
+
+| # | sabotage | corpus rows moved (1,594 files × 6 fields) |
+| --- | --- | ---: |
+| **SAB-A** | `arenaEmitName` returns the RAW render (the deletion counterfactual) | **13** — BUILDRC(0/1) ×6, BUILDMSG ×7, BYTES ×7, RUNRC(0/1) ×6, **RUNOUT ×1**. Files: `types/{array-alias-nominal-element-stays-opaque, declared-vs-inline-mixed-union-field-twin, nullable-union-alias}`, `lists/{reflist-inline-shape-union-elem, union-element-array-litunion}`, `unions/{litunion-value-union-is, struct-field-array-of-struct-union}`, five `closures/*-litunion-mix-result`, `maps/closure-result-array-of-mixed-union-value-maps` |
+| **SAB-B** | the `underFunc` gate removed (canon runs on the func-nested leg too) | **4** — `closures/nested-closure-field-litunion-box-result` BUILDRC(0/1)+BUILDMSG+RUNRC, plus BYTES on `closures/named-fn-union-arm-litunion-mix-result`, `closures/nulclosure-mixed-union-result`, `maps/closure-result-array-of-mixed-union-value-maps` |
+
+### EQUIVALENCE
+
+* **corpus A/B, 1,594 files × 6 fields** (`vl check` rc · `vl check` message · `vl build` rc ·
+  `vl build` message · emitted BYTES · run rc+stdout) vs `base83.wasm` (master `8c22fa06`,
+  1,047,770 B): **0 rows moved on every field.** Graded by SAB-A (13) and SAB-B (4).
+* **fuzz A/B, 19,200 programs/side** (seeds 1301-1304 × depths 4/5/6 × plain/declared,
+  `--branching --multiobs`), generated ONCE with master's compiler so both legs read
+  byte-identical inputs: `vl check` **identical** (124,836 lines/side), `vl check --codegen`
+  **identical** (127,386 lines/side). **This channel is LIVE, not coverage** — the same shards
+  under the comparator read 32,052 reaches with 881 + 8 canon rewrites.
+* **master's FROZEN source compiled by this head** (`git archive 8c22fa06 compiler std`, 31
+  files): `cmp` **RC 0** against `base83.wasm`, 1,047,770 B — **and it is VACUOUS, proved by an
+  INVERTED CONTROL rather than assumed.** See the method note below.
+* **`SELFHOST_NATIVE_ALIGN=1 deno task test`: 3348 / 0 / 8** — master `8c22fa06`'s own reading.
+  No fixture added, so a delta would have been a defect.
+
+**BINARY: 1,047,770 → 1,047,784 B, +14 B.** A cost, reported as one: three inline
+compositions become three calls to one function. The fixpoint ladder held at **2 compiles**.
+
+### GATE — EVERY RC TAKEN BARE, NEVER THROUGH A PIPE
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,047,770 B**, sha256 `7737676f…` — `cmp` clean against the `base83.wasm` baseline, so the A/B baseline IS master's published compiler |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | log reads *"compile(next) == next — next is the fixpoint (2 compiles)"*, **1,047,784 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,047,784 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3348 / 0 / 8** |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
+| corpus A/B vs `base83.wasm`, 1,594 files × 6 fields | 0 | **0 rows moved**, graded 13 / 4 |
+| fuzz A/B, 19,200 programs, `check` + `check --codegen` | 0 | identical on both channels — LIVE (32,052 reaches) |
+| master's frozen source compiled by this head, `cmp` vs `base83.wasm` | 0 | byte-identical — **vacuous**, see below |
+
+### METHOD NOTES
+
+* **AN INVERTED CONTROL CAN FAIL A "STRONG" INSTRUMENT THAT HAS LIVE REACHES.** The compiler's
+  own source reaches `reachRegisterName`'s canon leg **207 times** (`vl check compiler/entry.vl
+  --codegen` under the comparator) and `funcRetUnrepresentable` / `collectTyReachCloSigs` zero
+  times — so the frozen-rebuild instrument looked LIVE for this family for the first time in
+  the arc. It is not. **Both sabotages — which move 13 and 4 corpus rows — leave master's
+  frozen rebuild byte-identical (1,047,770 B, `cmp` rc 0).** All 207 reaches are `SAME`, so a
+  sabotage that can only change the DISAGREEING answers has nothing to move. *Reach is not
+  consequentiality, and the way to find that out is to point the instrument at a build you have
+  already proved wrong on another channel.*
+* **AN 8,516-REACH ZERO IS NOT INERTNESS.** `collectTyReachCloSigs` reads 0 rewrites over
+  1,548 corpus + 19,200 fuzz programs, and a seven-line program makes it fire. What the zero
+  measured was the corpus's shape distribution — and, once the miscompile above was found, a
+  hard *reason* for it: the shapes that reach the rewriting arm cannot be compiled at all
+  today. *Before writing "inert", name the input that would break it and try to build one.*
+* **MEASURE AT THE CONSUMER, INCLUDING WHEN THE CODE READS LIKE IT MUST DISAGREE.**
+  `funcTypeShapeLowerable` chains into two NAME-keyed lookups and I had written the sentence
+  claiming its answer must flip on a rewritten field type. It never flips: 1,202 reaches, 12
+  string rewrites, 0 decision changes.
+* **A CENSUS RE-DERIVED FROM ITS PUBLISHED COMMAND IS WORTH THE BUILD.** Reproducing #1266's
+  7,531 / 7,234 / 297 and all three candidate tables to the unit is what makes B2's *new*
+  decomposition trustworthy — and it independently confirms P4 shipped a behaviour-preserving
+  phase. #1266 recorded its command; this slice records its classifier.
+* **THE BIGGEST CLASS IN A DISAGREEMENT IS NOT ALWAYS A DISAGREEMENT.** 114 of B2's 194 is
+  `Box<i32>` versus `{v:i32}`, and neither producer is applying a policy — the arena has no
+  record that an application was ever written. Naming that class correctly moves 59% of the
+  residue out of renderEmit's scope and into the typed-IR item.
+
+### WHAT THIS SLICE DELIBERATELY DID NOT SHIP
+
+* **The `funcRetUnrepresentable` canon deletion** — 0 consumer-decision disagreements over
+  1,202 reaches, but the consumer's `isUName` leg is a registry lookup, so what would close it
+  is a construction argument, not a larger sample.
+* **T's canon-only half (19 rows)** — the one uncontroversially canon-matching class. Taking it
+  edits `tyToNominalName` (`typecheck.vl`) and changes the `underFunc` leg's keys; it is P6's
+  first item, with T's `both` half explicitly NOT included (that half is O2, and #1122 already
+  measured the nominal route regressing).
+* **The value-union function-VALUE PARAMETER miscompile** — 12 of 36 cells, three-line repro,
+  `emit_classify.vl`'s `$fnsig` columns, outside this partition.
+* **Canon's paren-result parameter asymmetry** — whether a function type's PARAM is
+  canonicalized should not depend on whether its RESULT is parenthesized. Witness above.
+* **The mixed-union litunion-alias decision (Lsoft, 31 rows on B2's axis / 29 on B1's)** —
+  still the owner's call, untouched, exactly as #1266 left it.
