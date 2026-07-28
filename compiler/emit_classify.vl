@@ -110,6 +110,7 @@ import {
   tyIsLitUnionArray,
   tyIsNullableLitUnion,
   tyToEmitName,
+  tyToNominalName,
   unionAliasDeclNameOfTy,
   valueAtomKind,
 } from "./typecheck"
@@ -7223,16 +7224,33 @@ export function cloArrSlotRetName(slot: i32) {
 // `sigKeyRetTokIx` either — that home finds the LAST `>` with a whole-key scan, which
 // inside this per-character loop would make the walk quadratic.
 export function sigParamCoerceKind(key: string, idx: i32): VKind | null {
+  const k = sigParamKindAt(key, idx)
+  if k == "i64" || k == "f64" || k == "f32" { return k }
+  null
+}
+
+// The `VKind` of parameter `idx` in a `$fnsig` KEY's param-token spine — the WHOLE answer
+// `sigParamCoerceKind` above filters down to its three wide-scalar rows. `null` for an
+// out-of-range index (the walk reached the `>` result separator or ran out of key) or a
+// character outside the token vocabulary.
+//
+// THE INTERLOCK, and the reason this is a separate export rather than an inlined re-walk:
+// the token at position `idx` IS the valtype the `call_ref`'s cast functype declares for
+// that parameter, so an argument coercion decided from it cannot disagree with the bytes.
+// `emitCallRef`'s union-box arm reads it (`"union"` ⟹ the callee wants `(ref $uBox)`, so a
+// raw scalar / string / variant argument must be boxed) — a decision the key can make and
+// the CHECKER type alone cannot, because the key is what the three producers agreed on.
+// (The union NAME for the tag choice is the opposite: slot-free in the ABI, so it comes
+// from the checker type — `cloCallParamUnionName`. Kind from the key, identity from the
+// arena; each from the only side that has it.)
+export function sigParamKindAt(key: string, idx: i32): VKind | null {
   let i = 0
   let p = 0
   while i < key.length {
     const c = key[i]
     if c == '>' { return null }
     const k = repKindOfSigTok(c)
-    if p == idx {
-      if k == "i64" || k == "f64" || k == "f32" { return k }
-      return null
-    }
+    if p == idx { return k }
     if repSigTokHasSlot(k) {
       while i < key.length && key[i] != ';' { i = i + 1 }
       i = i + 1
@@ -7365,6 +7383,96 @@ export function cloCallParamLitUnion(callIx: i32, idx: i32) {
     }
   }
   0
+}
+
+// The union-BOX PARAMETER NAME of value call `callIx`'s parameter `idx` — the emitter's
+// registered union name (`isUName`), which `emitUnionCoerce` resolves to its member set for
+// the tag choice. "" when the parameter is not a union box.
+//
+// THE PARAMETER TWIN of the RESULT-side `cloCallUnionResultUnrepresentable`, and the
+// `emitCallRef` twin of the seed `emitCall` reads off a DECLARED callee's `Param` node
+// (`vtKindOfParam(...) == "union"` → `cUNm = tyNameOf(parType)` → `emitUnionBoxArg`), which a
+// function VALUE has no `Param` node to reach. Without it a value call pushed the RAW scalar /
+// string / ref into a parameter the `$fnsig` functype declares as `(ref $uBox)` — `vl check`
+// rc 0, INVALID WASM, from four ordinary lines:
+//
+//     function mk(k: string | i64): i32 { return 1 }
+//     const f: (string | i64) => i32 = mk
+//     print(f("a"))
+//   → "type mismatch: expected (ref $type), found (ref $type)"
+//
+// in EVERY function-value shape (annotated binding, lambda, HOF param) and for EVERY value-
+// union spelling (inline `string | i64`, the alias `type U = string | i64`, the mixed
+// `{w: i32} | i64`, the nullable-scalar niche `i32 | null` — which reps as the box too). A
+// union-VALUE argument escaped, because it already IS the box; only a raw member had to be
+// told which rep to take. The exact shape of the litunion `cloCallParamLitUnion` above.
+//
+// IT CANNOT COME FROM THE `$fnsig` KEY, for the same reason the litunion flavour cannot and a
+// stronger one: the union token `u` is deliberately SLOT-FREE (`repSigTokHasSlot` excludes it)
+// because every boxed union shares ONE `$uBox` valtype, so two functions taking different
+// unions MUST share a `$fnsig`. The key can therefore say a parameter is a box — which is
+// exactly what `sigParamKindAt` is read for at the call site — but never WHICH box. So the
+// KIND comes from the key (it is the byte the cast functype carries) and the IDENTITY from
+// the checker type, here.
+//
+// The two litunion flavours are subtracted FIRST and by the same predicates
+// `cloCallParamLitUnion` claims them with: a litunion alias reps as the interned i32 ATOM and
+// a `K | null` as the `-1` niche — neither is a box, and boxing one would undo #1170.
+export function cloCallParamUnionName(callIx: i32, idx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const ft = nodeTyIxOf(c.callFn)
+    if ft < 0 { return "" }
+    const t = T.tys[ft]
+    if t is TyFunc {
+      if idx < 0 || idx >= t.fnParamTypes.length { return "" }
+      const pty = t.fnParamTypes[idx]
+      if tyIsLitUnion(pty) { return "" }
+      if tyIsNullableLitUnion(pty) { return "" }
+      // A REGISTRY LOOKUP, not a key mint — which is why three candidate spellings is the
+      // right shape and not a smell. `emitUnionCoerce` needs a name the union REGISTRY
+      // knows (`isUName`, so `unionMemberSetOf` resolves it to the member set the tag
+      // choice reads); the registry was filled from whichever spelling reached this union
+      // first, and the arena cannot say which. So ASK, most-specific first, and let the
+      // token producer confirm — each candidate is measured, not guessed:
+      //
+      //  1. the DECLARED alias, by arena-index identity. `type U = A | B` registers under
+      //     `U`, so a render is a name `isUName` does not know: keying the render alone
+      //     turned nine working `type U = …` cells into a loud reject. `U` is also exactly
+      //     what the direct twin passes (`tyNameOf(parType)`), so both boundaries hand
+      //     `emitUnionCoerce` the same string.
+      //  2. the NOMINAL render. An INLINE union has no declaration to name and registers
+      //     under its member set — but that set is spelled NOMINALLY (`A|B`), because the
+      //     registration walk keys `tyToNominalName`. The STRUCTURAL renderer expands a
+      //     declared struct member to its shape (`{a:i32}|{b:i32}`), a name nothing
+      //     registered: `tests/cases/closures/closure-param-union-arena-walk.vl` — an
+      //     `(A | B) => i32` HOF param, registered ONLY by the arena walk — is the witness.
+      //  3. the STRUCTURAL render, for an inline union the source itself spelled
+      //     structurally, where that IS the registered key.
+      //
+      // The `canonEmitName` leg of the registration hop (`emit_collect.arenaEmitName`) is
+      // deliberately NOT reproduced here: its rewrites are litunion softening and alias
+      // transparency, and both litunion flavours are already subtracted above. A fourth
+      // copy of that hop would also have to move a private function across a module edge
+      // that runs the wrong way (`emit_collect` imports THIS file).
+      let nm = unionAliasDeclNameOfTy(pty)
+      if nm != "" {
+        if annParamKind(nm) == repSigTokOfKind("union") { return nm }
+      }
+      nm = tyToNominalName(pty)
+      if nm != "" {
+        if annParamKind(nm) == repSigTokOfKind("union") { return nm }
+      }
+      nm = tyToEmitName(pty)
+      if nm == "" { return "" }
+      // The REGISTRATION test, made by the token producer itself rather than restated: a name
+      // `annParamKind` keys `u` is one `isUName` admits, hence one `unionMemberSetOf` resolves.
+      // Asking the producer keeps this arm and the ABI from ever disagreeing about what a box is.
+      if annParamKind(nm) != repSigTokOfKind("union") { return "" }
+      return nm
+    }
+  }
+  ""
 }
 
 // The PRODUCER (concrete-lambda) `$fnsig` key of a function-VALUE binding `name` — the
