@@ -14222,6 +14222,41 @@ function matchBlockOf(bodyIx: i32) {
   mkBlock(one, -1)
 }
 
+// The arm's block WITH its payload bindings (phase 2b) — `matchBlockOf` plus the clause's
+// `const x = scrut.x` decls PREPENDED, which is the whole of the phase-2b lowering. The arm is
+// already `if scrut is Move { <block> }`, so the result is node-for-node the hand-written
+// `if cmd is Move { const x = cmd.x; … }` twin: no new chain, no new narrowing, no new emitter path.
+//
+// A Block body is rewritten IN PLACE (`P.nodes[bodyIx] = …`, the same arena overwrite
+// `desugarMatchAt` ends with) rather than replaced by a fresh index: the body already carries a
+// checked `nodeTyIx` row, and a new node minted here would read back -1 forever. A bare-expression
+// body has no such row to preserve — it is wrapped, exactly as `matchBlockOf` wraps it today.
+function matchArmBlockOf(bodyIx: i32, bindIx: i32) {
+  if bindIx < 0 { return matchBlockOf(bodyIx) }
+  const stmts: i32[] = []
+  const bn = P.nodes[bindIx]
+  if bn is Block {
+    let i = 0
+    while i < bn.blkStmts.length {
+      stmts.push(bn.blkStmts[i])
+      i = i + 1
+    }
+  }
+  const b = P.nodes[bodyIx]
+  if b is Block {
+    let j = 0
+    while j < b.blkStmts.length {
+      stmts.push(b.blkStmts[j])
+      j = j + 1
+    }
+    const spliced = mkBlock(stmts, b.pos)
+    P.nodes[bodyIx] = P.nodes[spliced]
+    return bodyIx
+  }
+  stmts.push(bodyIx)
+  mkBlock(stmts, -1)
+}
+
 // `scrut == p0 [|| scrut == p1 …]` over match arm `k`'s OR-patterns.
 //
 // A TYPE pattern is ALREADY the test: the parser minted it as an `IsExpr` over this very
@@ -14253,6 +14288,32 @@ function matchArmCond(
     pj = pj + 1
   }
   cond
+}
+
+// Arm `k`'s PAYLOAD-BINDING clause (phase 2b) — the `Block` of `const x = scrut.x` decls the
+// parser banked on the arm's pattern — or -1 when it binds nothing. Reads pattern 0's column entry
+// because only a SINGLE-pattern arm may carry a clause (`checkMatchTypeArms` rejects the rest,
+// which is forced: a multi-pattern arm gets no then-narrowing, so the scrutinee is still the whole
+// union inside it and the field read would not type). ONE rule, two readers — the checker declares
+// what this returns, the desugar prepends it.
+//
+// A multi-pattern arm reads -1 rather than pattern 0's clause: the or-pattern reject
+// (`matchArmHasBinds`, below) has already named the mistake, and CHECKING those decls would stack
+// a second, misleading `field 'x' is not on every member of <the whole union>` on top of it.
+function matchArmBindsOf(n: MatchExpr, k: i32) {
+  if n.matchArmCount[k] != 1 { return -1 }
+  n.matchBinds[n.matchArmStart[k]]
+}
+
+// Whether ANY of arm `k`'s patterns carries a clause — the or-pattern reject reads this, not
+// `matchArmBindsOf`, so `A | B{x} => …` is caught as well as `A{x} | B => …`.
+function matchArmHasBinds(n: MatchExpr, k: i32) {
+  let j = 0
+  while j < n.matchArmCount[k] {
+    if n.matchBinds[n.matchArmStart[k] + j] >= 0 { return true }
+    j = j + 1
+  }
+  false
 }
 
 // The arm that becomes the desugared chain's bare `else`: the `_` WILDCARD arm when there is
@@ -14300,12 +14361,12 @@ function desugarMatchAt(ix: i32) {
     const nArms = armStart.length
     if nArms > 0 {
       const elseArm = matchElseArmOf(pats, armStart, armCount)
-      let chain = matchBlockOf(bodies[elseArm])
+      let chain = matchArmBlockOf(bodies[elseArm], matchArmBindsOf(n, elseArm))
       let k = nArms - 1
       while k >= 0 {
         if k != elseArm {
           const cond = matchArmCond(scrut, pats, armStart, armCount, k, mpos)
-          const thenB = matchBlockOf(bodies[k])
+          const thenB = matchArmBlockOf(bodies[k], matchArmBindsOf(n, k))
           chain = mkIf(cond, thenB, chain, mpos)
         }
         k = k - 1
@@ -19392,6 +19453,99 @@ function matchScrutRejectMsg(st: i32, mems: i32[]) {
 // order (source order minus the else arm, then the else arm), because that is the order the
 // desugared chain subtracts members in. Folding them together would either misreport diagnostics
 // or check a body under the wrong narrowed type.
+// Whether the arm BODY declares `name` in its OWN top-level scope. The desugar prepends the
+// bindings to that block, so the two declarations land in ONE scope — a collision the ordinary
+// scope machinery never sees, because pre-desugar they are two nested scopes and shadowing is
+// legal there. Without this the emitter would be the first pass to meet two same-named locals of
+// possibly different types.
+function matchBodyDeclares(bodyIx: i32, name: string) {
+  if bodyIx < 0 { return false }
+  const b = P.nodes[bodyIx]
+  if b is Block {
+    let i = 0
+    while i < b.blkStmts.length {
+      const st = P.nodes[b.blkStmts[i]]
+      if st is LetDecl {
+        if st.letName == name { return true }
+      } else if st is FuncDecl {
+        if st.fnName == name { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The two clause-level rejects that exist because the desugar SPLICES rather than wraps: a name
+// bound twice by one clause, and a name the arm body redeclares. Both would be accepted here and
+// decided by the emitter's local allocator; both are reported AT the binding.
+function checkMatchBindNames(bIx: i32, bodyIx: i32) {
+  if bIx < 0 { return 0 }
+  const bn = P.nodes[bIx]
+  if bn is Block {
+    let i = 0
+    while i < bn.blkStmts.length {
+      const st = P.nodes[bn.blkStmts[i]]
+      if st is LetDecl {
+        let j = 0
+        while j < i {
+          const pv = P.nodes[bn.blkStmts[j]]
+          if pv is LetDecl {
+            if pv.letName == st.letName {
+              tErr(
+                "duplicate payload binding `" + st.letName + "`",
+                bn.blkStmts[i],
+              )
+            }
+          }
+          j = j + 1
+        }
+        if matchBodyDeclares(bodyIx, st.letName) {
+          tErr(
+            "payload binding `" +
+              st.letName +
+              "` is redeclared in the arm body — rename one",
+            bn.blkStmts[i],
+          )
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Check a clause's `const` decls INSIDE the arm's narrowing scope, so `const x = scrut.x` reads
+// the field off the NARROWED member and the name is visible to the body that follows. `checkNode`
+// on the clause `Block` itself would push a scope of its own and drop every binding on the floor.
+// A DUPLICATE binding is skipped rather than checked: `checkMatchBindNames` has already reported
+// it, and declaring the name twice in this one scope would stack the scope machinery's own terse
+// `redeclared x` on top of the message that explains what the mistake actually was.
+function checkMatchBindDecls(bIx: i32) {
+  if bIx < 0 { return 0 }
+  const bn = P.nodes[bIx]
+  if bn is Block {
+    let i = 0
+    while i < bn.blkStmts.length {
+      let dup = false
+      const st = P.nodes[bn.blkStmts[i]]
+      if st is LetDecl {
+        let j = 0
+        while j < i {
+          const pv = P.nodes[bn.blkStmts[j]]
+          if pv is LetDecl {
+            if pv.letName == st.letName { dup = true }
+          }
+          j = j + 1
+        }
+      }
+      if !dup { checkNode(bn.blkStmts[i]) }
+      i = i + 1
+    }
+  }
+  0
+}
+
 function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   // `uMems` is the scrutinee's variant list (`flattenVariantsInto`, so a nullable contributes
   // its inner variants plus `null`) — `unMemTys`' checker-side twin, a data structure, never a
@@ -19476,6 +19630,21 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       }
       pj = pj + 1
     }
+    // PAYLOAD CLAUSES (phase 2b), still in source order. An OR arm may not carry one: the checker
+    // gives a multi-pattern arm NO then-narrowing (`collectThenNarrows` reports none for the
+    // `a || b` condition the desugar builds for it), so the scrutinee inside the arm is still the
+    // whole union and `scrut.x` would not type. Rust's rule — identical bindings in every
+    // alternative — needs narrowing to the JOIN of the alternatives, which is ROADMAP B21 item 4.
+    if n.matchArmCount[ai] > 1 {
+      if matchArmHasBinds(n, ai) {
+        tErr(
+          "payload binding is not allowed on an or-pattern arm — give each type its own arm",
+          n.matchPats[n.matchArmStart[ai]],
+        )
+      }
+    } else {
+      checkMatchBindNames(matchArmBindsOf(n, ai), n.matchBodies[ai])
+    }
     ai = ai + 1
   }
   // Whether every member is named (or a `_` stands in for the rest) — settled by pass 1, and
@@ -19551,9 +19720,16 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
         collectThenNarrows(n.matchPats[n.matchArmStart[bi]], nmz, tyz)
       }
     }
-    if nmz.length > 0 {
+    // The scope is pushed for the PAYLOAD CLAUSE as well as for the narrowing — an arm can bind
+    // without narrowing (a non-place scrutinee contributes no fact), and its `const`s must still
+    // be arm-local. The clause is checked here, between `applyNarrows` and the body: after, so
+    // `scrut.x` reads the field off the narrowed member; before, so the body sees the names.
+    const bindIx = matchArmBindsOf(n, bi)
+    const scoped = nmz.length > 0 || bindIx >= 0
+    if scoped {
       pushScope(-1)
       applyNarrows(nmz, tyz)
+      checkMatchBindDecls(bindIx)
     }
     const body = n.matchBodies[bi]
     const bt = checkNode(body)
@@ -19565,7 +19741,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    if nmz.length > 0 { popScope() }
+    if scoped { popScope() }
     matchTy = joinTys(matchTy, armTy)
     bi = bi + 1
   }

@@ -141,8 +141,9 @@ hatch").** All four are prerequisites for each other in practice:
   Shipped shape + the three divergences from the charter: `docs/internals/vl-test-design.md`.
 
 **P2 — wanted, not gating:** ~~i32-keyed Map/Set + `for k in map` (B6a)~~ **DONE** for the mono value
-rep (i32 / boolean / atom values); ~~contextual f32 literals~~ **DONE**; **`match` phase 2 — variant payload
-binding** (`match cmd { Move{x,y} => … }`); literal-union compact representation (A16); readonly
+rep (i32 / boolean / atom values); ~~contextual f32 literals~~ **DONE**; ~~`match` phase 2 — variant payload
+binding~~ **DONE** (`match cmd { Move{x, y} => … }`, punned fields; renaming + nested destructuring
+measured and deferred — B21 item 1); literal-union compact representation (A16); readonly
 fields / A9 variance; default params (B15a); SIMD over Buffer (unlocked by P0, not requested yet);
 keep emitting a names section on non-`-O` builds.
 
@@ -699,17 +700,28 @@ in-language GC knobs.
   a loop evaluates to its `break` value or `null`. Three layers: grammar → types (mirror the
   `returnTypes` mechanism) → codegen (`__brk` block gets a result type).
 - 🟡 **B21. `match` over tagged unions (payload binding).** Phase 1 (literal-union `match`,
-  exhaustiveness-by-default — a missing arm is a hard error, à la Rust/Swift) and **phase 2a
-  (VALUE-union scrutinees)** have shipped (→ `CHANGELOG.md`; `tests/cases/match/*`). Phase 2a is the
+  exhaustiveness-by-default — a missing arm is a hard error, à la Rust/Swift), **phase 2a
+  (VALUE-union scrutinees)** and **phase 2b (PAYLOAD BINDING)** have shipped (→ `CHANGELOG.md`;
+  `tests/cases/match/*`). Phase 2a is the
   discrimination half: an arm pattern is a member TYPE (`C =>`, `i32 =>`, `null =>`, `A | B =>`),
   parsed into a real `IsExpr` over the scrutinee, so compiler-enforced completeness now covers
   structural/tagged-union discrimination — the complement to the if-chain coverage check
   (A-exhaust), which cannot demand completeness at all. Every arm binds the narrowed member.
+  Phase 2b is the binding half: `Move{x, y} => x + y` binds one arm-local `const` per punned field,
+  desugaring to the `const x = scrut.x` prepend the plan called for — byte-identical to the
+  hand-written if-chain twin across 18 measured cells.
   REMAINING:
-  1. **Payload/field BINDING** — `Move{x, y} => x + y`, binding an arm-local name per field rather
-     than re-reading through the narrowed scrutinee. The desugar is the extension point: an arm is
-     already `if scrut is Move { <body> }`, so a binding arm prepends `const x = scrut.x` statements
-     to that block. Nothing about the chain, the narrowing or the emitter has to change.
+  1. **Payload binding: the two richer clause forms.** ~~Flat punned binding~~ **DONE (phase 2b).**
+     Still open, both measured as one-branch extensions in `docs/internals/match-design.md`:
+     **renaming** (`Move{x: a}` — the formatter already reads the binding name off the `LetDecl`,
+     so it is a parser branch plus a `field: name` print) and **nested destructuring**
+     (`Move{p: {x, y}}` — needs a `Member` CHAIN initializer and narrowing through it).
+     Also open and NOT phase-2b-specific: a binding arm cannot be a `const` INITIALIZER
+     (`const r = match u { A{a} => a … }`) because a multi-statement if-expression arm hits the
+     pre-existing `emitProgram: if-expression arm is not a single value` — the hand-written twin
+     fails identically, and the same match without a clause lowers fine. Fixing that emitter gap
+     (an if-expression arm whose block has statements before its tail value) unblocks the whole
+     let-init context, `match` and `if` alike.
   2. **Unions with LITERAL members** (`0 | 1 | 2`, `"x" | 7`) — refused at the type tier today
      (`match over a union with literal members is not supported`) because an arm's test would be
      `n is 0`, which the emitter has no rep for (`literal \`is\` over a struct union is not
