@@ -223,6 +223,29 @@ import {
 // not asserted: dropping a name a consumer still wants makes the compiler refuse to build
 // itself and NAME the consumers, and these three produce no such error.
 //
+// ── AND THEN PHASE 2 PUT A REPUBLISHING LINE BACK. IT IS A KNOWN REGRESSION, NOT AN
+// OVERSIGHT ────────────────────────────────────────────────────────────────────────────
+// The `export { splitUnionAtoms, unionMemberCount } from "./tyname"` line below is exactly
+// the shape #1236 deleted, re-introduced for TWO names. D-TYNAMEHOME phase 2 moved those
+// two bodies down to the leaf; `emit_rep.vl` and `emit_collect.vl` re-pointed at the home
+// in the same slice, and the rest could not — they are HELD by concurrent slices. A
+// re-export keeps their imports resolving with ZERO held-file edits, and — because a VL
+// re-export is an import that also publishes — it is also what binds the two names for THIS
+// file's own five call sites, so the line does double duty and the plain `import` above
+// stays at seventeen.
+//
+// **WHO STILL COMES THROUGH HERE IS RESOLVER-DERIVED, NOT GREPPED, AND IT IS NOT THE SET
+// THE QUEUE ENTRY NAMED.** Demoting this line to a plain `import` makes the compiler refuse
+// to build itself and enumerate them: `emit_base.vl` (2 entries), `emit_classify.vl` (2),
+// `wasmEmit.vl` (1) — FIVE entries in THREE files. D-SPLITDOWN's queue entry priced phase 2
+// at "six import lines in three files — `emit_rep`, `wasmEmit`, `emit_collect`" and did not
+// list `emit_base` or `emit_classify` at all.
+//
+// **THE FOLLOW-UP IS FILED:** whichever slices own those three files re-point their entries
+// at `./tyname`, and the last one deletes this line — at which point this file needs the two
+// names in its own plain `import` (17 → 19) and nothing in the tree republishes a grammar
+// again. Tracked in `docs/internals/destringify-types-program.md`.
+//
 // A module line must sit with the other module lines: `vl fmt` hoists `import` and
 // `export … from` to the top of the file, so a module line parked at the grammars' old
 // position is not format-stable — it round-trips to here, dragging its comment along.
@@ -254,6 +277,7 @@ import {
   tyTopIndexOf,
   tyTopLevelSplit,
 } from "./tyname"
+export { splitUnionAtoms, unionMemberCount } from "./tyname"
 
 // ── Type-arena variants ──────────────────────────────────────────────────────
 // One struct per type KIND, prefixed field names so `is` discriminates the union
@@ -16844,64 +16868,12 @@ export function isInferLetNulBool(letIx: i32) {
 // same tables, the same heap-type interning, the same tags — so every downstream
 // lookup keyed on the type-name string just works.
 //
-// Append the member atoms of the synthetic union name `name` to `out`, split on its
-// TOP-LEVEL `|` separators (depth tracked so a nested `{…}` / `[…]` member is not
-// split inside). A bare name with no `|` appends one atom. The flat `out` accumulator
-// (vs returning a fresh `string[]`) keeps this off the self-host emitter's
-// empty-ref-array-literal return path.
-export function splitUnionAtoms(name: string, out: string[]) {
-  // Atoms are VERBATIM substrings of `name` between top-level `|` separators, so each
-  // is one `slice` from the last separator (`start`) — never a per-code-point
-  // accumulation, whose repeated copy-on-concat walked the whole atom AGAIN per char:
-  // O(len²) per call, ~14 s of compile for one 30-line program over a recursive
-  // struct's ~5 K-char render (the third recurrence of the per-code-point-concat
-  // quadratic class — see `retAtomsCheap`, which now also gates that render away).
-  //
-  // Paren-aware splitting keeps a paren-GROUPED arm whole: `(i32 | string)[] | {w: i32}`
-  // splits to `(i32 | string)[]` + `{w: i32}` (a brace/bracket-only depth mis-split it into
-  // the garbage atoms `(i32` + `string)[]`, so the WHOLE union mis-classified — the binding
-  // silently dropped its union rep and every `is` against the list arm const-folded FALSE, a
-  // live miscompile). The generic-application brackets `<…>` count too, so a union ARGUMENT
-  // (`Box<i32|null>`) stays ONE atom. All of that is now the ONE scanner's business.
-  //
-  // A TOP-LEVEL `=>` stops the split: the whole name is a single function-type member and its
-  // return is absorbed verbatim (a `|` inside it belongs to the return union, split
-  // separately). Asking for `|` OR the arrow in one query is what keeps this a single pass.
-  let start = 0
-  let going = true
-  while going {
-    const at = tyTopIndexOf(name, '|', '=', start)
-    if at < 0 || name[at] == '=' {
-      out.push(name.slice(start, name.length))
-      going = false
-    } else {
-      out.push(name.slice(start, at))
-      start = at + 1
-    }
-  }
-  0
-}
-
-// The number of TOP-LEVEL `|`-separated members in the synthetic name `name` (1 for a
-// bare name). Counts separators without materializing the atom strings.
-export function unionMemberCount(name: string) {
-  // The counting dual of `splitUnionAtoms` — the same query, without materializing the
-  // atom strings (a top-level `=>` stops the count, so `(i32) => i32 | string` is ONE
-  // function type and not a 2-member union).
-  let n = 1
-  let start = 0
-  let going = true
-  while going {
-    const at = tyTopIndexOf(name, '|', '=', start)
-    if at < 0 || name[at] == '=' {
-      going = false
-    } else {
-      n = n + 1
-      start = at + 1
-    }
-  }
-  n
-}
+// **THE TWO SPLITTERS OF THAT SYNTHETIC NAME ARE NOT HERE ANY MORE.**
+// `splitUnionAtoms` and `unionMemberCount` — the top-level `|` split and its counting
+// dual — are pure functions of a string that depend on nothing but `tyTopIndexOf`, so
+// D-TYNAMEHOME phase 2 moved them to their family's home in `tyname.vl` alongside
+// `tyTopLevelSplit`. This file imports them back (see the module-line comment at the top)
+// and every call site below is untouched.
 
 // The value-atom kind of a NICHE-nullable scalar-element LIST member name —
 // `(boolean | null)[]` / `(K | null)[]` share the i32-list backing (kind 7),
