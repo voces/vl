@@ -1917,6 +1917,13 @@ function fnAssignRetTargetName(fe: i32) {
         // become the function's result, so both take the cell's answer.
         let tailx = st[st.length - 1]
         const ts = P.nodes[tailx]
+        // A tail `if`/`else` whose ARMS each end in an assignment is the SAME implicit
+        // return, split across branches: `emitIfTail` lowers every arm through
+        // `emitStmtTail` → `emitReturnValue`, so each arm pushes ITS target cell's rep.
+        // The join is `ifTailAssignName` — one representative name, minted only when every
+        // arm's target cell has the same result identity, so the answer below is a plain
+        // cell answer again and the whole storage-class dispatch is reused unchanged.
+        if ts is IfStmt { return ifTailAssignName(tailx, fnStmts[fe]) }
         if ts is RetStmt {
           if ts.retArg < 0 { return "" }
           tailx = ts.retArg
@@ -2028,26 +2035,27 @@ function fnAssignKindGuard(k: VKind): VKind | null {
   k
 }
 
-// The authoritative result `VKind` of function `fe` when its implicit return is an
-// ASSIGNMENT, else `null`. Dispatched over the target's STORAGE CLASS in the order the
-// emitter resolves an assignment target — a body `let`, then a parameter, then a module
-// global — so a binding SHADOWING a same-named global answers for the cell that is
-// actually stored into. Each class asks the resolver that decides that cell's own valtype:
-// `letCellKind` for a local (the mirror of `collectLocals`), `vtKindOfParam` for a
-// parameter (the very function `emitTypeSection` writes the param valtype with), and
-// `globalCellKind` for a global (the very function the global section writes the cell
-// with) — so this answer cannot drift from the cell at any of the three.
+// ── the assignment TARGET CELL, by name ──────────────────────────────────────────────
+// The three resolvers below are the STORAGE-CLASS DISPATCH itself, keyed on a cell NAME
+// rather than on a function: a body `let` (`parentLetOf`, which is function-scoped and
+// descends into `if`/loop bodies), then a parameter, then a module global — the order the
+// emitter resolves an assignment target in, so a binding SHADOWING a same-named global
+// answers for the cell that is actually stored into. Each class asks the resolver that
+// decides that cell's OWN valtype: `letCellKind` for a local (the mirror of
+// `collectLocals`), `vtKindOfParam` for a parameter (the very function `emitTypeSection`
+// writes the param valtype with), and `globalCellKind` for a global (the very function the
+// global section writes the cell with) — so the answer cannot drift from the cell at any
+// of the three.
 //
-// #1235 gave the GLOBAL class its cell; this is the LOCAL/PARAM half. Its filing said the
-// local answer "needs the two ladders proved equal first"; the proof is that the two
-// ladders now have ONE ANNOTATED HOME (`vtKindOfType`, which `collectLocals`' annotation
-// arms and this one both ride) and ONE UN-ANNOTATED HOME (`letInitCellKind`), plus the
-// per-kind DECLINES in `fnAssignKindGuard` for every kind whose payload column
-// `emit_sections` cannot mint from the same binding.
-function fnAssignRetKind(fe: i32): VKind | null {
-  const nm = fnAssignRetTargetName(fe)
+// #1235 gave the GLOBAL class its cell and #1258 the LOCAL/PARAM half, both keyed on the
+// function. They are keyed on the NAME here because the IF-ARM join has to ask the SAME
+// question of EACH ARM's target before it can answer for the function at all; one home,
+// asked N times, is what keeps the arms and the straight-line tail from drifting apart.
+
+// The guarded `fbValtype` KIND of the cell named `nm` inside function `fnIx`, or `null`
+// when no storage class claims the name (or `fnAssignKindGuard` declines the kind).
+function fnAssignCellKind(fnIx: i32, nm: string): VKind | null {
   if nm == "" { return null }
-  const fnIx = fnStmts[fe]
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
     const li = parentLetOf(fn.fnBody, nm)
@@ -2058,6 +2066,226 @@ function fnAssignRetKind(fe: i32): VKind | null {
   const gi = globalLetOf(nm)
   if gi < 0 { return null }
   fnAssignKindGuard(globalCellKind(gi))
+}
+
+// The STRUCT-TABLE index of the cell named `nm` inside function `fnIx`, or -1 — the raw
+// per-class answer, ungated on the kind (`fnAssignRetSlot` applies the kind gate).
+function fnAssignCellSlot(fnIx: i32, nm: string) {
+  if nm == "" { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const li = parentLetOf(fn.fnBody, nm)
+    if li >= 0 { return structIndexOfLet(li, fnIx) }
+    const pi = fnParamNodeOf(fnIx, nm)
+    if pi >= 0 { return paramStructIdxOf(pi) }
+  }
+  const gi = globalLetOf(nm)
+  if gi < 0 { return -1 }
+  globalCellStructIdx(gi)
+}
+
+// The DECLARED TYPE SPELLING of the `LetDecl` at `letIx`, or "" when un-annotated (its
+// kind then comes from the initializer — `letInitCellKind`).
+function letDeclTypeName(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return tyNameOf(d.letType) }
+  }
+  ""
+}
+
+// The DECLARED TYPE SPELLING of the cell named `nm` inside function `fnIx`, or "".
+//
+// THE COLUMN `VKind` CANNOT SUPPLY. A literal-union cell and a plain `i32` cell are BOTH
+// `"i32"` to `fbValtype` (the atom is an interned i32), and a `boolean` cell is too — yet
+// `v: K` and `w: i32` are different RESULT types, and the checker joins two arms assigning
+// to them into a union BOX that the emitter then lowers correctly. Measured: with the join
+// keyed on kind+slot+elem alone, `if c { v = "b" } else { w = 3 }` over `K`/`i32` went
+// CORRECT → INVALID WASM — the only two cells of a 271-cell grid that moved BACKWARD, at
+// both the local/local and local/global spellings.
+function fnAssignCellTypeName(fnIx: i32, nm: string) {
+  if nm == "" { return "" }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const li = parentLetOf(fn.fnBody, nm)
+    if li >= 0 { return letDeclTypeName(li) }
+    const pi = fnParamNodeOf(fnIx, nm)
+    if pi >= 0 {
+      const p = P.nodes[pi]
+      if p is Param { return tyNameOf(p.parType) }
+    }
+  }
+  const gi = globalLetOf(nm)
+  if gi < 0 { return "" }
+  letDeclTypeName(gi)
+}
+
+// The REF-LIST ELEMENT type-name of the cell named `nm` inside function `fnIx`, or "".
+function fnAssignCellElem(fnIx: i32, nm: string) {
+  if nm == "" { return "" }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const li = parentLetOf(fn.fnBody, nm)
+    if li >= 0 { return letRefListElemName(li, fnIx) }
+    const pi = fnParamNodeOf(fnIx, nm)
+    if pi >= 0 {
+      const p = P.nodes[pi]
+      if p is Param { return refArrElemNameIf(tyNameOf(p.parType)) }
+    }
+  }
+  const gi = globalLetOf(nm)
+  if gi < 0 { return "" }
+  letRefListElemName(gi, -1)
+}
+
+// ── the IF-ARM join ──────────────────────────────────────────────────────────────────
+// THE JOIN RULE: two arms join iff their target cells have the same RESULT IDENTITY — the
+// same guarded KIND, the same struct-table SLOT, the same ref-list ELEMENT name and the
+// same DECLARED TYPE SPELLING. The first three are exactly what `criClassify` writes into
+// `fRetKind` / `fRetStructIdx` / `fRetRArrElem`, i.e. exactly what `emit_sections` turns
+// into the functype's result valtype; the fourth separates the cells `VKind` alone cannot
+// (see `fnAssignCellTypeName`). The NAMES may differ freely (`if c { v = 1 } else { w = 2 }`
+// over two `i64` locals joins, in any pair of storage classes); two `struct` cells of
+// DIFFERENT layouts do not (the slots differ).
+//
+// WHY IDENTITY AND NOT A WIDENING JOIN. The lowering is store-then-re-read per arm, so
+// each arm pushes its own cell's rep with no coercion site in between; a join that
+// answered anything but "both arms already agree" would declare a result one arm does not
+// produce — invalid wasm, the very outcome this replaces. `ifExprValtype` (the if-VALUE
+// join) can widen because its arms are EXPRESSIONS emitted into a known blocktype and its
+// numeric arms coerce at `emitIfExprAs`; there is no such coercion for a re-read cell.
+// Where the arms DISAGREE this declines (`null`) and the master outcome stands — see the
+// residue note in `tests/cases/statements/tail-assign-if-arms.vl`.
+//
+// AGREEMENT WITH `ifExprRefKind`. The if-VALUE ref join classifies the whole `if` from the
+// THEN arm alone, on the checker's proof that the arms share a join type. This rule is the
+// same shape — a representative arm decides — with the equality made EXPLICIT because the
+// checker offers no such proof here: it types `x = e` as `e`'s own type (the filed
+// `typecheck.vl` half), so on this family its join is not the emitter's cell join and
+// cannot be leaned on.
+
+// The TAIL statement of an if-ARM block, or -1 (an empty arm, or a non-block arm).
+function armTailStmtOf(blockIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const st = b.blkStmts
+    if st.length > 0 { return st[st.length - 1] }
+  }
+  -1
+}
+
+// The IDENT name an ARM-TAIL statement assigns to, or "" — the same unwrap
+// `fnAssignRetTargetName` runs on a straight-line tail, because both spellings reach
+// `emitBinExprNode`'s `=` arm through `emitStmtTail` and both leave the target cell on the
+// stack. An INDEX / MEMBER target answers "" (its value form is not lowered, so such an
+// arm is not a tail value at all and `emitIfTail` never claims the `if`).
+function armAssignTargetName(stmtIx: i32) {
+  if stmtIx < 0 { return "" }
+  let tx = stmtIx
+  const ts = P.nodes[tx]
+  if ts is RetStmt {
+    if ts.retArg < 0 { return "" }
+    tx = ts.retArg
+  }
+  const a = P.nodes[unwrapParen(tx)]
+  if a is BinExpr {
+    if a.binOp == "=" {
+      const t = P.nodes[unwrapParen(a.binLeft)]
+      if t is Ident { return t.identName }
+    }
+  }
+  ""
+}
+
+// The FIRST (leftmost) arm-tail assignment target under the tail `if` at `ifIx` — the
+// candidate the other arms are measured against. "" when the then-arm's tail is not an
+// assignment at all. A NESTED tail `if` in the then-arm recurses to ITS first arm.
+function ifTailFirstAssignName(ifIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    const t = armTailStmtOf(s.ifThen)
+    if t < 0 { return "" }
+    const tn = P.nodes[t]
+    if tn is IfStmt { return ifTailFirstAssignName(t) }
+    return armAssignTargetName(t)
+  }
+  ""
+}
+
+// True if the two cell names resolve, inside function `fnIx`, to the same result identity
+// (kind + struct slot + ref-list element + declared type spelling). A name no storage class
+// claims — or one whose kind `fnAssignKindGuard` declines — never agrees, so a declined
+// kind keeps its master outcome through the join exactly as it does through the
+// straight-line tail. Two UN-annotated cells carry "" for the spelling and are separated by
+// the other three columns alone (`letInitCellKind` is their one home, so equal kind + slot
+// + element there IS equal rep).
+function fnAssignCellEq(fnIx: i32, a: string, b: string) {
+  const ka = fnAssignCellKind(fnIx, a)
+  const kb = fnAssignCellKind(fnIx, b)
+  if ka == null { return false }
+  if kb == null { return false }
+  if ka != kb { return false }
+  if fnAssignCellSlot(fnIx, a) != fnAssignCellSlot(fnIx, b) { return false }
+  if fnAssignCellElem(fnIx, a) != fnAssignCellElem(fnIx, b) { return false }
+  fnAssignCellTypeName(fnIx, a) == fnAssignCellTypeName(fnIx, b)
+}
+
+// True if the ARM block at `blockIx` ends in an assignment whose target cell agrees with
+// `nm0`'s (a nested tail `if` recurses through every one of ITS arms).
+function ifTailArmAgrees(blockIx: i32, fnIx: i32, nm0: string) {
+  const t = armTailStmtOf(blockIx)
+  if t < 0 { return false }
+  const tn = P.nodes[t]
+  if tn is IfStmt { return ifTailArmsAgree(t, fnIx, nm0) }
+  const nm = armAssignTargetName(t)
+  if nm == "" { return false }
+  if nm == nm0 { return true }
+  fnAssignCellEq(fnIx, nm, nm0)
+}
+
+// True if EVERY arm of the tail `if` at `ifIx` ends in an assignment agreeing with `nm0`.
+// An `if` with NO else declines: the false path falls through with no value, so the
+// function's result is the checker's NULLABLE join and not any arm's cell (`i64` cells
+// under `function f(c) { if c { v = 3 } }` infer `i32?`, whose rep is neither cell's) —
+// that half stays exactly as master left it, filed with the fixture.
+function ifTailArmsAgree(ifIx: i32, fnIx: i32, nm0: string) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse < 0 { return false }
+    if !ifTailArmAgrees(s.ifThen, fnIx, nm0) { return false }
+    const els = P.nodes[s.ifElse]
+    if els is Block { return ifTailArmAgrees(s.ifElse, fnIx, nm0) }
+    // `else if`: a lone nested `IfStmt`, which must carry its own final `else`.
+    return ifTailArmsAgree(s.ifElse, fnIx, nm0)
+  }
+  false
+}
+
+// The ONE representative arm-tail assignment target of the tail `if` at `ifIx`, or "" —
+// the join. Minted only when every arm's target cell agrees with the first arm's, so the
+// name it returns stands for ALL of them and the three `fnAssignRet*` columns can be read
+// off it exactly as they are off a straight-line tail.
+function ifTailAssignName(ifIx: i32, fnIx: i32) {
+  const nm0 = ifTailFirstAssignName(ifIx)
+  if nm0 == "" { return "" }
+  if !ifTailArmsAgree(ifIx, fnIx, nm0) { return "" }
+  nm0
+}
+
+// The authoritative result `VKind` of function `fe` when its implicit return is an
+// ASSIGNMENT — a straight-line tail, an explicit `return (v = e)`, or a tail `if` whose
+// arms all assign to agreeing cells (`fnAssignRetTargetName`) — else `null`.
+//
+// #1235 gave the GLOBAL storage class its cell, #1258 the LOCAL/PARAM half. Its filing
+// said the local answer "needs the two ladders proved equal first"; the proof is that the
+// two ladders now have ONE ANNOTATED HOME (`vtKindOfType`, which `collectLocals`'
+// annotation arms and this one both ride) and ONE UN-ANNOTATED HOME (`letInitCellKind`),
+// plus the per-kind DECLINES in `fnAssignKindGuard` for every kind whose payload column
+// `emit_sections` cannot mint from the same binding.
+function fnAssignRetKind(fe: i32): VKind | null {
+  const nm = fnAssignRetTargetName(fe)
+  if nm == "" { return null }
+  fnAssignCellKind(fnStmts[fe], nm)
 }
 
 // The result-valtype SLOT that goes beside `fnAssignRetKind`'s answer — the struct table
@@ -2077,40 +2305,14 @@ function fnAssignRetSlot(fe: i32) {
   if k == null { return -1 }
   if k == "reflist" { return rlSlotByName(fnAssignRetElemName(fe)) }
   if k != "struct" && k != "nulstruct" { return -1 }
-  const nm = fnAssignRetTargetName(fe)
-  const fnIx = fnStmts[fe]
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const li = parentLetOf(fn.fnBody, nm)
-    if li >= 0 { return structIndexOfLet(li, fnIx) }
-    const pi = fnParamNodeOf(fnIx, nm)
-    if pi >= 0 { return paramStructIdxOf(pi) }
-  }
-  const gi = globalLetOf(nm)
-  if gi < 0 { return -1 }
-  globalCellStructIdx(gi)
+  fnAssignCellSlot(fnStmts[fe], fnAssignRetTargetName(fe))
 }
 
 // The ref-list ELEMENT TYPE-NAME beside `fnAssignRetKind`'s `reflist` answer — the column
 // `emit_sections`' inferred-return arm turns into the result's wrapper slot
 // (`rlSlotByName`). Same binding, same three storage classes, same order.
 function fnAssignRetElemName(fe: i32) {
-  const nm = fnAssignRetTargetName(fe)
-  if nm == "" { return "" }
-  const fnIx = fnStmts[fe]
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const li = parentLetOf(fn.fnBody, nm)
-    if li >= 0 { return letRefListElemName(li, fnIx) }
-    const pi = fnParamNodeOf(fnIx, nm)
-    if pi >= 0 {
-      const p = P.nodes[pi]
-      if p is Param { return refArrElemNameIf(tyNameOf(p.parType)) }
-    }
-  }
-  const gi = globalLetOf(nm)
-  if gi < 0 { return "" }
-  letRefListElemName(gi, -1)
+  fnAssignCellElem(fnStmts[fe], fnAssignRetTargetName(fe))
 }
 
 // Classify ONE valued return expression at `rx0` of the function at `fnStmts`
