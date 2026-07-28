@@ -1926,13 +1926,82 @@ export function unionStructAliasShape(variants: string[]) {
 export function gaeSplitArgs(s: string, out: string[]) {
   tyTopLevelSplit(s, ',', true, out)
 }
-// Substitute a declared param name (or its `T[]` array form) in a field's
-// type name with the application's argument name.
+// True when a declared type-parameter NAME binds nothing because a BUILTIN type spelling
+// wins it: `type Box<i32> = { v: i32 }` has no parameter, it has a field of type `i32`.
+//
+// This is the CHECKER's leaf-resolution ORDER read as a predicate, and that order is the
+// whole rule: `tsLeafTy`/`nameToTy` ask `primTyOfName` FIRST, the live parameter binding
+// (`tpEnvTyOfName`) SECOND, and the declared struct/union registry (`declaredTyOfName`)
+// THIRD. So a parameter named for a primitive is shadowed BY the primitive, while a
+// parameter named for a DECLARED type shadows it — and both directions are observable:
+// given `type Box<i32> = { v: i32 }` the checker reports `Box<string>` as `{v: i32}`,
+// and given `type S = {n: i32}` + `type Box<S> = { v: S }` it reports `Box<i32>` as
+// `{v: i32}`. Substituting at a primitive-named parameter therefore hands the emitter a
+// field type the checker never agreed to, and two answers for one field is invalid wasm
+// on a program `vl check` accepts.
+//
+// The bound is `primTyOfName`'s accept set — i32 / i64 / f64 / f32 / boolean / string /
+// void / null. `valueAtomKind` is that set MINUS `void`, which it does not carry because
+// `void` is a type spelling and not a VALUE; the one name is added back so the two sets
+// coincide exactly rather than nearly. `valueAtomKind` also claims the array spellings
+// (`i32[]` and friends), and those cannot decide anything here: this predicate is only
+// ever asked about a name that a LEAF compared equal to, and a leaf carries no `[]`.
+//
+// It is deliberately NOT the bound `genTyParamArr` (`emit_classify.vl`) uses for its own
+// shadow guard. That arm exists to spare `checkArrName` a name it would wrongly reject,
+// so its bound is `checkArrName`'s accept set; this one exists to agree with the CHECKER
+// about what a field's type IS, so its bound is the checker's own resolution order. Same
+// defect shape, different neighbour to agree with.
+//
+// TWO SIBLING DISAGREEMENTS OVER A SHADOWED PARAMETER SURVIVE THIS PREDICATE, both because
+// the name it would have to see is already gone by the time it is asked.
+//
+//   * A parameter named for a TRANSPARENT single-member alias. `type Id = i32` +
+//     `type Box<Id> = { v: Id }` + `const b: Box<string> = { v: "z" }` is `vl check` rc=0
+//     with `b` reported as `{v: string}` (the parameter binds, per the order above), and
+//     the emitted module does not parse ("expected i32, found (ref $type)"). The ANCHOR is
+//     `typecheck.canonEmitName`, whose alias transparency rewrites the field annotation
+//     `Id` to `i32` before `gaeCollectDecls` records it — so this function is handed the
+//     type name `i32` against a parameter list holding `Id`, with nothing left to match.
+//     `type Nm = string` fails identically; a declared STRUCT or UNION shadow does not
+//     (neither is transparent), which is why `type-param-shadows-declared-struct.vl` runs.
+//
+//   * The FuncDecl half at a non-i32 rep. `function id<i64>(v: i64) { return v }` +
+//     `print(id(1))` is `vl check` rc=0 and invalid wasm inside `id`
+//     ("expected i64, found i32"); `f32` fails the same way ("expected f32, found f64")
+//     and i32 / f64 / string / boolean all run. No array is involved — dropping the
+//     `i64[]` annotation that would implicate `genTyParamArr` does not move the cell — so
+//     the ANCHOR is the inferred-RETURN classification of a generic FuncDecl whose type
+//     parameter is a primitive spelling, not this substitution or that guard.
+function gaeParamShadowed(name: string) {
+  if name == "void" { return true }
+  valueAtomKind(name) >= 0
+}
+// Substitute a declared type-PARAMETER name in a field's type name with the application's
+// argument name, at ANY array depth: `T` → `i32`, `T[]` → `i32[]`, `T[][]` → `i32[][]`.
+//
+// The depth is taken from the ARRAY-NAME grammar's leaf peel (`arrLeafNameOf`) rather than
+// from a ladder of `pnames[i] + "[]"` renderings, because a ladder can only ever know the
+// rungs someone wrote: knowing exactly `T` and `T[]` is what made `type Box<T> = { v: T[][] }`
+// an emit error at every instantiation ("nested arrays are not supported") while the
+// concrete twin `type Box = { v: i32[][] }` lowered fine. The substituted shape kept
+// recording its ref-list element as the UN-substituted `T[]`, so the field pointed at a
+// struct-element row instead of the nested-i32-list row that was already interned beside
+// it. Nesting was never the axis — `type Box<T> = { v: T[] }` at `Box<i32[]>` yields the
+// identical `{v: i32[][]}` and always ran; the axis was the depth the parameter sits at IN
+// THE ALIAS BODY, which is exactly what the peel removes from the answer.
+//
+// `arrLeafNameOf` strips whole `[]` pairs off the END, so the leaf is a PREFIX of `tn` and
+// the remainder is precisely the `[]` repetitions to re-attach — the dimensions are carried
+// as the slice they already are, never rebuilt from a count.
 export function gaeApplyFieldTy(tn: string, pnames: string[], args: string[]) {
+  const leaf = arrLeafNameOf(tn)
+  const dims = tn.slice(leaf.length, tn.length)
   let i = 0
   while i < pnames.length {
-    if tn == pnames[i] { return args[i] }
-    if tn == pnames[i] + "[]" { return args[i] + "[]" }
+    if leaf == pnames[i] && !gaeParamShadowed(pnames[i]) {
+      return args[i] + dims
+    }
     i = i + 1
   }
   tn
