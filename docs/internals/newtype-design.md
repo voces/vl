@@ -177,8 +177,8 @@ end and launders the brand.
 
 ### 2.5 What sees THROUGH the brand, deliberately
 
-`print`, string interpolation, `toString` and the ordering operators over a
-same-brand pair all work, because the brand is not a capability — a branded
+`print`, `toString`, and the ordering operators over a same-brand pair all work,
+because the brand is not a capability — a branded
 `i32` is a `TyPrim i32` with a label and every structural question about it
 answers the way `i32` answers. Only the *assignment* and *mixing* questions
 consult the brand.
@@ -221,30 +221,40 @@ Ty."* Nominal facts are arena-index sidecars: `cStructTyIxs`/`cStructNames`
 let nwDeclNames: string[] = []   // names DECLARED `new`   (a declaration fact)
 let nwTyIxs: i32[] = []          // branded arena index    (the sidecar KEY)
 let nwNames: string[] = []       // the brand that index carries
+let nwBaseTyIxs: i32[] = []      // the un-branded index it stands for
 ```
 
-`nomNameOfTy(ix)` is the reader; `""` means unbranded. All three reset with the
+`nomNameOfTy(ix)` is the reader; `""` means unbranded. All four reset with the
 other sidecars at `checkProgramNode`.
 
-The branded index is minted differently per body kind, and the difference is the
-whole reason struct newtypes cost almost nothing:
+**One minting rule, both body kinds.** `declaredTyOfName` hands whatever it was
+about to return through `nwBrand`, which is the identity for every name not
+declared `new` and otherwise returns a branded index over the SAME `Ty` payload
+(`addTy(T.tys[base])` — a second index, not a deep copy). Interned once per
+(name, base) pair, so `assignable`'s `src == dst` fast path still fires and
+`resolveAnnot`'s name-keyed memo stays stable.
 
-- **Scalar / alias body** (a one-member `UnionDecl`): `cUserTypes[name]` must
-  stay the `TyUnion` so canon's transparency arm keeps claiming the name. So
-  `declaredTyOfName` returns a **branded copy** of the member — `addTy` of the
-  same `Ty` payload, which yields a fresh index sharing the node. Interned once
-  per newtype name, so `assignable`'s `src == dst` fast path still fires and
-  `resolveAnnot`'s name-keyed memo stays stable.
-- **Struct body** (a `TypeDecl`): the declaration already owns a unique arena
-  index (`mkObjTy` at 12842). Brand THAT index. Nothing else moves —
-  `structNameOfTy`, the emitter's `sNames`/shape key and `cStructTyIxs` all keep
-  pointing at the same node.
+The second index sharing the payload is what makes the pass ordering work: a
+`TyObj` placeholder minted in pass 0a and FILLED in pass 0b pushes into the very
+field arrays the brand shares, so a forward reference through the newtype name
+sees the finished shape without any re-minting.
+
+`cUserTypes[name]` is left pointing at the UN-branded index in both cases — for
+a scalar that is the `TyUnion` canon's transparency arm must keep claiming, and
+for a struct it is the index `sNames` / the shape key / `emit_rep.sTyIxOfName`
+already resolve through. That is the whole checker/emitter split in one line: the
+checker reads `declaredTyOfName` and gets the brand, the emitter reads
+`cUserTypes` and gets the shape. `nwBrand` mirrors the nominal sidecar rows
+(`cStructTyIxs` / `cUnionTyIxs`) onto the branded index so `structNameOfTy` and
+`unionAliasDeclNameOfTy` answer about the brand exactly as they answer about its
+base — without that, a declared struct reached through its newtype name would
+lose its declared name in the renderers.
 
 ### 3.2 What "zero cost" means at the wasm level
 
 For a **scalar** newtype there is no heap type and no wrapper: the emitted module
 is byte-identical to the same program with `EntityId` spelled `i32`. Proven per
-cell with `cmp`, §6.
+cell with `cmp`, §7.1.
 
 For a **struct** newtype the emitted module is byte-identical to the same program
 with `new` deleted from the declaration. Two DIFFERENT struct newtypes of the
@@ -272,7 +282,13 @@ An exported function taking `EntityId` **exports as its base scalar.**
 ```vl
 export function spawn(id: EntityId): EntityId { return id }
 ```
-emits `(func (param i32) (result i32))`.
+
+Read off the emitted bytes, not asserted:
+
+```wat
+(type (;2;) (func (param i32) (result i32)))
+(export "spawn" (func 0))
+```
 
 Zero-cost means invisible at the boundary, and it falls out of §3: canon
 rewrote the annotation to `i32` before the emitter built the functype, so there
@@ -344,7 +360,7 @@ deleted — and the second is the **inverted control**.
 |---|---|---|
 | REJECT cells | **72 / 72** | reject with `new`, and the inverted control **checks clean** — so every reject is attributable to the newtype and to nothing else in the program |
 | positive cells, checker | **47 / 47** | check clean and run correctly |
-| positive cells, ERASURE (`cmp` vs the same program with `new` deleted) | **46 / 46** | **byte-identical** |
+| positive cells, ERASURE (`cmp` vs the same program with `new` deleted) | **46 / 46** comparable | **byte-identical** |
 
 The erasure column is 46, not 47, and the missing cell is the honest one to state:
 `{[string]: f32}` with a float-literal `.set` **builds and runs with `new` and
@@ -419,11 +435,22 @@ fixtures, `std/buffer.vl` itself, and the 20 corpus files that IMPORT `std:buffe
 (they reject on the `d0a13651` side because that compiler cannot parse `new`).
 **Zero pre-existing files moved on any channel.**
 
-**Fuzz A/B** — and the reach statement matters more than the number:
-`scripts/fuzzgen.vl` contains the token `new` exactly once, **in a comment**, so
-the generated population contains **zero** newtype declarations by construction.
-The fuzz channel is therefore a NO-REGRESSION instrument for this change (does
-the machinery perturb programs that contain no newtype), never an agreement
+**Reach, stated before the channels are read.** The `= new ` form appears in
+**7** of the 1,625 corpus/std files, and all seven are added or changed by this
+work (6 fixtures + `std/buffer.vl`). So the corpus channel is an INERTNESS
+instrument for this feature, not a coverage one — its job is field 5, and the
+purpose-built 119-cell grid is the instrument that actually exercises the rules.
+Saying which is which matters: a green corpus here would otherwise read as
+coverage it does not have.
+
+**Fuzz A/B: IDENTICAL** — 7 seeds x 3 depths x 2,400 cases = **50,400 programs
+per side**, 625 finding-lines each, `diff` clean.
+
+And the reach statement matters more than the verdict: `scripts/fuzzgen.vl`
+contains the token `new` exactly once, **in a comment**, so the generated
+population contains **zero** newtype declarations by construction. The fuzz
+channel is therefore a NO-REGRESSION instrument for this change (does the
+machinery perturb programs that contain no newtype), never an agreement
 instrument for the feature. Its verdict has to be read that way or a green reads
 as coverage it does not have.
 
