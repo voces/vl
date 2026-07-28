@@ -1,0 +1,71 @@
+// @run
+// @log 5000000000
+// @log 1.5
+// @log 1.5
+// @log 1.5
+// @log 2.5
+// @log 1.5
+// DIAGNOSTIC + FILING: the boundary of a BARE `m[k]` (no `?? default`) over a map whose value is
+// a non-i32 SCALAR. `emitMapGet`'s miss arm is a three-way ladder over the mv value kind —
+//
+//     if mvValKind[mslot] == 11 { fbF64Const("0") }        // f64
+//     else if mvValKind[mslot] == 10 { fbI64Const(0, 0) }  // i64
+//     else { fbRefNull(mvValElemHeapOf(mslot)) }           // a REF value
+//
+// — and the SCALAR set has THREE members, not two: `mvScalarValKind` (the chokepoint the
+// get/set/append paths consult) reads 11 f64, 10 i64 AND **13 f32**. The ladder above knows
+// only the first two, so an f32-valued map falls into the ref arm and the miss branch emits
+// `ref.null $fa32` into a local declared `f32` — INVALID WASM with `vl check` rc 0. Classifier
+// taught HALF a set, with the other half already interned one function away.
+//
+// THREE CELLS MEASURED on 8ff5fd4, all `vl check` rc 0 (this file pins the arms that WORK; the
+// broken ones cannot be pinned without failing the suite, so they are named here instead):
+//
+//   1. `sink(m["k"])` into an `f32 | null` param over `{[string]: f32}` — invalid wasm,
+//      "type mismatch: expected f32, found (ref null $type)". The i64 and f64 twins RUN and are
+//      pinned below; i32 / boolean / string run too. Binding first (`const b = m["k"]; sink(b)`)
+//      does not move it. ANCHOR: `emitMapGet` (`wasmEmit.vl`), the ladder quoted above.
+//   2. `for v in m.values()` over an f32-valued map AT MODULE SCOPE — invalid wasm. The
+//      identical loop INSIDE a function runs (pinned below), and the f64 twin runs at module
+//      scope, so the ANCHOR is the start function's own scratch detection
+//      (`startFnDetectScratch`, `emit_sections.vl`), not the loop lowering.
+//   3. NOT an emit bug but a SILENT wrong answer, filed with them because it is the same miss
+//      arm: for i64/f64 a MISS reads the rep's ZERO, and `if v != null` then sees a non-null
+//      value — `sink(m["zz"])` prints `0`, not the null arm. A scalar map value has no null rep,
+//      so the bare read cannot represent "absent"; `m[k] ?? d` is the spelling that can.
+//      Deliberately NOT pinned above — pinning it would freeze the wrong answer as contract.
+
+// PIN 1 — the two scalar arms of the miss ladder that ARE taught. A HIT over an i64- and an
+// f64-valued map crosses into a nullable-scalar param and narrows.
+function sinkI64(v: i64 | null) {
+  if v != null { print(v) } else { print("N") }
+}
+function sinkF64(v: f64 | null) {
+  if v != null { print(v) } else { print("N") }
+}
+function pins() {
+  const a: {[string]: i64} = Map()
+  a["k"] = 5000000000
+  sinkI64(a["k"]) // 5000000000
+  const b: {[string]: f64} = Map()
+  b["k"] = 1.5
+  sinkF64(b["k"]) // 1.5
+}
+pins()
+
+// PIN 2 — the f32-valued map's WORKING spellings: a coalesced read at module scope, and the
+// `.values()` for-in INSIDE a function (cell 2 above is the module-scope twin of this loop).
+const g: {[string]: f32} = Map()
+g["k"] = 1.5
+print(g["k"] ?? 0.0) // 1.5
+
+function f32Loop() {
+  const m: {[string]: f32} = Map()
+  m["k"] = 1.5
+  m["j"] = 2.5
+  for v in m.values() {
+    print(v) // 1.5, 2.5 — insertion order
+  }
+  print(m["k"] ?? 0.0) // 1.5
+}
+f32Loop()
