@@ -8042,11 +8042,52 @@ function fbNumOp(op: i32) {
   0
 }
 
+// One operand of a NUMERIC-OPCODE intrinsic, emitted at the width the OPERATION
+// declares (`k`: the `emitExprAsKind` codes — 0 i32, 3 i64, 4 f64, 5 f32) with the
+// ENCLOSING wide-scalar context cleared. The i32-by-declaration twin of
+// `emitMemIntrinArg`, generalized to all four widths because these operands are not
+// all i32: an operand's width comes from the intrinsic's own signature (`f32fromBits`
+// takes an i32, `f64fromBits` an i64, `sqrt` its operands' float width), never from
+// the position the CALL sits in — the same rule a call ARGUMENT already obeys
+// (`f32-context-call-argument.vl`) and for the same reason.
+//
+// Measured on the parent commit over a 19-context x 22-expression matrix: 197 of 418
+// cells emitted `type mismatch: expected i32/f64, found f32` with `vl check` clean.
+// Every f32-seeding context (`: f32` binding/global/return/tail/param, `f32[]` push /
+// element assign, `__store_f32__`, a union f32 atom, an inferred f32 local, a nested
+// block) crossed with every intrinsic whose operand is NOT the enclosing f32: the
+// bitcast pair `f32fromBits(1065353216)`, the integer ops under an `as f32`
+// (`clz`/`popcnt`/`rotl`/`divU`), and the float ops at f64 width (`nearest(2.5)`).
+// `pendingF32` is read FIRST in `emitNumLitNode`, so it beat both the i64 and the f64
+// literal forms and every literal in reach lowered as `f32.const`.
+//
+// The flags are CLEARED, not re-seeded per width: `emitExprAsF32`/`AsF64`/`AsI64`
+// already lower a top-level literal at their own width, and the f32 arm's `pendingF32
+// = true` seed that the `__store_f32__` / f32-param boundaries carry buys nothing
+// here (a literal nested deeper than the operand root is `exprIsF32`-invisible either
+// way, so those cells stay exactly as they were).
+function emitNumIntrArg(body: i32[], ix: i32, k: i32, fnIx: i32) {
+  const savedF32 = pendingF32
+  const savedF64 = pendingF64
+  const savedI64 = pendingI64
+  pendingF32 = false
+  pendingF64 = false
+  pendingI64 = false
+  const r = emitExprAsKind(body, ix, k, fnIx)
+  pendingF32 = savedF32
+  pendingF64 = savedF64
+  pendingI64 = savedI64
+  r
+}
+
 // Lower `f32bits` / `f64bits` / `f32fromBits` / `f64fromBits`: push the argument at
 // the source type, then the one reinterpret instruction. Returns `NUM_INTR_NONE` when
 // `name` is not one of them. The argument rides the coercing emitters, so an i32 in
 // f64 position converts exactly as it would at any other f64 boundary — the CAST is
-// ordinary, only the reinterpretation is not.
+// ordinary, only the reinterpretation is not. The width is the BITCAST's own, so the
+// operand takes `emitNumIntrArg` (the enclosing wide-scalar context cleared): a
+// `f32fromBits(1065353216)` under any f32 context otherwise lowered its i32 argument
+// as `f32.const` and handed `f32.reinterpret_i32` an f32.
 function emitBitcastIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
   if (
     name != "f32bits" &&
@@ -8063,18 +8104,18 @@ function emitBitcastIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
     }
     const arg = c.callArgs[0]
     if name == "f32bits" {
-      if emitExprAsF32(body, arg, fnIx) < 0 { return -1 }
+      if emitNumIntrArg(body, arg, 5, fnIx) < 0 { return -1 }
       return fbNumOp(OP_I32_REINTERPRET_F32) // 0xbc i32.reinterpret_f32
     }
     if name == "f64bits" {
-      if emitExprAsF64(body, arg, fnIx) < 0 { return -1 }
+      if emitNumIntrArg(body, arg, 4, fnIx) < 0 { return -1 }
       return fbNumOp(OP_I64_REINTERPRET_F64) // 0xbd i64.reinterpret_f64
     }
     if name == "f32fromBits" {
-      if emitExpr(body, arg, fnIx) < 0 { return -1 }
+      if emitNumIntrArg(body, arg, 0, fnIx) < 0 { return -1 }
       return fbNumOp(OP_F32_REINTERPRET_I32) // 0xbe f32.reinterpret_i32
     }
-    if emitExprAsI64(body, arg, fnIx) < 0 { return -1 }
+    if emitNumIntrArg(body, arg, 3, fnIx) < 0 { return -1 }
     return fbNumOp(OP_F64_REINTERPRET_I64) // 0xbf f64.reinterpret_i64
   }
   NUM_INTR_NONE
@@ -8173,13 +8214,15 @@ function emitFloatIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
     // operand as both sides, which asks the same question of it.
     const hardF64 = binMixHardF64(args[0], args[args.length - 1], fnIx)
     const useF32 = anyF32 && !hardF64
+    // The chosen width is the OPERATION's, so each operand takes it with the enclosing
+    // wide-scalar context cleared (`emitNumIntrArg`). The f64 arm is the one that
+    // needed it: `nearest(2.5)` under an f32 context lowered `2.5` as `f32.const` and
+    // handed `f64.nearest` an f32.
+    let fiK = 4
+    if useF32 { fiK = 5 }
     let j = 0
     while j < args.length {
-      if useF32 {
-        if emitExprAsF32(body, args[j], fnIx) < 0 { return -1 }
-      } else {
-        if emitExprAsF64(body, args[j], fnIx) < 0 { return -1 }
-      }
+      if emitNumIntrArg(body, args[j], fiK, fnIx) < 0 { return -1 }
       j = j + 1
     }
     if useF32 { return fbNumOp(opF32) }
@@ -8203,13 +8246,14 @@ function emitIntIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
       if exprIsI64(args[i], fnIx) { useI64 = true }
       i = i + 1
     }
+    // The chosen width is the OPERATION's — an i32 op's operand is an i32 whatever the
+    // enclosing position wants — so each one takes `emitNumIntrArg`. Without it
+    // `clz(1) as f32` lowered the `1` as `f32.const` into `i32.clz`.
+    let iiK = 0
+    if useI64 { iiK = 3 }
     let j = 0
     while j < args.length {
-      if useI64 {
-        if emitExprAsI64(body, args[j], fnIx) < 0 { return -1 }
-      } else {
-        if emitExpr(body, args[j], fnIx) < 0 { return -1 }
-      }
+      if emitNumIntrArg(body, args[j], iiK, fnIx) < 0 { return -1 }
       j = j + 1
     }
     if useI64 { return fbNumOp(intIntrOpI64(name)) }
