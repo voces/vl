@@ -1487,6 +1487,35 @@ let cUnionTyIxs: i32[] = []
 // resolve back to its alias name — used to pin an anonymous lambda's litunion return as the
 // ALIAS (an inline litunion spelling reps as a string ref, so the alias name is required).
 let cUnionNames: string[] = []
+// GENERIC-APPLICATION NOMINAL sidecar (typed-IR P1). The third reverse map in the
+// `cStructTyIxs`/`cUnionTyIxs` family, and the record #1267 measured missing: the arena
+// knows what `Box<i32>` EXPANDS to and nothing at all about the fact that an application
+// was written, so the nominal renderer had no route back to `Box<i32>` and produced the
+// structural `{value: i32}` instead — 114 of the 194 cells where `tyToNominalName ∘
+// nameToTy` disagrees with `canonEmitName`, the single largest class in that residue.
+//
+// `applyGenAliasArgs` is the site with both halves in hand. It MEMOIZES the expansion per
+// `(head, argument type indices)` and mints a fresh `TyObj` per distinct application, and
+// the arena does not intern (`addTy` always pushes), so the recorded index belongs to that
+// application and to nothing else — an inline `{value: i32}` written elsewhere in the same
+// program gets its own index and is never claimed by this map.
+//
+// A NAME IS A NAME: the head is genuine nominal identity (the emitter's own `gaeBases`
+// registry is keyed by that declared name), so storing it as a string is not the disease.
+// The ARGUMENTS are stored as ARENA INDICES, not as a spelling — the renderer recurses
+// through them, so nothing here has to be parsed back.
+let gaAppTyIxs: i32[] = []
+let gaAppHeads: string[] = []
+// The arguments of each `gaAppTyIxs` entry, flattened: entry `i` owns
+// `gaAppArgFlat[gaAppArgStart[i] .. + gaAppArgCount[i]]`. Same flat-slice shape as the
+// `gaParamNames`/`gaParamStart`/`gaParamCount` triple this file already uses for the
+// declaration side.
+let gaAppArgStart: i32[] = []
+let gaAppArgCount: i32[] = []
+let gaAppArgFlat: i32[] = []
+// Per-row finiteness memo for the reader's cycle guard: -1 unknown, 0 the expansion is
+// CYCLIC (decline — see `tyReachesSelf`), 1 finite.
+let gaAppFinite: i32[] = []
 // The names of one-member `type N = A` aliases whose single variant is spelled as a bare
 // type NAME or a generic APPLICATION (`type MyCat = Cat`, `type Y = Box<i32>`) — recorded
 // SYNTACTICALLY in pass 0a, before any variant resolves. The parser encodes every
@@ -5294,6 +5323,19 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   const resIx = mkObjTy(fnames, ftys)
   cUserTypes[memoKey] = resIx
   cUserTypesVer = cUserTypesVer + 1 // new declared-name resolution registered
+  // TYPED-IR P1: bank the fact that this arena index IS the application `head<argTys>`.
+  // Recorded on the memo MISS, so exactly one row exists per distinct application — the
+  // same population `cUserTypes` keys, and the same index every later hit returns.
+  gaAppTyIxs.push(resIx)
+  gaAppHeads.push(head)
+  gaAppArgStart.push(gaAppArgFlat.length)
+  gaAppArgCount.push(argTys.length)
+  gaAppFinite.push(-1)
+  let gaf = 0
+  while gaf < argTys.length {
+    gaAppArgFlat.push(argTys[gaf])
+    gaf = gaf + 1
+  }
   let bi = 0
   while bi < pcount {
     tpEnvNames.push(gaParamNames[pstart + bi])
@@ -6814,6 +6856,162 @@ export function unionAliasDeclNameOfTy(ty: i32): string {
   ""
 }
 
+// The GENERIC APPLICATION arena index `ty` was produced by, rendered nominally
+// (`Box<i32>`, `Pair<i32,string>`), or "" when `ty` is not a recorded application — the
+// third leg of the `structNameOfTy` / `unionAliasDeclNameOfTy` family, over the sidecar
+// `applyGenAliasArgs` banks. First-match wins, exactly as on the two siblings; the memo
+// there makes at most one row per index anyway.
+//
+// The ARGUMENTS render through `tyToNominalNameAt` in FIELD position, so a nested
+// application (`Box<Box<i32>>`) spells in full and a declared struct argument keeps its
+// own name. The ancestor stack inside that entry is what makes the recursion safe on a
+// recursive alias — the cycle answers "" and this arm declines with it, rather than
+// producing a half-name a consumer would key on.
+//
+// The separator is `,` with no space, which is the spelling `gaeArgsTextOf` cuts on and
+// the one `canonEmitName` keeps — so an agreeing render is byte-equal, not merely
+// equivalent.
+// Does arena type `ix` REACH ITSELF — is its expansion CYCLIC?
+//
+// This is the guard the nominal short-circuit cannot do without. `type L<T> = {head: T,
+// tail: L<T>[]}` applied at `i32` mints a `TyObj` whose `tail` element IS that very index,
+// so the application has a perfectly finite nominal NAME (`L<i32>`) while its EXPANSION has
+// none. `tyToNominalNameAt`'s ancestor stack discovers that by descending into the body; a
+// head-first short-circuit returns before the descent and so never sees it, which silently
+// clears `nomNameCycle` — the bank `guardFiniteUserTypes` rejects such a program from.
+// Measured: without this guard all three `tests/cases/generics/recursive-generic-alias-*`
+// fixtures move from master's clean reject to a compiler TRAP (a wasm backtrace), because
+// the emitter is then handed a name whose shape it descends forever.
+//
+// A VISITED set (not a depth counter alone) is what makes this cheap: each reachable index
+// is expanded once, so a shared sub-shape costs once and a cycle terminates on the revisit.
+// The depth cap is a second belt for a pathologically deep acyclic type.
+function tyReachesSelf(ix: i32): boolean {
+  if ix < 0 { return false }
+  const seen: i32[] = []
+  tyReachesGo(ix, ix, seen, 0)
+}
+
+function tyReachesGo(cur: i32, target: i32, seen: i32[], depth: i32): boolean {
+  if cur < 0 { return false }
+  if depth > 64 { return false }
+  const kids: i32[] = []
+  tyChildrenOf(cur, kids)
+  let i = 0
+  while i < kids.length {
+    const k = kids[i]
+    if k == target { return true }
+    if k >= 0 {
+      let dup = false
+      let j = 0
+      while j < seen.length {
+        if seen[j] == k { dup = true }
+        j = j + 1
+      }
+      if !dup {
+        seen.push(k)
+        if tyReachesGo(k, target, seen, depth + 1) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The DIRECT child type indices of arena entry `ix`, appended to `out`. The leaf
+// constructors (`TyPrim`/`TyLit`/`TyVar`/`TyErr`) have none.
+function tyChildrenOf(ix: i32, out: i32[]) {
+  if ix < 0 { return 0 }
+  const t = T.tys[ix]
+  if t is TyArray {
+    out.push(t.aElem)
+    return 0
+  }
+  if t is TyNullable {
+    out.push(t.nInner)
+    return 0
+  }
+  if t is TyNeg {
+    out.push(t.negTy)
+    return 0
+  }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      out.push(ms[i])
+      i = i + 1
+    }
+    return 0
+  }
+  if t is TyObj {
+    const fs = t.objFieldTypes
+    let i = 0
+    while i < fs.length {
+      out.push(fs[i])
+      i = i + 1
+    }
+    return 0
+  }
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let i = 0
+    while i < ps.length {
+      out.push(ps[i])
+      i = i + 1
+    }
+    out.push(t.fnRet)
+    return 0
+  }
+  if t is TyMap {
+    out.push(t.mKey)
+    out.push(t.mVal)
+    return 0
+  }
+  0
+}
+
+export function genAppNameOfTy(ty: i32): string {
+  if ty < 0 { return "" }
+  let i = 0
+  while i < gaAppTyIxs.length {
+    if gaAppTyIxs[i] == ty {
+      // CYCLIC EXPANSION: decline, so the caller descends and the cycle bank fills exactly
+      // as it did before this arm existed. Memoized per row (`-1` unknown / `0` cyclic /
+      // `1` finite) — the answer cannot change once `applyGenAliasArgs` has filled the
+      // shape, and every read of this map happens after that.
+      if gaAppFinite[i] < 0 {
+        if tyReachesSelf(ty) { gaAppFinite[i] = 0 } else { gaAppFinite[i] = 1 }
+      }
+      if gaAppFinite[i] == 0 { return "" }
+      const st = gaAppArgStart[i]
+      const cn = gaAppArgCount[i]
+      // A zero-argument row cannot arise (`applyGenAliasArgs` rejects an arity mismatch
+      // before the memo, and a declared generic has at least one parameter), but a head
+      // with no arguments would render `Box<>` — not a spelling anything can resolve. Bail
+      // to "" so the caller keeps whatever route it had.
+      if cn <= 0 { return "" }
+      let s = ""
+      let a = 0
+      while a < cn {
+        const an = tyToNominalNameAt(gaAppArgFlat[st + a], RC_FIELD)
+        // An argument with no nominal name (a TyVar — an UNINSTANTIATED `Box<T>` inside the
+        // alias's own body — or a cycle) makes the whole application unspellable. Decline
+        // rather than emit `Box<>` or a partial name.
+        if an == "" { return "" }
+        if a > 0 { s = s + "," }
+        s = s + an
+        a = a + 1
+      }
+      // The application is ONE top-level atom, whatever the recursion left in the bank.
+      nomNameAtoms = 1
+      return gaAppHeads[i] + "<" + s + ">"
+    }
+    i = i + 1
+  }
+  ""
+}
+
 // NAME-FAITHFUL renderer (rep-adoption name-faithful-renderer slice). Like `tyToEmitName`,
 // but NOMINAL-FIRST: a TyObj that IS a registered declared struct renders as its NAME (via
 // `structNameOfTy`) and a TyUnion that IS a registered declared union alias renders as its
@@ -6908,6 +7106,14 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
   // so one atom (the reset above).
   const sdn = structNameOfTy(ix)
   if sdn != "" { return sdn }
+  // …and a GENERIC APPLICATION renders as the application (`Box<i32>`), which is equally
+  // nominal: the head is a declared name and the arguments render nominally under it.
+  // Ahead of the union arm for the same reason `structNameOfTy` is — an application
+  // expands to a `TyObj`/`TyUnion` whose structural render is exactly the expansion this
+  // renderer exists to avoid producing. Declines ("") for an uninstantiated or cyclic
+  // argument, so every shape that had no nominal route before still takes its old one.
+  const gan = genAppNameOfTy(ix)
+  if gan != "" { return gan }
   const udn = unionAliasDeclNameOfTy(ix)
   if udn != "" {
     // …EXCEPT a declared alias for a NUMERIC literal union (`type Z = 0 | 1`, the
@@ -12509,6 +12715,12 @@ function checkProgramNode(n: Program) {
   cVariantMemberTyIxs = []
   cUnionTyIxs = []
   cUnionNames = []
+  gaAppTyIxs = []
+  gaAppHeads = []
+  gaAppArgStart = []
+  gaAppArgCount = []
+  gaAppArgFlat = []
+  gaAppFinite = []
   cPlainAliasNames = []
   cLitUnionCopyTyIxs = []
   cLitUnionCopyAliasIxs = []
