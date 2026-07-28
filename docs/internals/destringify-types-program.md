@@ -29261,3 +29261,66 @@ and here it names its own cause.
   instrument (direct seeds only, no interprocedural step) read 61 and looked clean; the residue view
   showed it was missing `shapeInnerFieldSplit`'s whole caller family. A census that only tightens is
   optimising the wrong error.
+
+## D-GAERAWFIELD — the canon pass has no SCOPE, so it resolved a generic alias's own type PARAMETER; a sidecar closes 116 cells and the suppression alternative is measured WORSE (censused and graded off `cf24c6e`, rebased and re-gated on `8ff5fd4`, which touches none of these files — every reading below reproduced identically on both)
+
+`canonEmitTypeNames` rewrites every `TypeRef` in the arena. It is a NAME rewrite with no notion
+of scope, so inside the body of `type Box<Id> = { v: Id }` it resolved `Id` through the
+DECLARED registry while the checker resolved it as the alias's parameter (`tsLeafTy` asks
+`tpEnvTyOfName` before `declaredTyOfName`, and reports `Box<string>` as `{v: string}`).
+`emit_collect.gaeCollectDecls` therefore recorded `i32` against a parameter list holding `Id`
+and `emit_base.gaeApplyFieldTy` matched nothing — `vl check` rc=0, module does not parse.
+
+**The population was never "a transparent single-member alias."** Swept as a grid (alias body ×
+application argument × field depth, 108 cells, plus 108 non-shadowing controls, plus a
+14-row axis over WHAT the shadowed name names):
+
+* `singleMemberAliasName` claims `type Id = i32`, `type Ids = i32[]`, `type MyS = Sx` (alias to a
+  declared struct), the alias-of-an-alias, the function-type alias and the map alias.
+* `numLitUnionAliasName` — a DIFFERENT canon arm, reached before the `nameNeedsCanon` early-out —
+  claims `type Z = 0 | 1` and the one-member `type One = 1`. Same failure, same shape, and no
+  amount of staring at the transparency arm would have found it.
+* A declared STRUCT or UNION shadow never failed (canon rewrites neither), and neither did a
+  STRING literal union (`type K = "a" | "b"` keeps its alias name deliberately).
+
+Master: 82 invalid-wasm + 2 emit-error of 108; after: 108/108 correct, 0 regressions, and the 108
+controls stayed green throughout. Route grid: 30 more cells invalid-wasm → correct.
+
+### THE SUPPRESSION ALTERNATIVE IS MEASURED WORSE, AND THAT IS THE FILING
+
+The obvious fix is to teach `canonEmitNameAt` to leave a live parameter name alone (a
+`canonTpNames` scope, bounded by `primTyOfName` so a parameter named for a builtin still binds
+nothing). It was BUILT and SWEPT. It fixes the same 84 cells **and reddens 8 that are green on
+master**: every depth-2 field at the NO-OP instantiation (`type Box<Id> = { v: Id[][] }` at
+`Box<i32>`). Surviving in the arena, `Id[][]` is a nested list whose element names a
+`UnionDecl` — a one-member alias is still a `UnionDecl` — so the ref-list intern gave the inner
+row a union BOX element and `[[1]]` lowered into it (`expected i32, found (ref $type)`; the wat
+diff shows `(array (mut (ref null 1)))` where master has `(ref null 4)`).
+
+The substitution is the ONLY consumer that wants the parameter name back. So the arena keeps its
+single vocabulary and that one consumer gets a second column: `typecheck.genAliasFieldRawTyName`
+banks the pre-canon spelling per annotation node, and `gaeCollectDecls` takes it only where
+`emit_base.gaeParamSlotOf` (factored out of `gaeApplyFieldTy`, so the gate IS the substitution's
+own decision) says the substitution would land.
+
+### RESIDUE, WITH THE CONTROL THAT SORTS IT
+
+Cells still red after the fix, each paired with the same program at a NON-shadowing parameter
+name — the control is what says whether a red cell is this defect or a different one:
+
+| cell | shadowed | control | verdict |
+|---|---|---|---|
+| `type Box<Id> = { v: Id \| null }` | invalid wasm | **correct** | LIVE shadow defect — `gaeApplyFieldTy` peels only `[]`, so a parameter under a `\|` never matches |
+| `type Box<Id> = { v: { a: Id } }` | invalid wasm | **correct** | LIVE shadow defect, same cause at an inline shape |
+| `function ident<Id>(v: Id): Id` | invalid wasm | **correct** | LIVE, DIFFERENT ROUTE — the FuncDecl half. Every consumer of `fnTyParams` that substitutes (`monoAnnHasTyParam`, `monoSubstAnn`, `monoTyParamOf`, `monoBindFromAnn`) is in `emit_mono.vl` |
+| `type Outer<Id> = { o: Inner<Id> }` | emit error | emit error | NOT a shadow defect — a nested generic application is a pre-existing gap |
+| `Box<Nm>` where `type Nm = string` | invalid wasm | **invalid wasm** | NOT a shadow defect — a generic application whose ARGUMENT is a transparent alias is a pre-existing `vl check`-clean invalid-wasm hole, un-filed until now |
+| `type Box<Id> = { v: {[string]: Id} }` | invalid wasm | emit error | pre-existing map-value gap ("map value type has no interned slot"); the shadow makes it worse, not different |
+
+### LESSON
+
+**Ask what a fix leaves STANDING, not just what it removes.** Both candidates delete the same
+wrong answer; they differ only in what they leave in the arena for the other twenty passes to
+read. The 8 reddened cells were invisible to every channel except a swept grid that included the
+cells the defect did *not* break — the diagonal `A == B` no-op instantiations, which are the
+boring rows one is most tempted to drop from a grid.

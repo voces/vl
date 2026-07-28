@@ -37,6 +37,7 @@ import {
   annUnionAtomsOf,
   cUserTypes,
   canonEmitName,
+  genAliasFieldRawTyName,
   inferLetCount,
   inferLetNameOf,
   inferLetTyAt,
@@ -98,7 +99,10 @@ import {
 import {
   annArrowAt,
   annRetNameOf,
+  arrLeafNameOf,
   cloArrElemNameOf,
+  gaeParamSlotOf,
+  gaeSplitArgs,
   isStructAtom,
   isVariantBoxUnion,
   isVariantBoxUnionAtoms,
@@ -3441,6 +3445,31 @@ function collectAnonShapes() {
   0
 }
 
+// The type name to record for one generic-alias field: the annotation as CANON'd, except
+// where the field's type IS a type parameter — there, the DECLARED spelling.
+//
+// `canonEmitTypeNames` is a name rewrite with no scope, so inside the body of
+// `type Box<Id> = { v: Id }` it resolved `Id` through the DECLARED registry (`type Id = i32`
+// → "i32", `type Id = 0 | 1` → "i32" by a different arm) while the CHECKER resolved it as
+// the parameter — `tsLeafTy` asks the live binding before the registry, and reports
+// `Box<string>` as `{v: string}`. The emitter then substituted nothing, because the name it
+// had to match on was already gone. The pre-canon spelling is banked per annotation node at
+// `typecheck.genAliasFieldRawTyName`; the ARENA is untouched, because the substitution is
+// the only consumer that wants the parameter name back and a parameter name left standing
+// in the arena is a NAME `collectU` may already have claimed (`type Id = i32` is a
+// one-member `UnionDecl`, so an `Id[][]` field interned a ref-list of union BOXES and the
+// no-op instantiation `Box<i32>` stopped lowering).
+//
+// The `gaeParamSlotOf` gate is what keeps this narrow: the declared spelling is taken only
+// where the substitution would land, so `type Box<T> = { v: 0 | 1 }` still records the
+// canon'd `i32` and `type Box<i32> = { v: i32 }` still substitutes nothing.
+function gaeDeclFieldTyName(nodeIx: i32, canoned: string, pnames: string[]) {
+  const raw = genAliasFieldRawTyName(nodeIx)
+  if raw == "" { return canoned }
+  if gaeParamSlotOf(arrLeafNameOf(raw), pnames) < 0 { return canoned }
+  raw
+}
+
 // Record every generic-alias declaration into the registry.
 function gaeCollectDecls(stmts: i32[]) {
   gaeBases = []
@@ -3461,7 +3490,12 @@ function gaeCollectDecls(stmts: i32[]) {
       if annGenAppSpanEnds(s.tdName) {
         const lt = gaeLtAt(s.tdName)
         gaeBases.push(s.tdName.slice(0, lt))
-        gaeParams.push(s.tdName.slice(lt + 1, s.tdName.length - 1))
+        const ptext = s.tdName.slice(lt + 1, s.tdName.length - 1)
+        gaeParams.push(ptext)
+        // The parameter NAMES, needed here (not only at `gaeEnsure`) so a field whose type
+        // IS a parameter can be recorded as DECLARED rather than as canon resolved it.
+        const pnames: string[] = []
+        gaeSplitArgs(ptext, pnames)
         gaeFieldStart.push(gaeFieldNames.length)
         let cnt = 0
         const fields = s.tdFields
@@ -3473,6 +3507,7 @@ function gaeCollectDecls(stmts: i32[]) {
             if fnode.fdType >= 0 {
               const ftn = P.nodes[fnode.fdType]
               if ftn is TypeRef { tname = ftn.tyName }
+              tname = gaeDeclFieldTyName(fnode.fdType, tname, pnames)
             }
             gaeFieldNames.push(fnode.fdName)
             gaeFieldTyNames.push(tname)

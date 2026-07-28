@@ -1937,18 +1937,19 @@ export function gaeSplitArgs(s: string, out: string[]) {
 // about what a field's type IS, so its bound is the checker's own resolution order. Same
 // defect shape, different neighbour to agree with.
 //
-// TWO SIBLING DISAGREEMENTS OVER A SHADOWED PARAMETER SURVIVE THIS PREDICATE, both because
-// the name it would have to see is already gone by the time it is asked.
+// A parameter named for a name the CANON PASS REWRITES used to survive this predicate, and
+// no longer does — the name it had to see was gone by the time it was asked. `type Id = i32`
+// + `type Box<Id> = { v: Id }` + `const b: Box<string> = { v: "z" }` was `vl check` rc=0 with
+// `b` reported as `{v: string}` (the parameter binds, per the order above) and an emitted
+// module that did not parse, because `typecheck.canonEmitName` rewrote the field annotation
+// `Id` to `i32` before `gaeCollectDecls` recorded it. The population was never just the
+// transparent alias: `type Id = 0 | 1` and the one-member `type Id = 1` shadow through
+// `numLitUnionAliasName`, a DIFFERENT canon arm, and fail identically — while a declared
+// STRUCT or UNION shadow always ran, because canon rewrites neither. `gaeCollectDecls` now
+// records the DECLARED spelling for exactly the fields `gaeParamSlotOf` claims
+// (`typecheck.genAliasFieldRawTyName`), so this predicate is asked about `Id` again.
 //
-//   * A parameter named for a TRANSPARENT single-member alias. `type Id = i32` +
-//     `type Box<Id> = { v: Id }` + `const b: Box<string> = { v: "z" }` is `vl check` rc=0
-//     with `b` reported as `{v: string}` (the parameter binds, per the order above), and
-//     the emitted module does not parse ("expected i32, found (ref $type)"). The ANCHOR is
-//     `typecheck.canonEmitName`, whose alias transparency rewrites the field annotation
-//     `Id` to `i32` before `gaeCollectDecls` records it — so this function is handed the
-//     type name `i32` against a parameter list holding `Id`, with nothing left to match.
-//     `type Nm = string` fails identically; a declared STRUCT or UNION shadow does not
-//     (neither is transparent), which is why `type-param-shadows-declared-struct.vl` runs.
+// ONE SIBLING DISAGREEMENT OVER A SHADOWED PARAMETER SURVIVES:
 //
 //   * The FuncDecl half at a non-i32 rep. `function id<i64>(v: i64) { return v }` +
 //     `print(id(1))` is `vl check` rc=0 and invalid wasm inside `id`
@@ -1960,6 +1961,21 @@ export function gaeSplitArgs(s: string, out: string[]) {
 function gaeParamShadowed(name: string) {
   if name == "void" { return true }
   valueAtomKind(name) >= 0
+}
+// The parameter SLOT a field type's array LEAF names, or -1 when the leaf names no live
+// parameter (it is some other type, or it is a parameter the predicate above says binds
+// nothing). THE substitution's decision, published so the one other place that has to ask
+// "would `gaeApplyFieldTy` land here?" asks it rather than re-deriving it:
+// `emit_collect.gaeDeclFieldTyName` uses it to decide whether a field's DECLARED spelling
+// is the one to record. Two copies of this loop would be two answers to the same question,
+// and the whole defect this closes is exactly that.
+export function gaeParamSlotOf(leaf: string, pnames: string[]) {
+  let i = 0
+  while i < pnames.length {
+    if leaf == pnames[i] && !gaeParamShadowed(pnames[i]) { return i }
+    i = i + 1
+  }
+  -1
 }
 // Substitute a declared type-PARAMETER name in a field's type name with the application's
 // argument name, at ANY array depth: `T` → `i32`, `T[]` → `i32[]`, `T[][]` → `i32[][]`.
@@ -1980,15 +1996,9 @@ function gaeParamShadowed(name: string) {
 // as the slice they already are, never rebuilt from a count.
 export function gaeApplyFieldTy(tn: string, pnames: string[], args: string[]) {
   const leaf = arrLeafNameOf(tn)
-  const dims = tn.slice(leaf.length, tn.length)
-  let i = 0
-  while i < pnames.length {
-    if leaf == pnames[i] && !gaeParamShadowed(pnames[i]) {
-      return args[i] + dims
-    }
-    i = i + 1
-  }
-  tn
+  const slot = gaeParamSlotOf(leaf, pnames)
+  if slot < 0 { return tn }
+  args[slot] + tn.slice(leaf.length, tn.length)
 }
 // Lexicographic `a < b` over two strings by code point (VL has no `<` on `string`).
 // Compares char-by-char: at the first differing position the smaller code point wins;
