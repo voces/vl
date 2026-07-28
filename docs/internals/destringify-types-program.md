@@ -32940,3 +32940,263 @@ pin rather than a regression test for one edit:
   candidate B's forward cells are `INVWASM → RUNBAD` — still broken, just louder. A
   two-valued pass/fail column would have scored it 31-forward and shipped the one that
   breaks the previous slice's fixture.
+
+## TYPED-IR P1 — the mono-clone coverage hole is MEASURED AT ZERO, and #1267's G class turns out to live in the CHECKER: the generic APPLICATION gets a nominal record (off master `01b97c8a`)
+
+The brief for this slice, taken from this document's own P5 section, was: *"populate `nodeTyIx`
+for emit-time-CLONED monomorphized nodes, so the arena covers generics and the name fallback
+can retire."* That sentence appears at the end of TARGET 2's G-class analysis, has been quoted
+forward since, and **it is wrong in both halves**. The measurement that refutes it is the first
+thing below; what the G class actually needed is the rest.
+
+### THE COVERAGE HOLE, MEASURED — AND THERE ISN'T ONE
+
+**PROBE ZZTI.** At the point `monoMakeInstance` finalizes an instance, classify every
+annotation node that instance OWNS — its parameter annotations, its return annotation, and
+every `LetDecl` annotation in the (possibly cloned) body — three ways: **MISS** (`nodeTyIxOf`
+= -1, the arena has nothing), **VAR** (a recorded type that still mentions a `TyVar`: present
+but GENERIC, i.e. the type the shared body was checked with rather than this instance's), **OK**
+(a recorded concrete type). One `emitFail` line per program carries that program's counts;
+counting is complete when it runs, because every instance is minted inside `monomorphize`, so
+blocking the byte emission costs the measurement nothing.
+
+```
+build:   (probe in emit_mono.vl + a deep TyVar walk in typecheck.vl) scripts/refresh-compiler.sh
+run:     for d in tests/cases std scripts; do vl check --codegen $d --compiler TI-probe.wasm; done
+extract: grep -o 'ZZTI[^"]*'   # one record per program that minted an instance
+```
+
+| | total | MISS | VAR | OK |
+| --- | ---: | ---: | ---: | ---: |
+| instance PARAM annotations | 494 | 0 | 0 | **494** |
+| instance RETURN annotation | 215 | 0 | 0 | **215** |
+| instance BODY `LetDecl` annotations | 20 | 0 | 0 | **20** |
+| **all three** | **729** | **0** | **0** | **729 — 100.00%** |
+
+1,602 corpus files; **103** programs mint at least one instance; **392** instances. (40 / 177 /
+67 un-annotated slots are counted separately as `noAnn` — an absent annotation is not a coverage
+question.)
+
+**INVERTED CONTROL.** One flag (`zzInvert`) inverts the MISS test, so a wired instrument must
+report the complement and a dead one must report the same numbers. It reports **729 / 729 MISS,
+0 OK** — exactly complementary. The 100% is real, not a probe that never fired.
+
+**WHY IT IS ALREADY 100%, and the line that made it so.** `synthTypeRef` (`emit_classify.vl`)
+is not a plain `mkTypeRef` — it calls `recordClonedNodeTy` on every node it mints, and *every*
+annotation synthesis in the monomorphizer routes through it (the pinned param, all nine `nret`
+arms, `monoSubstLetType`, `monoCloneBody`'s inferred-list local, `monoCloneLambdaPinned`'s
+pinned param). The annotation nodes that are NOT synthesized are SHARED with the original
+declaration and carry the checker's own record. Between them there is nothing left to populate.
+The explicit `recordClonedNodeTy(nt, pinned[pj])` at `emit_mono.vl`'s param loop is therefore
+redundant with `synthTypeRef` on both of its synthesizing branches.
+
+### WHAT THE G CLASS ACTUALLY NEEDED — AND IT IS NOT IN THE MONOMORPHIZER
+
+The same probe, made to print what the arena holds at each node, on `type Box<T> = {value: T}`
+used at `i32` and `string`:
+
+```
+[0] name=Box<i32>     arena={value: i32}     nominal={value:i32}
+[0] name=Box<string>  arena={value: string}  nominal={value:string}
+```
+
+**The node is covered. The arena's answer is correct. The NOMINAL HEAD is what is absent.**
+`applyGenAliasArgs` expands the application into a fresh `TyObj` and keeps no record that an
+application was ever written, so `tyToNominalName` — whose whole job is to render nominally —
+has no third reverse map to consult beside `structNameOfTy` and `unionAliasDeclNameOfTy`, and
+falls through to the structural expansion. That is the entire G class, and its site is
+`applyGenAliasArgs` in **`typecheck.vl`** — a checker site, reached at annotation-resolution
+time. The monomorphizer never enters it. **A slice that populated `nodeTyIx` for cloned nodes,
+however thoroughly, would have moved G by exactly zero.**
+
+### THE CHANGE
+
+`applyGenAliasArgs` MEMOIZES its expansion per `(head, argument type indices)` and mints one
+fresh `TyObj` per distinct application; the arena does not intern (`addTy` always pushes). So
+the resulting index belongs to that application and to nothing else, and a sidecar keyed by it
+cannot be claimed by an inline `{value: i32}` written elsewhere. Banked at the memo MISS:
+`gaAppTyIxs` / `gaAppHeads` / `gaAppArgStart` / `gaAppArgCount` / `gaAppArgFlat` — the same
+flat-slice shape this file already uses for the declaration side (`gaParamNames`/`gaParamStart`
+/`gaParamCount`), reset beside `cStructTyIxs`/`cUnionTyIxs` so the sidecar's lifetime is exactly
+its two siblings'.
+
+A NAME IS A NAME: the head is genuine nominal identity (the emitter's `gaeBases` registry is
+keyed by that declared name). The ARGUMENTS are stored as arena INDICES and rendered by
+recursion, so nothing here is a spelling that has to be parsed back.
+
+`genAppNameOfTy(ty)` is the reader — the third leg of the nominal family — and one arm in
+`tyToNominalNameGo` consults it beside the other two.
+
+**THE CYCLE GUARD IS NOT OPTIONAL, AND THE FIRST BUILD WITHOUT IT TRAPPED THE COMPILER.**
+`type L<T> = {head: T, tail: L<T>[]}` at `i32` has a perfectly finite nominal NAME (`L<i32>`)
+and an expansion with none. `tyToNominalNameAt`'s ancestor stack discovers that by DESCENDING;
+a head-first short-circuit returns before the descent, silently clearing `nomNameCycle` — the
+bank `guardFiniteUserTypes` rejects such a program from. Measured: without the guard, all three
+`tests/cases/generics/recursive-generic-alias-*` fixtures move from master's clean reject to a
+wasm backtrace. `tyReachesSelf` (a visited-set reachability test, memoized per row in
+`gaAppFinite`) declines those, and every shape that had no nominal route before keeps its old one.
+
+### THE RETIRED CONSUMER, AND ITS COMPARATOR
+
+Retired: **`tyToNominalName`'s structural EXPANSION of a generic application.** The comparator
+is #1266/#1267's B2 axis (`tyToNominalName ∘ nameToTy` vs `canonEmitName`), re-derived on this
+base with the same ZZP probe and the same `P5-cen-an.sh` / `P5-b2.sh` scripts, 7,717 records:
+
+```
+build:  (ZZP probe grafted into canonEmitTypeNames) vl build compiler/entry.vl -o TI-cen{M,C}.wasm
+run:    vl check tests/cases --compiler TI-cen{M,C}.wasm > TI-cen{M,C}.out    # rc 1, the probe raises
+an:     bash P5-cen-an.sh TI-cen{M,C} && bash P5-b2.sh TI-cen{M,C}
+```
+
+| | master `01b97c8a` | this head |
+| --- | ---: | ---: |
+| **B2** agrees | 7,119 / 7,316 = **97.31%** | 7,221 / 7,316 = **98.70%** |
+| **B2** disagrees | **197** | **95** |
+| …canon-only / renderer-only / both | 59 / **108** / 30 | 59 / **12** / 24 |
+| **B1** (`tyToEmitName`) disagrees | 1,289 | **1,289 — UNMOVED** |
+| **B3** disagrees | 284 | 187 |
+
+Row by row: **111 fixed, 9 broken, net −102.** Every `Box<i32>` / `Box<string>` /
+`Pair<i32,string>` / `Inner<string>` / `Box<Box<i32|null>>` / `Pair<i32|null,string>[]` row is
+gone from the renderer-only column.
+
+**B1 UNMOVED IS THE INTERNAL CONTROL.** `tyToEmitName` is the STRUCTURAL renderer; a nominal-only
+change must not touch it, and it moves by zero on all three of its columns.
+
+**THE 9 BROKEN ROWS ARE ONE SHAPE, AND IT IS INHERENT.** `type Y = Box<i32>` — a one-member
+alias OF an application — in 5 files (`alias-to-generic-application{,-global}.vl`,
+`generic-application-name-grammar.vl`, `modules/plain-alias-ref-renamed/{entry,lib}.vl`). Canon
+resolves the alias transparently to `{v:i32}`; the renderer now answers `Box<i32>`. The memo in
+`applyGenAliasArgs` gives `Y` and `Box<i32>` the SAME arena index, so **nothing at the arena
+level distinguishes them** — the renderer cannot know the source said `Y`. These join the T
+(alias-transparency) class this document already has open; they are not new policy.
+
+### MEASUREMENT
+
+**Corpus A/B, six channels, vs `base90.wasm` (master `01b97c8a`, 1,049,670 B).** On master's
+own 1,602 files, **ONE cell differs**; with this slice's new fixture (1,603), **TWO**. Every one
+moves FORWARD:
+
+| file | field 3 | field 4 | field 6 |
+| --- | --- | --- | --- |
+| `generics/union-member-generic-application-inline-frontier.vl` | BUILDRC **1 → 0** | BUILDMSG | RUNRC **1 → 0** |
+| `generics/union-member-generic-application-inline-multiarg.vl` (new) | BUILDRC **1 → 0** | BUILDMSG | RUNRC **1 → 0** |
+
+The frontier fixture goes from `emitProgram: ref valtype with no interned shape` to a 167-byte
+module that runs and prints `1`. **Zero cells backward, on either count.** It was a FILED
+frontier pin whose own header prescribed the opposite fix (teach the NAME side to expand the
+application); the fix came from the other direction and needed no new rule — see its rewritten
+header.
+
+An earlier candidate WITHOUT the cycle guard moved four cells, and one of them moved BACKWARD
+(`recursive-generic-alias-array.vl`, clean reject → compiler trap). That reading is what
+produced the guard; it is recorded here because the guard's necessity is a measurement, not a
+design intuition.
+
+**REACH PROBE** (counters in `genAppNameOfTy`, reported from the end of `emitProgram`):
+
+| | |
+| --- | ---: |
+| programs reaching end-of-`emitProgram` | 1,351 |
+| `genAppNameOfTy` calls | 13,265,930 |
+| …calls whose index IS a banked application | 144,564 |
+| …**non-empty answers** | **123,754** |
+| programs with ≥ 1 answer | **927** |
+
+The 20,810 row-hits that decline are the cycle guard and unspellable (`TyVar`) arguments.
+*The report had to move to the emitter*: the host instantiates the compiler wasm FRESH per file,
+so a check-time report of emit-time counters reads zero for every program — measured, not assumed.
+
+**SABOTAGES.**
+
+| | inversion | witnesses |
+| --- | --- | --- |
+| **SAB-1** | the arm disabled (`gan = ""`) | **2** — `union-member-generic-application-inline-{frontier,multiarg}.vl` revert to the emit reject (BUILDRC 0→1, RUNRC 0→1) |
+| **SAB-2** | the cycle guard removed (`tyReachesSelf` → `false`) | **3** — all three `recursive-generic-alias-*` fixtures go from a clean reject to a compiler TRAP |
+| **SAB-A** | the head TEXT corrupted (`Box` → `BoxSAB`) | **ZERO on all six corpus channels** — see below |
+
+SAB-2 is visible on **field 4 alone**. Both sides are build rc 1; a clean reject and a trapping
+compiler are the same rc, the same empty stdout and the same absent bytes. That is precisely the
+channel `abcorpus3.sh`'s own header says it exists for, and this is another slice it has earned.
+
+**THE CORPUS CANNOT SEE WHICH NAME THE ARM RETURNS — ONLY THAT IT RETURNS ONE.** SAB-A moves
+zero of 1,603 files on all six channels, while the census sees it immediately: B2 disagreements
+**95 → 208**, *worse than master's 197*. The emit fix at the frontier fixture comes from the
+SHORT-CIRCUIT (the walk no longer descending into the expansion), which any non-empty answer
+supplies; the name's TEXT is a separate property that only the comparator measures. Two
+instruments, two different questions, and either one alone would have licensed a wrong claim.
+
+**FROZEN REBUILD — BYTE-IDENTICAL, AND VACUOUS FOR THIS FAMILY.** Master's frozen source
+compiled by this head reproduces `base90.wasm` exactly (1,049,670 B). It cannot do otherwise:
+`compiler/` and `std/` declare **zero** generic type aliases, so `applyGenAliasArgs` never runs
+during a self-compile and the arm can never answer. Recorded as a no-regression channel, not as
+evidence for this change. The fuzz A/B (6 seeds × depths 4–6 × 300, both sides) is IDENTICAL and
+vacuous for the same reason — `fuzzgen.vl` emits no generic alias declarations.
+
+**BYTE DELTA.** Head compiler **1,053,279 B** vs base90 1,049,670 B = **+3,609 B**, all of it
+new code — the self-compile never exercises the arm.
+
+**GATE**, from a FRESHLY FETCHED published seed, every rc BARE:
+
+| | rc |
+| --- | ---: |
+| `fetch-seed.sh` | 0 |
+| `refresh-compiler.sh --prove-fixpoint` | 0 |
+| `native-fixpoint.sh` | 0 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 — **3366 passed / 0 failed / 8 ignored** (master `01b97c8a`: 3364 / 0 / 8; the ignored count is the tell that the env var took) |
+| `lint-self.sh` | 0 |
+| `rep-fuzz-check.sh` | 0 |
+
+### A PRE-EXISTING DEFECT FOUND WHILE BUILDING THE FIXTURE (not this slice's)
+
+`const q: Box<i32>[] = [{v: 5}]` alongside a `const r: Box<string> | Tag = {v: "hi"}` binding
+writes **INVALID WASM** — `type mismatch: expected i32, found (ref $type)` — and it does so on
+**MASTER too**, with no generic application interned at all. `Box<i32>[]` on its own builds and
+runs identically on both sides, and each inline-union binding on its own moves FORWARD on this
+head. Filed here rather than pinned: the corpus has no `@`-tier for "writes invalid wasm", and
+the shape is a ref-list/union-arm interaction, not a naming one. The multiarg fixture's header
+records the exclusion and its reason.
+
+### WHAT P2 NEEDS
+
+1. **The 9 T-class rows.** Distinguishing `Y` from `Box<i32>` needs the ALIAS's own identity at
+   the render site; the arena index is shared by construction. `cPlainAliasNames` /
+   `aliasRefIsPlainRoot` is where that already lives — a separate slice, and a policy question
+   (#1122 ruled a one-member alias transparent) before it is a mechanical one.
+2. **B2's remaining 95** is 59 canon-only + 12 renderer-only + 24 both. The canon-only column is
+   unchanged at 59 and is dominated by **Lsoft** — the owner-pending string-litunion softening
+   rule — which is a decision, not a capability.
+3. **The census harness belongs in the gate for any further naming work.** SAB-A proves the
+   corpus A/B is blind to the one property a renderer change is about. `P5-cen-an.sh` /
+   `P5-b2.sh` run in about a minute against a probe build and should be run beside the corpus,
+   not instead of it.
+4. **`recordClonedNodeTy` at `emit_mono.vl`'s param loop is redundant** with `synthTypeRef` on
+   both synthesizing branches. Its one non-redundant effect is on the branch that REUSES the
+   original's `parType` node — where it overwrites a node SHARED with the template. Worth a
+   look; not touched here because the coverage measurement says nothing depends on it.
+
+### METHOD NOTES
+
+* **A PLAN SENTENCE THAT HAS BEEN QUOTED FORWARD FOUR TIMES IS STILL A HYPOTHESIS.** "That is
+  the C1-endgame typed-IR item (`nodeTyIx` for emit-time-cloned monomorphized nodes)" was
+  written as the G class's disposition, carried into the residue table, into the handoff and
+  into this slice's brief. The population it names is at **100% coverage** and the site it
+  needed is in a different file, in a different phase, reached by a different pass. *Measure the
+  population a plan names before building on the plan — the cost here was one probe, against a
+  slice aimed at the wrong module.*
+* **A 100% COVERAGE READING IS EXACTLY AS SUSPECT AS A 0% ONE.** 729/729 with 0 MISS and 0 VAR
+  is what a probe that never fired also reports. The inverted flag cost four lines and turned an
+  unbelievable number into a measurement.
+* **TWO INSTRUMENTS, TWO QUESTIONS, AND NEITHER RANKS.** The corpus reads ZERO on a compiler
+  whose generic-application names are all wrong; the census reads WORSE-THAN-MASTER on the same
+  binary. The corpus answers "does the program still build and run the same", the census answers
+  "do the two producers agree on the text". A naming slice that gated on the corpus alone would
+  ship a wrong renderer green.
+* **THE NOMINAL SHORT-CIRCUIT AND THE NAME IT RETURNS ARE SEPARABLE EFFECTS.** The emit fix came
+  from not descending into the expansion; the comparator fix came from the text. They were
+  discovered apart only because the sabotage corrupted the text without disabling the arm.
+  *Sabotage each property of an answer, not just its presence.*
+* **A HEAD-FIRST SHORT-CIRCUIT DISABLES EVERY GUARD THAT LIVED IN THE DESCENT.** `nomNameCycle`
+  is set by the ancestor stack during recursion; returning before the recursion clears it
+  silently, and the caller that rejects unbounded types then accepts one. *When adding an early
+  return to a walk, enumerate what the walk was BANKING on the way down.*
