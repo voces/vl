@@ -1,6 +1,6 @@
 # `match` — exhaustive value/variant dispatch
 
-Status: **phases 1 and 2a shipped; phase 2b (payload binding) open.** Motivated by the compiler code review's C2
+Status: **phases 1, 2a and 2b shipped.** Motivated by the compiler code review's C2
 (uncentralized kind-codes) and C3 (two ~1,000-line `is`-chain dispatchers, 95 arms, silent
 fallthrough). `match` is the construct that makes the litunion/union cleanup *safer than the
 status quo*, not just renamed.
@@ -46,8 +46,12 @@ Phase 1 (now):
 Phase 2a (now):
 - **Variant patterns** — `match n { FuncDecl => n.fnName, … }`, narrowing the scrutinee to the
   variant in the arm. *Unifies with the existing `is` narrowing* (literally: the pattern is an
-  `IsExpr`) and is the discrimination half of the C3 win. The BINDING half (`FuncDecl f => f.fnName`)
-  is phase 2b.
+  `IsExpr`) and is the discrimination half of the C3 win. The BINDING half is phase 2b.
+
+Phase 2b (now):
+- **Payload binding** — `Move{x, y} => x + y`: a PUNNED field list after a variant pattern, binding
+  one arm-local `const` per named field. Field punning only (`{x, y}`, not `{x: a}` and not nested
+  patterns) — see "Phase 2b as built" for why the two richer forms are deferred rather than absent.
 
 Deferred (follow-ups, captured here so we don't reinvent them):
 - **Guards** — `pat if cond => …` (`when`-style). Keep `if`-conditions OUT of the pattern grammar
@@ -81,7 +85,7 @@ Deferred (follow-ups, captured here so we don't reinvent them):
    **SHIPPED.**
 2. **Variant patterns + narrowing** — replaces the C3 `is`-chain dispatchers (the big win).
    - **2a — scrutinee + discrimination. SHIPPED.** See "Phase 2a as built" below.
-   - **2b — payload binding** (`Move{x, y} => x + y`). Open.
+   - **2b — payload binding** (`Move{x, y} => x + y`). **SHIPPED.** See "Phase 2b as built".
 3. **Expression-position polish** — ensure arms-yield-value works everywhere `if`-expressions do.
 4. **Guards** (`pat if cond =>`).
 5. (Maybe) ranges / `i32` density → `br_table` codegen.
@@ -127,6 +131,74 @@ density, not on phase 2. Phase 2b rides the chain directly: an arm is already
 `if scrut is Move { <block> }`, so binding `Move{x, y}` prepends `const x = scrut.x` statements to
 that block — no change to the chain, the narrowing, or the emitter.
 
+## Phase 2b as built
+
+**Syntax.** A variant pattern may carry a PUNNED field list: `Move{x, y} => …`. The clause is
+`'{' IDENT (',' IDENT)* ','? '}'` immediately after the pattern's type atom, and it binds one
+arm-local `const` per field, named after the field. `Move{}` is legal and binds nothing.
+
+**Lowering — the if-chain twin, verbatim.** The recorded plan ("Why not a tag `switch`", above) is
+what shipped: `desugarMatchAt` PREPENDS the arm's `const x = scrut.x` statements to the block the
+arm already became, so
+
+    match cmd { Move{x, y} => f(x, y), Attack{target} => g(target) }
+
+lowers to the same node shape as its hand-written twin
+
+    if cmd is Move { const x = cmd.x; const y = cmd.y; f(x, y) }
+    else { const target = cmd.target; g(target) }
+
+— the chain, the narrowing, the exhaustive-last-arm `else` and the emitter are all untouched. The
+*byte* claim is checked as a corpus cell, not asserted: the two spellings must compile to the same
+module. Nothing here is a new emitter path, so a binding arm can only fail where its twin fails.
+
+**Where the bindings live: a column on `MatchExpr`, not the body.** `matchBinds` is a new i32
+column PARALLEL TO `matchPats` (so `matchBinds[armStart[k] + j]` is pattern *j*'s clause): each
+entry is either -1 or a `Block` node holding that pattern's `LetDecl`s. Three properties fall out,
+and each is the reason a simpler placement was rejected:
+- The `LetDecl`/`Member` nodes are minted in the PARSER, beside the pattern's `IsExpr` — the same
+  rule phase 2a is built on. `nodeTyIx` is sized to the arena at `checkProgram` entry, so a node
+  minted at DESUGAR time reads back -1 forever.
+- The formatter still sees an unmodified arm body. Had the parser prepended the `const`s to the
+  body directly, `vl fmt` would print the synthesized statements — the desugar's output, not the
+  user's source.
+- `matchBinds` holds a `Block` rather than three parallel start/count columns: one new field on
+  the flat `Node` record instead of three.
+
+**Bindings are pattern data, so nothing that walks VALUES walks them.** `nodeChildren` (lint) and
+`modRwExpr` (the module merge) both exclude the clause for the reason they already exclude the
+pattern: a bind's initializer is a `Member` over the SHARED scrutinee node, so walking it would
+count/rename the scrutinee once more per bound field. The merge needs ONE thing instead — the arm
+body is rewritten while the bound names are on `modShadow`, or a module-level `const x` would
+capture an arm that binds `x` (the exact shadowing the merge already does for a `const` written
+inside the block).
+
+**Two rejects that exist because the desugar SPLICES.** Post-splice the bindings share the body
+block's scope, which the checker never type-checks them in (it checks them in the arm's narrowing
+scope, one level out). Two collisions would therefore be accepted by the checker and only decided
+by the emitter's local allocator:
+- `Move{x, x}` — a duplicate binding.
+- `Move{x} => { const x = "s" … }` — a body declaration shadowing a binding. Pre-desugar these are
+  two scopes and legal; post-splice they are one scope and two locals of possibly different types.
+
+Both are hard errors at the pattern. Rejecting is not a taste call: the alternative shape (wrap the
+body in an outer block instead of splicing) needs a Block-as-statement the emitter does not have,
+and VL has no bare-block surface to have built one from.
+
+**Or-patterns take no clause.** `A{x} | B{x} => …` is rejected. Forced, not stylistic: the checker
+gives a multi-pattern arm NO then-narrowing (`collectThenNarrows` reports none for the `a || b`
+condition the desugar builds), so the scrutinee is still the whole union inside the arm and
+`scrut.x` does not type. Rust's rule (identical bindings in every alternative) needs narrowing to a
+JOIN of the alternatives, which is item 4 of ROADMAP B21 — a pre-existing emitter gap.
+
+**Deferred, measured, not absent.**
+- **Renaming** `Move{x: a}` — the clause's binding name is read back off the `LetDecl` (`letName`)
+  by the formatter, so renaming is one parser branch plus a formatter that prints `field: name`
+  when they differ. Deferred because punning covers the command-dispatch shape the roadmap wants.
+- **Nested destructuring** `Move{p: {x, y}}` — needs the binding's initializer to be a `Member`
+  CHAIN and the checker to narrow through it; a real feature, still "only if a concrete need
+  appears" (see Deferred, above).
+
 ## Pipeline touch-points (per the language-features playbook)
 
 Adding the `MatchExpr` node requires handling at every per-variant dispatch site (VL has no common-field
@@ -145,3 +217,12 @@ referenceable" assumption written into them:
 - `lint.vl` — needed nothing: `collectTypeNameRefs` is a FLAT arena scan, so it finds the pattern's
   type name on its own, while `nodeChildren` still excludes patterns so the scrutinee is not counted
   as a use twice.
+
+Phase 2b added a THIRD: a pattern's payload clause is a nodes-bearing column that is neither a
+pattern nor a body, so every walk that enumerates one or the other has to be told about it
+explicitly. `format.vl` renders it (the pattern's own `[pos, end)` span stops at the type atom — the
+`IsExpr` is minted before the clause is parsed — so a verbatim slice DROPS `{x, y}`, which is the
+contextual-syntax trap #1278 recorded); `driver.vl` shadows the bound names over the arm body;
+`typecheck.vl` checks the clause's `LetDecl`s in the arm's narrowing scope and splices them at
+desugar. `lint.vl` again needed nothing, because by lint time the splice has already put the
+bindings inside an ordinary block.
