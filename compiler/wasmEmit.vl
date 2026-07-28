@@ -10906,6 +10906,40 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
         // the body clashes with it ("return expected f32, got f64"). `return x` (a bare f32) was
         // already f32; only a literal-bearing f32 expression needed the coercion.
         if fRetKind[rfe] == "f32" { retF32 = true }
+        // AN INFERRED `f32[]` RETURN HAS NO PRODUCER, and until this guard the function
+        // emitted INVALID WASM with `vl check` rc 0 — the worst class in the ordering, on a
+        // callee that need not even be CALLED (`function mk() { const xs: f32[] = [1.5];
+        // return xs }` beside a bare `print(1)` is enough). The functype result stays at the
+        // `"i32"` default (`retAnnKindChain`'s seed, read by `emitTypeSection`'s
+        // un-annotated arm through `inferredRetKindCore`) while the emitted `return` pushes
+        // the f32 list's `(ref $array)`.
+        //
+        // BOTH channels that fill the slot decline this shape, and each says so at its own
+        // site: the checker's A20 record admits only `i32[]`/`string[]` among arrays
+        // (`isClassifiableRetName`, `typecheck.vl`) so `emit_collect`'s `nameIsF32Array` arm
+        // never sees this function, and `criClassify`'s `exprF32Array` arm
+        // (`emit_classify.vl`) cannot classify a returned LOCAL during a pass that runs
+        // before any local table exists — the same gap `retIsMapLocalAnnot` was added to
+        // close for a returned map local. HERE the local table DOES exist, which is why the
+        // disagreement is detectable at this site and repairable at neither.
+        //
+        // The reject is a CLASS improvement, not the fix: invalid wasm becomes a loud error
+        // that names the remedy, because the ANNOTATED spelling lowers correctly today
+        // (#1223 gave it `fnRetAnnF32Array`; `tests/cases/arrays/f32-array-return.vl` pins
+        // it). Measured at `63a73d7` over 18 cells: the 6 that were invalid wasm — an
+        // annotated/`let`/local binding, a call ARGUMENT, an UNREAD binding, and the
+        // never-called callee — all become this error; the 3 that already rejected at the
+        // caller (`mk()[0]`, `mk().length`, a bare binding) now reject here instead, one
+        // function earlier and with the actionable message; the `f64`/`i64`/`i32`/`string`
+        // twins of the same three lines and the f32 SCALAR are untouched and still run.
+        // `function mk(a: f32[]) { return a }` also still runs: a returned PARAM is exactly
+        // what `criClassify`'s arm CAN see, so its slot holds `"f32list"` and this guard —
+        // keyed on the `"i32"` default, not on the expression alone — never fires for it.
+        if fRetKind[rfe] == "i32" && exprF32Array(retArg, fnIx) {
+          return emitFail(
+            "emitProgram: an f32[] return must be annotated (`: f32[]`) — the inferred form has no result type",
+          )
+        }
       }
     }
     // A literal-union return reads as a union NAME but is an i32 ATOM — exclude it from the value-union
