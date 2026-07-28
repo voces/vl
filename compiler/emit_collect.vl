@@ -2041,6 +2041,7 @@ export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
     return 0
   }
   if e is Member { return collectMemberPopRefSlotsExpr(e.memObj, fnIx) }
+  if e is OptMember { return collectMemberPopRefSlotsExpr(e.omObj, fnIx) }
   if e is Index {
     collectMemberPopRefSlotsExpr(e.idxArr, fnIx)
     collectMemberPopRefSlotsExpr(e.idxIndex, fnIx)
@@ -2048,6 +2049,35 @@ export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
   }
   if e is Unary { return collectMemberPopRefSlotsExpr(e.unArg, fnIx) }
   if e is Paren { return collectMemberPopRefSlotsExpr(e.parInner, fnIx) }
+  // The node set below is the one `exprHasCoalesceCall` (emit_query.vl) carries.
+  // It was missing here, so a ref-list `.pop` in an `is` guard, an `as` operand,
+  // an ARRAY-literal element, an OBJECT-literal field value or an if-EXPRESSION
+  // arm recorded no slot — and since `fnUsesRefPush` is INERT in `fbBeginFunc`
+  // (ref frames come from `fnRefPushSlots`, keyed by the receiver's ref-list
+  // slot), teaching the scalar push/pop BITS does nothing for these. The frame
+  // was simply never reserved: `vl check` rc 0, `vl build` rc 1 "unknown local N".
+  if e is IsExpr { return collectMemberPopRefSlotsExpr(e.isObj, fnIx) }
+  if e is AsExpr { return collectMemberPopRefSlotsExpr(e.asObj, fnIx) }
+  if e is IfStmt { return collectMemberPopRefSlotsIf(exprIx, fnIx) }
+  if e is ObjLit {
+    const fs = e.objFields
+    let fi = 0
+    while fi < fs.length {
+      const f = P.nodes[fs[fi]]
+      if f is FieldInit { collectMemberPopRefSlotsExpr(f.fiValue, fnIx) }
+      fi = fi + 1
+    }
+    return 0
+  }
+  if e is ArrayLit {
+    const es = e.arrElems
+    let ei = 0
+    while ei < es.length {
+      collectMemberPopRefSlotsExpr(es[ei], fnIx)
+      ei = ei + 1
+    }
+    return 0
+  }
   0
 }
 
@@ -2064,10 +2094,6 @@ export function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
         collectMemberPopRefSlotsExpr(s.letInit, fnIx)
       } else if s is RetStmt {
         collectMemberPopRefSlotsExpr(s.retArg, fnIx)
-      } else if s is BinExpr {
-        collectMemberPopRefSlotsExpr(stmts[i], fnIx)
-      } else if s is Call {
-        collectMemberPopRefSlotsExpr(stmts[i], fnIx)
       } else if s is IfStmt {
         collectMemberPopRefSlotsIf(stmts[i], fnIx)
       } else if s is WhileStmt {
@@ -2080,6 +2106,10 @@ export function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
         collectMemberPopRefSlotsExpr(s.frFrom, fnIx)
         collectMemberPopRefSlotsExpr(s.frTo, fnIx)
         collectMemberPopRefSlots(s.frBody, fnIx)
+      } else {
+        // Bare expression statement — a FALL-THROUGH, not the two shapes
+        // (`BinExpr` / `Call`) this used to name. See `blockHasArrNew`.
+        collectMemberPopRefSlotsExpr(stmts[i], fnIx)
       }
       i = i + 1
     }
@@ -2087,10 +2117,16 @@ export function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
   0
 }
 
-// Collect Member-receiver ref-list `.pop` slots from every arm of the `if` chain.
+// Collect Member-receiver ref-list `.pop` slots from every arm of the `if` chain —
+// CONDITION included. The condition was skipped, so `if b.xs.pop() != null { … }`
+// holding the function's only ref-list `.pop` recorded no slot and emitted against
+// a local the vector never declared. `startScanIf` (emit_sections.vl) hand-scans a
+// top-level `if`'s condition for the SCALAR bits but not for this recorder, so the
+// module-scope twin of this cell is still open there.
 function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
+    collectMemberPopRefSlotsExpr(s.ifCond, fnIx)
     collectMemberPopRefSlots(s.ifThen, fnIx)
     if s.ifElse >= 0 {
       const els = P.nodes[s.ifElse]

@@ -1,0 +1,125 @@
+// @run
+// @log 11
+// @log 22
+// @log 33
+// @log 44
+// @log 2
+// @log 6
+// @log 1
+// @log 77
+// THE REF-LIST half of the push/pop scratch-frame reservation, by POSITION.
+//
+// A ref-element list (`S[]` for a struct `S`) does NOT ride the `fnUsesRefPush`
+// flag — that flag is INERT in `fbBeginFunc`. A ref frame is reserved per RECEIVER
+// SLOT, from `fnRefPushSlots`, which only `collectRefPushSlots` (push side) and
+// `collectMemberPopRefSlots` / `collectMemberPopRefSlotsExpr` /
+// `collectMemberPopRefSlotsIf` (pop side, emit_collect.vl) ever write. So teaching
+// the SCALAR push/pop bit walkers (`exprPopBits` / `blockPushPopBits` /
+// `ifChainPushPopBits`, emit_classify.vl) a position does nothing here: the
+// ref-list twin of every one of those positions is a separate defect with a
+// separate home, and the probe builds byte-identical before and after a bits fix.
+//
+// None of `emitPush` / `emitPop` / `emitClear` / `emitPopOr` tests a "frame not
+// reserved" floor, so a position the recorder does not walk is INVALID WASM with
+// `vl check` rc 0 and `vl build` rc 1 "unknown local N: local index out of
+// bounds" — after the bad module is already written.
+//
+// The positions pinned below were all invalid wasm, and all became correct the
+// moment ANY `.push` of the same element type was added to the same function
+// (deleting that bystander is the probe). Two recorder defects produced them:
+//
+//   1. `collectMemberPopRefSlotsIf` walked `ifThen` and `ifElse` and never
+//      `s.ifCond` — so an `if` CONDITION, an `else if` condition, a condition in a
+//      lambda and a condition nested in a loop body were all unscanned.
+//   2. `collectMemberPopRefSlotsExpr` descended Call / BinExpr / Member / Index /
+//      Unary / Paren and stopped — so an `is` operand, an ARRAY-literal element and
+//      an OBJECT-literal field value were unscanned. Its sibling walkers in
+//      emit_query.vl carry `ObjLit` / `ArrayLit` / `AsExpr` / `IsExpr`; this one
+//      did not. Its block walker also NAMED two bare-statement shapes rather than
+//      falling through, the same miss `blockHasArrNew` had.
+//
+// STILL OPEN, same defect, different file: a TOP-LEVEL `if` CONDITION.
+// `startFnDetectScratch`/`startScanIf` (emit_sections.vl) hand-scan `st.ifCond`
+// for the scalar bits (`exprPopBits`) but never call
+// `collectMemberPopRefSlotsExpr` on it, so the start function's ref frame is
+// still unreserved:
+//
+//     const gxs: S[] = [{ v: 1 }]
+//     if gxs.pop() != null { seen = 1 }        // at module scope: unknown local N
+//
+// An if-EXPRESSION arm holding a ref `.pop` is a CLEAN REJECT today
+// ("if-expression arm is not a single value"), so it cannot be pinned; the
+// recorder carries the arm anyway so it stays correct when that lands.
+type S = { v: i32 }
+type Box = { xs: S[] }
+
+// 1. an `if` CONDITION, Member receiver — was NOT walked.
+const b1: Box = { xs: [{ v: 1 }] }
+function inIfCond(): i32 {
+  if b1.xs.pop() != null { return 11 }
+  return 0
+}
+print(inIfCond()) // 11
+
+// 2. an `else if` CONDITION — the chain recursion reaches it through the same arm.
+const b2: Box = { xs: [{ v: 1 }] }
+function inElseIfCond(c: boolean): i32 {
+  if c { return 5 } else if b2.xs.pop() != null { return 22 }
+  return 0
+}
+print(inElseIfCond(false)) // 22
+
+// 3. an `if` CONDITION with a module-GLOBAL receiver (the other receiver shape
+//    `stageListRecv` stages).
+const g3: S[] = [{ v: 1 }]
+function inGlobalIfCond(): i32 {
+  if g3.pop() != null { return 33 }
+  return 0
+}
+print(inGlobalIfCond()) // 33
+
+// 4. an `if` CONDITION inside a LAMBDA (a lifted FuncDecl runs the same recorder).
+const b4: Box = { xs: [{ v: 1 }] }
+const inLambdaIfCond = (n: i32) => {
+  if b4.xs.pop() != null { return 44 }
+  return n
+}
+print(inLambdaIfCond(0)) // 44
+
+// 5. an `if` CONDITION nested in a LOOP BODY.
+const b5: Box = { xs: [{ v: 1 }, { v: 2 }, { v: 3 }] }
+function inNestedIfCond(): i32 {
+  let n = 0
+  for i in 0 to 1 {
+    if b5.xs.pop() != null { n = n + 1 }
+  }
+  return n
+}
+print(inNestedIfCond()) // 2
+
+// 6. an OBJECT-LITERAL field value.
+type W = { p: S | null }
+const b6: Box = { xs: [{ v: 6 }] }
+function inObjLit(): i32 {
+  const w: W = { p: b6.xs.pop() }
+  if w.p != null { return w.p.v }
+  return 0
+}
+print(inObjLit()) // 6
+
+// 7. an ARRAY-LITERAL element.
+const b7: Box = { xs: [{ v: 1 }] }
+function inArrayLit(): i32 {
+  const ys: (S | null)[] = [b7.xs.pop()]
+  return ys.length
+}
+print(inArrayLit()) // 1
+
+// 8. an `is` GUARD operand.
+const b8: Box = { xs: [{ v: 1 }] }
+function inIsExpr(): i32 {
+  const q = b8.xs.pop() is S
+  if q { return 77 }
+  return 0
+}
+print(inIsExpr()) // 77
