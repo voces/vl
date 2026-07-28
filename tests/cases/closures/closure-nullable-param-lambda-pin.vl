@@ -1,0 +1,149 @@
+// @run
+// @hint Intentionally-unused parameter
+// An UN-ANNOTATED lambda parameter whose contextual type is a NULLABLE. Two lines are the
+// whole repro — no generics, no nesting:
+//
+//     const f: (i32 | null) => i32 = (_k) => 1
+//     print(f(3))
+//   → vl check rc=0, clean; vl build rc=0; vl run → "wasm trap: cast failure"
+//
+// `emit_rewrite.synthParamAnnots` pins an un-annotated callback param's checker-inferred
+// type onto its declaration so the later phases key on the real type instead of the i32
+// default. It had TWO arms and the nullable fell between them: `nodeTyIsUnion` is FALSE for
+// a `T | null` (that is a `TyNullable`, not a two-member `TyUnion`), and `nodeTyName` — the
+// general arm's source — renders "" for a `TyNullable` too. So the lambda declared a plain
+// i32 parameter while the ANNOTATION keyed the nullable, and the two disagreed at the value
+// call. THE MISSING HALF OF A SET THE FILE ALREADY SPELLED: the union arm directly above is
+// the same question about the sibling type constructor.
+//
+// The union arm's shortcut — pin ANY declared alias, since every boxed union shares one
+// `$uBox` — is unavailable here and must not be imitated, because nullables do NOT share a
+// rep. That single fact is what makes ONE pin produce three different right answers:
+//
+//   · `i32|null`, `i64|null`, `f64|null`, `f32|null` BOX. The i32 param declared a functype
+//     the value call's `ref.cast` did not — a cast-failure TRAP (`f1`…`f4` below).
+//   · The same payloads with the lambda USING its param (`(k) => useNF(k)`) were worse: the
+//     i32 fed the callee's box coercion where the wide scalar was stored — INVALID WASM
+//     ("expected i32, found (ref $type)"; `f8`).
+//   · `string|null`, `S|null`, `i32[]|null` are NICHE refs, and the pinned i32 made the
+//     value's own `$fnsig` key NON-EMPTY — so `emitClosureValueCore`'s `cloSigKeyExt == ""`
+//     floor never fired and the raw ref reached an i32 parameter (invalid wasm again). Those
+//     now reach the floor and reject cleanly; their pin is
+//     `error-nullable-niche-param-lambda-floor.vl`.
+//
+// `boolean|null` (`f5`) was already correct un-annotated — its niche IS an i32, so the
+// default happened to agree — and a nullable LITUNION (`c4`, the interned atom with the -1
+// sentinel) likewise. Both are here because a pin that changed them would be pinning the
+// wrong name: the fix has to make them right BY CONSTRUCTION, not leave them right by
+// coincidence.
+//
+// THE PIN IS THE ANNOTATED SPELLING, and that identity is the fix rather than a nicety:
+// `c1`/`c2` are the annotated twins of `f1`/`f8`, and every annotated lambda emits
+// byte-for-byte what it did before (measured over a 288-cell grid: all 45 building
+// annotated-nullable cells and all 126 value-union cells byte-identical).
+//
+// The nullable-ELEMENT list callback (`xs.map((_x) => …)`, `ys` below) is the same root
+// reached without any function-type annotation at all: the checker types the callback param
+// `i32 | null` off the element, and it was invalid wasm on a stock build.
+//
+// THE VALUE-UNION TWIN IS NOT IN THIS FILE, and its absence is a measurement rather than an
+// oversight. `closure-value-union-param-valuecall.vl` carries it. Put it here and it TRAPS —
+// on master too, from an INDEPENDENT defect in the union arm above: the pin is `unNames[0]`,
+// declaration-ORDER, and a LITUNION alias registers in `unNames`, so a program that declares
+// `type K = "a" | "b"` before any value-union alias pins an un-annotated `(i32 | string)`
+// param to `K` — the interned-atom rep, not the box:
+//
+//     type K = "a" | "b"
+//     const c: (i32 | string) => i32 = (_k) => 13
+//     print(c(3))                       → wasm trap: cast failure  (master and here)
+//
+// Declaring a VALUE-union alias first makes the same program correct, which is the whole
+// mechanism in one A/B. That is the union arm's alias CHOICE, not the missing nullable arm
+// this fixture pins, so it stays a separate root — recorded here so the next reader who adds
+// a `type K` beside a union lambda knows what they hit.
+
+type K = "a" | "b"
+
+function useNI(_x: i32 | null): i32 { return 3 }
+
+function useNF(_x: f64 | null): i32 { return 8 }
+
+const iv: i32 = 3
+const lv: i64 = 4
+const dv: f64 = 1.5
+const sv: f32 = 2.5
+const bv: boolean = true
+const kv: K = "a"
+
+// ── the boxed payloads, one per scalar rep: TRAP before the pin ──────────────────────────
+// @log 1
+const f1: (i32 | null) => i32 = (_k) => 1
+print(f1(iv))
+// @log 2
+const f2: (i64 | null) => i32 = (_k) => 2
+print(f2(lv))
+// @log 3
+const f3: (f64 | null) => i32 = (_k) => 3
+print(f3(dv))
+// @log 4
+const f4: (f32 | null) => i32 = (_k) => 4
+print(f4(sv))
+
+// The i32-niche sentinel: correct before AND after, by construction now.
+// @log 5
+const f5: (boolean | null) => i32 = (_k) => 5
+print(f5(bv))
+
+// A SECOND parameter beside the nullable — the pin is per-param, not per-lambda.
+// @log 6
+const f6: (i32 | null, i32) => i32 = (_k, _m) => 6
+print(f6(iv, 9))
+
+// The param USED: a direct call whose callee takes the same nullable.
+// @log 3
+const f7: (i32 | null) => i32 = (k) => useNI(k)
+print(f7(iv))
+
+// The wide-scalar leg of that shape — INVALID WASM before the pin, not a trap.
+// @log 8
+const f8: (f64 | null) => i32 = (k) => useNF(k)
+print(f8(dv))
+
+// A bare-`null` COMPARE in the body: with an i32 param it was an emit reject
+// ("bare null needs a struct-typed context"), a fourth outcome class off the same root.
+// @log false
+const f9: (i32 | null) => boolean = (k) => k == null
+print(f9(iv))
+
+// ── the other two function-value reaches: HOF argument and returned lambda ───────────────
+function hof(g: (i64 | null) => i32): i32 { return g(lv) }
+
+// @log 10
+print(hof((_k) => 10))
+
+function mk(): (f32 | null) => i32 { return (_k) => 11 }
+
+const f11 = mk()
+// @log 11
+print(f11(sv))
+
+// ── no function-type annotation at all: a nullable-ELEMENT list callback ─────────────────
+const xs: (i32 | null)[] = [1, null, 3]
+const ys = xs.map((_x) => 12)
+// @log 12
+print(ys[0])
+// @log 3
+print(ys.length)
+
+// ── CONTROLS ─────────────────────────────────────────────────────────────────────────────
+// The annotated twins of `f1` / `f8`: what the pin now reproduces byte-for-byte.
+// @log 1
+const c1: (i32 | null) => i32 = (_k: i32 | null) => 1
+print(c1(iv))
+// @log 8
+const c2: (f64 | null) => i32 = (k: f64 | null) => useNF(k)
+print(c2(dv))
+// A nullable LITUNION: the interned i32 atom niche, already correct.
+// @log 14
+const c4: (K | null) => i32 = (_k) => 14
+print(c4(kv))
