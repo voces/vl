@@ -31751,3 +31751,106 @@ recorded here so the next slice that sees a fixture fail `fmt --check` does not 
 regression, reformat 507 files, and produce a diff nothing can review. **Neither file is
 reformatted by this commit;** the edit stays comment-only, which is what makes byte-identity
 a claim about the change rather than about the formatter.
+
+## D-TYNAMEHOME PHASE 2's REPUBLISHING LINE COMES OUT — the follow-up filed in three places is discharged, and the resolver census reproduces to the column (off master `39b95f43`)
+
+D-TYNAMEHOME phase 2 moved `splitUnionAtoms` / `unionMemberCount` down to `tyname.vl` and
+could not finish the job: `emit_base.vl`, `emit_classify.vl` and `wasmEmit.vl` were HELD by
+concurrent slices, so the phase parked
+
+```vl
+export { splitUnionAtoms, unionMemberCount } from "./tyname"
+```
+
+in `typecheck.vl` — exactly the shape #1236 deleted — and filed the follow-up **in three
+places at once**: `tyname.vl`'s header, `typecheck.vl`'s header at the line itself, and this
+document. The three files are now free. This slice discharges the filing.
+
+### THE RESOLVER CENSUS — re-derived from scratch, and it reproduces to the column
+
+The census is not a grep and it was not read off phase 2's table. Delete the republishing
+line, put the two names in `typecheck.vl`'s own plain `import` (which is what binds them for
+its own five call sites once the re-export stops doing double duty), rebuild, and read what
+the module resolver refuses to build:
+
+```
+compiler/emit_base.vl:26:2      "splitUnionAtoms"  is not exported by "./typecheck"
+compiler/emit_base.vl:27:2      "unionMemberCount" is not exported by "./typecheck"
+compiler/emit_classify.vl:102:2 "splitUnionAtoms"  is not exported by "./typecheck"
+compiler/emit_classify.vl:108:2 "unionMemberCount" is not exported by "./typecheck"
+compiler/wasmEmit.vl:24:2       "splitUnionAtoms"  is not exported by "./typecheck"
+```
+
+**FIVE entries in THREE files** — `emit_base` (2), `emit_classify` (2), `wasmEmit` (1) —
+character-for-character phase 2's second leg, line and column included. That is the site
+census, and it is the whole census: D-SPLITDOWN's queue entry priced this at "six import
+lines in three files — `emit_rep`, `wasmEmit`, `emit_collect`" and named neither `emit_base`
+nor `emit_classify`, the two files that carry 4 of the 5 entries.
+
+Each entry moves from the file's `./typecheck` import to its existing `./tyname` import
+(`wasmEmit.vl`'s is the one-name W3 line at the bottom of its module block, which becomes
+two). No file gains or loses a module edge: all three already imported `tyname`.
+
+### THE PROOF IS THE CONTROL BUILD, AND THE BEHAVIOURAL INSTRUMENTS ARE VACUOUS
+
+| leg | rc | `is not exported by` |
+|---|---:|---:|
+| CENSUS build — line deleted, consumers untouched | 1 | **5** (above) |
+| **P0 CONTROL build — all five re-pointed** | **0** | **0** |
+
+Unpublishing is resolver-enforced in both directions and that is the entire residual risk
+here: a name a consumer still wants makes the compiler refuse to build itself and NAME the
+consumer, so a P0 control build at rc 0 with zero such errors **is** the proof that no site
+was missed. There is no fourth file.
+
+| instrument | reading |
+|---|---|
+| bytes | 1,046,759 → **1,046,759 (0)** |
+| `cmp` vs `base81.wasm` (master `39b95f43`) after the `--prove-fixpoint` ladder | **BYTE-IDENTICAL** |
+
+**THE BYTE-IDENTITY IS EXPECTED AND IT MAKES EVERY BEHAVIOURAL INSTRUMENT VACUOUS, NOT
+GREEN.** An import re-point changes no module SET — the same ten modules with the same
+bodies in the same order — so the emitted compiler cannot differ, and phases 0/1a/1b/1c each
+read byte-identical for the same reason while phase 2, which relocated two BODIES, read
+−31 B. That pair of readings is the signature the phase-2 entry drew, and this slice is the
+import-re-point half of it. A corpus A/B or a fuzz A/B over a byte-identical compiler is
+comparing an artifact with itself: it cannot fail, so it cannot inform. The risk that IS
+live is structural — did the census name every site — and the resolver gates exactly that.
+
+### GATE
+
+Every rc taken BARE, never through a pipe.
+
+| gate | rc | reading |
+|---|---:|---|
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | freshly fetched seed, 1,044,995 B |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint, **1,046,759 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3330 / 0 / 8** — master's own reading |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact |
+| `cmp` vs `base81.wasm` | 0 | byte-identical |
+
+### WHAT THIS SLICE FOUND WRONG
+
+1. **THE FILING'S "17 → 19" IS WRONG; `typecheck.vl`'s `tyname` IMPORT READS 26 → 28.**
+   Seventeen was D-TYNAMEHOME phase 1's number — the size of the set when the re-export was
+   demoted to a plain import — and it had been stale since W1/W2/W4/W7/W14 routed nine more
+   grammars into the leaf and added them to that very list. Phase 2 quoted it forward into
+   three headers and this document without re-deriving it. The arithmetic (+2) was right and
+   the base was two slices out of date; **a delta is only as good as the base it is added
+   to, and the base is one `awk` away from the file it describes.**
+2. **AND THE SAME DRIFT WAS SITTING IN TWO MORE HEADERS, ON THE LISTS THIS SLICE GREW.**
+   `emit_base.vl` opened its `tyname` import with "FOURTEEN pure character grammars" above a
+   24-name list; `emit_classify.vl` opened its with "Eleven" above a 20-name list. Both were
+   already wrong at master and this slice's +2 would have made each wrong by one more.
+   Corrected to 26 and 22, and both now say the count is DERIVED from the list below — the
+   third and fourth instances of the shape phase 2 recorded for `tyname.vl`'s own IN roster.
+   **A hand-maintained count parked beside the list it describes drifts on every slice that
+   touches the list, and this programme has now hit it four times in the same family.**
+3. **PHASE 2 DERIVED ITS CENSUS AND WROTE IT DOWN, AND THAT IS WHY THIS SLICE COULD CHECK
+   IT INSTEAD OF TRUSTING IT.** The queue entry's file list was wrong and the resolver's was
+   right; re-running the resolver reproduced the recorded answer to the column. A census that
+   is recorded WITH the command that produced it is falsifiable by the next slice at the cost
+   of one build. The counts in finding 1 and 2 were recorded WITHOUT one, and all three
+   drifted.
