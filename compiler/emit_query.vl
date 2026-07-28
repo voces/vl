@@ -255,6 +255,13 @@ export function exprHasArrNew(exprIx: i32) {
   if e is Paren { return exprHasArrNew(e.parInner) }
   if e is IsExpr { return exprHasArrNew(e.isObj) }
   if e is AsExpr { return exprHasArrNew(e.asObj) }
+  // An if-EXPRESSION (`const a = if c { __array_new__(n, 0) } else { … }`) is an
+  // `IfStmt` node in a VALUE slot; `emitExpr` lowers its arms through the ordinary
+  // path, so an allocator there stages its length in the arrNew scratch slot.
+  // Without this arm the walk fell off the end of its dispatch and `fnUsesArrNew`
+  // stayed false — there is no "frame not reserved" floor on this frame, so the
+  // slot was never handed out and the module was silently INVALID.
+  if e is IfStmt { return ifChainHasArrNew(exprIx) }
   if e is ObjLit {
     const fields = e.objFields
     let i = 0
@@ -280,6 +287,17 @@ export function exprHasArrNew(exprIx: i32) {
 }
 // True if any statement in the block at `blockIx` (descending into if/else arms
 // and loop bodies) contains an intrinsic allocator call.
+//
+// The EXPRESSION-statement case is a FALL-THROUGH, not an enumeration. It used to
+// name three shapes (`BinExpr` / `Call` / `ObjLit`), which silently skipped every
+// other way a block's trailing VALUE can be spelled — `(__array_new__(n, 0))`,
+// `__array_new__(n, 0).length`, `[__array_new__(n, 0)]`, `x as T`, `-e`. That
+// mattered most for a bare-expression function body: the parser wraps
+// `(n) => (__array_new__(n, 0).length)` in a SYNTHETIC one-statement Block whose
+// only statement is a `Paren`, so an expression-bodied lambda holding the
+// function's only allocator reserved nothing and emitted invalid wasm. Handing
+// every non-statement shape to the expression walker cannot over-reach: it
+// answers false for the statement kinds it does not know.
 export function blockHasArrNew(blockIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -291,12 +309,6 @@ export function blockHasArrNew(blockIx: i32) {
         if exprHasArrNew(s.letInit) { return true }
       } else if s is RetStmt {
         if exprHasArrNew(s.retArg) { return true }
-      } else if s is BinExpr {
-        if exprHasArrNew(stmts[i]) { return true }
-      } else if s is Call {
-        if exprHasArrNew(stmts[i]) { return true }
-      } else if s is ObjLit {
-        if exprHasArrNew(stmts[i]) { return true }
       } else if s is IfStmt {
         if ifChainHasArrNew(stmts[i]) { return true }
       } else if s is WhileStmt {
@@ -309,6 +321,8 @@ export function blockHasArrNew(blockIx: i32) {
         if exprHasArrNew(s.frFrom) { return true }
         if exprHasArrNew(s.frTo) { return true }
         if blockHasArrNew(s.frBody) { return true }
+      } else {
+        if exprHasArrNew(stmts[i]) { return true }
       }
       i = i + 1
     }
@@ -345,13 +359,41 @@ export function fnHasArrNew(fnIx: i32) {
 // containing such a `??`; a function without one keeps a byte-identical layout.
 // Over-approximates to ANY call-LHS `??` (the emit path uses the slot only for a
 // value-union-box result; an unhandled rep reserves-but-skips, still valid).
+//
+// True if any operand of the `??` CHAIN at `binIx` that BECOMES a `??` LHS is a
+// Call. `a ?? b ?? d` parses LEFT-associative as `(a ?? b) ?? d`, and
+// `emitCoalesce` (wasmEmit.vl) RE-ASSOCIATES it to `a ?? (b ?? d)` — minting a
+// fresh `BinExpr` in which the MIDDLE operand `b` is an LHS. That node does not
+// exist when this scan runs, and the parsed shape carries `b` in a `binRight`, so
+// asking only "is `binLeft` a Call?" missed it: `x ?? f() ?? d` reserved nothing
+// and then ran `fbLocalSet(coalesceCallSlot)` against an undeclared local.
+//
+// Walk the LEFT SPINE, mirroring the rewrite exactly: every operand of the chain
+// except the outermost `binRight` — the chain's final default, which the rewrite
+// never moves into an LHS position — can become one. Deliberately NOT widened to
+// "any operand": `x ?? f()` must keep a byte-identical layout.
+function coalChainHasCallLhs(binIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const lIx = unwrapParen(e.binLeft)
+    const l = P.nodes[lIx]
+    if l is Call { return true }
+    if l is BinExpr {
+      if l.binOp == "??" {
+        const m = P.nodes[unwrapParen(l.binRight)]
+        if m is Call { return true }
+        return coalChainHasCallLhs(lIx)
+      }
+    }
+  }
+  false
+}
 export function exprHasCoalesceCall(exprIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is BinExpr {
     if e.binOp == "??" {
-      const l = P.nodes[unwrapParen(e.binLeft)]
-      if l is Call { return true }
+      if coalChainHasCallLhs(exprIx) { return true }
     }
     if exprHasCoalesceCall(e.binLeft) { return true }
     return exprHasCoalesceCall(e.binRight)
@@ -376,6 +418,14 @@ export function exprHasCoalesceCall(exprIx: i32) {
   if e is Paren { return exprHasCoalesceCall(e.parInner) }
   if e is IsExpr { return exprHasCoalesceCall(e.isObj) }
   if e is AsExpr { return exprHasCoalesceCall(e.asObj) }
+  // An if-EXPRESSION (`const v = if c { f(n) ?? 0 } else { 0 }`) is an `IfStmt`
+  // node sitting in a VALUE slot (`exprIsIfStmt`), and `emitExpr` lowers its arms
+  // through the ordinary statement path — so a `??` in an arm reaches
+  // `emitCoalesce` and stashes into `coalesceCallSlot`. Without this arm the walk
+  // fell off the end of its dispatch and the frame was never reserved: `vl check`
+  // rc 0, `vl build` rc 1 "unknown local N". Hand the whole chain (condition,
+  // then-arm, `else`/`else if`) to the statement-level walker.
+  if e is IfStmt { return ifChainHasCoalesceCall(exprIx) }
   if e is ObjLit {
     const fields = e.objFields
     let i = 0
@@ -400,7 +450,12 @@ export function exprHasCoalesceCall(exprIx: i32) {
   false
 }
 // True if any statement in the block at `blockIx` (descending into if/else arms and
-// loop bodies) contains a call-LHS `??`. Mirrors `blockHasArrNew`.
+// loop bodies) contains a call-LHS `??`. Mirrors `blockHasArrNew` — including its
+// expression-statement FALL-THROUGH, for the same reason: the three named shapes
+// missed `(f(n) ?? 0)`, `f(n) ?? 0 as i32`, `mk(f(n) ?? 0).v`, `[f(n) ?? 0]`, and
+// above all the SYNTHETIC one-statement Block the parser wraps a bare-expression
+// function body in — so `(n) => (f(n) ?? 0)` reserved no stash and emitted a
+// `local.set` against an undeclared local.
 export function blockHasCoalesceCall(blockIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -412,12 +467,6 @@ export function blockHasCoalesceCall(blockIx: i32) {
         if exprHasCoalesceCall(s.letInit) { return true }
       } else if s is RetStmt {
         if exprHasCoalesceCall(s.retArg) { return true }
-      } else if s is BinExpr {
-        if exprHasCoalesceCall(stmts[i]) { return true }
-      } else if s is Call {
-        if exprHasCoalesceCall(stmts[i]) { return true }
-      } else if s is ObjLit {
-        if exprHasCoalesceCall(stmts[i]) { return true }
       } else if s is IfStmt {
         if ifChainHasCoalesceCall(stmts[i]) { return true }
       } else if s is WhileStmt {
@@ -430,6 +479,8 @@ export function blockHasCoalesceCall(blockIx: i32) {
         if exprHasCoalesceCall(s.frFrom) { return true }
         if exprHasCoalesceCall(s.frTo) { return true }
         if blockHasCoalesceCall(s.frBody) { return true }
+      } else {
+        if exprHasCoalesceCall(stmts[i]) { return true }
       }
       i = i + 1
     }

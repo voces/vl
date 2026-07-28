@@ -6,6 +6,23 @@
 // @log true
 // @log 4
 // @log 7
+// @log 6
+// @log true
+// @log true
+// @log 8
+// @log 5
+// @log 3
+// @log true
+// @log true
+// @log 3
+// @log 9
+// @log 4
+// @log true
+// @log 2
+// @log 2
+// @log 3
+// @log 6
+// @log 4
 // @log 0
 // @log 3
 // @log 3
@@ -46,29 +63,68 @@
 // `to`} x frame {call-LHS `??`, `__array_new__`, map, string-op, push/pop}, each
 // invalid wasm alone and correct with one more use of the same frame beside it.
 //
-// STILL NOT WALKED — measured on 6746f12:
+// ALSO NOW TAUGHT — the two families this file used to list as NOT walked, plus
+// one more found while closing them. All three are pinned at the bottom.
 //
-//   1. AN if-EXPRESSION ARM. An if-expression is an `IfStmt` node sitting in a
-//      value slot (`exprIsIfStmt`); `emitExpr` lowers its arms through the
-//      ordinary path. `exprHasArrNew`, `exprHasCoalesceCall` and `leqScanExpr`
-//      have no `IfStmt` arm and fall off the end of their dispatch.
-//      `blockHasCallRef` HAS one — same family, one member taught.
+//   1. (CLOSED.) AN if-EXPRESSION ARM. An if-expression is an `IfStmt` node
+//      sitting in a value slot (`exprIsIfStmt`, emit_query.vl); `emitExpr` lowers
+//      its arms through the ordinary path. All three expression walkers now have
+//      an `IfStmt` arm — `exprHasCoalesceCall` and `exprHasArrNew` hand the chain
+//      to their `ifChainHas*` walker, `leqScanExpr` (emit_collect.vl) hands it to
+//      `leqScanStmt`. `blockHasCallRef` (emit_classify.vl) already had one; this
+//      was the same family with one member taught and three not.
 //
-//          const v = if c then g(n) ?? 0 else 0      // g(): i32 | null
+//   2. (CLOSED.) THE MIDDLE OPERAND OF A `??` CHAIN. `a ?? b ?? d` parses as
+//      `(a ?? b) ?? d` and `emitCoalesce` (wasmEmit.vl) RE-ASSOCIATES it to
+//      `a ?? (b ?? d)`, minting a new `BinExpr` in which `b` is a `??` LHS. The
+//      scan used to ask only whether a `??`'s `binLeft` is a Call — never about
+//      `binRight` — and the re-associated node does not exist when the scan runs,
+//      so `x ?? f() ?? d` reserved nothing and then ran
+//      `fbLocalSet(coalesceCallSlot)`. `coalChainHasCallLhs` now walks the chain's
+//      LEFT SPINE, mirroring the rewrite: every operand except the outermost
+//      `binRight` (the final default, which the rewrite never moves into an LHS
+//      position) can become one. The exclusion is deliberate and measured — a
+//      call in the LAST operand emits a byte-identical module.
 //
-//   2. THE MIDDLE OPERAND OF A `??` CHAIN. `a ?? b ?? d` parses as `(a ?? b) ?? d`
-//      and `emitCoalesce` RE-ASSOCIATES it to `a ?? (b ?? d)`, minting a new
-//      `BinExpr` in which `b` is a `??` LHS. `exprHasCoalesceCall` only ever asks
-//      whether a `??`'s `binLeft` is a Call — it never asks about `binRight`, and
-//      the re-associated node does not exist when the scan runs. The rewrite is
-//      the scan's blind spot, not a member of any enumeration it could have been
-//      taught.
+//   3. (CLOSED — found while closing 1, not previously enumerated.) A BARE
+//      EXPRESSION STATEMENT that is not a `BinExpr`, `Call` or `ObjLit`.
+//      `blockHasArrNew` / `blockHasCoalesceCall` NAMED those three shapes, so a
+//      block whose trailing VALUE is spelled `(e)`, `e.length`, `xs[e]`, `[e]`,
+//      `-e` or `e as T` was skipped. The sharpest instance is a bare-EXPRESSION
+//      function body: `parseFuncBodyAndBuild` wraps it in a SYNTHETIC
+//      one-statement Block, so `(n) => (f(n) ?? 0)` is a Block holding one
+//      `Paren` — an expression-bodied lambda holding the function's only `??`-call
+//      or allocator reserved nothing, with no if-expression involved at all. Its
+//      sibling `(n) => f(n) ?? 0` (a `BinExpr` statement, the same program) was
+//      already correct: the discriminator was the SPELLING, not the construct.
+//      Both walkers now FALL THROUGH to the expression walker for any statement
+//      shape they do not name, which cannot over-reach (the expression walker
+//      answers false for statement kinds). Cost measured: a function that already
+//      compiled and now over-reserves the 1-slot arrNew frame grows by 2 bytes.
+//
+// 61 cells over these shapes x {named function, block-bodied lambda,
+// expression-bodied lambda, module scope, return position, call-argument
+// position} x {i32, string, boolean, f64, i32-list, string-list} reps — every one
+// invalid wasm alone, every one correct with a bystander, every one correct now.
+//
+// STILL OPEN, same family, other files (measured on this branch, each still
+// invalid wasm alone and correct with a bystander):
+//   • a Member-receiver `.pop()` in an if-EXPRESSION arm — `exprPopBits` /
+//     `blockPushPopBits` (emit_classify.vl) have no if-expression arm.
+//   • a map read `m[k] ?? d` in an if-EXPRESSION arm — `exprHasMapOp` /
+//     `blockHasMapOp` (emit_classify.vl), same.
+// `blockHasStrOp` and `blockHasCallRef` DO cover the if-expression arm, so this
+// is again a set with some members taught and some not.
 function maybe(n: i32): i32 | null {
   if n > 0 { return n }
   null
 }
 function maybeS(n: i32): string | null {
   if n > 0 { return "s" }
+  null
+}
+function maybeB(n: i32): boolean | null {
+  if n > 0 { return true }
   null
 }
 
@@ -132,6 +188,142 @@ for v in __array_new__(2, 0) {
 }
 total = total + src[0] + src[1]
 print(total) // 7
+
+// ── an if-EXPRESSION ARM, now WALKED for the call-LHS `??` stash ─────────────
+// `exprHasCoalesceCall` gained an `IfStmt` arm, so an if-expression holding the
+// function's ONLY `??`-call reserves the stash. Deleting the bystander is the
+// probe: each of these was invalid wasm (`vl check` rc 0, `vl build` rc 1
+// "unknown local N") before the arm and is correct now with nothing beside it.
+// All three reps are pinned because the frame is three slots handed out together
+// (`coalesceCallSlot` / `StrSlot` / `BoolSlot`).
+function coalInIfExprThen(c: boolean, n: i32) {
+  const v = if c { maybe(n) ?? -1 } else { 0 }
+  v
+}
+print(coalInIfExprThen(true, 6)) // 6
+
+function coalInIfExprElseStr(c: boolean, n: i32) {
+  const v = if c { "y" } else { maybeS(n) ?? "z" }
+  return v == "s"
+}
+print(coalInIfExprElseStr(false, 1)) // true
+
+// The `else if` arm of a chain, boolean rep — `ifChainHasCoalesceCall` recurses
+// the chain, so a nested `else if` arm is covered by the same one arm.
+function coalInElseIfBool(c: boolean, n: i32) {
+  const v = if c { false } else if n > 1 { maybeB(n) ?? false } else { false }
+  v
+}
+print(coalInElseIfBool(false, 2)) // true
+
+// The MODULE-SCOPE twin: `startFnDetectScratch` runs the same expression walker
+// over a top-level statement, so teaching the walker taught the start function.
+print(if 1 > 0 { maybe(8) ?? 0 } else { 0 }) // 8
+
+// ── an if-EXPRESSION ARM, now WALKED for the arrNew length slot ──────────────
+// The allocator twin of the block above: `exprHasArrNew` gained the same
+// `IfStmt` arm. Alone (no other `__array_new__` in the function) this emitted
+// `local.set` against a local the locals vector never declared.
+function arrNewInIfExprArm(c: boolean, n: i32) {
+  const a = if c { __array_new__(n, 0) } else { __array_new__(1, 0) }
+  a.length
+}
+print(arrNewInIfExprArm(true, 5)) // 5
+
+// The module-scope twin, in a call-ARGUMENT position.
+print((if 1 > 0 { __array_new__(3, 0) } else { __array_new__(1, 0) }).length) // 3
+
+// ── an if-EXPRESSION ARM, now WALKED for the list `==`/`+` frames ────────────
+// The third of the trio: `leqScanExpr` gained an `IfStmt` arm that defers to
+// `leqScanStmt` (which already walked condition + both arms at statement level).
+function listEqInIfExprArm(c: boolean) {
+  const xs = [1, 2]
+  const ys = [1, 2]
+  const b = if c { xs == ys } else { false }
+  b
+}
+print(listEqInIfExprArm(true)) // true
+
+// The STRING-list frame (`leqSScratchBase`, 4 slots) in the ELSE arm — a
+// separate reservation from the i32 one, so both halves are pinned.
+function listEqStrInIfExprElse(c: boolean) {
+  const xs = ["a", "b"]
+  const ys = ["a", "b"]
+  const b = if c { false } else { xs == ys }
+  b
+}
+print(listEqStrInIfExprElse(false)) // true
+
+// List `+` concat rides the same i32 frame, so it is the same reservation.
+function listConcatInIfExprArm(c: boolean) {
+  const xs = [1, 2]
+  const ys = [3]
+  const zs = if c { xs + ys } else { xs }
+  zs.length
+}
+print(listConcatInIfExprArm(true)) // 3
+
+// ── the MIDDLE OPERAND of a `??` chain, now WALKED ───────────────────────────
+// `x ?? f() ?? d` parses `(x ?? f()) ?? d`; `emitCoalesce` re-associates it to
+// `x ?? (f() ?? d)`, so `f()` BECOMES a `??` LHS and stashes. The leftmost
+// operand is not a call here, so the old scan reserved nothing at all.
+function coalChainMiddle(x: i32 | null, n: i32) {
+  const v = x ?? maybe(n) ?? -1
+  v
+}
+print(coalChainMiddle(null, 9)) // 9
+
+// A 4-long chain with the call THIRD: the spine walk recurses, so chain length
+// and the call's position along it do not matter.
+function coalChainMiddleDeep(x: i32 | null, y: i32 | null, n: i32) {
+  const v = x ?? y ?? maybe(n) ?? -1
+  v
+}
+print(coalChainMiddleDeep(null, null, 4)) // 4
+
+// The string rep of the same stash (`coalesceCallStrSlot`) in a middle operand.
+function coalChainMiddleStr(x: string | null, n: i32) {
+  const v = x ?? maybeS(n) ?? "z"
+  return v == "s"
+}
+print(coalChainMiddleStr(null, 1)) // true
+
+// PRECISION, not reach: the chain's FINAL default is never re-associated into an
+// LHS position, so a call THERE must not reserve. This was correct before and
+// still compiles to a byte-identical module — the spine walk stops one operand
+// short on purpose.
+function plainTwice(n: i32): i32 {
+  return n * 2
+}
+function coalLastOperandIsCall(x: i32 | null, n: i32) {
+  const v = x ?? plainTwice(n)
+  v
+}
+print(coalLastOperandIsCall(null, 1)) // 2
+
+// ── a bare EXPRESSION STATEMENT that is not BinExpr / Call / ObjLit ──────────
+// The block walkers used to NAME three statement shapes; a block's trailing
+// value can be spelled many more ways, and each of these held the function's
+// only use of its frame.
+function coalInParenStmt(n: i32) {
+  (maybe(n) ?? -1)
+}
+print(coalInParenStmt(2)) // 2
+
+function arrNewInMemberStmt(n: i32) {
+  __array_new__(n, 0).length
+}
+print(arrNewInMemberStmt(3)) // 3
+
+// The SYNTHETIC one-statement Block: `parseFuncBodyAndBuild` wraps a
+// bare-expression function body in a Block whose single statement is whatever
+// shape the expression is — a `Paren` here — so an expression-bodied lambda was
+// the sharpest instance of the miss.
+const coalLambda = (n: i32) => (maybe(n) ?? -1)
+print(coalLambda(6)) // 6
+
+const arrNewLambda = (n: i32) => (__array_new__(n, 0).length)
+print(arrNewLambda(4)) // 4
 
 // ── NOW TAUGHT: the TOP-LEVEL `while` condition ──────────────────────────────
 // Each header below holds the ONLY use of its frame in the start function, so
