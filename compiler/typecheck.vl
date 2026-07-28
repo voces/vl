@@ -7401,6 +7401,33 @@ let canonAtoms = 1
 let nluAtoms = 1
 let lupAtoms = 1
 
+// THE PRE-CANON SPELLING of every generic alias's field annotations, as a node-index
+// column and the name each node carried BEFORE `canonEmitTypeNames` rewrote it. Read by
+// `emit_collect.gaeCollectDecls` through `genAliasFieldRawTyName`.
+//
+// The canon pass is a NAME rewrite with no SCOPE: it resolves `Id` through the declared
+// registry wherever `Id` is written. Inside the body of `type Box<Id> = { v: Id }` that is
+// the wrong answer — there `Id` is the alias's own type PARAMETER, and the checker says so
+// (`tsLeafTy` asks `tpEnvTyOfName` before `declaredTyOfName`, so it reports `Box<string>`
+// as `{v: string}`). Transparency rewrote the field annotation to `i32` before the emitter
+// ever saw it, so `gaeCollectDecls` recorded `i32` against a parameter list holding `Id` and
+// `emit_base.gaeApplyFieldTy` had nothing left to match: the field kept the ALIAS's body
+// type while the checker had bound the parameter to the ARGUMENT. Two answers for one field,
+// `vl check` rc=0, and a module that does not parse.
+//
+// A SIDECAR rather than a suppression, and that is MEASURED. Teaching `canonEmitNameAt` to
+// leave a live parameter name alone fixes the same 84 cells but REDDENS 8 that are green on
+// master — every depth-2 field at the no-op instantiation (`type Id = i32` +
+// `type Box<Id> = { v: Id[][] }` at `Box<i32>`). Surviving in the ARENA, `Id[][]` is a
+// nested list whose ELEMENT is a name `collectU` has registered (a one-member alias is still
+// a `UnionDecl`), so the ref-list intern gave the inner row a union BOX element and the
+// literal `[[1]]` lowered into it — `expected i32, found (ref $type)`. The substitution is
+// the only consumer that wants the parameter name back; every other pass wants exactly what
+// canon produces. So the arena keeps its single vocabulary and the one consumer gets a
+// second column.
+let cgpFieldNodes: i32[] = []
+let cgpFieldRaw: string[] = []
+
 // A NULLABLE LITERAL-UNION's preserved canonical name, or "" if `parts` (the top-level `|`-split
 // members of a union annotation) are not one. `K | null` / `"a" | "b" | null` must keep the litunion
 // members intact — the generic union soften below collapses each quoted literal to `string`, erasing
@@ -7823,12 +7850,72 @@ function canonEmitNameAt(name: string, ctx: i32) {
   name
 }
 
+// Bank every generic alias's FIELD-ANNOTATION node with the name it carries RIGHT NOW —
+// i.e. before the rewrite loop below runs, so the banked spelling is the DECLARED one.
+// Read straight off the registry pass 0a already built (`gaDeclIxs[gi]` IS the `TypeDecl`
+// node), so the alias set is the checker's own; there is no second notion here of which
+// declarations are generic.
+//
+// Banked for EVERY field, not only the ones naming a parameter: which fields those are is
+// `gaeApplyFieldTy`'s question (leaf peel + `gaeParamShadowed`), and asking it here would be
+// a second copy of the predicate that decides the substitution. The consumer asks the real
+// one — `emit_collect.gaeDeclFieldTyName` takes the raw spelling only where
+// `gaeParamSlotOf` says the substitution would land, so a field like `type Box<T> = {v: 0|1}`
+// keeps the canon'd `i32` it has always had.
+function collectGenAliasFieldAnns() {
+  cgpFieldNodes = []
+  cgpFieldRaw = []
+  let gi = 0
+  while gi < gaNames.length {
+    const decl = P.nodes[gaDeclIxs[gi]]
+    if decl is TypeDecl {
+      const fields = decl.tdFields
+      let fi = 0
+      while fi < fields.length {
+        // The parser's bodyless sentinel is `tdFields == [-1]`; skip it rather than index
+        // the arena with it.
+        if fields[fi] >= 0 {
+          const fnode = P.nodes[fields[fi]]
+          if fnode is FieldDef {
+            if fnode.fdType >= 0 {
+              const tr = P.nodes[fnode.fdType]
+              if tr is TypeRef {
+                cgpFieldNodes.push(fnode.fdType)
+                cgpFieldRaw.push(tr.tyName)
+              }
+            }
+          }
+        }
+        fi = fi + 1
+      }
+    }
+    gi = gi + 1
+  }
+  0
+}
+
+// The DECLARED spelling of the generic-alias field annotation at `nodeIx`, or "" when
+// `nodeIx` is not one. The emitter's route back to a type-parameter name that alias
+// transparency (or numeric-literal-union softening — `type Z = 0 | 1` shadows a parameter
+// exactly as `type Id = i32` does) resolved out of the arena. See `cgpFieldNodes`.
+export function genAliasFieldRawTyName(nodeIx: i32) {
+  let i = 0
+  while i < cgpFieldNodes.length {
+    if cgpFieldNodes[i] == nodeIx { return cgpFieldRaw[i] }
+    i = i + 1
+  }
+  ""
+}
+
 // The post-check sweep: rewrite every `TypeRef` annotation and every
 // `UnionDecl` variant name in the arena. Runs once at the end of
 // `checkProgram` — `compileSrc` hands this SAME arena to `emitProgram`, so the
 // emitter only ever sees its own vocabulary.
 export function canonEmitTypeNames() {
   annUnionAtoms = []
+  // BEFORE the rewrite loop — the bank holds the declared spellings, which is the whole
+  // point of it.
+  collectGenAliasFieldAnns()
   let i = 0
   while i < P.nodes.length {
     // The atom-count bank (#1055): one entry PUSHED per node, in node order, so the
