@@ -28956,3 +28956,308 @@ not claim #1232's number was wrong — only that its own harness cannot produce 
 * **An import re-point's only real risk is the one the compiler already refuses to compile.** Three
   behavioural instruments read zero across this slice and none of them could have read anything else;
   the five that found something were all resolver errors from deliberately planted mistakes.
+
+## THE DISCOVERY CENSUS, POST-#1236 — a STRUCTURAL instrument, its false-positive controls stated as CONSTRUCTION, and the number with its denominator (measured at master `cf24c6e`; this slice edits only this file)
+
+The tracked scorecard is disproven as a progress measure: it counts *named resolver calls*, so
+converting anonymous character surgery into named calls makes it RISE while debt falls (twelve
+consecutive merges did exactly that). This section replaces it with a census that enumerates **by
+what the CODE is** — does this expression index into, take a substring of, or compare a whole type
+spelling — and publishes the number with its denominator, its three-way split, and a ranked
+worklist. It changes no compiler source; the compiler it builds is **byte-identical** to master's.
+
+### THE INSTRUMENT
+
+Three scripts, reproducible and comparable run to run. They live outside the tree (a session
+scratchpad — agents have deleted shared in-tree instruments before); the whole of the design is
+written down here so the next census can rebuild them from this section alone.
+
+**Lexing.** One pass, no regex: `//` comments blanked to spaces, **newlines preserved** so
+index → line stays exact; string and char literals kept VERBATIM in the code view (a stripper that
+blanks `'{'` as a string makes every character census read 0) and blanked in a second `masked` view
+used for identifier search. Functions are found by brace-MATCHING from the `function` keyword, never
+by reading a "block" and never by global depth tracking — the failure #1236 recorded.
+
+**UNIT A — one syntactic occurrence, in non-comment code, of a character-level operation whose
+operand is an ESTABLISHED TYPE SPELLING.** Exactly three operations, and only these three:
+
+| op | shape |
+|---|---|
+| **INDEX** | `v[E]` |
+| **SUBSTR** | `v.slice / substring / indexOf / lastIndexOf / charCodeAt / split / startsWith / endsWith / includes ( … )` |
+| **EQ** | `v == "lit"` / `v != "lit"` |
+
+**ESTABLISHMENT is a fixpoint whose seeds are read off the repository, never from a hand-written
+vocabulary of resolver names.** This is what makes the census *structural*: a site qualifies because
+of what happens to the VALUE, not because of which identifier the line mentions.
+
+| seed | rule |
+|---|---|
+| **S1** | `v` is argument 0 of a call to a GRAMMAR HOME. The home set is the 20 exports (+1 private body) of `compiler/tyname.vl` — the compiler's own **zero-import LEAF**, i.e. its own declaration of what the type-name grammar is — plus the eight bodies that module's header names as deliberately staying elsewhere. |
+| **S2** | `v ==`/`!=` a string literal containing type punctuation `[]{}` `|` `<>` **AND** an alphanumeric. |
+| **S3** | `v` is bound from a CUT home (`arrElemNameRaw`, `peelGroupParens`, `listElemNameOf`, `mapSpellKeyName`, `mapSpellValName`, `mapValNameOf`) — a cut of a spelling is a spelling. |
+| **S4** | `v` is bound from a `.slice`/`.substring` of an established spelling. |
+| **S5** | `v` is an element read out of an array a SPLITTER filled from an established spelling. A splitter is detected structurally: a `string` parameter, a `string[]` out-parameter, a body that `.push`es. |
+| **S6** | `v` is bound from a RENDERER: a callee whose returned string is built by concatenating TYPE PUNCTUATION (`+ "[]"`, `+ "<"`). Read off the callee body, not its name. |
+| **P1/P2** | interprocedural, to a fixpoint: a caller's established argument establishes the callee's parameter, and a callee's established parameter establishes the argument expression's root in the caller. The record's "scan one hop into the callee, and walk to the lowest live rung". |
+
+**UNIT B — PREFIX-CODED type languages.** Unit A is blind by construction to a string that encodes a
+type *without* using the type-name grammar's punctuation. Detector, again with no vocabulary: a
+literal `L` for which the tree holds **both** a producer `"L" + …` and a consumer
+`v.slice(0, len(L)) == "L"` (or `v.startsWith("L")`), and `L` carries a sentinel character. Unit B
+then counts the same three operations inside every consuming body.
+
+### THE FOUR CONFIRMED FALSE-POSITIVE CLASSES, EXCLUDED BY CONSTRUCTION
+
+Not one of these is hand-filtered. Each falls out of the seed rules.
+
+| class | how the instrument excludes it | evidence it works |
+|---|---|---|
+| **FP1 operator spellings** (`== "<<"`, `== "&&"`, `== ">>>"`) | S2 requires an **alphanumeric** in the literal, and an operator string is never argument 0 of a grammar home. An operator can therefore never *seed*, and nothing downstream of it is ever counted. | `wasmEmit.vl` holds hundreds of opcode-name compares; its Unit-A PARSE column is **2**. |
+| **FP2 protocol returns spelled like a type** (`inferNicheNullByName(x) == "boolean\|null"`) | computed from the **callee's body**: a function every one of whose `return`s *and* whose trailing expression is a string LITERAL is a TAG producer, so a compare against its result is classified **RENDER**, not PARSE. | the 4 `wasmEmit.vl` sites the old regex counted as debt land in RENDER automatically; 19 tag functions are found tree-wide. |
+| **FP3 THE HOME ITSELF** | two mechanisms. (a) every site whose enclosing function is a grammar home goes in its **own HOME column** and is never mixed into the debt, with membership read off the repository so a slice cannot inflate the debt by deleting the target; (b) more importantly the census is also reported in **COPIES** (below) — an operation written once *is* a home by measurement, and only the second and later writings are debt. | `tyname.vl` scores **0 PARSE / 14 HOME**; `typecheck.vl`'s depth walk scores 5 HOME. |
+| **FP4 non-type character work colocated in a type-carrying file** (hex-escape scanning in `emit_base.decodeStr`, numeric lexemes, the source lexer, the formatters) | such a value never reaches a grammar home and is never compared to a type-punctuated alphanumeric literal, so it is never *established*. Additionally the interprocedural step is gated: a callee inherits a spelling only if it does type-grammar work (transitively) and is **not a VALUE-LEXEME body** (every char-literal it compares lies in the numeric alphabet). | `lexer.vl`, `format.vl`, `fmt_util.vl`, `cli_util.vl`, `emit_bignum.vl`, `parser.vl`, `ast.vl` all score **0**, with no rule naming them. The value-lexeme gate is worth 23 sites on its own: `emitIs` genuinely hands the SAME string to `numLexFitsI32` — a numeric literal-union member *is* a numeric lexeme — and ungated, `emit_bignum`'s `parseI32`/`ieeeBytes`/`decIntDigits` contribute 23 false sites. |
+
+**A FIFTH CLASS, NEW HERE AND ALREADY RULED IN THE CODE: the `$fnsig` ABI.** `emit_classify.vl:6740`
+and `:19500` both carry an in-code census note saying the `$fnsig` key's `'>'`/`';'`/`'v'` are "the
+ABI token alphabet `repKindOfSigTok` owns, on a string the compiler MINTED, not a rendered type", and
+that a destringify census should skip them. The instrument now finds that class **structurally** —
+the TOKEN TABLE is the function whose every return is a one-character string literal with at least
+eight arms (`repSigTokOfKind`), its inverse is the single-`i32`-parameter function comparing against
+at least eight of that alphabet (`repKindOfSigTok`), and an ABI decoder is a body whose char compares
+lie inside that alphabet plus `;` `>` `v` `=` and the digits, and which calls no grammar home — and
+reports it in its own **ABI column**, 9 sites.
+
+**THE RECORD RULES `$fnsig` BOTH WAYS AND THAT SHOULD BE SETTLED.** The 13-agent audit recorded in
+the program memory calls "the `$fnsig` encode/decode pair" one of **"THREE COMPLETE
+RE-IMPLEMENTATIONS OF THE ANNOTATION GRAMMAR OUTSIDE THE PARSER"**; the two in-code notes rule it out
+of scope. This census sides with the code: the key is keyed on **representation KINDS**, its alphabet
+is minted by a table with a single home, and it never touches the parser's bracket language — so it
+is not "parsing a string for a type" in the owner's sense. It is reported separately rather than
+subtracted, so a future ruling can move it without re-deriving anything.
+
+### THE NUMBER, WITH ITS DENOMINATOR AND ITS SPLIT
+
+**Denominator: 459 character-level operations on an established type spelling, in 12 modules.** That
+is the population the instrument sees at all. It splits:
+
+| column | sites | rule | status |
+|---|---:|---|---|
+| **PARSE** | **98** | indexes / substrings a spelling, or compares a whole COMPOSITE spelling | **the debt** |
+| RENDER | 4 | compares a value whose producer returns only string LITERALS (a tag) | allowed — *"we might need a way to render a type"* |
+| NAME | 326 | `v == "i32"` / `"f64"` / `"null"` / `""` — the literal carries **no** type punctuation | allowed — *"a name is a name, so that's fine"* |
+| HOME | 22 | inside a grammar home | the consolidation TARGET, terminal |
+| ABI | 9 | the `$fnsig` minted encoding | ruled out of scope by two in-code notes; see above |
+
+Per module, PARSE only:
+
+| file | PARSE | INDEX | SUBSTR | EQ |
+|---|---:|---:|---:|---:|
+| `typecheck.vl` | 38 | 16 | 22 | 0 |
+| `emit_base.vl` | 25 | 8 | 17 | 0 |
+| `emit_classify.vl` | 19 | 2 | 17 | 0 |
+| `emit_mono.vl` | 5 | 3 | 2 | 0 |
+| `driver.vl` | 5 | 4 | 1 | 0 |
+| `emit_collect.vl` | 4 | 0 | 4 | 0 |
+| `wasmEmit.vl` | 2 | 2 | 0 | 0 |
+| **total** | **98** | **35** | **63** | **0** |
+| every other module (`emit_query` `emit_rep` `emit_rewrite` `emit_sections` `tyname` `parser` `ast` `lexer` `format` `fmt_util` `cli*` `emit_bignum` `emit_bytes` `emit_state` `lint` `check_*`) | **0** | | | |
+
+**`EQ` IS ZERO TREE-WIDE, WHICH INDEPENDENTLY CONFIRMS TIER 1 IS CLOSED.** Re-running the OLD
+whole-spelling regex at `cf24c6e` returns 6 raw matches: the 5 known `inferNicheNullByName` protocol
+tags plus the known multi-line-string artefact at `typecheck.vl:12550`. Removable = **0**. The brief's
+"42 found — 35 routed, 5 reclassified, 2 deleted" holds.
+
+**UNIT B adds 22 sites in 1 module** (`typecheck.vl`, 2 functions) — see W6.
+
+**HEADLINE: 120 type-PARSE sites across 8 modules** (98 Unit A + 22 Unit B), against 4 RENDER and
+326 NAME that the owner's rule explicitly permits, 22 HOME-internal that are the target rather than
+the debt, and 9 ABI that two in-code notes rule out of scope.
+
+### THE SECOND UNIT THAT MATTERS MORE: **COPIES**
+
+A grammar has to be spelled once *somewhere*. Counting total sites therefore over-counts by exactly
+the number of homes — which is the FP3 trap, and it is why every previous headline needed a
+hand-kept exclusion list. So the census also normalises each site's operation to a shape signature
+with the receiver abstracted (`X.slice(1, X.length - 1)`, `X[0] == '"'`) and counts how many times
+each is written:
+
+> **98 PARSE sites · 60 distinct normalised operations · 14 written more than once · 38 COPIES above
+> the first.**
+
+**38 is the number a routing slice can actually remove**, and unlike the site count it cannot be
+inflated by naming an inline operation. The 14 duplicated operations, in size order:
+
+| copies | operation | where |
+|---:|---|---|
+| **18** | `X.slice(1, X.length - 1)` | `emit_base` x3, `emit_classify` x9, `emit_collect` x2, `typecheck` x4 |
+| 4 | `X[i]` (an identifier-run walk over a type name) | `driver` x3, `typecheck` x1 |
+| 4 | `X[0] == '='` (+ `X[1] == '>'`, the pin marker) | `emit_mono` x2, `typecheck` x2 |
+| 3 | `X.slice(0, lt)` (generic-application HEAD) | `driver`, `emit_base`, `emit_collect` |
+| 3 | `X.slice(start, end)` (top-level split) | `emit_base`, `typecheck` x2 |
+| 3 | `X[0] != '"'` (quoted-leaf test) | `emit_base`, `typecheck` x2 |
+| 3 | `X[0] == '"'` (quoted-leaf test) | `typecheck`, `wasmEmit` x2 |
+| 2 | `X.slice(1, fa - 1)` (function-type PARAM list) | `emit_base`, `typecheck` |
+| 2 | `X.slice(fa + 2, X.length)` (function-type RETURN) | `emit_base`, `typecheck` |
+| 2 | `X.slice(1, n - 1)` | `emit_base`, `emit_classify` |
+| 2 | `X.slice(0, ltAt)` (generic HEAD again, other spelling) | `emit_classify`, `typecheck` |
+| 2 | `X.slice(0, X.length - 2)` (**this IS `arrElemNameRaw`**) | `emit_classify` x2 |
+| 2 | `X.slice(colonAt + 1, X.length)` (field TYPE after `:`) | `typecheck` x2 |
+| 2 | `X[0] == '!'` (negation prefix) | `typecheck` x2 |
+
+### THE RANKED WORKLIST — with the import-direction check taken on EVERY route
+
+**The families OVERLAP by site and only the COPIES figure is additive.** `emit_base.normTypeAtom:2108`
+is in both W1 and W7; `typecheck.canonEmitNameAt`'s four sites are split across W1, W4 and W9;
+`nameNeedsCanon` is in both W8 and W9. Sum the per-family columns and you double-count. The one
+overlap-free total is the **38 COPIES** above, and that is the number a routing programme burns down.
+
+The module graph at `cf24c6e`, re-derived (and it corrects the brief in one place):
+
+```
+tyname (leaf, 0 imports)
+  <- typecheck  (ast, check_state, emit_bignum, tyname)
+       <- emit_base  (ast, tyname, typecheck)
+            <- emit_query / emit_rep / emit_classify <- emit_collect <- emit_mono
+            <- emit_rewrite / emit_sections
+driver   -> ast check_query emit_base emit_sections emit_state format lexer lint parser tyname typecheck
+wasmEmit -> ast emit_base emit_bignum emit_bytes emit_classify emit_collect emit_mono
+            emit_query emit_rep emit_state typecheck          <-- NO tyname
+```
+
+**CORRECTION TO THE BRIEF: `typecheck.vl` imports FOUR modules, not three** — `ast`, `check_state`,
+`emit_bignum` **and `tyname`** (phase 0 added it, `typecheck.vl:247`). And **`wasmEmit.vl` is a tenth
+module doing type-name character work that does NOT import the leaf**; "nine direct consumers, all
+one hop" is right about the current import set and must not be read as "every module that needs the
+grammar has it".
+
+| # | family | sites | file · function | what it parses | home it should ask | legal? |
+|---|---|---:|---|---|---|---|
+| **W1** | **the GROUP-INTERIOR peel** | **18** | `emit_base.normTypeAtom` / `nameIsStructWithUnionField` / `nameIsStructWithLitUnionField` · `emit_classify.rlElemCloSigKey` / `cloArrSlotRetName` / `shapeFieldParse` / `funcTypeShapeLowerable` / `variantNestedShapeOk` / `internNonLowerableFieldShapes` / `internShapeFieldElems` / `internInlineShape` / `internShapeAs` · `emit_collect.shapeHasCloField` / `collectShapeVariantFields` · `typecheck.litMemberTy` / `nameToTyReal` / `canonShapeName` / `canonEmitNameAt` | the interior of a one-character-delimited group — a `{…}` shape body, a `(…)` group, a `"…"` quoted member | a new CUT `groupInnerOf(name)` in **`tyname.vl`**. The leaf already owns every SPAN TEST (`nameIsBraceSpanEnds`, `nameIsParenSpanEnds`, `nameIsMapSpanEnds`) and no interior CUT — the exact "test half homed, cut half not" shape D-ARRELEM found for the array grammar | **LEGAL** — all four modules import `tyname` |
+| **W2** | the GENERIC-APPLICATION cut | 11 | `driver.modGenBase` · `emit_base.annGenAppDecompose` · `emit_collect.gaeCollectDecls` · `emit_classify.gaeEnsure` · `typecheck.nameToTyReal` / `nameIsGenAppOfDecl` / `checkProgramNode` | `Head<A,B>` into head name and argument text | `gaeHeadNameOf` / `gaeArgsTextOf` in **`tyname.vl`**, beside the `gaeLtAt` index that is already there | **LEGAL** — driver / emit_base / emit_collect / emit_classify / typecheck all import `tyname` |
+| **W3** | the QUOTED-LEAF test | 8 | `emit_base.isLitVariantName` / `nulLitUnionInnerName` · `typecheck.litMemberTy` / `nameIsInlineLitUnion` · `wasmEmit.emitIs` / `emitUnionLitIs` · `driver.modTypeRenamed` | "is this atom a string-literal member" (`name[0] == '"'`) | `nameIsQuotedLeaf(name)` in **`tyname.vl`** — the leaf already owns the `"` alphabet via its private `skipQuotedName` | **LEGAL, with one new import**: `wasmEmit.vl` does not import `tyname` today. Adding it cannot cycle — `tyname` has zero imports |
+| **W4** | the FUNCTION-ARROW cut | 7 | `emit_base.annFnDecompose` / `annRetNameOf` · `emit_classify.shapeFieldTypeCompat` · `typecheck.canonEmitNameAt` x2 | `(p…) => ret` into the param list and the return, given the arrow index | the CUT pair in **`tyname.vl`** | **the obvious route is ILLEGAL, the correct one is legal.** Routing `typecheck` to `emit_base.annArrowAt` is an UP-move (`emit_base` imports `typecheck`). Moving `isTopLevelFuncTypeName` down is blocked — it writes the `funcArrowAt` module bank. But the CUT *given an index* is pure, so **the cut moves to `tyname` and the index stays where it is** |
+| **W5** | `arrElemNameRaw` written out by hand | 2 | `emit_classify.gaeEnsure:12058` · `emit_classify.unionListElemMapFieldMember:13085` | `X.slice(0, X.length - 2)` — literally the body of a home the file already imports | **`arrElemNameRaw`, no new home at all** | **LEGAL** — cheapest item on the list |
+| **W6** | **the DERIVED-HOLE PATH language** (Unit B) | **22** | `typecheck.holeBaseName` (6) · `typecheck.substHoleByName` (16) | `?fld.x.?ret.T` — a type DERIVATION (field-of / return-of / element-of / generic-alt-of) encoded as a dotted string and decoded by prefix match plus recursive slicing | **none, and none should exist.** This is not a grammar to home; it is *"a union is a data structure"* applied verbatim — a derived hole is `{kind: FLD, field: "x", of: <holeIx>}` | **LEGAL** — entirely inside `typecheck.vl`, no import moves at all |
+| **W7** | the SPACE-FREE normalisation family | 7 (+4 declined) | `emit_base.normTypeAtom` / `canonBareShapeName` · `emit_classify.spacelessName` / `mvValKindOfName` · `emit_rep.renderFaithful` | six bodies each asserting or enforcing "a canonical type name has no spaces" | `nameIsSpaceFree` + `nameStripSpaces` in **`tyname.vl`** | **LEGAL** — emit_base / emit_classify / emit_rep all import `tyname` |
+| **W8** | the type-name IDENTIFIER-RUN walk | 5 | `driver.modGenParams` / `modTypeRenamed` · `typecheck.nameNeedsCanon` | walks a rendered type name character by character classifying identifier runs (the module-merge rename, and the canon trigger scan) | a run tokenizer `nameIdentRuns(name, outStart, outEnd)` in **`tyname.vl`** | **LEGAL** — driver and typecheck both import `tyname` |
+| **W9** | the CANON pass | 10 | `typecheck.canonEmitNameAt` (4) · `canonShapeName` (4) · `nameNeedsCanon` (2) | the checker re-parsing names it rendered | **DESIGN-BLOCKED.** `canonEmitName` is not `tyToEmitName ∘ nameToTy` — they disagree on 853 of 5,172 annotations (16.5%), 41 canon-only / 108 renderer-only / 5 both. The `renderEmit(ty, ctx)` six-phase design is the answer; P1-P3 have landed | n/a — not a routing problem |
+| **W10** | `nameToTyReal` | 9 | `typecheck.nameToTyReal` | the compiler's SECOND recursive-descent type parser | **a SOURCES problem**, not a site problem: the answer is the parser's `annTs` spelling tree (D-PARSETY / D-TSTY). Partly banked at positioned annotations; the residue is the positions the parser still `tsPop()`s | n/a |
+| **W11** | the PIN / SENTINEL markers | 10 | `emit_mono.monoMakeInstance` (3) · `typecheck.recordClonedNodeTy` (7) | `=>sigkey` and `#anonN` PROVENANCE prefixes riding a `TypeRef.tyName` column | not a grammar. Retired by giving the pin its **own column**, not by a home | n/a |
+| **W12** | the `$fnsig` ABI | 9 (+4) | `emit_classify.sigKeyRetTokIx` / `sigKeyRetKind` / `sigKeyRetIsVoid` / `sigKeyRetSlot` / `sigKeyPinPayload` / `sigParamCoerceKind` · `emit_sections.synthSigIdxAt` / `emitSynthCloSig` | a minted representation-kind encoding | ruled out of scope by two in-code notes; each scan already has a single home | n/a |
+| **W13** | the SINGLE-WRITING homes | ~20 | `emit_base.tyTopLevelSplit` / `nullablePartOf` / `removeAtomFromGo` / `annObjFieldSplit` / `annGenAppDecompose` / `canonBareShapeName` / `nameIsStructWithMapField` / `parenUnionArrElemName` · `typecheck.splitTypeName` / `splitGenArgs` / `nameIsInlineLitUnion` · … | each is the ONE body for its grammar | moving them into `tyname.vl` changes the LOCATION, not the count | phase 2 (`splitUnionAtoms` / `unionMemberCount`) is the queued instance |
+
+### CAN THE CENSUS REACH 0? — NO, AND HERE IS EXACTLY WHY, WITH THE MEASUREMENT
+
+**By routing alone the reachable floor is 60, not 0.** 98 sites are 60 distinct operations; 38 are
+copies. W1-W5 plus W7 and W8 retire the copies; what is left is the 60 single writings, and *a
+grammar has to be spelled once*.
+
+**And the 60 cannot be retired by moving them either, because there is nothing to ask.** Measured
+per site rather than asserted: **96 of the 98 PARSE sites sit in a function all of whose parameters
+are scalars** (`string` / `i32` / `boolean` / out-arrays) — no node index, no `tyIx`, no arena handle
+in scope. Exactly **2** sites (`typecheck.checkProgramNode`) have a handle. This reproduces
+D-GRAMPRED's finding at 7.5x the population: *`nodeTyIx` coverage was never the blocker at this tier;
+the absence of any handle in the callee's signature was.*
+
+So the honest verdict, in four parts:
+
+1. **38 sites are mechanically removable now** (W1-W5, W7, W8) — all seven routes checked and
+   **legal**, one needing a new (cycle-free) import into `wasmEmit.vl`. W1 alone is 17 of them.
+2. **22 more are removable by building a data structure** (W6) — no import move, no home, and the
+   owner's *"a union is a data structure"* is the whole design brief. This family has **never been
+   counted**: the record scored it "2 tests … not type spellings", and the operation count is 22.
+3. **The remaining ~60 are IRREDUCIBLE UNDER ROUTING and reduce only with the SOURCES change.**
+   Zero is reached exactly when every consumer that is handed a rendered `string` today is handed a
+   `tyIx` instead — the C1 typed-IR endgame — because 96/98 of these functions have no other input.
+   Anyone promising zero from a home-routing slice is promising the wrong instrument's number.
+4. **42 of the 120 are blocked on decisions already made and recorded** — W9 (10) behind
+   `renderEmit`, W10 (9) behind the parser tree's coverage, W11 (10) behind an overloaded column,
+   W12 (13) ruled out of scope. Stated so motion on the other 78 is not mistaken for closure.
+
+### WHAT THE INSTRUMENT ITSELF STILL MISSES — stated, not hidden
+
+An inverted control was built for exactly this: enumerate **every** character-level operation on a
+string in `compiler/*.vl` with **no** provenance filter (2,726 raw), subtract the census, and read
+the residue per file. What the residue shows the automated units decline:
+
+* **`emit_rep.renderFaithful:1761`** (1 site) — walks a `tyToStr` render dropping spaces and
+  rewriting `?` to `|null`. Declined because its alphabet is `' '` / `'?'`, which is neither type
+  punctuation nor a home call. Real debt; it is W7's fifth body and is listed there by hand.
+* **`emit_classify.spacelessName:8121`** (3-4 sites) — same reason, same family, same fix.
+* **`emit_sections.synthSigIdxAt` / `emitSynthCloSig`** (4 sites) — the `$fnsig` decode outside
+  `emit_classify`; the ABI detector only fires where the census established a value.
+* **the direct-call compare form** `inferNicheNullByName(x) == "boolean|null"`
+  (`emit_classify.vl:8501`) — the operand is a call expression, not a variable, and the scan is
+  variable-rooted. It belongs in the **allowed** RENDER column, so the miss costs nothing, but it is
+  why the RENDER column reads 4 and the old regex reads 5.
+* **`emit_sections.passRowName` / `passRowNeeds`** — correctly declined: a pass-table row is not a
+  type. Named here so a later census does not chase them.
+
+Everything else in the residue is `lexer.vl`, the formatters, `emit_bignum`'s digit math,
+`parser.vl` (allowed by the rule *"outside the actual parser"*), `lint.vl`'s identifier-convention
+tests, and bare-name equality.
+
+### GATE — every exit code taken BARE, and the behavioural instruments are VACUOUS
+
+This slice edits **one file**, this one. No compiler source changes, so the module set is unchanged
+and the compiler must come out byte-identical.
+
+| leg | rc | reading |
+|---|---:|---|
+| `refresh-compiler.sh` | 0 | 1,041,412 B |
+| **`cmp` against master's build** | **0** | **BYTE-IDENTICAL**, sha256 `65f068509605c84c13dac419ea0d1bfd256fff5c58380a50545c611f4813e5ee` |
+| `lint-self.sh` (incl. `vl fmt --check`) | 0 | clean |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,240 passed / 0 failed / 14 ignored** |
+
+**Say it plainly: because the binary is byte-identical, the suite and every behavioural instrument
+are LOGICALLY VACUOUS rather than green.** They could not have failed. The only leg that carries
+information is the `cmp`, and what it proves is that the census changed nothing.
+
+**The suite reads 3,240/0/14, not master's 3,246/0/8, and the delta is fully attributed:** the six
+extra ignored tests are exactly `tests/selfhost_native_opt_test.ts`'s six `vl build -O` cases, which
+self-ignore because this worktree has no `node_modules` (`npm ci` is forbidden here — it deletes the
+shared symlink). Totals agree exactly: 3,240 + 14 = 3,254 = 3,246 + 8. The ignored count is the tell,
+and here it names its own cause.
+
+### WHAT THIS CENSUS FOUND WRONG IN THE RECORD
+
+1. **`typecheck.vl` imports four modules, not three** — `tyname` joined at phase 0.
+2. **`wasmEmit.vl` does type-name character work and does not import the leaf.** "Nine direct
+   consumers, all one hop" describes the import set, not the need.
+3. **`splitUnionAtoms` is 31 calls across 6 modules, not 37 across 5** (`emit_base` 7,
+   `emit_classify` 12, `emit_collect` 4, `emit_rep` 1, `typecheck` 4, `wasmEmit` 3), and one of the
+   six — `wasmEmit.vl` — does not import `tyname`, so **phase 2 needs an import edge the phase-1
+   record does not mention.** `unionMemberCount` is 9 calls across 4 modules. The definition lines
+   16533 / 16568 are exact.
+4. **"Tier 2's remainder is a SOURCES problem rather than a site problem" is right about the
+   MECHANISM and wrong about the SCOPE.** It was recorded for the files those slices owned;
+   tree-wide there are still 35 INDEX + 63 SUBSTR grammar operations outside the homes, and 38 of
+   them are literal copies of each other. The sources framing is correct for the 60 that remain
+   *after* the copies go — not for the population as it stands.
+5. **The derived-hole path language was scored at "2 tests" and ruled "not type spellings".** It is
+   22 operations in 2 functions, and it is the clearest instance in the compiler of a *type* being
+   represented by a *parsable string* — the exact thing the owner's rule names.
+6. **The record rules the `$fnsig` key both ways** (the audit: one of three re-implementations of the
+   annotation grammar; two in-code notes: out of scope). Reported in its own column so the ruling can
+   be made once, in one place.
+
+### METHOD NOTES
+
+* **Count COPIES, not sites.** It is the only unit that cannot be inflated by naming an inline
+  operation and cannot be deflated by deleting a home — the two failure modes this program has
+  already hit. Report sites for scale and copies for progress.
+* **A structural census needs its own INVERTED CONTROL.** The unfiltered 2,726-operation enumeration
+  is what found the derived-hole language, `renderFaithful` and `spacelessName` — none of which any
+  seed rule reached. A census with no residue view cannot tell "zero here" from "blind here".
+* **Gate the interprocedural step on what the CALLEE does, and state the gate positively.** "Not a
+  value-lexeme body" is worth 23 sites, and the reason is not sloppiness: a numeric literal-union
+  member genuinely *is* both a type-member spelling and a numeric lexeme, so the same string reaches
+  both kinds of code. There is no provenance answer available there — only a callee-behaviour answer.
+* **The HOME set should be read off the repository, not kept by hand.** `tyname.vl` is a zero-import
+  leaf whose header enumerates both what is in and what is deliberately out; that is the compiler's
+  own declaration of the boundary, and using it makes FP3 a construction rather than a policy.
+* **An establishment fixpoint under-counts before it over-counts.** The first version of this
+  instrument (direct seeds only, no interprocedural step) read 61 and looked clean; the residue view
+  showed it was missing `shapeInnerFieldSplit`'s whole caller family. A census that only tightens is
+  optimising the wrong error.
