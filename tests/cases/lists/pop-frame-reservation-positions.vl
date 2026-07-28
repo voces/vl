@@ -6,55 +6,73 @@
 // @log 2
 // @log 3
 // @log 4
-// THE TAUGHT HALF of the push/pop scratch-frame reservation, by POSITION — plus
-// the positions that are NOT taught, named in prose because they cannot be pinned
-// without failing the suite.
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 2
+// @log 2
+// @log b
+// @log b
+// @log 2
+// @log 2
+// @log 2
+// THE PUSH/POP SCRATCH-FRAME RESERVATION, pinned by POSITION — including the two
+// position families that used to be missing and are now taught.
 //
 // A `.pop()` whose receiver is a Member (`b.xs.pop()`) or a module GLOBAL
 // (`xs.pop()`) stages the receiver's wrapper ref into `<pushframe> + 3`
-// (`stageListRecv`, wasmEmit.vl:9613) — the SAME 4-slot frame a `.push` of that
-// element kind uses. The frame exists only if `fnUsesPush` / `fnUsesStrPush` /
-// `fnUsesRefPush` was set, and NONE of `emitPush` / `emitPop` / `emitClear` /
-// `emitPopOr` tests those flags: there is no "frame not reserved" floor here, so a
-// position the scan does not walk is INVALID WASM with `vl check` rc 0.
+// (`stageListRecv`) — the SAME 4-slot frame a `.push` of that element kind uses.
+// The frame exists only if `fnUsesPush` / `fnUsesStrPush` / `fnUsesRefPush` was
+// set, and NONE of `emitPush` / `emitPop` / `emitClear` / `emitPopOr` tests those
+// flags: there is no "frame not reserved" floor here, so a position the scan does
+// not walk is INVALID WASM with `vl check` rc 0.
 //
-// This file pins the positions the scan DOES walk — `blockPushPopBits`
-// (emit_classify.vl:3654) dispatches `LetDecl.letInit`, `RetStmt.retArg`, a bare
+// `blockPushPopBits` dispatches `LetDecl.letInit`, `RetStmt.retArg`, a bare
 // `BinExpr`/`Call` statement, `WhileStmt.whileCond` + body, `ForIn.fiIter` + body,
 // `ForRange.frFrom`/`frTo` + body, and `IfStmt` via `ifChainPushPopBits`.
 //
-// NOT WALKED — measured on 5394f3b, `vl check` rc 0, `vl build` rc 1, and every
-// cell becomes CORRECT the moment any `.push` of the same element kind is added to
-// the same function (deleting that bystander is the probe):
+// TWO position families were NOT walked, both fixed and pinned below (each was
+// invalid wasm ALONE and correct the moment any `.push` of the same element kind
+// joined the same function — deleting that bystander was the probe):
 //
 //   1. AN `if` CONDITION, in a regular function or a lambda. `ifChainPushPopBits`
-//      (emit_classify.vl:3697) walks `ifThen` and `ifElse` and never `s.ifCond` —
-//      its header says so, and says the start-fn if-scan handles conditions. It
-//      does: `startScanIf` (emit_sections.vl:758) walks `st.ifCond`. Nothing walks
-//      a regular function's. Three of the four condition positions are scanned
-//      (a `while` condition here, an `if` condition at module scope) and the
-//      fourth is not.
-//
-//          const xs: i32[] = [1]
-//          function f(): i32 {
-//            if (xs.pop() ?? -1) == 1 { return 1 }   // no import/frame reserved
-//            return 0
-//          }
+//      walked `ifThen` and `ifElse` and never `s.ifCond`; its header justified the
+//      omission with "the start-fn if-scan handles its conditions", which is true
+//      only of the START function — `startScanIf` does walk `st.ifCond`, and
+//      nothing walked a regular function's or a lambda's. Three of the four
+//      condition positions were scanned (a `while` condition, an `if` condition at
+//      module scope) and the fourth was not. 12 cells measured over element
+//      {i32, string} x receiver {module global, struct field} x position
+//      {`if` cond, `else if` cond, `if` cond in a lambda}.
 //
 //   2. AN `ArrayLit` ELEMENT, AN `ObjLit` FIELD VALUE, OR AN `as`-CAST OPERAND.
-//      `exprPopBits` (emit_classify.vl:3621) descends `Call`(args only),
-//      `BinExpr`, `Member`, `Index`, `Unary`, `Paren` — and stops. Its sibling
-//      walker in the same file, `exprHasMapOp`, carries `ObjLit`, `ArrayLit`,
-//      `AsExpr` and `IsExpr` arms; this one does not, and `emitExpr` lowers all
-//      four positions normally into `emitPop`.
+//      `exprPopBits` descended `Call`(args only), `BinExpr`, `Member`, `Index`,
+//      `Unary`, `Paren` — and stopped. Its sibling walker in the same file,
+//      `exprHasMapOp`, carries `ObjLit`, `ArrayLit`, `AsExpr` and `IsExpr` arms;
+//      this one did not, and `emitExpr` lowers all of those positions normally
+//      into `emitPop`. 12 cells measured over element {i32, string} x receiver
+//      {module global, struct field} x position {ArrayLit, ObjLit, `as`}, plus a
+//      nested literal and an `as f64`.
 //
-// Measured over element kind {i32, string} x receiver {module global, struct
-// field} x position {if cond, else-if cond, if cond in a lambda, ArrayLit, ObjLit,
-// as-operand}: 24 cells, every one invalid wasm alone and correct with a push
-// beside it. The corpus contains ZERO fixtures in either position.
+// STILL NOT COVERED, measured on 6746f12 — the REF-list twin of family 1. The
+// per-kind BITS are fixed, but a ref-list `.pop()` also needs its element-type
+// SLOT recorded, and `collectMemberPopRefSlots`/`…Expr`/`…If` (emit_collect.vl)
+// mirror the very same omissions: no `ifCond` arm, and no `ArrayLit`/`ObjLit`/
+// `AsExpr` arms in the expression walk. `fnUsesRefPush` is inert in `fbBeginFunc`
+// (the ref frames are driven by `fnRefPushSlots`), so the bit alone changes
+// nothing:
+//
+//     type Node = { id: i32 }
+//     const xs: Node[] = []
+//     function f(): i32 {
+//       if xs.pop() != null { return 1 }   // still invalid wasm; byte-identical
+//       return 0                            // before and after the bits fix
+//     }
 type B = { xs: i32[] }
 type C = { ss: string[] }
 
+// ── THE TAUGHT HALF ──────────────────────────────────────────────────────────
 // let-init position, GLOBAL receiver — walked (`LetDecl` arm).
 const gi = [1, 2, 3]
 function viaLetInit() {
@@ -86,8 +104,7 @@ function viaReturnStr(c: C) {
 const dd = { ss: ["a", "b"] }
 print(viaReturnStr(dd)) // b
 
-// while CONDITION, struct-field receiver — walked (`WhileStmt.whileCond`), and it
-// is the position whose `if` twin is NOT walked.
+// while CONDITION, struct-field receiver — walked (`WhileStmt.whileCond`).
 function viaWhileCond(b: B) {
   let n = 0
   while (b.xs.pop() ?? -1) > 0 {
@@ -109,11 +126,98 @@ function viaForBound() {
 }
 print(viaForBound()) // 3
 
-// An `if` condition AT MODULE SCOPE — walked, by `startScanIf`, which is the
-// half of the pair that has the arm. Its in-function twin is the gap above.
+// An `if` condition AT MODULE SCOPE — walked, by `startScanIf`.
 const gm = [4]
 let seen = 0
 if (gm.pop() ?? -1) == 4 {
   seen = 4
 }
 print(seen) // 4
+
+// ── GAP 1: an `if` CONDITION inside a function / a lambda ────────────────────
+const c1 = [1]
+function ifCondGlobal(): i32 {
+  if (c1.pop() ?? -1) == 1 { return 1 }
+  return 0
+}
+print(ifCondGlobal()) // 1
+
+const c2: B = { xs: [1] }
+function ifCondField(): i32 {
+  if (c2.xs.pop() ?? -1) == 1 { return 1 }
+  return 0
+}
+print(ifCondField()) // 1
+
+// An `else if` condition — `ifChainPushPopBits` recurses into a chained `else if`,
+// so the condition arm has to hold on the recursion too.
+const c3 = [1]
+function elifCondGlobal(q: boolean): i32 {
+  if q { return 5 } else if (c3.pop() ?? -1) == 1 { return 1 }
+  return 0
+}
+print(elifCondGlobal(false)) // 1
+
+// An `if` condition inside a LAMBDA — a lifted function body, walked through the
+// same `blockPushPopBits`.
+const c4: C = { ss: ["a"] }
+const ifCondLam = (q: i32) => {
+  let r = q
+  if (c4.ss.pop() ?? "z") == "a" { r = 1 }
+  r
+}
+print(ifCondLam(0)) // 1
+
+// ── GAP 2: an ArrayLit element / an ObjLit field value / an `as` operand ──────
+const d1 = [1, 2]
+function popInArrayLit(): i32 {
+  const a = [d1.pop() ?? -1]
+  return a[0]
+}
+print(popInArrayLit()) // 2
+
+type V = { v: i32 }
+const d2: B = { xs: [1, 2] }
+function popInObjLit(): i32 {
+  const o: V = { v: d2.xs.pop() ?? -1 }
+  return o.v
+}
+print(popInObjLit()) // 2
+
+const d3 = ["a", "b"]
+function popStrInArrayLit(): string {
+  const a = [d3.pop() ?? "z"]
+  return a[0]
+}
+print(popStrInArrayLit()) // b
+
+type S = { v: string }
+const d4: C = { ss: ["a", "b"] }
+function popStrInObjLit(): string {
+  const o: S = { v: d4.ss.pop() ?? "z" }
+  return o.v
+}
+print(popStrInObjLit()) // b
+
+const d5 = [1, 2]
+function popInAsCast(): i32 {
+  const a = (d5.pop() ?? -1) as i32
+  return a
+}
+print(popInAsCast()) // 2
+
+const d6 = [1, 2]
+function popInAsCastF64(): f64 {
+  const a = (d6.pop() ?? -1) as f64
+  return a
+}
+print(popInAsCastF64()) // 2
+
+// A NESTED literal: an ObjLit field value holding an ArrayLit holding the `.pop()`
+// — both new arms on one path.
+const d7 = [1, 2]
+function popInNestedLit(): i32 {
+  const o: B = { xs: [d7.pop() ?? -1] }
+  return o.xs[0]
+}
+print(popInNestedLit()) // 2

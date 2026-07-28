@@ -11,7 +11,9 @@ import {
   arrElemNameRaw,
   listElemNameOf,
   nameIsArray,
+  nameIsBraceSpanEnds,
   nameIsParenOpen,
+  nameIsParenSpanEnds,
 } from "./tyname"
 import {
   monoInferListElem,
@@ -235,6 +237,59 @@ function monoStructAnnName(name: string) {
   ""
 }
 
+// The annotation NAME of an ANNOTATED local / parameter whose type is a list over a
+// COMPOSITE element — a nested list (`i32[][]`), a grouping-paren element (`(i32|null)[]`)
+// or an inline object shape (`{a:i32}[]`) — or "" for anything else.
+//
+// It exists because the `expr*` cascade at the bottom of `monoArgTyName` CANNOT name these
+// and does not admit it in the same way twice: `exprRefArray` claims a `{…}[]` /
+// `(…|null)[]` argument and then answers "" for everything but an array LITERAL, while a
+// nested `i32[][]` falls past every list arm to `exprArray`'s catch-all, which would pin
+// `i32[]` — an instance one dimension short of what the CHECKER typed. Both answers are
+// wrong for the same reason: the classifiers read the EXPRESSION, and mid-mono the locals
+// table is unbuilt, so an Ident's element type is simply not derivable from it. The
+// ANNOTATION is, and the two arms above (`monoStructAnnName`, `isUName`) already trust it
+// for exactly that reason — this is the same trust extended to the list spellings they
+// decline, not a new source of truth.
+//
+// The element test is the three GROUP grammars at their homes (`nameIsArray` /
+// `nameIsParenSpanEnds` / `nameIsBraceSpanEnds`): a composite element is one that carries
+// its own bracket pair. A SCALAR-element list (`i32[]`, `f64[]`, `string[]`) is
+// deliberately NOT claimed — the cascade names every one of those correctly today, and
+// answering here would be a second spelling for a name that already has one.
+// The MODULE-scope `LetDecl` for `name`, or -1 — the top-level binding a generic call's
+// argument names when the call itself is at module scope. Declines outright inside a
+// function (`fnIx >= 0`): a function-scoped binding of the same name SHADOWS the global,
+// `parentLetOf` / `paramTypeNode` are the arms that answer there, and a global scan behind
+// them would answer for a name they deliberately declined.
+//
+// A flat scan of the top-level statement list, which is what module scope IS — no recursion
+// into a top-level `if`'s block (that binding is a start-function local, a different table),
+// FIRST-wins to match `parentLetOf`'s convention. `monoProgStmts` is set at
+// `monomorphize`'s entry, so it is populated for every caller of this.
+function monoGlobalLetOf(name: string, fnIx: i32) {
+  if fnIx >= 0 { return -1 }
+  let i = 0
+  while i < monoProgStmts.length {
+    const s = P.nodes[monoProgStmts[i]]
+    if s is LetDecl {
+      if s.letName == name { return monoProgStmts[i] }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+function monoCompositeListAnnName(name: string) {
+  if !nameIsArray(name) { return "" }
+  const elem = arrElemNameRaw(name)
+  if elem == "" { return "" }
+  if nameIsArray(elem) { return name }
+  if nameIsParenSpanEnds(elem) { return name }
+  if nameIsBraceSpanEnds(elem) { return name }
+  ""
+}
+
 export function monoArgTyName(ix: i32, fnIx: i32) {
   if exprIsClosure(ix, fnIx) {
     // A FUNCTION-VALUE argument pins its param as a CLOSURE (kind 14). The
@@ -309,6 +364,12 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
               // union NAME so the instance's param/return ride the union box. `isUName` covers a
               // registered inline union and a `type … = … | …` alias (both in `unNames`).
               if isUName(ltn) { return ltn }
+              // A COMPOSITE-ELEMENT list local (`xs: i32[][]`, `(i32|null)[]`, `{a:i32}[]`):
+              // the same annotation-is-the-truth rule, for the list spellings the cascade
+              // below either declines (`exprRefArray`, literal-only) or answers one
+              // dimension short (`exprArray`'s `i32[]` catch-all).
+              const rl = monoCompositeListAnnName(ltn)
+              if rl != "" { return rl }
             }
             if ld.letType < 0 && ld.letInit >= 0 {
               const innerTy = monoArgTyName(ld.letInit, fnIx)
@@ -326,6 +387,27 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
           const r = monoStructAnnName(pt.tyName)
           if r != "" { return r }
           if isUName(pt.tyName) { return pt.tyName }
+          // The composite-element list arm's PARAM twin — a generic body passing its own
+          // `xs: i32[][]` / `(i32|null)[]` parameter on to a second generic call.
+          const rl2 = monoCompositeListAnnName(pt.tyName)
+          if rl2 != "" { return rl2 }
+        }
+      }
+    }
+    // THE MODULE-SCOPE TWIN, and the SCOPE axis is why it is here rather than assumed.
+    // `parentLetOf` is function-scoped and every arm above sits behind `fnIx >= 0`, so a
+    // generic call whose argument is a top-level `const xs: i32[][]` reached NONE of them
+    // — the identical program moved into a `function main()` body did. It is scoped to the
+    // composite-element list question alone (not the struct / union arms above, which have
+    // their own module-scope story through the classifier tables) so the widening is
+    // exactly the names nothing else answers.
+    const gli = monoGlobalLetOf(argN.identName, fnIx)
+    if gli >= 0 {
+      const gd = P.nodes[gli]
+      if gd is LetDecl {
+        if gd.letType >= 0 {
+          const rg = monoCompositeListAnnName(tyNameOf(gd.letType))
+          if rg != "" { return rg }
         }
       }
     }
