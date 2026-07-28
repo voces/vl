@@ -1,0 +1,173 @@
+// @run
+// @hint Intentionally-unused parameter
+// ONE `type K = "a" | "b"` DECLARED ABOVE A UNION CALLBACK, and every un-annotated union
+// lambda in the file below it stopped working. Three lines are the whole repro — no
+// generics, no nesting, no collections:
+//
+//     type K = "a" | "b"
+//     function apply(f: (i32 | string) => i32): i32 { return f(1) }
+//     print(apply((_k) => 7))
+//   → vl check rc=0, clean; vl build rc=0; vl run → "wasm trap: cast failure"
+//
+// Move the `type K` line BELOW a `type V = i32 | string` and the identical program is
+// correct. The defect was the DECLARATION ORDER, which is why it reads as a curse on the
+// file rather than on the program: `emit_rewrite.synthParamAnnots` pinned an un-annotated
+// union param to `unNames[0]` — the FIRST declared union alias — and a litunion alias
+// registers in `unNames` beside the boxed ones. The arm's shortcut was sound for the set it
+// was written against ("every boxed union shares one `$uBox`, so ANY declared alias routes
+// emission identically") and `unNames` is simply a wider set than that sentence's "any":
+// a litunion reps as an INTERNED i32 ATOM, not the box. So the pinned param declared an i32
+// where the value call's `ref.cast` wanted the box.
+//
+// `unionParamPinName` now picks by the param's own REP — the first NON-litunion row for a
+// boxed param, the param's own spelling for a litunion one — and declaration order stops
+// being an input. Recorded as the union arm's open half by
+// `closure-nullable-param-lambda-pin.vl`, which carries the sibling `TyNullable` root and
+// the A/B above verbatim.
+//
+// THE GRID, 140 cells: declaration order (litunion first / value-union first / both, either
+// way / litunion + struct union, either way / neither) x the param's union kind
+// (`i32|string`, `i32|i64`, a struct union, an inline litunion, a litunion alias) x lambda
+// form (param unused / param used) x annotated-vs-bare. 102 of 140 built and ran correctly
+// on master; the 38 that did not are exactly the 38 whose emitted bytes this change moves,
+// and all 140 are correct after. Every annotated control and every already-correct bare cell
+// is byte-identical — including all 30 value-union-first bare cells, the swallow this fix
+// had to pass.
+//
+// FOUR OUTCOME CLASSES off the one pin, and which one a cell lands in is the lambda BODY:
+//   · the param UNUSED (`applyV((_k) => 1)`): the i32 param declared a functype the value
+//     call's `ref.cast` did not — a cast-failure TRAP.
+//   · the param USED (`applyV((k) => sinkV(k))`): the i32 also reached a box-typed callee
+//     parameter — INVALID WASM, "expected (ref $type), found i32".
+//   · through `.filter` / `.map` (`cats`, `tags`): a LOUD emit error rather than a bad
+//     module, and the arm's ORIGINAL use case — `xs.filter((a) => a is Cat)` is the call the
+//     shortcut was written for, and one `type K` above it took it out.
+//   · the INLINE litunion spelling (`applyI`): a trap in EVERY declaration order, including
+//     with no union declared at all, because `registerValueUnionName` declines an atom set —
+//     so `unNames` stayed EMPTY and the arm's own `unNames.length > 0` guard withheld the
+//     pin. That guard has moved into the selector, where "is a pin available" is a question
+//     only the boxed half has to ask.
+//
+// The MIRROR — a litunion-alias param behind a declared boxed union — is
+// `closure-litunion-param-pin-boxed-first.vl`. It cannot live here: one file has one
+// declaration order, and that IS the axis.
+//
+// STILL BROKEN, and deliberately absent below because it is a THIRD rep this selector cannot
+// yet name: a NULLABLE-litunion alias (`type N = "a" | "b" | null`) also registers an
+// `unNames` row, and its rep is neither the box nor the plain atom — it is the interned atom
+// with `-1` for null. Declared FIRST it is picked as the boxed pin and the module is invalid
+// wasm ("expected (ref $type), found i32"), on master and here alike; declare any boxed alias
+// above it and the identical program builds, so it is the same ORDER mechanism this file
+// pins:
+//
+//     type N = "a" | "b" | null
+//     function apply(f: (i32 | string) => i32): i32 { return f(1) }
+//     print(apply((_k) => 1))          → invalid wasm  (master AND here)
+//
+// It is left open rather than half-guarded because the exclusion cannot be spelled from what
+// the selector can see: the row's name is the ALIAS `N`, and its `unMemberSet` entry is the
+// emit-side WIDENED `string|null` — indistinguishable from the niche `type SN = string |
+// null`, which is correct and must keep working. Separating them needs the row's ARENA type
+// (`cUserTypes` + `tyIsNullableLitUnion`), which `typecheck.vl` does not export by name
+// today. A guard written on the member set was built and MEASURED INERT (it never fires),
+// so it was removed rather than shipped.
+
+type K = "a" | "b"
+type V = i32 | string
+type Cat = { c: i32 }
+type Dog = { d: i32 }
+type Pet = Cat | Dog
+// A value union with a litunion ARM: `registerValueUnionName` DOES register this one (the
+// alias arm rides the box as its member-string atom), so it is a legal boxed pin and the
+// selector must not confuse it with `K` — `nameIsLitUnionType` is false for it.
+type M = K | i64
+// A struct union with NO `type … = A | B` alias of its own: nothing registers under a name
+// for it, so the pin comes from the one-variant rows `Fox` / `Owl` register.
+type Fox = { f: i32 }
+type Owl = { o: i32 }
+
+function sinkV(_v: i32 | string): i32 { return 2 }
+
+function sinkW(_v: i32 | i64): i32 { return 4 }
+
+function sinkP(_v: Cat | Dog): i32 { return 6 }
+
+// ── the boxed param kinds, with the litunion sitting at `unNames[0]` ─────────────────────
+function applyV(f: (i32 | string) => i32): i32 { return f(1) }
+
+// @log 1
+print(applyV((_k) => 1))
+// @log 2
+print(applyV((k) => sinkV(k)))
+
+function applyW(f: (i32 | i64) => i32): i32 { return f(3) }
+
+// @log 3
+print(applyW((_k) => 3))
+// @log 4
+print(applyW((k) => sinkW(k)))
+
+function applyP(f: (Cat | Dog) => i32): i32 {
+  const p0: Cat = { c: 1 }
+  return f(p0)
+}
+
+// @log 5
+print(applyP((_k) => 5))
+// @log 6
+print(applyP((k) => sinkP(k)))
+
+// The litunion-ARM value union: master pinned `K` (row 0) and trapped; the row `M` is itself
+// the boxed pin the selector now finds.
+function applyM(f: (M) => i32): i32 { return f("a") }
+
+// @log 7
+print(applyM((_k) => 7))
+
+// The un-aliased struct union — the "" leg of the selector is NOT reached here, and that is
+// the measurement: `Fox` and `Owl` each register a one-variant row, so a boxed pin exists.
+function applyF(f: (Fox | Owl) => i32): i32 {
+  const q0: Fox = { f: 1 }
+  return f(q0)
+}
+
+// @log 8
+print(applyF((_k) => 8))
+
+// ── the two litunion SPELLINGS, which do not share a rep with each other ─────────────────
+// INLINE: `canonEmitTypeNames` softens it to `string`, so the pin must be `string` too.
+// Broken in every declaration order before, this one included.
+function applyI(f: ("a" | "b") => i32): i32 { return f("a") }
+
+// @log 9
+print(applyI((_k) => 9))
+
+// The declared ALIAS: preserved, and reps as the interned i32 atom. Already correct here
+// (`K` IS row 0), and it stays correct — by the param's own spelling now, not by the
+// coincidence that this file declares `K` first.
+function applyK(f: (K) => i32): i32 { return f("a") }
+
+// @log 10
+print(applyK((_k) => 10))
+
+// ── the arm's ORIGINAL use case: `is`-narrowing through a collection callback ────────────
+const pets: Pet[] = [{ c: 1 }, { d: 2 }]
+const cats = pets.filter((a) => a is Cat)
+// @log 1
+print(cats.length)
+const tags = pets.map((a) => a is Cat)
+// @log 2
+print(tags.length)
+
+// ── CONTROLS: the annotated twins, byte-identical across this change ─────────────────────
+// @log 1
+print(applyV((_k: i32 | string) => 1))
+// @log 2
+print(applyV((k: i32 | string) => sinkV(k)))
+// @log 5
+print(applyP((_k: Cat | Dog) => 5))
+// @log 10
+print(applyK((_k: K) => 10))
+const cats2 = pets.filter((a: Pet) => a is Cat)
+// @log 1
+print(cats2.length)
