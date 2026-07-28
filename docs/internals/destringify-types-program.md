@@ -30370,3 +30370,153 @@ tier), and the two fixtures carry in their headers what the directive cannot:
    `type A = {aName: string}; type B = {bNum: i32}; function go(t: A | B)` — is `emitProgram: ref
    valtype with no interned shape` on master for the DEFECT cell and for BOTH controls, so it is not
    this defect. It is why the fixtures spell their arms inline. Not investigated further here.
+
+## The COLLECTOR learns both narrow propagations — #1250's diagnosis applied and re-graded, and an independent second derivation of #1252's f32 cell-width rule (off master `173367f`)
+
+Two slices, two burdens: a fix whose burden is **a grid with controls plus a swallow measurement**,
+and a filing whose burden is **an anchor that survives being checked**. The second one turned out
+to be a *duplicate* — the anchor was checked, it refuted the filing it came from, and a concurrent
+slice had already reached the same refutation from the other side. That agreement is recorded here
+because it is the only evidence a merger can have that two halves of one family were fixed by one
+rule.
+
+### TASK 1 — `emit_collect`'s two missing narrow propagations
+
+#1250 diagnosed this to the line, applied both edits experimentally, reverted them (the file was
+outside its partition) and shipped the diagnosis plus an xfail pair. This slice applies them,
+re-grades from scratch on its own build, and graduates the pins. The edits are exactly the two
+#1250 named:
+
+* `collectLocals`'s statement loop gains `pushPostGuardNarrow(stmts[i], fnIx)` at the foot, with a
+  `narrowTop` save at block entry and a `restoreNarrow` before `scopePop` — the same save/restore
+  idiom `wasmEmit.emitStmts` and `emit_classify.blockHasStrOpScan` already carry;
+* `collectLocalsIf` gains the `setNarrowFromCondElse` save/restore pair around the else arm, so the
+  `else { … }` block and the `else if …` recursion are both walked under the complement narrowing —
+  mirroring `ifChainHasStrOp`, the structural sibling that has had both since it was written.
+
+**THE GRID — 600 cells**, the full cross product of #1250's four axes (narrow form 5 × binding form
+4 × field type 10 × scope 3), every red paired with its positive-narrow twin and its direct-use twin.
+
+| verdict | master `173367f` | with the two edits |
+|---|---:|---:|
+| correct | 501 | **585** |
+| invalid wasm (`vl check` clean) | 51 | 15 |
+| loud reject | 48 | **0** |
+
+**84 cells forward, 0 backward.** The 15 that remain are `direct` + `string | null` in all five
+narrow forms × all three scopes — **including the POSITIVE-narrow row**, so their control is red
+too: a pre-existing coalesce gap, not this defect and not reachable by this fix.
+
+The four readings #1250 predicted all reproduce: the `!` is not the cause (the complement spelling
+is red in every cell the negated one is); the `plain-else` row is red and only the else-arm
+propagation reaches it; the scalars are green by accident (an i32 default is the right slot for
+`i32`/`boolean`, and `letIsArray`/`letIsF64` resolve without the narrowing stack); and the
+annotation flips sign across field types (`const nm: string = …` was always green, `const nm:
+{b: i32} = …` was red).
+
+#### WHAT IT SWALLOWS — measured on the shapes the new propagations newly REACH
+
+`pushPostGuardNarrow` is not only the guard: it also carries **assignment narrowing** over
+null-bearing value unions, and the else-arm push now fires on every `if`/`else` the collector walks.
+So the swallow grid is 41 cells over exactly those shapes — value unions (`i32|string`, `i32|null`,
+`string|null`, `boolean|null`, `f64|null`) × {divergent guard + bind · assignment-narrow + bind ·
+else-arm bind · `else if` chain bind · **positive narrow (control)** · two guards in sequence ·
+a guard inside a nested block with a bind AFTER it (a depth-LEAK probe)} plus non-union controls
+(`i32`/`string`/`i32[]` bound under a guard that narrows nothing).
+
+**17 more cells invalid-wasm → correct, 0 backward, every control byte-identical.** The leak probe
+is the load-bearing one: `s7_leak_*` binds inside a guarded nested block AND again outside it, and
+both bindings are correct on the new compiler — the restore does not leak the narrowing past the
+block. The one remaining reject (`print` of an un-narrowed `i32 | string`) is unchanged.
+
+| instrument | reading |
+|---|---|
+| **six-channel corpus A/B**, 1,562 files, baseline = master `173367f` (sha256 `48dcbe26…`) | **field 5 (BYTES) `same` on ALL 1,562.** Exactly 2 rows move — the two graduated fixtures, BUILDRC 1→0 + BUILDMSG + RUNRC 1→0. Fields 1/2 all `same`. |
+| **fuzz A/B**, 9 legs (seeds 101/202/303 × depths 4/5/6, 150 each) | 1,350 programs per side, **0 legs differing**. |
+| byte delta | 1,044,088 → 1,044,178 = **+90 B** |
+
+The fuzz A/B is honestly a **no-regression signal only**, and the reason is checkable rather than
+asserted: `scripts/fuzzgen.vl`'s only narrowing vocabulary is `if <x> is T { <read> } else {
+print("OTHER") }` (kind 6, `guardCond`) — a POSITIVE narrow whose else arm never reads the union and
+never binds. It cannot generate a divergent guard, and it cannot generate a binding in an else arm,
+so it cannot reach the fixed region at all. It does exercise the new `setNarrowFromCondElse` push on
+those else arms, which is worth something; it is not a hit-detector.
+
+The xfail pair graduates to `@run` pins. The string one gains a FOURTH defect function —
+`plainElseBind`, `if t is Other { print(9) } else { … }`, no `return` anywhere — because the three
+it had were all reachable by the else-arm half OR the guard half, and a file that a
+one-propagation fix can pass is not a pin for a two-propagation bug.
+
+### TASK 2 — DROPPED as a duplicate of #1252, and the two derivations AGREE
+
+This cycle's second task was #1246's filing: "`exprIsF64` is asked before `exprIsF32` in the
+un-annotated cell-kind ladders — `emit_classify.vl:9560-9563` (`globalCellKind`'s init fallback) and
+the local twin at `emit_collect.vl:1703`". #1252 fixes it. Nothing of it ships here. What is worth
+recording is that the two derivations were independent and reached the **same rule and the same
+line**, including the same correction to #1246's anchor.
+
+**#1246's LOCAL anchor is wrong, and both slices found it separately.** `emit_collect.vl:1703` at
+#1246's own commit (`34ac8083`, checked out and read rather than inferred) is
+`} else if letIsF32(stmts[i]) || letInfersF32(stmts[i], fnIx) {`, sitting **eleven lines ABOVE**
+`} else if letIsF64(stmts[i], fnIx) {`. The local collector already asks the f32 question first, in
+its full form, and it produces the **correct** cell. There is no ordering defect in `emit_collect.vl`
+and there never was.
+
+**The two halves are MIRROR IMAGES, not the same code twice** — read off the disassembly of the same
+source line at the two scopes on master `173367f`:
+
+| scope | cell | init | reader | who disagrees |
+|---|---|---|---|---|
+| module `let g = f32fromBits(N) * 1.0` | `(mut f64)` | `f32.mul` + `f64.promote_f32` | `__print_f32__` | the **CELL** (and with it the init, which `emit_sections.vl:1106` drives FROM the cell kind) |
+| function `let g = f32fromBits(N) * 1.0` | `(local f32)` — **correct** | `f32.mul` + `f64.promote_f32` | `__print_f32__` — correct | the **INIT**, alone |
+
+So the rule is one rule with two different edits, and a reorder is only available at module scope.
+At function scope the init's f32 question is being asked in the wrong FORM: `wasmEmit.vl:11512`
+re-derives it with `letIsF32(stmtIx)` — **annotation-only** (`emit_query.vl:934`, one argument, no
+`fnIx`) — and falls through to `letIsF64`, which claims the expression via its float literal.
+
+Derived here experimentally (built, measured, reverted, `wasmEmit.vl` being another partition), the
+local edit was `} else if letIsF32(stmtIx) || letInfersF32(stmtIx, fnIx) {`. **#1252 ships that line
+character-for-character**, and its `globalKind` change is the reorder this slice predicted for the
+module half. Two derivations, one line, no coordination — that is the cross-check the merger needs
+and it costs nothing to state.
+
+The independent grid, kept only as corroboration (130 cells: init shape 10 × binding 4 {`let` ·
+`const` · `: f32` control · `: f64` control} × scope 3 {function · nested `if` · `while` body}, plus
+a lambda-value cell per init shape): **12 invalid-wasm → 0, 0 backward**, each fixed cell's printed
+value matching BOTH its `: f32` and `: f64` control. Three readings #1252's own 448-cell grid should
+agree with:
+
+1. **The trigger is the float LITERAL operand, not f32 arithmetic.** `fv + fv` (f32 var + f32 var)
+   is green in every binding, every scope. `fv * 1.0` and `f32fromBits(N) * 1.0` are the only two
+   red init shapes.
+2. **Both annotations are controls, and both are green.** `: f32` pins the slot; `: f64` makes the
+   promote consistent. Only the un-annotated bindings are red — which is why the local half is
+   `letInfersF32`-shaped: it is the inference, not the ordering, that the init path never learned.
+3. **Scope is inert**, and the "lambda" level of the axis is **unreachable**: VL's arrow lambdas are
+   expression-bodied (`function(...)` is a parse error — "anonymous functions use arrow syntax"), so
+   a lambda holds no binding and has no local cell-kind decision to get wrong. A brief that lists
+   `function/lambda/nested` as a scope axis is listing one level that cannot exist.
+
+### WHAT THESE SLICES FOUND WRONG
+
+1. **#1246's local anchor is wrong** — file, line and rule. `emit_collect.vl:1703` is the line that
+   ALREADY applies the rule #1246 says is missing there; the real local site is `wasmEmit.vl:11512`,
+   in a different partition, and the edit is not a reorder. The anchor was inferred from the global
+   half's shape instead of read off the local half's disassembly. Two slices re-derived it
+   independently and both landed on the same line, which is what makes this a correction rather than
+   a second opinion.
+2. **"The GLOBAL half and the LOCAL half of one family" is the wrong model here.** They share a
+   symptom and a rule and nothing else: at module scope the cell is wrong and the init follows it;
+   at function scope the cell is right and the init is wrong. A merger checking that two PRs used
+   the same ordering rule must check the RULE, not the diff shape — the diffs cannot match.
+3. **#1250's cell counts are low, in a way that does not change its verdict.** Its 440 is the same
+   four axes enumerated here at 600; its "20 string cells" are 24 (2 bindings × 4 non-positive
+   narrow forms × 3 scopes) and its "5 pre-existing red-with-red-control" are 15 (the same 5 at each
+   of the three scopes). Every qualitative claim it made reproduced exactly, including the one that
+   mattered — all cells go green except the ones whose control is already red.
+4. **The corpus is blind to the f32 fix and loud on the narrow fix**, on the same 1,562 files. Task
+   1 moves two rows (its own fixtures) and holds BYTES identical on all 1,562; the f32 edit moves
+   nothing at all on any of the six channels. Two emitter fixes of the same size in the same week
+   with opposite corpus profiles — the instrument ranks nothing, which is why the fixture is the
+   inverted control every time.
