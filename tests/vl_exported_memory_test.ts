@@ -204,6 +204,51 @@ export function sumBytes(base: i32, n: i32): i32 {
   },
 });
 
+Deno.test({
+  name: "exported-memory: the host sees NARROW stores byte-for-byte",
+  ignore: !ENABLED,
+  fn: async () => {
+    // `__store_i8__` / `__store_i16__` write 1 and 2 bytes. A guest-side round trip
+    // through `__load_u8__` proves the value; only the HOST can prove the WIDTH,
+    // because the emulation these replaced (a read-modify-write over the containing
+    // i32 word) passed every guest-side expectation while touching four bytes. The
+    // host reads the untouched neighbours here, which is the assertion that
+    // distinguishes the instruction from its stand-in.
+    const { exports } = await runWasm(await build(`
+export function poke(base: i32): i32 {
+  __store_i8__(base, 171)
+  __store_i16__(base + 4, 48879)
+  __store_i16__(base + 11, 4660)
+  base
+}
+__store_i32__(0, 1)
+print(__load_i32__(0))
+`));
+    const mem = exports.memory as WebAssembly.Memory;
+    // Pre-paint sixteen bytes from the HOST, so "untouched" is a value, not a zero.
+    const pre = new Uint8Array(mem.buffer, 256, 16);
+    pre.fill(0x5a);
+
+    (exports.poke as (b: number) => number)(256);
+
+    const after = new Uint8Array(mem.buffer, 256, 16);
+    assertEq(
+      [...after],
+      [
+        0xab, 0x5a, 0x5a, 0x5a, // one byte written, three neighbours survive
+        0xef, 0xbe, 0x5a, 0x5a, // 0xBEEF little-endian, two neighbours survive
+        0x5a, 0x5a, 0x5a, 0x34, // 0x1234 STRADDLING the 12-byte word boundary…
+        0x12, 0x5a, 0x5a, 0x5a, // …low byte at 11, high byte at 12
+      ],
+      "the host sees exactly 1 and 2 bytes change per narrow store",
+    );
+    // And the little-endian byte order agrees with a DataView's own reading.
+    const dv = new DataView(mem.buffer);
+    assertEq(dv.getUint16(260, true), 0xBEEF, "host reads the halfword the guest wrote");
+    assertEq(dv.getUint16(267, true), 0x1234, "…including the unaligned, straddling one");
+  },
+});
+
 // ── 3. THE DETACHMENT HAZARD, asserted rather than described ────────────────
 
 Deno.test({
