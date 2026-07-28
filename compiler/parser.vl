@@ -1219,9 +1219,19 @@ function parseLet() {
 // A struct type declaration. Each field is `IDENT ":" type` (the `type` reuses the
 // single-name `parseType`); fields are comma-separated with a tolerated trailing
 // comma. Returns a `TypeDecl` whose `tdFields` are the `FieldDef` indices in order.
-function parseTypeDecl() {
-  const p0 = peekTok().start // the `type` keyword
-  advance()                  // "type"
+// `flatAt` is the source offset of a preceding `flat` modifier (webcraft P1.2), or
+// -1 when there is none. It doubles as the declaration's POSITION when present, and
+// that is load-bearing rather than cosmetic: the formatter reprints a type
+// declaration from a VERBATIM SOURCE SLICE starting at `pos` (`emitTypeOrUnionDecl`
+// → `sliceNode`), so a `pos` left on the `type` keyword would put `flat` outside the
+// slice and `vl fmt` would SILENTLY DELETE IT — turning a checked layout back into a
+// plain record. `exportPrefix` still recovers a preceding `export` correctly,
+// because it reads the token immediately before `pos` and that is now the `flat`.
+function parseTypeDecl(flatAt: i32) {
+  let p0 = peekTok().start // the `type` keyword
+  if flatAt >= 0 { p0 = flatAt }
+  const isFlat = flatAt >= 0
+  advance()                // "type"
   let name = ""
   let nameTok = -1
   if peekKind() == "IDENT" {
@@ -1272,7 +1282,7 @@ function parseTypeDecl() {
     )
     const bodyless: i32[] = []
     bodyless.push(-1)
-    const blix = mkTypeDecl(name, bodyless, p0, 0)
+    const blix = mkTypeDecl(name, bodyless, p0, 0, 0)
     mkDeclNameTok(blix, nameTok)
     return blix
   }
@@ -1346,6 +1356,7 @@ function parseTypeDecl() {
       more = peekKind() == "PIPE"
     }
     P.pos = endTok
+    if isFlat { flatNeedsRecord(name, nameTok) }
     const uix = mkUnionDecl(name, variants, p0, isNew)
     setUdTs(uix, vroots)
     mkDeclNameTok(uix, nameTok)
@@ -1456,15 +1467,36 @@ function parseTypeDecl() {
       umore = peekKind() == "PIPE"
     }
     P.pos = endTok2
+    if isFlat { flatNeedsRecord(name, nameTok) }
     const u2ix = mkUnionDecl(name, variants, p0, isNew)
     setUdTs(u2ix, vroots2)
     mkDeclNameTok(u2ix, nameTok)
     return u2ix
   }
   P.pos = afterBrace
-  const tdix = mkTypeDecl(name, fields, p0, isNew)
+  let flatMark = 0
+  if isFlat { flatMark = 1 }
+  const tdix = mkTypeDecl(name, fields, p0, isNew, flatMark)
   mkDeclNameTok(tdix, nameTok)
   tdix
+}
+
+// `flat` on a body that is not a `{ … }` record. Reported HERE, at the syntactic
+// fork that decides the declaration form, because that is where the fact is: a
+// scalar alias, a union and an intersection do not have a layout, so there is
+// nothing for the checker to measure and no reason to carry the marker onto a
+// `UnionDecl`. Recovery is total — the declaration is parsed as the ordinary
+// non-flat alias it would otherwise be, so nothing cascades.
+function flatNeedsRecord(name: string, nameTok: i32) {
+  P.diags.push(
+    {
+      msg: "a `flat` type needs a record body — write `flat type " +
+        name +
+        " = { field: i32, … }`, or drop `flat`",
+      at: nameTok,
+    },
+  )
+  0
 }
 
 // `IDENT (":" type)?`
@@ -2101,7 +2133,23 @@ export function parseStmt() {
   const k = peekKind()
   if k == "LET" || k == "CONST" { return parseLet() }
   if k == "FUNCTION" { return parseFunc() }
-  if k == "TYPE" { return parseTypeDecl() }
+  if k == "TYPE" { return parseTypeDecl(-1) }
+  // FLAT RECORD (webcraft P1.2): `flat type TValue = { … }`. `flat` is a CONTEXTUAL
+  // keyword — it stays a legal identifier everywhere else in the language — and the
+  // guard here is EXACT rather than heuristic, because `type` is a hard lexer
+  // keyword: an IDENT followed by the `type` keyword is not a legal statement in VL
+  // under any parse. Verified on master, where `flat type X = { … }` parses as the
+  // expression statement `flat` plus the declaration and dies at
+  // `undeclared identifier 'flat'`. So the widening is TOTAL — every token sequence
+  // this newly accepts was previously a hard error — and no existing program can
+  // change meaning. `docs/internals/flat-records-design.md` §1.
+  if k == "IDENT" && kindAt(P.pos + 1) == "TYPE" {
+    if peekTok().text == "flat" {
+      const flatAt = peekTok().start
+      advance() // "flat"
+      return parseTypeDecl(flatAt)
+    }
+  }
   if k == "IF" { return parseIf() }
   if k == "WHILE" { return parseWhile("") }
   if k == "FOR" { return parseFor("") }
