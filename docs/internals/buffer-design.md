@@ -1702,6 +1702,12 @@ bracket buys spelling, and spelling only.
     Which means `drwSelfFnOf(n.binOp, 2)` at `emit_rewrite.vl:281`, the binary-operator arm of
     exactly this mechanism, **is unreachable dead code today**: no function can be *named* an
     operator, so the lookup can never hit.
+
+    > **CORRECTION (B14).** The premise holds and the conclusion does not. `isOpFuncName` has always
+    > accepted the operator SYMBOL tokens, so `function +(self: V, b: V)` parses and runs
+    > (`tests/cases/objects/operator-self-method.vl` pins it) and the arm was live the whole time.
+    > Only the BRACKET operators lacked a spelling, because `[` and `]` open an index expression
+    > everywhere else. B14 adds a QUOTED name form, which serves both.
   - `checkIndexNode` (`typecheck.vl:19154-19175`) has no arm for it; its `TyObj` case consults a
     `"[]"` FIELD and nothing else.
   - **Module-merge mangling.** The UFCS path launders the property through `ufcsAliasOf`
@@ -1709,6 +1715,13 @@ bracket buys spelling, and spelling only.
     The operator arm at :281 uses the RAW name with no such laundering — so a `"[]"` provided by
     **std** would not be found across the merge, which is exactly and only the case P1.1 needs. This
     is why route 2 is a language feature to design, not a views feature to bolt on.
+
+    > **RULED (B14).** The diagnosis is right — a cross-module `+` is measurably broken on master
+    > and stays broken — but it does NOT transfer to the bracket, and the reason is structural: a
+    > UFCS call site carries a property STRING the merge deliberately leaves plain, which is what
+    > creates the plain→mangled gap, whereas **a bracket names nothing**. B14 keys its operator
+    > registry off the MERGED program's declarations, so the mangled name is the only name it ever
+    > holds and no alias is needed. `index-operator-design.md` §R4.
 - **Route 3 — a nominal hook keyed on the type name `F32View`.** It would be the first nominal thing
   in the language, and it does not survive its own first question: `structNameOfTy`
   (`typecheck.vl:6890`) maps ANY declared struct to its name and knows nothing about std, so a
@@ -1725,10 +1738,20 @@ every user type at once, makes the dead operator arm reachable, and costs `std:b
 tiny functions. It is not on P1.1's critical path, because the kernel ergonomics P1.1 is actually
 after are available today at `x.getF32(i)` with identical codegen.
 
+> **TAKEN.** B14 shipped route 2, with two of the three "blockers" ruled differently than filed
+> above (the arm was never dead; the merge needed no alias). The one thing this plan did not
+> anticipate is what actually decided the design: `std:buffer` has TWO view types in ONE module, and
+> a second `function "[]"` is a redeclaration — so an index operator's DECLARATION NAME carries its
+> receiver (`[]@F32View`) and dispatch is by the receiver's type. `index-operator-design.md`.
+
 One consequence to design in when it is taken: `x[i] += vx[i]` desugars in the PARSER to
 `x[i] = x[i] + vx[i]` sharing one target node (`ast.vl:716-735`), so the receiver and index are
 evaluated TWICE under any dispatch route. Harmless for a local and an induction variable; not
 harmless for `x[f()] += 1`.
+
+> **MEASURED (B14).** This is already the behaviour of a NATIVE array — `a[idx()] += 10` calls
+> `idx()` twice — so the bracket inherits an existing rule rather than introducing one, and the
+> operator route was shipped consistent with it rather than fixed against it.
 
 ### L6. What the corpus pins
 
@@ -1829,6 +1852,15 @@ touched by it — `std:buffer` uses no closure fields.
    ```
    Both the raw read and the read back through `"[]"` answer 0. The write dispatches (or does not)
    silently; no diagnostic, no trap.
+
+   > **STALE — does not reproduce (re-measured at B14, master `eb9e05ca`).** That exact program
+   > prints **11**, the value it wrote. Whatever this described is either since fixed or was
+   > mis-measured; it is kept here as a record of the claim, not of a live defect. Defect 1 above
+   > DOES still reproduce, unchanged.
+   >
+   > A third, seen while re-measuring these two: `v[0] += 3` on the SAME closure-field trap TRAPS
+   > (`wasm trap: cast failure`) — on master and unchanged by B14. The free-function route handles
+   > the same spelling correctly, so the two index routes now differ on compound assignment.
 
 Neither was narrowed further — they are outside this slice's partition and outside its surface.
 They matter to record because route 1 is the obvious "zero compiler lines" way to reach for `x[i]`,
