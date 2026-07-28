@@ -30735,9 +30735,47 @@ Every rc taken BARE, never through a pipe.
    there is nothing to ask. Zero comes from the SOURCES change (hand the consumer a `tyIx`),
    not from another home.
 
-**With W1-W8 now closed or explicitly filed, the ROUTING phase of this programme is DONE.**
-What is left is 42 design-blocked sites and a ~60-site floor that only the typed-IR endgame
-moves.
+**With W1-W8 now closed or explicitly filed, the ROUTING phase of this programme is DONE** for
+the families #1239 enumerated. It found one more.
+
+### **W14 — the FIELD-COLON cut. A NEW family, ten writings, and the census scored it TWO.**
+
+Turned up while re-verifying that no W2/W4-shaped `.slice` remained in the partition. Every
+inline-shape parser splits a field `name:type` at its colon INDEX, and five functions write
+that pair out by hand:
+
+| file · function | NAME half | TYPE half | guard |
+|---|---|---|---|
+| `emit_base.annObjFieldSplit:2544` | `X.slice(0, ci)` | `X.slice(ci + 1, X.length)` | `ci <= 0` |
+| `emit_base.vl:2610` | `X.slice(0, ci)` | `X.slice(ci + 1, X.length)` | `ci <= 0` |
+| `emit_classify.shapeFieldParse:8316` | `X.slice(0, ci)` | `X.slice(ci + 1, X.length)` | `ci < 0` |
+| `typecheck.nameToTyReal:5881` | `X.slice(0, colonAt)` | `X.slice(colonAt + 1, X.length)` | `colonAt > 0` |
+| `typecheck.canonShapeName:7110` | **`X.slice(0, colonAt + 1)`** — keeps the colon | `X.slice(colonAt + 1, X.length)` | `colonAt >= 0` |
+
+**Ten writings in five functions across three modules — all three in this cycle's partition,
+all three already importing `tyname`.** The census's copies table scored this "2 |
+`X.slice(colonAt + 1, X.length)` (field TYPE after `:`) | typecheck x2": it saw one half, in
+one module, because the other three modules spell the index `ci` instead of `colonAt` and its
+normalisation abstracted the receiver but not the INDEX VARIABLE's name.
+
+Two properties make it a textbook member of this programme's shape:
+
+* **The NAME half has a sixth spelling that keeps the delimiter** (`slice(0, colonAt + 1)`),
+  which is the endpoint-normalisation trap #1250 recorded costing W1 a site twice, now at a
+  family the census had not opened.
+* **Four different guards** in front of one operation (`ci <= 0`, `ci < 0`, `colonAt > 0`,
+  `colonAt >= 0`), so the cut must be delimiter-blind exactly as `groupInnerOf`,
+  `gaeArgsTextOf` and `fnRetTextOf` are.
+
+**FILED, NOT ROUTED.** The commissioning brief scoped this slice to W2/W3/W4/W7/W8, and taking
+an unrequested sixth family would put a un-briefed change under the same gate. The route is
+two homes (`fieldNameOf(field, ci)` / `fieldTypeTextOf(field, ci)`, index passed in, guards
+left at the sites), ten one-line substitutions, and by W2's and W4's measured rate it should
+read roughly **−1,000 to −1,400 B** — a prediction the next slice can check rather than a
+promise. It is the largest routable family left anywhere in the census.
+
+What is otherwise left is 42 design-blocked sites and a ~60-site floor that only the typed-IR
+endgame moves.
 
 ### WHAT THIS SLICE FOUND WRONG
 
@@ -30757,11 +30795,16 @@ moves.
 5. **The census OVER-counts as well as under-counts.** Every previous correction in this family
    moved the number up. W8 moves it down (5 → 2 routable), and `driver.modTypeRenamed` is
    double-counted across W3 and W8 on two different characters of the same walk.
-6. **`base71.wasm`, the baseline the brief named, is not master `17eb646`.** It is 1,044,088 B;
+6. **There is a family the census never opened: W14, the FIELD-COLON cut, 10 writings in 5
+   functions.** It scored 2, in one module, because its normalisation abstracted the receiver
+   but not the INDEX VARIABLE's name — `ci` in three modules, `colonAt` in the fourth. It is
+   now the largest routable family left, and it was found by re-verifying a NEGATIVE (that no
+   W2/W4-shaped slice remained), not by running the census again.
+7. **`base71.wasm`, the baseline the brief named, is not master `17eb646`.** It is 1,044,088 B;
    master's compiler is 1,044,688 B, and they differ by far more than the transposed digits
    suggest (sha256 `48dcbe26…` vs `1b55fcbb…`). Every A/B here is against a baseline rebuilt
    from master's own source. A shared-scratchpad artifact is not a substitute for rebuilding
    the baseline.
-7. **`vl fmt <file>` prints to stdout; it does not rewrite the file.** There is no `--write` and
+8. **`vl fmt <file>` prints to stdout; it does not rewrite the file.** There is no `--write` and
    no `--stdout`, and `vl fmt --check` takes exactly one path per run. `scripts/lint-self.sh` is
    the only in-repo record of the calling convention.
