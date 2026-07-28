@@ -29483,3 +29483,26 @@ measurement.
 **STILL OPEN on this route:** a `LetDecl` inside a generic function body carries the same hazard
 and is not banked (`monoSubstLetType` reads the arena directly). No consumer needed it yet, and a
 bank entry with no consumer is a claim the checker cannot check.
+
+### D-CANONGENAPP — the argument position canon never reached (#TBD)
+
+`canonEmitNameAt` had a union arm, an intersection arm, an array arm, a paren arm, a
+function-type arm, a literal arm and an inline-shape arm. It had **no generic-APPLICATION arm**,
+so the argument position was the one place in an annotation the emitter's vocabulary never
+reached. `type Nm = string` + `type Box<T> = {v: T}` + `Box<Nm>` was `vl check` rc=0 — the checker
+resolves `Nm` through its own registry and reports `{v: string}` — and invalid wasm: the name
+arrived at `gaeEnsure` still spelling `Nm`, `gaeApplyFieldTy` substituted that TEXT verbatim, and
+the field was recorded as `Nm`, a name `collectU` had registered as a one-member `UnionDecl`. The
+field interned as a union BOX while every read lowered as the string it is.
+
+Swept over 9 alias-body kinds (string / i32 / i64 / f64 / f32 / boolean / `i32[]` / `0|1` /
+declared struct) against the identical program with the argument written CONCRETELY: **8 of 9
+invalid wasm, all 9 controls CORRECT.** The one green row is the declared struct — a name canon
+does not rewrite. **D-GAERAWFIELD's residue table recorded the control as also invalid wasm; it is
+not, and that mis-sorting is what kept this filed as a symmetric pre-existing gap rather than as a
+live defect.**
+
+The HEAD is deliberately not canon'd: it names a generic alias DECLARATION and the emitter's
+registry is keyed by that declared name. Corpus A/B on six channels: 2 of 1,544 files differ, both
+on emitted BYTES only with identical check/build/run outcomes — and both got SMALLER, which is the
+expected shape of two spellings of one type collapsing onto one intern key.
