@@ -1,0 +1,77 @@
+// @run
+// @log v
+// @log null
+// @log v
+// @log null
+// @log v
+// @log null
+// @log null
+// @log v
+// @log null
+// @log xy
+// @log v
+// CONTRACT (must-RUN): `print(m[k])` — a BARE read (no `?? default`) over a STRING-valued map,
+// which the checker types `string | null` and the emitter lowers through `emitPrintNulString`.
+//
+// The two ends of ONE decision have to ask the SAME question. The print HANDLER's ladder is
+// `exprIsLitAtom` → `exprNullableString` → `exprNulBool` → `exprString`; the SCRATCH-FRAME
+// RESERVATION scan (`exprHasStrOp`'s print arm) asked only `exprString` + `exprIsLitAtom`. And
+// `exprNullableString` is strictly WIDER: it claims a bare read over a `{[string]: string}` /
+// `{[string]: string | null}` map, and a call of a function whose return INFERS `string | null`
+// — two shapes neither of the other two predicates sees. Where the handler claimed a value the
+// scan did not, the 7-slot string frame was never reserved, and `emitPrintNulString`'s
+// `local.set strScratchBase + 0` wrote a `(ref $strArray)` into a local declared
+// `(ref $mapStruct)`: INVALID WASM with `vl check` rc 0 — silent, because `vl check` is blind
+// to the emitter.
+//
+// The probe that pinned it as a RESERVATION miss and not a lowering bug: adding ONE unrelated
+// string op to the same function (`print("x" + "y")`) reserved the frame and the identical
+// print then ran — so the bottom of this file keeps a cell of each, and they must agree. The
+// i32/f64/i64/f32-valued twins are CLEAN CHECKER REJECTS ("print of a union value (i32?) …"),
+// so the string leaf is the only one that reaches emit at all, which is why this hid.
+
+// MODULE SCOPE (the start function) — a hit renders the string, a MISS renders `null`.
+const g: {[string]: string} = Map()
+g["k"] = "v"
+print(g["k"]) // v
+print(g["zz"]) // null
+
+// A NULLABLE-string VALUE map (`{[string]: string | null}`) rides the same rep: a stored null
+// and a missing key are both `null`, a stored string renders.
+const n: {[string]: string | null} = Map()
+n["k"] = "v"
+n["n"] = null
+print(n["k"]) // v
+print(n["n"]) // null
+
+// FUNCTION scope — the same read inside a body, whose frame is reserved by `fnHasStrOp`.
+function inFn() {
+  const m: {[string]: string} = Map()
+  m["k"] = "v"
+  print(m["k"]) // v
+  print(m["zz"]) // null
+}
+inFn()
+
+// The INFERRED-RETURN shape: `pick` has no `: string | null` annotation, so only
+// `exprNullableString`'s call arm (`fnRetNulString` over the collected return kind) claims
+// `print(pick(...))` — `exprString` does not. Reserved in the CALLER, where the print is.
+function pick(k: string) {
+  const m: {[string]: string} = Map()
+  m["k"] = "v"
+  return m[k]
+}
+print(pick("zz")) // null
+print(pick("k")) // v
+
+// The two cells the decisive probe compares: with an unrelated string op present the frame was
+// always reserved and the print always ran, so this arm passed on master too. It stays as the
+// CONTROL — the arm above it and this one must render identically.
+function withOtherStrOp() {
+  const m: {[string]: string} = Map()
+  m["k"] = "v"
+  print(m["zz"]) // null
+  print("x" + "y") // xy
+  print(m["k"]) // v
+}
+withOtherStrOp()
