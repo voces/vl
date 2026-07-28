@@ -1278,3 +1278,188 @@ so no sabotage could reach the seed, and the seed's sha256 is unchanged across t
    per-access call under a hot loop", which it said "can only be taken after S5". There is now a
    kernel to write it against, and it is the number that decides O1(b) (compiler-known `Buffer`
    methods) versus leaving O1(c) as the permanent answer.
+
+---
+
+## K. What shipped: S3's narrow half + S6 — and P0.1 closes
+
+Appended to §J, which is appended to §I, §H and §A–§G; nothing before it is rewritten. Where a number
+here disagrees with one above, this section is the later measurement.
+
+Measured on a tree at master `e091f4e9`, against a seed FETCHED from the published `seed-latest`
+release — `sha256 84657bd0…`, which is byte-identical to master's compiler, so the A/B baseline and
+the seed are the same artifact and the bootstrap ladder is proven rather than assumed.
+
+### K1. The slice: four intrinsics, and every `std:buffer` emulation deleted
+
+| | before | after |
+| --- | --- | --- |
+| `__store_i8__` / `__store_i16__` | undeclared — `undeclared identifier` | `i32.store8` (0x3a) / `i32.store16` (0x3b) |
+| `__memory_copy__` / `__memory_fill__` | undeclared | `memory.copy` (fc 0a 00 00) / `memory.fill` (fc 0b 00) |
+| `std:buffer` `store8` | read-modify-write over the containing word | one instruction |
+| `std:buffer` `store16` | two byte-wide read-modify-writes | one instruction |
+| `std:buffer` `fill` | a byte loop | one instruction + a `len > 0` guard |
+| `std:buffer` `copyFrom` | a byte loop that CHOSE its direction | one instruction + a `len > 0` guard |
+
+Verified by disassembly, not by reading the table:
+
+```
+0xa5 | 3a 00 00    | i32_store8  memarg:MemArg { align: 0, max_align: 0, offset: 0, memory: 0 }
+0xa5 | 3b 01 00    | i32_store16 memarg:MemArg { align: 1, max_align: 1, offset: 0, memory: 0 }
+0xbe | fc 0a 00 00 | memory_copy dst_mem:0 src_mem:0
+0xa6 | fc 0b 00    | memory_fill mem:0
+```
+
+`0xfc` is the emitter's FIRST misc-prefix opcode — every prefixed instruction it wrote before this
+was `0xfb`, the GC prefix. The trailing zeros are memory INDEX immediates (one for `fill`, two for
+`copy`, destination first), not flags. `fbMemBulk` writes them.
+
+**This closes P0.1, and with P0.2 (§H3), P0.3 and P0.4 (#1161, re-measured here: all four bitcasts
+and all nineteen opcode intrinsics lower and answer correctly against python's own encodings),
+webcraft's entire P0 is shipped.** Nothing in P0 is outstanding on the compiler side.
+
+### K2. The scan-membership question, answered structurally
+
+§I1's discipline was "a width missing from any one list is a silent wrong answer". The census before
+touching anything: `__store_i32__` is enumerated in four files — typecheck (declaration +
+reservation), wasmEmit (opcode table, align table, emit arm, `drop` suppression), emit_sections
+(the memory-forcing scan), emit_classify (the tail-value classifier).
+
+The finding is that **three of those four are already membership-driven, not spelling-driven**. They
+ask `nameIsMemStoreIntrinsic`, so the narrow pair joined all three by joining ONE list, and the only
+file needing real work was the emitter that must pick different bytes. That is the design §I1 left
+behind working as intended, and it is why this slice's narrow half is small.
+
+The bulk pair had no such list, so it got one — `nameIsMemBulkIntrinsic`, added at all four sites in
+the same commit. Neither pair spent a day declared-but-unlowered, which is the window that creates a
+shadowing hatch (§I3): they are reserved at the definition from their first commit, and
+`store-narrow-width-user-definition-reserved.vl` / `bulk-op-user-definition-reserved.vl` say so.
+
+One place the narrow pair is NOT like the wide three: their VALUE operand is an i32, so it takes the
+ordinary `emitMemIntrinArg` spine rather than an `emitExprAs{I64,F32,F64}` widening. The wide arm's
+dispatch ended in an `else` that meant f64; a narrow name added to the list and forgotten there would
+have put an f64 operand under an i32 opcode. `memStoreValueIsI32` makes that a two-way choice over a
+total predicate instead. Sabotaging it back is one of §K5's rows, and it reddens six fixtures.
+
+### K3. What is NOT the same as the loops it replaced
+
+Two behaviour deltas, both real, both handled — and the second is the one a "pure optimization"
+framing would have missed:
+
+1. **The access WIDTH is now the instruction's.** The `store8` emulation touched 4 bytes where the
+   instruction touches 1. §J5 argued that was unobservable from VL (no threads, no shared memory)
+   and it was right — but it is observable from the HOST, through the exported memory. That
+   assertion now exists (`tests/vl_exported_memory_test.ts`): the host pre-paints sixteen bytes,
+   calls a guest function that does three narrow stores, and reads back exactly 1 and 2 changed
+   bytes with the neighbours intact. It is the one assertion the emulation would have failed.
+2. **`len` is UNSIGNED in both bulk instructions, and the loops it replaced were signed.** A VL
+   `while i < len` with `len = -5` writes nothing; `memory.fill(d, v, -5)` is a request for
+   4294967291 bytes and TRAPS. `buffer-bulk.vl` pinned the no-op behaviour, so `std:buffer`'s `fill`
+   and `copyFrom` guard `len > 0` and the pin holds. **§J9 item 4's claim that S6 "replaces two
+   bodies and changes no signature or expectation" is therefore true only WITH that guard** — the
+   naive swap reddens a pinned cell, which is exactly what it is there for.
+
+   The layering is deliberate: the intrinsic IS the instruction (`bulk-negative-length-traps.vl`
+   pins that `__memory_fill__(1024, 1, -5)` traps), and softening it is POLICY, which is std's under
+   O1(c). A guard in the emitter would have made the intrinsic something other than the instruction.
+
+A third, smaller one, recorded because it cost a build: a bare `return` in a void VL function
+type-checks and then fails at emit (`emitProgram: bare return is not supported`). The guards are
+spelled as positive `if`s. `vl check` was clean on the version that could not emit.
+
+### K4. The grid: 31 probe cells, and the two INVERTED controls that earned their place
+
+Outcome classes, worst to best: C0 silent-wrong · C1 invalid/trap · C2 emit-error · C3 check-reject ·
+C4 correct. **Before: 27 cells at C3, 4 at C4. After: 29 at C4, 2 at C0 BY DESIGN — no cell moved
+backward.** The 4 that were "C4" before were arity/void REJECT controls passing for the wrong
+reason: they read `undeclared identifier`, and they now read `wrong number of arguments: expected 3,
+got 2` and `cannot bind the void result` — the real diagnostics, the same correction §I2 recorded.
+
+The two C0 cells are the inverted controls, and they are the reason the other 29 mean anything:
+
+- `ctl-inverted-store8-truncation` expects 511 from `__store_i8__(a, 511)` — what a store that
+  failed to truncate would print. It reads 255, i.e. C0. A grid where every cell is graded "the run
+  was clean" would have called it C4.
+- `ctl-inverted-copy-overlap` expects `1,2,1,2` — what a naive FORWARD loop produces for an
+  overlapping copy with the destination above the source. It reads `1,2,3,4`. That single cell is
+  the evidence that `memory.copy`'s memmove semantics are the INSTRUCTION's and not something the
+  fixture arranged for.
+
+Plus a live control (`ctl-live`, no new intrinsic, C4 on both sides) so a moved cell cannot be
+blamed on the harness.
+
+Axes covered: both narrow widths at all four word lanes including the 16-bit STRADDLE at lane 3;
+truncation and the sign/zero-extension pair with the 127 / 32767 CONTROLS where both spellings must
+AGREE; neighbour survival; the last legal address of each width and the byte past it; four scopes
+(top level, named function, a function's implicit TAIL statement, and both lambda positions — the
+B3/O7 axis); `memory.copy` overlapping in BOTH directions, at zero length, self-copying, and across
+the 64 KiB page boundary; `memory.fill` at zero length, unaligned, truncating its byte, and over a
+FULL page.
+
+### K5. Grading the instruments by sabotage: 11 of 11, and the three that are engine coverage
+
+§I6's hazard was honoured rather than assumed: the pristine seed was saved once and restored BY
+COPY, never rebuilt, and its `sha256 f1bea9fc…` is identical before the first sabotage and after the
+last. The baseline sweep is empty on both ends.
+
+| sabotage | fixtures that redden |
+| --- | --- |
+| `i32.store8` opcode → `i32.store` (4 bytes) | narrow-round-trip, buffer-narrow-stores, **HOST** |
+| `i32.store16` opcode → `i32.store8` (1 byte) | narrow-round-trip, buffer-narrow-stores, buffer-bulk, buffer-widths, **HOST** |
+| narrow store VALUE routed as f64 | narrow-round-trip, bulk-copy-and-fill, buffer-narrow-stores, buffer-bulk, buffer-widths, **HOST** |
+| `memory.copy` emits ONE memory index | bulk-copy-and-fill, buffer-narrow-stores, buffer-bulk, buffer-widths |
+| `memory.copy` / `memory.fill` sub-opcodes swapped | bulk-copy-and-fill, buffer-bulk |
+| narrow stores dropped from `nameIsMemStoreIntrinsic` | narrow-round-trip, bulk-copy-and-fill, buffer-narrow-stores, buffer-bulk, buffer-widths, **HOST** |
+| `i32.store8` opcode → `i32.store16` | narrow-round-trip |
+| std `fill` drops the `len > 0` guard | buffer-bulk |
+| std `store8` off by one | buffer-narrow-stores, buffer-bulk |
+| std `copyFrom` swaps src and dst | buffer-bulk |
+| std `store8` masks the address into page 0 | buffer-store8-past-memory-traps |
+
+**11 of 11 sabotages reddened something; 7 of 10 fixtures were reddened by at least one.** The three
+that were not are `store-narrow-past-page-end-traps`, `bulk-copy-past-page-end-traps` and
+`bulk-negative-length-traps`, and that is a fact about what they pin rather than a hole: they assert
+the ENGINE's bounds check, which no emitter sabotage in this set can silence. What makes each of
+them a BOUNDS proof rather than a page-boundary artifact is the paired success cell —
+`bulk-copy-and-fill.vl` performs the identical 65534 copy successfully after a `__memory_grow__(1)`.
+Said out loud here so the next reader does not mistake unreddened for asleep.
+
+### K6. The zeros, graded
+
+- **Corpus A/B, six channels** (check rc, check message, build rc, build message, emitted bytes, run
+  rc + stdout) against master's own compiler, 1610 files: **19 rows differ and 1591 are identical on
+  all six**. All 19 are files this change adds or touches — the 7 new fixtures, `std/buffer.vl`, and
+  the 11 `tests/cases/std/buffer-*.vl` that import it. **Field 5 (emitted bytes) is `same` for all
+  1610**: no pre-existing program's wasm moved by a byte. Two of the 19 move in the REJECT direction
+  (`CHECKRC(0/1)`) and both are the user-definition-reserved fixtures — the reservation working, and
+  itself the pinned behaviour.
+- **Fuzz A/B**, 5 pinned seeds × 200 programs, both compilers: byte-identical output on every seed,
+  all findings pre-existing REJECTs on both sides. **This proves absence of collateral damage and
+  nothing else** — `fuzzgen.vl` emits no memory intrinsic and no `std:buffer` import, so no defect in
+  this slice could reach a generated program. It is a state-reach instrument here, not a live one.
+- **`wasm-opt -O` on a bulk-memory module: rc=0, and the optimized module still runs correctly.**
+  §B4 predicted a hard `bail!` the day the emitter first wrote these opcodes; the
+  `--enable-bulk-memory` flag was pre-landed (S0) and this is the first time that prediction was
+  testable against a module VL actually emitted. It holds.
+- Seed size 1053279 → 1054554, **+1275 bytes**. Fixpoint proven at both `refresh-compiler.sh
+  --prove-fixpoint` and `native-fixpoint.sh`.
+
+### K7. Where §J9's list stands now
+
+1. ~~O1, O5, O6, O2, O3~~ — ruled (§J2).
+2. ~~S1 / O7, the capture fix~~ — done (§I4).
+3. ~~The two NARROW store widths~~ — **done**, this section. `poke8` is deleted and
+   `buffer-narrow-stores.vl` passes unchanged, as §J9 required.
+4. ~~S6 bulk ops~~ — **done**, this section. It did change one thing §J9 said it would not: the
+   unsigned length (§K3).
+5. ~~S5 `std:buffer`~~ — done (§J).
+6. **§G's per-access call cost under a hot loop** — still open, still the number that decides O1(b)
+   versus leaving O1(c) permanent, and now more interesting than it was: every `std:buffer` body is
+   one instruction, so the measurement is cleanly "the call overhead" with nothing else in it.
+7. **New, and small:** `driver.vl`'s `builtinScan` LSP completion list (§B7) still has none of the
+   memory dunders — now 20 of them. Out of this change's file partition; unchanged in kind, four
+   names larger in degree.
+8. **New:** `tests/selfhost_native_align_test.ts`'s explicit whitelists still do not carry the
+   `std:buffer` fixtures (§J7) or this slice's seven. All were adjudicated natively by hand here —
+   `vl run` stdout equal to the `@log` lines, `vl check` clean, nonzero exit for the traps — but
+   promoting them belongs to that file's owner.

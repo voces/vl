@@ -30,7 +30,7 @@ vl's roadmap already plans a scoped `Buffer` linear-memory tier (DECISIONS
 "one deliberate escape hatch"; ROADMAP B-mem). This section is the concrete
 requirements list from webcraft's side — what "done" needs to mean.
 
-### P0.1 `Buffer`: allocation + full-width load/store
+### P0.1 `Buffer`: allocation + full-width load/store  ✅ SHIPPED
 
 ```vl
 const buf = Buffer(byteLength)      // zero-filled; grows the one linear memory
@@ -45,16 +45,25 @@ buf.loadF32(off): f32   buf.storeF32(off, v)
 buf.loadF64(off): f64   buf.storeF64(off, v)
 ```
 
-> Maintainer's note (vl side): "4 store widths" counts *declarations*. Measured,
-> **one** store width and one load width were lowered by the emitter — the other
-> four `__store_*__`/`__memory_*__` names typecheck and then fail at emit. The
-> four-width world was the deleted TS compiler's. See
-> [`internals/buffer-design.md`](internals/buffer-design.md) §A1 for the probe
-> table; the ask below is unchanged, only the baseline is.
+> Maintainer's note (vl side): **this section is done — the whole of it.** The
+> code block above is the API, spelled `store8`/`store16` rather than
+> `storeU8`/`storeI8` (see below), and it lives in `std:buffer`:
 >
-> **Update — the LOAD half of this matrix has shipped, as raw intrinsics.** All
-> eight load widths lower to single wasm instructions today, verified by
-> disassembly, and so do `memory.size`/`memory.grow`:
+> ```vl
+> import { Buffer, bufferMark, bufferRelease } from "std:buffer"
+>
+> const buf = Buffer(byteLength)        // zero-filled; grows the one linear memory
+> buf.length                            // i32, what you ASKED for
+> buf.loadI8/loadU8/loadI16/loadU16/loadI32/loadI64/loadF32/loadF64(off)
+> buf.store8/store16/storeI32/storeI64/storeF32/storeF64(off, v)
+> buf.fill(off, len, byte)              // memory.fill
+> dst.copyFrom(dstOff, src, srcOff, len) // memory.copy — the destination is the receiver
+> bufferMark() / bufferRelease(mark)    // LIFO reclamation; no per-object free
+> ```
+>
+> Every one of those bodies is a single wasm instruction plus its address
+> arithmetic. Underneath is a raw intrinsic floor a program may use directly —
+> eight loads, six stores, the two size ops and the two bulk ops, twenty in all:
 >
 > ```vl
 > __load_i8__(a): i32     // i32.load8_s   — sign-extends
@@ -65,37 +74,72 @@ buf.loadF64(off): f64   buf.storeF64(off, v)
 > __load_i64__(a): i64    // i64.load
 > __load_f32__(a): f32    // f32.load
 > __load_f64__(a): f64    // f64.load
-> __memory_size__(): i32       // pages currently mapped
-> __memory_grow__(pages): i32  // the PREVIOUS page count, or -1 on failure
+> __store_i8__(a, v: i32)     // i32.store8    — truncates
+> __store_i16__(a, v: i32)    // i32.store16   — truncates
+> __store_i32__(a, v: i32)    // i32.store
+> __store_i64__(a, v: i64)    // i64.store
+> __store_f32__(a, v: f32)    // f32.store
+> __store_f64__(a, v: f64)    // f64.store
+> __memory_size__(): i32           // pages currently mapped
+> __memory_grow__(pages): i32      // the PREVIOUS page count, or -1 on failure
+> __memory_copy__(dst, src, len)   // memory.copy — memmove, overlap-safe both ways
+> __memory_fill__(dst, byte, len)  // memory.fill
 > ```
 >
-> `a` is a byte address into the module's linear memory, which is now **exported
-> as `memory`** (P0.2, below). The port can start against
-> `__load_f32__(base + (i << 2))` — the same shape as the TS twin's `DataView` —
-> while the `Buffer` surface is designed. What is NOT here: the seven store
-> widths (only `__store_i32__` lowers, so a column is written as i32 words), the
-> `Buffer` type and its allocator, and the bulk ops. Two limits worth knowing
-> before you build on this:
+> `a` is a byte address into the module's linear memory, which is **exported as
+> `memory`** (P0.2, below). Four things worth knowing before you build on this:
 >
-> - **Top level and plain named functions only.** A named function wrapping one
->   of these fails to emit in any module that uses a function value anywhere
->   (`captured variable not found in enclosing frame`) — censused, it is all ten
->   names in that position, and it is why no `Buffer` method surface ships yet.
->   `buffer-design.md` §B3/O7.
+> - **Stores have no signed/unsigned split, and that is deliberate.** There is
+>   one instruction per width and it truncates — `i32.store8` cannot tell a
+>   signed byte from an unsigned one — so `storeU8` would falsely imply a signed
+>   twin. The loads keep their split because there really are two instructions:
+>   of the byte `0xFF`, `loadI8` answers -1 and `loadU8` answers 255. Your spec
+>   spelled `storeU8` alongside `store16`; the matrix normalizes both.
+> - **The bulk pair's `len` is UNSIGNED**, because the instruction's is. A
+>   negative length passed to a raw `__memory_fill__` is ~4 GiB and traps. The
+>   `std:buffer` wrappers guard it (`len <= 0` writes nothing) — that is policy,
+>   and policy is std's.
+> - **`memory.copy` is memmove, not memcpy.** It is defined to behave as if the
+>   bytes went through a temporary, so an overlapping snapshot/rollback in either
+>   direction is correct without your choosing a direction. Pinned by value in
+>   both directions.
 > - **`memory.grow` detaches every host view**, silently: `byteLength` becomes 0
 >   and an indexed read returns `undefined` rather than throwing. Re-read
 >   `.buffer` after any call that can grow; never cache a view across a guest
 >   call.
+>
+> The scope limitation this note used to carry — *"top level and plain named
+> functions only"*, a `captured variable not found in enclosing frame` failure
+> for every memory intrinsic in a module containing any function value — **is
+> fixed** and was fixed before the `Buffer` surface shipped, which is why that
+> surface exists at all. `buffer-design.md` §I4. Intrinsics work at top level, in
+> named functions, as a function's implicit tail statement, and inside lambda
+> bodies; all four positions are pinned in the corpus.
 
 - A real allocator (bump is fine — the sim allocates a few large Buffers at
   init and never frees), replacing today's "program picks raw addresses,
   two users collide" scratch page.
+  > Done: a bump allocator in `std:buffer`, 8-byte aligned, growing the memory
+  > lazily, with a reserved low kilobyte that `std:buffer` promises never to hand
+  > out (so a program poking raw addresses has documented room, and `base == 0`
+  > can never be a legitimate `Buf`). Reclamation is `bufferMark()` /
+  > `bufferRelease(mark)` — LIFO, free, and it CAN DANGLE: a `Buf` held across a
+  > release that undoes its allocation silently aliases its successor. Stated at
+  > the API surface and pinned as behaviour, not documented in a footnote.
 - **Bulk ops are load-bearing, not conveniences**: `Buffer.copy(dst, dstOff,
   src, srcOff, len)` and `buf.fill(off, len, byte)` lowering to
   `memory.copy`/`memory.fill`. Snapshot and rollback are exactly these ops;
   without them a snapshot is a per-word loop.
+  > Done, and lowering to exactly those two instructions. One spelling change:
+  > `Buffer.copy(dst, …)` is not expressible — VL has no static methods — so it
+  > is `dst.copyFrom(dstOff, src, srcOff, len)`, the destination as receiver,
+  > matching `dst.fill(...)` and the self-first UFCS shape the rest of `std:` uses.
 - Bounds: engine memory trap or explicit check, either is fine — but the
   loop-hoisting ask in P1.4 matters more than the per-access policy.
+  > Ruled: the engine trap, with no VL-level check anywhere in the tier. A `Buf`
+  > describes an extent and does not fence it — an access past the end of a `Buf`
+  > but still inside the memory is NOT caught. `std:buffer` traps only at
+  > ALLOCATION time (negative length, i32 overflow, a bad release mark).
 
 Why webcraft needs it (see performance-topology.md): every byte of
 authoritative sim state — ECS columns, entity tables, RNG/tick counters,
