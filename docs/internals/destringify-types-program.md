@@ -31698,3 +31698,56 @@ Every rc taken BARE, never through a pipe.
    BODY MOVE VS AN IMPORT RE-POINT.** Phases 0/1a/1b/1c read byte-identical; phase 2 reads
    −31 B with a byte-identical frozen rebuild. The pair of readings together is what
    identifies a change as module-order-only — either one alone is ambiguous.
+
+## THE TWO STALE FIXTURE HEADERS #1258 LEFT BEHIND — and `tests/` turns out not to be fmt-managed at all (same branch, off master `58880167`)
+
+#1258 closed the LOCAL and PARAM halves of the tail-assignment functype family and handed off
+two fixture headers it could not edit. Both described the world before it landed:
+
+| fixture | what was stale |
+|---|---|
+| `tests/cases/functions/tail-assign-inferred-return.vl` | Its closing paragraph said the LOCAL half "still rides the RHS answer", filed the coercing LOCAL cells as live invalid wasm at **`fnAssignRetTargetLet`** — a name that no longer exists in the tree — and gave as the reason "there is no local-cell-kind resolver reachable from that pass", which #1258 measured FALSE (`parentLetOf` resolves one on exactly that pass, as `retIsMapLocalAnnot` and `criRetLocalLet` always did) |
+| `tests/cases/functions/tail-assign-local-param-agreeing.vl` | Its two-row DISAGREEING-SET table listed rows that are now fixed and pinned; it named `fnAssignRetTargetLet` too; it described `criClassify` as reading `rx = rxe.binRight` for a non-global target; and its "fact 2" pointed at a `wasmEmit.vl` line-number filing that #1258 rewrote |
+
+Both now point at the STORAGE-CLASS dispatch (`fnAssignRetKind` → `letCellKind` /
+`vtKindOfParam` / `globalCellKind`) and at
+`tests/cases/statements/tail-assign-coercing-local.vl`, the pin #1258 minted for the
+disagreeing set. What is genuinely still open is carried over rather than dropped: the
+EMPTY-`[]` rows are fixed but unpinnable (the checker types `v = []` as the empty literal's
+own type, so the inferred return renders `<none>[]` and
+`tests/lsp_undisplayable_type_test.ts`'s corpus control rightly rejects it), filed at
+`fnAssignRetTargetName`; the remaining rows are listed with counts at `fnAssignRetKind`.
+
+**THE ROLE OF BOTH FILES CHANGED AND SAYING SO IS THE POINT.** They were minted as the
+AGREEING floor "so a future local-cell resolver has a floor to land on". That resolver
+landed. They are not boundary pins any more — they are the regression pin for the dispatch's
+easy rows, and the claim worth pinning about a resolver that had a whole storage class
+re-routed underneath it is precisely that the already-green cells stayed green.
+
+### MEASUREMENT — byte-identity IS the claim
+
+Comment-only, verified as such: `git diff -U0` over both files, filtered to lines that are
+not `//`, is EMPTY. `scripts/refresh-compiler.sh --prove-fixpoint` reads 0 and `cmp` against
+the phase-2 build returns **0 — 1,044,995 B, byte-identical**. Suite **3328 / 0 / 8**,
+unchanged.
+
+### AND A FINDING THAT IS NOT ABOUT THESE TWO FILES
+
+`vl fmt --check` REJECTS `tail-assign-local-param-agreeing.vl` — and it rejected it at master
+too, before this commit touched it (the six PARAM functions have single-statement bodies
+`vl fmt` wants on one line). The obvious reading, that a fixture had gone fmt-stale, is
+wrong. Scanning the whole corpus:
+
+```
+total fixtures:  1575
+not formatted:    507
+```
+
+**One fixture in three is not `vl fmt`-clean, and nothing gates it.** `scripts/lint-self.sh`
+fmt-checks `compiler/ std/ scripts/` only, and CI's dogfood step is that same script — so
+`tests/` is outside every fmt gate in the tree. This is a DESIGN fact, not a decay: a fixture
+is a program written to exercise a shape, and hand spelling is sometimes the shape. It is
+recorded here so the next slice that sees a fixture fail `fmt --check` does not read it as a
+regression, reformat 507 files, and produce a diff nothing can review. **Neither file is
+reformatted by this commit;** the edit stays comment-only, which is what makes byte-identity
+a claim about the change rather than about the formatter.
