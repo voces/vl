@@ -254,6 +254,7 @@ import {
   fbLoop,
   fbRefAsNonNull,
   fbRefNullForKind,
+  fbRefNullStruct,
   fbReturn,
   fbUnreachable,
   fbValtype,
@@ -1950,7 +1951,10 @@ function emitModule(_stmts: i32[]) {
 
   emitGlobalSection()
 
-  emitExportSection(n)
+  // The export ABI wrappers (#1264) sit after EVERY other function — user functions, the
+  // start fn, the `__log__` decoder and the shared helpers — so adding them shifts no
+  // existing function index. Wrapper k belongs to export entry k.
+  emitExportSection(n, helpBase + nHelpers)
 
   // Start section (id 8): names the function the runtime invokes once at instantiation,
   // before any export is callable — here the synthetic start fn that runs the non-const
@@ -2589,6 +2593,94 @@ function emitSynthCloSig(key: string) {
 // Type section (id 1): all WasmGC types in ONE recursion group, followed by the
 // standalone print/(log) functypes — the rec-group count excludes those. The inline
 // comments below carry the per-type framing.
+// ONE function's `0x60` functype, written to the type payload: the param valtypes then
+// the result valtype. `withEnv` decides the hidden leading `structref` (see below); every
+// other byte is the same either way, which is the whole reason this is a function.
+//
+// #1264 — IT IS CALLED TWICE PER EXPORTED FUNCTION, and the second call is what makes an
+// export wrapper possible: `emitTypeSection`'s main loop passes `fnValUsed` (the real,
+// env-leading signature the module calls internally), and the wrapper tail below passes
+// FALSE for the clean, env-free ABI signature the same function is PUBLISHED under. The
+// two must not drift — the result-type dispatch alone is a dozen branches over void /
+// closure / inferred / annotated returns, with per-kind slot resolution for structs, ref
+// lists, maps and variants — so they are one function, not a copy.
+function emitOneFuncType(ti: i32, withEnv: boolean) {
+  const fn = P.nodes[fnStmts[ti]]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    const nParams = params.length
+    wU8(96) // 0x60 func
+    // When a function value exists module-wide, EVERY function carries a hidden
+    // leading `structref env` param (local 0). The declared params follow at 1..p.
+    // A non-capturing function ignores its env; a capturing one `ref.cast`s + reads
+    // it. Gated on `fnValUsed` so a no-lambda module's functypes are byte-identical.
+    if withEnv {
+      wULEB(nParams + 1) // param count incl. the env param
+      wU8(107)           // env param: structref (0x6b)
+    } else {
+      wULEB(nParams) // param count
+    }
+    let pi = 0
+    while pi < nParams {
+      fbValtype(vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
+      pi = pi + 1
+    }
+    if fRetVoid[ti] == 1 {
+      wU8(0) // 0 results — a VOID function (`()->()`)
+    } else if fn.fnRet < 0 && fnReturnsClosure(ti) {
+      // A function VALUE return (un-annotated; its tail is a function value) — kind 14.
+      wU8(1)
+      fbValtype("closure", -1)
+    } else if fn.fnRet < 0 {
+      // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
+      // stored `fRetKind` slot the annotation path fills). i32 when nothing matched.
+      wU8(1) // 1 result
+      // The inferred result KIND from the single shared mapping (`inferredRetKindCore`) — so
+      // this site and `cloRetValKind` can't drift on a scalar/list/ref kind (the f32/f64/i64
+      // inferred-return holes were each one site missing what the other had). The SLOT follows
+      // the kind: struct index for a struct / nullable-struct ref (1 / 9), the element wrapper
+      // for a ref list (5, via the recorded element name), the map shape for a map (6); every
+      // other kind (string / scalar list / scalars) needs no per-function slot.
+      const infKind = inferredRetKindCore(ti)
+      let infSlot = -1
+      if infKind == "struct" || infKind == "nulstruct" {
+        infSlot = fRetStructIdx[ti]
+      }
+      if infKind == "reflist" { infSlot = rlSlotByName(fRetRArrElem[ti]) }
+      if infKind == "map" {
+        const mrx = fnRetExprOf(fnStmts[ti])
+        if mrx >= 0 { infSlot = mapRetExprShape(mrx, fnStmts[ti]) }
+      }
+      fbValtype(infKind, infSlot)
+    } else {
+      wU8(1) // 1 result
+      // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE
+      // SLOT for the element type (`retStructIndex` is -1 for a ref array), so the
+      // result valtype selects THIS function's element wrapper, not slot 0's.
+      let retSlot = retStructIndex(fn.fnRet)
+      if retRefArrFlag(fn.fnRet) == 1 { retSlot = tyAnnRefListSlot(fn.fnRet) }
+      // A NULLABLE ref-array return (`<ref-array> | null`, kind 18) — its slot is the INNER
+      // ref-list element wrapper (`tyAnnRefListSlot` strips the `| null` before resolving), so the
+      // `(ref null $wrapper)` result valtype selects THIS function's element wrapper.
+      if retNulRefArrFlag(fn.fnRet) == 1 {
+        retSlot = tyAnnRefListSlot(fn.fnRet)
+      }
+      // A string-keyed MAP return's slot is the map SHAPE (mono ⇒ -1, or the value type's mv
+      // slot for a `string`-valued map), so the result valtype selects THIS map's `$mapStruct`.
+      if retMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
+      // A NULLABLE map return (`{[string]: V} | null`, kind `nulmap`) — the SAME map SHAPE selects
+      // its `(ref null $mapStruct)` result valtype (`mapAnnShape` is `| null`-aware).
+      if retNulMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
+      // A `: Cat` concrete-variant return is kind 8 — its `fbValtype` slot is the VARIANT
+      // index (`uVarHeap[vi]`), which `retStructIndex` (standalone structs only) misses.
+      if retVariantFlag(fn.fnRet) == 1 {
+        retSlot = variantIndexOf(tyNameOf(fn.fnRet))
+      }
+      fbValtype(vtKindOfType(fn.fnRet), retSlot)
+    }
+  }
+}
+
 function emitTypeSection(
   n: i32,
   typeOffset: i32,
@@ -2602,9 +2694,10 @@ function emitTypeSection(
   // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
   // typePayload` identically. Restored just before `wSection` frames it (below).
   const tyPrev = wTarget(typePayload)
-  wULEB(1 + nPrintTypes + memFn + nHelpers) // rectypes: the rec group + the standalone print/(log)/helper functypes
-  wU8(78)                                   // 0x4e rec group
-  wULEB(n + typeOffset + hasStart)          // types inside the rec group (print functypes excluded)
+  const nWrapT = exportWrapSlots().length
+  wULEB(1 + nPrintTypes + memFn + nHelpers + nWrapT) // rectypes: the rec group + the standalone print/(log)/helper/export-wrapper functypes
+  wU8(78)                                            // 0x4e rec group
+  wULEB(n + typeOffset + hasStart)                   // types inside the rec group (print functypes excluded)
   // TWIN SKIP, used by four of the loops below (struct / variant / ref-list pair /
   // ref-valued map): a slot whose `*Twin[i] < i` shares an EARLIER slot's heap type,
   // which was already emitted — so skip it, in lock-step with the
@@ -2985,80 +3078,7 @@ function emitTypeSection(
   // covering this whole payload build was established above).
   let ti = 0
   while ti < n {
-    const fn = P.nodes[fnStmts[ti]]
-    if fn is FuncDecl {
-      const params = fn.fnParams
-      const nParams = params.length
-      wU8(96) // 0x60 func
-      // When a function value exists module-wide, EVERY function carries a hidden
-      // leading `structref env` param (local 0). The declared params follow at 1..p.
-      // A non-capturing function ignores its env; a capturing one `ref.cast`s + reads
-      // it. Gated on `fnValUsed` so a no-lambda module's functypes are byte-identical.
-      if fnValUsed {
-        wULEB(nParams + 1) // param count incl. the env param
-        wU8(107)           // env param: structref (0x6b)
-      } else {
-        wULEB(nParams) // param count
-      }
-      let pi = 0
-      while pi < nParams {
-        fbValtype(vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
-        pi = pi + 1
-      }
-      if fRetVoid[ti] == 1 {
-        wU8(0) // 0 results — a VOID function (`()->()`)
-      } else if fn.fnRet < 0 && fnReturnsClosure(ti) {
-        // A function VALUE return (un-annotated; its tail is a function value) — kind 14.
-        wU8(1)
-        fbValtype("closure", -1)
-      } else if fn.fnRet < 0 {
-        // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
-        // stored `fRetKind` slot the annotation path fills). i32 when nothing matched.
-        wU8(1) // 1 result
-        // The inferred result KIND from the single shared mapping (`inferredRetKindCore`) — so
-        // this site and `cloRetValKind` can't drift on a scalar/list/ref kind (the f32/f64/i64
-        // inferred-return holes were each one site missing what the other had). The SLOT follows
-        // the kind: struct index for a struct / nullable-struct ref (1 / 9), the element wrapper
-        // for a ref list (5, via the recorded element name), the map shape for a map (6); every
-        // other kind (string / scalar list / scalars) needs no per-function slot.
-        const infKind = inferredRetKindCore(ti)
-        let infSlot = -1
-        if infKind == "struct" || infKind == "nulstruct" {
-          infSlot = fRetStructIdx[ti]
-        }
-        if infKind == "reflist" { infSlot = rlSlotByName(fRetRArrElem[ti]) }
-        if infKind == "map" {
-          const mrx = fnRetExprOf(fnStmts[ti])
-          if mrx >= 0 { infSlot = mapRetExprShape(mrx, fnStmts[ti]) }
-        }
-        fbValtype(infKind, infSlot)
-      } else {
-        wU8(1) // 1 result
-        // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE
-        // SLOT for the element type (`retStructIndex` is -1 for a ref array), so the
-        // result valtype selects THIS function's element wrapper, not slot 0's.
-        let retSlot = retStructIndex(fn.fnRet)
-        if retRefArrFlag(fn.fnRet) == 1 { retSlot = tyAnnRefListSlot(fn.fnRet) }
-        // A NULLABLE ref-array return (`<ref-array> | null`, kind 18) — its slot is the INNER
-        // ref-list element wrapper (`tyAnnRefListSlot` strips the `| null` before resolving), so the
-        // `(ref null $wrapper)` result valtype selects THIS function's element wrapper.
-        if retNulRefArrFlag(fn.fnRet) == 1 {
-          retSlot = tyAnnRefListSlot(fn.fnRet)
-        }
-        // A string-keyed MAP return's slot is the map SHAPE (mono ⇒ -1, or the value type's mv
-        // slot for a `string`-valued map), so the result valtype selects THIS map's `$mapStruct`.
-        if retMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
-        // A NULLABLE map return (`{[string]: V} | null`, kind `nulmap`) — the SAME map SHAPE selects
-        // its `(ref null $mapStruct)` result valtype (`mapAnnShape` is `| null`-aware).
-        if retNulMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
-        // A `: Cat` concrete-variant return is kind 8 — its `fbValtype` slot is the VARIANT
-        // index (`uVarHeap[vi]`), which `retStructIndex` (standalone structs only) misses.
-        if retVariantFlag(fn.fnRet) == 1 {
-          retSlot = variantIndexOf(tyNameOf(fn.fnRet))
-        }
-        fbValtype(vtKindOfType(fn.fnRet), retSlot)
-      }
-    }
+    emitOneFuncType(ti, fnValUsed)
     ti = ti + 1
   }
   // ── the TAIL functypes, in emit order ───────────────────────────────────────
@@ -3127,6 +3147,17 @@ function emitTypeSection(
   if gHelpMapProbe >= 0 {
     helpFuncType("aaama", "i") // __map_probe__: (index, hashes, live, keysBacking, key) -> slot
     helpFuncType("aaaii", "a") // __map_resize__: (index, hashes, live, count, size) -> index'
+  }
+  // The EXPORT-WRAPPER functypes LAST (#1264), one per export entry, each the target's
+  // own signature emitted with `withEnv` FALSE — the clean ABI shape, produced by the
+  // same `emitOneFuncType` the main loop uses, so a wrapper's published type cannot drift
+  // from the function it forwards to. Empty unless `fnValUsed`, so a module with no
+  // function value emits no extra rectype and stays byte-identical.
+  const wrapT = exportWrapSlots()
+  let wti = 0
+  while wti < wrapT.length {
+    emitOneFuncType(wrapT[wti], false)
+    wti = wti + 1
   }
   wTarget(tyPrev)
   wSection(1, typePayload)
@@ -3214,7 +3245,8 @@ function emitFunctionSection(
   // the `()->()` functype at index `typeOffset + n`.
   const funcPayload: i32[] = []
   const fnPrev = wTarget(funcPayload)
-  wULEB(n + hasStart + memFn + nHelpers)
+  const wrapF = exportWrapSlots()
+  wULEB(n + hasStart + memFn + nHelpers + wrapF.length)
   let fi = 0
   while fi < n {
     // A function whose env-leading signature matches an interned `$fnsig` is declared
@@ -3244,6 +3276,14 @@ function emitFunctionSection(
   while hi < nHelpers {
     wULEB(helpTyBase + hi)
     hi = hi + 1
+  }
+  // The export wrappers LAST — after every other function, so no existing function index
+  // shifts — each on its own functype, emitted in this same order at the tail of the type
+  // section (`helpTyBase + nHelpers + k`).
+  let wfi = 0
+  while wfi < wrapF.length {
+    wULEB(helpTyBase + nHelpers + wfi)
+    wfi = wfi + 1
   }
   wTarget(fnPrev)
   wSection(3, funcPayload)
@@ -3433,7 +3473,109 @@ function emitGlobalSection() {
   0
 }
 
-function emitExportSection(_n: i32) {
+// The `fnStmts` slot an export TARGET name resolves to — the FIRST slot carrying it — or
+// -1. The module's ABI resolution, in one place: #1260's `monoFirstFnIndexNamed` mirrors
+// this same rule inside the monomorphizer, and four sections now depend on it agreeing.
+function exportSlotOfTarget(name: string): i32 {
+  let tj = 0
+  while tj < fnStmts.length {
+    const tfn = P.nodes[fnStmts[tj]]
+    if tfn is FuncDecl {
+      if tfn.fnName == name { return tj }
+    }
+    tj = tj + 1
+  }
+  -1
+}
+
+// The PUBLIC names the export section publishes, in section order: every alias-table
+// entry whose target resolves, minus duplicates (a wasm export name must be unique, and
+// a repeated public name keeps its FIRST entry).
+function exportPublicNames(): string[] {
+  const nms: string[] = []
+  let rxi = 0
+  while rxi < reExpName.length {
+    if (
+      exportSlotOfTarget(reExpTarget[rxi]) >= 0 &&
+      !capHas(nms, reExpName[rxi])
+    ) {
+      nms.push(reExpName[rxi])
+    }
+    rxi = rxi + 1
+  }
+  nms
+}
+
+// The `fnStmts` slot each published name resolves to, PARALLEL to `exportPublicNames`.
+// The two walk `reExpName` in the same order under the same two predicates, so entry k of
+// one belongs to entry k of the other by construction.
+function exportTargetSlots(): i32[] {
+  const slots: i32[] = []
+  const seen: string[] = []
+  let rxi = 0
+  while rxi < reExpName.length {
+    const hit = exportSlotOfTarget(reExpTarget[rxi])
+    if hit >= 0 && !capHas(seen, reExpName[rxi]) {
+      seen.push(reExpName[rxi])
+      slots.push(hit)
+    }
+    rxi = rxi + 1
+  }
+  slots
+}
+
+// #1264 — THE EXPORT ENTRIES THAT NEED AN ABI WRAPPER, parallel to `exportPublicNames`,
+// and EMPTY unless the module uses a function value.
+//
+// When `fnValUsed`, every function in the module carries a hidden leading `structref env`
+// param (`envSlotShift` — a whole-module decision, so it applies to functions that are
+// never taken as values and to modules whose only function value is an unrelated lambda
+// or a `.map` callback). That param is an INTERNAL calling convention, but the export
+// section published the target function DIRECTLY, so it leaked into the module's ABI:
+// `export function f(a: i32): i32` in a file that also writes `const g = f` — or merely
+// `xs.map(...)` anywhere — published `f` as `(structref, i32) -> i32`. An importer calling
+// `f(1)` gets a boundary TypeError ("type incompatibility when transforming from/to JS");
+// one that knows to pass `(null, 1)` gets the right answer. Measured, both.
+//
+// So each export entry gets a thin forwarding wrapper carrying the CLEAN signature, and
+// the export names the wrapper. Gated on `fnValUsed` because a module without function
+// values has no env param to hide, and must stay byte-identical.
+//
+// Per ENTRY rather than per slot: two public names may alias one function
+// (`export { id, id as identity }`), and one wrapper each is a few bytes against having to
+// dedup slots that the parallel-array invariant above would then lose.
+function exportWrapSlots(): i32[] {
+  const none: i32[] = []
+  if !fnValUsed { return none }
+  exportTargetSlots()
+}
+
+// A wrapper body: supply the env the internal convention wants, forward the declared
+// params, tail into the real function. A top-level export cannot capture anything — only
+// a NESTED function can, and `export` is top-level only — so `ref.null struct` is the
+// correct env, exactly as `wasmEmit`'s direct-call path passes for a non-capturing callee.
+// No locals: the wrapper's own params ARE locals 0..p-1, un-shifted, because this function
+// is the one function in the module that does NOT carry an env param.
+function emitExportWrapperCode(out: i32[], slot: i32) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(0) // no local runs
+  fbRefNullStruct()
+  const wfn = P.nodes[fnStmts[slot]]
+  if wfn is FuncDecl {
+    let pi = 0
+    while pi < wfn.fnParams.length {
+      fbLocalGet(pi)
+      pi = pi + 1
+    }
+  }
+  fbCall(gImports + slot)
+  fbEnd()
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+function emitExportSection(_n: i32, wrapBase: i32) {
   // Export section (id 7): the module's ABI is EXACTLY the alias tables the
   // driver staged — re-export entries (`export { name } from "dep"` → the
   // merged, mangled target) plus the root module's plain `export`-marked
@@ -3446,25 +3588,8 @@ function emitExportSection(_n: i32) {
   // char code IS its byte. Entries are resolved against `fnStmts` first so the
   // section count is exact; a duplicate public name keeps its FIRST entry
   // (export names must be unique). An export-free program omits the section.
-  const reExpEi: i32[] = [] // the target function's `fnStmts` position, parallel to its public name
-  const reExpNm: string[] = []
-  let rxi = 0
-  while rxi < reExpName.length {
-    let tj = 0
-    let hit = -1
-    while tj < fnStmts.length && hit < 0 {
-      const tfn = P.nodes[fnStmts[tj]]
-      if tfn is FuncDecl {
-        if tfn.fnName == reExpTarget[rxi] { hit = tj }
-      }
-      tj = tj + 1
-    }
-    if hit >= 0 && !capHas(reExpNm, reExpName[rxi]) {
-      reExpNm.push(reExpName[rxi])
-      reExpEi.push(hit)
-    }
-    rxi = rxi + 1
-  }
+  const reExpEi = exportTargetSlots() // the target's `fnStmts` position, parallel to its public name
+  const reExpNm = exportPublicNames()
   // P0.2 — EXPORT THE LINEAR MEMORY (`buffer-design.md` §C5, ruling O4(i)).
   //
   // The memory is exported under the universal name `memory`, automatically, and
@@ -3503,12 +3628,20 @@ function emitExportSection(_n: i32) {
   const exportPayload: i32[] = []
   const exPrev = wTarget(exportPayload)
   wULEB(nExports)
-  // Each entry: the bare public name pointing at the target's func index.
+  // Each entry: the bare public name pointing at the target's func index — or, when the
+  // module has an env-leading calling convention to hide, at entry `rei`'s ABI WRAPPER
+  // (#1264). `exportWrapSlots` is parallel to `reExpNm`, and the wrappers are appended in
+  // that same order after every other function, so entry `rei`'s wrapper is `wrapBase +
+  // rei`. Without a wrapper the internal `structref env` param leaked into the ABI.
   let rei = 0
   while rei < reExpNm.length {
     wName(reExpNm[rei])
     wU8(0) // export kind: func
-    wULEB(gImports + reExpEi[rei])
+    if fnValUsed {
+      wULEB(wrapBase + rei)
+    } else {
+      wULEB(gImports + reExpEi[rei])
+    }
     rei = rei + 1
   }
   // The memory entry LAST, so every function export keeps the index it had — the
@@ -3531,7 +3664,8 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   // shared-runtime-helper bodies LAST (in helper-index order).
   const codePayload: i32[] = []
   const codePrev = wTarget(codePayload)
-  wULEB(n + hasStart + memFn + nHelpers)
+  const wrapC = exportWrapSlots()
+  wULEB(n + hasStart + memFn + nHelpers + wrapC.length)
   wTarget(codePrev)
   let ci = 0
   while ci < n {
@@ -3552,6 +3686,12 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   if gHelpMapProbe >= 0 {
     if emitMapProbeFnCode(codePayload) < 0 { return -1 }
     if emitMapResizeFnCode(codePayload) < 0 { return -1 }
+  }
+  // The export-wrapper bodies LAST, in the same order the function section declared them.
+  let wci = 0
+  while wci < wrapC.length {
+    emitExportWrapperCode(codePayload, wrapC[wci])
+    wci = wci + 1
   }
   wSection(10, codePayload)
   0
