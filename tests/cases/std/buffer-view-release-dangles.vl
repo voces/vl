@@ -1,0 +1,57 @@
+// @run
+// @log 1.5
+// @log 1.5
+// @log 0
+// THE MARK/RELEASE HAZARD REACHES VIEWS TOO — DOCUMENTED, NOT FIXED.
+//
+// `bufferRelease(mark)` moves the one bump pointer back; it has no liveness
+// check and cannot have one (O6). `std:buffer`'s header already states that a
+// `Buf` held across a release that undoes its allocation silently aliases its
+// successor. A VIEW is the same descriptor over the same memory, so it inherits
+// the hazard EXACTLY — and slightly worsens the ergonomics of it, because a view
+// is the thing a kernel keeps in a local across a frame boundary.
+//
+// This case pins the behaviour rather than describing it: a view taken before a
+// release still reads and writes live, in-bounds, SINCE-REUSED memory. Nothing
+// traps, because nothing is out of bounds — the view's own bounds check is
+// satisfied (the index is inside `length`) and the engine's is satisfied (the
+// address is inside the memory). The check this module added protects against
+// indexing past a view; it cannot protect against a view outliving its bytes.
+//
+// Treat a released mark as invalidating every `Buf` AND every view derived from
+// an allocation after it.
+import {
+  Buffer,
+  bufferMark,
+  bufferRelease,
+  f32view,
+  getF32,
+  getI32,
+  i32view,
+  setF32,
+  setI32,
+} from "std:buffer"
+
+const mark = bufferMark()
+const first = Buffer(64)
+const stale = first.f32view(0, 4)
+stale.setF32(0, 1.5)
+const before = stale.getF32(0)
+print(before) // 1.5 — an ordinary, correct read
+
+bufferRelease(mark)
+
+// The next allocation gets the same addresses back. The stale view still points
+// at them and is still, by every check in the system, valid.
+const second = Buffer(64)
+const fresh = second.i32view(0, 4)
+const throughStale = stale.getF32(0)
+print(throughStale) // 1.5 — reading the PREVIOUS owner's bytes out of `second`
+
+// And a write through the stale view CORRUPTS THE NEW OWNER, silently. `fresh`
+// puts 7 in its element 1; the stale view then writes an f32 zero over the same
+// four bytes; `fresh` reads back 0 with nothing having gone wrong anywhere.
+fresh.setI32(1, 7)
+stale.setF32(1, 0.0)
+const seenByFresh = fresh.getI32(1)
+print(seenByFresh) // 0 — the 7 is gone, and no trap fired

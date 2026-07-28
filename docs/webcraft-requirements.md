@@ -225,7 +225,7 @@ unsigned variants `divU`, `remU`, `ltU/leU/gtU/geU` (`>>>` already exists).
 
 ## P1 — gates the port being good (perf + core ergonomics)
 
-### P1.1 Typed views over Buffer
+### P1.1 Typed views over Buffer  🟡 SHIPPED, minus the bracket sugar
 
 ```vl
 const x  = buf.f32view(offset, count)   // F32View
@@ -240,6 +240,64 @@ Raw `loadF32(base + (i << 2))` everywhere is the TS twin's DataView
 experience — workable, error-prone, and the thing most worth absorbing into
 the language. Views are also the natural unit for aliasing the render-publish
 ring and for the differential harness to diff columns.
+
+> Maintainer's note (vl side): **the views ship; `x[i]` does not.** In `std:buffer`,
+> pure VL, **zero compiler lines** — `refresh-compiler.sh --prove-fixpoint` reports
+> the compiler binary byte-identical. `buffer-design.md` §L.
+>
+> ```vl
+> const x = buf.f32view(off, count)     // F32View
+> x.setF32(i, v) ; const a = x.getF32(i) ; x.length
+> const id = buf.i32view(off, count)    // I32View: getI32 / setI32
+> const addr = x.byteAddrF32(i)         // the absolute byte address, unchecked
+> ```
+>
+> Three things to design around, one of them a sequencing correction:
+>
+> - **P1.1 depends on P1.5, and the dependency is not optional.** VL is
+>   structurally typed: `type X = {…}` names a shape, it does not mint an
+>   identity. Spelled as the ask has them — both views as `{base, count}` —
+>   `F32View` and `I32View` **are the same type**, an `I32View` satisfies every
+>   `F32View` parameter, and reading integer bytes as floats type-checks
+>   silently. Measured, not feared. So the shipped types spell their address
+>   field `f32base` / `i32base`: the element width is put in the field NAME,
+>   which is the only place a structural checker can see it. That is the
+>   workaround, it is ugly, and **P1.5's zero-cost newtype deletes it** — which
+>   makes P1.5 worth pulling forward rather than leaving below P1.2/P1.3.
+> - **`x[i]` is purely syntactic, and it is a language feature, not a views
+>   feature.** Under every dispatch route VL has or plans, `x[i]` lowers to
+>   exactly the call `x.getF32(i)` already lowers to. Four routes were probed;
+>   all four are blocked or wrong (§L5), and the right one — ROADMAP B14,
+>   free `self`-functions named for an operator — is blocked on the parser
+>   (`function "[]"(self: V, i: i32)` does not parse today) and on operator
+>   lookup surviving the module merge. Filed with the design. **The kernel
+>   ergonomics P1.1 is after are available now**, at the same codegen; what is
+>   missing is the bracket.
+> - **`x[i] += vx[i]` re-evaluates its receiver and index** under any bracket
+>   route, because the parser desugars a compound assignment to
+>   `x[i] = x[i] + vx[i]` over one shared target node. Harmless for a local and
+>   an induction variable; not harmless for `x[f()] += 1`.
+>
+> **Bounds, and the price** (this is also P1.4's answer, below): a view IS fenced
+> — the only fenced thing in the tier — because its failure mode is the one the
+> engine cannot see. One element past a column is *inside* the memory and inside
+> the next column, so unfenced it returns a neighbour silently, which is a desync
+> in exactly the code whose value is byte-comparability. So: `0 <= i < length`
+> per access, trapping on `unreachable`, plus a once-per-view extent check at
+> construction. Pinned by three trap fixtures, each with a separate `@run`
+> inverted control proving the prevented access would have SUCCEEDED.
+>
+> **The mark/release hazard reaches views** and is documented, not fixed: a view
+> held across a `bufferRelease` that undoes its allocation passes its own bounds
+> check AND the engine's, and reads/writes the next owner's bytes silently.
+>
+> **One size note, with the same punchline as P1.4's speed note.** The module
+> merge does not prune unreachable exported functions, so the view surface costs
+> **+422 bytes on every program that imports `std:buffer`**, used or not
+> (~162 per width family, scaling linearly as i64/f64/narrow widths arrive). At
+> `-O3 --closed-world` it is eliminated **completely** — byte-identical to a
+> build against the pre-view std. Same flag, second reason: the release profile
+> is what makes both the wrapper calls and the unused surface disappear.
 
 ### P1.2 Flat record layouts (AoS tier — the Lua VM's requirement)
 
@@ -271,13 +329,54 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 - Branch hinting (ROADMAP B-hint) is a later nicety for the pathing inner
   loops; not gating.
 
-### P1.4 Bounds-check ergonomics in hot loops
+### P1.4 Bounds-check ergonomics in hot loops  ✅ STATED (with the numbers)
 
 Not asking for unsafe access. Asking that the canonical loop —
 `for i in 0..view.length`-shaped iteration over a view — either hoists the
 bound or relies on the memory trap, and that this is *stated*, so kernel
 code can be written to the fast pattern deliberately. (Cranelift/binaryen
 eliminate some checks; "some" isn't a contract.)
+
+> Maintainer's note (vl side): **it does neither — it checks, every time — and
+> here is what that costs.** No hoisting: VL has no LICM, and binaryen at
+> `-O3 --closed-world --gufa` does not remove the check either (measured, it
+> survives). Not the memory trap: §L3 explains why the engine cannot see a
+> same-memory neighbour read, which is the failure this tier exists to prevent.
+>
+> Priced on P1.1's own canonical kernel, `x[i] += vx[i]`, 500M element-updates
+> (N=1M × 500 trips), built once and run, each against an R=0 build of the same
+> file as the inverted control. ns per element-update, medians of 5:
+>
+> | spelling | (none) | `-O` | `-O3 --closed-world --gufa` |
+> |---|---|---|---|
+> | raw intrinsics, hand-computed addresses | 0.426 | 0.452 | 0.434 |
+> | **hoisted base** (view for the extent, bare intrinsics inside) | 0.426 | 0.436 | 0.418 |
+> | `Buf` accessors (call per access, no check) | 2.436 | 2.504 | 0.700 |
+> | **view accessors** (call per access + the check) | 2.734 | 2.530 | 1.044 |
+>
+> Three conclusions kernel code should be written to:
+>
+> 1. **The CALL is the cost; the CHECK is not.** The bounds check is 0.30
+>    ns/element — 11% of the view's total, ~0.10 ns per access, under a third of
+>    a cycle. The wrapper call is 2.01. Do not trade the bounds policy away for
+>    speed before trading the call away.
+> 2. **The fast pattern is the hoisted base**, and it is FREE — identical to the
+>    hand-written raw kernel at every optimization level:
+>    ```vl
+>    const xb = x.byteAddrF32(0)
+>    const n = x.length
+>    let i = 0
+>    while i < n { __store_f32__(xb + (i << 2), …) ; i = i + 1 }
+>    ```
+>    So the fenced surface and raw speed are both available in one program.
+> 3. **`-O` is not enough; the release profile must be `-O3 --closed-world`.**
+>    `-O` does not inline the std wrappers and `-O3 --closed-world` does: a 3.5×
+>    swing on one flag. This is the number behind P1.3's ask. A residual 0.27
+>    ns/element survives inlining and is attributable to the per-access
+>    `struct.get` of the base field not being hoisted out of the loop — vl's own
+>    "backing-pointer hoisting (LICM)" backlog item, now with a price tag.
+>
+> Full method, caveats and the noise floor: `buffer-design.md` §L4.
 
 ### P1.5 Nominal/opaque types (vl A14) — id safety
 
@@ -286,6 +385,17 @@ Under pure structural typing they interchange silently; a generation-tagged
 entity id passed where a player index goes is exactly the bug class the TS
 twin catches with branded types. A zero-cost newtype (`type EntityId = new
 i32` or similar) closes it. Cheap, high-value for engine code.
+
+> Maintainer's note (vl side): **P1.1 already needed this, which argues for
+> pulling it above P1.2/P1.3.** The bug class is not hypothetical and it is not
+> confined to i32 ids — it bit the typed views on their first day. `F32View` and
+> `I32View` over the same `{base, count}` shape are ONE type to a structural
+> checker, so an integer column flows into a float accessor with no diagnostic
+> (measured; `buffer-design.md` §L2). The shipped workaround puts the element
+> width in the field NAME (`f32base` / `i32base`) because that is the only
+> discriminator a structural checker can see. A newtype deletes the workaround
+> and lets both fields go back to `base`. Every further width the view family
+> grows (i64, f64, the narrow widths) multiplies the same hack.
 
 ### P1.6 `vl test` (already designed)
 
