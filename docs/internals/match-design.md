@@ -33,7 +33,17 @@ expr may be a block** (Rust/Kotlin/Java/F#); the colon-`case:`-with-`break` styl
   is not a scrutinee at all — `match scrutinee must be a union, got i32`. A bare `i32` has no closed
   member set, so a `_`-only match over one would be an `if` with extra syntax.)
 - **Redundancy check.** A pattern already covered by an earlier arm is a compile error (dead arm).
-- **Scrutinee evaluated once.**
+- **Scrutinee evaluated once.** ⚠️ **NOT WHAT WAS BUILT — measured 2026-07-28.** Phase 2a mints
+  each arm's pattern as an `IsExpr` over the SHARED scrutinee NODE, and the desugar uses those
+  pattern nodes as the chain's conditions, so the scrutinee EXPRESSION is re-emitted once per
+  tested arm. A counting probe over a 3-arm match reads **2** evaluations (n−1, the exhaustive-
+  last-arm rule), identically on this branch and on master — so it is phase 2a's, not phase 2b's.
+  It is unobserved by the corpus because a scrutinee is almost always a plain place. Phase 2b
+  inherits it and adds one read per bound field, bounded by the same reason: a binding needs the
+  arm to NARROW the scrutinee, and only a place narrows, so a side-effecting scrutinee cannot
+  carry a payload clause at all (it reports `field 'x' is not on every member of … — narrow with
+  \`is\` first`). The honest fix is to bind the scrutinee to a synthesized temp once, ahead of the
+  chain — a desugar change, not a surface one.
 
 ## Patterns
 
