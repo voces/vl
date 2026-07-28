@@ -4,9 +4,20 @@
 // @log 3
 // @log ab
 // @log 2
-// THE TAUGHT HALF of the map scratch-frame reservation, pinned — plus the three
-// members that are NOT taught, named in prose because they cannot be pinned
-// without failing the suite.
+// @log 11
+// @log vv
+// @log true
+// @log 13
+// @log 14
+// @log 15
+// @log 16
+// @log 2
+// @log 2
+// @log 2
+// @log 2
+// @log 2
+// THE MAP SCRATCH-FRAME RESERVATION, pinned by RECEIVER — including the two
+// members that used to be missing and are now taught.
 //
 // `fbBeginFunc` reserves the 15-slot map scratch frame (`mapScratchBase`) plus the
 // per-mv-slot frames (`fnMvBase`) when `fnUsesMap` is set. Two scans set it
@@ -18,39 +29,54 @@
 // mapScratchBase + k` against locals that do not exist: INVALID WASM with
 // `vl check` rc 0.
 //
-// This file pins the covered spellings. A map LOCAL and a map PARAM are covered by
-// `fnHasMap` whatever the body does, so `.set` and `for k in m` work here.
+// TWO members were missing, both fixed and pinned below (measured over receiver
+// {global, struct field on a global struct, struct field on a param struct,
+// map-array element, lambda capture} x scope {module, named function, lambda,
+// nested} x value {i32, string, Set} — 21 + 13 cells, each invalid wasm ALONE and
+// correct the moment any one unrelated map op joined the same function):
 //
-// NOT COVERED — measured on 5394f3b, `vl check` rc 0, `vl build` rc 1, and every
-// cell becomes CORRECT if any ONE other map op is added to the same function
-// (deleting that bystander is the probe):
+//   1. `m.set(k, v)` — and its Set twin `s.add(x)`. `exprHasMapOp`'s Call arm
+//      enumerated `has` / `delete` / `keys` / `values` and had no `set` / `add`
+//      branch, while the handlers `emitMapSet` / `emitMapSetV` ask
+//      `exprMap(callee.memObj)`. Map LOCAL / PARAM receivers hid it (`fnHasMap`
+//      covers those whatever the body does), and the corpus MASKED it: this
+//      directory's only two global-map `.set` fixtures, `annotated-empty-ok.vl`
+//      and `infer-from-set.vl`, each carry a trailing `print(m[...] ?? -1)` whose
+//      READ is the only thing reserving the frame their own `.set` needs.
 //
-//   1. `m.set(k, v)` — and its Set twin `s.add(x)` — on any receiver that is not a
-//      map local/param of the enclosing frame: a module GLOBAL, a struct FIELD, a
-//      map-array element, a lambda capture. `exprHasMapOp`'s Call arm enumerates
-//      `has` / `delete` / `keys` / `values` and has no `set`/`add` branch, while
-//      the handlers `emitMapSet` (wasmEmit.vl:11546) and `emitMapSetV` (11564) ask
-//      `exprMap(callee.memObj)`.
+//   2. `for k in <map>` in its BARE form. The handler asks `forInMapRecv`, whose
+//      second half is `exprMap`; `blockHasMapOp`'s ForIn arm asked
+//      `exprHasMapOp(s.fiIter)`, which has no arm for a bare map iterable — a bare
+//      map Ident in an ordinary expression position is not a map op, only this
+//      header position makes one. `for k in m.keys()` / `m.values()` ARE covered,
+//      which is why this hid; and a Set has NO `.keys()` surface at all, so for a
+//      Set the bare form is the only form and had no working twin. Both halves of
+//      the pair are now asked through `forInMapRecv`: `blockHasMapOp`'s ForIn arm
+//      for a function body, `startFnDetectScratch`'s for a module-scope header.
 //
-//          const m: {[string]: i32} = Map()
-//          m.set("a", 1)                     // module scope, nothing else map-ish
-//
-//   2. `for k in <map>` in its BARE form on the same receivers. The handler asks
-//      `forInMapRecv` (emit_classify.vl:7735), whose second half is `exprMap`;
-//      `blockHasMapOp`'s ForIn arm asks `exprHasMapOp(s.fiIter)`, which has no
-//      `Ident` arm at all. `for k in m.keys()` / `m.values()` ARE covered (the
-//      `keys`/`values` Call arms), which is why this hid.
+// STILL NOT COVERED, measured on 6746f12:
 //
 //   3. `m[k]?.f ?? d` — `exprHasMapOp`'s `??` arm inspects an `Index` and a `Call`
 //      lhs; an `OptMember` lhs is claimed by no arm.
 //
-// The `.set` cells are additionally MASKED in this directory: `annotated-empty-ok.vl`
-// and `infer-from-set.vl` are the only two corpus fixtures that spell `m.set(...)`
-// on a global map, and both carry a trailing `print(m[...] ?? -1)` whose map READ is
-// the only thing reserving the frame their own `.set` needs. Strip the prints from
-// either and the module fails to validate.
+// EVERY function below holds exactly ONE map op, so each stays a real regression
+// pin: nothing in the file lends its frame to anything else. The readers take a
+// map PARAM (covered by `fnHasMap`), and the module-scope statements are calls
+// whose arguments are bare idents — no map op runs in the start function at all.
 type B = { m: {[string]: i32} }
 
+// ── readers: a map PARAM, covered by `fnHasMap`'s declaration scan ────────────
+function readIt(mm: {[string]: i32}) {
+  mm["k"] ?? -1
+}
+function readStr(mm: {[string]: string}) {
+  mm["k"] ?? "zz"
+}
+function hasIt(ss: {[string]: boolean}) {
+  return ss.has("k")
+}
+
+// ── THE TAUGHT HALF: a map LOCAL / PARAM, covered whatever the body does ──────
 // A map LOCAL: `fnHasMap`'s local scan reserves the frame regardless of the body,
 // so the method form works with no other map op present.
 function viaLocal() {
@@ -103,3 +129,139 @@ const q: {[string]: i32} = Map()
 q["a"] = 1
 q["b"] = 2
 print(forInParam(q)) // 2
+
+// ── GAP 1: `.set` / `.add` on a non-local, non-param receiver ─────────────────
+// A module GLOBAL map. `fnHasMap` sees no map declaration in this frame, so the
+// body walk is the ONLY thing that can reserve it.
+const gm: {[string]: i32} = Map()
+function setOnGlobal(): i32 {
+  gm.set("k", 11)
+  // The read runs in `readIt`'s frame, not this one: a Call whose callee is an
+  // Ident is not a map op here, so the `.set` above is still this frame's only one.
+  return readIt(gm)
+}
+print(setOnGlobal()) // 11
+
+// A STRING-valued global map — the same `.set`, a different mv value slot.
+const gs: {[string]: string} = Map()
+function setOnGlobalStr(): string {
+  gs.set("k", "vv")
+  return readStr(gs)
+}
+print(setOnGlobalStr()) // vv
+
+// A global Set — `.add`, the `.set` twin. A Set has no `.keys()`, so nothing else
+// in this shape could ever have reserved the frame for it.
+const gset: {[string]: boolean} = Set()
+function addOnGlobalSet(): boolean {
+  gset.add("k")
+  return hasIt(gset)
+}
+print(addOnGlobalSet()) // true
+
+// A map field of a module-GLOBAL struct.
+const gb: B = { m: Map() }
+function setOnField(): i32 {
+  gb.m.set("k", 13)
+  return readIt(gb.m)
+}
+print(setOnField()) // 13
+
+// A map field of a PARAM struct.
+function setOnParamField(pb: B): i32 {
+  pb.m.set("k", 14)
+  return readIt(pb.m)
+}
+const gb2: B = { m: Map() }
+print(setOnParamField(gb2)) // 14
+
+// An ELEMENT of a map array (`{[string]: i32}[]`, ref-list element kind 3).
+const garr: {[string]: i32}[] = [Map()]
+function setOnArrayElem(): i32 {
+  garr[0].set("k", 15)
+  return readIt(garr[0])
+}
+print(setOnArrayElem()) // 15
+
+// A lambda CAPTURE of a parent-frame map local: inside the lifted lambda the map
+// is neither a local nor a param, it is an env field (`capturedKindOf == "map"`).
+function setViaCapture(): i32 {
+  const m: {[string]: i32} = Map()
+  const f = (n: i32) => {
+    m.set("k", n)
+    0
+  }
+  const zz = f(16)
+  return readIt(m) + zz
+}
+print(setViaCapture()) // 16
+
+// ── GAP 2: the BARE `for k in <map>` on those same receivers ──────────────────
+function forInGlobal(): i32 {
+  let n = 0
+  for k in gm2 {
+    n = n + 1
+  }
+  return n
+}
+const gm2: {[string]: i32} = Map()
+const z7 = seed2(gm2)
+print(forInGlobal() + z7) // 2
+
+function forInField(): i32 {
+  let n = 0
+  for k in gb3.m {
+    n = n + 1
+  }
+  return n
+}
+const gb3: B = { m: Map() }
+const z8 = seed2(gb3.m)
+print(forInField() + z8) // 2
+
+function forInParamField(pb: B): i32 {
+  let n = 0
+  for k in pb.m {
+    n = n + 1
+  }
+  return n
+}
+const gb4: B = { m: Map() }
+const z9 = seed2(gb4.m)
+print(forInParamField(gb4) + z9) // 2
+
+function forInArrayElem(): i32 {
+  let n = 0
+  for k in garr2[0] {
+    n = n + 1
+  }
+  return n
+}
+const garr2: {[string]: i32}[] = [Map()]
+const z10 = seed2(garr2[0])
+print(forInArrayElem() + z10) // 2
+
+// A global SET: the bare form is the ONLY form (`.keys()` is not on a Set).
+function forInGlobalSet(): i32 {
+  let n = 0
+  for k in gset2 {
+    n = n + 1
+  }
+  return n
+}
+const gset2: {[string]: boolean} = Set()
+// Seeded at MODULE scope: `.add` has no PARAM surface (`unknown property add on
+// {[string]: boolean}`), so this pair is the only map op in the start function.
+// It cannot lend its frame to any pin in this file — every pin lives in its own
+// function.
+gset2.add("a")
+gset2.add("b")
+print(forInGlobalSet()) // 2
+
+// The seeders take a map PARAM, so their own frames come from `fnHasMap` and they
+// never lend one to the readers above.
+function seed2(mm: {[string]: i32}): i32 {
+  mm["a"] = 1
+  mm["b"] = 2
+  return 0
+}
