@@ -1,0 +1,105 @@
+// @run
+// @log 1
+// @log 2
+// @log 3
+// @log ab
+// @log 2
+// THE TAUGHT HALF of the map scratch-frame reservation, pinned — plus the three
+// members that are NOT taught, named in prose because they cannot be pinned
+// without failing the suite.
+//
+// `fbBeginFunc` reserves the 15-slot map scratch frame (`mapScratchBase`) plus the
+// per-mv-slot frames (`fnMvBase`) when `fnUsesMap` is set. Two scans set it
+// (`emit_sections.emitFuncCode`): `fnHasMap`, which reads the function's LOCAL and
+// PARAM declarations only, and `fnHasGlobalMapOp` → `blockHasMapOp` →
+// `exprHasMapOp`, which walks the body. The handlers all ask ONE predicate,
+// `exprMap(<receiver>)`, and none of them has a "frame not reserved" floor — so a
+// receiver `exprMap` resolves that neither scan claims writes `local.set
+// mapScratchBase + k` against locals that do not exist: INVALID WASM with
+// `vl check` rc 0.
+//
+// This file pins the covered spellings. A map LOCAL and a map PARAM are covered by
+// `fnHasMap` whatever the body does, so `.set` and `for k in m` work here.
+//
+// NOT COVERED — measured on 5394f3b, `vl check` rc 0, `vl build` rc 1, and every
+// cell becomes CORRECT if any ONE other map op is added to the same function
+// (deleting that bystander is the probe):
+//
+//   1. `m.set(k, v)` — and its Set twin `s.add(x)` — on any receiver that is not a
+//      map local/param of the enclosing frame: a module GLOBAL, a struct FIELD, a
+//      map-array element, a lambda capture. `exprHasMapOp`'s Call arm enumerates
+//      `has` / `delete` / `keys` / `values` and has no `set`/`add` branch, while
+//      the handlers `emitMapSet` (wasmEmit.vl:11546) and `emitMapSetV` (11564) ask
+//      `exprMap(callee.memObj)`.
+//
+//          const m: {[string]: i32} = Map()
+//          m.set("a", 1)                     // module scope, nothing else map-ish
+//
+//   2. `for k in <map>` in its BARE form on the same receivers. The handler asks
+//      `forInMapRecv` (emit_classify.vl:7735), whose second half is `exprMap`;
+//      `blockHasMapOp`'s ForIn arm asks `exprHasMapOp(s.fiIter)`, which has no
+//      `Ident` arm at all. `for k in m.keys()` / `m.values()` ARE covered (the
+//      `keys`/`values` Call arms), which is why this hid.
+//
+//   3. `m[k]?.f ?? d` — `exprHasMapOp`'s `??` arm inspects an `Index` and a `Call`
+//      lhs; an `OptMember` lhs is claimed by no arm.
+//
+// The `.set` cells are additionally MASKED in this directory: `annotated-empty-ok.vl`
+// and `infer-from-set.vl` are the only two corpus fixtures that spell `m.set(...)`
+// on a global map, and both carry a trailing `print(m[...] ?? -1)` whose map READ is
+// the only thing reserving the frame their own `.set` needs. Strip the prints from
+// either and the module fails to validate.
+type B = { m: {[string]: i32} }
+
+// A map LOCAL: `fnHasMap`'s local scan reserves the frame regardless of the body,
+// so the method form works with no other map op present.
+function viaLocal() {
+  const m: {[string]: i32} = Map()
+  m.set("a", 1)
+  m["a"] ?? 0
+}
+print(viaLocal()) // 1
+
+// A map PARAM: `fnHasMap`'s param arm (`nameIsMap` on the annotation).
+function viaParam(m: {[string]: i32}) {
+  m.set("b", 2)
+  m["b"] ?? 0
+}
+const p: {[string]: i32} = Map()
+print(viaParam(p)) // 2
+
+// A Set LOCAL — `.add` rides the same frame and the same local-scan backstop.
+function viaSetLocal() {
+  const s: {[string]: boolean} = Set()
+  s.add("x")
+  s.add("y")
+  s.add("z")
+  s.length
+}
+print(viaSetLocal()) // 3
+
+// The BARE `for k in m` over a map LOCAL — covered by `fnHasMap`, not by the body walk.
+function forInLocal() {
+  const m: {[string]: i32} = Map()
+  m["a"] = 1
+  m["b"] = 2
+  let out = ""
+  for k in m {
+    out = out + k
+  }
+  out
+}
+print(forInLocal()) // ab
+
+// The bare `for k in m` over a map PARAM.
+function forInParam(m: {[string]: i32}) {
+  let n = 0
+  for k in m {
+    n = n + 1
+  }
+  n
+}
+const q: {[string]: i32} = Map()
+q["a"] = 1
+q["b"] = 2
+print(forInParam(q)) // 2

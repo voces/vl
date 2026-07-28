@@ -29727,3 +29727,203 @@ sabotages, different channels.
   separate "can this operand be short here" questions. The W5 sites still needed their reachability
   arguments, because `arrElemNameRaw`'s guard genuinely changes the answer — which is exactly the
   line between the two families in this slice.
+---
+
+## RESERVATION-SCAN AUDIT (2026-07-27) — the family after #1240/#1241 is NOT closed
+
+`#1240` (string scratch frame) and `#1241` (print imports) were two instances of one shape:
+
+> A pass scans the program to decide what to RESERVE. A handler later consumes the
+> reservation. The two ends disagree about the member set, so for the members the scan
+> does not know, the handler emits code against a resource that was never reserved —
+> a `vl check`-clean INVALID WASM module.
+
+This is the audit of every other reservation pass. **The family is not closed: nine more
+gaps, 113 measured cells, every one `vl check` rc 0 / `vl build` rc 1.**
+
+### HOW THE PASSES WERE ENUMERATED (reproducible)
+
+Structurally, not by name. Three steps:
+
+1. **The reservation chain is one function.** `emit_bytes.fbBeginFunc` (emit_bytes.vl:733-860)
+   walks ONE cursor and hands out every `*ScratchBase` / `*Slot` global, each gated on a
+   `fnUses*` flag. `grep '^export let fnUses' compiler/emit_state.vl` yields the complete
+   flag list (18 flags + 4 slot arrays); `grep 'fbReserve' compiler/emit_bytes.vl` yields the
+   complete frame list. Module-level reservations are the residue: `gImports`,
+   `memUsed`/`memLogUsed`, `hasStart`, `gMemLogIdx`, `helpBase`, the element segment,
+   `cloSigBase`/`cloStructIdx`.
+2. **For each frame, grep its base global across `compiler/*.vl`.** Writers are in
+   `fbBeginFunc`; readers are the HANDLERS. The scans are the assignments to the flag
+   (`emit_sections.emitFuncCode` for user functions, `emit_sections.startFnDetectScratch`
+   for the start function).
+3. **Rank by whether the handler has a FLOOR.** `grep '!fnUses'` over `wasmEmit.vl` /
+   `emit_classify.vl` returns exactly five sites — `fnUsesVariantRebox` (wasmEmit.vl:1684),
+   `fnUsesMapKeys` (5036), `fnUsesMapVals` (5139), `fnUsesMapFilter` (10425, 10633) — plus
+   the ref-list compare's `leqRBaseOfSlot < 0` (13353). **Every other frame is unfloored**,
+   so a member-set diff there is invalid wasm rather than a clean reject. That grep IS the
+   priority order.
+
+Two mechanical instruments did the finding:
+
+- **The corpus print-strip sweep.** For all 1,538 `tests/cases/**/*.vl`: build as-is; drop
+  every line whose first token is `print(`; re-check and re-build. 12 files went
+  `vl check` rc 0 + invalid wasm. This is #1241's discovery mechanism run corpus-wide.
+- **The bystander control, on every probe.** Each probe is generated twice — alone, and
+  with one unrelated use of the same frame. `INVALID-WASM alone` + `correct with the
+  bystander` is the decisive signature of a reservation miss (as opposed to a lowering
+  bug, which the bystander does not touch). **113 of 113 cells in this family flipped.**
+
+### THE GAPS
+
+Every row: `vl check` rc 0, `vl build` rc 1, module written and unable to instantiate.
+
+| # | scan (file:fn) | handler (file:fn) | missing member | cells |
+|---|---|---|---|---|
+| 1 | `emit_classify.exprHasMapOp` Call arm (18160) — knows `has`/`delete`/`keys`/`values` | `wasmEmit.vl:11546` → `emitMapSet`; `11564` → `emitMapSetV`; both ask `exprMap(memObj)` | **`m.set(k, v)` and `s.add(x)`** on any receiver that is not a map local/param of the frame | 39 |
+| 2 | `emit_classify.blockHasMapOp` ForIn arm (18244) asks `exprHasMapOp(s.fiIter)`, which has no `Ident` arm | `wasmEmit.vl:11954` `emitForInStmt`, asks `forInMapRecv` = `exprMap(iterIx)` | **`for k in <map>` in its BARE form** (the `.keys()`/`.values()` forms ARE claimed) | 20 |
+| 3 | `emit_classify.ifChainPushPopBits` (3697) — walks `ifThen`/`ifElse`, never `s.ifCond` | `wasmEmit.emitPop` (9904) / `emitPopOr` (10214), `local.set <pushframe>+3` | **a `.pop()` in an `if`/`else if` CONDITION** inside a function or lambda | 12 |
+| 4 | `emit_classify.exprPopBits` (3621) — descends Call-args/BinExpr/Member/Index/Unary/Paren only | same | **a `.pop()` in an `ArrayLit` element, an `ObjLit` field value, or an `as`-cast operand** | 12 |
+| 5 | `emit_query.exprHasCoalesceCall` (348) — no `IfStmt` arm | `wasmEmit.emitCoalesce` (14308/14338/14358) | **a call-LHS `??` in an if-EXPRESSION arm** | 5 |
+| 6 | `emit_query.exprHasArrNew` (227) — no `IfStmt` arm | `wasmEmit.emitArrayNewIntr` (13977) | **`__array_new__` in an if-EXPRESSION arm** | 2 |
+| 7 | `emit_collect.leqScanExpr` (2132) — no `IfStmt` arm | `wasmEmit.vl:6621`/`6672` list-eq cores | **a list `==` in an if-EXPRESSION arm** | 3 |
+| 8 | `emit_sections.startFnDetectScratch` (864-895) hands `WhileStmt`/`ForRange` only their BODY | every frame's handler | **a top-level `while` CONDITION or `for`-range BOUND** holding the frame's only use | 6 |
+| 9 | `emit_query.exprHasCoalesceCall` asks only `binLeft is Call` | `wasmEmit.emitCoalesce` (14077-14090) RE-ASSOCIATES `(a ?? b) ?? d` into `a ?? (b ?? d)` | **the MIDDLE operand of a `??` chain** — the node the handler tests does not exist when the scan runs | 5 |
+
+Reproductions (each is the whole program; adding one more use of the same frame to the
+same function makes every one of them build and run):
+
+```
+const m: {[string]: i32} = Map()
+m.set("a", 1)                                   # 1
+
+const m: {[string]: i32} = Map()
+for k in m { const z = k }                      # 2
+
+const xs: i32[] = [1]
+function f() { if (xs.pop() ?? -1) == 1 { return 1 }  return 0 }      # 3
+function f() { const ys: i32[] = [xs.pop() ?? -1]  return ys.length } # 4
+
+function g(n: i32): i32 | null { if n > 0 { return n }  null }
+function f(c: boolean) { const v = if c then g(2) ?? 0 else 0  return v }                            # 5
+function f(c: boolean, n: i32) { const a = if c then __array_new__(n,0) else __array_new__(1,0)  return a.length }  # 6
+function f(c: boolean) { const xs=[1,2]  const ys=[1,2]  const b = if c then xs==ys else false  return b }          # 7
+
+let n = 3
+while (g(n) ?? 0) > 0 { n = n - 1 }             # 8, at module scope
+function f(x: i32 | null) { return x ?? g(2) ?? -1 }                 # 9
+```
+
+### THE PATTERN INSIDE THE PATTERN
+
+Six of the nine are a **walker family with one member missing the arm its siblings have**:
+
+- `ifCond`: `ifChainHasMapOp`, `ifChainHasStrOp`, `ifChainHasCoalesceCall` and
+  `startScanIf` all walk the condition. `ifChainPushPopBits` does not — and its header
+  says so, on the reasoning that "the start-fn if-scan handles its conditions". It does;
+  nothing handles a regular function's.
+- `IfStmt` as an EXPRESSION: `blockHasCallRef` has the arm; `exprHasArrNew`,
+  `exprHasCoalesceCall` and `leqScanExpr` do not.
+- `ArrayLit`/`ObjLit`/`AsExpr`: `exprHasMapOp` has all three; `exprPopBits` has none.
+- loop HEADERS: `blockHasMapOp`/`blockHasArrNew`/`blockHasCoalesceCall` walk `whileCond`,
+  `frFrom`, `frTo`; `startFnDetectScratch` walks the `ForIn` iterable and the `IfStmt`
+  condition by hand and leaves the other two headers unscanned.
+
+**The probe that finds these needs no new idea: run the same construct at every scope and
+in every syntactic position, twice, with and without a bystander.**
+
+### MASKED FIXTURES
+
+- `tests/cases/maps/annotated-empty-ok.vl` and `tests/cases/maps/infer-from-set.vl` are the
+  only two corpus fixtures that spell `m.set(...)` on a global map. **Both are masked**:
+  their trailing `print(m[...] ?? -1)` is the only thing reserving the frame their own
+  `.set` needs. Strip the prints and both modules fail to validate — the same relationship
+  `trap-message.vl` had to `__trap__` before #1241.
+- Gaps 2-9 have **zero** corpus coverage: no fixture anywhere spells a bare `for k in <map>`
+  on a non-local receiver, a `.pop()` in an `if` condition or a literal, a call-LHS `??` in
+  an if-expression arm, or a `??` chain.
+
+Three fixtures added by this audit pin the TAUGHT half of each and name the untaught half
+in prose (they cannot be pinned without failing the suite):
+`tests/cases/maps/map-scratch-frame-reservation.vl`,
+`tests/cases/lists/pop-frame-reservation-positions.vl`,
+`tests/cases/expressions/scratch-frame-reservation-positions.vl`.
+
+### WHAT IS CLOSED (negative results, with the evidence)
+
+- **The import family.** `emitPrintStrExpr` has exactly three call sites and `fbCall(0..3)`
+  appears only inside `print`'s router, `emitPrintStrExpr`/`emitPrintNulBool` and the
+  `__log__` decoder. `scanPrintUse` covers `print`, `__log__` and `__trap__` with arity 1 —
+  and the handler's `__trap__` arm streams on exactly `callArgs.length == 1`. Identical.
+- **The wide-scalar print imports.** Every base case of `exprIsF64`/`exprIsI64`/`exprIsF32`
+  traces to a `TypeRef`, a `NumLit`, an `AsExpr` `asTy`, a numeric intrinsic or a memory
+  load width — the scan's five sources. No construct found that is wide to the router and
+  invisible to the scan.
+- **The memory section**, the wide load/store NAME sets (7 loads, 3 wide stores, agreeing
+  across six tables and the checker's `declare()`s), `hasStart`, `gMemLogIdx`, the helper
+  count/indices (with `mUsed ⟹ aUsed` verified at all seven sites), the element segment
+  (a strict superset of what `fbRefFunc` can name), and `cloSigKeys`/`cloSigBase` (every
+  consumer `-1`-guarded with an `emitFail`): **identical member sets on both ends.**
+- **`fnUsesArrNew`'s intrinsic NAMES** (`__array_new__` + `__array_new_default__`) and the
+  **list-eq operator/element sets** (both ends call the same `listOpKindOfBin`) are
+  identical. Their exposure is positional only — gaps 6, 7, 8.
+- **The push/pop ELEMENT-kind axis is a clean reject, not a defect**: `emitPop`/`emitClear`
+  never ask `exprI64Array`/`exprF32Array`, but an `i64[]`/`f32[]`/`f64[]` `.pop()`/`.clear()`
+  is an `emitProgram:` reject before it reaches a frame. 20 cells, all clean.
+- **`fnValUsed`'s position enumeration** vs `emitIdentNode`'s total treatment of a resolving
+  `Ident` produced no invalid wasm across `return`, call-argument, `ArrayLit` and `??`
+  positions — the indirect `TypeRef` coverage holds. `return <bare fn name>` is an
+  emit-reject that a bystander turns into a correct compile: an expressiveness gap, not
+  this defect.
+- **A stale filing corrected.** The long `FILED, NOT FIXED` block at `wasmEmit.vl:8393`
+  describes the defect #1240 fixed; the fix landed in `emit_classify.vl` and this comment
+  was not updated. Also, `#1241`'s trailing filing (`let g: f32 = f32fromBits(1)` +
+  `print(g)`) is NOT an import-reservation miss: the module declares `__print_f32__`
+  correctly at index 4 and calls it correctly. Disassembled, the bug is
+  `(f32.reinterpret_i32 (f32.const 1))` — the annotation leaks into the intrinsic's
+  ARGUMENT, which wants an i32. A lowering defect, not a reservation one.
+
+### TWO UNGUARDED INDICES, FILED WITHOUT A WITNESS
+
+- `cloStructIdx` is set to `mNextType` — an UNALLOCATED type index — when `!fnValUsed`
+  (emit_collect.vl:2747), and `wasmEmit.vl:1371`/`8885`/`13843` write it with no
+  `fnValUsed` test. `emitClosureValueCore` floors on `fe` bounds and on an empty sig key,
+  but not on `fnValUsed`. No reaching path found.
+- The five helper `fbCall` targets (`wasmEmit.vl:4453, 4479, 5318, 6444, 6608`) carry no
+  `>= 0` guard, unlike the closure-sig site which calls `fnSigIsClosure` first. No reaching
+  path found.
+
+### A CORRECTNESS-NEUTRAL HYGIENE BUG, FOR WHOEVER IS NEXT IN THE FILE
+
+`emit_sections.vl:626-627` writes `fnUsesMapVals = false` TWICE inside `emitFuncCode`.
+`mfScan` sets exactly three flags and lines 624-633 clear all of them, so there is no
+fourth flag the second line could have meant. Its twin is missing one function away:
+`startFnDetectScratch` (793-815) resets every scratch flag `emitFuncCode` resets EXCEPT
+`fnUsesMapVals` — and `emitCodeSection` runs every user function before the start function,
+so the start function inherits `fnUsesMapVals` from `fnStmts[n-1]`. Over-reservation only
+(the layout and the locals vector both come from `fbBeginFunc`), so it is spare locals, not
+invalid wasm. The line belongs at emit_sections.vl:809.
+
+### A SEPARATE FAMILY THE SWEEP TURNED UP — NOT RESERVATION
+
+Ten of the twelve print-strip hits are NOT rescued by any bystander, so they are lowering
+defects, not reservation misses. They share a shape worth its own audit: **a value whose
+only consumer was the deleted `print` emits invalid wasm.** All ten are `vl check` rc 0.
+
+`literal-unions/atom-string-global-init.vl`, `literal-unions/atom-print.vl`,
+`numerics/widen-i32-into-i64-f64-slot.vl`, `functions/assign-rhs-lambda-inference.vl`,
+`functions/operator-capability-poly.vl`, `types/assign-narrow-then-null-guard.vl`,
+`globals/nullable-refarray-global-empty-init.vl`, `lists/list-literal-assign-union-elem.vl`,
+`lists/list-literal-assign-cell.vl`, `lists/litunion-inline-array-positions.vl` — strip the
+`print(` lines from each and re-run `vl build`.
+
+Two more from the same sweep, also un-rescued (a bystander does not help either):
+
+```
+const gi = [1, 2, 3]
+function f() { const n = gi.length  const _d = gi.pop()  n }
+print(f())                       # a BARE nullable `.pop()` binding — invalid wasm
+
+type Color = "red" | "green" | "blue"
+function f() { const c: Color = "blue"  const m: {[string]: string} = Map()  m["k"] = c  return 0 }
+f()                              # a literal-union atom widened into a map VALUE
+```

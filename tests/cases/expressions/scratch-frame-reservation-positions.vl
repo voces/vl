@@ -1,0 +1,128 @@
+// @run
+// @log 3
+// @log 2
+// @log 5
+// @log true
+// @log true
+// @log 4
+// @log 7
+// THE TAUGHT HALF of three more scratch-frame reservations, by POSITION — the
+// call-LHS `??` stash (`coalesceCallSlot`/`StrSlot`/`BoolSlot`), the array-intrinsic
+// length slot (`arrNewScratchBase`) and the list `==`/`+` frames
+// (`leqIScratchBase`/`leqSScratchBase`) — plus the positions that are NOT taught,
+// named in prose because they cannot be pinned without failing the suite.
+//
+// None of these three handlers has a "frame not reserved" floor (only the ref-list
+// compare arm does, wasmEmit.vl:13353), so a position the scan does not walk emits
+// `local.set` against a local the locals vector never declared: INVALID WASM with
+// `vl check` rc 0.
+//
+// NOT WALKED — measured on 5394f3b, `vl check` rc 0, `vl build` rc 1, each cell
+// CORRECT the moment one more use of the same frame is added to the same function:
+//
+//   1. AN if-EXPRESSION ARM. An if-expression is an `IfStmt` node sitting in a
+//      value slot (`exprIsIfStmt`, emit_query.vl:462); `emitExpr` lowers its arms
+//      through the ordinary path. `exprHasArrNew` (emit_query.vl:227),
+//      `exprHasCoalesceCall` (emit_query.vl:348) and `leqScanExpr`
+//      (emit_collect.vl:2132) have no `IfStmt` arm and fall off the end of their
+//      dispatch. `blockHasCallRef` (emit_classify.vl:5880) HAS one — same family,
+//      one member taught.
+//
+//          const v = if c then g(n) ?? 0 else 0      // g(): i32 | null
+//          const a = if c then __array_new__(n, 0) else __array_new__(1, 0)
+//          const b = if c then xs == ys else false
+//
+//   2. A TOP-LEVEL `while` CONDITION or `for`-RANGE BOUND. `startFnDetectScratch`
+//      (emit_sections.vl:864-895) hands a `WhileStmt` and a `ForRange` only their
+//      BODY to `startScanBlock`; `whileCond`, `frFrom` and `frTo` are scanned by
+//      nobody. The `ForIn` arm right beside them compensates by hand-scanning
+//      `st.fiIter`, and the `IfStmt` arm hand-scans `st.ifCond` — two of the four
+//      headers are covered and two are not. The in-function twins ARE covered
+//      (`blockHasArrNew`/`blockHasCoalesceCall`/`blockHasMapOp` all walk
+//      `whileCond`/`frFrom`/`frTo`), which is why this hid.
+//
+//          while (g(n) ?? 0) > 0 { n = n - 1 }       // at module scope
+//          for i in 0 to (g(2) ?? 0) { }             // at module scope
+//
+//   3. THE MIDDLE OPERAND OF A `??` CHAIN. `a ?? b ?? d` parses as `(a ?? b) ?? d`
+//      and `emitCoalesce` (wasmEmit.vl:14077-14090) RE-ASSOCIATES it to
+//      `a ?? (b ?? d)`, minting a new `BinExpr` in which `b` is a `??` LHS.
+//      `exprHasCoalesceCall` only ever asks whether a `??`'s `binLeft` is a Call —
+//      it never asks about `binRight`, and the re-associated node does not exist
+//      when the scan runs. So `x ?? f() ?? d` reserves nothing and then
+//      `fbLocalSet(coalesceCallSlot)` runs. The rewrite is the scan's blind spot,
+//      not a member of any enumeration it could have been taught.
+//
+// Measured: 22 cells over these three shapes x {named function, lambda, module
+// scope, return position, call-argument position} x {i32, string, boolean, list}
+// reps — every one invalid wasm alone, every one correct with a bystander.
+function maybe(n: i32): i32 | null {
+  if n > 0 { return n }
+  null
+}
+function maybeS(n: i32): string | null {
+  if n > 0 { return "s" }
+  null
+}
+
+// call-LHS `??` in a LetDecl init — walked (`blockHasCoalesceCall`'s `LetDecl` arm).
+function coalInLet(n: i32) {
+  const v = maybe(n) ?? -1
+  v
+}
+print(coalInLet(3)) // 3
+
+// call-LHS `??` in a while CONDITION inside a FUNCTION — walked
+// (`blockHasCoalesceCall`'s `WhileStmt` arm scans `whileCond`). Its module-scope
+// twin is gap 2 above.
+function coalInWhileCond(n: i32) {
+  let k = n
+  while (maybe(k) ?? 0) > 2 {
+    k = k - 1
+  }
+  k
+}
+print(coalInWhileCond(5)) // 2
+
+// call-LHS `??` in a for-range BOUND inside a FUNCTION — walked (`ForRange` arm).
+function coalInForBound() {
+  let n = 0
+  for i in 0 to (maybe(4) ?? 0) {
+    n = n + 1
+  }
+  n
+}
+print(coalInForBound()) // 5
+
+// the string|null rep of the same stash, in a return position — walked.
+function coalStr(n: i32) {
+  return (maybeS(n) ?? "z") == "s"
+}
+print(coalStr(1)) // true
+
+// list `==` in a LetDecl init — walked (`leqScanStmt`'s `LetDecl` arm).
+function listEqInLet() {
+  const xs = [1, 2]
+  const ys = [1, 2]
+  const b = xs == ys
+  b
+}
+print(listEqInLet()) // true
+
+// `__array_new__` in a LetDecl init — walked (`blockHasArrNew`'s `LetDecl` arm).
+function arrNewInLet(n: i32) {
+  const a = __array_new__(n, 0)
+  a.length
+}
+print(arrNewInLet(4)) // 4
+
+// A TOP-LEVEL for-in ITERABLE holding the frame's only use — walked, because the
+// `ForIn` arm of `startFnDetectScratch` hand-scans `st.fiIter`. This is the half of
+// the loop-header pair that HAS the arm; `while`/`for`-range are gap 2.
+const src = [3, 4]
+let total = 0
+for v in __array_new__(2, 0) {
+  total = total + v
+}
+total = total + src[0] + src[1]
+print(total) // 7
