@@ -6445,14 +6445,82 @@ function globalIsF32(name: string) {
 // NOT f32 (it defaults f64 — `exprIsF64`); it becomes f32 only as the operand of an f32
 // op or the init of an `: f32` binding. Checked BEFORE `exprIsF64` at every dispatch so
 // a mixed f32/float-literal expression routes to the f32 instructions. (Slice 5.)
-// Is the expression at `exprIx` (peeling parens) a FLOAT number literal (`2.5`)? A float literal is
-// polymorphic across the float types — it adapts DOWN to an f32 operand — so it does NOT force f64
-// the way a genuine f64 reference/result/variable does.
+// Is the expression at `exprIx` a FLOAT number literal, peeling grouping parens AND a leading
+// unary `-`? A float literal is polymorphic across the float types — it adapts DOWN to an f32
+// operand — so it does NOT force f64 the way a genuine f64 reference/result/variable does.
+//
+// The unary peel is not cosmetic: `-1.0` parses as a `Unary` OVER the literal, so the
+// paren-only spelling answered "not a literal" for it and `copysign(fv, -1.0)` / `min(fv, -2.5)`
+// resolved at f64 in an f32 slot. `emitExprAsF32` has the matching lowering (it re-encodes a
+// negated float literal directly as `f32.const -1.5`), which is what makes the negated form
+// genuinely adaptable and not just classified so.
 function exprIsFloatLit(exprIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[unwrapParen(exprIx)]
   if e is NumLit { return numTextIsFloat(e.numText) }
+  if e is Unary {
+    if e.unOp == "-" {
+      const neg = P.nodes[unwrapParen(e.unArg)]
+      if neg is NumLit { return numTextIsFloat(neg.numText) }
+    }
+  }
   false
+}
+
+// What kinds of LEAF does the arithmetic spine at `exprIx` (parens, unary `-`, `+ - * /`) carry?
+// Bit 1 = a leaf the f32 classifier claims; bit 2 = a leaf `exprIsF64` claims that is not a bare
+// number literal (a GENUINE f64). Number literals contribute NEITHER — a float literal re-encodes
+// at whichever width the operation resolves to.
+//
+// One `exprIsF32` / `exprIsF64` per spine leaf, so this is LINEAR in the subtree. A leaf is never
+// an arithmetic node, so it cannot re-enter `binMixHardF64` on its own spine.
+function spineFloatLeafBits(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  const e = P.nodes[exprIx]
+  if e is Paren { return spineFloatLeafBits(e.parInner, fnIx) }
+  if e is Unary {
+    if e.unOp == "-" { return spineFloatLeafBits(e.unArg, fnIx) }
+  }
+  if e is BinExpr {
+    const op = e.binOp
+    if op == "+" || op == "-" || op == "*" || op == "/" {
+      const lb = spineFloatLeafBits(e.binLeft, fnIx)
+      const rb = spineFloatLeafBits(e.binRight, fnIx)
+      return lb | rb
+    }
+  }
+  if e is NumLit { return 0 }
+  let bits = 0
+  if exprIsF32(exprIx, fnIx) { bits = 1 }
+  if exprIsF64(exprIx, fnIx) { bits = bits | 2 }
+  bits
+}
+
+// Is the OPERAND at `exprIx` a GENUINE f64 — an f64 that does NOT adapt down to an f32 operand?
+//
+// `exprIsF64` alone over-claims, because it is TRUE for any arithmetic node with a float LITERAL
+// anywhere inside it: `fv + 0.5` and `-1.0` are both `exprIsF64` while both lower perfectly well
+// at f32. Asking it of a COMPOUND operand therefore answered "genuine f64" about an expression
+// that is entirely f32 plus literals — which is how `floor(fv + 0.5)` and `copysign(fv, -1.0)`
+// came out `f64.floor` / `f64.copysign` in an f32 slot. `emitFloatIntr` asks this of an
+// intrinsic's first/last ARGUMENT (a one-argument intrinsic asks it of its single operand twice),
+// so the operand IS routinely a compound expression, not the leaf a binary operator's side is.
+//
+// The rule, in the order the arms below test it:
+//   • not `exprIsF64` at all             → not hard
+//   • a (parenthesized / negated) float literal → not hard, it re-encodes
+//   • a GENUINE f64 leaf anywhere in the spine  → HARD (`fv + dv`, `(fs + ft) * dw`)
+//   • otherwise soft ONLY if the spine has an f32 leaf to adapt to. An ALL-LITERAL float
+//     compound (`0.0 - 1.0`) has none: there is nothing to adapt to, and `emitExprAsF32` has no
+//     lowering for f64 arithmetic — its fallthrough is `f32.convert_i32_s`, which would take an
+//     `f64.sub`. So it stays f64, exactly as before (`float-opcodes-f32.vl` pins it).
+function exprHasHardF64(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  if !exprIsF64(exprIx, fnIx) { return false }
+  if exprIsFloatLit(exprIx) { return false }
+  const bits = spineFloatLeafBits(exprIx, fnIx)
+  if bits >= 2 { return true }
+  bits != 1
 }
 
 // Does a binary op over `leftIx`/`rightIx` have a GENUINE (non-literal) f64 operand? Such an operand
@@ -6461,13 +6529,8 @@ function exprIsFloatLit(exprIx: i32) {
 // not trigger this. Drives both the `exprIsF32` classification and the f32 emit slice: when true,
 // the op is f64 (the f64 slice), not f32 — without which the f32 slice demoted the f64 and trapped.
 export function binMixHardF64(leftIx: i32, rightIx: i32, fnIx: i32) {
-  if exprIsF64(leftIx, fnIx) {
-    if !exprIsFloatLit(leftIx) { return true }
-  }
-  if exprIsF64(rightIx, fnIx) {
-    if !exprIsFloatLit(rightIx) { return true }
-  }
-  false
+  if exprHasHardF64(leftIx, fnIx) { return true }
+  exprHasHardF64(rightIx, fnIx)
 }
 
 export function exprIsF32(exprIx: i32, fnIx: i32) {
