@@ -2237,6 +2237,44 @@ function monoNameIsExported(name: string) {
   false
 }
 
+// The `fnStmts` position `emitExportSection` would resolve `name` to: the FIRST slot holding a
+// `FuncDecl` of that name. Mirrors that resolver exactly, and the mirroring is load-bearing —
+// `monoNameIsExported` answers about a NAME, but two slots can carry one name and only one of
+// them is the ABI entry. A nested `function outer<T>(x: T) { … }` is lambda-lifted into `fnStmts`
+// UNMANGLED, so an `export function outer(n: i32): i32` elsewhere in the same file gives the
+// name two carriers: the concrete export at a lower index, and an un-instantiated generic
+// homonym at a higher one. The export section takes the first, so the second is ordinary dead
+// code that must keep taking the silent no-op stub. Measured — a name-only gate rejected that
+// program, moving a CORRECT cell backward to a reject, which is why this scan exists.
+//
+// Prior iterations of this same loop only ever REPLACE a slot with a same-named stub, so the
+// answer does not depend on how far the prune has walked.
+function monoFirstFnIndexNamed(name: string): i32 {
+  let i = 0
+  while i < fnStmts.length {
+    const f = P.nodes[fnStmts[i]]
+    if f is FuncDecl {
+      if f.fnName == name { return i }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The PUBLIC name an ABI entry publishes `name` under — for the diagnostic below, so it names
+// what the user WROTE. In module mode a declaration's merged name is mangled (`id$m1`) and a
+// re-export may rename it on the way out (`export { id as identity } from "./lib"`), so the raw
+// `fnName` is not something the source contains. Falls back to `name` (the single-source path,
+// where both tables hold the same string, and any name the tables do not carry).
+function monoExportPublicName(name: string): string {
+  let i = 0
+  while i < reExpTarget.length {
+    if reExpTarget[i] == name { return reExpName[i] }
+    i = i + 1
+  }
+  name
+}
+
 // Which of `names` is referenced as a function VALUE — i.e. appears as an `Ident` that is NOT
 // some `Call`'s callee — anywhere in the node arena. Returns an `i32[]` parallel to `names`
 // (1 = value-referenced). ONE arena pass regardless of how many names are asked about: the
@@ -2369,9 +2407,37 @@ export function monomorphize(stmts: i32[]) {
   // Replace each with a concrete no-op STUB (same name, no params, void body) — valid dead
   // code; nothing references it (any reference would have instantiated it).
   //
-  // A `<T>` decl takes this treatment UNCONDITIONALLY (master's behavior, byte-identical): it
+  // A `<T>` decl takes this treatment whenever it is NOT part of the module's wasm ABI: it
   // cannot be a lambda (anonymous literals take no type params) and is only ever reached by
-  // instantiation.
+  // instantiation, so an un-replaced non-exported slot is unreachable by construction.
+  //
+  // #1260 — THE EXPORTED HALF OF THAT SET IS A REJECT, NOT A STUB (the sin #1254's mechanism-B
+  // gate filed against the pre-existing `<T>` arm, live since #552). The stub keeps the
+  // declaration's NAME, so `emitExportSection` — which resolves the ABI by name — happily
+  // exported it, and `export function id<T>(x: T): T { return x }` with no call site built
+  // rc 0 and published `id` with the functype `() -> void` (measured, 34 bytes). An importer
+  // calling `id(1)` gets `undefined`: the JS/wasm boundary drops the surplus argument, so
+  // nothing traps and nothing is reported — a SILENT WRONG ANSWER, the worst outcome class
+  // alongside invalid wasm. Same for `<A, B>`, for a `T[]` param, and in module mode for both
+  // a root-declared export and a root `export { id } from "./lib"` re-export of a dependency's
+  // generic (all measured).
+  //
+  // There is no concrete signature to emit instead. Wasm has no generics, so the ABI entry must
+  // name ONE functype, and an un-instantiated `<T>` supplies no shape to pick — not even a bad
+  // default, since `T` may be i32, string, or a struct with different valtypes. Nor is there a
+  // cross-module escape hatch: VL's `import` MERGES the graph before this pass runs, so every
+  // instantiation of an exported generic is an in-module call site by the time the prune reads
+  // the slot (measured: `export { id } from "./lib"` alongside `id(1)` instantiates and exports
+  // `(i32) -> i32` — that cell keeps working). A wasm host is the only remaining consumer, and
+  // it cannot instantiate anything. So the choice is between a silently-wrong export, silently
+  // DROPPING the name (a link error at the importer — still silent at build time), and a loud
+  // build-time reject naming the fix. The reject is the only one that reports.
+  //
+  // The gate is exactly `monoNameIsExported`, which is the same name-resolution
+  // `emitExportSection` uses — so the reject fires on precisely the decls that would have
+  // reached the export section, and a dependency's un-imported generics (the routine case this
+  // prune exists for: `std:array`'s `reduce`/`count` in a program that uses only `indexOf`)
+  // are not in those tables and still stub silently.
   //
   // #1254 MECHANISM B — THE UN-ANNOTATED-PARAM HALF OF THE SAME SET. The gate used to be
   // `<T>`-only, so a NAMED function with an un-annotated parameter and no call site was emitted
@@ -2401,9 +2467,13 @@ export function monomorphize(stmts: i32[]) {
   //       { return s + "!" }` therefore keeps master's invalid wasm. The right treatment for that
   //       one is a LOUD reject naming the un-inferable export, which needs the emitter's own
   //       knowledge of whether the body lowers (this pass cannot tell `exclaim` from `add`), so it
-  //       is filed rather than guessed at. NOTE: the pre-existing `<T>` arm above already stubs an
-  //       EXPORTED uncalled `<T>` generic into that same `() -> void` ABI — measured, not
-  //       introduced here, and filed alongside.
+  //       is filed rather than guessed at — STILL OPEN after #1260.
+  //
+  //       The `<T>` half of that filing IS closed: #1260 made the arm above reject an EXPORTED
+  //       uncalled `<T>` generic instead of stubbing it into a `() -> void` ABI. The two halves
+  //       diverge for a reason, not by omission — a `<T>` decl has NO lowerable shape at all
+  //       (`add`'s hole has one, and it is a working export), so "never instantiated" is a
+  //       decidable property of the slot here, while "does the body lower" is not.
   //
   //   (3) NOT referenced as a function VALUE (`monoNamesUsedAsValue`) — see that helper.
   //
@@ -2437,6 +2507,26 @@ export function monomorphize(stmts: i32[]) {
       if gfn is FuncDecl {
         let prune = false
         if gfn.fnTyParams.length > 0 {
+          // #1260: the slot is still the captured template, so nothing instantiated it — and it
+          // IS the slot the export section resolves to, so the stub below would publish its name
+          // at `() -> void`. Reject loudly instead, under the name the export actually publishes.
+          // Both halves of the gate are needed: the name must be in the ABI tables, AND this slot
+          // must be the carrier `emitExportSection` picks (a lifted nested homonym is not).
+          let isAbiSlot = false
+          if monoNameIsExported(gfn.fnName) {
+            if monoFirstFnIndexNamed(gfn.fnName) == gp { isAbiSlot = true }
+          }
+          if isAbiSlot {
+            const pubNm = monoExportPublicName(gfn.fnName)
+            return emitFail(
+              "emitProgram: the exported generic function `" +
+                pubNm +
+                "` is never instantiated, so there is no concrete signature to export " +
+                "(a wasm export names one functype and `" +
+                pubNm +
+                "` names none) — call it in this module, or export a concrete wrapper",
+            )
+          }
           prune = true
         } else {
           let ci = 0
