@@ -31449,6 +31449,11 @@ three-writing SPLIT entry and W14 (field-colon cut) are closed. What remains, in
 | 6 | **REFUTED / a different operation** | **3** | NOT THE SAME QUESTION — re-derived and rejected, so no later census re-opens them | `typecheck.nameNeedsCanon` (a MEMBER-START digit rule, not a run-start one; `Box<0>` separates them) · `emit_base.normTypeAtom` (a two-sided trim over `' '` AND `'\t'`) · `emit_classify.mvValKindOfName` (skip a run at an index, then slice FROM it) |
 | 7 | **PHASE 2** — `splitUnionAtoms` / `unionMemberCount` move to `tyname.vl` | **2 bodies** | PARTITION ONLY — legal, pure, depends only on `tyTopIndexOf` which is already in the leaf. Costs **six import lines in three files** (`emit_rep.vl`, `wasmEmit.vl`, `emit_collect.vl`), all of which already import `tyname`. **A LOCATION change; it removes no copy** | `typecheck.splitUnionAtoms` / `unionMemberCount` |
 
+> **ROW 7 IS DONE, AND ITS COST LINE WAS WRONG.** D-TYNAMEHOME phase 2 (below, off master
+> `58880167`) landed the move. The resolver names **five** consuming files and **eight**
+> import entries, not three and six: `emit_base.vl` and `emit_classify.vl` are missing from
+> the row entirely. Left unedited as the record of what was believed; see that section.
+
 **THE TERMINAL RESIDUE IS 42 DESIGN-BLOCKED SITES + 4 NON-ROUTINGS (1 behaviour fix, 3
 refuted) + 1 PARTITION-BLOCKED LOCATION MOVE (2 bodies).** Zero routable copies remain.
 
@@ -31504,3 +31509,245 @@ Every rc taken BARE, never through a pipe.
    `tyTopIndexOf`, which every one of those ~168 K invocations already calls, has been across
    that module boundary since phase 0. What actually blocks the move is a partition, and the
    header should say so; it is corrected in place.
+
+## D-TYNAMEHOME PHASE 2 — the long-queued location move lands; the residue table's own cost line named the WRONG THREE FILES, and the resolver says which (off master `58880167`)
+
+The residue table's row 7, written one commit earlier, priced this move exactly:
+
+> **PHASE 2** — `splitUnionAtoms` / `unionMemberCount` move to `tyname.vl` · 2 bodies ·
+> PARTITION ONLY — legal, pure, depends only on `tyTopIndexOf` which is already in the
+> leaf. Costs **six import lines in three files** (`emit_rep.vl`, `wasmEmit.vl`,
+> `emit_collect.vl`), all of which already import `tyname`. **A LOCATION change; it
+> removes no copy**
+
+The legality claim holds and the move is done. **The cost line is wrong, and the error is
+not in the arithmetic — it is in the file list.**
+
+### THE MOVE
+
+Two bodies leave `typecheck.vl` for `tyname.vl`, verbatim, headers and all, landing beside
+`tyTopLevelSplit` under a new `the SPLIT` family heading. Nothing else changes: the bodies
+are character-identical, and `tyname.vl` remains a ZERO-IMPORT leaf
+(`grep -c '^import\|^export .*from "'` reads 0 before and after — the contract its own
+header calls "its whole contract").
+
+They are deliberately NOT folded into `tyTopLevelSplit(name, '|', false, out)`. A top-level
+`=>` STOPS them — the #516 rule, so `(i32) => i32 | string` is ONE function type whose return
+absorbs the pipe — and the generic splitter has no such stop. That distinction is what the
+sabotage below poisons, and it has 8 corpus witnesses.
+
+### THE RESOLVER CENSUS — the residue table named three files and the resolver names five
+
+The census is not a grep. Un-export the two names from `tyname.vl`, rebuild, and read what
+the module resolver refuses to build:
+
+```
+compiler/typecheck.vl:273:9    "splitUnionAtoms"  is not exported by "./tyname"
+compiler/typecheck.vl:273:26   "unionMemberCount" is not exported by "./tyname"
+compiler/emit_rep.vl:50:43     "splitUnionAtoms"  is not exported by "./tyname"
+compiler/emit_collect.vl:29:2  "splitUnionAtoms"  is not exported by "./tyname"
+compiler/emit_collect.vl:30:2  "unionMemberCount" is not exported by "./tyname"
+```
+
+Then the SECOND leg — demote `typecheck.vl`'s republishing line to a plain `import` and
+rebuild again, which enumerates everyone who reaches the names THROUGH this file:
+
+```
+compiler/emit_base.vl:26:2      "splitUnionAtoms"  is not exported by "./typecheck"
+compiler/emit_base.vl:27:2      "unionMemberCount" is not exported by "./typecheck"
+compiler/emit_classify.vl:102:2 "splitUnionAtoms"  is not exported by "./typecheck"
+compiler/emit_classify.vl:108:2 "unionMemberCount" is not exported by "./typecheck"
+compiler/wasmEmit.vl:24:2       "splitUnionAtoms"  is not exported by "./typecheck"
+```
+
+| | residue table's claim | resolver's answer |
+|---|---|---|
+| consuming files | 3 — `emit_rep`, `wasmEmit`, `emit_collect` | **5** — those three **plus `emit_base` and `emit_classify`** |
+| import entries | "six import lines" | **8** — `emit_rep` 1 · `emit_collect` 2 · `wasmEmit` 1 · `emit_base` 2 · `emit_classify` 2 |
+| files this slice could edit | (not stated) | **2** — `emit_rep` and `emit_collect`. The other three are HELD |
+
+`emit_base` and `emit_classify` were presumably assumed to be inside an earlier slice's
+partition and therefore free; they were never re-pointed, and no census caught it because
+every census of this pair had been a module-name list rather than a resolver run. **The
+lesson is the programme's own, restated: an import set derived by reading a table is not
+the set the resolver will produce.**
+
+### THE RE-EXPORT DECISION — a MEASURED regression of #1236, stated as one
+
+`typecheck.vl` now carries
+
+```vl
+export { splitUnionAtoms, unionMemberCount } from "./tyname"
+```
+
+which is exactly the shape #1236 deleted, re-introduced for two names. **This is a
+regression of that cleanup and it is documented as one rather than glossed.** Three
+alternatives were available and this is why it won:
+
+| option | verdict |
+|---|---|
+| re-point all five consumers | **ILLEGAL** — `wasmEmit.vl` and `emit_classify.vl` are owned by a concurrent slice and `emit_base.vl` is outside this partition. Three held files |
+| leave the bodies in `typecheck.vl` | declines the move a third time, on a ground that has already been refuted |
+| **republish two names from `typecheck.vl`** | **taken.** ZERO held-file edits. And because a VL re-export is an import that also publishes, the one line ALSO binds the two names for `typecheck.vl`'s own five call sites — so the plain `tyname` import above it stays at seventeen and no second line is needed |
+
+**FOLLOW-UP, FILED:** whichever slices next own `emit_base.vl`, `emit_classify.vl` and
+`wasmEmit.vl` re-point their 5 entries to `./tyname`; the last of the three deletes the
+republishing line, at which point `typecheck.vl` needs the two names in its own plain
+`import` (17 → 19) and nothing in the tree republishes a grammar again. Until then **nine of
+the leaf's ten importers are one hop and three modules are two** — the only republished path
+in the tree. The filing is written into both `tyname.vl`'s and `typecheck.vl`'s headers, at
+the line itself, not only here.
+
+### MEASUREMENT
+
+| instrument | reading |
+|---|---|
+| bytes | 1,045,026 → **1,044,995 (−31)** |
+| corpus A/B vs `base79.wasm` (1,582 files × 6 channels) | **0 / 0 / 0 / 0 / 0 / 0** |
+| frozen-source rebuild | **byte-identical**, and at master's own 1,045,026 B — the candidate compiles master's frozen `compiler/*.vl` to the same bytes master does |
+| fuzz A/B (seed 424242, 120 cases/side) | identical, 0 findings both sides |
+
+**THE FROZEN REBUILD IS THE DECISIVE ONE AND IT SAYS THE PROGRAM DID NOT CHANGE.** The −31 B
+on the compiler's own binary is therefore entirely a module-ORDER effect on its own source,
+which is what a location move is expected to produce and what the queue entry predicted. It
+is the first phase of D-TYNAMEHOME to move the binary at all: phases 0, 1a, 1b and 1c each
+read byte-identical, because an import re-point changes no module set while a body relocation
+changes which module a function is emitted from.
+
+### CALIBRATION — S1, and the two instruments SPLIT on it
+
+**S1** — `splitUnionAtoms` loses its arrow stop: `tyTopIndexOf(name, '|', '=', start)` becomes
+`tyTopIndexOf(name, '|', 0, start)`, so a function-type member's union RETURN is split as if
+it were a top-level union. Poisons the moved body only; `unionMemberCount` is left correct,
+so the pair also goes OUT OF AGREEMENT — the exact drift the two bodies' shared header warns
+about.
+
+| channel | CHECKRC | CHECKMSG | BUILDRC | BUILDMSG | BYTES | RUN |
+|---|---:|---:|---:|---:|---:|---:|
+| S1 over 1,582 files | 0 | 0 | 2 | **4** | **6** | 2 |
+
+Eight distinct witness files, and the population is coherent rather than scattered — six of
+the eight are closure-result shapes, which is precisely where a `=>` sits at top level next
+to a `|`:
+
+```
+closures/closure-result-union-composed-carrier.vl          BYTES
+closures/closure-result-variant-box-union.vl               BYTES
+closures/hof-inferred-return-through-callback.vl           BUILDRC(0/1) BUILDMSG RUNRC(0/1)
+closures/litunion-mix-closure-result.vl                    BYTES
+closures/nested-lambda-union-arm-litunion-struct-result.vl BUILDMSG BYTES
+closures/value-union-composite-closure-result.vl           BYTES
+maps/nullable-map-closure-nullable-litunion-result.vl      BUILDRC(0/1) BUILDMSG RUNRC(0/1)
+structs/anon-sidecar-nested-field-twin-rows.vl             BUILDMSG BYTES
+```
+
+1. **`vl check` READS ZERO ON A LIVE MISCOMPILE, AGAIN.** Fields 1 and 2 are `same` on all
+   1,582 files while 6 of them emit different bytes and 2 stop building. This is another
+   family in this programme with that profile; the corpus's build/bytes/run fields carry the
+   whole signal.
+2. **BUILDMSG IS NOT REDUNDANT WITH BUILDRC HERE.** 4 files move on field 4 and only 2 on
+   field 3 — two files build with rc 0 on BOTH sides while the message differs. A five-field
+   harness would have halved this sabotage's apparent reach.
+3. **AND THE FROZEN REBUILD IS BLIND TO S1 — `cmp` returns 0 against the baseline's own
+   output, at master's byte count exactly.** The instrument that PROVED this slice inert
+   cannot see the sabotage the corpus catches on eight files. That is not a contradiction
+   and it is not a ranking: the compiler's own `compiler/*.vl` contains no type name with a
+   top-level `=>` beside a `|`, so S1's witness population inside the compiler's source is
+   empty, exactly as the frozen rebuild has now read blind for every sabotage in five
+   consecutive slices of this programme. **Both instruments were run on both legs. Neither
+   ranks, and a slice that runs only one of them is guessing which family it is in.**
+
+### NO NEW FIXTURE
+
+The move is a relocation of two verbatim bodies; the behaviour they implement is already
+pinned. S1 is a HARD FAILURE — `BUILDRC(0/1)` and `RUNRC(0/1)` — on
+`tests/cases/closures/hof-inferred-return-through-callback.vl` and
+`tests/cases/maps/nullable-map-closure-nullable-litunion-result.vl`, both committed. The
+suite reads **3328 / 0 / 8**, master's own figure, on a branch that relocates two bodies.
+
+### GATE
+
+Every rc taken BARE, never through a pipe.
+
+| gate | rc | reading |
+|---|---:|---|
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | freshly fetched seed, 1,045,026 B |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint at the 2-compile rung, **1,044,995 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4, 1,044,995 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3328 / 0 / 8** — master's own reading |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined failure, 0 new, 0 stale |
+| corpus A/B | 0 | 1,582 files, 0 diffs × 6 channels, calibrated by S1 |
+| fuzz A/B | 0 | 0 divergences, 0 findings both sides |
+| frozen-source rebuild | 0 | byte-identical at 1,045,026 B — and BLIND to S1 |
+
+### WHAT THIS SLICE FOUND WRONG
+
+1. **THE RESIDUE TABLE'S COST LINE NAMED THREE FILES AND THE RESOLVER NAMES FIVE.** Above.
+   `emit_base.vl` and `emit_classify.vl` — 4 of the 8 import entries, half the cost — appear
+   in no version of that queue entry. Had this slice trusted it, the re-export would have
+   been sized for one held file and would still have been necessary for three.
+2. **`tyname.vl`'s IN ROSTER UNDERCOUNTED ITSELF.** The header read "32 bodies, in eleven
+   families" while the file held **33**: #1261 landed `tyTopLevelSplit`, rewrote the OUT entry
+   it discharged, and never added the new body to the IN list. Corrected to 35 in twelve
+   families, and the correction is now stated as DERIVED —
+   `grep -c '^export function\|^function' compiler/tyname.vl` — so the next slice re-runs it
+   instead of carrying it forward. **A roster that is hand-maintained beside a file it
+   describes will drift on exactly the slice that adds to the file.**
+3. **THIS IS THE FIRST D-TYNAMEHOME PHASE TO MOVE THE BINARY, AND THAT IS THE SIGNATURE OF A
+   BODY MOVE VS AN IMPORT RE-POINT.** Phases 0/1a/1b/1c read byte-identical; phase 2 reads
+   −31 B with a byte-identical frozen rebuild. The pair of readings together is what
+   identifies a change as module-order-only — either one alone is ambiguous.
+
+## THE TWO STALE FIXTURE HEADERS #1258 LEFT BEHIND — and `tests/` turns out not to be fmt-managed at all (same branch, off master `58880167`)
+
+#1258 closed the LOCAL and PARAM halves of the tail-assignment functype family and handed off
+two fixture headers it could not edit. Both described the world before it landed:
+
+| fixture | what was stale |
+|---|---|
+| `tests/cases/functions/tail-assign-inferred-return.vl` | Its closing paragraph said the LOCAL half "still rides the RHS answer", filed the coercing LOCAL cells as live invalid wasm at **`fnAssignRetTargetLet`** — a name that no longer exists in the tree — and gave as the reason "there is no local-cell-kind resolver reachable from that pass", which #1258 measured FALSE (`parentLetOf` resolves one on exactly that pass, as `retIsMapLocalAnnot` and `criRetLocalLet` always did) |
+| `tests/cases/functions/tail-assign-local-param-agreeing.vl` | Its two-row DISAGREEING-SET table listed rows that are now fixed and pinned; it named `fnAssignRetTargetLet` too; it described `criClassify` as reading `rx = rxe.binRight` for a non-global target; and its "fact 2" pointed at a `wasmEmit.vl` line-number filing that #1258 rewrote |
+
+Both now point at the STORAGE-CLASS dispatch (`fnAssignRetKind` → `letCellKind` /
+`vtKindOfParam` / `globalCellKind`) and at
+`tests/cases/statements/tail-assign-coercing-local.vl`, the pin #1258 minted for the
+disagreeing set. What is genuinely still open is carried over rather than dropped: the
+EMPTY-`[]` rows are fixed but unpinnable (the checker types `v = []` as the empty literal's
+own type, so the inferred return renders `<none>[]` and
+`tests/lsp_undisplayable_type_test.ts`'s corpus control rightly rejects it), filed at
+`fnAssignRetTargetName`; the remaining rows are listed with counts at `fnAssignRetKind`.
+
+**THE ROLE OF BOTH FILES CHANGED AND SAYING SO IS THE POINT.** They were minted as the
+AGREEING floor "so a future local-cell resolver has a floor to land on". That resolver
+landed. They are not boundary pins any more — they are the regression pin for the dispatch's
+easy rows, and the claim worth pinning about a resolver that had a whole storage class
+re-routed underneath it is precisely that the already-green cells stayed green.
+
+### MEASUREMENT — byte-identity IS the claim
+
+Comment-only, verified as such: `git diff -U0` over both files, filtered to lines that are
+not `//`, is EMPTY. `scripts/refresh-compiler.sh --prove-fixpoint` reads 0 and `cmp` against
+the phase-2 build returns **0 — 1,044,995 B, byte-identical**. Suite **3328 / 0 / 8**,
+unchanged.
+
+### AND A FINDING THAT IS NOT ABOUT THESE TWO FILES
+
+`vl fmt --check` REJECTS `tail-assign-local-param-agreeing.vl` — and it rejected it at master
+too, before this commit touched it (the six PARAM functions have single-statement bodies
+`vl fmt` wants on one line). The obvious reading, that a fixture had gone fmt-stale, is
+wrong. Scanning the whole corpus:
+
+```
+total fixtures:  1575
+not formatted:    507
+```
+
+**One fixture in three is not `vl fmt`-clean, and nothing gates it.** `scripts/lint-self.sh`
+fmt-checks `compiler/ std/ scripts/` only, and CI's dogfood step is that same script — so
+`tests/` is outside every fmt gate in the tree. This is a DESIGN fact, not a decay: a fixture
+is a program written to exercise a shape, and hand spelling is sometimes the shape. It is
+recorded here so the next slice that sees a fixture fail `fmt --check` does not read it as a
+regression, reformat 507 files, and produce a diff nothing can review. **Neither file is
+reformatted by this commit;** the edit stays comment-only, which is what makes byte-identity
+a claim about the change rather than about the formatter.

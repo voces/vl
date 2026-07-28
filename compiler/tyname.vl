@@ -50,10 +50,35 @@
 // not a needs set, and the next census should re-derive the consumers from what the code
 // DOES rather than from what it imports.
 //
+// **PHASE 2 PUT ONE REPUBLISHING LINE BACK, DELIBERATELY, AND THE COST WAS THREE TIMES
+// WHAT THE QUEUE ENTRY PRICED.** The move of `splitUnionAtoms` / `unionMemberCount` down
+// here (below) re-pointed `emit_rep` and `emit_collect` at this file; `typecheck.vl` now
+// carries `export { splitUnionAtoms, unionMemberCount } from "./tyname"`, so three modules
+// still reach the two names in TWO hops. That is a MEASURED REGRESSION of #1236's cleanup,
+// which emptied that exact line, and it is stated as one rather than glossed — the
+// follow-up is filed in `docs/internals/destringify-types-program.md`.
+//
+// **THE QUEUE ENTRY THIS REPLACES NAMED THE WRONG FILES, AND THE RESOLVER SAID SO.** The
+// entry (D-SPLITDOWN, #1261) priced the move at "six import lines in three files —
+// `emit_rep`, `wasmEmit`, `emit_collect`". Un-exporting the two names and letting the
+// module resolver enumerate the consumers gives a different set: FIVE entries in THREE
+// files — `emit_base` (2), `emit_classify` (2), `wasmEmit` (1) — and `emit_base` /
+// `emit_classify` are not in that list at all. They were assumed to be inside an earlier
+// slice's partition and were never re-pointed. All three are HELD by concurrent slices,
+// which is why the republishing line is the only shape phase 2 could take at all: a census
+// derived by GREPPING a module list would have concluded one held file and one line.
+//
 // ── WHAT IS IN, AND WHAT IS DELIBERATELY OUT ─────────────────────────────────────────
-// IN — 32 bodies, in eleven families, in dependency order:
+// IN — 35 bodies, in TWELVE families, in dependency order. **THE COUNT IS DERIVED, NOT
+// CARRIED FORWARD, AND THE ONE IT REPLACES WAS WRONG**: this line read "32 bodies" while
+// the file held 33, because #1261 landed `tyTopLevelSplit` and updated the OUT list it
+// discharged without adding the new body to the IN roster. `grep -c '^export function\|^function'`
+// is the check, and it takes one second:
 //   the WALK      `skipQuotedName` (private) · `nameIsQuotedLeaf` · `tyGtIsClose` ·
 //                 `tyTopIndexOf` · `tyGroupEndIndex`
+//   the SPLIT     `tyTopLevelSplit` — the generic top-level `sep` split ·
+//                 `splitUnionAtoms` / `unionMemberCount` — the `|` split and its counting
+//                 dual, which the ARROW rule keeps distinct from the generic one
 //   SPACE RULE    `nameIsSpaceFree` (assert) · `nameStripSpaces` (enforce)
 //   IDENT RUNS    `nameIdentChar` — the CLASS; the run TOKENIZER is measured and declined
 //   GROUP INNER   `groupInnerOf` — the ONE cut every delimiter shares
@@ -79,19 +104,6 @@
 //     stay**: W4 brought `fnParamsTextOf` / `fnRetTextOf` here, taking the arrow index as
 //     an ARGUMENT — precisely the half of that grammar that IS a pure function of a
 //     string. The FINDER and the CUT are two things, and only one of them is stuck.
-//   * **`splitUnionAtoms` / `unionMemberCount` STAY — FOR A PARTITION REASON, and the three
-//     reasons this line used to give are all refuted (D-SPLITDOWN).** It said they were
-//     "SPLITTERS that materialise atoms, not endpoint tests / spans / cuts": `tyTopLevelSplit`
-//     below is a splitter that materialises parts, and it lives here. It said "no D-* slice
-//     ever homed them as part of this family": D-SPLITDOWN is that slice. It said moving them
-//     would "drag the compiler's hottest name function (~168 K corpus invocations) across a
-//     module boundary": `tyTopIndexOf`, which every one of those invocations already calls,
-//     has been across that boundary since phase 0. They are pure, they depend on nothing but
-//     `tyTopIndexOf`, and the move is LEGAL. What is left is arithmetic: five modules import
-//     them from `typecheck.vl` and three of them (`emit_rep`, `wasmEmit`, `emit_collect`) sat
-//     outside D-SPLITDOWN's file partition, so the move costs six import lines in three files
-//     that all already import this one. It removes no COPY — it is a location change — which
-//     is why it is queued rather than urgent.
 //   * **`nameHasSep` / `nameHasPipe` STAY.** Pure, but private to the checker with no
 //     consumer anywhere else: moving them buys a name, not a deduplication.
 //   * **`emit_base.mapValNameOf` and `emit_base.nameIsShapeSpanEnds` STAY WHERE THEY
@@ -430,6 +442,87 @@ export function tyTopLevelSplit(
     start = end + 1
   }
   0
+}
+
+// ── the UNION-ATOM split: the same operation with the ARROW as a second stop ───────────
+//
+// An INLINE union annotation (`v: A | B`) parses to a `TypeRef` whose synthetic name is
+// the pipe-joined member list (`"A|B"`, mirroring the `i32[]` / `{[K]:V}` synthetic names
+// — see `parser.vl`'s `parseTypeName`), and both the checker and four emitter modules ask
+// that name for its members. These two are that question, in its materialising and its
+// counting form.
+//
+// They are NOT `tyTopLevelSplit(name, '|', false, out)`, and the difference is the whole
+// reason they are two bodies and not a delegation: a TOP-LEVEL `=>` STOPS them, so
+// `(i32) => i32 | string` is ONE function type whose return absorbs the pipe, where the
+// generic split would report two members. That is the #516 rule, and it is asked for in
+// the SAME pass — `tyTopIndexOf(name, '|', '=', start)` queries for the separator OR the
+// arrow at once — which is what keeps this off a second walk.
+//
+// **THE HEADER ABOVE USED TO SAY THESE STAY IN `typecheck.vl`, AND THE MOVE IS A PURE
+// LOCATION CHANGE.** D-SPLITDOWN (#1261) refuted all three reasons the decline gave; phase
+// 2 spends what that arithmetic priced — the import lines in the consumers — and removes
+// no copy. What it buys is the family: the two hottest readers of the bracket language now
+// sit next to the scanner they ride, and `typecheck.vl` stops being a waypoint for a
+// grammar it does not own.
+
+// Append the member atoms of the synthetic union name `name` to `out`, split on its
+// TOP-LEVEL `|` separators (depth tracked so a nested `{…}` / `[…]` member is not
+// split inside). A bare name with no `|` appends one atom. The flat `out` accumulator
+// (vs returning a fresh `string[]`) keeps this off the self-host emitter's
+// empty-ref-array-literal return path.
+export function splitUnionAtoms(name: string, out: string[]) {
+  // Atoms are VERBATIM substrings of `name` between top-level `|` separators, so each
+  // is one `slice` from the last separator (`start`) — never a per-code-point
+  // accumulation, whose repeated copy-on-concat walked the whole atom AGAIN per char:
+  // O(len²) per call, ~14 s of compile for one 30-line program over a recursive
+  // struct's ~5 K-char render (the third recurrence of the per-code-point-concat
+  // quadratic class — see `retAtomsCheap`, which now also gates that render away).
+  //
+  // Paren-aware splitting keeps a paren-GROUPED arm whole: `(i32 | string)[] | {w: i32}`
+  // splits to `(i32 | string)[]` + `{w: i32}` (a brace/bracket-only depth mis-split it into
+  // the garbage atoms `(i32` + `string)[]`, so the WHOLE union mis-classified — the binding
+  // silently dropped its union rep and every `is` against the list arm const-folded FALSE, a
+  // live miscompile). The generic-application brackets `<…>` count too, so a union ARGUMENT
+  // (`Box<i32|null>`) stays ONE atom. All of that is now the ONE scanner's business.
+  //
+  // A TOP-LEVEL `=>` stops the split: the whole name is a single function-type member and its
+  // return is absorbed verbatim (a `|` inside it belongs to the return union, split
+  // separately). Asking for `|` OR the arrow in one query is what keeps this a single pass.
+  let start = 0
+  let going = true
+  while going {
+    const at = tyTopIndexOf(name, '|', '=', start)
+    if at < 0 || name[at] == '=' {
+      out.push(name.slice(start, name.length))
+      going = false
+    } else {
+      out.push(name.slice(start, at))
+      start = at + 1
+    }
+  }
+  0
+}
+
+// The number of TOP-LEVEL `|`-separated members in the synthetic name `name` (1 for a
+// bare name). Counts separators without materializing the atom strings.
+export function unionMemberCount(name: string) {
+  // The counting dual of `splitUnionAtoms` — the same query, without materializing the
+  // atom strings (a top-level `=>` stops the count, so `(i32) => i32 | string` is ONE
+  // function type and not a 2-member union).
+  let n = 1
+  let start = 0
+  let going = true
+  while going {
+    const at = tyTopIndexOf(name, '|', '=', start)
+    if at < 0 || name[at] == '=' {
+      going = false
+    } else {
+      n = n + 1
+      start = at + 1
+    }
+  }
+  n
 }
 
 // The index at which the group opened by `name[from - 1]` CLOSES — the first
