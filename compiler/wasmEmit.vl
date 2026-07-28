@@ -450,6 +450,7 @@ import {
   letAnnStructIdx,
   letAnnVariantIdx,
   letInfStrListByUseV,
+  letInfersF32,
   letIsF64,
   letIsI64,
   letIsMap,
@@ -7867,12 +7868,20 @@ function emitExprAsKind(body: i32[], exprIx: i32, k: i32, fnIx: i32) {
 // classified f32-BEFORE-f64 because `exprIsF64` over-claims an f32 literal (see
 // `emitExprAsF64`). By construction of `checkCastNode` `asTy` is one of i32/i64/f32/f64, so
 // the four target arms below are exhaustive.
+//
+// The operand takes its own SOURCE width with the enclosing wide-scalar context CLEARED
+// (`emitNumIntrArg`, the same discipline the numeric-intrinsic operand spine uses). A cast
+// operand's width is the cast's, never the position the CAST sits in: under an `: f32`
+// binding / global / return / element / store, `pendingF32` reached the operand and lowered
+// `1.5` as `f32.const` — and then this function appended `f32.demote_f64` to it. `const g:
+// f32 = (1.5 as f32)` was `vl check` clean INVALID WASM in 12 of 16 measured positions, and
+// only the two spellings whose context happens NOT to seed `pendingF32` escaped.
 function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   const obj = e.asObj
   const tgt = e.asTy
   // Target f64: every source (i32/f32/i64/f64, incl. literals) is a widening or a
   // no-op the f64 helper already lowers correctly.
-  if tgt == "f64" { return emitExprAsF64(body, obj, fnIx) }
+  if tgt == "f64" { return emitNumIntrArg(body, obj, 4, fnIx) }
   // Classify the source rep (f32 first — see the comment above).
   let src = "i32"
   if exprIsF32(obj, fnIx) { src = "f32" }
@@ -7880,14 +7889,16 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   else if exprIsF64(obj, fnIx) { src = "f64" }
   if tgt == "i64" {
     // i32→i64 widening (and i64→i64 no-op) via the existing helper.
-    if src == "i32" || src == "i64" { return emitExprAsI64(body, obj, fnIx) }
+    if src == "i32" || src == "i64" {
+      return emitNumIntrArg(body, obj, 3, fnIx)
+    }
     // float→i64: TRAPPING truncation toward zero.
     if src == "f32" {
-      if emitExprAsF32(body, obj, fnIx) < 0 { return -1 }
+      if emitNumIntrArg(body, obj, 5, fnIx) < 0 { return -1 }
       fbI64TruncF32S()
       return 0
     }
-    if emitExprAsF64(body, obj, fnIx) < 0 {
+    if emitNumIntrArg(body, obj, 4, fnIx) < 0 {
       return -1 // f64 → i64
     }
     fbI64TruncF64S()
@@ -7895,13 +7906,15 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   }
   if tgt == "f32" {
     // i32→f32 (and f32→f32 no-op) via the existing helper (handles literals).
-    if src == "i32" || src == "f32" { return emitExprAsF32(body, obj, fnIx) }
+    if src == "i32" || src == "f32" {
+      return emitNumIntrArg(body, obj, 5, fnIx)
+    }
     if src == "i64" {
-      if emitExprAsI64(body, obj, fnIx) < 0 { return -1 }
+      if emitNumIntrArg(body, obj, 3, fnIx) < 0 { return -1 }
       fbF32ConvertI64S()
       return 0
     }
-    if emitExprAsF64(body, obj, fnIx) < 0 {
+    if emitNumIntrArg(body, obj, 4, fnIx) < 0 {
       return -1 // f64 → f32 demote
     }
     fbF32DemoteF64()
@@ -7909,19 +7922,19 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   }
   // tgt == "i32".
   if src == "i32" {
-    return emitExpr(body, obj, fnIx) // no-op
+    return emitNumIntrArg(body, obj, 0, fnIx) // no-op (plain `emitExpr` at kind 0)
   }
   if src == "i64" {
-    if emitExprAsI64(body, obj, fnIx) < 0 { return -1 }
+    if emitNumIntrArg(body, obj, 3, fnIx) < 0 { return -1 }
     fbI32WrapI64()
     return 0
   }
   if src == "f32" {
-    if emitExprAsF32(body, obj, fnIx) < 0 { return -1 }
+    if emitNumIntrArg(body, obj, 5, fnIx) < 0 { return -1 }
     fbI32TruncF32S()
     return 0
   }
-  if emitExprAsF64(body, obj, fnIx) < 0 {
+  if emitNumIntrArg(body, obj, 4, fnIx) < 0 {
     return -1 // f64 → i32 trunc
   }
   fbI32TruncF64S()
@@ -11509,7 +11522,14 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     }
   } else if letUNm != "" {
     if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
-  } else if letIsF32(stmtIx) {
+  } else if letIsF32(stmtIx) || letInfersF32(stmtIx, fnIx) {
+    // `letIsF32` is ANNOTATION-only; `collectLocals` types the SLOT with
+    // `letIsF32 || letInfersF32` (`emit_collect.vl`, the f32 arm), so an un-annotated
+    // `const g = fv * 1.0` got a kind-13 f32 slot here while this ladder fell through to
+    // the `letIsF64` arm below — whose own un-annotated fallback `exprIsF64` over-claims a
+    // mixed f32/float-literal init. `emitExprAsF64` then promoted the f32 value and stored
+    // an f64 into the f32 slot: `vl check` clean, INVALID WASM. The predicate is now the
+    // SAME PAIR the slot ladder uses, so the init and the slot cannot disagree.
     const savedF32 = pendingF32
     pendingF32 = true
     if emitExprAsF32(body, s.letInit, fnIx) < 0 { return -1 }

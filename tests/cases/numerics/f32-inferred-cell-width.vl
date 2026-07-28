@@ -1,0 +1,87 @@
+// @run
+// @log 1069547520
+// @log 1065353216
+// @log 1073741824
+// @log 1075838976
+// @log 1074790400
+// @log 2134900736
+// @log 1075838976
+// @log 1069547520
+// @log 1069547520
+// @log 1.5
+// @log 6
+// @log 4.5
+// @log 6
+// An UN-ANNOTATED binding whose initializer is f32 gets an f32 CELL, and every read of
+// that cell agrees with it. The classifier order is the rule `exprIsF32`'s own header
+// states — "checked BEFORE `exprIsF64` at every dispatch" — and which two ladders did not
+// obey: `globalKind` (the module cell) asked `exprIsF64` first, and `emitLetDeclStmt` (the
+// local INIT) asked the annotation-only `letIsF32` where `collectLocals` types the SLOT
+// with `letIsF32 || letInfersF32`.
+//
+// `exprIsF64` OVER-CLAIMS a mixed f32/float-literal expression: `fv * 1.0` is `exprIsF32`
+// (the literal adapts down) AND `exprIsF64` (the literal is a genuine `.` literal). So the
+// cell came out `(mut f64)` / the init came out `emitExprAsF64` while the value was
+// `f32.mul` and the checker typed the binding f32 — `vl check` clean, INVALID WASM at the
+// `global.set` / the local store / the print import. Measured over a
+// (scope x keyword x annotation x 28 init shapes x 2 readers) grid: 100 of 448 cells.
+//
+// Every value is pinned through `f32bits`, not `print`: a wrongly-WIDE cell that happened
+// to validate would still have to arrive as the right BIT PATTERN, and the f64 and f32
+// encodings of the same number are different integers.
+
+const fv: f32 = 1.5
+const fw: f32 = 2.25
+const dv: f64 = 4.5
+
+// ── the module GLOBAL cell ────────────────────────────────────────────────────
+const g0 = fv * 1.0
+print(f32bits(g0)) // 1.5f
+
+// The init that #1246 filed: an f32-returning intrinsic times a float literal.
+const g1 = f32fromBits(1065353216) * 1.0
+print(f32bits(g1)) // 1.0f
+
+// A `let` cell, then the two ASSIGN ladders that read it back (a literal RHS re-encodes
+// at single precision, an f32 variable RHS stores directly).
+let g2 = fv + 0.5
+print(f32bits(g2)) // 2.0f
+g2 = 2.5
+print(f32bits(g2)) // 2.5f
+g2 = fw
+print(f32bits(g2)) // 2.25f
+
+// ── the FUNCTION-scope local, same shapes ─────────────────────────────────────
+function loc(): i32 {
+  const a = fv * 1.0
+  const b = fv - 0.5
+  f32bits(a) + f32bits(b)
+}
+print(loc()) // 1069547520 + 1065353216
+
+function locAssign(): i32 {
+  let a = fv / 2.0
+  a = 2.5
+  f32bits(a)
+}
+print(locAssign()) // 2.5f
+
+// ── the inferred cell flowing into every other f32 boundary ───────────────────
+function take(x: f32): i32 { f32bits(x) }
+const g3 = fv * 1.0
+print(take(g3)) // 1.5f
+const xs: f32[] = []
+xs.push(g3)
+print(f32bits(xs[0])) // 1.5f
+
+// ── CONTROLS: the f64 inferences are untouched ────────────────────────────────
+// A BARE float literal is not `exprIsF32`, so it still takes the f64 cell.
+const d0 = 1.5
+print(d0)
+// A GENUINE f64 operand makes the whole init f64 (`binMixHardF64`), both orders.
+const d1 = fv + dv
+print(d1)
+const d2 = dv * 1.0
+print(d2)
+const d3 = dv + fv
+print(d3)
