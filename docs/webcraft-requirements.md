@@ -300,7 +300,7 @@ ring and for the differential harness to diff columns.
 > build against the pre-view std. Same flag, second reason: the release profile
 > is what makes both the wrapper calls and the unused surface disappear.
 
-### P1.2 Flat record layouts (AoS tier — the Lua VM's requirement)
+### P1.2 Flat record layouts (AoS tier — the Lua VM's requirement)  🟡 SHIPPED, minus `rows<T>` and the bracket
 
 ```vl
 flat type TValue = { value: i64, tt: i32, pad: i32 }   // explicit order, fixed size 16
@@ -318,6 +318,73 @@ stack[i].tt          // i32.load at offset + i*16 + 8
   and any state whose layout must match the TS twin exactly.
 - Can ship after P1.1 (views cover SoA, which is most of the kernel); the
   Lua VM port is blocked on this specifically.
+
+> Maintainer's note (vl side): **the DECLARATION ships — with its layout readable
+> — and it cost the emitter nothing. `rows<T>` and `stack[i].tt` do not.**
+> `docs/internals/flat-records-design.md` is the design record.
+>
+> ```vl
+> flat type TValue = { value: i64, tt: i32, pad: i32 }
+>
+> const row = base + i * TValue.size    // 16
+> const tt  = __load_i32__(row + TValue.tt)  // + 8
+> ```
+>
+> `TValue.size` is the record's total byte size and `TValue.<field>` is that
+> field's byte offset. Both are `i32` constants folded at check time.
+>
+> **The layout rule is NO IMPLICIT PADDING**, and your own example is the argument
+> for it. Offsets are the running sum of the declared field widths, the compiler
+> never inserts a byte, and field order IS layout. Under C's natural-alignment
+> rules `{ value: i64, tt: i32 }` is *already* 16 bytes — the trailing pad is
+> inserted for you — so the explicit `pad: i32` in your spec is only necessary if
+> nothing pads implicitly. It is pinned that `{ value: i64, tt: i32 }` is **12**.
+> Two further reasons: unaligned access is legal in wasm (the alignment immediate
+> is a hint, not a constraint, so there is no correctness argument for padding —
+> only a performance one, and paying it silently is not this tier's bargain); and
+> a rule that pads for you **cannot express a packed layout**, while natural
+> alignment is always reachable by writing the pad field, as you did.
+> `align`/`packed` modifiers are deferred, not rejected — no-implicit-padding is
+> the forward-compatible half.
+>
+> Four things to design around:
+>
+> - **Fields are `i32`/`i64`/`f32`/`f64`, a newtype over one of those, or another
+>   `flat` type** (which inlines — `Outer.k + Inner.a` composes by addition, so
+>   there is no second level of member access). Everything else rejects naming the
+>   representation fact. **`boolean` rejects deliberately**: it is an i32 in VL, so
+>   4 bytes would be consistent — but C's `bool` is 1, and a silent 3-byte drift is
+>   the exact failure this tier exists to prevent. Write `i32`. Every ruling here
+>   took the reject when in doubt, because widening a reject later is
+>   backward-compatible and narrowing an accept is not.
+> - **`flat` ADDS validation and constants and SUBTRACTS nothing.** The type is
+>   still an ordinary record — struct literal, parameter, return, nested field,
+>   array element — and it emits BYTE-IDENTICALLY to the same declaration with
+>   `flat` deleted. No `emit_*.vl` or `wasmEmit.vl` file changed.
+> - **`buf.rows<T>(off, count)` is NOT here.** It needs `T.size` to answer for a
+>   type PARAMETER at each instantiation, which needs generic `flat` types (a type
+>   parameter has no width, so they reject today) and a fold that runs after
+>   monomorphization. Filed with the design.
+> - **`stack[i].tt` is NOT here, and it is blocked on exactly what P1.1's `x[i]` is
+>   blocked on** — B14's free `self`-functions named for an operator, where
+>   `function "[]"(self: V, i: i32)` does not parse and the emitter's operator arm
+>   is unreachable dead code. It is additionally harder, because it must FUSE an
+>   index and a field into one load rather than materializing a row.
+>
+> **What that leaves you with today is the whole Lua accessor set, hand-written
+> once per record**, with every address derived from the declaration — pinned as
+> `tests/cases/memory/flat-lua-tvalue-accessors.vl`:
+>
+> ```vl
+> function slotAt(s: Stack, i: i32) { return s.base + i * TValue.size }
+> function tagOf(s: Stack, i: i32) { return __load_i32__(slotAt(s, i) + TValue.tt) }
+> ```
+>
+> What `rows<T>` and the bracket would delete from that file is the last two
+> accessors PER FIELD. That is boilerplate, not expressiveness — which is the
+> measurement that decided the phasing. The thing the declaration removes is the
+> failure mode: today those `16`s and `8`s are literals hand-computed from a layout
+> written down nowhere, and adding a field silently makes every one of them wrong.
 
 ### P1.3 Optimization defaults
 
@@ -485,9 +552,13 @@ and needs nothing from vl beyond scalar exports.
   opcode intrinsics). Port order — pathing first (hottest, most
   self-contained, exercises views hard), then kernel stores, then wc3
   systems; each stage behind the per-tick differential hash.
-- **Lua VM in vl**: needs P1.2 flat records; until then the Lua runtime stays
-  TS even if the kernel has ported (the pump doesn't care which side of the
-  boundary each module lives on — the state arena format is shared).
+- **Lua VM in vl**: needs P1.2 flat records — **the layout half of which now
+  exists**, so `Table`/`Node`/`TValue` can be declared once and addressed through
+  derived constants. What is still hand-written is one accessor pair per field
+  (`rows<T>` and `stack[i].tt` are filed); that is boilerplate, so the port is no
+  longer blocked, only more verbose than it will be. Until it happens the Lua
+  runtime stays TS even if the kernel has ported (the pump doesn't care which side
+  of the boundary each module lives on — the state arena format is shared).
 - **MP servers**: the vl artifact needs zero additions (same wasm under
   Node/workerd; wasmtime once its WasmGC matures — vl already pins 47, which
   runs the copying collector cleanly).

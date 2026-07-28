@@ -102,12 +102,23 @@ hatch").** All four are prerequisites for each other in practice:
   be a policy choice in its last bit, i.e. a determinism trap.
 
 **P1 — gates the port being GOOD.**
-- ⬜ **P1.1 Typed views over Buffer** (`buf.f32view(off, count)`, `x[i]`, `.length`) — the kernel is
-  structure-of-arrays; this is "the thing most worth absorbing into the language".
-- ⬜ **P1.2 `flat` record layouts (AoS)** — declared field order = layout, fixed sizes, no reordering,
-  scalars and nested `flat` only; `buf.rows<T>(off, count)`. The C-struct tier **WasmGC structurally
-  cannot provide**. Forcing customer is a Lua 5.3 VM needing bit-exact `pairs()` order. Ships after
-  P1.1; only the Lua port is blocked on it.
+- 🟡 **P1.1 Typed views over Buffer** (`buf.f32view(off, count)`, `.length`) — the kernel is
+  structure-of-arrays; this is "the thing most worth absorbing into the language". SHIPPED in
+  `std:buffer` with **zero compiler lines**; the `x[i]` BRACKET is filed, blocked on the same B14
+  operator route below (`function "[]"(self, i)` does not parse and `emit_rewrite.vl`'s operator arm
+  is unreachable dead code). `buffer-design.md` §L.
+- 🟡 **P1.2 `flat` record layouts (AoS)** — declared field order = layout, fixed sizes, no reordering,
+  scalars and nested `flat` only. The C-struct tier **WasmGC structurally cannot provide**. Forcing
+  customer is a Lua 5.3 VM needing bit-exact `pairs()` order. The DECLARATION half ships:
+  `flat type TValue = { value: i64, tt: i32, pad: i32 }` is validated (scalars, newtypes over
+  scalars, nested `flat`) and MEASURED, and the layout is readable as `TValue.size` /
+  `TValue.tt` — checker-folded constants, so **no emitter file changed** and a `flat` declaration
+  emits byte-identically to the same one without it. **No implicit padding**: offsets are the
+  running sum of declared widths (the spec's own explicit `pad` field is the argument, and
+  unaligned access is legal in wasm). REMAINING: `buf.rows<T>(off, count)` (needs `T.size` for a
+  type PARAMETER, which needs generic `flat` types) and the `stack[i].tt` sugar (the same blocked
+  B14 route as P1.1's bracket). Both are boilerplate rather than expressiveness — the accessor set
+  is writable today. `docs/internals/flat-records-design.md`.
 - ⬜ **P1.3 Optimization defaults** — Heap2Local in the blessed pipeline + a documented release
   profile (`--closed-world -O3 --gufa`). Our union boxes and `{backing,len,cap}` wrappers **must melt**
   in per-tick scratch code or alloc-free-steady-state becomes "avoid half the language".
