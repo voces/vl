@@ -2858,6 +2858,13 @@ export function monoBindOf(tvN: string[], tvV: string[], tp: string) {
 // there that this lacks leaves the substitution unreached. The two were already out of
 // step on the UNION and on `[]` depth, which is exactly where the generic-alias field
 // residues sat.
+//
+// **THE `[]`-RUN ARM WAS CLAIMED BY THIS HEADER FOR TWO SLICES BEFORE ANY ARM DELIVERED
+// IT.** The sentence above ("array-of at any dimension … or behind a `[]` run") described
+// a walk that stopped at `monoTyParamOf`'s ONE `[]` level: a composite under a `[]` was
+// claimed by nothing — `splitUnionAtoms` will not split inside the grouping parens of
+// `(T|null)[]`, `annObjFieldSplit` answers -1 on a name ending in `]`, and
+// `peelGroupParens` returns a `…[]` name unchanged. Read the arms, not the sentence.
 export function monoAnnHasTyParam(ann: string, typarams: string[]) {
   if monoTyParamOf(ann, typarams) != "" { return true }
   // A top-level UNION (`T | null`, `T | i32`). `splitUnionAtoms` is depth- and
@@ -2914,6 +2921,19 @@ export function monoAnnHasTyParam(ann: string, typarams: string[]) {
   // first; `peelGroupParens` answers a non-parenthesized name with itself.
   const pk = peelGroupParens(ann)
   if pk != ann { return monoAnnHasTyParam(pk, typarams) }
+  // The `[]` RUN over a composite element (`(T | null)[]`, `{a: T}[]`, `T[][]`,
+  // `Box<T>[]`). LAST, and peeling the WHOLE run in one step: every arm above claims a
+  // name by its OUTERMOST constructor, and a `[]` run's outermost constructor is the run.
+  //
+  // IT IS NOT PUSHED DOWN INTO `monoTyParamOf`, and that distinction is the whole of why
+  // #1242 measured its version of this widening moving 14 cells BACKWARD. `monoSubstAnn`'s
+  // `monoTyParamOf` branch answers with `b + "[]"` — ONE `[]`, from a boolean "was there a
+  // `[]`" — so a `T[][]` pattern teaching THAT arm substitutes to a one-dimensional name
+  // and the instance's parameter silently loses a dimension. The run arm re-attaches the
+  // run as the SLICE it already is (`monoSubstAnn`'s twin arm below, and `gaeApplyFieldTy`
+  // before it), so the dimensions are carried rather than recomputed.
+  const leaf = arrLeafNameOf(ann)
+  if leaf != ann { return monoAnnHasTyParam(leaf, typarams) }
   false
 }
 // The annotation name to READ for a generic FUNCTION's parameter or return: the arena's
@@ -3062,6 +3082,25 @@ export function monoSubstAnn(
     if ps == pk { return ann }
     return "(" + ps + ")"
   }
+  // The `[]` RUN, `monoAnnHasTyParam`'s closing arm in the same position. `arrLeafNameOf`
+  // strips whole `[]` pairs off the END, so the leaf is a PREFIX of `ann` and the
+  // remainder is precisely the repetitions to re-attach — the dimensions ride as the slice
+  // they already are, never rebuilt from a count. (Identical to `gaeApplyFieldTy`, which
+  // has carried this arm OUTSIDE the walk since #1234; the alias half can now stop
+  // peeling first, but the peel there is harmless and its header explains the seam.)
+  //
+  // An UNBOUND leaf returns "" up the chain, which is `monoSubstAnn`'s documented "the
+  // instance cannot be named" — and that is what turns `function fnv<T>(v: T[][])`'s
+  // written-then-invalid module into the monomorphizer's own loud reject when nothing
+  // binds `T`. Re-rendering is gated on the leaf actually MOVING, so a concrete `[]` run
+  // is returned verbatim and never becomes a second intern key.
+  const leaf = arrLeafNameOf(ann)
+  if leaf != ann {
+    const ls = monoSubstAnn(leaf, typarams, tvN, tvV)
+    if ls == "" { return "" }
+    if ls == leaf { return ann }
+    return ls + ann.slice(leaf.length, ann.length)
+  }
   ann
 }
 // Bind type params by matching a parameter's annotation PATTERN against the
@@ -3123,6 +3162,24 @@ export function monoBindFromAnn(
         fi = fi + 1
       }
       monoBindFromAnn(pRet, aRet, typarams, tvN, tvV)
+    }
+  }
+  // The `[]` RUN, the arm its two siblings close with, in the same position. `T[]` never
+  // reaches here — `monoTyParamOf` claims one `[]` level at the top and binds the
+  // ARGUMENT's element — so this is the run of TWO OR MORE (`T[][]`) and the run over a
+  // composite (`Box<T>[]`).
+  //
+  // THE RUN LENGTHS MUST MATCH BEFORE EITHER LEAF IS BELIEVED. `arrLeafNameOf` peels to
+  // fixpoint on both sides independently, so `T[][]` against `i32[]` would otherwise pair
+  // `T` with `i32` and pin an instance one dimension short of what the CHECKER typed —
+  // the same class of silent mis-pin this whole layer exists to stop. The lengths are
+  // compared as SLICE widths (leaf is a prefix of the whole on both sides), which is the
+  // `[]`-pair count without counting.
+  const leafP = arrLeafNameOf(pat)
+  if leafP != pat {
+    const leafA = arrLeafNameOf(actual)
+    if pat.length - leafP.length == actual.length - leafA.length {
+      monoBindFromAnn(leafP, leafA, typarams, tvN, tvV)
     }
   }
   0
