@@ -1119,3 +1119,67 @@ Deno.test({
     }
   },
 });
+
+// ── the flat-record modifier pin (webcraft P1.2) ─────────────────────────────
+// `vl fmt` must not DELETE `flat` from `flat type N = { … }`.
+//
+// The hazard is structural, not hypothetical. `emitTypeOrUnionDecl` reprints a
+// type declaration from a VERBATIM SOURCE SLICE starting at the declaration's
+// `pos`, and `pos` was the `type` keyword's start — so a modifier written BEFORE
+// `type` sits outside the slice and vanishes. `parseTypeDecl` now starts `pos` at
+// the `flat` token instead. Measured, by building the compiler with that one line
+// reverted: `vl fmt` silently dropped all four `flat` markers below AND the
+// `export` on the second one (`exportPrefix` reads the token immediately before
+// `pos`, which had become `flat` rather than `export`), turning checked layouts
+// back into plain records at rc 0. A silent downgrade, not a diagnostic.
+//
+// It cannot live in tests/cases: `tests/` is excluded from the `vl fmt --check`
+// gate and cases_wasm_test.ts has no `@fmt` directive (see the D-FMTDECL pin
+// above). Four positions, because the slice/prefix interaction differs across
+// them: bare, `export`-prefixed, over-width (so `wrapTypeDecl` is reached), and
+// already-multiline.
+Deno.test({
+  name: "vl-fmt: the `flat` type modifier survives formatting (all four positions)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const wide =
+      `flat type VeryWideFlatRecordNameForcingTheWrap = { alpha: i64, beta: i64, gamma: i64, delta: i64 }`;
+    if (wide.length <= 80) {
+      throw new Error(
+        `the over-width fixture is ${wide.length} cols — under fmtWidth, so wrapTypeDecl is never reached and that cell is inert`,
+      );
+    }
+    const src = [
+      `flat type TValue = { value: i64, tt: i32, pad: i32 }`,
+      `export flat type Node = { key: i32, next: i32 }`,
+      wide,
+      `flat type Multi = {`,
+      `  a: i32,`,
+      `  b: i64,`,
+      `}`,
+      `print(TValue.size + Node.size + VeryWideFlatRecordNameForcingTheWrap.size + Multi.size)`,
+      ``,
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    const flatCount = (r.out.match(/^(export )?flat type /gm) ?? []).length;
+    if (flatCount !== 4) {
+      throw new Error(
+        `fmt kept ${flatCount} of 4 \`flat\` modifiers — a dropped one silently downgrades a checked layout to a plain record:\n${r.out}`,
+      );
+    }
+    if (!/^export flat type Node /m.test(r.out)) {
+      throw new Error(
+        `fmt lost the \`export\` or reordered it against \`flat\`:\n${r.out}`,
+      );
+    }
+    const r2 = await run([], r.out);
+    if (r2.code !== 0 || r2.out !== r.out) {
+      throw new Error(
+        `not idempotent (rc ${r2.code}):\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`,
+      );
+    }
+  },
+});

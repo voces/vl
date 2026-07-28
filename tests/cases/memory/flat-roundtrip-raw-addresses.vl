@@ -1,0 +1,81 @@
+// @run
+// @log 100
+// @log 7
+// @log -1
+// @log 101
+// @log 8
+// @log -1
+// @log 102
+// @log 9
+// @log -1
+// @log 1
+// @log 2
+// @log 33
+// @log 44
+// @log 5
+// @log 3
+// @log 2
+// FLAT LAYOUT CONSTANTS, PROVED AT THE ADDRESS (webcraft P1.2). The companion to
+// `flat-layout-grid.vl`, and the assertion that matters.
+//
+// The grid file checks the offset TABLE against hand-computed numbers. That is not
+// enough on its own: a table can be internally consistent — every offset equal to
+// the running sum of every width — and still be wrong about which bytes a field
+// occupies, and nothing in an arithmetic assertion can see it. So this file closes
+// the loop the only way it can be closed. Every WRITE goes through the DERIVED
+// address (`base + i * TValue.size + TValue.tt`) and every READ comes back through
+// a raw intrinsic at a HAND-COMPUTED one (`base + i * 16 + 8`). The two address
+// expressions share nothing but the bytes they land on.
+//
+// The stride is exercised too: three consecutive rows are written and read, so an
+// offset that is right for row 0 and wrong for the stride cannot pass.
+import { Buffer } from "std:buffer"
+
+flat type TValue = { value: i64, tt: i32, pad: i32 }
+flat type Wide = { a: f32, b: f64, c: i32, d: i64, e: f32 }
+
+const buf = Buffer(1024)
+
+// WRITE through the derived addresses.
+let i = 0
+while i < 3 {
+  const row = buf.base + i * TValue.size
+  __store_i64__(row + TValue.value, (100 + i) as i64)
+  __store_i32__(row + TValue.tt, 7 + i)
+  __store_i32__(row + TValue.pad, -1)
+  i = i + 1
+}
+// READ through hand-computed ones: stride 16, value at 0, tt at 8, pad at 12.
+let j = 0
+while j < 3 {
+  const raw = buf.base + j * 16
+  print(__load_i64__(raw + 0) as i32)
+  print(__load_i32__(raw + 8))
+  print(__load_i32__(raw + 12))
+  j = j + 1
+}
+
+// The same, over every scalar width — including the f64 at offset 4, which is
+// UNALIGNED. That access is legal in wasm (the alignment immediate is a hint, not
+// a constraint), and it is the case a padding compiler would have moved.
+const w = buf.base + 512
+__store_f32__(w + Wide.a, 1.5 as f32)
+__store_f64__(w + Wide.b, 2.25)
+__store_i32__(w + Wide.c, 33)
+__store_i64__(w + Wide.d, 44 as i64)
+__store_f32__(w + Wide.e, 5.5 as f32)
+print(__load_f32__(w + 0) as i32)  // 1.5 -> 1
+print(__load_f64__(w + 4) as i32)  // 2.25 -> 2, at the straddling offset
+print(__load_i32__(w + 12))
+print(__load_i64__(w + 16) as i32)
+print(__load_f32__(w + 24) as i32) // 5.5 -> 5
+
+// A NESTED flat record inlines, so reaching one of its fields is the SUM of two
+// offsets — which is why the constant surface needs only one level of access.
+flat type Inner = { a: i32, b: i32 }
+flat type Outer = { x: i32, k: Inner }
+const o = buf.base + 768
+__store_i32__(o + Outer.k + Inner.a, 3)
+__store_i32__(o + Outer.k + Inner.b, 2)
+print(__load_i32__(o + 4)) // Outer.k(4) + Inner.a(0)
+print(__load_i32__(o + 8)) // Outer.k(4) + Inner.b(4)
