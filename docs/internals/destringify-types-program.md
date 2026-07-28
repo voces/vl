@@ -30645,7 +30645,15 @@ whoever owns that file next.
 |---|---|
 | **frozen-source rebuild** — master's own `compiler/entry.vl` compiled by this branch's compiler | **BYTE-IDENTICAL**, 1,044,688 B, sha256 `1b55fcbb4209130a423dbfb1a9b6ab2670a846b3ca6807f2a439a37a3e027ec3`. Re-run after EVERY family commit; identical five times. **INVERTED CONTROL:** the two compilers `cmp` as differing (rc 1), every time. |
 | **six-channel corpus A/B**, 1,565 files (`tests/cases` + `std` + `scripts`) | **0 diffs on all six channels.** |
-| **fuzz A/B**, 50,400 generated programs (14 seeds × 3 depths × {plain, declared} × 600) | **0 divergences.** |
+| **fuzz A/B**, 100,800 generated programs per side (14 seeds × 3 depths × {plain, declared}, 1,200 emitted per batch) | **0 divergences** — see the harness note below. |
+
+**A HARNESS BUG THE PREVIOUS RUNS OF THIS INSTRUMENT CARRIED.** The inherited fuzz A/B script
+normalises the `mktemp` directory out of `*.log` and NOT out of `*.err`, so every case that
+produces an emit ERROR reads as a divergence on its path alone. A raw `diff -r` of the two
+out-dirs is therefore not the answer — un-normalised it names hundreds of `case_*.err` files
+whose only difference is `/tmp/tmp.5B2rpZAIaC/` vs `/tmp/tmp.IVLq2sPKMX/`. **The reading above
+is after normalising BOTH.** Anyone re-running this instrument should apply the same `sed` to
+`*.err`, or read a "divergence" count that is entirely the temp path.
 
 **AND HERE IS THE FINDING THAT MATTERS MORE THAN ANY OF THEM: THE FROZEN-SOURCE REBUILD IS A
 NULL CALIBRATION FOR ALL FIVE FAMILIES.** The brief that commissioned this slice names it "the
@@ -30712,7 +30720,7 @@ Every rc taken BARE, never through a pipe.
 | `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined failure, 0 new, 0 stale |
 | corpus A/B | 0 | 1,565 files, 0 diffs × 6 channels, calibrated by S1 + S2 |
-| fuzz A/B | 0 | 50,400 programs/side, 0 divergences |
+| fuzz A/B | 0 | 100,800 programs/side, 0 divergences (after normalising `*.err` — see the harness note) |
 | frozen-source rebuild | 0 | byte-identical + inverted control rc 1 — **and measured BLIND to both sabotages** |
 
 ### WHAT REMAINS UN-ROUTED, WITH THE REASON
