@@ -252,6 +252,7 @@ import {
   nameIsShapeOpen,
   tyGroupEndIndex,
   tyTopIndexOf,
+  tyTopLevelSplit,
 } from "./tyname"
 
 // ── Type-arena variants ──────────────────────────────────────────────────────
@@ -5079,25 +5080,29 @@ export function isTopLevelFuncTypeName(name: string) {
   true
 }
 
-// Split `name` on its TOP-LEVEL occurrences of `sep` (depth-aware — `<…>` included, so a
-// generic ARGUMENT's own `|`/`&`/`,` never splits — quoted literal members skipped) into
-// `out`. Shared by the union (`|`), intersection (`&`) and param-list (`,`) arms of
-// `nameToTy`.
-function splitTypeName(name: string, sep: i32, out: string[]) {
-  let start = 0
-  let going = true
-  while going {
-    const at = tyTopIndexOf(name, sep, 0, start)
-    if at < 0 {
-      out.push(name.slice(start, name.length))
-      going = false
-    } else {
-      out.push(name.slice(start, at))
-      start = at + 1
-    }
-  }
-  0
-}
+// ── the TOP-LEVEL SPLIT: `splitTypeName` / `splitGenArgs` are `tyname.tyTopLevelSplit` ──
+//
+// D-SPLITDOWN. Both of this file's splitters WERE the SPLIT home written out again, and
+// the six + two call sites now spell the home directly:
+//
+//   * `splitGenArgs(s, out)` was `tyTopLevelSplit(s, ',', true, out)` statement for
+//     statement — the same `end = s.length` fall-through, the same `part.length > 0`
+//     push gate (which is what `dropEmpty` true selects), the same `start = end + 1`
+//     resume;
+//   * `splitTypeName(name, sep, out)` was `tyTopLevelSplit(name, sep, false, out)`. Only
+//     the `at < 0` arm was spelled differently — it pushed `slice(start, length)` inline
+//     where the home assigns `end = s.length` and falls into the common push — and the
+//     two agree on every input, not merely every reachable one: `at < 0` pushes
+//     `slice(start, length)` on both sides, `at >= 0` pushes `slice(start, at)` on both,
+//     and with `dropEmpty` FALSE the home's `part.length > 0 || !dropEmpty` gate is
+//     unconditionally true, exactly as this one's push was unguarded.
+//
+// The home could not live in `emit_base.vl`, where #1147 minted it: that file imports
+// THIS one, so a call from here would cycle the module graph. It lives in `tyname.vl`,
+// the zero-import leaf, which is also where `tyTopIndexOf` — the only thing its body
+// needs — already was. The census scored the three writings as three separate
+// "single-writing" homes; they were one operation, and the down-move is what let all
+// three reach it.
 
 // The registry slot of a generic alias base name ("Box"), or -1.
 function gaIndexOf(name: string) {
@@ -5107,26 +5112,6 @@ function gaIndexOf(name: string) {
     i = i + 1
   }
   -1
-}
-
-// Split a generic-application argument list ("i32,string", "Pair<i32,i32>,T")
-// at its TOP-LEVEL commas — `<>`/`{}`/`[]`/`()` nest, quoted literal-type names
-// skip whole, and the function arrow's `>` is NOT a closer (`(i32)=>i32,string`
-// must still split at its comma). Empty parts drop (a tolerated trailing comma).
-function splitGenArgs(s: string, out: string[]) {
-  let start = 0
-  let going = true
-  while going {
-    let end = tyTopIndexOf(s, ',', 0, start)
-    if end < 0 {
-      end = s.length
-      going = false
-    }
-    const part = s.slice(start, end)
-    if part.length > 0 { out.push(part) }
-    start = end + 1
-  }
-  0
 }
 
 // The AST node (a TypeRef / annotation child) that diagnostics raised INSIDE
@@ -5247,7 +5232,7 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
     }
   } else {
     const argNames: string[] = []
-    splitGenArgs(inner, argNames)
+    tyTopLevelSplit(inner, ',', true, argNames)
     let ai = 0
     while ai < argNames.length {
       const a = nameToTy(argNames[ai])
@@ -5692,7 +5677,7 @@ function nameToTyReal(name: string) {
   // members COLLAPSE (host `flattenType` dedup: `"a" | "a" | "b"` is `"a" | "b"`).
   if nameHasPipe(name) && !isTopLevelFuncTypeName(name) {
     const parts: string[] = []
-    splitTypeName(name, '|', parts)
+    tyTopLevelSplit(name, '|', false, parts)
     const members: i32[] = []
     let hasNull = false
     let pi = 0
@@ -5729,7 +5714,7 @@ function nameToTyReal(name: string) {
   // An unresolvable operand poisons the whole name (-1, "unknown type").
   if nameHasSep(name, '&') && !isTopLevelFuncTypeName(name) {
     const iparts: string[] = []
-    splitTypeName(name, '&', iparts)
+    tyTopLevelSplit(name, '&', false, iparts)
     let acc = -1
     let ii = 0
     while ii < iparts.length {
@@ -5791,7 +5776,7 @@ function nameToTyReal(name: string) {
       const ptys: i32[] = []
       if paramsStr.length > 0 {
         const pparts: string[] = []
-        splitTypeName(paramsStr, ',', pparts)
+        tyTopLevelSplit(paramsStr, ',', false, pparts)
         let pk = 0
         while pk < pparts.length {
           const pt = nameToTy(pparts[pk])
@@ -7710,7 +7695,7 @@ function canonEmitNameAt(name: string, ctx: i32) {
     const gArgs: string[] = []
     // Both cuts are `tyname.gaeHeadNameOf` / `gaeArgsTextOf` (W2) — the census never
     // listed this arm in the family at all, and it writes BOTH halves.
-    splitTypeName(gaeArgsTextOf(name, gLt), ',', gArgs)
+    tyTopLevelSplit(gaeArgsTextOf(name, gLt), ',', false, gArgs)
     let gOut = gaeHeadNameOf(name, gLt) + "<"
     let gi2 = 0
     while gi2 < gArgs.length {
@@ -7740,7 +7725,7 @@ function canonEmitNameAt(name: string, ctx: i32) {
   // the function-type pass-through below, NOT split here.
   if nameHasPipe(name) && !isTopLevelFuncTypeName(name) {
     const parts: string[] = []
-    splitTypeName(name, '|', parts)
+    tyTopLevelSplit(name, '|', false, parts)
     // A nullable literal-union (`K | null`) keeps its litunion members — see `nulLitUnionPreserve`.
     const nlu = nulLitUnionPreserve(parts)
     if nlu != "" {
@@ -7936,7 +7921,7 @@ function canonEmitNameAt(name: string, ctx: i32) {
     let out = "("
     if psStr.length > 0 {
       const parts: string[] = []
-      splitTypeName(psStr, ',', parts)
+      tyTopLevelSplit(psStr, ',', false, parts)
       let pi = 0
       while pi < parts.length {
         if pi > 0 { out = out + "," }
@@ -12403,7 +12388,7 @@ function checkProgramNode(n: Program) {
         // i.e. once per APPLICATION of the alias; the list is a property of the
         // DECLARATION and cannot change between applications.
         const gps: string[] = []
-        splitGenArgs(gaeArgsTextOf(gname, gLt), gps)
+        tyTopLevelSplit(gaeArgsTextOf(gname, gLt), ',', true, gps)
         gaParamStart.push(gaParamNames.length)
         gaParamCount.push(gps.length)
         let gpi = 0
