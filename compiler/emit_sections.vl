@@ -2045,6 +2045,16 @@ function passCheckTopLevel() {
 // index, so this is decided up front; a print-free program emits no import
 // section at all). Scans the WHOLE arena, so it must run after every pass that
 // mints nodes (monomorphization instances, synthesized annotations).
+//
+// "any print" is the PROPERTY, not the spelling `print(`: the reservation must
+// cover every construct the emitter lowers to a `__print_*__` import, whichever
+// name the author wrote. Three do — `print(...)`, `__log__(...)` (its decoder
+// prints through `__print_i32__`) and `__trap__(<string>)` (its reason streams
+// through `__print_char__`/`__print_str_flush__`). A construct that streams but
+// is missing here is not a wrong number, it is a module with no import section
+// whose streaming calls resolve to USER function indices: invalid wasm that
+// `vl check` passes. Grep `fbCall(0)`..`fbCall(4)` and `emitPrintStrExpr` in
+// `wasmEmit.vl` before adding a fourth.
 function scanPrintUse() {
   gImports = 0
   gNeedsI64Print = false
@@ -2106,6 +2116,26 @@ function scanPrintUse() {
           memUsed = true
           memLogUsed = true
           gImports = 4
+        }
+        // `__trap__("reason")` streams its message through the SAME
+        // `__print_char__` / `__print_str_flush__` pair `print(<string>)` uses
+        // (`wasmEmit.emitPrintStrExpr`), so it pulls in the 4-import print family
+        // exactly as a `print(...)` call does. It had no arm here, and the whole
+        // defect is that a MESSAGE-carrying trap was the only thing keeping a
+        // program's import section alive: `__trap__("boom")` as the only statement
+        // reserved nothing, the module got no import section at all, and the two
+        // streaming calls landed on USER function indices — invalid wasm with
+        // `vl check` rc 0 (measured on 367ab8d: a 351-byte module, "type mismatch:
+        // expected (ref $type), found i32"). The sibling classifier in
+        // `emit_classify.exprHasStrOp` had ALREADY been taught `__trap__(<string>)`
+        // for the string-op scratch frame; this is the other half of that set.
+        //
+        // Arity-gated on purpose: the BARE `__trap__()` lowers to `unreachable`
+        // alone and streams nothing, so reserving for it would put four unused
+        // imports and ~118 bytes into every bare-abort module that is already
+        // correct. `> 1` argument is the emitter's own loud reject, unchanged.
+        if pcallee.identName == "__trap__" {
+          if pn.callArgs.length == 1 { gImports = 4 }
         }
         // A numeric-opcode INTRINSIC yields a scalar that the annotation scan below
         // cannot see: `f64bits(x)` is an i64 and `f32fromBits(b)` an f32 in a program
