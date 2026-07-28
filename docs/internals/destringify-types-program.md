@@ -30645,7 +30645,7 @@ whoever owns that file next.
 |---|---|
 | **frozen-source rebuild** — master's own `compiler/entry.vl` compiled by this branch's compiler | **BYTE-IDENTICAL**, 1,044,688 B, sha256 `1b55fcbb4209130a423dbfb1a9b6ab2670a846b3ca6807f2a439a37a3e027ec3`. Re-run after EVERY family commit; identical five times. **INVERTED CONTROL:** the two compilers `cmp` as differing (rc 1), every time. |
 | **six-channel corpus A/B**, 1,565 files (`tests/cases` + `std` + `scripts`) | **0 diffs on all six channels.** |
-| **fuzz A/B**, 100,800 generated programs per side (14 seeds × 3 depths × {plain, declared}, 1,200 emitted per batch) | **0 divergences** — see the harness note below. |
+| **fuzz A/B**, 100,800 generated programs per side (14 seeds × 3 depths × {plain, declared}, 1,200 emitted per batch), 8,784 kept files per side | **0 divergences** — raw `diff -r` reads 15,052 lines and every one of them is the mktemp path; see the harness note below. |
 
 **A HARNESS BUG THE PREVIOUS RUNS OF THIS INSTRUMENT CARRIED.** The inherited fuzz A/B script
 normalises the `mktemp` directory out of `*.log` and NOT out of `*.err`, so every case that
@@ -30722,6 +30722,30 @@ Every rc taken BARE, never through a pipe.
 | corpus A/B | 0 | 1,565 files, 0 diffs × 6 channels, calibrated by S1 + S2 |
 | fuzz A/B | 0 | 100,800 programs/side, 0 divergences (after normalising `*.err` — see the harness note) |
 | frozen-source rebuild | 0 | byte-identical + inverted control rc 1 — **and measured BLIND to both sabotages** |
+
+#### RE-GATED ON `231e137c` — every reading reproduced, and the byte delta is IDENTICAL
+
+Master moved three commits (#1253 `emit_collect`, #1254 docs+fixtures, #1255 `emit_mono`) while
+this slice ran. Rebased — the only conflict is the doc's append/append, resolved by deleting the
+three markers so both section headers survive — and the whole gate re-run against a rebuilt,
+fixpoint-proved `231e137c` baseline (1,044,778 B, `compile(X) == X` verified in one extra
+compile). None of master's three commits touches a file in this partition.
+
+| gate | rc | reading on `231e137c` |
+|---|---:|---|
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint at the 2-compile rung, **1,042,817 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4, 1,042,817 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3306 / 0 / 8** (3300 + master's 3 new fixtures × 2 tiers) |
+| `scripts/lint-self.sh` | 0 | clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined, 0 new, 0 stale |
+| corpus A/B vs the new baseline | 0 | **1,569 files, 0 diffs × 6 channels** |
+| frozen-source rebuild of `231e137c`'s own source | 0 | **byte-identical**, 1,044,778 B, sha256 `42e12ff28960d19216068bf98c8165653297a8dafa81d18602afe6e7bf0f102a`; inverted control rc 1 |
+| fuzz A/B vs the new baseline | 0 | 100,800 programs/side, 0 divergences (`*.err` normalised) |
+
+**1,044,778 → 1,042,817 is −1,961 B — the SAME total as before the rebase**, on a baseline 90
+bytes larger. The per-family deltas are therefore additive with master's own work rather than
+entangled with it, which is the useful form of a byte claim: it survived its base changing
+underneath it.
 
 ### WHAT REMAINS UN-ROUTED, WITH THE REASON
 
