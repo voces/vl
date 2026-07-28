@@ -29324,3 +29324,91 @@ wrong answer; they differ only in what they leave in the arena for the other twe
 read. The 8 reddened cells were invisible to every channel except a swept grid that included the
 cells the defect did *not* break — the diagonal `A == B` no-op instantiations, which are the
 boring rows one is most tempted to drop from a grid.
+
+## D-GAESTRUCT — the shadow residue closed by ONE structural walk, and the SECOND half nobody was looking for (#TBD)
+
+Follow-up to D-GAERAWFIELD (#1238), whose residue table above listed the first two rows as LIVE
+shadow defects with green controls. They are, and so are three more the table did not have.
+
+### THE SUBSTITUTION WAS THE `[]` LADDER AND NOTHING ELSE
+
+`gaeApplyFieldTy` peeled the array run and matched the leaf against the parameter list. Every
+OTHER constructor the annotation grammar has — `Id | null`, `{a: Id}`, `Inner<Id>`, `Id | i32`,
+and any of those under a `[]` run — reported "the substitution does not land here", so
+`gaeDeclFieldTyName` recorded the CANON'd alias body and the field interned at the alias's own
+type while the checker had bound it to the ARGUMENT.
+
+Swept as a 15 × 8 grid — the shadowed declaration's KIND (i32/i64/f64/f32/boolean/string,
+`i32[]`, `0|1`, `1`, `"a"|"b"`, alias-of-alias, declared struct, alias-of-struct, map, function
+type) × the CONSTRUCTOR the parameter sits behind (`Id`, `Id[]`, `Id[][]`, `Id|null`, `{a:Id}`,
+`(Id|null)[]`, `{a:Id}[]`, `{a:Id[]}`) — each cell paired with the identical program at a
+non-shadowing `<T>`:
+
+| | master | after |
+|---|---|---|
+| CORRECT | 126 | **195** |
+| INVALID WASM | 66 | **0** |
+| silently WRONG output | 3 | **0** |
+| compiler CRASH (`vl build` traps) | 15 | **0** |
+| clean emit reject | 30 | 45 |
+
+All 120 SHADOW cells are correct; 0 cells moved backward. The 45 remaining rejects are all
+CONTROL cells at `(T|null)[]` / `{a:T}[]` / `{a:T[]}`, where an un-canon'd parameter NAME survives
+in the arena and a later scan chokes on it — a different, un-shadowed defect, and 15 of those 45
+were a compiler crash on master. Two more axes moved with it: a nested application field
+(`Inner<Id>`, 5 cells invalid wasm → correct) and a non-nullable union arm (`Id | i32`).
+
+The fix is not a third ladder. `monoSubstAnn` / `monoAnnHasTyParam` — the walk this same file
+already owns for the FuncDecl half — gained the two arms they were missing (a top-level UNION via
+`splitUnionAtoms`, and a grouping PAREN via `peelGroupParens`), and `gaeApplyFieldTy` now calls
+them with the alias's LIVE parameters as the bindings. The shadow rule stays where it was: the
+parameter list is filtered by `gaeParamShadowed` at the gae entry, not inside the shared walk,
+because the FuncDecl half's shadow question is a different arm at a different site.
+
+### THE MERGE THAT LOOKED OBVIOUS AND IS MEASURED WORSE
+
+`monoTyParamOf` reads ONE `[]` rung; `gaeApplyFieldTy` has read the full leaf peel since #1234.
+That is the "classifier taught HALF a set" shape exactly, and unifying it on the leaf peel was
+built and swept: **14 cells move `clean emit reject → invalid wasm`** (`function id<T>(v: T[][])`
+at every shadowed-name row, plus one shadow cell that was CORRECT), and nothing moves forward — a
+`T[][]` FuncDecl parameter is a nested list with no rep, so recognising it only replaces a loud
+reject with a written invalid module. The `[]` run therefore stays OUTSIDE the shared walk, in
+`gaeApplyFieldTy`, which is what lets the alias half carry a depth the FuncDecl half must not.
+
+### THE SECOND HALF: THE SUBSTITUTED SHAPE IS INTERNED BY NOBODY
+
+With the substitution correct, every inline-shape row was STILL invalid wasm. The substituted
+target `{a:string}` is a text that appears NOWHERE in the program: a declared struct's nested
+shape is interned from its own `FieldDef` (`collectNestedFieldShapes`) and an inline annotation's
+from its own `TypeRef` (`collectAnnShapes`), and a monomorphized generic-alias field has neither.
+`gaeEnsure` asked `structIndexByName`, got -1, coded the field -1 and declined to intern the
+INSTANCE at all.
+
+What told the two halves apart was a one-line probe: adding `const w: {a: string}` elsewhere in
+the very same program — which changes nothing about the substitution and only makes the shape
+reachable by an arena scan — turns the cell CORRECT on the substitution-only build and leaves it
+invalid on master. `emit_collect.collectGenAliasShapes` now interns an application's substituted
+field shapes before `gaeEnsure` codes them.
+
+### CORRECTIONS TO D-GAERAWFIELD'S RESIDUE TABLE
+
+* **`Box<Nm>` where `type Nm = string` — the control is CORRECT, not invalid wasm.** Swept over 9
+  alias-body kinds: 8 of 9 are invalid wasm with a green concrete-argument control (only a
+  DECLARED struct body runs). It is a LIVE defect, not a symmetric pre-existing gap, and the
+  anchor is that `canonEmitNameAt` has no generic-APPLICATION arm at all — the argument inside
+  `Head<…>` is never canon'd. Still open.
+* **`type Outer<Id> = { o: Inner<Id> }` is a LIVE shadow defect, not a symmetric gap** — 5 cells
+  invalid wasm against a CORRECT control. Closed here.
+* **A STRING literal union DOES fail** — not at the bare/`[]` depths the earlier grid swept, but
+  at `Id|null` / `{a:Id}` it produced silently WRONG OUTPUT (`0` instead of the string), the worst
+  class in the ordering. Closed here.
+
+### STILL OPEN, WITH ITS CONTROL
+
+| cell | shadowed | control | verdict |
+|---|---|---|---|
+| `Box<Nm>`, `type Nm = string` | invalid wasm | **correct** | LIVE — `canonEmitNameAt` has no gen-app arm, so the ARGUMENT is never canon'd |
+| `function ident<Id>(v: Id): Id`, `type Id = i32` | invalid wasm | **correct** | LIVE — 49 of 66 cells on an 11 × 6 shadowed-name × ARGUMENT-TYPE grid. The axis is the ARGUMENT's type, not the rep |
+| `function ident<i64>(v: i64)` at an i32 argument | invalid wasm | **correct** | LIVE — `monoTyParamOf` lacks the `gaeParamShadowed` guard its `gae` sibling carries. 2 cells |
+| `type Box<T> = { v: (T\|null)[] }` (no shadow) | — | emit reject | pre-existing: an un-canon'd `T` survives in the arena. 45 control cells; 15 were a compiler CRASH on master and are now clean rejects |
+| a NESTED application's own inline-shape fields | — | — | `gaeInternAppFieldShapes` does not recurse (a recursive alias would not terminate) |

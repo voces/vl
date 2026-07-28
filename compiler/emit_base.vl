@@ -1946,59 +1946,107 @@ export function gaeSplitArgs(s: string, out: string[]) {
 // transparent alias: `type Id = 0 | 1` and the one-member `type Id = 1` shadow through
 // `numLitUnionAliasName`, a DIFFERENT canon arm, and fail identically — while a declared
 // STRUCT or UNION shadow always ran, because canon rewrites neither. `gaeCollectDecls` now
-// records the DECLARED spelling for exactly the fields `gaeParamSlotOf` claims
+// records the DECLARED spelling for exactly the fields `gaeAnnHasParam` claims
 // (`typecheck.genAliasFieldRawTyName`), so this predicate is asked about `Id` again.
 //
-// ONE SIBLING DISAGREEMENT OVER A SHADOWED PARAMETER SURVIVES:
-//
-//   * The FuncDecl half at a non-i32 rep. `function id<i64>(v: i64) { return v }` +
-//     `print(id(1))` is `vl check` rc=0 and invalid wasm inside `id`
-//     ("expected i64, found i32"); `f32` fails the same way ("expected f32, found f64")
-//     and i32 / f64 / string / boolean all run. No array is involved — dropping the
-//     `i64[]` annotation that would implicate `genTyParamArr` does not move the cell — so
-//     the ANCHOR is the inferred-RETURN classification of a generic FuncDecl whose type
-//     parameter is a primitive spelling, not this substitution or that guard.
+// THE FuncDecl HALF ASKS THIS SAME QUESTION AT `monoTyParamOf`, and the note that used to
+// stand here — "the ANCHOR is the inferred-RETURN classification" — was WRONG in both of
+// its claims and is recorded as refuted rather than deleted. Measured over a 6x6
+// parameter-name x ARGUMENT-type grid, the axis is not the rep: it is whether the
+// ARGUMENT's type equals the shadowed primitive. `function id<i64>(v: i64)` RUNS when
+// handed a genuinely `i64`-typed argument and is invalid wasm when handed an `i32` one, and
+// the disassembly reads `(param i32) (result i64)` — the RETURN is the half that agrees
+// with the checker and the PARAM is the erased one, the opposite way round. The earlier
+// per-row single literal made the diagonal look green for the reason the diagonal is
+// always green. See `monoTyParamOf`'s own guard.
 function gaeParamShadowed(name: string) {
   if name == "void" { return true }
   valueAtomKind(name) >= 0
 }
-// The parameter SLOT a field type's array LEAF names, or -1 when the leaf names no live
-// parameter (it is some other type, or it is a parameter the predicate above says binds
-// nothing). THE substitution's decision, published so the one other place that has to ask
-// "would `gaeApplyFieldTy` land here?" asks it rather than re-deriving it:
-// `emit_collect.gaeDeclFieldTyName` uses it to decide whether a field's DECLARED spelling
-// is the one to record. Two copies of this loop would be two answers to the same question,
-// and the whole defect this closes is exactly that.
-export function gaeParamSlotOf(leaf: string, pnames: string[]) {
+// The LIVE parameter slots of a generic alias — the declared names that actually BIND,
+// paired with the application arguments that bind them. A parameter whose name is a
+// primitive spelling binds nothing (`gaeParamShadowed`, which is the checker's
+// `primTyOfName`-first resolution order read as a predicate), so it is dropped from BOTH
+// lists together and the substitution below never sees it.
+//
+// Filtering here rather than inside the walk is what keeps the shadow rule in ONE place:
+// `monoSubstAnn` is shared with the FuncDecl half, whose own shadow question is a
+// different arm at a different site, and a guard buried in the shared walk would answer
+// both with one rule.
+function gaeLiveParams(
+  pnames: string[],
+  args: string[],
+  outP: string[],
+  outA: string[],
+) {
   let i = 0
   while i < pnames.length {
-    if leaf == pnames[i] && !gaeParamShadowed(pnames[i]) { return i }
+    if !gaeParamShadowed(pnames[i]) {
+      outP.push(pnames[i])
+      outA.push(args[i])
+    }
     i = i + 1
   }
-  -1
+  0
+}
+// Would the substitution below CHANGE this field's type name — i.e. does the annotation
+// reach a live type parameter anywhere in its structure? THE substitution's decision,
+// published so the one other place that has to ask it asks it rather than re-deriving it:
+// `emit_collect.gaeDeclFieldTyName` uses it to decide whether a field's DECLARED spelling
+// is the one to record. Two copies of this question would be two answers, and the defect
+// #1238 closed is exactly that.
+//
+// It REPLACES the `gaeParamSlotOf(arrLeafNameOf(raw), …)` gate that shipped with the
+// sidecar. That gate read the array grammar and nothing else, so a parameter sitting
+// behind ANY other constructor — `Id | null`, `{a: Id}`, `Inner<Id>` — was reported as
+// "the substitution does not land here", the canon'd `i32` was recorded, and the field
+// interned at the ALIAS's body type while the checker had bound it to the ARGUMENT.
+export function gaeAnnHasParam(tn: string, pnames: string[]) {
+  const lp: string[] = []
+  const la: string[] = []
+  gaeLiveParams(pnames, pnames, lp, la)
+  monoAnnHasTyParam(arrLeafNameOf(tn), lp)
 }
 // Substitute a declared type-PARAMETER name in a field's type name with the application's
-// argument name, at ANY array depth: `T` → `i32`, `T[]` → `i32[]`, `T[][]` → `i32[][]`.
+// argument name, THROUGH THE TYPE'S STRUCTURE: `T` → `i32`, `T[][]` → `i32[][]`,
+// `T | null` → `i32 | null`, `{a: T}` → `{a: i32}`, `(T | null)[]` → `(i32 | null)[]`.
 //
-// The depth is taken from the ARRAY-NAME grammar's leaf peel (`arrLeafNameOf`) rather than
-// from a ladder of `pnames[i] + "[]"` renderings, because a ladder can only ever know the
-// rungs someone wrote: knowing exactly `T` and `T[]` is what made `type Box<T> = { v: T[][] }`
-// an emit error at every instantiation ("nested arrays are not supported") while the
-// concrete twin `type Box = { v: i32[][] }` lowered fine. The substituted shape kept
-// recording its ref-list element as the UN-substituted `T[]`, so the field pointed at a
-// struct-element row instead of the nested-i32-list row that was already interned beside
-// it. Nesting was never the axis — `type Box<T> = { v: T[] }` at `Box<i32[]>` yields the
-// identical `{v: i32[][]}` and always ran; the axis was the depth the parameter sits at IN
-// THE ALIAS BODY, which is exactly what the peel removes from the answer.
+// It is `monoSubstAnn` — the generic-instantiation walk this file already owns for the
+// FuncDecl half — asked with the alias's live parameters as the bindings, NOT a third
+// hand-rolled ladder. Peeling one constructor is what a ladder can do; the population is
+// every constructor the annotation grammar has, and each rung someone forgets to write is
+// a field that interns at the alias's BODY type while the checker reads the ARGUMENT.
+// #1234 bought the `[]` rung (`type Box<T> = {v: T[][]}` was an emit error at every
+// instantiation), and the `| null` and `{…}` rungs were the identical defect asked of two
+// more constructors — 26 `vl check`-clean invalid-wasm cells across a 15x8 declaration x
+// constructor grid, every one with a green non-shadowing control.
 //
-// `arrLeafNameOf` strips whole `[]` pairs off the END, so the leaf is a PREFIX of `tn` and
-// the remainder is precisely the `[]` repetitions to re-attach — the dimensions are carried
-// as the slice they already are, never rebuilt from a count.
+// THE `[]` RUN STAYS HERE, OUTSIDE THE SHARED WALK, and that seam is load-bearing rather
+// than incidental. `arrLeafNameOf` strips whole `[]` pairs off the END, so the leaf is a
+// PREFIX of `tn` and the remainder is precisely the repetitions to re-attach — the
+// dimensions are carried as the slice they already are, never rebuilt from a count. It is
+// NOT pushed down into `monoTyParamOf` to serve both halves: a `T[][]` FuncDecl parameter
+// is a nested list with no rep, so teaching the shared walk this depth moves 14 measured
+// cells from a loud emit reject to a written invalid module. See `monoTyParamOf`'s header.
+//
+// THE GATE IS NOT OPTIONAL AND IT IS NOT AN OPTIMISATION. An annotation that reaches no
+// live parameter is returned VERBATIM rather than walked, because the walk RE-RENDERS what
+// it descends (a union rejoins on `|`, a shape rebuilds `{n:t,…}`) and a re-rendered
+// spelling that differs from the recorded one by a single character is a second intern key
+// for one type. Only a name the substitution actually changes may be rebuilt.
 export function gaeApplyFieldTy(tn: string, pnames: string[], args: string[]) {
+  const lp: string[] = []
+  const la: string[] = []
+  gaeLiveParams(pnames, args, lp, la)
   const leaf = arrLeafNameOf(tn)
-  const slot = gaeParamSlotOf(leaf, pnames)
-  if slot < 0 { return tn }
-  args[slot] + tn.slice(leaf.length, tn.length)
+  if !monoAnnHasTyParam(leaf, lp) { return tn }
+  const s = monoSubstAnn(leaf, lp, lp, la)
+  // "" is `monoSubstAnn`'s UNBOUND answer, which cannot arise here — every name in `lp`
+  // is bound by construction — so this and the unchanged-leaf test are the
+  // un-substitutable fallbacks, not cases.
+  if s == "" { return tn }
+  if s == leaf { return tn }
+  s + tn.slice(leaf.length, tn.length)
 }
 // Lexicographic `a < b` over two strings by code point (VL has no `<` on `string`).
 // Compares char-by-char: at the first differing position the smaller code point wins;
@@ -2721,6 +2769,16 @@ export function monoIsGenericDecl(fnIx: i32) {
 // The type-parameter NAME a written annotation rides on — `ann == tp` (bare) or
 // `ann == tp + "[]"` (array-of) for some `tp` in `typarams` — or "" when the
 // annotation is concrete. Mirrors the checker's `resolveAnnot` shape.
+//
+// THE ONE-RUNG `[]` READING IS DELIBERATE AND IT WAS MEASURED. Widening it to the leaf
+// peel (`arrLeafNameOf`, the depth the generic-ALIAS half has used since #1234) looks like
+// the obvious merge of two halves of one set, and it is not: a `T[][]` FuncDecl parameter
+// is a nested list the emitter has no rep for, so recognising it turns a LOUD emit reject
+// into a written invalid module. Built and measured over an 11 x 5 shadowed-name x
+// constructor grid: 14 cells move `clean reject -> invalid wasm`, and nothing moves
+// forward. The alias half keeps its own `[]` run because it peels the run OUTSIDE this
+// walk (`gaeApplyFieldTy`), which is exactly the seam that lets one side carry a depth the
+// other cannot.
 export function monoTyParamOf(ann: string, typarams: string[]) {
   let i = 0
   while i < typarams.length {
@@ -2752,11 +2810,33 @@ export function monoBindOf(tvN: string[], tvV: string[], tp: string) {
   }
   ""
 }
-// Does the annotation NAME reach a declared type param — bare (`T`), array-of
-// (`T[]`), a generic-alias application argument (`Box<T>`), or an inline object
-// shape's field type (`{first:B,second:A}`)?
+// Does the annotation NAME reach a declared type param — bare (`T`), array-of at any
+// dimension (`T[]`, `T[][]`), a UNION member (`T | null`), a generic-alias application
+// argument (`Box<T>`), an inline object shape's field type (`{first:B,second:A}`), a
+// function type's parameter or result, or any of those under a grouping paren or behind
+// a `[]` run (`(T | null)[]`, `{a: T}[]`)?
+//
+// THE ARM LIST IS `monoSubstAnn`'S, IN THE SAME ORDER, AND THAT IS A CONTRACT rather
+// than a coincidence: every caller asks this first and substitutes second, so an arm here
+// that the substitution lacks reports a parameter it then fails to replace, and an arm
+// there that this lacks leaves the substitution unreached. The two were already out of
+// step on the UNION and on `[]` depth, which is exactly where the generic-alias field
+// residues sat.
 export function monoAnnHasTyParam(ann: string, typarams: string[]) {
   if monoTyParamOf(ann, typarams) != "" { return true }
+  // A top-level UNION (`T | null`, `T | i32`). `splitUnionAtoms` is depth- and
+  // quote-aware and stops at a top-level `=>`, so a function type whose RESULT is a
+  // union stays one atom and falls through to the function arm below.
+  const uatoms: string[] = []
+  splitUnionAtoms(ann, uatoms)
+  if uatoms.length > 1 {
+    let u = 0
+    while u < uatoms.length {
+      if monoAnnHasTyParam(uatoms[u], typarams) { return true }
+      u = u + 1
+    }
+    return false
+  }
   const parts: string[] = []
   if annGenAppDecompose(ann, parts) != "" {
     let i = 0
@@ -2793,6 +2873,11 @@ export function monoAnnHasTyParam(ann: string, typarams: string[]) {
     }
     if monoAnnHasTyParam(fret, typarams) { return true }
   }
+  // A GROUPING paren around the whole (`(T | null)` — the form a composite element wears
+  // under a `[]`). Below the function arm, so a top-level function type is claimed there
+  // first; `peelGroupParens` answers a non-parenthesized name with itself.
+  const pk = peelGroupParens(ann)
+  if pk != ann { return monoAnnHasTyParam(pk, typarams) }
   false
 }
 // Substitute the per-call type-param bindings through an annotation NAME —
@@ -2812,6 +2897,22 @@ export function monoSubstAnn(
     if b == "" { return "" }
     if ann == tp { return b }
     return b + "[]"
+  }
+  // A top-level UNION (`T | null`): substitute each member and rejoin. Paired with
+  // `monoAnnHasTyParam`'s union arm — see the contract note there.
+  const uatoms: string[] = []
+  splitUnionAtoms(ann, uatoms)
+  if uatoms.length > 1 {
+    let outU = ""
+    let u = 0
+    while u < uatoms.length {
+      const us = monoSubstAnn(uatoms[u], typarams, tvN, tvV)
+      if us == "" { return "" }
+      if u > 0 { outU = outU + "|" }
+      outU = outU + us
+      u = u + 1
+    }
+    return outU
   }
   const parts: string[] = []
   const gHead = annGenAppDecompose(ann, parts)
@@ -2864,6 +2965,18 @@ export function monoSubstAnn(
     const rs2 = monoSubstAnn(fret, typarams, tvN, tvV)
     if rs2 == "" { return "" }
     return outFn + ")=>" + rs2
+  }
+  // A GROUPING paren around the whole (`(T | null)` — the form a composite element wears
+  // under a `[]`), the arm `monoAnnHasTyParam` closes with. It re-renders only when the
+  // recursion actually moved: an untouched inner name returns `ann` VERBATIM, so a
+  // concrete annotation is never reassembled (a rebuilt spelling is a second intern key,
+  // which is the whole hazard this layer exists in).
+  const pk = peelGroupParens(ann)
+  if pk != ann {
+    const ps = monoSubstAnn(pk, typarams, tvN, tvV)
+    if ps == "" { return "" }
+    if ps == pk { return ann }
+    return "(" + ps + ")"
   }
   ann
 }
