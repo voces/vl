@@ -1734,6 +1734,50 @@ A view writes with the same `f32.store` into the same exported memory as every o
 nothing new to stay true — but that file was not touched and the claim is by construction rather
 than by assertion.
 
+### L6a. The size tax on every `std:buffer` importer — and the flag that removes it
+
+The prescribed corpus A/B varies the COMPILER. This change does not move the compiler by a byte, so
+that instrument is frozen-identical **by construction** and read 1619/1619 `same` on all six fields
+— it proves the absence of compiler drift and nothing at all about the change. The live instrument
+for a std-only change varies the STD DIRECTORY with the compiler held fixed. Run that way:
+
+**20 rows differ, 1599 identical on all six.** Nine are this slice's own new fixtures (they do not
+compile against the old std, correctly). Eleven are the PRE-EXISTING `tests/cases/std/buffer-*.vl`
+fixtures, and they differ on fields 4 and 5 — **their emitted bytes moved**, even though not one of
+them mentions a view. Field 6 (run rc + stdout) is `same` for all eleven: no behaviour changed.
+
+Measured, that movement is a flat **+422 bytes on every program that imports `std:buffer`**,
+identical across six fixtures of very different sizes — so the module merge brings in every exported
+function of an imported std module whether it is reachable or not. Bisected by building a
+half-surface std with the i32 view family removed:
+
+| `std:buffer` contains | `buffer-alloc.vl` | delta |
+|---|---|---|
+| no views (master) | 1076 | — |
+| f32 views only (+ the shared extent helper) | 1336 | +260 |
+| f32 + i32 views (shipped) | 1498 | +422 |
+
+**Each additional width family costs ~162 bytes on every importer**, used or not, and it scales
+linearly — the i64/f64/narrow widths a later slice adds would take that toward a kilobyte for a
+program that only wanted `Buffer(n)`.
+
+It does not reach a shipped module:
+
+| `buffer-alloc.vl` | (none) | `-O` | `-O3 --closed-world --gufa` |
+|---|---|---|---|
+| old std (no views) | 1076 | 530 | **394** |
+| new std (views) | 1498 | 610 | **394** |
+
+**Byte-identical at `-O3 --closed-world` — the unused surface is eliminated completely.** Which is
+the same flag §L4 shows is required to inline the accessors. Two independent findings converge on
+one recommendation: `-O3 --closed-world` is the release profile, it is worth 3.5× on kernel speed
+AND it is what keeps std's surface from being a size tax. A build at `-O` gets neither.
+
+The residual question this leaves open, for whoever grows the width family: whether the merge should
+prune unreachable exported functions from an imported module itself, rather than leaning on
+binaryen. The generics path already does something of this shape (uncalled `<T>` generics are pruned
+to no-op stubs); plain exported functions are not pruned at all.
+
 ### L7. Two defects this slice did not go looking for
 
 Both are in the B13 index-trap path (route 1 above), both pre-date this slice, and neither is

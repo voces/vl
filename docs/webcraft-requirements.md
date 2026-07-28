@@ -290,6 +290,14 @@ ring and for the differential harness to diff columns.
 > **The mark/release hazard reaches views** and is documented, not fixed: a view
 > held across a `bufferRelease` that undoes its allocation passes its own bounds
 > check AND the engine's, and reads/writes the next owner's bytes silently.
+>
+> **One size note, with the same punchline as P1.4's speed note.** The module
+> merge does not prune unreachable exported functions, so the view surface costs
+> **+422 bytes on every program that imports `std:buffer`**, used or not
+> (~162 per width family, scaling linearly as i64/f64/narrow widths arrive). At
+> `-O3 --closed-world` it is eliminated **completely** — byte-identical to a
+> build against the pre-view std. Same flag, second reason: the release profile
+> is what makes both the wrapper calls and the unused surface disappear.
 
 ### P1.2 Flat record layouts (AoS tier — the Lua VM's requirement)
 
