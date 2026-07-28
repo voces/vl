@@ -4649,24 +4649,59 @@ function nliInferIfLet(walk: i32[], i: i32) {
 // unions in its params/result, but its closure SIGNATURE is NOT interned here (sig
 // descent is the next slice — the slot digits are nominal-sensitive and need the
 // run-diff gate). Returns 0, or -1 (a `registerInlineUnion` `emitFail`).
-// The name-walk key for a reachable union, honoring the position-dependent litunion
-// softening that `canonEmitName` bakes in. `underFunc` = the union sits INSIDE a
-// function type on the reachability path. `canonEmitName` leaves a top-level function
-// type VERBATIM (it never recurses into a func's params/result), so a litunion alias
-// embedded there — a struct FIELD's `K0 | boolean` inside `(i32) => {a: K0|boolean,…}`
-// — is NEVER softened: the name walk (which extracts field text from the func's
-// already-canon'd source spelling) keys it faithfully as `K0|boolean`. Outside any
-// func, `canonEmitName` DOES soften a direct/field litunion (`K0|boolean` →
-// `string|boolean`, the `unionAliasMembers` expansion), matching the emit-side
-// annotation rewrite for a direct struct spelling. So: under a func, render faithfully
-// (`tyToNominalName` already produces the source-faithful, alias-preserving spelling);
-// otherwise soften once via `canonEmitName`. Reproduces the name-walk key in BOTH
-// positions — the prerequisite for retiring `registerShapeFieldUnions`.
-function reachRegisterName(tyIx: i32, underFunc: boolean): string {
+// ── THE ONE render-then-canon HOP IN THIS MODULE (W9) ─────────────────────────────
+// The emitter-vocabulary NAME of an arena type: `tyToNominalName` produces the
+// source-faithful (alias-preserving) spelling, then `canonEmitName` applies — ONCE
+// over the WHOLE render, where the surrounding structure is visible — the same
+// position-dependent rewrites `canonEmitTypeNames` already applied to every source
+// annotation. That is what makes an arena-derived key EQUAL the key the NAME walk
+// derived for the same type, which is the whole contract of the three walks below
+// (registrations and sigs UNION IN rather than forking).
+//
+// THIS BODY EXISTED THREE TIMES — here, in `funcRetUnrepresentable` and in
+// `collectTyReachCloSigs` — and the census that motivates the merge also RULES OUT
+// deleting the outer `canonEmitName`, which was the other candidate. One instrumented
+// compiler reporting BOTH legs at every reach (`vl check tests/cases --codegen`,
+// 1,548 programs, 9,501 reaches):
+//
+//   site                                    reaches   canon rewrites
+//   reachRegisterName (canon leg)             7,914      72  (0.91%)
+//   reachRegisterName (`underFunc` leg)         558       — (canon not applied)
+//   funcRetUnrepresentable                      134       4  (2.99%)
+//   collectTyReachCloSigs                       895       0
+//
+// The 72 are three rules and nothing else: 58 a string-litunion ALIAS inside a union
+// softened to `string` (`K0|f64` → `string|f64`), 12 alias TRANSPARENCY (`Z` → `i32`,
+// `L|i32` → `{n:i32}[]|i32`), 2 a union-ALIAS flattened into its members. Each is a
+// key the emitter genuinely uses; a render that skipped them would fork the registry.
+//
+// AND `collectTyReachCloSigs`' ZERO IS A COVERAGE ZERO, NOT AN IDENTITY. `canonEmitName`
+// leaves a top-level function type verbatim EXCEPT when its result is parenthesized
+// (`(i32) => ((i32) => i32)`), where it recurses into the PARAMS at `RC_FN_PARAM` — not
+// a litunion-keeping position — and softens there. Two lines make it fire:
+// `(K0|i64) => ((i32) => i32)` renders `(K0|i64)=>((i32)=>i32)` and canons to
+// `(string|i64)=>((i32)=>i32)`, while the unparenthesized `(K0|i64) => i32` is left
+// alone. The corpus contains no such program; the compiler does not stop being a
+// consumer because of that.
+//
+// `underFunc` = the union sits INSIDE a function type on the reachability path. A
+// litunion alias embedded there — a struct FIELD's `K0 | boolean` inside
+// `(i32) => {a: K0|boolean,…}` — is NEVER softened by the annotation pipeline either
+// (the name walk extracts field text from the func's already-canon'd source spelling
+// and keys it faithfully as `K0|boolean`), so that leg renders faithfully and stops.
+function arenaEmitName(tyIx: i32): string {
   const nom = tyToNominalName(tyIx)
   if nom == "" { return "" }
-  if underFunc { return nom }
   canonEmitName(nom)
+}
+
+// The name-walk key for a reachable union, honoring the position-dependent litunion
+// softening that `canonEmitName` bakes in — see `arenaEmitName` above for the rule and
+// for what `underFunc` buys. Reproduces the name-walk key in BOTH positions — the
+// prerequisite for retiring `registerShapeFieldUnions`.
+function reachRegisterName(tyIx: i32, underFunc: boolean): string {
+  if underFunc { return tyToNominalName(tyIx) }
+  arenaEmitName(tyIx)
 }
 
 function collectTyReachRegister(
@@ -4819,7 +4854,11 @@ function funcRetUnrepresentable(retIx: i32): boolean {
   if retIx < 0 { return false }
   const t = T.tys[retIx]
   if t is TyObj {
-    const nm = canonEmitName(tyToNominalName(retIx))
+    // `arenaEmitName` — the module's one render-then-canon hop. The `""` render this
+    // used to hand `canonEmitName` directly came back `""` and failed `nameIsShapeOpen`;
+    // the home returns `""` for it without entering the rewriter, which is the same
+    // answer one call earlier.
+    const nm = arenaEmitName(retIx)
     // The `length > 0` this replaces was the ONE spelling of the shape-open grammar in the
     // compiler that did not bound the name at 2 — on the single name `"{"` it read `nm[1]`
     // out of bounds, which TRAPS. The home bounds it, so this is the same predicate minus a
@@ -4911,7 +4950,10 @@ function collectTyReachCloSigs(tyIx: i32, depth: i32) {
     // and stays unminted; a mixed-union unregistered result is skipped so the call
     // rejects loudly (the name-pass discipline).
     if !funcRetUnrepresentable(t.fnRet) {
-      const nm = canonEmitName(tyToNominalName(tyIx))
+      // `arenaEmitName` — the module's one render-then-canon hop. Its own `""` guard
+      // subsumes nothing here (the `nm != ""` test below is the one that decides), so
+      // the two spellings agree on every input including the unnameable type.
+      const nm = arenaEmitName(tyIx)
       if nm != "" { internCloSigOfAtom(nm) }
     }
     // Descend params + result to reach closures nested inside them (a result struct's
