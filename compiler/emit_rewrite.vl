@@ -11,13 +11,16 @@ import { arrElemNameRaw, nameIsArray, nameIsSpaceFree } from "./tyname"
 import {
   inferRetNameByNode,
   isValueUnionName,
+  litUnionAliasNameOfTy,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
+  nodeTyIsLitUnionAlias,
   nodeTyIsNullable,
   nodeTyIsUnion,
   nodeTyIxOf,
   nodeTyName,
   recordNodeTyFrom,
+  tyIsLitUnion,
   tyToEmitName,
 } from "./typecheck"
 import {
@@ -600,6 +603,61 @@ export function synthRetAnnots() {
   0
 }
 
+// THE PIN an un-annotated UNION param takes — chosen by the param's OWN union REP, never by
+// `unNames` DECLARATION ORDER.
+//
+// Two reps answer to one `nodeTyIsUnion`: a BOXED union (`i32 | string`, `Cat | Dog`) is the
+// shared `{tag, value}` `$uBox`, and a LITUNION (`"a" | "b"`, `type K = "a" | "b"`) is an
+// interned i32 ATOM. `unNames` holds BOTH — `collectU` pushes every declared `type … = … | …`
+// alias in source order, litunion aliases included — so `unNames[0]` picked the pin by which
+// alias the FILE happened to declare first, and the two reps do not substitute for each other
+// in EITHER direction:
+//   · `type K = "a"|"b"` declared ahead of an `(i32|string)` callback param pinned the param to
+//     the ATOM, so the value call's `ref.cast` found an i32 where the box was declared — TRAP
+//     (and INVALID WASM, `expected (ref $type), found i32`, once the lambda body USES the
+//     param). Moving the same litunion declaration BELOW a value-union alias made the identical
+//     program correct — the defect was the ORDER, not the program.
+//   · the mirror: a litunion-ALIAS param (`(K) => i32`) behind ANY declared boxed union pinned
+//     the atom param to the box — the same trap, the same invalid wasm when the body uses it.
+//
+// The BOXED half keeps the arm's shortcut and states its bound: every boxed union shares
+// `$uBox` and program-global variant tags, so ANY declared BOXED alias routes emission
+// identically and the checker has already validated the precise type — the pin only has to
+// carry the REP. The LITUNION half cannot borrow that argument, because a litunion's atom ids
+// are its own member strings; it pins the param's OWN rendered type instead, which is the same
+// name an explicit annotation spells and the same move the nullable arm below makes.
+//
+// "" means NO PIN — the param keeps its un-pinned route, which is exactly what the arm did
+// when `unNames` was empty (that guard now lives here; see the call site). Reachable only for a
+// BOXED param in a program that registers no boxed alias at all — a struct union with no
+// `type U = A | B` alias, since `registerValueUnionName` declines a non-scalar member set. The
+// litunion half never returns "": its pin is the param's own spelling, not a registered row.
+function unionParamPinName(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if tyIsLitUnion(ty) {
+    // A litunion param, and its rep follows the SPELLING the context was written in — the
+    // `canonEmitTypeNames` soften invariant `tyToEmitNameGo`'s union arm states: a DECLARED
+    // alias (`(K) => i32`) is preserved and reps as the i32 ATOM, an INLINE member spelling
+    // (`("a"|"b") => i32`) softens to `string` and reps as the string ref. So the pin has to
+    // reproduce the context's spelling, not merely its rep, and `nodeTyIsLitUnionAlias` is the
+    // question that separates them — the alias's OWN arena index (`cUnionTyIxs`), not the
+    // member-set match, which an inline spelling satisfies too.
+    if nodeTyIsLitUnionAlias(ix) {
+      const al = litUnionAliasNameOfTy(ty)
+      if al != "" { return al }
+    }
+    // The inline spelling's own emit name: `string`, by that same soften.
+    return tyToEmitName(ty)
+  }
+  let u = 0
+  while u < unNames.length {
+    const nm = unNames[u]
+    if !nameIsLitUnionType(nm) { return nm }
+    u = u + 1
+  }
+  ""
+}
+
 export function synthParamAnnots() {
   let fe = 0
   while fe < fnStmts.length {
@@ -610,13 +668,24 @@ export function synthParamAnnots() {
       while pi < ps.length {
         const p = P.nodes[ps[pi]]
         if p is Param {
-          if p.parType < 0 && nodeTyIsUnion(ps[pi]) && unNames.length > 0 {
+          if p.parType < 0 && nodeTyIsUnion(ps[pi]) {
             // An un-annotated UNION-element callback param (`xs.filter((a) => a is Cat)`):
-            // the checker typed it as a value union. Pin it to a declared union alias so
-            // its `is`-narrowing and closure `$fnsig` param token (kind 4) resolve. All
-            // unions share `$uBox` and program-global variant tags, so any declared alias
-            // routes emission identically; the checker already validated the precise type.
-            p.parType = synthTypeRef(unNames[0], -1)
+            // the checker typed it as a union. Pin it to a name of the SAME REP so its
+            // `is`-narrowing and closure `$fnsig` param token (kind 4) resolve —
+            // `unionParamPinName` is which name, and why declaration order is not it.
+            //
+            // The `unNames.length > 0` GUARD that stood here has moved INTO the selector,
+            // where it belongs: it was a proxy for "a pin is available", true only of the
+            // boxed half — a litunion pin is the param's own spelling and needs no
+            // registered row. Out here it silently withheld the pin from a program whose
+            // only union is an INLINE litunion (`(("a"|"b") => i32)`, which
+            // `registerValueUnionName` declines — it is an atom, not a box), leaving the
+            // param on the i32 default while the annotation keyed the string soften: the
+            // same TRAP / invalid wasm the ordered cases produced. The selector's "" is the
+            // faithful "no pin available", and for the boxed half it is the same empty
+            // `unNames` this guard tested.
+            const upin = unionParamPinName(ps[pi])
+            if upin != "" { p.parType = synthTypeRef(upin, -1) }
           } else if p.parType < 0 && nodeTyIsNullable(ps[pi]) {
             // An un-annotated NULLABLE callback param (`const f: (i32 | null) => i32 =
             // (_k) => 1`). THE OTHER HALF OF THE ARM ABOVE: a `T | null` is a
