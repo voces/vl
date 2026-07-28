@@ -699,6 +699,14 @@ export function cloRetValKind(fe: i32): VKind | null {
       return vtKindOfType(fn.fnRet)
     }
     if fnReturnsClosure(fe) { return "closure" }
+    // An implicit return that is an ASSIGNMENT yields the target CELL (`fnAssignRetKind`).
+    // Consulted HERE, ahead of the variant-collapse arm, so the `$fnsig` functype and the
+    // function's own functype are minted from ONE fact: a lambda `() => { g = {m: 2} }`
+    // over a union global otherwise had `cbRetVariantIdx` name the collapsed VARIANT here
+    // while `emitTypeSection` emitted the union BOX — two functypes for one function, and
+    // invalid wasm at the `call_ref`.
+    const cloArk = fnAssignRetKind(fe)
+    if cloArk != null { return cloArk }
     // A callback that COLLAPSES to one concrete variant (`(a) => if a is Cat { a } else {
     // catShape }`) — the checker types it as that variant, so the `$fnsig` result is the
     // variant struct (kind 8), NOT the union box. Checked BEFORE the `"union"` kind, which
@@ -738,6 +746,9 @@ export function cloRetValSlot(fe: i32) {
       if k == "map" { return mapAnnShape(fn.fnRet) }
       return -1
     }
+    // The SLOT half of `cloRetValKind`'s assignment-cell arm, read from the same cell —
+    // ahead of the variant-collapse slot for the same reason the kind is.
+    if fnAssignRetKind(fe) != null { return fnAssignRetSlot(fe) }
     // A collapsed-to-one-variant inferred result (kind 8) — the variant index.
     const cvi = cbRetVariantIdx(fe)
     if cvi >= 0 { return cvi }
@@ -1854,11 +1865,148 @@ function criRetLocalLet(rx: i32, i: i32) {
   -1
 }
 
+// The `LetDecl` arena index of the module GLOBAL that function `fe`'s IMPLICIT RETURN
+// assigns to, or -1. That is: `fe` is un-annotated, and its body's LAST statement is
+// `<globalName> = <rhs>` — the shape `emitBinExprNode` lowers as an assignment-as-
+// expression and the trailing-expression rule then makes the function's result.
+//
+// WHY THE TARGET AND NOT THE RHS. `emitBinExprNode`'s `=` arm (`wasmEmit.vl`) lowers an
+// assignment-as-expression as STORE-then-RE-READ: `emitAssign` stores, then the TARGET
+// is re-read through the normal Ident path. The value left on the stack is therefore the
+// TARGET CELL's rep — the RHS *coerced to the target's declared type* — and
+// `globalCellKind` is the very resolver that decides that cell's valtype in the global
+// section, so this answer cannot drift from the cell. The read side agrees by
+// construction too: `emitIdentNode`'s global arm keys on `globalCellKind`.
+//
+// The RHS answer that used to be taken here is only ever right by COINCIDENCE: `g = "x"`
+// into a `string` cell needs no coercion, so the RHS's `"str"` IS the cell's kind. It
+// goes wrong exactly when `emitAssign` COERCES — an i32 literal widened into an `i64`
+// cell, a member literal interned into a literal-union cell's i32 atom, a value stored
+// into a NULLABLE cell — and every one of those was INVALID WASM on a program `vl check`
+// accepts, rc 0. Measured over a 504-cell matrix (41 target cell kinds × global/local ×
+// 7 statement shapes): 100 cells improved, 0 regressed, no cell left a TRAP.
+//
+// GLOBAL TARGETS ONLY, and the boundary is a MISSING RESOLVER, not a judgement. A LOCAL
+// target's cell kind is decided by `collectLocals` (`emit_collect.vl`), a ladder this
+// pass cannot reach — it runs per function at EMIT time, long after
+// `computeRetInference`, and `emit_classify` cannot import `emit_collect` (the module
+// graph already runs the other way; the loader rejects the cycle). `globalCellKind`
+// below is the same ladder in this file's storage class and would generalize over an
+// `fnIx`, but making it the local answer needs the two ladders proved equal first —
+// they are near-parallel, not identical. Until then the coercing LOCAL cells keep the
+// RHS answer and stay invalid wasm (~50 cells of the matrix), unchanged from master.
+//
+// THE OTHER SIDE OF THE DISAGREEMENT IS FILED, NOT FIXED. The CHECKER types `x = e` as
+// `e`'s own type UN-coerced — `let g: i64 = 0; function c() { g = 7 }` has `const r =
+// c()` inferred `i32`, and `g: string | null; g = null` inferred `null` — while both the
+// lowering and now the functype use the target's coerced type. The two differ only where
+// the value is CONSUMED, and consuming it is what `vl check` will mis-type; the fix is in
+// `typecheck.vl`'s assignment-expression typing, outside this partition.
+function fnAssignRetTargetLet(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    // An ANNOTATED return already drives the functype from its annotation (and the
+    // annotated spellings of every cell below run today) — leave it alone.
+    if fn.fnRet >= 0 { return -1 }
+    const b = P.nodes[fn.fnBody]
+    if b is Block {
+      const st = b.blkStmts
+      if st.length > 0 {
+        // The tail statement, and — for the EXPLICIT spelling `return (g = e)` — the
+        // returned expression inside it. Both reach `emitBinExprNode`'s `=` arm and both
+        // become the function's result, so both take the cell's answer.
+        let tailx = st[st.length - 1]
+        const ts = P.nodes[tailx]
+        if ts is RetStmt {
+          if ts.retArg < 0 { return -1 }
+          tailx = ts.retArg
+        }
+        const a = P.nodes[unwrapParen(tailx)]
+        if a is BinExpr {
+          if a.binOp == "=" {
+            const t = P.nodes[unwrapParen(a.binLeft)]
+            if t is Ident { return globalLetOf(t.identName) }
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The authoritative result `VKind` of function `fe` when its implicit return is an
+// assignment to a module global (`fnAssignRetTargetLet`), else `null` — `null` meaning
+// "no answer, leave every classifier exactly as it was".
+//
+// TWO CELL KINDS DELIBERATELY DECLINE, each because naming them makes the outcome WORSE
+// than the reject they replace:
+//
+//   `nulstr` — a `string | null` GLOBAL does not read back as its cell. `emitIdentNode`'s
+//     kind-16 arm applies `ref.as_non_null` UNCONDITIONALLY (the "`string | null` READ
+//     RULE", stated at `emitMem`'s field read), so the re-read pushes `(ref $array)` over
+//     a cell that may hold null. Answering `"nulstr"` makes the module VALID and it then
+//     TRAPS (`wasm trap: null reference`) on `g = null`; answering `"str"` is the same
+//     trap. A trap is worse than a reject, so this stays the loud invalid-wasm reject it
+//     is on master. THE ROOT IS THE UNCONDITIONAL RECOVER IN `wasmEmit.emitIdentNode`
+//     (~12740), not here — a store-then-re-read cannot be sound while the re-read
+//     force-recovers non-null.
+//
+//   `closure` / `nulclosure` — `fnReturnsClosure` already owns the closure result at both
+//     functype producers, ahead of every kind this could supply; naming it here would only
+//     race that owner.
+function fnAssignRetKind(fe: i32): VKind | null {
+  const li = fnAssignRetTargetLet(fe)
+  if li < 0 { return null }
+  const k = globalCellKind(li)
+  if k == "nulstr" { return null }
+  if k == "closure" || k == "nulclosure" { return null }
+  k
+}
+
+// The result-valtype SLOT that goes beside `fnAssignRetKind`'s answer — the struct table
+// index for a struct / nullable-struct cell, the ref-list slot for a ref-list cell, -1 for
+// every kind that needs none. Read from the SAME cell the kind came from, so the two can
+// never be minted from different facts.
+function fnAssignRetSlot(fe: i32) {
+  const li = fnAssignRetTargetLet(fe)
+  if li < 0 { return -1 }
+  const k = globalCellKind(li)
+  if k == "struct" || k == "nulstruct" { return globalCellStructIdx(li) }
+  if k == "reflist" { return rlSlotByName(letRefListElemName(li, -1)) }
+  -1
+}
+
 // Classify ONE valued return expression at `rx0` of the function at `fnStmts`
 // position `i`, under the CURRENT narrowing stack — the loop body the flat
 // return scan used to run, extracted so the narrowing-aware walk shares it.
 export function criClassify(rx0: i32, i: i32) {
   let rx = rx0
+  // AN ASSIGNMENT'S VALUE IS ITS TARGET CELL, not the RHS expression — `fnAssignRetKind`
+  // above. It is a property of the FUNCTION, not of this one return node, so it answers
+  // for every node of such a function and RETURNS: no expression-derived fact may touch
+  // the slot afterwards. That is what keeps `computeRetInference`'s fixed point
+  // TERMINATING — the cell kind is a plain direct write (it must beat the checker's A20
+  // seed, which `criSetRetKind`'s monotone ladder cannot lower), so leaving the eager
+  // expression writes live beside it would let the two alternate forever.
+  const ark = fnAssignRetKind(i)
+  if ark != null {
+    if fRetKind[i] != ark {
+      fRetKind[i] = ark
+      criChanged = true
+    }
+    // The per-kind PAYLOAD columns the result valtype needs beside the kind
+    // (`emit_sections`' inferred-return arm reads exactly these).
+    if ark == "struct" || ark == "nulstruct" {
+      fRetStructIdx[i] = fnAssignRetSlot(i)
+    }
+    if ark == "reflist" {
+      if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+        fRetRArrElem[i] = letRefListElemName(fnAssignRetTargetLet(i), -1)
+      }
+    }
+    return 0
+  }
   // A tail ASSIGNMENT yields its RHS (assignment-as-expression), so the
   // function's return kind is the RHS's kind (`function emit(s: string)
   // { acc = acc + s }` returns the new string).
@@ -7816,10 +7964,13 @@ function mapValuesResultKind(exprIx: i32, fnIx: i32) {
 // wall time): **N = 100 / 200 / 400 / 800 → 31 / 36 / 83 / 227 ms** — the 400→800 step
 // costs 2.7x for 2x the input, which is the quadratic term and not measurement noise.
 //
-// **But `fnStmts` is not written here.** Its five writers are `emit_collect.collectFns` /
-// `collectLifted` (two `.push`) and `emit_mono` (two `.push` plus the IN-PLACE
-// `fnStmts[origFe] = nfn` a count-0 instance does) — every one of them outside this
-// partition. A memo that merely caches the last answer is only equal to the scan if no
+// **But `fnStmts` is not written here.** Re-enumerated structurally at this commit, the
+// writer set is SEVEN, not the five recorded above it: `emit_collect` 433 (the reset),
+// 446 (`collectFns`) and 967 (`collectLifted`); `emit_mono` 547, 1422 and 1910 (three
+// `.push`) plus the two IN-PLACE writes 1409 (`fnStmts[origFe] = nfn`, the count-0
+// instance) and 2190. Every one of them is outside this partition, so the conclusion is
+// unchanged and the undercount never mattered — but the number was wrong, and a stale
+// summand is how this program has hidden a wrong answer inside a right total before. A memo that merely caches the last answer is only equal to the scan if no
 // LOWER position can ever come to hold an already-memoized node, which is a property of
 // `emit_mono`'s replacement writer (its `nfn` is a fresh clone, so its arena index is new)
 // — true today, unpinnable from here, and a silent miscompile the day it stops being true.
