@@ -1,0 +1,119 @@
+// @run
+// @log 3
+// @log 2
+// @log 1
+// @log b
+// @log 2
+// @log 3
+// @log 4
+// THE TAUGHT HALF of the push/pop scratch-frame reservation, by POSITION — plus
+// the positions that are NOT taught, named in prose because they cannot be pinned
+// without failing the suite.
+//
+// A `.pop()` whose receiver is a Member (`b.xs.pop()`) or a module GLOBAL
+// (`xs.pop()`) stages the receiver's wrapper ref into `<pushframe> + 3`
+// (`stageListRecv`, wasmEmit.vl:9613) — the SAME 4-slot frame a `.push` of that
+// element kind uses. The frame exists only if `fnUsesPush` / `fnUsesStrPush` /
+// `fnUsesRefPush` was set, and NONE of `emitPush` / `emitPop` / `emitClear` /
+// `emitPopOr` tests those flags: there is no "frame not reserved" floor here, so a
+// position the scan does not walk is INVALID WASM with `vl check` rc 0.
+//
+// This file pins the positions the scan DOES walk — `blockPushPopBits`
+// (emit_classify.vl:3654) dispatches `LetDecl.letInit`, `RetStmt.retArg`, a bare
+// `BinExpr`/`Call` statement, `WhileStmt.whileCond` + body, `ForIn.fiIter` + body,
+// `ForRange.frFrom`/`frTo` + body, and `IfStmt` via `ifChainPushPopBits`.
+//
+// NOT WALKED — measured on 5394f3b, `vl check` rc 0, `vl build` rc 1, and every
+// cell becomes CORRECT the moment any `.push` of the same element kind is added to
+// the same function (deleting that bystander is the probe):
+//
+//   1. AN `if` CONDITION, in a regular function or a lambda. `ifChainPushPopBits`
+//      (emit_classify.vl:3697) walks `ifThen` and `ifElse` and never `s.ifCond` —
+//      its header says so, and says the start-fn if-scan handles conditions. It
+//      does: `startScanIf` (emit_sections.vl:758) walks `st.ifCond`. Nothing walks
+//      a regular function's. Three of the four condition positions are scanned
+//      (a `while` condition here, an `if` condition at module scope) and the
+//      fourth is not.
+//
+//          const xs: i32[] = [1]
+//          function f(): i32 {
+//            if (xs.pop() ?? -1) == 1 { return 1 }   // no import/frame reserved
+//            return 0
+//          }
+//
+//   2. AN `ArrayLit` ELEMENT, AN `ObjLit` FIELD VALUE, OR AN `as`-CAST OPERAND.
+//      `exprPopBits` (emit_classify.vl:3621) descends `Call`(args only),
+//      `BinExpr`, `Member`, `Index`, `Unary`, `Paren` — and stops. Its sibling
+//      walker in the same file, `exprHasMapOp`, carries `ObjLit`, `ArrayLit`,
+//      `AsExpr` and `IsExpr` arms; this one does not, and `emitExpr` lowers all
+//      four positions normally into `emitPop`.
+//
+// Measured over element kind {i32, string} x receiver {module global, struct
+// field} x position {if cond, else-if cond, if cond in a lambda, ArrayLit, ObjLit,
+// as-operand}: 24 cells, every one invalid wasm alone and correct with a push
+// beside it. The corpus contains ZERO fixtures in either position.
+type B = { xs: i32[] }
+type C = { ss: string[] }
+
+// let-init position, GLOBAL receiver — walked (`LetDecl` arm).
+const gi = [1, 2, 3]
+function viaLetInit() {
+  const d = gi.pop() ?? -1
+  d
+}
+print(viaLetInit()) // 3
+
+// return position, struct-FIELD receiver — walked (`RetStmt` arm).
+function viaReturn(b: B) {
+  return b.xs.pop() ?? -1
+}
+const bb = { xs: [1, 2] }
+print(viaReturn(bb)) // 2
+
+// bare statement position, struct-field receiver — walked (`Call` arm).
+function viaStatement(b: B) {
+  b.xs.pop()
+  b.xs.length
+}
+const cc = { xs: [7, 8] }
+print(viaStatement(cc)) // 1
+
+// A STRING-element `.pop()` in return position — the string push/pop frame
+// (`strPushScratchBase`), walked by the same `RetStmt` arm.
+function viaReturnStr(c: C) {
+  return c.ss.pop() ?? "z"
+}
+const dd = { ss: ["a", "b"] }
+print(viaReturnStr(dd)) // b
+
+// while CONDITION, struct-field receiver — walked (`WhileStmt.whileCond`), and it
+// is the position whose `if` twin is NOT walked.
+function viaWhileCond(b: B) {
+  let n = 0
+  while (b.xs.pop() ?? -1) > 0 {
+    n = n + 1
+  }
+  n
+}
+const ee = { xs: [1, 2] }
+print(viaWhileCond(ee)) // 2
+
+// for-range BOUND, global receiver — walked (`ForRange.frTo`).
+const gr = [1, 2]
+function viaForBound() {
+  let n = 0
+  for i in 0 to (gr.pop() ?? 0) {
+    n = n + 1
+  }
+  n
+}
+print(viaForBound()) // 3
+
+// An `if` condition AT MODULE SCOPE — walked, by `startScanIf`, which is the
+// half of the pair that has the arm. Its in-function twin is the gap above.
+const gm = [4]
+let seen = 0
+if (gm.pop() ?? -1) == 4 {
+  seen = 4
+}
+print(seen) // 4
