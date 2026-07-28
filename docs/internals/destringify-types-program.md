@@ -30846,3 +30846,344 @@ endgame moves.
 8. **`vl fmt <file>` prints to stdout; it does not rewrite the file.** There is no `--write` and
    no `--stdout`, and `vl fmt --check` takes exactly one path per run. `scripts/lint-self.sh` is
    the only in-repo record of the calling convention.
+
+## W14 + THE TWO HELD-FILE RESIDUES — the FIELD-COLON cut gets its home, W2 reaches zero copies, and the "~60 single-writing floor" is REFUTED from the census's own table (off master `f84fa8b7`)
+
+Three families, three commits, one fixture. #1256 closed the routing phase for the families
+#1239 enumerated and left exactly three items behind: **W14**, a family the census never
+opened (10 writings, FILED not routed, because it was un-briefed); **W2's four
+`emit_collect.vl` writings**, held by a concurrent slice; and **W7's `emit_rewrite`
+assertion**, same reason. This slice takes all three. It also finds that the programme's
+stated FLOOR is not a floor.
+
+### THE RE-DERIVED SITE LISTS — and the census is corrected in a NEW direction
+
+| family | operation | re-derived | census | #1256 | what was missed |
+|---|---|---:|---:|---:|---|
+| **W14** FIELD-COLON cut | `X.slice(0, ci)` + `X.slice(ci + 1, X.length)` | **10 writings / 5 fns** (8 routable) | 2 | 10 | the INDEX VARIABLE's name — `ci` in three modules, `colonAt` in the fourth |
+| **W2** GENERIC-APP cut, `emit_collect` share | `X.slice(0, lt)` + `X.slice(lt + 1, len - 1)` | **4 writings / 2 fns** | 1 | 4 | `gaeInternAppFieldShapes` entirely; and only the HEAD half of `gaeCollectDecls` |
+| **W7** SPACE-FREE, `emit_rewrite` share | `!strContains(ctx, " ")` | **1 writing / 1 fn** | 0 | 1 | the SPELLING — the rule asked as a substring CALL |
+
+Every list re-derived STRUCTURALLY first and then confirmed by the RESOLVER (delete the
+import entry, rebuild, read the names the compiler prints). For W14 the resolver names
+exactly eight consuming expressions and no others; for W2's residue, exactly four.
+
+**THE STRUCTURAL PASS IS WHAT MAKES THE RESOLVER TRUSTWORTHY, AND IT HAS TO RUN FIRST.**
+The resolver enumerates consumers of a name that already exists; it is blind to a copy that
+never took the name. The check that closes that gap is a whole-tree `.slice(` census — 92
+non-comment sites across `compiler/` + `std/`, every one classified — and for
+`emit_collect.vl` it is decisive in the negative
+direction: **the file's ENTIRE `.slice` population is those four lines**, so there is no
+fifth writing behind a hoisted length, an index-expression receiver or a mid-scan position.
+That is the kind of claim the last six census corrections all turned on, and it is the
+cheapest one to make.
+
+### W14 — TWO HOMES, AND THE SIXTH SPELLING ROUTES WITHOUT A SECOND BODY
+
+    fieldNameOf(field, ci)      -> field.slice(0, ci)
+    fieldTypeTextOf(field, ci)  -> field.slice(ci + 1, field.length)
+
+Routed (8): `emit_base.annObjFieldSplit` / `shapeInnerFieldSplit` ·
+`typecheck.nameToTyReal` / `canonShapeName` — both halves at all four.
+FILED (2): `emit_classify.shapeFieldParse`, held file.
+
+Three properties, each of which the programme has paid for before:
+
+* **FOUR GUARDS IN FRONT OF ONE OPERATION** — `ci <= 0` (twice), `ci < 0`, `colonAt > 0`,
+  `colonAt >= 0` — so the cut is delimiter-blind, exactly as `groupInnerOf`,
+  `gaeArgsTextOf` and `fnRetTextOf` are. **And TWO FINDERS**, which is new: three sites ask
+  a depth-blind `indexOf(":")` over an already-flattened name, two ask
+  `tyTopIndexOf(field, ':', 0, 0)`. Neither the guard nor the finder folds in.
+* **THE SIXTH SPELLING KEEPS THE DELIMITER.** `canonShapeName` writes
+  `field.slice(0, colonAt + 1)` — it is rebuilding the shape text and needs the `:` back.
+  Because the index is a PARAMETER that is `fieldNameOf(field, colonAt + 1)`: the same home
+  at a different index. A home with the `+ 1` baked in would have needed a second body for
+  the other five writings. This is the endpoint-normalisation trap #1250 recorded costing W1
+  a site twice, and passing the index is the general answer to it.
+* **EQUIVALENCE BY CONSTRUCTION, NOT BY REACHABILITY.** Each body is the site's own slice
+  with the index lifted to a parameter, so there is no bound to discharge — a strictly
+  stronger position than W1's, which needed the clamp argument. (`.slice` CLAMPS rather than
+  traps: re-verified by running all eight out-of-range endpoint shapes — `"abc".slice(99, 3)`
+  and `"".slice(1, 0)` are both `""`, `"abc".slice(0, -1)` is `"ab"`.)
+
+**`fieldNameOf` IS `gaeHeadNameOf` AS AN OPERATION.** Both are `slice(0, i)`; so is
+`emit_sections.passRowName`'s cut, one delimiter over. They stay separate names, recorded in
+the header with the reason: the unit this programme homes is the QUESTION, not the
+arithmetic, and this file already carries the same redundancy in the other direction
+(`fnRetTextOf`, `gaeArgsTextOf` and `mapSpellValName` are three near-identical tails under
+three grammar names). The cost of keeping them apart is one function frame, and it is in the
+byte table rather than assumed.
+
+`tyname.vl` goes from 30 bodies to 32 and stays a zero-import leaf (`grep -c '^import'` = 0,
+before and after).
+
+### W2 REACHES ZERO HAND-WRITTEN COPIES — and #1256's filing had gone stale in one merge
+
+Both `emit_collect.vl` sites already imported `tyname` and already called
+`annGenAppSpanEnds` + `gaeLtAt` immediately above their cuts, exactly as #1256 predicted, so
+each is a two-line substitution. **The generic-application cut now has ZERO hand-written
+copies tree-wide**, and W2 was the only family #1256 left with a held-file residue.
+
+**#1256 filed those sites by LINE NUMBER (`3546/3547`, `3636/3641`) and #1257 moved them to
+`3670/3671` and `3760/3765` before this slice started.** One merge. The FUNCTION names in the
+same filing were still exact. A hand-off that names lines is a hand-off with an expiry date.
+
+`forceGenAppArgTypes` — added to this same file by #1257, and the brief asked whether it is
+now a W2 writing — **is not one, and the reason is worth stating**: it decomposes through
+`annGenAppDecompose`, which is itself a routed CONSUMER of these homes. Asking a caller of
+the home to instead call the home is not a routing.
+
+### W7's LAST ROUTABLE ASSERTION, discharged from `strContains`'s own code path
+
+`!strContains(ctx, " ")` is `nameIsSpaceFree(ctx)` on every input, and the argument is three
+lines of `strContains` rather than a reachability claim: with a one-character needle the
+empty string takes the `sub.length > s.length` early return (`false`, whose negation is the
+`true` the home answers) and every other input walks the identical `s[i] == ' '` compare
+under the identical bound. The needle's length is 1, so the inner loop is one compare and
+there is no third case.
+
+The guard is LIVE — it is the CANON-ONLY half of the plain-struct return pin, and a legacy
+SPACED record must keep its un-pinned route — so this is a routing under a real behaviour
+contract. W7's routable share closes at **4 of 6 bodies**, the two declines measured.
+
+### INERTNESS — the corpus carries it, and the frozen rebuild is NULL for W14 TOO
+
+| instrument | reading |
+|---|---|
+| **six-channel corpus A/B**, 1,573 files (`tests/cases` + `std` + `scripts`) vs master `f84fa8b7`'s own compiler | **0 diffs on all six channels**, re-run after EVERY family commit — three times, three zeros |
+| **frozen-source rebuild** — master's own `compiler/entry.vl` compiled by this branch's compiler | **BYTE-IDENTICAL**, 1,045,157 B, sha256 `ff25a2501084840f6e8ed8524c6b37206d7fd758d3e2914012c944292390d97c`. **INVERTED CONTROL:** the two compilers `cmp` as differing (rc 1) |
+| **fuzz A/B**, 14 seeds x 3 depths x {plain, declared} | **0 divergences** — 84 batches x 1,200 cases = **100,800 programs per side**, 8,784 kept files per side; raw `diff -r` rc 0 and **0 lines**, needing no explaining-away (see below) |
+
+**#1256's HARNESS BUG IS FIXED IN THIS SLICE'S COPY, AND THAT IS WHY THE RAW NUMBER IS
+READABLE.** The inherited `E-fuzzab.sh` normalises the `mktemp` directory out of `*.log` and
+NOT out of `*.err`, so every case that produces an emit ERROR reads as a divergence on its
+temp path alone — #1256's raw `diff -r` read 15,052 lines and every one of them was the path.
+This slice's harness normalises BOTH, so the reading is **0 lines raw**: a zero anyone can
+re-take without knowing which lines to discount. (Written as `W-fuzzab.sh`, a separate file:
+the shared scratchpad's `E-fuzzab.sh` and `frozen.sh` are other agents' instruments, pinned to
+other worktrees and other masters, and overwriting them is how a concurrent slice loses its
+baseline.)
+
+**THE FROZEN-SOURCE REBUILD IS A NULL CALIBRATION FOR W14, AND THE ONE-GREP REASON IS NEW.**
+#1256 proved it null for W2/W3/W4/W7/W8 because the compiler's source declares zero generic
+type aliases and zero literal-union types. W14 is a different grammar and needed its own
+check. It reads the same way, for a reason nobody had written down:
+
+**the compiler's own source declares ZERO INLINE (anonymous) SHAPE type annotations.** It
+declares 62 NOMINAL structs (`type X = {…}`) and it spells `{…}` in an annotation position
+34 times — and every one of those 34 is a MAP (`{[string]: i32}`), which takes the map
+grammar (`mapSpellKeyName` / `mapSpellValName`), not the field-colon cut. A line-based regex
+for a NON-map inline shape annotation over `compiler/*.vl` + `std/*.vl` returns **0**. So the
+compiler cannot exercise its own field-colon cut, and the frozen rebuild is measuring the
+absence of a witness — again.
+
+**THE GREP IS THE EXPLANATION; THE SABOTAGE IS THE PROOF** — and that ordering matters,
+because a line-based regex cannot see a multi-line annotation and would be the wrong thing to
+rest a null claim on. **Both sabotages leave the frozen rebuild byte-identical at the same
+sha256 while moving hundreds of corpus cells**, with the inverted control still reading rc 1
+so the sabotaged binaries are demonstrably different. That is an empirical zero over the
+whole source, not over what a regex could match in it.
+
+### THE CALIBRATION — three sabotages, and TWO of #1256's readings do NOT reproduce
+
+S3 and S4 partition this slice's 13 routed writings so each is poisoned exactly once, with
+DIFFERENT SHAPES: S3 poisons the two W14 HOMES (which have exactly eight consumers, so it is
+sharp), S4 poisons five CALL SITES (the four `emit_collect` cuts get a shifted index, the
+`emit_rewrite` assertion gets its polarity flipped) and no home at all. S5 is an extra: the
+CHECKER-ONLY subset of W14's eight, to attribute the zero on the CHECK channels.
+
+| what | writings poisoned | CHECKRC | CHECKMSG | BUILDRC | BUILDMSG | BYTES | RUNRC | frozen |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| the clean candidate | 0 | 0 | 0 | 0 | 0 | 0 | 0 | byte-identical |
+| **S3** — both W14 homes keep one character too many | 8 | **0** | **0** | 320 | 337 | 9 | 319 | **byte-identical** |
+| **S4** — 4 `emit_collect` indices shifted + the W7 assertion inverted | 5 | **0** | **0** | 37 | 38 | 4 | 37 | **byte-identical** |
+| **S5** — W14's two CHECKER functions only | 4 | **0** | **0** | 246 | 276 | 25 | 246 | — |
+
+**#1256's "the two profiles are DISJOINT at the top of the table" DOES NOT REPRODUCE.** Its
+S1 lit both CHECK channels (52 / 57) where its S2 read zero, and it concluded that a
+calibration run with either alone would have mis-graded which channels matter. Here S3 and
+S4 light exactly the SAME four channels and differ only in MAGNITUDE (8.6x). Partitioning the
+routed set into two sabotages does not buy disjoint profiles; whether it does is a property
+of WHERE the families live, not of the partition. For this slice's code region the
+six-channel instrument is a FOUR-channel instrument, and saying so is the calibration's
+whole job.
+
+**AND BOTH CHECK CHANNELS READ ZERO EVEN WHEN THE POISON IS IN THE CHECKER.** S5 poisons
+`typecheck.nameToTyReal` and `typecheck.canonShapeName` and nothing else: 246 files change
+their `vl build` outcome and **not one changes its `vl check` outcome**. This is
+[[vl-check-is-blind-to-the-emitter]] reproduced at a new location and against the natural
+expectation — "poison a checker body and the CHECK channels move" is simply false for these
+two bodies, whose answers are consumed on the emit path.
+
+**THE BYTES CHANNEL IS CONDITIONED, AND IT IS NOT MONOTONE IN SEVERITY.** S5 poisons a
+SUBSET of what S3 poisons (4 writings of S3's 8) and reads **25 BYTES to S3's 9**. The reason
+is in the harness: field 5 is only computed when BOTH sides build rc 0, so a cell that stops
+building drops out of the byte comparison entirely. A larger sabotage moves cells from the
+BYTES column into the BUILDRC column. Anyone reading BYTES as a severity proxy will rank two
+sabotages backwards.
+
+### BYTE DELTAS — and #1256's own W14 prediction is refuted by its own rule
+
+| family | writings | fns | compiler size after | Δ | Δ/writing | Δ/fn |
+|---|---:|---:|---:|---:|---:|---:|
+| (master `f84fa8b7`) | | | 1,045,157 | | | |
+| **W14** field-colon cut | 8 | 4 | 1,044,499 | **−658** | −82 | −164 |
+| **W2** `emit_collect` residue | 4 | 2 | 1,043,966 | **−533** | −133 | **−266** |
+| **W7** `emit_rewrite` residue | 1 | 1 | 1,043,961 | **−5** | −5 | −5 |
+| **total** | **13** | **7** | **1,043,961** | **−1,196** | −92 | −171 |
+
+**#1256 predicted W14 at "roughly −1,000 to −1,400 B" and it is −658 for 8 of 10 writings
+(≈ −820 extrapolated to all ten). The prediction was made with the wrong denominator by the
+slice that had just established the right one.** Its own byte table shows the rate is per
+FUNCTION for `.slice`-cut routings (W2 −172/fn, W4 −136/fn); the prediction scaled by WRITING
+count instead. W14 reads −164/fn — squarely inside the band — and 10 writings in 5 functions
+was never going to reach −1,200.
+
+**The `emit_collect` residue sets a new steepest rate: −266 B/function.** Both of its sites
+cut BOTH halves off the SAME receiver, so one routing retires two multi-token arithmetic
+expressions from one frame. The refined rule: the per-function rate scales with how many cut
+expressions the function retires, and −266 is the two-cut rung.
+
+W7's −5 B for a TEST routing lands with W3's −2/fn. Four families now say the "126-139 B/site
+constant" is a property of `.slice`-CUT routings and not of routing.
+
+### THE FIXTURE — a pin with three demonstrated witnesses
+
+`tests/cases/types/inline-shape-field-colon-depth.vl` annotates inline shapes whose FIELD
+TYPES carry colons and commas of their own one level down: a nested inline shape
+(`a: {b:i32,c:i32}`), a map-valued field (`m: {[string]:i32}`), a closure field
+(`f: (i32) => i32`), and the smallest non-degenerate split (`q: i32`, cut at index 1). It
+prints 7 / 6 / 9 / 3 on master and on the branch, and it is a HARD FAILURE under both the S3
+and the S5 sabotage (`emitProgram: only i32, i64, f64, f32, boolean, struct, union, array,
+or string parameters are supported` — the shape stops parsing as a shape). A regression pin
+without a demonstrated witness is a comment; this one was checked against the poisons built
+for the calibration, which is what they were already there for.
+
+**ONE PRE-EXISTING HOLE FOUND WHILE BUILDING IT**, filed rather than silently routed around:
+an inline shape with a MAP field cannot narrow the nullable index read —
+`const m: {m:{[string]:i32}, z:i32}` then `if got != null { print(got + m.z) }` is
+`emitProgram: bare null needs a struct-typed context`. It reproduces identically on master
+`f84fa8b7`, so it is not this family's; the fixture reads `.size` instead and says so in
+place.
+
+### GATE
+
+Every rc taken BARE, never through a pipe.
+
+| gate | rc | reading |
+|---|---:|---|
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | 1,045,157 B — and it `cmp`s EQUAL to the brief's `base75.wasm`, so that artifact IS master `f84fa8b7` (unlike `base71.wasm`, which #1256 found was not its master) |
+| `scripts/refresh-compiler.sh --prove-fixpoint` (baseline) | 0 | seed IS the fixpoint (1 compile), 1,045,157 B |
+| `scripts/refresh-compiler.sh --prove-fixpoint` (candidate) | 0 | fixpoint at the 2-compile rung, 1,043,961 B — re-run after every family commit |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4, 1,043,961 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3316 / 0 / 8** — master reads 3314/0/8 and the one new fixture adds exactly 2 (its corpus run and its native-align tier), measured at 3314 immediately before it landed |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined failure, 0 new, 0 stale |
+| corpus A/B | 0 | 1,573 files, 0 diffs x 6 channels, calibrated by S3 + S4 (+ S5) |
+| fuzz A/B | 0 | **0 divergences**, 100,800 programs/side |
+| frozen-source rebuild | 0 | byte-identical + inverted control rc 1 — **and measured BLIND to both sabotages, for a NEW one-grep reason** |
+
+### THE EXACT ROUTING RESIDUE
+
+**With W14, W2 and W7 closed to their partitions, the routable remainder is:**
+
+1. **HELD-FILE — 2 writings.** `emit_classify.shapeFieldParse`'s W14 pair. It already imports
+   `tyname` and already holds the index; a two-line substitution. **This is now the ONLY
+   held-file residue anywhere in the programme** (W2's four are closed; W3/W4/W7/W8 have
+   none).
+2. **BLOCKED BY A BEHAVIOUR DIFFERENCE — 1 site.** `driver.modTypeRenamed`'s W8 run walk:
+   its naive quote skip and the leaf's `skipQuotedName` disagree on `type T = "a\"b"`, which
+   the compiler accepts and runs (pinned by
+   `tests/cases/types/litunion-escaped-quote-member.vl`). Unifying them is a FIX.
+3. **REFUTED OR A DIFFERENT OPERATION — 3 sites.** `typecheck.nameNeedsCanon` (a MEMBER-START
+   digit rule, not a run-start one; `Box<0>` separates them) · `emit_base.normTypeAtom` (a
+   two-sided trim over `' '` AND `'\t'`) · `emit_classify.mvValKindOfName` (skip a run at an
+   index and slice from it).
+4. **DESIGN-BLOCKED — 42 sites**, exactly as #1239 recorded: W9 `renderEmit` (10), W10 the
+   parser's `annTs` coverage (9), W11 the overloaded pin column (10), W12 the `$fnsig` ABI
+   (13).
+5. **THE "~60 SINGLE-WRITING FLOOR" — AND IT IS NOT A FLOOR AT ITS OWN FIRST THREE ENTRIES.**
+   See finding 1 below. This is the one item the brief's predicted residue did not have.
+
+### WHAT THIS SLICE FOUND WRONG
+
+1. **THE CENSUS'S W13 "SINGLE-WRITING" ROW CONTAINS A THREE-WRITING FAMILY, AND THE FLOOR IS
+   OVER-COUNTED BY AT LEAST TWO.** W13 is defined as "each is the ONE body for its grammar",
+   and it lists `emit_base.tyTopLevelSplit`, `typecheck.splitTypeName` and
+   `typecheck.splitGenArgs` as three separate entries. They are **one operation written three
+   times**:
+
+   * `splitGenArgs(s, out)` is `tyTopLevelSplit(s, ',', true, out)` — statement for
+     statement, including the `end = s.length` fall-through and the `start = end + 1` resume;
+   * `splitTypeName(name, sep, out)` is `tyTopLevelSplit(name, sep, false, out)` — the `at`
+     spelling differs (it pushes the tail in the `at < 0` arm instead of assigning `end`),
+     and the two agree on every input by case analysis: `at < 0` pushes
+     `slice(start, length)` in both, `at >= 0` pushes `slice(start, at)` in both, and with
+     `dropEmpty` false the home's push is unconditional exactly as this one's is;
+   * `emit_base.gaeSplitArgs` is already a one-line DELEGATION to the same reading as
+     `splitGenArgs`, in a different module — which is the tell: the delegation and the copy
+     are the same call, and only one of them could reach the home.
+
+   **MEASURED BY A WORKING SPIKE, NOT ARGUED.** Dropping `tyTopLevelSplit`'s body into
+   `typecheck.vl` as a private helper and re-pointing both copies at it (the down-move's
+   behaviour, minus the module move) reads **1,573 → 1,574 files, 0 diffs on all six
+   channels** and **−532 B** — with the duplicate body still present, so the real move, which
+   RELOCATES rather than copies, is at least that good. Reverted before commit. That is the
+   same standard #1256 used to refute this file's own precondition: build the thing and read
+   it, rather than reason about it.
+
+   The blocker is the usual one and the fix is the usual one: **`emit_base.vl` imports
+   `typecheck.vl`, so the checker cannot call the home; `tyTopLevelSplit` depends on nothing
+   but `tyTopIndexOf`, which is already IN the leaf, so it is a legal DOWN-MOVE** to
+   `tyname.vl` — the same move D-PARENDOWN / D-ARRDOWN / D-BRACEDOWN / D-GENAPPDOWN /
+   D-MAPOPENDOWN each took. It is NOT taken here for a partition reason with a precise cause:
+   `emit_classify.vl` imports `tyTopLevelSplit` from `emit_base.vl`, and that file is held, so
+   the move would need either an edit to a held file or a re-introduced
+   `export … from "./tyname"` republish line — the exact hop #1236 deleted and the leaf's
+   header now describes as "not a path that exists". **FILED. It is the largest routable item
+   left, and it was found by reading the census's own floor row rather than by censusing the
+   code.**
+
+   Three DECLINES in the same neighbourhood, each with the reason, so the next slice does not
+   re-open them: `typecheck.splitUnionAtoms` takes a SECOND separator and bails on it
+   (`tyTopIndexOf(name, '|', '=', start)` plus `name[at] == '='`) — an arrow STOP the home has
+   no parameter for; `unionMemberCount` COUNTS instead of materialising; and
+   `nameToTyReal`'s own field loop ends at `nlen - 1` rather than `s.length` because it walks
+   a name that still carries its braces.
+
+2. **#1256's W14 byte PREDICTION (−1,000 to −1,400 B) is refuted by #1256's own rule.** The
+   measured figure is −658 for 8 of 10 writings. The prediction scaled by WRITING count; the
+   same slice's byte table had just established that `.slice`-cut routings scale per
+   FUNCTION. W14 reads −164 B/fn, inside the band its neighbours set.
+
+3. **"THE TWO SABOTAGE PROFILES ARE DISJOINT" DOES NOT GENERALISE.** #1256 read S1 and S2 as
+   lighting different channels and drew a methodological conclusion from it. This slice's S3
+   and S4 partition the routed set just as cleanly and light exactly the same four channels,
+   differing only 8.6x in magnitude. Disjointness is a property of where the poisoned code
+   sits, not of partitioning the set.
+
+4. **POISONING A CHECKER BODY DID NOT MOVE THE CHECK CHANNELS — 246 files changed their
+   `vl build` outcome and zero changed their `vl check` outcome.** S5 poisons
+   `typecheck.nameToTyReal` and `canonShapeName` and nothing else. The natural reading of the
+   six-channel instrument ("CHECK covers the checker, BUILD covers the emitter") is wrong;
+   the channels split by WHERE THE ANSWER IS CONSUMED, not by which module computes it.
+
+5. **THE BYTES CHANNEL IS NOT MONOTONE IN SABOTAGE SEVERITY.** S5 poisons a strict SUBSET of
+   S3's sites and reads 25 BYTES to S3's 9, because field 5 is conditioned on both sides
+   building. Never rank two sabotages by it.
+
+6. **A HAND-OFF THAT NAMES LINE NUMBERS EXPIRES IN ONE MERGE.** #1256 filed
+   `emit_collect.vl`'s four W2 writings at `3546/3547` and `3636/3641`; #1257 landed in that
+   file and they were at `3670/3671` and `3760/3765` before this slice began. The FUNCTION
+   names in the same filing were still exact. File by function.
+
+7. **`base75.wasm` IS master `f84fa8b7` — and the way to know that is to rebuild, not to
+   trust the name.** #1256's finding 7 recorded that `base71.wasm` was NOT its master. This
+   slice fetched the seed and `cmp`'d: byte-identical, sha256 `ff25a250…`, and
+   `--prove-fixpoint` puts the seed at the 1-compile rung. The artifact was right this time;
+   the procedure that establishes it is the same either way.
+
+8. **A PRE-EXISTING EMIT HOLE, found while building the fixture and not owned by this
+   family:** an inline shape with a MAP field cannot narrow the nullable index read
+   (`emitProgram: bare null needs a struct-typed context`), reproducing identically on master
+   `f84fa8b7`.
