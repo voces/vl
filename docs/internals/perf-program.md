@@ -150,18 +150,22 @@ a local speedup does not transfer, and four cores plus the still-serial
 
 ### 1.5.1 What the runner actually did
 
-Three runs on the real 4-core runner (PR #1311, runs `30478660499`,
-`30479027419`, `30479227774`):
+Four runs on the real 4-core runner (PR #1311, runs `30478660499`, `30479027419`,
+`30479227774`, `30479647563`):
 
-| job | run 1 | run 2 | run 3 | notable steps |
-| --- | ---: | ---: | ---: | --- |
-| `ci` | 20 s | 22 s | 22 s | unchanged |
-| **`ci-native`** | **42 s** | **50 s** | **49 s** | native suites **19 / 20 / 21 s** (was 27); cargo+target restore **skipped** all three; embed build gone |
-| `ci-embed-seed` | 74 s | 43 s | 42 s | restore 16–17 s + `cargo build --features embed-seed` **48 / 16 / 19 s** |
+| job | run 1 | run 2 | run 3 | run 4 | notable steps |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `ci` | 20 s | 22 s | 22 s | 17 s | unchanged |
+| **`ci-native`** | **42 s** | **50 s** | **49 s** | **44 s** | native suites **19 / 20 / 21 / 15 s** (was 27); cargo+target restore **skipped** all four; embed build gone |
+| `ci-embed-seed` | 74 s | 43 s | 42 s | 46 s | restore 16–17 s + `cargo build --features embed-seed` **48 / 16 / 19 / 7 s** |
 
-**`ci-native` 89 s p50 → 42–50 s.** The gate that blocks a merge decision is back
-under a minute, and the workflow's WALL CLOCK (the max over the three jobs) is
-89 → ~50 s.
+**`ci-native` 89 s p50 → 42–50 s** (median 46). The gate that blocks a merge
+decision is back under a minute, and the workflow's WALL CLOCK (the max over the
+three jobs) is 89 → ~50 s.
+
+Note the spread on this fleet: the same `cargo build` reads 7–48 s across four
+runs, and the native-suites step 15–21 s. **Any CI step-level claim here needs
+several samples**; a single reading cannot distinguish a change from the runner.
 
 **Runs 2 and 3 corrected run 1, and the correction is the point.** On run 1 the
 embed job's `cargo build` read 42.58 s and I filed `ci-embed-seed` as the new
