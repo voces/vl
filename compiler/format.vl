@@ -1936,16 +1936,110 @@ function primary(ix: i32, indent: i32, column: i32) {
 function callExpr(_ix: i32, node: Call, indent: i32, column: i32) {
   const callee = expr(node.callFn, indent, column)
   const head = calleePrimary(node.callFn, callee)
+  const n = node.callArgs.length
+  // Every argument BUT the last, at the wrapped list's continuation depth. The
+  // LAST one is rendered exactly ONCE, at the depth whichever form wins needs —
+  // rendering a lambda body CONSUMES the comments inside it (`cmtCursor` is a
+  // one-way cursor), so a speculative render that is thrown away would delete
+  // those comments from the output.
   const args: string[] = []
   let i = 0
-  while i < node.callArgs.length {
-    let nm = ""
-    if i < node.callArgNames.length { nm = node.callArgNames[i] }
-    const v = expr(node.callArgs[i], indent + 1, column)
-    if nm.length > 0 { args.push(nm + ": " + v) } else { args.push(v) }
+  while i + 1 < n {
+    args.push(callArgText(node, i, indent + 1, column))
     i = i + 1
   }
+  if n > 0 {
+    if isBlockLambda(node.callArgs[n - 1]) {
+      const hugged = hugTrailingLambda(node, args, head, indent, column)
+      if hugged.length > 0 { return hugged }
+    }
+    args.push(callArgText(node, n - 1, indent + 1, column))
+  }
   head + wrapList("(", args, ")", indent, column + head.length)
+}
+
+// Argument `i` as a list item: the value, with its optional NAME prefix.
+function callArgText(node: Call, i: i32, argIndent: i32, column: i32) {
+  let nm = ""
+  if i < node.callArgNames.length { nm = node.callArgNames[i] }
+  const v = expr(node.callArgs[i], argIndent, column)
+  if nm.length > 0 { return nm + ": " + v }
+  v
+}
+
+// ── the trailing-lambda exception ─────────────────────────────────────────────
+//
+// The generic list rule is "an argument spans lines ⇒ break EVERY argument",
+// which is right for every multi-line argument but one: a BLOCK-bodied lambda in
+// FINAL position already carries its own vertical structure in its braces, so
+// breaking the list around it adds four lines and a level of indent to say
+// nothing, at ANY width — `it("adds", () => { … })` became a six-line vertical
+// list in a 34-column call. Every JS formatter carves this exception; the three
+// rulings behind ours (LAST argument only / two lambdas ⇒ no hug / a lambda
+// followed by another argument ⇒ not trailing ⇒ no hug) and the corpus
+// measurement behind each live in `docs/internals/fmt-trailing-lambda-design.md`.
+//
+// The guards below are what make those three rulings ONE rule: an EARLIER lambda
+// renders multi-line, so it fails "every preceding argument fits on one line"
+// and the whole call breaks; a lambda that is not last fails "the last argument
+// is a block lambda". Neither needs a rule of its own.
+
+// Is node `ix` a lambda whose body is a braced BLOCK? An expression-bodied
+// lambda (`(v) => v + 1`) renders on one line and is already untouched by the
+// list rule, so it is deliberately not a hug candidate.
+function isBlockLambda(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return isBracedBlock(n.fnBody) }
+  false
+}
+
+// The hugged rendering `head(pre…, (p) => {` / body / `})`, or "" when a guard
+// declines it (the caller then falls through to the vertical list).
+//
+// DECIDES BEFORE IT RENDERS. The decision needs only the lambda's HEADER — the
+// parameter list and the return annotation, both recovered from source spans
+// with no side effects — so a DECLINED hug never touches the comment cursor and
+// the fall-through render is the argument's first and only one.
+function hugTrailingLambda(
+  node: Call,
+  pre: string[],
+  head: string,
+  indent: i32,
+  column: i32,
+) {
+  const nargs = node.callArgs.length
+  const lastIx = node.callArgs[nargs - 1]
+  const lam = P.nodes[lastIx]
+  if lam is FuncDecl {
+    // The head line the hug would produce, assembled from the pieces that will
+    // actually be concatenated below. `pre` is at most a handful of items, so
+    // the running accumulator here is not the O(n²) hazard `wrapList` guards.
+    let joined = ""
+    let j = 0
+    while j < pre.length {
+      // A preceding argument that spans lines is not going on the head line —
+      // that is the two-lambda case, and it takes the vertical form.
+      if hasNewline(pre[j]) { return "" }
+      joined = joined + pre[j] + ", "
+      j = j + 1
+    }
+    let nm = ""
+    if nargs - 1 < node.callArgNames.length {
+      nm = node.callArgNames[nargs - 1]
+    }
+    if nm.length > 0 { nm = nm + ": " }
+    // `functionExpr` builds its first line as `arrowHeader(…) + " => {"` from
+    // the SAME `indent` we are about to hand it, so this predicts that line
+    // exactly rather than guessing at it.
+    const header = arrowHeader(lam, indent * 2 + 6)
+    if hasNewline(header) { return "" }
+    const firstLine = head + "(" + joined + nm + header + " => {"
+    if column + firstLine.length > fmtWidth { return "" }
+    const body = expr(lastIx, indent, column)
+    return head + "(" + joined + nm + body + ")"
+  }
+  ""
 }
 
 function objectLiteral(_ix: i32, node: ObjLit, indent: i32, column: i32) {
