@@ -20,6 +20,7 @@ import {
   gaeHeadNameOf,
   gaeLtAt,
   groupInnerOf,
+  listElemNameOf,
   nameIsArray,
   nameIsFuncTypeAtom,
   nameIsMapOpen,
@@ -2954,18 +2955,27 @@ export function mAssignTypeIndices(_n: i32) {
 // `forceScalarListField`. This one stays here because it is `collectA`'s own reservation
 // concern and because that file is held by a concurrent slice; moving it is a pure relocation.
 // Whether an annotation spelling that MENTIONS an i32-keyed map is one the emitter can
-// lower: 0 when it is, else the loud reject (-1) naming the POSITION that failed. Two
-// spellings pass — a BARE `{[i32]: V}` and its `| null` twin.
+// lower: 0 when it is, else the loud reject (-1) naming the POSITION that failed.
 //
-// THE VALUE HALF OF THIS GATE IS GONE, and its absence is the whole point of the
-// (KEY,VALUE) slot identity: an i32-keyed map's value now interns its OWN map struct
-// exactly as the string-keyed twin's does (`mvShapeOfMapName` reads the key off the
-// spelling), so every value type the string-keyed rep lowers, this one lowers too. What
-// remains is the POSITION restriction, which is a different mechanism entirely: a struct
-// FIELD row, a ref-list ELEMENT row and a variant FIELD row record a map's VALUE name
-// with the KEY erased (`sFieldElemName` / `uFieldElemName` hold `V`, not `{[K]: V}`), so
-// a composed i32-keyed map would resolve its STRING-keyed twin's struct — invalid wasm
-// that `vl check` cannot see. Opening those needs a key column on each of those rows.
+// THE VALUE HALF OF THIS GATE IS GONE (#1286), and its absence is the whole point of the
+// (KEY,VALUE) slot identity: an i32-keyed map's value interns its OWN map struct exactly
+// as the string-keyed twin's does (`mvShapeOfMapName` reads the key off the spelling), so
+// every value type the string-keyed rep lowers, this one lowers too.
+//
+// THE ARRAY-ELEMENT HALF IS GONE TOO, and it cost this gate ONE peel. #1286 kept it
+// rejecting DELIBERATELY and said why: the `{[string]: V}` spelling of a list of maps was
+// itself invalid wasm for 12 of 15 value types, so opening the i32 half would have turned
+// a clean reject into that. The string half is fixed (`rlElemMapShape` seeds the element
+// `Map()`), and the i32 half then arrived for free exactly as that filing predicted — a
+// ref-list ELEMENT row records the WHOLE `{[i32]: V}` spelling (unlike a field row, which
+// erases the key), and `rlElemMapKeyI32` / `rlElemMapShape` read the key straight off it.
+// No table gained a column here; the ONE line below is the entire i32-keyed half.
+//
+// What remains is the struct / variant FIELD position, a different mechanism entirely: a
+// field ROW records a map's VALUE name with the KEY erased (`sFieldElemName` /
+// `uFieldElemName` hold `V`, not `{[K]: V}`), so a composed i32-keyed map would resolve
+// its STRING-keyed twin's struct — invalid wasm that `vl check` cannot see. Opening that
+// one DOES need a key column on both field tables.
 function i32MapSpellingLowerable(name: string) {
   let bare = name
   // A top-level function TYPE (`() => {[i32]: V}`) delegates to its RETURN spelling: the
@@ -2975,12 +2985,20 @@ function i32MapSpellingLowerable(name: string) {
   // i32})[]` (an ARRAY of such closures) is NOT peeled here and stays a loud reject.
   const fr = annRetNameOf(name)
   if fr != "" { bare = fr }
+  // An ARRAY of maps (`{[i32]: V}[]`, and the `({[i32]: V} | null)[]` niche whose one
+  // layer of grouping parens `listElemNameOf` strips): peel to the ELEMENT and ask the
+  // same question of it. ONE `[]`, so `{[i32]: V}[][]` — a list of lists of maps, whose
+  // inner-list element row is a ref-list slot of its own — keeps the loud reject rather
+  // than a guess; the same discipline the closure-array note above states.
+  const ae = listElemNameOf(bare)
+  if ae != "" { bare = ae }
   const inner = nulMapInnerName(bare)
   if inner != "" { bare = inner }
   if !nameIsMapSpanEnds(bare) || !nameIsI32KeyedMap(bare) {
     return emitFail(
       "emitProgram: an i32-keyed Map/Set is supported as a binding / parameter / " +
-        "return / `| null` / a closure result / a map value — not inside '" +
+        "return / `| null` / an ARRAY ELEMENT / a closure result / a map value — " +
+        "not inside '" +
         name +
         "'",
     )
@@ -3402,6 +3420,30 @@ export function collectA(_stmts: i32[]) {
           lUsed = true
           aUsed = true
         }
+        // …and the KEY half of that same arm, which it did not have. The BARE-map arm
+        // above sets FOUR things off a map spelling — `mUsed`/`lUsed`/`aUsed` AND
+        // `mI32Used` — and the map-ARRAY arm was taught only the first three, so a module
+        // whose ONLY i32-keyed map is spelled inside an array annotation left `mI32Used`
+        // false. That flag gates the i32-keyed map STRUCT, the i32 probe helper and — the
+        // symptom — the per-function 5-slot i32-KEY scratch frame (`mapI32Base`), so the
+        // store's key temporary aliased the map-REF temporary at the SAME local index:
+        // `type mismatch: expected (ref $type), found i32`, `vl check` rc 0.
+        //
+        // It stayed invisible while `{[i32]: V}[]` was itself a loud reject. Both cells it
+        // reaches were found by the parity grid AFTER that reject opened, and each was a
+        // form whose sibling had a different accidental source for the flag: `[Map()]`
+        // carries a `Map()` whose checker-recorded key type flips it on the CONSTRUCTOR
+        // arm, so only the `.push` form of a bare `{[i32]: V}[]` was exposed — and the
+        // nullable-element spelling `({[i32]: V} | null)[]` is not a `nameIsMapArray` at
+        // all, so it was exposed in EVERY form.
+        //
+        // Asked of the peeled ELEMENT rather than under the `nameIsMapArray(ran)` gate for
+        // that second reason: a nullable map element is a map element. `nameIsI32KeyedMap`
+        // is false for every non-map element name, so this is inert everywhere else.
+        let men = ren
+        const mni = nulMapInnerName(men)
+        if mni != "" { men = mni }
+        if nameIsI32KeyedMap(men) { mI32Used = true }
       } else if nameIsF64Array(nd.tyName) {
         // An `f64[]` annotation forces the f64 array + wrapper pair (Slice 4) — its own
         // `(array (mut f64))` backing, independent of the i32 array/list.
@@ -3989,8 +4031,8 @@ function fieldRecElemName(tyIx: i32, code: i32) {
     if strContains(tyNameOf(tyIx), "{[i32]:") {
       emitFail(
         "emitProgram: an i32-keyed Map/Set cannot be a struct / variant FIELD — " +
-          "supported as a binding / parameter / return / `| null` / a closure result " +
-          "/ a map value",
+          "supported as a binding / parameter / return / `| null` / an ARRAY ELEMENT " +
+          "/ a closure result / a map value",
       )
     }
   }
@@ -5581,6 +5623,23 @@ export function collectFnValUse() {
     }
     if nd is FieldInit {
       if exprIsBareFnName(nd.fiValue) { fnValUsed = true }
+    }
+    // A bare named function as a CALL ARGUMENT (`m.set(k, inc)`). Every arm above is a
+    // position where a function name lands in a cell some ANNOTATION also describes, and
+    // that annotation is what flips the machinery for a user call `f(inc)` (the param's
+    // `(…) => …` TypeRef). A BUILTIN method has no such annotation: `m.set(k, inc)` over
+    // `{[string]: (i32) => i32}` wrote `ref.func` with no declarative elem segment behind
+    // it — `undeclared function reference`, `vl check` rc 0 — while the index-store twin
+    // `m[k] = inc` ran, because THAT is an `Assign` and the `BinExpr` arm above claims it.
+    // Keyed on the ARGUMENT being a bare function name, not on the method, so it is inert
+    // for every call that does not pass one.
+    if nd is Call {
+      const cfvArgs = nd.callArgs
+      let cfv = 0
+      while cfv < cfvArgs.length {
+        if exprIsBareFnName(cfvArgs[cfv]) { fnValUsed = true }
+        cfv = cfv + 1
+      }
     }
     // A closure if-VALUE whose ARM is a bare named function (`if c then inc else dec`): the
     // named function is used as a VALUE, so flip `fnValUsed` so its `$fnsig` interns (a lambda

@@ -528,6 +528,7 @@ import {
   retVariantFlag,
   rlElemInnerSlot,
   rlElemLitStructRow,
+  rlElemMapShape,
   rlElemStructRow,
   rlSlotByName,
   rlSlotByNameTy,
@@ -4243,6 +4244,14 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
             elCtx.listKind = 5
             elCtx.listSlot = nestInnerSlot
           }
+          // A MAP element (kind 3): a `Map()` element builds THIS element's map struct.
+          // The literal twin of the `.push` / indexed-assign seed in `refElemValueCtx` —
+          // and the site the whole list-of-maps family ran through, because a list of maps
+          // is nearly always SPELLED as a literal (`const xs: {[string]: V}[] = [Map()]`).
+          // Unseeded, the element `Map()` built the MONO map struct into a backing typed to
+          // the element's own struct: invalid wasm for every value type with a per-value
+          // struct, `vl check` rc 0. Inert for a non-`Map()` element (an ident, a call).
+          if elemNest == 3 { elCtx.mapSlot = rlElemMapShape(rslot) }
           // A `(i32[] | null)[]` element (kind 4 nullable niche) may be a bare `null` → `ref.null
           // $lTypeIdx`; a `(<ref-array> | null)[]` element (kind 9 nullable niche) → `ref.null
           // $innerWrapper`; a distinct-backing `(f64[] | null)[]` / `(string[] | null)[]` element
@@ -9593,13 +9602,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         idxSlot = rslot
         if rlElemKindTbl[rslot] == 1 { storeStructIdx = rlElemStructRow(rslot) }
         if rlElemKindTbl[rslot] == 2 { storeUnionNm = rlElemName[rslot] }
-        if rlElemIsNestedList(rslot) { storeNestSlot = rslot }
-        // A NULLABLE-closure element (kind 5 niche): the stored value emits under
-        // `refElemValueCtx` so a bare `null` RHS seeds `ref.null $cloStruct` (inert
-        // for a lambda / ident RHS).
-        if rlElemKindTbl[rslot] == 5 && rlElemNullable[rslot] == 1 {
-          storeNestSlot = rslot
-        }
+        // Every element kind whose value emit needs the slot's context — a nested list,
+        // the nullable-CLOSURE niche, a MAP element — through ONE predicate.
+        if rlElemNeedsValueCtx(rslot) { storeNestSlot = rslot }
       } else if isStr {
         // A STRING list `xs[i] = s`: unwrap to its `(ref null $aTypeIdx)` string backing
         // (`mkListIdx`/`mkArrIdx`) and store the string ref — mirroring `emitIndex`'s
@@ -9934,7 +9939,17 @@ function refElemValueCtx(rslot: i32): ExpCtx {
     // A nullable-CLOSURE element (kind 5): a `null` value stores as `ref.null` of the
     // shared closure fat-pointer (the slot heap, `cloStructIdx`).
     if k == 5 { c.nulRefHeap = rlElemHeap[rslot] }
+    // A nullable-MAP element (kind 3): `ref.null` of the element's own map struct.
+    if k == 3 { c.nulRefHeap = rlElemHeap[rslot] }
   }
+  // A MAP element (kind 3): a `Map()` value builds the ELEMENT's map struct, not the
+  // ambient one. Without this seed `xs.push(Map())` / `xs[i] = Map()` over a
+  // `{[string]: V}[]` `struct.new`s the MONO map into a backing typed to the element's
+  // own struct — invalid wasm, `vl check` rc 0 — for every value type that interns a
+  // per-value map struct. The shape is `rlElemMapShape`, the ref-list twin of the
+  // map-VALUE boundary's `mvInnerMapShape`. Inert for a non-`Map()` value: only
+  // `emitMapNew` reads the seed, and it clears it.
+  if k == 3 { c.mapSlot = rlElemMapShape(rslot) }
   c
 }
 
@@ -9944,6 +9959,22 @@ function refElemValueCtx(rslot: i32): ExpCtx {
 function rlElemIsNestedList(rslot: i32) {
   const k = rlElemKindTbl[rslot]
   k == 4 || k == 6 || k == 7 || k == 8 || k == 9 || k == 10
+}
+
+// Whether a ref-list slot's element-VALUE emit needs `refElemValueCtx` at all — the ONE
+// predicate the `.push` and indexed-assign boundaries share.
+//
+// It exists because the set it names had already been taught in halves. Each boundary
+// spelled `if rlElemIsNestedList(rslot) { … }` and then bolted the nullable-CLOSURE niche
+// on beside it as a second `if`, hand-copied at both sites; the MAP element was a third
+// member nobody added at either. A slot whose element context is inert reads exactly the
+// ambient seeds (`expCtxHere`), so widening this predicate cannot move a cell whose kind
+// `refElemValueCtx` does not touch.
+function rlElemNeedsValueCtx(rslot: i32) {
+  const k = rlElemKindTbl[rslot]
+  if rlElemIsNestedList(rslot) { return true }
+  if k == 3 { return true }
+  k == 5 && rlElemNullable[rslot] == 1
 }
 
 // Stage a list-op RECEIVER that is not a bare local — a module GLOBAL, a struct FIELD, an
@@ -10057,13 +10088,8 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         base = refPushScratchBaseFor(rslot)
         if rlElemKindTbl[rslot] == 1 { pushStructIdx = rlElemStructRow(rslot) }
         if rlElemKindTbl[rslot] == 2 { pushUnionNm = rlElemName[rslot] }
-        if rlElemIsNestedList(rslot) { pushNestSlot = rslot }
-        // A NULLABLE-closure element (kind 5 niche): the pushed value emits under
-        // `refElemValueCtx` so a bare `null` seeds `ref.null $cloStruct` (inert for
-        // a lambda / ident value).
-        if rlElemKindTbl[rslot] == 5 && rlElemNullable[rslot] == 1 {
-          pushNestSlot = rslot
-        }
+        // The same ONE predicate the indexed-assign boundary uses (see there).
+        if rlElemNeedsValueCtx(rslot) { pushNestSlot = rslot }
       } else if isStr {
         if !slUsed {
           return emitFail(

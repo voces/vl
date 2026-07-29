@@ -533,20 +533,25 @@ in-language GC knobs.
   `xs.push(...ys)` once variadics land); representation inference (§VL.7 — lower never-grown
   values to a header-less fixed array); `map`/`filter` build-side generics for `Map`/`Set` (A10);
   `.vl`-std migration once a module system exists. (design: `docs/guide/collections-design.md`)
-- 🟡 **B6a. `Map` + `Set`.** REMAINING: **an i32-keyed map in a struct/variant FIELD or an array
-  ELEMENT** — `{[i32]: V}` now ships for every value type the string-keyed rep lowers (`string`, a
-  struct, `i32[]`, `string[]`, `f64`, `i64`, `f32`, `V | null`, a union, a closure, a nested map) as a
-  binding / parameter / return / `| null` / a closure RESULT / a map VALUE, because an mv slot's
-  identity is the (KEY, VALUE) pair (B6b). The two remaining positions are a loud emit-tier reject and
-  each has a filed mechanism: a FIELD row records the map's VALUE name and VALUE type with the KEY
-  ERASED (`sFieldElemName` / `sFieldElemTyIx`), so it needs a key column on both field tables; an
-  array ELEMENT is kept rejected DELIBERATELY, because the `{[string]: V}` spelling of a
-  list-of-maps store is itself invalid wasm for 12 of 14 value types today — fix that first and the
-  i32 half follows for free (the ref-list element row already records the whole `{[i32]: V}`
-  spelling). Also: `map`/`filter` over
-  Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`. (Self-host native parity:
-  string-keyed maps, delete, `Set`/`.add`/`.get`, and ref-valued maps (string/struct values, #319)
-  landed; map-typed params are the remaining native map gap.)
+- 🟡 **B6a. `Map` + `Set`.** REMAINING: **an i32-keyed map in a struct/variant FIELD**, the last
+  position it cannot occupy — `{[i32]: V}` ships for every value type the string-keyed rep lowers
+  (`string`, a struct, `i32[]`, `string[]`, `f64`, `i64`, `f32`, `V | null`, a union, a closure, a
+  nested map) as a binding / parameter / return / `| null` / an ARRAY ELEMENT / a closure RESULT / a
+  map VALUE, because an mv slot's identity is the (KEY, VALUE) pair (B6b). The FIELD reject has a
+  filed mechanism: a field ROW records the map's VALUE name and VALUE type with the KEY ERASED
+  (`sFieldElemName` / `sFieldElemTyIx`), so it needs a key column on both field tables. The ARRAY
+  ELEMENT opened once its string-keyed twin was fixed (a LIST of maps was invalid wasm for 12 of 15
+  value types — the element `Map()` was never seeded), for one `[]` peel, because a ref-list element
+  row carries the whole `{[i32]: V}` spelling. A list of LISTS of maps (`{[i32]: V}[][]`) is still a
+  loud reject: the map sits behind a second element row nobody has measured. Also filed, both loud
+  rejects on both key reps: a struct that is a MEMBER of a declared union cannot be a map VALUE
+  (`mvValKindOfName`'s last arm asks `structIndexByValName`, which a variant is not in —
+  `tests/cases/maps/error-map-value-struct-in-union.vl`), and `.set(k, v)` does not narrow a float
+  literal to `f32` or a string literal to a literal-union member the way `m[k] = v` does (a checker
+  gap; both are loud, and both reject identically on a list element and on a bare map). Also:
+  `map`/`filter` over Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`.
+  (Self-host native parity: string-keyed maps, delete, `Set`/`.add`/`.get`, and ref-valued maps
+  (string/struct values, #319) landed; map-typed params are the remaining native map gap.)
 - ⬜ **B6a-opt. `Set` drops the unused `vals` array** (LOW priority). A `Set` is emitted as a
   boolean-valued map, so it carries a `vals` array that is always `true` (~17% of a Set's memory +
   needless alloc/grow/`array.copy` on resize). The type already tracks `mSet` (a Set is distinguished
