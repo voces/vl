@@ -226,6 +226,7 @@ import {
   tyIsNulBool,
   tyNameOf,
   unionHasAtom,
+  unionTakesAtomAsStr,
   unwrapParen,
 } from "./emit_base"
 import {
@@ -4279,9 +4280,17 @@ export function exprIsStrConcat(binIx: i32, fnIx: i32) {
   false
 }
 
-// True if the Call at `callIx` passes a literal-union ATOM into a `string` parameter — the
-// atom widens to its member string (`emitAtomToStr`), which rides the string-op scratch frame.
-// An over-approximation (any atom arg + any `string` param) is fine: it only reserves a frame.
+// True if the Call at `callIx` passes a literal-union ATOM into a parameter that WIDENS it to
+// a string — a `string` param, or (D-ATOMSTORE) a boxed UNION param with a litunion / `string`
+// arm, whose store lowers through `emitAtomToStr` exactly as the `string` param does. The atom
+// widening rides the string-op scratch frame either way. An over-approximation (any atom arg +
+// any such param) is fine: it only reserves a frame.
+//
+// THE UNION LEG IS THE SIXTH MEMBER OF THIS SET, and it is this predicate's own witness:
+// `tests/cases/literal-unions/atom-store-into-mixed-union.vl`'s `argIsolated` — a `K` atom
+// passed to a `K | f64` param from a function holding NOTHING else. Delete the
+// `unionTakesAtomAsStr` call below and that fixture is INVALID WASM ("expected i32, found …"
+// at a local the vector never declared) while every other position keeps running.
 function callWidensAtomToStr(callIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   const c = P.nodes[callIx]
@@ -4303,6 +4312,10 @@ function callWidensAtomToStr(callIx: i32, fnIx: i32) {
             let pi = 0
             while pi < params.length {
               if vtKindOfParam(params[pi]) == "str" { return true }
+              const pn = P.nodes[params[pi]]
+              if pn is Param {
+                if unionTakesAtomAsStr(tyNameOf(pn.parType)) { return true }
+              }
               pi = pi + 1
             }
           }
@@ -4313,16 +4326,23 @@ function callWidensAtomToStr(callIx: i32, fnIx: i32) {
   false
 }
 
-// True if the assignment at `binIx` writes a literal-union atom into a `string`-typed target (a
-// local, global, or struct field) — the atom widens to its member string, riding the string-op
-// scratch frame. `exprString` over the TARGET uniformly covers all three lvalue forms.
+// True if the assignment at `binIx` writes a literal-union atom into a target that WIDENS it to
+// a string — a `string`-typed lvalue (a local, global, or struct field; `exprString` covers all
+// three uniformly), or (D-ATOMSTORE) a boxed UNION lvalue with a litunion / `string` arm.
+// Either way the atom widens to its member string, riding the string-op scratch frame.
+//
+// THE UNION LEG'S OWN WITNESS is `reassignIsolated` in
+// `tests/cases/literal-unions/atom-store-into-mixed-union.vl` (`let x: K | f64 = 2.5; x = k`,
+// alone in its function). Deleting the `unionTakesAtomAsStr` call takes that one cell to
+// INVALID WASM and leaves the other seven positions running.
 function assignWidensAtomToStr(binIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   const a = P.nodes[binIx]
   if a is BinExpr {
     if a.binOp == "=" {
-      if exprString(a.binLeft, fnIx) {
-        if exprIsLitAtom(a.binRight, fnIx) { return true }
+      if exprIsLitAtom(a.binRight, fnIx) {
+        if exprString(a.binLeft, fnIx) { return true }
+        if unionTakesAtomAsStr(unionNameOfExpr(a.binLeft, fnIx)) { return true }
       }
     }
   }
@@ -4343,48 +4363,98 @@ export function globalInitIsLitAtom(initIx: i32) {
       return r
     }
   }
-  false
+  // A CALL returning a litunion alias (`const gv: K | f64 = kOf()`) is the OTHER atom form a
+  // module-global initializer can take — the comment above ruled it out on the grounds that a
+  // global init "has no locals/params", which is true and does not cover a call. Measured: the
+  // start function's own coercion widens it (`emitUnionCoerce`'s D-ATOMSTORE leg claims it via
+  // `exprIsLitAtom`'s Call arm), so the scan has to claim it too or the frame is not there.
+  const r2 = exprIsLitAtom(initIx, -1)
+  r2
 }
 
-// True if the global at `letIx` is a `string` cell (kind 3) initialized with a literal-union atom
-// — it widens to its member string in the start function, riding the string-op scratch frame.
+// True if the global at `letIx` is a cell that WIDENS a literal-union atom initializer to its
+// member string in the start function, riding the string-op scratch frame: a `string` cell
+// (kind 3 / its nullable), or (D-ATOMSTORE) a boxed UNION cell (kind 4) with a litunion /
+// `string` arm. Witness: `globalIsolated` in
+// `tests/cases/literal-unions/atom-store-into-mixed-union.vl` — the ONE position whose frame
+// belongs to the START function, so its miss cannot be masked by anything inside a `function`.
 export function globalInitWidensAtomToStr(letIx: i32) {
   if gLitUnionUsed == 0 { return false }
   if letIx < 0 { return false }
-  const gk = globalCellKind(letIx)
-  if gk != "str" && gk != "nulstr" { return false }
   const d = P.nodes[letIx]
   if d is LetDecl {
+    const gk = globalCellKind(letIx)
+    let takes = false
+    if gk == "str" || gk == "nulstr" { takes = true }
+    if !takes && d.letType >= 0 {
+      if unionTakesAtomAsStr(tyNameOf(d.letType)) { takes = true }
+    }
+    if !takes { return false }
     const r = globalInitIsLitAtom(d.letInit)
     return r
   }
   false
 }
 
-// True if the binding at `letIx` is annotated `: string` and initialized with a literal-union
-// atom — it widens to its member string at the init, riding the string-op scratch frame.
+// True if the binding at `letIx` is annotated with a target that WIDENS a literal-union atom
+// initializer to its member string, riding the string-op scratch frame: `: string`, or
+// (D-ATOMSTORE) a boxed UNION with a litunion / `string` arm — and the ARRAY of one, whose
+// literal ELEMENTS each take the same store.
+//
+// TWO WITNESSES, because this predicate answers for TWO positions:
+//   · `bindIsolated`  — `const x: K | f64 = k`
+//   · `elemIsolated`  — `const xs: (K | f64)[] = [k]`
+// Deleting the union leg breaks the first and deleting the array leg breaks the second, each
+// alone (`tests/cases/literal-unions/atom-store-into-mixed-union.vl`). The array leg is the
+// ELEMENT position the five `*WidensAtomToStr` predicates did not cover: `exprHasStrOp`'s
+// ArrayLit arm recurses `exprHasStrOp` over the elements and an atom Ident answers false
+// there, while its ObjLit sibling one arm above DOES claim `exprIsLitAtom` on a field value.
+// The half of the pair that was taught is why the FIELD position needed no new code here.
 function letWidensAtomToStr(letIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
-      if tyNameOf(d.letType) == "string" {
+      const tn = tyNameOf(d.letType)
+      if unionTakesAtomAsStr(tn) {
         if exprIsLitAtom(d.letInit, fnIx) { return true }
+      }
+      const el = parenUnionArrElemName(tn)
+      if el != "" && unionTakesAtomAsStr(el) {
+        if arrLitHasAtomElem(d.letInit, fnIx) { return true }
       }
     }
   }
   false
 }
 
-// True if `retArgIx` is a literal-union atom returned from a `string`-typed function (`fnIx`'s
-// `fnRet`) — it widens to its member string at the return, riding the string-op scratch frame.
+// True if the expression at `ix` is an ARRAY LITERAL with at least one literal-union ATOM
+// element. The element-position half of `letWidensAtomToStr`.
+function arrLitHasAtomElem(ix: i32, fnIx: i32) {
+  if ix < 0 { return false }
+  const e = P.nodes[unwrapParen(ix)]
+  if e is ArrayLit {
+    const elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprIsLitAtom(elems[i], fnIx) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if `retArgIx` is a literal-union atom returned from a function whose return type WIDENS
+// it to a string (`fnIx`'s `fnRet`): `string`, or (D-ATOMSTORE) a boxed UNION with a litunion /
+// `string` arm. It widens at the return, riding the string-op scratch frame. Witness:
+// `retIsolated` in `tests/cases/literal-unions/atom-store-into-mixed-union.vl`.
 function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   if retArgIx < 0 { return false }
   if fnIx < 0 { return false }
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    if tyNameOf(fn.fnRet) == "string" {
+    if unionTakesAtomAsStr(tyNameOf(fn.fnRet)) {
       if exprIsLitAtom(retArgIx, fnIx) { return true }
     }
     // The INFERRED-string dual (mirrors `emitReturnValue`'s widen): an UN-annotated

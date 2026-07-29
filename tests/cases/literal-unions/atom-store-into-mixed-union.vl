@@ -1,0 +1,296 @@
+// @run
+// @log K
+// @log K
+// @log K
+// @log K
+// @log K
+// @log K
+// @log K
+// @log K
+// @log K
+// @log bb
+// @log true
+// @log cc
+// @log dd
+// @log aa
+// @log O
+// @log aa
+// @log aa
+// @log A
+// @log B
+// @log side
+// @log K
+// @log K
+// @log aa
+// @log aa
+// THE ATOM -> BOX STORE BOUNDARY (slice A of `docs/internals/litunion-compact-rep-design.md`,
+// defect family F1). An atom-typed VALUE — a `K`-typed local, param, call result — flowing
+// into a MIXED union (`K | f64`) fell past `emitUnionCoerce`'s value-atom ladder, because
+// `valueAtomKind("K")` is -1 and the ladder has no litunion arm. Measured on master at
+// `b7566067`, 184 isolated cells (8 mixed spellings x 3 carriers x 8 positions): ZERO correct.
+// `K | f64` emitted `f64.convert_i32_s` ON THE ATOM ID (silent wrong answer); `K | string` and
+// `K | i32[]` pushed the raw i32 at the box's `anyref` payload (invalid wasm, `vl check` rc 0).
+//
+// THE HAZARD IS THE RESERVATION SCAN, NOT THE EMIT. The store lowers through `emitAtomToStr`,
+// which stashes the atom id in the string-op scratch frame (`setStrScrI`) — and that frame is
+// reserved by `emit_classify`'s scan, whose atom-widening predicates all keyed on the TARGET
+// being spelled `string`. A union target carrying a litunion arm is the missing SIXTH member.
+// With the emit leg and no reservation, 96 of these cells are INVALID WASM.
+//
+// EVERY POSITION BELOW IS ISOLATED ON PURPOSE, AND THAT IS THE WHOLE POINT OF THE FILE.
+// The store function holds the store and NOTHING ELSE; the `is`/`print` check runs in a
+// separate function that receives the union BY VALUE (a union-typed value into a union param
+// is a pass-through, not a coercion, so the call adds no string op to the caller). The first
+// pass of this grid put the check beside the store, and `print("K")` — itself a string op —
+// reserved the frame for five of the eight positions. They read "covered" for a reason that
+// had nothing to do with the store. (#1287's `mI32Used` lesson: a wide-scope flag masks a
+// missed setter. `contaminatedStore` at the end of this file keeps that shape visible.)
+//
+// EACH NAMED FUNCTION IS ONE PREDICATE'S WITNESS. Delete that predicate's union leg and
+// exactly its function goes INVALID-WASM while the other seven keep running:
+//   bindIsolated      -> `letWidensAtomToStr`          (the union leg)
+//   elemIsolated      -> `letWidensAtomToStr`          (the ARRAY leg + `arrLitHasAtomElem`)
+//   argIsolated       -> `callWidensAtomToStr`
+//   retIsolated       -> `retWidensAtomToStr`
+//   globalIsolated    -> `globalInitWidensAtomToStr`   (+ `globalInitIsLitAtom`'s Call arm)
+//   reassignIsolated  -> `assignWidensAtomToStr`
+//   fieldIsolated     -> `exprHasStrOp`'s ObjLit arm, which ALREADY claimed any
+//                        `exprIsLitAtom` field value — the half of the pair that was taught,
+//                        and the reason the FIELD position needed no new code
+//   mapvalIsolated    -> the string-keyed map's OWN frame (its key compares are string ops);
+//   mapvalI32Isolated -> the i32-keyed twin, which has no such bystander
+
+type K = "aa" | "bb"
+
+// ── one isolated witness per reservation-scan member ─────────────────────────
+function chk(x: K | f64) {
+  if x is K { print("K") } else { print("O") }
+}
+
+function bindIsolated() {
+  const k: K = "aa"
+  const x: K | f64 = k
+  chk(x)
+}
+bindIsolated()
+
+function argIsolated() {
+  const k: K = "aa"
+  chk(k)
+}
+argIsolated()
+
+function mkRet(): K | f64 {
+  const k: K = "aa"
+  return k
+}
+function retIsolated() {
+  const x = mkRet()
+  chk(x)
+}
+retIsolated()
+
+// The GLOBAL position's frame belongs to the START function, so nothing inside a `function`
+// can mask its miss. The initializer is a CALL, which `globalInitIsLitAtom` did not claim.
+function kOf(): K { return "aa" }
+const gAtomBox: K | f64 = kOf()
+function globalIsolated() { chk(gAtomBox) }
+globalIsolated()
+
+function fieldIsolated() {
+  const k: K = "aa"
+  const s: { v: K | f64 } = { v: k }
+  chk(s.v)
+}
+fieldIsolated()
+
+function chkElem(xs: (K | f64)[]) {
+  const x = xs[0]
+  if x is K { print("K") } else { print("O") }
+}
+function elemIsolated() {
+  const k: K = "aa"
+  const xs: (K | f64)[] = [k]
+  chkElem(xs)
+}
+elemIsolated()
+
+function chkMap(mm: {[string]: K | f64}) {
+  const x = mm["p"]
+  if x is K { print("K") } else { print("O") }
+}
+function mapvalIsolated() {
+  const k: K = "aa"
+  const m: {[string]: K | f64} = Map()
+  m["p"] = k
+  chkMap(m)
+}
+mapvalIsolated()
+
+// The i32-KEYED map is the map position WITHOUT its bystander: a string-keyed map's own key
+// compares are string ops and reserve the frame for free, an i32-keyed map's do not.
+function chkMapI32(mm: {[i32]: K | f64}) {
+  const x = mm[1]
+  if x is K { print("K") } else { print("O") }
+}
+function mapvalI32Isolated() {
+  const k: K = "aa"
+  const m: {[i32]: K | f64} = Map()
+  m[1] = k
+  chkMapI32(m)
+}
+mapvalI32Isolated()
+
+function reassignIsolated() {
+  const k: K = "aa"
+  let x: K | f64 = 2.5
+  x = k
+  chk(x)
+}
+reassignIsolated()
+
+// ── the stored PAYLOAD is read back, not merely tag-tested ───────────────────
+// A tag-only oracle would pass on a box whose payload is wrong, so each of these reads the
+// narrowed member out again.
+function chkPrint(x: K | f64) {
+  if x is K { print(x) } else { print("O") }
+}
+function readBackPrint() {
+  const k: K = "bb"
+  const x: K | f64 = k
+  chkPrint(x)
+}
+readBackPrint()
+
+function chkEq(x: K | f64) {
+  if x is K {
+    const b = x == "bb"
+    print(b)
+  } else {
+    print("O")
+  }
+}
+function readBackEq() {
+  const k: K = "bb"
+  const x: K | f64 = k
+  chkEq(x)
+}
+readBackEq()
+
+// THREE and FOUR members: the `select` tower gains compares and the stashed id is re-read per
+// member, which is exactly the case the design's "cheaper 2-member variant" cannot serve. That
+// variant was built and measured (see `emitAtomToStr`'s header): with a stash-free two-member
+// tower and no reservation at all, every 2-member cell runs and only these two shapes break.
+type K3 = "aa" | "bb" | "cc"
+function chk3(x: K3 | f64) {
+  if x is K3 { print(x) } else { print("O") }
+}
+function threeMemberTower() {
+  const k: K3 = "cc"
+  const x: K3 | f64 = k
+  chk3(x)
+}
+threeMemberTower()
+
+type K4 = "aa" | "bb" | "cc" | "dd"
+function chk4(x: K4 | f64) {
+  if x is K4 { print(x) } else { print("O") }
+}
+function fourMemberTower() {
+  const k: K4 = "dd"
+  const x: K4 | f64 = k
+  chk4(x)
+}
+fourMemberTower()
+
+// ── the OTHER arm still wins its own tag, and a member LITERAL still stores ──
+// The store leg sits ABOVE the value-atom ladder, so these two are the controls that say it
+// did not swallow the ladder's own traffic.
+function litStillStores() {
+  const x: K | f64 = "aa"
+  chkPrint(x)
+}
+litStillStores()
+
+function otherArmStillStores() {
+  const x: K | f64 = 2.5
+  chk(x)
+}
+otherArmStillStores()
+
+// ── the PLAIN `string` arm is the litunion arm's twin, one spelling over ─────
+// `unionTakesAtomAsStr`'s second leg. `const x: string | f64 = k` failed the SAME way for the
+// SAME reason (the ladder cannot classify a `K` value), and it is fixed by the same line.
+function chkStr(x: string | f64) {
+  if x is string { print(x) } else { print("O") }
+}
+function stringArmIsolated() {
+  const k: K = "aa"
+  const x: string | f64 = k
+  chkStr(x)
+}
+stringArmIsolated()
+
+function stringArmArg() {
+  const k: K = "aa"
+  chkStr(k)
+}
+stringArmArg()
+
+// ── TWO stores in one function share ONE frame ───────────────────────────────
+type KB = "cc" | "dd"
+function chkTwo(a: K | f64, b: KB | f64) {
+  if a is K { print("A") } else { print("O") }
+  if b is KB { print("B") } else { print("O") }
+}
+function twoStoresOneFrame() {
+  const k: K = "aa"
+  const kb: KB = "cc"
+  const x: K | f64 = k
+  const y: KB | f64 = kb
+  chkTwo(x, y)
+}
+twoStoresOneFrame()
+
+// ── the store's operand may be a CALL WITH A SIDE EFFECT ─────────────────────
+// The widening tower pushes its two member constants before reading the id, so the operand's
+// own effects must still happen in source order.
+function kSide(): K {
+  print("side")
+  return "aa"
+}
+function sideEffectOrder() { chk(kSide()) }
+sideEffectOrder()
+
+// ── THE CONTAMINATED SHAPE, kept on purpose ──────────────────────────────────
+// Store and check in ONE function: `print("K")` reserves the frame by itself, so this cell
+// passes even with the reservation legs deleted. It is here as the negative control for every
+// isolated function above — if this were the only spelling in the file, the whole slice would
+// look unnecessary.
+function contaminatedStore() {
+  const k: K = "aa"
+  const x: K | f64 = k
+  if x is K { print("K") } else { print("O") }
+}
+contaminatedStore()
+
+// ── THE TWO REPS THAT ARE NOT A BOX, and must not be dragged into the widen ──
+// `unionTakesAtomAsStr` excludes both, and each exclusion is a measurement:
+//   · a PURE literal union is the interned i32 ATOM — an atom stored into it stays an atom.
+//     Deleting that gate reserves a wasted frame in 6 corpus files (+221 bytes).
+//   · `K | null` is the atom NICHE (i32 with a -1 sentinel), not a `{tag, anyref}` box.
+//     Deleting that gate costs 2 corpus files (+34 bytes); it moves ZERO cells at this base,
+//     which is exactly why the gate is stated as a rep fact and not as a bug fix.
+function pureTargetStaysAtom() {
+  const k: K = "aa"
+  const k2: K = k
+  print(k2)
+}
+pureTargetStaysAtom()
+
+function nicheTargetStaysNiche() {
+  const k: K = "aa"
+  const x: K | null = k
+  if x is K { print(x) } else { print("O") }
+}
+nicheTargetStaysNiche()
