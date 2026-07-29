@@ -428,6 +428,7 @@ import {
   repSlotOfTy,
   repStructSlotsTwin,
   sTyIxOfName,
+  sTyIxOfNameTy,
   scalarTagOfKind,
   tyDenotesFunc,
   tyIsI32LeafElem,
@@ -3683,15 +3684,43 @@ export function mvShapeOfValNameK(valNameIn: string, keyI32: boolean) {
   // `rls6` hoist above exists for).
   if keyI32 { mvKeyI32.push(1) } else { mvKeyI32.push(0) }
   recordMvValTyIx(valName)
+  // THE ROW THAT LINE JUST BANKED (destringify D-INLINESHAPETY). `recordMvValTyIx` is
+  // `mvValTyIx.push(fieldElemTyIxOfName(valName))` over the very spelling the two
+  // `valName` interns below key on, so the three MINT sites in this block stop asking
+  // `resolveAnnot` for an index that is now sitting at the end of the sidecar. The
+  // interner-rule discipline (`rlInternNameTy`'s header): a mint may be fronted only
+  // with a banked INPUT that is provably the one it would have computed — for the two
+  // `valName` sites the recorder's argument IS this call's argument, one line apart.
+  //
+  // The kind-6 site above is NOT reachable from this bank (it interns BEFORE the row is
+  // pushed, and it must — a reentrant intern between `mvValName.push` and
+  // `mvRlSlot.push` skews every parallel table). Its hint would be exact: a probe
+  // computing `fieldElemTyIxOfName(bare)` there agrees with the name leg on 169 of 169
+  // corpus entries. Taking it needs the resolution HOISTED above the kind-6 recursion,
+  // which moves when `resolveAnnot` mints — and `repElemKeyGo`'s identity arm keys
+  // `TyVar`/`TyLit`/`TyErr` by arena INDEX, so a mint reorder can move a key. Filed,
+  // not taken.
+  const vRowTy = mvValTyIxAt(mvValTyIx.length - 1)
   mvValKind.push(kind)
   mvValStructIdx.push(vsi)
   if kind == 1 {
+    // THE KIND-1 SITE IS DELIBERATELY UNHINTED, AND THE REASON IS A SIDECAR WITH TWO
+    // PRODUCERS. It interns `sNames[vsi]`, not `valName`, so the obvious hint is that
+    // row's own D0 cell — except `sTyIx` is written by `sTyIxOfName` at three mint
+    // sites AND by `anonRowTyIx` (a NODE bank) at the anonymous-literal row. For an
+    // `#anonN` row the two answer differently by construction: the bridge returns -1
+    // (the name resolves through neither `cUserTypes` nor the annotation grammar) while
+    // the sidecar holds the literal's context-resolved `TyObj`. Measured: 4 of 116
+    // entries, first witness `nm=#anon1 A={a:f64,f:f64,z:string,}` — a D2, which at a
+    // MINT re-keys the row from "never merged" to a structural key. A hint must be the
+    // input the function WOULD have computed; a strictly better-covered sidecar is not
+    // that input.
     mvRlSlot.push(rlInternName(sNames[vsi], 1))
     rlUsed = true
     raUsed = true
   } else if kind == 2 {
     // A union-VALUE ref list: element kind 2 (the union box, heap `uBoxIdx`).
-    mvRlSlot.push(rlInternName(valName, 2))
+    mvRlSlot.push(rlInternNameTy(valName, 2, vRowTy))
     rlUsed = true
     raUsed = true
   } else if kind == 6 {
@@ -3703,7 +3732,7 @@ export function mvShapeOfValNameK(valNameIn: string, keyI32: boolean) {
     raUsed = true
   } else if kind == 14 {
     // A CLOSURE-VALUE ref list: element kind 5 (the closure fat-pointer, heap `cloStructIdx`).
-    mvRlSlot.push(rlInternName(valName, 5))
+    mvRlSlot.push(rlInternNameTy(valName, 5, vRowTy))
     rlUsed = true
     raUsed = true
   } else {
@@ -5731,7 +5760,13 @@ export function mvValUnionScalarNullAt(slot: i32): i32 {
 export function mvValInnerRlSlot(slot: i32): i32 {
   const ar = mvValInnerRlSlotAt(slot)
   if ar >= 0 { return ar }
-  rlSlotOfArrName(mvValName[slot])
+  // …and the fall-through's rung 2 takes the SAME element type as its KEY hint
+  // (destringify D-INLINESHAPETY) — the one the arena rung above just computed and
+  // found no row for. Both sides start from ONE cell: `mvValTyIx` was recorded by
+  // `recordMvValTyIx` off the very `mvValName` spelling peeled here, so this is the
+  // arena peel and the name peel of a single row, not two provenances (the distinction
+  // #1295 measured at `collect:3465`, where they were two and disagreed 59 times).
+  rlSlotOfArrNameTy(mvValName[slot], tyRefArrElemOf(mvValTyIxAt(slot)))
 }
 
 // The mv slot of a NESTED-map value's inner value (destringify D5-final (b)). ARENA
@@ -11757,7 +11792,25 @@ export function rlInternNameTy(name: string, kind: i32, ty: i32) {
 // niche-nullable element's index read stays nullable — merging it with a non-null
 // slot would change the read discipline, not just the heap type). -1 when nothing
 // matches.
-export function rlSlotByName(name: string): i32 { rlSlotByNameTy(name, -1) }
+export function rlSlotByName(name: string): i32 {
+  rlSlotByNameTyK(name, -1, -1)
+}
+
+// `rlSlotByName` with a KEY-ONLY hint (destringify D-INLINESHAPETY): the caller's
+// recorded arena type for `name` reaches rung 2's `repElemKey` and NOTHING else — the
+// rendered rung 3 stays laddered, unlike `rlSlotByNameTy`'s full hint, which deletes it.
+//
+// THE TWO ARE DIFFERENT CLAIMS AND THAT IS WHY THERE ARE TWO ENTRY POINTS.
+// `rlSlotByNameTy(name, ty)` asserts *the arena leg is TOTAL here* — measured for
+// `sFieldRefSlot`, whose rendered rung answers 0 times over the corpus. A caller with a
+// recorded type but no such measurement (`variantFieldRefSlot`, `mvValInnerRlSlot`)
+// wants only the cheaper key; deleting its rendered rung would be an unmeasured
+// behaviour change on a rung that DOES answer there (25 of 584 entries at
+// `variantFieldRefSlot`). Passing -1 as the twin/rendered `ty` keeps that ladder exactly
+// as it was and buys the one thing the hint is for: rung 2 stops calling `resolveAnnot`.
+export function rlSlotByNameKeyTy(name: string, keyTy: i32): i32 {
+  rlSlotByNameTyK(name, -1, keyTy)
+}
 
 // The ref-list slot of the ELEMENT of the ref-array spelling `arrName` — `rlSlotByName`
 // of `refArrElemName`. Four sites (the two element/value sidecar fall-throughs and the
@@ -11766,7 +11819,15 @@ export function rlSlotByName(name: string): i32 { rlSlotByNameTy(name, -1) }
 // already a concept without being a function. One home is also the one place an arena
 // element type (`tyRefArrElemOf`) has to be threaded when it arrives.
 function rlSlotOfArrName(arrName: string): i32 {
-  rlSlotByName(refArrElemName(arrName))
+  rlSlotByNameKeyTy(refArrElemName(arrName), -1)
+}
+
+// `rlSlotOfArrName` with the caller's ARENA element type for `arrName`'s element — the
+// thread the home's header above says has to exist "when it arrives". KEY-ONLY (see
+// `rlSlotByNameKeyTy`): `elemTy` is `tyRefArrElemOf` of the array's recorded type, the
+// arena dual of the `refArrElemName` peel this composition performs on the spelling.
+function rlSlotOfArrNameTy(arrName: string, elemTy: i32): i32 {
+  rlSlotByNameKeyTy(refArrElemName(arrName), elemTy)
 }
 
 // `rlSlotByName` with the caller's RECORDED arena element type as a hint for rungs 2
@@ -11798,12 +11859,20 @@ function rlSlotOfArrName(arrName: string): i32 {
 // `ty` -1 = no hint (every caller but `sFieldRefSlot`), and those keep the rendered
 // rung unchanged — it is still load-bearing for them.
 export function rlSlotByNameTy(name: string, ty: i32): i32 {
+  rlSlotByNameTyK(name, ty, ty)
+}
+
+// The shared body of the three entry points above. `ty` is the FULL hint (rung 3's
+// twin input, and the assertion that lets the rendered rung be deleted); `keyTy` is the
+// KEY hint alone. `rlSlotByNameTy` passes the same index as both — its caller's claim
+// is the strong one; `rlSlotByNameKeyTy` passes -1 as `ty`, so only rung 2 moves.
+function rlSlotByNameTyK(name: string, ty: i32, keyTy: i32): i32 {
   let i = 0
   while i < rlElemName.length {
     if rlElemName[i] == name { return i }
     i = i + 1
   }
-  const key = repElemKeyOfNameTy(name, ty)
+  const key = repElemKeyOfNameTy(name, keyTy)
   let ci = 0
   while ci < rlElemName.length {
     if rlElemKey[ci] == key { return ci }
@@ -12708,7 +12777,31 @@ function internShapeFieldElems(nm: string) {
 // ref on it (code 15) — only a nested text with no code fails the whole shape.
 // Idempotent per field-name+code set (`annShapeIndexOf`), so a literal-interned
 // twin (`collectAnonShapes`) and a re-visited annotation share one entry.
-export function internInlineShape(nm: string) {
+export function internInlineShape(nm: string) { internInlineShapeTy(nm, -1) }
+
+// `internInlineShape` with the caller's RECORDED arena type for `nm` (destringify
+// D-INLINESHAPETY). The hint reaches the row's D0 `sTyIx` cell and NOTHING else: the
+// field split, every code classification, the `annShapeIndexOf` dedup and the stored
+// spelling are untouched, and an unhinted call records exactly what it recorded before.
+//
+// EQUAL BY CONSTRUCTION, and the construction is the reason this is allowed at a MINT
+// at all (`rlInternNameTy`'s header states the rule). Inside this function
+// `nameIsShapeSpanEnds(nm)` is TRUE — the early return above is what makes it so — and
+// on that branch `sTyIxOfName(nm)` IS `cUserTypes[nm] ?? resolveAnnot(nm)`, which is
+// `fieldElemTyIxOfName(nm)`'s whole body. The two shipped hints are
+// `uFieldElemTyIxRow(ufn)`, recorded by `recordUFieldElemRow` from the SAME
+// `uFieldElemName` cell the caller passes here, so the two legs read one arena index.
+// The only spelling where they part is the >4096-character runaway cap, which the
+// recorder answers -1 for — and a -1 hint takes the name leg unchanged.
+//
+// **THE OTHER FOUR CALLERS ARE NOT HINTABLE AND THAT IS THE MEASUREMENT, NOT AN
+// OMISSION.** 1,046 of the 1,064 `sTyIxOfName` resolutions arrive from
+// `internShapeDeep`'s peeled leaf (873), `internFuncTypeShapes` (116), this function's
+// own nested-field recursion (56) and `internShapeFieldElems` (5) — each of which
+// composed `nm` by CUTTING a larger spelling, so no caller holds a bank for the cut.
+// The largest chain roots at a `TypeRef` node, i.e. the mono-clone `nodeTyIx`
+// population D-REPELEMTY §3a refuted, one peel further away.
+export function internInlineShapeTy(nm: string, tyIx: i32) {
   if !nameIsShapeSpanEnds(nm) { return -1 }
   // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
   // the shape layer's ONE field scanner). `texts` keeps each field's type TEXT (a
@@ -12768,7 +12861,7 @@ export function internInlineShape(nm: string) {
   // `structIndexByName` on the annotation (or on a ref-list element name
   // `{v:i32}[]` → `{v:i32}`) resolves directly.
   sNames.push(nm)
-  recordSTyIx(sTyIxOfName(nm)) // D0
+  recordSTyIx(sTyIxOfNameTy(nm, tyIx)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
   let pi = 0
@@ -13365,9 +13458,14 @@ export function variantFieldRefSlot(vi: i32, fi: i32) {
   // the rep key the layer is already interned on; the recorded NAME is the
   // fall-through for a row the sidecar does not cover (and for `rlSlotByName`'s
   // struct-twin rung, which has no arena input).
-  const a = rlSlotOfTy(uFieldElemTyIxAt(vi, fi))
+  const ety = uFieldElemTyIxAt(vi, fi)
+  const a = rlSlotOfTy(ety)
   if a >= 0 { return a }
-  rlSlotByName(uFieldElemName[uFieldStart[vi] + fi])
+  // …and the fall-through's rung 2 reads that SAME index rather than re-resolving the
+  // name beside it (destringify D-INLINESHAPETY). KEY-ONLY: the rendered rung below it
+  // answers 25 of 584 entries here, so it stays laddered — `sFieldRefSlot`'s stronger
+  // `rlSlotByNameTy` claim is not this caller's.
+  rlSlotByNameKeyTy(uFieldElemName[uFieldStart[vi] + fi], ety)
 }
 
 // The ELEMENT/atom-set NAME recorded for variant `vi`'s field `fi` — a union-box field

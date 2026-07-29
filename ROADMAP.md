@@ -45,10 +45,36 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 > 38% of one column and 0% of another, which is why every prior "we're done" verdict was premature.
 > The single highest-value target: **`nameToTy` is the checker's SECOND recursive-descent type parser**
 > (~150 ops), and its bank is already shipped and proven — #1117's spelling tree probed at **0
-> disagreement over 319,945 comparisons** — and still **completely unread** (`typecheck.vl` does not
-> contain the string `annTs`). #1129 measured away the prerequisite that was thought to gate it: the
-> canon pass runs at the *end* of `checkProgram`, so it cannot reach a checker-time resolution
-> (333,073 reads · 0 stale · 0 missing). `tsToTy` is the whole remaining cost.
+> disagreement over 319,945 comparisons**. #1129 measured away the prerequisite that was thought to
+> gate it: the canon pass runs at the *end* of `checkProgram`, so it cannot reach a checker-time
+> resolution (333,073 reads · 0 stale · 0 missing). `tsToTy` is the whole remaining cost.
+> *(This line used to end "…and still completely unread — `typecheck.vl` does not contain the string
+> `annTs`". **That is false and has been since #1288**: `annTs` occurs 9 times in `typecheck.vl` today,
+> and the tree is read at five live sites — `annotResolve(name, annTsOf(ann))`, `isTypeTy`, the
+> field-declaration resolve, `canonEmitNameTs`'s `TypeRef` arm (#1294) and `tsMapKeyNodeOf`. The bank
+> is PARTLY read; what remains unconverted is `nameToTy`'s own descent, not the plumbing. Re-derive a
+> claim of the form "file X does not contain string Y" before quoting it — `grep -c` is the whole
+> cost.)*
+>
+> **THE EMIT-SIDE / CHECKER-SIDE FRONTIER IS TRACKED PER BUCKET IN THE PROGRAMME DOC**, with the
+> populations re-derived on each slice's own base (they drift, and three consecutive slices found the
+> filed *unit* wrong rather than the filed number). Three standing corrections that outlived the
+> slices that made them:
+> - **1c `unMemAtomTyIx` — a checker-side recorder is REFUTED, not merely unscheduled** (#1294 §8).
+>   The checker and the emitter's bridge resolve the same union member and disagree on **444 of 761**
+>   comparable atoms, because `canonEmitTypeNames` rewrites the spelling in between. A recorder at the
+>   checker's union registration would ship green (it is write-only) and be wrong the moment anything
+>   read it. The recorder has to be written by whoever performs the rewrite — canon — which is W9.
+> - **1c `sTyIxOfName` — filed to the EMITTER by #1294, and the emitter route is 14 reaches, not
+>   1,064** (#1297). All 1,064 resolutions do come from one function, `internInlineShape`; split by
+>   that function's SIX callers, only the two variant-field-table sites hold the D5 column the filing
+>   named. 1,046 arrive through `internShapeDeep`'s peeled leaf, `internFuncTypeShapes`, the nested-
+>   field recursion and `internShapeFieldElems` — each of which CUT `nm` out of a larger spelling, so
+>   no caller banks the cut. The 14 shipped; the rest waits on the mono-clone `nodeTyIx` item.
+> - **bucket 3 is `monoInferListElem` / `monoInferLocalScalar`, not `inferListElemName`** (#1294 §6) —
+>   a function name that never existed in the tree, carried through four slices against a count that
+>   was exact. Its producer `pinned` is built by string surgery in `emit_mono.monoInstanceFor`, so the
+>   route is one commit spanning `typecheck.vl` + `emit_mono.vl`, not an emitter-only move.
 
 ### Consumer-driven requirements — webcraft (`docs/webcraft-requirements.md`)
 
