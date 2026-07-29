@@ -583,7 +583,8 @@ measurable rather than hypothetical — and in that configuration it is **0 cell
 DOWN** (`==` over the regrouped box becomes `emitProgram: `==` over a struct union is not
 supported yet`). It buys nothing and costs two.
 
-**Outcome, 420 cells over four grids: 58 UP, 0 DOWN.** `K | K2` now scores exactly what the
+**Outcome, 420 cells over four grids: 54 UP, 0 DOWN** — 46 silent-wrong → correct and 8
+invalid-wasm → correct. `K | K2` now scores exactly what the
 un-aliased inline spelling of its flattened set scores (10 of 20) — the flatten's whole
 claim is that the two are one type — and with a DECLARED alias for the flattened set it
 scores 19 of 20, the same as the alias written directly. The residue is the inline-spelling

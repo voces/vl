@@ -581,7 +581,7 @@ in-language GC knobs.
   > UP and **12 DOWN**) — `tsToTyReal`'s annotation-union arm never flattened a union MEMBER, so
   > `K | K2` interned as a `TyUnion` OF UNIONS, `tyIsLitUnion` answered no, and `anyLitUnionUsed`
   > left `gLitUnionUsed` at 0, switching off every atom classifier in the module. With the arena
-  > arm + a canon mirror: **58 cells UP and 0 DOWN over 420**, and `K | K2` lands on the exact
+  > arm + a canon mirror: **54 cells UP and 0 DOWN over 420** (46 of them silent-wrong → correct), and `K | K2` lands on the exact
   > ten-cell RUN-OK set of the hand-written spelling of its flattened members (19 of 20 when a
   > declared alias for that set exists). The RUN-MERGE variant is ruled OUT with numbers — master
   > already performs it when the flattened alias is declared, and there it is 0 UP / 2 DOWN.

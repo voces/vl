@@ -37812,22 +37812,23 @@ supported yet`). The merge makes `K | K2 | f64` behave exactly like `K | f64`, w
 *consistent* and *worse* — C's `==` only works because the un-merged shape had degenerated to
 a bare string. **0 UP, 2 DOWN: ruled out, with numbers, without building it.**
 
-### The grids — 420 cells, 58 UP, 0 DOWN
+### The grids — 420 cells, 54 UP, 0 DOWN
 
 Each row is 20 ops (bind/print/eq × is-positive and is-negative, the five keep positions,
 param/return/global/reassign, the narrowed read/concat/arg, `for`-in, the atom store, `??`).
 Every grid carries a control whose members DIFFER (#1304's note).
 
-| grid | cells | before → after | moves |
+| grid | cells | RUN-OK before → after | moves |
 |---|---|---|---|
-| main (9 shapes + control) | 200 | 79 → 98 RUN-OK | 19 UP, 0 DOWN |
-| four-config (run-merge) | 100 | — | 21 UP, 0 DOWN |
-| inline-spelling controls | 80 | — | 18 UP, 0 DOWN |
-| nullable controls | 40 | — | 0 UP, 0 DOWN |
+| main (9 shapes + control) | 200 | 79 → 98 | 19 UP (17 silent, 2 invalid-wasm), 0 DOWN |
+| four-config (run-merge) | 100 | 28 → 45 | 17 UP (15 silent, 2 invalid-wasm), 0 DOWN |
+| inline-spelling controls | 80 | 49 → 67 | 18 UP (14 silent, 4 invalid-wasm), 0 DOWN |
+| nullable controls | 40 | 26 → 26 | 0 UP, 0 DOWN |
+| **total** | **420** | **182 → 236** | **54 UP (46 SILENT), 0 DOWN** |
 
-The 19 in the main grid: **16 silent-wrong → correct** (`is K` at the field, element,
+The 19 in the main grid: **17 silent-wrong → correct** (`is K` at the field, element,
 map-value and `for`-in positions of `K | K2`, `K | K2 | K3`, `(K | K2) | K3` and the
-overlapping `KO1 | KO2`), and **3 invalid-wasm/silent → correct** on the degenerate
+overlapping `KO1 | KO2`), and **2 invalid-wasm → correct** on the degenerate
 `K | ("aa"|"bb")`. The headline class is the first one: a guard that could never fire now
 fires exactly on its own member set.
 
