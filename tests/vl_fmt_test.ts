@@ -1238,3 +1238,222 @@ Deno.test({
     }
   },
 });
+
+// ── the trailing-lambda exception (roadmap P3) ───────────────────────────────
+// `vl fmt` used to explode `it("adds", () => { … })` into a six-line vertical
+// argument list STRUCTURALLY — at any column, because the list rule is "an
+// argument spans lines ⇒ break every argument" and a block-bodied lambda always
+// spans lines. `docs/internals/fmt-trailing-lambda-design.md` records the three
+// rulings; these four tests are what pin them.
+//
+// They live here and not in tests/cases because the fmt gate never sees
+// tests/cases (the #1278 lesson) — a formatting rule pinned only there is not
+// pinned at all.
+//
+// SABOTAGE WITNESSES (both measured by rebuilding the compiler with the guard
+// removed, see the design doc §5):
+//   hug-nothing  — `isBlockLambda` forced to `false`: test A reddens
+//                  ("the call exploded into a vertical argument list").
+//   hug-everything — the `hasNewline(pre[j])` guard deleted: test B reddens
+//                  (the two-lambda call hugs and emits a `}, () => {` seam).
+Deno.test({
+  name: "vl-fmt: a trailing block-bodied lambda hugs the call at ANY width (A)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      `function it(name: string, body: () => void) { body() }`,
+      `function describe(name: string, body: () => void) { body() }`,
+      ``,
+      `it("adds", () => {`,
+      `  print(1 + 1)`,
+      `})`,
+      ``,
+      `describe("strings", () => {`,
+      `  it("nests", () => {`,
+      `    print(2)`,
+      `  })`,
+      `})`,
+      ``,
+      `const doubled = [1, 2, 3].map((v) => v + 1)`,
+      `print(doubled.length)`,
+      ``,
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`vl fmt rejected valid source: ${r.err}`);
+    // The head line is 18 columns — nowhere near fmtWidth — so an exploded
+    // result would prove the rule is structural rather than width-driven, which
+    // is exactly the defect this closes.
+    if (r.out.includes("it(\n") || r.out.includes('\n  "adds",\n')) {
+      throw new Error(
+        `a 18-column call still exploded into a vertical argument list:\n${r.out}`,
+      );
+    }
+    for (const want of [`it("adds", () => {\n`, `\n})\n`, `  it("nests", () => {\n`, `\n  })\n`]) {
+      if (!r.out.includes(want)) {
+        throw new Error(`missing ${JSON.stringify(want)} in:\n${r.out}`);
+      }
+    }
+    // An EXPRESSION-bodied lambda was already untouched and must stay so.
+    if (!r.out.includes(`const doubled = [1, 2, 3].map((v) => v + 1)\n`)) {
+      throw new Error(`an expression-bodied lambda changed:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.code !== 0 || r2.out !== r.out) {
+      throw new Error(
+        `not idempotent (rc ${r2.code}):\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: the hug is LAST-ARGUMENT-ONLY — two lambdas / lambda-then-arg break the call (B)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      `function two(a: () => void, b: () => void) {`,
+      `  a()`,
+      `  b()`,
+      `}`,
+      `function firstLam(f: (i32) => i32, k: i32): i32 { f(k) }`,
+      ``,
+      `two(() => {`,
+      `  print(1)`,
+      `}, () => {`,
+      `  print(2)`,
+      `})`,
+      ``,
+      `print(firstLam((v) => {`,
+      `  return v + 1`,
+      `}, 7))`,
+      ``,
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`vl fmt rejected valid source: ${r.err}`);
+    // Ruling 2 — TWO lambdas: the FIRST one is not trailing, so the whole call
+    // takes the vertical form (Prettier's rule, and the only one that keeps the
+    // two bodies at the same depth).
+    if (!r.out.includes("two(\n  () => {\n") || !r.out.includes("\n  () => {\n    print(2)")) {
+      throw new Error(`the two-lambda call did not break vertically:\n${r.out}`);
+    }
+    if (r.out.includes("two(() => {") || r.out.includes("}, () => {")) {
+      throw new Error(`the two-lambda call hugged (hug-everything):\n${r.out}`);
+    }
+    // Ruling 3 — a lambda FOLLOWED by another argument is not trailing.
+    if (!r.out.includes("firstLam(\n    (v) => {\n") || !r.out.includes("\n    7,\n")) {
+      throw new Error(`a non-trailing lambda hugged or mis-wrapped:\n${r.out}`);
+    }
+    if (r.out.includes("firstLam((v) => {")) {
+      throw new Error(`a lambda followed by an argument hugged:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.code !== 0 || r2.out !== r.out) {
+      throw new Error(
+        `not idempotent (rc ${r2.code}):\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a hugged lambda keeps every comment; an over-width head declines the hug (C)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The comment half is the pin on the ONE-RENDER discipline: the lambda body
+    // is rendered through the consuming comment cursor, so a hug that renders
+    // speculatively and falls back would DELETE these three comments at rc 0.
+    const filler = "x".repeat(69);
+    const wideHead = `tag(1, "${filler}", () => {`;
+    if (wideHead.length <= 80) {
+      throw new Error(
+        `the over-width fixture head is ${wideHead.length} cols — under fmtWidth, so the decline branch is never reached and that half is inert`,
+      );
+    }
+    const src = [
+      `function it(name: string, body: () => void) { body() }`,
+      `function tag(a: i32, b: string, body: () => void) { body() }`,
+      ``,
+      `it("keeps comments", () => {`,
+      `  // leading own-line comment`,
+      `  print(1) // trailing comment`,
+      `  // comment after the last statement`,
+      `})`,
+      ``,
+      wideHead,
+      `  print(2)`,
+      `})`,
+      ``,
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`vl fmt rejected valid source: ${r.err}`);
+    for (
+      const want of [
+        "// leading own-line comment",
+        "// trailing comment",
+        "// comment after the last statement",
+      ]
+    ) {
+      const hits = r.out.split(want).length - 1;
+      if (hits !== 1) {
+        throw new Error(`comment ${JSON.stringify(want)} appears ${hits}× (want 1):\n${r.out}`);
+      }
+    }
+    if (!r.out.includes(`it("keeps comments", () => {\n`)) {
+      throw new Error(`the commented lambda did not hug:\n${r.out}`);
+    }
+    // The over-width head declines: the call takes the vertical form, and no
+    // emitted code line runs past fmtWidth on account of the hug.
+    if (!r.out.includes("tag(\n  1,\n") || r.out.includes(wideHead)) {
+      throw new Error(`an over-width head still hugged:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.code !== 0 || r2.out !== r.out) {
+      throw new Error(
+        `not idempotent (rc ${r2.code}):\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a real `vl test` file is fmt-clean AS WRITTEN (the shape the rule exists for)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The fixtures under tests/fixtures/vl-test/ were written the way a test
+    // file WANTS to read and carried a comment saying they were deliberately not
+    // fmt-normalized. Under the trailing-lambda exception the readable form IS
+    // the canonical form — pin that, so the claim in those comments stays true.
+    for (
+      const rel of [
+        "tests/fixtures/vl-test/pass.test.vl",
+        "tests/fixtures/vl-test/fail.test.vl",
+        "tests/fixtures/vl-test/trap.test.vl",
+        "tests/fixtures/vl-test/broken.test.vl",
+        "tests/fixtures/vl-test-parallel/slow_a.test.vl",
+      ]
+    ) {
+      const path = `${ROOT}/${rel}`;
+      const onDisk = await Deno.readTextFile(path);
+      const r = await run([path]);
+      if (r.code !== 0) throw new Error(`vl fmt failed on ${rel}: ${r.err}`);
+      if (r.out !== onDisk) {
+        throw new Error(
+          `${rel} is not fmt-clean as written — the trailing-lambda rule regressed:\n${
+            diffFirstLine(onDisk, r.out)
+          }`,
+        );
+      }
+    }
+  },
+});
+
+/** The first differing line of two texts, for a legible failure. */
+const diffFirstLine = (a: string, b: string): string => {
+  const la = a.split("\n"), lb = b.split("\n");
+  for (let i = 0; i < Math.max(la.length, lb.length); i++) {
+    if (la[i] !== lb[i]) {
+      return `line ${i + 1}:\n  on disk: ${JSON.stringify(la[i])}\n  fmt out: ${JSON.stringify(lb[i])}`;
+    }
+  }
+  return "(texts differ only in length)";
+};
