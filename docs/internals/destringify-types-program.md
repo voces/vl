@@ -34412,3 +34412,349 @@ edit in flight).
   is not a synthetic poison; it is the candidate as of one hour earlier. A refactor that gets
   caught is the cheapest sabotage available, and it comes with a real witness set. *Keep the
   patch you had to take back — it is an instrument.*
+
+<!-- APPEND-MARKER-CKFRONTIER-BEGIN -->
+
+## D-CANONFOLD — the CHECKER-side frontier re-derived per bucket: canon's last whole-annotation re-parse asks the tree, and THREE of the four filed buckets are refuted rather than taken (off master `771abe09`)
+
+#1291's §7 left four buckets marked *"OWNED ELSEWHERE"* — i.e. `typecheck.vl`, this partition.
+This slice re-derives each population **before** building against it, ships the one that a
+checker change can move, and reports the other three as measurements. Three of the four filings
+turn out to be wrong in a way that changes what should be scheduled, and one of the three is
+wrong about which *function* it names.
+
+### 1. THE FOUR POPULATIONS, RE-DERIVED — with the producing command, and three unit corrections
+
+**PROBE ZZFR.** One counter per site in `typecheck.vl` / `emit_rep.vl`, reported by
+`emitFail(zzReport())` at `emit_sections.emitProgram`'s tail. The host reuses one compiler
+instance per directory, so the counters accumulate and the LAST record is the corpus total —
+reading any earlier one under-counts.
+
+```
+build:  vl build compiler/entry.vl -o frFR.wasm --compiler <master 771abe09 fixpoint>
+run:    vl check --codegen tests/cases --compiler frFR.wasm > fr-cases.out   # rc 1, the probe raises
+read:   grep -o 'ZZFR|[^"]*' fr-cases.out | tail -1
+        ZZFR|A=33|B=30|C=25|C0=24|CTOP=23|CTREE=23|D=1705|F=1618|F1=447|F2=1064|F3=1064
+             |G=2359|G1=274|G2=2085|G3=2085
+```
+
+1,417 of the corpus's programs reach the end of `emitProgram`.
+
+| filing (#1291 §7) | filed | re-derived at `771abe09` | verdict on the filing |
+|---|---:|---:|---|
+| 3 — `inferListElemName`'s `paramTyNames` ×2 | 63 | **63** (33 + 30) | **the COUNT is exact and the NAME is fiction.** There is no `inferListElemName` in the tree. The two sites are `monoInferListElem` and `monoInferLocalScalar` |
+| 4a — canon's `&`-fold | 23 | **25** | +2 (the corpus grew) |
+| 4b — `unionMemberGenAppShape` | 21 | 1,705 **entries**, of which the `nameIsGenAppOfDecl` gate admits **4 distinct spellings** corpus-wide (`Box<i32>` · `Cell<string>` · `Pair<i32,string>` · `Box<Node>`) | the 21 is a post-gate reach; not re-derived in that unit here, and it is behind W9 by the filing's own account |
+| 1c — `sTyIxOfName` | "1,060 **calls**" | **1,618 calls**; 447 answer at `cUserTypes`; **1,064 reach `resolveAnnot`** | **THE UNIT IS WRONG.** 1,060 is the `resolveAnnot` REACH (D-SLOTARENA's ZZRA row 2 counted call sites *of `resolveAnnot`*, not calls *of the bridge*). The call count is 1.53x larger |
+| 1c — `unMemAtomTyIx` | "2,083 **calls**" | **2,359 calls**; 274 at `cUserTypes`; **2,085 reach `resolveAnnot`** | same unit error, 1.13x |
+
+*The brief this slice was written from also carried "canon's `&`-fold (44 reaches)". 44 is
+bucket 4's TOTAL — the fold's 23 plus `unionMemberGenAppShape`'s 21. Two rows, one number.*
+
+### 2. BUCKET 4a IS THE ONE A CHECKER CHANGE MOVES — and the population is TWELVE spellings
+
+**PROBE ZZDU**, the same build with a per-reach dump instead of a counter (check-time records
+into an array the emit-time reset cannot see — the first version put them in the per-program
+array and read a clean, wrong ZERO):
+
+| origin | depth | ctx | spelling |
+|---|---|---|---|
+| `TypeRef`, tree live | **2** | `RC_ROOT` | `A&B` |
+| `TypeRef`, tree live | 1 | `RC_ROOT` | `{[boolean]:i32}&Foo` |
+| `TypeRef`, tree live | 1 | `RC_ROOT` | `(0\|1\|2)&!2` |
+| `TypeRef`, tree live | **2** | `RC_UNION_MEM` | `(2\|3)&!3` |
+| `TypeRef`, tree live | 1 | `RC_ROOT` | `Node&{v:i32}` |
+| `TypeRef`, tree live | 1 | `RC_ROOT` | `Pair&{a:S}` |
+| `UnionDecl` member | 1 | `RC_ROOT` | `A&B` · `T&S` · `A&E` |
+| `UnionDecl` member | 1 | `RC_ROOT` | `{a:i32}&{b:i32}` · `{a:i32,c:i32}&{b:i32,c:i32}` · `{c:i32}&{d:i32}` |
+
+**THE LSOFT BOUNDARY, MEASURED RATHER THAN ASSUMED.** The brief's constraint was *"without
+deciding the owner-blocked string-litunion canon rule"*. **Zero of the twelve is a string
+literal union.** The two literal spellings in the population are NUMERIC (`(0|1|2)&!2`,
+`(2|3)&!3`) and they reach the fold through `intersectTy`'s negation subtraction, which is a
+different rule from the one `unionAliasMembers` softens at `RC_ROOT`. The fold is not behind
+Lsoft, and nothing in this slice reads or writes that decision.
+
+**BOTH ORIGINS HOLD A PARSER TREE, AND BOTH ALREADY HAVE A READER.** A `TypeRef`'s root is
+`annTsOf(nodeIx)`; a `UnionDecl` member's is `udTsRootAt(nodeIx, k)` — the same read D-UDVARTY
+put into `checkProgram`'s union registration one pass earlier, on the *same member spelling*.
+#1288 measured both funnels at 100% coverage.
+
+### 3. THE CHANGE — the root is a PARAMETER, never a bank, and the recursion is what makes it total
+
+`canonEmitNameAt(name, ctx)` becomes a two-line forwarder to `canonEmitNameTs(name, ctx, -1)`,
+which holds the body. `canonEmitTypeNames`'s two rewrite sites — the only callers that hold a
+root — pass theirs. The fold's `nameToTy(name)` becomes `annotResolve(name, root)`.
+
+```
+  TypeRef arm      const c  = canonEmitNameTs(n.tyName, RC_ROOT, annTsOf(i))
+  UnionDecl arm    let   c2 = canonEmitNameTs(vs[vi],  RC_ROOT, udTsRootAt(i, vi))
+  the fold         const folded = annotResolve(name, root)
+```
+
+**WHY A PARAMETER AND NOT A BANK.** Canon's arms cut SUBSTRINGS; the parser banked a root for
+the whole spelling only. A module-level "current root" would have to be gated on *is this name
+still the one the root describes* — a whole-string equality, which is the exact construct this
+programme retires. As a parameter the question does not arise: every recursion enters through
+`canonEmitNameAt`, which passes -1, so a fold reached from inside a union member / array
+element / function parameter takes the NAME leg unchanged and by construction.
+
+**AND THE INVARIANT REPAIR THAT COMES WITH THE READ.** `ast.clearUdTs(nodeIx, k)` — `clearAnnTs`'s
+twin one table over. The `UnionDecl` arm rewrites `udVariants[k]` in place (a softened literal,
+a folded intersection, an application replaced by its structural shape), which is no more a
+rename than the `TypeRef` arm's rewrite is; the member table simply had **no post-canon reader**
+until the fold above became one. That is why the invariant is stated on this table now and was
+not before.
+
+### 4. THE DUAL-WRITE, AND ITS GRADING
+
+A build computing BOTH legs at every fold reach and comparing them with a STRICT structural
+walk (kind + every payload field, recursively, with a pair-cycle guard — *not* `tyEq`, whose
+nominal short-circuit and union flattening D-UDVARTY already measured as too weak for this job):
+
+| | reaches | took the ROOT leg | took the NAME leg | **disagreements** |
+| --- | ---: | ---: | ---: | ---: |
+| `tests/cases` (1,417 programs) | **25** | **23** | 2 | **0** |
+| `std` | **0** | 0 | 0 | — *coverage, not agreement* |
+| **SAB-KID** — the fold resolves the intersection root's FIRST KID | 25 | 23 | 2 | **19**, first witness `A&B old=never new={a: string}` |
+
+The 2 name-leg reaches are the two depth-2 rows in §2, exactly as the design predicts.
+
+*A first sabotage attempt — hand over the PREVIOUS node's live root — was discarded: it traps
+the compiler ("out of bounds array access") on the first file, because a root banked under an
+earlier program indexes a spelling arena that has been reset. A sabotage that kills the run is
+not a graded channel. A second — shift the root index by one — read `root=0/25`, i.e. it
+silently DISABLED the tree route instead of corrupting it, and a disabled route is not a wrong
+one. `SAB-KID` is the third and it is in-bounds by construction.*
+
+### 5. TWO SABOTAGES WITH NAMED WITNESS SETS, AND A THIRD THAT READS ZERO ON THE SAME LINES
+
+Six-channel corpus A/B (`abcorpus3.sh`, 1,699 files) of master's fixpoint against each poison:
+
+* **SAB-KID** (the ROUTE is wrong but live) — **8 witnesses**, 4 fields
+  (BUILDRC 0/1 · BUILDMSG · BYTES · RUNRC 0/1): `modules/plain-alias-ref-renamed/entry.vl` ·
+  `modules/plain-alias-ref-renamed/lib.vl` · `parser/type-decl-brace-intersection-multiline.vl` ·
+  `types/flat-shape-rejects-control.vl` · `types/intersection-object-merge.vl` ·
+  `types/struct-alias-transparent.vl` · `types/union-alias-stays-a-union.vl` ·
+  `unions/inline-shape-open-span-homes.vl`.
+* **SAB-NOFOLD** (the ARM never folds at all) — **10 witnesses**, the eight above plus
+  `soundness/intersection-param-sound.vl` and `types/intersection-annotation.vl`.
+* **SAB-NOUDCLEAR** (the `clearUdTs` half deleted) — **0 of 1,699 on all six fields.**
+
+**THE ZERO IS INFORMATIVE BECAUSE IT SITS ON THE SAME FUNCTION AS THE 8 AND THE 10.** Canon runs
+exactly ONCE per parse — `driver.vl`'s four `checkProgram` call sites each follow a fresh
+`parseProgram`, and `tsReset` empties `udTsNode`/`udTsRoot` with the node arena — so no second
+canon pass exists to read the stale member root, and the only other readers (pass 0a's union
+registration, `driver`'s module merge) are strictly earlier. The drop is the invariant, exactly
+as `clearAnnTs` was at #1288, and it is reported as one rather than as a fix.
+
+**NO NEW FIXTURE IS OWED** (#1259's standard: run the poison, look for the fixture in its
+witness set). Ten committed cases already entomb this arm.
+
+### 6. BUCKET 3 — the 63 are the LAST step of a NAME-only pipeline that is entirely the emitter's
+
+`monoInferListElem` / `monoInferLocalScalar` take `paramTyNames: string[]` and resolve each entry
+with `nameToTy`. The brief's question was *who consumes the synthesized name, and can the
+consumer take the structured type instead*. Measured, the direction is the other way round: the
+**consumer is checker-side** (`nameToTy`, in this file) and the **producer is emitter-side**, and
+the producer has no arena index to hand over because it never had one.
+
+`emit_mono.monoInstanceFor` builds `pinned` by string surgery from end to end —
+`monoArgTyName(...)`, `monoDeclAnnName(...)`, `monoSubstAnn(...)`, and literally
+`pinned.push(bind + "[]")`. There is no `i32` anywhere in that pipeline to pass instead.
+
+**THE POPULATION IS SIX SPELLINGS.** ZZDU over the corpus, both sites together:
+`i32` · `i32[]` · `f64[]` · `string[]` · `string` · `boolean`. Nothing composite ever reaches
+either site.
+
+**FILED, with the exact signature and the exact producer line.** The indices ARE computed inside
+the same function, ~190 lines above both call sites: `monoMakeInstance`'s param loop already runs
+`recordClonedNodeTy(nt, pinned[pj], pinKinds[pj])`, whose first statement is
+`let ty = nameToTy(name)`. Banking that `ty` into a parallel `pinnedTyIx: i32[]` there costs one
+push and makes both sites index-fed:
+
+```
+typecheck.vl (this partition, additive):
+  export function monoInferListElemTy(declIx: i32, paramTyIxs: i32[], localName: string): string
+  export function monoInferLocalScalarTy(declIx: i32, paramTyIxs: i32[], localName: string): string
+    — identical bodies with `pty = paramTyIxs[pi]` in place of `pty = nameToTy(paramTyNames[pi])`
+
+emit_mono.vl (the concurrent partition):
+  recordClonedNodeTy → also return the ty (or a sibling `recordClonedNodeTyIx`) so the loop can
+  push it; then the two call sites pass `pinnedTyIx` instead of `pinned`.
+```
+
+**NOT SHIPPED HERE, DELIBERATELY.** The checker half alone is an exported function with no
+caller — a code change with no witness, which this document's own rule says does not ship. It is
+one commit once the emitter half lands with it.
+
+### 7. THE 9 T-CLASS ROWS — the count reproduces EXACTLY, the family is 16, and the hand-off is REFUTED
+
+**THE CENSUS, REBUILT.** #1199's instrument from its description: an instrumented compiler banks
+every `TypeRef`'s PRE and POST name inside `canonEmitTypeNames`'s rewrite loop and a SECOND pass
+after the loop computes the candidate over the saved pre-names, so the probe cannot perturb what
+it measures. One diagnostic per record, with a per-record index in the message (the `tErrCoded`
+de-duplication #1274's method note warns about).
+
+```
+run:   vl check tests/cases --compiler zzp.wasm > zzpcases.out    # rc 1, the probe raises
+count: grep -c '^\[ERROR\]: ZZP' zzpcases.out                     # 10,263 records
+```
+
+| | this measurement (`771abe09`) | #1274 (`01b97c8a`) |
+| --- | ---: | ---: |
+| records | **10,263** | 7,717 |
+| canon rewrote | 377 (3.67%) | — |
+| **B2** (`tyToNominalName ∘ nameToTy`) agrees | **9,748 / 9,843 = 99.03%** | 7,221 / 7,316 = 98.70% |
+| **B2 disagrees** | **95** | **95** |
+| …canon-only / renderer-only / both | **59 / 12 / 24** | **59 / 12 / 24** |
+
+**THE DISAGREEMENT REPRODUCES TO THE ROW ON A CORPUS THAT GREW BY 35%.** That is the strongest
+statement available about the census's stability, and it is worth more than either number alone.
+
+**THE T CLASS IS 9, EXACTLY AS FILED** — an alias OF a generic application, canon expanding it
+structurally while the renderer answers the application:
+
+| pre | canon | nominal | rows |
+| --- | --- | --- | ---: |
+| `Y` | `{v:i32}` | `Box<i32>` | 4 |
+| `BoxI` | `{v:i32}` | `Box<i32>` | 2 |
+| `P` | `{a:i32,b:string}` | `Pair<i32,string>` | 2 |
+| `Alias` | `{v:i32}` | `Box<i32>` | 1 |
+| | | | **9** |
+
+**AND THE FAMILY IS 16, WHICH THE FILING DID NOT SAY.** Seven more rows are the identical shape
+with a *declared-struct* head instead of an application head — the arm that answers them is
+`structNameOfTy`, one rung above `genAppNameOfTy`, so they were never "the generic application
+the arena cannot spell":
+
+| pre | canon | nominal | rows |
+| --- | --- | --- | ---: |
+| `MyCat` | `{meow:i32}` | `Cat` | 3 |
+| `MyCat` | `{legs:i32}` | `Cat` | 2 |
+| `MyS` | `{n:i32}` | `Sx` | 1 |
+| `Inner<MyS>` | `Inner<{n:i32}>` | `Inner<Sx>` | 1 |
+
+**THE HAND-OFF IS REFUTED, AND THE REASON IS ONE SENTENCE.** #1274's P2 note reads
+*"`cPlainAliasNames` / `aliasRefIsPlainRoot` is where that already lives"*. Read:
+`cPlainAliasNames` is a `string[]` of alias NAMES and `aliasRefIsPlainRoot(root)` is a three-kind
+test (`TS_NAME` / `TS_APP` / `TS_NULL`) on a spelling node. Neither holds an arena index, neither
+is consulted at a render site, and both run at RESOLUTION time — they are the mechanism that
+makes `Y` resolve *through* to `Box<i32>`'s index in the first place. **They are the cause of the
+shared index, not a cure for it.** A registry keyed by arena index cannot separate two spellings
+that share one index by construction, and a registry keyed by NAME is the string this programme
+exists to retire. The T class needs the render SITE to carry the source's own spelling — W9's
+`renderEmit(ty, ctx)` — and it needs the #1122 transparency ruling settled first, because with
+that ruling in force there is a defensible argument that *both* current answers are wrong and the
+right one is `Y`.
+
+### 8. BUCKET 1c — the checker recorder the brief prescribed is REFUTED for one half and MISPLACED for the other
+
+**PROBE ZZUM.** At every `recordUnMemTys` row, compare the per-atom bridge answer
+(`unMemAtomTyIx`) against the arena `uMembers` of the row's own declared union type — with the
+same strict structural walk §4 uses. Also, one counter per `sTyIxOfName` CALL SITE.
+
+```
+ZZUM|rows=1139|nom=391|union=391|width=391|at=761|ok=317|bad=444
+     |s1=0|s2=1064|s3=0|s4=0|w=K0/string bridge=string arena=
+```
+
+**`unMemAtomTyIx` — the checker HAS an answer and it is a DIFFERENT answer.** 1,139 union rows
+are registered; **391** have a row name that resolves through `cUserTypes`, all 391 are `TyUnion`
+in the arena, and all 391 match on member WIDTH — so the alignment is right. Of the 761 comparable
+atoms, **317 agree and 444 (58.3%) disagree**, first witness `K0/string bridge=string arena=…`.
+
+The mechanism is `canonEmitTypeNames` sitting between the two: the checker resolved the member as
+the author spelled it (`K0`, a literal-union alias) and the emitter's bridge resolves the CANON'D
+atom (`string`). **A write-side recorder at the checker's union registration would therefore bank
+a value the bridge is not computing** — it would not retire the bridge, it would add a second,
+disagreeing answer. That is a refutation of the prescribed shape, not a scheduling note; the
+recorder that could retire this bridge has to be written by whoever performs the rewrite, which
+is canon, which is name-in/name-out by contract (W9).
+
+**`sTyIxOfName` — the whole population is ONE call site, and it is not a checker site.**
+**1,064 of 1,064** `resolveAnnot` reaches come from `emit_classify.internInlineShape`; the other
+three call sites (`emit_collect`'s `s.tdName` row, `internShapeAs`, `gaeEnsure`) reach it **zero**
+times each. `internInlineShape(nm)` is called with names the EMITTER composed from its own field
+tables (`uFieldElemName[ufn]`, a peeled element spelling) at sites with no annotation node and no
+checker-visible key — so there is nothing for a `typecheck.vl` recorder to key on. What those
+call sites DO have, sitting in the adjacent column, is the D5 sidecar the same tables already
+carry:
+
+```
+FILED, emitter partition:  internInlineShapeTy(nm: string, tyIx: i32) — the interner takes the
+                           arena index its caller already holds (`uFieldElemTyIx[ufn]` /
+                           `sFieldElemTyIx[...]`) and skips `sTyIxOfName` entirely; the 424
+                           distinct inline-shape spellings on the corpus stop being re-resolved.
+```
+
+*This is D-SLOTARENA's shape a third time: the answer was banked one rung below where it was
+being recomputed. It is also why nothing was shipped here — a write-side-only recorder in
+`typecheck.vl` cannot reach either half, and the brief's own instruction was to measure that and
+file instead of shipping.*
+
+### 9. EQUIVALENCE AND GATE — every rc taken BARE, never through a pipe
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,102,386 B** — and it is master `771abe09`'s own fixpoint (master's source compiled by it reproduces it at ONE compile), so the A/B baseline IS master's published compiler |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,102,713 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,102,713 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); the 7 is the tell the env var took |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
+| corpus A/B, six channels, **1,699 files** | 0 | **0 rows moved on every field**, graded by SAB-KID (8) and SAB-NOFOLD (10) |
+| fuzz A/B, **18,000 programs/side** (seeds 3301-3303 × depths 4/5/6 × plain/declared, `--branching --multiobs`, generated once with master's compiler) | 0 | `vl check` identical (118,982 lines/side) · `vl check --codegen` identical (121,690 lines/side) — **and it is a COVERAGE zero, checked rather than assumed: `grep -rl '&' fuzzcases \| wc -l` reads 0 of 18,000.** `fuzzgen.vl` emits no intersection spelling, so the generated corpus cannot reach this arm at all |
+| master's FROZEN source compiled by this head | 0 | `cmp` clean — **and VACUOUS, proved by an inverted control: SAB-KID, which breaks 8 corpus programs, ALSO reproduces it byte-identically.** `compiler/` and `std/` spell no `&` type |
+
+**SEED BOOTSTRAP: no split needed.** The gate starts from a freshly fetched published
+`seed-latest` and it compiles this branch's source (`refresh-compiler.sh` rc 0 on the first
+self-compile).
+
+**BYTE DELTA: 1,102,386 → 1,102,713 = +327 B.** A forwarder, a third parameter threaded through
+one body, two call-site arguments, and `ast.clearUdTs`'s binary search. Reported, not hidden.
+
+### 10. THE CHECKER-SIDE FRONTIER AFTER THIS SLICE
+
+| # | bucket | reaches | status | what it actually needs |
+|---|---|---:|---|---|
+| 4a | canon's `&`-fold | 25 | **SHIPPED** — 23 of 25 take the tree | — |
+| 4b | `unionMemberGenAppShape` | 4 distinct spellings | **W9**, unchanged | canon's name-in/name-out contract |
+| 3 | `monoInferListElem` / `monoInferLocalScalar` | 63 | **FILED**, §6, with both signatures and the producer line | one commit spanning `typecheck.vl` + `emit_mono.vl` |
+| T | the 9 alias-of-application rows | 9 (of a 16-row family) | **FILED**, §7 — hand-off REFUTED | `renderEmit` **plus** the #1122 transparency ruling |
+| 1c | `unMemAtomTyIx` | 2,085 resolutions | **REFUTED**, §8 — a checker recorder banks a different answer (444/761) | a recorder written by CANON, i.e. W9 |
+| 1c | `sTyIxOfName` | 1,064 resolutions, **all one call site** | **FILED to the EMITTER**, §8 | `internInlineShapeTy(nm, tyIx)` reading the D5 column beside the name |
+
+### METHOD NOTES
+
+* **RE-DERIVE THE UNIT, NOT JUST THE NUMBER — AND THE SECOND-HAND QUOTE IS WHERE UNITS DIE.**
+  D-SLOTARENA's table is correct: its rows are `resolveAnnot` CALL SITES inside `emit_rep.vl`.
+  Quoted forward one hop, "`unMemAtomTyIx` 2,083" became "2,083 calls of `unMemAtomTyIx`", which
+  is 2,359. Both numbers describe the same code and neither substitutes for the other. *This is
+  the sixth published count in this programme re-derived into a different unit.*
+* **A FILING CAN NAME A FUNCTION THAT DOES NOT EXIST AND SURVIVE FOUR SLICES.**
+  `inferListElemName` has been the bucket-3 row's name since #1288 and appears nowhere in the
+  tree; the sites are `monoInferListElem` and `monoInferLocalScalar`. The count against it was
+  right to the unit. *A number can be correct while the thing it counts is misnamed — check the
+  name against the tree before planning against the row.*
+* **THE MECHANISM A HAND-OFF NAMES CAN BE THE CAUSE OF THE PROBLEM RATHER THAN ITS CURE.**
+  `cPlainAliasNames`/`aliasRefIsPlainRoot` was filed as "where the alias's identity already
+  lives". It is where the alias's identity is DISCARDED — the predicate exists to make `Y`
+  transparent, which is exactly what gives `Y` and `Box<i32>` one index. *Read the named
+  mechanism before scheduling the slice that is supposed to use it.*
+* **A "RECORD IT ON THE CHECKER SIDE" PLAN NEEDS THE TWO SIDES TO BE ASKING THE SAME QUESTION.**
+  The checker and `unMemAtomTyIx` resolve the same union member and disagree on 444 of 761,
+  because canon rewrites the spelling in between. A recorder there would have shipped green (it
+  is write-only) and been wrong the moment anything read it. *Before banking a value for a future
+  consumer, run the dual-write against the consumer's CURRENT answer.*
+* **THREE SABOTAGES OF ONE FIVE-LINE CHANGE, AND TWO OF THEM WERE UNUSABLE FOR OPPOSITE REASONS.**
+  The previous-root poison TRAPPED the compiler on file 1; the shifted-index poison silently
+  turned the new route OFF (`root=0/25`) and therefore compared the old leg with itself. Only the
+  first-kid poison is both live and wrong. *A sabotage has to survive, and it has to stay on the
+  path it is poisoning; check the reach counter of the poisoned build, not just its output.*
+* **A COVERAGE ZERO IS A SENTENCE, NOT A TICK.** The fuzz A/B is identical on 18,000 programs and
+  `grep -rl '&'` reads 0 of them. The frozen rebuild is byte-identical and so is a poison that
+  breaks 8 corpus files. Both legs are reported as no-regression channels with the command that
+  proves they are vacuous *for this family*, which is the only honest way to carry them.
+
+<!-- APPEND-MARKER-CKFRONTIER-END -->
