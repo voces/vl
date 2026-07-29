@@ -5758,6 +5758,53 @@ function tsLeafTy(name: string) {
   declaredTyOfName(name)
 }
 
+// D-MAPKEYDIAG — the spelling node whose KEY the unsupported-map-key diagnostic
+// names, or -1 when this annotation opens no map spelling. THE STRUCTURAL DUAL OF
+// `tyname.mapSpellKeyName`'s GATE, which was this checker's last re-parse of a name
+// it had itself rendered.
+//
+// That gate is `name[0] == '{' && name[1] == '['` — deliberately WIDER than a whole
+// map span, because a LIST of boolean-keyed maps (`{[boolean]:i32}[]`) and a nullable
+// one (`{[boolean]:i32}|null`) are the same user mistake and must get the same
+// actionable message (`maps/error-unsupported-key-not-whole-span.vl` is the fixture
+// that keeps that width honest). Read STRUCTURALLY, that width is a descent down the
+// LEFT SPINE and nothing else, because `ast.tsToName` puts a child's first character
+// at index 0 for exactly three constructors:
+//
+//   `TS_ARR`   renders `kid + "[]"`
+//   `TS_UNION` renders `kid0 + "|" + …`
+//   `TS_ISECT` renders `kid0 + "&" + …`
+//
+// Every other node opens with a character that cannot be `{[`: `TS_PAREN`/`TS_FUNC`
+// with `(`, `TS_NEG` with `!`, `TS_APP` with its head IDENT, the leaves with their own
+// lexeme, and `TS_OBJ` with a `{` whose NEXT character is a field NAME (an IDENT) or
+// `}` — never `[`. So `i32 | {[boolean]:i32}`, `({[boolean]:i32})` and
+// `{v: {[boolean]:i32}}` keep the bare "unknown type" they get today, and the descent
+// carries no character comparison at all.
+//
+// Terminates because `tsMk` finishes a node only after its children, so a kid's arena
+// index is strictly less than its parent's and the walk strictly descends.
+function tsMapKeyNodeOf(root: i32) {
+  let ix = root
+  let out = -1
+  let going = true
+  while going {
+    going = false
+    if ix >= 0 {
+      const k = tsKind[ix]
+      if k == TS_MAP {
+        out = ix
+      } else if k == TS_ARR || k == TS_UNION || k == TS_ISECT {
+        if tsKidCount[ix] > 0 {
+          ix = tsKids[tsKidStart[ix]]
+          going = true
+        }
+      }
+    }
+  }
+  out
+}
+
 // ── `tsToTy` — the structural dual of `nameToTy` ─────────────────────────────
 // `nameToTy` below is the compiler's SECOND recursive-descent type parser: the
 // first one is `parseTypeName` (`compiler/parser.vl`), which had the annotation's
@@ -8236,17 +8283,24 @@ function tyReachesBrand(ty: i32, d: i32) {
 }
 
 // The expression-aware retry for a slot checked with the BARE structural
-// `assignable` (the map `.set` pair). `assignableExpr` is where every contextual
-// coercion lives — the scalar-literal brand adoption AND the object-literal
-// field-wise adaptation, which is the one a nominal STRUCT slot needs and which
-// `nomLitAdopts` deliberately cannot supply (relaxing a whole walk under an
-// object literal would waive the brands of its field VALUES too).
+// `assignable` — now ONE such slot, the map `.set` KEY. `assignableExpr` is where
+// every contextual coercion lives — the scalar-literal brand adoption AND the
+// object-literal field-wise adaptation, which is the one a nominal STRUCT slot
+// needs and which `nomLitAdopts` deliberately cannot supply (relaxing a whole walk
+// under an object literal would waive the brands of its field VALUES too).
 //
 // Gated on the destination actually carrying a brand, so a program with no `new`
 // — and a newtype program's brand-free slots — keep the bare structural check
 // they have today, byte for byte. Without the gate this would widen every map
 // slot to `assignableExpr`'s coercions, which is a real behaviour change and an
 // unrelated one.
+//
+// THE `.set` VALUE NO LONGER COMES HERE: that slot took the full `assignableExpr`
+// (the twin-grid slice below), which SUBSUMES this retry. The KEY deliberately did
+// not follow it — `checkIndexNode`'s map arm checks `m[k]`'s key with the bare
+// `assignable` too, so widening the key would make `.set` diverge from the
+// assignment path in the OTHER direction, which is the defect this pairing exists
+// to remove.
 function nomSlotAccepts(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if nwTyIxs.length == 0 { return false }
   if srcExpr < 0 { return false }
@@ -11387,6 +11441,19 @@ function checkCallNode(n: Call, ix: i32) {
           tErr("set expects 2 arguments, got " + i32ToStr(margs2.length), ix)
         } else {
           const k0 = checkNode(margs2[0])
+          // THE VALUE ARGUMENT IS A STORE INTO THE MAP'S VALUE SLOT, so it takes the
+          // SAME two contextual steps `xs.push(v)` takes into an array element and
+          // `m[k] = v` takes into the very same slot — `seedExpected` first, then the
+          // expression-aware `assignableExpr`. Without them `.set` was the one store
+          // position with the bare structural check, and the twin grid against
+          // `m[k] = v` read 34 CHKERR cells whose index-assignment spelling was OK:
+          // a float / exact-integer literal into an `f32` value, a member literal into
+          // a literal-union value, an object / array literal adapting field- or
+          // element-wise, and each of those again through a `V | null` or `f32 |
+          // string` value and through a map reached from an array element or a struct
+          // field. `assignableExpr` is not a second copy of those rules — it IS the
+          // one home the assignment path calls, so the two cannot drift.
+          if rt.mVal >= 0 { seedExpected(margs2[1], rt.mVal) }
           const v0 = checkNode(margs2[1])
           if rt.mKey < 0 {
             rt.mKey = k0
@@ -11403,15 +11470,11 @@ function checkCallNode(n: Call, ix: i32) {
           if rt.mVal < 0 {
             rt.mVal = v0
             tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
-          } else if (
-            !assignable(v0, rt.mVal) &&
-            !nomSlotAccepts(margs2[1], v0, rt.mVal)
-          ) {
-            // A map slot is one of the positions checked with the bare structural
-            // `assignable` rather than `assignableExpr`, so the newtype's
-            // literal-adoption rule has to be asked for explicitly here — otherwise
-            // `m.set("k", 1)` over a `{[string]: EntityId}` would be the one binding
-            // position a literal could not reach.
+          } else if !assignableExpr(margs2[1], v0, rt.mVal) {
+            // `assignableExpr` SUBSUMES the `nomSlotAccepts` retry this arm used to
+            // carry (that helper IS `assignableExpr` behind two gates), so the newtype
+            // literal-adoption rule the map slot needed — `m.set("k", 1)` over a
+            // `{[string]: EntityId}` — still fires, now as one rung instead of two.
             tErr(
               "set: expected " + tyToStr(rt.mVal) + ", got " + tyToStr(v0),
               ix,
@@ -19198,13 +19261,32 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
         // `{[f64]: V}`) has no hash in the map rep — report that directly (with the
         // supported set) instead of a bare "unknown type", naming the constructor in
         // play. An emitter/runtime-capability rejection, not a type error — the
-        // unsupported-lowering channel. The KEY CUT is the MAP-NAME grammar's, at its
-        // home (this read the private `mapShapeKeyName`, which WAS that home's body
-        // written out a second time).
+        // unsupported-lowering channel.
         // A SUPPORTED key with an unresolvable VALUE (`{[string]: nope}`) is not a
         // key problem — it keeps the bare "unknown type", so this arm asks the key
         // gate itself rather than "is there a key text at all".
-        const badKey = mapSpellKeyName(tn.tyName)
+        //
+        // D-MAPKEYDIAG: the key TEXT comes from the PARSER'S SPELLING TREE — the very
+        // `IDENT` lexeme the parser read — instead of being sliced back out of the
+        // name the parser built from it (`mapSpellKeyName`, this checker's last call
+        // into a rendered-type re-parse). `tsMapKeyNodeOf` is that cut's gate read
+        // structurally; see its header for why the LEFT-SPINE descent is exactly the
+        // `{[`-prefix test, character for character.
+        //
+        // `nameToTy` — not `tsLeafTy`, its leaf-rung twin that `tsToTyReal`'s own map
+        // arm asks — is DELIBERATE and the two agree in VALUE on every possible key: a
+        // key is a bare `IDENT`, so `nameToTy`'s composite arms all decline and it runs
+        // `primTyOfName` → `tpEnvTyOfName` → `declaredTyOfName`, which IS `tsLeafTy`.
+        // They differ only in a SIDE EFFECT — `nameToTy` re-enters the `unkTyPart`
+        // bank at depth 1 and clears it, which is what makes the `else` arm below
+        // print the whole-annotation form (`unknown type '{[string]:nope}'`) rather
+        // than the component form (`unknown type 'nope' within …`) its `nope[]` /
+        // `nope | i32` siblings print. That inconsistency is real and pre-existing;
+        // changing it here would smuggle a diagnostic change into a refactor whose
+        // whole evidence is byte-identity, so it is filed, not taken.
+        const mapKeyIx = tsMapKeyNodeOf(annTsOf(n.letType))
+        let badKey = ""
+        if mapKeyIx >= 0 { badKey = tsText[mapKeyIx] }
         if badKey != "" && !mapKeyTySupported(nameToTy(badKey)) {
           tErrUnsupported(
             "A " +

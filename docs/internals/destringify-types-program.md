@@ -33673,3 +33673,167 @@ sources arc's remaining work at the CHECKER was the DECLARATION name, and this s
 * **RE-DERIVE WITH A STATED RULE OR DO NOT PUBLISH A NUMBER.** The W10 `9` reproduces under
   neither of the two units the family admits (10 arms / 7 writings). This is the fourth published
   count this programme has re-derived and moved.
+
+## D-MAPKEYDIAG — W10 row 5 taken: the checker's last rendered-map re-parse becomes a LEFT-SPINE descent; and the sketch's `tsLeafTy` is REFUTED by a sabotage witness (off master `3252d1df`)
+
+Shipped alongside a checker fix (`m.set(k, v)`'s literal narrowing) in one PR, but the two are
+independent and were measured independently: the diagnostic route is byte-identical everywhere and
+the `.set` fix carries every witness in the run.
+
+### 1. What moved
+
+`checkLetDeclNode`'s unsupported-map-key diagnostic — **W10 residue row 5**, filed by #1288 as the
+one routable site left in the sources arc — no longer slices the key out of the name the parser
+built. It reads the parser's SPELLING TREE:
+
+```vl
+const mapKeyIx = tsMapKeyNodeOf(annTsOf(n.letType))
+let badKey = ""
+if mapKeyIx >= 0 { badKey = tsText[mapKeyIx] }
+```
+
+`tsMapKeyNodeOf` is new, and it is the structural dual of `tyname.mapSpellKeyName`'s **gate**, not of
+its slice. That gate is `name[0] == '{' && name[1] == '['` — deliberately wider than a whole map
+span, because a LIST of boolean-keyed maps and a nullable one are the same user mistake and must get
+the same actionable message. Read structurally, that width is a descent down the **LEFT SPINE and
+nothing else**, because `ast.tsToName` puts a child's first character at index 0 for exactly three
+constructors:
+
+| constructor | render | descends? |
+| --- | --- | --- |
+| `TS_ARR` | `kid + "[]"` | **yes** |
+| `TS_UNION` | `kid0 + "\|" + …` | **yes** |
+| `TS_ISECT` | `kid0 + "&" + …` | **yes** |
+| `TS_PAREN` / `TS_FUNC` | `"(" + …` | no |
+| `TS_NEG` | `"!" + …` | no |
+| `TS_APP` | head IDENT + `"<"` | no |
+| `TS_OBJ` | `"{"` + a field NAME (an IDENT) or `"}"` | no — never `{[` |
+| the leaves | their own lexeme | no |
+
+So the descent **is** the `{[`-prefix test, with no character comparison in it. It terminates because
+`tsMk` finishes a node only after its children, so a kid's arena index is strictly less than its
+parent's.
+
+### 2. THE SKETCH'S `tsLeafTy` IS WRONG, AND A SABOTAGE WITNESS IS WHAT SAID SO
+
+Row 5's filed diff sketch ended "…and resolve it with `tsLeafTy(badKey)` instead of
+`nameToTy(mapSpellKeyName(tn.tyName))`". `tsLeafTy` is the right function on the reasoning the sketch
+gives — it is the very rung `tsToTyReal`'s own `TS_MAP` arm asks, so the diagnostic would be asking
+the same question the resolver asked. **It is still not a drop-in, and the difference is not in the
+value.**
+
+The two agree in VALUE on every possible key by construction: a `TS_MAP` key is a bare `IDENT`
+token, so `nameToTy`'s composite arms (pipe, isect, paren, func, array, map, brace, `<`) all decline
+and it runs `primTyOfName` → `tpEnvTyOfName` → `declaredTyOfName`, which *is* `tsLeafTy`'s body.
+
+They differ in a SIDE EFFECT. `nameToTy` re-enters the `unkTyPart` bank at depth 1 and CLEARS it;
+`tsLeafTy` does not. The bank is what the `else` arm's `unknownTyText(tn.tyName)` reads one line
+later. So swapping the resolver silently changes an unrelated diagnostic:
+
+| spelling | today (`nameToTy`) | with `tsLeafTy` |
+| --- | --- | --- |
+| `{[string]: nope}` | `unknown type '{[string]:nope}'` | `unknown type 'nope' within '{[string]:nope}'` |
+| `nope[]` (control, arm not entered) | `unknown type 'nope' within 'nope[]'` | (unchanged) |
+
+The `within` form is arguably the better one — it is what the `nope[]` and `nope | i32` siblings
+already print, and the whole-name form here is an accident of a clobber rather than a decision. It
+is **not taken in this slice**, because this slice's entire evidence is byte-identity and a
+diagnostic change smuggled inside it would have no evidence at all. Filed as a one-word follow-up.
+
+**How it was found is the transferable part.** Sabotage SAB-1 below (delete the `TS_ARR` arm) moved
+a cell nobody predicted: `val_nope_arr` (`{[string]: nope}[]`, a SUPPORTED key). It moved because a
+failed descent leaves `badKey == ""`, so `nameToTy` is never called, so the bank is never cleared —
+the clobber, visible only because a sabotage stopped it happening. *A sabotage's unpredicted
+witnesses are data about the code, not noise in the harness.*
+
+### 3. Equivalence evidence
+
+A purpose-built **spelling grid**: 28 let-annotation shapes × {`Map()`, `Set()`, `null`} initializer
+× {`let`, `const`}, plus one function-local `const` each — **196 cells**, compared on verdict AND the
+full diagnostic text (not a prefix).
+
+**196 of 196 byte-identical.** The grid covers the actionable side (`{[boolean]:…}`, `f64`, `f32`,
+`i64`, `char`, a declared struct, a litunion alias, an unresolvable key), the three descending
+carriers (`[]`, `[][]`, `|null`, `[]|null`, `|i32`, `&Foo`), the four non-descending ones
+(`i32|{[…]}`, `({[…]})`, `{v:{[…]}}`, `()=>{[…]}`), the supported-key-with-bad-value shapes, and
+five unrelated unknown-type controls.
+
+Six-channel corpus A/B, 1,689 files: **1 differing**, and it is the new `.set` fixture (§5). **Zero
+pre-existing files move on any of the six channels**, so no diagnostic in the corpus changed.
+
+Frozen-source rebuild (master's own `compiler/` + `std/` built by both compilers): **byte-identical**
+(1,100,994 B both). Fuzz: check / check --codegen over 14,400 pre-generated cases identical, and an
+off-baseline 6-seed × 3-flag sweep identical — but see §6, both zeros are VACUOUS and the mechanism
+is grep-checkable.
+
+### 4. THREE CALIBRATIONS, EACH WITH ITS WITNESS SET NAMED IN ADVANCE
+
+One calibration is not a calibration, and a zero from an unproven instrument says nothing.
+
+| sabotage | predicted witnesses | measured | corpus |
+| --- | --- | --- | --- |
+| **SAB-1** delete the `TS_ARR` arm | `arr`, `arr2`, `arrnul`, `val_nope_arr` | **28 cells = exactly those 4 spellings × 7** | 1 file: `maps/error-unsupported-key-not-whole-span.vl`, CHECKMSG |
+| **SAB-2** delete the `TS_UNION`/`TS_ISECT` arm | `nul`, `arrnul`, `un_first`, `isect_first` | **28 cells = exactly those 4 × 7** | (same file) |
+| **SAB-3** ADD a `TS_PAREN` arm (over-wide) | `paren` | **7 cells = that 1 spelling × 7** | `maps/error-unsupported-key-not-at-head.vl` |
+
+SAB-1's corpus row is what makes the main run's corpus zero meaningful: the CHECKMSG channel IS live
+in this region, so 0/1,689 is a real zero and not a blind instrument.
+
+Two fixtures carry the entombment, and each FAILS under its sabotage (verified by running them
+against the sabotaged compilers, not by reasoning):
+
+* `maps/error-unsupported-key-not-whole-span.vl` gains an INTERSECTION line — the three lines are now
+  one per descent arm, so deleting any arm drops an `@error`.
+* `maps/error-unsupported-key-not-at-head.vl` is new: the four carriers that must NOT descend, in the
+  order `TS_UNION`-later-member / `TS_PAREN` / `TS_OBJ` / `TS_FUNC`.
+
+### 5. The `.set` fix in the same PR (for the record; it is a checker BEHAVIOUR change, not destringify)
+
+`m.set(k, v)`'s VALUE argument was the last store position checked with the bare structural
+`assignable`. It now runs `seedExpected` then `assignableExpr` — the same two steps `xs.push(v)`
+runs, and `assignableExpr` is the very function the `m[k] = v` assignment path calls, so the two
+cannot drift. Twin grid vs the `m[k] = v` control, 146 cells: map-store twin pairs agreeing on
+verdict AND stdout go **16/38 → 38/38** direct and **0/12 → 12/12** nested; 34 cells move CHKERR →
+OK, each printing exactly what its twin prints.
+
+Two axes were swept and MEASURED AS NEEDING NOTHING, which is worth as much as the fix:
+`Set`'s `.add` (7/7 twin pairs already agreed — its argument is a KEY, and a key is `string`/`i32`
+with no literal to narrow) and the `.set` KEY (`checkIndexNode` checks `m[k]`'s key with the bare
+`assignable` too, so routing it through `assignableExpr` would make `.set` diverge from the
+assignment path in the OTHER direction — `nomSlotAccepts` survives for exactly that one slot).
+
+### 6. VACUITY, stated rather than banked
+
+**The fuzz channel cannot reach either change, and the mechanism is checkable in the generated
+corpus, not argued.** Over the 14,400 cases generated for this run:
+
+| probe | count |
+| --- | ---: |
+| cases containing `.set(` | **0** |
+| cases containing `.add(` | **0** |
+| distinct map-key spellings generated | **1** — `{[string]`, 12,903 occurrences |
+| cases containing an index assignment | 2,420 |
+| cases containing `f32` | 2,752 |
+
+So the generator reaches the assignment path heavily and the `.set` method never, and it never emits
+an unsupported map key. Both fuzz zeros are vacuous **by construction**; they are reported as
+coverage of everything else, not as evidence about these two changes.
+
+### 7. METHOD NOTES
+
+* **A FILED DIFF SKETCH IS A HYPOTHESIS, AND THIS ONE WAS WRONG IN ITS LAST CLAUSE.** Row 5's sketch
+  was right about the tree, the node and the key text, and wrong about the resolver — for a reason
+  (`unkTyPart`'s lifetime) that is invisible at the call site and lives four hundred lines away.
+  *Re-derive the last hop of a sketch you did not write.*
+* **A SABOTAGE'S UNPREDICTED WITNESS IS THE FINDING.** Three of SAB-1's four witness spellings were
+  named in advance; the fourth (`val_nope_arr`) was not, and it is the only reason the `unkTyPart`
+  clobber is now written down. Predict the set, then read the whole set.
+* **"ITS ONLY CHECKER CALLER" WAS A THIRD OFF.** `mapSpellKeyName` has three call sites in
+  `typecheck.vl`, not one: this diagnostic (retired here), `nameToTyReal`'s map arm (the string
+  resolver's own body — by design, it is the fall-through for unpositioned entries) and
+  `canonEmitNameAt` (W9, design-blocked). The residue after this slice is **2**, both structural.
+* **STALE FILING LEFT BEHIND (for whoever owns `tyname.vl` next):** `mapSpellKeyName`'s header still
+  says it exists "to give an actionable diagnostic for an unsupported map key … which is why it
+  deliberately does NOT ask for the closing `}`". That rationale now lives in
+  `typecheck.tsMapKeyNodeOf`; the function's surviving callers are the two above plus
+  `emit_base.nameIsI32KeyedMap`, none of which is the diagnostic. Not edited here — file partition.
