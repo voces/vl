@@ -1840,6 +1840,24 @@ touched by it — `std:buffer` uses no closure fields.
    same program runs. **Inverted control:** the identical closure stored under an ORDINARY field
    name and called directly (`m.get(0)`) returns 1.5 correctly — so the defect is in the trap
    rewrite's result typing, not in f32 closures.
+
+   > **FIXED.** The inverted control was the whole diagnosis, one step further in: `m.get(0)` is a
+   > node the CHECKER typed, so the f32 classifier's typed-IR fast path answers for it, while the
+   > trap rewrite MINTS its member-call node and the fast path reads -1. Behind the fast path the
+   > f32 classifier's `Call` arm knew only an IDENT callee — the FIELD-CLOSURE arm that
+   > `exprIsF64` and `exprIsI64` both carry was missing, so the f32 result was bound into an i32
+   > local. One arm; `tests/cases/index/f32-closure-field-read.vl` pins it with the i32 twin, the
+   > ordinary-name control and f32 arithmetic over two trapped reads. The memory intrinsic is
+   > incidental — a `"[]"` returning a captured f32 fails identically.
+   >
+   > The bracket was HALF the defect. The rewrite mints a member-call node for the `a op b`
+   > operator-field route too, so an f32-returning `"+"` closure field emitted the same invalid
+   > module and was never filed; the one arm closes both
+   > (`tests/cases/objects/operator-field-f32-result.vl`).
+   >
+   > This also removes the FIRST of route 1's three refutations in §L5. The other two stand: the
+   > `v[0] += 3` cast-failure trap below, and the indirect-call-through-a-per-view-allocation cost
+   > that made route 2 the answer anyway.
 2. **A `"[]="` closure field whose body is a memory-store intrinsic stores nothing.**
    ```vl
    function mkview(base: i32) {

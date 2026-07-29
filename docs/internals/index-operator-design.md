@@ -237,8 +237,12 @@ ships.
    not yet threaded there.
 4. **The two §L7 closure-field defects** were re-measured against this change (both routes are
    independent and neither touches the other). Defect 1 — an f32-returning `"[]"` closure field
-   emitting an invalid module — reproduces UNCHANGED. Defect 2 — a `"[]="` closure whose body is a
-   memory store "storing nothing" — **does not reproduce on master**: the filed program prints `11`,
-   the value it wrote. Whatever it described is either fixed or was mis-measured; the entry is stale.
-   A third, newly seen: `v[0] += 3` on a closure-field trap TRAPS (`cast failure`) under both the
-   master and this compiler — the free-function route handles the same spelling correctly.
+   emitting an invalid module — reproduced UNCHANGED here and is **now fixed**: the f32 expression
+   classifier lacked the field-closure `Call` arm its f64/i64 twins carry, and the trap's minted
+   call node has no checker-recorded type to fall back on. The free route was never affected —
+   its rewrite mints an IDENT callee, which the arm the classifier *did* have resolves. Defect 2
+   — a `"[]="` closure whose body is a memory store "storing nothing" — **does not reproduce on
+   master**: the filed program prints `11`, the value it wrote. Whatever it described is either
+   fixed or was mis-measured; the entry is stale. A third, still live: `v[0] += 3` on a
+   closure-field trap TRAPS (`cast failure`) — the free-function route handles the same spelling
+   correctly.

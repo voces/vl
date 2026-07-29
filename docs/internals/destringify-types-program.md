@@ -33329,7 +33329,15 @@ as the monomorphizer's instance-registry discriminator (`monoKeys`). Removing it
 (which is out of scope by ruling). **10 censused decode sites → 1, and the 1 is a mint, not a
 consumer.** The ANON leg needs no marker at all: it is `isSName`, a table query.
 
-### THE DEFECT THE COLUMN EXPOSED — filed, NOT fixed here
+### THE DEFECT THE COLUMN EXPOSED — filed here, CLOSED in the change after
+
+> **CLOSED.** The rung is gone; every prediction below held to the cell.
+> `tests/cases/closures/closure-result-value-union-field-nested-composite.vl` (renamed off its
+> `-floor` suffix) now `@run`s, and its assertions were strengthened past the original `1` to read
+> both value-union arms out of the nested composite. Corpus A/B moved **exactly that one cell** over
+> 1,673 files (fields 3/4/6 — BUILDRC 1→0, BUILDMSG, RUNRC 1→0; `vl check` never saw it). The fuzz's
+> plain leg stayed byte-identical and the declared leg lost **exactly the two named REJECTs**.
+> Compiler byte delta: **−15 B**.
 
 `isSName(name)` is not the prefix test. The prefix matched anything BEGINNING `#anon`, so
 `"#anon3[]"` — an **ARRAY** of an interned shape, minted by `emit_collect`'s inferred-list
