@@ -143,8 +143,10 @@ warm):
 | master | 13,717 ms | 13,084 ms | 14,159 ms | 1,797 passed / 0 failed |
 | pooled | 4,763 ms | 4,640 ms | 4,739 ms | 1,797 passed / 0 failed |
 
-**2.8× on a 24-core box.** On the 4-core CI runner the ceiling is lower — expect
-27 s → ~10–12 s, not 27 → 10/2.8.
+**2.8× on a 24-core box.** On the 4-core CI runner the ceiling is lower. I
+predicted 27 s → ~10–12 s from this; §1.5.1 measured 19–21 s. Recorded as a miss:
+a local speedup does not transfer, and four cores plus the still-serial
+`vl run --batch` waves ahead of the pool are the reason.
 
 ### 1.5.1 What the runner actually did
 
