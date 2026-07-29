@@ -859,14 +859,19 @@ in-language GC knobs.
     is what moved the count from seven to five to two. It also said "the matrix is now asymmetric the
     OTHER way: eight load widths, one store width" — true until the store slice.)*
     The matrix is now symmetric for every scalar VL has; only the narrow 8/16-bit stores are absent.
-  - **Bulk host I/O.** Export `ioMem` and implement the staging ABI `scripts/vl-host` already
-    documents and probes for (`<name>Reserve` / `<name>Load`, plus an `rbyte` bulk sibling): today
-    source crosses at ONE host call per code point (~3.4M per self-compile) and emitted bytes at one
-    call per byte (~1M). **Cheaper alternative to weigh first:** wasmtime 47's
-    `ArrayRef::new_from_i8_slice` builds a GC array from a host byte slice in ONE memcpy — no linear
-    memory, no `ioMem`, no data section. It is **i8-only**, so it lands free the moment strings are
-    `(array i8)` (B7) and not before. Sequencing question, not a fork: if B7 comes first this bullet
-    shrinks to a driver-ABI change.
+  - **Bulk host I/O — the SOURCE-IN half shipped** (`perf-program.md` §6). The driver exports
+    `srcLoad` / `modKeyLoad` / `modSrcLoad` / `cliResultLoad`; a `__load_i32__` in those loops sets
+    `memUsed`, which materialises the memory the host stages through (exported as `memory` per P0.2
+    — no `.vl` file can name an export `ioMem`, so `StrIn::probe` gained one line and now probes
+    `ioMem` then `memory`). **4,565,054 host calls per self-compile became 279; the host's
+    `stage_program` phase went 192 → 135 ms, `vl fmt --check compiler` 577 → 518 ms**, peak RSS
+    unchanged. No `Reserve` (VL has no list-capacity primitive) and no seed split (the published
+    seed compiles it). **Still open: the OUT direction** — emitted bytes at one call per byte
+    (`rbyteAt`, ~1M per self-compile) and every diagnostic string, which want the mirror mechanism
+    (guest writes the memory, host reads it). **Cheaper alternative to weigh first for the OUT
+    half:** wasmtime 47's `ArrayRef::new_from_i8_slice` builds a GC array from a host byte slice in
+    ONE memcpy — no linear memory, no data section. It is **i8-only**, so it lands free the moment
+    strings are `(array i8)` (B7) and not before. Sequencing question, not a fork.
   - **The tier itself** — an allocator (bump/arena), a data section, and the `Buffer`/`Array<T>`
     escape (`collections-design.md` §OQ.7), designed once for FFI / SIMD / bulk-I/O rather than
     accreted as intrinsics. Not a second object model → `DECISIONS.md`.
@@ -892,7 +897,10 @@ in-language GC knobs.
   records are NOT this lever** (P1.2 is a declaration feature with zero emitter lines; the
   flat-able i32 sidecars are ~10% of self-time against the string layer's 33.6%) and names the
   adjacent one that IS: bulk host↔guest staging over the now-host-visible linear memory, whose
-  host half is already written and waiting on `ioMem` + `srcLoad` exports.
+  host half is already written and waiting on `ioMem` + `srcLoad` exports. **That staging item has
+  since shipped** (§6) — and it moved TIME, not memory: peak RSS read 511.2 → 511.3 MB, because the
+  GC-side accumulator is unchanged and only the host CALL was removed. Allocation is still this
+  bullet's problem.
 - 🟡 **B-ci. CI wall clock** (`docs/internals/perf-program.md` §1). `ci-native` crept 74 s → 89 s
   p50 / 106 s p90 by 07-29; the forensics over all 1,317 master-push runs say the creep is
   **not** compiler speed (the self-compile step is 9 s of 89) but three step-level costs: the
