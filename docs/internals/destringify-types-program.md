@@ -36486,9 +36486,14 @@ name. Under the soften it read `string|i32|null` and the probe's `"string"` matc
 under the preserve it reads `K|i32|null`, **no probe atom can ever equal `K`**, the
 scanner answers -1, `emitUnionListLitViaRefArm` returns 0 ("not applicable"), and the
 literal falls through to `emitUnionCoerce`'s value-atom LADDER — which is the path whose
-own header says what happens next: *"the ladder would tag the box with the scalar-list
-atom (`string[]`) instead of the arm's slot tag"* and *"the gate would emit the RAW
-wrapper into the box slot (invalid wasm)"*. Both halves of that warning fired at once.
+own GUARD COMMENT (`wasmEmit.vl`, the four lines above the `viaListArm` call) predicted in
+full: *"the gate would emit the RAW wrapper into the box slot (invalid wasm) and the ladder
+would tag the box with the scalar-list atom (`string[]`) instead of the arm's slot tag, so
+every `is` against the arm was silently FALSE"*. **The FIRST half is what fired** — the
+module holds a bare `struct.new 8` string-list wrapper flowing into a `(ref $uBox)` local,
+with no tag emitted at all — so the failure is the loud-at-validation one, not the silent
+mis-tag. The comment was written when this routing was ADDED, against exactly the fall-through
+it was added to prevent; the preserve re-opened that fall-through from the other side.
 
 **HOW IT WAS FOUND — deletion, then the module, then the one line.**
 
