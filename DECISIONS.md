@@ -340,6 +340,18 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   open-addressing table into a linear scan). Insertion-ordered iteration is the
   contract for BOTH keys — replay depends on it, so no scheme that reorders on
   rehash is admissible. (B6a)
+- **A map-value SLOT is keyed on the (KEY, VALUE) PAIR, and the slot is what the
+  emitter threads.** The map struct's only key-varying field is field 0 (`keys`:
+  the string-ref list wrapper, or the i32 list wrapper), so two slots agreeing on
+  the value and differing on the key are two LAYOUTS — `mvKeyI32` is the second
+  identity column and `repMapValSlotsTwin` refuses to merge across it. Chosen over
+  the alternative of threading the key as a second parameter beside every shape:
+  downstream of the intern the slot is SELF-DESCRIBING, one integer answering both
+  halves, so `mapTypeIdxOf`, the `cm*` emit accessors and the typed per-slot
+  scratch frames took no new argument. A value on the shared i32 `vals` list interns
+  no slot on either key, so "mono" is still a SENTINEL — but a PAIR of them
+  (`-1` string-keyed, `-4` i32-keyed), named once at `mapMonoShapeOfKey`, because a
+  resolver landing on mono must still say which of the two structs it means. (B6b)
 - **A typed-value map has ONE struct heap type per value type, resolved
   position-independently.** `{[string]:f32}` mints its own `mvMapTypeIdx` struct
   (its `vals` field differs from the mono `$mStructIdx`); a map in COMPOSITION (a

@@ -562,11 +562,32 @@ and needs nothing from vl beyond scalar exports.
   > iteration. A mirror-parity grid of every operation × value type × scope reads
   > PARITY with its string-keyed twin in every cell whose value rides the mono rep.
   >
-  > **Deferred, and a loud emit-tier reject until it lands:** a REF or WIDE value
+  > ~~**Deferred, and a loud emit-tier reject until it lands:** a REF or WIDE value
   > (`{[i32]: string}`, struct, list, `f64`/`i64`/`f32`) and the composition
   > positions (a struct/variant FIELD, an array ELEMENT, a map VALUE). Both need a
   > per-value i32-keyed map struct and the mv-slot plumbing around it; neither is
-  > silent — `vl build` exits 1 naming the value type or the position.
+  > silent — `vl build` exits 1 naming the value type or the position.~~
+  > **The VALUE half is DONE (B6b).** An mv slot's identity is now the
+  > (KEY, VALUE) PAIR, not the value alone — one column (`mvKeyI32`) beside
+  > `mvValName`, and every resolver that turns a value type into a slot takes the
+  > key beside it. So `{[i32]: V}` mints its OWN map struct for every V the
+  > string-keyed rep lowers (`string`, a struct, `i32[]`, `string[]`, `f64`,
+  > `i64`, `f32`, `V | null`, a union, a closure, a nested map), and downstream the
+  > slot is SELF-DESCRIBING: `mapTypeIdxOf`, the `cm*` emit accessors and the typed
+  > per-slot scratch frames needed no second parameter. The **closure-RESULT** and
+  > **MAP-VALUE** composition positions came with it. The parity grid — value type ×
+  > operation × scope × position, each cell twinned with its `{[string]: V}`
+  > spelling — reads **130 PARITY / 15 gap / 11 both-fail** over 156 cells, with all
+  > 96 direct-position cells at parity.
+  >
+  > **Still a loud reject, both FILED with their mechanism:** a struct/variant
+  > **FIELD** (13 cells — the field ROW records the map's VALUE name and VALUE type
+  > with the key erased, so it needs a key column on both field tables), and an
+  > array **ELEMENT** (kept deliberately: the `{[string]: V}` spelling of a
+  > list-of-maps store is itself invalid wasm for 12 of 14 value types today, so
+  > opening the i32 half would turn a clean reject into that — fix the string half
+  > first and the i32 half follows, since the ref-list element row already records
+  > the whole `{[i32]: V}` spelling).
 - ~~**Contextual f32 literals**: `let x: f32 = 0.5` and `f32-typed` call sites
   accepting bare literals without `as f32` noise. Sim code is f32-saturated;
   today's `.`-literal-defaults-to-f64 + lossy-rejection rules make every

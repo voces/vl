@@ -1,0 +1,118 @@
+// @run
+// @log aa
+// @log bb
+// @log z
+// @log 2
+// @log 7
+// @log 9
+// @log 2
+// @log 1.5
+// @log 5000000000
+// @log 2.5
+// @log 3
+// @log 2
+// @log 2
+// @log 4
+// The i32-keyed rep's REF and WIDE value types — `string`, a struct, `i32[]`,
+// `string[]`, `f64`, `i64`, `f32`, `V | null`, a closure and a nested map.
+// #1282 shipped `{[i32]: V}` for the MONO value set only (i32 / boolean / a
+// literal-union atom / a nullable atom — the ones that ride the shared i32 `vals`
+// list) and REJECTED the rest, because a ref/wide value needs a per-value map struct
+// and the mv layer minted one only for the string-keyed rep.
+//
+// THE FIX IS ONE COLUMN, NOT A SECOND MACHINE. An mv slot's identity was the VALUE
+// type; it is now the (KEY, VALUE) PAIR — `mvKeyI32` beside `mvValName`, and every
+// resolver that turns a value type into a slot takes the key beside it. The map
+// struct's ONLY key-varying field is field 0 (`keys`: the string-ref list wrapper or
+// the i32 list wrapper), so two slots that agree on the value and differ on the key
+// are two LAYOUTS and `repMapValSlotsTwin` refuses to merge them. Downstream the slot
+// is SELF-DESCRIBING — one integer answers both halves — which is why `mapTypeIdxOf`,
+// the `cm*` emit accessors and the typed per-slot scratch frames needed no second
+// parameter.
+//
+// Every cell below is spelled identically to a `{[string]: V}` twin in this directory
+// (`map-return-value-kinds.vl`, `map-f64-values.vl`, `map-i64-values.vl`,
+// `f32-valued-map.vl`, `list-valued-map.vl`, `function-valued-map.vl`), which is what
+// makes a divergence between the two reps a diff between two fixtures rather than a
+// judgement call.
+//
+// NOT HERE, AND THE REASON IS THE STRING TWIN: a UNION-valued map (`{[i32]: S | T}`)
+// runs on its own (parity-grid cell `local-idx.union`), but a program holding BOTH a
+// struct-valued and a union-valued map rejects "unsupported map value type" — and the
+// `{[string]: …}` spelling of that same pair rejects identically, on master too. It is
+// a pre-existing string-keyed coexistence hole, not an i32-keyed one, so pinning it
+// here would pin the wrong rep.
+type S = { x: i32 }
+
+function inc(n: i32) { return n + 1 }
+
+function go() {
+  // string values — the vals list is the string-ref list (`mkListIdx`/`mkArrIdx`),
+  // the exact pair the STRING-keyed rep uses for its KEYS.
+  const ms: {[i32]: string} = Map()
+  ms[1] = "aa"
+  ms[2] = "bb"
+  print(ms[1] ?? "z") // aa
+  print(ms[2] ?? "z") // bb
+  print(ms[9] ?? "z") // z — absent
+  print(ms.length)    // 2
+
+  // struct values — the vals list is the element's ref list, interned exactly as an
+  // `S[]` is.
+  const mt: {[i32]: S} = Map()
+  mt[1] = { x: 7 }
+  mt[2] = { x: 9 }
+  const s1 = mt[1] ?? { x: 0 }
+  print(s1.x) // 7
+  const s2 = mt[2] ?? { x: 0 }
+  print(s2.x) // 9
+
+  // list values — the vals element is the inner list WRAPPER.
+  const ml: {[i32]: i32[]} = Map()
+  ml[5] = [7, 8]
+  const xs = ml[5] ?? []
+  print(xs.length) // 2
+
+  // the WIDE scalars ride their own scalar vals lists (f64 / i64 / f32), not a ref
+  // list — the same three mv value kinds (11 / 10 / 13) the string twin uses.
+  const mf: {[i32]: f64} = Map()
+  mf[1] = 1.5
+  print(mf[1] ?? 0.0) // 1.5
+
+  const mi: {[i32]: i64} = Map()
+  mi[1] = 5000000000
+  print(mi[1] ?? 0) // 5000000000
+
+  const m32: {[i32]: f32} = Map()
+  m32[1] = 2.5
+  print(m32[1] ?? 0.0) // 2.5
+
+  // `string[]` values, and a `V | null` value on its niche.
+  const msl: {[i32]: string[]} = Map()
+  msl[1] = ["aa", "bb", "cc"]
+  const sl: string[] = msl[1] ?? []
+  print(sl.length) // 3
+
+  const mn: {[i32]: string | null} = Map()
+  mn[1] = "aa"
+  mn[2] = null
+  print(mn.length) // 2
+
+  // a CLOSURE value rides the closure fat-pointer ref list.
+  const mc: {[i32]: (i32) => i32} = Map()
+  mc[1] = inc
+  const f1 = mc[1] ?? inc
+  print(f1(1)) // 2
+
+  // a NESTED i32-keyed map: the outer slot's vals element is the INNER map's struct,
+  // which the ref-list element layer now resolves per KEY as well as per value. The
+  // inner `Map()` is SEEDED with that shape at the store (`emitMapSetValExpr`) — the
+  // seed the string-keyed path never needed while its inner map was mono, and whose
+  // absence made `{[string]: {[string]: string}}` invalid wasm on master.
+  const mm: {[i32]: {[i32]: i32}} = Map()
+  mm[1] = Map()
+  const inner = mm[1] ?? Map()
+  inner[2] = 4
+  print(inner[2] ?? 0) // 4
+}
+go()

@@ -487,10 +487,12 @@ import {
   msSetOfText,
   msSoleMemberTy,
   msSubNull,
+  mvInnerMapShape,
   mvListValKind,
   mvSlotNullable,
   mvSlotOfValNameFind,
   mvValInnerRlSlot,
+  mvValIsMap,
   mvValUnionHasNull,
   nameIsWholeSpanShape,
   // (`monoIsRowMatch` was imported here — its ONE caller now takes the arena route
@@ -585,17 +587,20 @@ import {
 } from "./emit_classify"
 import {
   atomEqOpcodeOfKind,
+  mapShapeKeyI32,
   msHasValKind,
   msIsValueUnion,
   msMemberValKindsOf,
   msSoloValKind,
   mvSlotOfTy,
+  mvSlotOfTyK,
   nullBoxTag,
   nullValKind,
   repIsRowMatchTy,
   repScanLim,
   scalarTagOfKind,
   tyDenotesFunc,
+  tyMapKeyIsI32,
   tyMapValOf,
   valBlockTypeOfKind,
   vbHeapIdxOfKind,
@@ -1796,7 +1801,12 @@ function isArmTagOfTy(ity: i32): i32 {
     if tyIsLitUnion(ity) { ak = 2 }
   }
   if ak >= 0 { return scalarTagOfKind(ak) }
-  if unMemIsMap(ity) { return mapSlotTag(mvSlotOfTy(tyMapValOf(ity))) }
+  // The arm's map slot is the (KEY, VALUE) pair off ONE `TyMap` hop — a union arm is a
+  // composition position the i32-keyed rep does not enter yet, but the pair is what the
+  // slot is keyed on, so it is threaded here rather than assumed string-keyed.
+  if unMemIsMap(ity) {
+    return mapSlotTag(mvSlotOfTyK(tyMapValOf(ity), tyMapKeyIsI32(ity)))
+  }
   if unMemIsRefElemArray(ity) {
     const sl = rlSlotOfTy(tyRefArrElemOf(ity))
     if sl >= 0 { return refArrSlotTag(sl) }
@@ -2461,7 +2471,8 @@ function emitMapUnionUnboxRead(body: i32[], name: string, fnIx: i32) {
   // SENTINEL: `mvSlotOfTy` answers -1 for an un-interned value exactly as the name
   // resolver does for a MONO/atom-valued map, and `mapTypeIdxOf(-1)` is that shared
   // `$mStructIdx` — so the two legs agree on the miss as well as on the hit.
-  const slot = mvSlotOfTy(tyMapValOf(narrowedArmTyOf(name)))
+  const armTy = narrowedArmTyOf(name)
+  const slot = mvSlotOfTyK(tyMapValOf(armTy), tyMapKeyIsI32(armTy))
   fbRefCast(mapTypeIdxOf(slot)) // the payload IS the map struct ref
   0
 }
@@ -4404,12 +4415,16 @@ function cmMapTy() { mapTypeIdxOf(cmSlot) }
 function cmValsWrap() { mvValsWrapOf(cmSlot) }
 function cmValsBack() { mvValsBackOf(cmSlot) }
 
-// True when the current op runs on the i32-KEYED rep. The KEY half of the shape
-// vocabulary (`-4` map, `-5` Set) — asked by every accessor below that has to pick
-// between the two keys lists, the two probe helpers and the two key scratch slots.
-// Everything NOT below is key-blind by construction: `cmSlot < 0` for both i32-keyed
-// shapes, which is the mono VALUE rep they are restricted to.
-function cmKeyI32() { cmSlot == -4 || cmSlot == -5 }
+// True when the current op runs on the i32-KEYED rep. TWO sources, because a map shape
+// carries the key in two different places depending on the VALUE:
+//   · the MONO-value sentinels `-4` (map) / `-5` (Set) — a value on the shared i32
+//     `vals` list interns no slot, so the key has nowhere else to live;
+//   · an mv SLOT's own `mvKeyI32` column — a REF or WIDE value interns a slot, and the
+//     slot's identity is the (key, value) PAIR, so the slot answers both halves.
+// Asked by every accessor below that has to pick between the two keys lists, the two
+// probe helpers and the two key scratch slots. Everything NOT below is key-blind by
+// construction — it reads the VALUE side, which the slot answers on its own.
+function cmKeyI32() { mapShapeKeyI32(cmSlot) }
 // The current op's keys-list WRAPPER / BACKING heap types: the string-ref pair for the
 // string-keyed rep, the i32 list pair for the i32-keyed one.
 function cmKeysWrap() {
@@ -4432,13 +4447,15 @@ function cmKeysBkLocal() {
   if cmKeyI32() { return mapI32Base + 1 }
   mapScratchBase + 6
 }
-// The current op's mapRef local: the shared mono scratch slot 0 (or the i32-keyed
-// frame's own, since the mono local is typed `(ref $mStructIdx)` and cannot hold the
-// i32-keyed struct), or this mv slot's typed frame slot.
+// The current op's mapRef local. An mv SLOT always uses its OWN typed frame slot —
+// asked FIRST, because that frame is already typed to the slot's map struct whichever
+// key rep the slot carries. Only the two MONO shapes have to choose between the shared
+// `(ref $mStructIdx)` scratch slot 0 and the i32-keyed frame's own (the mono local is
+// typed to the string-keyed struct and cannot hold the i32-keyed one).
 function cmMapRefLocal() {
+  if cmSlot >= 0 { return fnMvMapRefLocal(cmSlot) }
   if cmKeyI32() { return mapI32Base + 4 }
-  if cmSlot < 0 { return mapScratchBase }
-  fnMvMapRefLocal(cmSlot)
+  mapScratchBase
 }
 // The current op's vals-backing scratch local (grow/compact temporary).
 function cmValsBkLocal() {
@@ -4655,7 +4672,7 @@ function emitMapRecvKey(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // The KEY expression must match the receiver's key rep. The checker proves the pair
   // agrees, so a mismatch here means the receiver's shape resolved wrong — reject
   // loudly rather than emit a string ref into an i32 keys array (invalid wasm).
-  if mshape == -4 {
+  if mapShapeKeyI32(mshape) {
     if exprString(keyIx, fnIx) {
       return emitFail("emitProgram: i32-keyed map indexed with a string key")
     }
@@ -5141,7 +5158,10 @@ function emitMapKeys(body: i32[], recvIx: i32, fnIx: i32) {
   }
   // A Set's keys() runs on the mono machinery of its own KEY rep.
   const shape = mapShapeFoldSet(shape0)
-  const keyI32 = shape == -4
+  // The KEY rep, from the mono sentinel OR the mv slot's own column — the same question
+  // `cmKeyI32` asks. A `{[i32]: string}`'s `.keys()` is an `i32[]` even though its shape
+  // is an mv slot, so this cannot key off the sentinel alone.
+  const keyI32 = mapShapeKeyI32(shape)
   if !keyI32 && !slUsed {
     return emitFail("emitProgram: .keys() but string list type not collected")
   }
@@ -5713,6 +5733,14 @@ function emitMapSetValExpr(
   if mslot >= 0 && mvValKind[mslot] == 1 {
     svCtx.structIdx = mvValStructIdx[mslot]
   }
+  // A NESTED-MAP value (`{[K]: {[K2]: V}}`): seed the shape the inner `Map()` builds, so
+  // it `struct.new`s the map struct THIS slot's vals element is typed to. Unseeded it
+  // built the ambient mono string-keyed struct, which was silently right only while the
+  // inner map was itself string-keyed AND mono — the store half of the same defect the
+  // let / return / global boundaries were each taught separately. The seed goes into the
+  // CONTEXT, not the global: `emitExprExpect` writes the whole context over the pending
+  // seeds, so a global written after `expCtxHere()` is overwritten by the snapshot.
+  if mvValIsMap(mslot) { svCtx.mapSlot = mvInnerMapShape(mslot) }
   emitExprExpect(body, valIx, fnIx, svCtx)
 }
 

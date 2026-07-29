@@ -140,8 +140,9 @@ hatch").** All four are prerequisites for each other in practice:
   half (`describe`/`it`/`itSkip`/`beforeEach`/`afterEach`) beside the matchers.
   Shipped shape + the three divergences from the charter: `docs/internals/vl-test-design.md`.
 
-**P2 — wanted, not gating:** ~~i32-keyed Map/Set + `for k in map` (B6a)~~ **DONE** for the mono value
-rep (i32 / boolean / atom values); ~~contextual f32 literals~~ **DONE**; ~~`match` phase 2 — variant payload
+**P2 — wanted, not gating:** ~~i32-keyed Map/Set + `for k in map` (B6a)~~ **DONE** for every value
+type the string-keyed rep lowers (B6b extended the mv slot's identity from the VALUE to the
+(KEY, VALUE) pair); ~~contextual f32 literals~~ **DONE**; ~~`match` phase 2 — variant payload
 binding~~ **DONE** (`match cmd { Move{x, y} => … }`, punned fields; renaming + nested destructuring
 measured and deferred — B21 item 1); literal-union compact representation (A16); readonly
 fields / A9 variance; default params (B15a); SIMD over Buffer (unlocked by P0, not requested yet);
@@ -532,11 +533,17 @@ in-language GC knobs.
   `xs.push(...ys)` once variadics land); representation inference (§VL.7 — lower never-grown
   values to a header-less fixed array); `map`/`filter` build-side generics for `Map`/`Set` (A10);
   `.vl`-std migration once a module system exists. (design: `docs/guide/collections-design.md`)
-- 🟡 **B6a. `Map` + `Set`.** REMAINING: **i32-keyed Map/Set beyond the MONO value rep** — `{[i32]: V}`
-  ships for `i32` / `boolean` / literal-union-atom values as a binding / parameter / return / `| null`
-  (every other value type and every other position is a loud emit-tier reject); a ref/wide value
-  (`string`, struct, list, `f64`/`i64`/`f32`) needs a per-value i32-keyed map struct + its mv-slot
-  plumbing, and a FIELD / array-element / map-value position needs the same. Also: `map`/`filter` over
+- 🟡 **B6a. `Map` + `Set`.** REMAINING: **an i32-keyed map in a struct/variant FIELD or an array
+  ELEMENT** — `{[i32]: V}` now ships for every value type the string-keyed rep lowers (`string`, a
+  struct, `i32[]`, `string[]`, `f64`, `i64`, `f32`, `V | null`, a union, a closure, a nested map) as a
+  binding / parameter / return / `| null` / a closure RESULT / a map VALUE, because an mv slot's
+  identity is the (KEY, VALUE) pair (B6b). The two remaining positions are a loud emit-tier reject and
+  each has a filed mechanism: a FIELD row records the map's VALUE name and VALUE type with the KEY
+  ERASED (`sFieldElemName` / `sFieldElemTyIx`), so it needs a key column on both field tables; an
+  array ELEMENT is kept rejected DELIBERATELY, because the `{[string]: V}` spelling of a
+  list-of-maps store is itself invalid wasm for 12 of 14 value types today — fix that first and the
+  i32 half follows for free (the ref-list element row already records the whole `{[i32]: V}`
+  spelling). Also: `map`/`filter` over
   Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`. (Self-host native parity:
   string-keyed maps, delete, `Set`/`.add`/`.get`, and ref-valued maps (string/struct values, #319)
   landed; map-typed params are the remaining native map gap.)
