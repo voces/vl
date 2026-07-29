@@ -144,7 +144,7 @@ warm):
 | pooled | 4,763 ms | 4,640 ms | 4,739 ms | 1,797 passed / 0 failed |
 
 **2.8× on a 24-core box.** On the 4-core CI runner the ceiling is lower. I
-predicted 27 s → ~10–12 s from this; §1.5.1 measured 19–21 s. Recorded as a miss:
+predicted 27 s → ~10–12 s from this; §1.5.1 measured 15–21 s over four runs. Recorded as a miss:
 a local speedup does not transfer, and four cores plus the still-serial
 `vl run --batch` waves ahead of the pool are the reason.
 
