@@ -92,10 +92,21 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 >   application the arena cannot spell", 114 rows at `8c22fa06` — is 0**: #1274's `genAppNameOfTy`
 >   closed it, and the nine rows that still hold that PAIR of spellings have swapped sides (canon
 >   expands, the renderer names) and are class T. So B2/B3's schedulable content is **TRANSP 19 ·
->   LINSOFT 7 · UCOLL 4 (terminal by design) · UEXP 2 · ISECT 2 · TRANSP-INV 1**, and TRANSP is the
+>   ~~LINSOFT 7~~ · UCOLL 4 (terminal by design) · UEXP 2 · ISECT 2 · TRANSP-INV 1**, and TRANSP is the
 >   one with a measured emitter cost — **26 duplicate `uVariants` rows in 16 corpus programs**, one
 >   layout under two names, each an extra entry in the base of all three tag bands. *Do not quote a
 >   B3 total as a defect count; join it to B2 per record first.*
+>
+>   **LINSOFT IS CLOSED (2026-07-29, off `81f47aaf`) and B2's residue is 28.** Both renderers gained
+>   the un-aliased inline litunion spelling (`litUnionInlineNameOfTy`, the arena twin of canon's
+>   `litUnionPreserve` / `nulLitUnionPreserve` pair), so the class reads **0 on B2 and B3** — 11 rows
+>   on the shipped corpus, 7 owned by the `ctxKeepsLitUnion` leg and 4 by the `| null` leg, an exact
+>   partition proved by deleting each. The registration key that moved is the **STRUCT LAYOUT row**,
+>   countable off the module: master interns 42 rec-group heap types for the grown fixture where the
+>   head interns 41, and the one that vanishes is the string-field twin of an atom-field struct. Two
+>   `vl check`-clean invalid-wasm shapes close with it (a lambda's inferred return, a closure-valued
+>   map). *Its published direction column was wrong too — all 7 rows are `REND-ONLY`, not
+>   `6 REND-ONLY, 1 BOTH`; the class totals only close with seven.*
 
 ### Consumer-driven requirements — webcraft (`docs/webcraft-requirements.md`)
 
