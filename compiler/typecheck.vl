@@ -108,7 +108,7 @@ import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
 // The parser's SPELLING TREE (D-PARSETY, #1117) — what `parseTypeName` saw,
 // before it concatenated it into a name. `tsToTy` resolves from this instead of
 // re-parsing the concatenation.
-import { PIN_NONE } from "./ast"
+import { PIN_ANON, PIN_NONE, PIN_SIGKEY } from "./ast"
 import {
   TS_APP,
   TS_ARR,
@@ -1641,12 +1641,11 @@ let cObjPinTyIx = -1
 // exactly like `nodeTyIx` beside it, and reset with it.
 //
 // This replaces reading the fact off the node's NAME. The two handles the emitter
-// mints (`"=>ii>i"`, `"#anon3"`) announce themselves by a PREFIX on the `tyName`
-// column, and every consumer decodes that prefix itself: two arms here, two in
-// `emit_mono`, one at `emit_classify.paramCloSigKey`. The census called that "not a
-// grammar — retired by giving the pin its own column", and this is it. THIS commit
-// builds and POPULATES the column; the consumers still read the name, and flip in
-// the commit after (the dual-write phase D-PARSETY established).
+// mints (`"=>ii>i"`, `"#anon3"`) used to announce themselves by a PREFIX on the
+// `tyName` column, and every consumer decoded that prefix itself: two arms here,
+// two in `emit_mono`, one at `emit_classify.paramCloSigKey`. The census called
+// that "not a grammar — retired by giving the pin its own column", and this is it.
+// Only the MINT still bridges from the legacy string form (`synthPinKindOf`).
 let nodePinKind: i32[] = []
 let nodePinPay: string[] = []
 // The node index of the if-EXPRESSION currently being checked as a `let`/`const`
@@ -16763,12 +16762,6 @@ function objLitFieldsCorrespond(e: ObjLit, mt: TyObj): boolean {
   }
   true
 }
-// EMIT-TIME typed-IR coverage (C1 endgame): the monomorphizer CLONES a generic instance's body,
-// creating fresh annotation nodes whose type-param names are substituted to CONCRETE names — these
-// nodes fall PAST the checker-sized `nodeTyIx` (so a structural classifier reads -1 and falls back to
-// the name). Resolve the concrete substituted `name` and record it on the new node so the emitter's
-// arena-reading classifiers cover monomorphized instances too. `name` is already concrete (no TyVar),
-// so `nameToTy` resolves it under the empty type-param env. Idempotent; grows the flat table as needed.
 // EMIT-TIME typed-IR coverage (C1 endgame): copy the type the checker already recorded on `srcNode`
 // onto a SYNTHESIZED annotation node `destNode`. Used where the synthesis name is an emitter-internal
 // form `nameToTy` can't resolve (an interned anonymous shape `#anonN`), but the source param/expr node
@@ -16781,7 +16774,7 @@ export function recordNodeTyFrom(destNode: i32, srcNode: i32) {
   0
 }
 // The lazily-built placeholder `TyFunc` for closure pins — only its `is TyFunc`-ness is read (via
-// `nodeTyIsFunc`); the real signature rides the `=>sigkey` NAME elsewhere. Reset per program.
+// `nodeTyIsFunc`); the real signature rides the PIN COLUMN's payload. Reset per program.
 function funcPinTyIx() {
   if cFuncPinTyIx < 0 {
     const ps: i32[] = []
@@ -16822,32 +16815,39 @@ export function nodePinKindOf(ix: i32) {
 }
 // The pin PAYLOAD recorded for node `ix` — for `PIN_SIGKEY`, the `$fnsig` key the
 // monomorphizer resolved for the closure argument that pinned this parameter. ""
-// when the node carries no pin.
+// when the node carries no pin. THE read `emit_classify.paramCloSigKey` makes
+// instead of slicing the marker off the node's name.
 export function nodePinPayloadOf(ix: i32) {
   if ix < 0 { return "" }
   if ix >= nodePinPay.length { return "" }
   nodePinPay[ix]
 }
-export function recordClonedNodeTy(nodeIx: i32, name: string) {
+// EMIT-TIME typed-IR coverage (C1 endgame): the monomorphizer CLONES a generic instance's body,
+// creating fresh annotation nodes whose type-param names are substituted to CONCRETE names — these
+// nodes fall PAST the checker-sized `nodeTyIx` (so a structural classifier reads -1 and falls back to
+// the name). Resolve the concrete substituted `name` and record it on the new node so the emitter's
+// arena-reading classifiers cover monomorphized instances too. `name` is already concrete (no TyVar),
+// so `nameToTy` resolves it under the empty type-param env. Idempotent; grows the flat table as needed.
+//
+// `pin` is the node's PIN COLUMN entry (`PIN_*`), supplied by the mint. It is only
+// consulted when `nameToTy` declines, which is exactly when the name is an
+// emitter-internal handle rather than a type spelling:
+//
+//   PIN_SIGKEY — a monomorphizer closure pin. It IS a function type, so record the
+//     placeholder `TyFunc` and `nodeTyIsFunc` classifies it structurally. The real
+//     signature rides the pin column's payload, not this arena entry.
+//   PIN_ANON — an interned anonymous shape. It IS a struct-shaped object, so record
+//     the placeholder `TyObj` for `nodeTyIsStruct`. The real layout rides `sNames`.
+//
+// Both used to be decided HERE by prefix-testing `name` (`'='`,`'>'` / `'#'`,`'a'`,
+// `'n'`,`'o'`,`'n'`) — seven character compares reading a provenance marker out of
+// a column that is supposed to hold a NAME (census W11).
+export function recordClonedNodeTy(nodeIx: i32, name: string, pin: i32) {
   if nodeIx < 0 { return 0 }
   let ty = nameToTy(name)
   if ty < 0 {
-    // A monomorphizer closure-pin `=>sigkey` (an emitter sig encoding `nameToTy` can't parse) IS a
-    // function type — record a placeholder `TyFunc` so `nodeTyIsFunc` classifies the pin structurally.
-    if name.length >= 2 && name[0] == '=' && name[1] == '>' {
-      ty = funcPinTyIx()
-    } else if (
-      name.length >= 5 &&
-      name[0] == '#' &&
-      name[1] == 'a' &&
-      name[2] == 'n' &&
-      name[3] == 'o' &&
-      name[4] == 'n'
-    ) {
-      // An interned anonymous-shape `#anonN` (`nameToTy` can't resolve the synthetic name) is a
-      // struct-shaped object — a placeholder `TyObj` so `nodeTyIsStruct` classifies it structurally.
-      ty = objPinTyIx()
-    }
+    if pin == PIN_SIGKEY { ty = funcPinTyIx() }
+    else if pin == PIN_ANON { ty = objPinTyIx() }
   }
   while nodeTyIx.length <= nodeIx { nodeTyIx.push(-1) }
   nodeTyIx[nodeIx] = ty

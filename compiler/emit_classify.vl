@@ -80,6 +80,7 @@ import {
   nodeArrayElemIsNulStr,
   nodeArrayElemName,
   nodeNulStructInnerName,
+  nodePinPayloadOf,
   nodeRepTyIxOf,
   nodeTyCanonObjName,
   nodeTyIsLitUnionAlias,
@@ -9613,7 +9614,7 @@ export function synthTypeRef(name: string, pos: i32) {
   const n = mkTypeRef(name, pos)
   const pin = pinKindOfName(name)
   recordNodePin(n, pin, synthPinPayloadOf(name, pin))
-  recordClonedNodeTy(n, name)
+  recordClonedNodeTy(n, name, pin)
   n
 }
 
@@ -9621,24 +9622,25 @@ export function synthTypeRef(name: string, pos: i32) {
 // the synthesized name `name` carries. Every pin enters the arena through
 // `synthTypeRef` above — `mkTypeRef`'s only other caller is the PARSER, whose names
 // are source spellings and never handles — so classifying here covers the column
-// completely, and no consumer will need to re-read a marker off a `tyName` again.
+// completely, and no consumer needs to re-read a marker off a `tyName` again.
 //
 // The ANON leg is STRUCTURAL and needs no marker at all: an interned anonymous
 // shape is exactly a name the emitter's own row table claims (`isSName`), which is
-// the fact the `'#','a','n','o','n'` prefix test stands in for.
+// the fact the old `'#','a','n','o','n'` prefix test was standing in for.
 //
-// The ARRAY rung keeps this refactor INERT, and it is reproducing a DEFECT. The
-// prefix matches any name BEGINNING `#anon`, so an ARRAY of an interned shape —
-// `"#anon3[]"`, minted by `emit_collect`'s inferred-list synthesis — matches too,
-// and the node records the placeholder `TyObj` that says "this annotation is a
-// struct". It is an array. Dropping the rung is a one-line change and it makes
-// `tests/cases/closures/closure-result-value-union-field-nested-composite-floor.vl`
-// (an `@emit-error` FLOOR) lower and run correctly instead of rejecting at "ref
-// valtype with no interned shape", and removes two spurious fuzz REJECTs. That is a
-// behavior FIX and it belongs to a change that argues for itself, not to a column
-// move; the floor's expectation has to be rewritten with it. Filed in the W11 ledger.
+// The ARRAY rung is there to keep this refactor INERT, and it is reproducing a
+// DEFECT. The old prefix matched any name BEGINNING `#anon`, so an ARRAY of an
+// interned shape — `"#anon3[]"`, minted by `emit_collect`'s inferred-list synthesis
+// — matched too, and the node recorded the placeholder `TyObj` that says "this
+// annotation is a struct". It is an array. Dropping the rung is a one-line change
+// and it makes `tests/cases/closures/closure-result-value-union-field-nested-
+// composite-floor.vl` (an `@emit-error` FLOOR) lower and run correctly instead of
+// rejecting at "ref valtype with no interned shape" — measured as the ONLY corpus
+// cell that moves, over 1,673 files, six channels. That is a behavior FIX and it
+// belongs to a change that argues for itself, not to a column move; the floor's
+// expectation has to be rewritten with it. Filed in the W11 ledger row.
 //
-// The SIGKEY leg is the ONE decode that stays, and it goes through the marker's
+// The SIGKEY leg is the ONE remaining decode, and it goes through the marker's
 // documented home (`sigKeyPinPayload`) rather than re-spelling the compares. It
 // stays because the marker is still how `monoArgTyName` HANDS the key over — the
 // key doubles as the monomorphizer's instance-registry discriminator, so removing
@@ -20811,18 +20813,20 @@ function paramCloSigKey(fnIx: i32, name: string) {
       if p is Param {
         if p.parName == name {
           if p.parType >= 0 {
+            // A MONOMORPHIZED closure-pinned param announces itself in the PIN COLUMN,
+            // which also carries the `$fnsig` key as its payload (census W11) — so this
+            // reads the fact where it lives instead of prefix-testing the node's NAME.
+            // An unpinned param records nothing, so "" here is unambiguously "not a pin"
+            // and the annotation arms below get their turn.
+            const pin = nodePinPayloadOf(p.parType)
+            if pin != "" { return pin }
             const ty = P.nodes[p.parType]
             if ty is TypeRef {
               const nm = ty.tyName
               if nm.length > 2 {
-                // A MONOMORPHIZED closure-pinned param carries the bare `"=>sigkey"` — the
-                // PIN MARKER and its payload at their home (`sigKeyPinPayload`), which
-                // carries this site's own `length > 2` bound, so a non-empty answer is
-                // exactly the two character compares this line spelled out. The `strContains`
-                // arm below keeps the bound because it asks a DIFFERENT question of the same
-                // two characters (an arrow ANYWHERE, i.e. a real function-type spelling).
-                const pin = sigKeyPinPayload(nm)
-                if pin != "" { return pin }
+                // The `strContains` arm keeps the `length > 2` bound because it asks a
+                // DIFFERENT question of the same two characters (an arrow ANYWHERE, i.e. a
+                // real function-type spelling, not the pin's provenance marker).
                 // A NULLABLE-closure param (`((i32) => string) | null`, kind 19) OR a SOURCE
                 // function-type annotation `(params)=>ret`: derive its sig key so a non-i32 (e.g.
                 // f64) signature casts to the right functype, and — for a nullable closure whose

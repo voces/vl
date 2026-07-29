@@ -74,6 +74,7 @@ import {
   mkUnary,
   mkWhile,
 } from "./ast"
+import { PIN_SIGKEY } from "./ast"
 import {
   annArrowAt,
   annFnDecompose,
@@ -142,9 +143,11 @@ import {
   isSName,
   isUName,
   nominalizeFnType,
+  pinKindOfName,
   sFieldElemNameAt,
   sFieldIndex,
   sFieldTypeAt,
+  sigKeyPinPayload,
   sigKeyRetKind,
   structIndexByName,
   structIndexOfExpr,
@@ -1165,9 +1168,31 @@ function monoAnyBakedCallback(cbFnNames: string[]) {
 // false for byte-identity on the all-i32 call path. `cbFnNames` (parallel to params, "" = none)
 // bakes a non-capturing concrete callback into the instance as a direct call — see
 // `monoBakeCallback`. Returns 0, or -1 via `emitFail`.
+// THE PIN COLUMN for one instance's parameter list (census W11), built in a single
+// parallel pass keyed by param index — the same shape `cbFnNames` uses below, and
+// for the same reason: a per-parameter FACT belongs beside the parameters, not
+// coded into one of their strings.
+//
+// `monoMakeInstance`'s two readers — the function-value flag and the un-annotated
+// closure param's result pin — used to ask `pinned[i]` directly, each with its own
+// `pinned[i][0] == '='` / `[1] == '>'` pair and its own `length > 2` bound. They now
+// read `kinds`/`pays`. The bridge from the legacy marker is `pinKindOfName` +
+// `sigKeyPinPayload`, the marker's documented home, called once per parameter here.
+function monoBuildPinCol(pinned: string[], kinds: i32[], pays: string[]) {
+  let i = 0
+  while i < pinned.length {
+    kinds.push(pinKindOfName(pinned[i]))
+    pays.push(sigKeyPinPayload(pinned[i]))
+    i = i + 1
+  }
+  0
+}
+
 function monoMakeInstance(
   origFe: i32,
   pinned: string[],
+  pinKinds: i32[],
+  pinPays: string[],
   tvN: string[],
   tvV: string[],
   calleeIx: i32,
@@ -1196,11 +1221,8 @@ function monoMakeInstance(
     // (the instance body `call_ref`s through it; the argument side builds the
     // fat pointer) — the same flag a lifted lambda flips in `liftFnsInExpr`.
     let pv = 0
-    while pv < pinned.length {
-      const pvn = pinned[pv]
-      if pvn.length > 2 {
-        if pvn[0] == '=' && pvn[1] == '>' { fnValUsed = true }
-      }
+    while pv < pinKinds.length {
+      if pinKinds[pv] == PIN_SIGKEY { fnValUsed = true }
       pv = pv + 1
     }
     // Registry hit: point this call site at the existing instance.
@@ -1257,7 +1279,7 @@ function monoMakeInstance(
         }
         // C1 endgame: record the pinned CONCRETE param type on the instance's annotation node so the
         // emitter's structural classifiers cover this monomorphized param (not just the name fallback).
-        if nt >= 0 { recordClonedNodeTy(nt, pinned[pj]) }
+        if nt >= 0 { recordClonedNodeTy(nt, pinned[pj], pinKinds[pj]) }
         nps.push(mkParam(p3.parName, nt, -1))
       }
       pj = pj + 1
@@ -1306,13 +1328,17 @@ function monoMakeInstance(
               if pp is Param {
                 if pp.parName == rcal.identName {
                   const pn = pinned[pq]
+                  // The bound is the PAREN arm's own (a `(…)`-opening function-type
+                  // spelling is never two characters); the pin arm beside it no longer
+                  // needs one, reading the column rather than the name's first two.
                   if pn.length > 2 {
-                    if pn[0] == '=' && pn[1] == '>' {
-                      // An UN-annotated closure param's sig-key pin (`=>i>d`): only its f64 result
-                      // kind has no expression-form return inference, so type it concretely here.
-                      // The pin's payload (past the `=>`) is a `$fnsig` key — decode its result
-                      // through the shared seam (`sigKeyRetKind`), not a raw token-char compare.
-                      if sigKeyRetKind(pn.slice(2, pn.length)) == "f64" {
+                    if pinKinds[pq] == PIN_SIGKEY {
+                      // An UN-annotated closure param's sig-key pin: only its f64 result kind
+                      // has no expression-form return inference, so type it concretely here.
+                      // The pin's PAYLOAD is a `$fnsig` key — it rides the column beside the
+                      // kind, and its result decodes through the shared seam (`sigKeyRetKind`),
+                      // not a raw token-char compare.
+                      if sigKeyRetKind(pinPays[pq]) == "f64" {
                         nret = synthTypeRef("f64", -1)
                       }
                     } else if nameIsParenOpen(pn) {
@@ -1600,7 +1626,20 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
     // The annotation-driven binding path (`const c: (f64,f64)=>f64 = add`) bakes no callback — the
     // value escapes its call sites, so its body keeps the `call_ref`. Empty → no key/body change.
     const noCb: string[] = []
-    return monoMakeInstance(origFe, pinned, tvN, tvV, letInitIx, true, noCb)
+    const pinKinds: i32[] = []
+    const pinPays: string[] = []
+    monoBuildPinCol(pinned, pinKinds, pinPays)
+    return monoMakeInstance(
+      origFe,
+      pinned,
+      pinKinds,
+      pinPays,
+      tvN,
+      tvV,
+      letInitIx,
+      true,
+      noCb,
+    )
   }
   0
 }
@@ -1846,9 +1885,14 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
         cbFnNames.push(monoSpecializableCallbackName(args[ci], ctx))
         ci = ci + 1
       }
+      const pinKinds: i32[] = []
+      const pinPays: string[] = []
+      monoBuildPinCol(pinned, pinKinds, pinPays)
       return monoMakeInstance(
         origFe,
         pinned,
+        pinKinds,
+        pinPays,
         tvN,
         tvV,
         c.callFn,
