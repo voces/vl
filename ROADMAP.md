@@ -107,6 +107,27 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 >   `vl check`-clean invalid-wasm shapes close with it (a lambda's inferred return, a closure-valued
 >   map). *Its published direction column was wrong too — all 7 rows are `REND-ONLY`, not
 >   `6 REND-ONLY, 1 BOTH`; the class totals only close with seven.*
+>
+>   **TRANSP IS HALF CLOSED (2026-07-29, off `8970dea6`) AND TWO OF THE LINES ABOVE ARE REFUTED.**
+>   *(a)* The filing's "TRANSP needs W9's `renderEmit` plus the #1122 ruling" is wrong at the
+>   ruling: #1122 says the transparent alias must render STRUCTURALLY *because* `collectU`
+>   registers it as a one-variant union and pushes the member's name into `uVariants` — and under
+>   that same ruling the alias is not a union, so the row was never owed. `collectU` skips it now
+>   (`isTransparentObjAlias`) and the member renders as its declared NAME
+>   (`transparentMemberEmitName`, read by canon AND the `is` rewriter). **B2 29 → 20, B3 127 → 120,
+>   9 rows, and the two halves are inseparable — either alone is a cell DOWN.** Six positions of
+>   `MyCat | i32` go from broken to running (2 silent INVALID WASM, 4 emit rejects), each landing on
+>   its alias-free control's verdict. The remaining 10 TRANSP rows are the generic-APPLICATION and
+>   map-value members; the application rung is BUILT and measured (B2 → 11) and blocked on ONE cell,
+>   `fieldTypeCode`'s missing route for `type Holder = { c: Box<i32> }`, which is an emit reject on
+>   master too. *(b)* **The "26 duplicate `uVariants` rows in 16 programs" is NOT TRANSP's cost.**
+>   Joined on FILE against the B2 dump, TRANSP contributes **0 of the 26**: 17 are an INFERRED union
+>   registered twice (the arena walk's structural spelling against the checker's reverse-mapped
+>   `Cat|Dog` — a class the census structurally cannot see, since an inferred return has no
+>   annotation), 7 are UCOLL or UCOLL-in-kind, 2 are UEXP. TRANSP's own duplicate row was in the
+>   82-row "SAME spelling, by design" bucket the probe dismissed — `{MyCat}=(0:Cat)` beside
+>   `{Cat|i32}=(1:Cat)`, two `Cat` rows where the first union does not exist. *Intersect the file
+>   sets before inheriting a class attribution; two populations that read alike need not overlap.*
 
 ### Consumer-driven requirements — webcraft (`docs/webcraft-requirements.md`)
 

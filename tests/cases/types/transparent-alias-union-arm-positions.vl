@@ -1,0 +1,86 @@
+// @run
+// @log 5
+// @log 8
+// @log 5
+// @log 8
+// @log 5
+// @log 8
+// @log 5
+// @log 8
+// @log 5
+// @log 5
+// A TRANSPARENT one-member object alias (`type MyCat = Cat`) standing as a UNION ARM, in
+// every position the emitter classifies separately. `transparent-alias-is-narrow-union-arm.vl`
+// covers the `is` SPELLING for all four arms of the transparency rule; this covers the arm
+// that has a nominal route to lose — the OBJECT one — in the positions where losing it is a
+// miscompile rather than a spelling.
+//
+// On the parent every line below is broken, and the breakage is not uniform, which is why the
+// positions are swept rather than sampled:
+//
+//   global reassigned   INVALID MODULE  `type mismatch: expected (ref $type), found i32`
+//   local reassigned    INVALID MODULE  (same)
+//   parameter           emit reject     `only i32, …, or string parameters are supported`
+//   return              emit reject     (same, at the result)
+//   struct field        emit reject     `only i32 / boolean / string / array struct fields`
+//   list element        emit reject     (same, at the element)
+//
+// The cause is one row. `canonEmitName` rewrote the transparent alias to its member's
+// STRUCTURAL shape (`{n:i32}`), because `collectU` registered `type MyCat = Cat` as a
+// one-variant UNION and pushed `Cat` into `uVariants` — which made `collectS` skip `Cat` as a
+// standalone struct (`variantIndexOf` claims it), so the only interned spelling was the inline
+// one. The union arm then read `{n:i32}|i32`: a MIXED union whose struct arm is an anonymous
+// shape, in a program where the shape the value actually carries is the declared `Cat`.
+//
+// The fix deletes that row (`isTransparentObjAlias`, read by `collectU`) and lets the member
+// render as its declared NAME. Both halves or neither: with the row and the nominal render,
+// `Cat` is a variant box and a plain `MyCat` param is `ref valtype with no interned shape`
+// (#1122 measured it); without the row and with the structural render, the inline shape is no
+// longer interned and the same param is an emit reject. Each half alone is a regression; the
+// pair lands every cell on the alias-free control's verdict.
+type Cat = { n: i32 }
+type MyCat = Cat
+
+// A GLOBAL cell, reassigned across the arms: the cell type must be the union BOX. The parent
+// declared it `(ref $Cat)` — the bare struct — and the `d = 7` store had nowhere to go.
+let g: MyCat | i32 = { n: 5 }
+if g is MyCat { print(g.n) }
+g = 7
+if g is MyCat { print(g.n) } else { print(g + 1) }
+
+// The same cell as a LOCAL — a different classifier, the same row behind it.
+function localArm() {
+  let d: MyCat | i32 = { n: 5 }
+  if d is MyCat { print(d.n) }
+  d = 7
+  if d is MyCat { print(d.n) } else { print(d + 1) }
+}
+localArm()
+
+// A PARAMETER, reached with each arm.
+function takes(d: MyCat | i32) {
+  if d is MyCat { print(d.n) } else { print(d + 1) }
+}
+takes({ n: 5 })
+takes(7)
+
+// A RETURN, joined from both arms.
+function gives(c: boolean): MyCat | i32 {
+  if c { return { n: 5 } }
+  return 7
+}
+const a = gives(true)
+if a is MyCat { print(a.n) }
+const b = gives(false)
+if b is MyCat { print(b.n) } else { print(b + 1) }
+
+// A STRUCT FIELD carrying the union.
+type Holder = { w: MyCat | i32 }
+const h: Holder = { w: { n: 5 } }
+const hw = h.w
+if hw is MyCat { print(hw.n) }
+
+// A LIST ELEMENT carrying the union.
+const xs: (MyCat | i32)[] = [{ n: 5 }, 7]
+const e = xs[0]
+if e is MyCat { print(e.n) }
