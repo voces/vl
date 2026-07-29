@@ -37,6 +37,16 @@ the host reads them and pushes them in; repeat until the graph is closed.
     modReset()              clear the module table
     modKeyPush(c: i32)      accumulate the next module's KEY (resolved path)
     modSrcPush(c: i32)      accumulate the next module's SOURCE
+    modKeyLoad(count: i32)  BULK twin of modKeyPush — append the `count` UTF-32LE
+    modSrcLoad(count: i32)  BULK twin of modSrcPush — code points the host wrote
+                            at byte 0 of the module's exported linear memory.
+                            An ALTERNATIVE to the per-code-point push, not a
+                            sequence: the host uses it when the module exports it
+                            AND a memory, else it pushes. See
+                            `compiler/driver.vl`'s `srcLoad` header for the
+                            protocol and `perf-program.md` §6 for why (staging the
+                            compiler's own graph was 4.57M host calls, ~10% of a
+                            self-compile).
     modCommit(found: i32)   register (key, source) — found=0 marks "host could
                             not read this key" so the unresolvable diagnostic
                             fires instead of an infinite re-request

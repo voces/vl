@@ -152,6 +152,44 @@ export function srcPush(c: i32): i32 {
   vcCodes.push(c)
   0
 }
+// ── BULK SOURCE INTAKE over linear memory (`docs/internals/perf-program.md` §3.1)
+//
+// `srcPush` above is ONE HOST CALL PER SOURCE CODE POINT — staging the compiler's
+// own 4.6 MB of source is ~4.6M wasmtime trampoline crossings, measured at ~10% of
+// a self-compile's wall clock (the `[profile] stage_program` phase). The batched
+// ABI the host has always probed for (`StrIn` in `scripts/vl-host/src/main.rs`)
+// replaces N calls with N/16384: the host writes a chunk of UTF-32LE code points
+// into the module's exported linear memory at byte 0 and calls `<name>Load(count)`
+// once per chunk; this loop copies them out.
+//
+// Three facts make this the shape it is, and none of them are negotiable:
+//   * WasmGC has NO runtime memory→GC-array copy (`memory-gc-design.md` §2 #10 —
+//     `array.new_data` reads a build-time passive segment, not live memory), so
+//     the per-element loop is the ONLY mechanism. What is bought is the CALL
+//     boundary, not the element move.
+//   * `__load_i32__` is a linear-memory intrinsic, so its mere presence sets the
+//     emitter's `memUsed` and forces the memory section + the `memory` export.
+//     That is how a module that never says `std:buffer` acquires an `ioMem`.
+//   * There is no capacity primitive in VL, so no `<name>Reserve` is exported;
+//     `.push`'s 2× growth already bounds the copy at 2N and the host's `StrIn`
+//     treats `Reserve` and `Load` as independently optional.
+//
+// The staging window is `ioMem[0 .. 4*count)` — page 0 of the module's linear
+// memory, owned by this protocol. The compiler uses linear memory for NOTHING
+// else; anything that later does must not claim page 0.
+//
+// A dropped or duplicated code point here is a silently WRONG compile, so the
+// integrity gate is the fixpoint ladder (the compiler reads its own source through
+// this path) plus a content-hash probe over the corpus.
+export function srcLoad(count: i32): i32 {
+  let i = 0
+  while i < count {
+    const cp = __load_i32__(i * 4)
+    vcCodes.push(cp)
+    i = i + 1
+  }
+  0
+}
 export function vcSource(): string { fromCodePoints(vcCodes) }
 // Source positions (and owning module) for the `P.diags` entries that carry NO
 // token anchor: LEX diagnostics (`Diag.at` is a token index, which a lex diag
@@ -1325,6 +1363,36 @@ export function modKeyPush(c: i32): i32 {
 }
 export function modSrcPush(c: i32): i32 {
   modSrcAcc.push(c)
+  0
+}
+// The `modKey`/`modSrc` twins of `srcLoad` — see its header for the protocol, the
+// staging window and why the loop cannot be a bulk copy. `modSrcLoad` is the one
+// that matters: it carries EVERY module of a multi-file graph (the whole compiler
+// during a self-compile), and `modSrcPush` was the 5th hottest function in the
+// profile that motivated this. `modKeyLoad` carries only module keys (paths) and
+// is here because a half-converted family is the defect the classifier memo warns
+// about: the host probes each channel independently, so a channel left behind just
+// keeps paying per code point, silently.
+export function modKeyLoad(count: i32): i32 {
+  let i = 0
+  while i < count {
+    const cp = __load_i32__(i * 4)
+    modKeyAcc.push(cp)
+    i = i + 1
+  }
+  0
+}
+// The four loops are deliberately the SAME shape. A local-alias + byte-cursor
+// variant (`const acc = modSrcAcc`, `while off < count * 4`) was built and A/B'd
+// interleaved: 135 vs 139 ms of `stage_program` over 9 runs — under the floor, and
+// the box's load moved more than the edit did. Uniformity wins on a tie.
+export function modSrcLoad(count: i32): i32 {
+  let i = 0
+  while i < count {
+    const cp = __load_i32__(i * 4)
+    modSrcAcc.push(cp)
+    i = i + 1
+  }
   0
 }
 // Register the accumulated (key, source) pair. `found = 0` marks "the host could

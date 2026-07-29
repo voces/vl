@@ -350,7 +350,10 @@ flat/linear-memory tier's payoff in the compiler is not record layouts, it is th
 - It needs **no host change and no ABI break**: an old seed simply does not export
   them and takes the existing path. No A/B seed split.
 
-That is item 1 of §3.
+That is item 1 of §3. **It shipped; §6 records what it cost, what it bought, and
+the one clause above that was wrong** — "export it as `ioMem`" is not something a
+`.vl` file can do, so the host's probe was widened by one line. The seed-split
+half of the claim held: no split was needed.
 
 ---
 
@@ -361,7 +364,7 @@ self-compile unless stated.
 
 | # | item | expected | cost | risk | how it is measured |
 | --- | --- | --- | --- | --- | --- |
-| 1 | **Bulk host↔guest staging** — export `ioMem` + `srcReserve`/`srcLoad` (and the `modSrc`/`modKey` twins); the host's batched path activates itself | −4.6% self (`modSrcPush`) directly; `memory-gc-design.md` measures staging at ~10% of the self-compile | medium: compiler-side exports + a UTF-32LE append loop; **no host change**, graceful fallback already written | low — old seeds fall back, so no seed split | profile self-% of `modSrcPush` (target: ≈0); peak RSS of the self-compile; wall clock is too noisy alone |
+| 1 | ~~**Bulk host↔guest staging**~~ — **SHIPPED, §6.** `srcLoad`/`modKeyLoad`/`modSrcLoad`/`cliResultLoad` + the memory the emitter exports; the host's batched path activates itself | predicted −4.6% self (`modSrcPush`); **got** `modSrcPush` 4.74 → 0.00 self, `modSrcLoad` 2.23 self, and the host's staging phase 192 → 135 ms | one host LINE (the memory probe) + 4 compiler-side exports; the fallback was already written | low — old seeds fall back, no seed split (**held**) | profile self-% of `modSrcPush` (target ≈0); the host's own `[profile] stage_program` phase; wall clock is too noisy alone |
 | 2 | **Intern identifiers to i32 symbol IDs** | **19.10%** of self-compile time is `__str_eq__` under symbol/identifier consumers | large: touches scope slots, capture tables, module rename tables, field names, the string-keyed maps | medium-high — it is the checker's identity model | re-run §2's consumer split; the target is the SYMBOL row, and the TYPE row (6.08%) must not move |
 | 3 | **`nameNamesFunction`: index the arena once** | 4.71% self — it scans every node in `P.nodes` per call | small: a name set built in one arena pass, invalidated on arena growth | medium — it runs BEFORE `buildFnMap`, and emit-time monomorphization appends nodes; the invalidation is the whole correctness question | deterministic CALL + scan-step counts on two builds over the same input (a ~5% change is countable, and wall clock cannot resolve it); then profile self-% |
 | 4 | **`fnStmtsPosOf`: an index at the writers** | 4.82% self | medium — the function's own header states the honest fix is an index minted by `emit_mono`'s replacement writer, not a memo at the site | medium — a memo that caches the last answer is a silent miscompile the day a lower position holds a memoized node (the header says so) | same as #3; plus the corpus + fuzz A/B, since it is emit-path |
@@ -441,3 +444,268 @@ for a one-function file.
 | `string` is `(array (mut i32))` | `wasm-tools print build/vl-compiler.wasm` and read the type section; `array.new_fixed` of it is a string literal |
 | cold vs warm sidecar | delete `build/vl-compiler.wasm.cwasm` and re-run the SAME command. The cost is a constant ~1.85 s, so quote it as a constant, never as a ratio — the ratio is 290× on a one-function file and 8.9× on a 22 K-line one |
 | compiler byte-identity of a CI-only change | `git diff master --name-only -- compiler/ std/ scripts/` is empty, and `vl build compiler/entry.vl` `cmp`s equal to the seed |
+| §6's staging cut | `VL_PROFILE=1 vl build compiler/entry.vl --compiler <seed>` and read the `[profile] stage_program` line; interleave the two seeds, min of 9, state the load |
+| §6's fallback matrix | the same phase timer across the 2×2 of {old,new} host × {old,new} seed — exactly one cell is fast, and all four outputs `md5` equal |
+| §6's V8 leg | `node` a fresh `WebAssembly.Instance` and stage the same 4.57 M code points twice: `modSrcPush` per point vs `new Int32Array(memory.buffer)` + `modSrcLoad` |
+
+---
+
+## 6. Item 1 shipped — bulk source ingestion over linear memory
+
+The compiler's four string-INPUT channels no longer cross the host boundary one
+code point at a time. `compiler/driver.vl`'s `srcLoad` header owns the protocol;
+this section is the measurement and the ABI record.
+
+### 6.1 The cost, re-derived on this base
+
+`feac41f0`, the published `seed-latest`, six warm guest runs, **11,925 samples**:
+`modSrcPush` **4.77% self** (569 samples), `modKeyPush` 0.08%. That is the same
+number §2 recorded at `883dca44` (4.56%) inside its error bars — the target had
+not moved. (`srcPush` and `cliResultPush` read 0.00% here for a structural reason,
+not because they are cheap: a `vl build` of a graph never touches the single-source
+buffer, and the CLI pump is a different entry point. They are measured in their own
+right below, on `vl check` and `vl fmt`.)
+
+The guest profiler **cannot see the half that matters**, and the host's own phase
+timer can: `VL_PROFILE=1 vl build compiler/entry.vl` reports
+
+```
+[profile] stage_program: 186 ms      <- 4,565,054 host calls
+[profile] compile.call: 1498 ms
+```
+
+**~10.5% of a self-compile is staging** — matching `memory-gc-design.md` §1.3's
+independent ~10% — of which the guest-visible push is ~4.8% and the rest is the
+wasmtime trampoline, which is invisible to a guest sampling profiler by
+construction. **Quote the phase timer for this item, not the profile share.**
+
+### 6.2 What shipped
+
+Four exports, one loop shape, no new language surface:
+
+| export | accumulator | who feeds it |
+| --- | --- | --- |
+| `srcLoad(count)` | `vcCodes` | `vl build`/`run` on an import-free file |
+| `modKeyLoad(count)` | `modKeyAcc` | the H3 module fetch loop (keys) |
+| `modSrcLoad(count)` | `modSrcAcc` | the H3 module fetch loop (**the self-compile**) |
+| `cliResultLoad(count)` | `cliResultAcc` | the CLI pump's `CMD_READ_FILE` (**`vl check`/`fmt`/`test`**) |
+
+Each appends the `count` UTF-32LE code points the host wrote at **byte 0 of the
+module's linear memory**. The memory itself is not new API: a `__load_i32__` in
+those loops sets the emitter's `memUsed`, which emits section 5 (one page, 64 KiB)
+and — since P0.2 / ruling O4(i) — exports it automatically as `memory`.
+
+**The one claim in §2.2 that was wrong: "no host change."** §2.2 said to "export it
+as `ioMem`", and no `.vl` file can do that — the export name is fixed by the
+emitter, deliberately (a bespoke export name for the compiler's own memory would be
+language surface invented for one consumer). So `StrIn::probe` gained ONE line: it
+now probes `ioMem` and then `memory`. Widening a probe is back-compatible in both
+directions, which §6.5 proves rather than asserts.
+
+**No `<name>Reserve` is exported.** VL has no list-capacity primitive, so there is
+nothing for a capacity hint to do; `.push`'s 2× growth already bounds the copy at
+2N. The host treats `Reserve` and `Load` as independently optional, so this costs
+one failed lookup per channel at startup.
+
+**Not converted, and why.** `cliArgPush` (argv) and `cliDirNamePush` (one directory
+entry) carry tens of code points, not millions — 0.00% of every profile. The
+OUTPUT direction is a separate item and is untouched here: `rbyteAt` is still one
+host call per emitted byte (0.90–0.96% self, `[profile] readback: 19–30 ms`), and
+so are `cliCmdDataAt` / `cliCmdPathAt` / `modPendingAt`. They want the mirror-image
+mechanism (guest writes the memory, host reads it) and a separate measurement.
+
+### 6.3 Measured
+
+**Guest profile, same input both legs** (branch source; A = master's compiler,
+B = the branch's; six warm runs each, `$mNN` stripped):
+
+| fn | A (master) | B (branch) |
+| --- | ---: | ---: |
+| `modSrcPush` | **4.74% self** | **0.00%** |
+| `modSrcLoad` | — | **2.23% self** |
+| `modKeyPush` / `modKeyLoad` | 0.06% | 0.08% |
+| `modCommit` (incl — the token scan, unchanged work) | 5.03% | 5.23% |
+
+The residue is real and expected: WasmGC has no runtime memory→array copy
+(`memory-gc-design.md` §2 #10), so the element move survives; only the CALL is
+bought. A local-alias/byte-cursor rewrite of the loop was built and A/B'd — 135 vs
+139 ms, under the floor — and rejected in favour of four identically-shaped loops.
+
+**Host-side, wasmtime, interleaved min-of-11, `.cwasm` warm, 24-core box at load
+2.8–3.2** (the same A/B at load 4.7–7.0 read 192/135 — the DELTA is stable, the
+absolutes are not):
+
+| phase | master seed | branch seed |
+| --- | ---: | ---: |
+| `stage_program` | **190 ms** | **132 ms** (−30.5%) |
+| `compile.call` | 1,548 ms | 1,534 ms (noise; the sign is not stable) |
+| whole `vl build` | 1,795 ms | 1,728 ms (−3.7%) |
+
+**The self-compile's total wall clock is NOT the headline** — the staging phase is
+~10% of it and the rest is noisier than the win. The phase timer is the instrument.
+
+**Tools, interleaved min-of-11, same box and load:**
+
+| task | master | branch |
+| --- | ---: | ---: |
+| `vl fmt --check compiler` | 528 ms | **476 ms** (−9.8%) |
+| `vl check compiler/entry.vl` | 941 ms | **884 ms** (−6.1%) |
+| `vl check compiler/typecheck.vl` | 226 ms | **211 ms** (−6.6%) |
+
+`vl fmt` gains most because it reads the most source per unit of work — which is
+the general shape of this item: **it pays in proportion to bytes-in over
+work-done**, so the tools benefit more than the compiler does. §4's table moves by
+these amounts and is otherwise unchanged.
+
+**V8 (Node), the same ABI, same 4,565,054 code points, min of 7 alternating legs:**
+
+| leg | ms |
+| --- | ---: |
+| per-code-point `modSrcPush` | 40.5 |
+| `new Int32Array(memory.buffer)` + `modSrcLoad` | **27.7** |
+
+**1.46× on V8 vs 1.42× on wasmtime — but note the absolute scale:** V8 stages in
+40 ms what wasmtime takes 192 ms to stage. A JS→wasm call is already cheap, so the
+V8-side saving is ~13 ms against a ~560 ms V8 self-compile (~2%). The deno corpus
+harness still uses `pushString`/`srcPush` and is deliberately left alone: its files
+are tens of lines.
+
+**Peak RSS is unchanged** — 511.2 MB → 511.3 MB (`wait4` on a fresh child). The
+extra 64 KiB page is 0.01%, and the GC-side accumulator is exactly what it was.
+**This item buys time, not memory.**
+
+**Byte delta:** the compiler is 1,111,882 → **1,112,716 bytes (+834)**.
+
+### 6.4 What the ABI record says
+
+- `compiler/driver.vl` — `srcLoad`'s header: the protocol, the staging window
+  (`ioMem[0 .. 4*count)`, page 0, owned by this protocol and used for nothing
+  else), the three constraints that force a per-element loop, and why there is no
+  `Reserve`.
+- `scripts/vl-host/src/main.rs` — `StrIn`'s header: the probe order and the
+  both-directions compatibility argument.
+- `docs/internals/cli-design.md` — `cliResultLoad` in the exports block.
+- `docs/internals/native-modules-design.md` — `modKeyLoad`/`modSrcLoad`.
+- `docs/internals/memory-gc-design.md` §1.3 — the "the emitter half does not
+  exist" note, now closed with its number.
+
+### 6.5 Fallback compositions — proved, not assumed
+
+Both halves of the ABI are optional and are probed independently, so all four
+compositions must work. The witness is the phase timer (the bulk path is ~55 ms
+faster on this input) plus the md5 of the compiler each cell produces:
+
+| composition | `stage_program` (min of 5) | output |
+| --- | ---: | --- |
+| old host + old seed | 186 ms | `e7906fc95c7c` |
+| old host + **new** seed | 185 ms | `e7906fc95c7c` |
+| **new** host + old seed | 190 ms | `e7906fc95c7c` |
+| **new** host + **new** seed | **131 ms** | `e7906fc95c7c` |
+
+**Exactly one cell takes the bulk path, and all four produce the byte-identical
+compiler** (which is also `cmp`-equal to the branch seed, so the fixpoint holds in
+every cell). The old host does not see a `memory` export and does not look for one;
+the old seed exports no `*Load`. A second, independent witness for the old-seed
+half: the Node harness prints `NOT EXPORTED by this module` for the master seed.
+
+**Seed-bootstrap: no split.** The published `seed-latest` (1,111,882 bytes) compiles
+this branch's source directly — `__load_i32__` and the automatic memory export both
+predate it (#1170, P0.2). PR A/B was not needed and is not used.
+
+### 6.6 Gate
+
+`rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` → fetched 1,111,882 bytes;
+`refresh-compiler.sh --prove-fixpoint` → fixpoint at 2 compiles, 1,112,716 bytes;
+`native-fixpoint.sh` → stage3 == stage4; `SELFHOST_NATIVE_ALIGN=1 deno task test`
+→ **3,599 passed / 0 failed / 7 ignored** (3,594 + this PR's 5), the ignored SET
+identical to master's (all seven in `cases_wasm_test.ts`); `lint-self.sh` clean;
+`rep-fuzz-check.sh` exact (1 baselined, 0 new, 0 stale).
+
+**Six-channel corpus A/B** (master-built vs branch-built compiler, `-o` path
+normalized): **1,712 files, all six fields `same`.**
+
+**Fuzz A/B**, 14 seeds × 3 depths × 300 = 12,600 programs per leg: identical
+finding sets (160 each, same md5). **Comparator sensitivity confirmed at a
+fraction of that volume** — sabotage A as the B leg gives 6 findings vs 0, a
+7-line diff. Note WHY it reddens: `scripts/fuzzgen.vl` is 52 KB, four chunks, so a
+broken intake cannot compile the fuzzer's own generator. The fuzz channel is
+therefore not evidence about generated-program SHAPES here; it is evidence that
+the harness noticed at all.
+
+**A cold `.cwasm` sidecar fails a test that is about neither the sidecar nor the
+compiler.** One suite run reddened at
+`vl_check_hygiene_test.ts: glob match took 33779ms — backtracking regression`. The
+glob was fine: the sabotage harness had deleted `build/vl-compiler.wasm.cwasm`, and
+`deno test --parallel` on 24 cores then had every spawned `vl` Cranelift-compile the
+1.1 MB seed at once. Warming the sidecar with one `vl check` took the whole suite
+37 s → 4 s and the failure vanished. §4 records the cold cost as a ~1.85 s CONSTANT;
+under a parallel spawn storm it is that constant times the fan-out. **Warm the
+sidecar before any suite run you intend to read a number from.**
+
+**A new suite, `tests/selfhost_native_bulk_intake_test.ts` (5 tests, 80 ms),** is the
+standing gate: it asserts the ABI is exported at all, that the staging window is a
+whole 64 KiB page (both sides derive the chunk size from it), and that bulk-in ==
+push-in EXACTLY at 0 / 1 / cap−1 / cap / cap+1 / 2·cap / 2·cap+7 code points and
+over astral characters. **Sabotage-verified against both §6.7 compilers**, and it
+names the defect where a ladder only says "parse error":
+`length mismatch at 1 code points` (A) and `length mismatch at 16384 code points`
+(B). It reaches the seam without a 16 KB fixture because the payload is generated.
+
+### 6.7 Integrity sabotages — and which instrument was actually load-bearing
+
+A bulk copy that drops or duplicates a code point is a silently WRONG compile, so
+both sabotages attack CONTENT, and both were run through every channel.
+
+**Sabotage A — drop the last code point of every chunk** (`while i < count - 1`,
+all four loops; fires on every file of any size).
+
+| witness | reading |
+| --- | --- |
+| self-compile (fixpoint rung 1) | **TIMEOUT** — a truncated module KEY never resolves, so the H3 fetch loop re-requests it forever |
+| `vl check compiler/typecheck.vl` | rc 1 — `"P" is not exported by "./ast"` |
+| `vl fmt --check compiler` | rc 2 — parse error, then every file "not formatted" |
+| `vl check`/`build` of a SMALL corpus case | **rc 0 — clean.** The dropped code point is the trailing newline |
+| six-channel corpus A/B | **97 of 1,712 rows differ** — but 95 of them are `BUILDRC(*/124)`, i.e. the fetch-loop hang, and only **2** are genuine content divergence (`scripts/fuzzgen.vl`, `tests/cases/literals/long-literal-chunked.vl`) |
+
+**Sabotage B — drop one code point only at a FULL-CHUNK SEAM** (`if count == 16384
+{ i = 1 }`; fires only on a file that spans more than one chunk).
+
+| witness | reading |
+| --- | --- |
+| self-compile | **rc 1, loud** — `parse error … "P" is not exported by "./ast"` |
+| `vl check compiler/typecheck.vl` | rc 1 |
+| `vl fmt --check compiler` | rc 2 |
+| small corpus case | rc 0 — clean, correctly (one chunk) |
+| corpus A/B | 26 of 1,712 rows |
+
+**Three findings worth more than the green run:**
+
+1. **The BYTES channel — field 5, the one you would reach for — read `1712 same`
+   under BOTH sabotages.** A corrupted intake makes a build FAIL, it does not make
+   it emit different bytes, and field 5 only compares when both legs return 0. For
+   a source-intake defect the live channels are CHECKRC/CHECKMSG/BUILDRC/BUILDMSG.
+2. **The corpus barely covers the chunk seam.** `cap` is `memory_size / 4` =
+   **16,384 code points ≈ 16 KB**, not 64 KB. Exactly **3** of the 1,712 corpus
+   files exceed one chunk (`std/buffer.vl`, `scripts/fuzzgen.vl`,
+   `tests/cases/literals/long-literal-chunked.vl`), and sabotage B's other 23 rows
+   are cases that merely IMPORT `std/buffer.vl`. **22 of the compiler's 26 files
+   exceed one chunk** — the fixpoint ladder is the seam instrument, and the corpus
+   is a bystander that happens to own three files.
+3. **A hang is a witness, but it is a bad one, and it breaks the comparator.**
+   `abcorpus3.sh` has no per-invocation timeout, so sabotage A did not redden it —
+   it hung it, spawning ~1,600 immortal `vl` processes. Use the `TMO`-bearing
+   variant when the B leg is a deliberately broken compiler; rc 124 is a divergence
+   like any other.
+4. **The fuzz channel reddens for a reason that is not about fuzzing.**
+   `scripts/fuzzgen.vl` is 52 KB — four chunks — so a broken intake cannot compile
+   the fuzzer's own GENERATOR, and the run produces no findings at all. Treat that
+   as "the harness noticed", not as shape coverage. The generator emits programs of
+   tens of lines; it can never reach a chunk seam by construction, exactly as the
+   3+-atom value-union sabotage could never be reached (`vl-compiler-profiling`,
+   the limits-of-fuzz finding).
+
+**What would have caught this WITHOUT the sabotages.** The honest answer is: the
+fixpoint ladder, and nothing else that runs by default — which is why
+`tests/selfhost_native_bulk_intake_test.ts` now exists. It reaches the seam with a
+generated payload instead of a fixture, in 80 ms instead of a ladder, and it names
+the size at which the intake diverged.

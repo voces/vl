@@ -132,11 +132,12 @@ The `vl` host and the compiler talk over an all-scalar ABI, because a GC ref can
 cross a wasm import/export boundary usefully and there is no memory to stage
 through. So:
 
-- **Source in:** `srcPush(c: i32)` / `modSrcPush(c: i32)` — **one host call per code
-  point**. Staging the compiler's own 3.36 MB of source is ~3.4M calls.
+- **Source in:** ~~`srcPush(c: i32)` / `modSrcPush(c: i32)` — one host call per code
+  point~~ — **FIXED**, see below.
 - **Module bytes out:** `rbyteAt(i: i32) -> i32` — **one host call per emitted byte**
-  (~1M for the compiler module).
-- **Every diagnostic string** crosses the same way, one code point per call.
+  (~1M for the compiler module). Still true.
+- **Every diagnostic string** crosses the same way, one code point per call. Still
+  true.
 
 `scripts/vl-host/src/main.rs` already documents the fix — a `<name>Reserve(n)`
 capacity hint plus an exported `ioMem` linear memory and `<name>Load(count)` bulk
@@ -145,6 +146,19 @@ emitter half does not exist, because there is no exported memory to write into.
 Measured on the compiler self-compile (below), staging is ~10% of wall clock under
 the null collector and ~6% under DRC. Not the headline, but it is free money that
 is already designed.
+
+**The source-IN half shipped** (`perf-program.md` §6). The driver exports
+`srcLoad` / `modKeyLoad` / `modSrcLoad` / `cliResultLoad`; a `__load_i32__` inside
+those loops sets `memUsed`, which is what materialises the memory the host writes
+into (it is exported as `memory`, per §1.2's P0.2 rule, and the host probes `ioMem`
+then `memory`). No `Reserve` exists — VL has no list-capacity primitive.
+**Measured: 4,565,054 host calls per self-compile became 279; the host's
+`[profile] stage_program` phase went 192 → 135 ms** (interleaved min-of-9), and
+peak RSS did not move (511.2 → 511.3 MB). The ~10% figure above was right and the
+residue is the element move, which **§2 constraint #10 makes irreducible** — there
+is no runtime memory→GC-array copy, so the guest still loops. The two remaining
+per-call channels are the OUT direction (`rbyteAt`, diagnostics), which want the
+mirror mechanism.
 
 ## 2. What WasmGC structurally cannot do
 

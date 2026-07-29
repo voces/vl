@@ -471,14 +471,31 @@ fn read_utf8(path: &std::path::Path) -> Option<String> {
 /// `cliResult`, …): the required per-code-point `<name>Push(cp)` export, plus two
 /// optional BATCHED variants probed from the instance — the same graceful-ABI-
 /// fallback idiom as `render_diags` and the module fetch loop. A seed exporting
-/// them gets the batched path; every current seed falls back to per-code-point
-/// pushes, byte-identical in behavior and cost.
+/// them gets the batched path; a seed that predates them falls back to
+/// per-code-point pushes, byte-identical in behavior.
 ///
-/// Batched ABI (compiler-side follow-up — no seed exports these yet):
+/// Batched ABI (live since the seed grew `srcLoad`/`modKeyLoad`/`modSrcLoad`/
+/// `cliResultLoad` — `compiler/driver.vl`'s `srcLoad` header owns the protocol):
 ///   `<name>Reserve(n: i32) -> i32` — capacity hint: about to append n more code
 ///       points (lets the buffer preallocate once instead of growing per push).
-///   `ioMem` (exported linear memory) + `<name>Load(count: i32) -> i32` — append
-///       the `count` UTF-32LE code points the host wrote at ioMem[0..4*count).
+///       No seed exports one: VL has no list-capacity primitive, and `.push`'s 2×
+///       growth already bounds the copy. Probed anyway — the two halves are
+///       INDEPENDENTLY optional, so a seed may offer either, both or neither.
+///   the staging memory + `<name>Load(count: i32) -> i32` — append the `count`
+///       UTF-32LE code points the host wrote at mem[0..4*count).
+///
+/// The staging memory is probed as `ioMem` FIRST and then as `memory`. `ioMem` was
+/// this ABI's private name, written before VL had linear memory at all; since P0.2
+/// (`buffer-design.md` §C5, ruling O4(i)) a module that touches linear memory
+/// exports it AUTOMATICALLY under the universal name `memory`, and there is no way
+/// for a `.vl` file to name it anything else — nor should there be, since a
+/// bespoke export name for the compiler's own memory would be language surface
+/// invented for one consumer. So `memory` is the name that actually arrives and
+/// `ioMem` is kept as the first probe: it costs one failed lookup at startup and
+/// keeps the door open for a module that ever does dedicate a second memory to
+/// staging. Widening a probe is back-compatible in BOTH directions — an old seed
+/// exports neither and falls back, and an old host finds neither on a new seed and
+/// falls back too (see the fallback-composition proofs in `perf-program.md` §6).
 struct StrIn {
     push: TypedFunc<i32, i32>,
     reserve: Option<TypedFunc<i32, i32>>,
@@ -493,8 +510,10 @@ impl StrIn {
         let reserve = inst
             .get_typed_func::<i32, i32>(&mut *store, &format!("{name}Reserve"))
             .ok();
-        let bulk = inst
+        let mem = inst
             .get_memory(&mut *store, "ioMem")
+            .or_else(|| inst.get_memory(&mut *store, "memory"));
+        let bulk = mem
             .zip(inst.get_typed_func::<i32, i32>(&mut *store, &format!("{name}Load")).ok());
         Ok(StrIn { push, reserve, bulk })
     }

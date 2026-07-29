@@ -83,6 +83,26 @@ cliExitCode() -> i32
 `modKeyPush` / `srcPush` — so the host streams strings the same way it already
 does.)
 
+**File CONTENT rides a bulk path** (`perf-program.md` §6). `CMD_READ_FILE`'s
+result is the only payload on this protocol big enough to matter — every `.vl`
+file `vl check` / `vl fmt` / `vl test` reads arrives through it — so alongside
+`cliResultPush(cp)` the driver exports
+
+```
+cliResultLoad(count: i32)   // append the `count` UTF-32LE code points the host
+                            // wrote at byte 0 of the module's exported linear
+                            // memory (`memory`, probed by the host as `ioMem`
+                            // then `memory`); `compiler/driver.vl`'s `srcLoad`
+                            // header owns the protocol
+```
+
+The two are alternatives, not a sequence: the host uses `cliResultLoad` when the
+module exports it AND a memory, and falls back to `cliResultPush` per code point
+otherwise, so an old seed and an old host both keep working. Nothing else on this
+protocol is bulk — argv and directory entries are tens of code points, and the
+host-BOUND direction (`cliCmdDataAt` / `cliCmdPathAt`) is still one call per code
+point and is a separate item.
+
 ### Command codes
 
 ```
