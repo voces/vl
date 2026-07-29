@@ -510,9 +510,7 @@ impl StrIn {
         let reserve = inst
             .get_typed_func::<i32, i32>(&mut *store, &format!("{name}Reserve"))
             .ok();
-        let mem = inst
-            .get_memory(&mut *store, "ioMem")
-            .or_else(|| inst.get_memory(&mut *store, "memory"));
+        let mem = io_mem(&mut *store, inst);
         let bulk = mem
             .zip(inst.get_typed_func::<i32, i32>(&mut *store, &format!("{name}Load")).ok());
         Ok(StrIn { push, reserve, bulk })
@@ -547,6 +545,155 @@ impl StrIn {
             self.push.call(&mut *store, ch as i32)?;
         }
         Ok(())
+    }
+}
+
+/// The module's staging window for BOTH directions of the bulk ABI: `ioMem` first,
+/// then `memory`. See `StrIn`'s header for why the second name is the one that
+/// actually arrives and why the first is kept.
+fn io_mem(store: &mut Store<()>, inst: &Instance) -> Option<Memory> {
+    inst.get_memory(&mut *store, "ioMem")
+        .or_else(|| inst.get_memory(&mut *store, "memory"))
+}
+
+/// One BYTE-output channel out of the compiler module (`rbyte` — the emitted wasm):
+/// the required `<name>Len()` / `<name>At(i)` accessor pair, plus the optional bulk
+/// `<name>Store(off, count)` probed from the instance. It is the exact mirror of
+/// `StrIn`, and the same graceful-ABI-fallback idiom: a seed exporting `Store` gets
+/// the bulk path, a seed that predates it falls back to one call per byte,
+/// byte-identical in behaviour.
+///
+/// Bulk ABI (`compiler/driver.vl`'s `rbyteStore` header owns the protocol): the
+/// guest packs `written` bytes FOUR PER i32 WORD, little-endian, at byte 0 of the
+/// staging memory and returns `written`; the host copies `mem[0..written)` straight
+/// out. Chunk = the whole window (65,536 bytes), so a ~1.1 MB self-compile reads
+/// back in 17 calls instead of 1,112,716.
+///
+/// A `Store` that returns 0, a negative, or more than it was asked for is a
+/// PROTOCOL VIOLATION and fails the read. It is deliberately not "fall back and
+/// carry on": re-asking from the same offset is an infinite loop, and a hang is a
+/// witness that breaks every comparator downstream of it (`perf-program.md` §6.7).
+struct BytesOut {
+    name: String,
+    len: TypedFunc<(), i32>,
+    at: TypedFunc<i32, i32>,
+    bulk: Option<(Memory, TypedFunc<(i32, i32), i32>)>,
+}
+
+impl BytesOut {
+    /// Errors only when the required `<name>Len`/`<name>At` exports are missing or
+    /// mistyped, so callers gate on them exactly as they gated on `get_typed_func`.
+    fn probe(store: &mut Store<()>, inst: &Instance, name: &str) -> Result<Self> {
+        let len = inst.get_typed_func::<(), i32>(&mut *store, &format!("{name}Len"))?;
+        let at = inst.get_typed_func::<i32, i32>(&mut *store, &format!("{name}At"))?;
+        let bulk = io_mem(&mut *store, inst).zip(
+            inst.get_typed_func::<(i32, i32), i32>(&mut *store, &format!("{name}Store"))
+                .ok(),
+        );
+        Ok(BytesOut { name: name.to_string(), len, at, bulk })
+    }
+
+    fn read(&self, store: &mut Store<()>) -> Result<Vec<u8>> {
+        let n = self.len.call(&mut *store, ())?.max(0);
+        let mut out: Vec<u8> = Vec::with_capacity(n as usize);
+        if let Some((mem, store_fn)) = &self.bulk {
+            let cap = mem.data_size(&mut *store);
+            if cap > 0 {
+                let mut off = 0i32;
+                while off < n {
+                    let want = ((n - off) as usize).min(cap) as i32;
+                    let got = store_fn.call(&mut *store, (off, want))?;
+                    if got <= 0 || got > want {
+                        bail!(
+                            "{}Store({off}, {want}) returned {got} — bulk read-back ABI violation",
+                            self.name
+                        );
+                    }
+                    out.extend_from_slice(&mem.data(&*store)[..got as usize]);
+                    off += got;
+                }
+                return Ok(out);
+            }
+        }
+        for i in 0..n {
+            out.push(self.at.call(&mut *store, i)? as u8);
+        }
+        Ok(out)
+    }
+}
+
+/// One STRING-output channel out of the compiler module (`cliCmdData`, `cliCmdPath`,
+/// …): the `<name>Len()` / `<name>At(j)` code-point accessor pair plus the optional
+/// bulk `<name>Store(off, count)`, which writes `written` UTF-32LE code points at
+/// byte 0 of the staging memory. Same protocol and same failure rule as `BytesOut`;
+/// the chunk is `memory_size / 4` code points because the element is already a word.
+///
+/// `cliCmdPath` deliberately has NO `Store` twin in the compiler, so the fallback
+/// arm here is not a museum piece for old seeds — it runs on every `vl check`.
+struct StrOut {
+    name: String,
+    len: TypedFunc<(), i32>,
+    at: TypedFunc<i32, i32>,
+    bulk: Option<(Memory, TypedFunc<(i32, i32), i32>)>,
+}
+
+impl StrOut {
+    fn probe(store: &mut Store<()>, inst: &Instance, name: &str) -> Result<Self> {
+        let len = inst.get_typed_func::<(), i32>(&mut *store, &format!("{name}Len"))?;
+        let at = inst.get_typed_func::<i32, i32>(&mut *store, &format!("{name}At"))?;
+        let bulk = io_mem(&mut *store, inst).zip(
+            inst.get_typed_func::<(i32, i32), i32>(&mut *store, &format!("{name}Store"))
+                .ok(),
+        );
+        Ok(StrOut { name: name.to_string(), len, at, bulk })
+    }
+
+    fn read(&self, store: &mut Store<()>) -> Result<String> {
+        let n = self.len.call(&mut *store, ())?.max(0);
+        let mut s = String::with_capacity(n as usize);
+        if let Some((mem, store_fn)) = &self.bulk {
+            let cap = mem.data_size(&mut *store) / 4;
+            if cap > 0 {
+                let mut off = 0i32;
+                while off < n {
+                    let want = ((n - off) as usize).min(cap) as i32;
+                    let got = store_fn.call(&mut *store, (off, want))?;
+                    if got <= 0 || got > want {
+                        bail!(
+                            "{}Store({off}, {want}) returned {got} — bulk read-back ABI violation",
+                            self.name
+                        );
+                    }
+                    let data = mem.data(&*store);
+                    for k in 0..got as usize {
+                        let v = u32::from_le_bytes([
+                            data[k * 4],
+                            data[k * 4 + 1],
+                            data[k * 4 + 2],
+                            data[k * 4 + 3],
+                        ]);
+                        push_cp(&mut s, v, off + k as i32);
+                    }
+                    off += got;
+                }
+                return Ok(s);
+            }
+        }
+        for j in 0..n {
+            let v = self.at.call(&mut *store, j)? as u32;
+            push_cp(&mut s, v, j);
+        }
+        Ok(s)
+    }
+}
+
+/// Append one UTF-32 code point to a payload being read back. The seed only stores
+/// code points that came from valid strings, so an unmappable value is a protocol
+/// bug — surface it in debug builds rather than silently shortening the payload.
+fn push_cp(s: &mut String, v: u32, j: i32) {
+    match char::from_u32(v) {
+        Some(c) => s.push(c),
+        None => debug_assert!(false, "invalid code point {v:#x} in a CLI payload at index {j}"),
     }
 }
 
@@ -776,8 +923,7 @@ fn compile_vl_instance(
     let mut store = store;
 
     let compile = inst.get_typed_func::<(), i32>(&mut store, entry)?;
-    let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
-    let rat = inst.get_typed_func::<i32, i32>(&mut store, "rbyteAt")?;
+    let result = BytesOut::probe(&mut store, inst, "rbyte")?;
 
     // Opt into the wasm "name" custom section so trap backtraces name functions.
     // The export is OFF by default (the compiler leaves goldens byte-identical);
@@ -813,14 +959,7 @@ fn compile_vl_instance(
         let diags = render_diags(inst, store, source_path)?;
         bail!("{stage} error\n{}", diags.trim_end());
     }
-    let bytes = phase!("readback", {
-        let n = rlen.call(&mut store, ())?;
-        let mut bytes = Vec::with_capacity(n as usize);
-        for i in 0..n {
-            bytes.push(rat.call(&mut store, i)? as u8);
-        }
-        Ok::<_, Error>(bytes)
-    })?;
+    let bytes = phase!("readback", result.read(&mut store))?;
     if rep_shadow {
         report_rep_shadow(inst, &mut store, source_path)?;
     }
@@ -1728,8 +1867,11 @@ const CMD_TEST_STASH: i32 = 7;
 const CMD_TEST_COLLECT: i32 = 8;
 const CMD_TEST_RUN: i32 = 9;
 
-/// Read the current command's string payload via a `<prefix>Len()` / `<prefix>At(j)`
-/// accessor pair (one UTF-32 code point per `At`, the seed's string-out idiom).
+/// Read a string payload via a bare `<prefix>Len()` / `<prefix>At(j)` accessor pair
+/// (one UTF-32 code point per `At`) off an instance that is NOT the compiler — a
+/// `vl test` module's `vltFailLen`/`vltFailAt`, whose exports come from `std:test`
+/// and carry no bulk twin. Payloads inside the compiler go through `StrOut`, which
+/// takes the bulk path when the seed offers one.
 fn read_cli_str(
     store: &mut Store<()>,
     len: &TypedFunc<(), i32>,
@@ -1738,14 +1880,7 @@ fn read_cli_str(
     let n = len.call(&mut *store, ())?;
     let mut s = String::with_capacity(n.max(0) as usize);
     for j in 0..n {
-        let v = at.call(&mut *store, j)? as u32;
-        match char::from_u32(v) {
-            Some(c) => s.push(c),
-            // The seed only stores code points that came from valid strings, so
-            // an unmappable value is a protocol bug — surface it in debug builds
-            // rather than silently shortening the payload.
-            None => debug_assert!(false, "invalid code point {v:#x} in a CLI payload at index {j}"),
-        }
+        push_cp(&mut s, at.call(&mut *store, j)? as u32, j);
     }
     Ok(s)
 }
@@ -1792,10 +1927,8 @@ fn cli_pump(args: &[String]) -> Result<()> {
     arg_commit.call(&mut store, ())?;
 
     let next = inst.get_typed_func::<(), i32>(&mut store, "cliNext")?;
-    let path_len = inst.get_typed_func::<(), i32>(&mut store, "cliCmdPathLen")?;
-    let path_at = inst.get_typed_func::<i32, i32>(&mut store, "cliCmdPathAt")?;
-    let data_len = inst.get_typed_func::<(), i32>(&mut store, "cliCmdDataLen")?;
-    let data_at = inst.get_typed_func::<i32, i32>(&mut store, "cliCmdDataAt")?;
+    let cmd_path = StrOut::probe(&mut store, &inst, "cliCmdPath")?;
+    let cmd_data = StrOut::probe(&mut store, &inst, "cliCmdData")?;
     let result_in = StrIn::probe(&mut store, &inst, "cliResult")?;
     let file_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?;
     let dir_name_push = inst.get_typed_func::<i32, i32>(&mut store, "cliDirNamePush")?;
@@ -1819,7 +1952,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // policy). `cliDirCommit(1)` when the path is a directory (entries
                 // streamed first), `0` when it is a file or does not exist, so the
                 // VL program can classify a file-vs-directory target.
-                let path = read_cli_str(&mut store, &path_len, &path_at)?;
+                let path = cmd_path.read(&mut store)?;
                 match std::fs::read_dir(&path) {
                     Ok(entries) => {
                         for entry in entries.flatten() {
@@ -1839,7 +1972,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 }
             }
             CMD_READ_FILE => {
-                let path = read_cli_str(&mut store, &path_len, &path_at)?;
+                let path = cmd_path.read(&mut store)?;
                 // A `std:` key maps to `<stdDir>/<name>.vl` (slash segments are
                 // subdirectories); every other key is a filesystem path read as-is.
                 // A missing file commits `found = 0` (the VL program raises its own
@@ -1863,8 +1996,8 @@ fn cli_pump(args: &[String]) -> Result<()> {
             CMD_WRITE_FILE => {
                 // Write the formatted (or fixed) contents back to disk. Path +
                 // data both ride the current-command payload.
-                let path = read_cli_str(&mut store, &path_len, &path_at)?;
-                let data = read_cli_str(&mut store, &data_len, &data_at)?;
+                let path = cmd_path.read(&mut store)?;
+                let data = cmd_data.read(&mut store)?;
                 std::fs::write(&path, data.as_bytes())
                     .map_err(|e| Error::from(e).context(format!("writing `{path}`")))?;
             }
@@ -1879,25 +2012,20 @@ fn cli_pump(args: &[String]) -> Result<()> {
             CMD_PRINT_OUT => {
                 // Raw stdout (no added newline) — formatted source carries its own
                 // trailing newline, so `vl fmt` output stays byte-exact.
-                let data = read_cli_str(&mut store, &data_len, &data_at)?;
+                let data = cmd_data.read(&mut store)?;
                 write!(out, "{data}")?;
             }
             CMD_PRINT_ERR => {
-                let line = read_cli_str(&mut store, &data_len, &data_at)?;
+                let line = cmd_data.read(&mut store)?;
                 writeln!(err, "{line}")?;
             }
             CMD_TEST_STASH => {
                 // The brain just emitted a test module; keep its bytes. They come
-                // back off the driver's own readback exports — the same `rbyteLen`
-                // / `rbyteAt` pair `vl build` reads — so nothing new crosses.
-                let path = read_cli_str(&mut store, &path_len, &path_at)?;
-                let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
-                let rat = inst.get_typed_func::<i32, i32>(&mut store, "rbyteAt")?;
-                let n = rlen.call(&mut store, ())?;
-                let mut bytes = Vec::with_capacity(n.max(0) as usize);
-                for i in 0..n {
-                    bytes.push(rat.call(&mut store, i)? as u8);
-                }
+                // back off the driver's own readback channel — the same `rbyte`
+                // `Len`/`At`/`Store` triple `vl build` reads — so nothing new
+                // crosses.
+                let path = cmd_path.read(&mut store)?;
+                let bytes = BytesOut::probe(&mut store, &inst, "rbyte")?.read(&mut store)?;
                 test_files.push(TestFile { path, bytes });
             }
             CMD_TEST_COLLECT => {

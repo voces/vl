@@ -859,19 +859,26 @@ in-language GC knobs.
     is what moved the count from seven to five to two. It also said "the matrix is now asymmetric the
     OTHER way: eight load widths, one store width" — true until the store slice.)*
     The matrix is now symmetric for every scalar VL has; only the narrow 8/16-bit stores are absent.
-  - **Bulk host I/O — the SOURCE-IN half shipped** (`perf-program.md` §6). The driver exports
+  - **Bulk host I/O — BOTH halves shipped** (`perf-program.md` §6 in, §7 out). The driver exports
     `srcLoad` / `modKeyLoad` / `modSrcLoad` / `cliResultLoad`; a `__load_i32__` in those loops sets
     `memUsed`, which materialises the memory the host stages through (exported as `memory` per P0.2
     — no `.vl` file can name an export `ioMem`, so `StrIn::probe` gained one line and now probes
     `ioMem` then `memory`). **4,565,054 host calls per self-compile became 279; the host's
     `stage_program` phase went 192 → 135 ms, `vl fmt --check compiler` 577 → 518 ms**, peak RSS
     unchanged. No `Reserve` (VL has no list-capacity primitive) and no seed split (the published
-    seed compiles it). **Still open: the OUT direction** — emitted bytes at one call per byte
-    (`rbyteAt`, ~1M per self-compile) and every diagnostic string, which want the mirror mechanism
-    (guest writes the memory, host reads it). **Cheaper alternative to weigh first for the OUT
-    half:** wasmtime 47's `ArrayRef::new_from_i8_slice` builds a GC array from a host byte slice in
-    ONE memcpy — no linear memory, no data section. It is **i8-only**, so it lands free the moment
-    strings are `(array i8)` (B7) and not before. Sequencing question, not a fork.
+    seed compiles it).
+    **The OUT direction is the mirror and also shipped** (`perf-program.md` §7): the GUEST writes the
+    same window and the host copies out. `rbyteStore(off, count)` packs emitted BYTES four per i32
+    word — chunk = the whole 65,536-byte page — and `cliCmdDataStore(off, count)` writes CLI payload
+    code points one per word. **A self-compile's read-back went 1,112,716 host calls → 17 and
+    `[profile] readback` 17 → 1 ms; `vl fmt compiler` went 4,520,527 calls → 290 and 545 → 486 ms.**
+    Same presence probe, same 2×2 fallback, still no seed split. The channels left per-call were
+    MEASURED small first: 300 diagnostics are 9,790 calls / 0 ms, `cliCmdPath` is one path, and a JS
+    consumer pays ~3–5 ns a call (the LSP's `fmtByteAt` over the repo's largest file is 4.93 ms).
+    **Still to weigh, and now only for a future B7:** wasmtime 47's `ArrayRef::new_from_i8_slice`
+    builds a GC array from a host byte slice in ONE memcpy — no linear memory, no data section, and
+    it would remove the element loop that survives on BOTH sides here. It is **i8-only**, so it lands
+    free the moment strings are `(array i8)` (B7) and not before. Sequencing question, not a fork.
   - **The tier itself** — an allocator (bump/arena), a data section, and the `Buffer`/`Array<T>`
     escape (`collections-design.md` §OQ.7), designed once for FFI / SIMD / bulk-I/O rather than
     accreted as intrinsics. Not a second object model → `DECISIONS.md`.

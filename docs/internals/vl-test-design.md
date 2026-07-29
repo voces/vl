@@ -80,7 +80,7 @@ Three commands, all additions to the existing pump (`compiler/cli.vl` ↔
 
 | code | command | the host's job |
 | ---- | ------- | -------------- |
-| 7 | `CMD_TEST_STASH` | keep the module the brain just emitted (read off the driver's own `rbyteLen`/`rbyteAt`, exactly as `vl build` does) |
+| 7 | `CMD_TEST_STASH` | keep the module the brain just emitted (read off the driver's own `rbyteLen`/`rbyteAt`/`rbyteStore` channel, exactly as `vl build` does) |
 | 8 | `CMD_TEST_COLLECT` | load + instantiate every stashed module across the pool, read each registry back, commit them in stash order |
 | 9 | `CMD_TEST_RUN` | read the plan, run it across the pool, commit each outcome |
 
