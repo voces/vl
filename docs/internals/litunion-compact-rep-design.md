@@ -1,9 +1,10 @@
 # The literal-union COMPACT REP inside a mixed union (webcraft P2 / A16)
 
 **Verdict: FILED, not shipped.** The rep's stated benefit — *fewer allocations* — is
-**refuted by measurement**, and the correctness defects it would close are **blocked on two
-owner rulings** (an ABI-wide tag re-base and a new wasm instruction family) that no slice
-should make on its own. This document records the measurement, the four defect families it
+**refuted by measurement**, and the correctness defects it would close are **blocked on
+three owner rulings** (an ABI-wide tag re-base, a new wasm instruction family, and what
+`K | K2` should mean) that no slice should make on its own. This document records the
+measurement, the four defect families it
 found, the ruling each design question has with the alternative it beats, and the two
 follow-on slices the filing hands off — each with its own population.
 
@@ -91,8 +92,8 @@ carries an explicit second test with the reason written out:
 
 So the emitter's kind vocabulary answers **"not a value atom"** for a litunion member, and
 individual gates compensate — or do not. **Measured: of 42 `valueAtomKind` call sites in
-`compiler/*.vl`, 7 have a litunion leg within ±6 lines and 35 do not**
-(`scratchpad/lucr/halfset.sh`; CALLS excludes the definition line and comment mentions).
+`compiler/*.vl`, 7 have a litunion leg within ±6 lines and 35 do not** (§10 derives the
+42 from three `grep`s; CALLS excludes the definition line and comment mentions).
 `isValueUnionName` (36 call sites) has no such leg, so `isValueUnionName("K|f64")` is
 **false**; its banked twin `msIsValueUnion` short-circuits on the same `-1`.
 
@@ -223,18 +224,19 @@ from its own alias twin at `print(x)` and `x + "!"`.
 | population | count | how |
 |---|---|---|
 | corpus `.vl` files | 1,696 | `find tests/cases -name '*.vl' \| wc -l` |
-| …declaring a litunion ALIAS | 165 | `corpusreach.sh` |
-| …with the alias beside `\| null` only (a NICHE, not a box) | 40 | ” |
-| **…with the alias beside a NON-null arm (a mixed BOX)** | **23** | ” (files listed by the script) |
-| …with an INLINE litunion inside a union | 1 | ” |
+| …declaring a litunion ALIAS | 165 | `grep -rlE '^ *type +[A-Za-z0-9_]+ *= *"' tests/cases \| wc -l` |
+| …with the alias beside `\| null` only (a NICHE, not a box) | 40 | per file, take the declared alias NAMES and look for each beside a `\|` on a non-declaration line |
+| **…with the alias beside a NON-null arm (a mixed BOX)** | **23** | ” , excluding the `null` sibling |
+| …with an INLINE litunion inside a union | 1 | `grep -rlE '\("[^"]+" *\|[^)]*\) *\|\|\| *\("[^"]+" *\|' tests/cases` |
 
 The 23 are concentrated in `tests/cases/closures/` (11) and `tests/cases/maps/` (4), plus
 `literal-unions/` (2), `unions/` (3), `lists/` (2), `types/` (1).
 
 ### 2.4 Fuzz reach — present, and VACUOUS on exactly the broken half
 
-Measured, not banked. Two batches of 800 cases (`genbatch.sh`, seeds 12345/777, depth 3/4,
-the second with `--declared`/`--branching`):
+Measured, not banked. Two batches of 800 cases, produced by running `scripts/fuzzgen.vl`
+with a `sed`-injected seed/count/depth exactly as `scripts/fuzz-vl.sh` does (seeds
+12345/777, depth 3/4, the second with `DECLTYPES`/`BRANCHING` on):
 
 | | seed 12345 | seed 777 |
 |---|---|---|
@@ -243,7 +245,7 @@ the second with `--declared`/`--branching`):
 | **`K<n>` beside a NON-null arm (a mixed BOX)** | **26** | **14** |
 | INLINE litunion spellings | **0** | **0** |
 
-So `scripts/fuzzgen.vl` **does** reach litunion-in-mixed-union — my standing note that it
+So `scripts/fuzzgen.vl` **does** reach litunion-in-mixed-union. The standing note that it
 has "zero inline-litunion reach" is right about the inline half (0 and 0) and wrong to
 imply the alias half is absent too.
 
@@ -321,10 +323,10 @@ unsound operation is `x is K`, and `is K` over a `K | string` box is `RUN-OK` in
 `S01lit_isK` — right answer, accidentally, because both arms carry tag 2 and the value
 stored happened to be a `K`. Rejecting the test takes that cell down.
 
-**Therefore F3 is BLOCKED on the rep.** It is not independently fixable, and the brief's
-anticipated outcome — *"if they cannot [stay discriminable], that shape gets a loud reject
-and the design says why"* — is refuted for this family. The design says why: the reject
-would cost more cells than it saves.
+**Therefore F3 is BLOCKED on the rep.** It is not independently fixable. The expected
+outcome going in was *"if the two members cannot stay discriminable, that shape gets a loud
+reject and the design says why"* — and the design says why the reject is unavailable
+instead: it would cost more working cells than it saves.
 
 This is also the sharpest argument for the per-set slot (§3's third alternative) over the
 single kind: the single kind leaves `K | K2` permanently unfixable-and-unrejectable.
@@ -351,15 +353,28 @@ Between the first two, `ref.i31` wins on the only axis that matters here, and th
 
 ### `ref.i31` is available in all three engines this project targets — measured
 
+The probe module, which exercises every instruction the encoding needs:
+
+```wat
+(module
+  (type $box (struct (field i32) (field anyref)))
+  (import "imports" "__print_i32__" (func $p (param i32)))
+  (func $go
+    (local $b (ref $box))
+    (local.set $b (struct.new $box (i32.const 2) (ref.i31 (i32.const 41))))
+    (call $p (i31.get_s (ref.cast (ref i31) (struct.get $box 1 (local.get $b))))))
+  (start $go))
+```
+
 | engine | how measured | result |
 |---|---|---|
-| `wasm-tools` **default** (shipped-proposals) feature set | `wasm-tools validate scratchpad/lucr/i31.wasm` | rc 0 |
-| V8 (deno, the JS test host) | `deno run i31run.ts i31.wasm` instantiating a module that does `struct.new` → `ref.i31` → `ref.cast (ref i31)` → `i31.get_s` | prints `41` |
-| wasmtime 47 (`vl-host`, `cfg.wasm_gc(true)`) | `vl check <any>.vl --compiler scratchpad/lucr/i31.wasm` | fails at **import resolution** (`unknown import: imports::__print_i32__`), i.e. `Module::new` VALIDATED the i31 module before instantiation |
+| `wasm-tools` **default** (shipped-proposals) feature set | `wasm-tools parse i31.wat -o i31.wasm && wasm-tools validate i31.wasm` | rc 0, rc 0 |
+| V8 (deno, the JS test host) | a two-line `deno run` that instantiates it with a `__print_i32__` import | prints `41` |
+| wasmtime 47 (`vl-host`, `cfg.wasm_gc(true)`) | `vl check <any>.vl --compiler i31.wasm` | fails at **import resolution** (`unknown import: imports::__print_i32__`), i.e. `Module::new` VALIDATED it before instantiation |
 
-The third row is the decisive one and it is cheap: a feature-gated instruction fails in
+The third row is the decisive one and it is cheap: a feature-gated instruction fails inside
 `Module::new`, before imports are consulted, so reaching an import error proves validation
-passed.
+passed. (`--compiler` hands wasmtime an arbitrary module; the probe borrows that door.)
 
 The emitter has **zero** `i31` today (`grep -rn 'i31' compiler/*.vl` → nothing). Adding an
 instruction family to the emitted vocabulary is an owner call (§7.2), not a slice's.
@@ -373,14 +388,8 @@ This is the finding that decides ship-or-file, so it is stated with its witness.
 **The claim under test:** *a mixed union box storing its litunion member as a string ref
 allocates, and storing the atom id instead would not.*
 
-**Witness `w1_store_literal.vl`** — a member literal stored into `K | f64` inside a loop.
-Counting the allocating instructions in the emitted body:
-
-```
-w1_store_literal   bytes=587   struct.new=1   array.new_fixed=0   global.get=2
-```
-
-and the body is
+**The witness** — a member literal stored into `K | f64` (§10 has the exact program and the
+two commands). The store's whole emitted sequence is three instructions:
 
 ```wat
 i32.const 2        ;; the string TAG
@@ -397,15 +406,14 @@ No rep can go below one. `ref.i31` matches it; the `$vbI32` route **doubles** it
 allocation win is zero, and the value-box variant of the compact rep is an allocation
 regression.**
 
-The brief's ship bar was *"byte/alloc evidence of the win (the point is fewer allocations —
-show a witness program's WAT losing the string-ref path)"*. There is no such witness to
-show, because the string-ref path does not allocate. **That bar cannot be met, and that is
-the ship-or-file answer.**
+The bar this slice was to clear before shipping was *byte/alloc evidence of the win — a
+witness program's WAT losing the string-ref path*. There is no such witness to show, because
+the string-ref path does not allocate. **That bar cannot be met, and that is the
+ship-or-file answer.**
 
 ### What IS real
 
-**Equality.** Witness `w2_eq_narrowed.vl` — `x == "aa"` on the narrowed litunion arm of a
-`K | f64` box:
+**Equality.** `x == "aa"` on the narrowed litunion arm of a `K | f64` box lowers to:
 
 ```wat
 local.get 0
@@ -457,13 +465,35 @@ exclusive.
 
 ### 7.3 `K | K2` — what should it MEAN?
 
-Today it silently reps as a bare string with `is K` const-folded false. Three coherent
-answers: two distinct tags (the third band); flatten to one litunion `"aa"|"bb"|"cc"|"dd"`
-and let `is K` be a membership test over K's subset (the atom rep already supports exactly
-this — `emitIs`'s `laTexts` ladder); or reject at the CHECKER, where §4's never-move-down
-arithmetic does not apply the same way because a check-level reject is measured against
-`CHECK-REJ`, not `RUN-OK`. The second is the most attractive and the cheapest, and it is
-independent of the rep.
+Today it silently reps as a bare string with `is K` const-folded false. Two coherent
+answers:
+
+- **Two distinct tags** (the third band, §7.1). Fixes all 16 cells, costs the ABI move.
+- **FLATTEN it** to one litunion `"aa"|"bb"|"cc"|"dd"` — a pure litunion, so it reps as the
+  interned ATOM and never boxes — and let `is K` be a **membership test over K's subset**.
+  **This already works on master, with zero compiler changes**, which is the measurement
+  that makes it the recommendation:
+
+  ```vl
+  type K  = "aa" | "bb"
+  type KA = "aa" | "bb" | "cc" | "dd"     // what `K | K2` would flatten to
+  const x: KA = "aa"
+  if x is K { print("K") } else { print("O") }   // K   ✓
+  const y: KA = "cc"
+  if y is K { print("K") } else { print("O") }   // O   ✓
+  ```
+
+  `emitIs`'s `laTexts` ladder emits `id == m0 || id == m1 || …` over the TESTED type's
+  members and even folds to `true` when the receiver's own members are within the tested
+  set. So the entire runtime story for `K | K2` exists; the only thing missing is that the
+  checker renders `K | K2` as `string` instead of flattening it. This is **independent of
+  the rep and of §7.1**, and it is the only one of the answers that could ship as its own
+  slice. It is also what the preserve ruling itself gestured at: *"preserved as `K | f64`
+  **or flattened to the constituent parts of `K | f64`**"*.
+
+A third option — reject `K | K2` — is **not** coherent: §4's arithmetic does not care which
+phase the reject comes from, so a checker-level reject moves the same 4 `RUN-OK` cells down
+that an emitter-level one does.
 
 ### 7.4 The rep KEY — `repCanonKeyGo`'s mix-widen inverts
 
@@ -482,11 +512,11 @@ now become load-bearing.
 
 ---
 
-## 8. The two follow-on slices this filing hands off
+## 8. The three follow-on slices this filing hands off
 
-Both are independent of §7's rulings and of each other. Neither is a partial compact rep;
-both are correctness fixes in the CURRENT rep, and the leg each adds is one the compact rep
-also needs (as a *widen* today, as a *no-op push* after).
+None is a partial compact rep; all three are correctness fixes in the CURRENT rep, and each
+adds a leg the compact rep also needs. **Slice C is the one to take first** — it is
+rep-independent, it needs no ruling from §7, and its entire runtime half already works.
 
 ### 8.1 Slice A — the atom→box STORE boundary (F1, 24 cells)
 
@@ -516,7 +546,24 @@ most real litunions are small, the reservation problem shrinks to the 3+-member 
 all. **This slice should wait for §7's rulings** — it is the one place where doing it in the
 current rep is throwaway work, and its 16 cells are `INVALID-WASM`, i.e. loud, not silent.
 
-### 8.3 Not a slice — the stale invariant
+### 8.3 Slice C — FLATTEN `K | K2` (16 cells, and it needs no ruling)
+
+A union all of whose members are literal unions is a literal union. Today the checker
+renders `K | K2` as `string`, so it reps as a bare string, `is K` const-folds false, and 16
+of 20 grid cells are broken. Flattened to `"aa"|"bb"|"cc"|"dd"` it is a PURE litunion — the
+interned atom rep, no box — and **every consumer already works**: §7.3's five-line witness
+runs correctly on master today at `type KA = "aa"|"bb"|"cc"|"dd"`, because `emitIs`'s
+`laTexts` membership ladder tests the subset. So the work is entirely in the render, the
+runtime half is free, and the outcome-class arithmetic is all upward.
+
+The scope question to settle first is whether the rule is *"all members are litunions"* or
+*"any run of litunion members merges"* — the second also improves `K | K2 | f64` (which
+today has TWO members colliding on tag 2 inside a real box) and is the shape §7.3's second
+bullet actually describes. Measure both before choosing. `mixedUnionLitAliasRegroup` and
+`litUnionPreserve` are the sites that would carry it, and the pinned floor for the
+already-working half is `mixed-union-litunion-arm-floor.vl`'s `flattenTargetAlreadyWorks`.
+
+### 8.4 Not a slice — the stale invariant
 
 `tests/cases/unions/litunion-value-union-is.vl`'s comment claims `K0 | string` collapses so
 the string tag never collides. §2.2 refutes it in six lines. The comment should be corrected
