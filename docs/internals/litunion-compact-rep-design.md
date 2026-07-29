@@ -471,8 +471,10 @@ answers:
 - **Two distinct tags** (the third band, §7.1). Fixes all 16 cells, costs the ABI move.
 - **FLATTEN it** to one litunion `"aa"|"bb"|"cc"|"dd"` — a pure litunion, so it reps as the
   interned ATOM and never boxes — and let `is K` be a **membership test over K's subset**.
-  **This already works on master, with zero compiler changes**, which is the measurement
-  that makes it the recommendation:
+  **SHIPPED as slice C (#1306) — see §8.3, including the one claim below that measurement
+  refuted** (the work was not "only the render": the checker's annotation-union arm never
+  flattened a union member either, and moving the render alone is 12 cells DOWN).
+  The runtime half genuinely is free, and that is the measurement below:
 
   ```vl
   type K  = "aa" | "bb"
@@ -546,22 +548,51 @@ most real litunions are small, the reservation problem shrinks to the 3+-member 
 all. **This slice should wait for §7's rulings** — it is the one place where doing it in the
 current rep is throwaway work, and its 16 cells are `INVALID-WASM`, i.e. loud, not silent.
 
-### 8.3 Slice C — FLATTEN `K | K2` (16 cells, and it needs no ruling)
+### 8.3 Slice C — FLATTEN `K | K2` — **SHIPPED (#1306)**, and it was NOT "entirely in the render"
 
-A union all of whose members are literal unions is a literal union. Today the checker
-renders `K | K2` as `string`, so it reps as a bare string, `is K` const-folds false, and 16
-of 20 grid cells are broken. Flattened to `"aa"|"bb"|"cc"|"dd"` it is a PURE litunion — the
-interned atom rep, no box — and **every consumer already works**: §7.3's five-line witness
-runs correctly on master today at `type KA = "aa"|"bb"|"cc"|"dd"`, because `emitIs`'s
-`laTexts` membership ladder tests the subset. So the work is entirely in the render, the
-runtime half is free, and the outcome-class arithmetic is all upward.
+A union all of whose members are literal unions is a literal union. On master the checker
+rendered `K | K2` as `string`, so it repped as a bare string, `is K` const-folded false, and
+16 of 20 grid cells were broken.
 
-The scope question to settle first is whether the rule is *"all members are litunions"* or
-*"any run of litunion members merges"* — the second also improves `K | K2 | f64` (which
-today has TWO members colliding on tag 2 inside a real box) and is the shape §7.3's second
-bullet actually describes. Measure both before choosing. `mixedUnionLitAliasRegroup` and
-`litUnionPreserve` are the sites that would carry it, and the pinned floor for the
-already-working half is `mixed-union-litunion-arm-floor.vl`'s `flattenTargetAlreadyWorks`.
+**The filing's premise was half right and the wrong half was the expensive one.** §7.3 is
+correct that the runtime is free — the flattened target already runs — but it inferred from
+that that "only the checker's render has to move", and **that is refuted by measurement**.
+The render-only change is **2 cells UP and 12 DOWN**. The root cause is one arm the filing
+never opened: **`tsToTyReal`'s `TS_UNION` arm (and its `nameToTyReal` twin) never flattened
+a union member**, so `K | K2` interned as a `TyUnion` whose MEMBERS ARE UNIONS. `tyIsLitUnion`
+is structural over `TyLit` members, so it answered NO for the whole annotation — which means
+`litUnionInlineNameOfTy` declined, both renderers softened, and `anyLitUnionUsed` never set
+`gLitUnionUsed`, turning off every atom classifier **in the module**. Teaching canon to
+SPELL the flattened members while the arena still says "not a literal union" is strictly
+worse than either alone: the annotation names an atom and the local slot is a string ref.
+
+The shipped shape is therefore an ARENA change with a canon mirror, `annUnionInnerTy` +
+`litUnionFlatten`, and four gates each of which was measured rather than reasoned:
+
+| gate | what it excludes | what deleting it costs |
+|---|---|---|
+| every member `tyIsLitUnion` | the RUN-MERGE into a mixed union | `closures/closure-result-union-composed-carrier.vl` invalid wasm |
+| `!hasNull` | the atom NICHE (`K \| K2 \| null`) | 3 cells DOWN — the nullable control's own holes |
+| `litUnionAliasTyOfMembers` (EXACT set) | a structural twin at a fresh index | 5 named corpus cases; and `>=` is a silent TYPE WIDENING |
+| canon keeps an ALIAS answer at every position | the inline spelling at `RC_ROOT`/`RC_FN_PARAM` | `P15atom_store` RUN-WRONG → INVALID-WASM |
+
+**The scope question is RULED: all members, not the run.** The run-merge is what master
+*already performs* whenever the flattened alias happens to be declared
+(`mixedUnionLitAliasRegroup` regroups `K | K2 | f64` to `KA|f64`), so it is directly
+measurable rather than hypothetical — and in that configuration it is **0 cells UP and 2
+DOWN** (`==` over the regrouped box becomes `emitProgram: `==` over a struct union is not
+supported yet`). It buys nothing and costs two.
+
+**Outcome, 420 cells over four grids: 54 UP, 0 DOWN** — 46 silent-wrong → correct and 8
+invalid-wasm → correct. `K | K2` now scores exactly what the
+un-aliased inline spelling of its flattened set scores (10 of 20) — the flatten's whole
+claim is that the two are one type — and with a DECLARED alias for the flattened set it
+scores 19 of 20, the same as the alias written directly. The residue is the inline-spelling
+PARAM/FIELD valtype work (`ctxKeepsLitUnion`'s two excluded positions) and the nullable
+niche's print holes, both filed with numbers.
+
+Pinned by `tests/cases/literal-unions/union-of-litunions-flatten.vl`; the already-working
+half stays pinned by `mixed-union-litunion-arm-floor.vl`'s `flattenTargetAlreadyWorks`.
 
 ### 8.4 Not a slice — the stale invariant
 

@@ -37708,3 +37708,218 @@ from the other side, and it is the reason the rep is an ABI event rather than an
   invariant, grep the corpus COMMENTS for the invariant, not just the code for the call sites.*
 
 <!-- APPEND-MARKER-LUCOMPACT-END -->
+
+---
+
+## SLICE C — a union of literal unions IS one. The filing said "only the render has to move" and that is REFUTED: the CHECKER's annotation-union arm never flattened a member either, and moving the render ALONE is 12 cells DOWN (off master `1f7b4fc7`)
+
+`docs/internals/litunion-compact-rep-design.md` §8.3 handed this slice off as the cheap one:
+*"the work is entirely in the render, the runtime half is free, and the outcome-class
+arithmetic is all upward."* Two of those three survive. The third — *entirely in the render* —
+is the interesting finding, and it is what this slice is actually about.
+
+### The measured claim, and the one it replaced
+
+`K | K2` is broken in **13 of 20** grid cells on master (11 of them SILENT), and the filing's
+diagnosis is right about the symptom: `is K` const-folds to `i32.const 0`, the whole
+annotation reps as a bare string, and the module contains no box at all. Its prescription —
+teach `canonEmitNameAt`'s union arm to SPELL the flattened member set — was built first and
+measured:
+
+| render-only (canon's `litUnionPreserve` gains a flatten tail) | 2 UP | **12 DOWN** |
+|---|---|---|
+
+The 12 are not subtle. `{v: K | K2}` moves from `RUN-OK` to `RUN-WRONG` — `print(s.v)` starts
+printing the raw ATOM ID `0` where `aa` is correct — and the map-value cell moves to
+`EMIT-REJ`. The bisect that explains it is four probes long and worth writing down, because
+the conclusion is not reachable by reading:
+
+1. **DELETE THE BYSTANDER.** Return `""` from the new flatten and the field prints `aa`
+   again. So the flatten is the cause, not a coincidence.
+2. **THE ALIAS ANSWER FAILS TOO.** Declare `type KA = "aa"|"bb"|"cc"|"dd"` so the flatten
+   answers with an alias NAME, and `{v: K | K2}` still prints `0` — while `{v: KA}`, the
+   identical annotation written by hand, prints `aa`. Two spellings, one canon'd text, two
+   behaviours. That refutes "the name is the whole story".
+3. **AN `emitFail` INSTRUMENT ON THE FIELD ROW.** `shapeFieldElemName`'s code-0 arm reports
+   `ftxt=[KA]` for BOTH files. The struct row, the field code and the recorded element name
+   are byte-identical. So the divergence is not in the registration either.
+4. **THE MEMBER ARM IS NEVER REACHED.** The same instrument moved into `exprIsLitAtom`'s
+   `Member` arm fires for `{v: KA}` and NOT for `{v: K | K2}` — and `exprIsLitAtom` has
+   exactly one earlier exit: `if gLitUnionUsed == 0 { return false }`. Adding one unrelated
+   `const forceflag: K = "aa"` to the failing file makes the arm fire and the print correct.
+
+### The root cause: `tsToTyReal`'s `TS_UNION` arm never flattened a member
+
+```vl
+const m = tsToTy(kid)
+if m < 0 { return -1 }
+… dedup …
+if !dup { members.push(m) }
+```
+
+`K | K2` interns as a `TyUnion` whose **members are unions**. `tyIsLitUnion` is structural
+over `TyLit` members, so it answers **NO** for the whole annotation — and every consumer
+that asks the ARENA rather than the name follows it down: `litUnionInlineNameOfTy` declines
+(so BOTH renderers soften), `nodeTyIsLitUnion` is false for every node in the program, and
+therefore `anyLitUnionUsed` never sets `gLitUnionUsed`, **which switches off every atom
+classifier in the MODULE**. That is the whole 16-cell population, and a render-only fix
+makes it worse because canon then names an atom while the arena still says string.
+
+The DECLARATION route has always flattened — `type Q = K | K2` registers a real litunion
+alias — which is why the filing's five-line witness ran: it spelled the flattened set as a
+declared alias. The two ANNOTATION routes (`tsToTyReal`, the parser-tree route, and
+`nameToTyReal`, the string route) were the only two places with neither the arena flatten
+nor canon's `unionAliasMembers` name-side equivalent.
+
+### What shipped, and the four gates each of which is a measurement
+
+`annUnionInnerTy(members, hasNull)` — one home, called by both annotation routes — plus
+`litUnionFlatten` as canon's mirror. Every gate on it was arrived at by a grid that went the
+wrong way first:
+
+| gate | deleting it costs |
+|---|---|
+| **every member `tyIsLitUnion`** (all-members, not the RUN) | `closures/closure-result-union-composed-carrier.vl` — `(() => K0 \| boolean) \| null` emits invalid wasm the moment `K0`'s literals become sibling members of the closure's result union |
+| **`!hasNull`** (the atom NICHE is excluded) | 3 cells DOWN on the nullable row |
+| **`litUnionAliasTyOfMembers`**, an EXACT set match | 5 named corpus cases (10 suite failures across two tiers) |
+| **canon keeps an ALIAS answer at EVERY position** | `P15atom_store` RUN-WRONG → INVALID-WASM, for `K \| K2` *and* for the pure inline spelling |
+
+The last one is `ctxKeepsLitUnion`'s own measurement read exactly rather than widened. That
+gate excludes `RC_ROOT` and `RC_FN_PARAM` because *"those two valtype ladders have an arm for
+the litunion ALIAS name and none for the inline member spelling"* — so the thing they cannot
+take is the INLINE spelling, and gating on **the shape of the ANSWER** (`!nameHasPipe(lup)`)
+is strictly more precise than gating on the position. Once the arena hands `K | K2` a
+declared alias's own index, leaving `RC_ROOT` spelling it `string` puts an i32 atom in a
+`(ref $array)` local.
+
+### THE SCOPE RULING — the run-merge is 0 UP and 2 DOWN, and master already performs it
+
+The filing asked for both variants to be measured. The run-merge does not need to be BUILT to
+be measured, because **master already does it whenever the flattened alias happens to be
+declared**: `mixedUnionLitAliasRegroup` regroups `K | K2 | f64` into `KA|f64`. So the
+four-config probe (#1300's technique) reads the merge directly:
+
+| config | RUN-OK | note |
+|---|---|---|
+| A `K \| K2`, no `KA` | 6 → **10** | this slice |
+| B `K \| K2`, `KA` declared | 6 → **19** | this slice, alias-preferred |
+| C `K \| K2 \| f64`, no `KA` | 6 → 6 | untouched |
+| **D `K \| K2 \| f64`, `KA` declared** | **5** | master ALREADY merges — 2 cells below C |
+| E `K \| f64` (the shipped #1300 shape) | 5 | D converges onto E |
+
+D's two lost cells are `==` over the box (`emitProgram: `==` over a struct union is not
+supported yet`). The merge makes `K | K2 | f64` behave exactly like `K | f64`, which is
+*consistent* and *worse* — C's `==` only works because the un-merged shape had degenerated to
+a bare string. **0 UP, 2 DOWN: ruled out, with numbers, without building it.**
+
+### The grids — 420 cells, 54 UP, 0 DOWN
+
+Each row is 20 ops (bind/print/eq × is-positive and is-negative, the five keep positions,
+param/return/global/reassign, the narrowed read/concat/arg, `for`-in, the atom store, `??`).
+Every grid carries a control whose members DIFFER (#1304's note).
+
+| grid | cells | RUN-OK before → after | moves |
+|---|---|---|---|
+| main (9 shapes + control) | 200 | 79 → 98 | 19 UP (17 silent, 2 invalid-wasm), 0 DOWN |
+| four-config (run-merge) | 100 | 28 → 45 | 17 UP (15 silent, 2 invalid-wasm), 0 DOWN |
+| inline-spelling controls | 80 | 49 → 67 | 18 UP (14 silent, 4 invalid-wasm), 0 DOWN |
+| nullable controls | 40 | 26 → 26 | 0 UP, 0 DOWN |
+| **total** | **420** | **182 → 236** | **54 UP (46 SILENT), 0 DOWN** |
+
+The 19 in the main grid: **17 silent-wrong → correct** (`is K` at the field, element,
+map-value and `for`-in positions of `K | K2`, `K | K2 | K3`, `(K | K2) | K3` and the
+overlapping `KO1 | KO2`), and **2 invalid-wasm → correct** on the degenerate
+`K | ("aa"|"bb")`. The headline class is the first one: a guard that could never fire now
+fires exactly on its own member set.
+
+**The un-aliased half lands exactly on its own control**, which is the slice's thesis stated
+as an equality: after the flatten, `K | K2`'s RUN-OK set is `{P02,P03,P04,P09,P10,P11,P14,
+P18,P19,P20}` — the *same ten cells*, not merely the same count, as the hand-written
+`"aa"|"bb"|"cc"|"dd"`. Two spellings of one type now behave as one type.
+
+The 18 in the inline-control grid are a BONUS the arena change made unavoidable and welcome:
+a pure inline litunion beside a declared alias with the same members (`"aa"|"bb"` next to
+`type K = "aa"|"bb"`) now resolves to `K`'s own arena index and canon spells it `K`, so it
+goes 10 → 19 of 20. That population is what `tests/vl_build_validate_test.ts`'s fixture was
+riding, and swapping it was this slice's only forced test edit.
+
+### Registration keys: SIX heap-type rows and one `$fnsig` row disappear
+
+Corpus A/B, six channels, 1,704 files. `CHECKRC`, `CHECKMSG`, `BUILDRC` and `RUN` are
+**identical on every file**; 11 files move on `BUILDMSG`+`BYTES` (the two are the same fact —
+`vl build` echoes the byte count). Every one is a litunion file, and every BYTES row is
+justified by a WAT diff:
+
+| file | heap types | bytes | what merged |
+|---|---|---|---|
+| `structs/structural-non-twin-distinct.vl` | 7 → 6 | **+62** | `{k: "a"\|"b"}` merges onto `{k: K}` — one row was an i32-ATOM field and the other a softened `string`-ref field |
+| `lists/litunion-inline-array-positions.vl` | 5 → 4 | −5 | two BYTE-IDENTICAL `(struct (field (mut (ref …))))` rows become one |
+| `lists/litunion-inline-nullable-array.vl` | 5 → 4 | −5 | ” |
+| `lists/litunion-inline-nullable-element.vl` | 11 → 10 | −5 | ” |
+| `lists/litunion-inline-array-ops.vl` | 7 → 6 | −5 | ” |
+| `literal-unions/inline-nested-atom-array.vl` | 7 → 6 | −5 | ” |
+| `literal-unions/inline-atom-map-value.vl` | 11 → 10 | −5 | ” |
+| `closures/closure-litunion-param-valuecall.vl` | 23 → 22 rows | −10 | a **`$fnsig` FUNCTYPE** row: `(param structref (ref 1))` → `(param structref i32)`, and the duplicate disappears |
+| `closures/closure-litunion-param-pin-boxed-first.vl` | ” | −8 | ” |
+| `closures/closure-union-param-pin-litunion-first.vl` | ” | −8 | ” |
+| `literal-unions/fn-value-litunion-arg.vl` | ” | −2 | ” |
+
+Net **+4 bytes** over 11 files: ten shrink by 58 together, one grows by 62. **The growth is
+the correct lowering arriving**, and it is worth stating plainly because a BYTES row that
+grows looks like a regression: with `{k:"a"|"b"}` merged onto the ATOM row, `print(wi.k)`
+now emits the atom→member-string `select` tower (`global.get` 9 → 11, `call` 11 → 13) that
+the string rep did not need. It prints `b` on both sides; only one of them was reading the
+field through the rep it was built with.
+
+**A fixture comment moved with the key.** `structs/structural-non-twin-distinct.vl` is the
+"non-twins must stay distinct" pin, and one of its three pairs — the litunion ALIAS field vs
+the INLINE litunion field — was never a non-twin: `type K = "a"|"b"` and `"a"|"b"` denote one
+type. Its comment now says so, with the heap-type count and the byte delta, because a pin
+whose comment describes the old answer is how a stale invariant survives a fix (the lesson
+`litunion-value-union-is.vl` taught this program two slices ago).
+
+### Sabotages
+
+| # | kind | change | witness |
+|---|---|---|---|
+| A | delete the bystander | `annUnionInnerTy`'s `litUnionAliasTyOfMembers` lookup returns -1 | **10 failures / 5 cases**: `union-of-litunions-flatten`, `structs/structural-non-twin-distinct`, `closures/closure-litunion-param-{pin-boxed-first,valuecall}`, `closures/closure-union-param-pin-litunion-first` — each in BOTH the wasm-oracle and native-align tiers |
+| B | poison | `litUnionAliasTyOfMembers`'s exact-set test `==` → `>=` | **the suite passed 3,580/0/7** — and the corpus was blind to a silent TYPE WIDENING |
+| C | delete the bystander | canon's `litUnionFlatten` tail returns `""` (arena flatten kept) | 2 failures / 1 case — the two producers disagree and the fixture catches it |
+
+**Sabotage B is the one that earned its keep.** A `>=` there lets a SUPERSET alias claim a
+narrower annotation: `("wa"|"wb")` adopts `W4 = "wa"|"wb"|"wc"|"wd"`'s arena index, and
+`x is ("wa"|"wb")` over a `"wc"` value then answers **Y**, `vl check` rc 0. The whole
+3,580-test suite did not notice, because every other litunion fixture spells sets that have
+no registered superset. The fixture gained a `widenGuard` cell for exactly that shape, and
+with it the poison fails 2 tests. *A sabotage that the suite survives is not a passing
+sabotage; it is a missing test, and it is the only kind worth running.*
+
+### Lessons
+
+* **"THE RUNTIME ALREADY WORKS" IS NOT "THE RENDER IS THE WHOLE FIX".** §7.3's five-line
+  witness is a true and load-bearing measurement — the flattened target genuinely runs on
+  master — but the inference from it ("only the checker's render has to move") skipped the
+  question *what does the ARENA say about this annotation?* The answer was "not a literal
+  union", and moving the render alone is 2 UP and 12 DOWN. *A witness proves the DESTINATION
+  is reachable; it says nothing about which layer is holding the value back.*
+* **A MODULE-WIDE FLAG TURNS A LOCAL DISAGREEMENT INTO A GLOBAL ONE.** `gLitUnionUsed` is set
+  by one `P.nodes` scan and read as an early-out by every atom classifier, so an arena that
+  answers "not a litunion" for the program's ONLY litunion mention silences the classifiers
+  for *unrelated* values too. The tell was that adding one irrelevant `const forceflag: K`
+  fixed a field read three functions away. *When a fix works because of a line that has
+  nothing to do with it, you have found a module-scoped gate, not a local one.*
+* **THE RUN-MERGE DID NOT NEED TO BE BUILT TO BE RULED OUT.** Master already performs it in
+  one configuration (a declared alias for the flattened set + `mixedUnionLitAliasRegroup`),
+  so the four-config probe measured the merge itself: 0 UP, 2 DOWN. *Before building a
+  variant to compare, check whether some existing configuration already IS the variant.*
+* **AN OUTCOME CLASS CAN "IMPROVE" INTO ITS CONTROL'S FLOOR AND STILL BE A REGRESSION.**
+  Flattened, `K | K2 | null` becomes byte-for-byte its declared-alias control `C | null`
+  (13/5/2 on both) — 10 cells UP and 3 DOWN, and the 3 are that control's OWN pre-existing
+  holes. Converging onto a sibling is the right end state and it is still three cells a user
+  would feel, so the niche half is gated off with its numbers rather than shipped with an
+  argument. *"It now matches its control" is a good reason to file, not a licence to regress.*
+* **A SABOTAGE THE SUITE SURVIVES IS THE MOST VALUABLE ONE YOU CAN RUN.** Sabotage B passed
+  3,580 tests while silently widening a type. The suite was not weak in general — sabotages A
+  and C each fell over immediately — it was blind to ONE axis (a registered SUPERSET of the
+  set being resolved), because no fixture had ever spelled that pair. *Grade a sabotage by
+  what it reveals about the tests, not by whether the code survived it.*

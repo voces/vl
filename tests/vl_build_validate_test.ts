@@ -20,8 +20,8 @@
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
 // to disassemble. The exit code, not the artifact's absence, is the signal.
 //
-// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE emitter bug (a `.map` callback
-// PARAMETER spelled as an inline literal union). If that bug is fixed the fixture
+// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE emitter bug (the narrowed read of a
+// literal-union arm back into a `K`-typed position). If that bug is fixed the fixture
 // stops producing an invalid module and this pin would silently go inert — so the
 // first assertion checks the PRECONDITION (`vl run` on the source still fails) and
 // fails loudly with a swap instruction rather than passing vacuously. Swap in any
@@ -48,29 +48,31 @@ if (GATED && !ENABLED) {
   console.warn("[vl-build-validate] skipped — missing vl binary or seed wasm.");
 }
 
-// Type-checks clean, emits invalid wasm: a `.map` over a literal-union list whose
-// CALLBACK PARAMETER is spelled as the inline member union rather than the alias.
-// The receiver's element reps as the interned i32 atom, the callback's parameter
-// slot reps as a `string` (the canon pass softens an inline litunion at
-// `RC_FN_PARAM`), and the loop hands the atom to the string slot:
-// `type mismatch: expected (ref $type), found i32`. Filed as OPEN in
-// `docs/internals/destringify-types-program.md` ("THE `.map` CALLBACK-PARAM
-// FAMILY"), whose measurement says closing it needs an inline-litunion arm in the
-// PARAM and DECLARED-FIELD valtype ladders; two independent candidates
-// (#1205's `vtKindOfType` flip, #1206's alias-convergence refinement) each traded
-// cells instead of healing, so the fixture is stable.
+// Type-checks clean, emits invalid wasm: the NARROWED ARM of a mixed union read back
+// into a `K`-typed position. The box holds the member's STRING ref while the
+// destination's rep is the interned i32 atom id, and nothing converts:
+// `type mismatch: expected i32, found (ref $type)`. This is family F2 of
+// `docs/internals/litunion-compact-rep-design.md` (§2.2, 16 cells, INVALID-WASM in 8
+// of 8 mixed spellings), handed off there as slice B — which the design says should
+// WAIT for the compact-rep rulings, because the box→atom direction is the one place
+// a fix in the current string rep is throwaway work. So the fixture is stable.
 //
-// It REPLACES the previous fixture — an unread global binding of a generic
-// function's nullable-closure return — which stopped emitting an invalid module
-// once `globalCellKind`'s un-annotated arm learned the `nulclosure` cell. The
-// precondition assertion below is what caught that, exactly as designed.
-const INVALID_SRC = `type K = "a" | "b"\n` +
-  `const xs: K[] = ["a", "b"]\n` +
-  `const ys = xs.map((v: ("a" | "b")) => {\n` +
-  `  if v == "a" { return 1 }\n` +
-  `  return 2\n` +
-  `})\n` +
-  `print(ys[0])\n`;
+// It REPLACES the previous fixture — a `.map` callback PARAMETER spelled as the inline
+// member union rather than the alias — which stopped emitting an invalid module once
+// canon learned to keep a preserve whose answer is a DECLARED ALIAS NAME at every
+// position (#1306's litunion flatten: the callback param's `("a" | "b")` now canons to
+// `K`, the spelling the param valtype ladder has always had an arm for). And that one
+// had itself replaced an unread global binding of a generic function's nullable-closure
+// return. The precondition assertion below is what caught both, exactly as designed.
+const INVALID_SRC = `type K = "aa" | "bb"\n` +
+  `function go() {\n` +
+  `  const x: K | f64 = "aa"\n` +
+  `  if x is K {\n` +
+  `    const y: K = x\n` +
+  `    print(y)\n` +
+  `  } else { print("N") }\n` +
+  `}\n` +
+  `go()\n`;
 
 // The over-rejection control: an ordinary valid program must still build clean.
 const VALID_SRC = `print(6 * 7)\n`;
