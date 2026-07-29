@@ -36735,8 +36735,10 @@ emitter half landed adds the site those two were hiding:
 
 **SITE 14 WAS INVISIBLE UNTIL 7 WAS FIXED, AND THAT IS A PROPERTY OF THE CENSUS, NOT AN
 OVERSIGHT.** While `canonLitUnionArms` re-widened, no stored element spelling ever carried
-an alias, so the scanner's comparison was never asked the new question — the site is
-`nameIsLitUnionType`-free and looks arena-innocent in source. *A census of "who reads this
+an alias, so the scanner's comparison was never asked the new question. And it does not
+LOOK like a site of this family in source: there is no `valueAtomKind`/`nameIsLitUnionType`
+pair to notice, only a plain `==` between two strings — the tell is not in the compare, it
+is in the fact that one side's range is fixed. *A census of "who reads this
 spelling" cannot see a reader that the spelling has never reached. The instrument that
 found it was not a census at all: it was the corpus telling us a cell had moved from a
 clean reject to invalid wasm, on the BUILDMSG channel that distinguishes those two.*
