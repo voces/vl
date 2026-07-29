@@ -141,8 +141,9 @@ hatch").** All four are prerequisites for each other in practice:
   Shipped shape + the three divergences from the charter: `docs/internals/vl-test-design.md`.
 
 **P2 — wanted, not gating:** ~~i32-keyed Map/Set + `for k in map` (B6a)~~ **DONE** for every value
-type the string-keyed rep lowers (B6b extended the mv slot's identity from the VALUE to the
-(KEY, VALUE) pair); ~~contextual f32 literals~~ **DONE**; ~~`match` phase 2 — variant payload
+type the string-keyed rep lowers and every position but a union member (B6b extended the mv slot's
+identity from the VALUE to the (KEY, VALUE) pair, then gave the struct/variant FIELD row the same
+key column); ~~contextual f32 literals~~ **DONE**; ~~`match` phase 2 — variant payload
 binding~~ **DONE** (`match cmd { Move{x, y} => … }`, punned fields; renaming + nested destructuring
 measured and deferred — B21 item 1); literal-union compact representation (A16); readonly
 fields / A9 variance; default params (B15a); SIMD over Buffer (unlocked by P0, not requested yet);
@@ -533,22 +534,26 @@ in-language GC knobs.
   `xs.push(...ys)` once variadics land); representation inference (§VL.7 — lower never-grown
   values to a header-less fixed array); `map`/`filter` build-side generics for `Map`/`Set` (A10);
   `.vl`-std migration once a module system exists. (design: `docs/guide/collections-design.md`)
-- 🟡 **B6a. `Map` + `Set`.** REMAINING: **an i32-keyed map in a struct/variant FIELD**, the last
-  position it cannot occupy — `{[i32]: V}` ships for every value type the string-keyed rep lowers
-  (`string`, a struct, `i32[]`, `string[]`, `f64`, `i64`, `f32`, `V | null`, a union, a closure, a
-  nested map) as a binding / parameter / return / `| null` / an ARRAY ELEMENT / a closure RESULT / a
-  map VALUE, because an mv slot's identity is the (KEY, VALUE) pair (B6b). The FIELD reject has a
-  filed mechanism: a field ROW records the map's VALUE name and VALUE type with the KEY ERASED
-  (`sFieldElemName` / `sFieldElemTyIx`), so it needs a key column on both field tables. The ARRAY
-  ELEMENT opened once its string-keyed twin was fixed (a LIST of maps was invalid wasm for 12 of 15
-  value types — the element `Map()` was never seeded), for one `[]` peel, because a ref-list element
-  row carries the whole `{[i32]: V}` spelling. A list of LISTS of maps (`{[i32]: V}[][]`) is still a
-  loud reject: the map sits behind a second element row nobody has measured. Also filed, both loud
-  rejects on both key reps: a struct that is a MEMBER of a declared union cannot be a map VALUE
-  (`mvValKindOfName`'s last arm asks `structIndexByValName`, which a variant is not in —
-  `tests/cases/maps/error-map-value-struct-in-union.vl`), and `.set(k, v)` does not narrow a float
-  literal to `f32` or a string literal to a literal-union member the way `m[k] = v` does (a checker
-  gap; both are loud, and both reject identically on a list element and on a bare map). Also:
+- 🟡 **B6a. `Map` + `Set`.** The **struct/variant FIELD position is DONE** — `{[i32]: V}` now ships
+  in every position the string-keyed rep occupies except a UNION MEMBER, for every value type it
+  lowers (`string`, a struct, `i32[]`, `string[]`, `f64`, `i64`, `f32`, `V | null`, a union, a
+  closure, a nested map): a binding / parameter / return / `| null` / an ARRAY ELEMENT / a closure
+  RESULT / a map VALUE / a STRUCT or VARIANT FIELD. The field's mechanism was the filed one: a
+  field ROW recorded the map's VALUE name and VALUE type with the KEY ERASED (`sFieldElemName` /
+  `sFieldElemTyIx`) while an mv slot's identity is the (KEY, VALUE) pair (B6b), so both field
+  tables grew a key column (`sFieldElemKeyI32` / `uFieldElemKeyI32`, written by the ONE row
+  recorder and read at the ONE shape home `sFieldMapShape` / `uFieldMapShape`). REMAINING, all
+  loud rejects with pinned fixtures: **a UNION MEMBER** (`{[i32]: V} | i32` — the box carries no
+  map shape, `maps/error-i32-keyed-position-union-member.vl`); **a list of LISTS of maps**
+  (`{[i32]: V}[][]`, one `[]` deeper than the peel, on both the bare and the field spelling —
+  `maps/error-i32-keyed-position-array.vl`); and an ARRAY OF CLOSURES returning one
+  (`(() => {[i32]: V})[]`). Also filed, on both key reps: a struct that is a MEMBER of a declared
+  union cannot be a map VALUE (`mvValKindOfName`'s last arm asks `structIndexByValName`, which a
+  variant is not in — `tests/cases/maps/error-map-value-struct-in-union.vl`); `.set(k, v)` does not
+  narrow a float literal to `f32` or a string literal to a literal-union member the way
+  `m[k] = v` does; and **a SET-typed FIELD has no `.add`** (`unknown property \`add\` on
+  {[K]: boolean}` — the checker's member table does not reach a `{[K]: boolean}` reached through a
+  field; identical on both keys, so it is a checker gap and not a rep one). Also:
   `map`/`filter` over Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`.
   (Self-host native parity: string-keyed maps, delete, `Set`/`.add`/`.get`, and ref-valued maps
   (string/struct values, #319) landed; map-typed params are the remaining native map gap.)

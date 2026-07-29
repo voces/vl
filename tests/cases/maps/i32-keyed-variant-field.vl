@@ -1,0 +1,116 @@
+// @run
+// @log 2
+// @log 3
+// @log true
+// @log 1
+// @log 11
+// @log hi
+// @log 1
+// @log other
+// @log 9
+// @log 1
+// @log 2
+// CAPABILITY (B6b): an i32-keyed map is a UNION-VARIANT FIELD — the struct
+// fixture's twin one table over (`i32-keyed-struct-field.vl` states the
+// mechanism; this file states what is DIFFERENT about the variant side).
+//
+// Three things are the variant table's own:
+//   · the ROW is `uFieldElemKeyI32`, written through the same `pushFieldRow` by
+//     BOTH variant recorders — the DECLARED `type A = {f: {[i32]: V}}` arm
+//     (`collectVariantFields`, which reads a `FieldDef`) and the INLINE
+//     `{f: {[i32]: V}} | i32` arm (`collectShapeVariantFields`, which reads the
+//     field TYPE TEXT). They are two derivations of the same answer;
+//   · the READ is `uFieldMapShape`, reached from three places — the type
+//     section's variant loop, the variant-literal construct seed, and BOTH of
+//     `mapShapeOfExpr`'s variant arms (the `is`-NARROWED member and the
+//     variant-TYPED value);
+//   · the LAYOUT GUARD. `variantFieldLayoutEq` decides whether two variants share
+//     one WasmGC heap type, and its code-19 arm compared the map VALUE alone — so
+//     `{f: {[i32]: V}}` and `{f: {[string]: V}}` looked like layout twins while
+//     storing two different map structs. `variantFieldCodesEq` (the earlier,
+//     `collectU`-time discrimination reject) had the same blind spot. Both now
+//     ask the key column, which is why the two spellings in `mixedUnion` below
+//     stay two rows.
+
+type Hits = { h: {[i32]: i32} }
+type Miss = { m: i32 }
+type Ev = Hits | Miss
+
+// The DECLARED variant arm, narrowed by `is`.
+function declaredArm() {
+  const e: Ev = { h: Map() }
+  if e is Hits {
+    e.h[11] = 3
+    e.h[22] = 4
+    print(e.h.length)      // 2
+    print(e.h[11] ?? 0)    // 3
+    print(e.h.has(22))     // true
+    e.h.delete(22)
+    // The BOUND receiver off a narrowed variant field.
+    const b = e.h
+    print(b.length)        // 1
+    for k in e.h {
+      print(k)             // 11
+    }
+  }
+}
+declaredArm()
+
+// The INLINE-SHAPE variant arm: the WHOLE `{f: {[i32]: V}} | i32` spelling is one
+// `TypeRef`, so the union peel in `i32MapSpellingLowerable` is what lets it in and
+// the shape-text recorder is what writes its row.
+function inlineArm() {
+  const v: {f: {[i32]: string}} | i32 = { f: Map() }
+  if v is {f: {[i32]: string}} {
+    v.f[11] = "hi"
+    print(v.f[11] ?? "-")  // hi
+    print(v.f.length)      // 1
+  } else {
+    print("other")
+  }
+  // The non-map arm still narrows.
+  const w: {f: {[i32]: string}} | i32 = 7
+  if w is {f: {[i32]: string}} {
+    print(w.f.length)
+  } else {
+    print("other")         // other
+  }
+}
+inlineArm()
+
+// A variant field map built behind a RETURN boundary, then read back.
+function makeIt(): {g: {[i32]: i32}} | i64 {
+  const h: {[i32]: i32} = Map()
+  h[11] = 9
+  return {g: h}
+}
+function acrossReturn() {
+  const r: {g: {[i32]: i32}} | i64 = makeIt()
+  if r is {g: {[i32]: i32}} {
+    print(r.g[11] ?? 0)    // 9
+  } else {
+    print(0)
+  }
+}
+acrossReturn()
+
+// TWO KEY REPS, TWO UNIONS, ONE MODULE. The arms carry DISTINCT field names, so
+// this is a discrimination-legal pair; what it pins is the LAYOUT half — the two
+// map fields agree on their value ("i32") and differ only in the key column, and
+// each must keep its own variant struct.
+type KI = { ki: {[i32]: i32} }
+type KS = { ks: {[string]: i32} }
+type KU = KI | KS
+function mixedUnion() {
+  const a: KU = { ki: Map() }
+  if a is KI {
+    a.ki[11] = 1
+    print(a.ki.length)     // 1
+  }
+  const b: KU = { ks: Map() }
+  if b is KS {
+    b.ks["z"] = 2
+    print(b.ks["z"] ?? 0)  // 2
+  }
+}
+mixedUnion()

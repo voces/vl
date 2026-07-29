@@ -361,6 +361,7 @@ import {
   rlWrapIdx,
   sDeclared,
   sFieldCount,
+  sFieldElemKeyI32,
   sFieldElemName,
   sFieldElemTyIx,
   sFieldNames,
@@ -376,6 +377,7 @@ import {
   startStmts,
   uDeclared,
   uFieldCount,
+  uFieldElemKeyI32,
   uFieldElemName,
   uFieldElemTyIx,
   uFieldNames,
@@ -408,7 +410,7 @@ import {
   mvSlotOfTyK,
   mvSlotOfValNameTyK,
   recordMvValTyIx,
-  recordSFieldElemTyIx,
+  recordSFieldElemRow,
   recordSTyIx,
   recordUnMemTys,
   repCanonKey,
@@ -4981,6 +4983,70 @@ export function uFieldElemTyIxAt(vi: i32, fi: i32): i32 {
   const ix = uFieldStart[vi] + fi
   if ix >= uFieldElemTyIx.length { return -1 }
   uFieldElemTyIx[ix]
+}
+
+// The KEY half of struct `si`'s MAP field `fi` (B6b): true when the field's type is an
+// i32-keyed map. `sFieldElemKeyI32At`'s uncovered answer is FALSE (string-keyed), the
+// same self-heal shape the arena sidecar's -1 has — and the same conservative one, since
+// the string key is what every row meant before the column existed.
+export function sFieldElemKeyI32At(si: i32, fi: i32): boolean {
+  sFieldRowKeyI32(sFieldStart[si] + fi)
+}
+
+// The FLAT-ROW form, for the passes that walk the whole field table by row index rather
+// than by (struct, field) — `collectA`'s field re-derivation is the one that must not
+// lose the key, because an INLINE `{m: {[i32]: V}}` shape is ONE `TypeRef` whose map
+// never reaches the annotation scan's own bare-map arm.
+export function sFieldRowKeyI32(row: i32): boolean {
+  if row >= sFieldElemKeyI32.length { return false }
+  sFieldElemKeyI32[row] == 1
+}
+
+// The `sFieldElemKeyI32At` twin for VARIANT fields (`uFieldElemKeyI32`).
+export function uFieldElemKeyI32At(vi: i32, fi: i32): boolean {
+  uFieldRowKeyI32(uFieldStart[vi] + fi)
+}
+
+// The `sFieldRowKeyI32` twin for the VARIANT field table.
+export function uFieldRowKeyI32(row: i32): boolean {
+  if row >= uFieldElemKeyI32.length { return false }
+  uFieldElemKeyI32[row] == 1
+}
+
+// THE ONE HOME of "which map does struct `si`'s MAP field `fi` denote" — the shape
+// vocabulary every map op site threads (`-1` mono string-keyed, `-4` mono i32-keyed, a
+// `>= 0` mv slot for a ref/wide value on either key).
+//
+// Before B6b this was `mvSlotOfValNameFind(sFieldElemNameAt(si, fi))` spelled at four
+// sites (the type SECTION's struct loop, the object-literal construct seed, the field
+// STORE seed, and `mapShapeOfExpr`'s struct-receiver arm), each of which read the VALUE
+// column alone — so an i32-keyed map field would have resolved its string-keyed twin's
+// map struct. The FIELD ROW's key column (`sFieldElemKeyI32`) is the missing half, and
+// naming the composition once is what keeps the four sites from disagreeing.
+//
+// ARENA first (the `sFieldMapValSlot` discipline it replaces): the recorded VALUE type
+// resolves through the mv layer's own key, PAIRED with the row's key rep. Every negative
+// falls through to the name resolver unchanged, so the mono verdict and the loud
+// "no interned slot" failure stay exactly where they were — with the mono verdict now
+// naming WHICH mono struct it means (`mapMonoShapeOfKey`), which is the whole point.
+export function sFieldMapShape(si: i32, fi: i32): i32 {
+  const ki = sFieldElemKeyI32At(si, fi)
+  const a = mvSlotOfTyK(sFieldElemTyIxAt(si, fi), ki)
+  if a >= 0 { return a }
+  const s = mvSlotOfValNameFindK(sFieldElemNameAt(si, fi), ki)
+  if s == -1 { return mapMonoShapeOfKey(ki) }
+  s
+}
+
+// The `sFieldMapShape` twin for a VARIANT's map field, off the `uFieldElemTyIx` /
+// `uFieldElemKeyI32` sidecars (the `uFieldTgtStructIdx` / `variantFieldRefSlot` shape).
+export function uFieldMapShape(vi: i32, fj: i32): i32 {
+  const ki = uFieldElemKeyI32At(vi, fj)
+  const a = mvSlotOfTyK(uFieldElemTyIxAt(vi, fj), ki)
+  if a >= 0 { return a }
+  const s = mvSlotOfValNameFindK(variantFieldElemName(vi, fj), ki)
+  if s == -1 { return mapMonoShapeOfKey(ki) }
+  s
 }
 
 // The ref-list table SLOT for an ARENA element type (destringify D5) — the
@@ -12690,7 +12756,7 @@ export function internInlineShape(nm: string) {
         }
       }
       sFieldElemName.push(e5)
-      recordSFieldElemTyIx(e5) // D5
+      recordSFieldElemRow(e5, false) // D5 (+ B6b: a ref-list field has no map key)
       if isValueUnionName(e5) { registerValueUnionName(e5) }
     } else if codes[pi] == 28 {
       // A NULLABLE ref-list field (`f: S[] | null`): its element name is the ref-array element of the
@@ -12713,7 +12779,7 @@ export function internInlineShape(nm: string) {
         if structIndexByName(raw28) >= 0 { e28 = raw28 }
       }
       sFieldElemName.push(e28)
-      recordSFieldElemTyIx(e28) // D5
+      recordSFieldElemRow(e28, false) // D5 (+ B6b: not a map field)
       if isValueUnionName(e28) { registerValueUnionName(e28) }
     } else {
       // EVERY OTHER CODE is recorded IDENTICALLY from the field's spelling, so the
@@ -12727,7 +12793,11 @@ export function internInlineShape(nm: string) {
       // records a DEFERRED `[]`-slice for `collectA`'s variant field pass to intern.
       const en = shapeFieldElemName(texts[pi], codes[pi])
       sFieldElemName.push(en)
-      recordSFieldElemTyIx(en) // D5
+      // B6b: the KEY half of a map field's row (codes 19 / 29) — read off the field's
+      // own SPELLING, the same text `shapeFieldElemName` sliced the VALUE out of.
+      // `nameIsI32KeyedMap` is false for every non-map spelling, so this is inert on
+      // every other code in this arm.
+      recordSFieldElemRow(en, nameIsI32KeyedMap(texts[pi])) // D5
       // The union FIELD's name keys its atom set; registering it interns the shared
       // box + the value-box reps it needs (this runs after `collectU`, but before any
       // type-index math).
@@ -12775,7 +12845,11 @@ export function internShapeAs(key: string, nm: string) {
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
     sFieldElemName.push("")
-    recordSFieldElemTyIx("") // D5
+    // This recorder banks NO element name for any code (its rows carry "" — the alias
+    // shape's fields are re-derived elsewhere), but the KEY half is free and is read
+    // straight off the field's own spelling, so a mono i32-keyed map field here names
+    // its own map struct instead of the string-keyed twin's.
+    recordSFieldElemRow("", nameIsI32KeyedMap(rawTexts[pi])) // D5
     pi = pi + 1
   }
   0
@@ -12873,6 +12947,10 @@ export function gaeEnsure(name: string) {
   const names: string[] = []
   const codes: i32[] = []
   const elems: string[] = []
+  // B6b: the field ROW's KEY column, banked per field beside its element name — an
+  // APPLIED field spelling (`{[i32]: T}` at `T = i32`) is the only place the key is
+  // legible, and the push loop below no longer has the spelling.
+  const ekeys: i32[] = []
   let ok = true
   const fs = gaeFieldStart[gi]
   const fc = gaeFieldCount[gi]
@@ -12921,6 +12999,9 @@ export function gaeEnsure(name: string) {
     names.push(gaeFieldNames[fs + fi])
     codes.push(code)
     elems.push(elem)
+    let ek = 0
+    if nameIsI32KeyedMap(tn) { ek = 1 }
+    ekeys.push(ek)
     fi = fi + 1
   }
   if !ok { return 0 }
@@ -12935,7 +13016,7 @@ export function gaeEnsure(name: string) {
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
     sFieldElemName.push(elems[pi])
-    recordSFieldElemTyIx(elems[pi]) // D5
+    recordSFieldElemRow(elems[pi], ekeys[pi] == 1) // D5
     pi = pi + 1
   }
   0
@@ -13280,6 +13361,18 @@ function variantFieldLayoutEq(a: i32, b: i32): i32 {
         return 0
       }
     } else if ca == 19 {
+      // NO KEY COMPARISON HERE, AND IT IS MEASURED, NOT ASSUMED (B6b). A `{[i32]: V}`
+      // field and a `{[string]: V}` field DO store different map structs, and the value
+      // comparison below cannot see the difference (both rows record the same VALUE
+      // name) — but this guard never runs on such a pair: `buildVariantTwins` only calls
+      // it when `repNameCanonKey` already matched, and that key comes off the ARENA,
+      // where the two spellings are `TyMap`s with different key types. The witness is
+      // `tests/cases/maps/i32-keyed-variant-field.vl`'s `mixedUnion` plus a two-UNION
+      // probe (`{f:{[i32]:string}}` in one, `{f:{[string]:string}}` in another, the only
+      // shape that reaches this comparison across unions): both run byte-identically with
+      // a key comparison added here and with it absent. The `collectU`-time sibling
+      // `variantFieldCodesEq` is a different story — it is NOT canon-key gated, and its
+      // key comparison has a witness (`unions/same-field-names-different-map-keys-reject.vl`).
       const ma = mvSlotOfMapValNameOrMono(uFieldElemName[uFieldStart[a] + fi])
       const mb = mvSlotOfMapValNameOrMono(uFieldElemName[uFieldStart[b] + fi])
       let mOk = false
@@ -19373,13 +19466,16 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       if letIsNulMap(gl, -1) { return nulMapShapeOf(gl, -1) }
     }
   }
-  // A MAP-typed struct field read (`node.children`, code 19): the shape is the
-  // field's value-type mv slot (-1 = the mono i32 map). Mirrors `memberFieldCode`'s
-  // receiver dispatch — a NARROWED union member (`t0.f` after `is {f:{[string]:V}}`)
-  // and a VARIANT-typed value resolve through the variant field tables (without the
-  // arms the read fell to the mono -1 and the typed map ref mismatched its
-  // mono-typed scratch local — invalid wasm), a plain struct receiver through the
-  // struct table.
+  // A MAP-typed struct field read (`node.children`, code 19): the shape is the field
+  // row's (KEY, VALUE) pair — `-1` the mono string-keyed map, `-4` the mono i32-keyed
+  // one, a mv slot for a ref/wide value. Mirrors `memberFieldCode`'s receiver dispatch
+  // — a NARROWED union member (`t0.f` after `is {f:{[string]:V}}`) and a VARIANT-typed
+  // value resolve through the variant field tables (without the arms the read fell to
+  // the mono -1 and the typed map ref mismatched its mono-typed scratch local — invalid
+  // wasm), a plain struct receiver through the struct table. All three read the shape
+  // through the same home the CONSTRUCT and the TYPE SECTION do (B6b): a receiver
+  // classifier that answered a different struct than the field's storage type is the
+  // same invalid-wasm class one layer up.
   if e is Member {
     if memIsNarrowed(exprIx) {
       const nvi = memNarrowVariantIndex(exprIx)
@@ -19387,9 +19483,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
         const nvfi = variantFieldIndex(nvi, e.memProp)
         if nvfi >= 0 {
           const nvc = variantFieldTypeAt(nvi, nvfi)
-          if nvc == 19 || nvc == 29 {
-            return mvSlotOfValNameFind(variantFieldElemName(nvi, nvfi))
-          }
+          if nvc == 19 || nvc == 29 { return uFieldMapShape(nvi, nvfi) }
         }
       }
     }
@@ -19398,9 +19492,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       const pvfi = variantFieldIndex(pvi, e.memProp)
       if pvfi >= 0 {
         const pvc = variantFieldTypeAt(pvi, pvfi)
-        if pvc == 19 || pvc == 29 {
-          return mvSlotOfValNameFind(variantFieldElemName(pvi, pvfi))
-        }
+        if pvc == 19 || pvc == 29 { return uFieldMapShape(pvi, pvfi) }
       }
     }
     const msi = structIndexOfExpr(e.memObj, fnIx)
@@ -19408,9 +19500,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       const mfi = sFieldIndex(msi, e.memProp)
       if mfi >= 0 {
         const mfc = sFieldTypeAt(msi, mfi)
-        if mfc == 19 || mfc == 29 {
-          return mvSlotOfValNameFind(sFieldElemNameAt(msi, mfi))
-        }
+        if mfc == 19 || mfc == 29 { return sFieldMapShape(msi, mfi) }
       }
     }
   }
