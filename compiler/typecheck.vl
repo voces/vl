@@ -11430,7 +11430,8 @@ function checkCallNode(n: Call, ix: i32) {
     // Map/Set methods over the `{[K]: V}` rep, gated by FLAVOR: a map exposes
     // `.set`/`.get`/`.has`/`.delete`/`.keys()`/`.values()`; a SET exposes only
     // `.add`/`.has`/`.delete`/`.values()` (the Map surface must not leak — `.set`
-    // on a set / `.add` on a map is an unknown-property error). The first
+    // on a set is an unknown-property error). `.add` is the one member gated on
+    // the VALUE TYPE rather than on the flavor bit — see its arm. The first
     // `.set`/`.add` on a bare `Map()`/`Set()` PINS its key/value holes in place,
     // so a later conflicting use is a clean type error.
     if rt is TyMap {
@@ -11497,7 +11498,31 @@ function checkCallNode(n: Call, ix: i32) {
         }
         return mkNullableTy(rt.mVal)
       }
-      if mp == "add" && rt.mSet == 1 {
+      // `.add(x)` — the membership INSERT, `m[x] = true` spelled as the Set surface.
+      // ADMITTED ON ANY MAP WHOSE VALUE IS `boolean`, not only on one whose
+      // PROVENANCE is a `Set()` call. `mSet` is a one-way refinement: it is written
+      // by the `Set()` constructor and carried onto a `let`/`const` binding under a
+      // map-shaped annotation (see `checkLetDeclNode`), and by NO other position —
+      // a struct or variant FIELD, an inline-shape field, a PARAM, a return, an
+      // array element and a map value all resolve `{[K]: boolean}` through
+      // `tsToTy`/`nameToTyReal`, which build `mkMapTy(k, v, 0)`. So gating `.add` on
+      // `mSet == 1` made it a property of HOW THE VALUE WAS SPELLED AT ITS BINDING
+      // rather than of its type, and `s.seen.add(5)` was `unknown property` in every
+      // one of those positions — through a BOUND receiver (`const b = s.seen`)
+      // exactly as much as a direct one, which is what says the receiver form was
+      // never the discriminator.
+      // The value type IS the whole question: a `boolean`-valued map is precisely
+      // the shape that holds a Set's contents, `.add` stores the same constant
+      // `true` the assignment path stores, and the emitter's `add` arm is already
+      // flavor-blind (it gates on `exprMap`, the predicate `.set` gates on, and the
+      // reservation scan claims `set` and `add` in ONE arm). The Set surface stays
+      // sealed in the direction the tests pin: an `mSet == 1` value still gets
+      // `unknown property` for `.set`/`.get`/`.keys` (those arms gate on
+      // `mSet == 0`), and `.values()` still yields ELEMENTS for a set and the
+      // membership booleans for a map. A bare `Map()` whose value hole is still
+      // open (`mVal < 0`) is NOT boolean-valued, so it keeps rejecting `.add` —
+      // `Set()` remains the way to write a set.
+      if mp == "add" && (rt.mSet == 1 || tyIsPrimNamed(rt.mVal, "boolean")) {
         if margs2.length != 1 {
           tErr("add expects 1 argument, got " + i32ToStr(margs2.length), ix)
         } else {
@@ -19273,21 +19298,24 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
         // structurally; see its header for why the LEFT-SPINE descent is exactly the
         // `{[`-prefix test, character for character.
         //
-        // `nameToTy` — not `tsLeafTy`, its leaf-rung twin that `tsToTyReal`'s own map
-        // arm asks — is DELIBERATE and the two agree in VALUE on every possible key: a
-        // key is a bare `IDENT`, so `nameToTy`'s composite arms all decline and it runs
-        // `primTyOfName` → `tpEnvTyOfName` → `declaredTyOfName`, which IS `tsLeafTy`.
-        // They differ only in a SIDE EFFECT — `nameToTy` re-enters the `unkTyPart`
-        // bank at depth 1 and clears it, which is what makes the `else` arm below
-        // print the whole-annotation form (`unknown type '{[string]:nope}'`) rather
-        // than the component form (`unknown type 'nope' within …`) its `nope[]` /
-        // `nope | i32` siblings print. That inconsistency is real and pre-existing;
-        // changing it here would smuggle a diagnostic change into a refactor whose
-        // whole evidence is byte-identity, so it is filed, not taken.
+        // THE KEY PROBE IS `tsLeafTy`, THE LEAF RUNG `tsToTyReal`'S OWN MAP ARM ASKS.
+        // It resolves the same VALUE `nameToTy` does for every possible key — a key is
+        // a bare `IDENT`, so `nameToTy`'s composite arms all decline and it runs
+        // `primTyOfName` → `tpEnvTyOfName` → `declaredTyOfName`, which IS `tsLeafTy` —
+        // and it differs in the SIDE EFFECT that matters here: `nameToTy` re-enters the
+        // `unkTyPart` bank at depth 1 and CLEARS it. That clear is what made the `else`
+        // arm below print the whole-annotation form for a map whose VALUE is the
+        // unresolved part (`unknown type '{[string]:nope}'`) where the `nope[]` /
+        // `nope | i32` / `{v: nope}` siblings all print the component form
+        // (`unknown type 'nope' within '…'`) — a diagnostic that named the spelling
+        // the user already typed instead of the leaf they must fix. #1290 filed that
+        // inconsistency rather than smuggling it into a byte-identity refactor; this
+        // is the fix, and it is a probe that no longer perturbs a diagnostic bank it
+        // has no business touching, not a rewording.
         const mapKeyIx = tsMapKeyNodeOf(annTsOf(n.letType))
         let badKey = ""
         if mapKeyIx >= 0 { badKey = tsText[mapKeyIx] }
-        if badKey != "" && !mapKeyTySupported(nameToTy(badKey)) {
+        if badKey != "" && !mapKeyTySupported(tsLeafTy(badKey)) {
           tErrUnsupported(
             "A " +
               badKey +

@@ -1,0 +1,124 @@
+// @run
+// @log 2
+// @log true
+// @log 2
+// @log 5
+// @log 7
+// @log 2
+// @log 2
+// @log 1
+// @log 2
+// @log 2
+// @log 2
+// @log 2
+// @log 3
+// @log 1
+// CAPABILITY (B6a): `.add(x)` is admitted on ANY `boolean`-valued map, not only on
+// one whose PROVENANCE is a `Set()` call — so a set held in a struct FIELD, an
+// inline-shape field, a union ARM's field, a nested field, a PARAM, a RETURN, an
+// ARRAY ELEMENT or a global finally has the insert its own binding has.
+//
+// WHY IT WAS MISSING, AND WHY THE FIELD RECEIVER WAS NOT THE CAUSE. The checker's
+// `mSet` bit is written in exactly two places — the `Set()` constructor, and the
+// graft that carries it onto a `let`/`const` under a map-shaped annotation. Every
+// other position resolves `{[K]: boolean}` through `tsToTy` / `nameToTyReal`, which
+// build `mkMapTy(k, v, 0)`. So `.add` gated on `mSet == 1` was a property of HOW THE
+// VALUE WAS SPELLED AT ITS BINDING, not of its type, and the BOUND receiver
+// (`const b = s.seen`) was `unknown property` exactly as much as the direct one —
+// which is what proves the receiver form was never the discriminator.
+//
+// The gate is now the VALUE TYPE, which is the whole question: a `boolean`-valued
+// map is precisely the shape that holds a set's contents, and `.add(k)` stores the
+// same constant `true` that `.set(k, true)` stores through the very same
+// `emitMapSetV`. Every cell below was verified to print what its `.set(k, true)`
+// twin prints (168/168 over the sweep grid), and the Set surface stays sealed in the
+// direction the tests pin: `.set`/`.get`/`.keys` on a `Set()` value are still
+// unknown properties (`error-no-map-methods.vl`, `error-no-get.vl`), a
+// non-`boolean`-valued map still has no `.add`, and neither does a bare `Map()`
+// whose value hole is still open (`error-add-non-boolean-value.vl`).
+
+// A DECLARED struct field — direct and bound receivers.
+type S = { seen: {[i32]: boolean} }
+const s: S = { seen: Set() }
+s.seen.add(5)
+s.seen.add(7)
+s.seen.add(5) // duplicate — no-op
+print(s.seen.length) // 2
+print(s.seen.has(7)) // true
+const sb = s.seen
+sb.add(5)
+print(sb.length) // 2 — the bound receiver is the same set
+for k in s.seen {
+  print(k) // 5, then 7 — insertion order
+}
+
+// An INLINE-SHAPE field, string-keyed.
+const t: { seen: {[string]: boolean} } = { seen: Set() }
+t.seen.add("a")
+t.seen.add("b")
+print(t.seen.length) // 2
+
+// A DECLARED UNION ARM's field, reached through an `is` narrow.
+type A = { seen: {[i32]: boolean} }
+type B = { n: i32 }
+type U = A | B
+const u: U = { seen: Set() }
+if u is A {
+  u.seen.add(9)
+  u.seen.add(10)
+  print(u.seen.length) // 2
+  u.seen.delete(9)
+  print(u.seen.length) // 1
+}
+
+// An INLINE UNION ARM's field — the whole `{seen: {[K]: boolean}} | i32` spelling is
+// one `TypeRef`, so it is the arm that needed its own collect gate in #1289.
+const v: { seen: {[string]: boolean} } | i32 = { seen: Set() }
+if v is { seen: {[string]: boolean} } {
+  v.seen.add("p")
+  v.seen.add("q")
+  print(v.seen.length) // 2
+}
+
+// A NESTED field (`n.a.seen`).
+type I = { seen: {[string]: boolean} }
+type N = { a: I }
+const nn: N = { a: { seen: Set() } }
+nn.a.seen.add("x")
+nn.a.seen.add("y")
+print(nn.a.seen.length) // 2
+
+// A PARAM annotation, and an ARRAY ELEMENT.
+function fill(p: {[i32]: boolean}) {
+  p.add(1)
+  p.add(2)
+  print(p.length) // 2
+}
+const seed: {[i32]: boolean} = Set()
+fill(seed)
+
+const xs: {[i32]: boolean}[] = [Set()]
+xs[0].add(5)
+xs[0].add(7)
+print(xs[0].length) // 2
+
+// A RETURN boundary. `mk`'s local IS a `Set()`; what comes back is typed by the
+// RETURN annotation, so on master this binding had no `.add` either.
+function mk(): {[string]: boolean} {
+  const inner: {[string]: boolean} = Set()
+  inner.add("q")
+  return inner
+}
+const back = mk()
+back.add("r")
+back.add("s")
+print(back.length) // 3
+
+// THE `mSet == 1` DISJUNCT'S OWN WITNESS. A `Set()` under a `boolean | null`-valued
+// annotation keeps the Set flavor through the binding graft, but its value RENDERS
+// `boolean|null` — a two-member union, not the `boolean` primitive — so the value-typed
+// half of the gate answers no and only the flavor bit carries it. Without this cell,
+// deleting `rt.mSet == 1` is inert on the whole corpus.
+const nulset: {[string]: boolean | null} = Set()
+nulset.add("z")
+print(nulset.length) // 1

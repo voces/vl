@@ -34073,3 +34073,111 @@ producer. The re-resolver population that could be routed with the data already 
   Master's frozen source compiled by this head is byte-identical — and byte-identical under
   SAB-SHIFT too, which breaks 106 corpus programs. `compiler/`'s own struct table never hits an
   ambiguity `slotCanonKey` decides. *Report it as a no-regression leg, never as evidence.*
+
+## D-MAPKEYDIAG's FILED RESIDUE DISCHARGED — the key PROBE stops clobbering the `unkTyPart` bank, and the binding site joins the other four annotation sites (off master `75ff7198`)
+
+#1290 took W10 row 5 and, in taking it, **filed a diagnostic inconsistency rather than smuggling it
+into a byte-identity refactor**: `const m: {[string]: nope} = Map()` printed `unknown type
+'{[string]:nope}'` — the whole spelling the author had just typed — where the `nope[]`,
+`nope | i32`, `{v: nope}` and `{v: {[string]: nope}}` twins all printed the component form
+`unknown type 'nope' within '…'`. That filing is discharged here, and the mechanism was exactly the
+one #1290's own PR body named.
+
+### The cause is a SIDE EFFECT of a probe, not a message rule
+
+`checkLetDeclNode` resolves the annotation, and on failure the innermost frame has already banked the
+offending leaf in `unkTyPart`. Only THEN does the unsupported-map-key gate run, and it probed the key
+with `nameToTy(badKey)` — the WRAPPED resolver, which re-enters at `unkTyDepth == 1` and **clears the
+bank** before resolving `string` successfully. `unknownTyText` then read an empty bank and fell back
+to the whole name. The `nope[]` twin never reaches the gate at all (`tsMapKeyNodeOf` returns -1, so
+`badKey` is `""` and the probe never runs), which is precisely why the two spellings disagreed.
+
+The probe is now `tsLeafTy(badKey)` — **the leaf rung `tsToTyReal`'s own `TS_MAP` arm asks**. #1290
+proved the two agree in VALUE on every possible key over a 196-cell grid (a key is a bare `IDENT`, so
+`nameToTy`'s composite arms all decline and it runs `primTyOfName` → `tpEnvTyOfName` →
+`declaredTyOfName`, which IS `tsLeafTy`); the only difference was the bank, and the bank is the bug.
+So the sketch row 5 filed was not wrong about `tsLeafTy` — it was wrong about `tsLeafTy` being
+*inert*, and it is that non-inertness that fixes this.
+
+**A diagnostic PROBE has no business perturbing a diagnostic BANK.** That is the transferable rule:
+when a message reads worse at exactly one of five otherwise-identical sites, look for a side effect
+between the resolution and the read, not for a missing arm in the message builder.
+
+### What moved, enumerated
+
+A purpose-built 925-cell grid — 37 annotation shapes × 4 initializers × 7 declaration forms — compared
+on VERDICT and the FULL diagnostic text: **805 identical, 120 differing, 0 rc moved**. Every one of the
+120 is the same strict improvement, and they fall into exactly ten distinct message pairs:
+
+| A (master) | B (this change) | cells |
+| --- | --- | ---: |
+| `unknown type '{[string]:nope}'` | `unknown type 'nope' within '{[string]:nope}'` | 12 |
+| `unknown type '{[i32]:nope}'` | `unknown type 'nope' within '{[i32]:nope}'` | 12 |
+| `unknown type '{[string]:nope[]}'` | `unknown type 'nope' within '{[string]:nope[]}'` | 12 |
+| `unknown type '{[string]:nope\|i32}'` | `unknown type 'nope' within '{[string]:nope\|i32}'` | 12 |
+| `unknown type '{[string]:{v:nope}}'` | `unknown type 'nope' within '{[string]:{v:nope}}'` | 12 |
+| `unknown type '{[string]:{[string]:nope}}'` | `unknown type 'nope' within '{[string]:{[string]:nope}}'` | 12 |
+| `unknown type '{[string]:nope}[]'` | `unknown type 'nope' within '{[string]:nope}[]'` | 12 |
+| `unknown type '{[string]:nope}\|null'` | `unknown type 'nope' within '{[string]:nope}\|null'` | 12 |
+| `unknown type '{[string]:nope}\|i32'` | `unknown type 'nope' within '{[string]:nope}\|i32'` | 12 |
+| `unknown type '{[string]:{[boolean]:i32}}'` | `unknown type '{[boolean]:i32}' within '{[string]:{[boolean]:i32}}'` | 12 |
+
+All 120 are in the `const` / `let` / function-local-`const` forms — 40 each — and **zero** are at a
+PARAM, RETURN, FIELD or ALIAS site, because only the binding site runs the key gate. That is the
+result restated as a scope claim: the fix makes the binding site agree with the four sites that were
+already right, and `types/unknown-type-names-the-component.vl`'s `function d(v: {[string]: nope})` is
+the pre-existing witness that they were.
+
+The `{[string]: {[boolean]: i32}}` row is worth its own line: the OUTER key is supported, so the gate
+declines and the else arm runs — and what the bank holds there is the INNER MAP, not a leaf name. The
+component form is a component form, not a leaf form.
+
+Two shapes that DID NOT move are the boundary:
+
+* `{v: {[string]: nope}}` already printed the `within` form on master — its left spine opens `TS_OBJ`,
+  so `tsMapKeyNodeOf` declines and the probe never ran. The width `tsMapKeyNodeOf` documents is the
+  width that decides which spellings this touches, unchanged.
+* `{[boolean]: i32}` (and its `[]` / `| null` carriers) keep the actionable capability message. Nothing
+  failed at a leaf inside them, so the bank is empty either way — the `unkTyDepth == 1` reset that
+  `unknown-type-names-the-component.vl` pins is untouched and still the only thing standing between
+  that message and a stale `nope` banked by an earlier annotation.
+
+### Instrument calibration: the corpus zero is REAL
+
+Six-channel corpus A/B over 1,699 files: **field 5 (BYTES) 1,699 same, and ZERO pre-existing files
+move on any channel** — the only two rows are the two fixtures this branch adds.
+
+That zero would be worthless if field 2 were blind here, so it was calibrated. SAB-4 — replace
+`unknownTyText`'s component form with a nonsense concatenation — moves **9 CHECKMSG rows, 7 of them
+PRE-EXISTING**: `types/unknown-type-names-the-component.vl`, `types/unknown-type-in-union-member.vl`,
+`types/unknown-type-in-inline-object-field.vl`, `types/unknown-type-in-map-value.vl`,
+`maps/error-unsupported-key-not-at-head.vl`, `soundness/union-unknown-member-reject.vl` and
+`lint/generic-intersection-no-warn.vl`. The channel sees this message family; it simply has nothing
+pre-existing to say about the binding SITE, because a corpus fixture that spells an unresolvable map
+value spells it at a param or a return.
+
+SAB-3 — restore `nameToTy(badKey)` — reddens **exactly one** test, the new
+`types/unknown-type-in-map-value-binding.vl`, which is the fixture's whole reason to exist.
+
+### VACUITY, stated rather than banked
+
+The fuzz channel cannot reach this change either, and the mechanism is checkable in the generated
+corpus. Over **28,800 cases / 343,678 lines** (6 seeds × 3 depths × 800, pinned grammar):
+
+| probe | count |
+| --- | ---: |
+| cases containing an unresolvable type name (`nope`) | **0** |
+| cases containing `{[i32]` | **0** |
+| cases containing `{[string]` | 5,538 files / 23,418 occurrences |
+| cases containing `Map()` | 5,156 files |
+
+The generator only ever spells types that resolve, so it cannot produce an `unknown type` diagnostic
+at all. Its zero is coverage of everything else (0 of 28,800 cases differ on `vl check --codegen`),
+not evidence about this change.
+
+### STALE FILING CLEARED
+
+`typecheck.vl`'s own header comment at the key gate — the paragraph explaining why `nameToTy` was
+kept "DELIBERATE" — is replaced by the paragraph explaining why `tsLeafTy` is. #1290's residue note
+in this document's §7 (`the sketch's tsLeafTy is REFUTED by a sabotage witness`) should be read
+together with this section: the witness refuted *inertness*, not the resolver.
