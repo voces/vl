@@ -328,6 +328,7 @@ import {
   msSetNext,
   msSetRow,
   msSetText,
+  mvKeyI32,
   mvMapTypeIdx,
   mvRlSlot,
   mvValKind,
@@ -401,9 +402,11 @@ import {
 import { emitFail } from "./emit_bytes"
 import {
   fieldElemTyIxOfName,
+  mapShapeKeyI32,
   msAtomIdOf,
-  mvSlotOfTy,
-  mvSlotOfValNameTy,
+  mvSlotKeyI32,
+  mvSlotOfTyK,
+  mvSlotOfValNameTyK,
   recordMvValTyIx,
   recordSFieldElemTyIx,
   recordSTyIx,
@@ -426,6 +429,7 @@ import {
   tyDenotesFunc,
   tyIsI32LeafElem,
   tyIsStrLeafElem,
+  tyMapKeyIsI32,
   unMemRowStart,
   vbHeapIdxOfKind,
 } from "./emit_rep"
@@ -3552,31 +3556,55 @@ function canonLitUnionArms(name: string): string {
 }
 
 // The mv table's NAME scan — first-match-wins over the recorded canonical value
-// spellings. The legacy key of the map-value slot layer, shared by every entry
-// point so the one scan order is stated once.
-export function mvSlotByValName(valName: string): i32 {
+// spellings, WITHIN one key rep. The legacy key of the map-value slot layer, shared by
+// every entry point so the one scan order is stated once. The `keyI32` argument is the
+// slot identity's other half: `{[string]: S}` and `{[i32]: S}` record the SAME value
+// spelling and are two layouts, so a key-blind scan would hand the second map the first
+// one's struct (a string-ref keys list read as an i32 list — invalid wasm).
+export function mvSlotByValNameK(valName: string, keyI32: boolean): i32 {
   let i = 0
   while i < mvValName.length {
-    if mvValName[i] == valName { return i }
+    if mvValName[i] == valName {
+      if mvSlotKeyI32(i) == keyI32 { return i }
+    }
     i = i + 1
   }
   -1
 }
-
 // The mv shape of a BARE MAP spelling — `mvShapeOfValName` of the map's VALUE. Five call
 // sites composed these two by hand, which meant five sites each deciding, locally, that
 // the way to get from `{[string]: V}` to its value rep is to SLICE `V` out of the
 // spelling. One home: when the map's value comes off the arena instead
 // (`T.tys[m] is TyMap` → the value ty), there is one call to change.
+//
+// THIS IS THE ONE PLACE THE KEY ENTERS THE MV LAYER. Every other resolver takes the key
+// as an argument; this one reads it off the map spelling itself, so an i32-keyed map's
+// VALUE interns against the i32-keyed key rep without any caller being taught.
 export function mvShapeOfMapName(mapName: string) {
-  // An i32-KEYED map rides its OWN map struct, never an mv slot: its supported values
-  // are exactly the mono ones (`collectA`'s capability gate rejects the rest), so the
-  // shape is the i32-keyed mono sentinel and no slot is interned for it.
-  if nameIsI32KeyedMap(mapName) { return -4 }
-  mvShapeOfValName(mapValNameOf(mapName))
+  const ki = nameIsI32KeyedMap(mapName)
+  const sh = mvShapeOfValNameK(mapValNameOf(mapName), ki)
+  // A MONO value (i32 / boolean / a literal-union atom / a nullable atom) rides the
+  // shared i32 `vals` list, so it needs no per-value struct at all: it is the `-1`
+  // string-keyed / `-4` i32-keyed sentinel, which is the pair every value-blind
+  // classifier already reads as "the mono rep".
+  if sh == -1 { return mapMonoShapeOfKey(ki) }
+  sh
 }
 
 export function mvShapeOfValName(valNameIn: string) {
+  mvShapeOfValNameK(valNameIn, false)
+}
+
+// The MONO map shape of a key rep — the `-1` / `-4` pair, named once. A value that rides
+// the shared i32 `vals` list interns no slot on EITHER key, so every resolver that lands
+// on "mono" still has to say which of the two structs it means; before the i32-keyed rep
+// existed there was only one answer and the constant was written inline.
+export function mapMonoShapeOfKey(keyI32: boolean) {
+  if keyI32 { return -4 }
+  -1
+}
+
+export function mvShapeOfValNameK(valNameIn: string, keyI32: boolean) {
   const valName = mvCanonValName(valNameIn)
   const kind = mvValKindOfName(valName)
   if kind == -1 { return -1 }
@@ -3597,12 +3625,12 @@ export function mvShapeOfValName(valNameIn: string) {
     if isValueUnionName(valName) { registerValueUnionName(valName) }
     markMapUnionArms(valName)
   }
-  // The slot's identity is STRUCTURAL (`repMvValKey` over the value's arena type),
-  // not the recorded spelling; the name scan stays as the fall-through for a value
-  // spelling the arena does not resolve.
-  const aSh = mvSlotOfValNameTy(valNameIn)
+  // The slot's identity is STRUCTURAL (`repMvValKey` over the value's arena type) PAIRED
+  // with the key rep, not the recorded spelling; the name scan stays as the fall-through
+  // for a value spelling the arena does not resolve.
+  const aSh = mvSlotOfValNameTyK(valNameIn, keyI32)
   if aSh >= 0 { return aSh }
-  const nmSh = mvSlotByValName(valName)
+  const nmSh = mvSlotByValNameK(valName, keyI32)
   if nmSh >= 0 { return nmSh }
   // A kind-6 (ref-VALUE: nested map / list) value forces the i32-list + map types, and a
   // MAP value also interns its INNER value shape first (so a ref-valued inner map's struct
@@ -3630,6 +3658,10 @@ export function mvShapeOfValName(valNameIn: string) {
     rls6 = ensureRefElem(bare)
   }
   mvValName.push(valName)
+  // The slot's KEY half, pushed in lockstep with its NAME half — the pair IS the row's
+  // identity, so nothing between the two pushes may intern (the same discipline the
+  // `rls6` hoist above exists for).
+  if keyI32 { mvKeyI32.push(1) } else { mvKeyI32.push(0) }
   recordMvValTyIx(valName)
   mvValKind.push(kind)
   mvValStructIdx.push(vsi)
@@ -3676,6 +3708,9 @@ export function mvShapeOfValName(valNameIn: string) {
 // `mAssignTypeIndices` would mint no type index) — so a miss is a compiler bug
 // and fails loudly.
 export function mvSlotOfValNameFind(valNameIn: string) {
+  mvSlotOfValNameFindK(valNameIn, false)
+}
+export function mvSlotOfValNameFindK(valNameIn: string, keyI32: boolean) {
   const valName = mvCanonValName(valNameIn)
   // Mono-ness is decided by the ONE classifier the interner uses (`mvValKindOfName`):
   // i32 / boolean, a literal-union ATOM value (`{[string]: K0}` — a struct FIELD records
@@ -3684,9 +3719,9 @@ export function mvSlotOfValNameFind(valNameIn: string) {
   // old two-name test rejected the atom spellings loudly ("no interned slot") even
   // though the SAME map lowers fine as a binding — the R1 map-in-field seam.
   if mvValKindOfName(valName) == -1 { return -1 }
-  const aFd = mvSlotOfValNameTy(valNameIn)
+  const aFd = mvSlotOfValNameTyK(valNameIn, keyI32)
   if aFd >= 0 { return aFd }
-  const nmFd = mvSlotByValName(valName)
+  const nmFd = mvSlotByValNameK(valName, keyI32)
   if nmFd >= 0 { return nmFd }
   emitFail("emitProgram: map value type has no interned slot")
   -1
@@ -3695,10 +3730,25 @@ export function mvSlotOfValNameFind(valNameIn: string) {
 // A kind-6 (ref-VALUE) map slot's values are either inner MAP structs (ref-list element
 // kind 3) or i32-LIST wrappers (element kind 4). These split the two so a read classifies
 // as the right thing — `m[k]` over a nested map is a Map, over a list-valued map an i32 list.
-function mvValIsMap(slot: i32) {
+export function mvValIsMap(slot: i32) {
   if slot < 0 { return false }
   if mvValKind[slot] != 6 { return false }
   rlElemKindTbl[mvRlSlot[slot]] == 3
+}
+
+// The map SHAPE a nested-MAP-valued slot's inner `Map()` must construct: the inner
+// value's own mv slot when it has one, else the MONO shape of the INNER map's key. Only
+// meaningful when `mvValIsMap(slot)`.
+//
+// Before the i32-keyed rep this question had a silent right answer at one of its two
+// call sites and a silent WRONG one at the other: an inner mono `{[string]: i32}` is the
+// `-1` every unseeded `Map()` already builds, so the store/read never had to seed it,
+// while an inner `{[string]: string}` built the mono struct into a typed vals slot —
+// invalid wasm on master, `vl check` clean. Naming the shape fixes both halves at once.
+export function mvInnerMapShape(slot: i32): i32 {
+  const inner = mvValInnerMvSlot(slot)
+  if inner >= 0 { return inner }
+  mapMonoShapeOfKey(rlElemMapKeyI32(mvRlSlot[slot]))
 }
 
 // The list-element rep of a list-VALUED map slot — `2` i32-list (ref-list elem 4), `7`
@@ -5318,7 +5368,37 @@ export function rlElemMapValMvSlotAt(slot: i32, peelNul: boolean): i32 {
   }
   if b < 0 { return -1 }
   const bt = T.tys[b]
-  if bt is TyMap { return mvSlotOfTy(bt.mVal) }
+  // The slot's KEY comes off the SAME `TyMap` its value does — one hop, both halves.
+  if bt is TyMap { return mvSlotOfTyK(bt.mVal, tyMapKeyIsI32(b)) }
+  -1
+}
+
+// The KEY half of the same element question: `1` the ref-list element is an i32-KEYED
+// map, `0` it is string-keyed, `-1` the sidecar does not cover the slot / the element is
+// not a map (the caller keeps its element-NAME leg). Always peels one `TyNullable`, as
+// the value twin does with `peelNul` — a `{[i32]: V} | null` element carries the SAME
+// map struct as its non-null twin, so its key must answer the same too.
+export function rlElemMapKeyI32(slot: i32): boolean {
+  const ar = rlElemMapKeyI32At(slot)
+  if ar >= 0 { return ar == 1 }
+  let en = rlElemName[slot]
+  const enn = nulMapInnerName(en)
+  if enn != "" { en = enn }
+  nameIsI32KeyedMap(en)
+}
+
+export function rlElemMapKeyI32At(slot: i32): i32 {
+  const ty = rlElemTyIxAt(slot)
+  if ty < 0 { return -1 }
+  let b = ty
+  const t = T.tys[b]
+  if t is TyNullable { b = t.nInner }
+  if b < 0 { return -1 }
+  const bt = T.tys[b]
+  if bt is TyMap {
+    if tyMapKeyIsI32(b) { return 1 }
+    return 0
+  }
   -1
 }
 
@@ -5378,7 +5458,7 @@ export function mvValInnerMvSlotAt(slot: i32): i32 {
   const t = T.tys[ty]
   // NOT peeled through a `| null`: `mapValNameOf` requires a bare `{[K]:V}` spelling
   // too (it answers "" for a nullable map name), so both legs decline together.
-  if t is TyMap { return mvSlotOfTy(t.mVal) }
+  if t is TyMap { return mvSlotOfTyK(t.mVal, tyMapKeyIsI32(ty)) }
   -1
 }
 
@@ -8073,7 +8153,7 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
         // question — the two `"str"` answers below are the string-keyed half of a pair.
         const kk = mapShapeOfExpr(callee.memObj, fnIx)
         if callee.memProp == "keys" {
-          if kk == -4 || kk == -5 { return "i32" }
+          if mapShapeKeyI32(kk) { return "i32" }
           return "str"
         }
         if callee.memProp == "values" {
@@ -8116,7 +8196,7 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   // the string-keyed rep (kind 3), i32 for the i32-keyed one.
   if exprMap(iterIx, fnIx) {
     const bk = mapShapeOfExpr(iterIx, fnIx)
-    if bk == -4 || bk == -5 { return "i32" }
+    if mapShapeKeyI32(bk) { return "i32" }
     return "str"
   }
   if exprStringArray(iterIx, fnIx) { return "str" }
@@ -10003,15 +10083,19 @@ export function mapAnnShape(tyIx: i32) {
       const nim = nulMapInnerName(mn)
       if nim != "" { mn = nim }
       if nameIsMap(mn) {
-        // An i32-KEYED annotation selects the i32-keyed struct, whatever its (mono)
-        // value — the param/return/nulmap valtype and the body shape must agree.
-        if nameIsI32KeyedMap(mn) { return -4 }
+        // The KEY selects which map struct family the annotation names — the
+        // param/return/nulmap valtype and the body shape must agree on BOTH halves.
+        const kAn = nameIsI32KeyedMap(mn)
         const vn = mapValNameOf(mn)
-        if vn == "i32" || vn == "boolean" { return -1 }
-        const aAn = mvSlotOfValNameTy(vn)
+        // A MONO value rides the shared struct of its own key rep: the `-1`/`-4` pair.
+        if vn == "i32" || vn == "boolean" { return mapMonoShapeOfKey(kAn) }
+        const aAn = mvSlotOfValNameTyK(vn, kAn)
         if aAn >= 0 { return aAn }
-        const nmAn = mvSlotByValName(vn)
+        const nmAn = mvSlotByValNameK(vn, kAn)
         if nmAn >= 0 { return nmAn }
+        // A mono-repped value spelling the two scans above never intern (a literal-union
+        // atom, a nullable atom) still resolves by KEY alone.
+        if kAn { return -4 }
       }
     }
   }
@@ -11795,6 +11879,12 @@ export function rlSlotsLayoutTwin(a: i32, b: i32): i32 {
 export function repMapValSlotsTwin(a: i32, b: i32): i32 {
   if a == b { return 1 }
   if a < 0 || b < 0 { return 0 }
+  // THE KEY IS PART OF THE LAYOUT, not just of the identity: field 0 (`keys`) is the
+  // string-ref list wrapper on one rep and the i32 list wrapper on the other, so two
+  // slots agreeing on every VALUE question are still two byte-DIFFERENT map structs when
+  // their keys differ. Asked first — it is the cheapest discriminator and the only one
+  // the value-side guards below cannot see.
+  if mvSlotKeyI32(a) != mvSlotKeyI32(b) { return 0 }
   const k = mvValKind[a]
   if k != mvValKind[b] { return 0 }
   const ka = mvValCanonKey(a)
@@ -17309,8 +17399,7 @@ export function exprArray(exprIx: i32, fnIx: i32) {
     if kc32 is Member {
       if kc32.memProp == "keys" {
         if exprMap(kc32.memObj, fnIx) {
-          const k32 = mapShapeOfExpr(kc32.memObj, fnIx)
-          if k32 == -4 || k32 == -5 { return true }
+          if mapShapeKeyI32(mapShapeOfExpr(kc32.memObj, fnIx)) { return true }
         }
       }
     }
@@ -18015,8 +18104,7 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
     if kcallee is Member {
       if kcallee.memProp == "keys" {
         if exprMap(kcallee.memObj, fnIx) {
-          const ksh = mapShapeOfExpr(kcallee.memObj, fnIx)
-          return ksh != -4 && ksh != -5
+          return !mapShapeKeyI32(mapShapeOfExpr(kcallee.memObj, fnIx))
         }
       }
     }
@@ -19185,10 +19273,12 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       const fe = fnIndexOf(callee.identName)
       if fe >= 0 { return fnRetMapShape(callee.identName) }
     }
-    // An i32-KEYED constructor / factory result: the key comes off the CALL's own
-    // recorded type, since a bare `Map()` carries no spelling. Asked before the value
-    // fall-through below, which resolves an mv slot the i32-keyed rep never uses.
-    if nodeTyMapKeyIsI32(exprIx) { return -4 }
+    // An i32-KEYED constructor / factory result: the KEY comes off the CALL's own
+    // recorded type, since a bare `Map()` carries no spelling. It is the other half of
+    // the slot identity, so it is read HERE and PAIRED with the value below rather than
+    // short-circuiting to the mono sentinel (which was right only while an i32-keyed map
+    // could not have a ref value).
+    const ckI32 = nodeTyMapKeyIsI32(exprIx)
     // FALLBACK: a map-returning CLOSURE-VALUE / factory call whose callee the syntactic path misses (a
     // closure local `v()`, an indexed closure `arr[i]()`) — resolve the shape from the checker's recorded
     // map VALUE type (mono/atom ⇒ -1, else the value name's mv slot). Mirrors the `exprMap` fallback and
@@ -19200,10 +19290,13 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       // on the checker's recorded litunion first (the atom map has no slot by design).
       // Same for the NULLABLE-atom niche (`{[string]: K0 | null}` — the `-1` sentinel rides
       // the mono map; its rendered value name would collapse to `string | null`).
-      if nodeTyMapValIsLitUnion(exprIx) { return -1 }
-      if nodeTyMapValIsNulLitUnion(exprIx) { return -1 }
-      return mvSlotOfMapValNameOrMono(nodeTyMapValName(exprIx))
+      if nodeTyMapValIsLitUnion(exprIx) { return mapMonoShapeOfKey(ckI32) }
+      if nodeTyMapValIsNulLitUnion(exprIx) { return mapMonoShapeOfKey(ckI32) }
+      const cSh = mvSlotOfMapValNameOrMonoK(nodeTyMapValName(exprIx), ckI32)
+      if cSh == -1 { return mapMonoShapeOfKey(ckI32) }
+      return cSh
     }
+    if ckI32 { return -4 }
     return -1
   }
   if e is Ident {
@@ -19344,17 +19437,25 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
 // support side): three questions about a map's value, each of which was being answered
 // by re-slicing `V` out of `{[string]: V}` at every asking.
 function mvSlotOfMapName(mapName: string): i32 {
-  // The i32-keyed rep has no mv slot — its shape is the sentinel (see `mvShapeOfMapName`).
-  if nameIsI32KeyedMap(mapName) { return -4 }
-  mvSlotOfMapValNameOrMono(mapValNameOf(mapName))
+  // The KEY comes off the map spelling, exactly as on the intern side
+  // (`mvShapeOfMapName`); a MONO value needs no slot on either key rep, so it is the
+  // `-1`/`-4` sentinel pair.
+  const ki = nameIsI32KeyedMap(mapName)
+  const sl = mvSlotOfMapValNameOrMonoK(mapValNameOf(mapName), ki)
+  if sl == -1 { return mapMonoShapeOfKey(ki) }
+  sl
 }
 
 export function mvSlotOfMapValNameOrMono(ivIn: string): i32 {
+  mvSlotOfMapValNameOrMonoK(ivIn, false)
+}
+
+export function mvSlotOfMapValNameOrMonoK(ivIn: string, keyI32: boolean): i32 {
   const iv = mvCanonValName(ivIn)
   if mvValKindOfName(iv) == -1 { return -1 }
-  const aMo = mvSlotOfValNameTy(ivIn)
+  const aMo = mvSlotOfValNameTyK(ivIn, keyI32)
   if aMo >= 0 { return aMo }
-  const nmMo = mvSlotByValName(iv)
+  const nmMo = mvSlotByValNameK(iv, keyI32)
   if nmMo >= 0 { return nmMo }
   // A TYPED value name (kind != -1) with NO interned slot: the map was reached through a
   // seam whose collect pass missed it. Returning the mono `-1` here silently lowered the

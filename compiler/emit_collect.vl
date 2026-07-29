@@ -20,7 +20,6 @@ import {
   gaeHeadNameOf,
   gaeLtAt,
   groupInnerOf,
-  mapSpellValName,
   nameIsArray,
   nameIsFuncTypeAtom,
   nameIsMapOpen,
@@ -215,6 +214,7 @@ import {
   mUsed,
   mkArrIdx,
   mkListIdx,
+  mvKeyI32,
   mvMapTypeIdx,
   mvRlSlot,
   mvTwin,
@@ -287,7 +287,7 @@ import { emitFail } from "./emit_bytes"
 import {
   anonRowTyIx,
   buildStructTwins,
-  mvSlotOfValNameTy,
+  mvSlotOfValNameTyK,
   recordSFieldElemTyIx,
   recordSTyIx,
   recordUFieldElemTyIx,
@@ -391,9 +391,9 @@ import {
   msMemberAtomsOf,
   mvCanonRepOf,
   mvCanonValName,
+  mvShapeOfMapName,
   mvShapeOfValName,
-  mvSlotByValName,
-  mvValKindOfName,
+  mvSlotByValNameK,
   nameFieldCode,
   nameIsNulRefList,
   nameIsRefArray,
@@ -418,6 +418,7 @@ import {
   retRefArrElemName,
   retStructIndex,
   rlElemInnerSlot,
+  rlElemMapKeyI32,
   rlElemMapValMvSlotAt,
   rlElemStructRow,
   rlInternName,
@@ -2488,10 +2489,10 @@ function mAllocType() {
 // nested-map value) resolves its struct heap to `mStructIdxPre` (mono) or `mvMapTypeIdx`
 // (typed) by this lookup. A non-failing sibling of `mvSlotOfValNameFind` (which fails on a
 // mono value): the element-heap resolver below must tolerate the mono case.
-function mvSlotByValNameOr(vn: string): i32 {
-  const aOr = mvSlotOfValNameTy(vn)
+function mvSlotByValNameOrK(vn: string, keyI32: boolean): i32 {
+  const aOr = mvSlotOfValNameTyK(vn, keyI32)
   if aOr >= 0 { return aOr }
-  mvSlotByValName(vn)
+  mvSlotByValNameK(vn, keyI32)
 }
 
 // The mv slot a MAP-element ref-list slot's VALUE occupies — the element-heap
@@ -2502,7 +2503,7 @@ function mvSlotByValNameOr(vn: string): i32 {
 // litunion-alias value `K0 | i64` interns as `string | i64`), the sig / first heap
 // pass does not. The arena leg needs no such flag — `repMvValKey` performs that fold
 // itself (#1094).
-// SENTINEL DISCIPLINE (D3'): `mvSlotByValNameOr` misses with -1, which every caller
+// SENTINEL DISCIPLINE (D3'): `mvSlotByValNameOrK` misses with -1, which every caller
 // reads as "the MONO map"; the arena leg therefore answers ONLY a real slot (>= 0)
 // and its own miss is swallowed here, never returned.
 function rlMapElemValSlot(slot: i32, canon: boolean): i32 {
@@ -2513,7 +2514,7 @@ function rlMapElemValSlot(slot: i32, canon: boolean): i32 {
   if enn != "" { en = enn }
   let vn = mapValNameOf(en)
   if canon { vn = mvCanonValName(vn) }
-  mvSlotByValNameOr(vn)
+  mvSlotByValNameOrK(vn, rlElemMapKeyI32(slot))
 }
 
 // The VARIANT struct heap index of ref-list slot `slot`'s element (`Cat[]` → the `Cat`
@@ -2646,7 +2647,11 @@ export function mAssignTypeIndices(_n: i32) {
       // 2nd independent draw).
       const mmv = rlMapElemValSlot(rss, false)
       if mmv < 0 {
+        // MONO on BOTH key reps, and they are two DIFFERENT structs — so the mono sig
+        // has to name the key or an `{[i32]: i32}` element would twin onto a
+        // `{[string]: i32}` one and take its (string-ref keys) struct.
         sig = "3:m"
+        if rlElemMapKeyI32(rss) { sig = "3:mi32" }
       } else {
         sig = "3:" + i32ToStr(mvCanonRepOf(mmv))
       }
@@ -2709,7 +2714,14 @@ export function mAssignTypeIndices(_n: i32) {
       // position-independent rep: a map element resolves the SAME struct a standalone
       // `{[string]: V}` binding does, whichever value type it carries.
       if rlMapElemValSlot(rs, false) < 0 {
-        rlElemHeap[rs] = mStructIdxPre
+        // The MONO map of the element's OWN key rep: the string-keyed struct, or its
+        // i32-keyed twin one index later (`mStructI32Idx`, minted immediately after —
+        // the same "computable up front from the counter" reasoning as `mStructIdxPre`).
+        if rlElemMapKeyI32(rs) {
+          rlElemHeap[rs] = mStructIdxPre + 1
+        } else {
+          rlElemHeap[rs] = mStructIdxPre
+        }
       } else {
         rlElemHeap[rs] = 0
       }
@@ -2942,30 +2954,35 @@ export function mAssignTypeIndices(_n: i32) {
 // `forceScalarListField`. This one stays here because it is `collectA`'s own reservation
 // concern and because that file is held by a concurrent slice; moving it is a pure relocation.
 // Whether an annotation spelling that MENTIONS an i32-keyed map is one the emitter can
-// lower: 0 when it is, else the loud reject (-1) naming which half failed. Two spellings
-// pass — a BARE `{[i32]: V}` and its `| null` twin — with a VALUE that rides the MONO
-// rep. "Rides the mono rep" is not re-decided here: it is `mvValKindOfName == -1`, the
-// interner's OWN classifier (i32 / boolean / a literal-union atom / a nullable atom),
-// which is exactly the set whose values live in the shared i32 `vals` list. A value that
-// would intern an mv slot needs a per-value i32-keyed map struct, and none is minted.
+// lower: 0 when it is, else the loud reject (-1) naming the POSITION that failed. Two
+// spellings pass — a BARE `{[i32]: V}` and its `| null` twin.
+//
+// THE VALUE HALF OF THIS GATE IS GONE, and its absence is the whole point of the
+// (KEY,VALUE) slot identity: an i32-keyed map's value now interns its OWN map struct
+// exactly as the string-keyed twin's does (`mvShapeOfMapName` reads the key off the
+// spelling), so every value type the string-keyed rep lowers, this one lowers too. What
+// remains is the POSITION restriction, which is a different mechanism entirely: a struct
+// FIELD row, a ref-list ELEMENT row and a variant FIELD row record a map's VALUE name
+// with the KEY erased (`sFieldElemName` / `uFieldElemName` hold `V`, not `{[K]: V}`), so
+// a composed i32-keyed map would resolve its STRING-keyed twin's struct — invalid wasm
+// that `vl check` cannot see. Opening those needs a key column on each of those rows.
 function i32MapSpellingLowerable(name: string) {
   let bare = name
-  const inner = nulMapInnerName(name)
+  // A top-level function TYPE (`() => {[i32]: V}`) delegates to its RETURN spelling: the
+  // closure-result boundary carries the map's SHAPE (`cloRetValSlot`), which is the same
+  // key-paired slot every other boundary carries, so the position is supported by the
+  // same mechanism the return position is. The arrow is TOP-LEVEL, so `(() => {[i32]:
+  // i32})[]` (an ARRAY of such closures) is NOT peeled here and stays a loud reject.
+  const fr = annRetNameOf(name)
+  if fr != "" { bare = fr }
+  const inner = nulMapInnerName(bare)
   if inner != "" { bare = inner }
   if !nameIsMapSpanEnds(bare) || !nameIsI32KeyedMap(bare) {
     return emitFail(
       "emitProgram: an i32-keyed Map/Set is supported as a binding / parameter / " +
-        "return / `| null` only — not inside '" +
+        "return / `| null` / a closure result / a map value — not inside '" +
         name +
         "'",
-    )
-  }
-  const vn = mapSpellValName(bare)
-  if mvValKindOfName(mvCanonValName(vn)) != -1 {
-    return emitFail(
-      "emitProgram: unsupported i32-keyed map value type '" +
-        vn +
-        "' (i32-keyed Map/Set values are i32 / boolean / literal-union atoms)",
     )
   }
   0
@@ -3071,6 +3088,7 @@ export function collectA(_stmts: i32[]) {
   slUsed = false
   fa64Used = false
   mvValName = []
+  mvKeyI32 = []
   mvValTyIx = []
   mvValKind = []
   mvValStructIdx = []
@@ -3290,12 +3308,13 @@ export function collectA(_stmts: i32[]) {
         // map — local, param, return, global, nested — contributes the flag here,
         // before `mAssignTypeIndices` mints the type.
         if nameIsI32KeyedMap(nd.tyName) { mI32Used = true }
-        // A REF value type (`{[string]: string}` / `{[string]: {x:i32}}`) interns a
-        // per-value-type map slot (its own map struct over a ref vals list). All mv
+        // A REF value type (`{[string]: string}` / `{[i32]: {x:i32}}`) interns a
+        // per-(KEY,VALUE) map slot (its own map struct over a ref vals list). All mv
         // interning happens HERE (collect scans every TypeRef), so the type-index
         // assignment in `emitModule` sees the full slot set; later resolutions are
-        // idempotent lookups.
-        mvShapeOfValName(mapValNameOf(nd.tyName))
+        // idempotent lookups. `mvShapeOfMapName` reads the KEY off the spelling, which is
+        // why the whole i32-keyed ref-value surface needed no second walk.
+        mvShapeOfMapName(nd.tyName)
       } else if nulMapInnerName(nd.tyName) != "" {
         // A `{[string]: V} | null` (kind `nulmap`) annotation collects the SAME map types as its
         // non-null inner map — even when the program never `Map()`-constructs one (a nulmap PARAM
@@ -3306,7 +3325,7 @@ export function collectA(_stmts: i32[]) {
         lUsed = true
         aUsed = true
         if nameIsI32KeyedMap(nd.tyName) { mI32Used = true }
-        mvShapeOfValName(mapValNameOf(nulMapInnerName(nd.tyName)))
+        mvShapeOfMapName(nulMapInnerName(nd.tyName))
       } else if nameIsStringArray(nd.tyName) {
         // A `string[]` annotation is a string-ref list — the SAME wrapper/backing as
         // the map keys list. Force the keys list types (`slUsed`) + the string backing
@@ -3957,13 +3976,21 @@ function fieldRecElemName(tyIx: i32, code: i32) {
   // An i32-KEYED map FIELD (code 19, or 29 nullable). `collectA`'s capability gate
   // cannot see this position — the field's own annotation node IS a bare map, which is
   // a supported spelling — so the FIELD asks here. Without it the field's cell resolves
-  // the STRING-keyed struct (the mv-slot layer the i32-keyed rep does not join) and the
-  // reject lands much later, at the first key op, with a message about the KEY.
+  // the STRING-keyed struct and the reject lands much later, at the first key op, with
+  // a message about the KEY.
+  //
+  // THIS IS THE ROW THAT ERASES THE KEY. An mv slot's identity is the (KEY, VALUE)
+  // pair, but a map field records only V — `sFieldElemName` / `uFieldElemName` hold the
+  // VALUE spelling and `sFieldElemTyIx` the VALUE type — so there is nothing here to
+  // resolve the i32-keyed struct WITH. Opening the position is a key column on both
+  // field tables, written at every push site; see the fixture
+  // `maps/error-i32-keyed-position-field.vl`.
   if code == 19 || code == 29 {
     if strContains(tyNameOf(tyIx), "{[i32]:") {
       emitFail(
         "emitProgram: an i32-keyed Map/Set cannot be a struct / variant FIELD — " +
-          "supported as a binding / parameter / return / `| null` only",
+          "supported as a binding / parameter / return / `| null` / a closure result " +
+          "/ a map value",
       )
     }
   }

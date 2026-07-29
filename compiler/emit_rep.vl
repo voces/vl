@@ -61,6 +61,7 @@ import {
   msSetNext,
   msSetRow,
   msSetText,
+  mvKeyI32,
   mvValName,
   mvValTyIx,
   sFieldCount,
@@ -770,13 +771,41 @@ export function recordMvValTyIx(nm: string) {
 // First-match-wins, exactly like the name scans it fronts. Both sides compute the
 // key at QUERY time from the recorded arena INDEX (never a key frozen at intern
 // time), so an in-place arena mutation moves both together — the D1 hazard.
-export function mvSlotOfTy(ty: i32): i32 {
+// The KEY half of an mv slot's identity: true when slot `slot`'s map struct carries the
+// i32 keys list. THE ONE READ of the `mvKeyI32` column — the slot resolvers here, the
+// `cm*` emit accessors and the type section all ask through it, so a slot is
+// self-describing and nothing downstream of the intern carries a second key parameter.
+// Lives in this module rather than beside its siblings in `emit_classify` because
+// `emit_classify` imports FROM here: the lower module is the only place both can read.
+export function mvSlotKeyI32(slot: i32): boolean {
+  if slot < 0 { return false }
+  if slot >= mvKeyI32.length { return false }
+  mvKeyI32[slot] == 1
+}
+
+// THE ONE KEY QUESTION ASKED OF A MAP SHAPE, in the shape vocabulary every op site
+// threads: the two MONO sentinels (`-4` map / `-5` Set — a value on the shared i32
+// `vals` list interns no slot, so the key has nowhere else to live) plus an mv SLOT's
+// own column. Both halves or neither: a site that tested `sh == -4` alone was correct
+// only while an i32-keyed map's value was restricted to the mono rep.
+export function mapShapeKeyI32(sh: i32): boolean {
+  sh == -4 || sh == -5 || mvSlotKeyI32(sh)
+}
+
+export function mvSlotOfTy(ty: i32): i32 { mvSlotOfTyK(ty, false) }
+// The KEY-paired form. A slot's identity is (key rep, value type) — the map struct's
+// `keys` field differs between the two reps — so the scan must agree on BOTH halves or
+// a `{[i32]: S}` would resolve its `{[string]: S}` twin's struct (a string-ref keys list
+// read as an i32 list: invalid wasm that `vl check` cannot see).
+export function mvSlotOfTyK(ty: i32, keyI32: boolean): i32 {
   if ty < 0 { return -1 }
   const k = repMvValKey(ty)
   let i = 0
   while i < mvValTyIx.length {
     if mvValTyIx[i] >= 0 {
-      if repMvValKey(mvValTyIx[i]) == k { return i }
+      if mvSlotKeyI32(i) == keyI32 {
+        if repMvValKey(mvValTyIx[i]) == k { return i }
+      }
     }
     i = i + 1
   }
@@ -795,11 +824,29 @@ export function tyMapValOf(ty: i32): i32 {
   -1
 }
 
+// The KEY half of the same hop: true when the map type `ty` is i32-KEYED — the
+// structural form of `nameIsI32KeyedMap(name)`, and the argument every arena-side
+// `mvSlotOfTyK` caller pairs with `tyMapValOf`. A non-map answers false, exactly as the
+// name predicate does for a non-map spelling, so the two legs decline together.
+export function tyMapKeyIsI32(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyMap {
+    if t.mKey < 0 { return false }
+    const kt = T.tys[t.mKey]
+    if kt is TyPrim { return kt.primName == "i32" }
+  }
+  false
+}
+
 // The name bridge for the mv layer (still name-keyed at its entry points):
-// resolve a map-value NAME to its arena type, then to its slot. -1 when the name
-// does not resolve or no row claims it — the caller keeps its name scan.
-export function mvSlotOfValNameTy(nm: string): i32 {
-  mvSlotOfTy(fieldElemTyIxOfName(nm))
+// resolve a map-value NAME to its arena type, then to its (key-paired) slot. -1 when
+// the name does not resolve or no row claims it — the caller keeps its name scan.
+// There is no key-blind sibling: every caller holds a map whose key it can name, and a
+// default of "string-keyed" is exactly the silent wrong answer the key column exists
+// to prevent.
+export function mvSlotOfValNameTyK(nm: string, keyI32: boolean): i32 {
+  mvSlotOfTyK(fieldElemTyIxOfName(nm), keyI32)
 }
 
 // The interned STRUCT-table slot for an object type `ty`, derived from the arena
