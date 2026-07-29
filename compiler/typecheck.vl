@@ -8814,20 +8814,119 @@ function arrSpineIsScalar(ty: i32) {
 // distinction #1207 had to draw for its own second target, and it is why the graded channel
 // here is the corpus A/B, where cutting the arm reddens 21 rows and cutting the `is` site 2.
 //
-// NOMINAL-vs-STRUCTURAL is unchanged and stays load-bearing — see the render sites. Resolving
-// a declared-struct member to its declared NAME instead (`type MyCat = Cat` → "Cat", via
-// `structNameOfTy`) looks strictly better — it keeps nominal identity — and it REGRESSES both
-// `type MyCat = Cat` and `type Y = B` to `emitProgram: ref valtype with no interned shape`.
-// The reason is the very row this fix routes around: the emitter's `collectU` still registers
-// the one-member alias as a union (its variant `Cat` is not a `{…}` shape, so
-// `unionStructAliasShape` does not skip it) and PUSHES `Cat` into `uVariants` — so the name
-// `Cat` classifies as a union VARIANT box, not a plain struct. The named route is poisoned;
-// the inline shape is the one that resolves.
+// NOMINAL-vs-STRUCTURAL was load-bearing and IS NO LONGER — the paragraph below is kept
+// because the fix is the row it names. Resolving a declared-struct member to its declared NAME
+// (`type MyCat = Cat` → "Cat", via `structNameOfTy`) looked strictly better — it keeps nominal
+// identity — and it REGRESSED both `type MyCat = Cat` and `type Y = B` to `emitProgram: ref
+// valtype with no interned shape`. The reason is the very row this fix routed around: the
+// emitter's `collectU` registered the one-member alias as a union (its variant `Cat` is not a
+// `{…}` shape, so `unionStructAliasShape` did not skip it) and PUSHED `Cat` into `uVariants` —
+// so the name `Cat` classified as a union VARIANT box, not a plain struct. The named route was
+// poisoned; the inline shape was the one that resolved.
+//
+// THAT ROW IS GONE. Under this ruling `MyCat` is not a union — it denotes `Cat` — so the row
+// was never owed, and `collectU` now skips it (`isTransparentObjAlias`, below). The OBJECT arm
+// therefore renders NOMINALLY (`transparentMemberEmitName`, below), and the entombment is the
+// pair of sabotages that reproduce this paragraph and its mirror: restoring the row is
+// `ref valtype with no interned shape` on `types/struct-alias-transparent.vl`, and keeping the
+// row's absence with the STRUCTURAL render is `only i32, …, or string parameters are supported`
+// on the same file. Every other arm (`TyPrim` / `TyFunc` / `TyArray` / `TyMap`) renders exactly
+// as before.
 function singleMemberAliasTyIx(name: string) {
   if !cUserTypes.has(name) { return -1 }
   const ti = cUserTypes[name] ?? -1
   if ti < 0 { return -1 }
   singleAliasMemberTyIx(ti, name)
+}
+
+// True when the DECLARED name `name` is a one-member alias whose transparent member is an
+// OBJECT (`type MyCat = Cat`, `type Y = Box<i32>`) — the `TyObj` arm of
+// `singleAliasMemberTyIx`, gated there on `isPlainAliasRef` so the canonicalized
+// intersection (`type AB = {a} & {b}`) is NOT claimed.
+//
+// EXPORTED FOR `collectU`'S SKIP, AND THAT SKIP IS THE POISON THE PARAGRAPH ABOVE NAMES.
+// The note over `singleMemberAliasTyIx` records why the transparent member must render
+// STRUCTURALLY rather than as its declared NAME: routing `type MyCat = Cat` to "Cat"
+// regressed to `ref valtype with no interned shape`, *because* `collectU` registers the
+// alias as a one-variant union and pushes `Cat` into `uVariants`, so the NAME classifies as
+// a union VARIANT box. That row is not a fact about the language — under this very ruling
+// `MyCat` is not a union at all, it DENOTES `Cat` — so the emitter stops minting it, and the
+// nominal route it was poisoning comes back.
+//
+// ONLY the object arm is claimed, and the reason is a property of the row rather than of the
+// arm: a `TyPrim` / `TyFunc` / `TyArray` / `TyMap` member is not an `isStructAtom`, so its
+// alias row carries ZERO variants and poisons no name. Those rows stay exactly as they are —
+// this predicate is the population whose row holds a duplicate `uVariants` entry, not the
+// transparency population at large.
+//
+// THE GATE IS CONSERVATIVE AND ITS PRICE IS MEASURED, NOT ASSUMED. Widening it to every
+// transparent arm (`return true` in place of the `TyObj` test) keeps the whole suite green —
+// 3,584 passed / 0 failed / 7 ignored, the same ignored SET — and moves 37 corpus files, ALL
+// of them SMALLER, **-437 bytes**, with check / build-rc / run identical on every one. A
+// zero-variant row is not free after all: it sets `uDeclared`, which mints the shared union
+// box `(struct (field i32) (field anyref))` for a program that has no union. That is a
+// different thesis from this one (the empty row's box, not the duplicate variant row), it
+// touches the scalar / function / array / map alias registrations that `markValueUnionAtoms`,
+// `markRefArrayArms` and `markMapUnionArms` hang off the same row, and it owes 37 BYTES
+// justifications of its own — so it is filed with its numbers rather than folded in here.
+export function isTransparentObjAlias(name: string) {
+  const m = singleMemberAliasTyIx(name)
+  if m < 0 { return false }
+  const mt = T.tys[m]
+  if mt is TyObj { return true }
+  false
+}
+
+// The emit SPELLING of a transparent alias's member — the ONE producer read by both the
+// annotation rewriter (`canonEmitNameTs`) and the `is` rewriter. D-ISALIAS is the reason it
+// is one function and not two call sites: those two spell the union's VARIANT and the test
+// that names it, and a divergence between them is `is` naming a variant the emitter does not
+// have (an emit reject for the object arm, an INVALID MODULE for the scalar and array arms).
+//
+// NOMINAL-FIRST FOR AN OBJECT MEMBER, WHICH IS THE HALF #1122 COULD NOT HAVE. That ruling
+// BUILT the declared-NAME render, measured it regressing `type MyCat = Cat` to
+// `ref valtype with no interned shape`, and named the cause in the same paragraph: `collectU`
+// minted the alias as a one-variant union and pushed the member's own name into `uVariants`.
+// The consequence is one rung further on, in `collectS`, and it is what the measurement
+// actually saw: that pass skips a `TypeDecl` whose name `variantIndexOf` claims, so the poison
+// row stopped `Cat` from interning as a standalone STRUCT, and the only interned spelling left
+// was the inline shape `collectAnnShapes` put there. With the row gone (`isTransparentObjAlias`
+// above, read by `collectU`) the member interns under its own name — and the inline shape stops
+// being interned, because `collectAnnShapes` dedups it against the declared struct. So the two
+// halves are ONE change in both directions: with the row, only the structural spelling
+// resolves; without it, only the nominal one does.
+//
+// The gate is the member's own arena entry, not a second reading of the alias: the `TyObj` arm
+// of `singleAliasMemberTyIx` is already `isPlainAliasRef`-gated, so a `TyObj` here IS the
+// plain-reference population and the canonicalized intersection never reaches it. A member with
+// no declared name (an inline shape behind a generic application) falls through to the
+// structural render unchanged, which is every other arm's behaviour too.
+//
+// THE GENERIC-APPLICATION RUNG IS MEASURED AND NOT TAKEN, WITH THE CELL THAT BLOCKS IT.
+// Adding `genAppNameOfTy` under `structNameOfTy` here — so `type Y = Box<i32>` renders "Box<i32>"
+// — closes NINE more census rows on the nominal axis (B2 20 → 11) and moves nothing on the
+// six-channel corpus. It costs one WORKING cell: a struct FIELD typed by the alias
+// (`type Holder = { c: Y }`) runs today because the structural render hands `fieldTypeCode` an
+// inline shape, and under the application name it takes the reject the DIRECT spelling
+// `{ c: Box<i32> }` already gets on master and here alike
+// (`emitProgram: only i32 / boolean / string / array struct fields are supported`). So the
+// blocker is `fieldTypeCode`'s missing generic-application route, not this render, and the rung
+// belongs with whoever builds that route. The 11-position alias-vs-application sweep is the
+// instrument: every other cell of that family is identical across the two spellings and across
+// both compilers.
+function transparentMemberEmitName(smt: i32, ctx: i32): string {
+  const mt = T.tys[smt]
+  if mt is TyObj {
+    const sdn = structNameOfTy(smt)
+    if sdn != "" {
+      // A declared name is ONE identifier, so one atom — the same bank
+      // `tyToEmitNameAt` fills for its own renders, set here because this arm
+      // returns without calling it.
+      emitNameAtoms = 1
+      return sdn
+    }
+  }
+  tyToEmitNameAt(smt, ctx)
 }
 
 // The BASE-SCALAR emit name of a NUMERIC literal-union type (`0 | 1` → "i32",
@@ -9426,7 +9525,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   // which is the whole reason this arm can render AT `ctx` instead of at `RC_ROOT`.
   const smt = singleMemberAliasTyIx(name)
   if smt >= 0 {
-    const smr = tyToEmitNameAt(smt, ctx)
+    const smr = transparentMemberEmitName(smt, ctx)
     // The EMPTINESS guard the predecessor carried implicitly: it tested its own render for
     // "" (`sma != ""`) and fell through to the rest of the rewriter when the member had no
     // emit name at all. Same test, one render later, so an unnameable member still reaches
@@ -10063,7 +10162,7 @@ export function canonEmitTypeNames() {
           if gis != "" { n.isVariant = gis }
           const sit = singleMemberAliasTyIx(n.isVariant)
           if sit >= 0 {
-            const sir = tyToEmitName(sit)
+            const sir = transparentMemberEmitName(sit, RC_ROOT)
             if sir != "" { n.isVariant = sir }
           }
         }

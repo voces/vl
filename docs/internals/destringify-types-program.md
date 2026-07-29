@@ -38130,3 +38130,287 @@ slice's shape never.
 * **A GATE THAT MOVES ZERO CELLS CAN STILL EARN ITS LINE — say which currency it is paid in.**
   The niche and pure-litunion exclusions are worth 255 bytes over 8 files and nothing else.
   Calling them correctness fixes would have been a lie the next slice would inherit.
+
+## TRANSP — the class's OWN duplicate row was in the bucket the filing called "by design", the 26 twin rows are a DIFFERENT class (they share no file with TRANSP), and the ruling that forbade the fix names the row that has to go (off master `8970dea6`)
+
+**THE FILING SAID TRANSP NEEDS W9's `renderEmit(ty, ctx)` PLUS #1122's TRANSPARENCY RULING.
+BOTH HALVES ARE WRONG, AND THE SECOND ONE IS WRONG IN THE RULING'S OWN TEXT.** #1122 wrote
+down why the transparent alias must render STRUCTURALLY, and the reason it gave is a
+*registration row*, not a render:
+
+> the emitter's `collectU` still registers the one-member alias as a union (its variant `Cat`
+> is not a `{…}` shape, so `unionStructAliasShape` does not skip it) and PUSHES `Cat` into
+> `uVariants` — so the name `Cat` classifies as a union VARIANT box, not a plain struct. The
+> named route is poisoned; the inline shape is the one that resolves.
+
+Under that same ruling `MyCat` is not a union — it DENOTES `Cat`. The row was never owed. It
+is one `continue` in `collectU`, and with it gone the nominal route the ruling measured
+regressing is the one that works.
+
+### 1. THE BASE, RE-DERIVED — B2 is 29, and one of its rows is new since #1304
+
+```
+census:   bash T/cen.sh cenM cenM && bash T/cen-an.sh cenM
+rows:     bash T/bx.sh cenM 4
+twins:    bash T/cgrun.sh twinM twincases tests/cases && python3 Q/twinan.py T/twincases.out
+```
+
+| | `81f47aaf` (#1304) | **`8970dea6` (this base)** | **this head** |
+| --- | ---: | ---: | ---: |
+| annotations canon saw | 10,295 | **10,395** | 10,395 |
+| canon byte-identical / rewritten | 9,967 / 328 | **10,043 / 352** | **10,043 / 352 — canon's COUNT does not move** |
+| **B1** `tyToEmitName ∘ nameToTy` | 1,926 | **1,971** — 0 / 1,938 / 33 | **1,979** — 0 / 1,938 / 41 |
+| **B2** `tyToNominalName ∘ nameToTy` | 28 | **29** — 3 / 5 / 21 | **20** — 3 / 5 / 12 |
+| **B3** `tyToNominalName ∘ nodeTyIxOf` | 126 | **127** — 3 / 91 / 33 | **120** — 3 / 91 / 26 |
+
+B2's 29 by RULE, every row accounted for:
+
+| rule | rows | files | note |
+| --- | ---: | ---: | --- |
+| **TRANSP** | **19** | 10 | `MyCat`→`{meow:i32}`/`Cat` ×5 · `MyDog` · `MyS` · `Inner<MyS>` · `MyCat\|i32` · `Y`/`BoxI`/`Alias`→`{v:i32}`/`Box<i32>` ×7 · `P`→`Pair<i32,string>` ×2 · `P`→`{[string]:Pt}` |
+| **UCOLL** | 4 | 3 | terminal by design |
+| **UEXP** | 2 | 1 | `AB\|null`, filed |
+| **ISECT** | 2 | 1 | filed |
+| **TRANSP-INV** | 1 | 1 | terminal by P6 |
+| **LINFLAT — NEW SINCE #1304** | **1** | 1 | `K\|K` → canon `string` / nominal `K`, in #1306's own fixture `literal-unions/union-of-litunions-flatten.vl`. The checker flattens the union of litunions; canon softens the flattened set where the nominal renderer keeps the alias |
+| | **29** | 17 | |
+
+### 2. THE TWIN ROWS AND THE CENSUS ROWS ARE NOT THE SAME CLASS — the file sets are almost disjoint
+
+#1303 §5 reported the ZZTWIN probe's 26 two-spelling duplicate rows as *"the census's TRANSP
+and UCOLL classes, materialised in the emitter"*. The probe reproduces to the entry at this
+base — **82 SAME-spelling rows in 49 programs, 26 TWO-spelling rows in 16 programs** — and the
+attribution does not survive a join:
+
+```
+comm -12 <the 16 twin programs> <the 17 B2-disagreeing programs>   →  4 files
+```
+
+Bucketed by root, with the instrument that decides each (`T/mkun.py` — dump `unNames` with its
+`uVariants` slice; `T/mkrr.py` — dump BOTH renders at every arena reach-registration):
+
+| root | rows | programs | census class |
+| --- | ---: | ---: | --- |
+| **INFERRED UNION REGISTERED TWICE** — the arena walk registers `{meow:i32}\|{woof:i32}`, the checker's reverse-mapped name registers `Cat\|Dog` | **17** | 8 | **NONE — the census cannot see these.** An inferred return carries no annotation, so `canonEmitTypeNames` never visits one |
+| **UCOLL** — `A`←`B`, `Cat`←`Dog`: two DECLARED types of one shape | 3 | 3 | UCOLL, same root |
+| **UCOLL in kind** — `Cat`←`Kot` in the four `variant-twin-*` fixtures | 4 | 4 | none — both names are the source's own, so no annotation disagrees |
+| **UEXP** — canon expands `AB\|null` to its members' structural shapes; the arena walk registers that expansion | 2 | 1 | UEXP, same root |
+| **TRANSP** | **0** | 0 | — |
+
+**THE 17 ARE THE LARGEST GROUP AND THEY ARE NOT A CANON-VS-RENDERER DISAGREEMENT AT ALL.**
+`reachRegisterName` renders through `tyToNominalName`, and that renderer has no route from an
+anonymous inferred `TyObj` to the declared `Cat` it equals; the checker's `structUnionRetName`
+does (bidirectional assignability), and `registerInferRetNominalUnion` registers ITS answer.
+Two producers of one union's NAME, both inside the emitter's registration, neither gated on the
+other (`isUName` compares the composite, and the composites differ). ZZRR settles which
+producer is which: on four of the five twin fixtures `tyToNominalName` and `arenaEmitName`
+return the SAME string, so the structural spelling is the nominal renderer's own answer and not
+a canon softening.
+
+```
+functions/inferred-struct-union-return.vl
+  {{meow:i32}|{woof:i32}}=(0:{meow:i32},1:{woof:i32})   {Cat|Dog}=(2:Cat,3:Dog)
+  {{a:i32}|{b:i32}|{c:i32}}=(4,5,6)                     {A|B|C}=(7:A,8:B,9:C)
+```
+
+### 3. TRANSP'S OWN DUPLICATE ROW IS IN THE **SAME-SPELLING** BUCKET — the one the filing dismissed
+
+`twinan.py` splits the duplicates into *"SAME spelling — two unions in one module each holding
+`{w:i32}`, by design, the flattened list is per-union-slice"* (82) and *"TWO spellings"* (26),
+and files the first as not-a-defect. It is not all by design:
+
+```
+types/transparent-alias-is-narrow-union-arm.vl
+  {MyCat}=(0:Cat)      ← the transparent alias's own union row
+  {Cat|i32}=(1:Cat)    ← the real union
+```
+
+Two `Cat` rows, one layout, and the first union does not exist: `MyCat` is `Cat`. **A
+by-design bucket is a claim about each row's PROVENANCE, and this classifier only reads the two
+rows' TEXT.**
+
+### 4. WHAT SHIPS — one `continue` and one nominal-first rung, and NEITHER WORKS ALONE
+
+* **`collectU` skips the transparent object alias.** `isTransparentObjAlias(name)` (typecheck,
+  beside `singleMemberAliasTyIx`) is `singleAliasMemberTyIx`'s `TyObj` arm — already
+  `isPlainAliasRef`-gated, so the canonicalized intersection is never claimed. One predicate,
+  read by the checker's resolution and the emitter's registration, exactly as #1122 required of
+  `nameToTy` / `singleMemberAliasTyIx`.
+* **`transparentMemberEmitName(smt, ctx)`** renders a `TyObj` member as its declared name
+  (`structNameOfTy`) and everything else as before. It is ONE function because two callers read
+  it: `canonEmitNameTs`'s transparency arm and the `is`-rewriter — D-ISALIAS's rule that the
+  variant spelling and the test that names it come from one producer.
+
+**THE HALVES ARE INSEPARABLE IN BOTH DIRECTIONS, AND THAT IS MEASURED RATHER THAN ARGUED.**
+A 13-position × 2-spelling sweep (`T/possweep.py`), the alias against its alias-free control,
+run against master and against each half:
+
+| position | master | **skip only** | **skip + nominal** | control (all builds) |
+| --- | --- | --- | --- | --- |
+| global reassigned | INVALID WASM | INVALID WASM | **OK 5 8** | OK 5 8 |
+| local reassigned | INVALID WASM | INVALID WASM | **OK 5 8** | OK 5 8 |
+| parameter | emit reject | emit reject | **OK 5 8** | OK 5 8 |
+| return | emit reject | emit reject | **OK 5 8** | OK 5 8 |
+| struct field (union) | emit reject | emit reject | **OK 5** | OK 5 |
+| list element (union) | emit reject | emit reject | **OK 5** | OK 5 |
+| plain parameter `k: MyCat` | OK 70 | **emit reject** | OK 70 | OK 70 |
+| the other 6 positions | — | unmoved | unmoved | unmoved |
+
+**Six cells UP — two of them silent invalid wasm at `vl check` rc 0 — and every one lands on
+the alias-free control's verdict, with all 13 controls unmoved across all four builds.** The
+skip alone REGRESSES `plain-param`, and the reason is one rung past where #1122 looked:
+`collectS` skips a `TypeDecl` whose name `variantIndexOf` claims, so with the poison row
+present `Cat` never interned as a standalone struct and the only interned spelling was the
+inline shape `collectAnnShapes` left; with the row gone `Cat` interns and the inline shape is
+deduped away. *The row and the render select which of two spellings the emitter's tables hold,
+so they have to move together.*
+
+### 5. THE MERGED ROWS, READ OFF `unNames` AND OFF THE MODULE
+
+```
+rows:  bash T/undiff.sh unM unC <file>      types: bash T/typedelta.sh basem cand <file>
+```
+
+| file | `unNames` rows removed | heap types | bytes | what vanishes |
+| --- | --- | ---: | ---: | --- |
+| `types/struct-alias-transparent.vl` | `{MyCat}=(0:Cat)` | 12 → 10 | **−10** | the `Cat` variant struct + the shared UNION BOX `(struct (field i32) (field anyref))` — the program has no union left |
+| `types/transparent-alias-is-narrow-union-arm.vl` | `{MyCat}=(0:Cat)` | 15 → 14 | +15 | the duplicate `Cat` variant heap type; `uVariants.length` 2 → 1 so every tag drops by one (`i32.const 13`→`12`). **The +15 is a REP CORRECTION**: master declared the `MyCat \| i32` global `(mut (ref $Cat))` — the bare struct — and the head declares it `(mut (ref $box))` and boxes the initializer, which is why `d = 7` was invalid wasm on master |
+| `modules/plain-alias-ref-renamed/entry.vl` | `{MyCat}=(0:Cat)` `{MyDog}=(1:Dog)` `{BoxI}=()` | 14 → 11 | **−14** | two variant structs + the union box |
+| `modules/plain-alias-ref-renamed/lib.vl` | `{MyCat}=(0:Cat)` `{BoxI}=()` | 8 → 6 | **−10** | one variant struct + the union box |
+| `generics/type-param-shadows-transparent-alias.vl` | `{MyS}=(0:Sx)` | 37 → 36 | **−4** | the `Sx` variant struct |
+| `generics/alias-to-generic-application.vl` | `{Y}=()` `{P}=()` | 13 → 12 | **−6** | the union box (an EMPTY alias row still sets `uDeclared`) |
+| `generics/alias-to-generic-application-global.vl` | `{Y}=()` | 5 → 4 | **−6** | the union box |
+| `generics/type-param-shadows-alias-through-constructors.vl` | `{MyS}=(0:Sx)` | 43 → 43 | +1 | two tags drop by one; the interned application shape moves `Inner<{n:i32}>` → `Inner<Sx>`, whose `w` field is a struct REF where master coded it `i32`. Dead in this program (its run is identical and the direct construction `const f: Inner<MyS> = {w:{n:3}}` runs on both), so it is stated as a rep move, not banked as a fix |
+| | | | **−34 net** | |
+
+Corpus-wide the SAME-spelling twin count falls **82 → 81** (49 → 48 programs) and the
+TWO-spelling count is unchanged at 26 — the disjointness of §2, measured after the fact.
+
+### 6. THE CENSUS DELTA — NINE ROWS CHANGE AXIS AND NOTHING ELSE MOVES
+
+`comm` of the two B2 dumps: **9 removed, 0 added.** `comm` of the two B1 dumps: **9 added, 1
+removed** (`Inner<MyS>`, which was already disagreeing and changed its content). Every row is
+the same six files. B2 **29 → 20**, B3 **127 → 120**, B1 **1,971 → 1,979**.
+
+**THE B1 MOVE IS THE TRADE, AND IT IS NOT AVOIDABLE ON THIS AXIS.** B1 is the STRUCTURAL
+renderer; B2/B3 are the NOMINAL one; TRANSP *is* the population where those two disagree, so
+canon can agree with one or the other and not both. Which one is not a matter of taste: with
+the poison row gone the emitter's tables hold `Cat` and no longer hold `{meow:i32}`, and the
+skip-only build is the witness — canon structural against tables that are now nominal is an
+emit reject. Making B1 agree too means the structural renderer answering `Cat`, which is the
+wholesale `renderEmit` move #1271 measured at **145 corpus cells / 44 running programs**.
+
+### 7. THE GENERIC-APPLICATION RUNG — BUILT, MEASURED, NOT SHIPPED, WITH THE CELL THAT BLOCKS IT
+
+Adding `genAppNameOfTy` under `structNameOfTy` in `transparentMemberEmitName` (so
+`type Y = Box<i32>` renders `Box<i32>`) takes **B2 to 11 and B3 to 111** — TRANSP's remaining
+10 rows minus the map one — and moves **nothing** on the six-channel corpus. It costs one
+WORKING cell: an 11-position sweep of the application family (`T/possweep2.py`) is identical
+across both spellings and all three builds in 10 positions, and at `type Holder = { c: Y }`
+master runs and the rung emit-rejects — landing on the verdict the DIRECT spelling
+`{ c: Box<i32> }` already has on master and on this head alike:
+
+```
+emitProgram: only i32 / boolean / string / array struct fields are supported
+```
+
+So the blocker is `fieldTypeCode`'s missing generic-application route, not this render. Filed
+at the function's header with the sweep that found it.
+
+### 8. THE WIDENING PROBE — the `TyObj` gate is worth 437 bytes, and the suite cannot see it
+
+`isTransparentObjAlias` claims only the object arm, because only an object member is an
+`isStructAtom` and so only its row holds a duplicate `uVariants` entry. Dropping the gate
+(`return true` for every transparent arm — `type Id = i32`, `type F = (i32)=>i32`,
+`type L = i32[]`, `type M = {[string]:i32}`):
+
+| channel | reading |
+| --- | --- |
+| suite | **3,584 passed / 0 failed / 7 ignored — identical, same ignored SET** |
+| six-channel corpus vs the head | check-rc, check-msg, build-rc, RUN identical on 1,707 files; **37 files move on BYTES** |
+| direction | **37 of 37 SMALLER, −437 bytes**, 0 bigger |
+
+A zero-variant alias row is not free: it sets `uDeclared`, which mints the shared union box for
+a program with no union. That is a different thesis from this slice's (the empty row's BOX, not
+the duplicate variant ROW), it moves the scalar / function / array / map registrations that
+`markValueUnionAtoms`, `markRefArrayArms` and `markMapUnionArms` hang off the same row, and it
+owes 37 BYTES justifications — so it is filed with its numbers. **The suite reading zero here
+is the point: this gate's price is only visible on the corpus's byte channel.**
+
+### 9. SABOTAGES — four, three with named witnesses and one that names a follow-on
+
+Each is the shipped tree with ONE edit, self-compiled from the fetched seed, its own compiler
+installed as that tree's `build/vl-compiler.wasm`, and the FULL suite run in that tree.
+(`.github` must be copied into the probe tree or `ci_seed_coverage_test.ts` fails for a
+missing-file reason in every arm — an artifact that inflated three of these by one before it
+was isolated.)
+
+| sabotage | edit | suite | witnesses |
+| --- | --- | ---: | --- |
+| **S-POISONBACK** | `collectU` mints the alias row again, nominal render kept | 3,580 / **4** | `types/struct-alias-transparent.vl` · `modules/plain-alias-ref-renamed/` (each ×2, cases + native-align) — `emitProgram: ref valtype with no interned shape`, #1122's own measurement reproduced |
+| **S-RENDERBACK** | `transparentMemberEmitName` renders structurally again, skip kept | 3,580 / **4** | `types/struct-alias-transparent.vl` · `types/transparent-alias-union-arm-positions.vl` — `only i32, …, or string parameters are supported` |
+| **S-ISOFF** (delete the bystander) | the `is` rewriter keeps its own `tyToEmitName` render | 3,580 / **4** | `types/transparent-alias-is-narrow-union-arm.vl` · `types/transparent-alias-union-arm-positions.vl` — ``emitProgram: `is` names a type that is not a union variant`` |
+| **S-WIDEN** (widening guard) | the `TyObj` gate deleted | **3,584 / 0** | **none** — §8 |
+
+The first two are the poison pair: each is one HALF of the shipped change, and each is red on a
+file the other is green on, which is the inseparability of §4 stated as two experiments.
+
+### 10. CORPUS AND FUZZ
+
+`WT=… A=basem B=cand OUT=final bash ck/abcorpus3.sh` — six channels, `-o` path normalized:
+
+| channel | 1,707 files |
+| --- | --- |
+| CHECKRC · CHECKMSG | **1,707 same** |
+| BUILDRC | 1,706 same · **1 up** (`types/transparent-alias-union-arm-positions.vl`, 1 → 0) |
+| BUILDMSG | 1,698 same · 9 (the 8 BYTES rows carry the byte count in the message, plus the new fixture) |
+| BYTES | 1,699 same · **8** — every one in §5 |
+| RUN | 1,706 same · **1 up** (the new fixture, 1 → 0) |
+
+**No cell down; the only outcome that moves, moves up.**
+
+Fuzz A/B, 10 seeds × 3 depths × 200 cases = **6,000 cases per side, logs BYTE-IDENTICAL**, 0
+unsound-class lines either side. **AND IT IS VACUOUS FOR THIS SLICE, MEASURED:** over 6,400
+generated cases in both `DECLTYPES` configurations, `scripts/fuzzgen.vl` emits **1,856**
+`type X = …` declarations — 918 struct bodies and 938 literal-union bodies — and **ZERO** of
+the one-member plain-REFERENCE form, **ZERO** generic applications. The fuzzer cannot reach
+this population at all; the A/B is a no-regression channel and nothing more.
+
+### 11. GATE
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && bash scripts/fetch-seed.sh` | 0 | 1,111,234 B published seed |
+| `bash scripts/refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint in 2 compiles — **the published seed compiles this branch's source, no A/B split** |
+| `bash scripts/native-fixpoint.sh` | 0 | stage3 == stage4, 1,111,490 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,584 passed / 0 failed / 7 ignored** (master 3,582/0/7; ignored SET identical — the 7 named `lint/*`, `loops/empty-range`, `soundness/*`, `types/struct-union-same-shape`) |
+| `bash scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `bash scripts/rep-fuzz-check.sh` | 0 | exact ✅, 1 baselined reject, 0 new / 0 stale |
+
+**BYTE DELTA: 1,111,234 → 1,111,490 = +256 B.**
+
+### 12. LESSONS
+
+* **A RULING THAT FORBIDS A FIX OFTEN NAMES THE THING THAT HAS TO GO — read it for its
+  MECHANISM, not its verdict.** #1122's "the named route is poisoned" is followed, in the same
+  sentence, by the row that poisons it. Three slices carried TRANSP as *"blocked on W9's
+  `renderEmit` plus the #1122 ruling"* without asking whether the ruling's own cause was still
+  standing. *An entombment is a measurement of a state, and the state is editable.*
+* **A "BY DESIGN" BUCKET IS A CLAIM ABOUT PROVENANCE, AND A TEXT CLASSIFIER CANNOT MAKE IT.**
+  The one duplicate row TRANSP owns is two rows both spelled `Cat`, so it scored in the 82-row
+  bucket the probe's own header calls by-design. *The 26 got three paragraphs and a route; the
+  82 got a sentence — and the sentence was where this class's row was hiding.*
+* **A CLASS ATTRIBUTION IS A JOIN, NOT A RESEMBLANCE.** "The 26 pairs read `Cat` ← `Kot`, …,
+  they are the census's TRANSP and UCOLL classes" is a reading of the NAMES. Joined on FILE,
+  TRANSP contributes zero of the 26 and the largest group is a class the census structurally
+  cannot see, because an inferred return has no annotation to canonicalize. *When two
+  populations look alike, intersect their file sets before you inherit the sentence.*
+* **THE THIRD PRODUCER OF A NAME CAN BE INSIDE THE PASS YOU ARE NOT MEASURING.** The census
+  measures canon against two renderers. The 17 twin rows come from the emitter's own
+  registration disagreeing with the CHECKER's reverse-mapped name — three producers, and the
+  instrument only had two columns. *A two-axis census cannot count a defect between two
+  producers that both live on one axis's side.*
+* **WHEN A FIX MOVES WHICH SPELLING THE TABLES HOLD, EITHER HALF ALONE IS A REGRESSION — and
+  the half that fails first is the one you did not change.** The skip alone breaks
+  `plain-param`, a position the skip does not touch, because `collectS`'s `variantIndexOf`
+  gate then interns the OTHER spelling. *Sweep the positions the change does not name.*
