@@ -1,0 +1,245 @@
+// @run
+// @log K
+// @log O
+// @log NOT
+// @log aa
+// @log true
+// @log aa!
+// @log K
+// @log K
+// @log K
+// @log K
+// @log K
+// @log K
+// @log K
+// @log K
+// @log O
+// @log P
+// @log O
+// @log NOT
+// @log true
+// @log P
+// @log P
+// @log P
+// @log P
+// @log K
+// @log O
+// THE FLOOR UNDER THE LITUNION COMPACT REP (`docs/internals/litunion-compact-rep-design.md`).
+//
+// The compact rep is FILED, not shipped: its stated benefit (fewer allocations) is refuted
+// by measurement — a litunion member stored into a mixed box already costs exactly ONE
+// `struct.new`, because the member string is a POOLED immutable global (`collectStrPool`),
+// so the payload is a `global.get` and not an allocation. What the rep would buy is
+// correctness (a value-atom KIND for the litunion member, which `valueAtomKind` does not
+// have) and equality (a `ref.cast` + an O(len) `__str_eq__` CALL becomes one `i32.eq`).
+//
+// This file is the FLOOR that filing leaves behind: every litunion-in-mixed-union cell
+// that RUNS CORRECTLY on master today, pinned by position, so the follow-on slices named
+// in §7 of the design cannot close their defects by breaking a working cell. The design's
+// governing law is that an outcome class never moves DOWN, and a floor is how that is
+// checked rather than asserted.
+//
+// The cells this file deliberately does NOT contain are the measured defects, and they are
+// enumerated with their witnesses in the design doc rather than pinned here — pinning a
+// silent wrong answer would make it an invariant. In one line each:
+//   · storing an atom-typed VALUE (`const k: K = "aa"; const x: K | f64 = k`) mis-tags or
+//     emits invalid wasm in 9 of 9 mixed spellings (the ladder has no litunion arm);
+//   · reading a narrowed arm back into a `K`-typed position (`const y: K = x`) is invalid
+//     wasm in 9 of 9 (the box holds a string ref where the atom rep wants an i32 id);
+//   · `K | string` and `K | K2` put TWO members on ONE tag.
+//
+// THE TWO SPELLINGS ARE CONTROLS FOR EACH OTHER ONLY BECAUSE THEIR MEMBERS DIFFER. The
+// declared alias is `"aa"|"bb"` and the un-aliased inline run is `"pp"|"qq"`: a shared
+// member set would let the ALIAS registration answer the INLINE lookup, and the inline half
+// would green without ever being reached (#1304's method note).
+
+type K = "aa" | "bb"
+
+// ── the DECLARED ALIAS inside a mixed box ───────────────────────────────────
+function aStore() {
+  const x: K | f64 = "aa"
+  if x is K { print("K") } else { print("O") }
+}
+aStore()
+
+function aOtherArm() {
+  const x: K | f64 = 2.5
+  if x is K { print("K") } else { print("O") }
+}
+aOtherArm()
+
+function aIsOther() {
+  const x: K | f64 = "aa"
+  if x is f64 { print("OTH") } else { print("NOT") }
+}
+aIsOther()
+
+function aNarrowPrint() {
+  const x: K | f64 = "aa"
+  if x is K { print(x) } else { print("O") }
+}
+aNarrowPrint()
+
+function aNarrowEq() {
+  const x: K | f64 = "aa"
+  if x is K {
+    const b = x == "aa"
+    print(b)
+  } else {
+    print("O")
+  }
+}
+aNarrowEq()
+
+function aNarrowConcat() {
+  const x: K | f64 = "aa"
+  if x is K {
+    const t = x + "!"
+    print(t)
+  } else {
+    print("O")
+  }
+}
+aNarrowConcat()
+
+function aRet(n: i32): K | f64 {
+  if n > 0 { return "aa" }
+  return 2.5
+}
+function aReturn() {
+  const x = aRet(1)
+  if x is K { print("K") } else { print("O") }
+}
+aReturn()
+
+function aTake(x: K | f64) {
+  if x is K { print("K") } else { print("O") }
+}
+function aParam() { aTake("bb") }
+aParam()
+
+const aG: K | f64 = "aa"
+function aGlobal() {
+  if aG is K { print("K") } else { print("O") }
+}
+aGlobal()
+
+function aField() {
+  const s: { v: K | f64 } = { v: "aa" }
+  const x = s.v
+  if x is K { print("K") } else { print("O") }
+}
+aField()
+
+function aElem() {
+  const xs: (K | f64)[] = ["aa", 2.5]
+  const x = xs[0]
+  if x is K { print("K") } else { print("O") }
+}
+aElem()
+
+function aMapVal() {
+  const m: {[string]: K | f64} = Map()
+  m["p"] = "bb"
+  const x = m["p"]
+  if x is K { print("K") } else { print("O") }
+}
+aMapVal()
+
+function aNullable() {
+  const x: K | f64 | null = "aa"
+  if x is K { print("K") } else { print("O") }
+}
+aNullable()
+
+function aReassign() {
+  let x: K | f64 = "aa"
+  if x is K { print("K") } else { print("O") }
+  x = 2.5
+  if x is K { print("K") } else { print("O") }
+}
+aReassign()
+
+// ── the UN-ALIASED INLINE run inside a mixed box (different members) ─────────
+function iStore() {
+  const x: ("pp" | "qq") | f64 = "pp"
+  if x is ("pp" | "qq") { print("P") } else { print("O") }
+}
+iStore()
+
+function iOtherArm() {
+  const x: ("pp" | "qq") | f64 = 2.5
+  if x is ("pp" | "qq") { print("P") } else { print("O") }
+}
+iOtherArm()
+
+function iIsOther() {
+  const x: ("pp" | "qq") | f64 = "pp"
+  if x is f64 { print("OTH") } else { print("NOT") }
+}
+iIsOther()
+
+// The narrowed READ of the inline arm (`print(x)`, `x + "!"`) is NOT here: with members
+// that differ from the alias it is INVALID WASM on master in 5 of 6 mixed spellings, and
+// G1's first pass reported it green only because that grid spelled the inline run with
+// `K`'s own members. The alias twin above (`aNarrowPrint` / `aNarrowConcat`) runs, so the
+// pair is the design's cleanest statement of the alias/inline divergence. `==` on the
+// narrowed inline arm DOES run, and is pinned.
+function iNarrowEq() {
+  const x: ("pp" | "qq") | f64 = "pp"
+  if x is ("pp" | "qq") {
+    const b = x == "pp"
+    print(b)
+  } else {
+    print("O")
+  }
+}
+iNarrowEq()
+
+function iRet(n: i32): ("pp" | "qq") | f64 {
+  if n > 0 { return "pp" }
+  return 2.5
+}
+function iReturn() {
+  const x = iRet(1)
+  if x is ("pp" | "qq") { print("P") } else { print("O") }
+}
+iReturn()
+
+function iTake(x: ("pp" | "qq") | f64) {
+  if x is ("pp" | "qq") { print("P") } else { print("O") }
+}
+function iParam() { iTake("qq") }
+iParam()
+
+const iG: ("pp" | "qq") | f64 = "pp"
+function iGlobal() {
+  if iG is ("pp" | "qq") { print("P") } else { print("O") }
+}
+iGlobal()
+
+function iField() {
+  const s: { v: ("pp" | "qq") | f64 } = { v: "pp" }
+  const x = s.v
+  if x is ("pp" | "qq") { print("P") } else { print("O") }
+}
+iField()
+
+// ── the FLATTEN target for `K | K2`, pinned because it ALREADY WORKS ─────────
+// `K | K2` (a union of two literal unions) is the design's §7.3 open question: today it
+// reps as a bare string with `is K` const-folded to `i32.const 0`, so 16 of its 20 grid
+// cells are broken. The recommended answer is to FLATTEN it — a union all of whose members
+// are literal unions IS a literal union — and the reason that recommendation is cheap is
+// pinned right here: `KA` below is exactly what `K | K2` would flatten to, and the SUBSET
+// test against `K` already answers correctly, because `emitIs`'s membership ladder tests
+// the tested type's own members (`id == "aa" || id == "bb"`) over the interned atom.
+// So slice C's runtime half is free and only the render has to move. If this pair ever
+// stops printing `K` then `O`, that recommendation is void and the design must be re-read.
+type KA = "aa" | "bb" | "cc" | "dd"
+function flattenTargetAlreadyWorks() {
+  const x: KA = "aa"
+  if x is K { print("K") } else { print("O") }
+  const y: KA = "cc"
+  if y is K { print("K") } else { print("O") }
+}
+flattenTargetAlreadyWorks()

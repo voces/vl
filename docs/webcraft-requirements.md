@@ -633,6 +633,28 @@ and needs nothing from vl beyond scalar exports.
 - **Literal-union compact representation** (A16 remaining): order/state enums
   stored as i32 tags rather than softened values — mostly a memory nicety
   since authoritative enums live in Buffers anyway.
+  **DESIGNED AND FILED, not shipped** (`docs/internals/litunion-compact-rep-design.md`).
+  > **Your own framing was right and the "memory nicety" is the part that does not
+  > survive measurement.** A standalone literal union — and the four keep positions
+  > (array element, struct field, map value, function result) — ALREADY rep as an
+  > interned i32 atom. The only place that does not is the member of a MIXED union
+  > (`K | f64`), and there the store already costs exactly **one** `struct.new`,
+  > because every distinct string literal is interned into an immutable global, so
+  > the box's payload is a `global.get` rather than an allocation. No representation
+  > can allocate less; the obvious compact encoding (a scalar value box around the
+  > atom id) would allocate MORE. **So there is no memory to win here, and the
+  > feature should not be scheduled as a memory feature.**
+  >
+  > What measurement DID find is a correctness population: **81 of 244 grid cells
+  > across the mixed-union spellings are broken today, 42 of them silent wrong
+  > answers**, all `vl check`-clean. `const k: K = "aa"; const x: K | f64 = k`
+  > converts the atom ID to a float; `if x is K { const y: K = x }` is invalid wasm;
+  > `K | string` answers `x is K` TRUE for a plain string. If webcraft's order/state
+  > enums ever sit in a union beside a non-enum arm, those are the shapes to avoid —
+  > and if that is a real pattern for you rather than a hypothetical, say so, because
+  > it moves this from "nicety" to a correctness item and changes its priority.
+  > Enums that stay standalone, or live in a Buffer, are unaffected: they are already
+  > i32 atoms.
 - **Readonly fields / A9 variance**: would let kernel expose read-only views
   of component data to wc3 systems, enforcing the "renderer/systems read,
   commands write" direction in the type system.

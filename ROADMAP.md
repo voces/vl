@@ -203,7 +203,9 @@ type the string-keyed rep lowers and every position but a union member (B6b exte
 identity from the VALUE to the (KEY, VALUE) pair, then gave the struct/variant FIELD row the same
 key column); ~~contextual f32 literals~~ **DONE**; ~~`match` phase 2 — variant payload
 binding~~ **DONE** (`match cmd { Move{x, y} => … }`, punned fields; renaming + nested destructuring
-measured and deferred — B21 item 1); literal-union compact representation (A16); readonly
+measured and deferred — B21 item 1); literal-union compact representation (A16) — **DESIGNED
+AND FILED**, its allocation rationale refuted by measurement and its correctness half (81 of 244
+cells) blocked on three owner rulings; readonly
 fields / A9 variance; default params (B15a); SIMD over Buffer (unlocked by P0, not requested yet);
 keep emitting a names section on non-`-O` builds.
 
@@ -547,6 +549,41 @@ in-language GC knobs.
 - 🟡 **A16. Literal-union types.** REMAINING: the **enum representation** (i32 tag for a closed
   literal union — see `docs/guide/unions.md`); a literal union read *inside* a body softens to base
   (coarser member-narrowing there than at the call boundary).
+  > **The MIXED-UNION half is DESIGNED AND FILED, not shipped** — `docs/internals/litunion-compact-rep-design.md`.
+  > A standalone litunion and the four `ctxKeepsLitUnion` positions ALREADY rep as the interned
+  > i32 atom; what does not is the member of a mixed box (`K | f64`), which stores a string ref.
+  > **The rationale that justified building it is refuted by measurement**: the store already
+  > costs exactly ONE `struct.new`, because the member string is a pooled immutable global
+  > (`collectStrPool`) and the payload is a `global.get` — so no rep can allocate less, and the
+  > `$vbI32` variant of the compact rep would allocate MORE. The surviving wins are equality (a
+  > `ref.cast` + an O(len) `__str_eq__` CALL becomes one `i32.eq`) and correctness.
+  >
+  > **The correctness population is 81 of 244 grid cells — 42 of them SILENT wrong answers, 34
+  > invalid wasm, all `vl check` rc 0** — and it has ONE root cause: `valueAtomKind` has no code
+  > for a literal-union member (it returns `-1`), so the box's kind vocabulary cannot name the
+  > arm. **35 of its 42 call sites have no compensating litunion leg**; the four defect families
+  > are exactly the gates nobody visited. Storing an atom-typed VALUE into `K | f64` emits
+  > `f64.convert_i32_s` on the atom ID and tags it f64; reading a narrowed arm back into a
+  > `K`-typed position is invalid wasm in 9 of 9 spellings; `K | string` puts a real string on
+  > the litunion arm's tag (`x is K` is TRUE for `"zz"`, six lines); `K | K2` reps as a bare
+  > string with `is K` const-folded to `i32.const 0`.
+  >
+  > **A loud reject is NOT available for the collision shapes** — measured: rejecting
+  > `K | string` moves 12 `RUN-OK` cells DOWN and `K | K2` moves 4, so they are BLOCKED on the
+  > rep rather than independently fixable. Three owner rulings gate the build: the tag scheme (a
+  > 14th value-atom kind re-bases both slot bands by a constant; a per-set slot band re-bases
+  > them wholesale, renumbering every union box tag in every program), whether `ref.i31` enters
+  > the emitted vocabulary (measured available in wasm-tools' shipped set, V8 and wasmtime 47 —
+  > and the only encoding that does not regress allocations; the emitter has zero i31 today), and
+  > what `K | K2` should MEAN — **and that last one turns out to need no ruling and to be the
+  > slice to take FIRST**: a union all of whose members are literal unions IS one, and the
+  > flattened target already runs on master with zero compiler changes
+  > (`type KA = "aa"|"bb"|"cc"|"dd"`, `x is K` answers correctly), because `emitIs`'s
+  > membership ladder tests the tested type's own members over the interned atom. Only the
+  > checker's render has to move. THREE follow-on slices are scoped with their populations; the
+  > working cells are pinned by `tests/cases/literal-unions/mixed-union-litunion-arm-floor.vl`.
+  > *Also measured: the fuzzer DOES reach litunion-in-mixed-union (26 and 14 of 800 cases on two
+  > seeds) and is VACUOUS on every defect family — it only ever stores a member LITERAL.*
 - ⬜ **A17 follow-up: `never` inference + `unconditional-recursion` lint.** A17 demand-driven inference
   is shipped. REMAINING: (a) infer `never` for a genuinely base-case-less divergent recursive cycle
   (currently a stopgap "annotate a return type" error); (b) an `unconditional-recursion` lint that fires
