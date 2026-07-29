@@ -586,15 +586,23 @@ in-language GC knobs.
   `maps/error-i32-keyed-position-array.vl`); and an ARRAY OF CLOSURES returning one
   (`(() => {[i32]: V})[]`). Also filed, on both key reps: a struct that is a MEMBER of a declared
   union cannot be a map VALUE (`mvValKindOfName`'s last arm asks `structIndexByValName`, which a
-  variant is not in — `tests/cases/maps/error-map-value-struct-in-union.vl`); `m.get(k) ?? member`
-  over an ATOM-valued map prints the raw atom id (`0` where `a` is expected), on BOTH key reps;
-  `m.get(k) ?? nonMember` is a LATE emit error where the `m[k] ?? …` spelling is a clean checker
-  reject — not worth fixing until the raw-atom-id defect above is; a LIST-valued map read as
-  `const g = m[k]; if g != null { g[0] }` is `emitProgram: bare null needs a struct-typed context`
-  on both key spellings and for `i32[]` too (the `(m[k] ?? [])[0]` idiom works); and
-  **a SET-typed FIELD has no `.add`** (`unknown property \`add\` on
-  {[K]: boolean}` — the checker's member table does not reach a `{[K]: boolean}` reached through a
-  field; identical on both keys, so it is a checker gap and not a rep one). Also:
+  variant is not in — `tests/cases/maps/error-map-value-struct-in-union.vl`).
+  (The filed "a SET-typed FIELD has no `.add`" row is STALE — `.add` gates on the VALUE TYPE as
+  of `sets/add-through-every-position.vl`, and `{seen: {[i32]: boolean}}` + `s.seen.add(5)` runs.)
+  **The `m.get(k) ?? d` METHOD spelling is DONE** — it was taught HALF the fused-read set (every
+  `??` rule asked `binLeft is Index`), so it printed the RAW ATOM ID over an atom-valued map and
+  turned the non-member default into a LATE emit error; both now resolve the receiver through the
+  ONE shape home `fusedMapReadRecvIx`. The **BARE mono-map read's MISS is null** for a
+  niche-bearing value too (`{[K]: K}` / `{[K]: boolean}`, not just the `| null` spellings) — `0`
+  was a real value there (atom id 0 is the first-interned member, boolean 0 is `false`), so
+  `m[missing] == <that member>` read TRUE and the `!= null` narrow saw a miss as present.
+  REMAINING on that axis, both loud: a **plain-`i32`-valued** map's narrowed bare read
+  (`const g = m[k]; if g != null`) is `emitProgram: bare null needs a struct-typed context` — every
+  i32 is a legal value so there is no spare sentinel, and `m[k] ?? d` is the spelling; and a
+  **BARE `m.get(k)` with no `??`** is `emitProgram: callee is not a function name` in every
+  position, on both key reps and for every value rep (only the FUSED `m.get(k) ?? d` lowers —
+  routing the bare method spelling would need the `.get` twin at every `expr*` Index arm, not just
+  the `??` ones). Also:
   `map`/`filter` over Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`.
   (Self-host native parity: string-keyed maps, delete, `Set`/`.add`/`.get`, and ref-valued maps
   (string/struct values, #319) landed; map-typed params are the remaining native map gap.)

@@ -62,6 +62,7 @@ import {
   TyPrim,
   TyUnion,
   anyLitUnionUsed,
+  fusedMapReadRecvIx,
   inferRetNameByNode,
   inferRetNameOf,
   isInferLetNulBool,
@@ -9489,15 +9490,24 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     // `const t = m[k]` binds the niche and narrows with `!= null` against `-1`. The bare-read
     // dual of the `m[k] ?? d` arm below (a bare read has no `??` to route it).
     if nodeTyMapValIsNulLitUnion(e.idxArr) { return true }
+    // …and the NON-nullable spelling `{[string]: K}` reads the SAME niche: a bare `m[k]` is
+    // `K | null` there too (a MISSING key is null), and `emitMapGet`'s miss arm yields the
+    // very same `-1`. The two map spellings differ only in whether a null can be STORED, not
+    // in what a read produces, so claiming one and not the other left `const g = m[k]` off the
+    // atom slot — `g != null` then emitted a bare null (`bare null needs a struct-typed
+    // context`) instead of the `-1` compare.
+    if nodeTyMapValIsLitUnion(e.idxArr) { return true }
   }
   // A fused `m[k] ?? d` read over a NULLABLE-atom-valued map (`{[string]: K | null}`) yields
   // the `K | null` niche i32 (a member id or the `-1` sentinel — a stored null is preserved),
-  // so an un-annotated `const t = m[k] ?? d` binds the niche and narrows with `!= null`.
+  // so an un-annotated `const t = m[k] ?? d` binds the niche and narrows with `!= null`. The
+  // receiver comes from the ONE fused-read shape home so the METHOD spelling `m.get(k) ?? d`
+  // — the same lowering — claims identically (the `exprIsLitAtom` twin of this half-set).
   if e is BinExpr {
     if e.binOp == "??" {
-      const nbl = P.nodes[unwrapParen(e.binLeft)]
-      if nbl is Index {
-        if nodeTyMapValIsNulLitUnion(nbl.idxArr) { return true }
+      const nblRecv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
+      if nblRecv >= 0 {
+        if nodeTyMapValIsNulLitUnion(nblRecv) { return true }
       }
     }
   }
@@ -13427,9 +13437,14 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     // `m[k] ?? d` over an ATOM-valued map yields the atom — the mono vals list holds
     // ids, so the fused get's result is a real i32 atom (like an atom array element).
+    // The METHOD spelling `m.get(k) ?? d` is the SAME fused get (`emitCoalesce` routes
+    // both to `emitMapGetOr`), so the receiver comes from the ONE fused-read shape home
+    // rather than an `is Index` half-set — without the `.get` half this classifier
+    // declined, `print` skipped the atom→member widen, and the read printed its RAW ATOM
+    // ID (`0` where `aa` is expected): a silent wrong answer, on both key reps.
     if e.binOp == "??" {
-      const bl = P.nodes[unwrapParen(e.binLeft)]
-      if bl is Index { return nodeTyMapValIsLitUnion(bl.idxArr) }
+      const blRecv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
+      if blRecv >= 0 { return nodeTyMapValIsLitUnion(blRecv) }
     }
   }
   false
