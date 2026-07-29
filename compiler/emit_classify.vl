@@ -3478,28 +3478,31 @@ export function mvValKindOfName(valName: string): i32 {
 // element's ref-list types (`rlInternName`), and every ref-valued map forces the
 // string-list (keys) + mono map types — the shared probe machinery and the keys
 // list ride on them.
-// Canonicalize a map-VALUE union name for the mv table: a litunion-ALIAS atom widens
-// to `string` (`K0|i64|null` → `string|i64|null` — R3's boxed member-string rule, the
-// SAME transform `rlSlotByName`'s fallback documents for ref-list slots). Two spellings
-// of one value union otherwise interned TWIN mv slots with divergent vals reps, and the
-// narrowed map read resolved the wrong twin's struct — INVALID-WASM (fuzz-nightly seed
-// 658239060 d5). A non-union / alias-free name passes through unchanged.
+// Canonicalize a map-VALUE union name for the mv table so that two spellings of ONE value
+// union cannot intern TWIN mv slots with divergent vals reps — the narrowed map read then
+// resolves the wrong twin's struct, INVALID-WASM (fuzz-nightly seed 658239060 d5). The
+// canon is a DESCENT, not a widening: it reaches litunion atoms nested under `[]` / `{…}`
+// so every producer keys one slot. Since the owner ruling of 2026-07-29 a litunion-ALIAS
+// atom is PRESERVED at every depth (`K0|i64|null` stays `K0|i64|null`), because both
+// checker producers spell it that way and this table is queried with what they spell. A
+// non-union / alias-free name passes through unchanged.
 export function mvCanonValName(valName: string) {
   // RUNAWAY CAP (the `repNameCanonKey` crash family): a value spelling this long is
   // never a legit mv key — pass it through untouched so the kind classifier's -3
   // unsupported path fails LOUDLY instead of splitting/rendering a runaway name.
   if valName.length > 4096 { return valName }
-  // A ref-LIST value (`(K0|i32)[]`, the map value of `{[string]: (K0|i32)[]}`): soften its
-  // element union's litunion aliases THROUGH the array wrapper — the same canon
-  // `rlInternName` keys the vals ref-list slot on. Without this the annotation spelling and
-  // a self-inferred factory-return lambda (`() => (h0)`) minted twin mv/map structs, a cast
-  // TRAP at the returned-map read. (Func-type element arrays are left untouched inside.)
+  // A ref-LIST value (`(K0|i32)[]`, the map value of `{[string]: (K0|i32)[]}`): canon its
+  // element union THROUGH the array wrapper — the same canon `rlInternName` keys the vals
+  // ref-list slot on. Without this the annotation spelling and a self-inferred
+  // factory-return lambda (`() => (h0)`) minted twin mv/map structs, a cast TRAP at the
+  // returned-map read. (Func-type element arrays are left untouched inside.)
   if nameIsElemArray(valName) { return rlCanonLitUnionAtoms(valName) }
   // A STRUCT / nested-MAP value (`{f: K0 | f64}` — the value of `{[string]: {f: K0|f64}}`):
-  // soften its field / value litunion aliases THROUGH the shape, the struct sibling of the
-  // ref-list `[]` arm above. Without this the annotation (`canonEmitTypeNames`-softened to
-  // `{f:string|f64}`) and a self-inferred factory-return lambda (`{f:K0|f64}`) minted twin
-  // mv slots → twin map/functypes → a `$fnsig` cast TRAP at the returned-map read.
+  // canon its field / value unions THROUGH the shape, the struct sibling of the ref-list
+  // `[]` arm above. Without this the annotation and a self-inferred factory-return lambda
+  // minted twin mv slots → twin map/functypes → a `$fnsig` cast TRAP at the returned-map
+  // read. (Both producers now spell the litunion atom the same way, so what this arm
+  // reconciles is the nesting, not the alias.)
   //
   // The WIDE brace-endpoint span at its home (`emit_base.nameIsBraceSpanEnds`): this arm
   // must see a MAP value as well as a struct one, so it is deliberately NOT
@@ -3513,17 +3516,22 @@ export function mvCanonValName(valName: string) {
 
 // THE LITUNION-ARM CANON, WRITTEN ONCE. `mvCanonValName` (above) and
 // `rlCanonLitUnionAtoms` (the ref-list element normalizer) each carried this
-// thirty-line body VERBATIM — same split, same niche guard, same widen-or-descend
-// loop, same "unchanged ⇒ return the original" fall-through — differing only in the
-// name of the parameter. Two copies of a union grammar are two copies of the split
-// inside it, and two places for the R3 boxed-member rule to drift.
+// thirty-line body VERBATIM — same split, same niche guard, same descent loop, same
+// "unchanged ⇒ return the original" fall-through — differing only in the name of the
+// parameter. Two copies of a union grammar are two copies of the split inside it, and
+// two places for the R3 boxed-member rule to drift.
 //
-// Widen ONLY a genuine MIX (a non-null, non-litunion sibling exists): a pure
-// `K0 | null` value is the -1-sentinel MONO niche (`nameIsNulLitUnion`), NOT the
-// string-atom box — widening it re-repped the niche as `string|null` and broke the
-// nullable-litunion map values. A non-litunion atom DESCENDS (a nullable struct value
-// `{f: K0|f64} | null` carries its litunion one level down), so the nested spelling
-// keys the same softened slot.
+// THE WIDENING LEG IS GONE (owner ruling 2026-07-29). This function used to rewrite a
+// litunion-ALIAS atom of a genuine MIX to `string`; it is the EMITTER's copy of the rule
+// the two checker producers carry, and when they moved to PRESERVE it had to move with
+// them — a re-widening here queries the union registry under a spelling no row was ever
+// minted with, so a value union failed the box lookup it had registered itself
+// (`union box atom test on a union with no recorded members: string|f64`, 4 corpus files).
+// What survives is the DESCENT: a non-litunion atom recurses (a nullable struct value
+// `{f: K0|f64} | null` carries its union one level down) so the nested spelling keys the
+// same slot as the flat one. The `hasOther` MIX gate is kept even though nothing widens
+// any more — a pure `K0 | null` is the -1-sentinel MONO niche (`nameIsNulLitUnion`), not
+// the string-atom box, and the gate is what states that the two are different reps.
 //
 // Callers keep their own cardinality gate, because they spell it differently for a
 // reason: `mvCanonValName` returns early on a non-union, `rlCanonLitUnionAtoms` falls
@@ -3543,10 +3551,11 @@ function canonLitUnionArms(name: string): string {
   let i = 0
   while i < atoms.length {
     let a = atoms[i]
-    if nameIsLitUnionType(a) {
-      a = "string"
-      changed = true
-    } else if a != "null" {
+    // A litunion-ALIAS atom is PRESERVED (owner ruling 2026-07-29). The two CHECKER
+    // producers no longer soften, so re-widening the atom here would query the union
+    // registry under a spelling no row was minted with — registration and query stop
+    // agreeing, and the box lookup fails on a union it registered itself.
+    if !nameIsLitUnionType(a) && a != "null" {
       const ra = rlCanonLitUnionAtoms(a)
       if ra != a {
         a = ra
@@ -11640,12 +11649,14 @@ function rlElemNicheNullable(kind: i32, name: string) {
   return nullablePartOf(name) != ""
 }
 
-// Soften every litunion-ALIAS atom in an element NAME to its boxed `string` atom
-// (`K0|i32` → `string|i32`, R3's rule), DESCENDING through array-of-union and paren
-// grouping so `(K0|i32)[]` canonicalizes to `(string|i32)[]`. A closure element / a
-// top-level function type is left untouched (its `=>`-result litunion is not a slot-key
-// union — descending would corrupt its param/result parens). Mirrors `canonEmitName`'s
-// guarded array/paren descent with the litunion-alias softening `canonEmitName` omits.
+// Canonicalize an element NAME's unions to the ONE spelling every producer of that name
+// uses, DESCENDING through array-of-union, paren grouping, inline shapes and map values so
+// a nested union keys the same slot as a flat one. A closure element / a top-level function
+// type is left untouched (its `=>`-result litunion is not a slot-key union — descending
+// would corrupt its param/result parens). Mirrors `canonEmitName`'s guarded array/paren
+// descent. Since the owner ruling of 2026-07-29 a litunion-ALIAS atom is PRESERVED here
+// (`(K0|i32)[]` stays `(K0|i32)[]`), matching what both checker producers spell — see
+// `canonLitUnionArms`, which this delegates every union arm to.
 function rlCanonLitUnionAtoms(name: string): string {
   const n = name.length
   if n == 0 { return name }
@@ -11734,14 +11745,23 @@ function rlCanonLitUnionAtoms(name: string): string {
 // canonical NAME the slot STORES, which the not-yet-destringified downstream
 // name-consumers still read to make their own decisions — the `is`-narrowing
 // emit's litunion classifier, the union-variant lookup, `mapValNameOf`,
-// `structIdxOfElemName`. Those live in later phases (D3+): until they migrate,
-// the stored name must be the emit-canonical spelling, so a litunion-alias atom
-// is softened to its boxed `string` (`K0|{w:i32}` → `string|{w:i32}`; else the
-// `is`-emit reads the raw `K0` and mis-selects the union-variant path) and an
-// i32-/string-backed leaf list folds to its shared-wrapper spelling. This is
-// name normalization for name-consumers, NOT the slot key — `rlCanonLitUnionAtoms`
-// (retained for the map-VALUE layer) does the softening, and the two array folds
-// mirror `nameIsI32Array` / `nameIsStringArray`.
+// `structIdxOfElemName`, and the ref-array ARM scanner
+// (`unionRefArrayArmSlotForElemAtom`). Those live in later phases (D3+): until
+// they migrate, the stored name must be the emit-canonical spelling — which
+// since the owner ruling of 2026-07-29 PRESERVES a litunion-alias atom
+// (`K0|{w:i32}` stays `K0|{w:i32}`), because that is what both checker producers
+// spell and what the union ROW is registered under. An i32-/string-backed leaf
+// list still folds to its shared-wrapper spelling. This is name normalization for
+// name-consumers, NOT the slot key — `rlCanonLitUnionAtoms` does the canon, and
+// the two array folds mirror `nameIsI32Array` / `nameIsStringArray`.
+//
+// WHEN THIS SPELLING MOVED, ITS READERS HAD TO MOVE WITH IT, and one of them had
+// never been reached by an alias before: the arm scanner compares these atoms
+// against a CLOSED probe vocabulary (`"string"`, `"boolean"`, `"f64"`, `"i64"`,
+// `"i32"`, a variant name), so a preserved `K0` matched nothing and a list literal
+// lost its ref-array arm — invalid wasm. Any future change to what is stored here
+// owes that site a look; it cannot report a miss as an error, because "no arm
+// matched" is one of its legitimate answers.
 function rlElemStoredName(name: string): string {
   const c = rlCanonLitUnionAtoms(name)
   if nameIsI32Array(c) { return "i32[]" }
@@ -11772,12 +11792,15 @@ export function rlInternNameTy(name: string, kind: i32, ty: i32) {
   // share a WasmGC wrapper collapse to ONE slot: an i32-backed leaf list
   // (`boolean[]` / litunion `K[]` / `(boolean|null)[]` — the shared `lTypeIdx`
   // i32-list wrapper), a string-backed leaf list (`(string|null)[]` — the
-  // `$mkListIdx` wrapper), and a litunion-alias union member softened to its boxed
-  // `string` atom (`K0|i64` ≡ `string|i64`, R3's rule — else two slots sharing one
-  // wrapper keyed TWO `$fnsig` results `>r0;`/`>r1;`, minting byte-identical yet
-  // iso-recursively DISTINCT functypes, a value-call `ref.cast` TRAP). Declared
-  // struct twins stay apart (`repElemKey` keys a struct nominally). The stored name
-  // is the canonical spelling for downstream name-consumers (see `rlElemStoredName`).
+  // `$mkListIdx` wrapper), and a litunion-alias union member with its boxed `string`
+  // atom (`K0|i64` ≡ `string|i64`, R3's rule — else two slots sharing one wrapper
+  // keyed TWO `$fnsig` results `>r0;`/`>r1;`, minting byte-identical yet
+  // iso-recursively DISTINCT functypes, a value-call `ref.cast` TRAP). That last
+  // equivalence is REP-level and structural (`repCanonKey` rewrites a litunion member
+  // to `string` while walking `uMembers`), so it is unaffected by the 2026-07-29 ruling
+  // that the NAME preserves the alias — the two layers are deliberately separate here.
+  // Declared struct twins stay apart (`repElemKey` keys a struct nominally). The stored
+  // name is the canonical spelling for downstream name-consumers (`rlElemStoredName`).
   const key = repElemKeyOfNameTy(name, ty)
   let i = 0
   while i < rlElemName.length {
@@ -14903,6 +14926,16 @@ function unionRefArrayArmSlotForElemAtom(name: string, elemAtom: string) {
       let j = 0
       while j < eAtoms.length {
         if eAtoms[j] == elemAtom { return slot }
+        // R3's BOXED-MEMBER rule, at the arm's STORED element spelling. A litunion-ALIAS
+        // member of a value union rides the box AS the `string` atom (`K|i32` boxes an
+        // "a" with the string tag), and since the owner ruling of 2026-07-29 the stored
+        // spelling PRESERVES the alias instead of widening it to `string`. The caller's
+        // probe can only ever name the BOXED atom — it classifies a string element as
+        // "string", never as `K` — so without this leg a `(K | i32)[]` arm is invisible
+        // to a string-element literal, the routing returns -1 and the literal falls to
+        // the value-atom LADDER, which stores a RAW string-list wrapper into the
+        // box-typed slot: invalid wasm ("expected (ref null $type), found i32").
+        if elemAtom == "string" && nameIsLitUnionType(eAtoms[j]) { return slot }
         j = j + 1
       }
     }
