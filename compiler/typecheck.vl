@@ -6639,14 +6639,14 @@ function nameNeedsCanon(name: string) {
 // `tyToEmitName`: a `TyVar` / residual `TyNeg` / `TyErr` / the `never` prim has no
 // name, and a composite has one exactly when every component does.
 //
-// `tyToEmitName`'s litunion-ALIAS legs (`litUnionAliasNameOfTy` on a union member,
-// nullable inner, struct field, array element, map value, fn result) are NOT
-// mirrored here because they cannot change the ANSWER, only the spelling: an alias
-// name is only ever substituted for a type `tyIsLitUnion` accepts — a union of
-// string literals — and every one of those already names itself (`string`). Same
-// for the flattened-alias REGROUP, which only ever substitutes for `TyLit` members.
-// `tyToEmitName` has no cycle guard, so neither does this; a type that would
-// recurse forever here recursed forever there.
+// `tyToEmitName`'s remaining litunion-ALIAS legs (`litUnionAliasNameOfTy` on a
+// nullable inner, struct field, array element, map value, fn result — the union
+// MEMBER leg and the flattened-lit regroup came out with the 2026-07-28 mixed-union
+// soften) are NOT mirrored here because they cannot change the ANSWER, only the
+// spelling: an alias name is only ever substituted for a type `tyIsLitUnion` accepts
+// — a union of string literals — and every one of those already names itself
+// (`string`). `tyToEmitName` has no cycle guard, so neither does this; a type that
+// would recurse forever here recursed forever there.
 function tyIsEmitRepresentable(ix: i32): boolean {
   if ix < 0 { return false }
   const t = T.tys[ix]
@@ -6705,46 +6705,26 @@ function tyEmitNameIsString(ix: i32): boolean {
   if t is TyUnion {
     const members = t.uMembers
     if members.length == 0 { return false }
-    // The flattened-alias REGROUP (`tyToEmitName`'s union arm) replaces the literal
-    // run with a declared litunion NAME, so a fired regroup spells `string` only if
-    // that alias is itself named `string`. Mirrored rather than assumed away.
-    const rgTexts: string[] = []
-    let rgNonLit = false
-    let rg = 0
-    while rg < members.length {
-      const rm = T.tys[members[rg]]
-      if rm is TyLit {
-        if rm.litKind == "str" { rgTexts.push(rm.litText) }
-      } else {
-        let rmNull = false
-        if rm is TyPrim {
-          if rm.primName == "null" { rmNull = true }
-        }
-        if !rmNull { rgNonLit = true }
-      }
-      rg = rg + 1
-    }
-    let rgAlias = ""
-    if rgNonLit && rgTexts.length >= 2 {
-      rgAlias = litUnionAliasOfLitTexts(rgTexts)
-    }
-    if rgAlias != "" && rgAlias != "string" { return false }
+    // THE MIRROR OF THE UNION ARM, AND IT SHRANK WITH IT (owner ruling 2026-07-28). This
+    // block held two extra tests — the flattened-alias REGROUP and the per-member
+    // litunion-ALIAS lookup — because the render it predicts could substitute a declared
+    // alias NAME for a literal run, and a name that is not `string` makes the answer false.
+    // Both legs are gone from `tyToEmitNameGo`'s union arm, so both are gone from here: a
+    // str-literal member now renders `string` through the `TyLit` arm, which the recursion
+    // below already answers true for. Dual-written in the same slice, deliberately — the
+    // header's contract is `tyToEmitName(ix) == "string"` decided structurally, and it is a
+    // contract only if the two move together.
+    //
+    // The answer this MOVES is exactly the mixed union whose non-lit members all render
+    // `string` (`"a" | "b" | string`, a litunion alias beside its own base): master
+    // predicted `K0|string` and answered false, this build renders `string` and answers
+    // true. That is the render being right, not the predictor being loosened.
     let i = 0
     while i < members.length {
       const rgm = T.tys[members[i]]
-      let skip = false
-      if rgAlias != "" && rgm is TyLit { skip = true }
-      if !skip {
-        // A closure member renders PARENTHESIZED (`(()=>i32)`) — never bare.
-        if rgm is TyFunc { return false }
-        // A member that IS a registered litunion alias contributes its NAME.
-        const al = litUnionAliasNameOfTy(members[i])
-        if al != "" {
-          if al != "string" { return false }
-        } else if !tyEmitNameIsString(members[i]) {
-          return false
-        }
-      }
+      // A closure member renders PARENTHESIZED (`(()=>i32)`) — never bare.
+      if rgm is TyFunc { return false }
+      if !tyEmitNameIsString(members[i]) { return false }
       i = i + 1
     }
     return true
@@ -6910,73 +6890,60 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
   if t is TyLit { return tyLitBaseName(t) }
   if t is TyUnion {
     const members = t.uMembers
-    // FLATTENED-alias regroup: a litunion-ALIAS member's literals flatten into sibling
-    // TyLit members (`flattenVariantsInto`: `K0 | i64` → ["64","bjtvb","tt", i64]), so
-    // the per-member alias lookup below never sees the alias and each lit softened to
-    // `string` — the widened spelling minted TWIN field/slot rows beside the
-    // annotation-spelled ones (divergent structs/mv slots — INVALID-WASM; fuzz-nightly
-    // seed 658239060 d5). In a MIXED union (at least one non-TyLit member) regroup the
-    // str-lit members into their exactly-matching registered alias, rendered at the
-    // FIRST lit's position. A PURE litunion keeps the historical `string` softening
-    // (the `canonEmitTypeNames` invariant), and a lit set matching no alias keeps the
-    // per-member path unchanged.
-    let rgAlias = ""
-    const rgTexts: string[] = []
-    let rgNonLit = false
-    let rg = 0
-    while rg < members.length {
-      const rm = T.tys[members[rg]]
-      if rm is TyLit {
-        if rm.litKind == "str" { rgTexts.push(rm.litText) }
-      } else {
-        let rmNull = false
-        if rm is TyPrim {
-          if rm.primName == "null" { rmNull = true }
-        }
-        if !rmNull { rgNonLit = true }
-      }
-      rg = rg + 1
-    }
-    if rgNonLit && rgTexts.length >= 2 {
-      rgAlias = litUnionAliasOfLitTexts(rgTexts)
-    }
+    // THE MIXED-UNION SOFTEN — the OWNER'S RULING of 2026-07-28, and the reason this arm
+    // has no litunion-alias leg at all. In the emitter's vocabulary a string-litunion
+    // ALIAS standing as a MEMBER of a union is spelled by its BASE `string`: `K0 | f64`
+    // is `string|f64`, not `K0|f64`.
+    //
+    // IT IS THE SPELLING THE ANNOTATION SIDE HAS ALWAYS CARRIED. `canonEmitName`'s union
+    // arm canons each top-level member and then flattens a union-ALIAS member through
+    // `unionAliasMembers`, which renders the alias's own arena type — a PURE litunion,
+    // which this very function softens to `string`. So a declared `f(x): K0 | f64`
+    // reached the emitter as `string|f64` before this slice and after it; what changed is
+    // that the RENDER of the same type now says the same thing. Measured at 54 corpus
+    // annotations on 23 files (B1's canon-only residue) and 56 on B2's — the census's
+    // class Lsoft, which this arm's two preserving legs were the whole of.
+    //
+    // THE DATA REP DOES NOT MOVE, WHICH IS WHY THE SPELLING MAY. A litunion member
+    // entering a mixed box is already a STRING REF on the wire: `emitUnionCoerce`'s atom
+    // ladder classifies the incoming value by EXPRESSION (`exprString` → value-atom kind
+    // 2), never by the union's spelling, and `repCanonKey`'s union arm mix-widens the
+    // member before any rep key is minted. The gates in front of that ladder
+    // (`unionHasValueAtom`, `isVariantBoxUnionAtoms`) admitted the alias arm through a
+    // dedicated `nameIsLitUnionType` leg; they admit `string` through `valueAtomKind` on
+    // the line above it, so the boundary coercion is reached by the same path either way.
+    // The CHECKER's types are untouched — narrowing, exhaustiveness and assignability keep
+    // the exact litunion, and canon runs after all of them.
+    //
+    // WHAT THE TWO DELETED LEGS WERE, AND WHY THEIR WITNESSES SURVIVE THE DELETION. The
+    // first regrouped the sibling `TyLit` members a litunion-ALIAS member flattens into
+    // (`flattenVariantsInto`: `K0 | i64` → ["64","bjtvb","tt", i64]) back into the alias
+    // name (fuzz-nightly seed 658239060 d5 — divergent struct/mv slot rows, INVALID-WASM);
+    // the second gave a member that IS a registered litunion alias its name (fuzz-nightly
+    // run 29808029476, seed 78530533 d5 — divergent functypes at a `(K0 | i64)[]` closure
+    // result, a cast-failure TRAP). Both seeds pinned a DISAGREEMENT between this render
+    // and the annotation canon'd beside it, not the alias spelling itself: with both
+    // producers on `string` the two keys meet again, and both seeds are re-measured clean
+    // under this build. The FOUR positions where a litunion alias IS still preserved — an
+    // array ELEMENT, a struct FIELD, a map VALUE and a function RESULT (`ctxKeepsLitUnion`,
+    // and the four arms below) — are untouched by the ruling and by this slice: there the
+    // alias reps as the interned i32 ATOM and canon preserves it too.
     const parts: string[] = []
     // The render's atom count, accumulated as the parts are KEPT: the join below inserts
     // exactly one top-level `|` per part boundary, so the whole render is as wide as its
     // parts together. A part is not always ONE atom — a nullable member renders `X|null` —
     // which is why this is summed rather than read off `parts.length` at the end.
     let psum = 0
-    let rgDone = false
     let i = 0
     while i < members.length {
-      // A MEMBER that is a registered litunion ALIAS (`K0 | i64`) keeps its alias name
-      // rather than softening to `string` — the alias arm reps as the i32 atom in the
-      // union box, and every `$fnsig`/slot key derived from this render must agree with
-      // the annotation side's `(K0|i64)` spelling. Without it a closure returning
-      // `(K0 | i64)[]` keyed `(string|i64)[]` while the value call keyed the alias —
-      // divergent functypes, a cast-failure TRAP (fuzz-nightly run 29808029476, seed
-      // 78530533 d5). The union-member sibling of the TyFunc-result / TyObj-field
-      // alias preservation above and below.
       const rgm = T.tys[members[i]]
-      if rgAlias != "" && rgm is TyLit {
-        if !rgDone {
-          rgDone = true
-          parts.push(rgAlias)
-          psum = psum + 1
-        }
-        i = i + 1
-        continue
-      }
-      // An ALIAS name is one identifier — one atom. Only the RENDER leg can be wider,
-      // and it reports its own width in `emitNameAtoms`.
-      let sc = 1
-      let s = litUnionAliasNameOfTy(members[i])
-      if s == "" {
-        // A union MEMBER, carrying the sticky nullable bit down so this arm agrees with
-        // canon's flat `A|B|null` split about what "under a nullable" means.
-        s = tyToEmitNameAt(members[i], RC_UNION_MEM | (ctx & RC_NULLABLE))
-        sc = emitNameAtoms
-      }
+      // A union MEMBER, carrying the sticky nullable bit down so this arm agrees with
+      // canon's flat `A|B|null` split about what "under a nullable" means. A str-literal
+      // member renders `string` through the `TyLit` arm and the dedup below collapses a
+      // whole flattened litunion run into ONE `string` part — which is exactly the shape
+      // canon's own member loop produces for the alias spelling.
+      let s = tyToEmitNameAt(members[i], RC_UNION_MEM | (ctx & RC_NULLABLE))
+      let sc = emitNameAtoms
       if s == "" { return "" }
       // A FUNCTION-TYPE member renders PARENTHESIZED (`(()=>f32|null)|{w:i32}`) — the
       // annotation's atom spelling. Bare, the closure's result arms swallow the union's
@@ -7469,18 +7436,41 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
     // through the arena index it is already holding. So the two producers cannot drift, and
     // the renderer takes the destringified route — no name, no second parse.
     //
-    // The STRING-litunion alias is NOT this rule and is deliberately out: `numLitUnionBaseName`
-    // returns "" for a string base (its alias name IS the atom identity), and `tyIsLitUnion`
-    // — the gate on the five `litUnionAliasNameOfTy` legs below — is string-only, so a
-    // numeric alias never reaches those legs and a string alias never reaches this one. The
-    // owner-pending mixed-union softening decision is untouched on both sides.
-    //
     // UNCONDITIONAL IN THE POSITION, INCLUDING INSIDE A FUNCTION TYPE, and #1271's
     // `RC_UNDER_FUNC` gate on exactly this arm is the thing that came out to make it so.
     // The gate said "not under a function type — that region is `canonEmitName`'s VERBATIM
     // region"; `canonEmitNameAt`'s function-type arm no longer HAS a verbatim region, so
     // the alias softens on both sides of every `$fnsig` fork instead of on neither. See
     // the position-bit note above for the measurement.
+    // THE STRING-LITUNION TWIN OF THIS ARM IS THE OWNER'S 2026-07-28 SOFTEN, AND IT IS
+    // BLOCKED HERE BY A DEFECT THAT IS NOT THIS RULE'S. `tyToEmitNameGo`'s union arm now
+    // spells a string-litunion ALIAS member `string`; the same soften belongs on this
+    // renderer, and the shape it takes is this short-circuit gaining
+    // `if (ctx & RC_UNION_MEM) != 0 && tyIsLitUnion(ix) { fall through }`. Built and
+    // measured: it takes B2's Lsoft class from 56 rows to 0 and B3's from 58 to 2 — and it
+    // makes ONE fuzz shape in 6,000 stop compiling, because `IsExpr.isVariant` is not in
+    // the emitter's vocabulary and master's DUPLICATE variant row was hiding that:
+    //
+    //   type K0 = "080" | "lp" | "hp"                              // fuzz seed 1000003 d6,
+    //   const v: ((i32) => {f: K0 | i64} | string)[] = [(q0) => ({f: 5000000077})]
+    //   const t0 = v[0](1)                                         // case_00039
+    //   if t0 is {f: K0 | i64} { … }
+    //   // master: registers BOTH `{f:K0|i64}` (this render) and `{f:string|i64}` (the
+    //   // canon'd annotation) as variants, and the `is` spelling matches the first.
+    //   // With the soften: one row, `{f:string|i64}`, and the raw `is` spelling matches
+    //   // nothing → `emitProgram: `is` names a type that is not a union variant`.
+    //
+    // `canonEmitTypeNames`'s `IsExpr` arm rewrites `isVariant` for a union operand through
+    // TWO partial pieces of canon already (`unionMemberGenAppShape`, the transparency
+    // render); the completion is to canon the whole spelling. That was built too, and it is
+    // NOT a small gate: `canonEmitNameAt(isVariant, RC_ROOT)` softens a bare string LITERAL
+    // test as well (`is "lhrf"` → `is string`), and past a `tyIsLitUnion` /
+    // `numLitUnionBaseName` / `tyIsNullableLitUnion` guard it still reddens four corpus
+    // files, one of them a WRONG ANSWER (`soundness/literal-is-runtime-value.vl`, RUNOUT).
+    // So the `is` spelling needs its own slice — most likely rendering the checker's banked
+    // `isVarTyIxOf` type rather than growing a fourth exclusion — and this arm waits for it.
+    // Until then this renderer stays SOURCE-FAITHFUL and the two producers agree on B1's
+    // axis only.
     const nlb = numLitUnionBaseName(ix)
     if nlb != "" { return nlb }
     return udn
@@ -7496,14 +7486,21 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
   if t is TyLit { return tyLitBaseName(t) }
   if t is TyUnion {
     const members = t.uMembers
-    // SOURCE-FAITHFUL (alias-preserving) render, mirroring `tyToEmitName`'s union arm: a
-    // litunion-ALIAS member keeps its alias name (`K0` in `K0 | {w:i32}`), reconstructing a
-    // flattened lit run into its registered alias via the regroup. The POSITION-DEPENDENT
-    // litunion softening (`canonEmitName` softens `K0` in a DIRECT union but keeps it inside a
-    // closure RESULT) is NOT re-implemented here — a consumer applies `canonEmitName` once over
-    // the WHOLE rendered name, where the func-type structure is visible; softening per-arm in
-    // isolation would lose that context. So this arm produces exactly the source spelling the
-    // name walk started from, and `canonEmitName(render)` reproduces the name walk's key.
+    // SOURCE-FAITHFUL (alias-preserving) render: a litunion-ALIAS member keeps its alias
+    // name (`K0` in `K0 | {w:i32}`), reconstructing a flattened lit run into its registered
+    // alias via the regroup. The POSITION-DEPENDENT litunion softening (`canonEmitName`
+    // softens `K0` in a DIRECT union but keeps it inside a closure RESULT) is NOT
+    // re-implemented here — a consumer applies `canonEmitName` once over the WHOLE rendered
+    // name, where the func-type structure is visible; softening per-arm in isolation would
+    // lose that context. So this arm produces exactly the source spelling the name walk
+    // started from, and `canonEmitName(render)` reproduces the name walk's key.
+    //
+    // IT NO LONGER MIRRORS `tyToEmitNameGo`'s UNION ARM, AND THAT IS RECORDED RATHER THAN
+    // TIDIED. That arm lost both of these legs to the owner's 2026-07-28 mixed-union
+    // soften; this one keeps them because the SOURCE-FAITHFUL property is load-bearing for
+    // one consumer that the ruling did not reach — see the blocked-soften note on the
+    // `unionAliasDeclNameOfTy` short-circuit above, which carries the fuzz shape, the two
+    // measured fix attempts and what the next slice has to do first.
     let rgAlias = ""
     const rgTexts: string[] = []
     let rgNonLit = false
