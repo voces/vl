@@ -145,6 +145,7 @@ import {
   unionEqOperandOk,
   unionHasAtom,
   unionHasValueAtom,
+  unionTakesAtomAsStr,
   unwrapParen,
 } from "./emit_base"
 import {
@@ -2814,6 +2815,36 @@ export function emitUnionCoerce(
   if viaListArm == 1 { return 0 }
   if unionName == "" || !unionHasValueAtom(unionName) {
     return emitExpr(body, exprIx, fnIx)
+  }
+  // D-ATOMSTORE — an ATOM-typed VALUE entering the box (slice A of
+  // `docs/internals/litunion-compact-rep-design.md`, family F1). ABOVE the value-atom
+  // ladder, because the ladder cannot classify this value at all: `valueAtomKind("K")` is
+  // -1, so a `K`-typed local/param/call result falls past every branch to the numeric
+  // default and then to the union's own promotion rules. Measured on master at `b7566067`,
+  // 184 cells (8 mixed spellings x 3 carriers x 8 positions), ZERO of them correct:
+  //   · `K | f64` — `cak` promotes to 4 and the body is `f64.convert_i32_s` applied to the
+  //     ATOM ID under the f64 tag. `is K` compares tag 2 and is false: SILENT wrong answer.
+  //   · `K | i32` / `K | i64` / `K | boolean` / `K | {w:i32}` — the raw id boxes under the
+  //     wrong tag, same silent miss.
+  //   · `K | string` / `K | i32[]` — the id is pushed at the box's `anyref` payload:
+  //     "type mismatch: expected anyref, found i32". INVALID WASM, `vl check` rc 0.
+  // The value's rep IS the interned i32 id and the box's payload is a REF, so the store has
+  // to WIDEN — `emitAtomToStr`'s `select` tower over the member constants — and tag the box
+  // kind 2, which is the tag `isArmTagOfTy` already hands a litunion arm by hand
+  // (`if tyIsLitUnion(ity) { ak = 2 }`). Store and `is` then resolve one tag.
+  //
+  // THE HAZARD IS THE RESERVATION SCAN, NOT THIS EMIT. `emitAtomToStr` stashes the id in
+  // the string-op scratch frame (`setStrScrI`), reserved by `emit_classify`'s scan — whose
+  // atom-widening predicates all keyed on the target being spelled `string`. A union target
+  // carrying a litunion arm is their missing SIXTH member; `unionTakesAtomAsStr` is the
+  // shared question, asked here and at all six scan sites. Adding this leg without the
+  // reservation is invalid wasm (measured: 96 cells, and the frame is per-FUNCTION so the
+  // miss lands on whichever local the layout put at `strScratchBase + 3`).
+  if unionTakesAtomAsStr(unionName) && exprIsLitAtom(exprIx, fnIx) {
+    fbI32Const(scalarTagOfKind(2)) // the string tag — kind 2 rides the anyref directly
+    if emitAtomToStr(body, exprIx, fnIx) < 0 { return -1 }
+    fbStructNew(uBoxIdx) // { tag, member-string ref }
+    return 0
   }
   // Classify the value's atom. Order mirrors the print-import ladder (f32 before
   // f64 — a float literal classifies f64 too; string/bool/i64 are disjoint). The
@@ -12959,6 +12990,22 @@ export function emitAtomToStr(body: i32[], atomIx: i32, fnIx: i32) {
       "emitProgram: literal-union string widening but array type not collected",
     )
   }
+  // THE DESIGN'S "CHEAPER 2-MEMBER VARIANT" WAS BUILT AND MEASURED, AND IS NOT SHIPPED
+  // (§8.1: "for a 2-MEMBER litunion the tower is one `select_t` and the id is consumed exactly
+  // once, so no stash — and no frame — is needed. If most real litunions are small, the
+  // reservation problem shrinks to the 3+-member case."). The MECHANISM is confirmed: with a
+  // stash-free two-member tower and ZERO reservation work, every 2-member cell of the isolated
+  // grid runs (175/184, the same score the shipped fix gets) and only 3-and-4-member sets are
+  // invalid wasm (139 cells each). The SCOPE REDUCTION is refuted:
+  //   · 23 of the 64 corpus litunion aliases that sit beside a NON-null arm — the population
+  //     that reaches this boundary at all — have 3+ members (36%), so the reservation work is
+  //     still needed in full; the variant partitions the problem, it does not shrink it.
+  //   · It is therefore ADDITIVE, not cheaper: it can only be built on top of the scan work.
+  //   · Measured, it buys -44 bytes over 4 of 167 litunion corpus files while costing +263
+  //     bytes of compiler.
+  //   · And it would make the SCAN have to agree with this handler on MEMBER COUNT — a second
+  //     axis for the scan-vs-handler mismatch that is this repo's richest invalid-wasm vein,
+  //     added to the target-shape axis the scan already has to get right.
   // Evaluate the atom (its i32 id) once, stash in the str-op scratch i32 slot 0.
   const savedLU = pendingLitUnion
   pendingLitUnion = 1

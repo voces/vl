@@ -37923,3 +37923,210 @@ sabotage; it is a missing test, and it is the only kind worth running.*
   and C each fell over immediately — it was blind to ONE axis (a registered SUPERSET of the
   set being resolved), because no fixture had ever spelled that pair. *Grade a sabotage by
   what it reveals about the tests, not by whether the code survived it.*
+
+---
+
+## SLICE A — the atom→box STORE boundary. The emit leg is ONE branch; the RESERVATION SCAN is the slice, and the FIRST GRID COULD NOT SEE IT because the oracle reserved the frame (off master `b7566067`)
+
+`docs/internals/litunion-compact-rep-design.md` §8.1 handed this slice off with its hazard
+already named — *"the hazard is the RESERVATION SCAN, not the emit"* — and that half is
+correct and load-bearing. Two things it could not know: **the grid it implied is a
+contaminated control**, and **"adding the widen without the reservation is invalid wasm" is
+too kind at one position**.
+
+### The population, RE-DERIVED at this base — and the spelling that had moved
+
+The filing's F1 is *"8 mixed spellings × 3 ops = 24 cells"*. Re-derived at `b7566067` the
+count holds exactly — **24 cells, 18 `RUN-WRONG` + 6 `INVALID-WASM`, 0 `RUN-OK`** — but one
+of the eight spellings is no longer the same object. **Slice C (#1306) made `K | K2` a
+literal union**, so an atom stored into it never reaches this boundary at all (`print(x)`
+after that store is `RUN-OK` on master and after; the cell that still fails for `K | K2` is
+an `is` at a `K | K2` PARAM, which is #1306's own filed `RC_FN_PARAM` residue and is
+identical on both sides). Its place in the eight is taken by `K | f64 | null` — a boxed
+union with a null tag, silent-wrong in the same class as `K | f64`.
+
+The filing's decomposition also has no POSITION axis, and that is where the real size is:
+
+| the VALUE's litunion spelling | RUN-OK before | after | note |
+|---|---|---|---|
+| declared alias, 2 members | **0 / 184** | 175 | 8 positions × 3 carriers × 8 mixed spellings |
+| declared alias, 3 members | **0 / 184** | 175 | |
+| `K \| K2` **with a declared alias for the flattened set** | **0 / 184** | 175 | #1306 turned this into a genuine atom — so it inherits F1 |
+| `K \| K2` with NO such alias | 169 / 184 | 169 | not an atom; unchanged |
+| un-aliased INLINE (`("pp"\|"qq")`) | 152 / 184 | 152 | its value is a string REF and never was an atom |
+| **CONTROL — a `string` value into `string \| f64`** | 152 / 161 | 152 | the already-working ladder |
+
+The inline row is why the existing floor fixture never showed this: *the un-aliased inline
+spelling's value is not an atom*, so the half of `mixed-union-litunion-arm-floor.vl` that
+looks like it should have caught F1 could not.
+
+**Totals: 1,265 isolated cells, 525 UP, 0 DOWN — 414 silent-wrong → correct, 111
+invalid-wasm → correct.** The declared alias lands on the EXACT nine-cell residue of its own
+`string`-typed control (`i32arr` at field/element/map-value × 3 carriers), which is this
+slice's thesis stated as an equality: the litunion arm now behaves as the plain `string` arm
+does, including where that arm is itself broken.
+
+### THE FIRST GRID WAS A CONTAMINATED CONTROL, and it under-reported the hazard 3.2×
+
+The natural cell is *store, then check*:
+
+```vl
+function go() {
+  const k: K = "aa"
+  const x: K | f64 = k
+  if x is K { print("K") } else { print("O") }   // <-- the ORACLE is a string op
+}
+```
+
+`print("K")` is claimed by `exprHasStrOp`, so **the oracle reserves the string-op scratch
+frame the store needs**. Built that way, the emit-leg-without-reservation reads **96 cells
+DOWN**; built with the store alone in its function and the check in a separate one (a
+union-typed value into a union param is a pass-through, not a coercion, so the call adds no
+string op), it reads **306**. The contaminated grid hid 210 of 306 misses and made
+`field`/`map-value`/`bind`/`reassign` look already-covered.
+
+This is §2.1's lesson one turn further on. There, a control failed because its members did
+not differ. Here the members differ fine — *the OBSERVATION reserved the resource under
+test*. **A control has to differ from the thing it controls in the dimension being measured,
+and "what the oracle costs" is a dimension.**
+
+### The six scan members, each with an isolated single-file witness
+
+`emitUnionCoerce` gains one branch (`unionTakesAtomAsStr` + `exprIsLitAtom` → tag kind 2,
+lower through `emitAtomToStr`). Everything else is the scan. Each row's sabotage moves ITS
+witness and no other — which is only observable because each witness is its own `.vl` FILE
+(one file is one module; nineteen witnesses in one file would all read "invalid" together):
+
+| # | leg deleted | witnesses that move | outcome |
+|---|---|---|---|
+| S1 | `letWidensAtomToStr` union leg | `W1_bind_let`, `WA_strarm_bind`, `WB_readback_print`, `WC_three_member` — the four BIND cells | 4 INVALID-WASM |
+| S2 | `letWidensAtomToStr` **array** leg (+`arrLitHasAtomElem`) | `W2_elem_letarr` | 1 INVALID-WASM |
+| S3 | `callWidensAtomToStr` union leg | `W3_arg_call` | 1 INVALID-WASM |
+| S4 | `retWidensAtomToStr` union leg | `W4_ret` | 1 INVALID-WASM |
+| S5 | `globalInitWidensAtomToStr` union leg | `W5_global_ident`, `W5b_global_call` | 2 INVALID-WASM |
+| S5b | `globalInitIsLitAtom`'s new **Call** arm | `W5b_global_call` alone | 1 INVALID-WASM |
+| S6 | `assignWidensAtomToStr` union leg | `W6_reassign` loudly; `W8`/`W9` map-value SILENTLY (below) | 1 INVALID-WASM + 2 unreserved-but-running |
+| S7 | `exprHasStrOp`'s ObjLit `exprIsLitAtom` leg (PRE-EXISTING) | `W7_field_objlit` | 1 INVALID-WASM |
+| S9 | `unionTakesAtomAsStr`'s **litunion** leg | 13 of 19 | 13 RUN-WRONG |
+| S10 | `unionTakesAtomAsStr`'s **`string`** leg | `WA_strarm_bind` alone | 1 RUN-WRONG |
+| POISON | tag the box kind 9 instead of kind 2 | 14 of 19 | 14 RUN-WRONG, `vl check` rc 0 |
+
+S7 is the finding inside the finding. The **struct FIELD position needed no new code**, because
+`exprHasStrOp`'s ObjLit arm already claimed *any* `exprIsLitAtom` field value — and its
+ArrayLit sibling, seven lines below in the same function, did not. *A classifier taught half
+a set, with the taught half visible from the untaught one.* The array leg this slice adds is
+the missing half, and S2/S7 are the pair that says both are load-bearing.
+
+### "INVALID WASM" IS TOO KIND FOR THE MAP-VALUE POSITION — it is VALID wasm that clobbers
+
+Under S6 the map-value witnesses keep printing `K`. They are not covered; they are LUCKY.
+The WAT says so: without the reservation the atom stash lowers to `local.set 5` / `local.get
+5` in a locals vector **six entries shorter**, and local 5 is a same-typed i32 slot of the
+**MAP** scratch frame — reserved, dead at that instant, and therefore silently writable.
+
+```wat
+;; emit leg, NO reservation — the module VALIDATES
+local.get 0 ; the atom id
+local.set 5 ; <-- strScratchBase+3 lands on the MAP frame's i32 slot
+global.get 2 ; "aa"
+... array.new_fixed ; "bb"
+local.get 5
+i32.const 0
+i32.eq
+select (result (ref 2))
+```
+
+So the design's *"adding the widen without the reservation is invalid wasm"* is right at six
+positions and understates the seventh: at the map-value position it is a **silent
+clobber**, invisible to `vl check`, to `vl build`, and to the run. It was found by DIFFING
+THE LOCALS VECTOR, not by running anything. **When a reservation-scan sabotage leaves a cell
+passing, diff the locals vector before believing the cell is covered** — a missed frame that
+lands on a same-typed neighbour is valid wasm, and it is the worse half of this family.
+
+### The design's cheaper 2-member variant: BUILT, MEASURED, NOT SHIPPED
+
+§8.1 asked for it to be measured first: *"for a 2-MEMBER litunion the tower is one `select_t`
+and the id is consumed exactly once, so no stash — and no frame — is needed. If most real
+litunions are small, the reservation problem shrinks to the 3+-member case."*
+
+**The mechanism is confirmed.** Built (a stash-free two-member tower) and run with the SCAN
+REVERTED TO MASTER, the 2-member grid row scores **175/184 — the same score the shipped fix
+gets** — and only the 3-member and 4-member rows break (139 cells each).
+
+**The scope reduction is refuted, on four measurements:**
+
+| claim | measurement |
+|---|---|
+| "most real litunions are small" | 76% of all 312 corpus litunion sites are 2-member — but of the **64 aliases that sit beside a NON-null arm**, the ones that reach this boundary, **23 are 3-member (36%)** |
+| "the reservation problem shrinks" | it PARTITIONS: the 3+ third still needs every predicate this slice teaches |
+| "cheaper" | it is ADDITIVE — it can only be built on top of the scan work |
+| the win | **−44 bytes over 4 of 167** litunion corpus files, for **+263 bytes of compiler** |
+
+And a fifth, which is the one that decides it: the variant would make the SCAN agree with the
+handler on **MEMBER COUNT**. The scan does not know member counts today and does not need to.
+Adding that axis to a family whose failure mode is scan-vs-handler disagreement — this repo's
+richest silent-invalid-wasm vein — buys 44 bytes and costs a new way to be wrong.
+
+### The nullable arm: the question is answered NO, and the answer is a BYTE cost
+
+`unionTakesAtomAsStr` excludes two reps that are not boxes — a PURE literal union (the atom
+stays an atom) and the `K | null` NICHE (an i32 with a `-1` sentinel). Both gates were
+deleted and measured. **Neither moves a single cell**: the leg is unreachable for those
+targets. What they cost is bytes — 221 over 6 corpus files for the pure gate, 34 over 2 for
+the niche gate — because without them the scan reserves a string-op frame nothing writes.
+
+That is worth stating precisely rather than dressing up: *these two gates are rep facts with
+a measured price, not bug fixes.* `K | f64 | null` is deliberately NOT excluded — three-plus
+members with a null sibling is a boxed union with a null tag, and it is 24 of the shipped
+grid's UP cells.
+
+### Registration keys: the corpus does not contain the shape, and that is the finding
+
+Corpus A/B, six channels, 1,706 files: `CHECKRC`, `CHECKMSG` and `BUILDRC` are **identical on
+every file**, and the only file that moves on ANY channel is the fixture this PR adds. The
+compiler grew 707 bytes (1,110,527 → 1,111,234) and the isolated grid moved 525 cells, so the
+change is anything but inert — **the corpus simply never spelled an atom-typed value flowing
+into a mixed union.** 57 corpus files put a litunion beside a non-null arm; every one of them
+stores a member LITERAL.
+
+The one BYTES row is justified by its WAT, and the direction is the informative part —
+5,790 → **6,304 (+514)**, a file that GROWS:
+
+| | master | branch |
+|---|---|---|
+| `f64.convert_i32_s` | **19** | **0** |
+| `select` | 1 | **23** |
+
+Nineteen `f64.convert_i32_s` is nineteen atom ids converted to a float and tagged `f64`; the
+twenty-two new `select`s are the atom→member-string towers that replace them. *A BYTES row
+that grows on a correctness fix is the correct lowering arriving, and the way to say so is to
+name the instruction that disappeared.*
+
+The fuzz says the same thing, measured rather than banked: 3 seeds × 800 cases, reports
+identical; and across 3,200 generated cases in two configurations, **zero** declare a
+`K<n>`-returning function and **zero** carry a bare atom-typed binding outside a `// @shape`
+comment. `scripts/fuzzgen.vl` reaches litunion-in-mixed-union constantly and reaches this
+slice's shape never.
+
+### Lessons
+
+* **THE ORACLE CAN RESERVE THE RESOURCE UNDER TEST.** `print("K")` beside the store reserved
+  the string-op frame the store needed, and the reservation hazard read 96 cells instead of
+  306. *When the thing you are measuring is a RESOURCE, the observation has to be free of it —
+  put the store alone in its function and check somewhere else.*
+* **A MISSED FRAME IS NOT ALWAYS INVALID WASM.** At the map-value position the unreserved
+  stash landed on a same-typed dead slot of another frame: valid module, right answer, no
+  channel showing anything. *A reservation-scan sabotage that leaves the cell passing has not
+  proved coverage; diff the locals vector.*
+* **RE-DERIVING A FILED POPULATION IS NOT A FORMALITY.** The count was right (24) and one of
+  its eight members was no longer the same type, because the slice that shipped two days
+  earlier changed what `K | K2` IS. *A population is a set of shapes, not a number; the number
+  can survive a member being replaced.*
+* **A VARIANT CAN BE CONFIRMED IN ITS MECHANISM AND REFUTED IN ITS PURPOSE.** The 2-member
+  tower really does need no frame — and 36% of the population that reaches this boundary is
+  3+, so it partitions the work instead of removing it. *Measure the population the
+  optimisation is FOR, not the population overall*: 76% of all litunion sites are 2-member and
+  only 64% of the ones that matter here are.
+* **A GATE THAT MOVES ZERO CELLS CAN STILL EARN ITS LINE — say which currency it is paid in.**
+  The niche and pure-litunion exclusions are worth 255 bytes over 8 files and nothing else.
+  Calling them correctness fixes would have been a lie the next slice would inherit.

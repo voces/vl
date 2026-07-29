@@ -162,10 +162,12 @@ this document's own first grid, which is why the floor fixture spells the two ha
 *They are families, not a partition — a `K | string` cell can belong to F1 and to F3 at
 once, so the counts below deliberately do not sum to 81.*
 
-**F1 — an atom-typed VALUE entering the box (24 cells).** `const k: K = "aa"; const x: K |
-f64 = k` — and the same through a `K`-returning call, and at an argument boundary. 8 cells
-per op × 3 ops (`S02atom_isK`, `S03call_isK`, `S18param_atom`), across all mixed
-spellings.
+**F1 — an atom-typed VALUE entering the box (24 cells). CLOSED by slice A (#1307) — §8.1.**
+`const k: K = "aa"; const x: K | f64 = k` — and the same through a `K`-returning call, and at
+an argument boundary. 8 cells per op × 3 ops (`S02atom_isK`, `S03call_isK`, `S18param_atom`),
+across all mixed spellings. (Re-derived at `b7566067` the count held exactly — 18
+`RUN-WRONG` + 6 `INVALID-WASM` — but one spelling had moved and the POSITION axis this
+decomposition does not carry multiplies it by eight; §8.1 has both numbers.)
 
 `emitUnionCoerce`'s ladder has no litunion arm, so an atom value falls past every branch to
 the numeric default and then to the union's own promotion rules:
@@ -517,29 +519,93 @@ now become load-bearing.
 ## 8. The three follow-on slices this filing hands off
 
 None is a partial compact rep; all three are correctness fixes in the CURRENT rep, and each
-adds a leg the compact rep also needs. **Slice C is the one to take first** — it is
-rep-independent, it needs no ruling from §7, and its entire runtime half already works.
+adds a leg the compact rep also needs. **Slice C shipped first (#1306)** — it was
+rep-independent and needed no ruling from §7 — and **slice A shipped next (#1307)**. Slice B
+is the one still open, and it is the one the filing says should WAIT for §7's rulings.
 
-### 8.1 Slice A — the atom→box STORE boundary (F1, 24 cells)
+Order matters between them, and it was measured rather than guessed: slice C changed which
+spellings reach slice A's boundary (`K | K2` stopped being a box), so slice A re-derived its
+own population at C's base instead of taking the filing's. §8.1 records what moved.
 
-`emitUnionCoerce` gains a leg above the value-atom ladder: an `exprIsLitAtom` value flowing
-into a union with a litunion arm classifies `cak = 2` and lowers through `emitAtomToStr`
-instead of falling to the numeric default.
+### 8.1 Slice A — the atom→box STORE boundary (F1) — **SHIPPED (#1307)**
 
-**The hazard is the RESERVATION SCAN, not the emit.** `emitAtomToStr` stashes the atom id in
-the string-op scratch frame (`setStrScrI`), and that frame is reserved by a scan
-(`emit_classify`) whose five atom-widening predicates — `callWidensAtomToStr`,
-`assignWidensAtomToStr`, `letWidensAtomToStr`, `retWidensAtomToStr`,
-`globalInitWidensAtomToStr` — each key on the TARGET being spelled `string`. A union target
-carrying a litunion arm is the missing sixth, at all five sites plus the positions the five
-do not cover (a struct field, an array element, a map value). Adding the widen without the
-reservation is invalid wasm — the exact scan-vs-handler mismatch that is this repo's
-richest silent-invalid-wasm vein. The probe is DELETE THE BYSTANDER: remove one taught
-predicate at a time and confirm a named witness moves.
+`emitUnionCoerce` gained a leg above the value-atom ladder: an `exprIsLitAtom` value flowing
+into a union that takes an atom AS A STRING (`emit_base.unionTakesAtomAsStr`) classifies
+`cak = 2` and lowers through `emitAtomToStr` instead of falling to the numeric default.
+**1,265 isolated cells: 525 UP, 0 DOWN** — 414 silent-wrong → correct, 111 invalid-wasm →
+correct.
 
-A cheaper variant worth measuring first: for a **2-member** litunion the tower is one
-`select_t` and the id is consumed exactly once, so no stash — and no frame — is needed. If
-most real litunions are small, the reservation problem shrinks to the 3+-member case.
+**The population was re-derived at `b7566067` before building, and one of the eight
+spellings had MOVED.** This section's own decomposition (8 mixed spellings × 3 ops) is still
+**24 cells, 24 broken — 18 `RUN-WRONG`, 6 `INVALID-WASM`, 0 `RUN-OK`** — but the filing's
+eighth spelling `K | K2` is no longer a mixed union at all: slice C (#1306) made it a
+literal union, so an atom store into it never reaches this boundary (measured: `print(x)`
+after that store is `RUN-OK` on master and after). Its place is taken by `K | f64 | null`,
+which is a boxed union with a null tag and fails in the same silent class. Widened to eight
+POSITIONS × three CARRIERS × eight spellings, a declared 2-member alias scores **0 of 184**;
+so does a 3-member alias; so does `K | K2` **with a declared alias for its flattened set**,
+which #1306 turned into a genuine atom. The un-aliased inline spelling scores 152 of 184 —
+because its value is a string ref and never was an atom — and that is why the inline half of
+the floor fixture never showed this defect.
+
+**The hazard was the RESERVATION SCAN, not the emit, and the first grid could not see it.**
+The five atom-widening predicates (`callWidensAtomToStr`, `assignWidensAtomToStr`,
+`letWidensAtomToStr`, `retWidensAtomToStr`, `globalInitWidensAtomToStr`) each keyed on the
+TARGET being spelled `string`; a union target carrying a litunion arm was the missing sixth.
+All five were taught, plus two positions none of them covered:
+
+| position | who reserves it now | note |
+|---|---|---|
+| bind | `letWidensAtomToStr` (union leg) | |
+| array ELEMENT | `letWidensAtomToStr` (array leg + `arrLitHasAtomElem`) | the position the five did not cover |
+| argument | `callWidensAtomToStr` (union leg) | |
+| return | `retWidensAtomToStr` (union leg) | |
+| global | `globalInitWidensAtomToStr` (union leg) + `globalInitIsLitAtom`'s new **Call** arm | the frame belongs to the START function |
+| reassign · map VALUE (both key reps) | `assignWidensAtomToStr` (union leg) | one leg, three spellings |
+| struct FIELD | **already covered** — `exprHasStrOp`'s ObjLit arm claims any `exprIsLitAtom` field value | its ArrayLit sibling did not: a classifier taught half a set, both halves in one function |
+
+**THE FIRST GRID WAS A CONTAMINATED CONTROL, exactly as §2.1's was.** With the store and the
+`is`/`print` check in ONE function, `print("K")` is itself a string op and reserved the
+frame for five of the eight positions. The emit-leg-without-reservation read **96 cells
+DOWN** on that grid and **306** on the isolated one — the contaminated grid hid 210 of the
+misses. Every cell of the shipped grid puts the store in a function holding nothing else and
+hands the box to a separate checker by value (a union value into a union param is a
+pass-through, not a coercion).
+
+**"Adding the widen without the reservation is invalid wasm" is right for six positions and
+too kind for the seventh.** At the map-value position the unreserved stash lands on a
+same-typed, dead **MAP** scratch slot in a locals vector six entries shorter: the module
+VALIDATES and prints the right answer. That is valid wasm that clobbers, and it is only
+visible in the WAT (or by deleting the leg and diffing the locals vector), never in the run.
+Two of the eleven sabotages had to be graded that way.
+
+**The cheaper 2-member variant was BUILT and MEASURED, and is NOT shipped.** The mechanism is
+confirmed: with a stash-free two-member tower and ZERO reservation work, every 2-member cell
+runs (175/184 — the shipped score) and only 3-and-4-member sets break (139 cells each). The
+scope reduction is refuted on four counts:
+
+- **36% of the population is 3+.** Of the 64 corpus litunion aliases that sit beside a
+  non-null arm — the aliases that reach this boundary at all — 41 are 2-member and **23 are
+  3-member**. The variant partitions the problem; it does not shrink it.
+- **It is additive, not cheaper**: it can only be built on top of the scan work it was meant
+  to avoid.
+- **Its measured win is −44 bytes over 4 of 167 litunion corpus files, for +263 bytes of
+  compiler.**
+- It would make the SCAN agree with the handler on **member count** — a second axis of the
+  scan-vs-handler mismatch family, on top of the target-shape axis the scan already has to
+  get right.
+
+**The nullable arm's question is answered NO, with the measurement.** `unionTakesAtomAsStr`
+excludes two reps that are not boxes: a PURE literal union (`K`, `"a"|"b"` — the atom stays
+an atom) and the `K | null` NICHE (an i32 with a `-1` sentinel, `nameIsNulLitUnion`). Neither
+gate moves a single cell at this base — the leg is unreachable for those targets — so each is
+a measured BYTE cost rather than a bug fix: deleting the pure gate costs 221 bytes over 6
+corpus files, deleting the niche gate 34 bytes over 2. `K | f64 | null` is deliberately NOT
+excluded: three-or-more members with a null sibling is a boxed union with a null tag, and it
+is 24 of the shipped grid's UP cells.
+
+Pinned by `tests/cases/literal-unions/atom-store-into-mixed-union.vl`, which carries one
+isolated witness per scan member plus the contaminated shape as a negative control.
 
 ### 8.2 Slice B — the box→atom READ boundary (F2, 16 cells)
 
