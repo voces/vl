@@ -37914,7 +37914,7 @@ sabotage; it is a missing test, and it is the only kind worth running.*
   variant to compare, check whether some existing configuration already IS the variant.*
 * **AN OUTCOME CLASS CAN "IMPROVE" INTO ITS CONTROL'S FLOOR AND STILL BE A REGRESSION.**
   Flattened, `K | K2 | null` becomes byte-for-byte its declared-alias control `C | null`
-  (13/5/2 on both) — 11 cells UP and 3 DOWN, and the 3 are that control's OWN pre-existing
+  (13/5/2 on both) — 10 cells UP and 3 DOWN, and the 3 are that control's OWN pre-existing
   holes. Converging onto a sibling is the right end state and it is still three cells a user
   would feel, so the niche half is gated off with its numbers rather than shipped with an
   argument. *"It now matches its control" is a good reason to file, not a licence to regress.*
