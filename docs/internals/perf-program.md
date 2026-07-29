@@ -148,30 +148,30 @@ warm):
 
 ### 1.5.1 What the runner actually did
 
-Two runs on the real 4-core runner (PR #1311, runs `30478660499` and
-`30479027419`):
+Three runs on the real 4-core runner (PR #1311, runs `30478660499`,
+`30479027419`, `30479227774`):
 
-| job | run 1 | run 2 | notable steps |
-| --- | ---: | ---: | --- |
-| `ci` | 20 s | 22 s | unchanged |
-| **`ci-native`** | **42 s** | **50 s** | native suites **19 / 20 s** (was 27); cargo+target restore **skipped** both runs; embed build gone |
-| `ci-embed-seed` | 74 s | 43 s | restore 16/17 s + `cargo build --features embed-seed` **48 / 16 s** |
+| job | run 1 | run 2 | run 3 | notable steps |
+| --- | ---: | ---: | ---: | --- |
+| `ci` | 20 s | 22 s | 22 s | unchanged |
+| **`ci-native`** | **42 s** | **50 s** | **49 s** | native suites **19 / 20 / 21 s** (was 27); cargo+target restore **skipped** all three; embed build gone |
+| `ci-embed-seed` | 74 s | 43 s | 42 s | restore 16–17 s + `cargo build --features embed-seed` **48 / 16 / 19 s** |
 
 **`ci-native` 89 s p50 → 42–50 s.** The gate that blocks a merge decision is back
 under a minute, and the workflow's WALL CLOCK (the max over the three jobs) is
 89 → ~50 s.
 
-**The second sample corrected the first, and the correction is the point.** On run
-1 the embed job's `cargo build` read 42.58 s and I filed `ci-embed-seed` as the
-new critical path with a structural cause attached (`build.rs` emits
+**Runs 2 and 3 corrected run 1, and the correction is the point.** On run 1 the
+embed job's `cargo build` read 42.58 s and I filed `ci-embed-seed` as the new
+critical path with a structural cause attached (`build.rs` emits
 `cargo:rustc-env=VL_SEED_KEY=<hash of the seed>`, so a changed seed invalidates
-the crate fingerprint every push). Run 2 read **16 s** for the same build — in
-line with the 15 s median it had inside `ci-native`, and with the 13.77 s master
-reading I had called "variance or something not yet found". It was variance. The
-`VL_SEED_KEY` recompile is real and does happen every push; it is ~16 s, not
-~48 s, and it does not make this job the critical path. **One observation was
-enough to name a cause and not enough to size it** — which is why item 8 of §3
-demands several samples before anyone acts on it.
+the crate fingerprint every push). Runs 2 and 3 read **16 s and 19 s** for the
+same build — in line with the 15 s median it had inside `ci-native`, and with the
+13.77 s master reading I had called "variance or something not yet found". It was
+variance. The `VL_SEED_KEY` recompile is real and does happen every push; it is
+~17 s, not ~48 s, and it does not make this job the critical path. **One
+observation was enough to name a cause and not enough to size it** — which is why
+item 8 of §3 demands several samples before anyone acts on it.
 
 **The one qualification that survived both samples: the pooling gave −8 s on CI,
 not the −15 s the local 2.8× predicted** (27 → 19/20 s). Four cores cap it, and
@@ -275,7 +275,9 @@ to page granularity. Per-process `wait4` rusage, min of N, quiet box:
 | `vl build compiler/entry.vl` (self-compile) | 1,950 ms | **510.8 MB** |
 | `vl check compiler/entry.vl` | 969 ms | **649.5 MB** |
 
-**~0.5 GB of never-freed GC heap to compile 52 K lines — ~10 KB per source line.**
+**~0.5 GB of never-freed GC heap to compile `compiler/*.vl` — 100,238 lines /
+4.56 MB — i.e. ~5 KB of heap per source LINE, or ~112 bytes of heap per source
+BYTE.**
 And `vl check` allocates *more* than `vl build` while doing less work, which is
 itself a filed lead (§3, item 6).
 
@@ -358,7 +360,7 @@ self-compile unless stated.
 | 3 | **`nameNamesFunction`: index the arena once** | 4.71% self — it scans every node in `P.nodes` per call | small: a name set built in one arena pass, invalidated on arena growth | medium — it runs BEFORE `buildFnMap`, and emit-time monomorphization appends nodes; the invalidation is the whole correctness question | deterministic CALL + scan-step counts on two builds over the same input (a ~5% change is countable, and wall clock cannot resolve it); then profile self-% |
 | 4 | **`fnStmtsPosOf`: an index at the writers** | 4.82% self | medium — the function's own header states the honest fix is an index minted by `emit_mono`'s replacement writer, not a memo at the site | medium — a memo that caches the last answer is a silent miscompile the day a lower position holds a memoized node (the header says so) | same as #3; plus the corpus + fuzz A/B, since it is emit-path |
 | 5 | **Native-align: batch the `vl check` legs** the way RUN/TRAP is batched | the pooled version (shipped) took 27 → 19 s on CI; a `vl check` batch mode would take the remaining ~1,600 process spawns to a handful, and the 4-core cap stops applying | medium: a host `check --batch` mode + per-case verdict files | medium — the per-case verdict is the gate; a batch that blurs verdicts weakens it | the interleaved A/B in §1.5, plus the memo-key sabotage |
-| 8 | **`ci-embed-seed` recompiles the whole crate every push** — `build.rs` emits `cargo:rustc-env=VL_SEED_KEY=<hash of the seed>`, so a changed seed invalidates the crate fingerprint by construction | ~16 s off a job that is NOT the critical path (43–74 s against `ci-native`'s 42–50 s) — so this is a "when it is free" item, not a lever | small: compute the key at startup instead — but read `build.rs`'s header first, it is baked in to avoid hashing ~1 MB per invocation | low, but it trades a CI second for a runtime millisecond, which is the wrong direction if done naively | several samples of `Finished \`release\` profile in Xs` — two readings were 48 s and 16 s, so ONE sample cannot size this |
+| 8 | **`ci-embed-seed` recompiles the whole crate every push** — `build.rs` emits `cargo:rustc-env=VL_SEED_KEY=<hash of the seed>`, so a changed seed invalidates the crate fingerprint by construction | ~16 s off a job that is NOT the critical path (42–74 s against `ci-native`'s 42–50 s) — so this is a "when it is free" item, not a lever | small: compute the key at startup instead — but read `build.rs`'s header first, it is baked in to avoid hashing ~1 MB per invocation | low, but it trades a CI second for a runtime millisecond, which is the wrong direction if done naively | several samples of `Finished \`release\` profile in Xs` — three readings were 48 s, 16 s and 19 s, so ONE sample cannot size this |
 | 6 | **`vl check` allocates more than `vl build`** (649 MB vs 511 MB) while doing less | unquantified; a 138 MB gap in the LSP's own path | investigation first | none (a measurement) | peak RSS per §2.1; then bisect by pass |
 | 7 | **Editor latency**: `vl check` on one compiler file is 231 ms | the LSP path; see §4 | unquantified | — | the §4 table |
 
@@ -388,7 +390,7 @@ Per-process `wait4` rusage, min-of-N, quiet box (load ≈ 5), `.cwasm` sidecar
 | --- | ---: | ---: |
 | `vl check tiny.vl` (1 fn — the floor) | **5 ms** | 15.1 MB |
 | `vl build tiny.vl -o /dev/null` | 6 ms | 16.3 MB |
-| `vl check compiler/typecheck.vl` (one 15 K-line file) | **231 ms** | 188.6 MB |
+| `vl check compiler/typecheck.vl` (one 21,947-line file) | **231 ms** | 188.6 MB |
 | `vl check compiler/entry.vl` (26-file graph) | 969 ms | 649.5 MB |
 | `vl build compiler/entry.vl` (self-compile) | 1,950 ms | 510.8 MB |
 | `vl fmt --check compiler` (whole tree) | 559 ms | 508.8 MB |

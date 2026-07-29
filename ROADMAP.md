@@ -885,7 +885,8 @@ in-language GC knobs.
   `{backing,len,cap}` wrapper for never-grown lists; more union-arm niche encodings to drop
   `{tag,value}` boxes; `Set`'s dead `vals` array (B6a-opt).
   **MEASURED 2026-07-29** (`docs/internals/perf-program.md` §2.1): a self-compile peaks at
-  **511 MB** of never-reclaimed GC heap for 52 K lines (~10 KB/line) under the null collector,
+  **511 MB** of never-reclaimed GC heap for `compiler/*.vl` (100,238 lines / 4.56 MB — ~112 bytes
+  of heap per source BYTE) under the null collector,
   and the static census says why — `string` is `(array (mut i32))`, so every one of the binary's
   2,573 string literals is an i32-per-code-point array. The same document rules that **`flat`
   records are NOT this lever** (P1.2 is a declaration feature with zero emitter lines; the
