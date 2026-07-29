@@ -154,6 +154,32 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 >   reach, and an inverted control that reddens 11. **Filed, with a reproduction: an ARRAY LITERAL
 >   of inferred-union elements still registers the structural spelling a second time** — a different
 >   producer, identical on both compilers, and the next twin-row target.
+>
+>   **THE TWIN-ROW RESIDUE IS RE-DERIVED BY PRODUCER, AND THE FILED "ARRAY LITERAL" IS A BYSTANDER
+>   (2026-07-29, off `187869b7`).** A site-attribution probe (ZZSITE — tag every registration walk
+>   ROOT, log `(root, name)` at the funnel) says the second row comes from the `iru` loop, and the
+>   smallest witness has NO ARRAY: any annotation that spells the union's nominal composite is
+>   enough, because `inferRetArenaUnionIsDup` disqualified itself on `isUName(nm)`. That gate was
+>   BACKWARDS — `isUName(nm)` TRUE means the row already exists, which is the strongest reason to
+>   suppress the walk's structural second spelling, not to allow it. *A gate that asserts another
+>   producer's behaviour must name the STATE it is asserting; these two readings differ only in
+>   tense.* The gate is gone and `functions/inferred-union-one-row.vl` has its LIST and FIELD
+>   positions back: **corpus TWO-spelling twins with those positions restored are 17 on master and
+>   15 here.** The dedup exposed a **THIRD reader of the `is` spelling** (`monoStaticIsResult`'s
+>   exclusion, which const-folded an inline-shape union test to FALSE once the duplicate row stopped
+>   registering that spelling) — and applying #1309's rule there UNCONDITIONALLY costs **12 of 60
+>   monomorphized-guard cells**, so it is scoped by `nodeTyIsUnion(receiver)`, the CHECKER's view
+>   rather than the emitter's `exprUnion`. *A guard's blast radius is measured on the axis the guard
+>   does not mention.* **THE RESIDUE IS NOW RULED, family by family**: 6 SOURCE-spells-it-twice + 3
+>   UCOLL (the second row IS the union's second member) + 4 UCOLL-in-kind (per-union `uVariants`
+>   slice entries) are TERMINAL BY DESIGN, and the 2 UEXP rows are **canon's, not the walk's** —
+>   ZZLTN shows the arena renderer producing `AB|null` correctly and `canonEmitName` expanding it
+>   structurally because `unionAliasMembers` renders through `tyToEmitName`, which makes
+>   `types/nullable-union-alias.vl`'s own header stale. **Filed, not taken** (a canon union-arm
+>   change in the twice-ruled Lsoft/PRESERVE region), together with a bigger one found by the grid:
+>   **an UN-ANNOTATED array literal of union elements is silent INVALID WASM on master in every
+>   shape measured** — root cause `arrLitIsRef` classifying by the SYNTAX of the first element, and
+>   the checker's `nodeArrayElemName` having no `TyUnion` arm to read.
 
 ### Consumer-driven requirements — webcraft (`docs/webcraft-requirements.md`)
 
