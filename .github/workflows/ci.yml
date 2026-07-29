@@ -88,7 +88,14 @@ jobs:
   # dir (cold wasmtime build ~2-4 min, warm seconds — busted only when
   # scripts/vl-host/Cargo.lock changes), the finished `vl` binary (skips cargo
   # entirely when rustc + lockfile + crate source are unchanged), and the seed +
-  # its `.cwasm` sidecar keyed on the compiler source it was built from.
+  # its `.cwasm` sidecar keyed on the compiler source it was built from. The
+  # binary cache is restored FIRST and gates the target-dir restore: on the 97.9%
+  # of runs where it hits, this job runs no cargo at all and skips the ~1.2 GB
+  # download entirely.
+  #
+  # The release DISTRIBUTION build (`--features embed-seed`) used to be the last
+  # step here; it is now the parallel `ci-embed-seed` job, because it was the only
+  # reason this job restored the cargo target dir at all.
   #
   # Docs-only skip is mirrored from `ci` so a docs-only PR exits this job green
   # too (keeping the stable job name satisfied for branch protection).
@@ -124,8 +131,10 @@ jobs:
           restore-keys: |
             deno-${{ runner.os }}-
 
-      # Cargo registry/index + the vl-host target dir. Cold wasmtime build is the
-      # only real cost here; warm restores drop it to seconds.
+      # Cargo registry/index + the vl-host target dir — needed ONLY when the
+      # binary cache below missed and `cargo build` has to run.
+      # Cold wasmtime build is the only real cost here; warm restores drop it to
+      # seconds.
       #
       # The rustc version is part of the key ON PURPOSE: a target dir compiled by
       # one rustc is fully fingerprint-invalidated under the next (ubuntu-latest
@@ -154,8 +163,34 @@ jobs:
         id: rustc
         run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
 
-      - name: Cache cargo + vl-host target
+      # The finished `vl` binary, keyed on EVERYTHING that determines it (rustc,
+      # Cargo.lock, the crate source). An exact hit means cargo would reproduce
+      # this same binary, so the build step is skipped outright — and "the host
+      # still compiles" stays covered every run regardless: the `ci-embed-seed`
+      # job compiles the same crate (a feature superset) from scratch inputs.
+      #
+      # Restored BEFORE the cargo/target cache on purpose. An exact hit here means
+      # NOTHING in this job runs cargo, so the ~1.2 GB target-dir restore can be
+      # skipped outright — and it is the second-largest step in the job (17 s
+      # median; measured 2026-07-29 over the last 30 full master-push runs). The
+      # hit rate is 97.9% (377/385 full runs since 07-15): only a
+      # `scripts/vl-host/src/**`, `build.rs`, manifest or lockfile change misses,
+      # and on a miss the gated restore below runs exactly as it did before.
+      - name: Cache vl-host binary
         if: steps.docs_check.outputs.docs_only != 'true'
+        id: vlbin
+        uses: actions/cache@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: vl-bin-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}
+
+      # GATED on the binary cache missing: this job's ONLY cargo consumer is the
+      # build step below, which is gated on the same condition. `ci-embed-seed`
+      # restores (and saves) this same cache under the same key, so a lockfile or
+      # toolchain move still populates it; this job just stops paying a 17 s
+      # download for a target dir it will not open.
+      - name: Cache cargo + vl-host target
+        if: steps.docs_check.outputs.docs_only != 'true' && steps.vlbin.outputs.cache-hit != 'true'
         uses: actions/cache@v5
         with:
           path: |
@@ -166,20 +201,6 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-
             cargo-${{ runner.os }}-
-
-      # The finished `vl` binary, keyed on EVERYTHING that determines it (rustc,
-      # Cargo.lock, the crate source). An exact hit means cargo would reproduce
-      # this same binary, so the build step is skipped outright — and "the host
-      # still compiles" stays covered every run regardless: the embedded-seed
-      # step at the end compiles the same crate (a feature superset) from
-      # scratch inputs.
-      - name: Cache vl-host binary
-        if: steps.docs_check.outputs.docs_only != 'true'
-        id: vlbin
-        uses: actions/cache@v5
-        with:
-          path: scripts/vl-host/target/release/vl
-          key: vl-bin-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}
 
       - name: Build vl-host (native tool)
         if: steps.docs_check.outputs.docs_only != 'true' && steps.vlbin.outputs.cache-hit != 'true'
@@ -300,9 +321,10 @@ jobs:
           tests/playground_completion_test.ts
 
       # Collect the backgrounded self-lint: wait for its rc file, replay the full
-      # log, and fail the job on any lint/fmt finding. Sits BEFORE the
-      # embedded-seed build as a fence — that build overwrites target/release/vl,
-      # and lint must not race an in-place binary rewrite.
+      # log, and fail the job on any lint/fmt finding. LAST step in the job — no
+      # later step may touch `target/release/vl`, because lint must not race an
+      # in-place binary rewrite. (That fence is why the embedded-seed build, which
+      # rewrites it, is a separate job now; see `ci-embed-seed`.)
       - name: Self-lint (result)
         if: steps.docs_check.outputs.docs_only != 'true'
         run: |
@@ -325,21 +347,90 @@ jobs:
           cat /tmp/lint-self.log
           exit "$(cat /tmp/lint-self.rc)"
 
-      # The release distribution build (roadmap H-M2): `--features embed-seed` bakes
-      # the seed into the binary so a shipped `vl` is one self-contained file. Built
-      # here (the seed now exists) and smoke-tested from a dir with NO on-disk seed,
-      # forcing the embedded fallback — guards the distribution path against rot on
-      # every push, not just at release time. Runs LAST: the feature build overwrites
-      # target/release/vl, and no later step uses it. (The seed defaults to repo
-      # build/vl-compiler.wasm; the earlier steps' `vl` is the no-feature build.)
-      #
-      # The plain binary is stashed and put back afterward, so the vl-bin cache's
-      # post-job save (and anything else that reads target/release/vl later)
-      # sees the NO-FEATURE binary, never the embed-seed one.
+  # ---------------------------------------------------------------------------
+  # ci-embed-seed — the release DISTRIBUTION build (roadmap H-M2), gated on every
+  # push instead of only at release time.
+  #
+  # A SEPARATE, PARALLEL job because it is the only remaining cargo consumer and
+  # it shares nothing with `ci-native`'s suites. Measured 2026-07-29 over the last
+  # 30 full master-push runs it cost that job 15 s of `cargo build` PLUS the 17 s
+  # ~1.2 GB target-dir restore it was the only reason to pay — 32 s of a 89 s
+  # median critical path, for work nothing downstream consumes. Out here it runs
+  # concurrently and costs the wall clock nothing.
+  #
+  # What it asserts is UNCHANGED: `--features embed-seed` compiles, the resulting
+  # binary runs from a directory with NO on-disk seed (forcing the embedded
+  # fallback), and its Cranelift compilation cache materializes so a shipped `vl`
+  # does not re-JIT the seed every invocation.
+  #
+  # The seed it embeds comes from the same rolling cache `ci-native` uses, else
+  # `scripts/fetch-seed.sh`. It deliberately does NOT wait for `ci-native`'s
+  # freshly refreshed seed: every assertion here is about the DISTRIBUTION
+  # MECHANISM (build.rs staging, the embedded fallback, the cache key), and any
+  # healthy seed exercises all of it. The seed's own correctness is proven in
+  # `ci-native` by the fixpoint ladder, which is where that gate belongs.
+  # ---------------------------------------------------------------------------
+  ci-embed-seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect docs-only change
+        id: docs_check
+        uses: ./.github/actions/docs-only
+
+      - name: Rustc version (cargo cache key)
+        if: steps.docs_check.outputs.docs_only != 'true'
+        id: rustc
+        run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
+
+      # RESTORE-ONLY, on `ci-native`'s key. This job's target dir holds
+      # `--features embed-seed` artifacts, and writing those under the shared key
+      # would hand `ci-native` a target dir whose `release/vl` is the embed-seed
+      # binary. `ci-native` is the writer: any input that busts this key (rustc,
+      # Cargo.lock, Cargo.toml) also busts its `vl-bin` key, so it always misses,
+      # restores, builds and saves. One cold wasmtime build after a toolchain bump
+      # is the same cost as before the split.
+      - name: Restore cargo + vl-host target
+        if: steps.docs_check.outputs.docs_only != 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            scripts/vl-host/target
+          key: cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-
+            cargo-${{ runner.os }}-
+
+      # Also RESTORE-ONLY: any healthy seed will do here (see the job header), so
+      # a restore-keys hit is a full hit and the fetch below covers a cold cache —
+      # while `ci-native` stays the sole writer of the seed pair, which is what
+      # keeps the `.cwasm` sidecar riding along with the wasm it was built from.
+      - name: Restore seed compiler wasm
+        if: steps.docs_check.outputs.docs_only != 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.cwasm
+          key: vl-seedpair-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
+          restore-keys: |
+            vl-seedpair-${{ runner.os }}-
+
+      # Idempotent: fetch-seed.sh leaves a present, non-empty seed untouched.
+      - name: Ensure a seed to embed
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: ./scripts/fetch-seed.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Verify embedded-seed build (distribution path)
         if: steps.docs_check.outputs.docs_only != 'true'
         run: |
-          cp scripts/vl-host/target/release/vl /tmp/vl-plain
           cargo build --release --features embed-seed --manifest-path scripts/vl-host/Cargo.toml
           probe="$(mktemp -d)"
           # Isolated cache dir: the embedded seed has no `build/` beside it, so its
@@ -366,4 +457,3 @@ jobs:
           fi
           echo "embedded-seed build runs with no on-disk seed (got 42), and caches its compile:"
           ls -la "$VL_CACHE_DIR"
-          mv /tmp/vl-plain scripts/vl-host/target/release/vl

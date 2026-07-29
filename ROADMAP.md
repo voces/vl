@@ -884,6 +884,23 @@ in-language GC knobs.
   `DECISIONS.md` leans on is opt-in); representation inference (B6 §VL.7) to drop the
   `{backing,len,cap}` wrapper for never-grown lists; more union-arm niche encodings to drop
   `{tag,value}` boxes; `Set`'s dead `vals` array (B6a-opt).
+  **MEASURED 2026-07-29** (`docs/internals/perf-program.md` §2.1): a self-compile peaks at
+  **511 MB** of never-reclaimed GC heap for 52 K lines (~10 KB/line) under the null collector,
+  and the static census says why — `string` is `(array (mut i32))`, so every one of the binary's
+  2,573 string literals is an i32-per-code-point array. The same document rules that **`flat`
+  records are NOT this lever** (P1.2 is a declaration feature with zero emitter lines; the
+  flat-able i32 sidecars are ~10% of self-time against the string layer's 33.6%) and names the
+  adjacent one that IS: bulk host↔guest staging over the now-host-visible linear memory, whose
+  host half is already written and waiting on `ioMem` + `srcLoad` exports.
+- 🟡 **B-ci. CI wall clock** (`docs/internals/perf-program.md` §1). `ci-native` crept 74 s → 89 s
+  p50 / 106 s p90 by 07-29; the forensics over all 1,317 master-push runs say the creep is
+  **not** compiler speed (the self-compile step is 9 s of 89) but three step-level costs: the
+  native-align suite's ~1,618 SERIAL `vl check` spawns (27 s), a 1.2 GB cargo-target restore
+  (17 s) and a per-push `--features embed-seed` cargo build (15 s). SHIPPED: the embed-seed build
+  is now the parallel `ci-embed-seed` job, the target-dir restore is gated on the `vl-bin` cache
+  missing (97.9% hit rate), and the align spawns are pooled (13.1 s → 4.6 s, interleaved min-of-3,
+  same 1,797/0). REMAINING: a `vl check --batch` mode would take the last ~1,600 spawns to a
+  handful (§3 item 5).
 - ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
   position and emit it.
 - ⬜ **B-chore-liststore-fuse. Re-fuse the three split-form list stores in `emit_rep.vl`**

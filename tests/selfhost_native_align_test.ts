@@ -71,26 +71,72 @@ const path = (rel: string) => new URL(rel, CASES).pathname;
 const base = (rel: string) => rel.split("/").pop()!;
 const head = (s: string, n = 1) => s.trim().split("\n").slice(0, n).join(" / ");
 
-type Run = { code: number; out: string; err: string };
-const vl = async (args: string[]): Promise<Run> => {
-  const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: [...args, "--compiler", COMPILER],
-    stdout: "piped",
-    stderr: "piped",
-    // Deterministic, compact stderr (no Rust backtrace) for stage matching.
-    // VL_STD pins the std dir to THIS tree: agent worktrees symlink the cargo
-    // target into the main checkout, so the binary's exe-relative std/
-    // fallback (/proc/self/exe resolves symlinks) would point at the WRONG
-    // checkout there. The env override is the first hit in the host's std-dir
-    // resolution either way.
-    env: { RUST_BACKTRACE: "0", VL_STD: `${ROOT}/std` },
-  }).output();
-  return {
-    code,
-    out: new TextDecoder().decode(stdout),
-    err: new TextDecoder().decode(stderr),
+// ── Bounded-concurrency gate for subprocess spawns ────────────────────────────
+// Deno runs the tests in ONE file sequentially, so an awaited spawn per case is a
+// strictly SERIAL chain: 1,618 `vl check` processes, each paying process +
+// wasmtime engine + seed `.cwasm` deserialize before it compiles anything. That
+// CHAIN, not the compiling, was this suite's cost (measured 2026-07-29: ~6 ms per
+// spawn, the file alone 12 s locally and ~27 s on the 4-core CI runner — the
+// single largest step in `ci-native`).
+//
+// The spawns are independent of one another, so they are queued through this gate
+// and each test awaits its OWN memoized result. The command, its arguments, its
+// environment and the assertion applied to its output are all UNCHANGED; only the
+// SCHEDULE moves.
+//
+// The limit is the core count clamped to [2, 8]: `deno test --parallel` already
+// fans the test FILES across workers, so an unbounded pool here would multiply
+// against that and thrash a small runner.
+const gate = (limit: number) => {
+  let active = 0;
+  const waiting: (() => void)[] = [];
+  const acquire = (): Promise<void> => {
+    if (active < limit) {
+      active++;
+      return Promise.resolve();
+    }
+    return new Promise<void>((res) => waiting.push(res));
+  };
+  const release = () => {
+    // Hand the SLOT to the next waiter rather than releasing and re-acquiring, so
+    // the limit cannot be transiently exceeded by an interleaved caller.
+    const next = waiting.shift();
+    if (next) next();
+    else active--;
+  };
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    await acquire();
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
   };
 };
+const SPAWN_JOBS = Math.max(2, Math.min(8, navigator.hardwareConcurrency || 4));
+const spawnGate = gate(SPAWN_JOBS);
+
+type Run = { code: number; out: string; err: string };
+const vl = (args: string[]): Promise<Run> =>
+  spawnGate(async () => {
+    const { code, stdout, stderr } = await new Deno.Command(VL, {
+      args: [...args, "--compiler", COMPILER],
+      stdout: "piped",
+      stderr: "piped",
+      // Deterministic, compact stderr (no Rust backtrace) for stage matching.
+      // VL_STD pins the std dir to THIS tree: agent worktrees symlink the cargo
+      // target into the main checkout, so the binary's exe-relative std/
+      // fallback (/proc/self/exe resolves symlinks) would point at the WRONG
+      // checkout there. The env override is the first hit in the host's std-dir
+      // resolution either way.
+      env: { RUST_BACKTRACE: "0", VL_STD: `${ROOT}/std` },
+    }).output();
+    return {
+      code,
+      out: new TextDecoder().decode(stdout),
+      err: new TextDecoder().decode(stderr),
+    };
+  });
 const stageOf = (err: string) => err.match(/(parse|type|emit) error/)?.[1] ?? "other";
 
 // ── Directive scan + tier classification ──────────────────────────────────────
@@ -272,6 +318,53 @@ const runOne = async (rel: string): Promise<BatchResult> => {
   return { out: r.out, err: r.code === 0 ? null : r.err || r.out };
 };
 
+// ── The `vl check` legs, memoized and PREFETCHED ──────────────────────────────
+// Every tier ends in a `vl check` (or `vl check --codegen`) of one case, and each
+// is independent of every other. `checkRun` memoizes the spawn per (case, flag) so
+// a case is checked exactly once, and `warmChecks()` queues ALL of them through
+// `spawnGate` — after which the sequential per-case tests below mostly COLLECT a
+// finished result instead of starting one.
+//
+// The memo key is exactly the two things that vary (the case path and the
+// `--codegen` flag), so no case can read another's result, and the assertion
+// functions are otherwise untouched. Like the `vl run --batch` fixture above the
+// prefetch is LAZY — it is kicked off from the setup fixture, so a filtered run
+// that never reaches it still spawns only the cases it actually adjudicates.
+//
+// SABOTAGE-VERIFIED (2026-07-29), and the two halves of the key do NOT verify the
+// same way. Collapsing the key to drop `rel` — every case reading one shared
+// result — reddens the suite loudly: 260 of 1,646 fail. Collapsing it to drop the
+// `codegen` flag stays GREEN, and that is not a hole in the key, it is a property
+// of the tier partition: a case lands in exactly ONE tier, so no case is ever
+// checked both ways and the two flavours cannot collide today. The flag stays in
+// the key because it is what makes the memo correct rather than accidentally
+// correct — do not "simplify" it out on the strength of a green run.
+const checkMemo = new Map<string, Promise<Run>>();
+const checkRun = (rel: string, codegen: boolean): Promise<Run> => {
+  const key = `${codegen ? "codegen" : "check"} ${rel}`;
+  const memo = checkMemo.get(key);
+  if (memo) return memo;
+  const args = codegen ? ["check", "--codegen", path(rel)] : ["check", path(rel)];
+  const p = vl(args);
+  // A prefetched spawn can settle long before its test awaits it. `vl()` rejects
+  // only when the PROCESS cannot start (a nonzero exit is a resolved value, not a
+  // rejection), but marking the promise handled here keeps that failure from
+  // surfacing as an unhandled rejection that kills the worker before the owning
+  // test can report it against the case.
+  p.catch(() => {});
+  checkMemo.set(key, p);
+  return p;
+};
+let warmed = false;
+const warmChecks = (): void => {
+  if (warmed) return;
+  warmed = true;
+  for (const rel of TIERS.run) checkRun(rel, false);
+  for (const rel of TIERS.accept) checkRun(rel, false);
+  for (const rel of TIERS.reject) checkRun(rel, false);
+  for (const rel of TIERS["emit-reject"]) checkRun(rel, true);
+};
+
 // ── Per-tier assertions, as functions: `null` = the native tool agrees ─────────
 // The per-case tests and the exclusion tripwires call the SAME function, so a
 // tripwire can never drift from the assertion it is guarding.
@@ -297,14 +390,14 @@ const trapDivergence = (r: BatchResult): string | null => {
 };
 
 const checkCleanDivergence = async (rel: string): Promise<string | null> => {
-  const c = await vl(["check", path(rel)]);
+  const c = await checkRun(rel, false);
   return c.code === 0
     ? null
     : `vl check should compile clean, exited ${c.code} (${stageOf(c.err)}): ${head(c.err)}`;
 };
 
 const rejectDivergence = async (rel: string): Promise<string | null> => {
-  const r = await vl(["check", path(rel)]);
+  const r = await checkRun(rel, false);
   if (r.code === 0) return "expected rejection, vl check exited 0";
   const stage = stageOf(r.err);
   // The front end must catch it — an invalid program must never slip past the
@@ -316,7 +409,7 @@ const rejectDivergence = async (rel: string): Promise<string | null> => {
 };
 
 const emitRejectDivergence = async (rel: string): Promise<string | null> => {
-  const r = await vl(["check", "--codegen", path(rel)]);
+  const r = await checkRun(rel, true);
   if (r.code === 0) {
     return "expected an emit-stage rejection, vl check --codegen exited 0";
   }
@@ -364,6 +457,13 @@ Deno.test({
     if (results.size === 0) {
       throw new Error("vl run --batch produced no per-case results");
     }
+    // Queue every per-case `vl check` behind the batch, so the sequential
+    // per-case tests below mostly COLLECT results instead of starting them.
+    // Deliberately AFTER the batch await (the batch waves spawn outside
+    // `spawnGate`, so overlapping the two would oversubscribe a small runner) and
+    // deliberately NOT awaited: `spawnGate` bounds the in-flight count, and the
+    // owning test still awaits — and reports — its own case.
+    warmChecks();
   },
 });
 
