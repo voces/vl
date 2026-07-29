@@ -575,7 +575,12 @@ in-language GC knobs.
   > them wholesale, renumbering every union box tag in every program), whether `ref.i31` enters
   > the emitted vocabulary (measured available in wasm-tools' shipped set, V8 and wasmtime 47 —
   > and the only encoding that does not regress allocations; the emitter has zero i31 today), and
-  > what `K | K2` should MEAN. Two follow-on slices are scoped with their populations; the
+  > what `K | K2` should MEAN — **and that last one turns out to need no ruling and to be the
+  > slice to take FIRST**: a union all of whose members are literal unions IS one, and the
+  > flattened target already runs on master with zero compiler changes
+  > (`type KA = "aa"|"bb"|"cc"|"dd"`, `x is K` answers correctly), because `emitIs`'s
+  > membership ladder tests the tested type's own members over the interned atom. Only the
+  > checker's render has to move. THREE follow-on slices are scoped with their populations; the
   > working cells are pinned by `tests/cases/literal-unions/mixed-union-litunion-arm-floor.vl`.
   > *Also measured: the fuzzer DOES reach litunion-in-mixed-union (26 and 14 of 800 cases on two
   > seeds) and is VACUOUS on every defect family — it only ever stores a member LITERAL.*
