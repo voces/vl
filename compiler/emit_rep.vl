@@ -1526,12 +1526,54 @@ export function recordUnMemTys(set: string) {
 
 function slotCanonKey(si: i32): string {
   if si < 0 || si >= sNames.length { return "" }
-  // D1: the ARENA-INDEX sidecar (`sTyIx`, recorded at every row mint in D0) is
-  // authoritative — this row's type is known structurally, so there is nothing to
-  // re-derive from its name. Covers the `#anon` literal rows too (recorded from the
-  // literal's context-resolved rep type), which the name path cannot resolve at all
-  // and which previously needed a separate key-string sidecar. A row the sidecar
-  // does not cover (-1) keeps the legacy name path unchanged.
+  // RUNG 1 — the ARENA-INDEX sidecar (`sTyIx`, recorded at every row mint in D0),
+  // consulted FIRST (destringify D-SLOTARENA). This row's type is known
+  // structurally, so there is nothing to re-derive from its name; the rung the
+  // header below has called "authoritative" since D1 now actually runs first.
+  // Covers the `#anon` literal rows (recorded from the literal's context-resolved
+  // rep type), which the name path cannot resolve at all and which previously
+  // needed a separate key-string sidecar.
+  //
+  // CONFIRM-ONLY, exactly like `nulBaseStructRow`'s arena rung: an uncovered row
+  // (-1, the pad-on-push self-heal) or a covered row whose recorded type is not a
+  // `TyObj` falls through to the name ladder below, unchanged and in its old order.
+  // The only cell where the two rungs can BOTH answer is a row that is covered AND
+  // whose name resolves — dual-write measured **0 divergences over 12,469 arena
+  // answers in 13,341 entries** (`tests/cases` + `std`), and that zero is graded:
+  // the same rung reading `sTyIx[si + 1]` diverges on **6,567** of them, first
+  // witness `row=P A={x:i32,y:i32,} L={x:i32,}` (the grading run was taken at the
+  // census base `01dfb205`, where the same probe read 12,467 / 13,339).
+  //
+  // WHAT MOVING IT BUYS is not tidiness: the name ladder's inline-shape fallback is
+  // a `resolveAnnot` RE-PARSE of a spelling whose answer this table already banked,
+  // and `slotCanonKey` is the hottest of `emit_rep`'s seven `resolveAnnot` callers
+  // (`repRowOfTyStruct` and `buildStructTwins` both scan it over every row). The
+  // re-parse count over `tests/cases` falls **8,811 -> 54**, and with it 30.5% of
+  // this module's whole emit-time name-resolution traffic (28,719 -> 19,962 calls
+  // across the seven sites; the other six move by exactly zero — the control, and
+  // it holds to the unit: 4,667 · 1,060 · 9,805 · 2,083 · 624 · 1,669 on both sides).
+  if si < sTyIx.length {
+    const dix = sTyIx[si]
+    if dix >= 0 {
+      const dt = T.tys[dix]
+      if dt is TyObj { return repCanonKey(dix) }
+    }
+  }
+  // RUNG 2 — the NAME ladder, for a row the sidecar does not cover: a mint site that
+  // does not call `recordSTyIx` (pad-on-push -1 / a column shorter than `sNames`), or
+  // a name that had not resolved yet when the row was interned. Unchanged, and STILL
+  // LIVE — measured, not assumed. Over `tests/cases`: rung 1 answers 12,455 · control
+  // reaches rung 2 **872** times · rung 2 returns a non-"" key **32** times · its
+  // `resolveAnnot` fires **54** times · the `TyObj` gate above declines a COVERED row
+  // **12** times. So the fall-through is not decoration and the rung is not deletable.
+  //
+  // TWO OF ITS PROPERTIES ARE NEVERTHELESS INVISIBLE TO THE CORPUS, and that is stated
+  // rather than banked as a zero: making rung 1 TOTAL wherever the column covers the
+  // row (never falling through) and dropping the `TyObj` gate each move **0 files on
+  // all six channels** (1,692 at the census base), while `sTyIx[si + 1]` moves **106**
+  // and deleting rung 1 outright moves **5** — both re-run on the shipped bytes over
+  // 1,695. The 32 answers therefore all come from rows PAST the column's end, which is
+  // the only decline the corpus can see.
   const nm = sNames[si]
   let di = cUserTypes[nm] ?? -1
   if di < 0 {
@@ -1544,21 +1586,8 @@ function slotCanonKey(si: i32): string {
     if !(t is TyObj) { return "" }
     return repCanonKey(di)
   }
-  // The NAME did not resolve through the checker's annotation grammar — a
-  // synthetic `#anon` object-literal row, or an unresolvable spelling. The
-  // ARENA-INDEX sidecar (`sTyIx`, recorded at every row mint) carries the row's
-  // type, so an anonymous row still participates in twin dedup / row resolution.
-  // This REPLACED a key-STRING sidecar (`sAnonCanon`) that froze `repCanonKey` at
-  // intern time; keying off the index instead re-derives at query time, so the key
-  // follows later arena mutation. "" when the sidecar does not cover the row
-  // either — the legacy never-merged behaviour.
-  if si < sTyIx.length {
-    const dix = sTyIx[si]
-    if dix >= 0 {
-      const dt = T.tys[dix]
-      if dt is TyObj { return repCanonKey(dix) }
-    }
-  }
+  // Neither rung: a synthetic `#anon` row the D0 recorder could not type, or an
+  // unresolvable spelling. "" is the legacy never-merged behaviour.
   ""
 }
 
@@ -1862,16 +1891,18 @@ function renderFaithful(nm: string): string {
 //
 // **CALL-SITE COUNT, RE-DERIVED — this header said "six" and was WRONG for four merges.**
 // #1146 (`2fae030`) collapsed `structIndexOfTypeRef`'s duplicated nullable arm and dropped
-// a fifth site; the count has been **four** since, and is **four** now:
-// `nulBaseStructRow`, `structIdxOfElemName`, `monoIsRowMatch`, `shapeElemDeclaredStructIdx`
+// a fifth site; the count was **four** from then until D-SLOTARENA, and is **three** now:
+// `nulBaseStructRow`, `structIdxOfElemName`, `shapeElemDeclaredStructIdx`
 // — all in `emit_classify.vl`, all on classification paths. (Counted comment-stripped, own
 // definition header excluded; the import line is not a call.) The stale six is exactly the
 // pathology this program keeps rediscovering: **a header comment is not evidence.**
 //
-// **ONE OF THE FOUR IS NOW UNREACHABLE (D-MONOISTY).** `monoIsRowMatch`'s only caller —
-// `wasmEmit.monoStaticIsResult` — takes the ARENA route (`repIsRowMatchTy`, below) as of this
-// slice, so `monoIsRowMatch` has ZERO callers and its `repRowOfName` round trip can never run.
-// Graded, not assumed. A dual-write probe running BOTH legs at that seam and failing loudly on
+// **THE FOURTH WAS UNREACHABLE AND IS NOW DELETED (D-MONOISTY, filed; D-SLOTARENA, taken).**
+// `monoIsRowMatch`'s only caller — `wasmEmit.monoStaticIsResult` — took the ARENA route
+// (`repIsRowMatchTy`, below) at D-MONOISTY, leaving the function with ZERO callers and a
+// `repRowOfName` round trip that could never run. It was filed for deletion there because
+// `emit_classify.vl` was outside that slice's partition; D-SLOTARENA deletes it. Graded, not
+// assumed. A dual-write probe running BOTH legs at that seam and failing loudly on
 // any disagreement reached **9 of 1,448 corpus files** with **0 divergences** — the reach is the
 // positive control that the comparison was live. The FUZZ channel is covered end-to-end instead
 // (an A/B of the name-leg build against this one over **50,400 programs, 0 divergences**), not by
@@ -1879,8 +1910,7 @@ function renderFaithful(nm: string): string {
 // because a probe result and a differential result are not interchangeable evidence.
 // The zero is AGREEMENT, not coverage: inverting `repIsRowMatchTy`'s answer moves **4 corpus
 // rows** (3 build failures plus a byte+stdout diff on `generics/mono-is-anon-shape-guard.vl`, the
-// pin minted for this seam). The orphaned `monoIsRowMatch` is **filed for deletion** in
-// `emit_classify.vl` (not this slice's partition).
+// pin minted for this seam).
 // Live round-trip consumers: **3** (`nulBaseStructRow`, `shapeElemDeclaredStructIdx`, plus
 // `structIdxOfElemName`, itself measured dead below its first rung — see the table below).
 //
@@ -1911,7 +1941,7 @@ function renderFaithful(nm: string): string {
 //   | consumer                    | corpus files | fuzz dirs / programs |
 //   | `nulBaseStructRow`          |     105      |  84 / 2,003          |
 //   | `structIdxOfElemName`       |     **0**    |  **0 / 0**           |
-//   | `monoIsRowMatch`            |       6      |   0 / 0              |
+//   | `monoIsRowMatch` (deleted)  |       6      |   0 / 0              |
 //   | `shapeElemDeclaredStructIdx`|      44      |  79 /   633          |
 //
 // The zeros are GRADED, not assumed: consumers 1 and 4 fire on both channels from the same

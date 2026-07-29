@@ -33837,3 +33837,239 @@ coverage of everything else, not as evidence about these two changes.
   deliberately does NOT ask for the closing `}`". That rationale now lives in
   `typecheck.tsMapKeyNodeOf`; the function's surviving callers are the two above plus
   `emit_base.nameIsI32KeyedMap`, none of which is the diagnostic. Not edited here — file partition.
+## D-SLOTARENA — the EMIT-side frontier re-derived, and `emit_rep`'s hottest `resolveAnnot` caller stops asking: the row's arena index was already banked, one rung too low (censused and graded off master `01dfb205`, rebased and re-gated on `75ff7198` — D-MAPKEYDIAG, which touches none of these files; §7 row 5 is the one line the rebase moved)
+
+#1288 closed the checker-side SOURCES arc and left a four-bucket residue whose header sentence
+was *"everything left is EMIT-side"*. This slice re-derives that residue **from the emitter's
+side of the boundary**, finds that its headline number is stated in a unit no emitter change can
+move, and takes the largest piece of the unit that a routing change *can* move.
+
+### 1. THE RESIDUE RE-DERIVED — #1288's `3,057` is a CALLEE-side, POST-MEMO unit, and the call-site unit is **28,446**
+
+`resolveAnnot` is not one call. `resolveAnnotTs` opens with a name-keyed memo
+(`annotNameMemo` positively, `annotNameMemoNegVer` negatively) and only a MISS reaches
+`annotResolve`. #1288's instrument counted `annotResolve` entries — *resolutions* — and got
+**3,057**. What a routing slice retires is **calls**, and nobody had counted those.
+
+**PROBE ZZRA.** One counter per `resolveAnnot` call site in `emit_rep.vl`, reported by
+`emitFail` at the end of `emitProgram` (the counters accumulate across a directory sweep,
+because the host reuses one compiler instance per directory — so the LAST record is the corpus
+total, and reading any earlier one double-counts):
+
+```
+build:   (7 counters in emit_rep.vl + emitFail(zzRaReport()) at emit_sections.vl's emitProgram tail)
+         vl build compiler/entry.vl -o ra-probe.wasm --compiler <master fixpoint>
+run:     vl check --codegen tests/cases --compiler ra-probe.wasm > ra-cases.out    # rc 1, the probe raises
+extract: grep -o 'ZZRA|[0-9|]*' ra-cases.out | tail -1
+```
+
+Both legs below were re-derived on the SHIPPED base `75ff7198` (the census was taken at
+`01dfb205`; #1290 added three `tests/cases/maps/` fixtures, which is the whole of the drift —
+rows 1, 3 and 4 move by +13 / +251 / +9 on BOTH sides and nothing else changes):
+
+| # | `emit_rep.vl` call site | what it converts | kind | master | after |
+|---|---|---|---|---:|---:|
+| 1 | `repElemKeyOfName` | a ref-list ELEMENT name | bridge + one re-resolve rung | 4,667 | 4,667 |
+| 2 | `sTyIxOfName` | a struct ROW name (the D0 bridge) | **bridge** | 1,060 | 1,060 |
+| 3 | `fieldElemTyIxOfName` | a struct/variant FIELD's element name (the D5 bridge) | **bridge** | 9,805 | 9,805 |
+| 4 | `unMemAtomTyIx` | a union MEMBER atom | **bridge** | 2,083 | 2,083 |
+| 5 | **`slotCanonKey`** | **a struct ROW name, AGAIN, at query time** | **re-resolver** | **8,811** | **54** |
+| 6 | `repNameCanonKey` | an mv/variant table key spelling | re-resolver | 624 | 624 |
+| 7 | `repRowOfName` | a spelling put through `renderFaithful` | re-resolver | 1,669 | 1,669 |
+| | **total** | | | **28,719** | **19,962 (−30.5%)** |
+
+**THE SIX UNMOVED ROWS ARE THE INTERNAL CONTROL AND THEY HOLD TO THE UNIT** — a routing change
+confined to one site must move exactly one column, and it does. (`std` adds 18 calls in all;
+1,415 of the corpus's programs reach the end of `emitProgram`.)
+
+**THE BUCKETING IS THE FINDING, AND IT IS NOT THE ONE THE RESIDUE TABLE PREDICTED.** Four of the
+seven — rows 1–4 — are **one-shot BRIDGES**: each runs once per row / field / member at INTERN
+time and exists precisely to turn a name into an arena index so that everything downstream can
+read the index instead. Retiring those is not a routing move, it is a new checker-side recorder
+(filed in §6). Only rows 5–7 are **re-resolvers**, and one of them is 8,811 of the 12,104.
+
+### 2. `slotCanonKey` HELD THE ANSWER AND CONSULTED IT LAST
+
+`slotCanonKey(si)` is the canonical structural key of struct-table row `si` — the key
+`repRowOfTyStruct` scans over every row and `buildStructTwins` computes for every slot. Its D1
+header opens *"the ARENA-INDEX sidecar (`sTyIx`, recorded at every row mint in D0) is
+**authoritative** — this row's type is known structurally, so there is nothing to re-derive from
+its name"*, and then the body does this:
+
+```
+  1. cUserTypes[nm]                       nominal
+  2. if nameIsShapeSpanEnds(nm) -> resolveAnnot(nm)     ← the re-parse
+  3. if either resolved -> repCanonKey
+  4. ...only NOW: sTyIx[si]               the authoritative rung
+```
+
+The sidecar was the **fallback for the `#anon` rows**, not the first rung. Every inline-shape row
+— `{v:i32}`, `{f: {f: i64|null}}`, every deduped field shape — re-parsed a spelling whose answer
+`sTyIxOfName` had already computed and banked at the mint, once per row, per scan, per query.
+
+**THE CHANGE IS THE ORDER.** Rung 1 is the sidecar, CONFIRM-ONLY in exactly
+`nulBaseStructRow`'s shape: an uncovered row (`-1`, the pad-on-push self-heal) or a covered row
+whose recorded type is not a `TyObj` falls through to the name ladder, unchanged and in its old
+order. Nothing else moved. The `emitProgram` header's promise — *"the pre-collect window then
+reads UNCOVERED and every consumer keeps its name path"* — holds verbatim, because
+`sTyIx = []` makes `si < sTyIx.length` false and rung 1 declines.
+
+### 3. THE DUAL-WRITE PROOF, AND ITS GRADING
+
+The only cell where the two rungs can BOTH answer is a row that is covered AND whose name
+resolves. A build computing both at every entry and reporting disagreements:
+
+```
+build:  (slotCanonKey split into slotCanonKeyArenaRung + slotCanonKeyLegacy, both run, compared)
+run:    vl check --codegen tests/cases --compiler dw-probe.wasm ; ... std
+```
+
+| | entries | arena rung answers | **disagreements** |
+| --- | ---: | ---: | ---: |
+| `tests/cases` (`75ff7198`) | 13,327 | 12,455 | **0** |
+| `std` | 14 | 14 | **0** |
+| **the same rung reading `sTyIx[si + 1]`** (graded at `01dfb205`, 13,325 entries) | 13,325 | 9,078 | **6,567** |
+
+The sabotaged run names its first witness in the record — `row=P A={x:i32,y:i32,} L={x:i32,}` —
+so the zero is AGREEMENT, not a comparison that never ran.
+
+### 4. RUNG 2 IS STILL LIVE, AND TWO OF ITS PROPERTIES ARE INVISIBLE TO THE CORPUS
+
+A second probe, on the shipped ladder, counting where control actually goes (`tests/cases`):
+
+| | |
+| --- | ---: |
+| rung 1 answers | **12,455** |
+| control reaches rung 2 | **872** |
+| rung 2 returns a non-`""` key | **32** |
+| rung 2's `resolveAnnot` fires | **54** |
+| the `TyObj` gate declines a COVERED row | **12** |
+
+So the fall-through is load-bearing and the rung is not deletable — *an unreached rung is not a
+wrong one* (D-PARENCLASSIFY), and this one is reached. But two of its guards are measured
+INVISIBLE, and that is stated rather than banked:
+
+| sabotage of the shipped ladder | corpus A/B x 6 fields |
+| --- | ---: |
+| **SAB-SHIFT** rung 1 reads `sTyIx[si + 1]` | **106 files / 245 cells** (re-run on the shipped bytes, 1,695 files — reproduces file-for-file) |
+| **SAB-DROP1** rung 1 deleted outright | **5 files / 11 cells** (re-run on the shipped bytes — the same five files) |
+| SAB-NOFALL rung 1 made TOTAL wherever the column covers the row | **0** (1,692, census base) |
+| SAB-NOGATE the `dt is TyObj` gate dropped | **0** (1,692, census base) |
+
+The two zeros are not blindness — SAB-SHIFT proves the channel sees this very function — they
+are a statement about WHERE the 32 rung-2 answers come from: rows PAST the column's end (a mint
+site that never called `recordSTyIx`), which is the only decline SAB-NOFALL leaves alone.
+
+**THE TWO WITNESS SETS, NAMED, ALL ALREADY COMMITTED** — so no new fixture is owed (#1259's
+standard: run the poison, look for the fixture in its witness set).
+
+* **SAB-SHIFT (106)**, incl. `structs/structural-twin-heap-dedup.vl` ·
+  `structs/inline-shape-declared-twin-heap.vl` · `structs/structural-twin-reflist-dedup.vl` ·
+  `structs/nullable-wrapper-literal-widen.vl` · `structs/nullable-base-row-arena-node.vl` ·
+  `structs/nested-null-hole-list-elem-twin.vl` · `structs/uninterned-inline-shape-boundary.vl` ·
+  `types/type-name-walk-homes-coverage.vl` · `soundness/narrowing-null-guard.vl`.
+* **SAB-DROP1 (5), the `#anon` population, exhaustively**:
+  `generics/mono-is-anon-shape-guard.vl` · `inference/hole-guard-member-rebase.vl` ·
+  `inference/hole-is-guard-alternative.vl` · `inference/hole-is-guard-return-join.vl` ·
+  `inference/hole-join-two-level-chain.vl`.
+
+### 5. THE DEAD CONSUMER D-MONOISTY FILED IS DELETED
+
+`emit_classify.monoIsRowMatch` lost its only caller at D-MONOISTY (`wasmEmit.monoStaticIsResult`
+took the arena route through `repIsRowMatchTy`) and was **filed for deletion** in
+`emit_rep.repRowOfName`'s header — *"not this slice's partition"*. It is this slice's partition.
+Deleted, with the two headers that pointed at it corrected.
+
+**AND ITS COMMENT BLOCK HAD BEEN SPLICED THROUGH ANOTHER FUNCTION'S HEADER.** Deleting it
+rejoins a sentence that had been broken across 24 lines for as long as both functions have
+existed:
+
+```
+// ... resolves to via the structural bridge (`structIndexOfTypeName`), or -1. GATED on a DECLARED twin
+// (`nameIsStructDecl`): an inline spelling matching only an anonymous-literal / interned-shape slot ...
+function shapeElemDeclaredStructIdx(base: string) {
+```
+
+`repRowOfName`'s live round-trip consumer count goes **4 -> 3**.
+
+### 6. EQUIVALENCE AND GATE — every rc taken BARE, never through a pipe
+
+Run twice: once at the census base `01dfb205`, then again in full on `75ff7198` after
+D-MAPKEYDIAG landed mid-gate. Every figure below is the SECOND run, against the pushed bytes.
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,102,454 B** — and it is master `75ff7198`'s own fixpoint: master's frozen source compiled by it reproduces it byte-for-byte at ONE compile, so the A/B baseline IS master's published compiler |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,102,362 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,102,362 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,556 / 0 / 7** — magnitude AND ignored SET identical to master run on the SAME tree (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`, `diff` rc 0); the 7 is the tell the env var took |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
+| corpus A/B, six channels, **1,695 files** | 0 | **0 rows moved on every field**, graded by SAB-SHIFT (106) and SAB-DROP1 (5), both re-run against these bytes |
+| fuzz A/B, **9,000 programs/side** (seeds 2401-2403 x depths 4/5/6 x plain/declared, `--branching --multiobs`, regenerated with `75ff7198`'s compiler so both legs read byte-identical inputs) | 0 | `vl check` identical (58,394 lines/side) · `vl check --codegen` identical (59,706 lines/side) — **graded: SAB-SHIFT reddens the codegen channel by 94 diff-lines** while the `plain` channel is identical even under it, i.e. the `check` leg is a coverage zero for an emitter change and says so |
+| master's FROZEN source compiled by this head | 0 | `cmp` clean — **and VACUOUS, proved by an inverted control: SAB-SHIFT, which breaks 106 corpus programs, ALSO reproduces it byte-identically** |
+
+**MASTER'S OWN SUITE NUMBER WAS TAKEN ON THIS TREE, NOT QUOTED.** Its first run read
+3,555 / 1 / 7 — the one failure being `vl-test: files run in PARALLEL`, a wall-clock comparison,
+on a run that took 44s against the branch's 12s (cold `.cwasm`). Re-run: **3,556 / 0 / 7**. A
+timing assertion is not a channel, and a red one is worth one re-run before it is worth a word.
+
+**SEED BOOTSTRAP: no split needed.** The gate starts from a freshly fetched published
+`seed-latest` and it compiles this branch's source (`refresh-compiler.sh` rc 0 on the first
+self-compile).
+
+**BYTE DELTA: 1,102,454 -> 1,102,362 = −92 B** (the same −92 the census base produced, which is
+the expected reading for a change that shares no line with #1290). A net shrink: a deleted
+function and a rung that short-circuits before a two-branch name ladder, against one moved block.
+
+### 7. THE EMIT-SIDE FRONTIER AFTER THIS SLICE — per bucket, with what each needs and who owns it
+
+| # | bucket (#1288's filing) | reaches | status here | what it actually needs |
+|---|---|---:|---|---|
+| 1 | `resolveAnnot`'s 7 `emit_rep` callers | 3,057 resolutions / **28,719 calls** | **PARTLY SHIPPED** — 8,757 calls retired (30.5%); 19,962 remain | NOT `renderEmit`. The filing said these need W9 because "the name is post-canon so no tree exists" — true, and irrelevant: four of the seven are one-shot NAME->INDEX bridges whose whole job is to exist, and the fifth held its answer already. See the four rows below. |
+| 1a | `fieldElemTyIxOfName` (the D5 bridge) | 9,805 calls | **FILED** | the largest remaining. The struct's OWN arena type is `sTyIx[si]`; a field's element type is reachable from `T.tys[sTyIx[si]].objFieldTypes[fi]` through the same peel `tyRefArrElemOf` performs. What blocks it is that the recorded NAME is a role (code-15 target / code-16 union name / map value / array element), so the peel differs per field CODE — a per-code table, not a one-liner. Wholly inside `emit_rep`/`emit_collect`; no checker file needed. |
+| 1b | `repElemKeyOfName` | 4,667 calls | **FILED** | two callers: `rlInternName` (a mint-time bridge — leave) and `rlSlotByNameTy`'s rung 2. `rlSlotOfTy(ty)` is the exact arena twin of that rung and already exists; but `sFieldRefSlot` calls `rlSlotOfTy` FIRST, so reaching rung 2 means the arena already declined. **NOT redundant — do not delete it** without a probe showing the name rung answers nothing there. |
+| 1c | `unMemAtomTyIx` · `sTyIxOfName` | 2,083 + 1,060 | **FILED as NOT-ROUTABLE** | these ARE the bridges. Retiring them means the checker recording a member's / a declaration's arena index at registration — a `typecheck.vl` recorder, i.e. the concurrent partition. |
+| 1d | `repRowOfName` · `repNameCanonKey` | 1,669 + 624 | **FILED** | `repRowOfName` is down to 3 live consumers (§5). `structIdxOfElemName`'s is still measured DEAD below its first rung (0 of 1,416 corpus files); `nulBaseStructRow`'s rung 2 answers on exactly 1 file and cannot be deleted; `shapeElemDeclaredStructIdx` is NODE-LESS by construction. The remaining route is a caller that has a node. |
+| 2 | `typecheck.recordClonedNodeTy` | 1,986 | **REFUTED AS A COVERAGE HOLE, ALREADY** | #1274 measured the mono-clone population at **729/729 OK, 0 MISS, 0 VAR** with an inverted control. These 1,986 are the *recorder's* reaches, not misses — `emit_classify.synthTypeRef` calling it on every node it mints is exactly what makes the coverage 100%. There is nothing here to close; the row should be struck from the residue table, not scheduled. |
+| 3 | `inferListElemName`'s `paramTyNames` | 63 | **OWNED ELSEWHERE** | `typecheck.vl`. |
+| 4 | canon's `&`-fold · `unionMemberGenAppShape` | 23 + 21 | **OWNED ELSEWHERE + W9** | `typecheck.vl`, and canon's name-in/name-out contract. |
+| 5 | `checkLetDeclNode`'s map-KEY diagnostic | 4 | **CLOSED by D-MAPKEYDIAG (#1290)**, which landed on master while this slice was in its gate — the section directly above this one. Re-checked on rebase, not assumed. | — |
+| — | **Lsoft — the string-litunion-in-union canon rule** | 29–31 census rows | **OWNER-BLOCKED, UNTOUCHED** | a decision, not a capability. Nothing in this slice reads or writes it. |
+
+**THE HONEST SHAPE OF WHAT IS LEFT ON THIS SIDE.** After this slice, `emit_rep`'s emit-time
+name-resolution traffic is **72% two functions** (`fieldElemTyIxOfName` 9,805 + `repElemKeyOfName`
+4,667 of 19,962), and both are *bridge* sites — the place a name is turned into an index for the
+last time. Retiring a bridge is not the same kind of work as retiring a re-resolver: a
+re-resolver has a banked answer to read (that is this slice), a bridge needs a NEW bank at a new
+producer. The re-resolver population that could be routed with the data already in hand was
+**one function**, and it is taken.
+
+### METHOD NOTES
+
+* **A COUNT AND THE THING IT LICENSES CAN BE IN DIFFERENT UNITS, AND THE MEMO IS WHERE THEY
+  SPLIT.** `3,057` is right, was measured correctly, and is the number of *resolutions*. A
+  routing slice retires *calls*, of which there are 28,719 — 9.4x more — because
+  `resolveAnnotTs`'s name memo absorbs the rest. Neither number is wrong and neither substitutes
+  for the other: quote the one whose unit matches the change. *This is the fifth published count
+  in this programme re-derived into a different unit.*
+* **"THIS NEEDS A BIG DESIGN" IS A CLAIM ABOUT A BUCKET, NOT ABOUT ITS ROWS.** Bucket 1 was
+  filed whole as blocked on `renderEmit`. Bucketed by call site, 30.5% of it needed no design at
+  all — the answer was banked one rung below where it was being recomputed — and 72% of the
+  remainder turns out to need something *different* from `renderEmit` (a new producer, not a
+  renderer). *Split a filed blocker by site before believing its blocker.*
+* **A HEADER THAT CALLS A RUNG "AUTHORITATIVE" IS A PLACE TO CHECK WHETHER IT RUNS FIRST.**
+  `slotCanonKey`'s D1 comment has said the sidecar is authoritative since the sidecar was added.
+  The sidecar was the fourth rung. The comment was aspirational and nothing had contradicted it,
+  because both rungs return the same key — which is exactly why it survived, and exactly why the
+  dual-write had to be run before believing it.
+* **FOUR SABOTAGES, TWO WITNESS SETS, TWO ZEROS — AND THE ZEROS ARE THE INFORMATIVE HALF.**
+  SAB-NOFALL and SAB-NOGATE each move 0 of 1,692 files on all six channels on a change to the
+  same five lines SAB-SHIFT moves 106 with. That profile localizes rung 2's remaining value to
+  rows past the sidecar column's end — a statement the 872/32 reach probe then confirms
+  independently. *A sabotage that reads zero next to one that reads 106 is a measurement of the
+  code, not of the channel.*
+* **THE FROZEN-REBUILD CHANNEL IS VACUOUS HERE AND THE INVERTED CONTROL SAYS SO IN ONE LINE.**
+  Master's frozen source compiled by this head is byte-identical — and byte-identical under
+  SAB-SHIFT too, which breaks 106 corpus programs. `compiler/`'s own struct table never hits an
+  ambiguity `slotCanonKey` decides. *Report it as a no-regression leg, never as evidence.*
