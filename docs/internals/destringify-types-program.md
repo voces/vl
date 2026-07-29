@@ -37626,7 +37626,7 @@ them. But the compact rep it was supposed to unlock buys **zero allocations**, b
 string it would replace is already free: `collectStrPool` interns every distinct literal into an
 immutable global and `emitStr` lowers a pooled literal to one `global.get`, so
 `const x: K | f64 = "aa"` emits `i32.const 2 / global.get 0 / struct.new 0` — **one**
-`struct.new`, the box itself (`alloc/count.sh`: `struct.new=1`, `array.new_fixed=0`). The
+`struct.new`, the box itself (the design doc's §10 reproduces it in two commands). The
 obvious compact encoding (the existing `$vbI32` scalar value box around the atom id) makes it
 **two**. Only `ref.i31` matches one, and the emitter has zero i31 today (`grep -c i31
 compiler/*.vl` sums to 0).
@@ -37638,7 +37638,8 @@ and rides-the-anyref test is a projection of — has **no arm for a literal-unio
 returns `-1`, *not a value atom*. The tree says so beside the workaround, in
 `emit_base.unionHasValueAtom`, which carries a second `nameIsLitUnionType` test with the reason
 written out. **35 of `valueAtomKind`'s 42 call sites have no such compensation within ±6 lines;
-7 do** (`halfset.sh`). `isValueUnionName` (36 sites) is one of the 35, so
+7 do** (the three-`grep` derivation is in the design doc's §10). `isValueUnionName`
+(36 sites) is one of the 35, so
 `isValueUnionName("K|f64")` is false and its banked twin `msIsValueUnion` short-circuits on the
 same `-1`.
 

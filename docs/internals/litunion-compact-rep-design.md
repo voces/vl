@@ -158,6 +158,9 @@ this document's own first grid, which is why the floor fixture spells the two ha
 
 ### 2.2 The four defect families
 
+*They are families, not a partition — a `K | string` cell can belong to F1 and to F3 at
+once, so the counts below deliberately do not sum to 81.*
+
 **F1 — an atom-typed VALUE entering the box (24 cells).** `const k: K = "aa"; const x: K |
 f64 = k` — and the same through a `K`-returning call, and at an argument boundary. 8 cells
 per op × 3 ops (`S02atom_isK`, `S03call_isK`, `S18param_atom`), across all mixed
@@ -183,7 +186,10 @@ string ref; the destination's rep is the i32 atom id, and nothing converts.
 This is the direction the string rep is genuinely bad at: going back requires a chain of
 `__str_eq__` calls against each member constant, where the compact rep is a no-op.
 
-**F3 — TWO members on ONE tag (24 alias cells + 13 inline cells).**
+**F3 — TWO members on ONE tag.** The two colliding spellings' rows are the worst in either
+grid: `K | string` 12 OK / 8 broken and `K | K2` 4 OK / 16 broken on G1, and `K | string`
+**1 OK / 13 broken** on G2 — against 15 OK / 5 broken for every non-colliding alias
+spelling.
 
 - `K | string`: both arms claim kind 2. Six lines reproduce it —
   ```vl
@@ -204,9 +210,10 @@ This is the direction the string rep is genuinely bad at: going back requires a 
   at all**, and `is K` is **const-folded to `i32.const 0`** — a guard that can never fire.
   12 of 20 cells `RUN-WRONG`, one `EMIT-REJ` naming the registration gap directly
   (`emitProgram: union box atom test on a union with no recorded members: string`).
-- The inline spelling of `K | string` is the worst cell in either grid: **1 OK / 13
-  broken**, including `expected struct type at index 0, found (array (mut i32))` at the
-  return and param boundaries.
+- The INLINE spelling of `K | string` collapses hardest of all: `is ("pp"|"qq")` answers
+  false in every position, and the return and param boundaries are invalid wasm
+  (`expected struct type at index 0, found (array (mut i32))` — a raw string array where
+  the box belongs).
 
 **F4 — the inline-only narrowed read (10 cells).** §2.1 above. The un-aliased run diverges
 from its own alias twin at `print(x)` and `x + "!"`.
