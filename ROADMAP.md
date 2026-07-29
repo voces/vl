@@ -899,11 +899,13 @@ in-language GC knobs.
   (17 s) and a per-push `--features embed-seed` cargo build (15 s). SHIPPED: the embed-seed build
   is now the parallel `ci-embed-seed` job, the target-dir restore is gated on the `vl-bin` cache
   missing (97.9% hit rate), and the align spawns are pooled (13.1 s → 4.6 s locally, interleaved
-  min-of-3, same 1,797/0). **MEASURED ON THE RUNNER: `ci-native` 89 s → 42 s (−53%)** — the align
-  step 27 → 19 s (four cores cap what 2.8× local predicted), the 17 s restore skipped, the 15 s
-  embed build gone. REMAINING: `ci-embed-seed` is now the workflow's longest job at 74 s because
-  `build.rs`'s `VL_SEED_KEY` forces a full crate recompile every push (§3 item 8), and a
-  `vl check --batch` mode would take the last ~1,600 spawns to a handful (§3 item 5).
+  min-of-3, same 1,797/0). **MEASURED ON THE RUNNER over two runs: `ci-native` 89 s p50 → 42–50 s**
+  — the align step 27 → 19/20 s (four cores cap what 2.8× local predicted), the 17 s restore
+  skipped, the 15 s embed build gone; workflow wall clock 89 → ~50 s. REMAINING: a
+  `vl check --batch` mode would take the last ~1,600 spawns to a handful (§3 item 5), and
+  `build.rs`'s `VL_SEED_KEY` forces a full crate recompile of the embed job every push (§3 item 8,
+  ~16 s on a job that is not the critical path — the 48 s first reading was runner variance, and
+  §1.5.1 records that correction as the method point it is).
 - ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
   position and emit it.
 - ⬜ **B-chore-liststore-fuse. Re-fuse the three split-form list stores in `emit_rep.vl`**

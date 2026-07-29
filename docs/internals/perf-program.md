@@ -148,35 +148,35 @@ warm):
 
 ### 1.5.1 What the runner actually did
 
-First run on the real 4-core runner (PR #1311, run `30478660499`):
+Two runs on the real 4-core runner (PR #1311, runs `30478660499` and
+`30479027419`):
 
-| job | total | notable steps |
-| --- | ---: | --- |
-| `ci` | 20 s | unchanged |
-| **`ci-native`** | **42 s** | native suites **19 s** (was 27); cargo+target restore **skipped**; embed build gone; refresh+fixpoint 3 s |
-| `ci-embed-seed` | 74 s | restore 16 s + `cargo build --features embed-seed` 48 s |
+| job | run 1 | run 2 | notable steps |
+| --- | ---: | ---: | --- |
+| `ci` | 20 s | 22 s | unchanged |
+| **`ci-native`** | **42 s** | **50 s** | native suites **19 / 20 s** (was 27); cargo+target restore **skipped** both runs; embed build gone |
+| `ci-embed-seed` | 74 s | 43 s | restore 16/17 s + `cargo build --features embed-seed` **48 / 16 s** |
 
-**`ci-native` 89 s p50 → 42 s (−53%)**, and the gate people watch is now under a
-minute again. Two honest qualifications:
+**`ci-native` 89 s p50 → 42–50 s.** The gate that blocks a merge decision is back
+under a minute, and the workflow's WALL CLOCK (the max over the three jobs) is
+89 → ~50 s.
 
-1. **The pooling gave −8 s on CI, not the −15 s the local 2.8× predicted.** 27 →
-   19 s. Four cores cap it, and the `vl run --batch` waves are still serial ahead
-   of the pool. The local number is not a CI number, and this is the difference.
-2. **`ci-embed-seed` (74 s) is now the workflow's longest job**, so the WALL CLOCK
-   for a whole push is 89 → ~74 s (−17%), not 89 → 42. Its `cargo build` measured
-   42.58 s of crate compile against a **13.77 s** reading for the same compile in
-   the master run before the split — same rustc, same exact cargo cache key, so
-   that is runner variance or a difference not yet found, on one observation
-   each. Do not quote 74 s as this job's steady state until it has several
-   samples. What is not in doubt: this cost is no longer inside the gate that
-   blocks a merge decision, and it is now visible as its own line instead of
-   hidden in `ci-native`'s tail.
+**The second sample corrected the first, and the correction is the point.** On run
+1 the embed job's `cargo build` read 42.58 s and I filed `ci-embed-seed` as the
+new critical path with a structural cause attached (`build.rs` emits
+`cargo:rustc-env=VL_SEED_KEY=<hash of the seed>`, so a changed seed invalidates
+the crate fingerprint every push). Run 2 read **16 s** for the same build — in
+line with the 15 s median it had inside `ci-native`, and with the 13.77 s master
+reading I had called "variance or something not yet found". It was variance. The
+`VL_SEED_KEY` recompile is real and does happen every push; it is ~16 s, not
+~48 s, and it does not make this job the critical path. **One observation was
+enough to name a cause and not enough to size it** — which is why item 8 of §3
+demands several samples before anyone acts on it.
 
-If the embed job turns out to be genuinely ~70 s, the follow-up is to stop forcing
-a full crate recompile every push: `build.rs` emits `cargo:rustc-env=VL_SEED_KEY=`
-&lt;hash of the seed&gt;, so a changed seed invalidates the crate's fingerprint on
-every single run. Computing that key at startup instead (the header explains why
-it is baked in — a ~1 MB hash per invocation) would make the embed build a relink.
+**The one qualification that survived both samples: the pooling gave −8 s on CI,
+not the −15 s the local 2.8× predicted** (27 → 19/20 s). Four cores cap it, and
+the `vl run --batch` waves are still serial ahead of the pool. A local number is
+not a CI number.
 
 ### 1.6 Gate
 
@@ -358,7 +358,7 @@ self-compile unless stated.
 | 3 | **`nameNamesFunction`: index the arena once** | 4.71% self — it scans every node in `P.nodes` per call | small: a name set built in one arena pass, invalidated on arena growth | medium — it runs BEFORE `buildFnMap`, and emit-time monomorphization appends nodes; the invalidation is the whole correctness question | deterministic CALL + scan-step counts on two builds over the same input (a ~5% change is countable, and wall clock cannot resolve it); then profile self-% |
 | 4 | **`fnStmtsPosOf`: an index at the writers** | 4.82% self | medium — the function's own header states the honest fix is an index minted by `emit_mono`'s replacement writer, not a memo at the site | medium — a memo that caches the last answer is a silent miscompile the day a lower position holds a memoized node (the header says so) | same as #3; plus the corpus + fuzz A/B, since it is emit-path |
 | 5 | **Native-align: batch the `vl check` legs** the way RUN/TRAP is batched | the pooled version (shipped) took 27 → 19 s on CI; a `vl check` batch mode would take the remaining ~1,600 process spawns to a handful, and the 4-core cap stops applying | medium: a host `check --batch` mode + per-case verdict files | medium — the per-case verdict is the gate; a batch that blurs verdicts weakens it | the interleaved A/B in §1.5, plus the memo-key sabotage |
-| 8 | **`ci-embed-seed` recompiles the whole crate every push** | it is now the workflow's longest job (74 s on its first run); a relink instead of a recompile would take most of that | small: move `VL_SEED_KEY` off `cargo:rustc-env` (`build.rs`) and compute it at startup — but read that header first, it is baked in to avoid hashing ~1 MB per invocation | low, but it trades a CI second for a runtime millisecond and that is the wrong direction if done naively | several samples of the job's `Finished \`release\` profile in Xs` line FIRST — the one reading against master's 13.77 s may be runner variance |
+| 8 | **`ci-embed-seed` recompiles the whole crate every push** — `build.rs` emits `cargo:rustc-env=VL_SEED_KEY=<hash of the seed>`, so a changed seed invalidates the crate fingerprint by construction | ~16 s off a job that is NOT the critical path (43–74 s against `ci-native`'s 42–50 s) — so this is a "when it is free" item, not a lever | small: compute the key at startup instead — but read `build.rs`'s header first, it is baked in to avoid hashing ~1 MB per invocation | low, but it trades a CI second for a runtime millisecond, which is the wrong direction if done naively | several samples of `Finished \`release\` profile in Xs` — two readings were 48 s and 16 s, so ONE sample cannot size this |
 | 6 | **`vl check` allocates more than `vl build`** (649 MB vs 511 MB) while doing less | unquantified; a 138 MB gap in the LSP's own path | investigation first | none (a measurement) | peak RSS per §2.1; then bisect by pass |
 | 7 | **Editor latency**: `vl check` on one compiler file is 231 ms | the LSP path; see §4 | unquantified | — | the §4 table |
 
