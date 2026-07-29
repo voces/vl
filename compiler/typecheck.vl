@@ -18215,6 +18215,48 @@ export function nodeTyMapValIsNulBool(ix: i32) {
   false
 }
 
+// True if node `ix`'s recorded type is a MAP whose VALUE is a plain `boolean` — the MONO i32
+// map with 0/1 values and the `2` NICHE still spare. A BARE read `m[k]` over one types
+// `boolean | null` (a missing key IS null), so its miss arm can and must yield that spare
+// sentinel: the non-nullable-value dual of `nodeTyMapValIsNulBool`, which the miss arm reads
+// beside it. (`{[K]: boolean}` and `{[K]: boolean | null}` differ only in whether a null can
+// be STORED; the read type — and so the read's rep — is the niche either way.)
+export function nodeTyMapValIsBool(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return primNameOf(t.mVal) == "boolean" }
+  false
+}
+
+// The MAP RECEIVER node of a fused map READ — `m[k]` (an Index) and its METHOD spelling
+// `m.get(k)` are the SAME fused get (`emitCoalesce` routes both through `emitMapGetOr`), so
+// every rule that keys a `??` on the RECEIVER's value type must see BOTH spellings or it is
+// taught half a set: the `.get` half then falls through to whatever the generic path does,
+// which for an atom-valued map is the raw i32 id (a silent wrong answer at `print`) and for a
+// non-member default is a LATE emit reject where the index spelling is a clean one.
+//
+// Returns the receiver node index, or -1 when `lhsIx` is not a read shape. Deliberately a
+// pure SHAPE query: the caller still asks the receiver's recorded type for its map-ness
+// (`nodeTyMapValIsLitUnion` / `nodeTyMapValIsNulLitUnion`), so a LIST `xs[i]` / `xs.get(i)`
+// answers exactly as it did before. Parens are NOT peeled here — each caller passes the node
+// its own layer already resolved (the emitter's `unwrapParen`, which lives downstream in
+// `emit_base.vl` and so cannot be called from here).
+export function fusedMapReadRecvIx(lhsIx: i32) {
+  if lhsIx < 0 { return -1 }
+  const l = P.nodes[lhsIx]
+  if l is Index { return l.idxArr }
+  if l is Call {
+    const c = P.nodes[l.callFn]
+    if c is Member {
+      if c.memProp == "get" {
+        if l.callArgs.length == 1 { return c.memObj }
+      }
+    }
+  }
+  -1
+}
+
 // The member literal TEXTS (raw inner lexeme, no quotes) of the VALUE literal union of node
 // `ix`'s recorded map type — the atom-map dual of `nodeLitUnionMemberTexts`. Empty if `ix`
 // is not an atom-valued map. The emitter's `??`-default gate checks the default literal is
@@ -19270,9 +19312,14 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
         // the bare i32 atom id, so a `string`-typed default (or a NON-member literal,
         // which would mint a fresh id) cannot lower: type-valid (`joinTys` widens to
         // `string`) but unbuildable — the emitter-capability channel.
-        const mgl = P.nodes[n.binLeft]
-        if mgl is Index {
-          if nodeTyMapValIsLitUnion(mgl.idxArr) {
+        //
+        // The receiver comes from the ONE fused-read shape home (`fusedMapReadRecvIx`), so
+        // the METHOD spelling `m.get(k) ?? d` — which `emitCoalesce` lowers through the very
+        // same `emitMapGetOr` — is rejected HERE too. It used to fall past this `is Index`
+        // gate and reach the emitter's own copy of the rule as a LATE `emitProgram:` error.
+        const mgRecv = fusedMapReadRecvIx(n.binLeft)
+        if mgRecv >= 0 {
+          if nodeTyMapValIsLitUnion(mgRecv) {
             if !assignable(rt, innerFull) {
               tErrUnsupported(
                 "`??` over an atom-valued map needs a member-literal (or atom) default",
