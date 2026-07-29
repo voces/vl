@@ -168,33 +168,32 @@ argument 1: expected () -> void, got () -> i32
 
 ## Known gaps (v1)
 
-0. **`vl fmt` has no trailing-lambda rule, and it disfigures every test file.**
-   The highest-value follow-up for this surface, found by formatting the
-   fixtures. `vl fmt` explodes a call with a BLOCK-bodied lambda argument into a
-   vertical argument list — STRUCTURALLY, not on width:
+0. **`vl fmt`'s trailing-lambda rule — CLOSED.** The runner PR filed this as its
+   top follow-up: `vl fmt` exploded a call with a BLOCK-bodied lambda argument
+   into a vertical argument list STRUCTURALLY, not on width, so a 34-column
+   `it("adds", () => { … })` became six lines and every table-driven test file
+   was disfigured.
+
+   Shipped as the trailing-lambda exception — when the FINAL argument of a call
+   is a block-bodied lambda, the preceding arguments all fit on one line, and the
+   head line fits `fmtWidth`, the call hugs:
 
    ```
-   it("adds", () => {              it(
-     expect(1 + 1).toEqual(2)        "adds",
-   })                        →       () => {
-                                       expect(1 + 1).toEqual(2)
-                                     },
-                                   )
+   it("adds", () => {
+     expect(1 + 1).toEqual(2)
+   })
    ```
 
-   Measured: a 34-column `it(…)` explodes just as a 100-column one does, and an
-   EXPRESSION-bodied lambda (`xs.map((v) => v + 1)`) is untouched — so the rule
-   that fires is "an argument spans lines ⇒ break every argument", and what is
-   missing is the trailing-lambda exception every JS formatter has. On a corpus
-   of thousands of table-driven cases this is not cosmetic.
+   The three design questions this section deferred (only the last argument? two
+   lambdas? a lambda followed by another argument?) are answered with a ruling
+   and a corpus measurement each in
+   `docs/internals/fmt-trailing-lambda-design.md`; they turned out to be one
+   guard set, not three rules. Blast radius on the gated tree was ZERO.
 
-   Deliberately NOT fixed here: it is a formatter feature with its own design
-   questions (only the last argument? two lambdas? a lambda followed by another
-   argument?), and rushing it inside a runner PR is how a bad formatting rule
-   gets locked in. The fixtures under `tests/fixtures/vl-test*/` are therefore
-   written in the readable form and are NOT `vl fmt`-clean — legal, because
-   `tests/` is outside the fmt gate by construction (`scripts/lint-self.sh`
-   never passes it in) — each with a comment saying so.
+   The fixtures under `tests/fixtures/vl-test*/` are therefore now `vl fmt`-clean
+   AS WRITTEN — the readable form IS the canonical form — and
+   `tests/vl_fmt_test.ts` pins that, so a regression in the rule reddens there
+   rather than silently disfiguring every test file again.
 1. **Void-return covariance on function values.** The wart above. The fix is not
    a relaxed check: the array's element type IS the interned `$fnsig`, so a
    `() => i32` closure in a `(() => void)[]` needs a real coercion at the store,
