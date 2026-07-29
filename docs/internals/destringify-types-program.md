@@ -34758,3 +34758,304 @@ one body, two call-site arguments, and `ast.clearUdTs`'s binary search. Reported
   proves they are vacuous *for this family*, which is the only honest way to carry them.
 
 <!-- APPEND-MARKER-CKFRONTIER-END -->
+
+<!-- APPEND-MARKER-REPELEMTY-BEGIN -->
+## D-REPELEMTY — bucket 1b re-derived: `repElemKeyOfName` is 83% an INTERNER, its filed "two callers" are twenty-seven, and the arena rung that ships is equal by CONSTRUCTION rather than by measurement (off master `7f01b944`)
+
+#1291 filed 1b in one sentence: *"two callers: `rlInternName` (a mint-time bridge — leave) and
+`rlSlotByNameTy`'s rung 2. `rlSlotOfTy(ty)` is the exact arena twin of that rung and already
+exists; but `sFieldRefSlot` calls `rlSlotOfTy` FIRST, so reaching rung 2 means the arena already
+declined."* Both halves of that are measured here, and both move.
+
+### 1. THE POPULATION, BY CALL SITE — 4,675 reaches, 27 live sites, and the filing's "two callers" are 2 lexical / 27 effective
+
+`repElemKeyOfName` has exactly two *lexical* callers, which is what the filing counted. Both are
+fan-in points: `rlInternName` is reached from 14 sites through two layers (`ensureRefElem` is
+itself a bridge with 8 callers) and `rlSlotByNameTy` from 14. The probe is #1293's — a site id
+threaded down the call layers, the ZZRA counter reported by `emitFail` at `emitProgram`'s tail,
+LAST record per directory:
+
+```
+build: scripts/vl-host/target/release/vl build compiler/entry.vl -o C-pop.wasm --compiler <seed>
+run:   vl check --codegen tests/cases --compiler C-pop.wasm   (LAST record; 1,417 emitProgram reaches)
+```
+
+| # | call site | class | RA reaches | share |
+|---|---|---|---:|---:|
+| 1 | `ensureRefElem` ← `collectA`'s `TypeRef` walk (`emit_collect:3465`) | **MINT** · holds the NODE | 1,335 | 28.6% |
+| 2 | `rlInternName` ← `collectA`'s array LITERAL (`emit_collect:3209`) | **MINT** · holds the NODE | 1,218 | 26.1% |
+| 3 | `rlSlotByNameTy` rung 2 ← `sFieldRefSlot` (`wasmEmit:741`) | FIND · **hinted; the arena already declined** | 383 | 8.2% |
+| 4 | `ensureRefElem` ← the STRUCT field table (`emit_collect:3660`) | **MINT** · holds the D5 column | 320 | 6.8% |
+| 5 | `rlSlotByName` ← `refListSlotOfExpr` (`emit_classify:17960`) | FIND · holds an EXPR node | 232 | 5.0% |
+| 6 | `ensureRefElem` ← `forceCloResultListTypes` (`emit_classify:13611`) | MINT · name only | 204 | 4.4% |
+| 7 | `ensureRefElem` ← its OWN k==9 recursion (`emit_classify:10871`) | MINT · derived from the caller's hint | 187 | 4.0% |
+| 8 | `ensureRefElem` ← `mvShapeOfValNameK`'s kind-6 list value (`:3678`) | MINT · name only | 169 | 3.6% |
+| 9 | `ensureRefElem` ← the union-arm ref-array scan (`emit_classify:13763`) | MINT · name only | 157 | 3.4% |
+| 10 | `rlInternName` ← `mvShapeOfValNameK` kind 1 (`:3689`) | MINT · name only | 116 | 2.5% |
+| 11 | `rlInternName` ← `mvShapeOfValNameK` kind 2 (`:3694`) | MINT · name only | 88 | 1.9% |
+| 12 | `rlSlotOfArrName` ← `annRetKind` (`emit_classify:20169`) | FIND · name only | 84 | 1.8% |
+| 13 | `rlSlotByName` ← `variantFieldRefSlot` (`:13313`) | FIND · **the arena already declined** | 72 | 1.5% |
+| 14 | `rlInternName` ← `mvShapeOfValNameK` kind 14 (`:3706`) | MINT · name only | 51 | 1.1% |
+| 15 | `ensureRefElem` ← the VARIANT field table, code 5 (`emit_collect:3611`) | **MINT** · holds the D5 column | 36 | 0.8% |
+| 16 | `rlSlotOfArrName` ← `mvValInnerRlSlot` (`:5717`) | FIND · **the arena already declined** | 6 | 0.1% |
+| 17 | `rlSlotByName` ← `letRefListSlot` (`:18078`) | FIND · name only | 6 | 0.1% |
+| 18–22 | `rlInternName` ← `collectMapFilterUse` ×3 · `collectA`'s reflist expr · `ensureRefElem` ← the VARIANT field table code 28 | MINT | 3 + 2 + 2 + 2 + 2 | 0.2% |
+| — | 10 further FIND sites (`cloRetValSlot`, `mfResultSlotOf` ×4, `emitArr`, `emitOneFuncType`, `annParamKind`, `collectLocals`, `fnAssignRetSlot`, `nulRefArrayInnerSlot`, `rlElemInnerSlot`) | FIND | **0** | — |
+| | **total** | | **4,675** | |
+
+(4,675, not #1291's 4,667: #1292 and #1293 added corpus programs; the six OTHER ZZRA rows move by
+the same drift and are the internal control in §5.)
+
+**THE HEADLINE IS THE CLASS SPLIT: 3,892 of 4,675 (83.3%) are MINT traffic and 783 (16.8%) are
+FIND.** The filed sentence has it exactly backwards in emphasis — the interner it said to *leave*
+is five sixths of the bucket, and the one rung it pointed at as the candidate is a sixth. And
+inside that sixth, only **383** come from `sFieldRefSlot`; the other **400** come from thirteen
+unhinted `rlSlotByName` callers where no arena rung ran at all, so the filing's *"reaching rung 2
+means the arena already declined"* is true of 49% of the rung's traffic and false of the rest.
+
+**TEN FIND SITES REACH ZERO.** They are not dead — they are sites where rung 1, the exact
+stored-name match, always answers (`refListSlotOfExpr` alone: 15,362 of 15,594 entries). Recorded
+so the next census does not re-measure them.
+
+### 2. THE RUNG #1291 SAID NOT TO DELETE WITHOUT A PROBE — the probe, and what it says
+
+At `sFieldRefSlot`, over 1,792 entries: **rung 1 answers 0 times, rung 2 answers 0 times, rung 3
+(`rlSlotOfTyTwin`) answers 7.** The 383 `resolveAnnot` calls rung 2 makes there produce a slot
+zero times.
+
+That is not an accident of the corpus, it is the construction. `sFieldRefSlot` runs
+`rlSlotOfTy(sFieldElemTyIxAt(si, fi))` first — `repElemKey` of the sidecar type, scanned against
+`rlElemKey` — and only a decline reaches `rlSlotByNameTy` with the SAME type as its hint. Rung 2
+computes `repElemKey(resolveAnnot(name))` and scans the same column. Where the two keys agree the
+scan has already been run and lost; the rung can only answer where the name resolves to something
+the sidecar does not name.
+
+So the rung is not deleted — *an unreached rung is not a wrong one* (D-PARENCLASSIFY) and the
+ladder shape is the contract. What it stops doing is **asking**: rung 2 now reads the hint it was
+already handed. 371 of the 383 retire (the remaining 12 are rows the sidecar does not cover, where
+the name path is unchanged and still first).
+
+### 3. WHAT SHIPPED, AND THE THREE ROUTES THAT DID NOT
+
+`emit_rep.repElemKeyOfName` gains its arena twin, in the file's own established idiom
+(`rlSlotByName` / `rlSlotByNameTy`, one layer down):
+
+```
+repElemKeyOfNameTy(name, ty)   ty >= 0 -> repElemKey(ty); else the name ladder, verbatim
+```
+
+`emit_classify` threads it: `rlInternNameTy(name, kind, ty)` and `ensureRefElemTy(elemName, ty)`,
+each a `…Ty` twin whose unhinted form is the old function. Four sites pass a hint:
+
+* **the STRUCT field table** (`emit_collect:3660`) and **the VARIANT field tables**
+  (`:3611`, `:3719`) pass `sFieldElemTyIxRow(sfi)` / `uFieldElemTyIxRow(ufi)` — two new FLAT-index
+  accessors for the D5 sidecars, the form these passes hold (they walk `sFieldTypes` straight
+  through rather than per `(struct, field)` pair);
+* **`rlSlotByNameTy`'s rung 2** uses the hint the function already receives.
+
+**THE EQUIVALENCE IS BY CONSTRUCTION, WHICH IS THE POINT.** Every shipped hint is
+`sFieldElemTyIx` / `uFieldElemTyIx`, and `recordSFieldElemRow`'s body is
+`sFieldElemTyIx.push(fieldElemTyIxOfName(nm))` over the SAME `sFieldElemName` cell the caller
+passes. Both rungs therefore compute `repElemKey` of one arena index. A dual-write confirms rather
+than establishes it:
+
+| routed candidate | entries | arena covered | **D1** arena −1 | **D2** arena + / name − | **D3** both +, DIFFERENT |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| the STRUCT field table (`collect:3660`) | 320 | 320 | 0 | 0 | **0** |
+| the VARIANT field table, code 5 (`collect:3611`) | 36 | 36 | 0 | 0 | **0** |
+| the VARIANT field table, code 28 (`collect:3719`) | 2 | 2 | 0 | 0 | **0** |
+| `rlSlotByNameTy` rung 2 (all 14 callers) | 783 | 371 | 412 | 0 | **0** |
+| — | | | | | |
+| `collectA`'s `TypeRef` walk (`collect:3465`) — **NOT SHIPPED** | 1,335 | 1,328 | 7 | 0 | **59** |
+| `collectA`'s array LITERAL (`collect:3209`) — **NOT SHIPPED** | 1,218 | 1,218 | 0 | **21** | **616** |
+| `ensureRefElem`'s k==9 recursion — **NOT SHIPPED** | 187 | 96 | 91 | 0 | **2** |
+
+`std`: 7 entries, 7 covered, 0 disagreements.
+
+**SPLITTING BY DIRECTION IS AGAIN WHAT MAKES THE TABLE READABLE** (#1293's note, reproduced): a
+single count would read 698 and say "abandon". Split, it says four rows are exact, and the other
+three fail for three unrelated reasons, each worth its own line.
+
+#### 3a. THE NODE-BANK ROUTE IS BLOCKED BY MONOMORPHIZATION, AND THE `@<index>` KEY IS THE TELL
+
+`collect:3465` is the single largest site and it holds a `TypeRef` NODE, so
+`tyRefArrElemOf(nodeTyIxOf(i))` is `refArrElemName`'s exact structural dual — the very expression
+`annRefArrSlot` already ships. It disagrees on 59 of 1,328 covered entries. A *witness histogram*
+(distinct `(name, arenaKey, legacyKey)` triples with counts, aggregated per corpus directory)
+localizes 51 of the 59 to one shape: the arena key contains an `@<arena index>` token —
+`repElemKeyGo`'s final arm, which keys `TyVar` / `TyLit` / `TyErr` by identity so they never
+falsely merge.
+
+```
+14x  nm={a:i32}    A={a:(@32|@33),}  L={a:i32,}
+10x  nm=i32|null   A=@64?            L=i32?
+10x  nm={a:string} A={a:@76,}        L={a:string,}
+10x  nm=i32[]      A=@89[]           L=$rlI32L
+ 7x  nm=i32|null   A=@102?           L=i32?
+```
+
+That is the emitter's monomorphized clone: `nd.tyName` is the SUBSTITUTED spelling and the node's
+banked type is still the generic's. A `repElemKeyPortable` guard — a flag set by that one arm,
+read once, six lines, no duplicated walk — was built and measured: it cuts the 59 to **8** and
+costs 109 agreements. The residual 8 are all in `tests/cases/generics/` and all the same class one
+step further along (`nm=i32|null A=string?`, `nm={a:i32} A={a:i64,}`, `nm=S A=string` — a *concrete*
+type from the WRONG instantiation), so the guard does not close it and was not shipped. **This is
+the C1-endgame's mono-clone `nodeTyIx` item reached from the emitter's side, now carrying a
+measured population: 1,335 reaches wait on it at this one site.**
+
+#### 3b. THE ARRAY LITERAL'S ELEMENT NAME IS NOT ITS ELEMENT TYPE — 637 of 1,218
+
+`rlInternName(arrLitElemName(i), …)` derives its name from the FIRST ELEMENT's node;
+`tyRefArrElemOf(nodeTyIxOf(i))` is the checker's element type for the whole literal. The histogram
+separates three causes, none of them fixable by a peel:
+
+```
+68x nm=Cell    A={n:i32,}    L=S0                             a DECLARED struct, keyed nominally
+58x nm=S       A={v:i32,}    L=S0                             by the name and STRUCTURALLY by the
+52x nm=S       A={n:i32,}    L=S0                             node — `repSlotOfTyDecl` is
+ 6x nm=Cat|Dog A={meow:i32,} L=({meow:i32,}|{bark:i32,})       arena-INDEX identity; and the union
+30x nm=i32[]   A=$rlStrL     L=$rlI32L                         WIDENING that the first element
+ 6x nm=#anon0  A={v:i32,}    L=name:#anon0                     does not carry (D2 row)
+```
+
+The first class is the D-ALIASARR / nominal-vs-inline hazard #1293 met at the map's VALUE,
+reappearing at the array's ELEMENT — and it is *why* it is not a peel problem: `repSlotOfTyDecl`
+keys on `repSlotByDecl[ty]`, the declaration's own arena index, so a structurally equal type minted
+at another index is not that declaration. FILED at the site.
+
+#### 3c. THE k==9 RECURSION — 2 of 94, and 2 is enough
+
+`ensureRefElem`'s nested-list recursion could take `tyRefArrElemOf(ty)` for free once the outer
+call is hinted. It disagrees twice (`nm=S A=i32 L=S0`). At a MINT site a disagreeing hint re-keys
+a row, which is the same silent wrong-slot failure `rlInternNameTy`'s header names; the recursion
+passes -1 and says so in a comment.
+
+### 4. WHY THIS IS ALLOWED AT AN INTERNER AT ALL
+
+#1293's rule — *the arena leg can front a FIND; it must NOT front a MINT* — is about a rung that
+RETURNS where the mint would have run. This is not one: the scan, the mint, the stored spelling and
+every sidecar push are untouched, and a hinted call that finds no row interns exactly the row an
+unhinted one would. What an interner requires INSTEAD is the stronger property that the hint
+compute the *same key* — a disagreeing hint does not skip the mint, it mints under a different
+key, and every later name-keyed lookup then misses the row. That is why §3's D3 column, not its D2
+column, is the fatal one here, and why the shipped hints are the ones that are equal by
+construction. **The general rule, restated: front a FIND with a banked ANSWER; front a MINT only
+with a banked INPUT, and only where the input is provably the one the function would have
+computed.**
+
+### 5. RETIREMENT — same unit, same command, six control rows unmoved
+
+| ZZRA row (`emit_rep` `resolveAnnot` call site) | master `7f01b944` | after | Δ |
+|---|---:|---:|---:|
+| **1 `repElemKeyOfNameTy`** | **4,675** | **3,946** | **−729 (−15.6%)** |
+| 2 `sTyIxOfName` | 1,064 | 1,064 | 0 |
+| 3 `fieldElemTyIxOfName` | 7,770 | 7,770 | 0 |
+| 4 `unMemAtomTyIx` | 2,085 | 2,085 | 0 |
+| 5 `slotCanonKey` | 54 | 54 | 0 |
+| 6 `repNameCanonKey` | 629 | 629 | 0 |
+| 7 `repRowOfName` | 1,669 | 1,669 | 0 |
+| **total** | **17,946** | **17,217** | **−729 (−4.1%)** |
+
+Per routed site: `collect:3660` 320 → 0 · `collect:3611` 36 → 0 · `collect:3719` 2 → 0 ·
+`sFieldRefSlot` 383 → 12. `std`: 7 → 6. 1,417 `emitProgram` reaches on both sides. The six
+unmoved rows are the internal control and they hold to the digit.
+
+### 6. GRADING — every rc taken BARE, never through a pipe
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,103,063 B** — and it IS master `7f01b944`'s own fixpoint: master's frozen source compiled by it reproduces it byte-for-byte at ONE compile, so the A/B baseline is master's published compiler |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,103,310 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,103,310 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); the 7 is the tell the env var took, and `git diff --stat ee380e01 7f01b944 -- tests/` is empty, so master's published 3,564 carries over unchanged |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
+| corpus A/B, six channels, **1,699 files** | 0 | **0 rows moved on every field**, graded by the two sabotages below |
+| fuzz A/B, 3,600 programs/side × 2 legs (seeds 4101/4202/4303 × depths 4/5/6, `plain` and `--branching --multiobs`) | 0 | byte-identical per leg (96 / 91 lines a side, md5 equal) — **and NOT a coverage zero: the inverted control reddens it, see below** |
+| master's FROZEN source compiled by this head | 0 | `cmp` clean — **and VACUOUS, proved by an inverted control: SAB-SHIFT, which breaks 77 corpus programs, ALSO reproduces it byte-identically** |
+
+**THE TWO SABOTAGES, WITH NAMED WITNESS SETS.**
+
+| sabotage | corpus A/B × 6 channels |
+| --- | ---: |
+| **SAB-SHIFT** — `repElemKeyOfNameTy`'s arena rung returns `repElemKey(ty + 1)` | **77 files** — `BUILDRC(0/1)` · `BUILDMSG` · `RUNRC(0/1)` on every one |
+| **SAB-NODE** — the §3a route this slice built and REMOVED (`collect:3465` hinted from `tyRefArrElemOf(nodeTyIxOf(i))`) | **3 files**, exhaustively |
+
+* **SAB-SHIFT (77)**, the first ten: `closures/closure-array-field-literal.vl` ·
+  `closures/closure-array-union-arm-field-call.vl` ·
+  `closures/closure-result-closure-field-nested-struct-twin.vl` ·
+  `closures/closure-result-nullable-scalar-list-field.vl` ·
+  `closures/nested-struct-field-nullable-closure-sig.vl` ·
+  `generics/type-arg-nested-list-field.vl` · `lists/struct-field-pop-statement.vl` ·
+  `structs/nullable-reflist-field.vl` · `unions/variant-reflist-field.vl` ·
+  `unions/variant-twin-nested-reflist-field-struct-twin-elem.vl`. Every one of the 77 carries a
+  ref-list STRUCT or VARIANT field, which is exactly the population the two shipped hints serve —
+  the channel sees this rung, on these lines, at real cells.
+* **SAB-NODE (3), exhaustively**: `generics/type-param-shadows-alias-through-constructors.vl` ·
+  `generics/type-param-shadows-declared-struct.vl` (both `BUILDRC(0/1)` + `RUNRC(0/1)`) ·
+  `types/numlitunion-alias-under-closure-type.vl` (`BUILDMSG` + **BYTES**). The BYTES row is the
+  one worth the line: a program that still builds, from a compiler that keyed one row differently —
+  the silent shape, caught by the field that exists for it.
+* **THE FUZZ CHANNEL IS NOT VACUOUS HERE, WHICH IS UNUSUAL FOR THIS PROGRAMME.** SAB-SHIFT run
+  through the same 3,600-program `--branching --multiobs` stream turns 8 findings into **42 in the
+  first batch alone** (324 TRAP/REJECT lines against the baseline's 55, including two
+  INVALID-WASM). The generated grammar reaches ref-list struct fields densely, so the fuzz zero is
+  coverage.
+
+**SEED BOOTSTRAP: no split needed** — the gate starts from a freshly fetched published
+`seed-latest` and it compiles this branch's source (`refresh-compiler.sh` rc 0 on the first
+self-compile).
+
+**BYTE DELTA: 1,103,063 → 1,103,310 = +247 B.** Two `…Ty` twins, two flat accessors and one extra
+parameter on three call paths, against nothing deleted.
+
+### 7. THE EMIT-SIDE FRONTIER AFTER THIS SLICE
+
+| # | bucket | reaches | status | what it needs |
+|---|---|---:|---|---|
+| 1a | `fieldElemTyIxOfName` | 7,770 | FILED (#1293 §6) | unchanged by this slice |
+| 1b | `repElemKeyOfNameTy` | **4,675 → 3,946** | **PARTLY SHIPPED** — 729 retired (15.6%) | see the three rows below |
+| 1b-i | `collect:3465` (the `TypeRef` walk) · `collect:3209` (the array literal) · the k==9 recursion | 2,740 (69% of the residue) | **BLOCKED, MEASURED** | §3a needs the mono-clone `nodeTyIx` fix (the `@<index>` guard closes 51 of 59 and is not enough); §3b needs `repSlotOfTyDecl` keyed structurally, or the literal's element name taken from the literal's TYPE; §3c is 2 disagreements at a mint |
+| 1b-ii | the ten name-only MINT sites (`forceCloResultListTypes` 204 · kind-6 list value 169 · the union-arm scan 157 · `mvShapeOfValNameK` ×3 = 255 · the rest 11) | 796 | **FILED** | these hold a spelling by construction. `mvShapeOfValNameK`'s three are the near ones: `recordMvValTyIx(valName)` banks the value type nine lines above `rlInternName(valName, 2)`, so the hint exists — but at `mvValTyIx.length - 1`, i.e. it needs the row index threaded, not a lookup |
+| 1b-iii | the FIND residue (`refListSlotOfExpr` 232 · `annRetKind` 84 · `variantFieldRefSlot` 72 · `mvValInnerRlSlot` 6 · `letRefListSlot` 6) | 400 | **FILED** | `refListSlotOfExpr` holds an EXPR node and is the largest — same §3a exposure, unmeasured. `variantFieldRefSlot` and `mvValInnerRlSlot` are `sFieldRefSlot`'s twins (an arena rung declined above them) and route the same way, but through `rlSlotByName`, whose `ty` parameter also DELETES the rendered rung 3 — so they need a key-only hint, not this one |
+| 1c | `unMemAtomTyIx` · `sTyIxOfName` | 2,085 + 1,064 | NOT ROUTABLE HERE | a `typecheck.vl` recorder |
+
+**NOTHING FILED FOR THE CHECKER PARTITION.** No route in this slice needed a `typecheck.vl`
+recorder, and the two that would unblock 1b-i are both emit-side: `repSlotOfTyDecl` keyed by
+`repCanonKey` rather than arena index (a behaviour change to struct-slot identity, not a routing
+move), and the mono-clone `nodeTyIx` population — `emit_mono`'s clone path calling
+`recordClonedNodeTy(clonedNodeIx, substitutedTyIx, kind)` for every `TypeRef` it rewrites, not
+only the pinned ones it does today (`emit_mono:1282`).
+
+**Lsoft IS UNTOUCHED.** No shipped site's behaviour depends on the mixed-union litunion spelling:
+`repElemKeyGo`'s MIX-widening arm runs identically on both legs of every dual-write above, and the
+one witness class that mentions it (`{a:f32,f:K0,z:i64}` at `collect:3209`) is in a route that was
+refuted for the nominal/inline reason, not the litunion one.
+
+### METHOD NOTES
+
+* **"TWO CALLERS" IS A LEXICAL FACT AND A ROUTING LIE.** `repElemKeyOfName` has two call sites and
+  27 effective ones, because both are fan-in points and one of them fans in through a second
+  bridge. The filing that said "two callers, one of them a mint bridge — leave" described 83% of
+  the population in four words and got its class right and its weight backwards. *This is the
+  third consecutive slice where bucketing a filed function BY CALLER changed what the work was.*
+* **THE INTERNER RULE HAS A SECOND HALF, AND IT IS THE ONE THAT BINDS HERE.** #1293 established
+  that an arena leg must not front a MINT. The complement, needed the moment you want to touch an
+  interner at all: an arena leg may supply a mint's INPUT, but only where the input is provably the
+  one the function would have computed — because a disagreeing input does not skip the mint, it
+  mints under a different key, which is the same silent failure one layer down. Both shipped hints
+  here are `fieldElemTyIxOfName` over the caller's own name cell; that is why the dual-write is a
+  confirmation and not the argument.
+* **A WITNESS HISTOGRAM BEATS A FIRST WITNESS WHEN THE QUESTION IS "WHY".** The first-witness form
+  (#1291, #1293) answers *is this real*. Counting DISTINCT `(name, arenaKey, legacyKey)` triples
+  answered *how many causes* — three at `collect:3209`, one-and-a-residue at `collect:3465` — and
+  the `@<index>` prefix that named the dominant one was visible only in the histogram. Cost: one
+  extra probe build, and a cap, because the un-capped version blew the host's diagnostic buffer
+  ("allocation size too large") only on the WHOLE-corpus sweep and not on any single directory —
+  so the per-directory run that isolated it is also the run that produced the data.
+* **A SABOTAGE BUILT FROM THE ROUTE YOU REJECTED IS FREE AND HONEST.** SAB-NODE is §3a's patch as
+  of an hour earlier. It costs nothing to keep, it grades the corpus zero with three real files,
+  and one of them moves on BYTES — the channel that says "the wrong key reached the emitted
+  module". *Keep the patch you had to take back.* (#1293 said this; it is repeated because it paid
+  again, and because the histogram is what told us which patch was worth keeping.)
+<!-- APPEND-MARKER-REPELEMTY-END -->
