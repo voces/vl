@@ -36063,3 +36063,375 @@ owner's reversal moves `K | f64`, these routes move with the name leg they front
   ones you expect to skip; "already covered" and "not routable" look identical from the source.*
 
 <!-- APPEND-MARKER-MVSLOTFIND-END -->
+
+## renderEmit P1's REVERSAL — Lsoft: the OWNER RE-RULED (PRESERVE). Both checker producers unify on the alias, the census's Lsoft class reaches ZERO on B1, B2 AND B3 — and the EMITTER holds a THIRD copy of the soften rule that blocks four corpus cells (off master `839dc9a0`)
+
+Base `839dc9a0` (#1296, the both-SOFTEN unification), **rebased and re-gated on `cf8746f3`**
+(#1297 D-INLINESHAPETY + #1298/#1299, which touch `emit_classify.vl`, `format.vl` and this
+file but no line this slice reads) — **every figure below reproduces on both bases**, and
+the corpus A/B moves the same 10 files with the same 4 red on each. Branch
+`refactor/lsoft-preserve-reversal`. Partition: `compiler/typecheck.vl`, the #1296 fixture
+renamed and re-headed, one CHANGELOG line, this append. **No emitter file is touched, and
+that is the whole finding of this section: the ruling cannot be completed without one.**
+
+### THE RULING (owner, 2026-07-29) — VERBATIM
+
+> I'm reverting the softening. `K | f64` should be preserved as `K | f64` (or flattened to
+> the constituent parts of `K | f64`). Softening to a string is just wrong as I see it.
+
+This is a REVERSAL of the 2026-07-28 ruling #1296 shipped. It was NOT implemented as a
+`git revert`: reverting #1296 restores the canon-softens / renderer-preserves DISAGREEMENT
+(55 rows), which is the defect shape both rulings exist to prevent. Both checker producers
+move to PRESERVE in one slice — `tyToEmitNameGo`'s union arm regains its two legs AND
+`canonEmitNameAt`'s union arm gains their mirror (`mixedUnionLitAliasRegroup`), so the
+ANNOTATION spelling and the RENDER of the same type are the same string.
+
+### ALIAS vs FLATTEN — DECIDED BY MEASUREMENT, BOTH SIDES' NUMBERS
+
+The ruling allows two spellings. Both were BUILT and run against the same six-channel
+corpus A/B (1,700 files, master baseline):
+
+| spelling | `K \| f64` renders | corpus files moved | **rc 0 → 1** | first failure |
+| --- | --- | ---: | ---: | --- |
+| **ALIAS** (shipped here) | `K\|f64` | 10 | **4** | `union box atom test on a union with no recorded members: string\|f64` |
+| **FLATTEN** | `"a"\|"b"\|f64` | 19 | **13** | `union box atom test on a union with no recorded members: "aa"\|"bb"\|f64` — and `only i32, i64, f64, f32, boolean, struct, union, array, or string parameters are supported` |
+
+**FLATTEN is three times worse, and structurally so.** A single quoted literal is not a
+union ATOM in the emitter's grammar: `nameIsLitUnionType("\"a\"")` is false
+(`nameIsInlineLitUnion` requires 2+ quoted atoms) and `valueAtomKind("\"a\"")` is -1, so
+every ladder that classifies a union's members — `unionHasValueAtom`,
+`isVariantBoxUnionAtoms`, `canonLitUnionArms`, the param valtype ladder — reads a flattened
+literal as an unclassifiable "other" member and the box loses its string arm. The ALIAS
+spelling is the one every one of those ladders already has a `nameIsLitUnionType` leg for,
+and it is what this renderer produced for the whole of the project's history before #1296.
+FLATTEN would need `valueAtomKind` to admit a quoted leaf AND the box builder to collapse
+the resulting run of same-tag atoms — a strictly larger change in strictly more files.
+
+**The rep-key fragmentation hazard that motivated FLATTEN does not exist.** `repCanonKey`'s
+union arm (`emit_rep.vl:375-420`) is ARENA-keyed: it walks `t.uMembers`, tests
+`tyIsLitUnion` / `is TyLit` structurally and rewrites the member to `"string"` before any
+key is minted. It never reads a NAME. So `K | f64` and the inline `("a"|"b") | f64` — the
+same arena type — key the same rep row under either spelling, and **the rep key does not
+move with this ruling.** Verified by reading the arm, and confirmed by the corpus: no BYTES
+cell moved for a rep reason (the 6 BYTES cells are all litunion-mix closure/map shapes
+whose *name* changed, not their layout). The NAME layer and the REP layer are already
+separate here, which is exactly the seam the ruling needs and already has.
+
+### THE CENSUS — Lsoft REACHES ZERO ON ALL THREE AXES
+
+#1266's instrument at its #1296 anchor, unchanged.
+
+```
+build:    (probe tree) vl build compiler/entry.vl -o probeM.wasm --compiler build/vl-compiler.wasm
+run:      vl check tests/cases --compiler probeM.wasm > cenM.out     # rc 1, the probe raises
+extract:  bash ck/P5-cen-an.sh cenM
+classify: bash L2/bx.sh cenM <3|4|5> && python3 P5-b2class.py cenM.b<N>
+```
+
+| | `839dc9a0` (#1296, SOFTEN) | **this head (PRESERVE)** |
+| --- | ---: | ---: |
+| annotations canon saw | 10,269 | 10,269 |
+| canon byte-identical / rewritten | 9,891 / 378 | **9,948 / 321** — canon rewrites 57 FEWER |
+| **B1** `tyToEmitName ∘ nameToTy` | 1,933 — 0 / 1,911 / 22 | **1,933 — 0 / 1,913 / 20** |
+| **B2** `tyToNominalName ∘ nameToTy` | 96 — 60 / 12 / 24 | **39 — 3 / 12 / 24** |
+| **B3** `tyToNominalName ∘ nodeTyIxOf` | 193 — 60 / 97 / 36 | **136 — 3 / 97 / 36** |
+
+Class tables (the `?:other`/T/G/M/U rows are untouched in every one, so only the moving
+classes are shown):
+
+| axis | class | before | after |
+| --- | --- | ---: | ---: |
+| B1 | canon-only residue | 0 | **0** (unchanged — #1296 already emptied it, from the other side) |
+| **B2** | **Lsoft** | **57 / 0 / 0 (25 files)** | **0 — the class is GONE** |
+| B2 | TOTAL | 96 (46 files) | **39 (21 files)** |
+| **B3** | **Lsoft** | **57 / 0 / 2 (27 files)** | **2 — the 2 BOTH rows only** |
+| B3 | TOTAL | 193 (88 files) | **136 (63 files)** |
+
+**THIS IS THE OUTCOME #1296'S BLOCKED HALF WAS REACHING FOR, TO THE ROW.** #1296 measured
+that softening `tyToNominalNameGo` would take B2 96 → 39 and B3 193 → 136 — and had to
+revert it, because softening the nominal renderer deleted the duplicate variant row that
+`IsExpr.isVariant`'s raw spelling had been matching (seed 1000003 d6 case_00039). Moving
+the OTHER TWO producers to preserve reaches the identical pair of numbers and **cannot hit
+that defect at all**: the surviving row is the `K0` spelling, which is the one the `is` test
+names. The nominal renderer is not touched by this slice.
+
+**EVERY RECORD THAT MOVED IS NAMED.** A per-record diff of the two 10,269-row TSVs reads
+**60 records**, all `string` → `K`/`K0`/`K1` inside a union — the exact 60 #1296 moved, in
+the opposite direction. They move on **canon's column (57) and B1's (60)** and on **ZERO
+records of B2's or B3's columns**: the nominal renderer already preserved every one of
+them, which is why B2/B3's disagreement counts fall without a single B2/B3 cell changing
+value. The 3-record gap between 57 and 60 is the class shift `BOTH` → `REND-ONLY` on B1
+(22 → 20, and `?:other` 1,625/2 → 1,627/0).
+
+### THE FOUR-CONFIG CONTROL MATRIX
+
+Four builds, one axis each. `SS` = master. `PP` = this head. `SP`/`PS` are single-sided
+(the other producer's half of the reversal disabled in a scratchpad tree).
+
+The seed runs are
+
+```
+SEED_WASM=<build> scripts/fuzz-vl.sh --seed <s> --count 200 --depth <d> --quiet \
+  --baseline scripts/rep-fuzz-baseline.txt
+```
+
+at the nine cited (seed, depth) pairs — 658239060/5, 78530533/5, 556796311/6,
+142958508/{4,5,6}, 679748579/5, 210853359/6, 113148886/6.
+
+| config | canon | `tyToEmitNameGo` | corpus vs `PP` | the SEVEN cited seeds (9 runs × 200) |
+| --- | --- | --- | ---: | --- |
+| **SS** master | soften | soften | 10 files, 4 rc **0→1** | clean (0 unsound) |
+| **PP** this head | **preserve** | **preserve** | — | **clean, log BYTE-IDENTICAL to master's** |
+| **SP** (= pre-#1296) | soften | preserve | 10 files, 4 rc **1→0** | clean |
+| **PS** (= #1296's CTRL) | preserve | soften | **0 on all six** | clean |
+
+**THE FALSIFIABILITY IS ONE-SIDED, AND IT IS REPORTED AS ONE-SIDED.** CANON's half is
+falsifiable and falsified: `SP` (canon reverted) moves 10 corpus files and flips the four
+red cells back to green, and sabotaging canon's regrouped alias moves 16 files (below). The
+STRUCTURAL RENDERER's half is **not falsifiable on any instrument this slice has**: `PS`
+reads 0 on all six corpus channels, and poisoning the renderer's regroup (`SAB2`) reads 0
+on all six channels AND 0 unsound lines across all nine seed runs. So the renderer's two
+restored legs are carried on the CONTRACT — the two producers must spell one type one way —
+and not on a measured cell, exactly as #1296 carried its `tyEmitNameIsString` dual-write.
+*Under the soften ruling the inert half was canon's; under the preserve ruling it is the
+renderer's. The pair of slices says the corpus only ever reads ONE of the two producers at
+these annotations, and it is the annotation side.*
+
+### THE COERCION-SITE CENSUS, RE-DERIVED UNDER THE PRESERVED SPELLING
+
+#1296's 13 sites, re-asked in the OTHER direction. **The conclusion inverts on exactly one
+row, and that row is the whole blocker.**
+
+| # | site | file:line | keyed on | under `string` (#1296) | **under `K0` (this ruling)** |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `emitUnionCoerce`'s atom ladder | `wasmEmit.vl:2827` | **ARENA/EXPR** | value-classified | **unchanged — the name is not an input** |
+| 2 | `unionHasValueAtom` | `emit_base.vl:2103` | NAME | `valueAtomKind("string")==2` | `nameIsLitUnionType("K0")` → true, the leg one line BELOW. Same answer |
+| 3 | `isVariantBoxUnionAtoms` | `emit_base.vl:2325` | NAME | first disjunct | second disjunct of the same `else if`. Same branch |
+| 4 | `isArmTagOfTy` | `wasmEmit.vl:1784` | **ARENA** | tag from the arena | **unchanged** |
+| 5 | `markValueUnionAtoms` | `emit_classify.vl:13569`/`13571` | ARENA + NAME | `aUsed = true` | same flag through the NAME leg |
+| 6 | `narrowedValueAtomOf` | `emit_classify.vl:16253+` | NAME | returns `"string"` one line earlier | `nameIsLitUnionType(v)` → `"string"`. Byte-identical answer |
+| 7 | **`canonLitUnionArms`** | **`emit_classify.vl:3529-3545`** | **NAME** | IDEMPOTENT — "the ruling, already written on the emitter's side" | **THE BLOCKER. It REWRITES `K0` → `string` and the union ROW is registered under the preserved annotation, so the query is a string no row holds** |
+| 8 | `registerValueUnionName` / `collectU` | `emit_classify.vl:13555`, `emit_collect.vl:4536` | NAME | mints the row as `string\|f64` | mints it as `K0\|f64` — which is site 7's other half: **registration and query stop agreeing** |
+| 9 | `synthRetAnnots`'s PIN | `emit_rewrite.vl:451-452` | NAME | `isValueUnionName` | `nameIsLitUnionArmValueUnion`, the arm two lines up — same `synthTypeRef` |
+| 10 | `nulCloMixedUnionUnregistered` | `emit_collect.vl:5961`, `5970` | NAME | `valueAtomKind >= 0` | the `\|\| nameIsLitUnionType(a)` disjunct on the same line. Same side of the mix |
+| 11 | **`repCanonKey`** | **`emit_rep.vl:375-420`** | **ARENA** | `(string\|f64)` | **`(string\|f64)` — IDENTICAL. Re-read, not carried: the arm walks `uMembers` and tests `tyIsLitUnion`/`is TyLit`; no name reaches it. THE REP KEY DOES NOT MOVE WITH THE NAME** |
+| 12 | `unionParamPinName` | `emit_rewrite.vl:664-677` | ARENA | outside the rule | untouched |
+| 13 | the four `nodeTyIsLitUnionAlias` exclusions | `wasmEmit.vl:9315`, `9439`, `11728`, `11362` | ARENA | outside the rule | untouched |
+
+**RE-DERIVING RATHER THAN CARRYING IS WHAT FOUND THE BLOCKER.** #1296's table scored site 7
+as the strongest *support* for softening — "the emitter had already written this exact rule
+on the name side". Read in the preserve direction the same sentence is the objection: the
+emitter has a THIRD producer of this vocabulary, it implements SOFTEN, and it is downstream
+of both of the two this slice moved. Six sites are arena-keyed and safe by construction in
+BOTH directions; six of the seven name-keyed ones map `K0` and `string` onto the same
+downstream branch in BOTH directions. Only sites 7+8 are direction-sensitive, and they are
+the pair.
+
+### THE BREAKAGE — NAMED, MINIMISED, AND NOT SHIPPED AROUND
+
+**Four corpus cells go rc 0 → 1** (`vl build`; `vl check` is unmoved on all 1,700 files):
+
+* `tests/cases/closures/paren-classify-homes.vl` — `union box atom test on a union with no recorded members: string|i32`
+* `tests/cases/lists/union-element-array-litunion.vl` — `… string|i32|null`
+* `tests/cases/maps/litunion-i32-array-value-closure-factory.vl` — `… string|i32`
+* `tests/cases/maps/litunion-struct-field-array-value-closure-factory.vl` — a DIFFERENT
+  message from the same cause, `unsupported map value type (only i32 / boolean / string /
+  struct values)`: here the preserved name reaches the map-value classifier instead of the
+  union-row lookup
+
+Minimised to four lines — this is the whole defect:
+
+```
+type K = "a" | "b"
+function mk(): (K | f64)[] { return ["a", 2.5] }
+function go() { const xs = mk(); const v = xs[0]; if v is K { print(v) } }
+go()
+// master: rc 0, prints `a`
+// this head: emitProgram: union box atom test on a union with no recorded members: string|f64
+```
+
+**The producer of `string|f64` is `emit_classify.canonLitUnionArms`, proved by deleting the
+bystander:** a scratchpad build whose `canonLitUnionArms` returns its argument unchanged
+compiles this program at rc 0 under this head's checker. The path is
+`rlInternName` → `rlElemStoredName` → `rlCanonLitUnionAtoms` → `canonLitUnionArms`, and
+`rlElemStoredName`'s own header states the rule it is applying: *"the stored name must be
+the emit-canonical spelling, so a litunion-alias atom is softened to its boxed `string` …
+else the `is`-emit reads the raw `K0` and mis-selects the union-variant path."*
+
+**A POSITION GATE WAS BUILT TWICE AND IS REFUTED TWICE.** Softening only where the emitter
+re-widens would have made the checker half separable. It does not exist:
+
+| gate | corpus files | rc 0 → 1 | why it fails |
+| --- | ---: | ---: | --- |
+| `RC_ELEM` | 8 | **1** | the emitter's normalizer DESCENDS (`X[]` → element, `{[K]:V}` → value, `{f:T}` → field), so a FIELD under an element still forks — `maps/litunion-struct-field-array-value-closure-factory.vl` (`{[string]: {f: K0 \| f64}[]}`) |
+| `RC_ELEM \| RC_FIELD \| RC_MAP_VAL` (the normalizer's whole reach) | 10 | **2** | fixes that one, breaks TWO OTHERS — `types/declared-vs-inline-mixed-union-field-twin.vl`, `unions/struct-field-array-of-struct-union.vl` |
+
+The second failure is the general law and it is worth stating on its own: **the union
+REGISTRY is keyed by NAME and is blind to POSITION.** A rule that spells one arena type
+`K0|{w:i32}` at the root and `string|{w:i32}` as a field mints TWO rows for ONE type — the
+same fragmentation both rulings exist to prevent, re-introduced by the gate meant to avoid
+it. So the mixed-union spelling must be position-INDEPENDENT, and the only two
+position-independent rules are "soften everywhere" (master) and "preserve everywhere"
+(this head). There is no third.
+
+**THE FUZZ A/B FOUND A FIFTH INSTANCE OF THE SAME SHAPE AND NOTHING ELSE.** 10 seeds × 3
+depths × 200 cases = 6,000 per side, master vs this head: **0 unsound-class lines on both**,
+and the two logs differ on exactly one generated type — `{[string]: {[string]: {f: K0 |
+i64}[]}}` at seed 60466176 depth 6, which goes from compiling to a **clean REJECT** (2 log
+lines, the `p1r`/`p1c` legs of one case; REJECT 8 → 10 in that run). It is the map-value →
+array-element → struct-field composition of
+`maps/litunion-struct-field-array-value-closure-factory.vl`, i.e. the same `rlCanonLitUnionAtoms`
+descent. *The blocker's entire fuzz footprint in 6,000 cases is one shape and it is a clean
+compiler error, not a wrong answer.*
+
+**PRESERVE IS GREEN AT EVERY OTHER POSITION**, swept directly (`K | f64` at each, built and
+run under both compilers): `RC_ROOT`, a struct FIELD, a function RESULT, a function PARAM,
+under `| null`, as a member of an outer union, and as a 2-D element (`(K|f64)[][]`, whose
+inner element is reached through a LIST element rather than a union one) — **7 of 8
+positions identical to master, only the DIRECT ref-list union element moves.**
+
+### THE EMITTER HALF, FILED WITH ITS EXACT DIFF
+
+It is `compiler/emit_classify.vl`, which this slice's partition forbids and which a
+concurrent agent is editing. **The unification is SPLIT and this branch is the checker half
+only; it is NOT green and is not proposed for merge as it stands.**
+
+The first move is the deletion of the softening leg in `canonLitUnionArms`:
+
+```diff
+     let a = atoms[i]
+-    if nameIsLitUnionType(a) {
+-      a = "string"
+-      changed = true
+-    } else if a != "null" {
++    if nameIsLitUnionType(a) {
++      // preserved (owner ruling 2026-07-29) — the annotation side no longer softens,
++      // so re-widening here makes the query miss the row this name registered.
++    } else if a != "null" {
+       const ra = rlCanonLitUnionAtoms(a)
+```
+
+**MEASURED, NOT PROPOSED: that diff is necessary and NOT sufficient.** Built on top of this
+head it takes the corpus from 10 moved / 4 red to **7 moved / 1 red**, and the survivor gets
+WORSE IN KIND — `lists/union-element-array-litunion.vl` stops being a clean reject and
+becomes **silently invalid wasm**:
+
+```
+type K = "a" | "b"
+function go() {
+  const v: (K | i32 | null)[] | {w: i32} = ["a", 5]
+  const t0 = v
+  if t0 is (K | i32 | null)[] { const u0 = t0[0]; if u0 != null { if u0 is K { print(u0) } } }
+}
+go()
+// this head + the diff above:
+//   wrote x.wasm (815 bytes) … type mismatch: expected (ref null $type), found i32 (at offset 0x139)
+```
+
+So the emitter half is `canonLitUnionArms` **plus** the name-consumers `rlElemStoredName`'s
+header enumerates — the `is`-narrowing emit's litunion classifier and the union-variant
+lookup — learning the preserved spelling. That is its own slice with its own evidence, and
+the fixture `literal-unions/mixed-union-alias-member-preserves.vl` plus the four red cells
+above are its acceptance set.
+
+### THE SIX-CHANNEL CORPUS A/B, AND THE TWO SABOTAGES
+
+`WT=… A=base-master.wasm B=cand.wasm bash ck/abcorpus3.sh` over `tests/cases std scripts`
+(1,700 files × 6 fields: CHECKRC, CHECKMSG, BUILDRC, BUILDMSG, BYTES, RUN):
+
+| A/B | files moved |
+| --- | --- |
+| master → **this head** | **10** — CHECKRC 0, CHECKMSG 0, BUILDRC(0/1) ×4, BUILDMSG ×4, BYTES ×6, RUNRC(0/1) ×4 |
+| this head → **SAB1** (canon's regrouped alias suffixed `ZZ`) | **16** — BUILDRC ×11, BUILDMSG ×16, BYTES ×2, RUNRC ×12 |
+| this head → **SAB2** (the RENDERER's regrouped alias suffixed `ZZ`) | **0 on all six** — and 0 unsound lines on all nine seed runs |
+| this head → **SP** (canon's half reverted) | **10** — 4 rc 1→0, 6 BYTES |
+| this head → **PS** (the renderer's half reverted) | **0 on all six** |
+
+**EVERY MOVED CELL, ENUMERATED.** The 4 rc 0→1 are named above. The 6 BYTES cells — same
+program, same rc, different module bytes, all litunion-mix closure/map shapes whose emitted
+NAME changed: `closures/cloarray-litunion-mix-result` · `closures/litunion-mix-closure-result`
+· `closures/named-fn-union-arm-litunion-mix-result` · `closures/nulclosure-mixed-union-result`
+· `closures/union-arm-litunion-mix-result` ·
+`maps/closure-result-array-of-mixed-union-value-maps`.
+
+SAB1's 16 witnesses, the proof canon's new regroup is live on exactly this code:
+`closures/map-nul-litunion-mix-field-result` ·
+`closures/named-fn-union-arm-litunion-mix-result` ·
+`closures/nested-closure-field-litunion-box-result` ·
+`closures/nulclosure-litunion-arm-list-result` · `closures/paren-classify-homes` ·
+`lists/list-literal-assign-union-elem` · `lists/reflist-inline-shape-union-elem` ·
+`lists/union-element-array-litunion` ·
+**`literal-unions/mixed-union-alias-member-preserves`** ·
+`maps/closure-result-array-of-mixed-union-value-maps` ·
+`maps/litunion-i32-array-value-closure-factory` ·
+`maps/litunion-struct-field-value-closure-factory` ·
+`types/declared-vs-inline-mixed-union-field-twin` · `unions/litunion-member-narrow-read` ·
+`unions/litunion-value-union-is` · `unions/struct-field-array-of-struct-union`.
+
+**SAB2 IS A ZERO AND IT IS REPORTED AS ONE — ON TWO CHANNELS, NOT ONE.** The renderer's
+restored legs change 60 census records and no measured behaviour: 0 corpus cells on six
+channels, 0 unsound lines across all nine cited-seed runs (200 generated programs each,
+both the raw and canon legs). They are the
+contract half of the unification (both producers spell one type one way) and they are
+carried as that, not as a measured cell.
+
+### THE GATE
+
+| gate | result |
+| --- | --- |
+| `rm -f build/vl-compiler.wasm && bash scripts/fetch-seed.sh` | seed **1,103,140 B** (`seed-latest` at `cf8746f3`); **the published seed compiles this branch's source** (no PR A/B split needed) |
+| `bash scripts/refresh-compiler.sh --prove-fixpoint` | rc 0 — fixpoint at 2 compiles, **1,106,033 B** |
+| `bash scripts/native-fixpoint.sh` | rc 0 — stage3 == stage4 byte-for-byte |
+| `bash scripts/lint-self.sh` | rc 0 — self-lint + fmt-check clean |
+| `bash scripts/rep-fuzz-check.sh` | rc 0 — exact ✅ (1 baselined, 0 unsound, 1 reject, 0 new, 0 stale) |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **3,562 passed / 8 failed / 7 ignored** (3,558/8/7 pre-rebase; ignored SET identical). **The 8 are the 4 blocked cells × 2 tiers** (`cases_wasm_test` + `selfhost_native_align_test`) and NOTHING else, so no test moved for any other reason |
+| six-channel corpus A/B | 1,700 files — **10 moved, 4 of them rc 0 → 1** |
+| the seven cited seeds, 9 runs × 200 cases | master and this head **byte-identical**, 0 INVALID-WASM / 0 TRAP / 0 MISMATCH on both |
+| fuzz A/B, 10 seeds × 3 depths × 200 cases = **6,000 per side** | **0 unsound-class lines on BOTH sides**, and the logs differ by exactly ONE shape — see below |
+
+**Byte delta: 1,103,140 → 1,106,033 = +2,893 B** — the SAME +2,893 either side of the
+rebase (+151 lines of CODE, −4; the rest of the 382-line diff is rationale).
+
+### OPEN
+
+* **The emitter half** — `emit_classify.canonLitUnionArms` and the name-consumers behind
+  `rlElemStoredName`. Diff, measured insufficiency and the invalid-wasm survivor above.
+  **Until it lands, the ruling is implemented in the checker and blocked at the ref-list
+  element.**
+* **The THIRD checker producer** — `variantBoxUnionRetName` / `vbUnionMemberName`
+  (`typecheck.vl`) and `valueUnionRetName` mint this vocabulary for an inferred lambda
+  return and have always PRESERVED the alias. #1296 filed them as "not obviously safe" to
+  soften; under this ruling they are already in agreement and the filing is discharged.
+* **`K | string` is `vl check`-clean invalid wasm**, unchanged on master and here alike
+  (#1296's filing stands).
+* **B2's remaining canon-only residue** is 3 rows and Lsoft is none of them: 2 class X
+  (`AB|null`) and 1 class T (`L|i32`), both pre-existing and both filed in #1271/#1296.
+
+### METHOD NOTES
+
+* **RE-DERIVE THE CENSUS IN THE NEW DIRECTION; A SITE'S SAFETY IS NOT A PROPERTY OF THE
+  SITE.** Site 7 of the 13-site coercion census was #1296's strongest evidence FOR softening
+  ("the emitter already writes this rule") and is the sole blocker AGAINST preserving. The
+  table did not change; the direction did. *Six of the thirteen were direction-free (arena),
+  six mapped both spellings to one branch, and the one that flipped was the one whose
+  header sounded most reassuring.*
+* **A POSITION-DEPENDENT SPELLING IS A SECOND ROW.** The gate built to make the checker half
+  separable — soften exactly where the emitter re-widens — fixed one corpus cell and broke
+  two, because the union registry is keyed by name and blind to position. *Any rule of the
+  form "spell it X here and Y there" mints two rows for one type in a name-keyed registry;
+  the fragmentation you are avoiding is the fragmentation you create.*
+* **THE INERT HALF SWAPS WITH THE RULING.** #1296 moved the renderer and its canon column was
+  byte-identical; this slice moves both and only canon's half is observable — `PS` and `SAB2`
+  each read 0 on all six corpus channels and 0 unsound lines on all nine cited-seed runs. *The corpus reads the
+  ANNOTATION, not the render, at these positions. Two slices, opposite directions, same
+  conclusion — and neither could have been stated without running the single-sided control.*
+* **THE SEEDS PIN THE DISAGREEMENT, WHICH IS WHY THEY ARE CLEAN IN BOTH DIRECTIONS.** The
+  seven seeds cited in `tyToEmitNameGo`'s arms are byte-identical on master (SOFTEN) and on
+  this head (PRESERVE), and clean on both single-sided controls too. They were never
+  evidence for a spelling. *A regression seed proves a fork existed; it cannot vote on which
+  side of the fork to unify to.*
+* **`vl check` SAW NOTHING.** All four red cells are CHECKRC `same` / CHECKMSG `same` and
+  move only on BUILDRC/BUILDMSG/RUN. The six-channel harness is the only reason the breakage
+  has a name instead of a byte count.
+
+<!-- APPEND-MARKER-LSOFT-REVERSAL-END -->
