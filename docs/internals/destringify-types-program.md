@@ -38719,3 +38719,253 @@ on the canon path.
   in-file control was moved out, and the third had to give up two positions because an array
   literal's own registration would have put the duplicated row back. *The rule that makes a probe
   valid makes a test file valid: one claim per module, and check what else the module registers.*
+
+## THE TWIN-ROW RESIDUE RE-DERIVED BY PRODUCER — the filed "array literal" is not one, the gate that let the duplicate back in was BACKWARDS, and the `is` spelling turns out to have a THIRD reader (off master `187869b7`)
+
+**#1309 FILED THE NEXT TARGET AS "AN ARRAY LITERAL OF INFERRED-UNION ELEMENTS REGISTERS A SECOND
+STRUCTURAL ROW". THE ARRAY LITERAL IS A BYSTANDER.** Its own reproduction contains
+`const xs: (Cat | Dog)[] = [pick(true), pick(false)]`, and a site-attribution probe says the
+registration comes from the `iru` loop, not from the literal — the `(Cat | Dog)[]` ANNOTATION is
+the active ingredient. Delete the array and keep the annotation and the duplicate is still there:
+
+```
+type Cat = { meow: i32 }
+type Dog = { woof: i32 }
+function pick(c: boolean) { if c { return { meow: 500 } }  return { woof: 600 } }
+function f() { const w: Cat | Dog = pick(true)  if w is Cat { print(w.meow) } }
+   master:  {Cat|Dog}=(0:Cat,1:Dog)  {{meow:i32}|{woof:i32}}=(2,3)     ← no array anywhere
+   head:    {Cat|Dog}=(0:Cat,1:Dog)
+```
+
+### 1. THE PRODUCER, ASKED DIRECTLY (ZZSITE)
+
+`U/mkirr.py` asked the inferred-return table; this asks the REGISTRATION FUNNEL. A module-level
+tag is set at each of the seven walk ROOTS in `collectU` / `collectInlineUnionsIn`, and
+`registerInlineUnion` logs `(tag, name)` past its own `isUName` no-op gate (`V/mksite.py`). Ten
+variants of #1309's reproduction, one run:
+
+| program | ZZSITE |
+| --- | --- |
+| `const xs: (Cat\|Dog)[] = [pick(true), pick(false)]` (the filed repro) | `letWalk→Cat\|Dog` · **`iruWalk→{meow:i32}\|{woof:i32}`** |
+| `const w: Cat \| Dog = pick(true)` — **no array at all** | `letWalk→Cat\|Dog` · **`iruWalk→{meow:i32}\|{woof:i32}`** |
+| `const xs: (Cat\|Dog)[] = []` + `xs.push(pick(true))` — **an EMPTY literal** | `letWalk→Cat\|Dog` · **`iruWalk→…`** |
+| `function sink(xs: (Cat\|Dog)[])` + `sink([pick(true)])` | `paramWalk→Cat\|Dog` · **`iruWalk→…`** |
+| `const xs = [pick(true), pick(false)]` — the array, **no annotation** | `iruName→Cat\|Dog` — **ONE row** |
+| `const xs: (Cat\|Dog)[] = []` + `xs.push({meow:1})` — **no inferred return** | `letWalk→Cat\|Dog` — ONE row |
+
+The duplicate needs an inferred struct-union return AND any annotation that spells its NOMINAL
+composite. The array literal supplies neither; it was in the repro because that is where the
+annotation was written.
+
+### 2. THE GATE WAS BACKWARDS, AND ITS OWN COMMENT SAYS WHY
+
+`inferRetArenaUnionIsDup` disqualified itself on `isUName(nm)`, glossed as *"a nominal name the
+fallback would not register anyway"*. That conflates **the fallback declines** with **there would
+be no row**. `isUName(nm)` TRUE means the nominal composite ALREADY HAS ITS ROW — put there by an
+annotation, a `UnionDecl`, or an earlier inferred-return row — which is the strongest possible
+reason to suppress the walk's second, STRUCTURAL spelling. One line comes out. The remaining four
+gates are unchanged and each is still a case where the two names are not two spellings of one
+union.
+
+*A gate written as "the other producer will not fire" has to say which STATE it is asserting.
+Here the state was the opposite of the one the author had in mind, and the predicate had been
+carrying the negation for a release.*
+
+### 3. THE TWIN POPULATION AT THIS BASE, ATTRIBUTED BY PRODUCER RATHER THAN BY NAME
+
+`bash V/cgrun.sh twinM twincasesM tests/cases && python3 V/twinfiles.py … two` reproduces #1309's
+number exactly — **15 TWO-spelling over 11 files, 83 SAME** — and ZZSITE + ZZLTN then say who made
+each row. **#1309's bucketing is right in its counts and wrong in one attribution**: its
+"6 SOURCE-spells-it-twice" is really 1, and 5 of the 6 are the ARENA WALK faithfully reproducing a
+spelling the source wrote twice — the same conclusion, reached at the producer.
+
+| producer | rows | files | verdict |
+| --- | ---: | --- | --- |
+| **SOURCE spells one layout twice** — the file writes the inline shape AND the named chain, deliberately, because it is testing both paths | **6** | `generics/union-member-generic-application-mixed` (1: `UShape` has an inline `{t:i32}` member, `UAlias` a nominal `Tag`), `unions/nullable-collection-of-variant-box-arm-field-union` (2), `unions/variant-nullable-list-field` (3) | **TERMINAL BY DESIGN.** Both spellings are the author's, and both are the subject of the test. A dedup would delete a test's own second half. |
+| **UCOLL — two DECLARED structs of one layout inside ONE union** (`registerCollapsedUnionName`) | **3** | `soundness/union-same-shape-discriminant-sound`, `types/struct-union-same-shape`, `types/struct-union-same-shape-field-slot` | **TERMINAL BY DESIGN, and this one is not even a duplicate REGISTRATION** — the second row IS the union's second member. `uVarTwin` has already folded the LAYOUT (they share a heap type); what the row carries is the TAG that makes `x is Dog` mean something, and the first file in the list is the soundness pin for exactly that. |
+| **UCOLL-in-kind — two DECLARED unions whose arms are layout twins** | **4** | `unions/variant-twin-{heap,map-elem-list-field,nested-reflist-field-struct-twin-elem,reflist-field-struct-twin-elem}` (`type Cat` / `type Kot`, `U = Cat\|Dog`, `V = Kot\|Bird`) | **TERMINAL BY DESIGN.** `unVarStart`/`unVarCount` slice `uVariants` per union, so the rows are per-union SLICE entries, not global dedup candidates; sharing one would break the slice contiguity every union-keyed reader depends on. |
+| **UEXP — the nullable SPELLING of a union alias** | **2** | `types/nullable-union-alias` (`type AB = A\|B`; `const u: AB \| null`) | **TERMINAL FOR THIS SLICE, and the cause is not the walk.** See §4 — it is a canon vocabulary question, in the region the owner has ruled on twice. |
+
+### 4. THE UEXP ROWS ARE CANON'S, NOT THE WALK'S — measured, and the file's own header is stale
+
+`V/mkltn.py` (**ZZLTN**) dumps, at every annotation site, the SOURCE spelling the name walk uses
+(`tyNameOf`) beside the arena walk's raw render (`tyToNominalName`) and its canon'd registration
+key (`reachRegisterName`). On `types/nullable-union-alias.vl`:
+
+```
+LET  src={t:i32,a:i32}|{t:i32,b:i32}|null   nom=AB|null   reg={t:i32,a:i32}|{t:i32,b:i32}|null
+```
+
+**The arena renderer is the one that gets it RIGHT** (`AB|null`); `canonEmitName` is what expands
+it, and it expands it STRUCTURALLY rather than to the members — because `unionAliasMembers` renders
+through `tyToEmitName`, the structural sibling. The two producers agree (`src == reg`), so this is
+not a fork; it is one vocabulary choice, made once, that spells a declared alias's members as
+shapes. **The file's own header claims the other thing** — *"`canonEmitName` now FLATTENS a
+union-alias member of an outer union, so `AB | null` canonicalizes to the same `A|B|null` the
+inline form produces"* — and has been stale since `tyToEmitName` became the renderer under it.
+
+Rendering those members nominally would turn 2 TWO-spelling rows into 2 SAME-spelling rows (the
+`variantIndexOf` hazard is the TWO class), not into zero: `AB` and `AB|null` are two union NAMES
+with two variant slices either way, which is the same shape as most of the 83 SAME rows. It is a
+`canonEmitName` union-arm change in the region of two successive owner rulings (Lsoft, then its
+PRESERVE reversal), so it is **filed with its producer named, not taken here**.
+
+### 5. WHAT SHIPS, AND THE TWO-HALF TRAP FIRED TWICE
+
+**(a) `inferRetArenaUnionIsDup` loses the `isUName(nm)` gate** (`emit_collect.vl`).
+
+**(b) `monoStaticIsResult` gains the `is`-spelling rule — THE THIRD GATE** (`wasmEmit.vl`). #1309
+established that the tested spelling has TWO readers that must resolve it against the rows the
+emitter actually has (`emitIs`'s ladder, `pushNarrowIs`). It has a third, and the dedup exposed it:
+`monoStaticIsResult`'s opening EXCLUSION — *"a declared VARIANT name keeps the loud union-only
+failure below"* — asked the RAW string. With the duplicate structural row gone, `a is {meow: i32}`
+stopped naming a row, the arm claimed it as a monomorphized static guard and **CONST-FOLDED IT TO
+FALSE**, after which nothing stopped an already-invalid module from being written.
+
+**(c) AND THE THIRD GATE HAD TO BE SCOPED BY THE RECEIVER, which a second grid decided.**
+`isVariantSpelling` answers about the tested TYPE, not about the receiver, so applying it
+unconditionally also stopped folding `v is {meow: i32}` in a `g<T>` instance where `T` is `i32` —
+**12 of 60 monomorphized-guard cells that master decided correctly turned into a reject**. The gate
+is scoped by `nodeTyIsUnion(receiver)` — the CHECKER's view, deliberately not the emitter's
+`exprUnion`, because `exprUnion` is the REP classification and the rep classification is exactly
+what has the gap here.
+
+| grid | cells | master → head |
+| --- | ---: | --- |
+| `is`-spelling × REGISTRATION-SOURCE × READ-POSITION (`V/isgrid.py`) | 96 | **2 UP** (silent INVALID WASM → clean emit reject), 0 down, 94 identical |
+| the same grid with the inferred return DELETED (`--ctl`) | 96 | **0 of 96** — the control's members differ and none of them move |
+| monomorphized `is`-guard × union-provenance × arg kind (`V/monogrid.py`) | 60 | **0 of 60**; the unscoped build is **12 DOWN**, which is why the scope exists |
+
+### 6. THE ROW THAT MERGES, READ OFF THE MODULE
+
+`functions/inferred-union-one-row.vl` gets back the LIST and FIELD positions #1309 had to omit
+(its `(Cat | Dog)[]` and `{ v: Cat | Dog }` annotations are exactly the registrations the deleted
+gate turned into a second row):
+
+| reading | master | head |
+| --- | --- | --- |
+| `unNames` | `{Cat\|Dog}=(0:Cat,1:Dog)` **`{{meow:i32}\|{woof:i32}}=(2,3)`** | `{Cat\|Dog}=(0:Cat,1:Dog)` |
+| module | 787 B, 278 WAT lines | 787 B, 278 WAT lines |
+| the WAT diff | — | **every changed constant is `Dog`'s variant TAG, `2` → `1`, at all three of its uses; no heap type appears or disappears and the size is identical** |
+| corpus TWO-spelling twins **with this file's positions restored** | **17** | **15** |
+
+That last row is the slice stated as one number: the positions cost two twin rows on master and
+zero here.
+
+### 7. THE PRE-EXISTING DEFECT THE GRID WALKED INTO, FILED WITH ITS ROOT CAUSE
+
+The 2 cells that go UP are in a position that **does not compile on master either** — it writes an
+invalid module with no diagnostic. `V/lst.py`, 10 shapes × 2 compilers:
+
+| shape | master | head |
+| --- | --- | --- |
+| `const xs = [pick(true)]` (inferred return element) | **INVALID WASM** | INVALID WASM |
+| `const w = pick(true)`; `const xs = [w]` | **INVALID WASM** | INVALID WASM |
+| `const w: Cat \| Dog = pick(true)`; `const xs = [w]` | **INVALID WASM** | INVALID WASM |
+| `const w: U = { meow: 1 }`; `const xs = [w]` — **a plainly DECLARED union, no inference at all** | **INVALID WASM** | INVALID WASM |
+| `const xs: (Cat \| Dog)[] = [pick(true)]` (the annotated control) | OK | OK |
+
+**ROOT CAUSE, one function: `arrLitIsRef` classifies an array literal by the SYNTAX of its FIRST
+ELEMENT** — an `ObjLit`, a lambda, a nested literal, or a checker-recorded element name containing
+`=>`. A CALL and an IDENT are none of those, so a union-element literal falls through to the i32
+list and the box stored into it is `expected i32, found (ref $type)`. The checker's own
+`nodeArrayElemName` has arms for prim / obj / func / nullable-closure elements and **no `TyUnion`
+arm**, so there is no signal for the emitter to read even if the classifier asked. That is the
+shape of the fix (a `TyUnion` arm on the query, then `arrLitIsRef` / `arrLitElemKind` /
+`arrLitElemName` reading it) and it is a capability slice, not a twin-row one. **FILED.**
+
+`unions/error-inline-shape-is-over-inferred-list-element.vl` pins the DIAGNOSTIC half now, and it
+is the corpus's one witness that BUILDMSG is not an optional channel: master and head both exit
+`vl build` rc **1**, both run rc nonzero with empty stdout, and the module BYTES cannot be compared
+because master's does not validate — **the improvement is visible on exactly one of the six
+channels.**
+
+### 8. SABOTAGES — three, and the green one is green on the channel it has
+
+| sabotage | edit | suite | witness |
+| --- | --- | ---: | --- |
+| **S-THIRDOFF** | `monoStaticIsResult` loses the third gate entirely | 3,592 / **2** | `unions/error-inline-shape-is-over-inferred-list-element.vl` ×2 — the emit reject becomes an invalid module |
+| **S-UNSCOPED** | the third gate keeps `isVariantSpelling` but loses `nodeTyIsUnion` | 3,592 / **2** | `generics/mono-static-is-inline-shape-beside-union.vl` ×2 — ``is` receiver is not a union value` on a program master decides correctly |
+| **S-GATEBACK** | `isUName(nm)` returns to `inferRetArenaUnionIsDup` | **3,593 / 1 (flake)** | **none — by design.** Verified LIVE on the byte channel: `inferred-union-one-row.vl`'s `Dog` tag goes back to `2` at all three uses, and its `unNames` back to two rows. |
+
+S-THIRDOFF and S-UNSCOPED are the two halves of one rule, each reddening the file the other leaves
+green — the gate and its scope stated as two experiments. S-GATEBACK's single failure is
+`check: an adversarial --exclude glob completes`, a 34-second timing test under load, not its
+witness; its thesis is the `uVariants` ROW COUNT and the tag bands, which no test in the suite
+reads, so it is verified on the channel that does.
+
+### 9. CORPUS AND FUZZ
+
+`WT=… A=basem B=head OUT=FINAL bash V/abcorpus3.sh`, six channels, `-o` path normalized:
+
+| channel | 1,712 files |
+| --- | --- |
+| CHECKRC · CHECKMSG · BUILDRC · RUN | **1,712 same** |
+| BUILDMSG | 1,711 same · **1** (`error-inline-shape-is-over-inferred-list-element.vl` — invalid module → named reject) |
+| BYTES | 1,711 same · **1** (`inferred-union-one-row.vl` — size-identical, tags renumbered) |
+
+**No cell down, and the only two that move are the branch's own fixtures.** Against master's own
+1,710 files the run is 0 diffs on all six channels — the change is invisible to the corpus, which
+is why the grids and the fixtures carry it. Fuzz A/B, 10 seeds × 3 depths × 200 cases = 6,000 per
+side, logs **BYTE-IDENTICAL**, 0 unsound-class lines either side, and vacuous for the same reason
+#1308 measured: `scripts/fuzzgen.vl` emits no inferred struct-union return.
+
+**THE CENSUS DOES NOT MOVE, BY CONSTRUCTION.** B1 / B2 / B3 measure canon against the two
+renderers; the two emitter changes are a registration gate and an `is`-lowering gate, and the
+checker addition is a second CALLER of an existing query (`nodeTyIsUnion`), not a new render.
+
+### 10. GATE
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && bash scripts/fetch-seed.sh` | 0 | 1,111,831 B published seed |
+| `bash scripts/refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint in 2 compiles — **the published seed compiles this branch's source, no A/B split** |
+| `bash scripts/native-fixpoint.sh` | 0 | stage3 == stage4 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,594 passed / 0 failed / 7 ignored** (master 3,590/0/7; +4 = 2 new fixtures × {cases, native-align}; ignored SET identical) |
+| `bash scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `bash scripts/rep-fuzz-check.sh` | 0 | exact ✅, 1 baselined reject, 0 new / 0 stale |
+
+**BYTE DELTA: 1,111,831 → 1,111,882 = +51 B.**
+
+### 11. INSTRUMENTS (scratchpad `V/`, session a43e2b0f)
+
+`V/{env,mktree,mkwtree,buildtree,cgrun,undiff,un1,rr,b2,tw,watd,bytes,ab,abcorpus3,fzab,fmt,gtest,mksabtree}.sh` ·
+`V/{mktwin,twinfiles,mkun,mkirr,mksite,mkltn,mkis,mkis2,mksab,isgrid,monogrid,lst}.py`
+
+* **ZZSITE** (`V/mksite.py`) — the probe that refuted the filing. Tags every registration walk ROOT
+  and logs `(root, name)` at the funnel, so "who registered this row" is one run instead of a
+  bisect over fifteen call sites.
+* **ZZLTN** (`V/mkltn.py`) — the source spelling, the raw nominal render and the canon'd
+  registration key at every annotation site, side by side. It is what proved the UEXP rows are
+  canon's rather than the walk's, and that the arena renderer is the one that gets them right.
+* **ZZIS2** (`V/mkis2.py`) — every gate `emitIs`'s arms consult, dumped at the top of the function.
+  It named `monoStaticIsResult` in one run; the first probe (`V/mkis.py`, at the variant ladder)
+  printed NOTHING on the failing side, which is itself the finding — an arm ABOVE it had claimed
+  the test.
+* **`V/isgrid.py` / `V/monogrid.py`** — the two grids. Running the second is the point: the first
+  reads 2-up-0-down on a build that the second reads 12 DOWN.
+
+### 12. LESSONS
+
+* **A FILED REPRODUCTION NAMES A PROGRAM, NOT A PRODUCER.** "An array literal of inferred-union
+  elements registers a second structural row" was written from a program that has an array literal
+  in it. The literal is inert; the annotation beside it is the cause, and the smallest witness has
+  no array at all. *Before inheriting a filing's mechanism, minimise its reproduction — the
+  variable you remove last is the one it was about.*
+* **A GATE THAT ASSERTS ANOTHER PRODUCER'S BEHAVIOUR MUST NAME THE STATE IT IS ASSERTING.**
+  `isUName(nm)` was read as "the fallback will not register this" when it means "this is already
+  registered" — the exact opposite of the condition the dedup wanted, and it shipped as a
+  disqualifier for a release. The two readings differ only in TENSE.
+* **THE SECOND GRID IS NOT A FORMALITY.** The `is`-spelling grid graded the shipped rule 2 up / 0
+  down. The monomorphized-guard grid graded the SAME rule 12 down, because the rule answers about
+  the tested type and that grid varies the RECEIVER. *A guard's blast radius is measured on the
+  axis the guard does not mention.*
+* **A REJECT CAN BE A BYSTANDER'S REJECT.** Master's clean error in six grid cells was an `is` line
+  refusing a module that was already going to be invalid; the same program with the `is` deleted is
+  invalid wasm on master. Reporting "the fix costs 6 cells" without deleting the bystander would
+  have been true of the cell and false about the change.
+* **THE RESIDUE OF A CORRECT CLASSIFICATION IS STILL WORTH RE-ASKING AT THE PRODUCER.** #1309
+  learned this once (its own "17 rows" was 11); the same move applied to what it left behind moves
+  5 of its 6 "source spells it twice" rows into a different mechanism and turns one of them into a
+  named, stale doc claim about `unionAliasMembers`. *Every attribution has a producer that can be
+  asked; the ones reached by exclusion are the ones to ask about.*
