@@ -36824,3 +36824,400 @@ the four legs are poison-pinned by this one file.
   free evidence that both measurements were sound.*
 
 <!-- APPEND-MARKER-LSOFT-REVERSAL-COMPLETE-END -->
+
+<!-- APPEND-MARKER-POSTPRESERVE-BEGIN -->
+## POST-PRESERVE P1 — the B2/B3 frontier re-derived at the completed ruling: B2 turns out to be a SUBSET of B3, the G class is ZERO, and the largest ACTIONABLE row in the residue was ONE GROUPING PAREN that cost two heap types and a silent invalid module (off master `c7301d3a`)
+
+Base `c7301d3a` (#1302). Partition: `compiler/typecheck.vl`, one existing fixture grown,
+one CHANGELOG line, this append. No emitter file, no import, no new module.
+
+Three arcs were left in states that predate #1300/#1301's PRESERVE ruling. This slice
+re-derives all three before anything is briefed on them, and ships the one the
+re-derivation says is actionable. **Two of the three published headings are refuted by
+their own instrument, and the third — the `is`-spelling seam — is RETIRED with the
+measurement that retires it.**
+
+### 1. THE CENSUS, RE-DERIVED AT THIS BASE — the producing command first
+
+#1266's instrument at its #1296 anchor, unchanged. The probe tree carries the BRANCH's
+`tests/cases`, so both sides compare record for record.
+
+```
+tree:     git archive HEAD | tar -x            (+ the seed as build/vl-compiler.wasm)
+patch:    python3 L1/mkprobe.py <tree>/compiler/typecheck.vl
+build:    vl build compiler/entry.vl -o probe{M,C}.wasm --compiler build/vl-compiler.wasm
+run:      vl check tests/cases --compiler probe{M,C}.wasm > cen{Q,C}.out   # rc 1, the probe raises
+extract:  bash ck/P5-cen-an.sh cen{Q,C}
+classify: bash L3/bx.sh cen{Q,C} <3|4|5> && python3 P5-b2class.py cen{Q,C}.b<N>
+```
+
+| | `3ae713e4` (#1301, published) | **`c7301d3a` (this base)** | **this head** |
+| --- | ---: | ---: | ---: |
+| annotations canon saw | 10,269 | **10,280** | 10,280 |
+| canon byte-identical / rewritten | 9,948 / 321 | **9,959 / 321** | **9,959 / 321** |
+| **B1** `tyToEmitName ∘ nameToTy` | 1,933 — 0 / 1,913 / 20 | **1,933 — 0 / 1,913 / 20** | **1,929 — 0 / 1,913 / 16** |
+| **B2** `tyToNominalName ∘ nameToTy` | 136 → **39** — 3 / 12 / 24 | **39 — 3 / 12 / 24** | **35 — 3 / 12 / 20** |
+| **B3** `tyToNominalName ∘ nodeTyIxOf` | 193 → **136** — 3 / 97 / 36 | **136 — 3 / 97 / 36** | **132 — 3 / 97 / 32** |
+
+**#1301'S THREE FIGURES REPRODUCE TO THE COLUMN ON A CORPUS THAT GREW BY 11 RECORDS.**
+The 11 are #1301/#1302's own fixtures; not one of them lands in a disagreeing row.
+
+### 2. B2 IS A SUBSET OF B3, EXACTLY — and B3's extra 97 are TWO families, neither of them a producer disagreement
+
+The published tables report B2 and B3 as two axes with similar class breakdowns. Joined
+**per record** (`Q/join.py`, the same predicate `bx.sh` uses on each axis) they are not two
+populations at all:
+
+```
+records: 10280
+  B2:ag   B3:ag    9748       B2-only disagreements:  0
+  B2:na   B3:na     340       BOTH-axes            :  39  (21 files)
+  B2:na   B3:dis     80       B3-only              :  97  (51 files)
+  B2:ag   B3:na      56
+  B2:dis  B3:dis     39
+  B2:ag   B3:dis     17
+```
+
+**`B2-only` is ZERO.** Every B2 disagreement is a B3 disagreement, so B3 = B2's 39 + 97, and
+the 97 split by whether `nameToTy` could resolve the annotation at all:
+
+| family | rows | files | what it is |
+| --- | ---: | ---: | --- |
+| **PARAM-INST** (`B2:na B3:dis`) | **80** | 49 | the annotation is a generic type PARAMETER. `nameToTy("T")` answers `@UNRES` — there is no such type — while `nodeTyIxOf` hands back the CLONE's concrete instantiation (`i32`, `string`, `Pair<i32,string>`). Canon reads the generic BODY's text; the arena holds the monomorphized node. **49 of the 49 files are `tests/cases/generics/*`.** Not a disagreement between two producers: it is two different questions |
+| **SHADOW** (`B2:ag B3:dis`) | **17** | **3** | the name resolves and canon and the NAME round-trip AGREE (`Z` → `i32`); the NODE disagrees (`string`). The three files are `generics/type-param-shadows-{alias-through-constructors, declared-struct, transparent-alias}.vl` — the corpus names the family itself |
+
+*#1301 recorded B3's 2 residual `Lsoft`-classified rows as "the generic type-param SHADOW
+family, filed elsewhere". They are 2 of these 17, and the 17 are 3 files. The whole
+SHADOW population on B3's axis is now stated with its denominator.*
+
+### 3. B2's 39, BY RULE — and the published `Lin-alias`/`Lin-soft` split is a CLASSIFIER ARTIFACT
+
+`P5-b2class.py` decides `Lin-alias` vs `Lin-soft` by *"does the nominal render contain any
+identifier that is not a primitive"*. **A FIELD NAME satisfies that**, so `{v:"a,b"|"zz"|null,w:i32}`
+→ `{v:string|null,w:i32}` — a pure soften — scores `Lin-alias`. Four of the eight
+`Lin-alias` rows are softens wearing a field name, and two more softens hide inside `G`
+(their `pre` carries a `<`). Re-bucketed by the RULE that produced the disagreement, with
+every row accounted for:
+
+| rule | rows | files | direction | ROUTE |
+| --- | ---: | ---: | --- | --- |
+| **TRANSP** — canon resolves a declared alias transparently, the nominal renderer keeps a NAME (`MyCat` → canon `{meow:i32}` / nominal `Cat`; `Y` → canon `{v:i32}` / nominal `Box<i32>`) | **19** | 11 | 18 BOTH, 1 CANON-ONLY | **BLOCKED** — W9's `renderEmit(ty, ctx)` (the render SITE carrying the source's own spelling) **plus** the #1122 transparency ruling. #1294 §7 refuted the `cPlainAliasNames` hand-off: that predicate is what gives `Y` and `Box<i32>` ONE arena index, so it is the cause of the shared index, not a cure |
+| **LINSOFT** — canon PRESERVES a PURE inline literal union in a keep position (`ctxKeepsLitUnion`); BOTH renderers soften it to `string` | **7** | 5 | 6 REND-ONLY, 1 BOTH | **ACTIONABLE, NOT TAKEN** — needs the renderers' union arm to spell an UN-ALIASED litunion from its `TyLit` members. `litUnionAliasNameOfTy` only answers when a declared alias exists, which is why these seven survive. Filed with its file list below |
+| **LINALIAS** — canon SOFTENS an inline litunion the renderers regroup into the declared alias (`(("a"\|"b")\|null)[]` → canon `(string\|null)[]` / nominal `(K\|null)[]`) | **4** | **1** | BOTH | **SHIPPED HERE** — §5 |
+| **UCOLL** — same-shape union members collapse under a nominal render (`A\|B` → `A`) | **4** | 3 | REND-ONLY | **TERMINAL BY DESIGN.** VL is structurally typed and `types/struct-union-same-shape.vl` says *"a `B` value genuinely IS an `A`"*. P5's ruling, unchanged |
+| **UEXP** — canon expands a union ALIAS into its members (`AB\|null` → `{t:i32,a:i32}\|{t:i32,b:i32}\|null`) | **2** | 1 | CANON-ONLY | **FILED** (#1271/#1296), unmoved |
+| **ISECT** — an intersection one side folds and the other leaves verbatim | **2** | 1 | 1 REND-ONLY, 1 BOTH | **FILED**, canon's `&`-fold policy (#1294 §2's home) |
+| **TRANSP-INV** — `L\|i32` → canon `{n:i32}[]\|i32` / nominal `L\|i32` | **1** | 1 | CANON-ONLY | **TERMINAL** — P6 measured the nominal route regressing; unconvertible on this axis |
+| | **39** | 21 | 3 / 12 / 24 | |
+
+### 4. THE G CLASS IS ZERO — #1274's SIDECAR CLOSED IT, AND THE DIRECTION INVERTED
+
+The brief carried G as *"the generic application the arena cannot spell — 114 at
+`8c22fa06`, took a cut at #1274, what is it now?"*. **It is zero, and the classifier's
+surviving `G` bucket (3 rows) is not it.**
+
+G was defined by P5 as: *the nominal renderer has no nominal route to `Box<i32>`, so it
+expands the instantiated shape; canon keeps the head.* Searching the 39 rows for that
+shape — canon naming an application, the render expanding it — finds **0 rows**.
+`genAppNameOfTy` (#1274's nominal record for the application) answers, and every one of
+those 114 now agrees.
+
+What the classifier still scores `G` is three rows whose `pre` merely CONTAINS a `<`, and
+each is a different rule seen through an application:
+
+| row | canon | nominal | actually |
+| --- | --- | --- | --- |
+| `Inner<MyS>` | `Inner<{n:i32}>` | `Inner<Sx>` | **TRANSP** in an ARGUMENT |
+| `Box<"a,b"\|"zz"\|null>` | verbatim | `Box<string\|null>` | **LINSOFT** in an ARGUMENT |
+| `P<"a<b"\|"zz"\|null,i32>` | verbatim | `P<string\|null,i32>` | **LINSOFT** in an ARGUMENT |
+
+**AND THE DIRECTION HAS FLIPPED, WHICH IS THE PART A COUNT CANNOT SAY.** The nine rows
+`?:other` + `M:len+other` hold (`Y`/`BoxI`/`Alias` → `Box<i32>`, `P` → `Pair<i32,string>`)
+are the same *pair of spellings* P5's G class held — but with canon on the EXPANDING side
+and the renderer on the NAMING side. They are #1294 §7's "9 alias-of-application rows", and
+they are TRANSP: an alias whose body is an application, resolved transparently by canon.
+*A class defined by "which producer cannot spell it" does not survive the capability
+landing; the rows persist and change sides.*
+
+### 5. THE `is`-SPELLING SEAM (#1296) — RETIRED, WITH THE MEASUREMENT THAT RETIRES IT
+
+#1296 filed: *master registers BOTH spellings of `{f:K0|i64}` as variant rows, and
+`variantIndexOf(nd.isVariant)` — an exact string compare of the RAW source spelling —
+matches the twin; delete the twin and the `is` matches nothing.* The witness is fuzz seed
+1000003 depth 6 case_00039.
+
+**PROBE ZZVARIANTS** (`L1/mkvprobe.py`, anchored at `emit_sections.emitProgram`'s
+`const rc = emitModule(stmts)`): dump the flattened `uVariants` table.
+
+| | `ab1ccc7a` (#1296's base, published) | **`c7301d3a`, this base** |
+| --- | --- | --- |
+| `uVariants` for case_00039 | `2 :: [0]{f:K0\|i64} [1]{f:string\|i64}` | **`1 :: [0]{f:K0\|i64}`** |
+| the program | rc 0, prints `OTHER` | **rc 0, prints `OTHER`** |
+
+**THE DUPLICATE ROW IS GONE AND THE SURVIVOR IS THE PRESERVED SPELLING — the one the `is`
+test names.** #1300 predicted exactly this from the other side (*"the surviving row is the
+`K0` spelling, which is the one the `is` test names"*); this is that prediction measured
+rather than argued. The filed blocker cannot recur from this direction: under the preserve
+ruling canon and the nominal renderer already spell this shape identically, so there is no
+second row for a de-duplication to delete. **The filing is retired.**
+
+**WHAT IS NOT RETIRED IS STATED SEPARATELY, WITH ITS OWN NUMBER.** `IsExpr.isVariant` is
+still a RAW source spelling compared by exact string, and duplicate variant rows still
+exist. **PROBE ZZTWIN** reports every row the compiler's OWN duplicate test flags
+(`buildVariantTwins`: `uVarTwin[i] != i`, i.e. `repNameCanonKey`-equal AND
+`variantFieldLayoutEq`), over `vl check --codegen tests/cases`:
+
+| duplicate-row entries | count | programs |
+| --- | ---: | ---: |
+| SAME spelling (two unions in one module each holding `{w:i32}`) — by design, the flattened list is per-union-slice | 82 | 49 |
+| **TWO spellings — ONE layout registered under TWO names** | **26** | **16** |
+
+The 26 pairs read `Cat` ← `Kot`, `{meow:i32}` ← `Cat`, `A` ← `B`, `W` ← `{w:i32}`,
+`{t:i32,a:i32}` ← `A`, … — **they are the census's TRANSP and UCOLL classes, materialised
+in the emitter.** `uVariants.length` is the base of all three tag bands
+(`scalarTagOfKind`, `refArrSlotTag`, `mapSlotTag`), so each of those 26 is the same cost
+#1301 measured and removed for the litunion alias, still being paid. *The census's two
+"cosmetic" classes are not cosmetic; they are 26 rows and a tag band. That is a new number
+and it belongs to the TRANSP route, not to the `is` filing.*
+
+### 6. WHAT SHIPS — `nulLitUnionPreserve` LEARNS THE RUNG ITS SIBLING CLASSIFIER ALREADY HAS
+
+The LINALIAS class is four rows in one file, and the corpus holds the contrast that names
+the defect **on two adjacent lines of one fixture**:
+
+```
+("a"|"b")[]|null        canon  K[]|null           PRESERVED, and aliased
+(("a"|"b")|null)[]      canon  (string|null)[]    SOFTENED
+```
+
+The same literal union, one grouping paren apart, and **both renderers spell the second
+`(K|null)[]`**. The cause is nine lines down from the split:
+
+```vl
+  if nameIsLitUnionType(core) { … return core + "|null" }
+  ""            // ← everything else falls out here
+```
+
+`nameIsLitUnionType`'s inline leg (`nameIsInlineLitUnion`) opens with an O(1) reject that
+requires the name to BEGIN with a quote. A top-level `|` split of the ELEMENT
+`("a"|"b")|null` hands out the part `("a"|"b")` **with its grouper still on**, so the test
+declines by construction and canon falls through to the generic soften.
+
+**THE MISSING RUNG WAS ALREADY IN THE FILE, 130 LINES DOWN, WRITTEN BY THE SAME RULING.**
+`litRunPartTexts` — the 2026-07-29 preserve's own member classifier — states it:
+
+```vl
+  // A GROUPER is not a member: `("a"|"b")` contributes exactly what its interior does.
+  if nameIsParenSpanEnds(p) && !isTopLevelFuncTypeName(p) { return litRunPartTexts(groupInnerOf(p), out) }
+```
+
+So `nulLitUnionPreserve` gains that rung, with the identical two-conjunct guard, and hands
+the interior to the NON-NULL sibling `litUnionPreserve` rather than re-testing it — so the
+declared-ALIAS preference (`litUnionAliasOfLitTexts`) keeps exactly one home:
+
+```vl
+  if nameIsParenSpanEnds(core) && !isTopLevelFuncTypeName(core) {
+    const iparts: string[] = []
+    tyTopLevelSplit(groupInnerOf(core), '|', false, iparts)
+    const lup = litUnionPreserve(iparts)
+    if lup != "" { nluAtoms = lupAtoms + 1; return lup + "|null" }
+  }
+```
+
+**9 lines of code** (+35 in the file, 26 of them the rationale above).
+
+**THE GUARD IS EXACT ON THIS OPERAND, AND THAT IS AN ARGUMENT THE SIBLING ALREADY MADE.**
+`nameIsParenSpanEnds` is the WEAK test (leading `(`, trailing `)`) and would admit
+`(a)|(b)` in general — but the operand here is reconstructed from TOP-LEVEL split parts,
+none of which can carry a top-level `|` of its own, which is the same construction
+`litRunPartTexts` relies on one rung below (*"a top-level `|` split never hands out a part
+that still has one"*).
+
+### 7. THE CENSUS DELTA — 4 RECORDS, ONE SHAPE, ONE COLUMN
+
+`L3/tsvdiff.py` over the two 10,280-row TSVs:
+
+```
+records: 10280   records with ANY column moved: 4
+  canon  moved on 4 records      B1 0      B2 0      B3 0
+distinct (pre, before, after, columns) shapes: 1
+    4  pre=(("a"|"b")|null)[]     canon: (string|null)[] -> (K|null)[]
+files touched: 1
+```
+
+**Canon's own rewrite COUNT does not move (321 either side) — it rewrites the same records,
+differently.** B1/B2/B3 move on zero cells, because the renderers already produced
+`(K|null)[]`; what moved is the column they were disagreeing WITH. B1 1,933 → 1,929, B2
+39 → 35, B3 136 → 132, all four on the `BOTH` class.
+
+### 8. THE MECHANISM, READ OFF THE MODULE — TWO HEAP TYPES DELETED
+
+`wasm-tools print` of `tests/cases/lists/litunion-inline-nullable-element.vl` under both:
+
+| | master | this head |
+| --- | ---: | ---: |
+| `(type …)` declarations | **27** | **25** |
+| bytes | 1,127 | **1,114** |
+| stdout | `2 2 2 2 2 2 a a 1 1` | identical |
+
+The two that vanish are `(type 5) (array (mut (ref null 3)))` and
+`(type 6) (struct (field (mut (ref 5))) …)` — **the STRING-LIST family**, interned because
+the softened name `(string|null)[]` pulled it in. The i32-atom family (`(array (mut i32))`
++ its wrapper) is the one the ALIAS column already used, and the inline column now shares
+it. *One spelling, one rep — and the rep was never the thing that forked; only the NAME
+was, which is why the output is identical and the module is smaller.*
+
+### 9. THE POSITION SWEEP — 9 POSITIONS, 7 IDENTICAL, AND THE TWO THAT MOVE WERE BOTH BROKEN
+
+One program per position (`Q/possweep.sh`), master vs this head:
+
+| position | master | this head |
+| --- | --- | --- |
+| root · local · array ELEMENT · struct FIELD · fn RESULT · fn PARAM · scalar field | ok, identical | ok, identical |
+| **`(("a"\|"b")\|null)[][]`** (2-D) | **`vl check` rc 0, `vl build` writes 530 bytes that DO NOT VALIDATE** — `type mismatch: expected (ref $type), found (ref $type)` | **ok**, prints `1 2` |
+| **`{[string]: (("a"\|"b")\|null)[]}`** (map VALUE) | **clean REJECT** — `emitProgram: field access but no struct type declared` | **ok**, prints `2` |
+
+**Their `(K | null)` ALIAS controls are byte-identical on both compilers** (`cmp` rc 0),
+which is what makes the pair a control rather than a second copy of the assertion. So this
+is not a spelling unification that happens to be safe: it closes one **silent invalid
+wasm** and one clean reject, and the `vl check` channel saw neither.
+
+### 10. FALSIFIABILITY — THE DELETION AND THE POISON, BOTH NON-EMPTY
+
+`WT=… A=… B=… bash ck/abcorpus3.sh` over `tests/cases std scripts` (**1,703 files** ×
+CHECKRC / CHECKMSG / BUILDRC / BUILDMSG / BYTES / RUN, the `-o` path normalized):
+
+| A/B | files moved |
+| --- | --- |
+| master (`basem`, built from HEAD's sources by the fetched seed, `cmp`-identical to it) → **this head**, run over master's OWN corpus (the fixture not yet grown) | **1** — BUILDMSG + BYTES on `lists/litunion-inline-nullable-element.vl`, and the BUILDMSG delta IS the byte count inside `wrote … (N bytes)`. **CHECKRC 0 · CHECKMSG 0 · BUILDRC 0 · RUN 0** |
+| the same pair, re-run over the **SHIPPED** corpus (the fixture grown) | **1** — the same cell, now **BUILDRC 1 → 0** + BUILDMSG + **RUNRC 1 → 0**: master cannot compile the two positions §9 unblocks. Still 0 on CHECKRC / CHECKMSG / BYTES |
+| this head → **SAB1** (the preserved name suffixed `ZZ`) | **1** — BUILDRC **0 → 1**, BUILDMSG, RUNRC 0 → 1: `emitProgram: a nullable-KZZ list element has no rep; use a non-null element type`. Identical on both corpora |
+
+**BOTH READINGS ARE REPORTED BECAUSE THEY ANSWER DIFFERENT QUESTIONS.** The first holds the
+corpus fixed and so isolates the COMPILER change: one cell, and it moves on bytes alone. The
+second is what ships, and it is the fixture doing its job — the pin is red on master. A slice
+that published only the second would be reporting its own fixture back to itself; one that
+published only the first would not have shown the pin.
+
+The DELETE-THE-BYSTANDER control is the first row read backwards: a build without the rung
+is master, and it moves exactly that cell. **The poison is a different measurement and it is
+non-empty**, so the rung is live on the code it is pointed at rather than merely removable.
+
+**THE CORPUS WITNESS SET IS ONE CELL, AND THAT IS REPORTED AS ONE.** The shape needs an
+INLINE literal union, GROUPED, with a `null` sibling — the corpus has exactly one file with
+it, which is why the fixture grows the two unblocked positions (§9) instead of a new file
+being added: the acceptance set has to be wider than the population that already existed.
+
+### 11. THE FIXTURE
+
+`tests/cases/lists/litunion-inline-nullable-element.vl` gains `nested()` (the 2-D element)
+and `mapVals()` (the map value), each beside its `(K | null)` alias control, and six
+`@log` lines. Its "WHY IT IS A FIXTURE" paragraph — which described the soften as current
+behaviour — is rewritten to record what the soften COST and that the structural rejects
+(`annIsNulLitUnionArray` / `annIsNulStrListDeep`) stay as the guard for a spelling that no
+longer arrives. **The grown fixture is RED on master** (`emitProgram: field access receiver
+is not a struct`) and green here, so it is a live net for all three of the slice's claims.
+
+### 12. THE GATE — every rc taken BARE, never through a pipe
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && bash scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,106,922 B** — and `cmp` rc 0 against `basem.wasm` (HEAD's sources compiled by it), so **the A/B baseline IS master's published compiler** |
+| `bash scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next — next is the fixpoint (2 compiles)"*, **1,107,011 B** |
+| `bash scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte (1,107,011 B) |
+| `bash scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `bash scripts/rep-fuzz-check.sh` | 0 | exact ✅ (1 baselined, 0 unsound, 1 reject, 0 new, 0 stale) |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,576 passed / 0 failed / 7 ignored** — master's numbers exactly, and the ignored SET is identical name for name (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`). The 7 is the tell the env var took |
+| six-channel corpus A/B, **1,703 files**, run TWICE (master's corpus and the shipped one) | 0 | **1 file moved on each** — §10. On master's corpus it is BYTES only; on the shipped corpus it is the grown fixture's BUILDRC 1 → 0 |
+| fuzz A/B, 10 seeds × 3 depths × 200 = **6,000 cases per side** | 0 | **logs BYTE-IDENTICAL**, 0 unsound-class lines on both sides — **and it is a COVERAGE zero, checked rather than assumed** (below) |
+
+**THE FUZZ ZERO IS VACUOUS FOR THIS FAMILY AND THE COMMAND THAT PROVES IT IS RECORDED.**
+The same 30 (seed, depth) batches were re-generated with `fuzzgen.vl` (the same
+sed-injection `fuzz-vl.sh` performs) and the generated SOURCE was searched:
+
+```
+batches 30   ===CASE records 12,000   generated source 2,384,944 B
+lines carrying a quoted-literal union member in a type spelling : 1,710
+GROUPED inline literal unions  (("a"|"b")  …)                   :     0
+…with a `null` sibling — the new rung's actual shape             :     0
+```
+
+`fuzzgen.vl` spells literal unions through a DECLARED alias (`K0`/`K1`) and never emits the
+inline grouped form, so the generated corpus cannot reach this rung at all. The A/B is a
+no-regression channel here and nothing more.
+
+**SEED BOOTSTRAP: no split needed.** The gate starts from a freshly fetched published
+`seed-latest` and it compiles this branch's source (`refresh-compiler.sh` rc 0 on the first
+self-compile).
+
+**BYTE DELTA: 1,106,922 → 1,107,011 = +89 B** for 9 lines of code.
+
+### 13. OPEN — with the numbers that make each schedulable
+
+* **LINSOFT, 7 rows / 5 files, ACTIONABLE and not taken.** Canon preserves a PURE inline
+  litunion at `ctxKeepsLitUnion` positions; both renderers soften it, because
+  `litUnionAliasNameOfTy` only answers when a declared alias exists. Files:
+  `literal-unions/quoted-separator-in-litunion-member.vl` (4, two of them inside a generic
+  APPLICATION argument) · `types/literal-union.vl` · `structs/nullable-wrapper-literal-widen.vl`
+  · `lists/litunion-nullable-list.vl`. The change is the renderers' `TyUnion` arm spelling
+  an un-aliased litunion from its `TyLit` members — which moves REGISTRATION KEYS, the
+  direction #1296 paid for, so it needs its own slice with its own six-channel evidence.
+* **TRANSP, 19 rows / 11 files, BLOCKED** on W9's `renderEmit(ty, ctx)` and the #1122
+  transparency ruling — and now with a measured emitter cost: **26 duplicate variant rows
+  in 16 programs** (§5), each one an extra entry in the base of all three tag bands.
+* **The generic type-param SHADOW family** is **17 rows in 3 files** on B3's axis
+  (§2), all three named `generics/type-param-shadows-*.vl`. Filed elsewhere, unmoved.
+* **PARAM-INST (80 rows / 49 files) is not a defect** and should stop being counted as one:
+  canon reads a generic body's `T`, `nodeTyIxOf` hands back the clone's instantiation. B3's
+  headline number is 136 and its *disagreement* content is 39 + 17.
+* **UCOLL (4) is TERMINAL BY DESIGN**; `TRANSP-INV` (1) is terminal by P6's measurement;
+  UEXP (2) and ISECT (2) stay filed at #1271/#1296 and #1294 §2.
+* **The UNGROUPED nullable litunion keeps its verbatim spelling.** `"a"|"b"|null` reaches
+  `nameIsLitUnionType(core)` true one rung above the new one and returns `"a"|"b"|null`
+  rather than `K|null`, so it does not get the alias preference. **This is stated, not
+  fixed: the census reads 0 rows for it on all three axes**, and an unreached rung is not a
+  wrong one — but the two rungs now answer the same question two ways, and the day one is
+  reached it is the same defect this slice closed.
+
+### 14. METHOD NOTES
+
+* **A CLASS DEFINED BY "WHICH PRODUCER CANNOT SPELL IT" DOES NOT SURVIVE THE CAPABILITY
+  LANDING — THE ROWS CHANGE SIDES.** G was 114 rows of *"the renderer expands `Box<i32>`
+  because it has no nominal route"*. #1274 built the route; G is 0; and nine rows of the
+  same two spellings are still there with canon on the expanding side. A count that fell
+  from 114 to 0 and a class that did not go away. *Re-derive what a class MEANS, not just
+  what it counts.*
+* **JOIN THE AXES PER RECORD BEFORE COMPARING THEIR CLASS TABLES.** B2 and B3 published
+  similar-looking breakdowns for four slices. Joined per record, `B2-only` is 0 and 80 of
+  B3's extra 97 are a type PARAMETER against its own instantiation — two different
+  questions, not two answers. *Two axes with the same classifier are not two samples.*
+* **A MECHANICAL CLASSIFIER'S BUCKETS ARE ONLY AS GOOD AS ITS DISCRIMINATOR, AND THIS ONE
+  COULD NOT SEE A FIELD NAME.** `Lin-alias` vs `Lin-soft` is decided by "is there a
+  non-primitive identifier in the render" — true of every struct shape. 4 of 8 `Lin-alias`
+  rows are softens. *The corrections a classifier needs are found by reading its rows, not
+  by trusting its totals; this is the second published census in this programme corrected
+  by its own dump.*
+* **THE MISSING HALF WAS 130 LINES AWAY AND HAD BEEN WRITTEN BY THE SAME RULING.**
+  `litRunPartTexts` states "a GROUPER is not a member" in a comment; `nulLitUnionPreserve`,
+  answering the same question about the same spellings in the same file, did not have it.
+  The corpus even held the contrast on two adjacent fixture lines (`("a"|"b")[]|null`
+  preserved, `(("a"|"b")|null)[]` softened). *When one classifier of a family is taught a
+  rung, sweep the family — and the sibling that shares its operand grammar first.*
+* **`vl check` SAW NEITHER DEFECT.** The 2-D case is `vl check` rc 0 and a 530-byte module
+  that does not validate; the map-value case is CHECKRC `same` and BUILDMSG-only. The
+  position SWEEP found both, and the six-channel corpus confirmed the blast radius was one
+  cell. *A nine-cell position sweep is cheaper than a census and finds what a census cannot:
+  the positions the shape never occupied in the corpus.*
+* **A ONE-CELL WITNESS SET IS A REASON TO GROW THE FIXTURE, NOT A REASON TO SHIP QUIETLY.**
+  The A/B moves one file and the poison breaks the same one. That is a live wire and a thin
+  net, and the answer is the two positions the fix unblocks — both of which were broken, one
+  of them silently. *Report the width of the net alongside the strength of the signal.*
+* **A 6,000-CASE FUZZ ZERO SAYS NOTHING UNTIL YOU GREP THE GENERATOR'S OUTPUT.** Both sides
+  are byte-identical over 6,000 cases and 1,710 of the generated lines carry a quoted
+  literal in a type — which makes the channel look live for litunions. It is not live for
+  THIS shape: 0 of 2.38 MB of generated source contains a grouped inline litunion, because
+  `fuzzgen.vl` only ever spells one through a declared alias. *The denominator that matters
+  is not "cases run", it is "cases that could have contained the construct" — and it costs
+  one grep of the generated batch to have it.*
+
+<!-- APPEND-MARKER-POSTPRESERVE-END -->

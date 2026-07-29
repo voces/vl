@@ -83,6 +83,19 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 >   a function name that never existed in the tree, carried through four slices against a count that
 >   was exact. Its producer `pinned` is built by string surgery in `emit_mono.monoInstanceFor`, so the
 >   route is one commit spanning `typecheck.vl` + `emit_mono.vl`, not an emitter-only move.
+> - **B2 is a strict SUBSET of B3, the G class is ZERO, and 80 of B3's 136 rows are not a
+>   disagreement at all** (post-preserve P1, off `c7301d3a`). Joined PER RECORD rather than compared
+>   as two class tables: `B2-only` = **0**, so B3 = B2's 39 + 97, and the 97 split into **80
+>   PARAM-INST** (the annotation is a generic type PARAMETER — `nameToTy` cannot resolve it and
+>   `nodeTyIxOf` returns the clone's instantiation; 49 of 49 files are `tests/cases/generics/*`) and
+>   **17 SHADOW** (3 files, all named `generics/type-param-shadows-*.vl`). **G — "the generic
+>   application the arena cannot spell", 114 rows at `8c22fa06` — is 0**: #1274's `genAppNameOfTy`
+>   closed it, and the nine rows that still hold that PAIR of spellings have swapped sides (canon
+>   expands, the renderer names) and are class T. So B2/B3's schedulable content is **TRANSP 19 ·
+>   LINSOFT 7 · UCOLL 4 (terminal by design) · UEXP 2 · ISECT 2 · TRANSP-INV 1**, and TRANSP is the
+>   one with a measured emitter cost — **26 duplicate `uVariants` rows in 16 corpus programs**, one
+>   layout under two names, each an extra entry in the base of all three tag bands. *Do not quote a
+>   B3 total as a defect count; join it to B2 per record first.*
 
 ### Consumer-driven requirements — webcraft (`docs/webcraft-requirements.md`)
 
