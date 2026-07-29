@@ -33417,3 +33417,259 @@ self-ignore and the suite still exits 0.
   `annArrowAt` returns 0 or a positive number. No character compare, so no grep for the marker
   finds them, and `annRetNameOf`'s header states the invariant with the wrong justification
   ("no renderer produces" a leading `=>` — the mint does). *A positional encoding is an encoding.*
+
+---
+
+## D-DECLPARAM + D-CANONTS — the SOURCES arc opens: W10 re-derived, the canon/tree invariant closed, and the DECLARATION half taken (off master `4607bf9b`)
+
+The first slice of the SOURCES arc. The routing programme is terminal (#1261: zero routable
+copies); what is left of W10 is not a *site* problem but a *sources* problem, and this slice
+re-derives what is actually left of it, measures the one hazard the residue table did not
+record, and takes the largest coherent piece.
+
+### 1. THE W10 CENSUS RE-DERIVED — the residue table's `9` reproduces under NEITHER unit
+
+The row says **W10 | `nameToTyReal` | 9**. Re-derived on `4607bf9b`, with the rule stated:
+
+**Unit A — DECOMPOSING ARMS** (what "the compiler's SECOND recursive-descent type parser" names:
+one arm per way of taking a rendered annotation apart). `nameToTyReal` has **TEN**: union ·
+intersection · negation · paren group · function type · literal member (`litMemberTy`) · array ·
+map · inline object · generic application. The three LEAF rungs (`primTyOfName` /
+`tpEnvTyOfName` / `declaredTyOfName`) are excluded by the code's own header — "a name is a name",
+none inspects a character. Its structural dual `tsToTyReal` has twelve kind arms; the string side
+merges `TS_LITSTR`/`TS_LITNUM` into one `litMemberTy` call and answers `TS_NULL` at
+`primTyOfName`, which is the 12 → 10.
+
+**Unit B — UN-HOMED CHARACTER WRITINGS** (what is still spelled out in the body after W1–W8
+routed everything with a `tyname.vl` home). **SEVEN**, in exactly three arms:
+
+| arm | writings |
+|---|---|
+| NEGATION | `name[0] == '!'` · `name.slice(1, name.length)` |
+| PAREN group | `tyGroupEndIndex(name, 1) == name.length - 1` (the endpoint arithmetic) |
+| INLINE OBJECT field loop | `fstart = 1` · `fend = nlen - 1` · `name.slice(fstart, fend)` · `fstart = fend + 1` |
+
+Neither is 9. **The 9 is an inherited figure in a unit the row never states** — the fourth time
+this programme has re-derived a published count and found it moved. Both numbers above come with
+their producing rule; use one or the other, not the row.
+
+### 2. THE SOURCES MEASUREMENT — the ANNOTATION half of W10 is ALREADY CLOSED, and the residue is entirely emit-time
+
+Probe host over `tests/cases` + `std`, 1,623 cases, one shared instance
+(`scratchpad/w10/probehost.ts`, the #1154 instrument; the compiler cannot `print` under `vl build`):
+
+```
+annotResolve TREE leg   16,047      annotResolve NAME leg    3,057   (16.0%)
+nameToTyReal entries    12,150      ... at unkTyDepth == 1    5,154
+```
+
+Bucketing the 3,057 NAME-leg calls **by call site** is the whole finding:
+
+| funnel | NAME-leg reaches | verdict |
+|---|---:|---|
+| `resolveAnnotAt` (let / param / return annotation) | **0** | tree present on every read |
+| `nameToTyAnn` (struct FIELD annotation) | **0** | tree present on every read |
+| `isTypeTy` (`is` / `!is` / `match` type pattern) | **0** | tree present on every read |
+| `udTsRootAt` (UnionDecl member) | **0** | tree present on every read |
+| exported `resolveAnnot(name, typarams)` | **3,057** | the EMITTER's re-resolutions — post-canon, no tree exists |
+
+**Every positioned checker funnel is at 100% tree coverage.** `AsExpr.asTy` is banked too (D-PARSETY
+P3 landed it; #1121's exclusion is stale — `parser.parseAsType` → `setAnnTs`, and `driver.modRwExpr`
+rewrites the tree). So there is no annotation position left to convert, and a slice that budgeted
+for "convert the remaining annotation callers" would have found nothing to do.
+
+The direct `nameToTy` callers, likewise measured rather than assumed:
+
+| site | reaches | why it cannot ask a tree |
+|---|---:|---|
+| `recordClonedNodeTy` | 1,986 | the monomorphizer CLONES a body and substitutes concrete names; no parser node exists for them (C1 endgame territory) |
+| `inferListElemName`'s `paramTyNames` (×2) | 63 | names the checker synthesised for a speculative re-check |
+| `canonEmitNameAt`'s `&`-fold | 23 | inside canon, which is name-in/name-out by contract (W9) |
+| `unionMemberGenAppShape` | 21 | called from canon, same |
+| `checkLetDeclNode`'s map-KEY diagnostic | 4 | **ROUTABLE — filed below, not shipped** |
+
+### 3. 🔴 THE CANON/TREE INVARIANT WAS BROKEN, THE BREAK IS REACHABLE, AND IT IS INERT FOR A STRUCTURAL REASON
+
+`canonEmitTypeNames` rewrites `TypeRef.tyName` **in place** and did not touch the spelling tree, so
+downstream of canon a live root described the PRE-canon name. `driver.modRwType` hit the same shape
+one pass earlier and fixed it the other way — rewrite the TREE, re-render (`t.tyName = tsToName(root)`).
+Canon cannot do that: `canonEmitName` is not `tyToEmitName ∘ nameToTy` (that is the whole W9 block).
+
+Measured, on the same corpus:
+
+```
+TypeRef nodes canon visited          10,148
+... carrying a spelling tree         10,148     (100%)
+... canon REWROTE the name              369     (3.64%)
+... tree render != the name written     369     ← EQUAL, so the tree goes stale on
+                                                   exactly the rewritten nodes and no others
+tree reads that happen AFTER canon        14
+... of them STALE                          0     (on the corpus)
+```
+
+**The 14 are real and they have one shape.** All 14 are `applyGenAliasArgs` re-resolving a generic
+alias's FIELD annotations, for an application whose argument type the emitter minted a fresh arena
+index for (`Box<i32|null>`, `Box<f32>`, `Pair<i32|null,string>`, `Pair$m1<i32>`) — `mkNullableTy`
+is not hash-consed, so the `head + "<#" + argTyIxs` memo MISSES at emit time and the fields resolve
+a second time. Every one of the 14 reads a bare type-PARAMETER spelling (`T`, `A`, `B`), which
+holds no canon-able construct — which is why the corpus reads 0 stale, *structurally* rather than
+by luck.
+
+**The two populations DO intersect, and a hand-built witness set proves it.** 17 of the 369 canon
+rewrites already land on a generic-alias declaration's field (`Id` → `i32`, `Nm|null` →
+`string|null`, `Fn` → `(i32)=>i32`, `Inner<MyS>` → `Inner<{n:i32}>`, …). Crossing the rewriting
+field spellings with the two memo-missing triggers gives **12 programs on which master takes a
+POST-STALE tree read** — e.g. the tree says `"a"|"b"` while the node's name says `string`:
+
+```
+POST-STALE  Box<f32>        w  tree="a"|"b"         name=string
+POST-STALE  Box<i32|null>   w  tree=(0|1|2)&!2      name=i32
+POST-STALE  Box<f32>        w  tree=("a"|"b")=>i32  name=(string)=>i32          … 12 in all
+```
+
+**And all 12 are byte-, message- and run-IDENTICAL on all six channels, before and after the fix.**
+Said plainly: *this sabotage is inert on every channel, and here is why* — canon is
+**rep-preserving by construction** (softening a literal member to its base scalar, folding an
+intersection, stripping a whole-name paren all leave the runtime representation alone), and the
+only post-canon tree consumer feeds the emitter's rep queries. A stale read therefore returns a
+different `Ty` with the same rep, and nothing downstream can see the difference.
+
+**Shipped anyway, as an invariant repair rather than a bug fix, and labelled as one.**
+`ast.clearAnnTs(nodeIx)` drops the row when canon rewrites the name, so `annTsOf` answers -1 and
+the consumer falls to the NAME leg — which is what the emitter's own re-resolutions already use.
+After it, *a live root renders to the node's current name* is TOTAL. That is the precondition any
+future tree-first consumer downstream of canon needs, and it is 15 lines and **+195 bytes**.
+
+`tests/cases/generics/genalias-field-reresolved-after-canon.vl` is committed as the corpus's REACH
+into that read (2 POST-STALE reads, measured) — coverage, not a pin, and its header says so.
+
+### 4. D-DECLPARAM — the generic DECLARATION's parameter list comes from the parser now
+
+The shippable sources conversion this slice found. `parseTypeDecl` reads `type Box<T>` /
+`type Pair<A, B>` and **concatenates the parameter tokens into the declared name**
+(`mkTypeDecl("Pair<A,B>", …)`). Four consumers then took them back out of that concatenation:
+
+| # | site | what it re-parsed | now |
+|---|---|---|---|
+| 1 | `typecheck` pass 0a (generic-alias registration) | `gaeLtAt` + `gaeHeadNameOf` + `tyTopLevelSplit(gaeArgsTextOf(…), ',')` | `declGpBaseOf(node)` + `declGpParamsOf(node)` |
+| 2 | `typecheck.resolveFlatLayouts` (the generic-`flat` reject) | `gaeLtAt(sd.tdName) > 0` | `declGpBaseOf(node) != ""` |
+| 3 | `driver.modGenBase` (3 call sites) | `gaeLtAt` + the head cut | `modDeclBase(node, name)` — one array read |
+| 4 | `driver.modGenParams` (2 call sites) | a second `gaeLtAt` + a hand-written identifier-RUN walk with its own `fromCodePoints` buffer | `declGpParamsOf(node)` |
+
+`ast.vl` gains one push-keyed table (`declGpNode` / `declGpBase` / `declGpStart` / `declGpCount` /
+`declGpName`, `setDeclGp` / `declGpBaseOf` / `declGpParamsOf` / `setDeclGpBase`), scanned linearly
+and not binary-searched on purpose: generic declarations are a handful per program, and the
+`annTsNode` search would cost more code than it saves. Both retiring functions are deleted;
+`driver.vl` drops `gaeHeadNameOf` and `gaeLtAt` from its `tyname` import entirely.
+
+**THE GUARD MOVED WITH THE DATA AND IS EXACT.** `gLt > 0` tested "a `<` follows the declared
+name" (index 0 is impossible — a declared name starts with an identifier). The bank exists iff the
+parser consumed that `<`, so a zero-parameter `type Box<> = …` still banks a row with an empty
+list, exactly as `gaeArgsTextOf` + `tyTopLevelSplit` produced an empty list for it.
+
+**THE THIRD POSITION OF THE IN-PLACE-REWRITE HAZARD, and the one that would have shipped a bug.**
+The module merge rewrites `tdName`/`udName`'s base segment in place. A bank left alone would
+register the alias in the checker's generic registry under `Box` while every application spells
+`Box$m1` — the identical shape that left the spelling tree describing the PRE-merge name
+(`modRwType`'s note) and the pre-CANON name (§3). `driver.modRwDeclBase` re-runs `modTypeRenamed`
+on the bare base under the same live `modTyShadow`, immediately after the rename lands, so the two
+copies cannot drift.
+
+**DUAL-WRITE PROOF (phase-0 style, structural — never a diff of two renders).** A build computing
+BOTH answers at all four converted sites and printing every disagreement:
+
+```
+0 disagreements over 7,323 comparisons on 1,623 cases
+  ( 5,631 base · 895 parameter-list · 797 is-generic )
+```
+
+### 5. TWO SABOTAGES, BOTH WITH NAMED WITNESS SETS
+
+Six-channel corpus A/B (`abcorpus3.sh`) of the branch against each poison, 1,685 files:
+
+* **S-B — delete `modRwDeclBase` from the merge** (the invariant §4 names). **3 witnesses**, all
+  committed: `tests/cases/modules/generic-export/entry.vl` ·
+  `tests/cases/modules/generic-isolation/entry.vl` ·
+  `tests/cases/modules/plain-alias-ref-renamed/entry.vl`. Four fields move
+  (CHECKRC 0/1, CHECKMSG, BUILDRC 0/1, BUILDMSG, RUNRC 0/1).
+* **S-C — bank the parameter list in REVERSE order**. **18 witnesses**, incl.
+  `generics/type-alias-pair.vl` · `generics/type-arg-union-param.vl` ·
+  `generics/union-member-generic-application-inline-multiarg.vl` ·
+  `unions/variant-generic-application-list-field.vl` ·
+  `literal-unions/quoted-separator-in-litunion-member.vl`.
+
+So **no new fixture is owed for D-DECLPARAM** — both halves of it are already entombed by the
+committed suite, which is #1259's standard (run the poison, look for the fixture in its witness
+set). The one file added is §3's coverage case.
+
+* **The canon/tree sabotage (§3) is INERT on every channel, stated plainly**, with the 12-program
+  witness set built and run, and with the structural reason (rep-preservation) rather than "we
+  found nothing".
+
+### 6. GATE (every rc taken BARE, never through a pipe)
+
+```
+rm -f build/vl-compiler.wasm && bash scripts/fetch-seed.sh      rc 0  (1,099,332 B, seed-latest)
+bash scripts/refresh-compiler.sh --prove-fixpoint               rc 0  fixpoint at 2 compiles, 1,100,994 B
+bash scripts/native-fixpoint.sh                                 rc 0  stage3 == stage4, 1,100,994 B
+SELFHOST_NATIVE_ALIGN=1 deno task test                          rc 0  3538 passed / 0 failed / 7 ignored
+bash scripts/lint-self.sh                                       rc 0  self-lint + fmt-check clean
+bash scripts/rep-fuzz-check.sh                                  rc 0  exact (1 baselined, 0 new, 0 stale)
+corpus A/B (six channels, master fixpoint vs branch fixpoint)   1,685 files, 0 differing on EVERY field
+fuzz A/B, 3 seeds x 3 flag sets x 400 cases x 2 sides           class-tagged shape lines IDENTICAL
+```
+
+Master at `4607bf9b` reads **3,536 / 0 / 7**; the +2 is the one added fixture, counted in the wasm
+tier and the native-align tier. The **ignored SET is identical to master's** (`lint/exhaustive-is-chain-dead-else` ·
+`lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` ·
+`soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`) —
+the 7 is the tell that `SELFHOST_NATIVE_ALIGN` was honoured.
+
+**SEED BOOTSTRAP: no split needed.** The gate above starts from a *freshly fetched* published
+`seed-latest`, and that seed compiles this branch's source (`refresh-compiler.sh` rc 0 on the first
+self-compile) — the branch adds no construct the published emitter lacks.
+
+**BYTE DELTA: +1,662 (1,099,332 → 1,100,994, +0.15%), split +195 canon/tree · +1,467 D-DECLPARAM.**
+Reported, not hidden. It is a bank plus four accessors against two deleted functions and six
+deleted grammar call sites, and it is NOT the shape #1154 declined at 608 bytes: that one
+*relocated* a walk to a home with ONE legal consumer; this one *deletes* the walk, because the
+information it recovered had never needed to be destroyed. If a later slice wants the bytes back,
+`declGpStart`/`declGpCount` collapse into one column (rows are pushed in order, so a row's count is
+the next row's start minus its own) — measured as a follow-up, not taken here.
+
+### 7. THE W10 RESIDUE AFTER THIS SLICE — filed per site, with the exact column each needs
+
+| # | site | reaches | blocker | the exact thing it needs |
+|---|---|---:|---|---|
+| 1 | exported `typecheck.resolveAnnot`, 7 callers in `emit_rep.vl` | 3,057 | **DESIGN + PARTITION.** The name is post-canon, so no tree exists for it — and canon cannot rebuild one without `renderEmit` (W9). Also an emitter file, outside this slice's partition | W9's `renderEmit(ty, ctx)` rewriting the TREE, then §3's invalidation becomes a re-render |
+| 2 | `typecheck.recordClonedNodeTy` | 1,986 | **DESIGN (C1 endgame).** The monomorphizer clones a body and substitutes concrete names onto nodes past the checker-sized `nodeTyIx`; no parser node was ever built for them | per-instance typed-IR — `emit_mono` recording a `tyIx` at the clone instead of a name |
+| 3 | `typecheck.inferListElemName`'s `paramTyNames` (2 sites) | 63 | **DESIGN.** Speculative re-check over names the checker synthesised | the speculative path would have to carry `tyIx`, not `string[]` |
+| 4 | `typecheck.canonEmitNameAt`'s `&`-fold · `unionMemberGenAppShape` | 23 + 21 | **W9.** Canon's contract is name-in/name-out | `renderEmit` |
+| 5 | **`typecheck.checkLetDeclNode`'s map-KEY diagnostic** | **4** | **NONE — ROUTABLE, deliberately not shipped here** (it changes a diagnostic path and would need its own six-channel evidence run; this slice already carries two entombed changes) | the site holds `n.letType`, whose tree is present on 100% of reads (§2). Diff sketch: `const kr = annTsOf(n.letType)` → `if kr >= 0 && tsKind[kr] == TS_MAP { badKey = tsText[kr] }` and resolve it with `tsLeafTy(badKey)` instead of `nameToTy(mapSpellKeyName(tn.tyName))` — that retires `mapSpellKeyName`'s only checker caller AND a `nameToTyReal` entry. `TS_MAP`'s `tsText` IS the key token the lexer produced (`ast.vl`'s column note), so the two answers are the same string by construction |
+
+**The honest summary of the arc's shape.** W10 was filed as "behind the parser tree's coverage".
+It is not: the coverage is **100% at every positioned annotation funnel — 0 misses in 16,047
+tree reads**, and the 3,057 name-leg calls are ALL the emitter's. What is actually left is one routable diagnostic site (row 5) and ~5,150 reaches
+that are all *emit-time names for which no parse ever happened* — rows 1–4. Those do not close
+with more parser banking; they close with `renderEmit` (W9) and per-instance typed-IR (C1). The
+sources arc's remaining work at the CHECKER was the DECLARATION name, and this slice took it.
+
+### METHOD NOTES
+
+* **A COVERAGE HOLE AND A RESIDUE ARE DIFFERENT QUESTIONS, AND THE CENSUS ROW CONFLATED THEM.**
+  "W10 is behind the parser tree's coverage" predicts that converting more annotation positions
+  reduces it. Measured, the positions are already at 100% and the residue is 100% emit-time.
+  *Bucket a family's reaches BY CALL SITE before planning against its total.*
+* **A STALE-DATA HAZARD CAN BE REACHABLE AND STILL INERT — AND THE REASON MATTERS MORE THAN THE
+  ZERO.** §3's twelve witnesses take the stale read and move nothing, because canon is
+  rep-preserving and the only consumer asks for a rep. That is a *structural* inertness, and it
+  predicts exactly when it will stop being inert (the first consumer that asks the tree for
+  something sharper than a rep). "We found no witness" would have predicted nothing.
+* **THE THIRD INSTANCE OF ONE BUG CLASS IN ONE FAMILY.** In-place string rewrite between producer
+  and consumer, with a structural copy left behind: the module merge vs the spelling tree
+  (#1117, fixed), canon vs the spelling tree (§3, fixed here), the module merge vs the declaration
+  parameter bank (§4, prevented here before it could ship). *Every new bank a pass reads is a new
+  thing every in-place rewriter has to update — write the sync in the same commit as the bank.*
+* **RE-DERIVE WITH A STATED RULE OR DO NOT PUBLISH A NUMBER.** The W10 `9` reproduces under
+  neither of the two units the family admits (10 arms / 7 writings). This is the fourth published
+  count this programme has re-derived and moved.

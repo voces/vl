@@ -61,11 +61,14 @@ import {
   TS_MAP,
   TS_NAME,
   annTsOf,
+  declGpBaseOf,
+  declGpParamsOf,
   declNameTok,
   declNameTokOf,
   i32ToStr,
   mkProgram,
   nodeToks,
+  setDeclGpBase,
   tsKidCount,
   tsKidStart,
   tsKids,
@@ -78,7 +81,7 @@ import {
   ufcsAliasReset,
 } from "./ast"
 import { parseProgram } from "./parser"
-import { gaeHeadNameOf, gaeLtAt, nameIdentChar } from "./tyname"
+import { nameIdentChar } from "./tyname"
 import { T, checkProgram, demangleMsg, initChecker } from "./typecheck"
 import {
   redunTokAt,
@@ -2274,70 +2277,49 @@ function modCompile(emit: i32): i32 {
 // every application (`Box<i32>` → `Box$mN<i32>`) rewrite consistently through
 // the segment rewriter. Generic FUNCTIONS carry their parameters out-of-name
 // (`fnTyParams`) and rename like any value.
-// Both cuts below take the head/argument split from the ONE `<`-scan
-// (`typecheck.gaeLtAt`, D-GENAPPDOWN) rather than re-rolling it. This file held the
-// FOURTH and FIFTH hand-written copies of that loop — the pair D-GENAPPDOWN filed
-// when it moved the home down and could not reach them; `driver.vl` imports
-// `typecheck.vl`, so the route is DOWN the graph and legal (D-MODGENLT).
+// D-DECLPARAM — BOTH OF THESE ARE NOW THE PARSER'S OWN LIST.
 //
-// Neither site wants the generic-application SPAN (`annGenAppSpanEnds`). Both are
-// asked about a DECLARED name in the merge rename map, where a non-generic name is
-// the common case and must fall through to "no cut"; the span's trailing-`>` compare
-// would answer false for exactly the names that need the `<` found. Same split pass 0a
-// established at the home: the `<`-scan and the span are two predicates, not one.
+// The base segment of a DECLARED name (`Box` of `Box<T>`), and the type-parameter
+// names folded into it. Master derived both by re-parsing the string
+// `parseTypeDecl` had built by concatenating those very tokens: `modGenBase` was a
+// `<`-scan (`gaeLtAt`) plus the head cut, and `modGenParams` was a second `<`-scan
+// plus a hand-written identifier-RUN walk with its own `fromCodePoints` buffer.
+// The parser banks the base and the list on the declaration node
+// (`ast.setDeclGp`), so both are one array read, keyed by the NODE the caller
+// already holds.
 //
-// The base segment of a declared name (`Box` of `Box<T>`); a non-generic name
-// is its own base. `gaeLtAt`'s -1 IS the non-generic answer; index 0 keeps the
-// copies' own reading (a leading `<` cuts to ""), since `slice(0, 0)` is what the
-// hand-rolled loop returned there.
+// Every caller of the old pair passed a name it had just read off a node, so no
+// call site gained an argument it did not have. `modDeclBase` keeps the old
+// fall-through verbatim — a non-generic declaration (and every `FuncDecl` /
+// `LetDecl` name, which never folds parameters: a generic FUNCTION carries them
+// out-of-name in `fnTyParams`) is its own base.
 //
-// The HEAD cut itself is `tyname.gaeHeadNameOf`, the delimiter-blind home (W2), which
-// takes the index this function already holds rather than re-scanning for it. The `lt < 0`
-// fall-through STAYS here: it is this site's own reading (a non-generic name is its own
-// base) and one of the three disagreeing guards that keep the cut blind. Index 0 keeps the
-// copies' reading too (a leading `<` cuts to ""), since `slice(0, 0)` is what the
-// hand-rolled loop returned there. The tail is a plain CALL, which lowers — it is a bare
-// member-call statement that does not (`emitProgram: unsupported member-call statement`),
-// which is why the home binds its slice and this site no longer has to.
-function modGenBase(name: string): string {
-  const lt = gaeLtAt(name)
-  if lt < 0 { return name }
-  gaeHeadNameOf(name, lt)
+// The 608-byte measurement in `modGenParams`'s old header — that routing the walk
+// to a run TOKENIZER cost more than it saved — is not refuted by this: it declined
+// a different home. This does not move the walk, it deletes it, because the walk
+// was recovering information that had never needed to be destroyed.
+function modDeclBase(ix: i32, name: string): string {
+  const b = declGpBaseOf(ix)
+  if b != "" { return b }
+  name
 }
-// The type-parameter names folded into a generic declared name (`Pair<A,B>` →
-// A, B); empty for a non-generic name. Declaration-position parameters are
-// plain identifiers, so ident runs after the `<` are exactly the names.
+// Carry the merge's rename INTO the bank, immediately after it lands in the
+// declared name. `modTypeRenamed` rewrites identifier SEGMENTS under the live
+// `modTyShadow` (the declaration's own parameters, pushed by the caller before
+// the rename), so running it on the bare base gives exactly the head segment it
+// gave the folded name — the two cannot drift.
 //
-// The identifier CHARACTER CLASS is `tyname.nameIdentChar` (W8), shared with
-// `modTypeRenamed` below. The RUN WALK stays here, and that is a MEASUREMENT rather than a
-// preference: the census's proposed home was a run TOKENIZER
-// (`nameIdentRuns(name, outStart, outEnd)`), it was built, this site was routed to it, and
-// the compiler grew **608 bytes** — two materialised `i32[]` index columns and their push
-// loops, to serve the tokenizer's ONE legal consumer (`modTypeRenamed` cannot take it; see
-// its header). The classifier is the operation that is actually written twice; the walk is
-// written once, and moving a single writing changes its location, not the count.
-//
-// The `<` is FOUND rather than walked past, which retires the copy's `started` flag: that
-// flag was only ever "have I passed the first `<` yet", and starting at `lt + 1` answers it
-// positionally. A trailing run is flushed by the closing `>`, as in the copy — every
-// declared generic name ends in one.
-function modGenParams(name: string): string[] {
-  const out: string[] = []
-  const lt = gaeLtAt(name)
-  if lt < 0 { return out }
-  let run: i32[] = []
-  let i = lt + 1
-  while i < name.length {
-    const c = name[i]
-    if nameIdentChar(c) {
-      run.push(c)
-    } else if run.length > 0 {
-      out.push(fromCodePoints(run))
-      run = []
-    }
-    i = i + 1
-  }
-  out
+// This is the third position of the same discipline, and the reason it is not
+// optional: an in-place string rewrite between a producer and a consumer is what
+// left the spelling tree describing the PRE-merge name (`modRwType`'s note) and
+// what leaves it describing the pre-CANON name after `canonEmitTypeNames`
+// (`ast.clearAnnTs`). A stale base here would register the alias in the checker's
+// generic registry under `Box` while every application spells `Box$m1`.
+// A non-generic declaration has no row and this is a no-op.
+function modRwDeclBase(ix: i32): i32 {
+  const b = declGpBaseOf(ix)
+  if b != "" { setDeclGpBase(ix, modTypeRenamed(b)) }
+  0
 }
 // Diagnose every top-level declaration of module `m` whose name (base segment,
 // for a generic) collides with one of its import locals. Without this, the
@@ -2365,7 +2347,7 @@ function modCheckDupBindings(m: i32, root: i32): i32 {
       if st is TypeDecl { nm = st.tdName }
       if st is UnionDecl { nm = st.udName }
       if nm != "" {
-        const base = modGenBase(nm)
+        const base = modDeclBase(ss[si], nm)
         if capHas(impLocals, base) {
           P.diags.push(
             {
@@ -2406,7 +2388,7 @@ function modBuildRename(m: i32, root: i32): i32 {
       if st is TypeDecl { nm = st.tdName }
       if st is UnionDecl { nm = st.udName }
       if nm != "" {
-        const base = modGenBase(nm)
+        const base = modDeclBase(ss[si], nm)
         if !capHas(impLocals, base) {
           modRenameFrom.push(base)
           modRenameTo.push(base + suffix)
@@ -2457,10 +2439,12 @@ function modCollectSelfFns(roots: i32[]): i32 {
             const p0 = P.nodes[st.fnParams[0]]
             if p0 is Param {
               if p0.parName == "self" {
-                // `modGenBase` strips a generic parameter list; the base segment
+                // `modDeclBase` strips a generic parameter list; the base segment
                 // is what the rename map keys on, and a UFCS callee names the
-                // function by that bare segment.
-                modSelfFnName.push(modRenamed(modGenBase(st.fnName)))
+                // function by that bare segment. A `FuncDecl` never folds one
+                // (`fnTyParams` is out-of-name), so this is the identity here —
+                // kept because the rename map is built through the same call.
+                modSelfFnName.push(modRenamed(modDeclBase(ss[si], st.fnName)))
                 modSelfFnArity.push(st.fnParams.length)
               }
             }
@@ -2783,13 +2767,14 @@ function modRwStmt(ix: i32): i32 {
     // A generic alias's parameters (folded into the declared name) are live
     // across the name and the field annotations.
     const tdTySaved = modTyShadow.length
-    const tdPs = modGenParams(n.tdName)
+    const tdPs = declGpParamsOf(ix)
     let tdPi = 0
     while tdPi < tdPs.length {
       modTyShadow.push(tdPs[tdPi])
       tdPi = tdPi + 1
     }
     n.tdName = modTypeRenamed(n.tdName)
+    modRwDeclBase(ix)
     let i = 0
     while i < n.tdFields.length {
       const f = P.nodes[n.tdFields[i]]
@@ -2801,13 +2786,14 @@ function modRwStmt(ix: i32): i32 {
   }
   if n is UnionDecl {
     const udTySaved = modTyShadow.length
-    const udPs = modGenParams(n.udName)
+    const udPs = declGpParamsOf(ix)
     let udPi = 0
     while udPi < udPs.length {
       modTyShadow.push(udPs[udPi])
       udPi = udPi + 1
     }
     n.udName = modTypeRenamed(n.udName)
+    modRwDeclBase(ix)
     const vs: string[] = []
     let i = 0
     while i < n.udVariants.length {

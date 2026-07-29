@@ -126,6 +126,9 @@ import {
   TS_PAREN,
   TS_UNION,
   annTsOf,
+  clearAnnTs,
+  declGpBaseOf,
+  declGpParamsOf,
   tsKidCount,
   tsKidStart,
   tsKids,
@@ -7845,7 +7848,10 @@ function resolveFlatLayouts(stmts: i32[]) {
         // there is no instantiation to measure at a declaration. Rejected here
         // rather than staged, so it never enters the sidecar and `Box<T>.size`
         // stays an ordinary undeclared-identifier error.
-        if gaeLtAt(sd.tdName) > 0 {
+        // "Is this declaration generic" is the PARSER's fact (D-DECLPARAM): the
+        // bank exists iff a `<` followed the declared name, which is exactly what
+        // the `gaeLtAt(…) > 0` scan of the folded name answered.
+        if declGpBaseOf(stmts[ri]) != "" {
           tErr(
             "a `flat` type cannot be generic — `" +
               sd.tdName +
@@ -9279,7 +9285,14 @@ export function canonEmitTypeNames() {
     const n = P.nodes[i]
     if n is TypeRef {
       const c = canonEmitName(n.tyName)
-      if c != n.tyName { n.tyName = c }
+      // The rewrite INVALIDATES the parser's spelling tree for this node: canon
+      // is not a rename, so a tree kept past it describes a different TYPE, not a
+      // different spelling of the same one (`ast.clearAnnTs`, which carries the
+      // measurement). Dropped BEFORE the assignment so the two never disagree.
+      if c != n.tyName {
+        clearAnnTs(i)
+        n.tyName = c
+      }
       atoms = canonAtoms
     } else if n is UnionDecl {
       const vs = n.udVariants
@@ -13738,26 +13751,31 @@ function checkProgramNode(n: Program) {
       // phase — the generic-alias registry memo-keys applications by a
       // synthesized name and branding that is a separate design — so the marker
       // is only honoured on the concrete arm below.
-      const gname = sd0.tdName
-      // The GENERIC-APPLICATION grammar's `<`-SCAN at its home in `tyname.vl`, and ONLY the scan:
-      // this is a DECLARATION, so there is no span to test — the closing `>` is the
-      // parameter-list cut's business two lines down, and asking `annGenAppSpanEnds` here
-      // would be a tightening (it would also demand a trailing `>` before the registry
-      // entry exists).
-      // The two CUTS are `tyname.gaeHeadNameOf` / `gaeArgsTextOf` (W2). The GUARD stays
-      // this site's own — `gLt > 0` on a DECLARATION, where the closing `>` is the
-      // parameter-list cut's business — which is one of the three disagreeing guards the
-      // delimiter-blind cut exists to serve.
-      const gLt = gaeLtAt(gname)
-      if gLt > 0 {
-        gaNames.push(gaeHeadNameOf(gname, gLt))
+      // D-DECLPARAM — THE PARSER'S OWN LIST, NOT A RE-PARSE OF THE NAME IT JOINED.
+      // This was a `<`-scan (`gaeLtAt`) plus two cuts (`gaeHeadNameOf` /
+      // `gaeArgsTextOf`) plus a top-level split, run over `tdName` — a string
+      // `parseTypeDecl` had assembled by concatenating the very IDENT tokens
+      // being recovered here. The parser banks the base and the list on the
+      // declaration node (`ast.setDeclGp`), so this is two array reads.
+      //
+      // The GUARD moves with the data and stays exact: the bank exists iff the
+      // parser consumed a `<` after the declared name, which is what `gLt > 0`
+      // tested (index 0 is impossible — a declared name starts with an
+      // identifier). A zero-parameter `type Box<> = …` banks a row with an empty
+      // list, as `gaeArgsTextOf` + `tyTopLevelSplit` produced an empty list for it.
+      //
+      // The MODULE MERGE rewrites `tdName`'s base segment in place; the bank is
+      // re-written in lockstep there (`driver.modRwStmt` → `setDeclGpBase`), the
+      // same discipline `modRwType` keeps for a `TypeRef`'s spelling tree.
+      const gBase = declGpBaseOf(stmts[t0])
+      if gBase != "" {
+        gaNames.push(gBase)
         gaDeclIxs.push(stmts[t0])
-        // D-GAPARAM: split the folded parameter list ONCE, here, into the flat
+        // D-GAPARAM: the parameter list is banked ONCE, here, into the flat
         // column. Master re-split the joined string inside `applyGenAliasArgs`,
         // i.e. once per APPLICATION of the alias; the list is a property of the
         // DECLARATION and cannot change between applications.
-        const gps: string[] = []
-        tyTopLevelSplit(gaeArgsTextOf(gname, gLt), ',', true, gps)
+        const gps = declGpParamsOf(stmts[t0])
         gaParamStart.push(gaParamNames.length)
         gaParamCount.push(gps.length)
         let gpi = 0
