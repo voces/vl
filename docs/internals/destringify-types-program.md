@@ -37603,3 +37603,107 @@ self-compile).
   break it, not just so the feature passes.*
 
 <!-- APPEND-MARKER-LINSOFT-END -->
+
+---
+
+## LITUNION COMPACT REP — the door the PRESERVE ruling opened, walked through and MEASURED: the allocation rationale is refuted by the string POOL, and the correctness population underneath it has one root cause (`valueAtomKind` has no litunion code) that two 13-site coercion censuses could not see (design-first, off master `5e59abdf`)
+
+**Design filed, nothing shipped in the compiler.** `docs/internals/litunion-compact-rep-design.md`
+carries the rulings, the alternatives each beat, the grids and the two follow-on slices; this
+section records only what belongs to THIS programme — the rep/vocabulary seam, and the method
+notes the slice produced.
+
+### Why it is destringify's business
+
+The preserve ruling (#1300, completed #1303/#1304) made all four producers of the emitter's
+vocabulary spell a litunion member of a mixed union as `K`, not `string`. The stated reason it
+was worth the churn was that a compact ATOM rep *"is only spellable if the vocabulary
+distinguishes `K` from `string`"*. That is a destringify claim — a rep unlocked by a spelling —
+and it is now measured, in both directions.
+
+**The spelling half is right and the rep half is refuted.** The vocabulary does now distinguish
+them. But the compact rep it was supposed to unlock buys **zero allocations**, because the
+string it would replace is already free: `collectStrPool` interns every distinct literal into an
+immutable global and `emitStr` lowers a pooled literal to one `global.get`, so
+`const x: K | f64 = "aa"` emits `i32.const 2 / global.get 0 / struct.new 0` — **one**
+`struct.new`, the box itself (`alloc/count.sh`: `struct.new=1`, `array.new_fixed=0`). The
+obvious compact encoding (the existing `$vbI32` scalar value box around the atom id) makes it
+**two**. Only `ref.i31` matches one, and the emitter has zero i31 today (`grep -c i31
+compiler/*.vl` sums to 0).
+
+### The root cause is a MISSING CODE, and the censuses that missed it were asking the other question
+
+`valueAtomKind` — the emitter's name→kind table, the thing every box tag, value box, eq opcode
+and rides-the-anyref test is a projection of — has **no arm for a literal-union member**. It
+returns `-1`, *not a value atom*. The tree says so beside the workaround, in
+`emit_base.unionHasValueAtom`, which carries a second `nameIsLitUnionType` test with the reason
+written out. **35 of `valueAtomKind`'s 42 call sites have no such compensation within ±6 lines;
+7 do** (`halfset.sh`). `isValueUnionName` (36 sites) is one of the 35, so
+`isValueUnionName("K|f64")` is false and its banked twin `msIsValueUnion` short-circuits on the
+same `-1`.
+
+#1296 and #1300 each ran a **13-site coercion census** (6 arena-keyed, 7 name-keyed) and each
+concluded — correctly — that none keys on the preserved spelling. That is what let preserve ship
+without touching the rep, and it stands. But both censuses asked *"does an existing site read
+the name I am changing?"*. Neither asked *"is a site MISSING?"* — and the largest defect family
+here is a missing arm in `emitUnionCoerce`'s ladder, which no census of existing sites can
+contain. #1300's own completion found the same lesson one step earlier: the fourth producer of
+this vocabulary was a CONSUMER nobody had enumerated, invisible to *"two successive 13-site
+coercion censuses"*. **An enumeration of the sites that exist is not an enumeration of the sites
+that should.**
+
+### The seam this programme owns: `repCanonKeyGo`'s mix-widen inverts
+
+#1300's changelog records *"The REP key does not move — `repCanonKey`'s union arm is arena-keyed
+and mix-widens structurally."* True then, and it is the precise thing a compact rep reverses.
+That arm rewrites a litunion member of a MIXED union to `"string"` for KEYING and dedups
+`K0 | string` to one render; its comment records the invalid-wasm finding it exists to prevent
+(fuzz-nightly `29875839073`, `mix:{a: K0 | {w: i32}, …}` seed 88370995 d6 — a declared and an
+inline spelling keying differently, declining the struct-twin dedup, minting two byte-identical
+but iso-recursively DISTINCT heap types). Under a compact rep the widening must invert, which
+**fragments struct-twin rows** and must not reopen that finding. It is the #1300-era seam read
+from the other side, and it is the reason the rep is an ABI event rather than an emitter change.
+
+### Method notes
+
+* **A REFUTED RATIONALE IS A RESULT, and the refutation was one `grep -c struct.new`.** The
+  headline for this work — *"cheaper allocation"* — had been carried through the preserve slices
+  as the reason preserve mattered. It survives until someone counts the allocating instructions
+  in a witness's own body, and then it is over in one command. *Cost claims about an emitted
+  rep are cheap to falsify off the module; falsify them BEFORE scoping the work they justify,
+  not after.*
+* **MY OWN GRID GREENED FALSELY ON THE CONTROL RULE #1304 PUBLISHED.** G1's inline row was
+  spelled `("aa"|"bb") | f64` in a file that also declared `type K = "aa" | "bb"` — identical
+  members, so the ALIAS registration answered every INLINE lookup and the inline half reported
+  the alias's own profile. Re-run with `("pp"|"qq")` and **no alias in the file**, the narrowed
+  READ of the inline arm is INVALID WASM in 5 of 6 mixed spellings. **10 cells were hidden by
+  one shared member set.** *The rule was published one PR ago, in this document, and it still
+  cost a pass. Write the differing members into the fixture and say why in a comment, because
+  the next reader will make the same mistake.*
+* **A LOUD REJECT IS A CELL MOVE LIKE ANY OTHER, AND IT HAS TO BE COUNTED.** The obvious
+  containment for the two collision shapes (`K | string`, `K | K2`) is a loud emit reject. It is
+  ILLEGAL: rejecting `K | string` moves **12** `RUN-OK` cells DOWN and `K | K2` moves **4**,
+  because both shapes have working positions that the collision never touches. *"Give it a loud
+  reject" is not automatically the safe answer — count the working cells of the shape you are
+  about to reject first.*
+* **AN ORACLE-LESS OUTCOME PROBE HIDES THE WORST CLASS.** The first pass of this grid recorded
+  rc only, and read `120 RUN-OK / 13 INVALID-WASM / 9 CHECK-REJ / 2 EMIT-REJ`. With an EXPECTED
+  stdout per case, the same grid reads **34 of those "OK" cells as `RUN-WRONG`**. A silent wrong
+  answer is rc 0 on every channel a rc-only probe has. *`BUILDMSG` separates clean-reject from
+  invalid-wasm; only an expectation separates a right answer from a wrong one.*
+* **THE FUZZER'S REACH AND ITS COVERAGE ARE DIFFERENT FACTS.** `fuzzgen.vl` DOES generate
+  litunion-in-mixed-union — 26 and 14 of 800 cases on two seeds — which corrects the standing
+  note that it has "zero inline-litunion and zero litunion-alias reach" (the inline half is
+  genuinely 0 and 0; the alias half is not). And it is **vacuous on every defect family
+  anyway**: the carrier is always a member LITERAL stored into the box, then `is K0` + `print`,
+  which is exactly the two grid cells that already pass. 400 cases × 2 seeds report 0 findings,
+  truthfully. *Measure what the generator EMITS, not whether it ran — a reach count and a
+  coverage claim are two greps apart and only one of them was ever taken.*
+* **A STALE INVARIANT IN A FIXTURE COMMENT OUTLIVES THE FIX THAT BROKE IT.**
+  `tests/cases/unions/litunion-value-union-is.vl` (#845) asserts *"A real `string` member cannot
+  coexist (`K0 | string` collapses to `string`), so the string tag never collides."* Six lines
+  refute it on master. The comment is not wrong about the design it was written for; it is wrong
+  about the design that replaced it, and nothing re-read it. *When a ruling changes a rep's
+  invariant, grep the corpus COMMENTS for the invariant, not just the code for the call sites.*
+
+<!-- APPEND-MARKER-LUCOMPACT-END -->
