@@ -36443,8 +36443,12 @@ completion: the emitter half it filed, the root cause of the survivor it measure
 could not name, and the whole evidence set re-run on the unified compiler. Base
 `3ae713e4` (#1301); the previous section's figures were taken at `cf8746f3` and **every
 one of them reproduces on this base, to the row** — the four red cells with their four
-messages, the 10,269-record census on all three axes, the 60 moved records, the six
-BYTES cells and SAB1's sixteen names.
+messages, the 10,269-record census on all three axes (9,891/378 → 9,948/321 · B1 1,933
+0/1,911/22 → 0/1,913/20 · B2 96 60/12/24 → 39 3/12/24 · B3 193 60/97/36 → 136 3/97/36),
+the 60 moved records over 26 files, and the six BYTES cells by name. SAB1's sixteen names
+all reappear in this base's seventeen (the seventeenth is arithmetic and is explained
+below). The one figure NOT re-measured here is #1300's own FLATTEN build (19 moved / 13
+red): the ALIAS-vs-FLATTEN decision is settled and its loser was not rebuilt.
 
 ### WHAT WAS STILL MISSING, AND WHAT IT COST
 
@@ -36453,7 +36457,9 @@ with its exact diff and a measurement that the diff is **necessary and NOT suffi
 applied, the corpus goes 10 moved / 4 red → 7 moved / 1 red and the survivor
 (`lists/union-element-array-litunion.vl`) stops being a clean reject and starts writing a
 module that does not validate. That is the state this slice started from and it is
-reproduced here exactly (`armoff` below IS that build, to the byte: 1,106,577 B).
+reproduced here exactly — `armoff` below and a build of "#1300 + the filed diff" `cmp`
+byte-for-byte (1,106,577 B), so the config that falsifies the fourth leg IS the state the
+third leg left behind.
 
 **There are FOUR legs, not three, and the fourth is not a producer at all.** The three
 producers MINT this vocabulary (canon's annotation spelling, the structural render, the
