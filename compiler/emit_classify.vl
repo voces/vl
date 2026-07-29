@@ -416,7 +416,7 @@ import {
   recordUnMemTys,
   repCanonKey,
   repElemKey,
-  repElemKeyOfName,
+  repElemKeyOfNameTy,
   repKindOfSigTok,
   repNameCanonKey,
   repOfNode,
@@ -5003,6 +5003,23 @@ export function uFieldElemTyIxAt(vi: i32, fi: i32): i32 {
   uFieldElemTyIx[ix]
 }
 
+// The same two sidecars addressed by their FLAT row index — the form the field-table
+// re-derivation passes in `emit_collect` hold, because they walk `sFieldTypes` /
+// `uFieldTypes` straight through rather than per (struct, field) pair. Same uncovered
+// answer as the `…At` pair above (-1 = "keep the name path"), and the same pad-on-push
+// self-heal behind it.
+export function sFieldElemTyIxRow(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  if ix >= sFieldElemTyIx.length { return -1 }
+  sFieldElemTyIx[ix]
+}
+
+export function uFieldElemTyIxRow(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  if ix >= uFieldElemTyIx.length { return -1 }
+  uFieldElemTyIx[ix]
+}
+
 // The KEY half of struct `si`'s MAP field `fi` (B6b): true when the field's type is an
 // i32-keyed map. `sFieldElemKeyI32At`'s uncovered answer is FALSE (string-keyed), the
 // same self-heal shape the arena sidecar's -1 has — and the same conservative one, since
@@ -5071,7 +5088,7 @@ export function uFieldMapShape(vi: i32, fj: i32): i32 {
 // arena-input entry point to the layer `repElemKey` ALREADY keys: `rlInternName`
 // interns each slot on `repElemKey` and `rlSlotByName` scans the same column, so this
 // is a lookup, not new design. It answers `rlSlotByName`'s first two rungs (the
-// exact-stored-name fast path and the `repElemKeyOfName` rescan, which resolves the
+// exact-stored-name fast path and the `repElemKeyOfNameTy` rescan, which resolves the
 // name back to an arena type to compute exactly this key) directly from the type. The
 // THIRD rung — the struct-twin name FALLBACK — has no arena input and is deliberately
 // NOT reproduced here: a caller keeps its name path for the -1 answer, the
@@ -10799,6 +10816,20 @@ export function nameIsRefArray(name: string) {
 // `X[]…[]` nesting of any ref leaf (struct / union / closure) fall out: interning is inner-first,
 // recursively, bottoming out at the leaf array (whose element is not itself a ref array, k != 9).
 export function ensureRefElem(elemName: string) {
+  ensureRefElemTy(elemName, -1)
+}
+
+// `ensureRefElem` with the caller's RECORDED arena type for `elemName` (destringify
+// D-REPELEMTY), threaded to `rlInternNameTy` for the slot KEY and to nothing else: every
+// classification below still reads the spelling, and the intern still MINTS on a miss.
+// `ty` -1 = no hint.
+//
+// THE k==9 RECURSION IS DELIBERATELY UNHINTED. `tyRefArrElemOf(ty)` is `refArrElemName`'s
+// structural dual for ONE peel, but this recursion peels a name the arm has already
+// re-formed and re-classified, and the two disagree: 2 of 94 covered entries over the
+// corpus (`nm=S A=i32 L=S0`). An arena rung at a MINT site has to be equal by
+// construction or it re-keys a row; this one is not, so it stays a name.
+export function ensureRefElemTy(elemName: string, ty: i32) {
   if elemName == "" { return -1 }
   // Re-form the element's ARRAY name to read its kind. A nullable-LIST element (`i32[] | null`) needs its
   // grouping parens back (`(elem)[]`) — without them `refArrElemKind` mis-reads `i32[] | null[]` as a
@@ -10871,7 +10902,7 @@ export function ensureRefElem(elemName: string) {
   } else if k == 10 {
     fa32Used = true
   }
-  rlInternName(elemName, k)
+  rlInternNameTy(elemName, k, ty)
 }
 
 export function refArrElemKind(name: string) {
@@ -11657,6 +11688,22 @@ function rlElemStoredName(name: string): string {
 }
 
 export function rlInternName(name: string, kind: i32) {
+  rlInternNameTy(name, kind, -1)
+}
+
+// `rlInternName` with the caller's RECORDED arena type for `name` (destringify
+// D-REPELEMTY). The hint reaches the KEY and nothing else — the scan, the MINT, the
+// stored spelling and every sidecar push below are unchanged, and a hinted call that
+// finds no row interns exactly the row an unhinted one would.
+//
+// THAT IS THE WHOLE OF WHY THIS IS ALLOWED AT AN INTERNER. D-MAPNODETY's rule — *the
+// arena leg can front a FIND; it must NOT front a MINT* — is about a rung that RETURNS
+// where the mint would have run; this is not one. What it does require instead is that
+// the hint compute the SAME key: a hint that disagrees re-keys the row, which is the
+// same silent-wrong-slot failure by another route. `repElemKeyOfNameTy`'s header states
+// the construction that makes the two shipped hint sites equal, and the two node-bank
+// sites it refutes.
+export function rlInternNameTy(name: string, kind: i32, ty: i32) {
   if name == "" { return -1 }
   // Dedup on the element's REP key (`repElemKey`, destringify D2) — the STRUCTURAL
   // wrapper-equivalence class, NOT a string-canonicalized name. Two spellings that
@@ -11669,7 +11716,7 @@ export function rlInternName(name: string, kind: i32) {
   // iso-recursively DISTINCT functypes, a value-call `ref.cast` TRAP). Declared
   // struct twins stay apart (`repElemKey` keys a struct nominally). The stored name
   // is the canonical spelling for downstream name-consumers (see `rlElemStoredName`).
-  const key = repElemKeyOfName(name)
+  const key = repElemKeyOfNameTy(name, ty)
   let i = 0
   while i < rlElemName.length {
     if rlElemKey[i] == key { return i }
@@ -11722,12 +11769,22 @@ function rlSlotOfArrName(arrName: string): i32 {
   rlSlotByName(refArrElemName(arrName))
 }
 
-// `rlSlotByName` with the caller's RECORDED arena element type as a hint for the
-// struct-twin rung (destringify D-TWINROW). Rungs 1 and 2 are untouched and still
-// run first — a hint must never preempt the exact-name or rep-key match. Rung 3 is
-// the one that had no arena input: it resolves a struct ROW from a rendered element
-// spelling on BOTH sides (`structIndexOfTypeName` → `shapeFieldParse`), and
-// `rlSlotOfTyTwin` is its arena dual.
+// `rlSlotByName` with the caller's RECORDED arena element type as a hint for rungs 2
+// and 3 (destringify D-TWINROW, then D-REPELEMTY). Rung 1, the exact-stored-name match,
+// is untouched and still first — a hint must never preempt it. Rung 3 is the one that
+// had no arena input: it resolves a struct ROW from a rendered element spelling on BOTH
+// sides (`structIndexOfTypeName` → `shapeFieldParse`), and `rlSlotOfTyTwin` is its arena
+// dual.
+//
+// RUNG 2 IS THE SAME KEY EITHER WAY, AND FOR A HINTED CALLER IT IS PROVABLY A REPEAT.
+// The rung computes `repElemKey` of what `name` resolves to; `repElemKeyOfNameTy` reads
+// the hint instead of re-resolving. `sFieldRefSlot`, the only hinted caller, has ALREADY
+// run `rlSlotOfTy(ty)` — `repElemKey(ty)` against this very column — and reached here
+// because it declined, so the hinted rung 2 can only decline again. It is kept rather
+// than deleted because an unreached rung is not a wrong one and the ladder shape is the
+// contract; what it stops doing is asking `resolveAnnot`. Measured on the shipped ladder
+// before the change: rung 2 returns a slot **0 times in 1,792 entries** at that caller
+// (rung 1: 0, rung 3: 7), i.e. the probe #1291 asked for before touching this rung.
 //
 // **A HINTED call never runs the rendered rung 3** — that leg is DELETED for it, not
 // laddered, because the arena leg is TOTAL there and was measured so: an
@@ -11746,7 +11803,7 @@ export function rlSlotByNameTy(name: string, ty: i32): i32 {
     if rlElemName[i] == name { return i }
     i = i + 1
   }
-  const key = repElemKeyOfName(name)
+  const key = repElemKeyOfNameTy(name, ty)
   let ci = 0
   while ci < rlElemName.length {
     if rlElemKey[ci] == key { return ci }
