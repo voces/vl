@@ -35397,3 +35397,354 @@ stringZZ|f64`.
   calling the other, which is also why canon's own column could not move.*
 
 <!-- APPEND-MARKER-LSOFT-END -->
+
+<!-- APPEND-MARKER-INLINESHAPETY-BEGIN -->
+## D-INLINESHAPETY — the 1c emitter filing re-derived: `sTyIxOfName`'s "one call site" is one FUNCTION with six CALLERS, and only 14 of its 1,064 resolutions hold the column; plus two MINT hints, two FIND twins, and a sidecar that is refuted for having two producers (censused and graded off master `ab1ccc7a`, rebased and re-gated on `839dc9a0` — #1296, Lsoft, `typecheck.vl` only; §5's DELTA is identical on both bases and §5a is the second reading)
+
+#1294 §8 filed 1c to this partition in one line: *"`internInlineShapeTy(nm, tyIx)` — the interner
+takes the arena index its caller already holds (`uFieldElemTyIx[ufn]` / `sFieldElemTyIx[...]`) and
+skips `sTyIxOfName` entirely; the 424 distinct inline-shape spellings on the corpus stop being
+re-resolved."* The interner is right, the mechanism is right, and the population is **1.3% of what
+the filing implies**. That is measured first here, because it changed what this slice built.
+
+### 1. THE POPULATIONS, RE-DERIVED PER CALL SITE — the same ZZRA unit, on this base
+
+**PROBE ZZRA.** One counter per site, threaded down the call layers as a site id (#1293's pattern);
+the table reported by `emitFail(zzRaReport())` at `emit_sections.emitProgram`'s tail. The host
+reuses one compiler instance per directory, so the counters accumulate and the LAST record is the
+corpus total.
+
+```
+build: scripts/vl-host/target/release/vl build compiler/entry.vl -o C-pop1.wasm --compiler <seed>
+run:   vl check --codegen tests/cases --compiler C-pop1.wasm   (LAST record; 1,417 emitProgram reaches)
+       vl check --codegen std          --compiler C-pop1.wasm
+```
+
+Every one of the seven ZZRA rows reproduces D-REPELEMTY's post-merge reading to the digit
+(3,946 · 1,064 · 7,770 · 2,085 · 54 · 629 · 1,669 = 17,217), so this base is that slice's base and
+the deltas in §5 are comparable without adjustment.
+
+#### 1a. `sTyIxOfName` — 1,064 of 1,064 from ONE function, and SIX callers of it
+
+#1294 measured the FUNCTION correctly: `internInlineShape` is the only one of the four
+`sTyIxOfName` call sites that reaches `resolveAnnot` (the `s.tdName` row, `internShapeAs` and
+`gaeEnsure` reach it **0** times each, all three re-confirmed here). What it did not do is split
+that function by ITS callers, which is where the routability lives:
+
+| # | `internInlineShape` caller | entries | **mints (= `sTyIxOfName` reaches)** | share | banked? |
+|---|---|---:|---:|---:|---|
+| 1 | `internShapeDeep`'s leaf (`emit_classify:12354`) | 21,441 | **873** | 82.0% | no — a PEELED spelling |
+| 2 | `internFuncTypeShapes` (`emit_classify:12630`) | 271 | **116** | 10.9% | no — a param/result CUT |
+| 3 | its OWN nested-field recursion (`emit_classify:12750`) | 378 | **56** | 5.3% | no — `nonNulBaseOf(ftxt)` |
+| 4 | the VARIANT field table, code 15 (`emit_collect:3601`) | 56 | **12** | 1.1% | **YES — `uFieldElemTyIx[ufn]`** |
+| 5 | `internShapeFieldElems` (`emit_classify:12696`) | 14 | **5** | 0.5% | no — `arrLeafNameOf(ftexts[fi])` |
+| 6 | the VARIANT field table, code 5 (`emit_collect:3611`) | 6 | **2** | 0.2% | **YES — `uFieldElemTyIx[ufn]`** |
+| | **total** | 22,166 | **1,064** | | **14 routable** |
+
+**THE FILING NAMED THE ONLY TWO CALLERS THAT HOLD THE COLUMN AND THEY ARE 14 REACHES.** Its
+sentence — *"called with names the EMITTER composed from its own field tables
+(`uFieldElemName[ufn]`, a peeled element spelling)"* — describes rows 4 and 6 exactly and rows 1,
+2, 3 and 5 not at all. The other 1,046 are names composed by CUTTING a larger spelling: an array
+element, a `| null` peel, a map value, a function parameter, a field text. **A caller that cut the
+name cannot bank the cut**, which is the structural reason this bucket does not open further, and
+it is the same wall as D-REPELEMTY §3b one layer up (`arrLitElemName` vs the literal's type).
+
+Row 1's chain roots at `emit_collect:3762`, `if tn is TypeRef { internShapeDeep(tn.tyName) }` — a
+`TypeRef` NODE, i.e. the mono-clone `nodeTyIx` population D-REPELEMTY §3a refuted at 59/1,328,
+here one peel further away AND feeding `slotCanonKey`'s dedup rung, where a wrong index is a merged
+heap type rather than a re-keyed row. Not attempted.
+
+#### 1b. THE OTHER FIVE CANDIDATES, RE-DERIVED
+
+| candidate | filed (#1295 §7) | here | class |
+|---|---:|---:|---|
+| `mvShapeOfValNameK` kind 1 (`rlInternName(sNames[vsi], 1)`) | 116 | **116** | MINT |
+| `mvShapeOfValNameK` kind 2 (`rlInternName(valName, 2)`) | 88 | **88** | MINT |
+| `mvShapeOfValNameK` kind 14 (`rlInternName(valName, 5)`) | 51 | **51** | MINT |
+| `mvShapeOfValNameK` kind 6 (`ensureRefElem(bare)`) | 169 | **169** | MINT |
+| `variantFieldRefSlot` (`rlSlotByName`) | 72 | **72** (of 584 entries) | FIND |
+| `mvValInnerRlSlot` (`rlSlotOfArrName`) | 6 | **6** (of 282 entries) | FIND |
+
+Every filed number reproduces exactly. The two FIND rows are worth their entry counts: at
+`variantFieldRefSlot` **512 of 584 entries carry an EMPTY element name** (a plain scalar variant
+field) and decline in `repElemKeyOfNameTy`'s first line, so 72 is the whole live population, not a
+sample of it.
+
+### 2. WHAT SHIPPED — three routes, in the file's own `…Ty` idiom
+
+```
+emit_rep.sTyIxOfNameTy(nm, tyIx)              tyIx >= 0 -> tyIx; else the ladder, verbatim
+emit_classify.internInlineShapeTy(nm, tyIx)   threads it to the row's D0 cell and nowhere else
+emit_classify.rlSlotByNameKeyTy(name, keyTy)  a KEY-ONLY hint: rung 2 only, rung 3 untouched
+emit_classify.rlSlotOfArrNameTy(arr, elemTy)  the composition home's arena thread
+```
+
+* **`internInlineShapeTy` at `emit_collect:3601` / `:3611`** takes `uFieldElemTyIxRow(ufn)` — the
+  accessor #1295 shipped, the cell `recordUFieldElemRow` wrote from the SAME `uFieldElemName[ufn]`
+  the caller passes. Inside `internInlineShape` the early return has already established
+  `nameIsShapeSpanEnds(nm)`, and on that branch `sTyIxOfName(nm)` **is**
+  `cUserTypes[nm] ?? resolveAnnot(nm)` — `fieldElemTyIxOfName(nm)`'s whole body. Equal by
+  construction; the one spelling where they part is the >4096 runaway cap, which the recorder
+  answers -1 for, and -1 takes the name leg.
+* **`mvShapeOfValNameK`'s kind-2 and kind-14 interns** take
+  `mvValTyIxAt(mvValTyIx.length - 1)` — the row `recordMvValTyIx(valName)` banked **five lines
+  above**, over the same `valName` both interns key on.
+* **`variantFieldRefSlot` and `mvValInnerRlSlot`** take a KEY-ONLY hint. Their arena rung
+  (`rlSlotOfTy`) has already declined above them, exactly as at `sFieldRefSlot`; what they do NOT
+  have is `sFieldRefSlot`'s measurement that the RENDERED rung never answers — it answers **25 of
+  584 entries** at `variantFieldRefSlot` — so `rlSlotByNameTy`'s full hint, which DELETES that rung,
+  is not their claim to make. `rlSlotByNameTyK(name, ty, keyTy)` splits the two claims; the three
+  entry points differ only in what they pass.
+
+**THE THREE ENTRY POINTS ARE THE POINT OF THIS SLICE'S DESIGN.** A hint parameter on a ladder is
+two independent permissions — *use my index as the key* and *my index makes your fallback
+unreachable* — and #1290 fused them because its one caller held both. Splitting them is what let
+72 + 6 reaches route without re-opening a rung that is live at 4.3% of its entries.
+
+### 3. WHAT DID NOT SHIP, AND WHY — a sidecar with TWO PRODUCERS is not a hint
+
+`mvShapeOfValNameK`'s **kind-1** intern is the near miss and the most interesting row in the slice.
+It interns `sNames[vsi]`, not `valName`, so its hint is that struct row's own D0 cell — for which
+an accessor was written, the route was built, and the dual-write refuted it:
+
+| direction | count | first witness |
+|---|---:|---|
+| covered (`sTyIx[vsi] >= 0`) | 112 / 116 | |
+| **D2 — arena answers, the NAME leg declines** | **4** | `nm=#anon1  A={a:f64,f:f64,z:string,}  L=name:#anon1` |
+| D3 — both answer, differently | 0 | |
+
+**`sTyIx` HAS TWO PRODUCERS AND THE HINT LAW IS ABOUT ONE OF THEM.** `recordSTyIx` is called from
+four sites: three pass `sTyIxOfName(...)`, and `emit_collect:3851` passes `anonRowTyIx(ai)` — a
+NODE bank (`nodeRepTyIxOf` of the object literal). For an `#anonN` row the two answer differently
+*by construction*: the name resolves through neither `cUserTypes` nor the annotation grammar, so
+the bridge returns -1 and the sidecar holds the literal's context-resolved `TyObj`. The hint would
+therefore re-key that ref-list row from `name:#anon1` — the deliberately-unmergeable spelling — to
+a structural key that merges it with any twin. That is the silent wrong-slot failure
+`rlInternNameTy`'s header names, arriving through the D2 column rather than D3.
+
+> **THE RULE, EXTENDED.** D-REPELEMTY: *front a FIND with a banked ANSWER; front a MINT only with a
+> banked INPUT, and only where the input is provably the one the function would have computed.*
+> The new clause: **a sidecar with more than one producer is not that input, even when it is
+> strictly better covered.** "Better covered" and "the same answer" are different properties, and at
+> a MINT only the second one is safe. The tell is cheap — count the writers of the column before
+> reading it as a hint.
+
+**The kind-6 site (169) is exact and blocked on ORDER, not on agreement.** A probe computing
+`fieldElemTyIxOfName(bare)` at that site agrees with the name leg on **169 of 169** entries, 0 in
+every direction. It cannot be taken from the bank because the intern runs BEFORE the row is pushed
+— and it must: a reentrant intern between `mvValName.push` and `mvRlSlot.push` skews every parallel
+table, which is why the `rls6` hoist exists at all. Taking it means hoisting the resolution above
+the kind-6 recursion, which moves *when* `resolveAnnot` mints; `repElemKeyGo`'s identity arm keys
+`TyVar`/`TyLit`/`TyErr` by arena INDEX, so a mint reorder can move a key. **FILED with its measured
+agreement and its one named hazard**, at the site.
+
+### 4. THE DUAL-WRITE, BY DIRECTION AND BY CALLER
+
+Per-directory aggregation (42 directories; the whole-corpus sweep blows the host's diagnostic
+buffer, #1295's method note reproduced exactly).
+
+| routed candidate | entries | arena covered | **D1** arena −1 | **D2** arena + / name − | **D3** both +, DIFFERENT | end-to-end SLOT ≠ |
+|---|---:|---:|---:|---:|---:|---:|
+| `internInlineShapeTy` ← variant table code 15 | 12 | 12 | 0 | 0 | **0** | — |
+| `internInlineShapeTy` ← variant table code 5 | 2 | 2 | 0 | 0 | **0** | — |
+| `rlInternNameTy` ← `mvShapeOfValNameK` kind 2 | 88 | 88 | 0 | 0 | **0** | — |
+| `rlInternNameTy` ← `mvShapeOfValNameK` kind 14 | 51 | 51 | 0 | 0 | **0** | — |
+| `rlSlotByNameKeyTy` ← `variantFieldRefSlot` | 584 | 72 | 512 | 0 | **0** | **0** |
+| `rlSlotByNameKeyTy` ← `mvValInnerRlSlot` | 282 | 19 | 263 | 0 | **0** | **0** |
+| — | | | | | | |
+| `rlInternNameTy` ← kind 1 (`sTyIxRow`) — **NOT SHIPPED** | 116 | 112 | 4 | **4** | 0 | — |
+| `ensureRefElem` ← kind 6 — **NOT SHIPPED (order)** | 169 | 169 | 0 | 0 | **0** | — |
+
+The two FIND rows carry a SECOND comparison the MINT rows cannot have: the end-to-end
+`rlSlotByNameKeyTy(name, ety)` vs `rlSlotByNameKeyTy(name, -1)` slot, which is the value the caller
+actually consumes. Both read 0 differences over all 866 entries. **`std`: 0 entries at every routed
+site, stated rather than reported as a zero.**
+
+D1 at the two FIND sites is not a coverage failure: 512 of `variantFieldRefSlot`'s 584 entries and
+263 of `mvValInnerRlSlot`'s 282 have an EMPTY element name, where `repElemKeyOfNameTy`'s
+`name == ""` early-out sits ABOVE the hint and both legs return `""` together.
+
+### 5. RETIREMENT — same unit, same command, five control rows unmoved
+
+| ZZRA row (`emit_rep` `resolveAnnot` call site) | master `ab1ccc7a` | after | Δ |
+|---|---:|---:|---:|
+| **1 `repElemKeyOfNameTy`** | **3,946** | **3,729** | **−217 (−5.5%)** |
+| **2 `sTyIxOfName`** | **1,064** | **1,050** | **−14 (−1.3%)** |
+| 3 `fieldElemTyIxOfName` | 7,770 | 7,770 | 0 |
+| 4 `unMemAtomTyIx` | 2,085 | 2,085 | 0 |
+| 5 `slotCanonKey` | 54 | 54 | 0 |
+| 6 `repNameCanonKey` | 629 | 629 | 0 |
+| 7 `repRowOfName` | 1,669 | 1,669 | 0 |
+| **total** | **17,217** | **16,986** | **−231 (−1.3%)** |
+
+Per routed site: kind 2 88 → 0 · kind 14 51 → 0 · `variantFieldRefSlot` 72 → 0 ·
+`mvValInnerRlSlot` 6 → 0 · `collect:3601` 12 → 0 · `collect:3611` 2 → 0. 1,417 `emitProgram`
+reaches on both sides; `std` 6 → 6.
+
+**THE PER-SITE ROWS ARE A SECOND CONTROL AND A STRICTER ONE.** Every unrouted site in §1's tables
+reads identically before and after — `internShapeDeep` 873, `internFuncTypeShapes` 116, the nested
+recursion 56, `internShapeFieldElems` 5, kind 1 116, kind 6 169, `sFieldRefSlot` 12,
+`ensureRefElem`'s other callers 1,883, `rlSlotByName`'s other callers 238 — so the delta is
+localized to the six lines that changed, not merely equal in total.
+
+#### 5a. THE SAME MEASUREMENT ON THE REBASE BASE — the delta is identical, the base is not
+
+Re-run in full on `839dc9a0` (#1296, Lsoft — `typecheck.vl` only, none of this slice's files), with
+the same probes and the same commands:
+
+| ZZRA row | master `839dc9a0` | after | Δ | Δ at `ab1ccc7a` |
+|---|---:|---:|---:|---:|
+| 1 `repElemKeyOfNameTy` | 3,930 | 3,713 | **−217** | **−217** |
+| 2 `sTyIxOfName` | 1,064 | 1,050 | **−14** | **−14** |
+| 3 `fieldElemTyIxOfName` | 7,769 | 7,769 | 0 | 0 |
+| 4 `unMemAtomTyIx` | 2,089 | 2,089 | 0 | 0 |
+| 5 `slotCanonKey` | 54 | 54 | 0 | 0 |
+| 6 `repNameCanonKey` | 629 | 629 | 0 | 0 |
+| 7 `repRowOfName` | 1,669 | 1,669 | 0 | 0 |
+| **total** | **17,204** | **16,973** | **−231** | **−231** |
+
+**THE BASE MOVED AND THE DELTA DID NOT, WHICH IS THE POINT OF REPORTING BOTH.** Lsoft's softening
+retires 16 reaches of its own at `annRetKind`'s `rlSlotOfArrName` (84 → 68) — a mixed-union litunion
+element spelling that now resolves where it did not — and #1296's fixture adds one program (1,418
+`emitProgram` reaches, up from 1,417), which moves `internShapeDeep`'s leaf 873 → 874 and
+`internFuncTypeShapes` 116 → 115 *within* an unchanged row-2 total of 1,064. Every routed site
+retires exactly what it retired before.
+
+### 6. THE ROW-3 CENSUS, TAKEN WHILE THE INSTRUMENT WAS BUILT — 60% of the largest bucket is ONE query
+
+`fieldElemTyIxOfName` (7,770) has been the emit-side frontier's biggest row since #1293 filed it as
+"1a". It has five callers and the split is lopsided:
+
+| `fieldElemTyIxOfName` caller | reaches | share | class |
+|---|---:|---:|---|
+| **`mvSlotOfValNameTyK`** (`emit_rep:888`) | **4,677** | **60.2%** | **FIND** — the mv layer's name→ty→slot query |
+| `rlInternNameTy`'s mint → `rlElemTyIx` | 1,540 | 19.8% | MINT (sidecar producer) |
+| `recordSFieldElemRow` | 783 | 10.1% | MINT (sidecar producer) |
+| `recordMvValTyIx` | 675 | 8.7% | MINT (sidecar producer) |
+| `recordUFieldElemRow` | 98 | 1.3% | MINT (sidecar producer) |
+| | **7,773** | | |
+
+(7,773, not 7,770: the census build adds one probe-only resolution at the kind-6 site, which
+perturbs `resolveAnnot`'s memo by 3. The unperturbed row is 7,770.)
+
+**FOUR OF THE FIVE ARE THE D5 SIDECARS' OWN PRODUCERS** — they are not re-parsing anything, they
+are the single point at which each column is computed, and retiring them means the columns come
+from somewhere else entirely (the checker). The **FIND** is the whole routable half:
+`mvSlotOfValNameTyK(nm, keyI32)` is `mvSlotOfTyK(fieldElemTyIxOfName(nm), keyI32)`, reached from
+five arena-first rungs (`mvShapeOfValNameK` ×2, `emit_classify:10257`, `:19770`,
+`emit_collect:2502`) that each hold only a spelling. **FILED: 4,677 reaches at one function, whose
+callers need a NODE or a sidecar to hold the value type — the largest single routable population
+now standing in this partition.**
+
+### 7. GRADING — every rc taken BARE, never through a pipe
+
+Both bases are reported: the CENSUS base `ab1ccc7a` (where the three sabotages were built and
+graded) and the REBASE base `839dc9a0`, where every leg was re-run bare.
+
+| leg | rc | reading at `ab1ccc7a` | reading at `839dc9a0` (re-gate) |
+| --- | ---: | --- | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,103,310 B** — and it IS that master's own fixpoint (its frozen source compiled by it reproduces it byte-for-byte at ONE compile, and again at two), so the A/B baseline is master's published compiler | **1,102,171 B**, same property re-checked (`seed-latest` moved mid-session) |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,103,497 B** | **1,102,358 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,103,497 B | stage3 == stage4, 1,102,358 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** | **3,566 / 0 / 7** (#1296 added two cases) — magnitude AND ignored SET identical to the respective master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); the 7 is the tell the env var took |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean | clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale | exact, same counts |
+| corpus A/B, six channels | 0 | **1,699 files, 0 rows moved on every field**, graded by the three sabotages below | **1,700 files, 0 rows moved on every field** |
+| fuzz A/B, 1,800 programs/side × 2 legs (seeds 4101/4202/4303 × depths 4/5/6, `plain` and `--branching --multiobs`) | 0 | byte-identical per leg (96 / 91 lines a side, md5 equal) — **and NOT a coverage zero, see below** | identical md5s on both legs, to the same digests |
+| master's FROZEN source compiled by this head | 0 | `cmp` clean — **and VACUOUS, proved by an inverted control: SAB-MVKEY, which breaks 38 corpus programs, ALSO reproduces it byte-identically** | — |
+
+**THREE SABOTAGES, ONE PER SHIPPED ROUTE, WITH NAMED WITNESS SETS.**
+
+| sabotage | what it poisons | corpus A/B × 6 channels |
+| --- | --- | ---: |
+| **SAB-MVKEY** — `mvShapeOfValNameK`'s banked `vRowTy + 1` | the two kind-2/kind-14 MINT hints | **38 files** — `BUILDRC(0/1)` · `BUILDMSG` · `RUNRC(0/1)` |
+| **SAB-FINDKEY** — `rlSlotByNameKeyTy` passes `keyTy + 1` | the two FIND twins | **5 files** — `BUILDRC(0/1)` · `BUILDMSG` · `RUNRC(0/1)` |
+| **SAB-SHAPETY** — `internInlineShapeTy` records `tyIx + 1` | the 14-reach D0 route | **3 files** — `BUILDMSG` + **BYTES** |
+
+* **SAB-MVKEY (38)**, the first ten: `closures/closure-map-nulscalar-result-valuecall.vl` ·
+  `closures/closure-struct-elem-list-map-fields.vl` · `closures/for-in-closure-array.vl` ·
+  `closures/lambda-array-result-adopt.vl` · `closures/map-nul-litunion-mix-field-result.vl` ·
+  `maps/array-of-map-union-arm.vl` · `maps/i32-keyed-ref-values.vl` ·
+  `maps/list-of-maps-element-values.vl` · `maps/union-valued-map.vl` ·
+  `unions/map-member-refvalue.vl`. Every one carries a REF-VALUED map, which is exactly the
+  population kinds 2/14 serve.
+* **SAB-FINDKEY (5), exhaustively**: `closures/closure-array-union-arm-field-call.vl` ·
+  `closures/closure-array-union-arm-field-nolambda.vl` ·
+  `closures/rebind-union-arm-closure-field-call.vl` ·
+  `maps/closure-field-variant-map-result.vl` · `unions/narrowed-guard-binding-shape-field.vl` —
+  four of the five are a union VARIANT's ref-list field, i.e. `variantFieldRefSlot`'s own cell.
+* **SAB-SHAPETY (3), exhaustively**: `structs/error-deep-union-nullable-list-field-array-shape.vl` ·
+  `unions/deep-composite-elem-union-narrowed-reads.vl` ·
+  `unions/nested-struct-field-elem-union-scalar-box.vl`. **All three move on BYTES**, none on any rc
+  — a fourteen-reach route whose only visible effect is a program that still builds from a compiler
+  that keyed one row differently. *That is the channel BUILDMSG+BYTES exists for, and it is the only
+  reason a 14-reach route is gradeable at all.*
+* **THE FUZZ CHANNEL IS NOT VACUOUS.** SAB-MVKEY through the same 1,800-program
+  `--branching --multiobs` stream turns 8 findings into 14 in the first batch and 55 TRAP/REJECT
+  lines into **214** across the run. The generated grammar reaches ref-valued maps densely, so the
+  fuzz zero is coverage.
+
+**SEED BOOTSTRAP: no split needed** — the gate starts from a freshly fetched published
+`seed-latest` and it compiles this branch's source (`refresh-compiler.sh` rc 0 on the first
+self-compile).
+
+**BYTE DELTA: +187 B at BOTH bases** (1,103,310 → 1,103,497 · 1,102,171 → 1,102,358). Four `…Ty`
+twins, one ladder body split into a three-argument core, and six call-site arguments, against
+nothing deleted.
+
+### 8. THE EMIT-SIDE FRONTIER AFTER THIS SLICE
+
+| # | bucket | reaches | status | what it needs |
+|---|---|---:|---|---|
+| 1a | `fieldElemTyIxOfName` | **7,770** | **RE-DERIVED, §6** | 4,677 (60%) are ONE FIND, `mvSlotOfValNameTyK`; the other 3,093 are the D5 columns' own producers and retire only if the CHECKER writes the columns |
+| 1b-i | `collect:3465` · `collect:3209` · the k==9 recursion | 2,740 | BLOCKED, MEASURED (#1295 §3) | unchanged |
+| 1b-ii | the name-only MINT sites | 796 → **657** | **PARTLY SHIPPED** — kind 2 + kind 14 retired | kind 1 is **REFUTED**, §3 (two producers); kind 6 (169) is exact and blocked on the resolveAnnot ORDER; `forceCloResultListTypes` 204 / the union-arm scan 157 hold a spelling by construction |
+| 1b-iii | the FIND residue | 400 → **322** | **PARTLY SHIPPED** — both `sFieldRefSlot` twins retired | `refListSlotOfExpr` (232) holds an EXPR node — same §3a exposure, still unmeasured; `annRetKind` (84) is name-only |
+| 1c | `sTyIxOfName` | 1,064 → **1,050** | **CLOSED FOR THIS ROUTE**, §1a | the residue is 1,046 CUT spellings; 873 of them root at a `TypeRef` node, i.e. the mono-clone `nodeTyIx` item, feeding the struct DEDUP key |
+| 1c | `unMemAtomTyIx` | 2,085 | REFUTED (#1294 §8) | a recorder written by CANON, i.e. W9 |
+
+**NOTHING FILED FOR THE CHECKER PARTITION.** The one item that would unblock the largest remaining
+row (§6's `mvSlotOfValNameTyK`) is emit-side: its five callers need a node bank or a sidecar for the
+map VALUE type, and D-MAPNODETY already ruled that the two `collectA` callers' node banks may front
+its FIND siblings but not `mvShapeOfValNameK`'s mint.
+
+**Lsoft IS UNTOUCHED — AND THE REBASE IS THE STRONGER STATEMENT.** No shipped site's behaviour
+depends on the mixed-union litunion spelling: `repElemKeyGo`'s MIX-widening arm and `repCanonKey`'s
+union arm run identically on both legs of every dual-write above, and the kind-2 (value-union) hint
+agrees on 88 of 88 entries *through* that arm rather than around it. #1296 then shipped the soften
+underneath this branch and every routed site retired exactly the same count (§5a), which is the
+independence claim measured rather than asserted. Lsoft's own retirement shows up in a row this
+slice does not touch: `annRetKind`'s `rlSlotOfArrName` 84 → 68.
+
+### METHOD NOTES
+
+* **"ONE CALL SITE" IS A TRUE SENTENCE THAT CAN HIDE THE WHOLE QUESTION.** #1294's *"1,064 of 1,064
+  reaches come from `emit_classify.internInlineShape`"* is exactly right and it is a statement about
+  a FUNCTION. Routability is a property of that function's CALLERS, and its six split 82 / 11 / 5 /
+  1 / 0.5 / 0.2, with the column present only in the last two rungs. *When a filing localizes a
+  population to a function, the next question is never "does it hold a bank" — it is "which of its
+  callers does".* This is the fourth consecutive slice where bucketing by caller changed the work.
+* **A SIDECAR WITH TWO PRODUCERS IS NOT A HINT.** `sTyIx` is written by `sTyIxOfName` at three sites
+  and by `anonRowTyIx` — a node bank — at a fourth, so it is strictly better covered than the bridge
+  it would front, and *better covered is not the same answer*. The disagreement showed up in the D2
+  column (arena answers where the name declines), the direction that looks benign at a FIND and
+  re-keys a row at a MINT. **Count the writers of a column before reading it as a hint** — a
+  two-line grep that would have saved the route.
+* **A HINT PARAMETER CAN CARRY TWO PERMISSIONS, AND FUSING THEM IS A REAL COST.**
+  `rlSlotByNameTy(name, ty)` means both *key on my index* and *my index makes your rendered
+  fallback unreachable*. #1290 fused them because its single caller had measured both. Two later
+  callers had the first and not the second — and the second is live for them (25 of 584 entries) —
+  so the fused parameter was un-passable and the population sat filed for two slices. Splitting it
+  is nine lines. *When a filing says "route X the way Y routed", check whether Y's hint asserts more
+  than the key.*
+* **A ROUTE TOO SMALL TO MOVE AN rc IS STILL GRADEABLE, ON BYTES.** SAB-SHAPETY's 14 reaches move
+  **zero** files on CHECKRC, CHECKMSG, BUILDRC and RUNRC, and three on BUILDMSG+BYTES. A five-field
+  A/B would have graded this slice's smallest route at zero and called it uncovered. *The sixth
+  channel is not a luxury for small routes; it is the only channel they have.*
+* **MEASURE THE CENSUS YOU DID NOT COME FOR WHILE THE INSTRUMENT IS BUILT.** §6 cost one extra
+  counter per call site on a probe build that already existed, and it moved the largest row in the
+  frontier from "filed, 7,770" to "60% is one FIND at one function, and the other 40% cannot retire
+  without moving the columns to the checker". *The marginal cost of a second census on a live probe
+  is a line each; take it.*
+
+<!-- APPEND-MARKER-INLINESHAPETY-END -->
