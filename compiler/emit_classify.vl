@@ -408,6 +408,7 @@ import {
   msAtomIdOf,
   mvSlotKeyI32,
   mvSlotOfTyK,
+  mvSlotOfValNameRowTy,
   mvSlotOfValNameTyK,
   nodeMapValTyIx,
   recordMvValTyIx,
@@ -434,6 +435,7 @@ import {
   tyIsI32LeafElem,
   tyIsStrLeafElem,
   tyMapKeyIsI32,
+  tyMapValOf,
   unMemRowStart,
   vbHeapIdxOfKind,
 } from "./emit_rep"
@@ -3625,7 +3627,25 @@ export function mapMonoShapeOfKey(keyI32: boolean) {
 // `vl check` rc 0. Its FIND-side siblings — `mapAnnShape` and
 // `mvSlotOfMapValNameOrMonoK` — take the same banked type with a dual-write disagreement
 // count of 0 and ARE routed.
+//
+// …AND THE ROW FORM BELOW IS THE ONE EXCEPTION THE RULE ALWAYS HAD, NOW TAKEN. The rule
+// forbids a better ANSWER at this rung; it does not forbid the SAME INPUT. The two
+// field-table re-derivation loops in `emit_collect` call this function with a
+// `sFieldElemName` / `uFieldElemName` cell whose arena type the row's own recorder
+// computed — by calling `fieldElemTyIxOfName` on that very string — and `rowTy` carries
+// it. Dual-write over the corpus: 441 + 56 entries, all covered, and the raw arena
+// INDEX is identical on every one, so the lookup below cannot move and the mint below it
+// cannot be skipped. (`ensureRefElemTy` two lines further down the SAME loop already
+// takes the same cell; this is that thread reaching the sibling intern.)
 export function mvShapeOfValNameK(valNameIn: string, keyI32: boolean) {
+  mvShapeOfValNameRowTy(valNameIn, keyI32, -1)
+}
+
+export function mvShapeOfValNameRowTy(
+  valNameIn: string,
+  keyI32: boolean,
+  rowTy: i32,
+) {
   const valName = mvCanonValName(valNameIn)
   const kind = mvValKindOfName(valName)
   if kind == -1 { return -1 }
@@ -3649,7 +3669,7 @@ export function mvShapeOfValNameK(valNameIn: string, keyI32: boolean) {
   // The slot's identity is STRUCTURAL (`repMvValKey` over the value's arena type) PAIRED
   // with the key rep, not the recorded spelling; the name scan stays as the fall-through
   // for a value spelling the arena does not resolve.
-  const aSh = mvSlotOfValNameTyK(valNameIn, keyI32)
+  const aSh = mvSlotOfValNameRowTy(valNameIn, keyI32, rowTy)
   if aSh >= 0 { return aSh }
   const nmSh = mvSlotByValNameK(valName, keyI32)
   if nmSh >= 0 { return nmSh }
@@ -8499,9 +8519,16 @@ function mapReadMvSlot(exprIx: i32, fnIx: i32) {
     if ax is Ident {
       const aun = unionNameOfIdent(ax.identName, fnIx)
       if aun != "" {
-        const ma = unionMapArmName(aun)
+        // The arm's ARENA type comes back with its spelling (D-MVSLOTFIND), so the
+        // value slot resolves off the `TyMap` the member scan already read instead of
+        // re-slicing `V` out of the rendered arm. An arena-blind row pushes nothing and
+        // the name leg below `mvSlotOfMapNameTy` answers exactly as before.
+        const armTy: i32[] = []
+        const ma = unionMapArmNameTy(aun, armTy)
         if ma != "" {
-          const msl = mvSlotOfMapName(ma)
+          let maVt = -1
+          if armTy.length > 0 { maVt = tyMapValOf(armTy[0]) }
+          const msl = mvSlotOfMapNameTy(ma, maVt)
           if msl >= 0 { return msl }
         }
       }
@@ -13530,8 +13557,20 @@ function variantFieldLayoutEq(a: i32, b: i32): i32 {
       // a key comparison added here and with it absent. The `collectU`-time sibling
       // `variantFieldCodesEq` is a different story — it is NOT canon-key gated, and its
       // key comparison has a witness (`unions/same-field-names-different-map-keys-reject.vl`).
-      const ma = mvSlotOfMapValNameOrMono(uFieldElemName[uFieldStart[a] + fi])
-      const mb = mvSlotOfMapValNameOrMono(uFieldElemName[uFieldStart[b] + fi])
+      // Each side takes its OWN row's D5 cell (D-MVSLOTFIND): a code-19 row records the
+      // map's VALUE name in `uFieldElemName`, and `recordUFieldElemRow` banked
+      // `fieldElemTyIxOfName` of that exact string beside it, so the two are one row's
+      // two columns rather than two provenances.
+      const ma = mvSlotOfMapValNameOrMonoKTy(
+        uFieldElemName[uFieldStart[a] + fi],
+        false,
+        uFieldElemTyIxRow(uFieldStart[a] + fi),
+      )
+      const mb = mvSlotOfMapValNameOrMonoKTy(
+        uFieldElemName[uFieldStart[b] + fi],
+        false,
+        uFieldElemTyIxRow(uFieldStart[b] + fi),
+      )
       let mOk = false
       if ma == -1 && mb == -1 { mOk = true }
       if ma >= 0 && mb >= 0 {
@@ -13950,7 +13989,13 @@ export function unionHasMapArmSlot(name: string, slot: i32) {
       isMap = a != "null" && nameIsMap(a)
     }
     if isMap {
-      if (mvCanonRepOf(mvSlotOfMapName(a)) == mvCanonRepOf(slot)) {
+      // The arm's VALUE type is already in hand when the arena decided the arm
+      // (D-MVSLOTFIND): `mems[i]` IS this atom's `TyMap`, so the slot lookup takes one
+      // hop instead of re-parsing `mapValNameOf(a)`. An arena-blind row (`cov` false)
+      // passes -1 and the name leg answers where it always did.
+      let aVt = -1
+      if cov { aVt = tyMapValOf(mems[i]) }
+      if (mvCanonRepOf(mvSlotOfMapNameTy(a, aVt)) == mvCanonRepOf(slot)) {
         return true
       }
     }
@@ -14001,6 +14046,18 @@ export function unionHasMapArm(name: string) { unionMapArmName(name) != "" }
 // arm's VALUE mv slot from it so a `t[k] ?? d` binding classifies its value union in the frame
 // pre-pass (where the `is`-narrow that makes `t` a map is not active).
 export function unionMapArmName(name: string) {
+  const armTy: i32[] = []
+  unionMapArmNameTy(name, armTy)
+}
+
+// …and the form that also HANDS BACK the arm's arena type, pushed onto `outTy` (empty
+// when the arena leg did not decide the arm). The map-slot layer downstream is still
+// name-keyed, so the spelling stays the return value; what changed is that the caller no
+// longer has to re-derive `V` from it — `tyMapValOf(outTy[0])` is the value type this
+// scan already read off the row (D-MVSLOTFIND). An out-array rather than a second
+// function because the arm is chosen by ONE walk: a `unionMapArmTy` sibling would scan
+// the member slice a second time to answer about the row this one already picked.
+export function unionMapArmNameTy(name: string, outTy: i32[]) {
   const atoms: string[] = []
   // D-UNION: pick the map arm from the row's recorded ARENA member types
   // (`unMemIsMap` — `T.tys[m] is TyMap`) instead of re-classifying each atom's
@@ -14012,7 +14069,10 @@ export function unionMapArmName(name: string) {
   if unionArmTys(name, atoms, mems) {
     let m = 0
     while m < mems.length {
-      if unMemIsMap(mems[m]) { return atoms[m] }
+      if unMemIsMap(mems[m]) {
+        outTy.push(mems[m])
+        return atoms[m]
+      }
       m = m + 1
     }
     return ""
@@ -16438,6 +16498,26 @@ export function narrowedMapOf(name: string) {
   // wasm (the same guard every `paramMap` / `retMapFlag` / `nameFieldCode` site carries).
   if nameIsBareMap(v) { return v }
   ""
+}
+
+// The map VALUE type the narrowing banks for `name`, or -1 — `narrowedMapOf`'s structural
+// sibling, reading the SAME stack slot's TYPE column instead of its rendered variant and
+// taking one `TyMap` hop down to the value. The two answers are one row's two halves
+// (`pushNarrowRep` writes `narrowVariants[i]` and `narrowTys[i]` together), which is why
+// the consumer can pair them without asking whether they describe the same map.
+//
+// THE BIGGEST SINGLE `fieldElemTyIxOfName` CALLER IN THE EMITTER WAS THE ABSENCE OF THIS
+// FUNCTION (D-MVSLOTFIND): `mapShapeOfExpr`'s narrowed-arm rung handed `mvSlotOfMapName`
+// the rendered arm spelling, which sliced `V` back out of `{[K]: V}` and put the slice
+// through the annotation grammar — 672 `resolveAnnot` reaches over the corpus, every one
+// of them re-deriving a type the `is`-narrow had banked at the push. Dual-write, 912
+// entries: covered 912, D1/D2/D3 all 0, and the arena leg resolves a slot at exactly the
+// 672 entries the name leg does. -1 (a complement narrow, a 2+-member set, a non-map arm)
+// keeps the name path in its old position.
+export function narrowedMapValTyOf(name: string): i32 {
+  const i = narrowSlotOf(name)
+  if i < 0 { return -1 }
+  tyMapValOf(narrowSlotTy(i))
 }
 
 // The atom KIND an IDENT expression currently reads as, for the scalar/string
@@ -19606,8 +19686,14 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     // -1, or a typed value's mv slot) — the map ops in the narrowed branch read that value type,
     // not the mono i32 assumption a bare -1 would force. Checked FIRST (the declared type is a
     // union, so `declaredMap`/`paramMap`/global below miss it), mirroring `exprMap`.
+    // …and the VALUE type comes off the same narrow-stack row as the arm spelling
+    // (D-MVSLOTFIND — `narrowedMapValTyOf`), so the rendered `{[K]: V}` is no longer
+    // re-sliced and re-parsed to recover what the `is`-push banked. The name leg stays
+    // BELOW it, unmoved, for a narrow that banked no single type.
     const nm = narrowedMapOf(e.identName)
-    if nm != "" { return mvSlotOfMapName(nm) }
+    if nm != "" {
+      return mvSlotOfMapNameTy(nm, narrowedMapValTyOf(e.identName))
+    }
     if declaredMap(e.identName) {
       const slot = declaredSlotOf(e.identName)
       if slot >= 0 { return localStructIdx[slot] }

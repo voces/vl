@@ -58,7 +58,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 >
 > **THE EMIT-SIDE / CHECKER-SIDE FRONTIER IS TRACKED PER BUCKET IN THE PROGRAMME DOC**, with the
 > populations re-derived on each slice's own base (they drift, and three consecutive slices found the
-> filed *unit* wrong rather than the filed number). Three standing corrections that outlived the
+> filed *unit* wrong rather than the filed number). Four standing corrections that outlived the
 > slices that made them:
 > - **1c `unMemAtomTyIx` — a checker-side recorder is REFUTED, not merely unscheduled** (#1294 §8).
 >   The checker and the emitter's bridge resolve the same union member and disagree on **444 of 761**
@@ -71,6 +71,14 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 >   named. 1,046 arrive through `internShapeDeep`'s peeled leaf, `internFuncTypeShapes`, the nested-
 >   field recursion and `internShapeFieldElems` — each of which CUT `nm` out of a larger spelling, so
 >   no caller banks the cut. The 14 shipped; the rest waits on the mono-clone `nodeTyIx` item.
+> - **1a `mvSlotOfValNameTyK` — 61% of the "largest routable population now standing" is two rows the
+>   programme had ALREADY refuted** (#1301). #1297's bonus census is exact (4,677 reaches at one
+>   FIND) and its availability claim is not: bucketed by CALLER, 2,042 are `letMapShapeOf` and 812
+>   are `collectA`'s `TypeRef` walk — D-MAPNODETY §3a/§3b, both re-measured to the same entry here
+>   (D3 = 128 · D2 = 2). Neither is a routing problem: the first needs the alias identity in the emit
+>   spelling, the second needs the intern and the lookup split into two functions. *A bucket's SIZE
+>   and its AVAILABILITY are independent facts; check a new census against the refutations already in
+>   the document before filing it as work.*
 > - **bucket 3 is `monoInferListElem` / `monoInferLocalScalar`, not `inferListElemName`** (#1294 §6) —
 >   a function name that never existed in the tree, carried through four slices against a count that
 >   was exact. Its producer `pinned` is built by string surgery in `emit_mono.monoInstanceFor`, so the
