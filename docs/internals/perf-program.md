@@ -383,8 +383,8 @@ self-compile unless stated.
 
 ## 4. LSP / tools latency
 
-Per-process `wait4` rusage, min-of-N, quiet box (load ≈ 5), `.cwasm` sidecar
-**warm** — the cold sidecar is ~10× slower and is a different measurement.
+Per-process `wait4` rusage, min-of-N, quiet box (load ≈ 1.4–5), `.cwasm` sidecar
+**warm**.
 
 | task | wall | peak RSS |
 | --- | ---: | ---: |
@@ -401,12 +401,23 @@ Reading: **the single-file LSP path is fine at the small end and the seed-load
 floor is 5 ms**, so per-keystroke checking of an ordinary file is not the problem.
 The 231 ms for one large compiler file, and the 969 ms whole-graph check, are what
 an editor would feel on a big project — and both are §3's items 2–4 territory.
-`vl fmt` over the whole compiler tree at 559 ms is comfortably inside a
-save-hook budget.
+`vl fmt` over the whole compiler tree at 559 ms is comfortably inside a save-hook
+budget.
 
-**Cold vs warm**: every row above is sidecar-warm. A cold `.cwasm` adds a
-one-time Cranelift compile of the ~1.1 MB seed (seconds), which is why the shipped
-binary's embedded-seed cache is gated in CI at all — see `ci-embed-seed`.
+**COLD vs WARM, measured — and the "~10×" I first wrote is wrong for the case that
+matters.** Deleting `build/vl-compiler.wasm.cwasm` and re-running the same command:
+
+| task | cold | warm | ratio |
+| --- | ---: | ---: | ---: |
+| `vl build tiny.vl` | **1,850 ms** | 6 ms | **290×** |
+| `vl check compiler/typecheck.vl` | 1,968 ms | 222 ms | 8.9× |
+
+The cold cost is a **constant ~1.85 s** — the Cranelift compile of the ~1.1 MB
+seed — so the RATIO is entirely a function of how small the real work is, and it
+is worst exactly where an editor lives. That is the reason the shipped binary's
+embedded-seed cache is gated in CI at all (see `ci-embed-seed`), and the reason
+a "the sidecar makes it 10× slower" rule of thumb should not be quoted: it is 290×
+for a one-function file.
 
 ---
 
@@ -422,4 +433,5 @@ binary's embedded-seed cache is gated in CI at all — see `ci-embed-seed`.
 | `__str_eq__` consumer split | walk each `__str_eq__` sample one frame up (two, through `__map_probe__`) and classify the caller |
 | ~0.5 GB per self-compile | `wait4` rusage `ru_maxrss` on a FRESH child per measurement. `getrusage(RUSAGE_CHILDREN)` is a cumulative high-water mark and will report the max over every child so far — that mistake made `vl check` look like it allocated 649 MB when the number was really the previous `vl build` |
 | `string` is `(array (mut i32))` | `wasm-tools print build/vl-compiler.wasm` and read the type section; `array.new_fixed` of it is a string literal |
+| cold vs warm sidecar | delete `build/vl-compiler.wasm.cwasm` and re-run the SAME command. The cost is a constant ~1.85 s, so quote it as a constant, never as a ratio — the ratio is 290× on a one-function file and 8.9× on a 22 K-line one |
 | compiler byte-identity of a CI-only change | `git diff master --name-only -- compiler/ std/ scripts/` is empty, and `vl build compiler/entry.vl` `cmp`s equal to the seed |
