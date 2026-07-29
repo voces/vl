@@ -1,0 +1,149 @@
+// @run
+// @log 2
+// @log 7
+// @log true
+// @log 1
+// @log 5
+// @log 2
+// @log 11
+// @log 33
+// @log alpha
+// @log beta
+// @log 2
+// @log is
+// @log 2
+// @log 8
+// @log zz
+// @log 1
+// @log 4
+// @log 6
+// @log 8
+// CAPABILITY (B6b): an i32-keyed map is a STRUCT FIELD. This file is what
+// `maps/error-i32-keyed-position-field.vl` became.
+//
+// THE MECHANISM, in one line: a field ROW records only the map's VALUE
+// (`sFieldElemName` holds `V`, the D5 sidecar holds V's arena type) while an mv
+// slot's identity is the (KEY, VALUE) PAIR — so before the row grew its KEY
+// COLUMN (`sFieldElemKeyI32`) an i32-keyed map field resolved its STRING-keyed
+// twin's map struct: a string-ref keys list read as an i32 list, invalid wasm
+// that `vl check` cannot see. That is why the position was a loud reject and not
+// merely a missing feature.
+//
+// The column is written by `pushFieldRow` / `recordSFieldElemRow` off the field's
+// own SPELLING and read back at ONE home, `sFieldMapShape`, which the four sites
+// that used to spell `mvSlotOfValNameFind(sFieldElemNameAt(si, fi))` by hand all
+// call: the TYPE SECTION's field storage, the object-literal construct seed, the
+// field-STORE seed, and `mapShapeOfExpr`'s struct-receiver arm. A receiver
+// classifier that answered a different struct than the field's storage type is
+// the same invalid-wasm class one layer up, which is why they share a home.
+//
+// THE DECISIVE CELL IS `both` BELOW: one struct with an i32-keyed AND a
+// string-keyed field over the SAME value type. Their rows are byte-identical in
+// every column the emitter had before this change.
+
+type Counts = { hits: {[i32]: i32}, tag: string }
+type Names = { by: {[i32]: string} }
+type Both = { a: {[i32]: string}, b: {[string]: string} }
+
+// A MONO (i32-valued) i32-keyed map field: the `-4` shape, no interned mv slot.
+function mono() {
+  const c: Counts = { hits: Map(), tag: "c" }
+  c.hits[11] = 7
+  c.hits[22] = 9
+  print(c.hits.length)          // 2
+  print(c.hits[11] ?? 0)        // 7
+  print(c.hits.has(22))         // true
+  c.hits.delete(22)
+  print(c.hits.length)          // 1
+  // The BOUND receiver — the field read flows into a local whose map type comes
+  // from `mapShapeOfExpr`'s struct-field arm.
+  const m = c.hits
+  m[33] = 5
+  print(m[33] ?? 0)             // 5
+  print(c.hits.length)          // 2
+  for k in c.hits {
+    print(k)                    // 11, 33
+  }
+}
+mono()
+
+// A REF-valued i32-keyed map field: a real mv slot, interned against the i32 key.
+function refVal() {
+  const n: Names = { by: Map() }
+  n.by[11] = "alpha"
+  n.by.set(22, "beta")
+  print(n.by[11] ?? "-")        // alpha
+  print(n.by.get(22) ?? "-")    // beta
+  const b = n.by
+  print(b.length)               // 2
+}
+refVal()
+
+// BOTH KEY REPS IN ONE STRUCT, over the SAME value type. Every column the field
+// row had before B6b is identical for these two fields — same code (19), same
+// recorded value name ("string"), same recorded value arena type — so the key
+// column is the ONLY thing that tells `a`'s storage from `b`'s.
+function both() {
+  const t: Both = { a: Map(), b: Map() }
+  t.a[11] = "i"
+  t.b["k"] = "s"
+  print((t.a[11] ?? "-") + (t.b["k"] ?? "-")) // is
+  print(t.a.length + t.b.length)             // 2
+}
+both()
+
+// The INLINE shape (`{ m: {[i32]: V} }`) — a DIFFERENT path to the same row: the
+// whole shape is ONE `TypeRef` name, so the field's own `{[i32]: V}` never
+// reaches the annotation scan on its own. `i32MapSpellingLowerable` peels the
+// shape to its fields, and the field-table pass is the only thing that interns
+// the value and sets `mI32Used`.
+function inlineShape() {
+  const s: { m: {[i32]: i32}, n: i32 } = { m: Map(), n: 5 }
+  s.m[11] = 3
+  print((s.m[11] ?? 0) + s.n)   // 8
+  const q: { by: {[i32]: string} } = { by: Map() }
+  q.by[11] = "zz"
+  print(q.by[11] ?? "-")        // zz
+}
+inlineShape()
+
+// A NULLABLE i32-keyed map field (code 29) and a nested-STRUCT owner.
+type Inner = { f: {[i32]: i32} | null }
+type Outer = { i: Inner }
+function nullableAndNested() {
+  const m: {[i32]: i32} = Map()
+  m[11] = 4
+  const o: Outer = { i: { f: m } }
+  const q = o.i.f
+  if q != null {
+    print(q.length)             // 1
+    print(q[11] ?? 0)           // 4
+  }
+}
+nullableAndNested()
+
+// A field map crossing a FUNCTION boundary in both directions.
+function put(c: Counts) {
+  c.hits[44] = 6
+}
+function rd(c: Counts): i32 {
+  return c.hits[44] ?? 0
+}
+function acrossParams() {
+  const c: Counts = { hits: Map(), tag: "p" }
+  put(c)
+  print(rd(c))                  // 6
+}
+acrossParams()
+
+// A GLOBAL struct whose field is the map: the store and the read run in frames
+// that declare no map of their own.
+const gc: Counts = { hits: Map(), tag: "g" }
+function setGlobalField() {
+  gc.hits[55] = 8
+}
+function readGlobalField(): i32 {
+  return gc.hits[55] ?? 0
+}
+setGlobalField()
+print(readGlobalField())        // 8

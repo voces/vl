@@ -244,6 +244,7 @@ import {
   rlWrapIdx,
   sDeclared,
   sFieldCount,
+  sFieldElemKeyI32,
   sFieldElemName,
   sFieldElemTyIx,
   sFieldNames,
@@ -258,6 +259,7 @@ import {
   uBoxIdx,
   uDeclared,
   uFieldCount,
+  uFieldElemKeyI32,
   uFieldElemName,
   uFieldElemTyIx,
   uFieldNames,
@@ -289,9 +291,9 @@ import {
   anonRowTyIx,
   buildStructTwins,
   mvSlotOfValNameTyK,
-  recordSFieldElemTyIx,
+  recordSFieldElemRow,
   recordSTyIx,
-  recordUFieldElemTyIx,
+  recordUFieldElemRow,
   recordUnMemTys,
   sTyIxOfName,
 } from "./emit_rep"
@@ -393,7 +395,7 @@ import {
   mvCanonRepOf,
   mvCanonValName,
   mvShapeOfMapName,
-  mvShapeOfValName,
+  mvShapeOfValNameK,
   mvSlotByValNameK,
   nameFieldCode,
   nameIsNulRefList,
@@ -424,6 +426,7 @@ import {
   rlElemStructRow,
   rlInternName,
   rlSlotByName,
+  sFieldRowKeyI32,
   scopeBind,
   scopePop,
   scopePush,
@@ -438,6 +441,8 @@ import {
   structIndexOfObj,
   structIndexOfTypeName,
   synthTypeRef,
+  uFieldElemKeyI32At,
+  uFieldRowKeyI32,
   unionArmSigKey,
   unionSetHasNull,
   variantIndexOf,
@@ -2994,14 +2999,69 @@ function i32MapSpellingLowerable(name: string) {
   if ae != "" { bare = ae }
   const inner = nulMapInnerName(bare)
   if inner != "" { bare = inner }
-  if !nameIsMapSpanEnds(bare) || !nameIsI32KeyedMap(bare) {
-    return emitFail(
-      "emitProgram: an i32-keyed Map/Set is supported as a binding / parameter / " +
-        "return / `| null` / an ARRAY ELEMENT / a closure result / a map value — " +
-        "not inside '" +
-        name +
-        "'",
-    )
+  if nameIsMapSpanEnds(bare) && nameIsI32KeyedMap(bare) { return 0 }
+  // A SHAPE spelling (B6b) — an INLINE struct annotation (`{m: {[i32]: V}}`) or an
+  // inline union ARM — delegates to its FIELDS. This is the one position whose map is
+  // invisible to the scan that reaches this gate: the whole shape is ONE `TypeRef` name,
+  // so the field's own `{[i32]: V}` never arrives here alone the way a DECLARED
+  // `type S = {m: {[i32]: V}}`'s field annotation does. Each field text is asked THIS
+  // question, so the set a field may hold is exactly the set any other position may hold
+  // — a bare map, its `| null` twin, an ARRAY of maps, a closure RETURNING one, and a
+  // nested shape by recursion — and nothing wider is guessed at.
+  if nameIsShapeSpanEnds(bare) { return i32MapShapeFieldsLowerable(bare) }
+  // A UNION spelling (`{f: {[i32]: V}} | i32`): every member that MENTIONS an i32-keyed
+  // map must be a struct ARM, asked as the shape above. A member that IS the map
+  // (`{[i32]: V} | i32` — the map as a union MEMBER, boxed) is deliberately NOT peeled:
+  // the box carries no map shape, so it stays the loud reject it has always been.
+  if unionMemberCount(bare) > 1 {
+    const atoms: string[] = []
+    splitUnionAtoms(bare, atoms)
+    let ai = 0
+    while ai < atoms.length {
+      if strContains(atoms[ai], "{[i32]:") {
+        if !nameIsShapeSpanEnds(atoms[ai]) {
+          return i32MapSpellingUnsupported(name)
+        }
+        if i32MapShapeFieldsLowerable(atoms[ai]) < 0 { return -1 }
+      }
+      ai = ai + 1
+    }
+    return 0
+  }
+  i32MapSpellingUnsupported(name)
+}
+
+// The gate's REJECT, named once: three sites raise it (the leaf test above, the union
+// arm's non-shape member, and — through the recursion — a shape's field), and the message
+// must not drift between them.
+function i32MapSpellingUnsupported(name: string): i32 {
+  emitFail(
+    "emitProgram: an i32-keyed Map/Set is supported as a binding / parameter / " +
+      "return / `| null` / an ARRAY ELEMENT / a closure result / a map value — " +
+      "not inside '" +
+      name +
+      "'",
+  )
+}
+
+// Ask `i32MapSpellingLowerable` of every FIELD of the shape spelling `nm` that mentions
+// an i32-keyed map. The FIELD ROW's key column (B6b) is what makes this legal: a map
+// field records only its VALUE, and the key column is the other half of the mv slot's
+// identity, so `{m: {[i32]: V}}` now names its OWN map struct at the type section, at the
+// construct, and at every receiver read. Fields that do not mention the key rep are not
+// examined — this gate answers for the i32-keyed rep and nothing else.
+function i32MapShapeFieldsLowerable(nm: string): i32 {
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1); the guard is the
+  // caller's `nameIsShapeSpanEnds`.
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
+  let i = 0
+  while i < ftexts.length {
+    if strContains(ftexts[i], "{[i32]:") {
+      if i32MapSpellingLowerable(ftexts[i]) < 0 { return -1 }
+    }
+    i = i + 1
   }
   0
 }
@@ -3565,18 +3625,28 @@ export function collectA(_stmts: i32[]) {
   // them as code-19 fields with the value name in `sFieldElemName`; intern each one's mv slot.
   let sfi = 0
   while sfi < sFieldTypes.length {
-    if sFieldTypes[sfi] == 19 {
+    if sFieldTypes[sfi] == 19 || sFieldTypes[sfi] == 29 {
+      // (Code 29, the NULLABLE map field, interns the same mv value slot as its non-null
+      // twin — the two arms were byte-identical copies and are now one.)
       mUsed = true
       lUsed = true
       aUsed = true
-      mvShapeOfValName(sFieldElemName[sfi])
-    }
-    // A NULLABLE map field (code 29) interns the same mv value slot as its non-null twin.
-    if sFieldTypes[sfi] == 29 {
-      mUsed = true
-      lUsed = true
-      aUsed = true
-      mvShapeOfValName(sFieldElemName[sfi])
+      // THE FIELD ROW'S KEY, threaded into the intern (B6b). An mv slot's identity is the
+      // (KEY, VALUE) pair, so a `{[i32]: string}` field must intern the i32-keyed slot —
+      // interning the string-keyed one and then RESOLVING the i32-keyed one is the loud
+      // "map value type has no interned slot", and interning against the wrong key is the
+      // silent wrong map struct.
+      const sfk = sFieldRowKeyI32(sfi)
+      mvShapeOfValNameK(sFieldElemName[sfi], sfk)
+      // …AND THE FLAG. An INLINE shape (`const s: {m: {[i32]: i32}}`) is ONE `TypeRef`
+      // name, so the annotation scan's bare-map arm — the site that sets `mI32Used` for
+      // every other position — never sees this map. `mI32Used` gates the i32-keyed map
+      // STRUCT, the i32 probe helper and the per-function 5-slot i32-KEY scratch frame,
+      // so without it the store's key temporary aliases the map-REF temporary at the same
+      // local index: `vl check` rc 0, invalid wasm. The module-wide flag means ANY other
+      // i32-keyed map in the file covers the miss (#1287's lesson (a)) — the witness has
+      // to be a fixture with nothing else in it.
+      if sfk { mI32Used = true }
     }
     // A REF-LIST field (code 5) and its nullable twin (28): intern the element so
     // `sFieldRefSlot` (`rlSlotByName`) resolves.
@@ -3651,7 +3721,21 @@ export function collectA(_stmts: i32[]) {
       mUsed = true
       lUsed = true
       aUsed = true
-      mvShapeOfValName(uFieldElemName[ufi])
+      // The struct pass's KEY + FLAG rule, one table over (B6b) — see its header there.
+      //
+      // BOTH WRITES HERE ARE JOINTLY, NOT SEVERALLY, NECESSARY, and that is measured
+      // rather than argued: sabotage either one ALONE and no fixture fails; sabotage it
+      // together with the STRUCT pass's twin and `i32-keyed-inline-arm-field-collect.vl`
+      // fails (the intern with "map value type has no interned slot", the flag with
+      // invalid wasm). The reason is one accident: an inline union ARM must SPELL its
+      // shape to be narrowed (`if v is {f: {[i32]: V}}`), and that spelling interns a
+      // STRUCT row for the same shape, whose pass does both jobs over again. Kept rather
+      // than deleted because that covering row belongs to another pass, not to this
+      // table's invariant — a variant row this file writes must be collectable from this
+      // file's own column.
+      const ufk = uFieldRowKeyI32(ufi)
+      mvShapeOfValNameK(uFieldElemName[ufi], ufk)
+      if ufk { mI32Used = true }
     }
     ufi = ufi + 1
   }
@@ -3750,7 +3834,11 @@ function collectAnonShapes() {
             sFieldNames.push(names[pi])
             sFieldTypes.push(codes[pi])
             sFieldElemName.push(elemNames[pi])
-            recordSFieldElemTyIx(elemNames[pi]) // D5
+            // B6b: an ANONYMOUS literal shape never carries a map field —
+            // `anonFieldCode` has no arm returning 19 / 29 (a `Map()` field value is
+            // unclassifiable, which un-interns the whole shape), so the key column is
+            // false by construction rather than by omission.
+            recordSFieldElemRow(elemNames[pi], false) // D5
             // A function-valued field (code 14) interns a closure cell `(ref
             // $cloStruct)`; flag the module so the closure rec-group types are
             // emitted even when no lambda is otherwise lifted (e.g. a top-level
@@ -4014,28 +4102,17 @@ function collectNestedFieldShapes(stmts: i32[]) {
 // ("the ATOM codes the shape-text recorder keys and the NODE recorder does not", its own header
 // in `emit_classify.vl`); the atom name then comes from the annotation's own spelling, which is
 // what these two arms supply.
+//
+// THE ROW THAT ERASED THE KEY NOW CARRIES IT (B6b). An mv slot's identity is the
+// (KEY, VALUE) pair, but a map field records only V — `sFieldElemName` / `uFieldElemName`
+// hold the VALUE spelling and `sFieldElemTyIx` the VALUE type — so an i32-keyed map FIELD
+// had nothing in its row to resolve its own map struct with, and this function was where
+// the position's loud reject lived. The missing half is the field row's KEY COLUMN
+// (`sFieldElemKeyI32` / `uFieldElemKeyI32`), written by `pushFieldRow` off the field's own
+// SPELLING and read back through `sFieldMapShape` / `uFieldMapShape`. This recorder is
+// unchanged by that: the key never travels through the elem NAME, which is exactly why it
+// needed a column of its own.
 function fieldRecElemName(tyIx: i32, code: i32) {
-  // An i32-KEYED map FIELD (code 19, or 29 nullable). `collectA`'s capability gate
-  // cannot see this position — the field's own annotation node IS a bare map, which is
-  // a supported spelling — so the FIELD asks here. Without it the field's cell resolves
-  // the STRING-keyed struct and the reject lands much later, at the first key op, with
-  // a message about the KEY.
-  //
-  // THIS IS THE ROW THAT ERASES THE KEY. An mv slot's identity is the (KEY, VALUE)
-  // pair, but a map field records only V — `sFieldElemName` / `uFieldElemName` hold the
-  // VALUE spelling and `sFieldElemTyIx` the VALUE type — so there is nothing here to
-  // resolve the i32-keyed struct WITH. Opening the position is a key column on both
-  // field tables, written at every push site; see the fixture
-  // `maps/error-i32-keyed-position-field.vl`.
-  if code == 19 || code == 29 {
-    if strContains(tyNameOf(tyIx), "{[i32]:") {
-      emitFail(
-        "emitProgram: an i32-keyed Map/Set cannot be a struct / variant FIELD — " +
-          "supported as a binding / parameter / return / `| null` / an ARRAY ELEMENT " +
-          "/ a closure result / a map value",
-      )
-    }
-  }
   const en = fieldRefElemName(tyIx)
   // A literal-union atom field (code 0) records its union NAME (not the ref-elem name,
   // which is "" for it) so `sFieldIsLitUnion` recovers the atom rep + membership.
@@ -4063,6 +4140,11 @@ function fieldRecElemName(tyIx: i32, code: i32) {
 // from a `FieldDef` (`fieldRecElemName(fdType, code)`, #1147), genuinely different questions.
 // The ROW is what all three share, character for character, and all that is named here.
 //
+// `keyI32` is the row's KEY column (B6b): a map field records only its VALUE, and an mv
+// slot's identity is the (KEY, VALUE) pair, so the caller — which still holds the field's
+// SPELLING — answers `nameIsI32KeyedMap` here. Every non-map code passes false, which is
+// what the predicate answers for a non-map spelling anyway.
+//
 // The push ORDER matters and is preserved exactly: the D5 sidecar recorder pads itself
 // against `*FieldElemName.length`, so it must run AFTER that column's push and before the
 // next row's; `registerValueUnionName` must run after the row is complete because it can
@@ -4071,17 +4153,18 @@ function pushFieldRow(
   toVariant: boolean,
   code: i32,
   elemNm: string,
+  keyI32: boolean,
   fName: string,
 ) {
   if toVariant {
     uFieldTypes.push(code)
     uFieldElemName.push(elemNm)
-    recordUFieldElemTyIx(elemNm) // D5
+    recordUFieldElemRow(elemNm, keyI32) // D5 + B6b
     uFieldNames.push(fName)
   } else {
     sFieldTypes.push(code)
     sFieldElemName.push(elemNm)
-    recordSFieldElemTyIx(elemNm) // D5
+    recordSFieldElemRow(elemNm, keyI32) // D5 + B6b
     sFieldNames.push(fName)
   }
   // A value-union field interns its box reps (the three recorders' shared parity rule):
@@ -4114,6 +4197,7 @@ export function collectS(stmts: i32[]) {
   sFieldTypes = []
   sFieldElemName = []
   sFieldElemTyIx = []
+  sFieldElemKeyI32 = []
   // Nested inline-shape FIELD types intern first, so the struct decls that reference them resolve.
   collectNestedFieldShapes(stmts)
   // A `type X = {…}` that is a UNION VARIANT is collected by `collectU` into its own
@@ -4160,6 +4244,7 @@ export function collectS(stmts: i32[]) {
               false,
               code,
               fieldRecElemName(fnode.fdType, code),
+              nameIsI32KeyedMap(tyNameOf(fnode.fdType)),
               fnode.fdName,
             )
             cnt = cnt + 1
@@ -4220,7 +4305,13 @@ function collectShapeVariantFields(nm: string) {
     // The ROW is `pushFieldRow`'s (the variant table) — the same four columns and the same
     // two per-row side effects the two NODE recorders push. Only the elem-NAME derivation
     // is this recorder's own: it reads the field TYPE TEXT, where they read a `FieldDef`.
-    pushFieldRow(true, fc, shapeFieldElemName(ftxt, fc), fnames[fi])
+    pushFieldRow(
+      true,
+      fc,
+      shapeFieldElemName(ftxt, fc),
+      nameIsI32KeyedMap(ftxt),
+      fnames[fi],
+    )
     cnt = cnt + 1
     fi = fi + 1
   }
@@ -4261,6 +4352,7 @@ function collectVariantFields(stmts: i32[], name: string) {
               true,
               code,
               fieldRecElemName(fnode.fdType, code),
+              nameIsI32KeyedMap(tyNameOf(fnode.fdType)),
               fnode.fdName,
             )
             cnt = cnt + 1
@@ -4297,6 +4389,10 @@ function variantFieldCodesEq(a: i32, b: i32) {
     ) {
       return false
     }
+    // The KEY half of a map field's storage (B6b): the elem-name column above records
+    // only `V`, so `{f: {[i32]: i32}}` and `{f: {[string]: i32}}` compare EQUAL there
+    // while storing two different map structs. Same table, same row, one column over.
+    if uFieldElemKeyI32At(a, fi) != uFieldElemKeyI32At(b, fi) { return false }
     fi = fi + 1
   }
   true
@@ -5480,6 +5576,7 @@ export function collectU(stmts: i32[]) {
   uFieldTypes = []
   uFieldElemName = []
   uFieldElemTyIx = []
+  uFieldElemKeyI32 = []
   let i = 0
   while i < stmts.length {
     const s = P.nodes[stmts[i]]
