@@ -289,8 +289,11 @@ in-language GC knobs.
   Deliberately NOT building new enum/ADT machinery yet — only if adopting today's `match`+union
   surface proves insufficient. Related: carry structured `Ty` through codegen instead of
   round-tripping through emit-name strings (the `tyToEmitName` `K0→string` softening caused an
-  invalid-wasm this session; `splitUnionAtoms` paren-depth was the same class) — subsumed by the
-  `repOf(type)→descriptor` rewrite (item 3, which already derives from the `Ty` arena).
+  invalid-wasm; `splitUnionAtoms` paren-depth was the same class; and REVERSING that softening
+  cost another, because a name-keyed consumer compared the stored spelling against a CLOSED atom
+  vocabulary that a user's alias name can never be in — the string layer makes both directions of
+  a spelling change unsafe) — subsumed by the `repOf(type)→descriptor` rewrite (item 3, which
+  already derives from the `Ty` arena).
 
 - ⬜ **Emitter rep architecture — reduce the structural↔nominal / kind-scheme special-casing.** The
   recurring smell (see `DECISIONS.md` if expanded): the checker is **structural** (`{x:i32}`), the
