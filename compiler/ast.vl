@@ -592,6 +592,89 @@ export function setUdTs(nodeIx: i32, roots: i32[]) {
   0
 }
 
+// ── the generic type-DECLARATION's parameter list, as the parser read it ──────
+// `type Box<T>` / `type Pair<A, B>` folds its parameters INTO the declared name
+// (`mkTypeDecl("Box<T>", …)`), and three consumers used to take them back out of
+// that concatenation with a `<`-scan plus a slice or an identifier-RUN walk:
+// `typecheck`'s generic-alias registration, and `driver.modGenBase` /
+// `modGenParams` in the module merge. The parser HAS the list — it advanced over
+// the very `IDENT` tokens it joined — so it hands it over instead (D-DECLPARAM,
+// the SOURCES arc's declaration half; the ANNOTATION half is `annTsRoot` above).
+//
+// One row per generic declaration, keyed by the `TypeDecl` / `UnionDecl` node,
+// holding the BASE name (`Box`) and a slice of the flat parameter-name column.
+// A row exists iff the parser consumed a `<` after the declared name, so a
+// zero-parameter `type Box<> = …` is still a row — matching the `gaeLtAt(name) >
+// 0` guard the copies used, which is a test for the `<`, not for a parameter.
+//
+// Scanned linearly, not binary-searched: generic declarations are a handful per
+// program (the compiler's own source has 0, the corpus's richest file 6), so the
+// `annTsNode` binary search would cost more code than it saves. The node column
+// is push-ordered all the same.
+export let declGpNode: i32[] = []
+export let declGpBase: string[] = []
+export let declGpStart: i32[] = []
+export let declGpCount: i32[] = []
+export let declGpName: string[] = []
+
+export function setDeclGp(nodeIx: i32, base: string, names: string[]) {
+  declGpNode.push(nodeIx)
+  declGpBase.push(base)
+  declGpStart.push(declGpName.length)
+  declGpCount.push(names.length)
+  let i = 0
+  while i < names.length {
+    declGpName.push(names[i])
+    i = i + 1
+  }
+  0
+}
+
+// The row index of `nodeIx`, or -1 when it is not a generic declaration.
+function declGpRowOf(nodeIx: i32) {
+  let i = 0
+  while i < declGpNode.length {
+    if declGpNode[i] == nodeIx { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// The BASE name of the generic declaration at `nodeIx` (`Box` of `Box<T>`), or
+// "" when the node is not one — which is the answer every caller already treats
+// as "this declared name is its own base".
+export function declGpBaseOf(nodeIx: i32) {
+  const r = declGpRowOf(nodeIx)
+  if r < 0 { return "" }
+  declGpBase[r]
+}
+
+// Its type-PARAMETER names in declaration order; empty for a non-generic node.
+export function declGpParamsOf(nodeIx: i32): string[] {
+  const out: string[] = []
+  const r = declGpRowOf(nodeIx)
+  if r < 0 { return out }
+  const start = declGpStart[r]
+  let i = 0
+  while i < declGpCount[r] {
+    out.push(declGpName[start + i])
+    i = i + 1
+  }
+  out
+}
+
+// The module merge renames a declaration's base segment (`Box` → `Box$m1`) and
+// writes the result back into `tdName`/`udName`. The BANK is a second copy of
+// that segment, so it moves with it — the same lockstep `modRwType` keeps
+// between a `TypeRef`'s tree and its name, and the same bug class if it does
+// not (a stale base makes the checker register the alias under a name no
+// application spells).
+export function setDeclGpBase(nodeIx: i32, base: string) {
+  const r = declGpRowOf(nodeIx)
+  if r >= 0 { declGpBase[r] = base }
+  0
+}
+
 // The `k`-th member spelling root recorded for `nodeIx`, or -1 when the node has
 // none (or fewer than `k + 1`). Binary search for the LEFTMOST row of `nodeIx`
 // over the non-decreasing key column, then index by `k`.
@@ -632,6 +715,48 @@ export function annTsOf(nodeIx: i32) {
   -1
 }
 
+// DROP the spelling root recorded for `nodeIx`, so `annTsOf` answers -1 from
+// here on and every consumer falls back to the node's NAME.
+//
+// The one caller is `typecheck.canonEmitTypeNames`, and the reason is the
+// invariant this table is only useful under: **a live root renders to the node's
+// CURRENT name**. Canon rewrites `TypeRef.tyName` IN PLACE, and it is not a
+// rename — it softens a literal member to its base scalar, folds an
+// intersection, strips a whole-name paren — so the tree it leaves behind
+// describes the PRE-canon spelling, which is a DIFFERENT TYPE, not a different
+// spelling of the same one. The module merge (`driver.modRwType`) hit the same
+// hazard one pass earlier and fixed it the other way, by rewriting the TREE and
+// re-rendering; canon cannot do that (`canonEmitName` is not
+// `tyToEmitName ∘ nameToTy` — see the W9 residue), so the honest move is to stop
+// claiming a tree for a name the tree no longer describes.
+//
+// Measured on the corpus before this existed: canon rewrites 369 of 10,148
+// `TypeRef` names and the tree goes stale on exactly those 369 and on no others,
+// while 14 tree reads DO happen after canon has run (all of them
+// `applyGenAliasArgs` re-resolving a generic alias's field annotations for an
+// application whose argument type the emitter minted a fresh arena index for, so
+// the memo misses). The two populations do not intersect on the corpus — every
+// one of those 14 reads a bare type-PARAMETER spelling (`T`, `A`, `B`), which
+// has no canon-able construct in it — which is why this is an invariant repair
+// and not a bug fix, and why no corpus row moves.
+//
+// A binary search over the same strictly-increasing key column `annTsOf` walks;
+// a node with no row is left alone (its answer is already -1).
+export function clearAnnTs(nodeIx: i32) {
+  let lo = 0
+  let hi = annTsNode.length - 1
+  while lo <= hi {
+    const mid = lo + (hi - lo) / 2
+    const at = annTsNode[mid]
+    if at == nodeIx {
+      annTsRoot[mid] = -1
+      return 0
+    }
+    if at < nodeIx { lo = mid + 1 } else { hi = mid - 1 }
+  }
+  0
+}
+
 // Clear the spelling arena and its node columns. The driver calls this alongside
 // `P.nodes = []` / `nodeToks = []` — a recorded root indexes THIS program's
 // arena and means nothing against the next one's.
@@ -646,6 +771,11 @@ export function tsReset() {
   annTsRoot = []
   udTsNode = []
   udTsRoot = []
+  declGpNode = []
+  declGpBase = []
+  declGpStart = []
+  declGpCount = []
+  declGpName = []
   0
 }
 
