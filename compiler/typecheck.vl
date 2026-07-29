@@ -6908,6 +6908,32 @@ function tyToEmitNameAt(ix: i32, ctx: i32) {
   r
 }
 
+// The position a composite's INTERIOR stands at, for the STRUCTURAL renderer — normally
+// the interior's own position, but `RC_ROOT` when `ix` is a registered generic-APPLICATION
+// instance (`Box<"a"|"b">`).
+//
+// WHY THE EXPANSION IS A ROOT AND NOT A FIELD. Canon never sees this shape structurally: it
+// spells the annotation `Box<` + `canonEmitNameAt(arg, RC_ROOT)` + `>` and hands the
+// EXPANSION to `gaeBases`, so the emitter's row for `Box<"a"|"b">` carries whatever
+// `RC_ROOT` produced — a softened `string` field. This renderer walks the arena and sees
+// only the expanded `{v: …}`, where the argument now stands at `RC_FIELD` and the inline
+// litunion leg would keep it. That fork is invalid wasm and it was MEASURED, not feared: a
+// lambda whose inferred return is `Box<"aa"|"zz">` builds a module whose functype names the
+// atom-field row while the annotation registered the string-field one
+// (`type mismatch: expected (ref $type), found (ref $type)`, `vl check` rc 0). Teaching
+// CANON the argument's real position was built too (`canonarg`) and is worse: the same cell
+// becomes `emitProgram: ref valtype with no interned shape` and a green global moves 489 →
+// 564 bytes. Canon's own application arm says why — *"an ARGUMENT stands where the parameter
+// it binds stands, which is a position this rewrite has no way to know"* — so the renderer
+// agrees with the position canon actually used, rather than inventing a better one.
+//
+// The NOMINAL renderer needs none of this: `genAppNameOfTy` short-circuits ahead of its
+// composite arms, so an application instance never reaches them.
+function appKidCtx(ix: i32, ctx: i32): i32 {
+  if cTyIxListHas(gaAppTyIxs, ix) { return RC_ROOT }
+  ctx
+}
+
 function tyToEmitNameGo(ix: i32, ctx: i32) {
   emitNameAtoms = 1
   if ix < 0 { return "" }
@@ -6922,6 +6948,32 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
   if t is TyLit { return tyLitBaseName(t) }
   if t is TyUnion {
     const members = t.uMembers
+    // THE PURE INLINE LITERAL UNION KEEPS ITS MEMBERS — canon's `litUnionPreserve` /
+    // `nulLitUnionPreserve` pair, mirrored off the arena. Without it every `TyLit` member
+    // below rendered its BASE (`string`) and the dedup collapsed the run to that one
+    // scalar, so an inline `{tag: "a" | "b"}` rendered `{tag:string}` while the ANNOTATION
+    // side spelled it `{tag:"a"|"b"}` — one arena type, two names, and every name-keyed
+    // registry downstream (struct layouts, `$fnsig` keys, mv slots, union rows) holds a
+    // row for each.
+    //
+    // THE TWO GATES ARE CANON'S TWO RUNGS, NOT A NEW POLICY. `nulLitUnionPreserve` fires
+    // on any top-level split holding a `null` sibling, at EVERY position; the bare form
+    // reaches `litUnionPreserve` only under `ctxKeepsLitUnion`, because a bare inline
+    // litunion at `RC_ROOT` / `RC_FN_PARAM` has no param-valtype or struct-field ladder arm
+    // (the measurement is on `ctxKeepsLitUnion` itself). Rendering it at those two
+    // positions would spell a name the emitter rejects; rendering it at neither leaves the
+    // disagreement this leg exists to close.
+    const luiN = litUnionInlineNameOfTy(ix)
+    if luiN != "" {
+      if luiHasNull {
+        emitNameAtoms = luiAtoms + 1
+        return luiN + "|null"
+      }
+      if ctxKeepsLitUnion(ctx) {
+        emitNameAtoms = luiAtoms
+        return luiN
+      }
+    }
     // THE MIXED-UNION PRESERVE — the OWNER'S RULING of 2026-07-29, which REVERSES the
     // soften ruling of 2026-07-28: *"I'm reverting the softening. `K | f64` should be
     // preserved as `K | f64` (or flattened to the constituent parts of `K | f64`).
@@ -7070,6 +7122,15 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       emitNameAtoms = 2
       return nal + "|null"
     }
+    // …and an UN-ALIASED one keeps its MEMBERS, for the same reason and at every position:
+    // canon's `nulLitUnionPreserve` has no `ctxKeepsLitUnion` gate. The alias leg above is
+    // the same preference `litUnionInlineNameOfTy` applies internally, so the two cannot
+    // disagree about which spelling wins.
+    const nlui = litUnionInlineNameOfTy(t.nInner)
+    if nlui != "" {
+      emitNameAtoms = luiAtoms + 1
+      return nlui + "|null"
+    }
     const inner = tyToEmitNameAt(t.nInner, RC_NULLABLE)
     const innerAtoms = emitNameAtoms
     if inner == "" { return "" }
@@ -7111,7 +7172,7 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
         const fbal = litUnionAliasNameOfTy(ftys[fi])
         if fbal != "" { fs = fbal }
       }
-      if fs == "" { fs = tyToEmitNameAt(ftys[fi], RC_FIELD) }
+      if fs == "" { fs = tyToEmitNameAt(ftys[fi], appKidCtx(ix, RC_FIELD)) }
       if fs == "" { return "" }
       if fi > 0 { out = out + "," }
       out = out + names[fi] + ":" + fs
@@ -7135,7 +7196,7 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
     // identifier is one atom, the render leg reports its own (D-ARRWIDTH).
     let elw = 1
     if el == "" {
-      el = tyToEmitNameAt(t.aElem, RC_ELEM)
+      el = tyToEmitNameAt(t.aElem, appKidCtx(ix, RC_ELEM))
       elw = emitNameAtoms
     }
     if el == "" { return "" }
@@ -7157,7 +7218,7 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
     // (fuzz seed 113148886 d6). The map-value sibling of the TyUnion-member /
     // TyObj-field / TyFunc-result alias preservation around it.
     let mv = litUnionAliasNameOfTy(t.mVal)
-    if mv == "" { mv = tyToEmitNameAt(t.mVal, RC_MAP_VAL) }
+    if mv == "" { mv = tyToEmitNameAt(t.mVal, appKidCtx(ix, RC_MAP_VAL)) }
     if mk == "" || mv == "" { return "" }
     // The key/value separators sit inside the braces — one atom.
     emitNameAtoms = 1
@@ -7194,7 +7255,7 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       const bal = litUnionAliasNameOfTy(t.fnRet)
       if bal != "" { rs = bal }
     }
-    if rs == "" { rs = tyToEmitNameAt(t.fnRet, RC_FN_RES) }
+    if rs == "" { rs = tyToEmitNameAt(t.fnRet, appKidCtx(ix, RC_FN_RES)) }
     if rs == "" { return "" }
     // A function-type RESULT keeps grouping parens so the outer `$fnsig` producers see a
     // single result token (`(i32)=>((i32)=>i32)`), matching the source-annotation form.
@@ -7377,7 +7438,19 @@ export function genAppNameOfTy(ty: i32): string {
       let s = ""
       let a = 0
       while a < cn {
-        const an = tyToNominalNameAt(gaAppArgFlat[st + a], RC_FIELD)
+        // `RC_ROOT`, WORD FOR WORD THE RULE CANON'S OWN APPLICATION ARM STATES: *"an
+        // ARGUMENT stands where the parameter it binds stands, which is a position this
+        // rewrite has no way to know — `RC_ROOT` is what every other whole-annotation entry
+        // uses and what the argument text arrived carrying"*. This arm said `RC_FIELD`, and
+        // while nothing read the bit the two spellings could not disagree; the inline
+        // litunion leg reads it, and `Box<"a=>b"|"zz">` promptly SPLIT — canon softening the
+        // argument at `RC_ROOT` to `Box<string>` while this renderer kept it at the
+        // `RC_FIELD` keep position. One arena type, two names, which is the fragmentation
+        // both producers' preserve rules exist to remove. (`ctx` reaches nothing else in
+        // this renderer but the sticky `RC_NULLABLE` bit, which neither constant carries —
+        // so the change is inert everywhere the new leg does not fire, and that is
+        // measured, not argued: see the `garoot` control in the programme doc.)
+        const an = tyToNominalNameAt(gaAppArgFlat[st + a], RC_ROOT)
         // An argument with no nominal name (a TyVar — an UNINSTANTIATED `Box<T>` inside the
         // alias's own body — or a cycle) makes the whole application unspellable. Decline
         // rather than emit `Box<>` or a partial name.
@@ -7564,6 +7637,22 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
   if t is TyLit { return tyLitBaseName(t) }
   if t is TyUnion {
     const members = t.uMembers
+    // THE PURE INLINE LITERAL UNION KEEPS ITS MEMBERS — the structural sibling's leg,
+    // character for character, and it must be: the two renderers and canon spell one arena
+    // type one way or the name-keyed registries hold a row per spelling. See the twin in
+    // `tyToEmitNameGo` for the two gates and why they are canon's rungs rather than a new
+    // policy.
+    const luiN = litUnionInlineNameOfTy(ix)
+    if luiN != "" {
+      if luiHasNull {
+        nomNameAtoms = luiAtoms + 1
+        return luiN + "|null"
+      }
+      if ctxKeepsLitUnion(ctx) {
+        nomNameAtoms = luiAtoms
+        return luiN
+      }
+    }
     // SOURCE-FAITHFUL (alias-preserving) render: a litunion-ALIAS member keeps its alias
     // name (`K0` in `K0 | {w:i32}`), reconstructing a flattened lit run into its registered
     // alias via the regroup. The POSITION-DEPENDENT litunion softening (`canonEmitName`
@@ -7661,6 +7750,13 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
       // An alias identifier plus the `null` arm — two atoms.
       nomNameAtoms = 2
       return nal + "|null"
+    }
+    // …and an UN-ALIASED one keeps its MEMBERS at every position — `nulLitUnionPreserve`'s
+    // mirror, the structural sibling's leg.
+    const nlui = litUnionInlineNameOfTy(t.nInner)
+    if nlui != "" {
+      nomNameAtoms = luiAtoms + 1
+      return nlui + "|null"
     }
     // A nullable DECLARED struct/union keeps its nominal name (`S|null`, `U|null`).
     const nsn = tyToNominalNameAt(t.nInner, RC_NULLABLE)
@@ -17681,6 +17777,88 @@ export function litUnionAliasOfLitTexts(texts: string[]): string {
   }
   ""
 }
+// The atom WIDTH of the last `litUnionInlineNameOfTy` answer, and whether that union
+// carried a `null` MEMBER — the arena twin of canon's `lupAtoms` / `nulLitUnionPreserve`'s
+// `hasNull`. Banked rather than returned because a VL function has one result.
+let luiAtoms = 1
+let luiHasNull = false
+
+// The INLINE spelling of the string-LITERAL run of union `ty`, from its arena members
+// (`"a"|"b"`), or "" when `ty` is not a string-literal union. **The UN-ALIASED sibling of
+// `litUnionAliasNameOfTy`, and the ARENA twin of canon's `litUnionPreserve`** — the two
+// renderers had the alias half of this rule at six positions each and no leg at all for an
+// inline litunion the program never named, so a keep-position `{tag: "a" | "b"}` was
+// softened to `{tag:string}` while canon (whose `litUnionPreserve` has been preserving it
+// since #1302) spelled the annotation `{tag:"a"|"b"}`. Two spellings of ONE arena type is
+// two rows in every name-keyed registry downstream.
+//
+// A `null` MEMBER is not a literal and does not disqualify the run: the arena spells
+// `"a" | "b" | null` BOTH as a `TyNullable` over a pure litunion and as a flat `TyUnion`
+// with a `null` `TyPrim` member (`tyIsNullableLitUnion` carries both forms), and canon's
+// `nulLitUnionPreserve` reaches the flat one through its top-level split. `luiHasNull`
+// reports which the caller got, because the `| null` form is preserved at EVERY position
+// while the bare form is preserved only where `ctxKeepsLitUnion` holds — canon's asymmetry,
+// mirrored rather than corrected here (see the residue note in
+// `docs/internals/destringify-types-program.md`).
+//
+// FEWER THAN TWO DISTINCT MEMBERS HAS NO INLINE SPELLING, and that is the emitter's name
+// grammar rather than a taste: `nameIsInlineLitUnion` requires 2+ quoted atoms, so a
+// one-member run would render a name no downstream litunion classifier accepts. Canon's
+// `litUnionPreserve` declines on the identical `kept.length < 2` test.
+//
+// A DECLARED alias with exactly these members WINS the spelling, which is
+// `litUnionPreserve`'s own `litUnionAliasOfLitTexts` preference asked off the arena instead
+// of off the text: a name that is an intern KEY must be one name per type.
+export function litUnionInlineNameOfTy(ty: i32): string {
+  luiAtoms = 1
+  luiHasNull = false
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const texts: string[] = []
+    let sawNull = false
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyLit {
+        if m.litKind != "str" { return "" }
+        let dup = false
+        let d = 0
+        while d < texts.length {
+          if texts[d] == m.litText { dup = true }
+          d = d + 1
+        }
+        if !dup { texts.push(m.litText) }
+      } else if m is TyPrim {
+        if m.primName != "null" { return "" }
+        sawNull = true
+      } else {
+        return ""
+      }
+      i = i + 1
+    }
+    if texts.length < 2 { return "" }
+    luiHasNull = sawNull
+    const al = litUnionAliasOfLitTexts(texts)
+    if al != "" {
+      // An alias name is ONE identifier — one atom.
+      luiAtoms = 1
+      return al
+    }
+    // A quoted member holds no top-level `|` of its own, so the join writes exactly
+    // `texts.length - 1` separators — canon's `lupAtoms = kept.length`.
+    let out = "\"" + texts[0] + "\""
+    let k = 1
+    while k < texts.length {
+      out = out + "|\"" + texts[k] + "\""
+      k = k + 1
+    }
+    luiAtoms = texts.length
+    return out
+  }
+  ""
+}
+
 export function nodeTyIsLitUnionAlias(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
