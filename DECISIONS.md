@@ -352,6 +352,19 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   no slot on either key, so "mono" is still a SENTINEL — but a PAIR of them
   (`-1` string-keyed, `-4` i32-keyed), named once at `mapMonoShapeOfKey`, because a
   resolver landing on mono must still say which of the two structs it means. (B6b)
+- **Every boundary that can CONSTRUCT a map is seeded with the shape it must
+  build, and the boundaries are enumerated, not discovered.** `Map()` builds
+  whatever `pendingMapSlot` says; unseeded it builds the MONO struct, which is
+  correct for exactly the values that have no struct of their own (`i32`,
+  `boolean`, a literal-union atom) and invalid wasm — `vl check` clean — for every
+  other. Three boundaries were taught the seed one bug at a time (a let / return /
+  global init, then struct + variant fields, then the map VALUE in #1286, then the
+  ARRAY ELEMENT here), and each time the tell was the same: the MONO values worked.
+  So the rule is now stated positively — a position that can hold a map is a
+  position that must name its shape — and the answer per position lives in ONE
+  named function (`letMapShapeOf`, `mvInnerMapShape`, `rlElemMapShape`) rather than
+  at the seed site, so a second consumer of the same position cannot re-derive it
+  differently. (B6b)
 - **A typed-value map has ONE struct heap type per value type, resolved
   position-independently.** `{[string]:f32}` mints its own `mvMapTypeIdx` struct
   (its `vals` field differs from the mono `$mStructIdx`); a map in COMPOSITION (a
