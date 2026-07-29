@@ -1,0 +1,204 @@
+// @run
+// @log aa
+// @log true
+// @log false
+// @log Y
+// @log N
+// @log Y
+// @log Y
+// @log N
+// @log Y
+// @log N
+// @log Y
+// @log N
+// @log oa
+// @log Y
+// @log N
+// @log Y
+// @log Y
+// @log Y
+// @log Y
+// @log N
+// @log Y
+// @log Y
+// @log N
+// @log pa
+// @log pa!
+// @log pa
+// @log P
+// @log Q
+// @log N
+// @log Y
+// A UNION OF LITERAL UNIONS IS A LITERAL UNION — slice C of
+// `docs/internals/litunion-compact-rep-design.md` (§8.3).
+//
+// `K | K2` denotes the litunion whose members are the UNION of K's and K2's, so it
+// reps as the interned i32 ATOM and `is K` is a MEMBERSHIP test over K's subset.
+// Master built it as a `TyUnion` whose MEMBERS ARE UNIONS: `tyIsLitUnion` answered
+// NO, both renderers softened the whole annotation to `string`, `anyLitUnionUsed`
+// never set the module's litunion flag (which turns off every atom classifier in the
+// MODULE), and `is K` const-folded to `i32.const 0` — a guard that can never fire.
+//
+// THE CONTROLS' MEMBERS DIFFER (#1304's method note): the two halves below are
+// spelled from disjoint lexemes (`aa`/`cc`/`ee`/`oa` vs `pa`/`pc`), so an alias
+// registration cannot answer a lookup it was not asked.
+//
+// WHAT IS DELIBERATELY NOT HERE, because it is still broken and pinning a wrong
+// answer would make it an invariant. Without a DECLARED alias for the flattened set,
+// `K | K2` is spelled `string` at `RC_ROOT` and `RC_FN_PARAM` — the two positions
+// `ctxKeepsLitUnion` excludes, because their valtype ladders have no arm for an
+// INLINE litunion spelling — so a bare `const x: K | K2` binding, a param, a global,
+// a reassignment and the narrowed READ are all still wrong there. That is the SAME
+// residue an un-aliased inline litunion has on master (measured: the un-aliased
+// spelling scores 10 of 20 grid cells, and `K | K2` now scores exactly the same 10 —
+// the flatten's whole claim is that the two are one type). The aliased half below
+// scores 19 of 20, and closing the gap is the inline-spelling PARAM/FIELD valtype
+// work filed in `docs/internals/destringify-types-program.md`.
+type K = "aa" | "bb"
+type K2 = "cc" | "dd"
+type K3 = "ee" | "ff"
+
+// ── the ATOM REP: the member prints as its lexeme and compares by id ─────────────
+function atomRep() {
+  const s: { v: K | K2 } = { v: "aa" }
+  const x = s.v
+  print(x)
+  const b = x == "aa"
+  print(b)
+  const c = x == "cc"
+  print(c)
+}
+atomRep()
+
+// ── the four KEEP positions (`ctxKeepsLitUnion`): field, element, map value, result
+function field() {
+  const s: { v: K | K2 } = { v: "aa" }
+  const x = s.v
+  if x is K { print("Y") } else { print("N") }
+  const t: { v: K | K2 } = { v: "cc" }
+  const z = t.v
+  if z is K { print("Y") } else { print("N") }
+}
+field()
+
+function elem() {
+  const xs: (K | K2)[] = ["aa", "cc"]
+  const x = xs[0]
+  if x is K { print("Y") } else { print("N") }
+  for v in xs {
+    if v is K { print("Y") } else { print("N") }
+  }
+}
+elem()
+
+function mapVal() {
+  const m: {[string]: K | K2} = Map()
+  m["p"] = "bb"
+  const x = m["p"]
+  if x is K { print("Y") } else { print("N") }
+  m["q"] = "dd"
+  const y = m["q"]
+  if y is K { print("Y") } else { print("N") }
+}
+mapVal()
+
+// ── OVERLAPPING member sets: the flattened set is the UNION, `is` stays a SUBSET ──
+type KO1 = "oa" | "ob"
+type KO2 = "ob" | "oc"
+function overlap() {
+  const xs: (KO1 | KO2)[] = ["oa", "oc"]
+  const x = xs[0]
+  if x is KO1 { print("Y") } else { print("N") }
+  const y = xs[1]
+  if y is KO1 { print("Y") } else { print("N") }
+  print(x)
+}
+overlap()
+
+// ── THREE members, and the NESTED spelling — one union, however it is grouped ──
+function nested() {
+  const s: { v: (K | K2) | K3 } = { v: "aa" }
+  const x = s.v
+  if x is K { print("Y") } else { print("N") }
+  const t: { v: K | K2 | K3 } = { v: "ee" }
+  const z = t.v
+  if z is K { print("Y") } else { print("N") }
+  if z is K3 { print("Y") } else { print("N") }
+}
+nested()
+
+// ── the DEGENERATE forms: `K | K`, and an alias beside its OWN inline spelling ──
+// Both denote `K`, and both must land on `K`'s OWN arena index — the identity the
+// `cUnionTyIxs`-keyed classifiers compare (`nodeTyIsLitUnionAlias` and friends). A
+// structural twin at a fresh index answers NO to every one of them, which is why
+// `annUnionInnerTy` ends in an alias lookup rather than a bare `mkUnionTy`.
+function degenerate() {
+  const x: K | K = "aa"
+  if x is K { print("Y") } else { print("N") }
+  const y: K | ("aa" | "bb") = "bb"
+  if y is K { print("Y") } else { print("N") }
+}
+degenerate()
+
+// ── the ALIAS-PREFERENCE half: a DECLARED alias for the flattened set ───────────
+// `PA` has exactly `P1 | P2`'s members, so it OWNS both the spelling and the arena
+// index at EVERY position — including `RC_ROOT` and `RC_FN_PARAM`, where
+// `ctxKeepsLitUnion` is false. That gate exists because those two valtype ladders
+// have no arm for the INLINE member spelling; they have always had one for the ALIAS
+// name, so the gate is on the shape of the ANSWER, not on the position. Without it
+// the arena says "atom" while the local slot says `string`, and the store below
+// (`const x: P1 | P2 = k`) is invalid wasm.
+type P1 = "pa" | "pb"
+type P2 = "pc" | "pd"
+type PA = "pa" | "pb" | "pc" | "pd"
+function takes(x: P1 | P2) {
+  if x is P1 { print("P") } else { print("Q") }
+}
+const pg: P1 | P2 = "pa"
+function aliasPreference() {
+  const x: P1 | P2 = "pa"
+  if x is P1 { print("Y") } else { print("N") }
+  const y: P1 | P2 = "pc"
+  if y is P1 { print("Y") } else { print("N") }
+  if pg is P1 { print("Y") } else { print("N") }
+  let m: P1 | P2 = "pa"
+  if m is P1 { print("Y") } else { print("N") }
+  m = "pd"
+  if m is P1 { print("Y") } else { print("N") }
+  // the narrowed READ back into a `P1`-typed position, and the concat seam
+  if x is P1 {
+    const r: P1 = x
+    print(r)
+    const s = x + "!"
+    print(s)
+    show(x)
+  } else {
+    print("N")
+  }
+}
+function show(k: P1) { print(k) }
+function aliasStore() {
+  const k: P1 = "pa"
+  const x: P1 | P2 = k
+  takes(x)
+  const z: PA = "pc"
+  takes(z)
+}
+aliasPreference()
+aliasStore()
+
+// ── the WIDENING GUARD: the alias preference is an EXACT-SET match ──────────────
+// `litUnionAliasTyOfMembers` must match the alias's member set exactly. Relaxing its
+// count test to `>=` — a SUPERSET alias claiming a narrower annotation — is a silent
+// TYPE WIDENING: `("wa"|"wb")` adopts `W4`'s arena index, and the guard below then
+// answers Y for a `"wc"` value, `vl check` clean. Nothing else in the corpus catches
+// it (measured: the poisoned compiler passes 3,580/0/7 without this cell), because
+// every other litunion fixture spells sets that have no registered superset.
+type W4 = "wa" | "wb" | "wc" | "wd"
+function widenGuard() {
+  const x: W4 = "wc"
+  if x is ("wa" | "wb") { print("Y") } else { print("N") }
+  const y: W4 = "wa"
+  if y is ("wa" | "wb") { print("Y") } else { print("N") }
+}
+widenGuard()

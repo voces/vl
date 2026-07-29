@@ -5904,6 +5904,116 @@ function nameToTy(name: string) {
   r
 }
 
+// ── the ANNOTATION union's member list, shared by BOTH annotation routes ────────────
+// `tsToTyReal` (the parser TREE route) and `nameToTyReal` (the string NAME route) build
+// the same union from the same members, so the two rules below have ONE home each. A
+// second copy is what let the flatten below land on one route and not the other.
+
+// The union TYPE an annotation's kept `members` denote, with the LITERAL-UNION FLATTEN.
+//
+// A UNION OF LITERAL UNIONS IS A LITERAL UNION: `K | K2` denotes the litunion whose
+// members are `K`'s and `K2`'s LITERALS, not a union with two opaque union members.
+// Without the flatten `tyIsLitUnion` sees `TyUnion` members and answers NO for the whole
+// annotation, so `litUnionInlineNameOfTy` declines, BOTH renderers soften it to `string`,
+// `anyLitUnionUsed` never sets `gLitUnionUsed` (which turns off every atom classifier in
+// the MODULE), and `is K` const-folds to `i32.const 0` — a guard that can never fire.
+// Sixteen of the twenty grid cells in `docs/internals/litunion-compact-rep-design.md`
+// §8.3 are that one missing flatten, eleven of them SILENTLY wrong.
+//
+// THE DECLARATION ROUTE HAS ALWAYS FLATTENED — `type Q = K | K2` registers a real
+// litunion alias — so this is the ANNOTATION route reaching the same arena shape, not a
+// new rule. It is the same "a union of unions is one union" that `joinTys` applies
+// through `flattenVariantsInto` and that canon's `unionAliasMembers` applies on the NAME
+// side; the two annotation arms were the only places that had neither, and they are the
+// reason a render-only fix cannot work: canon can be taught to SPELL `K | K2` as its
+// flattened members, but every classifier that asks the ARENA still answers "not a
+// literal union", and the two answers together are worse than either alone (measured:
+// canon-only is 2 cells UP and 12 DOWN).
+//
+// SCOPED TO LITERAL-UNION MEMBERS, by measurement rather than by taste. A general member
+// flatten is a much wider arena change (every `AB | null` over a struct / value-union
+// alias) with its own population; a litunion member is the one whose REP the outer union
+// must adopt, and the grid says the run-merge into a MIXED union buys ZERO cells and
+// costs two (§8.3's scope ruling).
+//
+// A `null` SIBLING DECLINES THE FLATTEN, and that is the governing law rather than a
+// gap. `K | K2 | null` flattened lands on the atom NICHE, where it becomes
+// byte-for-byte its declared-alias control `C | null` — 13 RUN-OK / 5 RUN-WRONG / 2
+// EMIT-REJ on both — which is 11 cells UP and 3 DOWN, and the 3 are that control's OWN
+// pre-existing holes (an un-narrowed `print` of a nullable litunion is a deliberate loud
+// reject; a nullable-litunion FIELD / ELEMENT read prints its raw atom id). An outcome
+// class must never move down, so the niche half ships when those holes close, with the
+// numbers already measured.
+//
+// The DEDUP is the arm's own, unchanged: `sameVariantTy` against what is already kept,
+// so an overlapping pair (`"oa"|"ob" | "ob"|"oc"`) keeps `"ob"` exactly once and the
+// flattened set is the UNION of the member sets — while `is K` stays a SUBSET test,
+// because `emitIs`'s `laTexts` ladder compares against the TESTED type's own members.
+//
+// A ONE-MEMBER list is returned UNCHANGED — the degenerate `K | K` deduped to `K`'s own
+// arena index long before this, and re-minting a structural twin for it would lose
+// exactly the identity `nodeTyIsLitUnionAlias` compares.
+function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
+  if members.length == 0 { return TY_ERR }
+  if members.length == 1 { return members[0] }
+  if hasNull { return mkUnionTy(members) }
+  // EVERY member must be a literal union. A litunion member of a MIXED union keeps its
+  // own arena node, and that is the scope ruling rather than caution: flattening the RUN
+  // buys ZERO grid cells (`K | K2 | f64` measures 6 RUN-OK unmerged and 5 merged — the
+  // merge is what master already performs when the flattened alias happens to be
+  // declared, and it costs `==` two cells) while the mixed arena SHAPE is load-bearing
+  // elsewhere — `tests/cases/closures/closure-result-union-composed-carrier.vl`'s
+  // `(() => K0 | boolean) | null` emits invalid wasm the moment `K0`'s literals become
+  // sibling members of the closure's result union.
+  let allLit = true
+  let a = 0
+  while a < members.length {
+    if !tyIsLitUnion(members[a]) { allLit = false }
+    a = a + 1
+  }
+  const flat: i32[] = []
+  let i = 0
+  while i < members.length {
+    const mlits: i32[] = []
+    if allLit {
+      const mt = T.tys[members[i]]
+      if mt is TyUnion {
+        let ml = 0
+        while ml < mt.uMembers.length {
+          mlits.push(mt.uMembers[ml])
+          ml = ml + 1
+        }
+      }
+    }
+    if mlits.length == 0 { mlits.push(members[i]) }
+    let mk = 0
+    while mk < mlits.length {
+      let dup = false
+      let dj = 0
+      while dj < flat.length {
+        if sameVariantTy(mlits[mk], flat[dj]) { dup = true }
+        dj = dj + 1
+      }
+      if !dup { flat.push(mlits[mk]) }
+      mk = mk + 1
+    }
+    i = i + 1
+  }
+  if flat.length == 1 { return flat[0] }
+  // A DECLARED alias with exactly these literal members OWNS the arena index — see
+  // `litUnionAliasTyOfMembers`. Minting a twin instead is what the index-identity
+  // classifiers cannot see through, and it is asked of the NON-flattened member list
+  // too: the PURE inline spelling of an aliased set (`"aa"|"bb"` beside
+  // `type K = "aa"|"bb"`) reaches here with `allLit` false — its members are `TyLit`s,
+  // not unions — and canon spells it `K`, so without the lookup the two producers
+  // disagree exactly as they did before this slice (measured: 16 cells DOWN).
+  // `litUnionAliasTyOfMembers` answers -1 for any member that is not a string literal,
+  // so a mixed list (`K0 | boolean` flattened or not) never reaches an alias here.
+  const lal = litUnionAliasTyOfMembers(flat)
+  if lal >= 0 { return lal }
+  mkUnionTy(flat)
+}
+
 function tsToTyReal(ix: i32) {
   if ix < 0 { return -1 }
   const k = tsKind[ix]
@@ -5936,9 +6046,7 @@ function tsToTyReal(ix: i32) {
       }
       pi = pi + 1
     }
-    let inner = TY_ERR
-    if members.length == 1 { inner = members[0] }
-    else if members.length > 1 { inner = mkUnionTy(members) }
+    const inner = annUnionInnerTy(members, hasNull)
     if hasNull { return mkNullableTy(inner) }
     return inner
   }
@@ -6100,9 +6208,9 @@ function nameToTyReal(name: string) {
       }
       pi = pi + 1
     }
-    let inner = TY_ERR
-    if members.length == 1 { inner = members[0] }
-    else if members.length > 1 { inner = mkUnionTy(members) }
+    // The litunion FLATTEN at its shared home — the TREE route's mirror
+    // (`tsToTyReal`'s `TS_UNION` arm). Two annotation routes, one rule.
+    const inner = annUnionInnerTy(members, hasNull)
     if hasNull { return mkNullableTy(inner) }
     return inner
   }
@@ -8945,6 +9053,14 @@ function nulLitUnionPreserve(parts: string[]) {
       return lup + "|null"
     }
   }
+  // A NULLABLE UNION OF LITERAL UNIONS (`K | K2 | null`) DELIBERATELY DOES NOT FLATTEN
+  // HERE, and the gate is the ARENA's: `annUnionInnerTy` declines a `null`-carrying
+  // annotation, so flattening the SPELLING alone would put the two producers back in the
+  // state this slice exists to end — canon naming an atom niche while every arena
+  // classifier answers "not a literal union". Measured, on the 20-cell nullable row:
+  // canon-only is 4 cells DOWN, arena+canon together is 11 UP and 3 DOWN, and the 3 are
+  // the declared-alias control's own pre-existing holes. The niche half ships with those,
+  // not before — see `annUnionInnerTy`'s header for the numbers.
   ""
 }
 
@@ -9059,7 +9175,83 @@ function litUnionPreserve(parts: string[]) {
     lupAtoms = kept.length
     return core
   }
-  ""
+  // A UNION OF LITERAL UNIONS IS A LITERAL UNION — the leg above answers only when every
+  // part is a quoted LEXEME, so `K | K2` fell past it. See `litUnionFlatten`.
+  litUnionFlatten(parts)
+}
+
+// ── the FLATTEN: a union all of whose members are literal unions IS a literal union ──
+// `K | K2` spells the litunion whose members are the UNION of `K`'s and `K2`'s
+// (`"aa"|"bb"|"cc"|"dd"`), which reps as the interned i32 ATOM and never boxes. Returns
+// that spelling, or "" when some part of `parts` is not literal-derived.
+//
+// THIS IS THE ARENA'S RULE, ARRIVING ON THE STRING SIDE — not a new policy. The checker
+// flattens a union of unions into ONE `TyUnion` of `TyLit` members (`flattenVariantsInto`),
+// so `litUnionInlineNameOfTy` — the structural renderer's litunion leg — has ALWAYS spelled
+// `K | K2` as its flattened member set. Canon had no such leg: `litUnionPreserve`'s
+// `nameIsLitUnionType(core)` test is asked of the joined PART SPELLINGS (`"K|K2"`), and an
+// alias-named part is not a quoted lexeme, so the whole union fell through to the
+// per-member softening below, every member widened to `string`, and the dedup collapsed it
+// to the bare scalar. One arena type, two spellings — the exact disagreement #1296/#1300
+// and both renderers' preserve legs exist to prevent, still open at this one shape.
+//
+// The tail below is `litUnionInlineNameOfTy`'s tail character-for-character — dedup the
+// member TEXTS, prefer a DECLARED alias with exactly that set (a name that is an intern KEY
+// must be one name per type), else join the quoted members and bank the width. The two
+// producers agree because they run the same three steps in the same order on the same set.
+//
+// EVERY part must be literal-derived (`LRP_LITS`). `LRP_NEUTRAL` is NOT enough and that is
+// load-bearing: a NUMERIC literal member classifies neutral and pushes no text, so
+// accepting it would silently DROP the member from the flattened set (`"a" | "b" | 1`
+// would spell `"a"|"b"`, a narrower type than the program wrote). The `null` arm is neutral
+// for the same reason and is handled by `nulLitUnionPreserve`, which strips it before
+// asking. `litRunPartTexts` is the shared member classifier, so a grouper
+// (`K | ("aa"|"bb")`), a nested union (`(K | K2) | K3`) and a bare quoted lexeme all reach
+// here through the one grammar.
+//
+// SET UNION IS THE MEANING, and `is K` stays a SUBSET test: `emitIs`'s `laTexts` ladder
+// emits `id == m0 || id == m1 || …` over the TESTED type's own members, so `x is K` over a
+// flattened `KO1 | KO2` answers true for exactly `K`'s members and false for the rest —
+// which is what an overlapping pair (`"oa"|"ob" | "ob"|"oc"`) needs and what a duplicate
+// pair (`K | K`, `K | ("aa"|"bb")`) collapses to.
+function litUnionFlatten(parts: string[]) {
+  const texts: string[] = []
+  let i = 0
+  while i < parts.length {
+    const c = litRunPartTexts(parts[i], texts)
+    if c != LRP_LITS { return "" }
+    i = i + 1
+  }
+  const kept: string[] = []
+  let t = 0
+  while t < texts.length {
+    let dup = false
+    let j = 0
+    while j < kept.length {
+      if kept[j] == texts[t] { dup = true }
+      j = j + 1
+    }
+    if !dup { kept.push(texts[t]) }
+    t = t + 1
+  }
+  // FEWER THAN TWO DISTINCT MEMBERS HAS NO INLINE SPELLING — `nameIsInlineLitUnion` requires
+  // 2+ quoted atoms, so a one-member set would render a name no downstream classifier
+  // accepts. The identical guard sits in `litUnionPreserve` above and in the arena twin.
+  if kept.length < 2 { return "" }
+  const al = litUnionAliasOfLitTexts(kept)
+  if al != "" {
+    // An alias name is ONE identifier — one atom.
+    lupAtoms = 1
+    return al
+  }
+  let out = "\"" + kept[0] + "\""
+  let k = 1
+  while k < kept.length {
+    out = out + "|\"" + kept[k] + "\""
+    k = k + 1
+  }
+  lupAtoms = kept.length
+  out
 }
 
 // ── the mixed-union literal-run REGROUP, canon's side (owner ruling 2026-07-29) ───────
@@ -9333,9 +9525,29 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
     // `nameIsLitUnionType` accepts the inline member spelling (`nameIsInlineLitUnion`)
     // beside the alias name, and the `| null` form has been arriving here preserved since
     // `nulLitUnionPreserve` was written.
-    if ctxKeepsLitUnion(ctx) {
-      const lup = litUnionPreserve(parts)
-      if lup != "" {
+    const lup = litUnionPreserve(parts)
+    // …and a preserve whose answer is a DECLARED ALIAS NAME is kept at EVERY position,
+    // which is `ctxKeepsLitUnion`'s own measurement read exactly rather than widened.
+    // That gate exists because an ungated preserve reddens four cells — a bare INLINE
+    // litunion spelling as a function PARAM and as a DECLARED struct field, "because
+    // those two valtype ladders have an arm for the litunion ALIAS name and none for the
+    // inline member spelling". So the thing the two positions cannot take is the INLINE
+    // spelling, and the ALIAS name is what they already have an arm for; gating on the
+    // SHAPE OF THE ANSWER is strictly more precise than gating on the position.
+    //
+    // IT IS ALSO WHAT THE ARENA NOW REQUIRES. `annUnionInnerTy` gives `K | K2` the
+    // DECLARED alias's own arena index when one matches, so the value's REP at every
+    // position is the interned atom; leaving `RC_ROOT` spelling it `string` puts an i32
+    // atom in a `(ref $array)` local — the `P15atom_store` cell, RUN-WRONG on master and
+    // INVALID-WASM without this line (measured, both for `K | K2` and for the pure inline
+    // spelling of an aliased set).
+    //
+    // `nameHasPipe` IS the alias test here: `litUnionPreserve` returns either one
+    // identifier (its `litUnionAliasOfLitTexts` preference) or a `|`-joined member run,
+    // and only the second is the spelling those two ladders lack.
+    if lup != "" {
+      const lupAlias = !nameHasPipe(lup)
+      if ctxKeepsLitUnion(ctx) || lupAlias {
         canonAtoms = lupAtoms
         return lup
       }
@@ -17777,6 +17989,68 @@ export function litUnionAliasOfLitTexts(texts: string[]): string {
   }
   ""
 }
+// The registered litunion ALIAS's OWN arena index whose member set is exactly the
+// str-literal types `members` (`["aa","bb"]` -> `K`'s index), or -1.
+//
+// THE ARENA TWIN of `litUnionAliasOfLitTexts`, and it exists for the same reason one
+// index apart: a NAME that is an intern key must be one name per type, and an arena
+// INDEX that a classifier compares by identity must be one index per type.
+// `nodeTyIsLitUnionAlias` / `litUnionAliasNameOfTy` / `noteLitUnionCopy` all ask
+// `cTyIxListHas(cUnionTyIxs, ty)` — INDEX identity with a registered alias — so a
+// FRESHLY MINTED union carrying exactly `K`'s members is not `K` to any of them.
+// `tsToTy`'s union arm used to get that identity for free on the degenerate spellings
+// (`K | K` deduped to ONE member and returned `K`'s own index); once the litunion
+// flatten opens the member list that accident is gone, and this restores it as a rule.
+export function litUnionAliasTyOfMembers(members: i32[]): i32 {
+  if members.length < 2 { return -1 }
+  const texts: string[] = []
+  let i = 0
+  while i < members.length {
+    const m = T.tys[members[i]]
+    if m is TyLit {
+      if m.litKind != "str" { return -1 }
+      texts.push(m.litText)
+    } else {
+      return -1
+    }
+    i = i + 1
+  }
+  let a = 0
+  while a < cUnionTyIxs.length {
+    const ti = cUnionTyIxs[a]
+    if tyIsLitUnion(ti) {
+      const rt = T.tys[ti]
+      if rt is TyUnion {
+        // AN EXACT SET, both directions. `>=` here is a silent TYPE WIDENING: a
+        // 2-member annotation would adopt a 4-member alias's index, and `is
+        // ("wa"|"wb")` over a `W4` value then answers TRUE for every member — a
+        // guard that always fires, `vl check` clean. Pinned by
+        // `tests/cases/literal-unions/union-of-litunions-flatten.vl`'s `widenGuard`.
+        if rt.uMembers.length == texts.length {
+          let all = true
+          let mi = 0
+          while mi < texts.length {
+            let found = false
+            let r = 0
+            while r < rt.uMembers.length {
+              const rm = T.tys[rt.uMembers[r]]
+              if rm is TyLit {
+                if rm.litText == texts[mi] { found = true }
+              }
+              r = r + 1
+            }
+            if !found { all = false }
+            mi = mi + 1
+          }
+          if all { return ti }
+        }
+      }
+    }
+    a = a + 1
+  }
+  -1
+}
+
 // The atom WIDTH of the last `litUnionInlineNameOfTy` answer, and whether that union
 // carried a `null` MEMBER — the arena twin of canon's `lupAtoms` / `nulLitUnionPreserve`'s
 // `hasNull`. Banked rather than returned because a VL function has one result.

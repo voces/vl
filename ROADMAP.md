@@ -575,13 +575,20 @@ in-language GC knobs.
   > them wholesale, renumbering every union box tag in every program), whether `ref.i31` enters
   > the emitted vocabulary (measured available in wasm-tools' shipped set, V8 and wasmtime 47 —
   > and the only encoding that does not regress allocations; the emitter has zero i31 today), and
-  > what `K | K2` should MEAN — **and that last one turns out to need no ruling and to be the
-  > slice to take FIRST**: a union all of whose members are literal unions IS one, and the
-  > flattened target already runs on master with zero compiler changes
-  > (`type KA = "aa"|"bb"|"cc"|"dd"`, `x is K` answers correctly), because `emitIs`'s
-  > membership ladder tests the tested type's own members over the interned atom. Only the
-  > checker's render has to move. THREE follow-on slices are scoped with their populations; the
-  > working cells are pinned by `tests/cases/literal-unions/mixed-union-litunion-arm-floor.vl`.
+  > what `K | K2` should MEAN — **and that last one needed no ruling and SHIPPED as slice C
+  > (→ `CHANGELOG.md`)**: a union all of whose members are literal unions IS one. The filing's
+  > *"only the checker's render has to move"* is REFUTED by measurement (render-only is 2 cells
+  > UP and **12 DOWN**) — `tsToTyReal`'s annotation-union arm never flattened a union MEMBER, so
+  > `K | K2` interned as a `TyUnion` OF UNIONS, `tyIsLitUnion` answered no, and `anyLitUnionUsed`
+  > left `gLitUnionUsed` at 0, switching off every atom classifier in the module. With the arena
+  > arm + a canon mirror: **58 cells UP and 0 DOWN over 420**, and `K | K2` lands on the exact
+  > ten-cell RUN-OK set of the hand-written spelling of its flattened members (19 of 20 when a
+  > declared alias for that set exists). The RUN-MERGE variant is ruled OUT with numbers — master
+  > already performs it when the flattened alias is declared, and there it is 0 UP / 2 DOWN.
+  > TWO follow-on slices remain (A: the atom→box STORE; B: the box→atom READ, which should wait
+  > for the rep rulings); the working cells are pinned by
+  > `tests/cases/literal-unions/mixed-union-litunion-arm-floor.vl` and the flatten by
+  > `tests/cases/literal-unions/union-of-litunions-flatten.vl`.
   > *Also measured: the fuzzer DOES reach litunion-in-mixed-union (26 and 14 of 800 cases on two
   > seeds) and is VACUOUS on every defect family — it only ever stores a member LITERAL.*
 - ⬜ **A17 follow-up: `never` inference + `unconditional-recursion` lint.** A17 demand-driven inference
