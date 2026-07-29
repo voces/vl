@@ -34181,3 +34181,234 @@ not evidence about this change.
 kept "DELIBERATE" — is replaced by the paragraph explaining why `tsLeafTy` is. #1290's residue note
 in this document's §7 (`the sketch's tsLeafTy is REFUTED by a sabotage witness`) should be read
 together with this section: the witness refuted *inertness*, not the resolver.
+## D-MAPNODETY — bucket 1a re-derived and the filing REFUTED: `fieldElemTyIxOfName`'s biggest population is not the D5 bridge but a map-value QUERY, and two of its five node-holding callers route (censused and graded off master `61291c9c`, rebased and re-gated on `771abe09` — #1292, a checker-side Set/`.add` fix; the retirement DELTA is identical on both bases)
+
+**#1291 FILED 1a AS "`fieldElemTyIxOfName` (the D5 bridge)" NEEDING "A PER-FIELD-CODE PEEL
+TABLE". THE PEEL TABLE WOULD HAVE SERVED 8.9% OF THE POPULATION.** The filing named the
+function correctly and its *dominant caller* wrongly, and the correction is this slice's first
+deliverable: bucketed by call site, the two D5 field-row recorders the peel table exists for are
+**871 of 9,805 reaches**, while **6,723 (68.6%) arrive through `mvSlotOfValNameTyK`** — a
+QUERY-time bridge with four live callers, none of which is a field row and none of which a
+per-field-CODE peel would touch.
+
+### 1. THE POPULATION, BY CALL SITE — the unit is #1291's, verbatim
+
+`fieldElemTyIxOfName` has FIVE call sites and they hide a two-level fan-in; the ZZRA unit
+(`resolveAnnot` calls reached through the function) does not resolve at that depth, so the probe
+threads a site id down two layers. Command, both sides:
+
+```
+build: scripts/vl-host/target/release/vl build compiler/entry.vl -o C-popN.wasm --compiler <seed>
+run:   vl check --codegen tests/cases --compiler C-popN.wasm   (LAST record; 1,416 emitProgram reaches)
+```
+
+| # | call site | class | RA reaches | share |
+|---|---|---|---:|---:|
+| 1 | `mvShapeOfMapName` ← `letMapShapeOf` (`emit_classify:19339`) | query · **holds the NODE** | 2,042 | 20.8% |
+| 2 | `mapAnnShape` (`emit_classify:10182`) | query · **holds the NODE** | 1,806 | 18.4% |
+| 3 | `rlInternName` (`emit_classify:11660`) | mint bridge | 1,536 | 15.7% |
+| 4 | `mvShapeOfMapName` ← `collectA`'s `TypeRef` walk (`emit_collect:3395`) | mint · **holds the NODE** | 812 | 8.3% |
+| 5 | `recordSFieldElemRow` (the D5 struct field row) | mint bridge | 776 | 7.9% |
+| 6 | `recordMvValTyIx` | mint bridge | 675 | 6.9% |
+| 7 | `mvSlotOfMapName` ← narrowed arm (`emit_classify:19401`) | query · name only | 672 | 6.9% |
+| 8 | `mvSlotOfMapValNameOrMonoK` ← `mapShapeOfExpr` (`emit_classify:19388`) | query · **holds the NODE** | 329 | 3.4% |
+| 9 | `mvShapeOfValNameK` ← `collect:3640` (struct field table) | mint · holds the **D5 column** | 273 | 2.8% |
+| 10 | `mvSlotOfMapName` ← `repSigSlotTokOfKind` (`:20111`) | query · name only | 177 | 1.8% |
+| 11 | `mvShapeOfMapName` ← `:10829` | mint · name only | 177 | 1.8% |
+| 12 | `mvShapeOfMapName` ← `:13628` | mint · name only | 134 | 1.4% |
+| 13 | `recordUFieldElemRow` (the D5 variant field row) | mint bridge | 95 | 1.0% |
+| 14 | `mvSlotOfMapValNameOrMonoK` ← key-blind form | query | 68 | 0.7% |
+| 15 | `mvSlotByValNameOrK` (`emit_collect:2499`) | query · **reached only when the arena declined** | 45 | 0.5% |
+| 16 | `mvShapeOfMapName` ← `:13672` | mint | 40 | 0.4% |
+| 17 | `mvShapeOfValNameK` ← `collect:3737` (variant field table) | mint · holds the **D5 column** | 36 | 0.4% |
+| 18 | `mvSlotOfMapName` ← `:13772` | query | 33 | 0.3% |
+| 19 | `mvShapeOfMapName` ← `:3651` (own recursion) | mint | 32 | 0.3% |
+| 20 | `mvShapeOfMapName` ← `collect:3406` (nulmap arm) | mint · **holds the NODE** | 30 | 0.3% |
+| 21 | `mvSlotOfMapName` ← `:8434` | query | 14 | 0.1% |
+| 22 | `mvSlotOfMapName` ← `:5709` | query | 3 | 0.0% |
+| — | `mvSlotOfValNameFindK` (`emit_classify:3724`) | query | **0** | — |
+| | **total** | | **9,805** | |
+
+The total reproduces #1291's published figure to the digit, which is what licenses reading the
+rows as a decomposition of it rather than as a second measurement.
+
+**THE ROW THAT ORGANISES THE REST IS "WHAT DOES THE CALLER ALREADY HOLD".** Five sites (1, 2, 4,
+8, 20 — **5,019 reaches, 51.2%**) are handed an annotation or expression NODE, and the checker
+banked that node's type at the node. They do not need a peel table, a renderer, or a new
+recorder; they need `nodeTyIxOf` and one `| null` peel. Two sites (9, 17) hold the D5 column
+itself. The rest hold only a spelling.
+
+### 2. WHAT SHIPPED — the mv layer's arena leg gets a NODE-side entry, at the two sites where a dual-write says it is the same answer
+
+`emit_rep` gains the node twin of the sidecar legs (`rlElemMapValMvSlotAt`, `mvValInnerMvSlotAt`)
+that already read `tyMapValOf` / `tyMapKeyIsI32` off their own columns:
+
+```
+nodeMapTyIx(nodeIx)    the (| null-peeled) TyMap the node denotes, or -1
+nodeMapValTyIx(nodeIx) = tyMapValOf(nodeMapTyIx(nodeIx))
+```
+
+and TWO consumers take it as rung 1, keeping the name bridge below them verbatim:
+
+* **`mapAnnShape`** — every one of its call sites hands it a node (`fn.fnRet`, `d.letType`,
+  `bn.parType`), so the map it is asked about *is* the node whose type it now reads.
+* **`mvSlotOfMapValNameOrMonoK`**, at `mapShapeOfExpr`'s arena fall-through, which was passing
+  `nodeTyMapValName(exprIx)` — `tyToEmitName` of the very type `nodeMapValTyIx` returns. A render
+  of an arena type, re-parsed by the annotation grammar to recover the arena type. That one is
+  deleted as a *route*; the rendered name stays only because the rungs BELOW it
+  (`mvValKindOfName`, `mvSlotByValNameK`) are still name-keyed.
+
+**RETIREMENT, SAME UNIT, SAME COMMAND: 9,805 → 7,756 = −2,049 (−20.9%)** on `tests/cases`
+(1,416 emitProgram reaches on both sides); `std` 3 → 3.
+
+**RE-MEASURED ON THE REBASE BASE AND THE DELTA IS THE SAME INTEGER: 9,819 → 7,770 = −2,049**
+(1,417 reaches — #1292 added one corpus program, which is the whole of the +14 on both legs).
+A rebase that moves both endpoints by the same amount is the cheapest available check that the
+figure is a property of the change and not of the tree it was taken on.
+
+### 3. THE DUAL-WRITE, AND THE TWO SITES IT STOPPED
+
+Both legs computed at every entry, the LEGACY answer shipped, disagreements split three ways —
+because "different" is three different findings here, and only one of them is fatal:
+
+| routed candidate | entries | arena covered | **D1** arena −1 / name + | **D2** arena + / name −1 | **D3** both +, DIFFERENT |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `mvSlotOfMapValNameOrMonoK` ← `:19388` | 1,297 | 329 | 0 | 0 | **0** |
+| `mapAnnShape` | 2,083 | 2,083 | 33 | 0 | **0** |
+| `mvShapeOfValNameK` ← `letMapShapeOf` | 2,097 | 2,097 | 9 | 0 | **128** |
+| `mvShapeOfValNameK` ← `collect:3395` | 862 | 862 | 10 | **2** | 0 |
+| `mvShapeOfValNameK` ← `collect:3406` | 32 | 32 | 0 | 0 | 0 |
+
+The two shipped rows have **D2 = D3 = 0**: wherever the arena answers, the name bridge answers
+the same, so rung 1 can only shorten the ladder, never redirect it. D1 is the decline the
+fall-through absorbs. The other three rows are the slice's other two deliverables.
+
+#### 3a. THE ARENA LEG CAN FRONT A *FIND*; IT MUST NOT FRONT A *MINT*
+
+`mvShapeOfValNameK` is the mv-slot INTERNER. Its first rung asks "does a slot already exist?" and
+everything below it exists to create one when the answer is no. A banked node type is a strictly
+BETTER answer to that lookup and a WRONG one to the function: **D2 = 2** at `collect:3395` means
+the arena claimed an existing slot at two entries where the name bridge claimed none, the mint
+never ran, and the module emitted **INVALID WASM at `vl check` rc 0** —
+
+```
+tests/cases/maps/alias-positions-and-value-kinds.vl
+  type mismatch: expected i32, found (ref $type) (at offset 0x1420)
+```
+
+That is a *shipped* measurement, not a thought experiment: the routing was built, gated, and
+caught by the six-channel corpus A/B as `BUILDRC(0/1)` · `BUILDMSG` · `RUNRC(0/1)` on one file
+before it was taken back out. **It is also the second sabotage's witness set** (§5, SAB-MINT).
+
+#### 3b. `letMapShapeOf`'s NODE AND ITS SPELLING NAME DIFFERENT mv SLOTS — 128 of 2,097
+
+The single largest row in §1 asks the arena whether the node is a map (`nodeTyIsMap(d.letType)`)
+and then hands the resolver the NAME. Routing the value across the same gate produces a
+*different mv slot* on **128 entries, all from one fixture**,
+`tests/cases/maps/alias-positions-and-value-kinds.vl`, whose first witness is
+`nm={x:i32} A=0 L=1`.
+
+The cause is an alias identity the emit spelling drops. That fixture declares
+`type Pt = { x: i32 }` and `type P = {[string]: Pt}`; `lt.tyName` renders the value as the INLINE
+`{x:i32}` while the arena keeps the NOMINAL `Pt` — and `repMvValKey` keys a struct NOMINALLY, so
+the two spellings claim two different slots. **The fixture's own header argues this exposure does
+not exist for maps** ("`tyToEmitName`'s map arm emits `{[K]:V}` whatever `V` is, so a map name is
+never an emit route"). That is true of the map NAME and false one layer down, at the mv slot the
+value name resolves — the D-ALIASARR hazard, reappearing at the map's VALUE instead of the
+array's ELEMENT. Routing this site is a behaviour change, not a refactor; it needs the alias
+identity in the emit spelling, or an mv layer keyed structurally at the value. FILED, at the
+site, with the witness.
+
+### 4. WHAT `mvSlotOfValNameFindK` READS, AND WHY THAT IS NOT A DELETION
+
+Zero. Not "zero disagreements" — zero *entries*, over 1,416 corpus programs. It is not deleted
+and no probe here licenses deleting it: an unreached rung is not a wrong one (D-PARENCLASSIFY),
+and this one is the loud-reject twin of a resolver whose misses are otherwise silent. Recorded so
+the next census does not have to re-measure it.
+
+Likewise §1 row 15, `mvSlotByValNameOrK` — 45 reaches — is reached ONLY after
+`rlElemMapValMvSlotAt` (the arena leg) has already declined. #1291's 1b warning transfers exactly:
+its reachability MEANS the arena said no, so its coverage number is not evidence about it.
+
+### 5. GRADING — every rc taken BARE, never through a pipe
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,102,386 B** = master `771abe09`'s own fixpoint |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,102,736 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,102,736 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); the pre-rebase run read 3,556 / 0 / 7, and the +8 is #1292's |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
+| corpus A/B, six channels, **1,699 files** | 0 | **0 rows moved on every field** (pre-rebase: the same zero over 1,695) |
+| fuzz A/B, 3,600 programs/side (seeds 3101/3202/3303 × depths 4/5/6 × plain/declared, `--branching --multiobs`) | 0 | byte-identical per leg — **and a COVERAGE ZERO, said so by the inverted control: SAB-SHIFT, which reddens 6 corpus files, leaves the fuzz stream byte-identical too** |
+
+**THE THREE SABOTAGES, WITH NAMED WITNESS SETS.** The corpus A/B's zero is graded, not assumed:
+
+| sabotage | corpus A/B × 6 channels |
+| --- | ---: |
+| **SAB-SHIFT** — `nodeMapValTyIx` returns the arena type `+ 1` | **6 files / 14 cells** (re-run on the rebased bytes over 1,699 files — reproduces file-for-file) |
+| **SAB-MINT** — the §3a routing that was built and removed (`mvShapeOfValNameK` fronted by the node type at `collect:3395`/`3406`) | **1 file / 3 cells** |
+| **SAB-NOFALL** — `mapAnnShape`'s rung 1 made TOTAL where the node is covered (the D1 fall-through deleted) | **0** of 1,699 |
+
+* **SAB-SHIFT (6), exhaustively**: `closures/closure-result-map-field.vl` ·
+  `maps/map-return-value-kinds.vl` · `maps/map-value-twin-heap.vl` (BYTES) ·
+  `maps/nullable-map-value-kinds.vl` · `maps/struct-valued-map-boundary.vl` ·
+  `unions/nullable-collection-of-variant-box-arm-field-union.vl` (BYTES). Two of the six move on
+  **BYTES**, which is the positive statement the zero cannot make: the arena rung is chosen at
+  real cells and its answer reaches the emitted module.
+* **SAB-MINT (1), exhaustively**: `maps/alias-positions-and-value-kinds.vl`.
+* **SAB-NOFALL's 0 is a measurement, not blindness** — SAB-SHIFT proves the channel sees this
+  very function, on the very same lines. It localizes `mapAnnShape`'s 33 declines to cells where
+  the rungs BELOW the name bridge (`mvSlotByValNameK`, then the `kAn` sentinel) already produce
+  the same shape. The fall-through is a safety property with no observed behaviour behind it, and
+  that is stated rather than banked.
+
+**SEED BOOTSTRAP: no split needed** — the gate starts from a freshly fetched published
+`seed-latest` and it compiles this branch's source (`refresh-compiler.sh` rc 0 on the first
+self-compile).
+
+**BYTE DELTA: 1,102,386 → 1,102,736 = +350 B** (the same +350 the pre-rebase base produced). Two new arena readers and one extra rung at two
+call sites, against nothing deleted.
+
+**`tyname.vl` IS COMMENT-ONLY AND THAT IS ITS WHOLE GATE:** rebuild + `cmp` against the
+pre-edit compiler, rc 0, 1,102,712 B on both sides (taken pre-rebase, where it was the only
+edit in flight).
+
+### 6. THE EMIT-SIDE FRONTIER AFTER THIS SLICE
+
+| # | bucket | reaches | status | what it needs |
+|---|---|---:|---|---|
+| 1a | `fieldElemTyIxOfName` | **9,805 → 7,756** | **PARTLY SHIPPED** — 2,049 retired (20.9%) | see the rows below; the filed per-field-CODE peel table is NOT the mechanism and never was — it addresses 871 reaches (8.9%) |
+| 1a-i | `mvShapeOfValNameK`'s three mint callers (`letMapShapeOf` 2,042 · `collect:3395` 812 · `collect:3406` 30) | 2,884 | **BLOCKED, MEASURED** | §3a (a mint cannot be fronted by a find) and §3b (the alias name the emit spelling drops). Not a routing problem; the first needs the intern and the lookup split into two functions, the second needs alias identity in the spelling. |
+| 1a-ii | `rlInternName` · `recordMvValTyIx` · `record{S,U}FieldElemRow` | 3,082 | **FILED** | the four one-shot MINT bridges. Each runs once per row and exists to turn a name into an index; retiring one is a new bank at a new producer, not a routing move (#1291 §7). `collect:3640`/`:3737` (309) are the exception — they hold the D5 column already and are blocked only by §3a. |
+| 1a-iii | `mvSlotOfMapName`'s name-only callers (narrowed arm 672 · `:20111` 177 · `:13772` 33 · `:8434` 14 · `:5709` 3) | 899 | **FILED** | the callers hold a NAME by construction (a narrow-table entry, an `rlElemName` row, an `mvValName` row). `:5709` and `:5504` read rows whose arena sidecar (`mvValTyIx` / `rlElemTyIx`) already exists — those two are routable the way this slice's two were, and they are worth 3 + the `:5504` row. |
+| 1b | `repElemKeyOfName` | 4,667 | **FILED, unchanged** | #1291 §7; `rlSlotByNameTy`'s rung 2 is reached only when `rlSlotOfTy` declined. |
+| 1c | `unMemAtomTyIx` · `sTyIxOfName` | 2,083 + 1,060 | **NOT ROUTABLE HERE** | a `typecheck.vl` recorder — the concurrent partition. |
+
+### METHOD NOTES
+
+* **A FILING NAMES A FUNCTION; A BUCKETING NAMES ITS CALLERS; ONLY THE SECOND PREDICTS THE
+  WORK.** "1a = `fieldElemTyIxOfName`, the D5 bridge, needs a per-field-CODE peel table" was
+  right about the function and wrong about 91% of its traffic. The instrument that corrected it
+  is not clever — it is a site id threaded down two call layers, three builds. *When a filing
+  says "the X bridge", measure which caller reaches it before believing what X is for.*
+* **"DIFFERENT" IS THREE FINDINGS AND ONLY ONE IS FATAL.** A dual-write that reports one
+  disagreement count would have read 182 here and said "not equivalent, abandon". Split by
+  direction it reads: 52 declines the fall-through absorbs (harmless), **2** where the arena
+  answers and the name does not (INVALID WASM, because the site mints), and **128** where both
+  answer differently (a behaviour change with a named cause). Three different verdicts, three
+  different follow-ups. *Split a disagreement by direction before grading it.*
+* **THE ARENA LEG CAN FRONT A FIND; IT MUST NOT FRONT A MINT.** The general form of §3a, and it
+  is not obvious from the call site: `mvShapeOfMapName(nd.tyName)` at `collect:3395` is called
+  for its SIDE EFFECT, and its return value is discarded. A rung that improves the return value
+  and skips the effect is a strict improvement to the expression and a defect in the statement.
+  *Before fronting a resolver with a banked answer, ask whether its lower rungs do work.*
+* **A COVERAGE ZERO IS ONLY WORTH REPORTING WHEN ITS INVERTED CONTROL RAN.** The fuzz A/B is
+  byte-identical on 3,600 programs a side — and byte-identical under SAB-SHIFT, which breaks six
+  corpus programs. The generated grammar reaches no annotated map whose value type is banked. One
+  line, reported as a no-regression leg, never as evidence.
+* **THE SABOTAGE THAT GRADES THIS SLICE IS A ROUTE THE SLICE ITSELF BUILT AND REMOVED.** SAB-MINT
+  is not a synthetic poison; it is the candidate as of one hour earlier. A refactor that gets
+  caught is the cheapest sabotage available, and it comes with a real witness set. *Keep the
+  patch you had to take back — it is an instrument.*

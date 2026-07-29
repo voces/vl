@@ -409,6 +409,7 @@ import {
   mvSlotKeyI32,
   mvSlotOfTyK,
   mvSlotOfValNameTyK,
+  nodeMapValTyIx,
   recordMvValTyIx,
   recordSFieldElemRow,
   recordSTyIx,
@@ -3582,6 +3583,12 @@ export function mvSlotByValNameK(valName: string, keyI32: boolean): i32 {
 // THIS IS THE ONE PLACE THE KEY ENTERS THE MV LAYER. Every other resolver takes the key
 // as an argument; this one reads it off the map spelling itself, so an i32-keyed map's
 // VALUE interns against the i32-keyed key rep without any caller being taught.
+//
+// …AND THE "ONE CALL TO CHANGE" IS NOT THIS ONE — D-MAPNODETY BUILT IT AND TOOK IT BACK.
+// The two `collectA` `TypeRef`-walk callers hold the annotation NODE, so the value type is
+// free (`nodeMapValTyIx`); routing it emitted INVALID WASM on
+// `tests/cases/maps/alias-positions-and-value-kinds.vl`, because this path MINTS. The rule
+// that came out of it is on `mvShapeOfValNameK` below.
 export function mvShapeOfMapName(mapName: string) {
   const ki = nameIsI32KeyedMap(mapName)
   const sh = mvShapeOfValNameK(mapValNameOf(mapName), ki)
@@ -3606,6 +3613,17 @@ export function mapMonoShapeOfKey(keyI32: boolean) {
   -1
 }
 
+// THE ARENA LEG CAN FRONT A *FIND*; IT MUST NOT FRONT A *MINT* — D-MAPNODETY, measured.
+// This function is the mv-slot INTERNER: its first rung asks "is there already a slot for
+// this value?", and everything below it exists to create one when there is not. Handing
+// that rung a banked node type (`nodeMapValTyIx`, which the two `collectA` `TypeRef`-walk
+// callers hold) is a strictly better answer to the LOOKUP and a wrong one to the
+// FUNCTION: on `tests/cases/maps/alias-positions-and-value-kinds.vl` the arena leg claimed
+// an existing slot at 2 entries where the name bridge claimed none, the mint below never
+// ran, and the module emitted INVALID WASM ("expected i32, found (ref $type)") at
+// `vl check` rc 0. Its FIND-side siblings — `mapAnnShape` and
+// `mvSlotOfMapValNameOrMonoK` — take the same banked type with a dual-write disagreement
+// count of 0 and ARE routed.
 export function mvShapeOfValNameK(valNameIn: string, keyI32: boolean) {
   const valName = mvCanonValName(valNameIn)
   const kind = mvValKindOfName(valName)
@@ -10179,7 +10197,15 @@ export function mapAnnShape(tyIx: i32) {
         const vn = mapValNameOf(mn)
         // A MONO value rides the shared struct of its own key rep: the `-1`/`-4` pair.
         if vn == "i32" || vn == "boolean" { return mapMonoShapeOfKey(kAn) }
-        const aAn = mvSlotOfValNameTyK(vn, kAn)
+        // The arena leg's type comes from THIS annotation node when the checker banked one
+        // (D-MAPNODETY): `mapAnnShape` is handed a node index at every one of its call sites
+        // (`fn.fnRet`, `d.letType`, `bn.parType`), so the map it is being asked about is
+        // exactly the node whose type `nodeMapValTyIx` reads. An UNCOVERED node (-1) keeps
+        // the name bridge, unchanged and in its old position.
+        let aAn = -1
+        const vtAn = nodeMapValTyIx(tyIx)
+        if vtAn >= 0 { aAn = mvSlotOfTyK(vtAn, kAn) }
+        if aAn < 0 { aAn = mvSlotOfValNameTyK(vn, kAn) }
         if aAn >= 0 { return aAn }
         const nmAn = mvSlotByValNameK(vn, kAn)
         if nmAn >= 0 { return nmAn }
@@ -19336,6 +19362,26 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
         // A map-member UNION annotation is NOT a bare map (see `letIsMap`) — skip it so the union
         // box, not a garbled map value shape, is picked. ARENA (D-BAREMAP): a `TyUnion` is not a
         // `TyMap`, so the exclusion is the classifier itself rather than a second scan after it.
+        //
+        // …AND THE VALUE DOES *NOT* COME OFF THE SAME `TyMap` THE GATE JUST READ — MEASURED,
+        // NOT ASSUMED (D-MAPNODETY). This is the single largest re-resolution in the whole
+        // `fieldElemTyIxOfName` population (2,042 of its 9,805 `resolveAnnot` reaches on
+        // `tests/cases`) and the obvious route — give `mvShapeOfMapName` a `Ty` form and hand it
+        // the `nodeMapValTyIx(d.letType)` the gate above already proved is a `TyMap` — is WRONG.
+        // A dual-write of the two legs over the corpus: 2,097 entries, ALL covered, and **128
+        // land on a DIFFERENT mv slot** (both legs answering, `A=0` vs `L=1`), from ONE fixture,
+        // `tests/cases/maps/alias-positions-and-value-kinds.vl`.
+        //
+        // THE CAUSE IS AN ALIAS NAME THE EMIT SPELLING DROPS. That fixture declares
+        // `type Pt = {x:i32}` and `type P = {[string]: Pt}`; `lt.tyName` renders the value as
+        // the INLINE `{x:i32}` while the arena keeps the NOMINAL `Pt`, and `repMvValKey` keys a
+        // struct nominally — so the two spellings claim two different mv slots and the shipped
+        // answer is the name's. (That fixture's own header argues the map arm has no such
+        // exposure because "`tyToEmitName`'s map arm emits `{[K]:V}` whatever `V` is". True of
+        // the map NAME; false one layer down, at the mv slot the value name resolves.)
+        // Routing this site is a behaviour change, not a refactor — it needs the alias identity
+        // in the emit spelling, or an mv layer keyed structurally at the value. The four
+        // conflict-free node sites are routed; this one is not.
         if nodeTyIsMap(d.letType) { return mvShapeOfMapName(lt.tyName) }
       }
     }
@@ -19385,7 +19431,15 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       // the mono map; its rendered value name would collapse to `string | null`).
       if nodeTyMapValIsLitUnion(exprIx) { return mapMonoShapeOfKey(ckI32) }
       if nodeTyMapValIsNulLitUnion(exprIx) { return mapMonoShapeOfKey(ckI32) }
-      const cSh = mvSlotOfMapValNameOrMonoK(nodeTyMapValName(exprIx), ckI32)
+      // The NAME here is `tyToEmitName` of the very type `nodeMapValTyIx` returns — a
+      // render followed by a re-parse of the render (D-MAPNODETY). The type goes straight
+      // across; the rendered name stays because the rungs BELOW the arena leg (the kind
+      // classifier, `mvSlotByValNameK`) are still name-keyed.
+      const cSh = mvSlotOfMapValNameOrMonoKTy(
+        nodeTyMapValName(exprIx),
+        ckI32,
+        nodeMapValTyIx(exprIx),
+      )
       if cSh == -1 { return mapMonoShapeOfKey(ckI32) }
       return cSh
     }
@@ -19527,11 +19581,17 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
 // support side): three questions about a map's value, each of which was being answered
 // by re-slicing `V` out of `{[string]: V}` at every asking.
 function mvSlotOfMapName(mapName: string): i32 {
+  mvSlotOfMapNameTy(mapName, -1)
+}
+// The `Ty` form (D-MAPNODETY): `valTy` is the map VALUE's banked arena type when the caller
+// holds the node, else -1. There is deliberately NO intern-side twin of this — the intern
+// path is `mvShapeOfMapName`, and its header says why it does not get one.
+function mvSlotOfMapNameTy(mapName: string, valTy: i32): i32 {
   // The KEY comes off the map spelling, exactly as on the intern side
   // (`mvShapeOfMapName`); a MONO value needs no slot on either key rep, so it is the
   // `-1`/`-4` sentinel pair.
   const ki = nameIsI32KeyedMap(mapName)
-  const sl = mvSlotOfMapValNameOrMonoK(mapValNameOf(mapName), ki)
+  const sl = mvSlotOfMapValNameOrMonoKTy(mapValNameOf(mapName), ki, valTy)
   if sl == -1 { return mapMonoShapeOfKey(ki) }
   sl
 }
@@ -19541,9 +19601,21 @@ export function mvSlotOfMapValNameOrMono(ivIn: string): i32 {
 }
 
 export function mvSlotOfMapValNameOrMonoK(ivIn: string, keyI32: boolean): i32 {
+  mvSlotOfMapValNameOrMonoKTy(ivIn, keyI32, -1)
+}
+// The `Ty` form (D-MAPNODETY) — the same rung swap `mapAnnShape` makes: the arena leg's
+// type comes from the caller's node when it banked one, and every other rung (the mono
+// early-out, the name scan, the loud `-3`) is unmoved.
+export function mvSlotOfMapValNameOrMonoKTy(
+  ivIn: string,
+  keyI32: boolean,
+  valTy: i32,
+): i32 {
   const iv = mvCanonValName(ivIn)
   if mvValKindOfName(iv) == -1 { return -1 }
-  const aMo = mvSlotOfValNameTyK(ivIn, keyI32)
+  let aMo = -1
+  if valTy >= 0 { aMo = mvSlotOfTyK(valTy, keyI32) }
+  if aMo < 0 { aMo = mvSlotOfValNameTyK(ivIn, keyI32) }
   if aMo >= 0 { return aMo }
   const nmMo = mvSlotByValNameK(iv, keyI32)
   if nmMo >= 0 { return nmMo }

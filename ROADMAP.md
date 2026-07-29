@@ -549,9 +549,13 @@ in-language GC knobs.
   `maps/error-i32-keyed-position-array.vl`); and an ARRAY OF CLOSURES returning one
   (`(() => {[i32]: V})[]`). Also filed, on both key reps: a struct that is a MEMBER of a declared
   union cannot be a map VALUE (`mvValKindOfName`'s last arm asks `structIndexByValName`, which a
-  variant is not in — `tests/cases/maps/error-map-value-struct-in-union.vl`); `.set(k, v)` does not
-  narrow a float literal to `f32` or a string literal to a literal-union member the way
-  `m[k] = v` does; and **a SET-typed FIELD has no `.add`** (`unknown property \`add\` on
+  variant is not in — `tests/cases/maps/error-map-value-struct-in-union.vl`); `m.get(k) ?? member`
+  over an ATOM-valued map prints the raw atom id (`0` where `a` is expected), on BOTH key reps;
+  `m.get(k) ?? nonMember` is a LATE emit error where the `m[k] ?? …` spelling is a clean checker
+  reject — not worth fixing until the raw-atom-id defect above is; a LIST-valued map read as
+  `const g = m[k]; if g != null { g[0] }` is `emitProgram: bare null needs a struct-typed context`
+  on both key spellings and for `i32[]` too (the `(m[k] ?? [])[0]` idiom works); and
+  **a SET-typed FIELD has no `.add`** (`unknown property \`add\` on
   {[K]: boolean}` — the checker's member table does not reach a `{[K]: boolean}` reached through a
   field; identical on both keys, so it is a checker gap and not a rep one). Also:
   `map`/`filter` over Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`.
