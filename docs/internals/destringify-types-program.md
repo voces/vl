@@ -36636,8 +36636,9 @@ comparator moving together:
 
 Those constants are union-box TAGS, and the tag bands are all rooted at ONE number:
 `scalarTagOfKind(k) = uVariants.length + k`, `refArrSlotTag(slot) = uVariants.length + 13 + 2·slot`,
-`mapSlotTag(slot) = uVariants.length + 16 + 2·slot`. So a uniform translation of every tag
-in a module is a change in `uVariants.length` and nothing else — **and the band formula
+`mapSlotTag(slot) = uVariants.length + 16 + 2·slot`. A slot change would move ONE band by
+an even step; a translation applied to tags of THREE DIFFERENT KINDS in one module can only
+be a change in the shared base. That is what each cell shows — and **the band formula then
 lets the count be read straight off the tags**, without a probe compiler:
 
 * `union-arm-litunion-mix-result` (`((i32) => K0 | {w: i32}) | boolean`) — master's tags
@@ -36651,9 +36652,13 @@ lets the count be read straight off the tags**, without a probe compiler:
 `uVariants` only ever grows by a struct atom of a REGISTERED union member-set
 (`emit_collect.vl:4817`). Master registered these mixed unions under TWO spellings — canon's
 softened `string|{w:i32}` and the renderer's preserved `K0|{w:i32}` — and pushed the struct
-variant once per row. One spelling, one row, one push. **The six BYTES cells are not a side
-effect of the ruling; they are the ruling's whole point, made visible: the duplicate union
-row is gone, and the tag numbering shrank by exactly the variants it was double-counting.**
+variant once per row. One spelling, one row, one push. **And the drop is a HALVING in every
+case**: 2 → 1 in five of the six, 4 → 2 in `nulclosure-mixed-union-result` (which registers
+the same union from two sources, each previously in two spellings). A halving is what "each
+row was minted twice" predicts, and it is not what any other explanation predicts. **The six
+BYTES cells are not a side effect of the ruling; they are the ruling's whole point, made
+visible: the duplicate union row is gone, and the tag numbering shrank by exactly the
+variants it was double-counting.**
 The RUN channel (rc + stdout) is `same` on all 1,700 files, these six included.
 
 ### THE CENSUS — RE-RUN ON `3ae713e4`, AND Lsoft IS ZERO
