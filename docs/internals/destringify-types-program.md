@@ -29144,7 +29144,7 @@ grammar has it".
 | **W9** | the CANON pass | 10 | `typecheck.canonEmitNameAt` (4) · `canonShapeName` (4) · `nameNeedsCanon` (2) | the checker re-parsing names it rendered | **DESIGN-BLOCKED.** `canonEmitName` is not `tyToEmitName ∘ nameToTy` — they disagree on 853 of 5,172 annotations (16.5%), 41 canon-only / 108 renderer-only / 5 both. The `renderEmit(ty, ctx)` six-phase design is the answer; P1-P3 have landed | n/a — not a routing problem |
 | | ↑ **SUPERSEDED — read the P4 and P5 sections at the end of this document.** #1266 re-derived the census (the row above staples B1's TOTAL to B3's decomposition; 41+108+5 = 154 ≠ 853). Current: **B1** 1,230 / 7,063 = 17.41%, 29 canon-only / 1,179 renderer-only / 22 both. **B2** (`tyToNominalName ∘ nameToTy`) **176 / 7,201 = 2.44% since P6** (was 194 / 7,130 = 2.72%), 34 / 112 / 30, decomposed by P5 into nine classes of which **114 (58.8%) is the generic APPLICATION the arena cannot spell**. **B3** 272 / 7,150 = 3.80%, 43 / 191 / 38. `emit_collect.vl`'s three render-then-re-canon sites are **one** since P5, and the outer canon there is measured LOAD-BEARING (its deletion moves 13 corpus rows, one of them a wrong answer) | |
 | **W10** | `nameToTyReal` | 9 | `typecheck.nameToTyReal` | the compiler's SECOND recursive-descent type parser | **a SOURCES problem**, not a site problem: the answer is the parser's `annTs` spelling tree (D-PARSETY / D-TSTY). Partly banked at positioned annotations; the residue is the positions the parser still `tsPop()`s | n/a |
-| **W11** | the PIN / SENTINEL markers | 10 | `emit_mono.monoMakeInstance` (3) · `typecheck.recordClonedNodeTy` (7) | `=>sigkey` and `#anonN` PROVENANCE prefixes riding a `TypeRef.tyName` column | not a grammar. Retired by giving the pin its **own column**, not by a home | n/a |
+| **W11** ✅ **CLOSED** (D-PINCOL — see the section at the end) | the PIN / SENTINEL markers | **10 as censused; 11 on the census's OWN rule and scope; 2 mints + 5 decode sites + 3 positional gates as re-derived; 1 residue as built** | `emit_mono.monoMakeInstance` (**4**, not 3 — the second `=>` test sits 108 lines below the first, in the same 400-line function) · `typecheck.recordClonedNodeTy` (7) · **plus** the two MINTS (`emit_mono.monoArgTyName`, `emit_collect`'s `#anon` intern), `emit_classify.sigKeyPinPayload`, and the `annArrowAt` INDEX gates no character-grep can see | `=>sigkey` and `#anonN` PROVENANCE prefixes riding a `TypeRef.tyName` column | not a grammar. Retired by giving the pin its **own column**, not by a home | n/a |
 | **W12** | the `$fnsig` ABI | 9 (+4) | `emit_classify.sigKeyRetTokIx` / `sigKeyRetKind` / `sigKeyRetIsVoid` / `sigKeyRetSlot` / `sigKeyPinPayload` / `sigParamCoerceKind` · `emit_sections.synthSigIdxAt` / `emitSynthCloSig` | a minted representation-kind encoding | ruled out of scope by two in-code notes; each scan already has a single home | n/a |
 | **W13** | the SINGLE-WRITING homes | ~20 | `emit_base.tyTopLevelSplit` / `nullablePartOf` / `removeAtomFromGo` / `annObjFieldSplit` / `annGenAppDecompose` / `canonBareShapeName` / `nameIsStructWithMapField` / `parenUnionArrElemName` · `typecheck.splitTypeName` / `splitGenArgs` / `nameIsInlineLitUnion` · … | each is the ONE body for its grammar | moving them into `tyname.vl` changes the LOCATION, not the count | phase 2 (`splitUnionAtoms` / `unionMemberCount`) is the queued instance |
 
@@ -31444,7 +31444,7 @@ three-writing SPLIT entry and W14 (field-colon cut) are closed. What remains, in
 |---|---|---:|---|---|
 | 1 | **W9** the CANON pass | **10** | DESIGN — `canonEmitName` is not `tyToEmitName ∘ nameToTy`. **The 853/5,172 figure is superseded** (see the P4/P5 sections at the end): B1 is 1,247 / 7,134 = 17.48%, B2 is **176 / 7,201 = 2.44%** (P6 closed T's 18 numeric-litunion-alias rows). P1-P6 landed; `emit_collect`'s three render-then-re-canon sites are one, the canon there is measured load-bearing, and 145 of B2's remaining 176 is G (typed-IR) + Lsoft (owner) | `typecheck.canonEmitNameAt` (4) · `canonShapeName` (4) · `nameNeedsCanon` (2) |
 | 2 | **W10** `nameToTyReal` | **9** | DESIGN — a SOURCES problem; the answer is the parser's `annTs` spelling tree (D-PARSETY / D-TSTY), partly banked | `typecheck.nameToTyReal` |
-| 3 | **W11** the PIN / SENTINEL markers | **10** | DESIGN — not a grammar; retired by giving the pin its own COLUMN | `emit_mono.monoMakeInstance` (3) · `typecheck.recordClonedNodeTy` (7) |
+| 3 | **W11** ✅ **CLOSED** (D-PINCOL) the PIN / SENTINEL markers | **10 censused → 11 re-derived → 1** | the COLUMN was built and every consumer flipped to it. The one residue is the MINT-side bridge (`pinKindOfName`'s SIGKEY leg), which cannot go until `monoArgTyName` returns structure instead of a marked string and the instance registry is re-keyed — a W12-adjacent move | `emit_classify.pinKindOfName` (the residue) · see the D-PINCOL section at the end |
 | 4 | **W12** the `$fnsig` ABI | **13** | DESIGN — a minted encoding, ruled out of scope by two in-code notes; each scan already has a single home | `emit_classify.sigKey*` / `sigParamCoerceKind` · `emit_sections.synthSigIdxAt` / `emitSynthCloSig` |
 | 5 | **W8's last site** — the module-merge rename walk | **1** | BEHAVIOUR DIFFERENCE — its naive quote skip and `skipQuotedName` disagree on `type T = "a\"b"`, which the compiler accepts and runs. **Unifying them is a FIX, not a routing** | `driver.modTypeRenamed`; pinned by `tests/cases/types/litunion-escaped-quote-member.vl` |
 | 6 | **REFUTED / a different operation** | **3** | NOT THE SAME QUESTION — re-derived and rejected, so no later census re-opens them | `typecheck.nameNeedsCanon` (a MEMBER-START digit rule, not a run-start one; `Box<0>` separates them) · `emit_base.normTypeAtom` (a two-sided trim over `' '` AND `'\t'`) · `emit_classify.mvValKindOfName` (skip a run at an index, then slice FROM it) |
@@ -33229,3 +33229,183 @@ and a future slice that moves either reset needs to know the two are not in step
   is set by the ancestor stack during recursion; returning before the recursion clears it
   silently, and the caller that rejects unbounded types then accepts one. *When adding an early
   return to a walk, enumerate what the walk was BANKING on the way down.*
+
+---
+
+## D-PINCOL — W11 retired: the pin gets its own column
+
+Off master `0d76b817`. The census row said it in one line: *"not a grammar. Retired by giving
+the pin its **own column**, not by a home."* This is that column.
+
+### THE RE-DERIVED POPULATION — the census's 10 is 11 on its own rule, and the rule was the smaller error
+
+The census scoped W11 to two functions and counted **10**: `emit_mono.monoMakeInstance` (3) ·
+`typecheck.recordClonedNodeTy` (7). Re-deriving structurally — every site that PUTS a marker into
+a name, and every site that takes one out — gives a different shape at three levels.
+
+**1. On the census's own counting rule, inside the census's own two functions, it is 11.**
+The rule that yields exactly 7 for `recordClonedNodeTy` is *count the character comparisons*
+(`'='`,`'>'` = 2, plus `'#'`,`'a'`,`'n'`,`'o'`,`'n'` = 5). `monoMakeInstance` has **two** `=>`
+tests, not one:
+
+```
+compiler/emit_mono.vl:1202   if pvn[0] == '=' && pvn[1] == '>' { fnValUsed = true }
+compiler/emit_mono.vl:1310   if pn[0] == '=' && pn[1] == '>' {        # the result-kind pin
+```
+
+`monoMakeInstance` spans 1168-1566, so both are inside it — **108 lines apart, in a 400-line
+function**. The census saw the first and stopped. This is the *mid-scan position* blind spot,
+and it is the ninth family in a row to have one.
+
+    grep -n "== '='" compiler/*.vl        # the whole population, 4 lines in the two files
+
+**2. The two MINTS were out of scope, and a marker family with no mint in its census cannot be
+retired from the census alone.** Both are one line each:
+
+| | site | mints |
+|---|---|---|
+| SIGKEY | `emit_mono.monoArgTyName` | `return "=>" + ck` |
+| ANON | `emit_collect` interning pass | `sNames.push("#anon" + i32ToStr(sNames.length))` |
+
+**3. The marker also has POSITIONAL readers the census's grep cannot see.** `annArrowAt` is
+`tyTopIndexOf(name, '=', 0, 0)`, so for a pin it returns **0** — a pin *is* a name with a
+top-level arrow, at index 0. The discriminator between "a pin" and "a function type" is therefore
+the arrow's INDEX, and it is read at two polarities:
+
+* **3 pin-EXCLUDING gates** spell `annArrowAt(...) >= 1`, plus `emit_base.annRetNameOf`'s `at < 1`
+  bail, whose own header states the invariant — *"an arrow at index 0 would mean a name beginning
+  `=>`, which no renderer produces."* **The pin mint produces exactly that**, which is what the
+  bail is really excluding; the header names the wrong reason.
+* **26 pin-FOLDING gates** spell `annArrowAt(...) >= 0` / `< 0`. Each is correct only because no
+  pin reaches it. That is an unstated invariant, not a check.
+
+```
+grep -c "annArrowAt(.*) >= 1" compiler/*.vl                         # 3 (emit_mono 1, emit_classify 2)
+grep -o "annArrowAt([^)]*)[a-z ]*[<>]=* 0" compiler/*.vl | wc -l    # 26
+```
+
+**Population as built: 2 mints + 5 decode sites (11 character compares) + 3 explicit positional
+gates, with an unstated no-pin-reaches-here invariant guarding 26 more.** The fifth decode site,
+`emit_classify.sigKeyPinPayload`, is the marker's documented ONE HOME and sits outside the
+census's two-function scope.
+
+### THE COLUMN
+
+`ast.vl` gets the vocabulary (`PIN_NONE` / `PIN_SIGKEY` / `PIN_ANON`); `typecheck.vl` gets the
+column itself, keyed by node index and reset beside `nodeTyIx`:
+
+```
+let nodePinKind: i32[] = []
+let nodePinPay: string[] = []
+export function recordNodePin(nodeIx, kind, payload)
+export function nodePinKindOf(ix) / nodePinPayloadOf(ix)
+```
+
+A `PIN_NONE` write is a no-op, so the table stays sparse and a `""` / `PIN_NONE` read is
+unambiguously "not a pin" without sizing it to the arena.
+
+**Every pin enters the arena through one seam.** `mkTypeRef`'s only callers are the PARSER (source
+spellings, never handles) and `emit_classify.synthTypeRef` — so classifying at `synthTypeRef`
+covers the column completely. That is `pinKindOfName`, the mint-side bridge.
+
+### PER-CONSUMER CONVERSION
+
+| consumer | was | now |
+|---|---|---|
+| `typecheck.recordClonedNodeTy` SIGKEY arm | `name[0]=='=' && name[1]=='>'` | `pin == PIN_SIGKEY` (kind is a parameter) |
+| `typecheck.recordClonedNodeTy` ANON arm | 5 char compares on `#anon` | `pin == PIN_ANON` |
+| `emit_mono.monoMakeInstance` `fnValUsed` flip | `pvn.length>2 && pvn[0]=='=' && pvn[1]=='>'` | `pinKinds[pv] == PIN_SIGKEY` |
+| `emit_mono.monoMakeInstance` result pin | same pair, then `pn.slice(2, pn.length)` | `pinKinds[pq] == PIN_SIGKEY`, payload from `pinPays[pq]` |
+| `emit_classify.paramCloSigKey` | `sigKeyPinPayload(ty.tyName)` | `nodePinPayloadOf(p.parType)` |
+
+`emit_mono` builds its half of the column in one parallel pass (`monoBuildPinCol`) keyed by param
+index — the same shape `cbFnNames` beside it already uses, which is why that convention was
+followed rather than a node key: at that point no node exists yet.
+
+**WHAT REMAINS: one site.** `pinKindOfName`'s SIGKEY leg still asks `sigKeyPinPayload(name) != ""`,
+because the marker is still how `monoArgTyName` HANDS the key over, and the marked string doubles
+as the monomorphizer's instance-registry discriminator (`monoKeys`). Removing it means giving
+`monoArgTyName` a structured return and re-keying the registry — a separate move, adjacent to W12
+(which is out of scope by ruling). **10 censused decode sites → 1, and the 1 is a mint, not a
+consumer.** The ANON leg needs no marker at all: it is `isSName`, a table query.
+
+### THE DEFECT THE COLUMN EXPOSED — filed, NOT fixed here
+
+`isSName(name)` is not the prefix test. The prefix matched anything BEGINNING `#anon`, so
+`"#anon3[]"` — an **ARRAY** of an interned shape, minted by `emit_collect`'s inferred-list
+synthesis — matched too, and the node recorded the placeholder `TyObj` that says *"this annotation
+is a struct."* It is an array.
+
+Dropping the array rung from `pinKindOfName` is one line. Measured, it:
+
+* makes `tests/cases/closures/closure-result-value-union-field-nested-composite-floor.vl` (an
+  `@emit-error` FLOOR: *"ref valtype with no interned shape"*) **build and run correctly**,
+  printing its expected `1`;
+* removes **2 spurious REJECTs** from the fuzz — `() => {a: () => string, f: i64, z: f64}[]` at
+  `p0r` and `p0c`, i.e. a closure returning an array of structs, the same shape as the floor.
+
+It is the ONLY corpus cell that moves, over 1,673 files and six channels. **That is a behavior
+FIX and it needs its own change** — the floor's expectation has to be rewritten with it — so this
+slice keeps the rung and reproduces the defect deliberately, with the reason at the line.
+
+### MEASUREMENT — and two channels that read GREEN for no good reason
+
+Corpus A/B vs `base99.wasm` (master `0d76b817`, 1,096,568 B), six channels, 1,673 files:
+**0 diffs on every channel.** Byte delta of the compiler itself: **+1,110 B** (1,097,678).
+
+The calibrations are the point, because two of the three instruments are **vacuous for this
+family** and would have read green on a broken build:
+
+| instrument | SAB-A (`=>` arm neutered) | SAB-B (`#anon` arm neutered) | verdict |
+|---|---|---|---|
+| **corpus A/B** | **2 witnesses** (`functions/indirect.vl`, `indirect-polymorphic.vl`) | **15 witnesses**, one INVERTED | **LIVE for both arms** |
+| **fuzz A/B** | byte-identical | **differs** (2 REJECTs) | **LIVE for ANON, VACUOUS for SIGKEY** |
+| **frozen rebuild** | byte-identical | byte-identical | **VACUOUS for both** |
+
+The frozen rebuild — compile master's frozen `compiler/` + `std/` with each candidate — produces
+`md5=23444fccb1a2656c`, 1,096,568 B, for **base99, the change, AND BOTH SABOTAGES**. The brief
+predicted this channel might be live here, since closures and generics are dense in the compiler's
+own source. It is not: the compiler's own generic instantiations never hand a closure to an
+un-annotated parameter, nor synthesize an interned-shape annotation. *A frozen instrument reading
+identical is evidence only after a sabotage has moved it.*
+
+Per-channel profile of both live sabotages: fields **3/4/6** (BUILDRC, BUILDMSG, RUNRC) move;
+fields **1/2/5** (CHECKRC, CHECKMSG, BYTES) never do. W11 is invisible to `vl check` — consistent
+with the pin being read only by the emitter's structural classifiers.
+
+A third calibration came free: the first candidate (`isSName` without the array rung) moved
+**exactly one** corpus cell. The instrument resolves a single-cell move in this code region.
+
+### GATE
+
+All rcs bare, on the post-`fmt` tree:
+
+```
+fetch-seed.sh (fresh)                       rc=0   1096568 B, == base99
+refresh-compiler.sh --prove-fixpoint        rc=0   fixpoint at 2 compiles, 1097678 B
+native-fixpoint.sh                          rc=0
+lint-self.sh                                rc=0
+rep-fuzz-check.sh                           rc=0
+SELFHOST_NATIVE_ALIGN=1 deno task test      rc=0   3512 passed / 0 failed / 7 ignored
+corpus A/B (1,673 files x 6 channels)              0 diffs
+fuzz A/B (8 seeds x depths 4/5/6, plain + branching/multiobs/declared)   byte-identical
+```
+
+The `7 ignored` is the tell that `SELFHOST_NATIVE_ALIGN` was honored; without it ~608 cases
+self-ignore and the suite still exits 0.
+
+### METHOD NOTES
+
+* **A MARKER FAMILY CENSUSED WITHOUT ITS MINTS CANNOT BE CLOSED FROM THE CENSUS.** W11's row named
+  only decoders. The two producers are one line each and neither is in the row — yet the residue
+  after this slice is *exactly a mint*, and it is a mint precisely because the marked string is
+  load-bearing somewhere the census never looked (the instance registry key). *Census a marker in
+  both directions or the count will not predict the work.*
+* **A PREFIX TEST AND THE PREDICATE IT STANDS IN FOR ARE RARELY THE SAME SET.** `#anon`-prefixed
+  and `isSName` differ by exactly the array spelling, and the difference is a live defect with
+  corpus AND fuzz reach. *When replacing a coded read with a structural one, diff the two match
+  sets before assuming inertness — the diff is where the bugs were hiding.*
+* **THE INDEX IS A MARKER TOO.** 29 sites discriminate pin-from-function-type on whether
+  `annArrowAt` returns 0 or a positive number. No character compare, so no grep for the marker
+  finds them, and `annRetNameOf`'s header states the invariant with the wrong justification
+  ("no renderer produces" a leading `=>` — the mint does). *A positional encoding is an encoding.*
