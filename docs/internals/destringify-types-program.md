@@ -38414,3 +38414,308 @@ this population at all; the A/B is a no-regression channel and nothing more.
   the half that fails first is the one you did not change.** The skip alone breaks
   `plain-param`, a position the skip does not touch, because `collectS`'s `variantIndexOf`
   gate then interns the OTHER spelling. *Sweep the positions the change does not name.*
+
+## THE INFERRED-UNION DUPLICATE, AND S-WIDEN — the "17 rows" is 11, the duplicate was holding up an `is` SPELLING nothing else provided, and the widening the last slice filed ships with a 608-cell guard (off master `8b7679c6`)
+
+**TWO TARGETS, ONE PR, AND THEY TOUCH DISJOINT CELLS — which is measured, not asserted:** the
+inferred-union dedup moves 5 corpus files and 0 of the widening sweep's 140 reached cells; the
+widening moves 37 corpus files and 0 of the dedup's twin rows. They ship together because both are
+consequences of #1308's own filing; the join is the doc, not the code.
+
+### 1. TARGET 1's MECHANISM, AND THE COUNT #1308 GOT WRONG
+
+The emitter reaches an inferred return TWICE and nothing gated one on the other
+(`emit_collect.vl`, the `iru` loop):
+
+```
+collectTyReachRegister(stmts, inferRetTyIxAt(iru), 16, false)   // {meow:i32}|{woof:i32}
+registerInferRetNominalUnion(stmts, inferRetTyAt(iru), iru)     // Cat|Dog
+```
+
+The walk renders the RECORDED type, and the recorded type is the ANONYMOUS union the checker
+inferred, so `tyToNominalName` has no route to `Cat` and spells it structurally. The fallback
+registers the checker's own reverse map (`structUnionRetName` → `nominalNameOfObj`, bidirectional
+assignability). `isUName` compares the COMPOSITE; the composites differ; both fire. **Two
+`unNames` rows, ONE layout — and every duplicate is an extra `uVariants` entry, which is the base
+of all three tag bands** (`assignTags`' dense ranks, `scalarTagOfKind` = `uVariants.length + kind`,
+`refArrSlotTag` / `mapSlotTag` above it).
+
+**#1308 SAID 17 ROWS IN 8 PROGRAMS. IT IS 11 IN 5, AND THE PRODUCER SAYS SO.** That attribution
+was reached by elimination — the 26 twin rows minus the UCOLL / UEXP ones it could name. A probe
+that asks the producer directly (**ZZIRR**, `U/mkirr.py`: dump `inferRetTyAt` against
+`reachRegisterName(inferRetTyIxAt, false)` and the recorded atom count at every inferred-return
+row) reads **EMPTY on three of the eight programs** — they contain no inferred return at all:
+
+| program | ZZIRR rows | its 2-spelling twins |
+| --- | --- | ---: |
+| `closures/inferred-variant-box-lambda-result.vl` | `Cat\|i32` vs `{legs:i32}\|i32` | **1** |
+| `functions/inferred-struct-union-common-field.vl` | `A\|B` vs `{tag:i32,a:i32}\|{tag:i32,b:i32}` | **2** |
+| `functions/inferred-struct-union-return.vl` | `Cat\|Dog`, `A\|B\|C` vs both structural | **5** |
+| `functions/inferred-variant-box-union-return.vl` | `Cat\|i32` vs `{legs:i32}\|i32` (3 more rows AGREE) | **1** |
+| `statements/tail-assign-if-arms.vl` | `Dog\|Cat` vs `{tail:i32}\|{legs:i32}` (18 more agree) | **2** |
+| `generics/union-member-generic-application-mixed.vl` | **none** — `type UShape = Box<i32> \| {t:i32}` beside `type UAlias = BoxI \| Tag` | 1 |
+| `unions/nullable-collection-of-variant-box-arm-field-union.vl` | **none** — an inline `{[string]: {f: boolean\|{w:i32}} \| boolean}\|null` beside `type V = S \| boolean` | 2 |
+| `unions/variant-nullable-list-field.vl` | **none** — inline `{f: i32[]\|null}\|{w:i32}` beside `type U = A \| B` | 3 |
+
+The last three are the SOURCE spelling one layout two ways — the UCOLL family one rung over, and
+terminal for the same reason: both spellings are the author's own. *An attribution reached by
+elimination is still an attribution. Ask the producer.*
+
+Note the rows that AGREE: `{w:i32}|i32|null` and `i32|{x:i32}` render identically on both legs,
+which is why the gate below tests `ar == nm` rather than assuming disagreement.
+
+### 2. WHAT SHIPS FOR TARGET 1 — one predicate, four gates, each a case where the two names are NOT two spellings of one union
+
+```
+function inferRetArenaUnionIsDup(tyIx: i32, nm: string, row: i32): boolean
+```
+
+`TyUnion` root only (a nullable / collection root owns registrations the member descent alone
+would drop) · `!isUName(nm)` and `inferRetAtomCountAt(row) >= 2` (else the fallback would not
+register anyway) · `ar != nm` (nothing duplicated) · `!isUName(ar)` (the source ALSO spells the
+structural form, so master's path is already an `isUName` no-op and is kept exactly). When it
+holds, the walk runs `collectTyMembersReach` — the bucket (c) pre-descent every variant-box
+registration needs — and the top-level row is the NAME's.
+
+### 3. THE MERGED ROWS, READ OFF `unNames` AND OFF THE MODULE
+
+```
+rows:  bash U/undiff.sh unM unC <file>     twins: bash U/cgrun.sh twinM twincasesM tests/cases
+                                                  && python3 U/twinfiles.py U/twincasesM.out two
+```
+
+| file | `unNames` row removed | twins | bytes | heap types | what the WAT shows |
+| --- | --- | ---: | ---: | ---: | --- |
+| `closures/inferred-variant-box-lambda-result.vl` | `{{legs:i32}\|i32}` | 1 | 805 → 805 | 19 → 19 | `Cat` tag `2`→`1`, the `{w:i32}\|i32` arm `3`→`2` |
+| `functions/inferred-struct-union-common-field.vl` | `{{tag:i32,a:i32}\|{tag:i32,b:i32}}` | 2 | 318 → 318 | 7 → 7 | `B` tag `2`→`1` |
+| `functions/inferred-struct-union-return.vl` | both structural rows | 5 | 434 → 434 | 13 → 13 | `Cat` `6`→`3`, `Dog` `8`→`4`, `A` `2`→`1`, `B` `4`→`2` |
+| `functions/inferred-variant-box-union-return.vl` | `{{legs:i32}\|i32}` | 1 | 1039 → 1039 | 21 → 21 | ranks `5`→`4`, `4`→`3`, `2`→`1` **and value-atom band tags `12`→`11`, `11`→`10`, `6`→`5`** |
+| `statements/tail-assign-if-arms.vl` | `{{tail:i32}\|{legs:i32}}` | 2 | 2051 → 2051 | 60 → 60 | `6`→`4` (two duplicates before it), `3`→`2` |
+
+**EVERY CHANGED CONSTANT IN ALL FIVE MODULES IS A VARIANT TAG, and it drops by exactly the number
+of duplicate rows that sorted before it.** No heap type appears or disappears (`uVarTwin` already
+folded the layouts, so the duplicates shared their struct) and no module changes SIZE — which is
+why `BUILDMSG`, whose text carries the byte count, reads `same` on all five while `cmp` reads
+BYTES. Row 4 is the three-bands claim materialised: `i32.const 12` → `11` is `scalarTagOfKind`'s
+band, not a variant rank, and it moves because its base is `uVariants.length`.
+
+Corpus TWO-spelling twin rows **26 → 15 over 5 files, 0 added anywhere**; SAME-spelling unchanged
+at 81 on every pre-existing file. The 15 that remain: 4 UCOLL-in-kind (`Cat`←`Kot`), 3 UCOLL
+(`B`←`A`), 2 UEXP, 6 SOURCE-spells-it-twice — all terminal by design or already filed.
+
+### 4. THE TWO-HALF TRAP FIRED, AND THE HALF IT BROKE WAS A SPELLING NOTHING ELSE PROVIDED
+
+The dedup's corpus A/B is 5 BYTES rows and nothing else. **A 14-cell `is`-spelling ×
+union-PROVENANCE sweep (`U/isspell.py`) found three cells going DOWN that no corpus channel could
+see**, because no corpus file writes the test:
+
+| provenance of the union operand | `is Cat` | `is {meow: i32}` master | dedup alone | **shipped** |
+| --- | --- | --- | --- | --- |
+| inferred (`const a = pick(true)`) | OK | OK | **EMIT REJECT** | OK |
+| declared alias (`const a: U = pick(true)`) | OK | OK | **EMIT REJECT** | OK |
+| alias + literal init (`const a: U = {meow:1}`) | OK | OK | **EMIT REJECT** | OK |
+| annotated nominal · annotated structural · structural + literal | OK | OK | OK | OK |
+
+The emitter resolves an `is` by an EXACT STRING COMPARE against `uVariants` (`variantIndexOf`), so
+which spellings work is decided by which spellings got REGISTERED — and the duplicate's rows
+`{meow:i32}` / `{woof:i32}` were the ones an inline test matched. **DELETE THE BYSTANDER SETTLES
+WHAT KIND OF CAPABILITY IT WAS.** Remove the unrelated `pick` from the same programs and two of
+the three are an emit reject *on master too*:
+
+| | master, with `pick` | master, `pick` deleted | shipped, `pick` deleted |
+| --- | --- | --- | --- |
+| `const a: Cat\|Dog = {meow:1}`; `a is {meow: i32}` | OK | **EMIT REJECT** | **OK** |
+| `const a: U = {meow:1}`; `a is {meow: i32}` | OK | **EMIT REJECT** | **OK** |
+
+*On master, whether this test compiled depended on whether some other function in the module
+happened to have an inferred struct-union return.* That is not a capability, it is an accident of
+a duplicate registration — and the answer is not to keep the duplicate but to give the spelling a
+producer.
+
+### 5. `isVariantSpelling` — the spelling resolved at its CONSUMER, and it is TWO gates
+
+```
+export function isVariantSpelling(variant: string, tyIx: i32): string
+```
+
+The author's spelling when it names a row; otherwise the DECLARED name of the struct that
+spelling's TYPE equals, read from the checker's banked `isVarTyIxOf` through
+`nominalStructNameOfTy` — **the same reverse map that spelled the union's members in the first
+place**, so the test and the variant it names come from one producer (D-ISALIAS's rule, one rung
+further out than the canon rewriter can reach: whether `{meow:i32}` or `Cat` is the registered
+spelling is EMITTER state, and an inline-shape ANNOTATION union registers the structural form, so
+canon rewriting the test would break the spelling that works).
+
+**IT IS TWO GATES AND THEY ARE TWO, MEASURED:** `emitIs`'s own `variantIndexOf`, and the narrowing
+PUSH (`pushNarrowIs`) whose spelling every narrowed-receiver reader inherits. Patching only the
+first moves the failure one site over, from ``is` names a type that is not a union variant`` to
+`narrowed receiver names no union variant` — which is why every case in the new fixture READS A
+FIELD through the narrowing rather than stopping at the test.
+
+**AND THE REVERSE MAP HAD TO BE THE ASSIGNABILITY ONE.** The first build used `structNameOfTy`,
+which matches by arena-index IDENTITY (`cStructTyIxs[i] == ty`) — an inline `{meow: i32}` written
+in an `is` test interns its OWN arena entry, so it answered "" and the rung never fired at either
+gate. `nominalStructNameOfTy` wraps `nominalNameOfObj` (bidirectional `assignable`), which is the
+equality the variant tables were built under. Entombed as S-IDENTITY.
+
+### 6. TARGET 2 — S-WIDEN, and the guard sweep that is the reason it ships
+
+#1308 filed the `TyObj` gate on `isTransparentObjAlias` with its numbers and declined to ship it.
+Reproduced to the byte at this base: dropping the gate moves **37 corpus files, ALL smaller,
+−437 bytes**, check / check-msg / build-rc / RUN identical on 1,707. The thesis is the EMPTY row,
+not the duplicate variant row: a zero-variant alias row still sets `uDeclared`, which mints the
+shared union box **for a program that has no union**.
+
+| what the 37 lose | files |
+| --- | ---: |
+| the shared union box `(struct (field i32) (field anyref))` | **26** |
+| at least one heap type | **36** |
+| a duplicate MAP SLOT + three scan locals per function (`maps/alias-positions-and-value-kinds.vl`, −36, types 25 → 25 — a locals-vector diff at a reservation seam) | 1 |
+| the closure fat-pointer `(struct (field funcref) (field structref) (field i32))` and the `structref` env param on every `$fnsig` (`generics/type-param-shadows-alias-funcdecl.vl`, −94, types 33 → 26) | 1 |
+| the union box PLUS all four value-atom boxes (`numerics/as-cast-alias-target.vl`, −22, types 15 → 10) | 1 |
+
+**THE WIDENING-GUARD SWEEP (`U/widsweep.py`), because #1234's precedent is that a swallow
+reported as one cell is a SAMPLE.** 19 member KINDS × 17 POSITIONS × {alias spelling, alias-free
+CONTROL} = **608 cells**, graded on the RUN:
+
+| reading | value |
+| --- | --- |
+| cells where the widening moves the RUN | **0 of 608** |
+| cells where it moves the MODULE (`U/widsweep2.py` — build rc + size) | **140** — every widened kind (prim ×5, array ×3, func ×2, map ×3), **no** unclaimed kind (`obj`, `genapp`, `arr-struct`, `lit1`, `litunion`, `nullable`), and **no control cell** |
+| direction of those 140 | **140 smaller, 0 bigger, −1,042 B** |
+| build rc differing on any cell | **0** |
+| **INVERTED CONTROL** — the grid against a compiler where this predicate answers FALSE (#1308 reverted) | **11 cells RED**, 2 of them silent INVALID WASM, all in the `obj` kind |
+
+**The inverted control is what makes the 0 a real zero.** Kinds and positions the widening does
+not claim are unmoved on the module channel too, which is the control's members differing (#1304);
+and only ONE union POSITION is reached at all (`prim-bool` × `union-bool`), because where a real
+union already exists the empty alias row costs nothing — the thesis restated by the grid.
+
+The predicate is renamed `isTransparentAlias`, since `Obj` stopped being true of it.
+
+### 7. THE FIXTURES, AND WHY THEY ARE THREE FILES
+
+Each of the first two was GREEN on master until its bystander was moved out, which is §4's lesson
+applied to test authoring:
+
+* `unions/is-inline-shape-names-a-nominal-variant.vl` — the subject. Red on master
+  (``is` names a type that is not a union variant``). It had a `structuralAnnotation` control in
+  it, and the control's own `{meow: i32} | {woof: i32}` rows made the SUBJECT compile on master.
+* `unions/is-inline-shape-structural-union-control.vl` — that control, alone. Green on both, which
+  is the additivity claim. It also drops its `is Dog` case: a NOMINAL test against a union whose
+  rows are inline shapes is a reject on both compilers, and the fallback only maps the other way.
+* `functions/inferred-union-one-row.vl` — the dedup's own pin, both `is` spellings agreeing on one
+  inferred union. It deliberately omits the LIST and FIELD positions: **an array literal of
+  inferred-union elements registers a SECOND structural union row, identically on both compilers**
+  — a different producer, reproduced below, and the next twin-row target. Including it would have
+  put two rows back in a file named for having one, and GROWN the corpus twin count.
+
+```
+type Cat = { meow: i32 }
+type Dog = { woof: i32 }
+function pick(c: boolean) { if c { return { meow: 500 } }  return { woof: 600 } }
+function positions() {
+  const xs: (Cat | Dog)[] = [pick(true), pick(false)]
+  const e = xs[0]
+  if e is Cat { print(e.meow) }
+}
+positions()
+   ZZUN, master AND head:  {Cat|Dog}=(0:Cat,1:Dog)  {{meow:i32}|{woof:i32}}=(2,3)
+```
+
+### 8. SABOTAGES — five, and the two that are GREEN are green by design
+
+Each is the shipped tree with ONE edit, self-compiled from the fetched seed, its own compiler
+installed as that tree's `build/vl-compiler.wasm`, `.github` / `lsp` / `playground` copied in, and
+the FULL suite run in that tree.
+
+| sabotage | edit | suite | witness |
+| --- | --- | ---: | --- |
+| **S-SPELLOFF** | `emitIs` stops resolving the spelling (the push keeps it) | 3,588 / **2** | `unions/is-inline-shape-names-a-nominal-variant.vl` ×2 — ``emitProgram: `is` names a type that is not a union variant`` |
+| **S-PUSHOFF** | the narrow PUSH stops resolving it (`emitIs` keeps it) | 3,587 / **2** + 1 flake | the same file ×2 — `emitProgram: narrowed receiver names no union variant` |
+| **S-IDENTITY** | the reverse map matches by arena-index identity (`structNameOfTy`) | 3,588 / **2** | the same file ×2 — ``is` names a type that is not a union variant`` |
+| **S-DUPBACK** | `inferRetArenaUnionIsDup` always false | **3,590 / 0** | **none — by design.** Verified LIVE on the byte channel: `inferred-struct-union-return.vl`'s tags go back to `3`→`6`, `4`→`8` |
+| **S-WIDENBACK** | the `TyObj` gate returns | **3,590 / 0** (+1 flake) | **none — by design.** Verified live: `primitive-type-alias.vl` +18, `type-param-shadows-alias-funcdecl.vl` +94 |
+
+S-SPELLOFF and S-PUSHOFF are the two-gate pair: each is one half, and each reddens the SAME file
+with the OTHER's message — §5's "two gates" stated as two experiments. The flake in two runs is
+`vl-test: files run in PARALLEL`, a timing test.
+
+**THE TWO GREEN SABOTAGES ARE THE HONEST READING, NOT A GAP.** Neither thesis has a RUN
+consequence on any program the suite contains — the dedup's channel is the `uVariants` row COUNT
+and the tag bands, the widening's is BYTES. A suite that cannot see them is the same instrument
+that read #1308's S-WIDEN at 3,584/0, and it is why both needed a probe of their own.
+
+### 9. CORPUS AND FUZZ
+
+`WT=… A=basem B=head OUT=FINAL2 bash ck/abcorpus3.sh` — six channels, `-o` path normalized:
+
+| channel | 1,710 files |
+| --- | --- |
+| CHECKRC · CHECKMSG | **1,710 same** |
+| BUILDRC | 1,709 same · **1 up** (the new fixture, 1 → 0) |
+| BUILDMSG | 1,672 same · 38 (the 37 widening rows carry the byte count in the message, plus the new fixture) |
+| BYTES | 1,667 same · **43** — 5 from target 1 (size-identical, tags renumbered), 37 from target 2 (all smaller), 1 the new fixture |
+| RUN | 1,709 same · **1 up** (the new fixture, 1 → 0) |
+
+**No cell down; the only outcome that moves, moves up.** Fuzz A/B, 10 seeds × 3 depths × 200 cases
+= 6,000 per side, logs **BYTE-IDENTICAL**, 0 unsound-class lines either side — and vacuous for both
+targets for the reason #1308 measured: `scripts/fuzzgen.vl` emits no one-member plain-reference
+alias and no inferred struct-union return.
+
+**THE CENSUS DOES NOT MOVE, BY CONSTRUCTION.** B1 / B2 / B3 measure canon against the two
+renderers; all three changes are emitter-side (`collectU`'s skip, the `iru` loop's registration,
+`emitIs` / `pushNarrowIs`), and the one typecheck ADDITION (`nominalStructNameOfTy`) has no caller
+on the canon path.
+
+### 10. GATE
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && bash scripts/fetch-seed.sh` | 0 | 1,111,490 B published seed |
+| `bash scripts/refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint in 2 compiles — **the published seed compiles this branch's source, no A/B split** |
+| `bash scripts/native-fixpoint.sh` | 0 | stage3 == stage4, 1,111,831 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,590 passed / 0 failed / 7 ignored** (master 3,584/0/7; +6 = 3 new fixtures × {cases, native-align}; ignored SET identical) |
+| `bash scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `bash scripts/rep-fuzz-check.sh` | 0 | exact ✅, 1 baselined reject, 0 new / 0 stale |
+
+**BYTE DELTA: 1,111,490 → 1,111,831 = +341 B.**
+
+### 11. INSTRUMENTS (scratchpad `U/`, session a43e2b0f)
+
+`U/{env,mktree,mkwtree,buildtree,cgrun,undiff,typedelta,typedelta-res,bytes,bytesres,watd,un1,r1,twodiff,ab,abcorpus3,fzab,fmt,gtest,mksabtree}.sh` ·
+`U/{mkun,mkrr,mktwin,twinan,twinfiles,mkirr,mkwiden,mknoskip,mkisnom,mksab,widsweep,widsweep2,irhunt,isspell,isspell2}.py`
+
+* **ZZIRR** (`U/mkirr.py`) — the probe that corrected the 17. Dumps the CHECKER's recorded name
+  against the ARENA walk's render at every inferred-return row; three of the eight attributed
+  programs print nothing at all.
+* **`U/isspell.py` / `isspell2.py`** — the `is`-spelling × union-PROVENANCE grid and its
+  delete-the-bystander twin (the same grid with the inferred-return function removed from `PRE`).
+  The pair is what turned "3 cells down" into "2 cells up".
+* **`U/widsweep.py` / `widsweep2.py`** — the same 608-cell grid graded on the RUN and on the
+  MODULE. Running both is the point: the first reads 0 and the second proves the 0 is not coverage.
+
+### 12. LESSONS
+
+* **AN ATTRIBUTION REACHED BY ELIMINATION IS STILL AN ATTRIBUTION — ASK THE PRODUCER.** #1308
+  bucketed 26 twin rows by naming the ones it recognised and assigning the remainder to "the
+  inferred union, registered twice". Six of those rows are in programs with no inferred return at
+  all, and one probe over the producer's own table said so in a single run. *The residue of a
+  correct classification is not automatically one class.*
+* **WHEN A DUPLICATE REGISTRATION IS DELETED, ASK WHAT WAS READING THE COPY — IN A GRID THE CORPUS
+  CANNOT ANSWER.** The dedup's corpus A/B is clean on every outcome channel and it still took three
+  cells down. The capability it removed (`is {meow: i32}`) is not written anywhere in 1,707 files,
+  so only a constructed spelling × provenance grid could see it. *#1308's lesson was "measure each
+  half alone"; the half here is not a half of the CHANGE, it is a consumer of the thing removed.*
+* **A CAPABILITY THAT DEPENDS ON AN UNRELATED FUNCTION IS NOT A CAPABILITY.** Delete-the-bystander
+  turned "the fix regresses 3 cells" into "master's answer was an accident in 2 of them, and the
+  rule that fixes the third fixes those too" — 3 cells restored and 2 gained. *Run the control
+  WITHOUT the thing you are about to remove, before concluding you removed something.*
+* **A SUITE READING GREEN UNDER A SABOTAGE IS EVIDENCE ABOUT THE SUITE.** Two of five sabotages are
+  green and both were predicted to be: their theses have no RUN consequence on any program in the
+  corpus. Reporting them as green beside the byte channel that DOES see them is the honest form;
+  inventing a fixture that cannot fail for the right reason is worse.
+* **A FIXTURE CAN HAVE A BYSTANDER TOO.** Two of three new files were green on master until their
+  in-file control was moved out, and the third had to give up two positions because an array
+  literal's own registration would have put the duplicated row back. *The rule that makes a probe
+  valid makes a test file valid: one claim per module, and check what else the module registers.*

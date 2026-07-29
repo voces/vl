@@ -54,7 +54,7 @@ import {
   inferRetNameOf,
   inferRetTyAt,
   inferRetTyIxAt,
-  isTransparentObjAlias,
+  isTransparentAlias,
   isValueUnionName,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
@@ -5374,6 +5374,44 @@ function registerInferRetNominalUnion(stmts: i32[], nm: string, row: i32) {
   0
 }
 
+// ONE UNION, ONE SPELLING — the gate that stops the inferred-return row being registered
+// TWICE. `registerInferRetNominalUnion` above is a FALLBACK by name, but nothing gated the
+// arena walk that runs before it: for an inferred STRUCT-union / VARIANT-BOX return the walk
+// renders the recorded (anonymous) arena type STRUCTURALLY (`{meow:i32}|{woof:i32}`) and
+// registers THAT, then the fallback registers the checker's reverse-mapped NOMINAL composite
+// (`Cat|Dog`) — because `isUName` compares the composite and the two composites differ. Two
+// `unNames` rows, ONE layout, and every variant of the second is a DUPLICATE entry in
+// `uVariants` — which is the base of all three tag bands, so the duplicates renumber every
+// tag in the module and `variantIndexOf`'s exact string compare can land on the copy.
+//
+// The two producers are not equal and the choice is not a taste: the NOMINAL name is the one
+// the rest of the emitter classifies the binding / return / `is`-narrow by (`isUName("Cat|Dog")`),
+// and it is the only one that survives the owner's PRESERVE ruling — the vocabulary keeps
+// names. `tyToNominalName` simply has no route from an anonymous inferred `TyObj` to the
+// declared `Cat` it equals, so its "structural" answer is a MISS, not a second opinion.
+// So when the fallback is about to register the nominal composite, the arena walk registers
+// only the union's MEMBERS (the bucket (c) pre-descent every variant-box registration needs)
+// and leaves the top-level row to the name.
+//
+// Gated four ways, and each gate is a case where the two names are NOT two spellings of one
+// union: a non-`TyUnion` root (a nullable / collection root owns registrations the member
+// descent alone would drop); a nominal name the fallback would not register anyway
+// (`isUName`, or fewer than 2 recorded atoms); a render that AGREES with the recorded name
+// (nothing duplicated — 4 of the corpus's inferred rows are this); and a structural render
+// the source itself ALSO spells, which some annotation already registered (`isUName(ar)`) —
+// there the arena registration is already an `isUName` no-op and master's path is exact.
+function inferRetArenaUnionIsDup(tyIx: i32, nm: string, row: i32): boolean {
+  if tyIx < 0 { return false }
+  const t = T.tys[tyIx]
+  if !(t is TyUnion) { return false }
+  if isUName(nm) { return false }
+  if inferRetAtomCountAt(row) < 2 { return false }
+  const ar = reachRegisterName(tyIx, false)
+  if ar == "" { return false }
+  if ar == nm { return false }
+  !isUName(ar)
+}
+
 // Scan every top-level FuncDecl's parameter + return annotations and every top-level
 // `let`/`const` annotation for INLINE union types, registering each as a synthetic
 // union alias (so it interns its variant shapes + heap types exactly like a named
@@ -5622,15 +5660,19 @@ export function collectU(stmts: i32[]) {
         i = i + 1
         continue
       }
-      // A TRANSPARENT one-member OBJECT alias (`type MyCat = Cat`, `type Y = Box<i32>`) is
-      // not a union either — under #1122's ruling it DENOTES its member, and the checker
-      // resolves it that way in `declaredTyOfName`. The row this pass used to mint for it is
-      // the POISON that ruling named: it pushed the member's own name (`Cat`) into
-      // `uVariants` a second time, so `Cat` classified as a union VARIANT box wherever it
-      // stood, and the transparent render had to be STRUCTURAL to route around it. One
-      // predicate (`isTransparentObjAlias` → `singleAliasMemberTyIx`) decides it on both
+      // A TRANSPARENT one-member alias (`type MyCat = Cat`, `type Y = Box<i32>`,
+      // `type Id = i32`, `type F = (i32) => i32`, `type L = i32[]`, `type M = {[string]: i32}`)
+      // is not a union either — under #1122's ruling it DENOTES its member, and the checker
+      // resolves it that way in `declaredTyOfName`. The row this pass used to mint for it cost
+      // BOTH of the things a `UnionDecl` row costs. For the OBJECT arm it was the POISON that
+      // ruling named: it pushed the member's own name (`Cat`) into `uVariants` a second time,
+      // so `Cat` classified as a union VARIANT box wherever it stood, and the transparent
+      // render had to be STRUCTURAL to route around it. For EVERY arm — including the four
+      // whose row is empty — it also set `uDeclared`, minting the shared union box and the
+      // atom / ref-array / map registrations that hang off it for a program with no union at
+      // all. One predicate (`isTransparentAlias` → `singleAliasMemberTyIx`) decides it on both
       // sides, exactly as `nameToTy` and `singleMemberAliasTyIx` already do.
-      if isTransparentObjAlias(s.udName) {
+      if isTransparentAlias(s.udName) {
         i = i + 1
         continue
       }
@@ -5715,17 +5757,23 @@ export function collectU(stmts: i32[]) {
     // interning is `cloSigPosOfKey`-gated), so an inferred type whose reps the name
     // walk already reached is a no-op — this only ADDS the coverage the render missed.
     // #1046 made inferred variant-box returns 0-growth redundancy here.
-    if collectTyReachRegister(stmts, inferRetTyIxAt(iru), 16, false) < 0 {
-      return -1
+    // ONE SPELLING (`inferRetArenaUnionIsDup`): where the walk's STRUCTURAL render of
+    // this root and the NAME FALLBACK's NOMINAL composite are two spellings of ONE union,
+    // the walk descends the MEMBERS only and the row is the name's. Everywhere else the
+    // walk is master's, top-level registration included.
+    const irTyIx = inferRetTyIxAt(iru)
+    const irNom = inferRetTyAt(iru)
+    if inferRetArenaUnionIsDup(irTyIx, irNom, iru) {
+      if collectTyMembersReach(stmts, irTyIx, 15, false) < 0 { return -1 }
+    } else {
+      if collectTyReachRegister(stmts, irTyIx, 16, false) < 0 { return -1 }
     }
     // NAME FALLBACK — the one inferred-return registration the arena walk cannot
     // reproduce (see `registerInferRetNominalUnion`): an inferred STRUCT-union /
     // VARIANT-BOX return whose members are ANONYMOUS inferred shapes, recorded under
     // its NOMINAL composite (`Cat|Dog`, `Cat|i32`) which lives only in the name.
-    if registerInferRetNominalUnion(stmts, inferRetTyAt(iru), iru) < 0 {
-      return -1
-    }
-    cloSigWalkRoots.push(inferRetTyIxAt(iru))
+    if registerInferRetNominalUnion(stmts, irNom, iru) < 0 { return -1 }
+    cloSigWalkRoots.push(irTyIx)
     iru = iru + 1
   }
   // Inferred VALUE-union BINDINGS (`const x = if c then v else null`): same treatment,

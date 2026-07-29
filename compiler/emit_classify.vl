@@ -109,6 +109,7 @@ import {
   nodeTyName,
   nodeTyWidenedRepName,
   nodeUnionName,
+  nominalStructNameOfTy,
   recordClonedNodeTy,
   recordNodePin,
   tyIsLitUnion,
@@ -3969,7 +3970,54 @@ function pushNarrow(name: string, variant: string) {
 // resolved it to at the `is` node (`isVarTyIxOf` — -1 for a node the checker never saw,
 // e.g. a monomorphized clone, which lands on the name path).
 function pushNarrowIs(name: string, variant: string, condIx: i32) {
-  pushNarrowRep(name, variant, isVarTyIxOf(condIx), -1)
+  const ity = isVarTyIxOf(condIx)
+  pushNarrowRep(name, isVariantSpelling(variant, ity), ity, -1)
+}
+
+// The `uVariants` SPELLING of an `is`-tested type: the author's own spelling when it names
+// a variant row, otherwise the DECLARED name of the struct that spelling's type equals.
+//
+// WHY THE SECOND RUNG EXISTS. The emitter resolves an `is` test by an EXACT STRING COMPARE
+// against `uVariants` (`variantIndexOf`), so which spellings work is decided by which
+// spellings got REGISTERED. For an inferred struct-union return the registration is the
+// checker's reverse-mapped NOMINAL composite (`Cat|Dog` — `structUnionRetName` →
+// `registerInferRetNominalUnion`), so the rows read `Cat` and `Dog` and the inline shape
+// `is {meow: i32}` names no row. It USED to name one, for a reason that was never a rule:
+// the arena walk registered the SAME union a second time under its structural spelling, and
+// its duplicate rows `{meow:i32}` / `{woof:i32}` were what the inline test matched. Deleting
+// that duplicate (`inferRetArenaUnionIsDup`, `emit_collect.vl`) therefore took the inline
+// spelling with it — the two-half trap, caught by a 14-cell `is`-spelling x union-PROVENANCE
+// sweep before the corpus could see it (the corpus never writes this test).
+//
+// SO THE SPELLING IS RESOLVED WHERE IT IS CONSUMED, AND FROM THE CHECKER'S OWN BANK. `tyIx`
+// is `isVarTyIxOf`'s banked arena type for the `is` node — the same bank `isArmTagOfTy` and
+// the narrow push read — and `nominalStructNameOfTy` is the reverse map that spelled the
+// union's members in the first place, so the test and the variant it names come from ONE
+// producer. That is D-ISALIAS's rule, applied one rung further out than the canon rewriter
+// could reach: canon cannot make this call, because whether `{meow: i32}` or `Cat` is the
+// registered spelling is EMITTER state (an inline-shape ANNOTATION union registers the
+// structural spelling, and rewriting its test would break the one that works).
+//
+// STRICTLY ADDITIVE — the raw spelling is returned untouched whenever it resolves, so no
+// resolution that worked before can change, and the fallback only converts a LOUD REJECT
+// into a hit. Two gates read it, and they are two gates rather than one: the `is` test's own
+// `variantIndexOf` (`emitIs`) and this narrowing push, whose spelling every downstream
+// narrowed-receiver reader inherits. Fixing only the first moved the failure from
+// ``is` names a type that is not a union variant`` to `narrowed receiver names no union
+// variant` — the same reject, one site over.
+//
+// IT ALSO CLOSES AN ACTION AT A DISTANCE. On master `if a is {meow: i32}` over a
+// `Cat | Dog`-typed binding compiled ONLY when the module happened to contain some OTHER
+// function with an inferred struct-union return, because that function's duplicate
+// registration is what put `{meow:i32}` in `uVariants`. Delete the unrelated function and
+// the test stopped compiling. Both of those cells run here, with or without the bystander.
+export function isVariantSpelling(variant: string, tyIx: i32): string {
+  if variantIndexOf(variant) >= 0 { return variant }
+  const nomn = nominalStructNameOfTy(tyIx)
+  if nomn != "" {
+    if variantIndexOf(nomn) >= 0 { return nomn }
+  }
+  variant
 }
 
 // Append the declared-local name `name` to `localNames` as a FRESH slot (one wasm

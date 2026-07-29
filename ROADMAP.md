@@ -128,6 +128,32 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 >   82-row "SAME spelling, by design" bucket the probe dismissed — `{MyCat}=(0:Cat)` beside
 >   `{Cat|i32}=(1:Cat)`, two `Cat` rows where the first union does not exist. *Intersect the file
 >   sets before inheriting a class attribution; two populations that read alike need not overlap.*
+>
+>   **THE INFERRED-UNION DUPLICATE IS CLOSED AND THE WIDENING SHIPPED (2026-07-29, off `8b7679c6`).**
+>   The line above says the 26 duplicate rows are "17 inferred, 7 UCOLL, 2 UEXP". **The 17 is 11**,
+>   and the correction comes from the producer itself: a ZZIRR probe (dump `inferRetTyAt` against
+>   `reachRegisterName` at every inferred-return row) reads EMPTY on three of the eight programs the
+>   17 was attributed to — they have no inferred return at all, and their 6 rows are the SOURCE
+>   spelling one layout two ways (an inline-shape annotation beside a nominal `type` chain), the
+>   UCOLL family one rung over. *An attribution by elimination is still an attribution; ask the
+>   producer.* The 11 are gone (`inferRetArenaUnionIsDup`: where the arena walk's structural render
+>   and the name fallback's nominal composite are two spellings of ONE union, the walk descends the
+>   MEMBERS and the row is the name's) — **corpus TWO-spelling 26 → 15 over 5 files, 0 added, and
+>   the 15 that remain are 4 UCOLL-in-kind + 3 UCOLL + 2 UEXP + those 6, every one terminal by
+>   design or already filed.** The removal takes the inline-shape `is` spelling with it (the
+>   duplicate's rows were what `is {meow: i32}` matched — the two-half trap, caught by an
+>   `is`-spelling × union-PROVENANCE sweep, 3 cells DOWN), so the spelling is resolved at its
+>   CONSUMER instead (`isVariantSpelling`, from the checker's banked `is` type through the same
+>   reverse map that spelled the union's members). **That is 2 cells UP over master and it ends an
+>   action at a distance**: on master `x is {meow: i32}` over a `Cat | Dog` binding compiled only
+>   when the module happened to contain an unrelated inferred struct-union return. **S-WIDEN
+>   SHIPPED**: the `TyObj` gate on the transparency skip is gone (`isTransparentAlias`), because an
+>   EMPTY alias row still sets `uDeclared` and mints the union box — 37 corpus files, all smaller,
+>   **−437 bytes**, 26 of them losing exactly that box; its widening-guard sweep is 19 member kinds
+>   × 17 positions × {alias, control} = 608 cells with **0 run movement**, a 140-cell module-channel
+>   reach, and an inverted control that reddens 11. **Filed, with a reproduction: an ARRAY LITERAL
+>   of inferred-union elements still registers the structural spelling a second time** — a different
+>   producer, identical on both compilers, and the next twin-row target.
 
 ### Consumer-driven requirements — webcraft (`docs/webcraft-requirements.md`)
 

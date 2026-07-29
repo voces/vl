@@ -1,0 +1,72 @@
+// @run
+// @log 500
+// @log 1
+// @log 600
+// @log 2
+// ONE UNION IS ONE ROW. An inferred STRUCT-union return used to be registered TWICE, and
+// this file is the program where both registrations are observable at once.
+//
+// The emitter reaches an inferred return two ways and neither was gated on the other. The
+// ARENA WALK (`collectTyReachRegister` → `reachRegisterName` → `tyToNominalName`) renders the
+// recorded type, which is the ANONYMOUS union the checker inferred, so it spells it
+// STRUCTURALLY — `{meow:i32}|{woof:i32}`. The NAME FALLBACK (`registerInferRetNominalUnion`)
+// registers the checker's own reverse-mapped composite — `Cat|Dog` (`structUnionRetName` →
+// `nominalNameOfObj`, bidirectional assignability), which is the spelling every `isUName`
+// consumer classifies the binding, the return and the `is`-narrow by. `isUName` compares the
+// COMPOSITE, the two composites differ, so both fired: two `unNames` rows, ONE layout.
+//
+// THE COST IS NOT THE ROW, IT IS THE VARIANTS. Each duplicate is an extra entry in
+// `uVariants`, and `uVariants` is the base of all three tag bands — the struct-variant ranks
+// (`assignTags`), the value-atom band (`scalarTagOfKind` = `uVariants.length + kind`) and the
+// ref-array / map slot bands (`refArrSlotTag` / `mapSlotTag`). Two duplicate rows renumbered
+// every tag in the module, and `variantIndexOf`'s exact string compare could land on the copy
+// rather than on the original.
+//
+// `inferRetArenaUnionIsDup` (`emit_collect.vl`) is the gate: where the walk's structural
+// render and the fallback's nominal composite are two spellings of one union, the walk
+// descends the union's MEMBERS only — the bucket (c) pre-descent every variant-box
+// registration needs — and the top-level row is the NAME's. One row, one set of variants.
+//
+// THE HALF THAT COMES WITH IT. Deleting the duplicate also deletes the rows `{meow:i32}` /
+// `{woof:i32}`, which is what an INLINE-SHAPE `is` test used to match — so the spelling is
+// resolved at the consumer instead (`isVariantSpelling`), and both spellings below name the
+// same variant. `unions/is-inline-shape-names-a-nominal-variant.vl` pins that half in a
+// module with no inferred return at all; here the two spellings must AGREE, which is the
+// property the duplicate row could not guarantee.
+type Cat = { meow: i32 }
+type Dog = { woof: i32 }
+
+function pick(c: boolean) {
+  if c {
+    return { meow: 500 }
+  }
+  return { woof: 600 }
+}
+
+function bothSpellings() {
+  const a = pick(true)
+  if a is {meow: i32} {
+    print(a.meow)
+  }
+  if a is Cat {
+    print(1)
+  }
+  const b = pick(false)
+  if b is {woof: i32} {
+    print(b.woof)
+  }
+  if b is Dog {
+    print(2)
+  }
+}
+
+// THE ROW COUNT IS PART OF THE PIN, so this file deliberately does NOT put the inferred
+// value into a LIST or a struct FIELD. `const xs: (Cat | Dog)[] = [pick(true), pick(false)]`
+// registers a SECOND, structural union row — identically on both compilers — because the
+// ARRAY LITERAL's own inferred element type is the anonymous union and its registration walk
+// is a different producer from the one this file pins. Adding it here would put two rows back
+// in a file named for having one. It is a live twin-row residue, filed in
+// `docs/internals/destringify-types-program.md` with this reproduction, not covered here;
+// the list and field positions of an inferred union are already run by
+// `inferred-struct-union-return.vl` and `inferred-variant-box-union-return.vl`.
+bothSpellings()
