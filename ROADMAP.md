@@ -908,6 +908,30 @@ in-language GC knobs.
   since shipped** (§6) — and it moved TIME, not memory: peak RSS read 511.2 → 511.3 MB, because the
   GC-side accumulator is unchanged and only the host CALL was removed. Allocation is still this
   bullet's problem.
+- 🟡 **B-sym. Identifier interning** (`docs/internals/identifier-interning-design.md`;
+  `perf-program.md` §3 item 2 and §8). The largest compiler-side perf item, and the re-baseline
+  it required **re-ordered it**. The SYMBOL/IDENTIFIER consumer class is **19.59% of a
+  self-compile** (12 warm guest runs, 20,985 samples) — but it has no hotspot (largest member
+  3.07%, top five 10.31%), and four of its biggest measurable costs were not about identity at
+  all: a full capture re-WALK per returned identifier (4.35%, one call site), four un-hoisted
+  `fnStmtsPosOf` calls in one frame (4.34%), a whole-arena rescan per `nameNamesFunction` query
+  (2.64%), and `parentLetOf`'s double map probe (1.64%). **Those four plus `keywordKind`'s
+  19-way chain shipped and are worth −11.1% of a self-compile** (interleaved min-of-21;
+  `vl check`/`vl fmt` structurally flat as controls at −0.1%/−0.9%), with no intern table and
+  no new ID space. The design holds the rulings for what remains: ONE table in a new leaf
+  `compiler/symbols.vl`, a WHOLE-PROGRAM id space (per-module would have to be remapped at the
+  merge, and `modRenamed` is itself a top consumer), an **arena-node side table as the carrier**
+  (interning at the point of use is not a win — a `sidOf(name)` call has already paid the probe
+  it was meant to save), the eight in-place name writers that must notify, and R6: a name→index
+  map becomes a **sym-indexed dense ARRAY**, not an i32-keyed map, because the id space is dense
+  and "a later id is a different string" makes `sid >= len ⇒ absent` exact. Phases 3-5 are the
+  three whole-program name→index maps (6.2%), the checker's scope chain (4.4%) and the merge
+  rename table (1.6%). **Also ruled: `keywordKind` on interned ids is a NO** — a closed
+  vocabulary needs an enumeration, not a table — and the same applies to the whole TOKKIND class
+  (2.47%, a class neither earlier split had). **The sabotage worth remembering: a COLLISION in an
+  identity table is invisible to the fixpoint ladder, to the six-channel corpus A/B over 1,713
+  files, and to all 3,610 tests** (§8.4); `tests/cases/objects/anon-field-value-name-not-a-function.vl`
+  is the gate that now names it.
 - 🟡 **B-ci. CI wall clock** (`docs/internals/perf-program.md` §1). `ci-native` crept 74 s → 89 s
   p50 / 106 s p90 by 07-29; the forensics over all 1,317 master-push runs say the creep is
   **not** compiler speed (the self-compile step is 9 s of 89) but three step-level costs: the

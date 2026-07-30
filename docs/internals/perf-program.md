@@ -366,9 +366,10 @@ self-compile unless stated.
 | --- | --- | --- | --- | --- | --- |
 | 1 | ~~**Bulk host↔guest staging, IN**~~ — **SHIPPED, §6.** `srcLoad`/`modKeyLoad`/`modSrcLoad`/`cliResultLoad` + the memory the emitter exports; the host's batched path activates itself | predicted −4.6% self (`modSrcPush`); **got** `modSrcPush` 4.74 → 0.00 self, `modSrcLoad` 2.23 self, and the host's staging phase 192 → 135 ms | one host LINE (the memory probe) + 4 compiler-side exports; the fallback was already written | low — old seeds fall back, no seed split (**held**) | profile self-% of `modSrcPush` (target ≈0); the host's own `[profile] stage_program` phase; wall clock is too noisy alone |
 | 1b | ~~**…and OUT**~~ — **SHIPPED, §7.** `rbyteStore` (bytes, packed 4/word) + `cliCmdDataStore` (code points); the guest writes the same window and the host copies out | `[profile] readback` 17 → **1 ms**; `vl fmt compiler` 4,520,527 host calls → 290 and 520 → **453 ms** (−12.9%) | 2 compiler-side exports + 2 host structs; NO host probe change (`io_mem` was already there) | low — same 2×2 fallback, no seed split (**held**) | the `readback` phase; a `$VL_HOSTCOUNT` per-channel call counter; and the payload-free `vl fmt --check` as the control (run it to the same N) |
-| 2 | **Intern identifiers to i32 symbol IDs** | **19.10%** of self-compile time is `__str_eq__` under symbol/identifier consumers | large: touches scope slots, capture tables, module rename tables, field names, the string-keyed maps | medium-high — it is the checker's identity model | re-run §2's consumer split; the target is the SYMBOL row, and the TYPE row (6.08%) must not move |
-| 3 | **`nameNamesFunction`: index the arena once** | 4.71% self — it scans every node in `P.nodes` per call | small: a name set built in one arena pass, invalidated on arena growth | medium — it runs BEFORE `buildFnMap`, and emit-time monomorphization appends nodes; the invalidation is the whole correctness question | deterministic CALL + scan-step counts on two builds over the same input (a ~5% change is countable, and wall clock cannot resolve it); then profile self-% |
-| 4 | **`fnStmtsPosOf`: an index at the writers** | 4.82% self | medium — the function's own header states the honest fix is an index minted by `emit_mono`'s replacement writer, not a memo at the site | medium — a memo that caches the last answer is a silent miscompile the day a lower position holds a memoized node (the header says so) | same as #3; plus the corpus + fuzz A/B, since it is emit-path |
+| 2 | **Intern identifiers to i32 symbol IDs** — **DESIGNED AND RE-ORDERED, §8.** `identifier-interning-design.md` holds the rulings; the table is DEFERRED to phase 2 with the measurement that says why | was filed at 19.10%; the re-baseline reads **19.59%** but its top five are all whole-program name→index maps needing a carrier, and the FILED phase-1 consumer set measures **3.0%** after §8's fixes | large | medium-high | the consumer-class split re-derived per the design's §7 probes |
+| 2b | ~~**the four avoidable costs the re-baseline found**~~ — **SHIPPED, §8.** `retCapturedMapShape`'s per-return capture re-walk, `emitReturnValue`'s four un-hoisted `fnStmtsPosOf` calls, `nameNamesFunction`'s whole-arena rescan, `parentLetOf`'s double probe, `keywordKind`'s 19-way chain | **−10.7%** of a self-compile (interleaved min-of-15) | five local rewrites, no new data structure | low — all five are strict behaviour-preserving rewrites with the argument at the site | wall clock with `vl check`/`vl fmt` as flat controls at min-of-21; per-function samples PER RUN |
+| 3 | ~~**`nameNamesFunction`: index the arena once**~~ — **SHIPPED, §8.3.** Incremental fold with a high-water mark | 2.64% self → **0.07%** | small | the invalidation was the whole question and the answer is three facts pinned at their sites | as filed |
+| 4 | **`fnStmtsPosOf`: an index at the writers** — **STILL FILED**, but §8.2 removed the three quarters of it that were one un-hoisted call site (5.54% → 2.27% self) | 2.27% self remains | medium | medium — the header's argument about the writers is untouched | as filed |
 | 5 | **Native-align: batch the `vl check` legs** the way RUN/TRAP is batched | the pooled version (shipped) took 27 → 19 s on CI; a `vl check` batch mode would take the remaining ~1,600 process spawns to a handful, and the 4-core cap stops applying | medium: a host `check --batch` mode + per-case verdict files | medium — the per-case verdict is the gate; a batch that blurs verdicts weakens it | the interleaved A/B in §1.5, plus the memo-key sabotage |
 | 6 | **`vl check` allocates more than `vl build`** (649 MB vs 511 MB) while doing less | unquantified; a 138 MB gap in the LSP's own path | investigation first | none (a measurement) | peak RSS per §2.1; then bisect by pass |
 | 7 | **Editor latency**: `vl check` on one compiler file is 231 ms | the LSP path; see §4 | unquantified | — | the §4 table |
@@ -1021,3 +1022,170 @@ string literal (~180 KB emitted) and the code-point payload is the CLI pump driv
 to a `CMD_PRINT_OUT` of a generated 3,000-line file, both in-process. Both §7.7
 sabotages fail it, and it names the offset and the chunk size where a ladder says
 "parse error".
+
+---
+
+## 8. Item 2 — the identifier-interning arc: re-baselined, designed, and RE-ORDERED
+
+§3 item 2 was the largest compiler-side item on the list, and this section is what happened
+when its own precondition — **re-baseline before targeting** — was obeyed.
+`docs/internals/identifier-interning-design.md` is the design (rulings, alternatives, the ID
+space, the carrier, the invariant, the phase plan); this is the measurement and the record of
+what shipped.
+
+### 8.1 The re-baseline, and the finding that re-ordered the arc
+
+Master `1517c7f6`, **12 warm guest runs, 20,985 samples**. `__str_eq__` 25.19 → **27.71**,
+`__str_hash__` 4.75 → **5.62** — the pie SHRANK (#1312/#1313 took ~10% out at the host
+boundary) so the string layer is a bigger share of it. `modSrcPush` 4.56 → 0.00, replaced by
+`modSrcLoad` 2.32, exactly as §6 predicted.
+
+Splitting the string primitives by what their CALLER is comparing, with an UNCLASSIFIED bucket
+that is printed rather than dropped:
+
+| class | share | |
+| --- | ---: | --- |
+| **SYMBOL / IDENTIFIER** | **19.59%** | the arc's target; 19.10% at `883dca44` — stable |
+| TYPE | 9.13% | was 6.08%; the difference is the rep tree, now attributed |
+| UNCLASSIFIED | 4.62% | diffuse, no member over 0.25% |
+| **TOKKIND** | **2.47%** | **NEW — inside neither earlier number** |
+| MODPATH | 1.21% | |
+
+**TOKKIND is a class the earlier splits did not have**: the parser compares `tok.kind` against
+string literals everywhere. It is a CLOSED ~60-element vocabulary, which is a different problem
+from identifiers — it needs an enumeration, not a table (design §4.1).
+
+**And then the ranking:** the SYMBOL class has NO hotspot. Its largest member is 3.07%
+(`globalIndexOf`) and its top five total 10.31%. Chasing it consumer-by-consumer needs a
+carrier for the id (design R3), and before any of that, **four of its largest measurable costs
+turned out not to be about identity at all**:
+
+| what | measured | what it actually was |
+| --- | ---: | --- |
+| `captureNamesOf` under `retCapturedMapShape` | **4.35%, and 100% of it from that ONE call site** | a full capture re-WALK per returned identifier, for every function in the program |
+| `fnStmtsPosOf` under `emitReturnValue` | **4.34% of its 5.54% self** | the same O(functions) scan called FOUR times in one call frame |
+| `nameNamesFunction` | **2.64%, 100% from `anonFieldCode`** | a whole-arena rescan per query |
+| `parentLetOf` | 1.64% | `.has(k)` then `[k]` — two probes for one answer |
+
+That is ~12% of a self-compile in four places, none of which an intern table would have
+touched. **A fifth, `keywordKind` at 0.76%, is the item the filing named as phase-1 interning
+material and is answered by a first-character dispatch instead** (design §4.1: interning would
+pay one hash per identifier TOKEN to replace 19 length-compares, and would need ids whose
+numeric values mean something, which ruling R2 forbids).
+
+### 8.2 What shipped
+
+Five strict behaviour-preserving rewrites, each with its equivalence argument at the site.
+
+1. **`retCapturedMapShape` takes the conjunction's cheap half first** (`emit_classify.vl`). The
+   arm answers "is this returned identifier a captured MAP", which requires BOTH that the name
+   is in the capture set AND that its value kind is `"map"` — and `captureValKind`'s own first
+   line is `parentBindingOf(fe, name)`, which returns `"i32"` at -1. So testing
+   `parentBindingOf(fe, name) >= 0` first is exactly equivalent, calls nothing the original did
+   not call on this path, and is O(1) for a frame with no parent — every top-level function.
+2. **`emitReturnValue` hoists `fnStmtsPosOf`** (`wasmEmit.vl`) — one read under `fn.fnRet < 0`,
+   four uses. This is a strictly WEAKER claim than the cross-call memo `fnStmtsPosOf`'s header
+   rejects: it needs `fnStmts`/`monoOrigNode` stable inside ONE call frame, and both are written
+   only by passes that complete before `emitCodeSection` starts. **The filed index stays filed** —
+   what this adds to the filing is that three quarters of that scan's cost was one call site.
+3. **`nameNamesFunction` folds the arena incrementally** (`emit_base.vl`) instead of rescanning
+   it, resting on three facts pinned at their sites: the arena only grows, `addNode` takes a
+   complete node so a FuncDecl's name is final at append, and the ONE in-place `fnName` write
+   that lands afterwards (`emit_collect`'s lambda numbering) calls the new `noteFuncName`.
+4. **`parentLetOf` probes once** — `plScanStmt`'s first line proves every stored value is >= 0,
+   so `?? -1` is unambiguous and `.has` is redundant.
+5. **`keywordKind` dispatches on the first character** (`lexer.vl`). Closed vocabulary, at most
+   three keywords per bucket; a non-keyword costs one character read and a run of i32 compares.
+
+### 8.3 Measured
+
+Same input both legs, `.cwasm` warm, 24-core box at load 1.9, **interleaved min-of-21**:
+
+| task | A (master) | B (branch) | |
+| --- | ---: | ---: | --- |
+| **`vl build compiler/entry.vl`** | 1,544 ms | **1,372 ms** | **−11.1%** |
+| `vl check compiler/entry.vl` | 819 ms | 818 ms | −0.1% (control) |
+| `vl check compiler/typecheck.vl` | 198 ms | 197 ms | −0.5% (control) |
+| `vl fmt --check compiler` | 452 ms | 448 ms | −0.9% (control) |
+| `vl check` of a one-function file | 4 ms | 4 ms | 0 (the floor) |
+
+**The controls are not decoration here: all five changes are on the EMIT path, so `vl check`
+and `vl fmt --check` are STRUCTURALLY flat** and any movement they show is the error bar. At
+N=15 they read −1.5% and −1.6%; at N=21, −0.1% and −0.9%. Same lesson as §7.3.
+
+Guest profile, 12 warm runs per leg, interleaved batches, absolute samples PER RUN:
+
+| | A /run | B /run | |
+| --- | ---: | ---: | ---: |
+| `fnStmtsPosOf` | 97.8 | 40.9 | −58% |
+| `nameNamesFunction` | 39.8 | 0.8 | −98% |
+| `capScan`+`capIsBound`+`capRecord` | 32.7 | 6.2 | −81% |
+| `__str_eq__` | 486.2 | 441.1 | −9.3% |
+| `__str_hash__` | 102.3 | 93.6 | −8.5% |
+| SYMBOL class | 341.0 | 293.5 | −13.9% |
+| TOKKIND class | 40.9 | 31.0 | −24% |
+| **all samples** | **1,712** | **1,549** | **−9.5%** |
+
+**Byte delta:** 1,113,241 → **1,115,110 (+1,869)**.
+
+**DETERMINISTIC COUNTS — one throwaway compiler that runs BOTH implementations at each
+converted site and reports through `emitFail`** (the guest has no `print` that reaches a
+`vl build`). One self-compile, arena 247,145 nodes:
+
+| site | before | after | |
+| --- | ---: | ---: | ---: |
+| `nameNamesFunction` scan steps | **15,074,198** | **247,118** | 61× |
+| — calls / OLD-vs-NEW answer disagreements | 61 / **0** | | the differential oracle |
+| `captureNamesOf` calls from `retCapturedMapShape` | **4,176** | **0** | every reach skipped |
+| `fnStmtsPosOf` calls from `emitReturnValue` | 35,908 | 8,977 | 4× |
+| `fnStmtsPosOf` calls, whole compile | 46,037 | 19,106 | **−58.5%** |
+| `parentLetOf` map probes | 1,590,610 | 795,305 | 2× |
+
+The counts and the profile agree to within a point: −58.5% of `fnStmtsPosOf`'s CALLS against
+−58% of its self-time, −98.4% of the fold's STEPS against −98%. And the residue is now sized:
+`fnStmtsPosOf` still runs 19,106 times for **25,953,420 scan steps** (1,358 per call), which is
+what §3 item 4's index would take.
+
+### 8.4 The sabotage that NOTHING caught — and the test that now does
+
+Six poisons, each compiled into a real compiler and run through the whole gate. The full table
+is in the design's §6.6; the one that matters here:
+
+**A COLLISION IN AN IDENTITY TABLE IS INVISIBLE TO EVERY STANDING INSTRUMENT.** Keying
+`nameNamesFunction`'s set on `name[0]` — so `q` and `qq` share an entry, and so does every
+other pair sharing a first character — produced a compiler that **self-compiles (rc 0), IS A
+FIXPOINT OF ITSELF** (so `native-fixpoint.sh`'s stage3 == stage4 passes), diffs **ZERO of
+1,713 corpus files on all six channels**, and passed **all 3,608 tests the suite then had**. Its only trace was
+that the compiler it builds is 14 bytes different from the good one — which nothing compares,
+because on a branch the compiler is supposed to change.
+
+That is the fourth recording of the corpus reading `same` under a real defect (§6.7, §7.7 twice)
+and the FIRST where the fixpoint ladder was blind too. New standing gate:
+`tests/cases/objects/anon-field-value-name-not-a-function.vl` — `q` (an i32 binding) beside
+`qq` (a function) in one anon-struct literal — which fails in both harnesses under the poison
+and names the defect: `struct.new[0] expected type (ref 5), found global.get of type i32`.
+
+The other five, for the record: `keywordKind` dropping one bucket arm → self-compile rc 1 +
+**791 failed**; the hoisted `fnStmtsPosOf` reading a stale position → rc 1 + **675 failed**;
+`parentLetOf`'s miss reading as node 0 → rc 1 + **75 failed**; the `retCapturedMapShape`
+pre-gate forced always-false → **32 failed over 11 cases** in `closures/`+`maps/` (that is the
+reorder's coverage number); and deleting the `noteFuncName` notification → **nothing at all**,
+which is a stated VACUITY: the only names it can add are `__lambda_<n>` and nothing queries
+that spelling. The line stays and the site says why, so a green run does not license deleting
+it.
+
+**A sabotage has to be characterised before its witness table is believed** (§7.7 finding 4,
+again): weakening the same pre-gate from `>= 0` to `> 0` LOOKED like a sabotage and is nearly a
+no-op — the only binding it drops is one at arena node 0. It moved four bytes of the compiler
+and zero tests.
+
+### 8.5 Gate
+
+`fetch-seed.sh` → 1,113,241 bytes; `refresh-compiler.sh --prove-fixpoint`;
+`native-fixpoint.sh` → stage3 == stage4 at 1,115,110; `SELFHOST_NATIVE_ALIGN=1 deno task test`
+→ **3,610 passed / 0 failed / 7 ignored** (master's 3,606 + 4: two new corpus cases × two
+harnesses), the ignored SET identical to master's; `lint-self.sh` clean; `rep-fuzz-check.sh`
+exact. **Six-channel corpus A/B: 1,714 files, all six fields `same`.** **Fuzz A/B: 14 seeds ×
+3 depths × 300 = 12,600 programs per leg, 80 findings each, same md5.** Seed-bootstrap: no
+split — the published seed compiles this branch's source directly (nothing here is a new
+language feature).

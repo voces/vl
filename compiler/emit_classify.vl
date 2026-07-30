@@ -1824,6 +1824,23 @@ export function mapRetExprShape(rx: i32, fnIx: i32) {
 // resolved here (a same-named local/param shadowing a capture stays with the local arms).
 // A map-returning closure over a captured map is invisible to the local/param map tests, so
 // without this its result inferred as i32 over a map-ref body — invalid wasm at the return.
+//
+// THE `parentBindingOf` PRE-GATE IS THE CONJUNCTION'S CHEAP HALF, TAKEN FIRST. This arm runs
+// for EVERY return whose expression is a bare identifier — every function in the program, not
+// only the closures it is about — and `captureNamesOf` re-WALKS the whole body whenever the
+// capture cache is off (the classify passes run before `capCacheBuild`). Measured on a
+// self-compile at `1517c7f6`: `captureNamesOf` is **4.35% of all samples and 100% of it is
+// reached from here** (12 warm guest profiles, 20,985 samples), which made this one call site
+// a fifth of the whole symbol/identifier string layer.
+//
+// The answer below is a CONJUNCTION — `name` is in the capture set AND its value kind is
+// `"map"` — and `captureValKind`'s own FIRST line is `parentBindingOf(fe, name)`, returning
+// `"i32"` when that is -1. So `parentBindingOf(fe, name) < 0` already implies the whole arm is
+// -3, whichever way the membership loop went. Asking it first is therefore EXACTLY equivalent,
+// evaluates no function the original did not evaluate on this path, and is O(1) for a frame
+// with no parent (`parentBindingFrameOf` returns -1 on `fnParent[fe] < 0`) — which is every
+// top-level function, i.e. the overwhelming majority of reaches. Only a returned identifier
+// that a genuinely ENCLOSING frame binds now pays for the walk.
 function retCapturedMapShape(fnIx: i32, rx: i32): i32 {
   let u = rx
   let done = false
@@ -1834,7 +1851,7 @@ function retCapturedMapShape(fnIx: i32, rx: i32): i32 {
   const e = P.nodes[u]
   if e is Ident {
     const fe = fnStmtsPosOf(fnIx)
-    if fe >= 0 {
+    if fe >= 0 && parentBindingOf(fe, e.identName) >= 0 {
       const caps = captureNamesOf(fe)
       let ci = 0
       while ci < caps.length {

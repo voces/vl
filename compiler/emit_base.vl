@@ -247,9 +247,31 @@ export function isBuiltinFnName(name: string) {
 let plCacheBlock: i32 = -1
 let plCacheMap: {[string]: i32} = Map()
 
+// The FuncDecl-name set behind `nameNamesFunction`, and the arena high-water mark it has
+// folded. See that function's header for the append-only argument; the reset rides on
+// `resetParentLetCache` because both are per-COMPILE arena caches with the same lifetime and
+// the same one call site (`emitProgram`), and splitting them is how one of them rots.
+let nnfSet: {[string]: boolean} = Map()
+let nnfScanned: i32 = 0
+
+// Record `name` as naming a function WITHOUT waiting for the fold to reach its node — the
+// escape hatch for the one writer that renames a FuncDecl IN PLACE after the arena already
+// holds it (`emit_collect`'s lambda numbering, `n.fnName = "__lambda_" + …`). Every other
+// FuncDecl reaches `P.nodes` fully built (`ast.addNode` takes a complete node), so the fold
+// sees the final name. A note is monotone — it can only ADD a name — which is why the reverse
+// direction (the driver's module-merge rename, which also RETIRES the old name) is not routed
+// here: it runs before `emitProgram`, i.e. before the reset, so the set never saw the old one.
+export function noteFuncName(name: string) {
+  if name == "" { return 0 }
+  nnfSet[name] = true
+  0
+}
+
 export function resetParentLetCache() {
   plCacheBlock = -1
   plCacheMap = Map()
+  nnfSet = Map()
+  nnfScanned = 0
   0
 }
 
@@ -299,11 +321,13 @@ export function parentLetOf(blockIx: i32, name: string) {
     plBuildLetMap(blockIx)
     plCacheBlock = blockIx
   }
-  if plCacheMap.has(name) {
-    const r = plCacheMap[name] ?? -1
-    return r
-  }
-  -1
+  // ONE probe, not two. `plCacheMap`'s values are arena indices written by `plScanStmt`, whose
+  // first line is `if ix < 0 { return 0 }` — so a stored value is always >= 0 and `?? -1` is
+  // distinguishable from every present value. The `.has` + `[]` pair was therefore two hashes
+  // and two key compares for one answer: measured at `1517c7f6`, `parentLetOf` is 1.64% of a
+  // self-compile's string-primitive self-time (12 warm profiles, 20,985 samples), essentially
+  // all of it in `__map_probe__`/`__str_hash__` under this line.
+  plCacheMap[name] ?? -1
 }
 // The loop-stack position a `break`/`continue` targets: "" (unlabelled) binds
 // to the TOP entry (the innermost loop); a label scans from the top for the
@@ -1841,19 +1865,44 @@ export function nodeIsTypeDecl(ix: i32) {
 // True if `name` is the name of a FuncDecl ANYWHERE in the arena (top-level or a
 // nested/lifted function). Used at `collectS` time — BEFORE `buildFnMap` populates
 // `fnNames`, so `fnIndexOf` is not yet usable — to classify an anon-struct field
-// whose value is a bare function name (`{ go: add }`). A direct arena scan, so it
-// sees a function declared after the literal too.
+// whose value is a bare function name (`{ go: add }`). It must see a function declared
+// AFTER the literal too, which is why it was a whole-arena scan per call.
+//
+// IT IS NOW AN INCREMENTAL FOLD OF THE SAME SCAN, and the difference between the two is
+// exactly the append-only property of the arena. Measured on a self-compile at `1517c7f6`
+// (12 warm guest profiles, 20,985 samples): **2.64% self, and 100% of it is reached from
+// `anonFieldCode`** — one classifier arm re-reading every node in `P.nodes` per identifier.
+//
+// WHY THE FOLD EQUALS THE SCAN. Three facts, each pinned at its own site:
+//  1. `P.nodes` only ever GROWS within a compile — `ast.addNode` is the single append and
+//     nothing removes. So a node folded at index i keeps its verdict.
+//  2. A node arrives fully built: `addNode(n)` takes a complete `Node`, so a FuncDecl's
+//     `fnName` is final at append. Monomorphization's clones go through it like everything
+//     else, which is why growth during emit needs no special handling — the next query folds
+//     the tail.
+//  3. The ONE in-place `fnName` write that can land after a node is already in the arena is
+//     `emit_collect`'s lambda numbering, and it calls `noteFuncName` (above). The driver's
+//     module-merge rename also writes in place, but it runs before `emitProgram`'s reset, so
+//     the set it would have polluted does not exist yet.
+// The `nnfScanned < P.nodes.length` guard also self-heals a MISSED reset in the shrinking
+// direction; the reset itself is in `resetParentLetCache`.
+//
+// This is NOT the `fnNameMap` the emitter builds later: that one is keyed to EMITTED function
+// indices and is not populated at `collectS` time, which is the whole reason this exists.
 export function nameNamesFunction(name: string) {
   if name == "" { return false }
-  let i = 0
-  while i < P.nodes.length {
-    const n = P.nodes[i]
-    if n is FuncDecl {
-      if n.fnName == name { return true }
-    }
-    i = i + 1
+  if nnfScanned > P.nodes.length {
+    nnfSet = Map()
+    nnfScanned = 0
   }
-  false
+  while nnfScanned < P.nodes.length {
+    const n = P.nodes[nnfScanned]
+    if n is FuncDecl {
+      if n.fnName != "" { nnfSet[n.fnName] = true }
+    }
+    nnfScanned = nnfScanned + 1
+  }
+  nnfSet[name] ?? false
 }
 // ── the SHAPE-NAME grammar: the OPENER and the WIDE SPAN are BOTH one module down ──────
 //
