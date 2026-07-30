@@ -909,7 +909,36 @@ in-language GC knobs.
   GC-side accumulator is unchanged and only the host CALL was removed. Allocation is still this
   bullet's problem.
 - 🟡 **B-sym. Identifier interning** (`docs/internals/identifier-interning-design.md`;
-  `perf-program.md` §3 item 2 and §8). The largest compiler-side perf item, and the re-baseline
+  `perf-program.md` §3 item 2, §8 and **§9**). **THE TABLE AND PHASE 3 SHIPPED.**
+  `compiler/symbols.vl` holds one intern table with a whole-program id space, an ARENA-NODE
+  side table as the carrier, and the eight in-place name writers notifying it; the three
+  whole-program name→index maps (`globalNameMap`, `fnNameMap`, `parentLetOf`'s per-block map,
+  plus `nestedNameSet` and the `startBlockLetOf` memo) are sym-indexed dense arrays, and ~70
+  call sites feed them `sidOfNode(<the index they already held>)`. **The re-baseline CONFIRMED
+  the phase table it was required to re-derive** — phase 3 6.32% against 6.2 predicted, phase 4
+  4.73% against 4.4, phase 5 1.63% against 1.6 — so this is the rare case where the plan
+  survived contact. Phase 3 is worth **−4.5% of a self-compile** (interleaved profile A/B, 14
+  runs per leg; min-of-41 wall clock −4.2%/−5.6% against a ±1.1%/±2.2% control band) and
+  **2,466,975 → 479,079 string-keyed probes per self-compile, with ZERO divergences over
+  2,371,115 both-implementation comparisons**. −1,383 compiler bytes.
+  **Three findings worth carrying.** (1) **R3 was confirmed by a dead-exact WASH**: the
+  intermediate build that converted the maps but left every caller passing a string read
+  `sidOf` + `sidLookup` = 6.33% against the 6.32% it replaced — *interning at the point of use
+  has already paid the probe it was meant to save*, and the entire win came from the carrier.
+  The carrier is read **20.5× per intern (95.1% hit rate)**. (2) **A SID-keyed table aliases
+  across programs where its NAME-keyed predecessor did not** — sid 3 exists in every program,
+  the spelling `foo` does not — so every sid-keyed table must be dropped where the id space is;
+  missing that failed **18 wasm-harness cases that each pass in isolation**. (3) **The fixpoint
+  ladder is BLIND to all eight name-writer poisons; the suite and the corpus are the
+  witnesses** — the filed "six poisons redden ONLY the ladder" reading did not reproduce at
+  the merge gate and `perf-program.md` §9.6.1 retracts it with the re-measurements. Writers
+  1–3 (the driver merge) are provably inert today because the carrier is empty before emit,
+  and they are kept as defence, not as covered code. **Phases 4 and 5 remain**: `lookup` is now
+  the largest single string consumer (2.83%) and the undo-log rewrite is small — but
+  `perf-program.md` §9.7 records the blocker, that `T.scopes[top][name] = v` and
+  `T.scopes.pop()` are the self-compile's only exercisers of two emitter arms. Historical
+  context follows.
+  The largest compiler-side perf item, and the re-baseline
   it required **re-ordered it**. The SYMBOL/IDENTIFIER consumer class is **19.59% of a
   self-compile** (12 warm guest runs, 20,985 samples) — but it has no hotspot (largest member
   3.07%, top five 10.31%), and four of its biggest measurable costs were not about identity at

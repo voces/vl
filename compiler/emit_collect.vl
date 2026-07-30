@@ -147,6 +147,13 @@ import {
   unwrapParen,
 } from "./emit_base"
 import {
+  sidArrGet,
+  sidArrPut,
+  sidLookup,
+  sidNoteNodeName,
+  sidOfNode,
+} from "./symbols"
+import {
   blockHasValuedReturn,
   exprIsIfStmt,
   ifArmValueExpr,
@@ -180,9 +187,9 @@ import {
   fl64TypeIdx,
   fnDispNames,
   fnEnvIdx,
+  fnIndexBySid,
   fnIndices,
   fnListEqRSlots,
-  fnNameMap,
   fnNames,
   fnParent,
   fnStmts,
@@ -200,7 +207,7 @@ import {
   gaeFieldTyNames,
   gaeParams,
   genTyParamNames,
-  globalNameMap,
+  globalIndexBySid,
   globalNames,
   globalStmts,
   ia64TypeIdx,
@@ -226,7 +233,7 @@ import {
   mvValStructIdx,
   mvValTyIx,
   narrowTop,
-  nestedNameSet,
+  nestedNameBySid,
   nliLetIxs,
   nliNames,
   pendingNulRefHeap,
@@ -331,7 +338,7 @@ import {
   fieldRefElemName,
   fieldTypeCode,
   fieldValueFeOf,
-  fnIndexOf,
+  fnIndexOfSid,
   fnReturnsClosure,
   fnSigKeyOf,
   fnStmtsPosOf,
@@ -465,7 +472,7 @@ export function collectFns(stmts: i32[]) {
   fnParent = []
   globalStmts = []
   globalNames = []
-  globalNameMap = Map()
+  globalIndexBySid = []
   startStmts = []
   lambdaCtr = 0
   fnDispNames = []
@@ -480,8 +487,13 @@ export function collectFns(stmts: i32[]) {
     } else if s is LetDecl {
       // A top-level `let`/`const` — a module global; its position here is its index.
       globalStmts.push(stmts[i])
-      if !globalNameMap.has(s.letName) {
-        globalNameMap[s.letName] = globalNames.length
+      // R6's BUILD POINT for `globalIndexBySid`: every key is interned here, which
+      // is what makes `sid >= length ⇒ absent` exact for every later lookup. The id
+      // comes from the CARRIER (`stmts[i]` is this `LetDecl`'s arena index), so the
+      // build pays the same one intern per global the map paid one hash for.
+      const gsid = sidOfNode(stmts[i])
+      if sidArrGet(globalIndexBySid, gsid) < 0 {
+        sidArrPut(globalIndexBySid, gsid, globalNames.length)
       }
       globalNames.push(s.letName)
     } else if nodeIsTypeDecl(stmts[i]) {
@@ -1011,6 +1023,11 @@ function liftFnsInExpr(ix: i32, parent: i32) {
       // argument requires it the day a query can, not because a case exercises it. Do not
       // delete it on the strength of a green run.
       noteFuncName(n.fnName)
+      // R4 writer 4 of 8 (`compiler/symbols.vl`). Unlike `noteFuncName` above, THIS
+      // one is not vacuous: `fnIndexOfSid`'s dense array is keyed by the carrier, and
+      // `buildFnMap` interns `s.fnName` for every lifted function — a stale carrier
+      // slot here would key the lambda's own row under the anonymous "" it replaced.
+      sidNoteNodeName(ix)
     }
     fnStmts.push(ix)
     fnParent.push(parent)
@@ -1126,8 +1143,8 @@ function liftFnsInExpr(ix: i32, parent: i32) {
 // function gets its own functype (`emitModule`). Returns the function count.
 export function buildFnMap(_stmts: i32[]) {
   fnNames = []
-  fnNameMap = Map()
-  nestedNameSet = Map()
+  fnIndexBySid = []
+  nestedNameBySid = []
   fnIndices = []
   fRetVoid = []
   fRetStructIdx = []
@@ -1139,12 +1156,15 @@ export function buildFnMap(_stmts: i32[]) {
     const s = P.nodes[fnStmts[i]]
     if s is FuncDecl {
       fnNames.push(s.fnName)
+      // R6's BUILD POINT for `fnIndexBySid`/`nestedNameBySid` — see `collectFns`'
+      // global row for the exactness argument the interning-as-we-build gives.
+      const fsid = sidOfNode(fnStmts[i])
       // FIRST occurrence wins (mirrors the old linear `fnIndexOf`): a later lifted
       // function sharing a name does not overwrite the earlier slot.
-      if !fnNameMap.has(s.fnName) { fnNameMap[s.fnName] = i }
+      if sidArrGet(fnIndexBySid, fsid) < 0 { sidArrPut(fnIndexBySid, fsid, i) }
       // A nested (lifted) function's name — drives `fnIndexOfInScope`'s scan gate.
       if i < fnParent.length && fnParent[i] >= 0 {
-        nestedNameSet[s.fnName] = true
+        sidArrPut(nestedNameBySid, fsid, 1)
       }
       fnIndices.push(i)
       fRetVoid.push(0)
@@ -1378,7 +1398,18 @@ function nestedFnDeclaredIn(name: string, pp: i32) {
 // where `fnStmts` is (it also owns the `monoOrigNode` fall-through, which no index of
 // `fnStmts` alone can answer).
 export function fnIndexOfInScopeChain(name: string, fnIx: i32) {
-  if fnIx >= 0 && (nestedNameSet[name] ?? false) {
+  fnIndexOfInScopeChainSid(sidLookup(name), name, fnIx)
+}
+
+// The sid-taking primitive (design R5). The callers that have the callee's arena
+// index pass `sidOfNode(ix)` and pay NOTHING for the gate below; the string form
+// above pays one `sidLookup` probe, which is what the `nestedNameSet` map probe it
+// replaces cost. `name` still rides along because the scan the gate guards
+// (`nestedFnDeclaredIn`) compares `FuncDecl.fnName` strings — converting THAT is a
+// later slice, and it is off the hot path by construction (the gate is false for
+// every callee in a module with no nested functions, this compiler included).
+export function fnIndexOfInScopeChainSid(sid: i32, name: string, fnIx: i32) {
+  if fnIx >= 0 && sidArrGet(nestedNameBySid, sid) == 1 {
     let pp = fnStmtsPosOf(fnIx)
     // `fnStmts.length` bounds the walk: a parent chain cannot be longer than the
     // function count, so this terminates even were `fnParent` ever to contain a cycle.
@@ -1390,7 +1421,7 @@ export function fnIndexOfInScopeChain(name: string, fnIx: i32) {
       steps = steps + 1
     }
   }
-  fnIndexOf(name)
+  fnIndexOfSid(sid)
 }
 
 // Classify each function's VOIDNESS as a monotone fixed point: a candidate (no

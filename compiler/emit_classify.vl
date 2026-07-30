@@ -206,6 +206,7 @@ import {
   objFieldVal,
   parenUnionArrElemName,
   parentLetOf,
+  parentLetOfSid,
   removeAtomFrom,
   retArrFlag,
   retF32ArrFlag,
@@ -280,8 +281,8 @@ import {
   fa32Used,
   fa64Used,
   fnEnvIdx,
+  fnIndexBySid,
   fnMvBase,
-  fnNameMap,
   fnParent,
   fnRefPushSlots,
   fnStmts,
@@ -301,7 +302,7 @@ import {
   gaeFieldTyNames,
   gaeParams,
   genTyParamNames,
-  globalNameMap,
+  globalIndexBySid,
   globalStmts,
   ia64Used,
   lUsed,
@@ -344,7 +345,7 @@ import {
   narrowTop,
   narrowTys,
   narrowVariants,
-  nestedNameSet,
+  nestedNameBySid,
   nliLetIxs,
   nliNames,
   pendingListKind,
@@ -442,6 +443,14 @@ import {
   unMemRowStart,
   vbHeapIdxOfKind,
 } from "./emit_rep"
+import {
+  sidArrGet,
+  sidArrPut,
+  sidLookup,
+  sidOf,
+  sidOfNode,
+  sidText,
+} from "./symbols"
 
 // The `$fnsig` PARAM-spine token for the parameter at `paramIx` — one token per distinct
 // param VALTYPE, so two functions share a `$fnsig` exactly when their param valtypes
@@ -614,7 +623,7 @@ function tailIsF64NoLocal(ix: i32, fnArenaIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOf(callee.identName)
+      const t = fnIndexOfSid(sidOfNode(e.callFn))
       if t >= 0 {
         if t < fRetKind.length { return fRetKind[t] == "f64" }
       }
@@ -632,7 +641,7 @@ export function fieldValueFeOf(valIx: i32) {
   if valIx < 0 { return -1 }
   const v = P.nodes[valIx]
   if v is FuncDecl { return fnStmtsPosOf(valIx) }
-  if v is Ident { return fnIndexOf(v.identName) }
+  if v is Ident { return fnIndexOfSid(sidOfNode(valIx)) }
   -1
 }
 
@@ -944,7 +953,7 @@ function recvMakerFnOf(recvIx: i32, fnIx: i32) {
   const ie = P.nodes[initIx]
   if ie is Call {
     const callee = P.nodes[ie.callFn]
-    if callee is Ident { return fnIndexOf(callee.identName) }
+    if callee is Ident { return fnIndexOfSid(sidOfNode(ie.callFn)) }
   }
   -1
 }
@@ -1024,7 +1033,7 @@ function fieldClosureFeOfInit(initIx: i32, prop: string) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOf(callee.identName)
+      const t = fnIndexOfSid(sidOfNode(e.callFn))
       if t >= 0 {
         const rx = fnRetExprOf(fnStmts[t])
         if rx >= 0 {
@@ -1078,28 +1087,41 @@ export function fnSigIdxForArity(ar: i32) {
   cloSigBase + p
 }
 
-// The wasm global index for `name`, or -1 if no top-level global has that name.
-export function globalIndexOf(name: string) { globalNameMap[name] ?? -1 }
+// The wasm global index for the symbol `sid`, or -1 if no top-level global has that
+// name. A bounds check plus a load (R6) — `collectFns` interned every global's name
+// when it built the array, so a sid beyond its end is a name that is not a global.
+export function globalIndexOfSid(sid: i32) { sidArrGet(globalIndexBySid, sid) }
 
-// The arena index of the `LetDecl` for the global `name`, or -1 if not a global.
-export function globalLetOf(name: string) {
-  const gi = globalIndexOf(name)
+// The wasm global index for `name`, or -1 if no top-level global has that name.
+// The STRING form: one `sidLookup` probe, exactly what the `{[string]: i32}` map
+// probe it replaces cost — so this shape is a WASH and is kept only for the call
+// sites that hold no arena index. Every hot caller takes the sid form above.
+export function globalIndexOf(name: string) {
+  sidArrGet(globalIndexBySid, sidLookup(name))
+}
+
+// The arena index of the `LetDecl` for the global symbol `sid`, or -1.
+export function globalLetOfSid(sid: i32) {
+  const gi = sidArrGet(globalIndexBySid, sid)
   if gi < 0 { return -1 }
   globalStmts[gi]
 }
+
+// The arena index of the `LetDecl` for the global `name`, or -1 if not a global.
+export function globalLetOf(name: string) { globalLetOfSid(sidLookup(name)) }
 
 // Whether the global `name` is a struct/array/string ref (so a bare reference to it in
 // an `exprStruct`/`exprArray`/`exprString` check is recognized as that ref type). The
 // global's valtype follows its `LetDecl` annotation or literal initializer, evaluated as
 // a top-level constexpr (`fnIx = -1`), mirroring the local `letIsX` predicates.
-function globalIsStruct(name: string) {
-  const li = globalLetOf(name)
+function globalIsStructSid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsStruct(li, -1)
 }
 
-function globalIsArray(name: string) {
-  const li = globalLetOf(name)
+function globalIsArraySid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   // A kind-18 NULLABLE REF-ARRAY cell is never the i32 list, whatever `letIsArray`
   // says. `letIsArray` falls through to the INITIALIZER when the annotation is not
@@ -1108,7 +1130,7 @@ function globalIsArray(name: string) {
   // its cell was the ref-list wrapper. A LOCAL never hits this: `buildLocals` files
   // it under `declaredKind == "nulreflist"` once and the init is never re-consulted;
   // only a global re-derives its kind per read, which is where the init leaks in.
-  if globalIsNulRefArray(name) { return false }
+  if globalIsNulRefArraySid(sid) { return false }
   letIsArray(li, -1)
 }
 
@@ -1117,8 +1139,8 @@ function globalIsArray(name: string) {
 // "nulreflist"` (local) and `paramNulRefArray` (param). Keyed on `globalCellKind`
 // — the CELL's own answer — so a read can never disagree with the cell, exactly as
 // `exprNullableRefArray`'s global arm is keyed.
-function globalIsNulRefArray(name: string) {
-  const li = globalLetOf(name)
+function globalIsNulRefArraySid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   globalCellKind(li) == "nulreflist"
 }
@@ -1138,46 +1160,46 @@ export function globalNulListCellRead(name: string) {
   isNulScalarListKind(k)
 }
 
-function globalIsString(name: string) {
-  const li = globalLetOf(name)
+function globalIsStringSid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   // A `string | null` (kind 16) global reads AS a string under narrowing — the global
   // read recovers non-null (`ref.as_non_null`), and the `!= null` check reads it raw.
   letIsString(li, -1) || letIsNulString(li, -1)
 }
 
-function globalIsRefArray(name: string) {
-  const li = globalLetOf(name)
+function globalIsRefArraySid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsRefArray(li, -1)
 }
 
-function globalIsStringArray(name: string) {
-  const li = globalLetOf(name)
+function globalIsStringArraySid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsStringArray(li, -1)
 }
 
-function globalIsMap(name: string) {
-  const li = globalLetOf(name)
+function globalIsMapSid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsMap(li, -1)
 }
 
-function globalIsF64Array(name: string) {
-  const li = globalLetOf(name)
+function globalIsF64ArraySid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsF64Array(li, -1)
 }
 
-function globalIsNulRef(name: string) {
-  const li = globalLetOf(name)
+function globalIsNulRefSid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsNulRef(li, -1)
 }
 
-function globalIsNulList(name: string) {
-  const li = globalLetOf(name)
+function globalIsNulListSid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   // `letIsNulListInfer`, not the annotation-only `letIsNulList`: an UN-annotated global
   // bound to a nullable-list producer (`const g = mk()` with `mk(): i32[] | null`, a
@@ -1199,15 +1221,15 @@ export function paramNulMap(fnIx: i32, name: string) {
   retNulMapFlag(paramTypeNode(fnIx, name)) == 1
 }
 // True if the global `name` is a NULLABLE map.
-function globalIsNulMap(name: string) {
-  const li = globalLetOf(name)
+function globalIsNulMapSid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsNulMap(li, -1)
 }
 
 // True if the function `name` returns a nullable struct (`"nulstruct"`).
-function fnRetNulRef(name: string) {
-  const i = fnIndexOf(name)
+function fnRetNulRefSid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "nulstruct"
 }
@@ -1301,7 +1323,7 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramNulList(fnIx, e.identName) { return true }
     if declaredNulList(e.identName) { return true }
-    return globalIsNulList(e.identName)
+    return globalIsNulListSid(sidOfNode(exprIx))
   }
   if e is Member { return memberFieldCode(exprIx, fnIx) == 18 }
   // Indexing a `(i32[] | null)[]` (a kind-4 ref list whose element slot keeps the `| null`) yields a
@@ -1320,7 +1342,7 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOf(callee.identName)
+      const target = fnIndexOfSid(sidOfNode(e.callFn))
       if target >= 0 {
         const fn = P.nodes[fnStmts[target]]
         if fn is FuncDecl {
@@ -1330,7 +1352,7 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
       // A closure-VALUE call (`v()` with `v: () => boolean[] | null` — a binding or a
       // param) whose resolved sig result is the nullable i32-backed list (`>o`), so an
       // un-annotated `const t0 = v()` infers kind 15 and narrows with `if t0 != null`.
-      return calleeRetKind(callee.identName, fnIx) == "nullist"
+      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "nullist"
     }
   }
   false
@@ -1380,7 +1402,7 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetNulRefArrayName(callee.identName) != "" { return true }
+      if fnRetNulRefArrayNameSid(sidOfNode(e.callFn)) != "" { return true }
     }
   }
   false
@@ -1432,7 +1454,7 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const rn = fnRetNulRefArrayName(callee.identName)
+      const rn = fnRetNulRefArrayNameSid(sidOfNode(e.callFn))
       if rn != "" { return rlSlotByName(rn) }
     }
   }
@@ -1520,7 +1542,7 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOf(callee.identName)
+      const target = fnIndexOfSid(sidOfNode(e.callFn))
       if target >= 0 {
         const fn = P.nodes[fnStmts[target]]
         if fn is FuncDecl {
@@ -1563,14 +1585,14 @@ export function declaredNulString(name: string) {
   declaredKind(name) == "nulstr"
 }
 
-function globalIsNulString(name: string) {
-  const li = globalLetOf(name)
+function globalIsNulStringSid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsNulString(li, -1)
 }
 
-function fnRetNulString(name: string) {
-  const i = fnIndexOf(name)
+function fnRetNulStringSid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "nulstr"
 }
@@ -1602,10 +1624,10 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetNulString(callee.identName) { return true }
+      if fnRetNulStringSid(sidOfNode(e.callFn)) { return true }
       // A `string | null`-returning function VALUE (a binding / `(…) => string | null`
       // param callee) — its result is the nullable raw array, `>N`.
-      return calleeRetKind(callee.identName, fnIx) == "nulstr"
+      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "nulstr"
     }
     // A `string | null`-returning FIELD-closure call.
     if callee is Member {
@@ -1621,7 +1643,7 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramNulString(fnIx, e.identName) { return true }
     if declaredNulString(e.identName) { return true }
-    return globalIsNulString(e.identName)
+    return globalIsNulStringSid(sidOfNode(unwrapParen(exprIx)))
   }
   // A `string | null` struct FIELD read (`a.v`, code 20) yields a nullable string ref.
   if e is Member { return memberFieldCode(exprIx, fnIx) == 20 }
@@ -1682,10 +1704,12 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetNulRef(callee.identName) { return true }
+      if fnRetNulRefSid(sidOfNode(e.callFn)) { return true }
       // An `S | null`-returning function VALUE (a binding / `(…) => S | null` param
       // callee) — its result is the nullable struct ref, `>nN;`.
-      if calleeRetKind(callee.identName, fnIx) == "nulstruct" { return true }
+      if calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "nulstruct" {
+        return true
+      }
     }
     // An `S | null`-returning FIELD-closure call.
     if callee is Member {
@@ -1709,7 +1733,7 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     // field is `(ref null $S)` (kind 9), so classify it nullable — else `p != null` reads as
     // struct equality. The struct index resolves via `capturedStructIndex`.
     if capturedKindOf(fnIx, e.identName) == "nulstruct" { return true }
-    return globalIsNulRef(e.identName)
+    return globalIsNulRefSid(sidOfNode(exprIx))
   }
   // A NESTED-STRUCT field read (code 15) is stored `(ref null $S)` — a `S|null`
   // field genuinely carries null; a plain `inner: S` field is always written
@@ -1805,7 +1829,7 @@ export function mapRetExprShape(rx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       if callee.identName == "Map" || callee.identName == "Set" { return -1 }
-      return fnRetMapShape(callee.identName)
+      return fnRetMapShapeSid(sidOfNode(e.callFn))
     }
   }
   // A CAPTURED map return (`(q) => (h)` over an enclosing-frame map `h`): the ident is
@@ -2623,7 +2647,12 @@ function criWalkStmt(stmtIx: i32, i: i32) {
 
 // Look up the wasm function index for `name`, or -1 if no such top-level function
 // exists (an undefined callee — the caller fails loudly).
-export function fnIndexOf(name: string) { fnNameMap[name] ?? -1 }
+export function fnIndexOf(name: string) {
+  sidArrGet(fnIndexBySid, sidLookup(name))
+}
+
+// The sid-taking primitive (R6) — an array read. See `globalIndexOfSid`.
+export function fnIndexOfSid(sid: i32) { sidArrGet(fnIndexBySid, sid) }
 
 // The `fnStmts` position of a lifted function named `name` whose PARENT frame is the
 // `fnStmts` position `pp`, or -1 — ONE rung of the scope-chain walk below. (Twin of
@@ -2672,9 +2701,15 @@ function nestedFnDeclaredInFrame(name: string, pp: i32) {
 // every callee in a module with no nested functions, including this compiler — costs
 // exactly the one `fnIndexOf` map lookup it cost before.
 export function fnIndexOfInScope(name: string, fnIx: i32) {
+  fnIndexOfInScopeSid(sidLookup(name), name, fnIx)
+}
+
+// The sid-taking primitive (R5/R6); see `emit_collect.fnIndexOfInScopeChainSid`,
+// the deliberate twin this mirrors.
+export function fnIndexOfInScopeSid(sid: i32, name: string, fnIx: i32) {
   // The parent-matching scan can only succeed for a NESTED function named `name`; skip
   // it entirely (→ O(1) `fnIndexOf`) when no lifted function carries this name.
-  if fnIx >= 0 && (nestedNameSet[name] ?? false) {
+  if fnIx >= 0 && sidArrGet(nestedNameBySid, sid) == 1 {
     let pp = fnStmtsPosOf(fnIx)
     // `fnStmts.length` bounds the walk: a parent chain cannot be longer than the
     // function count, so this terminates even were `fnParent` ever to contain a cycle.
@@ -2686,7 +2721,7 @@ export function fnIndexOfInScope(name: string, fnIx: i32) {
       steps = steps + 1
     }
   }
-  fnIndexOf(name)
+  fnIndexOfSid(sid)
 }
 
 // ── capture analysis (closures) ───────────────────────────────────────────────
@@ -4362,7 +4397,7 @@ function callWidensAtomToStr(callIx: i32, fnIx: i32) {
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Ident {
-      const target = fnIndexOf(callee.identName)
+      const target = fnIndexOfSid(sidOfNode(c.callFn))
       if target >= 0 {
         const cFn = P.nodes[fnStmts[target]]
         if cFn is FuncDecl {
@@ -6589,7 +6624,7 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
     const callee = P.nodes[n.callFn]
     let isVal = false
     if callee is Ident {
-      const t = fnIndexOf(callee.identName)
+      const t = fnIndexOfSid(sidOfNode(n.callFn))
       if t < 0 {
         if exprIsClosure(n.callFn, fnIx) { isVal = true }
         // `t()` where `t` is a union binding with a bare-closure arm (`const t = p.f; t()`,
@@ -7025,8 +7060,8 @@ export function ifExprValtype(ifIx: i32, fnIx: i32) {
 function declaredI64(name: string) { declaredKind(name) == "i64" }
 
 // True if the module GLOBAL `name` is an i64 cell.
-function globalIsI64(name: string) {
-  const li = globalLetOf(name)
+function globalIsI64Sid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsI64(li, -1)
 }
@@ -7098,7 +7133,7 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
     if uk != -3 { return uk == 3 }
     if paramIsI64(fnIx, e.identName) { return true }
     if declaredI64(e.identName) { return true }
-    return globalIsI64(e.identName)
+    return globalIsI64Sid(sidOfNode(exprIx))
   }
   // Slice 2: an ARITHMETIC / BITWISE / SHIFT op yields i64 when EITHER operand is i64
   // (the i32 side widens). COMPARISONS (`==` `!=` `<` `>` `<=` `>=`) and logical
@@ -7148,10 +7183,10 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
     if cloArrCallRetKind(exprIx, fnIx) == "i64" { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOf(callee.identName)
+      const target = fnIndexOfSid(sidOfNode(e.callFn))
       if target >= 0 { return fRetKind[target] == "i64" }
       // An i64-returning function VALUE (a binding / `(…) => i64` param callee).
-      return calleeReturnsI64(callee.identName, fnIx)
+      return calleeReturnsI64Sid(sidOfNode(e.callFn), fnIx)
     }
     // An i64-returning FIELD-closure call (`o.f(x)` over an `(…) => i64` field).
     if callee is Member {
@@ -7186,8 +7221,8 @@ export function letInfersF32(letIx: i32, fnIx: i32) {
 }
 
 // True if the module GLOBAL `name` is an f32 cell. (Slice 5.)
-function globalIsF32(name: string) {
-  const li = globalLetOf(name)
+function globalIsF32Sid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsF32(li)
 }
@@ -7308,7 +7343,7 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
     if uk != -3 { return uk == 5 }
     if paramIsF32(fnIx, e.identName) { return true }
     if declaredF32(e.identName) { return true }
-    return globalIsF32(e.identName)
+    return globalIsF32Sid(sidOfNode(exprIx))
   }
   // Arithmetic yields f32 when EITHER operand is f32. Comparisons / logical connectives
   // produce an i32 BOOL even over f32 operands, so they are NOT f32.
@@ -7330,7 +7365,7 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOf(callee.identName)
+      const target = fnIndexOfSid(sidOfNode(e.callFn))
       if target >= 0 { return fRetKind[target] == "f32" }
     }
     // An f32-returning FIELD-closure call (`o.f(x)` over an `(…) => f32` field) —
@@ -7390,8 +7425,8 @@ function armValueIsKind(exprIx: i32, fnIx: i32, kind: BtKind) {
 function declaredF64(name: string) { declaredKind(name) == "f64" }
 
 // True if the module GLOBAL `name` is an f64 cell. (Slice 3.)
-function globalIsF64(name: string) {
-  const li = globalLetOf(name)
+function globalIsF64Sid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsF64(li, -1)
 }
@@ -7437,7 +7472,7 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
     if uk != -3 { return uk == 4 }
     if paramIsF64(fnIx, e.identName) { return true }
     if declaredF64(e.identName) { return true }
-    return globalIsF64(e.identName)
+    return globalIsF64Sid(sidOfNode(exprIx))
   }
   // Arithmetic yields f64 when EITHER operand is f64. Comparisons / logical connectives
   // produce an i32 BOOL even over f64 operands, so they are NOT f64.
@@ -7473,10 +7508,10 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
     if cloArrCallRetKind(exprIx, fnIx) == "f64" { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOf(callee.identName)
+      const target = fnIndexOfSid(sidOfNode(e.callFn))
       if target >= 0 { return fRetKind[target] == "f64" }
       // A function-VALUE (closure) callee returning f64 — its result routes as f64.
-      return calleeReturnsF64(callee.identName, fnIx)
+      return calleeReturnsF64Sid(sidOfNode(e.callFn), fnIx)
     }
     // A FIELD-closure call `t.op(x)` whose field function returns f64.
     if callee is Member {
@@ -7701,7 +7736,7 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     // The syntactic resolvers — fast (no type render): a function-typed binding/param Ident, a struct
     // field closure, an indexed closure-array element.
     if cre is Ident {
-      const k = calleeCloSigKey(cre.identName, fnIx)
+      const k = calleeCloSigKeySid(sidOfNode(c.callFn), fnIx)
       if k != "" { return k }
     }
     if cre is Member {
@@ -8215,7 +8250,7 @@ function structUnionNullCmpName(condIx: i32, fnIx: i32) {
       if refIx >= 0 {
         const r = P.nodes[refIx]
         if r is Ident {
-          const un = unionNameOfIdent(r.identName, fnIx)
+          const un = unionNameOfIdentSid(sidOfNode(refIx), fnIx)
           if un != "" {
             if !isValueUnionName(un) {
               const uset = unionMemberSetOf(un)
@@ -8246,7 +8281,7 @@ function valueUnionNullCmpName(condIx: i32, fnIx: i32) {
       if refIx >= 0 {
         const r = P.nodes[refIx]
         if r is Ident {
-          const un = unionNameOfIdent(r.identName, fnIx)
+          const un = unionNameOfIdentSid(sidOfNode(refIx), fnIx)
           if un != "" {
             if isValueUnionName(un) { return r.identName }
           }
@@ -8442,7 +8477,7 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
     if s.binOp == "=" {
       const tgt = P.nodes[s.binLeft]
       if tgt is Ident {
-        const un = unionNameOfIdent(tgt.identName, fnIx)
+        const un = unionNameOfIdentSid(sidOfNode(s.binLeft), fnIx)
         if un != "" && isValueUnionName(un) && unionSetHasNull(un) {
           const rhs = P.nodes[unwrapParen(s.binRight)]
           let rhsNullable = false
@@ -8846,7 +8881,9 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
       // A CLOSURE-VALUE callee (a `() => void` param / a void-function binding, invisible
       // to `fnIndexOf`): a void one (`>v` sig) yields nothing, so it is a STATEMENT tail,
       // not a value — the signal that makes `run(g: () => void) { g() }` infer void.
-      if fnIx >= 0 && calleeReturnsVoid(callee.identName, fnIx) { return false }
+      if fnIx >= 0 && calleeReturnsVoidSid(sidOfNode(s.callFn), fnIx) {
+        return false
+      }
       return true
     }
     return false
@@ -9515,7 +9552,7 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOf(callee.identName)
+      const t = fnIndexOfSid(sidOfNode(e.callFn))
       if t >= 0 {
         const cfn = P.nodes[fnStmts[t]]
         if cfn is FuncDecl {
@@ -9649,7 +9686,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOf(callee.identName)
+      const t = fnIndexOfSid(sidOfNode(e.callFn))
       if t >= 0 {
         const cfn = P.nodes[fnStmts[t]]
         if cfn is FuncDecl {
@@ -10473,8 +10510,8 @@ function paramMapShape(fnIx: i32, name: string) {
 // The map SHAPE a function `name` RETURNS (its return annotation's value type), or -1 (the mono
 // map / an un-annotated return whose shape is not annotation-derived). Lets a caller resolve the
 // VALUE type of `mk()[k]` over a `string`-valued map factory.
-function fnRetMapShape(name: string) {
-  const fe = fnIndexOf(name)
+function fnRetMapShapeSid(sid: i32) {
+  const fe = fnIndexOfSid(sid)
   if fe >= 0 {
     const fn = P.nodes[fnStmts[fe]]
     if fn is FuncDecl {
@@ -10563,7 +10600,7 @@ function globalKind(initIx: i32): VKind {
   // top-level function name in value position — is a closure fat-pointer cell (kind 14).
   if e is FuncDecl { return "closure" }
   if e is Ident {
-    if fnIndexOf(e.identName) >= 0 { return "closure" }
+    if fnIndexOfSid(sidOfNode(initIx)) >= 0 { return "closure" }
   }
   // An un-annotated float `.` literal init (`const a = 1.5`) is an f64 cell (kind 11),
   // lowered as `f64.const`. (Slice 3 — additive; bare integer globals stay kind 0.)
@@ -10644,6 +10681,11 @@ function globalKind(initIx: i32): VKind {
 // (`global.get`) to decide whether the (nullable) cell needs a `ref.as_non_null`.
 export function globalNameIsNonConst(name: string) {
   globalIsNonConst(globalLetOf(name))
+}
+
+// The sid-taking primitive (R5): `emitIdentNode` already holds the identifier's id.
+export function globalNameIsNonConstSid(sid: i32) {
+  globalIsNonConst(globalLetOfSid(sid))
 }
 
 // The `fbValtype` kind for a module global's CELL. When the binding has a TYPE
@@ -13407,7 +13449,17 @@ export function resetLitAtoms() {
   // clears; that prologue is the natural home for this line once `emit_sections.vl`
   // is free to edit.
   startStmts = []
-  sblMemo = Map()
+  sidResetStartBlockLet()
+  0
+}
+
+// Drop this file's SID-KEYED rows — the `startBlockLetOf` memo. Paired with
+// `symbols.sidReset` by the driver (through `emit_sections.sidKeyedTablesReset`);
+// see that function's header for why a generation stamp is not enough on its own.
+export function sidResetStartBlockLet() {
+  sblVal = []
+  sblGen = []
+  sblEpoch = sblEpoch + 1
   0
 }
 
@@ -13557,7 +13609,7 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     if nodeTyIsLitUnionAlias(unwrapParen(exprIx)) { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOf(callee.identName)
+      const target = fnIndexOfSid(sidOfNode(e.callFn))
       if target >= 0 {
         const cf = P.nodes[fnStmts[target]]
         if cf is FuncDecl {
@@ -15318,8 +15370,8 @@ export function variantFieldIndex(vi: i32, field: string) {
 
 // True if the function `name` declares the struct as its return type (flat lookup
 // over the stored kind `buildFnMap` recorded — no arena rescan).
-function fnRetStruct(name: string) {
-  const i = fnIndexOf(name)
+function fnRetStructSid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "struct"
 }
@@ -15368,11 +15420,13 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetStruct(callee.identName) { return true }
+      if fnRetStructSid(sidOfNode(e.callFn)) { return true }
       // A struct-returning function VALUE (a binding / `(i32) => S` param callee): its
       // resolved `>sN;` sig (mirrors `structIndexOfExpr`'s closure case). Falls through to the
       // per-node-type fallback below when the sig path misses (a factory-inferred value).
-      if calleeReturnsStructIdx(callee.identName, fnIx) >= 0 { return true }
+      if calleeReturnsStructIdxSid(sidOfNode(e.callFn), fnIx) >= 0 {
+        return true
+      }
     }
     // A FIELD-CLOSURE call (`(a."*")(2)` — a rewritten operator/index trap)
     // yields the field function's return struct (mirrors `structIndexOfExpr`).
@@ -15395,7 +15449,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramStruct(fnIx, e.identName) { return true }
     if declaredStruct(e.identName) { return true }
-    return globalIsStruct(e.identName)
+    return globalIsStructSid(sidOfNode(exprIx))
   }
   // `xs[i]` over a STRUCT-element ref list yields the struct (G7-ref). Per-slot: the
   // element kind comes from the receiver's distinct ref-list slot (1 = struct).
@@ -15443,7 +15497,7 @@ export function exprNulClosure(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOf(callee.identName)
+      const t = fnIndexOfSid(sidOfNode(e.callFn))
       if t >= 0 {
         const cfn = P.nodes[fnStmts[t]]
         if cfn is FuncDecl { return nulCloFlag(cfn.fnRet) == 1 }
@@ -15695,7 +15749,7 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
   // A call to a `: Cat`-returning function yields the concrete variant ref.
   if e is Call {
     const callee = P.nodes[e.callFn]
-    if callee is Ident { return fnRetVariantIndex(callee.identName) }
+    if callee is Ident { return fnRetVariantIndexSid(sidOfNode(e.callFn)) }
   }
   // An index into a `Cat[]` variant-element ref list yields the bare variant struct.
   if e is Index {
@@ -15717,8 +15771,8 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
 
 // The union-VARIANT table index a function `name` returns (its `: Cat` return
 // annotation), or -1.
-function fnRetVariantIndex(name: string) {
-  const fe = fnIndexOf(name)
+function fnRetVariantIndexSid(sid: i32) {
+  const fe = fnIndexOfSid(sid)
   if fe >= 0 {
     const fn = P.nodes[fnStmts[fe]]
     if fn is FuncDecl {
@@ -15751,16 +15805,16 @@ function declaredStructIndex(name: string) {
 }
 
 // The struct table index a function `name` returns (recorded in `fRetStructIdx`), or -1.
-function fnRetStructIndex(name: string) {
-  const i = fnIndexOf(name)
+function fnRetStructIndexSid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return -1 }
   fRetStructIdx[i]
 }
 
 // The struct table index of a module global `name` (from its annotation/initializer),
 // or -1.
-function globalStructIndex(name: string) {
-  const li = globalLetOf(name)
+function globalStructIndexSid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return -1 }
   structIndexOfLet(li, -1)
 }
@@ -15893,13 +15947,13 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const ri = fnRetStructIndex(callee.identName)
+      const ri = fnRetStructIndexSid(sidOfNode(e.callFn))
       if ri >= 0 { return ri }
       // A struct-returning function VALUE (a binding / `(i32) => S` param callee, invisible
       // to `fnRetStructIndex`): the struct index from its resolved `>sN;` sig. Falls through to the
       // per-node-type fallback below when the sig path misses (a value INFERRED from a factory call —
       // `const g = mk()` — whose `>sN;` the syntactic path can't recover).
-      const ci = calleeReturnsStructIdx(callee.identName, fnIx)
+      const ci = calleeReturnsStructIdxSid(sidOfNode(e.callFn), fnIx)
       if ci >= 0 { return ci }
     }
     // A FIELD-CLOSURE call (`(a."[]")(i)` — a chained index trap whose "[]"
@@ -15953,7 +16007,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     if pi >= 0 { return pi }
     const di = declaredStructIndex(e.identName)
     if di >= 0 { return di }
-    const gi = globalStructIndex(e.identName)
+    const gi = globalStructIndexSid(sidOfNode(exprIx))
     if gi >= 0 { return gi }
     return capturedStructIndex(fnIx, e.identName)
   }
@@ -16079,8 +16133,8 @@ export function structIndexOfLet(letIx: i32, fnIx: i32) {
 // a bare object literal (its boxing is driven by the EXPECTED type at the boundary).
 
 // True if function `name` declares the union as its return type.
-function fnRetUnion(name: string) {
-  const i = fnIndexOf(name)
+function fnRetUnionSid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "union"
 }
@@ -16106,10 +16160,10 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetUnion(callee.identName) { return true }
+      if fnRetUnionSid(sidOfNode(e.callFn)) { return true }
       // A union-returning function VALUE (a binding / `(…) => A | B` param callee) — its
       // result is the union box, `>u`.
-      if calleeRetKind(callee.identName, fnIx) == "union" { return true }
+      if calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "union" { return true }
       // A miss here is NOT authoritative: a closure REBOUND from a composed carrier with
       // no annotation (`const v = xs[0]; v(1)` over a union-result closure element) has no
       // sig the syntactic resolution sees, yet its call_ref yields the union BOX — fall
@@ -16235,6 +16289,20 @@ export function letIsUnion(letIx: i32, fnIx: i32) {
 // global's), or "" when the binding is not union-typed. The name string IS the
 // atom set (`"boolean|i32"`), so narrowing complements split it directly.
 export function unionNameOfIdent(name: string, fnIx: i32) {
+  unionNameOfIdentSid(sidOf(name), fnIx)
+}
+
+// The sid-taking primitive. THE BIGGEST SINGLE CONVERSION IN THIS PHASE: on the
+// `13f318ec` re-baseline this function reaches `parentLetOf` for 1.09% of a
+// self-compile and `globalLetOf` for another 0.39%, and it also runs a
+// `__str_eq__` per parameter and two more name-keyed lookups on the miss path.
+// **One id now serves all five**, and the param scan compares i32s.
+//
+// Note the string wrapper mints (`sidOf`, not `sidLookup`): this body recovers the
+// spelling with `sidText`, which is only faithful for an id that exists. That is the
+// standing rule for every sid form that needs its own text back.
+export function unionNameOfIdentSid(sid: i32, fnIx: i32) {
+  const name = sidText(sid)
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
     if fn is FuncDecl {
@@ -16245,7 +16313,10 @@ export function unionNameOfIdent(name: string, fnIx: i32) {
       while i < params.length {
         const p = P.nodes[params[i]]
         if p is Param {
-          if p.parName == name {
+          // `sidOfNode(params[i])` IS `sidOf(p.parName)` — the carrier answers from an
+          // i32 array, so this scan costs an integer compare per parameter where it
+          // cost a `__str_eq__` before.
+          if sidOfNode(params[i]) == sid {
             const pn = tyNameOf(p.parType)
             if isUName(pn) { return pn }
             return ""
@@ -16253,7 +16324,7 @@ export function unionNameOfIdent(name: string, fnIx: i32) {
         }
         i = i + 1
       }
-      const li = parentLetOf(body, name)
+      const li = parentLetOfSid(body, sid)
       if li >= 0 { return letUnionNameOf(li, fnIx) }
       // A `for <name> in <(C|S)[]>` loop variable is a kind-4 union box but is NOT a
       // `LetDecl`, so `parentLetOf` misses it — resolve its member set from the iterable's
@@ -16277,9 +16348,9 @@ export function unionNameOfIdent(name: string, fnIx: i32) {
   // A CAPTURED union box — resolve its member set from the parent frame's binding.
   const cun = capturedUnionName(fnIx, name)
   if cun != "" { return cun }
-  const gi = globalLetOf(name)
+  const gi = globalLetOfSid(sid)
   if gi >= 0 { return letUnionNameOf(gi, -1) }
-  const bl = startBlockLetOf(name)
+  const bl = startBlockLetOfSid(sid)
   if bl >= 0 { return letUnionNameOf(bl, -1) }
   ""
 }
@@ -16292,7 +16363,12 @@ export function unionNameOfIdent(name: string, fnIx: i32) {
 // map the caller's own function was using (measured over the 1,113-program corpus:
 // without this memo `plBuildLetMap` is +34,741 and `plScanStmt` +62,350; with it,
 // +1,384 and +4,285). A memo MISS is fail-safe: it declines, exactly as master does.
-let sblMemo: {[string]: i32} = Map()
+// R6 with a generation stamp, the `parentLetOf` shape: `sblGen[sid] == sblEpoch`
+// means the row is live. The epoch is bumped by `resetLitAtoms` alongside
+// `startStmts`, so a row can never outlive the arena whose node it names.
+let sblVal: i32[] = []
+let sblGen: i32[] = []
+let sblEpoch: i32 = 0
 
 // The `LetDecl` for a MODULE-scope binding declared inside a top-level BLOCK
 // (`if true { const r = g() }`), or -1. Such a binding is a START-FUNCTION LOCAL, not
@@ -16304,20 +16380,23 @@ let sblMemo: {[string]: i32} = Map()
 // `startStmts` is filled by `collectFns`, the fourth pass, and `resetLitAtoms` empties
 // it per program, so an emptiness here means "the collect pass has not run yet" and
 // declining is both correct and what a fresh compiler instance already does.
-function startBlockLetOf(name: string) {
+// Sid-only: the one caller (`unionNameOfIdentSid`) already holds the id, so the
+// string wrapper every other converted table keeps would be dead code here.
+// It delegates to `parentLetOfSid`, whose table is built LAZILY — which is why a
+// string caller would have to mint rather than `sidLookup` (see that function).
+function startBlockLetOfSid(sid: i32) {
   if startStmts.length < 1 { return -1 }
-  if sblMemo.has(name) {
-    const hit = sblMemo[name] ?? -1
-    return hit
-  }
+  if sid < 0 { return -1 }
+  if sidArrGet(sblGen, sid) == sblEpoch { return sidArrGet(sblVal, sid) }
   let si = 0
   let found = -1
   while si < startStmts.length && found < 0 {
-    const li = parentLetOf(startStmts[si], name)
+    const li = parentLetOfSid(startStmts[si], sid)
     if li >= 0 { found = li }
     si = si + 1
   }
-  sblMemo[name] = found
+  sidArrPut(sblGen, sid, sblEpoch)
+  sidArrPut(sblVal, sid, found)
   found
 }
 
@@ -16443,7 +16522,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOf(callee.identName)
+      const t = fnIndexOfSid(sidOfNode(e.callFn))
       if t >= 0 {
         const fn = P.nodes[fnStmts[t]]
         if fn is FuncDecl {
@@ -16714,7 +16793,7 @@ export function narrowedMapValTyOf(name: string): i32 {
 function unionIdentReadKind(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is Ident {
-    if unionNameOfIdent(e.identName, fnIx) != "" {
+    if unionNameOfIdentSid(sidOfNode(exprIx), fnIx) != "" {
       const a = narrowedValueAtomOf(e.identName)
       if a != "" { return valueAtomKind(a) }
       return -2
@@ -17831,8 +17910,8 @@ export function exprReReadable(exprIx: i32): boolean {
 // `a[i]` and `a.length` are i32 (NOT arrays), so they are deliberately absent here.
 
 // True if the function `name` declares an array (`i32[]`) as its return type.
-function fnRetArray(name: string) {
-  const i = fnIndexOf(name)
+function fnRetArraySid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "list"
 }
@@ -17911,11 +17990,11 @@ export function exprArray(exprIx: i32, fnIx: i32) {
       // The intrinsic allocators yield an i32 list unless the fill is f64
       // (`arrNewIntrKind` 1 — then `exprF64Array` claims the call).
       if arrNewIntrKind(exprIx, fnIx) == 0 { return true }
-      if fnRetArray(callee.identName) { return true }
+      if fnRetArraySid(sidOfNode(e.callFn)) { return true }
       // A closure-VALUE call (`g(x)` with `g: (i32) => i32[]`) whose resolved sig
       // result is the i32 list (`>a`) — so `const xs = g(x)` types `xs` as a
       // list and its `.length` / index reads lower through the list machinery.
-      return calleeRetKind(callee.identName, fnIx) == "list"
+      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "list"
     }
     // `xs.map(f)` / `xs.filter(p)` yield a NEW list — the i32 list exactly when the
     // result ELEMENT kind is i32/boolean (map: the callback's return kind; filter:
@@ -17953,7 +18032,7 @@ export function exprArray(exprIx: i32, fnIx: i32) {
     if valueAtomKind(narrowedValueAtomOf(e.identName)) == 7 { return true }
     if paramArray(fnIx, e.identName) { return true }
     if declaredArray(e.identName) { return true }
-    if globalIsArray(e.identName) {
+    if globalIsArraySid(sidOfNode(exprIx)) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
     }
     // A NULLABLE i32-list binding (`i32[] | null`, kind 15) participates in the
@@ -17961,7 +18040,7 @@ export function exprArray(exprIx: i32, fnIx: i32) {
     // read as a list; the op's read site inserts the `ref.as_non_null` recover.
     if paramNulList(fnIx, e.identName) { return true }
     if declaredNulList(e.identName) { return true }
-    if globalIsNulList(e.identName) {
+    if globalIsNulListSid(sidOfNode(exprIx)) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
     }
     // A CAPTURED i32-list read (`store[k]` inside a closure capturing `store`).
@@ -18036,8 +18115,8 @@ export function letIsArray(letIx: i32, fnIx: i32) {
 // yield i32 / the element, not the list). `localIsRef` code `5` flags a ref-list local.
 
 // True if function `name` declares a ref array (`S[]`/`N[]`) as its return type.
-function fnRetRefArray(name: string) {
-  const i = fnIndexOf(name)
+function fnRetRefArraySid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "reflist"
 }
@@ -18079,10 +18158,10 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
     if arrNewIntrKind(exprIx, fnIx) == 3 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetRefArray(callee.identName) { return true }
+      if fnRetRefArraySid(sidOfNode(e.callFn)) { return true }
       // A closure-VALUE callee returning a ref list (`mk: () => S[]`) — its resolved `$fnsig`
       // result is the ref-list wrapper (`>r<slot>;`), so `mk()[i]` indexes it directly.
-      return calleeRetKind(callee.identName, fnIx) == "reflist"
+      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "reflist"
     }
     // A `.filter` over a struct/union array yields the SAME ref list (kind 2).
     if callee is Member {
@@ -18129,8 +18208,8 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
     // against the cell's ref-list wrapper (invalid wasm, `vl check` clean); with a
     // `= null` initializer no classifier claimed it at all and the read fell out of
     // the list family entirely (a loud emit error).
-    if globalIsNulRefArray(e.identName) { return true }
-    return globalIsRefArray(e.identName)
+    if globalIsNulRefArraySid(sidOfNode(exprIx)) { return true }
+    return globalIsRefArraySid(sidOfNode(exprIx))
   }
   // A field read `p.items` whose struct field is a `T[]`/`N[]` (code `5`) yields the ref
   // list wrapper ref — so `.length` / indexing / assignment treat it as a ref list.
@@ -18182,8 +18261,8 @@ function paramRefArrayName(fnIx: i32, name: string) {
 
 // The ref-list ELEMENT type-NAME a function `name` returns (from its `S[]`/`N[]` return
 // annotation, recorded in `fRetRArrElem`), or "".
-function fnRetRefArrayName(name: string) {
-  const i = fnIndexOf(name)
+function fnRetRefArrayNameSid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return "" }
   fRetRArrElem[i]
 }
@@ -18192,8 +18271,8 @@ function fnRetRefArrayName(name: string) {
 // (`i32[][] | null` → the inner `i32[]`), else "". Reads the return-type node directly (`fRetRArrElem`
 // records only the NON-null ref-array element), so a consumer `const t = mk()` infers the kind-18 niche
 // and its `!= null` narrow + narrowed indexing resolve the inner ref-list slot.
-function fnRetNulRefArrayName(name: string) {
-  const i = fnIndexOf(name)
+function fnRetNulRefArrayNameSid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return "" }
   const fn = P.nodes[fnStmts[i]]
   if fn is FuncDecl {
@@ -18251,15 +18330,15 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const fn = fnRetRefArrayName(callee.identName)
+      const fn = fnRetRefArrayNameSid(sidOfNode(e.callFn))
       if fn != "" { return fn }
       // A nulreflist-returning function (`mk: () => i32[][] | null`): the INNER ref-list element name.
-      const nfn = fnRetNulRefArrayName(callee.identName)
+      const nfn = fnRetNulRefArrayNameSid(sidOfNode(e.callFn))
       if nfn != "" { return nfn }
       // A closure-VALUE callee returning a ref list (`mk: () => S[]`): its element name is the
       // `rlElemName` of the `>r<slot>;` result slot parsed off the callee's resolved `$fnsig`
       // (kind-gated on `"reflist"` — the shared slot reader parses ANY slot-carrying result).
-      const ck = calleeCloSigKey(callee.identName, fnIx)
+      const ck = calleeCloSigKeySid(sidOfNode(e.callFn), fnIx)
       if sigKeyRetKind(ck) == "reflist" {
         const rs = sigKeyRetSlot(ck)
         if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
@@ -18336,7 +18415,7 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     // reads a BARE ref-array annotation and then falls through to the initializer, which
     // for the `[]` / `null` spellings names no element at all (slot 0 — whatever row that
     // happens to be).
-    if globalIsNulRefArray(e.identName) {
+    if globalIsNulRefArraySid(sidOfNode(exprIx)) {
       const g18 = globalLetOf(e.identName)
       const gs18 = letAnnRefListSlot(g18)
       if gs18 >= 0 && gs18 < rlElemName.length { return rlElemName[gs18] }
@@ -18588,8 +18667,8 @@ function declaredStringArray(name: string) { declaredKind(name) == "strlist" }
 // True if function `name` declares (or, un-annotated, infers) a `string[]` return type
 // (`"strlist"`). Mirrors `fnRetArray`/`fnRetRefArray` — lets a `string[]`-returning call
 // classify so an untyped `let x = snap()` picks the string-list local kind (code `7`).
-function fnRetStringArray(name: string) {
-  const i = fnIndexOf(name)
+function fnRetStringArraySid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "strlist"
 }
@@ -18597,8 +18676,8 @@ function fnRetStringArray(name: string) {
 // True if function `name` declares (or, un-annotated, infers) an `f64[]` return — the f64
 // analogue of `fnRetStringArray`, so an untyped `let x = mk()` / a call argument classifies as
 // an f64 list (kind 12) instead of falling through to i32.
-function fnRetF64Array(name: string) {
-  const i = fnIndexOf(name)
+function fnRetF64ArraySid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "f64list"
 }
@@ -18606,8 +18685,8 @@ function fnRetF64Array(name: string) {
 // True if function `name` returns a string-keyed mono map (`{[string]: i32}`, annotated or
 // inferred — `"map"`). Lets `exprMap`/`mapShapeOfExpr` classify a call to it, so
 // `const r = mk()` (or `mk()[k]`) routes through the map lowering.
-function fnRetMap(name: string) {
-  const i = fnIndexOf(name)
+function fnRetMapSid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "map"
 }
@@ -18649,10 +18728,10 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
     if mapValuesResultKind(exprIx, fnIx) == 7 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetStringArray(callee.identName) { return true }
+      if fnRetStringArraySid(sidOfNode(e.callFn)) { return true }
       // A closure-VALUE call (`g(x)` with `g: (i32) => string[]`) whose resolved sig
       // result is the string list (`>A`).
-      return calleeRetKind(callee.identName, fnIx) == "strlist"
+      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "strlist"
     }
     return false
   }
@@ -18662,7 +18741,7 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
     if unionIdentReadKind(exprIx, fnIx) == 9 { return true }
     if paramStringArray(fnIx, e.identName) { return true }
     if declaredStringArray(e.identName) { return true }
-    if globalIsStringArray(e.identName) {
+    if globalIsStringArraySid(sidOfNode(exprIx)) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
     }
     // A CAPTURED string-list read (incl. a boxed captured-mutated `string` local). Kind 7.
@@ -18921,7 +19000,7 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
     if unionIdentReadKind(exprIx, fnIx) == 8 { return true }
     if paramF64Array(fnIx, e.identName) { return true }
     if declaredF64Array(e.identName) { return true }
-    if globalIsF64Array(e.identName) {
+    if globalIsF64ArraySid(sidOfNode(exprIx)) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
     }
     // A CAPTURED f64-list read (`xs[i]` inside a closure capturing `xs` — incl. a boxed
@@ -18945,10 +19024,10 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       // A NAMED function returning `f64[]` (annotated or inferred, `"f64list"`).
-      if fnRetF64Array(callee.identName) { return true }
+      if fnRetF64ArraySid(sidOfNode(e.callFn)) { return true }
       // A closure-VALUE call (`g(x)` with `g: (i32) => f64[]`) whose resolved sig
       // result is the f64 list (`>D`).
-      return calleeRetKind(callee.identName, fnIx) == "f64list"
+      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "f64list"
     }
     return false
   }
@@ -18985,14 +19064,14 @@ function callResTyIsF32Array(tyIx: i32) {
 
 function declaredF32Array(name: string) { declaredKind(name) == "f32list" }
 
-function globalIsF32Array(name: string) {
-  const li = globalLetOf(name)
+function globalIsF32ArraySid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsF32Array(li, -1)
 }
 
-function fnRetF32Array(name: string) {
-  const i = fnIndexOf(name)
+function fnRetF32ArraySid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "f32list"
 }
@@ -19021,8 +19100,8 @@ function fnRetF32Array(name: string) {
 // function's result valtype really is i32 and claiming the call site is an f32 list turns
 // a loud reject into invalid wasm — measured). Pinned by
 // `tests/cases/arrays/error-inferred-f32-list-return.vl`, which stays an `@emit-error`.
-function fnRetAnnF32Array(name: string) {
-  const i = fnIndexOf(name)
+function fnRetAnnF32ArraySid(sid: i32) {
+  const i = fnIndexOfSid(sid)
   if i < 0 || i >= fnStmts.length { return false }
   const fn = P.nodes[fnStmts[i]]
   if fn is FuncDecl {
@@ -19071,7 +19150,7 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
     if unionIdentReadKind(exprIx, fnIx) == 12 { return true }
     if paramF32Array(fnIx, e.identName) { return true }
     if declaredF32Array(e.identName) { return true }
-    if globalIsF32Array(e.identName) {
+    if globalIsF32ArraySid(sidOfNode(exprIx)) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
     }
     // A CAPTURED f32-list read (incl. a boxed captured-mutated `f32` local). Kind 21 = f32 list.
@@ -19095,16 +19174,16 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
     }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetF32Array(callee.identName) { return true }
+      if fnRetF32ArraySid(sidOfNode(e.callFn)) { return true }
       // A NAMED function with an ANNOTATED `f32[]` return — the annotation node read
       // directly, because f32 has neither of the two channels the i64/f64 siblings use
       // (see `fnRetAnnF32Array`). Without it the callee emitted the f32-list wrapper as
       // its result while every caller-side classifier said "not a list", and the read
       // `mk()[0]` fell through to the array arm's loud reject.
-      if fnRetAnnF32Array(callee.identName) { return true }
+      if fnRetAnnF32ArraySid(sidOfNode(e.callFn)) { return true }
       // A closure-VALUE call (`g()` with `g: () => f32[]`) whose resolved sig result is
       // the f32 list (`>F`) — the f32 dual of the i64/f64-list callee arms.
-      return calleeRetKind(callee.identName, fnIx) == "f32list"
+      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "f32list"
     }
     // A CURRIED / composed value call (`t0()(1)` — the callee is itself a Call): the
     // checker's recorded RESULT type decides. Reliable here, unlike a general typed-IR
@@ -19152,8 +19231,8 @@ export function letIsI64Array(letIx: i32, fnIx: i32) {
   false
 }
 
-function globalIsI64Array(name: string) {
-  const li = globalLetOf(name)
+function globalIsI64ArraySid(sid: i32) {
+  const li = globalLetOfSid(sid)
   if li < 0 { return false }
   letIsI64Array(li, -1)
 }
@@ -19194,7 +19273,7 @@ export function exprI64Array(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramI64Array(fnIx, e.identName) { return true }
     if declaredI64Array(e.identName) { return true }
-    if globalIsI64Array(e.identName) {
+    if globalIsI64ArraySid(sidOfNode(exprIx)) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
     }
     // A CAPTURED i64-list read (incl. a boxed captured-mutated `i64` local). Kind 20 = i64 list.
@@ -19212,7 +19291,7 @@ export function exprI64Array(exprIx: i32, fnIx: i32) {
       // A closure-VALUE call (`g()` with `g: () => i64[]`) whose resolved sig result is
       // the i64 list (`>L`) — the i64 dual of the f64/f32-list callee arms. A NAMED
       // function returning `i64[]` is recognized via the typed-IR fast path above.
-      return calleeRetKind(callee.identName, fnIx) == "i64list"
+      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "i64list"
     }
     return false
   }
@@ -19285,7 +19364,7 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramNulMap(fnIx, e.identName) { return true }
     if declaredNulMap(e.identName) { return true }
-    return globalIsNulMap(e.identName)
+    return globalIsNulMapSid(sidOfNode(exprIx))
   }
   // A `recv.f` read of a NULLABLE map FIELD (`f: {[string]: V} | null`, code 29) yields a
   // nullable map — `const t = v.f` infers kind `nulmap` and narrows with `if t != null`.
@@ -19317,7 +19396,7 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOf(callee.identName)
+      const target = fnIndexOfSid(sidOfNode(e.callFn))
       if target >= 0 {
         const fn = P.nodes[fnStmts[target]]
         if fn is FuncDecl {
@@ -19344,7 +19423,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
     // through the map lowering.
     if callee is Ident {
       if callee.identName == "Map" || callee.identName == "Set" { return true }
-      if fnRetMap(callee.identName) { return true }
+      if fnRetMapSid(sidOfNode(e.callFn)) { return true }
     }
     // `scopes.pop()` over a map ref list (`{[string]:i32}[]`) yields a Map ref.
     if callee is Member {
@@ -19371,7 +19450,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
     if narrowedMapOf(e.identName) != "" { return true }
     if paramMap(fnIx, e.identName) { return true }
     if declaredMap(e.identName) { return true }
-    if globalIsMap(e.identName) { return true }
+    if globalIsMapSid(sidOfNode(exprIx)) { return true }
     // A CAPTURED map variable of a lifted lambda (`() => (h0)` with `h0` a parent-frame
     // map binding): its env field carries the map ref — classify it exactly as a
     // param/local receiver would, so a captured map flowing into a union-boxed RESULT
@@ -19827,8 +19906,8 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       }
       // A map-returning function yields its declared map SHAPE (mono ⇒ -1, or a `string`-valued
       // map's mv slot); a `Map()` constructor is the mono map (-1).
-      const fe = fnIndexOf(callee.identName)
-      if fe >= 0 { return fnRetMapShape(callee.identName) }
+      const fe = fnIndexOfSid(sidOfNode(e.callFn))
+      if fe >= 0 { return fnRetMapShapeSid(sidOfNode(e.callFn)) }
     }
     // An i32-KEYED constructor / factory result: the KEY comes off the CALL's own
     // recorded type, since a bare `Map()` carries no spelling. It is the other half of
@@ -20066,11 +20145,15 @@ export function mvSlotOfMapValNameOrMonoKTy(
 // a named call) routes `value + fromCodePoint(cp)` to string concat, flags
 // `let s = fromCodePoint(n)` as a string local, etc., exactly as a user `string`-
 // returning function would be.
-function fnRetString(name: string) {
+function fnRetStringSid(sid: i32) {
+  // The three BUILTIN string producers are recognized by spelling, not by the
+  // function table — `sidText` reads the spelling back out of the intern table with
+  // an array index (the sid form's callers all mint, so the text is faithful).
+  const name = sidText(sid)
   if name == "fromCodePoint" { return true }
   if name == "fromCodePoints" { return true }
   if name == "toString" { return true }
-  const i = fnIndexOf(name)
+  const i = fnIndexOfSid(sid)
   if i < 0 { return false }
   fRetKind[i] == "str"
 }
@@ -20155,7 +20238,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
     if cloArrCallRetKind(exprIx, fnIx) == "str" { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetString(callee.identName) { return true }
+      if fnRetStringSid(sidOfNode(e.callFn)) { return true }
       // A string-returning function VALUE (a binding / `(i32) => string` param callee,
       // invisible to `fnRetString`): its resolved `>S` sig. EXCEPT a call the checker
       // typed as an aliased LITUNION (`t(3)` where `t: (i32) => K0` came off a map
@@ -20165,7 +20248,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
       // already excludes it; the per-name claim needs the same gate, else `print`
       // hands the raw atom to the string path (invalid wasm). The atom widens at
       // `exprIsLitAtom` instead.
-      if calleeReturnsString(callee.identName, fnIx) {
+      if calleeReturnsStringSid(sidOfNode(e.callFn), fnIx) {
         if !nodeTyIsLitUnionAlias(exprIx) { return true }
       }
     }
@@ -20239,7 +20322,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // A CAPTURED string (`const s = "…"; () => s.length`): the env field is a string ref (kind
     // 3), so classify it like a string param/local — else `s.length` reads as a struct field.
     if capturedKindOf(fnIx, e.identName) == "str" { return true }
-    return globalIsString(e.identName)
+    return globalIsStringSid(sidOfNode(exprIx))
   }
   // An index read over a STRING list (`names[i]`, a `string[]` element) yields a
   // string ref. (An index over an i32 list or a string `s[i]` yields an i32 — the
@@ -20400,12 +20483,12 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOf(callee.identName)
+      const t = fnIndexOfSid(sidOfNode(e.callFn))
       if t >= 0 { return fnReturnsClosure(t) }
       // A CLOSURE-VALUE callee (`f(4)` where `f: (i32) => ((i32) => i32)`) whose result is
       // itself a closure — resolved from `f`'s `$fnsig` result (`>c`). Lets a curried lambda
       // `const g = f(4)` bind `g` as a closure and call it.
-      return calleeRetKind(callee.identName, fnIx) == "closure"
+      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "closure"
     }
     // A CHAINED value call `g()()` — the callee is itself a Call (`g()`) yielding a closure.
     // The whole call is a closure iff the checker typed its RESULT as a function type; the
@@ -20807,17 +20890,26 @@ export function unionArmSigKey(arm: string) {
 // function value. Lets a closure call over an INFERRED binding resolve the callee's real
 // signature (`fnSigKeyOf`), not the all-i32 arity sig.
 export function identClosureFe(name: string, fnIx: i32) {
+  identClosureFeSid(sidOf(name), fnIx)
+}
+
+// The sid-taking primitive. THE CANONICAL SHAPE (b) OF THIS ARC: the body asks TWO
+// name-keyed tables about the same identifier — the function-scope one and the
+// global one — so one intern replaces two hash-and-probes even when the caller has
+// no arena index to offer. With one (`sidOfNode` at the call site) it replaces two
+// with zero.
+export function identClosureFeSid(sid: i32, fnIx: i32) {
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
     if fn is FuncDecl {
-      const li = parentLetOf(fn.fnBody, name)
+      const li = parentLetOfSid(fn.fnBody, sid)
       if li >= 0 {
         const d = P.nodes[li]
         if d is LetDecl { return fieldValueFeOf(d.letInit) }
       }
     }
   }
-  const gi = globalLetOf(name)
+  const gi = globalLetOfSid(sid)
   if gi >= 0 {
     const gd = P.nodes[gi]
     if gd is LetDecl { return fieldValueFeOf(gd.letInit) }
@@ -20828,10 +20920,17 @@ export function identClosureFe(name: string, fnIx: i32) {
 // The function-type ANNOTATION NAME (`(f64)=>f64`) of a `let`/`const`/global `name` in
 // scope of `fnIx`, or "" when `name` is not a function-typed binding.
 export function identFnTypeAnnName(name: string, fnIx: i32) {
+  identFnTypeAnnNameSid(sidOf(name), fnIx)
+}
+
+// The sid-taking primitive — the second shape-(b) conversion: `parentLetOf` reached
+// from here is 1.00% of a self-compile and `globalLetOf` another 0.59%, the largest
+// pair of the four. One id serves both.
+export function identFnTypeAnnNameSid(sid: i32, fnIx: i32) {
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
     if fn is FuncDecl {
-      const li = parentLetOf(fn.fnBody, name)
+      const li = parentLetOfSid(fn.fnBody, sid)
       if li >= 0 {
         const d = P.nodes[li]
         if d is LetDecl {
@@ -20901,7 +21000,7 @@ export function identFnTypeAnnName(name: string, fnIx: i32) {
       }
     }
   }
-  const gi = globalLetOf(name)
+  const gi = globalLetOfSid(sid)
   if gi >= 0 {
     const gd = P.nodes[gi]
     if gd is LetDecl {
@@ -20938,10 +21037,14 @@ function cloNameSigKey(nm: string) {
 // p; if t0 != null { t0(1) }`) — the checker records no type on a plain Ident init node, so the
 // callee sig is recovered by chasing the copy to its source (a param / annotated binding).
 function identCopySource(name: string, fnIx: i32) {
+  identCopySourceSid(sidOf(name), fnIx)
+}
+
+function identCopySourceSid(sid: i32, fnIx: i32) {
   if fnIx < 0 { return "" }
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    const li = parentLetOf(fn.fnBody, name)
+    const li = parentLetOfSid(fn.fnBody, sid)
     if li >= 0 {
       const d = P.nodes[li]
       if d is LetDecl {
@@ -20956,6 +21059,16 @@ function identCopySource(name: string, fnIx: i32) {
 }
 
 function calleeCloSigKey(name: string, fnIx: i32) {
+  calleeCloSigKeySid(sidOf(name), fnIx)
+}
+
+// The sid-taking primitive. THE DENSEST RESOLUTION CHAIN IN THE CLASSIFIER: the
+// three `ident*` resolutions below each ask the function-scope table and the global
+// table about the SAME identifier, so one id replaces five hash-and-probes — and the
+// ~14 `calleeRetKind(callee.identName, …)` call sites hand it the CALLEE NODE's id
+// straight from the carrier, so they pay none at all.
+function calleeCloSigKeySid(sid: i32, fnIx: i32) {
+  const name = sidText(sid)
   // A union binding narrowed to a bare-closure arm (`if x is () => i64 { x() }`): the arm's
   // function-type name interns the SAME `$fnsig` an annotated closure would — so the `call_ref`
   // casts to the right functype and the result classifiers (`calleeReturnsI64`/…) read its return.
@@ -20966,19 +21079,23 @@ function calleeCloSigKey(name: string, fnIx: i32) {
   }
   const pk = paramCloSigKey(fnIx, name)
   if pk != "" { return pk }
-  const an = identFnTypeAnnName(name, fnIx)
+  // ONE intern for the three resolutions below (design R3's shape (b) at its densest:
+  // `identFnTypeAnnName`, `identClosureFe` and `identCopySource` each resolve the SAME
+  // identifier against the SAME two tables, so this line removes five hash-and-probes).
+  const csid = sid
+  const an = identFnTypeAnnNameSid(csid, fnIx)
   if an != "" {
     const ak = cloNameSigKey(an)
     if ak != "" { return ak }
   }
-  const fe = identClosureFe(name, fnIx)
+  const fe = identClosureFeSid(csid, fnIx)
   // The EXTENDED key (not just `fnSigKeyOf`) so a VOID-returning binding (`const f = hi`)
   // resolves its `>v` sig — interned above for void function values. A value-eligible
   // (i32/f64) binding takes the same key `fnSigKeyOf` would give.
   if fe >= 0 { return cloSigKeyExt(fe) }
   // An inferred COPY of another closure binding (`const t0 = p`): chase the source so a call
   // through the intermediate binding classifies its result (nullable-closure read pattern).
-  const src = identCopySource(name, fnIx)
+  const src = identCopySourceSid(csid, fnIx)
   if src != "" && src != name { return calleeCloSigKey(src, fnIx) }
   ""
 }
@@ -20987,8 +21104,8 @@ function calleeCloSigKey(name: string, fnIx: i32) {
 // `$fnsig` key's result kind is `"f64"`. Drives the closure-call RESULT classification
 // (print routing, numeric-context coercion), the value-call analogue of `fRetF64` for a
 // named function.
-function calleeReturnsF64(name: string, fnIx: i32) {
-  calleeRetKind(name, fnIx) == "f64"
+function calleeReturnsF64Sid(sid: i32, fnIx: i32) {
+  calleeRetKindSid(sid, fnIx) == "f64"
 }
 
 // True if the function-VALUE callee `name` (in scope of `fnIx`) returns void — its
@@ -21000,20 +21117,24 @@ export function calleeReturnsVoid(name: string, fnIx: i32) {
   sigKeyRetIsVoid(calleeCloSigKey(name, fnIx))
 }
 
+export function calleeReturnsVoidSid(sid: i32, fnIx: i32) {
+  sigKeyRetIsVoid(calleeCloSigKeySid(sid, fnIx))
+}
+
 // True if the function-VALUE callee `name` (in scope of `fnIx`) returns a string — its
 // resolved `$fnsig` key's result kind is `"str"`. The value-call analogue of
 // `fnRetString` for a named function — drives the closure-call RESULT's string typing
 // (binding cell, print routing).
-function calleeReturnsString(name: string, fnIx: i32) {
-  calleeRetKind(name, fnIx) == "str"
+function calleeReturnsStringSid(sid: i32, fnIx: i32) {
+  calleeRetKindSid(sid, fnIx) == "str"
 }
 
 // True if the function-VALUE callee `name` (in scope of `fnIx`) returns i64 — its resolved
 // `$fnsig` key's result kind is `"i64"`. The value-call analogue of `fRetI64` for a named
 // function — drives the closure-call RESULT's i64 typing (print routing, numeric-context
 // coercion).
-function calleeReturnsI64(name: string, fnIx: i32) {
-  calleeRetKind(name, fnIx) == "i64"
+function calleeReturnsI64Sid(sid: i32, fnIx: i32) {
+  calleeRetKindSid(sid, fnIx) == "i64"
 }
 
 // The struct-table INDEX a function-VALUE callee `name` (in scope of `fnIx`) returns, or
@@ -21021,8 +21142,8 @@ function calleeReturnsI64(name: string, fnIx: i32) {
 // (`>nN;`); the slot digits parse through the shared result-slot reader
 // (`sigKeyRetSlot`). The value-call analogue of `fnRetStructIndex` — drives the closure-
 // call RESULT's struct typing (`p.x` over `const p = f(5)`, struct or nullable-struct).
-function calleeReturnsStructIdx(name: string, fnIx: i32) {
-  const k = calleeCloSigKey(name, fnIx)
+function calleeReturnsStructIdxSid(sid: i32, fnIx: i32) {
+  const k = calleeCloSigKeySid(sid, fnIx)
   const rk = sigKeyRetKind(k)
   if rk == "struct" || rk == "nulstruct" { return sigKeyRetSlot(k) }
   -1
@@ -21471,8 +21592,8 @@ function sigKeyRetSlot(k: string) {
   acc
 }
 
-function calleeRetKind(name: string, fnIx: i32): VKind | null {
-  return sigKeyRetKind(calleeCloSigKey(name, fnIx))
+function calleeRetKindSid(sid: i32, fnIx: i32): VKind | null {
+  return sigKeyRetKind(calleeCloSigKeySid(sid, fnIx))
 }
 
 // The RESULT value-KIND of a call whose CALLEE is an INDEX into a closure array
@@ -21584,7 +21705,7 @@ function exprIsClosureNoLocal(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is Paren { return exprIsClosureNoLocal(e.parInner, fnIx) }
   if e is FuncDecl { return true }
-  if e is Ident { return fnIndexOf(e.identName) >= 0 }
+  if e is Ident { return fnIndexOfSid(sidOfNode(exprIx)) >= 0 }
   if e is ObjLit { return false }
   false
 }
@@ -21965,7 +22086,7 @@ function mfArrElemIsBool(arrIx: i32, fnIx: i32) {
 export function exprIsBareFnName(ix: i32) {
   if ix < 0 { return false }
   const e = P.nodes[ix]
-  if e is Ident { return fnIndexOf(e.identName) >= 0 }
+  if e is Ident { return fnIndexOfSid(sidOfNode(ix)) >= 0 }
   false
 }
 

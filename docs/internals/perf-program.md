@@ -366,7 +366,7 @@ self-compile unless stated.
 | --- | --- | --- | --- | --- | --- |
 | 1 | ~~**Bulk host↔guest staging, IN**~~ — **SHIPPED, §6.** `srcLoad`/`modKeyLoad`/`modSrcLoad`/`cliResultLoad` + the memory the emitter exports; the host's batched path activates itself | predicted −4.6% self (`modSrcPush`); **got** `modSrcPush` 4.74 → 0.00 self, `modSrcLoad` 2.23 self, and the host's staging phase 192 → 135 ms | one host LINE (the memory probe) + 4 compiler-side exports; the fallback was already written | low — old seeds fall back, no seed split (**held**) | profile self-% of `modSrcPush` (target ≈0); the host's own `[profile] stage_program` phase; wall clock is too noisy alone |
 | 1b | ~~**…and OUT**~~ — **SHIPPED, §7.** `rbyteStore` (bytes, packed 4/word) + `cliCmdDataStore` (code points); the guest writes the same window and the host copies out | `[profile] readback` 17 → **1 ms**; `vl fmt compiler` 4,520,527 host calls → 290 and 520 → **453 ms** (−12.9%) | 2 compiler-side exports + 2 host structs; NO host probe change (`io_mem` was already there) | low — same 2×2 fallback, no seed split (**held**) | the `readback` phase; a `$VL_HOSTCOUNT` per-channel call counter; and the payload-free `vl fmt --check` as the control (run it to the same N) |
-| 2 | **Intern identifiers to i32 symbol IDs** — **DESIGNED AND RE-ORDERED, §8.** `identifier-interning-design.md` holds the rulings; the table is DEFERRED to phase 2 with the measurement that says why | was filed at 19.10%; the re-baseline reads **19.59%** but its top five are all whole-program name→index maps needing a carrier, and the FILED phase-1 consumer set measures **3.0%** after §8's fixes | large | medium-high | the consumer-class split re-derived per the design's §7 probes |
+| 2 | **Intern identifiers to i32 symbol IDs** — **THE TABLE AND PHASE 3 SHIPPED, §9.** `compiler/symbols.vl` + the arena-node carrier + the eight notifications; the three whole-program name→index maps are sym-indexed dense arrays. **Phases 4 (checker scope chain, now the largest single consumer at 2.83%) and 5 (`modRenamed`, 1.82%) remain**, and §9.7 records the coverage blocker phase 4 acquired | re-baseline confirmed the phase table (3 = 6.32% vs 6.2 predicted, 4 = 4.73% vs 4.4, 5 = 1.63% vs 1.6); phase 3 delivered **−4.5%** of a self-compile and **2,466,975 → 479,079 string-keyed probes** | large | medium-high — **the suite and the six-channel corpus are the witnesses; the ladder is BLIND to all eight name-writer poisons** (§9.6.1 corrects §9.6's filed column) | the consumer-class split per the design's §7 probes; the both-implementations count in §9.4 |
 | 2b | ~~**the four avoidable costs the re-baseline found**~~ — **SHIPPED, §8.** `retCapturedMapShape`'s per-return capture re-walk, `emitReturnValue`'s four un-hoisted `fnStmtsPosOf` calls, `nameNamesFunction`'s whole-arena rescan, `parentLetOf`'s double probe, `keywordKind`'s 19-way chain | **−10.7%** of a self-compile (interleaved min-of-15) | five local rewrites, no new data structure | low — all five are strict behaviour-preserving rewrites with the argument at the site | wall clock with `vl check`/`vl fmt` as flat controls at min-of-21; per-function samples PER RUN |
 | 3 | ~~**`nameNamesFunction`: index the arena once**~~ — **SHIPPED, §8.3.** Incremental fold with a high-water mark | 2.64% self → **0.07%** | small | the invalidation was the whole question and the answer is three facts pinned at their sites | as filed |
 | 4 | **`fnStmtsPosOf`: an index at the writers** — **STILL FILED**, but §8.2 removed the three quarters of it that were one un-hoisted call site (5.54% → 2.27% self) | 2.27% self remains | medium | medium — the header's argument about the writers is untouched | as filed |
@@ -465,6 +465,13 @@ for a one-function file.
 | §7's `vl fmt` cut | interleaved min-of-15 wall clock of `vl fmt compiler` on both seeds — and `vl fmt --check compiler` at min-of-**21** as the payload-free control (it reads a false +2.4% at min-of-9) |
 | §7's fallback matrix | the same `readback` phase across {old,new} host × {old,new} seed — exactly one cell is 1 ms, all four md5s equal; plus a Node harness that prints `rbyteStore NOT EXPORTED` for the master seed |
 | §7's "the corpus cannot see the string channel" | run sabotage B (`cliCmdDataStore` drops one code point at a 16,384 seam) as the corpus A/B's B leg: **0 diffs over 1,712 files × 6 fields**, while `tests/selfhost_native_bulk_readback_test.ts` names the chunk size |
+| §9's phase re-baseline (3 = 6.32 / 4 = 4.73 / 5 = 1.63) | the §2 recipe at ≥12 warm runs, then walk each string-primitive sample up past the primitives to its first real consumer and sum the phase's members |
+| §9.2's "the string-wrapper conversion is a WASH" | build the intermediate (maps converted, every caller still passing a string) and read `sidOf` + `sidLookup` as consumers — they sum to what `globalIndexOf` + `fnIndexOf` + `parentLetOf` cost, to within 0.01 points |
+| §9.4's probe counts and the ZERO divergences | one throwaway compiler keeping the OLD `{[string]: i32}` maps alive beside the new arrays, answering every query BOTH ways and comparing, reporting through `return emitFail("COUNTPROBE …")` at the end of `emitProgram` |
+| §9.4's 95.1% carrier hit rate | `sidOfNode` calls vs fills in that same instrument — it is R3's whole justification and it is two counters |
+| §9.5's −4.5% | the INTERLEAVED profile A/B (14 runs per leg, samples PER RUN), corroborated by min-of-41 wall clock. **Do not quote a single wall clock**: four runs read −2.0 / −3.7 / −4.2 / −5.6% and one control read +2.6% |
+| §9.6's poison columns | apply the poison, build with the GOOD seed, `cmp` compile(X, source) against X — and put the good seed BACK before the next poison (§8's harness bug). **The "ladder is the only witness for six poisons" reading was WRONG and §9.6.1 retracts it**: the ladder is blind to all eight name-writers. Include a provably-unreachable poison as a CONTROL — a column that reads identically in every row is a claim about the harness |
+| §9.6's four "0 real" suite columns | read the failure MESSAGE, not the count: `glob match took …ms` and `--jobs 4 … ratio 0.75` are load-induced timing tests, and the same suite on the same tree is 3,610/0 |
 
 ---
 
@@ -1189,3 +1196,301 @@ exact. **Six-channel corpus A/B: 1,714 files, all six fields `same`.** **Fuzz A/
 3 depths × 300 = 12,600 programs per leg, 80 findings each, same md5.** Seed-bootstrap: no
 split — the published seed compiles this branch's source directly (nothing here is a new
 language feature).
+
+---
+
+## 9. Item 2's PAYING PHASE — the table ships, and phase 3 converts
+
+§8 designed the intern table and DEFERRED it on the measurement that the symbol layer's four
+biggest costs were avoidable calls. This section is the phase that follows: the re-baseline on
+the post-§8 profile, the table, and the conversion of the three whole-program name→index maps.
+`docs/internals/identifier-interning-design.md` §8 holds the design side — including the two
+rulings this phase had to ADD.
+
+### 9.1 The re-baseline — the phase table held
+
+Master `13f318ec`, **12 warm guest runs, 19,549 samples**, `.cwasm` warm, `$mNN` stripped.
+The pie moved by §8's −11.1%; the ranking did not.
+
+| % self | fn | | | % of all samples | consumer | phase |
+| ---: | --- | --- | --- | ---: | --- | --- |
+| 27.66 | `__str_eq__` | | | 3.20 | `globalIndexOf` | 3 |
+| 5.81 | `__str_hash__` | | | 2.39 | `lookup` (checker) | 4 |
+| 3.25 | `tokenize` | | | 1.68 | `fnIndexOf` | 3 |
+| 2.73 | `__map_probe__` | | | 1.63 | `modRenamed` | 5 |
+| 2.63 | `tyTopIndexOf` | | | 1.44 | `parentLetOf` | 3 |
+| 2.57 | `modSrcLoad` | | | 1.35 | `variantIndexOf` | TYPE |
+| 2.30 | `fnStmtsPosOf` | | | 0.96 | `objFieldType` | 4 |
+| 1.28 | `__str_concat__` | | | 0.74 | `declaredSlotOf` | — |
+| 1.07 | `modRenamed` | | | 0.70 | `paramTypeNode` | 4 |
+| | | | | 0.68 | `scopeSlotOf` | 4 |
+
+**phase 3 = 6.32%** (§8's table predicted 6.2), **phase 4 = 4.73%** (4.4), **phase 5 = 1.63%**
+(1.6). String primitives total **37.49% of all samples / 610.7 per run**. `keywordKind` is
+0.00 — §8.2's first-character dispatch, as recorded. **Nothing collapsed; the arc was aimed
+at the right three tables, and this section converts phase 3.**
+
+Two caller attributions decided HOW rather than WHETHER:
+
+- **`globalIndexOf` is 93.9% reached through `globalLetOf`**, and `globalLetOf`'s callers are
+  §8-§4.3's declined sibling-predicate run (`globalStructIndex` 0.36, `globalIsMap` 0.20,
+  `globalIsNulRefArray` 0.20, `globalIsNulMap` 0.19, …) plus three ident resolvers.
+- **`parentLetOf` is 84% reached through FOUR functions** — `unionNameOfIdent` 1.09,
+  `identFnTypeAnnName` 1.00, `identClosureFe` 0.35, `identCopySource` 0.30 — *the same three
+  that dominate `globalLetOf`.* Each resolves ONE identifier against BOTH tables.
+
+### 9.2 R3 confirmed by a dead-exact WASH
+
+The first build converted the three maps and left every caller passing a string. Measured:
+the three consumers vanished and **`sidLookup` 4.07% + `sidOf` 2.26% = 6.33%** took their
+place — against the **6.32%** they replaced.
+
+**That wash is the phase's most important number.** It is the design's R3 sentence turned into
+a measurement: *interning at the point of use has already paid the probe it was meant to
+save.* Every point of value in this phase came from the next step — feeding the id from the
+arena-node carrier at call sites that already hold an index.
+
+### 9.3 What shipped
+
+`compiler/symbols.vl` — one table, one leaf, importing only `ast` (R1). Whole-program id space
+reset where `P.nodes = []` is (R2). The carrier `sidNode: i32[]` indexed by arena node,
+filled lazily (R3), with the eight in-place name writers notifying (R4). `sidOf` mints,
+`sidLookup` probes without minting, `sidText` is an array read, `sidArrGet/Put/Clear` are the
+dense-array primitives (R6).
+
+Converted: `globalNameMap` → `globalIndexBySid`, `fnNameMap` → `fnIndexBySid`,
+`nestedNameSet` → `nestedNameBySid`, `parentLetOf`'s per-block map → generation-stamped
+`plSidVal`/`plSidGen`, `startBlockLetOf`'s memo → generation-stamped `sblVal`/`sblGen`. Then
+the call sites: the whole ident-resolution family takes a sid
+(`unionNameOfIdentSid`, `identFnTypeAnnNameSid`, `identClosureFeSid`, `identCopySourceSid`,
+`calleeCloSigKeySid` and the `calleeRet*`/`calleeReturns*` chain), the 18 `globalIs*` sibling
+predicates take a sid, the 17 `fnRet*` predicates take a sid, and ~70 call sites feed them
+`sidOfNode(<the node index they already had>)`.
+
+**`emitIdentNode` is the shape that made R3 load-bearing**: one identifier read resolved
+through SEVEN name-keyed lookups, and the arena index was already threaded in and named
+`_exprIx` — unused. It is one array read now, and the other six are array reads too.
+
+### 9.4 The DETERMINISTIC counts — one instrument, both implementations
+
+A throwaway compiler that keeps the OLD `{[string]: i32}` maps alive beside the new arrays,
+answers every query BOTH ways, counts the probes each scheme pays and compares the answers,
+then reports through `emitFail` at the end of `emitProgram` (§8's counting channel — the guest
+has no `print` that reaches a `vl build`). **One self-compile of `compiler/entry.vl`, arena =
+247,754 nodes, 6,711 distinct symbols interned:**
+
+| | count |
+| --- | ---: |
+| **string-keyed probes, OLD scheme** | **2,466,975** |
+| **string-keyed probes, NEW scheme** (every `sidOf` + `sidLookup`) | **479,079** |
+| | **5.15× — −80.6%** |
+| **OLD-vs-NEW answer DISAGREEMENTS** | **0** of 2,371,115 compared |
+| — `globalIndexBySid` queries | 1,223,033 |
+| — `fnIndexBySid` queries | 340,228 |
+| — `nestedNameBySid` queries | 8,846 |
+| — `parentLetOf` queries / rebuilds | 799,008 / 9,965 |
+| — `startBlockLetOf` queries | **0** |
+| `sidOfNode` calls / fills | **1,946,211 / 95,018** |
+| — i.e. the carrier is READ **20.5×** per intern, a **95.1% hit rate** | |
+| `unionNameOfIdent`'s param scan: `__str_eq__` → i32 compares | 515,560 |
+
+**The 95.1% hit rate is R3's justification, measured.** A scheme that interned at the point of
+use would have paid 1.95 M probes where this one pays 95 K.
+
+**Two numbers worth keeping past this PR.** `startBlockLetOf` is queried **zero** times on the
+compiler's own source — its memo (and the `parentLetOf` thrash it was written to prevent) is
+dead weight on this input, exactly as `rcmsWalks` was at §8. And `parentLetOf` still rebuilds
+its block map **9,965 times for 799,008 queries** (80 queries per rebuild), which sizes what a
+per-function cache would be worth if anyone wants it.
+
+### 9.5 Measured
+
+**Guest profile, interleaved A/B/A/B, 14 runs per leg, same input both legs (the branch
+tree), `.cwasm` warm, 24-core box, load 2.3.** Absolute samples PER RUN, because a share of a
+shrinking pie is not a saving:
+
+| | A /run | B /run | |
+| --- | ---: | ---: | ---: |
+| `__str_hash__` | 89.6 | 55.8 | **−37.8%** |
+| `__map_probe__` | 42.5 | 22.1 | **−47.9%** |
+| `__str_eq__` | 436.8 | 419.5 | −4.0% |
+| `plScanStmt` (the per-block build) | 8.8 | 6.0 | −31.7% |
+| `sidOfNode` (the carrier's own cost) | 0.0 | **17.5** | new |
+| **all string primitives** | **588.0** | **516.2** | **−12.2%** |
+| **all samples** | **1,564.7** | **1,493.8** | **−4.5%** |
+
+And the consumer table, which is the phase stated exactly:
+
+| consumer | A /run | B /run |
+| --- | ---: | ---: |
+| `globalIndexOf` | 45.4 | — |
+| `fnIndexOf` | 27.5 | — |
+| `parentLetOf` | 22.7 | — |
+| **phase 3, total** | **95.6** | — |
+| `sidOf` | — | 21.4 |
+| `sidLookup` | — | 11.0 |
+| **its replacement, total** | — | **32.4 (−66%)** |
+| … plus the carrier | — | 17.5 |
+| **net** | **95.6** | **49.9 (−48%)** |
+
+`lookup` — the CHECKER's scope chain, phase 4 — is now the largest single string consumer at
+**2.83%**, up from #2.
+
+**Wall clock, interleaved min-of-N, `.cwasm` warm.** A = the master-built compiler
+(`13f318ec`, 1,115,110 bytes), B = the branch-built one (1,113,727). Four runs, because the
+spread matters more than any single reading:
+
+| run | N | load (start→end) | **`vl build` (self-compile)** | `vl check` graph | `vl check` one file | `vl fmt --check` | `vl check` tiny |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 21 | 186 → 23 | **−3.7%** | −0.9% | +0.0% | +0.6% | 0 |
+| 2 | 21 | 1.9 → 2.7 | **−2.0%** | +0.5% | **+2.6%** | +1.0% | 0 |
+| 3 | 41 | 1.9 → 2.1 | **−5.6%** | −1.0% | +1.1% | −0.5% | 0 |
+| 4 | 41 | 2.0 → 2.8 | **−4.2%** | −2.2% | +0.5% | −0.7% | 0 |
+
+**Read this table honestly: the headline is −2.0% to −5.6% and the control band is up to
+±2.6%.** Run 2's `+2.6%` on a channel that cannot move (the whole conversion is emit-path;
+`vl check` never enters `emitProgram`) is the measurement's own error bar, and it is
+*larger than run 2's headline*. The converged pair (N=41, runs 3-4) reads **−4.2% / −5.6%
+against a ±1.1% / ±2.2% band**, and it agrees with the interleaved profile's **−4.5%** and
+with the deterministic count's arithmetic (2.0 M probes removed ≈ 10% of the profile's
+hash+probe time, less the carrier's 17.5 samples/run) — three instruments, one answer.
+**Quote −4.5% (the interleaved profile) as the number, not any single wall clock.**
+
+**Byte delta:** 1,115,110 → **1,113,727 (−1,383)**. The conversion REMOVES bytes: five
+`{[string]: i32}` map instantiations and their probe call sites cost more code than the
+dense-array reads that replace them.
+
+### 9.6 The poisons — fourteen, and the column that matters is WHICH instrument reddened
+
+Every id-minting and id-invalidating path, poisoned into a real compiler and run through the
+whole standing gate. `native-fixpoint`/`--prove-fixpoint` is shown as its own column because
+for six of these it is the ONLY witness.
+
+| poison | self-compile | fixpoint ladder | suite | the NAMED witness |
+| --- | --- | --- | --- | --- |
+| **P1 COLLISION — `sidOf` keys on the first character** | **rc 1** | — | **2,241 failed** of 3,610 | `arrays/array-slice.vl` +2,240 |
+| **P1b TARGETED collision — `qq` and `q` share an id** | rc 0 | **BROKEN** | **4 failed** | `tests/cases/objects/anon-field-value-name-not-a-function.vl` (#1314's witness, in both harnesses) |
+| P2a — writer 1/8, driver `n.fnName = modRenamed(…)` | rc 0 | HOLDS ‡ | 0 failed | **inert today** ‡ |
+| P2b — writer 2/8, driver `n.letName` | rc 0 | HOLDS ‡ | 0 real† | **inert today** ‡ |
+| P2c — writer 3/8, driver `n.identName` | rc 0 | **HOLDS — measured** ‡ | 0 real† | **inert today: 1,714/1,714 same on all six corpus channels** ‡ |
+| P2d — writer 4/8, `emit_collect` lambda numbering | rc 0 | HOLDS ‡ | 0 real† | the suite + the corpus ‡ |
+| P2e — writer 5/8, `emit_mono` registry hit | rc 0 | **HOLDS — measured** ‡ | **18 failed** | `closures/closure-alias-union-return-hof.vl` + 5 more in `generics/` |
+| P2f — writer 6/8, `emit_mono` new instance | rc 0 | HOLDS ‡ | **19 failed** | `functions/value-flow-mono.vl`, `generics/body-type-param.vl` … |
+| P2g — writer 7/8, `emit_mono` registry hit (call spine) | rc 0 | HOLDS ‡ | 0 failed | the suite + the corpus ‡ |
+| P2h — writer 8/8, `emit_mono` specialization | rc 0 | HOLDS ‡ | 0 failed | the suite + the corpus ‡ |
+| **P3 — the CARRIER survives an arena reset** | rc 0 | **BROKEN** | **1,273 failed** | `arith/typed-add.vl` +1,272 |
+| **P4 — the SID-KEYED TABLES survive an id-space reset** | rc 0 | **BROKEN** | **18 failed** | `index/write-trap.vl`, `maps/list-of-maps-*.vl` — all 18 `array element access out of bounds`, **all 18 pass in isolation** |
+| **P5 — `sidLookup` where the table is built LAZILY** | rc 0 | **BROKEN** | 0 real† | **the ladder alone** |
+| P6 — `sidArrGet`'s absence test off by one (`>` for `>=`) | **rc 1** | — | **2,807 failed** | `arith/literal-add.vl` +2,806 |
+| P7 — the carrier declines to name a `Param` | rc 0 | **BROKEN** | **177 failed** | `closures/closure-arm-nullable-scalar-result-union.vl` + 176 |
+
+† **Characterised, not counted.** Four poisons showed 1-2 suite "failures" whose messages are
+`glob match took 44942ms — backtracking regression` and `expected parallel scheduling: --jobs 4
+took 2412ms … ratio 0.75` — load-induced TIMING tests, on a box running a compiler build and a
+full suite back to back. The clean run of the same suite on the same tree is 3,610/0. They are
+reported as zero. (**Characterise a sabotage's witnesses before believing them** — §8.6, third
+recording, and this time the direction is the flattering one.)
+
+‡ **THE `P2*` LADDER COLUMN WAS WRONG AND IS CORRECTED — see §9.6.1.** As first written every
+P2 row read **BROKEN**, and findings 1 and 2 below were derived from that column. Re-measured
+at merge time, **the ladder is BLIND to every name-writer poison**. The rows above now carry
+the corrected reading. The non-P2 rows have NOT been re-measured and are left as filed.
+
+**Three findings from this table.**
+
+1. **THE LADDER IS BLIND TO ALL EIGHT NAME-WRITERS; THE SUITE AND THE CORPUS ARE THE
+   WITNESSES.** (Corrected — §9.6.1 holds the measurements.) Disabling all eight notifications
+   at once still self-compiles at rc 0, is a fixpoint of itself, and emits the CLEAN compiler
+   source byte-for-byte identically — while reddening **31 suite cases and 15 corpus rows**.
+   `scripts/native-fixpoint.sh` is still mandatory (it is the named witness for the COLLISION
+   and reset classes), but on this layer it is the suite and the six-channel corpus A/B that
+   are load-bearing, not the ladder. **The fuzz A/B is vacuous here** — 0 divergences over
+   1,440 programs against the all-eight poison, because `fuzzgen` emits no generic/callback
+   shape that reaches monomorphization.
+2. **WRITERS 1–3 ARE STRUCTURALLY INERT TODAY, AND THAT IS A PROPERTY OF THE PIPELINE ORDER,
+   NOT OF THE POISON.** Every `sidOfNode` caller lives in `emit_*`; the driver's module merge
+   runs strictly before any emit pass, so `sidNode` is still empty when `modRw*` renames and
+   `sidNoteNodeName` returns at its own `ix >= sidNode.length` guard. The three driver
+   notifications therefore cannot change an output today — measured, not argued: P2c is
+   1,714/1,714 same on all six corpus channels and a fixpoint. **Keep them.** They are the
+   defence for the day a pass between the merge and emit probes the carrier, and that day
+   arrives silently. What is NOT true is that an instrument would catch their removal.
+3. **P4 IS THE ONE THIS PHASE ACTUALLY SHIPPED WITH, BRIEFLY.** It is not a hypothetical: the
+   first build of the conversion had exactly this defect, and its 18 failures are how the
+   sid-vs-name aliasing difference (design §8.3) was found. Every one of the 18 passes in
+   isolation — the wasm harness's SHARED `WebAssembly.Instance` is the only instrument in the
+   gate that can see it, which makes it this hazard's named witness and worth protecting.
+
+### 9.6.1 The correction — the ladder column did not reproduce at the merge gate
+
+The table above was filed with **BROKEN** in the fixpoint column of all eight `P2*` rows, and
+the doctrine claim "six poisons redden ONLY the fixpoint ladder" was derived from it. Re-run
+independently at the merge gate, on this branch's own tree, against a freshly fetched
+`seed-latest` (1,115,110 B), **not one of the eight reproduces**. Method exactly as §5's row
+prescribes: apply the poison, build `X` with the GOOD seed, `cmp` `compile(X, source)` against
+`X`, restore the good seed before the next poison.
+
+| re-measured | self-compile | `compile(X)==X` | suite | corpus A/B (6 ch.) | fuzz A/B |
+| --- | --- | --- | --- | ---: | ---: |
+| **all eight at once** (`sidNoteNodeName` body deleted) | rc 0 | **HOLDS**, `abcc33f4…` both stages | **31 failed** | **15 rows** | 0 / 1,440 |
+| P2c alone (writer 3/8) | rc 0 | **HOLDS**, `b7328d4d…` both stages | — | **0 rows / 1,714** | — |
+| P2e alone (writer 5/8) | rc 0 | **HOLDS**, `cmp` clean | — | — | — |
+
+Three things follow, and the third is the one to carry forward.
+
+1. **The aggregate refutes the whole column, not just the two rows spot-checked.** Disabling a
+   SUPERSET of the notifications cannot repair a fixpoint that any subset breaks (barring a
+   cancellation for which there is no mechanism), so an all-eight poison that holds means no
+   single one breaks. The two singles were run anyway, because "cannot" is an argument.
+2. **The all-eight poison is a real miscompile, and the instruments that see it are named.**
+   Its 15 corpus rows are 13 build-rc/build-msg flips plus **two byte diffs, one of which is a
+   `RUNOUT`** — `tests/cases/index/generic-trap.vl` runs to completion and prints something
+   ELSE. Silently wrong output, caught by field 6 and by the suite, invisible to the ladder.
+3. **The most likely cause of the original reading is the harness bug §5's own row warns
+   about** — a `build/vl-compiler.wasm` left poisoned from the previous iteration makes
+   `compile(X) == X` fail for *every* subsequent poison, which is exactly the shape of a
+   column that reads BROKEN in all eight rows including the three that are provably inert.
+   **This is inference, not measurement: the original runs were not preserved.** The
+   transferable rule is the one that would have caught it at filing time — *a poison column
+   that reads the same in every row is a claim about the HARNESS until one row is shown to
+   differ*, and the cheapest way to show it is to poison something provably unreachable and
+   confirm the column goes quiet. P2c is now that control, and it is checked in as one.
+
+### 9.7 What did NOT ship, and the blocker phase 4 acquired
+
+`lookup` is now the biggest single string consumer (2.83%) and the rewrite that would remove
+it is small — `T.scopes` has ten real use sites, all in `typecheck.vl`, and a sid-indexed value
+cell plus an undo log replaces an O(levels) chain walk at two probes per level with ONE array
+read. **It is not free, and the reason is coverage, not difficulty.**
+
+`emit_classify.vl` ~19500 and `emit_sections.vl` ~611/625/813 name `T.scopes[top][name] = v`
+and `T.scopes.pop()` as the shapes their arms exist for — a write to an element of a GLOBAL
+struct-field map-array, and a Member-receiver ref-list `.pop`. **Deleting the scope chain
+deletes the self-compile's exerciser of both.** That is DELETE-THE-BYSTANDER in reverse, and
+it has to be answered first: establish whether `tests/cases` covers those two shapes, add the
+cases if it does not, and only then take the chain. Filed so the next slice starts at the
+obstacle instead of rediscovering it after the diff is written.
+
+Also unconverted and now sized: `modRenamed` (phase 5) reads **1.82% / 27.1 samples per run**
+on the converted profile — it went UP as a share, because it is 87% reached from `modRwExpr`
+and this phase did not touch the merge.
+
+### 9.8 Gate
+
+Every rc read BARE (a pipe reports `tail`'s status, not the command's).
+
+| gate | result |
+| --- | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 1,115,110 bytes |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | fixpoint in 2 compiles at **1,113,727** |
+| `scripts/native-fixpoint.sh` | **stage3 == stage4** at 1,113,727 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **3,610 passed / 0 failed / 7 ignored** — the ignored SET identical to master's (all seven in `cases_wasm_test.ts`) |
+| `scripts/lint-self.sh` | clean |
+| `scripts/rep-fuzz-check.sh` | exact (1 baselined, 0 new, 0 stale) |
+| **six-channel corpus A/B** vs the master-built compiler | **1,714 files, all six fields `same`** (`-o` path normalized) |
+| **fuzz A/B**, 14 seeds × 3 depths × 300 = **12,600 programs per leg** | **180 findings each, identical md5** `8360086f8275186a…` |
+| — and its SENSITIVITY, on a known-broken compiler (P7) | 40 findings → **139**, 117 differing lines — **the comparator reddens** |
+
+**Seed-bootstrap: NO SPLIT.** The freshly fetched `seed-latest` (1,115,110, i.e. `13f318ec`)
+compiles this branch's source directly — `compiler/symbols.vl` uses no language surface the
+published seed lacks.
