@@ -25,6 +25,7 @@ import {
   nodeTyWidenedRepName,
   valueAtomKind,
 } from "./typecheck"
+import { sidArrGet, sidArrPut, sidOf, sidOfNode } from "./symbols"
 // ── the type-name grammars this file CALLS, asked of their HOME directly ──────────────
 //
 // TWENTY-SIX pure character grammars over a type-name STRING — **the count is DERIVED from
@@ -245,7 +246,21 @@ export function isBuiltinFnName(name: string) {
 // `resetParentLetCache` clears it at `emitProgram` start (the arena is rebuilt each compile, so
 // a stale block index from a prior compile on a SHARED instance must not be trusted).
 let plCacheBlock: i32 = -1
-let plCacheMap: {[string]: i32} = Map()
+// R6, with the one twist a PER-BLOCK table needs. `plCacheMap` was a `{[string]:
+// i32}` thrown away and rebuilt on every block change; a dense sid-indexed array
+// cannot be thrown away that cheaply (clearing it is O(all symbols in the program)
+// per FUNCTION, which is worse than the map it replaces). So the array is
+// GENERATION-STAMPED: `plGen` is bumped once per rebuild and a slot counts as
+// present only when its stamp is the current generation. Clearing is O(1), the
+// lookup is two array reads, and a stale slot from an earlier block is
+// indistinguishable from absent — which is exactly what `Map()` meant.
+//
+// `plGen` starts at 0 and is bumped BEFORE the first build, so it is >= 1 whenever
+// a lookup can happen; `sidArrPut`'s fill value is -1, so an untouched slot can
+// never read as present.
+let plSidVal: i32[] = []
+let plSidGen: i32[] = []
+let plGen: i32 = 0
 
 // The FuncDecl-name set behind `nameNamesFunction`, and the arena high-water mark it has
 // folded. See that function's header for the append-only argument; the reset rides on
@@ -267,9 +282,22 @@ export function noteFuncName(name: string) {
   0
 }
 
-export function resetParentLetCache() {
+// Drop this file's SID-KEYED rows. Paired with `symbols.sidReset` by the driver
+// (through `emit_sections.sidKeyedTablesReset`) because the id space is re-keyed
+// there: a generation stamp defends against a stale KEY, never against a re-keyed
+// universe — program N+1 re-issues `plGen` from 0 and would match program N's rows,
+// handing out that program's arena indices. See `sidReset`'s header for the
+// measurement that found this.
+export function sidResetParentLet() {
   plCacheBlock = -1
-  plCacheMap = Map()
+  plSidVal = []
+  plSidGen = []
+  plGen = 0
+  0
+}
+
+export function resetParentLetCache() {
+  sidResetParentLet()
   nnfSet = Map()
   nnfScanned = 0
   0
@@ -288,7 +316,14 @@ function plScanStmt(ix: i32) {
   if ix < 0 { return 0 }
   const st = P.nodes[ix]
   if st is LetDecl {
-    if !plCacheMap.has(st.letName) { plCacheMap[st.letName] = ix }
+    // The id comes from the CARRIER — `ix` IS this `LetDecl`'s arena index, so after
+    // the first pass over this node the build costs no hash at all. FIRST-wins is the
+    // generation test (an earlier write in THIS generation blocks a later one).
+    const lsid = sidOfNode(ix)
+    if sidArrGet(plSidGen, lsid) != plGen {
+      sidArrPut(plSidGen, lsid, plGen)
+      sidArrPut(plSidVal, lsid, ix)
+    }
   } else if st is IfStmt {
     plScanStmt(st.ifThen)
     if st.ifElse >= 0 { plScanStmt(st.ifElse) }
@@ -315,19 +350,32 @@ function plBuildLetMap(blockIx: i32) { plScanStmt(blockIx) }
 // bodies — wasm locals are function-scoped). Returns its arena index or -1. Backed by the
 // single-entry per-block cache above (built on a miss, then O(1)).
 export function parentLetOf(blockIx: i32, name: string) {
+  // `sidOf`, not `sidLookup`: this table is built LAZILY on the miss inside
+  // `parentLetOfSid`, so a name interned only BY that build would resolve to -1 if
+  // the id were taken before it. See `sidLookup`'s header, tooth 1.
+  parentLetOfSid(blockIx, sidOf(name))
+}
+
+// The sid-taking primitive (R5/R6) — NO hash and NO probe, two array reads.
+//
+// This is the one the hot callers use. `parentLetOf` was 1.64% of a self-compile at
+// `1517c7f6` and 1.44% at `13f318ec` AFTER #1314 collapsed its double probe, and
+// **84% of it arrives through four functions** (`unionNameOfIdent`,
+// `identFnTypeAnnName`, `identClosureFe`, `identCopySource` — measured by walking
+// each string-primitive sample up to its first non-primitive frame). Each of those
+// resolves ONE identifier and then asks the global table about the SAME name, so
+// each interns once and spends the id twice; and the call sites that hold the
+// identifier's arena index get it from the carrier for free.
+export function parentLetOfSid(blockIx: i32, sid: i32) {
   if blockIx < 0 { return -1 }
   if blockIx != plCacheBlock {
-    plCacheMap = Map()
+    plGen = plGen + 1
     plBuildLetMap(blockIx)
     plCacheBlock = blockIx
   }
-  // ONE probe, not two. `plCacheMap`'s values are arena indices written by `plScanStmt`, whose
-  // first line is `if ix < 0 { return 0 }` — so a stored value is always >= 0 and `?? -1` is
-  // distinguishable from every present value. The `.has` + `[]` pair was therefore two hashes
-  // and two key compares for one answer: measured at `1517c7f6`, `parentLetOf` is 1.64% of a
-  // self-compile's string-primitive self-time (12 warm profiles, 20,985 samples), essentially
-  // all of it in `__map_probe__`/`__str_hash__` under this line.
-  plCacheMap[name] ?? -1
+  if sid < 0 { return -1 }
+  if sidArrGet(plSidGen, sid) != plGen { return -1 }
+  sidArrGet(plSidVal, sid)
 }
 // The loop-stack position a `break`/`continue` targets: "" (unlabelled) binds
 // to the TOP entry (the innermost loop); a label scans from the top for the

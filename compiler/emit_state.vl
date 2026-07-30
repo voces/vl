@@ -100,19 +100,40 @@ export let emitErr = ""
 export let emitCurFnIx = -1
 export let emitErrAt = -1
 export let fnNames: string[] = []
-// `fnName → fnStmts index` (FIRST occurrence wins, matching the old linear `fnIndexOf`
-// scan), so resolving a call's callee index is O(1) instead of an O(functions) string-
-// compare scan on every call site / classifier query. Built in `buildFnMap` alongside
-// `fnNames`/`fnIndices`.
-export let fnNameMap: {[string]: i32} = Map()
-// Names that appear as a NESTED (lifted) function (`fnParent[i] >= 0`). `fnIndexOfInScope`
-// only needs its O(functions) parent-matching scan when the name actually names a nested
-// function; for a plain top-level name (the overwhelming common case) it can skip
-// straight to the O(1) `fnIndexOf`. Built in `buildFnMap`.
-export let nestedNameSet: {[string]: boolean} = Map()
-// `globalName → its index in `globalNames`` (FIRST wins), so `globalIndexOf` is O(1)
-// rather than an O(globals) string-compare scan. Built in `collectFns`.
-export let globalNameMap: {[string]: i32} = Map()
+// ── the three whole-program name → INDEX tables, SYMBOL-ID keyed (R6) ────────
+// Each was a `{[string]: i32}`, i.e. a `__str_hash__` over the name plus a probe
+// per lookup, and together they were **6.3% of a self-compile** on the 13f318ec
+// re-baseline (`globalIndexOf` 3.20, `fnIndexOf` 1.68, `parentLetOf` 1.44 —
+// `docs/internals/perf-program.md` §9.1). They are now DENSE ARRAYS indexed by the
+// interned symbol id (`compiler/symbols.vl`), so a lookup is a bounds check plus a
+// load — provided the caller already HAS the id, which is what the arena-node
+// carrier is for (design R3/R5).
+//
+// **Why an array and not one of VL's i32-keyed maps** (B6a/B6b, shipped #1289):
+// the id space is dense from 0 by construction, so the map's hash+probe buys
+// nothing over an index. And the absence test is EXACT rather than approximate:
+// the array is sized where the table is BUILT, interning every key as it goes, so
+// a symbol minted afterwards is — by the interning invariant — a different string
+// from every key present, and `sid >= length ⇒ absent` cannot be wrong.
+//
+// **The caveat that goes with that argument**: the array must be rebuilt or
+// EXTENDED wherever the table is WRITTEN, not only where it is built.
+// `globalIndexBySid` is built once (`collectFns`); `fnIndexBySid` /
+// `nestedNameBySid` are built by `buildFnMap`, which monomorphization RE-RUNS
+// (`buildFnMap#2`) rather than extending in place — so the rebuild covers it.
+//
+// `fnName's sid → fnStmts index` (FIRST occurrence wins, matching the old linear
+// `fnIndexOf` scan), so resolving a call's callee index is O(1) instead of an
+// O(functions) string-compare scan on every call site / classifier query.
+export let fnIndexBySid: i32[] = []
+// Sids that name a NESTED (lifted) function (`fnParent[i] >= 0`), 1 = yes.
+// `fnIndexOfInScope` only needs its O(functions) parent-matching scan when the name
+// actually names a nested function; for a plain top-level name (the overwhelming
+// common case) it can skip straight to the O(1) `fnIndexOf`. Built in `buildFnMap`.
+export let nestedNameBySid: i32[] = []
+// `globalName's sid → its index in `globalNames`` (FIRST wins), so `globalIndexOf`
+// is O(1) rather than an O(globals) string-compare scan. Built in `collectFns`.
+export let globalIndexBySid: i32[] = []
 // Per-function VOIDNESS (1 = `()->()`: no return annotation, no valued `return`,
 // and no tail value — computed as a monotone fixed point in `computeVoidFns`,
 // since a tail CALL to a void callee makes the CALLER void too).

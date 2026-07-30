@@ -14,6 +14,15 @@ re-baseline forced and that the filed scope did not anticipate.
 
 ## 0. Verdict
 
+> **STATUS at `13f318ec`+1: the table SHIPPED and phase 3 is done.** §8 is the record —
+> the re-baseline this file demanded CONFIRMED phase 3 at 6.32% (predicted 6.2%), phase 4
+> at 4.73% (4.4%) and phase 5 at 1.63% (1.6%), `compiler/symbols.vl` exists with the
+> carrier and the eight notifications, and the three whole-program name→index maps are
+> sym-indexed dense arrays. **String-keyed probes per self-compile: 2,466,975 → 479,079,
+> zero divergences over 2.37 M differential comparisons.** Read §8 before §0-§7; the
+> rulings below are unchanged and were all load-bearing, but **R2 acquired a clause the
+> design did not anticipate** (§8.3) and the phase-4 entry acquired a blocker (§8.6).
+
 **The table is DEFERRED and the arc is RE-ORDERED. The re-baseline this design was required to
 take first found that the symbol layer's four largest measurable costs are not identity
 representation at all** — they are one avoidable recomputation, one un-hoisted scan, one
@@ -599,3 +608,140 @@ cases stand behind that arm.
 | the eight name-writer sites (R4) | `grep -n '\.identName = \|\.fnName = \|\.letName = \|\.parName = \|\.frVar = \|\.fiVar = ' compiler/*.vl` |
 | behaviour preservation | six-channel corpus A/B (all six fields `same` over 1,714 files), the 3-stage fixpoint ladder, `SELFHOST_NATIVE_ALIGN=1 deno task test`, multi-seed fuzz A/B |
 | the collision poison reddens | §6.4 of `perf-program.md` §8 — key `nameNamesFunction`'s set on the first character of the name and run the ladder |
+
+---
+
+## 8. Phase 3 SHIPPED — the table, the carrier, and what the re-baseline said
+
+`perf-program.md` §9 is the measurement record; this section is what the DESIGN got right,
+what it got wrong, and the two clauses it did not have.
+
+### 8.1 The re-baseline CONFIRMED the phase table
+
+Master `13f318ec`, **12 warm guest runs, 19,549 samples**, `$mNN` stripped, `.cwasm` warm.
+The pie moved by §6's −11.1% and the string layer moved with it — `__str_eq__` 27.71 →
+**27.66**, `__str_hash__` 5.62 → **5.81**, `__map_probe__` 2.78 → **2.73** — but the *ranking*
+this design's phase table rests on did not move at all:
+
+| consumer | §1.2 (at `1517c7f6`) | re-baseline (at `13f318ec`) | phase |
+| --- | ---: | ---: | --- |
+| `globalIndexOf` | 3.07 | **3.20** | 3 |
+| `lookup` (checker) | 2.11 | **2.39** | 4 |
+| `fnIndexOf` | 2.05 | **1.68** | 3 |
+| `modRenamed` | 1.39 | **1.63** | 5 |
+| `parentLetOf` | 1.64 | **1.44** | 3 |
+| `objFieldType` | 0.86 | **0.96** | 4 |
+| `declaredSlotOf` | 0.71 | **0.74** | — |
+| `paramTypeNode` | 0.64 | **0.70** | 4 |
+| `scopeSlotOf` | 0.75 | **0.68** | 4 |
+| `keywordKind` | 0.76 | **0.00** | (§6.4 shipped) |
+
+**phase 3 = 6.32%** (the table predicted 6.2), **phase 4 = 4.73%** (4.4), **phase 5 = 1.63%**
+(1.6). Nothing collapsed; the arc was targeted at the right three tables. Total string
+primitives: **37.49% of all samples, 610.7 per run.**
+
+The two caller attributions that decided HOW to convert:
+
+- **`globalIndexOf` is 93.9% reached through `globalLetOf`**, whose own callers are the
+  sibling-predicate run §4.3 filed and declined to memoize — `globalStructIndex` 0.36,
+  `globalIsMap` 0.20, `globalIsNulRefArray` 0.20, `globalIsNulMap` 0.19, `globalIsRefArray`
+  0.15, `globalIsStringArray` 0.12, `globalIsString` 0.07 — plus `identFnTypeAnnName` 0.59,
+  `identClosureFe` 0.41 and `unionNameOfIdent` 0.39.
+- **`parentLetOf` is 84% reached through FOUR functions** — `unionNameOfIdent` 1.09,
+  `identFnTypeAnnName` 1.00, `identClosureFe` 0.35, `identCopySource` 0.30 — *the same
+  three that also dominate `globalLetOf`*. Each resolves ONE identifier against BOTH tables.
+
+That coincidence is the whole shape of the conversion, and it is what R3 predicted from the
+other end.
+
+### 8.2 R3 was right, and the wash proves it
+
+The first build converted the three maps and left every caller passing a string
+(`globalIndexOf(name)` = `sidArrGet(globalIndexBySid, sidLookup(name))`). Measured on that
+build, the three consumers vanished from the profile and **`sidLookup` 4.07% + `sidOf` 2.26%
+= 6.33%** appeared in their place — against the 6.32% they replaced. **A dead-exact wash**,
+and the cleanest possible confirmation of R3's sentence: *interning at the point of use has
+already paid the probe it was meant to save.* Every point of the phase's value came from the
+next step — feeding the id from `sidOfNode` at call sites that already hold an arena index.
+
+### 8.3 R2 needed a clause: A SID-KEYED TABLE ALIASES ACROSS PROGRAMS
+
+R2 says the id space is minted per compile and reset where `P.nodes = []` is. It does not say
+what that implies for the tables KEYED by those ids, and the implication is not the one the
+string-keyed maps had:
+
+> A **name**-keyed row survives a program boundary harmlessly — the next program collides
+> with it only if it reuses the SPELLING. A **sid**-keyed dense array collides whenever the
+> next program mints the same NUMBER, and the space is dense from 0, so sid 3 exists in every
+> program with three identifiers.
+
+`globalIndexBySid` is rebuilt by `collectFns` and `fnIndexBySid` by `buildFnMap`, both INSIDE
+`emitProgram` — so between one program and the next program's collect pass there is a window
+where the rows are stale. That window is old (it is the same one `resetLitAtoms`' header
+describes) and with string keys it was almost always inert. With sid keys it is not.
+
+Measured: the wasm harness — one `WebAssembly.Instance` over the whole corpus — failed **18
+cases with `array element access out of bounds`** (a stale `globalIndexBySid` row indexing an
+emptied `globalStmts`), and **every one of those 18 passed in isolation**. The fix is
+`emit_sections.sidKeyedTablesReset()`, paired with `sidReset()` at all seven driver sites, and
+the enumeration of sid-keyed tables now has one home. **That harness is the hazard's standing
+witness** and the poison table records it as such.
+
+The same clause forced the two GENERATION-STAMPED tables (`parentLetOf`'s per-block rows,
+`startBlockLetOf`'s memo) to be DROPPED rather than re-stamped at a program boundary: a
+generation counter defends against a stale KEY, never against a re-keyed universe — the next
+program re-issues generation 1 and matches the last program's rows.
+
+### 8.4 A second clause: WHICH TABLES MAY USE THE NON-MINTING LOOKUP
+
+`sidLookup` (probe, never mint) is what a converted map's string wrapper wants, and it is
+exact for an EAGERLY built table by R6's argument read backwards. It is **wrong for a table
+built LAZILY**: `parentLetOfSid` builds its block's rows on the miss, interning each `LetDecl`
+name as it goes, so a wrapper that resolved the query name with `sidLookup` FIRST passes -1
+for a name the build is about to intern — and answers "absent" for a binding that exists.
+That is a silent wrong resolution, and `p5-lookup-on-lazy-table` in the poison table is it.
+The same applies to any sid form that recovers its own spelling with `sidText`.
+
+### 8.5 What converted
+
+| table / consumer | before | after |
+| --- | --- | --- |
+| `globalNameMap` | `{[string]: i32}` | `globalIndexBySid: i32[]` + `globalIndexOfSid`/`globalLetOfSid` |
+| `fnNameMap` | `{[string]: i32}` | `fnIndexBySid: i32[]` + `fnIndexOfSid` |
+| `nestedNameSet` | `{[string]: boolean}` | `nestedNameBySid: i32[]` |
+| `plCacheMap` (per block) | `{[string]: i32}`, rebuilt per function | generation-stamped `plSidVal`/`plSidGen` + `parentLetOfSid` |
+| `sblMemo` | `{[string]: i32}` | generation-stamped `sblVal`/`sblGen` |
+| the ident-resolution family | `(name, fnIx)` | `…Sid(sid, fnIx)` — `unionNameOfIdent`, `identFnTypeAnnName`, `identClosureFe`, `identCopySource`, `calleeCloSigKey` and the whole `calleeRet*`/`calleeReturns*` chain |
+| the `globalIs*` sibling run (18 predicates) | `(name)` | `…Sid(sid)` |
+| the `fnRet*` family (17 predicates) | `(name)` | `…Sid(sid)` |
+| `emitIdentNode`'s seven lookups | seven hashes over one string | one `sidOfNode(exprIx)` — **the parameter was already threaded in and named `_exprIx`** |
+| `unionNameOfIdent`'s param scan | one `__str_eq__` per parameter | one i32 compare (`sidOfNode(params[i]) == sid`) |
+
+### 8.6 Phase 4 is NOT next-for-free — the blocker the filing did not have
+
+`lookup` is now the LARGEST single string consumer (2.66% on the converted profile) and the
+undo-log rewrite that would remove it is small: `T.scopes` has ten real use sites, all in
+`typecheck.vl`, and a sid-indexed value cell plus an undo log turns an O(levels) chain walk
+with two probes per level into ONE array read.
+
+**The blocker is that `T.scopes` is also emitter COVERAGE.** `emit_classify.vl` ~19500 and
+`emit_sections.vl` ~611/625/813 name `T.scopes[top][name] = v` and `T.scopes.pop()` as the
+shapes their arms exist for — a global struct-field map-array element write, and a
+Member-receiver ref-list `.pop`. Deleting the chain deletes the self-compile's exerciser of
+both. That is a DELETE-THE-BYSTANDER risk in reverse and it has to be answered (are those
+shapes covered by `tests/cases`? if not, add the cases FIRST) before the rewrite, not after.
+Filed here so the next slice starts from the obstacle rather than rediscovering it.
+
+### 8.7 The numbers, and where to re-derive them
+
+`perf-program.md` §9 is the full record. In brief: **string-keyed probes 2,466,975 → 479,079
+(5.15×) with 0 divergences over 2,371,115 both-implementation comparisons**; the carrier is
+read **20.5× per intern (95.1% hit rate)**; string primitives **588.0 → 516.2 samples per run
+(−12.2%)** and all samples **1,564.7 → 1,493.8 (−4.5%)** on an interleaved 14-run profile A/B;
+compiler bytes **1,115,110 → 1,113,727 (−1,383)** — the conversion is net-negative in code
+size, because five map instantiations and their probe call sites cost more than the array
+reads that replace them. Fourteen poisons, of which **six redden only the fixpoint ladder**.
+
+**The one number to quote when someone asks whether the carrier was necessary: 1,946,211
+`sidOfNode` calls against 95,018 fills.** A scheme that interned at the point of use would
+have paid 1.95 M probes where this one pays 95 K.

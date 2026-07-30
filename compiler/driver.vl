@@ -40,7 +40,7 @@ import {
   UnionDecl,
   WhileStmt,
 } from "./ast"
-import { emitProgram } from "./emit_sections"
+import { emitProgram, sidKeyedTablesReset } from "./emit_sections"
 import {
   W,
   emitErr,
@@ -81,6 +81,12 @@ import {
   ufcsAliasReset,
 } from "./ast"
 import { parseProgram } from "./parser"
+// The identifier-intern table (`docs/internals/identifier-interning-design.md`).
+// The driver owns two of its obligations: the per-compile RESET (R2 — the carrier
+// is keyed by arena INDEX, so a reset arena that reuses index 5 for a different
+// identifier would read the previous program's answer), and three of the eight
+// in-place name writers (R4 — the module merge's renames below).
+import { sidNoteNodeName, sidReset } from "./symbols"
 import { nameIdentChar } from "./tyname"
 import { T, checkProgram, demangleMsg, initChecker } from "./typecheck"
 import {
@@ -394,6 +400,8 @@ export function compileSrc(): i32 {
   symSetEnabled(0)
   P.toks = []
   P.nodes = []
+  sidReset()
+  sidKeyedTablesReset()
   P.diags = []
   vcDiagMemoReset()
   P.pos = 0
@@ -513,6 +521,8 @@ export function checkSrc(): i32 {
   symSetEnabled(0)
   P.toks = []
   P.nodes = []
+  sidReset()
+  sidKeyedTablesReset()
   P.diags = []
   vcDiagMemoReset()
   P.pos = 0
@@ -559,6 +569,8 @@ export function lintSrc(): i32 {
   symSetEnabled(0)
   P.toks = []
   P.nodes = []
+  sidReset()
+  sidKeyedTablesReset()
   P.diags = []
   vcDiagMemoReset()
   P.pos = 0
@@ -643,6 +655,11 @@ export function lintGraph(): i32 {
     if modFound[m] != 0 {
       P.toks = []
       P.nodes = []
+      // THE SHARPEST EDGE THE CARRIER HAS. This loop re-parses each module into a
+      // FRESH arena, so index 5 is a different identifier every iteration; without
+      // this reset `sidOfNode(5)` would answer with the PREVIOUS module's name.
+      sidReset()
+      sidKeyedTablesReset()
       P.diags = []
       vcDiagMemoReset()
       P.pos = 0
@@ -698,6 +715,8 @@ export function formatSrc(): i32 {
   symSetEnabled(0)
   P.toks = []
   P.nodes = []
+  sidReset()
+  sidKeyedTablesReset()
   P.diags = []
   vcDiagMemoReset()
   P.pos = 0
@@ -766,6 +785,8 @@ export function formatSrc(): i32 {
   if vcFmtOut == src { return vcFmtOut.length }
   P.toks = []
   P.nodes = []
+  sidReset()
+  sidKeyedTablesReset()
   P.diags = []
   P.pos = 0
   nodeToks = []
@@ -797,6 +818,8 @@ export function checkSrcSym(): i32 {
   symSetEnabled(1)
   P.toks = []
   P.nodes = []
+  sidReset()
+  sidKeyedTablesReset()
   P.diags = []
   vcDiagMemoReset()
   P.pos = 0
@@ -2759,6 +2782,8 @@ function modRwFunc(ix: i32): i32 {
   const n = P.nodes[ix]
   if n is FuncDecl {
     n.fnName = modRenamed(n.fnName)
+    // R4 writer 1 of 8: an IN-PLACE name write on a node already in the arena.
+    sidNoteNodeName(ix)
     const saved = modShadow.length
     const tySaved = modTyShadow.length
     // The function's generic type parameters are live across its annotations
@@ -2850,6 +2875,8 @@ function modRwStmt(ix: i32): i32 {
     if n.letInit >= 0 { modRwExpr(n.letInit) }
     modRwType(n.letType)
     n.letName = modRenamed(n.letName)
+    // R4 writer 2 of 8.
+    sidNoteNodeName(ix)
     return 0
   }
   if n is FuncDecl { return modRwFunc(ix) }
@@ -2974,6 +3001,9 @@ function modRwExpr(ix: i32): i32 {
   const n = P.nodes[ix]
   if n is Ident {
     n.identName = modRenamed(n.identName)
+    // R4 writer 3 of 8 — and the one the self-compile exercises hardest: the merge
+    // renames every colliding top-level reference in all 26 compiler modules.
+    sidNoteNodeName(ix)
     return 0
   }
   if n is Call {
