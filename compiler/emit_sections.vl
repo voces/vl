@@ -1411,6 +1411,32 @@ function emitStrHashFnCode(out: i32[]) {
 
 // `__str_eq__(a, b) -> i32`: element-wise string value-equality — 0 if the lengths
 // differ or any code point differs, else 1. Params: a(0), b(1). Locals: n(2), i(3).
+//
+// IDENTITY FAST PATH (`ref.eq`) — the twelve bytes that pay for themselves. A
+// string is `(array (mut i32))`, hence an `eqref`, so the two operands can be
+// compared BY REFERENCE before anything is read. Same reference ⇒ equal, always:
+// there is no aliasing case where an array is unequal to itself, and a length-0
+// string already answered 1 down the slow path. So this is a pure short-circuit,
+// not a semantic change — every input that reached `1` still reaches `1`, and
+// every input that reached `0` still walks (distinct references fall through).
+//
+// It pays because the string-literal POOL (`emit_state.vl`'s `gStrPoolTexts` /
+// `gStrPoolIx`, consumed by `emitStr`) interns every distinct string LITERAL in
+// the program as ONE immutable module global: a literal occurrence
+// lowers to `global.get`, so the SAME `"IDENT"` in twelve source files is one
+// object. Every compare of a pooled literal against a value that came FROM that
+// literal — `tok.kind == "IDENT"`, a rep-tree tag, a canonical type spelling —
+// is therefore reference-identical and now costs `ref.eq` instead of a walk over
+// up to N code points. Measured on a self-compile: `__str_eq__` 424.7 → 360.1
+// samples/run (−15.2%) and the whole compile −3.8% (perf-program.md §10).
+//
+// The NULL corner is stated rather than left to be discovered, and it was
+// MEASURED rather than argued: `ref.eq(null, null)` would answer 1 where the old
+// body reached `array.len` on a null and TRAPPED. It is unreachable — a
+// `string | null` operand is unwrapped BEFORE the call, so `a == b` with both
+// null traps upstream of this helper. Both compilers run the probe (two null
+// `string | null` values compared with `==`) to the same `wasm trap: null
+// reference` at the same address; a reachable corner would have printed `EQ`.
 function emitStrEqFnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
@@ -1418,6 +1444,14 @@ function emitStrEqFnCode(out: i32[]) {
   wULEB(2)     // count 2
   wU8(127)     // 0x7f i32
   fbBlock(127) // block i32 — yields the 0/1 result
+  // if ref.eq(a, b) { 1 ; br out }
+  fbLocalGet(0)
+  fbLocalGet(1)
+  wU8(211) // 0xd3 ref.eq
+  fbIf(64) // if, void
+  fbI32Const(1)
+  fbBr(1)  // → out of the i32 block
+  fbEnd()
   // n = len(a) ; if n != len(b) { 0 ; br out }
   fbLocalGet(0)
   fbArrayLen()

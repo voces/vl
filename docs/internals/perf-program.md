@@ -1062,6 +1062,13 @@ that is printed rather than dropped:
 string literals everywhere. It is a CLOSED ~60-element vocabulary, which is a different problem
 from identifiers — it needs an enumeration, not a table (design §4.1).
 
+> **§10 took this item and the last clause did not survive contact.** Re-baselined at
+> `fb31405d` the class HELD (2.65% structurally; this 2.47% was measured by a name-based
+> classifier that under-reads it). But the enumeration is ~570 sites, and the thing that
+> actually moved TOKKIND was eight lines making `__str_eq__` short-circuit on `ref.eq` —
+> because every string LITERAL is one pooled global, so `tok.kind == "IDENT"` compares a
+> reference against ITSELF. §10.6 re-sizes what the enumeration is still worth.
+
 **And then the ranking:** the SYMBOL class has NO hotspot. Its largest member is 3.07%
 (`globalIndexOf`) and its top five total 10.31%. Chasing it consumer-by-consumer needs a
 carrier for the id (design R3), and before any of that, **four of its largest measurable costs
@@ -1494,3 +1501,356 @@ Every rc read BARE (a pipe reports `tail`'s status, not the command's).
 **Seed-bootstrap: NO SPLIT.** The freshly fetched `seed-latest` (1,115,110, i.e. `13f318ec`)
 compiles this branch's source directly — `compiler/symbols.vl` uses no language surface the
 published seed lacks.
+
+---
+
+## 10. The TOKKIND slice — the vocabulary was never the lever, the COMPARE was
+
+§8.1 filed a class the earlier profile splits did not have: **TOKKIND, 2.47%** — "the parser
+compares `tok.kind` against string literals everywhere … a CLOSED ~60-element vocabulary, which
+is a different problem from identifiers — it needs an enumeration, not a table". This section
+re-baselines that class on the post-#1315 pie, sizes what the enumeration would actually cost,
+and records the measurement that chose a different answer for a fraction of the price.
+
+### 10.1 The re-baseline — the class did NOT collapse, and the name-based split under-reads it
+
+Master `fb31405d`, **14 warm guest runs, 21,154 samples**, `.cwasm` warm, `$mNN` stripped,
+24-core box at load 0.4.
+
+The classifier used at §8.1 is a hand-written map from CONSUMER FUNCTION NAME to class, which
+is the wrong instrument for a re-baseline: it scores the functions its author remembered. Run
+unchanged on these samples it reads TOKKIND at **2.14%** — it misses `skipNewlines`, `accept`,
+`kindAt`, `looksLikeObject`, `isStmtKeyword` and all of `modScan`, while counting `keywordKind`,
+which is not a tok-kind consumer at all. So the split was re-derived **structurally**: walk each
+string-primitive sample up to its first real consumer, then attribute that consumer to the
+`compiler/*.vl` file that DEFINES it. That is a property of the code rather than of a list
+(`vl-structural-census-beats-names`, again).
+
+| defining file of the consumer | samples/run | % of all samples |
+| --- | ---: | ---: |
+| `emit_classify.vl` | 129.1 | 8.55 |
+| `typecheck.vl` | 126.1 | 8.34 |
+| `driver.vl` | 63.9 | 4.23 |
+| `emit_rep.vl` | 50.4 | 3.34 |
+| `symbols.vl` | 33.9 | 2.25 |
+| `emit_base.vl` | 30.3 | 2.00 |
+| **`parser.vl`** | **27.1** | **1.79** |
+| `emit_query.vl` | 15.7 | 1.04 |
+| `emit_sections.vl` | 11.6 | 0.77 |
+| **`lexer.vl`** | **9.9** | **0.65** |
+| `wasmEmit.vl` / `emit_collect.vl` / `ast.vl` / `emit_rewrite.vl` / `tyname.vl` | 16.3 | 1.07 |
+| **all string primitives** | **514.2** | **34.03** |
+
+TOKKIND read off that table member by member, with the non-members NAMED rather than absorbed:
+
+| member | samples/run | |
+| --- | ---: | --- |
+| `parser.vl`, all consumers | 27.1 | `binPrec` 5.14, `parsePostfix` 3.64, `parseBlock` 2.36, `parsePrimary` 2.14, `parseStmt` 2.14, `parseUnary` 1.93, `expectClose` 1.07, then diffuse |
+| — less `coalesceMixOp` | −2.0 | it compares operator LEXEMES (`&&`, `\|\|`, `??`) — a different closed vocabulary |
+| `lexer.vl` `tokenize` | 7.1 | the three `!= ""` no-match sentinel tests, per token |
+| `driver.vl` `modScan` | 7.9 | the import/export token re-scan; kind and text compares mixed |
+| **TOKKIND** | **≈40.1** | **≈2.65%** |
+| *(excluded)* `keywordKind` | 1.8 | compares IDENT TEXT to keyword spellings — an enumeration changes what it RETURNS; it cannot remove the compare |
+| *(excluded)* `scanQuoted` | 0.9 | `__str_concat__`, escape decoding |
+
+**2.47% → 2.65%: the class held, and the brief's refutation branch does not open.** Not because
+nothing happened to it — #1314's own A/B moved it 40.9 → 31.0 samples/run — but because #1314
+and #1315 removed SYMBOL-class cost, so TOKKIND kept its share of a smaller pie.
+
+### 10.2 The census — 570 sites, and two thirds of them in one file
+
+Every occurrence of a token-kind literal, over the 66-element vocabulary extracted from
+`keywordKind`/`oneCharKind`/`twoCharKind`/`threeCharKind`/`mkTok`, by file and by role:
+
+| file | total | `==`/`!=` | helper ARG (`expect("X")`, `accept("X")`) | `mkTok` | other |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `parser.vl` | **376** | 324 | 50 | 0 | 2 |
+| `lexer.vl` | 88 | 1 | 0 | 9 | 78 |
+| `driver.vl` | 76 | 76 | 0 | 0 | 0 |
+| `typecheck.vl` | 16 | 15 | 1 | 0 | 0 |
+| `format.vl` | 8 | 8 | 0 | 0 | 0 |
+| `fuzzgen.vl` / `ast.vl` / `check_query.vl` / `fmt_util.vl` / `lint.vl` | 6 | 3 | 1 | 0 | 2 |
+| **total** | **570** | 427 | 52 | 9 | 82 |
+
+Two corrections the census makes to the filing. **45 of `driver.vl`'s 76 are one COLD
+function** — `lexClsOf`, the LSP token classifier, at 0.00 samples on a self-compile. And
+`format.vl`/`lint.vl`/`fmt_util.vl`/`check_query.vl`, named in the filing as comparison sites,
+contribute **18 sites and zero self-compile samples** between them: `vl build` never formats.
+
+### 10.3 The three filed designs, and the fourth the measurement picked
+
+**(c) — intern the ~60 spellings through `compiler/symbols.vl` — is refuted by that file's own
+header.** `sidOf` is one `__str_hash__` plus one probe and pays only where the caller already
+holds the id (R3). A token kind is at most 18 characters and its `__str_eq__` usually fails on
+the length compare, so interning AT THE POINT OF USE is strictly a loss; interning INTO `Tok`
+is design (a) with a hash table where a constant would do.
+
+**(a) vs (b) — and the ranking is the opposite of the obvious one.** The natural reading is
+that (a) (an i32 `kindCode` ALONGSIDE `kind: string`) is the safe incremental option and (b)
+(replacing the field outright) is the risky big-bang. Measured, the safety runs the other way:
+
+```
+$ cat t1.vl
+const KC_A = 3
+function f(): i32 { KC_A }
+export function g(): i32 { const k = f() ; if k == "IDENT" { return 1 } ; 0 }
+$ vl check t1.vl
+[ERROR]: cannot compare i32 with string
+```
+
+Under **(b)** every one of the 570 sites that has not been converted is a hard type error: the
+checker is a COMPLETE ORACLE for the conversion and it cannot be silently half-done. Under
+**(a)** a missed site keeps comparing strings and still type-checks — the conversion is partial
+and the only signal is a profile that under-delivers. That is
+`vl-classifier-taught-half-a-set` with the checker offering to prevent it, and it is the single
+thing that would make a 570-site rewrite tractable. **If the enumeration is ever taken, it is
+(b).**
+
+**(d) — the one the measurement chose: do not enumerate the vocabulary; make the COMPARE an
+identity compare.** VL's `string` is `(array (mut i32))`, hence an `eqref`; and every distinct
+string LITERAL in a program is interned as ONE immutable module global by the string-literal
+pool (`emit_state.vl`'s `gStrPoolTexts`/`gStrPoolIx`, consumed by `emitStr`). So `tok.kind` on
+an `IDENT` token and the literal `"IDENT"` in `parser.vl` are **the same object**, and
+`__str_eq__` was walking five code points to discover it. A `ref.eq` short-circuit at the top of
+the helper is **eight lines of `emit_sections.vl` and twelve bytes of emitted wasm** — and it is
+not specific to token kinds at all: it fires wherever a value that came from a pooled literal is
+compared against that literal.
+
+### 10.4 What shipped
+
+1. **`__str_eq__` opens with `ref.eq`** (`emit_sections.vl`). A pure short-circuit: same
+   reference ⇒ equal, always; distinct references fall through to the existing walk. The null
+   corner (`ref.eq(null, null)` would answer 1 where the old body trapped in `array.len`) is
+   unreachable, and that was MEASURED rather than argued — a `string | null` operand is
+   unwrapped BEFORE the call, so two null strings compared with `==` trap at the same address
+   under both compilers instead of printing `EQ`.
+2. **`binPrec` dispatches on the first character** (`parser.vl`) — §8.2 item 5's `keywordKind`
+   recipe applied to the other closed vocabulary in the parser. The expression climber asks
+   `binPrec` of every token that could follow an operand and the usual answer is `0`, which the
+   `==` ladder charged **25 `__str_eq__` CALLS** to reach. Buckets hold at most six members and
+   keep FULL string compares inside, because `(first char, length)` is not a unique key over
+   this vocabulary — `STAREQ`/`STRING` both hash to (S,6) — and a cheaper in-bucket test would
+   be exactly the identity COLLISION §8.4 records as invisible to every standing instrument.
+   The dispatch narrows; it never decides.
+3. **`tokenize`'s three no-match sentinel tests read `.length != 0`** (`lexer.vl`) instead of
+   `!= ""` — three `__str_eq__` CALLS per token, ~all misses, to ask what `array.len` answers
+   inline.
+
+A static differential oracle checks (2): it extracts the `kind -> precedence` MAP from the old
+body (`git show HEAD`) and from the new one and compares them as maps, and separately proves
+every arm sits in the bucket its own first character selects. **25 arms both sides, zero
+precedence disagreements, zero mis-bucketed arms.**
+
+New standing case: `tests/cases/operators/precedence-ladder.vl` — every rung of the binding
+ladder pinned so that a DROPPED arm (which answers `0` and silently truncates the expression)
+or a MIS-BUCKETED one (which re-associates it) prints a different number. Neither failure mode
+is a crash, and neither shows up in a fixpoint: a compiler that mis-parses `a - b * c` still
+reproduces itself if it mis-parses its own source the same way twice.
+
+Not shipped: the enumeration. §10.6 records what it is now worth and what it would cost.
+
+### 10.5 Measured
+
+**Guest profile, interleaved A/B/A/B, 14 runs per leg, same input both legs, `.cwasm` warm,
+24-core box at load 0.4.** Absolute samples PER RUN, because a share of a shrinking pie is not
+a saving.
+
+| | A (master) | B (branch) | |
+| --- | ---: | ---: | ---: |
+| `__str_eq__` | 424.2 | 345.1 | **−18.6%** |
+| all string primitives | 514.2 | 437.1 | **−15.0%** |
+| — reached from `lexer.vl` | 9.9 | 3.9 | **−60.6%** |
+| — reached from `parser.vl` | 27.1 | 16.9 | **−37.6%** |
+| — reached from `emit_rep.vl` | 50.4 | 31.5 | −37.5% |
+| — reached from `driver.vl` | 63.9 | 51.9 | −18.8% |
+| — reached from `typecheck.vl` | 126.1 | 110.6 | −12.3% |
+| **all samples** | **1,511.0** | **1,418.3** | **−6.1%** |
+
+Per converted site: `binPrec` **5.14 → 0.57 (−89%)**, `tokenize` **7.14 → 1.29 (−82%)**.
+
+**FOUR interleaved runs, because the spread matters more than any single one** (§9.5's lesson,
+and this session had a machine that kept falling over, so every run is reported with the box it
+ran on):
+
+| run | A /run | B /run | delta | box |
+| ---: | ---: | ---: | ---: | --- |
+| 1 | 1,491.9 | 1,428.9 | −4.2% | busy |
+| 2 | 1,511.0 | 1,418.3 | **−6.1%** | idle |
+| 3 | 1,597.1 | 1,542.0 | −3.4% | still settling (5-min load 20.8) |
+| 4 | 1,513.1 | 1,441.0 | −4.8% | idle |
+
+**Quote −4.8%, the median; the range is −3.4% to −6.1%.** Run 3's A leg is 1,597 samples/run
+against 1,492–1,513 for the others — the profiler's sample count scales with wall time, so that
+row is a slow box inflating both legs, and it is the least trustworthy of the four. The
+per-file deltas, by contrast, are stable across all four runs (`parser.vl` −36% to −38%,
+`lexer.vl` ≈−60%, `emit_rep.vl` −30% to −38%) and `__str_eq__` reads −12.0/−16.0/−16.9/−18.6%.
+**The structural deltas are the robust measurement; the whole-compile percentage is the noisy
+one.**
+
+**The attribution between `ref.eq` and the two TOKKIND rewrites, by two independent
+instruments.** A separate interleaved A/B of the `ref.eq` change ALONE reads **−4.1%** against
+master (12 runs/leg), and an interleaved A/B of ref.eq-only against all-three isolates the two
+rewrites at **−0.7% / −10.7 samples per run** (12 runs/leg). The per-consumer deltas in the
+headline run agree to within a third of a sample: `binPrec` −4.57 plus `tokenize` −5.85 =
+**−10.4 samples/run of the total −92.7**. So **`ref.eq` is ~89% of the win and the two
+TOKKIND-specific rewrites are ~11%** — and that is the finding, not a footnote: the class was
+real, and the cheapest thing that moved it was not aimed at it.
+
+The three percentages do NOT sum (−4.1 and −0.7 against a −4.8% median); they are separate runs
+at different box loads. **Quote the direct master-vs-branch interleaved profile.**
+
+**Wall clock, interleaved min-of-21, `.cwasm` warm — run TWICE:**
+
+| channel | run 1 A → B | | run 2 A → B | |
+| --- | ---: | ---: | ---: | ---: |
+| **`vl build compiler/entry.vl`** | 1,279 → 1,226 ms | **−4.14%** | 1,353 → 1,297 ms | **−4.14%** |
+| `vl check compiler/entry.vl` (graph) | 787 → 744 ms | −5.46% | 815 → 781 ms | −4.17% |
+| `vl check compiler/typecheck.vl` | 189 → 181 ms | −4.23% | 202 → 188 ms | −6.93% |
+| `vl fmt --check compiler` | 433 → 405 ms | −6.47% | 440 → 430 ms | −2.27% |
+| `vl check` of a one-line file (the floor) | 5 → 5 ms | **+0.00%** | 5 → 5 ms | **+0.00%** |
+
+The two runs agree on the headline channel to the second decimal (−4.14% both times) and the
+floor reads exactly zero both times, which is the control behaving.
+
+**There is no structurally-flat control for this change and that is worth stating plainly.**
+Unlike §8 and §9, whose conversions were emit-path only, `ref.eq` is whole-program: every
+channel that compares strings SHOULD move, and all four do, in the same direction and by
+roughly the profile's margin. The only channel that cannot move is the seed-load floor, and it
+reads exactly zero. Where §9.5 had to discount a `+2.6%` control, here the flat channel is flat
+and the moving channels agree with the profile.
+
+**Byte delta:** 1,113,727 → **1,113,946 (+219)**. Note the compiler needs THREE compiles to
+reach its fixpoint on this branch rather than the usual one, because `build/vl-compiler.wasm`'s
+own `__str_eq__` is emitted by whatever compiler built it: the seed emits a stage-1 without the
+fast path, and stage-1 emits a stage-2 with it.
+
+**And the same twelve bytes, confirmed across the corpus.** 937 of the 1,715 corpus files emit
+`__str_eq__` at all; every one of those 937 differs by **exactly +12 bytes** and the other 778
+are byte-identical. Nothing else in the emitter moved.
+
+### 10.6 What did NOT ship — the enumeration, re-sized
+
+After this branch the TOKKIND residue is `parser.vl` 16.9 + `lexer.vl` 3.9 = **20.8 samples/run
+= 1.47%**, plus `modScan`'s kind-compare share of 7.0. An enumeration would take most of it —
+call it **1.5–1.9% of a self-compile for ~570 sites across 7 files**, 376 of them in
+`parser.vl`.
+
+Three things a future slice should not have to re-derive:
+
+1. **It is design (b), not (a)** — §10.3. Replacing `kind: string` with an i32 makes `vl check`
+   a complete conversion oracle; adding a field alongside it does not, and a half-converted
+   parser reads as a disappointing profile rather than an error.
+2. **The renderer is small.** There are **47 `.kind` READS** in all of `compiler/*.vl` and NO
+   host or test reader — `tok.kind` never crosses the wasm boundary. A `tokKindName(code)`
+   consumed by `kindDesc`/`foundDesc` covers the whole rendering surface.
+3. **Mint the string FROM the code; never mint both at the producer.** If `mkTok` takes the code
+   and sets `kind: tokKindName(code)`, a two-kinds-one-code collision cannot make the two
+   disagree — and it becomes VISIBLE, because the rendered spelling in an `expected …` message
+   changes and the corpus's CHECKMSG channel reddens. Minting them independently is the silent
+   version, and silent identity collisions are the class §8.4 and §9.6 both had to learn twice.
+
+Also filed, unfixed and now sized: `driver.vl`'s `modScan` (7.0 samples/run after this branch)
+re-scans each module's token stream for imports/exports with kind and text compares mixed, and
+`coalesceMixOp` (1.1) compares operator LEXEMES against `"&&"`/`"||"`/`"??"` — a second closed
+vocabulary, never enumerated, small.
+
+### 10.7 The poisons — and the CONTROL that proves the column measures the code
+
+Seven poisons, each compiled into a real compiler from the freshly restored good seed and run
+through the ladder and the whole suite. §9.6.1's correction is obeyed literally: **the good seed
+is restored before every row** — and checked, not assumed, because an interrupted sweep left
+both `emit_sections.vl` and `build/vl-compiler.wasm` carrying P2's residue exactly as that
+finding predicts — and a **provably-unreachable poison is included as a control** so the column
+can be shown to go quiet.
+
+Two notes on reading the ladder column. An emitter-shape poison changes the emitted
+`__str_eq__`, so stage1 ≠ stage2 for BYTE reasons alone; the honest question is whether the
+sequence CONVERGES, so the column reports **stage2 == stage3**, which is what
+`refresh-compiler.sh --prove-fixpoint` actually asks. The clean branch converges in three
+compiles for exactly the same reason.
+
+The WITNESS column runs five named cases DIRECTLY against the poisoned compiler, one `vl`
+process at a time, and diffs rc+stdout against the good one. It replaced "run the 3,612-case
+suite" for two reasons, and the second is §10.7.1's own story: the suite's answer to "which
+instrument reddens" is a NUMBER when the ledger wants a NAME, and `deno test --parallel` fans
+out a `vl` child per case, which against a poisoned compiler under the NULL collector is a bomb.
+The suite still runs, but only where the LADDER HOLDS — i.e. where the poison produced a working
+compiler and a pass/fail count means something.
+
+| poison | self-compile | ladder | witnesses (of 5) | suite | the NAMED witness |
+| --- | --- | --- | --- | --- | --- |
+| **P0ctl — CONTROL, `binPrec`'s length guard `< 2` → `< 1`** | rc 0, 1,113,946 | **HOLDS** | **0 RED** | **3,612 / 0 failed / 7 ignored** | **— every column quiet, as it must be** |
+| **P1inv — the `ref.eq` fast path INVERTED** (identical refs fall through, DIFFERENT refs answer 1) | rc 0, 1,113,953 | **BROKEN** | **5 RED** | skipped | everything |
+| **P2zero — the fast path answers 0** (a string is unequal to ITSELF) | rc 0, 1,113,946 | **BROKEN** | **5 RED** | skipped | everything |
+| **P3drop — `binPrec` DROPS the `PERCENT` arm** | rc 0, 1,113,932 | **BROKEN** — stage2 cannot compile the compiler | **2 RED** | skipped | **`operators/precedence-ladder.vl`** + `arith/ops.vl` |
+| **P4bucket — `USHR` MIS-BUCKETED under `S`** (so `>>>` answers 0) | rc 0, 1,113,934 | **BROKEN** — stage2 cannot compile the compiler | **2 RED** | skipped | **`operators/precedence-ladder.vl`** + `bitwise/shifts.vl` |
+| **P5prec — `PERCENT` returns the WRONG binding power** (10, not 11) | rc 0, 1,113,946 | **HOLDS — a fixpoint of itself** | **1 RED** | **2 failed** | **`operators/precedence-ladder.vl` — AND NOTHING ELSE IN THE GATE** |
+| **P6len — the lexer's no-match sentinel always says "matched"** | rc 0, 1,113,946 | **BROKEN** — stage2 cannot compile the compiler | **5 RED** | skipped | everything |
+
+**P5prec is the row this PR's test case exists for, and it is the §8.4 shape again.** It builds
+a compiler that self-compiles at rc 0 and **IS A FIXPOINT OF ITSELF** (stage2 == stage3, same
+1,113,946 bytes as the clean branch), mis-associating `a - b % c` the whole time — because a
+compiler that mis-parses its own source the same way twice still reproduces itself. Its only
+trace anywhere in the standing gate is the two failures of
+`tests/cases/operators/precedence-ladder.vl` (once per harness). `bitwise/precedence.vl`,
+`bitwise/shifts.vl`, `arith/ops.vl` and `strings/basics.vl` all read `same`. **Without the case
+this PR adds, P5prec ships green.**
+
+The witness column also separates the three parser poisons, which a count could not:
+`precedence-ladder.vl` is the only case that reddens for all of P3drop, P4bucket and P5prec;
+`bitwise/precedence.vl` reddens for none of them.
+
+### 10.7.1 The harness finding — and the control is what produced it
+
+The suite column melted this machine repeatedly: `deno test` went 2.5 GB → 27.4 GB in under
+twenty seconds, and on a later attempt the box fell from 15 GB available to 1.3 GB in five
+seconds at load 149 with **no single process over 8.5 GB** — death by AGGREGATE. Two guards were
+built for it. The first, a 10 GB per-process cap, never fired. The second watched
+`MemAvailable`, fired correctly, and then reported **OOM in four consecutive rows** — including
+two whose `cp` had silently failed so they were running the GOOD compiler, and one whose ladder
+had CONVERGED.
+
+**A column that reads the same in every row is a claim about the harness** (§9.6.1 finding 3,
+third recording), and the provably-unreachable control settled it: P0ctl produces a compiler
+whose ladder converges and whose five witnesses all read `same`, and its suite run STILL melted
+the box from a quiesced start. The poison could not be the cause.
+
+**The cause is the `.cwasm` sidecar.** Every row `cp`s a new `build/vl-compiler.wasm`, which
+invalidates its 10 MB compiled sidecar; then 24 `deno test` workers each Cranelift-compile the
+same 1.1 MB WasmGC module simultaneously. The same suite against a warm sidecar finishes in
+**four seconds at rc 0**. One serial `vl check tiny.vl` after the `cp` — about two seconds —
+removes the hazard entirely, and P0ctl's suite then read a clean 3,612/0/7.
+
+Three things to carry forward:
+
+1. **Warm the sidecar serially after any write to `build/vl-compiler.wasm`, before any parallel
+   consumer.** This is a property of the harness, not of this branch.
+2. **A poisoned compiler is a memory hazard, not just a failing one.** `vl` runs the compile
+   engine under the NULL collector, so a poison that damages a length or a loop bound becomes
+   unbounded allocation. Restoring the good seed between rows is a SAFETY INTERLOCK; two crashes
+   in this session left `emit_sections.vl` and `build/vl-compiler.wasm` poisoned, and every row
+   after that measured the residue.
+3. **The earlier "1 failed"/"2 failed" readings on the control were harness artifacts too** —
+   the load-induced `glob match took …ms` and `--jobs 4 … ratio 0.75` timing tests that §9.6's
+   footnote † had to characterise away. With a warm sidecar they do not fire at all. That
+   footnote can be retired for this class of run rather than re-applied.
+
+### 10.8 Gate
+
+Every rc read BARE (a pipe reports `tail`'s status, not the command's).
+
+| gate | result |
+| --- | --- |
+| `rm -f build/vl-compiler.wasm* && scripts/fetch-seed.sh` | **1,113,727 bytes** (`fb31405d`) |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | rc 0 — fixpoint in **3 compiles** at **1,113,946** |
+| `scripts/native-fixpoint.sh` | rc 0 — **stage3 == stage4** at 1,113,946 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **3,612 passed / 0 failed / 7 ignored** (master's 3,610 + 2: the new case × two harnesses); ignored SET md5 `a4295be3bf18e7367d730e02a02d3b43` — **identical to master's** |
+| `scripts/lint-self.sh` | rc 0, clean |
+| `scripts/rep-fuzz-check.sh` | rc 0, exact (1 baselined, 0 new, 0 stale) |
+| **six-channel corpus A/B** vs the master-built compiler | **1,715 files.** Fields 1/2/3/6 (CHECKRC, CHECKMSG, BUILDRC, **RUN**) **all `same`**. Fields 4/5 differ on **937** rows — every one by **exactly +12 bytes**, the emitted `__str_eq__` prologue; the other 778 emit no `__str_eq__` and are byte-identical. BUILDMSG moves with BYTES because `vl build` echoes the size. |
+| **fuzz A/B**, 14 seeds × 3 depths × 2 modes × 300 | **50,400 programs per leg, 0 divergences** |
+| **the fixpoint needs 3 compiles, not 1** | expected and explained: `build/vl-compiler.wasm`'s own `__str_eq__` is emitted by whatever compiler built it, so the seed emits a stage-1 without the fast path and stage-1 emits a stage-2 with it. The control confirms it — master source under the master seed is a ONE-step fixpoint. |
+
+**Seed-bootstrap: NO SPLIT.** The freshly fetched `seed-latest` (1,113,727, i.e. `fb31405d`)
+compiles this branch's source directly; `ref.eq` is an opcode the emitter already writes
+elsewhere (`wasmEmit.vl`'s closure equality) and nothing here is new language surface.
