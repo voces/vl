@@ -1137,7 +1137,7 @@ is in the design's §6.6; the one that matters here:
 `nameNamesFunction`'s set on `name[0]` — so `q` and `qq` share an entry, and so does every
 other pair sharing a first character — produced a compiler that **self-compiles (rc 0), IS A
 FIXPOINT OF ITSELF** (so `native-fixpoint.sh`'s stage3 == stage4 passes), diffs **ZERO of
-1,713 corpus files on all six channels**, and passes **all 3,610 tests**. Its only trace was
+1,713 corpus files on all six channels**, and passed **all 3,608 tests the suite then had**. Its only trace was
 that the compiler it builds is 14 bytes different from the good one — which nothing compares,
 because on a branch the compiler is supposed to change.
 

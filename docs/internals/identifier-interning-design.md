@@ -521,9 +521,9 @@ magnitude outside that drift.)
 Six poisons, each built into a real compiler and run through the whole standing gate. The
 column that matters is not "did it redden" but **which instrument reddened**.
 
-| poison | self-compile | own fixpoint | corpus A/B (6 fields × 1,713) | suite (3,610) |
+| poison | self-compile | own fixpoint | corpus A/B (6 fields × 1,713) | suite |
 | --- | --- | --- | --- | --- |
-| **P1 COLLISION** — `nameNamesFunction`'s set keyed on `name[0]`, so `q` and `qq` share an entry | **rc 0** | **holds** | **0 diffs** | **0 failed** |
+| **P1 COLLISION** — `nameNamesFunction`'s set keyed on `name[0]`, so `q` and `qq` share an entry | **rc 0** | **holds** | **0 diffs** | **0 failed of 3,608** — then **2 failed** once the new case below existed |
 | P2 — delete the `noteFuncName` notification | rc 0 | holds | — | **0 failed** |
 | P3 — `keywordKind` drops `is` (one bucket arm) | **rc 1** | — | — | **791 failed** |
 | P4a — the `retCapturedMapShape` pre-gate as `> 0` instead of `>= 0` | rc 0 | holds | — | 0 failed (compiler bytes DO differ) |
@@ -535,7 +535,7 @@ column that matters is not "did it redden" but **which instrument reddened**.
 failure mode this whole arc has to be safe against, and **every standing instrument was blind
 to it**: the poisoned compiler compiles itself, IS A FIXPOINT OF ITSELF (so
 `native-fixpoint.sh`'s stage3 == stage4 passes), produces byte-identical output for all 1,713
-corpus files on all six channels, and passes all 3,610 tests. The only trace it left was that
+corpus files on all six channels, and passed all 3,608 tests the suite then had. The only trace it left was that
 the compiler it builds from the compiler's own source is 14 bytes different from the good
 one — which no gate compares, because on a branch the compiler is *supposed* to change.
 
