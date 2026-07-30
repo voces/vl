@@ -364,7 +364,8 @@ self-compile unless stated.
 
 | # | item | expected | cost | risk | how it is measured |
 | --- | --- | --- | --- | --- | --- |
-| 1 | ~~**Bulk host↔guest staging**~~ — **SHIPPED, §6.** `srcLoad`/`modKeyLoad`/`modSrcLoad`/`cliResultLoad` + the memory the emitter exports; the host's batched path activates itself | predicted −4.6% self (`modSrcPush`); **got** `modSrcPush` 4.74 → 0.00 self, `modSrcLoad` 2.23 self, and the host's staging phase 192 → 135 ms | one host LINE (the memory probe) + 4 compiler-side exports; the fallback was already written | low — old seeds fall back, no seed split (**held**) | profile self-% of `modSrcPush` (target ≈0); the host's own `[profile] stage_program` phase; wall clock is too noisy alone |
+| 1 | ~~**Bulk host↔guest staging, IN**~~ — **SHIPPED, §6.** `srcLoad`/`modKeyLoad`/`modSrcLoad`/`cliResultLoad` + the memory the emitter exports; the host's batched path activates itself | predicted −4.6% self (`modSrcPush`); **got** `modSrcPush` 4.74 → 0.00 self, `modSrcLoad` 2.23 self, and the host's staging phase 192 → 135 ms | one host LINE (the memory probe) + 4 compiler-side exports; the fallback was already written | low — old seeds fall back, no seed split (**held**) | profile self-% of `modSrcPush` (target ≈0); the host's own `[profile] stage_program` phase; wall clock is too noisy alone |
+| 1b | ~~**…and OUT**~~ — **SHIPPED, §7.** `rbyteStore` (bytes, packed 4/word) + `cliCmdDataStore` (code points); the guest writes the same window and the host copies out | `[profile] readback` 17 → **1 ms**; `vl fmt compiler` 4,520,527 host calls → 290 and 520 → **453 ms** (−12.9%) | 2 compiler-side exports + 2 host structs; NO host probe change (`io_mem` was already there) | low — same 2×2 fallback, no seed split (**held**) | the `readback` phase; a `$VL_HOSTCOUNT` per-channel call counter; and the payload-free `vl fmt --check` as the control (run it to the same N) |
 | 2 | **Intern identifiers to i32 symbol IDs** | **19.10%** of self-compile time is `__str_eq__` under symbol/identifier consumers | large: touches scope slots, capture tables, module rename tables, field names, the string-keyed maps | medium-high — it is the checker's identity model | re-run §2's consumer split; the target is the SYMBOL row, and the TYPE row (6.08%) must not move |
 | 3 | **`nameNamesFunction`: index the arena once** | 4.71% self — it scans every node in `P.nodes` per call | small: a name set built in one arena pass, invalidated on arena growth | medium — it runs BEFORE `buildFnMap`, and emit-time monomorphization appends nodes; the invalidation is the whole correctness question | deterministic CALL + scan-step counts on two builds over the same input (a ~5% change is countable, and wall clock cannot resolve it); then profile self-% |
 | 4 | **`fnStmtsPosOf`: an index at the writers** | 4.82% self | medium — the function's own header states the honest fix is an index minted by `emit_mono`'s replacement writer, not a memo at the site | medium — a memo that caches the last answer is a silent miscompile the day a lower position holds a memoized node (the header says so) | same as #3; plus the corpus + fuzz A/B, since it is emit-path |
@@ -413,6 +414,17 @@ an editor would feel on a big project — and both are §3's items 2–4 territo
 `vl fmt` over the whole compiler tree at 559 ms is comfortably inside a save-hook
 budget.
 
+**§6 and §7 both move this table**, and in the same direction for the same reason
+— they pay in proportion to bytes crossing the boundary per unit of work, which is
+why `vl fmt` moves most and `vl check` barely at all. Re-measured on the same box
+after both (interleaved min-of-21, `.cwasm` warm, load 0.5): `vl fmt compiler`
+(whole tree, to stdout) **453 ms**, `vl fmt compiler/typecheck.vl` **99 ms**,
+`vl fmt --check compiler` 438 ms, `vl check compiler/entry.vl` 814 ms,
+`vl check compiler/typecheck.vl` 199 ms, `vl check tiny.vl` 4 ms, and the
+self-compile 1,566 ms. These are a quieter box than the 559/231/969/1,950 row
+above, so read the A-vs-B columns in §7.3 rather than differencing across
+sections.
+
 **COLD vs WARM, measured — and the "~10×" I first wrote is wrong for the case that
 matters.** Deleting `build/vl-compiler.wasm.cwasm` and re-running the same command:
 
@@ -447,6 +459,11 @@ for a one-function file.
 | §6's staging cut | `VL_PROFILE=1 vl build compiler/entry.vl --compiler <seed>` and read the `[profile] stage_program` line; interleave the two seeds, min of 9, state the load |
 | §6's fallback matrix | the same phase timer across the 2×2 of {old,new} host × {old,new} seed — exactly one cell is fast, and all four outputs `md5` equal |
 | §6's V8 leg | `node` a fresh `WebAssembly.Instance` and stage the same 4.57 M code points twice: `modSrcPush` per point vs `new Int32Array(memory.buffer)` + `modSrcLoad` |
+| §7's per-channel OUT costs | compile a throwaway `vl` with an `AtomicU64` per channel bumped at each `<name>At` call site and dumped under `$VL_HOSTCOUNT`; drive `vl build compiler/entry.vl`, `vl fmt compiler`, `vl fmt <one file>`, `vl check`, `vl check --json`, `vl test`, and a build with 300 type errors |
+| §7's read-back cut | `VL_PROFILE=1 vl build compiler/entry.vl --compiler <seed>` and read `[profile] readback`; interleave the two seeds, min of 11 |
+| §7's `vl fmt` cut | interleaved min-of-15 wall clock of `vl fmt compiler` on both seeds — and `vl fmt --check compiler` at min-of-**21** as the payload-free control (it reads a false +2.4% at min-of-9) |
+| §7's fallback matrix | the same `readback` phase across {old,new} host × {old,new} seed — exactly one cell is 1 ms, all four md5s equal; plus a Node harness that prints `rbyteStore NOT EXPORTED` for the master seed |
+| §7's "the corpus cannot see the string channel" | run sabotage B (`cliCmdDataStore` drops one code point at a 16,384 seam) as the corpus A/B's B leg: **0 diffs over 1,712 files × 6 fields**, while `tests/selfhost_native_bulk_readback_test.ts` names the chunk size |
 
 ---
 
@@ -509,10 +526,12 @@ one failed lookup per channel at startup.
 
 **Not converted, and why.** `cliArgPush` (argv) and `cliDirNamePush` (one directory
 entry) carry tens of code points, not millions — 0.00% of every profile. The
-OUTPUT direction is a separate item and is untouched here: `rbyteAt` is still one
-host call per emitted byte (0.90–0.96% self, `[profile] readback: 19–30 ms`), and
-so are `cliCmdDataAt` / `cliCmdPathAt` / `modPendingAt`. They want the mirror-image
-mechanism (guest writes the memory, host reads it) and a separate measurement.
+OUTPUT direction was left as a separate item and is untouched *here*: `rbyteAt` is
+still one host call per emitted byte at this point (0.90–0.96% self,
+`[profile] readback: 19–30 ms`), and so are `cliCmdDataAt` / `cliCmdPathAt` /
+`modPendingAt`. **§7 is that mirror** (guest writes the memory, host reads it), and
+its own measurement found the ranking here was incomplete: `cliCmdDataAt` is the
+bigger of the two, at 4.52 M calls for `vl fmt compiler`.
 
 ### 6.3 Measured
 
@@ -709,3 +728,296 @@ fixpoint ladder, and nothing else that runs by default — which is why
 `tests/selfhost_native_bulk_intake_test.ts` now exists. It reaches the seam with a
 generated payload instead of a fixture, in 80 ms instead of a ladder, and it names
 the size at which the intake diverged.
+
+---
+
+## 7. Item 1's mirror — bulk result read-back over linear memory
+
+§6 made the compiler's string INPUT cross the host boundary in bulk and left the
+OUT direction open on purpose. This section closes it. `compiler/driver.vl`'s
+`rbyteStore` header owns the protocol; this is the measurement and the ABI record.
+
+### 7.1 The cost, re-derived per channel
+
+The guest profiler cannot see a trampoline (§6.1, method note 16), so the OUT
+direction was measured two ways instead: the host's own `[profile] readback`
+phase, and a **per-channel host-call counter** compiled into a throwaway `vl`
+(one `AtomicU64` per channel, incremented at every `<name>At` / `<name>Push` call
+site, dumped at exit under `$VL_HOSTCOUNT`). Master host, master seed, `.cwasm`
+warm. Every OUT channel the host has, and what each actually moves:
+
+| OUT channel | export pair | worst driver measured | calls | ms |
+| --- | --- | --- | ---: | ---: |
+| emitted wasm bytes | `rbyteLen`/`rbyteAt` | `vl build compiler/entry.vl` | **1,112,716** | **19** |
+| CLI payload out | `cliCmdDataLen`/`cliCmdDataAt` | `vl fmt compiler` (whole tree to stdout) | **4,520,527** | **87** |
+| CLI payload out | " | `vl fmt compiler/typecheck.vl` (one 22 K-line file) | 1,010,306 | 20 |
+| CLI payload out | " | `vl check compiler/entry.vl` (hints + summary) | 16,752 | 0 |
+| CLI payload out | " | `vl check --json compiler/entry.vl` | 15,883 | 0 |
+| test module bytes | `rbyteLen`/`rbyteAt` | `vl test` (4 fixture files) | 19,800 | 0 |
+| diagnostics | `diagMsgLen`/`diagMsgAt` | a build with **300** type errors | 9,790 | 0 |
+| CLI path out | `cliCmdPathLen`/`cliCmdPathAt` | `vl check compiler/entry.vl` | 545 | 0 |
+| pending module keys | `modPendingLen`/`modPendingAt` | self-compile | 511 | 0 |
+| module key table | `modKeyAtLen`/`modKeyAtCharAt` | a multi-module diagnostic | ~500 | 0 |
+| test names / failure text | `vltNameAt`/`vltFailAt` | `vl test` | ~150 | 0 |
+
+**Two channels are the item and the other nine are not**, and the ordering is not
+the one the filing predicted. `rbyteAt` was named as "the certain one" and it is
+real — but the BIGGER OUT channel is `cliCmdData`, which nothing had named:
+`vl fmt` over the compiler tree pushes 4.52 M code points out one call at a time,
+almost exactly mirroring §6's 4.57 M coming in. **The lesson generalises past this
+item: enumerate and COUNT the whole family before picking a member.** The brief
+named one channel and guessed at a second; the counter found the ranking was
+neither. **Diagnostics were named as a
+candidate and measured out**: 300 diagnostics — far more than any real run — are
+9,790 calls and under a millisecond. They stay per-call.
+
+### 7.2 What shipped
+
+Two exports, two shapes, no new language surface:
+
+| export | accumulator | element | chunk | who reads it |
+| --- | --- | --- | ---: | --- |
+| `rbyteStore(off, count)` | `W.bytes` | a BYTE, packed 4 per i32 word | 65,536 | `vl build` / `run` / `test` (CMD_TEST_STASH) |
+| `cliCmdDataStore(off, count)` | `cliCmdData` | a code point, UTF-32LE | 16,384 | the CLI pump: `vl fmt` stdout + write, every `vl check` line, `--json` |
+
+Each writes `min(count, len - off)` elements at **byte 0 of the module's linear
+memory** — the same staging window `srcLoad` reads from, owned by the protocol and
+used for nothing else — and returns the count written. The host copies that range
+out in ONE `Memory::data` slice and asks again from `off + written`.
+
+**The byte channel packs and the string channel does not.** The intake's element
+IS an i32 code point, so it had no choice; here the element is a byte, and packing
+makes the host's copy a `memcpy` of exactly the bytes it wants instead of a strided
+gather — and it quadruples the chunk to a whole page, so a self-compile reads back
+in **17** calls rather than 68. The packing tail (`count % 4 != 0`) is assembled
+high-byte-first into one final word whose START is the largest multiple of 4 below
+`count`, hence at most `cap - 4`: the 1–3 padding bytes it also writes always land
+inside the window.
+
+**A `Store` that returns 0, a negative, or more than it was asked for FAILS the
+read.** It is deliberately not "fall back and carry on": re-asking from the same
+offset is an infinite loop, and §6.7 finding 3 is that a hang is a witness that
+breaks every comparator downstream of it.
+
+**No host-side probe change was needed this time.** §6 widened `StrIn::probe` to
+look for `memory` after `ioMem`; that lookup is now a shared `io_mem()` helper and
+the two new structs (`BytesOut`, `StrOut`) use it unchanged. The §6 lesson —
+*check whether a plan's compiler-side step is EXPRESSIBLE before banking "no host
+change"* — was applied in advance here: `__store_i32__` is one of the fifteen
+lowered memory builtins (`memory-gc-design.md` §1.2), so the guest half was
+expressible as written.
+
+**Not converted, and why.** Everything in §7.1's table below the two shipped rows.
+`cliCmdPath` is the interesting one: it is on the SAME `StrOut` type as
+`cliCmdData` and could have a `Store` for eight lines, and it deliberately does
+not. It carries one path, and leaving it per-code-point keeps the host's presence
+probe exercised **in production on every `vl check`** rather than only against an
+old seed. The JS consumers (`lsp/src/wasmChecker.ts`, `tests/cases_wasm_test.ts`)
+are left alone for the reason §6 left the deno harness alone, now with a number:
+see §7.4.
+
+### 7.3 Measured
+
+**Host phase timer, interleaved min-of-15, `.cwasm` warm, 24-core box at load
+0.9** (A = the master-built compiler, B = the branch-built one, same host):
+
+| phase | A (master seed) | B (branch seed) |
+| --- | ---: | ---: |
+| `readback` | **17 ms** | **1 ms** (−94%) |
+| `stage_program` | 126 ms | 127 ms (control — §6's channel, untouched) |
+| `compile.call` | 1,415 ms | 1,419 ms (control — inside the guest, untouched) |
+| whole `vl build` | 1,592 ms | 1,578 ms |
+
+(The same A/B at load 1.7–1.8 read `readback` 17/1, `stage_program` 133/132,
+`compile.call` 1,479/1,496, whole build 1,674/1,669 — the DELTA is stable, the
+absolutes are not, exactly as §6.3 found.)
+
+**Host-call counts on the same two seeds** (the `$VL_HOSTCOUNT` instrument again,
+this time compiled into the branch host so both sides use one instrument):
+
+| task | A: per-element calls | B: bulk calls |
+| --- | ---: | ---: |
+| `vl build compiler/entry.vl` | 1,113,241 | **17** (+1 `rbyteLen`) |
+| `vl fmt compiler` | 4,525,102 | **290** (+536 un-bulked `cliCmdPath`) |
+| `vl fmt compiler/typecheck.vl` | 1,010,348 | **62** |
+| `vl check compiler/entry.vl` | 17,297 | **85** (+545 `cliCmdPath`) |
+| `vl test` (4 fixtures) | 20,500 | **13** (+407 `cliCmdPath`) |
+
+**Tools, interleaved min-of-21, same box and load** (wall clock, `.cwasm` warm):
+
+| task | A | B | |
+| --- | ---: | ---: | ---: |
+| `vl fmt compiler` (4.52 M code points out) | 520 ms | **453 ms** | **−12.9%** |
+| `vl fmt compiler/typecheck.vl` (1.01 M) | 113 ms | **99 ms** | **−12.4%** |
+| `vl build compiler/entry.vl` (self-compile) | 1,596 ms | 1,566 ms | −1.9% |
+| `vl check --json compiler/entry.vl` | 731 ms | 740 ms | +1.2% (noise; −0.7% at min-of-15) |
+| `vl check compiler/entry.vl` | 816 ms | 814 ms | −0.2% |
+| `vl check compiler/typecheck.vl` | 200 ms | 199 ms | −0.5% |
+| `vl fmt --check compiler` (**control** — no payload out) | 439 ms | 438 ms | −0.2% |
+| `vl check tiny.vl` (**control** — the load floor) | 4 ms | 4 ms | 0 |
+| `vl test tests/fixtures/vl-test-parallel` | 4 ms | 4 ms | 0 |
+
+**The controls needed min-of-21 to converge, and at min-of-9 and min-of-15 the
+payload-free `vl fmt --check compiler` read +1.5% and +2.4%.** Both were noise:
+at min-of-21 it is 439/438. A change that is supposed to move NOTHING on a channel
+is exactly where an unconverged minimum invents a regression — **run the control to
+the same N as the headline.** (`vl check --json`'s +1.2% is the same artefact with
+the sign flipped: it read −0.7% at min-of-15 and its OUT channel is 15,883 code
+points, three orders below the two that moved.)
+
+**The self-compile's wall clock is not the headline** (again): read-back is ~1% of
+it, and `compile.call`'s run-to-run spread is larger than the win. `vl fmt` is the
+headline because it is the tool whose output-bytes-per-unit-work ratio is highest
+— the exact mirror of §6, where `vl fmt` gained most for having the highest
+input-bytes-per-unit-work ratio.
+
+### 7.4 V8, and why the JS consumers keep the per-element path
+
+Same module, same instance, the read-back run both ways (min of 7):
+
+| leg | 1,113,241 bytes |
+| --- | ---: |
+| per-byte `rbyteAt` | 3.4 ms |
+| `rbyteStore` + `new Uint8Array(memory.buffer)` | **0.7 ms** (4.9×) |
+
+The ratio is bigger than wasmtime's, the absolute is not: **V8 reads back in 3.4 ms
+what wasmtime takes 19 ms to read**, so a JS→wasm call is ~3 ns against wasmtime's
+~17 ns. The LSP's own worst OUT case is `fmtByteAt` over the repo's largest file —
+1,010,306 calls, **4.93 ms in V8** — and its real workload is a user's file, two
+orders of magnitude smaller. The corpus harness's cases are tens of lines.
+**Converting them buys ~4 ms on a payload no editor produces**, so they stay, and
+the presence probe means they can be converted later without a seed split.
+
+**Peak RSS is unchanged** — the staging page already existed for §6, and the guest
+writes into it rather than allocating. **Byte delta:** the compiler is
+1,112,716 → **1,113,241 bytes (+525)**.
+
+### 7.5 What the ABI record says
+
+- `compiler/driver.vl` — `rbyteStore`'s header: the OUT protocol, why the byte
+  channel packs, the tail's in-window proof, and the "a bad return FAILS, it does
+  not retry" rule.
+- `compiler/cli.vl` — `cliCmdDataStore`'s header: the code-point variant, the
+  number that justified it, and why `cliCmdPath` has no twin.
+- `scripts/vl-host/src/main.rs` — `BytesOut` and `StrOut` headers (and `io_mem`,
+  now shared with `StrIn`).
+- `docs/internals/cli-design.md` — `cliCmdDataStore` in the exports block.
+- `docs/internals/memory-gc-design.md` §1.3 — the OUT bullets, now struck through
+  with their numbers.
+- `ROADMAP.md` Track B — both halves of "bulk host I/O", and the note that
+  wasmtime's `ArrayRef::new_from_i8_slice` would remove the element loop that
+  survives on BOTH sides — but only once strings are `(array i8)` (B7).
+
+### 7.6 Fallback compositions — proved, not assumed
+
+Both halves are probed independently, so all four compositions must work. Witness
+= `[profile] readback` (min of 5) + the md5 of the compiler each cell builds:
+
+| composition | `readback` | output md5 |
+| --- | ---: | --- |
+| old host + old seed | 18 ms | `3925d4d52573` |
+| old host + **new** seed | 19 ms | `3925d4d52573` |
+| **new** host + old seed | 18 ms | `3925d4d52573` |
+| **new** host + **new** seed | **1 ms** | `3925d4d52573` |
+
+**Exactly one cell takes the bulk path, and all four produce the byte-identical
+compiler** (also `cmp`-equal to the branch seed, so the fixpoint holds in every
+cell). A second, independent witness for the old-seed half: a Node harness prints
+`rbyteStore NOT EXPORTED by this module` for the master seed and reads it per byte.
+
+**Seed-bootstrap: no split.** The published `seed-latest` (1,112,716 bytes)
+compiles this branch's source directly — `__store_i32__` and the automatic memory
+export both long predate it.
+
+### 7.7 Integrity sabotages — and the instrument that was NOT load-bearing
+
+A bulk copy that drops, duplicates or mis-packs one element is a silently WRONG
+result, so both sabotages attack CONTENT, one per shipped channel.
+
+**Sabotage A — the BYTE channel, every chunk.** `rbyteStore` reports `count` to
+the host but writes one byte fewer, so the last byte of every chunk is stale.
+Characterised exactly: `cmp -l` of a 150-byte and an 1,863-byte module against the
+good compiler shows **one** differing byte each, both the LAST, both zeroed.
+
+| witness | reading |
+| --- | --- |
+| self-compile (fixpoint rung 1) | **rc 1** — `is not a valid WebAssembly module … unexpected end-of-file` |
+| `vl build` of a small corpus case | **rc 1** |
+| six-channel corpus A/B | **1,433 of 1,712 rows** differ — all on BUILDRC(0/1) + BUILDMSG |
+| — its BYTES channel (field 5) | **`1712 same`** |
+| — its RUN channel (field 6) | **`1711 same`** |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` (new suite held out) | **31 failed** |
+| `vl fmt --check compiler` / `vl check` | rc 0, clean (a different channel) |
+| `vl run` of anything | **rc 0, clean — see below** |
+| fuzz A/B, 300 programs | **identical findings — see below** |
+| the new readback suite | FAILS: `rbyteStore(0, 1) content differs from rbyteAt: expected [0], got [98]` |
+
+**Sabotage B — the CODE-POINT channel, at a FULL-CHUNK SEAM only.**
+`cliCmdDataStore` replaces the last code point of a 16,384-element chunk with its
+predecessor; fires only on a payload spanning more than one chunk.
+
+| witness | reading |
+| --- | --- |
+| self-compile (fixpoint rung 1) | **rc 0, GREEN** — the byte channel is untouched |
+| `vl check compiler/typecheck.vl` | rc 0, clean |
+| `vl fmt --check compiler` | **rc 0, GREEN** — `--check` never reads the payload out |
+| `vl fmt compiler`, content-compared | 2,731,700 differing bytes — but nothing standing does that compare |
+| **six-channel corpus A/B** | **ZERO diffs on all six fields, 1,712 files** |
+| fuzz A/B | identical findings |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` (new suite held out) | **2 failed** — both in `tests/vl_fmt_scale_test.ts` |
+| the new readback suite | FAILS: `cliCmdDataStore(0, 16384) content differs from cliCmdDataAt` |
+
+**Four findings worth more than the green run:**
+
+1. **`vl run` is BLIND to a corrupted byte read-back, and that is why the fuzz
+   channel is.** `vl run` compiles with `emit_names = true`, so the module's LAST
+   section is the wasm **name** custom section — and wasmtime parses a malformed
+   name section leniently and ignores it. Sabotage A zeroes exactly the last byte,
+   which under `--names` lands in that custom section. So `vl run -e 'print(6*7)'`
+   prints `42`, the corpus RUN field reads `1711 same`, and the fuzz harness (which
+   drives `vl run --batch`) returns the SAME findings from a compiler that cannot
+   produce a valid module. **The custom section is a shock absorber; `vl build`,
+   which does not ask for names, is the channel that sees it.** Do not reach for
+   `vl run` as the integrity witness of an emitted-bytes change.
+2. **The corpus BYTES channel (field 5) read `1712 same` under BOTH sabotages** —
+   the third time this exact blindness has been recorded, and the first on the OUT
+   direction. Field 5 only compares when both legs return 0, and a corrupted
+   read-back makes the leg return 1. For a read-back defect the live corpus
+   channels are BUILDRC/BUILDMSG, and only for the byte half.
+3. **The corpus is a total bystander for the CODE-POINT channel.** Sabotage B
+   produced **zero** diffs over 1,712 files × six fields, because `vl check` and
+   `vl build` only ever push a few hundred code points through `cliCmdData` — the
+   seam is 16,384. The fixpoint ladder is green too. The channel's only standing
+   witness turned out to be `tests/vl_fmt_scale_test.ts`, which formats a
+   ~3,500-line file and asserts **idempotence** — a test written for an O(n²)
+   regression, catching a linear-memory ABI defect by accident. That is one
+   accidental test standing between this channel and a silent `vl fmt -w` that
+   corrupts source files on disk, which is the whole argument for §7.8.
+4. **A sabotage has to be characterised, not assumed.** "Drop the last byte of
+   every chunk" was written as a per-chunk corruption; `cmp -l` says it lands on
+   exactly ONE byte of a sub-chunk module, and that byte is often inside a section
+   nobody validates. The witness table above is only meaningful because the
+   sabotage was measured before it was believed.
+
+### 7.8 The standing gate
+
+`tests/selfhost_native_bulk_readback_test.ts` — 7 tests, **142 ms** — is the OUT
+mirror of §6.6's intake suite and, per finding 3, the only instrument that names
+this defect class:
+
+- the ABI is exported at all (both `Store`s + the memory), and `cliCmdPathStore`
+  is asserted ABSENT so §7.2's deliberate omission cannot rot into an accident;
+- the window is a whole 64 KiB page (both chunk sizes derive from it);
+- bulk-out == per-element-out EXACTLY over an **(offset, count) matrix** — offsets
+  0/1/2/3/4/cap−1/cap/cap+1/2·cap/len−1/len × counts 0/1/2/3/4/5/7/8/cap−1/cap —
+  on payloads deliberately longer than two chunks, for both channels;
+- the whole module round-trips and still starts with `\0asm`;
+- astral code points survive the string channel as ONE element each (a host that
+  wrote UTF-16 units passes every ASCII assertion and fails this one);
+- the guest clamps at the end instead of over-reading.
+
+It reaches the seam without a fixture: the byte payload is a generated 60,000-char
+string literal (~180 KB emitted) and the code-point payload is the CLI pump driven
+to a `CMD_PRINT_OUT` of a generated 3,000-line file, both in-process. Both §7.7
+sabotages fail it, and it names the offset and the chunk size where a ladder says
+"parse error".

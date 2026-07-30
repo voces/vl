@@ -134,10 +134,12 @@ through. So:
 
 - **Source in:** ~~`srcPush(c: i32)` / `modSrcPush(c: i32)` — one host call per code
   point~~ — **FIXED**, see below.
-- **Module bytes out:** `rbyteAt(i: i32) -> i32` — **one host call per emitted byte**
-  (~1M for the compiler module). Still true.
+- **Module bytes out:** ~~`rbyteAt(i: i32) -> i32` — one host call per emitted byte
+  (~1M for the compiler module)~~ — **FIXED**, see below.
+- **CLI payloads out:** ~~`cliCmdDataAt(j)` — one host call per output code point;
+  `vl fmt compiler` moved 4.52M of them~~ — **FIXED**, see below.
 - **Every diagnostic string** crosses the same way, one code point per call. Still
-  true.
+  true, and deliberately so: 300 diagnostics are 9,790 calls and 0 ms (measured).
 
 `scripts/vl-host/src/main.rs` already documents the fix — a `<name>Reserve(n)`
 capacity hint plus an exported `ioMem` linear memory and `<name>Load(count)` bulk
@@ -156,9 +158,20 @@ then `memory`). No `Reserve` exists — VL has no list-capacity primitive.
 `[profile] stage_program` phase went 192 → 135 ms** (interleaved min-of-9), and
 peak RSS did not move (511.2 → 511.3 MB). The ~10% figure above was right and the
 residue is the element move, which **§2 constraint #10 makes irreducible** — there
-is no runtime memory→GC-array copy, so the guest still loops. The two remaining
-per-call channels are the OUT direction (`rbyteAt`, diagnostics), which want the
-mirror mechanism.
+is no runtime memory→GC-array copy, so the guest still loops.
+
+**The OUT half shipped too** (`perf-program.md` §7), as the exact mirror: the GUEST
+writes the staging window and the host copies out. `rbyteStore(off, count)` packs
+emitted BYTES four per i32 word (so a chunk is the whole 65,536-byte page) and
+`cliCmdDataStore(off, count)` writes CLI payload code points one per word.
+**Measured: a self-compile's read-back went 1,112,716 host calls → 17 and
+`[profile] readback` 17 → 1 ms; `vl fmt compiler` went 4,520,527 → 290 calls and
+545 → 486 ms wall.** Constraint #10 binds here as well — there is no GC-array→memory
+copy either, so the guest loops to write, and only the CALL is bought.
+The channels left per-call are the ones that MEASURED small: diagnostics
+(9,790 calls / 0 ms for 300 of them), `cliCmdPath`, `modPendingAt`, `modKeyAtCharAt`,
+and the JS-side consumers, where a call is ~3–5 ns rather than ~17 ns
+(`fmtByteAt` over the repo's largest file is 4.93 ms in V8).
 
 ## 2. What WasmGC structurally cannot do
 

@@ -447,6 +447,63 @@ export function compileSrc(): i32 {
 }
 export function rbyteLen(): i32 { W.bytes.length }
 export function rbyteAt(i: i32): i32 { W.bytes[i] }
+// ── BULK RESULT READ-BACK over linear memory — the OUT mirror of `srcLoad`
+// (`docs/internals/perf-program.md` §7) ───────────────────────────────────────
+//
+// `rbyteAt` above is ONE HOST CALL PER EMITTED BYTE: a self-compile hands back
+// 1,112,716 bytes one trampoline crossing at a time (`[profile] readback`, ~19 ms).
+// This is the same trade `srcLoad` makes in the other direction — the host writes
+// the staging window and the guest copies out; here the GUEST writes it and the
+// host copies out — so the protocol, the window and the fallback shape are
+// deliberately identical. Read `srcLoad`'s header first; only the differences are
+// restated here.
+//
+//   `rbyteStore(off, count) -> written`
+//     Writes `written` = min(count, rbyteLen() - off) bytes, starting at
+//     `W.bytes[off]`, PACKED FOUR PER i32 WORD (little-endian) into
+//     `ioMem[0 .. written)`. The host then copies that byte range out in one
+//     `Memory::data` slice and asks again from `off + written`. A return of 0 or
+//     more than `count` is a protocol violation and the host FAILS on it — never
+//     loops, because a re-request loop is a hang, and a hang is a witness that
+//     breaks every comparator (`perf-program.md` §6.7, finding 3).
+//
+// WHY PACKED, when the intake window is one code point per word: the intake's
+// element IS an i32 code point, so it has to be. Here the element is a BYTE, and
+// packing makes the host's copy a `memcpy` of exactly the bytes it wants instead
+// of a strided gather — and it quadruples the chunk to a whole 65,536-byte page,
+// so the self-compile's read-back is 17 calls instead of 68.
+//
+// The tail (`count % 4 != 0`) is assembled high-byte-first into one final word:
+// the word START is the largest multiple of 4 strictly below `count`, hence at
+// most `cap - 4`, so the 1-3 padding bytes it also writes always land INSIDE the
+// window. `W.bytes` elements are masked to 0..255 at the one append site
+// (`emit_bytes.vl`'s `curBuf.push(b & 0xff)`), so no masking is repeated here.
+export function rbyteStore(off: i32, count: i32): i32 {
+  const bs = W.bytes
+  const avail = bs.length - off
+  let n = count
+  if n > avail { n = avail }
+  if n < 0 { n = 0 }
+  let i = 0
+  while i + 4 <= n {
+    const b0 = bs[off + i]
+    const b1 = bs[off + i + 1]
+    const b2 = bs[off + i + 2]
+    const b3 = bs[off + i + 3]
+    __store_i32__(i, b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+    i = i + 4
+  }
+  if i < n {
+    let w = 0
+    let k = n - 1
+    while k >= i {
+      w = (w << 8) | bs[off + k]
+      k = k - 1
+    }
+    __store_i32__(i, w)
+  }
+  n
+}
 // `vl check`: parse + typecheck ONLY, no emit. 0 = ok; 1 = lex/parse; 2 = type.
 // Emit is `vl build`'s job — skipping it makes `check` faster on large inputs
 // (~60% of a full compile of the whole compiler is emit) AND avoids rejecting a

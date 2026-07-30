@@ -68,6 +68,7 @@ cliNext() -> i32           // a CMD_* code; advances the state machine
 // Payload of the CURRENT command (valid until the next cliNext()):
 cliCmdPathLen() / cliCmdPathAt(j)      // LIST_DIR / READ_FILE / WRITE_FILE path
 cliCmdDataLen() / cliCmdDataAt(j)      // WRITE_FILE / PRINT_* payload (code points)
+cliCmdDataStore(off, count) -> written // …and its BULK twin (see below)
 
 // Commit the host's result for the current command:
 cliDirEntryPush(namePush…, isDir: i32) // one entry of a LIST_DIR result
@@ -98,10 +99,33 @@ cliResultLoad(count: i32)   // append the `count` UTF-32LE code points the host
 
 The two are alternatives, not a sequence: the host uses `cliResultLoad` when the
 module exports it AND a memory, and falls back to `cliResultPush` per code point
-otherwise, so an old seed and an old host both keep working. Nothing else on this
-protocol is bulk — argv and directory entries are tens of code points, and the
-host-BOUND direction (`cliCmdDataAt` / `cliCmdPathAt`) is still one call per code
-point and is a separate item.
+otherwise, so an old seed and an old host both keep working.
+
+**The host-BOUND payload rides one too** (`perf-program.md` §7). `cliCmdData` is
+where a whole formatted file leaves the module — `vl fmt compiler` moved
+**4,520,527 code points, one host call each, 87 ms** — so alongside
+`cliCmdDataAt(j)` the driver exports
+
+```
+cliCmdDataStore(off: i32, count: i32) -> written
+                            // write `written` = min(count, cliCmdDataLen() - off)
+                            // UTF-32LE code points at byte 0 of the module's
+                            // exported linear memory, starting from `off`, and
+                            // return the count; `compiler/driver.vl`'s
+                            // `rbyteStore` header owns the OUT protocol
+```
+
+Same presence probe, same both-directions fallback, and the same window
+(`ioMem`, then `memory`) as the intake half — the host's `StrOut` chunks at
+`memory_size / 4` = 16,384 code points and copies each chunk out in one read. A
+return of 0, a negative, or more than `count` FAILS the read rather than being
+retried: re-asking from the same offset is an infinite loop.
+
+**`cliCmdPath` deliberately has no `Store` twin.** It carries one path — tens of
+code points, 0 ms at every volume measured — and leaving it on the per-code-point
+accessor keeps the host's presence probe exercised in production, on every
+`vl check`, instead of only against an old seed. Argv and directory entries stay
+per-code-point for the same reason.
 
 ### Command codes
 
@@ -251,7 +275,7 @@ needs:
 
 | code | command | host mechanism |
 | ---- | ------- | -------------- |
-| 7 | `CMD_TEST_STASH` | keep the module the brain just emitted (`rbyteLen`/`rbyteAt`) |
+| 7 | `CMD_TEST_STASH` | keep the module the brain just emitted (`rbyteLen`/`rbyteAt`/`rbyteStore`) |
 | 8 | `CMD_TEST_COLLECT` | instantiate each stashed module across a thread pool, read its `vlt*` registry back |
 | 9 | `CMD_TEST_RUN` | run the brain's plan across the pool, catching a trap per test |
 
