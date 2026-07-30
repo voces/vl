@@ -514,6 +514,33 @@ magnitude outside that drift.)
 **Byte delta:** the compiler is 1,113,241 → **1,115,110 bytes (+1,869)**, almost all of it the
 `keywordKind` bucket chain.
 
+### 6.5.1 The DETERMINISTIC counts — one instrument, both sides
+
+Wall clock and a sampling profiler both have error bars; the work removed does not. A
+throwaway compiler was built that runs **both** implementations at each converted site and
+counts them, then reports through `emitFail` at the end of `emitProgram` (the guest has no
+`print` that reaches a `vl build`, so the diagnostic channel is the one that works). One
+self-compile of `compiler/entry.vl`, arena = **247,145 nodes**:
+
+| site | BEFORE | AFTER | |
+| --- | ---: | ---: | ---: |
+| `nameNamesFunction` scan steps | **15,074,198** | **247,118** (one fold) | **61×** |
+| — its calls, and the OLD-vs-NEW answer DISAGREEMENTS | 61 calls, **0 diverged** | | the differential oracle |
+| `captureNamesOf` calls from `retCapturedMapShape` | **4,176** | **0** | the pre-gate skips **all** of them on this input |
+| `fnStmtsPosOf` calls from `emitReturnValue` | **35,908** (4 × 8,977) | **8,977** | 4× |
+| `fnStmtsPosOf` calls, whole compile | **46,037** | **19,106** | **−58.5%** |
+| `parentLetOf` map probes | **1,590,610** | **795,305** | 2× |
+
+**The counts corroborate the profile independently and closely:** the hoist removes 58.5% of
+`fnStmtsPosOf`'s calls and the profile reads −58% of its self-time; the fold removes 98.4% of
+its scan steps and the profile reads −98%.
+
+Two numbers worth keeping beyond this PR. **`rcmsWalks` is ZERO** — on the compiler's own
+source, not one of the 4,176 reaches into `retCapturedMapShape` needed the capture set at all,
+which is the strongest possible statement of what §6.1 removed. And **`fnStmtsPosOf` still
+runs 19,106 times for 25,953,420 scan steps (1,358 steps per call)** — that is exactly the
+residue the filed index owns, now sized.
+
 ---
 
 ## 6.6 The sabotages — and the one that nothing caught

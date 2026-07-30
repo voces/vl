@@ -1128,6 +1128,24 @@ Guest profile, 12 warm runs per leg, interleaved batches, absolute samples PER R
 
 **Byte delta:** 1,113,241 → **1,115,110 (+1,869)**.
 
+**DETERMINISTIC COUNTS — one throwaway compiler that runs BOTH implementations at each
+converted site and reports through `emitFail`** (the guest has no `print` that reaches a
+`vl build`). One self-compile, arena 247,145 nodes:
+
+| site | before | after | |
+| --- | ---: | ---: | ---: |
+| `nameNamesFunction` scan steps | **15,074,198** | **247,118** | 61× |
+| — calls / OLD-vs-NEW answer disagreements | 61 / **0** | | the differential oracle |
+| `captureNamesOf` calls from `retCapturedMapShape` | **4,176** | **0** | every reach skipped |
+| `fnStmtsPosOf` calls from `emitReturnValue` | 35,908 | 8,977 | 4× |
+| `fnStmtsPosOf` calls, whole compile | 46,037 | 19,106 | **−58.5%** |
+| `parentLetOf` map probes | 1,590,610 | 795,305 | 2× |
+
+The counts and the profile agree to within a point: −58.5% of `fnStmtsPosOf`'s CALLS against
+−58% of its self-time, −98.4% of the fold's STEPS against −98%. And the residue is now sized:
+`fnStmtsPosOf` still runs 19,106 times for **25,953,420 scan steps** (1,358 per call), which is
+what §3 item 4's index would take.
+
 ### 8.4 The sabotage that NOTHING caught — and the test that now does
 
 Six poisons, each compiled into a real compiler and run through the whole gate. The full table
