@@ -366,7 +366,7 @@ self-compile unless stated.
 | --- | --- | --- | --- | --- | --- |
 | 1 | ~~**Bulk host↔guest staging, IN**~~ — **SHIPPED, §6.** `srcLoad`/`modKeyLoad`/`modSrcLoad`/`cliResultLoad` + the memory the emitter exports; the host's batched path activates itself | predicted −4.6% self (`modSrcPush`); **got** `modSrcPush` 4.74 → 0.00 self, `modSrcLoad` 2.23 self, and the host's staging phase 192 → 135 ms | one host LINE (the memory probe) + 4 compiler-side exports; the fallback was already written | low — old seeds fall back, no seed split (**held**) | profile self-% of `modSrcPush` (target ≈0); the host's own `[profile] stage_program` phase; wall clock is too noisy alone |
 | 1b | ~~**…and OUT**~~ — **SHIPPED, §7.** `rbyteStore` (bytes, packed 4/word) + `cliCmdDataStore` (code points); the guest writes the same window and the host copies out | `[profile] readback` 17 → **1 ms**; `vl fmt compiler` 4,520,527 host calls → 290 and 520 → **453 ms** (−12.9%) | 2 compiler-side exports + 2 host structs; NO host probe change (`io_mem` was already there) | low — same 2×2 fallback, no seed split (**held**) | the `readback` phase; a `$VL_HOSTCOUNT` per-channel call counter; and the payload-free `vl fmt --check` as the control (run it to the same N) |
-| 2 | **Intern identifiers to i32 symbol IDs** — **THE TABLE AND PHASE 3 SHIPPED, §9.** `compiler/symbols.vl` + the arena-node carrier + the eight notifications; the three whole-program name→index maps are sym-indexed dense arrays. **Phases 4 (checker scope chain, now the largest single consumer at 2.83%) and 5 (`modRenamed`, 1.82%) remain**, and §9.7 records the coverage blocker phase 4 acquired | re-baseline confirmed the phase table (3 = 6.32% vs 6.2 predicted, 4 = 4.73% vs 4.4, 5 = 1.63% vs 1.6); phase 3 delivered **−4.5%** of a self-compile and **2,466,975 → 479,079 string-keyed probes** | large | medium-high — **six of the fourteen poisons redden ONLY the fixpoint ladder** (§9.6) | the consumer-class split per the design's §7 probes; the both-implementations count in §9.4 |
+| 2 | **Intern identifiers to i32 symbol IDs** — **THE TABLE AND PHASE 3 SHIPPED, §9.** `compiler/symbols.vl` + the arena-node carrier + the eight notifications; the three whole-program name→index maps are sym-indexed dense arrays. **Phases 4 (checker scope chain, now the largest single consumer at 2.83%) and 5 (`modRenamed`, 1.82%) remain**, and §9.7 records the coverage blocker phase 4 acquired | re-baseline confirmed the phase table (3 = 6.32% vs 6.2 predicted, 4 = 4.73% vs 4.4, 5 = 1.63% vs 1.6); phase 3 delivered **−4.5%** of a self-compile and **2,466,975 → 479,079 string-keyed probes** | large | medium-high — **the suite and the six-channel corpus are the witnesses; the ladder is BLIND to all eight name-writer poisons** (§9.6.1 corrects §9.6's filed column) | the consumer-class split per the design's §7 probes; the both-implementations count in §9.4 |
 | 2b | ~~**the four avoidable costs the re-baseline found**~~ — **SHIPPED, §8.** `retCapturedMapShape`'s per-return capture re-walk, `emitReturnValue`'s four un-hoisted `fnStmtsPosOf` calls, `nameNamesFunction`'s whole-arena rescan, `parentLetOf`'s double probe, `keywordKind`'s 19-way chain | **−10.7%** of a self-compile (interleaved min-of-15) | five local rewrites, no new data structure | low — all five are strict behaviour-preserving rewrites with the argument at the site | wall clock with `vl check`/`vl fmt` as flat controls at min-of-21; per-function samples PER RUN |
 | 3 | ~~**`nameNamesFunction`: index the arena once**~~ — **SHIPPED, §8.3.** Incremental fold with a high-water mark | 2.64% self → **0.07%** | small | the invalidation was the whole question and the answer is three facts pinned at their sites | as filed |
 | 4 | **`fnStmtsPosOf`: an index at the writers** — **STILL FILED**, but §8.2 removed the three quarters of it that were one un-hoisted call site (5.54% → 2.27% self) | 2.27% self remains | medium | medium — the header's argument about the writers is untouched | as filed |
@@ -470,7 +470,7 @@ for a one-function file.
 | §9.4's probe counts and the ZERO divergences | one throwaway compiler keeping the OLD `{[string]: i32}` maps alive beside the new arrays, answering every query BOTH ways and comparing, reporting through `return emitFail("COUNTPROBE …")` at the end of `emitProgram` |
 | §9.4's 95.1% carrier hit rate | `sidOfNode` calls vs fills in that same instrument — it is R3's whole justification and it is two counters |
 | §9.5's −4.5% | the INTERLEAVED profile A/B (14 runs per leg, samples PER RUN), corroborated by min-of-41 wall clock. **Do not quote a single wall clock**: four runs read −2.0 / −3.7 / −4.2 / −5.6% and one control read +2.6% |
-| §9.6's "the ladder is the only witness for six poisons" | apply the poison, build with the GOOD seed, `cmp` compile(X, source) against X — and put the good seed BACK before the next poison (§8's harness bug) |
+| §9.6's poison columns | apply the poison, build with the GOOD seed, `cmp` compile(X, source) against X — and put the good seed BACK before the next poison (§8's harness bug). **The "ladder is the only witness for six poisons" reading was WRONG and §9.6.1 retracts it**: the ladder is blind to all eight name-writers. Include a provably-unreachable poison as a CONTROL — a column that reads identically in every row is a claim about the harness |
 | §9.6's four "0 real" suite columns | read the failure MESSAGE, not the count: `glob match took …ms` and `--jobs 4 … ratio 0.75` are load-induced timing tests, and the same suite on the same tree is 3,610/0 |
 
 ---
@@ -1370,14 +1370,14 @@ for six of these it is the ONLY witness.
 | --- | --- | --- | --- | --- |
 | **P1 COLLISION — `sidOf` keys on the first character** | **rc 1** | — | **2,241 failed** of 3,610 | `arrays/array-slice.vl` +2,240 |
 | **P1b TARGETED collision — `qq` and `q` share an id** | rc 0 | **BROKEN** | **4 failed** | `tests/cases/objects/anon-field-value-name-not-a-function.vl` (#1314's witness, in both harnesses) |
-| P2a — writer 1/8, driver `n.fnName = modRenamed(…)` | rc 0 | **BROKEN** | 0 failed | **the ladder alone** |
-| P2b — writer 2/8, driver `n.letName` | rc 0 | **BROKEN** | 0 real† | **the ladder alone** |
-| P2c — writer 3/8, driver `n.identName` | rc 0 | **BROKEN** | 0 real† | **the ladder alone** |
-| P2d — writer 4/8, `emit_collect` lambda numbering | rc 0 | **BROKEN** | 0 real† | **the ladder alone** |
-| P2e — writer 5/8, `emit_mono` registry hit | rc 0 | **BROKEN** | **18 failed** | `closures/closure-alias-union-return-hof.vl` + 5 more in `generics/` |
-| P2f — writer 6/8, `emit_mono` new instance | rc 0 | **BROKEN** | **19 failed** | `functions/value-flow-mono.vl`, `generics/body-type-param.vl` … |
-| P2g — writer 7/8, `emit_mono` registry hit (call spine) | rc 0 | **BROKEN** | 0 failed | **the ladder alone** |
-| P2h — writer 8/8, `emit_mono` specialization | rc 0 | **BROKEN** | 0 failed | **the ladder alone** |
+| P2a — writer 1/8, driver `n.fnName = modRenamed(…)` | rc 0 | HOLDS ‡ | 0 failed | **inert today** ‡ |
+| P2b — writer 2/8, driver `n.letName` | rc 0 | HOLDS ‡ | 0 real† | **inert today** ‡ |
+| P2c — writer 3/8, driver `n.identName` | rc 0 | **HOLDS — measured** ‡ | 0 real† | **inert today: 1,714/1,714 same on all six corpus channels** ‡ |
+| P2d — writer 4/8, `emit_collect` lambda numbering | rc 0 | HOLDS ‡ | 0 real† | the suite + the corpus ‡ |
+| P2e — writer 5/8, `emit_mono` registry hit | rc 0 | **HOLDS — measured** ‡ | **18 failed** | `closures/closure-alias-union-return-hof.vl` + 5 more in `generics/` |
+| P2f — writer 6/8, `emit_mono` new instance | rc 0 | HOLDS ‡ | **19 failed** | `functions/value-flow-mono.vl`, `generics/body-type-param.vl` … |
+| P2g — writer 7/8, `emit_mono` registry hit (call spine) | rc 0 | HOLDS ‡ | 0 failed | the suite + the corpus ‡ |
+| P2h — writer 8/8, `emit_mono` specialization | rc 0 | HOLDS ‡ | 0 failed | the suite + the corpus ‡ |
 | **P3 — the CARRIER survives an arena reset** | rc 0 | **BROKEN** | **1,273 failed** | `arith/typed-add.vl` +1,272 |
 | **P4 — the SID-KEYED TABLES survive an id-space reset** | rc 0 | **BROKEN** | **18 failed** | `index/write-trap.vl`, `maps/list-of-maps-*.vl` — all 18 `array element access out of bounds`, **all 18 pass in isolation** |
 | **P5 — `sidLookup` where the table is built LAZILY** | rc 0 | **BROKEN** | 0 real† | **the ladder alone** |
@@ -1391,26 +1391,70 @@ full suite back to back. The clean run of the same suite on the same tree is 3,6
 reported as zero. (**Characterise a sabotage's witnesses before believing them** — §8.6, third
 recording, and this time the direction is the flattering one.)
 
+‡ **THE `P2*` LADDER COLUMN WAS WRONG AND IS CORRECTED — see §9.6.1.** As first written every
+P2 row read **BROKEN**, and findings 1 and 2 below were derived from that column. Re-measured
+at merge time, **the ladder is BLIND to every name-writer poison**. The rows above now carry
+the corrected reading. The non-P2 rows have NOT been re-measured and are left as filed.
+
 **Three findings from this table.**
 
-1. **THE LADDER IS THE WITNESS FOR SIX OF THE EIGHT NAME-WRITERS, AND FOR THE LAZY-TABLE
-   POISON.** Six poisons redden nothing but `compile(X) == X`. That is a *better* result than
-   §8.4's, where a collided compiler was a FIXPOINT OF ITSELF and left no trace at all — but
-   it is also the reason `scripts/native-fixpoint.sh` must never be treated as a formality on
-   a branch that touches this layer. It is load-bearing here in a way the 3,610-test suite is
-   not.
-2. **THE CARRIER'S NOTIFICATION IS NOT THE VACUITY ITS PREDECESSOR WAS.** §8.4 recorded that
-   deleting `noteFuncName` at `emit_collect`'s lambda-numbering site reddened *nothing*,
-   because the only names it can add are `__lambda_<n>` and nothing queries that spelling.
-   Deleting `sidNoteNodeName` at the SAME site (P2d) breaks the fixpoint: `buildFnMap` keys
-   every lifted function's row by the carrier, so a stale slot files the lambda under the
-   anonymous `""` it replaced. The two lines sit two statements apart and only one of them
-   is decorative — the site says which.
+1. **THE LADDER IS BLIND TO ALL EIGHT NAME-WRITERS; THE SUITE AND THE CORPUS ARE THE
+   WITNESSES.** (Corrected — §9.6.1 holds the measurements.) Disabling all eight notifications
+   at once still self-compiles at rc 0, is a fixpoint of itself, and emits the CLEAN compiler
+   source byte-for-byte identically — while reddening **31 suite cases and 15 corpus rows**.
+   `scripts/native-fixpoint.sh` is still mandatory (it is the named witness for the COLLISION
+   and reset classes), but on this layer it is the suite and the six-channel corpus A/B that
+   are load-bearing, not the ladder. **The fuzz A/B is vacuous here** — 0 divergences over
+   1,440 programs against the all-eight poison, because `fuzzgen` emits no generic/callback
+   shape that reaches monomorphization.
+2. **WRITERS 1–3 ARE STRUCTURALLY INERT TODAY, AND THAT IS A PROPERTY OF THE PIPELINE ORDER,
+   NOT OF THE POISON.** Every `sidOfNode` caller lives in `emit_*`; the driver's module merge
+   runs strictly before any emit pass, so `sidNode` is still empty when `modRw*` renames and
+   `sidNoteNodeName` returns at its own `ix >= sidNode.length` guard. The three driver
+   notifications therefore cannot change an output today — measured, not argued: P2c is
+   1,714/1,714 same on all six corpus channels and a fixpoint. **Keep them.** They are the
+   defence for the day a pass between the merge and emit probes the carrier, and that day
+   arrives silently. What is NOT true is that an instrument would catch their removal.
 3. **P4 IS THE ONE THIS PHASE ACTUALLY SHIPPED WITH, BRIEFLY.** It is not a hypothetical: the
    first build of the conversion had exactly this defect, and its 18 failures are how the
    sid-vs-name aliasing difference (design §8.3) was found. Every one of the 18 passes in
    isolation — the wasm harness's SHARED `WebAssembly.Instance` is the only instrument in the
    gate that can see it, which makes it this hazard's named witness and worth protecting.
+
+### 9.6.1 The correction — the ladder column did not reproduce at the merge gate
+
+The table above was filed with **BROKEN** in the fixpoint column of all eight `P2*` rows, and
+the doctrine claim "six poisons redden ONLY the fixpoint ladder" was derived from it. Re-run
+independently at the merge gate, on this branch's own tree, against a freshly fetched
+`seed-latest` (1,115,110 B), **not one of the eight reproduces**. Method exactly as §5's row
+prescribes: apply the poison, build `X` with the GOOD seed, `cmp` `compile(X, source)` against
+`X`, restore the good seed before the next poison.
+
+| re-measured | self-compile | `compile(X)==X` | suite | corpus A/B (6 ch.) | fuzz A/B |
+| --- | --- | --- | --- | ---: | ---: |
+| **all eight at once** (`sidNoteNodeName` body deleted) | rc 0 | **HOLDS**, `abcc33f4…` both stages | **31 failed** | **15 rows** | 0 / 1,440 |
+| P2c alone (writer 3/8) | rc 0 | **HOLDS**, `b7328d4d…` both stages | — | **0 rows / 1,714** | — |
+| P2e alone (writer 5/8) | rc 0 | **HOLDS**, `cmp` clean | — | — | — |
+
+Three things follow, and the third is the one to carry forward.
+
+1. **The aggregate refutes the whole column, not just the two rows spot-checked.** Disabling a
+   SUPERSET of the notifications cannot repair a fixpoint that any subset breaks (barring a
+   cancellation for which there is no mechanism), so an all-eight poison that holds means no
+   single one breaks. The two singles were run anyway, because "cannot" is an argument.
+2. **The all-eight poison is a real miscompile, and the instruments that see it are named.**
+   Its 15 corpus rows are 13 build-rc/build-msg flips plus **two byte diffs, one of which is a
+   `RUNOUT`** — `tests/cases/index/generic-trap.vl` runs to completion and prints something
+   ELSE. Silently wrong output, caught by field 6 and by the suite, invisible to the ladder.
+3. **The most likely cause of the original reading is the harness bug §5's own row warns
+   about** — a `build/vl-compiler.wasm` left poisoned from the previous iteration makes
+   `compile(X) == X` fail for *every* subsequent poison, which is exactly the shape of a
+   column that reads BROKEN in all eight rows including the three that are provably inert.
+   **This is inference, not measurement: the original runs were not preserved.** The
+   transferable rule is the one that would have caught it at filing time — *a poison column
+   that reads the same in every row is a claim about the HARNESS until one row is shown to
+   differ*, and the cheapest way to show it is to poison something provably unreachable and
+   confirm the column goes quiet. P2c is now that control, and it is checked in as one.
 
 ### 9.7 What did NOT ship, and the blocker phase 4 acquired
 

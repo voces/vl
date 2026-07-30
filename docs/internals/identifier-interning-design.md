@@ -283,10 +283,17 @@ exactly the same eight notifications, plus a pass. Lazy needs only the notificat
 never fills a slot for a node nobody asks about.
 
 **How a violation must show.** A stale carrier slot resolves an identifier to the WRONG symbol
-— a silent miscompile, the worst class. It is caught by the fixpoint ladder (the compiler's own
-26 files exercise the merge rename and the lambda numbering on every self-compile), and, for
-the monomorphization writers, by the generics corpus. §6.4 runs the poison and records which
-instrument actually reddened, because "the ladder would catch it" is a claim, not a witness.
+— a silent miscompile, the worst class. §6.4 runs the poison and records which instrument
+actually reddened, because "the ladder would catch it" is a claim, not a witness — **and it was
+a claim, and it was wrong**. The filed prediction here was that the fixpoint ladder catches it,
+the compiler's own 26 files exercising the merge rename on every self-compile. Re-measured at
+the merge gate (`perf-program.md` §9.6.1): **the ladder is blind to all eight**. Disabling every
+notification at once still yields a compiler that is a fixpoint of itself AND emits the clean
+source byte-identically, while reddening 31 suite cases and 15 corpus rows. The merge rename is
+exercised hardest by the self-compile and is exactly where the carrier is still EMPTY — the
+notification is a no-op there because `sidOfNode`'s callers are all in `emit_*`, downstream of
+the merge. **The witnesses are the suite and the corpus; the fuzz A/B is vacuous for this
+class.**
 
 ### R5 — a CONSUMER converts only when its call sites already hold a node index
 
@@ -740,7 +747,8 @@ read **20.5× per intern (95.1% hit rate)**; string primitives **588.0 → 516.2
 (−12.2%)** and all samples **1,564.7 → 1,493.8 (−4.5%)** on an interleaved 14-run profile A/B;
 compiler bytes **1,115,110 → 1,113,727 (−1,383)** — the conversion is net-negative in code
 size, because five map instantiations and their probe call sites cost more than the array
-reads that replace them. Fourteen poisons, of which **six redden only the fixpoint ladder**.
+reads that replace them. Fourteen poisons; the eight name-writer ones redden **the suite and the
+corpus, never the ladder** (`perf-program.md` §9.6.1 corrects the filed reading).
 
 **The one number to quote when someone asks whether the carrier was necessary: 1,946,211
 `sidOfNode` calls against 95,018 fills.** A scheme that interned at the point of use would

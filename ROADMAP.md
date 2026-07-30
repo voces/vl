@@ -928,9 +928,12 @@ in-language GC knobs.
   The carrier is read **20.5× per intern (95.1% hit rate)**. (2) **A SID-keyed table aliases
   across programs where its NAME-keyed predecessor did not** — sid 3 exists in every program,
   the spelling `foo` does not — so every sid-keyed table must be dropped where the id space is;
-  missing that failed **18 wasm-harness cases that each pass in isolation**. (3) **Six of the
-  fourteen poisons redden ONLY the fixpoint ladder**, including the subtle "use the
-  non-minting lookup on a lazily-built table" one. **Phases 4 and 5 remain**: `lookup` is now
+  missing that failed **18 wasm-harness cases that each pass in isolation**. (3) **The fixpoint
+  ladder is BLIND to all eight name-writer poisons; the suite and the corpus are the
+  witnesses** — the filed "six poisons redden ONLY the ladder" reading did not reproduce at
+  the merge gate and `perf-program.md` §9.6.1 retracts it with the re-measurements. Writers
+  1–3 (the driver merge) are provably inert today because the carrier is empty before emit,
+  and they are kept as defence, not as covered code. **Phases 4 and 5 remain**: `lookup` is now
   the largest single string consumer (2.83%) and the undo-log rewrite is small — but
   `perf-program.md` §9.7 records the blocker, that `T.scopes[top][name] = v` and
   `T.scopes.pop()` are the self-compile's only exercisers of two emitter arms. Historical
