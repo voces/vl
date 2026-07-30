@@ -11259,6 +11259,23 @@ function emitForInList(body: i32[], iterIx: i32, fnIx: i32) {
 // wasm validation.
 function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   const fn = P.nodes[fnIx]
+  // `fnStmtsPosOf` IS AN O(functions) SCAN (see its header in `emit_classify`), and the
+  // INFERRED-return arms below asked it for the SAME `fnIx` four separate times — the variant
+  // seed, the variant index, the `fRetKind` widen and the atom-to-string widen. Measured on a
+  // self-compile at `1517c7f6` (12 warm guest profiles, 20,985 samples): `fnStmtsPosOf` is
+  // 5.54% self and **4.34 of that is reached from this one function** — i.e. this hoist, not
+  // the filed index, is where three quarters of that scan's cost lives.
+  //
+  // Taking it once is a HOIST, not a memo: nothing between the four reads writes `fnStmts` or
+  // `monoOrigNode` — both are written only by `emit_collect`'s collect passes and `emit_mono`'s
+  // replacement writers, all of which have run to completion before `emitCodeSection` begins.
+  // (That is a strictly weaker claim than the cross-call memo `fnStmtsPosOf`'s header rejects,
+  // which would have to hold across the whole emit; this one holds inside one call frame.) The
+  // read stays behind `fn.fnRet < 0` so an ANNOTATED return pays nothing, exactly as before.
+  let fnPos = -1
+  if fn is FuncDecl {
+    if fn.fnRet < 0 { fnPos = fnStmtsPosOf(fnIx) }
+  }
   if fn is FuncDecl {
     const rsi = retStructIndex(fn.fnRet)
     if rsi >= 0 {
@@ -11274,7 +11291,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     // the checker's recorded return shape so the else-arm's `{ … }` literal builds the bare
     // variant too, matching the then-arm's narrowed variant rep.
     if fn.fnRet < 0 {
-      const rvi = cbRetVariantIdx(fnStmtsPosOf(fnIx))
+      const rvi = cbRetVariantIdx(fnPos)
       if rvi >= 0 { pendingVariantIdx = rvi }
     }
     pendingListKind = tyAnnRefListKind(fn.fnRet)
@@ -11314,7 +11331,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
       retVi = variantIndexOf(tyNameOf(fn.fnRet))
     }
     if fn.fnRet < 0 {
-      const rvi2 = cbRetVariantIdx(fnStmtsPosOf(fnIx))
+      const rvi2 = cbRetVariantIdx(fnPos)
       if rvi2 >= 0 { retVi = rvi2 }
     }
     if retF32Flag(fn.fnRet) == 1 { retF32 = true }
@@ -11325,7 +11342,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     // branch returns a big i64 / an f64 expression stays `i32.const`, clashing with the i64/f64
     // functype result the inferred-return path declares (a soundness hole the checker accepts).
     if fn.fnRet < 0 {
-      const rfe = fnStmtsPosOf(fnIx)
+      const rfe = fnPos
       if rfe >= 0 {
         if fRetKind[rfe] == "i64" { retI64 = true }
         if fRetKind[rfe] == "f64" { retF64 = true }
@@ -11440,7 +11457,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     // (one path returns a member literal, another the atom — the checker joins to
     // `string`) widens an atom return value too; without it the raw i32 id flowed into
     // the string-ref functype result (invalid wasm).
-    if fn.fnRet < 0 && cloRetIsString(fnStmtsPosOf(fnIx)) {
+    if fn.fnRet < 0 && cloRetIsString(fnPos) {
       if exprIsLitAtom(retArg, fnIx) { retStrWiden = true }
     }
     // Inferred niche nullable (un-annotated): seed the niche from the A20 name so a
