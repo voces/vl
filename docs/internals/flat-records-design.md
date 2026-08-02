@@ -30,8 +30,14 @@ The ask is three features wearing one syntax:
 | | what it is | state |
 | --- | --- | --- |
 | **(a)** `flat type` declarations with computed offsets and size | a **declaration** feature | **SHIPPED** |
-| **(b)** `buf.rows<T>(off, n)` | a **generic accessor** feature | FILED (§6.1) |
-| **(c)** `stack[i].tt` | **index-then-field sugar** over linear memory | FILED (§6.2) |
+| **(b)** `buf.rows<T>(off, n)` | a **generic accessor** feature | FILED (§6.1, sketched §10) |
+| **(c)** `stack[i].tt` | **index-then-field sugar** over linear memory | **WRITABLE IN USER SPACE** (§9) — as `stack[i].tt()` |
+
+**(c) needed no compiler work in the end.** §6.2 filed it as blocked on a bracket that
+did not parse; B14 shipped that bracket, and the remaining half — making `.tt` an offset
+add rather than a materialized row — turns out to be a **library idiom**, not a language
+feature: have `"[]"` return a row-ADDRESS newtype. §9 is the pattern, the codegen proof
+that it fuses, and the one divergence (`.tt()`, not `.tt`).
 
 They are separable, and (a) is the one that carries the value. The measurement that decides
 the phasing is §6.3's: **with (a) alone, every accessor the Lua VM needs is already
@@ -370,18 +376,25 @@ measured:
 Until then the hand-written per-type accessor set (§6.3) is the route, and it is *expressible
 today* — this is boilerplate, not a blocker.
 
-### 6.2 `stack[i].tt`
+### 6.2 `stack[i].tt` — SUPERSEDED by §9
 
-**This is the same blocked road P1.1 filed for `x[i]`, and the same measurement applies.**
-`x[i]` on a non-array is purely syntactic; the right dispatch route is ROADMAP B14's free
-`self`-functions named for an operator, and `function "[]"(self: V, i: i32)` **does not
-parse today** — `emit_rewrite.vl:281`'s operator arm is unreachable dead code
-(`buffer-design.md` §L5). Nothing about flat records changes that verdict, and shipping a
-second bespoke bracket route for rows would be the wrong answer to the same question.
+This section filed `stack[i].tt` as blocked because `function "[]"(self: V, i: i32)` did not
+parse. **That premise expired**: B14's free index operators ship
+(`index-operator-design.md`), and the second half — the one this section called the harder
+one — needed no compiler work at all.
 
-`stack[i].tt` is additionally *harder* than `x[i]`: it is an index-then-field **pair** that
-must fuse into one load without materializing a row, so a lowering that returns a row value
-from `[]` and then reads `.tt` off it is not the same feature.
+The reasoning that dated fastest is worth keeping, because the conclusion was wrong in an
+instructive way:
+
+> `stack[i].tt` is additionally *harder* than `x[i]`: it is an index-then-field **pair** that
+> must fuse into one load without materializing a row, so a lowering that returns a row value
+> from `[]` and then reads `.tt` off it is not the same feature.
+
+Both sentences are true and the inference from them is not. It assumed `[]` must return a
+**row**, and then that fusing away the row is a lowering problem. But `[]` can return a row
+**ADDRESS** instead, and then there is no row to fuse away — the field accessor is an offset
+load off an integer, and the fusion is not an optimization the compiler must perform but a
+shape the program already has. §9 records the pattern and proves the codegen.
 
 ### 6.3 The measurement behind the phasing
 
@@ -402,8 +415,14 @@ function tvSetTt(r: TValueRows, i: i32, v: i32) { __store_i32__(tvAddr(r, i) + T
 ```
 
 Every address in that block is derived from the declaration. Nothing is hand-computed.
-`rows<T>` and `stack[i].tt` would delete the last two lines *per field*; they would not make
-anything newly possible.
+
+> **Correction, from §9.2.** The last sentence of this section used to read "`rows<T>` and
+> `stack[i].tt` would delete the last two lines *per field*". The second half is right —
+> nothing here is newly possible — but the accounting is wrong, and it was wrong about the
+> axis. The fused spelling needs the **same number** of functions for the same record (5 for
+> two fields, either way); what it deletes is the **container** dimension, because a
+> row-address accessor names no container and so is written once per record instead of once
+> per (record × container) pair. §9.2 has the measurement.
 
 ---
 
@@ -493,3 +512,294 @@ many seeds, not a big count.
 | layout computation, validation, cycle guard | `compiler/typecheck.vl` (declaration pass) |
 | the `N.size` / `N.f` fold | `compiler/typecheck.vl` (`checkMemberNode`) |
 | **the emitter** | **nothing** |
+| **the fused `stack[i].tt()` pattern (§9)** | **nothing — it is user code** |
+
+---
+
+## 9. The fused row pattern: `stack[i].tt()` in user space
+
+**RULING: `"[]"` returns a row ADDRESS, not a row. The field accessors take that address.
+Nothing about this is a compiler feature — it is three shipped features composed, and it
+costs zero bytes over the hand-written spelling.**
+
+```vl
+flat type TValue = { value: i64, tt: i32, pad: i32 }
+
+type RowAddr = new i32                        // the row ADDRESS, branded
+type Stack   = new { base: i32, count: i32 }
+
+function "[]"(self: Stack, i: i32): RowAddr {
+  return (self.base + i * TValue.size) as RowAddr
+}
+function tt(self: RowAddr)            { return __load_i32__((self as i32) + TValue.tt) }
+function setTt(self: RowAddr, v: i32) { __store_i32__((self as i32) + TValue.tt, v) }
+
+st[3].setTt(7)
+print(st[3].tt())        // an ADD, then an i32.load
+```
+
+Three shipped things compose, and each supplies exactly one piece:
+
+| piece | supplied by | what it gives |
+| --- | --- | --- |
+| `TValue.size` / `TValue.tt` fold to constants | **P1.2 half one** (§5) | the addresses are derived, never hand-computed |
+| `st[i]` dispatches to a free function | **B14** (`index-operator-design.md`) | the bracket |
+| `RowAddr` is a distinct type at width `i32` | **P1.5 newtypes** | a return type that is an *address*, and one that cannot be crossed with another record's |
+
+The whole trick is the third row. Once `"[]"` returns something branded over `i32`, the
+bracket yields an address, `.tt()` is UFCS on an integer, and **there is no row value
+anywhere in the program** — so there is nothing for a fusion optimization to remove.
+
+### 9.1 Divergence from the spec: `.tt()`, not `.tt`
+
+The requirements doc writes `stack[i].tt` — a FIELD. VL's UFCS is call-style, so what is
+writable is `stack[i].tt()`. **This is the only divergence, and it is a loud checker
+reject, not a wrong answer:**
+
+```
+member access '.tt' on non-object RowAddr
+```
+
+Pinned by `tests/cases/memory/flat-fused-row-field-spelling-rejected.vl`, which differs from
+the working fixture by exactly two characters.
+
+**Branding over `i32` is what makes the wrong spelling unrepresentable.** The alternative —
+branding `RowAddr` over a *struct* — would make `.tt` resolve, as a real field read of a
+materialized row, which is precisely the fusion the ask forbids. The paren-less spelling
+would then compile and be *slower*, which is a far worse outcome than not compiling. So the
+divergence is not a wart to be sanded off later; the reject is load-bearing.
+
+Closing it for real means field-position UFCS (`x.f` resolving to `f(x)` when `f` is a
+`self`-function and `x` has no such field), which is a language-wide change to member
+resolution with its own swallow to measure — not a flat-records question. Filed, not fixed.
+
+### 9.2 What it deletes — the container dimension, not the field one
+
+The honest count first, because the obvious claim is false:
+
+| | functions for a 2-field record | 
+| --- | --- |
+| hand-written (§6.3), `(container, index)` accessors | `slotAt` + 4 = **5** |
+| fused, row-address accessors | `"[]"` + 4 = **5** |
+
+**Identical.** The bracket removes nothing per field, and §6.3's "would delete the last two
+accessors PER FIELD" was wrong about which axis it saves on.
+
+What it removes is the **container** dimension. A `(container, index)` accessor names a
+container type, so it is written once per (record × container) pair; a row-address accessor
+names none, so it is written once per RECORD and each container contributes exactly one
+`"[]"`. **N×M becomes N+M.** Pinned at M=2 by
+`tests/cases/memory/flat-fused-row-one-accessor-set-two-containers.vl`: a `Stack` that
+addresses linearly and a `Ring` that masks and wraps share one accessor set, and the two
+operators have nothing in common.
+
+For the Lua VM — `TValue` reachable from the stack, from a table's array part, from a
+`Node`'s key and value slots — M is not 1, and this is the axis that matters.
+
+**The third rung, stated so the credit lands in the right place.** Accessors that take a
+bare `i32` address plus a per-container `slotAt` also get N+M, and they are expressible with
+*no* new features at all — no brand, no bracket, nothing from B14 or P1.5:
+
+```vl
+function slotAt(self: Stack, i: i32): i32 { return self.base + i * TValue.size }
+function tt(addr: i32): i32 { return __load_i32__(addr + TValue.tt) }
+print(tt(slotAt(st, i)))
+```
+
+So the fused pattern's marginal contribution over the *strongest* control is exactly two
+things: the call site reads as the spec's shape, and the address carries a brand.
+
+### 9.3 The measurement: the brand and the bracket are free
+
+Three programs, same loop (`acc += tt of row i`, 8 rows), built with the same compiler:
+
+| rung | spelling | `-O0` bytes | `-O3 --closed-world` bytes |
+| --- | --- | --- | --- |
+| 1 | `tagOf(st, i)` — `(container, index)`, §6.3's shape | 1555 | 298 |
+| 2 | `tt(slotAt(st, i))` — raw `i32` address, no brand, no bracket | **1551** | **296** |
+| 3 | `st[i].tt()` — **fused, branded** | **1551** | **296** |
+
+**Rungs 2 and 3 are `cmp`-IDENTICAL, at both optimization levels.** Not "the same size" —
+byte-for-byte the same module. The brand is erased before the emitter runs (P1.5's
+representation ruling) and the bracket is rewritten to a direct call before lowering (B14's
+§1), so `st[i].tt()` emits precisely what `tt(slotAt(st, i))` emits. The safety is free.
+
+Rung 1 is 4 bytes larger only because `tagOf` re-derives the address by calling `slotAt`
+rather than receiving it; the dynamic call count is 2 on every rung.
+
+**The fusion, in the disassembly.** `wasm-tools print` of the `-O0` rung-3 module — the two
+functions the access path goes through, in full:
+
+```wat
+(func (;41;) (param (ref 2) i32) (result i32)   ;; "[]"
+  local.get 0  struct.get 2 0                   ;; self.base
+  local.get 1  i32.const 16  i32.mul  i32.add   ;; + i * TValue.size
+  return)
+(func (;42;) (param i32) (result i32)           ;; tt — takes the ADDRESS
+  local.get 0  i32.const 8  i32.add             ;; + TValue.tt
+  i32.load
+  return)
+```
+
+Neither function allocates. The module's four `struct.new` sites are all outside the access
+path — three inside `std:buffer`'s own helpers and one for the `Stack` itself at setup
+(line 553, before the loop opens at 556); **the loop body contains none**. No row is
+materialized. The `RowAddr` parameter of func 42 is a bare `i32` — the brand is gone by
+codegen.
+
+At `-O3 --closed-world` both functions **inline away completely** and the loop body becomes,
+with the multiply strength-reduced to a shift and `count` dead-code-eliminated out of the
+struct:
+
+```wat
+global.get 3  i32.const 4  i32.shl     ;; i * 16
+global.get 2  struct.get 6 0  i32.add  ;; + base
+i32.const 8   i32.add                  ;; + TValue.tt
+i32.load
+```
+
+**No call remains** except the `print` import. This answers the P1.4 speed note directly: the
+two calls the fused spelling costs at `-O0` are both gone under the release profile, so
+`st[i].tt()` is an offset-add and a load and nothing else.
+
+### 9.4 The merge axis
+
+Every piece survives a module boundary, and the two mechanisms survive it for *different*
+reasons — which is why `tests/cases/memory/flat-fused-row-import/` is pinned separately:
+
+- the **bracket** names nothing, so there is nothing to alias; the operator registry is
+  built from the already-merged program (`index-operator-design.md` §R4);
+- the **UFCS accessors** carry a property string the merge deliberately leaves plain, so
+  they reach the mangled function through `ufcsAliasOf` — an entirely different route.
+
+The fused spelling rides both on every single access. `TValue.size` also folds against an
+imported `flat` declaration exactly as against a local one.
+
+### 9.5 Bounds: none, deliberately
+
+`st[i]` adds no check to the index and none to the address. A `RowAddr` is a raw address and
+the engine's bounds check is the policy — the same ruling `load-past-page-end-traps.vl`
+states for the raw intrinsics, and the opposite of `std:buffer`'s views, which DO fence each
+access (`buffer-design.md` §L3) because a view carries a length.
+
+The `Stack` in these fixtures carries a `count` and the operator ignores it. That is the
+right default for this tier, and the reason it is safe to state so flatly is that **the
+operator is user code**: a program that wants the fence writes it in the operator body, in
+four lines, which is exactly where the choice should live. Pinned by
+`tests/cases/memory/flat-fused-row-past-page-end-traps.vl`.
+
+### 9.6 Two pre-existing defects this pattern walks straight into
+
+Neither is caused by this work and neither is fixed here (both live in `compiler/*.vl`).
+Both were witnessed against the unmodified master compiler.
+
+**D1 — a UFCS call whose receiver parameter is not named `self` checks CLEAN and fails in
+the emitter.** `vl check` exits 0; `vl build` exits 1.
+
+```vl
+function bump(x: i32, by: i32): i32 { return x + by }
+const a = 5
+print(a.bump(3))
+// vl check → "Checked 1 file, no errors."      rc 0
+// vl build → "emitProgram: callee is not a function name"   rc 1
+```
+
+The checker's `ufcsCallTy` tests arity and `assignable(recvTy, params[0])` and **never looks
+at the parameter's name**; the emitter's rewrite requires `parName == "self"`. Struct
+receivers hide it (`assignable(struct, i32)` fails first, so the call is rejected for a
+different and correct reason) — it is reachable exactly when the first parameter is
+type-compatible but misnamed, which is the ordinary case for scalar and newtype receivers.
+
+This is the wall the P1.2 investigation hit first, and it is worth recording *why* it cost
+more than it should have: the initial reading was "the fused pattern is refuted — UFCS does
+not work on a branded scalar". It was not refuted; it was misspelled. A diagnostic naming
+the `self` rule at the call site would have turned an afternoon into a minute.
+
+**D2 — that emit error's span never points at the call site; it points at the emitter's
+CURRENT-FUNCTION cursor.** This was first filed here as "the span tracks the callee's
+declaration", which the original witness supported and which is wrong — the callee was
+simply the last function declared. Four witnesses separate the candidates:
+
+| witness | callee decl | enclosing fn | call site | span |
+| --- | ---: | ---: | ---: | ---: |
+| call inside a function, callee declared ABOVE | 4 | 8 | 10 | **8** |
+| call inside a function, callee declared BELOW | 9 | 2 | 4 | **2** |
+| top-level call, callee is the only function | 4 | — | 9 | **4** |
+| top-level call, an unrelated function declared AFTER the callee | 2 | — | 7 | **4** (`unrelated`) |
+
+So: for a call inside a function the span is the ENCLOSING function's declaration, and for a
+top-level call it is the LAST function declared — i.e. a stale leftover, since the emitter
+never entered a function for that statement. The two unify as "whatever the emitter's
+current-function cursor last pointed at". It coincides with the callee's declaration only
+when the callee happens to be the last-declared function, which is what the original witness
+did. *A span diagnosis needs the candidates separated on both axes; one witness where two of
+them coincide reads as a rule.*
+
+### 9.7 What is pinned
+
+| fixture | what it holds |
+| --- | --- |
+| `memory/flat-fused-row-accessors.vl` | the pattern end to end: fused write and read of `tt`/`value`, in a loop and at constant indices, cross-checked against HAND-COMPUTED raw addresses; the row-HANDLE idiom (`const r = st[9]`); the declared stride |
+| `memory/flat-fused-row-one-accessor-set-two-containers.vl` | N×M → N+M: `Stack` and `Ring` sharing one accessor set |
+| `memory/flat-fused-row-import/` | the merge axis, both mechanisms at once |
+| `memory/flat-fused-row-brands-dont-cross.vl` | two row brands over one representation; a `NodeAddr` into a `TValue` accessor, and a bare `i32` variable into a row accessor |
+| `memory/flat-fused-row-field-spelling-rejected.vl` | the `.tt` divergence, as the reject it is |
+| `memory/flat-fused-row-past-page-end-traps.vl` | the bounds policy |
+
+The read/write cross-check in the first fixture is the §7.2 discipline reapplied: every
+WRITE goes through the fused derived address and the verification READ comes back through a
+raw intrinsic at a hand-computed one, because an address scheme can be internally consistent
+and still be wrong about which bytes it touches.
+
+---
+
+## 10. Design sketch: generic `rows<T>` (NOT built)
+
+§6.1 files `buf.rows<T>(off, count)` behind two blockers. §9 changes what it is *for* — the
+per-record accessor set is no longer the cost, the per-record `"[]"` is — so it is worth
+saying crisply what remains.
+
+**What `rows<T>` would add over §9.** In §9 each record needs its own container type and its
+own operator, differing only in which `size` constant they multiply by:
+
+```vl
+type Stack = new { base: i32, count: i32 }
+function "[]"(self: Stack, i: i32): RowAddr { return (self.base + i * TValue.size) as RowAddr }
+type Nodes = new { base: i32, count: i32 }
+function "[]"(self: Nodes, i: i32): NodeAddr { return (self.base + i * Node.size) as NodeAddr }
+```
+
+That is the last per-record boilerplate the pattern has not deleted: **one container brand
+and one four-line operator per flat record.** A generic `Rows<T>` would collapse it to a
+single declaration.
+
+**The shape it would take.** Not a `buf.rows<T>` *method* — a generic container type with a
+generic operator, which is the same B14 route §9 already rides:
+
+```vl
+type Rows<T> = new { base: i32, count: i32 }
+function "[]"<T>(self: Rows<T>, i: i32): Addr<T> {
+  return (self.base + i * T.size) as Addr<T>
+}
+```
+
+**Three things stand in the way, and the third is new.**
+
+1. **Generic flat types are rejected** (§3) — a type parameter has no width. Unchanged.
+2. **`T.size` must fold after monomorphization**, not in the checker where `T` is still a
+   parameter (§6.1). Unchanged.
+3. **The row-address brand must be generic too** — `Addr<T>`, so that `Rows<TValue>` and
+   `Rows<Node>` yield addresses that do not cross. This is the requirement §9 makes newly
+   visible: without it a generic `rows<T>` would hand back a bare `i32` and give up exactly
+   the safety property §9.2 says is its whole marginal contribution over rung 2. A generic
+   newtype over a scalar is its own design (`newtype-design.md` §5's branded-application
+   question), and it is a *prerequisite*, not a nicety.
+
+**The ordering this implies.** (3) is the one to settle first, because it decides whether
+`rows<T>` is worth building at all: a `rows<T>` that returns unbranded addresses is
+strictly worse than the four lines it replaces. (1) and (2) are then mechanical.
+
+**And the honest priority.** Against §9 the remaining prize is one brand and one four-line
+operator per record — for the Lua VM, on the order of three declarations. That is smaller
+than what §6.3 estimated when the accessor set was still believed to be the cost. `rows<T>`
+should be scheduled behind anything that unblocks a program rather than shortening one.
