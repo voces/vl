@@ -1,0 +1,943 @@
+# The performance landscape — VL against Rust, V8 and CPython
+
+Measured 2026-08-02 on master `1dd3d6a2` with `bench/run.sh` (46 benchmarks, 45 measured, one
+VOID). The suite exists to answer one question — **where does VL actually sit, and what is making
+it slower than it should be** — and it is written to be adversarial about its own numbers: every
+benchmark was independently audited for dead-code elimination, auto-vectorisation, startup
+domination and stdout equivalence before any ratio here was quoted.
+
+Raw data: `bench/results/{results.json,summary.md,raw.ndjson}`. Deep dives on the five worst
+rows: `bench/findings/*.md`.
+
+---
+
+## 1. The verdict
+
+**VL is at parity with V8 in the median and roughly 2.5x off native — but the median hides the
+shape of the distribution, and the shape is the finding.** Across 45 benchmarks the median
+`vl/deno` is **1.04** (geomean 1.19) and the median `vl/rust` is **2.49x** (geomean 3.04x). VL
+**beats deno on 15 benchmarks, ties on 16, and loses on 14** — but its losses are far heavier than
+its wins: the worst loss is 14.0x (`strings/str-eq`) and the best win is 2.6x
+(`arrays/push-growth` at 0.38). So VL is not broadly behind V8; it is *episodically catastrophically*
+behind V8, on a small number of axes that a real program hits constantly — string equality, calling
+a function value, and indexing an array. Against the interpreter floor VL wins by a geomean of
+**15x**, which is where it should be, except that **it loses outright to CPython on three
+benchmarks** (`strings/substr-search` py/vl 0.1, `strings/str-eq` 0.3, `collections/set-ops` 0.8)
+and is under 2x on three more (`map-string` 1.2, `map-i32` 1.4, `word-freq` 1.8) — all six are
+string-hashing or string-comparison paths, and that clustering is not a coincidence. Against Rust,
+after correcting for the auto-vectorisation the audit found in 9 of 46 `main.rs` files, VL's
+*scalar* codegen is close (on `arith/i32-accum` the raw multiple is 5.7x but the scalar-vs-scalar
+multiple is ~1.4x); the genuine native headroom is concentrated in WasmGC array access and in the
+absence of any tail-call, inlining or SIMD story. **The single most important structural finding is
+that `vl build -O3` recovers 11.8x on `algorithms/lambda-hot` and 2.9x on
+`collections/struct-field` — meaning the default build, which is what every user and the
+self-hosted compiler actually run, is leaving multiples on the floor that a downstream tool can
+already find.** Nine of the fourteen losses are traced to four compiler-fixable defects with
+measured prototypes; fixing those four would flip six benchmarks and clear every Python red alert
+except one.
+
+---
+
+## 2. Methodology, and what it does not support
+
+### 2.1 The protocol
+
+| | |
+|---|---|
+| harness | `bench/run.sh`, 7 reps per configuration, **median** reported (min/max in `results.json`) |
+| statistic | median-of-7; a `vl/deno(min)` cross-check computed on min-of-7 is printed alongside |
+| cpu pinning | `taskset -c 2-5` (2 physical cores / 4 hw threads) |
+| toolchains | rustc 1.96.0 (`ac68faa20`, `-O`) · deno 2.9.0 · Python 3.11.2 · wasmtime via `scripts/vl-host` |
+| VL execution | **always a prebuilt module** (`vl build` then `vl run x.wasm`); compile time is a separate column |
+| ratios | computed on **startup-subtracted** times |
+| configurations | 253 across 45 benchmarks; 1,771 individual timed samples |
+
+**Startup was measured, not assumed.** Empty-program medians this run: rust 2.22 ms, `vl run
+<prebuilt.wasm>` 4.90 ms, `vl run <src.vl>` 12.19 ms, deno 12.20 ms, python3 9.51 ms. Every ratio
+in this document subtracts these. This matters: 16 of 184 (benchmark, language) columns sit under a
+200 ms floor where the launcher is a visible fraction — 11 of them Rust columns, because Rust is
+5–40x faster than VL on those axes and no single N puts both inside a 1–5 s window.
+
+**`vl run <src>` was never used for a timing.** It carries 10–390 ms of compile time
+(`collections/map-string`: 1.47 s prebuilt vs 1.86 s from source = 27% inflation).
+
+**Warmup.** deno's JIT is given the work inside the amortising loop rather than a separate warmup
+pass; every benchmark runs long enough (≥ 350 ms on deno except the three sub-floor columns) that
+TurboFan has tiered up. Python pays interpreter startup, subtracted as above.
+
+**Python's reduced N.** Most benchmarks run Python at a reduced N with the scale factor recorded in
+`meta.json`; `run.sh` carries a `PYSCALE` table with a per-benchmark justification and prints
+**both** `py(raw)` and `py(norm)`. Three benchmarks are marked **PY-UNNORMALISABLE** and print `-`:
+`recursion/deeprec` and `recursion/tailcall` move *two* knobs (depth 5000→900 and repeats
+120000→10000), so at reduced N Python is no longer exercising the deep-stack axis at all; and
+`recursion/treewalk` is dominated by a one-time 1M-node tree build, where a naive 7.5x multiply
+overstates Python by 2.5x (measured: the honest extrapolation is build ≈ 2.0 s + 0.043 s/walk ≈
+8.4 s, not 21.4 s). **Do not quote a normalised Python number for those three.**
+
+### 2.2 Noise floor: 7.0%
+
+Taken as the larger of (a) an explicit repeat probe — one identical configuration re-run from
+scratch at the end of the sweep: vl 7.0%, rust 1.0%, deno 3.7%; and (b) the p50 within-configuration
+spread, 6.6%. **Differences under 7% are not differences.** Outlier accounting: 49 of 1,771 samples
+exceeded 1.5x their own configuration's median, spread across 49 of 253 configurations — exactly one
+apiece, i.e. isolated interference rather than broad noise, which the median absorbs. The
+min-of-7 cross-check agrees with the median-based ratio to within 3% on every row including all
+nine priority losses.
+
+### 2.3 These numbers are PRELIMINARY
+
+**The machine was not quiet.** Load average ran ~3.8 from unrelated work during the sweep, and the
+per-benchmark audits independently measured this box swinging **2.5–4x on identical binaries** when
+a second timing job ran, *even with `taskset` pinning* (hyperthread sibling contention:
+`recursion/flatcall`'s Rust binary read 2.53 s in a sequential sweep vs 0.996 s as min-of-5 alone).
+A 1-rep smoke sweep taken minutes before the recorded one read `arith/intdivmod` at 2744 ms where
+the 7-rep sweep reads 484 ms — **5.7x wrong on one row**. Consequently:
+
+> **Read the RATIOS, not the absolutes.** Two independent interleaved passes agreed to within ~10%
+> on every cross-runtime ratio; absolute levels drifted much more. An authoritative pass needs
+> exclusive use of the box (§9).
+
+Single-CPU pinning was deliberately rejected: it would squeeze deno's background optimising-compiler
+and GC threads and wasmtime's helper threads onto the mutator's cpu, systematically penalising the
+runtimes VL is being compared against. Under WSL2 this box presents 12 uniform SMT cores with no
+P/E asymmetry (`lscpu -e`), so single-core pinning bought nothing to offset that risk.
+
+### 2.4 The `-O3` column is real (it very nearly was not)
+
+`vl build -O3` shells out to `wasm-opt`, and **when it cannot find one it prints a note to stderr,
+writes the UNOPTIMISED module, and exits 0.** `wasm-opt` is not on `PATH` here — it lives at
+`node_modules/binaryen/bin/wasm-opt`. Two independent authors reported `-O3` numbers that were
+re-runs of the unoptimised module (byte-identical, md5 verified) before catching it. `run.sh` now
+exports `VL_WASM_OPT` *and* `cmp`s the `-O3` module against the `-O0` module, raising an `O3-NOOP`
+flag if they are byte-identical. **Zero benchmarks raised `O3-NOOP` in the recorded sweep.**
+
+### 2.5 What was verified, so it is not re-litigated
+
+The adversarial audit ran over all 46 benchmarks × 4 languages and established:
+
+- **Equivalence** — all 184 programs built and ran; all 184 outputs byte-identical to
+  `meta.expect` / `expectPython`. (This required fixing a schema split where 32 of 46 `meta.json`
+  files omitted the trailing newline their programs actually emit and 14 included it.)
+- **Nothing is optimised away** — the driving knob was independently halved for all 46 × 4 and
+  everything re-timed. Every ratio lands 1.45–2.3x, with sub-2.0 readings fully explained by fixed
+  setup cost, plus the intentionally non-linear ones (`binarytrees` exponential in depth,
+  `mandelbrot`/`spectralnorm` quadratic, `fib` exponential).
+- **No numpy** — the only Python imports across the suite are `sys`, `math` and `functools.reduce`.
+- **Builtin vs hand-written is matched** — `sort-heap`, `reverse-inplace` and `binsearch` are
+  hand-written in *all four*; `substr-search`, `int-format` and the map/set benchmarks use each
+  language's own builtin on all four sides; `set-ops` deliberately forgoes Rust/Python/ES2025 set
+  algebra because VL has none.
+- **No VL hack smell** — every `main.vl` is the plain idiomatic spelling; the fast variants are
+  isolated in `opt.vl` and labelled as defect witnesses, never as advice.
+
+### 2.6 The one thing the audit could NOT see, and corrected afterwards
+
+**Undisclosed rustc auto-vectorisation, hitting 9 of 46 benchmarks.** Every author ran the
+prescribed N-vs-2N scale test and every one PASSED — because LLVM did not *delete* the loop, it
+*widened* it. The scale test is structurally blind to vectorisation; only disassembly sees it.
+Confirmed by counting packed SSE2 ops inside `main::main` against the std-library baseline:
+`fill-sum` 54, `struct-soa` 42, `matmul` 24, `reverse-inplace` 18, `char-scan` 12, `struct-aos` 12,
+plus `i32-accum` (`paddd`/`pand`, 4-wide, 4 accumulator chains, 16x unrolled), `i64-accum`
+(`paddq`, 2-wide, 8x unrolled) and `struct-field`'s nested phase (`paddd`/`pshufd`/`shufps` with a
+horizontal reduction — which also makes that benchmark's own `notes` field factually wrong; corrected
+in its `meta.audit`).
+
+> **On those nine rows a chunk of every "VL is Nx slower than Rust" headline is SIMD width, not
+> codegen quality.** Concretely, on `arith/i32-accum` the raw multiple is 5.4x but
+> `rustc -O -C target-cpu=native` reads 27.7 ms against rustc-`-O`'s 57.4 ms, so the *scalar*
+> multiple is ~1.4x. Each affected `meta.json` carries the evidence under `meta.audit.rustVectorised`.
+
+The same correction runs the other way once: **`arith/bitcount` is the one benchmark where the
+unfairness favours VL.** VL reads 172.8 ms vs `rustc -O` 224.8 ms — "VL beats native Rust" — because
+rustc's default target is baseline x86-64 (SWAR popcount) while wasmtime compiles for the *host*
+(real `POPCNT`/`LZCNT`). Measured: `rustc -O -C target-cpu=native` = 151.2 ms, so host-tuned Rust
+beats VL 1.15x and **the win evaporates. Do not publish that win without the `target-cpu=native`
+column.**
+
+---
+
+## 3. The landscape
+
+Times are medians in **ms**, startup-subtracted. `vl/rust` is **headroom**, not a loss. `vl/deno`
+is the competitive number: **> 1.00 means VL, statically typed and AOT-compiled, lost to a JIT'd
+dynamic language.** `py(norm)` is Python's reduced-N time × its scale factor; `-` = no valid scalar
+factor (§2.1).
+
+### arith
+
+| benchmark | rust | **vl** | vl -O3 | deno | py(norm) | vl/rust | **vl/deno** | verdict |
+| --- | --: | --: | --: | --: | --: | --: | --: | --- |
+| `floatops` | 482.8 | **381.7** | 385.2 | 350.7 | 36293.3 | 0.79 | **1.09** | PAR |
+| `bitops` | 295.4 | **324.0** | 318.3 | 311.4 | 36262.9 | 1.10 | **1.04** | PAR |
+| `intdivmod` | 238.9 | **483.6** | 476.3 | 479.3 | 9075.0 | 2.02 | **1.01** | PAR |
+| `f64-accum` | 551.9 | **535.9** | 539.5 | 546.7 | 6466.7 | 0.97 | **0.98** | PAR |
+| `i32-accum` | 56.1 | **320.0** | 289.5 | 343.7 | 20434.7 | 5.70 | **0.93** | PAR |
+| `mixed-width` | 172.3 | **195.4** | 474.3 | 257.9 | 17659.3 | 1.13 | **0.76** | WIN |
+| `convert` | 304.9 | **277.2** | 279.6 | 423.1 | 23028.6 | 0.91 | **0.66** | WIN |
+| `bitcount` | 224.8 | **172.8** | 181.9 | 321.8 | 12360.5 | 0.77 | **0.54** | WIN |
+| `i64-accum` | 112.1 | **295.9** | 300.7 | 592.1 | 20609.7 | 2.64 | **0.50** | WIN |
+
+Scalar arithmetic is **healthy**. VL never loses to deno here and beats it on four of nine. The
+`i32-accum` / `i64-accum` / `bitcount` Rust columns are SIMD- or host-ISA-inflated (§2.6). Note
+`mixed-width`'s `-O3` column: 195 → 474 ms, the **worst `-O3` regression in the suite**.
+
+### arrays
+
+| benchmark | rust | **vl** | vl -O3 | deno | py(norm) | vl/rust | **vl/deno** | verdict |
+| --- | --: | --: | --: | --: | --: | --: | --: | --- |
+| `matmul` | 106.9 | **1585.0** | 1567.7 | 582.8 | 31440.4 | 14.83 | **2.72** | PRIORITY-LOSS |
+| `struct-soa` | 104.1 | **1250.4** | 1130.1 | 500.8 | 16764.5 | 12.01 | **2.50** | PRIORITY-LOSS |
+| `reverse-inplace` | 261.8 | **2099.1** | 1810.9 | 958.2 | 27469.8 | 8.02 | **2.19** | PRIORITY-LOSS |
+| `sort-heap` | 316.4 | **936.2** | 1020.9 | 563.1 | 15226.0 | 2.96 | **1.66** | LOSS |
+| `binsearch` | 1066.3 | **1464.3** | 1802.1 | 1999.5 | 19743.3 | 1.37 | **0.73** | WIN |
+| `fill-sum` | 93.1 | **1037.0** | 930.9 | 1479.7 | 16397.4 | 11.14 | **0.70** | WIN |
+| `struct-aos` | 330.0 | **1583.3** | 1557.4 | 2650.6 | 20251.4 | 4.80 | **0.60** | WIN |
+| `push-growth` | 102.4 | **522.1** | 459.4 | 1382.7 | 7145.8 | 5.10 | **0.38** | WIN |
+
+The **array-indexing family**. Every row here is dominated by the same per-element cost (§4.5); the
+ones VL wins are the ones where the *other* runtime pays more elsewhere (V8 bounds-checks and
+megamorphic-loads too), not the ones where VL is fast. `push-growth` (0.38) is the suite's biggest
+win — geometric list growth is genuinely good. `binsearch` carries an `-O3` **regression** (1464 →
+1802 ms).
+
+### strings
+
+| benchmark | rust | **vl** | vl -O3 | deno | py(norm) | vl/rust | **vl/deno** | verdict |
+| --- | --: | --: | --: | --: | --: | --: | --: | --- |
+| `str-eq` | 37.8 | **1894.3** | 1869.8 | 135.1 | 654.5 | 50.09 | **14.02** | PRIORITY-LOSS |
+| `substr-search` | 37.7 | **1063.5** | 1109.4 | 125.3 | 133.4 | 28.22 | **8.49** | PRIORITY-LOSS |
+| `int-format` | 399.6 | **845.1** | 805.9 | 661.8 | 5582.0 | 2.12 | **1.28** | LOSS |
+| `slice-extract` | 293.3 | **1296.1** | 1271.1 | 1191.1 | 17643.5 | 4.42 | **1.09** | PAR |
+| `char-scan` | 262.4 | **1409.6** | 1248.1 | 1648.2 | 22318.3 | 5.37 | **0.86** | PAR |
+| `token-count` | 331.9 | **1409.3** | 1489.7 | 2304.0 | 23523.2 | 4.25 | **0.61** | WIN |
+
+**The worst category in the suite.** The two priority losses are also the two benchmarks VL loses to
+CPython. Note the shape: VL's raw per-character scan (`char-scan` 0.86, `token-count` 0.61) is
+*fine* — it is 1.5x faster than V8's `charCodeAt` loop. Everything VL loses is a place where the
+other three runtimes drop into a byte-oriented builtin (SIMD `memcmp`, Boyer-Moore `indexOf`) and
+VL stays in the element-at-a-time world. **`strings/concat-build` is VOID** and excluded (§3.1).
+
+### collections
+
+| benchmark | rust | **vl** | vl -O3 | deno | py(norm) | vl/rust | **vl/deno** | verdict |
+| --- | --: | --: | --: | --: | --: | --: | --: | --- |
+| `set-ops` | 415.8 | **870.5** | 800.9 | 347.1 | 655.0 | 2.09 | **2.51** | PRIORITY-LOSS |
+| `map-string` | 503.6 | **1255.8** | 1244.0 | 628.9 | 1515.4 | 2.49 | **2.00** | LOSS |
+| `word-freq` | 228.2 | **1202.4** | 1165.4 | 756.3 | 2140.8 | 5.27 | **1.59** | LOSS |
+| `map-i32` | 367.9 | **1067.1** | 990.7 | 854.5 | 1449.7 | 2.90 | **1.25** | PAR |
+| `struct-field` | 443.3 | **997.0** | 343.8 | 890.8 | 104279.8 | 2.25 | **1.12** | PAR |
+| `struct-array-scan` | 260.2 | **752.9** | 673.9 | 1013.1 | 11298.5 | 2.89 | **0.74** | WIN |
+| `struct-alloc` | 671.0 | **282.1** | 284.3 | 475.5 | 6905.3 | 0.42 | **0.59** | WIN |
+
+**All four Python red alerts live here.** `struct-alloc` is the suite's most interesting win — VL is
+**2.4x FASTER than `rustc -O`** on allocation-heavy tree building (0.42x of Rust), because wasmtime's
+bump allocator beats malloc. `struct-field` carries a 2.90x `-O3` gap.
+
+### algorithms
+
+| benchmark | rust | **vl** | vl -O3 | deno | py(norm) | vl/rust | **vl/deno** | verdict |
+| --- | --: | --: | --: | --: | --: | --: | --: | --- |
+| `lambda-hot` | 113.1 | **2155.7** | 182.5 | 194.7 | 22031.6 | 19.05 | **11.07** | PRIORITY-LOSS |
+| `dispatch-table` | 140.6 | **1179.3** | 1216.1 | 353.4 | 11436.1 | 8.39 | **3.34** | PRIORITY-LOSS |
+| `spectralnorm` | 1058.7 | **2487.8** | 2273.0 | 1629.8 | 90425.6 | 2.35 | **1.53** | LOSS |
+| `nbody` | 1380.2 | **2962.1** | 3232.9 | 2451.6 | 115057.1 | 2.15 | **1.21** | PAR |
+| `mandelbrot` | 2658.4 | **3175.3** | 2860.0 | 2902.4 | 80421.2 | 1.19 | **1.09** | PAR |
+| `map-filter-reduce` | 121.3 | **923.0** | 513.0 | 912.5 | 6751.2 | 7.61 | **1.01** | PAR |
+| `binarytrees` | 4029.4 | **4438.9** | 4443.2 | 4730.0 | 42934.6 | 1.10 | **0.94** | PAR |
+
+The **function-value family** (`lambda-hot`, `dispatch-table`, `map-filter-reduce`) against the
+**whole-program** benchmarks. On real numeric programs with no function values in the loop
+(`mandelbrot` 1.09, `binarytrees` 0.94, `nbody` 1.21) VL is level with V8 and within 1.1–2.2x of
+Rust — that is the honest picture of VL's baseline codegen.
+
+### recursion
+
+| benchmark | rust | **vl** | vl -O3 | deno | py(norm) | vl/rust | **vl/deno** | verdict |
+| --- | --: | --: | --: | --: | --: | --: | --: | --- |
+| `mutual` | 556.2 | **1560.3** | 1269.9 | 659.0 | 64513.1 | 2.81 | **2.37** | PRIORITY-LOSS |
+| `flatcall` | 976.9 | **1428.3** | 1419.2 | 1197.5 | 78665.9 | 1.46 | **1.19** | PAR |
+| `flatcall-inlined` | 970.1 | **1418.2** | 1431.8 | 1195.0 | 61828.6 | 1.46 | **1.19** | PAR |
+| `treewalk` | 656.5 | **747.2** | 720.2 | 873.6 | - | 1.14 | **0.86** | PAR |
+| `tailcall` | 118.3 | **1202.5** | 1202.2 | 1653.7 | - | 10.16 | **0.73** | WIN |
+| `fib` | 541.2 | **870.0** | 867.4 | 1449.6 | 18389.9 | 1.61 | **0.60** | WIN |
+| `deeprec` | 640.8 | **973.2** | 988.2 | 2242.5 | - | 1.52 | **0.43** | WIN |
+| `ackermann` | 265.7 | **523.9** | 520.4 | 1350.1 | 39680.8 | 1.97 | **0.39** | WIN |
+
+**Non-tail call overhead is healthy** — `ackermann` (0.39) is the cleanest read on it and VL is 2.6x
+ahead of V8. `flatcall` vs `flatcall-inlined` is the control that matters: **1.19 / 1.46 on both**,
+identical whether the body is a call or inlined, which rules the call itself out as the cause of the
+residual 1.2–1.5x. That residual is the wasmtime/Cranelift scalar-loop floor, not a VL emitter
+defect. The two rows with a real problem — `tailcall` (10.16x Rust despite beating deno) and
+`mutual` — are one instruction away from being fixed (§5, P1).
+
+### 3.1 VOID: `strings/concat-build`
+
+Excluded from every table. **The Rust column measures literally nothing** — min-of-7 pinned wall
+time is 4.6 ms, *below* the 6.8 ms empty-Rust-program startup baseline. deno reads 56.0 ms (34%
+launcher), python3 71.5 ms (17%), VL 1730 ms. It is not fixable by raising N: work is linear in
+`REPS` for Rust/JS/Python but VL is **O(n²)**, so `REPS × 20` puts Rust at ~92 ms (still under the
+floor) while VL goes to ~34 s. There is no N where the fastest and slowest sides are simultaneously
+measurable.
+
+**The VL-internal finding survives and is reported in full (§5, P8):** doubling N multiplies VL by
+~3.5x while Rust/JS/Python stay 1.6–1.9x. `s = s + c` reallocates and copies **both** operands on
+every append.
+
+---
+
+## 4. The losses, ranked
+
+Fourteen benchmarks lose to deno. Nine are PRIORITY (≥ 2.0x). Each is stated with its root cause and
+its class: **compiler-fixable** (VL's emitter can close it), **runtime-engine** (Cranelift/wasmtime
+owns it), or **language-design** (the representation has to change).
+
+### 4.1 `strings/str-eq` — 14.02x deno, 50.1x rust, **0.35x python** · compiler-fixable + language-design
+
+**The worst row in the suite, and the only one that loses to CPython by 3x.** 24M comparisons of
+64-char strings at ~79 ns each in VL vs ~5.6 ns in V8. `-O3` does nothing (1.01x).
+
+97% of the benchmark is `__str_eq__`'s content-compare loop (per-phase: identity 32 ms, equal-content
+748 ms, early-mismatch 400 ms, late-mismatch 783 ms — 1963 ms of a 2014 ms run). **Two stacked
+causes.** (1) *Loop shape*: `emitStrEqFnCode` (`compiler/emit_sections.vl:1814`) emits one compare,
+one branch and two bounds-checked `array.get`s **per code point** — 64 iterations and 128 GC loads to
+answer a 64-char compare. (2) *Representation*: VL strings are `(array (mut i32))`, UTF-32, one
+WasmGC element per code point — 4 bytes of traffic per ASCII char, a non-hoisted bounds check and
+object-header length load per element, and decisively **WasmGC has no instruction that compares more
+than one element at a time.**
+
+Everything else about the function is fine and was ruled out by measurement: no allocation, no
+`global.get`, no `ref.cast`, length already hoisted, the `ref.eq` identity fast path present and
+working (total per-comparison fixed cost incl. call, `ref.eq`, 2 `array.len` and 2 list reads is
+5.3 ns = 0.3% of the run), `i % GROUPS` through a mutable global is already handled by Cranelift,
+and `wasm-opt -O3 --gufa` recovers 1.05x.
+
+The measured ladder (60M comparisons, hand-written `.wat` under the same `vl run` host,
+`taskset -c 2`, min-of-5), ns per 64-char compare:
+
+| rung | ns | vs today |
+|---|--:|--:|
+| [0] VL today — GC i32 array, 1 elem/iter | 124.7 | 1.0x |
+| [1] same array, unrolled 8x with an xor/or accumulator | 59.0 | 2.1x |
+| [2] linear memory `i32.load`, 1 elem/iter | 23.0 | 5.4x |
+| [3] linear memory `i32.load`, unrolled 8x | 16.0 | 7.8x |
+| [4] linear memory `i64.load`, 8 bytes/iter | 4.5 | **27.7x** |
+| [5] linear memory `v128 i8x16.eq`/`all_true` | 2.9 | 43x |
+| — `rustc -O` | ~1.9 | |
+| — V8 | ~11 | |
+
+Rung 1 → 3 is **3.7x and is pure WasmGC array-access overhead**: same unrolled loop, same 4-byte
+elements, only the container changed. **wasmtime is not the ceiling** — it does a 64-byte string
+compare in 2.9–4.5 ns in this exact process.
+
+Full write-up: `bench/findings/bench-strings-str-eq.md`.
+
+### 4.2 `algorithms/lambda-hot` — 11.07x deno, 19.1x rust · compiler-fixable
+
+**A single instruction: `struct.get $closure 0`, where VL declares field 0 of its closure
+fat-pointer as a `funcref`.** In wasmtime 47 a GC-struct field load of func top-type does **not**
+lower to a load — it lowers to a builtin **host call**,
+`get_interned_func_ref(vmctx, id, expected_ty)`
+(`wasmtime-internal-cranelift-47.0.2/src/func_environ/gc.rs:341-381`; wasmtime's own TODO in
+`wasmtime-environ-47.0.2/src/builtin.rs:110-115` says they want to remove it). Measured cost
+**9.40 ns per read** vs **0.15 ns** for reading any other field of the *same* struct — a 62x penalty
+on one field. The mirror libcall `intern_func_ref_for_gc_heap` costs **~41 ns per closure creation**.
+
+The bisection is decisive (hand-written WAT, one edit at a time, 100M iterations, floor = direct call
+with no field reads = 69.9 ms):
+
+| variant | ms | delta |
+|---|--:|---|
+| floor: direct call, no field reads | 69.9 | |
+| + read an **i32** field in the loop | 84.5 | +0.15 ns/read |
+| + read a **structref** field pointing at a live GC object | 84.3 | +0.14 ns/read |
+| + read the **funcref** field, value **DROPPED**, call still direct | **1009.9** | **+9.40 ns/read** |
+| VL's exact shape (env get + funcref get + `ref.cast` + `call_ref`) | 1072.7 | |
+| same, field 0 typed `(ref $fn)` so no `ref.cast` needed | 1229.0 | **14% WORSE** |
+| same, funcref+env loads hoisted above the loop | 101.5 | 10.6x |
+| field 0 replaced by an i32 table index + `call_indirect` | **146.2** | **7.3x** |
+
+**94% of the whole lambda penalty is one `struct.get` with the call left untouched, and the value is
+discarded.** `call_ref` itself is free (+0.1 ns when the funcref is in a local). The `ref.cast`, the
+closure allocation and the captured environment are all innocent — capturing adds only 1.0 ns/iter
+on top of non-capturing.
+
+**Why `-O3` appears to fix it (11.81x):** `wasm-dis` of the `-O3` module shows binaryen **deleted
+every closure** — no `struct.new`, no `call_ref`, no closure type; 258 bytes vs 560. It devirtualised
+and inlined, i.e. it *removed* the funcref field rather than making it cheap. That does not
+generalise: a closure arriving as a parameter, stored in an array, or one-of-several cannot be
+devirtualised at all — which is exactly why `dispatch-table` (§4.3) reads `-O3` 0.97x.
+
+Full write-up: `bench/findings/bench-algorithms-lambda-hot.md`.
+
+### 4.3 `strings/substr-search` — 8.49x deno, 28.2x rust, **0.13x python** · compiler-fixable
+
+`String.indexOf` is inlined by `emitStrIndexOf` (`compiler/wasmEmit.vl:7437`) as a textbook naive
+O(n·m) scan with **no skip heuristic**, and it re-loads the needle character from its GC array every
+iteration — so the overwhelmingly common first-character-mismatch path costs **two** bounds-checked
+`array.get`s per candidate position instead of one. Rust (memchr + two-way), V8 (Boyer-Moore-Horspool
+with a bad-char table) and CPython (Crochemore-Perrin + Bloom skip) all skip; VL visits all n
+positions. The emitter's own doc comment concedes it: *"Mirrors the host's `__string_index_of__`
+naive O(n·m) scan"*.
+
+The loop itself is clean — wasm locals, no allocation, no `global.get`, no `ref.cast`, no boxing —
+so this is purely an algorithm choice. The inverse control proves it: a **hand-written naive loop in
+VL source measures 1225 ms, 11% SLOWER than the builtin's 1103 ms**. The builtin's lowering is good;
+the entire gap is the algorithm it refuses to use.
+
+Measured, 480 full 1M-char scans: VL 2.213 ns/char, rust 0.081, deno 0.265, python 0.271. Prototypes
+made by disassembling the shipped module, replacing **only** the inlined `indexOf` sequence, and
+reassembling (`compiler/**` untouched, both print `3173880`): first-char skip with the needle char
+hoisted = **653 ms (1.69x)**, allocation-free; Boyer-Moore-Horspool with a 256-entry table indexed
+`c & 255` = **352 ms (3.13x)**. `-O3` is reproducibly 4.4% **worse**.
+
+**A length gate is mandatory:** 3M short-haystack `indexOf` calls = 95 ms (28 ns/call), but 3M BMH
+table builds = 275 ms (88 ns each), so unconditional BMH would be a ~4x regression on short strings.
+
+Full write-up: `bench/findings/bench-strings-substr-search.md`.
+
+### 4.4 `algorithms/dispatch-table` — 3.34x deno, 8.4x rust · compiler-fixable
+
+**Same root cause as `lambda-hot`**, reached by a different route and *not* rescued by `-O3` (0.97x).
+Bisection on the compiler's own WAT (one change each, output unchanged): control 645 ms; drop the
+bounds check 606; delete the `ref.cast` 680; delete the closure record entirely, plain `funcref[]`
+669; force a single call target so nothing mispredicts 630; **keep all the loads but make the call
+direct 106 ms.** Isolation on a loop-invariant struct, 50M iterations: read its **i32** field and
+`drop` = 50 ms; read its **funcref** field and `drop` = **563 ms**. That a *dropped* value still
+costs proves it is an opaque call, not a load — Cranelift DCEs an unused immutable-field load.
+
+Collector-independent: `VL_GC=auto/tracing/refcount/none` → 520/515/531/539 ms. Not a GC barrier.
+Raw call costs with no GC objects: direct 55 ms, `call_ref` off a local 60 ms (+0.1 ns),
+`call_indirect` 4-way 111 ms (+1.1 ns).
+
+**Why `-O3` reads 0.97x here:** GUFA + closed-world genuinely removes the env param, the bounds
+check, the null check and the cast, narrowing the loop to
+`call_ref (struct.get $1 0 (array.get ...))` — and it is still 1329 ms, because that `struct.get` is
+still the libcall, now on the *slower* `get_typed` path (engine signature lookup + subtype check).
+The emitted wasm is already near-optimal at the wasm level; **only changing what VL stores in the
+field can help.**
+
+Per-phase, the axis in one line: going indirect costs Rust 2.1x, V8 2.7x, **VL 5.3x** over the
+if/else chain.
+
+Full write-up: `bench/findings/bench-algorithms-dispatch-table.md`.
+
+### 4.5 `arrays/matmul` 2.72x · `arrays/struct-soa` 2.50x · `arrays/reverse-inplace` 2.19x · `algorithms/spectralnorm` 1.53x · `arrays/sort-heap` 1.66x — **the array-indexing family** · mostly runtime-engine
+
+One cause, five benchmarks. Neither `-O3` (1.01x on matmul) nor any hand-written `opt.vl` (0.99x)
+moves it, so it is below the source level entirely.
+
+**Cranelift's WasmGC `array.get`/`array.set` lowering in wasmtime 47 is worth 3.41x on this kernel,
+and that is 73% of VL's excess.** Per element access wasmtime emits ~23 x86 instructions and 5
+conditional branches: a stack-slot **reload** of the `(ref $arr)` local (reference locals live in
+stack-map-tracked slots, so `local.get` is a memory load), a null check, a load of the array length
+from the GC heap, the wasm-visible bounds check, a three-op loop-invariant object-size overflow
+chain, a second implementation-internal object-size bounds check, and an
+`end - (obj_size - (idx*8+24))` address dance that never folds into an x86 `[base+idx*8+disp]` mode.
+Because the ref SSA value differs each iteration, the readonly length load and the whole overflow
+chain cannot be GVN'd or LICM'd. Upstream:
+`wasmtime-internal-cranelift-47.0.2/src/func_environ/gc.rs`, `array_elem_addr` (:945) and
+`emit_array_size_info`, which carry two explicit TODOs naming exactly this.
+
+**V8 proves it is the engine, not WasmGC.** The *same bytes*, warm TurboFan:
+
+| module | V8 | wasmtime |
+|---|--:|--:|
+| linear memory | 414.6 ms | 366 ms (wasmtime 1.13x faster) |
+| raw `(array (mut f64))` | 423.7 ms | **1249 ms (wasmtime 2.95x slower)** |
+| + VL's header struct | 408.4 ms | 1382 ms |
+| + VL's `select` len guard | 519.5 ms | 1553 ms |
+| VL's actual `main.wasm` | | 1528 ms (== the reconstruction) |
+
+**V8 pays 2% to move this kernel from linear memory to a WasmGC array; wasmtime pays 241%.** V8 also
+hoists the header-struct loads for free where wasmtime charges 10.6%.
+
+**The part that is ours is 18.2%**, and 9.9% of it is soundly recoverable today:
+`compiler/wasmEmit.vl:6254 emitListIdxGuard` re-loads the list header's backing-array ref
+(`struct.get 0`) *and* `len` (`struct.get 1`) on **every single element access**. Bisection
+(min-of-11 interleaved): emitted 1527.9 → hoist both into locals across the loop **1376.5 (−9.9%)**
+→ also drop the `select` guard 1249.1 (−18.2% cumulative). The remaining 8% needs range analysis to
+prove `i < len` from the loop bound; the guard cannot simply be deleted (`len < cap` after `.push`,
+and the slack reads zero silently).
+
+Decomposition of VL's 1528 ms: 225 ms (rustc scalar, `-C llvm-args=-vectorize-loops=false`) → ×1.63
+= 366 ms (same loop in wasm on linear memory — a reasonable wasm tax) → ×3.41 = 1249 ms (Cranelift
+WasmGC array lowering) → ×1.22 = 1528 ms (VL's header struct + len guard). **Rust's own column is
+2.27x SIMD** (99 ms vectorised vs 225 ms scalar).
+
+`struct-soa` is the sharpest statement of the family: **VL WINS the AoS side** (`struct-aos` 0.60)
+and **loses the SoA side 2.5x**. Reading 2 elements from 2 different `i32[]` per iteration is 2.5x
+V8; reading 2 fields from one inline record is fine. That is per-array-access overhead, not layout.
+`reverse-inplace` is the purest read — no arithmetic at all, just 4 bounds-checked accesses per
+iteration — and its `toplevel.vl` measures identical (1.01x), which rules out the globals cliff.
+
+Full write-up: `bench/findings/bench-arrays-matmul.md`.
+
+### 4.6 `collections/set-ops` 2.51x · `map-string` 2.00x · `word-freq` 1.59x · `map-i32` 1.25x — **the string-hashing family** · compiler-fixable
+
+**All four Python red alerts.** Normalised CPython is 1.33x **faster** than VL on `set-ops`
+(py/vl 0.75), and VL is only 1.21x / 1.78x / 1.36x ahead on the other three.
+
+**VL recomputes a string's hash on every map/set probe, and the hash is length-proportional over the
+`array i32` code-point storage.** V8 and CPython both cache the hash in the string object. Isolated
+by differencing r=120 against r=20 passes so string *construction* is fully subtracted, 10M lookups
+against a 100k-entry `{[string]: i32}`:
+
+| key length | VL | deno | python |
+|---|--:|--:|--:|
+| 9 chars | 693 ms (69 ns) | 195 ms (20 ns) | 710 ms |
+| 33 chars | 1426 ms (143 ns) | 189 ms (19 ns) | 840 ms |
+| 97 chars | 3210 ms (321 ns) | 185 ms (19 ns) | 812 ms |
+
+**VL scales linearly with key length (~2.6 ns per code point); V8 is dead flat; CPython is flat.** A
+miss-only control (probe keys prefixed `"Z"` so the compare almost never runs, isolating the *hash*)
+reads 377 ms per 10M at length 10 and 1438 ms at length 98 — **the hash alone is 3.8x more expensive
+for a 10x longer key**, so it is the hash being recomputed, not the compare.
+
+That `map-i32` — the dedicated **monomorphic i32 key representation** from the B6a/B6b work — still
+lands at 1.25x deno and only 1.36x CPython is a separate finding: the specialised rep did not buy
+what was expected.
+
+### 4.7 `recursion/mutual` — 2.37x deno, 2.8x rust · compiler-fixable, **already root-caused**
+
+Both legs of the cycle are tail calls and **VL emits a plain `call`.** Patching the two
+`(return (call $n))` into `(return_call $n)` in VL's **own** emitted module and running it on the
+**unmodified** host gives **1.97x** (0.971 s → 0.494 s, byte-identical output) — which closes the
+whole gap to deno. `-O3` recovers only 1.23x, by inlining one leg. Same defect as
+`recursion/tailcall`, which reads 10.16x of Rust and 2.02x idiom-gap despite *beating* deno.
+
+### 4.8 `strings/int-format` — 1.28x deno · library-quality
+
+Two findings. (1) The builtin `toString(i32)` is 1.28x behind V8's `String(v)` — modest. (2) Much
+worse: `stdfmt.vl`, which uses `std:fmt`'s pure-VL `toStr()`, measures **4477 ms — 5.3x slower than
+the builtin.** `toStr` is the **only** option for `i64`, which the builtin refuses, so **any i64
+formatting pays that 5.3x on a path users cannot avoid.**
+
+---
+
+## 5. PERFORMANCE CONSTRAINTS — the actionable list
+
+This is the point of the exercise. Every compiler-fixable item, as a work item naming the file and
+function, ranked by **(win × confidence) / effort**. "Prototyped" means a hand-edited version of
+VL's own emitted module (or hand-written `.wat` assembled with `wasm-as`) was run on the
+**unmodified** host and produced **byte-identical output**.
+
+| # | item | site | measured win | conf | effort |
+|---|---|---|--:|---|---|
+| **P1** | emit `return_call` in tail position | `compiler/wasmEmit.vl:11272 emitReturnValue` (+ a new `fbReturnCall` in `compiler/emit_bytes.vl`, alongside `fbCall` at :526) | **2.06x** tailcall, **1.97x** mutual, recursion depth 16.2k → ≥ 5M | prototyped | **XS** |
+| **P2** | closure fat-pointer: drop the `funcref` field, dispatch via `call_indirect` on the id it already stores | `compiler/emit_sections.vl:2490` (elem segment), `:3536` (struct type); `compiler/wasmEmit.vl:1362 emitClosureValueCore`, read sites `:9308`, `:11181 emitMfInvoke`, `:14549` | **5.4x** lambda-hot, **3.3x** dispatch-table, **−9.4 ns per element on every `.map`/`.filter`**, **−41 ns per closure allocation, program-wide** | prototyped | **M** |
+| **P3** | unroll `__str_eq__`'s element loop 8x with an xor/or accumulator + scalar remainder | `compiler/emit_sections.vl:1814 emitStrEqFnCode` | **2.17x** str-eq (2014 → 927 ms); also one of the compiler's own hottest helpers | prototyped | **S** |
+| **P4** | `indexOf`: hoist `needle[0]` + first-char skip; then Boyer-Moore-Horspool above a length gate | `compiler/wasmEmit.vl:7437 emitStrIndexOf` | **1.69x** (skip, allocation-free) then **3.13x** (BMH) | prototyped | **S** then **M** |
+| **P5** | hoist the list header's backing ref + `len` across a loop that cannot reallocate | `compiler/wasmEmit.vl:6254 emitListIdxGuard` | **9.9%** on matmul soundly today (18.2% ceiling); helps the whole array family | prototyped | **M** |
+| **P6** | fuse `a / b` and `a % b` on the same operands — lower the remainder as `a − q*b` | i32 div/rem emit in `compiler/wasmEmit.vl` | **1.99x** intdivmod | measured A/B | **S** |
+| **P7** | cache a string's hash instead of recomputing it per probe | `compiler/emit_sections.vl:1743 emitStrHashFnCode`, `:1931 emitMapProbeFnCode`; requires a hash slot in the string rep | up to **4.6x** on long keys; clears 3 of 4 Python red alerts | measured, **site not pinned** | **L** |
+| **P8** | `s = s + c` is O(n²) — `__str_concat__` allocates a fresh array and does 2 `array.copy` per append | `compiler/emit_sections.vl:1881 emitStrConcatFnCode`, `compiler/wasmEmit.vl:6647 emitStrConcat` | asymptotic: N-doubling costs VL 3.5x vs 1.6–1.9x elsewhere | measured | **L** |
+| **P9** | inline small leaf functions in the **default** build | the `-O3`-gap family | **2.90x** struct-field, **1.80x** map-filter-reduce, 8–13% sort-heap | measured via `-O3` A/B | **L** |
+| **P10** | top-level `const` emits a **mutable** wasm global | global emit path | not separately measured; blocks constant-folding a loop bound | `wasm-dis` witness | **XS** |
+| **P11** | fix the two `-O3` **regressions** before the release profile is trusted | `docs/internals/opt-profile-design.md` pipeline | `mixed-width` **2.43x SLOWER**, `binsearch` **1.23x SLOWER** | measured | **S** (gate) |
+| **P12** | UTF-8 bytes in linear memory for `string` | representation | **27.7x** on the compare itself; would also fix P7 and P8 | prototyped at `.wat` level | **XL** |
+| **P13** | linear-memory backing store for scalar arrays (`i32[]`/`i64[]`/`f32[]`/`f64[]`) | representation | **3.41x** on matmul's kernel; sidesteps the Cranelift bug entirely | prototyped at `.wat` level | **XL** |
+
+### P1 — `return_call` (do this first; it is the cheapest certain win in the suite)
+
+VL never emits wasm `return_call` for a call in tail position. `wasm-dis` of `bench/recursion/tailcall/main.wasm` shows
+`(return (call $0 (i32.sub (local.get $0) (i32.const 1)) ...))`. Rebuilding that same module with the
+one instruction changed via `wasm-as --enable-tail-call` and running it on the unmodified `vl` host:
+**1.313 s → 0.638 s (2.06x)** on `tailcall` and **0.971 s → 0.494 s (1.97x)** on `mutual`, both
+byte-identical output. It also lifts the recursion depth cap: `print(digestTail(5_000_000, 0))` traps
+with `wasm trap: call stack exhausted` today and prints `407392` with `return_call`.
+
+**No host change is needed** — `scripts/vl-host/src/main.rs` sets `wasm_gc` and
+`wasm_function_references` but never touches `wasm_tail_call`, and the patched module runs anyway
+(the proposal is on by default in wasmtime 47). `-O3` does not fix it: `wasm-dis` of the `-O3` module
+still shows `call $0`. `emit_bytes.vl` has no `fbReturnCall`; that is the one new byte emitter.
+
+It matches `opt.vl` exactly (594.5 ms vs the prototype's 638 ms, inside noise), so **no user
+contortion would be needed after the fix** — see §6.
+
+### P2 — closure dispatch (the largest blast radius)
+
+Stop putting the code pointer in a GC-struct `funcref` field. **Field 2 of the closure record already
+holds `gImports + fe`, the wasm function index** (`fbI32Const(gImports + fe)`, kept only as the `==`
+identity token), and `compiler/emit_sections.vl:2490-2509` already emits an element segment listing
+every user function at exactly that index — as a *declarative* segment (flags `0x03`), purely to
+legalise `ref.func`. Four edits:
+
+1. `emit_sections.vl:2490-2509` — promote the declarative segment to a **`funcref` table of
+   `gImports + n` entries plus an ACTIVE segment at offset `gImports`**, over the same
+   already-computed index vector.
+2. `emit_sections.vl:3536-3552` — **drop field 0** from the closure struct (`{ env: structref, id: i32 }`).
+   Dropping rather than merely not-reading is strictly better: it also removes the ~41 ns
+   `intern_func_ref_for_gc_heap` at every closure *creation*.
+3. `wasmEmit.vl:1362 emitClosureValueCore` — drop the `fbRefFunc(gImports + fe)`; field 2 unchanged.
+4. The read sites (`wasmEmit.vl:9308`, `:11181 emitMfInvoke`, `:14549`) — replace
+   `fbStructGet(cloStructIdx, 0); fbRefCast(sig); fbCallRef(sig)` with
+   `fbStructGet(cloStructIdx, 2); fbCallIndirect(tableIdx, sig)`. `emit_bytes.vl` has no
+   `fbCallIndirect` either; that is the second new byte emitter.
+
+**Soundness is preserved, not weakened.** `call_indirect` takes the same type index and performs the
+same runtime signature check the `ref.cast` was performing, and traps on mismatch, so every existing
+floor keeps its meaning. The interned `$fnsig` functypes and the whole `cloSigKeys`/`cloSigKeyExt`
+machinery are untouched. Function-value `==` already compares the id field.
+
+Prototyped in WAT against the same wasmtime: `lambda-hot` phase 3 1020.5 → ~146 ms (7.0x), phase 4
+1121.2 → ~160 ms (7.0x), whole benchmark 2258.6 → ~415 ms (5.4x); `dispatch-table` phase 2 623 →
+136 ms (4.6x), phase 3 569 → 151 ms (3.8x), whole benchmark 1255 → 382 ms (3.3x), which moves VL
+from 3.1x **slower** than deno to **faster** than deno. Table size is irrelevant to the win (a
+4096-entry table measured 134 ms), so it scales to a real program's whole function set.
+
+> **Do NOT "fix" this by typing field 0 more precisely — measured 14% SLOWER** (it takes wasmtime's
+> `get_typed` path with an engine subtype check).
+
+**Complementary, cheaper, strictly better where it applies:** hoist the closure unpack out of loops
+when the closure expression is a local not reassigned in the loop — measured 1072.7 → 101.5 ms
+(10.6x). Both together give ~380 ms.
+
+**Prioritise `emitMfInvoke` regardless.** It pays the 9.4 ns libcall **once per element**, confirmed
+in the disassembly of a 10M-element map, so **every idiomatic `xs.map(f)` / `xs.filter(f)` in VL is
+carrying it today** — including inside the self-hosted compiler.
+
+### P3 — `emitStrEqFnCode`
+
+Emit an 8x-unrolled element loop with an xor/or accumulator plus a scalar remainder loop, keeping the
+`ref.eq` and length gates exactly as they are. Whole benchmark 2014 → 927 ms; per phase: identity
+32→34 (noise, `ref.eq` still short-circuits), equal-content 748→347 (2.16x), differ-at-index-0
+400→212 (1.89x — it improves *even though* unrolling does 7 wasted loads on an early mismatch),
+differ-at-last 783→358 (2.19x). **No phase regresses.** Independently confirmed in the source
+language: a pure-VL `streq8()` with the same unroll takes phase B from 735 → 344 ms, matching the
+`.wat` prototype's 346 ms.
+
+While in that function: the loop is currently `if (i>=n) then {} else { ... br }` — an if/else with
+an **empty then-arm** around a `br` to the loop header. A bottom-tested `br_if $done` loop is the
+idiomatic shape; it measured inside noise (821 vs 838 ms), so do it for readability, not perf.
+
+`__str_eq__` is one of the compiler's own hottest helpers (its `ref.eq` fast path was worth −3.8% of
+a self-compile), so **re-run the self-compile ladder — this should show there too.**
+
+### P4 — `emitStrIndexOf`
+
+Step 1, unconditional and zero-risk: hoist `needle[0]` into a scratch local and make the outer loop a
+single-load first-character skip. Allocation-free, ~10 emitted instructions, one extra i32 scratch
+slot, no threshold needed. **1.69x.**
+
+Step 2, gated: escalate to Boyer-Moore-Horspool above `len(s) >= 64 && len(sub) >= 2`. 256-entry
+table via `array.new`, indexed `c & 255` — **sound for code-point strings without a range check,
+since aliasing can only produce a SMALLER, always-safe shift**. Reuse the already-typed-`$0`
+`strScratchBase + 2` ref slot so only one new i32 slot is needed (frame width at
+`compiler/emit_sections.vl:689` / `compiler/emit_bytes.vl:854`). **3.13x.** The gate is mandatory —
+88 ns table build vs 28 ns for an entire short search. Instrumented shift quality: 874,147 positions
+examined per 16-needle pass (~109k of 1M per full scan, average shift 9.2).
+
+**Do NOT file this against `-O3`, and do NOT pursue an i8 string representation for it** — narrowing
+the element from i32 to i8 is worth only 1.26x (792 → 630 ms) and is not worth the project.
+
+### P5 — `emitListIdxGuard`
+
+Cache the list header's backing-array ref and `len` in locals across a loop body that neither
+reassigns the binding nor can reallocate it (no `.push`, no call that could reach it). matmul's inner
+loop has zero calls so the analysis is trivial. **This is the transform V8 performs for free** (408 vs
+424 ms = noise) where wasmtime charges 10.6%. `wasm-opt -O3` recovers none of it — it will not hoist
+a `struct.get` past an `array.set` it cannot prove non-aliasing.
+
+### P7 — string hash caching (site not pinned; be honest about that)
+
+The witness is the key-length sweep in §4.6, which is unambiguous about the *behaviour*. The
+*implementation* was not traced to a line: `emitStrHashFnCode` (`compiler/emit_sections.vl:1743`)
+computes a masked non-negative FNV-1a over the code-point array, and `emitMapProbeFnCode` (`:1931`)
+calls it per probe. Note `emitMapProbeI32FnCode` (`:2015`) already has a **stored-hash** notion, so
+the map side may already be half-built; **what is missing is a place to cache the hash on the string
+itself.** That is a representation change (a mutable `hash` slot alongside the code-point array, or
+P12's linear-memory string), which is why this is L and not S.
+
+### P11 — the `-O3` regressions
+
+A release profile that makes a benchmark 2.43x slower is a finding in its own right.
+`arith/mixed-width`: 195.4 → 474.3 ms — `wasm-opt --closed-world -O3 --gufa` is actively destroying
+the mixed-width cast sequence. `arrays/binsearch`: 1464.3 → 1802.1 ms. Separately, `-O3` is a
+**wash or worse on the entire arith and arrays categories** and costs ~380 ms of build time against
+~9 ms plain. **Gate the release profile on this suite before recommending it.**
+
+### Not ours — track, do not chase inside `compiler/**`
+
+- **Cranelift `array_elem_addr` / `emit_array_size_info`** (§4.5). File upstream: fold the
+  wasm-visible bounds check into the internal object-size check, and keep reference locals in
+  registers so the length load and overflow chain can be GVN'd/LICM'd. Until it lands, **~3.4x on
+  every hot `T[]` element loop is a known platform ceiling.**
+- **`get_interned_func_ref`** (§4.2). wasmtime's own TODO says they want to remove it. P2 routes
+  around it rather than waiting.
+
+---
+
+## 6. IDIOM VS HACK
+
+**Every entry here is a DEFECT.** The project's goal is that users must not need hacks to get good
+performance, so a gap between `main.vl` and a contorted variant is filed, never recommended. `opt.vl`
+exists as *documentation of the gap*.
+
+Rows are from the recorded sweep's variant table unless noted. Two are **not**:
+`bench/strings/str-eq/opt.vl` and the `substr-search` BMH probe were written by the follow-up
+diagnoses *after* the sweep, so their absolutes come from those runs' own interleaved min-of-N
+(which read `str-eq` at 2014 ms where the sweep reads 1894 ms — §2.3: read the ratios, not the
+absolutes) and they do not appear in `bench/results/summary.md`.
+
+| benchmark | idiomatic | variant | ratio | the "hack" | ruling |
+|---|--:|--:|--:|---|---|
+| `algorithms/lambda-hot` | 2155.7 | opt 240.1 | **8.98x** | *stop using a lambda* — lift the body to a named top-level function | **not a language-design defect**: there is no VL spelling of a lambda that avoids it. Closes entirely with P2. |
+| `strings/int-format` | 845.1 | stdfmt 4477.5 | **5.3x** (inverse) | the *idiomatic library* path is the slow one | `std:fmt`'s `toStr()` is 5.3x the builtin, and is the **only** option for i64. Library-quality defect on an unavoidable path. |
+| `arith/i32-accum` | 320.0 | opt 155.8 | **2.05x** | hand-unrolled 4-accumulator loop | the simplest loop in the suite has a 2x hand-optimisation available. `-O3` recovers only 1.11x. |
+| `arith/intdivmod` | 483.6 | opt 238.3 | **2.03x** | `const q = i / d; sum + q + (i - q * d)` | P6. `-O3` recovers nothing (1.02x). deno is equally unfused (2.489 ns/iter), so VL merely *ties* JS here. |
+| `recursion/tailcall` | 1202.5 | opt 594.5 | **2.02x** | hand-written accumulator loop | P1 matches `opt.vl` **exactly**, so after the fix no contortion is needed at all. |
+| `strings/str-eq` | 2014 | streq8 1259 | **1.60x** | user-space 8x-unrolled compare | the hack is **strictly worse than the compiler fix and cannot be made equal**: VL exposes no reference-identity operator, so a user-space compare cannot reproduce `__str_eq__`'s `ref.eq` fast path and pays a full 64-element scan on the identity phase (that is the entire 1259 vs 927 difference). It wins 3 phases and loses the 4th. **Only the compiler can have both.** |
+| `arith/f64-accum` | 535.9 | main_global 830.4 | **1.55x** | *avoid top-level `let`* | the **globals cliff**, surviving half — see below. |
+| `arith/i64-accum` | 295.9 | main_global 416.3 | **1.41x** | same | the other surviving half. |
+| `collections/struct-array-scan` | 752.9 | opt 551.0 | **1.37x** | destroy the record type into parallel `i32[]` columns | a clear WIN against deno that is still leaving a third behind. See §8 (no inline-struct array rep). |
+| `strings/slice-extract` | 1296.1 | opt 988.5 | **1.31x** | hand-spelled window | PAR against deno, 31% left on the floor. `-O3` recovers 2%. |
+| `strings/substr-search` | 1103 | BMH in VL source 423 | **2.61x** | hand-write Boyer-Moore-Horspool in user code | the inverse control matters: a hand-written **naive** loop is 1225 ms, i.e. 11% *slower* than the builtin — so the builtin's inlining is good and the whole 2.61x is the algorithm it refuses to use. P4. |
+| `algorithms/dispatch-table` | 623 (phase 2) | 104 (if/else chain) | **6.0x** | *do not use a dispatch table* | the workaround does not survive contact with a registry of 50 handlers. P2. |
+
+### The top-level-`let`-becomes-a-global cliff (fix in flight)
+
+Briefed as 1.6–3.2x. **At this commit it is largely GONE and it is not this suite's to fix** (#1321
+landed in this tree), but it was measured on 8 probe pairs and it **survives on the wide scalars**:
+
+| probe pair | ratio | |
+|---|--:|---|
+| `arith/f64-accum` main vs `main_global` | **1.55x** | **survives** |
+| `arith/i64-accum` main vs `main_global` | **1.41x** | **survives** |
+| `arrays/fill-sum` main vs `toplevel` | 1.00x | gone |
+| `arrays/reverse-inplace` main vs `toplevel` | 1.01x | gone |
+| `collections/map-i32` main vs `toplevel` | 0.95x | gone |
+| `collections/struct-field` main vs `toplevel` | 1.01x | gone |
+| `strings/char-scan` main vs `globals` | 0.97x | gone |
+| `strings/token-count` main vs `globals` | 1.05x | gone |
+
+The seven recursion benchmarks that spell their hot loop at top level are **not** penalised for it
+(`flatcall` top-level 1.477 s vs the same code in a function 1.470 s). **Writing a script at top
+level — the most natural VL spelling — still costs 1.4–1.55x on i64/f64 accumulation**, and
+`vl build -O3` is not a workaround: `wasm-dis` of the `-O3` module still counts all six
+`global.get`/`global.set` in the loop body.
+
+Related and unfixed: **top-level `const` emits a MUTABLE wasm global** (P10) —
+`(global $global$0 (mut i64) (i64.const 1000000000))` for `const n: i64 = 1_000_000_000`, so the
+trip count is re-read every iteration and nothing can constant-fold it.
+
+### The `-O3` gap is an idiom-vs-hack defect too
+
+Where `vl build -O3` is much faster than the default build, **the default build is the idiom and
+users are paying for not knowing a flag**:
+
+| benchmark | default | `-O3` | gap |
+|---|--:|--:|--:|
+| `algorithms/lambda-hot` | 2155.7 | 182.5 | **11.81x** (`-O3` beats deno) |
+| `collections/struct-field` | 997.0 | 343.8 | **2.90x** (default LOSES to deno; `-O3` BEATS rustc `-O`) |
+| `algorithms/map-filter-reduce` | 923.0 | 513.0 | **1.80x** |
+| `recursion/mutual` | 1560.3 | 1269.9 | 1.23x |
+
+`vl run` has **no `-O` flag at all** (wasm-opt is wired only into `vl build -O/-O3`,
+`scripts/vl-host/src/main.rs:1355-1372`), so **the default path every user and the self-hosted
+compiler take always pays this.**
+
+---
+
+## 7. HEADROOM VS RUST
+
+Median `vl/rust` is 2.49x, geomean 3.04x — a reasonable place for a WasmGC language. The tail is
+where the information is. **After discounting the nine auto-vectorised rows (§2.6), the largest
+genuine gaps are:**
+
+| benchmark | vl/rust | how much is SIMD width | what is left |
+|---|--:|---|---|
+| `strings/str-eq` | 50.09 | none (Rust's is SIMD `memcmp`, but VL has no bulk path at all) | representation |
+| `strings/substr-search` | 28.22 | none (algorithm) | P4, then representation |
+| `algorithms/lambda-hot` | 19.05 | none | P2 |
+| `arrays/matmul` | 14.83 | **2.27x** | Cranelift + P5 + P13 |
+| `arrays/struct-soa` | 12.01 | 42 packed ops in `main::main` | Cranelift + P5 |
+| `arrays/fill-sum` | 11.14 | 54 packed ops | Cranelift + P5 |
+| `recursion/tailcall` | 10.16 | none | **P1** |
+| `algorithms/dispatch-table` | 8.39 | none | P2 |
+| `arrays/reverse-inplace` | 8.02 | 18 packed ops | Cranelift + P5 |
+| `algorithms/map-filter-reduce` | 7.61 | none | P2 + P9 |
+
+### "WasmGC cannot do this" — the hard ceiling
+
+- **There is no bulk compare.** WasmGC has no instruction that compares more than one array element
+  at a time. A 64-char string compare is 64 iterations, full stop. This is why `str-eq`'s ladder
+  bottoms out at 59 ns in the GC-array world and only reaches 4.5 ns by leaving it (§4.1).
+- **There is no bulk find.** Same reason `indexOf` cannot vectorise; ~1.15–1.31 ns per character
+  *touched* is the hard floor even after BMH (~14x off Rust's 0.081 ns/byte `memchr`).
+- **No SIMD anywhere in the pipeline.** VL emits no vector instructions; neither Cranelift nor
+  `wasm-opt` will introduce them. On a trivial reduction VL's emitted wasm is already minimal (a
+  4-instruction loop body) and its scalar issue rate is near-optimal (~1.5 cycles/iter), so the
+  remaining gap to `rustc -O` on `i32-accum` is **entirely SIMD width**.
+- **Reference locals are stack slots.** Cranelift keeps `(ref $arr)` locals in stack-map-tracked
+  slots, so `local.get` on an array is a memory load, which is what defeats GVN/LICM on the length
+  and the overflow chain (§4.5). This is arguably a Cranelift bug rather than a WasmGC law — V8 does
+  not pay it — but VL cannot fix it.
+
+### "We have not done this yet" — the roadmap
+
+In dependency order, largest first:
+
+1. **P2 closure dispatch** — 5.4x/3.3x on two benchmarks and a program-wide `.map`/`.filter` tax.
+2. **P1 `return_call`** — 2x on two benchmarks plus a 300x recursion-depth ceiling lift.
+3. **P12 UTF-8 strings in linear memory** — 27.7x measured on the compare itself; subsumes P3, P7
+   and P8. `std/buffer.vl` already has the machinery. This is the single largest item on the board
+   and it is a language-representation decision, not an emitter change.
+4. **P13 linear-memory backing for scalar arrays** — 3.41x measured; sidesteps the Cranelift bug
+   entirely, at the cost of explicit bounds checks and losing GC integration for scalar arrays.
+   Deserves its own design note.
+5. **P9 inlining in the default build** — `-O3` proves 2.9x is sitting there on `struct-field`.
+6. **P5 header hoisting** — 9.9%, soundly available today.
+7. **P6/P10** — small, certain, cheap.
+
+**Where VL is already at or past native, for calibration:** `collections/struct-alloc` at **0.42x of
+Rust** (VL is 2.4x *faster* than `rustc -O` on allocation-heavy tree building — wasmtime's bump
+allocator beats malloc), `arith/floatops` 0.79x, `arith/convert` 0.91x, `arith/f64-accum` 0.97x.
+Scalar float and integer arithmetic have no headroom problem.
+
+---
+
+## 8. What VL could not do at all
+
+These are correctness and expressiveness findings that fell out of a performance exercise. They are
+recorded here so they are not lost; each is reproducible as written.
+
+### 8.1 `vl check`-clean EMIT FAILURES (compile-time holes)
+
+| what | witness | error |
+|---|---|---|
+| **Bare map read bound to a local, then narrowed with `!= null`, for an i32-keyed or i32-valued map.** Blocked the idiomatic hit/miss spelling in three benchmarks (`map-string`, `map-i32`, `word-freq`), all rewritten to a `?? -1` sentinel. Works for `{[string]: string}` and `{[string]: Struct}`; the plain-i32 value type is the gap `tests/cases/maps/bare-read-narrow-nullable-mono-map.vl` does not reach. | `const m: {[string]: i32} = Map()` … `const v = m["a"]` … `if v != null { print(v) }` | `emit error: emitProgram: bare null needs a struct-typed context` — while `vl check` on the same file reports **`Checked 1 file, no errors.`** |
+| **A bare `return` (no value) in a void function.** Blocked the natural spelling of heapsort's sift-down early exit; all four languages were restructured to a `cont` flag to preserve equivalence. Note the diagnostic points at the **function** (1:9), not at the `return`. | `function f(x: i32) { if x > 0 { return } print(x) }` | `emit error: emitProgram: bare return is not supported` — `vl check` exits 0 |
+| **Importing anything from `std:fmt`** breaks a function with an annotated array return whose body holds a multi-element array literal with non-literal field initialisers. Cost the idiomatic number formatter in `nbody` and `spectralnorm`; both carry a longhand digit renderer instead. Removing the import makes it emit; removing the return annotation does not help. | `import { toStr } from "std:fmt"` + `function makeBodies(): Body[] { const bodies: Body[] = [{x:0.0,…}, {x:1.0,…}] return bodies }` | `emit error: emitProgram: object literal matches no union variant` — `vl check`: `Found 0 errors, 1 warning.`, exit 0 |
+| **A numeric intrinsic is not callable from any function in a module that uses function values.** This makes float algorithms and closures **mutually exclusive in one module**, which is why `nbody` and `spectralnorm` have no higher-order variant — the two `*-closures` benchmarks were dropped as inexpressible. | `function work(a: f64) { sqrt(a) }` + `const f = (v: i32) => v * 2` in the same module | `emit error: the numeric intrinsic 'sqrt' is mistaken for a captured variable here — it is not yet callable from a lambda, nor from a named function in a module that uses function values` |
+
+> Four separate `vl check`-clean emit failures found by writing 46 ordinary programs. This is
+> consistent with the standing ruling that **`vl check` is blind to the emitter**; `vl build` is the
+> usable channel.
+
+### 8.2 Benchmarks that could not be written
+
+| dropped | why |
+|---|---|
+| **split-based tokenisation** | VL has no `split` on string (`"a,b,c".split(",")` → `no method '.split' on string`), and `std:fmt`'s pure-VL `split()` allocates a fresh substring at **every scan position** to test the separator. `token-count` uses a hand-written state machine in all four instead so the algorithm stays identical. |
+| **iterate-all-occurrences search** | `indexOf` takes no start offset (`s.indexOf("o", 5)` → `indexOf expects 1 argument, got 2`, `compiler/typecheck.vl:12339`), so the only spelling re-slices the remainder — **quadratic**, and it would measure allocation rather than search. `substr-search` searches many different needles instead. |
+| **set algebra** | Rust has `HashSet::intersection`, Python has `a & b`, V8 2.9 has the ES2025 Set methods; **VL has none** (`unknown property 'intersection' on {[string]: boolean}`). `set-ops` uses an explicit membership loop in all four. |
+| **word-freq over one large corpus string** | Not constructible: `s = s + x` in a loop is **quadratic** — 25k appends 0.56 s, 50k 2.8 s (5.0x), 100k 19.7 s (7.0x), 200k timed out past 60 s. All three spellings (top-level, `for i in 0 to n`, appending a variable) are equally quadratic. Redesigned as 4000 short documents. |
+| **`nbody-closures` / `spectralnorm-closures`** | Inexpressible — see the `sqrt`-in-a-module-with-function-values emit error above. |
+| **a library-sort comparison** | **VL has no sort.** `std/array.vl` provides `indexOf`/`lastIndexOf`/`includes`/`count`/`reduce`/`reverse`/`concat`/`mapIndexed` and there is no sort intrinsic in the emitter, so there is no VL side to put in the comparison. `sort-heap` is hand-written heapsort in all four. |
+| **transcendental math** | Deliberately out of scope: VL has no transcendentals by design (no wasm opcode computes one, so any `sin` would be a library whose last bit is a policy choice — `compiler/typecheck.vl:11804`). Benchmarking it would compare libms. |
+| **`i64-accum` with BigInt in JS** | Rejected before writing — a BigInt spelling measures V8's bignum library, not integer arithmetic. The benchmark is sized so the i64 sum stays under 2⁵³ where plain JS doubles are exact; that is the honest idiomatic JS spelling. |
+
+Also dropped, but as *benchmark bugs* rather than VL findings — recorded because they are the shape
+of trap this suite kept hitting: **five benchmark drafts were VOID for Rust** because `rustc -O`
+folded them (`deeprec` draft 1 folded to a constant *and* LLVM's accumulator-recursion transform
+turned `n + f(n-1)` into a loop; `flatcall` draft 1 vectorised at 0.11 ns/iter because masking
+distributes over xor; `mutual` draft 1 collapsed to an O(1) parity test; `mutual` draft 2 and
+`treewalk` draft 1 hoisted a loop-invariant pure call). Each was rewritten with a genuine serial
+dependency, not dropped.
+
+### 8.3 Missing surface, catalogued
+
+- **String methods are four members** — `.slice` / `.indexOf` / `.includes` / `.charCodeAt`, plus
+  `.length` and `s[i]`. `.startsWith`, `.endsWith`, `.trim`, `.replace`, `.repeat`, `.padStart`,
+  `.lastIndexOf`, `.concat`, `.at`, `.codePointAt`, `.toUpperCase`, `.split` **all reject
+  identically** (`no method '.X' on string`).
+- **`toString` refuses i64 and f64.** `toString(x: i64)` → `toString expects an i32 or boolean, got
+  i64`; same for f64. **There is no float formatter in the language or in std** (`std/fmt.vl` states
+  f64→string is "deliberately absent"), so the only way to see a float is `print`, which cannot be
+  captured into a string. Every benchmark that prints a float carries its own ~35-line fixed-point
+  formatter.
+- **No single-probe map upsert** — no `entry` / `getOrInsert`, so a read-modify-write count is two
+  probes.
+- **No inline-struct array representation.** `Rec[]` is an array of **references** with one pointer
+  chase per element; there is no way to ask for the contiguous layout Rust's `Vec<Rec>` gets for
+  free. The only workaround is to destroy the record type into parallel `i32[]` columns — measured
+  1.35x, and **exactly the kind of hack the project says users must not need** (§6).
+- **No exponent form for float literals.** `1e18`, `4.84143144246472090e+00` are parse errors
+  (`expected ')' but found 'e18'`), so every Benchmarks-Game constant table had to be hand-expanded
+  into plain decimal. Correctness was fine — VL's decimal-to-double conversion is correctly rounded
+  and all four languages agreed bit-for-bit — but the reference programs cannot be pasted in.
+- **No range `for`.** Every VL loop in `arith/` is a `while` with a hand-written counter while all
+  three peers use their idiomatic range loop. It costs no performance (the emitted wasm is identical
+  in shape) but it is the one place the VL sources cannot be spelled idiomatically.
+- **No number→string coercion in `+`** — `"x" + n` → `operator '+' is not defined for string and i32`.
+- **Recursion depth ceiling ~16.2k frames** for a 2-parameter non-tail function, ~32.2k tail-shaped.
+  VL is level with V8 (15,625 / 16,113 / 32,409 on the same three shapes) and ~30x below Rust
+  (~500k–600k frames on an 8 MiB stack). Every limit was found by bisection, not estimated.
+  **P1 removes this ceiling entirely for tail calls.**
+
+### 8.4 Two correctness bugs found in passing
+
+- **`print` drops the sign of negative zero.** The value is correct — `f64bits(-0.0)` returns
+  `0x8000000000000000` and `1.0 / -0.0` evaluates to `-Infinity` — **only the formatter is wrong.**
+  JS and Rust both print `-0`. This is a live stdout-equivalence hazard for any cross-language float
+  benchmark: a program can be bit-exact and still print differently.
+- **`vl fmt` destroys comments inside an array literal.** It hoists every one out to after the
+  literal and pads them with blank lines. Semantics preserved, source is not. This is why no `.vl`
+  file in `bench/algorithms/` is fmt-clean — running `vl fmt -w` would scramble `nbody`'s
+  `// Sun` / `// Jupiter` body-table labels.
+
+---
+
+## 9. How to re-run, and what an authoritative pass requires
+
+```sh
+bench/run.sh                          # full sweep, 5 reps (~30 min)
+BENCH_REPS=7 bench/run.sh             # what produced this document (~40 min)
+BENCH_FILTER='strings/' bench/run.sh  # ERE over "<category>/<name>"
+BENCH_QUICK=1 bench/run.sh            # 1-rep smoke test — NOT a measurement (see below)
+BENCH_PIN=none bench/run.sh           # disable taskset pinning
+BENCH_REPORT_ONLY=1 bench/run.sh      # regenerate results.json/summary.md from raw.ndjson,
+                                      #   measuring nothing (for report-format changes)
+```
+
+`run.sh` owns `bench/results/` and rewrites all three files. It exports `VL_WASM_OPT` itself
+(§2.4). Everything is deterministic given the same box.
+
+**An authoritative pass requires all five of these. This pass had the first three.**
+
+1. **Prebuilt modules only.** `vl build` then `vl run x.wasm`, never `vl run x.vl` (§2.1).
+2. **min-of-N or median-of-N, N ≥ 7**, with a repeat probe to establish the noise floor. A 1-rep
+   sweep on this box was **5.7x wrong** on one row.
+3. **`VL_WASM_OPT` set**, plus the `cmp` that raises `O3-NOOP` — otherwise the entire `-O3` column
+   is a re-run of the unoptimised module (§2.4).
+4. **EXCLUSIVE USE OF THE BOX.** This is the one this pass did not have. Measured 2.5–4x swings on
+   identical binaries when a second timing job ran, *even pinned*. Nothing here is authoritative
+   until it is re-run idle. Check `uptime` before starting and after finishing.
+5. **Disassembly of every `main.rs`** whose `vl/rust` ratio is quoted as a codegen finding. The
+   prescribed N-vs-2N scale test **cannot see auto-vectorisation** and 9 of 46 benchmarks were
+   affected (§2.6). Count packed ops inside `main::main` against the std-library baseline, and take
+   a `-C target-cpu=native` column wherever the ratio is close.
+
+**Additionally worth fixing in the harness itself:**
+
+- Six extra `.vl` files sit outside the declared `main.vl`/`opt.vl` layout — `main_global.vl`
+  (`arith/i64-accum`, `arith/f64-accum`), `toplevel.vl` (`arrays/fill-sum`,
+  `arrays/reverse-inplace`, `collections/map-i32`, `collections/struct-field`), `globals.vl`
+  (`strings/char-scan`, `strings/token-count`), `stdfmt.vl` (`strings/int-format`). `run.sh`
+  discovers them and measures them as their own configurations with per-variant `expect<Variant>`
+  keys, which is the right behaviour, but the layout contract in `bench/README.md` should say so
+  explicitly. The globals probes are now **largely obsolete** (§6) and should be retired down to the
+  two pairs where the cliff survives.
+- Raise N on the sub-floor columns where it is possible without breaking the scale test:
+  `strings/substr-search` at `PASSES=240` puts Rust at ~195 ms and VL at ~4.3 s (`expect` needs
+  re-recording). `strings/str-eq` **cannot** be raised — VL would exceed ~9 s — so its correction
+  must stay subtractive.
+- Raise `nPython` ~3x on `arith/f64-accum` (71.8 ms, 17% CPython startup) and `arith/intdivmod`
+  (99.4 ms, 13%) before normalising; their reductions are 100x, so the launcher share is multiplied
+  by 100.
+
+---
+
+## Appendix — the five deep dives
+
+`bench/findings/` carries the full bisection logs, the hand-written `.wat` ladders and the exact
+commands for the five worst rows:
+
+- `bench-strings-str-eq.md` — the 6-rung compare ladder and the `emitStrEqFnCode` prototype
+- `bench-algorithms-lambda-hot.md` — the funcref-field bisection and the `call_indirect` prototype
+- `bench-algorithms-dispatch-table.md` — the same defect via arrays and struct fields, plus why
+  `-O3` cannot help
+- `bench-strings-substr-search.md` — the first-char-skip and BMH prototypes, and the short-string
+  hazard
+- `bench-arrays-matmul.md` — the 4-level representation ladder and the V8-vs-wasmtime control that
+  pins the cause on Cranelift

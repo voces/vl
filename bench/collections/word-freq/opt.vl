@@ -1,0 +1,107 @@
+// HAND-OPTIMIZED VL variant of main.vl — same output, contorted spelling.
+//
+// The only change is the counter upsert. Idiomatic VL is
+//
+//     freq[w] = (freq[w] ?? 0) + 1        // TWO hash probes per token
+//
+// because VL's map has no single-probe upsert (no `entry`/`or_insert`, no
+// `getOrInsert`). This variant boxes the count in a one-field struct so the map
+// value is a REFERENCE that can be mutated in place:
+//
+//     const c = freq[w]                   // ONE probe
+//     if c != null { c.n = c.n + 1 } else { freq[w] = { n: 1 } }
+//
+// which costs one probe on every token after the first occurrence — at the price
+// of a heap cell per distinct word and a much worse-reading program.
+//
+// This is exactly the kind of hack the project says users must not need; the
+// delta between this file and main.vl is the size of the missing feature.
+//
+// (Note the bare-read-then-narrow `const c = freq[w]; if c != null` spelling used
+// here COMPILES for a struct-valued map but is an EMIT ERROR for an i32-valued
+// one — see ../map-string/meta.json. That defect is why main.vl cannot even be
+// written in the natural `if v != null` form.)
+
+type Cnt = { n: i32 }
+
+function main() {
+  const v = 2_000
+  const d = 4_000
+  const k = 20
+  const r = 120
+
+  const vocab: string[] = []
+  let i = 0
+  while i < v {
+    vocab.push("w" + toString(i))
+    i = i + 1
+  }
+
+  let seed: i64 = 42
+  const docs: string[] = []
+  i = 0
+  while i < d {
+    let doc = ""
+    let j = 0
+    while j < k {
+      seed = (seed * 48271) % 2147483647
+      const t = (seed % (v as i64)) as i32
+      const idx = (t * t) / v
+      if j > 0 { doc = doc + " " }
+      doc = doc + vocab[idx]
+      j = j + 1
+    }
+    docs.push(doc)
+    i = i + 1
+  }
+
+  const freq: {[string]: Cnt} = Map()
+  let tokens: i64 = 0
+  let pass = 0
+  while pass < r {
+    i = 0
+    while i < d {
+      const doc = docs[i]
+      let start = 0
+      let j = 0
+      while j < doc.length {
+        if doc[j] == 32 {
+          if j > start {
+            const w = doc.slice(start, j)
+            const c = freq[w]
+            if c != null { c.n = c.n + 1 } else { freq[w] = { n: 1 } }
+            tokens = tokens + 1
+          }
+          start = j + 1
+        }
+        j = j + 1
+      }
+      if j > start {
+        const w = doc.slice(start, j)
+        const c = freq[w]
+        if c != null { c.n = c.n + 1 } else { freq[w] = { n: 1 } }
+        tokens = tokens + 1
+      }
+      i = i + 1
+    }
+    pass = pass + 1
+  }
+
+  let maxCount = 0
+  let checksum: i64 = 0
+  i = 0
+  while i < v {
+    const box = freq[vocab[i]]
+    let c = 0
+    if box != null { c = box.n }
+    if c > maxCount { maxCount = c }
+    checksum = checksum + ((c as i64) * ((i + 1) as i64))
+    i = i + 1
+  }
+
+  print(freq.length)
+  print(tokens)
+  print(maxCount)
+  print(checksum)
+}
+main()
