@@ -291,13 +291,46 @@ compilation, the plan, `-t` filtering, the report and the exit code — is VL in
   or — simpler near-term — `run` stays a host path until the protocol matures,
   since its policy is thin). Trap → exit code is host mechanism surfaced back.
 - **`build`**: VL owns arg parsing + the output path decision; the host writes the
-  `.wasm` (`CMD_WRITE_FILE`) and runs binaryen for `-O`/`--wat` (process spawn —
-  mechanism, a `CMD_OPTIMIZE` / `CMD_DISASM` or kept as a host step keyed off a
-  flag the VL program surfaces).
+  `.wasm` (`CMD_WRITE_FILE`) and runs binaryen for `-O`/`-O3`/`--wat` (process
+  spawn — mechanism, a `CMD_OPTIMIZE` / `CMD_DISASM` or kept as a host step keyed
+  off a flag the VL program surfaces).
 
 `run`/`build` are lower priority for the migration than `check`/`fmt` (their
 policy is thin and already mostly host-mechanism), so they can stay on today's
 host path until the protocol is proven on `check`.
+
+### `build` flags (today's host surface)
+
+`build` is the one command whose flags are still parsed entirely in Rust
+(`main.rs`), not in `cli.vl` — so this is where they are written down.
+
+| flag | what it does |
+|---|---|
+| `-o <out.wasm>` | output path (default: the input with `.vl` → `.wasm`) |
+| `-O` | **shrink rung** — one open-world `wasm-opt -O` |
+| `-O3` | **release profile** — `wasm-opt --closed-world -O3 --gufa -O3` |
+| `--wat` | also dump a `.wat` beside the module (`wasm-dis`), AFTER optimization |
+| `--names` | embed the wasm `name` custom section (legible trap backtraces) |
+| `--no-validate` | skip the "will the engine instantiate this" check |
+| `--compiler <f>` | the compiler module to compile with |
+
+Three rules hold across the two optimization rungs, and they are the contract:
+
+- **Both carry the same feature enables** (`--enable-reference-types
+  --enable-gc --enable-bulk-memory`, the shared `BINARYEN_FEATURES` that `--wat`
+  also uses). Never `-all` — it turns on post-3.0 features wasmtime then refuses
+  to load.
+- **A missing binaryen is a soft no-op, not a failure**: a note naming the flag on
+  stderr, the unoptimized module left on disk, exit 0. `$VL_WASM_OPT` /
+  `$VL_WASM_DIS` override the PATH scan.
+- **`-O3` outranks `-O`** when both are given; it is a superset of `-O`'s effect
+  on every measured shape.
+
+`-O3` is a PROFILE, not a level passed through — its load-bearing member,
+`--closed-world`, is a claim about the module boundary (scalar-only, DECISIONS H6)
+rather than an optimization level, and the level itself is measurably not the
+lever. What it buys, what each flag is worth, and the two scratch shapes that do
+NOT melt: `docs/internals/opt-profile-design.md`.
 
 ## Migration sequence
 
