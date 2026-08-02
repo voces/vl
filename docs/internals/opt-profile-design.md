@@ -135,7 +135,24 @@ stated first and the table above must be read through it.
    | struct union, field read (`acc + u.dist`) | 4 | **4** |
 
    The `else` arm is irrelevant (tag-only with and without an `else` both give 2).
-   The discriminating variable is whether the narrowed value is *consumed*.
+
+   **CORRECTED BY #1320 — "whether the narrowed value is consumed" is ONE of TWO
+   variables, and it is the less important one.** Every cell in the grid above has
+   the box constructed at TWO allocation sites (the helper has two `return`s, one
+   per arm). At ONE site the box melts *whatever* is done with it:
+
+   | construction sites | payload read? | none → `-O3` |
+   | ---: | --- | ---: |
+   | 1 | **yes** | 2 → **0** |
+   | 1 | no | 2 → **0** |
+   | 2 | no | 4 → **0** |
+   | 2 | **yes** | 4 → **4** |
+
+   So the rule is: *a union box melts when it is constructed at ONE allocation
+   site, whatever is done with it; at two or more sites it melts only if the
+   payload is dead.* The consumption axis alone does not explain the grid, and
+   reporting it as the discriminator understates what is fixable — see
+   `unboxed-union-rep-design.md` §2.
 
    So P1.3's ask — "vl's union boxes must melt in per-tick scratch code" — is
    **answered NO for the shape a sim actually writes**, and yes only for a box
@@ -166,6 +183,20 @@ fixtures so the rule stays honest.
    > Build it with `const u = <helper call>`, not by assigning a `let` on two
    > branches. `union-box-call` and `union-box-branch-local` are the same program
    > written both ways: 0 sites versus 2.
+
+   **THAT GUIDANCE IS NOT SUFFICIENT AS WRITTEN, and #1320 measured why.**
+   `union-box-payload-read.vl` *is* written with `const u = <helper call>` and it
+   does not melt — because the HELPER has two `return`s, and two returns are two
+   allocation sites just as surely as a `let` written on two branches is. The site
+   count is a property of the PRODUCER, not of how the consumer binds it.
+
+   **And there is no VL spelling that fixes it** — measured, three ways. A single
+   `return` of an `if`-expression and a single `return` of a local assigned on two
+   branches BOTH still emit two sites and both stay 4 → 4 (I verified both
+   independently). `emitUnionIfValue` routes each arm through `emitUnionCoerce`,
+   so the arm count is the site count regardless of syntax. That is precisely why
+   #1320 refuses a documented-pattern answer and recommends an emitter-side
+   return-path box-sink instead: there is no pattern to document.
 
 2. **The BACKING ARRAY of a grown list.** In `list-wrapper-push` the
    `{backing, len, cap}` wrapper itself melts completely — zero `struct.new` at

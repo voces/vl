@@ -419,11 +419,24 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 > a struct union with a tag-only test melts to 2, and to nothing at all once a
 > field is read. Details and the four-row grid: `opt-profile-design.md` §3 item 0.
 > The `{backing,len,cap}` wrapper half of your ask IS delivered (it melts
-> completely); the union half is not, and the honest fix is an UNBOXED union rep
-> rather than an optimizer that removes the allocation. Note this is **not** the
-> A16 compact-representation item in P2 — A16 changes what the box holds, not
-> whether it is allocated, and prices every encoding at one allocation for the box
-> itself. Do not read A16 landing as this row moving.
+> completely); the union half is not.
+>
+> **UPDATE (#1320): the fix is much cheaper than this note first said, and the rule
+> above is incomplete.** Consumption is one of TWO variables and the weaker one. The
+> real rule is **allocation SITES**: a union box melts when it is built at ONE site
+> whatever you do with it (2 → 0 read or unread), and only at TWO OR MORE sites does
+> reading the payload keep it alive. VL emits one site per union ARM — a two-armed
+> helper has two `return`s, hence two sites — which is why the grid above reads the
+> way it does. So this is an **emitter-shape defect, not a representation defect**:
+> the rep, the ABI and the module boundary are all fine, and a return-path box-sink
+> measured **2.0–2.2×** on hand-written WAT with no new wasm vocabulary. An unboxed
+> rep is REFUSED by that measurement, and A16 remains irrelevant to this row (it
+> changes what the box holds, not whether it is allocated).
+>
+> **There is no source workaround to adopt in the meantime** — an `if`-expression
+> and a local-assigned-on-two-branches both still emit two sites and still do not
+> melt. Do not restructure sim code hoping to hit the fast shape; wait for the sink.
+> `unboxed-union-rep-design.md` is the design record.
 >
 > ```
 > vl build sim.vl -O3     # --closed-world -O3 --gufa -O3, + the GC feature enables

@@ -265,11 +265,19 @@ hatch").** All four are prerequisites for each other in practice:
   shipped only because P1.3 names it. **(b) REMAINING, and it is the half that matters:** the union
   box does NOT melt once the narrowed value is READ. The 4→0 row is measured on allocate-tag-test-
   discard; `if e is Unit { e.hp }` — what a sim writes — is 4→4 at every rung, and a struct union is
-  4→2 even tag-only. The `{backing,len,cap}` wrapper half IS delivered (melts completely). **The fix
-  is an UNBOXED union rep, NOT A16** — `litunion-compact-rep-design.md` §5 prices every payload
-  encoding at one allocation for the box itself, so A16 changes what the box holds, not whether it
-  exists. Pinned at 4/4/4 by `opt-melt/union-box-payload-read`.
-  `docs/internals/opt-profile-design.md`.
+  4→2 even tag-only. The `{backing,len,cap}` wrapper half IS delivered (melts completely). Pinned at
+  4/4/4 by `opt-melt/union-box-payload-read`. `docs/internals/opt-profile-design.md`.
+  **#1320 CORRECTS THE RULE AND CHEAPENS THE FIX.** The discriminator is allocation SITES, not
+  consumption: at ONE site the box melts whatever is done with it (2→0 read or unread); only at ≥2
+  sites does a payload read keep it alive. VL emits one site per union ARM, so a two-armed helper is
+  two sites — which is the whole reason the rows above read as they do. **An unboxed rep is REFUSED
+  by measurement** (16 hand-written WAT modules: `ref.i31`, a payload-typed box and a tagless
+  `ref.test` box each halve 4→2 and then stop), and so is a documented source pattern — no VL
+  spelling reaches one site (`if`-expression and let-on-two-branches both stay 4→4, verified
+  independently). **The fix is an emitter-side RETURN-PATH BOX-SINK** — 309 corpus sites, two locals
+  and one exit block per union-returning function, touching no field-0 read, no tag band, no sig
+  token, no boundary and no checker; measured 2.0–2.2× on WAT. A16 remains irrelevant to this row.
+  `docs/internals/unboxed-union-rep-design.md` is the design record; **this is the next perf slice**.
 - ⬜ **P1.4 Bounds-check ergonomics** — not asking for unsafe access; asking that the canonical
   view loop either hoists the bound or relies on the memory trap, **and that this is stated** so
   kernel code can be written to the fast pattern deliberately.
@@ -583,9 +591,24 @@ in-language GC knobs.
   failure story BEFORE std grows fallible APIs (`std:fs`, parsing). Until it lands, std ships
   only total functions + `__trap__` aborts (std-design D1). Seven open questions (O1–O7)
   flagged for the maintainer.
-- **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
-  the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does
-  not exist yet; design + land it (both compilers).
+- ✅ **Explicit numeric conversion syntax — SHIPPED; this entry was STALE.** The lossless-only
+  implicit-widening rule (#298) makes the lossy edges expressible only via a cast, and that cast
+  **exists**: `as` covers every edge this item named — `i32 as f32`, `i64 as f64`, and the
+  narrowings (`i64 as i32`, `f64 as i32`, which truncates: `5.7 as i32` is `5`). The implicit form
+  gives a diagnostic that names the remedy (``i64 doesn't fit in f64 — the conversion is lossy and
+  must be made explicit with `as` (write `x as f64`)``), and mixed-width arithmetic rejects with
+  ``operator '+' mixes f64 and i64``. Verified 2026-08-02 on all four edges. **REMAINING is a
+  SEMANTICS + DIAGNOSTIC item, not a syntax one**, and it is sharper than the original entry:
+  - **`f64 as i32` out of range TRAPS, with a raw wasm backtrace and no diagnostic.** Measured:
+    `100000000000.0 as i32` → `error while executing at wasm backtrace: vl!<wasm function 5>`;
+    `(0.0/0.0) as i32` traps the same way. VL emits the trapping `i32.trunc_f64_s`; wasm also has
+    `i32.trunc_sat_f64_s`. The neighbours diverge — **Rust saturates** (`2147483647`), **JS wraps**
+    (`1215752192`) — so this is a real three-way design choice that VL has made by accident and
+    documented nowhere. Trapping is defensible under the "traps are for bugs" model, but it must be
+    a stated ruling with a diagnostic, not a bare backtrace.
+  - In-range truncation is toward zero (`5.7 as i32` → `5`); write it down and pin it.
+  - **Scientific-notation literals do not parse**: `1e30` is `undeclared identifier 'e30'`. Small
+    lexer gap, found while probing the above.
 - **Param-skip ergonomics** (`docs/guide/lambda-param-skip-design.md`) — prerequisite 1 (self-host
   lambdas/HOFs) is nearly satisfied; decide leading-comma vs `$#` (recommendation deliberately open).
 - **C5 / H-M1** — `deno compile` + brew tap. Small, decoupled; ships the distribution story now.
