@@ -395,7 +395,7 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 > failure mode: today those `16`s and `8`s are literals hand-computed from a layout
 > written down nowhere, and adding a field silently makes every one of them wrong.
 
-### P1.3 Optimization defaults
+### P1.3 Optimization defaults  ✅ SHIPPED (`vl build -O3`, with the melt counts)
 
 - The sim ships through `wasm-opt` always — but webcraft can own that in its
   build. The real ask: **Heap2Local in the blessed pipeline** and a
@@ -405,6 +405,75 @@ stack[i].tt          // i32.load at offset + i*16 + 8
   becomes "avoid half the language in the sim."
 - Branch hinting (ROADMAP B-hint) is a later nicety for the pathing inner
   loops; not gating.
+
+> Maintainer's note (vl side): **the profile is `vl build -O3`, the boxes melt,
+> and Heap2Local is not the mechanism.**
+> `docs/internals/opt-profile-design.md` is the design record.
+>
+> ```
+> vl build sim.vl -O3     # --closed-world -O3 --gufa -O3, + the GC feature enables
+> ```
+>
+> `-O` is unchanged (one open-world `-O`), `-O3` wins when both are passed, and a
+> missing `wasm-opt` stays a soft no-op — a note naming the flag, the unoptimized
+> module on disk, exit 0 — exactly as `-O` already behaved.
+>
+> **The melt, counted rather than asserted.** Six per-tick-scratch fixtures
+> (`tests/fixtures/opt-melt/`), each a loop that allocates and consumes scratch
+> and stores nothing. The number is allocation SITES (`struct.new*` / `array.new*`)
+> surviving in the module, read out of `vl build --wat` and pinned as goldens by
+> `tests/selfhost_native_release_test.ts`:
+>
+> | fixture | (none) | `-O` | `-O3` |
+> |---|---|---|---|
+> | `{x,y}` record from a helper, read, discarded | 3 | **0** | **0** |
+> | `[i, i+1, i+2]` built and read in the loop | 3 | **0** | **0** |
+> | same list, built by a helper across a call | 3 | **0** | **0** |
+> | **union box** from a helper, `is`-narrowed in the loop | 4 | **4** | **0** |
+> | same union box via a `let` written on two paths | 4 | **4** | **2** |
+> | scratch list **grown** by `.push` each trip | 6 | 3 | **2** |
+>
+> Four things fall out, and the first two change what the flag set should be.
+>
+> 1. **`--closed-world` is the whole lever; the LEVEL is not.** `-O3` alone leaves
+>    all four allocations of the canonical union box; `--closed-world -O` melts all
+>    four. `-O`/`-O2`/`-O3` are indistinguishable in both worlds. Reading the WAT
+>    says why: open-world `-O3` *does* inline the producer, so the two `struct.new`s
+>    sit in the loop provably non-escaping — and Heap2Local still leaves them,
+>    because the box reaches its use through an `if`-result of reference type.
+>    **The union box melts by closed-world type refinement plus DCE, not by escape
+>    analysis.** So "Heap2Local in the blessed pipeline" turns out to be the wrong
+>    request for the box you care about most; naming `--heap2local` explicitly
+>    changes nothing at any rung, and alone it melts 0 of the 4.
+> 2. **`--gufa` is measurably inert on vl output, and the REPEAT is what pays.**
+>    `--gufa` removes zero allocations and zero `ref.cast`s — on all six fixtures
+>    and on the 1.1 MB `vl-compiler.wasm` (4,503 casts with it and without). It is
+>    shipped because P1.3 names it and it costs 2s and −571 B, not because it was
+>    observed to do anything. The trailing second `-O3` is the member that earns
+>    its place: it is the only thing that moves the grown-list row from 4 sites to
+>    2 (`--closed-world -O3` alone is *worse* there than plain `-O`), and it is
+>    ~15% of module size by itself.
+> 3. **The two non-melts are characterized, and one is a rule for kernel code.**
+>    A box reached through a ref-typed local written on two paths does not melt —
+>    Heap2Local scalarizes per allocation site, so when two sites merge into one
+>    local neither can own it. Rows 4 and 5 are the *same program written both
+>    ways*: 0 sites versus 2. So: **build scratch with `const u = <call>`, not by
+>    assigning a `let` on two branches.** The other is the backing ARRAY of a grown
+>    list — the `{backing,len,cap}` wrapper melts completely, and what survives is
+>    the `array.new`/`array.copy` of growth, because binaryen scalarizes structs
+>    and only constant-indexed arrays. Size scratch lists once; don't `.push` per
+>    tick.
+> 4. **`--closed-world` is sound here, and that is now measured** — `buffer-design.md`
+>    §O had it open. All **1,338 corpus `@run` cases** produce identical stdout and
+>    identical exit status through the shipped profile. The invariant is DECISIONS
+>    H6: no GC type reaches an import or export. A host-visible string/struct ABI
+>    would require re-auditing this flag, and that sweep is the instrument.
+>
+> **One cost note, because it is why `-O` survives.** On a 1.1 MB module the
+> release profile is 1.4 KB *bigger* than `-O` (914,086 vs 912,719) and 60% slower
+> to produce (26s vs 16s): inlining duplicates code and duplicates allocation
+> *sites* even as it removes allocations *executed*. `-O` is the edit-loop rung;
+> `-O3` is what a shipped artifact gets. On small modules `-O3` wins on size too.
 
 ### P1.4 Bounds-check ergonomics in hot loops  ✅ STATED (with the numbers)
 

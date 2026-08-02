@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
 fn usage() -> ! {
-    eprintln!("usage: vl <build|check|run|fmt|test> <file.vl> [-o out.wasm] [--no-validate] [-w|--check] [-t name] [--jobs N] [--compiler vl-compiler.wasm]");
+    eprintln!("usage: vl <build|check|run|fmt|test> <file.vl> [-o out.wasm] [-O|-O3] [--wat] [--no-validate] [-w|--check] [-t name] [--jobs N] [--compiler vl-compiler.wasm]");
     std::process::exit(2);
 }
 
@@ -1304,11 +1304,10 @@ fn binaryen_missing_note(flag: &str, tool: &str, env_override: &str, consequence
     );
 }
 
-/// `vl build -O`: shell out to `wasm-opt` to shrink the emitted module IN PLACE,
-/// when a `wasm-opt` is available. VL output is WasmGC, so the GC + reference-type
-/// features are REQUIRED for binaryen to even validate it; we enable EXACTLY those
-/// (plus bulk memory, below) — `-all` would turn on post-3.0 features that wasmtime
-/// then refuses to load.
+/// The binaryen FEATURE enables, shared by both optimization rungs and by `--wat`.
+/// VL output is WasmGC, so the GC + reference-type features are REQUIRED for
+/// binaryen to even validate it; we enable EXACTLY those (plus bulk memory, below)
+/// — `-all` would turn on post-3.0 features that wasmtime then refuses to load.
 ///
 /// `--enable-bulk-memory` is the linear-memory tier's flag. Binaryen 130 (the pinned
 /// version) HARD-FAILS validation on `memory.copy`/`memory.fill` without it — measured,
@@ -1318,23 +1317,55 @@ fn binaryen_missing_note(flag: &str, tool: &str, env_override: &str, consequence
 /// (wasmtime 47, V8) have bulk memory on by default: it is wasm 2.0 core, so enabling
 /// it for binaryen costs nothing and closes a loud future failure.
 /// See `docs/internals/buffer-design.md` §B4.
+const BINARYEN_FEATURES: &[&str] = &[
+    "--enable-reference-types",
+    "--enable-gc",
+    "--enable-bulk-memory",
+];
+
+/// `vl build -O` — the SHRINK rung. One `-O` pass, open world. It melts a scratch
+/// allocation that reaches its uses in straight-line code (records, list literals,
+/// and a single-armed producer even across a call, since `-O` inlines). It melts
+/// NOTHING that reaches its use across a control-flow JOIN — so a `{tag, value}`
+/// union box built on two arms survives `-O` entirely. `-O3` is the rung for those.
+const OPT_PASSES: &[&str] = &["-O"];
+
+/// `vl build -O3` — the RELEASE PROFILE, the audited flag set from
+/// `docs/internals/opt-profile-design.md`. Not a bare binaryen `-O3`: VL's `-O`
+/// family has always meant "the audited flag set for this rung" rather than a
+/// level passed through, and the load-bearing member here is `--closed-world`,
+/// which is a claim about the module BOUNDARY, not an optimization level.
 ///
-/// A missing `wasm-opt` is a soft no-op (the unoptimized module is already written).
-fn optimize_in_place(path: &str) -> Result<()> {
+/// `--closed-world` is what melts VL's union boxes — measured, `-O3` alone leaves
+/// all four allocations of the canonical per-tick box and `--closed-world -O` melts
+/// all four, so the lever is the world assumption and not the level. It is sound
+/// for VL output because the module boundary is scalar-only (i32 print imports,
+/// i32 driver exports — DECISIONS H6), and that is checked rather than asserted:
+/// all 1,338 corpus `@run` cases produce identical stdout AND exit status through
+/// this profile. **The invariant it rests on is that no GC type reaches an import
+/// or export**; a host-visible string/struct ABI would have to re-audit this flag.
+///
+/// The REPEAT is load-bearing: the trailing `-O3` is the only member that melts the
+/// grown `{backing, len, cap}` wrapper (4 sites → 2), and it is ~15% of module size
+/// on its own. `--gufa` is in the set because P1.3 names it and it costs ~2s and
+/// −571 bytes on the 1.1 MB compiler module; its measured melt contribution is ZERO
+/// allocations and ZERO casts removed, on every fixture and on that module.
+const RELEASE_PASSES: &[&str] = &["--closed-world", "-O3", "--gufa", "-O3"];
+
+/// Shell out to `wasm-opt` to rewrite the emitted module IN PLACE with one of the
+/// two rungs above, when a `wasm-opt` is available. A missing `wasm-opt` is a soft
+/// no-op (the unoptimized module is already written), identical for both rungs.
+fn optimize_in_place(path: &str, flag: &str, passes: &[&str]) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
-        binaryen_missing_note("-O", "wasm-opt", "VL_WASM_OPT", "wrote the unoptimized module");
+        binaryen_missing_note(flag, "wasm-opt", "VL_WASM_OPT", "wrote the unoptimized module");
         return Ok(());
     };
+    let mut argv: Vec<&str> = vec![path];
+    argv.extend_from_slice(passes);
+    argv.extend_from_slice(BINARYEN_FEATURES);
+    argv.extend_from_slice(&["-o", path]);
     let status = std::process::Command::new(&opt)
-        .args([
-            path,
-            "-O",
-            "--enable-reference-types",
-            "--enable-gc",
-            "--enable-bulk-memory",
-            "-o",
-            path,
-        ])
+        .args(&argv)
         .status()
         .map_err(|e| Error::from(e).context(format!("running wasm-opt `{opt}`")))?;
     if !status.success() {
@@ -1348,22 +1379,18 @@ fn optimize_in_place(path: &str) -> Result<()> {
 /// enabled for `wasm-dis` to parse it (NOT `-all` — see `optimize_in_place`), and
 /// carries `--enable-bulk-memory` for symmetry with `-O`. Measured: `wasm-dis`
 /// tolerates bulk-memory opcodes either way (rc=0 both), so this flag changes nothing
-/// today — it is here so the two binaryen call sites cannot drift apart.
-/// A missing `wasm-dis` is a soft no-op (the `.wasm` is already written).
+/// today — the shared `BINARYEN_FEATURES` is what keeps the binaryen call sites from
+/// drifting apart. A missing `wasm-dis` is a soft no-op (the `.wasm` is already written).
 fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
     let Some(dis) = binaryen_tool("wasm-dis", "VL_WASM_DIS") else {
         binaryen_missing_note("--wat", "wasm-dis", "VL_WASM_DIS", "skipped the .wat");
         return Ok(());
     };
+    let mut argv: Vec<&str> = vec![wasm_path];
+    argv.extend_from_slice(BINARYEN_FEATURES);
+    argv.extend_from_slice(&["-o", wat_path]);
     let status = std::process::Command::new(&dis)
-        .args([
-            wasm_path,
-            "--enable-reference-types",
-            "--enable-gc",
-            "--enable-bulk-memory",
-            "-o",
-            wat_path,
-        ])
+        .args(&argv)
         .status()
         .map_err(|e| Error::from(e).context(format!("running wasm-dis `{dis}`")))?;
     if !status.success() {
@@ -2174,9 +2201,15 @@ fn main() -> Result<()> {
                 names,
             )?;
             std::fs::write(&out, &bytes)?;
-            // `-O`: optimize the written module in place (wasm-opt, when present).
-            if args.iter().any(|a| a == "-O") {
-                optimize_in_place(&out)?;
+            // Optimize the written module in place (wasm-opt, when present). Two
+            // rungs, and `-O3` WINS when both are given — it is a superset of `-O`'s
+            // effect on every measured shape, so running `-O` first would only cost a
+            // process spawn. `-O3` is the release profile (`RELEASE_PASSES`), not a
+            // bare binaryen level.
+            if args.iter().any(|a| a == "-O3") {
+                optimize_in_place(&out, "-O3", RELEASE_PASSES)?;
+            } else if args.iter().any(|a| a == "-O") {
+                optimize_in_place(&out, "-O", OPT_PASSES)?;
             }
             let len = std::fs::metadata(&out)
                 .map(|m| m.len())

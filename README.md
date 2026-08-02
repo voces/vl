@@ -44,7 +44,7 @@ vl run hello.vl
 ## The `vl` tool
 
 ```
-usage: vl <build|check|run|fmt> <file.vl> [-o out.wasm] [-w|--check] [--compiler vl-compiler.wasm]
+usage: vl <build|check|run|fmt> <file.vl> [-o out.wasm] [-O|-O3] [-w|--check] [--compiler vl-compiler.wasm]
 ```
 
 The compiler seed is resolved in order:
@@ -83,13 +83,22 @@ the host build.)
 | Command | What it does |
 |---|---|
 | `vl run <file.vl>` | Compile and run; program output goes to stdout. Also `vl run -e "<src>"`, `… \| vl run` (stdin), or `vl run <prebuilt.wasm>`. |
-| `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`; `-O` optimize, `--wat` also dump text, `--no-validate` skip the instantiability check). |
+| `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`; `-O` optimize, `-O3` the release profile, `--wat` also dump text, `--no-validate` skip the instantiability check). |
 | `vl check <path>` | Type-check + lint (errors + warnings/hints) a file, or every `*.vl` under a directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>` prunes paths). Pretty output (carets, TTY color) or `--concise`. `--severity <hint\|info\|warning\|error>` gates the exit code + display floor; `--codegen` also runs the emitter; `--fix` writes the safe lint fixes in place — `prefer-const` (`let`→`const`) and `redundant-type` (removes an explicit annotation the initializer already infers, e.g. `let x: i32 = 5` → `let x = 5`). |
 | `vl fmt <path>` | Format (AST-driven, via `format.vl`): stdout, `-w` write in place, `--check` CI gate, dirs recurse. |
 
-`-O` (optimize) and `--wat` (text dump) shell out to **binaryen** (`wasm-opt` / `wasm-dis`) on the
+`-O` / `-O3` (optimize) and `--wat` (text dump) shell out to **binaryen** (`wasm-opt` / `wasm-dis`) on the
 PATH — `brew install binaryen`, or the [prebuilt releases](https://github.com/WebAssembly/binaryen/releases)
 (or point `$VL_WASM_OPT` / `$VL_WASM_DIS` at them). Absent, each is a soft no-op with a note.
+
+**`-O3` is the release profile**, and it is a flag set rather than a level:
+`wasm-opt --closed-world -O3 --gufa -O3`. It is what makes per-tick scratch
+allocations disappear — a union box built by a helper and narrowed in a loop keeps
+all 4 of its allocation sites under `-O` and has **0** under `-O3`, because the
+lever is `--closed-world` and not the optimization level. `-O` is unchanged and
+stays the fast edit-loop rung (on a 1.1 MB module `-O3` is 60% slower and slightly
+larger). The measurements, the flag-by-flag audit, and the two scratch shapes that
+do *not* melt: [`docs/internals/opt-profile-design.md`](docs/internals/opt-profile-design.md).
 
 `vl build` **validates the module it wrote** and exits non-zero if the engine will not accept
 it — a module that cannot instantiate is a compiler emit bug, and blessing the artifact anyway
