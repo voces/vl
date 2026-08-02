@@ -255,9 +255,21 @@ hatch").** All four are prerequisites for each other in practice:
   REMAINING: `buf.rows<T>(off, count)` only — it needs `T.size` for a type PARAMETER (hence generic
   `flat` types and a post-mono fold) and a generic row brand `Addr<T>`, without which it gives up the
   only safety the fused pattern has over raw addresses. `docs/internals/flat-records-design.md`.
-- ⬜ **P1.3 Optimization defaults** — Heap2Local in the blessed pipeline + a documented release
-  profile (`--closed-world -O3 --gufa`). Our union boxes and `{backing,len,cap}` wrappers **must melt**
-  in per-tick scratch code or alloc-free-steady-state becomes "avoid half the language".
+- 🟡 **P1.3 Optimization defaults** — the PROFILE ships (#1318): `vl build -O3` runs
+  `wasm-opt --closed-world -O3 --gufa -O3`, `-O` is unchanged, and a missing `wasm-opt` stays a soft
+  no-op. Two measured findings invert the ask. **(a) Heap2Local is the wrong lever** — `-O3`
+  open-world leaves all four allocations of the canonical union box and naming `--heap2local`
+  explicitly changes nothing at any rung, while `--closed-world -O` melts all four; the box melts by
+  closed-world type refinement + DCE, not escape analysis. `--gufa` is measurably INERT on VL output
+  (0 allocations and 0 `ref.cast`s removed, on the fixtures and on the 1.1 MB compiler alike) and is
+  shipped only because P1.3 names it. **(b) REMAINING, and it is the half that matters:** the union
+  box does NOT melt once the narrowed value is READ. The 4→0 row is measured on allocate-tag-test-
+  discard; `if e is Unit { e.hp }` — what a sim writes — is 4→4 at every rung, and a struct union is
+  4→2 even tag-only. The `{backing,len,cap}` wrapper half IS delivered (melts completely). **The fix
+  is an UNBOXED union rep, NOT A16** — `litunion-compact-rep-design.md` §5 prices every payload
+  encoding at one allocation for the box itself, so A16 changes what the box holds, not whether it
+  exists. Pinned at 4/4/4 by `opt-melt/union-box-payload-read`.
+  `docs/internals/opt-profile-design.md`.
 - ⬜ **P1.4 Bounds-check ergonomics** — not asking for unsafe access; asking that the canonical
   view loop either hoists the bound or relies on the memory trap, **and that this is stated** so
   kernel code can be written to the fast pattern deliberately.
