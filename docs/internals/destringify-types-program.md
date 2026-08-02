@@ -39009,10 +39009,21 @@ grids of this same defect disagree about it.** A struct-union element read throu
 stops at #1310's own gate (`monoStaticIsResult`'s spelling-resolved exclusion, scoped by
 `nodeTyIsUnion`) and is a clean `` `is` receiver is not a union value``. A VALUE-union element read
 through `e is i32` is a value-ATOM test that reaches no such gate, and an element read with no `is`
-at all reaches nothing either: those write the module and say nothing. **All 20 silent cells are in
-the value-union kind**, and a grid whose reads bypass the `is` gate will score the whole population
-as silent instead. *The gate a defect happens to trip is a property of the test program, not of the
-defect; report the class per cell.*
+at all reaches nothing either: those write the module and say nothing.
+
+**Stated carefully, because the obvious summary of that is false.** All 20 silent cells *in THIS
+grid* are value-union — but only because this grid's struct-union cells all read through `is`. The
+silence is owned by the READ, so a struct union read without one is silent too. Witness, on master,
+`type U = Cat | Dog` + `const xs = [mk(true)]` + `print(xs.length)`:
+`type mismatch: expected i32, found (ref $type) (at offset 0xf3)` — the module written, the host
+rejecting it, no diagnostic. The value-union twin says the same thing at `0xfa`. An independent
+25-cell grid built entirely on `.length` reads scores **20 silent across all five union kinds**,
+which is the same defect this one scores as 20 silent in one kind.
+
+So neither "it is the union kind" nor "it is the value-union kind" is the rule: *the gate a defect
+happens to trip is a property of the test program, not of the defect.* Report the class per cell,
+and state which READ the grid used — two grids of one defect disagree about its class otherwise, and
+both are right about their own cells.
 
 `vl build` exits 1 for BOTH outcomes, so the discriminator is stderr text — the host writes the
 module and then says `is not a valid WebAssembly module`. Grading on the exit code alone reports
@@ -39095,7 +39106,27 @@ Neither half alone moves the cell, which is why S-EMPTY and S-GROUP share a witn
 ### 5. THE RESIDUE — 21 CELLS, ALL LOUD, THREE MECHANISMS, EACH FILED WITH ITS PRODUCER
 
 Cells that are not OK on head AND whose delete-the-bystander twin IS OK (so the array literal is
-the variable). **None is silent; every one exits `vl build` 1 with a named `emitProgram:` message.**
+the variable).
+
+**"None is silent" was written of THIS grid's 21 and is false of the family.** The nullable row
+below has a spelling this grid does not contain — the union written INLINE at the function return
+rather than through a declared alias — and it is still silent on head:
+
+```vl
+type Cat = { meow: i32 }
+function mk(b: boolean): Cat | null { if b { return { meow: 1 } } return null }
+function main() { const xs = [mk(true)] print(xs.length) }
+```
+
+`vl build` → `type mismatch: expected i32, found (ref null $type) (at offset 0xdc)`, i.e. the module
+written and the HOST rejecting it, with no `emitProgram:` diagnostic. Its delete-the-bystander twin
+(same `mk`, no array literal, `if w != null { print(w.meow) }`) builds clean, so it is a residue cell
+by the definition above. The declared-alias spelling `type U = Cat | null` IS fixed by this slice —
+so the nullable family is split by SPELLING, and only one half of it is loud.
+
+**So the accurate headline is that silent invalid wasm goes 20 → 0 ON THIS GRID, not that the class
+is closed.** The residue table's 21 are loud; the family has at least one silent member outside the
+grid, and it is the first thing the nullable follow-up should pin.
 
 | family | cells | mechanism | what it needs |
 | --- | ---: | --- | --- |
