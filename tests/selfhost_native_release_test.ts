@@ -78,6 +78,9 @@ const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }
   { fixture: "union-box-call", none: 4, O: 4, O3: 0 },
   { fixture: "union-box-branch-local", none: 4, O: 4, O3: 2 },
   { fixture: "list-wrapper-push", none: 6, O: 3, O3: 2 },
+  // The counterexample: `union-box-call` with its payload READ instead of
+  // discarded. Nothing melts, at any rung. See `opt-profile-design.md` §3 item 0.
+  { fixture: "union-box-payload-read", none: 4, O: 4, O3: 4 },
 ];
 
 // The same representative @run spread the `-O` suite uses, so the two rungs are

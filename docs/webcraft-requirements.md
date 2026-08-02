@@ -395,7 +395,7 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 > failure mode: today those `16`s and `8`s are literals hand-computed from a layout
 > written down nowhere, and adding a field silently makes every one of them wrong.
 
-### P1.3 Optimization defaults  ✅ SHIPPED (`vl build -O3`, with the melt counts)
+### P1.3 Optimization defaults  🟡 PROFILE SHIPPED (`vl build -O3`) — wrappers melt, the READ union box does not
 
 - The sim ships through `wasm-opt` always — but webcraft can own that in its
   build. The real ask: **Heap2Local in the blessed pipeline** and a
@@ -406,9 +406,22 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 - Branch hinting (ROADMAP B-hint) is a later nicety for the pathing inner
   loops; not gating.
 
-> Maintainer's note (vl side): **the profile is `vl build -O3`, the boxes melt,
-> and Heap2Local is not the mechanism.**
+> Maintainer's note (vl side): **the profile is `vl build -O3`, the record/list
+> wrappers melt, Heap2Local is not the mechanism — and the UNION box does NOT
+> melt once you read it, which is the half of this ask we did not deliver.**
 > `docs/internals/opt-profile-design.md` is the design record.
+>
+> **Read this before planning per-tick code around the table below.** The union-box
+> row says 4 → 0, and that is measured on a box that is allocated, tag-tested and
+> discarded. Consume the narrowed value — `if e is Unit { … e.hp … }`, which is
+> what a sim writes — and all four allocations come back at every rung including
+> the full release profile. The union KIND matters too: 4 → 0 is a scalar union;
+> a struct union with a tag-only test melts to 2, and to nothing at all once a
+> field is read. Details and the four-row grid: `opt-profile-design.md` §3 item 0.
+> The `{backing,len,cap}` wrapper half of your ask IS delivered (it melts
+> completely); the union half is not, and the honest fix is a union rep that does
+> not allocate rather than an optimizer that removes the allocation — which is the
+> A16 compact-representation item in P2.
 >
 > ```
 > vl build sim.vl -O3     # --closed-world -O3 --gufa -O3, + the GC feature enables
@@ -429,9 +442,10 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 > | `{x,y}` record from a helper, read, discarded | 3 | **0** | **0** |
 > | `[i, i+1, i+2]` built and read in the loop | 3 | **0** | **0** |
 > | same list, built by a helper across a call | 3 | **0** | **0** |
-> | **union box** from a helper, `is`-narrowed in the loop | 4 | **4** | **0** |
+> | **union box** from a helper, `is`-narrowed in the loop, payload NEVER READ | 4 | **4** | **0** |
 > | same union box via a `let` written on two paths | 4 | **4** | **2** |
 > | scratch list **grown** by `.push` each trip | 6 | 3 | **2** |
+> | **the same union box with its payload READ** — the shape a sim writes | 4 | 4 | **4** |
 >
 > Four things fall out, and the first two change what the flag set should be.
 >

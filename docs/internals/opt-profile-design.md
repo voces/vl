@@ -113,10 +113,40 @@ the same six modules.
   four-flag set on all six fixtures. The type passes are not carrying anything on
   these shapes, so they are not shipped.
 
-### The two shapes that do NOT melt
+### The shapes that do NOT melt
 
-Both are characterized, not mysterious, and both are pinned as fixtures so the
-rule stays honest.
+The first is the one that matters most to the customer and it was found by
+re-measuring this section's own headline rather than by a fixture, so it is
+stated first and the table above must be read through it.
+
+0. **READING THE NARROWED VALUE blocks the melt completely — and that is what
+   real per-tick code does.** The `union box … 4 → 0` row is measured on a
+   fixture whose `is` arm tests the tag and never touches the payload
+   (`if u is i64 { acc = acc + 1 }`). Add the read and every allocation comes
+   back, at every rung including the full release profile. The union KIND moves
+   it too: the 4 → 0 row is a SCALAR union (`i64 | boolean`); the same program
+   over a struct union melts only half.
+
+   | shape (same loop, same helper, release profile) | none | `-O3` profile |
+   | --- | ---: | ---: |
+   | scalar union `i64\|boolean`, tag test only — *the table's row* | 4 | **0** |
+   | struct union `Hit\|Miss`, tag test only | 4 | **2** |
+   | scalar union, payload read (`acc + (u as i32)`) | 4 | **4** |
+   | struct union, field read (`acc + u.dist`) | 4 | **4** |
+
+   The `else` arm is irrelevant (tag-only with and without an `else` both give 2).
+   The discriminating variable is whether the narrowed value is *consumed*.
+
+   So P1.3's ask — "vl's union boxes must melt in per-tick scratch code" — is
+   **answered NO for the shape a sim actually writes**, and yes only for a box
+   that is allocated, tag-tested and discarded. A kernel that writes
+   `if e is Unit { e.hp … }` allocates once per trip at every optimization level
+   available today. **Filed, not fixed**; it is the strongest remaining argument
+   for the A16 literal-union compact representation and for a non-boxing union
+   rep generally, since the fix is to not allocate rather than to melt.
+
+Both of the following are characterized, not mysterious, and both are pinned as
+fixtures so the rule stays honest.
 
 1. **A union box reached through a ref-typed local with two definitions.**
    `union-box-branch-local` writes `let u: i64 | boolean` on two paths and narrows
