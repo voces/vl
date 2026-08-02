@@ -277,7 +277,17 @@ hatch").** All four are prerequisites for each other in practice:
   independently). **The fix is an emitter-side RETURN-PATH BOX-SINK** — 309 corpus sites, two locals
   and one exit block per union-returning function, touching no field-0 read, no tag band, no sig
   token, no boundary and no checker; measured 2.0–2.2× on WAT. A16 remains irrelevant to this row.
-  `docs/internals/unboxed-union-rep-design.md` is the design record; **this is the next perf slice**.
+  `docs/internals/unboxed-union-rep-design.md` is the design record.
+  **PHASE 1 SHIPPED (#1322)**: the return path builds the box ONCE — 2 sites → 1 per two-armed
+  producer, 78 removed over 76 functions. **Quote the win with its optimizer level or not at all**:
+  plain `vl build` is a WASH (535 → 530 ms), `-O` is **1.76×** (304 → 173), `-O3` 1.66×. The sink
+  removes a MERGE POINT, not an allocation, so Heap2Local must be there to collect. It also melts a
+  rung EARLIER than predicted (plain `-O`, no `--closed-world`/`--gufa`) — the ceiling was the site
+  count, never binaryen. REMAINING, in size order: **a `return` of an if-expression still boxes per
+  arm** (`emitUnionIfValue` — the largest shape left), a `let` assigned on two branches (phase 2),
+  and then the payload box itself, which needs a single payload type to reach zero allocations.
+  Filed by #1322: `emitUnionIfValue`/`emitVariantIfValue`/`emitNullableIfBinding` still omit
+  `ctrlEnter`/`ctrlLeave`.
 - ⬜ **P1.4 Bounds-check ergonomics** — not asking for unsafe access; asking that the canonical
   view loop either hoists the bound or relies on the memory trap, **and that this is stated** so
   kernel code can be written to the fast pattern deliberately.
