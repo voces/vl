@@ -192,6 +192,7 @@ import {
   fnUsesMapFilter,
   fnUsesMapKeys,
   fnUsesMapVals,
+  fnUsesUnionSink,
   fnUsesVariantRebox,
   fnValUsed,
   gCellIdx,
@@ -279,12 +280,15 @@ import {
   strPushScratchBase,
   strScratchBase,
   uBoxIdx,
+  uBoxNewEnd,
   uDeclared,
   uFieldCount,
   uFieldNames,
   uFieldStart,
+  uSinkFired,
   uTags,
   uVarHeap,
+  unionSinkBase,
   variantReboxSlot,
 } from "./emit_state"
 import {
@@ -349,7 +353,11 @@ import {
   mvValsBackOf,
   nulScalarListFieldWrapHeap,
   nulScalarListWrapHeap,
+  wDropBack,
+  wLen,
+  wPeekBack,
   wSLEB,
+  wTarget,
   wU8,
   wULEB,
 } from "./emit_bytes"
@@ -11536,6 +11544,63 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   0
 }
 
+// The exact bytes `fbStructNew(uBoxIdx)` writes, produced BY that encoder into a scratch
+// buffer rather than re-derived — so the peephole's pattern cannot drift from the
+// instruction it matches if the encoding (or `uBoxIdx`'s ULEB width) ever changes.
+function unionBoxNewBytes() {
+  const probe: i32[] = []
+  const prev = wTarget(probe)
+  fbStructNew(uBoxIdx)
+  wTarget(prev)
+  probe
+}
+
+// Terminate a RETURN in function-result position: either the ordinary `return`, or — for
+// a union-box-returning function taking the SINK — the two `local.set`s and the branch to
+// the function's single exit block.
+//
+// This is a PEEPHOLE, and its justification is entirely local: when the last instruction
+// written is `struct.new $uBox`, that box's two operands are sitting on the wasm stack in
+// field order, so popping them into the exit locals and branching to the one site that
+// re-runs the same `struct.new` leaves observably identical behavior. Nothing about WHICH
+// emitter path produced the box enters the argument, which is why the sink needs no flag
+// threaded through the eighteen construction sites and cannot be fooled by one of them
+// growing a new caller.
+//
+// Two independent conditions must both hold before the rewrite (see `uBoxNewEnd`): the
+// cursor says nothing has been written since the box was built, and the trailing bytes
+// still spell it. Either alone admits a false match; neither can be defeated by an
+// operand that happens to look like an opcode.
+//
+// The branch target is `ctrlDepth` — the exit block is opened FIRST, so it is exactly
+// that many frames out from any point in the body. When the sink does not apply, the
+// plain `return` is emitted and the exit block simply has one fewer predecessor: the
+// transform is per-exit and never has to be total.
+export function emitUnionRetSink() {
+  if fnUsesUnionSink {
+    if uBoxNewEnd == wLen() {
+      const pat = unionBoxNewBytes()
+      const np = pat.length
+      let ok = true
+      let i = 0
+      while i < np {
+        if wPeekBack(i) != pat[np - 1 - i] { ok = false }
+        i = i + 1
+      }
+      if ok {
+        wDropBack(np)
+        fbLocalSet(unionSinkBase + 1) // the anyref payload — top of stack
+        fbLocalSet(unionSinkBase) // the i32 tag — beneath it
+        fbBr(ctrlDepth) // 0x0c br to the function's single exit block
+        uSinkFired = uSinkFired + 1
+        return 0
+      }
+    }
+  }
+  fbReturn() // 0x0f return
+  0
+}
+
 // Emit the `null` value of function `fnIx`'s nullable return rep, leaving it on the
 // stack as the function's result (the fall-through path's implicit `return null`).
 // Each arm mirrors the `NullLit` lowering for that rep: the `boolean|null` i32 sentinel
@@ -11665,9 +11730,9 @@ export function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       return emitFail("emitProgram: bare return is not supported")
     }
     // Seed the return context + emit the value (struct / list / union / nullable /
-    // widening) via the shared helper, then the `return` instruction.
+    // widening) via the shared helper, then terminate the exit.
     if emitReturnValue(body, s.retArg, fnIx) < 0 { return -1 }
-    fbReturn() // 0x0f return
+    emitUnionRetSink()
     return 0
   }
   if s is IfStmt { return emitIfStmtStmt(body, s, stmtIx, fnIx) }
@@ -12594,12 +12659,12 @@ export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
       if isLast && stmtIsTailValue(stmts[i], fnIx) {
         // Implicit return: seed the return context + push the value (so a trailing
         // `null` / nullable value boxes or sentinels exactly like `return e`), then
-        // `return` (0x0f).
+        // terminate the exit.
         if emitReturnValue(body, stmts[i], fnIx) < 0 {
           scopePop()
           return -1
         }
-        fbReturn() // 0x0f return
+        emitUnionRetSink()
       } else if isLast && lastStmtIsValueIf(stmts[i], fnIx) {
         // The body ends in an `if`/`else` whose arms each yield a value (implicit
         // return) rather than `return`ing — lower it tail-aware so each arm's trailing
@@ -12729,7 +12794,7 @@ function emitStmtTail(body: i32[], stmtIx: i32, fnIx: i32) {
     // An if-tail arm's implicit return — seed the return context (so a `null` arm
     // boxes / sentinels per the function's return type) exactly like `emitFuncBody`.
     if emitReturnValue(body, stmtIx, fnIx) < 0 { return -1 }
-    fbReturn() // 0x0f return
+    emitUnionRetSink()
     return 0
   }
   emitStmt(body, stmtIx, fnIx)
@@ -12745,6 +12810,10 @@ function emitIfTail(body: i32[], stmtIx: i32, fnIx: i32) {
   if s is IfStmt {
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbIf(64) // 0x04 if, 0x40 void blocktype
+    // The arms hold RETURNS, and a union-box return SINKS to a `br` whose operand is the
+    // frame distance to the function's exit block — so this frame has to be counted. The
+    // `else` reuses it (one frame per `if`/`else` pair), matching `emitIfStmtStmt`.
+    ctrlEnter()
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     if emitStmtsTail(body, s.ifThen, fnIx) < 0 { return -1 }
@@ -12764,6 +12833,7 @@ function emitIfTail(body: i32[], stmtIx: i32, fnIx: i32) {
       if narrowedElse { restoreNarrow(savedElseTop) }
     }
     fbEnd() // 0x0b end
+    ctrlLeave()
     return 0
   }
   emitFail("emitProgram: emitIfTail: not an if statement")

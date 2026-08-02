@@ -8980,6 +8980,80 @@ export function bodyEndsInReturn(blockIx: i32, fnIx: i32) {
   false
 }
 
+// How many value-producing EXITS the statement at `stmtIx` contributes, counting an
+// explicit `return` and a tail value the same way `emitFuncBody`/`emitStmtTail` do (both
+// lower through `emitReturnValue`). Recurses into the structured statements that can
+// hold one — `if`/`else`, `while`, both `for` forms — and deliberately NOT into a nested
+// `FuncDecl`, whose `return`s belong to its own lifted wasm function.
+//
+// This is a PREDICTION, and it is used for nothing but deciding whether to reserve the
+// return-sink's two locals. It may over- or under-count without consequence: an
+// over-count reserves two locals nothing writes, an under-count declines a sink that
+// would have paid. The exit block is emitted off `uSinkFired`, which counts what the
+// lowering ACTUALLY did.
+function retExitCount(stmtIx: i32, fnIx: i32) {
+  if stmtIx < 0 { return 0 }
+  const s = P.nodes[stmtIx]
+  if s is FuncDecl { return 0 }
+  if s is RetStmt { return 1 }
+  if s is Block {
+    const stmts = s.blkStmts
+    let n = 0
+    let i = 0
+    while i < stmts.length {
+      const isLast = i == stmts.length - 1
+      if isLast && stmtIsTailValue(stmts[i], fnIx) {
+        n = n + 1
+      } else {
+        n = n + retExitCount(stmts[i], fnIx)
+      }
+      i = i + 1
+    }
+    return n
+  }
+  if s is IfStmt {
+    return retExitCount(s.ifThen, fnIx) + retExitCount(s.ifElse, fnIx)
+  }
+  if s is WhileStmt { return retExitCount(s.whileBody, fnIx) }
+  if s is ForRange { return retExitCount(s.frBody, fnIx) }
+  if s is ForIn { return retExitCount(s.fiBody, fnIx) }
+  0
+}
+
+// True when function `fnIx` should reserve the union-box RETURN-SINK frame: its result
+// rep is the shared union box AND it has at least two value-producing exits, so sinking
+// can actually remove a construction site (a single-exit function already has the one
+// site the sink would build, and paying a block plus two locals for it is pure loss).
+//
+// The union-box test is the SAME ladder `emitReturnValue` runs to set `retUNm` — the
+// annotated `retUnionFlag` minus the three spellings that read as a union NAME but are
+// not a box (a literal-union alias and its nullable form are an i32 atom, a nullable
+// closure is the `ref.null $cloStruct` niche), plus the inferred value/struct union. It
+// has to agree with `retUNm` or the frame is reserved for a function that never sinks,
+// which costs two unused local declarations and nothing else.
+export function fnUnionRetSinkOk(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let isBox = false
+    if retUnionFlag(fn.fnRet) == 1 {
+      if (
+        !nodeTyIsLitUnionAlias(fn.fnRet) &&
+        !nodeTyIsNulLitUnion(fn.fnRet) &&
+        nulCloFlag(fn.fnRet) != 1
+      ) {
+        isBox = true
+      }
+    }
+    if fn.fnRet < 0 {
+      const im = inferRetNameOf(fn.fnName)
+      if isValueUnionName(im) || isUName(im) { isBox = true }
+    }
+    if !isBox { return false }
+    return retExitCount(fn.fnBody, fnIx) >= 2
+  }
+  false
+}
+
 // The per-function mv frame base for mv slot `slot` (valid when `fnUsesMap`).
 export function fnMvMapRefLocal(slot: i32) { fnMvBase + slot * 3 }
 

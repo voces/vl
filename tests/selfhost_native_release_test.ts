@@ -75,12 +75,27 @@ const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }
   { fixture: "struct-scratch-call", none: 3, O: 0, O3: 0 },
   { fixture: "list-wrapper-literal", none: 3, O: 0, O3: 0 },
   { fixture: "list-wrapper-call", none: 3, O: 0, O3: 0 },
-  { fixture: "union-box-call", none: 4, O: 4, O3: 0 },
+  // Both union-box producers here are two-armed helpers, and the RETURN SINK gives such a
+  // function ONE construction site: every `return` writes the tag/payload pair into two
+  // reserved locals and branches to a single exit that performs the only `struct.new`. So
+  // the `none` column is one below the arm count, and the surviving box is a single
+  // allocation site — which is the shape Heap2Local can own.
+  //
+  // The `-O` column is the sharper reading of what that bought. At TWO sites the box could
+  // only disappear through `--closed-world` type refinement, so `union-box-call` melted at
+  // `-O3` and not before; at one site plain escape analysis suffices and both fixtures melt
+  // a rung EARLIER than they used to.
+  { fixture: "union-box-call", none: 3, O: 0, O3: 0 },
+  // `union-box-branch-local` writes a `let` on two branches INSIDE one function. Those two
+  // sites never reach the return path, so the sink does not see them and this row is
+  // unmoved — it is the pin for the phase-2 slice (`unboxed-union-rep-design.md` §6).
   { fixture: "union-box-branch-local", none: 4, O: 4, O3: 2 },
   { fixture: "list-wrapper-push", none: 6, O: 3, O3: 2 },
-  // The counterexample: `union-box-call` with its payload READ instead of
-  // discarded. Nothing melts, at any rung. See `opt-profile-design.md` §3 item 0.
-  { fixture: "union-box-payload-read", none: 4, O: 4, O3: 4 },
+  // `union-box-call` with its payload READ instead of discarded. The read still blocks the
+  // melt at two sites — that is what `opt-profile-design.md` §3 item 0 measured — but the
+  // producer now has one site, and the two survivors at `-O`/`-O3` are the PAYLOAD
+  // allocations (the data), not the box (the overhead).
+  { fixture: "union-box-payload-read", none: 3, O: 2, O3: 2 },
 ];
 
 // The same representative @run spread the `-O` suite uses, so the two rungs are

@@ -138,6 +138,7 @@ import {
   fnUsesRefPush,
   fnUsesStrOp,
   fnUsesStrPush,
+  fnUsesUnionSink,
   fnUsesVariantRebox,
   fnValUsed,
   gCellIdx,
@@ -230,10 +231,13 @@ import {
   scopeSlots,
   slUsed,
   startStmts,
+  uBoxIdx,
+  uBoxNewEnd,
   uDeclared,
   uFieldCount,
   uFieldElemKeyI32,
   uFieldElemTyIx,
+  uSinkFired,
   uVarTwin,
   uVariants,
   unMemAtomIds,
@@ -242,6 +246,7 @@ import {
   unMemTyCount,
   unMemTyStart,
   unMemTys,
+  unionSinkBase,
   vbF32Used,
   vbF64Used,
   vbI32Used,
@@ -279,6 +284,7 @@ import {
   fbRefNullForKind,
   fbRefNullStruct,
   fbReturn,
+  fbStructNew,
   fbUnreachable,
   fbValtype,
   fbValtypeNullable,
@@ -320,6 +326,7 @@ import {
   fnSigIdxOfFn,
   fnSigIsClosure,
   fnStmtsPosOf,
+  fnUnionRetSinkOk,
   forInElemKind,
   forInMapRecv,
   forInRefArrayStructIdx,
@@ -422,6 +429,7 @@ import {
   emitNullForRet,
   emitStmt,
   emitUnionCoerce,
+  emitUnionRetSink,
   emitUserGlobalSet,
   mvValsWrapOf,
   pushFieldStorage,
@@ -668,6 +676,13 @@ function emitFuncCode(out: i32[], fnIx: i32) {
     fnUsesCloEq = false
     leqScanBlock(fn.fnBody, fnIx)
     const nLocals = localNames.length
+    // Union-box RETURN SINK: reserve the tag/payload pair when this function's result is
+    // the box and it has two or more exits. The frame has to be laid out BEFORE the body
+    // (a `local.set` needs the index), so this is a prediction; `uSinkFired` records what
+    // the body actually did and decides whether the exit block is emitted at all.
+    fnUsesUnionSink = fnUnionRetSinkOk(fnIx)
+    uSinkFired = 0
+    uBoxNewEnd = -1
     // Lay out every scratch frame after the params + declared locals via the
     // FuncBuilder cursor (Phase H), which sets `pushScratchBase` /
     // `refPushScratchBase` / `refPushBaseBySlot` / `strPushScratchBase` /
@@ -706,6 +721,14 @@ function emitFuncCode(out: i32[], fnIx: i32) {
     // flags by the FuncBuilder (Phase H) — the run count and every valtype come from
     // ONE place, so they cannot desync from the frame layout above.
     if fbEmitLocalsVec(body, nLocals) < 0 { return -1 }
+    // The return sink's single EXIT BLOCK, opened around the whole body so every sunk
+    // `return`'s `br <ctrlDepth>` lands on it. Emitted only when a `return` actually sank
+    // — otherwise the body holds no branch to it and the block would be dead weight.
+    if uSinkFired > 0 {
+      const blkPrev = wTarget(body)
+      fbBlock(64) // 0x02 block, 0x40 void blocktype
+      wTarget(blkPrev)
+    }
     appendAll(body, bodyExpr)
     // Bind the writer at `body` (the framed code entry) for the trailing padding/end
     // opcodes emitted via the `fb*` methods.
@@ -728,9 +751,22 @@ function emitFuncCode(out: i32[], fnIx: i32) {
     if !isVoidFn && !bodyEndsInReturn(fn.fnBody, fnIx) {
       if fnRetNullBearing(fnIx) {
         if emitNullForRet(body, fnIx) < 0 { return -1 }
+        // Inside the sink's exit block this fall-through value cannot simply be left on
+        // the stack for the function `end` — the block is void. It terminates like any
+        // other exit: sunk when it built a box, a plain `return` otherwise.
+        if uSinkFired > 0 { emitUnionRetSink() }
       } else {
         fbUnreachable() // 0x00 unreachable (dead padding for the result type)
       }
+    }
+    // Close the sink's exit block and perform the function's ONE box construction, whose
+    // operands every sunk `return` has already written. Falling off the function `end`
+    // with it on the stack is the result.
+    if uSinkFired > 0 {
+      fbEnd() // 0x0b end — the exit block
+      fbLocalGet(unionSinkBase)
+      fbLocalGet(unionSinkBase + 1)
+      fbStructNew(uBoxIdx)
     }
     fbEnd() // 0x0b end
     wTarget(endPrev)
@@ -1390,6 +1426,11 @@ function emitStartFnCode(out: i32[]) {
   const nStartLocals = collectStartLocals()
   if nStartLocals < 0 { return -1 }
   startFnDetectScratch()
+  // The start function is void, so it has no union-box return to sink; clear the flag the
+  // last user function left set, or `fbBeginFunc`/`fbLocalsCount`/`fbEmitLocalsVec` would
+  // each reserve a frame for it.
+  fnUsesUnionSink = false
+  uSinkFired = 0
   fbBeginFunc(0, nStartLocals)
 
   const bodyExpr: i32[] = []
