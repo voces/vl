@@ -792,7 +792,22 @@ site plain escape analysis is enough: both fixtures now melt **one optimizer run
 earlier**, at `-O`, with no `--closed-world` and no `--gufa`. The ceiling was never
 binaryen's — it was the site count.
 
-### 10.2 The speedup — REFUTED as stated; 1.7×, not 2.0–2.2×
+### 10.2 The speedup — REFUTED as stated; 1.7×, not 2.0–2.2×, AND ONLY UNDER `wasm-opt`
+
+> **Read the ratio with its condition: this slice is worth NOTHING without `-O`.** The sink
+> removes a *merge point*, not an allocation, so binaryen's Heap2Local has to be there to
+> collect. Independently re-measured on the same loop at 100 M trips, min-of-5, load 3.4:
+>
+> | build | A (master) | B (this slice) | ratio |
+> |---|---:|---:|---:|
+> | plain `vl build` | 535 ms | 530 ms | **1.00× — a wash** |
+> | `vl build -O` | 304 ms | **173 ms** | **1.76×** |
+> | `vl build -O3` | 293 ms | **176 ms** | 1.66× |
+>
+> A user on the default build gets nothing from this change. That is not a defect in the
+> slice — it is the same fact §10.1 records from the other side (the box melts at `-O`,
+> and before that there is nothing to melt into) — but any figure quoted from this section
+> without naming the optimizer level is wrong by 1.7×.
 
 §4 reports A6 at 61.8 → 31.0 ms (2.0×) and C3 at 60.8 → 28.1 ms (2.2×). Those are **V8**
 numbers. On the native host, 100 M trips of the same two loops, interleaved A/B, min-of-5:
