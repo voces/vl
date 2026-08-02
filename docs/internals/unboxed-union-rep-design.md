@@ -1,0 +1,764 @@
+# The UNBOXED union rep — and the measurement that says the REP is not the problem
+
+**Verdict: the rep change is REFUSED, and a non-rep phase 1 is recommended in its
+place.** The union box `(struct (field i32) (field anyref))` melts completely under the
+*shipped* release profile — no new wasm vocabulary, no ABI change, no boundary change —
+**whenever it is constructed at exactly ONE allocation site**. VL constructs it at one
+site *per arm*. That is the whole defect, and it is an emitter-shape defect, not a
+representation defect. Four candidate representations were hand-written, validated, run
+and timed against today's output; **the one that wins is "keep the rep, sink the
+construction"**, and it beats `ref.i31` on every axis measured.
+
+Measured off `master` at `0ab94642` (post-#1318), with a seed-built compiler
+(`scripts/refresh-compiler.sh`, which reports *"the seed IS the fixpoint"* at this base),
+binaryen 130, wasm-tools (shipped-proposals default), wasmtime 47 via `vl-host`, and
+V8 (node 24.18).
+
+---
+
+## 0. The ask, and the row it follows
+
+`docs/internals/opt-profile-design.md` §3 item 0 (#1318) measured that `vl build -O3`
+melts record and list-wrapper scratch completely but leaves a UNION box standing the
+moment the narrowed value is read:
+
+| shape (same loop/helper/profile) | none | release |
+| --- | ---: | ---: |
+| scalar union `i64\|boolean`, tag test only | 4 | 0 |
+| struct union `Hit\|Miss`, tag test only | 4 | 2 |
+| scalar union, payload read | 4 | **4** |
+| struct union, field read | 4 | **4** |
+
+and filed the conclusion that *"a kernel that writes `if e is Unit { e.hp … }` allocates
+once per trip at every optimization level available today."* That doc names the follow-up
+this document answers: *"what would move it is an unboxed union rep — the tag carried
+without a heap object at all — which is a different and much larger question."*
+
+It turns out to be a *smaller* question than that, and the melt table's own headline —
+**"the discriminating variable is whether the narrowed value is consumed"** — is
+incomplete. §2 replaces it with a two-variable rule, and §2's second variable is the one
+the fix hangs on.
+
+The instrument was cross-checked against the shipped fixtures before anything else was
+measured: `union-box-call` 4→0, `union-box-payload-read` 4→4, `union-box-branch-local`
+4→2, reproducing §2 and §3 of `opt-profile-design.md` to the digit.
+
+---
+
+## 1. THE POPULATION
+
+Three censuses, three units. Each unit is stated because they do not agree and are not
+supposed to: a *spelling* is what a programmer writes, a *site* is what the emitter
+emits, and a *function* is the scope binaryen's Heap2Local reasons in.
+
+### 1.1 SOURCE spellings, by union KIND
+
+**UNIT: one row per union type EXPRESSION written in an annotation position** — a type
+expression containing a top-level `|`. The same spelling written twice counts twice; the
+question is how much code writes unions, not how many distinct unions exist. Script in
+§8.1; comments and string literals are blanked first, multi-line spellings are joined.
+
+`tests/cases/**` — **1,715 files, 708 (41.3%) write at least one union**:
+
+| kind | spellings | share |
+|---|---:|---:|
+| nullable (`T \| null`) | 849 | 41.7% |
+| mixed (scalar + struct/composite) | 430 | 21.1% |
+| all-scalar | 335 | 16.5% |
+| litunion (all members quoted) | 224 | 11.0% |
+| all-struct | 179 | 8.8% |
+| mixed-litunion | 17 | 0.8% |
+| **total** | **2,034** | |
+
+`compiler/*.vl` + `std/*.vl` — **32 files, 9 write a union, 56 spellings**: nullable 42
+(75.0%), all-scalar 8 (14.3%), litunion 4 (7.1%), all-struct **2** (3.6%). One of those
+two all-struct rows is `type Node` (`compiler/ast.vl:278`), a **41-arm** union, and it is
+the single most-executed union in the project.
+
+**The compiler is not a representative consumer and must not be read as one.** It writes
+56 union annotations in 101,222 lines, 75% of them `T | null`; and its unions are AST
+nodes stored in a module-global array, so they *escape* and could never melt under any
+rep. The corpus is the population that speaks for user code.
+
+### 1.2 EMITTED sites — the melt-relevant unit
+
+**UNIT: one row per union-box INSTRUCTION in the emitted module.** The box is the unique
+type `(struct (field i32) (field anyref))` — exactly one per module (`uBoxIdx`,
+`compiler/emit_state.vl:1018`, *"All unions SHARE one box heap type"*; verified: exactly
+one such type in `build/vl-compiler.wasm`'s 2,953 types). Commands in §8.2.
+
+1,404 of the 1,715 corpus cases build to a module. The other **311 are deliberate rejects
+and multi-file cases** — checked, not assumed: `soundness/` 53, `types/` 44, `modules/` 32
+(these need the import graph, not a single-file build), `std/` 21, `maps/` 17, and the
+sampled stderr is `Error: type error` / `Error: emit error` on `error-*.vl` fixtures.
+**527 of the 1,404 (37.5%) contain a union box.** Across them:
+
+| instruction | count | what it is |
+|---|---:|---|
+| `struct.new <box>` | **1,537** | a union VALUE constructed |
+| `struct.get <box> 0` | 1,342 | a TAG read (`is`, `??`, `==`) |
+| `struct.get <box> 1` | **1,396** | a PAYLOAD read — the narrowed value being used |
+| … of which followed by `ref.cast` | **1,396** | **100%** |
+
+Every single payload read in the corpus is immediately followed by a `ref.cast`. That is
+the second discriminator §3 spends.
+
+The 1,537 constructions, bucketed by what produced the payload operand (the instruction
+immediately preceding, in `wasm-tools print`'s flat form) — which decides whether the
+value costs **one** allocation or **two**:
+
+| payload operand | sites | share | allocations per value |
+|---|---:|---:|---:|
+| `struct.new` of a variant/record type (struct arm) | 548 | 35.7% | **2** |
+| `struct.new` of `$vbI32`/`$vbI64`/`$vbF32`/`$vbF64` (scalar arm) | 514 | 33.4% | **2** |
+| `global.get` (a pooled string literal) | 180 | 11.7% | 1 |
+| `ref.null` (the null arm) | 165 | 10.7% | 1 |
+| an existing ref (`local.get`/`call`/`array.get`/…) | 130 | 8.5% | 1 |
+
+**1,062 of 1,537 (69.1%) union-value constructions cost TWO allocations.**
+
+Per module: **379 of the 527 (71.9%) read the payload**, 22 are tag-test-only, 126
+construct without testing. The tag-only shape that `opt-profile-design.md` §2's headline
+row melts is **4% of the union-using corpus**.
+
+`build/vl-compiler.wasm` (1,113,946 B) on the same unit: **56** constructions (51
+struct-arm, 4 scalar, 1 null), **3,321** tag reads, **5,942** payload reads, again 100%
+cast-followed. Through the shipped release profile it becomes 51 / 3,225 / 4,503 — **5 of
+56 construction sites melt (8.9%)**, on the only large non-foldable VL program that
+exists.
+
+### 1.3 SITES PER FUNCTION — the number the recommendation turns on
+
+**UNIT: one row per emitted wasm FUNCTION that constructs at least one union box**, and
+the bucket is how many `struct.new <box>` sites it contains. This is the right unit
+because binaryen's Heap2Local scalarizes **per allocation site** (§2), so a function with
+two sites feeding one value cannot melt either of them.
+
+Corpus, 775 such functions:
+
+| sites in the function | functions | share |
+|---:|---:|---:|
+| 1 | **417** | **53.8%** |
+| 2 | 195 | 25.2% |
+| 3 | 76 | 9.8% |
+| 4 | 38 | 4.9% |
+| 5 | 15 | 1.9% |
+| 6+ | 34 | 4.4% |
+| **≥2** | **358** | **46.2%** |
+
+And where in the function each of the 1,537 sites sits, bucketed by the instruction that
+follows it:
+
+| position | sites | share |
+|---|---:|---:|
+| `local.set` (a `let`/`const` binding or scratch slot) | 464 | 30.2% |
+| call argument | 335 | 21.8% |
+| **`return` (+5 implicit tail)** | **309** | **20.1%** |
+| nested into another allocation (field / element being built) | 229 | 14.9% |
+| `global.set` | 39 | 2.5% |
+| mid-expression operand (`i32.const`, `local.get`, …) | 161 | 10.5% |
+
+### 1.4 REFUTED: the corpus cannot measure the melt
+
+The obvious next census — run the release profile over all 1,404 modules and count what
+survives — was run, and its answer is **8 modules still contain a box type and 3
+constructions survive**. That is not a melt result; it is a constant-folding result.
+Corpus cases are straight-line `print` programs over literal inputs, and
+`--closed-world -O3 --gufa -O3` evaluates them at compile time: `unions/paren-is-narrow`
+comes out of the profile as a module whose entire body is `global`-initialised constants
+and a `start` that prints them. **The corpus measures the SOURCE population; only a
+parameterised loop measures the melt**, which is why `tests/fixtures/opt-melt/` exists and
+why §3's probe is hand-written rather than swept.
+
+---
+
+## 2. THE MECHANISM — a two-variable rule, and the correction it forces
+
+`opt-profile-design.md` §3 item 0 concludes *"the discriminating variable is whether the
+narrowed value is consumed."* That is true **at two or more allocation sites and false at
+one**, and the difference is the entire design. Four VL programs, one cell each, all
+built with the shipped compiler and the shipped release profile (§8.3):
+
+| box construction sites | payload read? | allocation sites none → `-O3` | witness |
+|---:|---|---:|---|
+| 1 | **yes** | 2 → **0** | `spell3.vl` (§8.3) |
+| 1 | no | 2 → **0** | `spell4.vl` |
+| 2 | no | 4 → **0** | `tests/fixtures/opt-melt/union-box-call.vl` |
+| 2 | **yes** | 4 → **4** | `tests/fixtures/opt-melt/union-box-payload-read.vl` |
+
+**The rule, corrected: a union box melts when it is constructed at ONE allocation site,
+whatever is done with it; at two or more sites it melts only if the payload is dead.**
+
+The mechanism is the one `opt-profile-design.md` §3 item 1 already names for
+`union-box-branch-local` — *"Heap2Local scalarizes per allocation site, so when two sites
+merge into one local, neither can own it"* — and the finding here is that **it is the same
+mechanism, and it reaches the return path too**. A helper with two `return` statements is
+two allocation sites just as surely as a `let` written on two branches is.
+
+That also means §3 item 1's shipped guidance is not sufficient as written:
+
+> *"Build it with `const u = <helper call>`, not by assigning a `let` on two branches."*
+
+`union-box-payload-read.vl` **is** written with `const u = <helper call>` and does not
+melt, because the *helper* has two returns. Rewording is proposed in this PR's body.
+
+### 2.1 There is no VL spelling that reaches one site — measured
+
+If a one-site construction is what melts, the cheapest possible fix would be a documented
+source pattern. There is none. Three spellings of the same two-armed producer, all built
+and counted (§8.3):
+
+| spelling | `struct.new <box>` sites | allocation sites none → `-O3` |
+|---|---:|---:|
+| two `return`s (the fixture) | 2 | 4 → 4 |
+| one `return` of an **if-expression** (`spell1.vl`) | 2 | 4 → 4 |
+| one `return` of a **local assigned on two branches** (`spell2.vl`) | 2 | 4 → 4 |
+| ONE-ARM producer (`spell3.vl`, the control) | **1** | 2 → **0** |
+
+`emitUnionIfValue` (`compiler/wasmEmit.vl:3079`) emits a value-typed `if` whose blocktype
+is `(ref $uBox)` and routes **each arm** through `emitUnionCoerce`; the `let`-on-two-paths
+form does the same. Every VL spelling of a two-armed union producer emits two boxes.
+**Candidate (d) — "do nothing and document the fast pattern" — is refuted: there is no
+fast pattern to document.**
+
+### 2.2 REFUTED: no binaryen flag set reaches it
+
+Before proposing emitter work, 16 flag sets were run against today's output of the
+canonical loop (§8.4). **All 16 leave all 4 allocations**, and 13 of them produce
+byte-identical output (179 bytes) to the shipped profile:
+
+`--closed-world -O3 --gufa -O3` (shipped) · that set twice · three times ·
+`+ --type-ssa` · `+ --type-ssa --type-merging` · the `wasm-toolchain-audit.md` §1 full
+pipeline · `+ --flatten --rereloop` · `+ --local-cse --precompute-propagate` ·
+`--heap2local` ×5 after `-O3` · `--type-ssa --heap2local` · `--type-refining` ×2 ·
+`--gsi --cfp --gto` · `--monomorphize` — all **4**.
+`--monomorphize-always` (and the two sets containing it) make it **8**.
+
+The shipped four-flag profile is already at binaryen's ceiling for this shape. **The lever
+is in the emitter or nowhere.**
+
+---
+
+## 3. THE CANDIDATE REPRESENTATIONS, PRICED
+
+Every row was hand-written as WAT, parsed and validated with `wasm-tools validate`, run
+under wasmtime through `vl run`, and checked against the same oracle (all 16 modules print
+`350`). §4 has the numbers; this section has the properties.
+
+| # | candidate | allocs / value | new wasm vocabulary | `is` stays a field-0 read? | crosses the module boundary? | what breaks |
+|---|---|---:|---|---|---|---|
+| **a** | `ref.i31` tagged-pointer payload | 2 → **1** (kinds 0/1 only) | `ref.i31`, `i31.get_s/u`, `ref.cast (ref i31)` — **zero i31 in the compiler today** | **yes**, untouched | yes (i31ref never reaches an export) | covers 2 of the 5 boxed kinds; **31 bits cannot hold VL's full-range `i32`**; `atomIsRefKind` becomes a 3-way payload discipline consumed at 8 unbox sites |
+| **b** | multi-value `(i32, T)` result | 2 → **0** | multi-value results — **and `--enable-multivalue`, which `BINARYEN_FEATURES` does not have** | no — the tag is a stack value / local | yes, if no union is exported (none is) | result arity is hard-coded to 0-or-1 at 5 functype sites; the sig-key vocabulary is **one char per slot**; `fRetKind` is a scalar; the `??` stash is one slot; the value-`if` blocktype is one valtype byte |
+| **c** | scalarize a non-escaping union LOCAL into (tag, payload) locals | 2 → **0** | none | no | n/a (never crosses) | the emitter is one-slot-per-binding at 9 named places (§5.3); `emitIs`'s 6 receiver forms each double |
+| **d** | leave it alone, document the fast pattern | 2 | none | yes | yes | **refuted — §2.1: no VL spelling produces the fast pattern** |
+| **e** | payload-TYPED box `{i32 tag, T payload}` per scalar rep | 2 → **1** | none | **yes**, untouched | yes | one box type per rep instead of one module-wide; only expressible when every arm shares a scalar rep; mixed ref/scalar unions still need the anyref |
+| **f** | drop the tag, discriminate with `ref.test` | 2 → **1** | `ref.test` | **no** | yes | **refuted by the code** — see below |
+| **g** | **SINK the construction to one site; rep unchanged** | 2 → **1**, and the box itself **melts at `-O3`** | **none** | **yes**, untouched | **yes, untouched** | two reserved locals and one exit block per union-returning function |
+
+Candidate **e** is not new: `compiler/emit_state.vl:1037` records that the retired
+TypeScript host *"uses a payload-typed box (`{tag, i32}`) when every member shares one
+scalar rep — the 'value' kind"*, and that the self-hosted emitter dropped it because the
+shared-`anyref` route *"reuses the single interned `uBoxIdx` machinery."* That trade is
+priced for the first time in §4.
+
+**Candidate f is refuted by two facts in the tree, not by argument.**
+1. `emitUnionUnionEq` compares **tag to tag** — `compiler/wasmEmit.vl:3499-3502` pushes
+   `struct.get <box> 0` for both operands and `i32.eq`s them, with no constant anywhere.
+   The tag is a first-class comparable i32, not a switch selector, so a rep that only
+   recovers it through a `ref.test` ladder loses the site.
+2. **The wasm heap type does not discriminate the arms.** `i32` and `boolean` share
+   `$vbI32` (`emit_state.vl:1032`, *"keyed by wasm rep — boolean shares the i32 box"*), and
+   `buildVariantTwins` (`compiler/emit_classify.vl:13818`) deliberately **collapses
+   structurally identical variants onto one heap type** — `uVarTwin[i]` is the smallest
+   earlier layout twin, keyed on `repNameCanonKey` + `variantFieldLayoutEq`. Two arms can
+   therefore be the same wasm type by construction.
+
+**A16 is not the fix, and this measurement agrees — with one correction.**
+`litunion-compact-rep-design.md` §5/§6 price every payload encoding at *one allocation,
+the box only*, and conclude the allocation rationale is refuted. That is correct **for the
+litunion arm**, whose payload is a pooled string literal reached by `global.get`. It is
+not the general case: §1.2 measures that **69.1% of union constructions allocate twice**,
+because a scalar arm's payload is a `$vbI32`/`$vbI64`/`$vbF32`/`$vbF64` heap object. So
+`ref.i31` really does halve the allocation count for kinds 0 and 1 — it just does not
+**melt** anything (§4), which is what the customer asked for.
+
+---
+
+## 4. THE PROBE — 16 hand-written modules, one loop, one oracle
+
+The canonical loop is `tests/fixtures/opt-melt/union-box-payload-read.vl`, transcribed
+instruction-for-instruction from `vl build --wat` with one change: the loop bound is a
+parameter of an exported `i32 -> i32` function so the same module can be benchmarked. The
+module boundary stays scalar, so `--closed-world` remains sound (DECISIONS H6 /
+`opt-profile-design.md` §4). Every module also keeps a `(start)` that prints `tick(100)`,
+which is the oracle: **all 16 print 350**, at every rung, under wasmtime.
+
+`allocs` = `struct.new*` + `array.new*` in the whole module — the same unit
+`opt-profile-design.md` §2 uses. V8 = min of 7 × `tick(20000000)`, node 24.18.
+Native = min of 5 × `vl run` of the same loop with the bound raised, wasmtime 47,
+process spawn included. Commands in §8.5.
+
+| id | representation | allocs/value | sites none → `-O3` | bytes `-O3` | V8 ms | native ms |
+|---|---|---:|---:|---:|---:|---:|
+| **Z0** | *control* — no union at all | 0 | 0 → 0 | 133 | **6.4** | **12** |
+| | **`i64 \| boolean`, payload read** | | | | | |
+| A0 | **TODAY** | 2 | 4 → **4** | 179 | 61.8 | 68 |
+| A6 | today's rep, box **SUNK to one site** | 2 → 1 | 3 → **2** | 158 | **31.0** | 53 |
+| A5 | today's rep, ONE site (mechanism witness) | 2 → 0 | 2 → **0** | 149 | **10.9** | 21 |
+| A1 | payload-typed box `{i32, i64}` (e) | 1 | 2 → 2 | 167 | 38.6 | 36 |
+| A4 | payload-typed box, ONE site (e+g) | 1 → 0 | 1 → **0** | 143 | 11.8 | 20 |
+| A3 | no tag, `ref.test` (f) | 1 | 2 → 2 | 154 | 23.0 | 44 |
+| A2 | multi-value `(i32,i64)` + scalar locals (b+c) | **0** | 0 → 0 | 156 | **8.0** | 16 |
+| | **`i32 \| boolean`, payload read** | | | | | |
+| B0 | **TODAY** | 2 | 4 → **4** | 179 | 71.5 | 66 |
+| B1 | **`ref.i31`** payload (a) | 1 | 2 → 2 | 171 | 38.2 | 37 |
+| B2 | payload-typed box `{i32, i32}` (e) | 1 | 2 → 2 | 164 | 30.6 | 38 |
+| B3 | multi-value `(i32,i32)` (b+c) | **0** | 0 → 0 | 150 | 11.6 | 20 |
+| | **`Hit \| Miss`, field read — the sim shape** | | | | | |
+| C0 | **TODAY** | 2 | 4 → **4** | 177 | 60.8 | 71 |
+| C3 | today's rep, box **SUNK to one site** | 2 → 1 | 3 → **2** | 156 | **28.1** | 49 |
+| C1 | no box, `ref.test` on the variant (f) | 1 | 2 → 2 | 154 | 22.0 | 45 |
+| C2 | multi-value `(i32, anyref)` (b) | 1 | 2 → 2 | 162 | 21.5 | 37 |
+
+### What the ladder says
+
+1. **Nothing melts by changing the payload.** `ref.i31` (B1), the payload-typed box (A1,
+   B2), and dropping the tag (A3, C1) all halve the static count 4 → 2 and then **stop**:
+   two sites survive the release profile in every one. They buy 1.6× – 2.8× on V8 (A1
+   1.60×, B1 1.87×, B2 2.34×, A3 2.69×, C1 2.76×), and they buy it by allocating less, not
+   by allocating nothing.
+2. **Sinking the construction to one site melts the box**, with the representation, the
+   tag bands, `is`, `??` and the boundary all untouched: A6 3 → 2 and C3 3 → 2, where the
+   survivors are the two payload allocations (the data) and the casualty is the box (the
+   overhead). 61.8 → 31.0 ms and 60.8 → 28.1 ms on V8, 2.0× and 2.2×.
+3. **Sink + a single payload type reaches zero**: A5 2 → 0 and A4 1 → 0, at **10.9 ms and
+   11.8 ms against a 6.4 ms no-union control** — i.e. within 1.7× of not having a union
+   at all, and *ahead of* the zero-allocation multi-value rep on the native host (21/20 ms
+   vs 16 ms, all against a 12 ms spawn-dominated floor).
+   (A5 is a **mechanism witness only**, not a shippable rep: it parks a `boolean` in a
+   `$vbI64` box, which is sound only because nothing reads the boolean arm. A4 is the
+   shippable form of the same cell.)
+4. **Multi-value is the theoretical floor, and it is barely below the row above it.**
+   A2 at 8.0 ms vs
+   A5 at 10.9 ms and A4 at 11.8 ms; on the native host A2/B3 are 16/20 ms vs A4/A5 at
+   20/21 ms — inside the noise of a 12 ms process floor. The last allocation is worth
+   ~2-4 ms per 20 M trips on V8 and nothing measurable natively.
+5. **`--enable-multivalue` is missing from the shipped flag set.** All three multi-value
+   modules parse and validate under `wasm-tools` (multivalue is wasm 2.0 core) and run
+   under wasmtime, and all three are **rejected by `wasm-opt`** with
+   `Tuples are not allowed unless multivalue is enabled … [--enable-multivalue]`.
+   `BINARYEN_FEATURES` (`scripts/vl-host/src/main.rs:1320`) carries only
+   `--enable-reference-types --enable-gc --enable-bulk-memory`. Candidate (b) cannot even
+   be measured without a host change; the numbers above were taken with the flag added by
+   hand.
+
+---
+
+## 5. THE BLAST RADIUS, read off the code
+
+Counted over `compiler/*.vl` at `0ab94642`. UNIT and exclusion rule stated per table;
+comment-only lines are dropped with `grep -vE ":[0-9]+: *//"` (VL has no block comments),
+definition lines with `grep -vE "^[^:]*:[0-9]+:(export )?function "`.
+
+### 5.1 The instruction census — 56 sites, all in one file
+
+```
+grep -c "fbStructNew(uBoxIdx)"    compiler/wasmEmit.vl   # 18
+grep -c "fbStructGet(uBoxIdx, 0)" compiler/wasmEmit.vl   # 20
+grep -c "fbStructGet(uBoxIdx, 1)" compiler/wasmEmit.vl   # 18
+```
+
+| instruction | sites | file |
+|---|---:|---|
+| `struct.new $uBox` — CONSTRUCT | **18** | all `wasmEmit.vl` |
+| `struct.get $uBox 0` — TAG READ | **20** | all `wasmEmit.vl` |
+| `struct.get $uBox 1` — PAYLOAD READ | **18** | all `wasmEmit.vl` |
+| `struct.new $vb*` — scalar payload box | 1 | `wasmEmit.vl:3026` |
+| `struct.get $vb* 0` + its `ref.cast` | 7 + 7 | `wasmEmit.vl` |
+| `ref.cast $uVarHeap[…]` (box payload → variant) | 6 | `wasmEmit.vl` |
+| `ref.cast $aTypeIdx` (box payload → string) | 4 | `wasmEmit.vl` |
+
+The box's heap-type index has exactly one spelling, `uBoxIdx` (`emit_state.vl:1018`); no
+variable ever holds it. Lines mentioning it, non-comment: `wasmEmit.vl` 59,
+`emit_bytes.vl` 5, `emit_collect.vl` 4, `emit_state.vl` 1 — **69 of 103 total mentions**.
+`emit_classify.vl`, `typecheck.vl`, `emit_base.vl`, `emit_query.vl` and
+`emit_sections.vl` mention it **only in prose**: they are documentation dependencies, not
+code dependencies.
+
+Five byte-level sites carry **no searchable token** and a grep census misses all of them:
+the box's own type bytes at `emit_sections.vl:2950-2955`
+(`wU8(95) wU8(2) wU8(127) wU8(0) wU8(110) wU8(0)`) and the four value-box types at
+`2961-2982`.
+
+### 5.2 The field-0 invariant — CONFIRMED, with two qualifications
+
+`litunion-compact-rep-design.md` §1.1 states that *"every consumer (`is`, `??`, the
+narrowing push, the unbox reads) reads field 0 and nothing else."* Checked against all 20
+field-0 reads: **every one is consumed by `i32.eq` (opcode 70) or `i32.ne` (71) and by
+nothing else** — never stored, returned, arithmetic'd or passed. 19 of 20 compare against
+a compile-time constant. Two corrections:
+
+- **The 20th compares tag to TAG** (`wasmEmit.vl:3499-3502`, `emitUnionUnionEq`'s chain
+  bottom). The tag is materialisable, which is what kills candidate (f).
+- **"The narrowing push" is not a consumer at all.** `pushNarrowRep`/`pushNarrow`/
+  `pushNarrowIs`/`pushNarrowComplement` (`emit_classify.vl:3999`, `4017`, `4024`,
+  `17344`) touch no box instruction; they bank an arena type and a member set. The field-0
+  read happens later, in `emitIs`.
+
+Field 1 is read at 18 sites. Exactly **8** of them sit under an instruction-level tag test
+emitted a few lines earlier (`wasmEmit.vl:3351`, `3477`, `3480`, `3584`, `3691`, `5031`,
+`14867`, `14965` — the `==`, `is`-literal, `??` and map-miss paths). The rest are the
+NARROWED-READ family (`:2175`, `:2188`, `:2432`, `:2468`, `:2487`, `:3162`, `:3699`,
+`:3763`, `:9805`, `:14323`): they carry no runtime tag test at all, relying on
+compile-time narrowing having already run the `is`, with `ref.cast` as the only runtime
+backstop. So the honest invariant is: *every RUNTIME DISCRIMINATION reads field 0 and
+nothing else; every narrowed payload read reads field 1 with `ref.cast` as its only
+runtime check.*
+
+### 5.3 The scalar value boxes, and which kinds pay for one
+
+**Four** value-box types, minted only when used (`emit_collect.vl:2653-2656`, flags set in
+`markValueUnionAtoms` at `emit_classify.vl:13954-13962`, bytes at
+`emit_sections.vl:2961-2982`): `$vbI32` `$vbI64` `$vbF32` `$vbF64`.
+
+| kind | spelling | second allocation? |
+|---:|---|---|
+| 0, 1 | `i32`, `boolean` | **yes — `$vbI32`** (boolean shares it) |
+| 3 | `i64` | **yes — `$vbI64`** |
+| 4 | `f64` | **yes — `$vbF64`** |
+| 5 | `f32` | **yes — `$vbF32`** |
+| 2 | `string` | no — the `(ref $aTypeIdx)` array rides the anyref directly |
+| 6 | `null` | no — `ref.null none` |
+| 7-10, 12 | `i32[]`, `f64[]`, `string[]`, `i64[]`, `f32[]` | no — the list wrapper rides directly |
+| 11 | closure | no — the `cloStructIdx` fat pointer rides directly |
+| — | struct variant / ref-array / map arm | no — tagged out of band, rides directly |
+
+**Boxed = five kinds, four box types.** That is the 33.4% scalar-arm slice of §1.2, and
+`ref.i31` could serve only kinds 0 and 1 of it — and only if VL's `i32` were narrowed to
+31 bits, which nothing in `valueAtomKind`'s kind-0 arm does.
+
+### 5.4 What each candidate would have to move
+
+**(g) sink the construction — the recommended phase 1.** Touches the CONSTRUCT half only:
+the return-position subset of the 18 `fbStructNew(uBoxIdx)` sites, plus two reserved
+locals and one exit block per union-returning function. Touches **none** of the 20 field-0
+reads, **none** of the 18 field-1 reads, no tag formula, no type byte, no sig token, no
+boundary.
+
+**(a) `ref.i31`.** Zero `i31` in the compiler (`grep -rn 'i31' compiler/*.vl` → nothing);
+no `fbI31New`/`fbI31Get` builder exists beside `fbStructNew`/`fbStructGet`/`fbRefCast`
+(`emit_bytes.vl:574,580,639`). `atomIsRefKind` (`wasmEmit.vl:2414`) becomes a three-way
+payload discipline consumed at 8 unbox sites. Field 1 stays `anyref` (i31ref is a
+subtype), so the type bytes survive — that is the one axis it is cheap on.
+
+**(c) scalarize the local.** The emitter is one-slot-per-binding at nine named places:
+`addLocalName(…, "union", -1)` (`emit_collect.vl:1643`, `1753`), the valtype byte
+(`emit_bytes.vl:1548-1551`), the local run (`emit_bytes.vl:1235`), the single `local.get`
+recovery (`emitUnionBoxPush`, `wasmEmit.vl:2316`), the non-defaultable pre-seed
+(`emitNulNullToLocal`, `wasmEmit.vl:7810`), the nullable-`if` binding
+(`wasmEmit.vl:11851-11880`), and the `slotKind == "union"` string test at eight query
+sites. And a union value must be ONE ref wherever it is stored in a single slot: struct
+field code 16 (`pushFieldStorage`, `wasmEmit.vl:811-816`; 20 sites test `== 16`), variant
+field, array element (`rlElemHeap[rs] = uBoxIdx`, `emit_collect.vl:2765`), map value
+(`emit_bytes.vl:764-773`), module global (`emit_sections.vl:1226`, `3663`), call argument
+(`wasmEmit.vl:9272`, `14276`, `14392`), return (`wasmEmit.vl:11489`), and the value-`if`
+blocktype (`wasmEmit.vl:3092`).
+
+**(b) multi-value.** Five functype sites hard-code result arity 0 or 1
+(`emit_sections.vl:2806`, `2814`, `2833`, `3206`, `3208`, plus the synthesized-signature
+path at `2751-2765`); the sig-key vocabulary is a **one-character-per-slot** bijection
+(`repSigTokOfKind`/`repKindOfSigTok`, `emit_rep.vl:155`, `240`; `"u"` is one box) with no
+spelling for a pair; `fRetKind[i]` is a scalar (`emit_collect.vl:1255`); the `??` call
+stash is exactly one `(ref $uBox)` local (`emit_bytes.vl:1232-1236`,
+`wasmEmit.vl:14855`); the value-`if` blocktype is one valtype byte
+(`wasmEmit.vl:3092`) and the emitter mints no functype blocktypes; and
+`emitUnionUnionEq` **re-evaluates its operand 2-6 times** (`wasmEmit.vl:3462-3501`,
+gated by `unionEqOperandOk` at `emit_base.vl:655`), which a two-value producer cannot
+satisfy. **This is a rewrite of the signature layer, not a slice** — and the number that
+shows it is the one-character sig token, because every param and result rep in the whole
+ABI key vocabulary is one character wide.
+
+---
+
+## 6. THE RULING
+
+**REFUSED: no representation change.** Every rep candidate was measured and none of them
+melts the box; the two that reach zero allocations (b, c) cost the signature layer, and
+the one the adjacency invites (`ref.i31`) covers 2 of 5 boxed kinds, cannot hold a
+full-range `i32`, needs an instruction family the emitter has never emitted, and still
+leaves the allocation standing at `-O3`.
+
+**RECOMMENDED phase 1 — SINK the union box to one construction site in the RETURN path.**
+
+In a function whose declared result is a boxed union, every union coercion at return
+position writes `(tag, payload)` into two reserved locals — an `i32` and an `anyref` — and
+branches to a single exit that performs the one `struct.new $uBoxIdx`.
+
+- **What it is worth**: the box melts entirely under the *shipped* release profile.
+  Measured on the canonical loop as A6 (3 → 2 sites, 61.8 → 31.0 ms V8) and on the sim
+  shape as C3 (3 → 2, 60.8 → 28.1 ms). On the shipped fixture `union-box-payload-read.vl`
+  the unoptimized count should go **4 → 3** (one of the two boxes disappears) and the
+  `-O3` count **4 → 2** (the surviving box melts). That pair is the gate, and the melt
+  table in `opt-profile-design.md` §2/§3 is where it gets pinned.
+- **What it costs**: two locals and one block per union-returning function, and a rewrite
+  of the union arm of the return path. It touches none of the 20 field-0 reads, none of
+  the 18 field-1 reads, no tag band, no type byte, no signature token, no module boundary,
+  and no checker.
+- **Its population**: **309 of 1,537 corpus construction sites (20.1%)** are in return
+  position, spread over the 358 functions (46.2%) that construct at two or more sites.
+- **The host prerequisite is zero.** Unlike candidate (b), nothing in
+  `BINARYEN_FEATURES` has to change.
+
+**Phase 2, filed not recommended: the same sink at `local.set` position** (464 sites,
+30.2%) — a `let`/`const` binding written on two branches, which is
+`opt-profile-design.md` §3 item 1's own row. Same transform, different position; it should
+be a separate slice because the binding's slot lifetime is the part that can go wrong.
+
+**Phase 3, filed: the payload-typed box for all-scalar unions** (candidate e). With phase
+1 it reaches **zero** (A4: 1 → 0, 11.8 ms against a 6.4 ms no-union control). Its
+population is the 335 all-scalar spellings (16.5%) plus the litunion rows; its cost is one
+box type per scalar rep instead of one module-wide, which re-opens the type-index
+questions `litunion-compact-rep-design.md` §7.1 hands to the owner. **Do phase 1 first and
+re-measure** — phase 1 alone already collects the larger half of the win.
+
+**Not recommended at any phase: `ref.i31` (a), multi-value (b), local scalarization (c),
+dropping the tag (f), and doing nothing (d).** (f) is refuted by the tag-to-tag compare
+and by twin collapse; (d) is refuted by §2.1; (a) does not melt; (b) and (c) are the
+signature layer.
+
+---
+
+## 7. Side findings (filed here because the witnesses were built here)
+
+Both were found while trying to construct a struct-union witness for candidate (f). Both
+are small programs, neither is fixed by this document, and neither is in the corpus.
+
+1. **The compiler TRAPS on a call result returned from a struct-union-typed function.**
+   `vl build` exits 1 with `wasm trap: out of bounds array access` and writes nothing —
+   a compiler-side crash, not a diagnostic. Witness (`callret.vl`, §8.6): a function
+   `boxOf(i): Hit | Miss` whose first `return` is `mkHit(7)` (a *call*) rather than an
+   object literal. Replacing the call with the literal compiles and runs.
+2. **Two structurally identical variants of one union are a loud emit reject.**
+   `type Cat = { n: i32 }` / `type Kot = { n: i32 }` with `pick(): Cat | Kot` gives
+   `emitProgram: ref valtype with no interned shape`; the same program with a narrowing
+   `is` gives `emitProgram: is receiver is not a union value`. This is
+   `buildVariantTwins`' collapse (§3, candidate f) surfacing as an expressiveness gap.
+
+---
+
+## 8. How to re-verify each headline, from a clean checkout
+
+```
+bash scripts/fetch-seed.sh && bash scripts/refresh-compiler.sh
+VL=scripts/vl-host/target/release/vl      # the host
+SEED=build/vl-compiler.wasm
+WT=wasm-tools                             # shipped-proposals default feature set
+WO=node_modules/binaryen/bin/wasm-opt
+FEAT="--enable-reference-types --enable-gc --enable-bulk-memory"
+REL="--closed-world -O3 --gufa -O3"
+```
+
+### 8.1 §1.1 — source spellings by kind
+
+Save as `kindcensus.py` and run
+`python3 kindcensus.py $(find tests/cases -name '*.vl' | sort)` and
+`python3 kindcensus.py compiler/*.vl std/*.vl`.
+
+```python
+import re, sys, collections
+PRIM = {"i32","i64","f32","f64","boolean","string","char","void"}
+def blank(s):                      # drop // comments and string bodies
+    o,i,n=[],0,len(s)
+    while i<n:
+        c=s[i]
+        if c=='/' and i+1<n and s[i+1]=='/':
+            while i<n and s[i]!='\n': o.append(' '); i+=1
+            continue
+        if c=='"':
+            o.append('"'); i+=1
+            while i<n and s[i]!='"':
+                if s[i]=='\\':
+                    o.append(' '); i+=1
+                    if i<n: o.append(' '); i+=1
+                    continue
+                o.append('_' if s[i]!='\n' else '\n'); i+=1
+            if i<n: o.append('"'); i+=1
+            continue
+        o.append(c); i+=1
+    return "".join(o)
+def take(s,i):                     # the type expression starting at i
+    d,st,n,prev=0,i,len(s),':'
+    while i<n:
+        c=s[i]
+        if c=='{' and d==0 and prev not in ":|,<(=": break
+        if c in "([{<": d+=1
+        elif c in ")]}>":
+            if c=='>' and i>st and s[i-1]=='=': i+=1; prev=c; continue
+            if d==0: break
+            d-=1
+        elif c=='\n':
+            j=i+1
+            while j<n and s[j] in " \t\n": j+=1
+            if prev=='|' or (j<n and s[j]=='|'): i+=1; continue
+            break
+        elif d==0 and c in ",;=":
+            if c=='=' and i+1<n and s[i+1]=='>': i+=2; continue
+            break
+        if not c.isspace(): prev=c
+        i+=1
+    return s[st:i].strip()
+def split(t):
+    o,d,cur=[],0,""
+    for j,c in enumerate(t):
+        if c in "([{<": d+=1
+        elif c in ")]}>":
+            if not (c=='>' and j>0 and t[j-1]=='='): d-=1
+        if c=='|' and d==0: o.append(cur.strip()); cur=""
+        else: cur+=c
+    o.append(cur.strip())
+    return [m for m in o if m]
+def kind(ms):
+    q=[m for m in ms if m.startswith('"')]; rest=[m for m in ms if m!="null"]
+    if q and len(q)==len(ms): return "litunion"
+    if len(ms)-len(rest) and len(rest)==1: return "nullable"
+    if q: return "mixed-litunion"
+    st=lambda m: bool(re.fullmatch(r'[A-Z][A-Za-z0-9_]*',m)) or m.startswith("{")
+    sc=lambda m: m in PRIM or m.endswith("[]") or m.startswith('"') or m.startswith("{[")
+    if all(st(m) for m in rest): return "all-struct"
+    if all(sc(m) for m in rest): return "all-scalar"
+    return "mixed"
+agg,files=collections.Counter(),collections.Counter()
+for p in sys.argv[1:]:
+    src=blank(open(p,encoding="utf8",errors="replace").read()); hit=0
+    for m in re.finditer(r'(:|\btype\s+[A-Za-z_]\w*\s*(?:<[^>]*>)?\s*=)',src):
+        if m.group(0)==':' and m.start()>0 and src[m.start()-1]==':': continue
+        t=take(src,m.end())
+        if '|' not in t: continue
+        mem=split(t)
+        if len(mem)<2: continue
+        agg[kind(mem)]+=1; hit=1
+    files["files"]+=1; files["files_with_union"]+=hit
+print(dict(files)); print(agg.most_common(), sum(agg.values()))
+```
+
+### 8.2 §1.2/§1.3 — emitted sites
+
+For one module (the box type is unique per module):
+
+```
+$WT print M.wasm -o M.wat
+BOX=$(grep -oP '^\s*\(type \(;\K\d+(?=;\) \(struct \(field i32\) \(field anyref\)\)\))' M.wat)
+grep -cP "^\s*struct\.new $BOX\s*\$"   M.wat     # constructions
+grep -cP "^\s*struct\.get $BOX 0\s*\$" M.wat     # tag reads
+grep -cP "^\s*struct\.get $BOX 1\s*\$" M.wat     # payload reads
+```
+
+On `build/vl-compiler.wasm` that is `BOX=60` and **56 / 3321 / 5942**. For the corpus,
+build every case first (`find tests/cases -name '*.vl'`, `$VL build … --compiler $SEED`,
+1,404 of 1,715 succeed) and sum. The per-payload-class, per-function and per-position
+buckets read the instruction immediately before/after each `struct.new $BOX` in the same
+flat listing.
+
+### 8.3 §2 — the melt truth table and the spellings
+
+```
+$VL build tests/fixtures/opt-melt/union-box-payload-read.vl -o f.wasm --compiler $SEED
+$WO f.wasm $REL $FEAT -o f-o3.wasm
+$WT print f-o3.wasm -o f-o3.wat && grep -cE '^\s*(struct|array)\.new' f-o3.wat   # 4
+```
+
+The four spellings (write each to a file and run the same three commands):
+
+```vl
+// spell1.vl — one `return` of an IF-EXPRESSION.  2 box sites, 4 -> 4
+function boxOf(i: i32): i64 | boolean { return if i % 2 == 0 { 7 } else { true } }
+// spell2.vl — one `return` of a local assigned on two branches.  2 box sites, 4 -> 4
+function boxOf(i: i32): i64 | boolean {
+  let u: i64 | boolean = true
+  if i % 2 == 0 { u = 7 }
+  return u
+}
+// spell3.vl — ONE-ARM producer, payload READ.  1 box site, 2 -> 0   (prints 4950)
+function tick(n: i32): i32 {
+  let acc = 0
+  let i = 0
+  while i < n {
+    const u: i64 | boolean = i as i64
+    if u is i64 { acc = acc + (u as i32) }
+    i = i + 1
+  }
+  return acc
+}
+print(tick(100))
+// spell4.vl — as spell3 with `acc = acc + 1` (tag test only).  1 box site, 2 -> 0
+```
+
+`spell1`/`spell2` reuse the `tick` loop of `union-box-payload-read.vl` verbatim.
+
+### 8.4 §2.2 — the flag hunt
+
+`$WO A0.wasm <SET> $FEAT -o out.wasm` for each of the 16 sets listed in §2.2, then the
+allocation count of §8.3. All 16 give 4 (or 8 with `--monomorphize-always`).
+
+### 8.5 §4 — the probe ladder
+
+Each variant is a hand-written `.wat` (A0/B0/C0 transcribed from `vl build --wat`; the
+rest written against them). For each:
+
+```
+$WT parse V.wat -o V.wasm && $WT validate V.wasm
+$WO V.wasm $REL $FEAT -o V-o3.wasm            # + --enable-multivalue for A2/B3/C2
+$WT print V-o3.wasm -o V-o3.wat && grep -cE '^\s*(struct|array)\.new' V-o3.wat
+$VL run V-o3.wasm                              # the oracle: 350
+```
+
+V8 timing: instantiate `V-o3.wasm` with the five `imports.__print_*__` stubs and call the
+exported `tick(20000000)`, min of 7. Native timing: substitute the `$main` loop bound with
+20000000, re-optimize, `time $VL run`, min of 5.
+
+### 8.6 §7 — the two side findings
+
+```vl
+// callret.vl — `vl build` TRAPS: "wasm trap: out of bounds array access"
+type Hit = { dist: i32 }
+type Miss = { why: i32 }
+function mkHit(v: i32): Hit { return { dist: v } }
+function boxOf(i: i32): Hit | Miss {
+  if i % 2 == 0 { return mkHit(7) }
+  return { why: 1 }
+}
+const u = boxOf(0)
+print(1)
+
+// twin6.vl — `emitProgram: ref valtype with no interned shape`
+type Cat = { n: i32 }
+type Kot = { n: i32 }
+function pick(i: i32): Cat | Kot {
+  if i % 2 == 0 { return { n: 7 } }
+  return { n: 1 }
+}
+const a = pick(0)
+print(1)
+```
+
+---
+
+## 9. Where the pieces live
+
+- `tests/fixtures/opt-melt/union-box-payload-read.vl` — the canonical loop this document
+  is written against; `union-box-call.vl` and `union-box-branch-local.vl` are the other
+  two cells of §2's truth table.
+- `compiler/emit_state.vl:1018` — `uBoxIdx`, the one box heap type; `:1029-1049` — the
+  representation note and the four value boxes.
+- `compiler/wasmEmit.vl` — all 56 box instructions: `emitUnionCoerce` (`:2622`),
+  `emitIs` (`:1855`), `isArmTagOfTy` (`:1810`), `emitCoalesce` (`:14614`),
+  `emitUnionUnionEq` (`:3376`), the unbox family (`:2425`, `:2466`, `:2485`, `:3245`).
+- `compiler/emit_rep.vl:1458` — `scalarTagOfKind`; `emit_classify.vl:13883`/`13896` —
+  `refArrSlotTag`/`mapSlotTag`; `:13818` — `buildVariantTwins`, the twin collapse.
+- `compiler/emit_sections.vl:2950-2982` — the box and value-box type BYTES, invisible to
+  every identifier grep.
+- `scripts/vl-host/src/main.rs:1320` — `BINARYEN_FEATURES` (no `--enable-multivalue`);
+  `:1353` — `RELEASE_PASSES`.
+- `docs/internals/opt-profile-design.md` §3 — the row this follows;
+  `docs/internals/litunion-compact-rep-design.md` §5/§6 — the payload-encoding pricing
+  this corrects for the non-litunion case.
