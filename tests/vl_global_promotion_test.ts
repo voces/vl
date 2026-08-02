@@ -45,7 +45,6 @@ const exists = (p: string): boolean => {
 const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
 const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
 const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
-const CASES = `${ROOT}/tests/cases/globals`;
 
 const haveBin = exists(VL);
 const haveSeed = exists(COMPILER);
@@ -74,7 +73,9 @@ const build = async (relPath: string): Promise<Uint8Array> => {
     }).output();
     if (code !== 0) {
       throw new Error(
-        `vl build ${relPath} failed: ${new TextDecoder().decode(stderr).trim()}`,
+        `vl build ${relPath} failed: ${
+          new TextDecoder().decode(stderr).trim()
+        }`,
       );
     }
     return await Deno.readFile(o);
@@ -125,7 +126,8 @@ const PROMOTED = "tests/cases/globals/promoted-scalar-start-locals.vl";
 const BLOCKED = "tests/cases/globals/promotion-blocked-by-function-read.vl";
 
 Deno.test({
-  name: "global-promotion: every scalar no function names becomes a start-fn local",
+  name:
+    "global-promotion: every scalar no function names becomes a start-fn local",
   ignore: !ENABLED,
   fn: async () => {
     const bytes = await build(PROMOTED);
@@ -136,7 +138,11 @@ Deno.test({
         "  (a nonzero count means the predicate refused a binding it should have taken)",
     );
     const { logs } = await runWasm(bytes);
-    assertEq(logs, await expectedLogs(PROMOTED), "promoted program's behaviour moved");
+    assertEq(
+      logs,
+      await expectedLogs(PROMOTED),
+      "promoted program's behaviour moved",
+    );
   },
 });
 
@@ -153,12 +159,17 @@ Deno.test({
         "  2 = the predicate refused `promoted`, and this control tests nothing",
     );
     const { logs } = await runWasm(bytes);
-    assertEq(logs, await expectedLogs(BLOCKED), "blocked program's behaviour moved");
+    assertEq(
+      logs,
+      await expectedLogs(BLOCKED),
+      "blocked program's behaviour moved",
+    );
   },
 });
 
 Deno.test({
-  name: "global-promotion: the corpus's cross-function global cases keep their cells",
+  name:
+    "global-promotion: the corpus's cross-function global cases keep their cells",
   ignore: !ENABLED,
   fn: async () => {
     // The pre-existing corpus already carries the shape the predicate must refuse, and
