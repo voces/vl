@@ -141,9 +141,16 @@ stated first and the table above must be read through it.
    **answered NO for the shape a sim actually writes**, and yes only for a box
    that is allocated, tag-tested and discarded. A kernel that writes
    `if e is Unit { e.hp … }` allocates once per trip at every optimization level
-   available today. **Filed, not fixed**; it is the strongest remaining argument
-   for the A16 literal-union compact representation and for a non-boxing union
-   rep generally, since the fix is to not allocate rather than to melt.
+   available today. **Filed, not fixed.**
+
+   **A16 is NOT the fix, and it is worth saying so here because the adjacency is
+   inviting.** `litunion-compact-rep-design.md` §5 prices every payload encoding
+   at *one allocation — the box only*; A16 changes what the box's `value` field
+   HOLDS (an atom id rather than a string ref), not whether the box exists. The
+   allocation that survives here is the box itself, so a compact payload leaves
+   this row exactly where it is. What would move it is an unboxed union rep — the
+   tag carried without a heap object at all — which is a different and much larger
+   question than A16, and nothing in this document licenses it.
 
 Both of the following are characterized, not mysterious, and both are pinned as
 fixtures so the rule stays honest.

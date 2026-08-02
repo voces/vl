@@ -419,9 +419,11 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 > a struct union with a tag-only test melts to 2, and to nothing at all once a
 > field is read. Details and the four-row grid: `opt-profile-design.md` §3 item 0.
 > The `{backing,len,cap}` wrapper half of your ask IS delivered (it melts
-> completely); the union half is not, and the honest fix is a union rep that does
-> not allocate rather than an optimizer that removes the allocation — which is the
-> A16 compact-representation item in P2.
+> completely); the union half is not, and the honest fix is an UNBOXED union rep
+> rather than an optimizer that removes the allocation. Note this is **not** the
+> A16 compact-representation item in P2 — A16 changes what the box holds, not
+> whether it is allocated, and prices every encoding at one allocation for the box
+> itself. Do not read A16 landing as this row moving.
 >
 > ```
 > vl build sim.vl -O3     # --closed-world -O3 --gufa -O3, + the GC feature enables
