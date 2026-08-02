@@ -1,0 +1,120 @@
+// str-eq — string equality in a tight loop, four phases.
+// Axis: cost of `==` on strings, split by WHY it answers:
+//   A  same object identity, equal              (VL can answer with ref.eq)
+//   B  different objects, equal content         (full content compare)
+//   C  different objects, differ at index 0     (early-out on the first char)
+//   D  different objects, differ at the LAST index (full scan, then false)
+// All strings are LEN chars of ASCII, built at run time so nothing is a
+// literal the compiler could intern or fold.
+
+const ALPHA = "abcdefghijklmnopqrstuvwxyz"
+
+const LEN = 64
+const GROUPS = 8
+const REPS = 6_000_000
+
+// A LEN-char string seeded by `seed`. When `flip >= 0` the character at that
+// index is bumped by one, so the result differs from mk(seed, -1) at exactly
+// that one position.
+function mk(seed: i32, flip: i32): string {
+  let s = ""
+  let i = 0
+  while i < LEN {
+    let k = (i * 7 + seed * 13) % 26
+    if i == flip { k = (k + 1) % 26 }
+    s = s + ALPHA.slice(k, k + 1)
+    i = i + 1
+  }
+  return s
+}
+
+// HAND-OPTIMISED VARIANT — see bench/findings/bench-strings-str-eq.md.
+// The ONLY change vs main.vl is that `a == b` is replaced by `a.streq8(b)`, a
+// user-space copy of the compiler's `__str_eq__` with the element loop unrolled
+// 8x and the per-element branch replaced by an xor/or accumulator. Everything
+// else (representation, bounds checks, code-point width) is identical, so this
+// isolates exactly one cost: the branch-per-code-point in the emitted helper.
+//
+// NOTE this variant CANNOT reproduce `__str_eq__`'s `ref.eq` identity fast path
+// — VL exposes no reference-identity operator — so phase A gets SLOWER here
+// while B/C/D get ~2x faster. That asymmetry is why this is filed as a compiler
+// defect and not recommended as a user technique.
+function streq8(self: string, o: string): boolean {
+  const n = self.length
+  if n != o.length { return false }
+  let i = 0
+  while i + 8 <= n {
+    const d = (self[i] ^ o[i]) |
+      (self[i + 1] ^ o[i + 1]) |
+      (self[i + 2] ^ o[i + 2]) |
+      (self[i + 3] ^ o[i + 3]) |
+      (self[i + 4] ^ o[i + 4]) |
+      (self[i + 5] ^ o[i + 5]) |
+      (self[i + 6] ^ o[i + 6]) |
+      (self[i + 7] ^ o[i + 7])
+    if d != 0 { return false }
+    i = i + 8
+  }
+  while i < n {
+    if self[i] != o[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+function main() {
+  const base: string[] = []
+  const ident: string[] = []
+  const copy: string[] = []
+  const first: string[] = []
+  const last: string[] = []
+  let j = 0
+  while j < GROUPS {
+    base.push(mk(j, -1))
+    copy.push(mk(j, -1))
+    if j % 2 == 0 { first.push(mk(j, -1)) } else { first.push(mk(j, 0)) }
+    if j < 5 { last.push(mk(j, -1)) } else { last.push(mk(j, LEN - 1)) }
+    j = j + 1
+  }
+  // Separate pass so no compiler can see that ident[j] IS base[j].
+  let j2 = 0
+  while j2 < GROUPS {
+    ident.push(base[j2])
+    j2 = j2 + 1
+  }
+
+  let cA = 0
+  let i = 0
+  while i < REPS {
+    const q = i % GROUPS
+    if base[q].streq8(ident[q]) { cA = cA + 1 }
+    i = i + 1
+  }
+  let cB = 0
+  i = 0
+  while i < REPS {
+    const q = i % GROUPS
+    if base[q].streq8(copy[q]) { cB = cB + 1 }
+    i = i + 1
+  }
+  let cC = 0
+  i = 0
+  while i < REPS {
+    const q = i % GROUPS
+    if base[q].streq8(first[q]) { cC = cC + 1 }
+    i = i + 1
+  }
+  let cD = 0
+  i = 0
+  while i < REPS {
+    const q = i % GROUPS
+    if base[q].streq8(last[q]) { cD = cD + 1 }
+    i = i + 1
+  }
+  print(cA)
+  print(cB)
+  print(cC)
+  print(cD)
+}
+
+main()

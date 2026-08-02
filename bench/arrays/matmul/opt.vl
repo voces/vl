@@ -1,0 +1,66 @@
+// matmul, hand-optimized attempt — index bases hoisted out of the inner loop
+// (`ib = i*n`, `kb = k*n`), so the innermost statement does two adds instead of two
+// multiply-adds. RESULT: a dead WASH against main.vl — interleaved min-of-5 A/B gives
+// 1.824s vs 1.789s, i.e. 2%. Recorded because the null result is the finding: the
+// matmul gap is NOT index arithmetic. Replacing the inner `while` with the range form
+// `for j in 0 to n - 1` is also a wash (1.76s), so bounds-narrowing over a range loop
+// is not implemented either; and `for x in xs` lowers to exactly the same per-element
+// sequence as `while i < n { ... xs[i] ... }` (0.4998s vs 0.5045s on a 2M x 200 sum).
+//
+// What the emitted wasm actually does per innermost iteration, for EACH of the three
+// element accesses (c read, b read, c write): `struct.get 0` to reload the backing
+// array ref, `struct.get 1` to reload len, `i32.lt_u` + `select` for an explicit
+// bounds check that feeds -1 on failure, and THEN the `array.get`/`array.set` with
+// the engine's own bounds check. Stripping just the redundant explicit check from the
+// emitted .wat by hand (leaving the engine check) is worth 20%; hand-writing the whole
+// kernel in raw WasmGC (`array (mut f64)` in a local, no header struct, no explicit
+// check) is worth only 17%. Hand-writing it against LINEAR MEMORY instead
+// (`f64.load`/`f64.store`) is worth 4.0x on wasmtime — 1.76s -> 0.44s. That, not the
+// emitter, is where the matmul headroom is.
+const N = 600
+const ROUNDS = 3
+
+function run(n: i32, rounds: i32): i64 {
+  const a: f64[] = []
+  const b: f64[] = []
+  const c: f64[] = []
+  let i = 0
+  while i < n * n {
+    a.push(((i * 31 + 7) % 97) as f64 * 0.125 - 6.0)
+    b.push(((i * 17 + 3) % 89) as f64 * 0.125 - 5.5)
+    c.push(0.0)
+    i = i + 1
+  }
+  let r = 0
+  while r < rounds {
+    i = 0
+    while i < n {
+      const ib = i * n
+      let k = 0
+      while k < n {
+        const aik = a[ib + k]
+        const kb = k * n
+        let j = 0
+        while j < n {
+          c[ib + j] = c[ib + j] + aik * b[kb + j]
+          j = j + 1
+        }
+        k = k + 1
+      }
+      i = i + 1
+    }
+    r = r + 1
+  }
+  let s = 0.0
+  i = 0
+  while i < n * n {
+    s = s + c[i]
+    i = i + 1
+  }
+  return (s * 1000.0) as i64
+}
+
+function main() {
+  print(run(N, ROUNDS))
+}
+main()
