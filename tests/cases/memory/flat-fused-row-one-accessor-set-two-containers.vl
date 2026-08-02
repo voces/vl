@@ -1,0 +1,63 @@
+// @run
+// @log 11
+// @log 22
+// @log 22
+// @log 33
+// WHAT THE FUSED PATTERN ACTUALLY DELETES — and it is not the accessor count.
+//
+// `flat-lua-tvalue-accessors.vl` needs 5 functions for 2 fields; the fused set
+// needs 5 for 2 as well. The count is IDENTICAL and any claim that the bracket
+// removes boilerplate per FIELD is false.
+//
+// What it removes is the CONTAINER dimension. A hand-written accessor takes
+// (container, index), so it is written once per (record × container) pair. A
+// fused accessor takes a row ADDRESS, so it is written once per RECORD and each
+// container contributes exactly one `"[]"` — N×M becomes N+M.
+//
+// This file is the proof at M=2: `Stack` addresses linearly, `Ring` masks the
+// index and wraps, the two operators share NOTHING, and ONE accessor set serves
+// both. Under the (container, index) spelling the second container costs a second
+// copy of every accessor, and the two copies drift independently.
+//
+// The honest control is a THIRD rung, expressible today with no new features at
+// all: accessors that take a bare `i32` address plus a per-container `slotAt`.
+// That also gets N+M. What the brand adds over it is that a `RowAddr` and a
+// `NodeAddr` cannot cross (`flat-fused-row-brands-dont-cross.vl`) where two raw
+// `i32` addresses silently can — and it adds it for ZERO bytes: the two modules
+// are `cmp`-identical (`flat-records-design.md` §9.3).
+import { Buffer } from "std:buffer"
+
+flat type TValue = { value: i64, tt: i32, pad: i32 }
+type RowAddr = new i32
+type Stack = new { base: i32, count: i32 }
+type Ring = new { base: i32, mask: i32 }
+
+// TWO containers with genuinely different addressing — one operator each.
+function "[]"(self: Stack, i: i32): RowAddr {
+  return (self.base + i * TValue.size) as RowAddr
+}
+function "[]"(self: Ring, i: i32): RowAddr {
+  return (self.base + (i & self.mask) * TValue.size) as RowAddr
+}
+
+// ONE accessor set, shared. Neither function mentions a container type.
+function tt(self: RowAddr) { return __load_i32__((self as i32) + TValue.tt) }
+function setTt(self: RowAddr, v: i32) {
+  __store_i32__((self as i32) + TValue.tt, v)
+}
+
+const buf = Buffer(4096)
+const st: Stack = { base: buf.base + 64, count: 128 }
+const rg: Ring = { base: buf.base + 2048, mask: 7 }
+
+st[2].setTt(11)
+rg[2].setTt(22)
+print(st[2].tt())
+print(rg[2].tt())
+// The ring WRAPS — index 10 masks to index 2, so it reads what index 2 wrote.
+// The two containers reached the same accessor and disagreed about the address,
+// which is the separation this file exists to show.
+print(rg[10].tt())
+// And writing through the wrapped index is visible at the unwrapped one.
+rg[10].setTt(33)
+print(rg[2].tt())
