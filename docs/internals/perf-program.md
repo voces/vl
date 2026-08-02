@@ -1854,3 +1854,225 @@ Every rc read BARE (a pipe reports `tail`'s status, not the command's).
 **Seed-bootstrap: NO SPLIT.** The freshly fetched `seed-latest` (1,113,727, i.e. `fb31405d`)
 compiles this branch's source directly; `ref.eq` is an opcode the emitter already writes
 elsewhere (`wasmEmit.vl`'s closure equality) and nothing here is new language surface.
+
+---
+
+## 11. The storage class of a top-level binding — a script's loop stops being 4x slower than a function's
+
+A top-level `let`/`const` lowered to a module GLOBAL. A mutable wasm global is
+observable module state, so an engine must keep it in memory across anything that could
+read it; a local lives in a register. The consequence is that **the first program a new
+user writes is the slow spelling of itself**:
+
+| program shape | wall (master) |
+| --- | ---: |
+| top-level `let s: f64` accumulate loop, 10^10 iterations | **16,839 ms** |
+| the identical loop inside `function run(): f64` | 4,041 ms |
+| top-level `let s: i64` loop | 4,588 ms |
+| the identical loop inside `function run(): i64` | 2,181 ms |
+
+`deno eval` of the equivalent JS is 5.47 s, so VL LOST to JS on the one-liner spelling
+and won comfortably on the function spelling. Confirmed by disassembly: the top-level
+loop body is `global.get $global$0` / `global.set $global$0` per iteration where the
+in-function version is `local.get` / `local.set`.
+
+**The optimizer will not do this for us.** The cells are not exported and the module has
+exactly one function, and `wasm-opt --closed-world -O3 --gufa -O3` still leaves 7 global
+ops in the loop (16.5 s after). The choice of storage class belongs to the emitter.
+
+### 11.1 What shipped
+
+`computeGlobalPromotion` (`compiler/emit_sections.vl`) gives a qualifying top-level
+binding a LOCAL of the synthetic start function instead of a cell, and the binding emits
+no cell at all — `gCellIdx` re-densifies the survivors and `userGlobalIdx` is the single
+index translation that reads it. **The binding STAYS in `globalStmts`**, which is the
+design's load-bearing restraint: `globalCellKind`, `letIsLitUnion`, `letIsNulBoolAnn`
+and every other classifier keep asking about the same `LetDecl` and keep answering the
+same thing. Promotion moves the VALUE, never the BINDING, so no kind ladder, niche flag
+or narrowing table is touched. The slot is registered under `<name>#g`, a spelling no
+source identifier can produce, so nothing resolves to it by name either.
+
+### 11.2 The safety predicate
+
+Four clauses, all four required. P2/P3 are `globalPromotable`; P1/P4 are
+`computeGlobalPromotion`.
+
+| | clause | why |
+| --- | --- | --- |
+| **P1** | the module HAS a top-level statement list | a binding in a pure-library module has nothing to be faster for, and this guarantees `hasStart` is already 1 — promotion can never MINT a start function |
+| **P2** | the cell kind is a plain numeric scalar (`i32`/`i64`/`f64`/`f32`) | for exactly these, `fbValtypeNullable(ck, cs)` and `fbValtype(ck, cs)` are the same byte, so a local is a drop-in for the cell; and they are precisely the kinds `emitIdentNode`'s non-const `ref.as_non_null` recovery already excludes, so no read-side path changes shape |
+| **P3** | the binding has an initializer | the global section already rejects one without, and a slot has no other way to acquire a value |
+| **P4** | every `Ident` node IN THE WHOLE ARENA spelling this name is inside the top-level region | rules out a named function body reading it, a lifted lambda capturing it, a monomorphized clone mentioning it, and any mention reached by a path the emitter does not model |
+
+**P4 is computed in the conservative DIRECTION, and that is the whole argument.** The
+obvious implementation — walk each function body looking for the name — is unsound under
+a walker hole: a shape the walk does not know hides a reference and the binding is
+promoted anyway. So the walk goes the other way. `promoMark` marks the top-level region
+(never descending into a nested `FuncDecl`, because a lifted lambda's body is its own
+wasm function that still addresses the cell), and a FLAT SCAN of the entire arena —
+exhaustive by construction, no walker involved — vetoes any binding named by an
+unmarked `Ident`. A hole in `promoMark` leaves a mention unmarked, which REFUSES the
+promotion. Every hole costs population; none costs soundness.
+
+P4 subsumes the export question rather than testing it: an `export let` produces no
+export entry at all (`exportSlotOfTarget` matches `FuncDecl`s only), the name section has
+no global-name subsection, and a VL program runs BY INSTANTIATION — the start section IS
+the top level, nothing before it, nothing after. The start function's frame is the whole
+observable lifetime of a binding no other function names.
+
+### 11.3 The failure ladder has three rungs, and none of them is silent
+
+`emitUserGlobalGet` / `emitUserGlobalSet` (`wasmEmit.vl`) are now the only producers of a
+USER cell's `global.get`/`global.set` — the string-literal pool is `fbGlobalGet`'s only
+other caller — so cell-vs-local is one decision no emit site can bypass. A promoted
+binding reached outside `emitStartFnCode`'s context window (`gPromoInStart`) is an
+`emitFail`, not a wrong opcode. **Sabotaged, in that order:**
+
+| sabotage | what happens |
+| --- | --- |
+| **A** — P4's veto made a no-op (`gPromoOk[gj] = 1`) | `promoted-scalar-start-locals.vl` still correct; `promotion-blocked-by-function-read.vl`, `cross-function.vl` and `mutate-in-loop.vl` become LOUD emit rejects naming the source position: `emitProgram: promoted top-level binding read outside the top-level statement list` at `…:8:9`. 2 of the 3 structural tests redden; the promotion test stays green |
+| **B** — promotion disabled entirely (P1 always returns) | **every program still prints exactly the right thing.** Nothing behavioural moves. Only the structural assertions redden, 5≠0 and 2≠1 |
+| **C** — A *and* the `emitFail` net removed | still loud, one rung down: `is not a valid WebAssembly module`. The slot is not even assigned while a user body is emitted, so the wrong-frame read emits an out-of-range local index and fails validation |
+
+**Sabotage B is the finding worth keeping.** The behavioural corpus — 1,720 files with
+`@log` oracles — is COMPLETELY BLIND to this optimization being switched off, because a
+correct program is correct in either storage class. That is exactly why
+`tests/vl_global_promotion_test.ts` counts global-section entries instead of trusting the
+oracle, and why the inverted control asserts EXACTLY ONE rather than "at least one": zero
+would mean a binding a function reads got promoted, two would mean the fixture stopped
+testing anything.
+
+### 11.4 The population
+
+Global-section entries per corpus program, both compilers, A minus B:
+
+```sh
+# per corpus file: vl build with each compiler, then
+wasm-tools print out.wasm | grep -c '^  (global '
+```
+
+**182 of the 1,442 corpus programs that build (12.6%) promote at least one binding;
+538 bindings in total.** The largest single program promotes 35.
+
+**The compiler itself promotes ZERO, and P1 is not the reason.** `compiler/*.vl` has 588
+top-level `let`/`const` declarations and no top-level statements at all, so P1 declines
+first — but a probe that RELAXES P1 (`startStmts.length < 0`) and rebuilds still emits
+**2,280 globals, unchanged**. P4 vetoes all 588: every top-level binding in a compiler is
+module state read from function bodies, which is what module state IS. So the
+self-compile is untouched by this item, and "relax P1 to reach the compiler" is refuted
+rather than filed.
+
+### 11.5 The speedup
+
+Wall clock, **interleaved** A/B (the two compilers alternate sample by sample, so box
+drift lands on both legs — a block-sequential run of the same eight programs read a
+monotonically falling series that invents a difference), median of 5, load 7.30.
+
+| program | master | branch | ratio | min ratio |
+| --- | ---: | ---: | ---: | ---: |
+| top-level `let s: f64` loop | 16,839 ms | **4,081 ms** | **4.13x** | 4.12x |
+| the same loop in `function run(): f64` | 4,041 ms | 4,077 ms | 0.99x | 1.00x |
+| top-level `let s: i64` loop | 4,588 ms | **3,481 ms** | **1.32x** | 1.24x |
+| the same loop in `function run(): i64` | 2,181 ms | 2,156 ms | 1.01x | 0.97x |
+| Mandelbrot, working vars at top level | 3,471 ms | **2,553 ms** | **1.36x** | 1.34x |
+| Mandelbrot, working vars block-scoped | 2,379 ms | 2,528 ms | 0.94x | 0.99x |
+| sieve, counters at top level | 2,526 ms | 2,442 ms | 1.03x | 1.06x |
+| sieve, counters block-scoped | 2,651 ms | 2,614 ms | 1.01x | 0.97x |
+
+**THE NOISE FLOOR IS STATED BY THE MODULES, not by a repeat count.** The two
+`function run()` programs declare no top-level binding at all, so both compilers emit
+**byte-identical wasm** for them (`cmp`-equal) — whatever ratio they read is the
+instrument. They read 0.99x and 1.01x on medians, 1.00x and 0.97x on minima: **the floor
+is +-3%**, and the block-scoped Mandelbrot's 0.94x median is inside it (its minima read
+0.99x).
+
+**The headline is the convergence, not the ratio.** After promotion the top-level and
+in-function f64 programs read 4,081 ms and 4,077 ms — the same program, as their now
+byte-identical loop bodies say they should be. The one-liner spelling stopped being the
+slow spelling, and VL stopped losing to `deno eval` (5.47 s) on it.
+
+**Two things this measurement REFUTES about itself:**
+
+1. **A "realistic program" is not automatically a promoting program.** The first
+   Mandelbrot and sieve I wrote declared their working variables inside the loop bodies —
+   already start-function locals — and read 0.95x and 1.00x. They are kept above as
+   controls. Promotion pays only where a promoted binding is touched in the hot path,
+   which is why the sieve's top-level variant only reads 1.03x: its inner loop is
+   dominated by the `flags[m] = 0` array store, and `flags` is a ref cell that P2
+   excludes.
+2. **The i64 pair does NOT converge and this is not attributed.** `wasm-tools print`
+   shows the two i64 loop bodies are byte-identical after promotion, yet 3,481 ms vs
+   2,156 ms is a stable 1.61x apart across every sample. Whatever that residue is, it is
+   not a storage class — the f64 pair with the same structure converges to 0.1%. Filed
+   as observed, with no mechanism claimed.
+
+### 11.6 The byte delta
+
+| | |
+| --- | --- |
+| the compiler | 1,114,399 -> **1,119,281 bytes (+4,882)** — ALL of it the new emitter source; the compiler promotes nothing (§11.4) |
+| corpus, 1,442 programs built by both legs | **net -974 bytes** |
+| the 1,260 programs that promote nothing | **+0 bytes, on every single one** |
+| the 182 that promote | -974 net; 96 smaller, 78 larger, 8 unchanged |
+
+**The per-binding model, and why some programs GROW.** A const-init cell costs
+`valtype + mut + init + end` = init+3. Promoted, it costs a locals-vector run (2) plus
+`init + local.set` (init+2) = init+4. So **+1 byte per promoted CONST-init scalar** —
+visible bare in the largest grower, which promotes 35 bindings for exactly +34 bytes. A
+NON-const cell instead loses its zero-init constexpr (an `f32.const 0.0` is 5 bytes) and
+keeps the same store, so it shrinks 3-6. The corpus is net negative because the f32/f64
+cells dominate; a program of nothing but `const` i32s pays a byte each for its registers.
+
+The zero on all 1,260 non-promoting programs is the stronger half of this table: the
+change is exactly inert where it does not fire.
+
+### 11.7 Gate
+
+Every rc read BARE (a pipe reports `tail`'s status, not the command's).
+
+| gate | rc | result |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | **1,114,399 bytes** (master `154e14f8`) |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint in **2 compiles** at **1,119,281** |
+| `scripts/native-fixpoint.sh` | 0 | **stage3 == stage4** at 1,119,281 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,652 passed / 0 failed / 7 ignored** — the ignored COUNT is the documented 7, so the native prereqs held and the run is readable |
+| `scripts/lint-self.sh` | 0 | clean (self-lint + fmt-check) |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined, 0 new, 0 stale |
+| **six-channel corpus A/B**, 1,720 files | — | CHECKRC **0 differ**, CHECKMSG **0**, BUILDRC **0**, BUILDMSG 176, BYTES 176, **RUN 8** |
+| **fuzz A/B**, 14 seeds x 150 x depths 3-5 | — | **identical finding sets** — 1 each (the baselined REJECT), md5 `bc11dae2de25ec29bcd6be5a706fcb75` both legs |
+
+**The RUN channel's 8 rows are the wasm BACKTRACE ADDRESS, and the corpus has no other
+divergence.** Every one is a `@trap` case whose stderr carries `0x9f - vl!<wasm function
+4>`; the rc is identical on all 8, the trap reason is identical on all 8, and normalizing
+`0x<hex>` to `0xADDR` takes the differing set to **ZERO rows**. A change that moves module
+bytes moves the address a trap reports, and 8 of 1,720 corpus files print one. Worth
+recording as a property of the channel: **RUN is not address-stable, so a byte-moving
+change should classify its RUN rows before reading them as behaviour.**
+
+BUILDMSG moves with BYTES because `vl build` echoes the size it wrote.
+
+**The fuzz channel's REACH was measured rather than assumed**, per the standing rule
+against banking a zero from a vacuous run. Generating a batch and comparing declared
+globals per case: **22 of 400 generated cases promote exactly one binding (5.5%)** —
+thin, but real, so the identical finding sets above are evidence. (The generator emits
+one top-level statement, `go()`, which satisfies P1; most of its top-level `const`s are
+closure- or composite-typed and P2 declines them.) The reach probe is
+`scripts/fuzzgen.vl` split on `===CASE` with `wasm-tools print | grep -c '^  (global '`
+under each compiler.
+
+**Seed-bootstrap: NO SPLIT.** The freshly fetched `seed-latest` compiles this branch's
+source directly. Nothing here is new language surface — the emitter writes `local.get` /
+`local.set` and registers locals through `addLocalName` exactly as `emitFuncCode` does.
+
+### 11.8 What is NOT promoted, and what the next slice would be
+
+- **Every ref-typed cell** (string, list, map, struct, closure, union, and all their
+  nullable forms). A non-const ref cell is declared NULLABLE and every read recovers with
+  `ref.as_non_null`; a local of the same kind is non-null. Reconciling those two valtypes
+  is the whole of the next slice and is deliberately not attempted here.
+- **Any binding in a module with no top-level statements** (P1) — including all 588 of
+  the compiler's, though §11.4 shows P4 would have vetoed them anyway.
+- **Any binding whose NAME appears anywhere in any function body**, even when that
+  mention is a same-named local of that function. P4 is name-keyed, not binding-keyed;
+  making it binding-keyed would add population at the cost of the property that makes the
+  flat arena scan exhaustive.

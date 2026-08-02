@@ -31,23 +31,34 @@ import {
   repSigTokHasSlot,
 } from "./emit_rep"
 import {
+  ArrayLit,
   AsExpr,
+  BinExpr,
   Block,
   Call,
+  FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  Index,
+  IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   NullLit,
   NumLit,
+  ObjLit,
+  OptMember,
   P,
   Param,
+  Paren,
   Program,
+  RetStmt,
   StrLit,
   TypeRef,
+  Unary,
   WhileStmt,
 } from "./ast"
 import { numLexFitsI32 } from "./emit_bignum"
@@ -129,6 +140,7 @@ import {
   fnUsesStrPush,
   fnUsesVariantRebox,
   fnValUsed,
+  gCellIdx,
   gEmitNames,
   gF32PrintIdx,
   gF64PrintIdx,
@@ -143,6 +155,9 @@ import {
   gNeedsF32Print,
   gNeedsF64Print,
   gNeedsI64Print,
+  gPromoInStart,
+  gPromoOk,
+  gPromoSlot,
   gStrPoolIx,
   gStrPoolTexts,
   globalIndexBySid,
@@ -250,7 +265,6 @@ import {
   fbEnd,
   fbF32Const,
   fbF64Const,
-  fbGlobalSet,
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
@@ -311,6 +325,7 @@ import {
   forInRefArrayStructIdx,
   globalCellKind,
   globalCellStructIdx,
+  globalIndexOf,
   globalInitIsLitAtom,
   globalInitWidensAtomToStr,
   globalRefListSlot,
@@ -407,10 +422,10 @@ import {
   emitNullForRet,
   emitStmt,
   emitUnionCoerce,
+  emitUserGlobalSet,
   mvValsWrapOf,
   pushFieldStorage,
   sFieldRefSlot,
-  userGlobalIdx,
 } from "./wasmEmit"
 
 // Host opt-in for the name section (see `gEmitNames`). The driver does NOT call
@@ -811,6 +826,277 @@ function startScanIf(ifIx: i32) {
   0
 }
 
+// ── PROMOTION of a top-level binding to a start-function LOCAL (G2c) ─────────
+// `emit_state.vl`'s `gPromoOk` header carries the model and the measurement that
+// motivates it. This block is the ANALYSIS: the reachability walk, the safety
+// predicate, and the one query the four start-fn / global-section gates share.
+
+// Mark every arena node reachable from the TOP-LEVEL REGION — the top-level statement
+// list and the top-level initializers — into `marks`, WITHOUT descending into a nested
+// `FuncDecl`. That stop is a semantic requirement, not an optimization: a lambda
+// literal written at top level is LIFTED to its own wasm function, and its body still
+// addresses the binding as a module cell.
+//
+// A node shape this ladder does not know leaves its descendants UNMARKED, and an
+// unmarked mention refuses the promotion — so a hole here costs POPULATION, never
+// soundness. That asymmetry is why reachability is computed in this direction rather
+// than the obvious one (walk each function body looking for the name): the flat arena
+// scan it pairs with in `computeGlobalPromotion` is exhaustive by construction, so a
+// hole in THIS walk can only move the answer to the conservative side. A hole in a
+// function-body walk would move it to the unsound side.
+function promoMark(marks: i32[], ix: i32) {
+  if ix < 0 { return 0 }
+  if ix >= marks.length { return 0 }
+  if marks[ix] == 1 { return 0 }
+  marks[ix] = 1
+  const n = P.nodes[ix]
+  if n is FuncDecl { return 0 }
+  if n is Block {
+    const bs = n.blkStmts
+    let bi = 0
+    while bi < bs.length {
+      promoMark(marks, bs[bi])
+      bi = bi + 1
+    }
+    return 0
+  }
+  if n is LetDecl { return promoMark(marks, n.letInit) }
+  if n is BinExpr {
+    promoMark(marks, n.binLeft)
+    return promoMark(marks, n.binRight)
+  }
+  if n is Call {
+    promoMark(marks, n.callFn)
+    const args = n.callArgs
+    let ai = 0
+    while ai < args.length {
+      promoMark(marks, args[ai])
+      ai = ai + 1
+    }
+    return 0
+  }
+  if n is IfStmt {
+    promoMark(marks, n.ifCond)
+    promoMark(marks, n.ifThen)
+    return promoMark(marks, n.ifElse)
+  }
+  if n is WhileStmt {
+    promoMark(marks, n.whileCond)
+    return promoMark(marks, n.whileBody)
+  }
+  if n is ForRange {
+    promoMark(marks, n.frFrom)
+    promoMark(marks, n.frTo)
+    promoMark(marks, n.frStep)
+    return promoMark(marks, n.frBody)
+  }
+  if n is ForIn {
+    promoMark(marks, n.fiIter)
+    return promoMark(marks, n.fiBody)
+  }
+  if n is RetStmt { return promoMark(marks, n.retArg) }
+  if n is Unary { return promoMark(marks, n.unArg) }
+  if n is Paren { return promoMark(marks, n.parInner) }
+  if n is Member { return promoMark(marks, n.memObj) }
+  if n is OptMember { return promoMark(marks, n.omObj) }
+  if n is IsExpr { return promoMark(marks, n.isObj) }
+  if n is AsExpr { return promoMark(marks, n.asObj) }
+  if n is Index {
+    promoMark(marks, n.idxArr)
+    return promoMark(marks, n.idxIndex)
+  }
+  if n is ArrayLit {
+    const es = n.arrElems
+    let ei = 0
+    while ei < es.length {
+      promoMark(marks, es[ei])
+      ei = ei + 1
+    }
+    return 0
+  }
+  if n is ObjLit {
+    const fs = n.objFields
+    let fi = 0
+    while fi < fs.length {
+      promoMark(marks, fs[fi])
+      fi = fi + 1
+    }
+    return 0
+  }
+  if n is FieldInit { return promoMark(marks, n.fiValue) }
+  if n is MatchExpr {
+    promoMark(marks, n.matchScrut)
+    const pats = n.matchPats
+    let pi = 0
+    while pi < pats.length {
+      promoMark(marks, pats[pi])
+      pi = pi + 1
+    }
+    const binds = n.matchBinds
+    let bj = 0
+    while bj < binds.length {
+      promoMark(marks, binds[bj])
+      bj = bj + 1
+    }
+    const bodies = n.matchBodies
+    let mj = 0
+    while mj < bodies.length {
+      promoMark(marks, bodies[mj])
+      mj = mj + 1
+    }
+    return 0
+  }
+  0
+}
+
+// THE CHEAP HALF of the safety predicate — the two clauses that read only this
+// binding's own declaration. The reachability clause is applied by
+// `computeGlobalPromotion`, which is the only caller.
+//
+//   P2  The cell kind is a plain numeric scalar (`i32`/`i64`/`f64`/`f32`). For exactly
+//       these, `fbValtypeNullable(ck, cs)` and `fbValtype(ck, cs)` are the same byte, so
+//       a start-fn local is a drop-in for the cell — and they are precisely the kinds
+//       `emitIdentNode`'s non-const `ref.as_non_null` recovery already excludes, so no
+//       read-side path changes shape. A REF cell is a NULLABLE global but would be a
+//       non-null local; reconciling those two valtypes is a different change and is
+//       deliberately not attempted here. Note the i32 kind also carries the
+//       literal-union, `K | null` and `boolean | null` NICHE encodings, and promoting
+//       them is storage-correct precisely because promotion moves the VALUE and not the
+//       BINDING: the row stays in `globalStmts`, so `globalCellKind`, `letIsLitUnion`,
+//       `letIsNulBoolAnn` and every other classifier keep answering about the same
+//       `LetDecl` and keep answering the same thing.
+//   P3  The binding has an initializer. `emitGlobalSection` already rejects one without,
+//       and a promoted binding's slot has no other way to acquire a value.
+function globalPromotable(gi: i32) {
+  const d = P.nodes[globalStmts[gi]]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    const ck = globalCellKind(globalStmts[gi])
+    if ck == "i32" { return true }
+    if ck == "i64" { return true }
+    if ck == "f64" { return true }
+    if ck == "f32" { return true }
+    return false
+  }
+  false
+}
+
+// Decide, for every top-level binding, whether it lives in a cell or a start-function
+// local, and re-densify the cell indices around the ones that leave. Runs ONCE, at the
+// top of `emitModule` — after every pass that mutates the arena (monomorphization
+// clones nodes, and a clone that mentions a name has to be seen by the scan below) and
+// before the first section that reads a global index.
+//
+// THE SAFETY PREDICATE is P1 here plus P2/P3 in `globalPromotable` plus P4 below:
+//
+//   P1  There IS a top-level statement list. A binding in a pure-library module has
+//       nothing to be faster for, and the clause additionally guarantees `hasStart` is
+//       already 1 — so promotion can never MINT a start function for a module that had
+//       none, and can never grow one.
+//   P4  Every `Ident` node in the arena that spells this binding's name is inside the
+//       top-level region. This is the clause that rules out a named function body
+//       reading it, a lifted lambda capturing it, a monomorphized clone mentioning it,
+//       and any mention reached by a path this file does not model. It is deliberately
+//       NAME-keyed and not binding-keyed: a function with its own local of the same
+//       name vetoes a promotion it did not need to veto, which costs population and
+//       nothing else.
+//
+// P4 subsumes the export question rather than testing it separately. An `export let`
+// produces no export entry at all (`exportSlotOfTarget` matches `FuncDecl`s only), the
+// name section has no global-name subsection, and a VL program runs BY INSTANTIATION —
+// the start section IS the top level, with nothing before it and nothing after it. So
+// the start function's frame is the whole observable lifetime of a binding no other
+// function names.
+export function computeGlobalPromotion() {
+  gPromoInStart = false
+  // REBUILT, not reset in place. `collectFns` seeds these three arrays so a
+  // `userGlobalIdx` before this pass still answers the identity, but any pass that
+  // appends a global after `collectFns` would leave them SHORT — the same hazard
+  // `emit_state.vl` records against `globalIndexBySid`, whose "built once" invariant is
+  // exactly what a rebuild here does not depend on.
+  gPromoOk = []
+  gPromoSlot = []
+  gCellIdx = []
+  let ri = 0
+  while ri < globalStmts.length {
+    gPromoOk.push(0)
+    gPromoSlot.push(-1)
+    gCellIdx.push(ri)
+    ri = ri + 1
+  }
+  if startStmts.length == 0 {
+    return 0 // P1
+  }
+  let anyCand = false
+  let ci = 0
+  while ci < globalStmts.length {
+    if globalPromotable(ci) {
+      gPromoOk[ci] = 1
+      anyCand = true
+    }
+    ci = ci + 1
+  }
+  if !anyCand { return 0 }
+  // P4, in two halves. The reachability walk marks the top-level region; the flat arena
+  // scan then finds every `Ident` the walk did NOT reach and vetoes the binding it
+  // names. The scan is over the WHOLE arena, which is what makes "everywhere else"
+  // exhaustive without needing to enumerate what "everywhere else" is.
+  const marks: i32[] = []
+  let mi = 0
+  while mi < P.nodes.length {
+    marks.push(0)
+    mi = mi + 1
+  }
+  let gi = 0
+  while gi < globalStmts.length {
+    promoMark(marks, globalStmts[gi])
+    gi = gi + 1
+  }
+  let si = 0
+  while si < startStmts.length {
+    promoMark(marks, startStmts[si])
+    si = si + 1
+  }
+  let ai = 0
+  while ai < P.nodes.length {
+    if marks[ai] == 0 {
+      const nd = P.nodes[ai]
+      if nd is Ident {
+        const gj = globalIndexOf(nd.identName)
+        if gj >= 0 { gPromoOk[gj] = 0 }
+      }
+    }
+    ai = ai + 1
+  }
+  // The surviving cells re-densify: a promoted binding emits none, so every cell below
+  // a promoted one keeps its index and every cell above it drops by one. `userGlobalIdx`
+  // is the single translation and reads this array.
+  let cell = 0
+  let di = 0
+  while di < globalStmts.length {
+    if gPromoOk[di] == 1 {
+      gCellIdx[di] = -1
+    } else {
+      gCellIdx[di] = cell
+      cell = cell + 1
+    }
+    di = di + 1
+  }
+  0
+}
+
+// Does the binding at `globalStmts` position `gi` have its initializer RUN by the start
+// function? True for a non-constexpr init (its cell is zero-initialized there and the
+// start fn stores the real value) and for a PROMOTED binding (which has no cell at all,
+// so its init — constexpr or not — becomes the `local.set` that gives the slot its
+// value). The four places that must agree on this question are `emitModule`'s `hasStart`
+// count, `startFnDetectScratch`'s initializer scan, `emitGlobalSection`'s cell arm, and
+// `emitStartFnCode`'s merge loop.
+export function globalRunsInStartFn(gi: i32) {
+  if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 { return true }
+  globalIsNonConst(globalStmts[gi])
+}
+
 // Detect, over the non-const global inits AND the top-level statements, the scratch
 // frames the start function's body needs — the start-fn analogue of `emitFuncCode`'s
 // per-function `fnHas*` detection. A `.push` is a statement-level void call (never in
@@ -846,7 +1132,10 @@ function startFnDetectScratch() {
   mfDstBases = []
   let gi = 0
   while gi < globalStmts.length {
-    if globalIsNonConst(globalStmts[gi]) {
+    // A PROMOTED binding's init runs here too (its `local.set` replaces the cell's
+    // constexpr), so its scratch needs are detected on the same gate — else a const
+    // init that needs a frame would reach the start fn with none reserved.
+    if globalRunsInStartFn(gi) {
       const g = P.nodes[globalStmts[gi]]
       if g is LetDecl {
         const ix = g.letInit
@@ -937,7 +1226,7 @@ function startFnDetectScratch() {
   // `blockHasVariantRebox` recurses into for/while/if bodies itself.
   let vrg = 0
   while vrg < globalStmts.length {
-    if globalIsNonConst(globalStmts[vrg]) {
+    if globalRunsInStartFn(vrg) {
       const vg = P.nodes[globalStmts[vrg]]
       if vg is LetDecl {
         if vg.letInit >= 0 {
@@ -960,7 +1249,7 @@ function startFnDetectScratch() {
   fnUsesCloEq = false
   let lgi = 0
   while lgi < globalStmts.length {
-    if globalIsNonConst(globalStmts[lgi]) {
+    if globalRunsInStartFn(lgi) {
       const lg = P.nodes[globalStmts[lgi]]
       if lg is LetDecl { leqScanExpr(lg.letInit, -1) }
     }
@@ -1054,6 +1343,34 @@ function collectStartLocals() {
     i = i + 1
   }
   scopePop()
+  // The PROMOTED top-level bindings (G2c) claim their slots LAST, after every local the
+  // statement walk declared, so a program that promotes nothing emits a byte-identical
+  // frame and a program that promotes leaves every other local's index where it was.
+  //
+  // The slot is registered under `<name>#g`, NOT under the binding's own name. The `#`
+  // cannot occur in a source identifier, so nothing resolves to this slot by NAME —
+  // `declaredIndexOf`, `scopeSlotOf` and the whole classifier layer keep seeing the
+  // binding as the module global it still is in `globalStmts`, and the ONLY reader of
+  // the slot is `emitUserGlobalGet`/`emitUserGlobalSet` via `gPromoSlot`. That is what
+  // keeps this change to a storage class instead of a rebinding: the kind ladders,
+  // niche flags and narrowing tables are untouched.
+  let pgi = 0
+  while pgi < globalStmts.length {
+    if gPromoOk[pgi] == 1 {
+      const pg = P.nodes[globalStmts[pgi]]
+      if pg is LetDecl {
+        // P2 restricted the cell to a plain numeric scalar, so `structIdx` is never
+        // consulted and `fbLocalRun(ck, -1)` writes the same valtype byte the cell's
+        // `fbValtypeNullable(ck, -1)` would have.
+        gPromoSlot[pgi] = addLocalName(
+          pg.letName + "#g",
+          globalCellKind(globalStmts[pgi]),
+          -1,
+        )
+      }
+    }
+    pgi = pgi + 1
+  }
   localNames.length
 }
 
@@ -1101,13 +1418,21 @@ function emitStartFnCode(out: i32[]) {
   // narrowing of `pushPostGuardNarrow` — a top-level guard `if` cannot
   // `return`, so only the assignment arm ever fires here). Restored at loop end.
   const savedStartNarrowTop = narrowTop
+  // THE PROMOTION CONTEXT WINDOW (G2c): a promoted binding's `local.get`/`local.set`
+  // is only meaningful in THIS frame, so the flag that lets `emitUserGlobalGet` /
+  // `emitUserGlobalSet` produce one is armed for exactly the span that streams this
+  // body. Every user function body has already been emitted by `emitCodeSection` at
+  // this point, and the const cells' constexpr inits by `emitGlobalSection` before
+  // that; both ran with the flag false, which is what makes a promoted binding
+  // reaching them a loud reject rather than a wrong opcode.
+  gPromoInStart = true
   while gi < globalStmts.length || si < startStmts.length {
     let takeGlobal = gi < globalStmts.length
     if takeGlobal && si < startStmts.length {
       if startStmts[si] < globalStmts[gi] { takeGlobal = false }
     }
     if takeGlobal {
-      if globalIsNonConst(globalStmts[gi]) {
+      if globalRunsInStartFn(gi) {
         const g = P.nodes[globalStmts[gi]]
         if g is LetDecl {
           // Numeric WIDENING at the global-init boundary (a non-const `: f64`/`: f32`/`: i64`
@@ -1263,7 +1588,11 @@ function emitStartFnCode(out: i32[]) {
             pendingNulRefHeap = -1
           }
           const setPrev = wTarget(bodyExpr)
-          fbGlobalSet(userGlobalIdx(gi))
+          if emitUserGlobalSet(gi) < 0 {
+            wTarget(setPrev)
+            wTarget(exprPrev)
+            return -1
+          }
           wTarget(setPrev)
         }
       }
@@ -1277,6 +1606,10 @@ function emitStartFnCode(out: i32[]) {
       si = si + 1
     }
   }
+  // Close the promotion window. The `return -1` paths above leave it armed, which is
+  // inert: a failed body aborts the whole module emit, and `computeGlobalPromotion`
+  // clears the flag at the top of the next one.
+  gPromoInStart = false
   restoreNarrow(savedStartNarrowTop)
   wTarget(exprPrev)
 
@@ -1971,10 +2304,15 @@ function emitModule(_stmts: i32[]) {
   // extra `()->()` functype, one extra function-section + code-section entry, and the
   // start section (id 8). When zero (the case for EVERY golden), nothing below
   // changes, so the module stays byte-identical.
+  // Decide the storage class of every top-level binding BEFORE any section reads a
+  // global index — the counts, the cell indices and the start-fn frame all derive from
+  // it. It runs here rather than as an emit PASS because it must see the arena every
+  // pass left behind, monomorphization clones included.
+  computeGlobalPromotion()
   let nNonConst = 0
   let gci = 0
   while gci < globalStmts.length {
-    if globalIsNonConst(globalStmts[gci]) { nNonConst = nNonConst + 1 }
+    if globalRunsInStartFn(gci) { nNonConst = nNonConst + 1 }
     gci = gci + 1
   }
   let hasStart = 0
@@ -3514,15 +3852,24 @@ function emitGlobalSection() {
   // `array.new_fixed` are all valid WasmGC constant expressions, so no start function is
   // needed for the literal initializers in scope. A non-constexpr init (a reference to a
   // local/param) fails loudly via `emitExpr(fnIx = -1)` (start-fn fallback deferred).
+  // A PROMOTED binding (G2c) emits NO cell — it lives in a start-function local — so
+  // the count is the declarations MINUS the promoted ones, and the survivors' indices
+  // come from `gCellIdx` (which `userGlobalIdx` is the single translation through).
   const ng = globalStmts.length
+  let nCells = 0
+  let nci = 0
+  while nci < ng {
+    if gPromoOk[nci] != 1 { nCells = nCells + 1 }
+    nci = nci + 1
+  }
   const np = gStrPoolTexts.length
-  if ng + np > 0 {
+  if nCells + np > 0 {
     const globalPayload: i32[] = []
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
     // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
     // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
     const gPrev = wTarget(globalPayload)
-    wULEB(ng + np)
+    wULEB(nCells + np)
     // The string-literal POOL first (indices 0..np-1, before the user cells — see
     // `gStrPoolTexts`): each entry an IMMUTABLE non-null string ref whose init
     // constexpr builds the literal once (`i32.const` per code point +
@@ -3544,6 +3891,12 @@ function emitGlobalSection() {
     }
     let gi = 0
     while gi < ng {
+      // A PROMOTED binding (G2c) emits no cell at all: its value lives in a
+      // start-function local and its initializer becomes a `local.set` there.
+      if gPromoOk[gi] == 1 {
+        gi = gi + 1
+        continue
+      }
       const g = P.nodes[globalStmts[gi]]
       if g is LetDecl {
         if g.letInit < 0 {
