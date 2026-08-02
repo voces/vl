@@ -1,0 +1,110 @@
+// @run
+// @log 3
+// @log 100
+// @log 3
+// @log 200
+// @log 5
+// @log 300
+// @log 1
+// @log 1
+// @log 9
+// @log 4242
+// @log 16
+// @log 1
+// THE FUSED SPELLING of webcraft P1.2's `stack[i].tt`, written in PURE VL with
+// ZERO compiler lines — the second half of the ask, which
+// `flat-records-design.md` §6.2 had filed as blocked.
+//
+// The mechanism is three pieces that already ship, composed:
+//   1. `flat type` (P1.2 half one) folds `TValue.size` / `TValue.tt` to constants;
+//   2. B14's free index operator (`index-operator-design.md`) makes `st[i]` a call;
+//   3. P1.5 newtypes give that call a RETURN TYPE that is a row ADDRESS, not a row.
+//
+// The whole trick is (3): `"[]"` returns `RowAddr`, a brand over `i32`, so the
+// bracket yields an ADDRESS and the field accessors are offset loads off it.
+// NO ROW STRUCT IS EVER MATERIALIZED — pinned by the disassembly recorded in
+// `flat-records-design.md` §9: `st[i].tt()` is `base + i*16`, then `+ 8`, then
+// `i32.load`, and at `-O3 --closed-world` both accessors inline away completely,
+// leaving the load in the loop body with no call at all.
+//
+// The DIVERGENCE from the spec's spelling: VL's UFCS is call-style, so this is
+// `st[i].tt()` and not `st[i].tt`. The field spelling is a LOUD checker reject
+// (`member access '.tt' on non-object RowAddr`), never a wrong address — see
+// `flat-fused-row-field-spelling-rejected.vl`, the inverted control for this file.
+//
+// BOUNDS: none, deliberately. A `RowAddr` is a raw address and the engine's own
+// check is the policy (`load-past-page-end-traps.vl` states it); the trapping
+// twin for this file is `flat-fused-row-past-page-end-traps.vl`.
+import { Buffer } from "std:buffer"
+
+flat type TValue = { value: i64, tt: i32, pad: i32 }
+
+// The row ADDRESS, branded. The brand is load-bearing twice: it is what the
+// index operator dispatches its RESULT into, and it is what stops a bare `i32`
+// from being read as a row (`flat-fused-row-brand-required.vl`).
+type RowAddr = new i32
+type Stack = new { base: i32, count: i32 }
+
+function "[]"(self: Stack, i: i32): RowAddr {
+  return (self.base + i * TValue.size) as RowAddr
+}
+
+// One accessor pair per field — the SAME count the hand-written set needs, but
+// each one now takes an ADDRESS rather than a (container, index) pair, which is
+// what lets the bracket supply it.
+function tt(self: RowAddr): i32 { return __load_i32__((self as i32) + TValue.tt) }
+function setTt(self: RowAddr, v: i32) {
+  __store_i32__((self as i32) + TValue.tt, v)
+}
+function value(self: RowAddr): i64 {
+  return __load_i64__((self as i32) + TValue.value)
+}
+function setValue(self: RowAddr, v: i64) {
+  __store_i64__((self as i32) + TValue.value, v)
+}
+
+const buf = Buffer(4096)
+const st: Stack = { base: buf.base + 64, count: 128 }
+
+// WRITE through the fused spelling.
+st[0].setTt(3)
+st[0].setValue(100 as i64)
+st[1].setTt(3)
+st[1].setValue(200 as i64)
+st[7].setTt(5)
+st[7].setValue(300 as i64)
+
+// READ through the fused spelling, in a loop and at a constant index.
+let i = 0
+while i < 2 {
+  print(st[i].tt())
+  print(st[i].value() as i32)
+  i = i + 1
+}
+print(st[7].tt())
+print(st[7].value() as i32)
+
+// The addresses are DERIVED, so cross-check them against HAND-COMPUTED raw ones.
+// An offset table can be internally consistent and still be wrong about which
+// bytes a field occupies; only a raw read can see that. Row 7's tag sits at
+// base + 7*16 + 8 and its value at base + 7*16 + 0.
+let rawOk = 0
+if __load_i32__(buf.base + 64 + 7 * 16 + 8) == 5 { rawOk = 1 }
+print(rawOk)
+let rawVal = 0
+if __load_i64__(buf.base + 64 + 7 * 16) == 300 as i64 { rawVal = 1 }
+print(rawVal)
+
+// A row address is an ordinary VALUE: bind it once, use it many times. This is
+// the row-HANDLE idiom, and the spec's field spelling cannot express it.
+const r = st[9]
+r.setTt(9)
+r.setValue(4242 as i64)
+print(r.tt())
+print(r.value() as i32)
+
+// The stride the bracket used is the DECLARED one, and it is the spec's number.
+print(TValue.size)
+let strideOk = 0
+if (st[7] as i32) - (st[0] as i32) == 7 * 16 { strideOk = 1 }
+print(strideOk)
