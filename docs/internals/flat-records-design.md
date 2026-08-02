@@ -715,9 +715,25 @@ more than it should have: the initial reading was "the fused pattern is refuted 
 not work on a branded scalar". It was not refuted; it was misspelled. A diagnostic naming
 the `self` rule at the call site would have turned an afternoon into a minute.
 
-**D2 — that emit error's span points at the callee's DECLARATION, not the call site.**
-With the declaration on line 12 and the offending call on line 20, the error reads
-`:12:9`. Verified by moving the two apart; the span tracks the declaration.
+**D2 — that emit error's span never points at the call site; it points at the emitter's
+CURRENT-FUNCTION cursor.** This was first filed here as "the span tracks the callee's
+declaration", which the original witness supported and which is wrong — the callee was
+simply the last function declared. Four witnesses separate the candidates:
+
+| witness | callee decl | enclosing fn | call site | span |
+| --- | ---: | ---: | ---: | ---: |
+| call inside a function, callee declared ABOVE | 4 | 8 | 10 | **8** |
+| call inside a function, callee declared BELOW | 9 | 2 | 4 | **2** |
+| top-level call, callee is the only function | 4 | — | 9 | **4** |
+| top-level call, an unrelated function declared AFTER the callee | 2 | — | 7 | **4** (`unrelated`) |
+
+So: for a call inside a function the span is the ENCLOSING function's declaration, and for a
+top-level call it is the LAST function declared — i.e. a stale leftover, since the emitter
+never entered a function for that statement. The two unify as "whatever the emitter's
+current-function cursor last pointed at". It coincides with the callee's declaration only
+when the callee happens to be the last-declared function, which is what the original witness
+did. *A span diagnosis needs the candidates separated on both axes; one witness where two of
+them coincide reads as a rule.*
 
 ### 9.7 What is pinned
 
