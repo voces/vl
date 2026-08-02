@@ -38969,3 +38969,268 @@ checker addition is a second CALLER of an existing query (`nodeTyIsUnion`), not 
   5 of its 6 "source spells it twice" rows into a different mechanism and turns one of them into a
   named, stale doc claim about `unionAliasMembers`. *Every attribution has a producer that can be
   asked; the ones reached by exclusion are the ones to ask about.*
+
+## D-ARRUNIONELEM — #1310's FILED CAPABILITY TAKEN: the un-annotated array literal of union elements. The filing's root cause holds, its ONE-arm remedy does not — the rule needs FOUR producers to agree, and the classifier order that made the fourth necessary had never been able to overlap before (off master `154e14f8`, rebased and re-gated on `0ab94642` — #1318, which touches no `compiler/*.vl`; every reading below reproduced identically on both)
+
+**#1310 FILED THIS WITH ITS ROOT CAUSE AND THE ROOT CAUSE IS RIGHT.** `arrLitIsRef` classifies an
+array literal by the SYNTAX of its FIRST ELEMENT — an `ObjLit`, a `FuncDecl`, a nested literal, or
+a checker-recorded element name carrying `=>` — and a CALL (`[pick(true)]`) and an IDENT (`[w]`)
+are none of those, so a union-element literal fell through to the i32 list and the box stored into
+it was `expected i32, found (ref $type)`. The checker's `nodeArrayElemName` had arms for prim /
+obj / func / nullable-closure elements and **no `TyUnion` arm**, so there was no signal to read
+even if the classifier had asked.
+
+What the filing got wrong is the SIZE of the remedy. "A `TyUnion` arm on the query, then
+`arrLitIsRef` / `arrLitElemKind` / `arrLitElemName` reading it" lands 48 of the 76 cells this
+slice moves. The other 28 are three producers the filing does not mention, and one of them is a
+REGRESSION the first build shipped.
+
+### 1. THE GRID, AND WHY THE DEFECT CLASS DEPENDS ON THE READ
+
+**252 cells** (`W/grid.py`): element source {call result · call result with an UN-ANNOTATED return ·
+un-annotated ident · annotated ident · declared-alias ident · inline literal} × union kind
+{`Cat|Dog` · declared alias `U` · value `i32|string` · mixed `Cat|i32` · nullable `Cat|null` ·
+litunion `K`} × position {const local · global · argument · inferred return · struct field ·
+annotated CONTROL · empty `[]` + `.push`}. Graded on six channels, and every cell has a
+**DELETE-THE-BYSTANDER twin** (`--ctl`): the identical program with the array literal removed and
+the value read directly.
+
+| | master | head |
+| --- | ---: | ---: |
+| OK | 98 | **174** |
+| EMIT REJECT (loud) | 113 | 57 |
+| CHECK REJECT (loud) | 21 | 21 |
+| **INVALID WASM (silent)** | **20** | **0** |
+
+**76 cells UP, 0 down, 0 sideways.**
+
+**THE DEFECT CLASS IS DECIDED BY THE READ, NOT BY THE UNION KIND — which is why two independent
+grids of this same defect disagree about it.** A struct-union element read through `e is Cat`
+stops at #1310's own gate (`monoStaticIsResult`'s spelling-resolved exclusion, scoped by
+`nodeTyIsUnion`) and is a clean `` `is` receiver is not a union value``. A VALUE-union element read
+through `e is i32` is a value-ATOM test that reaches no such gate, and an element read with no `is`
+at all reaches nothing either: those write the module and say nothing. **All 20 silent cells are in
+the value-union kind**, and a grid whose reads bypass the `is` gate will score the whole population
+as silent instead. *The gate a defect happens to trip is a property of the test program, not of the
+defect; report the class per cell.*
+
+`vl build` exits 1 for BOTH outcomes, so the discriminator is stderr text — the host writes the
+module and then says `is not a valid WebAssembly module`. Grading on the exit code alone reports
+the worst class as the acceptable one.
+
+### 2. WHAT SHIPS — ONE RULE, ONE HOME, AND THE HOME IS THE REASON THE FOURTH GATE EXISTS
+
+```
+export function arrLitUnionElemName(arrIx: i32): string     // emit_classify.vl
+```
+
+Four consumers need this question answered and none may drift from the others: `arrLitIsRef` (a ref
+list, yes), `arrLitElemKind` (kind 2, the box), `arrLitElemName` (the slot key), and `collectA`'s
+EMPTY-literal arm. Two gates:
+
+* **`isUName(cen)` — the EMITTER must HOLD that union's row.** That is what makes the kind-2 box
+  build and its variant tags available at all. A union the checker knows and the emitter never
+  registered keeps master's classification and master's LOUD failure, rather than building against
+  a slot that does not exist. This is what keeps the residue in §5 loud instead of silent.
+* **the SCALAR/STRING exclusion — and it is a genuine discovery, not a safety belt.**
+  `collectA` asks `arrLitIsRef` FIRST; `emitArr` asks the scalar classifiers first. **Master's
+  `arrLitIsRef` could never overlap them** — an objlit / lambda / nested literal is neither a
+  string nor a float — so the opposite orders were never observable. A UNION element can be both:
+  `["aa", 2.5]` contextually adopted as `(K | f64)[]` is `arrLitIsStr` on the emit side and would
+  be a ref list on the collect side, so the module collects a box list and emits an f64 one. The
+  first build shipped exactly that and reddened
+  `literal-unions/mixed-union-alias-member-preserves.vl` — `f64 array literal but f64 list type not
+  collected` — whose own subject is that such a literal reaches its box through the ARM SCANNER
+  instead. *Two passes that classify the same thing in opposite orders are a latent defect that
+  only a new overlap can expose; the widening that creates the overlap owns it.*
+
+The checker side (`typecheck.vl`, `nodeArrayElemName`) renders the NOMINAL composite — the spelling
+the `unNames` row is registered under, which is also the table key `refArrElemName` yields for the
+annotated `(Cat | Dog)[]`, so the two spellings of one list intern ONE slot. A LITERAL union is
+excluded (`tyIsLitUnion`): its elements are interned i32 ATOMS riding the i32-list wrapper, and
+`nodeArrayElemIsLitUnion` is that element's query.
+
+### 3. THE REVERSE MAP IS A FALLBACK, NOT A PREFERENCE — 20 CELLS SAY SO
+
+An INFERRED struct union (`function pick(b) { … }`, no return annotation) has the object literals'
+OWN arena entries as its members, and `tyToNominalName` keys its nominal short-circuit on
+arena-index IDENTITY (`structNameOfTy`), so it spells such a union `{meow:i32}|{woof:i32}` — a
+spelling no union ROW carries, because the emitter registers an inferred return under the
+reverse-mapped composite (`registerInferRetNominalUnion` ← `structUnionRetName`, bidirectional
+assignability). So `nodeArrayElemName` asks that same producer.
+
+**ASKING IT FIRST IS 20 CELLS DOWN, MEASURED IN ONE BUILD.** `structUnionRetName` spells a
+DECLARED ALIAS BY ITS MEMBERS — `Cat|Dog` for `type U = Cat | Dog`, whose registered row is `U` —
+so the preference gained the 4 inferred-return cells and lost every alias cell in the grid:
+
+| build | grid OK |
+| --- | ---: |
+| render only (`tyToNominalName`) | 166 |
+| **reverse map PREFERRED** | **154** |
+| reverse map gated on `unionAliasDeclNameOfTy == "" && structNameOfTy(member0) == ""` | **174** |
+
+The gate is the arena's own statement of "this render has no nominal route": no declared alias on
+the union, and member 0 is an anonymous entry. *#1309 learned that the reverse map had to be the
+ASSIGNABILITY one; the half it did not have to learn, because its consumer held a type rather than
+a name, is WHERE in the ladder it goes.*
+
+### 4. THE EMPTY LITERAL IS A THIRD PRODUCER, AND IT NEEDED BOTH HALVES
+
+`const xs = []` + `xs.push(u)` was silent invalid wasm in the value-union kind and a loud reject in
+the others, and `arrLitIsRef` declines it by construction — no element to classify, which its own
+header records as the case the binding annotation covers. That annotation is SYNTHESIZED
+(`collectLocals` reads the checker's recorded element type and writes the equivalent type), and two
+things had to hold:
+
+* **the synthesized ARRAY NAME has to RE-GROUP.** `Cat|Dog` + `[]` is `Cat|Dog[]`, which binds the
+  `[]` to the last member and is a different type. Same rule, same test as `rlCanonLitUnionAtoms`'s
+  array descent and `ensureRefElemTy`'s paren branch.
+* **the SLOT has to exist before that synthesis runs.** The synthesis postdates `collectA`, so it
+  can only RESOLVE a ref-list row, never mint one — the site's own comment says so. A spelling with
+  no row stays uncovered and the binding falls back to the i32-list default, which is the same
+  invalid module by a different route. `collectA` interns it from the same query.
+
+Neither half alone moves the cell, which is why S-EMPTY and S-GROUP share a witness (§7).
+
+### 5. THE RESIDUE — 21 CELLS, ALL LOUD, THREE MECHANISMS, EACH FILED WITH ITS PRODUCER
+
+Cells that are not OK on head AND whose delete-the-bystander twin IS OK (so the array literal is
+the variable). **None is silent; every one exits `vl build` 1 with a named `emitProgram:` message.**
+
+| family | cells | mechanism | what it needs |
+| --- | ---: | --- | --- |
+| **NULLABLE elements** (`Cat \| null`) | **9** | `Cat \| null` is a `TyNullable`, not a `TyUnion`, so no arm here fires. The annotated `(Cat \| null)[]` is a kind-1 NICHE list (`rlElemNicheNullable`), not a kind-2 box — a different rep with a different gate. `bare null needs a struct-typed context` | a `TyNullable`-of-`TyObj` arm on `nodeArrayElemName` returning `Cat\|null`, and a niche gate in `arrLitUnionElemName`'s place (`isUName` is false of it by design) |
+| **INFERRED returns `structUnionRetName` DECLINES** — mixed `Cat \| i32` ×4, litunion `K` ×1, all with no return annotation | **5** | that producer takes only an ALL-OBJECT union of ≥2 named members, so the render stays structural and no row carries it. The emitter's own recorded name for such a return comes from a LADDER (`valueUnionRetName` → `litUnionArrayValueUnionRetName` → `structUnionRetName` → `nullableRetName` → …), of which this arm asks ONE rung. `` `is` receiver is not a union value`` ×4, `string array literal but string list type not collected` ×1 | the recorded-return NAME ladder, not one rung of it — most likely by reading the banked `inferRetTyAt` rather than re-deriving |
+| **an INLINE OBJECT LITERAL as the element** — `{ v: [{…}] }` in an ANONYMOUS struct field ×4, `.push({…})` into an empty `[]` ×3 | **7** | pre-existing and NOT this family (`isUName` is false of a struct spelling, so no arm here fires): `object literal field count does not match struct` ×3, `ref .push but ref list type not collected` ×3, `object literal matches no union variant` ×1. The anon-field half is the `#anon<N>[]`-pinned-as-a-STRUCT defect already filed against `pinKindOfName` | its own slice |
+
+**NESTED — `const xs = [[mk(true)]]` — MOVES LOUD TO LOUD AND IS REPORTED AS A SIDE MOVE.** Master:
+`` `is` receiver is not a union value``. Head: `nested arrays are not supported`. The INNER literal
+now classifies as a ref list, so the OUTER one's nested-literal rung (`if !arrLitIsRef(inner)`)
+stops claiming it and the outer falls to the i32 list, where the element guard catches it. Neither
+compiler emits a module; the head message names the real blocker (the kind-9 element machinery)
+rather than blaming the `is`. It is not in the 252 (a second array axis), and no corpus file has
+the shape.
+
+### 6. THE CORPUS'S TWO PRE-EXISTING MOVERS ARE BOTH THE SAME SENTENCE
+
+`WT=… A=master B=head bash W/abcorpus.sh` — six channels, `-o` path and source path normalized,
+one output FILE PER INPUT concatenated (a shared `>>` tears on a long diagnostic), well-formedness
+asserted:
+
+| channel | 1,718 files |
+| --- | --- |
+| CHECKRC · CHECKMSG | **1,718 same** |
+| BUILDRC · RUN · RUNMSG | 1,714 same · **4** — the branch's own four fixtures, all 1 → 0 |
+| BYTES · BUILDMSG | 1,712 same · **6** — those four, plus two pre-existing files |
+
+The two pre-existing movers are `functions/inferred-union-one-row.vl` (799 → 545 B) and
+`unions/closure-array-arm.vl` (974 → 720 B), **−254 B each, rc identical, RUN identical**. Both lose
+**three heap types and three functions**: the `(array (mut i32))`, its `{backing,len,cap}` wrapper,
+and the three i32-list helpers. `collectA`'s ArrayLit chain falls through to
+`else { lUsed = true; aUsed = true }` for any literal `arrLitIsRef` declines, and its comment calls
+that "harmless presence, never wrong bytes" — true of the bytes, and it meant **every module with a
+union-element array literal carried an i32 list it never used**, including the ANNOTATED ones. The
+literal now collects as what it is. *A fall-through that is documented as harmless is still a
+claim about a population; this one was two corpus files and 508 bytes.*
+
+### 7. SABOTAGES — FIVE, AND THE PAIR THAT SHARES A WITNESS SHARES IT BY CONSTRUCTION
+
+Each is the shipped tree with ONE edit, self-compiled with the HEALTHY head compiler (never with
+itself), installed as that tree's `build/vl-compiler.wasm`, full suite run in that tree.
+
+| sabotage | edit | suite | witness |
+| --- | --- | ---: | --- |
+| **S-UNIONARM** | `nodeArrayElemName`'s `TyUnion` arm never fires | 3,609 / **9** | all four fixtures ×2 (+1 timing flake) |
+| **S-REVMAP** | the `structUnionRetName` fallback never fires | 3,616 / **2** | `unions/inline-shape-is-over-inferred-list-element.vl` ×2 — ONLY |
+| **S-SCALAR** | `arrLitUnionElemName` loses the scalar/string exclusion | 3,616 / **2** | `literal-unions/mixed-union-alias-member-preserves.vl` ×2 — ONLY, and it is a PRE-EXISTING corpus file |
+| **S-EMPTY** | `collectA`'s empty-literal intern never fires | 3,614 / **4** | `unions/un-annotated-empty-list-union-push.vl` ×2 (+2 timing flakes) |
+| **S-GROUP** | the synthesized array name stops re-grouping | 3,616 / **2** | the same file ×2 |
+
+**S-REVMAP AND S-SCALAR ARE THE TWO GATES §2 AND §3 ARGUE FOR, AND EACH REDDENS A FILE THE OTHER
+LEAVES GREEN** — disjoint witnesses for the two halves that could have been called safety belts.
+S-EMPTY and S-GROUP share theirs because they are two necessary halves of ONE capability (§4);
+naming a second file for one of them would have meant inventing a fixture that cannot fail for the
+right reason. The flakes are `check: an adversarial --exclude glob completes` and `vl-test: files
+run in PARALLEL`, both timing tests under load.
+
+### 8. FIXTURES — FOUR, AND ONE OF THEM IS A NEGATIVE TEST THAT GRADUATED
+
+* `unions/inline-shape-is-over-inferred-list-element.vl` — **was `error-inline-shape-is-over-…`,
+  an `@emit-error` file #1310 minted to pin the DIAGNOSTIC that stood in for this missing
+  capability.** A reject is what a compiler owes a program it cannot lower; this program is
+  lowerable, so the pin is now the RUN. It is S-REVMAP's sole witness (its return is un-annotated).
+* `unions/un-annotated-list-of-union-elements.vl` — the positions: call result, un-annotated ident,
+  inferred return, module global. No annotation anywhere in the file.
+* `unions/un-annotated-list-of-value-union-elements.vl` — the kind that had NO diagnostic at all.
+* `unions/un-annotated-empty-list-union-push.vl` — the empty `[]`, both kinds.
+
+All four are RED on master (three `` `is` receiver is not a union value``, one INVALID WASM) and
+green here.
+
+### 9. FUZZ IS VACUOUS FOR THIS FAMILY, AND THE GRAMMAR SAYS SO DIRECTLY
+
+Pinned-seed A/B (10 seeds × 200 cases per side, depths 4/5/6 round-robin — the sweep script draws
+FRESH random seeds per run, so its two invocations are two samples and not an A/B at all): all ten
+per-seed logs **BYTE-IDENTICAL**, shapes files identical, 38 REJECT lines each side, 0
+INVALID/TRAP/MISMATCH either side.
+
+**That is vacuity, not coverage, and it was checked at the producer rather than inferred from the
+zero.** `scripts/fuzzgen.vl` emits every binding as `const <name>: <TYPE> = <expr>` — always
+annotated, at every position it generates. The un-annotated array literal has **ZERO** fuzz reach
+by construction, and the annotated union-element literal that DOES move (§6) moves on BYTES, which
+`fuzz-vl.sh` does not grade.
+
+### 10. GATE
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && bash scripts/fetch-seed.sh` | 0 | 1,113,946 B published seed |
+| `bash scripts/refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint in 2 compiles — **the published seed compiles this branch's source, no A/B split** |
+| `bash scripts/native-fixpoint.sh` | 0 | stage3 == stage4, 1,114,399 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,645 passed / 0 failed / 7 ignored** on the rebased base; at `154e14f8` the branch read 3,618/0/7 against a MEASURED master baseline of 3,611/1(timing flake)/7 — **+6 = 3 new fixtures × {cases, native-align}**, ignored SET diffed with both sides asserted non-empty (7 = 7) |
+| `bash scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `bash scripts/rep-fuzz-check.sh` | 0 | exact ✅, 1 baselined reject, 0 new / 0 stale |
+
+**BYTE DELTA: 1,113,946 → 1,114,399 = +453 B.**
+
+### 11. INSTRUMENTS (scratchpad `W/`, session 2affa9b0)
+
+`W/{env,one,fx,gridrun,abone,abcorpus,watd,fzab,fzcmp,mksab,mkmaster}.sh` ·
+`W/{grid,pivot,abdiff,sab_unionarm,sab_revmap,sab_scalar,sab_empty,sab_group}.py`
+
+* **`W/grid.py` + `W/gridrun.sh`** — the 252-cell grid and its six-channel grader, with the
+  `INVALID` / `EMITREJECT` split taken from the build STDERR rather than the exit code, and a
+  `--ctl` twin of every cell.
+* **`W/mkmaster.sh`** — the MEASURED master baseline. **A COPY OF A LINKED GIT WORKTREE CARRIES A
+  `.git` FILE POINTING AT THE ORIGINAL GITDIR**, so the first version's `git checkout <master> --
+  compiler tests`, run with `cd` into the copy, rewrote the REAL worktree's index. `git diff HEAD`
+  was empty (the working tree was intact) while `git status` read `MM` on all three files — the
+  tell, and `git reset --hard HEAD` the repair. A tree copy that needs git needs its own gitdir.
+
+### 12. LESSONS
+
+* **A FILED ROOT CAUSE CAN BE RIGHT AND ITS REMEDY STILL BE A THIRD OF THE WORK.** #1310 named the
+  function, the missing arm and the failure mode exactly, and building precisely what it described
+  lands 48 of 76 cells. The rest are producers a reproduction cannot show you, because a
+  reproduction is ONE program: the inferred return spells its union by a different map, the empty
+  literal has no element to classify, and the collect pass and the emit pass turn out to classify
+  in opposite orders. *Take a filing's diagnosis; re-derive its scope from a grid.*
+* **A WIDENING OWNS EVERY DISAGREEMENT IT MAKES OBSERVABLE.** `collectA` and `emitArr` have
+  classified array literals in opposite orders for the life of both functions, and it was never a
+  defect because `arrLitIsRef`'s answers could not overlap the scalar classifiers' — an objlit is
+  not a float. One new arm made the overlap possible and the disagreement became a miscompile in
+  the first build. *When you widen a predicate, list what was previously disjoint from it.*
+* **A REVERSE MAP'S POSITION IN A LADDER IS AS LOAD-BEARING AS THE MAP.** The same
+  `structUnionRetName` that gains 4 cells as a FALLBACK loses 20 as a PREFERENCE, because it spells
+  a declared alias by its members. One build each; the grid decided it in ten seconds. *A rung that
+  is right about one population is not thereby right about the population above it.*
+* **THE DEFECT CLASS BELONGS TO THE CELL, NOT TO THE FAMILY.** Struct-union cells reject loudly and
+  value-union cells write bad bytes, for the same missing classification — the difference is
+  whether the read passes an `is` gate that happens to exist. Two grids of one defect can honestly
+  report 20 silent and 113 loud, or 20 silent and 5 OK, purely from how they read the element.
+  *Grade per cell on stderr text; never on `vl build`'s exit code, which is 1 for both.*
+* **A FALL-THROUGH DOCUMENTED AS HARMLESS IS AN UNMEASURED CLAIM ABOUT A POPULATION.** "an
+  i32-element or EMPTY literal contributes the i32 list … harmless presence, never wrong bytes" was
+  true about the bytes it wrote and false about the bytes it kept: two corpus files carried an
+  entire unused i32 list, wrapper and helpers, 254 bytes each. *The comment was right; nobody had
+  asked how many modules it applied to.*
