@@ -246,12 +246,15 @@ hatch").** All four are prerequisites for each other in practice:
   `TValue.tt` — checker-folded constants, so **no emitter file changed** and a `flat` declaration
   emits byte-identically to the same one without it. **No implicit padding**: offsets are the
   running sum of declared widths (the spec's own explicit `pad` field is the argument, and
-  unaligned access is legal in wasm). REMAINING: `buf.rows<T>(off, count)` (needs `T.size` for a
-  type PARAMETER, which needs generic `flat` types) and the `stack[i].tt` sugar — whose B14 blocker
-  is GONE (`stack[i]` is writable now, via a free `"[]"`), leaving only the FUSION half: `.tt` on the
-  indexed row must be an offset add rather than a materialized row, which a row-ADDRESS newtype plus
-  `flat`'s folded field offsets should give naturally. Both are boilerplate rather than
-  expressiveness — the accessor set is writable today. `docs/internals/flat-records-design.md`.
+  unaligned access is legal in wasm). **THE FUSION HALF IS DONE (#1317) — and it needed ZERO
+  compiler lines**: `"[]"` returns a row ADDRESS (a newtype over `i32`) rather than a row, so there
+  is no row to fuse away and `.tt()` is an offset load off an integer. `st[i].tt()` is `cmp`-identical
+  to the hand-written `tt(slotAt(st, i))` at both `-O0` and `-O3 --closed-world`, where both
+  accessors inline away entirely. The doc's "the bracket deletes two accessors per field" was
+  corrected by building it: it deletes none — it deletes the CONTAINER axis (N×M → N+M).
+  REMAINING: `buf.rows<T>(off, count)` only — it needs `T.size` for a type PARAMETER (hence generic
+  `flat` types and a post-mono fold) and a generic row brand `Addr<T>`, without which it gives up the
+  only safety the fused pattern has over raw addresses. `docs/internals/flat-records-design.md`.
 - ⬜ **P1.3 Optimization defaults** — Heap2Local in the blessed pipeline + a documented release
   profile (`--closed-world -O3 --gufa`). Our union boxes and `{backing,len,cap}` wrappers **must melt**
   in per-tick scratch code or alloc-free-steady-state becomes "avoid half the language".
