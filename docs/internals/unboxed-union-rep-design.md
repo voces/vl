@@ -762,3 +762,144 @@ print(1)
 - `docs/internals/opt-profile-design.md` §3 — the row this follows;
   `docs/internals/litunion-compact-rep-design.md` §5/§6 — the payload-encoding pricing
   this corrects for the non-litunion case.
+
+---
+
+## 10. PHASE 1 SHIPPED — what it did against what §6 predicted
+
+Measured on this document's own witnesses, `A` = the published `seed-latest`
+(master's compiler, 1,119,281 B), `B` = the return-sink compiler at its native
+fixpoint (1,120,712 B, `compile(B) == B` byte-for-byte). Same binaryen 130, same
+wasm-tools, same wasmtime-via-`vl-host`.
+
+### 10.1 The melt — predicted exactly
+
+§6 predicted the shipped fixture would go **4 → 3** unoptimized and **4 → 2** at `-O3`.
+Both are exact. The struct-union twin does the same, matching C3's 3 → 2.
+
+| fixture | box sites A→B | allocs none A→B | allocs `-O` A→B | allocs `-O3` A→B |
+|---|---:|---:|---:|---:|
+| `union-box-payload-read` | 2 → **1** | 4 → **3** | 4 → **2** | 4 → **2** |
+| struct-union twin (`Hit \| Miss`, field read) | 2 → **1** | 4 → **3** | 4 → **2** | 4 → **2** |
+| `union-box-call` | 2 → **1** | 4 → **3** | 4 → **0** | 0 → 0 |
+| `union-box-branch-local` | 2 → 2 | 4 → 4 | 4 → 4 | 2 → 2 |
+
+**The `-O` column is a finding §2.2 did not anticipate.** That section concluded the
+shipped four-flag profile *"is already at binaryen's ceiling for this shape"* and that
+the box melts *"by closed-world type refinement plus DCE, which is why no amount of `-O`
+level reaches it"* (`opt-profile-design.md` §3). That is a property of TWO sites. At one
+site plain escape analysis is enough: both fixtures now melt **one optimizer rung
+earlier**, at `-O`, with no `--closed-world` and no `--gufa`. The ceiling was never
+binaryen's — it was the site count.
+
+### 10.2 The speedup — REFUTED as stated; 1.7×, not 2.0–2.2×
+
+§4 reports A6 at 61.8 → 31.0 ms (2.0×) and C3 at 60.8 → 28.1 ms (2.2×). Those are **V8**
+numbers. On the native host, 100 M trips of the same two loops, interleaved A/B, min-of-5:
+
+| loop | A | B | ratio |
+|---|---:|---:|---:|
+| `i64 \| boolean`, payload read | 311 ms | **187 ms** | **1.66×** |
+| `Hit \| Miss`, field read | 279 ms | **164 ms** | **1.70×** |
+
+Noise floor (spawn + instantiate, `print(0)`, min-of-5) **3 ms**; load average 4.0 on a
+contended box. The two distributions do not overlap on either loop — B's slowest run
+beats A's fastest — so min-of-5 is not carrying the result. §4's own native column
+(A0 68 → A6 53 ms, 1.28×) understated it because a 20 M-trip run sits close to its 12 ms
+process floor; 1.7× is the honest native figure and 2.0–2.2× should be read as V8-only.
+
+**What the ratio is NOT is an allocation-count ratio.** A and B both allocate exactly
+TWO objects per trip before the optimizer — only one of A's two sites executes on any
+given trip. The sink removes no allocation by itself; it removes the *merge* that stopped
+Heap2Local from owning the one allocation that does happen. All of the win is downstream
+of the optimizer, which is why §1.4's warning matters: a corpus sweep cannot see it.
+
+### 10.3 The population — 78 sites, not 309
+
+§6 sizes the population as *"309 of 1,537 corpus construction sites (20.1%) in return
+position."* The sink removes **78** of them, across **76 functions** in **54 modules**
+(corpus at this base: 1,720 files, 1,442 building, 1,578 box sites → 1,500).
+
+The gap is arithmetic, not a measurement error, and §6 should not be read as a forecast:
+a function with *k* constructing returns loses *k−1* sites, never *k*, because the exit
+still builds one box. So the removable population is the return-position census **minus
+one site per union-returning function**, and a single-exit function contributes zero. 76
+of the roughly 230 functions holding those 309 sites have two or more constructing
+returns; the rest already had the one site the sink would have built for them.
+
+**A site census in return position is an upper bound on where the transform APPLIES, and
+roughly four times the count of what it REMOVES.** Any later phase sized off §1.3's
+position table should apply the same correction: phase 2's 464 `local.set` sites (30.2%)
+will not yield 464 either.
+
+### 10.4 What does NOT sink
+
+- **A `return` of an if-EXPRESSION (`spell1`).** `emitUnionIfValue` emits a value-typed
+  `if` whose blocktype is `(ref $uBox)` and boxes in EACH ARM, so one `return` carries two
+  sites and the last instruction written is the `if`'s `end`, not a `struct.new`.
+  Re-measured on B: still 2 sites, still 4 → 4. §2.1's row is unmoved, and this is the
+  single largest remaining return-position shape.
+- **A `let` assigned on two branches (`spell2`, `union-box-branch-local`).** Not a return;
+  phase 2's row, unmoved at 4 → 4 and 4/4/2 as pinned.
+- **A passthrough return** (`return u` where `u` is already a union). There is nothing to
+  sink and the sink correctly declines — pinned by `union-sink-passthrough`, whose two
+  sites are its CALLER's argument coercions and must stay two.
+- **Single-exit functions**, by the prediction predicate: sinking one site into one site
+  buys nothing and costs a block.
+- **The compiler's own unions.** §1.1 already says why — AST nodes live in a module-global
+  array and escape — so of the compiler's 56 construction sites the sink is worth static
+  size, not speed. It is +1,431 B (+0.128%) on `vl-compiler.wasm`.
+
+### 10.5 Corrections to §5.4's cost estimate
+
+§5.4 prices (g) as touching *"the return-position subset of the 18 `fbStructNew(uBoxIdx)`
+sites."* **It touches none of them.** The transform is a PEEPHOLE at the three places that
+terminate a return value (`emitStmt`'s `RetStmt`, `emitFuncBody`'s tail, `emitStmtTail`):
+when the last instruction written is `struct.new $uBox`, its two operands are already on
+the stack in field order, so they are popped into two reserved locals and a `br` replaces
+the `return`. Justified locally, it is indifferent to WHICH of the eighteen sites produced
+the box — which is why no flag is threaded through them and why a nineteenth site would be
+covered for free.
+
+Three consequences §5.4 does not list:
+
+1. **The transform is per-exit and need not be total.** An exit whose tail is not a box
+   emits its ordinary `return` and simply becomes one fewer predecessor of the exit block.
+   That is what makes the passthrough case safe without a whitelist.
+2. **Two conditions gate the rewrite, and a byte pattern alone is not enough.** An operand
+   can spell any opcode, so matching the trailing bytes proves only that they LOOK like the
+   instruction; `fbStructNew` records a cursor and the rewrite additionally requires that
+   nothing has been written since.
+3. **The exit block is decided AFTER the body is lowered**, off a count of what actually
+   sank — so only the two locals ride a prediction. A prediction that over-fires costs
+   4 bytes of unused local declarations and never a dead allocation: exactly one corpus
+   file (`statements/tail-assign-if-arms.vl`) is in that state, at +4 B.
+
+Every one of the 55 corpus byte movers is accounted for by that model: **+18 B per sunk
+function** (a block, its `end`, two `local.get`s, one `struct.new`, two local runs, and
++2 per merged return), +3 per arm beyond the second, +4 for the mispredicted one. Corpus
+total **+1,379 B (+0.069%)** over 1,442 modules, 55 up, 0 down — the sink trades static
+size for the melt, and the `-O3` artifact is SMALLER (the fixture: 156 → 140 B).
+
+### 10.6 A latent defect the sink forced closed
+
+`emitIfTail` opened a wasm `if` frame without `ctrlEnter()`/`ctrlLeave()`, as do
+`emitUnionIfValue`, `emitVariantIfValue` and `emitNullableIfBinding`. It was inert because
+nothing branch-bearing had ever been emitted inside those frames. A sunk `return` in an
+if-tail arm IS branch-bearing, and its `br` operand is the frame distance to the exit
+block, so `emitIfTail` now counts its frame. The other three still do not; anything that
+puts a branch inside them must fix them the same way. Nothing asserts this — the failure
+mode is an off-by-one `br` operand, which is invalid wasm rather than a wrong answer.
+
+### 10.7 A measurement trap, recorded because it cost a full benchmark round
+
+**`vl build -O3` is a SOFT NO-OP when no `wasm-opt` is reachable.** `binaryen_tool`
+consults `VL_WASM_OPT` and then `PATH`; this tree ships binaryen under
+`node_modules/binaryen/bin/` and puts neither on `PATH`, so `-O3` silently wrote the
+UNOPTIMIZED module. A first benchmark round read A = 382 ms / B = 381 ms — a clean,
+plausible, entirely false null result, because both artifacts were unoptimized and both
+therefore allocate twice per trip. The tell was structural, not temporal: the artifact
+still had the box's `struct.new` in it. `selfhost_native_release_test.ts` sets
+`VL_WASM_OPT`/`VL_WASM_DIS` explicitly for exactly this reason. **Any A/B of an optimizer
+effect must assert that the optimizer RAN** — count allocation sites in the timed
+artifact, never trust the flag.
