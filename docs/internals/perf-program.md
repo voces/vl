@@ -2076,3 +2076,205 @@ source directly. Nothing here is new language surface — the emitter writes `lo
   mention is a same-named local of that function. P4 is name-keyed, not binding-keyed;
   making it binding-keyed would add population at the cost of the property that makes the
   flat arena scan exhaustive.
+
+---
+
+## 12. PERF item P1 — `return_call` in tail position, and the flag the host does not set
+
+`perf-landscape.md` §5 P1, shipped. A call standing alone as a function's entire return
+value now lowers to wasm `return_call` instead of `call` + `return`.
+
+### 12.1 The measurements
+
+Interleaved A/B, min-of-5, `taskset -c 2-5`, load average 4.7–5.0 (shared box).
+**Noise floor measured, not assumed**: the same bytes run as both sides of the harness
+read 0.985 with 4–6% within-side spread, consistent with the suite's documented 7%.
+Quoted at BOTH optimizer levels, because a win visible only under `wasm-opt` is a
+different claim:
+
+| benchmark | level | before | after | ratio (min) |
+|---|---|--:|--:|--:|
+| `recursion/tailcall` | `vl build` default | 1179.8 ms | 585.5 ms | **2.01x** |
+| `recursion/tailcall` | `-O3` | 1161.8 ms | 581.3 ms | **2.00x** |
+| `recursion/mutual` | `vl build` default | 1557.6 ms | 793.4 ms | **1.96x** |
+
+Matching the filed 2.06x / 1.97x. **`-O3` cannot recover this**: `wasm-tools print` of the
+baseline `-O3` module contains ZERO `return_call`, so the emitter has to choose it.
+Read the ratios, not the absolutes — one baseline rep read 3793 ms under contention
+against a 1179 ms min, which is exactly why min-of-N is the statistic.
+
+The emitted module for `bench/recursion/tailcall` is **byte-identical to the hand-patched
+prototype** the landscape measured, which is the strongest available confirmation that the
+emitter reproduces the thing that was measured.
+
+### 12.2 The capability, which is not a speed claim
+
+`digestTail(5_000_000, 0)` traps `wasm trap: call stack exhausted` on master and prints
+`407392` here. Pinned as `tests/cases/functions/tail-call-depth.vl`, which also carries a
+mutual-recursion descent and a NON-tail control (`1 + sumDown(n-1)`) so that ordinary
+frame-consuming recursion is pinned as still frame-consuming.
+
+**This is the one intended behavioral change in the corpus**, and the six-channel A/B
+below isolates it to that single file.
+
+### 12.3 Which tail positions are covered, and which are declined
+
+COVERED — a DIRECT call to a user function that is the last thing written when a
+result-position `return` is terminated. That includes explicit `return f(x)`, an implicit
+trailing tail value, and each arm of a tail-position `if`/`else`. Self- and
+mutual-recursion both convert.
+
+The tail-position test is a WRITE CURSOR, not a syntactic search: `emitDirectCall` records
+`(tailCallEnd, tailCallIdx)`, and the terminator fires only when `tailCallEnd == wLen()`
+and the trailing bytes still spell that exact call. Two conditions for the reason
+`uBoxNewEnd`'s header already states — an operand can spell any opcode, so the byte
+pattern alone proves nothing, and the cursor alone proves nothing. Both are reset per
+function, so a cursor left by one body can never be read as another's.
+
+DECLINED, deliberately:
+
+- **A VOID enclosing function.** This is the ONE place the soundness argument in §12.4
+  breaks: `return` tolerates leftover operands beneath the result, `return_call` does not,
+  so a void caller with a value-returning callee would validate before and not after.
+  Declined rather than reasoned about.
+- **A union-box RETURN SINK function.** Its exits are branches to a single exit block whose
+  emission is gated on `uSinkFired`; a tail call is neither a branch nor a box
+  construction. Kept disjoint instead of ordered.
+- **`call_ref` (closure / captured calls).** `return_call_ref` exists and is a real
+  follow-up; not attempted here.
+- **`call_indirect`** — VL emits none today (see P2).
+
+### 12.4 Why no result-type comparison is needed
+
+`return_call`'s validation rule is the SAME subtyping condition on the callee's results
+that the `return` being replaced already imposes. So wherever `call f` immediately followed
+by `return` validates, the fused form validates. **Verified against the real validator
+rather than assumed**: a callee returning a concrete `(ref $s)` tail-called from an
+`anyref`-returning function validates (`wasm-tools validate --features all`), and a genuine
+`[i32]` vs `[i64]` mismatch is rejected. The arity hole is the void case, declined above.
+
+### 12.5 THE HOST FLAG — a required companion change outside this PR's partition
+
+**`vl build -O` and `-O3` HARD-FAIL on any module containing `return_call`**:
+
+```
+[wasm-validator error in function 0] unexpected false: return_call* requires tail calls
+  [--enable-tail-call]
+Fatal: error validating input
+Error: wasm-opt ... failed (exit Some(1))
+```
+
+`BINARYEN_FEATURES` in `scripts/vl-host/src/main.rs` is
+`--enable-reference-types --enable-gc --enable-bulk-memory` and must gain
+**`--enable-tail-call`**. Verified: with the flag, the identical invocation exits 0 and the
+`return_call` survives the whole `--closed-world -O3 --gufa -O3` profile.
+
+This is the same class as the `--enable-bulk-memory` note already in
+`tests/selfhost_native_opt_test.ts` — binaryen 130 hard-fails validation on an opcode it
+was not told about, rc=1 and no output file — and it is pinned there for exactly this
+reason. `wasm-dis` (the `--wat` path) is NOT affected; it does not validate.
+
+**CI is green without it today only by luck of population**: the six `selfhost_native_opt`
+cases (`arith/ops`, `objects/struct`, `strings/basics`, `loops/while-sum`,
+`tostring/numbers`, `maps/basics`) happen to contain no tail-position user call, and all
+six pass. The bootstrap is unaffected — `refresh-compiler.sh` and `native-fixpoint.sh`
+never invoke `-O`. But `vl build -O3` on any tail-recursive user program fails today.
+
+### 12.6 Host verification — three engines, plus the one that is retired
+
+The emitted compiler ITSELF now contains `return_call`, and the playground and LSP
+instantiate that module, so engine support is not only a question about user programs.
+
+| host | engine | result |
+|---|---|---|
+| `scripts/vl-host` (`vl run`) | wasmtime, `wasm_gc` + `wasm_function_references`, **never sets `wasm_tail_call`** | **runs** — prints `91392`, the module's `meta.expect` |
+| `tests/support/runWasm.ts` (`deno task test`) | deno 2.9.0 / V8 14.9 | **runs** — `logs=["91392"]`; 5M-deep descent also returns `407392` |
+| `lsp/src/wasmCheckerNode.ts` path | Node v24.18.0 / V8 | **runs** — `logs=["91392"]` |
+| `scripts/wasmtime-host.rs` | wasmtime, same `Config` | **retired spike** — no build wiring, docs-only, in no gate. Not executed; the identical `Config` is verified above. |
+
+NOT verified, and stated as such: a real BROWSER for `playground/`. The support floor
+argues it is safe — WasmGC ships no earlier than tail calls in any of the three engines
+(Chrome 112 tail calls / 119 WasmGC; Firefox 121/120; Safari 18.2 both), so an engine that
+can already run VL's WasmGC compiler can run its tail calls — but that is an argument, not
+a measurement.
+
+### 12.7 The gate
+
+| leg | rc | headline |
+|---|--:|---|
+| fresh `seed-latest` + `--prove-fixpoint` | 0 | fixpoint at stage 3, `compile(next2) == next2` |
+| `native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3659 passed / 0 failed / 7 ignored** (7 is the baseline; ~600 would mean voided prereqs) |
+| `lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `rep-fuzz-check.sh` | 0 | 1 baselined failure, 0 new, 0 stale |
+| corpus A/B, six channels, 1,721 files | — | see below |
+| fuzz A/B, 6,000 cases | — | identical finding sets (32 = 32) |
+
+**Compiler size: 1,120,712 → 1,118,836 bytes (−1,876).** `return_call <idx>` is one byte
+shorter than `call <idx>` + `return`, so the compiler's own tail-call population is legible
+in the delta.
+
+### 12.8 The corpus A/B, and the two normalizations it needs
+
+Six channels (check rc / check out / build rc / **build stderr** / run rc / run out) over
+all 1,721 files under `tests/cases`, master's `seed-latest` against this branch. Build
+stderr is not optional: `vl build` exits 1 BOTH for a clean emit reject and for an invalid
+module, so without it an invalid-wasm → clean-reject change reads as no difference.
+
+Raw: **1,721 records differ** — all harness artifact. Two normalizations, in order:
+
+1. The per-invocation `mktemp -d` path in `wrote /tmp/tmp.XXXX/m.wasm`. Random per run, so
+   it differs even A-vs-A. → 96 records left.
+2. The module SIZE in that same line, which is EXPECTED to move here. → **1 record left.**
+
+That one record is `tests/cases/functions/tail-call-depth.vl`, the new fixture: `R_RC=1`
+with a `call stack exhausted` backtrace on master, `R_RC=0` on this branch. **RUN is
+identical on 1,720 of 1,721 files**, and the 96th minus that fixture is 95 files whose only
+change is a smaller module.
+
+The first normalization is worth naming: an unnormalized six-channel A/B on this harness
+reads 100% differing and means nothing. Diff the channels, then subtract what the harness
+itself varies — A-vs-A is the control that tells you which is which.
+
+### 12.9 The fuzz leg is CLEAN but its REACH is unproven — do not bank it
+
+Identical finding sets, 32 REJECT on each side, empty diff. **But the reach probe reads
+zero**: of the cases the run retained, 0 contained a `return_call` at all. Per the standing
+rule against banking a zero from a vacuous run, that clean result is WEAK evidence and is
+not what this change rests on. The load-bearing instrument is the corpus A/B, whose reach
+IS demonstrated — 95 files changed emitted size, i.e. 95 files actually took the rewrite.
+
+### 12.10 What was dropped, and one refutation worth keeping
+
+**P6 (fuse `a/b` and `a%b`) — DROPPED, not attempted.** The fusion is only sound if it
+cannot move a trap. `i32.rem_s(INT32_MIN, -1)` returns 0 while `i32.div_s(INT32_MIN, -1)`
+TRAPS, so lowering the remainder as `a - q*b` introduces a divide the source did not ask
+for; and when the remainder is spelled BEFORE the quotient, hoisting the divide can move a
+trap ACROSS an intervening side effect. Both are answerable — the arithmetic identity
+itself is exact, since `|q*b| <= |a|` cannot overflow and the subtraction wraps back — but
+the sign/edge grid that would prove it was not built, and a fused remainder that changes
+which case traps is a soundness bug, not a 1.99x.
+
+**P10 (`const` → immutable global) — DROPPED for lack of evidence, but the filed population
+is WRONG in the interesting direction.** The landscape asks whether #1321's start-local
+promotion has emptied it. It has NOT, and the surviving shape is specific:
+
+> a top-level `const` is promoted to a start-function local only when nothing reads it from
+> inside a function body. **A `const` read from inside a function must stay a real wasm
+> global** — and that is precisely the loop-bound case P10 is about.
+
+Measured at this commit, `const ci: i32 = 1_000_000` read from inside `work()` emits
+`(global (;1;) (mut i32) i32.const 1000000)`; a const `string` and a const `i32[]` also
+survive as `(mut …)` cells, while `const` i64/f64/boolean bindings used only at top level
+are promoted away and emit no cell. So the population is non-empty and is exactly the
+perf-relevant one.
+
+The one-line change (emit mutability `0x00` for a `const` in `emitGlobalSection`'s
+constexpr arm) was implemented and reverted unshipped. It is sound by construction — both
+writers are excluded, since the checker rejects assignment to a const name and the start
+function runs only the initializers `globalRunsInStartFn` claims (promoted or
+non-constexpr), which that arm is neither — and it verifiably emits immutable cells that
+still run. **What is missing is the only number that matters**: whether an immutable cell
+actually lets binaryen fold the loop bound. P10's filed value was always "enables
+downstream folding", so shipping it without that measurement would prove nothing. The next
+attempt should measure the fold before writing the patch.

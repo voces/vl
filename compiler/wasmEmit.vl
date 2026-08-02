@@ -279,6 +279,8 @@ import {
   slUsed,
   strPushScratchBase,
   strScratchBase,
+  tailCallEnd,
+  tailCallIdx,
   uBoxIdx,
   uBoxNewEnd,
   uDeclared,
@@ -342,6 +344,7 @@ import {
   fbRefNullNone,
   fbRefNullStruct,
   fbReturn,
+  fbReturnCall,
   fbStructGet,
   fbStructNew,
   fbStructSet,
@@ -11555,8 +11558,63 @@ function unionBoxNewBytes() {
   probe
 }
 
-// Terminate a RETURN in function-result position: either the ordinary `return`, or — for
-// a union-box-returning function taking the SINK — the two `local.set`s and the branch to
+// The exact bytes `fbCall(fnIdx)` writes, produced BY that encoder into a scratch buffer
+// — the `unionBoxNewBytes` discipline, so the tail-call peephole's pattern cannot drift
+// from the instruction it matches if the funcidx's ULEB width changes.
+function callBytes(fnIdx: i32) {
+  const probe: i32[] = []
+  const prev = wTarget(probe)
+  fbCall(fnIdx)
+  wTarget(prev)
+  probe
+}
+
+// Rewrite a trailing direct `call` into `return_call`, reporting whether it fired.
+//
+// A call whose bytes are still the last thing written when the enclosing `return` is
+// being terminated IS in tail position: the terminator is only reached in
+// function-RESULT position, so the call's result is the function's result and no work
+// can follow it. That is the whole tail-position derivation — it is a property of the
+// write cursor, not a syntactic search, so it cannot disagree with what was emitted.
+//
+// Validity needs no result-type comparison: `return_call` imposes the SAME subtyping
+// condition on the callee's results that the `return` being replaced already imposes
+// (see `fbReturnCall`). The one place that equivalence breaks is arity — `return`
+// tolerates leftover operands beneath the result, `return_call` does not — so a VOID
+// enclosing function is declined rather than reasoned about. `fnStmtsPosOf` is an
+// O(functions) scan and is asked only HERE, behind both cursor tests, so it is paid
+// once per tail call rather than once per return.
+//
+// A union-box SINK function is declined outright: its exits are branches to a single
+// exit block whose emission is gated on `uSinkFired`, and a tail call is neither a
+// branch nor a box construction, so the two rewrites are kept disjoint instead of
+// ordered.
+function emitTailCallRet(fnIx: i32) {
+  if fnUsesUnionSink { return false }
+  if tailCallIdx < 0 { return false }
+  if tailCallEnd != wLen() { return false }
+  const pat = callBytes(tailCallIdx)
+  const np = pat.length
+  let ok = true
+  let i = 0
+  while i < np {
+    if wPeekBack(i) != pat[np - 1 - i] { ok = false }
+    i = i + 1
+  }
+  if !ok { return false }
+  const fnPos = fnStmtsPosOf(fnIx)
+  if fnPos < 0 { return false }
+  if fRetVoid[fnPos] == 1 { return false }
+  wDropBack(np)
+  fbReturnCall(tailCallIdx) // 0x12 return_call
+  tailCallEnd = -1
+  tailCallIdx = -1
+  true
+}
+
+// Terminate a RETURN in function-result position: either the ordinary `return`, the
+// TAIL-CALL rewrite when the result is a direct call standing alone, or — for a
+// union-box-returning function taking the SINK — the two `local.set`s and the branch to
 // the function's single exit block.
 //
 // This is a PEEPHOLE, and its justification is entirely local: when the last instruction
@@ -11576,7 +11634,7 @@ function unionBoxNewBytes() {
 // that many frames out from any point in the body. When the sink does not apply, the
 // plain `return` is emitted and the exit block simply has one fewer predecessor: the
 // transform is per-exit and never has to be total.
-export function emitUnionRetSink() {
+export function emitUnionRetSink(fnIx: i32) {
   if fnUsesUnionSink {
     if uBoxNewEnd == wLen() {
       const pat = unionBoxNewBytes()
@@ -11597,6 +11655,7 @@ export function emitUnionRetSink() {
       }
     }
   }
+  if emitTailCallRet(fnIx) { return 0 }
   fbReturn() // 0x0f return
   0
 }
@@ -11732,7 +11791,7 @@ export function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     // Seed the return context + emit the value (struct / list / union / nullable /
     // widening) via the shared helper, then terminate the exit.
     if emitReturnValue(body, s.retArg, fnIx) < 0 { return -1 }
-    emitUnionRetSink()
+    emitUnionRetSink(fnIx)
     return 0
   }
   if s is IfStmt { return emitIfStmtStmt(body, s, stmtIx, fnIx) }
@@ -12664,7 +12723,7 @@ export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
           scopePop()
           return -1
         }
-        emitUnionRetSink()
+        emitUnionRetSink(fnIx)
       } else if isLast && lastStmtIsValueIf(stmts[i], fnIx) {
         // The body ends in an `if`/`else` whose arms each yield a value (implicit
         // return) rather than `return`ing — lower it tail-aware so each arm's trailing
@@ -12794,7 +12853,7 @@ function emitStmtTail(body: i32[], stmtIx: i32, fnIx: i32) {
     // An if-tail arm's implicit return — seed the return context (so a `null` arm
     // boxes / sentinels per the function's return type) exactly like `emitFuncBody`.
     if emitReturnValue(body, stmtIx, fnIx) < 0 { return -1 }
-    emitUnionRetSink()
+    emitUnionRetSink(fnIx)
     return 0
   }
   emitStmt(body, stmtIx, fnIx)
@@ -14455,6 +14514,11 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
   pendingF32 = savedArgF32
   pendingF64 = savedArgF64
   fbCall(gImports + target) // 0x10 call (imports occupy indices 0..gImports-1)
+  // Arm the tail-call cursor: if this call is still the last thing written when the
+  // enclosing `return` terminates, it is in tail position and `emitUnionRetSink`
+  // rewrites the pair into `return_call`.
+  tailCallIdx = gImports + target
+  tailCallEnd = wLen()
   return 0
 }
 
