@@ -103,6 +103,34 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 > exact repeats**, so a probe reporting through the diagnostic channel silently reports a distinct-
 > value SET rather than a count (a first census read 481 for a population of 1,229).
 >
+> **THE NAME-SHORTCUT ROUTE IS EXHAUSTED (#1334). Both remaining rows are untakeable, for OPPOSITE
+> reasons, and the emit-side total stays 1,846.**
+> - **Row 2 `sTyIxOfNameTy` — the parse IS the mint.** 0 of 402 parses are arena-neutral (918 entries
+>   minted), and there is no text class to exploit: **282 distinct spellings for 402 parses**, head
+>   `{v:i32}` at 4.0%. That flatness is structural — the site is guarded by `nameIsShapeSpanEnds`, so
+>   every spelling reaching the grammar is an inline shape **whose arena type does not exist until
+>   this call creates it**. There is no bank to read and no rung to add, at any price.
+> - **Row 1 `repElemKeyOfNameTy` — its arena-neutral half IS the rung already refused here.** Of 463
+>   parses only 126 are mint-free, and **111 of those (88.1%) are exactly the `cUserTypes` rung
+>   #1331 declined over the `FView` newtype.** Taking it buys 111 parses for a silently re-keyed
+>   ref-list row. Residue: 15 parses, 0.8% of the total.
+>
+> **A NEW SOUNDNESS RULE, and it is the reusable part.** Row 1's by-TEXT head is not the declared
+> names — it is six PRIMITIVE-ARRAY spellings (`i32[]` 36 · `string[]` 12 · `f64[]` 11 · …), which
+> have exactly the closed-key-space property that made #1332's `primTyOfName` rung sound. And **70 of
+> those 70 MINT.** #1332 was arena-neutral because the arena *seeds* `i32`; nothing seeds `i32[]`.
+> *A closed key space is NECESSARY AND NOT SUFFICIENT — the second precondition #1332 satisfied by
+> accident is that the arena already holds the answer at a stable index.* Check both before reusing
+> that pattern.
+>
+> Also refuted: the "double resolution" hypothesis briefed for row 1. `resolveAnnot` memoizes per
+> spelling, so the intern's key call and `fieldElemTyIxOfName(stored)` ten lines later share one memo
+> entry — **463 is already the deduped count** and no reordering removes it.
+>
+> **What moves next is not a shortcut but the ARENA-INDEX THREADING** (D-INLINESHAPETY /
+> D-REPELEMTY): relocating parses to callers that already hold the index rather than removing them.
+> #1331 measured that population at 18 of 1,064 at row 2 — small, so price it before scheduling.
+>
 > **And the briefed target was refuted by its own witness.** Row 1 `repElemKeyOfNameTy`'s FIND rung 2
 > parses **0 times in 237 reaches** — all 463 of its parses are at the INTERN, and 457 of them are
 > immediately followed by a row mint resolving the same spelling. Its one arena-neutral shortcut
