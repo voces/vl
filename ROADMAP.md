@@ -270,29 +270,32 @@ ask keyed to **our own item IDs** (A14, A16, B6a, B15a, B-mem, B-hint). Its tier
 rather than re-derived. The forcing date is **M7** (the port begins); M2–M6 gate on nothing from us.
 
 **P0 — gates the port STARTING. The `Buffer` linear-memory tier (our B-mem, "one deliberate escape
-hatch").** All four are prerequisites for each other in practice:
-- 🟨 **P0.1 `Buffer` alloc + the full load/store width matrix** — `Buffer(n)`, `.length`, and
-  u8/i8/u16/i16/i32/i64/f32/f64 both directions. **The WIDTH MATRIX and the growth ops have shipped;
-  the allocator and the bulk ops have not.** Today: **8 load widths** (`__load_i8__`, `__load_u8__`,
-  `__load_i16__`, `__load_u16__`, `__load_i32__`, `__load_i64__`, `__load_f32__`, `__load_f64__`)
-  and **4 store widths** (`__store_i32__`, `__store_i64__`, `__store_f32__`, `__store_f64__`) plus
-  `__memory_size__`/`__memory_grow__`, all lowered to single instructions and verified by
-  disassembly. Every scalar VL has now round-trips at its own width; what is missing is the NARROW
-  store pair (`i32.store8`/`i32.store16`), whose spelling §O2 leaves unruled.
-  *(This line used to read "today: 4 store widths, 1 load width". That was measured false: it counted
-  DECLARATIONS, and described `compiler/wasmBuiltins.ts` — deleted by kill-TS, #466. Before the load
-  slice there was exactly one working store width and one working load width. See
-  `docs/internals/buffer-design.md` §A1 for the probe table and §I for the store slice.)*
-  Still needed: a real allocator (bump is fine — the sim allocates a few large Buffers at init and
-  never frees), replacing today's "program picks raw addresses, two users collide" scratch page; and
-  the `Buffer` type itself, which is deliberately NOT shipped while O1/O5/O6 are unruled.
+hatch"). ALL FOUR SHIP; this tier is CLOSED.** They were prerequisites for each other in practice,
+which is why they closed in order rather than in parallel.
+- ✅ **P0.1 `Buffer` alloc + the full load/store width matrix** — CLOSED (#1275 shipped the last
+  compiler half). **8 load widths** (`__load_i8__`, `__load_u8__`, `__load_i16__`, `__load_u16__`,
+  `__load_i32__`, `__load_i64__`, `__load_f32__`, `__load_f64__`) and **6 store widths** (the four
+  wide ones plus `__store_i8__`/`__store_i16__` → `i32.store8`/`i32.store16`), plus
+  `__memory_size__`/`__memory_grow__` and the emitter's first `0xfc` opcodes
+  `__memory_copy__`/`__memory_fill__` — all single instructions, verified by disassembly. Every
+  scalar VL has round-trips at its own width. **Bulk `len` is UNSIGNED**: a negative length TRAPS
+  where the old std emulation loops silently no-op'd, and `std:buffer` guards it. Overlap is pinned
+  as memmove semantics (both directions, with the inverted forward-loop control).
+  The allocator and the `Buffer` type ship in **`std:buffer`, not the compiler** (O1 = (c), owner's
+  ruling): `Buffer(n)` bump-allocates with lazy `memory.grow`, `Buf = { base, length }`, reclamation
+  is `bufferMark()`/`bufferRelease(mark)` (O6 — LIFO, no per-object free, **and a `Buf` held across a
+  release is a dangling reference into linear memory: silent corruption, not a trap**). O5 = lazy
+  growth with NO epoch export — the host re-takes its typed-array views after any allocating call and
+  detects staleness via `byteLength === 0`, which is what the ecosystem already does.
   **The capture bug (§B3/O7) that blocked every `Buffer` METHOD is fixed**: `capScan` exempts a
   builtin/intrinsic in CALLEE POSITION (#1172) and now reads the checker's own reservation list, so
   a named function wrapping any memory intrinsic emits in a module that uses a function value.
-  **`Buffer.copy` / `buf.fill` lowering to `memory.copy`/`memory.fill`
-  are load-bearing, not conveniences** — snapshot and rollback *are* those ops; without them a
-  snapshot is a per-word loop. The host flag they need (`--enable-bulk-memory`) has landed ahead of
-  them, so `vl build -O` will not break the day the emitter writes `0xfc`.
+  *(Two prior versions of this row were measured stale in opposite directions — first "4 store
+  widths, 1 load width" (it counted DECLARATIONS in `compiler/wasmBuiltins.ts`, deleted by kill-TS
+  #466), then "the allocator and the bulk ops have not shipped" with O1/O5/O6 called unruled, all
+  four claims false by then. **Re-derive a P0 row against `std/buffer.vl` and `compiler/typecheck.vl`
+  before quoting it** — this tier's rows have gone stale faster than any others in this file.)*
+  `docs/internals/buffer-design.md` §A1 (probe table), §I (stores), §J (S5/S6).
 - ✅ **P0.2 Exported memory** — replaces the per-scalar host-call ABI for bulk data; the host
   overlays `Float32Array`/`DataView` in place, and nothing else in the export contract changes.
   The module's linear memory is exported as `memory`, automatically,
@@ -347,7 +350,21 @@ hatch").** All four are prerequisites for each other in practice:
   `docs/internals/flat-records-design.md` §11.3.
 - 🟡 **P1.3 Optimization defaults** — the PROFILE ships (#1318): `vl build -O3` runs
   `wasm-opt --closed-world -O3 --gufa -O3`, `-O` is unchanged, and a missing `wasm-opt` stays a soft
-  no-op. Two measured findings invert the ask. **(a) Heap2Local is the wrong lever** — `-O3`
+  no-op.
+  **THE ASK IS "OPTIMIZATION DEFAULTS" AND THE HONEST ANSWER IS THAT THE BEST RUNG IS PER-PROGRAM.**
+  `bench/run.sh` built the default and `-O3` and **never plain `-O`**, so every "`-O3` recovers Nx"
+  figure in `perf-landscape.md` means *versus unoptimized*, not *versus the best rung available* — a
+  question this suite had never asked. A three-rung sweep over all 46 benchmarks says `-O3` is not
+  uniformly the answer, and separates two failure modes the two-rung harness reported identically:
+  **`OPT-LOSES`** (both optimized rungs worse than none — 7 rows, headed by `arith/mixed-width` at
+  **2.23×**, where the *unoptimized* build is 212 ms against Rust's 188; already ruled UPSTREAM by
+  #1325, since bare `-O` carries it identically) and **`O3-WORSE-THAN-O`** (`-O` is the best rung and
+  `-O3` hands the win back — `arrays/sort-heap` 854 / **648** / 837, which #1325's ruling does NOT
+  cover and which IS a profile question). Both flags now ship in the harness with the `-O` column.
+  `-O3` still wins big where it wins (`lambda-hot` 2.2× over `-O`, `dispatch-table` 1.43×). See
+  `perf-landscape.md` §2.4a and §P11. **Do not answer this ask with a single recommended flag until
+  the per-program split is either fixed or documented as the answer.**
+  Two further measured findings invert the ask. **(a) Heap2Local is the wrong lever** — `-O3`
   open-world leaves all four allocations of the canonical union box and naming `--heap2local`
   explicitly changes nothing at any rung, while `--closed-world -O` melts all four; the box melts by
   closed-world type refinement + DCE, not escape analysis. `--gufa` is measurably INERT on VL output
