@@ -39457,3 +39457,207 @@ builds (1,118,866 B), because no compiler source moved.
   6,812 rather than as a second measurement of a moved target — and it caught the slice's own bug
   first: arming the FIND by wrapping its TAIL expression made `zzSetFc(0)` the function's return
   value, and the corpus trapped on the first program instead of reporting a plausible-looking table.
+
+## D-DECLRUNG — the parse unit needs a THIRD column: a parse that MINTS NOTHING. Row 1 is 100% at the INTERN and its one arena-neutral shortcut is REFUTED by a newtype; the same shortcut takes 219 of row 6's 228 and 12 of row 7's 180 (off master `fc700b67`)
+
+#1327 corrected the programme's unit from `resolveAnnot` REACHES to `annotResolve` PARSES and stopped
+there, filing the reason: *"at a MISS, `annotResolve` MINTS … a hint that replaces a memo HIT is
+arena-neutral by construction; a hint that replaces a MISS is a rep change."* That sentence is the
+frontier's gate, and this slice measures it instead of assuming it. **It is false as stated: 1,342 of
+the emitter's 3,031 parses mint NOTHING.** A parse whose resolution adds no `T.tys` entry can be
+replaced with no arena consequence at all — it is a MISS by the memo's reckoning and a no-op by the
+arena's.
+
+### 1. THE SEVEN ROWS RE-DERIVED — #1327 reproduces to the digit, and row 1 splits
+
+```
+base:   master fc700b67; build/vl-compiler.wasm from a freshly fetched seed-latest,
+        1,124,718 B; refresh-compiler.sh --prove-fixpoint rc 0
+        ("compile(seed) == seed — the seed IS the fixpoint"), so the census base is master exactly
+probe:  ZZHM — #1327's instrument (the three exits inside `resolveAnnotTs`, caller-id tagged),
+        plus a `T.tys.length` delta taken around `annotResolve` and a `cUserTypes[name]` read
+build:  scripts/vl-host/target/release/vl build compiler/entry.vl \
+          -o C-zz.wasm --compiler build/vl-compiler.wasm
+run:    scripts/vl-host/target/release/vl check --codegen tests/cases --compiler C-zz.wasm
+        (one compiler instance; the LAST ZZHM record is the corpus total — 1,447 records
+         over 1,727 files)
+```
+
+| # | `emit_rep` site | reaches | hit | neg | **PARSES** | arena entries MINTED | **parses that mint ZERO** |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | `repElemKeyOfNameTy` | 3,700 | 3,212 | 25 | **463** | 540 | **126** |
+| 2 | `sTyIxOfNameTy` | 1,053 | 651 | 0 | **402** | 918 | **0** |
+| 3 | `fieldElemTyIxOfName` | 6,812 | 6,268 | 30 | **514** | 628 | **145** |
+| 4 | `unMemAtomTyIx` | 1,991 | 762 | 0 | **1,229** | 764 | **804** |
+| 5 | `slotCanonKey` | 54 | 23 | 16 | **15** | 17 | **5** |
+| 6 | `repNameCanonKey` | 622 | 367 | 27 | **228** | 7 | **224** |
+| 7 | `repRowOfName` | 1,669 | 1,489 | 0 | **180** | 284 | **38** |
+| | **emit-side total** | **15,901** | **12,772** | **98** | **3,031** | **3,158** | **1,342** |
+
+Every reach/hit/neg/parse cell reproduces #1327's table exactly, 13 master PRs later — so the mint
+column is a decomposition of the same measurement, not a second one.
+
+**THE MINT COLUMN DOES NOT TRACK THE PARSE COLUMN.** `repNameCanonKey` parses 228 times and mints
+**7 arena entries in total**; `sTyIxOfNameTy` parses 402 times and mints 918, never once for free.
+The row #1327 promoted to first place (`unMemAtomTyIx`, 1,229 parses) is 65% mint-free. *Whether a
+routing candidate is a rep change is a per-row property, and no row's parse count predicts it.*
+
+### 2. ROW 1 IS ONE CALL SITE — the FIND's rung 2 parses ZERO in 237 reaches
+
+`repElemKeyOfNameTy` has exactly two callers: `rlSlotByNameTyK`'s rung 2 (the ref-list FIND, reached
+from all three `rlSlotByName*` entry points) and `rlInternNameTy` (the INTERN). Tagged separately,
+and then the intern tagged again at each of its ten call sites:
+
+| caller | reaches | hit | neg | **PARSES** | minted | zero-mint | `cUserTypes` covers |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `rlSlotByNameTyK` rung 2 — the FIND | 237 | 225 | 12 | **0** | — | — | — |
+| `ensureRefElemTy` → `rlInternNameTy` (`emit_classify:11237`) | 2,076 | 1,720 | 1 | **355** | 462 | 72 | 71 |
+| `rlInternName(arrLitElemName(i), …)` (`emit_collect:3302`) | 1,256 | 1,164 | 10 | **82** | 78 | 28 | 16 |
+| `mvRlSlot.push(rlInternName(sNames[vsi], 1))` (`emit_classify:3802`) | 114 | 91 | 2 | **21** | 0 | 21 | 19 |
+| `rlInternName(uVariants[cvi], 1)` (`emit_collect:6099`) | 2 | 0 | 0 | **2** | 0 | 2 | 2 |
+| `rlInternName(sNames[rsi], 1)` (`emit_collect:6090`) | 3 | 1 | 0 | **2** | 0 | 2 | 2 |
+| `rlInternName(refListElemNameOfExpr(i, -1), 1)` (`emit_collect:3390`) | 2 | 1 | 0 | **1** | 0 | 1 | 1 |
+| `rlInternName(arrLitUnionElemName(i), 2)` (`emit_collect:3295`) | 8 | 8 | 0 | **0** | — | — | — |
+| `rlInternName(unNames[0], 2)` (`emit_collect:6111`) | 2 | 2 | 0 | **0** | — | — | — |
+| the two `mvRlSlot` HINTED sites (`emit_classify:3807/3819`) | 0 | 0 | 0 | **0** | — | — | — |
+| **total** | **3,700** | **3,212** | **25** | **463** | 540 | 126 | 111 |
+
+* **THE FIND NEVER PARSES.** #1300 measured that rung 2 *returns a slot* 0 times at `sFieldRefSlot`;
+  this measures the other half — over the whole corpus, through every entry point, rung 2 never once
+  reads the annotation grammar either. By the time a FIND runs, its spelling is always already
+  memoized by the intern that minted the row. **Row 1 is an INTERN-side cost with no query-side
+  component**, and the standing instruction not to delete rung 2 is moot in the parse unit: it costs
+  nothing to keep.
+* **457 OF THE 463 PARSES ARE FOLLOWED BY A ROW MINT** (6 by an early return on a key that already
+  matched a row) — measured by ticking the two exits of `rlInternNameTy` when the key call parsed.
+  On that path `rlElemTyIx.push(fieldElemTyIxOfName(stored))` runs ten lines later on the SAME
+  spelling, so the resolution is load-bearing twice over and reordering the two cannot remove it:
+  *the ref-list layer resolves each new element spelling exactly once, and 463 is that count.*
+* **76.7% of row 1 is one site**, `ensureRefElemTy`'s intern — #1300 filed its map arm as 1a-iii,
+  blocked on coverage (34 of 271). The parse unit does not unblock it.
+
+### 3. THE ONE ARENA-NEUTRAL ROUTE, AND THE MEASUREMENT THAT REFUTES IT AT ROW 1
+
+A parse that mints nothing is, almost always, a DECLARED name: `annotResolve` finds it already
+interned and hands the index back. `cUserTypes` is that table, and two of this file's name bridges
+already read it before the grammar — `sTyIxOfNameTy` and `fieldElemTyIxOfName` both open with
+`cUserTypes[nm] ?? -1`. Rows 1, 6 and 7 do not. Counting the parses `cUserTypes` would have
+answered:
+
+| row | parses | `cUserTypes` covers | share |
+|---|---:|---:|---:|
+| 1 `repElemKeyOfNameTy` | 463 | **111** | 24.0% |
+| 6 `repNameCanonKey` | 228 | **219** | 96.1% |
+| 7 `repRowOfName` | 180 | **12** | 6.7% |
+| rows 2/3 (they already have the rung) | 916 | **0** | the instrument's internal control |
+
+Coverage is not agreement, so both were measured — at the PARSE path (`cUserTypes[name]` vs
+`annotResolve`'s answer) and, the one that matters, at the **memo-HIT path**, where the new rung
+would preempt an index minted earlier in the program:
+
+| | covered reaches | **disagreements** |
+|---|---:|---:|
+| parse path, rows 1+6+7 | 342 | **0** |
+| memo-HIT path, all seven rows | 962 | **4** |
+| `repElemKey(cUserTypes[nm])` vs `repElemKey(resolveAnnot(nm))` at row 1 | 976 | **4** |
+| `repCanonKey(…)` at row 6 | 262 | **0** |
+| the raw index at row 7 | 66 | **0** |
+| the negative-memo path (a covered name the memo says is unresolvable) | 0 | — |
+
+**ALL FOUR DISAGREEMENTS ARE ONE SPELLING: `FView`**, in
+`tests/cases/memory/newtype-struct-views-distinct.vl` and its sibling
+`tests/cases/types/newtype-struct-sibling-rejected.vl` — a `type FView = new { … }` NEWTYPE over a
+struct. The mechanism is in `typecheck.vl`'s own header: only the NEGATIVE memo carries
+`cUserTypesVer`, so a positive `annotNameMemo` entry survives a `cUserTypes` rewrite, and a
+declaration that re-registers leaves the two tables holding different arena indices. At rows 6 and 7
+the two indices key the same rep; **at `repElemKeyOfNameTy` they do not** — `repElemKey` of the two
+differs, and that is a ref-list SLOT identity. So the rung ships at rows 6 and 7 and is refused at
+row 1, and the refusal is a measurement with a named witness rather than a caution.
+
+*(Filed, not fixed here: `fieldElemTyIxOfName` — which HAS the rung — therefore records a different
+arena type into `rlElemTyIx` for `FView` than the key its own interner computed. It is inert only
+because rung 2 answers 0 times; the "the hint must be the type this very name was resolved to"
+invariant in `repElemKeyOfNameTy`'s header is violated for a re-registered declaration.)*
+
+### 4. WHAT SHIPS
+
+`declTyIxOfName` — the one home for the two-rung emit-side name → arena-type bridge, guard-free so
+each caller keeps its own empty-name and runaway-cap policy (they differ: `-1` · `""` · `-2`, and
+`repRowOfName` caps the raw name while resolving the RENDER). `fieldElemTyIxOfName` had both rungs
+inline and now delegates; `repNameCanonKey` and `repRowOfName` gain rung 1; `repElemKeyOfNameTy`
+keeps asking the grammar, with §3's counts in its header.
+
+| row | parses before | after | Δ |
+|---|---:|---:|---:|
+| 1 `repElemKeyOfNameTy` | 463 | 463 | 0 (excluded by measurement) |
+| 2 `sTyIxOfNameTy` | 402 | 402 | 0 |
+| 3 `fieldElemTyIxOfName` | 514 | **494** | −20 |
+| 4 `unMemAtomTyIx` | 1,229 | 1,229 | 0 |
+| 5 `slotCanonKey` | 15 | 15 | 0 |
+| 6 `repNameCanonKey` | 228 | **25** | **−203** |
+| 7 `repRowOfName` | 180 | **172** | −8 |
+| **emit-side total** | **3,031** | **2,800** | **−231 (−7.6%)** |
+
+**THE LEDGER REDISTRIBUTES, AND NOT BY THE DIRECT ARITHMETIC.** Row 6's 219 covered parses predict a
+residue of 9; it lands at 25. Rows 3 and 7 fall by 20 and 8 beyond their own rung's effect. A site
+that stops resolving also stops MEMOIZING, so every other site's hit/miss split moves with it — the
+per-row parse counts are coupled through one shared memo, and only the TOTAL is additive. No row rose.
+
+### 5. GATE — every rc taken explicitly, never off a pipe
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, 1,124,718 B |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next — next is the fixpoint (2 compiles)"*, 1,124,728 B |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,675 passed · 0 failed · 7 ignored** — the ignored COUNT read first; 7, not ~600, so the prereqs held |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined failure, 0 new, 0 stale |
+| corpus A/B, six channels | — | **1,727 of 1,727 SAME, 0 DIFF** |
+| fuzz A/B, six channels | — | **12,480 of 12,480 SAME, 0 DIFF** |
+
+Six channels per file, both legs: `check` rc · `check` diagnostics · `build` rc · `build` diagnostics
+· emitted wasm bytes · `run` rc + stdout. `0x<hex>` (trap backtraces) and the harness's own output
+path are normalized; every record is one short line and the record count is asserted equal to the
+file count, so a torn append is loud.
+
+**THE GATE CHANNEL WAS SABOTAGE-VERIFIED BEFORE IT WAS BELIEVED.** The same harness, same corpus,
+against a deliberately-broken compiler (an `emitFail` at the tail of `emitProgram`) reads **1,447
+DIFF / 280 SAME** — the 280 being the `@error` files that never reach emit. A six-channel 0 is
+evidence only once the instrument has been shown able to print something else.
+
+**THE FUZZ LEG IS VACUOUS FOR ROW 6 AND SAYS SO.** The 12,480 programs (8 seeds × 3 dimension
+settings, `DECLTYPES` on) were censused with the probe build BEFORE the A/B: they reach
+`repNameCanonKey` 1,278 times but `cUserTypes` covers **0** of those reaches, so row 6's rung is
+inert across the whole fuzz population and its 0 diffs are not evidence about it. Row 7's rung IS
+exercised — 242 covered reaches, 64 covered parses, 0 disagreements. Row 1's excluded rung was
+measured there too: **820 covered reaches, 0 key disagreements** — the grammar emits no `new` type,
+so the fuzzer is structurally blind to the shape that refutes it, and the corpus is the only
+instrument that could have found `FView`.
+
+**BYTE DELTA: +10 B** (1,124,718 → 1,124,728).
+
+### 6. LESSONS
+
+* **A MISS IS NOT A MINT.** #1327's gate on the whole emit-side frontier — *"a hint that replaces a
+  MISS is a rep change"* — is true of 1,689 of the emitter's 3,031 parses and false of the other
+  1,342. The distinguishing measurement is four lines (`T.tys.length` before and after
+  `annotResolve`), it does not correlate with any column the programme already had, and it moves at
+  least one row (`repNameCanonKey`: 228 parses, **7** minted entries) from "rep change, serialize it"
+  to "free". *When a document's stop-condition is a claim about a mechanism, instrument the
+  mechanism before ranking anything by it.*
+* **THE AGREEMENT THAT MATTERS IS ON THE PATH YOU ARE NOT CHANGING.** The rung's substitution was
+  clean on all 342 parses it replaces — the population it was designed for — and wrong on 4 of 962
+  memo HITS, a path where the new rung changes an answer that was already being returned correctly.
+  Measuring only the target population would have shipped `FView` broken behind a 342/342 green
+  reading. *A rung inserted ABOVE an existing answer must be measured against that answer everywhere
+  it now runs, not only where it was meant to help.*
+* **THE FRONTIER'S BIGGEST ROW CAN BE A SINGLE `if`.** Row 1's 463 parses survived three units of
+  measurement (reaches, parses, mint-free parses) and turn out to be 100% intern-side, 76.7% at one
+  already-blocked site, and irreducible without the caller's type — while row 6, ranked sixth of
+  seven by reaches and fifth by parses, gave up 89% of its parsing to one map lookup. *Rank by the
+  cost of the REMEDY once the unit is right; the row that is cheapest to remove is not visible in any
+  column that counts work done.*
+* **A CENSUS ROW THAT READS ZERO IS A DELETED WORRY.** The find-side rung 2 — the one the slice was
+  briefed to protect — parses 0 times in 237 reaches. Two consecutive slices have now found their
+  cheapest fact in a column that read zero (#1327's `recordMvValTyIx`, this one's rung 2).
