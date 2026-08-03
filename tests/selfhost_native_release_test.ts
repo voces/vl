@@ -152,7 +152,22 @@ const LOOP_TABLE: Array<{
   // `bench/arrays/binsearch`'s kernel: the 1.23x row, and the nested case. The two
   // already-rotated loops at `none` are list-growth helpers, not user loops; both
   // rungs inline them away and rotate all three that remain.
-  { fixture: "binsearch-probe", none: [5, 2, 8], O: [3, 3, 6], O3: [3, 3, 6] },
+  //
+  // `none` moved 5,2,8 -> 6,3,8 when `__str_eq__` gained its 8x unroll (PERF P3).
+  // THE PROBE'S OWN LOOPS DID NOT MOVE — this counter is MODULE-WIDE, and it counts
+  // the runtime helpers VL emits into every module. Per-function counts, master vs
+  // that change: `$1` (bsearch itself) 2 -> 2, `$0`/`$3` 1 -> 1, and `$4` — the
+  // two-string-ref `__str_eq__` — 1 -> 2, which is exactly what an unrolled loop
+  // plus its scalar remainder looks like. `binsearch-probe` contains ZERO string
+  // operations, so no user loop could have changed.
+  //
+  // Recorded because it is the gate's first live firing and it fired on the wrong
+  // axis: the module-wide unit cannot distinguish "the probe's loop rotated" (the
+  // 2.40x defect this gate exists to catch) from "a shared helper gained a loop"
+  // (inert for this probe). Tightening it to the probe's own functions is filed;
+  // until then a helper change legitimately moves these numbers and the fix is to
+  // re-verify per-function and update the row, as done here.
+  { fixture: "binsearch-probe", none: [6, 3, 8], O: [3, 3, 6], O3: [3, 3, 6] },
 ];
 
 // The same representative @run spread the `-O` suite uses, so the two rungs are
