@@ -18,6 +18,11 @@
 //   · two-arm   1 — the positive cell (2 without the sink).
 //   · three-arm 1 — separates "the returns merged" from "a union producer emits one box".
 //                   Unsunk this reads 3, so any per-arm accounting is ruled out.
+//   · if-expression 1 — the same two-armed producer written as ONE `return` of an
+//                   if-EXPRESSION. A union-valued if-expression lowers as a value-typed
+//                   `if` that boxes in each arm, so this reads 2 unless the return path
+//                   splits it into per-arm exits; it is the spelling half of the same
+//                   claim the two-arm row makes for the statement form.
 //   · passthrough 2 — the INVERTED control. `pick`'s two exits return a union that already
 //                   exists, so neither constructs a box and the sink must not manufacture
 //                   one; the two sites counted are its CALLER's argument coercions. A sink
@@ -144,6 +149,11 @@ const expectedLogs = (fixture: string): string[] =>
 const SINK_SITES: Array<{ fixture: string; sites: number; why: string }> = [
   { fixture: "union-sink-two-arm", sites: 1, why: "two returns merge onto one exit" },
   { fixture: "union-sink-three-arm", sites: 1, why: "three returns merge onto one exit" },
+  {
+    fixture: "union-sink-if-expression",
+    sites: 1,
+    why: "one `return` of an if-expression splits into per-arm exits that merge onto one",
+  },
   {
     fixture: "union-sink-passthrough",
     sites: 2,

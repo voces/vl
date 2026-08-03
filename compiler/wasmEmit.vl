@@ -3111,12 +3111,18 @@ function emitUnionIfValue(
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     wU8(4)                 // 0x04 if
     fbValtype("union", -1) // result blocktype: the union box `(ref $uBox)`
+    // Count the frame: a `br` emitted anywhere inside an arm takes its operand from
+    // `ctrlDepth`, and the union return sink's branch to the function exit block is one.
+    // Nothing branch-bearing reaches an arm today (each is a single value expression),
+    // so this is currently byte-neutral — and the failure mode if it were dropped is an
+    // off-by-one `br` operand, i.e. invalid wasm rather than a wrong answer.
+    ctrlEnter()
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rcT = emitUnionIfArm(body, unionName, s.ifThen, fnIx)
     if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
-    fbElse()               // 0x05 else
+    fbElse() // 0x05 else
     const savedElseTop = narrowTop
     const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     const els = P.nodes[s.ifElse]
@@ -3129,6 +3135,7 @@ function emitUnionIfValue(
     if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }
     fbEnd() // 0x0b end
+    ctrlLeave()
     return 0
   }
   emitFail("emitProgram: expected a union if-expression")
@@ -3199,6 +3206,7 @@ function emitVariantIfValue(body: i32[], vi: i32, ifIx: i32, fnIx: i32) {
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     wU8(4)                   // 0x04 if
     fbValtype("variant", vi) // result blocktype: the variant struct `(ref $(uVarHeap[vi]))`
+    ctrlEnter()              // count the frame — see `emitUnionIfValue`
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rcT = emitVariantIfArm(body, vi, s.ifThen, fnIx)
@@ -3217,6 +3225,7 @@ function emitVariantIfValue(body: i32[], vi: i32, ifIx: i32, fnIx: i32) {
     if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }
     fbEnd() // 0x0b end
+    ctrlLeave()
     return 0
   }
   emitFail("emitProgram: expected a variant if-expression")
@@ -8407,6 +8416,7 @@ function emitNullableIfBinding(
   if s is IfStmt {
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbIf(64) // 0x04 if, 0x40 void blocktype
+    ctrlEnter() // count the frame — see `emitUnionIfValue`
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rc = emitNulArmToLocal(
@@ -8443,6 +8453,7 @@ function emitNullableIfBinding(
     if narrowedElse { restoreNarrow(savedElseTop) }
     if erc < 0 { return -1 }
     fbEnd() // 0x0b end
+    ctrlLeave()
     return 0
   }
   emitFail("emitProgram: expected an if expression")
@@ -12228,6 +12239,102 @@ export function emitUnionRetSink(fnIx: i32) {
   0
 }
 
+// TERMINATE A RETURN: lower the value at `retArg` as function `fnIx`'s result and end the
+// exit. Every exit in the emitter goes through here — `emitStmt`'s `RetStmt`, the
+// implicit tail value of `emitFuncBody`, and an if-tail arm's `emitStmtTail` — so the
+// value lowering and its terminator can never be paired differently at one of them.
+//
+// The one shape that is not "value then terminator" is a returned if-EXPRESSION in a
+// SINKING function, which is split into per-arm exits below.
+function emitReturnExit(body: i32[], retArg: i32, fnIx: i32) {
+  if fnUsesUnionSink {
+    const bare = P.nodes[unwrapParen(retArg)]
+    if bare is IfStmt {
+      return emitUnionRetIfSink(body, unwrapParen(retArg), fnIx)
+    }
+  }
+  if emitReturnValue(body, retArg, fnIx) < 0 { return -1 }
+  emitUnionRetSink(fnIx)
+  0
+}
+
+// `return if c { a } else { b }` in a union-box-returning function taking the SINK.
+//
+// `emitUnionCoerce`'s value-typed `if` (`emitUnionIfValue`) builds a box in EACH ARM to
+// satisfy a `(ref $uBox)` blocktype, so one `return` carries one construction site per
+// arm and the merge point at the `if`'s `end` is exactly what stops Heap2Local owning
+// any of them. Lowering the same source as a VOID statement-`if` whose arms each
+// terminate as their own return is the identical program — it is what
+// `if c { return a } else { return b }` already emits — and each arm's box then meets
+// `emitUnionRetSink`'s peephole and becomes two `local.set`s plus a `br`. The function's
+// sites collapse to the exit block's ONE.
+//
+// The trailing `unreachable` is load-bearing and NOT dead padding for the sunk case. A
+// wasm `if` whose arms both diverge is still REACHABLE at its `end` as far as the
+// validator is concerned, and the enclosing `return` used to make everything after it
+// stack-polymorphic. Without the `unreachable`, a function whose arms all DECLINED the
+// sink (both arms pass a union through, so no box is built and each arm emits a plain
+// `return`) would fall out of the `if` with an empty stack into a non-void function
+// `end`: invalid wasm. It restores the post-`return` polymorphism the split gave away.
+function emitUnionRetIfSink(body: i32[], ifIx: i32, fnIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse < 0 {
+      return emitFail("emitProgram: union if-expression requires an else arm")
+    }
+    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    fbIf(64) // 0x04 if, 0x40 void blocktype
+    // The arms hold sunk RETURNS whose `br` operand is the frame distance to the
+    // function's exit block, so this frame has to be counted. The `else` reuses it (one
+    // frame per `if`/`else` pair), matching `emitIfTail`/`emitIfStmtStmt`.
+    ctrlEnter()
+    const savedTop = narrowTop
+    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    const rcT = emitUnionRetIfArm(body, s.ifThen, fnIx)
+    if narrowed { restoreNarrow(savedTop) }
+    if rcT < 0 { return -1 }
+    fbElse() // 0x05 else
+    // A VALUE union narrows to the COMPLEMENT set in the else-arm (see `emitStmt`).
+    const savedElseTop = narrowTop
+    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
+    const els = P.nodes[s.ifElse]
+    let rc = 0
+    if els is IfStmt {
+      rc = emitUnionRetIfSink(body, s.ifElse, fnIx) // `else if`: another chain link
+    } else {
+      rc = emitUnionRetIfArm(body, s.ifElse, fnIx)
+    }
+    if narrowedElse { restoreNarrow(savedElseTop) }
+    if rc < 0 { return -1 }
+    fbEnd() // 0x0b end
+    ctrlLeave()
+    fbUnreachable() // 0x00 — every arm exited; see the header
+    return 0
+  }
+  emitFail("emitProgram: expected a union if-expression")
+}
+
+// One arm of a sunk returned if-expression: the arm Block's single tail-value statement,
+// lowered as the function's return value and terminated like any other exit
+// (`emitReturnExit`, which recurses when that value is itself an if-expression).
+function emitUnionRetIfArm(body: i32[], blockIx: i32, fnIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    if stmts.length == 1 {
+      if stmtIsTailValue(stmts[0], fnIx) {
+        return emitReturnExit(body, stmts[0], fnIx)
+      }
+      const inner = P.nodes[unwrapParen(stmts[0])]
+      if inner is IfStmt { return emitReturnExit(body, stmts[0], fnIx) }
+    }
+    return emitFail(
+      "emitProgram: union if-expression arm is not a single value",
+    )
+  }
+  emitFail("emitProgram: union if-expression arm is not a block")
+}
+
 // Emit the `null` value of function `fnIx`'s nullable return rep, leaving it on the
 // stack as the function's result (the fall-through path's implicit `return null`).
 // Each arm mirrors the `NullLit` lowering for that rep: the `boolean|null` i32 sentinel
@@ -12357,10 +12464,8 @@ export function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       return emitFail("emitProgram: bare return is not supported")
     }
     // Seed the return context + emit the value (struct / list / union / nullable /
-    // widening) via the shared helper, then terminate the exit.
-    if emitReturnValue(body, s.retArg, fnIx) < 0 { return -1 }
-    emitUnionRetSink(fnIx)
-    return 0
+    // widening) and terminate the exit, via the shared helper.
+    return emitReturnExit(body, s.retArg, fnIx)
   }
   if s is IfStmt { return emitIfStmtStmt(body, s, stmtIx, fnIx) }
   if s is WhileStmt { return emitWhileStmtStmt(body, s, stmtIx, fnIx) }
@@ -13302,11 +13407,10 @@ export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
         // Implicit return: seed the return context + push the value (so a trailing
         // `null` / nullable value boxes or sentinels exactly like `return e`), then
         // terminate the exit.
-        if emitReturnValue(body, stmts[i], fnIx) < 0 {
+        if emitReturnExit(body, stmts[i], fnIx) < 0 {
           scopePop()
           return -1
         }
-        emitUnionRetSink(fnIx)
       } else if isLast && lastStmtIsValueIf(stmts[i], fnIx) {
         // The body ends in an `if`/`else` whose arms each yield a value (implicit
         // return) rather than `return`ing — lower it tail-aware so each arm's trailing
@@ -13435,9 +13539,7 @@ function emitStmtTail(body: i32[], stmtIx: i32, fnIx: i32) {
   if stmtIsTailValue(stmtIx, fnIx) {
     // An if-tail arm's implicit return — seed the return context (so a `null` arm
     // boxes / sentinels per the function's return type) exactly like `emitFuncBody`.
-    if emitReturnValue(body, stmtIx, fnIx) < 0 { return -1 }
-    emitUnionRetSink(fnIx)
-    return 0
+    return emitReturnExit(body, stmtIx, fnIx)
   }
   emitStmt(body, stmtIx, fnIx)
 }
