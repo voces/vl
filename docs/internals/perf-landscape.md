@@ -122,8 +122,11 @@ A three-rung sweep over all 46 benchmarks (interleaved min-of-3, all three rungs
 non-empty stdout; the interesting rows re-taken at min-of-9) says it is not, and splits the failures
 into **two mechanisms the two-rung harness reports identically**:
 
-**(a) `wasm-opt` ITSELF loses — both optimised rungs are worse than no optimisation.** Seven rows;
-these are the ones the existing `O3-REGRESSION` flag can see, and it under-counts them at two:
+**(a) `wasm-opt` ITSELF loses — both optimised rungs are worse than no optimisation.** This class is
+**already ruled upstream by #1325** (see §P11): bare `wasm-opt -O` carries the regression identically,
+so no flag in the release profile is responsible — binaryen rotates the loop and Cranelift spills.
+What the third rung adds is the POPULATION. The existing `O3-REGRESSION` flag sees two rows; there
+are seven:
 
 | benchmark | default | `-O` | `-O3` | best optimised vs default |
 |---|---:|---:|---:|---|
@@ -137,8 +140,8 @@ these are the ones the existing `O3-REGRESSION` flag can see, and it under-count
 
 `mixed-width` is the one to look at: VL's *unoptimised* build is 212 ms against Rust's 188 ms —
 near parity on a three-accumulator mixed-width loop — and running the optimiser at either rung
-throws that away. Both optimised rungs land within 1.5% of each other, so this is `wasm-opt`
-disagreeing with Cranelift about a loop, not a flaw in the `-O3` profile specifically.
+throws that away. Both optimised rungs land within 1.5% of each other, which is the same signature
+#1325 measured with explicit flag ablation, now reproduced independently by rung.
 
 **(b) `-O3` SPECIFICALLY loses, and `-O` is the best rung.** The two-rung harness cannot see this
 class at all, because it reports the same "`-O3` ≈ default" as class (a):
@@ -780,13 +783,29 @@ the map side may already be half-built; **what is missing is a place to cache th
 itself.** That is a representation change (a mutable `hash` slot alongside the code-point array, or
 P12's linear-memory string), which is why this is L and not S.
 
-### P11 — the `-O3` regressions
+### P11 — the `-O3` regressions. **NOT the release profile's fault, and the name is misleading.**
 
 A release profile that makes a benchmark 2.43x slower is a finding in its own right.
-`arith/mixed-width`: 195.4 → 474.3 ms — `wasm-opt --closed-world -O3 --gufa` is actively destroying
-the mixed-width cast sequence. `arrays/binsearch`: 1464.3 → 1802.1 ms. Separately, `-O3` is a
+`arith/mixed-width`: 195.4 → 474.3 ms. `arrays/binsearch`: 1464.3 → 1802.1 ms. `-O3` is also a
 **wash or worse on the entire arith and arrays categories** and costs ~380 ms of build time against
-~9 ms plain. **Gate the release profile on this suite before recommending it.**
+~9 ms plain.
+
+**#1325 RULED THIS UPSTREAM, and the original diagnosis above — "`wasm-opt --closed-world -O3
+--gufa` is actively destroying the mixed-width cast sequence" — is refuted.** Bare `wasm-opt -O`
+carries the regression *identically*: plain 205 ms · `--closed-world` 209 · `--gufa` 205 · **bare
+`-O` 488**. No flag in the release profile is responsible. Binaryen rotates every loop and Cranelift
+then spills the carried values; V8 does not. The failure is gated by loop **shape**, and the fix is
+not ours.
+
+**That gate's counter is MODULE-WIDE** (`tests/selfhost_native_release_test.ts`) — it fired on #1328
+because `__str_eq__` gained an unroll remainder, while the probe it was supposed to be watching
+(`binsearch-probe`, zero string ops) was untouched. Get per-function loop counts before believing it.
+
+The three-rung sweep in §2.4a confirms the ruling on a wider population — seven benchmarks are worse
+at BOTH optimized rungs, not two — **and separates out a second class P11 does not cover**:
+`arrays/sort-heap`, where `-O` is the best rung by 1.32x and `-O3` specifically gives the win back.
+That one IS a profile question rather than an upstream one. `run.sh` now raises `OPT-LOSES` and
+`O3-WORSE-THAN-O` as distinct flags so the two never merge again.
 
 ### Not ours — track, do not chase inside `compiler/**`
 
