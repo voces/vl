@@ -8980,6 +8980,34 @@ export function bodyEndsInReturn(blockIx: i32, fnIx: i32) {
   false
 }
 
+// How many value-producing EXITS one RETURN VALUE contributes. An if-EXPRESSION
+// (`return if c { a } else { b }`, or the same shape as a bare tail value) lowers as a
+// void statement-`if` whose arms each terminate as their own return, so it contributes
+// one exit PER ARM — which is what makes such a function eligible for the sink at all.
+// Every other expression is a single exit.
+function retValueExitCount(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  const bare = P.nodes[unwrapParen(exprIx)]
+  if bare is IfStmt {
+    return retArmExitCount(bare.ifThen, fnIx) + retArmExitCount(bare.ifElse, fnIx)
+  }
+  1
+}
+
+// One arm of a returned if-EXPRESSION: an `else if` chain link is another if-expression,
+// a block's single tail value recurses (a NESTED if-expression contributes its own arms),
+// and anything else is one exit.
+function retArmExitCount(armIx: i32, fnIx: i32) {
+  if armIx < 0 { return 0 }
+  const a = P.nodes[armIx]
+  if a is IfStmt { return retValueExitCount(armIx, fnIx) }
+  if a is Block {
+    const stmts = a.blkStmts
+    if stmts.length == 1 { return retValueExitCount(stmts[0], fnIx) }
+  }
+  1
+}
+
 // How many value-producing EXITS the statement at `stmtIx` contributes, counting an
 // explicit `return` and a tail value the same way `emitFuncBody`/`emitStmtTail` do (both
 // lower through `emitReturnValue`). Recurses into the structured statements that can
@@ -8995,7 +9023,7 @@ function retExitCount(stmtIx: i32, fnIx: i32) {
   if stmtIx < 0 { return 0 }
   const s = P.nodes[stmtIx]
   if s is FuncDecl { return 0 }
-  if s is RetStmt { return 1 }
+  if s is RetStmt { return retValueExitCount(s.retArg, fnIx) }
   if s is Block {
     const stmts = s.blkStmts
     let n = 0
@@ -9003,7 +9031,7 @@ function retExitCount(stmtIx: i32, fnIx: i32) {
     while i < stmts.length {
       const isLast = i == stmts.length - 1
       if isLast && stmtIsTailValue(stmts[i], fnIx) {
-        n = n + 1
+        n = n + retValueExitCount(stmts[i], fnIx)
       } else {
         n = n + retExitCount(stmts[i], fnIx)
       }
