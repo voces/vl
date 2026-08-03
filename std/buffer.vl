@@ -345,12 +345,26 @@ export function copyFrom(
 // on an index outside `[0, length)` via `__trap__` (`unreachable`) — the same
 // loud, deterministic, unrecoverable stop the engine's own bounds trap is.
 //
-// The check is TWO compares per access and is NOT hoisted out of a loop by
-// anything in VL (P1.4 asks that the policy be stated, not that it be
-// eliminated). `docs/internals/buffer-design.md` §L carries the measured cost
-// and the recipe for the unchecked spelling when a kernel has proved its own
-// bounds: `Buf`'s `loadF32`/`storeF32` are still there, still unfenced, and
-// still take a byte offset.
+// THE CHECK IS TWO COMPARES PER ACCESS AND NOTHING HOISTS IT — not VL, which has
+// no LICM, and not binaryen at `--closed-world -O3 --gufa -O3`, which keeps both
+// compares even when the loop guard four instructions above them is the
+// byte-identical comparison against the same constant. That is read off the
+// disassembly, not inferred from a stopwatch, and it is pinned as a shape by
+// `tests/buffer_view_bounds_shape_test.ts`. P1.4 asks that the policy be stated,
+// not that it be eliminated; `docs/internals/buffer-design.md` §M is the
+// statement, with the price and the disassembly.
+//
+// The price is not what it looks like. On a loop holding ONE view the check
+// measures FREE at `-O3` (the compares are perfectly predicted and fill spare
+// issue slots); what costs is the per-access re-read of this struct's own `base`
+// and `length`, which binaryen hoists out of the loop only when GUFA can fold
+// them to constants — i.e. only when the program has one live view of the shape.
+// A two-view loop pays 7 field loads per element and runs 3.7x the hoisted
+// spelling. So the recipe for a kernel that has proved its own bounds is to take
+// the base and the count ONCE (`byteAddrF32(v, 0)`, `v.length`) and run the bare
+// intrinsics inside — measured identical to a hand-written raw kernel at EVERY
+// rung, no flag needed. `Buf`'s `loadF32`/`storeF32` are also still there, still
+// unfenced, and still take a byte offset.
 
 // The largest element count whose byte size fits in a positive i32, per width.
 // `count << 2` at 2^29 is already negative, so the count must be rejected BEFORE
@@ -430,10 +444,17 @@ export function setI32(self: I32View, i: i32, v: i32) {
 
 // ── the bracket (webcraft P1.1's spelling) ───────────────────────────────────
 // `x[i]` / `x[i] = v` over a view, as free INDEX-OPERATOR functions (B14). Each
-// is a one-line forward to the accessor above, and the bracket lowers to exactly
-// the call the accessor spelling lowers to — same bounds check, same single
-// load/store, byte-identical module. The bracket is SPELLING, not a second
-// access path, which is why the two spellings can be mixed freely in one loop.
+// is a one-line forward to the accessor above: same bounds check, same single
+// load/store, so the bracket is SPELLING, not a second access path, and the two
+// spellings mix freely in one loop.
+//
+// THE FORWARD IS A REAL FRAME AT THE UNOPTIMIZED RUNG. `x[i]` emits a call to
+// THIS function, which then calls `getF32` — two calls per access where
+// `x.getF32(i)` emits one. The modules are the same SIZE (one call index swapped
+// for another) but not the same bytes, and unoptimized the extra frame is
+// measurable. Both `-O` and `-O3` inline the forward away and the two spellings
+// converge, so this is a `vl build`-with-no-flags effect only; §M2 has the
+// number.
 //
 // Two `"[]"` declarations coexist because an index operator dispatches on its
 // `self` parameter's TYPE and the two views are distinct nominal brands — the

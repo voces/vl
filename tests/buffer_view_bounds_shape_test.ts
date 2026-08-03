@@ -3,7 +3,7 @@
 // P1.4 asks that the canonical view loop either HOIST the per-access bound or
 // rely on the memory trap, and that whichever it does be STATED so kernel code
 // can be written to the fast pattern deliberately. The answer
-// (`docs/internals/buffer-design.md` §L8) is that it does NEITHER: the check is
+// (`docs/internals/buffer-design.md` §M) is that it does NEITHER: the check is
 // emitted per access and survives every optimizer rung, including
 // `--closed-world -O3 --gufa -O3`, even when the loop guard immediately above it
 // is the byte-identical comparison.
@@ -22,7 +22,7 @@
 //   sget    `struct.get` inside at least one `loop` — the view descriptor's own
 //           `base` / `length` fields, re-read per access when GUFA cannot fold
 //           them. This is the column that explains the SPEED, and it is pinned
-//           because §L8's whole cost model rests on it.
+//           because §M's whole cost model rests on it.
 //
 // All three are MODULE-WIDE within loops, which is the honest upper bound and
 // the same unit `selfhost_native_release_test.ts` uses for allocation sites: at
@@ -34,7 +34,7 @@
 // "Inside a loop" is loop MEMBERSHIP, not innermost-loop membership, so a value
 // the driver reads once per TRIP counts too — that is what the `sget` on the
 // `hoist` rows is (three field reads per trip in `axpy-hoist`, none per element).
-// The per-ELEMENT reads are the ones §L8 quotes, and they are read off the
+// The per-ELEMENT reads are the ones §M quotes, and they are read off the
 // disassembly directly.
 //
 // The three spellings are what make each row mean something:
@@ -43,8 +43,8 @@
 //   hoist  the stated fast pattern — base + count out of the loop, bare intrinsic
 //
 // A moved cell is a finding either way and must be re-justified here and in
-// §L8: fewer traps at `-O3` means an optimizer learned to discharge the check
-// (which would let §L8's statement soften), more means a spelling grew one.
+// §M: fewer traps at `-O3` means an optimizer learned to discharge the check
+// (which would let §M's statement soften), more means a spelling grew one.
 //
 // GATING: needs the built binary, the seed, `wasm-opt` (without it `vl build -O3`
 // writes the UNOPTIMIZED module and still exits 0 — every rung would read the
@@ -121,7 +121,7 @@ const c = (trap: number, call: number, sget: number): Counts => ({ trap, call, s
 // sinks `base` into a local: 0 per-element field reads, and the check measures
 // free. `axpy` holds TWO views whose `base` differs, nothing folds, and binaryen
 // does not hoist the (immutable!) field loads out of the loop — 7 per element,
-// which is the 3.7x in §L8's table.
+// which is the 3.7x in §M's table.
 //
 // The `hoist` rows are the control: 0 traps and 0 calls at every rung, because
 // the base and the count left the loop and the body is the bare intrinsic (their
@@ -233,7 +233,7 @@ for (const [fixture, row] of Object.entries(TABLE)) {
           `${fixture} loop shape moved — ${bad.join("; ")}\n` +
             `  observed: ${seen.join(" ")}\n` +
             `  A moved cell is a P1.4 finding: re-derive it from the disassembly and\n` +
-            `  re-justify buffer-design.md §L8 in the same commit.`,
+            `  re-justify buffer-design.md §M in the same commit.`,
         );
       }
     },
@@ -256,7 +256,7 @@ Deno.test({
         throw new Error(
           `${shape}-view has no trap left inside its loop at -O3 — the per-access ` +
             `bounds check was eliminated. That is a real improvement and a real ` +
-            `documentation change: buffer-design.md §L8 and webcraft-requirements.md ` +
+            `documentation change: buffer-design.md §M and webcraft-requirements.md ` +
             `P1.4 both state that it survives.`,
         );
       }
@@ -272,7 +272,7 @@ Deno.test({
       if (hoist.trap !== 0 || hoist.call !== 0) {
         throw new Error(
           `${shape}-hoist is not bare at -O3: [trap,call] = [${hoist.trap},${hoist.call}]. ` +
-            `The fast pattern documented in §L8(4) must lower to the intrinsic with ` +
+            `The fast pattern documented in §M5 must lower to the intrinsic with ` +
             `nothing per access.`,
         );
       }

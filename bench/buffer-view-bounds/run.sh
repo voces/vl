@@ -4,20 +4,23 @@
 # `std:buffer` typed view costs in a hot kernel, at each optimizer rung
 # (webcraft P1.4).
 #
-# Four kernel SHAPES x three SPELLINGS x three RUNGS, plus an R=0 control build
-# of every one of them.
+# Four kernel SHAPES x three SPELLINGS x three RUNGS (plus one extra spelling on
+# `scale`), and an R=0 control build of every one of them.
 #
-#   spelling  view    the fenced canonical: `v[i]` / `v[i] = …` through the
-#                     typed-view bracket. One call per access, `0 <= i < length`
-#                     inside it.
-#   spelling  buf     the UNFENCED TWIN: `Buf.loadF32`/`storeF32`, byte offsets,
-#                     the same one call per access and NO check.
-#   spelling  hoist   the STATED FAST PATTERN: the view supplies the extent, the
-#                     base and the count come out of the loop, and the body is
-#                     the bare `__load_*__` / `__store_*__` intrinsic.
+#   spelling  view      the fenced canonical: `v[i]` / `v[i] = …` through the
+#                       typed-view bracket, `0 <= i < length` per access.
+#   spelling  accessor  the same kernel written `v.getF32(i)` / `v.setF32(i, …)`
+#                       — same check, one fewer call per access, because the
+#                       bracket is a function that FORWARDS to this one.
+#   spelling  buf       the UNFENCED TWIN: `Buf.loadF32`/`storeF32`, byte offsets,
+#                       one call per access and NO check.
+#   spelling  hoist     the STATED FAST PATTERN: the view supplies the extent, the
+#                       base and the count come out of the loop, and the body is
+#                       the bare `__load_*__` / `__store_*__` intrinsic.
 #
-#   (view - buf)  = the price of the FENCE
-#   (buf  - hoist) = the price of the CALL
+#   (accessor - buf) = the price of the FENCE at matched call counts
+#   (buf - hoist)    = the price of the CALL
+#   (view - accessor) = the bracket's forwarding hop (a `none`-rung effect only)
 #
 # METHOD, and why each part of it is there:
 #
@@ -76,8 +79,15 @@ fi
 
 mkdir -p "$WORK" || exit 1
 
-SHAPES="scale reduce axpy rows"
-SPELLINGS="view buf hoist"
+# Every kernel, as "<shape>-<spelling>". `scale-accessor` is the extra column:
+# `scale-view` with the bracket written out as the accessor call it forwards to,
+# which is the only spelling that executes the same ONE call per access as
+# `scale-buf` while still checking — i.e. the clean isolation of the check at the
+# unoptimized rung, where `view` is paying for the forwarding hop as well.
+KERNELS="scale-view scale-accessor scale-buf scale-hoist
+reduce-view reduce-buf reduce-hoist
+axpy-view axpy-buf axpy-hoist
+rows-view rows-buf rows-hoist"
 RUNGS="none O O3"
 
 # Inner-loop iterations per run: N * R, identical for all four shapes.
@@ -100,81 +110,80 @@ want0_of() { case "$1" in scale) echo 1 ;; reduce) echo 0 ;; axpy) echo 0 ;; row
 
 flag_of() { case "$1" in none) echo "" ;; O) echo "-O" ;; O3) echo "-O3" ;; esac; }
 
+nk=$(echo "$KERNELS" | wc -w)
+
 # ── build ──────────────────────────────────────────────────────────────────
-echo "== building 12 kernels x 3 rungs x {R, R=0} into $WORK =="
+echo "== building $nk kernels x 3 rungs x {R, R=0} into $WORK =="
 built=0
-for shape in $SHAPES; do
-  for spell in $SPELLINGS; do
-    src="$SRC/$shape-$spell.vl"
-    [ -f "$src" ] || { echo "FATAL: missing $src"; exit 1; }
-    # The R=0 control: the identical source with the trip count zeroed.
-    ctl="$WORK/$shape-$spell.r0.vl"
-    sed 's/^const R = .*$/const R = 0/' "$src" > "$ctl"
-    grep -q '^const R = 0$' "$ctl" || { echo "FATAL: R=0 substitution missed in $ctl"; exit 1; }
-    prev=""
-    for rung in $RUNGS; do
-      f=$(flag_of "$rung")
-      for v in main ctl; do
-        [ "$v" = main ] && s="$src" || s="$ctl"
-        out="$WORK/$shape-$spell.$v.$rung.wasm"
-        if [ -z "$f" ]; then
-          "$VL" build "$s" --compiler "$COMPILER" -o "$out" > /dev/null 2>&1
-        else
-          "$VL" build "$s" --compiler "$COMPILER" "$f" -o "$out" > /dev/null 2>&1
-        fi
-        rc=$?
-        [ $rc -eq 0 ] || { echo "FATAL: build rc=$rc for $s $f"; exit 1; }
-        built=$((built + 1))
-      done
-      # Assert wasm-opt actually did something at this rung (see the header).
-      sz=$(stat -c%s "$WORK/$shape-$spell.main.$rung.wasm")
-      if [ "$rung" != none ] && [ "$sz" = "$prev" ]; then
-        echo "FATAL: $shape-$spell $rung is byte-size-identical to the previous rung — wasm-opt inert?"
-        exit 1
+for k in $KERNELS; do
+  src="$SRC/$k.vl"
+  [ -f "$src" ] || { echo "FATAL: missing $src"; exit 1; }
+  # The R=0 control: the identical source with the trip count zeroed.
+  ctl="$WORK/$k.r0.vl"
+  sed 's/^const R = .*$/const R = 0/' "$src" > "$ctl"
+  grep -q '^const R = 0$' "$ctl" || { echo "FATAL: R=0 substitution missed in $ctl"; exit 1; }
+  base=""
+  for rung in $RUNGS; do
+    f=$(flag_of "$rung")
+    for v in main ctl; do
+      [ "$v" = main ] && s="$src" || s="$ctl"
+      out="$WORK/$k.$v.$rung.wasm"
+      if [ -z "$f" ]; then
+        "$VL" build "$s" --compiler "$COMPILER" -o "$out" > /dev/null 2>&1
+      else
+        "$VL" build "$s" --compiler "$COMPILER" "$f" -o "$out" > /dev/null 2>&1
       fi
-      [ "$rung" = none ] && prev="$sz"
+      rc=$?
+      [ $rc -eq 0 ] || { echo "FATAL: build rc=$rc for $s $f"; exit 1; }
+      built=$((built + 1))
     done
+    # Assert wasm-opt actually did something at this rung (see the header).
+    sz=$(stat -c%s "$WORK/$k.main.$rung.wasm")
+    if [ "$rung" = none ]; then
+      base="$sz"
+    elif [ "$sz" = "$base" ]; then
+      echo "FATAL: $k $rung is byte-size-identical to the unoptimized module — wasm-opt inert?"
+      exit 1
+    fi
   done
 done
 echo "   $built modules"
 
 # ── correctness + elision gate, once per configuration ─────────────────────
 echo "== verifying output and non-elision =="
-for shape in $SHAPES; do
-  want=$(want_of "$shape"); want0=$(want0_of "$shape")
-  for spell in $SPELLINGS; do
-    for rung in $RUNGS; do
-      got=$("${RUNNER[@]}" "$WORK/$shape-$spell.main.$rung.wasm" 2>&1)
-      rc=$?
-      [ $rc -eq 0 ] || { echo "FATAL: run rc=$rc $shape-$spell.$rung"; exit 1; }
-      [ "$got" = "$want" ] || { echo "FATAL: $shape-$spell.$rung printed [$got], want [$want]"; exit 1; }
-      got0=$("${RUNNER[@]}" "$WORK/$shape-$spell.ctl.$rung.wasm" 2>&1)
-      rc=$?
-      [ $rc -eq 0 ] || { echo "FATAL: control run rc=$rc $shape-$spell.$rung"; exit 1; }
-      [ "$got0" = "$want0" ] || { echo "FATAL: control $shape-$spell.$rung printed [$got0], want [$want0]"; exit 1; }
-    done
+for k in $KERNELS; do
+  shape="${k%%-*}"
+  want=$(want_of "$shape")
+  want0=$(want0_of "$shape")
+  for rung in $RUNGS; do
+    got=$("${RUNNER[@]}" "$WORK/$k.main.$rung.wasm" 2>&1)
+    rc=$?
+    [ $rc -eq 0 ] || { echo "FATAL: run rc=$rc $k.$rung"; exit 1; }
+    [ "$got" = "$want" ] || { echo "FATAL: $k.$rung printed [$got], want [$want]"; exit 1; }
+    got0=$("${RUNNER[@]}" "$WORK/$k.ctl.$rung.wasm" 2>&1)
+    rc=$?
+    [ $rc -eq 0 ] || { echo "FATAL: control run rc=$rc $k.$rung"; exit 1; }
+    [ "$got0" = "$want0" ] || { echo "FATAL: control $k.$rung printed [$got0], want [$want0]"; exit 1; }
   done
 done
-echo "   12 x 3 configurations produce their expected value, and their controls do not"
+echo "   $nk x 3 configurations produce their expected value, and their controls do not"
 
 # ── interleaved min-of-N ───────────────────────────────────────────────────
 declare -A MIN
 echo "== timing: $REPS interleaved reps, pin=$PIN =="
 for rep in $(seq 1 "$REPS"); do
-  for shape in $SHAPES; do
-    for spell in $SPELLINGS; do
-      for rung in $RUNGS; do
-        for v in main ctl; do
-          key="$shape/$spell/$rung/$v"
-          t0=$(date +%s%N)
-          "${RUNNER[@]}" "$WORK/$shape-$spell.$v.$rung.wasm" > /dev/null 2>&1
-          rc=$?
-          t1=$(date +%s%N)
-          [ $rc -eq 0 ] || { echo "FATAL: timed run rc=$rc $key"; exit 1; }
-          ns=$((t1 - t0))
-          cur="${MIN[$key]:-}"
-          if [ -z "$cur" ] || [ "$ns" -lt "$cur" ]; then MIN[$key]=$ns; fi
-        done
+  for k in $KERNELS; do
+    for rung in $RUNGS; do
+      for v in main ctl; do
+        key="$k/$rung/$v"
+        t0=$(date +%s%N)
+        "${RUNNER[@]}" "$WORK/$k.$v.$rung.wasm" > /dev/null 2>&1
+        rc=$?
+        t1=$(date +%s%N)
+        [ $rc -eq 0 ] || { echo "FATAL: timed run rc=$rc $key"; exit 1; }
+        ns=$((t1 - t0))
+        cur="${MIN[$key]:-}"
+        if [ -z "$cur" ] || [ "$ns" -lt "$cur" ]; then MIN[$key]=$ns; fi
       done
     done
   done
@@ -184,23 +193,23 @@ done
 # ── report ─────────────────────────────────────────────────────────────────
 echo
 echo "ns per inner-loop iteration ($ITERS iterations per run; control subtracted)"
-printf '%-8s %-7s %10s %10s %10s %8s\n' shape spelling none -O -O3 acc/iter
-for shape in $SHAPES; do
-  a=$(acc_of "$shape")
-  for spell in $SPELLINGS; do
-    row=""
-    for rung in $RUNGS; do
-      m=${MIN["$shape/$spell/$rung/main"]}
-      c=${MIN["$shape/$spell/$rung/ctl"]}
-      d=$((m - c))
-      if [ "$m" -lt $((c * ELIDE_FACTOR)) ]; then
-        echo "FATAL: $shape/$spell/$rung ran in ${m}ns against a ${c}ns control — kernel elided?"
-        exit 1
-      fi
-      row="$row $(awk -v d="$d" -v n="$ITERS" 'BEGIN{printf "%10.3f", d/n}')"
-    done
-    printf '%-8s %-7s%s %8d\n' "$shape" "$spell" "$row" "$a"
+printf '%-8s %-9s %10s %10s %10s %8s\n' shape spelling none -O -O3 acc/iter
+for k in $KERNELS; do
+  shape="${k%%-*}"
+  spell="${k#*-}"
+  row=""
+  for rung in $RUNGS; do
+    m=${MIN["$k/$rung/main"]}
+    c=${MIN["$k/$rung/ctl"]}
+    d=$((m - c))
+    if [ "$m" -lt $((c * ELIDE_FACTOR)) ]; then
+      echo "FATAL: $k/$rung ran in ${m}ns against a ${c}ns control — kernel elided?"
+      exit 1
+    fi
+    row="$row $(awk -v d="$d" -v n="$ITERS" 'BEGIN{printf "%10.3f", d/n}')"
   done
+  printf '%-8s %-9s%s %8d\n' "$shape" "$spell" "$row" "$(acc_of "$shape")"
 done
 echo
-echo "(view - buf) is the fence; (buf - hoist) is the wrapper call."
+echo 'At (none) read (accessor - buf) as the CHECK and (buf - hoist) as the CALL;'
+echo 'view additionally pays the bracket forwarding hop, which both rungs inline away.'
