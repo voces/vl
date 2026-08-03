@@ -39661,3 +39661,268 @@ instrument that could have found `FView`.
 * **A CENSUS ROW THAT READS ZERO IS A DELETED WORRY.** The find-side rung 2 — the one the slice was
   briefed to protect — parses 0 times in 237 reaches. Two consecutive slices have now found their
   cheapest fact in a column that read zero (#1327's `recordMvValTyIx`, this one's rung 2).
+
+## D-PRIMLEAF — row 4's parses are 65% ONE KEYWORD CLASS: the PRIMITIVE leaf answers before the annotation grammar, the canon recorder stays refuted (by REP now, not by spelling), and the corpus A/B is proved BLIND to the value it certifies (off master `b3d61549`)
+
+The brief for this slice was the filed route for bucket 1c: *a recorder written by CANON, banking
+each union member's `tyIx` at the point canon rewrites its spelling, so `unMemAtomTyIx` reads an
+index instead of re-parsing.* The instruction was to re-derive #1294 §8's 444/761 disagreement
+first, because that number is what makes the recorder canon's job rather than the checker's.
+
+It reproduces. It is also not the number that decides the row, and the mechanism it measures is
+not the one that was filed.
+
+### 1. THE DISAGREEMENT RE-DERIVED — 489 of 709, and it is a REP decision rather than a spelling one
+
+**PROBE ZZUM**, #1294 §8's instrument rebuilt: at every `recordUnMemTys` row whose name resolves
+through `cUserTypes` to a `TyUnion`, compare each member's bridge answer (`unMemAtomTyIx`) with
+the arena `uMembers` entry at the same index, under a strict structural walk (kind + every payload
+field, recursive, index-equality short-circuit, depth budget 12).
+
+```
+build:   (probe in emit_rep.vl, records raised through typecheck.tErr)
+         vl build compiler/entry.vl -o zzum.wasm --compiler <master fixpoint>
+run:     vl check --codegen tests/cases --compiler zzum.wasm > zz.out   # rc 1, the probe raises
+extract: grep -o 'ZZUM|[a-zA-Z0-9=|/]*' zz.out | tail -1
+```
+
+| | #1294 (`771abe09`) | this measurement (`b3d61549`) |
+| --- | ---: | ---: |
+| rows registered | 1,139 | **1,054** |
+| row name resolves / is `TyUnion` / member WIDTH matches | 391 / 391 / 391 | **310 / 310 / 310** |
+| comparable atoms | 761 | **709** |
+| agree | 317 | **220** |
+| **disagree** | **444 (58.3%)** | **489 (69.0%)** |
+| first witness | `K0/string bridge=string arena=…` | `ZZUMBAD\|K0\|string\|b=5\|a=32` |
+
+**THE FILING'S CONCLUSION HOLDS AND ITS MECHANISM DOES NOT.** #1294 attributed the disagreement to
+`canonEmitTypeNames` rewriting the spelling between the two readers — true, but too general to plan
+against. Tagging both sides with their arena KIND says what the rewrite IS:
+
+| bridge kind | arena kind | distinct records |
+|---|---|---:|
+| `TyPrim` string | `TyLit` str | 188 |
+| `TyPrim` i32 | `TyLit` int | 14 |
+| `TyPrim` f64 | `TyLit` flt | 3 |
+| `TyPrim` i32 | `TyUnion` | 2 |
+
+(Records, not reaches — `tErr` drops an exact repeat, so 207 distinct rows stand for the counter's
+489. The counter is the population; the table is its shape.)
+
+**Every disagreement but two is a LITERAL member read as its BASE SCALAR.** The checker's arena
+holds `"a"` and the emitter's member column holds `string`, because a literal union's box rep IS
+its base scalar — the two readers are not two encodings of one type, they are a type and a rep
+decision about it. That is the shape #1327's method note names (a column at 100% coverage that
+still changed 14.5% of its values), and it settles the route more sharply than the filing did:
+**a recorder banking the checker's index would not merely disagree with the bridge, it would hand
+the box-tag ABI a literal type where a scalar rep is required.** The canon recorder stays refused,
+now on rep grounds that no amount of spelling fidelity would fix.
+
+*The two `→ TyUnion` rows (`M`, `Y`) are a numeric literal union reached one arm deeper; the same
+rule, not a second family.*
+
+### 2. THE UNIT THAT DECIDES THE ROW — parses split by MINT, and 65% of row 4 is seven keywords
+
+#1331 added the third column (a parse that mints nothing) and left row 4 untouched at 1,229 parses,
+first by a wide margin. Splitting those 1,229 by whether `T.tys.length` grew across the call:
+
+| | parses | share |
+|---|---:|---:|
+| **MINT-FREE** | **804** | 65.4% |
+| minting | 425 | 34.6% |
+
+and the mint-free half is a closed vocabulary, not a long tail:
+
+| spelling | parses | | spelling | parses |
+|---|---:|---|---|---:|
+| `string` | 259 | | `boolean` | 76 |
+| `i32` | 152 | | `f32` | 22 |
+| `null` | 125 | | `Box<Node>` | 1 |
+| `i64` | 87 | | | |
+| `f64` | 82 | | **total** | **804** |
+
+**803 of the 804 are a bare PRIMITIVE KEYWORD**, and each resolves to a constant arena index in
+every one of the 1,727 corpus programs (`i32` 0 · `i64` 1 · `f64` 2 · `f32` 3 · `boolean` 4 ·
+`string` 5 · `null` 8) — the block the arena reset seeds with `mkPrim` before any annotation
+resolves. **A union member set is mostly scalars, and the emitter was running the annotation
+grammar to learn that `string` means `string`.**
+
+The 425 minting parses are the inline shapes (`{w:i32}` 73 · `{q:i64}` 18 · `{v:i32}` 13), the map
+spellings, the arrays and the closures. They are where the renumbering hazard lives, and this slice
+does not touch them.
+
+### 3. WHAT SHIPS — a third rung on the one bridge, and it is the checker's OWN leaf
+
+`typecheck.primTyOfName` is already documented as one of *"the three leaf rungs both resolvers
+bottom out at"* — a nominal lookup that *"inspects no character of its argument"*. It was private.
+It is now exported, and `declTyIxOfName` — #1331's one home for the emit-side name → arena bridge —
+asks it between the declared-name table and the grammar:
+
+```
+  rung 1   cUserTypes[nm]        the DECLARED name        (unchanged)
+  rung 2   primTyOfName(nm)      the PRIMITIVE leaf       <- this slice
+  rung 3   resolveAnnot(nm, …)   the annotation grammar   (unchanged)
+```
+
+`unMemAtomTyIx` had rungs 1 and 3 inline; it becomes a two-line caller of the bridge, and its
+empty-atom guard moves above the lookup (an empty spelling is not a declared name, so the probe it
+used to make could only ever miss).
+
+**THIS IS NOT A NEW COPY OF A RULE, WHICH IS THE WHOLE REASON IT IS ALLOWED.** A bare `i32` is a
+leaf: the grammar below takes it apart into nothing and arrives at `primTyOfName` itself. Rung 2 is
+the same lookup one call earlier — the D-SLOTARENA shape a fourth time (*the answer was already
+banked one rung below where it was being recomputed*), except the bank here is the arena's seeded
+prim block rather than a sidecar.
+
+### 4. THE DUAL-WRITE, ITS TOLERANCE, AND THE NEWTYPE GRADING
+
+Measured at the RAW ARENA INDEX — the tightest tolerance available, since equal indices make every
+consumer projection equal by construction — against the ladder's own answer, on the memo-HIT path
+as well as the parse path (the path where #1331's rung 1 failed):
+
+| site | reaches | rung 2 covers | **disagreements** | parses it removes |
+|---|---:|---:|---:|---:|
+| `unMemAtomTyIx` (row 4) | 1,991 | **1,481** | **0** | 803 |
+| `declTyIxOfName` (rows 3 · 6 · 7) | 9,819 | **2,447** | **0** | 151 |
+| `repElemKeyOfNameTy` (row 1) | 3,660 | **0** | — | 0 |
+
+Row 1's zero is COVERAGE, stated as a sentence rather than banked as a tick: a ref-list element is
+never spelled as a bare primitive, so the rung is not offered there and row 1 keeps asking the
+grammar for the reason #1331 gave it.
+
+**THE NEWTYPE-OVER-A-STRUCT GRADING IS A KEY-SPACE ARGUMENT, AND IT IS MEASURED RATHER THAN
+ASSERTED.** #1331 refused this bridge's rung 1 at `repElemKeyOfNameTy` because a positive
+`annotNameMemo` entry survives a `cUserTypes` rewrite, so a re-registered declaration
+(`type FView = new { … }`, `tests/cases/memory/newtype-struct-views-distinct.vl`) leaves the two
+tables holding different arena indices that key different `repElemKey`s — 4 divergences in 976.
+That mechanism needs a DECLARED name. Dumping every spelling rung 2 answers, corpus-wide:
+
+```
+extract: grep -o 'ZZCOV|[^ ]*' cov.out | sort -u
+  boolean · f32 · f64 · i32 · i64 · null · string
+```
+
+Seven names, no eighth. `FView` is not among them and no declaration can be spelled with a
+primitive keyword, so the skew has nothing to bite on. Independently: **0 of the 3,928 covered
+reaches carry a `cUserTypes` entry at all** (the `user=` counter), so rung 2 never preempts rung 1.
+
+### 5. THE CORPUS A/B IS VACUOUS FOR THIS FAMILY — and the FUZZER, for once, is the live channel
+
+The six-channel corpus A/B reads **1,727 of 1,727 SAME, 0 DIFF**. That reading is worth nothing
+here, and the slice says so with the commands that prove it:
+
+| build | corpus A/B (1,727 files) | **fuzz A/B (10,800 programs)** | the compiler's OWN source recompiled |
+|---|---|---|---|
+| **SHIP** | 1,727 SAME / 0 DIFF | **10,800 SAME / 0 DIFF** | **byte-identical to master** (`1c696d6e00da`) |
+| **SAB-SHIFT** — rung 2 returns `pi + 1` | **1,727 SAME / 0 DIFF** | **8,427 SAME / 2,373 DIFF** | **rc 1 — emits an INVALID MODULE** |
+| **SAB-NEG** — rung 2 returns -1 | **1,727 SAME / 0 DIFF** | — | byte-identical to master |
+
+**A SABOTAGE THAT BREAKS THE COMPILER MOVES NOTHING ON 1,727 CORPUS PROGRAMS.** SAB-SHIFT hands
+every primitive member the NEXT arena index (`i32`→`i64`, `string`→`void`, `null`→`never`); the
+corpus cannot see it on check rc, check diagnostics, build rc, build diagnostics, emitted bytes or
+run output, while `compiler/entry.vl` compiled by that same build fails validation outright.
+
+**THE SAME SABOTAGE MOVES 22% OF THE FUZZ CORPUS** — 2,373 of 10,800, spread evenly over all
+eighteen seed × depth × mode batches (109–170 per batch, none empty), flipping build rc, emitted
+bytes and run rc. So the ship build's 10,800 / 0 IS evidence, and the two channels have swapped
+their usual roles: the playbook's standing landmine is that the fuzzer's grammar cannot reach a
+construct the corpus does reach, and here it is the corpus that cannot see a value the fuzzer
+exercises 2,373 times. Union member sets of bare scalars are exactly what `fuzzgen.vl` builds.
+
+**SAB-NEG IS THE OTHER FAILURE MODE, AND IT IS THE ONE #1294's METHOD NOTE NAMES.** Returning -1
+looks destructive and is inert everywhere, because -1 is the column's self-healing "uncovered"
+sentinel: every consumer falls back to its legacy name path. It DISABLED the route instead of
+corrupting it, and a disabled route is not a wrong one. Two sabotages, two different reasons a zero
+means nothing — which is why the load-bearing evidence in §4 is a dual-write and not an A/B.
+
+### 6. THE LEDGER — and this time it IS additive
+
+| # | `emit_rep.vl` site | master | after | Δ |
+|---|---|---:|---:|---:|
+| 1 | `repElemKeyOfNameTy` | 463 | 463 | 0 |
+| 2 | `sTyIxOfNameTy` | 402 | 402 | 0 |
+| 4 | `unMemAtomTyIx` | **1,229** | **426** | **−803** |
+| 5 | `slotCanonKey` | 15 | 15 | 0 |
+| 3 · 6 · 7 | via `declTyIxOfName` | 691 | 540 | **−151** |
+| | **emit-side total** | **2,800** | **1,846** | **−954 (−34.1%)** |
+
+The master column reproduces #1331's published table on every row (463 · 402 · 1,229 · 15 ·
+494+25+172 = 691), which is the instrument's control.
+
+**#1331's redistribution does NOT recur, and the reason is worth keeping.** There, a site that
+stopped resolving also stopped MEMOIZING, so every other row's hit/miss split moved and only the
+total was additive. Rung 2 removes resolutions of spellings the CHECKER has already resolved in
+every program that mentions a type at all, so no memo entry that existed stops existing: the two
+untouched sites hold to the digit and the delta is exactly 803 + 151.
+
+**Row 4's residue is 426, and 425 of them MINT** — the one exception is the single `Box<Node>`. The
+row that was 40.5% of the emitter's annotation parsing is now, to within one parse, exactly the
+population whose skipping would renumber the arena. Whatever takes it next has to answer the mint
+question, not the spelling one.
+
+### 7. GATE — every rc taken BARE, never through a pipe
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,124,728 B** — master `b3d61549`'s own fixpoint, so the A/B baseline IS master's published compiler |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"NATIVE FIXPOINT HOLDS: compile(fixpoint) == fixpoint byte-for-byte"*, **1,124,591 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,124,591 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,675 passed · 0 failed · 7 ignored** — the ignored COUNT read first; 7, not ~600, so the env var took, and it is master's own count |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
+| corpus A/B, six channels, 1,727 files | — | 1,727 SAME / 0 DIFF — **and VACUOUS, §5** |
+| fuzz A/B, six channels, **10,800 programs** (seeds 3301-3303 × depths 4/5/6 × plain/`--branching --multiobs --declared`, generated once with master's compiler) | — | **10,800 SAME / 0 DIFF — and GRADED: the same sabotage moves 2,373 of them** |
+| the compiler's own source recompiled | 0 | **byte-identical to master's output** — the one channel §5 proves is live |
+
+**SEED BOOTSTRAP: no split needed** — the gate starts from a freshly fetched published `seed-latest`
+and it compiles this branch's source at the first self-compile.
+
+**BYTE DELTA: 1,124,728 → 1,124,591 = −137 B.** A rung added, an inline two-rung body deleted.
+
+### 8. THE EMIT-SIDE FRONTIER AFTER THIS SLICE
+
+| # | site | parses | status | what it needs |
+|---|---|---:|---|---|
+| 4 | `unMemAtomTyIx` | **426** | **425 of 426 MINT** | the mint question — a recorder that owns the arena index, not a name shortcut |
+| 1 | `repElemKeyOfNameTy` | 463 | blocked (#1331 §3) | the caller's type; 0 prim coverage, 76.7% at one blocked intern |
+| 2 | `sTyIxOfNameTy` | 402 | filed (#1294 §8) | `internInlineShapeTy(nm, tyIx)` — the D5 column beside the name |
+| 3 · 6 · 7 | via `declTyIxOfName` | 540 | — | composite spellings only |
+| 5 | `slotCanonKey` | 15 | — | the residue past the `sTyIx` column's end |
+| 1c | the CANON recorder | — | **REFUTED TWICE** | §1: it would bank a literal type where the box ABI needs a scalar rep |
+
+### METHOD NOTES
+
+* **A FILED BLOCKER CAN REPRODUCE AND STILL BE THE WRONG REASON.** 444/761 came back as 489/709,
+  and re-deriving it with the arena KIND on both sides turned "canon rewrote the spelling" into "a
+  literal member is read as its base scalar because that IS its box rep". The first framing invites
+  a spelling-fidelity fix; the second says no recorder on that side can ever be right. *Re-deriving
+  a number is not re-deriving its mechanism — tag both sides of a disagreement with what they ARE.*
+* **THE BIGGEST ROW IN A SCORECARD CAN BE MOSTLY A KEYWORD.** Row 4 held first place through three
+  units of measurement (reaches, parses, mint-free parses) and four slices of planning, and 65% of
+  it was seven primitive spellings resolving to a block the arena seeds before anything runs. Nobody
+  bucketed the row's parse population by TEXT until this slice. *Print the distinct inputs of a hot
+  path before designing the machinery that replaces it — it costs one counter and it can delete the
+  design.*
+* **`tErr` DEDUPES EXACT REPEATS, SO A RECORD COUNT IS NOT A COUNTER.** A per-site probe emitting
+  identical strings (`ZZPARSE|s=4`) read 481 for a population of 1,229 — one surviving record per
+  program — while the counter beside it was exact. The fix is to make every record unique (emit the
+  running tuple); the tell is a record count that is a suspiciously round fraction of the count it
+  should equal. *A probe channel that dedups silently converts a census into a distinct-value set;
+  check one site's records against its counter before trusting any of them.*
+* **BOTH INERTNESS CONTROLS FIRED, FOR OPPOSITE REASONS, ON THE SAME FIVE-LINE CHANGE.** A
+  corrupting sabotage that makes the compiler emit an invalid module moved 0 of 1,727 corpus
+  programs on six channels; a sabotage that reads like the harsher one merely disabled the route
+  through a self-healing -1. *Run the sabotage against the channel you intend to CITE — and when it
+  reads zero there, say the channel is vacuous instead of quietly keeping the clean zero.*
+* **THE CORPUS-REACHES / FUZZER-IS-BLIND ASYMMETRY RAN BACKWARDS HERE.** The standing landmine is
+  the other direction (`emitCapturedCall`: 25,200 fuzz programs inert, 2 corpus files live), and it
+  is easy to carry as a habit. On this family the identical sabotage reads 0 of 1,727 corpus files
+  and 2,373 of 10,800 fuzz programs. *Which channel is blind is a property of the FAMILY, not of the
+  harness — grade both every time, because the one you would have skipped is sometimes the only one
+  that can see.*
+* **A KEY SPACE CAN BE A SOUNDNESS ARGUMENT.** #1331 refused this bridge's rung 1 at one site over a
+  stale-memo skew with a named witness. Rung 2 is immune not because the skew was fixed but because
+  its keys are reserved words no declaration can be spelled with — and the way to show that is to
+  dump the rung's answered vocabulary over the whole corpus and count it (seven names), not to argue
+  it. *When a rung is refused for a mechanism, ask whether the next rung's key space can REACH that
+  mechanism before assuming it inherits the refusal.*
