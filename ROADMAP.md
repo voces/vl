@@ -81,6 +81,28 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 > — takes the emitter **3,031 → 2,800 parses (−7.6%)** at **+10 bytes**, corpus A/B 1,727/1,727
 > identical and fuzz 12,480/12,480 identical. *Measure the mint, not just the parse.*
 >
+> **#1332 TAKES THE EMITTER TO 1,846 PARSES (−34.1% in one slice) AND REFUTES THE CANON RECORDER A
+> SECOND TIME, ON REP GROUNDS.** Row 4 `unMemAtomTyIx` — first by parses at 1,229 — falls to **426**.
+> The briefed remedy was a recorder written by canon, and the 444/761 checker-vs-bridge disagreement
+> DOES reproduce (as **489 of 709, 69.0%**) — but re-deriving it with the arena KIND on both sides
+> changes what it means: **every disagreement but two is a `TyLit` read as its `TyPrim` base scalar**
+> (188 str · 14 int · 3 flt). That is a literal union's BOX REP, not an incidental spelling rewrite,
+> so a canon recorder would hand the box-tag ABI a literal type where a scalar rep is required.
+> *The disagreement is a rep decision, not a staleness bug.*
+>
+> What shipped instead came from bucketing the row's parses **by TEXT**, which no prior slice had
+> done: 804 of the 1,229 mint nothing, and **803 of those are a bare primitive keyword**. So the
+> majority needed a RUNG, not a recorder — `typecheck.primTyOfName`, already one of the three leaf
+> rungs both resolvers bottom out at, is now exported and asked between the declared-name table and
+> the grammar. The residue is **426, of which 425 MINT** — the row is now, to within one parse,
+> exactly the population whose skipping would renumber the arena. **−137 bytes.**
+>
+> Two instrument findings from it, both worth carrying: **the corpus A/B is VACUOUS for this family**
+> (a sabotage emitting an invalid module moves 0 of 1,727 corpus files on all six channels while
+> moving 2,373 of 10,800 fuzz programs — the usual asymmetry runs backwards), and **`tErr` dedupes
+> exact repeats**, so a probe reporting through the diagnostic channel silently reports a distinct-
+> value SET rather than a count (a first census read 481 for a population of 1,229).
+>
 > **And the briefed target was refuted by its own witness.** Row 1 `repElemKeyOfNameTy`'s FIND rung 2
 > parses **0 times in 237 reaches** — all 463 of its parses are at the INTERN, and 457 of them are
 > immediately followed by a row mint resolving the same spelling. Its one arena-neutral shortcut
