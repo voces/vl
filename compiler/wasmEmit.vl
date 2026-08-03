@@ -351,6 +351,15 @@ import {
   fbUnreachable,
   fbValtype,
   fbValtypeNullable,
+  lhBack,
+  lhKind,
+  lhLen,
+  lhLive,
+  lhName,
+  lhOpen,
+  lhScanName,
+  lhScanRep,
+  lhSlot,
   mapTypeIdxOf,
   mvValElemHeapOf,
   mvValsBackOf,
@@ -6269,6 +6278,79 @@ function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
   0
 }
 
+// The HOISTED twin of `emitListIdxGuard`, for an access whose receiver is a
+// binding with a live cached header. On entry the stack holds ONLY the index —
+// the receiver was never emitted, because the backing ref and `len` are already
+// in locals — and it leaves the same [backing, safeIndex] pair, with the same
+// `-1`-on-out-of-range meaning, that the general form leaves. The bounds check
+// is NOT weakened: it compares against the same `len` field, read once before
+// the loop instead of once per access.
+function emitListIdxGuardHoisted(row: i32) {
+  fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
+  fbLocalGet(lhBack[row])        // the cached backing (was `struct.get` field 0)
+  fbLocalGet(listIdxScratchBase)
+  fbI32Const(-1)                 // the out-of-range replacement index
+  fbLocalGet(listIdxScratchBase)
+  fbLocalGet(lhLen[row])         // the cached len (was `struct.get` field 1)
+  fbI32Bin(73)                   // 0x49 i32.lt_u
+  wU8(27)                        // 0x1b select → i if in-bounds else -1
+  0
+}
+
+// The live hoist row for an index receiver, or -1. THREE conditions, all
+// required: the receiver is a bare identifier (the prologue re-read exactly
+// that binding — a `Member`/`Call` receiver names no binding to cache), the row
+// is live (an enclosing loop opened it and has not closed it), and the row's
+// rep matches the arm asking. The rep check is the backstop that makes a
+// classifier disagreement between the prologue and the access DECLINE rather
+// than read a wrongly-typed local: the prologue cached whatever rep it resolved,
+// and an arm that resolved a different one falls through to the general guard.
+function liveHoistRow(exprIx: i32, kind: MfKind, slot: i32) {
+  if exprIx < 0 { return 0 - 1 }
+  const e = P.nodes[exprIx]
+  if e is Ident {
+    let k = 0
+    while k < lhName.length {
+      if (
+        lhLive[k] > 0 &&
+        lhName[k] == e.identName &&
+        lhKind[k] == kind &&
+        lhSlot[k] == slot
+      ) {
+        return k
+      }
+      k = k + 1
+    }
+  }
+  0 - 1
+}
+
+// Find (or mint) the hoist row for `name` at list rep (`kind`, `slot`). Minting
+// takes two slots of the lazy list frame — the backing ref (`liBack` 3, typed as
+// this kind's backing array) and the i32 `len` (`liBack` 4).
+function listHoistRow(name: string, kind: MfKind, slot: i32) {
+  let k = 0
+  while k < lhName.length {
+    if lhName[k] == name && lhKind[k] == kind && lhSlot[k] == slot { return k }
+    k = k + 1
+  }
+  liKinds.push(kind)
+  liSlots.push(slot)
+  liBack.push(3)
+  const bSlot = listIdxScratchBase + liKinds.length
+  liKinds.push(kind)
+  liSlots.push(slot)
+  liBack.push(4)
+  const lSlot = listIdxScratchBase + liKinds.length
+  lhName.push(name)
+  lhKind.push(kind)
+  lhSlot.push(slot)
+  lhBack.push(bSlot)
+  lhLen.push(lSlot)
+  lhLive.push(0)
+  lhName.length - 1
+}
+
 // The indexed-STORE value stash slot for list kind `kind` (`slot` = the
 // ref-list table slot for kind "ref", else 0) — a `liBack == 2` entry of the
 // same lazy list frame `listIdxWrapSlot` grows, typed as the element VALUE
@@ -6289,6 +6371,388 @@ function listIdxValSlot(kind: MfKind, slot: i32) {
   liSlots.push(slot)
   liBack.push(2)
   listIdxScratchBase + liKinds.length
+}
+
+// LIST-HEADER HOISTING — the soundness condition, and the whole of it.
+//
+// Across a loop body that cannot REALLOCATE a list, that list's backing-array
+// ref and `len` are loop-invariant, so they are read once into locals before the
+// loop and every access inside reads the locals instead of re-walking the
+// wrapper with two `struct.get`s. wasmtime re-loads both on every element access
+// and cannot hoist them itself — the ref SSA value differs each iteration, and
+// no optimiser will move a `struct.get` past an `array.set` it cannot prove
+// non-aliasing.
+//
+// ACCEPTED, in a body built only from literals, identifiers, parentheses, unary
+// and binary operators (assignment included), `o.f` reads, `x[i]` reads and
+// stores, `is`/`as`, and `if`/`while`/`for`/`return`/`break`/`continue`/`let`
+// over the same: `xs[i]` reads and `xs[i] = v` stores at any nesting depth, on a
+// binding declared OUTSIDE the loop, at any of the four scalar list reps, a ref
+// list, or a string list. An indexed STORE is accepted because `array.set`
+// changes neither the backing's identity nor `len`.
+//
+// DECLINED, each for a reason that would otherwise be a miscompile:
+//   - ANY call. `xs.push(v)` reallocates the backing and leaves a cached ref
+//     pointing at the ABANDONED array — a silently lost write — and any call at
+//     all can reach the list through a parameter, a capture or a global and push
+//     it there. Banning every call is what turns "cannot reallocate" into a
+//     local, syntactic question instead of an interprocedural one. This is also
+//     what declines `spectralnorm`'s inner loop, whose only offence is a call to
+//     a pure leaf function; recovering that case needs a callee summary and is
+//     deliberately not attempted here.
+//   - A `let`/`const` or loop variable REBINDING the spelling inside the body,
+//     or an assignment `xs = …`: either makes the body's `xs` a different
+//     wrapper than the one the prologue read.
+//   - A nullable receiver (`xs: i32[] | null`, narrowed). The prologue would
+//     have to recover non-null BEFORE the loop, moving a trap to a point the
+//     source does not guard.
+//   - Every shape not enumerated — lambdas, `match`, `o?.f`, list and object
+//     literals, nested declarations. This walk is a WHITELIST whose fall-through
+//     is DECLINE, so a construct added to the language later cannot silently
+//     license a stale header.
+function hoistSafeExpr(ix: i32): boolean {
+  if ix < 0 { return true }
+  const e = P.nodes[ix]
+  if e is NumLit { return true }
+  if e is StrLit { return true }
+  if e is CharLit { return true }
+  if e is BoolLit { return true }
+  if e is NullLit { return true }
+  if e is Ident { return true }
+  if e is Unary { return hoistSafeExpr(e.unArg) }
+  if e is Paren { return hoistSafeExpr(e.parInner) }
+  if e is IsExpr { return hoistSafeExpr(e.isObj) }
+  if e is AsExpr { return hoistSafeExpr(e.asObj) }
+  if e is Member { return hoistSafeExpr(e.memObj) }
+  if e is Index {
+    if !hoistSafeExpr(e.idxArr) { return false }
+    return hoistSafeExpr(e.idxIndex)
+  }
+  if e is BinExpr {
+    if !hoistSafeExpr(e.binLeft) { return false }
+    return hoistSafeExpr(e.binRight)
+  }
+  false
+}
+
+// The statement half of the whitelist. The fall-through hands an unrecognised
+// statement to the EXPRESSION walk (a bare expression statement is how an
+// assignment and a call both appear), which declines anything it does not know.
+function hoistSafeStmt(ix: i32): boolean {
+  if ix < 0 { return true }
+  const s = P.nodes[ix]
+  if s is LetDecl { return hoistSafeExpr(s.letInit) }
+  if s is RetStmt { return hoistSafeExpr(s.retArg) }
+  if s is BreakStmt { return true }
+  if s is ContinueStmt { return true }
+  if s is Block { return hoistSafeBlock(ix) }
+  if s is IfStmt {
+    if !hoistSafeExpr(s.ifCond) { return false }
+    if !hoistSafeStmt(s.ifThen) { return false }
+    return hoistSafeStmt(s.ifElse)
+  }
+  if s is WhileStmt {
+    if !hoistSafeExpr(s.whileCond) { return false }
+    return hoistSafeStmt(s.whileBody)
+  }
+  if s is ForRange {
+    if !hoistSafeExpr(s.frFrom) { return false }
+    if !hoistSafeExpr(s.frTo) { return false }
+    if !hoistSafeExpr(s.frStep) { return false }
+    return hoistSafeStmt(s.frBody)
+  }
+  if s is ForIn {
+    if !hoistSafeExpr(s.fiIter) { return false }
+    return hoistSafeStmt(s.fiBody)
+  }
+  hoistSafeExpr(ix)
+}
+
+function hoistSafeBlock(ix: i32): boolean {
+  if ix < 0 { return false }
+  const b = P.nodes[ix]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      if !hoistSafeStmt(stmts[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// True when `name` is REBOUND anywhere in the expression at `ix` — only an
+// `name = …` assignment can do that in an expression. Runs over an already
+// whitelisted body, so the enumeration matches `hoistSafeExpr`'s exactly.
+function exprReboundsName(ix: i32, name: string): boolean {
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    if e.binOp == "=" {
+      const lhs = P.nodes[e.binLeft]
+      if lhs is Ident {
+        if lhs.identName == name { return true }
+      }
+    }
+    if exprReboundsName(e.binLeft, name) { return true }
+    return exprReboundsName(e.binRight, name)
+  }
+  if e is Unary { return exprReboundsName(e.unArg, name) }
+  if e is Paren { return exprReboundsName(e.parInner, name) }
+  if e is IsExpr { return exprReboundsName(e.isObj, name) }
+  if e is AsExpr { return exprReboundsName(e.asObj, name) }
+  if e is Member { return exprReboundsName(e.memObj, name) }
+  if e is Index {
+    if exprReboundsName(e.idxArr, name) { return true }
+    return exprReboundsName(e.idxIndex, name)
+  }
+  false
+}
+
+// True when `name` is REBOUND anywhere in the statement at `ix`: a `let`/`const`
+// that shadows it, a loop variable that takes the spelling, or an assignment to
+// it. Any of the three means the body's `name` is not the wrapper the prologue
+// cached.
+function stmtReboundsName(ix: i32, name: string): boolean {
+  if ix < 0 { return false }
+  const s = P.nodes[ix]
+  if s is LetDecl {
+    if s.letName == name { return true }
+    return exprReboundsName(s.letInit, name)
+  }
+  if s is RetStmt { return exprReboundsName(s.retArg, name) }
+  if s is BreakStmt { return false }
+  if s is ContinueStmt { return false }
+  if s is Block { return blockReboundsName(ix, name) }
+  if s is IfStmt {
+    if exprReboundsName(s.ifCond, name) { return true }
+    if stmtReboundsName(s.ifThen, name) { return true }
+    return stmtReboundsName(s.ifElse, name)
+  }
+  if s is WhileStmt {
+    if exprReboundsName(s.whileCond, name) { return true }
+    return stmtReboundsName(s.whileBody, name)
+  }
+  if s is ForRange {
+    if s.frVar == name { return true }
+    if exprReboundsName(s.frFrom, name) { return true }
+    if exprReboundsName(s.frTo, name) { return true }
+    if exprReboundsName(s.frStep, name) { return true }
+    return stmtReboundsName(s.frBody, name)
+  }
+  if s is ForIn {
+    if s.fiVar == name { return true }
+    if exprReboundsName(s.fiIter, name) { return true }
+    return stmtReboundsName(s.fiBody, name)
+  }
+  exprReboundsName(ix, name)
+}
+
+function blockReboundsName(ix: i32, name: string): boolean {
+  if ix < 0 { return false }
+  const b = P.nodes[ix]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      if stmtReboundsName(stmts[i], name) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Record one index RECEIVER identifier and the `Index` node it was seen on. The
+// representative node is what the rep classifiers are asked about later, so the
+// first sighting is kept — every later sighting of the same spelling in this
+// body names the same binding (the caller has already established the body does
+// not rebind it).
+function hoistScanAdd(name: string, idxIx: i32) {
+  let i = 0
+  while i < lhScanName.length {
+    if lhScanName[i] == name { return 0 }
+    i = i + 1
+  }
+  lhScanName.push(name)
+  lhScanRep.push(idxIx)
+  0
+}
+
+function hoistScanExpr(ix: i32) {
+  if ix < 0 { return 0 }
+  const e = P.nodes[ix]
+  if e is Index {
+    const recv = P.nodes[e.idxArr]
+    if recv is Ident { hoistScanAdd(recv.identName, ix) }
+    hoistScanExpr(e.idxArr)
+    hoistScanExpr(e.idxIndex)
+    return 0
+  }
+  if e is Unary { return hoistScanExpr(e.unArg) }
+  if e is Paren { return hoistScanExpr(e.parInner) }
+  if e is IsExpr { return hoistScanExpr(e.isObj) }
+  if e is AsExpr { return hoistScanExpr(e.asObj) }
+  if e is Member { return hoistScanExpr(e.memObj) }
+  if e is BinExpr {
+    hoistScanExpr(e.binLeft)
+    return hoistScanExpr(e.binRight)
+  }
+  0
+}
+
+function hoistScanStmt(ix: i32) {
+  if ix < 0 { return 0 }
+  const s = P.nodes[ix]
+  if s is LetDecl { return hoistScanExpr(s.letInit) }
+  if s is RetStmt { return hoistScanExpr(s.retArg) }
+  if s is Block { return hoistScanBlock(ix) }
+  if s is IfStmt {
+    hoistScanExpr(s.ifCond)
+    hoistScanStmt(s.ifThen)
+    return hoistScanStmt(s.ifElse)
+  }
+  if s is WhileStmt {
+    hoistScanExpr(s.whileCond)
+    return hoistScanStmt(s.whileBody)
+  }
+  if s is ForRange {
+    hoistScanExpr(s.frFrom)
+    hoistScanExpr(s.frTo)
+    hoistScanExpr(s.frStep)
+    return hoistScanStmt(s.frBody)
+  }
+  if s is ForIn {
+    hoistScanExpr(s.fiIter)
+    return hoistScanStmt(s.fiBody)
+  }
+  hoistScanExpr(ix)
+}
+
+function hoistScanBlock(ix: i32) {
+  if ix < 0 { return 0 }
+  const b = P.nodes[ix]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      hoistScanStmt(stmts[i])
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Resolve the list rep of an index receiver into a hoist row, or -1 when this
+// receiver is not one of the reps the guard hoists. The cascade is `emitIndex`'s
+// own, in `emitIndex`'s order, so a row is only ever minted for a rep whose
+// access path the hoisted guard can actually serve — and the nullable arms,
+// checked FIRST exactly as they are there, decline.
+function hoistRowOfRecv(recvIx: i32, name: string, fnIx: i32) {
+  if exprNulScalarListKind(recvIx, fnIx) != null { return 0 - 1 }
+  if exprRefArray(recvIx, fnIx) {
+    if exprNullableRefArray(recvIx, fnIx) { return 0 - 1 }
+    if !raUsed { return 0 - 1 }
+    return listHoistRow(name, "ref", refListSlotOfExpr(recvIx, fnIx))
+  }
+  if exprNulStrArray(recvIx, fnIx) || exprStringArray(recvIx, fnIx) {
+    if !slUsed { return 0 - 1 }
+    return listHoistRow(name, "str", 0)
+  }
+  const ek = scalarListElemKind(recvIx, fnIx)
+  if ek != null {
+    if !scalarListUsed(ek) { return 0 - 1 }
+    return listHoistRow(name, listIdxKindOf(ek), 0)
+  }
+  0 - 1
+}
+
+// The wrapper struct type index a row's header is read out of — the mirror of
+// `hoistRowOfRecv`'s rep decision, and the type the prologue's two `struct.get`s
+// carry.
+function hoistWrapTyOfRow(row: i32) {
+  const k = lhKind[row]
+  if k == "ref" { return rlWrapIdx[lhSlot[row]] }
+  if k == "str" { return mkListIdx }
+  if k == "f64" { return scalarListWrap("f64") }
+  if k == "i64" { return scalarListWrap("i64") }
+  if k == "f32" { return scalarListWrap("f32") }
+  scalarListWrap("i32")
+}
+
+// Open the hoists for one loop: scan its body, and for every index receiver that
+// survives the soundness conditions read its header into the row's two locals.
+// Returns the number of rows this loop activated (its own `loopHoistClose`
+// argument), or -1 if the prologue failed to lower.
+//
+// A row already live from an ENCLOSING loop is skipped rather than re-read: the
+// outer body being hoist-safe makes every nested statement hoist-safe too, so
+// the outer cache is still valid and re-reading it inside would cost exactly
+// what the inner hoist saves.
+// `condIx` is the loop's per-iteration CONDITION (-1 when the loop form has
+// none). It is held to the same standard as the body and scanned with it: a
+// `while f() { … }` re-runs `f` on every iteration, so a condition that can
+// reallocate defeats the hoist exactly as a body that can would.
+//
+// `ownVar` is the loop's own variable, which the body sees as a fresh binding —
+// never a candidate.
+function loopHoistOpen(
+  body: i32[],
+  condIx: i32,
+  bodyIx: i32,
+  fnIx: i32,
+  ownVar: string,
+) {
+  if !hoistSafeExpr(condIx) { return 0 }
+  if !hoistSafeBlock(bodyIx) { return 0 }
+  lhScanName = []
+  lhScanRep = []
+  hoistScanExpr(condIx)
+  hoistScanBlock(bodyIx)
+  let opened = 0
+  let i = 0
+  while i < lhScanName.length {
+    const nm = lhScanName[i]
+    let ok = nm != ownVar
+    if ok && exprReboundsName(condIx, nm) { ok = false }
+    if ok && blockReboundsName(bodyIx, nm) { ok = false }
+    if ok {
+      const rep = P.nodes[lhScanRep[i]]
+      if rep is Index {
+        const row = hoistRowOfRecv(rep.idxArr, nm, fnIx)
+        if row >= 0 && lhLive[row] == 0 {
+          const wrapTy = hoistWrapTyOfRow(row)
+          const savedHF32 = pendingF32
+          pendingF32 = false
+          if emitExpr(body, rep.idxArr, fnIx) < 0 { return 0 - 1 }
+          fbStructGet(wrapTy, 0) // field 0: backing
+          fbLocalSet(lhBack[row])
+          if emitExpr(body, rep.idxArr, fnIx) < 0 { return 0 - 1 }
+          fbStructGet(wrapTy, 1) // field 1: len
+          fbLocalSet(lhLen[row])
+          pendingF32 = savedHF32
+          lhLive[row] = 1
+          lhOpen.push(row)
+          opened = opened + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  opened
+}
+
+// Close the `n` rows this loop opened, innermost first.
+function loopHoistClose(n: i32) {
+  let i = 0
+  while i < n {
+    const row = lhOpen[lhOpen.length - 1]
+    lhOpen.pop()
+    lhLive[row] = 0
+    i = i + 1
+  }
+  0
 }
 
 function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
@@ -6340,11 +6804,17 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
         )
       }
       const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
-      if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
-      // A NULLABLE ref-array receiver (`t: i32[][] | null`, kind 18, narrowed) reads `(ref null …)` —
-      // recover non-null before `struct.get` (the `if t != null` guard makes this safe).
-      if exprNullableRefArray(nd.idxArr, fnIx) {
-        wU8(212) // 0xd4 ref.as_non_null
+      // A live hoist row serves this access's header from locals, so the
+      // RECEIVER is not emitted at all — the prologue before the loop read it
+      // once. Only the index goes on the stack.
+      const rlHz = liveHoistRow(nd.idxArr, "ref", rslot)
+      if rlHz < 0 {
+        if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+        // A NULLABLE ref-array receiver (`t: i32[][] | null`, kind 18, narrowed) reads `(ref null …)` —
+        // recover non-null before `struct.get` (the `if t != null` guard makes this safe).
+        if exprNullableRefArray(nd.idxArr, fnIx) {
+          wU8(212) // 0xd4 ref.as_non_null
+        }
       }
       // THE INDEX IS ALWAYS i32 — every index arm here clears `pendingF32` around it, else
       // a bare index literal emits as `f32.const`. It bites on an INNER read `g[i][j]` over
@@ -6355,7 +6825,11 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
       pendingF32 = savedRlIxF32
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
-      emitListIdxGuard(listIdxWrapSlot("ref", rslot), rlWrapIdx[rslot])
+      if rlHz >= 0 {
+        emitListIdxGuardHoisted(rlHz)
+      } else {
+        emitListIdxGuard(listIdxWrapSlot("ref", rslot), rlWrapIdx[rslot])
+      }
       fbArrayGet(rlBackIdx[rslot]) // 0xfb 0x0b <this slot's ref backing array>
       // A NULLABLE-NICHE element legitimately holds null, so the read STAYS `(ref null $elem)` — no
       // `ref.as_non_null` recover (the bound `e` is the niche the caller narrows with `e != null`). The
@@ -6375,9 +6849,16 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
           "emitProgram: string index access but string list type not collected",
         )
       }
-      if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+      const nsHz = liveHoistRow(nd.idxArr, "str", 0)
+      if nsHz < 0 {
+        if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+      }
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
-      emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
+      if nsHz >= 0 {
+        emitListIdxGuardHoisted(nsHz)
+      } else {
+        emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
+      }
       fbArrayGet(mkArrIdx) // 0xfb 0x0b <string backing> — kept `(ref null $aTypeIdx)` (nullable)
       return 0
     }
@@ -6390,10 +6871,17 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
           "emitProgram: string index access but string list type not collected",
         )
       }
-      if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+      const slHz = liveHoistRow(nd.idxArr, "str", 0)
+      if slHz < 0 {
+        if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+      }
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
-      emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
+      if slHz >= 0 {
+        emitListIdxGuardHoisted(slHz)
+      } else {
+        emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
+      }
       fbArrayGet(mkArrIdx) // 0xfb 0x0b <string backing array type index>
       wU8(212)             // 0xd4 ref.as_non_null (recover the non-null string)
       return 0
@@ -6406,17 +6894,24 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       if !scalarListUsed(ek) {
         return emitFail("emitProgram: index access but list type not collected")
       }
-      if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+      const skHz = liveHoistRow(nd.idxArr, listIdxKindOf(ek), 0)
+      if skHz < 0 {
+        if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+      }
       // The index is always i32 (see the ref-array arm above).
       const savedIxF32 = pendingF32
       pendingF32 = false
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
       pendingF32 = savedIxF32
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
-      emitListIdxGuard(
-        listIdxWrapSlot(listIdxKindOf(ek), 0),
-        scalarListWrap(ek),
-      )
+      if skHz >= 0 {
+        emitListIdxGuardHoisted(skHz)
+      } else {
+        emitListIdxGuard(
+          listIdxWrapSlot(listIdxKindOf(ek), 0),
+          scalarListWrap(ek),
+        )
+      }
       fbArrayGet(scalarListBack(ek)) // yields the element in its rep
       return 0
     }
@@ -9796,7 +10291,15 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       // stale len (a grow-into-bounds store trapped). The value parks in a
       // typed `liBack == 2` stash across the guard — no user code runs between
       // its write and the `array.set`, so the shared slot is clobber-safe.
-      if emitExpr(body, target.idxArr, fnIx) < 0 { return -1 }
+      //
+      // A live hoist row skips the receiver entirely and guards against the
+      // CACHED header. Resolving late buys nothing there and costs nothing:
+      // hoisting is licensed only for a loop with no calls at all, so no RHS
+      // under it can reallocate the target.
+      const stHz = liveHoistRow(target.idxArr, idxKind, idxSlot)
+      if stHz < 0 {
+        if emitExpr(body, target.idxArr, fnIx) < 0 { return -1 }
+      }
       if emitExpr(body, target.idxIndex, fnIx) < 0 { return -1 }
       pendingStructIdx = storeStructIdx
       if storeUnionNm != "" {
@@ -9847,7 +10350,11 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       fbLocalSet(storeValSlot) // 0x21 — park the value under the guard operands
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
       // [backing, safeIndex] resolved AFTER the value ran.
-      emitListIdxGuard(listIdxWrapSlot(idxKind, idxSlot), lTy)
+      if stHz >= 0 {
+        emitListIdxGuardHoisted(stHz)
+      } else {
+        emitListIdxGuard(listIdxWrapSlot(idxKind, idxSlot), lTy)
+      }
       fbLocalGet(storeValSlot) // 0x20 — the parked value
       fbArraySet(aTy)          // 0xfb 0x0e <backing array type index>
       return 0
@@ -12371,6 +12878,13 @@ function emitWhileStmtStmt(body: i32[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   // relative `br` depth: the BLOCK is the `break` target (resume after the loop),
   // the LOOP is the `continue` target (re-check the condition). Push the ABSOLUTE
   // `ctrlDepth` of each frame; a branch site at depth D uses `D - <that depth>`.
+  //
+  // The list-header hoists open BEFORE the block: their prologue runs once, and
+  // a loop that never iterates simply leaves them unread (reading a non-null
+  // wrapper's fields cannot trap, so moving them out of the loop cannot move a
+  // trap into one).
+  const whHoist = loopHoistOpen(body, s.whileCond, s.whileBody, fnIx, "")
+  if whHoist < 0 { return -1 }
   fbBlock(64) // 0x02 block, 0x40 void blocktype
   ctrlEnter()
   loopBrkDepth.push(ctrlDepth)
@@ -12394,6 +12908,7 @@ function emitWhileStmtStmt(body: i32[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   ctrlLeave()
   loopBrkDepth.pop()
   loopBrkLabel.pop()
+  loopHoistClose(whHoist)
   return 0
 }
 
@@ -12463,6 +12978,12 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   fbLocalSet(vIdx)
   if emitExpr(body, s.frTo, fnIx) < 0 { return -1 }
   fbLocalSet(bIdx)
+  // The hoist prologue runs AFTER the range bounds (whose expressions may do
+  // anything) and BEFORE the loop variable is bound, so its receiver reads
+  // resolve in the enclosing scope. `frVar` itself is never a candidate — the
+  // body sees it as a fresh i32 binding.
+  const frHoist = loopHoistOpen(body, -1, s.frBody, fnIx, s.frVar)
+  if frHoist < 0 { return -1 }
   // Bind the loop var for the body (mirrors the collect pass's scopeBind).
   scopeBind(s.frVar, vSlot)
   fbBlock(64) // 0x02 block, void
@@ -12518,6 +13039,7 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   ctrlLeave()
   loopBrkDepth.pop()
   loopBrkLabel.pop()
+  loopHoistClose(frHoist)
   // The loop variable's scope is the loop (see `scopeUnbind`).
   scopeUnbind()
   return 0

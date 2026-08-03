@@ -6,6 +6,7 @@
 
 import { f32Bytes, f64Bytes, gIeeeOverflow } from "./emit_bignum"
 import {
+  MfKind,
   VKind,
   W,
   aTypeIdx,
@@ -973,8 +974,50 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   liKinds = []
   liSlots = []
   liBack = []
+  lhName = []
+  lhKind = []
+  lhSlot = []
+  lhBack = []
+  lhLen = []
+  lhLive = []
+  lhOpen = []
+  lhScanName = []
+  lhScanRep = []
   fbScratchCur
 }
+// LIST-HEADER HOIST rows. A row caches one binding's list header — the backing
+// array ref and `len` — in two locals of the lazy list frame, so an index
+// lowering inside a loop that provably cannot reallocate that list reads them
+// with a `local.get` instead of re-walking the wrapper with two `struct.get`s
+// per access.
+//
+//   lhName/lhKind/lhSlot — the binding spelling and its list rep (`lhSlot` is
+//     the ref-list table slot for kind "ref", 0 otherwise). The triple is the
+//     row key: two same-named bindings of DIFFERENT rep get different rows, so
+//     a row's slot types always match the header it caches.
+//   lhBack/lhLen        — the two frame locals (`liBack` 3 and 4).
+//   lhLive              — how many enclosing loops opened this row. Positive
+//     means the locals hold this binding's live header and an index lowering
+//     may read them; zero means they are stale and must not be.
+//
+// Rows outlive the loop that minted them (their locals are declared once per
+// function and two disjoint loops over the same binding share them); `lhLive`
+// is the only thing that scopes a cached header, and `fbBeginFunc` clears the
+// whole table because slot indices are per-function.
+export let lhName: string[] = []
+export let lhKind: MfKind[] = []
+export let lhSlot: i32[] = []
+export let lhBack: i32[] = []
+export let lhLen: i32[] = []
+export let lhLive: i32[] = []
+// The rows each open loop activated, innermost last — `loopHoistClose` pops the
+// count its own `loopHoistOpen` returned.
+export let lhOpen: i32[] = []
+// Scratch for the candidate scan: the distinct identifiers used as an index
+// RECEIVER in the loop body being considered, each with one representative
+// `Index` node (the node the rep classifiers are asked about).
+export let lhScanName: string[] = []
+export let lhScanRep: i32[] = []
 // One (1, i32) run — `0x7f`.
 export function fbI32Run() {
   wU8(1)
@@ -1315,15 +1358,18 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   // typed slot per entry (ref slots NULLABLE so they are defaultable) —
   // a WRAPPER ref for a bounds-check slot (`liBack` 0), the raw BACKING array
   // ref for a chunked-literal destination (`liBack` 1; a string literal's
-  // "i32" backing is the code-point array itself, `aTypeIdx`), or the element
+  // "i32" backing is the code-point array itself, `aTypeIdx`), the element
   // VALUE for an indexed-store stash (`liBack` 2 — the scalar valtype, the
-  // nullable string ref, or the slot's nullable element ref).
+  // nullable string ref, or the slot's nullable element ref), the HOISTED
+  // backing ref of a cached list header (`liBack` 3 — the same backing typing
+  // as 1, since it holds the same `struct.get 0` result), or that header's
+  // hoisted `len` (`liBack` 4 — always i32).
   if liKinds.length > 0 {
     fbI32Run()
     let lix = 0
     while lix < liKinds.length {
       const lk = liKinds[lix]
-      if liBack[lix] == 1 {
+      if liBack[lix] == 1 || liBack[lix] == 3 {
         match lk {
           "f64" => fbRefNullRun(fa64TypeIdx)
           "i64" => fbRefNullRun(ia64TypeIdx)
@@ -1332,6 +1378,8 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
           "str" => fbRefNullRun(mkArrIdx)
           "i32" => fbRefNullRun(aTypeIdx)
         }
+      } else if liBack[lix] == 4 {
+        fbI32Run()
       } else if liBack[lix] == 2 {
         match lk {
           "f64" => fbF64Run()

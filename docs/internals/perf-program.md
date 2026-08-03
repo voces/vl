@@ -2477,3 +2477,231 @@ source directly — the change adds no language surface, only two byte emitters.
 - **`return_call_indirect` is now available and unused.** P1 (#1324) emits `return_call`
   for a direct call in tail position; a function-value call in tail position could take
   `return_call_indirect` (`0x13`) by the same rule. Not attempted here.
+
+## 14. PERF item P5 — the list header stops being re-read once per element access
+
+`compiler/wasmEmit.vl emitListIdxGuard` re-loads a list's backing-array ref
+(`struct.get 0`) **and** its `len` (`struct.get 1`) on every single element
+access. §4.5 of the landscape bisected 9.9% of `matmul` to exactly that, and
+nothing downstream recovers it: the ref SSA value differs each iteration, so
+Cranelift can neither GVN the length load nor LICM the object-size chain, and
+`wasm-opt -O3` will not move a `struct.get` past an `array.set` it cannot prove
+non-aliasing. V8 hoists it for free, which is why the same bytes cost 408 ms
+there and 424+ here.
+
+Across a loop that provably cannot REALLOCATE the list, both fields are now read
+once into locals before the loop, and every access inside reads the locals.
+
+### 14.1 The soundness condition, which is the whole of the work
+
+The condition is deliberately **syntactic and local**. `hoistSafeExpr` /
+`hoistSafeStmt` are a WHITELIST whose fall-through is DECLINE, so a construct
+added to the language later cannot silently license a stale header — the same
+discipline `blockHasArrNew` learned the hard way when an unenumerated statement
+shape left a frame unreserved.
+
+ACCEPTED — a body built only from literals, identifiers, parentheses, unary and
+binary operators (assignment included), `o.f` reads, `x[i]` reads and stores,
+`is`/`as`, and `if`/`while`/`for`/`return`/`break`/`continue`/`let` over the
+same. Inside such a body: `xs[i]` reads and `xs[i] = v` stores at any depth, on
+a binding declared OUTSIDE the loop, at any of the four scalar list reps, a ref
+list, or a string list. An indexed STORE is accepted because `array.set` changes
+neither the backing's identity nor `len`.
+
+DECLINED, each because the alternative is a miscompile:
+
+- **Any call at all.** `xs.push(v)` reallocates the backing and leaves a cached
+  ref pointing at the ABANDONED array — a silently lost write — and any call can
+  reach the list through a parameter, a capture or a global and push it there.
+  Banning every call is what makes "cannot reallocate" a local question instead
+  of an interprocedural one.
+- **A rebinding** — a `let`/`const` or loop variable taking the spelling, or an
+  assignment `xs = …`. The body's `xs` would not be the wrapper the prologue read.
+- **A nullable receiver** (`xs: i32[] | null`, narrowed). The prologue would have
+  to recover non-null BEFORE the loop, moving a trap ahead of the source's guard.
+- **Every shape not enumerated** — lambdas, `match`, `o?.f`, list and object
+  literals, nested declarations.
+
+A `while`'s CONDITION is held to the same standard as its body, because it
+re-runs every iteration. Hoisting out of a loop that may run **zero** times is
+safe because the prologue only reads two fields of a non-null wrapper, which
+cannot trap on its own.
+
+Two shapes are declined that a stronger analysis would keep, and both are
+recorded rather than hidden. `algorithms/spectralnorm`'s inner loop is declined
+for a call to `aij`, a pure leaf function — recovering it needs a callee summary
+(no push, no assignment to a non-local) and is not attempted. `for … in <list>`
+loops do not open hoists at all; only `while` and `for … to …` do.
+
+### 14.2 The fixture has teeth — measured, not asserted
+
+`tests/cases/arrays/list-header-hoist-grid.vl` is six must-decline shapes and six
+must-hoist ones. Every declining case is written so a wrong hoist is LOUD. That
+was verified by SABOTAGE, in a throwaway worktree so no artifact was restored by
+rebuilding it (the playbook's rule):
+
+| sabotage | effect on the grid |
+|---|---|
+| delete the CALL decline (one line) | case 1 `pushThenRead` **traps**: `out of bounds array access`, a fresh index guarded against a stale `len` |
+| neuter the REBIND decline | case 2 `reassignInLoop` prints **3 instead of 21** — exit 0, no trap, a silent wrong answer |
+
+The second is the one that matters: without it the grid would have pinned only
+the loud failure mode.
+
+### 14.3 What it measures
+
+Min-of-5, A/B interleaved inside each rep, `taskset -c 2-5`, load 2.4–3.5.
+**Noise floor 0.49%** from a probe with IDENTICAL bytes on both sides — and a
+second, free floor probe: `algorithms/nbody` compiled **byte-identically** on both
+sides and read **1.0000**.
+
+| benchmark | A (HEAD) | B (P5) | B/A default | B/A `-O3` |
+|---|--:|--:|--:|--:|
+| `arrays/reverse-inplace` | 2174 | 1725 | **0.794** | 0.999 |
+| `arrays/sort-heap` | 931 | 846 | **0.909** | 0.848 |
+| `arrays/fill-sum` | 1023 | 931 | **0.910** | 0.989 |
+| `arrays/struct-soa` | 1220 | 1115 | **0.914** | 1.001 |
+| `arrays/matmul` | 1602 | 1487 | **0.928** | 1.008 |
+| `arrays/struct-aos` | 1474 | 1394 | 0.946 | 0.908 |
+| `arrays/binsearch` | 1292 | 1235 | 0.956 | 1.032 |
+| `algorithms/spectralnorm` | 2573 | 2572 | 1.000 (declined) | 0.984 |
+| `algorithms/nbody` | 3060 | 3059 | 1.000 (identical bytes) | 1.005 |
+| `algorithms/mandelbrot` | 3274 | 3303 | 1.009 | 1.006 |
+| `algorithms/binarytrees` | 4342 | 4293 | 0.989 | 1.020 |
+| `arrays/push-growth` | 523 | 538 | 1.029 → see below | 0.996 |
+
+`matmul` lands at **−7.2%** against the prototype's 9.9%. The `-O3` column is a
+different claim and is stated separately: it is mostly neutral, because `-O3` was
+already a wash on this category (P11), and the two rows that do move there
+(`sort-heap` 0.848, `struct-aos` 0.908) are the ones whose kernels survive
+inlining. Every `-O3` module was asserted byte-different from its `-O0` twin, so
+none of that column is the silent `wasm-opt`-missing no-op.
+
+**THE NOISE FLOOR IS PER-BENCHMARK, NOT PER-RIG — and that is what `push-growth`
+turned out to be.** Its +2.9% was re-measured min-of-9 and read **+0.77%**; in
+that run the same-bytes floor probe was built from `push-growth`'s own bytes and
+read **−2.1%**. A floor probe made of `matmul` bytes (0.49%) does not bound the
+variance of the most allocation-heavy benchmark in the suite. Two runs giving
++2.9% and +0.77% against a 2.1% floor is **not resolvable**, and it is reported
+as unresolved rather than as a regression or as noise. The mechanism that would
+make it real does exist — the transform adds a ref local to the frame, and every
+GC safepoint scans the stack map — so it is worth re-testing on a quiet box.
+
+### 14.4 The loop-shape gate fired, and this time it was the probe's own function
+
+`tests/selfhost_native_release_test.ts` moved `binsearch-probe`'s `none` row
+`6,3,8 → 6,3,6`. Per the gate's own instruction the golden was not touched until
+per-function counts were in hand, and they say something different from #1328's
+firing:
+
+    $0  bsearch      rot=0   carried 8 -> 6    <- the only row that moved
+    $1  (helper)     rot=0   carried 4 -> 4, second loop 2 -> 2
+    $3  (helper)     rot=1   carried 2 -> 2
+    $4  (helper)     rot=1   carried 1 -> 1 (twice)
+
+**Tightening the counter to the probe's own functions would NOT have suppressed
+this one** — the function that moved IS `bsearch`. So the filed tightening stays
+filed and is not the fix here. What moved is legitimate and benign: `loops` and
+`rotated` are unchanged, the loop that moved is UNROTATED at `none`, and the two
+values that left its carried set are the list-index frame slots the bounds guard
+used to write per access. FEWER carried is the direction the gate's own model
+calls faster, and `bench/arrays/binsearch` agrees (1292 → 1235 ms). `-O` and
+`-O3` are identical on both sides at 3,3,6.
+
+### 14.5 Gates
+
+| leg | result |
+|---|---|
+| freshly fetched `seed-latest` → `refresh-compiler.sh --prove-fixpoint` | rc 0 — **no bootstrap split needed** |
+| `native-fixpoint.sh` | rc 0, stage3 == stage4 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **3677 passed / 0 failed / 7 ignored** |
+| `lint-self.sh` | rc 0 (lint + fmt) |
+| `rep-fuzz-check.sh` | rc 0, exact — 0 new, 0 stale |
+| corpus A/B, six channels, 1728 files | **22 changed bytes; all 22 differ ONLY on the wasm hash and the byte count in `wrote …`. check rc, check diagnostics, build rc, run rc and run stdout identical on all 1728.** |
+| fuzz A/B, seeds 3/11/29/47 | identical finding sets — **but see below** |
+
+**The published `seed-latest` IS HEAD's fixpoint byte-for-byte** (`compile(seed)
+== seed`, 1,124,728 bytes), so the A side of every comparison here is exactly
+HEAD's compiler rather than an approximation of it. The branch's own fixpoint is
+1,135,127 bytes: **+10,399 (+0.92%)**.
+
+**THE FUZZ A/B IS STRUCTURALLY INERT FOR THIS CHANGE, and the identical finding
+sets are therefore not evidence for it.** Measured, not assumed: a 400-case ×
+depth-5 batch was generated and grepped — **800 cases, 0 containing `while`, 0
+containing `for`, 0 containing `.push`**. The generator emits no loops at all, so
+`loopHoistOpen` is never called on a fuzz case; 602 of them index a list, all
+outside any loop. The load-bearing evidence for P5 is the corpus A/B, the suite,
+and the sabotage grid — not the fuzzer.
+
+### 14.6 P4b (BMH for `indexOf`) — measured, and NOT taken. Here is what the numbers say.
+
+P4b was scoped alongside P5 and is deliberately not shipped. The reason is not
+effort: it is that **two of the three numbers the filing rests on do not survive
+measurement**, and the third changes the gate.
+
+**(a) The table build costs 295 ns, not 88 ns.** Measured on a quiet box (load
+0.4), min-of-5, control-subtracted: a 256-entry skip-table fill plus the needle's
+own `m-1` overwrites runs **622 ms** over 2,000,000 repetitions against **31 ms**
+for the identical program with only the 256-entry fill removed — **295 ns per
+build**, 3.4x the filing's figure. That is with the array allocated ONCE outside
+the loop, so it is the FILL, which no amount of reuse removes.
+
+**(b) Allocation-free is not the hard part — the fill is.** A module-level global
+holding one `array.new_default 256`, initialised in the start function, removes
+the allocation entirely and is straightforward. What it does not remove is the
+295 ns. The instruction that would is **`array.fill` (`0xfb 0x0f`), and the
+emitter has no `fbArrayFill` at all** — `grep` over `emit_bytes.vl`/`wasmEmit.vl`
+returns nothing. Adding it is the enabling move for P4b and is a byte emitter
+that needs its own gate; it would cut a 1 KB fill to one instruction.
+
+**(c) P4a costs 1.39 ns per position examined**, derived from the real benchmark
+rather than a synthetic one: `bench/strings/substr-search` is **673 ms** here
+(min-of-5, `taskset -c 2-5`, load 0.46) over ~484M examined positions
+(480 absent needles × 1M, 480 present ones near the front). CPython on the same
+box is **150 ms**, so VL is **4.49x behind** — the landscape's 666/148 = 4.5x
+reproduces exactly, which is what makes the per-position number trustworthy.
+
+> A synthetic sweep over haystacks of 32…2048 read 4.3 ns per position instead,
+> because its generated haystack repeats the needle's first character far more
+> often than real text and so enters the verify loop far more often. The
+> synthetic number would have made BMH look ~3x better than it is. The real
+> benchmark is the one used below.
+
+**The derived gate.** With `t_build = 295 ns`, `t_pos = 1.39 ns`, an average shift
+`d`, and BMH's per-position cost `k` times P4a's, break-even is at
+
+    P = t_build / (t_pos * (1 - k/d))
+
+| needle | shift `d` | k=1.0 | k=1.5 | k=2.0 |
+|---|--:|--:|--:|--:|
+| 12 | 9.2 (instrumented) | 238 | 254 | 271 |
+| 4 | ~3.5 | 292 | 372 | 495 |
+| 2 | ~1.9 | 424 | 1006 | **never wins** |
+
+Two conclusions, and the second contradicts the filing:
+
+- The haystack gate is around **512**, not 64. At 64 the table build alone is
+  more than twice the entire search.
+- **`len(sub) >= 2` is the wrong needle gate.** At `m = 2` the shift is bounded
+  by 2, so BMH can examine at best half the positions while paying 295 ns fixed
+  and a strictly higher per-position cost — it breaks even only past ~424
+  positions at best, and never at all if a table lookup costs twice a direct
+  compare. The needle gate has to be **`>= 4`**. So: **`len(s) >= 512 && len(sub)
+  >= 4`**, derived, and it moves once `array.fill` lands.
+
+**And P4b does not clear the CPython red alert anyway.** The filing calls it
+"what still stands between `substr-search` and CPython". At the prototype's own
+**measured 3.13x**, 673 ms becomes **215 ms against CPython's 150 — still 1.43x
+behind**. A model built from the numbers above is more optimistic (shift 9.2 at
+k=1.5 projects ~120 ms, which would clear it), but the only end-to-end figure
+anyone has actually measured for BMH here is 3.13x, and that one does not clear
+it. Clearing `substr-search` needs P12 (UTF-8 bytes in linear memory, 27.7x on
+the compare) or P7-style caching, not BMH alone.
+
+**What shipping it would take**, in order: `fbArrayFill`; a start-initialised
+global table; the gated second search path in `emitStrIndexOf`; and the
+`index-of-grid` extensions BMH specifically needs — a repeated-character haystack
+(`aaaa…` with needle `aaab`), a needle whose LAST character repeats internally
+(the shift table built naively gets this wrong), the needle at the very last
+start, and single-character needles. `indexOf` is on the self-hosted compiler's
+own hot path, so none of that is worth doing at less than full gate coverage.

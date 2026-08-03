@@ -1,0 +1,225 @@
+// @run
+// @log 7800
+// @log 21
+// @log 1980
+// @log 40
+// @log 55
+// @log 600
+// @log 240
+// @log abc
+// @log 7.5
+// @log 10
+// @log 0
+// @log 120
+// Adversarial grid for LIST-HEADER HOISTING. Across a loop that cannot
+// reallocate a list, the emitter caches that list's backing-array ref and `len`
+// in locals instead of re-reading the wrapper on every element access. The
+// shapes below are the ones that make the cache WRONG, so each must decline it,
+// and the shapes after them are the ones that must still hoist and still be
+// right.
+//
+// Every declining case is written so a wrong hoist is LOUD rather than subtle:
+// it either reads a stale backing (a wrong number) or guards a fresh index
+// against a stale `len` (an out-of-range replacement index, which traps at the
+// `array.get`). None of them can pass by accident.
+
+// (1) `.push` inside the loop REALLOCATES the backing. The read is of the
+// element just pushed, so a hoisted header guards a fresh index against a stale
+// `len` and traps.
+function pushThenRead(): i32 {
+  const xs: i32[] = [0]
+  let i = 1
+  let s = 0
+  while i < 40 {
+    xs.push(i * 10)
+    s = s + xs[xs.length - 1]
+    i = i + 1
+  }
+  return s
+}
+
+// (2) The binding is REASSIGNED in the loop, so the body's `a` is a different
+// wrapper than the one before the loop. A hoisted header would keep reading the
+// first list and return 3 instead of 21.
+function reassignInLoop(): i32 {
+  let a: i32[] = [1, 2, 3]
+  const b: i32[] = [10, 20, 30]
+  let i = 0
+  let s = 0
+  while i < 3 {
+    s = s + a[0]
+    a = b
+    i = i + 1
+  }
+  return s
+}
+
+// (3) A CALL reaches the list through a parameter and pushes there. Nothing at
+// the call site says so, which is why every call declines the hoist.
+function grow(t: i32[]) { t.push(99) }
+function callGrows(): i32 {
+  const xs: i32[] = [1]
+  let i = 0
+  let s = 0
+  while i < 20 {
+    grow(xs)
+    s = s + xs[xs.length - 1]
+    i = i + 1
+  }
+  return s
+}
+
+// (4) The reallocation is in a NESTED loop and the read is in the outer one, so
+// the outer loop is where a hoist would be taken and where it must not be.
+function nestedGrow(): i32 {
+  const xs: i32[] = [1]
+  let i = 0
+  let s = 0
+  while i < 5 {
+    let j = 0
+    while j < 3 {
+      xs.push(i * 3 + j)
+      j = j + 1
+    }
+    s = s + xs[xs.length - 1]
+    i = i + 1
+  }
+  return s
+}
+
+// (5) The same, in a `for … to …` range loop — the other loop form that opens
+// hoists.
+function forRangeGrow(): i32 {
+  const xs: i32[] = [0]
+  let s = 0
+  for k in 1 to 10 {
+    xs.push(k)
+    s = s + xs[xs.length - 1]
+  }
+  return s
+}
+
+// (6) The indexed list is DECLARED INSIDE the body, so it is a fresh wrapper on
+// every iteration and there is no binding to cache before the loop at all. The
+// enclosing `ys` read is what makes the loop look hoistable in the first place.
+function shadowInLoop(): i32 {
+  const ys: i32[] = [1, 2, 3]
+  let i = 0
+  let s = 0
+  while i < 3 {
+    if ys[0] > 0 {
+      const zs: i32[] = [100, 200, 300]
+      s = s + zs[i]
+    }
+    i = i + 1
+  }
+  return s
+}
+
+// (7) ACCEPTED: an in-place indexed STORE loop then a pure READ loop, both of
+// which hoist. `array.set` changes neither the backing's identity nor `len`.
+function storeThenRead(): i32 {
+  const xs: i32[] = []
+  let i = 0
+  while i < 16 {
+    xs.push(i)
+    i = i + 1
+  }
+  i = 0
+  while i < 16 {
+    xs[i] = xs[i] * 2
+    i = i + 1
+  }
+  let s = 0
+  i = 0
+  while i < 16 {
+    s = s + xs[i]
+    i = i + 1
+  }
+  return s
+}
+
+// (8) ACCEPTED, every hoisted rep in one nest: a string list, an f64 list, and a
+// ref list of lists read through two levels of index.
+function stringsHoisted(): string {
+  const ss: string[] = ["a", "b", "c"]
+  let out = ""
+  let i = 0
+  while i < 3 {
+    out = out + ss[i]
+    i = i + 1
+  }
+  return out
+}
+function floatsHoisted(): f64 {
+  const fs: f64[] = [1.5, 2.5, 3.5]
+  let f = 0.0
+  let i = 0
+  while i < 3 {
+    f = f + fs[i]
+    i = i + 1
+  }
+  return f
+}
+function nestedListsHoisted(): i32 {
+  const gs: i32[][] = [[1, 2], [3, 4]]
+  let g = 0
+  let i = 0
+  while i < 2 {
+    let j = 0
+    while j < 2 {
+      g = g + gs[i][j]
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return g
+}
+
+// (9) A loop that never iterates, over an EMPTY list. The prologue reads the
+// header before the loop is entered, so it must be an operation that cannot
+// trap on its own — reading two fields of a non-null wrapper is.
+function emptyNoTrap(): i32 {
+  const e: i32[] = []
+  let s = 0
+  let i = 0
+  while i < e.length {
+    s = s + e[i]
+    i = i + 1
+  }
+  return s
+}
+
+// (10) ACCEPTED: the list is a PARAMETER, which is the shape `binsearch` and
+// `sort-heap` index in their hot loops.
+function sumParam(a: i32[], n: i32): i32 {
+  let s = 0
+  let i = 0
+  while i < n {
+    s = s + a[i]
+    i = i + 1
+  }
+  return s
+}
+
+function main() {
+  print(pushThenRead())
+  print(reassignInLoop())
+  print(callGrows())
+  print(nestedGrow())
+  print(forRangeGrow())
+  print(shadowInLoop())
+  print(storeThenRead())
+  print(stringsHoisted())
+  print(floatsHoisted())
+  print(nestedListsHoisted())
+  print(emptyNoTrap())
+  const ps: i32[] = []
+  let i = 0
+  while i < 16 {
+    ps.push(i)
+    i = i + 1
+  }
+  print(sumParam(ps, 16))
+}
+main()
