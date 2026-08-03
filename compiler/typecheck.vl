@@ -8408,10 +8408,26 @@ function flatConstOf(d: i32, prop: string) {
   -1
 }
 
+// The layout constant `name.prop` by NAME, for the monomorphizer's per-instance
+// fold of a type parameter's layout members (`emit_mono.monoFoldTyParamLayout`):
+// -1 when `name` is not a usable `flat` type, -2 when it is one but has no member
+// `prop`. The two misses are separate because they are different mistakes and the
+// monomorphizer names each one against the binding that made it.
+export function flatConstOfNameProp(name: string, prop: string) {
+  const d = flatIndexOf(name)
+  if d < 0 { return -1 }
+  // A rejected or cyclic declaration: its error is already on the page.
+  if flSizes[d] < 0 { return -1 }
+  const v = flatConstOf(d, prop)
+  if v < 0 { return -2 }
+  v
+}
+
 // The `N.size` / `N.field` interception at the top of `checkMemberNode`, and the
 // only place the layout sidecar is READ. Answers 0 for an ordinary field access
 // (which the rest of `checkMemberNode` then handles), 1 when the node was FOLDED
-// to its constant, and 2 when it reported an error.
+// to its constant, 2 when it reported an error, and 3 when the receiver is a live
+// type PARAMETER whose fold belongs to the monomorphizer (typed `i32` here).
 //
 // THREE GUARDS, and together they make this unreachable from any program that
 // compiles today:
@@ -8434,6 +8450,16 @@ function flatMemberFold(n: Member, ix: i32) {
   if obj is Ident {
     const nm = obj.identName
     if lookup(nm) >= 0 { return 0 }
+    // A live type PARAMETER (`T.size` inside `function "[]"<T>(self: Rows<T>, …)`).
+    // The layout is not knowable HERE — `T` is abstract for the one pass the
+    // checker makes over a generic body — so the fold is DEFERRED to the
+    // monomorphizer, which owns the per-instance binding and rewrites this node
+    // once per instance (`emit_mono.monoSubstTyParamExprs`). The member's TYPE is
+    // `i32` under every binding, so the rest of the body checks exactly as it will
+    // after the fold; what the checker cannot verify is whether the binding names a
+    // `flat` type and whether it HAS this member, and both are reported by the
+    // monomorphizer against the instance that got it wrong.
+    if tpEnvTyOfName(nm) >= 0 { return 3 }
     const d = flatIndexOf(nm)
     if d < 0 {
       if (cUserTypes[nm] ?? -1) >= 0 {
@@ -21465,6 +21491,9 @@ function checkMemberNode(n: Member, ix: i32) {
   const fl = flatMemberFold(n, ix)
   if fl == 1 { return TY_I32 }
   if fl == 2 { return TY_ERR }
+  // A layout member on a type PARAMETER: an `i32` whose VALUE the monomorphizer
+  // supplies per instance. The node stays a `Member` until then.
+  if fl == 3 { return TY_I32 }
   // A flow-narrowed property path (`if o.v is T { … }`) overrides the stored
   // field type within the branch (the host's `narrowedPaths` overlay).
   const mKey = placeKeyOf(ix)

@@ -362,19 +362,20 @@ and both are silent wrong answers in address arithmetic.
 
 ## 6. What is NOT in this phase
 
-### 6.1 `buf.rows<T>(offset, count)`
+### 6.1 `buf.rows<T>(offset, count)` — blocker 2 SHIPPED (§11), blocker 1 REFUTED
 
-Needs a generic accessor whose element size depends on the type argument — i.e. `T.size`
-must answer for a **type parameter** at each instantiation. Two things stand in the way, both
-measured:
+This section filed two blockers. **One was real and is now closed; the other was never a
+blocker for this feature at all.** §11 re-derives both by building.
 
-1. **Generic flat types are rejected** (§3), so there is no `flat` declaration to
-   instantiate.
+1. ~~**Generic flat types are rejected** (§3), so there is no `flat` declaration to
+   instantiate.~~ **STALE — the premise misidentifies whose generic is needed.** `rows<T>`'s
+   `T` ranges over *concrete* flat records (`TValue`, `Node`); what is generic is the
+   **container**, and a generic container is an ordinary generic alias that has always been
+   legal. Generic `flat` declarations remain rejected and remain unrelated (§11.4).
 2. `T.size` for a parameter needs the fold to run **after** monomorphization substitutes the
    argument, and the fold currently runs in the checker where `T` is still a parameter.
-
-Until then the hand-written per-type accessor set (§6.3) is the route, and it is *expressible
-today* — this is boilerplate, not a blocker.
+   **REAL, and closed by §11**: the checker types the member and the monomorphizer folds it,
+   per instance.
 
 ### 6.2 `stack[i].tt` — SUPERSEDED by §9
 
@@ -783,23 +784,180 @@ function "[]"<T>(self: Rows<T>, i: i32): Addr<T> {
 }
 ```
 
-**Three things stand in the way, and the third is new.**
+**Three things were filed as standing in the way. §11 re-derives all three by building: (1)
+is not a blocker for this feature, (2) shipped, and (3) is confirmed and is now the ONLY
+thing left — for a reason sharper than "generic newtypes are a separate design".**
 
-1. **Generic flat types are rejected** (§3) — a type parameter has no width. Unchanged.
-2. **`T.size` must fold after monomorphization**, not in the checker where `T` is still a
-   parameter (§6.1). Unchanged.
+1. ~~**Generic flat types are rejected** (§3) — a type parameter has no width.~~ Refuted as a
+   blocker: the flat records `rows<T>` indexes are concrete (§11.4).
+2. ~~**`T.size` must fold after monomorphization.**~~ **SHIPPED** (§11.1).
 3. **The row-address brand must be generic too** — `Addr<T>`, so that `Rows<TValue>` and
-   `Rows<Node>` yield addresses that do not cross. This is the requirement §9 makes newly
-   visible: without it a generic `rows<T>` would hand back a bare `i32` and give up exactly
-   the safety property §9.2 says is its whole marginal contribution over rung 2. A generic
-   newtype over a scalar is its own design (`newtype-design.md` §5's branded-application
-   question), and it is a *prerequisite*, not a nicety.
+   `Rows<Node>` yield addresses that do not cross. **Confirmed, and it is the whole
+   remainder** (§11.3).
 
 **The ordering this implies.** (3) is the one to settle first, because it decides whether
 `rows<T>` is worth building at all: a `rows<T>` that returns unbranded addresses is
-strictly worse than the four lines it replaces. (1) and (2) are then mechanical.
+strictly worse than the four lines it replaces. That ordering held up — (2) turned out to be
+mechanical and landed, and (3) is where the feature stops.
 
 **And the honest priority.** Against §9 the remaining prize is one brand and one four-line
 operator per record — for the Lua VM, on the order of three declarations. That is smaller
 than what §6.3 estimated when the accessor set was still believed to be the cost. `rows<T>`
 should be scheduled behind anything that unblocks a program rather than shortening one.
+
+---
+
+## 11. A type PARAMETER answers for its layout — and where `rows<T>` actually stops
+
+**RULING: `T.size` / `T.<field>` are legal wherever `T` is a live type parameter. The checker
+types them `i32` and leaves the node standing; the MONOMORPHIZER folds them, once per
+instance, against that instance's binding.**
+
+```vl
+flat type TValue = { value: i64, tt: i32, pad: i32 }   // size 16
+flat type Node   = { key: i32, val: i32 }              // size 8
+
+type Rows<T> = { base: i32, count: i32 }
+function "[]"<T>(self: Rows<T>, i: i32): i32 {
+  return self.base + i * T.size          // 16 in one instance, 8 in the other
+}
+```
+
+One operator, every flat record. This is §10's sketch minus its brand, and it closes the
+second of the two blockers §6.1 filed.
+
+### 11.1 The phase is the whole design, and it is not the checker's
+
+The fold **cannot** run where the existing `TValue.size` fold runs (§5). The checker walks a
+generic body **once**, with `T` abstract; there is no binding to fold against, and inventing
+one would pick an arbitrary instance. So the checker does exactly two things — it recognises
+that the receiver is a live type parameter (`flatMemberFold` answer 3) and types the member
+`i32`, which is its type under *every* binding — and the constant is supplied later.
+
+The monomorphizer is where a binding first exists (`monoFoldTyParamLayout` in
+`emit_mono.vl`), and the fold has to happen **per instance**, which is the part that is not
+free:
+
+> **Instances SHARE the original's body arena nodes.** Folding `T.size` in place would hand
+> every instance the LAST binding's constants — a `Rows<Node>` addressed at `TValue`'s
+> stride. That is a wrong ADDRESS, silently, in the one tier whose entire value is
+> byte-precision.
+
+So the pass is **clone-if-changed** over `monoCloneGenericCalls`' traversal — the same
+traversal, for the same aliasing reason that function documents for a shared callee `Ident`.
+A body that reads no layout member returns the SAME node index, so the fold is usage-gated
+and a program without one emits byte-identically, preserving §4's property.
+
+**How the phase was verified, rather than assumed.** A single-instance program cannot tell
+the two phases apart: fold-in-the-checker, fold-at-the-first-instance and fold-in-place all
+agree when there is one binding. `flat-generic-rows-stride.vl` therefore instantiates the
+same operator at **two records with different strides** and asserts both, plus the layout
+constants themselves per instance, plus a write through the derived address read back at a
+HAND-COMPUTED one (§7.2's discipline). Fold-in-place fails that fixture on the first two
+lines; a checker-side fold cannot compile it at all.
+
+### 11.2 What the checker gives up, stated plainly
+
+`T.size` is typed without being validated. Whether the binding names a `flat` type, and
+whether that type HAS the member, are questions the checker cannot answer — it sees `T`, not
+`TValue`. Both are answered by the monomorphizer against the instance that got it wrong:
+
+```
+emitProgram: monomorphize: `T` is bound to `Plain`, which is not a `flat` type, so it has no byte layout
+emitProgram: monomorphize: `flat type TValue` (bound to `T`) has no field 'nosuch' — its layout members are `.size` and one offset per declared field
+```
+
+This is a **`vl check`-clean, `vl build`-rejected** pair, which this repo otherwise treats as
+a defect class. It is accepted here deliberately and only here: the alternative is rejecting
+every `T.size` in the checker, which is the feature. Both messages name the BINDING, not the
+parameter, because the binding is the thing the programmer chose. Pinned by
+`memory/flat-generic-rows-not-flat-rejected.vl` and
+`memory/flat-generic-rows-unknown-member-rejected.vl`.
+
+### 11.3 The brand: REFUTED, and the refutation needed a discriminating witness
+
+§10 requires that `Rows<TValue>` and `Rows<Node>` yield addresses that do not cross. The
+obvious route is to let the operator's RETURN be a type parameter, so the container names the
+brand:
+
+```vl
+type TVAddr = new i32
+type Rows<R, A> = { base: i32, count: i32 }
+function "[]"<R, A>(self: Rows<R, A>, i: i32): A { return self.base + i * R.size }
+
+const st: Rows<TValue, TVAddr> = { base: 1024, count: 4 }
+print(tt(st[1]))          // checks, builds, runs, reads the right bytes
+```
+
+**That program works, and it proves nothing.** The discriminating witness is the one where
+the brands are supposed to STOP the program:
+
+```vl
+const nd: Rows<Node, NodeAddr> = { base: 2048, count: 4 }
+print(tt(nd[1]))          // a Node row address into a TValue accessor
+// vl check → no errors.   vl build → ok.   vl run → 0
+```
+
+It compiles. A `string` parameter accepts it too, and *that* spelling emits an invalid module
+(`type mismatch: expected (ref $type), found i32`) with `vl check` clean. **The type-parameter
+return is not a brand — it is an UNCONSTRAINED type variable, which is assignable to
+everything.** Both witnesses reproduce against the published `seed-latest`, so this is
+pre-existing and is not caused by the layout fold; it is filed here because this is where it
+becomes load-bearing.
+
+The mechanism, since it explains why no small fix falls out. The checker binds type
+parameters by **structural unification** against the argument's arena type. A generic alias
+application EXPANDS into its body, and a `Rows<R, A>` body mentions neither `R` nor `A`, so
+the expansion is `{base: i32, count: i32}` with **no type variable left anywhere in it** —
+there is nothing to unify, and `A` stays unbound. (The application's arguments *are* recorded,
+in the `gaApp*` sidecar, but that sidecar is read only by the type RENDERER.) Two independent
+gaps follow, and both would have to close:
+
+- **the index route never binds at all** — `x[i]` returns the operator's declared return type
+  verbatim, so even a *non*-phantom generic operator returns its bare type parameter;
+- **a phantom parameter is unrecoverable structurally** — closing it means binding
+  NOMINALLY, from the application sidecar, which is a change to what generic-alias
+  application MEANS in the checker, not a patch to one route.
+
+Meanwhile the monomorphizer binds `Rows<TValue, TVAddr>` against `Rows<R, A>` by NAME, and
+gets it exactly right — which is why the *addresses* are correct while the *types* are not.
+**The two layers disagree about what a phantom type argument is, and the layout fold rides
+the layer that is right.**
+
+### 11.4 The other two routes to a brand, both closed by measurement
+
+- **A generic newtype `Addr<T>`** — `newtype-design.md` §5 files this as unbuilt. Re-derived:
+  `type Addr<T> = new i32` *declares* without complaint and its application is
+  `unknown type 'Addr<i32>'`, in an annotation and in an `as` cast alike. The reason is one
+  rung below newtypes: the generic-alias registry only accepts a **record** body at all —
+  plain `type Al<T> = i32` is equally `unknown type 'Al<i32>'`. So a generic newtype over a
+  scalar is not "a brand that is ignored", it is a declaration form the registry does not
+  have. Filed, unchanged.
+- **Generic `flat` types** (§3's reject, §6.1's blocker 1). Not on this path: `rows<T>`
+  indexes CONCRETE flat records, and `T.size` resolves them by name at the instance. A
+  generic `flat type Row<T>` would need its own spelling for the constants — `Row<i32>.size`
+  does not parse — reachable only through a concrete alias (`type RowI = Row<i32>`), which is
+  a separate feature with a separate consumer. The reject stands and is no longer the thing
+  standing between here and `rows<T>`.
+
+### 11.5 And the spec's own spelling does not parse
+
+`buf.rows<TValue>(offset, count)` is not writable in VL for a reason neither §6.1 nor §10
+records: **VL has no call-site type arguments.** `f<T>(x)` lexes as two comparisons, so
+`idOf<i32>(7)` is `undeclared identifier 'i32'` on master. VL's generics are inference-only —
+`<T>` appears in declarations and in type annotations, never at a call. And the fallback of
+inferring `T` from the call's expected type is closed too: a type parameter that appears ONLY
+in the return is rejected by the monomorphizer, by name
+(`monomorphize: a return type parameter of \`mkRows\` is not bound by any parameter`).
+
+So `rows<T>` can only ever be what §10 already said it should be — **a generic container type
+plus a generic operator**, not a method. That shape works today for the ADDRESS and not for
+the BRAND, and §11.3 is the reason.
+
+### 11.6 What is pinned
+
+| fixture | what it holds |
+| --- | --- |
+| `memory/flat-generic-rows-stride.vl` | one generic operator at TWO strides; the constants per instance; `T.<field>` offsets; a generic accessor calling another generic accessor; every write through the derived address, read back at a hand-computed one |
+| `memory/flat-generic-rows-not-flat-rejected.vl` | the binding is not a `flat` type — loud, at emit, naming the binding |
+| `memory/flat-generic-rows-unknown-member-rejected.vl` | the binding is flat and the member is not |

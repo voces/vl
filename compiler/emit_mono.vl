@@ -16,6 +16,7 @@ import {
   nameIsParenSpanEnds,
 } from "./tyname"
 import {
+  flatConstOfNameProp,
   monoInferListElem,
   monoInferLocalScalar,
   nodeTyName,
@@ -65,6 +66,7 @@ import {
   mkIsExprNeg,
   mkLet,
   mkMember,
+  mkNum,
   mkObjLit,
   mkOptMember,
   mkParam,
@@ -1151,6 +1153,239 @@ function monoCloneGenericCalls(ix: i32) {
   ix
 }
 
+// ── the per-instance layout fold: `T.size` / `T.<field>` (webcraft P1.2) ─────
+// A generic body may read the LAYOUT of one of its type parameters — the stride a
+// generic row accessor multiplies by (`self.base + i * T.size`) and the field
+// offsets it adds. The checker types those members `i32` and leaves the `Member`
+// node standing (`typecheck.flatMemberFold` answer 3), because the constant does
+// not exist until a BINDING does, and the binding is this pass's.
+//
+// Clone-if-changed over `monoCloneGenericCalls`' traversal, and for its reason:
+// instances SHARE the original's expression arena, so folding in place would hand
+// every instance the LAST binding's constants — a `Rows<Node>` addressed at
+// `TValue`'s stride, which is a silent wrong ADDRESS rather than a loud failure. A
+// body that reads no layout member returns the SAME node index, so a program with
+// no such member emits byte-identically.
+//
+// Every failure is loud and names the binding, because the checker could not: it
+// saw `T`, not `TValue`, so "is it flat" and "does it have this member" are
+// questions only an instance can answer.
+function monoFoldTyParamLayout(
+  ix: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  if ix < 0 { return ix }
+  const n = P.nodes[ix]
+  if n is Member {
+    const mo = P.nodes[n.memObj]
+    if mo is Ident {
+      if monoTyParamOf(mo.identName, typarams) != "" {
+        const bind = monoBindOf(tvN, tvV, mo.identName)
+        if bind == "" {
+          emitFail(
+            "emitProgram: monomorphize: `" +
+              mo.identName +
+              "." +
+              n.memProp +
+              "` needs `" +
+              mo.identName +
+              "` bound by a parameter — a layout constant is per-instance",
+          )
+          return ix
+        }
+        const v = flatConstOfNameProp(bind, n.memProp)
+        if v == -1 {
+          emitFail(
+            "emitProgram: monomorphize: `" +
+              mo.identName +
+              "` is bound to `" +
+              bind +
+              "`, which is not a `flat` type, so it has no byte layout",
+          )
+          return ix
+        }
+        if v == -2 {
+          emitFail(
+            "emitProgram: monomorphize: `flat type " +
+              bind +
+              "` (bound to `" +
+              mo.identName +
+              "`) has no field '" +
+              n.memProp +
+              "' — its layout members are `.size` and one offset per declared field",
+          )
+          return ix
+        }
+        return mkNum(i32ToStr(v), n.pos)
+      }
+    }
+    const mc = monoFoldTyParamLayout(n.memObj, typarams, tvN, tvV)
+    if mc == n.memObj { return ix }
+    return mkMember(mc, n.memProp, n.pos)
+  }
+  if n is Block {
+    const ns: i32[] = []
+    let bchanged = false
+    let i = 0
+    while i < n.blkStmts.length {
+      const cs = monoFoldTyParamLayout(n.blkStmts[i], typarams, tvN, tvV)
+      ns.push(cs)
+      if cs != n.blkStmts[i] { bchanged = true }
+      i = i + 1
+    }
+    if !bchanged { return ix }
+    return mkBlock(ns, n.pos)
+  }
+  if n is LetDecl {
+    const ci = monoFoldTyParamLayout(n.letInit, typarams, tvN, tvV)
+    if ci == n.letInit { return ix }
+    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+  }
+  if n is RetStmt {
+    const ca = monoFoldTyParamLayout(n.retArg, typarams, tvN, tvV)
+    if ca == n.retArg { return ix }
+    return mkReturn(ca, n.pos)
+  }
+  if n is IfStmt {
+    const cc = monoFoldTyParamLayout(n.ifCond, typarams, tvN, tvV)
+    const ct = monoFoldTyParamLayout(n.ifThen, typarams, tvN, tvV)
+    const ce = monoFoldTyParamLayout(n.ifElse, typarams, tvN, tvV)
+    if cc == n.ifCond && ct == n.ifThen && ce == n.ifElse { return ix }
+    return mkIf(cc, ct, ce, n.pos)
+  }
+  if n is WhileStmt {
+    const wc = monoFoldTyParamLayout(n.whileCond, typarams, tvN, tvV)
+    const wb = monoFoldTyParamLayout(n.whileBody, typarams, tvN, tvV)
+    if wc == n.whileCond && wb == n.whileBody { return ix }
+    return mkWhile(wc, wb, n.whileLabel, n.pos)
+  }
+  if n is ForRange {
+    const ff = monoFoldTyParamLayout(n.frFrom, typarams, tvN, tvV)
+    const ft = monoFoldTyParamLayout(n.frTo, typarams, tvN, tvV)
+    const fs = monoFoldTyParamLayout(n.frStep, typarams, tvN, tvV)
+    const fb = monoFoldTyParamLayout(n.frBody, typarams, tvN, tvV)
+    if ff == n.frFrom && ft == n.frTo && fs == n.frStep && fb == n.frBody {
+      return ix
+    }
+    return mkForRange(n.frVar, ff, ft, fs, fb, n.frLabel, n.pos)
+  }
+  if n is ForIn {
+    const fi = monoFoldTyParamLayout(n.fiIter, typarams, tvN, tvV)
+    const fbi = monoFoldTyParamLayout(n.fiBody, typarams, tvN, tvV)
+    if fi == n.fiIter && fbi == n.fiBody { return ix }
+    return mkForIn(n.fiVar, fi, fbi, n.fiLabel, n.pos)
+  }
+  if n is Call {
+    const cf = monoFoldTyParamLayout(n.callFn, typarams, tvN, tvV)
+    let changed = cf != n.callFn
+    const nargs: i32[] = []
+    let ai = 0
+    while ai < n.callArgs.length {
+      const ca2 = monoFoldTyParamLayout(n.callArgs[ai], typarams, tvN, tvV)
+      nargs.push(ca2)
+      if ca2 != n.callArgs[ai] { changed = true }
+      ai = ai + 1
+    }
+    if !changed { return ix }
+    return mkCallN(cf, nargs, n.callArgNames, n.pos)
+  }
+  if n is BinExpr {
+    // A COMPOUND assignment shares its TARGET node between the read and the write,
+    // so its limbs cannot be rebuilt independently — re-synthesize the whole form
+    // through the maker that re-establishes that sharing, exactly as
+    // `monoCloneGenericCalls` does.
+    if n.binCompound != "" {
+      const ct2 = monoFoldTyParamLayout(n.binLeft, typarams, tvN, tvV)
+      if n.binCompound == "++" || n.binCompound == "--" {
+        if ct2 == n.binLeft { return ix }
+        return mkPreIncr(n.binCompound, ct2, n.pos)
+      }
+      const inner = P.nodes[n.binRight]
+      if inner is BinExpr {
+        const iv = monoFoldTyParamLayout(inner.binRight, typarams, tvN, tvV)
+        if iv == inner.binRight && ct2 == n.binLeft { return ix }
+        return mkCompoundAssign(n.binCompound, ct2, iv, n.pos)
+      }
+      return ix
+    }
+    const bl = monoFoldTyParamLayout(n.binLeft, typarams, tvN, tvV)
+    const br = monoFoldTyParamLayout(n.binRight, typarams, tvN, tvV)
+    if bl == n.binLeft && br == n.binRight { return ix }
+    return mkBinary(n.binOp, bl, br, n.pos)
+  }
+  if n is Unary {
+    // A POSTFIX `x++`/`x--` rides a `Unary` over the assignment whose operand IS
+    // the mutated target — left whole for the compound form's reason.
+    if n.unOp == "p+" || n.unOp == "p-" { return ix }
+    const ua = monoFoldTyParamLayout(n.unArg, typarams, tvN, tvV)
+    if ua == n.unArg { return ix }
+    return mkUnary(n.unOp, ua, n.pos)
+  }
+  if n is Paren {
+    const pi = monoFoldTyParamLayout(n.parInner, typarams, tvN, tvV)
+    if pi == n.parInner { return ix }
+    return mkParen(pi, n.pos)
+  }
+  if n is OptMember {
+    const oo = monoFoldTyParamLayout(n.omObj, typarams, tvN, tvV)
+    if oo == n.omObj { return ix }
+    return mkOptMember(oo, n.omProp, n.pos)
+  }
+  if n is Index {
+    const xa = monoFoldTyParamLayout(n.idxArr, typarams, tvN, tvV)
+    const xi = monoFoldTyParamLayout(n.idxIndex, typarams, tvN, tvV)
+    if xa == n.idxArr && xi == n.idxIndex { return ix }
+    return mkIndex(xa, xi, n.pos)
+  }
+  if n is IsExpr {
+    const io = monoFoldTyParamLayout(n.isObj, typarams, tvN, tvV)
+    if io == n.isObj { return ix }
+    if n.isNeg == 1 { return mkIsExprNeg(io, n.isVariant, n.pos) }
+    return mkIsExpr(io, n.isVariant, n.pos)
+  }
+  if n is AsExpr {
+    const ao = monoFoldTyParamLayout(n.asObj, typarams, tvN, tvV)
+    if ao == n.asObj { return ix }
+    return mkAsExpr(ao, n.asTy, n.pos)
+  }
+  if n is ArrayLit {
+    const es: i32[] = []
+    let echanged = false
+    let ei = 0
+    while ei < n.arrElems.length {
+      const ce = monoFoldTyParamLayout(n.arrElems[ei], typarams, tvN, tvV)
+      es.push(ce)
+      if ce != n.arrElems[ei] { echanged = true }
+      ei = ei + 1
+    }
+    if !echanged { return ix }
+    return mkArrayLit(es, n.pos)
+  }
+  if n is ObjLit {
+    const fl: i32[] = []
+    let ochanged = false
+    let oi = 0
+    while oi < n.objFields.length {
+      let nf = n.objFields[oi]
+      const f = P.nodes[nf]
+      if f is FieldInit {
+        const cv = monoFoldTyParamLayout(f.fiValue, typarams, tvN, tvV)
+        if cv != f.fiValue {
+          nf = mkFieldInit(f.fiName, cv, f.pos)
+          ochanged = true
+        }
+      }
+      fl.push(nf)
+      oi = oi + 1
+    }
+    if !ochanged { return ix }
+    return mkObjLit(fl, n.pos)
+  }
+  ix
+}
+
 // Whether a specialization callback was baked for ANY param (the instance has at least one
 // `cbFnNames[k] != ""`) — gates the body rewrite + key extension below.
 function monoAnyBakedCallback(cbFnNames: string[]) {
@@ -1541,7 +1776,10 @@ function monoMakeInstance(
     // Per-instance copies of the direct generic calls this body makes, so instantiating THEM
     // rewrites only this instance's callee `Ident`s (a shared one made the last shape win for
     // every instance — see `monoCloneGenericCalls`). No generic call → the same node → no change.
-    const instBody = monoCloneGenericCalls(instBody2)
+    const instBody3 = monoCloneGenericCalls(instBody2)
+    // Per-instance layout constants for the type parameters this body reads
+    // (`i * T.size`) — folded HERE because the binding is what makes them exist.
+    const instBody = monoFoldTyParamLayout(instBody3, fn.fnTyParams, tvN, tvV)
     const nfn = mkFunc(instName, noTyParams, nps, nret, instBody, -1)
     if count == 0 {
       // First instance: keep the bare name and the original's wasm index.
