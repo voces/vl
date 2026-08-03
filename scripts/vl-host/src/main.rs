@@ -1493,12 +1493,33 @@ const OPT_PASSES: &[&str] = &["-O"];
 const RELEASE_PASSES: &[&str] = &["--closed-world", "-O3", "--gufa", "-O3"];
 
 /// Shell out to `wasm-opt` to rewrite the emitted module IN PLACE with one of the
-/// two rungs above, when a `wasm-opt` is available. A missing `wasm-opt` is a soft
-/// no-op (the unoptimized module is already written), identical for both rungs.
+/// two rungs above.
+///
+/// A missing `wasm-opt` is a HARD ERROR, not a soft no-op. `-O` / `-O3` are never
+/// implied — a build only reaches here because the caller typed the flag — and
+/// silently handing back an unoptimized module at exit 0 makes every downstream
+/// check believe it got an optimized one. That is not hypothetical: it has produced
+/// published `-O3` timings that were re-runs of the `-O0` module (byte-identical,
+/// md5 verified) more than once, and both `bench/run.sh` and the `selfhost_native_opt`
+/// tests carry hand-written guards that exist only to detect this. A plain
+/// `vl build` never calls this function, so a toolchain without binaryen keeps
+/// working for every build that did not ask to be optimized.
 fn optimize_in_place(path: &str, flag: &str, passes: &[&str]) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
-        binaryen_missing_note(flag, "wasm-opt", "VL_WASM_OPT", "wrote the unoptimized module");
-        return Ok(());
+        // The unoptimized module is already on disk at this point. Leaving it there
+        // would re-open the hole from the other side: a caller that ignores the exit
+        // status still finds a plausible artifact, and a previously-good output has
+        // just been overwritten by an unoptimized one. A failed build leaves nothing.
+        let _ = std::fs::remove_file(path);
+        let install = if cfg!(target_os = "macos") {
+            "`brew install binaryen`"
+        } else {
+            "your package manager, or https://github.com/WebAssembly/binaryen/releases"
+        };
+        bail!(
+            "{flag} requires `wasm-opt` and none was found on PATH — install binaryen ({install}), \
+             or set $VL_WASM_OPT. (Build without {flag} to emit the unoptimized module.)"
+        );
     };
     let mut argv: Vec<&str> = vec![path];
     argv.extend_from_slice(passes);

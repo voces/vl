@@ -524,12 +524,22 @@ Deno.test({
   },
 });
 
-// A missing `wasm-opt` must degrade the same way for both rungs: exit 0, a note
-// naming the flag on stderr, and the UNOPTIMIZED module left on disk (not a
-// half-written one). Runs with an emptied environment so neither PATH nor an
-// ambient `$VL_WASM_OPT` can find a binaryen.
+// A missing `wasm-opt` must FAIL both rungs, identically. `-O` / `-O3` are never
+// implied, so reaching the optimizer means the caller asked for it, and handing back
+// an unoptimized module at exit 0 makes every downstream check believe it got an
+// optimized one — which has produced published `-O3` timings that were re-runs of the
+// `-O0` module. The error must name the flag and say how to get binaryen.
+//
+// This test formerly asserted the OPPOSITE (exit 0 + a note + the unoptimized module
+// on disk). The soft no-op was deliberate under webcraft P1.3, and is deliberately
+// reversed here: a soft default build is worth protecting, an ignored explicit flag
+// is not. A plain `vl build` never shells out to wasm-opt, so a toolchain without
+// binaryen still builds everything that did not ask to be optimized.
+//
+// Runs with an emptied environment so neither PATH nor an ambient `$VL_WASM_OPT`
+// can find a binaryen.
 Deno.test({
-  name: "native-release: -O3 is a soft no-op with no wasm-opt (same as -O)",
+  name: "native-release: -O/-O3 FAIL LOUDLY with no wasm-opt (never a silent no-op)",
   ignore: !ENABLED,
   fn: async () => {
     const src = `${MELT}/union-box-call.vl`;
@@ -545,13 +555,55 @@ Deno.test({
           env: { PATH: "" },
         }).output();
         const err = new TextDecoder().decode(stderr);
-        if (code !== 0) throw new Error(`${flag} without wasm-opt exited ${code}: ${err.trim()}`);
-        if (!err.includes(`note: ${flag} requested but no \`wasm-opt\``)) {
-          throw new Error(`${flag} without wasm-opt printed no note; stderr was:\n${err}`);
+        if (code === 0) {
+          throw new Error(
+            `${flag} without wasm-opt exited 0 — a silently unoptimized module is exactly ` +
+              `the failure this test exists to prevent; stderr was:\n${err}`,
+          );
         }
-        if (!exists(out) || Deno.statSync(out).size <= 0) {
-          throw new Error(`${flag} without wasm-opt left no module at ${out}`);
+        if (!err.includes(flag) || !err.includes("wasm-opt")) {
+          throw new Error(
+            `${flag} without wasm-opt must name the flag AND wasm-opt in its error; stderr was:\n${err}`,
+          );
         }
+        if (!err.includes("VL_WASM_OPT")) {
+          throw new Error(
+            `${flag} without wasm-opt must tell the user how to point at a binaryen; stderr was:\n${err}`,
+          );
+        }
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
+// The INVERTED control for the test above: a plain `vl build` — no optimizer flag —
+// must still succeed in the same wasm-opt-less environment. Without this, making the
+// optimizer strict could have broken every build on a toolchain lacking binaryen and
+// the suite above would still be green.
+Deno.test({
+  name: "native-release: a plain `vl build` still succeeds with no wasm-opt",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = `${MELT}/union-box-call.vl`;
+    const tmp = await Deno.makeTempDir();
+    try {
+      const out = `${tmp}/plain.wasm`;
+      const { code, stderr } = await new Deno.Command(VL, {
+        args: ["build", src, "-o", out, "--compiler", COMPILER],
+        stdout: "piped",
+        stderr: "piped",
+        clearEnv: true,
+        env: { PATH: "" },
+      }).output();
+      if (code !== 0) {
+        throw new Error(
+          `plain build without wasm-opt exited ${code}: ${new TextDecoder().decode(stderr).trim()}`,
+        );
+      }
+      if (!exists(out) || Deno.statSync(out).size <= 0) {
+        throw new Error(`plain build without wasm-opt left no module at ${out}`);
       }
     } finally {
       await Deno.remove(tmp, { recursive: true });
