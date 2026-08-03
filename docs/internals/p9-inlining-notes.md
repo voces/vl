@@ -1,53 +1,117 @@
-# P9 — inlining in the DEFAULT build: what is known before anyone builds it
+# P9 — inlining in the DEFAULT build: MEASURED, and the item is misfiled
 
-**Status: NOT STARTED. This file exists so the one measurement that survived a failed slice is not
-lost.** Three attempts at P9 died to stream-level failures; each left an empty worktree. What follows
-is the finding that reached me in the last of them, plus the questions it changes.
+**Status: MEASURED on the case P9 was filed against (`bench/arrays/sort-heap`). The inlining question
+turned out to be the small half of what the measurement found.** Three earlier attempts died to
+stream-level failures without producing a number; this file now records the numbers rather than the
+plan, and the one claim that survived those attempts is **refuted** below.
 
-## The mechanism finding — `-O3`'s inlining win is NOT inlining alone
+## The headline, and it is not about inlining
 
-Measured while comparing binaryen pipeline variants on `sort-heap`:
+Six builds of the same benchmark — the idiomatic source (`main.vl`) and the hand-inlined twin
+(`opt.vl`, `siftDown` spliced into both call sites by hand) — at three optimizer rungs. Interleaved
+min-of-15, all six producing byte-identical non-empty stdout:
 
-> The inlined function carries **62 locals**; the variant with the cleanup pass coalesces to **20**.
+| source | `vl build` | `-O` | `-O3` |
+|---|---:|---:|---:|
+| `main.vl` (idiomatic) | 830 ms | **579 ms** | 827 ms |
+| `opt.vl` (hand-inlined) | 784 ms | **578 ms** | 839 ms |
 
-**Binaryen's inliner is naive about locals, and the cleanup pass is what pays.** It splices the
-callee's frame in wholesale and a later pass coalesces the resulting live ranges. So the observed
-`-O3` win on the P9 family (`struct-field` 2.90×, `map-filter-reduce` 1.80×, `sort-heap` 8–13%) is
-the product of two passes, not one.
+Three things fall out, in descending order of importance:
 
-**Why that matters for the item as filed.** P9 is written as "inline small leaf functions in the
-default build". If the emitter inlined the same functions but allocated locals *tightly* — which it
-can, because it is generating the code rather than rewriting it — it would skip the 62-local
-intermediate entirely and might capture the win without needing a coalescing pass at all. That is a
-materially different and cheaper proposition than reimplementing binaryen's inliner.
+1. **`-O3` IS A 1.43× REGRESSION AGAINST `-O`** (827 vs 579) and is a dead heat with the
+   *unoptimized* build (827 vs 830). The shipped release profile — `wasm-opt --closed-world -O3
+   --gufa -O3` — is the worst of the three rungs on this benchmark. See the mechanism below; it is
+   understood, not mysterious.
+2. **At `-O`, hand-inlining buys exactly nothing** (578 vs 579). Binaryen inlines `siftDown` there,
+   so an emitter-side inliner would be duplicating work already done at every rung a release build
+   would use.
+3. **P9's actual premise holds only at the DEFAULT rung, and is worth 5.6%** (830 → 784). Real, and
+   the smallest number on this page.
 
-It also raises the opposite possibility, which must be tested rather than assumed: if the win is
-mostly the *coalescing* rather than the inlining, then the emitter's own locals allocation is the
-real target and P9 is misfiled.
+## The mechanism — `-O3` trades a branchless test for an unpredictable BRANCH
 
-## The next step, and it is a measurement not an implementation
+`-O` and `-O3` produce almost the same shape: both leave 2 functions with 9 and 16/15 locals. Same
+`array.get`/`array.set` counts (10/6), same call count. **Identical structure, 43% apart** — so this
+is neither an inlining difference nor a locals-allocation difference. The hot loop condition is:
 
-Hand-inline a hot callee in VL **source** (`sort-heap` with `siftDown` inlined by hand is the case
-the failed slice had reached), build it with the **default** emitter, and compare against:
+    while cont && root * 2 + 1 <= last
 
-1. the same source un-inlined, default build — the baseline;
-2. the un-inlined source at `-O3` — what binaryen achieves;
-3. the hand-inlined source at `-O3` — whether binaryen still adds anything once inlining is done.
+`-O` emits it branchlessly, computing `root*2+1` once into a local:
 
-If (1 → hand-inlined default) captures most of (1 → 2), the emitter can win it cheaply. If it does
-not, the residue is the coalescing and P9 should be re-filed as a locals-allocation item.
+    local.get 1 / i32.const 1 / i32.shl / i32.const 1 / i32.add
+    local.tee 3          ;; child stashed
+    local.get 2 / i32.le_s
+    i32.and              ;; <-- branchless combine with `cont`
 
-Also count locals in each: the 62-vs-20 figure is the discriminator, and it is cheap to read out of
-`wasm-dis`.
+`-O3` turns that into a control-flow diamond **and rematerializes the arithmetic** rather than
+reusing the stashed local:
 
-## Constraints that still apply
+    if (result i32)
+      local.get 1 / i32.const 1 / i32.shl / i32.const 1 / i32.add
+      local.get 2 / i32.le_s
+    else
+      i32.const 0
+    end
+    ...
+    local.get 1 / i32.const 1 / i32.shl / i32.const 1 / i32.add   ;; computed AGAIN
+    local.tee 3
 
-- **Compose vs overlap.** #1326's closure-dispatch win vanished at `-O3` because binaryen was already
-  devirtualizing. If P9 only duplicates what `-O3` does, its value is the DEFAULT rung alone — real,
-  but it must be stated that way rather than as a headline multiple.
-- **Do not chase a count into an allocation regression.** This compiler is WasmGC-allocation-bound and
-  its own self-compile is in the gate; report the compiler's byte delta and self-compile time, not
-  only benchmark wins.
+Heapsort's sift-down branch is data-dependent and essentially unpredictable, so converting a
+branchless `i32.and` into a conditional branch in the hottest loop in the program is close to the
+worst available trade — and the rematerialization removes the CSE that `-O` kept.
+
+**This is a heuristic misfire, not a correctness issue**, and it is binaryen's, not the emitter's.
+What is ours is the decision to ship `-O3` as *the* release profile on the strength of benchmarks
+that never compared it against `-O`.
+
+## What is REFUTED
+
+- **"The inlined function carries 62 locals; the variant with the cleanup pass coalesces to 20."**
+  This does not reproduce on `sort-heap` at any rung. Maximum locals anywhere in any of the six
+  builds is **20**, and the two rungs that differ 1.43× in speed differ by **one local** (16 vs 15).
+  Whatever produced 62 was a different pipeline (a bare `--inlining` invocation, most likely), and
+  **locals coalescing is not the discriminator on this case.** The hypothesis it was recorded to
+  support — that P9 might really be a locals-allocation item — is not supported here.
+- **"`-O3`'s win on `sort-heap` is 8–13%".** That number was the HAND-INLINING A/B (`main.vl` vs
+  `opt.vl` at the default rung), quoted forward one hop into the `-O3` column. `-O3`'s real effect
+  on this benchmark is **−0.4%**, i.e. nothing. *A second instance of this programme's recurring
+  failure: a number that is correct about one thing, requoted about another.*
+
+## What this means for P9 as an item
+
+**Re-file it.** "Inline small leaf functions in the default build" is worth ~5.6% on its own
+motivating benchmark, and worth **zero** at `-O` and above. That is not a headline item; it is a
+default-rung ergonomics fix, and it should be quoted that way or not scheduled.
+
+The item that displaced it is **the optimizer-rung default itself**: the release profile is slower
+than `-O` here, and nothing in the harness could have caught it.
+
+## The harness blind spot that hid this
+
+`bench/run.sh` measures the `vl` (default) column and the `vl-O3` column. **It has never built
+`-O`.** Every "`-O3` recovers N×" statement in `perf-landscape.md` is therefore a comparison against
+the *unoptimized* build, not against the best available rung — true as stated, and not the question
+a release profile needs answered. Adding the `-O` column is the fix, and it is cheap.
+
+## Measurement traps hit while taking these numbers (all cost a run)
+
+- **`vl build -O3` with no `wasm-opt` writes the UNOPTIMIZED module and exits 0**, with only a note
+  on stderr and an identical byte size. `wasm-opt` is NOT on PATH in this repo — it is vendored at
+  `node_modules/.bin/wasm-opt`. Set `VL_WASM_OPT` and **assert the byte size changed**, or every
+  optimized cell silently measures `-O0`. `bench/run.sh` already guards this; ad-hoc measurement does
+  not.
+- **Four "identical" md5s can all be the md5 of an EMPTY file.** `/usr/bin/time` does not exist in
+  this container; the timing loop that used it failed every run, wrote four empty outputs, and the
+  equality check passed. Assert non-empty before asserting equal — the playbook's empty-vs-empty diff
+  landmine, in a new costume.
+- Piping a long-running sweep into `tail` buffers all progress until it exits, which reads exactly
+  like a hung job.
+
+## Constraints that still apply to any future inliner
+
+- **Do not chase a count into an allocation regression.** This compiler is WasmGC-allocation-bound
+  and its own self-compile is in the gate; report the compiler's byte delta and self-compile time,
+  not only benchmark wins.
 - **The loop-shape gate counts loops MODULE-WIDE** (`tests/selfhost_native_release_test.ts`) and will
   fire on inlining. Get per-function counts before touching a golden — see `perf-landscape.md`.
 - Correctness grid an inliner needs: unused result, trapping callee, closures in and out, early
