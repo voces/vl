@@ -23,6 +23,7 @@ import {
   nodeTyMapValIsLitUnion,
   nodeTyMapValIsNulBool,
   nodeTyMapValIsNulLitUnion,
+  nameIsLitUnionArmValueUnion,
   nodeTyMapValLitUnionTexts,
   tyIsLitUnion,
   tyLitMemberTexts,
@@ -1949,6 +1950,40 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
       }
     }
   }
+  // `x is K` over a BOXED union carrying `K` as an ARM (`K | string`, `K | f64`) — a
+  // MEMBERSHIP test over the payload, NOT a box-tag compare. The litunion arm rides the box
+  // as its member STRING (`unionTakesAtomAsStr`), so it shares kind 2's tag with a `string`
+  // arm and the tag alone answers `x is K` TRUE for every string in a `K | string` box,
+  // members and non-members alike — a `vl check`-clean, `vl build`-clean silent wrong answer.
+  //
+  // Giving the arm its own tag cannot fix that, and this is measured rather than reasoned
+  // (docs/internals/litunion-compact-rep-design.md §7.1.1): `K ⊆ string`, so the two arms
+  // OVERLAP, and a value belonging to both must answer TRUE to `is K` AND to `is string`
+  // — which ONE tag field cannot do. A 14th value-atom kind moves the wrong answer from
+  // `is K` to `is string`; it does not remove it (2 grid cells UP, 3 DOWN, all three losses
+  // the same silent class).
+  //
+  // The answer that holds for both is the VALUE test `x is "aa" || x is "bb"` — the same
+  // membership the atom ladder above emits over interned ids, lowered here through the
+  // per-literal tag-gated payload compare (`emitUnionLitIs`), and the same semantics #1306
+  // gave the flattened `K | K2`. `unionEqOperandOk` bounds the receiver to a re-readable
+  // binding: each member re-reads it (twice — tag, then payload).
+  if nd0 is IsExpr {
+    const luNm = unionNameOfExpr(nd0.isObj, fnIx)
+    if luNm != "" && nameIsLitUnionArmValueUnion(luNm) {
+      const luTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
+      if luTexts.length > 0 && unionEqOperandOk(nd0.isObj) {
+        let luI = 0
+        while luI < luTexts.length {
+          const luLit = quoteLex(luTexts[luI])
+          if emitUnionLitIs(body, nd0.isObj, luLit, fnIx) < 0 { return -1 }
+          if luI > 0 { fbI32Bin(114) } // 0x72 i32.or
+          luI = luI + 1
+        }
+        return 0
+      }
+    }
+  }
   // `x is i32` / `x is string` / … over a BOXED value union: the same box-tag
   // compare as a struct variant, against the atom's globally-stable scalar tag.
   const ndv = P.nodes[isIx]
@@ -3556,7 +3591,11 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   const uname = unionNameOfExpr(objIx, fnIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
   const usid = msSetOfText(uname)
-  if uname == "" || !isValueUnionOfSet(usid, uname) {
+  // A union carrying a literal-union ALIAS arm (`K | string`, `K | f64`) is a BOX like any
+  // value union — the arm rides it as its member string — but `isValueUnionName` declines it
+  // because `valueAtomKind("K")` is -1. It is the same box with the same tags, so the
+  // lowering below is unchanged; only the gate had to learn the second spelling.
+  if uname == "" || (!isValueUnionOfSet(usid, uname) && !nameIsLitUnionArmValueUnion(uname)) {
     return emitFail(
       "emitProgram: literal `is` over a struct union is not supported",
     )
@@ -3592,7 +3631,14 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
     atom = "i64"
     lak = 3
   }
-  if !unionHasAtomK(usid, uname, atom, lak) {
+  // A QUOTED literal has a rep arm whenever the box can carry it as a string ref — a plain
+  // `string` arm OR a literal-union arm, which is exactly `unionTakesAtomAsStr`'s question.
+  // Without its second leg a `K | f64` box statically answers `is "aa"` FALSE: the member
+  // kinds bank only `f64` (`valueAtomKind("K")` is -1), so the arm that actually holds the
+  // value looks absent.
+  let litHasArm = unionHasAtomK(usid, uname, atom, lak)
+  if !litHasArm && lak == 2 && unionTakesAtomAsStr(uname) { litHasArm = true }
+  if !litHasArm {
     if emitExpr(body, objIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
     fbI32Const(0)
