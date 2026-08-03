@@ -1938,7 +1938,7 @@ nearly free, and what actually costs is something else that §L4 guessed at and 
 ### M1. The population: four shapes, four spellings, three rungs
 
 `bench/buffer-view-bounds/` holds the kernels, `bench/buffer-view-bounds/run.sh` is the harness and
-`tests/buffer_view_bounds_shape_test.ts` is the pin. Four SHAPES, chosen so the answer cannot be an
+`tests/vl_buffer_view_bounds_shape_test.ts` is the pin. Four SHAPES, chosen so the answer cannot be an
 artifact of one loop:
 
 | shape | what it is | accesses / iteration |
@@ -2162,7 +2162,7 @@ For everything else, in the order the decisions get made:
 
 ### M7. What is pinned
 
-- `tests/buffer_view_bounds_shape_test.ts` — every kernel x every rung, the `unreachable` / `call` /
+- `tests/vl_buffer_view_bounds_shape_test.ts` — every kernel x every rung, the `unreachable` / `call` /
   `struct.get` counts inside loops as exact goldens, plus three contract assertions that hold
   independently of the exact numbers: the fence survives `-O3`, the unfenced twin has no check (so
   the delta measures the fence and nothing else), and the fast pattern is bare. A moved cell is a

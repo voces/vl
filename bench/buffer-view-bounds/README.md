@@ -109,7 +109,7 @@ Four readings, in the order they matter:
 ## What is pinned, and what is not
 
 Timing cannot be gated in CI. What IS gated is the SHAPE the timing explains —
-`tests/buffer_view_bounds_shape_test.ts` builds every kernel here at every rung
+`tests/vl_buffer_view_bounds_shape_test.ts` builds every kernel here at every rung
 and counts the `unreachable` / `call` / `struct.get` instructions inside loops
 against exact goldens, plus three contract assertions (the fence survives `-O3`,
 the unfenced twin has no check, the fast pattern is bare). Those numbers are what

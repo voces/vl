@@ -556,7 +556,7 @@ eliminate some checks; "some" isn't a contract.)
 > **Second pass — the same answer, now READ OFF THE DISASSEMBLY, on four kernel
 > shapes; and one of the three conclusions above is wrong about WHY.**
 > (`buffer-design.md` §M; kernels in `bench/buffer-view-bounds/`, pinned by
-> `tests/buffer_view_bounds_shape_test.ts`.) The table above was timed, and a
+> `tests/vl_buffer_view_bounds_shape_test.ts`.) The table above was timed, and a
 > stopwatch cannot tell a check that was HOISTED from a check the branch
 > predictor gets right every time. So this pass counted instructions instead.
 >
