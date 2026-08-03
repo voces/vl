@@ -58,8 +58,22 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 >
 > **THE EMIT-SIDE / CHECKER-SIDE FRONTIER IS TRACKED PER BUCKET IN THE PROGRAMME DOC**, with the
 > populations re-derived on each slice's own base (they drift, and three consecutive slices found the
-> filed *unit* wrong rather than the filed number). Four standing corrections that outlived the
-> slices that made them:
+> filed *unit* wrong rather than the filed number).
+>
+> **THE UNIT IS WRONG AGAIN, AND THIS TIME IT INVERTS THE RANK ORDER (#1327).** `resolveAnnot` has
+> carried a name-keyed memo since #961 — the source says so in as many words: *"Only the MISS path
+> resolves, so only the miss path reads the tree."* Every scorecard in this programme has counted a
+> memo HIT and a real parse as one "reach", and **80.3% of emit-side reaches are hits**: 15,901
+> reaches are **3,031 parses**. Split that way the frontier reorders — `fieldElemTyIxOfName` is
+> 6,812 reaches but only **514 parses (7.5%, the LOWEST rate of the seven rows)**, dropping it from
+> 1st to 3rd, while `unMemAtomTyIx` is 1,991 reaches and **1,229 parses (61.7%)**, making it **first
+> at 40.5% of all emitter parsing**. *Five consecutive slices (#1291 → #1300) drove the row that asks
+> the annotation grammar least often per reach.* Rank by PARSES from here; the reach column is a
+> cache-hit census. (Row 4 is 1c below, which is design-blocked on W9 — so the honest reading is that
+> the top-by-parses item is blocked and the programme's remaining emit-side parsing is ~3,031 ops,
+> not ~15,901.) Note also the compiler's own 39k lines make the entire emitter parse **24** spellings.
+>
+> Four standing corrections that outlived the slices that made them:
 > - **1c `unMemAtomTyIx` — a checker-side recorder is REFUTED, not merely unscheduled** (#1294 §8).
 >   The checker and the emitter's bridge resolve the same union member and disagree on **444 of 761**
 >   comparable atoms, because `canonEmitTypeNames` rewrites the spelling in between. A recorder at the
