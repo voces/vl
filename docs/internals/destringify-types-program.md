@@ -39265,3 +39265,195 @@ by construction, and the annotated union-element literal that DOES move (§6) mo
   true about the bytes it wrote and false about the bytes it kept: two corpus files carried an
   entire unused i32 list, wrapper and helpers, 254 bytes each. *The comment was right; nobody had
   asked how many modules it applied to.*
+
+## D-PARSEUNIT — bucket 1a re-derived on `a688dc6e`, and the UNIT the whole emit-side scorecard ranks by is 80% MEMO HITS: `resolveAnnot` reaches are not `annotResolve` parses, and separating them inverts the frontier's rank order (census only; no `compiler/*.vl` change)
+
+#1291 filed 1a as *"`fieldElemTyIxOfName`, 9,805 reaches, the largest actionable remaining"*. #1293
+re-derived it to 7,770, #1300 to 6,737, and decomposed the residue into five sub-rows every one of
+which is marked REFUTED, BLOCKED or FILED-for-the-checker. This slice re-derives it once more on
+current master and then asks a question the programme has never asked: **of a row's `resolveAnnot`
+reaches, how many actually PARSE a string?**
+
+`resolveAnnot` has had a name-keyed memo since #961 (`annotNameMemo`, one index per spelling per
+program, plus a `cUserTypesVer`-stamped negative memo). Only the MISS path reaches `annotResolve`
+and reads the annotation grammar; a HIT is a `{[string]: i32}` lookup that returns an index already
+minted. **The ZZRA unit every scorecard in this document is written in counts both as one reach.**
+The owner's directive names the other one: *"if we're ever parsing strings for types (outside the
+actual parser), we're doing it wrong."*
+
+### 1. PROBE ZZHM — the same seven sites, split three ways
+
+ZZRA's counter, plus the classification taken INSIDE `resolveAnnotTs` at the three exits that
+already exist there (memo hit · negative-memo hit · `annotResolve`). Nested resolves under a probed
+site are suppressed to their own bucket so a site is charged only its outermost call; the checker's
+own calls land in an unarmed bucket. Probe-only, reverted — nothing below changes `compiler/*.vl`.
+
+```
+base:   master a688dc6e; build/vl-compiler.wasm from a freshly fetched seed-latest,
+        refresh-compiler.sh --prove-fixpoint rc 0, 1,118,866 B (master IS its own fixpoint,
+        compile(seed) == seed at one compile)
+build:  scripts/vl-host/target/release/vl build compiler/entry.vl \
+          -o C-zzhm.wasm --compiler build/vl-compiler.wasm
+run:    scripts/vl-host/target/release/vl check --codegen tests/cases --compiler C-zzhm.wasm
+        (one compiler instance for the tree; the LAST ZZHM record is the corpus total,
+         1,444 records)
+```
+
+| # | `emit_rep` `resolveAnnot` site | **reaches** | memo hit | neg hit | **PARSES** | parse rate |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | `repElemKeyOfNameTy` | 3,700 | 3,212 | 25 | **463** | 12.5% |
+| 2 | `sTyIxOfName` | 1,053 | 651 | 0 | **402** | 38.2% |
+| 3 | **`fieldElemTyIxOfName`** | **6,812** | 6,268 | 30 | **514** | **7.5%** |
+| 4 | **`unMemAtomTyIx`** | 1,991 | 762 | 0 | **1,229** | **61.7%** |
+| 5 | `slotCanonKey` | 54 | 23 | 16 | **15** | 27.8% |
+| 6 | `repNameCanonKey` | 622 | 367 | 27 | **228** | 36.7% |
+| 7 | `repRowOfName` | 1,669 | 1,489 | 0 | **180** | 10.8% |
+| | **emit-side total** | **15,901** | **12,772** | **98** | **3,031** | **19.1%** |
+| — | the CHECKER's own `resolveAnnot` calls (context) | 16,145 | 13,167 | 15 | 2,963 | 18.4% |
+
+The reach column reproduces #1300's post-merge ZZRA reading to within 0.25% in total and 4.7% on its worst row
+(3,713 · 1,050 · 6,737 · 2,089 · 54 · 629 · 1,669 = 15,941 there; 15,901 here, 26 master PRs
+later), so this is the same unit measured on a moved base — not a different instrument.
+
+**THE RANK ORDER INVERTS.** By reaches, row 3 is the frontier's biggest at 42.8% and row 4 is third
+at 12.5%. By parses, **row 4 is first at 40.5% of all emitter parsing and row 3 is third at 17.0%**.
+Row 3 has the LOWEST parse rate of the seven. Five consecutive slices (#1291 → #1300) drove the row
+that asks the annotation grammar least often per reach.
+
+### 2. BUCKET 1a RE-DERIVED, AND SPLIT BY CALLER IN BOTH UNITS
+
+Site 3's arm carries a caller id set at each of the five call sites of `fieldElemTyIxOfName` (all
+five are in files this partition owns). Every other row reads identically to §1 across the two probe
+builds, which is the instrument's internal control.
+
+| `fieldElemTyIxOfName` caller | **reaches** | hit | neg | **PARSES** | doc's filing |
+|---|---:|---:|---:|---:|---|
+| `mvSlotOfValNameRowTy` — the FIND (`emit_rep:927`) | 3,670 | 3,419 | 2 | **249** | 1a-i…1a-iv |
+| `rlInternNameTy` → `rlElemTyIx` (`emit_classify:12137`) | 1,570 | 1,536 | 25 | **9** | 1a-v |
+| `recordSFieldElemRow` (`emit_rep:1185`) | 789 | 606 | 3 | **180** | 1a-v |
+| `recordMvValTyIx` (`emit_rep:795`) | 685 | 685 | 0 | **0** | 1a-v |
+| `recordUFieldElemRow` (`emit_rep:1200`) | 98 | 22 | 0 | **76** | 1a-v |
+| **total** | **6,812** | 6,268 | 30 | **514** | |
+
+* **THE FILED 9,805 IS STALE BY 30.5%**: 6,812 on `a688dc6e`. That much the doc already said
+  (7,770 → 6,737); this reproduces it independently on a base 26 PRs later.
+* **`recordMvValTyIx` PARSES ZERO TIMES IN 685 REACHES.** #1300 filed it in 1a-v as one of "the four
+  D5 columns' own producers … retire only if the CHECKER writes the columns". By the time it runs,
+  its spelling is always already in the memo. Routing it would retire 685 string-keyed lookups and
+  **not one parse** — and, because a memo hit mints nothing, it is also the one row in the bucket
+  whose removal is provably arena-order-neutral. *Both facts were invisible in the reach unit.*
+* **1a-v re-derives at 3,142 reaches but 265 parses.** The sub-row the frontier table sizes at
+  3,092 — the one whose remedy is "the checker writes the columns" — is 8.7% of the emitter's
+  parsing.
+* **The ORIGINAL filed remedy, priced in the new unit.** #1291's "needs a per-field-CODE peel table"
+  targets exactly `recordSFieldElemRow` + `recordUFieldElemRow`, which share one home
+  (`emit_collect.pushFieldRow`). That is 887 reaches and **256 parses — 8.4% of all emitter
+  parsing**. #1293 already corrected the remedy's coverage to 8.9% of the reaches; the parse unit
+  puts it at the same order. It remains the largest *routable* parse population in row 3, and
+  `recordUFieldElemRow` is the densest row in the whole bucket at **77.6% parses** — the variant
+  field table is usually the FIRST thing in a program to resolve its element spelling.
+
+### 3. WHAT THE 514 PARSES ARE — captured, not inferred
+
+The probe banks the first 60 distinct missing spellings with their caller id. They are dominated by
+UNIONS, at every caller:
+
+```
+M12<i32|null>  M12<S|null>  M12<(S|null)[]|null>  M11<F1|null>  M13<(f64|{w:i32})[]>
+M13<f64|{q:i64}>  M12<{f:f64}|boolean>  M12<i64|string|{q:i64}>  M12<A|B>
+M13<string|{w:i32}|{q:i64}>  M12<{[string]:f64}|i64>  M12<((i32)=>K0)|f64>
+M14<(i32[]|{f:(i32,i32,i32)=>boolean})[]>  M11<(i32)=>i32|null>  M12<(()=>i64)|f64>
+M11<f32>  M11<f64>  M11<boolean>  M13<string>  M14<string[]>  M14<i32[]>
+```
+
+(`M11` = the FIND · `M12` = `recordSFieldElemRow` · `M13` = `recordUFieldElemRow` ·
+`M14` = `rlInternNameTy`.)
+
+**THE EMITTER'S RESIDUAL PARSING IS A UNION PROBLEM.** Row 4 (`unMemAtomTyIx` — the union-member
+ATOM bridge) is 40.5% of it on its own, and the spellings row 3 parses are mostly union spellings
+too. The bare-scalar entries (`M11<f32>`, `M11<f64>`, `M11<boolean>`) are the FIND resolving a map
+VALUE that is a primitive, purely to discover the mono i32 map declines it.
+
+### 4. THE SAME CENSUS ON THE LARGEST SINGLE PROGRAM — the compiler itself
+
+```
+run: scripts/vl-host/target/release/vl check --codegen compiler/entry.vl --compiler C-zzhm.wasm
+```
+
+| | reaches | hit | neg | **parses** |
+|---|---:|---:|---:|---:|
+| emit-side, all seven rows | 589 | 565 | 0 | **24** |
+| row 3 alone (all five callers) | 61 | 60 | 0 | **1** |
+| the checker's own calls | 13,816 | 13,767 | 0 | **49** |
+
+Lowering the compiler's own 39k lines, **the entire emitter parses 24 type spellings and the checker
+49**. The reach-unit total for the same run is 14,405. A programme measured in reaches reads this
+program as heavy string traffic; measured in parses it is already at zero for practical purposes.
+
+### 5. WHAT THIS SLICE DID NOT DO, AND WHY
+
+No `compiler/*.vl` change. Bucket 1a's five sub-rows were each re-checked against the new unit and
+none of them became routable:
+
+| sub-row | reaches | **parses** | verdict on this base |
+|---|---:|---:|---|
+| 1a-i the two NODE-holding MINTs | 2,854 (in the FIND) | — | REFUTED TWICE (#1291 §3a/§3b, re-measured #1300); nothing in the parse unit changes a D3 = 128 |
+| 1a-ii the name-only MINT callers | 477 | — | each holds a spelling by construction |
+| 1a-iii `ensureRefElemTy`'s map arm | 177 | — | blocked on COVERAGE (34 of 271), unchanged |
+| 1a-iv arena-declined fall-throughs | 137 | — | reached only because the arena rung above said no |
+| 1a-v the four D5 producers | 3,142 | **265** | 2,877 of the 3,142 are memo hits; `recordMvValTyIx` is 685 reaches / 0 parses |
+
+The one route the parse unit newly makes *attractive* — `pushFieldRow` supplying the two field-table
+recorders an arena type peeled from the field's annotation NODE, 256 parses — is **not** cheap in the
+way the reach unit made it look, and the reason is specific: at a MISS, `annotResolve` MINTS. Every
+one of those 256 is the first resolution of that spelling in its program, so skipping it does not
+skip a lookup, it removes a `T.tys` entry and renumbers every arena index after it — and
+`repElemKeyGo`'s identity arm keys `TyVar`/`TyLit`/`TyErr` by arena INDEX. **A hint that replaces a
+memo HIT is arena-neutral by construction; a hint that replaces a MISS is a rep change.** #1300's
+shipped replacements were all of the first kind (`recordSFieldElemRow` had already called
+`fieldElemTyIxOfName` on that string, so the consumer's call was a hit) — which is exactly why they
+graded 0 on all six corpus channels. Filed with its number, not taken here.
+
+### 6. GATE — census-only branch, every rc taken BARE
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,118,866 B** |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(seed) == seed — the seed IS the fixpoint (1 compile)"*, **1,118,866 B** — master's published compiler is its own fixpoint, so the census base is master exactly |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | see §6a |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — baselined rejects only, 0 new, 0 stale |
+| corpus A/B six channels | — | **VACUOUS AND SAID SO.** This branch changes one documentation file; `git diff master -- compiler/ std/` is empty and the built compiler is byte-identical to master's. An A/B of a compiler against itself is 0 by construction and is not evidence of anything. It is not banked. |
+| fuzz A/B | — | vacuous for the same reason, not banked |
+
+**BYTE DELTA: 0 B** — `build/vl-compiler.wasm` is byte-identical to the one master's own source
+builds (1,118,866 B), because no compiler source moved.
+
+### METHOD NOTES
+
+* **THE UNIT A PROGRAMME RANKS BY MUST BE THE UNIT ITS DIRECTIVE NAMES.** "Drive string parsing to
+  zero" was measured for ten slices as `resolveAnnot` REACHES. 80.3% of those reaches are memo hits
+  that never touch the annotation grammar (80.9% counting the negative memo), the ratio is not uniform across rows (7.5% to 61.7%), and
+  correcting for it moves the biggest bucket from first place to third and promotes a bucket the
+  frontier table has carried as REFUTED to first. *A census is not neutral about which work looks
+  large; ask what one unit of the thing you are counting actually costs before ranking by it.*
+* **A MEMO TURNS ONE HAZARD INTO TWO DIFFERENT ROUTES.** Replacing a resolution that would have HIT
+  the memo cannot change the arena — the index already exists, nothing mints, and the six corpus
+  channels are free to read 0. Replacing one that would have MISSED deletes a `T.tys` entry and
+  renumbers everything after it. Both look identical in the source and identical in the reach
+  census; they are different classes of change. *Before pricing a routing candidate, count its
+  MISSES — that number, not its reach count, is what says whether the slice is a memo removal or a
+  rep change.*
+* **A ROW THAT READS ZERO IN THE NEW COLUMN IS THE CHEAPEST THING THE COLUMN BUYS.**
+  `recordMvValTyIx` parses 0 times in 685 reaches. It was filed as needing a checker-side recorder —
+  the most expensive remedy in the document — for traffic that costs nothing and, uniquely in its
+  bucket, could be removed with no arena consequence at all. *Three of #1300's cheapest findings
+  were also rows that read zero; instrument the sites you are about to price, not only the ones you
+  are about to change.*
+* **ONE PROBE, TWO BUILDS, AND THE SECOND IS THE CONTROL.** The caller-split build changed only how
+  site 3's counter is bucketed, and rows 1, 2, 4, 5, 6, 7 and the checker's row read identically to
+  the digit across both. That is what licenses reading the split as a decomposition of the same
+  6,812 rather than as a second measurement of a moved target — and it caught the slice's own bug
+  first: arming the FIND by wrapping its TAIL expression made `zzSetFc(0)` the function's return
+  value, and the corpus trapped on the first program instead of reporting a plausible-looking table.
