@@ -312,7 +312,11 @@ passing any `i32`.
 - **Newtype of a generic application** (`type Box2 = new Box<i32>`) and generic
   newtypes (`type Handle<T> = new i32`). The generic-alias registry is a
   separate table from `cUserTypes` and the application is memo-keyed by a
-  synthesized name; branding it is a second design.
+  synthesized name; branding it is a second design. A generic newtype over a
+  SCALAR is further out than that: the registry accepts only a record body, so
+  it is a declaration form that does not exist rather than a brand that is
+  dropped (§9's table). A generic container that needs a brand carries a
+  CONCRETE newtype in a field instead — `flat-records-design.md` §11.3.
 - **Opting a newtype OUT of struct dedup** for runtime identity — §3.2.
 - **A newtype over a function type or an array type.** Both are one-member
   aliases the checker resolves transparently, so the brand mechanism reaches
@@ -482,6 +486,6 @@ this feature's or pre-existing:
 | `type Id = new i32` used as a MAP KEY (`{[Id]: i32}`) | `unknown type '{[Id]:i32}'`. **Pre-existing** — a plain `type Id = i32` alias gets the identical error on `d0a13651`. The map-key name grammar admits only the literal spellings; nothing to do with brands. |
 | `{[string]: f32}` + a float-literal `.set` | `set: expected f32, got f64`. **Pre-existing**, reproduced on `d0a13651` with no newtype present. The BRANDED spelling accidentally works (§7.1). |
 | a struct-valued map in a composite program (`{[string]: V}` beside a `V[]` and a `V \| null`) | `emitProgram: unsupported map value type`. **Pre-existing** — identical on `d0a13651` with `new` deleted. The newtype spelling matches the plain spelling exactly. |
-| `type Handle<T> = new i32` | the marker is accepted and ignored — a generic alias registers in a separate table that this phase does not brand. Silent, which is the wrong shape for a rejection; filed, §5. |
+| `type Handle<T> = new i32` | the marker is accepted and ignored — a generic alias registers in a separate table that this phase does not brand. Filed, §5. **The "silent" half is wrong**: only the DECLARATION is silent. Every APPLICATION is `unknown type 'Handle<i32>'`, in an annotation and in an `as` cast alike, so there is no way to reach the un-branded type at all. The rung below explains it — the generic-alias registry accepts only a **record** body, and plain `type Al<T> = i32` is equally `unknown type 'Al<i32>'`. Re-measured against the published seed while shipping `flat-records-design.md` §11.3, which needed a brand and did not need this one. |
 | `x is EntityId` | works when the union's arms are distinguishable by REP (`EntityId \| string`); a newtype has no runtime tag, so it cannot discriminate against its own base. §5. |
 | `Buf` itself (`{base, length}`) | still a plain struct, so still interchangeable with a same-shaped user struct. Pre-existing and unchanged — but the fix is now a one-word edit. |
