@@ -2456,6 +2456,25 @@ function emitModule(_stmts: i32[]) {
 
   emitFunctionSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
 
+  // Table section (id 4, between function (3) and memory (5)): the ONE `funcref`
+  // table function values dispatch through, sized to cover every user function at its
+  // own wasm index (`gImports + i`), so the id a closure already stores IS the table
+  // slot — see `gFnTableIdx`. The leading `gImports` slots stay null: they mirror the
+  // imported functions, which are never function-value targets, and paying `gImports`
+  // (≤ 5) null slots buys an identity index map instead of a bias every call site
+  // would have to re-apply. Emitted only when `fnValUsed`, mirroring the element
+  // section below, so a module with no function value emits no section 4.
+  if fnValUsed {
+    const tabPayload: i32[] = []
+    const tabPrev = wTarget(tabPayload)
+    wULEB(1)            // 1 table
+    wU8(112)            // 0x70 funcref element type
+    wU8(0)              // limits flag 0x00: min only
+    wULEB(gImports + n) // min: every user function, at its own index
+    wTarget(tabPrev)
+    wSection(4, tabPayload)
+  }
+
   // Memory section (id 5, between function (3) and global (6)): ONE module-DEFINED
   // memory, min 1 page (64 KiB — ample for the corpus' tag/value scratch region), no
   // max. The host IMPORTS `imports.memory` instead; the native runner provides no
@@ -2491,19 +2510,23 @@ function emitModule(_stmts: i32[]) {
     wSection(8, startPayload)
   }
 
-  // Element section (id 9): a single DECLARATIVE elem segment declaring every user
-  // function as `ref.func`-referenceable (lambdas). `ref.func` requires its target be
-  // forward-declared; with no table we use a declarative segment (flags 0x03, elemkind
-  // 0x00 funcref, then the func-index vec). Emitted ONLY when a function value exists
-  // (`fnValUsed`), so a no-lambda module emits no section 9 and stays byte-identical —
-  // mirroring the start-section conditional. Sits AFTER start (8), BEFORE code (10).
+  // Element section (id 9): a single ACTIVE elem segment that FILLS the section-4
+  // table with every user function at its own wasm index — the initializer for the
+  // dispatch table `call_indirect` reads. Flags 0x00 is the plain active form (table
+  // 0 implied, an i32 offset expr, then the func-index vec); the offset is `gImports`
+  // because entry `gImports + i` must hold user function `i`. Emitted ONLY when a
+  // function value exists (`fnValUsed`), so a no-lambda module emits no section 9 and
+  // stays byte-identical — mirroring the start-section conditional. Sits AFTER start
+  // (8), BEFORE code (10).
   if fnValUsed {
     const elemPayload: i32[] = []
     const elPrev = wTarget(elemPayload)
     wULEB(1) // 1 element segment
-    wU8(3)   // flags 0x03: declarative, elemkind + func-index vec
-    wU8(0)   // elemkind 0x00 — funcref
-    wULEB(n) // count of declared funcs
+    wU8(0)   // flags 0x00: active, table 0, offset expr + func-index vec
+    wU8(65)  // 0x41 i32.const — the offset expr
+    wSLEB(gImports)
+    wU8(11)  // 0x0b end
+    wULEB(n) // count of table entries written
     let di = 0
     while di < n {
       wULEB(gImports + di) // func index (imports occupy 0..gImports-1)
@@ -3537,23 +3560,22 @@ function emitTypeSection(
     wU8(1)             // mutable
   }
   if fnValUsed {
-    // The closure fat-pointer struct `{ code: funcref, env: (ref null struct),
-    // id: i32 }` (lambdas) — field 0 a GENERIC `funcref` (so ONE closure struct
-    // serves every function arity), field 1 a nullable `structref` env (null when
-    // non-capturing), field 2 the lifted function's wasm INDEX (`gImports + fe`) —
-    // the identity token for `==` (funcrefs admit no `ref.eq`). All IMMUTABLE. At a
-    // `call_ref` site the funcref is `ref.cast` to the concrete env-leading `$fnsig`
-    // for that call's arity, then `call_ref`. The interned `$fnsig` functypes (one
-    // per distinct value-call arity) follow.
+    // The closure fat-pointer struct `{ env: (ref null struct), id: i32 }` (lambdas) —
+    // field 0 a nullable `structref` env (null when non-capturing), field 1 the lifted
+    // function's wasm INDEX (`gImports + fe`), which is BOTH the identity token for
+    // `==` and the `call_indirect` operand. Both IMMUTABLE. ONE closure struct serves
+    // every function arity because the id is untyped; a call site supplies the concrete
+    // env-leading `$fnsig` as `call_indirect`'s type operand and the engine checks the
+    // callee against it, trapping on mismatch. The struct holds NO `funcref`: reading a
+    // funcref field back out of the GC heap is a host libcall in wasmtime (~9.4 ns) and
+    // writing one interns per closure created (~41 ns), where an i32 field is a plain
+    // load. The interned `$fnsig` functypes (one per distinct value-call arity) follow.
     wU8(95)  // 0x5f struct
-    wU8(3)   // 3 fields
-    wU8(99)  // field 0 code: 0x63 (ref null) funcref
-    wU8(112) // ...the abstract `func` heaptype (0x70 funcref)
-    wU8(0)   // immutable
-    wU8(99)  // field 1 env: 0x63 (ref null ht)
+    wU8(2)   // 2 fields
+    wU8(99)  // field 0 env: 0x63 (ref null ht)
     wU8(107) // ...to the abstract `struct` heaptype (structref)
     wU8(0)   // immutable
-    wU8(127) // field 2 id: 0x7f i32 — the function-identity token
+    wU8(127) // field 1 id: 0x7f i32 — identity token AND dispatch index
     wU8(0)   // immutable
     // One env-leading `$fnsig` functype per distinct eligible SIGNATURE, in
     // `cloSigKeys` order: `(structref, params...) -> ret`, the param/result valtypes
