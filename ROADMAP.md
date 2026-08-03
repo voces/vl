@@ -350,7 +350,21 @@ which is why they closed in order rather than in parallel.
   `docs/internals/flat-records-design.md` §11.3.
 - 🟡 **P1.3 Optimization defaults** — the PROFILE ships (#1318): `vl build -O3` runs
   `wasm-opt --closed-world -O3 --gufa -O3`, `-O` is unchanged, and a missing `wasm-opt` stays a soft
-  no-op. Two measured findings invert the ask. **(a) Heap2Local is the wrong lever** — `-O3`
+  no-op.
+  **THE ASK IS "OPTIMIZATION DEFAULTS" AND THE HONEST ANSWER IS THAT THE BEST RUNG IS PER-PROGRAM.**
+  `bench/run.sh` built the default and `-O3` and **never plain `-O`**, so every "`-O3` recovers Nx"
+  figure in `perf-landscape.md` means *versus unoptimized*, not *versus the best rung available* — a
+  question this suite had never asked. A three-rung sweep over all 46 benchmarks says `-O3` is not
+  uniformly the answer, and separates two failure modes the two-rung harness reported identically:
+  **`OPT-LOSES`** (both optimized rungs worse than none — 7 rows, headed by `arith/mixed-width` at
+  **2.23×**, where the *unoptimized* build is 212 ms against Rust's 188; already ruled UPSTREAM by
+  #1325, since bare `-O` carries it identically) and **`O3-WORSE-THAN-O`** (`-O` is the best rung and
+  `-O3` hands the win back — `arrays/sort-heap` 854 / **648** / 837, which #1325's ruling does NOT
+  cover and which IS a profile question). Both flags now ship in the harness with the `-O` column.
+  `-O3` still wins big where it wins (`lambda-hot` 2.2× over `-O`, `dispatch-table` 1.43×). See
+  `perf-landscape.md` §2.4a and §P11. **Do not answer this ask with a single recommended flag until
+  the per-program split is either fixed or documented as the answer.**
+  Two further measured findings invert the ask. **(a) Heap2Local is the wrong lever** — `-O3`
   open-world leaves all four allocations of the canonical union box and naming `--heap2local`
   explicitly changes nothing at any rung, while `--closed-world -O` melts all four; the box melts by
   closed-world type refinement + DCE, not escape analysis. `--gufa` is measurably INERT on VL output
