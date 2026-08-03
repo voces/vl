@@ -626,7 +626,15 @@ export function tyIsStrLeafElem(e: i32): boolean {
 
 // The name bridge for the ref-list layer (which is name-keyed): resolve a
 // ref-list element NAME to its arena type (memoized per spelling by
-// `resolveAnnot`), then compute its rep key. A spelling that does not resolve
+// `resolveAnnot`), then compute its rep key.
+//
+// IT ASKS `resolveAnnot` DIRECTLY rather than through `declTyIxOfName`, and that is
+// a MEASURED exclusion, not an oversight: the declared-name table and the annotation
+// memo hold different indices for a re-registered declaration (a `new` newtype over a
+// struct), and here — unlike at the file's other two name bridges — the two index
+// **rep keys differ**. `declTyIxOfName`'s header carries the counts and the witness.
+//
+// A spelling that does not resolve
 // keys on the name itself (nominal — matches only an identical spelling), and
 // the runaway cap mirrors `repNameCanonKey`'s (a name this long is never a legit
 // slot key — feeding it to `resolveAnnot` mints fresh arena types per probe).
@@ -1127,10 +1135,11 @@ export function recordSTyIx(v: i32) {
 
 // The arena type index a struct/variant FIELD's recorded ELEMENT/TARGET name denotes,
 // or -1 — the `sFieldElemTyIx` / `uFieldElemTyIx` sidecars' producer (phase D5).
-// Nominal first (`cUserTypes` — a declared struct / union / alias name IS its identity;
-// a code-15 field's target and a code-16 field's union name are usually exactly that),
-// then the checker's annotation grammar for a composite spelling (`{v:i32}`, `S[]`,
-// `(i32 | null)`). `resolveAnnot` memoizes per spelling — positively AND negatively —
+// Nominal first, then the annotation grammar — the two rungs of `declTyIxOfName`,
+// whose header owns the rule (a declared struct / union / alias name IS its identity;
+// a code-15 field's target and a code-16 field's union name are usually exactly that,
+// while a composite spelling — `{v:i32}`, `S[]`, `(i32 | null)` — needs the grammar).
+// `resolveAnnot` memoizes per spelling — positively AND negatively —
 // so the synthetic `#anonN` element names (which resolve through neither path) cost one
 // failed lookup per program and record -1, the self-healing "uncovered" value.
 // Runs ONCE per struct field at intern time, so the #961 runaway does not apply.
@@ -1140,6 +1149,33 @@ export function fieldElemTyIxOfName(nm: string): i32 {
   // long is never a legit slot key, and feeding it to `resolveAnnot` mints fresh arena
   // types per probe. -1 is the documented safe degenerate (the name path is kept).
   if nm.length > 4096 { return -1 }
+  declTyIxOfName(nm)
+}
+
+// The emit side's NAME → ARENA-TYPE bridge, and the one home for its two rungs:
+// the DECLARED-name table answers a nominal spelling directly, and ONLY a spelling
+// it does not carry reaches the annotation grammar. Guard-free by design — each
+// caller keeps its own empty-name and runaway-cap policy above this call, because
+// those policies differ (-1 · "" · -2) and one of them caps a spelling this
+// function never sees (`repRowOfName` caps the raw name and resolves the RENDER).
+//
+// **THE RUNG IS A PARSE ELIMINATOR, NOT A CACHE.** `resolveAnnot` memoizes per
+// spelling, so a repeat query is already a map lookup either way; what rung 1 removes
+// is the FIRST resolution of a declared name — the one call that actually reads the
+// annotation grammar. Measured over the corpus, that is 219 of `repNameCanonKey`'s
+// 228 annotation-grammar reads and 12 of `repRowOfName`'s 180.
+//
+// **IT IS NOT SOUND EVERYWHERE, AND THE PLACE IT IS NOT IS `repElemKeyOfNameTy`.**
+// A positive `annotNameMemo` entry is NOT invalidated when `cUserTypes` is rewritten
+// (only the negative memo carries `cUserTypesVer`), so for a name whose declaration
+// re-registers — a `new` NEWTYPE over a struct — the two rungs hold different arena
+// indices, and there they key DIFFERENT reps. Measured: over 1,417 corpus programs
+// the two answers agree on 262 of 262 covered `repNameCanonKey` reaches and 66 of 66
+// `repRowOfName` reaches, and disagree on 4 of 976 at `repElemKeyOfNameTy` — every one
+// of them the newtype `FView` (`tests/cases/memory/newtype-struct-views-distinct.vl`),
+// where `repElemKey` of the two indices differs. That site therefore keeps asking the
+// grammar; see `docs/internals/destringify-types-program.md` (D-DECLRUNG).
+export function declTyIxOfName(nm: string): i32 {
   const di = cUserTypes[nm] ?? -1
   if di >= 0 { return di }
   resolveAnnot(nm, repNoTyparams)
@@ -1733,7 +1769,7 @@ export function repNameCanonKey(nm: string): string {
   // quadruple-nest). "" is the documented safe degenerate: the slot just never
   // participates in dedup (never merged) and the resolver falls through LOUDLY.
   if nm.length > 4096 { return "" }
-  const di = resolveAnnot(nm, repNoTyparams)
+  const di = declTyIxOfName(nm)
   if di < 0 { return "" }
   repCanonKey(di)
 }
@@ -2077,7 +2113,7 @@ export function repRowOfName(nm: string, lim: i32): i32 {
   // The `repNameCanonKey` runaway cap (a render this long is never a legit key and
   // MINTS fresh arena types per probe — the >1GB crash family): decline it.
   if nm.length > 4096 { return -2 }
-  const di = resolveAnnot(renderFaithful(nm), repNoTyparams)
+  const di = declTyIxOfName(renderFaithful(nm))
   if di < 0 { return -2 }
   const t = T.tys[di]
   if !(t is TyObj) { return -1 }
