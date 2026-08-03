@@ -86,6 +86,26 @@ ns per inner-loop iteration, control subtracted, min-of-5 interleaved,
 | rows | buf | 1.730 | 1.670 | 0.680 |
 | rows | **hoist** | **0.407** | **0.459** | **0.500** |
 
+### The attribution control
+
+`axpy-fencedhoist` is not a spelling anyone should write — it is the control that
+decides whether the fenced surface's cost is the CHECK or the FIELD RELOAD. It
+keeps the six per-access compares, written by hand, and hoists both bases and
+both extents into locals. Its own interleaved run
+(`VB_ONLY='^axpy-' bench/buffer-view-bounds/run.sh`), so the four rows are
+directly comparable to each other rather than to the table above:
+
+| `axpy` spelling | fenced? | field reloads / element | (none) | `-O` | `-O3` |
+|---|---|---|---|---|---|
+| view | yes | 7 | 3.934 | 2.428 | 1.638 |
+| **fencedhoist** | **yes** | **0** | **0.639** | **0.552** | **0.543** |
+| buf | no | 0 | 2.387 | 1.943 | 0.630 |
+| hoist | no | 0 | 0.413 | 0.415 | 0.403 |
+
+Six compares cost 0.140 ns/element; seven field reloads cost 1.095. **A fully
+fenced hot loop is available at 1.35x the raw kernel at every rung** — the fence
+and the speed are not a trade.
+
 **Noise floor:** a full independent re-run moved these by 1-14%, worst on the
 smallest numbers (`rows-view` `-O3` 0.508 -> 0.581). Do not read anything inside
 15% off this table; the conclusions in §M are all drawn from 3x gaps or from

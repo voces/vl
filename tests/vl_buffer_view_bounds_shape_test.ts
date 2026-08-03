@@ -139,6 +139,13 @@ const TABLE: Record<string, Row> = {
   "reduce-buf": { none: c(0, 2, 0), O: c(0, 0, 1), O3: c(0, 0, 1) },
   "reduce-hoist": { none: c(0, 1, 0), O: c(0, 0, 0), O3: c(0, 0, 0) },
   "axpy-view": { none: c(0, 4, 1), O: c(2, 2, 3), O3: c(6, 0, 7) },
+  // The ATTRIBUTION control (§M4): the same six per-access compares as
+  // `axpy-view`, written by hand over a base and an extent hoisted into locals.
+  // Six traps and ZERO field reloads per element at `none`; the seventh trap and
+  // the four `struct.get`s that appear once optimized are the view CONSTRUCTION
+  // check and its field reads, inlined into the driver's TRIP loop — per trip,
+  // not per element, which is the limit of a loop-membership counter.
+  "axpy-fencedhoist": { none: c(6, 1, 0), O: c(7, 0, 4), O3: c(7, 0, 4) },
   "axpy-buf": { none: c(0, 4, 0), O: c(0, 2, 1), O3: c(0, 0, 1) },
   "axpy-hoist": { none: c(0, 1, 0), O: c(0, 0, 3), O3: c(0, 0, 3) },
   "rows-view": { none: c(0, 3, 0), O: c(2, 1, 2), O3: c(4, 0, 0) },

@@ -2095,6 +2095,35 @@ views in the loop as such — it is what GUFA can prove:
   even though the fields are IMMUTABLE in the emitted type (`(struct (field i32) (field i32))`, no
   `mut`) and the loop contains no allocation. There is no LICM for them at any rung.
 
+**The attribution is a MEASUREMENT, not an inference.** `axpy-fencedhoist` is the control that
+separates the two candidates: it keeps the check — the same six per-access compares, written by hand
+— and removes only the reload, by hoisting both bases and both extents into locals first. Its own
+interleaved min-of-5 run, all four `axpy` spellings together:
+
+| spelling | check? | field reloads / element | (none) | `-O` | `-O3` |
+|---|---|---|---|---|---|
+| `view` | yes | 7 | 3.934 | 2.428 | 1.638 |
+| **`fencedhoist`** | **yes** | **0** | **0.639** | **0.552** | **0.543** |
+| `buf` | no | 0 | 2.387 | 1.943 | 0.630 |
+| `hoist` | no | 0 | 0.413 | 0.415 | 0.403 |
+
+At `-O3`, (fencedhoist − hoist) = **0.140 ns** is the whole cost of six bounds compares (~0.023
+each), and (view − fencedhoist) = **1.095 ns** is the whole cost of the seven field reloads. Same
+loop, same check, one difference. The check is 11% of the fenced spelling's excess and the reload is
+89%.
+
+The practical consequence is the one webcraft should take away: **the fence and the speed are both
+available today, together.** A hand-fenced hoisted loop runs at 1.35x the unfenced hoisted kernel,
+against 4.1x for the fenced view spelling — and it does so at EVERY rung, including no flags, where
+it is still 2.6x faster than the view spelling is at `-O3`.
+
+That in turn is a filed design option, not something this section ships: a scalar-argument accessor
+per width (`getF32At(base, length, i)` and its three siblings) would put exactly this shape behind
+the std surface — the caller hoists `byteAddrF32(v, 0)` and `v.length` once, and the fence comes
+along for 0.023 ns per compare. It is one function per width and no compiler lines. It is left to an
+owner ruling because it widens `std:buffer`'s public surface (and its §L6a size tax) rather than
+fixing anything, and because the same 3.0x is reachable today by hand.
+
 Two consequences a kernel author has to design around, and neither is local to the loop:
 
 - **The fenced spelling's cost depends on the rest of the program.** Adding a second column of the
@@ -2138,7 +2167,10 @@ For everything else, in the order the decisions get made:
    flags on every fenced row, and `-O` gets a third of it. P1.3's ask, priced again here.
 3. **If the loop touches TWO OR MORE views of the same width, hoist.** That is the `axpy` row, that
    is the SoA integrate step, and the 3.5x is not the check — it is seven field loads per element
-   that nothing removes. Hoisting recovers all of it.
+   that nothing removes. Hoisting recovers all of it. **And hoisting does not mean giving up the
+   fence**: hoist the base and the extent, then keep `if i < 0 { __trap__() }` /
+   `if i >= n { __trap__() }` in the loop over the hoisted `n`. Measured 0.543 vs 0.403 ns — 1.35x
+   for a full per-access fence, against 4.1x for the same fence taken through the accessors (M4).
 4. **If you ship a flagless build, prefer `v.getF32(i)` to `v[i]`** — 31% on `scale`. At `-O`/`-O3`
    the two are identical, so this is an edit-loop consideration only.
 

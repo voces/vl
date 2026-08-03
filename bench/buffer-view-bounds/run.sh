@@ -84,11 +84,27 @@ mkdir -p "$WORK" || exit 1
 # which is the only spelling that executes the same ONE call per access as
 # `scale-buf` while still checking — i.e. the clean isolation of the check at the
 # unoptimized rung, where `view` is paying for the forwarding hop as well.
+#
+# `axpy-fencedhoist` is the ATTRIBUTION control, not a spelling anyone should
+# write: the same six per-access compares as `axpy-view`, written by hand over a
+# base and an extent hoisted into locals. It separates the check from the field
+# reload, which is the whole question §M4 turns on.
 KERNELS="scale-view scale-accessor scale-buf scale-hoist
 reduce-view reduce-buf reduce-hoist
-axpy-view axpy-buf axpy-hoist
+axpy-view axpy-fencedhoist axpy-buf axpy-hoist
 rows-view rows-buf rows-hoist"
 RUNGS="none O O3"
+
+# VB_ONLY is an ERE matched against each kernel name — for re-measuring one
+# family without re-timing the whole table.
+if [ -n "${VB_ONLY:-}" ]; then
+  sel=""
+  for k in $KERNELS; do
+    echo "$k" | grep -Eq "$VB_ONLY" && sel="$sel $k"
+  done
+  [ -n "$sel" ] || { echo "FATAL: VB_ONLY='$VB_ONLY' matched no kernel"; exit 1; }
+  KERNELS="$sel"
+fi
 
 # Inner-loop iterations per run: N * R, identical for all four shapes.
 ITERS=525336576

@@ -591,6 +591,26 @@ eliminate some checks; "some" isn't a contract.)
 > property.** Adding a second column of the same width to a module can turn a
 > free check into a 3.5x one without the kernel's source changing a character.
 >
+> **2a. And the fence is separable from that cost — you can keep it.** The
+> control that proves the attribution is the same `axpy` loop with the same six
+> per-access compares written by hand over a base and an extent hoisted into
+> locals. Its own interleaved run of all four spellings:
+>
+> | `axpy` spelling | fenced? | field reloads/element | (none) | `-O` | `-O3` |
+> |---|---|---|---|---|---|
+> | through the accessors (`y[i]`) | yes | 7 | 3.934 | 2.428 | 1.638 |
+> | **hoisted, fenced by hand** | **yes** | **0** | **0.639** | **0.552** | **0.543** |
+> | unfenced `Buf` accessors | no | 0 | 2.387 | 1.943 | 0.630 |
+> | unfenced hoisted (raw) | no | 0 | 0.413 | 0.415 | 0.403 |
+>
+> Six bounds compares cost **0.140 ns/element**; the seven field reloads cost
+> **1.095**. So a fully fenced hot loop is available at **1.35x** the raw kernel
+> — at every rung, no flag — where the accessor spelling costs 4.1x. Filed for a
+> ruling rather than shipped: a scalar-argument accessor per width
+> (`getF32At(base, length, i)`) would put this behind the std surface for one
+> function per width and zero compiler lines, but it widens `std:buffer`'s public
+> API and the same win is reachable by hand today.
+>
 > **3. The fast pattern, restated, and the rung it needs: NONE.**
 > ```vl
 > const a = x.byteAddrF32(0)     // base, once
