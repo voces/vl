@@ -111,6 +111,66 @@ re-runs of the unoptimised module (byte-identical, md5 verified) before catching
 exports `VL_WASM_OPT` *and* `cmp`s the `-O3` module against the `-O0` module, raising an `O3-NOOP`
 flag if they are byte-identical. **Zero benchmarks raised `O3-NOOP` in the recorded sweep.**
 
+### 2.4a THE HARNESS HAS NEVER BUILT `-O`, AND THAT BLINDS EVERY `-O3` VERDICT IN THIS FILE
+
+`run.sh` builds two rungs: the default and `-O3`. **The middle rung, plain `wasm-opt -O`, has never
+been measured.** So every statement of the form "`-O3` recovers 11.8x" in this document is a
+comparison against the *unoptimised* build — true as written, and not the question a release profile
+needs answered, which is "is `-O3` the best rung available".
+
+A three-rung sweep over all 46 benchmarks (interleaved min-of-3, all three rungs required to agree on
+non-empty stdout; the interesting rows re-taken at min-of-9) says it is not, and splits the failures
+into **two mechanisms the two-rung harness reports identically**:
+
+**(a) `wasm-opt` ITSELF loses — both optimised rungs are worse than no optimisation.** This class is
+**already ruled upstream by #1325** (see §P11): bare `wasm-opt -O` carries the regression identically,
+so no flag in the release profile is responsible — binaryen rotates the loop and Cranelift spills.
+What the third rung adds is the POPULATION. The existing `O3-REGRESSION` flag sees two rows; there
+are seven:
+
+| benchmark | default | `-O` | `-O3` | best optimised vs default |
+|---|---:|---:|---:|---|
+| `arith/mixed-width` | **212** | 479 | 472 | **2.23x SLOWER** |
+| `arrays/binsearch` | **1371** | 1785 | 1859 | 1.30x slower |
+| `algorithms/nbody` | **3081** | 3504 | 3331 | 1.08x slower |
+| `strings/token-count` | **1464** | 1584 | 1631 | 1.08x slower |
+| `strings/substr-search` | **633** | 676 | 709 | 1.07x slower |
+| `arrays/reverse-inplace` | **1682** | 1780 | 1807 | 1.06x slower |
+| `arith/bitcount` | **176** | 186 | 184 | 1.05x slower |
+
+`mixed-width` is the one to look at: VL's *unoptimised* build is 212 ms against Rust's 188 ms —
+near parity on a three-accumulator mixed-width loop — and running the optimiser at either rung
+throws that away. Both optimised rungs land within 1.5% of each other, which is the same signature
+#1325 measured with explicit flag ablation, now reproduced independently by rung.
+
+**(b) `-O3` SPECIFICALLY loses, and `-O` is the best rung.** The two-rung harness cannot see this
+class at all, because it reports the same "`-O3` ≈ default" as class (a):
+
+| benchmark | default | `-O` | `-O3` |
+|---|---:|---:|---:|
+| `arrays/sort-heap` | 854 | **648** | 837 |
+
+`-O` is a 1.32x win here that this document has never recorded, and `-O3` gives all of it back —
+landing in a dead heat with the unoptimised build. **The mechanism is understood.** `-O` compiles
+the sift-down loop condition branchlessly, computing `root*2+1` once into a local:
+
+    ... i32.shl / i32.const 1 / i32.add / local.tee 3 / local.get 2 / i32.le_s / i32.and
+
+`-O3` turns that `i32.and` into an `if`/`else` control-flow diamond **and rematerialises the
+arithmetic** instead of reusing the stashed local. Heapsort's sift-down branch is data-dependent and
+essentially unpredictable, so this converts a branchless test into a mispredicting branch in the
+hottest loop in the program. Both rungs emit the same function count and locals within one (9/16 vs
+9/15), so it is neither an inlining nor a register-allocation difference — it is one heuristic
+firing the wrong way. See `p9-inlining-notes.md`.
+
+**What this changes.** `-O3` remains the right default where it wins, and it wins big (`lambda-hot`
+2.2x better than `-O`, `dispatch-table` 1.43x, `mandelbrot` 1.28x). But "`-O3` is the release
+profile" is a claim this suite has never actually tested, and on the evidence the honest position is
+that **the best rung is per-program and the toolchain currently offers no way to discover that
+except measuring all three.** Adding the `-O` column to `run.sh` is the cheap fix and it should
+precede any further `-O3`-based recommendation. Until then, treat every `-O3` multiple in §3 and §4
+as "versus unoptimised", never as "versus the best we can do".
+
 ### 2.5 What was verified, so it is not re-litigated
 
 The adversarial audit ran over all 46 benchmarks × 4 languages and established:
@@ -723,13 +783,29 @@ the map side may already be half-built; **what is missing is a place to cache th
 itself.** That is a representation change (a mutable `hash` slot alongside the code-point array, or
 P12's linear-memory string), which is why this is L and not S.
 
-### P11 — the `-O3` regressions
+### P11 — the `-O3` regressions. **NOT the release profile's fault, and the name is misleading.**
 
 A release profile that makes a benchmark 2.43x slower is a finding in its own right.
-`arith/mixed-width`: 195.4 → 474.3 ms — `wasm-opt --closed-world -O3 --gufa` is actively destroying
-the mixed-width cast sequence. `arrays/binsearch`: 1464.3 → 1802.1 ms. Separately, `-O3` is a
+`arith/mixed-width`: 195.4 → 474.3 ms. `arrays/binsearch`: 1464.3 → 1802.1 ms. `-O3` is also a
 **wash or worse on the entire arith and arrays categories** and costs ~380 ms of build time against
-~9 ms plain. **Gate the release profile on this suite before recommending it.**
+~9 ms plain.
+
+**#1325 RULED THIS UPSTREAM, and the original diagnosis above — "`wasm-opt --closed-world -O3
+--gufa` is actively destroying the mixed-width cast sequence" — is refuted.** Bare `wasm-opt -O`
+carries the regression *identically*: plain 205 ms · `--closed-world` 209 · `--gufa` 205 · **bare
+`-O` 488**. No flag in the release profile is responsible. Binaryen rotates every loop and Cranelift
+then spills the carried values; V8 does not. The failure is gated by loop **shape**, and the fix is
+not ours.
+
+**That gate's counter is MODULE-WIDE** (`tests/selfhost_native_release_test.ts`) — it fired on #1328
+because `__str_eq__` gained an unroll remainder, while the probe it was supposed to be watching
+(`binsearch-probe`, zero string ops) was untouched. Get per-function loop counts before believing it.
+
+The three-rung sweep in §2.4a confirms the ruling on a wider population — seven benchmarks are worse
+at BOTH optimized rungs, not two — **and separates out a second class P11 does not cover**:
+`arrays/sort-heap`, where `-O` is the best rung by 1.32x and `-O3` specifically gives the win back.
+That one IS a profile question rather than an upstream one. `run.sh` now raises `OPT-LOSES` and
+`O3-WORSE-THAN-O` as distinct flags so the two never merge again.
 
 ### Not ours — track, do not chase inside `compiler/**`
 
