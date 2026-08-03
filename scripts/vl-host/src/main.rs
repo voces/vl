@@ -33,31 +33,112 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
-/// The std source directory `std:` module keys read from. First hit wins:
-/// `$VL_STD`; the repo `std/` resolved off the exe path (the dev tree — the
-/// binary lives at `scripts/vl-host/target/release/vl`, so four levels up);
-/// `<exe dir>/std` (the release layout: std ships beside the binary).
-fn std_dir() -> Option<std::path::PathBuf> {
+/// A `std/` directory is VL's own if it holds the modules `std/` is required to
+/// have. The marker exists only for the UPWARD SEARCH below, which would otherwise
+/// happily adopt any unrelated directory called `std` sitting above the binary
+/// (`/usr/include/std`, a vendored C++ tree, …) and then report every `std:` import
+/// as a missing module rather than as the wrong directory.
+fn is_vl_std(dir: &std::path::Path) -> bool {
+    dir.join("array.vl").is_file() && dir.join("test.vl").is_file()
+}
+
+/// Every place `std:` modules are looked for, in priority order — the resolution
+/// itself (`std_dir`) and the diagnostic that names what was tried share this one
+/// list, so the message can never drift from the search.
+///
+/// The dev tree used to be a single hard-coded `../../../../std`: FOUR levels up
+/// from the real exe path, because the binary lives at
+/// `scripts/vl-host/target/release/vl`. That count is a property of one build
+/// layout, not of VL — a binary copied, symlinked, or `cargo install`ed to any
+/// other depth silently resolved NO std at all, and every `std:` import failed as
+/// `no module std:test` with nothing pointing at the real cause. The search is a
+/// walk instead: each ancestor of the exe, nearest first, so the dev tree is found
+/// at whatever depth it happens to sit at.
+fn std_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
     if let Ok(dir) = std::env::var("VL_STD") {
-        return Some(std::path::PathBuf::from(dir));
+        out.push(std::path::PathBuf::from(dir));
+        // $VL_STD is an explicit instruction, not a guess: when it is set it is the
+        // only candidate, so a typo in it reports as a bad std dir rather than
+        // silently resolving somewhere else.
+        return out;
     }
-    let exe = std::env::current_exe().ok()?;
-    let exe_dir = exe.parent()?;
-    let dev = exe_dir.join("../../../../std");
-    if dev.is_dir() {
-        return Some(dev);
+    let Some(exe) = std::env::current_exe().ok() else {
+        return out;
+    };
+    let Some(exe_dir) = exe.parent() else {
+        return out;
+    };
+    // The release layout — std ships beside the binary. Taken on `is_dir` alone: a
+    // directory the distribution put there is unambiguous, marker or not.
+    out.push(exe_dir.join("std"));
+    // The dev tree, at any depth: the nearest ancestor holding a real VL `std/`.
+    for anc in exe_dir.ancestors().skip(1) {
+        out.push(anc.join("std"));
     }
-    Some(exe_dir.join("std"))
+    out
+}
+
+/// The std source directory `std:` module keys read from, or `None` when no
+/// candidate holds one. The first candidate is taken on existence; the rest must
+/// look like VL's std (see `is_vl_std`).
+fn std_dir() -> Option<std::path::PathBuf> {
+    let mut cands = std_candidates().into_iter();
+    let first = cands.next()?;
+    if first.is_dir() {
+        return Some(first);
+    }
+    cands.find(|c| is_vl_std(c))
+}
+
+/// Read the source of `std:<name>`, and on failure explain — ONCE per process —
+/// where the host actually looked.
+///
+/// The guest raises `Cannot resolve import "std:test" (no module std:test)`, which
+/// is true but reads as "VL has no such module" when the real cause is "this binary
+/// resolved no `std/` at all". The host is the only side that knows the paths, so
+/// it is the only side that can name them; the guest diagnostic stays exactly as
+/// it is and this rides alongside on stderr.
+fn read_std_module(name: &str) -> Option<String> {
+    let dir = std_dir();
+    let found = dir
+        .as_ref()
+        .and_then(|d| read_utf8(&d.join(format!("{name}.vl"))));
+    if found.is_none() {
+        static EXPLAINED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !EXPLAINED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            match &dir {
+                Some(d) => eprintln!(
+                    "note: `std:{name}` was not found at {}",
+                    d.join(format!("{name}.vl")).display()
+                ),
+                None => {
+                    eprintln!("note: no VL `std/` directory found — looked in:");
+                    for c in std_candidates() {
+                        eprintln!("        {}", c.display());
+                    }
+                    eprintln!(
+                        "      set $VL_STD to VL's `std/` directory, or run the binary \
+                         from a tree that has one"
+                    );
+                }
+            }
+        }
+    }
+    found
 }
 
 fn gc_engine(collector: Collector) -> Result<Engine> {
     let mut cfg = Config::new();
     cfg.wasm_gc(true);
     cfg.wasm_function_references(true);
-    // The COMPILER instance is one-shot batch work: the null collector (never
-    // frees) skips every DRC barrier/refcount, trading memory for speed — give it
-    // a large reservation to grow into. User programs (`vl run`) get a real
-    // collector: they may be long-lived and actually need garbage collected.
+    // A ONE-SHOT compile (`vl build` / `vl run` / a single-file `vl check`) is batch
+    // work: the null collector (never frees) skips every DRC barrier/refcount, trading
+    // memory for speed — give it a large reservation to grow into. Anything that keeps
+    // running gets a real collector: user programs (`vl run`) may be long-lived, and
+    // the CLI pump (`cli_pump`) compiles EVERY file of a directory walk in ONE store,
+    // so its garbage is unbounded in the file count, not the file size.
     cfg.collector(collector);
     if matches!(collector, Collector::Null) {
         cfg.gc_heap_reservation(8 << 30); // 8 GiB virtual reservation (lazily committed)
@@ -779,9 +860,7 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
                     // commits `found = 0` either way (the compiler's
                     // Cannot-resolve diagnostic fires, never the host).
                     let src = match key.strip_prefix("std:") {
-                        Some(name) => {
-                            std_dir().and_then(|dir| read_utf8(&dir.join(format!("{name}.vl"))))
-                        }
+                        Some(name) => read_std_module(name),
                         None => read_utf8(std::path::Path::new(&key)),
                     };
                     commit_module(store, &key, src.as_deref())?;
@@ -1082,6 +1161,55 @@ fn js_number_to_string(v: f64) -> String {
     } else {
         body
     }
+}
+
+/// A VL-level explanation for a wasm trap, or `None` when the trap carries no VL
+/// meaning worth restating.
+///
+/// A trap escapes as `wasm trap: integer overflow` over an address backtrace: that
+/// names the OPCODE that refused, which is the one thing a VL author cannot act on.
+/// Every arm below maps a trap code back to the VL SOURCE CONSTRUCT that emits it.
+///
+/// These are the deliberate stops of the language, not accidents: VL's numeric
+/// conversions trap instead of manufacturing a value out of one they cannot
+/// represent (docs/internals/numeric-conversion-ruling.md). Where several
+/// constructs share a trap code the text lists them — the host cannot tell them
+/// apart, and guessing one would send the reader to the wrong line.
+fn trap_explanation(trap: Trap) -> Option<&'static str> {
+    Some(match trap {
+        // `i32.trunc_f64_s` and friends. VL's `as` traps rather than saturating
+        // (Rust) or wrapping (JS) — the ruling and its alternatives are written up
+        // in docs/internals/numeric-conversion-ruling.md.
+        Trap::IntegerOverflow => {
+            "a float→integer conversion (`as i32` / `as i64`) whose value lies outside \
+             the target integer's range, or `i32.MIN / -1`.\n      \
+             VL truncates toward zero and TRAPS out of range — it does not saturate \
+             (as Rust does) or wrap (as JS does).\n      \
+             Guard the range before converting."
+        }
+        Trap::BadConversionToInteger => {
+            "a float→integer conversion (`as i32` / `as i64`) whose value is NaN or \
+             infinite.\n      \
+             No integer represents these, so VL stops rather than inventing 0."
+        }
+        Trap::IntegerDivisionByZero => "an integer division or remainder by zero.",
+        Trap::ArrayOutOfBounds | Trap::TableOutOfBounds => {
+            "an index outside the bounds of an array."
+        }
+        Trap::MemoryOutOfBounds => "a load or store outside the bounds of memory.",
+        Trap::NullReference => "a null value was used where a non-null one was required.",
+        Trap::CastFailure => "a value was not an instance of the type it was narrowed to.",
+        Trap::StackOverflow => "the call stack was exhausted — most often unbounded recursion.",
+        // The failure mode a long `vl check`/`vl fmt` directory walk hits: the pump's
+        // GC heap could not satisfy a request. `cli_pump` uses a COLLECTING collector
+        // for exactly this reason, so reaching here means a genuinely oversized
+        // allocation rather than accumulated garbage.
+        Trap::AllocationTooLarge => {
+            "an allocation larger than the GC heap can ever hold."
+        }
+        Trap::UnreachableCodeReached => "an `unreachable` instruction — a compiler-emitted trap.",
+        _ => return None,
+    })
 }
 
 /// Instantiate an emitted VL program with the host print-import family and run it
@@ -1942,7 +2070,17 @@ fn cli_pump(args: &[String]) -> Result<()> {
     }
     let compiler = resolve_compiler(compiler);
 
-    let engine = gc_engine(Collector::Null)?;
+    // A COLLECTING collector, unlike the one-shot compile paths. The pump drives one
+    // compiler instance across every file a directory walk finds, so its garbage grows
+    // with the FILE COUNT; under the null collector the heap only ever grows and a walk
+    // of a few dozen files dies with `wasm trap: allocation size too large`. Two copies
+    // of this repo's own `compiler/` (54 files) were enough.
+    let engine = gc_engine(match std::env::var("VL_PUMP_GC").ok().as_deref() {
+        Some("null") => Collector::Null,
+        Some("tracing") => Collector::Copying,
+        Some("refcount") => Collector::DeferredReferenceCounting,
+        _ => Collector::Auto,
+    })?;
     let (mut store, inst) = load_compiler(&engine, &compiler)?;
 
     // TTY + NO_COLOR is host mechanism; the VL formatter can't probe isatty, so the
@@ -2017,9 +2155,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // A missing file commits `found = 0` (the VL program raises its own
                 // unresolvable-import / cannot-read diagnostic).
                 let data = match path.strip_prefix("std:") {
-                    Some(name) => {
-                        std_dir().and_then(|d| read_utf8(&d.join(format!("{name}.vl"))))
-                    }
+                    Some(name) => read_std_module(name),
                     None => read_utf8(std::path::Path::new(&path)),
                 };
                 match data {
@@ -2155,7 +2291,30 @@ fn cli_pump(args: &[String]) -> Result<()> {
 }
 
 
-fn main() -> Result<()> {
+/// Print a failed run the way anyhow would, plus — when a wasm TRAP is anywhere in
+/// the cause chain — the VL-level `note:` that says which source construct stops
+/// here. Without it a trap reaches the author as an opcode name over an address
+/// backtrace, with nothing naming the VL operation that refused.
+fn report(err: Error) -> ! {
+    eprintln!("Error: {err:?}");
+    if let Some(note) = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<Trap>())
+        .and_then(|t| trap_explanation(*t))
+    {
+        eprintln!("\nnote: {note}");
+    }
+    std::process::exit(1);
+}
+
+fn main() {
+    match real_main() {
+        Ok(()) => {}
+        Err(e) => report(e),
+    }
+}
+
+fn real_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     // `fmt`, `run`, and `check` have their own arg shapes (optional/absent file,
     // flags, stdin), so they're dispatched before the positional `<cmd> <input>`.
