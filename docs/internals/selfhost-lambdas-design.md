@@ -180,6 +180,21 @@ host does precisely this with `captureCollector` while compiling the body
 
 ### 3.2 Recommended representation: `call_ref` + a typed-funcref closure struct (NOT a table)
 
+> **SUPERSEDED BY MEASUREMENT — the emitter now uses a table + `call_indirect`.** Two of
+> this section's load-bearing predictions were measured and are false. (a) *"On perf and
+> size the two are ~neutral"*: in wasmtime a `funcref` cannot live in the GC heap as a
+> pointer, so reading the `code` field is not a load but the builtin host call
+> `get_interned_func_ref` — **8.4 ns against ~0.15 ns for any other field of the same
+> struct**, plus a matching intern libcall on every `struct.new`. (b) *"The emitter's job
+> is to emit the simplest correct lowering and let `-O` recover the performance"*: `vl run`
+> has no `-O` at all, and `-O` can only recover this where the callee is statically
+> unique — on `dispatch-table`, where it is not, `-O3` recovered nothing and was a 0.94x
+> pessimization. The table costs 30 bytes of emitter and made the corpus's modules
+> **smaller** on net. The one prediction that held is the type-safety column, but not as
+> stated: because field 0 was a GENERIC `funcref`, its check was already a RUNTIME
+> `ref.cast`, never validation — so `call_indirect`'s runtime signature check is the same
+> guarantee, not a weaker one. See `docs/internals/perf-program.md` §13.
+
 The host uses `call_indirect` + a **table** + an **elem section** because binaryen makes
 tables cheap. The self-host emitter has **no table section and no elem section today**
 (grep: the only `section 9`/table mention is a comment; the only `wU8(4)` is the `if`

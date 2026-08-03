@@ -2278,3 +2278,202 @@ still run. **What is missing is the only number that matters**: whether an immut
 actually lets binaryen fold the loop bound. P10's filed value was always "enables
 downstream folding", so shipping it without that measurement would prove nothing. The next
 attempt should measure the fold before writing the patch.
+
+## 13. PERF item P2 — a closure's code pointer stops being a `funcref`
+
+VL's closure fat-pointer was `{ code: funcref, env: structref, id: i32 }` and every call
+read field 0. **In wasmtime a `funcref` cannot live in the GC heap as a pointer**, so that
+`struct.get` does not lower to a load — it lowers to the builtin host call
+`get_interned_func_ref` (`wasmtime-internal-cranelift-47.0.2/src/func_environ/gc.rs`,
+carrying wasmtime's own TODO to remove it). The mirror libcall
+`intern_func_ref_for_gc_heap` runs on every `struct.new`. So a function value cost a host
+call **per call** and a second one **per creation**, and `emitMfInvoke` paid the first
+**once per element** of every `.map`/`.filter`.
+
+Field 2 already held `gImports + fe`, the callee's wasm function index, kept only as the
+`==` identity token. That is exactly `call_indirect`'s operand. The funcref is now gone.
+
+### 13.1 What shipped
+
+| site | before | after |
+| --- | --- | --- |
+| `emit_sections.vl` element section | DECLARATIVE segment (flags `0x03`), no table | a `funcref` **table** of `gImports + n` entries (new section 4) + an **ACTIVE** segment at offset `gImports` |
+| `emit_sections.vl` closure struct | 3 fields, field 0 `funcref` | 2 fields: `{ env: structref, id: i32 }` |
+| `wasmEmit.vl` `emitClosureValueCore` | `ref.func` + env + id | env + id |
+| the three read sites | `struct.get 0; ref.cast $fnsig; call_ref $fnsig` | `struct.get 1; call_indirect $fnsig` |
+
+The segment offset is `gImports` so that **table slot `i` holds wasm function `i`** — the
+stored id indexes the table with no translation, which is why nothing else had to learn a
+bias. The leading `gImports` (≤ 5) slots stay null; they mirror the imported functions,
+which are never function-value targets.
+
+`emit_bytes.vl` gains `fbCallIndirect` and loses `fbRefFunc`/`fbCallRef` — with them
+`OP_REF_FUNC` and `OP_CALL_REF`, because `vl check --severity info` (the `lint-self.sh`
+gate) fails on an unused function and would have caught them anyway.
+
+**Field numbering moved, and that is the whole risk surface.** Env went 1 → 0 and id
+2 → 1, so all eight remaining reads had to move together. The layout has a property worth
+recording: the two surviving fields have **different valtypes** (`structref` and `i32`),
+so any read left at the old index is a wasm **validation** failure, never a silent
+misread. The one thing validation cannot catch is the table MAPPING — a segment written
+at the wrong offset sends a call to a different function of the same signature, which
+`call_indirect`'s type check accepts. That is what the new corpus case exists for.
+
+### 13.2 Soundness is preserved, and the design doc's claim was already wrong
+
+`docs/internals/selfhost-lambdas-design.md` §3.2 chose the funcref representation partly
+on "mismatched call = **validation** error" versus the table's "runtime trap". **That was
+never true of what shipped.** Field 0 was declared a GENERIC `funcref` (deliberately — so
+one closure struct serves every arity), so the call site had to `ref.cast` it to the
+concrete `$fnsig`, and a `ref.cast` is a RUNTIME check. The guarantee was always a
+runtime trap; `call_indirect` performs the same runtime signature check against the same
+type index, so it is the same guarantee, not a weaker one.
+
+Demonstrated rather than asserted. No VL source spelling can deliver an arity-2 callee to
+an arity-1 call site, so the wrong-signature closure was injected at the wasm level — the
+closure built for `(i32)=>i32` was made to carry `(i32,i32)=>i32` while the call site kept
+its arity-1 `$fnsig`:
+
+| module | edit | result |
+| --- | --- | --- |
+| master | `ref.func 5` → `ref.func 6` | validates, then **`wasm trap: cast failure`** |
+| this branch | `i32.const 5` → `i32.const 6` | validates, then **`wasm trap: indirect call type mismatch`** |
+
+Both trap; neither runs the wrong function. The two failure modes a table has that a
+field does not also trap rather than misbehave: an id landing on a null slot is
+`uninitialized element`, and one past the end is `undefined element: out of bounds table
+access`. The trap TEXT differs between the two representations, and no corpus case
+observes it — the six-channel A/B's RUN channel, which carries trap reasons, is identical
+on all 1,722 files.
+
+### 13.3 Measured
+
+Interleaved min-of-5 (every configuration once per round, fixed order, so load drift hits
+both sides), `taskset -c 6`, prebuilt modules, empty-program startup subtracted, with a
+byte-identical copy of the A module run as its own configuration to measure the floor.
+**Three passes**: two against master at `25b1d785` on a quiet box, one against master at
+`fc15b17e` (post-rebase, so it includes P1 and P11) under heavy contention.
+
+| pass | load (before → after) | noise floor, identical bytes |
+| --- | --- | --- |
+| 1 | 0.66 → 1.96 | **0.76%** |
+| 2 | 1.79 → 1.86 | **0.35%** |
+| 3 (rebased) | 36.25 → 15.70 | **2.55%** |
+
+Every ratio below is quoted across all three passes. Nothing here is within the floor.
+
+| benchmark | master | this branch | **x (default)** | master -O3 | branch -O3 | **x (-O3)** |
+| --- | --: | --: | --: | --: | --: | --: |
+| `algorithms/lambda-hot` | 2085–2145 ms | 458–464 | **4.50 / 4.54 / 4.68** | 163–175 | 168–175 | 1.00 / 1.04 / 1.00 |
+| `algorithms/dispatch-table` | 1142–1187 | 361–386 | **2.98 / 3.17 / 3.23** | 1197–1227 | 247–258 | **4.90 / 4.76 / 4.75** |
+| `.map`, 10M callbacks | 141–144 | 52–56 | **2.58 / 2.52 / 2.75** | 40–43 | 40–44 | 0.91 / 0.99 / 1.01 |
+| 50M closure CALLS | 483–484 | 65–66 | **7.34 / 7.34 / 7.37** | 19–20 | 20 | ~1.00 |
+| 50M closure CREATIONS + calls | 3113–3132 | 110–113 | **28.4 / 28.3 / 27.8** | ~20 | ~20 | ~1.00 |
+
+**The call win and the creation win are different libcalls, so they are measured
+separately.** `call-only` holds one closure and calls it 50M times; `alloc-call` is the
+same program with the creation moved inside the loop (verified in the disassembly: the
+`struct.new` really is in the loop body). The difference between them, on one compiler, is
+the cost of one closure creation.
+
+| | master | this branch | saved |
+| --- | --: | --: | --: |
+| per closure CALL | — | — | **8.35–8.37 ns** |
+| per `.map` ELEMENT | — | — | **8.50–9.16 ns** |
+| closure CREATION | **52.6–53.0 ns** | **0.87–0.95 ns** | **51.7–52.0 ns** |
+
+Creation collapses to under a nanosecond because, with no funcref in it, the record
+becomes an ordinary struct that Cranelift can **scalar-replace** when it does not escape —
+the same reason §4.2's creation ladder read 2.1 ns for an i32 field against 56.4 ns for a
+`ref.func` one.
+
+### 13.4 What the report claimed, and what the measurement says
+
+| claim | measured | verdict |
+| --- | --- | --- |
+| `lambda-hot` **5.4x** | **4.50–4.68x** | **too high** — real, but a sixth smaller |
+| `dispatch-table` **3.3x** | **2.98–3.23x** | slightly too high |
+| **−9.4 ns** per `.map` element | **−8.5 to −9.2 ns** | confirmed at the low end |
+| **−41 ns** per closure allocation | **−51.7 to −52.0 ns** | **too low** — the allocation win is 26% bigger than filed |
+| the funcref read costs 9.40 ns | 8.35 ns per call | confirmed within noise |
+| "the self-hosted compiler itself uses closures" | **false** — see 13.6 | refuted |
+
+Two further results the filing did not predict:
+
+- **P2 does not compose with `-O3` on `lambda-hot`; it composes on `dispatch-table`, and
+  there it rescues `-O3` outright.** On `lambda-hot` binaryen already devirtualizes and
+  deletes the closure, so `-O3` is unchanged (1.00x) and still 2.6–2.8x faster than this
+  branch's default build — the remaining gap is inlining, not dispatch. On
+  `dispatch-table` the target is genuinely dynamic and devirtualization is impossible:
+  master's `-O3` is a **0.94–0.97x pessimization**, and with P2 the same flag becomes a
+  **1.42–1.55x win**. Filed at 4.75–4.90x, the largest single ratio in the set.
+- **`-O3` on `.map` is a wash either way** (0.91 / 0.99 / 1.01 across three passes — the
+  0.91 sat outside pass 1's floor and did not reproduce, so it was noise, not a
+  regression).
+
+### 13.5 Gate
+
+| leg | rc | headline |
+| --- | --: | --- |
+| `fetch-seed.sh` (fresh `seed-latest`) | 0 | seed-latest moved mid-session; both the old and the new one compile this source |
+| `refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint holds; **same bytes from two different seeds**, which is the property that matters |
+| `native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | 3,665 passed, 0 failed, **7 ignored** (the baseline count — not ~600, so prereqs held) |
+| `lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `rep-fuzz-check.sh` | 0 | exact — 1 baselined, 0 new, 0 stale |
+| **six-channel corpus A/B**, 1,722 files | — | CHECKRC 0, CHECKMSG 0, BUILDRC 0, BUILDSTDERR 0, RUNRC 0, **RUN 0** — only BYTES moves |
+| **fuzz A/B**, 7 seeds incl. `--branching` | — | identical finding sets on every seed |
+
+**The corpus A/B is clean on all six behavioural channels and moves only module SIZE**:
+412 of 1,722 modules change, **net −3,123 bytes**, 296 smaller and 116 larger, from −127
+to +5. The largest shrinks are closure-dense files (a `ref.cast` plus a `ref.func` per
+closure outweigh the table); the +5 rows are `functions/nested*`, where a program builds
+one capturing closure and pays the table section's fixed cost against almost no saving.
+
+Two instrument notes, both of which would have produced a false clean:
+
+- **The shared six-channel harness normalizes `0x<hex>` but not the per-invocation
+  `mktemp` directory**, which appears in `vl build`'s own "wrote …" line. Un-normalized,
+  **1,442 of 1,720 files "differed"** — every one of them spuriously, and a real
+  difference would have been indistinguishable in that noise. The temp path has to be
+  normalized rather than the line dropped, because that same line carries the module byte
+  count, which is the one channel that legitimately moves here.
+- **Fuzz REACH was measured, not assumed.** The emitter only emits section 4 when a
+  function value exists, so the table's presence in the output IS the reach oracle:
+  **39 of 400 generated modules (9.75%) emit one** (70 of 400 spell `=>` in source; the
+  rest are rejects or type-only spellings). The identical finding sets are therefore
+  evidence rather than a vacuous zero.
+
+**Seed-bootstrap: NO SPLIT.** A freshly fetched `seed-latest` compiles this branch's
+source directly — the change adds no language surface, only two byte emitters.
+
+### 13.6 What could not be verified, and what is deliberately left
+
+- **The self-hosted compiler does not exercise this path.** `compiler/*.vl` uses no
+  function values (`fnValUsed == 0`), so its own module has **zero tables and zero
+  `call_indirect`** and the bootstrap ladder is silent on the change — `compile(next) ==
+  next` at the first rung held precisely because the emitter's own output is unaffected.
+  The briefing expected a mistake here to "break the bootstrap loudly"; it would not. The
+  load-bearing gates are the corpus, the suite and the fuzz A/B, not the fixpoint.
+- **V8 is verified; a browser is not.** `tests/cases_wasm_test.ts` runs the whole corpus
+  through `tests/support/runWasm.ts` on deno/V8 — a different engine from wasmtime, where
+  a funcref field is an ordinary load — and it is **1,654 passed / 0 failed**, including
+  the new case. The playground/browser path was **not** verified: this worktree has no
+  browser and the playground tests run under deno, so they are the same V8 evidence, not
+  new evidence.
+- **The `-O3` module was checked for the O3-NOOP hazard** (`vl build -O3` writes the
+  unoptimised module and exits 0 when it cannot find `wasm-opt`): every `-O3` build is
+  byte-different from its `-O0` twin, asserted per benchmark in the build script.
+- **The identifiers still say `call_ref`** — `emitCallRef`, `callRefSlot`,
+  `fnUsesCallRef`, `blockHasCallRef`. They name the function-VALUE call path, not the
+  instruction, and renaming them is a mechanical sweep across ~110 sites in five files
+  that would bury this change and collide with concurrent work. The COMMENTS that
+  asserted the removed mechanism (a funcref field, `ref.func`, a call-site `ref.cast` on
+  it) were rewritten; the path names were not.
+- **The complementary hoist is not attempted.** §4.2 variant G — hoisting the closure
+  unpack out of a loop when the closure is a loop-invariant local — measured 10.6x where
+  it applies and is strictly better there, but it only applies to loop-invariant
+  closures. It composes with this and remains open.
+- **`return_call_indirect` is now available and unused.** P1 (#1324) emits `return_call`
+  for a direct call in tail position; a function-value call in tail position could take
+  `return_call_indirect` (`0x13`) by the same rule. Not attempted here.
