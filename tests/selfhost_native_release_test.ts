@@ -43,6 +43,13 @@
 //     deterministic, independent of machine load, and causally tied to the
 //     slowdown (hand-editing exactly this shape back recovers the whole 2.4x).
 //
+// (4) THE FEATURE ENABLES ACCEPT WHAT THE EMITTER WILL PRODUCE. `BINARYEN_FEATURES`
+//     is shared by both rungs and by `--wat`, and binaryen HARD-FAILS validation on
+//     an opcode whose feature is not enabled — exit 1 with NO OUTPUT FILE, so the
+//     rung `bail!`s rather than degrading. `tests/fixtures/opt-tailcall/` pins the
+//     tail-call enable that way, and the flag lists are read OUT OF `main.rs` so the
+//     test cannot drift from what ships.
+//
 // A missing `wasm-opt` stays a SOFT NO-OP for `-O3` exactly as for `-O`, which is
 // its own case below (exit 0, a note on stderr, the unoptimized module on disk).
 //
@@ -369,6 +376,87 @@ for (const rel of CASES_LIST) {
     },
   });
 }
+
+// THE FEATURE-ENABLE GATE. A wasm feature that binaryen does not have enabled is
+// not a missed optimization — it is a HARD FAILURE: `wasm-opt` exits 1 and writes
+// no output, so the rung bails and the program cannot be built at all. That makes
+// the enables a compatibility contract with whatever `compiler/*.vl` emits next,
+// and `--enable-bulk-memory` and `--enable-tail-call` are both in the list AHEAD of
+// the emitter producing their opcodes for exactly that reason.
+//
+// The fixture is `.wat`, not `.vl`, on purpose: a `.vl` tail-recursive program
+// compiles to a plain `call` until the tail-call emitter slice lands, so it would
+// pass with or without the enable — inert for precisely as long as the gate is the
+// only thing standing between a flag edit and a broken `-O`.
+//
+// Both flag lists are parsed out of `main.rs` so this exercises what SHIPS. A
+// rewrite that moves them elsewhere makes this test fail loudly rather than
+// silently testing a stale copy.
+const rustList = (src: string, name: string): string[] => {
+  const m = new RegExp(`const ${name}: &\\[&str\\] = &\\[([^\\]]*)\\]`).exec(src);
+  if (!m) throw new Error(`could not find ${name} in scripts/vl-host/src/main.rs`);
+  return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+};
+
+Deno.test({
+  name: "native-release: the feature enables accept a return_call module at BOTH rungs",
+  ignore: !ENABLED,
+  fn: async () => {
+    const mainRs = Deno.readTextFileSync(`${ROOT}/scripts/vl-host/src/main.rs`);
+    const features = rustList(mainRs, "BINARYEN_FEATURES");
+    if (!features.includes("--enable-tail-call")) {
+      throw new Error(
+        "BINARYEN_FEATURES is missing --enable-tail-call.\n" +
+          "  Without it `wasm-opt` exits 1 on any module containing `return_call`\n" +
+          "  and writes NO output file, so `vl build -O`/`-O3` bail on every\n" +
+          "  tail-recursive program. See opt-profile-design.md §8.",
+      );
+    }
+    const wat = `${ROOT}/tests/fixtures/opt-tailcall/tailcall.wat`;
+    const tmp = await Deno.makeTempDir();
+    const sh = async (bin: string, args: string[]) => {
+      const { code, stderr } = await new Deno.Command(bin, { args, stdout: "piped", stderr: "piped" })
+        .output();
+      return { code, err: new TextDecoder().decode(stderr) };
+    };
+    try {
+      const base = `${tmp}/tc.wasm`;
+      const asm = await sh(`${ROOT}/node_modules/.bin/wasm-as`, [wat, ...features, "-o", base]);
+      if (asm.code !== 0) throw new Error(`wasm-as rejected the fixture: ${asm.err.trim()}`);
+
+      for (const [label, passes] of [
+        ["-O", rustList(mainRs, "OPT_PASSES")],
+        ["-O3", rustList(mainRs, "RELEASE_PASSES")],
+      ] as const) {
+        const out = `${tmp}/opt${label}.wasm`;
+        const r = await sh(WASM_OPT, [base, ...passes, ...features, "-o", out]);
+        if (r.code !== 0) {
+          throw new Error(
+            `${label} (${passes.join(" ")}) rejected a return_call module: ${r.err.trim()}\n` +
+              "  wasm-opt writes no output on a validation failure, so this is a hard\n" +
+              "  build failure for every tail-recursive program, not a lost optimization.",
+          );
+        }
+        // The opcode must SURVIVE: an optimizer that silently rewrote it back to a
+        // plain `call` would pass the exit-status check while undoing the 2.0x.
+        const dis = await new Deno.Command(WASM_DIS, {
+          args: [out, ...features],
+          stdout: "piped",
+          stderr: "piped",
+        }).output();
+        if (!new TextDecoder().decode(dis.stdout).includes("return_call")) {
+          throw new Error(`${label} removed the return_call (the tail call did not survive)`);
+        }
+        const run = await vl(["run", out]);
+        if (run.code !== 0 || run.out.trim() !== "5050") {
+          throw new Error(`${label}: optimized module printed ${JSON.stringify(run.out)}, want "5050"`);
+        }
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
 
 // `-O3` outranks `-O` when both are passed: the release profile is a superset of
 // `-O`'s effect on every measured shape, so running the shrink rung first would

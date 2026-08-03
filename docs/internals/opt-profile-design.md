@@ -516,3 +516,52 @@ binaryen fixed this — and the golden update is the record of it.
 - **`--gufa` as a byte win in isolation**: it GROWS the compiler module by 7.9 KB
   and only nets −593 bytes because an `-O3` runs after it (§3).
 - **`--gufa`'s ~2s cost**: under a second, within noise of its own control (§3).
+
+---
+
+## 8. The feature enables are a COMPATIBILITY CONTRACT, not a tuning knob
+
+`BINARYEN_FEATURES` is shared by `-O`, `-O3` and `--wat` (§6). Every other flag in
+this document trades one number against another; these do not. **A wasm feature
+binaryen does not have enabled is not a missed optimization — it is a hard build
+failure**: `wasm-opt` exits 1 with `error validating input` and writes **no output
+file**, so `optimize_in_place` `bail!`s and the program cannot be built at that rung
+at all. The failure is total and it lands on whoever writes the construct, not on
+whoever changed the flag.
+
+That is why the list is populated **ahead of** the emitter producing the opcodes:
+
+| enable | opcodes | why it is here before it is needed |
+|---|---|---|
+| `--enable-reference-types`, `--enable-gc` | all of VL's heap output | required today; binaryen will not validate VL output without them |
+| `--enable-bulk-memory` | `memory.copy` / `memory.fill` | the linear-memory tier (`buffer-design.md` §B4) |
+| `--enable-tail-call` | `return_call`, `return_call_indirect` | the tail-call emitter (`perf-landscape.md` P1, worth 2.06× on `recursion/tailcall`) |
+
+Measured for the tail-call row, since it was added on the strength of a slice that
+had not landed yet:
+
+- **Without it**, `wasm-opt` rejects a `return_call` module at BOTH rungs — rc=1,
+  `return_call* requires tail calls [--enable-tail-call]`, no output file. So the
+  day the emitter starts producing it, every tail-recursive program stops building
+  under `-O` and `-O3` while building fine without a flag.
+- **With it**, both rungs return rc=0 and the `return_call` **survives** the full
+  release profile (it is not rewritten back to a `call`, which would silently undo
+  the 2.06×). The optimized module runs on the host and prints the right answer.
+- **No host change is needed to RUN it**: wasmtime 47 has the proposal on by
+  default, and the module executes correctly unoptimized and at both rungs.
+
+Pinned by `tests/fixtures/opt-tailcall/tailcall.wat` and its case in
+`tests/selfhost_native_release_test.ts`. Two deliberate choices there:
+
+1. **The fixture is `.wat`, not `.vl`.** A tail-recursive `.vl` program compiles to
+   a plain `call` until the emitter slice lands, so it would pass with or without
+   the enable — inert for exactly as long as the gate is the only thing standing
+   between a flag edit and a broken `-O`. Hand-written wasm is what makes the gate
+   live from the commit that adds the flag.
+2. **The flag lists are parsed out of `main.rs`** rather than copied. A test with
+   its own copy of `BINARYEN_FEATURES` passes while the shipped list is broken;
+   parsing means the test either exercises what ships or fails loudly saying it
+   could not find the list.
+
+**When a slice adds an opcode from a new proposal, its enable belongs here in the
+SAME change**, and the test above is the pattern to extend.

@@ -1317,10 +1317,22 @@ fn binaryen_missing_note(flag: &str, tool: &str, env_override: &str, consequence
 /// (wasmtime 47, V8) have bulk memory on by default: it is wasm 2.0 core, so enabling
 /// it for binaryen costs nothing and closes a loud future failure.
 /// See `docs/internals/buffer-design.md` §B4.
+///
+/// `--enable-tail-call` is the same shape of flag for the same reason. Binaryen 130
+/// HARD-FAILS validation on `return_call`/`return_call_indirect` without it —
+/// measured: `rc=1`, "return_call* requires tail calls", and NO OUTPUT FILE
+/// WRITTEN, so `vl build -O` would `bail!` on every tail-recursive program. It is
+/// enabled AHEAD of the emitter producing the opcode so the day it does, neither
+/// rung breaks. Measured with it: `return_call` survives both `-O` and the full
+/// release profile intact, and wasmtime 47 runs the result with no host change
+/// (the proposal is on by default there). Because the enables are orthogonal to
+/// the optimization level, this belongs in the SHARED list — a rung that missed it
+/// would fail on exactly the programs the other rung optimizes fine.
 const BINARYEN_FEATURES: &[&str] = &[
     "--enable-reference-types",
     "--enable-gc",
     "--enable-bulk-memory",
+    "--enable-tail-call",
 ];
 
 /// `vl build -O` — the SHRINK rung. One `-O` pass, open world. It melts a scratch
