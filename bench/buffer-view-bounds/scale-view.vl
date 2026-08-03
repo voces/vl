@@ -1,0 +1,60 @@
+// SHAPE `scale`, spelling `view` — the CANONICAL fenced kernel: one f32 column,
+// read-modify-write per element, through `std:buffer`'s typed-view bracket.
+// Two bounds checks per element-update (one per access) plus the loop compare.
+//
+// The multiplier alternates 2.0 / 0.5 once per TRIP (not per element), so the
+// column ends at 2.0 after an odd R and at 1.0 for the R=0 control — an exact
+// detector that the inner loop actually ran.
+import { Buffer, F32View, byteAddrF32, f32view, storeI32 } from "std:buffer"
+
+const N = 1048576
+const R = 501
+
+// An opaque 1.0. `memory.size` is a real instruction whose value binaryen may
+// not assume, so `one` / `two` / `half` reach the kernel as runtime f32 values
+// and no rung can fold the multiply away.
+const pages = __memory_size__()
+const one: f32 = (pages as f32) / (pages as f32)
+const two: f32 = one + one
+const half: f32 = one / two
+
+// Seeding is the unchecked spelling in every file, so it is identical work
+// across the three and stays out of the comparison.
+function seed(v: F32View, x: f32) {
+  const a = v.byteAddrF32(0)
+  const n = v.length
+  let i = 0
+  while i < n {
+    __store_f32__(a + (i << 2), x)
+    i = i + 1
+  }
+}
+
+function scale(v: F32View, k: f32) {
+  let i = 0
+  while i < v.length {
+    v[i] = v[i] * k
+    i = i + 1
+  }
+}
+
+function main(): f32 {
+  const buf = Buffer(N * 4)
+  // A second live allocation. With ONE `struct.new` per field value GUFA folds
+  // `base` to a constant and the kernel stops being representative of a program
+  // that owns more than one column.
+  const hdr = Buffer(64)
+  const v = buf.f32view(0, N)
+  seed(v, one)
+  let t = 0
+  let k = two
+  while t < R {
+    scale(v, k)
+    if k == two { k = half } else { k = two }
+    t = t + 1
+  }
+  hdr.storeI32(0, t)
+  return v[N - 1]
+}
+
+print(main())
