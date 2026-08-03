@@ -395,9 +395,38 @@ which is why they closed in order rather than in parallel.
   and then the payload box itself, which needs a single payload type to reach zero allocations.
   Filed by #1322: `emitUnionIfValue`/`emitVariantIfValue`/`emitNullableIfBinding` still omit
   `ctrlEnter`/`ctrlLeave`.
-- ⬜ **P1.4 Bounds-check ergonomics** — not asking for unsafe access; asking that the canonical
+- ✅ **P1.4 Bounds-check ergonomics** — not asking for unsafe access; asking that the canonical
   view loop either hoists the bound or relies on the memory trap, **and that this is stated** so
-  kernel code can be written to the fast pattern deliberately.
+  kernel code can be written to the fast pattern deliberately. **ANSWERED, and the answer is that
+  NO rung hoists it.** At `-O3` the whole kernel inlines into one loop and the body still executes
+  `i < 0 → unreachable` and `i >= len → unreachable` **per access** — the second being the exact
+  negation of the loop guard four instructions above it, which binaryen does not eliminate (nor does
+  it learn `i >= 0` from `i = 0` plus increment). Trap count inside the loop is **exactly
+  2 × accesses/iteration**: 2 read-only, 4 read-modify-write, 6 for `y[i] += x[i]*dt`.
+  **This could not have been answered by timing** — the checks are perfectly predicted, and
+  `scale-view` at `-O3` reads the same as a hand-hoisted bare-intrinsic kernel (0.444 vs 0.428 ns).
+  **The check is not what costs; the DESCRIPTOR FIELD RELOAD is, and it is a whole-program
+  property.** The two-view kernel reloads `base`/`length` **7× per element**; the one-view kernels
+  reload **0**, because with a single live view of a width GUFA folds both fields. So adding a second
+  column of the same width to a module turns a free check into a 3.5× one **with no source change**.
+  Measured by attribution, not inferred: six hand-written compares over hoisted base/extent cost
+  0.140 ns, the seven reloads 1.095 ns — the fence is **11%** of the excess, the reload **89%**. That
+  corrects §L4's "attributed, not proven" residual by **4×** (0.27 → 1.2 ns) and makes this
+  ROADMAP B6b's backing-pointer LICM, now priced.
+  **The stated fast pattern needs no rung**: hoist `byteAddrF32(0)` and `.length`, then bare
+  `__load_f32__`/`__store_f32__` — 0.296–0.500 ns on all four shapes at all three rungs. And the
+  fence is **not** a trade: hoisting base/extent while keeping `if i < 0 || i >= n { __trap__() }`
+  inline is fully fenced at **1.35×** raw, versus 4.1× through the accessors.
+  Also corrected: **`x[i]` is NOT byte-identical to `x.getF32(i)`** — it calls `"[]"`, which calls
+  `getF32`, an extra frame worth **0.855 ns/element (31%)** at the flagless rung.
+  Pinned by `tests/vl_buffer_view_bounds_shape_test.ts` (per-kernel per-rung goldens **plus three
+  contract assertions independent of the numbers**, sabotage-verified) and `bench/buffer-view-bounds/`.
+  `buffer-design.md` §M. **Filed for an owner ruling, NOT shipped**: a scalar-arg `getF32At(base,
+  length, i)` per width is zero compiler lines and 3.0× on the fenced two-view kernel, but it widens
+  `std:buffer`'s public surface and its §L6a size tax, and the same win is reachable by hand today.
+  *(This row read ⬜ "not started" while `webcraft-requirements.md` §P1.4 already read ✅ STATED from
+  the typed-views slice — the THIRD stale webcraft row found in one day. Re-derive a tier row against
+  the requirements doc and the tree before quoting it.)*
 - ✅ **P1.5 Nominal/opaque types (= our A14)** — `type EntityId = new i32` mints an identity a
   structural checker cannot; `new` is a contextual keyword, the type is erased before emit, and
   `std:buffer`'s two views are now `new { base, length }` (the `f32base`/`i32base` hack deleted,

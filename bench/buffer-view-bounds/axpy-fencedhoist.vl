@@ -1,0 +1,71 @@
+// SHAPE `axpy`, spelling `fencedhoist` — the FENCE WITHOUT THE FIELD RELOAD.
+//
+// `axpy-view` is the row that costs (3.5x the hoisted kernel at `-O3`), and the
+// disassembly says the price is not the bounds check: it is the seven
+// `struct.get`s per element that binaryen leaves in the loop because two live
+// views of one width stop GUFA folding `base` and `length`. This spelling tests
+// that attribution directly by keeping the CHECK and removing only the RELOAD —
+// both extents and both bases come out of the loop into locals, and the same
+// `0 <= i < length` guard is written by hand inside it, per access, over the
+// hoisted `n` and `m`.
+//
+// It is deliberately NOT a proposed API. It is the control that decides whether
+// the fenced surface's cost is inherent (the compares) or removable (the field
+// reload) — which is what a `getF32At(base, length, i)`-shaped std addition
+// would turn on. See `docs/internals/buffer-design.md` §M4.
+import { Buffer, F32View, byteAddrF32, f32view, storeI32 } from "std:buffer"
+
+const N = 1048576
+const R = 501
+
+const pages = __memory_size__()
+const one: f32 = (pages as f32) / (pages as f32)
+
+function seed(v: F32View, x: f32) {
+  const a = v.byteAddrF32(0)
+  const n = v.length
+  let i = 0
+  while i < n {
+    __store_f32__(a + (i << 2), x)
+    i = i + 1
+  }
+}
+
+function axpy(y: F32View, x: F32View, dt: f32) {
+  const ya = y.byteAddrF32(0)
+  const xa = x.byteAddrF32(0)
+  const n = y.length
+  const m = x.length
+  let i = 0
+  while i < n {
+    // The read of `y[i]`, `x[i]` and the write of `y[i]`, each fenced by hand
+    // against the hoisted extent — six compares, exactly what the accessors emit.
+    if i < 0 { __trap__() }
+    if i >= n { __trap__() }
+    if i < 0 { __trap__() }
+    if i >= m { __trap__() }
+    const v = __load_f32__(ya + (i << 2)) + __load_f32__(xa + (i << 2)) * dt
+    if i < 0 { __trap__() }
+    if i >= n { __trap__() }
+    __store_f32__(ya + (i << 2), v)
+    i = i + 1
+  }
+}
+
+function main(): f32 {
+  const buf = Buffer(N * 8)
+  const hdr = Buffer(64)
+  const y = buf.f32view(0, N)
+  const x = buf.f32view(N * 4, N)
+  seed(y, one - one)
+  seed(x, one)
+  let t = 0
+  while t < R {
+    axpy(y, x, one)
+    t = t + 1
+  }
+  hdr.storeI32(0, t)
+  return y[N - 1]
+}
+
+print(main())
