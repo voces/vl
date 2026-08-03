@@ -17773,8 +17773,13 @@ export function nodePinPayloadOf(ix: i32) {
 // Both used to be decided HERE by prefix-testing `name` (`'='`,`'>'` / `'#'`,`'a'`,
 // `'n'`,`'o'`,`'n'`) — seven character compares reading a provenance marker out of
 // a column that is supposed to hold a NAME (census W11).
+// RETURNS the recorded arena index (-1 when nothing resolved), so a caller that
+// already needs the pinned type as a VALUE reads it here instead of re-resolving the
+// same spelling later. The monomorphizer's speculative-inference windows
+// (`monoInferListElem` / `monoInferLocalScalar`) are index-fed from exactly this
+// return — the only producer of those indices, and the reason they take no names.
 export function recordClonedNodeTy(nodeIx: i32, name: string, pin: i32) {
-  if nodeIx < 0 { return 0 }
+  if nodeIx < 0 { return -1 }
   let ty = nameToTy(name)
   if ty < 0 {
     if pin == PIN_SIGKEY { ty = funcPinTyIx() }
@@ -17782,8 +17787,12 @@ export function recordClonedNodeTy(nodeIx: i32, name: string, pin: i32) {
   }
   while nodeTyIx.length <= nodeIx { nodeTyIx.push(-1) }
   nodeTyIx[nodeIx] = ty
-  0
+  ty
 }
+// The arena index of the `i32` primitive. The monomorphizer's all-i32 param arm mints no
+// annotation node at all (`parType` stays -1), so it has no `recordClonedNodeTy` return to
+// bank; this is the one type it needs and the constant is here rather than exported mutable.
+export function i32TyIx() { TY_I32 }
 // The primitive-type NAME the checker recorded for node `ix` — `T.tys[nodeTyIx[ix]]`'s
 // `primName` when it resolved to a `TyPrim` (`i32`/`i64`/`f64`/`f32`/`boolean`/…), else "".
 // A STRUCTURAL query over the `Ty` arena — the emitter's scalar classifiers read this
@@ -19280,10 +19289,15 @@ export function nodeUnionName(ix: i32) {
 // pass-through (`out.push(self[i])`) pins its element (the indexed param's element name), but
 // one built from a NON-TRIVIAL expression over the element (`out.push(self[i] * 2)`) cannot —
 // the hole isn't known to be numeric. This re-checks the body for ONE concrete call shape:
-// each parameter is bound to its pinned type (`paramTyNames`, aligned with the decl's params),
-// so the SAME existing list-element inference resolves the local concretely. Returns the
-// inferred LIST type-name of `localName` (`"i32[]"`, `"f64[]"`), or "" when it is not an
-// inferred list or stays generic — in which case the emitter keeps its prior behavior.
+// each parameter is bound to its pinned type (`paramTyIxs`, ARENA INDICES aligned with the
+// decl's params; -1 = unpinned, bound to the error type), so the SAME existing list-element
+// inference resolves the local concretely. Returns the inferred LIST type-name of `localName`
+// (`"i32[]"`, `"f64[]"`), or "" when it is not an inferred list or stays generic — in which
+// case the emitter keeps its prior behavior.
+//
+// The pins arrive already RESOLVED: the monomorphizer banks `recordClonedNodeTy`'s return (and
+// `i32TyIx()` on the arm that mints no annotation node) as it clones the params, so no pinned
+// type spelling is re-resolved here. The parameter is an index column, not a name column.
 //
 // Runs fully ISOLATED at emit time (after the real check pass): `nodeTyIx` recording and
 // symbols are suppressed via `inferQuiet`, and every diagnostic / inference table the body
@@ -19291,7 +19305,7 @@ export function nodeUnionName(ix: i32) {
 // emitter still reads is byte-identical afterwards. Mirrors `inferReturnsPrePass`'s discipline.
 export function monoInferListElem(
   declIx: i32,
-  paramTyNames: string[],
+  paramTyIxs: i32[],
   localName: string,
 ) {
   if declIx < 0 { return "" }
@@ -19328,8 +19342,8 @@ export function monoInferListElem(
     const p = P.nodes[params[pi]]
     if p is Param {
       let pty = TY_ERR
-      if pi < paramTyNames.length {
-        if paramTyNames[pi] != "" { pty = nameToTy(paramTyNames[pi]) }
+      if pi < paramTyIxs.length {
+        if paramTyIxs[pi] >= 0 { pty = paramTyIxs[pi] }
       }
       declare(p.parName, pty)
     }
@@ -19387,7 +19401,8 @@ export function monoInferListElem(
 }
 
 // The SCALAR sibling of `monoInferListElem`: re-check the body of `declIx` with its params
-// pinned to `paramTyNames` and read the resolved type of the LOCAL `localName`, returning its
+// pinned to `paramTyIxs` (arena indices, same column its list sibling takes) and read the
+// resolved type of the LOCAL `localName`, returning its
 // prim NAME when it settles on a concrete NON-i32 scalar (`string` / `f64` / `i64` / `f32`),
 // else "". This lets the monomorphizer type an un-annotated `return <local>` whose local is a
 // scalar ELEMENT of a hole-pinned param (`const t = self[i]; return t`, or a `let acc = "";
@@ -19399,7 +19414,7 @@ export function monoInferListElem(
 // `monoInferListElem` exactly (every append-only inference/diagnostic table is truncated back).
 export function monoInferLocalScalar(
   declIx: i32,
-  paramTyNames: string[],
+  paramTyIxs: i32[],
   localName: string,
 ) {
   if declIx < 0 { return "" }
@@ -19431,8 +19446,8 @@ export function monoInferLocalScalar(
     const p = P.nodes[params[pi]]
     if p is Param {
       let pty = TY_ERR
-      if pi < paramTyNames.length {
-        if paramTyNames[pi] != "" { pty = nameToTy(paramTyNames[pi]) }
+      if pi < paramTyIxs.length {
+        if paramTyIxs[pi] >= 0 { pty = paramTyIxs[pi] }
       }
       declare(p.parName, pty)
     }

@@ -310,6 +310,19 @@ PYEOF
          "$VL" build "$d/main.vl" -o "$W/main.wasm"; then
       measure "$bench" "$cat_" "$nm" "vl" "vl" "$EX.main.expect" "$VL" run "$W/main.wasm"
     fi
+    # The MIDDLE rung. Measuring only default and -O3 cannot distinguish
+    # "wasm-opt loses on this shape" (both optimized rungs lose, e.g.
+    # arith/mixed-width at 2.23x) from "-O3's profile specifically loses and -O
+    # is the best rung" (arrays/sort-heap: 854 / 648 / 837). Those have
+    # different answers and a two-rung sweep reports them identically.
+    if build_step "$bench" "$cat_" "$nm" "vl-build-O" "vl" \
+         "$VL" build "$d/main.vl" -O -o "$W/main.O.wasm"; then
+      if cmp -s "$W/main.wasm" "$W/main.O.wasm"; then
+        emit "{\"kind\":\"note\",\"bench\":\"$bench\",\"note\":\"O-NOOP\"}"
+        echo "      (note: -O module is byte-identical to -O0)"
+      fi
+      measure "$bench" "$cat_" "$nm" "vl-O" "vl" "$EX.main.expect" "$VL" run "$W/main.O.wasm"
+    fi
     if build_step "$bench" "$cat_" "$nm" "vl-build-O3" "vl" \
          "$VL" build "$d/main.vl" -O3 -o "$W/main.O3.wasm"; then
       # Guard: `vl build -O3` writes the UNOPTIMIZED module (with only a stderr
@@ -540,6 +553,7 @@ for b in sorted(metas):
     varlist = [v for v in metas[b].get("variants", "").split() if v]
     r_rust = med(b, "rust")
     r_vl   = med(b, "vl")
+    r_o1   = med(b, "vl-O")
     r_o3   = med(b, "vl-O3")
     r_deno = med(b, "deno")
     r_py   = med(b, "python")
@@ -553,6 +567,7 @@ for b in sorted(metas):
     vl_rust_min = ratio(mn_vl, mn_rust)
 
     n_rust = net(r_rust, "rust"); n_vl = net(r_vl, "vl")
+    n_o1 = net(r_o1, "vl")
     n_o3 = net(r_o3, "vl"); n_deno = net(r_deno, "deno"); n_py = net(r_py, "python")
     n_var = {v: net(x, "vl") for v, x in variants.items()}
 
@@ -563,7 +578,7 @@ for b in sorted(metas):
     vl_rust = ratio(n_vl, n_rust)
     py_vl   = ratio(py_norm, n_vl)          # how many x faster VL is than Python
     o3_deno = ratio(n_o3, n_deno)
-    best_vl = min([x for x in [n_vl, n_o3] + list(n_var.values()) if x], default=None)
+    best_vl = min([x for x in [n_vl, n_o1, n_o3] + list(n_var.values()) if x], default=None)
     best_vl_deno = ratio(best_vl, n_deno)
 
     if vl_deno is None:
@@ -594,6 +609,19 @@ for b in sorted(metas):
         flags.append("O3-GAP-%.2fx" % (n_vl / n_o3))
     if n_vl and n_o3 and n_o3 / n_vl > 1.15:
         flags.append("O3-REGRESSION-%.2fx" % (n_o3 / n_vl))
+    # The two optimizer failure modes, which a default-vs-O3 pair cannot tell
+    # apart. OPT-LOSES: BOTH optimized rungs are worse than no optimization, so
+    # the loser is wasm-opt on this shape. O3-WORSE-THAN-O: -O is the best rung
+    # and -O3's extra passes give the win back. Different diagnoses, different
+    # fixes -- see perf-landscape.md 2.4a.
+    if n_vl and n_o1 and n_o3:
+        best_opt = min(n_o1, n_o3)
+        if best_opt / n_vl > 1.05:
+            flags.append("OPT-LOSES-%.2fx" % (best_opt / n_vl))
+        if n_o3 / n_o1 > 1.10:
+            flags.append("O3-WORSE-THAN-O-%.2fx" % (n_o3 / n_o1))
+        if n_o1 / n_o3 > 1.10:
+            flags.append("O-WORSE-THAN-O3-%.2fx" % (n_o1 / n_o3))
     flags.extend(notes.get(b, []))
     # startup contamination
     for lab, rawms, base in (("rust", r_rust, "rust"), ("deno", r_deno, "deno"),
@@ -601,15 +629,15 @@ for b in sorted(metas):
         if rawms and startup.get(base) and startup[base] / rawms > 0.10:
             flags.append("STARTUP>%d%%(%s)" % (int(startup[base] / rawms * 100), lab))
 
-    statuses = {c: st(b, c) for c in ("rust", "vl", "vl-O3", "deno", "python")}
+    statuses = {c: st(b, c) for c in ("rust", "vl", "vl-O", "vl-O3", "deno", "python")}
     bad = {c: s for c, s in statuses.items() if s not in ("OK",)}
     bstat = {c: r["status"] for c, r in builds.get(b, {}).items() if r["status"] != "OK"}
 
     rows.append(dict(
         bench=b, category=cat, name=nm, axis=axis,
-        raw_ms=dict(rust=r_rust, vl=r_vl, vl_O3=r_o3, deno=r_deno, python=r_py,
+        raw_ms=dict(rust=r_rust, vl=r_vl, vl_O=r_o1, vl_O3=r_o3, deno=r_deno, python=r_py,
                     variants=variants),
-        net_ms=dict(rust=n_rust, vl=n_vl, vl_O3=n_o3, deno=n_deno, python=n_py,
+        net_ms=dict(rust=n_rust, vl=n_vl, vl_O=n_o1, vl_O3=n_o3, deno=n_deno, python=n_py,
                     variants=n_var),
         python_scale=sc, python_scale_why=scwhy, python_normalised_ms=py_norm,
         vl_over_deno=vl_deno, vl_over_rust=vl_rust, python_over_vl=py_vl,
@@ -710,13 +738,14 @@ A("Times are medians in **ms**, startup-subtracted. `py(norm)` is Python's reduc
 A("multiplied by that benchmark's scale factor; `-` means the benchmark's own audit says no")
 A("scalar factor is valid. `vl/rust` is HEADROOM, not a loss.")
 A("")
-A("| benchmark | rust | vl | vl -O3 | deno | py(raw) | py(norm) | vl/rust | vl/deno | vl/deno(min) | py/vl | verdict | flags |")
-A("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|---|")
+A("| benchmark | rust | vl | vl -O | vl -O3 | deno | py(raw) | py(norm) | vl/rust | vl/deno | vl/deno(min) | py/vl | verdict | flags |")
+A("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|---|")
 order = {"PRIORITY-LOSS": 0, "LOSS": 1, "NO-DATA": 2, "PAR": 3, "WIN": 4}
 for r in sorted(rows, key=lambda r: (order.get(r["verdict"], 9),
                                      -(r["vl_over_deno"] or 0))):
-    A("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
-        r["bench"], f(r["net_ms"]["rust"]), f(r["net_ms"]["vl"]), f(r["net_ms"]["vl_O3"]),
+    A("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+        r["bench"], f(r["net_ms"]["rust"]), f(r["net_ms"]["vl"]),
+        f(r["net_ms"]["vl_O"]), f(r["net_ms"]["vl_O3"]),
         f(r["net_ms"]["deno"]), f(r["net_ms"]["python"]), f(r["python_normalised_ms"]),
         f(r["vl_over_rust"], 2), f(r["vl_over_deno"], 2), f(r["vl_over_deno_minofN"], 2),
         f(r["python_over_vl"], 1),
