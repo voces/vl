@@ -2477,3 +2477,158 @@ source directly — the change adds no language surface, only two byte emitters.
 - **`return_call_indirect` is now available and unused.** P1 (#1324) emits `return_call`
   for a direct call in tail position; a function-value call in tail position could take
   `return_call_indirect` (`0x13`) by the same rule. Not attempted here.
+
+## 14. PERF item P5 — the list header stops being re-read once per element access
+
+`compiler/wasmEmit.vl emitListIdxGuard` re-loads a list's backing-array ref
+(`struct.get 0`) **and** its `len` (`struct.get 1`) on every single element
+access. §4.5 of the landscape bisected 9.9% of `matmul` to exactly that, and
+nothing downstream recovers it: the ref SSA value differs each iteration, so
+Cranelift can neither GVN the length load nor LICM the object-size chain, and
+`wasm-opt -O3` will not move a `struct.get` past an `array.set` it cannot prove
+non-aliasing. V8 hoists it for free, which is why the same bytes cost 408 ms
+there and 424+ here.
+
+Across a loop that provably cannot REALLOCATE the list, both fields are now read
+once into locals before the loop, and every access inside reads the locals.
+
+### 14.1 The soundness condition, which is the whole of the work
+
+The condition is deliberately **syntactic and local**. `hoistSafeExpr` /
+`hoistSafeStmt` are a WHITELIST whose fall-through is DECLINE, so a construct
+added to the language later cannot silently license a stale header — the same
+discipline `blockHasArrNew` learned the hard way when an unenumerated statement
+shape left a frame unreserved.
+
+ACCEPTED — a body built only from literals, identifiers, parentheses, unary and
+binary operators (assignment included), `o.f` reads, `x[i]` reads and stores,
+`is`/`as`, and `if`/`while`/`for`/`return`/`break`/`continue`/`let` over the
+same. Inside such a body: `xs[i]` reads and `xs[i] = v` stores at any depth, on
+a binding declared OUTSIDE the loop, at any of the four scalar list reps, a ref
+list, or a string list. An indexed STORE is accepted because `array.set` changes
+neither the backing's identity nor `len`.
+
+DECLINED, each because the alternative is a miscompile:
+
+- **Any call at all.** `xs.push(v)` reallocates the backing and leaves a cached
+  ref pointing at the ABANDONED array — a silently lost write — and any call can
+  reach the list through a parameter, a capture or a global and push it there.
+  Banning every call is what makes "cannot reallocate" a local question instead
+  of an interprocedural one.
+- **A rebinding** — a `let`/`const` or loop variable taking the spelling, or an
+  assignment `xs = …`. The body's `xs` would not be the wrapper the prologue read.
+- **A nullable receiver** (`xs: i32[] | null`, narrowed). The prologue would have
+  to recover non-null BEFORE the loop, moving a trap ahead of the source's guard.
+- **Every shape not enumerated** — lambdas, `match`, `o?.f`, list and object
+  literals, nested declarations.
+
+A `while`'s CONDITION is held to the same standard as its body, because it
+re-runs every iteration. Hoisting out of a loop that may run **zero** times is
+safe because the prologue only reads two fields of a non-null wrapper, which
+cannot trap on its own.
+
+Two shapes are declined that a stronger analysis would keep, and both are
+recorded rather than hidden. `algorithms/spectralnorm`'s inner loop is declined
+for a call to `aij`, a pure leaf function — recovering it needs a callee summary
+(no push, no assignment to a non-local) and is not attempted. `for … in <list>`
+loops do not open hoists at all; only `while` and `for … to …` do.
+
+### 14.2 The fixture has teeth — measured, not asserted
+
+`tests/cases/arrays/list-header-hoist-grid.vl` is six must-decline shapes and six
+must-hoist ones. Every declining case is written so a wrong hoist is LOUD. That
+was verified by SABOTAGE, in a throwaway worktree so no artifact was restored by
+rebuilding it (the playbook's rule):
+
+| sabotage | effect on the grid |
+|---|---|
+| delete the CALL decline (one line) | case 1 `pushThenRead` **traps**: `out of bounds array access`, a fresh index guarded against a stale `len` |
+| neuter the REBIND decline | case 2 `reassignInLoop` prints **3 instead of 21** — exit 0, no trap, a silent wrong answer |
+
+The second is the one that matters: without it the grid would have pinned only
+the loud failure mode.
+
+### 14.3 What it measures
+
+Min-of-5, A/B interleaved inside each rep, `taskset -c 2-5`, load 2.4–3.5.
+**Noise floor 0.49%** from a probe with IDENTICAL bytes on both sides — and a
+second, free floor probe: `algorithms/nbody` compiled **byte-identically** on both
+sides and read **1.0000**.
+
+| benchmark | A (HEAD) | B (P5) | B/A default | B/A `-O3` |
+|---|--:|--:|--:|--:|
+| `arrays/reverse-inplace` | 2174 | 1725 | **0.794** | 0.999 |
+| `arrays/sort-heap` | 931 | 846 | **0.909** | 0.848 |
+| `arrays/fill-sum` | 1023 | 931 | **0.910** | 0.989 |
+| `arrays/struct-soa` | 1220 | 1115 | **0.914** | 1.001 |
+| `arrays/matmul` | 1602 | 1487 | **0.928** | 1.008 |
+| `arrays/struct-aos` | 1474 | 1394 | 0.946 | 0.908 |
+| `arrays/binsearch` | 1292 | 1235 | 0.956 | 1.032 |
+| `algorithms/spectralnorm` | 2573 | 2572 | 1.000 (declined) | 0.984 |
+| `algorithms/nbody` | 3060 | 3059 | 1.000 (identical bytes) | 1.005 |
+| `algorithms/mandelbrot` | 3274 | 3303 | 1.009 | 1.006 |
+| `algorithms/binarytrees` | 4342 | 4293 | 0.989 | 1.020 |
+| `arrays/push-growth` | 523 | 538 | 1.029 → see below | 0.996 |
+
+`matmul` lands at **−7.2%** against the prototype's 9.9%. The `-O3` column is a
+different claim and is stated separately: it is mostly neutral, because `-O3` was
+already a wash on this category (P11), and the two rows that do move there
+(`sort-heap` 0.848, `struct-aos` 0.908) are the ones whose kernels survive
+inlining. Every `-O3` module was asserted byte-different from its `-O0` twin, so
+none of that column is the silent `wasm-opt`-missing no-op.
+
+**THE NOISE FLOOR IS PER-BENCHMARK, NOT PER-RIG — and that is what `push-growth`
+turned out to be.** Its +2.9% was re-measured min-of-9 and read **+0.77%**; in
+that run the same-bytes floor probe was built from `push-growth`'s own bytes and
+read **−2.1%**. A floor probe made of `matmul` bytes (0.49%) does not bound the
+variance of the most allocation-heavy benchmark in the suite. Two runs giving
++2.9% and +0.77% against a 2.1% floor is **not resolvable**, and it is reported
+as unresolved rather than as a regression or as noise. The mechanism that would
+make it real does exist — the transform adds a ref local to the frame, and every
+GC safepoint scans the stack map — so it is worth re-testing on a quiet box.
+
+### 14.4 The loop-shape gate fired, and this time it was the probe's own function
+
+`tests/selfhost_native_release_test.ts` moved `binsearch-probe`'s `none` row
+`6,3,8 → 6,3,6`. Per the gate's own instruction the golden was not touched until
+per-function counts were in hand, and they say something different from #1328's
+firing:
+
+    $0  bsearch      rot=0   carried 8 -> 6    <- the only row that moved
+    $1  (helper)     rot=0   carried 4 -> 4, second loop 2 -> 2
+    $3  (helper)     rot=1   carried 2 -> 2
+    $4  (helper)     rot=1   carried 1 -> 1 (twice)
+
+**Tightening the counter to the probe's own functions would NOT have suppressed
+this one** — the function that moved IS `bsearch`. So the filed tightening stays
+filed and is not the fix here. What moved is legitimate and benign: `loops` and
+`rotated` are unchanged, the loop that moved is UNROTATED at `none`, and the two
+values that left its carried set are the list-index frame slots the bounds guard
+used to write per access. FEWER carried is the direction the gate's own model
+calls faster, and `bench/arrays/binsearch` agrees (1292 → 1235 ms). `-O` and
+`-O3` are identical on both sides at 3,3,6.
+
+### 14.5 Gates
+
+| leg | result |
+|---|---|
+| freshly fetched `seed-latest` → `refresh-compiler.sh --prove-fixpoint` | rc 0 — **no bootstrap split needed** |
+| `native-fixpoint.sh` | rc 0, stage3 == stage4 |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | **3677 passed / 0 failed / 7 ignored** |
+| `lint-self.sh` | rc 0 (lint + fmt) |
+| `rep-fuzz-check.sh` | rc 0, exact — 0 new, 0 stale |
+| corpus A/B, six channels, 1728 files | **22 changed bytes; all 22 differ ONLY on the wasm hash and the byte count in `wrote …`. check rc, check diagnostics, build rc, run rc and run stdout identical on all 1728.** |
+| fuzz A/B, seeds 3/11/29/47 | identical finding sets — **but see below** |
+
+**The published `seed-latest` IS HEAD's fixpoint byte-for-byte** (`compile(seed)
+== seed`, 1,124,728 bytes), so the A side of every comparison here is exactly
+HEAD's compiler rather than an approximation of it. The branch's own fixpoint is
+1,135,127 bytes: **+10,399 (+0.92%)**.
+
+**THE FUZZ A/B IS STRUCTURALLY INERT FOR THIS CHANGE, and the identical finding
+sets are therefore not evidence for it.** Measured, not assumed: a 400-case ×
+depth-5 batch was generated and grepped — **800 cases, 0 containing `while`, 0
+containing `for`, 0 containing `.push`**. The generator emits no loops at all, so
+`loopHoistOpen` is never called on a fuzz case; 602 of them index a list, all
+outside any loop. The load-bearing evidence for P5 is the corpus A/B, the suite,
+and the sabotage grid — not the fuzzer.

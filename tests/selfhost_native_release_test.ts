@@ -167,7 +167,30 @@ const LOOP_TABLE: Array<{
   // (inert for this probe). Tightening it to the probe's own functions is filed;
   // until then a helper change legitimately moves these numbers and the fix is to
   // re-verify per-function and update the row, as done here.
-  { fixture: "binsearch-probe", none: [6, 3, 8], O: [3, 3, 6], O3: [3, 3, 6] },
+  //
+  // `none` then moved 6,3,8 -> 6,3,6 when the list-header hoist landed (PERF P5),
+  // and this firing is NOT the previous one's shape — tightening the counter to the
+  // probe's own functions would NOT have suppressed it, because the function that
+  // moved IS the probe's own. Per-function counts, before vs after:
+  //
+  //   $0  bsearch      rot=0  carried 8 -> 6   <- the only row that moved
+  //   $1  (helper)     rot=0  carried 4 -> 4, and its second loop 2 -> 2
+  //   $3  (helper)     rot=1  carried 2 -> 2
+  //   $4  (helper)     rot=1  carried 1 -> 1  (twice)
+  //
+  // `loops` and `rotated` are unchanged, and the loop that moved is UNROTATED at
+  // `none`, so the mechanism this gate grades — a rotated back-edge materialising
+  // its carried set at the block parameters on both edges — is untouched. What
+  // left bsearch's loop is the two list-index frame slots the bounds guard used to
+  // write per access (the nullable wrapper stash and its scratch); the hoist reads
+  // the header into two locals BEFORE the loop instead, so they are written once
+  // per loop rather than once per element. `-O` and `-O3` are byte-identical on
+  // both sides (3,3,6), because both rungs already inlined the same helpers away.
+  //
+  // FEWER carried is the direction the gate's own model calls faster, and the
+  // measurement agrees: `bench/arrays/binsearch` at `none` 1292 -> 1235 ms
+  // (0.956, min-of-5 interleaved, noise floor 0.49%).
+  { fixture: "binsearch-probe", none: [6, 3, 6], O: [3, 3, 6], O3: [3, 3, 6] },
 ];
 
 // The same representative @run spread the `-O` suite uses, so the two rungs are
