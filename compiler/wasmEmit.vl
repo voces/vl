@@ -198,6 +198,7 @@ import {
   gCellIdx,
   gF32PrintIdx,
   gF64PrintIdx,
+  gFnTableIdx,
   gHelpMapProbe,
   gHelpMapProbeI32,
   gHelpMapResize,
@@ -306,7 +307,7 @@ import {
   fbBr,
   fbBrIf,
   fbCall,
-  fbCallRef,
+  fbCallIndirect,
   fbDrop,
   fbElse,
   fbEnd,
@@ -339,7 +340,6 @@ import {
   fbLoop,
   fbRefAsNonNull,
   fbRefCast,
-  fbRefFunc,
   fbRefNull,
   fbRefNullNone,
   fbRefNullStruct,
@@ -1235,9 +1235,9 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
 // Does `name` appear as a VALUE — any position OTHER than the callee of a direct `name(...)`
 // call — anywhere in the subtree at `ix`? A generic function value bound to `name` (`const g
 // = f`) is sound to emit only when every use is a direct call: `monomorphize` rewrites each
-// `g(args)` to its per-call instance, so the stored closure is `call_ref`'d only at the type
+// `g(args)` to its per-call instance, so the stored closure is called only at the type
 // its slot was pinned to. A value-USE (an argument, a return, an array element) escapes to a
-// `call_ref` whose type the binding cannot guarantee. Mirrors `monoWalk`'s node coverage.
+// a call whose type the binding cannot guarantee. Mirrors `monoWalk`'s node coverage.
 function nameUsedAsValueIn(name: string, ix: i32) {
   if ix < 0 { return false }
   const n = P.nodes[ix]
@@ -1329,7 +1329,7 @@ function nameUsedAsValueIn(name: string, ix: i32) {
 
 // ── function-value construction (lambdas) ─────────────────────────────────────
 // Emit a function VALUE for the lifted function at `fnStmts` position `fe`: the closure
-// fat-pointer `struct.new $cloStruct [ ref.func $(gImports+fe), env, id ]`. The env is
+// fat-pointer `struct.new $cloStruct [ env, id ]`. The env is
 // `ref.null struct` for a non-capturing function, else a `struct.new $envStruct` of the
 // captured values, each READ in the enclosing frame `fnIx` (so a capture of `n` emits a
 // `local.get` of `n` in the maker's frame). The id is the lifted function's wasm index
@@ -1337,12 +1337,13 @@ function nameUsedAsValueIn(name: string, ix: i32) {
 function emitClosureValue(body: i32[], fe: i32, fnIx: i32) {
   // SOUNDNESS FLOOR: a GENERIC function (un-annotated parameters) taken as a VALUE emits its
   // params at the i32 DEFAULT (`vtKindOfParam(-1)` → 0), so the value is only callable at i32 —
-  // `g(2.5, …)` / `g("x", …)` then `ref.cast`s the funcref to the wrong functype (invalid wasm),
-  // and even the i32 case only "works" by coincidence. A function VALUE must be monomorphic.
+  // `g(2.5, …)` / `g("x", …)` then `call_indirect`s at the wrong functype (a signature-check
+  // trap), and even the i32 case only "works" by coincidence. A function VALUE must be
+  // monomorphic.
   // A `const g = f` used ONLY as a direct-call callee IS sound (each `g(args)` is monomorphized
-  // per call site, so the closure is `call_ref`'d only at the type its slot was pinned to) and
+  // per call site, so the closure is called only at the type its slot was pinned to) and
   // routes through `emitClosureValueCore` directly (the LetDecl emit), skipping this floor.
-  // Every OTHER value-use (argument, return, array element) escapes to a `call_ref` whose type
+  // Every OTHER value-use (argument, return, array element) escapes to a call whose type
   // the binding cannot guarantee, and lands here: reject (annotate the parameters, or call it
   // directly by name). NAMED source functions only — a lifted LAMBDA with un-annotated params is
   // either checker-rejected (a bare uninferable binding) or cloned/contextually-pinned per use
@@ -1359,8 +1360,8 @@ function emitClosureValue(body: i32[], fe: i32, fnIx: i32) {
 }
 
 // The closure-value emission WITHOUT the un-annotated-param floor — the `cloSigKeyExt`
-// representability floor still applies (even a sound direct-call-only binding is `call_ref`'d,
-// so its env-leading signature must be representable). Reached either through `emitClosureValue`
+// representability floor still applies (even a sound direct-call-only binding is called through
+// its `$fnsig`, so that env-leading signature must be representable). Reached either through `emitClosureValue`
 // (after its floor) or directly from the LetDecl emit for a monomorphized direct-call-only alias.
 function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
   if fe < 0 || fe >= fnStmts.length {
@@ -1368,9 +1369,9 @@ function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
   }
   // SOUNDNESS FLOOR: a function whose env-leading signature is not representable as a
   // closure `$fnsig` (`cloSigKeyExt` returns "" — a nullable-ref or map PARAMETER/result;
-  // i64/f32 are now in the ABI) cannot be soundly `call_ref`'d: the call site would
-  // fall back to the all-i32 arity functype and `ref.cast` the funcref to the WRONG type,
-  // trapping wasm validation. Reject at the value site with a clear, source-located
+  // i64/f32 are now in the ABI) cannot be soundly called as a value: the call site would
+  // fall back to the all-i32 arity functype and `call_indirect` at the WRONG type,
+  // trapping the engine's signature check. Reject at the value site with a clear, source-located
   // message instead of emitting invalid wasm (mirrors the inferred-union-return floor).
   if cloSigKeyExt(fe) == "" {
     return emitFail(
@@ -1379,9 +1380,7 @@ function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
         "call it as a named function instead",
     )
   }
-  // field 0: the typed funcref to the lifted function (imports occupy 0..gImports-1).
-  fbRefFunc(gImports + fe)
-  // field 1: the env. Non-capturing → null; capturing → a fresh env struct.
+  // field 0: the env. Non-capturing → null; capturing → a fresh env struct.
   const envIdx = fnEnvIdxOf(fe)
   if envIdx < 0 {
     fbRefNullStruct()
@@ -1396,7 +1395,8 @@ function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
     }
     fbStructNew(envIdx)
   }
-  // field 2: the identity token — the lifted function's wasm index.
+  // field 1: the lifted function's wasm index — the `==` identity token and the
+  // `call_indirect` operand (imports occupy 0..gImports-1).
   fbI32Const(gImports + fe)
   fbStructNew(cloStructIdx)
   0
@@ -7076,8 +7076,8 @@ function emitChainRead(
 }
 
 // Compare two closure fat-pointers already on the stack (left below right), leaving
-// a 0/1 i32 — function IDENTITY: the same lifted function (id, field 2) AND the same
-// captured env (`ref.eq` over field 1; two null envs are equal, two separately
+// a 0/1 i32 — function IDENTITY: the same lifted function (id, field 1) AND the same
+// captured env (`ref.eq` over field 0; two null envs are equal, two separately
 // CREATED envs of the same function are not). Stages both operands in the 2-slot
 // closure-eq frame (`cloEqScratchBase`, reserved by `cloEqNoteBin`'s scan). Mirrors
 // the host's function-identity `==` (same table index AND same env).
@@ -7085,14 +7085,14 @@ function emitCloEqCore(_body: i32[]) {
   fbLocalSet(cloEqScratchBase + 1) // B = right operand
   fbLocalSet(cloEqScratchBase + 0) // A = left operand
   fbLocalGet(cloEqScratchBase + 0)
-  fbStructGet(cloStructIdx, 2)     // A.id
+  fbStructGet(cloStructIdx, 1)     // A.id
   fbLocalGet(cloEqScratchBase + 1)
-  fbStructGet(cloStructIdx, 2)     // B.id
+  fbStructGet(cloStructIdx, 1)     // B.id
   fbI32Bin(70)                     // 0x46 i32.eq
   fbLocalGet(cloEqScratchBase + 0)
-  fbStructGet(cloStructIdx, 1)     // A.env
+  fbStructGet(cloStructIdx, 0)     // A.env
   fbLocalGet(cloEqScratchBase + 1)
-  fbStructGet(cloStructIdx, 1)     // B.env
+  fbStructGet(cloStructIdx, 0)     // B.env
   wU8(211)                         // 0xd3 ref.eq (null == null → 1)
   fbI32Bin(113)                    // 0x71 i32.and
   0
@@ -8573,7 +8573,7 @@ function emitIntIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
 }
 
 // One operand of a LINEAR-MEMORY intrinsic, emitted with every WIDE-SCALAR context
-// flag CLEARED — the same discipline (and the same reason) as the `call_ref` argument
+// flag CLEARED — the same discipline (and the same reason) as the function-value argument
 // spine in `emitCallRef` and the index-receiver arms in the `Index` lowering.
 //
 // Every operand ROUTED HERE is an i32 BY DECLARATION (`typecheck.vl`'s default scope:
@@ -9048,8 +9048,8 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       const target = fnIndexOfInScopeChain(callee.identName, fnIx)
       if target < 0 {
         // Not a known function name — a CLOSURE-VALUED callee (a let/param/global holding
-        // a function value, or a higher-order call result). Emit a `call_ref` over the
-        // closure fat-pointer: push env, push args, push code, `call_ref $fnsig`.
+        // a function value, or a higher-order call result). Dispatch through the closure
+        // fat-pointer: push env, push args, push the id, `call_indirect $fnsig`.
         if exprIsClosure(c.callFn, fnIx) {
           return emitCallRef(body, callIx, fnIx)
         }
@@ -9209,9 +9209,9 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
         "emitProgram: closure ref-list result element twin (deferred value-ABI composition)",
       )
     }
-    // env = closure.env (field 1).
+    // env = closure.env (field 0).
     fbLocalGet(callRefSlot)
-    fbStructGet(cloStructIdx, 1)
+    fbStructGet(cloStructIdx, 0)
     // args, each COERCED to its parameter's scalar valtype (an i32 literal widened into an i64 / f64
     // / f32 param) — the `call_ref` functype demands the exact valtype, exactly as a direct call.
     const args = c.callArgs
@@ -9296,7 +9296,8 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
     pendingF32 = savedArgF32
     pendingF64 = savedArgF64
     pendingI64 = savedArgI64
-    // code = closure.code (field 0) — a generic funcref. ref.cast it to the concrete `$fnsig`.
+    // id = closure.id (field 1) — the callee's wasm function index, `call_indirect`'d at
+    // the concrete `$fnsig` (the engine signature-checks the callee against it).
     let sig = -1
     if ckey != "" {
       const cp = cloSigPosOfKey(ckey)
@@ -9309,9 +9310,8 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
       )
     }
     fbLocalGet(callRefSlot)
-    fbStructGet(cloStructIdx, 0)
-    fbRefCast(sig) // 0xfb 0x16 <fnsig> ref.cast funcref -> (ref $fnsig)
-    fbCallRef(sig)
+    fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
+    fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
     return 0
   }
   emitFail("emitProgram: expected a call expression")
@@ -11166,8 +11166,9 @@ function emitMfElem(
 }
 
 // Invoke the callback closure (stashed in local `cL`) on `elem(i)`: push its env
-// (field 1), the element, its code funcref (field 0) cast to the concrete `$fnsig`,
-// then `call_ref $fnsig` — leaving the callback's result on the stack.
+// (field 0), the element, its function index (field 1), then `call_indirect $fnsig`
+// — leaving the callback's result on the stack. This runs ONCE PER ELEMENT, which is
+// why the id is an i32 load and not a funcref field's host libcall.
 function emitMfInvoke(
   body: i32[],
   cL: i32,
@@ -11179,12 +11180,11 @@ function emitMfInvoke(
   sig: i32,
 ) {
   fbLocalGet(cL)
-  fbStructGet(cloStructIdx, 1) // env
+  fbStructGet(cloStructIdx, 0)     // env
   emitMfElem(body, srcL, iL, srcWrap, srcBack, srcElemRef)
   fbLocalGet(cL)
-  fbStructGet(cloStructIdx, 0) // code (funcref)
-  fbRefCast(sig)               // 0xfb 0x16 <fnsig>
-  fbCallRef(sig)               // 0x14 <fnsig>
+  fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
+  fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
   0
 }
 
@@ -14531,7 +14531,7 @@ function emitCapturedCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
   if emitClosureValue(body, target, fnIx) < 0 { return -1 }
   fbLocalSet(callRefSlot)
   fbLocalGet(callRefSlot)
-  fbStructGet(cloStructIdx, 1) // env
+  fbStructGet(cloStructIdx, 0) // env
   // Parameter-order args (named-call reorder; see the direct path below).
   const cargs = orderedDirectArgs(callIx, target)
   if directArgsBad(cargs, callIx) {
@@ -14590,10 +14590,10 @@ function emitCapturedCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     }
     cai = cai + 1
   }
-  // The TARGET's OWN interned `$fnsig` — the functype `ref.func <target>` actually
-  // carries (`emitFunctionSection` declares a sig-eligible function WITH that
-  // `$fnsig`), so the `ref.cast` below accepts the funcref and the `call_ref`
-  // result is the target's real result type. It must be resolved from the TARGET
+  // The TARGET's OWN interned `$fnsig` — the functype the target is actually declared
+  // with (`emitFunctionSection` declares a sig-eligible function WITH that `$fnsig`), so
+  // the `call_indirect` below passes the engine's signature check and its result is the
+  // target's real result type. It must be resolved from the TARGET
   // and never from the arity alone: the all-i32 `fnSigIdxForArity` shape keys only
   // `(structref, i32 * ar) -> i32`, which is the right functype only when every
   // param AND the result are i32/boolean. Over a 48-cell param-kind × result-kind
@@ -14611,9 +14611,8 @@ function emitCapturedCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     )
   }
   fbLocalGet(callRefSlot)
-  fbStructGet(cloStructIdx, 0) // code (funcref)
-  fbRefCast(csig)
-  fbCallRef(csig)
+  fbStructGet(cloStructIdx, 1)      // the callee's wasm function index
+  fbCallIndirect(csig, gFnTableIdx) // 0x11 <fnsig> <table>
   return 0
 }
 
