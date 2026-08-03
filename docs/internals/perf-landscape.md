@@ -527,8 +527,8 @@ VL's own emitted module (or hand-written `.wat` assembled with `wasm-as`) was ru
 | **P2** | closure fat-pointer: drop the `funcref` field, dispatch via `call_indirect` on the id it already stores | `compiler/emit_sections.vl:2490` (elem segment), `:3536` (struct type); `compiler/wasmEmit.vl:1362 emitClosureValueCore`, read sites `:9308`, `:11181 emitMfInvoke`, `:14549` | **5.4x** lambda-hot, **3.3x** dispatch-table, **−9.4 ns per element on every `.map`/`.filter`**, **−41 ns per closure allocation, program-wide** | prototyped | **M** |
 | ~~**P3**~~ | ~~unroll `__str_eq__`'s element loop 8x~~ **SHIPPED #1328** | `emit_sections.vl emitStrEqFnCode` | **2.08x** measured (1970 → 945 ms), vs the 2.17x prototype | **DONE** | — |
 | ~~**P4a**~~ | ~~`indexOf`: hoist `needle[0]` + first-char skip~~ **SHIPPED #1328** | `wasmEmit.vl emitStrIndexOf` | **1.67x** measured (1114 → 666 ms), vs the 1.69x prototype | **DONE** | — |
-| **P4b** | `indexOf`: Boyer-Moore-Horspool above a length gate | `compiler/wasmEmit.vl emitStrIndexOf` | 3.13x prototyped — **and it is what still stands between `substr-search` and CPython** (see below) | prototyped, **NOT taken** | **M** |
-| **P5** | hoist the list header's backing ref + `len` across a loop that cannot reallocate | `compiler/wasmEmit.vl:6254 emitListIdxGuard` | **9.9%** on matmul soundly today (18.2% ceiling); helps the whole array family | prototyped | **M** |
+| **P4b** | `indexOf`: Boyer-Moore-Horspool above a length gate | `compiler/wasmEmit.vl emitStrIndexOf` | **REFUTED ON MEASUREMENT (#1333)** — would not clear CPython even at its own prototyped 3.13× | **NOT taken; see below** | M |
+| ~~**P5**~~ | ~~hoist the list header's backing ref + `len`~~ **SHIPPED #1333** | `wasmEmit.vl emitListIdxGuard` | **reverse-inplace −20.6%, matmul −7.2%**, whole array family −4% to −21% at default opt | **DONE** | — |
 | **P6** | fuse `a / b` and `a % b` on the same operands — lower the remainder as `a − q*b` | i32 div/rem emit in `compiler/wasmEmit.vl` | **1.99x** intdivmod | measured A/B, **SOUNDNESS-GATED** | **S** |
 | **P7** | cache a string's hash instead of recomputing it per probe | `compiler/emit_sections.vl:1743 emitStrHashFnCode`, `:1931 emitMapProbeFnCode`; requires a hash slot in the string rep | up to **4.6x** on long keys; clears 3 of 4 Python red alerts | measured, **site not pinned** | **L** |
 | **P8** | `s = s + c` is O(n²) — `__str_concat__` allocates a fresh array and does 2 `array.copy` per append | `compiler/emit_sections.vl:1881 emitStrConcatFnCode`, `compiler/wasmEmit.vl:6647 emitStrConcat` | asymptotic: N-doubling costs VL 3.5x vs 1.6–1.9x elsewhere | measured | **L** |
@@ -556,6 +556,43 @@ loop plus its scalar remainder. `binsearch-probe` contains **zero** string opera
 loop moved. **The counter is MODULE-WIDE and cannot separate "the probe's loop rotated" (the 2.40×
 defect the gate exists to catch) from "a shared runtime helper gained a loop" (inert here.)**
 Tightening it to the probe's own functions is filed at `tests/selfhost_native_release_test.ts`.
+
+### P4b is REFUTED, and the filed gate was wrong (#1333)
+
+Three measurements kill it, and the last one is decisive:
+
+1. **The skip-table BUILD costs 295 ns, not the filed 88** — 622 ms against a 31 ms fill-removed
+   control over 2M reps. Allocation-free is easy (a start-initialised global); it is the *fill* that
+   costs, and its real enabler, **`array.fill`, has no emitter at all**.
+2. **The filed gate `len(sub) >= 2` is wrong.** At m=2 the shift is bounded by 2, so BMH can never
+   break even if a table lookup costs twice a compare. The empirically derived gate is
+   **`len(s) >= 512 && len(sub) >= 4`**. P4a's real cost is **1.39 ns/position** measured from the
+   benchmark — a synthetic sweep read 4.3 and would have flattered BMH by 3×.
+3. **It would not clear the red alert anyway.** At the prototype's own 3.13×, `substr-search` goes
+   673 → 215 ms against CPython's 150 — still **1.43× behind**. The CPython gap on this benchmark
+   does not close with a better search algorithm; it closes with P12 (UTF-8 bytes in linear memory).
+
+*Re-price a filed remedy against the goal, not just against the baseline: a 3× win that still loses
+is not the item you think it is.*
+
+### P5's soundness condition, and the sabotage that proves it
+
+A **whitelist whose fall-through is DECLINE**. Accepted: literals, identifiers, operators including
+assignment, `o.f`, `x[i]` reads and in-place stores, `is`/`as`, and `if`/`while`/`for`/`return`/
+`break`/`continue`/`let`, at any depth, on a binding declared outside the loop, across all four
+scalar reps plus ref and string lists. Declined: **any call** (`.push` reallocates, and any call can
+reach the list through a parameter, capture or global), any rebinding, nullable receivers, and every
+unenumerated shape. A `while`'s condition is held to the body's standard.
+
+Two sabotages give it teeth, and the second is the one that matters: deleting the call-decline makes
+the fixture **trap**; neutering the rebind-decline makes it **print 3 instead of 21 at exit 0** —
+silently wrong. Verified independently: a loop that pushes mid-iteration and a loop that rebinds its
+list both produce identical answers on master and on the shipped compiler.
+
+Instrument note from the same slice: **the noise floor is per-BENCHMARK, not per-rig.**
+`push-growth` read +2.9% against the rig's 0.49% floor but only +0.77% against its *own* same-bytes
+floor of −2.1%. And the **fuzz A/B is structurally inert for P5** — 800 generated cases contain zero
+`while`/`for`/`.push`, so its identical findings are not evidence.
 
 ### Two items that must NOT ship as filed
 
