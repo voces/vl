@@ -73,6 +73,24 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 > the top-by-parses item is blocked and the programme's remaining emit-side parsing is ~3,031 ops,
 > not ~15,901.) Note also the compiler's own 39k lines make the entire emitter parse **24** spellings.
 >
+> **#1331 ADDS THE THIRD COLUMN AND IT REFUTES #1327's OWN GATE.** #1327 warned that replacing a
+> parse is a REP CHANGE, because a first-in-program resolution mints a `T.tys` entry and skipping it
+> renumbers the arena. Measuring what each parse actually MINTS: **1,342 of the 3,031 mint nothing**,
+> so that hazard governs less than half the population. `declTyIxOfName` — one home for the
+> `cUserTypes`-then-grammar bridge, with `fieldElemTyIxOfName` delegating and rows 6/7 gaining rung 1
+> — takes the emitter **3,031 → 2,800 parses (−7.6%)** at **+10 bytes**, corpus A/B 1,727/1,727
+> identical and fuzz 12,480/12,480 identical. *Measure the mint, not just the parse.*
+>
+> **And the briefed target was refuted by its own witness.** Row 1 `repElemKeyOfNameTy`'s FIND rung 2
+> parses **0 times in 237 reaches** — all 463 of its parses are at the INTERN, and 457 of them are
+> immediately followed by a row mint resolving the same spelling. Its one arena-neutral shortcut
+> disagrees on **4 of 976** covered memo-HIT reaches, every one the newtype `FView` in
+> `memory/newtype-struct-views-distinct.vl`, where the two indices key different `repElemKey`s.
+> **Filed latent defect**: `fieldElemTyIxOfName` already has that rung and therefore records a
+> different `rlElemTyIx` for `FView` than its own interner keyed — inert *only* because rung 2
+> answers zero times. A newtype over a struct is the shape that separates arena-index identity from
+> rep identity; any future rung here must be graded against it.
+>
 > Four standing corrections that outlived the slices that made them:
 > - **1c `unMemAtomTyIx` — a checker-side recorder is REFUTED, not merely unscheduled** (#1294 §8).
 >   The checker and the emitter's bridge resolve the same union member and disagree on **444 of 761**
@@ -266,9 +284,17 @@ hatch").** All four are prerequisites for each other in practice:
   to the hand-written `tt(slotAt(st, i))` at both `-O0` and `-O3 --closed-world`, where both
   accessors inline away entirely. The doc's "the bracket deletes two accessors per field" was
   corrected by building it: it deletes none — it deletes the CONTAINER axis (N×M → N+M).
-  REMAINING: `buf.rows<T>(off, count)` only — it needs `T.size` for a type PARAMETER (hence generic
-  `flat` types and a post-mono fold) and a generic row brand `Addr<T>`, without which it gives up the
-  only safety the fused pattern has over raw addresses. `docs/internals/flat-records-design.md`.
+  **`T.size` FOR A TYPE PARAMETER SHIPPED (#1329)** — `T.size` / `T.<field>` are legal wherever `T`
+  is a live type parameter: the checker types them `i32` and leaves the node standing, and the
+  MONOMORPHIZER folds them once per instance against that instance's binding. Verified on shapes
+  outside the fixture (`{x:i32,y:i32}` → 8, `{p:i64,q:i32,r:i32}` → 16, that type's `q` → 8).
+  **Of the two filed blockers, one was never a blocker**: generic `flat` DECLARATIONS are unrelated,
+  because the records `rows<T>` indexes are concrete. Generic `flat` decls remain rejected by design.
+  REMAINING for `buf.rows<T>` is the BRAND alone, and it is subtler than filed: letting the
+  operator's return be a type parameter so the container names the brand *compiles, runs and reads
+  the right bytes* — and proves nothing, because the discriminating witness is the one where the
+  brands are supposed to STOP a wrong program, and that is where it fails. Filed with the witness in
+  `docs/internals/flat-records-design.md` §11.3.
 - 🟡 **P1.3 Optimization defaults** — the PROFILE ships (#1318): `vl build -O3` runs
   `wasm-opt --closed-world -O3 --gufa -O3`, `-O` is unchanged, and a missing `wasm-opt` stays a soft
   no-op. Two measured findings invert the ask. **(a) Heap2Local is the wrong lever** — `-O3`

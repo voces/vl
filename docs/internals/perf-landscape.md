@@ -525,12 +525,50 @@ VL's own emitted module (or hand-written `.wat` assembled with `wasm-as`) was ru
 |---|---|---|--:|---|---|
 | **P1** | emit `return_call` in tail position | `compiler/wasmEmit.vl:11272 emitReturnValue` (+ a new `fbReturnCall` in `compiler/emit_bytes.vl`, alongside `fbCall` at :526) | **2.06x** tailcall, **1.97x** mutual, recursion depth 16.2k → ≥ 5M | prototyped | **XS** |
 | **P2** | closure fat-pointer: drop the `funcref` field, dispatch via `call_indirect` on the id it already stores | `compiler/emit_sections.vl:2490` (elem segment), `:3536` (struct type); `compiler/wasmEmit.vl:1362 emitClosureValueCore`, read sites `:9308`, `:11181 emitMfInvoke`, `:14549` | **5.4x** lambda-hot, **3.3x** dispatch-table, **−9.4 ns per element on every `.map`/`.filter`**, **−41 ns per closure allocation, program-wide** | prototyped | **M** |
-| **P3** | unroll `__str_eq__`'s element loop 8x with an xor/or accumulator + scalar remainder | `compiler/emit_sections.vl:1814 emitStrEqFnCode` | **2.17x** str-eq (2014 → 927 ms); also one of the compiler's own hottest helpers | prototyped | **S** |
-| **P4** | `indexOf`: hoist `needle[0]` + first-char skip; then Boyer-Moore-Horspool above a length gate | `compiler/wasmEmit.vl:7437 emitStrIndexOf` | **1.69x** (skip, allocation-free) then **3.13x** (BMH) | prototyped | **S** then **M** |
+| ~~**P3**~~ | ~~unroll `__str_eq__`'s element loop 8x~~ **SHIPPED #1328** | `emit_sections.vl emitStrEqFnCode` | **2.08x** measured (1970 → 945 ms), vs the 2.17x prototype | **DONE** | — |
+| ~~**P4a**~~ | ~~`indexOf`: hoist `needle[0]` + first-char skip~~ **SHIPPED #1328** | `wasmEmit.vl emitStrIndexOf` | **1.67x** measured (1114 → 666 ms), vs the 1.69x prototype | **DONE** | — |
+| **P4b** | `indexOf`: Boyer-Moore-Horspool above a length gate | `compiler/wasmEmit.vl emitStrIndexOf` | 3.13x prototyped — **and it is what still stands between `substr-search` and CPython** (see below) | prototyped, **NOT taken** | **M** |
 | **P5** | hoist the list header's backing ref + `len` across a loop that cannot reallocate | `compiler/wasmEmit.vl:6254 emitListIdxGuard` | **9.9%** on matmul soundly today (18.2% ceiling); helps the whole array family | prototyped | **M** |
-| **P6** | fuse `a / b` and `a % b` on the same operands — lower the remainder as `a − q*b` | i32 div/rem emit in `compiler/wasmEmit.vl` | **1.99x** intdivmod | measured A/B | **S** |
+| **P6** | fuse `a / b` and `a % b` on the same operands — lower the remainder as `a − q*b` | i32 div/rem emit in `compiler/wasmEmit.vl` | **1.99x** intdivmod | measured A/B, **SOUNDNESS-GATED** | **S** |
 | **P7** | cache a string's hash instead of recomputing it per probe | `compiler/emit_sections.vl:1743 emitStrHashFnCode`, `:1931 emitMapProbeFnCode`; requires a hash slot in the string rep | up to **4.6x** on long keys; clears 3 of 4 Python red alerts | measured, **site not pinned** | **L** |
 | **P8** | `s = s + c` is O(n²) — `__str_concat__` allocates a fresh array and does 2 `array.copy` per append | `compiler/emit_sections.vl:1881 emitStrConcatFnCode`, `compiler/wasmEmit.vl:6647 emitStrConcat` | asymptotic: N-doubling costs VL 3.5x vs 1.6–1.9x elsewhere | measured | **L** |
+
+### What #1328 changed, and what it did NOT
+
+`str-eq` **1970 → 945 ms** and `substr-search` **1114 → 666 ms** (min-of-5 interleaved, load 4.41).
+Against CPython, N-normalised — `str-eq`'s Python column carries a documented 8× N reduction,
+`substr-search` runs the same N both sides:
+
+| benchmark | CPython | was | now |
+|---|--:|--:|--:|
+| `strings/str-eq` | 752 ms | 2.6× behind | **1.26× behind** |
+| `strings/substr-search` | 148 ms | 7.5× behind | **4.5× behind** |
+
+**Both red alerts are sharply reduced and NEITHER is cleared.** `substr-search` stays 4.5× behind
+CPython precisely because **P4b was not taken** — BMH needs a length gate derived from measurement,
+and an un-gated skip table is an allocation in a hot path. That is the honest cost of the scope call
+and it is why P4b keeps its row.
+
+**#1325's loop-shape gate fired on this change, and it fired on the wrong axis.** It read
+`binsearch-probe`'s `none` row moving `5,2,8 → 6,3,8`. Per-function counts: `$1` (bsearch itself)
+2 → 2, `$0`/`$3` unchanged, `$4` — the two-string-ref `__str_eq__` — **1 → 2**, which is an unrolled
+loop plus its scalar remainder. `binsearch-probe` contains **zero** string operations, so no user
+loop moved. **The counter is MODULE-WIDE and cannot separate "the probe's loop rotated" (the 2.40×
+defect the gate exists to catch) from "a shared runtime helper gained a loop" (inert here.)**
+Tightening it to the probe's own functions is filed at `tests/selfhost_native_release_test.ts`.
+
+### Two items that must NOT ship as filed
+
+- **P6 is soundness-gated, not merely unscheduled.** The fusion is only valid if it cannot move a
+  trap: `i32.rem_s(INT32_MIN, -1)` returns **0** while `i32.div_s(INT32_MIN, -1)` **traps**, and a
+  remainder spelled before its quotient can hoist a divide across a side effect. The identity is
+  exact; the trap behaviour is not. It needs a sign/edge grid (both operand signs × zero divisor ×
+  the `INT32_MIN / -1` overflow) before the 1.99× is real.
+- **Scientific-notation literals (`1e30`) need the NUMERIC CONVERSION, not just the lexer.** Widening
+  the lexer alone was built and reverted: the value parser does `acc*10 + (c - '0')` over every
+  character, so `e` becomes a digit worth 53 and the literal silently evaluates wrong — `1e3` → 633,
+  `1e0` → 630, `2e1` → 731, `1E2` → 312, `1.5e-3` → 1.6303. A silently wrong number is a worse defect
+  than a parse error. See #1330.
 | **P9** | inline small leaf functions in the **default** build | the `-O3`-gap family | **2.90x** struct-field, **1.80x** map-filter-reduce, 8–13% sort-heap | measured via `-O3` A/B | **L** |
 | **P10** | top-level `const` emits a **mutable** wasm global | global emit path | not separately measured; blocks constant-folding a loop bound | `wasm-dis` witness | **XS** |
 | **P11** | fix the two `-O3` **regressions** before the release profile is trusted | `docs/internals/opt-profile-design.md` pipeline | `mixed-width` **2.43x SLOWER**, `binsearch` **1.23x SLOWER** | measured | **S** (gate) |
