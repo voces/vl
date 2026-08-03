@@ -2632,3 +2632,76 @@ containing `for`, 0 containing `.push`**. The generator emits no loops at all, s
 `loopHoistOpen` is never called on a fuzz case; 602 of them index a list, all
 outside any loop. The load-bearing evidence for P5 is the corpus A/B, the suite,
 and the sabotage grid — not the fuzzer.
+
+### 14.6 P4b (BMH for `indexOf`) — measured, and NOT taken. Here is what the numbers say.
+
+P4b was scoped alongside P5 and is deliberately not shipped. The reason is not
+effort: it is that **two of the three numbers the filing rests on do not survive
+measurement**, and the third changes the gate.
+
+**(a) The table build costs 295 ns, not 88 ns.** Measured on a quiet box (load
+0.4), min-of-5, control-subtracted: a 256-entry skip-table fill plus the needle's
+own `m-1` overwrites runs **622 ms** over 2,000,000 repetitions against **31 ms**
+for the identical program with only the 256-entry fill removed — **295 ns per
+build**, 3.4x the filing's figure. That is with the array allocated ONCE outside
+the loop, so it is the FILL, which no amount of reuse removes.
+
+**(b) Allocation-free is not the hard part — the fill is.** A module-level global
+holding one `array.new_default 256`, initialised in the start function, removes
+the allocation entirely and is straightforward. What it does not remove is the
+295 ns. The instruction that would is **`array.fill` (`0xfb 0x0f`), and the
+emitter has no `fbArrayFill` at all** — `grep` over `emit_bytes.vl`/`wasmEmit.vl`
+returns nothing. Adding it is the enabling move for P4b and is a byte emitter
+that needs its own gate; it would cut a 1 KB fill to one instruction.
+
+**(c) P4a costs 1.39 ns per position examined**, derived from the real benchmark
+rather than a synthetic one: `bench/strings/substr-search` is **673 ms** here
+(min-of-5, `taskset -c 2-5`, load 0.46) over ~484M examined positions
+(480 absent needles × 1M, 480 present ones near the front). CPython on the same
+box is **150 ms**, so VL is **4.49x behind** — the landscape's 666/148 = 4.5x
+reproduces exactly, which is what makes the per-position number trustworthy.
+
+> A synthetic sweep over haystacks of 32…2048 read 4.3 ns per position instead,
+> because its generated haystack repeats the needle's first character far more
+> often than real text and so enters the verify loop far more often. The
+> synthetic number would have made BMH look ~3x better than it is. The real
+> benchmark is the one used below.
+
+**The derived gate.** With `t_build = 295 ns`, `t_pos = 1.39 ns`, an average shift
+`d`, and BMH's per-position cost `k` times P4a's, break-even is at
+
+    P = t_build / (t_pos * (1 - k/d))
+
+| needle | shift `d` | k=1.0 | k=1.5 | k=2.0 |
+|---|--:|--:|--:|--:|
+| 12 | 9.2 (instrumented) | 238 | 254 | 271 |
+| 4 | ~3.5 | 292 | 372 | 495 |
+| 2 | ~1.9 | 424 | 1006 | **never wins** |
+
+Two conclusions, and the second contradicts the filing:
+
+- The haystack gate is around **512**, not 64. At 64 the table build alone is
+  more than twice the entire search.
+- **`len(sub) >= 2` is the wrong needle gate.** At `m = 2` the shift is bounded
+  by 2, so BMH can examine at best half the positions while paying 295 ns fixed
+  and a strictly higher per-position cost — it breaks even only past ~424
+  positions at best, and never at all if a table lookup costs twice a direct
+  compare. The needle gate has to be **`>= 4`**. So: **`len(s) >= 512 && len(sub)
+  >= 4`**, derived, and it moves once `array.fill` lands.
+
+**And P4b does not clear the CPython red alert anyway.** The filing calls it
+"what still stands between `substr-search` and CPython". At the prototype's own
+**measured 3.13x**, 673 ms becomes **215 ms against CPython's 150 — still 1.43x
+behind**. A model built from the numbers above is more optimistic (shift 9.2 at
+k=1.5 projects ~120 ms, which would clear it), but the only end-to-end figure
+anyone has actually measured for BMH here is 3.13x, and that one does not clear
+it. Clearing `substr-search` needs P12 (UTF-8 bytes in linear memory, 27.7x on
+the compare) or P7-style caching, not BMH alone.
+
+**What shipping it would take**, in order: `fbArrayFill`; a start-initialised
+global table; the gated second search path in `emitStrIndexOf`; and the
+`index-of-grid` extensions BMH specifically needs — a repeated-character haystack
+(`aaaa…` with needle `aaab`), a needle whose LAST character repeats internally
+(the shift table built naively gets this wrong), the needle at the very last
+start, and single-character needles. `indexOf` is on the self-hosted compiler's
+own hot path, so none of that is worth doing at less than full gate coverage.
