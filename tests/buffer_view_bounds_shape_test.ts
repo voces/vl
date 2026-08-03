@@ -129,6 +129,10 @@ const c = (trap: number, call: number, sget: number): Counts => ({ trap, call, s
 // check — the same call count as `view` at `none`, 0 traps anywhere.
 const TABLE: Record<string, Row> = {
   "scale-view": { none: c(0, 3, 1), O: c(2, 1, 3), O3: c(4, 0, 0) },
+  // Identical to `scale-view` in every cell, which is the POINT: the bracket's
+  // extra frame is one level DOWN (`"[]"` calls `getF32`), so a loop-level count
+  // cannot see it. It shows up only in the call TARGET and on the clock (§M3(4)).
+  "scale-accessor": { none: c(0, 3, 1), O: c(2, 1, 3), O3: c(4, 0, 0) },
   "scale-buf": { none: c(0, 3, 0), O: c(0, 1, 1), O3: c(0, 0, 1) },
   "scale-hoist": { none: c(0, 1, 0), O: c(0, 0, 0), O3: c(0, 0, 0) },
   "reduce-view": { none: c(0, 2, 1), O: c(2, 0, 0), O3: c(2, 0, 0) },

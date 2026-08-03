@@ -1602,7 +1602,11 @@ The policy, in full, so kernel code can be written to it deliberately:
    `-O3 --closed-world --gufa` does not remove the check either — measured, §L4, it survives and
    costs 0.34 ns per element-update. P1.4 asks that the loop "either hoists the bound or relies on
    the memory trap, and that this is *stated*". It does neither: it checks, every time, and here is
-   the number.
+   the number. **§M reads this off the disassembly** rather than off a stopwatch (which cannot tell
+   a hoisted check from a perfectly predicted one), on four kernel shapes, and confirms it: exactly
+   two `unreachable` guards per access survive `-O3` even when the loop guard four instructions
+   above is the byte-identical comparison. §M also corrects what the survivors COST — at `-O3`,
+   ~0.02 ns per compare, with the real per-access price being the descriptor field reload (§M4).
 4. **The deliberate fast pattern, for a kernel that has proved its own bounds**, is to take the base
    ONCE and run the bare intrinsics inside:
    ```vl
@@ -1669,6 +1673,11 @@ Five things fall out, in order of how much they should change behaviour:
   the first time. Attributed, not proven: the two spellings differ in that one respect and the
   `hoist` row isolates it, but no disassembly was read.
 
+  > **PROVEN, and it was an underestimate (§M4).** The disassembly shows the two-view loop
+  > reloading `length` four times and `base` three times PER ELEMENT — seven `struct.get`s that no
+  > rung hoists, worth 1.2 ns/element rather than 0.27. It is also conditional on the whole program:
+  > with ONE view of a width live, GUFA folds both fields and the reload disappears entirely.
+
 Caveat on the middle column: `-O` and unoptimized differ by up to 8% in both directions across
 these rows (`buf` 2.436 → 2.504 but `view` 2.734 → 2.530). That is this harness's noise floor, and
 it is why the load-bearing claims above are all drawn from the ~4× and ~6× gaps rather than from
@@ -1681,12 +1690,18 @@ absorbing into the language". This slice ships `x.getF32(i)` / `x.setF32(i, v)` 
 routes to the bracket form were enumerated and probed first; here is what each is blocked on.
 
 **The framing that decides it: the sugar is PURELY SYNTACTIC.** Under every dispatch route that
-exists or is planned, `x[i]` lowers to exactly the call that `x.getF32(i)` already lowers to —
-`emitIndex` is not reached at all, the rewriter turns the bracket into a call before the emitter
-sees it (`emit_rewrite.vl:312-323`). Only a built-in nominal arm inside `emitIndex` would emit a
-bare `f32.load`, and §L4 prices that whole prize at the 0.34 ns/element check plus the 0.27
-un-hoisted `struct.get` — both of which the free `hoist` spelling already recovers today. So the
-bracket buys spelling, and spelling only.
+exists or is planned, `x[i]` lowers to a call — `emitIndex` is not reached at all, the rewriter
+turns the bracket into a call before the emitter sees it (`emit_rewrite.vl:312-323`). Only a
+built-in nominal arm inside `emitIndex` would emit a bare `f32.load`, and §L4 prices that whole
+prize at the 0.34 ns/element check plus the 0.27 un-hoisted `struct.get` — both of which the free
+`hoist` spelling already recovers today. So the bracket buys spelling, and spelling only.
+
+> **One correction, from §M3(4).** "Lowers to exactly the call that `x.getF32(i)` already lowers to"
+> is not quite it: the bracket lowers to a call to `"[]"`, whose body then calls `getF32`. The two
+> modules are the same SIZE with one call index swapped — not byte-identical — and at the
+> unoptimized rung the extra frame is worth 0.86 ns/element, 31% of the bracket spelling's cost.
+> `-O` and `-O3` both inline the forward away and the two spellings converge exactly. The
+> conclusion is unaffected (the prize is still spelling), but a flagless build can see the hop.
 
 - **Route 1 — the existing B13 `"[]"` / `"[]="` closure-field trap.** Zero compiler lines: a view
   would carry its accessors as closure fields. **Refuted on three counts, two of them defects
@@ -1907,3 +1922,255 @@ and it is the one route that looks free and is not.
    are also the escape hatch §L3(4) recommends — so they are the one place a kernel can reintroduce
    the unfenced behaviour the rest of the tier now prevents. That is deliberate and stated, not an
    oversight.
+
+## M. What the per-access bound actually does — read off the disassembly (P1.4, closed)
+
+§L3(3) and §L4 answered P1.4 from a stopwatch and from the shape of the std source: the bound is
+checked at every access, nothing hoists it, and unoptimized that costs about 0.30 ns per
+element-update. Both statements survive this section. But a stopwatch cannot tell a check that was
+HOISTED OUT of the loop from a check the branch predictor gets right every time, and §L4 knew it —
+its last conclusion is explicitly labelled "Attributed, not proven … no disassembly was read".
+
+This section reads the disassembly, on FOUR kernel shapes instead of one. The headline answer is
+unchanged and now proven. The cost model under it is not: **at the release rung the check is very
+nearly free, and what actually costs is something else that §L4 guessed at and got half right.**
+
+### M1. The population: four shapes, four spellings, three rungs
+
+`bench/buffer-view-bounds/` holds the kernels, `bench/buffer-view-bounds/run.sh` is the harness and
+`tests/buffer_view_bounds_shape_test.ts` is the pin. Four SHAPES, chosen so the answer cannot be an
+artifact of one loop:
+
+| shape | what it is | accesses / iteration |
+|---|---|---|
+| `scale` | one f32 column, read-modify-write: `v[i] = v[i] * k` | 2 |
+| `reduce` | one i32 column, READ-ONLY: `s = s + g[i]` | 1 |
+| `axpy` | TWO views in one loop: `y[i] = y[i] + x[i] * dt` — P1.1's own integrate step | 3 |
+| `rows` | a nested loop over one ROW of a 1024x1024 i32 grid: `g[rb + c]` | 2 |
+
+and four SPELLINGS of each (`scale` carries all four; the other three carry three):
+
+| spelling | what it is |
+|---|---|
+| `view` | the fenced canonical — the typed-view bracket, `0 <= i < length` per access |
+| `accessor` | the identical kernel written `v.getF32(i)` / `v.setF32(i, …)` — same check, ONE call per access instead of two |
+| `buf` | the UNFENCED TWIN — `Buf.loadF32`/`storeF32`, byte offsets, a call per access, NO check |
+| `hoist` | the STATED FAST PATTERN — the view supplies the extent, base and count leave the loop, the body is the bare intrinsic |
+
+`accessor` exists because `view` and `buf` do not have matched call counts: `x[i]` calls `"[]"`,
+which calls `getF32`. So **(accessor − buf) is the check**, (buf − hoist) is the call, and
+(view − accessor) is the bracket's forwarding hop.
+
+N = 1,048,576 elements x R = 501 trips = **525,336,576 inner-loop iterations** per run, identical for
+all four shapes. Every module is PREBUILT (`vl run <src>` carries ~300 ms of compile time), every
+configuration has an **R=0 control build of the identical source** whose wall time is subtracted, the
+output of every run is asserted (each shape prints a value that differs between R>0 and R=0), and the
+R>0 time must exceed its own control by >=3x or the row fails as elided. Interleaved min-of-5,
+`taskset -c 2-5`, wasmtime via the Rust host. `-O3` is `vl build -O3` = `--closed-world -O3 --gufa
+-O3`, with `VL_WASM_OPT` set and every rung's module size asserted to have moved — without that,
+`-O3` finds no wasm-opt, prints a note, writes the UNOPTIMIZED module and exits 0, and the whole
+right-hand column silently measures `-O0`.
+
+### M2. The answer: the check is emitted per access, and no rung removes it
+
+**Proven, not inferred.** At `-O3 --closed-world`, `scale-view`'s whole program is inlined into one
+function and its inner loop reads (elided lines marked `…`):
+
+```wat
+loop                          ;; the element loop
+  local.get 0
+  i32.const 1048576
+  i32.lt_s                    ;; THE LOOP GUARD:  i < 1048576
+  if
+    local.get 0
+    i32.const 0
+    i32.lt_s                  ;; the READ's low bound:  i < 0
+    if  unreachable  end
+    local.get 0
+    i32.const 1048576
+    i32.ge_s                  ;; the READ's high bound: i >= 1048576  <- the guard, negated
+    if  unreachable  end
+    …  f32.load  …  f32.mul  …
+    local.get 0
+    i32.const 0
+    i32.lt_s                  ;; the WRITE's low bound, again
+    if  unreachable  end
+    local.get 0
+    i32.const 1048576
+    i32.ge_s                  ;; the WRITE's high bound, again
+    if  unreachable  end
+    …  f32.store  …
+```
+
+The loop guard and the first half-check are the **byte-identical comparison against the same
+constant, four instructions apart**, and binaryen keeps both. It also never learns `i >= 0` from
+`i = 0` plus `i = i + 1`. This is the most favourable case the fence can be given — the length
+folded to a literal, one view, everything inlined — and the check survives it intact.
+
+Counted over the whole population (`unreachable` inside a loop, per rung):
+
+| spelling | none | `-O` | `-O3` | traps at `-O3` vs accesses |
+|---|---|---|---|---|
+| `scale-view` / `scale-accessor` | 0 | 2 | **4** | 2 accesses x 2 |
+| `reduce-view` | 0 | 2 | **2** | 1 access x 2 |
+| `axpy-view` | 0 | 2 | **6** | 3 accesses x 2 |
+| `rows-view` | 0 | 2 | **4** | 2 accesses x 2 |
+| every `buf` and `hoist` row | 0 | 0 | **0** | — |
+
+**Exactly two traps per access at the release rung, on every shape.** The zeros in the `none` column
+are not an absence of checking — they are the checks being one frame down, inside `getF32`/`setF32`,
+which the same table's `call` column shows being called once per access. There is no rung, and no
+shape, at which the count falls.
+
+The transition is worth knowing for reading a `-O` disassembly: at `-O` binaryen inlines the VOID
+setter but not the f32-returning getter, so half the check appears in the loop and half stays in a
+callee. Nothing about the check itself changes.
+
+### M3. What it costs
+
+ns per inner-loop iteration, control subtracted, min-of-5 interleaved:
+
+| shape | spelling | (none) | `-O` | `-O3` |
+|---|---|---|---|---|
+| `scale` | view | 2.773 | 1.661 | 0.444 |
+| `scale` | accessor | 1.918 | 1.598 | 0.464 |
+| `scale` | buf | 1.622 | 1.214 | 0.466 |
+| `scale` | **hoist** | **0.326** | **0.419** | **0.428** |
+| `reduce` | view | 1.583 | 0.355 | 0.344 |
+| `reduce` | buf | 0.951 | 0.424 | 0.419 |
+| `reduce` | **hoist** | **0.296** | **0.276** | **0.291** |
+| `axpy` | view | 4.320 | 2.642 | 1.713 |
+| `axpy` | buf | 2.607 | 2.199 | 0.703 |
+| `axpy` | **hoist** | **0.444** | **0.487** | **0.493** |
+| `rows` | view | 2.645 | 1.699 | 0.581 |
+| `rows` | buf | 1.730 | 1.670 | 0.680 |
+| `rows` | **hoist** | **0.407** | **0.459** | **0.500** |
+
+Noise floor: a full independent re-run of the same 12 rows moved them by 1-14%, worst on the
+smallest numbers (`rows-view` `-O3` 0.508 → 0.581). Every claim below is drawn from a gap of 3x or
+more, or from a difference the disassembly independently explains.
+
+Four readings:
+
+1. **The check, isolated at matched call counts, is 0.15 ns per access** — (accessor − buf) at
+   `none` is 1.918 − 1.622 = 0.296 ns for two accesses. Four compares and four never-taken branches.
+   That is §L4's ~0.10 ns/access re-measured on a different kernel, and it stands.
+2. **At `-O3` the check is nearly free on any loop holding ONE view.** `scale` 0.444 against a
+   fully hand-hoisted 0.428; `reduce` 0.344 against 0.291; `rows` 0.581 against 0.500. Per compare
+   that is ~0.02 ns — under a tenth of a cycle. The fenced canonical loop IS the fast pattern on
+   these three, and M2 proves the compares are all still there, being predicted.
+3. **`-O` is not enough, and this is now four independent measurements of that.** `scale-view` is
+   2.773 → 1.661 → 0.444: `-O` buys a third of a 6.2x swing. `axpy-buf` 2.607 → 2.199 → 0.703.
+   The release profile is where the wrapper calls disappear, exactly as §L4 found.
+4. **The bracket costs one extra frame unoptimized, and only unoptimized.** (view − accessor) at
+   `none` is 0.855 ns/element — 31% of the bracket spelling's cost — and at `-O` and `-O3` it is
+   0.063 and −0.020, i.e. gone. `x[i]` and `x.getF32(i)` produce modules of the SAME SIZE with one
+   call index swapped, so this is invisible to a size diff and visible only in the call target and
+   on the clock.
+
+### M4. What actually costs: the descriptor field re-read — and it is a WHOLE-PROGRAM property
+
+`axpy` is the row that does not behave: 1.713 ns at `-O3` against a hoisted 0.493, a **3.5x** gap,
+where `scale` with the same two traps per access has none. The compares cannot be the explanation —
+`rows` pays four of them for 0.08 ns.
+
+The disassembly names it. Counting `struct.get` inside the loop at `-O3`:
+
+| kernel | traps | `struct.get` per element | `-O3` ns |
+|---|---|---|---|
+| `scale-view` | 4 | **0** | 0.444 |
+| `reduce-view` | 2 | **0** | 0.344 |
+| `rows-view` | 4 | **0** | 0.581 |
+| `axpy-view` | 6 | **7** | 1.713 |
+
+`axpy-view`'s inner loop reloads `length` four times and `base` three times per element, from the
+view struct, every iteration. The other three reload neither. The mechanism is not the number of
+views in the loop as such — it is what GUFA can prove:
+
+- `scale`, `reduce` and `rows` each hold ONE view, so every `struct.new` of the view shape agrees on
+  both field values. GUFA folds `length` to the literal `1048576` and sinks `base` into a local
+  before the loop. Nothing is left to read.
+- `axpy` holds TWO views of the same width whose `base` differs (one column at offset 0, one at
+  offset N*4). No field folds, and **binaryen does not hoist the loads out of the loop either** —
+  even though the fields are IMMUTABLE in the emitted type (`(struct (field i32) (field i32))`, no
+  `mut`) and the loop contains no allocation. There is no LICM for them at any rung.
+
+Two consequences a kernel author has to design around, and neither is local to the loop:
+
+- **The fenced spelling's cost depends on the rest of the program.** Adding a second column of the
+  same width to a module can turn a free check into a 3.5x one without the kernel's source changing
+  a character. That is the opposite of the property "written to the fast pattern deliberately"
+  needs, and it is the strongest argument in this file for hoisting a hot loop by hand rather than
+  trusting the rung.
+- **This is the un-hoisted BACKING POINTER, priced.** §L4 attributed its residual 0.27 ns/element at
+  `-O3` to "the per-access `struct.get` of the base field not being hoisted", explicitly without
+  reading a disassembly. That attribution is now confirmed AND was an underestimate twice over: the
+  field re-read is `length` as often as `base` (the bounds check needs it too), and on a two-view
+  loop the total is 1.2 ns/element rather than 0.27. It is ROADMAP B6b's "backing-pointer hoisting
+  (LICM)", and it is the largest single number in this tier.
+
+### M5. The fast pattern, stated — and which rung it needs
+
+**The fast pattern needs NO rung. That is the point of it.**
+
+```vl
+const a = x.byteAddrF32(0)     // the base, once — unchecked by design (§L3(4))
+const n = x.length             // the extent, once
+let i = 0
+while i < n {
+  __store_f32__(a + (i << 2), __load_f32__(a + (i << 2)) * k)
+  i = i + 1
+}
+```
+
+Measured 0.296-0.500 ns per element on all four shapes at ALL THREE rungs, never varying by more
+than 25% between them. It is the only spelling in the table whose cost a kernel author can predict
+without knowing the build profile or the rest of the module. The view still constructs, so its
+once-per-view extent check still ran; what is given up is the per-access fence, deliberately, on a
+loop whose bounds the author has proved.
+
+For everything else, in the order the decisions get made:
+
+1. **Write the fenced canonical (`v[i]`) by default and ship at `-O3`.** On a loop touching one
+   view it is within 0.02-0.08 ns/element of the hoisted kernel, with the fence intact. This is the
+   common case and it costs nothing worth naming.
+2. **`-O3 --closed-world` is not optional** — it is `vl build -O3`, it is a 3-6x swing over no
+   flags on every fenced row, and `-O` gets a third of it. P1.3's ask, priced again here.
+3. **If the loop touches TWO OR MORE views of the same width, hoist.** That is the `axpy` row, that
+   is the SoA integrate step, and the 3.5x is not the check — it is seven field loads per element
+   that nothing removes. Hoisting recovers all of it.
+4. **If you ship a flagless build, prefer `v.getF32(i)` to `v[i]`** — 31% on `scale`. At `-O`/`-O3`
+   the two are identical, so this is an edit-loop consideration only.
+
+### M6. What this corrects
+
+- **§L3(3) stands, and is now proven rather than measured.** "The bound is NOT hoisted out of the
+  canonical loop" was inferred from a timing that could not have distinguished hoisting from
+  prediction. M2 reads the instructions.
+- **§L4's "the CHECK is not the cost" stands and gets sharper.** It is 11% of the view's total
+  unoptimized, and at the release rung it is ~0 on a one-view loop. Nobody should trade the bounds
+  policy away for speed; there is nothing to win.
+- **§L4's residual is confirmed and was an underestimate** — see M4.
+- **The claim that the bracket produces a "byte-identical module" to the accessor spelling is
+  wrong** (§L5's framing, and `std/buffer.vl`'s bracket comment). The modules are the same SIZE with
+  one call index swapped, and unoptimized the bracket runs an extra frame per access worth 0.86
+  ns/element. Corrected in both places.
+- **P1.4's own framing — "either hoists the bound or relies on the memory trap" — remains a false
+  dichotomy for this tier**, for §L3's reason: the failure mode a view exists to catch is invisible
+  to the engine. What is new is that the third answer (check every time) is now measured to be the
+  cheap one wherever the descriptor's fields fold.
+
+### M7. What is pinned
+
+- `tests/buffer_view_bounds_shape_test.ts` — every kernel x every rung, the `unreachable` / `call` /
+  `struct.get` counts inside loops as exact goldens, plus three contract assertions that hold
+  independently of the exact numbers: the fence survives `-O3`, the unfenced twin has no check (so
+  the delta measures the fence and nothing else), and the fast pattern is bare. A moved cell is a
+  finding in either direction and must be re-justified here in the same commit. Verified live by
+  sabotage: perturbing one golden cell fails that fixture and nothing else.
+- `bench/buffer-view-bounds/run.sh` — the timing half. Not CI-gated (no timing can be), but
+  self-checking: it fails rather than reports if wasm-opt is missing, if a rung's module size did not
+  move, if any run prints the wrong value, or if a kernel ran within 3x of its own R=0 control.
+- The shape test does NOT see the bracket's forwarding hop: `scale-view` and `scale-accessor` have
+  identical loop-level counts, because the extra frame is one level down. That difference lives in
+  M3(4) and on the clock only.

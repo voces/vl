@@ -553,6 +553,64 @@ eliminate some checks; "some" isn't a contract.)
 >
 > Full method, caveats and the noise floor: `buffer-design.md` §L4.
 
+> **Second pass — the same answer, now READ OFF THE DISASSEMBLY, on four kernel
+> shapes; and one of the three conclusions above is wrong about WHY.**
+> (`buffer-design.md` §M; kernels in `bench/buffer-view-bounds/`, pinned by
+> `tests/buffer_view_bounds_shape_test.ts`.) The table above was timed, and a
+> stopwatch cannot tell a check that was HOISTED from a check the branch
+> predictor gets right every time. So this pass counted instructions instead.
+>
+> **1. The check is there, every access, at every rung — proven.** At
+> `vl build -O3` the whole kernel inlines into one loop, and four instructions
+> below a loop guard that reads `i < 1048576` the body still tests `i < 0` and
+> `i >= 1048576`, each branching to `unreachable`. Binaryen keeps both. Counted
+> across all four shapes, the surviving trap count at `-O3` is **exactly two per
+> access** — 2 for a read-only element, 4 for a read-modify-write, 6 for
+> `y[i] += x[i]*dt`. No rung and no shape reduces it.
+>
+> **2. But at `-O3` the check is nearly FREE, and the thing that costs is the
+> view descriptor's own fields.** ns per element, min-of-5, control subtracted:
+>
+> | kernel | fenced `v[i]` at `-O3` | hand-hoisted at `-O3` | ratio |
+> |---|---|---|---|
+> | one f32 column, `v[i] = v[i]*k` | 0.444 | 0.428 | 1.04 |
+> | one i32 column, read-only reduce | 0.344 | 0.291 | 1.18 |
+> | 1024x1024 i32 grid, inner loop over a row | 0.581 | 0.500 | 1.16 |
+> | **two views, `y[i] = y[i] + x[i]*dt`** | **1.713** | **0.493** | **3.5** |
+>
+> Same two-traps-per-access in every row. What separates the last row is that
+> its loop reloads `base` and `length` **from the view struct seven times per
+> element**, and the other three reload neither — because with ONE view of a
+> width live in the module, GUFA folds both fields to constants, and with two it
+> cannot. Binaryen does not hoist those loads out of the loop at any rung, even
+> though the fields are immutable. So conclusion 3 above was right that a
+> residual survives inlining and right about the mechanism, but it was **1.2
+> ns/element, not 0.27**, and `length` is reloaded as often as `base`.
+>
+> **The part to design around: the fenced spelling's cost is a WHOLE-PROGRAM
+> property.** Adding a second column of the same width to a module can turn a
+> free check into a 3.5x one without the kernel's source changing a character.
+>
+> **3. The fast pattern, restated, and the rung it needs: NONE.**
+> ```vl
+> const a = x.byteAddrF32(0)     // base, once
+> const n = x.length             // extent, once
+> let i = 0
+> while i < n { __store_f32__(a + (i << 2), __load_f32__(a + (i << 2)) * k); i = i + 1 }
+> ```
+> 0.296-0.500 ns/element on all four shapes at **all three rungs**, never varying
+> more than 25% between them. It is the only spelling whose cost is predictable
+> without knowing the build profile or the rest of the module.
+>
+> So, for kernel authors, in decision order: write `v[i]` and ship at
+> **`vl build -O3`** (fenced, and within 4-18% of hand-hoisted on a one-view
+> loop); **hoist by hand any loop touching two or more views of the same width**
+> (the 3.5x, and it is not the check); `-O` buys about a third of `-O3`'s swing
+> and is an edit-loop rung only. One footnote for flagless builds: `v[i]` calls
+> `"[]"`, which calls `getF32`, so the bracket runs an extra frame per access
+> worth 31% on the `scale` kernel — `v.getF32(i)` avoids it. Both wasm-opt rungs
+> inline the forward away and the two spellings converge exactly.
+
 ### P1.5 Nominal/opaque types (vl A14) — id safety
 
 The kernel traffics in `EntityId`, `PlayerSlot`, `AbilityHandle`, all i32.
