@@ -1788,7 +1788,26 @@ function emitStrHashFnCode(out: i32[]) {
 }
 
 // `__str_eq__(a, b) -> i32`: element-wise string value-equality — 0 if the lengths
-// differ or any code point differs, else 1. Params: a(0), b(1). Locals: n(2), i(3).
+// differ or any code point differs, else 1. Params: a(0), b(1). Locals: n(2), i(3),
+// lim(4).
+//
+// The element walk is UNROLLED EIGHT WIDE over an xor/or accumulator, then a
+// scalar remainder loop finishes the tail. Eight `a[i+k] ^ b[i+k]` values are
+// or-ed together and tested ONCE, so a full block costs one branch instead of
+// eight; the accumulator lives entirely on the wasm value stack and needs no
+// local. WasmGC has no instruction that compares more than one array element at a
+// time, so this is the whole of the available win — it removes branch and
+// loop-control overhead, not loads.
+//
+// `lim = n - 8` is the last index at which a full block still fits, and the gate
+// is `i > lim`, which is why it is computed as a SUBTRACTION rather than as
+// `i + 8 > n`: `n` is an `array.len` and cannot overflow the subtraction, while
+// `i + 8` on a maximal-length string could. For `n < 8` the limit goes negative,
+// `i > lim` is true at `i = 0`, and every element is answered by the remainder
+// loop — so the short strings that dominate real programs skip the wide loop
+// entirely rather than paying a wasted test. Because the block runs only when
+// `i <= n - 8`, every index it touches is `< n`; the unroll cannot read past the
+// end of either operand.
 //
 // IDENTITY FAST PATH (`ref.eq`) — the twelve bytes that pay for themselves. A
 // string is `(array (mut i32))`, hence an `eqref`, so the two operands can be
@@ -1819,7 +1838,7 @@ function emitStrEqFnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
   wULEB(1)     // 1 locals run
-  wULEB(2)     // count 2
+  wULEB(3)     // count 3
   wU8(127)     // 0x7f i32
   fbBlock(127) // block i32 — yields the 0/1 result
   // if ref.eq(a, b) { 1 ; br out }
@@ -1845,6 +1864,64 @@ function emitStrEqFnCode(out: i32[]) {
   // i = 0
   fbI32Const(0)
   fbLocalSet(3)
+  // SHORT-STRING GATE: skip the wide loop and its setup entirely unless a full
+  // block can run at least once. Strings shorter than the unroll factor are the
+  // common case in real programs (identifiers, keywords, tags), and for them the
+  // whole wide region is dead weight — one compare here replaces the limit
+  // computation plus a wide-loop trip test that could never succeed.
+  fbLocalGet(2)
+  fbI32Const(8)
+  fbI32Bin(78) // 0x4e i32.ge_s (n >= 8)
+  fbIf(64)     // if, void
+  // lim = n - 8 — the last start index at which a full eight-element block fits.
+  fbLocalGet(2)
+  fbI32Const(8)
+  fbI32Bin(107) // 0x6b i32.sub
+  fbLocalSet(4)
+  fbLoop(64)    // loop (eight wide), void
+  fbLocalGet(3)
+  fbLocalGet(4)
+  fbI32Bin(74)  // 0x4a i32.gt_s (i > lim → no full block left)
+  fbIf(64)      // then: done (empty)
+  fbElse()
+  // acc = (a[i]^b[i]) | (a[i+1]^b[i+1]) | ... | (a[i+7]^b[i+7]), on the stack.
+  let k = 0
+  while k < 8 {
+    fbLocalGet(0) // a
+    fbLocalGet(3) // i
+    if k > 0 {
+      fbI32Const(k)
+      fbI32Bin(106) // i32.add
+    }
+    fbArrayGet(aTypeIdx)
+    fbLocalGet(1) // b
+    fbLocalGet(3) // i
+    if k > 0 {
+      fbI32Const(k)
+      fbI32Bin(106) // i32.add
+    }
+    fbArrayGet(aTypeIdx)
+    fbI32Bin(115) // 0x73 i32.xor — 0 exactly when the pair matches
+    if k > 0 {
+      fbI32Bin(114) // 0x72 i32.or — fold into the accumulator
+    }
+    k = k + 1
+  }
+  // A non-zero accumulator means at least one of the eight pairs differed.
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(4) // → out of: if(0)·else(1)·loop(2)·n>=8 if(3)·block(4)
+  fbEnd()
+  // i = i + 8
+  fbLocalGet(3)
+  fbI32Const(8)
+  fbI32Bin(106)
+  fbLocalSet(3)
+  fbBr(1) // → loop header
+  fbEnd() // end (gt_s if/else)
+  fbEnd() // end (eight-wide loop)
+  fbEnd() // end (n >= 8 if)
+  // Scalar remainder: the fewer than eight elements the wide loop could not cover.
   fbLoop(64)   // loop, void
   fbLocalGet(3)
   fbLocalGet(2)
