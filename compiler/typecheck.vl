@@ -11513,6 +11513,35 @@ function opIdxRetTy(fn: string) {
   TY_ERR
 }
 
+// Bind the index operator's declared type parameters from the receiver and key
+// types, the way `opSelfFnTy` binds a binary operator's. ONE `"[]"` function
+// serves every instantiation of a generic container, so its declared parameter
+// and return types are a TEMPLATE, not the site's types: a site that takes them
+// verbatim types `b[0]` of a `function "[]"<T>(self: Box<T>, i: i32): T` as a
+// bare `T`, and an UNBOUND type variable is assignable to everything — which is
+// `vl check` clean and an invalid module at emit.
+// `keyTy` of -1 binds the receiver alone (the write arm, whose key may not have
+// been re-checked at that point).
+function opIdxBindGen(
+  fn: string,
+  recvTy: i32,
+  keyTy: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  const fnTy = lookup(fn)
+  if fnTy >= 0 {
+    const ft = T.tys[fnTy]
+    if ft is TyFunc {
+      const ps = ft.fnParamTypes
+      if ps.length > 0 { bindGenWalk(ps[0], recvTy, bNames, bTys) }
+      if ps.length > 1 {
+        if keyTy >= 0 { bindGenWalk(ps[1], keyTy, bNames, bTys) }
+      }
+    }
+  }
+}
+
 // Operator dispatch `a op b` over a STRUCT left operand through the free
 // `self`-function named for the operator (`function +(self, b)` — host parser
 // B13+B14): the function must exist, take exactly (self, right), and its FIRST
@@ -19830,7 +19859,14 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
         if !tyBuiltinIndexable(arrTy0) {
           const wfn = opIdxFnFor(OP_INDEX_SET, arrTy0)
           if wfn != "" {
-            const vt = opIdxParamTy(wfn, 2)
+            const wbNames: string[] = []
+            const wbTys: i32[] = []
+            opIdxBindGen(wfn, arrTy0, nodeTyIxOf(tgt.idxIndex), wbNames, wbTys)
+            const vt0 = opIdxParamTy(wfn, 2)
+            let vt = vt0
+            if vt0 >= 0 {
+              if wbNames.length > 0 { vt = substTyDeep(vt0, wbNames, wbTys) }
+            }
             if vt >= 0 {
               if !assignableExpr(n.binRight, rt, vt) {
                 tErr(
@@ -21646,17 +21682,23 @@ function checkIndexNode(n: Index, ix: i32) {
     if !tyBuiltinIndexable(arrTy) {
       const rfn = opIdxFnFor(OP_INDEX_GET, arrTy)
       if rfn != "" {
+        const bNames: string[] = []
+        const bTys: i32[] = []
+        opIdxBindGen(rfn, arrTy, idxTy, bNames, bTys)
         const kt = opIdxParamTy(rfn, 1)
         if kt >= 0 {
-          if !assignableExpr(n.idxIndex, idxTy, kt) {
+          const ktb = substTyDeep(kt, bNames, bTys)
+          if !assignableExpr(n.idxIndex, idxTy, ktb) {
             tErr(
-              "index: expected " + tyToStr(kt) + ", got " + tyToStr(idxTy),
+              "index: expected " + tyToStr(ktb) + ", got " + tyToStr(idxTy),
               ix,
             )
           }
         }
         opIdxBank(ix, rfn)
-        return opIdxRetTy(rfn)
+        const rty = opIdxRetTy(rfn)
+        if bNames.length > 0 { return substTyDeep(rty, bNames, bTys) }
+        return rty
       }
       // A WRITE operator with no READ operator is not a usable type: the
       // assignment form checks its target as an ordinary index expression, so
