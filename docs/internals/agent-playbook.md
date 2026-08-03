@@ -10,9 +10,13 @@ subsystem-avoidance notes.
   are the spec. Fix/extend behavior inside `compiler/*.vl`; never change what the
   language accepts or emits. (The former TS host that once served as the spec
   oracle is retired — ROADMAP "Kill the TS host. DONE".)
-- **Golden-neutral**: `git status tests/golden/` must be empty at every
-  commit. Never run `UPDATE_GOLDENS`. Rep changes that re-pin goldens are
-  serialized work for the orchestrator, not agents.
+- ~~**Golden-neutral**: `git status tests/golden/` must be empty at every commit.~~
+  **STALE — `tests/golden/` NO LONGER EXISTS in this tree** (verified 2026-08-03).
+  An agent gating on it gets a vacuous pass and thinks it checked something. The
+  live equivalents are the corpus A/B (six channels, RUN identical after
+  normalizing `0x<hex>`) and the golden tables inside
+  `tests/selfhost_native_release_test.ts` (`MELT_TABLE`, the loop-shape rows) —
+  those ARE real pins and moving one needs its justification in the same commit.
 - **Self-hosting constraint**: the `.vl` files compile themselves — only use
   language features the current native compiler supports; mimic file style.
 - **One namespace**: all `compiler/*.vl` share a single namespace in the
@@ -76,16 +80,27 @@ validator message alone — the disassembly is the debugging view of `vl build` 
   branch's baseline means binaryen is missing, not that anything changed. Diff the
   ignored NAME SET against the baseline with both files asserted non-empty — an
   empty-vs-empty diff is clean and means nothing, which has happened here.
-- Per commit: `git status tests/golden/` empty (+ the REJECT_CASES loop if
-  the checker got more permissive).
-- Before finishing: `deno test -A --no-check tests/selfhost_emit_fixpoint_test.ts`
-  must be 14/14. Read real output (`grep -E "passed|failed"`), never `tail -1`.
+- Per commit: the REJECT_CASES loop if the checker got more permissive.
+  (~~`git status tests/golden/` empty~~ — that directory is GONE; see above.)
+- ~~Before finishing: `deno test -A --no-check tests/selfhost_emit_fixpoint_test.ts`
+  must be 14/14.~~ **STALE — that file NO LONGER EXISTS** (verified 2026-08-03).
+  The fixpoint is gated by `bash scripts/refresh-compiler.sh --prove-fixpoint`
+  and `bash scripts/native-fixpoint.sh` (stage3 == stage4 byte-for-byte); check
+  REFRESH_RC explicitly, because refresh's failure tail READS LIKE SUCCESS.
+  Still read real output (`grep -E "passed|failed"`), never `tail -1`.
 - If you add an `is <Node>` narrowing on a new node type, OR call any
   `ast.vl` helper (`mk*`, etc.) not already imported there, add it to the
   import list in `tests/selfhost_wasm_emit_test.ts` and RUN that test —
   three slices have now tripped on this.
 
 ## Known landmines
+- **`@error-at` directive lines are 0-BASED, and the COLUMN is never compared**
+  (line-only matching) while the CLI prints 1-based. An off-by-one here passes
+  silently in one direction and fails confusingly in the other.
+- **A `redundant type annotation` HINT can be wrong about a load-bearing
+  annotation.** The monomorphizer binds a generic alias by NAME, so deleting an
+  annotation the checker calls redundant can turn a working program into an emit
+  error. Verify by building before acting on that hint in generic code.
 - When a slice makes something START WORKING, grep the test suites for stale
   negative tests asserting it fails (`fails loudly`, `err:`, REJECT lists) and
   flip them — two CI failures came from obsoleted expectations.
