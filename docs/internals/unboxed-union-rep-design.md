@@ -215,11 +215,15 @@ and counted (§8.3):
 | one `return` of a **local assigned on two branches** (`spell2.vl`) | 2 | 4 → 4 |
 | ONE-ARM producer (`spell3.vl`, the control) | **1** | 2 → **0** |
 
-`emitUnionIfValue` (`compiler/wasmEmit.vl:3079`) emits a value-typed `if` whose blocktype
-is `(ref $uBox)` and routes **each arm** through `emitUnionCoerce`; the `let`-on-two-paths
-form does the same. Every VL spelling of a two-armed union producer emits two boxes.
-**Candidate (d) — "do nothing and document the fast pattern" — is refuted: there is no
-fast pattern to document.**
+`emitUnionIfValue` emits a value-typed `if` whose blocktype is `(ref $uBox)` and routes
+**each arm** through `emitUnionCoerce`; the `let`-on-two-paths form does the same. Every
+VL spelling of a two-armed union producer emits two boxes. **Candidate (d) — "do nothing
+and document the fast pattern" — is refuted: there is no fast pattern to document.**
+
+**This table is the measurement that MOTIVATED the work and is no longer the emitter's
+behaviour.** The first two rows are now 1 site and 3 → 2: §10 sinks the two-`return`
+form and §11 splits the if-expression into the same per-arm exits. Only the third row —
+a local assigned on two branches — still reads as written; it is the open phase-2 shape.
 
 ### 2.2 REFUTED: no binaryen flag set reaches it
 
@@ -849,11 +853,6 @@ will not yield 464 either.
 
 ### 10.4 What does NOT sink
 
-- **A `return` of an if-EXPRESSION (`spell1`).** `emitUnionIfValue` emits a value-typed
-  `if` whose blocktype is `(ref $uBox)` and boxes in EACH ARM, so one `return` carries two
-  sites and the last instruction written is the `if`'s `end`, not a `struct.new`.
-  Re-measured on B: still 2 sites, still 4 → 4. §2.1's row is unmoved, and this is the
-  single largest remaining return-position shape.
 - **A `let` assigned on two branches (`spell2`, `union-box-branch-local`).** Not a return;
   phase 2's row, unmoved at 4 → 4 and 4/4/2 as pinned.
 - **A passthrough return** (`return u` where `u` is already a union). There is nothing to
@@ -898,13 +897,14 @@ size for the melt, and the `-O3` artifact is SMALLER (the fixture: 156 → 140 B
 
 ### 10.6 A latent defect the sink forced closed
 
-`emitIfTail` opened a wasm `if` frame without `ctrlEnter()`/`ctrlLeave()`, as do
+`emitIfTail` opened a wasm `if` frame without `ctrlEnter()`/`ctrlLeave()`, as did
 `emitUnionIfValue`, `emitVariantIfValue` and `emitNullableIfBinding`. It was inert because
 nothing branch-bearing had ever been emitted inside those frames. A sunk `return` in an
 if-tail arm IS branch-bearing, and its `br` operand is the frame distance to the exit
-block, so `emitIfTail` now counts its frame. The other three still do not; anything that
-puts a branch inside them must fix them the same way. Nothing asserts this — the failure
+block, so every one of the four counts its frame now. Nothing asserts this — the failure
 mode is an off-by-one `br` operand, which is invalid wasm rather than a wrong answer.
+Counting a frame nothing branches out of is byte-neutral, so the three that are still
+inert cost nothing for being correct.
 
 ### 10.7 A measurement trap, recorded because it cost a full benchmark round
 
@@ -918,3 +918,112 @@ still had the box's `struct.new` in it. `selfhost_native_release_test.ts` sets
 `VL_WASM_OPT`/`VL_WASM_DIS` explicitly for exactly this reason. **Any A/B of an optimizer
 effect must assert that the optimizer RAN** — count allocation sites in the timed
 artifact, never trust the flag.
+
+---
+
+## 11. THE RETURNED IF-EXPRESSION — §10.4's largest remaining shape, closed
+
+§10.4 filed `return if c { a } else { b }` as *"the single largest remaining
+return-position shape"*: `emitUnionCoerce` routes a union-valued if-expression to
+`emitUnionIfValue`, which emits a value-typed `if` with a `(ref $uBox)` blocktype and
+union-coerces EACH ARM, so one `return` carries one construction site per arm and the last
+instruction written is the `if`'s `end` — nothing for §10.5's peephole to match.
+
+`A` = the published `seed-latest` (1,135,405 B), `B` = this change at its native fixpoint
+(1,136,589 B, `compile(B) == B` and stage3 == stage4 byte-for-byte from a freshly fetched
+seed). Same binaryen 130, same wasm-tools, same wasmtime-via-`vl-host`.
+
+### 11.1 The transform is a SPLIT, not a second peephole
+
+The source is lowered as a VOID statement-`if` whose arms each terminate as their own
+return — which is the program `if c { return a } else { return b }` already emitted — so
+every arm's box meets the existing peephole unchanged. Nothing new matches bytes, no
+second frame is reserved, and §10.5's model still describes every byte: `emitReturnExit`
+is now the single place a return value is paired with its terminator (`emitStmt`'s
+`RetStmt`, `emitFuncBody`'s tail and `emitStmtTail` all route through it), and the split
+is the one shape it handles specially.
+
+Three consequences the split has that the statement form does not:
+
+1. **`retExitCount` had to learn to look INSIDE a return value.** A `RetStmt` counted 1
+   exit whatever it returned, so a two-armed if-expression predicted a single-exit
+   function and declined the frame. It now counts one exit per arm, through `else if`
+   chains and nested if-expressions. The prediction's failure modes are unchanged and both
+   harmless (§10.5): over-count reserves two unused locals, under-count declines a sink.
+2. **The trailing `unreachable` is load-bearing, not padding.** A wasm `if` whose arms both
+   diverge is still REACHABLE at its `end`; the `return` that used to sit after the value
+   made everything following it stack-polymorphic. Without the `unreachable`, a function
+   whose arms ALL declined the sink — both arms pass a union through, so no box is built
+   and each arm emits a plain `return` — falls out of the `if` with an empty stack into a
+   non-void function `end`. That is invalid wasm, and it is reachable from source: it is
+   exactly `union-sink-passthrough` written as an if-expression.
+3. **A nested if-expression arm now compiles.** `emitUnionIfArm` gates on
+   `stmtIsTailValue`, which is false for an `IfStmt`, so
+   `return if c { if d { a } else { b } } else { e }` was `emitProgram: union
+   if-expression arm is not a single value` — a loud reject, measured on A. Per-arm exits
+   recurse through the same return path, so the shape is just another exit. Pinned by
+   `tests/cases/unions/return-if-expression-arms.vl`.
+
+### 11.2 The melt, and the ratio with its rung
+
+`tests/fixtures/opt-melt/union-sink-if-expression.vl` is `union-box-payload-read`'s
+program in the if-expression spelling; the two rows must now read the same, and do.
+
+| fixture | box sites A→B | allocs none | allocs `-O` | allocs `-O3` |
+|---|---:|---:|---:|---:|
+| `union-sink-if-expression` | 2 → **1** | 4 → **3** | 4 → **2** | 4 → **2** |
+| `union-box-payload-read` (unmoved) | 1 | 3 | 2 | 2 |
+
+Wall clock on the same loop at 100 M trips, interleaved A/B, min-of-5, load 6.8, with the
+optimizer's having RUN asserted structurally in the timed artifact (A stays at 4
+allocations at every rung; B reaches 2):
+
+| build | A | B | ratio |
+|---|---:|---:|---:|
+| plain `vl build` | 514 ms | 507 ms | **1.01× — a wash** |
+| `vl build -O` | 364 ms | **218 ms** | **1.67×** |
+| `vl build -O3` | 353 ms | **207 ms** | **1.71×** |
+
+Read with §10.2's warning, which this reproduces to the digit: **the split is worth
+nothing without `-O`.** It removes a merge point, not an allocation, so Heap2Local has to
+be present to collect.
+
+### 11.3 The population is FOUR sites, and that is the honest number
+
+Corpus at this base, 1,735 files: A builds 1,451 and B builds 1,452 (the newly-accepted
+nested arm), with **zero** modules moving to or from invalid wasm. Union-box construction
+sites **1,500 → 1,496**: four removed across three modules, none added.
+
+| module | sites | bytes |
+|---|---|---:|
+| `conditionals/union-if-as-value-return.vl` | 6 → **4** | +39 |
+| `unions/infer-struct-union-return.vl` | 3 → **2** | +19 |
+| `unions/union-if-value-variant.vl` | 9 → **8** | +19 |
+| `closures/union-returning-map.vl` | 6 → 6 | +17 |
+
+Corpus total **+94 B (+0.004%)** over 1,451 modules, 4 up, 0 down.
+
+The fourth row is the mispredict class §10.5 records, in a form that table does not have:
+`tag(a) = return if a is Cat { {woof: a.meow} } else { a }` has ONE constructing arm and
+one passthrough, so the split fires, the exit block is emitted, and the site count is
+unchanged — one site in an arm became one site at the exit. **A split whose arms do not
+all construct buys nothing and still pays the frame.** It is bounded at +17 B and cannot
+produce an allocation that was not already there, which is why it is not worth a predicate
+to avoid: the predicate would have to agree with what the peephole actually did, and
+§10.5's whole argument is that only the lowering knows that.
+
+Four sites is small against §1.3's 309 return-position rows, and it is not a shortfall in
+the transform — it is that `return if …` is a RARE SPELLING. The corpus writes the
+two-`return` form instead, which is why phase 1 found 78. §10.3's correction applies here
+too: a spelling census is not a site census.
+
+### 11.4 The compiler pays for the code and gains nothing from the transform
+
+`vl-compiler.wasm` 1,135,405 → 1,136,589 B (**+1,184 B, +0.104%**), and the whole of it is
+the new lowering: the module's union-box construction sites are **52 → 52** and its total
+allocation sites **4,804 → 4,804**, with 5 new functions. The compiler writes no
+`return <if-expression>` union producer at all — §1.1 already says its 56 sites are AST
+nodes in a module-global array. Self-compile wall clock is inside the noise (min-of-7
+interleaved: A 1,499 ms, B 1,586 ms at load 22.9, distributions fully overlapping), which
+is the expected reading for a change that moves neither the site count nor the allocation
+count of the module being timed.
