@@ -40120,3 +40120,211 @@ of the slice as the probe's baseline: `scripts/fetch-seed.sh` (1,132,435 B) →
   `cUserTypes`-covered parses that #1331 measured with a different probe. *When the new instrument
   can rebuild the old one's sub-totals from per-record data, a surprise in the new column is a
   finding rather than a suspected bug.*
+
+<!-- APPEND-MARKER-MONOPINIX-BEGIN -->
+
+## D-MONOPINIX — bucket 3 taken: the filed 63 is EXACT and so are its six spellings, the unit is RESOLUTIONS rather than calls, and 25 of the 63 were MINTING a duplicate `TyArray` nobody kept (off master `9fec8d24`)
+
+D-CANONFOLD §6 filed bucket 3 with both signatures and the producer line, and deliberately did not
+ship it: *"the checker half alone is an exported function with no caller… It is one commit once the
+emitter half lands with it."* This is that commit. The filing re-derives correct in every particular
+it stated, and carries one number it did not state that decides how the conversion has to be graded.
+
+### 1. THE POPULATION, RE-DERIVED — 63, and the unit is a `nameToTy` RESOLUTION, not a call
+
+**PROBE ZZB3.** Six counters split across the two windows — entry (`AC`/`BC`), past the
+`FuncDecl`/`Block` guards (`AG`/`BG`), and the per-param `nameToTy` reach (`AR`/`BR`) — plus a MINT
+counter that brackets each resolution with `T.tys.length`, the distinct spellings, and the arena
+length at report time. Reported by `emitFail(zzb3Report())` at `emit_sections.emitProgram`'s tail.
+The host reuses one compiler instance per directory, so the counters accumulate and the LAST record
+is the corpus total; `T.tys` is reset per program, so `TYS` is that program's own arena and not a
+running sum.
+
+```
+build: vl build compiler/entry.vl -o zzb3.wasm --compiler <master 9fec8d24 fixpoint>
+run:   vl check --codegen tests/cases --compiler zzb3.wasm > zzb3-cases.out   # rc 1, the probe raises
+read:  grep -o 'ZZB3|[^"]*' zzb3-cases.out | tail -1
+       ZZB3|AC=23|AG=23|AR=33|AP=33|BC=20|BG=20|BR=30|BP=30|TOT=63|M=25|NEG=0|EQI=16
+            |NS=6|S=i32[] string[] f64[] i32 string boolean
+```
+
+1,451 of the corpus's programs reach the end of `emitProgram`.
+
+| filing (D-CANONFOLD §6) | filed | re-derived at `9fec8d24` | verdict |
+|---|---:|---:|---|
+| `monoInferListElem` + `monoInferLocalScalar` reaches | 63 | **63** (`AR` 33 + `BR` 30) | **exact**, and the unit is one `nameToTy` RESOLUTION per pinned param |
+| — the same population counted in CALLS | — | **43** (`AC` 23 + `BC` 20) | the number that is NOT 63; a call resolves 1–3 params |
+| "THE POPULATION IS SIX SPELLINGS" | 6 | **6**, the same six, in the same set | **exact** |
+| both function names exist in the tree | — | yes | the `inferListElemName` fiction stayed dead |
+
+Two structural readings come free and both matter. `AG == AC` and `BG == BC`: every call clears the
+`FuncDecl`/`Block` guards, so there is no silent decline arm to preserve. `AP == AR` (33) and
+`BP == BR` (30): every parameter the loop walks carries a NON-EMPTY pin, so the `""` arm — the one
+the conversion has to map onto a `-1` index — has zero reaches on the corpus and is preserved on
+reading rather than on measurement.
+
+**THE REACHING POPULATION IS TEN FILES.** Per-record deltas over the cumulative counters:
+
+| file | ΔAC | ΔBC | ΔAR | ΔBR | ΔMINT |
+|---|---:|---:|---:|---:|---:|
+| `generics/nested-generic-call-spine.vl` | 4 | 4 | 4 | 4 | **8** |
+| `generics/trailing-comma.vl` | 1 | 1 | 1 | 1 | 0 |
+| `generics/type-param-name-shadows-builtin.vl` | 1 | 1 | 1 | 1 | 0 |
+| `inference/hole-join-generic-arg.vl` | 2 | 2 | 6 | 6 | 0 |
+| `inference/hole-join-two-level-chain.vl` | 3 | 3 | 9 | 9 | 0 |
+| `inference/unannotated-build-expr.vl` | 3 | 0 | 3 | 0 | **3** |
+| `inference/unannotated-length.vl` | 1 | 1 | 1 | 1 | **2** |
+| `inference/unannotated-param-scalar-return.vl` | 6 | 6 | 6 | 6 | **12** |
+| `loops/while-true-return.vl` | 1 | 1 | 1 | 1 | 0 |
+| `types/type-name-walk-homes-coverage.vl` | 1 | 1 | 1 | 1 | 0 |
+| | **23** | **20** | **33** | **30** | **25** |
+
+### 2. THE NUMBER THE FILING DID NOT CARRY — 25 of the 63 MINT, and that is what decides the grading
+
+`nameToTy` does not intern array types: every `nameToTy("f64[]")` appends a fresh structural
+`TyArray` to `T.tys`. The prim spellings (`i32` · `string` · `boolean`) never mint; the three array
+spellings always do. **M=25**, i.e. 40% of the population was minting an arena entry that nothing
+kept a reference to — the window truncates every append-only inference and diagnostic table on the
+way out (`holeShape*`, `binCstr*`, `inferLet*`, `inferRet*`, `inferStack`, `redun*`, `T.diags`) but
+it has never truncated `T.tys`, by design and correctly, because a minted type may still be
+reachable from what it resolved.
+
+That makes the conversion a rep change and not just a plumbing change: **removing the 63 resolutions
+removes 25 mints, and every arena index above them renumbers.** Measured, per file, on the four that
+mint:
+
+| file | arena at `emitProgram` tail, before | after | Δ |
+|---|---:|---:|---:|
+| `generics/nested-generic-call-spine.vl` | 251 | 243 | **−8** |
+| `inference/unannotated-build-expr.vl` | 77 | 74 | **−3** |
+| `inference/unannotated-length.vl` | 67 | 65 | **−2** |
+| `inference/unannotated-param-scalar-return.vl` | 102 | 90 | **−12** |
+| | | | **−25** |
+
+Four of 1,451 programs, and no other program's arena size moves. The renumbering is REAL and the
+emitted bytes do not see it — §4's `sha256` column is identical on all four.
+
+**NEG=0.** No resolution in the population declines, so `recordClonedNodeTy`'s `PIN_SIGKEY` /
+`PIN_ANON` fallback (which the windows never had) cannot differ from the raw `nameToTy` they used —
+on the corpus. Off the corpus it can, and adopting the recorded index is the deliberate choice: a
+window that binds a parameter to a raw negative `nameToTy` result is holding a non-index in a scope
+slot, and a placeholder `TyFunc` is the better answer as well as the reachable one.
+
+### 3. WHAT SHIPPED
+
+Both windows now take `paramTyIxs: i32[]`. The indices are not newly computed anywhere — the
+resolution the conversion deletes and the resolution it reads are the same call:
+
+```
+typecheck.vl
+  recordClonedNodeTy(nodeIx, name, pin) -> i32     RETURNS the index it recorded (was 0)
+  i32TyIx() -> i32                                 the one arm with no recorder to read
+  monoInferListElem(declIx, paramTyIxs: i32[], localName)
+  monoInferLocalScalar(declIx, paramTyIxs: i32[], localName)
+      pty = TY_ERR;  if pi < paramTyIxs.length { if paramTyIxs[pi] >= 0 { pty = paramTyIxs[pi] } }
+
+emit_mono.vl, monoMakeInstance's param loop
+  const pinnedTyIx: i32[] = []                     one row per `params` entry, pushed unconditionally
+  if nt >= 0 { pinTy = recordClonedNodeTy(nt, pinned[pj], pinKinds[pj]) } else { pinTy = i32TyIx() }
+  … monoInferListElem(monoOrigNode[origFe], pinnedTyIx, rxe.identName)
+```
+
+The `else` arm is the one place the filing's "one push" understates the work: `recordClonedNodeTy`
+is called only when the clone MINTS an annotation node (`nt >= 0`), and the all-i32 path deliberately
+mints none (`parType` stays -1 so the emitter's default kind applies and the arena grows by zero).
+That arm has no recorder return to bank, and it is exactly `nameToTy("i32")`, so it banks `i32TyIx()`.
+
+**Same instrument, both sides** — the ZZB3 counters rebuilt against the index-fed signature:
+
+```
+BEFORE: ZZB3|AC=23|AG=23|AR=33|BC=20|BG=20|BR=30|TOT=63|M=25
+AFTER : ZZB3|AC=23|AG=23|AR=33|BC=20|BG=20|BR=30|TOT=63|M=0
+```
+
+**The REACHES are unchanged and the RESOLUTIONS are zero.** 63 reaches still happen — the windows
+still bind 63 parameters — and none of them parses a spelling or touches the arena. Reported in both
+units because the two move differently, which is the point of the correction in §1.
+
+### 4. EQUIVALENCE — the corpus A/B is the live instrument here and the FUZZ A/B is a coverage zero
+
+| leg | rc | reading |
+|---|---:|---|
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,135,405 B** — byte-identical to this branch's base fixpoint, so the A/B baseline IS master's published compiler |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,135,531 B** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,135,531 B |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,689 / 0 / 7** — the ignored SET is the seven documented names (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); 7 and not 13 is the tell that `wasm-opt` is present, 7 and not ~615 the tell that the env var took |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 unsound, 0 new, 0 stale |
+| corpus A/B, **1,734 files**, five per-file fields: `vl build` rc · **sha256 of the emitted wasm** · build stderr · `vl run` rc · run stdout | 0 | **0 rows moved**, and the four arena-renumbered files are inside it |
+| corpus directory channels: `vl check` (11,309 lines/side) · `vl check --codegen` (11,439 lines/side) | 0 | identical |
+| fuzz A/B, **18,000 programs/side** (seeds 4401-4403 × depths 4/5/6 × plain/declared, `--branching --multiobs`, generated once with master's compiler) | 0 | `vl check` identical (105,061 lines/side) · `vl check --codegen` identical (107,695 lines/side) — **and it is a COVERAGE ZERO, measured rather than assumed: ZZB3 over the same 18,000 programs reads `AC=0 BC=0 AR=0 BR=0`** |
+| master's FROZEN source compiled by this head | — | **not run, because it is a coverage zero too**: ZZB3 over `compiler/entry.vl` reads `AC=0 BC=0`. `compiler/*.vl` never reaches either window |
+
+**THE INVERTED CONTROL FIRES.** SAB-NOPIN — the pin dropped inside both windows (`paramTyIxs[pi] >= 0`
+inverted, so `pty` stays `TY_ERR`) — moves **3 of the 10 reaching files** on every field:
+`nested-generic-call-spine` and `unannotated-param-scalar-return` go BRC 0→1 with a different
+`sha256` and *"is not a valid WebAssembly"*, `unannotated-build-expr` goes to a clean emit reject
+(*"only i32[] arrays and struct/union element arrays are supported"*). The 0-row A/B above is
+therefore a measured zero on a live harness.
+
+**AND IT REFUTES THE BRIEF THIS SLICE WAS WRITTEN FROM**, which carried *"the corpus A/B is VACUOUS
+for this family… use the fuzz A/B as the primary equivalence instrument here"*. It is the exact
+inverse: the corpus is the only instrument with reach, and the fuzz corpus has none. The generator
+emits no un-annotated parameter whose body builds a list or binds a scalar from the hole element, so
+18,000 programs grade this change no better than zero of them.
+
+**ONE ARM HAS NO WITNESS, AND THAT IS REPORTED RATHER THAN PAPERED OVER.** SAB-NOI32 — the
+`i32TyIx()` fallback replaced by `-1`, so an all-i32 pinned param binds `TY_ERR` — is **INERT on all
+10 reaching files**, and three hand-built candidate shapes (a `self[k]` scalar read with an i32 index
+param, an `out.push(self[i] * k)` build with an i32 factor, an `i < n` bounded fold) agree
+byte-for-byte across head, sabotage and base. `i32TyIx()` is still the faithful value — it is what
+`nameToTy("i32")` returned — but nothing in the tree distinguishes it from `-1`, so it ships as a
+correctness argument and not as a tested one.
+
+**BYTE DELTA: 1,135,405 → 1,135,531 = +126 B.** A returned value, an accessor, an `i32[]` built per
+instance, and two changed call arguments.
+
+**SEED BOOTSTRAP: no split needed.** The gate starts from a freshly fetched published `seed-latest`
+and it compiles this branch's source (`refresh-compiler.sh` rc 0 on the first self-compile).
+
+### 5. THE CHECKER-SIDE FRONTIER AFTER THIS SLICE
+
+| # | bucket | reaches | status |
+|---|---|---:|---|
+| 4a | canon's `&`-fold | 25 | SHIPPED (D-CANONFOLD) |
+| 3 | `monoInferListElem` / `monoInferLocalScalar` | 63 resolutions | **SHIPPED — 63 → 0, and 25 arena mints with them** |
+| 4b | `unionMemberGenAppShape` | 4 distinct spellings | W9, unchanged |
+| T | the 9 alias-of-application rows | 9 (of a 16-row family) | FILED, hand-off REFUTED |
+| 1c | `unMemAtomTyIx` | 2,085 resolutions | REFUTED — a checker recorder banks a different answer |
+| 1c | `sTyIxOfName` | 1,064 resolutions, all one call site | FILED to the EMITTER (`internInlineShapeTy`) |
+
+### METHOD NOTES
+
+* **A CORRECT COUNT CAN STILL HIDE THE NUMBER THAT DECIDES THE SLICE.** The filing's 63 and its six
+  spellings both reproduce exactly, and neither says that 25 of the 63 MINT. A conversion that only
+  had to preserve *values* would have been a five-line edit; one that also renumbers four programs'
+  type arenas needs an emitted-BYTES A/B, which is a different gate. *Instrument the side effect of
+  the call you are deleting, not only its result — `T.tys.length` around the call is two lines.*
+* **THE UNIT SPLIT IS WHERE THIS PROGRAMME'S NUMBERS KEEP DYING, AND THE FIX IS TO REPORT BOTH.**
+  63 resolutions is 43 calls. Either number alone reads as "the population"; a reader planning a
+  per-call cache and a reader planning a per-param column need different ones. *This is the seventh
+  published count in this programme re-derived into a different unit — carry the ratio, not the
+  scalar.*
+* **A BRIEF'S INSTRUMENT ADVICE IS A CLAIM, AND IT IS CHEAPER TO MEASURE THAN TO TRUST.** The brief
+  named the fuzz A/B as primary and the corpus A/B as vacuous. One probe run over each population
+  inverted both: the corpus reaches the sites 63 times in 10 files and a sabotage moves 3 of them;
+  the fuzzer reaches them 0 times in 18,000 programs. *Run the coverage probe over the population
+  you were told to use before you use it — a zero there is the difference between a gate and a
+  ritual.*
+* **AN ARM WITH NO WITNESS IS A REPORTABLE RESULT.** The `i32TyIx()` fallback is inert under
+  sabotage on the whole reaching population and under three purpose-built candidate shapes. Saying
+  so is worth more than either quietly shipping it or manufacturing a fixture that only fails under
+  a poison. *Distinguish "preserved by argument" from "preserved by test" in the commit that makes
+  the choice.*
+* **THE `""` ARM AND THE PIN ARM ARE THE TWO EDGES A NAME→INDEX CONVERSION HAS TO MAP, AND NEITHER
+  HAS A REACH.** `AP == AR` says no pinned param is ever `""`; `NEG=0` says none ever fails to
+  resolve. Both edges are therefore preserved on reading rather than on measurement, and both are
+  named here so the next reader knows which lines have no coverage behind them. *When the census
+  shows a branch at zero, write down that it is at zero — the conversion still has to get it right.*
+
+<!-- APPEND-MARKER-MONOPINIX-END -->
