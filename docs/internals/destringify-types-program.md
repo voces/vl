@@ -39926,3 +39926,197 @@ and it compiles this branch's source at the first self-compile.
   dump the rung's answered vocabulary over the whole corpus and count it (seven names), not to argue
   it. *When a rung is refused for a mechanism, ask whether the next rung's key space can REACH that
   mechanism before assuming it inherits the refusal.*
+
+## D-ROWS12 — the frontier's two remaining rows are BOTH untakeable, and the by-TEXT bucket that took row 4 says so in one table: row 2 has NO arena-neutral parse at all, and 88% of row 1's is the rung already refuted here BY NAME (off master `1d3a8559`)
+
+#1332 took row 4 by printing the distinct inputs of a hot path before designing the machinery that
+replaced it — 65% of the row was seven primitive keywords. The brief for this slice was to apply
+that same unit to the two rows left standing, rows 1 (`repElemKeyOfNameTy`, 463 parses) and 2
+(`sTyIxOfNameTy`, 402), and to decide whether EITHER is takeable before converting anything.
+
+**Neither is.** The measurement is below, and it is a refutation with two different mechanisms —
+which is the useful part, because the two rows fail for opposite reasons.
+
+### 1. THE INSTRUMENT, AND ITS FOUR INDEPENDENT CONTROLS
+
+**PROBE ZZR**, one record per grammar READ at each of the two sites, tagged with the arena growth
+across the call and the spelling that caused it. `resolveAnnot` memoizes per spelling, so a "parse"
+is the MISS path only; the probe detects it with a tick inside `annotResolve` itself (every route,
+including the two non-memoized ones) and reads the delta, so a nested resolution never double-counts
+the outer call.
+
+```
+probe:   compiler/typecheck.vl   annotResolve  -> zzParseN = zzParseN + 1; export zzParses()
+         compiler/emit_rep.vl    repElemKeyOfNameTy / sTyIxOfNameTy — around each `resolveAnnot`:
+                                 zzp0 = zzParses(); zzt0 = T.tys.length; <call>
+                                 if zzParses() > zzp0 -> record(tag, T.tys.length - zzt0, name)
+build:   vl build compiler/entry.vl -o probe.wasm --compiler <master fixpoint>
+run:     vl check --codegen tests/cases --compiler probe.wasm > zz.out    # rc 1, the probe raises
+extract: grep -o 'ZZR1|[^ ]*' zz.out > ZZR1.rec
+         awk -F'|' '$3=="m0"' ZZR1.rec | cut -d'|' -f4- | sort | uniq -c | sort -rn
+```
+
+Every record carries a running sequence number. That is not decoration: **`tErr` drops an exact
+repeat**, so without it the census is a distinct-value SET (#1332 read 481 for a population of
+1,229 this way). With it the four control totals come back exact:
+
+| control | #1331 published | ZZR measured |
+|---|---:|---:|
+| row 1 parses | 463 | **463** |
+| row 1 arena entries minted | 540 | **540** |
+| row 1 mint-free parses | 126 | **126** |
+| row 2 parses / minted / mint-free | 402 / 918 / 0 | **402 / 918 / 0** |
+
+The mint totals are reconstructions from the per-record deltas (row 1: 201×1 + 87×2 + 35×3 + 11×4 +
+2×5 + 1×6 = 540; row 2: 168×1 + 85×2 + 83×3 + 35×4 + 19×5 + 2×6 + 4×7 + 2×8 + 1×9 + 2×10 + 1×11 =
+918), so agreeing with a separately-built instrument on both the count AND its decomposition is a
+stronger control than either number alone.
+
+### 2. ROW 2 IS UNTAKEABLE BECAUSE THE PARSE IS THE MINT — 0 of 402, and no text class exists
+
+| row 2 `sTyIxOfNameTy` | parses |
+|---|---:|
+| **MINT-FREE** | **0** |
+| minting (1–11 arena entries each) | **402** |
+
+There is no arena-neutral parse to take. Every one of the 402 grows `T.tys`, so skipping any of them
+removes an entry and renumbers every later arena index — the hazard #1331 named and the reason
+`repElemKeyGo`, which keys on that index, cannot be left to absorb it.
+
+The by-TEXT bucket says why this is structural rather than incidental. **282 distinct spellings for
+402 parses** — 1.43 parses per spelling — against row 4's 803 parses over SEVEN spellings:
+
+| spelling | parses | | spelling | parses |
+|---|---:|---|---|---:|
+| `{v:i32}` | 16 | | `{f:f64}` | 8 |
+| `{f:i64}` | 16 | | `{f:string}` | 6 |
+| `{x:i32}` | 13 | | `{f:f32}` | 6 |
+| `{f:i32}` | 8 | | …276 more | ≤5 each |
+
+The head of the distribution is 4.0% of the row. **This is a long tail by construction, not by
+accident**: the site's own guard is `nameIsShapeSpanEnds(nm)`, so every spelling that reaches the
+grammar here is an INLINE SHAPE, and an inline shape's arena type does not exist until this call
+creates it. Row 4's parses were *re-deriving* an answer the arena had already seeded; row 2's parses
+*are* the derivation. **There is nothing banked to read instead of parsing, so there is no rung to
+add** — the only route left is the filed `internInlineShapeTy(nm, tyIx)` thread (D-INLINESHAPETY),
+which does not remove the parse, it moves it to a caller that already holds the index. #1331 measured
+that population at 18 of 1,064; the other 1,046 arrive from a caller that CUT `nm` out of a larger
+spelling and therefore holds no bank for the cut.
+
+### 3. ROW 1 IS UNTAKEABLE BECAUSE ITS ARENA-NEUTRAL HALF IS THE REFUTED RUNG — 111 of 126
+
+Row 1's 463 parses partition cleanly on three flags (arena growth · `cUserTypes` covers · resolved):
+
+| mint | `cUserTypes` | resolves | parses | what it is |
+|---|---|---|---:|---|
+| **0** | **yes** | yes | **111** | a bare DECLARED name — `S` 30 · `P` 19 · `A` 10 · `Node` 8 · `T0` 7 · `B` 7 · `Pt` 5 · `N` 4 · `Box` 3 · `Animal` 3 · … |
+| **0** | no | **no** | **13** | the synthetic `#anon0` 9 · `#anon1` 3 · `#anon2` 1 — a first-time NEGATIVE resolution |
+| **0** | no | yes | **2** | `Box<i32>`, a generic application already interned |
+| 1–6 | no | yes | **337** | everything composite (540 entries minted) |
+
+**THE ARENA-NEUTRAL POPULATION IS 126, AND 111 OF IT (88.1%) IS EXACTLY THE RUNG THIS SITE ALREADY
+REFUSES.** The `u1` column IS `cUserTypes` coverage, measured per parse — and it comes back 111 over
+all 463, the number #1331 §3 measured on a different instrument. That rung is refused HERE and only
+here: a positive `annotNameMemo` entry is not invalidated when `cUserTypes` is rewritten, so a
+re-registered declaration (`type FView = new { … }`,
+`tests/cases/memory/newtype-struct-views-distinct.vl`) leaves the two tables holding different arena
+indices, and at this site — unlike rows 6 and 7 — `repElemKey` of the two **differs**: 4 disagreements
+in 976 memo-HIT reaches. So the one rung that could take row 1's arena-neutral half is the one with a
+named witness against it, and this slice's contribution is the denominator: taking it would buy **111
+parses at the price of a silently re-keyed ref-list row**.
+
+The residue past it is **15 parses**, and it is not worth a rung: 13 synthetic `#anonN` and 2
+`Box<i32>`, i.e. 0.8% of the emitter's 1,846.
+
+**THE 13 ARE A NEGATIVE RESOLUTION, WHICH IS THE ONE ARENA-NEUTRAL CONVERSION THAT EXISTS HERE — AND
+IT IS NOT FREE.** `#anonN` is a name the EMITTER synthesises; no user annotation can be spelled with a
+leading `#`, so the grammar is being run to conclude "unresolvable", and the caller then keys on
+`"name:" + name` — precisely what a `#`-prefix guard would return. It is skipped here anyway, because
+the negative path is not pure: it writes `annotNameMemoNegVer[name]` and banks `annotPart[name]`,
+which feeds `unkTyPart` and hence `unknownTyText`'s diagnostic leaf. Trading a measured diagnostic
+side effect for 13 parses (0.7% of the emit-side total) is the wrong side of that bargain, and it is
+recorded here so the next slice does not re-derive it.
+
+### 4. THE CLASS THAT LOOKS LIKE #1332's LEVER AND IS NOT — the primitive ARRAYS, 70 of 70 minting
+
+Row 1's by-TEXT head is not the declared names, it is arrays of primitive keywords:
+
+```
+extract: grep -E '\|(i32|i64|f64|f32|boolean|string)\[\]$' ZZR1.rec | cut -d'|' -f3 | sort | uniq -c
+  70 m1
+```
+
+`i32[]` 36 · `string[]` 12 · `f64[]` 11 · `i64[]` 7 · `f32[]` 3 · `boolean[]` 1. A closed vocabulary
+of six reserved spellings that no declaration can be spelled as — the exact key-space argument that
+made #1332's rung sound — and **70 of 70 of them MINT**, one `TyArray` entry each.
+
+That single column is the difference between the two slices, and it is the method note this one is
+for. #1332's rung was arena-neutral because the arena **seeds** `i32` … `null` at reset, before any
+annotation resolves: the answer was already in the arena, at a fixed index, and the parse was
+re-deriving it. There is no seeded `i32[]`. Its arena entry does not exist until something creates
+it, so a rung that answered the spelling without resolving would not be *reading a bank*, it would be
+*suppressing a mint* — and the entry then gets minted by whatever queries `i32[]` next, at a later
+index, renumbering everything after it. Seeding the six array types at reset would fix that and is a
+global renumbering of every program's arena, i.e. a rep change that re-pins goldens: orchestrator
+work, not a slice.
+
+*A closed key space is necessary for one of these rungs and it is not sufficient. The question that
+decides it is whether the arena already HOLDS the answer at a stable index — and #1332 passed that
+test by an accident of the reset seeding primitives, not by virtue of its vocabulary being closed.*
+
+### 5. THE FRONTIER AFTER THIS SLICE — no ledger movement, and that is the result
+
+| # | site | parses | status |
+|---|---|---:|---|
+| 4 | `unMemAtomTyIx` | 426 | 425 of 426 MINT — at its floor |
+| 1 | `repElemKeyOfNameTy` | 463 | **UNTAKEABLE** — 126 arena-neutral, 111 of them the `FView`-refuted rung, 15 residue |
+| 2 | `sTyIxOfNameTy` | 402 | **UNTAKEABLE** — 0 arena-neutral of 402; 282 distinct texts, no class |
+| 3 · 6 · 7 | via `declTyIxOfName` | 540 | composite spellings only |
+| 5 | `slotCanonKey` | 15 | residue past the `sTyIx` column's end |
+| | **emit-side total** | **1,846** | unchanged |
+
+**THE EMIT-SIDE PARSE FRONTIER IS AT ITS FLOOR FOR NAME-SHORTCUT ROUTES.** All three surviving rows
+are now mint-bound: row 4 is 425/426 minting, row 2 is 402/402, row 1 is 337/463 with its neutral
+remainder refuted. Every further parse on this side is either the creation of an arena type or a
+resolution whose only cheaper answer is a table this site has a measured reason not to read. What
+moves next is not another rung — it is the arena-index THREADING (D-INLINESHAPETY / D-REPELEMTY), which
+does not remove parses so much as relocate them to callers that already hold the index, and #1331
+measured that population at 18 of 1,064 at row 2.
+
+### 6. GATE
+
+Doc-only. No `compiler/*.vl` change ships in this slice: the probe was reverted before the commit
+(`git checkout compiler/emit_rep.vl compiler/typecheck.vl`, worktree clean), so the branch's tree
+differs from master in this file alone and the compiler is byte-identical to master's fixpoint by
+construction. Master's own fixpoint was re-derived from a freshly fetched published seed at the head
+of the slice as the probe's baseline: `scripts/fetch-seed.sh` (1,132,435 B) →
+`refresh-compiler.sh --prove-fixpoint` rc 0, *"NATIVE FIXPOINT HOLDS"*, **1,134,990 B**.
+
+**BYTE DELTA: 0.**
+
+### METHOD NOTES
+
+* **THE UNIT THAT TOOK A ROW CAN BE THE UNIT THAT CLOSES ONE.** Bucketing by TEXT was #1332's lever;
+  applied to rows 1 and 2 the same bucket returns 282 distinct spellings for 402 parses and 209 for
+  463 — a long tail where row 4 had seven keywords. *The bucket does not only find the shortcut; its
+  SHAPE is the verdict, and a flat distribution is a refutation you can read in one column.*
+* **A CLOSED KEY SPACE IS NECESSARY AND NOT SUFFICIENT.** Row 1's largest text class is six reserved
+  array spellings no declaration can collide with — #1332's exact soundness argument — and all 70
+  MINT, because the arena seeds `i32` but not `i32[]`. *Before reusing a rung's soundness argument,
+  check the OTHER precondition it happened to satisfy: that the arena already holds the answer at a
+  stable index. #1332 passed that by an accident of the reset, not by its key space.*
+* **A REFUTED RUNG'S DENOMINATOR IS WORTH MEASURING EVEN THOUGH THE RUNG IS REFUTED.** #1331 refused
+  `cUserTypes` at row 1 on 4 disagreements in 976. This slice measures what accepting it would have
+  BOUGHT — 111 parses, 88.1% of the row's entire arena-neutral population — which is what makes the
+  refusal a closed question instead of a deferred one. *A blocker without its denominator gets
+  re-litigated every slice; one with it does not.*
+* **TWO ROWS, TWO DIFFERENT REASONS, AND THE DIFFERENCE IS THE PLANNABLE PART.** Row 2 cannot be taken
+  because its parse CREATES the type; row 1 cannot because its neutral half needs a table that is
+  stale here. Collapsing both to "mint-bound" would lose that row 2 has no route at any price while
+  row 1 has one at a known and unacceptable one. *Report the mechanism per row — "untakeable" is a
+  verdict, not a finding.*
+* **AN INSTRUMENT THAT REPRODUCES A DECOMPOSITION IS BETTER CONTROLLED THAN ONE THAT REPRODUCES A
+  TOTAL.** ZZR agreed with #1331 on 463 and 402, and also on 540, 126, 918 and 0 — and on 111
+  `cUserTypes`-covered parses that #1331 measured with a different probe. *When the new instrument
+  can rebuild the old one's sub-totals from per-record data, a surprise in the new column is a
+  finding rather than a suspected bug.*
