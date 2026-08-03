@@ -124,6 +124,11 @@ const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }
   // producer now has one site, and the two survivors at `-O`/`-O3` are the PAYLOAD
   // allocations (the data), not the box (the overhead).
   { fixture: "union-box-payload-read", none: 3, O: 2, O3: 2 },
+  // The SAME program as `union-box-payload-read`, its producer written as one `return` of
+  // an if-EXPRESSION. A union-valued if-expression lowers as a value-typed `if` that boxes
+  // in each arm, which read 4/4/4 until the return path split it into per-arm exits. The
+  // two rows must stay equal: they are one program in two spellings.
+  { fixture: "union-sink-if-expression", none: 3, O: 2, O3: 2 },
 ];
 
 // Loop SHAPE per rung, per fixture in `tests/fixtures/opt-loop/`.
