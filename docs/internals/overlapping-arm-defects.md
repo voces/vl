@@ -94,7 +94,7 @@ unclassified and is not the number to quote):
 | root cause | cells | |
 |---|---:|---|
 | **ROOT A** — one tag cannot separate overlapping arms | **49** | a wrong `is` answer |
-| **ROOT B** — `is` narrowing launders past a live reject | **9** | **SOUNDNESS** |
+| ~~**ROOT B**~~ — `is` narrowing launders past a live reject | ~~9~~ | **CLOSED #1343 — and it was bigger than this table says** |
 | N5 container variance | 6 | already an open ruling, not this family |
 
 Per family: newtype-over-base A 13 / B 8 · struct-shape-overlap A 6 / B 1 · literal-union-remaining
@@ -179,3 +179,38 @@ plausible rather than novel. And the agent's own reading of the evidence — tha
 `{v: i32} | i32` "proves `u` became a single struct" — does **not** hold up: that is the correct
 `.v` for `{v: {v: i32}}`, so it is not evidence of a swallow. **The defect is confirmed by the
 controls above; the mechanism is not yet.**
+
+
+---
+
+## ROOT B is CLOSED (#1343) — and the mechanism recorded above was WRONG
+
+The entry above locates ROOT B in `checkIsExprNode` banking the tested type verbatim, gated by
+`assignable(chkTy, unionTy)`. The banking is real, but it is **not the hole**, and the union framing
+in that sentence is an artifact of how the defect was found (through `K | string` witnesses) rather
+than a property of the defect.
+
+**`checkIsExprNode` applied its soundness gate only when the operand was a UNION or NULLABLE. A plain
+operand was left ungated entirely.** The THEN branch narrows to the tested type either way, so an
+ungated `is` hands the branch a binding of a type the value provably does not have — with **no union,
+no tag and no overlap anywhere in the program**:
+
+```vl
+type Name = new string
+const n: Name = "bob"
+takesString(n)                        // vl check rc 1 — rejected
+if n is string { takesString(n) }     // vl check rc 0 — ran, printed "bob"
+```
+
+So ROOT B was never a member of the overlapping-arm family at all; it was found through that family's
+witnesses because an overlapping `is` is one way to reach it, not the only way. **No tag-compare fix
+could have rescued it.** The scalar cases were worse than the newtype one: `i32 is string`,
+`string is i32` and `i32 is i64` all passed `vl check` and emitted INVALID WASM.
+
+Fixed by gating every operand. `TyVar` and `TyErr` are assignable in both directions by construction,
+so generic parameters stay freely testable and an already-errored operand gains no second diagnostic.
+**48 cells, 6 UP, 0 DOWN, 22 legitimate-narrowing controls unchanged.**
+
+*The method note is the one this programme keeps re-learning: **the witnesses that find a defect
+shape the story told about it.** ROOT B was filed as a union bug because every witness had a union in
+it. The fix needed one line of gate and no union at all.*
