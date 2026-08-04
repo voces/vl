@@ -1,0 +1,158 @@
+// @run
+// @log ok
+// @log K
+// @log S
+// @log S
+// @log K
+// @log S
+// @log aa!
+// @log ok
+// @log K
+// @log K
+// @log O
+// @log cc
+// @log O
+// @log P
+// `x is K` over a BOXED union that carries `K` as an ARM is a MEMBERSHIP test over the
+// payload, not a box-tag compare — and the first line of this file is why.
+//
+// The litunion arm rides the box as its member STRING, so it shares the `string` atom's tag.
+// In `K | string` that tag is the ONLY thing an `is` could read, and it is identical for a
+// member and for a non-member: `x is K` answered TRUE for the string `"zz"`, at `vl check`
+// rc 0 and `vl run` rc 0. A silent wrong answer, the worst outcome class this compiler has.
+//
+// GIVING THE ARM ITS OWN TAG DOES NOT FIX IT, and that is measured rather than reasoned
+// (`docs/internals/litunion-compact-rep-design.md` §7.1.1). `K` ⊆ `string`, so the two arms
+// OVERLAP: the value `"aa"` is simultaneously a `K` and a `string`, and BOTH `x is K` and
+// `x is string` have to answer TRUE. A `{tag, value}` box discriminates on one tag field, so
+// a value in both arms carries exactly one of the two tags and the other test answers a
+// silent FALSE — a 14th value-atom kind moves the wrong answer from `is K` to `is string`
+// rather than removing it (2 grid cells UP, 3 DOWN, all three losses the same silent class).
+// The `is K`/`is string` PAIRS below are what holds that door shut: a tag scheme cannot make
+// both of a pair green, so no future re-tagging can green this file by halves.
+//
+// The answer that holds for both is the value test `x is "aa" || x is "bb"` — the same
+// membership `emitIs` already emits over interned atom ids for a standalone litunion
+// receiver, and the same semantics #1306 gave the flattened `K | K2`.
+//
+// Members are spelled DIFFERENTLY per section for the reason #1304 records: a shared member
+// set lets one registration answer another section's lookup, and the second section greens
+// without ever being reached.
+
+type K = "aa" | "bb"
+
+// ── the collision itself: a NON-member string in a `K | string` box ──────────
+function nonMemberIsNotK() {
+  const x: K | string = "zz"
+  if x is K { print("WRONG") } else { print("ok") }
+}
+nonMemberIsNotK()
+
+// A MEMBER string in the same box still answers K — the half a tag scheme has to give up.
+function memberIsK() {
+  const x: K | string = "aa"
+  if x is K { print("K") } else { print("S") }
+}
+memberIsK()
+
+// … and it is a `string` at the same time, because `K` ⊆ `string`. The pair above and this
+// one cannot both be green under any one-tag-per-arm scheme.
+function memberIsAlsoString() {
+  const x: K | string = "aa"
+  if x is string { print("S") } else { print("N") }
+}
+memberIsAlsoString()
+
+function nonMemberIsString() {
+  const x: K | string = "zz"
+  if x is string { print("S") } else { print("N") }
+}
+nonMemberIsString()
+
+// The store side, from a real ATOM value rather than a literal (#1307's D-ATOMSTORE leg
+// widens the interned id to its member string). The membership test reads the widened
+// payload, so both `is` questions answer on the same box.
+function atomStoreIsK() {
+  const k: K = "aa"
+  const x: K | string = k
+  if x is K { print("K") } else { print("S") }
+}
+atomStoreIsK()
+
+function atomStoreIsString() {
+  const k: K = "aa"
+  const x: K | string = k
+  if x is string { print("S") } else { print("N") }
+}
+atomStoreIsString()
+
+// The `string`-narrowed arm still concatenates — the narrowing that the `is string` guard
+// pushes must survive the membership lowering.
+function atomStoreNarrowedConcat() {
+  const k: K = "aa"
+  const x: K | string = k
+  if x is string { print(x + "!") } else { print("N") }
+}
+atomStoreNarrowedConcat()
+
+// The nullable sibling: 3+ members with a `null` arm is a BOX with a null tag, not the
+// `K | null` atom niche, so the same collision lives here.
+function nullableNonMemberIsNotK() {
+  const x: K | string | null = "zz"
+  if x is K { print("WRONG") } else { print("ok") }
+}
+nullableNonMemberIsNotK()
+
+function nullableMemberIsK() {
+  const x: K | string | null = "bb"
+  if x is K { print("K") } else { print("S") }
+}
+nullableMemberIsK()
+
+// ── the NON-colliding mixed spellings keep answering by value ────────────────
+// `K | f64` has no `string` arm, so its tag alone was already unambiguous. The membership
+// lowering replaces that tag compare too, and these pin that it did not cost the arm.
+type K2 = "cc" | "dd"
+
+function numericArmMember() {
+  const k: K2 = "cc"
+  const x: K2 | f64 = k
+  if x is K2 { print("K") } else { print("O") }
+}
+numericArmMember()
+
+function numericArmOther() {
+  const x: K2 | f64 = 2.5
+  if x is K2 { print("K") } else { print("O") }
+}
+numericArmOther()
+
+function numericArmNarrowedRead() {
+  const k: K2 = "cc"
+  const x: K2 | f64 = k
+  if x is K2 { print(x) } else { print("O") }
+}
+numericArmNarrowedRead()
+
+// The UN-ALIASED INLINE spelling of the same shape, with its own members.
+//
+// Only the NON-member half of `("pp" | "qq") | string` is pinned, and deliberately: the
+// MEMBER half answers `S` here AND on master, because that spelling never becomes a box —
+// the inline run and the `string` arm share a base, so `canonEmitTypeNames` softens the
+// whole annotation to a plain `string` and `x is ("pp" | "qq")` takes the softened-scalar
+// path, which is statically false for a multi-member tested type. That is a SEPARATE
+// pre-existing gap (the same one a bare `const s: string = "aa"; s is K` has), it is
+// unmoved by the membership lowering, and pinning its wrong answer here would make it an
+// invariant. The DECLARED-alias spelling above does box, which is why the collision is
+// visible there and not here.
+function inlineArmNonMember() {
+  const x: ("pp" | "qq") | string = "zz"
+  if x is ("pp" | "qq") { print("P") } else { print("O") }
+}
+inlineArmNonMember()
+
+function inlineArmMemberBoxed() {
+  const x: ("pp" | "qq") | f64 = "pp"
+  if x is ("pp" | "qq") { print("P") } else { print("O") }
+}
+inlineArmMemberBoxed()

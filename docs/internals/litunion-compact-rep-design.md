@@ -448,15 +448,85 @@ a vocabulary fix wearing a performance rationale.** §3 is the ruling that says 
 Both re-base the existing bands; they differ in how far.
 
 - **14th kind** — `refArrSlotTag` `+13 → +14`, `mapSlotTag` `+16 → +17`. Two constants, 5
-  and 3 call sites. Fixes F1, F2, and `K | string`. Leaves `K | K2` broken **and
+  and 3 call sites. Claimed to fix F1, F2, and `K | string`; **§7.1.1 measured it and it
+  fixes none of the three** — it moves `K | string`'s silent wrong answer from `is K` to
+  `is string` (2 cells UP, 3 DOWN) and leaves F2 INVALID-WASM. Leaves `K | K2` broken **and
   unrejectable** (§4).
 - **Third slot band** — an interned litunion member-SET table, tags interleaved 3-ways
   instead of 2. Fixes F3 completely. Renumbers every union box tag in every program.
+  **Inherits §7.1.1's refutation** for `K | string`: its litunion tag is distinct from
+  kind 2's, which is the whole mechanism of the loss.
 
 Either way the renumbering is a **uniform** ABI move whose corpus A/B is all-BYTES: #1300
 saw 6 files move that way from a single vanished union row, and the published band formulas
 (all rooted at `uVariants.length`) are what makes such a diff explicable rather than
 alarming. A deliberate re-base needs that explanation prepared *before* the A/B, not after.
+
+#### 7.1.1 MEASURED — neither tag scheme closes `K | string`: the arms OVERLAP
+
+The 14th kind was built as a probe and graded on a 23-cell isolated grid (`vl run` against
+each cell's `@log`, every rc taken BARE, `INVALID-WASM` discriminated on the validator text).
+It **is refuted as a fix** for `K | string`, and the refutation is structural, so it kills the
+third slot band with it.
+
+The root cause of `K | string` is not the saturated band. It is that the two arms
+**OVERLAP** — `K ⊆ string`, so the value `"aa"` is simultaneously a `K` and a `string`, and
+both `x is K` and `x is string` must answer TRUE. A `{tag, value}` box discriminates by ONE
+tag (§1.1's load-bearing invariant), so a value belonging to both arms carries exactly one of
+the two tags, and whichever it carries the other test answers a silent FALSE. Giving the
+litunion arm its own tag MOVES the wrong answer from `is K` to `is string`; it does not
+remove it. A third slot band's litunion tag is equally distinct from kind 2's, so it moves
+the same wrong answer to the same place.
+
+Probe 1 is `unMemAtomKind` answering 13 for a litunion member, which is the whole `is` side
+(`isArmTagOfTy` then tests tag 13 and its `tyIsLitUnion` fallback never fires). Probe 2 adds
+`emitUnionCoerce`'s D-ATOMSTORE leg tagging 13 — together the complete 14th kind, minus the
+two band constants, which no cell on this grid reaches.
+
+| cell | master | probe 1 | probe 2 |
+|---|---|---|---|
+| `const x: K \| string = "zz"; x is K` | **RUN-WRONG** | RUN-OK | RUN-OK |
+| `const x: K \| string \| null = "zz"; x is K` | **RUN-WRONG** | RUN-OK | RUN-OK |
+| `const x: K \| string = "aa"; x is K` | RUN-OK | **RUN-WRONG** | **RUN-WRONG** |
+| `const k: K = "aa"; const x: K \| string = k; x is string` | RUN-OK | RUN-OK | **RUN-WRONG** |
+| `… x is string { print(x + "!") }` | RUN-OK | RUN-OK | **RUN-WRONG** |
+| `const k: K = "aa"; const x: K \| string = k; x is K` | RUN-OK | RUN-WRONG | RUN-OK |
+| `const k: K = "aa"; const x: K \| f64 = k; x is K` | RUN-OK | RUN-WRONG | RUN-OK |
+| `const k: K = "aa"; const x: K \| i32 = k; x is K` | RUN-OK | RUN-WRONG | RUN-OK |
+| `… x is K { print(x) }` over `K \| string` and `K \| f64` | RUN-OK | RUN-WRONG | RUN-OK |
+
+**The complete 14th kind is 2 cells UP and 3 cells DOWN, and all three of the losses are the
+SAME outcome class as the defect it was built to close** — a `vl check` rc 0, `vl build`
+rc 0, silently wrong `is` answer. §4's outcome-class law forbids it exactly as it forbids the
+reject. (Probe 1 alone is 2 UP / 6 DOWN: separating the `is` tag without the store tag breaks
+every arm the store still tags 2, which is the whole F1 population #1307 fixed.)
+
+Two further costs the pricing did not carry:
+
+- **A bare string LITERAL member never reaches the atom store.** `exprIsLitAtom` claims a
+  litunion-flagged local, a litunion-annotated param, an atom element or a `K | null` niche —
+  never a literal — so `const x: K | string = "aa"` classifies `cak = 2` in
+  `emitUnionCoerce`'s ladder and keeps the string tag while `is K` tests 13. Recovering that
+  cell needs a store leg keyed on the literal's TEXT being a member of the arm, and a
+  `is string` that accepts BOTH tags. Neither is in §7.1's "two constants, 8 call sites".
+- **It does not fix F2.** `if x is K { const y: K = x }` is INVALID-WASM
+  (`type mismatch: expected i32, found (ref $type)`, `vl check` rc 0) on master and under
+  BOTH probes, for `K | string` and `K | f64` alike; so is `print(x)` over a `K | string`,
+  with the same signature. F2 is a narrowed-READ rep question — the narrowing binds the arm
+  as the i32 atom while the box hands back a string ref — and no tag scheme moves it.
+
+**What WOULD close it.** A `K | string` box has ONE payload type: `repCanonKeyGo` already
+dedups its two arms to a single `string` render (§7.4). So `x is K` reduces exactly to *is
+this string ref a member of K's set* — a VALUE test,
+`tag == scalarTagOfKind(2) && (__str_eq__(payload, "aa") || __str_eq__(payload, "bb"))`. It
+answers every cell in the table correctly, costs NO tag and NO ABI move, and lands in one
+place: `emitIs`'s box-tag path, beside the `laTexts` ladder that already emits the identical
+membership chain over interned atom ids for a standalone litunion receiver. It is also the
+semantics #1306 shipped for the flattened `K | K2` (§7.3: *"let `is K` be a membership test
+over K's subset"*). §7.1 is the wrong question for this defect: the fix is an `emitIs`
+change, not a rep change — and it is a semantic fork (`is K` becomes a value test, so a
+plain `string` local carrying `"aa"` would start answering `is K` true where today it
+answers false) that still wants the owner's ruling.
 
 ### 7.2 `ref.i31` in the emitted vocabulary — yes or no?
 
