@@ -86,8 +86,30 @@ At least one cell graded `RUN-WRONG` by the sweep is actually `INVALID-WASM` on 
 (`const a: i32[] = [1,2]; const b: f64[] = a` — `vl check` rc 0, `vl run` fails to build). Loud, not
 silent, and still a `vl check` hole.
 
-**A precise root-cause partition of all 64 has not been done** and is worth its own pass before any
-fix is scheduled — the count above is by keyword, which left 39 unclassified.
+## The root-cause partition — done, and it changes the priority
+
+Classified by what each minimal repro DOES rather than by keyword (a first keyword pass left 39
+unclassified and is not the number to quote):
+
+| root cause | cells | |
+|---|---:|---|
+| **ROOT A** — one tag cannot separate overlapping arms | **49** | a wrong `is` answer |
+| **ROOT B** — `is` narrowing launders past a live reject | **9** | **SOUNDNESS** |
+| N5 container variance | 6 | already an open ruling, not this family |
+
+Per family: newtype-over-base A 13 / B 8 · struct-shape-overlap A 6 / B 1 · literal-union-remaining
+A 11 · nullable-and-arrays A 12 / N5 5 · function-and-mixed A 7 / N5 1.
+
+**ROOT A is 5x the population, but ROOT B is the one to fix first.** A wrong `is` answer is a bug in
+one expression; a laundered narrowing lets a program call a function the checker rejects one line
+earlier, so it converts a type error into whatever the callee does with a value of the wrong rep.
+ROOT A also has a known shape of fix already shipped once (#1340's membership test) while ROOT B has
+none.
+
+Note the two are **not independent**: every ROOT B witness is also a ROOT A witness, because the
+laundering is only reachable through an `is` that answered wrongly. Fixing A may reduce B's
+population without closing it — B's gate (`assignable(chkTy, unionTy)`, true for every arm) is
+wrong regardless of what the tag compare answers.
 
 ## Method notes worth keeping
 
