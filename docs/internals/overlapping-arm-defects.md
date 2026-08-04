@@ -122,3 +122,60 @@ wrong regardless of what the tag compare answers.
 - **A filing's stated mechanism can be wrong for months while its symptom is real.** The tag-band
   framing survived because nobody built it; #1340 built it and it was 2 cells up, 3 down.
 
+
+---
+
+## The `generic-and-alias` family, recovered — and it found a defect that is NOT an overlap bug
+
+The family recorded above as UNMEASURED was re-probed. Its agent also stalled, but 25 probe cells
+survived on disk and were **re-run from scratch by the integrator** rather than taken on report.
+
+Most of the family is clean or correctly rejected: 8 RUN-OK with their inverted controls moving,
+11 CHECK-REJECT, 4 EMIT-REJECT. **No new overlap/tag defect was found here.** That is a real result
+for ROOT A — generic instantiation and alias transparency do *not* appear to manufacture the tag
+collision, which is worth knowing before generalising #1340's membership test.
+
+**But one cell is a live soundness hole of a different kind.**
+
+```vl
+type Box<T> = { v: T }
+type U = Box<Box<i32>> | i32
+const u: U = { v: 5 }        // vl check rc 0 — ACCEPTED, and it runs
+```
+
+`Box<Box<i32>>` is `{ v: { v: i32 } }`, so `{ v: 5 }` matches neither arm. It is accepted anyway.
+
+**Three controls localise it exactly:**
+
+| program | rc | |
+|---|---:|---|
+| the same union written WITHOUT generics — `{ v: { v: i32 } } \| i32` | **1** | correctly REJECTED |
+| the nested application with NO union — `const b: Box<Box<i32>> = { v: 5 }` | **1** | correctly REJECTED: *"cannot assign `{v: i32}` to 'b' of type `{v: {v: i32}}`"* |
+| the generic union with a CORRECT initializer — `{ v: { v: 5 } }` | 0 | correctly accepted |
+| **the generic union with the wrong initializer** — `const`, and in ARGUMENT position | **0** | **ACCEPTED — the defect** |
+
+So nested generic application resolves correctly on its own, and the union resolves correctly
+without generics. **The hole is specifically a generic alias application appearing as a UNION
+MEMBER.** The resulting value matches no arm — `if u is Box<Box<i32>>` answers NOT.
+
+### The suspect, flagged as a LEAD and not a conclusion
+
+`typecheck.vl:9054 unionMemberGenAppShape` is the union-member path for a generic application, and it
+resolves the type and then **renders it back to a NAME**:
+
+```vl
+const ti = nameToTy(member)
+if t is TyObj { return tyToEmitName(ti) }
+```
+
+That is a type round-tripped through a parsable string — exactly what the destringify programme
+exists to remove — sitting directly beneath a soundness hole. **If confirmed, this is the strongest
+argument the programme has produced**: a stringified type is not merely slow or ugly here, it is
+load-bearing for a wrong answer.
+
+Two reasons to hold it as a lead. `unionMemberGenAppShape` is already filed in the destringify
+programme as bucket **4b, blocked on W9** (canon's name-in/name-out contract), so the connection is
+plausible rather than novel. And the agent's own reading of the evidence — that `u.v` typing as
+`{v: i32} | i32` "proves `u` became a single struct" — does **not** hold up: that is the correct
+`.v` for `{v: {v: i32}}`, so it is not evidence of a swallow. **The defect is confirmed by the
+controls above; the mechanism is not yet.**
