@@ -195,7 +195,28 @@ const LOOP_TABLE: Array<{
   // FEWER carried is the direction the gate's own model calls faster, and the
   // measurement agrees: `bench/arrays/binsearch` at `none` 1292 -> 1235 ms
   // (0.956, min-of-5 interleaved, noise floor 0.49%).
-  { fixture: "binsearch-probe", none: [6, 3, 6], O: [3, 3, 6], O3: [3, 3, 6] },
+  // `none` then moved 6,3,6 -> 7,4,6 when `__str_hash__` gained its 4x unroll — the
+  // SAME shape as the `__str_eq__` firing above, and verified the same way rather
+  // than assumed. Per-function loop counts, master vs this change:
+  //
+  //   $4  rot  1 -> 1     $5  bsearch (the probe itself)  2 -> 2, BYTE-IDENTICAL
+  //   $6       0 -> 0     $7  __str_hash__                1 -> 2   <- the only row
+  //   $8       2 -> 2     $9                              0 -> 0
+  //
+  // `$7` takes one string ref, returns i32, and its body carries the FNV prime
+  // 16777619 FIVE times — four unrolled steps plus the remainder — which is exactly
+  // what an unrolled loop plus its scalar tail looks like. `binsearch-probe.vl`
+  // contains ZERO string operations (grep for a quote returns 0), so it never calls
+  // `$7`; the added loop and the added rotation are both unreachable from this
+  // program and cost it nothing. `-O` and `-O3` are UNCHANGED at 3,3,6 because both
+  // rungs already inline the helper away.
+  //
+  // This is the second time the module-wide unit has fired on the wrong axis, which
+  // strengthens the filed tightening: the gate cannot tell "the probe\'s loop
+  // rotated" (the 2.40x defect it exists to catch) from "a helper this program never
+  // calls gained a loop". Until that lands, a helper change legitimately moves these
+  // numbers and the fix is to re-verify PER FUNCTION and update the row.
+  { fixture: "binsearch-probe", none: [7, 4, 6], O: [3, 3, 6], O3: [3, 3, 6] },
 ];
 
 // The same representative @run spread the `-O` suite uses, so the two rungs are
