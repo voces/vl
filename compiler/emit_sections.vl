@@ -1740,44 +1740,98 @@ function helpFrameBody(out: i32[], body: i32[]) {
   0
 }
 
-// `__str_hash__(s) -> i32`: the masked non-negative FNV-1a hash of a string —
-// `h = 2166136261; for c in s { h = (h ^ c) * 16777619 }; h & 0x7fffffff`. The
-// 32-bit wasm `i32.mul` wraps exactly as the host's hash does. Params: s(0).
-// Locals: h(1), i(2).
-function emitStrHashFnCode(out: i32[]) {
-  const body: i32[] = []
-  const prev = wTarget(body)
-  wULEB(1)                // 1 locals run
-  wULEB(2)                // count 2
-  wU8(127)                // 0x7f i32
-  fbI32Const(-2128831035) // 2166136261 as signed (the FNV offset basis)
-  fbLocalSet(1)           // h
-  fbI32Const(0)
-  fbLocalSet(2)           // i = 0
-  fbLoop(64)              // loop, void
-  fbLocalGet(2)           // i
-  fbLocalGet(0)           // s
-  fbArrayLen()
-  fbI32Bin(78)            // 0x4e i32.ge_s (i >= len → done)
-  fbIf(64)                // then: done (empty)
-  fbElse()
-  // h = (h ^ s[i]) * 16777619
+// One `h = (h ^ s[i + k]) * 16777619` step of the FNV chain, against the
+// `__str_hash__` frame (s = param 0, h = local 1, i = local 2). `k == 0` skips
+// the offset add. Shared by the unrolled block and the remainder loop so the two
+// cannot drift into hashing differently.
+function fbStrHashStep(k: i32) {
   fbLocalGet(1)
   fbLocalGet(0)
   fbLocalGet(2)
+  if k != 0 {
+    fbI32Const(k)
+    fbI32Bin(106) // i32.add (i + k)
+  }
   fbArrayGet(aTypeIdx)
   fbI32Bin(115) // 0x73 i32.xor
   fbI32Const(16777619)
   fbI32Bin(108) // 0x6c i32.mul
   fbLocalSet(1)
-  // i = i + 1
+  0
+}
+
+// `__str_hash__(s) -> i32`: the masked non-negative FNV-1a hash of a string —
+// `h = 2166136261; for c in s { h = (h ^ c) * 16777619 }; h & 0x7fffffff`. The
+// 32-bit wasm `i32.mul` wraps exactly as the host's hash does. Params: s(0).
+// Locals: h(1), i(2), n(3), lim(4).
+//
+// The walk is UNROLLED FOUR WIDE, then a scalar remainder loop finishes the tail —
+// the same shape `__str_eq__` uses, and `lim = n - 4` is likewise a SUBTRACTION so
+// a maximal-length string cannot overflow the gate (`n` is an `array.len`, while
+// `i + 4` could wrap). For `n < 4` the limit goes negative, `i > lim` is true at
+// `i = 0`, and every element is answered by the remainder loop, so short strings
+// skip the wide block entirely instead of paying a wasted test.
+//
+// FNV is a SERIAL dependency chain — each `i32.mul` waits on the previous `h` — so
+// the unroll cannot overlap the arithmetic; what it removes is the per-element loop
+// control, and `n` is hoisted because a reference local lives in a stack-map slot,
+// making `local.get 0; array.len` a memory LOAD on every iteration rather than a
+// loop-invariant the engine can hoist. Measured on a 1k-entry / 8M-lookup probe at
+// 46-char keys: 2.13 → 1.10 ns per code point, which is ~3 cycles/point and hence
+// the `i32.mul` latency floor. Widening to eight is measurably WORSE (more code,
+// same chain), and no further unroll can help — the loop is now
+// dependency-bound, not overhead-bound. That floor is also what bounds any
+// hash-CACHING scheme: at short keys the whole walk is ~11 ns of a ~63 ns probe.
+function emitStrHashFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(1)                // 1 locals run
+  wULEB(4)                // count 4
+  wU8(127)                // 0x7f i32
+  fbI32Const(-2128831035) // 2166136261 as signed (the FNV offset basis)
+  fbLocalSet(1)           // h
+  fbI32Const(0)
+  fbLocalSet(2)           // i = 0
+  fbLocalGet(0)           // s
+  fbArrayLen()
+  fbLocalSet(3)           // n = array.len(s)
+  fbLocalGet(3)
+  fbI32Const(4)
+  fbI32Bin(107)           // i32.sub
+  fbLocalSet(4)           // lim = n - 4
+  // Wide block: while i <= lim { 4 chained steps ; i += 4 }
+  fbLoop(64)    // loop, void
+  fbLocalGet(2) // i
+  fbLocalGet(4) // lim
+  fbI32Bin(74)  // 0x4a i32.gt_s (i > lim → no full block fits)
+  fbIf(64)      // then: done (empty)
+  fbElse()
+  fbStrHashStep(0)
+  fbStrHashStep(1)
+  fbStrHashStep(2)
+  fbStrHashStep(3)
+  fbLocalGet(2)
+  fbI32Const(4)
+  fbI32Bin(106) // i32.add
+  fbLocalSet(2) // i += 4
+  fbBr(1)       // → loop header
+  fbEnd()       // end (gt_s if)
+  fbEnd()       // end (wide loop)
+  // Remainder: while i < n { one step ; i += 1 }
+  fbLoop(64)    // loop, void
+  fbLocalGet(2) // i
+  fbLocalGet(3) // n
+  fbI32Bin(78)  // 0x4e i32.ge_s (i >= n → done)
+  fbIf(64)      // then: done (empty)
+  fbElse()
+  fbStrHashStep(0)
   fbLocalGet(2)
   fbI32Const(1)
   fbI32Bin(106) // i32.add
   fbLocalSet(2)
   fbBr(1)       // → loop header
   fbEnd()       // end (ge_s if)
-  fbEnd()       // end (loop)
+  fbEnd()       // end (remainder loop)
   // h & 0x7fffffff — force non-negative (the result).
   fbLocalGet(1)
   fbI32Const(2147483647)
@@ -2001,6 +2055,18 @@ function emitStrConcatFnCode(out: i32[]) {
   helpFrameBody(out, body)
 }
 
+// THE INDEX-CAPACITY POWER-OF-TWO INVARIANT, which both probe helpers and the
+// rehash rely on to wrap with `i32.and` instead of `i32.rem_u` (a hardware
+// divide on every probe and every collision step). The `index` array's length is
+// a power of two at every point in a map's life, from its only three producers:
+//   · `emitMapNew` allocates it at INITIAL_CAP*2 = 16;
+//   · `__map_resize__` (`emitMapResizeFnCode`) replaces it with `2 * len(index)`;
+//   · `emitMapCompact` rebuilds it at `cap = 16; while cap < 2*size { cap *= 2 }`.
+// There is exactly one `struct.new` of a map struct and exactly two writes to its
+// `index` field, so this list is the whole population — a fourth producer that
+// did not preserve the invariant would silently corrupt every probe, so add one
+// only together with a `mask = cap - 1` that is still `cap - 1` for it.
+//
 // `__map_probe__(index, hashes, live, keysBacking, key) -> i32`: hash the key
 // (via `__str_hash__`) and linear-probe (wrapping) to the slot holding either the
 // matching key's entry or a free (0) slot — the shared core of every map op. The
@@ -2008,25 +2074,27 @@ function emitStrConcatFnCode(out: i32[]) {
 // (`live[entry-1] == 0`) probes past (a marker, not a hit) — see `emitMapProbe`'s
 // caller-side contract. Returns the PROBE SLOT; the caller re-reads
 // `index[slot]` for the entry. Params: index(0), hashes(1), live(2),
-// keysBack(3), key(4). Locals: cap(5), keyHash(6), slot(7), entry(8).
+// keysBack(3), key(4). Locals: mask(5), keyHash(6), slot(7), entry(8).
 function emitMapProbeFnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
   wULEB(4) // count 4
   wU8(127) // 0x7f i32
-  // cap = array.len(index)
+  // mask = array.len(index) - 1  (the index length is a power of two)
   fbLocalGet(0)
   fbArrayLen()
+  fbI32Const(1)
+  fbI32Bin(107) // 0x6b i32.sub
   fbLocalSet(5)
   // keyHash = __str_hash__(key)
   fbLocalGet(4)
   fbCall(gHelpStrHash)
   fbLocalSet(6)
-  // slot = keyHash % cap
+  // slot = keyHash & mask   (== keyHash % cap)
   fbLocalGet(6)
   fbLocalGet(5)
-  fbI32Bin(112) // 0x70 i32.rem_u
+  fbI32Bin(113) // 0x71 i32.and
   fbLocalSet(7)
   fbBlock(64)   // block (probe break target), void
   fbLoop(64)    // loop, void
@@ -2069,12 +2137,12 @@ function emitMapProbeFnCode(out: i32[]) {
   fbEnd()
   // if match { br out (hit) }
   fbBrIf(1)
-  // slot = (slot + 1) % cap  (collision OR a tombstone marker: keep probing)
+  // slot = (slot + 1) & mask  (collision OR a tombstone marker: keep probing)
   fbLocalGet(7)
   fbI32Const(1)
   fbI32Bin(106)
   fbLocalGet(5)
-  fbI32Bin(112) // i32.rem_u
+  fbI32Bin(113) // 0x71 i32.and
   fbLocalSet(7)
   fbBr(0)       // → loop header
   fbEnd()       // end (loop)
@@ -2092,24 +2160,26 @@ function emitMapProbeFnCode(out: i32[]) {
 // Everything else (the wrapping linear probe, the free-slot break, the tombstone
 // skip, the entry+1 encoding) is IDENTICAL, which is what lets both key kinds share
 // `__map_resize__`, the rehash and the compaction. Params: index(0), hashes(1),
-// live(2), keysBack(3), key(4). Locals: cap(5), keyHash(6), slot(7), entry(8).
+// live(2), keysBack(3), key(4). Locals: mask(5), keyHash(6), slot(7), entry(8).
 function emitMapProbeI32FnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
   wULEB(4) // count 4
   wU8(127) // 0x7f i32
-  // cap = array.len(index)
+  // mask = array.len(index) - 1  (the index length is a power of two)
   fbLocalGet(0)
   fbArrayLen()
+  fbI32Const(1)
+  fbI32Bin(107) // 0x6b i32.sub
   fbLocalSet(5)
   // keyHash = mix(key)
   fbI32HashMix(4, 6)
   fbLocalSet(6)
-  // slot = keyHash % cap
+  // slot = keyHash & mask   (== keyHash % cap)
   fbLocalGet(6)
   fbLocalGet(5)
-  fbI32Bin(112) // 0x70 i32.rem_u
+  fbI32Bin(113) // 0x71 i32.and
   fbLocalSet(7)
   fbBlock(64)   // block (probe break target), void
   fbLoop(64)    // loop, void
@@ -2151,12 +2221,12 @@ function emitMapProbeI32FnCode(out: i32[]) {
   fbEnd()
   // if match { br out (hit) }
   fbBrIf(1)
-  // slot = (slot + 1) % cap  (collision OR a tombstone marker: keep probing)
+  // slot = (slot + 1) & mask  (collision OR a tombstone marker: keep probing)
   fbLocalGet(7)
   fbI32Const(1)
   fbI32Bin(106)
   fbLocalGet(5)
-  fbI32Bin(112) // i32.rem_u
+  fbI32Bin(113) // 0x71 i32.and
   fbLocalSet(7)
   fbBr(0)       // → loop header
   fbEnd()       // end (loop)
