@@ -21816,28 +21816,44 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
   if chkTy < 0 {
     tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
   } else if n.isVariant != "null" {
-    // SOUNDNESS: `x is T` is meaningful only when `T` is one of the value's
-    // possible variants (or `null`). When the value's type is a union/nullable,
-    // the check type must be assignable to its non-null part — otherwise the
-    // test can never hold (e.g. `(string | i32) is boolean`, or a struct outside
-    // the union), so reject it rather than compile an always-false branch. Only
-    // a union/nullable value is "testable"; a plain (incl. generic/inferred)
-    // operand is left alone, matching the host.
+    // SOUNDNESS: `x is T` is meaningful only when the value can actually BE a
+    // `T` — i.e. `T` is assignable to `x`'s type (its non-null part when `x` is
+    // nullable). Otherwise the test can never hold, and since the THEN branch
+    // narrows `x` to `T` VERBATIM (`collectThenNarrows`), an ungated test hands
+    // the branch a binding of a type the value provably does not have. That is a
+    // LAUNDER, not a dead branch: `n: Name` (`type Name = new string`) passed to
+    // a `string` parameter is a hard type error, yet `if n is string { f(n) }`
+    // would slip the same value through — and for a newtype there is no legal
+    // unwrap at all (`as` is numeric-only). Scalar mismatches (`i32 is string`)
+    // launder straight into invalid wasm.
+    //
+    // The gate covers EVERY operand, not just unions. `TyVar` (a generic
+    // parameter) and `TyErr` (an un-inferred or already-errored operand) pass
+    // `assignable` in both directions by construction, so an opaque operand is
+    // still freely testable and never acquires a second diagnostic.
     const ot = T.tys[objTy]
-    let testable = false
     let baseTy = objTy
+    let inUnion = false
     if ot is TyUnion {
-      testable = true
+      inUnion = true
     } else if ot is TyNullable {
-      testable = true
+      inUnion = true
       baseTy = ot.nInner
     }
-    if testable {
-      if !assignable(chkTy, baseTy) {
+    if !assignable(chkTy, baseTy) {
+      if inUnion {
         tErr(
           "`is` check type '" +
             n.isVariant +
             "' is not a variant of " +
+            tyToStr(objTy),
+          ix,
+        )
+      } else {
+        tErr(
+          "`is` check type '" +
+            n.isVariant +
+            "' can never match a value of type " +
             tyToStr(objTy),
           ix,
         )
