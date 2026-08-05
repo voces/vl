@@ -2232,6 +2232,7 @@ export function initChecker() {
   annotNameMemo = Map()
   annotNameMemoNegVer = Map()
   annotPart = Map()
+  annotClash = Map()
   tpEnvNames = []
   tpEnvTys = []
   bgSrcStack = []
@@ -5871,10 +5872,18 @@ function tsMapKeyNodeOf(root: i32) {
 let unkTyPart = ""
 let unkTyDepth = 0
 
+// The SECOND bank on the same wire: a union member list the emitter cannot separate
+// (`nomUnionRepClashMsg`) is a resolution failure with a diagnostic of its own, so
+// `annUnionInnerTy` poisons the annotation to -1 exactly as an unresolved member does and
+// banks WHY. Every `unknownTyText` caller then reports the specific reason without gaining
+// an arm. Same lifetime as `unkTyPart` — cleared by the outermost resolver frame.
+let unkTyClash = ""
+
 // The `unknown type` diagnostic text for the whole annotation `name`, naming the
 // offending COMPONENT when the bank holds one that is not the whole name. Read
 // immediately after the failing resolution (every call site is a resolve/`tErr` pair).
 function unknownTyText(name: string) {
+  if unkTyClash.length > 0 { return unkTyClash }
   const part = unkTyPart
   if part.length == 0 { return "unknown type '" + name + "'" }
   if part == name { return "unknown type '" + name + "'" }
@@ -5889,7 +5898,10 @@ function unknownTyText(name: string) {
 // is quoted in the same canonical spacing the whole name is.
 function tsToTy(ix: i32) {
   unkTyDepth = unkTyDepth + 1
-  if unkTyDepth == 1 { unkTyPart = "" }
+  if unkTyDepth == 1 {
+    unkTyPart = ""
+    unkTyClash = ""
+  }
   const r = tsToTyReal(ix)
   if r < 0 {
     if unkTyPart.length == 0 { unkTyPart = tsToName(ix) }
@@ -5902,7 +5914,10 @@ function tsToTy(ix: i32) {
 // re-resolutions come through here).
 function nameToTy(name: string) {
   unkTyDepth = unkTyDepth + 1
-  if unkTyDepth == 1 { unkTyPart = "" }
+  if unkTyDepth == 1 {
+    unkTyPart = ""
+    unkTyClash = ""
+  }
   const r = nameToTyReal(name)
   if r < 0 {
     if unkTyPart.length == 0 { unkTyPart = name }
@@ -5963,6 +5978,13 @@ function nameToTy(name: string) {
 function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
   if members.length == 0 { return TY_ERR }
   if members.length == 1 { return members[0] }
+  // Two members the emitter cannot separate poison the annotation (-1) with the reason
+  // banked — ahead of the `null` early-out, because `N | i32 | null` is the same union.
+  const nwClash = nomUnionRepClashMsg(members)
+  if nwClash.length > 0 {
+    unkTyClash = nwClash
+    return -1
+  }
   if hasNull { return mkUnionTy(members) }
   // EVERY member must be a literal union. A litunion member of a MIXED union keeps its
   // own arena node, and that is the scope ruling rather than caution: flattening the RUN
@@ -6054,6 +6076,9 @@ function tsToTyReal(ix: i32) {
       pi = pi + 1
     }
     const inner = annUnionInnerTy(members, hasNull)
+    // A poisoned inner (an unseparable member pair) must NOT be wrapped: `mkNullableTy(-1)`
+    // would mint a nullable over the -1 sentinel and lose the failure.
+    if inner < 0 { return -1 }
     if hasNull { return mkNullableTy(inner) }
     return inner
   }
@@ -6218,6 +6243,9 @@ function nameToTyReal(name: string) {
     // The litunion FLATTEN at its shared home — the TREE route's mirror
     // (`tsToTyReal`'s `TS_UNION` arm). Two annotation routes, one rule.
     const inner = annUnionInnerTy(members, hasNull)
+    // A poisoned inner (an unseparable member pair) must NOT be wrapped: `mkNullableTy(-1)`
+    // would mint a nullable over the -1 sentinel and lose the failure.
+    if inner < 0 { return -1 }
     if hasNull { return mkNullableTy(inner) }
     return inner
   }
@@ -8544,6 +8572,76 @@ function nomBaseTyIx(ix: i32) {
     i = i + 1
   }
   ix
+}
+
+// The arena index `ix` ERASES to at run time: `nomBaseTyIx` iterated to a fixpoint, so a
+// brand over a brand (`type N2 = new N`) reaches the same base its outermost brand does.
+// The bound is a cycle guard, not a depth policy — the sidecar is append-only and a brand
+// is always minted over an index that already exists, so a chain cannot be long.
+function nomErasedTyIx(ix: i32) {
+  let cur = ix
+  let steps = 0
+  while steps < 8 {
+    const b = nomBaseTyIx(cur)
+    if b == cur { return cur }
+    cur = b
+    steps = steps + 1
+  }
+  cur
+}
+
+// ── unions whose arms share ONE runtime representation ──────────────────────────────
+// The diagnostic for a union two of whose members are DISTINCT to the checker but ONE
+// value shape to the emitter, or "" when every member is separable.
+//
+// A union box carries a single tag, and `emitIs` answers `x is T` by comparing it. A
+// nominal brand is minted as a SECOND arena index over the SAME `Ty` value and is ERASED
+// before the emitter runs (`canonEmitTypeNames`; `newtype-design.md` §3), so `N` and its
+// base — and two newtypes over one base — reach that tag identically. No membership
+// predicate can separate them the way #1340's separates a literal-union arm from a
+// `string` arm: a litunion member is a runtime-observable SUBSET of its base, whereas a
+// brand has no runtime witness at all. Every construction of such a union therefore
+// answers TRUE to `is` for both arms, whichever arm the value came from — measured across
+// i32/i64/f64/f32/boolean/string/array/struct bases and in local, parameter and struct-field
+// position, and the two cells that appear to survive are masked (their inverted twins,
+// built through the other arm, are wrong).
+//
+// So the union is not a type this language can represent, and the honest answer is to
+// refuse the SPELLING rather than to answer `is` wrongly. Giving the arm its own tag is
+// the escalation this declines: it requires the brand to survive into the emitter, which
+// is precisely the cost `newtype-design.md` exists to avoid.
+//
+// THE COMPARATOR IS THE MEMBER LIST'S OWN DEDUP, APPLIED ONE ERASURE DOWN, and that is
+// what bounds the rule to brands without naming them. Both member builders drop a member
+// that is `sameVariantTy` with one already kept, so every pair that reaches here is
+// already NOT mutually assignable; a pair whose ERASED forms then are can differ by
+// nothing but a brand. Index equality alone is not enough — it catches a scalar base,
+// whose name resolves to one canonical arena entry, and misses a STRUCTURAL one
+// (`new i32[]` beside `i32[]`, `new {a: i32}` beside `{a: i32}`), where each resolution
+// mints its own index over the same shape.
+//
+// INERT WITHOUT `new`: the sidecar is empty for every program that declares no newtype, so
+// this answers "" before looking at a member — a brand-free program cannot reach the
+// mutual-assignability calls below, let alone a diagnostic.
+function nomUnionRepClashMsg(members: i32[]) {
+  if nwTyIxs.length == 0 { return "" }
+  let i = 1
+  while i < members.length {
+    let j = 0
+    while j < i {
+      if sameVariantTy(nomErasedTyIx(members[i]), nomErasedTyIx(members[j])) {
+        return "union members '" +
+          tyToStr(members[j]) +
+          "' and '" +
+          tyToStr(members[i]) +
+          "' have the same runtime representation, so `is` cannot tell " +
+          "them apart — a nominal newtype is erased to its base at run time"
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  ""
 }
 
 // Would the assignment `srcExpr : srcTy -> dstTy` succeed if the NOMINAL brands in
@@ -12969,8 +13067,19 @@ let annotNameMemoNegVer: {[string]: i32} = Map()
 // line compiles, and the compiler's own source is then the strongest pin the fix can have.
 let annotPart: {[string]: string} = Map()
 
+// …and so does the UNSEPARABLE-MEMBER reason (`unkTyClash`), for the same reason and by
+// the same mechanism: a negative memo hit returns -1 without re-entering the resolver, so
+// a `N | i32` parameter hoisted in pass 1 and reported in pass 2 would fall back to the
+// generic "unknown type" wording. The two banks are separate maps rather than one tagged
+// map because they are two different bank FIELDS and the restore writes each back to its
+// own.
+let annotClash: {[string]: string} = Map()
+
 // The component banked for the failing spelling `name`, or "".
 function annotPartOf(name: string) { return annotPart[name] ?? "" }
+
+// The unseparable-member reason banked for the failing spelling `name`, or "".
+function annotClashOf(name: string) { return annotClash[name] ?? "" }
 
 export function resolveAnnot(name: string, typarams: string[]) {
   resolveAnnotTs(name, typarams, -1)
@@ -12995,6 +13104,7 @@ function resolveAnnotTs(name: string, typarams: string[], root: i32) {
         // Restore the component this name banked when it actually resolved, so the
         // caller's `unknownTyText` reads THIS name's leaf and not the last one anywhere.
         unkTyPart = annotPartOf(name)
+        unkTyClash = annotClashOf(name)
         return -1
       }
       const r = annotResolve(name, root)
@@ -13003,6 +13113,7 @@ function resolveAnnotTs(name: string, typarams: string[], root: i32) {
       } else {
         annotNameMemoNegVer[name] = cUserTypesVer
         annotPart[name] = unkTyPart
+        annotClash[name] = unkTyClash
       }
       return r
     }
@@ -14847,6 +14958,15 @@ function checkProgramNode(n: Program) {
                 )
               }
               vi = vi + 1
+            }
+            // The DECLARATION route's copy of `annUnionInnerTy`'s unseparable-member
+            // rule: this loop builds its member list itself, so `type U = N | i32`
+            // never reaches the shared annotation home. The union is still FILLED —
+            // one diagnostic at the declaration is the whole report, and poisoning the
+            // arena entry would turn every use into a second, worse message.
+            const nwClash = nomUnionRepClashMsg(members)
+            if nwClash.length > 0 {
+              tErr(nwClash + " in union '" + sd.udName + "'", stmts[ti])
             }
             // Variant-member registration is ARITY-AWARE (Stage B b1, latent
             // irregularity (a) from the #920 shadow report): only a REAL
