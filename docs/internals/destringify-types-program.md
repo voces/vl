@@ -31455,6 +31455,11 @@ three-writing SPLIT entry and W14 (field-colon cut) are closed. What remains, in
 > import entries, not three and six: `emit_base.vl` and `emit_classify.vl` are missing from
 > the row entirely. Left unedited as the record of what was believed; see that section.
 
+> **ROW 5 IS DONE, AND ITS "BEHAVIOUR DIFFERENCE" IS REFUTED — see D-MTRQUOTE below.**
+> `modTypeRenamed` takes `skipQuotedName`, so the two rules agree; but the row's premise
+> ("unifying them is a FIX") is wrong, because the naive rule is never reached on a program
+> that compiles. Left unedited as the record of what was believed.
+
 **THE TERMINAL RESIDUE IS 42 DESIGN-BLOCKED SITES + 4 NON-ROUTINGS (1 behaviour fix, 3
 refuted) + 1 PARTITION-BLOCKED LOCATION MOVE (2 bodies).** Zero routable copies remain.
 
@@ -40692,3 +40697,111 @@ this one file and the compiler is master's by construction.
   three consecutive slices have now found their best fact in a column added for a control.*
 
 <!-- APPEND-MARKER-CHECKPARSE-END -->
+<!-- APPEND-MARKER-MTRQUOTE-BEGIN -->
+
+## D-MTRQUOTE — row 5 taken: the two quote rules now agree, and the "BEHAVIOUR DIFFERENCE" that made it row 5 is REFUTED — `modTypeRenamed`'s quote arm is unreachable on any program that compiles
+
+The terminal-residue table's row 5 is the cheapest open item in the census and the only one it
+classifies as a FIX: *"its naive quote skip and `skipQuotedName` disagree on `type T = "a\"b"`,
+which the compiler accepts and runs. **Unifying them is a FIX, not a routing**."* The routing
+shipped. The classification did not survive the attempt to build its witness.
+
+### 1. THE DISAGREEMENT IS REAL AS ARITHMETIC
+
+`modTypeRenamed` scans a rendered type name for identifier runs and rewrites each through the
+module's rename map. On `"` it copied to the next `"`, on the reading "no escapes in type names".
+`skipQuotedName` honours `\`. Over the six characters `"a\"b"` they part company at index 3:
+
+| scanner | lands at | consequence |
+|---|---:|---|
+| `skipQuotedName` | 6 (past the closing quote) | the member is one opaque span |
+| the naive copy | 4 (past the ESCAPED quote) | `b` at 4 is an identifier run, and the `"` at 5 re-opens a run that swallows ` \| ` and hands `c` back as a second run |
+
+So a merge that walked the rendered name would rewrite BOTH `b` and `c` inside the literal — and
+`modBuildRename` puts every top-level declaration name in the map, so a module declaring either one
+is all the shape needs.
+
+### 2. THE WITNESS DOES NOT EXIST, AND THE PROBE SAYS SO IN TWO WAYS
+
+**PROBE MTRQ.** A `P.diags.push` at `modTypeRenamed`'s entry carrying the argument, so every call is
+a loud diagnostic. Two builds: one that fires only when the argument contains a `"`, one that fires
+on every call.
+
+```
+build: OUT=probe.wasm bash scripts/refresh-compiler.sh    # the probe is in the OUTPUT, not the seed
+run:   for f in $(find tests/cases -name '*.vl'); do vl check "$f" --compiler probe.wasm; done
+```
+
+| reading | value |
+|---|---:|
+| corpus files scanned | **1,737** |
+| `modTypeRenamed` calls | **187** |
+| distinct arguments | **51** |
+| arguments containing `"` | **0** |
+
+The 51 are declaration names and nothing else: `Box`, `Box<T>`, `Rows<R,A>`, `Q`, `v`, `w`. A
+purpose-built module fixture that puts an escaped-quote member through nine positions at once — a
+`UnionDecl` alias, a single-member alias, an inline annotation, a struct field, a generic
+application, an array alias, a map value, an `is` check type, and a cross-module call — produces
+nine calls, and all nine are the DECLARED NAMES (`b`, `Q`, `Single`, `Boxed<T>`, `Boxed`, `QBox`,
+`QArr`, `QMap`, `Shape`).
+
+### 3. WHY IT IS ZERO — three walls, and the census row saw none of them
+
+1. **The merge runs only on a multi-module program that PARSED.** A single-file program reaches
+   `modTypeRenamed` zero times (measured: the row's own pin,
+   `tests/cases/types/litunion-escaped-quote-member.vl`, produces no calls at all). A program with a
+   parse error reaches it zero times too — a deliberately malformed `type Q = "a\"b" |` in a lib
+   module produces no calls, so the "malformed parse" population `ast.tsPop`'s `-1` guard exists for
+   cannot get here either.
+2. **Every quoted spelling meets its TREE LEG first.** `modRwType`, `modRwIsType`, the `UnionDecl`
+   member loop and `modRwExpr`'s `as` arm each read the parser's spelling tree and render from it
+   (D-PARSETY P1/P2/P3), falling through to `modTypeRenamed` only when the bank answers -1. The
+   parser banks unconditionally at every mint: `mkTypeRef` has two parser call sites and both
+   `setAnnTs` on the next line, `mkUnionDecl` has two and both `setUdTs`, `mkIsExpr`/`mkIsExprNeg`
+   have three and all three bank, `mkAsExpr` banks. The only `-1` population is the EMITTER's
+   `synthTypeRef`, which is minted long after the merge has run.
+3. **The three UNCONDITIONAL call sites take declaration NAMES.** `n.tdName`, `n.udName` and
+   `modRwDeclBase`'s `declGpBase` are built by `parseTypeDecl` from IDENT tokens plus `<`, `,`, `>`.
+   A quote cannot appear in one.
+
+Walls 2 and 3 are the whole story: the quote arm exists so the pass is TOTAL, not because anything
+routes through it. Row 5 read the arm and inferred a behaviour from it without asking what reaches
+it.
+
+### 4. WHAT SHIPPED
+
+`skipQuotedName` is exported and `modTypeRenamed` copies the span `[i, skipQuotedName(tn, i))` —
+total on an unterminated segment, which lands at `tn.length`. The change is **behaviour-neutral by
+measurement**, not by argument, and it is worth having anyway: the fall-through is now correct by
+CONSTRUCTION rather than correct because nothing reaches it, so the day a tree leg is dropped the
+merge does not quietly start renaming inside literals.
+
+The compiler shrinks **151 B** (1,137,213 → 1,137,062 at the published-seed fixpoint): the call is
+smaller than the copy loop it replaces.
+
+### 5. THE PIN
+
+`tests/cases/modules/litunion-escaped-quote-member/` is the module half the row's own pin says the
+corpus has no vocabulary for — it does; a `tests/cases/modules/<name>/entry.vl` directory IS a
+multi-file case. The lib module declares top-level `b` AND `c`, the two segments the naive scan
+hands back, and carries the member through a declared alias and an inline annotation. It passes
+today because of wall 2, and it is the canary for the day wall 2 moves.
+
+### 6. THE LESSON
+
+* **"THE TWO RULES DISAGREE" IS AN ARITHMETIC CLAIM; "THE COMPILER BEHAVES DIFFERENTLY" IS A
+  REACHABILITY CLAIM, AND A CENSUS ROW CAN ONLY EVER MAKE THE FIRST.** Row 5 promoted one to the
+  other by reading two bodies side by side. The probe that separates them is a `P.diags.push` at the
+  entry of the function in question and one loop over the corpus — twenty minutes, against a row
+  that stood for the length of the programme. *Before filing a difference as a BEHAVIOUR
+  difference, print the arguments.*
+* **A `print` DOES NOT WORK INSIDE THE COMPILER AND A DIAGNOSTIC DOES.** `print` lowers to the
+  `__print_i32__` import family, which the host does not supply to the compiler module — the probe
+  build fails at the sanity run with `unknown import`. `P.diags.push({msg, at: 0})` needs no ABI and
+  survives to `vl check`'s output. *The compiler's own instrument is its diagnostic stream.*
+* **BUILD THE PROBE INTO `OUT`, NEVER INTO THE SEED.** `OUT=probe.wasm scripts/refresh-compiler.sh`
+  compiles the instrumented source WITH the clean seed, so `build/vl-compiler.wasm` is never
+  touched and the iteration loop stays honest.
+
+<!-- APPEND-MARKER-MTRQUOTE-END -->
