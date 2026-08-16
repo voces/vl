@@ -21,8 +21,14 @@ subsystem-avoidance notes.
   language features the current native compiler supports; mimic file style.
 - **One namespace**: all `compiler/*.vl` share a single namespace in the
   concatenated build — grep before adding any top-level name.
-- **Reject-parity**: a change that makes the checker accept more must keep
-  every `REJECT_CASES` entry (tests/selfhost_native_align_test.ts) rejecting.
+- **Reject-parity**: a change that makes the checker accept more must keep every
+  case that rejects today rejecting. ~~`REJECT_CASES`~~ **that named list NO
+  LONGER EXISTS** (`grep -rln REJECT_CASES tests/ scripts/` returns nothing) —
+  gating on it is the vacuous pass this file warns about two bullets up. The live
+  equivalents are the corpus `@error` cases adjudicated by
+  `tests/cases_wasm_test.ts`, and the REJECT tier of
+  `tests/selfhost_native_align_test.ts`, which discovers its members rather than
+  listing them.
 
 ## Work discipline
 - Recon is capped: be editing within ~15 tool calls.
@@ -108,7 +114,9 @@ validator message alone — the disassembly is the debugging view of `vl build` 
   branch's baseline means binaryen is missing, not that anything changed. Diff the
   ignored NAME SET against the baseline with both files asserted non-empty — an
   empty-vs-empty diff is clean and means nothing, which has happened here.
-- Per commit: the REJECT_CASES loop if the checker got more permissive.
+- Per commit, if the checker got more permissive: `deno test -A
+  tests/cases_wasm_test.ts` (the `@error` cases) plus the align suite's REJECT
+  tier. Not "the REJECT_CASES loop" — see the reject-parity bullet above.
   (~~`git status tests/golden/` empty~~ — that directory is GONE; see above.)
 - ~~Before finishing: `deno test -A --no-check tests/selfhost_emit_fixpoint_test.ts`
   must be 14/14.~~ **STALE — that file NO LONGER EXISTS** (verified 2026-08-03).
