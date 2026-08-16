@@ -538,6 +538,12 @@ with no field reads = 69.9 ms):
 | same, funcref+env loads hoisted above the loop | 101.5 | 10.6x |
 | field 0 replaced by an i32 table index + `call_indirect` | **146.2** | **7.3x** |
 
+**The 10.6x row and the 7.3x row are the SAME saving read twice, not two savings that compose.**
+Both delete the 9.40 ns funcref read; the last row is what P2 shipped. Hoisting on TOP of the
+shipped row can only remove the two ordinary loads (rows 2 and 3, 0.29 ns together) — a ~1.26x
+ceiling, measured at 1.12x in `perf-program.md` §13.7. Anyone quoting 10.6x for the hoist today is
+quoting the funcref libcall a second time.
+
 **94% of the whole lambda penalty is one `struct.get` with the call left untouched, and the value is
 discarded.** `call_ref` itself is free (+0.1 ns when the funcref is in a local). The `ref.cast`, the
 closure allocation and the captured environment are all innocent — capturing adds only 1.0 ns/iter
@@ -891,13 +897,17 @@ from 3.1x **slower** than deno to **faster** than deno. Table size is irrelevant
 > **Do NOT "fix" this by typing field 0 more precisely — measured 14% SLOWER** (it takes wasmtime's
 > `get_typed` path with an engine subtype check).
 
-**Complementary, cheaper, strictly better where it applies:** hoist the closure unpack out of loops
-when the closure expression is a local not reassigned in the loop — measured 1072.7 → 101.5 ms
-(10.6x). Both together give ~380 ms.
+**Complementary hoist (workboard G2) — the 10.6x below is NOT what it is worth after P2. Re-derived
+at 1.12x; see `perf-program.md` §13.7.** Hoisting the closure unpack out of a loop when the closure
+expression is a local not reassigned in the loop measured 1072.7 → 101.5 ms (10.6x) **on the funcref
+representation**, so what it was hoisting was the 9.40 ns libcall — which P2 deleted outright. §4.2's
+own ladder prices the residual: the shipped shape is the 146.2 ms row, and all that is left inside
+the loop is two ORDINARY field loads (0.15 + 0.14 ns), a ~1.26x ceiling. Measured 1.12x.
 
-**Prioritise `emitMfInvoke` regardless.** It pays the 9.4 ns libcall **once per element**, confirmed
-in the disassembly of a 10M-element map, so **every idiomatic `xs.map(f)` / `xs.filter(f)` in VL is
-carrying it today** — including inside the self-hosted compiler.
+**`emitMfInvoke` paid the 9.4 ns libcall once per ELEMENT** — confirmed in the disassembly of a
+10M-element map, so every idiomatic `xs.map(f)` / `xs.filter(f)` in VL carried it before P2. It is
+an i32 table-index load now; hoisting THAT out of the element loop is unmeasurable against a 4%
+floor over 10M elements (§13.7).
 
 ### P3 — `emitStrEqFnCode`
 
