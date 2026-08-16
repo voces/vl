@@ -81,7 +81,7 @@ No ruling exists anywhere. `grep -n "RULED\|SHIPPED\|owner" docs/internals/litun
 
 **Cost if taken.** Unpriced — no line/file/PR estimate exists in ROADMAP, DECISIONS, compiler-code-review.md or collections-design.md; every reference is a design sketch. The only sizing signal is negative: it is checker work with no existing scaffolding (zero variance code in compiler/).
 
-**Cost of waiting.** The `Cat[]` → `Animal[]` write hole stays silently accepted and emits invalid wasm (verified above), and it is not even pinned as an xfail — `ls tests/cases/soundness/xfail-*` shows nine xfail fixtures, none about container variance, and docs/guide/soundness.md's 'Known-unsound corners' section lists only the arithmetic hole-operand rule. So the gap is live, undocumented in the soundness corpus, and the 'fully statically sound' claim stays unearned. Readonly-field exports (modules-design §5 point 4, webcraft-requirements:834) stay blocked on it too.
+**Cost of waiting.** The `Cat[]` → `Animal[]` write hole stays silently accepted and emits invalid wasm (verified above), and it is not even pinned as an xfail — no fixture in `tests/cases/soundness/` is about container variance. It is now the ONLY entry in docs/guide/soundness.md's 'Known-unsound corners' section, the arithmetic/equality hole-operand rule having been closed and re-pinned as ordinary `@error` cases. So the gap is live, unpinned in the soundness corpus, and the 'fully statically sound' claim stays unearned. Readonly-field exports (modules-design §5 point 4, webcraft-requirements:834) stay blocked on it too.
 
 <details><summary>verification</summary>
 

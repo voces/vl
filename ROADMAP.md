@@ -722,9 +722,10 @@ in-language GC knobs.
     hybrid delivery, the two-primitive intrinsic floor + `__trap__`, slices 0–6 with gates; six
     open decisions flagged for the maintainer). Doubles as the demand-driven discovery engine
     for the remaining emitter long tail (each gap fails loudly).
-  - The `.vl` compiler is now the spec, so the parked soundness xfails (arith-hole-operand — A13)
-    are fixable bugs, not parity constraints. (array-element-recursion was one until B6a's i32-keyed
-    `Map` retired its premise that `{[i32]: T}` spells `T[]`; it is now a passing case.)
+  - The `.vl` compiler is the spec, so a parked soundness xfail is a fixable bug rather than a
+    parity constraint. Two have since flipped to ordinary passing pins on exactly that reasoning:
+    arith-hole-operand (A13), and array-element-recursion, whose premise that `{[i32]: T}` spells
+    `T[]` B6a's i32-keyed `Map` retired.
 - ✅ **`vl test`.** SHIPPED — see `docs/internals/vl-test-design.md` for the built protocol and the
   three divergences from the charter (brain in `compiler/cli.vl` not `std/test/runner.vl`;
   compilation stays VL-side and only EXECUTION crosses; `.only` is not spellable in VL, so
@@ -821,13 +822,17 @@ in-language GC knobs.
   `Buffer<N>`) — today generics take *type* params only; enabler for the parameterized
   `Decimal<Backing, Scale>` family (B2) and any fixed-size/parameter-by-value type.
   (Forward/mutual-reference return-type inference: shipped as A17 — see `CHANGELOG.md`.)
-- 🟡 **A12. Soundness corpus.** REMAINING: keep growing it; the known-unsound corners are
-  `xfail`-marked (e.g. the permissive `i32 + string` hole rule, A13). The SELF-HOST checker's
-  soundness floor (15 false-accept classes) is closed; new classes go straight to corpus +
-  both checkers.
-- 🟡 **A13. Operator-constraint inference.** REMAINING: the hole-operand rule is permissive (doesn't
-  reject `i32 + string` yet); the *stored-closure* operator case (`vec + vec` via a `"+"` field)
-  still hits the WasmGC width wall (B13).
+- 🟡 **A12. Soundness corpus.** REMAINING: keep growing it; a known-unsound corner is `xfail`-marked
+  until its fix lands, at which point the file drops the prefix and becomes an ordinary `@error`
+  pin. Container element variance (`Cat[]` into an `Animal[]` param) is live and not yet even
+  xfail-marked — `docs/internals/open-rulings.md`. The SELF-HOST checker's soundness floor
+  (15 false-accept classes) is closed; new classes go straight to corpus + both checkers.
+- 🟡 **A13. Operator-constraint inference.** A binary op with a hole operand records a deferred
+  `(lt, op, rt)` constraint that every generic call site re-validates under the substituted
+  argument types (`binOpDefinedFor`) — arithmetic, string concat, relational and equality all fall
+  out of that one rule, so `add(1, "x")` and `cmp(1, "x")` reject exactly as their annotated twins
+  do. REMAINING: the *stored-closure* operator case (`vec + vec` via a `"+"` field) still hits the
+  WasmGC width wall (B13).
 - 🟡 **A14. Named/opaque types.** Zero-cost nominal NEWTYPES ship: `type EntityId = new i32` /
   `type F32View = new { base: i32, length: i32 }`. Distinct in the checker in every position,
   ERASED before the emitter (no emitter file changed), literals brand-polymorphic, `as` for both

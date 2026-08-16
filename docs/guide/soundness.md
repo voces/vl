@@ -105,18 +105,34 @@ do not cross-contaminate.
 
 - sound: `is-generic-param-sound.vl`
 
+### Operators over inference holes
+
+An operator whose operand is an unresolved hole cannot be decided in the body — a
+hole is permissively assignable to string *and* numeric, so an eager check would
+have to guess a branch. The body records a deferred `(lt, op, rt)` constraint
+instead, and **every generic call site re-validates it under the substituted
+argument types**. One rule covers the whole capability: arithmetic, string
+concat, relational, and equality.
+
+So the annotated and un-annotated spellings of the same mistake reject alike —
+inference buys brevity, never a weaker check.
+
+- rejected: `arith-hole-operand-reject.vl` (`add(1, "x")` over
+  `function add(a, b) a + b`), `equality-hole-operand-reject.vl`,
+  `arith-annotated-mismatch.vl` (the annotated twin)
+- sound: `equality-hole-operand-sound.vl` (the same generic at four
+  self-compatible types), `equality-hole-null-test-sound.vl` (`x == null` asks
+  about the storage, not about type agreement, so it is exempt),
+  `functions/operator-capability-poly.vl`
+
 ## Known-unsound corners (documented gaps)
 
-The contract is the goal; a few corners are not yet enforced. They are captured
-as `xfail-*.vl` files with a `TODO(soundness):` note so the gap is *documented*
-even where it is not yet caught. Each compiles clean / runs today to encode
-current behavior, and is annotated with what it *should* do — the regression
-guard fires the moment a fix changes the behavior, surfacing it at merge.
+The contract is the goal; a corner not yet enforced is captured as an `xfail-*.vl`
+file that compiles clean today to encode current behavior and is annotated with
+what it *should* do — the regression guard fires the moment a fix changes the
+behavior, surfacing it at merge. When the gap closes, the file drops its `xfail-`
+prefix and becomes an ordinary `@error` pin.
 
-- **Arithmetic hole-operand rule is permissive** (ROADMAP A13). `i32 + string`
-  is rejected when both operands are concretely annotated
-  (`arith-annotated-mismatch.vl`), but a `+` whose operands are unresolved
-  inference holes defers concretization to the call site without re-checking
-  that the concrete argument types are addable. So `add(1, "x")` (with
-  `function add(a, b) a + b`) type-checks and runs instead of being rejected:
-  `xfail-arith-hole-operand.vl`.
+Container element variance is the live one and is **not** yet pinned here: a
+`Cat[]` flowing into an `Animal[]` parameter is silently accepted and emits
+invalid wasm (`docs/internals/open-rulings.md`).
