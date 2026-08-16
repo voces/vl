@@ -215,6 +215,66 @@ so generic parameters stay freely testable and an already-errored operand gains 
 shape the story told about it.** ROOT B was filed as a union bug because every witness had a union in
 it. The fix needed one line of gate and no union at all.*
 
+
+---
+
+## ROOT A's LARGEST POPULATION IS NOT AN OVERLAP — it is a REP COLLISION between DISJOINT arms
+
+ROOT A's 49 cells were filed as one mechanism. They are not. A 59-cell grid — five populations plus
+17 legitimate-narrowing controls, graded on `check` rc / `build` stderr TEXT / `run` stdout — splits
+them on a question #1340's framing never asked: **do the two arms share VALUES, or only a
+REPRESENTATION?**
+
+| | `K | string` (#1340) | `N | i32`, `EntityId | PlayerSlot` |
+|---|---|---|
+| arms share values | **yes** — `K ⊆ string`, `"aa"` is both | **no** — the checker refuses both directions |
+| arms share a runtime rep | yes | yes |
+| a runtime predicate separates them | **yes** — membership over the payload | **NO — a brand has no runtime witness** |
+| answer | re-lower `is` to a value test | **refuse the spelling** |
+
+A nominal newtype is *defined* to be absent from the emitter (`newtype-design.md` §3): the brand is a
+second arena index over the same `Ty`, and `canonEmitTypeNames` erases it before codegen. So `N` and
+its base reach `emitIs`'s box tag identically and **both** `x is N` and `x is i32` answer TRUE, for a
+value built through either arm. There is no membership predicate to write — a literal-union member is
+a runtime-observable SUBSET of its base, and a brand is nothing at all at run time.
+
+That makes the union a type the language cannot represent, and the shipped answer is a
+declaration-time reject rather than a wrong `is`. **The tag scheme #1340 measured and rejected stays
+rejected**: giving the arm its own tag requires the brand to survive into the emitter, which is the
+entire cost the newtype design exists to avoid — a rep escalation, not a fix.
+
+**The comparator is the member list's own dedup, applied one erasure down.** Both annotation routes
+and the declaration route already drop a member that is `sameVariantTy` with one kept, so every
+surviving pair is NOT mutually assignable; a pair whose ERASED forms then are can differ by nothing
+but a brand. That is what bounds the rule without naming brands in it, and it is why index equality
+alone was not enough — it catches a scalar base (one canonical arena entry per name) and misses a
+structural one (`new i32[]` beside `i32[]`), where each resolution mints its own index.
+
+**59 cells, 24 UP, 2 DOWN, 17 controls unchanged.** 19 RUN-WRONG and 5 EMIT-REJECT became
+CHECK-REJECT. The 2 down are **masked, and proven so**: each is a `N | i32` program whose single
+construction happens to agree with the wrong tag, and each has an inverted twin — the same program
+with the value built through the other arm — that is RUN-WRONG on master. A cell whose inverted twin
+moves is not a cell the shape decides correctly. Six-channel corpus A/B over 151 files (all 23
+pre-existing newtype-declaring files plus a spread sample): **0 differences**. The rule is inert for
+any program with no `new` declaration.
+
+### What is still open, measured on the same grid
+
+| population | cells | master grade | why not closed |
+|---|---:|---|---|
+| **struct arms, same field NAMES, i32-vs-boolean field types** | 3 | RUN-WRONG | a DIFFERENT mechanism, and localized: `emit_collect.vl`'s discriminability reject already refuses `{a:i32} \| {a:f64}` and `{a:i32} \| {a:string}` (verified), but `variantFieldCodesEq` compares STORAGE codes, and `boolean` and `i32` share one — so the pair is treated as the layout-equal twin the exemption is for, both members rank tag 0, and the WAT compares both `is` against `i32.const 0`. Its exemption is keyed on layout where it means IDENTITY. |
+| **struct arms, same shape, width-subtype, or a named twin** | 3 | EMIT-REJECT | already loud; a clean checker diagnostic would be an improvement, not a defect closure |
+| **function-type arms** (arity / param / return differ) | 3 RUN-WRONG + 1 EMIT-REJECT | RUN-WRONG | unprobed mechanism; the closure fat-pointer's arm tag is a separate table from the value-atom tags this slice touched |
+| **literal-union shapes #1340 did not reach** | 5 | RUN-WRONG | `is K` answers FALSE where #1340's membership test should fire: a NUMERIC literal union beside `i32`/`f64`, two literal unions sharing a member, and the INLINE (unaliased) spelling beside `string`. The gate is `nameIsLitUnionArmValueUnion` on the union NAME — the closest thing to a ready template in the tree, and the population most likely to close with #1340's own shape |
+
+One grid oracle was corrected while measuring: three P5 cells were written expecting `is K` and
+`is <base>` to be mutually exclusive. They are not — that IS #1340's rule, and a member is a member of
+both. The grades did not move, but the `want` column did.
+
+*Method note this slice adds: **an inverted twin is what tells a masked cell from a correct one.** Two
+of the newtype cells graded RUN-OK on master and would have read as over-rejection; their twins,
+built through the other arm, are RUN-WRONG, which is what makes those two cells part of the defect
+rather than casualties of the fix.*
 ---
 
 ## The litunion remainder, measured — the filed shape was wrong twice
