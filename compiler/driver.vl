@@ -306,10 +306,12 @@ let modTyShadow: string[] = []
 // ── per-INSTANCE module scan/token cache ──────────────────────────────────────
 // A directory check (`vl check <dir>`) rebuilds the module table once PER FILE
 // (modReset + the fetch loop), so a shared dependency is token-scanned
-// (modCommit → modScan) and tokenized again (modCompile → vcLoadToks) once per
-// dependent. Cache both per (module key, source text): the scan's import/
-// export entries replay under the new table index, and the token stream
-// re-pushes with fresh global `pos` anchors. Slices are FLATTENED into shared
+// (modCommit → modScan) once per dependent. Cache per (module key, source
+// text): the scan's import/export entries replay under the new table index, and
+// its token stream re-pushes with fresh global `pos` anchors — so the parse
+// stage (modCompile → vcLoadToksMod) replays rather than tokenizing, and ONE
+// tokenization serves both stages for every module of every build, single-file
+// included. Slices are FLATTENED into shared
 // arrays with per-slot [off, end) ranges (`string[][]` is not
 // self-host-emittable). The cache spans modReset by design; a slot is keyed on
 // the exact source, so a rewrite (e.g. `check --fix`) misses and a fresh slot
@@ -322,11 +324,16 @@ const modCacheReOff: i32[] = []
 const modCacheReEnd: i32[] = []
 const modCacheExpOff: i32[] = []
 const modCacheExpEnd: i32[] = []
-// Token slice, filled lazily at the parse stage (-1 = not captured yet); only
-// a CLEAN tokenization (no lex diags) is cached, so a hit never has diags to
-// re-fold.
+// Token slice (-1 = not captured); only a CLEAN tokenization (no lex diags) is
+// cached, so a hit never has diags to re-fold.
 const modCacheTokOff: i32[] = []
 const modCacheTokEnd: i32[] = []
+// The token range `modScan` just banked into the flat storage, handed to
+// `modScanCached` for the slot it appends. `modScan` is called from exactly one
+// place and its result is recorded immediately, so a scalar pair carries it
+// without threading a return type through the scan.
+let modScanTokOff = -1
+let modScanTokEnd = -1
 // Flat storage backing the slices above.
 const modCacheImpSpec: string[] = []
 const modCacheImpKey: string[] = []
@@ -1493,7 +1500,7 @@ export function modCommit(found: i32): i32 {
 // `modScan` through the per-instance cache: replay a recorded scan under table
 // index `m` on a hit; on a miss, scan and record the entries the scan appended
 // (modScan only ever appends, and only for `m`, so the [before, after) slice IS
-// this module's scan result).
+// this module's scan result) together with the token range it banked.
 function modScanCached(m: i32, key: string, src: string): i32 {
   const ci = modCacheLookup(key, src)
   if ci >= 0 {
@@ -1568,14 +1575,17 @@ function modScanCached(m: i32, key: string, src: string): i32 {
     ce = ce + 1
   }
   modCacheExpEnd.push(modCacheExpName.length)
-  modCacheTokOff.push(-1)
-  modCacheTokEnd.push(-1)
+  modCacheTokOff.push(modScanTokOff)
+  modCacheTokEnd.push(modScanTokEnd)
   0
 }
 // `vcLoadToks` for module `m` through the per-instance cache: on a hit, re-push
 // the cached token stream with fresh global `pos` anchors (no lex diags — only
 // a clean tokenization is cached); on a miss, tokenize and capture the stream
-// into `m`'s cache slot when it produced no lex diags.
+// into `m`'s cache slot when it produced no lex diags. The hit is the ordinary
+// path — `modScan` banked the stream at commit time — so the miss covers a
+// module the scan skipped (`found == 0`) or one whose lex diags made it
+// unbankable, and those must still reach `vcLoadToks` to fold their diags.
 function vcLoadToksMod(m: i32): i32 {
   const ci = modCacheLookup(modKeys[m], modSrcs[m])
   if ci >= 0 && modCacheTokOff[ci] >= 0 {
@@ -1795,9 +1805,31 @@ function modResolveSpecifier(spec: string, fromKey: string): string {
 // one import entry per specifier (resolved against THIS module's key); each
 // top-level `export`-modified `function`/`let`/`const`/`type` records an export
 // name. Imports still PARSE as no-ops later — this scan is the only reader.
+//
+// The stream this scan tokenizes IS the one the parse stage wants, so it is
+// banked into the cache's flat token storage on the way past and `vcLoadToksMod`
+// replays it instead of tokenizing the same source a second time. Only a CLEAN
+// tokenization is bankable — a cache hit re-pushes tokens and has no lex diags
+// to re-fold — so a source with lex diags banks nothing and the parse stage
+// tokenizes it itself.
 function modScan(m: i32, src: string): i32 {
   const r = tokenize(src)
   const toks = r.tokens
+  modScanTokOff = -1
+  modScanTokEnd = -1
+  if r.diags.length == 0 {
+    modScanTokOff = modCacheTokKind.length
+    let b = 0
+    while b < toks.length {
+      modCacheTokKind.push(toks[b].kind)
+      modCacheTokText.push(toks[b].text)
+      modCacheTokStart.push(toks[b].start)
+      modCacheTokLine.push(toks[b].line)
+      modCacheTokCol.push(toks[b].col)
+      b = b + 1
+    }
+    modScanTokEnd = modCacheTokKind.length
+  }
   let depth = 0
   let i = 0
   while i < toks.length {
