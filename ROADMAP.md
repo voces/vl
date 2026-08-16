@@ -852,18 +852,47 @@ in-language GC knobs.
   is shipped. REMAINING: (a) infer `never` for a genuinely base-case-less divergent recursive cycle
   (currently a stopgap "annotate a return type" error); (b) an `unconditional-recursion` lint that fires
   even when the return type is explicitly annotated (catches accidental infinite loops).
-- 🟡 **A-infer-empty. Usage-based inference for empty collections.** Empty ARRAY `[]` inference shipped
-  (see `CHANGELOG.md`): `const xs = []; xs.push(1)` infers `xs: i32[]` from downstream usage (push /
-  `T[]` param / annotated assignment / `T[]`-returning tail / index-set). REMAINING: the same for
-  `Map()`/`Set()` — infer key/value/element from `m.set(k,v)` / `.add(x)` later usage; the `Map()`/`Set()`
-  hole isn't yet materialised into a `{[K]:V}` object by `.set`/`.add`.
-- ⬜ **A-infer-null. `let x = null` as a nullable hole.** Treat `let x = null` like `[]`: infer the `T`
-  in `T | null` from later usage (`x = 5` ⇒ `i32 | null`), the initializer contributing `| null`, with
-  flow-narrowing stripping the `| null` on definitely-assigned paths (no null tax on the straight line);
-  an unconstrained `let x = null` resolves to `null`. Today `let x = null` pins `x` to the exact `null`
-  type, so `let x = null; x = 5` errors. Distinct from a pin violation — `null` is hole-bearing, not a
-  complete type. Ties A-infer-empty (same usage-driven hole-filling) and A-definite-assign (shared flow
-  machinery). (Rationale: DECISIONS "`let x = null` is a nullable hole".)
+- ✅ **A-infer-empty. Usage-based inference for empty collections.** Empty ARRAY `[]` inference
+  shipped, and so did the `Map()`/`Set()` half this row filed as REMAINING (**A-infer-map-set**;
+  headline case `tests/cases/maps/infer-from-set.vl`, `tests/cases/sets/infer-from-add.vl`).
+  `const xs = []; xs.push(1)` infers `xs: i32[]`; `const m = Map(); m.set("a", 1)` materialises
+  `{[string]: i32}` and the whole Map surface works off it; `const s = Set(); s.add(3)` likewise.
+  The un-inferable case still reports the clean "cannot infer — annotate" floor
+  (`tests/cases/maps/error-uninferred.vl`) rather than crashing. **One residue is split out as its
+  own row below** — the inferred map's VALUE representation.
+- ⬜ **A-infer-map-value. An inferred `Map()` only reaches the MONO value reps.** `A-infer-map-set`
+  materialises the hole for `i32` and `boolean` values only; **every other value type the annotated
+  spelling supports fails to lower**, at emit, with `emitProgram: unsupported map value type (only
+  i32 / boolean / string / struct values)` — a message that names `string` as supported while
+  rejecting it, because the reject is about the *shape sentinel*, not the type. Measured on the
+  current seed:
+
+  | spelling | inferred | annotated twin |
+  |---|---|---|
+  | `m.set("a", 1)` / `m.set(1, 2)` | **runs** | runs |
+  | `m.set("a", true)` | **runs** | runs |
+  | `m.set("a", "x")` | **emit error** | `{[string]: string}` runs |
+  | `m.set(1, "x")` | **emit error** | `{[i32]: string}` runs |
+  | `m.set("a", 1.5)` | **emit error** | `{[string]: f64}` runs |
+
+  **The KEY type is not the axis** — `i32` and `string` keys behave identically; the VALUE type is.
+  **Root cause, and it names the fix:** `letMapShapeOf` (`compiler/emit_classify.vl`) is
+  **annotation-first** — an `mv` slot `>= 0`, the per-value-type map struct, is minted from *the
+  annotation's value type-NAME* (`mvShapeOfMapName(lt.tyName)`). An un-annotated `const m = Map()`
+  has no such name, so it falls through to `mapShapeOfExpr` over a bare constructor, which can only
+  answer the mono shape or `-3`; `emitMapNew` (`compiler/wasmEmit.vl`) then fails loudly on `-3`.
+  So usage-driven inference resolves the map's TYPE without ever minting its REP. Closing it means
+  seeding the mv slot from the inferred value type rather than from a spelled name — which is the
+  same "keyed structurally at the value" layer the alias-identity note at `letMapShapeOf` already
+  argues for, so the two wants converge. `Set()` inference is unaffected (a Set is boolean-valued
+  and therefore mono either way). Unpinned by the corpus: `infer-from-set.vl` is the only
+  un-annotated `Map()` case and it uses an `i32` value. Ties **A-robust** — this is exactly the
+  "audit the other holes (`Map()`/`Set()` empties) for the same clean-diagnostic-not-crash
+  guarantee" REMAINING, and today the diagnostic is neither clean nor accurate.
+- ✅ **A-infer-null. `let x = null` as a nullable hole.** SHIPPED. `let x = null; x = 5;
+  print(x + 1)` prints `6` on the current seed — the `T` in `T | null` is inferred from later usage,
+  with flow-narrowing stripping the `| null` on definitely-assigned paths. (Rationale: DECISIONS
+  "`let x = null` is a nullable hole".)
 - ⬜ **A-infer-params. Top-level function param inference.** Infer named-function param types from
   usage constraints (HM / the existing A13 row-poly inference path), consistent with "hide types where
   possible." Requiring annotations on all named-fn params is NOT VL's stated stance.
@@ -877,6 +906,10 @@ in-language GC knobs.
   — is fixed (A-infer-empty now infers it, and the "cannot infer — annotate" floor is deferred to
   scope-close so it fires only for a genuinely-unconstrained empty). REMAINING: audit the other holes
   (`Map()`/`Set()` empties, unresolved generic params) for the same clean-diagnostic-not-crash guarantee.
+  The `Map()` half has a **named instance**: an inferred map with a non-mono value type reaches emit
+  and fails there with a message that lists `string` as supported while rejecting a `string` value —
+  see **A-infer-map-value**. That one is a rep gap, not only a diagnostic gap, but it is also the
+  concrete case this REMAINING was written for.
 
 ---
 
@@ -1310,25 +1343,50 @@ seed from current `compiler/*.vl` in ~40s.*
 *Independent; do continuously.*
 
 - ✅ **F2. Gate debug `console.log`s** — moot: `toWasm.ts` is deleted (the `.vl` emitter has no such logs).
-- ⬜ **F4. Re-enable inline `m.validate()`** during dev for earlier failure.
+- ✅ **F4. Re-enable inline `m.validate()`** — moot, and superseded by something stronger.
+  `m.validate()` is the **binaryen-JS `Module` API**, which no compile path uses any more: the
+  emitter writes bytes directly (`compiler/emit_bytes.vl`) and the only surviving binaryen-JS call
+  in the tree is the playground's `readBinary`/`emitText` WAT pane. What the ask wanted — catching
+  an invalid module before it is blessed — ships instead as **`vl build` running wasmtime's
+  `Module::validate` over every artifact it writes and exiting 1 when the engine rejects it**
+  (`--no-validate` opts out), gated by `tests/vl_build_validate_test.ts`. That is the real
+  validator on every build, not binaryen's on a dev build.
 - ⬜ **F5. Settle the name** (VL vs Vital) and apply consistently.
-- ⬜ **F6. Document the build** (`deno task build`/`test`; the antlr/gradle gen step is gone).
-- ⬜ **F7. Fix the `paramater` misspelling** project-wide (optional; currently consistent).
+- ✅ **F6. Document the build** — done, and the command this row named never survived kill-TS.
+  There is **no root `deno task build`**: `deno.json`'s tasks are `lsp:build` · `lsp:dev` · `test` ·
+  `gen-std` · `compile` · `install` · `playground*`, and `deno task build` exists only inside
+  `lsp/deno.json`. The build is documented in `AGENTS.md` — `scripts/refresh-compiler.sh` (seed),
+  `cd scripts/vl-host && cargo build --release` (the shipping CLI), `cd lsp && deno task build`
+  (the LSP bundle), `deno task test`. The antlr/gradle gen step was already gone when this was
+  filed. (Two TS-era spike records — `docs/internals/wasmtime-parity.md`,
+  `docs/internals/selfhost-g2-spec.md` — still invoke the retired root `deno task build`; that is
+  era-appropriate text inside dated records, not a live instruction.)
+- ✅ **F7. Fix the `paramater` misspelling** — moot: **the only occurrence of that string in the
+  tree is this row** (`grep -r paramater`, excluding `.git`/`node_modules`, hits this line and the
+  workboard row tracking it). Whatever carried it is gone.
 - 🟡 **F8.** REMAINING (F5-adjacent): confirm vscode-languageclient forking the ESM server in VS Code.
 - 🟡 **F9. Perf baseline.** The TS-driven harnesses (`scripts/perf*.ts`) were RETIRED with the
   kill-TS dev-script sweep (they benchmarked the TS `compile()`); the past wins/abandons live in
   `CHANGELOG.md`. REMAINING: rebuild a baseline against the NATIVE binary
   (`vl build`/`vl run` timing) if/when regression-tracking is wanted again; plus:
-  - ⬜ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — LOW priority (the dominant
-    cost fell with the F9c memoize; binaryen modules are not trivially cloneable).
+  - ✅ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — moot: **there is no binaryen
+    IR to cache.** No selfhost sub-test constructs a binaryen `Module`; the emitter writes bytes
+    (`compiler/emit_bytes.vl`) and binaryen survives in the tree only as the `wasm-opt` **binary**
+    that `vl build -O/-O3` shells out to, plus the playground's `readBinary`/`emitText` WAT pane.
+    Same cause as F4.
   - 🟡 **F-tiers. Collapse the redundant corpus runner.** (This is Track J's J1 — it removes
-    Deno-as-an-engine.) REMAINING: delete the
-    `SELFHOST_DENO_RUN`-gated tiers (the corpus RUN half + its 305-file whitelist, the check→emit
-    verdicts, the V8-side golden fixpoint + emit-program suite) outright once the native tier is
-    the undisputed runner; fold the deno-side CHECK verdicts the same way when the native checker
-    gates message/span parity. Also: the single-unit assembly compile is SUPERLINEAR in the TS
-    host (~5s as a 2-module graph vs ~100s concatenated — wasmEmit.vl is the multiplier); worth a
-    profile if any gated assembly is still exercised regularly. (Landed → `CHANGELOG.md`: gating,
+    Deno-as-an-engine.) **RE-SCOPED — the gate this row was written against no longer exists.**
+    `SELFHOST_DENO_RUN` is gone from the tree entirely (→ `CHANGELOG.md`), along with the corpus
+    RUN half, its 305-file whitelist, the V8-side golden fixpoint and the emit-program suite. **The
+    actual residue is narrower and lives somewhere else: four deno tests still EXECUTE emitted wasm
+    under V8** via `tests/support/runWasm.ts` — `tests/cases_wasm_test.ts` (the whole behavioral
+    corpus, and the one that matters), plus `vl_exported_memory_test.ts`,
+    `vl_global_promotion_test.ts` and `vl_reexport_abi_test.ts`. REMAINING: move those onto the
+    native runner, which is what "removes Deno-as-an-engine" now means. **`cases_wasm_test.ts` is
+    the SOLE behavioral corpus oracle** and its `EXPECTED_DIVERGENCES` list is load-bearing, so it
+    cannot simply be deleted — it has to be re-hosted. Also: the single-unit assembly compile was
+    SUPERLINEAR in the TS host (~5s as a 2-module graph vs ~100s concatenated — wasmEmit.vl was the
+    multiplier); that host is retired, so the note is history. (Landed → `CHANGELOG.md`: gating,
     parallel sweep, seed cache + ~3s refresh, graph-compile caching — no big assembly remains
     always-on. The native golden byte-tripwire that briefly covered this is since retired —
     redundant with the fixpoint + the functional corpus, → `CHANGELOG.md`.)
