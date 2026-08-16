@@ -41159,3 +41159,187 @@ arena-neutral has to name the mechanism that makes it so; the base rate is now 8
   isolation.
 
 <!-- APPEND-MARKER-FIELDROWMINT-END -->
+
+<!-- APPEND-MARKER-FLOORREAD-BEGIN -->
+
+## D-FLOORREAD — the "~60 single-writing floor" re-derived by READING THE BODIES, as #1259 said the next census must. It is not 60: the site population is 38, the distinct operations are 22, and 8 of the 22 are re-writings of a home the file ALREADY IMPORTS. The routing-irreducible residue is 12 (census only; off master `6ef19f67`)
+
+Workboard row **B9**: *"W13's ~60 single-writing floor — never re-derived. 'An assumption in a table,
+never a measurement.'*" The programme has quoted 60 forward through eleven slices. Its provenance is
+#1239's sentence — *"98 sites are 60 distinct operations; 38 are copies … what is left is the 60
+single writings, and a grammar has to be spelled once"* — and the 60 was computed by **normalising
+each site's SHAPE SIGNATURE with the receiver abstracted** (`X.slice(1, X.length - 1)`,
+`X[0] == '"'`) and counting distinct signatures.
+
+#1259 then found three of W13's own entries were **one operation written three times** and wrote the
+correction into the record: *"the next census of that row should re-derive it the way #1259 did — by
+reading the bodies, not by counting the names."* This is that census. **A shape signature is not an
+operation, and the gap between the two units is the whole finding.**
+
+### 1. METHOD, AND THE RULE THE COUNT IS TAKEN UNDER
+
+Same population rule as #1239 — a **character-level operation on an established TYPE SPELLING**, with
+its four false-positive classes (operator spellings, protocol tag returns, expression/numeric
+lexemes, the `$fnsig` ABI alphabet) and its NAME exclusion (`v == "i32"` carries no type punctuation)
+kept verbatim. Two additions, both stated so the number is reproducible:
+
+* **A CALL TO A HOME IS NOT A SITE.** 17 call sites of `emit_base.strContains` reach it with a
+  type-punctuated needle (`"=>"` x10, `"{[i32]:"` x3, `"{["`, `"[]"`, `"("`, `"?"`). They index
+  nothing themselves. Counting them would inflate the debt by 45% and would score the ONE body they
+  all reach as fourteen operations. #1239's own FP3 rule says this; its per-module table (`emit_collect` 4,
+  `wasmEmit` 2) confirms it was applied there too.
+* **A LENGTH BOUND IS NEITHER AN INDEX NOR A SUBSTRING.** Six `X.length < k` pre-rejects in
+  `emit_base.vl` sit in front of a delegated home as index-safety. #1239's columns are INDEX (35) and
+  SUBSTR (63) and they sum to its 98, so bounds were not in it. Reported here, not counted.
+
+Read by three independent passes over disjoint file sets, then merged by hand; every claim the
+headline rests on was re-read at the source line.
+
+### 2. THE POPULATION HAS FALLEN 98 → 38, AND FIVE MODULES ARE NOW AT ZERO
+
+| file | #1239 PARSE | **here** |
+|---|---:|---:|
+| `typecheck.vl` | 38 | **10** |
+| `emit_base.vl` | 25 | **20** |
+| `emit_classify.vl` | 19 | **6** |
+| `emit_mono.vl` | 5 | **2** |
+| `driver.vl` | 5 | **0** |
+| `emit_collect.vl` | 4 | **0** |
+| `wasmEmit.vl` | 2 | **0** |
+| `emit_rep.vl` | 0 | **1** |
+| **total** | **98** | **38** |
+
+`driver.vl`, `wasmEmit.vl`, `emit_collect.vl`, `emit_rewrite.vl`, `emit_sections.vl` and
+`emit_query.vl` hold **zero** hand-written type-name character work; every spelling question they ask
+is a call. That is W2/W3/W8/W14 and the six down-moves landing, and it is the routing programme's
+result rather than this census's.
+
+### 3. THE 38 SITES ARE 22 OPERATIONS — 16 COPIES, NOT ZERO
+
+| # | operation | writings | where |
+|---|---|---:|---|
+| 1 | map-seam FIND (`]:`) | 1 | `emit_base.mapValNameOf:410` |
+| 2 | map-VALUE cut | 1 | `emit_base.mapValNameOf:411` |
+| 3 | **numeric-literal leading DIGIT** | **3** | `emit_base.isLitVariantName:650` · `typecheck.litMemberTy:1296` · `typecheck.nameNeedsCanon:6767` |
+| 4 | **balance ENDPOINT** ("does the leading group close on the last character") | **2** | `emit_base.tyGroupWrapsWhole:1002` · `typecheck.nameToTyReal:6285` |
+| 5 | head/tail cut at a found `\|` | 1 | `emit_base.nullablePartOf:1013,1014` |
+| 6 | group-INTERIOR cut (the file's last W1 site) | 1 | `emit_base.parenUnionArrElemName:1808` |
+| 7 | **trailing `[]`-RUN as whole-minus-leaf** | **2** | `emit_base.gaeApplyFieldTy:2150` · `emit_base.monoSubstAnn:3249` |
+| 8 | two-sided `' '`/`'\t'` TRIM | 1 | `emit_base.normTypeAtom:2292,2293,2295` |
+| 9 | leading-space SKIP at an index | 1 | `emit_classify.mvValKindOfName:3437` |
+| 10 | union-set RE-JOIN by position | 1 | `emit_base.removeAtomFromGo:2350,2353,2358` |
+| 11 | **arrow-relative param-list CLOSE** | **2** | `emit_base.annFnDecompose:2588` · `typecheck.isTopLevelFuncTypeName:5413` |
+| 12 | **field-colon FIND** | **3** | `emit_base.annObjFieldSplit:2654` · `emit_base.shapeInnerFieldSplit:2724` · `emit_classify.shapeFieldParse:9441` |
+| 13 | **contains a punctuation RUN** | **3** | `emit_base.strContains:2890` (the home) · `emit_base.nameIsStructWithMapField:2854` · `emit_rep.renderFaithful:2088` |
+| 14 | **negation-prefix TEST** | **2** | `typecheck.nameToTyReal:6272` · `typecheck.canonEmitNameTs:10159` |
+| 15 | negation-operand CUT | 1 | `typecheck.nameToTyReal:6273` |
+| 16 | **top-level FIELD SPLIT of a brace body** | **2** | `typecheck.nameToTyReal:6405` · `typecheck.canonShapeName:8046` |
+| 17 | canon-trigger character-SET scan | 1 | `typecheck.nameNeedsCanon:6755` |
+| 18 | return-text CUT past the arrow | 1 | `emit_classify.mvValKindOfName:3438` |
+| 19 | map-value OFFSET counted back from the tail | 1 | `emit_classify.rlCanonLitUnionAtoms:12151` |
+| 20 | brace OPENER (`len >= 1 · OPEN`) | 1 | `emit_classify.internShapeArms:12792` |
+| 21 | array-suffix TEST | 1 | `emit_mono.monoInstantiate:2185` |
+| 22 | array-ELEMENT cut | 1 | `emit_mono.monoInstantiate:2194` |
+| | **total** | **38** | **22 operations · 16 copies** |
+
+**FIVE OF THOSE MERGES A SHAPE CENSUS CANNOT MAKE, and they are the ones #1259 predicted.** Rows 3,
+4, 13 and 16 group bodies whose normalised SIGNATURES differ:
+
+* **13** is one predicate in three spellings — `strContains(X, needle)`, a hand-written
+  `while X[sp] == '{' && X[sp+1] == '['`, and a hand-written `while X[i] == '?'` walk. The first is
+  the home; the second is `strContains(name, "{[")` on every input (the hand-written
+  `sp + 1 < X.length` window is `strContains`'s `i + sub.length <= X.length` window); the third
+  differs only in USING the hit's position.
+* **16** is `tyTopLevelSplit` twice: `nameToTyReal:6405` is the home with `dropEmpty` **true** (it
+  gates on `field.length > 0`) scanning the still-braced name from index 1 with an end of
+  `nlen - 1`; `canonShapeName:8046` is the home with `dropEmpty` **false** over the already-peeled
+  interior. Different signatures, same parts on every input.
+* **3** is `X[0] >= '0' && X[0] <= '9'` at two sites and the same test with a separator lookback at
+  the third — one grammar question ("does a member spelling begin a numeric literal") asked at index
+  0 and at every member start.
+* **4** is `tyGroupEndIndex(X, 1) == X.length - 1` at both sites — **and the two do not agree.**
+  `emit_base.tyGroupWrapsWhole` prepends `if e < 0 { return true }`; `typecheck.vl:6285` writes the
+  bare comparison, which is `false` for a never-closing group. Same operation, two answers, and the
+  divergence is only visible by reading both bodies.
+
+### 4. THE FLOOR: 8 OF THE 22 ARE RE-WRITINGS OF A HOME, THREE IN FILES THAT ALREADY IMPORT IT
+
+The 60 was published as *irreducible under routing*. On the 22 that remain, that claim is false for
+eight of them, and the three cheapest are not even an import away:
+
+| operation | the home that exists | status |
+|---|---|---|
+| 22 array-ELEMENT cut | `tyname.arrElemNameRaw` | **`emit_mono.vl` imports it at line 11** and calls it correctly 1,880 lines earlier; `:2194` writes `an2.slice(0, an2n - 2)` — the home's body verbatim |
+| 21 array-suffix TEST | `tyname.nameIsArray` | **`emit_mono.vl` imports it at line 13**; `:2185` writes the `'['` conjunct only, dropping the `']'` test |
+| 18 return-text CUT | `tyname.fnRetTextOf` | **`emit_classify.vl` imports it at line 30**; `:3438` writes `ncl.slice(nri, ncl.length)` with `nri` seeded at `nca + 2` — the home's exact start index |
+| 4 balance ENDPOINT | `tyname.parenEnclosesWhole` | `typecheck.vl:6285` is the home's one-line body verbatim; `emit_base:1002` is it plus the `e < 0` arm |
+| 16 FIELD SPLIT | `tyname.tyTopLevelSplit` | two resume loops in `typecheck.vl`, one per `dropEmpty` value |
+| 12 field-colon FIND | `tyname.tyTopIndexOf` | three `indexOf(":")` writings; the checker already uses the depth-aware home, so this is also a quote/depth BLINDNESS difference, not only a copy |
+| 6 group-INTERIOR cut | `tyname.groupInnerOf` | `emit_base:1808`'s `slice(1, len - 3)` is the home applied inside the `[]` suffix; the file's own comment at :1795 proves the equality |
+| 13 contains a RUN | `emit_base.strContains` | two of its three writings are hand-written walks |
+| 1, 2 map seam / value | `tyname.mapSpellKeyEnd` / `mapSpellValName` | **DECLINED with a written reason** — `mapValNameOf`'s SPAN gate is `nameIsMap`, the home's is `nameIsMapSpanEnds`, and they answer differently on `{[string]:i32}\|null`. A real second predicate, not a copy |
+
+> **THE RE-DERIVED FLOOR IS 12, NOT 60** — the 22 operations less the 8 with an existing home and the
+> 2 declined against one. And **three of the 12 are themselves declines the leaf's own header already
+> records** (8 and 9, the two whitespace operations it names as "NEITHER"; 20, the brace opener whose
+> in-code note calls it *"THE ONE GRAMMAR-PREDICATE CHARACTER TEST THIS FILE KEEPS"*). **Nine
+> operations in the whole compiler are hand-written type-name grammar with no home and no filed
+> reason**: the numeric-literal digit (3), the bar head/tail cut (5), the `[]`-run difference (7),
+> the union-set re-join (10), the arrow-relative param close (11), the negation test (14) and its cut
+> (15), the canon-trigger scan (17), and the map-value tail offset (19).
+
+### 5. AND THE LEAF ITSELF IS NOT 35 OPERATIONS — IT IS 16
+
+The same reading applied to the target rather than the debt. `tyname.vl`'s header derives its own
+count honestly (*"IN — 35 bodies, in TWELVE families … the count is DERIVED, not carried forward"*),
+but a body count is a name count, which is the unit this census exists to distrust.
+
+| operation | bodies | what the reading shows |
+|---|---:|---|
+| **the DEPTH LADDER** | 2 | `tyTopIndexOf` and `tyGroupEndIndex` are the same 25-line walk with a different stop — the file's own header says so (*"The same ladder as `tyTopIndexOf`, with the closer as the target instead of a separator"*) |
+| the quoted-segment SKIP | 1 | `skipQuotedName` |
+| the `>` vs `=>` test | 1 | `tyGtIsClose` |
+| the first `<` | 1 | `gaeLtAt` — deliberately depth- and quote-BLIND |
+| **the SPACE scan** | 2 | `nameIsSpaceFree` (assert) / `nameStripSpaces` (enforce) — one walk, two materialisations |
+| the identifier CLASS | 1 | `nameIdentChar` |
+| the generic top-level SPLIT | 1 | `tyTopLevelSplit` |
+| **the `\|` split with the ARROW STOP** | 2 | `splitUnionAtoms` / `unionMemberCount` — the same query, materialised and counted |
+| **the OPENER test** | 2 | `nameIsParenOpen` / `nameIsQuotedLeaf` — `X[0] == c`, delimiter constant apart |
+| **the BRACE/MAP discrimination** | 2 | `nameIsShapeOpen` / `nameIsMapOpen` — exact complements on `X[1]` |
+| **the SPAN-ENDS layer** | 3 | `nameIsParenSpanEnds` / `nameIsBraceSpanEnds` / `nameIsMapSpanEnds`. Each header calls itself *"A LAYER over the opener, not a second copy of it"* — true of the opener, and the LAYER is the same layer three times |
+| the ARRAY suffix digraph | 1 | `nameIsArray` — no opener, so not the span-ends operation |
+| the GENERIC-APP span | 1 | `annGenAppSpanEnds` — its opener is FOUND, not at index 0 |
+| the BALANCE endpoint | 1 | `parenEnclosesWhole` |
+| the FUNCTION-TYPE atom | 1 | `nameIsFuncTypeAtom` |
+| **the CUT** | **10** | `groupInnerOf` `fnParamsTextOf` `fnRetTextOf` `arrElemNameRaw` `fieldNameOf` `fieldTypeTextOf` `mapSpellKeyName` `mapSpellValName` `gaeHeadNameOf` `gaeArgsTextOf` — ten one-line `String.slice` calls whose index is a PARAMETER or a constant offset from `length`. `fieldNameOf` and `gaeHeadNameOf` are character-identical. **Not one of the ten contains any grammar**: the grammar is entirely in the finder that supplies the index |
+| | **35 → 16** | plus 3 pure compositions (`listElemNameOf`, `mapSpellKeyEnd`, `peelGroupParens`) that add no character work |
+
+**THE HOME FILE HAS 19 COPIES ABOVE THE FIRST, WHICH IS HALF AGAIN WHAT THE WHOLE DEBT HAS (16).**
+That is not a defect — a home is allowed to spell a family out for legibility, and the SPAN-ENDS
+trio and the OPEN pair each read better as three and two named predicates than as one call with a
+delimiter argument. It is a statement about the UNIT: **"one body per grammar" is a property of the
+tree's naming, not of the tree's grammar, and the census's floor was computed from the naming.**
+
+Tree-wide, the compiler spells **29 distinct type-name character operations** (the leaf's 16, plus
+`emit_base.strContains`, plus the 12 unhomed) across **73 writings** (35 leaf bodies + 38 debt sites).
+
+### 6. METHOD NOTES
+
+* **A FLOOR DERIVED FROM SHAPE SIGNATURES IS AN UPPER BOUND ON THE FLOOR, NEVER THE FLOOR.** Every
+  correction this census makes runs the same direction: 60 → 22 → 12. Two mechanisms, both real and
+  separable — routing since #1239 took the site population 98 → 38, and reading bodies took the
+  operation count below the signature count at rows 3, 4, 13 and 16. *A census that normalises
+  syntax measures how many ways the tree spells a thing; only reading the bodies measures how many
+  things there are.*
+* **"IRREDUCIBLE UNDER ROUTING" HAS TO BE CHECKED AGAINST THE IMPORT LIST, NOT ARGUED.** Three of the
+  22 operations are hand-written in a file whose import block already names the home
+  (`emit_mono` x2, `emit_classify` x1). The cheapest items on this whole programme are found by
+  reading a body against the imports at the top of its own file.
+* **TWO WRITINGS OF ONE OPERATION ARE A LATENT DISAGREEMENT UNTIL SOMEONE READS BOTH.** Operation 4
+  is written twice and the two answers differ on a never-closing group; operation 21 drops half of
+  `nameIsArray`'s conjunction. Neither is visible in a signature census, a grep, or a call graph.
+* **COUNTING A CALL AS A SITE INFLATES A CENSUS BY WHATEVER THE MOST-CALLED HOME IS WORTH.** Here
+  that is 17 of 55 candidate rows — 31% — all reaching one nine-line body. *Before counting, ask of
+  every row whether it indexes anything itself.*
+
+<!-- APPEND-MARKER-FLOORREAD-END -->
