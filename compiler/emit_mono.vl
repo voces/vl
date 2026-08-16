@@ -29,6 +29,7 @@ import {
   BinExpr,
   Block,
   Call,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
@@ -45,6 +46,7 @@ import {
   Param,
   Paren,
   RetStmt,
+  TypeDecl,
   TypeRef,
   Unary,
   UnionDecl,
@@ -84,6 +86,7 @@ import { sidNoteNodeName, sidOfNode } from "./symbols"
 import {
   annArrowAt,
   annFnDecompose,
+  annObjFieldSplit,
   annRetNameOf,
   monoAnnHasTyParam,
   monoBindFromAnn,
@@ -97,6 +100,7 @@ import {
   nodeIsTypeDecl,
   normTypeAtom,
   parentLetOf,
+  pushUniqueAtom,
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
@@ -139,6 +143,8 @@ import {
   exprStringArray,
   exprStruct,
   exprUnion,
+  fieldValueFeOf,
+  fnHasUnannotatedParam,
   fnIndexOf,
   fnIndexOfInScope,
   fnRetExprOf,
@@ -1905,18 +1911,88 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
   0
 }
 
+// The field NAMES and field TYPE-NAMES of the struct type `tname` names, appended in parallel to
+// `outNames` / `outTexts`; false when `tname` names no struct at all.
+//
+// TWO spellings reach here and they resolve differently. A DECLARED alias (`type Box = {…}`) is
+// read off the `TypeDecl`'s own `FieldDef` nodes, so each field's type arrives as an arena
+// `TypeRef` that `tyNameOf` names exactly as the annotation spelled it — no round-trip through
+// the type-name grammar. An INLINE shape (`const b: {op: (i32,i32)=>i32} = …`) has no declaration
+// to read and falls back to the shape layer's own field scanner (`annObjFieldSplit`, which is
+// depth-aware over the generic-application brackets a field type can carry).
+function monoStructFieldTypes(
+  tname: string,
+  outNames: string[],
+  outTexts: string[],
+) {
+  if tname == "" { return false }
+  let i = 0
+  while i < monoProgStmts.length {
+    const s = P.nodes[monoProgStmts[i]]
+    if s is TypeDecl {
+      if s.tdName == tname {
+        const fs = s.tdFields
+        let j = 0
+        while j < fs.length {
+          const fd = P.nodes[fs[j]]
+          if fd is FieldDef {
+            outNames.push(fd.fdName)
+            outTexts.push(tyNameOf(fd.fdType))
+          }
+          j = j + 1
+        }
+        return true
+      }
+    }
+    i = i + 1
+  }
+  annObjFieldSplit(tname, outNames, outTexts) == 1
+}
+
 // Coerce a generic function VALUE (or a composite of them) flowing into the expected type NAMED by
 // `tname`. If `exprIx` is an `Ident` naming a generic (un-annotated-param) function and `tname` is a
 // CONCRETE function type, materialize the instance for its param types and point the `Ident` at it
 // (`monoInstanceFor`). If `exprIx` is an ARRAY LITERAL and `tname` is a closure-array type
-// (`((i32,i32)=>i32)[]`), recurse into each element against the element function type. The single
-// coercion shared by every typed boundary a generic function value reaches — an annotated binding, a
-// concrete function-typed call ARGUMENT, an annotated RETURN, an ARRAY element — so the value carries
-// its concrete type wherever it escapes. The checker (`genericFnAssignable`) has already proved the
-// instantiation valid; this only emits it.
+// (`((i32,i32)=>i32)[]`), recurse into each element against the element function type; if it is an
+// OBJECT LITERAL and `tname` names a declared struct, recurse into each field value against that
+// field's declared type. The single coercion shared by every typed boundary a generic function value
+// reaches — an annotated binding, a concrete function-typed call ARGUMENT, an annotated RETURN, an
+// ARRAY element, a struct FIELD — so the value carries its concrete type wherever it escapes. The
+// checker (`genericFnAssignable`) has already proved the instantiation valid; this only emits it.
 function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
+  if e is ObjLit {
+    // A function-valued struct FIELD (`type Box = {op: (i32,i32)=>i32}`, `const b: Box = {op: add}`).
+    // The composite arms are mutually recursive with the `Ident` arm below, so a generic function
+    // nested any depth down a literal (a field holding an array of them, an array of literals)
+    // materializes at the type its own slot declares.
+    const fnames: string[] = []
+    const ftexts: string[] = []
+    if monoStructFieldTypes(tname, fnames, ftexts) {
+      const flds = e.objFields
+      let k = 0
+      while k < flds.length {
+        const f = P.nodes[flds[k]]
+        if f is FieldInit {
+          let d = 0
+          while d < fnames.length {
+            if fnames[d] == f.fiName {
+              if (
+                monoCoerceFnValueName(f.fiValue, normTypeAtom(ftexts[d]), ctx) <
+                0
+              ) {
+                return -1
+              }
+            }
+            d = d + 1
+          }
+        }
+        k = k + 1
+      }
+    }
+    return 0
+  }
   if e is ArrayLit {
     if nameIsClosureArray(tname) {
       // The `[]` cut stays RAW here (not `listElemNameOf`): that home strips one
@@ -2606,6 +2682,79 @@ function monoExportPublicName(name: string): string {
   name
 }
 
+// Did `monomorphize` pin the generic declaration at lifted position `origFe` from at least one
+// call site? Every instantiation records a row — INCLUDING the count-0 one that reuses the
+// original slot (`monoInstFe == origFe`) — so this is the rename-immune answer to "is this
+// template's parameter shape backed by a real argument list", asked AFTER the pass has rewritten
+// callee identifiers to instance names (which is why counting `Ident`s cannot answer it).
+//
+// A generic template that NOTHING instantiated still emits its body at the i32 DEFAULT, and that
+// body is only accidentally valid: `function add(a, b) { return a + b }` lowers, while
+// `function exclaim(s) { return s + "!" }` emits a string-concat helper call over an i32
+// parameter — `vl check` rc 0, INVALID WASM (this is #1254 mechanism B, whose prune declines
+// exactly when the name is taken as a VALUE). So every value-floor exemption that hands such a
+// template out as a closure has to demand this first.
+export function monoInstantiatedAny(origFe: i32) {
+  let k = 0
+  while k < monoInstOrig.length {
+    if monoInstOrig[k] == origFe { return true }
+    k = k + 1
+  }
+  false
+}
+
+// The distinct concrete parameter spellings every instance `monomorphize` pinned for the generic
+// declaration at `origFe`, comma-joined — `"(i32, i32), (f64, f64)"` — or "" when no call site
+// pinned it. The DIAGNOSTIC half of `monoInstantiatedAny`: a value site that has to decline a
+// generic function can name the signatures the program itself already proves it wants, which is
+// the annotation the user has to write. Read off each instance DECLARATION's parameters, so an
+// all-i32 clone (which keeps `parType = -1` for byte-identity) still renders as `i32`.
+//
+// `monoInstFe` can name an APPENDED instance slot, which is why the bound is `fnStmts.length` and
+// not `monoOrigNode.length` — the pre-pass column is only as long as the declaration count, and
+// indexing it past that end traps the whole compiler with no diagnostic.
+export function monoPinnedSigsOf(origFe: i32) {
+  const sigs: string[] = []
+  let k = 0
+  while k < monoInstOrig.length {
+    if monoInstOrig[k] == origFe {
+      const ife = monoInstFe[k]
+      if ife >= 0 && ife < fnStmts.length {
+        const fn = P.nodes[fnStmts[ife]]
+        if fn is FuncDecl {
+          let sig = "("
+          const ps = fn.fnParams
+          let i = 0
+          while i < ps.length {
+            if i > 0 { sig = sig + ", " }
+            const p = P.nodes[ps[i]]
+            if p is Param {
+              if p.parType >= 0 {
+                sig = sig + tyNameOf(p.parType)
+              } else {
+                sig = sig + "i32"
+              }
+            }
+            i = i + 1
+          }
+          // Two instances can render the same spelling (their keys differ in a baked CALLBACK,
+          // not in a parameter type), and a repeated signature reads as a compiler bug.
+          pushUniqueAtom(sigs, sig + ")")
+        }
+      }
+    }
+    k = k + 1
+  }
+  let out = ""
+  let j = 0
+  while j < sigs.length {
+    if j > 0 { out = out + ", " }
+    out = out + sigs[j]
+    j = j + 1
+  }
+  out
+}
+
 // Which of `names` is referenced as a function VALUE — i.e. appears as an `Ident` that is NOT
 // some `Call`'s callee — anywhere in the node arena. Returns an `i32[]` parallel to `names`
 // (1 = value-referenced). ONE arena pass regardless of how many names are asked about: the
@@ -2623,7 +2772,7 @@ function monoExportPublicName(name: string): string {
 //
 // Conservative by construction: a same-named LOCAL (`const exclaim = 5`) also matches and
 // merely declines the prune, which is the status quo, never a regression.
-function monoNamesUsedAsValue(names: string[]): i32[] {
+export function monoNamesUsedAsValue(names: string[]): i32[] {
   const hit: i32[] = []
   let h = 0
   while h < names.length {
@@ -2661,6 +2810,47 @@ function monoNamesUsedAsValue(names: string[]): i32[] {
     k = k + 1
   }
   hit
+}
+
+// The lifted-function position of the GENERIC (un-annotated-param) NAMED function that the
+// MODULE-LEVEL binding at `letIx` aliases, when handing that template out as this binding's
+// closure value is sound — else -1. The module-scope twin of the function-body exemption in
+// `emitLetDeclStmt`, and it answers the same question over a wider region: a global is visible
+// from every function body, so "used only as a direct-call callee" has to hold PROGRAM-WIDE, not
+// within one frame.
+//
+// WHY IT IS SOUND. `monoWalk` resolves `f(args)` through the binding to `add`'s slot and
+// monomorphizes per call site exactly as it does for a by-name call, so each call reaches the
+// instance its own argument types pinned. The closure this binding stores is therefore never the
+// thing a differently-typed call goes through — it is either dead or `call_ref`'d at the one
+// shape its own slot kept. A value-USE (passed, returned, stored in a field) escapes to a call
+// whose type the binding cannot guarantee, and that is what the arena scan rules out.
+//
+// THREE gates, each load-bearing:
+//   (1) an un-annotated-param NAMED function. An ANNOTATED binding (`const f: (i32,i32)=>i32 =
+//       add`) already materializes its instance at `monoCoerceFnValue` and never reaches the
+//       floor; a lifted anonymous LAMBDA is contextually pinned per use and is excluded from
+//       this whole family by `criFnIsAnonLambda`.
+//   (2) INSTANTIATED at least once. An uncalled template emits its body at the i32 default, which
+//       is valid only by accident — see `monoInstantiatedAny`.
+//   (3) never referenced as a VALUE. Conservative by construction: a same-named local in some
+//       other frame also matches and merely declines, which is the pre-existing reject.
+export function monoGenericAliasFe(letIx: i32) {
+  if letIx < 0 { return -1 }
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    const fe = fieldValueFeOf(d.letInit)
+    if fe < 0 { return -1 }
+    if !fnHasUnannotatedParam(fe) { return -1 }
+    if criFnIsAnonLambda(fe) { return -1 }
+    if !monoInstantiatedAny(fe) { return -1 }
+    const one: string[] = []
+    one.push(d.letName)
+    const used = monoNamesUsedAsValue(one)
+    if used[0] == 1 { return -1 }
+    return fe
+  }
+  -1
 }
 
 // The monomorphization pass: snapshot which lifted functions are generic, then

@@ -1030,8 +1030,18 @@ in-language GC knobs.
 - 🟡 **B15. Lambdas + declaration-vs-value.** SELF-HOST function-value ABI shipped (#306: `call_ref`
   + closure struct, non-capturing + capturing; design `docs/internals/selfhost-lambdas-design.md`); escaping
   closures + function-valued struct fields shipped (#310); `.map`/`.filter` EMIT is the next slice
-  (see Next). REMAINING (host): **untyped** lambdas (a stored closure has one signature — needs
-  pinning-by-use or boxing).
+  (see Next). Pinning-by-use for an UN-ANNOTATED function taken as a value is now the rule rather
+  than the exception: `monoCoerceFnValue` materializes a concrete instance at every typed boundary
+  a generic function value crosses — an annotated binding, a concrete function-typed call
+  ARGUMENT, an annotated RETURN, an ARRAY element, a struct FIELD (declared alias or inline shape)
+  — and a binding used only as a direct-call callee monomorphizes per call site at FUNCTION and
+  MODULE scope alike. REMAINING: a generic passed to a HOF whose CALLBACK PARAMETER is itself
+  un-annotated (`function apply(g, x, y) { return g(x, y) }`) — nothing declares a type to
+  materialize against, so it needs the callback's type inferred from the HOF's own BODY. The
+  reject names the function, the un-annotated parameters, and the signatures the program's own
+  call sites already pin (`error-generic-fn-value-inferred-hof.vl`). Also open: an inline object
+  shape that COINCIDES with a declared alias's shape is a separate emitter limit ("binding's
+  inline-shape type has an unsupported field"), unrelated to generics.
 - ⬜ **B15a. Optional params + default values.** Wanted (owner, 2026-07); neither parses today
   (`p?: T` and `p: T = e` are both parse errors — verified). Design intent: **defaults subsume
   optionals** — VL has real `null` unions, so `p?: T` is sugar for `p: T | null = null`; one

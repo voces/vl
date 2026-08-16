@@ -642,7 +642,11 @@ import {
   valBlockTypeOfKind,
   vbHeapIdxOfKind,
 } from "./emit_rep"
-import { monoArgTyName } from "./emit_mono"
+import {
+  monoArgTyName,
+  monoInstantiatedAny,
+  monoPinnedSigsOf,
+} from "./emit_mono"
 import { fnIndexOfInScopeChain } from "./emit_collect"
 // THE TYPE-NAME GRAMMAR'S LEAF — and this is the edge that never existed. `tyname.vl`'s
 // own header has recorded since phase 1 that its nine importers are the import SET and not
@@ -1362,21 +1366,89 @@ function emitClosureValue(body: i32[], fe: i32, fnIx: i32) {
   // either checker-rejected (a bare uninferable binding) or cloned/contextually-pinned per use
   // (a `.map`/`.filter` callback), so its i32 default is sound; `criFnIsAnonLambda` excludes it.
   if fnHasUnannotatedParam(fe) {
-    if !criFnIsAnonLambda(fe) {
-      return emitFail(
-        "emitProgram: cannot take a generic function (un-annotated parameters) as a value — its " +
-          "parameters would default to i32; annotate them, or call it directly by name",
-      )
-    }
+    if !criFnIsAnonLambda(fe) { return emitFail(genericFnValueRejectMsg(fe)) }
   }
   return emitClosureValueCore(body, fe, fnIx)
+}
+
+// The value-floor reject text for the generic function at lifted position `fe`. It NAMES the three
+// things the user needs and the bare "annotate them" did not carry: which function, which of its
+// parameters are the holes, and — from `monoPinnedSigsOf` — the concrete signatures the program's
+// OWN call sites already pin it at. That last part is the annotation to write, read out of the
+// instances monomorphization built rather than left for the reader to reconstruct; with no call
+// site there is no inferred signature to offer and the message says so instead of implying one.
+function genericFnValueRejectMsg(fe: i32) {
+  let nm = "<anonymous>"
+  let holes = ""
+  let nHoles = 0
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fn.fnName != "" { nm = fn.fnName }
+    const ps = fn.fnParams
+    let i = 0
+    while i < ps.length {
+      const p = P.nodes[ps[i]]
+      if p is Param {
+        if p.parType < 0 {
+          if holes != "" { holes = holes + ", " }
+          holes = holes + "`" + p.parName + "`"
+          nHoles = nHoles + 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  let head = "emitProgram: cannot take the generic function `" +
+    nm +
+    "` as a value — a function value carries ONE signature, and "
+  if nHoles == 1 {
+    head = head +
+      "parameter " +
+      holes +
+      " is un-annotated (it would default to i32). "
+  } else {
+    head = head +
+      "parameters " +
+      holes +
+      " are un-annotated (they would default to i32). "
+  }
+  const sigs = monoPinnedSigsOf(fe)
+  if sigs == "" {
+    return head +
+      "No call site pins `" +
+      nm +
+      "`, so there is no inferred signature to adopt — annotate the parameter" +
+      pluralS(nHoles) +
+      ", or call `" +
+      nm +
+      "` directly by name"
+  }
+  head +
+    "Call sites pin `" +
+    nm +
+    "` at " +
+    sigs +
+    " — annotate the parameter" +
+    pluralS(nHoles) +
+    " with the signature this value needs, or call `" +
+    nm +
+    "` directly by name"
+}
+
+// `"s"` for a plural count, `""` for exactly one — the diagnostic's own agreement, kept out of the
+// message builder so the two branches cannot disagree about it.
+function pluralS(n: i32) {
+  if n == 1 { return "" }
+  "s"
 }
 
 // The closure-value emission WITHOUT the un-annotated-param floor — the `cloSigKeyExt`
 // representability floor still applies (even a sound direct-call-only binding is called through
 // its `$fnsig`, so that env-leading signature must be representable). Reached either through `emitClosureValue`
-// (after its floor) or directly from the LetDecl emit for a monomorphized direct-call-only alias.
-function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
+// (after its floor) or directly from the binding emit for a monomorphized direct-call-only alias —
+// the local one here (`emitLetDeclStmt`) and the module-level one in `emit_sections.vl`, which
+// gates on `monoGenericAliasFe` instead.
+export function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
   if fe < 0 || fe >= fnStmts.length {
     return emitFail("emitProgram: function value with no lifted function")
   }
@@ -12867,17 +12939,28 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // `emitClosureValue` would reject it on those un-annotated params, so emit through the
   // floor-LESS core. A value-USE of `g` (passed, returned, stored) escapes — `nameUsedAsValueIn`
   // catches it — and falls through to the normal path, where the floor rejects it.
+  //
+  // `monoInstantiatedAny` is the second half of that soundness argument and it is NOT optional:
+  // "the closure is called only at the shape its slot was pinned to" presupposes a call site
+  // pinned it. With NO call site the template stays un-pinned and its body emits at the i32
+  // default, which for a non-numeric body is INVALID WASM at `vl check` rc 0 — witness
+  // `function exclaim(s) { return s + "!" }` with `const f = exclaim` and no call, which reached
+  // the engine as `type mismatch: expected (ref $type), found i32`. A never-called alias now
+  // takes the floor's loud reject instead; the module-level twin gates the same way
+  // (`monoGenericAliasFe`).
   if fnIx >= 0 {
     const aliasFe = fieldValueFeOf(s.letInit)
     if fnHasUnannotatedParam(aliasFe) {
       if !criFnIsAnonLambda(aliasFe) {
-        const encl = P.nodes[fnIx]
-        if encl is FuncDecl {
-          if !nameUsedAsValueIn(s.letName, encl.fnBody) {
-            if emitClosureValueCore(body, aliasFe, fnIx) < 0 { return -1 }
-            fbLocalSet(idx) // 0x21 local.set
-            scopeBind(s.letName, slot)
-            return 0
+        if monoInstantiatedAny(aliasFe) {
+          const encl = P.nodes[fnIx]
+          if encl is FuncDecl {
+            if !nameUsedAsValueIn(s.letName, encl.fnBody) {
+              if emitClosureValueCore(body, aliasFe, fnIx) < 0 { return -1 }
+              fbLocalSet(idx) // 0x21 local.set
+              scopeBind(s.letName, slot)
+              return 0
+            }
           }
         }
       }
