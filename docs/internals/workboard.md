@@ -92,18 +92,31 @@ before those two PRs now under-reads by whatever share of it is a declared name
 or a bare primitive. **Re-derive in CALLS as well as reaches** — a rung-1 answer
 is still `cUserTypes[nm]`, which is the terminal condition verbatim.
 
+**A FOURTH, from B3: THE TWO RUNGS ATE THE ARENA-NEUTRAL PARSES, so the mint gate
+#1331 refuted as a general rule is now true of nine parses in ten.** Mint-free
+emitter parses were **1,342 of 3,031 (44.3%)** at #1331 and are **166 of 1,915
+(8.7%)** at `6ef19f67`. The fall is the rungs' own documented take (219 + 12 +
+803 + 151 = 1,185 parses; `1,342 − 1,185 = 157` against 166 on a 22%-larger
+corpus). A rung that skips the first resolution of a declared name or a bare
+primitive is arena-neutral BY CONSTRUCTION — somebody else minted that index — so
+the shortcut programme has been harvesting exactly the safe parses, and what is
+left is by selection the parses that mint. **Any new row claiming arena-neutrality
+must name the mechanism; the base rate is 8.7% and falling.**
+
 | id | item | anchor | measured | status | eff | risk |
 |---|---|---|---|---|---|---|
 | ~~**B1**~~ | ~~Checker-side parse census~~ | `destringify-types-program.md` D-CHECKPARSE | **CLOSED — measured negative.** 3,093 of 17,834; **17,832 of 17,834 are TREE walks**; `nameToTy` entered **54 times corpus-wide**, **0** over the compiler's own source | **CLOSED** | — | — |
 | **B1a** | **`is` triple resolution** — `collectThenNarrows` / `collectElseNarrows` / the if-chain scan each re-resolve what the `is` node already banks in `isVarTyIx` | family c9+c10+c11+c13 | **6,574 = 36.9%** of checker parsing (**87.9%** on the compiler's own source). Bank covers 4,427 of 4,429 readers; **2,530 of 2,530 index-identical, 0 disagreements** | **PARTLY TAKEABLE** — the other **1,897 MINT a duplicate arena entry**, so skipping renumbers (#1331's gate) | M | med |
 | **B2** | **TRANSP residue** — add `genAppNameOfTy` under `structNameOfTy` so `type Y = Box<i32>` renders `Box<i32>` | `typecheck.vl:8945`; blocker `emit_classify.vl:11474 fieldTypeCode` | rung is **BUILT and MEASURED**: B2 20→11, B3 120→111, moves nothing on the six-channel corpus, costs ONE cell | OPEN — both halves of the old filing REFUTED | M+S | med |
-| **B3** | **1a-v `pushFieldRow`** — per-field-CODE peel table | `emit_collect.vl:4271`; `emit_rep.vl:1226`, `:1241` | **887 reaches / 256 parses = 8.4% of all emitter parsing**; `recordUFieldElemRow` densest at 77.6% | OPEN — "all 256 mint" is **BRIEFED, unverified since #1331** | M | high if they mint |
+| ~~**B3**~~ | ~~1a-v `pushFieldRow` — per-field-CODE peel table~~ | `destringify-types-program.md` D-FIELDROWMINT | **MEASURED NEGATIVE.** Re-derived at **3,583 CALLS** (2,510 empty-name guard · 185 rung 1 · 215 rung 2 · **673** `resolveAnnot` reaches) / **220 parses** (11.5% of the emitter's 1,915) / **206 of the 220 MINT (93.6%)**, and on the subset `pushFieldRow` can actually reach, **83 of 84 (98.8%)**. The 14 mint-free are 6 generic re-applications + 8 `#anon` failures, 13 of them outside `pushFieldRow` | **BLOCKED-REP** — behind **B5** | — | — |
 | ~~**B4**~~ | ~~`recordMvValTyIx` routing~~ | `destringify-types-program.md` B4 | **SHIPPED.** Re-derived at **725 CALLS** (40 rung-1 · 274 rung-2 · **411** `resolveAnnot` reaches) / **0 parses** / **0 arena mints**; dual-write **725 of 725 index-identical**, corpus A/B 1,743 files × 7 channels **0 rows moved**, **+25 B**. The filed 685 reconciles as `725 − 40 − 274`: the row grew, the CHOKEPOINT moved | **CLOSED** | — | — |
 | **B5** | **Mono-clone `nodeTyIx`** — clone banks the generic's type while `tyName` carries the substituted spelling | `emit_collect.vl:3413`, `:3868`; `emit_mono.vl:1430` | disagrees on **59 of 1,328**; a guard cuts 59→8 but costs 109 agreements, **not shipped**; **1,335 reaches wait on it** | OPEN — blocks B3/B6 | L | **HIGH** |
 | **B6** | **Arena-index threading** (D-INLINESHAPETY / D-REPELEMTY) — relocate parses to callers holding the index | — | population quoted as **18 of 1,064** in three places but the measuring table sums to **14 / 1,050** | OPEN, **re-derive first** | M | med |
 | **B7** | **W9 — canon `renderEmit(ty, ctx)`** | `typecheck.vl:9524`, `:7985`, `:6723` | **B2 = 176 / 7,201 = 2.44%**; gate 4b admits **4 distinct spellings corpus-wide** | **DESIGN-BLOCKED** — canon is name-in/name-out by contract | L | high |
 | **B8** | **W10 — `nameToTyReal`**, the checker's second descent | `typecheck.vl:6184` | a SOURCES problem; the "~150 ops" headline **predates the #1327 unit correction** | OPEN, **re-derive** | L | high |
-| **B9** | **W13's ~60 single-writing floor** — never re-derived | — | *"an assumption in a table, never a measurement"* | OPEN census | S | none |
+| ~~**B9**~~ | ~~W13's ~60 single-writing floor~~ | `destringify-types-program.md` D-FLOORREAD | **RE-DERIVED BY READING THE BODIES. It is not 60.** Site population **98 → 38** (five modules at zero); those 38 are **22 distinct operations, 16 copies**; **8 of the 22 re-write a home that exists** — three in files that already IMPORT it (`emit_mono` x2, `emit_classify` x1) — and 2 are declines against one. **Floor = 12**, of which 3 are declines the leaf header records, leaving **9 unhomed grammars with no filed reason**. `tyname.vl` itself is **35 bodies / 16 operations** (the CUT is ten one-line `slice`s) | **CLOSED** | — | — |
+| **B9a** | **the three FREE routings D-FLOORREAD found** — a hand-written body in a file whose import block already names the home | `emit_mono.vl:2185`, `:2194` (`nameIsArray` / `arrElemNameRaw`, imported at `:11`/`:13`); `emit_classify.vl:3438` (`fnRetTextOf`, imported at `:30`) | `:2185` drops `nameIsArray`'s `']'` conjunct — a latent disagreement, not just a copy | OPEN | **S** | low |
+| **B9b** | **operation 4 is written twice and the two answers DIFFER** — `tyGroupEndIndex(X,1) == X.length-1` | `emit_base.vl:1002` (`e < 0 ⇒ true`) vs `typecheck.vl:6285` (bare compare ⇒ false); home `tyname.parenEnclosesWhole` | never-closing group answers TRUE at one site and FALSE at the other | OPEN — decide which is right BEFORE routing | S | med |
 | **B10** | **Latent defect** — only the NEGATIVE memo carries `cUserTypesVer`, so a positive entry survives a `cUserTypes` rewrite | `emit_rep.vl:1147` → `:1198` | **4 disagreements in 976** memo-HIT reaches; inert only because rung 2 answers 0 times in 237 | OPEN | S | med (mint reorder) |
 
 **EXHAUSTED / REFUTED — do not schedule.** The name-shortcut route entire (#1334);

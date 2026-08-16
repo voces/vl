@@ -41009,3 +41009,337 @@ value is dual-written at 725 of 725.
   *Grade the instrument on the same edit you grade the change with, and read the zeros.*
 
 <!-- APPEND-MARKER-MVROWBANK-END -->
+
+<!-- APPEND-MARKER-FIELDROWMINT-BEGIN -->
+
+## D-FIELDROWMINT — B3's mint column, measured at last: 206 of the row's 220 parses MINT, and 83 of the 84 the filed remedy can actually reach. The gate HOLDS, B3 is blocked on REP grounds, and the reason the answer inverted is that #1331/#1332's own rungs ATE the arena-neutral population (census only; off master `6ef19f67`)
+
+Workboard row **B3** — `1a-v pushFieldRow`, the per-field-CODE peel table — has carried the same
+status for four slices: *"887 reaches / 256 parses = 8.4% of all emitter parsing;
+`recordUFieldElemRow` densest at 77.6%; OPEN — 'all 256 mint' is BRIEFED, unverified since #1331."*
+
+The briefing is #1327's: *"at a MISS, `annotResolve` MINTS. Every one of those 256 is the first
+resolution of that spelling in its program, so skipping it does not skip a lookup, it removes a
+`T.tys` entry and renumbers every arena index after it."* #1331 then refuted that sentence **as a
+general rule** — 1,342 of the emitter's 3,031 parses mint nothing — and measured the mint column for
+all seven `emit_rep` rows. It did **not** split row 3 by CALLER, so the two field-row recorders' own
+mint share has never been read. This slice reads it. The check is two lines: `T.tys.length` around
+the population.
+
+**Both possible answers close the row, which is why it was worth two lines.** They came out on the
+blocking side, and the row is marked so rather than left ambiguous.
+
+### 1. PROBE ZZF, AND ITS FIVE CONTROLS
+
+```
+base:   master 6ef19f67; build/vl-compiler.wasm self-compiled from a freshly fetched
+        seed-latest by scripts/agent-setup.sh (rc 0), 1,150,535 B,
+        sha256 b39bc901c5aca2cd8f79c678109850b26dc22eedc034eca259e16684ce99c80d
+probe:  one wrapper around the `fieldElemTyIxOfName` call inside EACH of the two
+        recorders (`emit_rep.recordSFieldElemRow` / `recordUFieldElemRow`), banking
+        rung 1 (`cUserTypes`), rung 2 (`primTyOfName`), the memo class taken inside
+        `typecheck.vl` where `annotNameMemo` lives, and a `T.tys.length` delta;
+        plus a `zzVia` flag set by `emit_collect.pushFieldRow` around its two calls,
+        and six cumulative counters on the exported `resolveAnnot` (the emit side's
+        only entry — its four textual call sites are all in `emit_rep.vl`)
+build:  scripts/vl-host/target/release/vl build compiler/entry.vl \
+          -o C-zzf.wasm --compiler build/vl-compiler.wasm      # 1,151,975 B
+run:    scripts/vl-host/target/release/vl check --codegen tests/cases --compiler C-zzf.wasm
+        (one compiler instance for the whole tree; rc 1, the probe reports through the
+         diagnostic channel; the LAST ZZT record is the corpus total)
+extract: grep -o 'ZZF|.*' zzf.out ; grep -o 'ZZT|.*' zzf.out
+```
+
+One record per CALL of either recorder:
+`ZZF|<seq>|c<recorder>|v<via pushFieldRow>|u<cUserTypes>|p<primTyOfName>|k<memo class>|m<T.tys delta>|a<answer>|L<len>|<spelling>`.
+The spelling is LAST because a union spelling contains `|`, and `L` is its length so a torn or
+re-rendered record is loud.
+
+**RECORDS ARE PUSHED STRAIGHT ONTO `T.diags`, NOT RAISED THROUGH `tErr`** — #1332's landmine
+(*"`tErr` DEDUPES EXACT REPEATS … one census read 481 for a population of 1,229"*) would have been
+live here: 2,510 of this population's 3,583 records are byte-identical except for their sequence
+number. The `T.diags` push bypasses `tErrCoded`'s dedup entirely, and the sequence number is the
+check that it did.
+
+| control | reading |
+|---|---|
+| **the instrument is not deduping** | the 3,583 sequence numbers are exactly 1…3,583 — **contiguous, no gaps, no repeats**. 2,510 records differ from a sibling in the seq field alone, and all 2,510 survived. |
+| **no torn record** | 3,582 of 3,583 records satisfy `len(spelling) == L`. The single exception (`ZZF\|1860`, `L8` rendering as the five visible characters `Inner`) is a diagnostic-RENDER artifact, not a tear — the host's diagnostic reader drops code points `char::from_u32` rejects. Named rather than swept: one record, all numeric columns intact, classified rung 1. |
+| **a memo hit never mints** | `T.tys` grew across **0 of 3,363** calls that were not parses — every memo hit, every negative hit, both rungs, and all 2,510 guard returns. The mint column's own zero-check, and it reads zero. |
+| **the totals reconstruct** | the 1,507 `ZZT` records are **monotone non-decreasing in all six columns**, and the final record satisfies `re == hit + neg + par + tp` exactly (12,179 = 10,166 + 98 + 1,915 + 0). |
+| **`tpEnv` is empty at emit time** | the `tp` column is **0 of 12,179**. The emitter's `resolveAnnot` calls never run under a live type-parameter binding, which is the precondition the memo classification assumes. |
+
+Denominators: **1,767 `.vl` files** under `tests/cases`, **1,507 of them reach `emitProgram`** (the
+rest stop at a check error and never emit), **762 reach either field-row recorder at all**.
+
+### 2. THE ROW, IN THREE UNITS — calls, reaches, parses — and the mint column
+
+| | **calls** | empty-name guard | rung 1 `cUserTypes` | rung 2 `primTyOfName` | memo hit | neg | **`resolveAnnot` reaches** | **PARSES** | **that MINT** | **mint-FREE** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `recordSFieldElemRow` | 2,815 | 1,851 | 174 | 191 | 438 | 3 | 599 | **158** | **145** | 13 |
+| — via `pushFieldRow` | 753 | 626 | 51 | 17 | 37 | 0 | 59 | **22** | **22** | **0** |
+| — its six direct callers | 2,062 | 1,225 | 123 | 174 | 401 | 3 | 540 | **136** | **123** | 13 |
+| `recordUFieldElemRow` | 768 | 659 | 11 | 24 | 12 | 0 | 74 | **62** | **61** | 1 |
+| **ROW TOTAL** | **3,583** | **2,510** | **185** | **215** | **450** | **3** | **673** | **220** | **206 (93.6%)** | **14 (6.4%)** |
+| **the routable subset — via `pushFieldRow`** | 1,521 | 1,285 | 62 | 41 | 49 | 0 | 133 | **84** | **83 (98.8%)** | **1 (1.2%)** |
+
+Emit-side denominator, from the same run's `ZZT` counters (all seven `emit_rep` rows, cumulative
+over 1,507 programs): **12,179 `resolveAnnot` reaches · 10,166 memo hits · 98 negative · 1,915
+PARSES (15.7%) · 1,749 of those parses MINT (91.3%)**.
+
+So the row is **220 of 1,915 = 11.5% of all emitter parsing** — it did not shrink as a share, it
+GREW, because the emit-side total fell faster than the row did (#1327: 256 of 3,031 = 8.4%). And the
+part of it the filed remedy can reach is **84 of 1,915 = 4.4%**.
+
+### 3. THE ANSWER TO THE QUESTION THE ROW WAS OPEN ON
+
+**"ALL 256 MINT" IS FALSE AS AN ABSOLUTE AND TRUE AS A DECISION.** 14 of 220 parses mint nothing —
+so the briefing was literally wrong — but the 14 are named, they are not the routable class, and
+13 of them are not even reachable through `pushFieldRow`:
+
+```
+Pair<i32,string>  x5      a generic APPLICATION re-resolving to an instance the arena already holds
+Inner<f32>        x1      the same
+#anon0/1/2        x8      the synthetic anon element names, which resolve through NEITHER path and
+                         record -1 — a failure that happens to bank no partial type
+```
+
+The other **206 mint**, adding **358 `T.tys` entries** corpus-wide (131 of them through
+`pushFieldRow`). Every one is a first resolution of that spelling in its program, so deleting the
+call removes the arena entry and renumbers every index after it — and `repElemKeyGo`'s identity arm
+keys `TyVar`/`TyLit`/`TyErr` by arena INDEX.
+
+**On the subset that is actually B3 the gate is not 93.6% but 98.8%: 83 of 84.** The single
+mint-free reach through `pushFieldRow` is one `Pair<i32,string>` at `recordUFieldElemRow`. There is
+no low-risk slice hiding inside this row.
+
+> **VERDICT: B3 IS BLOCKED, AND IT IS BLOCKED FOR THE REASON #1327 GAVE, ON A POPULATION #1327 NEVER
+> MEASURED.** Mark the row BLOCKED-REP rather than OPEN. It becomes takeable only behind B5 (the
+> mono-clone `nodeTyIx` bank), which is what would let the field's annotation NODE hand over an index
+> that is *already in the arena* instead of one the emitter has to mint.
+
+### 4. THE FINDING THAT IS BIGGER THAN THE ROW: THE TWO RUNGS ATE THE MINT-FREE POPULATION
+
+#1331 refuted the mint gate with **1,342 of 3,031 emitter parses (44.3%) minting nothing**. On this
+base it is **166 of 1,915 (8.7%)**. The gate #1331 refuted as a general rule is now true of nine
+parses in ten.
+
+**The arithmetic closes, and it closes on #1331's own numbers.** Its mint-free column was
+concentrated in exactly the two rows the next two PRs then shortcut: `unMemAtomTyIx` 804 mint-free of
+1,229, `repNameCanonKey` 224 of 228. #1331 measured rung 1 at *219 of `repNameCanonKey`'s 228 and 12
+of `repRowOfName`'s 180*, and #1332 measured rung 2 at *803 of `unMemAtomTyIx`'s 1,229 and 151 more
+across `fieldElemTyIxOfName`'s other callers* — **1,185 parses**. `1,342 − 1,185 = 157`, against 166
+measured on a corpus 22% larger (1,447 → 1,767 files). Within 6%.
+
+*A rung that removes the FIRST resolution of a declared name or a bare primitive removes an
+arena-NEUTRAL parse by construction, because the index it answers with was minted by somebody else.*
+The shortcut programme has therefore been harvesting precisely the parses that were safe to harvest,
+and what it leaves behind is, by selection, the parses that mint. Any future row that hopes to be
+arena-neutral has to name the mechanism that makes it so; the base rate is now 8.7% and falling.
+
+### 5. THE UNIT FINDINGS, RESTATED ON A THIRD ROW
+
+* **THE ROW GREW WHILE ITS CHOKEPOINT FELL, exactly as B4 predicted it would.** Filed at 887
+  `resolveAnnot` reaches; re-derives at **673 reaches** and **1,073 non-guard calls**. Rung 1 (185)
+  and rung 2 (215) now answer 400 of them above the chokepoint, and `887 × 1.22` (the corpus growth
+  factor) `= 1,082` against 1,073 measured. *The old number reconciles arithmetically; it was never
+  stale, it was measured at a different point in the ladder.*
+* **70.1% OF THIS ROW'S CALLS ARE THE EMPTY-NAME GUARD — 2,510 of 3,583 — AND NO UNIT THE PROGRAMME
+  HAS RANKED BY COULD SEE THEM.** They return -1 before touching `cUserTypes`, the memo or the
+  grammar. A routing that hands the recorder an index deletes 3,583 calls, of which 2,510 do nothing
+  at all today.
+* **"`recordUFieldElemRow` IS THE DENSEST ROW IN THE BUCKET AT 77.6% PARSES" IS AN ARTIFACT OF THE
+  REACH UNIT.** In reaches it re-derives at 62 of 74 = **83.8%**, denser still. In CALLS it is 62 of
+  768 = **8.1%**, and **659 of its 768 calls (85.8%) are the empty-name guard**. *A parse RATE whose
+  denominator is a chokepoint ranks rows by how much of their traffic the rungs above already
+  removed, not by how much work they do.*
+* **THE RESIDUAL PARSING IS STILL A UNION PROBLEM.** 135 distinct spellings across the 220 parses;
+  by shape, **146 unions**, 23 arrays, 20 inline shapes, 8 paren/function atoms, 8 generic
+  applications, 8 `#anon`, 7 maps. #1327 said this of the whole emit side; it is true of this row in
+  isolation.
+
+<!-- APPEND-MARKER-FIELDROWMINT-END -->
+
+<!-- APPEND-MARKER-FLOORREAD-BEGIN -->
+
+## D-FLOORREAD — the "~60 single-writing floor" re-derived by READING THE BODIES, as #1259 said the next census must. It is not 60: the site population is 38, the distinct operations are 22, and 8 of the 22 are re-writings of a home the file ALREADY IMPORTS. The routing-irreducible residue is 12 (census only; off master `6ef19f67`)
+
+Workboard row **B9**: *"W13's ~60 single-writing floor — never re-derived. 'An assumption in a table,
+never a measurement.'*" The programme has quoted 60 forward through eleven slices. Its provenance is
+#1239's sentence — *"98 sites are 60 distinct operations; 38 are copies … what is left is the 60
+single writings, and a grammar has to be spelled once"* — and the 60 was computed by **normalising
+each site's SHAPE SIGNATURE with the receiver abstracted** (`X.slice(1, X.length - 1)`,
+`X[0] == '"'`) and counting distinct signatures.
+
+#1259 then found three of W13's own entries were **one operation written three times** and wrote the
+correction into the record: *"the next census of that row should re-derive it the way #1259 did — by
+reading the bodies, not by counting the names."* This is that census. **A shape signature is not an
+operation, and the gap between the two units is the whole finding.**
+
+### 1. METHOD, AND THE RULE THE COUNT IS TAKEN UNDER
+
+Same population rule as #1239 — a **character-level operation on an established TYPE SPELLING**, with
+its four false-positive classes (operator spellings, protocol tag returns, expression/numeric
+lexemes, the `$fnsig` ABI alphabet) and its NAME exclusion (`v == "i32"` carries no type punctuation)
+kept verbatim. Two additions, both stated so the number is reproducible:
+
+* **A CALL TO A HOME IS NOT A SITE.** 17 call sites of `emit_base.strContains` reach it with a
+  type-punctuated needle (`"=>"` x10, `"{[i32]:"` x3, `"{["`, `"[]"`, `"("`, `"?"`). They index
+  nothing themselves. Counting them would inflate the debt by 45% and would score the ONE body they
+  all reach as fourteen operations. #1239's own FP3 rule says this; its per-module table (`emit_collect` 4,
+  `wasmEmit` 2) confirms it was applied there too.
+* **A LENGTH BOUND IS NEITHER AN INDEX NOR A SUBSTRING.** Six `X.length < k` pre-rejects in
+  `emit_base.vl` sit in front of a delegated home as index-safety. #1239's columns are INDEX (35) and
+  SUBSTR (63) and they sum to its 98, so bounds were not in it. Reported here, not counted.
+
+Read by three independent passes over disjoint file sets, then merged by hand; every claim the
+headline rests on was re-read at the source line.
+
+### 2. THE POPULATION HAS FALLEN 98 → 38, AND FIVE MODULES ARE NOW AT ZERO
+
+| file | #1239 PARSE | **here** |
+|---|---:|---:|
+| `typecheck.vl` | 38 | **10** |
+| `emit_base.vl` | 25 | **20** |
+| `emit_classify.vl` | 19 | **6** |
+| `emit_mono.vl` | 5 | **2** |
+| `driver.vl` | 5 | **0** |
+| `emit_collect.vl` | 4 | **0** |
+| `wasmEmit.vl` | 2 | **0** |
+| `emit_rep.vl` | 0 | **1** |
+| **total** | **98** | **38** |
+
+`driver.vl`, `wasmEmit.vl`, `emit_collect.vl`, `emit_rewrite.vl`, `emit_sections.vl` and
+`emit_query.vl` hold **zero** hand-written type-name character work; every spelling question they ask
+is a call. That is W2/W3/W8/W14 and the six down-moves landing, and it is the routing programme's
+result rather than this census's.
+
+### 3. THE 38 SITES ARE 22 OPERATIONS — 16 COPIES, NOT ZERO
+
+| # | operation | writings | where |
+|---|---|---:|---|
+| 1 | map-seam FIND (`]:`) | 1 | `emit_base.mapValNameOf:410` |
+| 2 | map-VALUE cut | 1 | `emit_base.mapValNameOf:411` |
+| 3 | **numeric-literal leading DIGIT** | **3** | `emit_base.isLitVariantName:650` · `typecheck.litMemberTy:1296` · `typecheck.nameNeedsCanon:6767` |
+| 4 | **balance ENDPOINT** ("does the leading group close on the last character") | **2** | `emit_base.tyGroupWrapsWhole:1002` · `typecheck.nameToTyReal:6285` |
+| 5 | head/tail cut at a found `\|` | 1 | `emit_base.nullablePartOf:1013,1014` |
+| 6 | group-INTERIOR cut (the file's last W1 site) | 1 | `emit_base.parenUnionArrElemName:1808` |
+| 7 | **trailing `[]`-RUN as whole-minus-leaf** | **2** | `emit_base.gaeApplyFieldTy:2150` · `emit_base.monoSubstAnn:3249` |
+| 8 | two-sided `' '`/`'\t'` TRIM | 1 | `emit_base.normTypeAtom:2292,2293,2295` |
+| 9 | leading-space SKIP at an index | 1 | `emit_classify.mvValKindOfName:3437` |
+| 10 | union-set RE-JOIN by position | 1 | `emit_base.removeAtomFromGo:2350,2353,2358` |
+| 11 | **arrow-relative param-list CLOSE** | **2** | `emit_base.annFnDecompose:2588` · `typecheck.isTopLevelFuncTypeName:5413` |
+| 12 | **field-colon FIND** | **3** | `emit_base.annObjFieldSplit:2654` · `emit_base.shapeInnerFieldSplit:2724` · `emit_classify.shapeFieldParse:9441` |
+| 13 | **contains a punctuation RUN** | **3** | `emit_base.strContains:2890` (the home) · `emit_base.nameIsStructWithMapField:2854` · `emit_rep.renderFaithful:2088` |
+| 14 | **negation-prefix TEST** | **2** | `typecheck.nameToTyReal:6272` · `typecheck.canonEmitNameTs:10159` |
+| 15 | negation-operand CUT | 1 | `typecheck.nameToTyReal:6273` |
+| 16 | **top-level FIELD SPLIT of a brace body** | **2** | `typecheck.nameToTyReal:6405` · `typecheck.canonShapeName:8046` |
+| 17 | canon-trigger character-SET scan | 1 | `typecheck.nameNeedsCanon:6755` |
+| 18 | return-text CUT past the arrow | 1 | `emit_classify.mvValKindOfName:3438` |
+| 19 | map-value OFFSET counted back from the tail | 1 | `emit_classify.rlCanonLitUnionAtoms:12151` |
+| 20 | brace OPENER (`len >= 1 · OPEN`) | 1 | `emit_classify.internShapeArms:12792` |
+| 21 | array-suffix TEST | 1 | `emit_mono.monoInstantiate:2185` |
+| 22 | array-ELEMENT cut | 1 | `emit_mono.monoInstantiate:2194` |
+| | **total** | **38** | **22 operations · 16 copies** |
+
+**FIVE OF THOSE MERGES A SHAPE CENSUS CANNOT MAKE, and they are the ones #1259 predicted.** Rows 3,
+4, 13 and 16 group bodies whose normalised SIGNATURES differ:
+
+* **13** is one predicate in three spellings — `strContains(X, needle)`, a hand-written
+  `while X[sp] == '{' && X[sp+1] == '['`, and a hand-written `while X[i] == '?'` walk. The first is
+  the home; the second is `strContains(name, "{[")` on every input (the hand-written
+  `sp + 1 < X.length` window is `strContains`'s `i + sub.length <= X.length` window); the third
+  differs only in USING the hit's position.
+* **16** is `tyTopLevelSplit` twice: `nameToTyReal:6405` is the home with `dropEmpty` **true** (it
+  gates on `field.length > 0`) scanning the still-braced name from index 1 with an end of
+  `nlen - 1`; `canonShapeName:8046` is the home with `dropEmpty` **false** over the already-peeled
+  interior. Different signatures, same parts on every input.
+* **3** is `X[0] >= '0' && X[0] <= '9'` at two sites and the same test with a separator lookback at
+  the third — one grammar question ("does a member spelling begin a numeric literal") asked at index
+  0 and at every member start.
+* **4** is `tyGroupEndIndex(X, 1) == X.length - 1` at both sites — **and the two do not agree.**
+  `emit_base.tyGroupWrapsWhole` prepends `if e < 0 { return true }`; `typecheck.vl:6285` writes the
+  bare comparison, which is `false` for a never-closing group. Same operation, two answers, and the
+  divergence is only visible by reading both bodies.
+
+### 4. THE FLOOR: 8 OF THE 22 ARE RE-WRITINGS OF A HOME, THREE IN FILES THAT ALREADY IMPORT IT
+
+The 60 was published as *irreducible under routing*. On the 22 that remain, that claim is false for
+eight of them, and the three cheapest are not even an import away:
+
+| operation | the home that exists | status |
+|---|---|---|
+| 22 array-ELEMENT cut | `tyname.arrElemNameRaw` | **`emit_mono.vl` imports it at line 11** and calls it correctly 1,880 lines earlier; `:2194` writes `an2.slice(0, an2n - 2)` — the home's body verbatim |
+| 21 array-suffix TEST | `tyname.nameIsArray` | **`emit_mono.vl` imports it at line 13**; `:2185` writes the `'['` conjunct only, dropping the `']'` test |
+| 18 return-text CUT | `tyname.fnRetTextOf` | **`emit_classify.vl` imports it at line 30**; `:3438` writes `ncl.slice(nri, ncl.length)` with `nri` seeded at `nca + 2` — the home's exact start index |
+| 4 balance ENDPOINT | `tyname.parenEnclosesWhole` | `typecheck.vl:6285` is the home's one-line body verbatim; `emit_base:1002` is it plus the `e < 0` arm |
+| 16 FIELD SPLIT | `tyname.tyTopLevelSplit` | two resume loops in `typecheck.vl`, one per `dropEmpty` value |
+| 12 field-colon FIND | `tyname.tyTopIndexOf` | three `indexOf(":")` writings; the checker already uses the depth-aware home, so this is also a quote/depth BLINDNESS difference, not only a copy |
+| 6 group-INTERIOR cut | `tyname.groupInnerOf` | `emit_base:1808`'s `slice(1, len - 3)` is the home applied inside the `[]` suffix; the file's own comment at :1795 proves the equality |
+| 13 contains a RUN | `emit_base.strContains` | two of its three writings are hand-written walks |
+| 1, 2 map seam / value | `tyname.mapSpellKeyEnd` / `mapSpellValName` | **DECLINED with a written reason** — `mapValNameOf`'s SPAN gate is `nameIsMap`, the home's is `nameIsMapSpanEnds`, and they answer differently on `{[string]:i32}\|null`. A real second predicate, not a copy |
+
+> **THE RE-DERIVED FLOOR IS 12, NOT 60** — the 22 operations less the 8 with an existing home and the
+> 2 declined against one. And **three of the 12 are themselves declines the leaf's own header already
+> records** (8 and 9, the two whitespace operations it names as "NEITHER"; 20, the brace opener whose
+> in-code note calls it *"THE ONE GRAMMAR-PREDICATE CHARACTER TEST THIS FILE KEEPS"*). **Nine
+> operations in the whole compiler are hand-written type-name grammar with no home and no filed
+> reason**: the numeric-literal digit (3), the bar head/tail cut (5), the `[]`-run difference (7),
+> the union-set re-join (10), the arrow-relative param close (11), the negation test (14) and its cut
+> (15), the canon-trigger scan (17), and the map-value tail offset (19).
+
+### 5. AND THE LEAF ITSELF IS NOT 35 OPERATIONS — IT IS 16
+
+The same reading applied to the target rather than the debt. `tyname.vl`'s header derives its own
+count honestly (*"IN — 35 bodies, in TWELVE families … the count is DERIVED, not carried forward"*),
+but a body count is a name count, which is the unit this census exists to distrust.
+
+| operation | bodies | what the reading shows |
+|---|---:|---|
+| **the DEPTH LADDER** | 2 | `tyTopIndexOf` and `tyGroupEndIndex` are the same 25-line walk with a different stop — the file's own header says so (*"The same ladder as `tyTopIndexOf`, with the closer as the target instead of a separator"*) |
+| the quoted-segment SKIP | 1 | `skipQuotedName` |
+| the `>` vs `=>` test | 1 | `tyGtIsClose` |
+| the first `<` | 1 | `gaeLtAt` — deliberately depth- and quote-BLIND |
+| **the SPACE scan** | 2 | `nameIsSpaceFree` (assert) / `nameStripSpaces` (enforce) — one walk, two materialisations |
+| the identifier CLASS | 1 | `nameIdentChar` |
+| the generic top-level SPLIT | 1 | `tyTopLevelSplit` |
+| **the `\|` split with the ARROW STOP** | 2 | `splitUnionAtoms` / `unionMemberCount` — the same query, materialised and counted |
+| **the OPENER test** | 2 | `nameIsParenOpen` / `nameIsQuotedLeaf` — `X[0] == c`, delimiter constant apart |
+| **the BRACE/MAP discrimination** | 2 | `nameIsShapeOpen` / `nameIsMapOpen` — exact complements on `X[1]` |
+| **the SPAN-ENDS layer** | 3 | `nameIsParenSpanEnds` / `nameIsBraceSpanEnds` / `nameIsMapSpanEnds`. Each header calls itself *"A LAYER over the opener, not a second copy of it"* — true of the opener, and the LAYER is the same layer three times |
+| the ARRAY suffix digraph | 1 | `nameIsArray` — no opener, so not the span-ends operation |
+| the GENERIC-APP span | 1 | `annGenAppSpanEnds` — its opener is FOUND, not at index 0 |
+| the BALANCE endpoint | 1 | `parenEnclosesWhole` |
+| the FUNCTION-TYPE atom | 1 | `nameIsFuncTypeAtom` |
+| **the CUT** | **10** | `groupInnerOf` `fnParamsTextOf` `fnRetTextOf` `arrElemNameRaw` `fieldNameOf` `fieldTypeTextOf` `mapSpellKeyName` `mapSpellValName` `gaeHeadNameOf` `gaeArgsTextOf` — ten one-line `String.slice` calls whose index is a PARAMETER or a constant offset from `length`. `fieldNameOf` and `gaeHeadNameOf` are character-identical. **Not one of the ten contains any grammar**: the grammar is entirely in the finder that supplies the index |
+| | **35 → 16** | plus 3 pure compositions (`listElemNameOf`, `mapSpellKeyEnd`, `peelGroupParens`) that add no character work |
+
+**THE HOME FILE HAS 19 COPIES ABOVE THE FIRST, WHICH IS HALF AGAIN WHAT THE WHOLE DEBT HAS (16).**
+That is not a defect — a home is allowed to spell a family out for legibility, and the SPAN-ENDS
+trio and the OPEN pair each read better as three and two named predicates than as one call with a
+delimiter argument. It is a statement about the UNIT: **"one body per grammar" is a property of the
+tree's naming, not of the tree's grammar, and the census's floor was computed from the naming.**
+
+Tree-wide, the compiler spells **29 distinct type-name character operations** (the leaf's 16, plus
+`emit_base.strContains`, plus the 12 unhomed) across **73 writings** (35 leaf bodies + 38 debt sites).
+
+### 6. METHOD NOTES
+
+* **A FLOOR DERIVED FROM SHAPE SIGNATURES IS AN UPPER BOUND ON THE FLOOR, NEVER THE FLOOR.** Every
+  correction this census makes runs the same direction: 60 → 22 → 12. Two mechanisms, both real and
+  separable — routing since #1239 took the site population 98 → 38, and reading bodies took the
+  operation count below the signature count at rows 3, 4, 13 and 16. *A census that normalises
+  syntax measures how many ways the tree spells a thing; only reading the bodies measures how many
+  things there are.*
+* **"IRREDUCIBLE UNDER ROUTING" HAS TO BE CHECKED AGAINST THE IMPORT LIST, NOT ARGUED.** Three of the
+  22 operations are hand-written in a file whose import block already names the home
+  (`emit_mono` x2, `emit_classify` x1). The cheapest items on this whole programme are found by
+  reading a body against the imports at the top of its own file.
+* **TWO WRITINGS OF ONE OPERATION ARE A LATENT DISAGREEMENT UNTIL SOMEONE READS BOTH.** Operation 4
+  is written twice and the two answers differ on a never-closing group; operation 21 drops half of
+  `nameIsArray`'s conjunction. Neither is visible in a signature census, a grep, or a call graph.
+* **COUNTING A CALL AS A SITE INFLATES A CENSUS BY WHATEVER THE MOST-CALLED HOME IS WORTH.** Here
+  that is 17 of 55 candidate rows — 31% — all reaching one nine-line body. *Before counting, ask of
+  every row whether it indexes anything itself.*
+
+<!-- APPEND-MARKER-FLOORREAD-END -->
