@@ -9,32 +9,83 @@ domination and stdout equivalence before any ratio here was quoted.
 Raw data: `bench/results/{results.json,summary.md,raw.ndjson}`. Deep dives on the five worst
 rows: `bench/findings/*.md`.
 
+> ## THE 08-02 TABLES ARE SUPERSEDED — read this before quoting a number from §3 or §4
+>
+> Eight items have landed against this suite since the 08-02 sweep: **P1** `return_call`
+> (#1324), **P2** closure dispatch (#1326), **P3** `__str_eq__` 8x unroll + **P4a** `indexOf`
+> first-char skip (#1328), **P5** list-header hoist (#1333), the union return-path box sinks
+> (#1322, #1337), the top-level-`let` storage class (#1321), and **P7's unroll** (#1342).
+> **§3's landscape and §4's loss ranking were written before any of them and were not
+> re-measured; §5's item table was.**
+>
+> The current sweep is `bench/results/summary.md` / `results.json`, generated
+> **2026-08-03T01:21:48 at repo `1d3a8559`** — a different run with a different protocol
+> (5 reps, not 7; 254 configurations, 1,270 samples; noise floor 6.3%). Every §3/§4 number
+> below is kept as the 08-02 record, with the rows the shipped work moved called out
+> underneath their table and in each §4 heading. **Where the two disagree, the 08-03 figure
+> is the live one.**
+>
+> **The 08-03 sweep labels itself PRELIMINARY for the same reason this document does**
+> ("other work may have been on the machine"). It re-ranks the landscape; it does not settle
+> it. An authoritative pass still needs exclusive use of the box (§9), and neither sweep has
+> had one.
+
 ---
 
 ## 1. The verdict
 
-**VL is at parity with V8 in the median and roughly 2.5x off native — but the median hides the
+**VL is at parity with V8 in the median and roughly 2.3x off native — but the median hides the
 shape of the distribution, and the shape is the finding.** Across 45 benchmarks the median
-`vl/deno` is **1.04** (geomean 1.19) and the median `vl/rust` is **2.49x** (geomean 3.04x). VL
-**beats deno on 15 benchmarks, ties on 16, and loses on 14** — but its losses are far heavier than
-its wins: the worst loss is 14.0x (`strings/str-eq`) and the best win is 2.6x
-(`arrays/push-growth` at 0.38). So VL is not broadly behind V8; it is *episodically catastrophically*
-behind V8, on a small number of axes that a real program hits constantly — string equality, calling
-a function value, and indexing an array. Against the interpreter floor VL wins by a geomean of
-**15x**, which is where it should be, except that **it loses outright to CPython on three
-benchmarks** (`strings/substr-search` py/vl 0.1, `strings/str-eq` 0.3, `collections/set-ops` 0.8)
-and is under 2x on three more (`map-string` 1.2, `map-i32` 1.4, `word-freq` 1.8) — all six are
-string-hashing or string-comparison paths, and that clustering is not a coincidence. Against Rust,
-after correcting for the auto-vectorisation the audit found in 9 of 46 `main.rs` files, VL's
-*scalar* codegen is close (on `arith/i32-accum` the raw multiple is 5.7x but the scalar-vs-scalar
-multiple is ~1.4x); the genuine native headroom is concentrated in WasmGC array access and in the
-absence of any tail-call, inlining or SIMD story. **The single most important structural finding is
-that `vl build -O3` recovers 11.8x on `algorithms/lambda-hot` and 2.9x on
-`collections/struct-field` — meaning the default build, which is what every user and the
-self-hosted compiler actually run, is leaving multiples on the floor that a downstream tool can
-already find.** Nine of the fourteen losses are traced to four compiler-fixable defects with
-measured prototypes; fixing those four would flip six benchmarks and clear every Python red alert
-except one.
+`vl/deno` is **1.00** (geomean 1.04) and the median `vl/rust` is **2.29x** (geomean 2.65x). VL
+**beats deno on 16 benchmarks, ties on 15, and loses on 14** — but its losses are still heavier
+than its wins: the worst loss is **6.9x** (`strings/str-eq`) and the best win is 2.8x
+(`recursion/tailcall` at 0.35). So VL is not broadly behind V8; it is *episodically* behind V8, on
+a small number of axes that a real program hits constantly — string equality, substring search,
+and indexing an array. Against the interpreter floor VL wins by a geomean of **17.5x**, which is
+where it should be, except that **it loses outright to CPython on three benchmarks**
+(`strings/substr-search` py/vl 0.2, `strings/str-eq` 0.7, `collections/set-ops` 0.98) and is under
+2x on three more (`map-string` 1.1, `map-i32` 1.2, `word-freq` 1.7) — all six are string-hashing or
+string-comparison paths, and that clustering is not a coincidence. Against Rust, after correcting
+for the auto-vectorisation the audit found in 9 of 46 `main.rs` files, VL's *scalar* codegen is
+close (on `arith/i32-accum` the raw multiple is 5.4x but the scalar-vs-scalar multiple is ~1.4x);
+the genuine native headroom is concentrated in WasmGC array access and in the absence of any
+inlining or SIMD story. **The single most important structural finding is that `vl build -O3`
+recovers 3.0x on `algorithms/lambda-hot` and 2.9x on `collections/struct-field` — meaning the
+default build, which is what every user and the self-hosted compiler actually run, is leaving
+multiples on the floor that a downstream tool can already find.**
+
+### 1.1 What the 08-02 verdict said, and what the shipped work did to it
+
+Every figure in §1 above is the **08-03 sweep** (`bench/results/summary.md`, repo `1d3a8559`,
+PRELIMINARY). The 08-02 sweep this document was written from — and which §3 and §4 still carry —
+read:
+
+| | 08-02 (`1dd3d6a2`) | 08-03 (`1d3a8559`) |
+|---|--:|--:|
+| median `vl/deno` | 1.04 | **1.00** |
+| geomean `vl/deno` | 1.19 | **1.04** |
+| median `vl/rust` | 2.49x | **2.29x** |
+| geomean `vl/rust` | 3.04x | **2.65x** |
+| geomean `py/vl` (42 normalisable) | 15.2x | **17.5x** |
+| WIN / PAR / LOSS / PRIORITY-LOSS | 15 / 16 / 5 / 9 | **16 / 15 / 7 / 7** |
+| worst loss | `str-eq` **14.02x** | `str-eq` **6.88x** |
+| best win | `push-growth` 0.38 (2.6x) | `tailcall` 0.35 (2.8x) |
+| `-O3` gap on `lambda-hot` | 11.81x | **3.01x** |
+
+**The loss COUNT did not move — it is 14 on both sweeps.** What moved is the tier and the
+membership: the PRIORITY tier went 9 → 7, `algorithms/dispatch-table` (3.34 → 1.00) and
+`recursion/mutual` (2.37 → 1.22) left the loss list outright, and `collections/map-i32` (1.25 →
+1.33) and `algorithms/nbody` (1.21 → 1.30) slid in across the 1.25 threshold to replace them. The
+`-O3` gap on `lambda-hot` collapsed from 11.81x to 3.01x for the reason §4.2 predicted — P2 made
+the *default* build fast, so there is far less for the optimiser to recover.
+
+**The prediction in the original verdict was that fixing four compiler-fixable defects "would flip
+six benchmarks and clear every Python red alert except one". Five items shipped (P1, P2, P3, P4a,
+P5) and it half-held.** Two benchmarks left the loss list and two more crossed from PAR to WIN
+(`algorithms/map-filter-reduce` 1.01 → 0.66, `recursion/treewalk` 0.86 → 0.77) — but **not one
+Python red alert cleared**: six rows carried `PYTHON-RED-ALERT` on 08-02 and the same six carry it
+on 08-03. `str-eq` more than doubled its py/vl (0.35 → 0.74) and still loses to CPython. The
+string-layer red alerts do not close with loop-shape work; §4.6 and P12 are where they close.
 
 ---
 
@@ -116,7 +167,8 @@ flag if they are byte-identical. **Zero benchmarks raised `O3-NOOP` in the recor
 `run.sh` builds two rungs: the default and `-O3`. **The middle rung, plain `wasm-opt -O`, has never
 been measured.** So every statement of the form "`-O3` recovers 11.8x" in this document is a
 comparison against the *unoptimised* build — true as written, and not the question a release profile
-needs answered, which is "is `-O3` the best rung available".
+needs answered, which is "is `-O3` the best rung available". (That particular figure is 3.01x on the
+08-03 sweep: P2 made the *unoptimised* build fast, which is the point.)
 
 A three-rung sweep over all 46 benchmarks (interleaved min-of-3, all three rungs required to agree on
 non-empty stdout; the interesting rows re-taken at min-of-9) says it is not, and splits the failures
@@ -223,6 +275,12 @@ is the competitive number: **> 1.00 means VL, statically typed and AOT-compiled,
 dynamic language.** `py(norm)` is Python's reduced-N time × its scale factor; `-` = no valid scalar
 factor (§2.1).
 
+> **These five tables are the 08-02 sweep and are NOT re-measured.** They are kept because they
+> carry the `-O3` column and the audit context the 08-03 sweep does not restate. Under each one is
+> a **`Moved since (08-03)`** line naming every row whose `vl/deno` shifted by more than the 6.3–7%
+> noise floor **or** changed verdict tier; a row not named there did not move. Verdict thresholds
+> (`bench/run.sh`): WIN `< 0.80`, PAR `0.80–1.25`, LOSS `> 1.25`, PRIORITY-LOSS `≥ 2.00`.
+
 ### arith
 
 | benchmark | rust | **vl** | vl -O3 | deno | py(norm) | vl/rust | **vl/deno** | verdict |
@@ -240,6 +298,11 @@ factor (§2.1).
 Scalar arithmetic is **healthy**. VL never loses to deno here and beats it on four of nine. The
 `i32-accum` / `i64-accum` / `bitcount` Rust columns are SIMD- or host-ISA-inflated (§2.6). Note
 `mixed-width`'s `-O3` column: 195 → 474 ms, the **worst `-O3` regression in the suite**.
+
+**Moved since (08-03):** `i64-accum` 0.50 → **0.57** (still WIN, still the category's best);
+`mixed-width` 0.76 → **0.80**, which is under the noise floor but lands exactly ON the WIN/PAR
+boundary and so is scored **PAR** now — a threshold straddle, not a regression. The category's
+character is unchanged: still zero losses, still four wins.
 
 ### arrays
 
@@ -260,6 +323,14 @@ megamorphic-loads too), not the ones where VL is fast. `push-growth` (0.38) is t
 win — geometric list growth is genuinely good. `binsearch` carries an `-O3` **regression** (1464 →
 1802 ms).
 
+**Moved since (08-03) — this is P5's category, and P5 (#1333) landed:** `reverse-inplace` 2.19 →
+**1.51**, out of the PRIORITY tier into plain LOSS; `struct-soa` 2.50 → **2.25**; `sort-heap` 1.66
+→ **1.51**; `fill-sum` 0.70 → **0.61**. Two rows moved the *other* way and neither is P5's:
+`push-growth` 0.38 → **0.45**, which costs it the "biggest win in the suite" title (`tailcall`
+0.35 now holds it), and `struct-aos` 0.60 → **0.65**. `matmul` (2.72 → 2.80) and `binsearch` (0.73
+→ 0.70) did not move. **The family is still the family** — P5 took the header re-load out and the
+Cranelift `array.get` lowering underneath it (§4.5) is untouched.
+
 ### strings
 
 | benchmark | rust | **vl** | vl -O3 | deno | py(norm) | vl/rust | **vl/deno** | verdict |
@@ -277,6 +348,13 @@ CPython. Note the shape: VL's raw per-character scan (`char-scan` 0.86, `token-c
 other three runtimes drop into a byte-oriented builtin (SIMD `memcmp`, Boyer-Moore `indexOf`) and
 VL stays in the element-at-a-time world. **`strings/concat-build` is VOID** and excluded (§3.1).
 
+**Moved since (08-03) — P3 and P4a (#1328) landed:** `str-eq` 14.02 → **6.88** deno / 50.09 →
+**24.19** rust / py/vl 0.35 → **0.74**; `substr-search` 8.49 → **5.17** deno / 28.22 → **17.21**
+rust / py/vl 0.13 → **0.21**. `char-scan` 0.86 → **0.92** is the only other move and is at the
+noise floor. **Both are still PRIORITY losses and both still lose to CPython** — halving them was
+not enough to clear either red alert, which is the finding, not a footnote (see §5's "What #1328
+changed, and what it did NOT"). This is still the worst category in the suite.
+
 ### collections
 
 | benchmark | rust | **vl** | vl -O3 | deno | py(norm) | vl/rust | **vl/deno** | verdict |
@@ -289,9 +367,17 @@ VL stays in the element-at-a-time world. **`strings/concat-build` is VOID** and 
 | `struct-array-scan` | 260.2 | **752.9** | 673.9 | 1013.1 | 11298.5 | 2.89 | **0.74** | WIN |
 | `struct-alloc` | 671.0 | **282.1** | 284.3 | 475.5 | 6905.3 | 0.42 | **0.59** | WIN |
 
-**All four Python red alerts live here.** `struct-alloc` is the suite's most interesting win — VL is
-**2.4x FASTER than `rustc -O`** on allocation-heavy tree building (0.42x of Rust), because wasmtime's
-bump allocator beats malloc. `struct-field` carries a 2.90x `-O3` gap.
+**All four collections Python red alerts live here.** `struct-alloc` is the suite's most
+interesting win — VL is **2.4x FASTER than `rustc -O`** on allocation-heavy tree building (0.42x of
+Rust), because wasmtime's bump allocator beats malloc. `struct-field` carries a 2.90x `-O3` gap.
+
+**Moved since (08-03) — nothing shipped against this category, and it shows.** Every row is inside
+the noise floor, but three sit on thresholds and re-scored: `map-string` 2.00 → **2.03** crosses
+INTO PRIORITY-LOSS; `map-i32` 1.25 → **1.33** crosses PAR → LOSS; `set-ops` 2.51 → **2.32** and
+`word-freq` 1.59 → **1.70** stay in tier. Read these as scoring noise on an unmoved category, not
+as a regression — **and as the reason the string-hashing family (§4.6) is now the largest untouched
+block of compiler-fixable loss in the suite.** P7's unroll (#1342) landed after this sweep and is
+not in these numbers.
 
 ### algorithms
 
@@ -309,6 +395,14 @@ The **function-value family** (`lambda-hot`, `dispatch-table`, `map-filter-reduc
 **whole-program** benchmarks. On real numeric programs with no function values in the loop
 (`mandelbrot` 1.09, `binarytrees` 0.94, `nbody` 1.21) VL is level with V8 and within 1.1–2.2x of
 Rust — that is the honest picture of VL's baseline codegen.
+
+**Moved since (08-03) — this is P2's category, and P2 (#1326) landed. It is the largest movement
+in the suite:** `lambda-hot` 11.07 → **2.55** deno / 19.05 → **4.60** rust; `dispatch-table` 3.34 →
+**1.00**, PRIORITY-LOSS → **PAR, off the loss list entirely**; `map-filter-reduce` 1.01 → **0.66**,
+PAR → **WIN** — that last one is `emitMfInvoke` paying the 9.4 ns libcall once per element, exactly
+as §5's P2 entry said it would. Two rows moved without P2's help: `nbody` 1.21 → **1.30** crosses
+PAR → LOSS and `binarytrees` 0.94 → **0.87**, both at the noise floor. **`lambda-hot` is still a
+PRIORITY loss** — the row improved 4.34x against deno and what is left is still 2.55x behind it.
 
 ### recursion
 
@@ -330,6 +424,12 @@ residual 1.2–1.5x. That residual is the wasmtime/Cranelift scalar-loop floor, 
 defect. The two rows with a real problem — `tailcall` (10.16x Rust despite beating deno) and
 `mutual` — are one instruction away from being fixed (§5, P1).
 
+**Moved since (08-03) — P1 (#1324) landed, and it is the cleanest confirmed prediction in the
+document:** `mutual` 2.37 → **1.22**, PRIORITY-LOSS → **PAR, off the loss list**, against a filed
+prototype of 1.97x; `tailcall` 0.73 → **0.35**, now the **best win in the suite**, against a filed
+prototype of 2.06x. `treewalk` 0.86 → **0.77** crosses PAR → WIN and `ackermann` 0.39 → **0.36** is
+at the noise floor; nothing else moved. The category now has **zero losses**.
+
 ### 3.1 VOID: `strings/concat-build`
 
 Excluded from every table. **The Rust column measures literally nothing** — min-of-7 pinned wall
@@ -347,14 +447,29 @@ every append.
 
 ## 4. The losses, ranked
 
-Fourteen benchmarks lose to deno. Nine are PRIORITY (≥ 2.0x). Each is stated with its root cause and
-its class: **compiler-fixable** (VL's emitter can close it), **runtime-engine** (Cranelift/wasmtime
-owns it), or **language-design** (the representation has to change).
+**This ranking is the 08-02 order. Fourteen benchmarks lost to deno and nine were PRIORITY
+(≥ 2.0x); on 08-03 fourteen still lose but only seven are PRIORITY.** Each heading below carries
+`08-02 → 08-03` so the ordering can be read against the sweep it was ranked on. Each item is stated
+with its root cause and its class: **compiler-fixable** (VL's emitter can close it),
+**runtime-engine** (Cranelift/wasmtime owns it), or **language-design** (the representation has to
+change).
 
-### 4.1 `strings/str-eq` — 14.02x deno, 50.1x rust, **0.35x python** · compiler-fixable + language-design
+**What the list looks like on 08-03**, in order — `str-eq` 6.88 · `substr-search` 5.17 · `matmul`
+2.80 · `lambda-hot` 2.55 · `set-ops` 2.32 · `struct-soa` 2.25 · `map-string` 2.03 (the seven
+PRIORITY rows) · `word-freq` 1.70 · `sort-heap` 1.51 · `reverse-inplace` 1.51 · `spectralnorm`
+1.48 · `map-i32` 1.33 · `nbody` 1.30 · `int-format` 1.27. **`algorithms/dispatch-table` (§4.4) and
+`recursion/mutual` (§4.7) are no longer losses at all** — their sections are kept as the record of
+what fixed them.
 
-**The worst row in the suite, and the only one that loses to CPython by 3x.** 24M comparisons of
-64-char strings at ~79 ns each in VL vs ~5.6 ns in V8. `-O3` does nothing (1.01x).
+### 4.1 `strings/str-eq` — 14.02x → **6.88x** deno, 50.1x → **24.19x** rust, **0.35x → 0.74x python** · compiler-fixable + language-design
+
+> **P3 (#1328) shipped the 8x unroll this section prescribes and measured 2.08x** (1970 → 945 ms),
+> which is what took 14.02 → 6.88. Everything below about the *representation* still holds: the row
+> is **still the worst in the suite and still loses to CPython**. The unroll removed loop control;
+> it did not remove 4 bytes of GC-array traffic per ASCII character. §5's P12 is the rest.
+
+**The worst row in the suite, and on 08-02 the only one that lost to CPython by 3x.** 24M
+comparisons of 64-char strings at ~79 ns each in VL vs ~5.6 ns in V8. `-O3` does nothing (1.01x).
 
 97% of the benchmark is `__str_eq__`'s content-compare loop (per-phase: identity 32 ms, equal-content
 748 ms, early-mismatch 400 ms, late-mismatch 783 ms — 1963 ms of a 2014 ms run). **Two stacked
@@ -391,7 +506,13 @@ compare in 2.9–4.5 ns in this exact process.
 
 Full write-up: `bench/findings/bench-strings-str-eq.md`.
 
-### 4.2 `algorithms/lambda-hot` — 11.07x deno, 19.1x rust · compiler-fixable
+### 4.2 `algorithms/lambda-hot` — 11.07x → **2.55x** deno, 19.1x → **4.60x** rust · compiler-fixable
+
+> **P2 (#1326) shipped exactly the change this section prescribes** and measured 4.50–4.68x on this
+> benchmark (§5's P2 filing said 5.4x — "real, but a sixth smaller"). It is still a PRIORITY loss.
+> The paragraph below on why `-O3` "appeared to fix it" is now visible in the other direction: the
+> `-O3` gap fell 11.81x → **3.01x**, because binaryen's devirtualisation had far less left to
+> recover once the default build stopped paying the libcall.
 
 **A single instruction: `struct.get $closure 0`, where VL declares field 0 of its closure
 fat-pointer as a `funcref`.** In wasmtime 47 a GC-struct field load of func top-type does **not**
@@ -429,7 +550,11 @@ devirtualised at all — which is exactly why `dispatch-table` (§4.3) reads `-O
 
 Full write-up: `bench/findings/bench-algorithms-lambda-hot.md`.
 
-### 4.3 `strings/substr-search` — 8.49x deno, 28.2x rust, **0.13x python** · compiler-fixable
+### 4.3 `strings/substr-search` — 8.49x → **5.17x** deno, 28.2x → **17.21x** rust, **0.13x → 0.21x python** · compiler-fixable
+
+> **P4a (#1328) shipped the first-char skip** and measured 1.67x (1114 → 666 ms) against its
+> prototyped 1.69x. **P4b (BMH) was measured and REFUTED** — see §5. The row is still a PRIORITY
+> loss and still the worst py/vl in the suite.
 
 `String.indexOf` is inlined by `emitStrIndexOf` (`compiler/wasmEmit.vl:7437`) as a textbook naive
 O(n·m) scan with **no skip heuristic**, and it re-loads the needle character from its GC array every
@@ -455,7 +580,14 @@ table builds = 275 ms (88 ns each), so unconditional BMH would be a ~4x regressi
 
 Full write-up: `bench/findings/bench-strings-substr-search.md`.
 
-### 4.4 `algorithms/dispatch-table` — 3.34x deno, 8.4x rust · compiler-fixable
+### 4.4 `algorithms/dispatch-table` — 3.34x → **1.00x** deno, 8.4x → **2.79x** rust · **CLOSED by P2 (#1326)**
+
+> **This is no longer a loss.** P2 measured 2.98–3.23x here and the row went PRIORITY-LOSS → PAR,
+> landing at a dead heat with deno. The section is kept because it is the load-bearing evidence for
+> *why* the funcref field had to go — its `-O3` reading of 0.97x is what proved the cost was an
+> opaque libcall rather than anything binaryen could optimise, which `lambda-hot`'s 11.8x `-O3` gap
+> had disguised. **P2's win is bigger at `-O3` than at the default here** (4.75–4.90x), the reverse
+> of `lambda-hot`.
 
 **Same root cause as `lambda-hot`**, reached by a different route and *not* rescued by `-O3` (0.97x).
 Bisection on the compiler's own WAT (one change each, output unchanged): control 645 ms; drop the
@@ -481,7 +613,13 @@ if/else chain.
 
 Full write-up: `bench/findings/bench-algorithms-dispatch-table.md`.
 
-### 4.5 `arrays/matmul` 2.72x · `arrays/struct-soa` 2.50x · `arrays/reverse-inplace` 2.19x · `algorithms/spectralnorm` 1.53x · `arrays/sort-heap` 1.66x — **the array-indexing family** · mostly runtime-engine
+### 4.5 `arrays/matmul` 2.72 → **2.80** · `arrays/struct-soa` 2.50 → **2.25** · `arrays/reverse-inplace` 2.19 → **1.51** · `algorithms/spectralnorm` 1.53 → **1.48** · `arrays/sort-heap` 1.66 → **1.51** — **the array-indexing family** · mostly runtime-engine
+
+> **P5 (#1333) shipped the 9.9% half of this section** — the list-header hoist — and measured
+> `reverse-inplace` −20.6% / `matmul` −7.2%, the family −4% to −21% at default opt. Only
+> `reverse-inplace` left the PRIORITY tier. **The family survives intact because its dominant term
+> was never ours**: the 3.41x Cranelift `array.get` lowering below is untouched, and §5's P13
+> (linear-memory scalar arrays) is the only item that addresses it.
 
 One cause, five benchmarks. Neither `-O3` (1.01x on matmul) nor any hand-written `opt.vl` (0.99x)
 moves it, so it is below the source level entirely.
@@ -532,10 +670,18 @@ iteration — and its `toplevel.vl` measures identical (1.01x), which rules out 
 
 Full write-up: `bench/findings/bench-arrays-matmul.md`.
 
-### 4.6 `collections/set-ops` 2.51x · `map-string` 2.00x · `word-freq` 1.59x · `map-i32` 1.25x — **the string-hashing family** · compiler-fixable
+### 4.6 `collections/set-ops` 2.51 → **2.32** · `map-string` 2.00 → **2.03** · `word-freq` 1.59 → **1.70** · `map-i32` 1.25 → **1.33** — **the string-hashing family** · compiler-fixable
 
-**All four Python red alerts.** Normalised CPython is 1.33x **faster** than VL on `set-ops`
-(py/vl 0.75), and VL is only 1.21x / 1.78x / 1.36x ahead on the other three.
+> **Nothing had shipped against this family when the 08-03 sweep ran, and every row is unmoved
+> beyond scoring noise. It is now the largest untouched block of compiler-fixable loss in the
+> suite** — four of the fourteen losses, three of them PRIORITY, all four red alerts.
+> **P7's 4-wide `__str_hash__` unroll (#1342) landed after this sweep** and is not in these
+> numbers; it is worth 1.135x on hash-dominated work, so it moves these rows but does not close
+> them. **The hash CACHE — the item that would attack the length-proportionality measured
+> below — is still fully open** (§5, P7b).
+
+**All four collections Python red alerts.** Normalised CPython is 1.33x **faster** than VL on
+`set-ops` (py/vl 0.75), and VL is only 1.21x / 1.78x / 1.36x ahead on the other three.
 
 **VL recomputes a string's hash on every map/set probe, and the hash is length-proportional over the
 `array i32` code-point storage.** V8 and CPython both cache the hash in the string object. Isolated
@@ -557,7 +703,11 @@ That `map-i32` — the dedicated **monomorphic i32 key representation** from the
 lands at 1.25x deno and only 1.36x CPython is a separate finding: the specialised rep did not buy
 what was expected.
 
-### 4.7 `recursion/mutual` — 2.37x deno, 2.8x rust · compiler-fixable, **already root-caused**
+### 4.7 `recursion/mutual` — 2.37x → **1.22x** deno, 2.8x → **1.44x** rust · **CLOSED by P1 (#1324)**
+
+> **This is no longer a loss** — PRIORITY-LOSS → PAR. P1 measured 1.96x here against the 1.97x
+> prototyped below, and 2.01x on `recursion/tailcall` against 2.06x prototyped. The prediction in
+> this section is the most exactly confirmed one in the document, which is why it is kept verbatim.
 
 Both legs of the cycle are tail calls and **VL emits a plain `call`.** Patching the two
 `(return (call $n))` into `(return_call $n)` in VL's **own** emitted module and running it on the
@@ -565,7 +715,9 @@ Both legs of the cycle are tail calls and **VL emits a plain `call`.** Patching 
 whole gap to deno. `-O3` recovers only 1.23x, by inlining one leg. Same defect as
 `recursion/tailcall`, which reads 10.16x of Rust and 2.02x idiom-gap despite *beating* deno.
 
-### 4.8 `strings/int-format` — 1.28x deno · library-quality
+### 4.8 `strings/int-format` — 1.28x → **1.27x** deno · library-quality
+
+> Unmoved. Nothing has shipped against it.
 
 Two findings. (1) The builtin `toString(i32)` is 1.28x behind V8's `String(v)` — modest. (2) Much
 worse: `stdfmt.vl`, which uses `std:fmt`'s pure-VL `toStr()`, measures **4477 ms — 5.3x slower than
@@ -583,14 +735,15 @@ VL's own emitted module (or hand-written `.wat` assembled with `wasm-as`) was ru
 
 | # | item | site | measured win | conf | effort |
 |---|---|---|--:|---|---|
-| **P1** | emit `return_call` in tail position | `compiler/wasmEmit.vl:11272 emitReturnValue` (+ a new `fbReturnCall` in `compiler/emit_bytes.vl`, alongside `fbCall` at :526) | **2.06x** tailcall, **1.97x** mutual, recursion depth 16.2k → ≥ 5M | prototyped | **XS** |
-| **P2** | closure fat-pointer: drop the `funcref` field, dispatch via `call_indirect` on the id it already stores | `compiler/emit_sections.vl:2490` (elem segment), `:3536` (struct type); `compiler/wasmEmit.vl:1362 emitClosureValueCore`, read sites `:9308`, `:11181 emitMfInvoke`, `:14549` | **5.4x** lambda-hot, **3.3x** dispatch-table, **−9.4 ns per element on every `.map`/`.filter`**, **−41 ns per closure allocation, program-wide** | prototyped | **M** |
+| ~~**P1**~~ | ~~emit `return_call` in tail position~~ **SHIPPED #1324** | `wasmEmit.vl emitReturnValue` (+ `fbReturnCall` in `emit_bytes.vl`) | **2.01x** tailcall, **1.96x** mutual measured (vs 2.06x / 1.97x prototyped); recursion depth 16.2k → **5M** | **DONE** | — |
+| ~~**P2**~~ | ~~closure fat-pointer: drop the `funcref` field, dispatch via `call_indirect` on the id it already stores~~ **SHIPPED #1326** | `emit_sections.vl` (elem segment, struct type); `wasmEmit.vl emitClosureValueCore`, `emitMfInvoke` + the read sites | **4.50–4.68x** lambda-hot, **2.98–3.23x** dispatch-table, **−8.5 to −9.2 ns per `.map` element**, **−51.7 ns per closure allocation** (the filing said 5.4x / 3.3x / −9.4 ns / −41 ns: the two benchmark figures were **too high**, the allocation figure **too low**) | **DONE** | — |
 | ~~**P3**~~ | ~~unroll `__str_eq__`'s element loop 8x~~ **SHIPPED #1328** | `emit_sections.vl emitStrEqFnCode` | **2.08x** measured (1970 → 945 ms), vs the 2.17x prototype | **DONE** | — |
 | ~~**P4a**~~ | ~~`indexOf`: hoist `needle[0]` + first-char skip~~ **SHIPPED #1328** | `wasmEmit.vl emitStrIndexOf` | **1.67x** measured (1114 → 666 ms), vs the 1.69x prototype | **DONE** | — |
 | **P4b** | `indexOf`: Boyer-Moore-Horspool above a length gate | `compiler/wasmEmit.vl emitStrIndexOf` | **REFUTED ON MEASUREMENT (#1333)** — would not clear CPython even at its own prototyped 3.13× | **NOT taken; see below** | M |
 | ~~**P5**~~ | ~~hoist the list header's backing ref + `len`~~ **SHIPPED #1333** | `wasmEmit.vl emitListIdxGuard` | **reverse-inplace −20.6%, matmul −7.2%**, whole array family −4% to −21% at default opt | **DONE** | — |
 | **P6** | fuse `a / b` and `a % b` on the same operands — lower the remainder as `a − q*b` | i32 div/rem emit in `compiler/wasmEmit.vl` | **1.99x** intdivmod | measured A/B, **SOUNDNESS-GATED** | **S** |
-| **P7** | cache a string's hash instead of recomputing it per probe | `compiler/emit_sections.vl:1743 emitStrHashFnCode`, `:1931 emitMapProbeFnCode`; requires a hash slot in the string rep | up to **4.6x** on long keys; clears 3 of 4 Python red alerts | measured, **site not pinned** | **L** |
+| ~~**P7a**~~ | ~~unroll `__str_hash__`'s FNV walk 4 wide~~ **SHIPPED #1342** | `emit_sections.vl emitStrHashFnCode` (+ `fbStrHashStep`) | **1.135x** measured on hash-dominated insertion (109 → 96 ms); 2.13 → **1.10 ns per code point** on the walk itself | **DONE** | — |
+| **P7b** | **cache** a string's hash instead of recomputing it per probe | `compiler/emit_sections.vl emitStrHashFnCode`, `emitMapProbeFnCode`; requires a hash slot in the string rep | filed at up to **4.6x** on long keys; clears 3 of 4 Python red alerts — **both figures predate P7a and neither has been re-measured** | measured (pre-P7a), **site not pinned** | **L** |
 | **P8** | `s = s + c` is O(n²) — `__str_concat__` allocates a fresh array and does 2 `array.copy` per append | `compiler/emit_sections.vl:1881 emitStrConcatFnCode`, `compiler/wasmEmit.vl:6647 emitStrConcat` | asymptotic: N-doubling costs VL 3.5x vs 1.6–1.9x elsewhere | measured | **L** |
 
 ### What #1328 changed, and what it did NOT
@@ -669,12 +822,19 @@ floor of −2.1%. And the **fuzz A/B is structurally inert for P5** — 800 gene
 | **P9** | inline small leaf functions in the **default** build | the `-O3`-gap family | **2.90x** struct-field, **1.80x** map-filter-reduce, 8–13% sort-heap | measured via `-O3` A/B | **L** |
 | **P10** | top-level `const` emits a **mutable** wasm global | global emit path | not separately measured; blocks constant-folding a loop bound | `wasm-dis` witness | **XS** |
 | **P11** | fix the two `-O3` **regressions** before the release profile is trusted | `docs/internals/opt-profile-design.md` pipeline | `mixed-width` **2.43x SLOWER**, `binsearch` **1.23x SLOWER** | measured | **S** (gate) |
-| **P12** | UTF-8 bytes in linear memory for `string` | representation | **27.7x** on the compare itself; would also fix P7 and P8 | prototyped at `.wat` level | **XL** |
+| **P12** | UTF-8 bytes in linear memory for `string` | representation | **27.7x** on the compare itself; would also fix P7b and P8 | prototyped at `.wat` level | **XL** |
 | **P13** | linear-memory backing store for scalar arrays (`i32[]`/`i64[]`/`f32[]`/`f64[]`) | representation | **3.41x** on matmul's kernel; sidesteps the Cranelift bug entirely | prototyped at `.wat` level | **XL** |
 
-### P1 — `return_call` (do this first; it is the cheapest certain win in the suite)
+### P1 — `return_call` — **SHIPPED #1324**
 
-VL never emits wasm `return_call` for a call in tail position. `wasm-dis` of `bench/recursion/tailcall/main.wasm` shows
+> Measured on the shipped emitter, interleaved min-of-5: `tailcall` 1179.8 → **585.5 ms (2.01x)**
+> at the default and 1161.8 → 581.3 (2.00x) at `-O3`; `mutual` 1557.6 → **793.4 ms (1.96x)**. The
+> emitted module for `bench/recursion/tailcall` is **byte-identical to the hand-patched prototype**
+> described below. `digestTail(5_000_000, 0)` now prints instead of trapping, pinned as
+> `tests/cases/functions/tail-call-depth.vl`. Full write-up: `perf-program.md` §12. The filing is
+> kept because the prototype it describes is what the shipped emitter reproduces byte-for-byte.
+
+VL never emitted wasm `return_call` for a call in tail position. `wasm-dis` of `bench/recursion/tailcall/main.wasm` shows
 `(return (call $0 (i32.sub (local.get $0) (i32.const 1)) ...))`. Rebuilding that same module with the
 one instruction changed via `wasm-as --enable-tail-call` and running it on the unmodified `vl` host:
 **1.313 s → 0.638 s (2.06x)** on `tailcall` and **0.971 s → 0.494 s (1.97x)** on `mutual`, both
@@ -689,7 +849,14 @@ still shows `call $0`. `emit_bytes.vl` has no `fbReturnCall`; that is the one ne
 It matches `opt.vl` exactly (594.5 ms vs the prototype's 638 ms, inside noise), so **no user
 contortion would be needed after the fix** — see §6.
 
-### P2 — closure dispatch (the largest blast radius)
+### P2 — closure dispatch (the largest blast radius) — **SHIPPED #1326**
+
+> Measured across three interleaved min-of-5 passes: `lambda-hot` **4.50–4.68x**, `dispatch-table`
+> **2.98–3.23x** (and **4.75–4.90x** at `-O3`), **−8.5 to −9.2 ns per `.map` element**, closure
+> creation **52.6 → 0.87 ns**. Two of the filed figures did not survive: `lambda-hot`'s 5.4x and
+> `dispatch-table`'s 3.3x were **too high**, while −41 ns per allocation was **26% too low**. The
+> claim "the self-hosted compiler itself uses closures" was **refuted**. Full write-up:
+> `perf-program.md` §13.
 
 Stop putting the code pointer in a GC-struct `funcref` field. **Field 2 of the closure record already
 holds `gImports + fe`, the wasm function index** (`fbI32Const(gImports + fe)`, kept only as the `==`
@@ -773,15 +940,64 @@ loop has zero calls so the analysis is trivial. **This is the transform V8 perfo
 424 ms = noise) where wasmtime charges 10.6%. `wasm-opt -O3` recovers none of it — it will not hoist
 a `struct.get` past an `array.set` it cannot prove non-aliasing.
 
-### P7 — string hash caching (site not pinned; be honest about that)
+### P7 was filed as ONE item and is TWO. Do not read the shipped number as the filed one.
 
-The witness is the key-length sweep in §4.6, which is unambiguous about the *behaviour*. The
-*implementation* was not traced to a line: `emitStrHashFnCode` (`compiler/emit_sections.vl:1743`)
-computes a masked non-negative FNV-1a over the code-point array, and `emitMapProbeFnCode` (`:1931`)
-calls it per probe. Note `emitMapProbeI32FnCode` (`:2015`) already has a **stored-hash** notion, so
-the map side may already be half-built; **what is missing is a place to cache the hash on the string
-itself.** That is a representation change (a mutable `hash` slot alongside the code-point array, or
-P12's linear-memory string), which is why this is L and not S.
+**P7 was filed as "cache a string's hash instead of recomputing it per probe", at up to 4.6x.
+What shipped under the name P7 is not that.** #1342 shipped a 4-wide unroll of the FNV walk, worth
+1.135x. The cache is untouched and still carries its own, much larger, unrealised number. They are
+split here as **P7a** (shipped) and **P7b** (open) so the two can never again be mistaken for each
+other.
+
+#### P7a — `__str_hash__` unrolls FOUR WIDE — **SHIPPED #1342**
+
+`emitStrHashFnCode` hashed one code point per loop iteration; it now does four, with a scalar
+remainder loop for the tail — the same shape `__str_eq__` took in P3. The step is factored into
+`fbStrHashStep(k)` and **shared** by the unrolled block and the remainder, so the two cannot drift
+into hashing differently (that failure mode is a silently wrong hash, not a crash). `lim = n - 4`
+is a **subtraction** deliberately: `n` is an `array.len`, so a gate written `i + 4 <= n` could wrap
+on a maximal-length string.
+
+| | min |
+|---|--:|
+| master | 109 ms |
+| shipped | **96 ms** |
+| | **1.135x** |
+
+Hash-dominated insertion (30k distinct long string keys × 10 rounds), interleaved min-of-9, outputs
+asserted identical, **taken at load 3.86 on a shared box, so it is a lower bound** — and it is above
+the suite's 7% noise floor. On a 1k-entry / 8M-lookup probe at 46-char keys the walk itself goes
+**2.13 → 1.10 ns per code point**.
+
+**FNV is a serial dependency chain** — each `i32.mul` waits on the previous `h` — so the unroll
+cannot overlap the arithmetic; what it removes is per-element loop control, plus hoisting `n`
+(a reference local lives in a stack-map slot, so `local.get 0; array.len` is a memory load every
+iteration). **Widening to eight is measurably WORSE and no further unroll can help**: at ~3
+cycles/point the loop is now `i32.mul`-latency-bound, not overhead-bound.
+
+**#1325's module-wide loop-shape gate fired again, on `__str_hash__` this time**, and was verified
+per function rather than bumped — `binsearch-probe` contains zero string operations and never calls
+the helper, so the added loop is unreachable from it. That is the **second** false positive from the
+same counter (P3's unroll was the first); the tightening filed at
+`tests/selfhost_native_release_test.ts` is now twice-evidenced.
+
+#### P7b — the hash CACHE (site still not pinned; be honest about that) — **OPEN**
+
+**Nothing about the cache shipped.** The witness is the key-length sweep in §4.6, which is
+unambiguous about the *behaviour*: VL scales linearly with key length (~2.6 ns per code point
+pre-P7a) where V8 and CPython are flat. The *implementation* was never traced to a line:
+`emitStrHashFnCode` computes a masked non-negative FNV-1a over the code-point array and
+`emitMapProbeFnCode` calls it per probe. Note `emitMapProbeI32FnCode` already has a **stored-hash**
+notion, so the map side may already be half-built; **what is missing is a place to cache the hash on
+the string itself.** That is a representation change (a mutable `hash` slot alongside the code-point
+array, or P12's linear-memory string), which is why this is L and not S.
+
+**Re-price it before taking it.** The filed "up to 4.6x on long keys / clears 3 of 4 Python red
+alerts" was derived from the §4.6 sweep, which is **pre-P7a**: P7a already took the per-code-point
+walk roughly in half, so the length-proportionality P7b attacks is smaller than it was and the
+residual has not been measured. P7a's own instrumentation puts a further bound on it — **at short
+keys the whole walk is ~11 ns of a ~63 ns probe**, so a cache cannot be worth more than that on
+short-key workloads however perfect it is. The long-key case is where the item lives; that is the
+measurement to take first.
 
 ### P11 — the `-O3` regressions. **NOT the release profile's fault, and the name is misleading.**
 
@@ -798,8 +1014,9 @@ then spills the carried values; V8 does not. The failure is gated by loop **shap
 not ours.
 
 **That gate's counter is MODULE-WIDE** (`tests/selfhost_native_release_test.ts`) — it fired on #1328
-because `__str_eq__` gained an unroll remainder, while the probe it was supposed to be watching
-(`binsearch-probe`, zero string ops) was untouched. Get per-function loop counts before believing it.
+because `__str_eq__` gained an unroll remainder, and again on #1342 because `__str_hash__` did,
+while the probe it was supposed to be watching (`binsearch-probe`, zero string ops) was untouched
+both times. Get per-function loop counts before believing it.
 
 The three-rung sweep in §2.4a confirms the ruling on a wider population — seven benchmarks are worse
 at BOTH optimized rungs, not two — **and separates out a second class P11 does not cover**:
@@ -823,6 +1040,26 @@ That one IS a profile question rather than an upstream one. `run.sh` now raises 
 **Every entry here is a DEFECT.** The project's goal is that users must not need hacks to get good
 performance, so a gap between `main.vl` and a contorted variant is filed, never recommended. `opt.vl`
 exists as *documentation of the gap*.
+
+> **Superseded where the shipped work closed a gap.** This table is the 08-02 sweep; the 08-03
+> variant table (`bench/results/summary.md`, "Extra VL spellings") reads:
+>
+> | benchmark | gap 08-02 | gap 08-03 | |
+> |---|--:|--:|---|
+> | `algorithms/lambda-hot` opt | 8.98x | **2.03x** | P2 |
+> | `recursion/tailcall` opt | 2.02x | **1.00x** | **P1 CLOSED IT EXACTLY**, as the row below predicted |
+> | `arith/f64-accum` main_global | 1.55x | **0.99x** | the globals cliff is GONE on f64 |
+> | `arith/i64-accum` main_global | 1.41x | **1.16x** | reduced, still surviving |
+> | `arith/i32-accum` opt | 2.05x | 2.16x | unmoved |
+> | `arith/intdivmod` opt | 2.03x | 2.03x | unmoved — P6 is still open and soundness-gated |
+> | `collections/struct-array-scan` opt | 1.37x | 1.35x | unmoved |
+> | `strings/slice-extract` opt | 1.31x | 1.30x | unmoved |
+> | `strings/int-format` stdfmt | 5.3x | 5.4x | unmoved |
+>
+> `strings/str-eq` inverts: its `opt.vl` is now **slower** than the idiom (0.74x), because P3 gave
+> the compiler the unroll the hack existed to supply. The `str-eq streq8` and `substr-search` BMH
+> rows below were never in a sweep's variant table (§6's own preamble says so) and have not been
+> re-measured.
 
 Rows are from the recorded sweep's variant table unless noted. Two are **not**:
 `bench/strings/str-eq/opt.vl` and the `substr-search` BMH probe were written by the follow-up
@@ -850,22 +1087,22 @@ absolutes) and they do not appear in `bench/results/summary.md`.
 Briefed as 1.6–3.2x. **At this commit it is largely GONE and it is not this suite's to fix** (#1321
 landed in this tree), but it was measured on 8 probe pairs and it **survives on the wide scalars**:
 
-| probe pair | ratio | |
-|---|--:|---|
-| `arith/f64-accum` main vs `main_global` | **1.55x** | **survives** |
-| `arith/i64-accum` main vs `main_global` | **1.41x** | **survives** |
-| `arrays/fill-sum` main vs `toplevel` | 1.00x | gone |
-| `arrays/reverse-inplace` main vs `toplevel` | 1.01x | gone |
-| `collections/map-i32` main vs `toplevel` | 0.95x | gone |
-| `collections/struct-field` main vs `toplevel` | 1.01x | gone |
-| `strings/char-scan` main vs `globals` | 0.97x | gone |
-| `strings/token-count` main vs `globals` | 1.05x | gone |
+| probe pair | ratio 08-02 | ratio 08-03 | |
+|---|--:|--:|---|
+| `arith/f64-accum` main vs `main_global` | **1.55x** | **0.99x** | **now GONE** |
+| `arith/i64-accum` main vs `main_global` | **1.41x** | **1.16x** | **reduced, still survives** |
+| `arrays/fill-sum` main vs `toplevel` | 1.00x | 0.95x | gone |
+| `arrays/reverse-inplace` main vs `toplevel` | 1.01x | 0.98x | gone |
+| `collections/map-i32` main vs `toplevel` | 0.95x | 1.09x | gone |
+| `collections/struct-field` main vs `toplevel` | 1.01x | 1.03x | gone |
+| `strings/char-scan` main vs `globals` | 0.97x | 0.87x | gone |
+| `strings/token-count` main vs `globals` | 1.05x | 1.05x | gone |
 
 The seven recursion benchmarks that spell their hot loop at top level are **not** penalised for it
-(`flatcall` top-level 1.477 s vs the same code in a function 1.470 s). **Writing a script at top
-level — the most natural VL spelling — still costs 1.4–1.55x on i64/f64 accumulation**, and
-`vl build -O3` is not a workaround: `wasm-dis` of the `-O3` module still counts all six
-`global.get`/`global.set` in the loop body.
+(`flatcall` top-level 1.477 s vs the same code in a function 1.470 s). On 08-02 writing a script at
+top level still cost 1.4–1.55x on i64/f64 accumulation; **on 08-03 the f64 half is inside the noise
+floor and only the i64 half survives, at 1.16x.** `vl build -O3` was never a workaround:
+`wasm-dis` of the `-O3` module still counts all six `global.get`/`global.set` in the loop body.
 
 Related and unfixed: **top-level `const` emits a MUTABLE wasm global** (P10) —
 `(global $global$0 (mut i64) (i64.const 1000000000))` for `const n: i64 = 1_000_000_000`, so the
@@ -876,12 +1113,13 @@ trip count is re-read every iteration and nothing can constant-fold it.
 Where `vl build -O3` is much faster than the default build, **the default build is the idiom and
 users are paying for not knowing a flag**:
 
-| benchmark | default | `-O3` | gap |
-|---|--:|--:|--:|
-| `algorithms/lambda-hot` | 2155.7 | 182.5 | **11.81x** (`-O3` beats deno) |
-| `collections/struct-field` | 997.0 | 343.8 | **2.90x** (default LOSES to deno; `-O3` BEATS rustc `-O`) |
-| `algorithms/map-filter-reduce` | 923.0 | 513.0 | **1.80x** |
-| `recursion/mutual` | 1560.3 | 1269.9 | 1.23x |
+| benchmark | default (08-02) | `-O3` (08-02) | gap | gap on 08-03 |
+|---|--:|--:|--:|---|
+| `algorithms/lambda-hot` | 2155.7 | 182.5 | **11.81x** (`-O3` beats deno) | **3.01x** — P2 closed most of it in the DEFAULT build |
+| `collections/struct-field` | 997.0 | 343.8 | **2.90x** (default LOSES to deno; `-O3` BEATS rustc `-O`) | **2.92x** — unmoved, and now the largest `-O3` gap in the suite |
+| `algorithms/map-filter-reduce` | 923.0 | 513.0 | **1.80x** | **1.12x** — P2 |
+| `recursion/mutual` | 1560.3 | 1269.9 | 1.23x | **1.00x** — P1 |
+| `algorithms/dispatch-table` | 1179.3 | 1216.1 | 0.97x | **1.45x** — P2's win is bigger at `-O3` here |
 
 `vl run` has **no `-O` flag at all** (wasm-opt is wired only into `vl build -O/-O3`,
 `scripts/vl-host/src/main.rs:1355-1372`), so **the default path every user and the self-hosted
@@ -891,22 +1129,28 @@ compiler take always pays this.**
 
 ## 7. HEADROOM VS RUST
 
-Median `vl/rust` is 2.49x, geomean 3.04x — a reasonable place for a WasmGC language. The tail is
-where the information is. **After discounting the nine auto-vectorised rows (§2.6), the largest
-genuine gaps are:**
+Median `vl/rust` is **2.29x, geomean 2.65x** on the 08-03 sweep (it was 2.49x / 3.04x on 08-02) — a
+reasonable place for a WasmGC language. The tail is where the information is. **After discounting
+the nine auto-vectorised rows (§2.6), the largest genuine gaps are** (the `08-02` ranking, with the
+current figure alongside):
 
-| benchmark | vl/rust | how much is SIMD width | what is left |
-|---|--:|---|---|
-| `strings/str-eq` | 50.09 | none (Rust's is SIMD `memcmp`, but VL has no bulk path at all) | representation |
-| `strings/substr-search` | 28.22 | none (algorithm) | P4, then representation |
-| `algorithms/lambda-hot` | 19.05 | none | P2 |
-| `arrays/matmul` | 14.83 | **2.27x** | Cranelift + P5 + P13 |
-| `arrays/struct-soa` | 12.01 | 42 packed ops in `main::main` | Cranelift + P5 |
-| `arrays/fill-sum` | 11.14 | 54 packed ops | Cranelift + P5 |
-| `recursion/tailcall` | 10.16 | none | **P1** |
-| `algorithms/dispatch-table` | 8.39 | none | P2 |
-| `arrays/reverse-inplace` | 8.02 | 18 packed ops | Cranelift + P5 |
-| `algorithms/map-filter-reduce` | 7.61 | none | P2 + P9 |
+| benchmark | vl/rust 08-02 | vl/rust 08-03 | how much is SIMD width | what is left |
+|---|--:|--:|---|---|
+| `strings/str-eq` | 50.09 | **24.19** | none (Rust's is SIMD `memcmp`, but VL has no bulk path at all) | P3 shipped; representation (P12) |
+| `strings/substr-search` | 28.22 | **17.21** | none (algorithm) | P4a shipped, P4b refuted; representation |
+| `algorithms/lambda-hot` | 19.05 | **4.60** | none | **P2 shipped** |
+| `arrays/matmul` | 14.83 | **14.47** | **2.27x** | Cranelift + P13 (P5 shipped) |
+| `arrays/struct-soa` | 12.01 | **10.61** | 42 packed ops in `main::main` | Cranelift (P5 shipped) |
+| `arrays/fill-sum` | 11.14 | **9.07** | 54 packed ops | Cranelift (P5 shipped) |
+| `recursion/tailcall` | 10.16 | **5.05** | none | **P1 shipped** |
+| `algorithms/dispatch-table` | 8.39 | **2.79** | none | **P2 shipped** |
+| `arrays/reverse-inplace` | 8.02 | **7.38** | 18 packed ops | Cranelift (P5 shipped) |
+| `algorithms/map-filter-reduce` | 7.61 | **4.66** | none | P2 shipped; P9 |
+
+**The shape of this tail is the clearest single statement of what the five shipped items did.**
+Every row whose "what is left" named an emitter item moved by 2–3x; every row whose remainder is
+Cranelift's `array.get` lowering barely moved at all. The residual headroom against Rust is now
+concentrated almost entirely in the two representation items (P12, P13) and in SIMD width.
 
 ### "WasmGC cannot do this" — the hard ceiling
 
@@ -926,19 +1170,24 @@ genuine gaps are:**
 
 ### "We have not done this yet" — the roadmap
 
-In dependency order, largest first:
+In dependency order, largest first. **The two items that headed this list — P2 closure dispatch and
+P1 `return_call` — have SHIPPED (#1326, #1324), along with P3, P4a (#1328), P5 (#1333) and P7a
+(#1342). What remains:**
 
-1. **P2 closure dispatch** — 5.4x/3.3x on two benchmarks and a program-wide `.map`/`.filter` tax.
-2. **P1 `return_call`** — 2x on two benchmarks plus a 300x recursion-depth ceiling lift.
-3. **P12 UTF-8 strings in linear memory** — 27.7x measured on the compare itself; subsumes P3, P7
-   and P8. `std/buffer.vl` already has the machinery. This is the single largest item on the board
-   and it is a language-representation decision, not an emitter change.
-4. **P13 linear-memory backing for scalar arrays** — 3.41x measured; sidesteps the Cranelift bug
+1. **P12 UTF-8 strings in linear memory** — 27.7x measured on the compare itself; subsumes P7b and
+   P8, and is the rest of P3. `std/buffer.vl` already has the machinery. This is the single largest
+   item on the board and it is a language-representation decision, not an emitter change.
+2. **P13 linear-memory backing for scalar arrays** — 3.41x measured; sidesteps the Cranelift bug
    entirely, at the cost of explicit bounds checks and losing GC integration for scalar arrays.
-   Deserves its own design note.
-5. **P9 inlining in the default build** — `-O3` proves 2.9x is sitting there on `struct-field`.
-6. **P5 header hoisting** — 9.9%, soundly available today.
-7. **P6/P10** — small, certain, cheap.
+   Deserves its own design note. **P5 shipped the 9.9% that was available above it; this is the
+   3.41x underneath.**
+3. **P9 inlining in the default build** — `-O3` proves 2.9x is sitting there on `struct-field`.
+4. **P7b the hash cache** — the string-hashing family (§4.6) is now the largest untouched block of
+   compiler-fixable loss in the suite, and P7a's unroll did not dent it. Re-price before taking it.
+5. **P6/P10** — small, certain, cheap. **P6 is soundness-gated** (see above), not merely
+   unscheduled.
+
+**P4b (BMH for `indexOf`) is REFUTED on measurement and is not on this list.**
 
 **Where VL is already at or past native, for calibration:** `collections/struct-alloc` at **0.42x of
 Rust** (VL is 2.4x *faster* than `rustc -O` on allocation-heavy tree building — wasmtime's bump
