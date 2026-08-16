@@ -297,14 +297,37 @@ itself PRELIMINARY. A wall-clock gate therefore cannot separate a regression fro
 busy runner — the identical ambiguity that made the `vl test` parallelism ratio
 unusable. Whatever gates in CI must be contention-proof.
 
-### Phase 1 — extend the deterministic pins (no timing at all)
+### Phase 1 — extend the deterministic pins (no timing at all) — DONE
 
 `MELT_TABLE`'s pattern already gates emitted-code SIZE and LOOP SHAPE per optimizer
-rung, and cannot flake because it measures the artifact, not the machine. Extend it
-across the hot benchmark shapes. This catches codegen regressions outright.
+rung, and cannot flake because it measures the artifact, not the machine. Extended
+across the hot benchmark shapes as `SHAPE_TABLE` in
+`tests/selfhost_native_release_test.ts`: 13 rows, one per `bench/<cat>/<name>/main.vl`
+— the same sources `bench/run.sh` times — graded at `-O` and `-O3` on module bytes
+(banded, `max(3%, 16B)`) plus exact counts of functions, allocation sites,
+`call_indirect`, and, where they are the axis, `return_call` and `ref.eq`. Covers
+closure dispatch (`lambda-hot`, `map-filter-reduce`, with `dispatch-table` as the
+must-stay-indirect control), tail calls (`tailcall`, `mutual`), string equality and
+hashing (`str-eq`, `map-string`, `word-freq`), map probes (`map-string`, `map-i32`),
+array/struct element access (`fill-sum`, `binsearch`, `struct-aos`) and the tight
+scalar loop (`mixed-width`). Union boxing was already the densest area of
+`MELT_TABLE` and got no new rows.
+
+Two design points that are load-bearing if this is ever revised:
+
+- **The new rows skip the `none` rung on purpose.** Every counter is module-wide, and
+  an unoptimized module carries helpers the program never calls — `LOOP_TABLE`'s
+  `none` row has fired twice on exactly that wrong axis (`__str_eq__`'s unroll, then
+  `__str_hash__`'s). `-O`/`-O3` run DCE, so at those rungs a module-wide count is a
+  reachability-scoped count. VL's own emission is still graded: the optimizer inlines
+  VL's output, so extra emitted work lands in the optimized columns.
+- **Bytes are banded, not exact.** An exact byte golden on 13 modules reddens on
+  instruction-selection noise and then gets muted, which is worse than no pin.
 
 Bounds worth stating: a shape pin cannot see a regression that keeps the loop shape
-and adds work per iteration. It is the reliable half, not the whole answer.
+and adds work per iteration. It is the reliable half, not the whole answer. The one
+row where the byte band is fine-grained enough to notice added per-iteration work is
+`arith/mixed-width` (203 bytes, one loop, no allocation).
 
 ### Phase 2 — a CPU-time baseline
 
