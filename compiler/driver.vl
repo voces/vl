@@ -86,7 +86,14 @@ import { parseProgram } from "./parser"
 // is keyed by arena INDEX, so a reset arena that reuses index 5 for a different
 // identifier would read the previous program's answer), and three of the eight
 // in-place name writers (R4 — the module merge's renames below).
-import { sidNoteNodeName, sidReset } from "./symbols"
+import {
+  sidArrGet,
+  sidArrPut,
+  sidLookup,
+  sidNoteNodeName,
+  sidOf,
+  sidReset,
+} from "./symbols"
 import { nameIdentChar, skipQuotedName } from "./tyname"
 import { T, checkProgram, demangleMsg, initChecker } from "./typecheck"
 import {
@@ -285,6 +292,20 @@ let modLoadMod: i32[] = []
 // Per-module rename map (`name` → `name$mN`) and the lexical shadow stack.
 let modRenameFrom: string[] = []
 let modRenameTo: string[] = []
+// Sid-indexed views of that map — `symbols.vl` R6, the dense-array form of a
+// name→row lookup. `modRenameFrom` averages ~718 rows over a self-compile and is
+// probed once per identifier, so the linear scan is the merge's quadratic term;
+// these turn it into one `sidLookup` plus one array read.
+//
+// TWO arrays because the map's two readers disagree about a DUPLICATE key and the
+// disagreement is pre-existing: `modRenamed` returns at the FIRST matching row,
+// while `modRwTsName` / `modTypeRenamed` keep scanning and so take the LAST. A
+// duplicate `from` is reachable only in a program that is already rejected (two
+// top-level declarations of one name, or two imports binding one local), but
+// which row wins decides the diagnostic TEXT, so each reader keeps its own view
+// rather than being quietly normalized onto the other's.
+let modRenameFirstBySid: i32[] = []
+let modRenameLastBySid: i32[] = []
 let modShadow: string[] = []
 // Registry of every top-level free `self`-function across all modules, keyed by
 // its MANGLED name (`shout$m1`) with its parameter arity. A UFCS call
@@ -2546,9 +2567,27 @@ function modCheckDupBindings(m: i32, root: i32): i32 {
   }
   0
 }
+// Append one row to the rename map and index it under its interned `from`.
+// The two sid views are FRESH ARRAYS per module (below), so a row index is only
+// ever read against the map that produced it and no cross-program row can
+// survive a `sidReset` — the hazard `symbols.sidKeyedTablesReset`'s header
+// describes for the tables that are NOT rebuilt at their point of use.
+function modRenamePush(from: string, to: string): i32 {
+  const row = modRenameFrom.length
+  modRenameFrom.push(from)
+  modRenameTo.push(to)
+  const s = sidOf(from)
+  if sidArrGet(modRenameFirstBySid, s) < 0 {
+    sidArrPut(modRenameFirstBySid, s, row)
+  }
+  sidArrPut(modRenameLastBySid, s, row)
+  0
+}
 function modBuildRename(m: i32, root: i32): i32 {
   modRenameFrom = []
   modRenameTo = []
+  modRenameFirstBySid = []
+  modRenameLastBySid = []
   const impLocals: string[] = []
   let ii = 0
   while ii < impMod.length {
@@ -2569,10 +2608,7 @@ function modBuildRename(m: i32, root: i32): i32 {
       if st is UnionDecl { nm = st.udName }
       if nm != "" {
         const base = modDeclBase(ss[si], nm)
-        if !capHas(impLocals, base) {
-          modRenameFrom.push(base)
-          modRenameTo.push(base + suffix)
-        }
+        if !capHas(impLocals, base) { modRenamePush(base, base + suffix) }
       }
       si = si + 1
     }
@@ -2581,12 +2617,11 @@ function modBuildRename(m: i32, root: i32): i32 {
   while ij < impMod.length {
     if impMod[ij] == m && impLocal[ij] != "" {
       const dd = modIndexOfKey(impKey[ij])
+      // The dep may only RE-EXPORT this name rather than declare it, so the
+      // target is the chased declaration, not the flat `impName[ij]$mdd` (which
+      // would rewrite every reference onto a name the merge never defines).
       if dd >= 0 {
-        modRenameFrom.push(impLocal[ij])
-        // The dep may only RE-EXPORT this name rather than declare it, so the
-        // target is the chased declaration, not the flat `impName[ij]$mdd` (which
-        // would rewrite every reference onto a name the merge never defines).
-        modRenameTo.push(modMergedTargetOf(dd, impName[ij]))
+        modRenamePush(impLocal[ij], modMergedTargetOf(dd, impName[ij]))
       }
     }
     ij = ij + 1
@@ -2651,14 +2686,19 @@ function modSelfFnTarget(prop: string, argc: i32): string {
   ""
 }
 // A VALUE reference: shadowed locals win, then the rename map, else unchanged.
+//
+// The MAP is consulted before the shadow stack even though the shadow WINS. That
+// is the same answer either way — a name absent from the map renames to itself,
+// so whether a local shadows it cannot change the result — and it is the cheap
+// order: two thirds of the calls on a self-compile are locals with no map row,
+// and they now pay one `sidLookup` instead of a walk of the whole shadow stack.
+// `sidLookup` never mints, which is exact here by R6: every `from` was interned
+// by `modRenamePush`, so a name with no id cannot be a key.
 function modRenamed(name: string): string {
+  const row = sidArrGet(modRenameFirstBySid, sidLookup(name))
+  if row < 0 { return name }
   if capHas(modShadow, name) { return name }
-  let j = 0
-  while j < modRenameFrom.length {
-    if modRenameFrom[j] == name { return modRenameTo[j] }
-    j = j + 1
-  }
-  name
+  modRenameTo[row]
 }
 // A TYPE-position name: annotations are SYNTHETIC strings ("A|B", "Point[]",
 // "Box<i32>"), so rewrite identifier SEGMENTS through the rename map (types are
@@ -2701,11 +2741,8 @@ function modTypeRenamed(tn: string): string {
         // A live generic type-parameter name is the PARAMETER here, never the
         // top-level binding it may textually collide with.
         if !capHas(modTyShadow, seg) {
-          let j = 0
-          while j < modRenameFrom.length {
-            if modRenameFrom[j] == seg { rep = modRenameTo[j] }
-            j = j + 1
-          }
+          const row = sidArrGet(modRenameLastBySid, sidLookup(seg))
+          if row >= 0 { rep = modRenameTo[row] }
         }
         let k = 0
         while k < rep.length {
@@ -2765,11 +2802,8 @@ function modRwTsName(root: i32): i32 {
   if k == TS_NAME || k == TS_APP || k == TS_MAP {
     const seg = tsText[root]
     if seg.length > 0 && !capHas(modTyShadow, seg) {
-      let j = 0
-      while j < modRenameFrom.length {
-        if modRenameFrom[j] == seg { tsText[root] = modRenameTo[j] }
-        j = j + 1
-      }
+      const row = sidArrGet(modRenameLastBySid, sidLookup(seg))
+      if row >= 0 { tsText[root] = modRenameTo[row] }
     }
   }
   const start = tsKidStart[root]
