@@ -20,13 +20,13 @@
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
 // to disassemble. The exit code, not the artifact's absence, is the signal.
 //
-// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE emitter bug (the narrowed read of a
-// literal-union arm back into a `K`-typed position). If that bug is fixed the fixture
-// stops producing an invalid module and this pin would silently go inert — so the
-// first assertion checks the PRECONDITION (`vl run` on the source still fails) and
-// fails loudly with a swap instruction rather than passing vacuously. Swap in any
-// other source that emits an invalid module; the whole corpus had none (1,411 files
-// swept, 0 divergences), which is why the fixture must be constructed.
+// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (container variance — an `i32[]`
+// assigned into an `f64[]`). If that hole is closed the fixture stops producing an
+// invalid module and this pin would silently go inert — so the first assertion checks
+// the PRECONDITION (`vl run` on the source still fails) and fails loudly with a swap
+// instruction rather than passing vacuously. Swap in any other source that emits an
+// invalid module; the whole corpus had none (1,411 files swept, 0 divergences), which
+// is why the fixture must be constructed.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary + seed.
 
@@ -48,31 +48,24 @@ if (GATED && !ENABLED) {
   console.warn("[vl-build-validate] skipped — missing vl binary or seed wasm.");
 }
 
-// Type-checks clean, emits invalid wasm: the NARROWED ARM of a mixed union read back
-// into a `K`-typed position. The box holds the member's STRING ref while the
-// destination's rep is the interned i32 atom id, and nothing converts:
-// `type mismatch: expected i32, found (ref $type)`. This is family F2 of
-// `docs/internals/litunion-compact-rep-design.md` (§2.2, 16 cells, INVALID-WASM in 8
-// of 8 mixed spellings), handed off there as slice B — which the design says should
-// WAIT for the compact-rep rulings, because the box→atom direction is the one place
-// a fix in the current string rep is throwaway work. So the fixture is stable.
+// Type-checks clean, emits invalid wasm: an `i32[]` flowing into an `f64[]` binding.
+// The checker accepts the assignment while the two lists have DIFFERENT heap types, so
+// the store is `(ref $i32list)` into a `(ref null $f64list)` slot —
+// `type mismatch: expected (ref null $type), found (ref $type)`. This is the N5/A8/A9
+// CONTAINER VARIANCE ruling in `docs/internals/open-rulings.md`, an open checker hole
+// rather than an emitter one, which is what makes the fixture stable: closing it is a
+// `vl check` reject, and a `vl check` reject would be caught by the precondition
+// assertion below rather than silently blessing this pin.
 //
-// It REPLACES the previous fixture — a `.map` callback PARAMETER spelled as the inline
-// member union rather than the alias — which stopped emitting an invalid module once
-// canon learned to keep a preserve whose answer is a DECLARED ALIAS NAME at every
-// position (#1306's litunion flatten: the callback param's `("a" | "b")` now canons to
-// `K`, the spelling the param valtype ladder has always had an arm for). And that one
-// had itself replaced an unread global binding of a generic function's nullable-closure
-// return. The precondition assertion below is what caught both, exactly as designed.
-const INVALID_SRC = `type K = "aa" | "bb"\n` +
-  `function go() {\n` +
-  `  const x: K | f64 = "aa"\n` +
-  `  if x is K {\n` +
-  `    const y: K = x\n` +
-  `    print(y)\n` +
-  `  } else { print("N") }\n` +
-  `}\n` +
-  `go()\n`;
+// It REPLACES the narrowed-litunion-arm fixture — `const x: K | f64 = "aa"; if x is K {
+// const y: K = x }` — which stopped emitting an invalid module once `emitStrToAtom`
+// gave the string→atom rep boundary its conversion. That one had itself replaced a
+// `.map` callback PARAMETER spelled as the inline member union, and that one an unread
+// global binding of a generic function's nullable-closure return. The precondition
+// assertion below is what caught all three, exactly as designed.
+const INVALID_SRC = `const a = [1, 2]\n` +
+  `const b: f64[] = a\n` +
+  `print(b[0])\n`;
 
 // The over-rejection control: an ordinary valid program must still build clean.
 const VALID_SRC = `print(6 * 7)\n`;
