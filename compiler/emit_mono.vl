@@ -29,6 +29,7 @@ import {
   BinExpr,
   Block,
   Call,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
@@ -45,6 +46,7 @@ import {
   Param,
   Paren,
   RetStmt,
+  TypeDecl,
   TypeRef,
   Unary,
   UnionDecl,
@@ -84,6 +86,7 @@ import { sidNoteNodeName, sidOfNode } from "./symbols"
 import {
   annArrowAt,
   annFnDecompose,
+  annObjFieldSplit,
   annRetNameOf,
   monoAnnHasTyParam,
   monoBindFromAnn,
@@ -1907,18 +1910,85 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
   0
 }
 
+// The field NAMES and field TYPE-NAMES of the struct type `tname` names, appended in parallel to
+// `outNames` / `outTexts`; false when `tname` names no struct at all.
+//
+// TWO spellings reach here and they resolve differently. A DECLARED alias (`type Box = {…}`) is
+// read off the `TypeDecl`'s own `FieldDef` nodes, so each field's type arrives as an arena
+// `TypeRef` that `tyNameOf` names exactly as the annotation spelled it — no round-trip through
+// the type-name grammar. An INLINE shape (`const b: {op: (i32,i32)=>i32} = …`) has no declaration
+// to read and falls back to the shape layer's own field scanner (`annObjFieldSplit`, which is
+// depth-aware over the generic-application brackets a field type can carry).
+function monoStructFieldTypes(
+  tname: string,
+  outNames: string[],
+  outTexts: string[],
+) {
+  if tname == "" { return false }
+  let i = 0
+  while i < monoProgStmts.length {
+    const s = P.nodes[monoProgStmts[i]]
+    if s is TypeDecl {
+      if s.tdName == tname {
+        const fs = s.tdFields
+        let j = 0
+        while j < fs.length {
+          const fd = P.nodes[fs[j]]
+          if fd is FieldDef {
+            outNames.push(fd.fdName)
+            outTexts.push(tyNameOf(fd.fdType))
+          }
+          j = j + 1
+        }
+        return true
+      }
+    }
+    i = i + 1
+  }
+  annObjFieldSplit(tname, outNames, outTexts) == 1
+}
+
 // Coerce a generic function VALUE (or a composite of them) flowing into the expected type NAMED by
 // `tname`. If `exprIx` is an `Ident` naming a generic (un-annotated-param) function and `tname` is a
 // CONCRETE function type, materialize the instance for its param types and point the `Ident` at it
 // (`monoInstanceFor`). If `exprIx` is an ARRAY LITERAL and `tname` is a closure-array type
-// (`((i32,i32)=>i32)[]`), recurse into each element against the element function type. The single
-// coercion shared by every typed boundary a generic function value reaches — an annotated binding, a
-// concrete function-typed call ARGUMENT, an annotated RETURN, an ARRAY element — so the value carries
-// its concrete type wherever it escapes. The checker (`genericFnAssignable`) has already proved the
-// instantiation valid; this only emits it.
+// (`((i32,i32)=>i32)[]`), recurse into each element against the element function type; if it is an
+// OBJECT LITERAL and `tname` names a declared struct, recurse into each field value against that
+// field's declared type. The single coercion shared by every typed boundary a generic function value
+// reaches — an annotated binding, a concrete function-typed call ARGUMENT, an annotated RETURN, an
+// ARRAY element, a struct FIELD — so the value carries its concrete type wherever it escapes. The
+// checker (`genericFnAssignable`) has already proved the instantiation valid; this only emits it.
 function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
+  if e is ObjLit {
+    // A function-valued struct FIELD (`type Box = {op: (i32,i32)=>i32}`, `const b: Box = {op: add}`).
+    // The composite arms are mutually recursive with the `Ident` arm below, so a generic function
+    // nested any depth down a literal (a field holding an array of them, an array of literals)
+    // materializes at the type its own slot declares.
+    const fnames: string[] = []
+    const ftexts: string[] = []
+    if monoStructFieldTypes(tname, fnames, ftexts) {
+      const flds = e.objFields
+      let k = 0
+      while k < flds.length {
+        const f = P.nodes[flds[k]]
+        if f is FieldInit {
+          let d = 0
+          while d < fnames.length {
+            if fnames[d] == f.fiName {
+              if monoCoerceFnValueName(f.fiValue, normTypeAtom(ftexts[d]), ctx) < 0 {
+                return -1
+              }
+            }
+            d = d + 1
+          }
+        }
+        k = k + 1
+      }
+    }
+    return 0
+  }
   if e is ArrayLit {
     if nameIsClosureArray(tname) {
       // The `[]` cut stays RAW here (not `listElemNameOf`): that home strips one
