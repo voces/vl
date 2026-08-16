@@ -164,6 +164,7 @@ import {
   VKind,
   aTypeIdx,
   aUsed,
+  armPreludeBlocks,
   arrNewScratchBase,
   callRefSlot,
   capCacheOn,
@@ -3237,7 +3238,7 @@ function emitUnionIfValue(
   emitFail("emitProgram: expected a union if-expression")
 }
 
-// One arm of a union if-expression: the arm Block's single tail-value statement,
+// One arm of a union if-expression: the arm's prelude, then its tail-value statement
 // union-coerced to the box rep (`emitUnionCoerce` — a variant struct boxes, a passthrough
 // union rides as-is, a scalar value-boxes).
 function emitUnionIfArm(
@@ -3248,16 +3249,17 @@ function emitUnionIfArm(
 ) {
   const b = P.nodes[blockIx]
   if b is Block {
-    const stmts = b.blkStmts
-    if stmts.length == 1 {
-      if stmtIsTailValue(stmts[0], fnIx) {
+    const tv = ifArmValueExpr(blockIx)
+    if tv >= 0 {
+      if stmtIsTailValue(tv, fnIx) {
+        if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
         // The if-value's result IS the union BOX `(ref $uBox)` (the blocktype), so a CONCRETE-
         // VARIANT arm (`cat`, a kind-8 `(ref $variant)` local/value — `if c then cat else dog`)
         // must be BOXED to match, exactly as a variant return/argument is: `emitUnionBoxArg`
         // boxes a variant ref and defers every other shape (object literal, passthrough union,
         // scalar) to `emitUnionCoerce`. Plain `emitUnionCoerce` emitted the raw variant ref —
         // invalid wasm ("expected (ref $uBox), found (ref $variant)").
-        return emitUnionBoxArg(body, unionName, stmts[0], fnIx)
+        return emitIfArmClose(emitUnionBoxArg(body, unionName, tv, fnIx))
       }
     }
     return emitFail(
@@ -3327,13 +3329,16 @@ function emitVariantIfValue(body: i32[], vi: i32, ifIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a variant if-expression")
 }
 
+// One arm of a variant if-expression: the arm's prelude, then its tail-value statement
+// coerced to the concrete variant rep.
 function emitVariantIfArm(body: i32[], vi: i32, blockIx: i32, fnIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
-    const stmts = b.blkStmts
-    if stmts.length == 1 {
-      if stmtIsTailValue(stmts[0], fnIx) {
-        return emitVariantCoerce(body, vi, stmts[0], fnIx)
+    const tv = ifArmValueExpr(blockIx)
+    if tv >= 0 {
+      if stmtIsTailValue(tv, fnIx) {
+        if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        return emitIfArmClose(emitVariantCoerce(body, vi, tv, fnIx))
       }
     }
     return emitFail(
@@ -8367,9 +8372,71 @@ function emitIfExprRef(
   emitFail("emitProgram: expected an if expression")
 }
 
-// One arm of a REF-typed if-expression: its single tail-value statement, emitted in the
-// join rep. Re-seeds `pendingStructIdx` (struct arms) / `pendingListKind`+`pendingListSlot`
-// (ref-list arms) first, since the previous arm's emit consumed the pending seed.
+// ── if-EXPRESSION arm prelude ─────────────────────────────────────────────────
+// An if-expression arm is a Block whose VALUE is its LAST statement (`ifArmValueExpr`);
+// every statement before it is the arm's PRELUDE. The parser writes a one-statement arm
+// for `if c { v }`, but a `const` declared in the arm makes it two — and that is exactly
+// what a `match` payload-binding arm desugars to (`match u { A{a} => a }` becomes
+// `if u is A { const a = u.a; a }`), so the prelude is what lets a BINDING arm sit in
+// value position. Wasm-wise the prelude is stack-neutral: it runs inside the arm's
+// `if`/`else` frame and leaves only the value the blocktype promises.
+//
+// `emitIfArmOpen` pushes the arm's lexical frame and lowers the prelude; the caller then
+// emits the value in ITS join rep and closes with `emitIfArmClose`, which pops the frame
+// so the arm's bindings do not leak into the sibling arm or past the `if`. The two are
+// separate calls because each arm emitter lowers the VALUE differently (coerced numeric,
+// ref, union box, variant struct, return exit) while the prelude and the frame are shared.
+
+// Push the arm's lexical frame and lower every statement before the arm's value.
+// Returns 0, or -1 (the caller still owes `emitIfArmClose`).
+//
+// A non-empty prelude is lowered ONLY when `collectLocalsIf` walked this arm
+// (`armPreludeBlocks`) — that walk is what allocated the arm's locals, in the pre-order
+// `emitLetDeclStmt`'s cursor replays. An if-expression collect does not descend into
+// (one buried inside another expression, or a top-level global's initializer) is rejected
+// here rather than lowered against slots that belong to something else.
+function emitIfArmOpen(body: i32[], blockIx: i32, fnIx: i32) {
+  scopePush()
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    if stmts.length > 1 {
+      if !armPreludeWalked(blockIx) {
+        return emitFail(
+          "emitProgram: an if-expression arm that declares a local is supported only as a binding initializer inside a function",
+        )
+      }
+    }
+    let i = 0
+    while i + 1 < stmts.length {
+      if emitStmt(body, stmts[i], fnIx) < 0 { return -1 }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// True if the collect pass allocated the prelude locals of the arm block at `blockIx`.
+function armPreludeWalked(blockIx: i32) {
+  let i = 0
+  while i < armPreludeBlocks.length {
+    if armPreludeBlocks[i] == blockIx { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Pop the arm's lexical frame, passing `rc` through so an arm emitter can close and
+// return in one expression.
+function emitIfArmClose(rc: i32) {
+  scopePop()
+  rc
+}
+
+// One arm of a REF-typed if-expression: its prelude, then its tail-value statement
+// emitted in the join rep. Re-seeds `pendingStructIdx` (struct arms) /
+// `pendingListKind`+`pendingListSlot` (ref-list arms) after the prelude — the previous
+// arm's emit consumed the pending seed, and so can a prelude statement.
 function emitRefIfArm(
   body: i32[],
   blockIx: i32,
@@ -8379,9 +8446,10 @@ function emitRefIfArm(
 ) {
   const b = P.nodes[blockIx]
   if b is Block {
-    const stmts = b.blkStmts
-    if stmts.length == 1 {
-      if ifArmIsValue(stmts[0], fnIx) {
+    const tv = ifArmValueExpr(blockIx)
+    if tv >= 0 {
+      if ifArmIsValue(tv, fnIx) {
+        if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
         if kind == "struct" { pendingStructIdx = slot }
         if kind == "reflist" {
           pendingListKind = 5
@@ -8390,10 +8458,10 @@ function emitRefIfArm(
         // An ATOM arm in a `string` join widens to its member string (the atom is a
         // bare i32 id; the join blocktype is the string ref) — the if-expression seam
         // of the atom-as-string-subtype widen (`retStrWiden` at returns).
-        if kind == "str" && exprIsLitAtom(stmts[0], fnIx) {
-          return emitAtomToStr(body, stmts[0], fnIx)
+        if kind == "str" && exprIsLitAtom(tv, fnIx) {
+          return emitIfArmClose(emitAtomToStr(body, tv, fnIx))
         }
-        return emitExpr(body, stmts[0], fnIx)
+        return emitIfArmClose(emitExpr(body, tv, fnIx))
       }
     }
     return emitFail("emitProgram: if-expression arm is not a single value")
@@ -8434,20 +8502,20 @@ function emitIfExprAs(body: i32[], ifIx: i32, fnIx: i32, kind: i32) {
   emitFail("emitProgram: expected an if expression")
 }
 
-// The VALUE of an if-expression arm (the parser wraps `then <expr>` as a Block of
-// ONE statement): its single tail-value statement, emitted as an expression COERCED to
-// the if-expression's result rep `kind` (so an i32-literal arm widens into an f64/f32/
-// i64 join). The i32 default emits the value as-is.
+// The VALUE of an if-expression arm: its prelude, then its tail-value statement emitted
+// as an expression COERCED to the if-expression's result rep `kind` (so an i32-literal
+// arm widens into an f64/f32/i64 join). The i32 default emits the value as-is.
 function emitBlockValueAs(body: i32[], blockIx: i32, fnIx: i32, kind: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
-    const stmts = b.blkStmts
-    if stmts.length == 1 {
-      if ifArmIsValue(stmts[0], fnIx) {
-        if kind == 124 { return emitExprAsF64(body, stmts[0], fnIx) }
-        if kind == 125 { return emitExprAsF32(body, stmts[0], fnIx) }
-        if kind == 126 { return emitExprAsI64(body, stmts[0], fnIx) }
-        return emitExpr(body, stmts[0], fnIx)
+    const tv = ifArmValueExpr(blockIx)
+    if tv >= 0 {
+      if ifArmIsValue(tv, fnIx) {
+        if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        if kind == 124 { return emitIfArmClose(emitExprAsF64(body, tv, fnIx)) }
+        if kind == 125 { return emitIfArmClose(emitExprAsF32(body, tv, fnIx)) }
+        if kind == 126 { return emitIfArmClose(emitExprAsI64(body, tv, fnIx)) }
+        return emitIfArmClose(emitExpr(body, tv, fnIx))
       }
     }
     return emitFail("emitProgram: if-expression arm is not a single value")
@@ -8521,6 +8589,23 @@ function emitNulNullToLocal(_body: i32[], idx: i32, rep: i32) {
   0
 }
 
+// One arm of a nullable if-BINDING: its prelude (`emitIfArmOpen`), then its tail value
+// written into the binding's local. The binding-init counterpart of `emitBlockValueAs` —
+// the arm is a Block here too, so a `const` it declares is lowered the same way.
+function emitNulArmBlockToLocal(
+  body: i32[],
+  blockIx: i32,
+  idx: i32,
+  rep: i32,
+  unionName: string,
+  fnIx: i32,
+) {
+  if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+  emitIfArmClose(
+    emitNulArmToLocal(body, ifArmValueExpr(blockIx), idx, rep, unionName, fnIx),
+  )
+}
+
 // Lower a nullable/value-union if-EXPRESSION binding init at `ifIx` into local `idx`:
 // a void `if` whose then-arm writes the binding (narrowed by the condition), and whose
 // else writes the else-arm value, a nested `else if` (recurse), or — when there is no
@@ -8540,14 +8625,7 @@ function emitNullableIfBinding(
     ctrlEnter() // count the frame — see `emitUnionIfValue`
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
-    const rc = emitNulArmToLocal(
-      body,
-      ifArmValueExpr(s.ifThen),
-      idx,
-      rep,
-      unionName,
-      fnIx,
-    )
+    const rc = emitNulArmBlockToLocal(body, s.ifThen, idx, rep, unionName, fnIx)
     if narrowed { restoreNarrow(savedTop) }
     if rc < 0 { return -1 }
     fbElse() // 0x05 else
@@ -8561,14 +8639,7 @@ function emitNullableIfBinding(
       if els is IfStmt {
         erc = emitNullableIfBinding(body, s.ifElse, idx, rep, unionName, fnIx)
       } else {
-        erc = emitNulArmToLocal(
-          body,
-          ifArmValueExpr(s.ifElse),
-          idx,
-          rep,
-          unionName,
-          fnIx,
-        )
+        erc = emitNulArmBlockToLocal(body, s.ifElse, idx, rep, unionName, fnIx)
       }
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
@@ -8668,6 +8739,22 @@ function emitUnionNullToPair() {
   0
 }
 
+// One arm of a union-box if-BINDING sink: its prelude (`emitIfArmOpen`), then its tail
+// value written into the sink pair. The prelude precedes the arm's box construction, so
+// the `uBoxNewIsLast` peephole still sees the construction as the last instruction.
+function emitUnionArmBlockToPair(
+  body: i32[],
+  blockIx: i32,
+  idx: i32,
+  unionName: string,
+  fnIx: i32,
+) {
+  if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+  emitIfArmClose(
+    emitUnionArmToPair(body, ifArmValueExpr(blockIx), idx, unionName, fnIx),
+  )
+}
+
 // `emitNullableIfBinding`'s rep-0 shape with every arm writing the sink pair instead of
 // the binding's slot. The caller performs the one `struct.new` after the `if`.
 function emitUnionIfBindingSink(
@@ -8684,13 +8771,7 @@ function emitUnionIfBindingSink(
     ctrlEnter() // count the frame — see `emitUnionIfValue`
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
-    const rc = emitUnionArmToPair(
-      body,
-      ifArmValueExpr(s.ifThen),
-      idx,
-      unionName,
-      fnIx,
-    )
+    const rc = emitUnionArmBlockToPair(body, s.ifThen, idx, unionName, fnIx)
     if narrowed { restoreNarrow(savedTop) }
     if rc < 0 { return -1 }
     fbElse() // 0x05 else
@@ -8704,13 +8785,7 @@ function emitUnionIfBindingSink(
       if els is IfStmt {
         erc = emitUnionIfBindingSink(body, s.ifElse, idx, unionName, fnIx)
       } else {
-        erc = emitUnionArmToPair(
-          body,
-          ifArmValueExpr(s.ifElse),
-          idx,
-          unionName,
-          fnIx,
-        )
+        erc = emitUnionArmBlockToPair(body, s.ifElse, idx, unionName, fnIx)
       }
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
@@ -12595,19 +12670,23 @@ function emitUnionRetIfSink(body: i32[], ifIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a union if-expression")
 }
 
-// One arm of a sunk returned if-expression: the arm Block's single tail-value statement,
-// lowered as the function's return value and terminated like any other exit
+// One arm of a sunk returned if-expression: the arm's prelude, then its tail-value
+// statement lowered as the function's return value and terminated like any other exit
 // (`emitReturnExit`, which recurses when that value is itself an if-expression).
 function emitUnionRetIfArm(body: i32[], blockIx: i32, fnIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
-    const stmts = b.blkStmts
-    if stmts.length == 1 {
-      if stmtIsTailValue(stmts[0], fnIx) {
-        return emitReturnExit(body, stmts[0], fnIx)
+    const tv = ifArmValueExpr(blockIx)
+    if tv >= 0 {
+      if stmtIsTailValue(tv, fnIx) {
+        if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        return emitIfArmClose(emitReturnExit(body, tv, fnIx))
       }
-      const inner = P.nodes[unwrapParen(stmts[0])]
-      if inner is IfStmt { return emitReturnExit(body, stmts[0], fnIx) }
+      const inner = P.nodes[unwrapParen(tv)]
+      if inner is IfStmt {
+        if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        return emitIfArmClose(emitReturnExit(body, tv, fnIx))
+      }
     }
     return emitFail(
       "emitProgram: union if-expression arm is not a single value",

@@ -97,6 +97,7 @@ Deferred (follow-ups, captured here so we don't reinvent them):
    - **2a — scrutinee + discrimination. SHIPPED.** See "Phase 2a as built" below.
    - **2b — payload binding** (`Move{x, y} => x + y`). **SHIPPED.** See "Phase 2b as built".
 3. **Expression-position polish** — ensure arms-yield-value works everywhere `if`-expressions do.
+   **A BINDING arm in value position: SHIPPED.** See "A binding arm in value position" below.
 4. **Guards** (`pat if cond =>`).
 5. (Maybe) ranges / `i32` density → `br_table` codegen.
 
@@ -208,6 +209,50 @@ JOIN of the alternatives, which is item 4 of ROADMAP B21 — a pre-existing emit
 - **Nested destructuring** `Move{p: {x, y}}` — needs the binding's initializer to be a `Member`
   CHAIN and the checker to narrow through it; a real feature, still "only if a concrete need
   appears" (see Deferred, above).
+
+Neither gets EASIER from the value-position work below: renaming is still one parser branch plus a
+formatter print, and nested destructuring is still a `Member`-chain initializer plus narrowing
+through it. What they get is that whatever they bind lands in the arm's PRELUDE, so both work in
+value position on the day they ship rather than needing a second slice for it — nested
+destructuring especially, since it is the form that puts the most `const`s in one arm.
+
+## A binding arm in value position
+
+`const r = match u { A{a} => a, B{b} => b }` reported `emitProgram: if-expression arm is not a
+single value`. The grid that localises it — binding/non-binding × statement/tail/value position,
+for `match` and for the hand-written `if` twin — reads: 8 of 10 cells lowered on master, and the
+two that did not were binding × VALUE position, `match` and `if` alike. So it was the BINDING that
+broke value position, not `match` in value position, and not phase 2b: the desugar's output is the
+`if` twin, and the twin failed identically.
+
+**An arm's value is its LAST statement.** `blockTailIsValue` already applies that rule in tail
+position and `emitStmts` walks a statement-position arm of any length; only the if-EXPRESSION arm
+emitters demanded a one-statement Block. `ifArmValueExpr` now yields the last statement, and
+everything before it is the arm's PRELUDE — which is exactly what a payload clause produces
+(`if u is A { const a = u.a; a }`). `emitIfArmOpen`/`emitIfArmClose` lower the prelude inside the
+arm's own lexical frame; each of the five arm emitters (numeric join, ref join, union box, concrete
+variant, return sink) and the two binding-init sinks (nullable local, union-box pair) still lower
+the VALUE in its own rep. Stack-wise the prelude is neutral: it runs inside the arm's `if`/`else`
+frame and leaves only the value the blocktype promises.
+
+**The constraint is the local-slot PRE-ORDER, and it is why two positions are refused.** Wasm
+locals are function-scoped, and `emitLetDeclStmt` claims them off a linear cursor whose order the
+collect pass must have replayed exactly — a slot claimed out of order is another binding's cell,
+which is a silent wrong answer, not a crash. So the collect pass walks the two statement positions
+whose order the emitter reproduces (`collectIfExprLocals`): a binding INITIALIZER and a `return`
+operand. It does NOT walk an if-expression nested deeper inside an expression (an argument, an
+arm's own tail value), nor a TOP-LEVEL binding, whose `const` is a module global that the start
+function's local collection never descends into. `armPreludeBlocks` records the arms collect walked
+and `emitIfArmOpen` requires membership, so those two shapes are diagnostics naming the supported
+spelling. Without that test both were compiler TRAPS (`out of bounds array access`) the moment the
+arm emitters accepted a multi-statement arm — the mark is what converts a silent-or-crashing
+misalignment into a loud one. Widening either position means teaching collect to walk expressions
+in the emitter's evaluation order; the pre-order is the whole cost.
+
+`armPreludeBlocks` holds arena NODE indices, so it resets in `emitProgram`'s sidecar block with the
+other index columns. A stale index that happens to name a node in the next program grants
+permission collect never gave — reachable only when one instance lowers several programs, which is
+why the corpus driver (not the CLI, not the fixpoint ladder) is where it showed.
 
 ## Pipeline touch-points (per the language-features playbook)
 

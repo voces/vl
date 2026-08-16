@@ -1242,12 +1242,17 @@ in-language GC knobs.
      **renaming** (`Move{x: a}` — the formatter already reads the binding name off the `LetDecl`,
      so it is a parser branch plus a `field: name` print) and **nested destructuring**
      (`Move{p: {x, y}}` — needs a `Member` CHAIN initializer and narrowing through it).
-     Also open and NOT phase-2b-specific: a binding arm cannot be a `const` INITIALIZER
-     (`const r = match u { A{a} => a … }`) because a multi-statement if-expression arm hits the
-     pre-existing `emitProgram: if-expression arm is not a single value` — the hand-written twin
-     fails identically, and the same match without a clause lowers fine. Fixing that emitter gap
-     (an if-expression arm whose block has statements before its tail value) unblocks the whole
-     let-init context, `match` and `if` alike.
+     ~~Also open and NOT phase-2b-specific: a binding arm cannot be a `const` INITIALIZER~~
+     **DONE (C6)** — an if-expression arm's value is now its LAST statement and everything before
+     it is the arm's PRELUDE, so `const r = match u { A{a} => a … }` and the hand-written `if`
+     twin both lower, in every join rep. The prelude is lowered only where the collect pass
+     allocated its locals in the order the emitter's local cursor replays — a binding INITIALIZER
+     and a `return` operand. The two positions it does not walk (an if-expression buried deeper
+     in an expression, e.g. `print(match u { A{a} => a … })`; a TOP-LEVEL binding, whose `const`
+     is a module global and whose start-function collection never sees the initializer) are LOUD
+     rejects naming the supported spelling. Widening either means teaching collect to walk
+     expressions / global inits in emit's evaluation order — the slot pre-order is the whole
+     constraint, and `armPreludeBlocks` is what keeps a mismatch loud instead of silent.
   2. **Unions with LITERAL members** (`0 | 1 | 2`, `"x" | 7`) — refused at the type tier today
      (`match over a union with literal members is not supported`) because an arm's test would be
      `n is 0`, which the emitter has no rep for (`literal \`is\` over a struct union is not
