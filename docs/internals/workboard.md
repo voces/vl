@@ -38,15 +38,41 @@ a fix does.
 
 ## In flight
 
-| item | where | state |
-|---|---|---|
-| D7 W8 `modTypeRenamed` quote skip | agent, worktree | running |
-| H5 perf/roadmap doc truth-up | agent, worktree | running |
-| D1 litunion alias `is` | PR #1353 | CI |
+Nothing. The queue is empty; pick from the bands below.
 
-Recently landed: **#1344** (brand-only union arms rejected — owner-confirmed
-narrowing), #1345 (`vl test` scheduling witness), #1348 (comment policy), #1349
-(dependabot high, dev-only transitive).
+## Landed this cycle
+
+| item | PR | result |
+|---|---|---|
+| **B1** checker-side parse census | #1354 | **CLOSED, measured negative** — 17,832 of 17,834 are tree walks |
+| **B2** TRANSP residue | #1373 | shipped; found a THIRD down-cell the filing lacked |
+| **B3** mint column | #1372 | **BLOCKED-REP behind B5** — 206 of 220 mint |
+| **B4** `recordMvValTyIx` | #1366 | shipped; 725 calls, 0 parses, 0 mints |
+| **B9a/B9b** routings + endpoint | #1375 | shipped; the endpoint row was **mis-identified**, divergence deliberate |
+| **B9** W13 floor | #1372 | re-derived: **12, not ~60** |
+| **C1** union box melt | #1363 | shipped; 1.36x default / 1.68x `-O` |
+| **C6** `match` binding in value position | #1367 | shipped; unblocked `if` too |
+| **C9** webcraft doc staleness | #1351 | shipped |
+| **C10** names section | #1351 | **resolved** — consumer passes `--names`; default flip costs the seed +5.3% |
+| **D1** litunion alias `is` | #1353 | shipped |
+| **D2** numeric literal unions | #1365 | shipped; a fourth rep with its own lowering |
+| **D5** storage-vs-identity exemption | #1362 | shipped; 6 UP, 0 DOWN |
+| **E1** generic fn as a value | #1364 | shipped; closed a live invalid-wasm emit |
+| **E2** inferred map VALUE type | #1359 | shipped; the axis was the value, not the key |
+| **E3** `unconditional-recursion` lint | #1368 | shipped; half (a) left as a language ruling |
+| **F5** `modScan` re-scan | #1371 | shipped; **-4% CPU** on the self-compile |
+| **G2** closure-unpack hoist | #1374 | **REFUTED** — the filed 10.6x is P2's saving counted twice |
+| **H2** perf gate phase 1 | #1370 | shipped; SHAPE_TABLE, 22 → 35 tests |
+| **H4/H5** doc truth-up | #1358 | shipped |
+
+Also landed: #1344 (brand-only union arms — owner-confirmed narrowing), #1345
+(`vl test` scheduling witness), #1348 (comment policy), #1349 (dependabot),
+#1350 (this board), #1355 (four dead agent-environment claims), #1356
+(`modTypeRenamed` — behaviour difference REFUTED), #1360 (fourth dead playbook
+gate), #1369 (A5b/A5c/A5d literal-inference rows).
+
+**Cycle scorecard: 8 filed claims refuted or corrected by measurement**, five of
+them numbers or units, three of them framings. Two were the orchestrator's own.
 
 ---
 
