@@ -2037,6 +2037,33 @@ fn test_worker_count(requested: i32) -> usize {
         .unwrap_or(1)
 }
 
+/// Whether `$VL_TEST_TRACE=1` asked for the per-file scheduling trace below.
+fn test_trace_on() -> bool {
+    std::env::var("VL_TEST_TRACE").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Emit one per-file scheduling stamp (`$VL_TEST_TRACE=1` only), microseconds
+/// from a phase-local epoch. `eprintln!` takes the stderr lock, so lines from
+/// concurrent workers never interleave.
+///
+/// WHY STAMPS AND NOT A STOPWATCH. The claim `vl test` makes is about
+/// SCHEDULING — files run concurrently — and wall clock cannot witness it. A
+/// ratio like "`--jobs N` finishes faster than `--jobs 1`" measures scheduling
+/// TIMES the free CPU the box happens to have, so a serial-fallback REGRESSION
+/// and a merely BUSY runner are indistinguishable: both read ~1.0. Two further
+/// shapes defeat it outright — the leg measured first absorbs the one-time
+/// wasmtime compile of the seed (a cold-start bias no idle box escapes), and on
+/// a single core N threads timeslicing are strictly SLOWER than one, so no
+/// correct scheduler can pass.
+///
+/// These stamps witness the schedule itself: the intervals OVERLAP under
+/// `--jobs N>1` and are DISJOINT under `--jobs 1`, on any core count, under any
+/// load. Contention makes each file take LONGER, which makes the overlap wider
+/// — the measurement gets more robust as the box gets busier, not less.
+fn test_trace_stamp(phase: &str, file: usize, start_us: u128, end_us: u128) {
+    eprintln!("vl-test-trace {phase} file={file} start_us={start_us} end_us={end_us}");
+}
+
 // ── `vl check` — driven by the in-wasm CLI command-queue (docs/cli-design.md) ──
 // The host is a thin PUMP: push argv, then call `cliNext()` until CMD_DONE,
 // servicing each raw I/O command (read a file, print a line) and committing the
@@ -2236,8 +2263,15 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 let file_commit =
                     inst.get_typed_func::<i32, i32>(&mut store, "cliTestFileCommit")?;
                 let engine_t = test_engine(&mut test_engine_slot)?;
+                let trace = test_trace_on();
+                let epoch = std::time::Instant::now();
                 test_regs = parallel_map(test_files.len(), workers, |i| {
-                    collect_test_file(&engine_t, &test_files[i])
+                    let start_us = epoch.elapsed().as_micros();
+                    let reg = collect_test_file(&engine_t, &test_files[i]);
+                    if trace {
+                        test_trace_stamp("collect", i, start_us, epoch.elapsed().as_micros());
+                    }
+                    reg
                 });
                 for reg in &test_regs {
                     for (name, skip) in reg.names.iter().zip(reg.skips.iter()) {
@@ -2276,8 +2310,15 @@ fn cli_pump(args: &[String]) -> Result<()> {
                     }
                 }
                 let engine_t = test_engine(&mut test_engine_slot)?;
+                let trace = test_trace_on();
+                let epoch = std::time::Instant::now();
                 let batches = parallel_map(per_file.len(), workers, |i| {
-                    run_test_file(&engine_t, &test_regs[i], &per_file[i])
+                    let start_us = epoch.elapsed().as_micros();
+                    let batch = run_test_file(&engine_t, &test_regs[i], &per_file[i]);
+                    if trace {
+                        test_trace_stamp("run", i, start_us, epoch.elapsed().as_micros());
+                    }
+                    batch
                 });
                 let mut outcomes: Vec<Option<TestOutcome>> =
                     (0..n as usize).map(|_| None).collect();

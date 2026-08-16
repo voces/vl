@@ -7,7 +7,8 @@
 //     (the isolation proof: the host re-instantiates the module);
 //   * a test file that does not COMPILE is one failing entry and the run continues;
 //   * a green run exits 0, any failure exits 1, a usage error exits 2;
-//   * files really do run in parallel (`--jobs 1` is measurably slower).
+//   * files really are SCHEDULED in parallel (their stamped run intervals
+//     overlap under `--jobs 4` and are disjoint under `--jobs 1`).
 //
 // The report is built entirely in VL (`compiler/cli.vl`) — the host contributes
 // only wasm instances, the thread pool and trap catching — so these assertions
@@ -40,12 +41,13 @@ if (GATED && !ENABLED) {
 const runTest = async (
   target: string,
   extraArgs: string[] = [],
+  extraEnv: Record<string, string> = {},
 ): Promise<{ code: number; out: string; err: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: ["test", target, "--compiler", COMPILER, ...extraArgs],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", ...extraEnv },
   }).output();
   return {
     code,
@@ -73,7 +75,9 @@ Deno.test({
   fn: async () => {
     const r = await runTest(`${FIXTURES}/pass.test.vl`);
     if (r.code !== 0) {
-      throw new Error(`expected exit 0 on an all-green file, got ${r.code}:\n${r.err}`);
+      throw new Error(
+        `expected exit 0 on an all-green file, got ${r.code}:\n${r.err}`,
+      );
     }
     expectHas(r.err, "ok   adds");
     // A nested `describe` contributes its scope to the reported path.
@@ -86,12 +90,15 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-test: a failed expectation reports std:test's recorded message + captured output",
+  name:
+    "vl-test: a failed expectation reports std:test's recorded message + captured output",
   ignore: !ENABLED,
   fn: async () => {
     const r = await runTest(`${FIXTURES}/fail.test.vl`);
     if (r.code !== 1) {
-      throw new Error(`expected exit 1 when a test fails, got ${r.code}:\n${r.err}`);
+      throw new Error(
+        `expected exit 1 when a test fails, got ${r.code}:\n${r.err}`,
+      );
     }
     // The message is the matcher's, read back off the instance AFTER the trap —
     // not the engine's "unreachable" text.
@@ -110,12 +117,15 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-test: a TRAP fails only its own test — the file keeps running (isolation)",
+  name:
+    "vl-test: a TRAP fails only its own test — the file keeps running (isolation)",
   ignore: !ENABLED,
   fn: async () => {
     const r = await runTest(`${FIXTURES}/trap.test.vl`);
     if (r.code !== 1) {
-      throw new Error(`expected exit 1 when a test traps, got ${r.code}:\n${r.err}`);
+      throw new Error(
+        `expected exit 1 when a test traps, got ${r.code}:\n${r.err}`,
+      );
     }
     // Two DIFFERENT traps, neither carrying a recorded message: the engine's own
     // trap text becomes the failure message.
@@ -129,12 +139,15 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-test: a test file that does not compile is one failure, and the run continues",
+  name:
+    "vl-test: a test file that does not compile is one failure, and the run continues",
   ignore: !ENABLED,
   fn: async () => {
     const r = await runTest(FIXTURES);
     if (r.code !== 1) {
-      throw new Error(`expected exit 1 over the mixed fixture set, got ${r.code}:\n${r.err}`);
+      throw new Error(
+        `expected exit 1 over the mixed fixture set, got ${r.code}:\n${r.err}`,
+      );
     }
     expectHas(r.err, "FAIL <compile>");
     // The compiler's own diagnostic, positioned in the user's file — proof the
@@ -164,7 +177,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-test: discovery finds only *.test.vl, and an empty tree is not a failure",
+  name:
+    "vl-test: discovery finds only *.test.vl, and an empty tree is not a failure",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_test_discovery_" });
@@ -178,7 +192,9 @@ Deno.test({
       await Deno.writeTextFile(`${dir}/test.vl`, "let q: string = 5\n");
       const empty = await runTest(dir);
       if (empty.code !== 0) {
-        throw new Error(`a tree with no *.test.vl should exit 0, got ${empty.code}:\n${empty.err}`);
+        throw new Error(
+          `a tree with no *.test.vl should exit 0, got ${empty.code}:\n${empty.err}`,
+        );
       }
       expectHas(empty.err, "no *.test.vl files found");
 
@@ -194,7 +210,9 @@ Deno.test({
       );
       const r = await runTest(dir);
       if (r.code !== 0) {
-        throw new Error(`node_modules must not be walked; got ${r.code}:\n${r.err}`);
+        throw new Error(
+          `node_modules must not be walked; got ${r.code}:\n${r.err}`,
+        );
       }
       expectHas(r.err, "1 file · 1 passed · 0 failed");
     } finally {
@@ -209,7 +227,9 @@ Deno.test({
   fn: async () => {
     const bad = await runTest(FIXTURES, ["--nonsense"]);
     if (bad.code !== 2) {
-      throw new Error(`an unknown flag should exit 2, got ${bad.code}:\n${bad.err}`);
+      throw new Error(
+        `an unknown flag should exit 2, got ${bad.code}:\n${bad.err}`,
+      );
     }
     expectHas(bad.err, "unknown flag");
 
@@ -220,36 +240,101 @@ Deno.test({
 
     const missing = await runTest(`${FIXTURES}/does-not-exist.test.vl`);
     if (missing.code !== 2) {
-      throw new Error(`a missing named target should exit 2, got ${missing.code}:\n${missing.err}`);
+      throw new Error(
+        `a missing named target should exit 2, got ${missing.code}:\n${missing.err}`,
+      );
     }
     expectHas(missing.err, "cannot read");
   },
 });
 
+/** The `[start_us, end_us]` stamp each file's `phase` carried under `$VL_TEST_TRACE=1`. */
+const traceIntervals = (
+  stderr: string,
+  phase: string,
+): Array<[number, number]> => {
+  const out: Array<[number, number]> = [];
+  for (const line of stderr.split("\n")) {
+    const m = line.match(
+      /^vl-test-trace (\w+) file=(\d+) start_us=(\d+) end_us=(\d+)$/,
+    );
+    if (m && m[1] === phase) out.push([Number(m[3]), Number(m[4])]);
+  }
+  return out;
+};
+
+/** The most files in flight at once — a sweep over the interval endpoints. */
+const peakConcurrency = (intervals: Array<[number, number]>): number => {
+  const events: Array<[number, number]> = [];
+  for (const [start, end] of intervals) {
+    events.push([start, 1], [end, -1]);
+  }
+  // An END sorts BEFORE a START at an equal stamp: the intervals are half-open,
+  // so a file that finishes exactly as the next begins is serial, not concurrent.
+  events.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let live = 0;
+  let peak = 0;
+  for (const [, delta] of events) {
+    live += delta;
+    if (live > peak) peak = live;
+  }
+  return peak;
+};
+
 Deno.test({
-  name: "vl-test: files run in PARALLEL — --jobs 1 over the same work is markedly slower",
+  name:
+    "vl-test: files run in PARALLEL — the schedule itself, not a wall-clock proxy",
   ignore: !ENABLED,
   fn: async () => {
-    // Four files, one ~250 ms test each. Serial must take roughly 4x the parallel
-    // wall clock; the assertion is deliberately loose (parallel < 70% of serial)
-    // so a loaded or few-core CI box cannot flake it, while a runner that silently
-    // fell back to serial scheduling — the regression this guards — reads ~1.0.
-    const t0 = performance.now();
-    const par = await runTest(SLOW, ["--jobs", "4"]);
-    const parallelMs = performance.now() - t0;
-
-    const t1 = performance.now();
-    const ser = await runTest(SLOW, ["--jobs", "1"]);
-    const serialMs = performance.now() - t1;
+    // Four files, one ~250 ms test each, stamped per file by the host under
+    // `$VL_TEST_TRACE=1` (see `test_trace_stamp`). The assertion is two-sided and
+    // reads the SCHEDULE: `--jobs 4` must run all four concurrently, `--jobs 1`
+    // must run them one at a time.
+    //
+    // It reads the schedule and NOT a wall-clock ratio, because this file runs
+    // under CI's `deno test --parallel` sweep beside ~1,876 subprocess-spawning
+    // cases on 4 vCPUs. A ratio measures scheduling TIMES the box's free CPU, so
+    // under that saturation a silent fallback to serial and a merely busy runner
+    // are the same reading (~1.0). Overlap has no such ambiguity: contention
+    // makes each file take LONGER, which WIDENS the overlap rather than hiding
+    // it, so the measurement strengthens as the runner gets busier.
+    const par = await runTest(SLOW, ["--jobs", "4"], { VL_TEST_TRACE: "1" });
+    const ser = await runTest(SLOW, ["--jobs", "1"], { VL_TEST_TRACE: "1" });
 
     if (par.code !== 0 || ser.code !== 0) {
-      throw new Error(`the slow fixtures must all pass:\n${par.err}\n${ser.err}`);
+      throw new Error(
+        `the slow fixtures must all pass:\n${par.err}\n${ser.err}`,
+      );
     }
     expectHas(par.err, "4 files · 4 passed · 0 failed");
-    if (parallelMs > serialMs * 0.7) {
+
+    const parIntervals = traceIntervals(par.err, "run");
+    const serIntervals = traceIntervals(ser.err, "run");
+    for (
+      const [jobs, got] of [["4", parIntervals], ["1", serIntervals]] as const
+    ) {
+      if (got.length !== 4) {
+        throw new Error(
+          `--jobs ${jobs} stamped ${got.length} run intervals, want 4 — ` +
+            `is $VL_TEST_TRACE still wired?`,
+        );
+      }
+    }
+
+    const parPeak = peakConcurrency(parIntervals);
+    if (parPeak !== 4) {
       throw new Error(
-        `expected parallel scheduling: --jobs 4 took ${parallelMs.toFixed(0)}ms, ` +
-          `--jobs 1 took ${serialMs.toFixed(0)}ms (ratio ${(parallelMs / serialMs).toFixed(2)}, want < 0.70)`,
+        `--jobs 4 ran at most ${parPeak} file(s) at once, want 4 — ` +
+          `the runner is not scheduling files concurrently:\n${par.err}`,
+      );
+    }
+
+    // The other side of the claim: `--jobs 1` is honoured rather than ignored.
+    const serPeak = peakConcurrency(serIntervals);
+    if (serPeak !== 1) {
+      throw new Error(
+        `--jobs 1 ran ${serPeak} files at once, want 1 — serial scheduling is ` +
+          `not honoured:\n${ser.err}`,
       );
     }
   },
