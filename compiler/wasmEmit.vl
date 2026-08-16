@@ -14,6 +14,7 @@ import {
   nodeArrayElemIsNulStr,
   nodeLitMembersWithin,
   nodeLitUnionMemberTexts,
+  nodeTyIsLitUnion,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
   nodeTyIsNulLitUnion,
@@ -2124,6 +2125,63 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
         fbI32Const(parseI32(lv))
         fbI32Bin(70) // 0x46 i32.eq
         return 0
+      }
+    }
+  }
+  // `u is K` over a literal-union receiver whose REP IS ITS MEMBER STRING, not an
+  // interned atom. Both reps exist and `nodeTyIsLitUnionAlias` decides which: the atom
+  // valtype ladders carry a litunion only where its emit-time spelling is a registered
+  // ALIAS NAME, so a litunion with no alias of its own — the flattened `A | B`, and the
+  // bare inline spelling — stays a `(ref $array)` string at `RC_ROOT` and `RC_FN_PARAM`
+  // (`ctxKeepsLitUnion`). The receiver classifier agrees with the ladder by construction
+  // (`localLitUnion`/`exprIsLitAtom` key on the same alias test), so this arm is reached
+  // only where the value really is a string, and every path above has declined for the
+  // matching reason: the atom ladder because there is no atom, `nameIsLitUnionArmValueUnion`
+  // and the tag compares because an all-literal member set carries no box.
+  //
+  // The test is the SAME membership the atom ladder emits — the tested type's member set,
+  // ORed — lowered through string equality instead of interned-id equality: `recv == "m0"
+  // || recv == "m1" || …`, i.e. the `is <literal>` arm below repeated over the set. Without
+  // it the guard reached `monoStaticIsResult`, which sees a non-union REP and a tested name
+  // that is no variant row, and CONST-FOLDED IT TO FALSE — a branch that can never run,
+  // `vl check --codegen` clean.
+  if nd0 is IsExpr {
+    if !exprUnion(nd0.isObj, fnIx) && !exprIsLitAtom(nd0.isObj, fnIx) {
+      if nodeTyIsLitUnion(nd0.isObj) {
+        const lsTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
+        if lsTexts.length > 0 {
+          // The receiver's OWN members are all in the tested set: true by construction,
+          // and folded without evaluating the receiver — the atom ladder's twin fold.
+          if nodeLitMembersWithin(nd0.isObj, lsTexts) {
+            fbI32Const(1)
+            return 0
+          }
+          // Two or more members RE-READ the receiver, so those need a re-readable place
+          // (`unionEqOperandOk`); a one-member tested type evaluates it exactly once and
+          // accepts any receiver expression.
+          let lsOk = lsTexts.length == 1
+          if unionEqOperandOk(nd0.isObj) { lsOk = true }
+          if lsOk {
+            if !aUsed {
+              return emitFail(
+                "emitProgram: literal-union `is` test but array type not collected",
+              )
+            }
+            let lsI = 0
+            while lsI < lsTexts.length {
+              if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+              if emitExpr(body, mkStr(quoteLex(lsTexts[lsI]), -1), fnIx) < 0 {
+                return -1
+              }
+              if emitStrEqCore(body) < 0 { return -1 }
+              if lsI > 0 {
+                fbI32Bin(114) // 0x72 i32.or
+              }
+              lsI = lsI + 1
+            }
+            return 0
+          }
+        }
       }
     }
   }
