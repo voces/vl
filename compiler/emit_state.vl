@@ -522,19 +522,32 @@ export let coalesceCallBoolSlot = 0
 // source needs no stash. Flagged by `fnHasVariantRebox`.
 export let fnUsesVariantRebox = false
 export let variantReboxSlot = 0
-// ── union-box RETURN SINK ────────────────────────────────────────────────────
-// A function whose result rep is the shared union box `{tag: i32, payload: anyref}`
-// constructs one box PER `return` — one allocation site per union ARM. Binaryen's
-// Heap2Local scalarizes per allocation SITE, so two sites merging into one value melt
-// neither: the box survives the whole release profile the moment the payload is read.
-// The sink gives such a function ONE construction site: every `return` writes the two
-// operands into these two slots and branches to a single exit block, which performs the
-// only `struct.new`. Two slots — an i32 tag and an `anyref` payload, both defaultable,
-// so nothing pre-seeds them. Flagged by `fnUnionRetSinkOk` (the prediction); the exit
-// block and its `struct.new` are emitted only when `uSinkFired` says a `return` actually
-// took the sink, so an over-firing prediction costs two unused local declarations and
-// never a dead allocation.
+// ── union-box SINK ───────────────────────────────────────────────────────────
+// A value whose rep is the shared union box `{tag: i32, payload: anyref}` and that is
+// produced on TWO branches gets one construction site per branch. Binaryen's Heap2Local
+// scalarizes per allocation SITE, so two sites merging into one value melt neither: the
+// box survives the whole release profile the moment the payload is read. The sink gives
+// the merge ONE construction site — each branch writes the box's two operands into these
+// two slots and the single `struct.new` is performed once, past the merge.
+//
+// Two positions take it, and they share ONE frame: an i32 tag slot then an `anyref`
+// payload slot, both defaultable, so nothing pre-seeds them. The pair is live only from a
+// branch's write to the construction that reads it, with no instruction of the other
+// position in between — a sunk `return` branches straight to the exit block, and a sunk
+// binding arm falls straight to the `if`'s `end` — so one frame serves both.
+//
+//   • RETURN position (`fnUsesUnionSink`, predicted by `fnUnionRetSinkOk`): every `return`
+//     of a union-box-returning function writes the pair and branches to a single exit
+//     block that performs the only `struct.new`. The block is emitted only when
+//     `uSinkFired` says a `return` actually took the sink, so an over-firing prediction
+//     costs two unused local declarations and never a dead allocation.
+//   • BINDING position (`fnUsesUnionLetSink`, predicted by `fnUnionLetSinkOk`): a
+//     `let`/`const` whose init is a union-box if-EXPRESSION writes the pair in each arm of
+//     the void `if` and builds the box once after it. That also retires the arm-merge
+//     pre-seed the binding's non-defaultable `(ref $uBox)` slot would otherwise need, so
+//     the shape goes from one site per arm PLUS the pre-seed to exactly one.
 export let fnUsesUnionSink = false
+export let fnUsesUnionLetSink = false
 export let unionSinkBase = 0
 // How many `return`s took the sink in the function being lowered. Reset per function;
 // read AFTER the body is lowered to decide whether the exit block is emitted at all.

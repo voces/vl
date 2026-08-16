@@ -114,9 +114,11 @@ const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }
   // `-O3` and not before; at one site plain escape analysis suffices and both fixtures melt
   // a rung EARLIER than they used to.
   { fixture: "union-box-call", none: 3, O: 0, O3: 0 },
-  // `union-box-branch-local` writes a `let` on two branches INSIDE one function. Those two
-  // sites never reach the return path, so the sink does not see them and this row is
-  // unmoved — it is the pin for the phase-2 slice (`unboxed-union-rep-design.md` §6).
+  // `union-box-branch-local` writes a `let` on two branches by SEPARATE statements — an
+  // init and an assignment inside an `if`. There is no merge point for a box to sink into,
+  // so neither sink sees it and this row is unmoved. Collapsing it needs the binding's slot
+  // to hold the tag/payload pair across a liveness window, which is a rep question and not
+  // a sink (`unboxed-union-rep-design.md` §12.4).
   { fixture: "union-box-branch-local", none: 4, O: 4, O3: 2 },
   { fixture: "list-wrapper-push", none: 6, O: 3, O3: 2 },
   // `union-box-call` with its payload READ instead of discarded. The read still blocks the
@@ -129,6 +131,13 @@ const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }
   // in each arm, which read 4/4/4 until the return path split it into per-arm exits. The
   // two rows must stay equal: they are one program in two spellings.
   { fixture: "union-sink-if-expression", none: 3, O: 2, O3: 2 },
+  // The SAME program a THIRD way: a `const` BINDING whose init is the if-expression. It
+  // read 5/4/4 — a box per arm plus the null box pre-seeded into the binding's
+  // non-defaultable slot, which a void-`if` merge does not definitely assign. The BINDING
+  // SINK writes the pair in each arm and builds the box once after the `if`, which
+  // dominates every read and so retires the pre-seed too: three sites become one. All
+  // three spellings must now read the same.
+  { fixture: "union-sink-let-if", none: 3, O: 2, O3: 2 },
 ];
 
 // Loop SHAPE per rung, per fixture in `tests/fixtures/opt-loop/`.

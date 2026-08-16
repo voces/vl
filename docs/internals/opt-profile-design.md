@@ -69,25 +69,26 @@ sites (`struct.new*` / `array.new*`) surviving in the module**, read out of
 | `list-wrapper-call` | same list, built by a helper across a call | 3 | **0** | **0** |
 | `union-box-call` | `i64 \| boolean` from a helper, `is`-narrowed in the loop | 3 | **0** | **0** |
 | `union-box-payload-read` | same, with the narrowed payload READ | 3 | 2 | **2** |
-| `union-box-branch-local` | same box via a `let` written on two paths | 4 | 4 | **2** |
+| `union-box-branch-local` | same box via a `let` written on two SEPARATE statements | 4 | 4 | **2** |
 | `list-wrapper-push` | scratch list GROWN by `.push` each trip | 6 | 3 | **2** |
 
 The count is over the whole module, which is the honest upper bound: unoptimized,
 some sites live in helpers the loop calls; optimized, everything reachable has
 been inlined into the one loop, so the module IS the loop.
 
-The three `union-sink-*` fixtures in the same directory belong to the return-path
-box sink and are pinned by `tests/vl_union_return_sink_test.ts`, not here.
+The four `union-sink-*` fixtures in the same directory belong to the box sink and
+are pinned by `tests/vl_union_return_sink_test.ts`, not here.
 
 **The headline: what decides whether a union box melts is the number of
 CONSTRUCTION SITES, and the rung needed follows from it.** At one site plain escape
 analysis suffices and `-O` melts the box; at two or more the box can only go through
-`--closed-world` type refinement, which is the `-O3` rung. The return-path sink gives
-a multi-armed producer one site, which is why `union-box-call` now melts a rung
+`--closed-world` type refinement, which is the `-O3` rung. The box sink gives a
+multi-armed producer one site, which is why `union-box-call` now melts a rung
 earlier than the profile's first measurement found. `union-box-branch-local` writes
-its `let` on two branches *inside* one function, never reaches the return path, and
-so still needs `-O3` — and still leaves two sites. §3 item 0 is where that rule is
-stated in full; it is the SITE COUNT, not whether the payload is consumed.
+its `let` from two SEPARATE statements — an init and an assignment inside an `if` —
+so there is no merge point for a box to sink into, and it still needs `-O3` and
+still leaves two sites. §3 item 0 is where that rule is stated in full; it is the
+SITE COUNT, not whether the payload is consumed.
 
 ---
 
@@ -219,13 +220,22 @@ fixtures so the rule stays honest.
    allocation sites just as surely as a `let` written on two branches is. The site
    count is a property of the PRODUCER, not of how the consumer binds it.
 
-   **And there is no VL spelling that fixes it** — measured, three ways. A single
+   **And there was no VL spelling that fixed it** — measured, three ways. A single
    `return` of an `if`-expression and a single `return` of a local assigned on two
-   branches BOTH still emit two sites and both stay 4 → 4 (I verified both
+   branches BOTH still emitted two sites and both stayed 4 → 4 (verified
    independently). `emitUnionIfValue` routes each arm through `emitUnionCoerce`,
-   so the arm count is the site count regardless of syntax. That is precisely why
+   so the arm count was the site count regardless of syntax. That is precisely why
    #1320 refuses a documented-pattern answer and recommends an emitter-side
-   return-path box-sink instead: there is no pattern to document.
+   box-sink instead: there is no pattern to document.
+
+   **THE SINK HAS SINCE CLOSED EVERY SPELLING BUT THIS ONE, so the row that
+   survives is narrower than the rule above states.** A multi-`return` producer,
+   a `return` of an if-expression and a `const u = if c { a } else { b }` BINDING
+   all reach one site and melt at `-O`. What is left is the literal shape of this
+   fixture — an init and a LATER assignment, two writes with no merge point
+   between them — and closing it means holding the tag and payload across a
+   liveness window rather than rewriting a join, which is a REP question.
+   `unboxed-union-rep-design.md` §12.4 has the argument and the before-number.
 
 2. **The BACKING ARRAY of a grown list.** In `list-wrapper-push` the
    `{backing, len, cap}` wrapper itself melts completely — zero `struct.new` at

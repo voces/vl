@@ -1027,3 +1027,154 @@ nodes in a module-global array. Self-compile wall clock is inside the noise (min
 interleaved: A 1,499 ms, B 1,586 ms at load 22.9, distributions fully overlapping), which
 is the expected reading for a change that moves neither the site count nor the allocation
 count of the module being timed.
+
+---
+
+## 12. THE BINDING — §10.4's `let` row, and the half of it that is a sink
+
+§10.4 filed *"a `let` assigned on two branches"* as one remaining shape. **It is two
+shapes, they fail for different reasons, and only one of them is a sink.** Splitting them
+is the first result of this section; closing the sinkable one is the second.
+
+| spelling | why it had two-or-more sites | closed by |
+|---|---|---|
+| `const u: A\|B = if c { a } else { b }` | one box per arm PLUS a pre-seed | **this section** |
+| `let u: A\|B = a; if c { u = b }` | two writes, no merge point to sink into | **not a sink** — §12.4 |
+
+`A` = the worktree's `master` compiler at its native fixpoint (1,139,472 B), `B` = this
+change at its own (1,141,227 B, `compile(B) == B` byte-for-byte from a freshly fetched
+`seed-latest`). Same binaryen 130, same wasm-tools 1.256, same wasmtime-via-`vl-host`.
+
+### 12.1 The binding shape had THREE sites, not two — and the third is dead
+
+`emitNullableIfBinding` already lowered a union-box binding as a VOID `if` whose arms each
+`local.set` the binding's own slot, so the value-typed-`if` merge §11 had to split was
+never there. It still read 5/4/4, and the reason is the site the arm count does not
+predict: the slot is a non-null `(ref $uBox)`, which is **not defaultable**, and a void-`if`
+merge does not satisfy the validator's definite-assignment check, so the rep's NULL BOX was
+constructed before the `if` and overwritten on every path. Two arms, three sites, and the
+third one allocates on every trip and is read by nothing.
+
+### 12.2 The transform is §10.5's peephole at a second position
+
+Each arm's value is lowered exactly as before; when its last written instruction is the
+box's own `struct.new $uBox`, the same two conditions §10.5 states unwrite it and pop its
+operands into the sink pair. The single `struct.new` then follows the `if` and stores the
+binding. **The pre-seed goes with it** — not as an optimization but as a consequence: one
+store, dominating every read, is definite assignment.
+
+So the shape drops from `arms + 1` sites to exactly ONE, and the arm count stops mattering:
+a three-armed `else if` chain is also one, and an else-LESS chain's null path writes the
+tag and payload directly instead of building a box for the merge to discard.
+
+**The two sinks share ONE frame** (`fbUsesSinkPair` is the single condition behind the
+reservation, the locals count and the two valtype runs). The pair's live ranges cannot
+interleave: a sunk `return` branches straight to the exit block, a sunk binding arm falls
+straight to the `if`'s `end`, and an arm's value is an EXPRESSION, so no `return` can be
+emitted between an arm's write and the construction that reads it. That argument is what
+`tests/cases/unions/let-if-binding-sink-with-returns.vl` exists to witness — both nestings,
+checked behaviourally, because the failure mode is reading a value from the wrong producer
+rather than failing to validate.
+
+### 12.3 Two arm shapes DECLINE, and the gate is static
+
+`unionIfBindingAllBox` refuses the whole rewrite unless every terminal arm constructs:
+
+- an arm whose value is itself an if-expression lowers as `emitUnionIfValue`'s value-typed
+  `if`, so its last instruction is a frame `end` and there is no construction to unwrite;
+- an arm passing an EXISTING union through builds no box at all.
+
+The second is the one that has to be a GATE rather than a per-arm decline, and this is
+where binding position differs from return position. A declining EXIT is free — it emits an
+ordinary `return` and is one fewer predecessor of the block (§10.5 consequence 1). A
+declining ARM is not: the `if` has one join, so a mixed `if` would have to unbox the
+passthrough arm and rebuild it after the merge, **trading no site for an allocation that
+executes every trip at the default rung**. `emitUnionArmToPair` still contains that
+unbox/rebuild as the backstop for a mispredicted arm — correct at exactly that price — but
+the gate is what keeps it unreached.
+
+### 12.4 The other half needs a REP change, and that is the honest answer
+
+`union-box-branch-local` / §8.3's `spell2` is unmoved at 4/4/2 and this change does not
+touch it:
+
+```vl
+let u: i64 | boolean = true   // site 1
+if i % 2 == 0 { u = 7 }       // site 2
+```
+
+The two writes are SEPARATE STATEMENTS. There is no merge point for a box to sink into —
+the `if` has no else, and `u` is live out of both paths — so the sink has nothing to
+rewrite. Collapsing it means holding the tag and payload in the pair across a LIVENESS
+WINDOW (from the declaration to the first read of `u`), proving every write in that window
+constructs and no read occurs inside it, and materialising the box at the window's end.
+That is §6's candidate (c), local scalarization, filed there as *"the signature layer"* and
+not recommended: it changes what a union-typed local IS between two program points, which
+is a representation question and not a peephole. **A measured "this is bigger than filed"
+is the result for this row**, and `tests/vl_union_return_sink_test.ts` keeps it pinned at 2
+so a future attempt has its before-number.
+
+### 12.5 The melt, and the rung — this one is NOT a wash at plain `vl build`
+
+`tests/fixtures/opt-melt/union-sink-let-if.vl` is `union-box-payload-read`'s program in the
+binding spelling; all three spellings must now read the same, and do.
+
+| fixture | box sites A→B | allocs none | allocs `-O` | allocs `-O3` |
+|---|---:|---:|---:|---:|
+| `union-sink-let-if` | 3 → **1** | 5 → **3** | 4 → **2** | 4 → **2** |
+| `union-box-payload-read` (unmoved) | 1 | 3 | 2 | 2 |
+| `union-sink-if-expression` (unmoved) | 1 | 3 | 2 | 2 |
+
+100 M trips of the same loop, interleaved A/B, **CPU milliseconds** (`scripts/p7-time.sh`,
+min and median of 7) because the box was at load 80–88 and a wall-clock ratio on the same
+runs swung between 1.02× and 1.40× at one rung. The optimizer's having RUN is asserted
+structurally in each timed artifact, per §10.7.
+
+| build | A min/med | B min/med | ratio (min) |
+|---|---:|---:|---:|
+| plain `vl build` | 750 / 772 ms | **551 / 602 ms** | **1.36×** |
+| `vl build -O` | 594 / 613 ms | **354 / 373 ms** | **1.68×** |
+| `vl build -O3` | 558 / 576 ms | **372 / 397 ms** | **1.50×** |
+
+The distributions do not overlap at any rung (A's fastest beats B's slowest every time).
+
+**§10.2's warning does not transfer, and the difference is the mechanism.** Phase 1 and
+§11 remove a MERGE POINT — A and B execute the same number of allocations, so there is
+nothing to win before Heap2Local arrives, and both were a wash at plain `vl build`. This
+removes an ALLOCATION: the pre-seed box was built and discarded on every trip, so three
+allocations per trip become two and the default rung improves by 1.36× on its own. The
+`-O` column is then the merge win on top of it. **Quote either number with its rung**; they
+are not the same claim.
+
+### 12.6 The population — 53 sites over 6 modules
+
+Corpus at this base (`tests/cases` + `std` + `bench`, 1,831 files, 1,544 building, and the
+SAME 1,544 on both sides — no module moved to or from invalid wasm). Union-box construction
+sites **1,551 → 1,498**: 53 removed, none added.
+
+| module | sites | bytes |
+|---|---|---:|
+| `functions/inferred-nullable-if-binding.vl` | 19 → **6** | +11 |
+| `functions/nullable-if-expr-binding.vl` | 16 → **5** | +9 |
+| `functions/else-less-if-expression-binding.vl` | 15 → **5** | +10 |
+| `functions/inferred-if-binding-ident-arm.vl` | 12 → **4** | +8 |
+| `unions/let-if-binding-arms.vl` | 21 → **12** | +15 |
+| `unions/union-if-value-variant.vl` | 8 → **6** | +2 |
+
+Corpus total **+55 B (+0.0022%)** over 1,544 modules, 6 up, 0 down — and the six byte movers
+are exactly the six site movers, so nothing moved that did not sink. The fifth row is the
+case this change ADDS, compiled by both compilers from the same source; the other five are
+population.
+
+§10.3's correction applies here in the opposite direction from §11.3's. The SPELLING is
+rare — 15 source sites in 8 files at A's base — but each one loses `arms` sites rather than
+`arms − 1`, because the pre-seed goes too. That is why a shape §11 found four instances of
+yields 53 here: `nullable-if-expr-binding.vl` alone holds six bindings, and a two-armed one
+is a 3 → 1.
+
+### 12.7 The compiler pays for the code and gains nothing from the transform
+
+`vl-compiler.wasm` 1,139,472 → 1,141,227 B (**+1,755 B, +0.154%**), and the whole of it is
+the new lowering: the module's union-box construction sites are **52 → 52** and its total
+allocation sites **4,826 → 4,826**. The compiler writes no union-box `let … = if …` binding
+at all, which is the same reading §11.4 records for the if-expression split.
