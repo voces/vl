@@ -27,8 +27,8 @@ Deno fills **six distinct roles**. Each is removed by a different front:
 | # | Role | What depends on it | Removed by |
 |---|------|--------------------|------------|
 | J0 | **TS-oracle brain** | ~~the `compiler/*.ts` graph, corpus adjudication~~ → DONE: TS front end DELETED; `deno check`/`deno lint` now cover only the surviving type leaves + JS tooling | — (the TWO COMPILERS are now one) |
-| J1 | **V8 wasm executor** | `runWasm` in the corpus/selfhost tests; the deno-side golden + emit suites | Folding RUN/CHECK onto the native (wasmtime) tier — F-tiers |
-| J2 | **Test harness** | all 52 `tests/*.ts` (`Deno.test`) | `vl test` for behavioral `.vl`; `node --test` for TS-infra tests |
+| J1 | **V8 wasm executor** | `runWasm` in **four** tests (the deno-side golden + emit suites are gone) | Folding RUN/CHECK onto the native (wasmtime) tier — F-tiers |
+| J2 | **Test harness** | all 51 `tests/*.ts` (`Deno.test`) | `vl test` for behavioral `.vl`; `node --test` for TS-infra tests |
 | J3 | **Build/dev scripts** | `deno run scripts/*.ts` | port load-bearing scripts to `.vl`/Node; retire/move dev-only ones |
 | J4 | **Bundling** | `lsp` esbuild build, `playground/build.ts` | esbuild-on-Node (deps already node-resolvable) |
 | J5 | **Distribution** | ~~`deno compile`~~ → DONE: native `vl` host, seed embedded (`release.yml`) | — (shipped, H-M2) |
@@ -57,16 +57,24 @@ already removes it; spend effort only on the genuinely Deno-specific residue (J1
 
 ### J1 — the V8 wasm executor (🟡 in progress as F-tiers)
 - Tests execute emitted wasm with `runWasm` (Deno's V8). The native tier runs the *same bytes*
-  under wasmtime (`scripts/vl-host`), already gated by `ci-native` (native fixpoint, golden
-  byte-tripwire, corpus alignment).
-- **Action:** finish F-tiers — delete the `SELFHOST_DENO_RUN`-gated RUN half + 305-file whitelist
-  + V8-side golden/emit suites once the native tier is the undisputed runner; fold the deno-side
-  CHECK verdicts the same way when the native checker gates message/span parity. After this Deno
-  never *executes* wasm — it only *orchestrates* `Deno.test`, which J2 removes.
+  under wasmtime (`scripts/vl-host`), already gated by `ci-native` (native fixpoint, corpus
+  alignment; the golden byte-tripwire that once sat alongside them is retired — redundant with the
+  fixpoint, → `CHANGELOG.md`).
+- **Action, RE-SCOPED — the deletions this bullet named are already done.**
+  `SELFHOST_DENO_RUN` no longer exists anywhere in the tree, and with it went the corpus RUN half,
+  its 305-file whitelist, the V8-side golden fixpoint and the emit-program suite. **The surviving
+  V8 executor is exactly four files**, all reaching V8 through `tests/support/runWasm.ts`:
+  `cases_wasm_test.ts`, `vl_exported_memory_test.ts`, `vl_global_promotion_test.ts`,
+  `vl_reexport_abi_test.ts`. Move those onto the native runner. `cases_wasm_test.ts` is the **sole
+  behavioral corpus oracle** and its `EXPECTED_DIVERGENCES` list is load-bearing, so it is a
+  re-host, not a delete. Fold the deno-side CHECK verdicts the same way when the native checker
+  gates message/span parity. After this Deno never *executes* wasm — it only *orchestrates*
+  `Deno.test`, which J2 removes.
 
 ### J2 — the test harness (the hard core)
-All 52 `tests/*.ts` are `Deno.test`. Split by subject:
-- **Behavioral `.vl` corpus** — `cases_test.ts`, `cases_wasm_test.ts`, and the `selfhost_*` suites.
+All 51 `tests/*.ts` are `Deno.test` (`cases_test.ts` is gone — it was a TS-parity suite, deleted
+with the TS host). Split by subject:
+- **Behavioral `.vl` corpus** — `cases_wasm_test.ts` and the `selfhost_*` suites.
   Migrate to native + `*.test.vl` under **`vl test`** (designed: `docs/internals/test-runner-design.md`;
   charted in ROADMAP Next — new behavioral tests switch to `*.test.vl` at `vl test` v1, and the
   directive-corpus conversion waits for the TS-tier teardown). This is the bulk of the harness and

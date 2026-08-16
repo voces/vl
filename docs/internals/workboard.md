@@ -192,14 +192,21 @@ speed one*: the profile has not moved across slices since `8d2471e`.
 
 ### 3d. Performance — runtime
 
-⚠️ **`perf-landscape.md` §1/§3/§4 are pre-`1d3a8559`** and understate VL by up to
-4.3× on headline rows (`str-eq` 14.02x → **6.88x**; `lambda-hot` 11.07x → **2.55x**;
-`dispatch-table` 3.34x → **1.00x, off the loss list**). Current distribution is
-**16 WIN / 15 PAR / 7 LOSS / 7 PRIORITY-LOSS**. Quote `bench/results/summary.md`.
+`perf-landscape.md`'s §1/§3/§4/§6/§7 **now carry the `1d3a8559` sweep alongside the
+08-02 tables**, each moved row marked. Current distribution is **16 WIN / 15 PAR /
+7 LOSS / 7 PRIORITY-LOSS**; median `vl/deno` **1.00** (was 1.04), median `vl/rust`
+**2.29×** (was 2.49×). Quote `bench/results/summary.md`, which labels itself
+**PRELIMINARY** — it re-ranks the landscape, it does not settle it.
+
+**The loss COUNT is 14 on both sweeps.** The PRIORITY tier went 9 → 7;
+`dispatch-table` (3.34 → 1.00) and `mutual` (2.37 → 1.22) left the loss list,
+`map-i32` and `nbody` slid in across the 1.25 threshold. **Not one Python red alert
+cleared** — six rows carried the flag on 08-02 and the same six carry it now, which
+is the standing argument for G1/G3.
 
 | id | item | measured | status | eff | risk |
 |---|---|---|---|---|---|
-| **G1** | **P7 (the real one) — cache a string's hash** | **up to 4.6× on long keys**; clears 3 of 4 Python red alerts; `__str_hash__` is also 4.75% of a self-compile | OPEN, **site not pinned**. ⚠️ the shipped #1342 was a 4-wide unroll worth **1.135×** — *not* this item | L | med-high |
+| **G1** | **P7b — cache a string's hash** (the landscape now splits **P7a** shipped / **P7b** open) | filed at **up to 4.6× on long keys**; clears 3 of 4 Python red alerts; `__str_hash__` is also 4.75% of a self-compile | OPEN, **site not pinned**, and **RE-PRICE FIRST**: both figures predate #1342's unroll (P7a, **1.135×**, which halved the per-code-point walk to 1.10 ns) and neither has been re-measured. P7a's own bound: at short keys the whole walk is ~11 ns of a ~63 ns probe | L | med-high |
 | **G2** | **P2 follow-on (a)** — hoist the closure unpack out of loops | **10.6×** where it applies (1072.7 → 101.5 ms) | OPEN. Note the self-hosted compiler does not exercise this path at all | M | low |
 | **G3** | **P12 — UTF-8 bytes for `string`** | **27.7×** on the compare; VL's `string` is 4 bytes/code point | OPEN | XL | high — `memory-gc-design.md §2.2` argues 4× denser but strictly *less* scannable under WasmGC |
 | **G4** | **P13 — linear-memory backing for scalar arrays** | **3.41×** on matmul's kernel | OPEN | XL | high |
@@ -219,9 +226,9 @@ in-file). `flat` records as a compiler perf lever (targets the wrong half).
 |---|---|---|
 | **H1** | **F5 — settle VL vs Vital** | OPEN, real. ~13 live sites; `lsp/package.json` `displayName` is a published surface |
 | **H2** | **F9 — perf regression gate vs the NATIVE binary** | OPEN. Design below |
-| **H3** | **F-tiers residue** | OPEN but the row is **STALE** — `SELFHOST_DENO_RUN` no longer exists; the real residue is `cases_wasm_test.ts` executing under V8 |
-| **H4** | **Close F4 / F6 / F7 / F9b** | **MOOT or STALE.** F7's only occurrence of `paramater` is the ROADMAP line filing it; F4's `m.validate()` is a binaryen-JS API the emitter no longer uses; F6 names a `deno task build` that does not exist |
-| **H5** | **Doc corrections** | `perf-landscape.md` §1/§3/§4 stale; P7 must be split (1.135× shipped vs 4.6× open); ROADMAP Track A's `A-infer-null` and `A-infer-empty` Map/Set rows describe shipped work |
+| **H3** | **F-tiers residue** | OPEN, **row RE-SCOPED in `ROADMAP.md`**. `SELFHOST_DENO_RUN` is gone; the residue is **four** tests executing emitted wasm under V8 via `tests/support/runWasm.ts` — `cases_wasm_test.ts` (the sole behavioral corpus oracle; must be re-hosted, not deleted) + `vl_exported_memory` / `vl_global_promotion` / `vl_reexport_abi` |
+| ~~**H4**~~ | ~~**Close F4 / F6 / F7 / F9b**~~ | **DONE.** All four closed in `ROADMAP.md` with their evidence: F7's only `paramater` was the filing row; F4 and F9b are moot together (no compile path builds binaryen IR — and `vl build` already runs wasmtime's `Module::validate`, gated by `tests/vl_build_validate_test.ts`); root `deno.json` has no `build` task, and AGENTS.md documents the build |
+| ~~**H5**~~ | ~~**Doc corrections**~~ | **DONE.** `perf-landscape.md` §1/§3/§4/§6/§7 re-derived against the 08-03 sweep with the 08-02 tables kept and marked superseded (and §5's P1/P2 rows, still filed as open, closed with their measured-vs-filed deltas); P7 split into **P7a** shipped 1.135x / **P7b** cache open, with a new `perf-program.md` §15; `A-infer-null` and `A-infer-empty` closed as shipped. **One find:** the `A-infer-empty` residue is NOT the surveyed "inferred i32 key" — the key is fine and the VALUE type is the axis, filed as the new **`A-infer-map-value`** row |
 
 ---
 
