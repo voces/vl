@@ -151,6 +151,7 @@ import {
   unionEqOperandOk,
   unionHasAtom,
   unionHasValueAtom,
+  unionStrArmCount,
   unionTakesAtomAsStr,
   unwrapParen,
 } from "./emit_base"
@@ -1978,6 +1979,27 @@ function emitNumLitEq(body: i32[], recvIx: i32, lv: string, fnIx: i32) {
   return 0
 }
 
+// The value-union NAME of an `is` RECEIVER, for the box-tag soundness floor in `emitIs`.
+// `unionNameOfExpr` covers every receiver form the tag compare has an arm for EXCEPT the
+// optional chain — `x?.y is i32` reads its field through `optChainStructIdxOf` rather than
+// through the expression classifier, so the chain's own leaf field is resolved here. ""
+// when the receiver is not a union (the floor then does not apply).
+function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
+  const nm = unionNameOfExpr(exprIx, fnIx)
+  if nm != "" { return nm }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is OptMember {
+    const si = optChainStructIdxOf(e.omObj, fnIx)
+    if si >= 0 {
+      const fi = sFieldIndex(si, e.omProp)
+      if fi >= 0 {
+        if sFieldTypeAt(si, fi) == 16 { return sFieldElemNameAt(si, fi) }
+      }
+    }
+  }
+  ""
+}
+
 // Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag), then
 // `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
@@ -2159,6 +2181,24 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
     // paths. Destringify D-ISTY: derived from the type the CHECKER resolved for this
     // `is` node, not from re-classifying the tested SPELLING — see `isArmTagOfTy`.
     const armTag = isArmTagOfTy(isVarTyIxOf(isIx))
+    // THE TAG COMPARE BELOW IS UNSOUND FOR A LITERAL-UNION TESTED TYPE OVER A BOX WITH
+    // TWO STRING-REPPED ARMS, and floors here rather than emitting a silent wrong answer.
+    // A litunion arm rides the box as its member STRING, so it shares kind 2's tag with a
+    // plain `string` arm (or with a second litunion arm) — `tag == 2` then answers `x is K`
+    // TRUE for every string the box holds, non-members included. The answer is the
+    // MEMBERSHIP arm above, which claims every re-readable PLACE receiver
+    // (`unionEqOperandOk`, which is what a per-member re-read needs). A receiver it cannot
+    // claim — a call result, an optional chain — has NO correct lowering here, so it gets
+    // the loud floor. One string-repped arm keeps the tag compare: `K | i32` reaches kind 2
+    // only through `K`, so the tag decides it exactly.
+    if armTag == 2 && tyIsLitUnion(isVarTyIxOf(isIx)) {
+      const amNm = isStrTagUnionNameOf(ndv.isObj, fnIx)
+      if amNm != "" && unionStrArmCount(amNm) > 1 {
+        return emitFail(
+          "emitProgram: `is` over a literal-union arm needs a re-readable receiver (a call / optional-chain receiver has no membership lowering)",
+        )
+      }
+    }
     if armTag >= 0 {
       // A union-typed IDENT receiver pushes its RAW box slot directly — even
       // when an outer arm has already narrowed it to a single atom (the last
