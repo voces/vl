@@ -30,6 +30,10 @@ error from a `@error` case, and breaks the suite.
 - **No `dynamic` / no implicit `any`.** There is no type that silently accepts
   every value and defers checking. Where a value can be one of several types, it
   has an explicit **union** type and must be narrowed before use.
+  ⚠️ The *diagnostics* do not say this yet: an unresolved hole prints as `any`
+  ("got any and string", "cannot assign `(any, any) -> any`"), which reads as
+  exactly the type this bullet denies exists. The claim is about the type system,
+  not the wording; the wording is filed as workboard **E7** (ROADMAP B17).
 
 ## The rules the corpus pins down
 
