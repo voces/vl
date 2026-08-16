@@ -214,3 +214,78 @@ so generic parameters stay freely testable and an already-errored operand gains 
 *The method note is the one this programme keeps re-learning: **the witnesses that find a defect
 shape the story told about it.** ROOT B was filed as a union bug because every witness had a union in
 it. The fix needed one line of gate and no union at all.*
+
+---
+
+## The litunion remainder, measured — the filed shape was wrong twice
+
+Probed on master @42bcd627 with a seed refreshed from that source. Every cell below is `vl check
+--codegen` **rc 0** — a silent wrong answer, not a diagnostic.
+
+### The trigger is a litunion ALIAS as the TESTED type, not a shared member
+
+The ranking called this shape "two litunions sharing a member". The shared member is irrelevant, and
+so is the count of arms carrying values:
+
+| probe | `is` answers | correct? |
+|---|---|---|
+| `type A = "x"\|"y"`, `type B = "z"\|"w"` (**disjoint**), `u: A\|B` → `u is A` | FALSE | ❌ |
+| same, `u is B` | FALSE | ❌ |
+| `type A`, `type B` **sharing** `"y"`, `u is A` | FALSE | ❌ |
+| both arms, both directions, `const`/`let`/**parameter** receivers | FALSE | ❌ |
+
+Disjoint fails identically to overlapping, and **both arms** answer FALSE — so the union is not
+mis-discriminated, it is **un**-discriminated. It fails CLOSED (an `if` branch that never runs),
+which is a different and safer class than #1344's newtype cells (a value laundered into the wrong
+type).
+
+### The isolating probe
+
+One receiver, one union, one value, two spellings of the same test:
+
+```vl
+type A = "x" | "y"
+type B = "z" | "w"
+function probe(u: A | B) {
+  if u is "x" { print("lit:yes") } else { print("lit:no") }       // lit:yes    ✅
+  if u is A   { print("aliasA:yes") } else { print("aliasA:no") } // aliasA:no  ❌
+  0
+}
+probe("x")
+```
+
+The receiver's rep and the membership ladder are both HEALTHY — the bare-literal spelling answers
+correctly on the identical value. What fails is resolving the ALIAS to its member set on that path,
+so the ladder never fires and the test folds to `i32.const 0` (confirmed in the disassembly).
+
+**This is not ROOT A.** ROOT A is "one tag cannot separate overlapping arms". Here there is no tag
+compare to get wrong and no overlap to separate: the receiver is a compact interned atom, the correct
+lowering (a membership ladder) already exists and demonstrably works one line above, and the alias
+spelling simply fails to reach it. Re-filing the litunion remainder under ROOT A's fix shape would
+have built a membership test that is already built.
+
+### Why the one-alias case works, and what that bounds
+
+| union | classified as | `is A` |
+|---|---|---|
+| `A \| string`, `A \| i32`, `A \| string \| i32` | value union, litunion ARM (#1340's `nameIsLitUnionArmValueUnion`) | ✅ correct |
+| `A \| B` (every member a string literal) | **pure** litunion — a compact atom, no box | ❌ always FALSE |
+
+#1340's gate is reached only when a NON-litunion arm forces the box. Two litunion aliases flatten to
+an all-literal member set, which is a pure litunion, which takes the atom path — the one #1340 never
+touched.
+
+### Numeric literal unions are a separate, deeper cut
+
+`type K = 1 | 2` / `type K = 1.5 | 2.5` beside `i32` / `f64` also answer FALSE, but for an unrelated
+reason: `tyIsLitUnion` requires **every** member `litKind == "str"`, and `tyLitMemberTexts` collects
+only `"str"` members. VL models `"str"`, `"flt"` and integer literal types (`litBaseTy`), so the whole
+litunion machinery — classification AND member extraction — is string-only by construction. A numeric
+litunion is not a "litunion" anywhere in the compiler, so no gate declines it; it is never a candidate
+at all. Fixing these is not the same change as the alias-resolution cut above, and should not be
+bundled with it.
+
+*Method note, again: **the witnesses shape the story.** This family was filed from cells that all had
+a shared member, so the shared member entered the description; it turned out to be a coincidence of
+how the probes were written. The one-line disproof — swap the members to disjoint sets and rerun —
+cost less than the reasoning that preceded it.*
