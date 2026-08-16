@@ -388,6 +388,10 @@ a shared member, so the shared member entered the description; it turned out to 
 how the probes were written. The one-line disproof — swap the members to disjoint sets and rerun —
 cost less than the reasoning that preceded it.*
 
+**CLOSED — see the section at the end of this file.** The filed mechanism is exactly right; what it
+does not say is that the answer is a FOURTH rep with its own lowering, and that the shape reaches two
+reps rather than one.
+
 *And the note the third filing adds: **a claim about a REP is only worth what the disassembly says.**
 "The receiver is an atom" was asserted from the type's classification (`tyIsLitUnion` answers YES for
 the flattened member set) and never read off the emitted module; the valtype is decided one predicate
@@ -469,3 +473,113 @@ compare, and answer it by poisoning the arm rather than by reading it.** The thr
 named state the structural-typing contract in their own headers; no amount of staring at
 `variantFieldCodesEq` would have produced them, and without them "just delete the exemption" reads
 like a defensible option.*
+
+
+---
+
+## D2 (numeric literal unions) is CLOSED — the machinery was not half-converted, a FOURTH rep was added
+
+The filing above is right about the cause and says nothing about the answer, and the two are not the
+same question. This section records what the answer turned out to be, because the obvious reading of
+that filing — *"widen `tyIsLitUnion` and `tyLitMemberTexts` to the numeric kinds"* — is the
+half-converted classifier the rest of this document warns about, and it would have shipped invalid
+wasm.
+
+### The rep, from the disassembly, before any lowering was written
+
+| spelling | valtype of the binding | `is K` on master |
+|---|---|---|
+| `type K = 1 \| 2`, `const k: K` | `(local i32)` | `i32.const 0` — folded FALSE |
+| `const x: K \| i32` | `(local i32)` — **no box, no tag** | `i32.const 0` |
+| `type K = 1.5 \| 2.5`, `const x: K \| f64` | `(local f64)` — no box | `i32.const 0` |
+| `const x: K \| string` (K numeric) | `$uBox {i32, anyref}` | loud emit reject |
+| *(control)* `type K = "a" \| "b"`, `const x: K \| string` | `$uBox` | tag + `__str_eq__` membership |
+
+The mixed `K | i32` and `K | f64` unions **collapse to their base scalar entirely** — every member
+softens to the one scalar, so the union has one rep and carries no discriminant at all.
+`literal-unions/numeric-litunion-alias.vl` already pinned that contract for READS; what it did not
+say is that it makes `is` a value question with no tag to consult.
+
+**That is why widening `tyIsLitUnion` would have been wrong.** `tyIsLitUnion` is not "is this a union
+of literals" — it is the **ATOM-rep classifier**, read by ~25 sites across `emit_rep` / `emit_classify`
+to claim the interned-i32-atom valtype ladder. A numeric litunion does not rep as an atom; it reps as
+its base scalar, and the compiler already says so in a different vocabulary (`numLitUnionBaseName`,
+`softenLitTy`, `unionParamPinName`'s numeric arm). Making the string-only predicate answer YES for
+numeric member sets would have handed the atom ladder an `f64`.
+
+So the classification gap in the filing is real and the fix for it is **not** to close it in place.
+The two extractors partition the literal KINDS exactly as the two REPS do, and the numeric side got
+its own pair (`tyNumLitMemberTexts`, `nodeNumScalarBaseName`) rather than a widened one.
+
+### Two arms, because the shape reaches two reps
+
+- **unboxed** (`K`, `K | i32`, `K | f64`, `K | i64`, `A | B`, the inline `(1|2) | i32`): membership
+  over the value, `x == m0 || x == m1 || …`, in the base's own compare.
+- **boxed** (`K | string` — a numeric litunion beside a different rep): the tag-gated payload compare
+  `emitUnionLitIs` per member, ORed. This is the numeric twin of #1340's arm and membership for the
+  same reason: `K ⊆ i32`, so the arm shares kind 0's tag with any `i32` arm.
+
+**The unboxed arm checks BOTH bases and requires them to agree** — the tested type's
+(`numLitUnionBaseName`) and the receiver's (`nodeNumScalarBaseName`, which also claims the mixed
+spellings the tested side never carries). Without the receiver half, a monomorphized `g<T>(v: T)`
+instance pinned to `string` takes the arm and compares a `(ref $array)` with `i32.eq`: invalid wasm
+traded for a wrong answer, which is precisely the trap #1345's filing walked into by asserting a rep
+instead of reading one. It is also what keeps an i64 receiver off an i32-based member set.
+
+### The second cell, which the filing did not predict
+
+The un-aliased spelling `x is 1 | 2` was wrong for an unrelated reason: `isLitVariantName` decides on
+the tested spelling's FIRST CHARACTER, so a multi-member inline set is a "literal" to it and lowered
+as the single compare `x == 1` — **every non-first member silently dropped**. Putting the membership
+arm AHEAD of the bare-literal arm fixes it, and costs that arm nothing: a tested type that really is
+one literal reaches the same `emitNumLitEq` and emits the same bytes.
+
+**14 cells, 8 UP (6 silent RUN-WRONG + 2 EMIT-REJECT → correct), 0 DOWN, 6 controls unchanged.**
+Corpus `deno test -A tests/cases_wasm_test.ts` 1,683 passed / 0 failed / 7 ignored; align 1,690
+passed / 0 failed / 0 ignored. Pinned by `tests/cases/literal-unions/is-numeric-litunion-membership.vl`
+and its control `is-string-litunion-reps-unmoved.vl` (all three string reps, one group each).
+
+### What is still open, measured on the same grid
+
+**The `K | i32` PARAM slot is a REP hole, not an `is` hole, and it is loud.** A param annotated
+`K | i32` classifies as a BOXED union (`exprUnion` true, `paramUnion`) while `RC_ROOT` gives the
+identical type a plain scalar local. It fails at emit **with no `is` in the program at all** —
+
+```vl
+type K = 1 | 2
+function probe(x: K | i32) { 0 }
+probe(1)          // emitProgram: union box atom test on a union with no recorded members: i32
+```
+
+— so every param-receiver cell of this family is blocked behind it, and no `is` lowering can reach
+them. Filed rather than bundled: reconciling the param classifier with the root valtype is a rep
+change.
+
+**A non-IDENT receiver with a 2+ member set still answers a constant FALSE** (`s.f is K`, `src() is K`).
+Both arms bound the receiver with `unionEqOperandOk` because each member re-reads it, which is the
+same bound the atom ladder and #1345's string arm carry. It fails CLOSED and has a one-line
+workaround (bind to a local first, which then answers correctly).
+
+**And the string side of that same position is WORSE, which is a new measurement.** A struct-FIELD
+receiver of a STRING litunion answers `is K` **TRUE for a non-member**:
+
+```vl
+type K = "a" | "b"
+type S = { f: K | string }
+const s: S = { f: "zz" }
+if s.f is K { … }   // TAKEN — vl check --codegen rc 0
+```
+
+The member cell of the same shape answers TRUE as well, so a test that looked like it worked is a
+constant fold reading the receiver's own type as within the tested set. Fails OPEN, unlike everything
+this slice touched. Not bundled — it is #1345's population, not this one, and it wants its own grid.
+
+*Method note this closure adds: **a classification gap is not automatically a classification fix.**
+The filing named two string-only predicates and the natural next sentence is "widen them". They are
+string-only because the STRING rep is what they select, and the numeric shape's whole problem is that
+it has a different rep — so the gap closes by adding the missing rep's lowering, not by making the
+existing rep's classifier lie about what it selects. The tell was available before any code: the
+compiler already carried a numeric-base vocabulary (`numLitUnionBaseName`, and `unionParamPinName`'s
+arm saying in prose that a numeric litunion "falls past `tyIsLitUnion` into the boxed loop below — a
+rep it does not have"). Grep for the vocabulary the other rep already speaks before widening the one
+in front of you.*

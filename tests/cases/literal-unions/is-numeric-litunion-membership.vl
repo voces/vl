@@ -1,0 +1,163 @@
+// @run
+// CONTRACT: `x is K` over a NUMERIC literal union (`type K = 1 | 2`, `type K = 1.5 | 2.5`)
+// is a MEMBERSHIP test over the value — the alias standalone, beside its own base scalar
+// (`K | i32`, `K | f64`, `K | i64`), beside another numeric litunion, and boxed beside a
+// different rep (`K | string`).
+//
+// THE REP IS THE PLAIN BASE SCALAR, and it is what makes this a different lowering from
+// either string sibling rather than the same one with a swapped comparator: `const x:
+// K | i32` gives the binding an `i32` local and `K | f64` an `f64` local — no box, no tag,
+// because every member of either union softens to the one scalar (`numeric-litunion-alias.vl`
+// pins that contract). So the test is `x == m0 || x == m1 || …` in the base's own compare,
+// the same bytes the bare-literal spelling `x is 1 || x is 2` emits.
+//
+// A numeric litunion was not a "litunion" ANYWHERE in the compiler before: `tyIsLitUnion`
+// requires every member `litKind == "str"` and `tyLitMemberTexts` collects only `"str"`
+// members, so no gate DECLINED these — they were never candidates, every arm of `emitIs`
+// fell through, and the guard reached the monomorphized static-`is` fold, which sees a
+// non-union rep and a tested name that is no variant row and answered a CONSTANT FALSE.
+// Every cell below printed the `NOT` branch, `vl check --codegen` rc 0.
+//
+// The INLINE spelling is the second thing this pins, and it failed for its own reason:
+// `isLitVariantName` decides on the tested spelling's FIRST CHARACTER, so `x is 1 | 2`
+// was a "literal" to it and lowered as the single compare `x == 1` — every non-first
+// member silently dropped. The membership arm reads the member set off the arena and
+// takes precedence, so alias and inline answer identically.
+//
+// CONTROLS THAT MUST NOT MOVE: the bare-literal spelling over the same receivers, and the
+// string litunions of all three of their own reps (atom / member-string / box).
+
+// ── the integer alias: standalone, and beside its own base ──────────────────────
+// @log ia:IS
+// @log ib:IS
+// @log ic:NOT
+type K = 1 | 2
+const kOnly: K = 1
+if kOnly is K { print("ia:IS") } else { print("ia:NOT") }
+const kMix: K | i32 = 2
+if kMix is K { print("ib:IS") } else { print("ib:NOT") }
+const kOut: K | i32 = 5
+if kOut is K { print("ic:IS") } else { print("ic:NOT") }
+
+// ── the FLOAT alias, the same three cells ───────────────────────────────────────
+// @log fa:IS
+// @log fb:IS
+// @log fc:NOT
+type FK = 1.5 | 2.5
+const fOnly: FK = 2.5
+if fOnly is FK { print("fa:IS") } else { print("fa:NOT") }
+const fMix: FK | f64 = 1.5
+if fMix is FK { print("fb:IS") } else { print("fb:NOT") }
+const fOut: FK | f64 = 9.75
+if fOut is FK { print("fc:IS") } else { print("fc:NOT") }
+
+// ── an i64-based alias: the member set is out of i32 range, so the compare is i64.eq ─
+// @log wa:IS
+// @log wb:NOT
+type W = 5000000000 | 6000000000
+const wIn: W | i64 = 5000000000
+if wIn is W { print("wa:IS") } else { print("wa:NOT") }
+const wOut: W | i64 = 7000000000
+if wOut is W { print("wb:IS") } else { print("wb:NOT") }
+
+// ── three members, and the alias-OF-an-alias wrapper the parser mints ───────────
+// @log ta:IS
+// @log tb:NOT
+// @log ya:IS
+// @log yb:NOT
+type T = 0 | 1 | 2
+const tIn: T | i32 = 2
+if tIn is T { print("ta:IS") } else { print("ta:NOT") }
+const tOut: T | i32 = 3
+if tOut is T { print("tb:IS") } else { print("tb:NOT") }
+type Z = 6 | 7
+type Y = Z
+const yIn: Y | i32 = 7
+if yIn is Y { print("ya:IS") } else { print("ya:NOT") }
+const yOut: Y | i32 = 8
+if yOut is Y { print("yb:IS") } else { print("yb:NOT") }
+
+// ── TWO numeric aliases flattened into one union: disjoint, and overlapping ─────
+// @log da:A
+// @log da:-
+// @log oa:A
+// @log oa:B
+type DA = 11 | 12
+type DB = 13 | 14
+const dv: DA | DB = 11
+if dv is DA { print("da:A") } else { print("da:-") }
+if dv is DB { print("da:B") } else { print("da:-") }
+type OA = 21 | 22
+type OB = 22 | 23
+const ov: OA | OB = 22
+if ov is OA { print("oa:A") } else { print("oa:-") }
+if ov is OB { print("oa:B") } else { print("oa:-") }
+
+// ── the INLINE spelling, both sides un-aliased ──────────────────────────────────
+// @log na:IS
+// @log nb:NOT
+const nIn: (31 | 32) | i32 = 32
+if nIn is 31 | 32 { print("na:IS") } else { print("na:NOT") }
+const nOut: (31 | 32) | i32 = 33
+if nOut is 31 | 32 { print("nb:IS") } else { print("nb:NOT") }
+
+// ── BOXED: a numeric litunion arm beside a different rep, so the union really boxes ─
+// @log ba:IS
+// @log bb:NOT
+type BK = 41 | 42
+const bkv: BK = 41
+const bIn: BK | string = bkv
+if bIn is BK { print("ba:IS") } else { print("ba:NOT") }
+const bOut: BK | string = "zz"
+if bOut is BK { print("bb:IS") } else { print("bb:NOT") }
+
+// ── the binding forms: module global, `let`, and a reassigned `let` ─────────────
+// @log ga:IS
+// @log la:NOT
+// @log lb:IS
+type GK = 51 | 52
+const gBind: GK | i32 = 51
+function bindings() {
+  if gBind is GK { print("ga:IS") } else { print("ga:NOT") }
+  let l: GK | i32 = 59
+  if l is GK { print("la:IS") } else { print("la:NOT") }
+  l = 52
+  if l is GK { print("lb:IS") } else { print("lb:NOT") }
+  0
+}
+bindings()
+
+// ── a plain BASE-scalar receiver narrowed down to the subset ────────────────────
+// @log pa:IS
+// @log pb:NOT
+type PK = 61 | 62
+function plainRecv(n: i32, tag: string) {
+  if n is PK { print(tag + ":IS") } else { print(tag + ":NOT") }
+  0
+}
+plainRecv(62, "pa")
+plainRecv(63, "pb")
+
+// ── the narrowed value is CONSUMED at the alias type ────────────────────────────
+// The receiver and the alias share the one base scalar, so the narrowing re-binds to a
+// slot of the same valtype and the value flows into a `CK` parameter unchanged. (The
+// string sibling's third rep cannot do this — there the narrowing rebinds a `(ref $array)`
+// value to an ATOM slot, which is the valtype-ladder hole its own filing records.)
+// @log 70
+// @log 71
+type CK = 70 | 71
+function takesCK(k: CK) {
+  print(k)
+  0
+}
+const cv: CK | i32 = 70
+if cv is CK { takesCK(cv) } else { print("ca:NOT") }
+const cw: CK | i32 = 71
+if cw is CK { takesCK(cw) } else { print("cb:NOT") }
+
+// ── CONTROL: the bare-literal spelling over the same receivers, unchanged ───────
+// @log ma:yes
+// @log mb:no
+const mv: K | i32 = 1
+if mv is 1 { print("ma:yes") } else { print("ma:no") }
+if mv is 2 { print("mb:yes") } else { print("mb:no") }
