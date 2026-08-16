@@ -188,7 +188,7 @@ in-file). `flat` records as a compiler perf lever (targets the wrong half).
 | id | item | status |
 |---|---|---|
 | **H1** | **F5 — settle VL vs Vital** | OPEN, real. ~13 live sites; `lsp/package.json` `displayName` is a published surface |
-| **H2** | **F9 — perf baseline vs the NATIVE binary** | OPEN. `scripts/p7-time.sh` is the closest reusable rig (CPU ms, output-equality asserted); not regression-gated |
+| **H2** | **F9 — perf regression gate vs the NATIVE binary** | OPEN. Design below |
 | **H3** | **F-tiers residue** | OPEN but the row is **STALE** — `SELFHOST_DENO_RUN` no longer exists; the real residue is `cases_wasm_test.ts` executing under V8 |
 | **H4** | **Close F4 / F6 / F7 / F9b** | **MOOT or STALE.** F7's only occurrence of `paramater` is the ROADMAP line filing it; F4's `m.validate()` is a binaryen-JS API the emitter no longer uses; F6 names a `deno task build` that does not exist |
 | **H5** | **Doc corrections** | `perf-landscape.md` §1/§3/§4 stale; P7 must be split (1.135× shipped vs 4.6× open); ROADMAP Track A's `A-infer-null` and `A-infer-empty` Map/Set rows describe shipped work |
@@ -226,3 +226,53 @@ History belongs in git and in the design docs.
 **Measurement:** one file per worker in any parallel sweep (a `>>` above `PIPE_BUF`
 tears and silently invents or drops records). Probe records need a sequence number —
 `tErr` dedupes exact repeats, which silently turns a count into a distinct-value set.
+
+---
+
+## H2 / F9 — the perf regression gate, in two phases
+
+**What exists.** `bench/run.sh` answers *"where does VL sit against Rust, deno and
+CPython"* — 46 benchmarks, four runtimes, stdout verified per case, `taskset`
+pinning, a noise-floor probe. Its per-case `meta.json` audits are adversarial about
+their own numbers (`arith/i32-accum` records that `rustc -O` auto-vectorises the
+loop to SSE2 and that the honest scalar gap is ~1.4x against a 5.4x headline).
+CI separately carries DETERMINISTIC pins — `MELT_TABLE` and the loop-shape rows
+(`loops, rotated, carried`) in `tests/selfhost_native_release_test.ts`.
+
+**What is missing is a GATE, not another harness.** Nothing catches a regression at
+PR time, and the cost of that is already on the record: three perf documents drifted
+to numbers stale by up to 4.3x, and the filed-vs-shipped P7 split survived unnoticed,
+because nothing re-measured.
+
+**The constraint that decides the design.** `bench/README.md` records this box
+swinging **up to 2.5x under contention even with `taskset`**, and the sweep labels
+itself PRELIMINARY. A wall-clock gate therefore cannot separate a regression from a
+busy runner — the identical ambiguity that made the `vl test` parallelism ratio
+unusable. Whatever gates in CI must be contention-proof.
+
+### Phase 1 — extend the deterministic pins (no timing at all)
+
+`MELT_TABLE`'s pattern already gates emitted-code SIZE and LOOP SHAPE per optimizer
+rung, and cannot flake because it measures the artifact, not the machine. Extend it
+across the hot benchmark shapes. This catches codegen regressions outright.
+
+Bounds worth stating: a shape pin cannot see a regression that keeps the loop shape
+and adds work per iteration. It is the reliable half, not the whole answer.
+
+### Phase 2 — a CPU-time baseline
+
+`scripts/p7-time.sh` is the primitive: interleaved min+median of **user+sys CPU
+milliseconds**, with stdout equality asserted across modules before any timing.
+
+CPU time is the load-bearing choice. Measured on this box at **load average ~100**
+(four compile-heavy agents running), one module over 2 reps:
+
+```
+cpu_min=1906ms  cpu_med=1906ms  wall_min=2384ms  cpu=[1926 1906]
+```
+
+**1% spread on CPU time while wall clock carried the contention.** That is the
+property a gate needs. Interleaving modules within a rep spreads any residual drift
+across both sides of an A/B rather than one.
+
+Sequence phase 1 first: it is cheaper, cannot flake, and its failures are exact.
