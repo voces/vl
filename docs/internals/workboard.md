@@ -82,13 +82,23 @@ The counter-datum this reinforces: lowering the compiler's own 39k lines, **the
 entire emitter parses 24 type spellings and the checker 0**. The open populations
 are corpus-wide aggregates over small files.
 
+**A THIRD instrument finding, from B4: a scorecard row is a (population,
+CHOKEPOINT) pair, and shipping a rung moves the chokepoint without moving the
+work.** `recordMvValTyIx` was filed at 685 `resolveAnnot` reaches and re-derives
+at 411 — a 40% fall while the row itself GREW, to 725 calls. Its base predates
+both rungs under `fieldElemTyIxOfName` (#1331 rung 1, #1332 rung 2), and the
+arithmetic closes exactly: `725 − 40 rung-1 − 274 rung-2 = 411`. Any row censused
+before those two PRs now under-reads by whatever share of it is a declared name
+or a bare primitive. **Re-derive in CALLS as well as reaches** — a rung-1 answer
+is still `cUserTypes[nm]`, which is the terminal condition verbatim.
+
 | id | item | anchor | measured | status | eff | risk |
 |---|---|---|---|---|---|---|
 | ~~**B1**~~ | ~~Checker-side parse census~~ | `destringify-types-program.md` D-CHECKPARSE | **CLOSED — measured negative.** 3,093 of 17,834; **17,832 of 17,834 are TREE walks**; `nameToTy` entered **54 times corpus-wide**, **0** over the compiler's own source | **CLOSED** | — | — |
 | **B1a** | **`is` triple resolution** — `collectThenNarrows` / `collectElseNarrows` / the if-chain scan each re-resolve what the `is` node already banks in `isVarTyIx` | family c9+c10+c11+c13 | **6,574 = 36.9%** of checker parsing (**87.9%** on the compiler's own source). Bank covers 4,427 of 4,429 readers; **2,530 of 2,530 index-identical, 0 disagreements** | **PARTLY TAKEABLE** — the other **1,897 MINT a duplicate arena entry**, so skipping renumbers (#1331's gate) | M | med |
 | **B2** | **TRANSP residue** — add `genAppNameOfTy` under `structNameOfTy` so `type Y = Box<i32>` renders `Box<i32>` | `typecheck.vl:8945`; blocker `emit_classify.vl:11474 fieldTypeCode` | rung is **BUILT and MEASURED**: B2 20→11, B3 120→111, moves nothing on the six-channel corpus, costs ONE cell | OPEN — both halves of the old filing REFUTED | M+S | med |
 | **B3** | **1a-v `pushFieldRow`** — per-field-CODE peel table | `emit_collect.vl:4271`; `emit_rep.vl:1226`, `:1241` | **887 reaches / 256 parses = 8.4% of all emitter parsing**; `recordUFieldElemRow` densest at 77.6% | OPEN — "all 256 mint" is **BRIEFED, unverified since #1331** | M | high if they mint |
-| **B4** | **`recordMvValTyIx` routing** | `emit_rep.vl:799` | **685 reaches, 0 parses** — the one row with a *proof* of arena neutrality | OPEN | S–M | **LOW** |
+| ~~**B4**~~ | ~~`recordMvValTyIx` routing~~ | `destringify-types-program.md` B4 | **SHIPPED.** Re-derived at **725 CALLS** (40 rung-1 · 274 rung-2 · **411** `resolveAnnot` reaches) / **0 parses** / **0 arena mints**; dual-write **725 of 725 index-identical**, corpus A/B 1,743 files × 7 channels **0 rows moved**, **+25 B**. The filed 685 reconciles as `725 − 40 − 274`: the row grew, the CHOKEPOINT moved | **CLOSED** | — | — |
 | **B5** | **Mono-clone `nodeTyIx`** — clone banks the generic's type while `tyName` carries the substituted spelling | `emit_collect.vl:3413`, `:3868`; `emit_mono.vl:1430` | disagrees on **59 of 1,328**; a guard cuts 59→8 but costs 109 agreements, **not shipped**; **1,335 reaches wait on it** | OPEN — blocks B3/B6 | L | **HIGH** |
 | **B6** | **Arena-index threading** (D-INLINESHAPETY / D-REPELEMTY) — relocate parses to callers holding the index | — | population quoted as **18 of 1,064** in three places but the measuring table sums to **14 / 1,050** | OPEN, **re-derive first** | M | med |
 | **B7** | **W9 — canon `renderEmit(ty, ctx)`** | `typecheck.vl:9524`, `:7985`, `:6723` | **B2 = 176 / 7,201 = 2.44%**; gate 4b admits **4 distinct spellings corpus-wide** | **DESIGN-BLOCKED** — canon is name-in/name-out by contract | L | high |

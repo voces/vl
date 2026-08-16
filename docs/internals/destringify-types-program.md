@@ -40805,3 +40805,207 @@ today because of wall 2, and it is the canary for the day wall 2 moves.
   touched and the iteration loop stays honest.
 
 <!-- APPEND-MARKER-MTRQUOTE-END -->
+
+<!-- APPEND-MARKER-MVROWBANK-BEGIN -->
+
+## B4 — the row that reads ZERO in the parse column, taken: the mv row's value type is the slot FIND's OWN resolution. The filed 685 reconciles EXACTLY as `725 calls − 40 rung-1 − 274 rung-2`, so the row did not shrink — the chokepoint the census measures at moved below two thirds of it (off master `d6b8de0e`)
+
+#1327 filed `recordMvValTyIx` as *"685 reaches, 0 parses … the one row in the bucket whose removal
+is provably arena-order-neutral"*, and its own method note called it *"the cheapest thing the column
+buys"*: a row filed as needing the most expensive remedy in the document — a checker-side recorder —
+against traffic that costs no parsing at all. This slice takes it, and re-derives the filing first,
+because 44 master PRs have landed since.
+
+### 1. PROBE ZZB4 — the recorder instrumented in FOUR units at once, because three of them decide the slice
+
+| counter | what it counts |
+|---|---|
+| `5` | CALLS to `recordMvValTyIx` — the string-keyed lookups a routing actually retires |
+| `1`/`2`/`3`/`4` | of those, the ones that REACH `resolveAnnot`, split at its three exits (memo hit · negative-memo hit · `annotResolve` PARSE), nested resolves suppressed to their own bucket |
+| `6` | `T.tys.length` AFTER minus BEFORE, summed over every call — the MINT column, which is what the neutrality claim is actually about |
+| `9`/`10` | the dual-write: the recorder's own index vs the index the caller is holding, compared RAW |
+
+```
+base:   master d6b8de0e; build/vl-compiler.wasm self-compiled from that source,
+        1,139,472 B (sha256 2ec63ced…)
+build:  vl build compiler/entry.vl -o probe.wasm --compiler <that base>
+run:    vl check --codegen tests/cases --compiler probe.wasm
+        (one compiler instance for the tree; counters accumulate, the LAST record is
+         the corpus total — 1,457 records)
+read:   ZZB4|0=0|1=411|2=411|3=0|4=0|5=725|6=0|7=725|8=0|9=725|10=0|11=24|12=0|13=0|14=0|15=0
+        ZZR|CALLS=725|RUNG1=40|RUNG2=274|RUNG3=411          (the rung split, second build)
+```
+
+| reading | value | denominator |
+|---|---:|---|
+| recorder CALLS | **725** | 1,457 corpus programs reaching `emitProgram`'s tail |
+| … answered by `declTyIxOfName` rung 1 (`cUserTypes`) | 40 | 725 |
+| … answered by rung 2 (the primitive leaf) | 274 | 725 |
+| … reaching `resolveAnnot` (rung 3) | **411** | 725 |
+| … of those, memo HITS | **411** | 411 |
+| … negative-memo hits | 0 | 411 |
+| … **`annotResolve` PARSES** | **0** | 411 |
+| **arena MINTS** (`ΔT.tys.length` summed over every call) | **0** | 725 |
+| the caller's index == the recorder's own | **725** | 725 |
+| **disagreements** | **0** | 725 |
+| calls whose caller bank came from a D5 field row (`rowTy >= 0` at `mvShapeOfValNameRowTy`) | 24 | 725 |
+| calls where `mvCanonValName` rewrote the spelling | **0** | 725 |
+
+### 2. THE FILED 685 RECONCILES EXACTLY, AND WHAT MOVED WAS THE INSTRUMENT'S CHOKEPOINT
+
+`a688dc6e` — #1327's base — predates BOTH rungs under `fieldElemTyIxOfName`: rung 1 landed in
+#1331 (`6648e20d`, D-DECLRUNG) and rung 2 in #1332 (`e45d69dd`, D-PRIMLEAF), and both are ancestors
+of this base rather than of that one. At the filing every call therefore entered `resolveAnnot`, so
+**the filed 685 was 685 CALLS as well as 685 reaches**. Today:
+
+```
+725 calls  −  40 (rung 1)  −  274 (rung 2)  =  411 reaches
+```
+
+**The row did not shrink by 40%. It grew slightly** (685 → 725 calls, on a corpus that grew
+1,444 → 1,457 programs) **and 314 of it stopped passing the point the census counts at.** A
+scorecard that ranks by `resolveAnnot` reaches now under-reads this row by 43%, for the same reason
+#1327 showed the reach unit over-read it: the unit is a chokepoint, and shipping a rung moves the
+chokepoint without moving the work.
+
+**The unit that decides THIS slice is CALLS.** A rung-1 answer is `cUserTypes[nm]` and a rung-2
+answer is `primTyOfName(nm)` — both are a type-name string used as a table KEY, which is the
+programme's terminal condition verbatim. 725 string-keyed lookups retire here; **0 parses do**, and
+this slice claims none.
+
+### 3. THE NEUTRALITY IS BY CONSTRUCTION, NOT ONLY BY MEASUREMENT
+
+`mvShapeOfValNameRowTy` resolved the value spelling TWICE — once at the slot FIND, above the kind-6
+recursion, and once at `recordMvValTyIx` thirty lines below it — passing the same string to the same
+function both times.
+
+* `resolveAnnot` memoizes per spelling and a POSITIVE entry is never invalidated (only the negative
+  memo carries `cUserTypesVer`). If the FIND parsed and minted, the recorder's call is a HIT that
+  returns that very index.
+* Where the FIND took a bank instead (`rowTy >= 0` — the two D5 field-row callers), that bank is
+  `record{S,U}FieldElemRow`'s own `fieldElemTyIxOfName` over the same string, so the spelling has
+  already resolved before the row is pushed and the recorder's call is again a hit.
+* Nothing between the two calls can move the answer: every write to `cUserTypes` is in
+  `typecheck.vl`, and the only one reachable during emit keys on a synthetic `head + "<#…"`
+  application key that no map-value spelling can collide with.
+
+So the second resolution mints nothing the first did not, and skips nothing that would have minted.
+**`repElemKeyGo`'s identity arm keys `TyVar`/`TyLit`/`TyErr` by arena INDEX, so mint ORDER is
+load-bearing — and reuse of the same spelling's own earlier resolution is the one class of change
+that cannot move it.** That is the whole difference between this row and B3/B5, whose hints replace
+a MISS. The measured `ΔT.tys.length = 0` over 725 calls is the confirmation, not the argument.
+
+### 4. WHAT SHIPPED
+
+```
+emit_rep.vl
+  mvValTyIxOfNameRow(nm, rowTy) -> i32   the INDEX-level rung: `rowTy >= 0` REPLACES the bridge,
+                                         -1 is "no bank" and keeps it verbatim
+  recordMvValTyIx(nm, rowTy)             pushes `mvValTyIxOfNameRow(nm, rowTy)`
+  mvSlotOfValNameTyK(nm, keyI32)         resolves directly; the slot-level row sibling
+                                         `mvSlotOfValNameRowTy` is DELETED — the reusable rung is
+                                         the INDEX, and its two callers want different halves
+
+emit_classify.vl, mvShapeOfValNameRowTy
+  const vTy = mvValTyIxOfNameRow(valNameIn, rowTy)    the FIND, resolution HELD
+  const aSh = mvSlotOfTyK(vTy, keyI32)
+  …
+  let vBank = -1
+  if valName == valNameIn { vBank = vTy }
+  recordMvValTyIx(valName, vBank)
+```
+
+**THE ONE ARM WITH NO REACH IS THE CANON GUARD, AND IT IS NAMED HERE RATHER THAN ASSUMED.** The
+FIND resolves `valNameIn`; the recorder records `mvCanonValName(valNameIn)`. Where canon rewrites
+the spelling the two calls have different inputs, so the bank is withheld (-1) and the recorder
+resolves its own. Canon is a no-op on **725 of 725** corpus calls and **26 of 26** hand-built ones:
+that arm is preserved on reading, not on test.
+
+### 5. THE FUZZER IS BLIND TO THE GRADING SHAPE, SO THE POPULATION IS HAND-BUILT
+
+The standing soundness rule for this layer is the newtype: `type F = new {…}` separates arena-index
+identity from rep identity, and the fuzz grammar emits no `new` type, so fuzz agreement is not
+evidence for this class. Six programs put a newtype over a struct at every map-VALUE position the
+intern site has an arm for — the plain value, a same-shape newtype TWIN, a newtype/plain-struct
+pair, a ref-LIST value (`{[string]: FView[]}`), a NESTED map value (the kind-6 arm whose recursive
+intern runs before the row is pushed) and a struct FIELD row (the `rowTy >= 0` caller) — plus a
+union / litunion / nested-shape program aimed at `mvCanonValName`.
+
+**THE CORPUS HAD NO NEWTYPE AT A MAP-VALUE POSITION AT ALL, so four of the six are promoted** —
+`tests/cases/maps/newtype-struct-{map-value-twin,reflist-map-value,nested-map-value,map-value-struct-field}.vl`.
+Under SAB-UNCOV (§7) the two kind-6 members move on the emitted BYTES while still building and
+running clean, so they are live pins for this column and not merely reachable ones.
+
+| population | recorder calls | reaches | parses | mints | dual-write |
+|---|---:|---:|---:|---:|---|
+| `tests/cases`, 1,457 programs | 725 | 411 | **0** | **0** | **725 / 725 index-identical** |
+| the hand-built newtype + canon set, 6 programs | 26 | 10 | **0** | **0** | **26 / 26 index-identical** |
+| the compiler's own source, 39k lines | 2 | 0 | **0** | **0** | **2 / 2 index-identical** |
+
+All six hand-built programs produce identical output on base and branch, and the four promoted ones
+are byte-identical across the two compilers on all seven per-file channels.
+
+### 6. EQUIVALENCE — every rc taken BARE
+
+| leg | rc | reading |
+|---|---:|---|
+| `scripts/refresh-compiler.sh` | 0 | **1,139,497 B** from the branch's own sources |
+| `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | published `seed-latest`, 1,139,879 B |
+| `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next — next is the fixpoint (2 compiles)"*, **1,139,497 B**, byte-identical to the self-built ladder's output. **No bootstrap ordering problem: master's published compiler compiles this source at the first self-compile.** |
+| `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,139,497 B |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 unsound, 0 new, 0 stale |
+| `deno test -A tests/cases_wasm_test.ts` | 0 | **1,679 passed / 0 failed / 7 ignored** (1,675 before the four promoted cases) |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,731 passed / 0 failed / 7 ignored** (3,723 before the four promoted cases, which land in two suites each) — the ignored SET is the seven documented names (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); 7 and not 13 is the tell that `wasm-opt` is present |
+| corpus A/B, **1,743 files × 7 per-file channels** — `vl check` rc · check stderr · `vl build` rc · build stderr · **sha256 of the emitted wasm** · `vl run` rc · run stdout — one output FILE PER WORKER concatenated, well-formedness asserted (12,201 lines == 12,201 leading-`F` records, 1,743 record files, per side) | 0 | **0 rows moved on any of the seven** |
+| corpus DIRECTORY channels, one compiler instance per side: `vl check` (11,338 lines/side) · `vl check --codegen` (11,468 lines/side) | 0 | **identical** |
+
+**BYTE DELTA: 1,139,472 → 1,139,497 = +25 B.** One extra function, one extra parameter, one string
+compare at the intern site.
+
+### 7. THE INVERTED CONTROLS — and the one that shows the DIAGNOSTIC channel is blind where the BYTE channel is not
+
+Each sabotage is the shipped tree with ONE edit inside `recordMvValTyIx`, self-compiled with the
+HEALTHY head compiler and never with itself.
+
+| sabotage | edit | `vl check --codegen tests/cases` | per-file build/bytes/run, `maps` + `literal-unions` (200 files) |
+|---|---|---|---|
+| **SAB-UNCOV** | a banked row records `-1` ("uncovered") | **0 diff lines of 11,468** | **8 of 200 move on BUILDRC · BUILDMSG · BYTES · RUNRC · RUNMSG**; **2 of the 4 promoted newtype cases move on BYTES alone** |
+| **SAB-OFFBY1** | a banked row records `rowTy + 1` | **traps on the first program** (`wasm trap: out of bounds array access`) | — |
+
+**SAB-UNCOV IS THE INTERESTING ONE.** Blanking the column changes not one line of
+`vl check --codegen` output over 1,743 files, and makes **8 of 200** files emit a module that will
+not instantiate — `map-arm-value-union-scalar-box.vl` writes 3,407 bytes and then
+*"type mismatch: expected (ref $type), found (ref $type)"*. The sidecar is self-healing by design
+(an uncovered row falls back to the name scan) but not everywhere, and `vl check --codegen` does not
+validate the bytes it emits. **A directory-channel A/B is not a substitute for a per-file byte A/B
+on this layer**, and that is measured here rather than assumed.
+
+SAB-OFFBY1 says the other half: a WRONG index in this column is loud immediately. Between them, the
+harness is blind to an ABSENT bank in the diagnostic channel, sees it in the byte channel, and
+cannot miss a wrong one. What this slice changes is the bank's PROVENANCE, not its value, and the
+value is dual-written at 725 of 725.
+
+### METHOD NOTES
+
+* **A CENSUS UNIT THAT IS A CHOKEPOINT MOVES WHEN YOU SHIP A RUNG ABOVE IT, AND THE ROW DOES NOT.**
+  `recordMvValTyIx` was filed at 685 `resolveAnnot` reaches and re-derives at 411 — and it grew, to
+  725 calls. Two rungs landed underneath between the two readings and took 314 of them out of the
+  column. *A scorecard row is a (population, chokepoint) pair; when the chokepoint moves, the row's
+  number changes without any of its work changing. Re-derive both halves, and reconcile the old
+  number arithmetically rather than declaring it stale.*
+* **THE UNIT THAT PRICES A ROUTING IS THE UNIT OF WHAT THE ROUTING DELETES.** This one deletes a
+  CALL, so calls (725) is its unit. The parse column (0) is what says the routing is not a parse
+  reduction and must not be reported as one; the mint column (0) is what says it is safe. Three
+  columns, three different questions. *Do not let the column a programme ranks by decide which
+  question you are answering.*
+* **"PROVABLY NEUTRAL" IS CHEAP TO CHECK AND WORTH CHECKING ANYWAY.** The argument here is two
+  sentences about a memo that never invalidates a positive entry. `T.tys.length` around the call is
+  two lines and turns it into a measurement over 725 calls. *Both, always — the argument tells you
+  which population to measure, and the measurement tells you the argument covered it.*
+* **A SABOTAGE THAT LEAVES A CHANNEL AT ZERO HAS MEASURED THAT CHANNEL, NOT FAILED.** SAB-UNCOV is
+  inert on 11,468 lines of `vl check --codegen` and moves 8 of 200 files on the emitted bytes. The
+  zero is the finding: `check --codegen` runs the emitter but does not instantiate what it emits.
+  *Grade the instrument on the same edit you grade the change with, and read the zeros.*
+
+<!-- APPEND-MARKER-MVROWBANK-END -->
