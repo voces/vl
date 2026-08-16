@@ -87,7 +87,7 @@ import { parseProgram } from "./parser"
 // identifier would read the previous program's answer), and three of the eight
 // in-place name writers (R4 — the module merge's renames below).
 import { sidNoteNodeName, sidReset } from "./symbols"
-import { nameIdentChar } from "./tyname"
+import { nameIdentChar, skipQuotedName } from "./tyname"
 import { T, checkProgram, demangleMsg, initChecker } from "./typecheck"
 import {
   redunTokAt,
@@ -2633,13 +2633,22 @@ function modRenamed(name: string): string {
 // never shadowed by locals — VL has no local type declarations). Quoted
 // string-literal segments (`"a"|"b"`) are copied verbatim.
 //
-// The identifier CHARACTER CLASS is `tyname.nameIdentChar` (W8) — the half this body shares
-// with `modGenParams` above, character for character. The RUN WALK is not routed and the
-// reason is measured: the quoted-segment skip below is the NAIVE one ("no escapes in type
-// names") while the leaf's is `skipQuotedName`, which honours `\`, and they disagree on a
-// literal member carrying an escaped quote (`type T = "a\"b"`, which the compiler accepts
-// and runs). Adopting the leaf's rule would rename inside a quoted member differently —
-// arguably better, certainly a BEHAVIOUR change — so it is filed rather than taken here.
+// Both halves of the walk are the leaf's (W8): the identifier CHARACTER CLASS is
+// `tyname.nameIdentChar`, and where a quoted member ENDS is `tyname.skipQuotedName`, so a
+// `\` escape keeps its quote INSIDE the member (`type T = "a\"b"`, which the compiler
+// accepts and runs) and the `b` after it is never a rename candidate. Only the accumulating
+// run itself is written here; a run TOKENIZER is refuted at the leaf, with the byte count.
+//
+// **THE QUOTE ARM IS UNREACHABLE ON A COMPILING PROGRAM, AND IT IS STILL THE LEAF'S RULE.**
+// The merge runs only on a multi-module program that PARSED, and on a clean parse every
+// quoted spelling reaches its own tree leg first — `modRwType` / `modRwIsType` / the
+// `UnionDecl` member loop / `modRwExpr`'s `as` arm all render from the parser's spelling
+// tree (`setAnnTs` / `setUdTs`, banked unconditionally at every mint) and never call here.
+// What DOES arrive is declaration NAMES — `tdName`, `udName`, `declGpBase` — built from
+// IDENT tokens plus `<`, `,`, `>`, which cannot carry a quote. Measured over the corpus:
+// 187 calls across 1,737 files, 51 distinct arguments, none containing `"`. The arm stays
+// because the pass is total either way, and it holds the leaf's rule so that a future
+// consumer feeding it a rendered name gets the same answer every other scanner gives.
 function modTypeRenamed(tn: string): string {
   const out: i32[] = []
   let run: i32[] = []
@@ -2674,13 +2683,13 @@ function modTypeRenamed(tn: string): string {
       }
       if !atEnd {
         if c == '"' {
-          // copy a quoted literal segment verbatim (no escapes in type names)
-          out.push(c)
-          i = i + 1
-          let copying = true
-          while copying && i < tn.length {
+          // Copy a quoted literal member verbatim. `skipQuotedName` owns where one ends —
+          // it lands just past the closing quote, or at `tn.length` for an unterminated
+          // segment, so the span is total. The trailing decrement hands the outer `i + 1`
+          // the character AFTER the member.
+          const qEnd = skipQuotedName(tn, i)
+          while i < qEnd {
             out.push(tn[i])
-            if tn[i] == '"' { copying = false }
             i = i + 1
           }
           i = i - 1
