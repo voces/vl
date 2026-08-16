@@ -291,16 +291,13 @@ Deno.test({
     // reads the SCHEDULE: `--jobs 4` must run all four concurrently, `--jobs 1`
     // must run them one at a time.
     //
-    // This replaced a wall-clock ratio ("--jobs 4 finishes in under 70% of --jobs
-    // 1") on 2026-08-16. That proxy measured scheduling TIMES the free CPU of the
-    // box, so it could not tell the regression it guarded — a silent fallback to
-    // serial — from a merely busy runner: both read ~1.0. It flaked twice on
-    // 2026-08-04, on master and on an unrelated PR, under the `deno test
-    // --parallel` sweep that puts ~1,876 subprocess-spawning cases against 4
-    // vCPUs; it also failed on an IDLE 24-core box, because the parallel leg ran
-    // first and absorbed the one-time wasmtime compile of the seed. Overlap has
-    // neither failure mode: a contended box makes each file take LONGER, which
-    // widens the overlap rather than hiding it.
+    // It reads the schedule and NOT a wall-clock ratio, because this file runs
+    // under CI's `deno test --parallel` sweep beside ~1,876 subprocess-spawning
+    // cases on 4 vCPUs. A ratio measures scheduling TIMES the box's free CPU, so
+    // under that saturation a silent fallback to serial and a merely busy runner
+    // are the same reading (~1.0). Overlap has no such ambiguity: contention
+    // makes each file take LONGER, which WIDENS the overlap rather than hiding
+    // it, so the measurement strengthens as the runner gets busier.
     const par = await runTest(SLOW, ["--jobs", "4"], { VL_TEST_TRACE: "1" });
     const ser = await runTest(SLOW, ["--jobs", "1"], { VL_TEST_TRACE: "1" });
 

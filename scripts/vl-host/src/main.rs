@@ -2047,18 +2047,14 @@ fn test_trace_on() -> bool {
 /// concurrent workers never interleave.
 ///
 /// WHY STAMPS AND NOT A STOPWATCH. The claim `vl test` makes is about
-/// SCHEDULING — files run concurrently — but the obvious proxy for it, "`--jobs
-/// N` finishes faster than `--jobs 1`", measures scheduling TIMES the free CPU
-/// the box happens to have. On a saturated machine those are indistinguishable:
-/// a serial-fallback REGRESSION and a merely BUSY runner both read ~1.0. That
-/// proxy is what the suite asserted until 2026-08-16, and it flaked on exactly
-/// that ambiguity — twice on 2026-08-04, on master and on an unrelated PR, under
-/// the `deno test --parallel` sweep that runs ~1,876 subprocess-spawning cases
-/// against 4 vCPUs. It also carried a cold-start bias (the parallel leg ran
-/// first and absorbed the one-time wasmtime compile of the seed), which failed
-/// it on an IDLE 24-core box; and pinned to ONE core it read 7.06 against a
-/// `< 0.70` threshold, because 4 threads timeslicing a single core are strictly
-/// slower than 1.
+/// SCHEDULING — files run concurrently — and wall clock cannot witness it. A
+/// ratio like "`--jobs N` finishes faster than `--jobs 1`" measures scheduling
+/// TIMES the free CPU the box happens to have, so a serial-fallback REGRESSION
+/// and a merely BUSY runner are indistinguishable: both read ~1.0. Two further
+/// shapes defeat it outright — the leg measured first absorbs the one-time
+/// wasmtime compile of the seed (a cold-start bias no idle box escapes), and on
+/// a single core N threads timeslicing are strictly SLOWER than one, so no
+/// correct scheduler can pass.
 ///
 /// These stamps witness the schedule itself: the intervals OVERLAP under
 /// `--jobs N>1` and are DISJOINT under `--jobs 1`, on any core count, under any
