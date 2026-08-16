@@ -41343,3 +41343,90 @@ Tree-wide, the compiler spells **29 distinct type-name character operations** (t
   every row whether it indexes anything itself.*
 
 <!-- APPEND-MARKER-FLOORREAD-END -->
+
+<!-- APPEND-MARKER-FREEROUTE-BEGIN -->
+
+## D-FREEROUTE — D-FLOORREAD's four cheapest rows taken. TWO of the four were free, one is a strict TIGHTENING with an empty divergence class, and row 4 was NOT a disagreement between two writings of one operation: it is one LADDER under two NAMED predicates, and the copy was a third site writing one of them out. Compiler wasm 1151503 → 1151304 (**−199 B**)
+
+Workboard rows **B9a** (operations 18, 21, 22) and **B9b** (operation 4). No parse count moves: these
+are terminal-condition routings — a type-name STRING indexed where a home already answers.
+
+### 1. ROW 4 IS NOT ONE OPERATION, AND THAT CHANGES WHAT THE FIX IS
+
+D-FLOORREAD read `emit_base.tyGroupWrapsWhole` and `typecheck.nameToTyReal:6285` as two writings of
+`tyGroupEndIndex(X, 1) == X.length - 1` that answer differently on a never-closing group. Both halves
+of that reading need correcting.
+
+* **`emit_base:1002` is a HOME, not a site.** `tyGroupWrapsWhole` is the single writing of "does the
+  leading group run to the END", exported and consumed by `emit_classify.nameIsWholeSpanShape` and
+  `emit_base.normTypeAtom`. A census that counts a home as a site double-counts the very operation it
+  is measuring the debt of.
+* **The `-1` reading is not a drift; it is the two predicates' DEFINING difference,** and three
+  in-tree headers already record it (`tyname.vl` at `parenEnclosesWhole`, `emit_base.vl` at
+  `tyGroupWrapsWhole` and again at the PAREN-grammar republish, which says in as many words that
+  merging them by eyeball is the mistake the comment exists to prevent).
+
+**WHICH ANSWER IS CORRECT DEPENDS ON WHAT THE CALLER DOES WITH IT, AND BOTH CALLERS ARE RIGHT.**
+
+| consumer | what it does with the answer | correct on never-closes |
+|---|---|---|
+| `nameIsWholeSpanShape`, `normTypeAtom` (via `tyGroupWrapsWhole`) | asks whether NOTHING closed the group early — a SPAN question | **TRUE**: nothing closed it early, vacuously |
+| `peelGroupParens`, `nameToTyReal` (via `parenEnclosesWhole`) | then CUTS the first and last characters | **FALSE**: the group's closer does not exist, so the last character is a real one and `groupInnerOf` would eat it (`(abc` → `ab`) |
+
+`normTypeAtom`'s own header states the peel half of this from the other side — it keeps a trailing-`)`
+cheap reject specifically because that is "the only place this function could return NONSENSE". So the
+correct move is NOT to pick one answer: it is to make every site call the predicate whose reading it
+wants, and the site that spelled the comparison out was choosing between them in silence.
+
+**THE ROUTING:** `typecheck.nameToTyReal` now calls `tyname.parenEnclosesWhole`. `tyGroupEndIndex`
+leaves `typecheck.vl`'s import list — that site was its only consumer in the file. Answer-identical by
+construction: the routed call IS the body that was there.
+
+### 2. AND IT IS UNREACHABLE — A REAL DIVERGENCE, NOT A LIVE BUG
+
+The two readings differ only when `tyGroupEndIndex(name, 1)` returns -1 under a guard that already
+requires a leading `(` and a trailing `)` (`nameIsParenSpanEnds`) — i.e. on an UNBALANCED name such as
+`(a()`. That name cannot exist:
+
+* **The parser rejects it.** `type F = (i32` is `parse error … expected ')' but found end of line`.
+  A type annotation's parens are balanced before any name is synthesised.
+* **Every synthetic producer wraps balanced text.** The `"(" + X + ")"` writings tree-wide
+  (`parser.vl:571,576`, `ast.vl:857,859`, `typecheck.vl:5375,5376,7234,7292,7411,7870,7917`,
+  `emit_collect.vl:1602`, `emit_base.vl:3230`) all wrap an already-rendered name.
+
+This matches what the other two sites already publish: `P_WSNC` fired **0 of 199,621** at
+`nameIsWholeSpanShape` and **0 of 19,680** at `normTypeAtom`. The branch itself IS reached — a
+`type U = (i32 | string)` alias resolves through it — so the guard is live and only its -1 arm is
+empty. **Report it as what it is: the divergence is real and deliberate, the disagreement between the
+two readings is unobservable, and routing the third writing is correct-by-construction rather than a
+repair of a live defect.**
+
+### 3. THE THREE B9a ROWS — "FREE" HELD FOR TWO OF THEM
+
+| row | routing | free? |
+|---|---|---|
+| 22 array-ELEMENT cut | `emit_mono:2194` `an2.slice(0, an2n - 2)` → `arrElemNameRaw(an2)` | **YES** — the guard above it already establishes array-ness, so the home's own `nameIsArray` gate cannot change the answer, and `"[]"` → `""` at both |
+| 18 return-text CUT | `emit_classify:3438` `ncl.slice(nri, ncl.length)` → `fnRetTextOf(ncl, nca)` with the space skip moved onto the RESULT | **YES**, provably: `nret[i] == ncl[nca + 2 + i]` and `nret.length == ncl.length - (nca + 2)`, so the space scan sees the same characters and the two cuts compose to the same string — including the clamped `nca + 2 > length` case, where both sides are `""` |
+| 21 array-suffix TEST | `emit_mono:2185` `an2[an2n - 2] != '['` → `!nameIsArray(an2)` | **NO — a strict TIGHTENING.** The home adds the `']'` conjunct |
+
+**ROW 21'S DIVERGENCE CLASS IS EMPTY, AND THE REASON IS A CHECKER GATE, NOT A GRAMMAR ONE.** The two
+tests differ only on a name whose second-to-last character is `[` and whose last is not `]`. In the
+type-name grammar the ONLY such spellings are quoted literals ending in a bracket (`"a["`, `"["`) —
+arrays end `]`, structs and maps `}`, generic applications `>`. For one to reach `:2185` it would have
+to be the argument type at a `T[]` parameter, and the checker rejects that first:
+`argument 1: expected T[], got "["`. The tightened branch also reuses the site's existing message
+verbatim, so even a witness would only change WHICH of two identical diagnostics fires. The
+leading-space skip left behind at `emit_classify:3438` stays a site (operation 9, one of the 12 with
+no home) and it is load-bearing rather than cosmetic: `nameIsLitUnionType` opens with an exact
+`cUserTypes` lookup, which a leading space misses outright.
+
+### 4. METHOD NOTE
+
+**A CENSUS ROW THAT NAMES A HOME AND A SITE AS "TWO WRITINGS" HAS ALREADY MADE THE MERGE ARGUMENT,
+AND THAT IS THE ROW TO DISTRUST.** Row 4's evidence was two bodies with the same expression in them;
+the tree's answer was three headers explaining why the two predicates over that expression are
+distinct. Reading bodies is what D-FLOORREAD correctly demanded of a signature census — and reading
+the bodies' HEADERS is the same demand one level up. The row was still worth taking: there WAS a copy,
+it was just the third site rather than either of the two the row named.
+
+<!-- APPEND-MARKER-FREEROUTE-END -->
