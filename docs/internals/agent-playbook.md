@@ -124,10 +124,13 @@ validator message alone — the disassembly is the debugging view of `vl build` 
   and `bash scripts/native-fixpoint.sh` (stage3 == stage4 byte-for-byte); check
   REFRESH_RC explicitly, because refresh's failure tail READS LIKE SUCCESS.
   Still read real output (`grep -E "passed|failed"`), never `tail -1`.
-- If you add an `is <Node>` narrowing on a new node type, OR call any
-  `ast.vl` helper (`mk*`, etc.) not already imported there, add it to the
-  import list in `tests/selfhost_wasm_emit_test.ts` and RUN that test —
-  three slices have now tripped on this.
+- If you add an `is <Node>` narrowing on a new node type, OR call any `ast.vl`
+  helper (`mk*`, etc.) not already imported in the file you are editing, the
+  self-compile is what catches it: `bash scripts/refresh-compiler.sh` fails on the
+  missing import. Three slices tripped on this, so read its rc rather than assuming.
+  ~~add it to the import list in `tests/selfhost_wasm_emit_test.ts` and RUN that
+  test~~ — **STALE, that file NO LONGER EXISTS** and no TS test imports `ast.vl`
+  helpers any more.
 
 ## Known landmines
 - **`@error-at` directive lines are 0-BASED, and the COLUMN is never compared**
