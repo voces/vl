@@ -143,7 +143,7 @@ must name the mechanism; the base rate is 8.7% and falling.**
 | ~~**B9**~~ | ~~W13's ~60 single-writing floor~~ | `destringify-types-program.md` D-FLOORREAD | **RE-DERIVED BY READING THE BODIES. It is not 60.** Site population **98 → 38** (five modules at zero); those 38 are **22 distinct operations, 16 copies**; **8 of the 22 re-write a home that exists** — three in files that already IMPORT it (`emit_mono` x2, `emit_classify` x1) — and 2 are declines against one. **Floor = 12**, of which 3 are declines the leaf header records, leaving **9 unhomed grammars with no filed reason**. `tyname.vl` itself is **35 bodies / 16 operations** (the CUT is ten one-line `slice`s) | **CLOSED** | — | — |
 | ~~**B9a**~~ | ~~the three FREE routings D-FLOORREAD found~~ | `destringify-types-program.md` D-FREEROUTE | **SHIPPED, and only TWO of the three were free.** `:2194`→`arrElemNameRaw` and `:3438`→`fnRetTextOf` are answer-identical on every input (the second provably: the leading-space skip commutes with the arrow cut). `:2185`→`nameIsArray` ADDS the `']'` conjunct, so it is a strict TIGHTENING; its divergence class (a name ending `[` with no `]`, i.e. a quoted literal such as `"a["`) cannot reach the site — the checker rejects a non-array at a `T[]` param (`expected T[], got "["`), and the tightened reject reuses the site's own message | **CLOSED** | — | — |
 | ~~**B9b**~~ | ~~operation 4 is written twice and the two answers DIFFER~~ | `destringify-types-program.md` D-FREEROUTE | **MIS-IDENTIFIED, and the disagreement is UNREACHABLE.** Not one operation written twice: `emit_base.tyGroupWrapsWhole` and `tyname.parenEnclosesWhole` are two NAMED predicates over one ladder, each correct for its own consumers (SPAN tests want never-closes ⇒ TRUE, PEELS want FALSE — a group whose closer does not exist has no final character to give up), and three in-tree headers already say so. The copy was `typecheck.vl:6285`, `parenEnclosesWhole`'s body verbatim; routed to the predicate's home. Reachability: an unclosed paren in a type annotation is a **parse error** (`expected ) but found end of line`) and every synthetic producer wraps balanced text (`"(" + inner + ")"`), so no input reaches either reading of the never-closes case | **CLOSED** | — | — |
-| **B10** | **Latent defect** — only the NEGATIVE memo carries `cUserTypesVer`, so a positive entry survives a `cUserTypes` rewrite | `emit_rep.vl:1147` → `:1198` | **4 disagreements in 976** memo-HIT reaches; inert only because rung 2 answers 0 times in 237 | OPEN | S | med (mint reorder) |
+| ~~**B10**~~ | ~~Latent defect — only the NEGATIVE memo carries `cUserTypesVer`, so a positive entry survives a `cUserTypes` rewrite~~ | `destringify-types-program.md` D-NWBRANDKEY | **MISDIAGNOSED — closed.** Nothing is stale: `cUserTypes` has FOUR writers, three in pass 0a and one add-only, so no declared name's entry ever changes. The two indices are the newtype BASE and `nwBrand`'s second `addTy` over the same `Ty`, both current, differing in rep key only because only the base owns an `sNames` row. Re-derived at **28 disagreements in 1,034** covered reaches (21/914 memo-HIT), 7 witnesses, all `new` structs; `repRowOfName` reproduces at 0/66, `repNameCanonKey` 0/294. **The proposed stamp, built and run: 0 of 28 moved**, 357 stale hits re-resolved of which **12 re-MINT a structurally identical duplicate** (the arena runaway the memo exists to close), `T.tys` moved on **5 of 1,773** files, wasm bytes **0 of 1,773**. Inertness holds but not for the filed reason — rung 2 answers **225 in 3,083**, yet **0 of 2,607** resolved-key FIND reaches is on a disagreeing name | **CLOSED** | — | — |
 
 **EXHAUSTED / REFUTED — do not schedule.** The name-shortcut route entire (#1334);
 row 2 `sTyIxOfNameTy` (0 of 402 arena-neutral, 282 distinct spellings for 402
@@ -157,14 +157,20 @@ is a `TyLit` read as its `TyPrim` base); the primitive-ARRAY rung (70 of 70 mint
 disagreements but buys nothing — `tsLeafTy`'s FIRST LINE already *is* `primTyOfName`,
 so there is nothing between caller and answer to skip. `cUserTypes` is refuted much
 harder here than at the emitter: **345 disagreements in 3,135 (11.0%)** at 13 of 16
-sites, against the emitter's 4 in 976, over two mechanisms the emitter cannot have —
-the newtype brand and the transparent alias — plus a **live type-parameter binding**
-(`tsLeafTy` asks `tpEnvTyOfName` before `declaredTyOfName`).
+sites, against the emitter's 28 in 1,034, over two mechanisms — the newtype brand and
+the transparent alias — plus a **live type-parameter binding** (`tsLeafTy` asks
+`tpEnvTyOfName` before `declaredTyOfName`) that the emitter cannot have. The first of
+those mechanisms is the emitter's too: D-NWBRANDKEY shows every one of its 28 is a
+`new` struct's base-vs-brand pair, not the stale memo B10 filed.
 
 **Standing soundness rule.** A newtype over a struct separates arena-index identity
 from rep identity; any future rung here must be graded against it. **The fuzzer is
 structurally blind to it** — the grammar emits no `new` type (820 covered fuzz
-reaches, 0 key disagreements), so fuzz agreement is not evidence for this class.
+reaches, 0 key disagreements), so fuzz agreement is not evidence for this class. The
+hand-built population is
+`tests/cases/memory/newtype-struct-reflist-key-population.vl` (two same-shape
+newtypes, their plain declared twin and a bare inline shape, at four ref-list element
+positions) plus the `newtype-struct-*` cases in `tests/cases/maps/`.
 
 ---
 
