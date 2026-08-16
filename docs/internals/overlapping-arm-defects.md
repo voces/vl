@@ -314,26 +314,64 @@ function probe(u: A | B) {
 probe("x")
 ```
 
-The receiver's rep and the membership ladder are both HEALTHY — the bare-literal spelling answers
-correctly on the identical value. What fails is resolving the ALIAS to its member set on that path,
-so the ladder never fires and the test folds to `i32.const 0` (confirmed in the disassembly).
+The membership semantics are HEALTHY — the bare-literal spelling answers correctly on the identical
+value — and the test folds to `i32.const 0` (confirmed in the disassembly).
 
 **This is not ROOT A.** ROOT A is "one tag cannot separate overlapping arms". Here there is no tag
-compare to get wrong and no overlap to separate: the receiver is a compact interned atom, the correct
-lowering (a membership ladder) already exists and demonstrably works one line above, and the alias
-spelling simply fails to reach it. Re-filing the litunion remainder under ROOT A's fix shape would
-have built a membership test that is already built.
+compare to get wrong and no overlap to separate.
 
-### Why the one-alias case works, and what that bounds
+### The third wrong mechanism: the receiver is a STRING, not an atom
 
-| union | classified as | `is A` |
+The filing above reasoned from "the receiver is a compact interned atom, so the atom membership
+ladder exists and the alias spelling merely fails to reach it", and named two classifiers
+(`exprIsLitAtom`, `unionNameOfIdentSid`) as the things to widen. **The disassembly refutes it.** For
+`function probe(u: A | B)` the param is `(param (ref $1))` — an array-of-i32 STRING — and the working
+`u is "x"` one line above lowers to a `__str_eq__` call, not to an `i32.eq` against an interned id.
+Widening `exprIsLitAtom` to claim this shape would have emitted the atom ladder's `i32.eq` against a
+string ref: invalid wasm, traded for a wrong answer.
+
+**Both reps exist, and `nodeTyIsLitUnionAlias` decides which.** The atom valtype ladders carry a
+literal union only where its emit-time spelling is a registered alias NAME; `ctxKeepsLitUnion` is
+false at `RC_ROOT` and `RC_FN_PARAM`, so a litunion with no alias of its own — the flattened `A | B`,
+and the bare inline spelling — stays a string there. The receiver classifiers key on that same alias
+test, so classifier and valtype ladder AGREE: neither is wrong, and there was no classification gap
+to close. What was missing is the `is` lowering for the string rep.
+
+That lowering is the same MEMBERSHIP the atom ladder emits, through string equality instead of
+interned-id equality: `recv == "m0" || recv == "m1" || …`. Absent it the guard fell to
+`monoStaticIsResult`, which sees a non-union REP and a tested name that is no variant row, and
+answered the constant FALSE.
+
+### The three reps of a litunion `is`, which is what bounds the cut
+
+| union | rep | `is A` lowering |
 |---|---|---|
-| `A \| string`, `A \| i32`, `A \| string \| i32` | value union, litunion ARM (#1340's `nameIsLitUnionArmValueUnion`) | ✅ correct |
-| `A \| B` (every member a string literal) | **pure** litunion — a compact atom, no box | ❌ always FALSE |
+| `A \| string`, `A \| i32`, `A \| string \| i32` | value-union BOX | tag-gated payload membership (#1340's `nameIsLitUnionArmValueUnion`) |
+| `A` alone, or a `K`-typed field / element / map value | interned i32 ATOM | `id == m0 \|\| id == m1 \|\| …` |
+| `A \| B`, and the inline `("a"\|"b") \| ("c"\|"d")`, at `RC_ROOT` / `RC_FN_PARAM` | member STRING | `recv == "m0" \|\| recv == "m1" \|\| …` |
 
 #1340's gate is reached only when a NON-litunion arm forces the box. Two litunion aliases flatten to
-an all-literal member set, which is a pure litunion, which takes the atom path — the one #1340 never
-touched.
+an all-literal member set, which carries no box at all — so the third row is a rep neither #1340 nor
+slice C's atom work had a lowering for.
+
+**CLOSED**, both arms, disjoint and overlapping member sets, the inline spelling, and param /
+`const` / `let` / reassigned-`let` / module-global receivers. Pinned by
+`tests/cases/literal-unions/is-alias-arm-of-flattened-litunion.vl`, which scores 18 wrong lines
+without the fix.
+
+### What the cut does NOT reach
+
+CONSUMING a string-repped receiver once it is NARROWED to an alias — `if u is K { const r: K = u }`,
+or passing the narrowed value to a `K` param — is invalid wasm, before and after: the narrowing
+rebinds to `K`, whose slot is an ATOM, while the value is a string ref. That is a valtype-ladder
+hole, not an `is` hole, and it is the same inline-spelling PARAM/FIELD work
+`docs/internals/destringify-types-program.md` files.
+
+Adjacent and separately unmeasured until now: a plain `string` receiver tested against a literal
+union (`function f(s: string) { if s is A … }`) is `vl check`-clean and also answers a constant
+FALSE. The receiver is the same string rep and the same lowering would serve it; it is a different
+receiver POPULATION (a narrowing of `string` down to a subset, not a union arm test), so it is filed
+rather than bundled.
 
 ### Numeric literal unions are a separate, deeper cut
 
@@ -349,3 +387,10 @@ bundled with it.
 a shared member, so the shared member entered the description; it turned out to be a coincidence of
 how the probes were written. The one-line disproof — swap the members to disjoint sets and rerun —
 cost less than the reasoning that preceded it.*
+
+*And the note the third filing adds: **a claim about a REP is only worth what the disassembly says.**
+"The receiver is an atom" was asserted from the type's classification (`tyIsLitUnion` answers YES for
+the flattened member set) and never read off the emitted module; the valtype is decided one predicate
+further on (`nodeTyIsLitUnionAlias`) and says STRING. Two named classifiers were queued for widening
+on the strength of it, and widening either would have shipped invalid wasm. `wasm-dis` on the
+function costs one command.*
