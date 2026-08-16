@@ -276,6 +276,7 @@ import {
   uFieldElemTyIx,
   uFieldNames,
   uFieldStart,
+  uFieldTyText,
   uFieldTypes,
   uTags,
   uVarHeap,
@@ -4273,6 +4274,13 @@ function fieldRecElemName(tyIx: i32, code: i32) {
 // SPELLING — answers `nameIsI32KeyedMap` here. Every non-map code passes false, which is
 // what the predicate answers for a non-map spelling anyway.
 //
+// `tyText` is the row's IDENTITY column: the field's own canonical type text, which the
+// three recorders hold and no other column preserves (the code is storage, the elem name is
+// a referenced layer). Supplied by the same two provenances as `keyI32` — `tyNameOf(fdType)`
+// from the two node recorders, the field TYPE TEXT from the shape-text one — so the two
+// spellings of one type agree here exactly as they already do there. Recorded only into the
+// VARIANT table, whose `variantFieldTysEq` is its one reader.
+//
 // The push ORDER matters and is preserved exactly: the D5 sidecar recorder pads itself
 // against `*FieldElemName.length`, so it must run AFTER that column's push and before the
 // next row's; `registerValueUnionName` must run after the row is complete because it can
@@ -4283,9 +4291,11 @@ function pushFieldRow(
   elemNm: string,
   keyI32: boolean,
   fName: string,
+  tyText: string,
 ) {
   if toVariant {
     uFieldTypes.push(code)
+    uFieldTyText.push(tyText)
     uFieldElemName.push(elemNm)
     recordUFieldElemRow(elemNm, keyI32) // D5 + B6b
     uFieldNames.push(fName)
@@ -4374,6 +4384,7 @@ export function collectS(stmts: i32[]) {
               fieldRecElemName(fnode.fdType, code),
               nameIsI32KeyedMap(tyNameOf(fnode.fdType)),
               fnode.fdName,
+              tyNameOf(fnode.fdType),
             )
             cnt = cnt + 1
           } else {
@@ -4439,6 +4450,7 @@ function collectShapeVariantFields(nm: string) {
       shapeFieldElemName(ftxt, fc),
       nameIsI32KeyedMap(ftxt),
       fnames[fi],
+      ftxt,
     )
     cnt = cnt + 1
     fi = fi + 1
@@ -4482,6 +4494,7 @@ function collectVariantFields(stmts: i32[], name: string) {
               fieldRecElemName(fnode.fdType, code),
               nameIsI32KeyedMap(tyNameOf(fnode.fdType)),
               fnode.fdName,
+              tyNameOf(fnode.fdType),
             )
             cnt = cnt + 1
           } else {
@@ -4498,17 +4511,39 @@ function collectVariantFields(stmts: i32[], name: string) {
   emitFail("emitProgram: union variant names an unknown struct type")
 }
 
-// True if variants `a` and `b` STORE the same thing per field — the field-TYPE half of
-// variant identity, whose name half is `variantSig`. Deliberately the CODE comparison and
-// nothing deeper: this runs inside `collectU`, the FIRST emit pass, so the ref-list / struct
-// / map slot tables `variantFieldLayoutEq` consults do not exist yet. A code difference is
-// therefore a sufficient (not necessary) witness of divergent storage, which is all the
-// reject below needs.
-function variantFieldCodesEq(a: i32, b: i32) {
+// True if variants `a` and `b` are the SAME TYPE per field — the field-TYPE half of variant
+// identity, whose name half is `variantSig`. The `assignTags` reject below exempts a pair
+// this answers true for, and the exemption means "these two arms ARE one variant", so the
+// question asked here has to be IDENTITY.
+//
+// STORAGE IS NOT IDENTITY, AND KEYING THE EXEMPTION ON STORAGE WAS A SILENT WRONG ANSWER.
+// One wasm-type code covers several VL types — `i32` and `boolean` are both code 0 — so
+// `{a: i32} | {a: boolean}` presented as the layout-equal twin the exemption exists for:
+// both arms ranked tag 0 and both `is` tests lowered to the same `i32.const 0` compare, the
+// exact silent miscompile the reject exists to convert into a message. The `uFieldTyText`
+// column is the field's own type spelling, so the pair now parts on the same question
+// `{a: i32} | {a: f64}` and `{a: i32} | {a: string}` already parted on.
+//
+// Type text is the discriminator that a code cannot be; the code and elem-name comparisons
+// stay because they are the STORAGE half and answer for spellings the text cannot separate
+// on its own. This runs inside `collectU`, the FIRST emit pass, so the ref-list / struct /
+// map slot tables `variantFieldLayoutEq` consults do not exist yet — a code difference is a
+// sufficient (not necessary) witness of divergent storage, which is all the reject needs.
+//
+// A transparent alias is not a false reject: `canonEmitTypeNames` rewrites every annotation
+// into its canonical emit name before any emit pass, so `type Id = i32` reaches this column
+// as `"i32"` and `{a: Id} | {a: i32}` stays the one variant it is.
+function variantFieldTysEq(a: i32, b: i32) {
   if uFieldCount[a] != uFieldCount[b] { return false }
   let fi = 0
   while fi < uFieldCount[a] {
     if uFieldTypes[uFieldStart[a] + fi] != uFieldTypes[uFieldStart[b] + fi] {
+      return false
+    }
+    if (
+      uFieldTyText[uFieldStart[a] + fi] !=
+      uFieldTyText[uFieldStart[b] + fi]
+    ) {
       return false
     }
     if (
@@ -4568,7 +4603,7 @@ function assignTags() {
       let b = a + 1
       while b < vc {
         if sigs[vs0 + a] == sigs[vs0 + b] {
-          if !variantFieldCodesEq(vs0 + a, vs0 + b) {
+          if !variantFieldTysEq(vs0 + a, vs0 + b) {
             return emitFail(
               "emitProgram: union `" +
                 unNames[ui] +
@@ -5757,6 +5792,7 @@ export function collectU(stmts: i32[]) {
   uFieldStart = []
   uFieldCount = []
   uFieldTypes = []
+  uFieldTyText = []
   uFieldElemName = []
   uFieldElemTyIx = []
   uFieldElemKeyI32 = []
