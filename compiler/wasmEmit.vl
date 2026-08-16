@@ -641,7 +641,7 @@ import {
   valBlockTypeOfKind,
   vbHeapIdxOfKind,
 } from "./emit_rep"
-import { monoArgTyName } from "./emit_mono"
+import { monoArgTyName, monoInstantiatedAny } from "./emit_mono"
 import { fnIndexOfInScopeChain } from "./emit_collect"
 // THE TYPE-NAME GRAMMAR'S LEAF — and this is the edge that never existed. `tyname.vl`'s
 // own header has recorded since phase 1 that its nine importers are the import SET and not
@@ -1374,8 +1374,10 @@ function emitClosureValue(body: i32[], fe: i32, fnIx: i32) {
 // The closure-value emission WITHOUT the un-annotated-param floor — the `cloSigKeyExt`
 // representability floor still applies (even a sound direct-call-only binding is called through
 // its `$fnsig`, so that env-leading signature must be representable). Reached either through `emitClosureValue`
-// (after its floor) or directly from the LetDecl emit for a monomorphized direct-call-only alias.
-function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
+// (after its floor) or directly from the binding emit for a monomorphized direct-call-only alias —
+// the local one here (`emitLetDeclStmt`) and the module-level one in `emit_sections.vl`, which
+// gates on `monoGenericAliasFe` instead.
+export function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
   if fe < 0 || fe >= fnStmts.length {
     return emitFail("emitProgram: function value with no lifted function")
   }
@@ -12788,17 +12790,28 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // `emitClosureValue` would reject it on those un-annotated params, so emit through the
   // floor-LESS core. A value-USE of `g` (passed, returned, stored) escapes — `nameUsedAsValueIn`
   // catches it — and falls through to the normal path, where the floor rejects it.
+  //
+  // `monoInstantiatedAny` is the second half of that soundness argument and it is NOT optional:
+  // "the closure is called only at the shape its slot was pinned to" presupposes a call site
+  // pinned it. With NO call site the template stays un-pinned and its body emits at the i32
+  // default, which for a non-numeric body is INVALID WASM at `vl check` rc 0 — witness
+  // `function exclaim(s) { return s + "!" }` with `const f = exclaim` and no call, which reached
+  // the engine as `type mismatch: expected (ref $type), found i32`. A never-called alias now
+  // takes the floor's loud reject instead; the module-level twin gates the same way
+  // (`monoGenericAliasFe`).
   if fnIx >= 0 {
     const aliasFe = fieldValueFeOf(s.letInit)
     if fnHasUnannotatedParam(aliasFe) {
       if !criFnIsAnonLambda(aliasFe) {
-        const encl = P.nodes[fnIx]
-        if encl is FuncDecl {
-          if !nameUsedAsValueIn(s.letName, encl.fnBody) {
-            if emitClosureValueCore(body, aliasFe, fnIx) < 0 { return -1 }
-            fbLocalSet(idx) // 0x21 local.set
-            scopeBind(s.letName, slot)
-            return 0
+        if monoInstantiatedAny(aliasFe) {
+          const encl = P.nodes[fnIx]
+          if encl is FuncDecl {
+            if !nameUsedAsValueIn(s.letName, encl.fnBody) {
+              if emitClosureValueCore(body, aliasFe, fnIx) < 0 { return -1 }
+              fbLocalSet(idx) // 0x21 local.set
+              scopeBind(s.letName, slot)
+              return 0
+            }
           }
         }
       }

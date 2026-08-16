@@ -139,6 +139,8 @@ import {
   exprStringArray,
   exprStruct,
   exprUnion,
+  fieldValueFeOf,
+  fnHasUnannotatedParam,
   fnIndexOf,
   fnIndexOfInScope,
   fnRetExprOf,
@@ -2606,6 +2608,27 @@ function monoExportPublicName(name: string): string {
   name
 }
 
+// Did `monomorphize` pin the generic declaration at lifted position `origFe` from at least one
+// call site? Every instantiation records a row — INCLUDING the count-0 one that reuses the
+// original slot (`monoInstFe == origFe`) — so this is the rename-immune answer to "is this
+// template's parameter shape backed by a real argument list", asked AFTER the pass has rewritten
+// callee identifiers to instance names (which is why counting `Ident`s cannot answer it).
+//
+// A generic template that NOTHING instantiated still emits its body at the i32 DEFAULT, and that
+// body is only accidentally valid: `function add(a, b) { return a + b }` lowers, while
+// `function exclaim(s) { return s + "!" }` emits a string-concat helper call over an i32
+// parameter — `vl check` rc 0, INVALID WASM (this is #1254 mechanism B, whose prune declines
+// exactly when the name is taken as a VALUE). So every value-floor exemption that hands such a
+// template out as a closure has to demand this first.
+export function monoInstantiatedAny(origFe: i32) {
+  let k = 0
+  while k < monoInstOrig.length {
+    if monoInstOrig[k] == origFe { return true }
+    k = k + 1
+  }
+  false
+}
+
 // Which of `names` is referenced as a function VALUE — i.e. appears as an `Ident` that is NOT
 // some `Call`'s callee — anywhere in the node arena. Returns an `i32[]` parallel to `names`
 // (1 = value-referenced). ONE arena pass regardless of how many names are asked about: the
@@ -2623,7 +2646,7 @@ function monoExportPublicName(name: string): string {
 //
 // Conservative by construction: a same-named LOCAL (`const exclaim = 5`) also matches and
 // merely declines the prune, which is the status quo, never a regression.
-function monoNamesUsedAsValue(names: string[]): i32[] {
+export function monoNamesUsedAsValue(names: string[]): i32[] {
   const hit: i32[] = []
   let h = 0
   while h < names.length {
@@ -2661,6 +2684,47 @@ function monoNamesUsedAsValue(names: string[]): i32[] {
     k = k + 1
   }
   hit
+}
+
+// The lifted-function position of the GENERIC (un-annotated-param) NAMED function that the
+// MODULE-LEVEL binding at `letIx` aliases, when handing that template out as this binding's
+// closure value is sound — else -1. The module-scope twin of the function-body exemption in
+// `emitLetDeclStmt`, and it answers the same question over a wider region: a global is visible
+// from every function body, so "used only as a direct-call callee" has to hold PROGRAM-WIDE, not
+// within one frame.
+//
+// WHY IT IS SOUND. `monoWalk` resolves `f(args)` through the binding to `add`'s slot and
+// monomorphizes per call site exactly as it does for a by-name call, so each call reaches the
+// instance its own argument types pinned. The closure this binding stores is therefore never the
+// thing a differently-typed call goes through — it is either dead or `call_ref`'d at the one
+// shape its own slot kept. A value-USE (passed, returned, stored in a field) escapes to a call
+// whose type the binding cannot guarantee, and that is what the arena scan rules out.
+//
+// THREE gates, each load-bearing:
+//   (1) an un-annotated-param NAMED function. An ANNOTATED binding (`const f: (i32,i32)=>i32 =
+//       add`) already materializes its instance at `monoCoerceFnValue` and never reaches the
+//       floor; a lifted anonymous LAMBDA is contextually pinned per use and is excluded from
+//       this whole family by `criFnIsAnonLambda`.
+//   (2) INSTANTIATED at least once. An uncalled template emits its body at the i32 default, which
+//       is valid only by accident — see `monoInstantiatedAny`.
+//   (3) never referenced as a VALUE. Conservative by construction: a same-named local in some
+//       other frame also matches and merely declines, which is the pre-existing reject.
+export function monoGenericAliasFe(letIx: i32) {
+  if letIx < 0 { return -1 }
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    const fe = fieldValueFeOf(d.letInit)
+    if fe < 0 { return -1 }
+    if !fnHasUnannotatedParam(fe) { return -1 }
+    if criFnIsAnonLambda(fe) { return -1 }
+    if !monoInstantiatedAny(fe) { return -1 }
+    const one: string[] = []
+    one.push(d.letName)
+    const used = monoNamesUsedAsValue(one)
+    if used[0] == 1 { return -1 }
+    return fe
+  }
+  -1
 }
 
 // The monomorphization pass: snapshot which lifted functions are generic, then
