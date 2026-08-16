@@ -262,7 +262,7 @@ any program with no `new` declaration.
 
 | population | cells | master grade | why not closed |
 |---|---:|---|---|
-| **struct arms, same field NAMES, i32-vs-boolean field types** | 3 | RUN-WRONG | a DIFFERENT mechanism, and localized: `emit_collect.vl`'s discriminability reject already refuses `{a:i32} \| {a:f64}` and `{a:i32} \| {a:string}` (verified), but `variantFieldCodesEq` compares STORAGE codes, and `boolean` and `i32` share one — so the pair is treated as the layout-equal twin the exemption is for, both members rank tag 0, and the WAT compares both `is` against `i32.const 0`. Its exemption is keyed on layout where it means IDENTITY. |
+| ~~**struct arms, same field NAMES, i32-vs-boolean field types**~~ | ~~3~~ | RUN-WRONG | **CLOSED — see the section at the end of this file. The filed mechanism was right and the filed SCOPE was too small.** |
 | **struct arms, same shape, width-subtype, or a named twin** | 3 | EMIT-REJECT | already loud; a clean checker diagnostic would be an improvement, not a defect closure |
 | **function-type arms** (arity / param / return differ) | 3 RUN-WRONG + 1 EMIT-REJECT | RUN-WRONG | unprobed mechanism; the closure fat-pointer's arm tag is a separate table from the value-atom tags this slice touched |
 | **literal-union shapes #1340 did not reach** | 5 | RUN-WRONG | `is K` answers FALSE where #1340's membership test should fire: a NUMERIC literal union beside `i32`/`f64`, two literal unions sharing a member, and the INLINE (unaliased) spelling beside `string`. The gate is `nameIsLitUnionArmValueUnion` on the union NAME — the closest thing to a ready template in the tree, and the population most likely to close with #1340's own shape |
@@ -394,3 +394,78 @@ the flattened member set) and never read off the emitted module; the valtype is 
 further on (`nodeTyIsLitUnionAlias`) and says STRING. Two named classifiers were queued for widening
 on the strength of it, and widening either would have shipped invalid wasm. `wasm-dis` on the
 function costs one command.*
+
+
+---
+
+## D5 (`{a:i32} | {a:boolean}`) is CLOSED — the mechanism was filed right, the SCOPE was filed small
+
+The "still open" table above calls this population **3 cells** and pins the mechanism in one line:
+*"Its exemption is keyed on layout where it means IDENTITY."* That sentence is exactly right, and it
+is the whole fix. What the filing got small is how far the sentence reaches.
+
+### The exemption's live population — measured, not assumed
+
+`assignTags` rejects two variants of one union that share a field-NAME set (`variantSig`, which IS
+the tag key) *unless* the field comparator says they are one variant. Before asking what the
+comparator should compare, the question worth answering is **what the exemption is FOR**, and that is
+measurable: replace the exempt arm with an `emitFail` and sweep the corpus.
+
+**3 of 1,743 `tests/cases` files, and nothing else:**
+
+| file | the twin it needs |
+|---|---|
+| `types/struct-union-same-shape.vl` | `type A = {tag:i32,v:i32}` / `type B = {…}` identical, `A \| B` at a PARAM slot |
+| `types/struct-union-same-shape-field-slot.vl` | the same pair at a struct-FIELD slot |
+| `soundness/union-same-shape-discriminant-sound.vl` | the `kind`-field discriminant idiom over two identical shapes |
+
+All three are one contract: VL is structurally typed, so two `type` aliases with the same shape are
+**the same variant** — a `B` genuinely IS an `A`, `is A` is soundly always true, and the arena
+already collapses the union (`sameVariantTy`). That is a real rule with a real population, which is
+why the exemption cannot simply be deleted.
+
+### Why the comparator was wrong, in the terms the population sets
+
+The exemption meant *"these two arms ARE one variant"* and was implemented as *"these two arms STORE
+the same way"* (`variantFieldCodesEq` over the wasm-type CODE column). One code covers several VL
+types — `i32` and `boolean` are both code 0 — so a pair that is two variants presented as one.
+The fix is a per-field **type TEXT** column on the variant table (`uFieldTyText`), recorded by the
+one field-row home from the same two provenances the map-KEY column already uses, and read by the
+renamed `variantFieldTysEq`.
+
+A transparent alias is not a false reject and this is the route with no other pin in the corpus:
+`canonEmitTypeNames` rewrites every annotation into its canonical emit name before any emit pass, so
+`type Id = i32` arrives in the column as `"i32"` and `{a: Id} | {a: i32}` stays the one variant it is.
+`unions/variant-twin-scalar-spellings.vl` now pins that route alongside the two-declared-names and
+declared-vs-inline routes.
+
+### The count, and what "3 cells" missed
+
+The 3 is not reproducible from this document — the cells were never enumerated — so the shape was
+re-gridded from scratch: **15 cells, 6 UP, 0 DOWN, 9 unchanged** (3 already-rejecting controls, 6
+twin-exemption controls).
+
+The 6 that moved RUN-WRONG → EMIT-REJECT are the declared spelling and the inline spelling, **both
+arm orders**, a carrier with a second matching field, and — the one the filed description does not
+name — **`{a: i32[]} | {a: boolean[]}`**. The defect is not "i32-vs-boolean field types"; it is *every
+storage code that covers more than one type*, and code 4 (the i32-backed list) is the second such
+code the corpus can reach. The 3 unchanged rejecting controls are the pairs whose difference the
+ELEM-NAME column already carried: a literal-union field beside `i32`, a map field differing in its
+VALUE, and `i32 | null` beside `boolean | null`.
+
+Both arm orders being wrong is what makes this a defect rather than a masked cell: there is no
+construction of this union that the tag scheme decides correctly, so no inverted twin rescues it.
+
+### What is NOT affected, and why it did not need the same change
+
+`variantFieldLayoutEq` — the `mAssignTypeIndices`-time sibling that folds twins into one heap type —
+looks like it has the same confusion and does not: `buildVariantTwins` calls it only where
+`repNameCanonKey` has already matched off the ARENA, so identity is established before layout is
+consulted. Storage-vs-identity is only a confusion where nothing else establishes identity, which at
+`collectU` time is the case for exactly this comparator.
+
+*Method note this closure adds: **ask what an exemption is FOR before deciding what it should
+compare, and answer it by poisoning the arm rather than by reading it.** The three files the sweep
+named state the structural-typing contract in their own headers; no amount of staring at
+`variantFieldCodesEq` would have produced them, and without them "just delete the exemption" reads
+like a defensible option.*
