@@ -233,6 +233,7 @@ import {
 } from "./emit_base"
 import {
   blockAlwaysReturns,
+  exprIsIfStmt,
   firstValuedReturn,
   globalHasTypeAnn,
   globalIsNonConst,
@@ -9107,6 +9108,66 @@ export function fnUnionRetSinkOk(fnIx: i32) {
     if !isBox { return false }
     return retExitCount(fn.fnBody, fnIx) >= 2
   }
+  false
+}
+
+// Is some collected declared local named `name` the union BOX rep (kind 4)? The binding
+// sink's prediction asks this rather than re-deriving the slot cursor: `buildLocals` has
+// already run, so the kind is on record, and a shadowed name that answers for the WRONG
+// slot only mis-predicts — which costs two unused local declarations, never a wrong sink
+// (the lowering reads `localIsRef[slot]` for the slot it is actually emitting).
+function localNameIsUnionSlot(name: string) {
+  let i = 0
+  while i < localNames.length {
+    if localNames[i] == name {
+      if localIsRef[i] == "union" { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Does the statement at `stmtIx` hold a `let`/`const` of the union BOX rep whose init is
+// an if-EXPRESSION — the shape the binding sink rewrites? Deliberately does NOT descend
+// into a nested `FuncDecl`, whose locals belong to its own lifted wasm function.
+function blockHasUnionLetIf(stmtIx: i32) {
+  if stmtIx < 0 { return false }
+  const s = P.nodes[stmtIx]
+  if s is FuncDecl { return false }
+  if s is LetDecl {
+    if exprIsIfStmt(s.letInit) { return localNameIsUnionSlot(s.letName) }
+    return false
+  }
+  if s is Block {
+    const stmts = s.blkStmts
+    let i = 0
+    while i < stmts.length {
+      if blockHasUnionLetIf(stmts[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if s is IfStmt {
+    if blockHasUnionLetIf(s.ifThen) { return true }
+    return blockHasUnionLetIf(s.ifElse)
+  }
+  if s is WhileStmt { return blockHasUnionLetIf(s.whileBody) }
+  if s is ForRange { return blockHasUnionLetIf(s.frBody) }
+  if s is ForIn { return blockHasUnionLetIf(s.fiBody) }
+  false
+}
+
+// True when function `fnIx` should reserve the union-box sink pair for a BINDING: it holds
+// a union-box `let`/`const` initialized by an if-expression, so an arm's box can be sunk
+// past the merge and built once after it.
+//
+// This is a PREDICTION on the same terms as `fnUnionRetSinkOk`'s: whether the rewrite
+// actually fires is decided during lowering (`unionIfBindingAllBox` gates it on every arm
+// CONSTRUCTING a box, which only the coercion ladder knows). An over-firing prediction
+// costs two unused local declarations; an under-firing one declines a sink.
+export function fnUnionLetSinkOk(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return blockHasUnionLetIf(fn.fnBody) }
   false
 }
 

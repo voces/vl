@@ -194,6 +194,7 @@ import {
   fnUsesMapFilter,
   fnUsesMapKeys,
   fnUsesMapVals,
+  fnUsesUnionLetSink,
   fnUsesUnionSink,
   fnUsesVariantRebox,
   fnValUsed,
@@ -8579,6 +8580,148 @@ function emitNullableIfBinding(
   emitFail("emitProgram: expected an if expression")
 }
 
+// ── the union-box BINDING SINK ────────────────────────────────────────────────
+// `const u: A | B = if c { a } else { b }` in the value-union box rep, with the box built
+// ONCE past the merge instead of once per arm.
+//
+// `emitNullableIfBinding`'s rep-0 lowering builds a box in every arm and stores it into
+// the binding's slot, and pays a THIRD construction before the `if` — the slot is a
+// non-null `(ref $uBox)`, which is not defaultable, and a void-`if` merge does not satisfy
+// the definite-assignment check, so the rep's null box is pre-seeded and immediately
+// overwritten on every path. Heap2Local scalarizes per allocation SITE, so none of the
+// three can own the slot and the box survives the whole release profile.
+//
+// The sink writes each arm's tag and payload into the shared sink pair and performs the
+// single `struct.new` after the `if`, storing it into the slot. That one `local.set`
+// dominates every read of the binding, so the pre-seed is not merely redundant — it is
+// unnecessary, and the shape drops from `arms + 1` sites to exactly one.
+//
+// Gated on `unionIfBindingAllBox`: an arm that PASSES a box through builds nothing, and
+// routing it through the pair would unbox and rebuild it — trading no site for a new
+// allocation on that path. `emitUnionArmToPair`'s backstop keeps such an arm correct if
+// the gate is ever wrong about one, at exactly that price.
+
+// Does every terminal arm of the union-box if-binding at `ifIx` CONSTRUCT its box? An
+// `else if` chain link recurses; an else-LESS chain contributes the rep's null box, which
+// is a construction like any other.
+function unionIfBindingAllBox(ifIx: i32, fnIx: i32) {
+  const s = P.nodes[unwrapParen(ifIx)]
+  if s is IfStmt {
+    if !unionIfArmBoxes(ifArmValueExpr(s.ifThen), fnIx) { return false }
+    if s.ifElse < 0 { return true }
+    const els = P.nodes[s.ifElse]
+    if els is IfStmt { return unionIfBindingAllBox(s.ifElse, fnIx) }
+    return unionIfArmBoxes(ifArmValueExpr(s.ifElse), fnIx)
+  }
+  false
+}
+
+// The two arm shapes whose lowering does NOT end in `struct.new $uBox`: a value that is
+// ALREADY a box (`emitUnionCoerce` passes it through untouched) and a NESTED if-expression
+// (`emitUnionIfValue`'s value-typed `if`, whose last instruction is the frame's `end`).
+// Every other shape — a scalar atom, a `null`, an object literal, a bare variant ref, a
+// map carrier — bottoms out in the box's own construction.
+function unionIfArmBoxes(valIx: i32, fnIx: i32) {
+  if valIx < 0 { return false }
+  if exprUnion(valIx, fnIx) { return false }
+  const v = P.nodes[unwrapParen(valIx)]
+  if v is IfStmt { return false }
+  true
+}
+
+// Emit ONE arm value into the sink pair: the arm's box, unwritten by the peephole down to
+// its two operands. The BACKSTOP (an arm that did not end in a construction after all)
+// stores the box it did produce into the binding's own slot and reads the pair back out of
+// it — correct, and costing the rebuild after the `if` that the gate exists to avoid.
+function emitUnionArmToPair(
+  body: i32[],
+  valIx: i32,
+  idx: i32,
+  unionName: string,
+  fnIx: i32,
+) {
+  if valIx < 0 {
+    return emitFail("emitProgram: if-expression arm is not a value")
+  }
+  if emitUnionBoxArg(body, unionName, valIx, fnIx) < 0 { return -1 }
+  if uBoxNewIsLast() {
+    uBoxSinkToPair()
+    return 0
+  }
+  fbLocalSet(idx)
+  fbLocalGet(idx)
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbLocalSet(unionSinkBase)
+  fbLocalGet(idx)
+  fbStructGet(uBoxIdx, 1) // field 1: payload (anyref)
+  fbLocalSet(unionSinkBase + 1)
+  0
+}
+
+// The rep's NULL into the sink pair (the else-less false path): the null tag and the
+// unread payload slot, written directly rather than through a box the merge would discard.
+function emitUnionNullToPair() {
+  fbI32Const(nullBoxTag())
+  fbLocalSet(unionSinkBase)
+  fbRefNullNone() // the payload slot is unread under the null tag
+  fbLocalSet(unionSinkBase + 1)
+  0
+}
+
+// `emitNullableIfBinding`'s rep-0 shape with every arm writing the sink pair instead of
+// the binding's slot. The caller performs the one `struct.new` after the `if`.
+function emitUnionIfBindingSink(
+  body: i32[],
+  ifIx: i32,
+  idx: i32,
+  unionName: string,
+  fnIx: i32,
+) {
+  const s = P.nodes[unwrapParen(ifIx)]
+  if s is IfStmt {
+    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    fbIf(64) // 0x04 if, 0x40 void blocktype
+    ctrlEnter() // count the frame — see `emitUnionIfValue`
+    const savedTop = narrowTop
+    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    const rc = emitUnionArmToPair(
+      body,
+      ifArmValueExpr(s.ifThen),
+      idx,
+      unionName,
+      fnIx,
+    )
+    if narrowed { restoreNarrow(savedTop) }
+    if rc < 0 { return -1 }
+    fbElse() // 0x05 else
+    const savedElseTop = narrowTop
+    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
+    let erc = 0
+    if s.ifElse < 0 {
+      erc = emitUnionNullToPair()
+    } else {
+      const els = P.nodes[s.ifElse]
+      if els is IfStmt {
+        erc = emitUnionIfBindingSink(body, s.ifElse, idx, unionName, fnIx)
+      } else {
+        erc = emitUnionArmToPair(
+          body,
+          ifArmValueExpr(s.ifElse),
+          idx,
+          unionName,
+          fnIx,
+        )
+      }
+    }
+    if narrowedElse { restoreNarrow(savedElseTop) }
+    if erc < 0 { return -1 }
+    fbEnd() // 0x0b end
+    ctrlLeave()
+    return 0
+  }
+  emitFail("emitProgram: expected an if expression")
+}
+
 // The expression whose REP the `emitExprAs*` widenings must classify. ASSIGNMENT is a
 // value expression yielding a RE-READ of its TARGET — `emitBinExprNode`'s `=` arm stores
 // through `emitAssign` and then emits the target through the normal Ident path — so
@@ -12335,27 +12478,45 @@ function emitTailCallRet(fnIx: i32) {
 // transform is per-exit and never has to be total.
 export function emitUnionRetSink(fnIx: i32) {
   if fnUsesUnionSink {
-    if uBoxNewEnd == wLen() {
-      const pat = unionBoxNewBytes()
-      const np = pat.length
-      let ok = true
-      let i = 0
-      while i < np {
-        if wPeekBack(i) != pat[np - 1 - i] { ok = false }
-        i = i + 1
-      }
-      if ok {
-        wDropBack(np)
-        fbLocalSet(unionSinkBase + 1) // the anyref payload — top of stack
-        fbLocalSet(unionSinkBase) // the i32 tag — beneath it
-        fbBr(ctrlDepth) // 0x0c br to the function's single exit block
-        uSinkFired = uSinkFired + 1
-        return 0
-      }
+    if uBoxNewIsLast() {
+      uBoxSinkToPair()
+      fbBr(ctrlDepth) // 0x0c br to the function's single exit block
+      uSinkFired = uSinkFired + 1
+      return 0
     }
   }
   if emitTailCallRet(fnIx) { return 0 }
   fbReturn() // 0x0f return
+  0
+}
+
+// THE UNION-BOX PEEPHOLE'S MATCH, shared by both sink positions: is the last instruction
+// written the box's own `struct.new $uBox`, with its two operands still sitting on the
+// wasm stack in field order?
+//
+// Both conditions are load-bearing and neither implies the other. The cursor says nothing
+// has been written since the box was built; the trailing bytes say they still spell it. A
+// byte pattern alone admits a false match, because an operand can spell any opcode.
+function uBoxNewIsLast() {
+  if uBoxNewEnd != wLen() { return false }
+  const pat = unionBoxNewBytes()
+  const np = pat.length
+  let ok = true
+  let i = 0
+  while i < np {
+    if wPeekBack(i) != pat[np - 1 - i] { ok = false }
+    i = i + 1
+  }
+  ok
+}
+
+// Unwrite the matched `struct.new $uBox` and pop its two operands into the sink pair,
+// leaving the wasm stack as it was before the box's operands were pushed. Valid only
+// immediately after `uBoxNewIsLast()` answered true.
+function uBoxSinkToPair() {
+  wDropBack(unionBoxNewBytes().length)
+  fbLocalSet(unionSinkBase + 1) // the anyref payload — top of stack
+  fbLocalSet(unionSinkBase) // the i32 tag — beneath it
   0
 }
 
@@ -12775,6 +12936,22 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
       nulRep = 2
     }
     if nulRep >= 0 {
+      // THE BINDING SINK: with every arm writing the shared pair and ONE `struct.new`
+      // after the `if`, the arms' construction sites collapse to that one — and the
+      // pre-seed below goes with them, because the single store dominates every read.
+      if nulRep == 0 && fnUsesUnionLetSink {
+        if unionIfBindingAllBox(s.letInit, fnIx) {
+          if emitUnionIfBindingSink(body, s.letInit, idx, nulNm, fnIx) < 0 {
+            return -1
+          }
+          fbLocalGet(unionSinkBase)
+          fbLocalGet(unionSinkBase + 1)
+          fbStructNew(uBoxIdx) // the binding's ONE box
+          fbLocalSet(idx)
+          scopeBind(s.letName, slot)
+          return 0
+        }
+      }
       // The value-union box local (kind 4) is a NON-null `(ref $uBoxIdx)` — non-
       // defaultable, so the validator needs it definitely assigned. Both arms below
       // set it, but a void-`if` merge does not satisfy V8's local-init check; pre-seed

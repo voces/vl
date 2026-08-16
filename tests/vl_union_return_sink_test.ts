@@ -1,16 +1,21 @@
-// The union-box RETURN SINK, counted structurally — because the corpus cannot see it.
+// The union-box SINK, counted structurally — because the corpus cannot see it.
 //
-// A function whose result is the shared union box `(struct (field i32) (field anyref))`
-// used to construct one box per `return`, i.e. one allocation site per union ARM.
-// Binaryen's Heap2Local scalarizes per allocation SITE, so two sites feeding one value
-// melt neither and the box survives the whole release profile the moment its payload is
-// read. The sink gives such a function ONE site: every `return` writes the tag and the
-// payload into two reserved locals and branches to a single exit block that performs the
-// only `struct.new`.
+// A value whose rep is the shared union box `(struct (field i32) (field anyref))` and that
+// is produced on TWO branches used to get one allocation site per branch. Binaryen's
+// Heap2Local scalarizes per allocation SITE, so two sites feeding one value melt neither
+// and the box survives the whole release profile the moment its payload is read. The sink
+// gives the merge ONE site: each branch writes the tag and the payload into two reserved
+// locals, and the single `struct.new` is performed once past the merge.
+//
+// Two positions take it. In RETURN position every `return` branches to a single exit block
+// that performs the construction. In BINDING position — a `let`/`const` whose init is a
+// union-box if-expression — each arm of the void `if` writes the pair and the construction
+// follows the `if`, which also retires the null box that used to be pre-seeded into the
+// binding's non-defaultable slot before the merge.
 //
 // WHY THIS FILE EXISTS. The behavioural oracle is completely blind to the transform — a
-// correct program prints the same thing whether its box is built once or once per arm, so
-// all 1,700-odd `@log` fixtures would stay green with the sink switched off. This counts
+// correct program prints the same thing whether its box is built once or once per branch,
+// so all 1,700-odd `@log` fixtures would stay green with the sink switched off. This counts
 // the construction sites instead. `selfhost_native_release_test.ts`'s MELT_TABLE pins what
 // the OPTIMIZER then does with them; this pins what the EMITTER produced.
 //
@@ -23,19 +28,26 @@
 //                   `if` that boxes in each arm, so this reads 2 unless the return path
 //                   splits it into per-arm exits; it is the spelling half of the same
 //                   claim the two-arm row makes for the statement form.
+//   · let-if     1 — the BINDING position's positive cell, and the same program again.
+//                   Unsunk it reads 3, not 2: one box per arm PLUS the pre-seed. That
+//                   third site is why this row is not redundant with the if-expression
+//                   one — a sink that merged the arms but kept the pre-seed reads 2 here
+//                   and would still not melt.
 //   · passthrough 2 — the INVERTED control. `pick`'s two exits return a union that already
 //                   exists, so neither constructs a box and the sink must not manufacture
 //                   one; the two sites counted are its CALLER's argument coercions. A sink
 //                   that wrapped every union-returning function would read 3 here, i.e.
 //                   would have made a function with no allocation allocate.
-//   · branch-local 2 — a `let` written on two branches inside ONE function. Those sites
-//                   never reach the return path, so this must not move; it is the pin for
-//                   the phase-2 slice.
+//   · branch-local 2 — a `let` written on two branches by SEPARATE statements: an init and
+//                   an assignment inside an `if`, with no merge point to sink into. Neither
+//                   sink sees it, so this must not move. Collapsing it needs the binding's
+//                   slot to hold the pair across a liveness window, which is a rep question
+//                   and not a sink (`unboxed-union-rep-design.md` §12.4).
 //
 // GATING: needs the built binary, the seed, and `wasm-tools` (the spec-grade disassembler
 // the playbook requires on PATH). A missing prerequisite self-ignores rather than fails,
-// so read the suite's IGNORED COUNT, not just its pass count — four extra ignores here
-// means the prerequisites broke, not that anything was proven.
+// so read the suite's IGNORED COUNT, not just its pass count — extra ignores here mean the
+// prerequisites broke, not that anything was proven.
 
 const exists = (p: string): boolean => {
   try {
@@ -155,6 +167,11 @@ const SINK_SITES: Array<{ fixture: string; sites: number; why: string }> = [
     why: "one `return` of an if-expression splits into per-arm exits that merge onto one",
   },
   {
+    fixture: "union-sink-let-if",
+    sites: 1,
+    why: "a binding's if-expression arms write the sink pair and the box is built once after the `if`",
+  },
+  {
     fixture: "union-sink-passthrough",
     sites: 2,
     why: "both exits pass a union through; the two sites are the caller's arguments",
@@ -162,7 +179,7 @@ const SINK_SITES: Array<{ fixture: string; sites: number; why: string }> = [
   {
     fixture: "union-box-branch-local",
     sites: 2,
-    why: "a `let` on two branches is not a return, so the sink never sees it",
+    why: "an init and a later assignment have no merge point, so neither sink sees them",
   },
   { fixture: "union-box-payload-read", sites: 1, why: "two returns merge onto one exit" },
 ];
