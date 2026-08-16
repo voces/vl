@@ -780,7 +780,32 @@ in-language GC knobs.
 - 🟡 **A4. Negation types** (`!A`). REMAINING: full open-world negation tracking (needs A12).
 - 🟡 **A5. Flow narrowing.** REMAINING: `case`/multi-guard (no grammar); stored-witness (A6b Stage B);
   optional *call* `x?.f()` + chain short-circuit `x?.y.z` (use `x?.y?.z`); per-call
-  reachability-pruned return types (blocked on memoize-with-holes — see `docs/guide/narrowing.md`).
+  reachability-pruned return types (blocked on memoize-with-holes — see `docs/guide/narrowing.md`,
+  and see A5b: the pruning is ALSO gated on A4, which the guide does not say).
+- ⬜ **A5b. The pruning asymmetry — one side is intersection, the other is negation.** MEASURED
+  2026-08-16 on `function foo(thing) { if thing is string { return 6 } return "ok" }`:
+  `foo(true)` infers **`string`** (pruned) while `foo("ok")` infers **`i32 | string`** (not pruned).
+  An explicit `else` does not change it. The working side kills the then-branch by INTERSECTION
+  (`boolean ∩ string = Never`), which ships; the missing side needs the else-branch to narrow by
+  NEGATION (`string ∖ string = Never`), which is **A4**, *"REMAINING: full open-world negation
+  tracking (needs A12)"*. So A5's pruning is partly gated on A4, not only on memoize-with-holes.
+  (The behaviour is verified; the intersection-vs-negation attribution is read off A4's own text
+  and is not instrumented — confirm before scheduling.)
+- ⬜ **A5c. Literal-preserving inference for STRINGS, with use-site widening.** Owner ruling
+  2026-08-16: `const x = "ok"` should infer the singleton litunion `"ok"`, not `string`, because
+  string-literal unions are VL's enum idiom and a hardcoded string is far likelier to be an enum
+  member than a plain string; widen to `string` at the USE site if usage demands it. Numeric
+  bindings are unchanged — `let x = 0` stays `i32`. Return position is the sharper half: a literal
+  return feeds the caller's inference and compounds with A5's pruning (`foo("ok")` → `6`, not `i32`).
+  **REP PREREQUISITE, and it inverts the rationale if skipped:** a NAMED litunion reps as an interned
+  i32 atom, but an un-named/inline one reps as a real `(ref $array)` string — verified, the named
+  const emits no global while the inline one emits `(global (ref 1) … array.new_fixed)`. Inference
+  produces un-named types BY CONSTRUCTION, so shipping this without first extending the atom rep to
+  un-named literal types puts inferred values in the slower rep — losing the runtime parity that is
+  the whole argument for string enums.
+- ⬜ **A5d. Deferred (use-site) widening.** `softenImplicitType` widens a literal to its base EAGERLY
+  at the binding. A5c needs the opposite: keep the literal, widen on demand at the use. Different
+  machinery, not a parameter of the existing pass. Unfiled before 2026-08-16.
 - 🟡 **A6. `is` operator + tagged unions.** REMAINING: `ref.test` fast-path for ref-vs-ref; union
   arrays (`[boolean | i32]`); declared type-guard signatures (A6b Stage A).
 - 🟡 **A6b. Proof-carrying narrowing (type guards as values).** REMAINING — **Stage A:** richer
