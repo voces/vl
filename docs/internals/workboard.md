@@ -40,9 +40,9 @@ a fix does.
 
 | item | where | state |
 |---|---|---|
-| B1 checker-side parse census | agent, worktree | running |
 | D7 W8 `modTypeRenamed` quote skip | agent, worktree | running |
-| C9 webcraft doc staleness | agent, worktree | running |
+| H5 perf/roadmap doc truth-up | agent, worktree | running |
+| D1 litunion alias `is` | PR #1353 | CI |
 
 Recently landed: **#1344** (brand-only union arms rejected — owner-confirmed
 narrowing), #1345 (`vl test` scheduling witness), #1348 (comment policy), #1349
@@ -58,14 +58,34 @@ surviving emitter rows are mint-bound — row 4 is 425 of 426 minting, row 2 is 
 of 402, and row 1's arena-neutral remainder is 111 of 126 the `FView`-refuted rung.
 There is no fourth rung to add.
 
-The counter-datum worth keeping in view: lowering the compiler's own 39k lines,
-**the entire emitter parses 24 type spellings and the checker 49**. Measured in
-parses, the disease is already near-zero on the largest real program; the open
-populations are corpus-wide aggregates over 1,727 small files.
+**AND THE CHECKER SIDE IS NOT A SECOND FRONTIER — the two numbers the programme
+ranked against each other were DIFFERENT UNITS (D-CHECKPARSE).** The checker's
+population is `tsToTy` walks over the parser's spelling TREE, not string parsing:
+**17,832 of 17,834 are tree walks**, the string parser `nameToTy` is entered **54
+times corpus-wide (23 outermost)**, and **0 times over the compiler's own 39k
+lines**. The emitter's 1,846 are string parses by construction (`root = -1` at
+every site). So "2,963 checker parses beats 1,846 emitter parses" compared tree
+walks to string parses.
+
+**On the programme's own question — stop representing types as strings — the
+checker is already done: it reads 23 type STRINGS across 1,737 files.**
+
+Two instrument findings worth carrying. The published row re-derives at 3,093 (vs
+2,963, +4.4%, `neg` identical at 15) — but it is **17.3% of the real population**:
+only 4 checker sites use the memoized `resolveAnnotTs`, while **11 more call
+`annotResolve` directly, carry no memo, and parse on 100% of their 14,741
+reaches**. Every instrument in the programme sat at the memo, so 82.7% of the work
+was never in a column. Controls: 0 unattributed records of 31,911, four
+independently-built probe binaries agreeing, `T.tys` grew across 0 of 13,736 hits.
+
+The counter-datum this reinforces: lowering the compiler's own 39k lines, **the
+entire emitter parses 24 type spellings and the checker 0**. The open populations
+are corpus-wide aggregates over small files.
 
 | id | item | anchor | measured | status | eff | risk |
 |---|---|---|---|---|---|---|
-| **B1** | **Checker-side parse census** — bucket by caller × mint × text, as #1327/#1331/#1332 did for the emitter | `destringify-types-program.md` ~:39312 | **16,145 reaches · 13,167 memo hit · 2,963 PARSES · 18.4%**, over the 1,727-file corpus | IN FLIGHT | S | low |
+| ~~**B1**~~ | ~~Checker-side parse census~~ | `destringify-types-program.md` D-CHECKPARSE | **CLOSED — measured negative.** 3,093 of 17,834; **17,832 of 17,834 are TREE walks**; `nameToTy` entered **54 times corpus-wide**, **0** over the compiler's own source | **CLOSED** | — | — |
+| **B1a** | **`is` triple resolution** — `collectThenNarrows` / `collectElseNarrows` / the if-chain scan each re-resolve what the `is` node already banks in `isVarTyIx` | family c9+c10+c11+c13 | **6,574 = 36.9%** of checker parsing (**87.9%** on the compiler's own source). Bank covers 4,427 of 4,429 readers; **2,530 of 2,530 index-identical, 0 disagreements** | **PARTLY TAKEABLE** — the other **1,897 MINT a duplicate arena entry**, so skipping renumbers (#1331's gate) | M | med |
 | **B2** | **TRANSP residue** — add `genAppNameOfTy` under `structNameOfTy` so `type Y = Box<i32>` renders `Box<i32>` | `typecheck.vl:8945`; blocker `emit_classify.vl:11474 fieldTypeCode` | rung is **BUILT and MEASURED**: B2 20→11, B3 120→111, moves nothing on the six-channel corpus, costs ONE cell | OPEN — both halves of the old filing REFUTED | M+S | med |
 | **B3** | **1a-v `pushFieldRow`** — per-field-CODE peel table | `emit_collect.vl:4271`; `emit_rep.vl:1226`, `:1241` | **887 reaches / 256 parses = 8.4% of all emitter parsing**; `recordUFieldElemRow` densest at 77.6% | OPEN — "all 256 mint" is **BRIEFED, unverified since #1331** | M | high if they mint |
 | **B4** | **`recordMvValTyIx` routing** | `emit_rep.vl:799` | **685 reaches, 0 parses** — the one row with a *proof* of arena neutrality | OPEN | S–M | **LOW** |
@@ -83,6 +103,14 @@ recorder (refuted twice, most recently on REP grounds — every disagreement but
 is a `TyLit` read as its `TyPrim` base); the primitive-ARRAY rung (70 of 70 mint);
 1a-i's two NODE-holding mints (refuted twice); `nameIsRefArray`; bucket 3 (shipped
 #1336); the G class (closed by #1274); LINSOFT (closed); W1–W8, W12, W14.
+
+**Refuted CHECKER-side by D-CHECKPARSE.** `primTyOfName` covers 5,105 with 0
+disagreements but buys nothing — `tsLeafTy`'s FIRST LINE already *is* `primTyOfName`,
+so there is nothing between caller and answer to skip. `cUserTypes` is refuted much
+harder here than at the emitter: **345 disagreements in 3,135 (11.0%)** at 13 of 16
+sites, against the emitter's 4 in 976, over two mechanisms the emitter cannot have —
+the newtype brand and the transparent alias — plus a **live type-parameter binding**
+(`tsLeafTy` asks `tpEnvTyOfName` before `declaredTyOfName`).
 
 **Standing soundness rule.** A newtype over a struct separates arena-index identity
 from rep identity; any future rung here must be graded against it. **The fuzzer is
