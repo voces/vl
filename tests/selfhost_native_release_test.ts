@@ -259,6 +259,16 @@ const LOOP_TABLE: Array<{
 // these counters and only a few bytes. It is the reliable half, not the whole answer; the
 // CPU-time baseline is the other half and is deliberately not attempted here.
 //
+// THE SELECTIVITY IS MEASURED, NOT ASSERTED. A pin that reddens on unrelated work gets muted
+// and then catches nothing, so the table was derived twice: once at 976e3b77, and again after
+// rebasing over four changes that all touch EMITTED CODE — the union box sink for
+// if-expression-initialised bindings, the numeric-litunion `is` lowering, generic function
+// values crossing typed boundaries, and `recordMvValTyIx` routing. The compiler binary itself
+// moved 1141634 -> 1147912 bytes across them. All 26 rung-rows below re-derived BYTE-IDENTICAL,
+// on every counter. That is the evidence for the claim these rows only move when one of the
+// shapes they name moves — none of these 13 programs contains the constructs those four
+// changes rewrite.
+//
 // WHY ONLY `-O` AND `-O3`, WHEN THE OTHER TWO TABLES ALSO PIN `none`. Every counter here
 // is MODULE-WIDE, and at `none` a module contains runtime helpers the program never calls:
 // `binsearch-probe` contains zero string operations and still carries `__str_hash__`. That
