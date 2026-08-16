@@ -9109,6 +9109,104 @@ export function numLitUnionBaseName(ty: i32): string {
   ""
 }
 
+// The single base NUMERIC scalar every value of `ty` reps as at emit — `"i32"` /
+// `"i64"` / `"f64"` — or "" when `ty` is not uniformly one of the three.
+//
+// This is the RECEIVER side of the numeric-litunion `is` membership test, and it has to
+// answer for the MIXED spellings the tested type never carries: `K | i32` and `K | f64`
+// (a numeric litunion beside its own base) collapse to that base with NO union box —
+// every member softens to the same scalar, so the union has exactly one rep and the
+// emitter gives the binding a plain `i32` / `f64` local. `numLitUnionBaseName` cannot
+// answer for those: `softenLitTy` leaves a union alone the moment a member is not a
+// `TyLit`, which is precisely what the `i32` arm of `K | i32` is.
+//
+// A `boolean` / `char` / `string` / `f32` member answers "" — they are not one of the
+// three names, so an i32-repped `boolean` never presents as the i32 a numeric compare
+// would then be emitted against.
+//
+// The walk is an explicit WORKLIST rather than recursion, and it is STEP-BOUNDED for the
+// same reason `numLitUnionBaseName` peels under a bound: a declared type may be cyclic
+// (`applyGenAlias` registers an instance under its own index) and this runs with no
+// finiteness guard in front of it. Exceeding the bound answers "" — the conservative
+// direction, since every consumer treats "" as "not my shape".
+function tyNumScalarBaseName(ty: i32): string {
+  const work: i32[] = [ty]
+  let wi = 0
+  let base = ""
+  while wi < work.length {
+    if wi >= 64 { return "" }
+    const cur = work[wi]
+    wi = wi + 1
+    if cur < 0 { return "" }
+    const t = T.tys[cur]
+    if t is TyUnion {
+      let i = 0
+      while i < t.uMembers.length {
+        work.push(t.uMembers[i])
+        i = i + 1
+      }
+    } else {
+      let nm = ""
+      if t is TyPrim { nm = t.primName }
+      if t is TyLit { nm = tyLitBaseName(t) }
+      if nm != "i32" && nm != "i64" && nm != "f64" { return "" }
+      if base == "" { base = nm } else if base != nm { return "" }
+    }
+  }
+  base
+}
+
+// The base numeric scalar node `ix`'s recorded type reps as, or "" — `tyNumScalarBaseName`
+// as the node query the emitter asks (it holds nodes, not arena indices, and reads every
+// other type fact of an `is` receiver through a wrapper of exactly this shape).
+export function nodeNumScalarBaseName(ix: i32) {
+  tyNumScalarBaseName(nodeTyIxOf(ix))
+}
+
+// The member literal TEXTS (raw lexemes) of a NUMERIC literal-union type `ty`, in source
+// order — `0 | 1` -> ["0","1"], `1.5 | 2.5` -> ["1.5","2.5"], the one-member `1` -> ["1"].
+// Empty for anything `numLitUnionBaseName` does not claim, so a STRING litunion answers
+// empty here and a numeric one answers empty in `tyLitMemberTexts`: the two extractors
+// partition the literal kinds exactly as the two REPS do (an interned atom / member string
+// for the string kinds, a plain base scalar for the numeric ones), and neither can hand a
+// caller a text of the kind it is not lowering for.
+//
+// The one-member `UnionDecl` wrapper the parser mints for `type Y = Z` is peeled on the
+// same bound `numLitUnionBaseName` peels on, so an alias-of-an-alias yields the members.
+export function tyNumLitMemberTexts(ty: i32) {
+  const out: string[] = []
+  if numLitUnionBaseName(ty) == "" { return out }
+  let cur = ty
+  let peels = 0
+  while peels < 8 {
+    if cur < 0 { return out }
+    const t = T.tys[cur]
+    let inner = -1
+    if t is TyUnion {
+      if t.uMembers.length == 1 { inner = t.uMembers[0] }
+    }
+    if inner < 0 {
+      peels = 8
+    } else {
+      cur = inner
+      peels = peels + 1
+    }
+  }
+  if cur < 0 { return out }
+  const ct = T.tys[cur]
+  if ct is TyUnion {
+    let i = 0
+    while i < ct.uMembers.length {
+      const m = T.tys[ct.uMembers[i]]
+      if m is TyLit { out.push(m.litText) }
+      i = i + 1
+    }
+    return out
+  }
+  if ct is TyLit { out.push(ct.litText) }
+  out
+}
+
 // The emit name of a DECLARED alias for a numeric literal union, or "". Exported for the
 // registered-ROW reader `numLitUnionBaseName`'s note names.
 export function numLitUnionAliasName(name: string) {

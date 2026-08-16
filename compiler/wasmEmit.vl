@@ -26,8 +26,11 @@ import {
   nodeTyMapValIsNulBool,
   nodeTyMapValIsNulLitUnion,
   nodeTyMapValLitUnionTexts,
+  nodeNumScalarBaseName,
+  numLitUnionBaseName,
   tyIsLitUnion,
   tyLitMemberTexts,
+  tyNumLitMemberTexts,
   valueAtomKind,
 } from "./typecheck"
 import {
@@ -1873,6 +1876,35 @@ function narrowedArmTyOf(name: string): i32 {
   -1
 }
 
+// `recv == <numeric literal>` onto `body` — the scalar VALUE test shared by the
+// bare-literal `is` spelling (`v is 1`) and the numeric-litunion MEMBERSHIP ladder
+// (`v is K`, one call per member). Leaves a 0/1 i32.
+//
+// THE COMPARE'S WIDTH FOLLOWS THE LEXEME AND THE RECEIVER, NOT A SEPARATELY DERIVED BASE
+// NAME, and that is the invariant this one home exists to keep: a float lexeme is
+// `f64.eq`, an i64 receiver or a lexeme too wide for i32 is `i64.eq`, everything else
+// `i32.eq`. A membership ladder that re-derived the width per member from the TESTED
+// type's base could disagree with the receiver's own valtype on exactly the mixed
+// receivers the ladder is for; sharing the decision makes that disagreement
+// unrepresentable.
+function emitNumLitEq(body: i32[], recvIx: i32, lv: string, fnIx: i32) {
+  if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
+  if numTextIsFloat(lv) {
+    fbF64Const(lv)
+    fbI32Bin(97) // 0x61 f64.eq
+    return 0
+  }
+  if exprIsI64(recvIx, fnIx) || !numLexFitsI32(lv) {
+    const pr = parseI64Pair(lv)
+    fbI64Const(pr[0], pr[1])
+    fbI32Bin(81) // 0x51 i64.eq
+    return 0
+  }
+  fbI32Const(parseI32(lv))
+  fbI32Bin(70) // 0x46 i32.eq
+  return 0
+}
+
 // Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag), then
 // `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
@@ -1988,6 +2020,52 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
       }
     }
   }
+  // `x is K` over a BOXED union carrying a NUMERIC literal union as an arm
+  // (`K | string`, `type K = 1 | 2`) — the numeric twin of the arm above, and membership
+  // for the same reason: `K ⊆ i32`, so the arm shares kind 0's tag with any i32 arm and a
+  // tag compare cannot separate a member from a non-member. Here it could not even try —
+  // `isArmTagOfTy` derives its tag through `tyIsLitUnion`, which is string-only, so a
+  // numeric arm claims no tag at all and the guard fell past every path to the loud
+  // ``is` names a type that is not a union variant`.
+  //
+  // The per-member compare is `emitUnionLitIs`, the tag-gated payload test the bare
+  // `x is 1` spelling already lowers to over this same box.
+  //
+  // BOTH OF THAT HELPER'S OWN REJECT CONDITIONS ARE PRE-CHECKED HERE, and that is what
+  // makes this arm a candidate test rather than a commitment: `unionEqOperandOk` (each
+  // member re-reads the receiver) and the value-union NAME gate. Letting either fire from
+  // inside would convert every shape this arm merely fails to claim into a hard emit
+  // failure with THIS arm's message, hiding whichever diagnostic the paths below would
+  // have given it — and one such shape is live, the `K | i32` PARAM slot, whose rep
+  // classifier calls it a box while `RC_ROOT` gives the identical type a plain scalar.
+  //
+  // The tested type is asked FIRST and the union NAME only after it answers: resolving a
+  // name costs `msSetOfText`'s two map probes plus, on a first miss, a linear scan of every
+  // registered row (see `isValueUnionOfSet`), and `numLitUnionBaseName` is an arena walk
+  // that rejects every non-numeric-literal test — which is nearly all of them — before a
+  // probe is charged.
+  if nd0 is IsExpr {
+    if numLitUnionBaseName(isVarTyIxOf(isIx)) != "" {
+      const nbTexts = tyNumLitMemberTexts(isVarTyIxOf(isIx))
+      if nbTexts.length > 0 && exprUnion(nd0.isObj, fnIx) &&
+        unionEqOperandOk(nd0.isObj) {
+        const nbNm = unionNameOfExpr(nd0.isObj, fnIx)
+        if nbNm != "" &&
+          (isValueUnionOfSet(msSetOfText(nbNm), nbNm) ||
+            nameIsLitUnionArmValueUnion(nbNm)) {
+          let nbI = 0
+          while nbI < nbTexts.length {
+            if emitUnionLitIs(body, nd0.isObj, nbTexts[nbI], fnIx) < 0 { return -1 }
+            if nbI > 0 {
+              fbI32Bin(114) // 0x72 i32.or
+            }
+            nbI = nbI + 1
+          }
+          return 0
+        }
+      }
+    }
+  }
   // `x is i32` / `x is string` / … over a BOXED value union: the same box-tag
   // compare as a struct variant, against the atom's globally-stable scalar tag.
   const ndv = P.nodes[isIx]
@@ -2082,6 +2160,67 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
       }
     }
   }
+  // `x is K` over a NUMERIC literal union (`type K = 1 | 2`, `type K = 1.5 | 2.5`) —
+  // the FOURTH rep, and the one no litunion machinery could see. `tyIsLitUnion` requires
+  // every member `litKind == "str"` and `tyLitMemberTexts` collects only `"str"` members,
+  // so a numeric literal union is not a "litunion" anywhere above: no gate DECLINED it, it
+  // was never a candidate. Every arm fell through and the guard reached
+  // `monoStaticIsResult`, which CONST-FOLDED IT TO FALSE — `vl check --codegen` clean, and
+  // FALSE even for `k: K` tested against its own alias.
+  //
+  // The rep is the plain BASE SCALAR, read off the disassembly and not off the
+  // classification: `const x: K | i32 = k` gives the binding an `i32` local and `K | f64`
+  // an `f64` local — no box, no tag, because every member of either union softens to the
+  // one scalar (`numeric-litunion-alias.vl` is that contract's pin). So this is NOT the
+  // string sibling's lowering with the comparator swapped for a numeric one — that arm
+  // tests a `(ref $array)` receiver through `__str_eq__`, and there is no ref here at all.
+  //
+  // The test is MEMBERSHIP over the value, `recv == m0 || recv == m1 || …`, which is
+  // exactly what makes a numeric litunion different from a newtype brand (#1344): its
+  // members are a runtime-observable SUBSET of the base, so the predicate EXISTS. The
+  // per-member compare is the bare-literal spelling's own (`emitNumLitEq`), so `x is K`
+  // and `x is 1 || x is 2` emit the same bytes.
+  //
+  // BOTH BASES ARE CHECKED AND THEY MUST AGREE. The tested type's base is
+  // `numLitUnionBaseName` (all-`TyLit`, homogeneous); the RECEIVER's is
+  // `nodeNumScalarBaseName`, which also claims the mixed `K | i32` / `K | f64` spellings the
+  // tested side never carries. Without the receiver half a monomorphized `g<T>(v: T)`
+  // instance pinned to `string` would take this arm and compare a string ref with
+  // `i32.eq` — invalid wasm traded for a wrong answer, the trap the string sibling's
+  // filing walked into by asserting a rep instead of reading it. It is also what keeps an
+  // i64 receiver off an i32-based member set and an f64 receiver off an integer one.
+  //
+  // AHEAD OF THE BARE-LITERAL ARM BELOW, AND THAT ORDER IS LOAD-BEARING FOR THE INLINE
+  // SPELLING. `isLitVariantName` decides on the tested spelling's FIRST CHARACTER, so the
+  // un-aliased `x is 1 | 2` is a "literal" to it and lowered as the single compare
+  // `x == 1` — every non-first member silently dropped. This arm reads the member set off
+  // the arena instead, so the alias and the inline spelling answer identically; a tested
+  // type that really is ONE literal still reaches `emitNumLitEq` here and emits the same
+  // bytes that arm would, which is why taking it first costs that arm nothing.
+  if nd0 is IsExpr {
+    if !exprUnion(nd0.isObj, fnIx) {
+      const nlBase = numLitUnionBaseName(isVarTyIxOf(isIx))
+      if nlBase != "" && nodeNumScalarBaseName(nd0.isObj) == nlBase {
+        const nlTexts = tyNumLitMemberTexts(isVarTyIxOf(isIx))
+        // Two or more members RE-READ the receiver, so those need a re-readable place
+        // (`unionEqOperandOk`); a one-member tested type evaluates it exactly once and
+        // accepts any receiver expression. Both bounds mirror the atom ladder above.
+        let nlOk = nlTexts.length == 1
+        if unionEqOperandOk(nd0.isObj) { nlOk = true }
+        if nlTexts.length > 0 && nlOk {
+          let nlI = 0
+          while nlI < nlTexts.length {
+            if emitNumLitEq(body, nd0.isObj, nlTexts[nlI], fnIx) < 0 { return -1 }
+            if nlI > 0 {
+              fbI32Bin(114) // 0x72 i32.or
+            }
+            nlI = nlI + 1
+          }
+          return 0
+        }
+      }
+    }
+  }
   // `v is <literal>` over a SOFTENED scalar: a same-base literal union rides
   // its base scalar after `canonEmitTypeNames` (`"a" | "b"` a string, `0 | 1`
   // an i32, `1.5 | 2.5` an f64), so the `is` is a runtime VALUE test — the
@@ -2111,21 +2250,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
           if emitExpr(body, mkStr(lv, -1), fnIx) < 0 { return -1 }
           return emitStrEqCore(body)
         }
-        if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
-        if numTextIsFloat(lv) {
-          fbF64Const(lv)
-          fbI32Bin(97) // 0x61 f64.eq
-          return 0
-        }
-        if exprIsI64(nd0.isObj, fnIx) || !numLexFitsI32(lv) {
-          const pr = parseI64Pair(lv)
-          fbI64Const(pr[0], pr[1])
-          fbI32Bin(81) // 0x51 i64.eq
-          return 0
-        }
-        fbI32Const(parseI32(lv))
-        fbI32Bin(70) // 0x46 i32.eq
-        return 0
+        return emitNumLitEq(body, nd0.isObj, lv, fnIx)
       }
     }
   }
