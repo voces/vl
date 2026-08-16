@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# P7 scratch: interleaved min-of-N timer over prebuilt .wasm modules.
+# Interleaved min-of-N timer over prebuilt .wasm modules — the general A/B rig.
 #   p7-time.sh <reps> <mod.wasm> [mod2.wasm ...]
 # Reports MIN and MEDIAN of (user+sys) CPU MILLISECONDS, which is far less
 # contention-sensitive than wall clock on this shared box, plus min wall.
 # Asserts every module's stdout is identical before timing.
+#
+# CPU time is the load-bearing choice, not an incidental one. `bench/README.md`
+# records this box swinging up to 2.5x under contention even with `taskset`, so a
+# wall-clock A/B cannot separate a real regression from a busy neighbour — the same
+# ambiguity that makes a wall-clock ratio unusable as a gate. Interleaving the
+# modules within a rep spreads any drift across both sides rather than one.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VL="$ROOT/scripts/vl-host/target/release/vl"

@@ -4,7 +4,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 VL="$ROOT/scripts/vl-host/target/release/vl"
-W="${P7_WORK:-/tmp/claude-1000/-workspace/2affa9b0-2835-43ff-8cfe-223a7861ce47/scratchpad/p7}"
+W="${P7_WORK:-/tmp/vl-p7-work}"
 mkdir -p "$W"
 TAG="${1:-base}"
 for b in collections/map-string collections/word-freq collections/set-ops collections/map-i32 strings/str-eq; do
