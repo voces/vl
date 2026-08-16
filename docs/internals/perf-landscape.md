@@ -11,12 +11,13 @@ rows: `bench/findings/*.md`.
 
 > ## THE 08-02 TABLES ARE SUPERSEDED — read this before quoting a number from §3 or §4
 >
-> Eight items have landed against this suite since the 08-02 sweep: **P1** `return_call`
+> Eight PRs have landed against this suite since the 08-02 sweep: **P1** `return_call`
 > (#1324), **P2** closure dispatch (#1326), **P3** `__str_eq__` 8x unroll + **P4a** `indexOf`
 > first-char skip (#1328), **P5** list-header hoist (#1333), the union return-path box sinks
-> (#1322, #1337), the top-level-`let` storage class (#1321), and **P7's unroll** (#1342).
-> **§3's landscape and §4's loss ranking were written before any of them and were not
-> re-measured; §5's item table was.**
+> (#1322, #1337), the top-level-`let` storage class (#1321), and **P7a's unroll** (#1342).
+> **§3's landscape, §4's loss ranking, §6's idiom gaps and §7's headroom tail were all written
+> before any of them.** (§5's item table had the P3/P4a/P5 rows but still listed **P1 and P2 as
+> open with their prototyped numbers**; those are closed with their measured figures now.)
 >
 > The current sweep is `bench/results/summary.md` / `results.json`, generated
 > **2026-08-03T01:21:48 at repo `1d3a8559`** — a different run with a different protocol
