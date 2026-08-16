@@ -390,11 +390,22 @@ which is why they closed in order rather than in parallel.
   plain `vl build` is a WASH (535 → 530 ms), `-O` is **1.76×** (304 → 173), `-O3` 1.66×. The sink
   removes a MERGE POINT, not an allocation, so Heap2Local must be there to collect. It also melts a
   rung EARLIER than predicted (plain `-O`, no `--closed-world`/`--gufa`) — the ceiling was the site
-  count, never binaryen. REMAINING, in size order: **a `return` of an if-expression still boxes per
-  arm** (`emitUnionIfValue` — the largest shape left), a `let` assigned on two branches (phase 2),
-  and then the payload box itself, which needs a single payload type to reach zero allocations.
-  Filed by #1322: `emitUnionIfValue`/`emitVariantIfValue`/`emitNullableIfBinding` still omit
-  `ctrlEnter`/`ctrlLeave`.
+  count, never binaryen.
+  **THE RETURNED IF-EXPRESSION SHIPPED (#1337)**: it lowers as per-arm exits through the same
+  peephole — 4 sites over 3 modules, and the two spellings of one program now read the same.
+  **THE BINDING SHIPPED**: `const u: A | B = if c { a } else { b }` reaches ONE site — box sites
+  **1,551 → 1,498 corpus-wide (53 removed over 6 modules)**, +55 B (+0.0022%), 6 up 0 down. That
+  shape had THREE sites, not two: the binding's slot is a non-null `(ref $uBox)`, so a null box was
+  pre-seeded before the `if` for definite assignment and overwritten on every path. The single
+  post-`if` store dominates every read, so the pre-seed goes too. **The rung story is DIFFERENT for
+  this one and must not be quoted as phase 1's**: it removes an ALLOCATION, not just a merge point,
+  so plain `vl build` is **1.36×** (750 → 551 ms CPU, min-of-7) where phase 1 was a wash; `-O` is
+  1.68×, `-O3` 1.50×. Both sinks share one reserved local pair.
+  REMAINING: **a `let` written from an init and a LATER assignment** (`union-box-branch-local`,
+  4/4/2) is NOT a sink — its two writes have no merge point, and collapsing it means holding the
+  tag/payload pair across a liveness window, i.e. §6's refused candidate (c). Measured and filed in
+  `unboxed-union-rep-design.md` §12.4. Then the payload box itself, which needs a single payload
+  type to reach zero allocations.
 - ✅ **P1.4 Bounds-check ergonomics** — not asking for unsafe access; asking that the canonical
   view loop either hoists the bound or relies on the memory trap, **and that this is stated** so
   kernel code can be written to the fast pattern deliberately. **ANSWERED, and the answer is that
