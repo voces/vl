@@ -859,10 +859,35 @@ in-language GC knobs.
   > `tests/cases/literal-unions/union-of-litunions-flatten.vl`.
   > *Also measured: the fuzzer DOES reach litunion-in-mixed-union (26 and 14 of 800 cases on two
   > seeds) and is VACUOUS on every defect family — it only ever stores a member LITERAL.*
-- ⬜ **A17 follow-up: `never` inference + `unconditional-recursion` lint.** A17 demand-driven inference
-  is shipped. REMAINING: (a) infer `never` for a genuinely base-case-less divergent recursive cycle
-  (currently a stopgap "annotate a return type" error); (b) an `unconditional-recursion` lint that fires
-  even when the return type is explicitly annotated (catches accidental infinite loops).
+- ⬜ **A17 follow-up: `never` inference.** A17 demand-driven inference is shipped, and so is
+  half (b) of this row — **the `unconditional-recursion` lint SHIPPED** (`compiler/lint.vl`,
+  headline case `tests/cases/lint/unconditional-recursion.vl`). It fires with the return type
+  ANNOTATED, which is the spelling nothing else saw: dropping the annotation gets "cannot infer
+  a return type", and adding one silences that message while leaving the infinite recursion in
+  place. The rule is a clean-PATH existence question — each statement reports whether some path
+  through it reaches a function exit or the next statement WITHOUT a self-call, and it fires only
+  when the body has neither — so a base case, a self-call in a loop body or one `if` arm, and a
+  self-call behind `&&`/`||`/`??` all stay quiet. **Measured 10 firing / 12 quiet over 22
+  constructed shapes; ZERO findings across `compiler/*.vl` + `std/`.** Scope is DIRECT
+  self-recursion keyed by the declaration's own name; mutual recursion (`f` → `g` → `f`) needs a
+  must-call graph over the module and is pinned OUT by
+  `tests/cases/lint/unconditional-recursion-mutual-no-warn.vl`.
+  > REMAINING: (a) infer `never` for a genuinely base-case-less divergent recursive cycle
+  > (currently a stopgap "annotate a return type" error). **This is a LANGUAGE-DESIGN slice, not
+  > a bug fix, and it needs an owner ruling** — measured while landing (b):
+  > **`never` is not spellable** (`function f(): never` → `unknown type 'never'`), so an inferred
+  > `never` is a type hover would display and `--fix`/annotation round-trips could not write back;
+  > **`tyIsEmitRepresentable` returns false for it** (`typecheck.vl`), so a `never`-returning
+  > function has no wasm functype result and no call-site value rep; and the language's STANDING
+  > posture is that a `never`-typed value is a HARD ERROR at its declaration (CHANGELOG "A3 fix:
+  > `never`-typed value rejected cleanly", `tests/cases/lint/empty-intersection.vl`), which (a)
+  > would have to carve an exception in. The payoff is also now small: the ANNOTATED spelling
+  > already checks AND emits fine today (`vl build` rc 0), so (a) buys only the right to omit an
+  > arbitrary annotation — and with (b) shipped, omitting it no longer costs the user the
+  > diagnostic that names the real bug. Three rulings gate it: does `never` enter the SURFACE type
+  > vocabulary; what wasm result does a `never` function declare (no-result + `unreachable`, or a
+  > poison value); and what `const x = loop(1)` means when `never` is bottom-assignable to
+  > everything (`assignable` already returns true for it).
 - ✅ **A-infer-empty. Usage-based inference for empty collections.** Empty ARRAY `[]` inference
   shipped, and so did the `Map()`/`Set()` half this row filed as REMAINING (**A-infer-map-set**;
   headline case `tests/cases/maps/infer-from-set.vl`, `tests/cases/sets/infer-from-add.vl`).
