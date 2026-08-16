@@ -2470,13 +2470,84 @@ source directly — the change adds no language surface, only two byte emitters.
   that would bury this change and collide with concurrent work. The COMMENTS that
   asserted the removed mechanism (a funcref field, `ref.func`, a call-site `ref.cast` on
   it) were rewritten; the path names were not.
-- **The complementary hoist is not attempted.** §4.2 variant G — hoisting the closure
-  unpack out of a loop when the closure is a loop-invariant local — measured 10.6x where
-  it applies and is strictly better there, but it only applies to loop-invariant
-  closures. It composes with this and remains open.
+- **The complementary hoist is not attempted, and the 10.6x it was filed at does not
+  survive P2** — §13.7 re-derives it at **1.12x**. It does NOT compose with this change;
+  it is the same saving counted twice.
 - **`return_call_indirect` is now available and unused.** P1 (#1324) emits `return_call`
   for a direct call in tail position; a function-value call in tail position could take
   `return_call_indirect` (`0x13`) by the same rule. Not attempted here.
+
+### 13.7 G2 (P2 follow-on (a), the loop hoist) re-derived — **1.12x, not 10.6x**, and NOT taken
+
+Workboard G2 carries "hoist the closure unpack out of loops — **10.6x** where it applies
+(1072.7 → 101.5 ms)". **That number belongs to P2 and has already been banked.** It comes
+from `perf-landscape.md` §4.2's WAT ladder, where the thing being hoisted above the loop
+was the **funcref** field read — the 9.40 ns `get_interned_func_ref` libcall §13 deleted.
+The same ladder's last row is the shape P2 shipped (i32 table index + `call_indirect`,
+146.2 ms). Hoisting on top of THAT can only remove what is still in the loop: two ordinary
+field loads, priced by rows 2 and 3 of the same ladder at 0.15 + 0.14 = **0.29 ns**. So the
+ladder's own arithmetic caps the follow-on at ~1.26x, and 10.6x is the same saving counted
+a second time.
+
+Measured rather than left as arithmetic. Three constructed witnesses, `scripts/p7-time.sh`
+(interleaved, min+median of user+sys CPU ms, `taskset -c 2-5`), stdout asserted equal
+across every module before timing, and a **byte-identical copy of the A module timed as its
+own configuration** so the floor is per-witness rather than per-rig.
+
+**Witness 1 — a capturing lambda in a local, called 50,000,000 times, nothing else in the
+loop.** Four modules: `A` as the emitter writes it, `A2` a byte-identical copy of `A`, `N`
+with only the `callRefSlot` spill removed, `B` with both `struct.get`s hoisted above the
+loop. Plain `vl build` (no `wasm-opt`). Three runs, min-of-9 / min-of-7 / min-of-11:
+
+| module | loop body | cpu_min (ms) | vs A |
+|---|---|--:|--:|
+| `A` | spill + `struct.get 0` + `struct.get 1` | 113 / 113 / 111 | — |
+| `A2` | **identical bytes to A** — the floor | 113 / 116 | **1.00 / 0.97** |
+| `N` | spill removed, both loads still in the loop | 114 / 112 | 0.99 / 0.99 |
+| `B` | both loads hoisted above the loop | 100 / 100 / 99 | **1.13 / 1.13 / 1.12** |
+
+**0.26 ns per call** ((113−100) ms / 50M), against 0.29 ns predicted by the ladder. The
+`callRefSlot` spill costs **nothing** — Cranelift coalesces the copy — so the whole of the
+residual is the two loads, and a peephole that only deletes the spill buys zero.
+
+**Witness 2 — the same loop with the closure arriving as a PARAMETER**, so nothing can
+scalar-replace it. Min-of-7, floor (identical bytes) 4% on that run:
+
+| rung | in-loop | hoisted | x |
+|---|--:|--:|--:|
+| default | 118 | 108 | 1.09 |
+| `-O` | 145 | 127 | 1.14 |
+| `-O3` | 121 | 100 | 1.21 |
+
+**Witness 3 — `.map` over 1,000 elements × 10,000 reps = 10M callback invocations**, the
+`emitMfInvoke` path P2 flagged as the widest exposure. Default rung: 47 → 46 ms against a
+control of 49. **Inside the floor and not resolvable** — 10M × 0.26 ns is 2.6 ms of a 47 ms
+run, and `.map` is allocation-dominated.
+
+**`wasm-opt -O` ALREADY PERFORMS THIS TRANSFORM whenever the closure does not escape.**
+Read out of the disassembly, not assumed: at `-O`, witness 1's closure struct is gone
+entirely (`Heap2Local` scalarises it — env and id become locals set before the loop, the
+loop body is `local.get env / arg / local.get id / call_indirect`), and witness 3's `.map`
+is the same. It does **not** happen for witness 2, where the closure is a parameter: both
+`struct.get`s stay in the loop at `-O` **and** at `-O3`. So the population G2 can still pay
+on is "a closure the optimiser cannot scalar-replace (a parameter, an array element, a
+field), called in a loop that does not rebind it" — plus everything at the plain `vl build`
+rung.
+
+**Not taken, and the reason is the size, not the shape.** The source-level hoist is a
+targeted transform, not a general LICM: the closure struct's two fields are **immutable**
+(`{ env: structref, id: i32 }`, neither declared `mut`), so no call in the loop can
+invalidate a cached unpack and the whole soundness condition is "the callee `Ident`'s
+binding is declared outside the loop and is neither assigned nor shadowed inside it". That
+is P5's `loopHoistOpen` shape — a name-keyed scan plus a loop prologue plus two frame slots
+per hoisted site — and P5's own whitelist cannot be reused, because it declines **any**
+call and a closure call is a call. M-sized machinery for a ≤1.26x ceiling that `-O` already
+reaches on the scalarisable majority.
+
+The `emitMfInvoke` variant is ~20 lines and needs no analysis at all (the emitter owns both
+the local and the loop, so `cL` is provably written once before it), but witness 3 says it
+is unmeasurable. It would still add two slots to the `.map`/`.filter` frame of every
+function that uses one, i.e. a corpus-wide byte move for a win under the floor.
 
 ## 14. PERF item P5 — the list header stops being re-read once per element access
 

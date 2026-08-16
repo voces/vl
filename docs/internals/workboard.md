@@ -230,7 +230,7 @@ is the standing argument for G1/G3.
 | id | item | measured | status | eff | risk |
 |---|---|---|---|---|---|
 | **G1** | **P7b — cache a string's hash** (the landscape now splits **P7a** shipped / **P7b** open) | filed at **up to 4.6× on long keys**; clears 3 of 4 Python red alerts; `__str_hash__` is also 4.75% of a self-compile | OPEN, **site not pinned**, and **RE-PRICE FIRST**: both figures predate #1342's unroll (P7a, **1.135×**, which halved the per-code-point walk to 1.10 ns) and neither has been re-measured. P7a's own bound: at short keys the whole walk is ~11 ns of a ~63 ns probe | L | med-high |
-| **G2** | **P2 follow-on (a)** — hoist the closure unpack out of loops | **10.6×** where it applies (1072.7 → 101.5 ms) | OPEN. Note the self-hosted compiler does not exercise this path at all | M | low |
+| ~~**G2**~~ | ~~**P2 follow-on (a)** — hoist the closure unpack out of loops~~ | **re-derived 1.12×**, not 10.6× | **CLOSED, measured, not taken.** The 10.6× was the FUNCREF libcall, which P2 (#1326) already deleted — the ladder row and the shipped row are one saving counted twice. Residual is two ordinary field loads, **0.26 ns/call** measured against 0.29 predicted; `wasm-opt -O` already does the hoist wherever the closure is scalar-replaceable, and the `.map` variant is inside the noise floor. `perf-program.md §13.7` | M | low |
 | **G3** | **P12 — UTF-8 bytes for `string`** | **27.7×** on the compare; VL's `string` is 4 bytes/code point | OPEN | XL | high — `memory-gc-design.md §2.2` argues 4× denser but strictly *less* scannable under WasmGC |
 | **G4** | **P13 — linear-memory backing for scalar arrays** | **3.41×** on matmul's kernel | OPEN | XL | high |
 | **G5** | **P10 — `const` → immutable global** | one line; **measure whether an immutable cell lets binaryen fold the loop bound BEFORE writing the patch** | OPEN, correctly parked | XS | low |
@@ -241,7 +241,10 @@ build is 295 ns not 88; the gate is wrong; at its own 3.13× it still loses to
 CPython by 1.43×; and `array.fill` has no emitter at all). P11 (**ruled upstream
 #1325**; bare `wasm-opt -O` carries `mixed-width` identically). P9 (5.6% at the
 default rung, **exactly zero at `-O` and above**; two supporting claims refuted
-in-file). `flat` records as a compiler perf lever (targets the wrong half).
+in-file). `flat` records as a compiler perf lever (targets the wrong half). **G2**
+(the closure-unpack loop hoist: filed at 10.6×, re-derived at **1.12× / 0.26 ns per
+call**, because the 10.6× was P2's own funcref libcall read a second time —
+`perf-program.md §13.7`).
 
 ### 3e. Hygiene
 
