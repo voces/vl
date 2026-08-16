@@ -151,6 +151,7 @@ import {
   unionEqOperandOk,
   unionHasAtom,
   unionHasValueAtom,
+  unionStrArmCount,
   unionTakesAtomAsStr,
   unwrapParen,
 } from "./emit_base"
@@ -352,6 +353,7 @@ import {
   fbRefNullStruct,
   fbReturn,
   fbReturnCall,
+  fbSelect,
   fbStructGet,
   fbStructNew,
   fbStructSet,
@@ -1978,6 +1980,27 @@ function emitNumLitEq(body: i32[], recvIx: i32, lv: string, fnIx: i32) {
   return 0
 }
 
+// The value-union NAME of an `is` RECEIVER, for the box-tag soundness floor in `emitIs`.
+// `unionNameOfExpr` covers every receiver form the tag compare has an arm for EXCEPT the
+// optional chain — `x?.y is i32` reads its field through `optChainStructIdxOf` rather than
+// through the expression classifier, so the chain's own leaf field is resolved here. ""
+// when the receiver is not a union (the floor then does not apply).
+function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
+  const nm = unionNameOfExpr(exprIx, fnIx)
+  if nm != "" { return nm }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is OptMember {
+    const si = optChainStructIdxOf(e.omObj, fnIx)
+    if si >= 0 {
+      const fi = sFieldIndex(si, e.omProp)
+      if fi >= 0 {
+        if sFieldTypeAt(si, fi) == 16 { return sFieldElemNameAt(si, fi) }
+      }
+    }
+  }
+  ""
+}
+
 // Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag), then
 // `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
@@ -2036,11 +2059,11 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
         // Otherwise: `id == m0 || id == m1 || …`. A ONE-member tested type is ONE compare,
         // so the receiver is evaluated exactly once and ANY receiver expression is safe (a
         // map read, an element read, a call). Two or more members re-read it, so those
-        // require an IDENT — a re-readable binding with no side effect; any other receiver
-        // keeps the paths below rather than having its call/read silently duplicated.
+        // need a re-readable PLACE (`unionEqOperandOk` — the same bound the boxed arms
+        // below carry); any other receiver keeps the paths below rather than having its
+        // call silently duplicated.
         let laOk = laTexts.length == 1
-        const laRecv = P.nodes[unwrapParen(nd0.isObj)]
-        if laRecv is Ident { laOk = true }
+        if unionEqOperandOk(nd0.isObj) { laOk = true }
         if laOk {
           let laI = 0
           while laI < laTexts.length {
@@ -2159,6 +2182,24 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
     // paths. Destringify D-ISTY: derived from the type the CHECKER resolved for this
     // `is` node, not from re-classifying the tested SPELLING — see `isArmTagOfTy`.
     const armTag = isArmTagOfTy(isVarTyIxOf(isIx))
+    // THE TAG COMPARE BELOW IS UNSOUND FOR A LITERAL-UNION TESTED TYPE OVER A BOX WITH
+    // TWO STRING-REPPED ARMS, and floors here rather than emitting a silent wrong answer.
+    // A litunion arm rides the box as its member STRING, so it shares kind 2's tag with a
+    // plain `string` arm (or with a second litunion arm) — `tag == 2` then answers `x is K`
+    // TRUE for every string the box holds, non-members included. The answer is the
+    // MEMBERSHIP arm above, which claims every re-readable PLACE receiver
+    // (`unionEqOperandOk`, which is what a per-member re-read needs). A receiver it cannot
+    // claim — a call result, an optional chain — has NO correct lowering here, so it gets
+    // the loud floor. One string-repped arm keeps the tag compare: `K | i32` reaches kind 2
+    // only through `K`, so the tag decides it exactly.
+    if armTag == 2 && tyIsLitUnion(isVarTyIxOf(isIx)) {
+      const amNm = isStrTagUnionNameOf(ndv.isObj, fnIx)
+      if amNm != "" && unionStrArmCount(amNm) > 1 {
+        return emitFail(
+          "emitProgram: `is` over a literal-union arm needs a re-readable receiver (a call / optional-chain receiver has no membership lowering)",
+        )
+      }
+    }
     if armTag >= 0 {
       // A union-typed IDENT receiver pushes its RAW box slot directly — even
       // when an outer arm has already narrowed it to a single atom (the last
@@ -8456,6 +8497,17 @@ function emitStrCharCode(body: i32[], callIx: i32, fnIx: i32) {
 
 export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
+  // A STRING-repped literal union reaching an ATOM-typed destination narrows to its interned
+  // id here — ONE hook rather than one per destination, because `pendingLitUnion` is already
+  // the context every atom-typed slot seeds (an annotated local, a `K` parameter, a `K`
+  // field, a `K[]` element, a `K` return, a `K`-valued map store). Without it the store was
+  // a `local.set` of a `(ref $array)` into an `i32` slot: invalid wasm with `vl check
+  // --codegen` rc 0, at every one of those destinations.
+  if pendingLitUnion == 1 {
+    if strReppedLitUnionAt(exprIx, fnIx) {
+      return emitStrToAtom(body, unwrapParen(exprIx), fnIx)
+    }
+  }
   const e = P.nodes[exprIx]
   if e is NumLit { return emitNumLitNode(body, e, exprIx, fnIx) }
   if e is BoolLit {
@@ -14559,6 +14611,89 @@ function emitStrValue(body: i32[], ix: i32, fnIx: i32) {
   }
   const re = emitExpr(body, ix, fnIx)
   re
+}
+
+// Narrow a STRING-repped literal-union value to its interned i32 ATOM id — `emitAtomToStr`'s
+// inverse, and the arm that was missing at every atom-typed slot.
+//
+// A litunion has two reps and `nodeTyIsLitUnionAlias` decides which: a registered alias NAME
+// is an interned atom, while an un-named one — the FLATTENED `A | B`, and the inline spelling
+// — stays a `(ref $array)` string at `RC_ROOT` / `RC_FN_PARAM` (`ctxKeepsLitUnion`). Narrowing
+// crosses between them: `if u is A { const r: A = u }` rebinds a string-repped `u` to `A`,
+// whose slot is an ATOM. Without a conversion the store is `local.set` of a `(ref $array)`
+// into an `i32` local — invalid wasm, `vl check --codegen` clean, at every atom-typed
+// destination (an annotated local, a `K` parameter, a `K` field, a `K[]` element, a `K`
+// return).
+//
+// The tower is `emitAtomToStr`'s, mirrored: member `i`'s id if the value equals member `i`'s
+// string, else the chain for `i+1`, with the LAST member the unconditional default (membership
+// is checker-guaranteed). It uses NO scratch frame, and that is deliberate rather than
+// incidental — `emitAtomToStr` stashes its id in the str-op frame and therefore has to be
+// agreed with by a reservation SCAN, which is this emitter's richest invalid-wasm vein. Here
+// the value is RE-READ per member instead, which costs the receiver bound
+// (`unionEqOperandOk`) and buys the whole scan out of the change.
+function emitStrToAtom(body: i32[], ix: i32, fnIx: i32) {
+  const texts = nodeLitUnionMemberTexts(ix)
+  if texts.length == 0 {
+    return emitFail("emitProgram: literal-union atom narrowing with no members")
+  }
+  if !aUsed {
+    return emitFail(
+      "emitProgram: literal-union atom narrowing but array type not collected",
+    )
+  }
+  if !unionEqOperandOk(ix) {
+    return emitFail(
+      "emitProgram: literal-union atom narrowing needs a re-readable receiver",
+    )
+  }
+  // The inner emits run OUTSIDE the atom context: the value re-reads must lower as the
+  // string they are (re-entering this arm would not terminate), and the per-member literal
+  // must lower as a string CONSTANT, not as its own interned id.
+  const savedLU = pendingLitUnion
+  pendingLitUnion = 0
+  const r = emitStrToAtomChain(body, ix, texts, 0, fnIx)
+  pendingLitUnion = savedLU
+  r
+}
+
+// The `select` tower for `emitStrToAtom`: member `i`'s interned id if the value string-equals
+// member `i`, else the chain for `i+1`. The last member is the unconditional default arm.
+function emitStrToAtomChain(
+  body: i32[],
+  ix: i32,
+  texts: string[],
+  i: i32,
+  fnIx: i32,
+) {
+  if i >= texts.length - 1 {
+    fbI32Const(internAtom(quoteLex(texts[i])))
+    return 0
+  }
+  // val1 = this member's interned id
+  fbI32Const(internAtom(quoteLex(texts[i])))
+  // val2 = the remaining chain
+  if emitStrToAtomChain(body, ix, texts, i + 1, fnIx) < 0 { return -1 }
+  // cond = (the value string-equals this member)
+  if emitExpr(body, ix, fnIx) < 0 { return -1 }
+  if emitExpr(body, mkStr(quoteLex(texts[i]), -1), fnIx) < 0 { return -1 }
+  if emitStrEqCore(body) < 0 { return -1 }
+  fbSelect() // 0x1b select — val1 if cond else val2 (both i32)
+  0
+}
+
+// True when `ix` is a literal-union value whose REP is its member STRING rather than the
+// interned i32 atom — the un-named FLATTENED (`A | B`) and inline spellings, which
+// `ctxKeepsLitUnion` leaves as a `(ref $array)` at `RC_ROOT` / `RC_FN_PARAM`. The two
+// declines are the two things that are already atoms in atom context: an atom-repped
+// expression (`exprIsLitAtom`, the classifier the valtype ladders agree with), and a member
+// STRING LITERAL, whose id `emitExpr`'s `StrLit` arm folds at compile time.
+function strReppedLitUnionAt(ix: i32, fnIx: i32) {
+  if exprIsLitAtom(ix, fnIx) { return false }
+  const av = unwrapParen(ix)
+  const e = P.nodes[av]
+  if e is StrLit { return false }
+  nodeTyIsLitUnion(av)
 }
 
 function emitNumLitNode(_body: i32[], e: NumLit, exprIx: i32, fnIx: i32) {

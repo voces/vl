@@ -583,3 +583,154 @@ compiler already carried a numeric-base vocabulary (`numLitUnionBaseName`, and `
 arm saying in prose that a numeric litunion "falls past `tyIsLitUnion` into the boxed loop below — a
 rep it does not have"). Grep for the vocabulary the other rep already speaks before widening the one
 in front of you.*
+
+
+---
+
+## D1b is CLOSED — the fail-OPEN cell was one of SIXTEEN, and the bound was never IDENT-ness
+
+D1b was filed as one cell: a struct-FIELD receiver of a `K | string` answering `is K` TRUE for the
+non-member `"zz"`, `vl check --codegen` rc 0. Re-verified on master's seed, then re-gridded:
+**9 receiver forms × 5 union shapes = 45 cells**, each carrying its member and its non-member value
+so a wrong answer cannot hide behind the one construction that happens to agree.
+
+### The population — measured on master's seed
+
+| receiver | `K \| string` | `K \| string \| i32` | `K \| null` | `K` (bare) | `K \| i32` |
+|---|---|---|---|---|---|
+| local / param / module global (IDENT) | ok | ok | ok | ok | ok |
+| bound map read (`const r = m[k]`) | ok | ok | ok | ok | ok |
+| **struct field `s.f`** | **OPEN** | **OPEN** | closed | ok | ok |
+| **nested field `s.g.f`** | **OPEN** | **OPEN** | closed | ok | ok |
+| **array element `a[0]`** | **OPEN** | **OPEN** | closed | ok | ok |
+| **direct map read `m[k]`** | **OPEN** | **OPEN** | ok | ok | ok |
+| **optional chain `s?.f`** | **OPEN** | **OPEN** | closed | closed | ok |
+| **call result `src()`** | **OPEN** | **OPEN** | closed | ok | ok |
+
+OPEN = a branch that RUNS on a non-member. closed = a branch that never runs. **12 open cells, 4
+closed**, against a filing of one. The direct map read is a receiver form the filing does not name
+at all and it is in the open class.
+
+`K | i32` is a whole COLUMN of correct answers and it is the column that explains the defect: a
+`K | i32` box reaches kind 2's tag only through `K`, so the tag compare decides it exactly. The
+defect is not "a field receiver"; it is **two arms sharing one tag**, which is #1340's own finding
+one receiver form further out.
+
+### The mechanism — one predicate, and it was asking the wrong question
+
+`emitIs`'s litunion MEMBERSHIP arm (#1340) is gated by `unionEqOperandOk`, whose whole body was
+`if e is Ident { return true }`. Every other receiver fell past the membership arm into the bare
+box-tag compare one arm below it, which is the lowering #1340 measured and rejected.
+
+The bound those lowerings actually need is that the receiver is a **PLACE** — re-evaluable without
+effect, because `emitUnionLitIs` reads it twice per member (tag, then payload). A field path, an
+optional-chain link and an element/map read are places exactly when their receiver — and, for an
+element read, its SUBSCRIPT — is. That is the predicate now, and it is what moves 6 of the 12 open
+cells plus 2 of the closed ones (the atom ladder's hand-rolled `laRecv is Ident` copy of the same
+bound is routed through it).
+
+### The residue is FLOORED, not left open
+
+A call result and an optional chain are not places, and there is no scratch slot reserved for this
+shape, so there is no membership lowering to give them. They now hit a loud emit reject instead of
+the tag compare that is *known* to answer wrongly: **`unionStrArmCount` is the discriminator** —
+one string-repped arm and the tag decides the question exactly (`K | i32` keeps its exact bytes);
+two or more and it cannot, so there is nothing correct to emit.
+
+**16 cells moved, 0 down. 12 silent wrong answers are gone: 6 now correct, 4 loud, and the 2 closed
+field cells now correct.** Corpus `deno test -A tests/cases_wasm_test.ts` 1,708 passed / 0 failed /
+7 ignored; align 1,715 passed / 0 failed / 0 ignored; opt+release 41 passed / 0 failed / 0 ignored.
+Pinned by `tests/cases/literal-unions/is-litunion-arm-non-ident-receivers.vl` (7 wrong lines on
+master's seed) and `is-litunion-arm-call-receiver-rejected.vl` (master ran it and printed `yes` for
+`"zz"`).
+
+### What is still open, measured on the same grid
+
+**4 fail-CLOSED cells, all in the ATOM ladder, none of them fail-open.** `a[0] is K` over a
+`(K | null)[]`, `src() is K` over a `K | null` return, and both optional-chain cells (`s?.f is K`
+over `K | null` and over a bare `K` field). The atom ladder's receiver classifier
+(`exprIsLitAtom`) has no arm for a NULLABLE litunion element read and none for an optional chain,
+so the ladder is not reached and the guard const-folds FALSE. Different classifier, same shape of
+answer as the string side; not bundled because closing it is `exprIsLitAtom`/`exprNulLitUnion`
+work, not `emitIs` work.
+
+**The membership lowering for a NON-place receiver is unbuilt, and it wants a rep decision, not a
+patch.** Either the receiver spills to a reserved scratch slot — which puts this shape into the
+reservation-SCAN discipline that `emitAtomToStr`'s own comment calls this emitter's richest
+invalid-wasm vein — or `emitUnionLitIs` grows a form that reads the box once. Both are bigger than
+the floor, and the floor is not a placeholder: it is the correct answer until one of them exists.
+
+*Method note this closure adds: **a filing that names a receiver names a witness, not a
+population.** D1b was filed at "struct field" because that is where it was found. The grid that
+asked all nine receivers found the direct map read in the same fail-open class and found a whole
+column (`K | i32`) that is CORRECT — and it is that correct column, not the broken ones, that
+identifies the mechanism as tag-sharing rather than receiver-shape.*
+
+
+---
+
+## D1a is CLOSED — and it was a ladder arm, exactly as the D1 report predicted
+
+D1a: `if u is K { const r: K = u }` over a STRING-repped litunion is invalid wasm before and after
+the D1 fix — `type mismatch: expected i32, found (ref $type)`. The report called it *"a valtype-ladder
+hole, not an `is` hole"*, and said the fix shape would differ from D1's. Both halves hold.
+
+### The rep, from the disassembly, before any lowering was written
+
+`function probe(u: A | B)` gets `(param (ref 1))` — an array-of-i32 STRING. The `is A` guard is the
+`__str_eq__` membership #1345 shipped, and it is correct. The narrowed binding `const r: A = u` gets
+`(local i32)` — `A` is a registered alias, so its slot is the interned ATOM. `local.get 0`
+(a `(ref $array)`) into `local.set 1` (an `i32`) is the whole defect.
+
+### The population — 6 destinations × 3 spellings
+
+| consumption site | `A \| B` param | `A \| B` local | inline `("x"\|"y") \| ("z"\|"w")` | control: `u: A` (atom) |
+|---|---|---|---|---|
+| `const r: A = u` | INVALID | INVALID | INVALID | ok |
+| `takesA(u)` (a `K` parameter) | INVALID | INVALID | INVALID | ok |
+| `{ f: u }` (a `K` field) | INVALID | INVALID | INVALID | ok |
+| `[u]` (a `K[]` element) | INVALID | INVALID | INVALID | ok |
+| `retA(u)` (a `K` return) | INVALID | INVALID | INVALID | ok |
+| `r = u` (assign a `K` local) | INVALID | INVALID | INVALID | ok |
+| *controls:* `const r = u`, `print(u)`, `u == "x"`, `"v=" + u` | ok | ok | ok | ok |
+
+**18 INVALID-WASM cells, 22 controls.** The four control sites are exactly the ones where no
+atom-typed slot is involved and the value stays a string — which is what says the defect is the
+REP BOUNDARY and not the narrowing.
+
+### The answer: `emitStrToAtom`, and the reason it needs no scan
+
+`emitAtomToStr` already existed — an atom widened to its member string, a `select` tower over the
+interned ids. The missing arm is its INVERSE: a `select` tower picking member `i`'s id when the
+value string-equals member `i`, last member unconditional (membership is checker-guaranteed).
+
+The one design decision worth recording is that it **stashes nothing**. `emitAtomToStr` parks its id
+in the str-op scratch frame and therefore has to be agreed with by a reservation SCAN — the failure
+mode its own comment calls *"this repo's richest invalid-wasm vein"*. The inverse re-reads the value
+per member instead: it pays the `unionEqOperandOk` bound and buys the entire scan out of the change.
+`gHelpStrEq` needs no gate of its own — it rides `aUsed`, which a string-repped litunion makes true
+by existing.
+
+**ONE hook closes all six destinations**, in `emitExpr` under `pendingLitUnion`, because that flag is
+already the context every atom-typed slot seeds. The two declines are the two things that are already
+atoms there: an `exprIsLitAtom` expression, and a member string LITERAL whose id the `StrLit` arm
+folds at compile time.
+
+**18 cells UP, 0 DOWN, 22 controls unchanged.** Pinned by
+`tests/cases/literal-unions/narrowed-string-rep-litunion-consumption.vl`, whose `atomForms` control
+is the same six sites over an already-atom receiver.
+
+### What bounds it, and what the checker bounds for us
+
+`emitStrToAtom` floors loudly on a non-place receiver, and that floor is **unreachable from source
+today**: the checker does not narrow a member-path or element receiver down to a litunion alias
+(`if s.f is A { const r: A = s.f }` is `cannot assign "x"|"y"|"z"|"w" to 'r'`), so every reachable
+D1a cell has an IDENT receiver. The bound is stated because it is the lowering's real precondition,
+not because a program can reach it.
+
+*Method note: **the D1 report's own classification was the load-bearing part of this fix.** It said
+valtype ladder, not `is`, and the vocabulary to look for followed directly — `emitAtomToStr` is one
+grep from `emitStrValue`, and finding a direction that already exists tells you the missing one is
+an arm and not a rep change. The alternative reading of the same symptom — "make the `A` slot hold a
+string" — is a rep change, and it is refuted by the destinations: a `K` parameter, field, element and
+return all have their rep fixed by a signature the binding cannot influence.*

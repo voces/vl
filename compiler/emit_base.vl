@@ -101,10 +101,12 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  Index,
   LetDecl,
   Member,
   NumLit,
   ObjLit,
+  OptMember,
   P,
   Param,
   Paren,
@@ -650,11 +652,34 @@ export function isLitVariantName(name: string) {
   const c = name[0]
   c >= '0' && c <= '9'
 }
-// True when the union-box operand at `exprIx` can be re-evaluated without side
-// effects (an ident read — a param, local, or module global).
+// True when the operand at `exprIx` is a PLACE that can be re-evaluated without side
+// effects. Every multi-compare union lowering re-reads its operand once per compare
+// (`emitUnionLitIs` reads it TWICE per member — tag, then payload), so a receiver that
+// is not re-readable would have its effect duplicated; those sites keep their
+// single-evaluation paths instead.
+//
+// THE BOUND IS EFFECT-FREEDOM, NOT IDENT-NESS, and the difference is a soundness one:
+// while this answered NO for every non-Ident receiver, `s.f is K` over a `K | string`
+// FIELD fell past `emitIs`'s litunion MEMBERSHIP arm into the bare box-tag compare one
+// arm below it — and `K ⊆ string` share kind 2's tag, so that compare answered TRUE for
+// a non-member string. Fail-OPEN, `vl check --codegen` clean.
+//
+// A field path (`s.f`, `s.g.f`), an optional-chain link (`s?.f`) and an element/map read
+// (`a[0]`, `m[k]`) re-read to the same value with no effect of their own, so each is a
+// place exactly when its receiver — and, for an element read, its SUBSCRIPT — is. A
+// literal is trivially re-readable. Everything else (a call, an assignment, an operator
+// application) is not.
 export function unionEqOperandOk(exprIx: i32) {
+  if exprIx < 0 { return false }
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Ident { return true }
+  if e is NumLit { return true }
+  if e is StrLit { return true }
+  if e is Member { return unionEqOperandOk(e.memObj) }
+  if e is OptMember { return unionEqOperandOk(e.omObj) }
+  if e is Index {
+    return unionEqOperandOk(e.idxArr) && unionEqOperandOk(e.idxIndex)
+  }
   false
 }
 // D-EQOPCODE (#1136) moved the value-eq opcode table to `emit_rep`'s
@@ -2222,6 +2247,23 @@ export function unionTakesAtomAsStr(name: string) {
     i = i + 1
   }
   false
+}
+// How many ARMS of the value union `name` ride the box as a string ref — a plain `string`
+// arm, and each literal-union arm. `unionTakesAtomAsStr`'s counting dual, and the reason
+// it is worth counting rather than testing: kind 2's box TAG discriminates an arm only
+// while this answers 1. At 2 or more the arms OVERLAP in the tag (`K ⊆ string`), and
+// `x is K` cannot be decided by reading it — the decision has to be MEMBERSHIP over the
+// payload, which is what `emitIs`'s litunion arm emits.
+export function unionStrArmCount(name: string) {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let n = 0
+  let i = 0
+  while i < atoms.length {
+    if atoms[i] == "string" || nameIsLitUnionType(atoms[i]) { n = n + 1 }
+    i = i + 1
+  }
+  n
 }
 // True if the value union `name` contains the member atom `atom`.
 export function unionHasAtom(name: string, atom: string) {
