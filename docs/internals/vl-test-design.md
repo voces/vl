@@ -225,4 +225,22 @@ argument 1: expected () -> void, got () -> i32
 `tests/fixtures/vl-test-parallel/` (four ~250 ms tests), asserting the report
 text, all three exit codes, isolation-after-trap, `-t`, discovery (including that
 a plain `.vl` and a bare `test.vl` are NOT collected and `node_modules` is not
-walked), and that `--jobs 4` finishes in under 70% of `--jobs 1`'s wall clock.
+walked), and that files are really SCHEDULED concurrently.
+
+### The scheduling witness
+
+The parallelism claim is gated on the schedule itself, not on a wall-clock proxy.
+Under `$VL_TEST_TRACE=1` the host stamps each file's collect/run interval
+(`test_trace_stamp`), and the test asserts both sides: `--jobs 4` runs all four
+files concurrently (peak overlap 4) and `--jobs 1` runs them one at a time (peak
+overlap 1).
+
+This replaced a ratio assertion — "`--jobs 4` finishes in under 70% of `--jobs
+1`'s wall clock" — on 2026-08-16. Wall clock measures scheduling **times the free
+CPU the box has**, so it cannot separate the regression it guards (a silent
+fallback to serial) from a merely busy runner: both read ~1.0. It flaked twice on
+2026-08-04, on master and on an unrelated PR, under the `deno test --parallel`
+sweep that puts ~1,876 subprocess-spawning cases against 4 vCPUs — and it also
+failed on an *idle* 24-core box, because the parallel leg ran first and absorbed
+the one-time wasmtime compile of the seed. Overlap has neither failure mode:
+contention makes each file take longer, which **widens** the overlap.
