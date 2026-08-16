@@ -37,6 +37,10 @@
 //                           name downgrades to a `hint`; exported top-level
 //                           bindings are exempt).
 //   - prefer-const        : a `let` that is read but never reassigned.
+//   - unconditional-recursion : a function whose every path calls ITSELF, so it
+//                           can never return (fires with the return type
+//                           annotated — no other diagnostic covers that
+//                           spelling).
 //   - unused-import       : an `ImportDecl` local binding never referenced in
 //                           its own module — by an `Ident` occurrence resolving
 //                           to it (binding-keyed, via the scope stack), a UFCS
@@ -228,6 +232,7 @@ export function lint(progRoot: i32) {
     lintWalk(lintRuleUnreachable, progRoot)
     lintWalk(lintRuleConstBranch, progRoot)
     lintWalk(lintRuleStepZero, progRoot)
+    lintWalk(lintRuleUncondRecursion, progRoot)
   }
   lintCodes.length
 }
@@ -245,6 +250,7 @@ export function lint(progRoot: i32) {
 const lintRuleConstBranch = 0
 const lintRuleStepZero = 1
 const lintRuleUnreachable = 2
+const lintRuleUncondRecursion = 3
 
 // Visit `ix` for `rule`, then recurse into its children (pre-order: a rule sees
 // a node before any of its descendants). `-1` child slots (absent) and any
@@ -254,6 +260,7 @@ function lintWalk(rule: i32, ix: i32) {
   if rule == lintRuleConstBranch { constantBranchVisit(ix) }
   else if rule == lintRuleStepZero { degenerateStepVisit(ix) }
   else if rule == lintRuleUnreachable { unreachableVisit(ix) }
+  else if rule == lintRuleUncondRecursion { uncondRecursionVisit(ix) }
   const kids = nodeChildren(ix)
   let i = 0
   while i < kids.length {
@@ -540,6 +547,218 @@ function unreachableVisit(ix: i32) {
     }
   }
   0
+}
+
+// ── 6. Unconditional recursion ───────────────────────────────────────────────
+// A function that calls ITSELF on every path through its body can never return:
+// the call recurses until the stack is exhausted. The classic accident is a
+// missing (or unreachable) base case —
+//
+//     function loop(n: i32): i32 { return loop(n + 1) }
+//
+// — and the annotated spelling above is exactly the one no other diagnostic
+// sees: WITHOUT the annotation the checker reports "cannot infer a return type",
+// and annotating it silences that message without fixing the defect. This rule
+// is annotation-independent, so it survives that workaround.
+//
+// The analysis is a clean-PATH existence question, not a "does the body contain
+// a self-call" question: the rule fires only when NO path reaches a function
+// exit without a self-call. That is what keeps every real recursion quiet — a
+// base case (`if n == 0 { return 0 }`) is a clean exit path, a self-call in a
+// loop body or one `if` arm is a path that may skip it, and a self-call behind
+// `&&`/`||`/`??` is a path that short-circuits before it.
+//
+// SCOPE: direct self-recursion, keyed by the declaration's own name, over the
+// body of ONE function — the walk never descends into a NESTED `FuncDecl`, whose
+// body only runs when that inner function is called (the shared walker visits it
+// separately, against its own name). Mutual recursion (`f` → `g` → `f`) is out
+// of scope: proving it needs a must-call graph over the whole module, and this
+// rule's value is in the shape that has no other diagnostic at all.
+const URC_EXIT = 1 // some path RETURNS from the function without a self-call
+const URC_FALL = 2 // some path REACHES THE NEXT statement without a self-call
+
+// The name the current analysis treats as the self-call. Set per `FuncDecl` by
+// `uncondRecursionVisit`; the analysis below never re-enters the visitor, so a
+// plain assignment (no save/restore) is the whole discipline it needs.
+let urcName = ""
+
+function uncondRecursionVisit(ix: i32) {
+  const s = P.nodes[ix]
+  if s is FuncDecl {
+    if s.fnName.length == 0 || s.fnBody < 0 { return 0 }
+    urcName = s.fnName
+    if urcStmtFlags(s.fnBody) == 0 {
+      // Falling off the end of the body IS a return (the block's implicit
+      // value), so `0` — neither a clean exit nor a clean fall-through — means
+      // every path recurses.
+      const msg = "This function always recurses: every path through `" +
+        opDeclLabel(s.fnName) +
+        "` calls it again, so the call never returns"
+      // Anchor at the declaration's NAME token: the node's own anchor is its
+      // closing `}`, which points at the wrong line.
+      const nameTok = declNameTokOf(ix)
+      if nameTok >= 0 {
+        lintEmitAtTok("unconditional-recursion", msg, "warning", nameTok)
+      } else {
+        lintEmit("unconditional-recursion", msg, "warning", ix)
+      }
+    }
+  }
+  0
+}
+
+// Is `ix` the callee position of a call to the function under analysis? Every
+// call form the parser produces — plain `f(…)`, UFCS `x.m(…)`, an operator — is
+// a `Call` with an `Ident` callee, so the one name test covers them all. Like
+// the unused-function rule this is NAME-keyed, so a local shadowing the
+// function's name would be read as the function (documented in the header).
+function urcIsSelfCallee(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const c = P.nodes[ix]
+  if c is Ident { return c.identName == urcName }
+  false
+}
+
+// True when SOME evaluation path of expression `ix` performs no self-call.
+// Absent slots (`-1`) and unknown leaves are clean — the conservative direction,
+// since only "no clean path anywhere" fires the rule.
+function urcExprClean(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const e = P.nodes[ix]
+  if e is Call {
+    if urcIsSelfCallee(e.callFn) { return false }
+    if !urcExprClean(e.callFn) { return false }
+    let i = 0
+    while i < e.callArgs.length {
+      if !urcExprClean(e.callArgs[i]) { return false }
+      i = i + 1
+    }
+    return true
+  } else if e is BinExpr {
+    if !urcExprClean(e.binLeft) { return false }
+    // `&&` / `||` / `??` may never evaluate their right operand, so a self-call
+    // there is a path the short circuit skips.
+    if e.binOp == "&&" || e.binOp == "||" || e.binOp == "??" { return true }
+    return urcExprClean(e.binRight)
+  } else if e is Unary {
+    return urcExprClean(e.unArg)
+  } else if e is Paren {
+    return urcExprClean(e.parInner)
+  } else if e is Member {
+    return urcExprClean(e.memObj)
+  } else if e is OptMember {
+    return urcExprClean(e.omObj)
+  } else if e is Index {
+    if !urcExprClean(e.idxArr) { return false }
+    return urcExprClean(e.idxIndex)
+  } else if e is ArrayLit {
+    let i = 0
+    while i < e.arrElems.length {
+      if !urcExprClean(e.arrElems[i]) { return false }
+      i = i + 1
+    }
+    return true
+  } else if e is ObjLit {
+    let i = 0
+    while i < e.objFields.length {
+      if !urcExprClean(e.objFields[i]) { return false }
+      i = i + 1
+    }
+    return true
+  } else if e is FieldInit {
+    return urcExprClean(e.fiValue)
+  } else if e is IsExpr {
+    return urcExprClean(e.isObj)
+  } else if e is AsExpr {
+    return urcExprClean(e.asObj)
+  } else if e is Block {
+    // VL's block-valued forms reach expression position; their clean paths are
+    // the statement analysis's. The delegation is ONE-WAY by construction — the
+    // three kinds below are handled EXPLICITLY in `urcStmtFlags`, so it never
+    // bounces an expression back here and the two functions cannot spin.
+    return urcStmtFlags(ix) != 0
+  } else if e is IfStmt {
+    return urcStmtFlags(ix) != 0
+  } else if e is MatchExpr {
+    return urcStmtFlags(ix) != 0
+  }
+  // Every leaf (a literal, an identifier, a type node, a recovery node) is
+  // clean: it performs no call at all.
+  true
+}
+
+// The clean-path flags of statement `ix` (`URC_EXIT` | `URC_FALL`, see above).
+// `0` is the firing condition: every path through the statement performs a
+// self-call, or leaves via `break`/`continue` — which is not a function exit.
+function urcStmtFlags(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return URC_FALL }
+  const s = P.nodes[ix]
+  if s is RetStmt {
+    if urcExprClean(s.retArg) { return URC_EXIT }
+    return 0
+  } else if s is BreakStmt {
+    return 0
+  } else if s is ContinueStmt {
+    return 0
+  } else if s is Block {
+    return urcBlockFlags(s.blkStmts)
+  } else if s is IfStmt {
+    if !urcExprClean(s.ifCond) { return 0 }
+    const f = urcStmtFlags(s.ifThen)
+    // A missing `else` IS a clean fall-through: the condition being false skips
+    // the arm entirely. This is what spares the `if n == 0 { return 0 }` guard.
+    if s.ifElse >= 0 { return f | urcStmtFlags(s.ifElse) }
+    return f | URC_FALL
+  } else if s is WhileStmt {
+    if !urcExprClean(s.whileCond) { return 0 }
+    // A loop body may run zero times, so the loop always falls through cleanly;
+    // a `return` inside it contributes its own clean exit.
+    return URC_FALL | (urcStmtFlags(s.whileBody) & URC_EXIT)
+  } else if s is ForRange {
+    if !urcExprClean(s.frFrom) { return 0 }
+    if !urcExprClean(s.frTo) { return 0 }
+    if !urcExprClean(s.frStep) { return 0 }
+    return URC_FALL | (urcStmtFlags(s.frBody) & URC_EXIT)
+  } else if s is ForIn {
+    if !urcExprClean(s.fiIter) { return 0 }
+    return URC_FALL | (urcStmtFlags(s.fiBody) & URC_EXIT)
+  } else if s is LetDecl {
+    if urcExprClean(s.letInit) { return URC_FALL }
+    return 0
+  } else if s is FuncDecl {
+    // A nested declaration executes nothing where it stands, and its body runs
+    // only when IT is called — never descend into it.
+    return URC_FALL
+  } else if s is MatchExpr {
+    if !urcExprClean(s.matchScrut) { return 0 }
+    if s.matchBodies.length == 0 { return URC_FALL }
+    let f = 0
+    let i = 0
+    while i < s.matchBodies.length {
+      f = f | urcStmtFlags(s.matchBodies[i])
+      i = i + 1
+    }
+    return f
+  }
+  // Everything else in statement position is an expression statement.
+  if urcExprClean(ix) { return URC_FALL }
+  0
+}
+
+// The clean-path flags of a statement LIST. Statements run in order, so the scan
+// stops at the first one with no clean fall-through: nothing after it is reached
+// on a clean path. Clean exits found before that point still count, and reaching
+// the end of the list is itself a clean fall-through.
+function urcBlockFlags(stmts: i32[]) {
+  let exits = 0
+  let i = 0
+  while i < stmts.length {
+    const f = urcStmtFlags(stmts[i])
+    exits = exits | (f & URC_EXIT)
+    if (f & URC_FALL) == 0 { return exits }
+    i = i + 1
+  }
+  exits | URC_FALL
 }
 
 // ── 1b. Unused functions ─────────────────────────────────────────────────────
