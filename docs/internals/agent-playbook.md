@@ -43,13 +43,41 @@ A file is PROMOTABLE only when check passes AND run stdout exactly equals
 lists). A file that advances to a
 later failure stage is progress to report, not promote.
 
-To diagnose invalid emitted wasm (`wasm-tools` is installed on PATH —
-spec-grade, full WasmGC support; see docs/internals/wasm-toolchain-audit.md §3):
+To diagnose invalid emitted wasm. **CHECK WHICH DISASSEMBLER YOU HAVE FIRST** —
+`wasm-tools` is the better tool (spec-grade, full WasmGC, byte-level `dump`; see
+docs/internals/wasm-toolchain-audit.md §3) but it is NOT guaranteed present, and a
+playbook that assumes it sends you down a dead path at the moment you are already
+debugging something hard.
+
     vl build <file> --compiler build/vl-compiler.wasm -o /tmp/x.wasm
+
+`vl build` already validates through the engine and exits 1 on a reject, so the
+build's own stderr is the first read. For the disassembly:
+
+    command -v wasm-tools >/dev/null && echo have-wasm-tools || echo use-binaryen
+
+    # with wasm-tools (preferred):
     wasm-tools validate --features all /tmp/x.wasm   # precise byte offset + reason
-    wasm-tools print /tmp/x.wasm                     # WAT disassembly — READ the offending function
+    wasm-tools print /tmp/x.wasm                     # WAT — READ the offending function
     wasm-tools dump /tmp/x.wasm                      # byte-level section/LEB framing when too
                                                      # malformed for the disassembler to parse
+
+    # fallback, always present after `npm ci` (it is what ships `wasm-opt`).
+    # THE FEATURE FLAGS ARE MANDATORY — see the trap below.
+    F="--enable-reference-types --enable-gc --enable-bulk-memory --enable-tail-call"
+    node_modules/.bin/wasm-dis $F /tmp/x.wasm -o /tmp/x.wat
+    node_modules/.bin/wasm-opt $F -O3 /tmp/x.wasm -o /dev/null   # rejects ⇒ actually invalid
+
+**BINARYEN WITHOUT THOSE FLAGS FALSELY REJECTS EVERY VL MODULE.** Bare `wasm-opt`
+on a module the engine just validated reports `[wasm-validator error in function 0]
+unexpected false: all used types should be allowed` and `Fatal: error validating
+input` — the GC types are not enabled by default. That is a FALSE POSITIVE on the
+very diagnostic you are debugging with, and it says "invalid" about bytes that are
+fine. The flag list is the host's own (`main.rs`, the `-O` path); keep them in sync.
+
+Binaryen's reader is also not spec-grade and has no `dump`, so a module too
+malformed to disassemble needs `wasm-tools`; install it before concluding the bytes
+are fine.
 For a trap, disassemble and trace the faulting function; for a mismatch, diff the
 WAT of the value's write path vs read path. Don't debug codegen blind against the
 validator message alone — the disassembly is the debugging view of `vl build` output.
