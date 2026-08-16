@@ -822,11 +822,17 @@ in-language GC knobs.
   `Buffer<N>`) — today generics take *type* params only; enabler for the parameterized
   `Decimal<Backing, Scale>` family (B2) and any fixed-size/parameter-by-value type.
   (Forward/mutual-reference return-type inference: shipped as A17 — see `CHANGELOG.md`.)
-- 🟡 **A12. Soundness corpus.** REMAINING: keep growing it; a known-unsound corner is `xfail`-marked
-  until its fix lands, at which point the file drops the prefix and becomes an ordinary `@error`
-  pin. Container element variance (`Cat[]` into an `Animal[]` param) is live and not yet even
-  xfail-marked — `docs/internals/open-rulings.md`. The SELF-HOST checker's soundness floor
-  (15 false-accept classes) is closed; new classes go straight to corpus + both checkers.
+- 🟡 **A12. Soundness corpus.** REMAINING: keep growing it. NAMING IS LOAD-BEARING and has its own
+  contract (`tests/cases/soundness/README.vl`, mirrored in `docs/guide/soundness.md`): a must-error
+  pin is `*-reject.vl`; `xfail-` means the COMPILER is wrong and splits by direction —
+  `xfail-unsound-*` accepts too much (no `@error`; closing it tightens the checker),
+  `xfail-false-reject-*` refuses a sound program (`@error` pins the undesired diagnostic; closing it
+  LOOSENS the checker, so it needs reject-parity work). An `xfail-` file that is really a passing
+  pin makes the item it belongs to read OPEN — six did exactly that to A13 below. There are
+  currently no `xfail-unsound-*` files. Container element variance (`Cat[]` into an `Animal[]`
+  param) is live and not pinned here at all — `docs/internals/open-rulings.md`. The SELF-HOST
+  checker's soundness floor (15 false-accept classes) is closed; new classes go straight to corpus
+  + both checkers.
 - 🟡 **A13. Operator-constraint inference.** A binary op with a hole operand records a deferred
   `(lt, op, rt)` constraint that every generic call site re-validates under the substituted
   argument types (`binOpDefinedFor`) — arithmetic, string concat, relational and equality all fall

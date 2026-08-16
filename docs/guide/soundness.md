@@ -127,12 +127,26 @@ inference buys brevity, never a weaker check.
 
 ## Known-unsound corners (documented gaps)
 
-The contract is the goal; a corner not yet enforced is captured as an `xfail-*.vl`
-file that compiles clean today to encode current behavior and is annotated with
-what it *should* do — the regression guard fires the moment a fix changes the
-behavior, surfacing it at merge. When the gap closes, the file drops its `xfail-`
-prefix and becomes an ordinary `@error` pin.
+The contract is the goal; a corner where the checker is *wrong* is captured as an
+`xfail-*.vl` file that pins today's behavior and is annotated with what it *should*
+do — the regression guard fires the moment a fix changes the behavior, surfacing it
+at merge.
 
-Container element variance is the live one and is **not** yet pinned here: a
-`Cat[]` flowing into an `Animal[]` parameter is silently accepted and emits
-invalid wasm (`docs/internals/open-rulings.md`).
+A checker can be wrong in two opposite directions, so the prefix always says which
+(`tests/cases/soundness/README.vl` is the normative statement):
+
+| prefix | meaning | directive shape | closing it |
+|---|---|---|---|
+| `xfail-unsound-*` | **accepts too much** — a program that should be refused compiles clean. A hole in the contract above. | no `@error`, plus a `TODO(soundness):` note | tightens the checker; the file becomes an ordinary `*-reject.vl` `@error` pin |
+| `xfail-false-reject-*` | **rejects too much** — a SOUND program is refused. A completeness gap, never a soundness one. | an `@error` pinning the *undesired* diagnostic | **loosens** the checker, so it needs reject-parity work; the file drops the prefix and flips to `@run` + `@log` |
+
+`xfail-` is about the *compiler* being wrong, never about the *test* failing: a
+file named `xfail-…` still passes `deno task test`, and a name that merely sounds
+like a known failure while pinning correct behavior is a documentation defect —
+six such files here left ROADMAP A13 reading OPEN long after its defect was fixed.
+A must-error pin is named `*-reject.vl`, whatever it took to get it there.
+
+There are currently **no** `xfail-unsound-*` files. Container element variance is
+the live unsound corner and is **not** pinned here at all: a `Cat[]` flowing into
+an `Animal[]` parameter is silently accepted and emits invalid wasm
+(`docs/internals/open-rulings.md`).

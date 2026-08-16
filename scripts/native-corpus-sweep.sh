@@ -13,7 +13,7 @@
 #
 # NOTE: matches files containing the literal `// @run` ANYWHERE — two soundness
 # @check files mention `// @run` in prose comments and show up as CHECKFAIL noise
-# (xfail-elseif-chain-residual, xfail-seq-guard-residual-codegen); read the
+# (xfail-false-reject-elseif-chain-residual, xfail-false-reject-seq-guard-residual); read the
 # directive line before chasing them.
 #
 # Prereqs: scripts/vl-host built (cargo build --release) and a fresh seed
