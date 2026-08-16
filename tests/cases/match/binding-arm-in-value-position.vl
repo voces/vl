@@ -1,0 +1,186 @@
+// @run
+// @log 7
+// @log 9
+// @log 8
+// @log aa
+// @log bb
+// @log 3
+// @log 0
+// @log 0
+// @log 4
+// @log 4
+// @log 6
+// @log 7
+// @log -1
+// @log yes
+// @log none
+// @log 7
+// @log 2
+// @log 7
+// @log 9
+// @log 1
+// @log 2
+// @log 3
+// @log 10
+// @log 9
+// @log 15
+// @log 8
+// @log 9
+// A binding arm in VALUE position: `const r = match u { A{a} => a, … }`.
+//
+// A `match` arm that BINDS desugars to `if u is A { const a = u.a; <value> }` — a Block whose
+// value is its LAST statement, with the binding as a PRELUDE before it. Statement position and
+// function-TAIL position already lowered that shape (`emitStmts` / `emitStmtsTail` walk a block
+// of any length); only the if-EXPRESSION arm emitters demanded a one-statement arm, so the
+// binding was what broke value position — the same `match` with no clause compiled fine, and the
+// hand-written `if` twin failed identically. Both are covered here, because the fix is in the
+// if-expression arm lowering (`emitIfArmOpen`) that `match` lowers through.
+//
+// The arm's locals are allocated by the collect pass in the pre-order the emitter's local cursor
+// replays (`collectIfExprLocals`), which is why the supported positions are exactly the two the
+// collect pass walks: a binding INITIALIZER and a `return` operand.
+type A = { a: i32 }
+type B = { b: i32 }
+type U = A | B
+
+type SA = { s: string }
+type SB = { t: string }
+type SU = SA | SB
+
+type LA = { xs: i32[] }
+type LB = { ys: i32[] }
+type LU = LA | LB
+
+type P = { x: i32, y: i32 }
+type NA = { na: string }
+type NB = { nb: i32 }
+type NU = NA | NB
+type IorS = i32 | string
+
+// The C6 shape itself: an i32 join.
+function pick(u: U) {
+  const r = match u { A{a} => a, B{b} => b }
+  r
+}
+
+// A `let` initializer takes the same path as `const`.
+function pickLet(u: U) {
+  let r = match u { A{a} => a, B{b} => b }
+  r = r + 1
+  r
+}
+
+// A `string` join — the REF arm emitter, not the numeric one.
+function name(u: SU) {
+  const r = match u { SA{s} => s, SB{t} => t }
+  r
+}
+
+// A STRUCT join: each arm builds the joined struct after its binding runs.
+function toPoint(u: U) {
+  const p = match u { A{a} => ({ x: a, y: 0 }), B{b} => ({ x: 0, y: b }) }
+  p
+}
+
+// A ref-LIST join.
+function firstOf(u: LU) {
+  const r = match u { LA{xs} => xs, LB{ys} => ys }
+  r[0]
+}
+
+// A NULLABLE join — the binding-init `if` writes the binding's own local per arm.
+function maybe(u: U) {
+  const r: i32 | null = match u { A{a} => a, B{b} => null }
+  r ?? -1
+}
+
+// A `string | null` join (the typed-ref nullable rep).
+function maybeName(u: NU) {
+  const r: string | null = match u { NA{na} => na, NB{nb} => null }
+  r ?? "none"
+}
+
+// A value-UNION join — every arm writes the shared box sink.
+function either(u: NU) {
+  const r: IorS = match u { NA{na} => na, NB{nb} => nb }
+  if r is i32 { r } else { r.length }
+}
+
+// A `return` operand, the other position the collect pass walks.
+function pickReturn(u: U) {
+  return match u { A{a} => a, B{b} => b }
+}
+
+// The hand-written `if` twin, including an `else if` chain — the shape whose emitter gap this is.
+type C = { c: i32 }
+type U3 = A | B | C
+
+function pickIf(u: U3) {
+  const r = if u is A {
+    const a = u.a
+    a
+  } else if u is B {
+    const b = u.b
+    b * 2
+  } else {
+    const c = u.c
+    c * 3
+  }
+  r
+}
+
+// A prelude of SEVERAL statements, one of them derived from the others.
+function widePrelude(u: SU) {
+  const r = if u is SA {
+    const s = u.s
+    const n = s.length
+    const bump = n + 7
+    bump
+  } else {
+    const t = u.t
+    t.length
+  }
+  r
+}
+
+// A prelude statement whose OWN initializer is an if-expression with a prelude: the inner arm is
+// walked because a binding initializer is walked wherever it sits.
+function nestedInit(u: U, c: boolean) {
+  const r = if u is A {
+    const a = u.a
+    const q = if c { const z = a * 2; z } else { a }
+    q + 1
+  } else {
+    const b = u.b
+    b
+  }
+  r
+}
+
+print(pick({ a: 7 }))
+print(pick({ b: 9 }))
+print(pickLet({ a: 7 }))
+print(name({ s: "aa" }))
+print(name({ t: "bb" }))
+print(toPoint({ a: 3 }).x)
+print(toPoint({ a: 3 }).y)
+print(toPoint({ b: 4 }).x)
+print(toPoint({ b: 4 }).y)
+print(firstOf({ xs: [4, 5] }))
+print(firstOf({ ys: [6, 7] }))
+print(maybe({ a: 7 }))
+print(maybe({ b: 1 }))
+print(maybeName({ na: "yes" }))
+print(maybeName({ nb: 1 }))
+print(either({ nb: 7 }))
+print(either({ na: "hi" }))
+print(pickReturn({ a: 7 }))
+print(pickReturn({ b: 9 }))
+print(pickIf({ a: 1 }))
+print(pickIf({ b: 1 }))
+print(pickIf({ c: 1 }))
+print(widePrelude({ s: "abc" }))
+print(widePrelude({ t: "123456789" }))
+print(nestedInit({ a: 7 }, true))
+print(nestedInit({ a: 7 }, false))
+print(nestedInit({ b: 9 }, true))

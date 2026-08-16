@@ -167,6 +167,7 @@ import {
   aUsed,
   annRlNul,
   annRlSlot,
+  armPreludeBlocks,
   cloSigBase,
   cloSigKeys,
   cloSigRepFn,
@@ -1840,6 +1841,14 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
           }
           slot = addLocalName(s.letName, "i32", -1)
         }
+        // An if-EXPRESSION initializer's arm PRELUDES declare locals of their own. They
+        // are allocated AFTER this binding's own slot and BEFORE its name is bound,
+        // because that is exactly the order `emitLetDeclStmt` walks (it takes
+        // `emitLetCursor` for the binding, emits the init, then `scopeBind`s the name).
+        if collectIfExprLocals(s.letInit, fnIx) < 0 {
+          scopePop()
+          return -1
+        }
         scopeBind(s.letName, slot)
       } else if s is IfStmt {
         if collectLocalsIf(stmts[i], fnIx) < 0 {
@@ -1959,6 +1968,14 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
         }
         // The loop variable's scope is the loop (see `scopeUnbind`).
         scopeUnbind()
+      } else if s is RetStmt {
+        // `return if c { … } else { … }` — the returned if-EXPRESSION's arm preludes are
+        // the only locals a `return` can introduce, and `emitStmt`'s return path emits
+        // them in this same order (nothing precedes the value).
+        if collectIfExprLocals(s.retArg, fnIx) < 0 {
+          scopePop()
+          return -1
+        }
       }
       // Post-guard complement narrowing (mirrors `emitStmts` / `blockHasStrOpScan`):
       // a guard `if` with no else whose then-branch always returns narrows the REST of
@@ -1981,9 +1998,44 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
 // not just the first nested level. (Mirrors how `emitStmt` re-enters each arm via
 // `emitStmts`/`emitStmt`, so the slots `collectLocals` allocates match the `let`s
 // `emitStmt` stores into, at any nesting depth.) Returns 0, or -1 (via `emitFail`).
+// Allocate the arm-PRELUDE locals of an if-EXPRESSION standing as a statement's whole
+// VALUE expression — a binding initializer or a `return` operand. That is also where a
+// `match` in value position lands (`const r = match u { A{a} => a … }` desugars to an
+// if-chain whose arm blocks open with `const a = u.a`). Only this shape is walked: an
+// if-expression nested DEEPER inside an expression is reached by the emitter in an order
+// this pass does not replay, so it stays unwalked and `armPreludeBlocks` denies it.
+function collectIfExprLocals(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  const bare = unwrapParen(exprIx)
+  const n = P.nodes[bare]
+  if n is IfStmt { return collectLocalsIf(bare, fnIx) }
+  0
+}
+
+// Record that the arm block at `blockIx` had its prelude locals allocated here, so
+// `emitIfArmOpen` may lower them (see `armPreludeBlocks`). Only a MULTI-statement arm
+// carries a prelude; recording just those keeps the membership scan trivial. Idempotent —
+// a node index is arena-unique, so a re-walk must not append a duplicate.
+function markArmPrelude(blockIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    if b.blkStmts.length > 1 {
+      let i = 0
+      while i < armPreludeBlocks.length {
+        if armPreludeBlocks[i] == blockIx { return 0 }
+        i = i + 1
+      }
+      armPreludeBlocks.push(blockIx)
+    }
+  }
+  0
+}
+
 export function collectLocalsIf(ifIx: i32, fnIx: i32) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
+    markArmPrelude(s.ifThen)
+    if s.ifElse >= 0 { markArmPrelude(s.ifElse) }
     // Narrow `n` to its variant across the THEN-branch (mirroring `emitStmt`), so a
     // `let x = n.arrField` over a narrowed union-variant ARRAY field is classified as
     // an array local here — `exprArray`/`memFieldTypeCode` resolve the variant field
