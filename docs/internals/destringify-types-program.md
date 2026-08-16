@@ -41430,3 +41430,163 @@ the bodies' HEADERS is the same demand one level up. The row was still worth tak
 it was just the third site rather than either of the two the row named.
 
 <!-- APPEND-MARKER-FREEROUTE-END -->
+
+## D-NWBRANDKEY — B10's mechanism is the NEWTYPE BRAND, not a stale memo. The proposed stamp moves ZERO of the 28 disagreements, re-mints 12 duplicate arena entries, and moves `T.tys` on 5 corpus files
+
+B10 was filed as: *"only the NEGATIVE memo carries `cUserTypesVer`, so a positive `annotNameMemo`
+entry survives a `cUserTypes` rewrite"*, with `fieldElemTyIxOfName` therefore recording an
+`rlElemTyIx` that disagrees with the key its own interner computed — **4 disagreements in 976**,
+inert *"only because `rlSlotByNameTyK`'s rung 2 answers 0 times in 237 reaches"*. Every clause of
+that is re-derived below. **The count reproduces in shape and drifts in size; the MECHANISM is
+something else entirely; and the stated reason for inertness is false while the inertness itself
+holds for a better reason.**
+
+### 1. THE CENSUS, RE-DERIVED, IN BOTH UNITS
+
+```
+base:   master dca22fe9 + agent-setup (seed-latest fetched, self-compiled;
+        build/vl-compiler.wasm 1,151,688 B)
+probe:  a dual write at each of the three `declTyIxOfName`-family name bridges —
+        r1 = cUserTypes[nm], r2 = resolveAnnot(nm, []), compared on the RAW index
+run:    vl check --codegen tests/cases --compiler C-probe.wasm   (one instance;
+        1,773 files, 1,773 records, the last record is the corpus total)
+```
+
+| site | reaches | covered (`cUserTypes` answers) | of those, memo HITs | **disagreements** |
+|---|---:|---:|---:|---:|
+| `repElemKeyOfNameTy` | 3,828 | **1,034** | 914 | **28** |
+| `repNameCanonKey` | 657 | **294** | 47 | **0** |
+| `repRowOfName` | 1,913 | **66** | 54 | **0** |
+
+Restricted to the filing's own unit — *covered* **memo-HIT** reaches, which is the population a probe
+can measure without minting — the first row is **21 in 914**.
+
+`repRowOfName` reproduces exactly (0 of 66). The other two drifted: `repNameCanonKey`'s covered
+population 262 → 294, and the headline row's 4 in 976 → **28 in 1,034**. The disagreement population
+grew 7× because the corpus grew the witnesses, not the rate: the filing's single witness `FView`
+(`tests/cases/memory/newtype-struct-views-distinct.vl`) is now **seven** — `AView`, `CView`, `DView`,
+`EView`, `FView`, `GView`, `IView` — across `tests/cases/maps/newtype-struct-*.vl` and
+`tests/cases/memory/newtype-struct-views-distinct.vl`. **Every single one is a `new` struct
+newtype**, exactly as filed.
+
+### 2. THE MECHANISM IS `nwBrand`, AND NOTHING IS STALE
+
+Every witness has the same shape:
+
+```
+name=FView  r1=31  r2=33   repElemKey(31)=S0   repElemKey(33)={base:i32,length:i32,}
+```
+
+`cUserTypes` is written in **four places, all in `typecheck.vl`**, and none of them is a rewrite that
+can strand a memo entry: three are pass 0a's declaration registration (`:14955`, `:14961`, `:14988`,
+which all run before the first annotation resolves), and the fourth is `applyGenAlias`'s synthetic
+`head + "<#…"` application key (`:5599`), guarded by `cUserTypes.has(memoKey)` so it only ever ADDS.
+**No declared name's `cUserTypes` value ever changes after pass 0a.** There is no rewrite for a
+positive memo entry to survive.
+
+What actually produces two indices is `declaredTyOfName` → **`nwBrand(name, base)`**: a `new`
+declaration gets `addTy(T.tys[base])`, a SECOND arena entry over the same `Ty` value, carrying the
+nominal identity the brand exists to give. `cUserTypes[nm]` holds the base; the annotation grammar
+resolves `nm` to the brand. **Both are current.** `nwBrand` is itself memoized on `(name, base)`
+(`nwNames` ∥ `nwBaseTyIxs` ∥ `nwTyIxs`), so a re-resolution returns the very same brand index.
+
+The two indices key different reps only because **only the base owns an `sNames` row**: `repElemKey`
+keys a declared struct nominally (`S0`) and has nothing nominal to say about the brand, so it expands
+it structurally (`{base:i32,length:i32,}`).
+
+This mechanism was already on the board — the workboard's checker-side paragraph names *"the newtype
+brand and the transparent alias"* as the two mechanisms behind **345 disagreements in 3,135** at
+`tsLeafTy`, and contrasts them with *"the emitter's 4 in 976"* as though the emitter's were a third
+thing. It is not. It is the first one.
+
+### 3. THE PROPOSED FIX, BUILT AND MEASURED: 0 OF 28 MOVED, 12 DUPLICATES MINTED, ARENA MOVED, BYTES IDENTICAL
+
+The fix — a `annotNameMemoPosVer` stamp on the positive memo, checked on the hit — was built clean
+and run over the corpus against the identical probe.
+
+| channel | base | with the stamp |
+|---|---|---|
+| disagreements at `repElemKeyOfNameTy` (memo-HIT unit) | 21 / 914 | **21 / 914 — identical** |
+| positive-memo hits | 24,114 | 24,114 |
+| hits whose stamp is STALE | **357** | 62 (re-stamped on re-resolution) |
+| stale hits that RE-RESOLVE TO A DIFFERENT INDEX | — | **12** |
+| `T.tys.length`, per file, 1,773 files | — | **5 files differ** (+1, +1, +2, +7, +12) |
+| emitted wasm sha256, per file, 1,773 files | — | **0 files differ** |
+
+**It moves not one of the disagreements** — which is the direct refutation of the filing, and follows
+from §2: re-resolving `FView` calls `declaredTyOfName` again, which calls `nwBrand` again, which
+returns 33 again.
+
+**The 12 answers it does change are all duplicate re-mints of a structurally identical type**, printed
+with both renderings:
+
+```
+K[]                       old=34  new=64    "a" | "b"[]              →  "a" | "b"[]
+K[]                       old=64  new=149   "a" | "b"[]              →  "a" | "b"[]
+K[]                       old=149 new=298   "a" | "b"[]              →  "a" | "b"[]
+{x:i32}                   old=33  new=38    {x: i32}                 →  {x: i32}
+i32[]                     old=33  new=40    i32[]                    →  i32[]
+Pair<i32|null,string>     old=44  new=49    {a: i32?, b: string}     →  {a: i32?, b: string}
+Pair<(i32)=>i32,i32>      old=33  new=43    {a: (i32) -> i32, b: i32} → {a: (i32) -> i32, b: i32}
+…12 in total, `oldT == newT` in every one
+```
+
+That is the memo's own invariant being broken. `nameToTy` MINTS fresh arena types per call for an
+inline spelling; the positive memo exists to hold **one index per spelling per program**, and it was
+added because re-minting grew the arena past 300K types on a deep same-fieldset composite and crashed
+the compiler on a table allocation (fuzz seed 459979688 d6 bm; `annotNameMemo`'s header). Versioning
+the positive memo re-opens exactly that door, in proportion to how often `applyGenAlias` bumps
+`cUserTypesVer` — which is why the five files whose arena moves are four generics/literal-union cases
+and one soundness case, not the newtype cases the item is about.
+
+**The arena moved, so this is a rep change and it is not shipped.** The byte channel being clean on
+all 1,773 files is not a licence: `repElemKeyGo`'s identity arm keys `TyVar`/`TyLit`/`TyErr` by arena
+INDEX, so a corpus that happens not to reach a moved key today is one program away from doing so. The
+DIRECTORY-channel caution applies in reverse here and is worth recording as a positive result: on
+this layer the byte channel moved **0 of 1,773** while the arena channel moved **5 of 1,773** — the
+arena census is the strictly finer instrument, and an A/B that had only looked at bytes would have
+graded a rep change as free.
+
+### 4. THE INERTNESS IS REAL AND THE FILED REASON FOR IT IS NOT
+
+Filed: *"inert only because `rlSlotByNameTyK`'s rung 2 answers 0 times in 237 reaches."* On this base
+that rung is **reached 3,083 times and ANSWERS 225** of them. The premise is stale.
+
+The inertness holds anyway, for a reason that is a property of the population rather than of a dormant
+rung. Instrumenting **both** `repElemKeyOfNameTy` consumers to compute the key rung 1's index would
+have given, and then to locate the slot each key finds:
+
+| consumer | reaches with a resolved key | reaches on a DISAGREEING name | reaches where the two keys find a DIFFERENT slot |
+|---|---:|---:|---:|
+| `rlSlotByNameTyK` rung 2 — the FIND | 2,607 | **0** | **0** |
+| `rlInternNameTy` — the INTERN | 3,591 | 28 | 18 |
+
+**No newtype name ever reaches the FIND's rung 2.** The 18 at the INTERN are not a wrong answer: they
+are the difference between the shipped routing and the rung-1 routing D-DECLRUNG refused, and in every
+one the current key finds slot 0 (whose key IS `{base:i32,length:i32,}`) while rung 1's `S0`/`S1`
+finds nothing — i.e. the rung-1 routing would MINT a fresh slot. Which of the two is correct is
+settled by the corpus, not by this item: `newtype-struct-map-value-twin.vl` and
+`newtype-struct-reflist-map-value.vl` both specify that same-shape newtypes **share** one slot and one
+heap type. The shipped answer is the specified one.
+
+**Constructed by hand, since the fuzzer's grammar emits no `new` type and grades this class at zero:**
+`tests/cases/memory/newtype-struct-reflist-key-population.vl` puts all four ref-list element spellings
+in one program — two same-shape newtypes, their same-shape PLAIN declared twin, and a bare inline
+shape, plus the nested-list and struct-field intern paths. All twelve reads return their own values.
+
+### 5. VERDICT, AND THE METHOD NOTE
+
+**B10 is CLOSED as MISDIAGNOSED.** There is no stale positive memo at this site; there are two live
+arena indices for one newtype name, the shipped code asks the rung that gets the specified one, and
+the proposed stamp is inert for the filed symptom and actively harmful to the invariant the memo
+exists to hold.
+
+The method note is about the shape of the filing. **"A carries a version and B does not" is a
+DIFFERENCE, not a defect; the defect claim needs a witness where B's answer is WRONG, and this one had
+a witness where B's answer merely DIFFERED.** The witness (`FView`, two indices, two rep keys) was
+real and correctly measured — it was the causal story attached to it that was never checked, and it
+was checkable in one grep: `cUserTypes` has four writers and none of them rewrites a declared name.
+The cheapest test of any "stale cache" filing is to build the invalidation and see whether the symptom
+moves. Here it moved nothing, and the build cost less than the census did.
+
+<!-- APPEND-MARKER-NWBRANDKEY-END -->
