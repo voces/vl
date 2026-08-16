@@ -6927,7 +6927,7 @@ which is `tyToEmitName`'s reachability):
 | population | files | which |
 |---|---|---|
 | **nom > 0** (the live crash) | **3** | only the three new pins |
-| **str > 0, nom = 0** (latent, #1126's) | **14** | `recursive-linked-list-sound` · `recursive-binary-tree-sound` · `recursive-type-build-traverse` · `recursive-alias-nullable-arg` · `xfail-mutual-recursive-types` · `mutual-recursive-type` · `recursive-tree` · `recursive-array-element` · `recursive-map-value` · `nullable-recursive-call-narrow-canary` · `optional-chain-member-recv` · `structural-twin-heap-dedup` · `scripts/fuzzgen.vl` (str=28) · the new nominal-boundary pin |
+| **str > 0, nom = 0** (latent, #1126's) | **14** | `recursive-linked-list-sound` · `recursive-binary-tree-sound` · `recursive-type-build-traverse` · `recursive-alias-nullable-arg` · `mutual-recursive-types-sound` · `mutual-recursive-type` · `recursive-tree` · `recursive-array-element` · `recursive-map-value` · `nullable-recursive-call-narrow-canary` · `optional-chain-member-recv` · `structural-twin-heap-dedup` · `scripts/fuzzgen.vl` (str=28) · the new nominal-boundary pin |
 
 The two sets are **disjoint**: every pre-existing file in the structural population reads
 `nom = 0`. So this fix does NOT protect a future `tyToEmitName` consumer — 13 pre-existing
@@ -8110,7 +8110,7 @@ D-FIELDCODE exist to have removed.
 `tyToEmitName(ty)` at `repRowOfTyLenientRow`'s entry — route (a), the only route from an arena
 index to a spelling — **TRAPPED the compiler on 9 of 1,315 corpus files** that master compiled
 cleanly (`types/recursive-tree.vl`, `types/mutual-recursive-type.vl`, the four
-`soundness/recursive-*` files, `soundness/xfail-mutual-recursive-types.vl`,
+`soundness/recursive-*` files, `soundness/mutual-recursive-types-sound.vl`,
 `structs/structural-twin-heap-dedup.vl`, `structs/optional-chain-member-recv.vl`); the backtrace
 was `tyToEmitName` self-recursing. That was written up as a hard blocker. **#1129 (D-RECRENDER)
 landed while this slice was gating, and the identical probe rebuilt at `cd69bd9` traps on
@@ -29688,7 +29688,7 @@ sabotages, different channels.
 | `rm -f build/vl-compiler.wasm && fetch-seed.sh` | 0 | 1,042,874 B published seed |
 | `refresh-compiler.sh --prove-fixpoint` | 0 | fixpoint in 2 compiles, **1,040,963 B** |
 | `native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,254 passed / 0 failed / 8 ignored** — master's exact reading. The 8: `lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/README` · `soundness/literal-is-union-param-dispatch` · `soundness/xfail-array-element-recursion` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`. (14 would have meant a missing `node_modules`.) |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,254 passed / 0 failed / 8 ignored** — master's exact reading. The 8: `lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/README` · `soundness/literal-is-union-param-dispatch` · `soundness/xfail-array-element-recursion` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`. (14 would have meant a missing `node_modules`.) |
 | `lint-self.sh` (incl. `vl fmt --check`) | 0 | clean |
 | `rep-fuzz-check.sh` | 0 | exact — 1 baselined failure, 0 new, 0 stale |
 | corpus A/B (6 channels, 1,543 files) | 0 | 0 diffs |
@@ -33627,7 +33627,7 @@ fuzz A/B, 3 seeds x 3 flag sets x 400 cases x 2 sides           class-tagged sha
 Master at `4607bf9b` reads **3,536 / 0 / 7**; the +2 is the one added fixture, counted in the wasm
 tier and the native-align tier. The **ignored SET is identical to master's** (`lint/exhaustive-is-chain-dead-else` ·
 `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` ·
-`soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`) —
+`soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`) —
 the 7 is the tell that `SELFHOST_NATIVE_ALIGN` was honoured.
 
 **SEED BOOTSTRAP: no split needed.** The gate above starts from a *freshly fetched* published
@@ -34007,7 +34007,7 @@ D-MAPKEYDIAG landed mid-gate. Every figure below is the SECOND run, against the 
 | `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,102,454 B** — and it is master `75ff7198`'s own fixpoint: master's frozen source compiled by it reproduces it byte-for-byte at ONE compile, so the A/B baseline IS master's published compiler |
 | `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,102,362 B** |
 | `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,102,362 B |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,556 / 0 / 7** — magnitude AND ignored SET identical to master run on the SAME tree (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`, `diff` rc 0); the 7 is the tell the env var took |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,556 / 0 / 7** — magnitude AND ignored SET identical to master run on the SAME tree (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`, `diff` rc 0); the 7 is the tell the env var took |
 | `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
 | corpus A/B, six channels, **1,695 files** | 0 | **0 rows moved on every field**, graded by SAB-SHIFT (106) and SAB-DROP1 (5), both re-run against these bytes |
@@ -34342,7 +34342,7 @@ its reachability MEANS the arena said no, so its coverage number is not evidence
 | `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,102,386 B** = master `771abe09`'s own fixpoint |
 | `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,102,736 B** |
 | `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,102,736 B |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); the pre-rebase run read 3,556 / 0 / 7, and the +8 is #1292's |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`); the pre-rebase run read 3,556 / 0 / 7, and the +8 is #1292's |
 | `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
 | corpus A/B, six channels, **1,699 files** | 0 | **0 rows moved on every field** (pre-rebase: the same zero over 1,695) |
@@ -34705,7 +34705,7 @@ file instead of shipping.*
 | `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,102,386 B** — and it is master `771abe09`'s own fixpoint (master's source compiled by it reproduces it at ONE compile), so the A/B baseline IS master's published compiler |
 | `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,102,713 B** |
 | `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,102,713 B |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); the 7 is the tell the env var took |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`); the 7 is the tell the env var took |
 | `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
 | corpus A/B, six channels, **1,699 files** | 0 | **0 rows moved on every field**, graded by SAB-KID (8) and SAB-NOFOLD (10) |
@@ -34972,7 +34972,7 @@ unmoved rows are the internal control and they hold to the digit.
 | `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,103,063 B** — and it IS master `7f01b944`'s own fixpoint: master's frozen source compiled by it reproduces it byte-for-byte at ONE compile, so the A/B baseline is master's published compiler |
 | `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,103,310 B** |
 | `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,103,310 B |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); the 7 is the tell the env var took, and `git diff --stat ee380e01 7f01b944 -- tests/` is empty, so master's published 3,564 carries over unchanged |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`); the 7 is the tell the env var took, and `git diff --stat ee380e01 7f01b944 -- tests/` is empty, so master's published 3,564 carries over unchanged |
 | `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale |
 | corpus A/B, six channels, **1,699 files** | 0 | **0 rows moved on every field**, graded by the two sabotages below |
@@ -35651,7 +35651,7 @@ graded) and the REBASE base `839dc9a0`, where every leg was re-run bare.
 | `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,103,310 B** — and it IS that master's own fixpoint (its frozen source compiled by it reproduces it byte-for-byte at ONE compile, and again at two), so the A/B baseline is master's published compiler | **1,102,171 B**, same property re-checked (`seed-latest` moved mid-session) |
 | `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,103,497 B** | **1,102,358 B** |
 | `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,103,497 B | stage3 == stage4, 1,102,358 B |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** | **3,566 / 0 / 7** (#1296 added two cases) — magnitude AND ignored SET identical to the respective master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); the 7 is the tell the env var took |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,564 / 0 / 7** | **3,566 / 0 / 7** (#1296 added two cases) — magnitude AND ignored SET identical to the respective master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`); the 7 is the tell the env var took |
 | `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean | clean |
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 new, 0 stale | exact, same counts |
 | corpus A/B, six channels | 0 | **1,699 files, 0 rows moved on every field**, graded by the three sabotages below | **1,700 files, 0 rows moved on every field** |
@@ -35964,7 +35964,7 @@ re-run bare.
 | `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,102,358 B** — and it IS that master's own fixpoint: one compile of its frozen source by it reproduces it byte-for-byte (`cmp` rc 0), so the A/B baseline is master's published compiler | **1,103,140 B** (`seed-latest` moved mid-slice), same property re-checked, `cmp` rc 0 |
 | `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,102,907 B** | **1,103,689 B** |
 | `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,102,907 B | stage3 == stage4, 1,103,689 B |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,566 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); the 7 is the tell the env var took | **3,570 / 0 / 7** (#1298 added four `vl fmt` cases) — same ignored SET |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,566 / 0 / 7** — magnitude AND ignored SET identical to master (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`); the 7 is the tell the env var took | **3,570 / 0 / 7** (#1298 added four `vl fmt` cases) — same ignored SET |
 | `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean | clean — **and this is the leg the rebase was about**: #1298 changed the formatter, and this slice's three files are fmt-clean under the new rule without an edit |
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 unsound, 0 new, 0 stale | exact, same counts |
 | corpus A/B, six channels | 0 | **1,700 files, 0 rows moved on every field**, graded by the sabotages below | **1,700 files, 0 rows moved on every field** |
@@ -37132,7 +37132,7 @@ is not a struct`) and green here, so it is a live net for all three of the slice
 | `bash scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte (1,107,011 B) |
 | `bash scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
 | `bash scripts/rep-fuzz-check.sh` | 0 | exact ✅ (1 baselined, 0 unsound, 1 reject, 0 new, 0 stale) |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,576 passed / 0 failed / 7 ignored** — master's numbers exactly, and the ignored SET is identical name for name (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`). The 7 is the tell the env var took |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,576 passed / 0 failed / 7 ignored** — master's numbers exactly, and the ignored SET is identical name for name (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`). The 7 is the tell the env var took |
 | six-channel corpus A/B, **1,703 files**, run TWICE (master's corpus and the shipped one) | 0 | **1 file moved on each** — §10. On master's corpus it is BYTES only; on the shipped corpus it is the grown fixture's BUILDRC 1 → 0 |
 | fuzz A/B, 10 seeds × 3 depths × 200 = **6,000 cases per side** | 0 | **logs BYTE-IDENTICAL**, 0 unsound-class lines on both sides — **and it is a COVERAGE zero, checked rather than assumed** (below) |
 
@@ -37513,7 +37513,7 @@ differ.
 | `bash scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte (1,108,097 B) |
 | `bash scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
 | `bash scripts/rep-fuzz-check.sh` | 0 | exact ✅ (1 baselined, 0 unsound, 1 reject, 0 new, 0 stale) |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,576 passed / 0 failed / 7 ignored** — master's numbers exactly, ignored SET identical name for name (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`) |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,576 passed / 0 failed / 7 ignored** — master's numbers exactly, ignored SET identical name for name (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`) |
 | six-channel corpus A/B, 1,703 files, run TWICE | 0 | **0 moved on master's corpus · 1 moved on the shipped one** — §7 |
 | fuzz A/B, 10 seeds × 3 depths × 200 = **6,000 cases per side** | 0 | logs **BYTE-IDENTICAL**, 0 unsound-class lines on both — **and it is a COVERAGE zero, checked** (below) |
 
@@ -40257,7 +40257,7 @@ units because the two move differently, which is the point of the correction in 
 | `rm -f build/vl-compiler.wasm && scripts/fetch-seed.sh` | 0 | fresh `seed-latest`, **1,135,405 B** — byte-identical to this branch's base fixpoint, so the A/B baseline IS master's published compiler |
 | `scripts/refresh-compiler.sh --prove-fixpoint` | 0 | *"compile(next) == next (2 compiles)"*, **1,135,531 B** |
 | `scripts/native-fixpoint.sh` | 0 | stage3 == stage4 byte-for-byte, 1,135,531 B |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,689 / 0 / 7** — the ignored SET is the seven documented names (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); 7 and not 13 is the tell that `wasm-opt` is present, 7 and not ~615 the tell that the env var took |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,689 / 0 / 7** — the ignored SET is the seven documented names (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`); 7 and not 13 is the tell that `wasm-opt` is present, 7 and not ~615 the tell that the env var took |
 | `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 unsound, 0 new, 0 stale |
 | corpus A/B, **1,734 files**, five per-file fields: `vl build` rc · **sha256 of the emitted wasm** · build stderr · `vl run` rc · run stdout | 0 | **0 rows moved**, and the four arena-renumbered files are inside it |
@@ -40956,7 +40956,7 @@ are byte-identical across the two compilers on all seven per-file channels.
 | `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
 | `scripts/rep-fuzz-check.sh` | 0 | exact — 1 baselined reject, 0 unsound, 0 new, 0 stale |
 | `deno test -A tests/cases_wasm_test.ts` | 0 | **1,679 passed / 0 failed / 7 ignored** (1,675 before the four promoted cases) |
-| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,731 passed / 0 failed / 7 ignored** (3,723 before the four promoted cases, which land in two suites each) — the ignored SET is the seven documented names (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-seq-guard-residual-codegen` · `types/struct-union-same-shape`); 7 and not 13 is the tell that `wasm-opt` is present |
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **3,731 passed / 0 failed / 7 ignored** (3,723 before the four promoted cases, which land in two suites each) — the ignored SET is the seven documented names (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`); 7 and not 13 is the tell that `wasm-opt` is present |
 | corpus A/B, **1,743 files × 7 per-file channels** — `vl check` rc · check stderr · `vl build` rc · build stderr · **sha256 of the emitted wasm** · `vl run` rc · run stdout — one output FILE PER WORKER concatenated, well-formedness asserted (12,201 lines == 12,201 leading-`F` records, 1,743 record files, per side) | 0 | **0 rows moved on any of the seven** |
 | corpus DIRECTORY channels, one compiler instance per side: `vl check` (11,338 lines/side) · `vl check --codegen` (11,468 lines/side) | 0 | **identical** |
 

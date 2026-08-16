@@ -822,17 +822,32 @@ in-language GC knobs.
   `Buffer<N>`) — today generics take *type* params only; enabler for the parameterized
   `Decimal<Backing, Scale>` family (B2) and any fixed-size/parameter-by-value type.
   (Forward/mutual-reference return-type inference: shipped as A17 — see `CHANGELOG.md`.)
-- 🟡 **A12. Soundness corpus.** REMAINING: keep growing it; a known-unsound corner is `xfail`-marked
-  until its fix lands, at which point the file drops the prefix and becomes an ordinary `@error`
-  pin. Container element variance (`Cat[]` into an `Animal[]` param) is live and not yet even
-  xfail-marked — `docs/internals/open-rulings.md`. The SELF-HOST checker's soundness floor
-  (15 false-accept classes) is closed; new classes go straight to corpus + both checkers.
+- 🟡 **A12. Soundness corpus.** REMAINING: keep growing it. NAMING IS LOAD-BEARING and has its own
+  contract (`tests/cases/soundness/README.vl`, mirrored in `docs/guide/soundness.md`): a must-error
+  pin is `*-reject.vl`; `xfail-` means the COMPILER is wrong and splits by direction —
+  `xfail-unsound-*` accepts too much (no `@error`; closing it tightens the checker),
+  `xfail-false-reject-*` refuses a sound program (`@error` pins the undesired diagnostic; closing it
+  LOOSENS the checker, so it needs reject-parity work). An `xfail-` file that is really a passing
+  pin makes the item it belongs to read OPEN — six did exactly that to A13 below. There are
+  currently no `xfail-unsound-*` files. Container element variance (`Cat[]` into an `Animal[]`
+  param) is live and not pinned here at all — `docs/internals/open-rulings.md`. The SELF-HOST
+  checker's soundness floor (15 false-accept classes) is closed; new classes go straight to corpus
+  + both checkers.
 - 🟡 **A13. Operator-constraint inference.** A binary op with a hole operand records a deferred
   `(lt, op, rt)` constraint that every generic call site re-validates under the substituted
   argument types (`binOpDefinedFor`) — arithmetic, string concat, relational and equality all fall
   out of that one rule, so `add(1, "x")` and `cmp(1, "x")` reject exactly as their annotated twins
   do. REMAINING: the *stored-closure* operator case (`vec + vec` via a `"+"` field) still hits the
-  WasmGC width wall (B13).
+  WasmGC width wall (B13). Also REMAINING — the rule does not cover a MIXED hole/concrete ORDERING
+  comparison, and the miss is a FALSE REJECT: `function f(a, b: string) { a < b }` called
+  `f("a","b")` errors *"comparison expects numeric operands, got any and string"*, while the fully
+  un-annotated twin accepts and prints `true`. The string-ordering fast path
+  (`typecheck.vl:20493`) needs `isStringTy` on BOTH sides, so a hole on either side falls to
+  `isNumeric` and is refused instead of deferring the constraint to the call site. Measured **8 of
+  28 cells**: `<` `<=` `>` `>=` × the two half-annotated spellings; `==`, `!=`, `+` are clean in
+  all four spellings. Annotating MORE must never lose a program. NOTE the direction: fixing this
+  LOOSENS the checker, so it carries reject-parity work rather than riding along on a soundness
+  fix. Workboard E6; the `any` rendering it exposes is E7.
 - 🟡 **A14. Named/opaque types.** Zero-cost nominal NEWTYPES ship: `type EntityId = new i32` /
   `type F32View = new { base: i32, length: i32 }`. Distinct in the checker in every position,
   ERASED before the emitter (no emitter file changed), literals brand-polymorphic, `as` for both
@@ -988,7 +1003,15 @@ in-language GC knobs.
   direction — the lossy widenings, narrowings and trapping float→int; see `CHANGELOG.md`):
   SHIPPED (#290–#298). REMAINING: **arbitrary-precision `BigInt` and a `Decimal<Backing,
   Scale>` family** as future `std`-library generic types (not primitives). Prereq: const
-  generics (A10).
+  generics (A10). Also REMAINING — an EMITTER GAP, live: **`%` with a float operand emits
+  invalid wasm.** `binOpcodeF64` / `binOpcodeF32` (`emit_base.vl:552`, `:591`) return `-1` for
+  `%` because wasm has no `f64.rem`; the consumer (`wasmEmit.vl:15514`) guards `if opcF >= 0`
+  and falls THROUGH to the i32 tail, emitting `i32.rem_s` over float operands. `vl check` is
+  clean, then instantiate fails `type mismatch: expected i32, found f64`. Verified with BOTH
+  operands annotated (`f64 % f64`, `f64 % i32`, `i32 % f64`, `f32 % f32`) and on the bare
+  literal `5.5 % 2.0`, so it is not an inference gap. A `-1` opcode must fail loudly rather
+  than fall through; the language-consistent fix lowers `a % b` as `a - trunc(a/b)*b`.
+  Workboard D7.
 - 🟡 **B5. Objects.** REMAINING: methods via `self`+UFCS (B14); typed literals in object values
   (`{n: 4<i64>}`); Exact-by-default for values (A8).
 - 🟡 **B6. Collections — growable `T[]`.** REMAINING: in-place bulk append (deferred — will be
@@ -1094,9 +1117,16 @@ in-language GC knobs.
   un-annotated (`function apply(g, x, y) { return g(x, y) }`) — nothing declares a type to
   materialize against, so it needs the callback's type inferred from the HOF's own BODY. The
   reject names the function, the un-annotated parameters, and the signatures the program's own
-  call sites already pin (`error-generic-fn-value-inferred-hof.vl`). Also open: an inline object
-  shape that COINCIDES with a declared alias's shape is a separate emitter limit ("binding's
-  inline-shape type has an unsupported field"), unrelated to generics.
+  call sites already pin (`error-generic-fn-value-inferred-hof.vl`). Also REMAINING, live and
+  measured: **an un-annotated nested function that CAPTURES.** `function o(n) { function k(x) x
+  + n; k(1.5) }` — the capture path lowers `k` through the function-VALUE ABI, where an
+  un-annotated param defaults to i32. The i32 instantiation hits the loud reject above
+  (`wasmEmit.vl:1404`) even though `k` is only ever called directly by name; the f64
+  instantiation does NOT — it checks clean and emits invalid wasm. 44-cell grid (4 operand types
+  × 11 operators): f64 11/11 invalid wasm, i32 11/11 loud reject, and the ANNOTATED twin is
+  clean in all 22. Workboard D8. Also open: an inline object shape that COINCIDES with a
+  declared alias's shape is a separate emitter limit ("binding's inline-shape type has an
+  unsupported field"), unrelated to generics.
 - ⬜ **B15a. Optional params + default values.** Wanted (owner, 2026-07); neither parses today
   (`p?: T` and `p: T = e` are both parse errors — verified). Design intent: **defaults subsume
   optionals** — VL has real `null` unions, so `p?: T` is sugar for `p: T | null = null`; one
@@ -1135,6 +1165,15 @@ in-language GC knobs.
     (Low priority.)
   - **LSP quick-fixes** (code actions): "remove unused binding" / "prefix with `_`" / "`let`→`const`".
     Diagnostics already carry stable `code`s; the LSP has no code-action provider yet.
+  - **an inference HOLE renders as `any` in user-visible diagnostics** — *"comparison expects
+    numeric operands, got any and string"*, *"cannot assign (any, any) -> any"*. This contradicts
+    a documented guarantee in as many words: `docs/guide/soundness.md` says an un-annotated
+    parameter "is a hole, not a dynamic value" and that there is "**No `dynamic` / no implicit
+    `any`**". `any` is the single word most likely to teach a reader the opposite. Pick a spelling
+    that says "not yet pinned" (`_`, `?`, `<hole>`) and change it everywhere at once — the `any`
+    type spelling is directive-pinned in 5 corpus files (the four
+    `soundness/generic-fn-*-reject.vl` plus `soundness/hole-is-guard-alternative-reject.vl`).
+    Workboard E7.
   - Cross-cutting: thread `severity` through all remaining error variants; consistent message style.
 - 🟡 **B-mem. Linear memory — make it a design, not a scratch page**
   (design: `docs/internals/memory-gc-design.md`). The collector half shipped (`vl run` on the
