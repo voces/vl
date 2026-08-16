@@ -40328,3 +40328,367 @@ and it compiles this branch's source (`refresh-compiler.sh` rc 0 on the first se
   shows a branch at zero, write down that it is at zero — the conversion still has to get it right.*
 
 <!-- APPEND-MARKER-MONOPINIX-END -->
+
+<!-- APPEND-MARKER-CHECKPARSE-BEGIN -->
+
+## D-CHECKPARSE — the CHECKER side bucketed for the first time, and the row the frontier ranks it by is 17.3% of it: the other 14,741 parses never pass the memo. 17,832 of 17,834 are SPELLING-TREE walks, the checker reads 23 type STRINGS in the whole corpus, and its one takeable route is a resolution the `is` node already banks (census only; off master `1fa7eca7`)
+
+The emit side is at its floor for name-shortcut routes — 1,846 parses, D-ROWS12 §5. The CHECKER side
+has been measured exactly once, as an unlabelled context row under #1327's emit-side table:
+*16,145 reaches · 13,167 memo hit · 15 neg · **2,963 PARSES** · 18.4%*. 2,963 > 1,846, so on the
+programme's own ledger this is the largest remaining population, and unlike every emitter row it
+has never been bucketed by caller, by mint, or by text.
+
+This slice buckets it three ways, exactly as #1327 / #1331 / #1332 bucketed the emitter. **The row
+reproduces to within 4.4% and it is 17.3% of the checker's population.** The rest of the checker's
+annotation resolution never enters `resolveAnnotTs` at all, so it carries no memo, appears in no
+column of the frontier table, and is five times the size of the row that does.
+
+And a fourth column — which LEG of `annotResolve` a parse takes — settles the programme's own
+question about this whole side of the compiler in one number.
+
+### 1. PROBE ZZC, AND ITS FOUR CONTROLS
+
+```
+base:   master 1fa7eca7; build/vl-compiler.wasm from a freshly fetched seed-latest,
+        1,137,213 B, refresh-compiler.sh rc 0 self-compiling to the SAME 1,137,213 B
+        (master is its own fixpoint, so the census base is master exactly)
+probe:  compiler/typecheck.vl only — a wrapper on each of the two funnels
+        (`resolveAnnotTs`, `annotResolve`) and one on `nameToTy`, plus a caller id
+        armed at each of the 18 call sites
+build:  vl build compiler/entry.vl -o C-zzc.wasm --compiler build/vl-compiler.wasm
+run:    vl check tests/cases --compiler C-zzc.wasm      # rc 1, the probe raises
+extract: sed -n 's/^\[ERROR\]: \(ZZ[CN]|.*\)$/\1/p' zzc.out > ZZ.rec
+```
+
+One record per OUTERMOST resolver entry, plus one per ARMED nested entry:
+`ZZC|<seq>|c<caller>|<hit|neg|parse>|d<depth>|m<T.tys delta>|u<cUserTypes>|p<primTyOfName>|r<leg>|n<nameToTy entries>|a<answer>|b<isVarTyIx bank>|<spelling>`.
+The spelling is LAST because a union spelling contains `|`.
+
+**THE RECORDS ARE BANKED, NOT RAISED INLINE — and that is not a style choice.** `checkProgram` has
+three speculative regions that pop `T.diags` back to a saved length (`typecheck.vl:13203`, `19397`,
+`19501`) and a fourth that gates `validateEscJoins` on the length being UNCHANGED (`12883`). A probe
+reporting through `tErr` as it goes would have had records silently popped inside the first three and
+would have DISABLED a validation pass through the fourth. Records go into a `string[]` and are pushed
+straight onto `T.diags` at the end of `checkProgram`, past every pop, bypassing `tErrCoded`'s
+exact-repeat dedup entirely — the landmine #1332 recorded (*"`tErr` DEDUPES EXACT REPEATS … 481 for a
+population of 1,229"*) cannot fire, and every record carries a running sequence number anyway.
+
+Four controls, all read before any number below was believed:
+
+| control | reading |
+|---|---|
+| **caller coverage** | **0 records with caller id 0 at depth 0**, of 31,911. The 18 armed sites are ALL the sites; nothing reaches either funnel unattributed. |
+| **the counters vs the records** | `ts=16,844` `ar=18,160` `neg=15` `nm=54`, and the records reconstruct every one of them exactly (16,844 = the four memoized callers' reaches; 18,160 = 17,834 depth-0 + 326 nested). |
+| **four builds** | The four probe binaries (adding the leg column, then the string-parser counter, then the answer/bank pair) all read **31,911 records** with an identical per-caller × per-class × per-depth breakdown. The added columns are a decomposition of one measurement. |
+| **a memo hit never mints** | `T.tys` grew across **0 of 13,736** memo hits. The mint column's own zero-check, and it reads zero. |
+
+Denominators: **1,737 `.vl` files** under `tests/cases`, **1,695 `checkProgram` invocations** (a
+module directory merges its files into one check), 1,734 files reporting at least one record.
+
+### 2. #1327's ROW RE-DERIVED — and the population it is 17.3% of
+
+| the memoized route (`resolveAnnotTs`) | #1327, `a688dc6e` | here, `1fa7eca7` | Δ |
+|---|---:|---:|---:|
+| reaches | 16,145 | **16,844** | +4.3% |
+| memo hit | 13,167 | **13,736** | +4.3% |
+| negative memo | 15 | **15** | **exact** |
+| **PARSES** | **2,963** | **3,093** | +4.4% |
+| parse rate | 18.4% | 18.4% | — |
+
+Same population, ~55 master PRs later — the drift is the corpus growing, and it is smaller than the
+4.7% worst-row drift #1327 itself accepted when re-deriving the emitter on a moved base.
+
+**AND IT IS ONE OF TWO ROUTES.** `resolveAnnotTs` is the memoized entry, and only four checker call
+sites use it (the `resolveAnnotAt` pair in `checkFuncDeclNode` and their twins in the pass-1.5
+hoist). Eleven more sites call `annotResolve` DIRECTLY — through `nameToTyAt` / `nameToTyAnn` /
+`isTypeTy`, or bare — and that route has **no memo at all**, so every reach reads the grammar:
+
+| route | reaches | memo hit | neg | **PARSES** | parse rate |
+|---|---:|---:|---:|---:|---:|
+| memoized — `resolveAnnotTs`, 4 sites | 16,844 | 13,736 | 15 | **3,093** | 18.4% |
+| direct — `annotResolve`, 11 sites | 14,741 | — | — | **14,741** | **100%** |
+| **checker total, depth 0** | **31,585** | **13,736** | **15** | **17,834** | **56.5%** |
+| nested inside another parse (1 site) | 326 | — | — | 326 | 100% |
+
+**THE ROW THE FRONTIER TABLE CARRIES IS 3,093 OF 17,834 — 17.3%.** The unmeasured 82.7% is
+invisible to every instrument this programme has built, because all of them were placed at the memo.
+*A census placed at a cache measures the cache's population, not the work's.*
+
+### 3. BY CALLER — 16 sites, all of them
+
+Caller ids as armed in the probe; every site is in `compiler/typecheck.vl`.
+
+| id | site | route | reaches | hit | neg | **PARSES** | minted | **mint-free** | distinct texts |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| c7 | `checkLetDeclNode` — the `let` annotation | direct | 4,529 | — | — | **4,529** | 7,586 | 1,180 | **1,139** |
+| c9 | `collectThenNarrows` — `is` in the THEN facts | direct | 2,175 | — | — | **2,175** | 1,707 | 1,233 | 304 |
+| c10 | `collectElseNarrows` — `is` in the ELSE facts | direct | 2,163 | — | — | **2,163** | 1,707 | 1,221 | 304 |
+| c13 | `checkIsExprNode` — the `is` node itself | direct | 2,145 | — | — | **2,145** | 1,707 | 1,203 | 292 |
+| c3 | hoist PARAM (`resolveAnnotAt`) | memoized | 4,855 | 3,306 | 0 | **1,549** | 1,814 | 685 | 521 |
+| c6 | struct-member `let` (`nameToTyAt`) | direct | 1,284 | — | — | **1,284** | 1,463 | 481 | 507 |
+| c5 | struct FIELD decl (`nameToTyAnn`) | direct | 1,133 | — | — | **1,133** | 266 | **954** | 132 |
+| c4 | hoist RETURN (`resolveAnnotAt`) | memoized | 2,110 | 1,070 | 0 | **1,040** | 1,062 | 505 | 278 |
+| c16 | `UnionDecl` variant registration | direct | 897 | — | — | **897** | 623 | 297 | 276 |
+| c1 | `checkFuncDeclNode` PARAM | memoized | 7,680 | 7,315 | 14 | **351** | 536 | 38 | 57 |
+| c14 | generic-alias FIELD (inside `instantiateAlias`) | direct, **nested** | 326 | — | — | **326** | 66 | 288 | 43 |
+| c8 | `checkCastNode` — the `as` target | direct | 212 | — | — | **212** | **0** | **212** | **17** |
+| c2 | `checkFuncDeclNode` RETURN | memoized | 2,199 | 2,045 | 1 | **153** | 196 | 6 | 25 |
+| c11 | if-chain exhaustiveness scan | direct | 91 | — | — | **91** | 13 | 78 | 35 |
+| c12 | `match` TYPE pattern | direct | 87 | — | — | **87** | **0** | **87** | 25 |
+| c15 | `canonEmitTypeNames`' `&`-fold | direct | 25 | — | — | **25** | 72 | 6 | 11 |
+| | **total (depth 0)** | | **31,585** | **13,736** | **15** | **17,834** | **18,752** | **8,186** | |
+
+* **THE `is` TEST IS RESOLVED THREE TIMES PER NODE.** c9, c10 and c13 are 2,175 / 2,163 / 2,145
+  parses with **the same 1,707 minted entries each** and near-identical spelling distributions
+  (`diff` of the two collectors' text histograms moves five rows by ≤5). The narrowing collectors and
+  the node checker each resolve the same `is` type independently. As a family: **6,574 of 17,834,
+  36.9% of the checker's whole parse population** — bigger than any single caller and bigger than the
+  entire memoized route.
+* **THE MEMO IS DOING ITS JOB WHERE IT EXISTS.** The four memoized sites reach 16,844 times and parse
+  3,093 (18.4%); the pass-1.5 hoist parses FIRST (c3+c4 = 2,589) and the real pass then hits
+  (c1 95.2% hit, c2 93.0%). The double pass is already collapsed — there is no second rung there.
+* **MINT-FREE IS NOT RARE HERE.** 8,186 of 17,834 (45.9%) parses grow `T.tys` by zero, against
+  1,342 of 3,031 (44.3%) on the emit side — the same ratio, arrived at independently.
+
+### 4. THE COLUMN THAT DECIDES THE WHOLE SIDE — the LEG
+
+`annotResolve` is a two-leg ladder:
+
+```
+function annotResolve(name: string, root: i32) {
+  if root >= 0 { return tsToTy(root) }   // the parser's banked SPELLING TREE
+  nameToTy(name)                          // the STRING
+}
+```
+
+`tsToTyReal` walks the tree and bottoms out at `tsLeafTy`, which inspects no character. `nameToTyReal`
+is the string parser: `tyTopLevelSplit` on `|`, the `&` fold, the `[]` suffix, the `{`-shape scan, the
+`<`-application. The emit side's seven sites all reach through the exported `resolveAnnot`, which
+passes `root = -1` — *"a post-canon emit-time name has no live tree"* — so **all 1,846 emitter parses
+are STRING parses**. The checker's are not:
+
+| leg | checker parses (depth 0) | share |
+|---|---:|---:|
+| `r1` — the spelling TREE (`tsToTy`) | **17,832** | **99.99%** |
+| `r0` — the STRING (`nameToTy`) | **2** | 0.01% |
+
+And the string parser's own counter, over the whole corpus: **`nameToTy` is entered 54 times, 23 of
+them outermost.** Every one of the 23, printed:
+
+| site | parses | minted | spellings |
+|---|---:|---:|---|
+| `unionMemberGenAppShape` (`typecheck.vl:9149`) | **21** | **0** | `Box<i32>` ×17 · `Cell<string>` · `Pair<i32,string>` ×2 · `Box<Node>` |
+| `canonEmitTypeNames`' `&`-fold (`typecheck.vl:9786`) | **2** | 6 | `A&B` (m1) · `(2\|3)&!3` (m5) |
+| `recordClonedNodeTy` (`typecheck.vl:17926`) | **0** | — | the monomorphizer; never runs under `vl check` |
+| **total** | **23** | **6** | 31 more `nameToTy` entries are the recursion INSIDE those 23 |
+
+**THE CHECKER PARSES 23 TYPE STRINGS IN 1,737 FILES.** The owner's directive — *"if we're ever
+parsing strings for types (outside the actual parser), we're doing it wrong"* — is satisfied on this
+side to within 23 reaches of zero, and has been for as long as the spelling tree has been threaded
+(D-PARSETY / D-ASCANON). **The 2,963 in the frontier table and the 1,846 beside it are different
+units**, and the sentence that put the checker "above" the emitter compared a tree walk to a string
+parse.
+
+*(Both `&`-fold strings are the arm D-CANONFOLD already filed as the checker's last whole-annotation
+re-parse, at 25 reaches. It re-derives here at 25 reaches / 2 name-leg parses, and is 0.01% of the
+checker's population.)*
+
+### 5. BY TEXT, AND THE TWO NAME RUNGS PRICED AT EVERY SITE
+
+The record carries `cUserTypes[name]` and `primTyOfName(name)` read BEFORE the call and the resolved
+answer after it, so both of the emit side's shipped rungs are dual-written here for free:
+
+| rung | covered parses | **agree** | **DISAGREE** | mint-free |
+|---|---:|---:|---:|---:|
+| `primTyOfName` — the PRIMITIVE leaf (#1332's rung 2) | **5,105** of 17,834 | **5,105** | **0** | 4,970 |
+| `cUserTypes` — the DECLARED name (#1331's rung 1) | **3,135** of 17,834 | 2,790 | **345 (11.0%)** | 2,988 |
+| neither | 9,594 of 17,834 | — | — | 228 |
+
+* **THE PRIM RUNG IS SOUND AND BUYS NOTHING.** 5,105 covered, zero disagreements — #1332's key-space
+  argument holds unchanged (no declaration can be spelled with a reserved word). But `tsLeafTy`'s
+  FIRST line **is** `primTyOfName`, with `tpEnvTyOfName` and `declaredTyOfName` below it. On the emit
+  side rung 2 deleted a string parse; here it would delete three function calls above a lookup that
+  already answers. *#1332's rung was a shortcut past the GRAMMAR; on this side there is no grammar
+  between the caller and the answer.*
+* **THE DECL RUNG IS REFUTED HARDER HERE THAN AT THE EMITTER, AND FOR A SECOND MECHANISM.** #1331
+  refused it at `repElemKeyOfNameTy` on **4 disagreements in 976**, one spelling (`FView`). Here it is
+  **345 in 3,135**, at 13 of the 16 sites, with two distinct causes and named witnesses:
+  the NEWTYPE brand `declaredTyOfName` applies and `cUserTypes[name]` does not
+  (`RowAddr` ×8 — `type RowAddr = new i32`, `tests/cases/memory/flat-fused-row-import/lib.vl`;
+  `F32View` ×31; `I32`/`I64`/`F32`/`F64` ×4 each; `EntityId`, `IView`, `Brand`), the TRANSPARENT
+  single-member alias (`MyCat` ×13 at c9 and ×13 at c13 —
+  `type MyCat = Cat`, `tests/cases/types/struct-alias-transparent.vl`), and — the mechanism the
+  emitter structurally cannot have — a LIVE type-parameter environment, since `tsLeafTy` asks
+  `tpEnvTyOfName` BEFORE `declaredTyOfName` and `cUserTypes` would shadow a bound parameter
+  (`T`, `F`, `Z`, `S`, `J`, `Y`, `L`, `M`, `P`, `G`, `Both<T>`). *The emitter resolves after every
+  binding is gone; the checker resolves inside them, and a table keyed on the declaration alone
+  cannot be right there.*
+
+The by-TEXT shape per caller is what says which sites are long tails and which are vocabularies:
+
+| caller | parses | distinct | head spelling | head share |
+|---|---:|---:|---|---:|
+| c8 `as` target | 212 | **17** | `i32` 88 | 41.5% |
+| c5 struct FIELD | 1,133 | 132 | **`i32` 817** | **72.1%** |
+| c9/c10/c11 the `is` READERS | 4,429 | 304 | `i32` 518 | 11.7% |
+| c7 `let` annotation | 4,529 | **1,139** | `f32` 167 | **3.7%** |
+| c6 struct-member `let` | 1,284 | 507 | 110 | 8.6% |
+| c3 hoist param | 1,549 | 521 | 384 | 24.8% |
+
+c8 is a closed vocabulary of 17 — 175 primitive keywords + 37 declared names = **212 of 212, 100%
+covered by the two-rung ladder, and 212 of 212 mint-free**. c7 is the opposite: 3.98 parses per
+spelling, 7,586 arena entries minted, D-ROWS12's row-2 mechanism on the checker's side of the
+compiler — *the parse IS the derivation*, and 74% of it mints.
+
+### 6. THE ONE TAKEABLE ROUTE — `is` is resolved three times and the node already banks the answer
+
+`checkIsExprNode` ends by BANKING its resolved check type on the `is` node
+(`isVarTyIx[ix] = chkTy`, `typecheck.vl:21984`; read back through the exported `isVarTyIxOf`, which
+`wasmEmit.vl` and `emit_classify.vl` already consume at nine sites). The two narrowing collectors and
+the exhaustiveness scan re-resolve the same spelling on the same node instead of reading it.
+
+Measured at the RAW ARENA INDEX — the tightest tolerance available, since equal indices make every
+consumer projection equal by construction — with the bank read BEFORE the call:
+
+| reader | parses | bank covers | **index-identical** | **disagree** | mint-free |
+|---|---:|---:|---:|---:|---:|
+| c9 `collectThenNarrows` | 2,175 | 2,174 | 1,232 | 942 | 1,233 |
+| c10 `collectElseNarrows` | 2,163 | 2,162 | 1,220 | 942 | 1,221 |
+| c11 if-chain exhaustiveness | 91 | 91 | 78 | 13 | 78 |
+| **total** | **4,429** | **4,427** | **2,530** | **1,897** | **2,532** |
+
+and the two columns partition **exactly**:
+
+| the 4,427 bank-covered reader parses | count | verdict |
+|---|---:|---|
+| **MINT-FREE and index-identical to the bank** | **2,530 of 2,530 — 0 disagreements** | **TAKEABLE** |
+| MINTING, index differs by construction | 1,897 of 1,897 — 0 agreements | a duplicate MINT |
+
+**EVERY DISAGREEMENT IS A DUPLICATE MINT, AND EVERY MINT-FREE READ AGREES.** There is no third case.
+The mint-free half is `i32` 518 · `string` 339 · `K` 198 · `i64` 177 · `boolean` 148 · `Cat` 148 ·
+`f64` 138 · `K0` 124 · `A` 105 · `Dog` 88 · `f32` 60 · `B` 60 · `C` 52 · … — primitives and declared
+names, which `tsLeafTy` answers from a seeded or registered index. The minting half is `{w:i32}` 152 ·
+`{foo:string}` 60 · `{[string]:i32}` 46 · `()=>i64` 40 · `i32[]` 38 · `{f:K0}` 36 · `("pp"|"qq")` 36 —
+inline shapes, arrays, closures, maps, literal unions, and **the tree walk mints a fresh entry for
+each of the three readers**, so one `is {w: i32}` costs three structurally identical `TyObj` rows.
+
+**2,530 of 17,834 (14.2%) is the takeable population on the corpus. On the compiler's own source it
+is 12,661 of 21,609 (58.6%), with 12,661 of 12,661 index-identical and 0 disagreements** — see §7.
+
+The 1,897 minting reads are NOT takeable, and the reason is #1331's gate exactly: skipping them
+removes `T.tys` entries and renumbers every arena index after them. That the removed entries are
+DUPLICATES makes the change desirable and does not make it neutral — it is a rep change, and it is
+filed here rather than taken.
+
+*(Two further readings, banked so the next slice does not re-derive them: `checkIsExprNode` itself
+finds a bank already present on **920 of its 2,145** reaches — the `is` node is re-checked — and
+agrees on 486 of those, disagreeing on the 434 that mint. The `match` TYPE pattern (c12) writes its
+own bank at `typecheck.vl:21030` and so reads it on only 14 of 87; all 87 are mint-free.)*
+
+### 7. THE SAME CENSUS ON THE LARGEST SINGLE PROGRAM — the compiler itself
+
+```
+run: vl check compiler/entry.vl --compiler C-zzc.wasm
+```
+
+| | reaches | hit | **parses** | minted | mint-free |
+|---|---:|---:|---:|---:|---:|
+| the four MEMOIZED sites | 14,030 | 13,981 | **49** | 4 | 45 |
+| the eleven DIRECT sites | 21,560 | — | **21,560** | 2,199 | 19,366 |
+| **total (depth 0)** | **35,590** | **13,981** | **21,609** | **2,203** | **19,411** |
+| the `is` family (c9+c10+c11+c13) | 18,993 | — | **18,993** | **0** | **18,993** |
+| **STRING parses (`nameToTy`)** | — | — | **0** | — | — |
+
+* **THE COMPILER'S OWN 39k LINES PARSE ZERO TYPE STRINGS.** `nm=0`. (#1327 measured the same program
+  at *"the checker 49"* in the memoized unit — that number re-derives here to the digit, 49, and is
+  0.23% of the program's actual 21,609.)
+* **THE `is` FAMILY IS 87.9% OF IT AND 100% ARENA-NEUTRAL.** Every one of the 18,993 mints nothing:
+  a self-hosting compiler's `is` tests are all against DECLARED node types, 48 distinct spellings.
+  The three readers are **12,661 parses, 12,661 bank-covered, 12,661 index-identical, 0
+  disagreements** — the route of §6 at 58.6% of the whole program with a perfect reading.
+* The DECL rung covers 19,212 here with **0 disagreements**, which is not a reprieve for it: this
+  program declares no newtype over a struct and spells no bound type parameter where the census
+  looks. *A rung refuted by 345 witnesses in one population and clean in another is refuted.*
+
+### 8. THE CHECKER-SIDE FRONTIER — the verdict per route
+
+| # | route | parses | of 17,834 | mint-free | verdict |
+|---|---|---:|---:|---:|---|
+| 1 | the `is` triple resolution — READ the `isVarTyIx` bank at c9/c10/c11 | **4,429** | 24.8% | 2,530 | **TAKEABLE for the 2,530** — 2,530 of 2,530 index-identical, 0 disagreements, on the corpus AND on the compiler (12,661 of 12,661). The other 1,897 MINT: skipping them deletes duplicate arena entries and renumbers — **BLOCKED** by #1331's gate. |
+| 2 | c7 `checkLetDeclNode`'s annotation | **4,529** | 25.4% | 1,180 | **REFUTED** — 1,139 distinct spellings for 4,529 parses (head 3.7%), 7,586 entries minted. D-ROWS12's row-2 mechanism on the checker's side: the parse IS the derivation, and there is nothing banked to read instead. |
+| 3 | the hoist pass — c3 + c4 | **2,589** | 14.5% | 1,190 | **AT ITS FLOOR** — the memo already collapses the double pass (c1 95.2% hit, c2 93.0%). The hoist parses first BECAUSE it runs first; a second cache over the same key buys 0. |
+| — | c5 struct FIELD (`i32` ×817 of 1,133) and c8 `as` (17 spellings, 212 of 212 mint-free) | 1,345 | 7.5% | 1,166 | **REFUTED AS A DESTRINGIFY** — 100% and 82% covered by `primTyOfName`, 0 disagreements, and `tsLeafTy` asks `primTyOfName` on its first line. A sound rung over a lookup that already answers. |
+| — | the `cUserTypes` rung, anywhere | 3,135 | 17.6% | 2,988 | **REFUTED** — 345 disagreements (11.0%), two mechanisms, named witnesses. |
+| — | **STRING parses** | **23** | **0.13%** | 21 | **IRREDUCIBLE, and already at the floor** — 21 are `unionMemberGenAppShape`'s generic-application probe, 2 are the filed `&`-fold. |
+
+**IS THERE A RUNG? ON THE PROGRAMME'S OWN QUESTION, NO — THE CHECKER IS AT 23 STRING PARSES IN 1,737
+FILES AND THE POPULATION IS IRREDUCIBLE.** The 17,834 that the frontier's unit counts are
+spelling-tree walks that inspect no character; the two name rungs that took emitter rows are, here,
+one sound-but-empty (`primTyOfName` is already the first line below) and one refuted with 345
+witnesses (`cUserTypes` cannot see a brand or a type-param binding).
+
+**ON THE ADJACENT QUESTION — REDUNDANT RESOLUTION — YES, AND IT IS LARGE.** The same `is` spelling is
+resolved three times per node, the third resolution BANKS its answer on the node, and 2,530 of the
+corpus's 4,429 reader parses (12,661 of 12,661 on the compiler itself) would return the identical
+arena index from that bank with zero measured disagreements. That is a different ledger from this
+programme's — it removes tree walks and duplicate arena rows, not string parses — and it is filed
+with its denominator so whoever takes it knows the shape of the half that cannot come with it.
+
+### 9. GATE — census-only branch
+
+Doc-only. No `compiler/*.vl` change ships: the probe was reverted before the commit
+(`git checkout compiler/typecheck.vl`, worktree clean) and `build/vl-compiler.wasm` was restored from
+the saved pre-probe artifact and `cmp`-verified byte-identical, so the branch differs from master in
+this one file and the compiler is master's by construction.
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `scripts/refresh-compiler.sh` (fetches `seed-latest` first) | 0 | fresh seed **1,137,213 B**, self-compiling to **1,137,213 B** — master is its own fixpoint, so the census base IS master's published compiler |
+| corpus A/B six channels | — | **VACUOUS AND SAID SO.** `git diff master -- compiler/ std/` is empty and the built compiler is byte-identical to master's. An A/B of a compiler against itself is 0 by construction. Not banked. |
+| fuzz A/B | — | vacuous for the same reason, not banked |
+
+**BYTE DELTA: 0 B.**
+
+### METHOD NOTES
+
+* **A CENSUS PLACED AT A CACHE MEASURES THE CACHE, NOT THE WORK.** Ten slices measured this side
+  through `resolveAnnotTs`, because that is where the memo is and where the classification exits
+  already existed. Eleven of the checker's fifteen call sites do not go through it, and they are
+  14,741 of the 17,834 parses — 82.7% of the population, in a row published as the programme's
+  largest. *Before bucketing a funnel, enumerate the callers of the thing the funnel wraps and check
+  that the funnel is on all of their paths; an unattributed-caller bucket that reads 0 is what proves
+  it.*
+* **TWO COLUMNS IN THE SAME TABLE CAN BE DIFFERENT UNITS.** `2,963` and `1,846` were ranked against
+  each other for three slices. The emitter's are string parses (`root = -1` at every one of its
+  sites, by construction — a post-canon name has no tree); the checker's are 17,832-of-17,834 tree
+  walks. One boolean per record settles it, and it is the same shape as #1327's own finding one level
+  down. *When a scorecard's rows come from different callers of one function, print the ARGUMENT that
+  selects the function's leg — a shared name is not a shared unit.*
+* **A SOUND RUNG OVER A LOOKUP THAT ALREADY ANSWERS BUYS NOTHING, AND THE KEY-SPACE ARGUMENT WILL NOT
+  TELL YOU.** `primTyOfName` covers 5,105 checker parses with 0 disagreements — #1332's exact
+  soundness case, reproduced. It is still refuted, because `tsLeafTy`'s first line is
+  `primTyOfName`. D-ROWS12 recorded that a closed key space is necessary and not sufficient, and
+  named the missing precondition as "does the arena already hold the answer at a stable index"; this
+  is a THIRD precondition — *is there anything between the caller and the answer to skip?* Read the
+  callee's first line before pricing a rung above it.
+* **AN INSTRUMENT'S REPORTING CHANNEL MUST BE CHECKED AGAINST THE CODE IT REPORTS FROM.** #1332's
+  landmine is `tErr`'s exact-repeat dedup. This checker has a second and worse one: three regions
+  that POP `T.diags` back and one that branches on its LENGTH. A probe that raises inline would have
+  lost records to the pops and silently disabled `validateEscJoins` through the gate — and the record
+  count would have looked plausible either way. *Grep the channel you are writing into for its own
+  readers before you write into it; a diagnostic list that something else pops or measures is not a
+  log.*
+* **THE ROUTE WORTH FILING WAS IN THE COLUMN THAT LOOKED LIKE THREE SEPARATE ROWS.** c9, c10 and c13
+  sit apart in the by-caller table at 2,175 / 2,163 / 2,145 and look like three medium sites. They are
+  one `is` node resolved three times, they mint the same 1,707 entries each, and the third of them
+  banks the answer the other two recompute. *When three rows in a census carry the same mint total,
+  they are one population — check whether one of them already stores what the others derive.*
+* **A MEASURED NEGATIVE IS CHEAPEST WHEN IT NAMES WHAT WOULD HAVE BEEN BUILT.** The brief for this
+  slice was to find the checker's rung. There is none for string parsing, and the evidence is 23
+  reaches in 1,737 files — but the same probe, at no extra cost, priced both emit-side rungs on this
+  side (one empty, one refuted with 345 witnesses) and found a 2,530-parse redundancy in an adjacent
+  ledger. *Instrument the sites you are about to PRICE, not only the ones you are about to change —
+  three consecutive slices have now found their best fact in a column added for a control.*
+
+<!-- APPEND-MARKER-CHECKPARSE-END -->
