@@ -306,7 +306,7 @@ ring and for the differential harness to diff columns.
 > build against the pre-view std. Same flag, second reason: the release profile
 > is what makes both the wrapper calls and the unused surface disappear.
 
-### P1.2 Flat record layouts (AoS tier — the Lua VM's requirement)  🟡 SHIPPED, minus `rows<T>` and the bracket
+### P1.2 Flat record layouts (AoS tier — the Lua VM's requirement)  ✅ SHIPPED, `rows<T>` and the bracket included — as a CONTAINER, never as a method
 
 ```vl
 flat type TValue = { value: i64, tt: i32, pad: i32 }   // explicit order, fixed size 16
@@ -325,8 +325,11 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 - Can ship after P1.1 (views cover SoA, which is most of the kernel); the
   Lua VM port is blocked on this specifically.
 
-> Maintainer's note (vl side): **the DECLARATION ships — with its layout readable
-> — and it cost the emitter nothing. `rows<T>` and `stack[i].tt` do not.**
+> Maintainer's note (vl side): **every capability in this section ships — the
+> declaration (#1278), the fused `stack[i].tt` access (#1317), `T.size` for a live
+> type PARAMETER (#1329), and the branded `rows<T>` container (#1335).** The one
+> thing refused is the literal SPELLING `buf.rows<TValue>(…)`, and it is refused by
+> design rather than by phase (last bullet).
 > `docs/internals/flat-records-design.md` is the design record.
 >
 > ```vl
@@ -353,7 +356,7 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 > `align`/`packed` modifiers are deferred, not rejected — no-implicit-padding is
 > the forward-compatible half.
 >
-> Four things to design around:
+> Five things to design around:
 >
 > - **Fields are `i32`/`i64`/`f32`/`f64`, a newtype over one of those, or another
 >   `flat` type** (which inlines — `Outer.k + Inner.a` composes by addition, so
@@ -367,33 +370,72 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 >   still an ordinary record — struct literal, parameter, return, nested field,
 >   array element — and it emits BYTE-IDENTICALLY to the same declaration with
 >   `flat` deleted. No `emit_*.vl` or `wasmEmit.vl` file changed.
-> - **`buf.rows<T>(off, count)` is NOT here.** It needs `T.size` to answer for a
->   type PARAMETER at each instantiation, which needs generic `flat` types (a type
->   parameter has no width, so they reject today) and a fold that runs after
->   monomorphization. Filed with the design.
-> - **`stack[i].tt` is NOT here, but its blocker is gone.** B14's free INDEX
->   OPERATORS now ship (`index-operator-design.md`), so `stack[i]` is writable the
->   moment `Stack` has a `function "[]"(self: Stack, i: i32): Row`. What remains is
->   the SECOND half, and it is the interesting one: `.tt` on that row must be an
->   offset add rather than a materialized value. With `flat` constants that looks
->   natural — have the operator return a row-ADDRESS newtype and give the field
->   accessors offsets off it — and it is now a design question rather than a
->   blocked one.
+> - **`rows<T>` ships as a generic CONTAINER — and both blockers this bullet used to
+>   name are dead** (#1329, #1335). `T.size` and `T.<field>` answer for a live type
+>   PARAMETER: they fold per monomorphized INSTANCE, so one generic accessor serves
+>   every flat record and two records of different stride cannot share an instance
+>   (`tests/cases/memory/flat-generic-rows-stride.vl` pins exactly that). Generic
+>   `flat` types were never on the path — `rows<T>` indexes CONCRETE flat records and
+>   resolves them by name at the instance — so §3's reject stands and costs this
+>   nothing (`flat-records-design.md` §11.4). §10's shape, whole:
 >
-> **What that leaves you with today is the whole Lua accessor set, hand-written
-> once per record**, with every address derived from the declaration — pinned as
-> `tests/cases/memory/flat-lua-tvalue-accessors.vl`:
+>   ```vl
+>   type Rows<R, A> = { base: i32, count: i32, brand: A }
+>   function "[]"<R, A>(self: Rows<R, A>, i: i32): A { return self.base + i * R.size }
 >
-> ```vl
-> function slotAt(s: Stack, i: i32) { return s.base + i * TValue.size }
-> function tagOf(s: Stack, i: i32) { return __load_i32__(slotAt(s, i) + TValue.tt) }
-> ```
+>   const st: Rows<TValue, TVAddr> = { base: 1024, count: 4, brand: 0 }
+>   const nd: Rows<Node,   NodeAddr> = { base: 2048, count: 4, brand: 0 }
+>   print(tt(st[2]))    // stride 16 — the same operator strides `nd` by 8
+>   print(tt(nd[2]))    // argument 1: expected TVAddr, got NodeAddr
+>   ```
 >
-> What `rows<T>` and the bracket would delete from that file is the last two
-> accessors PER FIELD. That is boilerplate, not expressiveness — which is the
-> measurement that decided the phasing. The thing the declaration removes is the
-> failure mode: today those `16`s and `8`s are literals hand-computed from a layout
-> written down nowhere, and adding a field silently makes every one of them wrong.
+>   **Name the brand in the BODY, not merely as a type argument.** With
+>   `type Rows<R, A> = { base: i32, count: i32 }` the crossing on the last line
+>   COMPILES: a generic alias application expands into its body, so there is no type
+>   variable left in it to unify `A` against, and an unbound parameter is assignable
+>   to everything. `R` stays phantom deliberately — the monomorphizer binds it by
+>   NAME, and that is the layer that folds `R.size`. Pinned in both directions by
+>   `flat-generic-rows-branded{,-bracket}.vl` and their `-crosses-rejected` twins;
+>   the mechanism is `flat-records-design.md` §11.3.
+> - **`stack[i].tt` ships as a LIBRARY IDIOM, for zero compiler lines** (#1317).
+>   B14's free index operators (#1280) give `stack[i]`; the second half is answered
+>   by having `"[]"` return a row-ADDRESS newtype and hanging the field accessors off
+>   it, so `.tt` is an offset add and never materializes a row. `st[i].tt()` is
+>   `cmp`-IDENTICAL to its unbranded, unbracketed twin `tt(slotAt(st, i))` at `-O0`
+>   AND at `-O3` — byte-for-byte the same module, because the brand is erased before
+>   the emitter runs and the bracket is rewritten to a direct call before lowering.
+>   Under `-O3 --closed-world` both functions inline away and the access is a shift,
+>   an add and an `i32.load`. **Two characters diverge from your spec:
+>   `stack[i].tt()`, not `stack[i].tt`** — VL's UFCS is call-style, so the field
+>   spelling is a loud checker reject (`member access '.tt' on non-object RowAddr`),
+>   and that reject is load-bearing: branding the address over a STRUCT instead would
+>   make `.tt` resolve as a real field read of a materialized row, i.e. compile and
+>   be slower. Closing it for real means field-position UFCS, a language-wide change
+>   to member resolution — filed, not fixed (`flat-records-design.md` §9.1).
+> - **`buf.rows<TValue>(off, count)` as spelled is a WON'T-FIX, and the reason is not
+>   phasing: VL has no call-site type arguments.** `f<T>(x)` lexes as two
+>   comparisons, so `rows<TValue>(…)` is `undeclared identifier 'TValue'` — VL's
+>   generics are inference-only, `<T>` appears in declarations and annotations and
+>   never at a call. Inferring `T` from the call's expected type is closed too: a
+>   type parameter that appears ONLY in a return is rejected by the monomorphizer, by
+>   name. So the capability is real and a METHOD is not a form it can take — write
+>   the container (`flat-records-design.md` §11.5).
+>
+> **What this leaves you with is one accessor set per RECORD, not per (record ×
+> container).** The honest count: the bracket deletes nothing per field — a 2-field
+> record costs 5 functions hand-written (`slotAt` + 4) and 5 fused (`"[]"` + 4). What
+> collapses is the CONTAINER dimension, N×M → N+M, because a row-address accessor
+> names no container and each container contributes exactly one `"[]"`. For the Lua
+> VM — `TValue` reachable from the stack, from a table's array part, and from a
+> `Node`'s key and value slots — M is not 1, and that is the axis that pays. Pinned
+> at M=2 by `tests/cases/memory/flat-fused-row-one-accessor-set-two-containers.vl`
+> (a `Stack` that addresses linearly and a `Ring` that masks and wraps, sharing one
+> accessor set); the `(container, index)` control is
+> `tests/cases/memory/flat-lua-tvalue-accessors.vl`.
+>
+> The thing the declaration removes is the failure mode: without it those `16`s and
+> `8`s are literals hand-computed from a layout written down nowhere, and adding a
+> field silently makes every one of them wrong.
 
 ### P1.3 Optimization defaults  🟡 PROFILE SHIPPED (`vl build -O3`) — wrappers melt, the READ union box does not
 
@@ -442,9 +484,18 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 > vl build sim.vl -O3     # --closed-world -O3 --gufa -O3, + the GC feature enables
 > ```
 >
-> `-O` is unchanged (one open-world `-O`), `-O3` wins when both are passed, and a
-> missing `wasm-opt` stays a soft no-op — a note naming the flag, the unoptimized
-> module on disk, exit 0 — exactly as `-O` already behaved.
+> `-O` is unchanged (one open-world `-O`) and `-O3` wins when both are passed.
+>
+> **A missing `wasm-opt` is a HARD ERROR** (ruled 2026-08-03, shipped as #1339 —
+> `docs/internals/open-rulings.md` records the supersession). `-O`/`-O3` are never
+> implied, so reaching the optimizer means the caller TYPED the flag, and handing
+> back an unoptimized module at exit 0 makes every downstream check believe it got an
+> optimized one — which had already produced published `-O3` timings that were re-runs
+> of the `-O0` module. The failed build also REMOVES the output file, so a caller that
+> ignores the exit status cannot find a misleading artifact either. The distinction
+> that makes this safe for you: **a default `vl build` never invokes `wasm-opt` at
+> all**, so a toolchain without binaryen still builds everything that did not ask to
+> be optimized — its own inverted-control test.
 >
 > **The melt, counted rather than asserted.** Six per-tick-scratch fixtures
 > (`tests/fixtures/opt-melt/`), each a loop that allocates and consumes scratch
@@ -803,9 +854,48 @@ and needs nothing from vl beyond scalar exports.
   > (`docs/internals/contextual-f32-literals-design.md`,
   > `tests/cases/numerics/f32-contextual-integer-literal.vl` + 4 siblings,
   > `tests/cases/unions/nullable-float-integer-literal.vl`)
-- **`match` phase 2** (variant payload binding): command dispatch
+- ~~**`match` phase 2** (variant payload binding): command dispatch
   (`match cmd { Move{x,y} => …, Attack{target} => … }`) is the natural shape
-  for the order pipeline; if-chains work meanwhile.
+  for the order pipeline; if-chains work meanwhile.~~ **DONE**, both halves — the
+  struck example compiles and runs verbatim, on one line with the comma or one arm
+  per line. Three slivers remain, listed below.
+  > **Phase 2a — VALUE-union scrutinees (#1131).** `match` dispatches over EVERY
+  > union, not only literal ones: struct unions (`C | D`), scalar unions
+  > (`i32 | string`), mixed, and both `| null` spellings. An arm's pattern is a TYPE
+  > and the parser mints it as a real `IsExpr` over the scrutinee, so the arm rides
+  > the existing `x is T` machinery end to end — narrowing, emit ABI, module-merge
+  > rename, lint. **Exhaustiveness is the point**: a missing member is a compile
+  > error naming it (`non-exhaustive match — missing {c: i32}`), where the `is`-chain
+  > this replaces has none.
+  >
+  > **Phase 2b — PAYLOAD BINDING (#1283).** An arm narrows AND binds in one form.
+  > The lowering adds no machinery: the arm is already `if scrut is Move { … }`, so
+  > the desugar PREPENDS `const x = scrut.x` statements to that block. Measured, not
+  > asserted — 18 grid cells each compile BYTE-IDENTICAL to their hand-written
+  > if-chain twin. Pinned by `tests/cases/match/payload-binding-*.vl` and
+  > `value-union-*.vl`.
+  >
+  > **What is left, in the order it will bite you:**
+  >
+  > - **A binding arm cannot sit in a `const` INITIALIZER.** `const r = match u { … }`
+  >   is fine while every arm is a single expression, but the moment an arm binds, the
+  >   desugar's prepended `const x = scrut.x` makes that arm a multi-statement block
+  >   and the if-EXPRESSION lowering refuses it:
+  >   `emitProgram: if-expression arm is not a single value`. It is an emit-time
+  >   error, not a checker one. The workaround is one line — declare the result
+  >   `let r = 0` and use the match in STATEMENT position, assigning in each arm —
+  >   but the value-position spelling is the one you will reach for first.
+  > - **Arm renaming** `Move{x: a}` — punning only. A parse error
+  >   (`match payload binding must be a field name`), and the fix is one parser branch
+  >   plus a formatter that prints `field: name` when the two differ.
+  > - **Nested destructuring** `Move{p: {x, y}}` — same reject; a real feature (the
+  >   binding's initializer becomes a `Member` CHAIN and the checker has to narrow
+  >   through it), deferred until a concrete need appears.
+  >
+  > Also refused, each deliberately and with one error: a payload clause on an OR arm
+  > (a multi-pattern arm gets no then-narrowing, so `scrut.x` cannot type), a
+  > duplicate binding, a body declaration shadowing a binding, and an unknown field.
+  > `docs/internals/match-design.md` is the design record.
 - **Literal-union compact representation** (A16 remaining): order/state enums
   stored as i32 tags rather than softened values — mostly a memory nicety
   since authoritative enums live in Buffers anyway.
@@ -840,8 +930,36 @@ and needs nothing from vl beyond scalar exports.
   not requested now. Same for engine-level threads/atomics: webcraft's
   topology keeps the sim single-threaded on principle.
 - **Guest profiling parity in browser**: `VL_PROFILE_GUEST` exists for
-  wasmtime; in-browser we'll use DevTools + the names section. Ask is only:
-  keep emitting a names section on non-`-O` builds.
+  wasmtime; in-browser we'll use DevTools + the names section. ~~Ask is only:
+  keep emitting a names section on non-`-O` builds.~~ **There is no such state to
+  keep — the name section is off by DEFAULT, at every optimization level. Pass
+  `--names`; the subsection below is the whole answer.**
+
+### The `name` section is OPT-IN — build the profiling artifact with `--names`  ✅ ANSWERED (no vl change)
+
+> Maintainer's note (vl side): **the ask describes a state that does not hold. The
+> name section is off by default on every build — `-O` has nothing to do with it —
+> and `vl build --names` is the only thing that turns it on.**
+>
+> `compiler/emit_sections.vl` gates the emitter on `gEmitNames` (initial `0`) and the
+> compiler driver NEVER sets it. The single opt-in is the host calling the exported
+> `setEmitNames(1)`: `vl build --names` does, and so does `vl run` (legible traps are
+> the point there, and that module is never written to disk). Measured on a
+> two-function module: a plain `vl build` writes **79 bytes** with no name section,
+> `--names` writes **112** with `addTwo` in it.
+>
+> **The default is not going to flip, and the price is measured rather than feared.**
+> The compiler seed is itself built with a plain `vl build`; building
+> `compiler/entry.vl --names` costs **1,197,510 bytes vs 1,137,213 — +60,297 bytes,
+> +5.3%**. That is a tax on every seed download, on the embedded-seed binary and on
+> the playground payload, paid by everyone who is not profiling. Byte-identity of the
+> default emit path is also what the self-compile fixpoint stands on (stage3 ==
+> stage4, byte-for-byte), so the flag is what keeps a profiling build from moving it.
+>
+> **So the resolution is one word at the command line: build the profiling artifact
+> with `vl build sim.vl --names` and ship the default build to production.** DevTools
+> gets the function names, nobody else pays the 5%.
+> `docs/internals/selfhost-name-section.md` is the design record.
 
 ## Non-asks (deliberate)
 
@@ -867,13 +985,14 @@ and needs nothing from vl beyond scalar exports.
   opcode intrinsics). Port order — pathing first (hottest, most
   self-contained, exercises views hard), then kernel stores, then wc3
   systems; each stage behind the per-tick differential hash.
-- **Lua VM in vl**: needs P1.2 flat records — **the layout half of which now
-  exists**, so `Table`/`Node`/`TValue` can be declared once and addressed through
-  derived constants. What is still hand-written is one accessor pair per field
-  (`rows<T>` and `stack[i].tt` are filed); that is boilerplate, so the port is no
-  longer blocked, only more verbose than it will be. Until it happens the Lua
-  runtime stays TS even if the kernel has ported (the pump doesn't care which side
-  of the boundary each module lives on — the state arena format is shared).
+- **Lua VM in vl**: needs P1.2 flat records — **which now ship whole**, so
+  `Table`/`Node`/`TValue` are declared once, addressed through derived constants, and
+  reached as `st[i].tt()` through one branded `Rows<R, A>` container per access
+  pattern. What is still hand-written is one accessor per field, which no longer
+  multiplies by the number of containers a record is reachable from (N×M → N+M) —
+  the axis that mattered for `TValue`. The port is not blocked. Until it happens the
+  Lua runtime stays TS even if the kernel has ported (the pump doesn't care which
+  side of the boundary each module lives on — the state arena format is shared).
 - **MP servers**: the vl artifact needs zero additions (same wasm under
   Node/workerd; wasmtime once its WasmGC matures — vl already pins 47, which
   runs the copying collector cleanly).
