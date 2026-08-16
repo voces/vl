@@ -2705,3 +2705,115 @@ global table; the gated second search path in `emitStrIndexOf`; and the
 (the shift table built naively gets this wrong), the needle at the very last
 start, and single-character needles. `indexOf` is on the self-hosted compiler's
 own hot path, so none of that is worth doing at less than full gate coverage.
+
+---
+
+## 15. PERF item P7 — and it is NOT the item that was filed
+
+`perf-landscape.md` §5 filed **P7 as "cache a string's hash instead of
+recomputing it per probe"**, sized at up to 4.6x on long keys. **What shipped
+under that name is a different change**: `__str_hash__`'s FNV-1a walk now hashes
+four code points per loop iteration instead of one — the same shape `__str_eq__`
+took in P3. It is worth **1.135x**. The landscape splits the two as **P7a**
+(this, shipped) and **P7b** (the cache, untouched and still open); read this
+section as P7a's record and nothing more.
+
+**Why the smaller change was the one to take.** A cache needs somewhere to put
+the hash — a field on every string, a side table, or an interning scheme — plus
+an invalidation story. This compiler is **WasmGC-allocation-bound**, so widening
+every string in the language to carry a hash slot is an allocation-size change
+across the whole program, and `string` is `(array (mut i32))` today: a bare
+array with no header to put a slot in. The unroll needs none of that.
+
+### 15.1 What shipped
+
+`emitStrHashFnCode` (`compiler/emit_sections.vl`) emits two loops where it
+emitted one: a **wide block** running four chained FNV steps while `i <= lim`,
+then a **scalar remainder loop** for the tail. `n` is hoisted into a local. The
+locals run goes 3 → 4 (`h`, `i`, `n`, `lim`).
+
+Two properties carry the correctness, and both are structural rather than
+asserted:
+
+- **`lim = n - 4` is a SUBTRACTION, deliberately.** `n` is an `array.len`, so the
+  natural spelling `i + 4 <= n` could **wrap** on a maximal-length string; the
+  subtraction cannot. It also gives the short-string case for free: for `n < 4`
+  the limit goes negative, `i > lim` holds at `i = 0`, and every element is
+  answered by the remainder loop — a short string skips the wide block instead of
+  paying a wasted test.
+- **The step is factored into `fbStrHashStep(k)` and SHARED** by the unrolled
+  block and the remainder loop, so the two cannot drift into hashing differently.
+  That failure mode is a **silently wrong hash, not a crash** — every map and set
+  in every VL program would still run, and would still find keys, because the
+  same wrong function is used to insert and to probe. It would surface as a
+  corpus divergence only where a hash value is observable, which is nowhere. A
+  shared emitter removes the failure mode instead of testing for it.
+
+### 15.2 Measured
+
+Hash-dominated insertion — 30k distinct long string keys × 10 rounds —
+interleaved min-of-9, every module's stdout asserted identical and non-empty
+before timing:
+
+| | min |
+|---|--:|
+| master | 109 ms |
+| this change | **96 ms** |
+| | **1.135x** |
+
+**Taken at load 3.86 on a box shared with two other agents, so it is a LOWER
+BOUND**, and it is above the suite's 7% noise floor. On a separate 1k-entry /
+8M-lookup probe at 46-char keys the walk itself goes **2.13 → 1.10 ns per code
+point**.
+
+**Why 1.135x and not more, and why no further unroll can help.** FNV is a
+**serial dependency chain** — each `i32.mul` waits on the previous `h` — so
+unrolling cannot overlap the arithmetic. What it removes is per-element loop
+control, plus the hoist of `n` (a reference local lives in a stack-map-tracked
+slot, so `local.get 0; array.len` is a memory **load** on every iteration rather
+than a loop invariant the engine can hoist). At ~3 cycles per code point the loop
+is now at the `i32.mul` latency floor: **widening to eight is measurably WORSE**
+— more code, same chain — and the loop is dependency-bound, not overhead-bound.
+
+**That floor is also the bound on P7b.** At short keys the whole walk is ~11 ns
+of a ~63 ns probe, so a perfect cache cannot be worth more than that on
+short-key workloads. P7b's filed 4.6x is a **long-key** number taken **before**
+this change halved the per-code-point cost; it has not been re-measured and
+should be re-priced before the item is taken.
+
+### 15.3 The harness
+
+`scripts/p7-*` is kept. `p7-time.sh` is the piece worth reusing: it reports
+**MIN and MEDIAN of (user+sys) CPU milliseconds** rather than wall clock — far
+less contention-sensitive on a shared box, which is this repo's normal condition
+— interleaves every module once per round, and **asserts every module's stdout is
+identical before timing anything**. `p7-gen.sh`/`p7-patch.py` generate WAT
+variants from one base; `p7-build.sh`/`p7-probe.sh` build and disassemble.
+
+### 15.4 The loop-shape gate fired, and it was checked rather than bumped
+
+`binsearch-probe`'s `none` row moved **6,3,6 → 7,4,6**. The gate's own message
+calls a `none` row that gains a rotated loop *"VL's own emitter regressing"*, so
+the move was verified per function:
+
+    $4 rot 1->1   $5 bsearch (the probe itself)  2->2 and BYTE-IDENTICAL
+    $6     0->0   $7 __str_hash__                1->2   <- the only row that moved
+    $8     2->2   $9                             0->0
+
+`$7` takes one string ref, returns `i32`, and carries the FNV prime `16777619`
+**five times** — four unrolled steps plus the remainder. **`binsearch-probe.vl`
+contains zero string operations**, so it never calls `$7`: the added loop and the
+added rotation are unreachable from that program and cost it nothing. `-O` and
+`-O3` are unchanged at 3,3,6, because both rungs already inline the helper away.
+
+**This is the SECOND time the module-wide counter has fired on the wrong axis**
+(the first was `__str_eq__`'s 8x unroll in #1328). The tightening filed at
+`tests/selfhost_native_release_test.ts` is now twice-evidenced: the counter cannot
+distinguish *"the probe's loop rotated"* — the 2.40x defect it exists to catch —
+from *"a helper this program never calls gained a loop"*.
+
+### 15.5 Gate
+
+`refresh-compiler.sh` **REFRESH_RC=0** (1,137,079 B) · full suite, serial,
+`SELFHOST_NATIVE_ALIGN=1`: **3,711 passed / 0 failed / 7 ignored** ·
+`lint-self.sh` rc 0 · release test alone 21/0.
