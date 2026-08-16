@@ -41009,3 +41009,153 @@ value is dual-written at 725 of 725.
   *Grade the instrument on the same edit you grade the change with, and read the zeros.*
 
 <!-- APPEND-MARKER-MVROWBANK-END -->
+
+<!-- APPEND-MARKER-FIELDROWMINT-BEGIN -->
+
+## D-FIELDROWMINT — B3's mint column, measured at last: 206 of the row's 220 parses MINT, and 83 of the 84 the filed remedy can actually reach. The gate HOLDS, B3 is blocked on REP grounds, and the reason the answer inverted is that #1331/#1332's own rungs ATE the arena-neutral population (census only; off master `6ef19f67`)
+
+Workboard row **B3** — `1a-v pushFieldRow`, the per-field-CODE peel table — has carried the same
+status for four slices: *"887 reaches / 256 parses = 8.4% of all emitter parsing;
+`recordUFieldElemRow` densest at 77.6%; OPEN — 'all 256 mint' is BRIEFED, unverified since #1331."*
+
+The briefing is #1327's: *"at a MISS, `annotResolve` MINTS. Every one of those 256 is the first
+resolution of that spelling in its program, so skipping it does not skip a lookup, it removes a
+`T.tys` entry and renumbers every arena index after it."* #1331 then refuted that sentence **as a
+general rule** — 1,342 of the emitter's 3,031 parses mint nothing — and measured the mint column for
+all seven `emit_rep` rows. It did **not** split row 3 by CALLER, so the two field-row recorders' own
+mint share has never been read. This slice reads it. The check is two lines: `T.tys.length` around
+the population.
+
+**Both possible answers close the row, which is why it was worth two lines.** They came out on the
+blocking side, and the row is marked so rather than left ambiguous.
+
+### 1. PROBE ZZF, AND ITS FIVE CONTROLS
+
+```
+base:   master 6ef19f67; build/vl-compiler.wasm self-compiled from a freshly fetched
+        seed-latest by scripts/agent-setup.sh (rc 0), 1,150,535 B,
+        sha256 b39bc901c5aca2cd8f79c678109850b26dc22eedc034eca259e16684ce99c80d
+probe:  one wrapper around the `fieldElemTyIxOfName` call inside EACH of the two
+        recorders (`emit_rep.recordSFieldElemRow` / `recordUFieldElemRow`), banking
+        rung 1 (`cUserTypes`), rung 2 (`primTyOfName`), the memo class taken inside
+        `typecheck.vl` where `annotNameMemo` lives, and a `T.tys.length` delta;
+        plus a `zzVia` flag set by `emit_collect.pushFieldRow` around its two calls,
+        and six cumulative counters on the exported `resolveAnnot` (the emit side's
+        only entry — its four textual call sites are all in `emit_rep.vl`)
+build:  scripts/vl-host/target/release/vl build compiler/entry.vl \
+          -o C-zzf.wasm --compiler build/vl-compiler.wasm      # 1,151,975 B
+run:    scripts/vl-host/target/release/vl check --codegen tests/cases --compiler C-zzf.wasm
+        (one compiler instance for the whole tree; rc 1, the probe reports through the
+         diagnostic channel; the LAST ZZT record is the corpus total)
+extract: grep -o 'ZZF|.*' zzf.out ; grep -o 'ZZT|.*' zzf.out
+```
+
+One record per CALL of either recorder:
+`ZZF|<seq>|c<recorder>|v<via pushFieldRow>|u<cUserTypes>|p<primTyOfName>|k<memo class>|m<T.tys delta>|a<answer>|L<len>|<spelling>`.
+The spelling is LAST because a union spelling contains `|`, and `L` is its length so a torn or
+re-rendered record is loud.
+
+**RECORDS ARE PUSHED STRAIGHT ONTO `T.diags`, NOT RAISED THROUGH `tErr`** — #1332's landmine
+(*"`tErr` DEDUPES EXACT REPEATS … one census read 481 for a population of 1,229"*) would have been
+live here: 2,510 of this population's 3,583 records are byte-identical except for their sequence
+number. The `T.diags` push bypasses `tErrCoded`'s dedup entirely, and the sequence number is the
+check that it did.
+
+| control | reading |
+|---|---|
+| **the instrument is not deduping** | the 3,583 sequence numbers are exactly 1…3,583 — **contiguous, no gaps, no repeats**. 2,510 records differ from a sibling in the seq field alone, and all 2,510 survived. |
+| **no torn record** | 3,582 of 3,583 records satisfy `len(spelling) == L`. The single exception (`ZZF\|1860`, `L8` rendering as the five visible characters `Inner`) is a diagnostic-RENDER artifact, not a tear — the host's diagnostic reader drops code points `char::from_u32` rejects. Named rather than swept: one record, all numeric columns intact, classified rung 1. |
+| **a memo hit never mints** | `T.tys` grew across **0 of 3,363** calls that were not parses — every memo hit, every negative hit, both rungs, and all 2,510 guard returns. The mint column's own zero-check, and it reads zero. |
+| **the totals reconstruct** | the 1,507 `ZZT` records are **monotone non-decreasing in all six columns**, and the final record satisfies `re == hit + neg + par + tp` exactly (12,179 = 10,166 + 98 + 1,915 + 0). |
+| **`tpEnv` is empty at emit time** | the `tp` column is **0 of 12,179**. The emitter's `resolveAnnot` calls never run under a live type-parameter binding, which is the precondition the memo classification assumes. |
+
+Denominators: **1,767 `.vl` files** under `tests/cases`, **1,507 of them reach `emitProgram`** (the
+rest stop at a check error and never emit), **762 reach either field-row recorder at all**.
+
+### 2. THE ROW, IN THREE UNITS — calls, reaches, parses — and the mint column
+
+| | **calls** | empty-name guard | rung 1 `cUserTypes` | rung 2 `primTyOfName` | memo hit | neg | **`resolveAnnot` reaches** | **PARSES** | **that MINT** | **mint-FREE** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `recordSFieldElemRow` | 2,815 | 1,851 | 174 | 191 | 438 | 3 | 599 | **158** | **145** | 13 |
+| — via `pushFieldRow` | 753 | 626 | 51 | 17 | 37 | 0 | 59 | **22** | **22** | **0** |
+| — its six direct callers | 2,062 | 1,225 | 123 | 174 | 401 | 3 | 540 | **136** | **123** | 13 |
+| `recordUFieldElemRow` | 768 | 659 | 11 | 24 | 12 | 0 | 74 | **62** | **61** | 1 |
+| **ROW TOTAL** | **3,583** | **2,510** | **185** | **215** | **450** | **3** | **673** | **220** | **206 (93.6%)** | **14 (6.4%)** |
+| **the routable subset — via `pushFieldRow`** | 1,521 | 1,285 | 62 | 41 | 49 | 0 | 133 | **84** | **83 (98.8%)** | **1 (1.2%)** |
+
+Emit-side denominator, from the same run's `ZZT` counters (all seven `emit_rep` rows, cumulative
+over 1,507 programs): **12,179 `resolveAnnot` reaches · 10,166 memo hits · 98 negative · 1,915
+PARSES (15.7%) · 1,749 of those parses MINT (91.3%)**.
+
+So the row is **220 of 1,915 = 11.5% of all emitter parsing** — it did not shrink as a share, it
+GREW, because the emit-side total fell faster than the row did (#1327: 256 of 3,031 = 8.4%). And the
+part of it the filed remedy can reach is **84 of 1,915 = 4.4%**.
+
+### 3. THE ANSWER TO THE QUESTION THE ROW WAS OPEN ON
+
+**"ALL 256 MINT" IS FALSE AS AN ABSOLUTE AND TRUE AS A DECISION.** 14 of 220 parses mint nothing —
+so the briefing was literally wrong — but the 14 are named, they are not the routable class, and
+13 of them are not even reachable through `pushFieldRow`:
+
+```
+Pair<i32,string>  x5      a generic APPLICATION re-resolving to an instance the arena already holds
+Inner<f32>        x1      the same
+#anon0/1/2        x8      the synthetic anon element names, which resolve through NEITHER path and
+                         record -1 — a failure that happens to bank no partial type
+```
+
+The other **206 mint**, adding **358 `T.tys` entries** corpus-wide (131 of them through
+`pushFieldRow`). Every one is a first resolution of that spelling in its program, so deleting the
+call removes the arena entry and renumbers every index after it — and `repElemKeyGo`'s identity arm
+keys `TyVar`/`TyLit`/`TyErr` by arena INDEX.
+
+**On the subset that is actually B3 the gate is not 93.6% but 98.8%: 83 of 84.** The single
+mint-free reach through `pushFieldRow` is one `Pair<i32,string>` at `recordUFieldElemRow`. There is
+no low-risk slice hiding inside this row.
+
+> **VERDICT: B3 IS BLOCKED, AND IT IS BLOCKED FOR THE REASON #1327 GAVE, ON A POPULATION #1327 NEVER
+> MEASURED.** Mark the row BLOCKED-REP rather than OPEN. It becomes takeable only behind B5 (the
+> mono-clone `nodeTyIx` bank), which is what would let the field's annotation NODE hand over an index
+> that is *already in the arena* instead of one the emitter has to mint.
+
+### 4. THE FINDING THAT IS BIGGER THAN THE ROW: THE TWO RUNGS ATE THE MINT-FREE POPULATION
+
+#1331 refuted the mint gate with **1,342 of 3,031 emitter parses (44.3%) minting nothing**. On this
+base it is **166 of 1,915 (8.7%)**. The gate #1331 refuted as a general rule is now true of nine
+parses in ten.
+
+**The arithmetic closes, and it closes on #1331's own numbers.** Its mint-free column was
+concentrated in exactly the two rows the next two PRs then shortcut: `unMemAtomTyIx` 804 mint-free of
+1,229, `repNameCanonKey` 224 of 228. #1331 measured rung 1 at *219 of `repNameCanonKey`'s 228 and 12
+of `repRowOfName`'s 180*, and #1332 measured rung 2 at *803 of `unMemAtomTyIx`'s 1,229 and 151 more
+across `fieldElemTyIxOfName`'s other callers* — **1,185 parses**. `1,342 − 1,185 = 157`, against 166
+measured on a corpus 22% larger (1,447 → 1,767 files). Within 6%.
+
+*A rung that removes the FIRST resolution of a declared name or a bare primitive removes an
+arena-NEUTRAL parse by construction, because the index it answers with was minted by somebody else.*
+The shortcut programme has therefore been harvesting precisely the parses that were safe to harvest,
+and what it leaves behind is, by selection, the parses that mint. Any future row that hopes to be
+arena-neutral has to name the mechanism that makes it so; the base rate is now 8.7% and falling.
+
+### 5. THE UNIT FINDINGS, RESTATED ON A THIRD ROW
+
+* **THE ROW GREW WHILE ITS CHOKEPOINT FELL, exactly as B4 predicted it would.** Filed at 887
+  `resolveAnnot` reaches; re-derives at **673 reaches** and **1,073 non-guard calls**. Rung 1 (185)
+  and rung 2 (215) now answer 400 of them above the chokepoint, and `887 × 1.22` (the corpus growth
+  factor) `= 1,082` against 1,073 measured. *The old number reconciles arithmetically; it was never
+  stale, it was measured at a different point in the ladder.*
+* **70.1% OF THIS ROW'S CALLS ARE THE EMPTY-NAME GUARD — 2,510 of 3,583 — AND NO UNIT THE PROGRAMME
+  HAS RANKED BY COULD SEE THEM.** They return -1 before touching `cUserTypes`, the memo or the
+  grammar. A routing that hands the recorder an index deletes 3,583 calls, of which 2,510 do nothing
+  at all today.
+* **"`recordUFieldElemRow` IS THE DENSEST ROW IN THE BUCKET AT 77.6% PARSES" IS AN ARTIFACT OF THE
+  REACH UNIT.** In reaches it re-derives at 62 of 74 = **83.8%**, denser still. In CALLS it is 62 of
+  768 = **8.1%**, and **659 of its 768 calls (85.8%) are the empty-name guard**. *A parse RATE whose
+  denominator is a chokepoint ranks rows by how much of their traffic the rungs above already
+  removed, not by how much work they do.*
+* **THE RESIDUAL PARSING IS STILL A UNION PROBLEM.** 135 distinct spellings across the 220 parses;
+  by shape, **146 unions**, 23 arrays, 20 inline shapes, 8 paren/function atoms, 8 generic
+  applications, 8 `#anon`, 7 maps. #1327 said this of the whole emit side; it is true of this row in
+  isolation.
+
+<!-- APPEND-MARKER-FIELDROWMINT-END -->
