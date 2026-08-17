@@ -240,6 +240,34 @@ question in two directions: does the arm claim it, and does
 directly? Byte-identity of the two programs is the cheapest way to ask — the
 branded, the aliased and the bare spellings of one type must build one module.
 
+**The one base kind the arm does NOT claim, and cannot as written:
+`type T = X | null` UN-parenthesized.** The parens decide the arena shape: a
+`type T = (X | null)` body is ONE variant, so it interns as a one-member wrapper
+over a `TyNullable` and the nullable arm claims it. Without them the parser
+splits on the top-level `|` and the declaration is a TWO-variant `UnionDecl`,
+which no arm here can reach — `singleAliasMemberTyIx` returns a member INDEX and
+there is no `TyNullable` index for it to return. Closing it is a NORMALIZATION
+change (a two-variant `UnionDecl` whose second variant is `null` should intern
+as its inner's nullable, the way the inline annotation already does), with a
+blast radius over every nullable alias in the tree, so it is not this arm's
+extension.
+
+Its population, measured on a 4-inner × 3-position × {`new`, `alias`, `direct`}
+grid (36 cells) graded on the RUN VALUE: **all 12 `direct` cells correct, and all
+24 alias-spelled cells wrong** — 12 check-clean invalid wasm (a litunion or
+`string` inner) and 12 loud checker rejects (`print of a union value (T1)` for an
+`i32` inner, `field 'n' is not on every member of T1` for a struct inner).
+
+**Six of those 24 changed CLASS when the `null`-operand brand exemption landed,
+from a loud checker reject to check-clean invalid wasm, and that is a mask
+lifting rather than a defect appearing**: the `cannot compare T1 and null`
+message was firing before the value was ever built, and the un-branded `alias`
+twin of every one of those six cells is already check-clean invalid wasm without
+it. The alternative — restricting the exemption to a `TyNullable` so the message
+keeps firing — was considered and rejected: it would tie a checker predicate to
+an emitter gap, and `tyAdmitsNull` is the question the exemption actually means
+to ask.
+
 ### 3.1 Where the brand lives
 
 The arena is deliberately structural — `typecheck.vl:1475`: *"The arena stays
