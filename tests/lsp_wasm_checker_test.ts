@@ -283,13 +283,13 @@ Deno.test({
   // An `is` guard over an un-annotated param contributes an ALTERNATIVE, not extra
   // fields (see `tests/cases/inference/hole-is-guard-alternative.vl`). Hover reports
   // the SAME disjunction the call-arg diagnostic names — the hole itself renders as
-  // an uninformative `any`.
+  // an uninformative `_`.
   const guarded = "function foobar(v) {\n" +
     "  if v is { foo: string } then return v.foo\n" +
     "  return v.bar\n" +
     "}\n" +
     'print(foobar({ foo: "foo" }))\n';
-  const want = "{foo: string} | {bar: any}";
+  const want = "{foo: string} | {bar: _}";
   // The param's declaration (line 0, col 16) and its use in `v.bar` (line 2, col 9).
   const declTy = await checker.hoverTypeAt(guarded, "/tmp/x.vl", noSiblings, 0, 16);
   if (declTy !== want) {
@@ -299,11 +299,11 @@ Deno.test({
   if (useTy !== want) {
     throw new Error(`expected ${want} at the param use, got ${JSON.stringify(useTy)}`);
   }
-  // A hole the body never constrains stays `any` — there is nothing to report.
+  // A hole the body never constrains stays the blank `_` — there is nothing to report.
   const free = "function twice(n) { return n + n }\nprint(twice(3))\n";
   const freeTy = await checker.hoverTypeAt(free, "/tmp/x.vl", noSiblings, 0, 15);
-  if (freeTy !== "any") {
-    throw new Error(`expected any for an unconstrained hole, got ${JSON.stringify(freeTy)}`);
+  if (freeTy !== "_") {
+    throw new Error(`expected _ for an unconstrained hole, got ${JSON.stringify(freeTy)}`);
   }
 });
 
@@ -357,15 +357,15 @@ Deno.test({ name: "wasm-symbols: an unannotated function's inferred return is re
   }
 });
 
-Deno.test({ name: "wasm-symbols: an un-annotated polymorphic param hovers as any, not an inference hole", ignore }, async () => {
+Deno.test({ name: "wasm-symbols: an un-annotated polymorphic param hovers as the blank, not an inference hole", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // `x` is never annotated and only probed via `is i32`, so it stays a fresh
-  // inference hole (`?describe.0`). The hover must render that as `any` (host
-  // parity), not leak the internal hole name.
+  // inference hole (`?describe.0`). The hover must render that as the blank `_`,
+  // not leak the internal hole name.
   const fixture = 'function describe(x): string {\n  if x is i32 { return "num" }\n  return "str"\n}\n';
   const ty = await checker.hoverTypeAt(fixture, "/tmp/x.vl", noSiblings, 0, 9);
-  if (ty !== "(any) -> string") {
-    throw new Error(`expected (any) -> string for a polymorphic param, got ${JSON.stringify(ty)}`);
+  if (ty !== "(_) -> string") {
+    throw new Error(`expected (_) -> string for a polymorphic param, got ${JSON.stringify(ty)}`);
   }
 });
 

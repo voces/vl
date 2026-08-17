@@ -1175,14 +1175,14 @@ in-language GC knobs.
     (Low priority.)
   - **LSP quick-fixes** (code actions): "remove unused binding" / "prefix with `_`" / "`let`→`const`".
     Diagnostics already carry stable `code`s; the LSP has no code-action provider yet.
-  - **an inference HOLE renders as `any` in user-visible diagnostics** — *"comparison expects
-    numeric operands, got any and string"*, *"cannot assign (any, any) -> any"*. This contradicts
-    a documented guarantee in as many words: `docs/guide/soundness.md` says an un-annotated
-    parameter "is a hole, not a dynamic value" and that there is "**No `dynamic` / no implicit
-    `any`**". `any` is the single word most likely to teach a reader the opposite. Pick a spelling
-    that says "not yet pinned" (`_`, `?`, `<hole>`) and change it everywhere at once — the `any`
-    type spelling is directive-pinned in 5 corpus files (the four
-    `soundness/generic-fn-*-reject.vl` plus `soundness/hole-is-guard-alternative-reject.vl`).
+  - ~~**an inference HOLE renders as `any` in user-visible diagnostics**~~ **DONE** — a hole
+    now renders as the blank `_` (*"comparison expects numeric operands, got `_` and string"*,
+    *"cannot assign `(_, _) -> _`"*), so the diagnostics no longer contradict
+    `docs/guide/soundness.md`'s "**No `dynamic` / no implicit `any`**". Chosen from this
+    entry's own shortlist by elimination: `?` already suffixes a nullable in the SAME renderer
+    (`{bar: ?}` one token from `{bar: T?}`), `<hole>` adopts the angle-bracket shape the
+    renderer reserves for ABSENCE (`<none>`/`<error>`/`<?>`) when a hole is present, and every
+    bareword (`unknown`, `unsolved`) repeats `any`'s category error of looking like a type NAME.
     Workboard E7.
   - Cross-cutting: thread `severity` through all remaining error variants; consistent message style.
 - 🟡 **B-mem. Linear memory — make it a design, not a scratch page**
