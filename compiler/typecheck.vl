@@ -7364,335 +7364,353 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
   emitNameAtoms = 1
   if ix < 0 { return "" }
   const t = T.tys[ix]
-  if t is TyPrim {
-    if t.primName == "never" { return "" }
-    return t.primName
-  }
-  // A LITERAL renders as its base scalar, at the ONE home that answers that (see
-  // `tyLitBaseName`) — this arm and its twin in the other renderer were two of the three
-  // hand-written copies of `litBaseTy`'s four-way rule.
-  if t is TyLit { return tyLitBaseName(t) }
-  if t is TyUnion {
-    const members = t.uMembers
-    // THE PURE INLINE LITERAL UNION KEEPS ITS MEMBERS — canon's `litUnionPreserve` /
-    // `nulLitUnionPreserve` pair, mirrored off the arena. Without it every `TyLit` member
-    // below rendered its BASE (`string`) and the dedup collapsed the run to that one
-    // scalar, so an inline `{tag: "a" | "b"}` rendered `{tag:string}` while the ANNOTATION
-    // side spelled it `{tag:"a"|"b"}` — one arena type, two names, and every name-keyed
-    // registry downstream (struct layouts, `$fnsig` keys, mv slots, union rows) holds a
-    // row for each.
-    //
-    // THE TWO GATES ARE CANON'S TWO RUNGS, NOT A NEW POLICY. `nulLitUnionPreserve` fires
-    // on any top-level split holding a `null` sibling, at EVERY position; the bare form
-    // reaches `litUnionPreserve` only under `ctxKeepsLitUnion`, because a bare inline
-    // litunion at `RC_ROOT` / `RC_FN_PARAM` has no param-valtype or struct-field ladder arm
-    // (the measurement is on `ctxKeepsLitUnion` itself). Rendering it at those two
-    // positions would spell a name the emitter rejects; rendering it at neither leaves the
-    // disagreement this leg exists to close.
-    const luiN = litUnionInlineNameOfTy(ix)
-    if luiN != "" {
-      if luiHasNull {
-        emitNameAtoms = luiAtoms + 1
-        return luiN + "|null"
-      }
-      if ctxKeepsLitUnion(ctx) {
-        emitNameAtoms = luiAtoms
-        return luiN
-      }
+  // EXHAUSTIVE over `Ty` and deliberately `_`-less: a 12th arena variant breaks the
+  // self-compile here instead of silently rendering "" = "no emitter-classifiable
+  // name", which every name-keyed registry downstream reads as a settled answer.
+  match t {
+    TyPrim => {
+      if t.primName == "never" { return "" }
+      return t.primName
     }
-    // THE MIXED-UNION PRESERVE — the OWNER'S RULING of 2026-07-29, which REVERSES the
-    // soften ruling of 2026-07-28: *"I'm reverting the softening. `K | f64` should be
-    // preserved as `K | f64` (or flattened to the constituent parts of `K | f64`).
-    // Softening to a string is just wrong as I see it."*
-    //
-    // So a string-litunion ALIAS standing as a MEMBER of a union keeps its ALIAS name:
-    // `K0 | f64` is `K0|f64`, not `string|f64`. The two legs below are the rule, and
-    // `canonEmitNameAt`'s union arm carries its MIRROR (`mixedUnionLitAliasRegroup`) so
-    // the ANNOTATION side spells the same union the same way — that mirror is what makes
-    // this a unification rather than a return to the 55-row disagreement #1296 closed.
-    //
-    // WHICH OF THE OWNER'S TWO SPELLINGS THIS IS, AND WHY. The ruling allows the ALIAS or
-    // the FLATTENED members; this is the ALIAS, chosen by measurement, not by taste. The
-    // flattened spelling `"a"|"b"|f64` is not in the EMITTER's union grammar: a union ATOM
-    // that is a single quoted literal fails `nameIsLitUnionType` (`nameIsInlineLitUnion`
-    // needs 2+ quoted atoms), so `canonLitUnionArms`, `unionHasValueAtom` and
-    // `isVariantBoxUnionAtoms` all classify it as a non-atom "other" member and the box
-    // loses its string arm. The alias spelling is the one every one of those ladders
-    // already has a leg for — it is what this renderer produced for the whole of the
-    // project's history before #1296, and the emitter consumed it.
-    //
-    // A LIT RUN WITH NO REGISTERED ALIAS STILL SOFTENS, on both producers, and that is the
-    // ruling read exactly: there is no `K` to preserve for an un-aliased inline
-    // `"a"|"b"|f64`, and softening it is the behaviour master and pre-#1296 master share.
-    // The rule is therefore "spell the run by its alias where the program gave it one".
-    //
-    // THE DATA REP DOES NOT MOVE IN EITHER DIRECTION, which is why the spelling is free to:
-    // `emitUnionCoerce`'s atom ladder classifies the incoming value by EXPRESSION
-    // (`exprString` → value-atom kind 2), never by the union's spelling, and
-    // `repCanonKey`'s union arm mix-widens the member in the ARENA before any rep key is
-    // minted. The rep key for `K0|f64` is `(string|f64)` under both rulings — see the
-    // re-derived coercion census in `docs/internals/destringify-types-program.md`.
-    //
-    // FLATTENED-alias regroup: a litunion-ALIAS member's literals flatten into sibling
-    // TyLit members (`flattenVariantsInto`: `K0 | i64` → ["64","bjtvb","tt", i64]), so
-    // the per-member alias lookup below never sees the alias and each lit softened to
-    // `string` — the widened spelling minted TWIN field/slot rows beside the
-    // annotation-spelled ones (divergent structs/mv slots — INVALID-WASM; fuzz-nightly
-    // seed 658239060 d5). In a MIXED union (at least one non-TyLit member) regroup the
-    // str-lit members into their exactly-matching registered alias, rendered at the
-    // FIRST lit's position. A PURE litunion keeps the historical `string` softening
-    // (the `canonEmitTypeNames` invariant), and a lit set matching no alias keeps the
-    // per-member path unchanged.
-    let rgAlias = ""
-    const rgTexts: string[] = []
-    let rgNonLit = false
-    let rg = 0
-    while rg < members.length {
-      const rm = T.tys[members[rg]]
-      if rm is TyLit {
-        if rm.litKind == "str" { rgTexts.push(rm.litText) }
-      } else {
-        let rmNull = false
-        if rm is TyPrim {
-          if rm.primName == "null" { rmNull = true }
+    // A LITERAL renders as its base scalar, at the ONE home that answers that (see
+    // `tyLitBaseName`) — this arm and its twin in the other renderer were two of the three
+    // hand-written copies of `litBaseTy`'s four-way rule.
+    TyLit => { return tyLitBaseName(t) }
+    TyUnion => {
+      const members = t.uMembers
+      // THE PURE INLINE LITERAL UNION KEEPS ITS MEMBERS — canon's `litUnionPreserve` /
+      // `nulLitUnionPreserve` pair, mirrored off the arena. Without it every `TyLit` member
+      // below rendered its BASE (`string`) and the dedup collapsed the run to that one
+      // scalar, so an inline `{tag: "a" | "b"}` rendered `{tag:string}` while the ANNOTATION
+      // side spelled it `{tag:"a"|"b"}` — one arena type, two names, and every name-keyed
+      // registry downstream (struct layouts, `$fnsig` keys, mv slots, union rows) holds a
+      // row for each.
+      //
+      // THE TWO GATES ARE CANON'S TWO RUNGS, NOT A NEW POLICY. `nulLitUnionPreserve` fires
+      // on any top-level split holding a `null` sibling, at EVERY position; the bare form
+      // reaches `litUnionPreserve` only under `ctxKeepsLitUnion`, because a bare inline
+      // litunion at `RC_ROOT` / `RC_FN_PARAM` has no param-valtype or struct-field ladder arm
+      // (the measurement is on `ctxKeepsLitUnion` itself). Rendering it at those two
+      // positions would spell a name the emitter rejects; rendering it at neither leaves the
+      // disagreement this leg exists to close.
+      const luiN = litUnionInlineNameOfTy(ix)
+      if luiN != "" {
+        if luiHasNull {
+          emitNameAtoms = luiAtoms + 1
+          return luiN + "|null"
         }
-        if !rmNull { rgNonLit = true }
+        if ctxKeepsLitUnion(ctx) {
+          emitNameAtoms = luiAtoms
+          return luiN
+        }
       }
-      rg = rg + 1
-    }
-    if rgNonLit && rgTexts.length >= 2 {
-      rgAlias = litUnionAliasOfLitTexts(rgTexts)
-    }
-    const parts: string[] = []
-    // The render's atom count, accumulated as the parts are KEPT: the join below inserts
-    // exactly one top-level `|` per part boundary, so the whole render is as wide as its
-    // parts together. A part is not always ONE atom — a nullable member renders `X|null` —
-    // which is why this is summed rather than read off `parts.length` at the end.
-    let psum = 0
-    let rgDone = false
-    let i = 0
-    while i < members.length {
-      // A MEMBER that is a registered litunion ALIAS (`K0 | i64`) keeps its alias name
-      // rather than softening to `string` — the alias arm reps as the i32 atom in the
-      // union box, and every `$fnsig`/slot key derived from this render must agree with
-      // the annotation side's `(K0|i64)` spelling. Without it a closure returning
-      // `(K0 | i64)[]` keyed `(string|i64)[]` while the value call keyed the alias —
-      // divergent functypes, a cast-failure TRAP (fuzz-nightly run 29808029476, seed
-      // 78530533 d5). The union-member sibling of the TyFunc-result / TyObj-field
-      // alias preservation above and below.
-      const rgm = T.tys[members[i]]
-      if rgAlias != "" && rgm is TyLit {
-        if !rgDone {
-          rgDone = true
-          parts.push(rgAlias)
-          psum = psum + 1
+      // THE MIXED-UNION PRESERVE — the OWNER'S RULING of 2026-07-29, which REVERSES the
+      // soften ruling of 2026-07-28: *"I'm reverting the softening. `K | f64` should be
+      // preserved as `K | f64` (or flattened to the constituent parts of `K | f64`).
+      // Softening to a string is just wrong as I see it."*
+      //
+      // So a string-litunion ALIAS standing as a MEMBER of a union keeps its ALIAS name:
+      // `K0 | f64` is `K0|f64`, not `string|f64`. The two legs below are the rule, and
+      // `canonEmitNameAt`'s union arm carries its MIRROR (`mixedUnionLitAliasRegroup`) so
+      // the ANNOTATION side spells the same union the same way — that mirror is what makes
+      // this a unification rather than a return to the 55-row disagreement #1296 closed.
+      //
+      // WHICH OF THE OWNER'S TWO SPELLINGS THIS IS, AND WHY. The ruling allows the ALIAS or
+      // the FLATTENED members; this is the ALIAS, chosen by measurement, not by taste. The
+      // flattened spelling `"a"|"b"|f64` is not in the EMITTER's union grammar: a union ATOM
+      // that is a single quoted literal fails `nameIsLitUnionType` (`nameIsInlineLitUnion`
+      // needs 2+ quoted atoms), so `canonLitUnionArms`, `unionHasValueAtom` and
+      // `isVariantBoxUnionAtoms` all classify it as a non-atom "other" member and the box
+      // loses its string arm. The alias spelling is the one every one of those ladders
+      // already has a leg for — it is what this renderer produced for the whole of the
+      // project's history before #1296, and the emitter consumed it.
+      //
+      // A LIT RUN WITH NO REGISTERED ALIAS STILL SOFTENS, on both producers, and that is the
+      // ruling read exactly: there is no `K` to preserve for an un-aliased inline
+      // `"a"|"b"|f64`, and softening it is the behaviour master and pre-#1296 master share.
+      // The rule is therefore "spell the run by its alias where the program gave it one".
+      //
+      // THE DATA REP DOES NOT MOVE IN EITHER DIRECTION, which is why the spelling is free to:
+      // `emitUnionCoerce`'s atom ladder classifies the incoming value by EXPRESSION
+      // (`exprString` → value-atom kind 2), never by the union's spelling, and
+      // `repCanonKey`'s union arm mix-widens the member in the ARENA before any rep key is
+      // minted. The rep key for `K0|f64` is `(string|f64)` under both rulings — see the
+      // re-derived coercion census in `docs/internals/destringify-types-program.md`.
+      //
+      // FLATTENED-alias regroup: a litunion-ALIAS member's literals flatten into sibling
+      // TyLit members (`flattenVariantsInto`: `K0 | i64` → ["64","bjtvb","tt", i64]), so
+      // the per-member alias lookup below never sees the alias and each lit softened to
+      // `string` — the widened spelling minted TWIN field/slot rows beside the
+      // annotation-spelled ones (divergent structs/mv slots — INVALID-WASM; fuzz-nightly
+      // seed 658239060 d5). In a MIXED union (at least one non-TyLit member) regroup the
+      // str-lit members into their exactly-matching registered alias, rendered at the
+      // FIRST lit's position. A PURE litunion keeps the historical `string` softening
+      // (the `canonEmitTypeNames` invariant), and a lit set matching no alias keeps the
+      // per-member path unchanged.
+      let rgAlias = ""
+      const rgTexts: string[] = []
+      let rgNonLit = false
+      let rg = 0
+      while rg < members.length {
+        const rm = T.tys[members[rg]]
+        if rm is TyLit {
+          if rm.litKind == "str" { rgTexts.push(rm.litText) }
+        } else {
+          let rmNull = false
+          if rm is TyPrim {
+            if rm.primName == "null" { rmNull = true }
+          }
+          if !rmNull { rgNonLit = true }
+        }
+        rg = rg + 1
+      }
+      if rgNonLit && rgTexts.length >= 2 {
+        rgAlias = litUnionAliasOfLitTexts(rgTexts)
+      }
+      const parts: string[] = []
+      // The render's atom count, accumulated as the parts are KEPT: the join below inserts
+      // exactly one top-level `|` per part boundary, so the whole render is as wide as its
+      // parts together. A part is not always ONE atom — a nullable member renders `X|null` —
+      // which is why this is summed rather than read off `parts.length` at the end.
+      let psum = 0
+      let rgDone = false
+      let i = 0
+      while i < members.length {
+        // A MEMBER that is a registered litunion ALIAS (`K0 | i64`) keeps its alias name
+        // rather than softening to `string` — the alias arm reps as the i32 atom in the
+        // union box, and every `$fnsig`/slot key derived from this render must agree with
+        // the annotation side's `(K0|i64)` spelling. Without it a closure returning
+        // `(K0 | i64)[]` keyed `(string|i64)[]` while the value call keyed the alias —
+        // divergent functypes, a cast-failure TRAP (fuzz-nightly run 29808029476, seed
+        // 78530533 d5). The union-member sibling of the TyFunc-result / TyObj-field
+        // alias preservation above and below.
+        const rgm = T.tys[members[i]]
+        if rgAlias != "" && rgm is TyLit {
+          if !rgDone {
+            rgDone = true
+            parts.push(rgAlias)
+            psum = psum + 1
+          }
+          i = i + 1
+          continue
+        }
+        // An ALIAS name is one identifier — one atom. Only the RENDER leg can be wider,
+        // and it reports its own width in `emitNameAtoms`.
+        let sc = 1
+        let s = litUnionAliasNameOfTy(members[i])
+        if s == "" {
+          // A union MEMBER, carrying the sticky nullable bit down so this arm agrees with
+          // canon's flat `A|B|null` split about what "under a nullable" means.
+          s = tyToEmitNameAt(members[i], RC_UNION_MEM | (ctx & RC_NULLABLE))
+          sc = emitNameAtoms
+        }
+        if s == "" { return "" }
+        // A FUNCTION-TYPE member renders PARENTHESIZED (`(()=>f32|null)|{w:i32}`) — the
+        // annotation's atom spelling. Bare, the closure's result arms swallow the union's
+        // sibling members (`()=>f32|null|{w:i32}`), so `annSigKey` read a top-level arrow
+        // and keyed the whole result `>c` while the pinned lambda interned `>u` — a
+        // divergent `ref.cast` functype at the value call (INVALID-WASM; fuzz-nightly
+        // seed 556796311 d6).
+        // The grouping parens put every separator inside a grouper — one atom again.
+        if rgm is TyFunc {
+          s = "(" + s + ")"
+          sc = 1
+        }
+        let dup = false
+        let j = 0
+        while j < parts.length {
+          if parts[j] == s { dup = true }
+          j = j + 1
+        }
+        if !dup {
+          parts.push(s)
+          psum = psum + sc
         }
         i = i + 1
-        continue
       }
-      // An ALIAS name is one identifier — one atom. Only the RENDER leg can be wider,
-      // and it reports its own width in `emitNameAtoms`.
-      let sc = 1
-      let s = litUnionAliasNameOfTy(members[i])
-      if s == "" {
-        // A union MEMBER, carrying the sticky nullable bit down so this arm agrees with
-        // canon's flat `A|B|null` split about what "under a nullable" means.
-        s = tyToEmitNameAt(members[i], RC_UNION_MEM | (ctx & RC_NULLABLE))
-        sc = emitNameAtoms
+      if parts.length == 0 { return "" }
+      let out = parts[0]
+      let k = 1
+      while k < parts.length {
+        out = out + "|" + parts[k]
+        k = k + 1
       }
-      if s == "" { return "" }
-      // A FUNCTION-TYPE member renders PARENTHESIZED (`(()=>f32|null)|{w:i32}`) — the
-      // annotation's atom spelling. Bare, the closure's result arms swallow the union's
-      // sibling members (`()=>f32|null|{w:i32}`), so `annSigKey` read a top-level arrow
-      // and keyed the whole result `>c` while the pinned lambda interned `>u` — a
-      // divergent `ref.cast` functype at the value call (INVALID-WASM; fuzz-nightly
-      // seed 556796311 d6).
-      // The grouping parens put every separator inside a grouper — one atom again.
-      if rgm is TyFunc {
-        s = "(" + s + ")"
-        sc = 1
-      }
-      let dup = false
-      let j = 0
-      while j < parts.length {
-        if parts[j] == s { dup = true }
-        j = j + 1
-      }
-      if !dup {
-        parts.push(s)
-        psum = psum + sc
-      }
-      i = i + 1
+      emitNameAtoms = psum
+      return out
     }
-    if parts.length == 0 { return "" }
-    let out = parts[0]
-    let k = 1
-    while k < parts.length {
-      out = out + "|" + parts[k]
-      k = k + 1
+    TyNullable => {
+      // A NULLABLE LITUNION-ALIAS (`K0 | null`) keeps its alias rather than the softened
+      // `string|null` — the two spell DIFFERENT reps (the alias niche is the i32 atom with
+      // the -1 sentinel; `string|null` is the nullable string ref). A `{[string]: K0|null}[]`
+      // lambda pin rendered the softened value and its element slot keyed the STRING-valued
+      // map struct while the captured map was the mono atom map — INVALID-WASM at the array
+      // build (fuzz sweep4 plain leg, seed 142958508 case_00046). The nullable sibling of
+      // the TyUnion-member / TyObj-field / TyMap-value / TyArray-element alias preservation.
+      const nal = litUnionAliasNameOfTy(t.nInner)
+      if nal != "" {
+        // An alias identifier plus the `null` arm — two atoms.
+        emitNameAtoms = 2
+        return nal + "|null"
+      }
+      // …and an UN-ALIASED one keeps its MEMBERS, for the same reason and at every position:
+      // canon's `nulLitUnionPreserve` has no `ctxKeepsLitUnion` gate. The alias leg above is
+      // the same preference `litUnionInlineNameOfTy` applies internally, so the two cannot
+      // disagree about which spelling wins.
+      const nlui = litUnionInlineNameOfTy(t.nInner)
+      if nlui != "" {
+        emitNameAtoms = luiAtoms + 1
+        return nlui + "|null"
+      }
+      const inner = tyToEmitNameAt(t.nInner, RC_NULLABLE)
+      const innerAtoms = emitNameAtoms
+      if inner == "" { return "" }
+      // A NULLABLE FUNCTION type keeps the kind-19 grouping parens (`((i32)=>string)|null`)
+      // — bare, the render spells a closure RETURNING `string|null` instead (the `|null`
+      // binds to the result), the same swallowed-arm ambiguity as the union-member case.
+      const nfn = T.tys[t.nInner]
+      if nfn is TyFunc {
+        // The grouped closure is one atom; `null` is the second.
+        emitNameAtoms = 2
+        return "(" + inner + ")|null"
+      }
+      // A union INNER keeps its own top-level `|`s (`A|B|null`), so the `null` arm ADDS to
+      // the inner render's width rather than making the whole name two atoms.
+      emitNameAtoms = innerAtoms + 1
+      return inner + "|null"
     }
-    emitNameAtoms = psum
-    return out
+    TyObj => {
+      const names = t.objFieldNames
+      const ftys = t.objFieldTypes
+      let out = "{"
+      let fi = 0
+      while fi < names.length {
+        // A FIELD preserves a literal-union ALIAS (`{f: K0}`, `{f: K0 | null}`) rather
+        // than the softened `string` — so a rendered shape resolves the SAME struct index
+        // the annotation side interned (`{f:K0}`, the i32-atom field layout), not the
+        // string-field twin. Without it a nullable-struct closure-result pin
+        // (`nullableRetName`'s TyObj arm) keyed `>n` on `{f:string}` while the annotated
+        // value call keyed `>n` on `{f:K0}` — divergent `$fnsig` entries: a cast-failure
+        // TRAP at the narrowed nullable-closure call (fuzz frontier seed 679748579 d5).
+        // The field dual of the TyFunc-result alias preservation below.
+        let fs = ""
+        const ftn = T.tys[ftys[fi]]
+        if ftn is TyNullable {
+          const fal = litUnionAliasNameOfTy(ftn.nInner)
+          if fal != "" { fs = fal + "|null" }
+        }
+        if fs == "" {
+          const fbal = litUnionAliasNameOfTy(ftys[fi])
+          if fbal != "" { fs = fbal }
+        }
+        if fs == "" { fs = tyToEmitNameAt(ftys[fi], appKidCtx(ix, RC_FIELD)) }
+        if fs == "" { return "" }
+        if fi > 0 { out = out + "," }
+        out = out + names[fi] + ":" + fs
+        fi = fi + 1
+      }
+      // Every field separator sits inside the braces — ONE atom. Set rather than
+      // inherited: the field renders above left `emitNameAtoms` holding the last field's
+      // width.
+      emitNameAtoms = 1
+      return out + "}"
+    }
+    TyArray => {
+      // A litunion-ALIAS element (`K0[]`) keeps its alias name rather than softening to
+      // `string[]` — the two spell DIFFERENT reps (the alias array is the interned-i32
+      // ATOM list; `string[]` is the string-ref list), so a widened render minted a TWIN
+      // mv slot beside the annotation-spelled one and the narrowed map read resolved the
+      // other twin's struct (INVALID-WASM; fuzz-nightly seed 210853359 d6). The array
+      // sibling of the TyUnion-member / TyObj-field / TyMap-value alias preservation.
+      let el = litUnionAliasNameOfTy(t.aElem)
+      // The ELEMENT's own atom WIDTH, as the element's producer reported it — an alias
+      // identifier is one atom, the render leg reports its own (D-ARRWIDTH).
+      let elw = 1
+      if el == "" {
+        el = tyToEmitNameAt(t.aElem, appKidCtx(ix, RC_ELEM))
+        elw = emitNameAtoms
+      }
+      if el == "" { return "" }
+      // A list name is ONE atom in every form — a union element is parenthesized precisely
+      // so its `|`s stop being top-level. Set rather than inherited (the element render
+      // left its own width behind). The grouping itself is `arrElemRender`'s (D-ARRGROUP),
+      // which also carries the CLOSURE-element rationale this arm used to state twice.
+      emitNameAtoms = 1
+      return arrElemRender(el, t.aElem, elw)
+    }
+    TyMap => {
+      const mk = tyToEmitNameAt(t.mKey, RC_MAP_KEY)
+      // A litunion-ALIAS map VALUE (`{[string]: K0}`) keeps its alias name rather than
+      // softening to `string` — an atom-valued map is the MONO i32 map, and every
+      // `$fnsig`/mv-slot key derived from this render must agree with the annotation
+      // side's `{[string]:K0}` spelling. Widened, a never-constructed inner closure's
+      // synthesized `>m` sig keyed the STRING-valued map struct while the narrowed
+      // call's map read resolved the mono atom map — INVALID-WASM at the result store
+      // (fuzz seed 113148886 d6). The map-value sibling of the TyUnion-member /
+      // TyObj-field / TyFunc-result alias preservation around it.
+      let mv = litUnionAliasNameOfTy(t.mVal)
+      if mv == "" { mv = tyToEmitNameAt(t.mVal, appKidCtx(ix, RC_MAP_VAL)) }
+      if mk == "" || mv == "" { return "" }
+      // The key/value separators sit inside the braces — one atom.
+      emitNameAtoms = 1
+      return "{[" + mk + "]:" + mv + "}"
+    }
+    // A FUNCTION type renders the emitter's closure-annotation form `(p1, p2) => ret` — so an
+    // inferred closure VALUE (`const g = f(4)`) recovers an annotation-shaped name the closure
+    // `$fnsig` producers (`annSigKey`) can key. "" if any param / the result is unrenderable.
+    TyFunc => {
+      const ps = t.fnParamTypes
+      let out = "("
+      let i = 0
+      while i < ps.length {
+        const ps1 = tyToEmitNameAt(ps[i], RC_FN_PARAM)
+        if ps1 == "" { return "" }
+        if i > 0 { out = out + "," }
+        out = out + ps1
+        i = i + 1
+      }
+      // A function RESULT preserves a literal-union ALIAS (`() => K0`, `() => K0 | null`)
+      // rather than `tyToEmitName`'s softened `string` — so an INFERRED closure value (a
+      // `??`-defaulted map-value closure, a call result) keys the litunion's i32-atom token
+      // (`>i`, via `annRetKind`), byte-matching the constructed lambda's `$fnsig`. Without it
+      // the inferred name widened to `string|null`, whose `nulstr` `(ref array)` result clashed
+      // with the litunion-atom call (INVALID-WASM at the value call's `local.set`). Mirrors the
+      // return-position `nulLitUnionRetName` / `nullableRetName` alias preservation.
+      let rs = ""
+      const rtn = T.tys[t.fnRet]
+      if rtn is TyNullable {
+        const nal = litUnionAliasNameOfTy(rtn.nInner)
+        if nal != "" { rs = nal + "|null" }
+      }
+      if rs == "" {
+        const bal = litUnionAliasNameOfTy(t.fnRet)
+        if bal != "" { rs = bal }
+      }
+      if rs == "" { rs = tyToEmitNameAt(t.fnRet, appKidCtx(ix, RC_FN_RES)) }
+      if rs == "" { return "" }
+      // A function-type RESULT keeps grouping parens so the outer `$fnsig` producers see a
+      // single result token (`(i32)=>((i32)=>i32)`), matching the source-annotation form.
+      const rt = T.tys[t.fnRet]
+      if rt is TyFunc { rs = "(" + rs + ")" }
+      // A function type is ONE atom: the params are parenthesized and everything after the
+      // top-level `=>` belongs to the RESULT — the #516 rule `unionMemberCount` implements
+      // by stopping at a top-level arrow, so `(i32)=>A|B` counts 1, not 2.
+      emitNameAtoms = 1
+      return out + ")=>" + rs
+    }
+    TyVar => {
+      // An unsolved type PARAMETER has no name in the emitter's vocabulary — the
+      // monomorphizer names the INSTANCE.
+    }
+    TyNeg => {
+      // A RESIDUAL negation — `intersectTy` folds the rest — has no emitter name.
+    }
+    TyErr => {
+      // The error/unknown hole has no emitter name; a rejected program never
+      // reaches the emitter that would need one.
+    }
   }
-  if t is TyNullable {
-    // A NULLABLE LITUNION-ALIAS (`K0 | null`) keeps its alias rather than the softened
-    // `string|null` — the two spell DIFFERENT reps (the alias niche is the i32 atom with
-    // the -1 sentinel; `string|null` is the nullable string ref). A `{[string]: K0|null}[]`
-    // lambda pin rendered the softened value and its element slot keyed the STRING-valued
-    // map struct while the captured map was the mono atom map — INVALID-WASM at the array
-    // build (fuzz sweep4 plain leg, seed 142958508 case_00046). The nullable sibling of
-    // the TyUnion-member / TyObj-field / TyMap-value / TyArray-element alias preservation.
-    const nal = litUnionAliasNameOfTy(t.nInner)
-    if nal != "" {
-      // An alias identifier plus the `null` arm — two atoms.
-      emitNameAtoms = 2
-      return nal + "|null"
-    }
-    // …and an UN-ALIASED one keeps its MEMBERS, for the same reason and at every position:
-    // canon's `nulLitUnionPreserve` has no `ctxKeepsLitUnion` gate. The alias leg above is
-    // the same preference `litUnionInlineNameOfTy` applies internally, so the two cannot
-    // disagree about which spelling wins.
-    const nlui = litUnionInlineNameOfTy(t.nInner)
-    if nlui != "" {
-      emitNameAtoms = luiAtoms + 1
-      return nlui + "|null"
-    }
-    const inner = tyToEmitNameAt(t.nInner, RC_NULLABLE)
-    const innerAtoms = emitNameAtoms
-    if inner == "" { return "" }
-    // A NULLABLE FUNCTION type keeps the kind-19 grouping parens (`((i32)=>string)|null`)
-    // — bare, the render spells a closure RETURNING `string|null` instead (the `|null`
-    // binds to the result), the same swallowed-arm ambiguity as the union-member case.
-    const nfn = T.tys[t.nInner]
-    if nfn is TyFunc {
-      // The grouped closure is one atom; `null` is the second.
-      emitNameAtoms = 2
-      return "(" + inner + ")|null"
-    }
-    // A union INNER keeps its own top-level `|`s (`A|B|null`), so the `null` arm ADDS to
-    // the inner render's width rather than making the whole name two atoms.
-    emitNameAtoms = innerAtoms + 1
-    return inner + "|null"
-  }
-  if t is TyObj {
-    const names = t.objFieldNames
-    const ftys = t.objFieldTypes
-    let out = "{"
-    let fi = 0
-    while fi < names.length {
-      // A FIELD preserves a literal-union ALIAS (`{f: K0}`, `{f: K0 | null}`) rather
-      // than the softened `string` — so a rendered shape resolves the SAME struct index
-      // the annotation side interned (`{f:K0}`, the i32-atom field layout), not the
-      // string-field twin. Without it a nullable-struct closure-result pin
-      // (`nullableRetName`'s TyObj arm) keyed `>n` on `{f:string}` while the annotated
-      // value call keyed `>n` on `{f:K0}` — divergent `$fnsig` entries: a cast-failure
-      // TRAP at the narrowed nullable-closure call (fuzz frontier seed 679748579 d5).
-      // The field dual of the TyFunc-result alias preservation below.
-      let fs = ""
-      const ftn = T.tys[ftys[fi]]
-      if ftn is TyNullable {
-        const fal = litUnionAliasNameOfTy(ftn.nInner)
-        if fal != "" { fs = fal + "|null" }
-      }
-      if fs == "" {
-        const fbal = litUnionAliasNameOfTy(ftys[fi])
-        if fbal != "" { fs = fbal }
-      }
-      if fs == "" { fs = tyToEmitNameAt(ftys[fi], appKidCtx(ix, RC_FIELD)) }
-      if fs == "" { return "" }
-      if fi > 0 { out = out + "," }
-      out = out + names[fi] + ":" + fs
-      fi = fi + 1
-    }
-    // Every field separator sits inside the braces — ONE atom. Set rather than
-    // inherited: the field renders above left `emitNameAtoms` holding the last field's
-    // width.
-    emitNameAtoms = 1
-    return out + "}"
-  }
-  if t is TyArray {
-    // A litunion-ALIAS element (`K0[]`) keeps its alias name rather than softening to
-    // `string[]` — the two spell DIFFERENT reps (the alias array is the interned-i32
-    // ATOM list; `string[]` is the string-ref list), so a widened render minted a TWIN
-    // mv slot beside the annotation-spelled one and the narrowed map read resolved the
-    // other twin's struct (INVALID-WASM; fuzz-nightly seed 210853359 d6). The array
-    // sibling of the TyUnion-member / TyObj-field / TyMap-value alias preservation.
-    let el = litUnionAliasNameOfTy(t.aElem)
-    // The ELEMENT's own atom WIDTH, as the element's producer reported it — an alias
-    // identifier is one atom, the render leg reports its own (D-ARRWIDTH).
-    let elw = 1
-    if el == "" {
-      el = tyToEmitNameAt(t.aElem, appKidCtx(ix, RC_ELEM))
-      elw = emitNameAtoms
-    }
-    if el == "" { return "" }
-    // A list name is ONE atom in every form — a union element is parenthesized precisely
-    // so its `|`s stop being top-level. Set rather than inherited (the element render
-    // left its own width behind). The grouping itself is `arrElemRender`'s (D-ARRGROUP),
-    // which also carries the CLOSURE-element rationale this arm used to state twice.
-    emitNameAtoms = 1
-    return arrElemRender(el, t.aElem, elw)
-  }
-  if t is TyMap {
-    const mk = tyToEmitNameAt(t.mKey, RC_MAP_KEY)
-    // A litunion-ALIAS map VALUE (`{[string]: K0}`) keeps its alias name rather than
-    // softening to `string` — an atom-valued map is the MONO i32 map, and every
-    // `$fnsig`/mv-slot key derived from this render must agree with the annotation
-    // side's `{[string]:K0}` spelling. Widened, a never-constructed inner closure's
-    // synthesized `>m` sig keyed the STRING-valued map struct while the narrowed
-    // call's map read resolved the mono atom map — INVALID-WASM at the result store
-    // (fuzz seed 113148886 d6). The map-value sibling of the TyUnion-member /
-    // TyObj-field / TyFunc-result alias preservation around it.
-    let mv = litUnionAliasNameOfTy(t.mVal)
-    if mv == "" { mv = tyToEmitNameAt(t.mVal, appKidCtx(ix, RC_MAP_VAL)) }
-    if mk == "" || mv == "" { return "" }
-    // The key/value separators sit inside the braces — one atom.
-    emitNameAtoms = 1
-    return "{[" + mk + "]:" + mv + "}"
-  }
-  // A FUNCTION type renders the emitter's closure-annotation form `(p1, p2) => ret` — so an
-  // inferred closure VALUE (`const g = f(4)`) recovers an annotation-shaped name the closure
-  // `$fnsig` producers (`annSigKey`) can key. "" if any param / the result is unrenderable.
-  if t is TyFunc {
-    const ps = t.fnParamTypes
-    let out = "("
-    let i = 0
-    while i < ps.length {
-      const ps1 = tyToEmitNameAt(ps[i], RC_FN_PARAM)
-      if ps1 == "" { return "" }
-      if i > 0 { out = out + "," }
-      out = out + ps1
-      i = i + 1
-    }
-    // A function RESULT preserves a literal-union ALIAS (`() => K0`, `() => K0 | null`)
-    // rather than `tyToEmitName`'s softened `string` — so an INFERRED closure value (a
-    // `??`-defaulted map-value closure, a call result) keys the litunion's i32-atom token
-    // (`>i`, via `annRetKind`), byte-matching the constructed lambda's `$fnsig`. Without it
-    // the inferred name widened to `string|null`, whose `nulstr` `(ref array)` result clashed
-    // with the litunion-atom call (INVALID-WASM at the value call's `local.set`). Mirrors the
-    // return-position `nulLitUnionRetName` / `nullableRetName` alias preservation.
-    let rs = ""
-    const rtn = T.tys[t.fnRet]
-    if rtn is TyNullable {
-      const nal = litUnionAliasNameOfTy(rtn.nInner)
-      if nal != "" { rs = nal + "|null" }
-    }
-    if rs == "" {
-      const bal = litUnionAliasNameOfTy(t.fnRet)
-      if bal != "" { rs = bal }
-    }
-    if rs == "" { rs = tyToEmitNameAt(t.fnRet, appKidCtx(ix, RC_FN_RES)) }
-    if rs == "" { return "" }
-    // A function-type RESULT keeps grouping parens so the outer `$fnsig` producers see a
-    // single result token (`(i32)=>((i32)=>i32)`), matching the source-annotation form.
-    const rt = T.tys[t.fnRet]
-    if rt is TyFunc { rs = "(" + rs + ")" }
-    // A function type is ONE atom: the params are parenthesized and everything after the
-    // top-level `=>` belongs to the RESULT — the #516 rule `unionMemberCount` implements
-    // by stopping at a top-level arrow, so `(i32)=>A|B` counts 1, not 2.
-    emitNameAtoms = 1
-    return out + ")=>" + rs
-  }
+  // The empty arms above land here: "" is the renderer's "no emitter-classifiable
+  // name", which `tyIsEmitRepresentable` predicts structurally arm-for-arm.
   ""
 }
 
