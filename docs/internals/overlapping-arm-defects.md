@@ -373,6 +373,59 @@ FALSE. The receiver is the same string rep and the same lowering would serve it;
 receiver POPULATION (a narrowing of `string` down to a subset, not a union arm test), so it is filed
 rather than bundled.
 
+**That filing is CLOSED and was a THIRD of its own population — see "the non-litunion receiver"
+below.**
+
+## The non-litunion receiver, measured — the filing was a third of it
+
+A 233-cell grid (7 receiver types × 5 tested-against spellings × 5 test forms, a 5-origin second
+grid, and 19 rep-crossing cells) over the filed shape. Baseline **82 silently wrong**, 56
+check-rejects, 17 `vl check`-clean emit-rejects, 78 clean. After the cut: **0 silently wrong**, 155
+clean, 56 check-rejects (unchanged — no reject-parity movement), 22 emit-rejects.
+
+The filed cell — `s: string`, `if s is A` — is 16 of those 82. The rest:
+
+| receiver | baseline | why |
+|---|---|---|
+| plain `string` (param / `let` / field / element / global / nested fn / `.slice`) | const **FALSE** | no rep path claimed it; it fell to `monoStaticIsResult` |
+| un-annotated param monomorphized to `string` | const **FALSE** | same |
+| `string \| null` NARROWED by `!= null` | const **FALSE** | same |
+| **`string \| i32` — a value-union BOX whose one string arm is not the tested type** | const **TRUE** | the box-tag compare: a litunion tested type claims kind 2's tag, the SAME tag a plain `string` arm claims |
+
+The last row is the one the filing could not have predicted, and it is the opposite sign. The
+existing litunion floor already knew the tag compare is unsound over a box with **two** string-repped
+arms; its stated exemption — "`K | i32` reaches kind 2 only through `K`, so the tag decides it
+exactly" — assumes the one string arm **is** the tested type, and nothing enforced that.
+
+**The oracle was always one line away.** `s is "m0"` answers correctly on every one of these
+receivers; only `s is K` did not. So the cut is not a new lowering: it is ONE per-member compare
+(`emitLitMemberEq`) shared by the bare-literal spelling and the membership ladder, placed ahead of
+the box-tag compare. The two spellings now emit the same bytes by construction and cannot disagree.
+
+Two bounds the grid set rather than reasoned:
+
+- **The fold-to-TRUE needs a PURE literal-union receiver.** `nodeLitMembersWithin` reads only the
+  STRING literal members, so over the mixed `"b" | 1` — what an else-if chain narrows `"a" | "b" | 1`
+  to — it reports "all mine are yours" for the tested `"b"` and folds a guard the value `1` must
+  answer FALSE to. `soundness/exhaustive-is-chain-no-else-returns.vl` caught it.
+- **A box the per-member compare cannot lower keeps the tag compare.** `emitUnionLitIs` declines a
+  union with a STRUCT arm, and for `K | { w: i32 }` the tag compare is EXACT. Pre-checking that
+  helper's own rejects at the gate is what keeps a working shape working instead of converting it
+  into a hard emit failure — 7 corpus cases said so.
+
+Non-place receivers (a call, a concat, a `.slice`) with a two-or-more-member tested type have no
+membership lowering and no spill slot, so they take the **loud floor** the box rep already had; the
+two floors now share one message. A one-member tested type evaluates the receiver exactly once and is
+unaffected.
+
+**Still open, and it is a RULING not a lowering:** a RAW `string | null` receiver (16 cells) stays a
+loud `vl check`-clean emit-reject. Its bare-literal twin `(string | null) is "x"` **traps on a null
+receiver** — measured — so membership cannot delegate to it, and making both answer FALSE for null
+changes shipped `is` semantics. Filed as D1c.
+
+Pinned by `tests/cases/literal-unions/is-litunion-over-string-receiver.vl` (15 wrong lines without
+the cut) and `is-litunion-string-call-receiver-rejected.vl` (compiles and answers FALSE without it).
+
 ### Numeric literal unions are a separate, deeper cut
 
 `type K = 1 | 2` / `type K = 1.5 | 2.5` beside `i32` / `f64` also answer FALSE, but for an unrelated

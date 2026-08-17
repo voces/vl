@@ -2150,6 +2150,85 @@ function emitNulIsNullTest(
   0
 }
 
+// ONE member-literal test `recv == <lex>`, in whichever shape the RECEIVER's rep demands:
+// the tag-gated payload compare over a value-union BOX, string value-equality over a
+// string ref, the numeric compare otherwise. `lex` is a RAW lexeme (quotes kept, escapes
+// unresolved — a `StrLit.strText`), which is what both callers hold.
+//
+// ONE HOME, BECAUSE THE TWO SPELLINGS MUST EMIT THE SAME BYTES. The bare-literal `is "m0"`
+// spelling and the litunion MEMBERSHIP ladder (`is K` → `m0 || m1 || …`) ask the same
+// question of the same value; splitting the per-member lowering is how a rep the membership
+// ladder cannot reach — but the bare literal can — becomes a wrong answer instead of a
+// shared one. Every rep the bare-literal spelling handles, membership handles for free.
+function emitLitMemberEq(body: i32[], recvIx: i32, lex: string, fnIx: i32) {
+  if exprUnion(recvIx, fnIx) { return emitUnionLitIs(body, recvIx, lex, fnIx) }
+  // The QUOTED-LEAF test at its home (`tyname.nameIsQuotedLeaf`, W3). A synthesized
+  // `StrLit` node lowers the lexeme, then the value-eq core.
+  if nameIsQuotedLeaf(lex) {
+    if !aUsed {
+      return emitFail(
+        "emitProgram: string `is` test but array type not collected",
+      )
+    }
+    if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
+    if emitExpr(body, mkStr(lex, -1), fnIx) < 0 { return -1 }
+    return emitStrEqCore(body)
+  }
+  emitNumLitEq(body, recvIx, lex, fnIx)
+}
+
+// The ONE text for "this `is` is a literal-union MEMBERSHIP test and the receiver cannot be
+// re-read". Both floors that can reach it — the membership ladder's own place bound and the
+// box-tag compare's litunion guard — are the same refusal, so they say the same thing.
+function emitFailNoMembershipRecv() {
+  emitFail(
+    "emitProgram: `is` over a literal union needs a re-readable receiver (each member re-reads it; a call / optional-chain receiver has no membership lowering)",
+  )
+}
+
+// True when `recvIx` is a receiver `emitLitMemberEq` can be applied to REPEATEDLY — i.e.
+// one whose rep that compare reaches. The reps a string literal union can meet: a
+// value-union BOX (payload compare), a string-repped litunion, and a plain `string`.
+//
+// THE NULLABLE STRING IS EXCLUDED AND THAT IS DELIBERATE. `(string | null) is "x"` — the
+// bare-literal spelling this ladder delegates to — emits `ref.as_non_null` and TRAPS on a
+// null receiver; claiming that rep here would spread the trap across the whole member set
+// rather than answer FALSE for null, which is the answer a membership test owes. Those
+// receivers keep the loud `is` floor below until the null-guarded form lands at BOTH
+// spellings. A receiver NARROWED to non-null (`if s != null { s is K }`) is a different
+// value and IS claimed: `exprNullableString` is declaration-scoped and still calls it
+// nullable, but the CHECKER's banked node type does not, and the read `emitExpr` yields is
+// already recovered — so the two classifiers DISAGREEING is exactly the narrowing signal.
+//
+// A MONOMORPHIZED receiver is why this asks the emitter's REP classifiers (`exprUnion` /
+// `exprString`, both `fnIx`-scoped) and not the node's banked TYPE: one `v is K` node in a
+// `g<T>(v: T)` body is emitted once per instance, and the instance pinned to `i32` must not
+// take a string compare — invalid wasm traded for a wrong answer.
+function litMembershipRecvOk(recvIx: i32, fnIx: i32) {
+  if exprNullableString(recvIx, fnIx) && nodeTyIsNullable(recvIx) {
+    return false
+  }
+  // A BOX reaches the per-member compare through `emitUnionLitIs`, and BOTH of that
+  // helper's own union-shape rejects are PRE-CHECKED here rather than let fire from inside.
+  // A union it declines — one carrying a STRUCT arm — still has an EXACT box-tag compare
+  // below it (`K | { w: i32 }` reaches kind 2 only through `K`, so the tag decides the
+  // question), and letting the helper fail from in here would convert that working shape
+  // into a hard emit failure carrying a message about a lowering it never needed.
+  if exprUnion(recvIx, fnIx) {
+    const bxNm = unionNameOfExpr(recvIx, fnIx)
+    if bxNm == "" { return false }
+    if isValueUnionOfSet(msSetOfText(bxNm), bxNm) { return true }
+    return nameIsLitUnionArmValueUnion(bxNm)
+  }
+  if nodeTyIsLitUnion(recvIx) { return true }
+  if exprString(recvIx, fnIx) { return true }
+  // Left over from the first line: the emitter's DECLARATION-scoped classifier still calls
+  // this a nullable string while the CHECKER's banked node type does not — i.e. an active
+  // `!= null` narrowing. The read `emitExpr` yields is already recovered to non-null, so the
+  // per-member compare is exact.
+  exprNullableString(recvIx, fnIx)
+}
+
 // Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag), then
 // `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
@@ -2315,6 +2394,69 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
       }
     }
   }
+  // `x is K` over a STRING literal union `K`, for every receiver rep the per-member compare
+  // reaches (`litMembershipRecvOk`): the MEMBERSHIP test `x == m0 || x == m1 || …`, which is
+  // what `K` MEANS — its members are a runtime-observable subset of `string`, so the
+  // predicate exists as a value test and nothing about the receiver's rep can change the
+  // answer, only how each compare is spelled.
+  //
+  // AHEAD OF THE BOX-TAG COMPARE BELOW, AND THAT ORDER IS THE CORRECTNESS ARGUMENT. A
+  // litunion tested type claims kind 2's tag (`isArmTagOfTy`), the SAME tag a plain `string`
+  // arm claims, so the tag compare answers `x is K` TRUE for every string a `string | i32`
+  // box holds — members and non-members alike, `vl check` clean. The floor below only
+  // catches a box with TWO string-repped arms; a box whose single string arm is not `K`
+  // itself walked straight into the tag compare.
+  //
+  // A `string` RECEIVER is the same defect one rep over: `if s is K` on a plain `(ref
+  // $array)` matched no box, no atom and no litunion rep, fell to `monoStaticIsResult` —
+  // which sees a non-union rep and a tested name that is no variant row — and CONST-FOLDED
+  // TO FALSE. `if s is "m0"` on the identical value answered correctly one line away, which
+  // is the oracle: the two spellings now share `emitLitMemberEq` and cannot disagree.
+  //
+  // Two or more members RE-READ the receiver, so those need a re-readable place
+  // (`unionEqOperandOk`); a one-member tested type evaluates it exactly once and accepts any
+  // receiver expression. A receiver the bound declines has NO membership lowering and no
+  // spill slot reserved for one, so it takes the loud floor rather than falling through to
+  // the tag compare / static fold below, both of which are known wrong for this question.
+  if nd0 is IsExpr {
+    if !exprIsLitAtom(nd0.isObj, fnIx) {
+      const lsTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
+      if lsTexts.length > 0 && litMembershipRecvOk(nd0.isObj, fnIx) {
+        // The receiver's OWN members are all in the tested set: true by construction, and
+        // folded without evaluating the receiver — the atom ladder's twin fold.
+        //
+        // THE FOLD NEEDS A PURE LITERAL-UNION RECEIVER, NOT JUST ONE CARRYING LITERALS.
+        // `nodeLitMembersWithin` reads the STRING literal members and is blind to every
+        // other member, so over a MIXED `"b" | 1` — what an else-if chain narrows
+        // `"a" | "b" | 1` to — it reports "all mine are yours" for the tested `"b"` and
+        // folds a guard the value `1` must answer FALSE to. A plain `string` receiver has
+        // no members and never folds here either way.
+        if nodeTyIsLitUnion(nd0.isObj) {
+          if nodeLitMembersWithin(nd0.isObj, lsTexts) {
+            fbI32Const(1)
+            return 0
+          }
+        }
+        let lsOk = lsTexts.length == 1
+        if unionEqOperandOk(nd0.isObj) { lsOk = true }
+        if !lsOk { return emitFailNoMembershipRecv() }
+        let lsI = 0
+        while lsI < lsTexts.length {
+          if (
+            emitLitMemberEq(body, nd0.isObj, quoteLex(lsTexts[lsI]), fnIx) <
+            0
+          ) {
+            return -1
+          }
+          if lsI > 0 {
+            fbI32Bin(114) // 0x72 i32.or
+          }
+          lsI = lsI + 1
+        }
+        return 0
+      }
+    }
+  }
   // `x is i32` / `x is string` / … over a BOXED value union: the same box-tag
   // compare as a struct variant, against the atom's globally-stable scalar tag.
   const ndv = P.nodes[isIx]
@@ -2341,9 +2483,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
     if armTag == 2 && tyIsLitUnion(isVarTyIxOf(isIx)) {
       const amNm = isStrTagUnionNameOf(ndv.isObj, fnIx)
       if amNm != "" && unionStrArmCount(amNm) > 1 {
-        return emitFail(
-          "emitProgram: `is` over a literal-union arm needs a re-readable receiver (a call / optional-chain receiver has no membership lowering)",
-        )
+        return emitFailNoMembershipRecv()
       }
     }
     if armTag >= 0 {
@@ -2497,87 +2637,14 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   // A literal `is` over a still-BOXED mixed-rep union (`"a" | "b" | 1`) is the
   // tag-gated payload compare (`emitUnionLitIs`) — same-rep literals share a
   // tag, so the tag alone cannot discriminate them.
+  //
+  // The STRING literals of this arm are already claimed by the membership ladder above (a
+  // one-member set, through the same `emitLitMemberEq`); what reaches here is the NUMERIC
+  // literal spelling and any string one whose receiver the ladder's place bound declined.
   if nd0 is IsExpr {
     const lv = nd0.isVariant
     if isLitVariantName(lv) {
-      if exprUnion(nd0.isObj, fnIx) {
-        return emitUnionLitIs(body, nd0.isObj, lv, fnIx)
-      }
-      if !exprUnion(nd0.isObj, fnIx) {
-        // The QUOTED-LEAF test at its home (`tyname.nameIsQuotedLeaf`, W3). Its bound is
-        // `isLitVariantName`'s `length == 0` reject two lines up, not the home's.
-        if nameIsQuotedLeaf(lv) {
-          // The variant lexeme IS a raw quoted string lexeme (quotes kept,
-          // escapes unresolved — the same shape a `StrLit.strText` carries),
-          // so a synthesized `StrLit` node lowers it; then the value-eq core.
-          if !aUsed {
-            return emitFail(
-              "emitProgram: string `is` test but array type not collected",
-            )
-          }
-          if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
-          if emitExpr(body, mkStr(lv, -1), fnIx) < 0 { return -1 }
-          return emitStrEqCore(body)
-        }
-        return emitNumLitEq(body, nd0.isObj, lv, fnIx)
-      }
-    }
-  }
-  // `u is K` over a literal-union receiver whose REP IS ITS MEMBER STRING, not an
-  // interned atom. Both reps exist and `nodeTyIsLitUnionAlias` decides which: the atom
-  // valtype ladders carry a litunion only where its emit-time spelling is a registered
-  // ALIAS NAME, so a litunion with no alias of its own — the flattened `A | B`, and the
-  // bare inline spelling — stays a `(ref $array)` string at `RC_ROOT` and `RC_FN_PARAM`
-  // (`ctxKeepsLitUnion`). The receiver classifier agrees with the ladder by construction
-  // (`localLitUnion`/`exprIsLitAtom` key on the same alias test), so this arm is reached
-  // only where the value really is a string, and every path above has declined for the
-  // matching reason: the atom ladder because there is no atom, `nameIsLitUnionArmValueUnion`
-  // and the tag compares because an all-literal member set carries no box.
-  //
-  // The test is the SAME membership the atom ladder emits — the tested type's member set,
-  // ORed — lowered through string equality instead of interned-id equality: `recv == "m0"
-  // || recv == "m1" || …`, i.e. the `is <literal>` arm below repeated over the set. Without
-  // it the guard reached `monoStaticIsResult`, which sees a non-union REP and a tested name
-  // that is no variant row, and CONST-FOLDED IT TO FALSE — a branch that can never run,
-  // `vl check --codegen` clean.
-  if nd0 is IsExpr {
-    if !exprUnion(nd0.isObj, fnIx) && !exprIsLitAtom(nd0.isObj, fnIx) {
-      if nodeTyIsLitUnion(nd0.isObj) {
-        const lsTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
-        if lsTexts.length > 0 {
-          // The receiver's OWN members are all in the tested set: true by construction,
-          // and folded without evaluating the receiver — the atom ladder's twin fold.
-          if nodeLitMembersWithin(nd0.isObj, lsTexts) {
-            fbI32Const(1)
-            return 0
-          }
-          // Two or more members RE-READ the receiver, so those need a re-readable place
-          // (`unionEqOperandOk`); a one-member tested type evaluates it exactly once and
-          // accepts any receiver expression.
-          let lsOk = lsTexts.length == 1
-          if unionEqOperandOk(nd0.isObj) { lsOk = true }
-          if lsOk {
-            if !aUsed {
-              return emitFail(
-                "emitProgram: literal-union `is` test but array type not collected",
-              )
-            }
-            let lsI = 0
-            while lsI < lsTexts.length {
-              if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
-              if emitExpr(body, mkStr(quoteLex(lsTexts[lsI]), -1), fnIx) < 0 {
-                return -1
-              }
-              if emitStrEqCore(body) < 0 { return -1 }
-              if lsI > 0 {
-                fbI32Bin(114) // 0x72 i32.or
-              }
-              lsI = lsI + 1
-            }
-            return 0
-          }
-        }
-      }
+      return emitLitMemberEq(body, nd0.isObj, lv, fnIx)
     }
   }
   // `x is null` / `x is <member>` over a NULLABLE value whose rep is a
