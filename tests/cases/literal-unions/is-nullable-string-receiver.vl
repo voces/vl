@@ -1,0 +1,289 @@
+// @run
+// CONTRACT: `s is "m"` and `s is K` over a RAW `string | null` receiver — one never narrowed
+// by a `!= null` first — are the membership test over the receiver's VALUE, and A NULL
+// RECEIVER ANSWERS FALSE. `null is "m"` is a well-formed question whose answer is no.
+//
+// TWO SPELLINGS, ONE FAILURE, AND THEY HAD TO BE FIXED TOGETHER. The bare literal
+// `(string | null) is "m"` reached the shared per-member compare and read its receiver as a
+// VALUE — `ref.as_non_null` at a param/local/field/global (a TRAP on the null it exists to
+// answer for) and a bare `(ref null $array)` handed to `__str_eq__` at a call / map / element
+// receiver (`vl check` clean, INVALID WASM). The ALIAS spelling `is K` never lowered at all:
+// the membership ladder's receiver bound refused the nullable rep precisely BECAUSE
+// delegating to that compare would have spread the trap across the whole member set.
+//
+// So the null guard lives in `emitLitMemberEq` — the ONE per-member compare both spellings
+// share — as `emitNulStrLitEq`: one `br_on_null` over ONE raw read, the compare on the
+// non-null path and a const 0 on the null one. Neither spelling can answer this differently
+// from the other, and the receiver is read exactly once (a map read `m["k"]` is the common
+// shape and re-reading it would re-probe).
+//
+// THE IN-FILE ORACLE IS THE NARROWED TWIN. Every group below prints the raw spelling's answer
+// and, where the shape admits it, the `if s != null { s is … }` spelling's — which was always
+// correct — on the same three inputs. The two must agree on all three.
+//
+// SOUNDNESS, THE OTHER DIRECTION: the guard replaces a trap with `false`, so the THEN branch
+// must still be narrowed non-null (proved below by concatenating the receiver there) and the
+// ELSE branch must NOT be (a `+` on it is a type error, so it cannot be shown in an `@run`
+// case — `tests/cases/literal-unions/error-is-nullable-string-else-not-narrowed.vl` pins it).
+//
+// EVERY GROUP SPELLS DISJOINT LEXEMES so no alias registration can answer a lookup it was not
+// asked, and `"zz"` is the non-member everywhere.
+
+// ── a `string | null` PARAM: both halves, three inputs, against the narrowed twin ──
+// @log pa:L+ pa:A+ pa:I+ pa:S+ | pa:N+
+// @log pz:L- pz:A- pz:I- pz:S- | pz:N-
+// @log pn:L- pn:A- pn:I- pn:S- | pn:N-
+type PA = "pa" | "pb"
+type PS = "pa"
+function pParam(s: string | null, tag: string) {
+  let line = tag
+  if s is "pa" { line = line + ":L+" } else { line = line + ":L-" }
+  if s is PA { line = line + " " + tag + ":A+" } else { line = line + " " + tag + ":A-" }
+  if s is ("pa" | "pb") {
+    line = line + " " + tag + ":I+"
+  } else {
+    line = line + " " + tag + ":I-"
+  }
+  if s is PS { line = line + " " + tag + ":S+" } else { line = line + " " + tag + ":S-" }
+  // the narrowed twin — the spelling that already answered correctly
+  line = line + " | " + tag
+  if s != null {
+    if s is PA { line = line + ":N+" } else { line = line + ":N-" }
+  } else {
+    line = line + ":N-"
+  }
+  print(line)
+  0
+}
+pParam("pa", "pa")
+pParam("zz", "pz")
+pParam(null, "pn")
+
+// ── the THEN branch is narrowed NON-NULL: the receiver concatenates there ─────────
+// @log ta:then:ta
+// @log tz:else
+// @log tn:else
+// @log ua:thenK:ua
+// @log uz:elseK
+// @log un:elseK
+type UA = "ua" | "ub"
+function pThenLit(s: string | null, tag: string) {
+  if s is "ta" { print(tag + ":then:" + s) } else { print(tag + ":else") }
+  0
+}
+pThenLit("ta", "ta")
+pThenLit("zz", "tz")
+pThenLit(null, "tn")
+function pThenAlias(s: string | null, tag: string) {
+  if s is UA { print(tag + ":thenK:" + s) } else { print(tag + ":elseK") }
+  0
+}
+pThenAlias("ua", "ua")
+pThenAlias("zz", "uz")
+pThenAlias(null, "un")
+
+// ── the receiver ORIGINS: a `let`, a struct FIELD, a list ELEMENT, a module GLOBAL ─
+// The element and the field are where the bare literal produced INVALID WASM rather than a
+// trap — no read path recovers them, so the raw nullable ref reached `__str_eq__` directly.
+// @log oa:let+ oa:fld+ oa:elem+
+// @log oz:let- oz:fld- oz:elem-
+// @log on:let- on:fld- on:elem-
+// @log g0:glob+
+// @log g1:glob-
+// @hint redundant type annotation: `o` is inferred as `{f: string?}`
+// @hint redundant type annotation: `xs` is inferred as `string?[]`
+type OA = "oa" | "ob"
+type OBT = { f: string | null }
+let gOa: string | null = "oa"
+function pOriginsLit(v: string | null, tag: string) {
+  let line = tag
+  let l: string | null = null
+  l = v
+  if l is "oa" { line = line + ":let+" } else { line = line + ":let-" }
+  const o: OBT = { f: v }
+  if o.f is OA { line = line + " " + tag + ":fld+" } else { line = line + " " + tag + ":fld-" }
+  const xs: (string | null)[] = [v]
+  if xs[0] is "oa" {
+    line = line + " " + tag + ":elem+"
+  } else {
+    line = line + " " + tag + ":elem-"
+  }
+  print(line)
+  0
+}
+pOriginsLit("oa", "oa")
+pOriginsLit("zz", "oz")
+pOriginsLit(null, "on")
+function pGlobal(tag: string) {
+  if gOa is OA { print(tag + ":glob+") } else { print(tag + ":glob-") }
+  0
+}
+pGlobal("g0")
+gOa = null
+pGlobal("g1")
+
+// ── a MAP READ: `m["k"]` types `string | null`, so this IS the population, and it is
+// the receiver that must be read exactly ONCE (a re-read re-probes the table). ─────
+// @log ma:map+ ma:mapK+
+// @log mz:map- mz:mapK-
+// @log mn:map- mn:mapK-
+type MA = "ma" | "mb"
+function pMap(v: string | null, tag: string) {
+  const mp: { [string]: string } = Map()
+  if v != null { mp["k"] = v }
+  let line = tag
+  if mp["k"] is "ma" { line = line + ":map+" } else { line = line + ":map-" }
+  if mp["k"] is MA {
+    line = line + " " + tag + ":mapK+"
+  } else {
+    line = line + " " + tag + ":mapK-"
+  }
+  print(line)
+  0
+}
+pMap("ma", "ma")
+pMap("zz", "mz")
+pMap(null, "mn")
+
+// ── a CALL result and a `??` chain: neither is a re-readable PLACE, so a MULTI-member
+// tested type keeps the loud membership floor (parity with a plain `string` receiver);
+// a ONE-member tested type evaluates the receiver once and lowers. ────────────────
+// @log ca:call+
+// @log cz:call-
+// @log cn:call-
+type CS = "ca"
+let cSeed: string | null = "ca"
+function cGet(): string | null {
+  return cSeed
+}
+function pCall(tag: string) {
+  if cGet() is CS { print(tag + ":call+") } else { print(tag + ":call-") }
+  0
+}
+pCall("ca")
+cSeed = "zz"
+pCall("cz")
+cSeed = null
+pCall("cn")
+
+// ── `??` WITH A NULLABLE DEFAULT stays nullable at a RAW read, and that is what lets
+// `(p ?? q) is "m"` answer FALSE instead of trapping: a coalesce whose default can itself
+// be null must not declare a non-null result. `(p ?? q) != null` is the same read. ──
+// @log qa:q+ qa:nn
+// @log qb:q+ qb:nn
+// @log qn:q- qn:n
+type QS = "qa"
+function pCoalesce(p: string | null, q: string | null, tag: string) {
+  let line = tag
+  if (p ?? q) is QS { line = line + ":q+" } else { line = line + ":q-" }
+  if (p ?? q) != null {
+    line = line + " " + tag + ":nn"
+  } else {
+    line = line + " " + tag + ":n"
+  }
+  print(line)
+  0
+}
+pCoalesce("qa", null, "qa")
+pCoalesce(null, "qa", "qb")
+pCoalesce(null, null, "qn")
+
+// ── the TEST FORMS over a raw nullable receiver: negated, boolean-valued, a `while`
+// guard, inside `&&` and inside `||`. Each in BOTH spellings. ────────────────────
+// @log fa:neg+ fa:val+ fa:while+ fa:and+ fa:or+
+// @log fz:neg- fz:val- fz:while- fz:and- fz:or-
+// @log fn:neg- fn:val- fn:while- fn:and- fn:or-
+// @log ha:neg+ ha:val+ ha:while+ ha:and+ ha:or+
+// @log hz:neg- hz:val- hz:while- hz:and- hz:or-
+// @log hn:neg- hn:val- hn:while- hn:and- hn:or-
+type FA = "fa" | "fb"
+function pFormsLit(s: string | null, tag: string) {
+  let line = tag
+  if !(s is "fa") { line = line + ":neg-" } else { line = line + ":neg+" }
+  const b = s is "fa"
+  if b { line = line + " " + tag + ":val+" } else { line = line + " " + tag + ":val-" }
+  let n = 0
+  while n == 0 && (s is "fa") {
+    line = line + " " + tag + ":while+"
+    n = 1
+  }
+  if n == 0 { line = line + " " + tag + ":while-" }
+  if true && (s is "fa") {
+    line = line + " " + tag + ":and+"
+  } else {
+    line = line + " " + tag + ":and-"
+  }
+  if false || (s is "fa") {
+    line = line + " " + tag + ":or+"
+  } else {
+    line = line + " " + tag + ":or-"
+  }
+  print(line)
+  0
+}
+pFormsLit("fa", "fa")
+pFormsLit("zz", "fz")
+pFormsLit(null, "fn")
+function pFormsAlias(s: string | null, tag: string) {
+  let line = tag
+  if !(s is FA) { line = line + ":neg-" } else { line = line + ":neg+" }
+  const b = s is FA
+  if b { line = line + " " + tag + ":val+" } else { line = line + " " + tag + ":val-" }
+  let n = 0
+  while n == 0 && (s is FA) {
+    line = line + " " + tag + ":while+"
+    n = 1
+  }
+  if n == 0 { line = line + " " + tag + ":while-" }
+  if true && (s is FA) {
+    line = line + " " + tag + ":and+"
+  } else {
+    line = line + " " + tag + ":and-"
+  }
+  if false || (s is FA) {
+    line = line + " " + tag + ":or+"
+  } else {
+    line = line + " " + tag + ":or-"
+  }
+  print(line)
+  0
+}
+pFormsAlias("fa", "ha")
+pFormsAlias("zz", "hz")
+pFormsAlias(null, "hn")
+
+// ── an UN-ANNOTATED hole that resolves to `string | null`, and a `string | i32 | null`
+// BOX receiver: the two other reps a nullable string-literal test can meet. The box was
+// never broken (its member compare is the tag-gated payload one) and is the CONTROL. ─
+// @log ia:hole+
+// @log ia:box+
+// @log iz:hole-
+// @log iz:box-
+// @log in:hole-
+// @log in:box-
+// @log ii:box-
+type IA = "ia" | "ib"
+let iSeed: string | null = "ia"
+function iGet(): string | null {
+  return iSeed
+}
+function pHole(tag: string) {
+  let line = tag
+  const h = iGet()
+  if h is IA { line = line + ":hole+" } else { line = line + ":hole-" }
+  print(line)
+  0
+}
+function pBox(u: string | i32 | null, tag: string) {
+  if u is IA { print(tag + ":box+") } else { print(tag + ":box-") }
+  0
+}
+pHole("ia")
+pBox("ia", "ia")
+iSeed = "zz"
+pHole("iz")
+pBox("zz", "iz")
+iSeed = null
+pHole("in")
+pBox(null, "in")
+pBox(7, "ii")
