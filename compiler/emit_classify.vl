@@ -8735,6 +8735,37 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
       }
     }
   }
+  // `w.f == null` / `w.f != null` over a boxed-union FIELD narrows the member PATH — the
+  // null-compare twin of the `is` arm's member channel above, and the narrowing key is the
+  // same path string (`emitMem` unboxes under it). Without it the guard's TEST was correct
+  // (the box tag compare) while the then-arm's `w.f` read stayed the raw `(ref $uBox)` and
+  // went straight into its i32 consumer: `vl check` clean, INVALID WASM — while the `is null`
+  // spelling of the identical program was correct, because only THAT spelling had a member
+  // channel. The member set comes from the FIELD's own declared union name, not from
+  // `currentNarrowSetOf`, whose `unionNameOfIdent` fallback cannot resolve a path key.
+  const mnull = nullCmpRefOf(condIx)
+  if mnull >= 0 {
+    if P.nodes[mnull] is Member {
+      const mfn = memberUnionFieldName(mnull, fnIx)
+      if mfn != "" && isValueUnionName(mfn) {
+        const mk = memberPathKeyOf(mnull)
+        if mk != "" {
+          const mcn = P.nodes[condIx]
+          if mcn is BinExpr {
+            if mcn.binOp == "==" {
+              pushNarrow(mk, "null")
+              return true
+            }
+            const mrest = removeAtomFromSet(unionMemberSetOf(mfn), "null")
+            if mrest != "" {
+              pushNarrow(mk, mrest)
+              return true
+            }
+          }
+        }
+      }
+    }
+  }
   // The same null-compare narrowing over a BOXED STRUCT union with a `null` member
   // (`v: A | B | null`): `!=` strips `null` (so an inner `is`/else chain subtracts
   // toward a single variant), `==` pins `null`. The 1-struct niche (`S | null`) is
@@ -8762,6 +8793,25 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
   false
 }
 
+// The NON-NULL operand of a `x == null` / `x != null` comparison at `condIx` (parens
+// peeled, either operand order), or -1 when `condIx` is not a null compare. The ONE home
+// for that extraction, which the three narrowing selectors below and the emitter's own
+// null-test routing each wrote out by hand — and it is a GRAMMAR question (which side is
+// the literal), not a per-rep one, so a rep added to one selector cannot get the peel
+// subtly different from its siblings.
+function nullCmpRefOf(condIx: i32) {
+  const c = P.nodes[condIx]
+  if c is BinExpr {
+    if c.binOp == "==" || c.binOp == "!=" {
+      const lhs = P.nodes[unwrapParen(c.binLeft)]
+      const rhs = P.nodes[unwrapParen(c.binRight)]
+      if rhs is NullLit { return unwrapParen(c.binLeft) }
+      if lhs is NullLit { return unwrapParen(c.binRight) }
+    }
+  }
+  -1
+}
+
 // The receiver NAME when the condition at `condIx` is `<ident> == null` /
 // `<ident> != null` over a BOXED STRUCT union (2+ struct variants plus a `null`
 // member), else "". The value-union and 1-struct-niche forms are excluded (each
@@ -8770,11 +8820,7 @@ function structUnionNullCmpName(condIx: i32, fnIx: i32) {
   const c = P.nodes[condIx]
   if c is BinExpr {
     if c.binOp == "==" || c.binOp == "!=" {
-      const lhs = P.nodes[unwrapParen(c.binLeft)]
-      const rhs = P.nodes[unwrapParen(c.binRight)]
-      let refIx = -1
-      if rhs is NullLit { refIx = unwrapParen(c.binLeft) }
-      if lhs is NullLit { refIx = unwrapParen(c.binRight) }
+      const refIx = nullCmpRefOf(condIx)
       if refIx >= 0 {
         const r = P.nodes[refIx]
         if r is Ident {
@@ -8801,11 +8847,7 @@ function valueUnionNullCmpName(condIx: i32, fnIx: i32) {
   const c = P.nodes[condIx]
   if c is BinExpr {
     if c.binOp == "==" || c.binOp == "!=" {
-      const lhs = P.nodes[unwrapParen(c.binLeft)]
-      const rhs = P.nodes[unwrapParen(c.binRight)]
-      let refIx = -1
-      if rhs is NullLit { refIx = unwrapParen(c.binLeft) }
-      if lhs is NullLit { refIx = unwrapParen(c.binRight) }
+      const refIx = nullCmpRefOf(condIx)
       if refIx >= 0 {
         const r = P.nodes[refIx]
         if r is Ident {
@@ -8959,6 +9001,36 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
       if rest != "" {
         pushNarrow(nm, rest)
         return true
+      }
+    }
+  }
+  // The MEMBER-PATH dual of the arm above, and the complement of `setNarrowFromCond`'s
+  // own member channel: in the else of `w.f != null` the field IS `null`; in the else of
+  // `w.f == null` it is the non-null member set, which is what unboxes the else-arm's
+  // `w.f` reads. Both branch senses of both spellings must narrow, or the one left out is
+  // `vl check`-clean invalid wasm on the very program whose sibling spelling is correct —
+  // `if w.f == null { … } else { print(w.f) }` was exactly that residue after the
+  // then-side channel landed.
+  const emnull = nullCmpRefOf(condIx)
+  if emnull >= 0 {
+    if P.nodes[emnull] is Member {
+      const emfn = memberUnionFieldName(emnull, fnIx)
+      if emfn != "" && isValueUnionName(emfn) {
+        const emk = memberPathKeyOf(emnull)
+        if emk != "" {
+          const emcn = P.nodes[condIx]
+          if emcn is BinExpr {
+            if emcn.binOp == "!=" {
+              pushNarrow(emk, "null")
+              return true
+            }
+            const emrest = removeAtomFromSet(unionMemberSetOf(emfn), "null")
+            if emrest != "" {
+              pushNarrow(emk, emrest)
+              return true
+            }
+          }
+        }
       }
     }
   }
