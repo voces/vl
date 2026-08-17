@@ -2963,9 +2963,16 @@ pre-existing: `modRenamed` returns at the FIRST matching row; `modRwTsName` and
 `modTypeRenamed` scan on and take the LAST. A duplicate `from` needs two imports binding one
 local (a decl colliding with an import is diagnosed by `modCheckDupBindings`), and which row
 wins decides the diagnostic text and which import a reference resolves to — so neither reader
-is quietly normalized onto the other's answer. Pinned directly: two imports of the same local
-`g` from different modules run `1` (the FIRST import) and emit md5-identical bytes on both
-sides.
+is quietly normalized onto the other's answer.
+
+**The corpus pins it, and the pin has a witness.**
+`tests/cases/modules/duplicate-import-first-vs-last/` imports one value name and one TYPE name
+from each of two modules that both export them, and asserts `1` (the FIRST module's function)
+and `beta` (the SECOND module's `string` type). Each collapse was compiled into a real compiler
+by the saved good seed and run: `modRenamed` on the LAST view prints **2**, and the type readers
+on the FIRST view stop the case checking with `cannot assign string to 't' of type i32`. Without
+that case nothing in the corpus notices a "tidy" that merges the two views, and the failure it
+would let through is a silently different import binding.
 
 `modRenamed` also consults the map **before** the shadow stack. Same answer either way — a name
 absent from the map renames to itself whether or not a local shadows it — and 64.4% of calls
@@ -3024,8 +3031,8 @@ Every rc read BARE.
 | `scripts/refresh-compiler.sh` | rc 0, **1,151,180 B** |
 | **seed ladder leg 2** (`mv` the seed out, `fetch-seed.sh`, `refresh --prove-fixpoint`) | rc 0 — **fixpoint in 2 compiles**, and its md5 is the artifact the A/B timed |
 | `scripts/lint-self.sh` | rc 0 (`vl fmt -w compiler/driver.vl` once) |
-| `deno test -A tests/cases_wasm_test.ts` | **1,706 passed / 0 failed / 7 ignored** |
-| `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check tests/selfhost_native_align_test.ts` | **1,713 passed / 0 failed / 0 ignored** — and verified BOTH ways: without the env var the same file reads 0 / 0 / **1,713 ignored**, so the count is the suite and not a self-ignore |
+| `deno test -A tests/cases_wasm_test.ts` | **1,707 passed / 0 failed / 7 ignored** (1,706 before the duplicate-import case) |
+| `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check tests/selfhost_native_align_test.ts` | **1,714 passed / 0 failed / 0 ignored** (1,713 before it; the suite is discovery-based, so the case needs no registration) — and verified BOTH ways: without the env var the same file reads 0 / 0 / **1,713 ignored**, so the count is the suite and not a self-ignore |
 | **six-channel A/B** (check rc, check stderr, build rc, emitted BYTES, run rc, run stdout) over the 57 multi-module corpus cases + `compiler/entry.vl` | **58 / 58 same**, one result file per worker, run against the shipped artifact |
 | the same six channels over single-module corpus files | **304 of 1,655 same, 0 differing** — a PARTIAL sweep, cut off at a 24-core box sitting at load 90–175 under other agents. It is the module bucket, not this, that is the population the row is about |
 
