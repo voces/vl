@@ -52,6 +52,7 @@ Nothing. The queue is empty; pick from the bands below.
 | **B9a/B9b** routings + endpoint | #1375 | shipped; the endpoint row was **mis-identified**, divergence deliberate |
 | **B9** W13 floor | #1372 | re-derived: **12, not ~60** |
 | **C1** union box melt | #1363 | shipped; 1.36x default / 1.68x `-O` |
+| **C2** backing-pointer LICM | — | **CLOSED, measured negative** — anchor stale; emitter reaches 1 of 7 reads (2.9%); binaryen's `licm` is top-level-only; the axis is the inlining budget, not the view count |
 | **C6** `match` binding in value position | #1367 | shipped; unblocked `if` too |
 | **C9** webcraft doc staleness | #1351 | shipped |
 | **C10** names section | #1351 | **resolved** — consumer passes `--names`; default flip costs the seed +5.3% |
@@ -72,8 +73,11 @@ Also landed: #1344 (brand-only union arms — owner-confirmed narrowing), #1345
 (`modTypeRenamed` — behaviour difference REFUTED), #1360 (fourth dead playbook
 gate), #1369 (A5b/A5c/A5d literal-inference rows).
 
-**Cycle scorecard: 8 filed claims refuted or corrected by measurement**, five of
-them numbers or units, three of them framings. Two were the orchestrator's own.
+**Cycle scorecard: 9 filed claims refuted or corrected by measurement**, five of
+them numbers or units, four of them framings. Two were the orchestrator's own.
+C2 contributed a framing (the descriptor reload was filed as "two views of one
+width, GUFA cannot fold" and is really "the inlining budget did not melt the
+descriptor") and a stale anchor.
 
 ---
 
@@ -199,7 +203,7 @@ small and concentrated.
 | id | item | anchor | measured | status | eff | risk |
 |---|---|---|---|---|---|---|
 | **C1** | **P1.3 — union box must melt when the payload is READ** | `unboxed-union-rep-design.md` §12.4 / §12.7 | phase 1 **#1322** (78 sites over 76 functions; **wash** at plain `vl build`, **1.76× at `-O`**); if-expr **#1337** (1.67× at `-O`); binding sink (1.36× default / 1.68× `-O`). The `let`-on-two-branches remainder re-derived: **4/4/4 with the payload READ**, and the blocker is Heap2Local's single-definition requirement, not the emitter | **CLOSED — measured negative.** Three sinkable spellings ship; the fourth needs a REP change (escalated, not done) | M | med |
-| **C2** | **P1.4 follow-on — backing-pointer LICM** for view descriptor fields | ROADMAP `:949` | two views of one width costs **3.5×** (1.713 vs 0.493 ns/elem); the fence is **11%** of the excess, the per-element field reload **89%** | OPEN | L | med |
+| **C2** | **P1.4 follow-on — backing-pointer LICM** for view descriptor fields | ROADMAP `:409` (the filed `:949` was STALE — it points into `A-infer-map-value`); `buffer-design.md` §M4 | re-derived: `axpy-view` **1.725 ns/elem at `-O3`** vs a byte-identical hand-hoisted twin **0.573** = **3.01×**; split re-derived on one-axis-apart modules as reload **90.3%** / fence **9.7%** | **REFUTED — measured negative.** Emitter can reach 1 of 7 reads (**2.9%**); binaryen's `licm` moves only TOP-LEVEL loop-body statements; the axis is the INLINING BUDGET, not the view count (`scale-seedtwice`: one view, one column, **3.05×**). Route around = `--always-inline-max-function-size=60` (0 reads, 1.736→0.636 ns) at **+82% size / +127% opt time** on the compiler → belongs to **C3** | L | med |
 | **C3** | **P1.3 — optimization defaults** | ROADMAP `:353` | three-rung sweep separates `OPT-LOSES` (7 rows) from `O3-WORSE-THAN-O` (`sort-heap` 854/**648**/837) | **OWNER RULING** `O-release-rung-default` | S in code | moves published guidance |
 | **C9** | **webcraft doc staleness** — P1.2, the `wasm-opt` soft-no-op clause, `match` phase 2 | `webcraft-requirements.md` :309/:371-396, :446, :806 | three blocks describe shipped capability as open | IN FLIGHT | S | none |
 | **C10** | **Names section** — the ask says "keep emitting"; it is **opt-in and off by default** | `emit_sections.vl` `gEmitNames`; `--names` | default build **167 B, no names**; `--names` **258 B**. Flipping the default costs the seed **+60,297 B (+5.3%)**: 1,137,213 → 1,197,510 | **Resolution: consumer passes `--names`.** Do NOT flip the default | S (doc) | none |

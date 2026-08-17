@@ -1676,7 +1676,9 @@ Five things fall out, in order of how much they should change behaviour:
   > **PROVEN, and it was an underestimate (§M4).** The disassembly shows the two-view loop
   > reloading `length` four times and `base` three times PER ELEMENT — seven `struct.get`s that no
   > rung hoists, worth 1.2 ns/element rather than 0.27. It is also conditional on the whole program:
-  > with ONE view of a width live, GUFA folds both fields and the reload disappears entirely.
+  > when binaryen's inlining budget folds `f32view` into the function that owns the loop, Heap2Local
+  > melts the descriptor and the reload disappears entirely — which is why a change anywhere in the
+  > module can decide it. The LICM repair itself is **refuted** (§M4).
 
 Caveat on the middle column: `-O` and unoptimized differ by up to 8% in both directions across
 these rows (`buf` 2.436 → 2.504 but `view` 2.734 → 2.530). That is this harness's noise floor, and
@@ -2084,16 +2086,57 @@ The disassembly names it. Counting `struct.get` inside the loop at `-O3`:
 | `axpy-view` | 6 | **7** | 1.713 |
 
 `axpy-view`'s inner loop reloads `length` four times and `base` three times per element, from the
-view struct, every iteration. The other three reload neither. The mechanism is not the number of
-views in the loop as such — it is what GUFA can prove:
+view struct, every iteration. The other three reload neither.
 
-- `scale`, `reduce` and `rows` each hold ONE view, so every `struct.new` of the view shape agrees on
-  both field values. GUFA folds `length` to the literal `1048576` and sinks `base` into a local
-  before the loop. Nothing is left to read.
-- `axpy` holds TWO views of the same width whose `base` differs (one column at offset 0, one at
-  offset N*4). No field folds, and **binaryen does not hoist the loads out of the loop either** —
-  even though the fields are IMMUTABLE in the emitted type (`(struct (field i32) (field i32))`, no
-  `mut`) and the loop contains no allocation. There is no LICM for them at any rung.
+**The mechanism is the INLINING BUDGET, not the view count and not GUFA field folding.** The
+disassembly says it plainly: at `-O3` the three fast kernels are down to TWO functions and ONE
+`struct.new` in the whole module — the `Buffer`'s. `f32view` was inlined into the driver, and with
+the allocation and all its uses in one function Heap2Local melts the descriptor outright; there is
+no struct left to read a field from. `axpy-view` at `-O3` still has FOUR functions and TWO
+`struct.new`s: `f32view` survived as a callee, so the descriptor is built there and returned, which
+no rung can melt, and every access reloads it.
+
+Three controls separate the two candidate axes, and they agree:
+
+| control | views | descriptor melted? | `-O3` ns/element |
+|---|---|---|---|
+| `scale-view` | 1 | yes (2 funcs, 1 `struct.new`) | **0.447** |
+| `scale`, `f32view(0,N)` called twice — two descriptors that AGREE on both fields | 2 | yes (2 funcs, 1 `struct.new`) | **0.440** |
+| `scale-seedtwice` — one view, an idempotent helper called twice | **1** | **no** (3 funcs, 2 `struct.new`) | **1.363** |
+| `scale`, second column at a different offset, hot loop touches ONE of them | 2 | no (4 funcs, 2 `struct.new`) | ~1.36 |
+
+The second row kills "GUFA cannot fold two disagreeing `struct.new`s": two descriptors that agree on
+*both* fields are still two, and it stays fast. The third row kills "two views of one width": ONE
+view, ONE column, a kernel whose source does not change a character, and it runs **3.05x slower**
+because an unrelated helper elsewhere in the file gained a second call site. `scale-seedtwice` is in
+`bench/buffer-view-bounds/` as the standing control for exactly this.
+
+**And binaryen will not hoist what it cannot melt.** Every precondition a mover could want holds:
+the reads are loop-invariant, the field is IMMUTABLE in the optimized type (`(struct (field i32)
+(field i32))`, no `mut` — binaryen's own `GlobalTypeOptimization` refines it there, so the emitter
+declaring the field mutable is NOT the blocker), the reference is non-nullable so the read cannot
+trap, and the loop allocates nothing. They stay in anyway, at every rung, because binaryen's `licm`
+is (a) not in the release pipeline and (b) written to move only TOP-LEVEL statements of the loop
+body. The two-function probe in `tests/vl_view_descriptor_melt_test.ts` is identical on both sides
+except for that nesting: `--licm` alone hoists 3 of 3 reads out of the top-level spelling and 0 of 3
+out of the one nested inside the fence's `if`, and the full release profile hoists neither (it sinks
+a single-use hoisted local straight back into the `if`).
+
+**So the emitter is not the lever, and "backing-pointer LICM" as an emitter pass is refuted.** Only
+ONE of `axpy-view`'s seven per-element reads is written in the user's function — the `i < y.length`
+in the loop guard. The other six are inside `std:buffer`'s `getF32`/`setF32` and enter the loop only
+when binaryen inlines them, long after the emitter is done. Hand-hoisting exactly the one an
+AST-level pass could reach, in the emitted module, is worth **2.9%** (1.780 -> 1.729 ns/element, all
+seven reads costing ~0.17 ns each and scaling linearly with how many are left).
+
+The lever that DOES work is binaryen's inline threshold, and it is priced rather than taken:
+`--always-inline-max-function-size=60` (the smallest multiple of ten that melts this kernel) takes
+`axpy-view` at `-O3` to **0 `struct.new` and 0 per-element reads**, 1.736 -> 0.636 ns/element, in a
+module that is also 113 bytes SMALLER. On the 1.16 MB compiler module the same flag costs **+82% of
+module size** (955,265 -> 1,740,871 B) and **+127% of `wasm-opt` wall time** (22s -> 50s), so it is
+not a candidate for `RELEASE_PASSES`. `--flexible-inline-max-function-size=60` is the cheaper half —
+5 of 14 reads left, 1.199 ns/element, +28% compiler size — and buys 1.45x for a size tax that P1.3
+would still have to rule on.
 
 **The attribution is a MEASUREMENT, not an inference.** `axpy-fencedhoist` is the control that
 separates the two candidates: it keeps the check — the same six per-access compares, written by hand
@@ -2112,6 +2155,25 @@ each), and (view − fencedhoist) = **1.095 ns** is the whole cost of the seven 
 loop, same check, one difference. The check is 11% of the fenced spelling's excess and the reload is
 89%.
 
+**Re-derived at the byte level.** The table above compares four separately compiled VL sources, so
+"one difference" is an argument about the sources. It was re-run on three modules that are literally
+the same bytes except for the one axis each: take `axpy-view`'s own `-O3` output, replace exactly
+the seven in-loop `struct.get`s with reads of four locals filled before the trip loop (B), then
+delete exactly the six `if <cmp> then unreachable` blocks from B (C). Interleaved min/median of 9
+CPU-time reps, control-subtracted:
+
+| module | reload | fence | ns/element |
+|---|---|---|---|
+| A = `axpy-view` `-O3` as emitted | 7 | yes | **1.725** |
+| B = A with the 7 reads hoisted, nothing else | 0 | yes | **0.573** |
+| C = B with the 6 compares deleted, nothing else | 0 | no | **0.449** |
+
+(A − B) = 1.152 ns is the reload, **90.3%** of the 1.276 ns excess; (B − C) = 0.124 ns is the fence,
+**9.7%**. That is the 89/11 split independently confirmed on the current tree, with the two axes
+separated by editing one module rather than by compiling two programs. B also survives a further
+`-O` or `-O3` pass with its hoist intact (0 in-loop reads at all three rungs), which is what says the
+hoist is a real missing transform and not something binaryen would undo.
+
 The practical consequence is the one webcraft should take away: **the fence and the speed are both
 available today, together.** A hand-fenced hoisted loop runs at 1.35x the unfenced hoisted kernel,
 against 4.1x for the fenced view spelling — and it does so at EVERY rung, including no flags, where
@@ -2126,17 +2188,21 @@ fixing anything, and because the same 3.0x is reachable today by hand.
 
 Two consequences a kernel author has to design around, and neither is local to the loop:
 
-- **The fenced spelling's cost depends on the rest of the program.** Adding a second column of the
-  same width to a module can turn a free check into a 3.5x one without the kernel's source changing
-  a character. That is the opposite of the property "written to the fast pattern deliberately"
-  needs, and it is the strongest argument in this file for hoisting a hot loop by hand rather than
-  trusting the rung.
-- **This is the un-hoisted BACKING POINTER, priced.** §L4 attributed its residual 0.27 ns/element at
-  `-O3` to "the per-access `struct.get` of the base field not being hoisted", explicitly without
-  reading a disassembly. That attribution is now confirmed AND was an underestimate twice over: the
-  field re-read is `length` as often as `base` (the bounds check needs it too), and on a two-view
-  loop the total is 1.2 ns/element rather than 0.27. It is ROADMAP B6b's "backing-pointer hoisting
-  (LICM)", and it is the largest single number in this tier.
+- **The fenced spelling's cost depends on the rest of the program, and the dependence is worse than
+  "a second column".** Any edit that keeps a second callee alive — `scale-seedtwice` calls one
+  idempotent helper twice — can turn a free check into a 3.0x one with one view, one column, and no
+  change to the kernel at all. That is the opposite of the property "written to the fast pattern
+  deliberately" needs, and it is the strongest argument in this file for hoisting a hot loop by hand
+  rather than trusting the rung.
+- **This is the un-hoisted BACKING POINTER, priced — and it is not an emitter LICM item.** §L4
+  attributed its residual 0.27 ns/element at `-O3` to "the per-access `struct.get` of the base field
+  not being hoisted", explicitly without reading a disassembly. That attribution is confirmed AND
+  was an underestimate twice over: the field re-read is `length` as often as `base` (the bounds
+  check needs it too), and on a two-view loop the total is 1.2 ns/element rather than 0.27. ROADMAP
+  B6b files the repair as "backing-pointer hoisting (LICM)"; the measurement above refutes that
+  shape of repair (six of the seven reads are not in the emitter's reach, and binaryen will not move
+  the seventh's shape either) and replaces it with an inline-threshold question that belongs to the
+  optimization-defaults row, priced at +82% module size on the compiler.
 
 ### M5. The fast pattern, stated — and which rung it needs
 
@@ -2200,6 +2266,15 @@ For everything else, in the order the decisions get made:
   the delta measures the fence and nothing else), and the fast pattern is bare. A moved cell is a
   finding in either direction and must be re-justified here in the same commit. Verified live by
   sabotage: perturbing one golden cell fails that fixture and nothing else.
+- `tests/vl_view_descriptor_melt_test.ts` — the three facts M4 turns on, pinned as shapes: the
+  two-function `--licm` probe (binaryen hoists the top-level spelling, 3 of 3, and the nested one 0
+  of 3, at every rung — the `--licm`-alone row is the live control that proves the probe is not
+  inert); `scale-view` vs `scale-seedtwice` (0 in-loop reads and 1 `struct.new` against 5 and 2,
+  from a source difference that is one repeated call to an idempotent helper); and the priced route
+  around (`--always-inline-max-function-size=60` takes `axpy-view` from 7 reads / 2 allocations to
+  0 / 0). Sabotage-verified all three ways: top-levelling the probe's nested reads, deleting
+  `scale-seedtwice`'s second seed call, and lowering the threshold to 20 each redden exactly their
+  own assertion.
 - `bench/buffer-view-bounds/run.sh` — the timing half. Not CI-gated (no timing can be), but
   self-checking: it fails rather than reports if wasm-opt is missing, if a rung's module size did not
   move, if any run prints the wrong value, or if a kernel ran within 3x of its own R=0 control.

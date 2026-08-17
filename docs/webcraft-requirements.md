@@ -631,16 +631,24 @@ eliminate some checks; "some" isn't a contract.)
 >
 > Same two-traps-per-access in every row. What separates the last row is that
 > its loop reloads `base` and `length` **from the view struct seven times per
-> element**, and the other three reload neither — because with ONE view of a
-> width live in the module, GUFA folds both fields to constants, and with two it
-> cannot. Binaryen does not hoist those loads out of the loop at any rung, even
-> though the fields are immutable. So conclusion 3 above was right that a
-> residual survives inlining and right about the mechanism, but it was **1.2
-> ns/element, not 0.27**, and `length` is reloaded as often as `base`.
+> element**, and the other three reload neither — because in those three the
+> whole module collapses into the driver, `f32view` is inlined, and the view
+> descriptor is **melted away entirely** (one `struct.new` left in the module,
+> the `Buffer`'s). In the last row `f32view` survives as a callee, so the
+> descriptor is built there and returned, which nothing can melt. Binaryen does
+> not hoist the loads out of the loop at any rung either, even though the fields
+> are immutable — its loop-invariant motion moves only top-level loop-body
+> statements, never a read nested inside the fence's `if`. So conclusion 3 above
+> was right that a residual survives inlining and right about the mechanism, but
+> it was **1.2 ns/element, not 0.27**, and `length` is reloaded as often as
+> `base`.
 >
 > **The part to design around: the fenced spelling's cost is a WHOLE-PROGRAM
-> property.** Adding a second column of the same width to a module can turn a
-> free check into a 3.5x one without the kernel's source changing a character.
+> property, and it does not even need a second column.** The axis is whether the
+> inlining budget melts the descriptor, so an unrelated edit can turn a free
+> check into a 3.0x one: `scale-seedtwice` is the one-column kernel with an
+> idempotent helper called twice, and it runs 0.447 -> 1.363 ns/element with the
+> kernel's source unchanged. Adding a second column does it too.
 >
 > **2a. And the fence is separable from that cost — you can keep it.** The
 > control that proves the attribution is the same `axpy` loop with the same six
