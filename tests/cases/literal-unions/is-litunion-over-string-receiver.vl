@@ -1,0 +1,159 @@
+// @run
+// CONTRACT: `s is K` over a receiver that is NOT itself a literal union — a plain `string`,
+// a value-union box whose string arm is not `K`, a narrowed `string | null`, a
+// monomorphized un-annotated param — is the MEMBERSHIP test `s == "m0" || s == "m1" || …`
+// over K's member set, at every receiver position and in every test form.
+//
+// The literal spelling one line away is the ORACLE and it always answered correctly:
+// `s is "m0"` on a `string` lowers to `__str_eq__`. The ALIAS spelling reached no rep path
+// at all — no box, no interned atom, and the litunion string-rep arm keyed on the RECEIVER
+// being a litunion — so it fell to the monomorphized static-`is` fold, which sees a
+// non-union rep and a tested name that is no variant row, and CONST-FOLDED IT TO FALSE. A
+// branch that can never run, `vl check --codegen` rc 0.
+//
+// The BOX receiver below is the same defect with the opposite sign: a litunion tested type
+// claims kind 2's tag, the same tag a plain `string` arm claims, so the tag compare answered
+// TRUE for every string a `string | i32` box holds — members and non-members alike.
+//
+// Both now route through ONE per-member compare shared with the bare-literal spelling
+// (`emitLitMemberEq`), so the two spellings emit the same bytes and cannot disagree.
+//
+// EVERY GROUP SPELLS DISJOINT LEXEMES (#1304's method note) so no alias registration can
+// answer a lookup it was not asked, and `"zz"` is the non-member everywhere.
+
+// ── a `string` PARAM: the alias, the inline spelling, and the bare literal ───────
+// @log sa:A
+// @log sa:I
+// @log sa:L
+// @log sb:A
+// @log sb:I
+// @log sb:-
+// @log zz:-
+// @log zz:-
+// @log zz:-
+type SA = "sa" | "sb"
+function pStr(s: string, tag: string) {
+  if s is SA { print(tag + ":A") } else { print(tag + ":-") }
+  if s is ("sa" | "sb") { print(tag + ":I") } else { print(tag + ":-") }
+  if s is "sa" { print(tag + ":L") } else { print(tag + ":-") }
+  0
+}
+pStr("sa", "sa")
+pStr("sb", "sb")
+pStr("zz", "zz")
+
+// ── the TEST FORMS: a negated guard, a boolean-valued `is`, an `is` in a `while` ─
+// @log fa:neg+
+// @log fa:val+
+// @log fa:while+
+// @log zz:neg-
+// @log zz:val-
+// @log zz:while-
+type FA = "fa" | "fb"
+function pForms(s: string, tag: string) {
+  if !(s is FA) { print(tag + ":neg-") } else { print(tag + ":neg+") }
+  const b = s is FA
+  if b { print(tag + ":val+") } else { print(tag + ":val-") }
+  let n = 0
+  while n == 0 && (s is FA) {
+    print(tag + ":while+")
+    n = 1
+  }
+  if n == 0 { print(tag + ":while-") }
+  0
+}
+pForms("fa", "fa")
+pForms("zz", "zz")
+
+// ── the receiver ORIGINS: a `let`, a struct field, a list element, a module global ─
+// @log oa:let
+// @log oa:fld
+// @log oa:elem
+// @log zz:-
+// @log zz:-
+// @log zz:-
+// @log g0:glob
+// @log g1:-
+type OA = "oa" | "ob"
+type ObT = { f: string }
+let gOa: string = "oa"
+function pOrigins(s: string, tag: string) {
+  let l: string = "zz"
+  l = s
+  if l is OA { print(tag + ":let") } else { print(tag + ":-") }
+  const o: ObT = { f: s }
+  if o.f is OA { print(tag + ":fld") } else { print(tag + ":-") }
+  const xs: string[] = [s]
+  if xs[0] is OA { print(tag + ":elem") } else { print(tag + ":-") }
+  0
+}
+pOrigins("oa", "oa")
+pOrigins("zz", "zz")
+function pGlobal(tag: string) {
+  if gOa is OA { print(tag + ":glob") } else { print(tag + ":-") }
+  0
+}
+pGlobal("g0")
+gOa = "zz"
+pGlobal("g1")
+
+// ── the BOX rep: a value union whose ONE string-repped arm is not the tested type ─
+// @log ba:A
+// @log zz:-
+// @log int:-
+type BA = "ba" | "bb"
+function pBox(u: string | i32, tag: string) {
+  if u is BA { print(tag + ":A") } else { print(tag + ":-") }
+  0
+}
+pBox("ba", "ba")
+pBox("zz", "zz")
+pBox(7, "int")
+
+// ── a `string | null` NARROWED to non-null: the recovered read is a plain string ──
+// @log na:A
+// @log zz:-
+// @log n:null
+type NA = "na" | "nb"
+function pNul(u: string | null, tag: string) {
+  if u != null {
+    if u is NA { print(tag + ":A") } else { print(tag + ":-") }
+  } else {
+    print(tag + ":null")
+  }
+  0
+}
+pNul("na", "na")
+pNul("zz", "zz")
+pNul(null, "n")
+
+// ── a MONOMORPHIZED un-annotated param, pinned to `string` AND to `i32` ───────────
+// The i32 instance must keep the static fold: a string compare there would be invalid wasm.
+// @log ga:A
+// @log zz:-
+// @log int:-
+type GA = "ga" | "gb"
+function pGen(v, tag: string) {
+  if v is GA { print(tag + ":A") } else { print(tag + ":-") }
+  0
+}
+pGen("ga", "ga")
+pGen("zz", "zz")
+pGen(7, "int")
+
+// ── CONTROLS: a base-TYPE test over a string, and a member lexeme carrying an escape ─
+// @log c:str
+// @log q0:A
+// @log q1:-
+function pBase(s: string, tag: string) {
+  if s is string { print(tag + ":str") } else { print(tag + ":-") }
+  0
+}
+pBase("zz", "c")
+type EA = "e\"a" | "eb"
+function pEsc(s: string, tag: string) {
+  if s is EA { print(tag + ":A") } else { print(tag + ":-") }
+  0
+}
+pEsc("e\"a", "q0")
+pEsc("zz", "q1")
