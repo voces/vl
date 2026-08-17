@@ -3134,6 +3134,41 @@ function parentBindingOf(fe: i32, name: string) {
   -1
 }
 
+// The enclosing-frame BINDING a CAPTURED `name` of the capturing lifted function `fnIx`
+// resolves to — a `Param` or a `LetDecl` arena index — or -1 when `name` is not a capture of
+// `fnIx`. THE capture channel for the expression classifiers, and the reason they cannot
+// disagree with the env struct: `captureValKind` below types the env FIELD off this very
+// binding, so a classifier answering "what rep does this READ have" from the same node is
+// answering the same question about the same declaration. The guards mirror
+// `capturedStructIndex`'s.
+function capturedBindingOf(fnIx: i32, name: string) {
+  if fnIx < 0 { return -1 }
+  if !fnValUsed { return -1 }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return -1 }
+  const caps = captureNamesOf(fe)
+  let ci = 0
+  while ci < caps.length {
+    if caps[ci] == name { return parentBindingOf(fe, name) }
+    ci = ci + 1
+  }
+  -1
+}
+
+// The ARENA index of the `FuncDecl` whose frame OWNS a captured `name`'s binding, or -1.
+// `capturedBindingOf`'s companion: an UN-ANNOTATED binding is classified from its
+// INITIALIZER, and an initializer only resolves in the frame it was written in.
+// `parentBindingFrameOf` answers in `fnStmts` POSITIONS while every classifier's `fnIx` is an
+// arena index, so the conversion lives here rather than at each caller.
+function capturedBindingFrameOf(fnIx: i32, name: string) {
+  if fnIx < 0 { return -1 }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return -1 }
+  const par = parentBindingFrameOf(fe, name)
+  if par < 0 || par >= fnStmts.length { return -1 }
+  fnStmts[par]
+}
+
 // The `fbValtype` kind for a captured variable `name` of lifted function `fe`,
 // resolved against the parent frame's binding (a param's annotation, or a local
 // `let`'s annotation / struct-literal initializer). Defaults to i32 (kind 0).
@@ -10258,6 +10293,10 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     return nodeTyIsNulLitUnion(exprIx)
   }
   if e is Ident {
+    // A CAPTURED variable, resolved against the enclosing frame's binding — the niche twin of
+    // `exprIsLitAtom`'s capture channel, and the same node `captureValKind` sizes the env
+    // field from. Checked first: a capture is none of the three channels below.
+    if capturedIsNulLitUnion(fnIx, e.identName) { return true }
     if fnIx >= 0 {
       const fn = P.nodes[fnIx]
       if fn is FuncDecl {
@@ -14184,6 +14223,56 @@ export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
   false
 }
 
+// True when the BINDING at `bindIx` — a `Param` or a `LetDecl` — holds an interned i32 ATOM
+// rather than a member STRING. This is the ONE question every channel of `exprIsLitAtom` asks
+// about a name's DECLARATION SITE, and it is the same question `vtKindOfType` answers with
+// "i32" when it sizes that binding's SLOT (`nodeTyIsLitUnionAlias` on the annotation) and that
+// `collectLocals` answers when it sets `localLitUnion` from an un-annotated initializer.
+// `ownerFnIx` is the ARENA index of the frame the binding lives in (-1 at module scope): the
+// un-annotated arm classifies the INITIALIZER, which resolves only in its own frame.
+export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
+  if bindIx < 0 { return false }
+  const bn = P.nodes[bindIx]
+  if bn is Param { return nodeTyIsLitUnionAlias(bn.parType) }
+  if bn is LetDecl {
+    return letIsLitUnion(bindIx) || letInitIsLitAtom(bindIx, ownerFnIx)
+  }
+  false
+}
+
+// The `K | null` NICHE dual of `bindingIsLitAtom`: the binding holds the same i32 atom with
+// the spare `-1` encoding null (no box).
+function bindingIsNulLitUnion(bindIx: i32, ownerFnIx: i32) {
+  if bindIx < 0 { return false }
+  const bn = P.nodes[bindIx]
+  if bn is Param { return nodeTyIsNulLitUnion(bn.parType) }
+  if bn is LetDecl { return letNulLitUnion(bindIx, ownerFnIx) }
+  false
+}
+
+// True when `name` is a CAPTURED variable of the capturing lifted function `fnIx` whose
+// enclosing-frame binding holds an i32 atom. The CAPTURE channel of `exprIsLitAtom`, which
+// otherwise resolves an identifier through the reader's own declared locals, its own params
+// and the module globals — none of which a capture is. Missing it, a captured atom read as a
+// STRING: `strReppedLitUnionAt` claimed it and `emitStrToAtom` handed the env field's i32 to
+// `__str_eq__`, while `print` skipped the atom→member widen and printed the RAW ID.
+function capturedIsLitAtom(fnIx: i32, name: string) {
+  bindingIsLitAtom(
+    capturedBindingOf(fnIx, name),
+    capturedBindingFrameOf(fnIx, name),
+  )
+}
+
+// The niche dual of `capturedIsLitAtom` — `exprNulLitUnion`'s capture channel. A `K | null`
+// capture rides the same i32 env field (`vtKindOfType` answers "i32" for both spellings), so
+// both classifiers need the channel or the two spellings disagree about one field.
+function capturedIsNulLitUnion(fnIx: i32, name: string) {
+  bindingIsNulLitUnion(
+    capturedBindingOf(fnIx, name),
+    capturedBindingFrameOf(fnIx, name),
+  )
+}
+
 // True if `exprIx` is a literal-union ATOM VALUE (an i32 id) — a litunion-flagged local or a litunion-
 // annotated param. Distinguishes a real atom from a checker-inferred literal union (which is a string).
 export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
@@ -14195,6 +14284,11 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   if exprNulLitUnion(exprIx, fnIx) { return true }
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Ident {
+    // A CAPTURED variable, resolved against the enclosing frame's binding — the same node
+    // `captureValKind` sizes the env field from, checked FIRST for the reason
+    // `emitIdentNode` checks `emitCapturedRead` first: a capture shadows nothing (it is by
+    // construction neither a local nor a param of the reader, nor a global).
+    if capturedIsLitAtom(fnIx, e.identName) { return true }
     const slot = declaredSlotOf(e.identName)
     if slot >= 0 && slot < localLitUnion.length {
       if localLitUnion[slot] == 1 { return true }
@@ -14208,9 +14302,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     if gli >= 0 {
       // An annotated `: K` global OR an UN-annotated global whose init is an atom
       // (`const r = pick(ks)` / `const r = ks[0]`) — the global dual of the
-      // `localLitUnion` init classification `collectLocals` applies (`letInitIsLitAtom`),
-      // so a `print(r)` widens the atom to its member string instead of printing the raw id.
-      return letIsLitUnion(gli) || letInitIsLitAtom(gli, -1)
+      // `localLitUnion` init classification `collectLocals` applies, through the same
+      // declaration-site answer the capture channel above asks for.
+      return bindingIsLitAtom(gli, -1)
     }
   }
   if e is Index {
