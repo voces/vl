@@ -2322,6 +2322,42 @@ function emitFailNoMembershipRecv() {
   )
 }
 
+// True when the union named `nm` carries a literal-union ARM beside another value arm — the
+// BOX shape whose litunion arm rides the box as its member STRING, so `x is K` over it is a
+// MEMBERSHIP question over the payload and can never be a tag compare.
+//
+// AN ALIAS NAME IS RESOLVED TO ITS MEMBER SET FIRST, AND THAT IS THE WHOLE REASON THIS
+// FUNCTION EXISTS. `nameIsLitUnionArmValueUnion` decides on the SPELLING it is handed by
+// splitting it at top-level `|`, so a declared `type W = K | i32` splits to the single atom
+// `"W"` and answers FALSE while the INLINE `K | i32` spelling of the identical box answers
+// TRUE. `unionNameOfExpr` hands out whichever spelling the annotation carried, so the two
+// spellings of one program took different lowerings: the alias fell past the membership arm
+// into the box-tag compare, whose `tag == 2` answers `w is KS` TRUE for EVERY string the box
+// holds — members and non-members alike, `vl check` rc 0 and `vl build` clean, while the
+// inline twin one line away was correct. `unionMemberSetOf` is the registered expansion
+// (`type W = K | i32` → `"K|i32"`), which is what makes the two spellings ask one question.
+//
+// The unresolved name is asked FIRST and the expansion only on its miss: an already-joined
+// member set is the common case and resolves to itself, and `unionMemberSetOf` is a linear
+// scan of every registered union row.
+function unionCarriesLitUnionArm(nm: string) {
+  if nm == "" { return false }
+  if nameIsLitUnionArmValueUnion(nm) { return true }
+  const setNm = unionMemberSetOf(nm)
+  if setNm == nm { return false }
+  nameIsLitUnionArmValueUnion(setNm)
+}
+
+// `unionStrArmCount` over a union name that may be a declared ALIAS. The count is what
+// decides whether kind 2's box tag discriminates an arm at all (1 arm: exactly; 2+: not at
+// all), and it is read off the TOP-LEVEL arms — so an alias has to be expanded for the same
+// reason `unionCarriesLitUnionArm` expands one, and the soundness FLOOR that reads this count
+// has to see the same arms the membership arm above it does or the two disagree about which
+// shapes have a correct lowering.
+function unionStrArmCountOf(nm: string) {
+  unionStrArmCount(unionMemberSetOf(nm))
+}
+
 // True when `recvIx` is a receiver `emitLitMemberEq` can be applied to REPEATEDLY — i.e.
 // one whose rep that compare reaches. The reps a string literal union can meet: a
 // value-union BOX (payload compare), a string-repped litunion, a plain `string`, and the
@@ -2354,7 +2390,7 @@ function litMembershipRecvOk(recvIx: i32, fnIx: i32) {
     const bxNm = unionNameOfExpr(recvIx, fnIx)
     if bxNm == "" { return false }
     if isValueUnionOfSet(msSetOfText(bxNm), bxNm) { return true }
-    return nameIsLitUnionArmValueUnion(bxNm)
+    return unionCarriesLitUnionArm(bxNm)
   }
   if nodeTyIsLitUnion(recvIx) { return true }
   if exprString(recvIx, fnIx) { return true }
@@ -2461,7 +2497,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   // binding: each member re-reads it (twice — tag, then payload).
   if nd0 is IsExpr {
     const luNm = unionNameOfExpr(nd0.isObj, fnIx)
-    if luNm != "" && nameIsLitUnionArmValueUnion(luNm) {
+    if unionCarriesLitUnionArm(luNm) {
       const luTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
       if luTexts.length > 0 && unionEqOperandOk(nd0.isObj) {
         let luI = 0
@@ -2513,7 +2549,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
         if (
           nbNm != "" &&
           (isValueUnionOfSet(msSetOfText(nbNm), nbNm) ||
-            nameIsLitUnionArmValueUnion(nbNm))
+            unionCarriesLitUnionArm(nbNm))
         ) {
           let nbI = 0
           while nbI < nbTexts.length {
@@ -2618,7 +2654,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
     // only through `K`, so the tag decides it exactly.
     if armTag == 2 && tyIsLitUnion(isVarTyIxOf(isIx)) {
       const amNm = isStrTagUnionNameOf(ndv.isObj, fnIx)
-      if amNm != "" && unionStrArmCount(amNm) > 1 {
+      if amNm != "" && unionStrArmCountOf(amNm) > 1 {
         return emitFailNoMembershipRecv()
       }
     }
@@ -4294,13 +4330,22 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   const uname = unionNameOfExpr(objIx, fnIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
   const usid = msSetOfText(uname)
+  // THE ARM SPELLINGS, WITH A DECLARED ALIAS RESOLVED — every predicate below that reads a
+  // NAME reads this one, while the interned SET stays keyed on the name the receiver carries.
+  // `unionHasAtomTy` / `unionTakesAtomAsStr` answer by splitting the spelling at top-level
+  // `|`, so `type W = K | i32` split to the single atom `"W"`: no arm could hold a quoted
+  // literal, `litHasArm` was false and the whole compare CONST-FOLDED TO 0 — while the
+  // INLINE `K | i32` spelling of the identical box, whose arms those same predicates can
+  // see, was correct. `unionMemberSetOf` returns a non-alias name unchanged, so this is the
+  // string the working spelling already passed.
+  const unmArms = unionMemberSetOf(uname)
   // A union carrying a literal-union ALIAS arm (`K | string`, `K | f64`) is a BOX like any
   // value union — the arm rides it as its member string — but `isValueUnionName` declines it
   // because `valueAtomKind("K")` is -1. It is the same box with the same tags, so the
   // lowering below is unchanged; only the gate had to learn the second spelling.
   if (
     uname == "" ||
-    (!isValueUnionOfSet(usid, uname) && !nameIsLitUnionArmValueUnion(uname))
+    (!isValueUnionOfSet(usid, uname) && !unionCarriesLitUnionArm(uname))
   ) {
     return emitFail(
       "emitProgram: literal `is` over a struct union is not supported",
@@ -4331,8 +4376,8 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
     atom = "i64"
     lak = 3
   } else if (
-    !unionHasAtomK(usid, uname, "i32", 0) &&
-    unionHasAtomK(usid, uname, "i64", 3)
+    !unionHasAtomK(usid, unmArms, "i32", 0) &&
+    unionHasAtomK(usid, unmArms, "i64", 3)
   ) {
     atom = "i64"
     lak = 3
@@ -4342,8 +4387,8 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   // Without its second leg a `K | f64` box statically answers `is "aa"` FALSE: the member
   // kinds bank only `f64` (`valueAtomKind("K")` is -1), so the arm that actually holds the
   // value looks absent.
-  let litHasArm = unionHasAtomK(usid, uname, atom, lak)
-  if !litHasArm && lak == 2 && unionTakesAtomAsStr(uname) { litHasArm = true }
+  let litHasArm = unionHasAtomK(usid, unmArms, atom, lak)
+  if !litHasArm && lak == 2 && unionTakesAtomAsStr(unmArms) { litHasArm = true }
   if !litHasArm {
     if emitExpr(body, objIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
