@@ -801,16 +801,18 @@ let pgFrames: i32[] = []
 // and the inner write read it, so `null` went into a `string` binding and the
 // binding's type was overwritten with `i32?` — a check-clean wrong type.
 //
-// `asgDeclRetiredBy` is the bare-name twin of `npInvBy`: the arena index of the write
-// that ended the narrowing, or -1 while it is in force. A GUARD-kind narrowing that has
-// been retired makes the name UNREADABLE for the rest of the guarded region, and that is
-// not conservatism — the EMITTER's own narrow stack (`narrowStripNullOnly` in
-// `emit_state.vl`) is built on "writing null back inside a null guard is impossible", so
-// a read after such a write is emitted against the stale UNBOXED rep. Over `i32 | null`
-// that is a check-clean invalid module ("expected (ref null $type), found i32"); over a
-// REF rep it happens to work. The two must agree or a boxed read diverges, so the
-// checker refuses the read the emitter cannot lower. The property-path side has always
-// behaved this way (`pathInvalidatedErr`), so the two spellings match.
+// A RETIRED bare-name narrowing leaves the name READABLE, at its DECLARED type — the
+// declared type going back into the scope the narrowing shadowed IS the whole retirement,
+// and every read after the write then asks the storage. It used to be refused outright,
+// for an emitter reason and not a soundness one: the emitter's narrow stack held the
+// region's narrowed rep for the rest of the guarded block, so a read typed `i32?` here
+// lowered against the stale UNBOXED rep. The emitter retires the same write now
+// (`narrowRetired`, emit_state.vl), so the two agree and the read lowers.
+//
+// THE PROPERTY-PATH SPELLING STILL REFUSES (`pathInvalidatedErr`), and the asymmetry is the
+// difference in what the emitter can see: a bare-name write is a statement the emit walk
+// passes over, while a path narrowing also dies to an ALIASED write through a call, which
+// the emitter has no relation to detect.
 //
 // `narFnEpoch` counts FUNCTION BODIES CHECKED, and every narrowing — bank entry or path
 // overlay slot — records the count at install. A closure created inside a guarded region
@@ -831,7 +833,6 @@ let asgDeclKeys: string[] = []
 let asgDeclTys: i32[] = []
 let asgDeclDepths: i32[] = []
 let asgDeclKinds: i32[] = []
-let asgDeclRetiredBy: i32[] = []
 let asgDeclEpochs: i32[] = []
 let asgDeclFrames: i32[] = []
 
@@ -883,14 +884,6 @@ function narGuardSlot(name: string) {
   -1
 }
 
-// The write that retired `name`'s guard narrowing, or -1 when it is still in force or
-// there is none. Read at the bare-name READ arm.
-function narRetiredBy(name: string) {
-  const i = narGuardSlot(name)
-  if i < 0 { return -1 }
-  asgDeclRetiredBy[i]
-}
-
 // Bank `name`'s declared type before a narrowing shadows it, at the scope depth the
 // shadowing `declare` writes to. Idempotent per (name, depth, kind): a second
 // `x = e` must not re-bank the ALREADY-NARROWED type as the declaration.
@@ -911,7 +904,6 @@ function noteNarShadow(name: string, declTy: i32, kind: i32) {
   asgDeclTys.push(declTy)
   asgDeclDepths.push(d)
   asgDeclKinds.push(kind)
-  asgDeclRetiredBy.push(-1)
   asgDeclEpochs.push(narFnEpoch)
   0
 }
@@ -2570,7 +2562,6 @@ export function initChecker() {
   asgDeclTys = []
   asgDeclDepths = []
   asgDeclKinds = []
-  asgDeclRetiredBy = []
   asgDeclEpochs = []
   asgDeclFrames = []
   narFnEpoch = 0
@@ -3636,12 +3627,6 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
         // LATER write to the same name is checked against the storage again.
         const d = lookupDepth(nm)
         if d >= 0 { T.scopes[d][nm] = dcl }
-        // A guard-kind narrowing additionally poisons READS for the rest of the
-        // guarded region — see `asgDeclRetiredBy`.
-        const gs = narGuardSlot(nm)
-        if gs >= 0 {
-          if asgDeclRetiredBy[gs] < 0 { asgDeclRetiredBy[gs] = atIx }
-        }
       }
     }
   }
@@ -3709,24 +3694,6 @@ function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
       key +
       "' after " +
       after,
-    at,
-  )
-  TY_ERR
-}
-
-// The same diagnostic for a BARE NAME whose guard narrowing an assignment retired. It
-// names the write and says where a read can go, because the narrowing is genuinely dead
-// for the rest of the guarded region and re-testing inside it does not revive it: the
-// emitter's narrow stack still holds the region's rep (see `asgDeclRetiredBy`).
-function nameRetiredErr(name: string, byIx: i32, at: i32) {
-  tErr(
-    "'" +
-      name +
-      "' was narrowed by a guard, but the assignment on line " +
-      i32ToStr(nodeLineOf(byIx)) +
-      " ended the narrowing — read '" +
-      name +
-      "' outside the guarded block, or under a fresh guard there",
     at,
   )
   TY_ERR
@@ -4782,7 +4749,6 @@ function popScope() {
       asgDeclTys.pop()
       asgDeclDepths.pop()
       asgDeclKinds.pop()
-      asgDeclRetiredBy.pop()
       asgDeclEpochs.pop()
     }
   }
@@ -18323,14 +18289,7 @@ function checkNodeReal(ix: i32) {
     // read (the `BinExpr` `=` arm marks it as `daWriteTarget` before evaluating
     // the target), so it is skipped here; a compound `x += …` desugars to
     // `x = x + (…)` whose RHS reads `x` and DOES reach this gate.
-    if ix != daWriteTarget {
-      daCheckRead(n.identName, ix)
-      // A guard narrowing an assignment RETIRED makes the name unreadable for the rest
-      // of the guarded region. Skipped for the write target itself, which is the one
-      // position that asks about the storage rather than the value.
-      const retBy = narRetiredBy(n.identName)
-      if retBy >= 0 { return nameRetiredErr(n.identName, retBy, ix) }
-    }
+    if ix != daWriteTarget { daCheckRead(n.identName, ix) }
     return ty
   } else if n is Paren {
     return checkNode(n.parInner)
