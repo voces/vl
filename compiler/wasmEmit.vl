@@ -7523,6 +7523,14 @@ function hoistScanBlock(ix: i32) {
 // checked FIRST exactly as they are there, decline.
 function hoistRowOfRecv(recvIx: i32, name: string, fnIx: i32) {
   if exprNulScalarListKind(recvIx, fnIx) != null { return 0 - 1 }
+  // The SHARED-backing nullable lists (`i32[] | null`, `boolean[] | null`) decline
+  // here too. `exprNulScalarListKind` above only names the four leaves that own a
+  // wrapper heap type, so these reached `scalarListElemKind` below as if they were
+  // plain `i32[]` — and the prologue then read the header ABOVE the guard that
+  // proves the wrapper present. In a loop CONDITION that is also a short-circuit
+  // violation: `while e != null && e[0] >= 0` hoisted `struct.get $lTypeIdx 0/1`
+  // out of the loop and in front of the `ref.is_null`, trapping on a null `e`.
+  if exprNullableList(recvIx, fnIx) { return 0 - 1 }
   if exprRefArray(recvIx, fnIx) {
     if exprNullableRefArray(recvIx, fnIx) { return 0 - 1 }
     if !raUsed { return 0 - 1 }
@@ -16076,21 +16084,39 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   //   `a || b`  ≡  if (a) { 1 } else { b }   (skip b when a is true  → 1)
   // The condition `a` is evaluated first, then `if 0x04` with i32 result-type
   // blocktype `0x7f`; the then-branch, `else 0x05`, the else-branch, then `end 0x0b`.
+  //
+  // THE RIGHT OPERAND IS A NARROWING SCOPE, exactly like an `if` ARM. `a` decides
+  // whether `b` runs at all, so `b` is emitted under whatever `a` proved — the same
+  // fact the checker types `b` against. `&&` gives `b` the THEN-sense of `a`
+  // (`setNarrowFromCond`, which recurses through a nested `a && b` and through `!`),
+  // `||` the ELSE-sense (`setNarrowFromCondElse` — `b` runs only when `a` was false).
+  // Without the push, `e != null && e >= 0` over a value-union BOX (`i32 | null` is
+  // `(struct (field i32) (field anyref))`) pushed the BOX ref under `i32.ge_s`:
+  // `vl check` rc 0, invalid wasm. The statement spelling of the identical operation
+  // (`if e != null { return e >= 0 }`) always worked because THAT arm pushes here, and
+  // the two now emit byte-identical unbox sequences. `==` survived un-narrowed only
+  // because a boxed operand has its own structural lowering (`emitUnionConcreteEq` /
+  // `emitUnionUnionEq`) that reads the tag and payload itself.
   if e.binOp == "&&" || e.binOp == "||" {
     if emitExpr(body, e.binLeft, fnIx) < 0 {
       return -1 // condition `a`
     }
     fbIf(127) // 0x04 if, 0x7f i32 result-type blocktype (yields an i32)
+    const scTop = narrowTop
     if e.binOp == "&&" {
       // then = b, else = 0
+      const scNarrowed = setNarrowFromCond(e.binLeft, fnIx)
       if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+      if scNarrowed { restoreNarrow(scTop) }
       fbElse() // 0x05 else
       fbI32Const(0)
     } else {
       // then = 1, else = b
       fbI32Const(1)
       fbElse() // 0x05 else
+      const scNarrowedElse = setNarrowFromCondElse(e.binLeft, fnIx)
       if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+      if scNarrowedElse { restoreNarrow(scTop) }
     }
     fbEnd() // 0x0b end
     return 0
@@ -16411,6 +16437,10 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     // A NON-NULL struct param position (kind 1, `(ref $S)`): a nullable-REP
     // argument needs `ref.as_non_null` at the boundary (see below).
     let cParamStruct = false
+    // The NON-NULL list / map param positions — every kind whose slot is a
+    // `(ref $wrapper)` that a `(ref null $wrapper)` argument does not satisfy.
+    // Same boundary recover as `cParamStruct`, over the reps owning a wrapper.
+    let cParamNonNullList = false
     // A UNION-typed param position (kind 4): the callee wants the box, so a raw
     // scalar/string/null argument is COERCED into the union representation
     // (`emitUnionCoerce` — the host's call-boundary `coerceUnion`). The param's
@@ -16471,6 +16501,18 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           pendingNulRefHeap = mapTypeIdxOf(paramStructIdxOf(cParams[i]))
         }
         if vtKindOfParam(cParams[i]) == "struct" { cParamStruct = true }
+        const cpvk = vtKindOfParam(cParams[i])
+        if (
+          cpvk == "list" ||
+          cpvk == "strlist" ||
+          cpvk == "f64list" ||
+          cpvk == "i64list" ||
+          cpvk == "f32list" ||
+          cpvk == "reflist" ||
+          cpvk == "map"
+        ) {
+          cParamNonNullList = true
+        }
         if vtKindOfParam(cParams[i]) == "variant" {
           cVi = paramStructIdxOf(cParams[i])
         }
@@ -16582,6 +16624,27 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
         // rep, which a `(ref $S)` param does not accept.
         if cParamStruct {
           if exprNullableStruct(args[i], fnIx) {
+            fbRefAsNonNull() // 0xd4
+          }
+        }
+        // The LIST / MAP dual of the recover above, over every nullable wrapper
+        // rep: `nullist` (`i32[] | null`, `boolean[] | null`), the four
+        // distinct-backing scalar lists, `nulreflist` (`S[] | null`) and
+        // `nulmap`. A `!= null`-narrowed value keeps its `(ref null $wrapper)`
+        // slot — narrowing is type-level — so `takes(e)` against a
+        // `takes(x: i32[])` pushed `(ref null $type)` under a `(ref $type)`
+        // param: `vl check` rc 0, invalid wasm, in the `if`-statement spelling
+        // as much as in a short-circuit operand. The checker proved the call
+        // guarded, so the recover cannot trap. These four predicates are the
+        // ones the READ sites already use, and the param-kind gate keeps them
+        // off the nullable param positions above, which want the slot nullable.
+        if cParamNonNullList {
+          if (
+            exprNullableList(args[i], fnIx) ||
+            exprNulScalarListKind(args[i], fnIx) != null ||
+            exprNullableRefArray(args[i], fnIx) ||
+            exprNullableMap(args[i], fnIx)
+          ) {
             fbRefAsNonNull() // 0xd4
           }
         }

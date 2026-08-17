@@ -1,0 +1,277 @@
+// @run
+// THE RIGHT OPERAND OF `&&` / `||` IS A NARROWING SCOPE, exactly like an `if` arm.
+//
+// `a && b` lowers to a value-typed `if` whose THEN-arm is `b`; `a || b` to one whose
+// ELSE-arm is `b`. Either way `b` runs only under what `a` proved, and the checker types
+// it that way. The emitter did not: it emitted `b` with the narrowing stack untouched, so
+// over a value-union BOX (`i32 | null` is `(struct (field i32) (field anyref))`, not a
+// niche) the raw box ref landed under `i32.ge_s` — `vl check` rc 0, then invalid wasm
+// (`type mismatch: expected i32, found (ref $type)`).
+//
+// WHY `==` SURVIVED AND `>=` DID NOT: a boxed operand of `==`/`!=` has its own structural
+// lowering (`emitUnionConcreteEq` / `emitUnionUnionEq`) which reads the tag and the payload
+// itself and needs no narrowing. `>=` and arithmetic have no such path — they need the
+// unbox the narrowing supplies (`struct.get $box 1 ; ref.cast ; struct.get $boxi32 0`).
+//
+// THE ORACLE IS THE THIRD COLUMN OF EVERY TRIPLE. Each shape is spelled three ways — the
+// short-circuit operand (`sc`), the `if`-STATEMENT arm (`st`), and the `if`-EXPRESSION arm
+// (`ie`) — and all three must print the same value at BOTH runtime inputs. `st` and `ie`
+// always worked, so a triple whose first line disagrees is this defect; the emitted module
+// for `sc` is byte-identical to the one for `ie`, which is the same value-position shape.
+//
+// @log GE-i32 true true true
+// @log GE-i32 false false false
+// @log OR-i32 true true true
+// @log OR-i32 true true true
+// @log NEST-i32 true true true
+// @log NEST-i32 false false false
+// @log NEG-i32 true true true
+// @log NEG-i32 false false false
+// @log ARITH-i32 true true true
+// @log ARITH-i32 false false false
+// @log PARAM-i32 true true true
+// @log PARAM-i32 false false false
+// @log GE-f64 true true true
+// @log GE-f64 false false false
+// @log ARITH-f64 true true true
+// @log ARITH-f64 false false false
+// @log SELF-bool true true true
+// @log SELF-bool false false false
+// @log EQ-bool true true true
+// @log EQ-bool false false false
+// @log LEN-str true true true
+// @log LEN-str false false false
+// @log EQ-lit true true true
+// @log EQ-lit false false false
+// @log POS-bind true true
+// @log POS-bind false false
+// @log POS-ifcond true true
+// @log POS-ifcond false false
+// @log POS-arg true true
+// @log POS-arg false false
+// @log POS-while true true
+// @log POS-while false false
+// @log SIDE and-null false
+// @log A
+// @log SIDE and-5 true
+// @log SIDE or-null true
+// @log O
+// @log SIDE or-5 true
+
+type K = "a" | "b"
+
+function takesI32(x: i32) { return x }
+
+// ---- i32 | null — the BOX, the shape the defect was found on ----
+function scGeI32(e: i32 | null) { return e != null && e >= 0 }
+function stGeI32(e: i32 | null) {
+  if e != null { return e >= 0 }
+  return false
+}
+function ieGeI32(e: i32 | null) { return if e != null then e >= 0 else false }
+
+// `||` carries the ELSE-sense of its left operand: `b` runs only when `a` was false,
+// so `e == null || …` narrows `e` to non-null in the right operand.
+function scOrI32(e: i32 | null) { return e == null || e >= 0 }
+function stOrI32(e: i32 | null) {
+  if e == null { return true }
+  return e >= 0
+}
+function ieOrI32(e: i32 | null) { return if e == null then true else e >= 0 }
+
+// `a && b && c` is `(a && b) && c`: the outer push recurses through the inner `&&`,
+// so `c` sees the guard two conjuncts back.
+function scNestI32(e: i32 | null) { return e != null && e >= 0 && e < 100 }
+function stNestI32(e: i32 | null) {
+  if e != null {
+    if e >= 0 { return e < 100 }
+  }
+  return false
+}
+function ieNestI32(e: i32 | null) {
+  return if e != null then (if e >= 0 then e < 100 else false) else false
+}
+
+// `!(e == null)` swaps the sense: the right operand sees the ELSE-narrowing of the
+// inner compare.
+function scNegI32(e: i32 | null) { return !(e == null) && e >= 0 }
+function stNegI32(e: i32 | null) {
+  if !(e == null) { return e >= 0 }
+  return false
+}
+function ieNegI32(e: i32 | null) { return if !(e == null) then e >= 0 else false }
+
+function scArithI32(e: i32 | null) { return e != null && e + 1 > 0 }
+function stArithI32(e: i32 | null) {
+  if e != null { return e + 1 > 0 }
+  return false
+}
+function ieArithI32(e: i32 | null) {
+  return if e != null then e + 1 > 0 else false
+}
+
+function scParamI32(e: i32 | null) { return e != null && takesI32(e) > 0 }
+function stParamI32(e: i32 | null) {
+  if e != null { return takesI32(e) > 0 }
+  return false
+}
+function ieParamI32(e: i32 | null) {
+  return if e != null then takesI32(e) > 0 else false
+}
+
+// ---- f64 | null — the second boxed rep ----
+function scGeF64(e: f64 | null) { return e != null && e >= 0.0 }
+function stGeF64(e: f64 | null) {
+  if e != null { return e >= 0.0 }
+  return false
+}
+function ieGeF64(e: f64 | null) { return if e != null then e >= 0.0 else false }
+
+function scArithF64(e: f64 | null) { return e != null && e + 1.0 > 0.0 }
+function stArithF64(e: f64 | null) {
+  if e != null { return e + 1.0 > 0.0 }
+  return false
+}
+function ieArithF64(e: f64 | null) {
+  return if e != null then e + 1.0 > 0.0 else false
+}
+
+// ---- boolean | null — a box whose narrowed value is CONSUMED AS THE RESULT ----
+function scSelfBool(e: boolean | null) { return e != null && e }
+function stSelfBool(e: boolean | null) {
+  if e != null { return e }
+  return false
+}
+function ieSelfBool(e: boolean | null) { return if e != null then e else false }
+
+function scEqBool(e: boolean | null) { return e != null && e == true }
+function stEqBool(e: boolean | null) {
+  if e != null { return e == true }
+  return false
+}
+function ieEqBool(e: boolean | null) {
+  return if e != null then e == true else false
+}
+
+// ---- string | null and K | null — the NICHE controls, green before and after ----
+function scLenStr(e: string | null) { return e != null && e.length > 0 }
+function stLenStr(e: string | null) {
+  if e != null { return e.length > 0 }
+  return false
+}
+function ieLenStr(e: string | null) {
+  return if e != null then e.length > 0 else false
+}
+
+function scEqLit(e: K | null) { return e != null && e == "a" }
+function stEqLit(e: K | null) {
+  if e != null { return e == "a" }
+  return false
+}
+function ieEqLit(e: K | null) { return if e != null then e == "a" else false }
+
+// ---- the guarded operand in each non-return POSITION ----
+function scBind(e: i32 | null) {
+  const r = e != null && e >= 0
+  return r
+}
+function stBind(e: i32 | null) {
+  let r = false
+  if e != null { r = e >= 0 }
+  return r
+}
+
+function scIfCond(e: i32 | null) {
+  if e != null && e >= 0 { return true }
+  return false
+}
+function stIfCond(e: i32 | null) {
+  if e != null {
+    if e >= 0 { return true }
+  }
+  return false
+}
+
+function idb(b: boolean) { return b }
+function scArg(e: i32 | null) { return idb(e != null && e >= 0) }
+function stArg(e: i32 | null) {
+  if e != null { return idb(e >= 0) }
+  return idb(false)
+}
+
+function scWhile(e: i32 | null) {
+  let n = 0
+  while e != null && e >= 0 {
+    n = 1
+    break
+  }
+  return n == 1
+}
+// The statement twin hoists the guarded compare into an `if` arm: the checker
+// narrows an `if` arm, not a `while` BODY, so a `while e != null { e >= 0 }`
+// spelling is a CHECK error and cannot serve as the oracle here.
+function stWhile(e: i32 | null) {
+  let n = 0
+  let go = false
+  if e != null { go = e >= 0 }
+  while go {
+    n = 1
+    break
+  }
+  return n == 1
+}
+
+// ---- the short circuit ITSELF still holds: a marker inside the right operand ----
+function mark(tag: string) {
+  print(tag)
+  return true
+}
+function scSideAnd(e: i32 | null) { return e != null && mark("A") && e >= 0 }
+function scSideOr(e: i32 | null) { return e == null || mark("O") && e >= 0 }
+
+function triple(tag: string, a: boolean, b: boolean, c: boolean) {
+  print(tag + " " + toString(a) + " " + toString(b) + " " + toString(c))
+  0
+}
+function pair(tag: string, a: boolean, b: boolean) {
+  print(tag + " " + toString(a) + " " + toString(b))
+  0
+}
+
+triple("GE-i32", scGeI32(5), stGeI32(5), ieGeI32(5))
+triple("GE-i32", scGeI32(null), stGeI32(null), ieGeI32(null))
+triple("OR-i32", scOrI32(5), stOrI32(5), ieOrI32(5))
+triple("OR-i32", scOrI32(null), stOrI32(null), ieOrI32(null))
+triple("NEST-i32", scNestI32(5), stNestI32(5), ieNestI32(5))
+triple("NEST-i32", scNestI32(null), stNestI32(null), ieNestI32(null))
+triple("NEG-i32", scNegI32(5), stNegI32(5), ieNegI32(5))
+triple("NEG-i32", scNegI32(null), stNegI32(null), ieNegI32(null))
+triple("ARITH-i32", scArithI32(5), stArithI32(5), ieArithI32(5))
+triple("ARITH-i32", scArithI32(null), stArithI32(null), ieArithI32(null))
+triple("PARAM-i32", scParamI32(5), stParamI32(5), ieParamI32(5))
+triple("PARAM-i32", scParamI32(null), stParamI32(null), ieParamI32(null))
+triple("GE-f64", scGeF64(5.0), stGeF64(5.0), ieGeF64(5.0))
+triple("GE-f64", scGeF64(null), stGeF64(null), ieGeF64(null))
+triple("ARITH-f64", scArithF64(5.0), stArithF64(5.0), ieArithF64(5.0))
+triple("ARITH-f64", scArithF64(null), stArithF64(null), ieArithF64(null))
+triple("SELF-bool", scSelfBool(true), stSelfBool(true), ieSelfBool(true))
+triple("SELF-bool", scSelfBool(null), stSelfBool(null), ieSelfBool(null))
+triple("EQ-bool", scEqBool(true), stEqBool(true), ieEqBool(true))
+triple("EQ-bool", scEqBool(null), stEqBool(null), ieEqBool(null))
+triple("LEN-str", scLenStr("ab"), stLenStr("ab"), ieLenStr("ab"))
+triple("LEN-str", scLenStr(null), stLenStr(null), ieLenStr(null))
+triple("EQ-lit", scEqLit("a"), stEqLit("a"), ieEqLit("a"))
+triple("EQ-lit", scEqLit(null), stEqLit(null), ieEqLit(null))
+pair("POS-bind", scBind(5), stBind(5))
+pair("POS-bind", scBind(null), stBind(null))
+pair("POS-ifcond", scIfCond(5), stIfCond(5))
+pair("POS-ifcond", scIfCond(null), stIfCond(null))
+pair("POS-arg", scArg(5), stArg(5))
+pair("POS-arg", scArg(null), stArg(null))
+pair("POS-while", scWhile(5), stWhile(5))
+pair("POS-while", scWhile(null), stWhile(null))
+// The marker must be ABSENT on the row where the left operand already decided.
+print("SIDE and-null " + toString(scSideAnd(null)))
+print("SIDE and-5 " + toString(scSideAnd(5)))
+print("SIDE or-null " + toString(scSideOr(null)))
+print("SIDE or-5 " + toString(scSideOr(5)))
