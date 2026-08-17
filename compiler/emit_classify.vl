@@ -17268,22 +17268,23 @@ export function unionNameOfIdentSid(sid: i32, fnIx: i32) {
       if li >= 0 { return letUnionNameOf(li, fnIx) }
       // A `for <name> in <(C|S)[]>` loop variable is a kind-4 union box but is NOT a
       // `LetDecl`, so `parentLetOf` misses it — resolve its member set from the iterable's
-      // union-box element type so `x is C` narrows inside the loop body. GUARDED on the slot
-      // already being a kind-4 union box, so a non-union loop var (an f32 `for v in
-      // m.values()`, a struct `for s in ss`) never reaches the ref-array reclassification
-      // below (which could mis-name it and corrupt its codegen).
-      if declaredKind(name) == "union" {
-        const iter = forInIterBlock(body, name)
-        if iter >= 0 {
-          if exprRefArray(iter, fnIx) {
-            const slot = refListSlotOfExpr(iter, fnIx)
-            if slot >= 0 && slot < rlElemKindTbl.length {
-              if rlElemKindTbl[slot] == 2 { return rlElemName[slot] }
-            }
-          }
-        }
-      }
+      // union-box element type so `x is C` narrows inside the loop body.
+      const flv = forInLoopVarUnionName(forInIterBlock(body, name), name, fnIx)
+      if flv != "" { return flv }
     }
+  }
+  // THE MODULE-SCOPE DUAL of the loop-var arm above, and the same relation
+  // `startBlockLetOfSid` has to `parentLetOfSid`: a TOP-LEVEL `for x in <(i32|null)[]>`
+  // runs in the START function, where there is no `FuncDecl` body to scan, so the arm
+  // above is unreachable at `fnIx < 0` and the box loop var resolved to NO union. The
+  // slot is still declared as the kind-4 box (`declareForInLocals` is shared), so the
+  // narrowed read found no member set to unbox through and pushed the raw `(ref $uBox)`
+  // where the loop var's own valtype said the unboxed scalar — `vl check`-clean invalid
+  // wasm, in every module-scope read shape (`for`, `.slice`, `.filter`, a nested `for`,
+  // a `w.xs` field iterable, a `mk()` return iterable, a `let` iterable).
+  if fnIx < 0 {
+    const slv = forInLoopVarUnionName(forInIterIn(startStmts, name), name, -1)
+    if slv != "" { return slv }
   }
   // A CAPTURED union box — resolve its member set from the parent frame's binding.
   const cun = capturedUnionName(fnIx, name)
@@ -17338,6 +17339,28 @@ function startBlockLetOfSid(sid: i32) {
   sidArrPut(sblGen, sid, sblEpoch)
   sidArrPut(sblVal, sid, found)
   found
+}
+
+// THE ONE HOME for "which value union does a `for <name> in <iter>` LOOP VARIABLE flow as",
+// given the iterable node the enclosing loop iterates (-1 = no enclosing loop found). A loop
+// var is the storage class with NO declaration node at all — no `Param`, no `LetDecl` — so
+// its member set can only come from the iterable's union-box ELEMENT type, and both walks
+// that reach it (`unionNameOfIdentSid`'s function-scope arm over the `FuncDecl` body, and its
+// module-scope dual over `startStmts`) must answer identically: the slot `declareForInLocals`
+// declares is the same kind-4 box either way, and a walk that answers "" leaves the narrowed
+// read with no member set to unbox through.
+//
+// GUARDED on the slot ALREADY being a kind-4 union box, so a non-union loop var (an f32
+// `for v in m.values()`, a struct `for s in ss`) never reaches the ref-array
+// reclassification below — which could mis-name it and corrupt its codegen.
+function forInLoopVarUnionName(iterIx: i32, name: string, fnIx: i32) {
+  if iterIx < 0 { return "" }
+  if declaredKind(name) != "union" { return "" }
+  if !exprRefArray(iterIx, fnIx) { return "" }
+  const slot = refListSlotOfExpr(iterIx, fnIx)
+  if slot < 0 || slot >= rlElemKindTbl.length { return "" }
+  if rlElemKindTbl[slot] != 2 { return "" }
+  rlElemName[slot]
 }
 
 // The ITERABLE expression node of an enclosing `for <name> in <iter>` loop within the
