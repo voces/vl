@@ -40116,9 +40116,13 @@ grammar here is an INLINE SHAPE, and an inline shape's arena type does not exist
 creates it. Row 4's parses were *re-deriving* an answer the arena had already seeded; row 2's parses
 *are* the derivation. **There is nothing banked to read instead of parsing, so there is no rung to
 add** — the only route left is the filed `internInlineShapeTy(nm, tyIx)` thread (D-INLINESHAPETY),
-which does not remove the parse, it moves it to a caller that already holds the index. #1331 measured
-that population at 18 of 1,064; the other 1,046 arrive from a caller that CUT `nm` out of a larger
-spelling and therefore holds no bank for the cut.
+which does not remove the parse, it moves it to a caller that already holds the index. That
+population is **14 of the interner's 1,064 row mints** (D-INLINESHAPETY §1a; re-derived unchanged in
+D-B6THREAD §1, where the 1,064 mints are also shown to be 14 hinted + row 2's 1,050 reaches — one
+population in two units). The other 1,050 arrive from a caller that CUT `nm` out of a larger
+spelling and therefore holds no bank for the cut, EXCEPT the 300 uncut node-rooted mints
+D-B6THREAD §2 measures, whose bank is the CHECKER's `nodeTyIx` and disagrees with the name ladder on
+215 of 299 indices and 13 of 299 keys.
 
 ### 3. ROW 1 IS UNTAKEABLE BECAUSE ITS ARENA-NEUTRAL HALF IS THE REFUTED RUNG — 111 of 126
 
@@ -40197,8 +40201,10 @@ are now mint-bound: row 4 is 425/426 minting, row 2 is 402/402, row 1 is 337/463
 remainder refuted. Every further parse on this side is either the creation of an arena type or a
 resolution whose only cheaper answer is a table this site has a measured reason not to read. What
 moves next is not another rung — it is the arena-index THREADING (D-INLINESHAPETY / D-REPELEMTY), which
-does not remove parses so much as relocate them to callers that already hold the index, and #1331
-measured that population at 18 of 1,064 at row 2.
+does not remove parses so much as relocate them to callers that already hold the index. That
+population is **14 of the interner's 1,064 row mints** at row 2, all 14 shipped (D-INLINESHAPETY §1a,
+re-derived in D-B6THREAD §1); the only population left past it is the NODE bank, refuted in
+D-B6THREAD §2.
 
 ### 6. GATE
 
@@ -41940,3 +41946,225 @@ this is a redundancy result on the arena's own ledger, not a perf one, and it is
   already paid for the allocation".
 
 <!-- APPEND-MARKER-ISBANK-END -->
+
+## D-B6THREAD — B6 re-derived: the filed "18 of 1,064" is unsourced and the pair "14 / 1,050" is TWO UNITS of one population, the remaining threading population at row 2 is the NODE bank and it mixes the two vocabularies WORSE than B5's own site (215 of 299 on index, 13 of 299 on the consumed key), and the one route that is clean was filed blocked on a HOIST THAT DOES NOT EXIST (off master `b3314a04`)
+
+The board carried B6 as *"population quoted as **18 of 1,064** in three places but the measuring
+table sums to **14 / 1,050**"*, with a standing instruction to re-derive before pricing. This does
+that, in CALLS as well as reaches, and then answers the question the re-derivation exists for:
+whether the callers that "already hold the index" hold the CHECKER's index or the EMITTER's.
+
+### 1. THE DISCREPANCY, RESOLVED — the two numbers are one population in two units, and only one of them was ever measured
+
+**PROBE ZZB6.** One counter per site in `emit_rep.vl` / `emit_classify.vl` / `emit_collect.vl`,
+reported by `emitFail(zzRep())` at `emit_sections.emitProgram`'s tail, after `emitModule` so every
+collect pass has run. The host reuses one compiler instance for the whole tree, so the counters
+accumulate; **every slot was checked for MONOTONICITY across all 1,500 records** and the last record
+is the corpus total (an earlier record would under-count — the failure mode #1294's method note
+names).
+
+```
+build: vl build compiler/entry.vl -o probe.wasm --compiler <master b3314a04 fixpoint, 1,162,553 B>
+run:   vl check --codegen tests/cases --compiler probe.wasm   (1,500 emitProgram records)
+       vl check --codegen std         --compiler probe.wasm   (4 records)
+```
+
+| unit | count | where it comes from |
+|---|---:|---|
+| `sTyIxOfNameTy` **CALLS** | **1,733** | all four call sites of the bridge |
+| …answered by the **HINT** (`tyIx >= 0`) | **14** | the two shipped `internInlineShapeTy` threads |
+| …answered by `cUserTypes` | **539** | rung 1 |
+| …reaching **`resolveAnnot`** | **1,050** | the ZZRA row-2 unit, reproduced to the digit |
+| …declining (not a shape spelling) | 130 | |
+| `internInlineShapeTy` **CALLS** | **24,792** | six call sites |
+| …passing the `nameIsShapeSpanEnds` guard | **3,018** | |
+| …**MINTING a row** (`recordSTyIx` reached) | **1,064** | |
+
+**1,064 AND 1,050 ARE THE SAME POPULATION IN TWO UNITS, ONE MEASURED BEFORE THE HINT AND ONE AFTER.**
+Every `sNames` row minted by the interner calls `sTyIxOfNameTy` exactly once: 1,064 mints = 14 hinted
++ 1,050 reaches, and the arithmetic closes on this base as it did on #1297's (`14 + 539 + 1,050 + 130
+= 1,733`). The per-caller split reproduces D-INLINESHAPETY §1a on every row:
+
+| # | `internInlineShapeTy` caller | calls | guard-passing | **mints** | #1297 |
+|---|---|---:|---:|---:|---:|
+| 1 | `internShapeDeep`'s leaf | 24,061 | 2,321 | **874** | 873 |
+| 2 | `internFuncTypeShapes` | 275 | 275 | **115** | 116 |
+| 3 | its OWN nested-field recursion | 376 | 348 | **56** | 56 |
+| 4 | the VARIANT field table, code 15 | 60 | 54 | **12** | 12 |
+| 5 | `internShapeFieldElems` | 14 | 14 | **5** | 5 |
+| 6 | the VARIANT field table, code 5 | 6 | 6 | **2** | 2 |
+| | **total** | **24,792** | **3,018** | **1,064** | 1,064 |
+
+**THE 14 IS RIGHT, THE 18 IS UNSOURCED, AND IT IS ALSO MIS-ATTRIBUTED.** Rows 4 and 6 (12 + 2 = 14)
+are the only callers that hold a bank, they are the two that shipped, and the hint answers **exactly
+14** of the 1,064 mints on this base — the shipped route is intact and the census is stable across a
+12% corpus growth (the CALLS column grew 22,166 → 24,792; the MINT column did not move at all). The
+"18 of 1,064" enters the tree in #1334 (D-ROWS12 §2 and §5), which is doc-only and measured nothing
+at this site; it credits the figure to **#1331**, which is D-DECLRUNG — a slice about rows 1, 6 and 7
+that never censused `internInlineShape`'s callers. The only census of this population is
+D-INLINESHAPETY §1a, and it says 14. *A number with a citation is not a number with a measurement;
+this one had a citation to a slice that does not contain it.*
+
+### 2. THE REMAINING THREADING POPULATION IS THE NODE BANK, AND IT IS 300 — of which 215 DISAGREE
+
+Row 1 of the table is 82% of the row and its chain roots at `collectAnnShapes`:
+`if tn is TypeRef { internShapeDeep(tn.tyName) }`. The node also carries `nodeTyIx`, so the filing's
+sentence — "a caller that already holds the index" — is literally true of it. What the node holds
+the index OF is the question.
+
+| | count | denominator |
+|---|---:|---|
+| `TypeRef` nodes walked by `collectAnnShapes` | **23,362** | |
+| …with `nodeTyIxOf >= 0` | **23,299** | 99.7% covered |
+| site-1 mints reached from a node root | **806** | of 874 |
+| …**with the leaf spelling UNCUT** (`nm == tn.tyName`) | **300** | of 806 |
+| …**CUT** (a peel off array / `\| null` / map / functype) | 506 | of 806 |
+
+**A CUT CANNOT BANK, so the routable population is 300 — 28.6% of the row's 1,050 reaches, not 18 and
+not 1,046.** For those 300 the node bank and the name ladder are both askable, and they are two
+answers to two questions:
+
+| direction | count | of 299 covered |
+|---|---:|---|
+| index-IDENTICAL | **84** | 28.1% |
+| **both resolve, DIFFERENT arena index** | **215** | **71.9%** |
+| same **`repCanonKey`** (the value the consumer reads) | 286 | 95.7% |
+| **DIFFERENT `repCanonKey`** | **13** | **4.3%** |
+| node uncovered, name resolves | 1 | |
+
+The 13 witnesses name the mechanism twice over:
+
+```
+{a:string}     node={a:@41,}        name={a:string,}          un-widened TyLit vs the widened base
+{a:i32}        node={a:f64,}        name={a:i32,}             two different scalar types
+{a:K[]}        node={a:string[],}   name={a:(@42|@43)[],}     litunion alias, opposite directions
+{a:Sx}         node={a:i64,}        name={a:{n:i32,},}        a transparent alias, expanded one side
+{v:"aa"|"bb"|"cc"|"dd"}  node={v:(@40|@41|@42|@43),}  name={v:(@303|@304|@305|@306),}
+```
+
+The first four are `typecheck.canonEmitTypeNames` rewriting `TypeRef.tyName` in place while
+`nodeTyIx` keeps the pre-canon type — **B5's mechanism, one layer out**, and `emit_rep`'s
+`repElemKeyOfNameTy` header already states it for `collectA`'s walk. The other nine are
+`repElemKeyGo`'s identity arm keying `TyLit` by arena INDEX over a structurally identical type the
+ladder minted a second copy of.
+
+**SO THREADING AT THE ONLY POPULATION B6 HAS LEFT DOES MIX THE TWO VOCABULARIES, AND IT MIXES THEM
+HARDER THAN B5's OWN SITE DOES**: 215 of 299 on the index against B5's 61 of 1,400, and 13 of 299 on
+the key that actually reaches `slotCanonKey`'s dedup rung — where a wrong key is a merged or split
+heap type, not a re-keyed row. B6 is therefore **not** unblocked by the re-attribution: it is the
+same ruling, measured one peel further from the node, and it stays BLOCKED-REP behind B5.
+
+**AND IT WOULD MOVE THE ARENA ANYWAY.** Of the 300, **132 resolutions MINT** (`ΔT.tys > 0` measured
+across the call) and 168 are memo hits. Skipping a minting resolution deletes an arena entry and
+renumbers every index after it — #1331's gate, and #1334's own finding that row 2 has 0 arena-neutral
+parses of 402. The 71.9% index disagreement is the same fact read from the other end: the ladder is
+not *re-deriving* the node's type, it is *minting a duplicate of it*.
+
+**WHAT THE 14 THAT DID SHIP HOLD, AND WHY THEY ARE A DIFFERENT CLAIM.** `uFieldElemTyIxRow(ufn)` is
+the D5 sidecar, written by `recordUFieldElemRow` calling `fieldElemTyIxOfName` on the SAME
+`uFieldElemName` cell the caller passes to the interner. That is the emitter's own vocabulary
+resolving the emitter's own spelling — one vocabulary, equal by construction. The node bank is the
+checker's algebra over a spelling the canon pass has since rewritten. *The distinction is not
+"banked vs not banked"; it is WHOSE QUESTION the bank answered.*
+
+### 3. THE ROUTE THAT WAS CLEAN — the kind-6 vals ref-list slot, blocked on a HOIST THAT DOES NOT EXIST
+
+D-INLINESHAPETY §3 filed `mvShapeOfValNameK`'s kind-6 intern (`ensureRefElem(bare)`) with its
+agreement measured (169 of 169) and one named hazard: *"Taking it means hoisting the resolution above
+the kind-6 recursion, which moves when `resolveAnnot` mints."*
+
+**THERE IS NOTHING TO HOIST.** `const vTy = mvValTyIxOfNameRow(valNameIn, rowTy)` runs
+unconditionally at the top of `mvShapeOfValNameRowTy`, above the `if kind == 6` block entirely — the
+slot FIND's own resolution, already computed, already paid for. The filing looked for the bank in
+`recordMvValTyIx` (which is genuinely below the intern and genuinely unreachable from it) and did not
+look above.
+
+The route is `rls6 = ensureRefElemTy(bare, bareTy)` with `bareTy = vTy` iff `bare == valNameIn` — the
+same withhold-on-a-different-input guard `recordMvValTyIx` uses one screen below for the canon
+rewrite. `bare` differs from `valNameIn` only for a NICHE-nullable value, which peels to its inner
+member (`nulRefMapValInnerOf`); a peel has no bank.
+
+| kind-6 entries (corpus) | count | |
+|---|---:|---|
+| total | **200** | #1297 measured 169 on a 12% smaller corpus |
+| `bare == valNameIn` — **banked** | **196** | 98.0% |
+| `bare != valNameIn` — declined | 4 | the niche-nullable peel |
+| **key-IDENTICAL** `repElemKeyOfNameTy(bare, vTy)` vs `(bare, -1)` | **196 of 196** | **0 disagreements either way** |
+| **arena-neutral** (`ΔT.tys = 0` on the resolution replaced) | **196 of 196** | |
+| entries whose resolution MINTS | 2 | **both in the declining 4** |
+| `cUserTypes` answers for `bare` | **0 of 196** | the nominal-rung skew is unreachable here |
+
+**THE INVARIANT, NOT THE AGREEMENT RATE, IS WHAT LICENSES THIS.** `mvValTyIxOfNameRow`'s own header
+already states the rule: *"A BANK THAT IS THE SAME SPELLING'S OWN EARLIER RESOLUTION IS
+ARENA-ORDER-NEUTRAL BY CONSTRUCTION… `resolveAnnot` memoizes per spelling and a positive entry is
+never invalidated, so a second ask could only return the index the first one minted."* The guard
+`bare == valNameIn` is exactly the predicate that puts this site in that class. The 196-of-196
+`ΔT.tys = 0` is the measurement confirming it, not the argument for it — and the two entries that DO
+mint are, by that same construction, precisely the ones where `bare` is a different spelling and the
+bank is withheld.
+
+**THE NOMINAL-RUNG RESIDUE, STATED RATHER THAN BANKED AS A ZERO.** `vTy` comes from
+`fieldElemTyIxOfName` (`cUserTypes` first, then the grammar) while `repElemKeyOfNameTy`'s own leg is
+`resolveAnnot` only — the rung #1331 refused at that site over the `FView` newtype. It is unreachable
+here for two independent reasons: a transparent alias is expanded by `canonEmitTypeNames` before the
+emitter sees the spelling (`tests/cases/maps/alias-positions-and-value-kinds.vl` already pins the
+`{[string]: M}` construction, and the probe reads 0 nominal answers over it), and a newtype over a
+list or map cannot be constructed at all (`type Cnt = new {[string]: i32}` — *"cannot assign
+{[string]: i32} to 'c' of type Cnt"*; `type ARow = AView[]` — *"cannot index non-array AView[]"*). The
+corpus's own hand-built newtype population (`maps/newtype-struct-*`, including
+`newtype-struct-reflist-map-value.vl`, which is this exact arm) is inside the 196 with 0
+disagreements. This is the same residual class the already-shipped `ensureRefElemTy(en5,
+uFieldElemTyIxRow(ufn))` carries; it is not a new one.
+
+### 4. RETIREMENT, AND THE THREE CONTROL ROWS
+
+Same probe on both sides, one counter per `resolveAnnot` call site in `emit_rep`:
+
+| `emit_rep` `resolveAnnot` site | master `b3314a04` | after | Δ |
+|---|---:|---:|---:|
+| **`repElemKeyOfNameTy`** | **3,910** | **3,714** | **−196 (−5.0%)** |
+| `sTyIxOfNameTy` | 1,050 | 1,050 | 0 |
+| `declTyIxOfName` | 7,526 | 7,526 | 0 |
+| `slotCanonKey` | 54 | 54 | 0 |
+
+`std`: 4 `sTyIxOfNameTy` calls, all answered at `cUserTypes`, **0 reaches and 0 kind-6 entries** —
+stated rather than reported as a zero.
+
+### 5. GATE
+
+* `refresh-compiler.sh` rc 0; `scripts/lint-self.sh` rc 0.
+* `deno test -A tests/cases_wasm_test.ts` — **1,738 passed / 0 failed / 7 ignored**.
+* `tests/selfhost_native_align_test.ts` — **1,745 passed / 0 failed** under
+  `SELFHOST_NATIVE_ALIGN=1`, verified both ways (ungated: 0 passed / 0 failed / **1,745 ignored**,
+  the vacuous pass the playbook names).
+* **Per-file A/B over all 1,808 corpus files, BOTH channels, each side asserted non-empty:** emitted
+  wasm sha256 **0 rows moved** (308 build-rejects, identical set); **`T.tys.length` 0 rows moved**
+  (1,500 census values + 308 NOEMIT, identical set). The arena channel is a separate census compiler
+  per side, because the byte channel alone is blind on this layer (D-NWBRANDKEY: 0 of 1,773 on bytes
+  while 5 moved on `T.tys`).
+* Seed ladder leg 2: `rm build/vl-compiler.wasm*` → `fetch-seed.sh` (1,162,553 B) →
+  `refresh-compiler.sh --prove-fixpoint` rc 0, *"NATIVE FIXPOINT HOLDS"*, **1,162,578 B**.
+
+**BYTE DELTA: +25 B.**
+
+### METHOD NOTES
+
+* **A FILED NUMBER WITH A CITATION IS NOT A MEASURED NUMBER.** "18 of 1,064" survived three
+  restatements and one board cycle on a citation to a slice that never measured it. The cheap check
+  is not to re-measure first — it is to open the cited slice and look for the table. There was none.
+* **TWO NUMBERS THAT LOOK LIKE A DISCREPANCY CAN BE TWO UNITS.** 1,064 (mints) and 1,050 (reaches)
+  differ by exactly the 14 the hint answers. The board's instruction to re-derive with denominators
+  is what surfaced that; quoting either alone hides which side of the shipped route it is on.
+* **"ALREADY HOLDS THE INDEX" IS NOT A PROPERTY OF THE CALLER, IT IS A PROPERTY OF THE QUESTION THE
+  INDEX ANSWERED.** Six callers of one interner all "hold an index"; two hold the emitter's
+  resolution of the very string they pass (shipped, equal by construction), and the largest holds the
+  checker's type for a spelling the canon pass has since rewritten (215 of 299 disagreements). The
+  same sentence describes both.
+* **A BLOCKER FILED AS AN ORDER HAZARD IS WORTH RE-READING FOR WHETHER THE MOVE IT DESCRIBES IS
+  NEEDED AT ALL.** The kind-6 site was blocked for two slices on a hoist that would move a mint; the
+  resolution it needed was already sitting above the block, computed by the FIND, and the hoist was
+  never required. *Look UP the function before pricing a move DOWN it.*
+* **THE PROBE MUST NOT BE THE THING THAT MINTS.** Every dual-write resolution here runs under a
+  `zzQuiet` flag and immediately before the call it shadows, so the memo state, the mint order and
+  the counters are the same as the unprobed run — confirmed by row 2 reading exactly 1,050, the
+  figure D-INLINESHAPETY published, on the probed master build.
