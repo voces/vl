@@ -737,6 +737,7 @@ let pendDepths: i32[] = []
 let npKeys: string[] = []
 let npTys: i32[] = []
 let npInvBy: i32[] = []
+let npEpochs: i32[] = []
 let npFrames: i32[] = []
 
 // CYCLE GUARD stacks for `assignable` over recursive named types (A11): a
@@ -810,13 +811,28 @@ let pgFrames: i32[] = []
 // REF rep it happens to work. The two must agree or a boxed read diverges, so the
 // checker refuses the read the emitter cannot lower. The property-path side has always
 // behaved this way (`pathInvalidatedErr`), so the two spellings match.
+//
+// `narFnEpoch` counts FUNCTION BODIES CHECKED, and every narrowing — bank entry or path
+// overlay slot — records the count at install. A closure created inside a guarded region
+// reads its capture at the region's NARROWED rep and runs later, so a write that retires
+// the narrowing behind it is observed through the capture: `if v != null { const w = () =>
+// { print(v + 1) }   v = null   w() }` is check-clean and emits an invalid module without
+// this. A mismatch between the recorded epoch and the current one means "a body that may
+// have captured this narrowing has been checked since it was installed", and the write
+// keeps master's verdict AND master's message — a captured narrowing is exactly the case
+// where refusing the write is the sound answer, not an accident.
+//
+// A closure created BEFORE the guard captured the binding un-narrowed, and its epoch is
+// already spent when the narrowing installs, so it does not block the write.
 const NAR_KIND_ASG = 0
 const NAR_KIND_GUARD = 1
+let narFnEpoch = 0
 let asgDeclKeys: string[] = []
 let asgDeclTys: i32[] = []
 let asgDeclDepths: i32[] = []
 let asgDeclKinds: i32[] = []
 let asgDeclRetiredBy: i32[] = []
+let asgDeclEpochs: i32[] = []
 let asgDeclFrames: i32[] = []
 
 // The scope-chain DEPTH of the innermost binding of `name`, or -1 when undeclared.
@@ -896,6 +912,7 @@ function noteNarShadow(name: string, declTy: i32, kind: i32) {
   asgDeclDepths.push(d)
   asgDeclKinds.push(kind)
   asgDeclRetiredBy.push(-1)
+  asgDeclEpochs.push(narFnEpoch)
   0
 }
 
@@ -2532,6 +2549,7 @@ export function initChecker() {
   npKeys = []
   npTys = []
   npInvBy = []
+  npEpochs = []
   npFrames = []
   weKeys = []
   weVals = []
@@ -2548,7 +2566,9 @@ export function initChecker() {
   asgDeclDepths = []
   asgDeclKinds = []
   asgDeclRetiredBy = []
+  asgDeclEpochs = []
   asgDeclFrames = []
+  narFnEpoch = 0
   reScopeBases = []
   reNpBases = []
   guardNames = []
@@ -3502,10 +3522,11 @@ function writeStorageTy(ix: i32) {
     // `let x: i32 | null = null` / `x = 5` / `while c { use(x)   x = null }` is a
     // CORRECT program for a single-iteration loop, so barring it would newly reject
     // working code. Only the guard-kind acceptance is new, so only it is bounded.
-    const gDcl = narDeclaredTy(n.identName, NAR_KIND_GUARD)
-    if gDcl >= 0 {
+    const gSlot = narGuardSlot(n.identName)
+    if gSlot >= 0 {
+      if asgDeclEpochs[gSlot] != narFnEpoch { return -1 }
       if !narInsideBarrier(lookupDepth(n.identName)) { return -1 }
-      return gDcl
+      return asgDeclTys[gSlot]
     }
     return narDeclaredTy(n.identName, NAR_KIND_ASG)
   }
@@ -3514,6 +3535,7 @@ function writeStorageTy(ix: i32) {
     if key == "" { return -1 }
     const slot = narrowedPathIx(key)
     if slot < 0 || npInvBy[slot] >= 0 { return -1 }
+    if npEpochs[slot] != narFnEpoch { return -1 }
     if !npInsideBarrier(slot) { return -1 }
     const noNames: string[] = []
     const noTys: i32[] = []
@@ -4599,6 +4621,7 @@ function applyNarrows(names: string[], tys: i32[]) {
       npKeys.push(names[i])
       npTys.push(tys[i])
       npInvBy.push(-1)
+      npEpochs.push(narFnEpoch)
     } else {
       const wasConst = isConstName(names[i])
       const declTy = lookup(names[i])
@@ -4713,6 +4736,7 @@ function popScope() {
       npKeys.pop()
       npTys.pop()
       npInvBy.pop()
+      npEpochs.pop()
     }
   }
   if pgFrames.length > 0 {
@@ -4729,6 +4753,7 @@ function popScope() {
       asgDeclDepths.pop()
       asgDeclKinds.pop()
       asgDeclRetiredBy.pop()
+      asgDeclEpochs.pop()
     }
   }
   if symEnabled != 0 {
@@ -16175,6 +16200,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     inferSawErr = false
     fnSawValueRet = false
   }
+  // A FUNCTION BODY CHECKED HERE CAN CAPTURE whatever narrowings are live around it, and
+  // it runs LATER — so a narrowing installed BEFORE this point and retired AFTER it would
+  // be retired behind the capture's back. `narFnEpoch` is how the write side tells the two
+  // apart; see `writeStorageTy`.
+  narFnEpoch = narFnEpoch + 1
   // Check the body in a fresh scope sharing the parameters.
   pushScope(n.fnBody)
   // Keep the function's TYPE PARAMETERS in scope for the WHOLE body, so a body
@@ -24623,6 +24653,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
               npKeys.push(gKey)
               npTys.push(gTy)
               npInvBy.push(-1)
+              npEpochs.push(narFnEpoch)
             } else if gTy == nonNullTy(lookup(gKey)) {
               declare(gKey, gTy)
             } else {
