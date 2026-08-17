@@ -355,6 +355,7 @@ import {
   mvValsOutBase,
   narrowNames,
   narrowSets,
+  narrowStripNullOnly,
   narrowTop,
   narrowTys,
   narrowVariants,
@@ -8656,7 +8657,9 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
   // (including the `&&`-conjunct recursion) sees the bare condition shape.
   const condIx = unwrapParen(condIx0)
   const c = P.nodes[condIx]
-  if c is IsExpr {
+  // An `is T` test PINS a variant rather than stripping `null`, so a consumer that only
+  // accepts strips (the loop body — see `narrowStripNullOnly`) skips this whole block.
+  if c is IsExpr && !narrowStripNullOnly {
     const recv = P.nodes[c.isObj]
     if recv is Ident {
       if exprUnion(c.isObj, fnIx) {
@@ -8724,6 +8727,8 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
     const cn = P.nodes[condIx]
     if cn is BinExpr {
       if cn.binOp == "==" {
+        // Pinning `x` to `null` is not a strip — skipped for a strip-only consumer.
+        if narrowStripNullOnly { return false }
         pushNarrow(nm, "null")
         return true
       }
@@ -8776,6 +8781,8 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
     const scn = P.nodes[condIx]
     if scn is BinExpr {
       if scn.binOp == "==" {
+        // Pinning `v` to `null` is not a strip — skipped for a strip-only consumer.
+        if narrowStripNullOnly { return false }
         pushNarrow(snm, "null")
         return true
       }
@@ -8873,7 +8880,9 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
   // complement-narrows the same as the bare spelling.
   const condIx = unwrapParen(condIx0)
   const c = P.nodes[condIx]
-  if c is IsExpr {
+  // The else of `x is null` STRIPS null (that is how `!(e is null)` narrows); the else of
+  // `x is T` subtracts `T`, which pins a variant. A strip-only consumer keeps the former.
+  if c is IsExpr && (c.isVariant == "null" || !narrowStripNullOnly) {
     if valueAtomKind(c.isVariant) >= 0 {
       const recv = P.nodes[unwrapParen(c.isObj)]
       if recv is Ident {
@@ -8993,6 +9002,8 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
     const cn = P.nodes[condIx]
     if cn is BinExpr {
       if cn.binOp == "!=" {
+        // The else of `x != null` pins `null`, not a strip.
+        if narrowStripNullOnly { return false }
         pushNarrow(nm, "null")
         return true
       }
@@ -9042,6 +9053,8 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
     const scn = P.nodes[condIx]
     if scn is BinExpr {
       if scn.binOp == "!=" {
+        // The else of `v != null` pins `null`, not a strip.
+        if narrowStripNullOnly { return false }
         pushNarrow(snm, "null")
         return true
       }
@@ -9065,61 +9078,6 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
 export function restoreNarrow(n: i32) {
   narrowTop = n
   0
-}
-
-// COMPACT AWAY the property-PATH entries a `setNarrowFromCond` push added above depth
-// `base`, keeping its bare-NAME entries in place. Returns whether anything above `base`
-// survives (so a caller's `restoreNarrow` stays gated the same way `narrowed` gates it).
-//
-// The one caller is the LOOP-BODY narrowing, and the reason is a layer agreement rather
-// than a preference: the checker narrows a loop body from the condition for bare names
-// ONLY (a path fact is falsifiable inside the body through any alias of the object, and
-// nothing re-points a path overlay's WRITE side at the declaration), so an emitter that
-// unboxed a narrowed `o.v` there would be reading a slot the checker still types as the
-// union. The two must push the same set or the boxed reps emit a raw box where an
-// unboxed value is expected.
-//
-// WHAT IS MEASURED, so the next reader does not read more into it than was shown. The
-// drop is REACHED: a `while o.v is A { … }` guard over a union-typed struct field pushes
-// a path key, and this compacts it away (3 of 3 constructed shapes; 0 of 1902 corpus
-// files, and 0 in the compiler's own self-compile — no corpus loop guards on a path).
-// On all three the emitted module is BYTE-IDENTICAL with and without the compaction,
-// because those bodies hold no consumer of a path narrowing that also type-checks
-// against the un-narrowed union — a narrowed path is consumed by a FIELD READ, and a
-// field read the checker did not narrow is a check error, never emitted. So this is a
-// lockstep guard on a reachable push, not an observed output fix: it is what keeps the
-// next path-narrowing consumer from silently disagreeing with the checker.
-export function dropPathNarrowsAbove(base: i32) {
-  let w = base
-  let i = base
-  while i < narrowTop {
-    if !narrowKeyIsPath(narrowNames[i]) {
-      if w != i {
-        narrowNames[w] = narrowNames[i]
-        narrowVariants[w] = narrowVariants[i]
-        narrowTys[w] = narrowTys[i]
-        narrowSets[w] = narrowSets[i]
-      }
-      w = w + 1
-    }
-    i = i + 1
-  }
-  narrowTop = w
-  w > base
-}
-
-// Whether a narrowing-stack key is a property PATH (`o.v`, `n.a.b`) rather than a bare
-// name — the emit-side mirror of the checker's `isPathKey`, over the same '.'-joined
-// spelling `memberPathKeyOf` builds.
-function narrowKeyIsPath(s: string) {
-  let i = 0
-  while i < s.length {
-    if s[i] == 46 {
-      return true // '.'
-    }
-    i = i + 1
-  }
-  false
 }
 
 // After a GUARD `if` — one with NO else whose then-branch always LEAVES the path — the
