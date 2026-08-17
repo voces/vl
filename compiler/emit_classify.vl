@@ -1837,8 +1837,14 @@ export function mapRetExprShape(rx: i32, fe: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if callee.identName == "Map" || callee.identName == "Set" { return -1 }
-      return fnRetMapShapeSid(sidOfNode(e.callFn))
+      // A `Set()` is the mono map on either key rep (its value is the constant boolean).
+      if callee.identName == "Set" { return -1 }
+      // A bare `Map()` returned straight out (`function mk() { return Map() }`) carries NO
+      // spelling at all — its value type lives only in what the checker inferred, so it
+      // falls to the recorded ladder at the bottom rather than short-circuiting to mono.
+      if callee.identName != "Map" {
+        return fnRetMapShapeSid(sidOfNode(e.callFn))
+      }
     }
   }
   // A CAPTURED map return (`(q) => (h)` over an enclosing-frame map `h`): the ident is
@@ -1847,6 +1853,15 @@ export function mapRetExprShape(rx: i32, fe: i32) {
   // functype result `$mapStruct` heap type matches the env field AND the captured value.
   const cap = retCapturedMapShape(fe, rx)
   if cap != -3 { return cap }
+  // FALLBACK — the map type the CHECKER RECORDED on the returned expression. Every rung
+  // above reads a SPELLING (a param annotation, a `let` annotation, a callee's return
+  // annotation), and an inferred map has none: `function mk() { return Map() }` and
+  // `const t = Map()` pinned by its first write both put zero map syntax in the arena.
+  // The mint side (`mvShapeOfMapNodeTy`, through `collectA`) reads this same recorded
+  // type, so the slot found here is the one the type section interned — which is what
+  // keeps the functype RESULT valtype (`emitFunctionSection`'s inferred-map arm) and the
+  // caller's receiver shape (`mapShapeOfExpr` → `fnRetMapShapeSid`) naming one struct.
+  if nodeTyIsMap(u) { return mapFindShapeOfNodeTy(u) }
   -1
 }
 
@@ -1907,7 +1922,12 @@ function retCapturedMapShape(fe: i32, rx: i32): i32 {
   -3
 }
 
-function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
+// True if `rx` returns a body-declared map LOCAL whose value type the mv layer can lower.
+// The local's kind is not collected during the GLOBAL return pass, so neither `exprMap` nor
+// any Ident classifier can see it — this reads the DECLARATION instead, and it is what puts
+// `"map"` in `fRetKind` (the functype result valtype, and the `return Map()` constructor
+// seed, both follow from there).
+function retIsMapLocal(rx: i32, fnIx: i32) {
   let u = rx
   let done = false
   while !done {
@@ -1934,7 +1954,15 @@ function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
                 return mapValKindLowerable(lt.tyName)
               }
             }
+            return false
           }
+          // An UN-ANNOTATED map local (`const t = Map()`, its value type pinned by the first
+          // write) has no annotation for the rung above to read: the checker's recorded type
+          // on the returned ident is the only spelling of it. Leaving it unclassified left
+          // the functype result at the `"i32"` default over a body that returns a map ref —
+          // and the CALLER resolves the same recorded type, so the two disagreed as invalid
+          // wasm rather than as a loud reject.
+          if nodeTyIsMap(u) { return mapNodeValKindLowerable(u) }
         }
       }
     }
@@ -1945,7 +1973,7 @@ function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
 // The parent-`let` arena index a returned bare IDENT names in function `i`'s
 // body, or -1 (the return is not an ident, or the name is a param / global —
 // `parentLetOf` only finds body-declared `let`s). The lookup half of the
-// returned-LOCAL classification in `criClassify`, mirroring `retIsMapLocalAnnot`.
+// returned-LOCAL classification in `criClassify`, mirroring `retIsMapLocal`.
 function criRetLocalLet(rx: i32, i: i32) {
   const u = unwrapParen(rx)
   const e = P.nodes[u]
@@ -2466,11 +2494,12 @@ export function criClassify(rx0: i32, i: i32) {
   }
   if fRetKind[i] != "map" {
     // `exprMap` classifies a returned map PARAM (reads `parType` directly) and a `Map()`/
-    // map-returning-call. A returned map LOCAL needs `retIsMapLocalAnnot` — its kind isn't
-    // collected during this GLOBAL return pass, so read its `{[string]: i32}` annotation.
+    // map-returning-call. A returned map LOCAL needs `retIsMapLocal` — its kind isn't
+    // collected during this GLOBAL return pass, so read its DECLARATION (the annotation,
+    // else the type the checker inferred for it).
     if (
       exprMap(rx, fnStmts[i]) ||
-      retIsMapLocalAnnot(rx, fnStmts[i]) ||
+      retIsMapLocal(rx, fnStmts[i]) ||
       retCapturedMapShape(i, rx) != -3
     ) {
       criSetRetKind(i, "map")
@@ -2529,7 +2558,7 @@ export function criClassify(rx0: i32, i: i32) {
   // functype result would default to i32 over a body that yields a ref — invalid
   // wasm. Classify through the DECLARATION (annotation first, else the
   // initializer's shape) via the shared per-let classifiers, exactly as
-  // `retIsMapLocalAnnot` does for a returned map local. The scalar / string /
+  // `retIsMapLocal` does for a returned map local. The scalar / string /
   // scalar-list local kinds never reach here — the checker's recorded
   // inferred-return name (the A20 pass) already covers them.
   const rll = criRetLocalLet(rx, i)
@@ -3399,6 +3428,14 @@ function mapValKindLowerable(mapName: string) {
   mvValKindOfName(mapValNameOf(mapName)) != -3
 }
 
+// The recorded-type twin of `mapValKindLowerable`: true if the map type the CHECKER
+// RECORDED on node `ix` has a value the mv layer can lower. An INFERRED map puts no map
+// spelling in the arena at all, so there is nothing to slice a value name out of — the
+// value name comes off the arena render instead. Same `-3` sentinel, one home.
+function mapNodeValKindLowerable(ix: i32) {
+  mvValKindOfName(nodeTyMapValName(ix)) != -3
+}
+
 export function mvValKindOfName(valName: string): i32 {
   if valName == "i32" || valName == "boolean" { return -1 }
   // A literal-union ATOM value (`{[string]: K0}`, `K0 = "aa" | "bb"`): each value IS the
@@ -3711,6 +3748,31 @@ export function mvShapeOfMapNodeTy(ix: i32) {
   if nodeTyMapValIsLitUnion(ix) { return mapMonoShapeOfKey(ki) }
   if nodeTyMapValIsNulLitUnion(ix) { return mapMonoShapeOfKey(ki) }
   const sh = mvShapeOfValNameK(nodeTyMapValName(ix), ki)
+  if sh == -1 { return mapMonoShapeOfKey(ki) }
+  sh
+}
+
+// The map SHAPE of the map type the CHECKER RECORDED on node `ix` — the FIND-side twin of
+// the mint `mvShapeOfMapNodeTy` directly above, and the ONLY route from an INFERRED map
+// value type to its rep. Callers gate on `nodeTyIsMap(ix)` first; the rung order is the
+// mint's, so a FIND lands on exactly the slot the type section interned.
+//
+// The two atom rungs are load-bearing, not defensive: an atom-valued map (`{[string]: K0}`)
+// rides the MONO i32 `vals` list and interns NO slot, while its RENDERED value name
+// collapses to `string` (`tyToEmitName` widens each member literal) — so without them the
+// name rung would claim a string-valued slot the mint never made.
+export function mapFindShapeOfNodeTy(ix: i32) {
+  const ki = nodeTyMapKeyIsI32(ix)
+  if nodeTyMapValIsLitUnion(ix) { return mapMonoShapeOfKey(ki) }
+  if nodeTyMapValIsNulLitUnion(ix) { return mapMonoShapeOfKey(ki) }
+  // The NAME here is `tyToEmitName` of the very type `nodeMapValTyIx` returns — a render
+  // followed by a re-parse of the render (D-MAPNODETY). The type goes straight across; the
+  // rendered name stays because the rungs BELOW the arena leg are still name-keyed.
+  const sh = mvSlotOfMapValNameOrMonoKTy(
+    nodeTyMapValName(ix),
+    ki,
+    nodeMapValTyIx(ix),
+  )
   if sh == -1 { return mapMonoShapeOfKey(ki) }
   sh
 }
@@ -20355,27 +20417,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     // closure local `v()`, an indexed closure `arr[i]()`) — resolve the shape from the checker's recorded
     // map VALUE type (mono/atom ⇒ -1, else the value name's mv slot). Mirrors the `exprMap` fallback and
     // `structIndexOfExpr`'s `nodeTyName` struct fallback, so `v()[k] ?? d` picks the right value rep.
-    if nodeTyIsMap(exprIx) {
-      // An ATOM-valued map (`{[string]: K0}`) is the MONO i32 map, but its RENDERED value
-      // name collapses to `string` (`tyToEmitName` widens each member literal) — which the
-      // slot resolver would treat as a slot-less STRING-valued map and reject loudly. Gate
-      // on the checker's recorded litunion first (the atom map has no slot by design).
-      // Same for the NULLABLE-atom niche (`{[string]: K0 | null}` — the `-1` sentinel rides
-      // the mono map; its rendered value name would collapse to `string | null`).
-      if nodeTyMapValIsLitUnion(exprIx) { return mapMonoShapeOfKey(ckI32) }
-      if nodeTyMapValIsNulLitUnion(exprIx) { return mapMonoShapeOfKey(ckI32) }
-      // The NAME here is `tyToEmitName` of the very type `nodeMapValTyIx` returns — a
-      // render followed by a re-parse of the render (D-MAPNODETY). The type goes straight
-      // across; the rendered name stays because the rungs BELOW the arena leg (the kind
-      // classifier, `mvSlotByValNameK`) are still name-keyed.
-      const cSh = mvSlotOfMapValNameOrMonoKTy(
-        nodeTyMapValName(exprIx),
-        ckI32,
-        nodeMapValTyIx(exprIx),
-      )
-      if cSh == -1 { return mapMonoShapeOfKey(ckI32) }
-      return cSh
-    }
+    if nodeTyIsMap(exprIx) { return mapFindShapeOfNodeTy(exprIx) }
     if ckI32 { return -4 }
     return -1
   }
