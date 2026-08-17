@@ -1423,3 +1423,107 @@ is the cheapest class; the fix shape is to let a single match consult the node t
 Pinned by `tests/cases/structs/anon-fieldset-collision-scalar-axis.vl` (unannotated throughout, so
 no minted slot can carry it) and `anon-fieldset-collision-silent-reads.vl` (which RUNS on the
 reverted compiler and prints the two wrong values).
+
+---
+
+## The nullable ALIAS is CLOSED for a faithful inner — the defect was the DECLARATION route, not the transparency predicate
+
+D11 relocated its defect to alias transparency and #1423 closed the one-member wrapper over a
+`TyNullable`. Both were about the ALIAS's member. This one is about how the alias's member list is
+BUILT, and the filing's suspected layer (the transparency predicate) was the wrong one:
+`singleAliasMemberTyIx` never saw the shape at all, because there was no `TyNullable` for it to see.
+
+**The mechanism, from the arena.** `parseTypeDecl` reads `type T = X | null` as a **two-variant
+`UnionDecl`**. Pass 0b resolved each variant independently and pushed every survivor into the
+alias's member list, `null` among them — so the alias interned as `TyUnion[X, null]`. Both
+annotation routes (`tsToTyReal`'s `TS_UNION` arm, `nameToTyReal`'s pipe arm) instead set `hasNull`
+and wrap: `TyNullable(X)`. The declaration route had **neither line**, so the parenthesized
+declaration `type T = (X | null)` — ONE variant, resolved through the annotation route — got the
+niche and the un-parenthesized one did not. The two spellings differ only in where the parens go,
+and the rendered type in a diagnostic is the cheapest confirmation: `i32 | null` for the
+un-parenthesized alias, `i32?` for the parenthesized one and for the inline annotation.
+
+Three consumers keyed on the niche then missed it: the `!= null` narrow (`nonNullTy` peels a
+`TyNullable`, never a `null` SIBLING), the emitter's niche lowering against the union ROW the
+two-member arity minted (`cVariantMemberTyIxs`, `collectU`), and the transparency predicate itself.
+
+`type T = X?` **does not spell** — `expected an expression but found QUESTION`, at the declaration
+only; `x: X?` is fine as an annotation. So the parenthesization axis has exactly three live forms.
+
+### The grids
+
+Two, both graded against the INLINE spelling as oracle at BOTH runtime inputs (a non-null call and
+a `null` call in every program), on the seed before and after.
+
+| grid | cells/spelling | spelling | oracle-parity before → after | check-clean INVALID WASM before → after | silently WRONG output |
+|---|---:|---|---|---|---|
+| positions (12 inners × 8 positions) | 96 | `X \| null` | 4 → **57** | 35 → **7** | 0 → 0 |
+| | 96 | `(X) \| null` | 1 → **57** | 39 → **7** | 0 → 0 |
+| | 96 | `(X \| null)` | 59 → 59 | 5 → 5 | 0 → 0 |
+| uses (7 inners × 8 uses) | 56 | `X \| null` | 14 → **50** | 12 → **0** | 0 → 0 |
+| | 56 | `(X) \| null` | 14 → **50** | 12 → **0** | 0 → 0 |
+| | 56 | `(X \| null)` | 48 → 48 | 0 → 0 | 0 → 0 |
+
+Positions: parameter, return, module `const`, function-local `let`, struct field, list element, map
+value, generic instantiation. Uses: `!= null` guard, `is` test, `??`, passed onward, returned and
+re-narrowed, arithmetic/concat after narrowing, `== null`, `!= null &&`. Inners: `string`, a named
+litunion, an inline litunion, a NUMERIC litunion, `i32`, `f64`, `boolean`, a declared struct, a
+list, a map, a newtype, a nested nullable.
+
+**The inline oracle and the parenthesized control are both unmoved, cell for cell** — 0 of 192
+oracle cells and 0 of 152 `(X | null)` cells move. **Zero silently-wrong-output cells in either
+grid, before or after**: every reachable failure of this defect is a build or check verdict, which
+is why its fixtures redden on those and not on a log mismatch.
+
+**Byte identity.** On the seed before, **0 of 96** position groups had all four spellings even
+build. After, **56 of 56** groups where all four build are byte-identical, and **46 of 46** in the
+use grid.
+
+### The gate is on the INNER, and it is what the six down-cells buy
+
+An UNGATED fold is **108 cells up and 6 down**, two of them into the silent class. A member the
+emitter renders STRUCTURALLY under the `| null` keeps a capability on the two-member union that the
+niche does not have: `type T = S | null` over a declared struct plus `v is S` RUNS on the union row
+(the test finds its variant) and is `emitProgram: `is` receiver is not a union value` on the niche,
+because `collectU` still mints T's row from the parser's variant NAMES while the param now lowers
+from the ARENA as a niche — the two disagree. A NEWTYPE inner is the same cell one kind over
+(`type NW = new i32` is itself a one-member union, so it declines too), and there the niche spelling
+is check-clean INVALID WASM — the INLINE spelling's own pre-existing hole, reached through the
+alias.
+
+So the fold is gated on `nulNicheInnerFaithful`, factored out of `nulAliasMemberFaithful`: the same
+"which niche inners does `tyToEmitNameGo` spell position-free" question, one rung down. Folded:
+`string`, `i32`, `f64`, `boolean`, a STRING litunion (named or inline). Declined: a declared struct,
+a list, a map, a NUMERIC litunion, a newtype, a nested nullable — each keeping master's shape
+exactly.
+
+**The single source of truth afterwards** is `annUnionInnerTy` (the member list: litunion flatten,
+unseparable-pair poison) plus `annUnionTy` (the `null` wrap) for the two annotation routes, and the
+same `annUnionInnerTy` + `nulNicheInnerFaithful` + `mkNullableTy` for the declaration route, which
+takes the two halves rather than the whole because the gate sits between them.
+
+### What is still open, measured on the same grid
+
+**The residue is identical for all three alias spellings** — it is no longer a parenthesization
+defect. Per spelling, out of 96 position cells: **32 CHECKREJ** (a declared struct 8, a list 8, a
+map 8, a numeric litunion 8 — every position) and **7 INVALIDWASM** (a nested-nullable inner; 5 for
+the parenthesized spelling, whose other 2 are a loud emit reject instead).
+
+The struct/list/map 24 are ONE defect, and it is the alias's union WRAPPER at the CHECKER rather
+than at the emitter: `type T = (S | null)` interns `TyUnion[S?]`, and `nonNullTy` peels a
+`TyNullable` but not a one-member union around one, so `if v != null { v.v }` reads `field 'v' is
+not on every member of {v: i32}? — narrow with `is` first` while the inline `S | null` narrows and
+runs. A one-member-union peel in `nonNullTy` would lift all 24, and its blast radius is every
+`nonNullTy` reader (`type Id = i32` is also a one-member union), so it wants its own measured slice.
+
+Two adjacent defects the grids found, each with a control:
+
+- **`is <NewtypeName>` on a nullable newtype is check-clean INVALID WASM in the INLINE spelling.**
+  `type NW = new i32; function f(v: NW | null) { if v is NW { print(v as i32) } }` →
+  `type mismatch: expected i32, found (ref $type)`, `vl check` rc 0. Pre-existing and unmoved by
+  this cut; the alias spelling now shares it (2 cells), where before the two-member union answered
+  it correctly by accident of the NAME-level variant row. Control: `is i32` on `i32 | null` runs.
+- **A NUMERIC litunion niche is `emitProgram: bare null needs a struct-typed context`** for the
+  inline spelling at the parameter and return positions (`type NL = 0 | 1; f(v: NL | null)`), so the
+  oracle itself is loud there and the alias cannot be graded above it. Control: the same program
+  with a STRING litunion runs.
