@@ -16076,21 +16076,39 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   //   `a || b`  ≡  if (a) { 1 } else { b }   (skip b when a is true  → 1)
   // The condition `a` is evaluated first, then `if 0x04` with i32 result-type
   // blocktype `0x7f`; the then-branch, `else 0x05`, the else-branch, then `end 0x0b`.
+  //
+  // THE RIGHT OPERAND IS A NARROWING SCOPE, exactly like an `if` ARM. `a` decides
+  // whether `b` runs at all, so `b` is emitted under whatever `a` proved — the same
+  // fact the checker types `b` against. `&&` gives `b` the THEN-sense of `a`
+  // (`setNarrowFromCond`, which recurses through a nested `a && b` and through `!`),
+  // `||` the ELSE-sense (`setNarrowFromCondElse` — `b` runs only when `a` was false).
+  // Without the push, `e != null && e >= 0` over a value-union BOX (`i32 | null` is
+  // `(struct (field i32) (field anyref))`) pushed the BOX ref under `i32.ge_s`:
+  // `vl check` rc 0, invalid wasm. The statement spelling of the identical operation
+  // (`if e != null { return e >= 0 }`) always worked because THAT arm pushes here, and
+  // the two now emit byte-identical unbox sequences. `==` survived un-narrowed only
+  // because a boxed operand has its own structural lowering (`emitUnionConcreteEq` /
+  // `emitUnionUnionEq`) that reads the tag and payload itself.
   if e.binOp == "&&" || e.binOp == "||" {
     if emitExpr(body, e.binLeft, fnIx) < 0 {
       return -1 // condition `a`
     }
     fbIf(127) // 0x04 if, 0x7f i32 result-type blocktype (yields an i32)
+    const scTop = narrowTop
     if e.binOp == "&&" {
       // then = b, else = 0
+      const scNarrowed = setNarrowFromCond(e.binLeft, fnIx)
       if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+      if scNarrowed { restoreNarrow(scTop) }
       fbElse() // 0x05 else
       fbI32Const(0)
     } else {
       // then = 1, else = b
       fbI32Const(1)
       fbElse() // 0x05 else
+      const scNarrowedElse = setNarrowFromCondElse(e.binLeft, fnIx)
       if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+      if scNarrowedElse { restoreNarrow(scTop) }
     }
     fbEnd() // 0x0b end
     return 0
