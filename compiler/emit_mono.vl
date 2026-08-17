@@ -1872,7 +1872,7 @@ function monoMakeInstance(
     // Walk THIS INSTANCE's body — a nested generic call instantiates its own callee against this
     // instance's concrete annotations, and the callee rename lands on the instance's own `Call`
     // spine (`monoCloneGenericCalls`) rather than on nodes its siblings share.
-    if monoWalk(instBody, nfn) < 0 { return -1 }
+    if monoWalkFnBody(nfn) < 0 { return -1 }
     if monoRebuild() < 0 { return -1 }
     return 0
   }
@@ -2039,6 +2039,28 @@ function monoStructFieldTypes(
   annObjFieldSplit(tname, outNames, outTexts) == 1
 }
 
+// The `fnStmts` slot of the function an `Ident` NAMES — the ONE resolver every question this pass
+// asks about a named function goes through, whichever spelling declared it. Two halves, both
+// load-bearing:
+//
+//   * `fnIndexOfInScope` — the language's innermost-scope rule for a name a `FuncDecl` CARRIES.
+//     The flat `fnIndexOf` returns the FIRST slot with the name, which resolves a nested homonym
+//     to the wrong frame (#1265) while `wasmEmit` lowers the same reference through the chain.
+//   * `identClosureFeSid` — an arrow lambda parses to a NAMELESS `FuncDecl` (`parseArrowLambda`),
+//     so a `const`/`let` holding one carries the name on the BINDING and has no entry in the name
+//     map at all. Only the binding walk reaches its slot.
+//
+// Without the second half a RECEIVER spelled `const hof = (g: (i32,i32) => i32, …) => …` presents
+// no parameter list, so the declared callback type never reaches `monoCoerceFnValue` and the value
+// floor refuses the very function value the `function hof(g: (i32,i32) => i32, …)` spelling takes.
+// `identIx` is the `Ident` node (read for its sid), `name` its text, `ctx` the enclosing function
+// node (-1 = top level).
+function monoFnFeOfIdent(identIx: i32, name: string, ctx: i32) {
+  const fe = fnIndexOfInScope(name, ctx)
+  if fe >= 0 { return fe }
+  identClosureFeSid(sidOfNode(identIx), ctx)
+}
+
 // Coerce a generic function VALUE (or a composite of them) flowing into the expected type NAMED by
 // `tname`. If `exprIx` is an `Ident` naming a generic (un-annotated-param) function and `tname` is a
 // CONCRETE function type, materialize the instance for its param types and point the `Ident` at it
@@ -2123,8 +2145,7 @@ function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
     // A bare function NAME, or a VALUE BINDING holding a generic function (`const add = (a,b) =>
     // a + b`, or `const g = named`) — resolve the binding to its lifted slot so an escaping lambda
     // binding materializes at the boundary type too, not just a by-name generic function.
-    let gfe = fnIndexOf(e.identName)
-    if gfe < 0 { gfe = identClosureFeSid(sidOfNode(exprIx), ctx) }
+    const gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
     if gfe >= 0 && gfe < monoGen.length {
       if monoGen[gfe] == 1 {
         const pnames: string[] = []
@@ -2165,21 +2186,23 @@ function monoCoerceFnValue(exprIx: i32, expectedTyIx: i32, ctx: i32) {
   return monoCoerceFnValueName(exprIx, tyNameOf(expectedTyIx), ctx)
 }
 
-// The written type-annotation node of parameter `i` of the named function `name` (its ORIGINAL
-// declaration, before monomorphization may replace the slot), or -1. Lets a call site read the
-// concrete function type a callback parameter declares, to coerce a generic function argument.
+// The written type-annotation node of parameter `i` of the function occupying `fnStmts` slot `fe`
+// (its ORIGINAL declaration, before monomorphization may replace the slot), or -1. Lets a call site
+// read the concrete function type a callback parameter declares, to coerce a generic function
+// argument. Callers resolve `fe` through `monoFnFeOfIdent`, so the answer is the same for every
+// spelling of the declaring function.
 //
 // `monoOrigNode` is captured in the PRE-pass and is only as long as the declaration count, while
-// `fnIndexOf` reads the name map `monoRebuild` refreshes — which DOES carry the appended instance
-// slots (`at$1`, `apply$cb0`). A name that resolves past `monoOrigNode`'s end read out of bounds,
-// trapping the whole compiler with no diagnostic (`wasm trap: out of bounds array access`) — the
-// crash `monoWalk` reaches whenever it revisits a `Call` whose callee `Ident` an earlier walk
-// already renamed to a count>0 instance. An appended slot has no separate "original": its
-// declaration IS `fnStmts[fe]`, and its params carry the PINNED annotations, which is exactly the
-// concrete function type this answer is for.
-function monoFnParamTypeAt(name: string, i: i32) {
-  const fe = fnIndexOf(name)
+// the name map `monoRebuild` refreshes DOES carry the appended instance slots (`at$1`,
+// `apply$cb0`). A name that resolves past `monoOrigNode`'s end read out of bounds, trapping the
+// whole compiler with no diagnostic (`wasm trap: out of bounds array access`) — the crash
+// `monoWalk` reaches whenever it revisits a `Call` whose callee `Ident` an earlier walk already
+// renamed to a count>0 instance. An appended slot has no separate "original": its declaration IS
+// `fnStmts[fe]`, and its params carry the PINNED annotations, which is exactly the concrete
+// function type this answer is for.
+function monoFnParamTypeAt(fe: i32, i: i32) {
   if fe < 0 { return -1 }
+  if fe >= fnStmts.length { return -1 }
   let declIx = fnStmts[fe]
   if fe < monoOrigNode.length { declIx = monoOrigNode[fe] }
   const fn = P.nodes[declIx]
@@ -2596,10 +2619,14 @@ function monoWalk(ix: i32, ctx: i32) {
     if callee is Ident {
       // A generic function value passed as an ARGUMENT to a concrete function-typed PARAMETER
       // (`apply(add)` where `apply(f: (i32,i32)=>i32)`): materialize the instance for the
-      // parameter's declared function type so the argument closure carries it.
+      // parameter's declared function type so the argument closure carries it. The RECEIVER's own
+      // definition form is not an axis — `monoFnFeOfIdent` reaches a `function` declaration and an
+      // arrow bound to a `const`/`let` alike, and each declares its parameters the same way.
+      // Resolved ONCE for the whole argument list rather than per argument.
+      const dfe = monoFnFeOfIdent(n.callFn, callee.identName, ctx)
       let ca = 0
       while ca < args.length {
-        const pty = monoFnParamTypeAt(callee.identName, ca)
+        const pty = monoFnParamTypeAt(dfe, ca)
         if pty >= 0 {
           if monoCoerceFnValue(args[ca], pty, ctx) < 0 { return -1 }
         }
@@ -2631,6 +2658,11 @@ function monoWalk(ix: i32, ctx: i32) {
         // (`const f: (i32) => i32 = (x) => …`) is contextually pinned and `call_ref`'d, never
         // monomorphized (`criFnIsAnonLambda` excludes it; the emit-time value floor and the
         // LetDecl direct-call exemption keep the two paths sound).
+        //
+        // This is `monoFnFeOfIdent`'s second half, re-read rather than reused from `dfe` above:
+        // the coercion loop between them materializes instances, and the callee binding may be
+        // one of the arguments it rewrote. The fold below is a REWRITE, so it reads the slot as
+        // of now; `dfe` only had to answer a parameter-list question that instances do not move.
         const afe = identClosureFeSid(sidOfNode(n.callFn), ctx)
         if afe >= 0 {
           if !criFnIsAnonLambda(afe) {
@@ -2772,6 +2804,23 @@ function monoWalk(ix: i32, ctx: i32) {
   // call in an arm sits in an `IfStmt` limb both traversals do cover. Measured: a generic called ONLY
   // from a match arm instantiates (it would otherwise be pruned to a no-op stub and emit an
   // arity-mismatched call), and the same arm at two element types gets two instances.
+  0
+}
+
+// Walk function `fnIx`'s own body, coercing its IMPLICIT return first. A bare-expression body
+// (`const mk = (): (i32, i32) => i32 => padd`) parses to a synthetic one-statement `Block` with no
+// `RetStmt` at all (`parseFuncBodyAndBuild`), so `monoWalk`'s `RetStmt` arm has nothing to read and
+// the declared return type reached the value at NO point — the same declaration written
+// `=> { return padd }` was coerced and accepted. The value of a body block is its LAST statement,
+// which is exactly what `monoCoerceFnValueName`'s `Block` arm walks to, so handing it the whole
+// body covers the braced trailing-expression form by the same rule. A `RetStmt` tail matches no arm
+// there, so an explicit `return` is still coerced once, by the `RetStmt` arm.
+function monoWalkFnBody(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if monoCoerceFnValue(fn.fnBody, fn.fnRet, fnIx) < 0 { return -1 }
+    return monoWalk(fn.fnBody, fnIx)
+  }
   0
 }
 
@@ -3063,10 +3112,7 @@ export function monomorphize(stmts: i32[]) {
   const nDecl = monoGen.length
   while fe2 < nDecl {
     if monoGen[fe2] == 0 {
-      const fn = P.nodes[fnStmts[fe2]]
-      if fn is FuncDecl {
-        if monoWalk(fn.fnBody, fnStmts[fe2]) < 0 { return -1 }
-      }
+      if monoWalkFnBody(fnStmts[fe2]) < 0 { return -1 }
     }
     fe2 = fe2 + 1
   }
