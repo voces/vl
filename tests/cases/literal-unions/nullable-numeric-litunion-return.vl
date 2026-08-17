@@ -1,0 +1,155 @@
+// @run
+// @hint redundant type annotation: `r` is inferred as `1 | 2?` — remove it to lean on inference
+// @hint redundant type annotation: `s` is inferred as `{f: 1 | 2?}` — remove it to lean on inference
+// @hint redundant type annotation: `s` is inferred as `{f: 1.5 | 2.5?}` — remove it to lean on inference
+// @hint redundant type annotation: `s` is inferred as `{f: 5000000000 | 6000000000?}` — remove it to lean on inference
+// THE FOUR HINTS ARE DECLARED BECAUSE ALL FOUR ANNOTATIONS ARE THE POINT. `r`'s is the ANNOTATED
+// receiving local, which is a different cell from the inferred one — the two are pinned side by
+// side here because "annotated works, inferred doesn't" held in this area for eight PRs and then
+// broke on the annotated path. The three `s: S…` annotations name the DECLARED struct type, which
+// is what puts the nullable litunion in a FIELD rather than inferring an anonymous shape; dropping
+// them would move the cell off the field position this file is pinning.
+//
+// CONTRACT (A WIDENING — every cell here is a LOUD REJECT on master): a function may DECLARE a
+// nullable numeric literal union as its return type, `return null` from it, and have the caller
+// narrow the result with `is` or `!= null` and read the value. Both runtime inputs, every cell.
+//
+// THREE HOMES HAD TO AGREE, AND THAT IS WHY MOVING ONE MADE IT WORSE. `vtKindOfType` already gave
+// the return SLOT the box valtype, while `nodeTyIsUnionAlias` — which `retUnionFlag` reads, and
+// which therefore decides `emitReturnValue`'s `retUNm`, `emitNullReturn`'s box, `retAnnKindChain`'s
+// stored `fRetKind` and hence the CALL-RESULT classifier (`fnRetUnionSid` reads that column) —
+// answered NO for the same type, because `isValueUnionBox` rejects a `TyNullable` whose inner is a
+// homogeneous litunion. Teaching only `emitReturnValue` boxes the `return null` and leaves the
+// receiving `const r = mk(b)` local an i32: a loud reject becomes `vl check`-clean invalid wasm,
+// which is how this shape was measured and DECLINED once. Teaching the shared predicate moves the
+// functype, the returned value and the receiving local from ONE answer, so they cannot disagree.
+//
+// THE PRODUCERS ARE ALL THREE SPELLINGS OF "return null", because they reach different emit sites:
+// an explicit `return null` statement, an implicit trailing `null`, and an if-EXPRESSION body whose
+// else arm is `null`.
+//
+// The one shape that is still a LOUD reject is `is` on a BARE CALL RESULT — pinned in
+// `nullable-numeric-litunion-is-on-call-result-reject.vl`, because a membership ladder re-reads its
+// receiver and a call is not re-readable.
+
+type N = 1 | 2
+
+// ── explicit `return null`, result bound then `is`-narrowed ────────────────────
+// @log 1
+// @log none
+function mkStmt(b: boolean): N | null {
+  if b { return 1 }
+  return null
+}
+function showStmt(b: boolean) {
+  const r = mkStmt(b)
+  if r is N { print(r) } else { print("none") }
+}
+showStmt(true)
+showStmt(false)
+
+// ── implicit trailing `null`, and the `!= null` spelling of the test ───────────
+// @log 2
+// @log none
+function mkImpl(b: boolean): 1 | 2 | null {
+  if b { return 2 }
+  null
+}
+function showImpl(b: boolean) {
+  const r = mkImpl(b)
+  if r != null { print(r) } else { print("none") }
+}
+showImpl(true)
+showImpl(false)
+
+// ── an if-EXPRESSION body, and an ANNOTATED receiving local ────────────────────
+// @log 1
+// @log none
+function mkIfExpr(b: boolean): N | null {
+  if b { 1 } else { null }
+}
+function showIfExpr(b: boolean) {
+  const r: N | null = mkIfExpr(b)
+  if r is N { print(r) } else { print("none") }
+}
+showIfExpr(true)
+showIfExpr(false)
+
+// ── the result forwarded as an ARGUMENT (never bound in the caller) ────────────
+// @log 1
+// @log none
+function takes(p: N | null) {
+  if p is N { print(p) } else { print("none") }
+}
+function showArg(b: boolean) {
+  takes(mkStmt(b))
+}
+showArg(true)
+showArg(false)
+
+// ── the result through `??`, whose default MUST be a member of the litunion ────
+// @log 1
+// @log 2
+function showCoalesce(b: boolean) {
+  print(mkStmt(b) ?? 2)
+}
+showCoalesce(true)
+showCoalesce(false)
+
+// ── the result stored in a struct FIELD, narrowed through the member path ──────
+// @log 1
+// @log none
+type S = { f: N | null }
+function showField(b: boolean) {
+  const s: S = { f: mkStmt(b) }
+  if s.f is N { print(s.f) } else { print("none") }
+}
+showField(true)
+showField(false)
+
+// ── an f64 base and an i64 base: the SAME arm, a different scalar. The f64 cell is
+//    also the `tyKindOf` pin — the field read unboxes to an f64 and `print` must route
+//    to `__print_f64__`, which it did not while a litunion had no kind. ──────────────
+// @log 2.5
+// @log none
+type W = 1.5 | 2.5
+type SW = { f: W | null }
+function mkF64(b: boolean): W | null {
+  if b { return 2.5 }
+  return null
+}
+function showF64(b: boolean) {
+  const s: SW = { f: mkF64(b) }
+  if s.f is W { print(s.f) } else { print("none") }
+}
+showF64(true)
+showF64(false)
+
+// @log 5000000000
+// @log none
+type L = 5000000000 | 6000000000
+type SL = { f: L | null }
+function mkI64(b: boolean): L | null {
+  if b { return 5000000000 }
+  return null
+}
+function showI64(b: boolean) {
+  const s: SL = { f: mkI64(b) }
+  if s.f is L { print(s.f) } else { print("none") }
+}
+showI64(true)
+showI64(false)
+
+// ── CONTROL: a nullable i32 return, which was correct at every position already ─
+// @log 7
+// @log none
+function mkI32(b: boolean): i32 | null {
+  if b { return 7 }
+  return null
+}
+function showI32(b: boolean) {
+  const r = mkI32(b)
+  if r != null { print(r) } else { print("none") }
+}
+showI32(true)
+showI32(false)

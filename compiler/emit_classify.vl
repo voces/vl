@@ -115,6 +115,8 @@ import {
   nodeTyWidenedRepName,
   nodeUnionName,
   nominalStructNameOfTy,
+  numLitUnionBaseName,
+  primTyOfName,
   recordClonedNodeTy,
   recordNodePin,
   tyIsLitUnion,
@@ -18056,11 +18058,42 @@ export function narrowedValueAtomOf(name: string) {
     const tk = unMemAtomKind(ty)
     if tk == 6 { return "" }
     if tk < 0 {
+      // A NUMERIC litunion arm (`if p is N` where `type N = 1 | 2`, and the inline /
+      // single-literal spellings `is 1 | 2` / `is 1`) unboxes as its BASE SCALAR — the
+      // rep the box's payload actually holds, which is `numLitUnionBaseName`'s answer
+      // and the same one `emitUnionCoerce` boxed the member with. ASKED OF THE ARENA,
+      // not of the spelling, because there is no spelling that carries it: the narrow
+      // banks the tested name (`N`, or a bare `1`), and `valueAtomKind` of either is -1
+      // while `nameIsLitUnionType` — the STRING twin two lines down — is `litKind ==
+      // "str"` only. So this rep reached neither leg and the read stayed the raw
+      // `(ref $uBox)` where the arm's i32/i64/f64 was expected: `vl check`-clean INVALID
+      // WASM at every `is`-narrowed read of a `N | null`, while the `!= null` spelling of
+      // the identical program was correct (its complement push banks the base scalar's
+      // own name, so it lands on `valueAtomKind` below).
+      const nb = numLitUnionBaseName(ty)
+      if nb != "" { return nb }
       if !tyIsLitUnion(ty) { return "" }
     }
   }
   const k = valueAtomKind(v)
   if k >= 0 && k != 6 { return v }
+  // A TRANSPARENT ALIAS of a scalar/string atom (`type N = i32` then `if p is N` over a
+  // `p: i32 | null`) banks the ALIAS spelling, which `valueAtomKind` declines — while the
+  // ARENA type the SAME push banked is the `TyPrim` whose `primName` is the canonical atom
+  // spelling. That is not a second rule: it is exactly the string `unMemAtomKind` hands
+  // `valueAtomKind` two functions down, so the two legs cannot disagree about which atom
+  // an arm is. Without it the box-tag test was correct and the narrowed read stayed the raw
+  // `(ref $uBox)` — `vl check`-clean INVALID WASM at every non-capture storage class, while
+  // `is i32` (the same question spelled with the atom's own name) was correct beside it.
+  // `TyPrim` ONLY: a closure / list / map arm's SPELLING carries information its kind does
+  // not (its signature, its element type), and those consumers read the spelling.
+  if k < 0 && ty >= 0 {
+    const at = T.tys[ty]
+    if at is TyPrim {
+      const ak = valueAtomKind(at.primName)
+      if ak >= 0 && ak != 6 { return at.primName }
+    }
+  }
   // A litunion-alias narrow (`x is K0` where `type K0 = "a" | "b"`) unboxes as the
   // STRING ref the box stores its litunion member as (`emitUnionCoerce` boxes it so).
   if k < 0 && nameIsLitUnionType(v) { return "string" }
@@ -20387,6 +20420,29 @@ function tyKindOf(tyIx: i32) {
     }
     return -1 // struct / ref / nested-list element — needs the ref-list slot
   }
+  // A NUMERIC literal type or literal UNION (`1`, `1 | 2`, `1.5 | 2.5`) has NO rep of its own
+  // — it reps as its BASE SCALAR — so its kind is that scalar's, resolved through
+  // `numLitUnionBaseName` (the single home for that rule) and then through THIS function's own
+  // `TyPrim` arm, so the name→kind map is not written twice.
+  //
+  // Without it every typed-IR fast path built on this function answered -1 for an `is`-narrowed
+  // litunion arm and fell back to a syntactic derivation that has no litunion case either. The
+  // reaching shape: a struct FIELD typed `W | null` over `type W = 1.5 | 2.5`, narrowed by
+  // `if s.f is W` — the field read correctly unboxed to an f64 and `print` then routed it to
+  // `__print_i32__`, because `exprIsF64`'s fast path asks this function and its Member arm asks
+  // the field's DECLARED code (16, the box). `vl check` rc 0, `type mismatch: expected i32,
+  // found f64`. The `f64 | string` field one line away was correct, because the checker banks
+  // the bare `f64` there and this function has always answered for that.
+  //
+  // STRING literals answer "" at that home and stay -1 here, which is required, not incidental:
+  // a string litunion member is an interned i32 ATOM, not the `(ref $array)` kind 3 would name.
+  //
+  // The walk is GATED ON THE VARIANT rather than charged to every -1: only a literal or a union
+  // node can be a numeric litunion, and this function sits under every scalar classifier.
+  let litBase = ""
+  if t is TyLit { litBase = numLitUnionBaseName(tyIx) }
+  if t is TyUnion { litBase = numLitUnionBaseName(tyIx) }
+  if litBase != "" { return tyKindOf(primTyOfName(litBase)) }
   -1
 }
 
