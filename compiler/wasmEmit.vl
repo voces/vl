@@ -135,6 +135,7 @@ import {
   directArgsBad,
   inferNicheNullByName,
   isLitVariantName,
+  litLexIsMember,
   loopStackFind,
   mapShapeFoldSet,
   memberPathKeyOf,
@@ -144,6 +145,7 @@ import {
   numLexIsDecimal,
   numTextIsFloat,
   objFieldVal,
+  quoteLex,
   retF32Flag,
   retF64Flag,
   retI64Flag,
@@ -413,6 +415,7 @@ import {
   cloSigKeyExt,
   cloSigPosOfKey,
   coalesceDefaultNullable,
+  coalesceLitUnionFits,
   criFnIsAnonLambda,
   ctrlEnter,
   ctrlLeave,
@@ -5965,11 +5968,7 @@ function emitMonoMapDefault(body: i32[], recvIx: i32, defIx: i32, fnIx: i32) {
   if atomTexts.length > 0 {
     const du = P.nodes[unwrapParen(defIx)]
     if du is StrLit {
-      let mi = 0
-      while mi < atomTexts.length {
-        if quoteLex(atomTexts[mi]) == du.strText { atomDef = true }
-        mi = mi + 1
-      }
+      if litLexIsMember(du.strText, atomTexts) { atomDef = true }
     } else if du is NullLit {
       // A NULLABLE-atom value (`{[string]: K | null}`) admits a bare `null` default — lowered as
       // the `-1` niche sentinel (the `??` result stays `K | null`).
@@ -12753,6 +12752,33 @@ function emitClampLocal(_body: i32[], idxL: i32, lenL: i32) {
   0
 }
 
+// The WRAPPER heap-type index the nullable-COLLECTION cell at `exprIx` holds:
+//
+//   >= 0  the wrapper's heap type — `$lTypeIdx` for the i32-backed `i32[] | null`, the
+//         leaf list's own wrapper for a DISTINCT-backing scalar list (`string[] | null`,
+//         `f64[] | null`, `i64[] | null`, `f32[] | null`), this ref-list slot's wrapper for
+//         a nullable ref array (`i32[][] | null`, `S[] | null`).
+//   -2    a nullable collection whose wrapper this emit cannot NAME — a nullable ref array
+//         whose element slot never resolved. Still a nullable collection (so the recover
+//         below claims it); a lowering that needs the index itself must decline.
+//   -1    not a nullable collection.
+//
+// ONE HOME FOR THE FAMILY, because a consumer that knows the rep is nullable and a consumer
+// that knows its wrapper must never disagree: `nulRecvNeedsRecover` is exactly "this answered
+// something", and `??` declares its block type off the index. Spelling the three-family
+// disjunction twice is how a rep gets a null TEST and no recover.
+function nulCollWrapHeap(exprIx: i32, fnIx: i32) {
+  if exprNullableList(exprIx, fnIx) { return lTypeIdx }
+  const nsk = exprNulScalarListKind(exprIx, fnIx)
+  if nsk != null { return nulScalarListWrapHeap(nsk) }
+  if exprNullableRefArray(exprIx, fnIx) {
+    const s = refListSlotOfExpr(exprIx, fnIx)
+    if s >= 0 && s < rlWrapIdx.length { return rlWrapIdx[s] }
+    return -2
+  }
+  -1
+}
+
 // TRUE when `exprIx` names a NARROWED nullable COLLECTION whose cell still holds a
 // `(ref null $wrap)` — every rep a list/map OPERATION must `ref.as_non_null` before the
 // wrapper `struct.get`, because the wrapper field demands `(ref $wrap)`.
@@ -12764,11 +12790,10 @@ function emitClampLocal(_body: i32[], idxL: i32, lenL: i32) {
 // (`exprNullableList`) is only ONE of the four list families — the distinct-backing scalar
 // lists carry their own wrappers (`exprNulScalarListKind`) and a ref array its slot's
 // (`exprNullableRefArray`) — so asking `exprNullableList` alone answers "already non-null"
-// for the other three. One helper, so a new nullable collection rep is added once.
+// for the other three. `nulCollWrapHeap` IS that disjunction, so a new nullable collection
+// rep is added once and every consumer of the family follows.
 function nulRecvNeedsRecover(exprIx: i32, fnIx: i32) {
-  exprNullableList(exprIx, fnIx) ||
-    exprNulScalarListKind(exprIx, fnIx) != null ||
-    exprNullableRefArray(exprIx, fnIx)
+  nulCollWrapHeap(exprIx, fnIx) != -1
 }
 
 // TRUE when an ELEMENT read out of the list `exprIx` yields a rep that legitimately holds
@@ -15040,13 +15065,6 @@ function emitExprExpect(body: i32[], exprIx: i32, fnIx: i32, ctx: ExpCtx) {
   r
 }
 
-// The re-quoted source LEXEME for a literal-union member's inner text (`i32` -> `"i32"`) — matches the
-// raw `StrLit.strText` so `internAtom` yields the SAME id, and feeds a synthetic `StrLit` for printing.
-function quoteLex(inner: string) {
-  const q = "\""
-  q + inner + q
-}
-
 // Emit `print(<string expr>)`: stream each code point through `__print_char__`, then one
 // `__print_str_flush__`. Factored from the print handler so the literal-union widening can reuse it.
 function emitPrintStrExpr(body: i32[], strExpr: i32, fnIx: i32) {
@@ -17011,6 +17029,81 @@ function coalesceNulStrArmCtx(raw: boolean): ExpCtx {
   return c
 }
 
+// The context the DEFAULT arm of a `K | null` `??` emits under: a member `StrLit` / `NumLit`
+// default lowers as its interned ATOM ID (`litUnion`) and a bare `null` default as the spare
+// sentinel `-1` (`nulLitUnion`) — the same pair the `v = "b"` / `v = null` assignment
+// boundary seeds for the identical cell, because both are "produce this niche's i32".
+function coalesceNulLitUnionArmCtx(): ExpCtx {
+  const c = expCtxHere()
+  c.nulLitUnion = true
+  c.litUnion = 1
+  return c
+}
+
+// The context the DEFAULT arm of a nullable-COLLECTION `??` emits under: a list LITERAL
+// default builds THIS cell's backing (`listKind` / `listSlot`) and a bare `null` default the
+// matching `ref.null` — every seed keyed off the LHS place, which IS the cell whose rep the
+// block type declares. The seeds come from the same two homes the assignment boundary reads
+// (`exprListCellBuildKind` / `exprListCellBuildSlot`), so a default literal can never build a
+// backing the block type disagrees with.
+//
+// `nulList` is the i32-backed family's flag and `nulRefHeap` every other family's wrapper, so
+// `nulCollWrapHeap` supplies the latter directly rather than re-deriving the family.
+function coalesceNulCollArmCtx(lhsIx: i32, wrapIx: i32, fnIx: i32): ExpCtx {
+  const c = expCtxHere()
+  c.listKind = exprListCellBuildKind(lhsIx, fnIx)
+  c.listSlot = exprListCellBuildSlot(lhsIx, fnIx)
+  if exprNullableList(lhsIx, fnIx) {
+    c.nulList = true
+  } else {
+    c.nulRefHeap = wrapIx
+  }
+  return c
+}
+
+// The `br_on_non_null` lowering EVERY nullable-REF-niche `??` shares — the nullable STRUCT
+// (`S | null`) and the nullable COLLECTIONS (`i32[] | null`, `string[] | null`,
+// `i32[][] | null`, …). `heapIx` is the cell's own heap type and `defCtx` the context the
+// default arm emits under.
+//
+// ONE EVALUATION, NO STASH, AND IT SHORT-CIRCUITS. `br_on_non_null` consumes the one
+// nullable ref and either branches out of the block carrying `(ref $heapIx)` or falls through
+// to the default — so this shape needs NEITHER the re-eval the `boolean | null` / `K | null`
+// sentinel arms use (their niche is an i32, which has no `br_on_null`) NOR the per-rep stash
+// slot the `string | null` call arm reserves, and it covers every LHS source (ident, param,
+// field, index, CALL) with one arm. The default is reached only when the LHS was null.
+//
+// THE RESULT TYPE IS THE DEFAULT'S NULL-NESS (`coalesceDefaultNullable`), not a constant: a
+// NON-null default collapses the read to `(ref $heapIx)`, a NULLABLE one leaves it nullable
+// and the block must say so, else the default arm's legitimately-null ref meets a non-null
+// block type. `br_on_non_null` works under either — it branches with `(ref $heapIx)`, a
+// subtype of both.
+function emitCoalesceNulRef(
+  body: i32[],
+  e: BinExpr,
+  heapIx: i32,
+  defCtx: ExpCtx,
+  fnIx: i32,
+) {
+  wU8(2) // 0x02 block
+  if coalesceDefaultNullable(e.binRight, fnIx) {
+    wU8(99) // blocktype: (ref null $heapIx) — the result stays nullable
+  } else {
+    wU8(100) // blocktype: (ref $heapIx) — the non-null result
+  }
+  wSLEB(heapIx)
+  ctrlEnter()
+  if emitExpr(body, e.binLeft, fnIx) < 0 {
+    return -1 // the nullable ref, evaluated ONCE
+  }
+  wU8(214) // 0xd6 br_on_non_null
+  wULEB(0) //   non-null → branch to the block end with the (ref $heapIx)
+  if emitExprExpect(body, e.binRight, fnIx, defCtx) < 0 { return -1 }
+  wU8(11) // 0x0b end
+  ctrlLeave()
+  0
+}
+
 function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized LHS so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -17107,6 +17200,72 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
     wU8(27)      // 0x1b select → d if null else x
     return 0
+  }
+  // `<e> ?? d` over a `K | null` NICHE — an ident / param / global binding, a `K | null`
+  // struct FIELD (code 30), a `(K | null)[]` element read, or a `K | null`-returning CALL.
+  // The i32 cell holds an interned atom id (always >= 0) or the spare sentinel `-1` for
+  // `null`, so the null test is the `-1` compare (`emitNulIsNullTest`'s litunion arm) and the
+  // result is the same i32 either way: nullable and non-null share one valtype, so this rep
+  // has NO NULLABILITY consumer half in the emit — the block type is unconditional `0x7f`. What
+  // the CONSUMER does need is the ATOM IDENTITY of the result, and `coalesceLitUnionFits` is the
+  // ONE claim this arm and both consumer classifiers (`exprIsLitAtom` / `exprNulLitUnion`) make:
+  // it also decides whether the rep SURVIVES the default at all, so `k ?? "zz"` — whose join is
+  // `string` — declines here and keeps its loud reject instead of putting a heap string in an i32
+  // blocktype.
+  //
+  // A BRANCHING `if`, NOT THE `select` ITS `boolean | null` TWIN USES. `select` is one opcode and
+  // evaluates BOTH operands unconditionally; the `if`/`else`/`end` framing over the `0x7f`
+  // blocktype is THREE BYTES MORE PER SITE (measured: 1351 vs 1342 over three `??` sites) and
+  // evaluates the default ONLY when the LHS is null — the semantics `??` states. The
+  // `boolean | null` and bool-`pop` arms above still `select`, so a side-effecting default runs
+  // there even when the LHS is present; that is an open ruling, and this arm deliberately does
+  // not import it into a new rep for three bytes.
+  //
+  // A CALL LHS cannot be re-read, so it is STASHED once in the i32 coalesce-call slot — the
+  // same slot the `boolean | null` call arm uses, and reserved by the same
+  // over-approximating scan (`exprHasCoalesceCall` reserves all three slots for ANY call-LHS
+  // `??`), so no layout moves. Sound across nesting for the reason that arm gives: each `??`
+  // sets-tests-uses within its own evaluation.
+  if coalesceLitUnionFits(exprIx, fnIx) {
+    if emitExpr(body, e.binLeft, fnIx) < 0 {
+      return -1 // the niche i32, evaluated ONCE
+    }
+    if !lhsReEval {
+      fbLocalSet(coalesceCallBoolSlot)
+      fbLocalGet(coalesceCallBoolSlot)
+    }
+    fbI32Const(-1)
+    fbI32Bin(70) // 0x46 i32.eq → x == -1 (null)
+    fbIf(127)    // 0x04 if, 0x7f i32 blocktype
+    ctrlEnter()
+    if emitExprExpect(body, e.binRight, fnIx, coalesceNulLitUnionArmCtx()) < 0 {
+      return -1 // d, as this niche's i32
+    }
+    fbElse() // 0x05 else — present → the atom id
+    if lhsReEval {
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+    } else {
+      fbLocalGet(coalesceCallBoolSlot)
+    }
+    fbEnd() // 0x0b end
+    ctrlLeave()
+    return 0
+  }
+  // `<e> ?? d` over a nullable COLLECTION niche (`i32[] | null`, `string[] | null` /
+  // `f64[] | null` / `i64[] | null` / `f32[] | null`, `i32[][] | null` / `S[] | null`): the
+  // cell is a `(ref null $wrapper)`, so it takes the SAME `br_on_non_null` lowering as the
+  // nullable STRUCT below — one evaluation, no stash, and the default only on the null path.
+  // Placed before the sentinel-free ref paths for the same reason `emitNulIsNullTest` orders
+  // its niches: the wrapper heap type is what distinguishes the families.
+  const cnclw = nulCollWrapHeap(e.binLeft, fnIx)
+  if cnclw >= 0 {
+    return emitCoalesceNulRef(
+      body,
+      e,
+      cnclw,
+      coalesceNulCollArmCtx(e.binLeft, cnclw, fnIx),
+      fnIx,
+    )
   }
   // `<e> ?? d` over a `string | null` NICHE (an ident binding OR a `string | null`
   // struct FIELD, code 20): the nullable raw-array ref — a VALUE-typed `if` on
@@ -17657,31 +17816,11 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   if exprNullableStruct(e.binLeft, fnIx) {
     const csi = structIndexOfExpr(e.binLeft, fnIx)
     if csi >= 0 && csi < sHeapIdx.length {
-      wU8(2) // 0x02 block
-      // THE RESULT TYPE IS THE DEFAULT'S NULL-NESS (`coalesceDefaultNullable`), not a
-      // constant: a NON-null default collapses the read to `(ref $struct)`, while a
-      // NULLABLE default leaves the result `S | null` and the block must say so — else the
-      // default arm's legitimately-null ref meets a non-null block type. `br_on_non_null`
-      // works under either: it branches with `(ref $struct)`, a subtype of both.
-      if coalesceDefaultNullable(e.binRight, fnIx) {
-        wU8(99) // blocktype: (ref null $struct) — the result stays nullable
-      } else {
-        wU8(100) // blocktype: (ref $struct) — the non-null result
-      }
-      wSLEB(sHeapIdx[csi])
-      ctrlEnter()
-      if emitExpr(body, e.binLeft, fnIx) < 0 {
-        return -1 // the nullable struct ref, evaluated ONCE
-      }
-      wU8(214) // 0xd6 br_on_non_null
-      wULEB(0) //   non-null → branch to the block end with the (ref $struct)
-      // null path: emit the default, seeding an ObjLit default to this struct.
+      // The default arm seeds an ObjLit default to THIS struct; the block type and the
+      // one-evaluation shape are the nullable-ref-niche lowering the collections share.
       const defCtx = expCtxHere()
       defCtx.structIdx = csi
-      if emitExprExpect(body, e.binRight, fnIx, defCtx) < 0 { return -1 }
-      wU8(11) // 0x0b end
-      ctrlLeave()
-      return 0
+      return emitCoalesceNulRef(body, e, sHeapIdx[csi], defCtx, fnIx)
     }
   }
   return emitFail("emitProgram: `??` is only supported on a map index get")
