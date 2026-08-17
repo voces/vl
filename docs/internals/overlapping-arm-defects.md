@@ -1632,3 +1632,26 @@ early return} fails on **exactly the same 24 of its 63 subsets** for the alias s
 the INLINE spelling on master — which is what "the alias stopped being a dialect" means for a shape
 broken in both. `types/nullable-alias-opaque-inner-narrow.vl` and
 `types/nullable-alias-opaque-inner-is-and-return.vl` are split along that line.
+
+### #1427's DECLARATION-fold gate can now be widened, measured but NOT shipped here
+
+#1427 gated the `type T = X | null` fold on `nulNicheInnerFaithful` because an ungated fold was 6
+cells down, the largest of them `type T = S | null` plus `v is S`: that RAN on the two-member union
+because the test found its variant ROW, and became `emitProgram: \`is\` receiver is not a union
+value` on the niche, since `collectU` still minted T's row while the param lowered from the arena.
+**That down-cell is gone**, because the transparency arm above now claims the niche, so `collectU`
+SKIPS the alias's row and `v is S` resolves against the declared struct — which is exactly what the
+parenthesized spelling already does (`is` on the alias runs for a struct, list and map inner).
+
+Measured on the same 1,020-cell grid, with the fold ungated ON TOP of this cut: **226 more cells up**
+(the `X | null` and `(X) | null` columns reach 135/135 in the use grid and 103/120 in the position
+grid, matching the parenthesized spelling exactly), **byte identity across ALL FOUR spellings on
+94/94** buildable use groups, corpus 1805/1805, and **0 moves into a silent class**. The residue is
+4 running programs lost, every one of them landing on the INLINE oracle's own loud verdict rather
+than on a new one: a declared-union inner under a NESTED `!= null` guard (`cannot compare
+{a: i32} | {b: i32} with null` — the inline spelling's message) and a nested-nullable inner under
+`is` (`emitProgram: bare null needs a struct-typed context`, likewise).
+
+So the recommendation is: widen it, in its own slice, with those 4 cells as the thing to argue
+about — they are parity gains and capability losses at the same time, which is the one judgement
+call the grid cannot make.
