@@ -358,8 +358,9 @@ The reasoning:
   language.
 
 The compiler's own null collector stays internal and is deliberately *not* routed
-through `VL_GC`: it is not a user's decision, and letting it float would also
-invalidate the `.cwasm` sidecar on every change of the variable.
+through `VL_GC`: it is not a user's decision, and letting it float would also mint a
+fresh `.cwasm` sidecar — a Cranelift compile of the whole seed — per value of the
+variable.
 
 ### 4.4 The better answer to GC pressure: allocate less
 
@@ -441,13 +442,13 @@ byte-for-byte, and all three collectors emit byte-identical modules.
 2. **Tune the run engine's heap.** Only the null-collector engine gets an explicit
    `gc_heap_reservation`. A semispace collector's reservation *is* its collection
    frequency; the default is currently unexamined.
-3. **Expect one `.cwasm` recompile per config change.** The sidecar is keyed on
-   engine configuration, so the first run after changing the collector recompiles
-   the seed through Cranelift (~3–5 s observed) and rewrites it — including when a
-   CI cache restores a sidecar built by a different wasmtime version, which heals on
-   first use rather than costing every later invocation. Self-healing, but surprising if
-   measured naively — this is why `VL_GC` deliberately does not touch the compiler
-   engine.
+3. **Expect one `.cwasm` recompile the FIRST time a config is used.** The sidecar
+   PATH is keyed on engine configuration (`<seed>.<engine tag>.cwasm`), so each config
+   compiles the seed through Cranelift once (~3–5 s observed) into an entry of its own
+   and every later run of that config deserializes — alternating configs does not
+   thrash. A CI cache restoring an entry built by a different wasmtime version carries
+   a different tag and is simply not read. Self-healing, but surprising if measured
+   naively — this is why `VL_GC` deliberately does not touch the compiler engine.
 4. **Budget one slow `ci-native` run per wasmtime bump.** That job's cargo cache is
    keyed on `Cargo.lock`, so a version bump misses it and rebuilds the host from
    scratch — 2m19s observed, against ~30 s for everything else in the job. The
