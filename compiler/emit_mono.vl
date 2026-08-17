@@ -1499,6 +1499,35 @@ function monoMakeInstance(
             }
           }
         }
+        // A VALUE use (`annotateI32`) reaching an instance a DIRECT CALL already built. The call
+        // path spells an i32 pin as the hole it was — `parType = -1`, the emitter's default kind,
+        // zero new arena nodes — which is byte-identical for a CALL but leaves
+        // `fnHasUnannotatedParam` true, so the emit-time value floor rejects a function this very
+        // program has already pinned monomorphic. Write the pin onto the shared slot: the pinned
+        // name IS the kind the slot already lowers at, so every call through it is unchanged, and
+        // the value now carries the ONE signature the floor requires. ORDER-INDEPENDENCE is the
+        // point — without it `add(1, 2)` BEFORE `apply(add, …)` rejects while the same two lines
+        // in the other order compile, which is not a rule anyone can hold.
+        if annotateI32 {
+          const hfn = P.nodes[fnStmts[monoInstFe[k]]]
+          if hfn is FuncDecl {
+            const hps = hfn.fnParams
+            if hps.length == pinned.length {
+              let hp = 0
+              while hp < hps.length {
+                const hpp = P.nodes[hps[hp]]
+                if hpp is Param {
+                  if hpp.parType < 0 {
+                    const hnt = synthTypeRef(pinned[hp], -1)
+                    recordClonedNodeTy(hnt, pinned[hp], pinKinds[hp])
+                    hpp.parType = hnt
+                  }
+                }
+                hp = hp + 1
+              }
+            }
+          }
+        }
         return 0
       }
       k = k + 1
@@ -1872,21 +1901,78 @@ function monoFnTypeAnnParamsName(name: string, out: string[]) {
 // create the instance (annotating an i32 param too, so the binding's closure value passes the value
 // floor), pointing the binding init `letInitIx` at it. Unlike the call-driven `monoInstantiate`,
 // this carries the value its concrete type INDEPENDENT of any call — so a binding that ESCAPES
-// (passed to a HOF / returned / stored) is `call_ref`'d at the type its annotation pinned. Restricted
-// to a generic whose params are ALL un-annotated holes (the capability-bounded case); a `<T>` or
-// annotated-param generic keeps the call-driven path. Returns 0, or -1 via `emitFail`.
+// (passed to a HOF / returned / stored) is `call_ref`'d at the type its annotation pinned.
+//
+// Every parameter is read, in one of three ways, and the reading is what keeps the path sound:
+//   - UN-ANNOTATED — a hole, filled from the boundary. This is the original case.
+//   - annotated with a TYPE PARAMETER (`x: T`, `xs: T[]`, `b: Box<T>`) — the boundary BINDS it,
+//     exactly as an argument type does on the call-driven path (`monoBindFromAnn`), and the
+//     binding also substitutes the return.
+//   - annotated CONCRETELY — it must AGREE with the boundary's param name, else decline. So a
+//     written `a: i32` is never re-read as a boundary's `f64`; the emit-time value floor then
+//     rejects, which is the verdict that spelling had before.
+// The gate that used to sit here — every parameter un-annotated — disagreed with the value floor's
+// own predicate (`fnHasUnannotatedParam`, satisfied by ONE hole), and the gap between the two was
+// the partially-annotated function: strictly WORSE as a value than the same function with no
+// annotations at all, which is the opposite of what an annotation should do. The `<T>` half of the
+// gap was worse still: `fnHasUnannotatedParam` is FALSE for `f<T>(x: T)`, so the floor never fired
+// and the value emitted at the UN-SUBSTITUTED shape — `vl check` clean, then `wasm trap: indirect
+// call type mismatch`. Binding the type parameter here is what makes that shape emit the instance
+// the checker already typed it as.
+// Returns 0, or -1 via `emitFail`.
 function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
     const params = fn.fnParams
     if params.length != pinnedNames.length { return 0 }
+    const tvN: string[] = []
+    const tvV: string[] = []
     let i = 0
     while i < params.length {
       const p = P.nodes[params[i]]
       if p is Param {
-        if p.parType >= 0 { return 0 }
+        if p.parType >= 0 {
+          // The declared spelling, so a parameter whose annotation names a type PARAMETER is read
+          // as that parameter rather than as whatever an alias of the same name canon'd to —
+          // `monoInstantiate`'s rule, for the same reason.
+          const ann = monoDeclAnnName(
+            p.parType,
+            tyNameOf(p.parType),
+            fn.fnTyParams,
+          )
+          if monoAnnHasTyParam(ann, fn.fnTyParams) {
+            monoBindFromAnn(ann, pinnedNames[i], fn.fnTyParams, tvN, tvV)
+          } else if normTypeAtom(ann) != normTypeAtom(pinnedNames[i]) {
+            return 0
+          }
+        }
       }
       i = i + 1
+    }
+    // POST-CONDITION on the bindings, and it needs its own pass because `monoBindFromAnn` is
+    // FIRST-USE-WINS: substituting them back through every type-param-riding annotation must
+    // REPRODUCE the boundary. `pairT<T>(a: T, b: T)` reaching `(i32, string) => i32` binds T to
+    // i32 from `a` and then silently disagrees at `b`; without this it materialized an instance
+    // the second position contradicts. Declining hands it to the value floor, which is a
+    // diagnostic rather than a value emitted at a shape half the boundary denies.
+    let v = 0
+    while v < params.length {
+      const pv = P.nodes[params[v]]
+      if pv is Param {
+        if pv.parType >= 0 {
+          const annV = monoDeclAnnName(
+            pv.parType,
+            tyNameOf(pv.parType),
+            fn.fnTyParams,
+          )
+          if monoAnnHasTyParam(annV, fn.fnTyParams) {
+            const sub = monoSubstAnn(annV, fn.fnTyParams, tvN, tvV)
+            if sub == "" { return 0 }
+            if normTypeAtom(sub) != normTypeAtom(pinnedNames[v]) { return 0 }
+          }
+        }
+      }
+      v = v + 1
     }
     const pinned: string[] = []
     let j = 0
@@ -1894,8 +1980,6 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
       pinned.push(pinnedNames[j])
       j = j + 1
     }
-    const tvN: string[] = []
-    const tvV: string[] = []
     // The annotation-driven binding path (`const c: (f64,f64)=>f64 = add`) bakes no callback — the
     // value escapes its call sites, so its body keeps the `call_ref`. Empty → no key/body change.
     const noCb: string[] = []
@@ -2019,6 +2103,22 @@ function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
     }
     return 0
   }
+  if e is Paren { return monoCoerceFnValueName(e.parInner, tname, ctx) }
+  if e is IfStmt {
+    // An if-EXPRESSION in value position (`const f: (i32,i32)=>i32 = if c { add } else { mul }`).
+    // The expected type reaches EVERY arm unchanged — each arm independently produces the whole
+    // value — so the recursion is per-arm, not per-element as it is for the composite literals.
+    // A `match` in value position needs no limb of its own: the checker lowers an exhaustive
+    // `match` to an if/else chain IN PLACE, so by emit time its arms are these arms.
+    if monoCoerceFnValueName(e.ifThen, tname, ctx) < 0 { return -1 }
+    return monoCoerceFnValueName(e.ifElse, tname, ctx)
+  }
+  if e is Block {
+    // An arm's VALUE is its LAST statement, so that is the only position the expected type reaches.
+    const bs = e.blkStmts
+    if bs.length == 0 { return 0 }
+    return monoCoerceFnValueName(bs[bs.length - 1], tname, ctx)
+  }
   if e is Ident {
     // A bare function NAME, or a VALUE BINDING holding a generic function (`const add = (a,b) =>
     // a + b`, or `const g = named`) — resolve the binding to its lifted slot so an escaping lambda
@@ -2035,6 +2135,27 @@ function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
     }
   }
   0
+}
+
+// Is `name` ever the TARGET of an assignment (`name = …`) anywhere in the arena? An arena scan
+// rather than a scope walk, so it is coarse by NAME: a homonym in another frame answers true for
+// both. That direction is the safe one — it declines a callee fold and leaves the `call_ref` the
+// annotation already guarantees a signature for, where the opposite error silently drops a write.
+function monoNameIsAssigned(name: string) {
+  let i = 0
+  while i < P.nodes.length {
+    const nd = P.nodes[i]
+    if nd is BinExpr {
+      if nd.binOp == "=" {
+        const tg = P.nodes[nd.binLeft]
+        if tg is Ident {
+          if tg.identName == name { return true }
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // `monoCoerceFnValueName` keyed on an expected TYPE-annotation node (`-1` / a non-function type is a
@@ -2513,7 +2634,15 @@ function monoWalk(ix: i32, ctx: i32) {
         const afe = identClosureFeSid(sidOfNode(n.callFn), ctx)
         if afe >= 0 {
           if !criFnIsAnonLambda(afe) {
-            fe = afe
+            // The fold below REWRITES `f(x)` into a by-name call to the INITIALIZER's instance,
+            // which is only faithful while the binding still holds that initializer. A binding
+            // that is ASSIGNED does not, and the fold made every later assignment invisible —
+            // `let f: (i32,i32)=>i32 = sub; f = mul; f(3,4)` answered `sub`'s result at rc 0 from
+            // both `vl check` and the emitter. Restricted to an ANNOTATED binding, whose
+            // annotation guarantees the `$fnsig` the surviving `call_ref` resolves through; an
+            // un-annotated one has no such guarantee and keeps the fold.
+            if identFnTypeAnnName(callee.identName, ctx) == "" { fe = afe }
+            else if !monoNameIsAssigned(callee.identName) { fe = afe }
           } else if identFnTypeAnnName(callee.identName, ctx) == "" {
             // A lambda bound to an UN-annotated `const` (`const add = (a, b) => a + b`): its params
             // are inference holes — monomorphize it per call exactly like a named generic function.
@@ -2584,6 +2713,21 @@ function monoWalk(ix: i32, ctx: i32) {
     return monoWalk(n.retArg, ctx)
   }
   if n is BinExpr {
+    // ASSIGNMENT to a function-typed binding (`let f: (i32,i32)=>i32 = mul; f = add`). The
+    // declared type is the same boundary the LetDecl arm reads, so a generic reaching it through
+    // a later `=` materializes identically to one reaching it through the initializer — the
+    // binding has ONE declared type and every write to it is that type. `identFnTypeAnnName`
+    // resolves the target's written annotation; "" (no annotation, or not a function type) is a
+    // no-op and leaves the walk byte-identical.
+    if n.binOp == "=" {
+      const tgt = P.nodes[n.binLeft]
+      if tgt is Ident {
+        const atn = identFnTypeAnnName(tgt.identName, ctx)
+        if atn != "" {
+          if monoCoerceFnValueName(n.binRight, atn, ctx) < 0 { return -1 }
+        }
+      }
+    }
     if monoWalk(n.binLeft, ctx) < 0 { return -1 }
     return monoWalk(n.binRight, ctx)
   }
