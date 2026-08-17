@@ -20,6 +20,7 @@ import {
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
   nodeTyIsNulLitUnion,
+  nodeTyIsNulNumLitUnion,
   nodeTyIsNullable,
   nodeTyIsNullableStruct,
   nodeTyIsUnion,
@@ -2187,7 +2188,16 @@ function emitNulIsNullTest(
     // A value-union BOX (`i32 | null`, `A | B | null`) is never itself null — the null
     // variant rides the TAG — so compare the box tag against the global null tag (the
     // host's `variantTag(info, null)` path), never `ref.is_null`.
-    if exprUnion(refIx, fnIx) {
+    //
+    // THE SECOND CHANNEL IS THE CHECKER'S BANKED TYPE, and it is here because a NULLABLE
+    // NUMERIC litunion (`1 | 2 | null`) is a box whose registered union NAME the receiver's
+    // storage class does not always carry — `exprUnion` resolves through `unionNameOfIdent`,
+    // which asks `isUName` of the annotation's rendered name, and a param spelling reaches it
+    // canon'd. The rep is settled structurally by `nodeTyIsNulNumLitUnion` (`vtKindOfType`'s
+    // own arm reads the same predicate), so both spellings of the null test emit this one tag
+    // compare instead of the `!= null` half falling to the i32 tail with an unseeded bare
+    // `null` (`bare null needs a struct-typed context`) while `is null` was already correct.
+    if exprUnion(refIx, fnIx) || nodeTyIsNulNumLitUnion(refIx) {
       if emitExpr(body, refIx, fnIx) < 0 { return -1 }
       fbStructGet(uBoxIdx, 0) // box field 0: tag
       fbI32Const(nullBoxTag())
@@ -13223,6 +13233,15 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     // `emitUnionBoxArg` `struct.new`'d a box into an i32 result. The ARENA answers for both the
     // aliased (`type K = "ab" | "zz" | null`) and the inline spelling; the NAME cannot, because
     // `retUnionFlag` is true for either and a bare alias name carries no members to scan.
+    // A NULLABLE NUMERIC litunion return (`1 | 2 | null`) is NOT claimed here, and the
+    // omission is measured rather than an oversight. Its cell IS the box — `vtKindOfType`'s
+    // own arm says so, which is what makes its PARAM and its null TEST correct — and adding
+    // `nodeTyIsNulNumLitUnion` to this gate does box the `return null`. But the CALL-RESULT
+    // classifier is a third home (`computeRetInference` / `criClassify`, whose call-result
+    // union test is name-keyed exactly as `retUnionFlag` is), so the receiving `const r = f(b)`
+    // local stayed an i32 while the functype and the body both moved to the box: 8 of 520 grid
+    // cells went from a LOUD reject to `vl check`-clean INVALID WASM. Until that third home
+    // moves in the same change, `return null` over this rep keeps the loud floor.
     if retUnionFlag(fn.fnRet) == 1 {
       if (
         !nodeTyIsLitUnionAlias(fn.fnRet) &&

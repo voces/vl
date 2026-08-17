@@ -91,6 +91,7 @@ import {
   nodeTyIsMap,
   nodeTyIsNulBool,
   nodeTyIsNulLitUnion,
+  nodeTyIsNulNumLitUnion,
   nodeTyIsNulScalarBox,
   nodeTyIsNulStruct,
   nodeTyIsNullable,
@@ -321,6 +322,7 @@ import {
   listIdxScratchBase,
   localIsRef,
   localLitUnion,
+  localLoopIter,
   localLoopVar,
   localNames,
   localStructIdx,
@@ -4326,6 +4328,7 @@ export function addLocalName(name: string, isRef: VKind, structIdx: i32) {
   localIsRef.push(isRef)
   localStructIdx.push(structIdx)
   localLoopVar.push(0)
+  localLoopIter.push(-1)
   localLitUnion.push(0)
   pos
 }
@@ -4340,6 +4343,17 @@ export function addLocalName(name: string, isRef: VKind, structIdx: i32) {
 // outer/global binding exactly as the host's loop-scoped declaration does.
 export function markLoopVarSlot(slot: i32) {
   localLoopVar[slot] = 1
+  0
+}
+
+// Mark the declared-local slot as a FOR-IN ELEMENT loop variable and pin the ITERABLE node
+// its loop iterates, so a question only the iterable can answer resolves from the SLOT the
+// scope stack hands out rather than from the loop var's NAME (`localLoopIter`'s header
+// carries why the name is not the key). The `for`-counter form has no iterable and keeps
+// the plain `markLoopVarSlot`.
+export function markLoopVarIter(slot: i32, iterIx: i32) {
+  localLoopVar[slot] = 1
+  localLoopIter[slot] = iterIx
   0
 }
 
@@ -8721,6 +8735,37 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
       }
     }
   }
+  // `w.f == null` / `w.f != null` over a boxed-union FIELD narrows the member PATH — the
+  // null-compare twin of the `is` arm's member channel above, and the narrowing key is the
+  // same path string (`emitMem` unboxes under it). Without it the guard's TEST was correct
+  // (the box tag compare) while the then-arm's `w.f` read stayed the raw `(ref $uBox)` and
+  // went straight into its i32 consumer: `vl check` clean, INVALID WASM — while the `is null`
+  // spelling of the identical program was correct, because only THAT spelling had a member
+  // channel. The member set comes from the FIELD's own declared union name, not from
+  // `currentNarrowSetOf`, whose `unionNameOfIdent` fallback cannot resolve a path key.
+  const mnull = nullCmpRefOf(condIx)
+  if mnull >= 0 {
+    if P.nodes[mnull] is Member {
+      const mfn = memberUnionFieldName(mnull, fnIx)
+      if mfn != "" && isValueUnionName(mfn) {
+        const mk = memberPathKeyOf(mnull)
+        if mk != "" {
+          const mcn = P.nodes[condIx]
+          if mcn is BinExpr {
+            if mcn.binOp == "==" {
+              pushNarrow(mk, "null")
+              return true
+            }
+            const mrest = removeAtomFromSet(unionMemberSetOf(mfn), "null")
+            if mrest != "" {
+              pushNarrow(mk, mrest)
+              return true
+            }
+          }
+        }
+      }
+    }
+  }
   // The same null-compare narrowing over a BOXED STRUCT union with a `null` member
   // (`v: A | B | null`): `!=` strips `null` (so an inner `is`/else chain subtracts
   // toward a single variant), `==` pins `null`. The 1-struct niche (`S | null`) is
@@ -8748,6 +8793,25 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
   false
 }
 
+// The NON-NULL operand of a `x == null` / `x != null` comparison at `condIx` (parens
+// peeled, either operand order), or -1 when `condIx` is not a null compare. The ONE home
+// for that extraction, which the three narrowing selectors below and the emitter's own
+// null-test routing each wrote out by hand — and it is a GRAMMAR question (which side is
+// the literal), not a per-rep one, so a rep added to one selector cannot get the peel
+// subtly different from its siblings.
+function nullCmpRefOf(condIx: i32) {
+  const c = P.nodes[condIx]
+  if c is BinExpr {
+    if c.binOp == "==" || c.binOp == "!=" {
+      const lhs = P.nodes[unwrapParen(c.binLeft)]
+      const rhs = P.nodes[unwrapParen(c.binRight)]
+      if rhs is NullLit { return unwrapParen(c.binLeft) }
+      if lhs is NullLit { return unwrapParen(c.binRight) }
+    }
+  }
+  -1
+}
+
 // The receiver NAME when the condition at `condIx` is `<ident> == null` /
 // `<ident> != null` over a BOXED STRUCT union (2+ struct variants plus a `null`
 // member), else "". The value-union and 1-struct-niche forms are excluded (each
@@ -8756,11 +8820,7 @@ function structUnionNullCmpName(condIx: i32, fnIx: i32) {
   const c = P.nodes[condIx]
   if c is BinExpr {
     if c.binOp == "==" || c.binOp == "!=" {
-      const lhs = P.nodes[unwrapParen(c.binLeft)]
-      const rhs = P.nodes[unwrapParen(c.binRight)]
-      let refIx = -1
-      if rhs is NullLit { refIx = unwrapParen(c.binLeft) }
-      if lhs is NullLit { refIx = unwrapParen(c.binRight) }
+      const refIx = nullCmpRefOf(condIx)
       if refIx >= 0 {
         const r = P.nodes[refIx]
         if r is Ident {
@@ -8787,11 +8847,7 @@ function valueUnionNullCmpName(condIx: i32, fnIx: i32) {
   const c = P.nodes[condIx]
   if c is BinExpr {
     if c.binOp == "==" || c.binOp == "!=" {
-      const lhs = P.nodes[unwrapParen(c.binLeft)]
-      const rhs = P.nodes[unwrapParen(c.binRight)]
-      let refIx = -1
-      if rhs is NullLit { refIx = unwrapParen(c.binLeft) }
-      if lhs is NullLit { refIx = unwrapParen(c.binRight) }
+      const refIx = nullCmpRefOf(condIx)
       if refIx >= 0 {
         const r = P.nodes[refIx]
         if r is Ident {
@@ -8948,6 +9004,36 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
       }
     }
   }
+  // The MEMBER-PATH dual of the arm above, and the complement of `setNarrowFromCond`'s
+  // own member channel: in the else of `w.f != null` the field IS `null`; in the else of
+  // `w.f == null` it is the non-null member set, which is what unboxes the else-arm's
+  // `w.f` reads. Both branch senses of both spellings must narrow, or the one left out is
+  // `vl check`-clean invalid wasm on the very program whose sibling spelling is correct —
+  // `if w.f == null { … } else { print(w.f) }` was exactly that residue after the
+  // then-side channel landed.
+  const emnull = nullCmpRefOf(condIx)
+  if emnull >= 0 {
+    if P.nodes[emnull] is Member {
+      const emfn = memberUnionFieldName(emnull, fnIx)
+      if emfn != "" && isValueUnionName(emfn) {
+        const emk = memberPathKeyOf(emnull)
+        if emk != "" {
+          const emcn = P.nodes[condIx]
+          if emcn is BinExpr {
+            if emcn.binOp == "!=" {
+              pushNarrow(emk, "null")
+              return true
+            }
+            const emrest = removeAtomFromSet(unionMemberSetOf(emfn), "null")
+            if emrest != "" {
+              pushNarrow(emk, emrest)
+              return true
+            }
+          }
+        }
+      }
+    }
+  }
   // The struct-union dual: in the else of `v != null` the value IS `null`; in the
   // else of `v == null` it is the non-null variant set.
   const snm = structUnionNullCmpName(condIx, fnIx)
@@ -9054,6 +9140,15 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
           const vsl = mapShapeOfExpr(callee.memObj, fnIx)
           if vsl >= 0 {
             if mvValKind[vsl] == 3 {
+              // A NULLABLE string value (`{[string]: string | null}`) rides the SAME kind-3
+              // vals list its non-null twin does — the vals element slot is
+              // `(ref null $aTypeIdx)` either way — so only the LOOP VAR differs: kind 16,
+              // the `string | null` niche, exactly as `const v = m[k]` binds. The non-null
+              // `"str"` loop var recovers each element `ref.as_non_null` and would TRAP on a
+              // stored null, and its `v != null` finds no nullable rep to test
+              // (`bare null needs a struct-typed context`). One `for` must bind what one
+              // index read yields — the rule the LIST ladder below states for `(string|null)[]`.
+              if mvSlotNullable(vsl) { return "nulstr" }
               return "str" // string value
             }
             if mvValKind[vsl] == 11 {
@@ -9073,6 +9168,18 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
             // loop-var kind is the value-list's rep (`mvListValKind` → 2/7/12/20/21, or 5 for a
             // struct/ref list). The `#l` temp is the vals ref-list wrapper (`forInMapValsSlot`).
             if mvValKind[vsl] == 6 { return mvListValKind(vsl) }
+            // A UNION-BOX value (`{[string]: i32 | null}`, `{[string]: C | S}`, a numeric
+            // litunion `{[string]: 1 | 2 | null}`): the vals element IS `$uBox`, so the loop
+            // var binds as a kind-4 union-box local — the SAME arm the ref-list ladder below
+            // gives a `(C | S)[]` element. Without it the box fell to `"struct"` and the slot
+            // resolution answered -1 (`ref valtype with no interned shape`).
+            if mvValKind[vsl] == 2 { return "union" }
+            // A NULLABLE-STRUCT value (`{[string]: S | null}`) rides the same kind-1 vals list
+            // as its non-null twin, with a `(ref null $S)` element slot: the loop var is the
+            // kind-9 niche, the map twin of the `(P | null)[]` element arm below. The non-null
+            // `"struct"` loop var recovers each element and its `v != null` reached the
+            // structural struct-equality path instead of a null test.
+            if mvSlotNullable(vsl) { return "nulstruct" }
             return "struct" // struct value
           }
           return "i32"
@@ -11195,6 +11302,18 @@ export function vtKindOfType(tyIx: i32): VKind {
       if nodeTyIsNulLitUnion(tyIx) { return "i32" }
     }
   }
+  // A NULLABLE NUMERIC literal union (`1 | 2 | null`, `Z | null` over `type Z = 1 | 2`) is the
+  // value-union BOX — `<base scalar> | null`, and a nullable i32/i64/f64 boxes. NEITHER litunion
+  // rule claims it (`nulNumLitUnionBaseName`'s header carries why: the string niche is
+  // `litKind == "str"` only, and the numeric BASE collapse declines the moment a member is not a
+  // `TyLit`, which `null` is), so without this arm it fell to the `"i32"` default at the bottom
+  // while the `let`/global ladder's NAME test (`letIsUnion`) built the same type as a box. That
+  // disagreement is one type with two reps: the `let` and element/field/map-value positions were
+  // correct and the PARAM / RETURN cells were an i32 that cannot hold the null their own
+  // annotation admits — `emitProgram: bare null needs a struct-typed context` at `f(null)` and
+  // at `return null`, and a `vl check`-clean invalid-wasm `x is null` over the param.
+  // AFTER the atom-niche arms above (a STRING litunion keeps the `-1` sentinel, not the box).
+  if nodeTyIsNulNumLitUnion(tyIx) { return "union" }
   // A NULLABLE function `(fn) | null` is the closure fat-pointer made nullable, `"nulclosure"` —
   // checked BEFORE `tyIsFuncType` (whose `=>` test would otherwise claim it as the non-null
   // `"closure"`). The non-null part is a function, but the `| null` makes the slot nullable.
@@ -17492,21 +17611,21 @@ export function unionNameOfIdentSid(sid: i32, fnIx: i32) {
       // A `for <name> in <(C|S)[]>` loop variable is a kind-4 union box but is NOT a
       // `LetDecl`, so `parentLetOf` misses it — resolve its member set from the iterable's
       // union-box element type so `x is C` narrows inside the loop body.
-      const flv = forInLoopVarUnionName(forInIterBlock(body, name), name, fnIx)
+      const flv = forInLoopVarUnionName(name, fnIx)
       if flv != "" { return flv }
     }
   }
-  // THE MODULE-SCOPE DUAL of the loop-var arm above, and the same relation
-  // `startBlockLetOfSid` has to `parentLetOfSid`: a TOP-LEVEL `for x in <(i32|null)[]>`
-  // runs in the START function, where there is no `FuncDecl` body to scan, so the arm
-  // above is unreachable at `fnIx < 0` and the box loop var resolved to NO union. The
-  // slot is still declared as the kind-4 box (`declareForInLocals` is shared), so the
-  // narrowed read found no member set to unbox through and pushed the raw `(ref $uBox)`
-  // where the loop var's own valtype said the unboxed scalar — `vl check`-clean invalid
-  // wasm, in every module-scope read shape (`for`, `.slice`, `.filter`, a nested `for`,
-  // a `w.xs` field iterable, a `mk()` return iterable, a `let` iterable).
+  // THE MODULE-SCOPE DUAL of the loop-var arm above: a TOP-LEVEL `for x in <(i32|null)[]>`
+  // runs in the START function, where there is no `FuncDecl` body, so the arm above is
+  // unreachable at `fnIx < 0` and the box loop var resolved to NO union. The slot is still
+  // declared as the kind-4 box (`declareForInLocals` is shared), so the narrowed read found
+  // no member set to unbox through and pushed the raw `(ref $uBox)` where the loop var's own
+  // valtype said the unboxed scalar — `vl check`-clean invalid wasm, in every module-scope
+  // read shape (`for`, `.slice`, `.filter`, a nested `for`, a `w.xs` field iterable, a
+  // `mk()` return iterable, a `let` iterable). Both arms read the SAME slot sidecar, so the
+  // two scopes cannot drift.
   if fnIx < 0 {
-    const slv = forInLoopVarUnionName(forInIterIn(startStmts, name), name, -1)
+    const slv = forInLoopVarUnionName(name, -1)
     if slv != "" { return slv }
   }
   // A CAPTURED union box — resolve its member set from the parent frame's binding.
@@ -17568,69 +17687,42 @@ function startBlockLetOfSid(sid: i32) {
 // given the iterable node the enclosing loop iterates (-1 = no enclosing loop found). A loop
 // var is the storage class with NO declaration node at all — no `Param`, no `LetDecl` — so
 // its member set can only come from the iterable's union-box ELEMENT type, and both walks
-// that reach it (`unionNameOfIdentSid`'s function-scope arm over the `FuncDecl` body, and its
-// module-scope dual over `startStmts`) must answer identically: the slot `declareForInLocals`
-// declares is the same kind-4 box either way, and a walk that answers "" leaves the narrowed
-// read with no member set to unbox through.
+// that reach it (`unionNameOfIdentSid`'s function-scope arm and its module-scope dual) must
+// answer identically: the slot `declareForInLocals` declares is the same kind-4 box either
+// way, and an arm that answers "" leaves the narrowed read with no member set to unbox
+// through. Both read ONE fact — the live slot's `localLoopIter` pin — so they cannot drift.
+//
+// THE SLOT IS THE KEY, NOT THE NAME, AND KEYING ON THE NAME IS A MISCOMPILE. Two for-in
+// loops in one frame may share a loop-var name while binding different reps or different
+// unions: `for v in xs` over an `i32[]`, then `for v in m.values()` over a box-valued map; or
+// two box lists over `C | S` and `A | B`. A first-match-by-name AST scan handed the SECOND
+// loop's read the FIRST loop's iterable — for a non-union iterable it answered "" and the raw
+// `(ref $uBox)` went into `__print_i32__` (`vl check` clean, invalid wasm), and for a union
+// iterable of a DIFFERENT union it answered the wrong member set (loud: `narrowed receiver
+// names no union variant`). Renaming either loop var was the whole difference, at module
+// scope and inside a function alike. `declaredSlotOf` is the scope-resolved lookup
+// `declaredKind` already rides, so the iterable and the kind describe one binding.
 //
 // GUARDED on the slot ALREADY being a kind-4 union box, so a non-union loop var (an f32
 // `for v in m.values()`, a struct `for s in ss`) never reaches the ref-array
 // reclassification below — which could mis-name it and corrupt its codegen.
-function forInLoopVarUnionName(iterIx: i32, name: string, fnIx: i32) {
-  if iterIx < 0 { return "" }
+function forInLoopVarUnionName(name: string, fnIx: i32) {
   if declaredKind(name) != "union" { return "" }
+  const slot = declaredSlotOf(name)
+  if slot < 0 || slot >= localLoopIter.length { return "" }
+  forInIterUnionElemName(localLoopIter[slot], fnIx)
+}
+
+// The union NAME an ITERABLE's element carries, or "". A union-box ref array (`(C | S)[]`,
+// and the vals list of a box-VALUED map, which `exprRefArray` claims too) answers its
+// element's registered member set; every other iterable answers "".
+function forInIterUnionElemName(iterIx: i32, fnIx: i32) {
+  if iterIx < 0 { return "" }
   if !exprRefArray(iterIx, fnIx) { return "" }
   const slot = refListSlotOfExpr(iterIx, fnIx)
   if slot < 0 || slot >= rlElemKindTbl.length { return "" }
   if rlElemKindTbl[slot] != 2 { return "" }
   rlElemName[slot]
-}
-
-// The ITERABLE expression node of an enclosing `for <name> in <iter>` loop within the
-// statement list `stmts` (recursing into nested if / while / for / for-in bodies), or -1.
-// A for-in loop variable is not a `LetDecl`, so `parentLetOf` cannot resolve its type;
-// this lets `unionNameOfIdent` recover a union loop var's member set from its iterable.
-function forInIterIn(stmts: i32[], name: string) {
-  let i = 0
-  while i < stmts.length {
-    const s = P.nodes[stmts[i]]
-    if s is ForIn {
-      if s.fiVar == name { return s.fiIter }
-      const rf = forInIterBlock(s.fiBody, name)
-      if rf >= 0 { return rf }
-    } else if s is IfStmt {
-      const rt = forInIterBlock(s.ifThen, name)
-      if rt >= 0 { return rt }
-      if s.ifElse >= 0 {
-        const els = P.nodes[s.ifElse]
-        if els is Block {
-          const re = forInIterBlock(s.ifElse, name)
-          if re >= 0 { return re }
-        } else {
-          const one: i32[] = []
-          one.push(s.ifElse)
-          const r2 = forInIterIn(one, name)
-          if r2 >= 0 { return r2 }
-        }
-      }
-    } else if s is WhileStmt {
-      const rw = forInIterBlock(s.whileBody, name)
-      if rw >= 0 { return rw }
-    } else if s is ForRange {
-      const rr = forInIterBlock(s.frBody, name)
-      if rr >= 0 { return rr }
-    }
-    i = i + 1
-  }
-  -1
-}
-
-// Recurse into a Block node's statement list to find a for-in binding `name` (else -1).
-function forInIterBlock(blockIx: i32, name: string) {
-  if blockIx < 0 { return -1 }
-  const b = P.nodes[blockIx]
-  if b is Block { return forInIterIn(b.blkStmts, name) }
-  -1
 }
 
 // The union name of a `LetDecl`: its annotation when that names a union, else the
