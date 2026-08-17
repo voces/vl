@@ -135,6 +135,7 @@ import {
   directArgsBad,
   inferNicheNullByName,
   isLitVariantName,
+  litLexIsMember,
   loopStackFind,
   mapShapeFoldSet,
   memberPathKeyOf,
@@ -144,6 +145,7 @@ import {
   numLexIsDecimal,
   numTextIsFloat,
   objFieldVal,
+  quoteLex,
   retF32Flag,
   retF64Flag,
   retI64Flag,
@@ -413,6 +415,7 @@ import {
   cloSigKeyExt,
   cloSigPosOfKey,
   coalesceDefaultNullable,
+  coalesceLitUnionFits,
   criFnIsAnonLambda,
   ctrlEnter,
   ctrlLeave,
@@ -5965,11 +5968,7 @@ function emitMonoMapDefault(body: i32[], recvIx: i32, defIx: i32, fnIx: i32) {
   if atomTexts.length > 0 {
     const du = P.nodes[unwrapParen(defIx)]
     if du is StrLit {
-      let mi = 0
-      while mi < atomTexts.length {
-        if quoteLex(atomTexts[mi]) == du.strText { atomDef = true }
-        mi = mi + 1
-      }
+      if litLexIsMember(du.strText, atomTexts) { atomDef = true }
     } else if du is NullLit {
       // A NULLABLE-atom value (`{[string]: K | null}`) admits a bare `null` default — lowered as
       // the `-1` niche sentinel (the `??` result stays `K | null`).
@@ -15066,13 +15065,6 @@ function emitExprExpect(body: i32[], exprIx: i32, fnIx: i32, ctx: ExpCtx) {
   r
 }
 
-// The re-quoted source LEXEME for a literal-union member's inner text (`i32` -> `"i32"`) — matches the
-// raw `StrLit.strText` so `internAtom` yields the SAME id, and feeds a synthetic `StrLit` for printing.
-function quoteLex(inner: string) {
-  const q = "\""
-  q + inner + q
-}
-
 // Emit `print(<string expr>)`: stream each code point through `__print_char__`, then one
 // `__print_str_flush__`. Factored from the print handler so the literal-union widening can reuse it.
 function emitPrintStrExpr(body: i32[], strExpr: i32, fnIx: i32) {
@@ -17214,22 +17206,27 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // The i32 cell holds an interned atom id (always >= 0) or the spare sentinel `-1` for
   // `null`, so the null test is the `-1` compare (`emitNulIsNullTest`'s litunion arm) and the
   // result is the same i32 either way: nullable and non-null share one valtype, so this rep
-  // has NO consumer half in the emit — the block type is unconditional `0x7f`. What the
-  // CONSUMER does need is the ATOM IDENTITY of the result (`exprNulLitUnion` /
-  // `exprIsLitAtom`'s `??` arms), or an inferred binding renders the id instead of the member.
+  // has NO NULLABILITY consumer half in the emit — the block type is unconditional `0x7f`. What
+  // the CONSUMER does need is the ATOM IDENTITY of the result, and `coalesceLitUnionFits` is the
+  // ONE claim this arm and both consumer classifiers (`exprIsLitAtom` / `exprNulLitUnion`) make:
+  // it also decides whether the rep SURVIVES the default at all, so `k ?? "zz"` — whose join is
+  // `string` — declines here and keeps its loud reject instead of putting a heap string in an i32
+  // blocktype.
   //
-  // A BRANCHING `if`, NOT THE `select` ITS `boolean | null` TWIN USES. Both cost the same
-  // bytes over an i32 blocktype, and the `if` evaluates the default ONLY when the LHS is null
-  // — the semantics `??` states. (The `boolean | null` and bool-`pop` arms above still
-  // `select`, so both operands run there; that is the owner's open short-circuit ruling, and
-  // this arm deliberately does not import it into a new rep.)
+  // A BRANCHING `if`, NOT THE `select` ITS `boolean | null` TWIN USES. `select` is one opcode and
+  // evaluates BOTH operands unconditionally; the `if`/`else`/`end` framing over the `0x7f`
+  // blocktype is THREE BYTES MORE PER SITE (measured: 1351 vs 1342 over three `??` sites) and
+  // evaluates the default ONLY when the LHS is null — the semantics `??` states. The
+  // `boolean | null` and bool-`pop` arms above still `select`, so a side-effecting default runs
+  // there even when the LHS is present; that is an open ruling, and this arm deliberately does
+  // not import it into a new rep for three bytes.
   //
   // A CALL LHS cannot be re-read, so it is STASHED once in the i32 coalesce-call slot — the
   // same slot the `boolean | null` call arm uses, and reserved by the same
   // over-approximating scan (`exprHasCoalesceCall` reserves all three slots for ANY call-LHS
   // `??`), so no layout moves. Sound across nesting for the reason that arm gives: each `??`
   // sets-tests-uses within its own evaluation.
-  if exprNulLitUnion(e.binLeft, fnIx) {
+  if coalesceLitUnionFits(exprIx, fnIx) {
     if emitExpr(body, e.binLeft, fnIx) < 0 {
       return -1 // the niche i32, evaluated ONCE
     }

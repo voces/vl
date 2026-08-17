@@ -1,0 +1,128 @@
+// @run
+// @log a
+// @log b
+// @log NUL
+// @log b
+// @log a
+// @log a
+// @log b
+// @log a
+// @log b
+// @log a
+// @log b
+// @log a
+// @log b
+// @log NUL
+// @log b
+// @log a
+// @log b
+// @log a
+// @log b
+// @log b
+// @log SIDE
+// @log a
+// @hint redundant type annotation: `v` is inferred as `"a" | "b"`
+// @hint redundant type annotation: `o` is inferred as `{fld: "a" | "b"?}`
+// @hint redundant type annotation: `xs` is inferred as `"a" | "b"?[]`
+// `??` over the `K | null` NICHE — the i32 atom id with the spare `-1` sentinel for null.
+// Every consumer must see the result AS AN ATOM, not as the raw i32: the niche and the bare
+// litunion share one valtype, so nothing about the emitted block type distinguishes them and a
+// consumer that binds a plain i32 cell renders the INTERNED ID instead of the member. Both
+// runtime inputs per shape (null / a member), because the null leg exercises the default arm and
+// the member leg the sentinel compare.
+
+type K = "a" | "b"
+
+function nulK(): K | null { return null }
+
+// ── the default kinds: a non-null member, a nullable operand, and the chain ──
+function nonNull(p: K | null) {
+  const v = p ?? "a"
+  print(v)
+}
+nonNull(null) // a
+nonNull("b")  // b
+
+function nulDefault(p: K | null, q: K | null) {
+  const v = p ?? q
+  if v != null { print(v) } else { print("NUL") }
+}
+nulDefault(null, null) // NUL
+nulDefault(null, "b")  // b
+nulDefault("a", null)  // a
+
+// ── the consumer positions: an ANNOTATED binding, an argument, a return ──
+function annotated(p: K | null) {
+  const v: K = p ?? "a"
+  print(v)
+}
+annotated(null) // a
+annotated("b")  // b
+
+function takesAtom(v: K) { print(v) }
+
+function asArgument(p: K | null) { takesAtom(p ?? "a") }
+asArgument(null) // a
+asArgument("b")  // b
+
+function returnsAtom(p: K | null): K { return p ?? "a" }
+const retNul = returnsAtom(null)
+print(retNul) // a
+const retVal = returnsAtom("b")
+print(retVal) // b
+
+// ── the LHS sources: a struct FIELD (code 30), a `(K | null)[]` element, and a CALL ──
+type Box = { fld: K | null }
+
+function fieldLhs(p: K | null) {
+  const o: Box = { fld: p }
+  const v = o.fld ?? "a"
+  print(v)
+}
+fieldLhs(null) // a
+fieldLhs("b")  // b
+
+function elemLhs(p: K | null) {
+  const xs: (K | null)[] = [p]
+  const v = xs[0] ?? nulK()
+  if v != null { print(v) } else { print("NUL") }
+}
+elemLhs(null) // NUL
+elemLhs("b")  // b
+
+// A CALL lhs cannot be re-read, so it is stashed once in the i32 coalesce-call slot.
+function mkK(n: i32): K | null {
+  if n == 0 { return null }
+  return "b"
+}
+
+function callLhs(n: i32) {
+  const v = mkK(n) ?? "a"
+  print(v)
+}
+callLhs(0) // a
+callLhs(1) // b
+
+// A CALL in the MIDDLE of a chain becomes an LHS only after the re-association, so it is the
+// operand the stash-slot reservation scan has to see.
+function midCall(n: i32, r: K | null) {
+  const v = r ?? mkK(n) ?? "a"
+  print(v)
+}
+midCall(0, null) // a
+midCall(1, null) // b
+
+// SHORT-CIRCUIT: the default is evaluated ONLY when the LHS is null, so the side effect prints
+// exactly once across the two calls. (The `boolean | null` twin lowers as wasm `select` and does
+// run both operands — that difference is deliberate, not an inconsistency to normalize away.)
+function loud(): K {
+  print("SIDE")
+  "a"
+}
+
+function shortCircuit(p: K | null) {
+  const v = p ?? loud()
+  print(v)
+}
+shortCircuit("b")  // b — no SIDE
+shortCircuit(null) // SIDE, then a

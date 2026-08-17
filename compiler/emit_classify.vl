@@ -81,6 +81,8 @@ import {
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
   nodeArrayElemName,
+  nodeLitUnionMemberTexts,
+  nodeNulLitUnionMemberTexts,
   nodeNulStructInnerName,
   nodePinPayloadOf,
   nodeRepTyIxOf,
@@ -171,6 +173,7 @@ import {
   gaeSplitArgs,
   inferNicheNullByName,
   isBuiltinFnName,
+  litLexIsMember,
   mapShapeFoldSet,
   mapValNameOf,
   memberPathKeyOf,
@@ -9371,6 +9374,62 @@ export function coalesceNicheStaysNullable(exprIx: i32, fnIx: i32) {
   false
 }
 
+// True when the DEFAULT of a `K | null` `??` reps as that niche's own i32 — a bare `null` (the
+// `-1` sentinel), an ATOM place / field / call, another `K | null`, a MEMBER literal, or,
+// structurally, a chain of those.
+//
+// STRUCTURAL IN THE CHAIN, NEVER BANKED — the discipline `coalesceDefaultNullable`'s header
+// states, and for the same reason: the re-association mints a `??` node carrying no type at all,
+// so a banked answer says "not an atom" about every chained default.
+//
+// A member LITERAL is decided by LEXEME MEMBERSHIP (`litLexIsMember`, the same test the
+// atom-valued-MAP `??` default already uses), which is the only leg that can say no:
+// `exprIsLitAtom` has no `StrLit` arm, so `"aa"` and `"zz"` are indistinguishable to it while only
+// one of them is this niche's i32. The lexeme, not the banked type — a member literal in a DEFAULT
+// position carries the JOIN's type, not a `TyLit`, so a banked answer declines `"aa"` too.
+function coalesceLitUnionDefaultIsAtom(defIx: i32, texts: string[], fnIx: i32) {
+  if defIx < 0 { return false }
+  const dix = unwrapParen(defIx)
+  const d = P.nodes[dix]
+  if d is NullLit { return true }
+  if d is StrLit { return litLexIsMember(d.strText, texts) }
+  if d is BinExpr {
+    if d.binOp == "??" {
+      if !coalesceLitUnionDefaultIsAtom(d.binLeft, texts, fnIx) { return false }
+      return coalesceLitUnionDefaultIsAtom(d.binRight, texts, fnIx)
+    }
+  }
+  exprIsLitAtom(dix, fnIx)
+}
+
+// True when the `??` at `exprIx` lowers as the `K | null` ATOM NICHE: its LHS is that niche AND
+// its default reps as the same i32.
+//
+// THE DEFAULT DECIDES WHETHER THE REP SURVIVES AT ALL, not merely its nullability. `k ?? "zz"`
+// over `type K0 = "aa" | "bb"` joins the result to `string`, whose rep is a heap array — the atom
+// lowering would leave a `(ref $array)` in an i32 blocktype and the `print` widen would have no
+// member texts for the join. So a NON-atom default (a non-member literal, a `string` place)
+// declines here and keeps the loud emit reject `maps/error-nonmap-coalesce.vl` pins; without the
+// decline that reject would have become `vl check`-clean invalid wasm.
+//
+// ONE HOME FOR THE EMIT ARM AND BOTH CONSUMER HALVES, because they must agree exactly: an emit
+// arm that declines while `exprIsLitAtom` still claims an atom cell is how `print(k ?? "zz")`
+// stopped reporting the `??` reject and started reporting a downstream "carries no member texts".
+export function coalesceLitUnionFits(exprIx: i32, fnIx: i32) {
+  const lhs = coalesceNicheLhs(exprIx)
+  if lhs < 0 { return false }
+  if !exprNulLitUnion(lhs, fnIx) { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is BinExpr {
+    // The niche's member set: its nullable spelling first, then the bare one for an LHS whose
+    // banked type the narrow already collapsed.
+    let lut = nodeNulLitUnionMemberTexts(lhs)
+    if lut.length == 0 { lut = nodeLitUnionMemberTexts(lhs) }
+    return coalesceLitUnionDefaultIsAtom(e.binRight, lut, fnIx)
+  }
+  false
+}
+
 // The list-element rep (2/7/12/20 — see `mvListValKind`) of a bare `m[k]` or `m[k] ?? d`
 // read over a list-VALUED map, else -1. The single classifier hook each `expr*Array` uses to
 // claim a list-valued-map read of its own element type.
@@ -10463,7 +10522,9 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       // `exprNulBool` / `exprNullableString` / `exprNullableStruct` state for their own reps.
       // Without it an inferred `const nv = p ?? q` bound a cell that answered no niche arm and
       // its `nv != null` emitted a bare null: `bare null needs a struct-typed context`.
-      if exprNulLitUnion(e.binLeft, fnIx) {
+      // `coalesceLitUnionFits` is the SAME claim the emit arm makes, so a default that pushes
+      // the join off the niche (`k ?? "zz"`) is declined on both sides at once.
+      if coalesceLitUnionFits(exprIx, fnIx) {
         return coalesceDefaultNullable(e.binRight, fnIx)
       }
     }
@@ -14569,13 +14630,11 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   if exprNulLitUnion(exprIx, fnIx) { return true }
   // `p ?? d` over the `K | null` niche is an ATOM in BOTH halves — the line above already
   // claims the nullable one, and a NON-null default coalesces the sentinel away to leave the
-  // plain atom id. The half is irrelevant here, so this asks only the rep. Without it an
-  // inferred `const v = p ?? "a"` bound a bare i32 and every atom consumer (the `print` widen,
-  // a litunion arg, a member compare) saw a NUMBER: `vl check` rc 0, `0` printed for `"a"`.
-  const claLhs = coalesceNicheLhs(exprIx)
-  if claLhs >= 0 {
-    if exprNulLitUnion(claLhs, fnIx) { return true }
-  }
+  // plain atom id. The half is irrelevant here, so this asks only whether the rep survives
+  // (`coalesceLitUnionFits`, the emit arm's own claim). Without it an inferred
+  // `const v = p ?? "a"` bound a bare i32 and every atom consumer (the `print` widen, a
+  // litunion arg, a member compare) saw a NUMBER: `vl check` rc 0, `0` printed for `"a"`.
+  if coalesceLitUnionFits(exprIx, fnIx) { return true }
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Ident {
     // A CAPTURED variable, resolved against the enclosing frame's binding — the same node
