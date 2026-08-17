@@ -1478,9 +1478,11 @@ it has to be answered first: establish whether `tests/cases` covers those two sh
 cases if it does not, and only then take the chain. Filed so the next slice starts at the
 obstacle instead of rediscovering it after the diff is written.
 
-Also unconverted and now sized: `modRenamed` (phase 5) reads **1.82% / 27.1 samples per run**
-on the converted profile — it went UP as a share, because it is 87% reached from `modRwExpr`
-and this phase did not touch the merge.
+Also sized here: `modRenamed` (phase 5) reads **1.82% / 27.1 samples per run** on the converted
+profile — it went UP as a share, because it is 87% reached from `modRwExpr` and this phase did
+not touch the merge. **§16 is phase 5**; both figures re-derive there, and both understate the
+row — the self share is under half of what the function costs, and a second reader of the same
+table is not named here at all.
 
 ### 9.8 Gate
 
@@ -2888,3 +2890,151 @@ from *"a helper this program never calls gained a loop"*.
 `refresh-compiler.sh` **REFRESH_RC=0** (1,137,079 B) · full suite, serial,
 `SELFHOST_NATIVE_ALIGN=1`: **3,711 passed / 0 failed / 7 ignored** ·
 `lint-self.sh` rc 0 · release test alone 21/0.
+
+---
+
+## 16. Item F3 — the module merge's rename table, sid-indexed
+
+§9.7 filed `modRenamed` as the unconverted phase-5 row at **1.82% self / 27.1 samples per
+run**, noting it is 87% reached from `modRwExpr`. Both halves of that filing re-derive
+exactly. What the row does NOT say is that the self figure is **less than half** of what the
+function costs, and that a SECOND reader of the same table, not named in the row at all, costs
+another 1.96%.
+
+### 16.1 The re-derived profile
+
+Master `9fda2180`, **12 warm guest runs, 17,613 samples (1,467.8 per run)**, `--names` seed,
+`$mNN` stripped — §2's recipe.
+
+| | % self | self /run | % incl | incl /run |
+| --- | ---: | ---: | ---: | ---: |
+| `modRenamed` | 1.80 | 26.4 | **3.94** | **57.8** |
+| `modRwTsName` | 1.00 | 14.8 | 1.89 | 27.8 |
+| `modRwStmt` — the whole merge rewrite | 0.04 | 0.6 | **6.44** | **94.6** |
+
+**The filed 1.82% is `modRenamed`'s SELF, and `__str_eq__` under it is another 28.4 samples per
+run filed on a different row.** Its callers re-derive as filed: `modRwExpr` **86.17%**,
+`modRwFunc` 6.05, `modSelfFnTarget` 5.33, `modRwStmt` 2.45. Its leaves split
+`__str_eq__` 49.14 / self 45.68 / `capHas` 5.19.
+
+### 16.2 Was the information already banked? No — and the reason is structural
+
+`symbols.vl`'s R4 header already answers it: the merge's three name writers are *"INERT TODAY —
+the merge runs before any emit pass and every `sidOfNode` caller is in `emit_*`, so the carrier
+is empty"*. **The merge is the FIRST pass over the arena**, so at the moment `modRwExpr` asks
+there is nothing banked to read; the sibling item's shape (information produced and thrown
+away) does not occur here.
+
+What IS one level out from the row as filed is the **second reader**. `modRwTsName` walks the
+SAME `modRenameFrom` with the SAME linear scan, once per type-spelling node, and it is not
+mentioned in §9.7. Converting only the filed row would have left it reading ~718 rows per
+`TS_NAME`. The object is the merge REWRITE, not the one function.
+
+### 16.3 The DETERMINISTIC counts
+
+A counting build of `modRenamed`, one self-compile of `compiler/entry.vl` (**27 modules, arena
+256,912 nodes**):
+
+| | count |
+| --- | ---: |
+| `modRenamed` calls | **96,432** |
+| — of them from `modRwExpr`'s `Ident` arm | 81,438 (84.4%) |
+| **rename-table string compares** | **12,281,353** |
+| shadow-stack string compares | 561,805 |
+| mean `modRenameFrom` length at call time | **718** |
+| exits at the shadow (a local) | 62,068 (64.4%) |
+| exits at the table (renamed) | 32,618 (33.8%) |
+| falls through unrenamed | 1,746 (1.8%) |
+
+**For scale, §9.4's phase-3 conversion moved 2,466,975 string-keyed probes to 479,079.** This
+one function pays **five times the whole of that budget** in raw compares — they are cheap
+compares (a length check rejects most), which is why the row reads 1.8% rather than 20%, but
+the count is the quadratic the conversion removes.
+
+### 16.4 What shipped
+
+`modRenamePush` appends a row and indexes it under `sidOf(from)`. Readers are `sidLookup` plus
+one `sidArrGet`. `sidLookup` never mints, which is exact here by R6: every key was interned at
+the build point, so a name with no id cannot be one. The parallel `modRenameFrom: string[]`
+goes with the scan that was its only reader — the row carries the identity now.
+
+**TWO sid views, not one.** The readers disagree about a duplicate key and the disagreement is
+pre-existing: `modRenamed` returns at the FIRST matching row; `modRwTsName` and
+`modTypeRenamed` scan on and take the LAST. A duplicate `from` needs two imports binding one
+local (a decl colliding with an import is diagnosed by `modCheckDupBindings`), and which row
+wins decides the diagnostic text and which import a reference resolves to — so neither reader
+is quietly normalized onto the other's answer.
+
+**The corpus pins it, and the pin has a witness.**
+`tests/cases/modules/duplicate-import-first-vs-last/` imports one value name and one TYPE name
+from each of two modules that both export them, and asserts `1` (the FIRST module's function)
+and `beta` (the SECOND module's `string` type). Each collapse was compiled into a real compiler
+by the saved good seed and run: `modRenamed` on the LAST view prints **2**, and the type readers
+on the FIRST view stop the case checking with `cannot assign string to 't' of type i32`. Without
+that case nothing in the corpus notices a "tidy" that merges the two views, and the failure it
+would let through is a silently different import binding.
+
+`modRenamed` also consults the map **before** the shadow stack. Same answer either way — a name
+absent from the map renames to itself whether or not a local shadows it — and 64.4% of calls
+are locals with no row, which now skip the walk entirely.
+
+**The carrier stays untouched, deliberately.** Nothing here calls `sidOfNode`, so `sidNode` is
+still empty through the merge and R4 writers 1-3 stay inert — no new miscompile surface in a
+class §9.6.1 records the fixpoint ladder as blind to. What DOES change is that the merge now
+MINTS: emit's id space no longer starts at 0. R2 forbids depending on an id's numeric value,
+and the corpus A/B is that rule's witness here.
+
+### 16.5 Measured
+
+**Guest profile, interleaved A/B/A/B, 12 runs per leg, same input both legs, `$mNN` stripped.**
+Absolute samples PER RUN:
+
+| | A /run | B /run | |
+| --- | ---: | ---: | ---: |
+| `modRwStmt` (the whole merge rewrite) | 97.3 | 18.2 | **−81.3%** |
+| `modRenamed` | 58.2 | 8.6 | **−85.2%** |
+| `modRwTsName` | 28.4 | 0.7 | **−97.5%** |
+| `__str_eq__` | 352.3 | 319.8 | −9.2% |
+| `__map_probe__` (the price) | 92.0 | 102.5 | +11.4% |
+| `__str_hash__` (the price) | 46.9 | 50.6 | +7.9% |
+| **all samples** | **1,452.2** | **1,378.1** | **−5.1%** |
+
+**Self-compile CPU milliseconds** (user+sys, interleaved, `taskset -c 2-5`, emitted bytes
+asserted md5-identical before timing). CPU rather than wall because this box swings up to 2.5×
+under contention (§15.3) — and this session was the contention, so **both runs are reported
+with the load they ran at**:
+
+| reps | load | A min → B min | A med → B med |
+| ---: | ---: | --- | --- |
+| 13 | 8–14 | **1,421 → 1,344 ms (−5.4%)** | 1,479 → 1,424 ms (−3.7%) |
+| 11 | 50–73 | 1,666 → 1,607 ms (−3.5%) | 1,875 → 1,712 ms (−8.7%) |
+
+**Quote the profile's −5.1% and the quiet run's −5.4% min.** The load-70 row is the pair of
+numbers that shows why: its two channels straddle the answer by ±3 points because at three
+times the core count every rep is measuring a different machine.
+
+**What is left, and why it is the floor.** `modRenamed`'s remaining 8.6 samples per run are
+3.4 `__str_hash__` + 2.1 `__str_eq__` + 0.8 `__map_probe__` (the `sidLookup`) + 1.1
+`sidArrGet` + 0.8 self + **0.4 `capHas`** — the shadow stack is gone as a cost. Going below the
+probe means taking the id from the CARRIER (`sidOfNode(ix)`, which every call site already has
+as an arena index) rather than from the name. **Priced and declined**: the merge would fill
+96,432 carrier slots and then invalidate 32,618 of them by renaming, so emit re-mints those;
+net ≈31 K fewer probes ≈ 3–4 samples per run ≈ 0.25%, bought by making R4 writers 1-3 live.
+That is a miscompile-class invariant for a quarter of a point.
+
+### 16.6 Gate
+
+Every rc read BARE.
+
+| gate | result |
+| --- | --- |
+| `scripts/refresh-compiler.sh` | rc 0, **1,151,180 B** |
+| **seed ladder leg 2** (`mv` the seed out, `fetch-seed.sh`, `refresh --prove-fixpoint`) | rc 0 — **fixpoint in 2 compiles**, and its md5 is the artifact the A/B timed |
+| `scripts/lint-self.sh` | rc 0 (`vl fmt -w compiler/driver.vl` once) |
+| `deno test -A tests/cases_wasm_test.ts` | **1,707 passed / 0 failed / 7 ignored** (1,706 before the duplicate-import case) |
+| `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check tests/selfhost_native_align_test.ts` | **1,714 passed / 0 failed / 0 ignored** (1,713 before it; the suite is discovery-based, so the case needs no registration) — and verified BOTH ways: without the env var the same file reads 0 / 0 / **1,713 ignored**, so the count is the suite and not a self-ignore |
+| **six-channel A/B** (check rc, check stderr, build rc, emitted BYTES, run rc, run stdout) over the 57 multi-module corpus cases + `compiler/entry.vl` | **58 / 58 same**, one result file per worker, run against the shipped artifact |
+| the same six channels over single-module corpus files | **304 of 1,655 same, 0 differing** — a PARTIAL sweep, cut off at a 24-core box sitting at load 90–175 under other agents. It is the module bucket, not this, that is the population the row is about |
+
+**Seed-bootstrap: NO SPLIT.** The change uses only `symbols.vl` exports the published seed
+already ships.
