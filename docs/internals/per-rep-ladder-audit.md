@@ -456,18 +456,22 @@ Measured against `vl build`, not assumed. Three ladder shapes convert:
   `while`, an assignment, a call) or be EMPTY `{ }`. An empty arm with a reason
   comment is the readable spelling for "this variant is a leaf".
 * **The value-position `match`** — bound to a name or as the trailing expression.
-  Arms must each be a SINGLE value expression.
+  Multi-statement arms are fine here; the arm's value is its last statement.
 
-Two shapes are `vl check`-clean and rejected by the EMITTER — both with a
-mechanical rewrite, so neither blocks the class, but a converter that hits one
-reads the error as a language limit rather than a shape nit:
+Two shapes are `vl check`-clean and rejected by the EMITTER. **Neither is
+`match`-specific**: both reproduce identically with a hand-written `is`-chain, so
+the conversion's envelope is exactly the envelope the original ladder already had
+and no conversion can be blocked by anything new. Recorded because the messages
+mislead a converter into reading a shape nit as a language limit:
 
-* a statement-position `match` where any arm body ends in a **bare value**
-  expression → `emitProgram: unsupported statement in body`. Fix: drop the
-  trailing `0`, or use `{ }`.
-* a value-position `match` where any arm body has **more than one statement** →
-  `emitProgram: if-expression arm is not a single value`. Fix: convert that arm
-  to a `return` and take the early-`return` shape.
+* a **value-producing if-expression or `match` in STATEMENT position** (`if u is A
+  { 0 } else { 0 }` as a bare statement; every `match` arm a bare value) →
+  `emitProgram: unsupported statement in body`. Fix: end each arm in a statement,
+  or spell it `{ }`.
+* a **VOID-valued branch mixed with a value branch in VALUE position** (`const r =
+  if u is A { xs.push(u.a) } else { 0 }`) → `emitProgram: if-expression arm is not
+  a single value`, which misnames the cause: the branch IS a single expression, it
+  is a VOID one. Fix: take the statement-position or early-`return` shape.
 
 ### The recommendation, ranked
 
