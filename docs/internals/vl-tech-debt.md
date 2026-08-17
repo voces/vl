@@ -121,22 +121,24 @@ in order of safety:
   measured 0 sightings on diagnostic-free corpus files, so the filter is confined to
   broken code. **`…` is deliberately NOT filtered** (45 clean sightings — the depth cap
   on legitimately deep recursive types; it means a type is PRESENT but elided).
-  Remaining: `any` still reaches the editor. It renders a `?fn.N` inference hole and
-  cannot be filtered host-side without deleting informative hints from healthy code
-  (`: any[]`, `: {x: any, y: any}`, 88 clean corpus labels). The real fix is a separate
-  DISPLAY renderer that spells a hole as a type parameter (`T`, `U` — which VL can
-  actually write, and which preserves the distinctness `any` destroys), leaving
-  `tyToStr` alone for error messages.
+  Remaining: the HOLE marker still reaches the editor. It renders a `?fn.N` inference
+  hole and cannot be filtered host-side without deleting informative hints from healthy
+  code (`: _[]`, `: {x: _, y: _}`, 88 clean corpus labels). It is spelled `_` rather than
+  `any` precisely so an unfilterable marker does not read as a writable type name, but a
+  hint is formatted `: T` (a suggestion of the annotation to write) and `_` is not
+  writable either. The remaining fix is a separate DISPLAY renderer that spells a hole as
+  a type parameter (`T`, `U` — which VL can actually write, and which preserves the
+  distinctness a single marker destroys), leaving `tyToStr` alone for error messages.
 
 - **`inlayHole` is shallow, and `check_state.vl`'s header says otherwise.** The comment
   at `check_state.vl` ("A type that's still an inference hole … is skipped") is true
   only of a TOP-LEVEL hole: `inlayHole` (`typecheck.vl`) tests one arena node, so a
   `TyUnion` whose members are all holes passes the guard and a return hint renders
-  `any | any` — two DISTINCT holes (`?f.0`, `?f.1`) that the renderer prints
+  `_ | _` — two DISTINCT holes (`?f.0`, `?f.1`) that the renderer prints
   identically. This is the owner-reported defect. A validated four-line union arm on
   `inlayHole` (probe-built and measured: corpus inlay hints 4,249 → 4,207, unspellable
-  labels 110 → 74, all 36 removed being all-holes unions, `: any | string` and
-  `: {foo: any, bar: any}` both preserved, diagnostics unchanged) is filed with the
+  labels 110 → 74, all 36 removed being all-holes unions, `: _ | string` and
+  `: {foo: _, bar: _}` both preserved, diagnostics unchanged) is filed with the
   `typecheck.vl` owner. NB the union case should be skipped for the same reason the
   scalar case already is — a lone hole return renders no hint today.
 

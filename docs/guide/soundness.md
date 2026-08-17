@@ -30,10 +30,12 @@ error from a `@error` case, and breaks the suite.
 - **No `dynamic` / no implicit `any`.** There is no type that silently accepts
   every value and defers checking. Where a value can be one of several types, it
   has an explicit **union** type and must be narrowed before use.
-  ⚠️ The *diagnostics* do not say this yet: an unresolved hole prints as `any`
-  ("got any and string", "cannot assign `(any, any) -> any`"), which reads as
-  exactly the type this bullet denies exists. The claim is about the type system,
-  not the wording; the wording is filed as workboard **E7** (ROADMAP B17).
+  The *diagnostics* say the same thing: an unresolved hole renders as the blank
+  `_` — "comparison expects numeric operands, got `_` and boolean", "cannot
+  assign `(_, _) -> _` to 'c' of type `(i32, i32) -> string`". `_` is not a type
+  name; it is an unfilled slot, and there is nothing to write in it because the
+  fix is to constrain the hole (pass a different argument, add an annotation),
+  never to name a top type.
 
 ## The rules the corpus pins down
 
