@@ -1509,12 +1509,8 @@ defect. Per spelling, out of 96 position cells: **32 CHECKREJ** (a declared stru
 map 8, a numeric litunion 8 — every position) and **7 INVALIDWASM** (a nested-nullable inner; 5 for
 the parenthesized spelling, whose other 2 are a loud emit reject instead).
 
-The struct/list/map 24 are ONE defect, and it is the alias's union WRAPPER at the CHECKER rather
-than at the emitter: `type T = (S | null)` interns `TyUnion[S?]`, and `nonNullTy` peels a
-`TyNullable` but not a one-member union around one, so `if v != null { v.v }` reads `field 'v' is
-not on every member of {v: i32}? — narrow with `is` first` while the inline `S | null` narrows and
-runs. A one-member-union peel in `nonNullTy` would lift all 24, and its blast radius is every
-`nonNullTy` reader (`type Id = i32` is also a one-member union), so it wants its own measured slice.
+The struct/list/map 24 are ONE defect — **CLOSED, and the layer this section named for it was the
+wrong one; see the section below.**
 
 Two adjacent defects the grids found, each with a control:
 
@@ -1527,3 +1523,112 @@ Two adjacent defects the grids found, each with a control:
   inline spelling at the parameter and return positions (`type NL = 0 | 1; f(v: NL | null)`), so the
   oracle itself is loud there and the alias cannot be graded above it. Control: the same program
   with a STRING litunion runs.
+
+## The struct/list/map 24 are CLOSED — and `nonNullTy` was the wrong layer, refuted by its own grid
+
+The filing above named `nonNullTy` ("peels a `TyNullable` but not a one-member union around one")
+and asked for a slice because "its blast radius is every `nonNullTy` reader". Both halves came out
+wrong, and in opposite directions: the blast radius is **nine call sites**, and the peel is not a
+missing case there but a **miscompile**.
+
+### The census the filing asked for, and why it is not the interesting number
+
+`nonNullTy` has 9 readers. Six are narrow-FACT producers that act on `inner != cur`:
+`collectThenNarrows`' `!=`-arm and its guard-call arm, `collectElseNarrows`' `==`-arm, its
+`is null` arm and its guard-call arm, and `pushOptChainThenFacts`' `?.`-receiver arm. Two are the
+assignment path (`declare(name, nonNullTy(asgCur))` for the straight-line narrow, and the `??`
+full-nullability peel). The ninth is the guard-clause post-narrow, which compares
+`gTy == nonNullTy(lookup(gKey))` to tell a null-STRIP from a union SUBTRACTION — both sides of that
+equality are `nonNullTy`-derived, so any peel is neutral there by construction.
+
+A one-member-union peel changes the answer at all eight of the others, and for the WHOLE
+transparent-alias population rather than the nullable one: `type Id = i32` is `TyUnion[i32]`, so an
+unconditional peel pushes a narrowing fact for a place that admits no null at all. Gating the peel
+on "the member is a `TyNullable`" fixes that — and then buys **nothing**, because for every inner
+the transparency arm already claims, `declaredTyOfName` resolved the annotation to `S?` before
+`nonNullTy` ever saw it.
+
+### The peel is a miscompile, measured
+
+Built and graded on the 1,020-cell grid below: **17 cells up, 6 down (3 into the silent class), 62
+lateral (15 more into the silent class), and ZERO new running programs.** 47 cells go from a loud
+check reject to `emitProgram: bare null needs a struct-typed context` and 18 to check-clean invalid
+wasm, because the checker narrows a value the emitter is still lowering as a union box. That is the
+divergence `declaredTyOfName`'s own note predicts in one line — *"collapsing here without the
+emitter's `singleMemberAliasTyIx` agreeing (or the reverse) diverges the two"* — and it is why
+`nonNullTy` now carries the invariant instead of the peel.
+
+### The single source of truth, and the gate that came off it
+
+`singleAliasMemberTyIx` is the one ruling, read by the CHECKER through `declaredTyOfName` and by
+the EMITTER through `singleMemberAliasTyIx`. Its nullable arm (`nulAliasMemberFaithful`) was gated
+on the inner via `nulNicheInnerFaithful` — a primitive or a litunion — so a declared struct, an
+inline struct, a list, a map, a generic application, a closure, a declared union, a numeric litunion
+and a nested nullable were opaque on BOTH sides. **That arm now takes every inner.**
+`nulNicheInnerFaithful` keeps its other reader, the `| null` DECLARATION fold, unchanged: this is a
+gate on which shapes are TRANSPARENT, not on which shape a declaration INTERNS.
+
+### The grid — 1,020 cells, 15 inners, both runtime inputs, the inline spelling as oracle
+
+15 inners (declared struct, inline struct, list, map, generic application, closure, declared union,
+numeric litunion, string litunion, `string`, `i32`, `f64`, `boolean`, newtype, nested nullable) x
+(8 positions + 9 uses/narrowing forms) x {`(X | null)`, `X | null`, `(X) | null`, the alias-free
+INLINE oracle}. Positions: parameter, return, module `const`, function-local `let`, struct field,
+list element, map value, generic instantiation. Uses/forms: the inner-natural read, `is`, `??`,
+passed onward to a non-null parameter, returned and re-narrowed, arithmetic/concat, `== null` early
+return, `!= null &&`, a nested guard. Every program calls at a NON-NULL and at a `null` input.
+
+| spelling | grid A parity (120) | grid B parity (135) | check-clean INVALID WASM | silently WRONG |
+|---|---|---|---|---|
+| INLINE (oracle) | 120 → 120 | 135 → 135 | 0/4 → 0/4 | 0 → 0 |
+| `(X \| null)` | 55 → **103** | 67 → **135** | 0/1 → 0/4 | 0 → 0 |
+| `X \| null` | 57 → 57 | 76 → 76 | 0/2 → 0/2 | 0 → 0 |
+| `(X) \| null` | 57 → 57 | 76 → 76 | 0/2 → 0/2 | 0 → 0 |
+
+**124 cells up. 0 silently-wrong output, before or after. 0 cells that RAN on master stopped running
+or changed output.** The oracle is unmoved in all 255 of its cells and the two un-parenthesized
+spellings in all 510 of theirs, so #1427's declaration fold is measurably untouched. Byte identity:
+`inline == (X | null)` on **94/96** buildable position groups and **94/94** use groups.
+
+### What the fix does NOT reach, each with its own number
+
+- **7 cells the alias now EXCEEDS the oracle on** — a LIST OF the nullable (`TT[]`), where the
+  inline spelling still reads `argument 1: expected {v: i32} | null[], got {v: i32}[]`. The alias
+  runs; the inline spelling is the one to fix.
+- **3 residual cells, all the DECLARED STRUCT inner, all loud on both sides and never a wrong
+  answer**: a module `const` (`emitProgram: ref valtype with no interned shape`), a generic
+  instantiation (`only i32, … parameters are supported`) and a list ELEMENT (`a nullable-{v:i32}
+  list element has no rep`, where the inline spelling rejects too). The `| null` render drops the
+  declared struct NAME the emitter's tables key on — #1423's original rationale, now scoped to 3
+  axes of 17. Gating the declared struct back out costs 13 oracle-parity cells including the
+  parameter-position field read, so it is filed for the emitter rather than bought here.
+- **3 cells move from a loud check reject onto the INLINE spelling's own check-clean-invalid-wasm
+  hole**: passing the narrowed value onward to a non-null parameter, for a list, a map or a closure
+  inner (`type mismatch: expected (ref $type), found (ref null $type)`). Reproduces on master with
+  NO alias in the program.
+
+### A pre-existing INLINE defect the fixtures had to be split around
+
+A nullable-MAP parameter standing beside a NARROWED nullable-struct parameter is check-clean
+invalid wasm (`type mismatch: expected (ref null $type), found (ref null $type)` — two distinct
+`$type` indices wasmtime prints identically). On master, in the alias-free spelling:
+
+```vl
+type S = {v: i32}
+type M = {[string]: i32}
+function fM(x: M | null) { if x != null { print(x["k"] ?? 0) } else { print("N") } }
+function useS(y: S) { print(y.v + 100) }
+function gS(x: S | null) { if x != null { useS(x) } else { print("N") } }
+const mv: M = Map()
+mv["k"] = 7
+fM(mv)
+fM(null)
+gS({v: 6})
+gS(null)
+```
+
+The six-section powerset over {field read, `.length`, map get, `is`, return round trip, `== null`
+early return} fails on **exactly the same 24 of its 63 subsets** for the alias spelling after this cut and for
+the INLINE spelling on master — which is what "the alias stopped being a dialect" means for a shape
+broken in both. `types/nullable-alias-opaque-inner-narrow.vl` and
+`types/nullable-alias-opaque-inner-is-and-return.vl` are split along that line.
