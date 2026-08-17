@@ -3164,6 +3164,14 @@ load they ran at:
 | ---: | ---: | --- | --- |
 | 15 | 13–21 | **1,444 → 1,415 ms (−2.0%)** | **1,484 → 1,434 ms (−3.4%)** |
 | 21 | 7–34 | 1,430 → 1,416 ms (−1.0%) | 1,500 → 1,468 ms (−2.1%) |
+| 25 | 9–18 | 1,424 → 1,382 ms (−2.9%) | 1,531 → 1,504 ms (−1.8%) |
+
+**Three runs, one direction, −1.0% to −3.4%** — and no single one of them is quotable
+alone, which is the point of running three on a box whose 1-minute load moved between 7 and
+34 while they ran. **Quote the profile's 3.09 → 0.01 points as the structural result and
+this table's spread as the timing**; the gap between "3.09 points of samples gone" and "≈2%
+of CPU" is what the fast path itself costs plus the difference between a sample share and a
+second.
 
 **The population where the row's own header lives is the frame ladder, and there the
 change is half the compile.** `fnStmtsPosOf`'s header measures itself on N functions that
