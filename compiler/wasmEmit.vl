@@ -426,6 +426,7 @@ import {
   currentStructNarrowSetOf,
   declaredKind,
   declaredNulString,
+  dropPathNarrowsAbove,
   elseLessNullableTail,
   envSlotShift,
   exprArray,
@@ -14351,8 +14352,23 @@ function emitWhileStmtStmt(body: i32[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   if emitExpr(body, s.whileCond, fnIx) < 0 { return -1 }
   fbI32Eqz() // 0x45 i32.eqz (invert: exit if condition was false)
   fbBrIf(1)  // 0x0d br_if, depth 1 = break out of block
+  // THE BODY IS A NARROWING SCOPE (the checker's `checkWhileStmtNode` narrows it): the
+  // condition is re-tested at the top of every iteration, so a `while e != null { … }`
+  // body reads `e` unboxed exactly as an `if` arm does. Pushed AFTER the condition —
+  // the condition itself re-reads the raw union each iteration — and rewound after the
+  // body so the fall-through and any enclosing scope are unaffected.
+  //
+  // Pushed after `loopHoistOpen` too, and that ORDER is load-bearing: the hoist
+  // prologue runs ONCE, before the loop's first condition test, so a receiver it
+  // classified under the narrowing would have its header read while the guard has not
+  // yet held — a trap on the null input. Leaving the hoist to see the un-narrowed
+  // nullable type is what keeps it off a guarded receiver.
+  const whSavedTop = narrowTop
+  let whNarrowed = setNarrowFromCond(s.whileCond, fnIx)
+  if whNarrowed { whNarrowed = dropPathNarrowsAbove(whSavedTop) }
   // body statements
   if emitStmts(body, s.whileBody, fnIx) < 0 { return -1 }
+  if whNarrowed { restoreNarrow(whSavedTop) }
   fbBr(0) // 0x0c br, depth 0 = continue loop
   fbEnd() // 0x0b end (loop)
   ctrlLeave()

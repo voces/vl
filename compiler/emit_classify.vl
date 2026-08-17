@@ -239,6 +239,7 @@ import {
 } from "./emit_base"
 import {
   blockAlwaysReturns,
+  blockLastStmtExits,
   exprIsIfStmt,
   firstValuedReturn,
   globalHasTypeAnn,
@@ -9066,18 +9067,69 @@ export function restoreNarrow(n: i32) {
   0
 }
 
-// After a GUARD `if` — one with NO else whose then-branch always returns — the
+// COMPACT AWAY the property-PATH entries a `setNarrowFromCond` push added above depth
+// `base`, keeping its bare-NAME entries in place. Returns whether anything above `base`
+// survives (so a caller's `restoreNarrow` stays gated the same way `narrowed` gates it).
+//
+// The one caller is the LOOP-BODY narrowing, and the reason is a layer agreement rather
+// than a preference: the checker narrows a loop body from the condition for bare names
+// ONLY (a path fact is falsifiable inside the body through any alias of the object, and
+// nothing re-points a path overlay's WRITE side at the declaration), so an emitter that
+// unboxed a narrowed `o.v` there would be reading a slot the checker still types as the
+// union. The two must push the same set or the boxed reps emit a raw box where an
+// unboxed value is expected.
+export function dropPathNarrowsAbove(base: i32) {
+  let w = base
+  let i = base
+  while i < narrowTop {
+    if !narrowKeyIsPath(narrowNames[i]) {
+      if w != i {
+        narrowNames[w] = narrowNames[i]
+        narrowVariants[w] = narrowVariants[i]
+        narrowTys[w] = narrowTys[i]
+        narrowSets[w] = narrowSets[i]
+      }
+      w = w + 1
+    }
+    i = i + 1
+  }
+  narrowTop = w
+  w > base
+}
+
+// Whether a narrowing-stack key is a property PATH (`o.v`, `n.a.b`) rather than a bare
+// name — the emit-side mirror of the checker's `isPathKey`, over the same '.'-joined
+// spelling `memberPathKeyOf` builds.
+function narrowKeyIsPath(s: string) {
+  let i = 0
+  while i < s.length {
+    if s[i] == 46 {
+      return true // '.'
+    }
+    i = i + 1
+  }
+  false
+}
+
+// After a GUARD `if` — one with NO else whose then-branch always LEAVES the path — the
 // rest of the enclosing block only runs when the guard was FALSE, so it sees
 // the same complement narrowing an explicit else-arm would (the host's flow
 // narrowing after an early return): `if x is boolean { return 0 } return x`
 // reads `x` as the unboxed `i32` below the guard. Pushes via
 // `setNarrowFromCondElse` (VALUE unions only — struct unions keep their
 // no-else-narrowing behavior); the CALLER restores the depth at block exit.
+//
+// `break`/`continue` leave the path exactly as `return` does, and inside a LOOP body they
+// are how a guard clause is spelled (`while … { if e == null { break } … e + 1 … }`). The
+// checker post-narrows all three (`checkIfStmtNode`), so both tests are asked here — a
+// `return`-only gate left the loop spelling check-clean and invalid.
 export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
   const s = P.nodes[stmtIx]
   if s is IfStmt {
     if s.ifElse < 0 {
-      if blockAlwaysReturns(s.ifThen) { setNarrowFromCondElse(s.ifCond, fnIx) }
+      if blockAlwaysReturns(s.ifThen) || blockLastStmtExits(s.ifThen) {
+        setNarrowFromCondElse(s.ifCond, fnIx)
+      }
     }
   }
   // ASSIGNMENT narrowing (A-infer-null, the host's `assignmentNarrowing`): a
