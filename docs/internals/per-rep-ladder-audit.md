@@ -76,7 +76,8 @@ counts.
 | ... open (1 ladder family, reached) | 1 + 11 (C4, all outside the target family) |
 | check-clean SILENTLY WRONG output, reached | 0 + 26 (C4) |
 | ... closed | 26 (C4) |
-| spurious LOUD reject of a valid program, reached | 7 ladders + 47 cells (C4) |
+| spurious LOUD reject of a valid program, reached | 7 ladders + 47 cells (C4) + 56 cells (C5) |
+| ... closed | 56 (C5) |
 | DANGEROUS-UNPROVEN (no reaching program found) | 5 |
 
 No silently-wrong cell was found *by this sweep*, and the reason is a blind spot
@@ -229,6 +230,68 @@ differences** — measured once per conversion, not once for the set. Four of th
 converted ladders (`tyToStrGo`, `tyEqGo`, `assignableGo`, `vbUnionMemberName`)
 have a trailing default that is now UNREACHABLE by construction and says so.
 
+## CLOSED — C5. The `$fnsig` TOKEN table, and the four ladders downstream of it
+
+The token table (`repSigTokOfKind`) is the audit's cheapest shape to reason about — a
+kind→character map — and `cloParamTok` is a MEMBERSHIP gate over it: which kinds may cross
+the value-call ABI at the PARAM position. Three nullable-REF niches had a token character
+(`nulstr` `N`, `nulstruct` `n<slot>;`, `nullist` `o`) that was wired for the RESULT position
+only, so `fnSigKeyOf`/`cloSigKeyExt` keyed "" for any lambda TAKING one and nothing was
+interned. A `.map`/`.filter` over a nullable-ELEMENT array is that shape at its most
+ordinary: the loop's `call_indirect` had no signature to name.
+
+* Reached by: `const xs: (string | null)[] = ["a", null, "b"]` ;
+  `for f in xs.map((x) => x == null) { print(f) }`.
+* Actual: `vl check` rc 0, `emitProgram: .map/.filter callback signature is not interned`
+  — LOUD, which is why this row is a capability gap rather than a soundness one. Oracles:
+  the `(i32 | null)[]` element (the value-union BOX, whose token `u` was always admitted)
+  and the plain `string[]` control.
+* NOT the box's model. The box works for a different reason than the niche needs: its
+  `null` is a member TAG inside a non-null `(ref $uBox)`, so the element is never a wasm
+  null and the unconditional `ref.as_non_null` after `array.get` is safe. Every ref/string
+  BACKING is `(array (mut (ref null $elem)))`, so a niche element genuinely IS null and that
+  recover TRAPS on it. The correct model is the INDEXED READ (`emitIndex`), which has always
+  withheld the recover for a nullable niche; the two now share one predicate,
+  `listElemStaysNullable`.
+* Four ladders, each missing the same rep in a different table: `cloParamTok`'s membership
+  gate (the root), `emitMfElem`'s recover (via `emitMapFilter`'s `srcElemRef`),
+  `mfResultKindOf`'s result kind for a niche-RETURNING callback, and `exprStringArray`'s
+  `.map`/`.filter` arm — which its i32-list sibling has and it did not, so an UN-ANNOTATED
+  `.filter` result binding took the i32 DEFAULT cell while the emitter pushed the string-list
+  wrapper. `collectMapFilterUse` (row R4) is the fifth: `mfCbResultIsStrList` now names the
+  same set `mfResultKindOf` answers `"str"` for.
+* Measured: element rep x method/callback/result-consumer shape x both runtime inputs = 17 x
+  10 x 2 = **340 cells**, each against its own expected stdout (six shapes analytic, three
+  against a for-in oracle that does not go through `.map`/`.filter`). OK 128 -> 184, loud
+  emit reject 200 -> 144, **check-clean invalid wasm 8 -> 8 (the identical cell set by
+  name), silently wrong 0 -> 0, traps 0 -> 0, 0 cells worse in any direction**. The
+  value-call ABI dual — 3 niche payloads x 6 function-value positions x 3 argument spellings
+  = 54 cells — went OK 0 -> 18, loud reject 54 -> 36, invalid wasm 0 -> 0.
+* THE GRID'S OWN BLIND SPOT, recorded because it is the lesson: the first grid consumed every
+  `.map`/`.filter` result through `.length` or a for-in over a fresh boolean/i32 list, and the
+  one shape it never built — an UN-ANNOTATED result binding of the SOURCE element rep, then
+  iterated — was the only cell the fix moved INTO check-clean invalid wasm. Widening the grid
+  by the result-CONSUMER dimension is what caught it, before the corpus did.
+* Pinned by `tests/cases/arrays/map-filter-nullable-element.vl` and
+  `tests/cases/closures/closure-value-nullable-niche-param.vl` (both LOG-mismatch pins,
+  sabotage-verified), and by the graduation of
+  `tests/cases/arrays/map-named-nulstr-callback.vl` from `@emit-error` to `@run` — which its
+  own header had predicted.
+
+Residues this row does NOT close, each with a reaching program:
+
+* the **eight nullable niches with no token character at all** — `nulreflist`, `nulmap`, and
+  the four distinct-backing scalar-list niches (`nulstrlist`/`nulf64list`/`nuli64list`/
+  `nulf32list`), plus the deliberately-excluded `nulclosure` (`C` is result-only) and `map`
+  params. 140 of the 340 cells, all LOUD (`callback signature is not interned`). Reached by
+  `const xs: (f64[] | null)[] = [[1.5], null]` ; `xs.map((r) => r == null)`. Closing them is a
+  token-table EXTENSION (encode + decode + the slot predicate), not a membership change.
+* a **`.map` whose callback returns the `nulstruct` / `nullist` niche** (`(x) => x` over
+  `(S | null)[]`): `mfResultKindOf` answers `null`, so it stays a loud reject. The blocker is
+  `mfResultSlotOf`, which has no resolver for the NULLABLE-ELEMENT ref-list slot — it would
+  hand back `S[]`'s slot, whose `rlElemNullable` bit is the opposite one. 4 of the 340 cells.
+  The `nulstr` twin has no such ambiguity (one string-list slot) and is closed above.
+
 ## OPEN — ranked
 
 ### R1. DANGEROUS, check-clean INVALID WASM — a DECLARED alias over a nullable niche is not the same arena variant as the inline spelling
@@ -301,9 +364,11 @@ and this one lacks `nulstr`, `nullist`, `nulmap`, `nulclosure`, `nulbool`,
 
 ### R4. SAFE-LOUD — `collectMapFilterUse` is a hand-copied second copy of `mfResultKindOf`
 
-`mfResultKindOf` knows 8 result kinds; this flag-forcing twin knows 5 and still
+`mfResultKindOf` knows 9 result kinds; this flag-forcing twin knows 5 and still
 asks `cloRetKindOf`, which folds `i64`/`f32` to nothing. Fallthrough forces the
-i32-list machinery (`aUsed`/`lUsed`).
+i32-list machinery (`aUsed`/`lUsed`). The STRING-list arm is the one row where the
+two no longer drift: both sides read `mfCbResultIsStrList` (C5), so the plain
+`string` and the `string | null` niche force `slUsed` together.
 
 * Reached by: `function big(n: i32): i64 { n + 1 }` … `const ys = xs.map(big)`.
 * Actual: LOUD and precise — `emitProgram: .map result is i64[] but i64 list type

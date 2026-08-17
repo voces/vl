@@ -7704,10 +7704,10 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       }
       fbArrayGet(rlBackIdx[rslot]) // 0xfb 0x0b <this slot's ref backing array>
       // A NULLABLE-NICHE element legitimately holds null, so the read STAYS `(ref null $elem)` — no
-      // `ref.as_non_null` recover (the bound `e` is the niche the caller narrows with `e != null`). The
-      // structured `rlElemNullable` bit (set at intern time, kind-discriminated) replaces the old
-      // name-based test that conflated a nullable niche with a value-union box.
-      if rlElemNullable[rslot] == 1 { return 0 }
+      // `ref.as_non_null` recover (the bound `e` is the niche the caller narrows with `e != null`).
+      // `listElemStaysNullable` is the shared answer: the `.map`/`.filter` element step asks it too,
+      // and a rep answered in only one of the two is a recover that traps in the other.
+      if listElemStaysNullable(nd.idxArr, fnIx) { return 0 }
       wU8(212) // 0xd4 ref.as_non_null (recover the non-null element)
       return 0
     }
@@ -12490,7 +12490,9 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         )
       }
       // The SOURCE wrapper/backing heap types (+ whether the element is a ref that
-      // needs `ref.as_non_null` after `array.get`).
+      // needs `ref.as_non_null` after `array.get` — a nullable-NICHE element does NOT:
+      // see `listElemStaysNullable`, which the indexed read asks for the same reason).
+      const srcElemNul = listElemStaysNullable(callee.memObj, fnIx)
       let srcWrap = lTypeIdx
       let srcBack = aTypeIdx
       let srcElemRef = false
@@ -12528,11 +12530,12 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         srcSlot = refListSlotOfExpr(callee.memObj, fnIx)
         srcWrap = rlWrapIdx[srcSlot]
         srcBack = rlBackIdx[srcSlot]
-        srcElemRef = true
+        srcElemRef = !srcElemNul
       } else if recvK == "str" {
         // A STRING list: wrapper `$mkListIdx`, backing `$mkArrIdx` (the array of string
         // refs). The element is itself a ref (an `array i32` of code points), so it needs
-        // `ref.as_non_null` after `array.get`, exactly like a ref-list element.
+        // `ref.as_non_null` after `array.get`, exactly like a ref-list element — unless the
+        // element is the `(string | null)[]` niche, which keeps the nullable read.
         if !slUsed {
           return emitFail(
             "emitProgram: .map/.filter over string[] but string list type not collected",
@@ -12540,7 +12543,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         }
         srcWrap = mkListIdx
         srcBack = mkArrIdx
-        srcElemRef = true
+        srcElemRef = !srcElemNul
       } else if !lUsed || !aUsed {
         return emitFail("emitProgram: .map/.filter but list type not collected")
       }
@@ -12758,6 +12761,28 @@ function nulRecvNeedsRecover(exprIx: i32, fnIx: i32) {
   exprNullableList(exprIx, fnIx) ||
     exprNulScalarListKind(exprIx, fnIx) != null ||
     exprNullableRefArray(exprIx, fnIx)
+}
+
+// TRUE when an ELEMENT read out of the list `exprIx` yields a rep that legitimately holds
+// `null`, so the read must STAY `(ref null $elem)`. Every ref/string backing is declared
+// `(array (mut (ref null $elem)))` (spare slots default to null), so a non-null element
+// needs `ref.as_non_null` after `array.get` — and that recover TRAPS on the one value a
+// nullable-NICHE element exists to carry. The two answers are one rule: this predicate is
+// asked by the indexed read (`emitIndex`) and by the `.map`/`.filter` element step
+// (`emitMfElem`, via `emitMapFilter`'s `srcElemRef`), which is what keeps a callback's
+// declared param valtype and the value handed to it in agreement.
+//
+// A ref list answers from the interned per-slot bit (kind-discriminated, so a nullable
+// niche is not confused with a value-union box, whose `null` is a member tag INSIDE a
+// non-null box); a `(string | null)[]` answers from the annotation (`exprNulStrArray`),
+// since every string list shares one backing slot.
+function listElemStaysNullable(exprIx: i32, fnIx: i32) {
+  if exprNulStrArray(exprIx, fnIx) { return true }
+  if exprRefArray(exprIx, fnIx) {
+    const s = refListSlotOfExpr(exprIx, fnIx)
+    if s >= 0 && s < rlElemNullable.length { return rlElemNullable[s] == 1 }
+  }
+  false
 }
 
 // Lower an array `xs.slice(start, end?)` onto `body`, leaving a NEW list wrapper of the

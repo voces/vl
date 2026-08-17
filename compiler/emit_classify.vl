@@ -473,37 +473,37 @@ function cloParamTok(paramIx: i32) {
   const k = vtKindOfParam(paramIx)
   // The slot-CARRYING kinds append their interned table slot (struct index /
   // variant index / ref-list slot), so two sigs share a `$fnsig` exactly when
-  // the param SHAPES match, not just the kind.
-  if k == "struct" || k == "variant" || k == "reflist" {
+  // the param SHAPES match, not just the kind. `nulstruct` carries the SAME
+  // struct slot as its non-null twin — `repSigTokHasSlot` names both, and
+  // `paramStructIdxOf` resolves a `S | null` annotation to S's row.
+  if k == "struct" || k == "variant" || k == "reflist" || k == "nulstruct" {
     return repSigSlotTokOfKind(k, paramStructIdxOf(paramIx))
   }
-  // Param-position ABI gate: the nullable-REF kinds (struct|null, string|null —
-  // and via the empty table entries i32[]|null, closure|null) still mis-lower as
-  // a closure-call param — left "" so the value's signature stays un-interned
-  // and the soundness floor (`emitClosureValue`) rejects it with a clear message
-  // rather than emitting invalid wasm. (`nulstr`/`nulstruct` DO carry result
-  // tokens, so the exclusion must be explicit here.)
-  if k == "nulstr" || k == "nulstruct" { return "" }
-  // A NULLABLE-closure param (`((i32) => i32) | null`, kind 19) stays OUTSIDE the value-call
-  // ABI (only nullable-closure RESULTS are wired — the closure result carries the niche).
-  // `repSigTokOfKind("nulclosure")` now yields a RESULT token (`C`), so exclude it explicitly
-  // here (like map/nulstr/nulstruct) — else a nulclosure param would key a slot-less `C` and
-  // mis-lower. The soundness floor rejects a nulclosure-param value with a clear message.
+  // A NULLABLE-closure param (`((i32) => i32) | null`) stays OUTSIDE the value-call ABI
+  // (only nullable-closure RESULTS are wired — the closure result carries the niche).
+  // `repSigTokOfKind("nulclosure")` yields a RESULT token (`C`), so exclude it explicitly
+  // here (like map) — else a nulclosure param would key a slot-less `C` and mis-lower.
+  // The soundness floor rejects a nulclosure-param value with a clear message.
   if k == "nulclosure" { return "" }
   // A MAP param stays OUTSIDE the value-call ABI (only map RESULTS are wired — the closure
-  // result carries the map shape). `repSigTokOfKind("map")` now yields a result token, so
-  // exclude it explicitly here (like `nulstr`/`nulstruct`) — else a map param would key a
-  // slot-less `m` and mis-lower. The soundness floor rejects a map-param value with a clear
-  // message.
+  // result carries the map shape). `repSigTokOfKind("map")` yields a result token, so
+  // exclude it explicitly here — else a map param would key a slot-less `m` and mis-lower.
+  // The soundness floor rejects a map-param value with a clear message.
   if k == "map" { return "" }
-  // A NULLABLE-list param (`i32[] | null`, kind 15) stays OUTSIDE the value-call ABI
-  // (only nullable-list RESULTS are wired — the closure result carries the niche).
-  // `repSigTokOfKind("nullist")` now yields a RESULT token (`o`), so exclude it
-  // explicitly here (like map/nulstr/nulstruct/nulclosure) — else a nullable-list param
-  // would key a slot-less `o` and mis-lower. The soundness floor rejects it loudly.
-  if k == "nullist" { return "" }
-  // Every slot-free kind reads the shared canonical token table (emit_rep) —
-  // "" for the kinds outside the value-call ABI (scalar lists, niches).
+  // Every slot-free kind reads the shared canonical token table (emit_rep) — "" for the
+  // kinds with no token character at all (`nulreflist`, `nulmap`, and the four
+  // distinct-backing scalar-list niches), which keeps their signature un-interned so the
+  // soundness floor (`emitClosureValue`) rejects the value loudly.
+  //
+  // The nullable-REF niches that DO have a token — `nulstr` (`N`), `nullist` (`o`), and
+  // `nulstruct` (`n<slot>;`) above — are in the ABI at the PARAM position as well as the
+  // result one. Their param valtype is exactly the `(ref null …)` the callee's own
+  // functype declares (`emitOneFuncType` and `emitSynthCloSig` both stream it through the
+  // one `fbValtype` table), so a `call_indirect` through the interned sig passes the
+  // engine's signature check and a `null` argument crosses as `ref.null` rather than as a
+  // wrong-typed scalar. A nullable ELEMENT read out of a list is the shape that needs
+  // this: `xs.map(cb)` over a `(string | null)[]` hands `cb` a `(ref null $aTypeIdx)`, so
+  // without a param token there is no `$fnsig` for the loop's `call_indirect` to name.
   repSigTokOfKind(k)
 }
 
@@ -602,6 +602,17 @@ export function cloRetIsString(fe: i32) {
     if fe < fRetKind.length { return fRetKind[fe] == "str" }
   }
   false
+}
+
+// True when the `.map` callback at `fe` produces an element that rides the STRING LIST — a
+// plain `string`, or the `string | null` niche, which share ONE wrapper/backing pair
+// (`$mkListIdx` / `$mkArrIdx`, whose element type is already `(ref null $aTypeIdx)` so a
+// spare slot defaults to null). The collect-time twin of `mfResultKindOf`'s `"str"` answer,
+// and the two must name the same set: a result the emitter picks the string wrapper for
+// while the collect flag stayed unforced is `emitProgram: .map/.filter result is string[]
+// but string list type not collected`, from a program whose ONLY string list is that result.
+export function mfCbResultIsStrList(fe: i32) {
+  cloRetIsString(fe) || cloRetValKind(fe) == "nulstr"
 }
 
 // Registry-independent f64-ness of a lifted callback's tail expression: float
@@ -19748,6 +19759,17 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
     if arrNewIntrKind(exprIx, fnIx) == 2 { return true }
     // An INDEXED closure call `fs[i](x)` whose element signature returns `string[]`.
     if cloArrCallRetKind(exprIx, fnIx) == "strlist" { return true }
+    // `xs.map(f)` / `xs.filter(p)` yield a NEW list — the string list exactly when the
+    // result ELEMENT kind is a string (map: the callback's return kind; filter: the
+    // receiver's element kind). The i32-list classifier carries the same pair of arms; a
+    // rep that has the `.slice` arm and not this one answers "not a string list" for the
+    // `.filter` RESULT of a `(string | null)[]`, whose arena kind is the nulstr-element
+    // array rather than the plain `string[]` the fast path above claims — and the cell
+    // that binds it then takes the i32 DEFAULT while `emitMapFilter` pushes the string-list
+    // wrapper (`vl check`-clean invalid wasm).
+    if callIsMapFilter(exprIx, fnIx) {
+      return mfResultKindOf(exprIx, fnIx) == "str"
+    }
     // `xs.slice(...)` over a string list yields a string list.
     if callIsArrSlice(exprIx, fnIx) {
       return mfResultKindOf(exprIx, fnIx) == "str"
@@ -22890,6 +22912,13 @@ export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
         // 2). All unions share `$uBox`, so the result element is the declared union; its box
         // body is produced by the callback's own union-boxing return path.
         if cloRetValKind(fe) == "union" { return "ref" }
+        // A NULLABLE-STRING-returning callback maps to a `(string | null)[]` result — the SAME
+        // string list (one wrapper, one backing, whose element type is already
+        // `(ref null $aTypeIdx)` so spare slots can default to null), with the nullable element
+        // DISCIPLINE on reads. `cloRetKindOf` folds the un-annotated niche into the i32 result
+        // token, so this consults `cloRetValKind` — the answer the callback's own functype BYTES
+        // are streamed from — exactly as the struct/union/i64/f32 cases above do.
+        if cloRetValKind(fe) == "nulstr" { return "str" }
         // An i64- / f32-returning callback maps to an i64- / f32-list result (mf-kinds 4 / 13).
         // `cloRetKindOf` folds these to -1 (out of the value-CALL ABI), so consult
         // `cloRetValKind` (10 = i64, 13 = f32) directly, as the struct/union cases above do.
