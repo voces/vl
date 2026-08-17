@@ -827,7 +827,7 @@ floor of −2.1%. And the **fuzz A/B is structurally inert for P5** — 800 gene
   `1e0` → 630, `2e1` → 731, `1E2` → 312, `1.5e-3` → 1.6303. A silently wrong number is a worse defect
   than a parse error. See #1330.
 | **P9** | inline small leaf functions in the **default** build | the `-O3`-gap family | **2.90x** struct-field, **1.80x** map-filter-reduce, 8–13% sort-heap | measured via `-O3` A/B | **L** |
-| **P10** | top-level `const` emits a **mutable** wasm global | global emit path | not separately measured; blocks constant-folding a loop bound | `wasm-dis` witness | **XS** |
+| ~~**P10**~~ | ~~top-level `const` emits a **mutable** wasm global~~ | global emit path | **REFUTED — it blocks nothing.** Binaryen folds the loop bound off the mutable cell; mutable and immutable inputs optimize to byte-identical modules | one-byte-differing WAT pair through `wasm-opt`, `perf-program.md §12.10.1` | **XS** |
 | **P11** | fix the two `-O3` **regressions** before the release profile is trusted | `docs/internals/opt-profile-design.md` pipeline | `mixed-width` **2.43x SLOWER**, `binsearch` **1.23x SLOWER** | measured | **S** (gate) |
 | **P12** | UTF-8 bytes in linear memory for `string` | representation | **27.7x** on the compare itself; would also fix P7b and P8 | prototyped at `.wat` level | **XL** |
 | **P13** | linear-memory backing store for scalar arrays (`i32[]`/`i64[]`/`f32[]`/`f64[]`) | representation | **3.41x** on matmul's kernel; sidesteps the Cranelift bug entirely | prototyped at `.wat` level | **XL** |
@@ -1115,9 +1115,14 @@ top level still cost 1.4–1.55x on i64/f64 accumulation; **on 08-03 the f64 hal
 floor and only the i64 half survives, at 1.16x.** `vl build -O3` was never a workaround:
 `wasm-dis` of the `-O3` module still counts all six `global.get`/`global.set` in the loop body.
 
-Related and unfixed: **top-level `const` emits a MUTABLE wasm global** (P10) —
-`(global $global$0 (mut i64) (i64.const 1000000000))` for `const n: i64 = 1_000_000_000`, so the
-trip count is re-read every iteration and nothing can constant-fold it.
+Related, and **the "nothing can constant-fold it" half is refuted**: a top-level `const` does
+emit a MUTABLE wasm global (P10) — `(global $global$0 (mut i64) (i64.const 1000000000))` for
+`const n: i64 = 1_000_000_000` — but the cell is never written, and binaryen infers
+immutability from that rather than from the declared bit. At `-O`/`-O3` it deletes the cell
+and inlines the bound; at the default rung wasmtime hoists the read. The mutable declaration
+costs nothing measurable (`perf-program.md §12.10.1`). The six `global.get`/`global.set`
+that survive `-O3` in the loop body above are a **`let`** global — genuinely written, so the
+same inference correctly refuses to fold it. That is the live half of this row.
 
 ### The `-O3` gap is an idiom-vs-hack defect too
 
@@ -1195,10 +1200,12 @@ P1 `return_call` — have SHIPPED (#1326, #1324), along with P3, P4a (#1328), P5
 3. **P9 inlining in the default build** — `-O3` proves 2.9x is sitting there on `struct-field`.
 4. **P7b the hash cache** — the string-hashing family (§4.6) is now the largest untouched block of
    compiler-fixable loss in the suite, and P7a's unroll did not dent it. Re-price before taking it.
-5. **P6/P10** — small, certain, cheap. **P6 is soundness-gated** (see above), not merely
-   unscheduled.
+5. **P6** — small and cheap, but **soundness-gated** (see above), not merely unscheduled.
+   (**P10 has left this list**: measured, it buys nothing — binaryen folds the loop bound
+   off the mutable cell, so the immutable declaration is a no-op.)
 
-**P4b (BMH for `indexOf`) is REFUTED on measurement and is not on this list.**
+**P4b (BMH for `indexOf`) and P10 (`const` → immutable global) are REFUTED on measurement
+and are not on this list.**
 
 **Where VL is already at or past native, for calibration:** `collections/struct-alloc` at **0.42x of
 Rust** (VL is 2.4x *faster* than `rustc -O` on allocation-heavy tree building — wasmtime's bump
