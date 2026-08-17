@@ -4642,6 +4642,83 @@ function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
   false
 }
 
+// THE IMPLICIT-RETURN TWIN of `retWidensAtomToStr`, and the reason the pair exists: a VL
+// function's value is its LAST STATEMENT, so `emitFuncBody` routes that statement through
+// `emitReturnExit` (a bare tail value) or `emitIfTail` (a tail `if` whose arms yield values)
+// and BOTH reach the same `emitReturnValue` widen `return e` does. The widen stashes the atom
+// id in the string-op scratch frame (`emitAtomToStr` → `setStrScrI`), so the reservation scan
+// has to ask the atom-widening question in tail position too — `blockHasStrOpScan` asks it
+// only under `RetStmt`, and a bare trailing `Ident` is not even on its statement whitelist.
+// Without this leg the tail widen writes `local.set <strScratchBase>` at an index past the
+// end of a locals vector that reserved nothing ("unknown local N: local index out of bounds"
+// from the engine, with `vl check` clean). Witness:
+// `tests/cases/literal-unions/atom-widened-at-tail.vl`.
+function fnTailWidensAtomToStr(fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const savedTop = narrowTop
+    const hit = tailBlockWidensAtomToStr(fn.fnBody, fnIx)
+    restoreNarrow(savedTop)
+    return hit
+  }
+  false
+}
+
+// Mirrors `emitStmtsTail`: every statement but the last is an ordinary statement (walked here
+// only for the post-guard narrowing the tail value is classified under, exactly as the emit
+// loop does), and the LAST one is the block's value.
+function tailBlockWidensAtomToStr(blockIx: i32, fnIx: i32) {
+  if blockIx < 0 { return false }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    const n = stmts.length
+    if n == 0 { return false }
+    let i = 0
+    while i < n - 1 {
+      pushPostGuardNarrow(stmts[i], fnIx)
+      i = i + 1
+    }
+    return tailStmtWidensAtomToStr(stmts[n - 1], fnIx)
+  }
+  false
+}
+
+// Mirrors `emitStmtTail`: a tail `if`/`else` whose arms yield values recurses into BOTH arms
+// under the same narrowing `emitIfTail` applies (an `else if` is a lone nested `IfStmt`, still
+// in tail position); any other tail VALUE statement widens exactly like a `return` of it.
+function tailStmtWidensAtomToStr(stmtIx: i32, fnIx: i32) {
+  const s = P.nodes[stmtIx]
+  if s is IfStmt {
+    if !lastStmtIsValueIf(stmtIx, fnIx) && !elseLessNullableTail(stmtIx, fnIx) {
+      return false
+    }
+    const savedTop = narrowTop
+    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    const hitThen = tailBlockWidensAtomToStr(s.ifThen, fnIx)
+    if narrowed { restoreNarrow(savedTop) }
+    if hitThen { return true }
+    if s.ifElse >= 0 {
+      const savedElseTop = narrowTop
+      const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
+      const els = P.nodes[s.ifElse]
+      let hitElse = false
+      if els is Block {
+        hitElse = tailBlockWidensAtomToStr(s.ifElse, fnIx)
+      } else {
+        hitElse = tailStmtWidensAtomToStr(s.ifElse, fnIx)
+      }
+      if narrowedElse { restoreNarrow(savedElseTop) }
+      return hitElse
+    }
+    return false
+  }
+  if !stmtIsTailValue(stmtIx, fnIx) { return false }
+  retWidensAtomToStr(stmtIx, fnIx)
+}
+
 // True if `binIx` is `==`/`!=` whose operands are strings (string value-equality).
 export function exprIsStrEq(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
@@ -5110,10 +5187,15 @@ function ifChainHasStrOp(ifIx: i32, fnIx: i32) {
 }
 
 // True if the FuncDecl at `fnIx` uses any string op (`+`/`==`/`!=`/`.slice`) — so it
-// reserves the shared string scratch frame.
+// reserves the shared string scratch frame. The statement scan covers every op reachable
+// from a STATEMENT; the tail leg covers the one position that is a return without being
+// spelled as one (the body's implicit-return value).
 export function fnHasStrOp(fnIx: i32) {
   const fn = P.nodes[fnIx]
-  if fn is FuncDecl { return blockHasStrOp(fn.fnBody, fnIx) }
+  if fn is FuncDecl {
+    if blockHasStrOp(fn.fnBody, fnIx) { return true }
+    return fnTailWidensAtomToStr(fnIx)
+  }
   false
 }
 
