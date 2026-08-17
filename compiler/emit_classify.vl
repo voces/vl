@@ -364,6 +364,7 @@ import {
   mvValTyIx,
   mvValsOutBase,
   narrowNames,
+  narrowRetired,
   narrowSets,
   narrowStripNullOnly,
   narrowTop,
@@ -3397,7 +3398,9 @@ function capNarrowRecord(fnIx: i32, ifree: string[]) {
   let i = 0
   while i < narrowTop {
     const nm = narrowNames[i]
-    if capHas(ifree, nm) {
+    // A RETIRED entry is not a declaration-site fact: the closure below the write reads
+    // its capture at the declared rep, the same as the live stack answers for it.
+    if capHas(ifree, nm) && narrowRetired[i] == 0 {
       cnFe.push(fe)
       cnName.push(nm)
       cnVariant.push(narrowVariants[i])
@@ -4415,13 +4418,35 @@ export function scalarListElemKind(exprIx: i32, fnIx: i32): VKind | null {
 // The STACK SLOT of the innermost active narrowing of `name`, or -1 when `name` is not
 // currently narrowed. The one scan every narrowing query shares, so a consumer that wants
 // both the rendered variant and its structure pays for one walk.
-function narrowSlotOf(name: string): i32 {
+// A RETIRED entry is skipped rather than answering, so a name whose narrowing a write
+// falsified reads at the DECLARED rep again — which is what the checker types it as
+// (`retireNarrowingsForWrite` puts the declared type back into the scope the narrowing
+// shadowed). Skipping rather than stopping lets an OUTER narrowing of the same name still
+// answer, exactly as the shadowing rule already does for a live inner entry.
+export function narrowSlotOf(name: string): i32 {
   let i = narrowTop - 1
   while i >= 0 {
-    if narrowNames[i] == name { return i }
+    if narrowNames[i] == name {
+      if narrowRetired[i] == 0 { return i }
+    }
     i = i - 1
   }
   -1
+}
+
+// The arena TYPE the narrowing at stack slot `i` binds — see `narrowSlotTy`. Exported for
+// the emitter's narrowed-arm consumers, which ask it of the slot `narrowSlotOf` returned.
+export function narrowSlotTyOf(i: i32): i32 { narrowSlotTy(i) }
+
+// Retire every live narrowing of `name`. Called for a write the narrowing does not admit;
+// the entry is marked in place (see `narrowRetired`).
+function retireNarrowFor(name: string) {
+  let i = 0
+  while i < narrowTop {
+    if narrowNames[i] == name { narrowRetired[i] = 1 }
+    i = i + 1
+  }
+  0
 }
 
 // The variant a union local `name` is narrowed to in the current scope (the innermost
@@ -4453,11 +4478,13 @@ function pushNarrowRep(name: string, variant: string, ty: i32, set: i32) {
     narrowVariants[narrowTop] = variant
     narrowTys[narrowTop] = ty
     narrowSets[narrowTop] = set
+    narrowRetired[narrowTop] = 0
   } else {
     narrowNames.push(name)
     narrowVariants.push(variant)
     narrowTys.push(ty)
     narrowSets.push(set)
+    narrowRetired.push(0)
   }
   narrowTop = narrowTop + 1
   narrowTop
@@ -9372,15 +9399,35 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
   // plain `=` to a bare name whose RHS is itself non-null (a `x = maybeNull()`
   // RHS, or a bare `null`, leaves `x` un-narrowed). The CALLER restores the
   // depth at block exit, so a branch-local assignment never leaks past the join.
+  //
+  // AND THE SAME STATEMENT RETIRES ONE. The narrowing is a FLOW fact, so a write the
+  // narrowing does not admit ends it — for the assignment kind AND for a guard's, since
+  // both live in one stack and one question is asked of both. `retireNarrowFor` marks in
+  // place; the write's own null-bearing-ness is the gate, which is the emit-side reading of
+  // `writeRetiresNarrowing`'s VALUE leg (a write the narrowing still admits — `x = 5` under
+  // an `i32` narrowing — keeps it, so only the null-carrying writes retire).
+  //
+  // THE TWO SIDES MUST NOT DISAGREE. The checker retires the same write
+  // (`retireNarrowingsForWrite` puts the declared type back into the scope the narrowing
+  // shadowed) and types every read after it at the DECLARED rep. Without the emit half the
+  // stack still claimed the narrowed rep: `let x: i32 | null = null` / `x = 5` / `x = null`
+  // / `f(x)` unboxed a null payload and TRAPPED on the `ref.cast`, `print(x ?? 0)` met an
+  // unboxed operand where the box arm reads the tag, and over a boxed `K | null` the
+  // sentinel read back as an atom.
   if s is BinExpr {
     if s.binOp == "=" {
       const tgt = P.nodes[s.binLeft]
       if tgt is Ident {
+        // NULL-BEARING RIGHT-HAND SIDE, off the CHECKER's banked node type rather than the
+        // registered-union member scan: the scan resolves a value union's rendered name and
+        // answers "" for every NICHE rep (`string | null`, `boolean | null`, a nullable
+        // collection), whose guard narrowings need retiring just as much. A bare `null`
+        // literal is typed `null`, not `T?`, so it keeps its own leg.
+        const rhs = P.nodes[unwrapParen(s.binRight)]
+        let rhsNullable = nodeTyIsNullable(unwrapParen(s.binRight))
+        if rhs is NullLit { rhsNullable = true }
         const un = unionNameOfIdentSid(sidOfNode(s.binLeft), fnIx)
-        if un != "" && isValueUnionName(un) && unionSetHasNull(un) {
-          const rhs = P.nodes[unwrapParen(s.binRight)]
-          let rhsNullable = false
-          if rhs is NullLit { rhsNullable = true }
+        if !rhsNullable {
           const rn = unionNameOfExpr(s.binRight, fnIx)
           if rn != "" {
             // NOT migrated: the RHS union name here is never a covered member SET
@@ -9388,11 +9435,13 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
             // programs), so it keeps the member-name scan (method note 6).
             if unionHasAtom(rn, "null") { rhsNullable = true }
           }
-          if !rhsNullable {
-            const asid = msSetOfText(un)
-            if pushNarrowComplement(tgt.identName, asid, "null") == "" {
-              pushNarrow(tgt.identName, removeAtomFromSet(un, "null"))
-            }
+        }
+        if rhsNullable {
+          retireNarrowFor(tgt.identName)
+        } else if un != "" && isValueUnionName(un) && unionSetHasNull(un) {
+          const asid = msSetOfText(un)
+          if pushNarrowComplement(tgt.identName, asid, "null") == "" {
+            pushNarrow(tgt.identName, removeAtomFromSet(un, "null"))
           }
         }
       }
@@ -18302,6 +18351,48 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
 // narrowed / narrowed to a sub-union (a pipe-joined set classifies as no atom) /
 // narrowed to `null` / narrowed to a struct variant. A non-"" answer means an
 // ident READ unboxes to that atom's rep.
+// DOES THE NARROWING IN FORCE HERE PROVE `name` IS NOT NULL? The one home for that
+// question, and the reason it has to exist: `emitIdentNode` reads a narrowed binding at the
+// ARM's rep (unboxed scalar / list wrapper / map struct), while the two null-shaped
+// constructs over the same name — the `??` lowering and the null TEST — were written for the
+// DECLARED nullable rep and re-derived nothing about the narrowing. `if x != null { print(x
+// ?? 0) }` put an unboxed i32 where the box arm reads the tag (`vl check`-clean INVALID
+// WASM), and `x = 5` then `if x != null` emitted a bare `null` against a non-nullable
+// operand (`bare null needs a struct-typed context`). Both are answered by "the null side is
+// DEAD here", which is one predicate, not two lowerings.
+//
+// DECIDED ON THE ARENA TYPE THE PUSH BANKED, never on the rendered variant. The spelling
+// cannot carry the answer: a transparent alias of a nullable union (`type MI = i32 | null`,
+// `x is MI`) renders `MI`, which contains no `null` member to find, and reading the answer
+// off that text would claim non-null for a narrowing that admits it. `narrowSlotTy` is the
+// same structure column every other narrowed-arm consumer reads, so this predicate and the
+// unboxing reads cannot disagree about what the arm is.
+//
+// A narrowing whose slot banks NO single type (a 2+-member surviving set, a set the pool does
+// not cover) answers false and keeps master's lowering: the question is only useful where the
+// arm is one type, and a wrong `true` here is a semantic change rather than a rep mismatch.
+export function narrowExcludesNull(name: string): boolean {
+  const i = narrowSlotOf(name)
+  if i < 0 { return false }
+  const v = narrowVariants[i]
+  if v == "" { return false }
+  if v == "null" { return false }
+  const ty = narrowSlotTy(i)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return false }
+  !tyIsNullPrim(ty)
+}
+
+// True when arena type `ty` IS the `null` type itself (as against a nullable of something).
+// `narrowExcludesNull`'s second half: a `== null` / `is null` push banks the null type, and a
+// narrowing TO null excludes nothing.
+function tyIsNullPrim(ty: i32): boolean {
+  const t = T.tys[ty]
+  if t is TyPrim { return t.primName == "null" }
+  false
+}
+
 export function narrowedValueAtomOf(name: string) {
   const i = narrowSlotOf(name)
   if i < 0 { return "" }
