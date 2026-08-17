@@ -2959,10 +2959,15 @@ function callArgPlaces(cn: Call) {
   out
 }
 
-// The `FuncDecl` arena index a call resolves to STATICALLY, or -1 for a callee this
-// analysis must treat as opaque. `-2` marks a callee that cannot write an object
-// field at all — a builtin (`print`, a string/array/map method), which is neither a
-// declared function nor a function-typed binding in scope.
+// The callee classification behind every invalidation decision:
+//   >= 0  the `FuncDecl` the call resolves to STATICALLY (a UFCS receiver occupies
+//         parameter 0), so its write effects can be summarised.
+//   -1    OPAQUE — a function VALUE, a struct field holding one, or a receiver whose
+//         type did not resolve. The target is not statically one body, so assume it
+//         writes anything reachable.
+//   -2    an INTRINSIC — `print`, or a string/array/map/set method. It writes no
+//         field of an object handed to it, and saying so is what keeps a read-only
+//         callee from invalidating its caller's narrowings.
 function callDeclFnIx(cn: Call) {
   const cf = P.nodes[cn.callFn]
   if cf is Ident {
@@ -2974,9 +2979,151 @@ function callDeclFnIx(cn: Call) {
   if cf is Member {
     const d = lookupFnDeclNode(cf.memProp)
     if d >= 0 { return d }
-    return -1 // a struct field holding a function, or a builtin method
+    return memberCalleeKind(cf)
   }
   -1
+}
+
+// A non-UFCS member callee: a STRUCT FIELD holding a function is opaque (the value it
+// holds is not statically one body), anything else is a collection/string method.
+function memberCalleeKind(cf: Member) {
+  const rt = nodeTyOf(cf.memObj)
+  if rt < 0 { return -1 } // receiver type unresolved → fail closed
+  const t = T.tys[rt]
+  if t is TyObj {
+    if objFieldType(t, cf.memProp) >= 0 { return -1 }
+  }
+  -2
+}
+
+// The type recorded for a node by the check that already visited it, or -1.
+function nodeTyOf(ix: i32) {
+  if ix < 0 || ix >= nodeTyIx.length { return -1 }
+  nodeTyIx[ix]
+}
+
+// The names a function BINDS: its parameters, every `let`/`const` in its body at any
+// depth, both `for` variables, and every nested function's parameters and name. A
+// write rooted at one of these is local business; a write rooted at anything else is
+// a write through a FREE variable, which is the caller's binding.
+function fnBoundNames(fnIx: i32, out: string[]) {
+  const n = P.nodes[fnIx]
+  if n is FuncDecl {
+    let i = 0
+    while i < n.fnParams.length {
+      const p = P.nodes[n.fnParams[i]]
+      if p is Param { out.push(p.parName) }
+      i = i + 1
+    }
+  }
+  if n is LetDecl { out.push(n.letName) }
+  if n is ForRange { out.push(n.frVar) }
+  if n is ForIn { out.push(n.fiVar) }
+  const kids = nodeChildren(fnIx)
+  let k = 0
+  while k < kids.length {
+    if kids[k] >= 0 { fnBoundNames(kids[k], out) }
+    k = k + 1
+  }
+  0
+}
+
+function nameIn(names: string[], name: string) {
+  let i = 0
+  while i < names.length {
+    if names[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The FULL place keys a function writes through a FREE variable — a captured local or
+// a module-level binding — `,`-terminated, or `"*"` for opaque.
+//
+// WHY THIS CHANNEL EXISTS: the parameter channel is keyed on ARGUMENTS, so a callee
+// that takes none cannot be seen through it. `function zap() { o.v = null }` called
+// inside `if o.v != null { … }` is exactly as falsifying as `clr(o)` and was exactly
+// as invisible. A capturing nested function and a capturing closure are the two
+// mutation routes that reach a field with no argument at all.
+function fnWriteFreePaths(fnIx: i32) {
+  const key = i32ToStr(fnIx) + "#free"
+  let ci = 0
+  while ci < weKeys.length {
+    if weKeys[ci] == key { return weVals[ci] }
+    ci = ci + 1
+  }
+  let oi = 0
+  while oi < weOpen.length {
+    if weOpen[oi] == key { return "*" } // recursive cycle → fail closed
+    oi = oi + 1
+  }
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    const bound: string[] = []
+    fnBoundNames(fnIx, bound)
+    weOpen.push(key)
+    const acc = weScanFree(fd.fnBody, bound)
+    weOpen.pop()
+    weKeys.push(key)
+    weVals.push(acc)
+    return acc
+  }
+  "*"
+}
+
+// Accumulate the free-variable place keys a subtree writes, composing a nested known
+// callee's own free writes. An opaque nested callee makes the whole answer opaque.
+function weScanFree(ix: i32, bound: string[]) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  let acc = ""
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const k = placeKeyOf(n.binLeft)
+      if k != "" && isPathKey(k) {
+        if !nameIn(bound, placeRootOf(k)) { acc = acc + k + "," }
+      }
+    }
+  } else if n is Call {
+    const inner = callFreeEffects(ix)
+    if inner == "*" { return "*" }
+    acc = acc + inner
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    const sub = weScanFree(kids[i], bound)
+    if sub == "*" { return "*" }
+    acc = acc + sub
+    i = i + 1
+  }
+  acc
+}
+
+// The free-variable writes a nested CALL contributes. An intrinsic contributes none;
+// an opaque callee makes the answer opaque.
+function callFreeEffects(callIx: i32) {
+  const cn = P.nodes[callIx]
+  if cn is Call {
+    const d = callDeclFnIx(cn)
+    if d == -2 { return "" }
+    if d < 0 { return "*" }
+    return fnWriteFreePaths(d)
+  }
+  ""
+}
+
+// The ROOT name of a place key (`"o.a.v"` → `"o"`).
+function placeRootOf(key: string) {
+  let i = 0
+  while i < key.length {
+    if key[i] == '.' {
+      const head = key.slice(0, i)
+      return head
+    }
+    i = i + 1
+  }
+  key
 }
 
 // THE ONE PLACE that decides whether the call at `callIx` invalidates the path
@@ -3005,7 +3152,20 @@ function callInvalidatesNarrowedPath(callIx: i32, key: string) {
 
 function callInvalidatesReal(cn: Call, key: string) {
   const declIx = callDeclFnIx(cn)
-  if declIx == -2 { return false } // an intrinsic writes no object field
+  // An intrinsic writes no object field. The BROAD rule as filed does not make that
+  // distinction — "any call that receives the object" includes `print(o)` — so the
+  // switch bypasses this too, and the two measurements compare the filed rules
+  // rather than a hybrid.
+  if declIx == -2 && !ALIAS_RULE_BROAD { return false }
+  // AN OPAQUE CALLEE INVALIDATES EVERY LIVE NARROWING, not only the ones rooted at
+  // its arguments. A closure that captured the object takes NO argument, so an
+  // argument-keyed fallback would fail open on exactly the construct that has no
+  // statically known body.
+  if declIx < 0 { return true }
+  // Writes through a FREE variable, which likewise need no argument.
+  const free = fnWriteFreePaths(declIx)
+  if free == "*" { return true }
+  if pathHitsAny(key, free, "") { return true }
   const args = callArgPlaces(cn)
   let i = 0
   while i < args.length {
@@ -3014,20 +3174,28 @@ function callInvalidatesReal(cn: Call, key: string) {
       if key == ak { return true }
       const pfx = ak + "."
       if keyHasPrefix(key, pfx) {
-        if declIx < 0 || ALIAS_RULE_BROAD { return true }
+        if ALIAS_RULE_BROAD { return true }
         const sum = fnWriteEffects(declIx, i)
         if sum == "*" { return true }
         const rest = key.slice(pfx.length, key.length)
-        const parts = weSplit(sum)
-        let j = 0
-        while j < parts.length {
-          const w = parts[j]
-          if rest == w || keyHasPrefix(rest, w + ".") { return true }
-          j = j + 1
-        }
+        if pathHitsAny(rest, sum, "") { return true }
       }
     }
     i = i + 1
+  }
+  false
+}
+
+// Whether any written sub-path in the `,`-terminated summary `sum` (each optionally
+// carried under `under`) is `path` itself or a PREFIX of it. Writing `o.a` replaces
+// the sub-object, so it kills `o.a.v` as surely as writing `o.a.v` does.
+function pathHitsAny(path: string, sum: string, under: string) {
+  const parts = weSplit(sum)
+  let j = 0
+  while j < parts.length {
+    const w = under + parts[j]
+    if path == w || keyHasPrefix(path, w + ".") { return true }
+    j = j + 1
   }
   false
 }
