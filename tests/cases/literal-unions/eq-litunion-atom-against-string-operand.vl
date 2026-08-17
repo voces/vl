@@ -1,0 +1,182 @@
+// @run
+// The two annotations the lint oracle calls redundant are kept deliberately: `bv: string`
+// states that this operand is a PLAIN string and not a litunion (which is the whole rep
+// pairing under test), and `rec: Rec` is what gives the member-read operand a `K`-typed field.
+// @hint redundant type annotation: `rec` is inferred as `{f: "a" | "b"}` — remove it to lean on inference
+// @hint redundant type annotation: `bv` is inferred as `string` — remove it to lean on inference
+// CONTRACT: `==` / `!=` between a litunion ATOM and an operand of a DIFFERENT rep compares
+// the two values, at a matching value and at a non-matching one. Three rep pairings:
+//
+//   atom  vs plain `string`   — the atom WIDENS to its member string and the compare is
+//                              string value-equality (`emitStrValue` → `emitStrEq`).
+//   atom  vs a union BOX      — the box's tag selects its string arm and the payload
+//                              compares the widened atom (`emitUnionConcreteEq`).
+//   atom  vs atom / a member  — unchanged: both sides are interned ids, `i32.eq`.
+//
+// THE MIXED PAIR WAS FORCED INTO ATOM CONTEXT AND PUSHED A `(ref $array)` UNDER AN `i32.eq`:
+// `expected i32, found (ref $type)`, `vl check` rc 0. `eqAtomOperandOk` now requires BOTH
+// operands to be atom-lowerable, and the direction the mixed pair takes instead is not a
+// preference — narrowing the STRING side is unsound. `emitStrToAtom`'s tower makes the last
+// member the unconditional default because membership is checker-guaranteed for a litunion
+// value, which is exactly what a plain `string` does not carry, so a non-member `"z"` would
+// narrow to the last member's id and compare EQUAL to it. Widening is total in its direction,
+// so that is the one that runs. Every cell below therefore has BOTH a matching and a
+// non-matching input, and the non-matching one is an out-of-set string wherever the receiver
+// type admits one.
+//
+// The oracle is the `is` spelling of the same question over the same receiver, at the bottom.
+
+type K = "a" | "b"
+type K1 = "a"
+const kk: K = "a"
+const k1: K1 = "a"
+type Rec = { f: K }
+const rec: Rec = { f: kk }
+function mk() {
+  return kk
+}
+
+// ── a plain `string` receiver against every atom-valued operand shape ───────────
+// @log s-const:Y
+// @log s-const:N
+function sConst(u: string) {
+  if u == kk { return "s-const:Y" }
+  return "s-const:N"
+}
+print(sConst("a"))
+print(sConst("z"))
+
+// @log s-call:Y
+// @log s-call:N
+function sCall(u: string) {
+  if u == mk() { return "s-call:Y" }
+  return "s-call:N"
+}
+print(sCall("a"))
+print(sCall("z"))
+
+// @log s-field:Y
+// @log s-field:N
+function sField(u: string) {
+  if u == rec.f { return "s-field:Y" }
+  return "s-field:N"
+}
+print(sField("a"))
+print(sField("z"))
+
+// `!=`, which negates the same compare — the inverted direction has to answer the
+// inverted way, not merely compile.
+// @log s-ne:Y
+// @log s-ne:N
+function sNe(u: string) {
+  if u != kk { return "s-ne:N" }
+  return "s-ne:Y"
+}
+print(sNe("a"))
+print(sNe("z"))
+
+// The ATOM on the LEFT — equality is symmetric and so is the operand test.
+// @log s-swap:Y
+// @log s-swap:N
+function sSwap(u: string) {
+  if kk == u { return "s-swap:Y" }
+  return "s-swap:N"
+}
+print(sSwap("a"))
+print(sSwap("z"))
+
+// ── an UN-ANNOTATED receiver, and a GENERIC one: the rep is the instance's ──────
+// @log h:Y
+// @log h:N
+function hEq(u) {
+  if u == kk { return "h:Y" }
+  return "h:N"
+}
+print(hEq("a"))
+print(hEq("z"))
+
+// @log g:Y
+// @log g:N
+function gEq<T>(u: T) {
+  if u == kk { return "g:Y" }
+  return "g:N"
+}
+print(gEq("a"))
+print(gEq("z"))
+
+// ── a litunion-typed receiver against a plain `string` operand: the mirror pair ─
+// @log lit-bv:Y
+// @log lit-bv:N
+const bv: string = "a"
+function litBv(u: K) {
+  if u == bv { return "lit-bv:Y" }
+  return "lit-bv:N"
+}
+print(litBv("a"))
+print(litBv("b"))
+
+// ── a union BOX receiver: the tag-gated payload compare, against an atom operand
+// and against a bare member literal ─────────────────────────────────────────────
+// @log box-const:Y
+// @log box-const:N
+function boxConst(u: K | i32) {
+  if u == kk { return "box-const:Y" }
+  return "box-const:N"
+}
+print(boxConst("a"))
+print(boxConst(7))
+
+// @log box-lit:Y
+// @log box-lit:N
+function boxLit(u: K | i32) {
+  if u == "a" { return "box-lit:Y" }
+  return "box-lit:N"
+}
+print(boxLit("a"))
+print(boxLit(7))
+
+// The box holding the OTHER member: the tag matches and the payload must not.
+// @log box-const:N
+print(boxConst("b"))
+
+// A box compared to an atom of a ONE-member alias, where the widen's `select` tower is
+// its degenerate single-arm form.
+// @log box-one:Y
+// @log box-one:N
+function boxOne(u: K1 | i32) {
+  if u == k1 { return "box-one:Y" }
+  return "box-one:N"
+}
+print(boxOne("a"))
+print(boxOne(7))
+
+// ── CONTROLS THAT MUST NOT MOVE ────────────────────────────────────────────────
+// The atom-vs-atom and atom-vs-member-literal compares, still the `i32.eq`.
+// @log aa:Y
+// @log aa:N
+const kb: K = "b"
+function atomAtom(u: K) {
+  if u == kk { return "aa:Y" }
+  return "aa:N"
+}
+print(atomAtom(kk))
+print(atomAtom(kb))
+
+// @log al:Y
+// @log al:N
+function atomLit(u: K) {
+  if u == "a" { return "al:Y" }
+  return "al:N"
+}
+print(atomLit(kk))
+print(atomLit(kb))
+
+// The `is` ORACLE for the string-receiver row: the same question, the same answers.
+// @log o-is:Y
+// @log o-is:N
+function oIs(u: string) {
+  if u is K1 { return "o-is:Y" }
+  return "o-is:N"
+}
+print(oIs("a"))
+print(oIs("z"))
