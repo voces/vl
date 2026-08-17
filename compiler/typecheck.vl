@@ -11092,6 +11092,148 @@ function isEquatable(ty: i32, seen: i32[]) {
   false
 }
 
+// ── `==`/`!=` LOWERABILITY: the ONE home for "can these operands be compared, and how" ──
+// `isEquatable` one function up answers a DIFFERENT question — "are this object/array's
+// COMPONENTS value-comparable" — and it is a soundness rule about fields. This answers the
+// question about the OPERAND'S OWN REP: which compare core, if any, exists for it. Both the
+// checker's acceptance (`checkBin`'s equality arm) and the emitter's dispatch
+// (`nodeEqCmpKind` → `emitNulNicheEq` / `emitEqNonNullCore`, plus the `emitFail` backstop)
+// read THIS function, so "the checker accepted it" and "the emitter can lower it" are one
+// sentence rather than two guesses.
+//
+// THEY WERE TWO GUESSES, AND THAT IS THE DEFECT THIS CLOSES. The equatability gate above runs
+// only when the LEFT operand is a `TyObj`/`TyArray`, so a `TyNullable` operand never reached
+// any gate at all; the emitter's `==` ladder then classified the niche by its NON-NULL rep
+// (`listOpKindOfBin` claims `i32[] | null` as an i32 list, `exprIsStrEq` claims
+// `string | null`, `exprIsClosure` claims a nullable closure) and lowered the bare compare —
+// `vl check`-clean INVALID WASM for the list/closure niches (a `(ref null $l)` into the
+// compare frame's `(ref $l)` slot) and a `vl check`-clean runtime TRAP for the string/struct
+// niches (the recovered read / the field `struct.get` on a genuine null).
+//
+// The token names the LOWERING, not the type:
+//   ""           OPAQUE — this operand's rep does not decide the compare: a type variable,
+//                the error hole, a literal or literal-union (whose interned-atom machinery
+//                owns its own dispatch), a value-union BOX, and every BOX- or SENTINEL-repped
+//                nullable (`boolean | null` rides the i32 sentinel 2, `i32 | null` and
+//                `K | null` ride the box's null tag). Those already answer `null == null`
+//                true and `null == v` false. The existing dispatch keeps them; the checker
+//                accepts.
+//   "none"       NO LOWERING EXISTS — the checker rejects (`unsupported-lowering`) and the
+//                emitter carries the same answer as an `emitFail` backstop.
+//   "scalar" · "str" · "list" · "strlist" · "reflist" · "struct" · "closure"
+//                a NON-NULL rep the emitter has a compare core for.
+//   "nulstr" · "nullist" · "nulstrlist" · "nulreflist" · "nulstruct" · "nulclosure"
+//                a nullable REF NICHE — the same core, under the null guard
+//                (`emitNulNicheEq`). These are exactly the six niches whose NON-NULL core
+//                exists. The other five nullable niches answer "none" because their
+//                non-null `==` has no core either: `nulmap`, and the four distinct-backing
+//                scalar lists (`nulf64list`/`nuli64list`/`nulf32list` — `f64[] == f64[]` is
+//                itself check-clean invalid wasm today — and the ref-list shapes deeper than
+//                `i32[][]`).
+export function eqCmpKindOfTy(ty: i32): string {
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    if t.primName == "string" { return "str" }
+    // `void` / `null` / `never` never reach a value compare — a null test decides first.
+    return "scalar"
+  }
+  if t is TyErr { return "" }
+  if t is TyVar { return "" }
+  if t is TyNeg { return "" }
+  if t is TyLit { return "" }
+  if t is TyFunc { return "closure" }
+  if t is TyObj { return "struct" }
+  if t is TyMap { return "none" }
+  if t is TyArray { return eqCmpKindOfArrayElem(t.aElem) }
+  if t is TyNullable { return eqCmpKindOfNulInner(t.nInner) }
+  if t is TyUnion {
+    // A DECLARED nullable alias (`type L = i32[] | null`) resolves through the `UnionDecl`
+    // route and lands here as `TyUnion[i32[], null]` while the INLINE spelling of the same
+    // type is a `TyNullable` — the same rep, two arena shapes. Both must reach the niche
+    // answer or the alias spelling keeps the invalid wasm the inline one loses.
+    const uInner = unionSoleNonNullMember(ty)
+    if uInner >= 0 { return eqCmpKindOfNulInner(uInner) }
+    return ""
+  }
+  ""
+}
+
+// The single non-null MEMBER of a two-member `X | null` union, or -1 when `ty` is not that
+// shape (a wider value union, or one with no `null` member).
+function unionSoleNonNullMember(ty: i32) {
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length != 2 { return -1 }
+    if isNullTy(t.uMembers[0]) { return t.uMembers[1] }
+    if isNullTy(t.uMembers[1]) { return t.uMembers[0] }
+  }
+  -1
+}
+
+// The `==` token for an ARRAY whose element type is `elem`. The emitter has exactly three
+// list-compare cores — `emitListEqICore` (i32/boolean backing), `emitListEqSCore` (string
+// elements) and `emitListEqRCore` (a ref list of i32/boolean lists) — so this is a CLOSED
+// list and every other element rep is "none". A HOLE element (`-1`, an un-pinned `[]`) takes
+// the i32 core, which is what `exprArray` classifies an empty literal as.
+function eqCmpKindOfArrayElem(elem: i32): string {
+  if elem < 0 { return "list" }
+  const e = T.tys[elem]
+  if e is TyVar { return "" }
+  if e is TyErr { return "" }
+  if e is TyPrim {
+    if e.primName == "i32" { return "list" }
+    if e.primName == "boolean" { return "list" }
+    if e.primName == "string" { return "strlist" }
+    return "none"
+  }
+  if e is TyArray {
+    const ie = e.aElem
+    if ie < 0 { return "reflist" }
+    const i2 = T.tys[ie]
+    if i2 is TyPrim {
+      if i2.primName == "i32" { return "reflist" }
+      if i2.primName == "boolean" { return "reflist" }
+    }
+    return "none"
+  }
+  "none"
+}
+
+// The `==` token for a nullable `inner | null`. The BOX- and SENTINEL-repped nullables answer
+// "" (they compare tag-first and are already correct on every runtime input); every remaining
+// nullable is a `(ref null …)` niche, which needs the null guard and can only have one when
+// its non-null rep has a core.
+function eqCmpKindOfNulInner(inner: i32): string {
+  if inner < 0 { return "" }
+  const it = T.tys[inner]
+  if it is TyPrim {
+    if it.primName == "string" { return "nulstr" }
+    return ""
+  }
+  if it is TyLit { return "" }
+  if it is TyUnion { return "" }
+  if it is TyErr { return "" }
+  if it is TyVar { return "" }
+  if it is TyNeg { return "" }
+  if it is TyNullable { return eqCmpKindOfNulInner(it.nInner) }
+  if it is TyFunc { return "nulclosure" }
+  if it is TyObj { return "nulstruct" }
+  if it is TyMap { return "none" }
+  if it is TyArray {
+    const ak = eqCmpKindOfArrayElem(it.aElem)
+    if ak == "list" { return "nullist" }
+    if ak == "strlist" { return "nulstrlist" }
+    if ak == "reflist" { return "nulreflist" }
+    return ak
+  }
+  ""
+}
+
+// The `==` lowering token for the value AST node `ix` reads — `eqCmpKindOfTy` of the type the
+// checker banked for it. The emitter's whole view of the comparability question.
+export function nodeEqCmpKind(ix: i32): string { eqCmpKindOfTy(nodeTyIxOf(ix)) }
+
 // ── structural assignability: is `src` assignable to `dst`? ──────────────────
 // Both are type-arena indices. The error type is assignable in both directions
 // (so one failure doesn't cascade). Primitives match by name. An object is
@@ -22101,6 +22243,23 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
             ix,
           )
         }
+      }
+    }
+    // THE EMITTER-CAPABILITY GATE, off the ONE comparability home (`eqCmpKindOfTy`). A rep
+    // with no compare core must not pass `vl check`: every one of them was check-clean
+    // INVALID WASM, because the emitter's `==` ladder has no arm for it and falls through to
+    // the i32 tail, which emits `i32.eq` over two refs. A null TEST is exempt — it is not a
+    // value compare and `emitNulIsNullTest` owns it for every rep.
+    if !isNullTy(lt) && !isNullTy(rt) {
+      const eqLk = eqCmpKindOfTy(lt)
+      const eqRk = eqCmpKindOfTy(rt)
+      if eqLk == "none" || eqRk == "none" {
+        let eqBad = lt
+        if eqLk != "none" { eqBad = rt }
+        tErrUnsupported(
+          "`" + op + "` over " + tyToStr(eqBad) + " has no lowering",
+          ix,
+        )
       }
     }
     return TY_BOOL

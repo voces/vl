@@ -12,6 +12,7 @@ import {
   nodeArrayElemIsNulBool,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
+  nodeEqCmpKind,
   nodeLitMembersWithin,
   nodeLitUnionMemberTexts,
   nodeNulLitUnionMemberTexts,
@@ -429,6 +430,7 @@ import {
   declaredNulString,
   elseLessNullableTail,
   envSlotShift,
+  eqCoreKindOfBin,
   exprArray,
   exprF32Array,
   exprF64Array,
@@ -8083,8 +8085,10 @@ function emitStrEq(body: i32[], binIx: i32, fnIx: i32) {
     // `eqAtomOperandOk`). The widen stages the id in the string-op scratch frame, which this
     // compare's own `exprIsStrEq` already reserves through `exprHasStrOp`.
     if emitStrValue(body, e.binLeft, fnIx) < 0 { return -1 }
+    if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
     if emitStrValue(body, e.binRight, fnIx) < 0 { return -1 }
-    if emitStrEqCore(body) < 0 { return -1 }
+    if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
+    if emitEqNonNullCore(body, binIx, fnIx) < 0 { return -1 }
     if isNe {
       fbI32Eqz() // 0x45 i32.eqz  (`!=` negates value-equality)
     }
@@ -8486,6 +8490,245 @@ function emitCloEqCore(_body: i32[]) {
   wU8(211)                         // 0xd3 ref.eq (null == null → 1)
   fbI32Bin(113)                    // 0x71 i32.and
   0
+}
+
+// THE ONE CORE-SELECTION LADDER for a `==`/`!=` whose two operands are ALREADY ON THE STACK as
+// NON-NULL refs. Leaves the 0/1 EQUALITY answer — never the negation; `!=` belongs to the
+// caller, which is what lets the null-guarded wrapper negate exactly once.
+//
+// Read by the plain compare paths AND by `emitNulNicheEq`, so a rep the plain compare can
+// handle is a rep the nullable form can handle BY CONSTRUCTION. Two ladders is how the nullable
+// half of a rep drifts out of the non-null half's capability, which is the shape of the defect
+// this closes.
+function emitEqNonNullCore(body: i32[], binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const coreK = eqCoreKindOfBin(binIx, fnIx)
+    if coreK == 0 { return emitListEqICore(body) }
+    if coreK == 3 { return emitListEqSCore(body) }
+    if coreK == 4 {
+      let lslot = refListSlotOfExpr(e.binLeft, fnIx)
+      if lslot < 0 { lslot = refListSlotOfExpr(e.binRight, fnIx) }
+      const lbase = leqRBaseOfSlot(lslot)
+      if lbase < 0 {
+        return emitFail("emitProgram: ref-list compare frame not reserved")
+      }
+      return emitListEqRCore(body, lslot, lbase)
+    }
+    if coreK == 5 { return emitStrEqCore(body) }
+    if coreK == 6 { return emitCloEqCore(body) }
+    return emitFail(
+      "emitProgram: `" +
+        e.binOp +
+        "` over this operand rep has no compare core",
+    )
+  }
+  emitFail("emitProgram: expected a `==`/`!=` for the compare core")
+}
+
+// One RAW read of a nullable-niche `==` operand — never `ref.as_non_null`, because the guard
+// around it exists precisely to SEE the null this rep can hold (a kind-16 `string | null` ident
+// otherwise recovers itself and traps on the very value the guard answers for). A literal-union
+// ATOM operand still widens to its member string first (`emitStrValue`), the same boundary
+// `emitStrEq` applies for `s == k`.
+function emitEqOperandRaw(body: i32[], ix: i32, fnIx: i32) {
+  if exprIsLitAtom(ix, fnIx) { return emitStrValue(body, ix, fnIx) }
+  const rawCtx = expCtxHere()
+  rawCtx.rawNullRead = true
+  emitExprExpect(body, ix, fnIx, rawCtx)
+}
+
+// A NARROWED nullable-niche operand's CELL still holds a `(ref null …)`, and every compare
+// core's frame slot demands the non-null ref — so a PLAIN (unguarded) compare recovers its
+// operands exactly as `for`-in, `.slice` and the member ops do. The checker proved the read
+// guarded (that is what narrowed it), so the cast can never trap.
+//
+// The collection family answers through its own one home (`nulRecvNeedsRecover`, the READ dual
+// of `emitNulIsNullTest`'s niche disjunction); a nullable CLOSURE keeps its cell the same way.
+// A `string | null` read RECOVERS ITSELF — suppressing that is exactly what `rawNullRead` is
+// for — and a nullable STRUCT reaches its fields through `emitChainRead`, which recovers too.
+//
+// GENUINELY-nullable operands never arrive here: `binEqNulNiche` claims them off the checker's
+// banked type and the guard reads them raw. Only the narrowed spelling reaches this.
+function emitEqRecoverNarrowed(exprIx: i32, fnIx: i32) {
+  if nulRecvNeedsRecover(exprIx, fnIx) || exprNulClosure(exprIx, fnIx) {
+    fbRefAsNonNull() // 0xd4 ref.as_non_null
+  }
+  0
+}
+
+// "Is this `==` operand null" — the shared ladder's answer for a nullable operand, a constant 0
+// for a non-nullable one (the MIXED pairing `S | null == S`). Never a hand-rolled
+// `ref.is_null`: `emitNulIsNullTest` is the one home for the null test of every rep and its
+// header carries why.
+function emitEqIsNull(body: i32[], ix: i32, fnIx: i32) {
+  const claimed = emitNulIsNullTest(body, ix, fnIx, false, false)
+  if claimed < 0 { return -1 }
+  if claimed > 0 { return 0 }
+  fbI32Const(0)
+  0
+}
+
+// A `==`/`!=` where at least one operand is a nullable REF NICHE, lowered as the rep's OWN
+// compare under a NULL GUARD. Leaves the 0/1 EQUALITY answer (the caller negates for `!=`).
+//
+// SEMANTICS — `null == null` is TRUE, `null == v` is FALSE. That is not a free choice: every
+// nullable rep in the language that already compares correctly answers exactly this. The
+// value-union box (`i32 | null`, `f64 | null`), the `boolean | null` i32 sentinel and the
+// `K | null` atom sentinel all compare the null tag/sentinel first, and `emitCloEqCore`'s
+// `ref.eq` over two null envs is 1 for the same reason. The non-null half is the rep's existing
+// core, UNCHANGED — so `[1,2] == [1,2]` over two separately built lists stays TRUE (list `==`
+// is deep/structural, not `ref.eq`) and two function values stay compared by identity.
+//
+// ONE EVALUATION PER OPERAND, AND THAT IS WHAT DECIDES THE BLOCK SHAPE. `br_on_null` consumes
+// the ref it tested, so a test-then-re-read guard would double-CALL a call-result operand — and
+// a call result is squarely in this class (`f() == g()` over an `i32[] | null` return). The
+// right operand's read is EMITTED twice, once per left-nullness path, and exactly one of the two
+// ever executes.
+//
+//     block $out (result i32)
+//       block $onenull                  ;; void
+//         block $lnull                  ;; void
+//           <L raw>  br_on_null $lnull
+//           <R raw>  br_on_null $onenull   ;; discards L on the way out — see below
+//           <the rep's non-null core>  br $out
+//         end                           ;; L was null
+//         <R raw>  ref.is_null  br $out ;; both null ⇒ equal
+//       end                             ;; exactly one side null
+//       i32.const 0
+//     end
+//
+// BOTH REFS LIVE IN THE SAME CONTROL FRAME ($lnull), and that is not stylistic: an instruction
+// may not consume an operand pushed BELOW its own frame's entry height, so a core nested one
+// block deeper than the left operand's push cannot reach it ("expected (ref $type) but nothing
+// on stack"). Testing the right operand against the OUTER $onenull label is what keeps them
+// together — a branch unwinds the stack to the target label's height, so the left ref is
+// discarded by the branch itself and needs no `drop`.
+function emitNulNicheEq(body: i32[], binIx: i32, fnIx: i32, niche: string) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if niche == "nulstruct" { return emitNulStructEq(body, binIx, fnIx) }
+    fbBlock(127) // block i32 — $out, the 0/1 answer
+    ctrlEnter()
+    fbBlock(64) // block void — $onenull
+    ctrlEnter()
+    fbBlock(64) // block void — $lnull
+    ctrlEnter()
+    if emitEqOperandRaw(body, e.binLeft, fnIx) < 0 { return -1 }
+    wU8(213) // 0xd5 br_on_null — pops it; on non-null leaves (ref $rep)
+    wULEB(0) // → $lnull
+    if emitEqOperandRaw(body, e.binRight, fnIx) < 0 { return -1 }
+    wU8(213) // 0xd5 br_on_null
+    wULEB(1) // → $onenull (unwinding past the left ref, which needs no drop)
+    if emitEqNonNullCore(body, binIx, fnIx) < 0 { return -1 }
+    fbBr(2) // → $out
+    fbEnd()
+    ctrlLeave() // end $lnull — the left operand was null
+    if emitEqOperandRaw(body, e.binRight, fnIx) < 0 { return -1 }
+    wU8(209) // 0xd1 ref.is_null — both null ⇒ equal
+    fbBr(1) // → $out
+    fbEnd()
+    ctrlLeave() // end $onenull — exactly one side was null
+    fbI32Const(0)
+    fbEnd()
+    ctrlLeave() // end $out
+    return 0
+  }
+  emitFail("emitProgram: expected a `==`/`!=` over a nullable niche")
+}
+
+// The `nulstruct` arm of `emitNulNicheEq`. The struct core is RE-READ based by contract
+// (`emitStructEq`: both operands must be pure re-reads, because every field compare
+// re-evaluates the full chain from its root), so there is no single-evaluation form to preserve
+// and the guard is spelled as two null TESTS instead of the `br_on_null` consume.
+function emitNulStructEq(body: i32[], binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const si = structIndexOfExpr(e.binLeft, fnIx)
+    if si < 0 {
+      return emitFail("emitProgram: struct equality over a non-struct operand")
+    }
+    fbBlock(127) // block i32 — $out
+    ctrlEnter()
+    if emitEqIsNull(body, e.binLeft, fnIx) < 0 { return -1 }
+    if emitEqIsNull(body, e.binRight, fnIx) < 0 { return -1 }
+    fbI32Bin(71) // 0x47 i32.ne — the two sides disagree on nullness
+    fbIf(64)
+    ctrlEnter()
+    fbI32Const(0)
+    fbBr(1) // → $out
+    fbEnd()
+    ctrlLeave()
+    if emitEqIsNull(body, e.binLeft, fnIx) < 0 { return -1 }
+    fbIf(64)
+    ctrlEnter()
+    fbI32Const(1) // both null ⇒ equal
+    fbBr(1) // → $out
+    fbEnd()
+    ctrlLeave()
+    const pathSi: i32[] = []
+    const pathFi: i32[] = []
+    if (
+      emitStructEqRec(body, e.binLeft, e.binRight, si, pathSi, pathFi, fnIx) <
+      0
+    ) {
+      return -1
+    }
+    fbEnd()
+    ctrlLeave() // end $out
+    return 0
+  }
+  emitFail("emitProgram: expected a nullable-struct equality")
+}
+
+// True for the six `eqCmpKindOfTy` tokens that name a nullable REF NICHE — the ones whose
+// compare needs `emitNulNicheEq`'s guard. The BOX- and SENTINEL-repped nullables answer "" from
+// that function and are deliberately not here: they already compare tag-first and correctly.
+function eqKindIsNulNiche(k: string) {
+  k == "nulstr" ||
+    k == "nullist" ||
+    k == "nulstrlist" ||
+    k == "nulreflist" ||
+    k == "nulstruct" ||
+    k == "nulclosure"
+}
+
+// The nullable-niche token for this `==`/`!=`, or "" when neither operand is one (the existing
+// dispatch keeps it). Reads the ONE comparability home through the CHECKER'S BANKED TYPE, and
+// that is what makes a NARROWED operand fall out for free: inside `if a != null { a == b }` the
+// banked type is the non-null one, so the plain path keeps the compare and its bytes do not
+// move.
+//
+// A bare `null` operand is excluded — `x == null` is the null TEST, not a value compare, and
+// `emitNulIsNullTest` owns it further down this same dispatch.
+function binEqNulNiche(binIx: i32): string {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      if P.nodes[unwrapParen(e.binLeft)] is NullLit { return "" }
+      if P.nodes[unwrapParen(e.binRight)] is NullLit { return "" }
+      const lk = nodeEqCmpKind(e.binLeft)
+      if eqKindIsNulNiche(lk) { return lk }
+      const rk = nodeEqCmpKind(e.binRight)
+      if eqKindIsNulNiche(rk) { return rk }
+    }
+  }
+  ""
+}
+
+// The emitter's half of the ONE comparability answer: true when a `==`/`!=` operand's rep has
+// NO compare core. The checker rejects these (`unsupported-lowering`, off the same
+// `eqCmpKindOfTy`), so this is the FLOOR — unreachable from accepted source, and the difference
+// between a loud `emitProgram:` failure and the i32 tail emitting `i32.eq` over two refs.
+function binEqHasNoLowering(binIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if P.nodes[unwrapParen(e.binLeft)] is NullLit { return false }
+    if P.nodes[unwrapParen(e.binRight)] is NullLit { return false }
+    return nodeEqCmpKind(e.binLeft) == "none" ||
+      nodeEqCmpKind(e.binRight) == "none"
+  }
+  false
 }
 
 // Lower a STRUCTURAL struct equality `a == b` (or `!=`) onto `body`, leaving a 0/1
@@ -16292,6 +16535,28 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       }
     }
   }
+  // A `==`/`!=` OVER A NULLABLE REF NICHE, plus the emitter-capability FLOOR for a rep with no
+  // compare core — both off the ONE comparability home (`nodeEqCmpKind`), the same function the
+  // checker's acceptance reads. This has to come BEFORE the string / list / struct / closure
+  // compares below, because every one of them classifies its operands by their NON-NULL rep and
+  // would lower the niche as though the null could not be there.
+  if e.binOp == "==" || e.binOp == "!=" {
+    if binEqHasNoLowering(exprIx) {
+      return emitFail(
+        "emitProgram: `" +
+          e.binOp +
+          "` over this operand rep has no lowering",
+      )
+    }
+    const nulNiche = binEqNulNiche(exprIx)
+    if nulNiche != "" {
+      if emitNulNicheEq(body, exprIx, fnIx, nulNiche) < 0 { return -1 }
+      if e.binOp == "!=" {
+        fbI32Eqz() // 0x45 i32.eqz — the wrapper always leaves the `==` answer
+      }
+      return 0
+    }
+  }
   // G6 string operators (a string is a `(array i32)` of code points): `+` is a NEW
   // concatenated array; `==`/`!=` are ELEMENT-WISE value-equality, NOT ref identity
   // — so they take their own inline lowering BEFORE the i32 `binOpcode` path (which
@@ -16314,19 +16579,10 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       return emitListConcatI(body, e.binLeft, e.binRight, fnIx)
     }
     if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+    if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
     if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-    if lopK == 0 {
-      if emitListEqICore(body) < 0 { return -1 }
-    } else if lopK == 3 {
-      if emitListEqSCore(body) < 0 { return -1 }
-    } else {
-      const lslot = refListSlotOfExpr(e.binLeft, fnIx)
-      const lbase = leqRBaseOfSlot(lslot)
-      if lbase < 0 {
-        return emitFail("emitProgram: ref-list compare frame not reserved")
-      }
-      if emitListEqRCore(body, lslot, lbase) < 0 { return -1 }
-    }
+    if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
+    if emitEqNonNullCore(body, exprIx, fnIx) < 0 { return -1 }
     if e.binOp == "!=" {
       fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
     }
@@ -16367,8 +16623,10 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     // table index AND same env; null == null envs are equal).
     if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
       if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+      if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
       if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-      if emitCloEqCore(body) < 0 { return -1 }
+      if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
+      if emitEqNonNullCore(body, exprIx, fnIx) < 0 { return -1 }
       if e.binOp == "!=" {
         fbI32Eqz() // 0x45 i32.eqz — negate identity-equality
       }

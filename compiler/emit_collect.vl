@@ -340,6 +340,7 @@ import {
   criWalkBlock,
   ensureRefElem,
   ensureRefElemTy,
+  eqCoreKindOfBin,
   exprIsBareFnName,
   exprMap,
   fieldRefElemName,
@@ -2363,21 +2364,34 @@ function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
   0
 }
 
-// Note one BinExpr's list-op kind into the per-function frame flags.
+// Note one BinExpr's list-op kind into the per-function frame flags. `listOpKindOfBin` decides
+// `+` (concat has no `eqCoreKindOfBin` answer); a `==`/`!=` it does not claim falls to the ONE
+// compare-core home, which is the same function `emitEqNonNullCore` reads — a core reserved here
+// and a core emitted there are the same decision or the emitted core writes locals the function
+// never declared.
 function leqNoteBin(binIx: i32, fnIx: i32) {
-  const k = listOpKindOfBin(binIx, fnIx)
+  let k = listOpKindOfBin(binIx, fnIx)
+  if k < 0 { k = eqCoreKindOfBin(binIx, fnIx) }
   if k == 0 { fnUsesListEqI = true }
   if k == 3 {
     fnUsesListEqS = true
     // The per-element string compares stage operands in the string-op frame.
     fnUsesStrOp = true
   }
+  // The string-eq helper stages nothing itself, but a nullable-string compare the string-op
+  // scan (`exprHasStrOp` → `exprIsStrEq`) does not claim still reaches this core through the
+  // banked type, and its operands may widen an atom into the string-op frame.
+  if k == 5 { fnUsesStrOp = true }
   if k == 4 {
     // The nested element compare recurses into the i32-list frame.
     fnUsesListEqI = true
     const e = P.nodes[binIx]
     if e is BinExpr {
-      const slot = refListSlotOfExpr(e.binLeft, fnIx)
+      // Either operand may be the one whose rep resolves a slot — a MIXED pairing
+      // (`i32[][] | null == i32[][]`) can have the nullable side unresolvable, and
+      // `emitEqNonNullCore` falls back the same way, so both must.
+      let slot = refListSlotOfExpr(e.binLeft, fnIx)
+      if slot < 0 { slot = refListSlotOfExpr(e.binRight, fnIx) }
       if slot >= 0 {
         let seen = false
         let i = 0
