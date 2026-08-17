@@ -2749,6 +2749,32 @@ function isVoidTy(ty: i32) {
   false
 }
 
+// Whether `ty` CARRIES a `void` — the primitive itself, or a `void` MEMBER of a union /
+// nullable. No value has such a type: `void | i32` is what an if-expression with one void
+// arm and one value arm joins to, and it reaches a value slot exactly where a plain `void`
+// does (`print(if c { f() } else { 1 })` emitted a module that fails to validate).
+//
+// Depth-bounded like the other structural walks. Composites (array / map / struct / fn)
+// are deliberately NOT descended: a `void` inside one is refused at the element or field
+// slot that built it, which names the position the author wrote.
+function tyMentionsVoid(ty: i32, depth: i32) {
+  if ty < 0 { return false }
+  if depth <= 0 { return false }
+  if isVoidTy(ty) { return true }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const ms = t.uMembers
+    let mi = 0
+    while mi < ms.length {
+      if tyMentionsVoid(ms[mi], depth - 1) { return true }
+      mi = mi + 1
+    }
+    return false
+  }
+  if t is TyNullable { return tyMentionsVoid(t.nInner, depth - 1) }
+  false
+}
+
 // Whether the expression at `exprIx` (peeled through parens) is an if-EXPRESSION or a
 // `match` — the two void-typed expression FORMS every void-in-value-slot gate exempts,
 // and the one predicate all of them ask.
@@ -2782,9 +2808,14 @@ function voidSlotExemptExpr(exprIx: i32) {
 // checker's other slot messages already use. Answers whether the slot was refused, so the
 // caller can substitute `TY_ERR` and keep one mistake to one diagnostic.
 function voidValueSlotErr(ty: i32, exprIx: i32, slot: string, at: i32) {
-  if !isVoidTy(ty) { return false }
-  if voidSlotExemptExpr(exprIx) { return false }
-  tErr(slot + " expects a value, got void", at)
+  if !tyMentionsVoid(ty, 8) { return false }
+  // The provisional-void exemption covers a WHOLLY void if/match only: a union that
+  // MENTIONS void is a MIXED arm join (`if c { f() } else { 1 }`), where the void is one
+  // arm's real type and no position resolves it away.
+  if isVoidTy(ty) {
+    if voidSlotExemptExpr(exprIx) { return false }
+  }
+  tErr(slot + " expects a value, got " + tyToStr(ty), at)
   true
 }
 
