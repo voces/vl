@@ -604,6 +604,17 @@ export function cloRetIsString(fe: i32) {
   false
 }
 
+// True when the `.map` callback at `fe` produces an element that rides the STRING LIST — a
+// plain `string`, or the `string | null` niche, which share ONE wrapper/backing pair
+// (`$mkListIdx` / `$mkArrIdx`, whose element type is already `(ref null $aTypeIdx)` so a
+// spare slot defaults to null). The collect-time twin of `mfResultKindOf`'s `"str"` answer,
+// and the two must name the same set: a result the emitter picks the string wrapper for
+// while the collect flag stayed unforced is `emitProgram: .map/.filter result is string[]
+// but string list type not collected`, from a program whose ONLY string list is that result.
+export function mfCbResultIsStrList(fe: i32) {
+  cloRetIsString(fe) || cloRetValKind(fe) == "nulstr"
+}
+
 // Registry-independent f64-ness of a lifted callback's tail expression: float
 // literals, f64 PARAMS, f64 arithmetic over those, and f64-returning named calls.
 // Deliberately avoids `declaredF64`/`declaredSlotOf` (the locals registry belongs to
@@ -19748,6 +19759,17 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
     if arrNewIntrKind(exprIx, fnIx) == 2 { return true }
     // An INDEXED closure call `fs[i](x)` whose element signature returns `string[]`.
     if cloArrCallRetKind(exprIx, fnIx) == "strlist" { return true }
+    // `xs.map(f)` / `xs.filter(p)` yield a NEW list — the string list exactly when the
+    // result ELEMENT kind is a string (map: the callback's return kind; filter: the
+    // receiver's element kind). The i32-list classifier carries the same pair of arms; a
+    // rep that has the `.slice` arm and not this one answers "not a string list" for the
+    // `.filter` RESULT of a `(string | null)[]`, whose arena kind is the nulstr-element
+    // array rather than the plain `string[]` the fast path above claims — and the cell
+    // that binds it then takes the i32 DEFAULT while `emitMapFilter` pushes the string-list
+    // wrapper (`vl check`-clean invalid wasm).
+    if callIsMapFilter(exprIx, fnIx) {
+      return mfResultKindOf(exprIx, fnIx) == "str"
+    }
     // `xs.slice(...)` over a string list yields a string list.
     if callIsArrSlice(exprIx, fnIx) {
       return mfResultKindOf(exprIx, fnIx) == "str"
@@ -22890,6 +22912,13 @@ export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
         // 2). All unions share `$uBox`, so the result element is the declared union; its box
         // body is produced by the callback's own union-boxing return path.
         if cloRetValKind(fe) == "union" { return "ref" }
+        // A NULLABLE-STRING-returning callback maps to a `(string | null)[]` result — the SAME
+        // string list (one wrapper, one backing, whose element type is already
+        // `(ref null $aTypeIdx)` so spare slots can default to null), with the nullable element
+        // DISCIPLINE on reads. `cloRetKindOf` folds the un-annotated niche into the i32 result
+        // token, so this consults `cloRetValKind` — the answer the callback's own functype BYTES
+        // are streamed from — exactly as the struct/union/i64/f32 cases above do.
+        if cloRetValKind(fe) == "nulstr" { return "str" }
         // An i64- / f32-returning callback maps to an i64- / f32-list result (mf-kinds 4 / 13).
         // `cloRetKindOf` folds these to -1 (out of the value-CALL ABI), so consult
         // `cloRetValKind` (10 = i64, 13 = f32) directly, as the struct/union cases above do.
