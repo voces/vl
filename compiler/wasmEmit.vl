@@ -12580,9 +12580,10 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
       // receiver chain completes — including its result wrapper — before this store,
       // so the shared frame slots are free to reuse.)
       if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-      // A NARROWED nullable-list receiver keeps its nullable slot; the src
-      // scratch slot is non-null, so recover first (checker-guarded, never traps).
-      if exprNullableList(callee.memObj, fnIx) {
+      // A NARROWED nullable-list receiver keeps its nullable slot at EVERY element kind;
+      // the src scratch slot is declared non-null (`fbRefRun` writes `0x64`), so recover
+      // first (checker-guarded, never traps). See `nulRecvNeedsRecover`.
+      if nulRecvNeedsRecover(callee.memObj, fnIx) {
         wU8(212) // 0xd4 ref.as_non_null
       }
       fbLocalSet(srcL)
@@ -12710,6 +12711,24 @@ function emitClampLocal(_body: i32[], idxL: i32, lenL: i32) {
   0
 }
 
+// TRUE when `exprIx` names a NARROWED nullable COLLECTION whose cell still holds a
+// `(ref null $wrap)` — every rep a list/map OPERATION must `ref.as_non_null` before the
+// wrapper `struct.get`, because the wrapper field demands `(ref $wrap)`.
+//
+// This is the READ dual of `emitNulIsNullTest`'s niche disjunction, and the two must name
+// the same reps for the same reason its header gives: a rep the null TEST claims but an
+// operation's recover does not is `vl check`-clean INVALID WASM (`type mismatch: expected
+// (ref $type), found (ref null $type)`), never a diagnostic. The i32-list niche
+// (`exprNullableList`) is only ONE of the four list families — the distinct-backing scalar
+// lists carry their own wrappers (`exprNulScalarListKind`) and a ref array its slot's
+// (`exprNullableRefArray`) — so asking `exprNullableList` alone answers "already non-null"
+// for the other three. One helper, so a new nullable collection rep is added once.
+function nulRecvNeedsRecover(exprIx: i32, fnIx: i32) {
+  exprNullableList(exprIx, fnIx) ||
+    exprNulScalarListKind(exprIx, fnIx) != null ||
+    exprNullableRefArray(exprIx, fnIx)
+}
+
 // Lower an array `xs.slice(start, end?)` onto `body`, leaving a NEW list wrapper of the
 // SAME element kind over the half-open clamped range `[start, end)` (JS semantics: a
 // missing `end` defaults to the length, negatives count from the end, the out length is
@@ -12786,12 +12805,12 @@ function emitArrSlice(body: i32[], callIx: i32, fnIx: i32) {
       const startL = mfScratchBase + 0
       const endL = mfScratchBase + 1
       const auxL = mfScratchBase + 2
-      // src = <receiver>, evaluated ONCE (a NARROWED nullable i32 list recovers non-null).
+      // src = <receiver>, evaluated ONCE. A NARROWED nullable list recovers non-null at
+      // EVERY element kind (`srcL` is declared non-null and `struct.get wrap` demands it),
+      // not just the i32 one — see `nulRecvNeedsRecover`.
       if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-      if recvK == "i32" {
-        if exprNullableList(callee.memObj, fnIx) {
-          wU8(212) // 0xd4 ref.as_non_null
-        }
+      if nulRecvNeedsRecover(callee.memObj, fnIx) {
+        wU8(212) // 0xd4 ref.as_non_null
       }
       fbLocalSet(srcL)
       // auxL = src.len (the wrapper's logical length, field 1)
@@ -14440,9 +14459,10 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   }
   // list = <iter> (evaluated once); cursor = 0
   if emitForInList(body, s.fiIter, fnIx) < 0 { return -1 }
-  // A NARROWED nullable-list iterable (`i32[] | null`, kind 15) keeps its
-  // nullable slot; the `#l` temp is non-null, so recover first (checker-guarded).
-  if exprNullableList(s.fiIter, fnIx) {
+  // A NARROWED nullable-list iterable keeps its nullable slot at EVERY element kind — the
+  // i32-list niche, a distinct-backing scalar list and a ref array alike; the `#l` temp is
+  // non-null, so recover first (checker-guarded). See `nulRecvNeedsRecover`.
+  if nulRecvNeedsRecover(s.fiIter, fnIx) {
     wU8(212) // 0xd4 ref.as_non_null
   }
   fbLocalSet(lIdx)
