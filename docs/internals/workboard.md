@@ -38,12 +38,19 @@ a fix does.
 
 ## In flight
 
-Nothing. The queue is empty; pick from the bands below.
+Three agents, all on **silent-class** defects:
+
+| item | verdict on the tip | axis |
+|---|---|---|
+| `while`-body narrowing from its condition guard | loud, rep-independent | the **mutation** axis is its own deliberable — a body reassigning the guarded variable to `null` invalidates the guard, so narrowing unconditionally would be unsound; newly accepting such a program is a stop-and-report |
+| `print(f())` double-evaluates a named-litunion call | **check-clean, silently wrong** — `S / a / S`, the callee runs twice | named litunion (atom rep) × `print` argument × the argument is a CALL. Five working controls, two of which reach the same atom widen from another position. Weighing a spill against routing to the existing *"atom narrowing needs a re-readable receiver"* floor |
+| a NUMERIC litunion under `\| null`, tested with `is` | **check-clean INVALID WASM** | see the corrected row below |
 
 ## Landed this cycle
 
 | item | PR | result |
 |---|---|---|
+| **null-rep** — three shapes, one message, **THREE roots** | #1439 | shipped. `emitNullLitNode` was **not** the defective table — my briefed framing was refuted: its arm set is complete, its fallthrough is loud, and a box's `null` is a `struct.new`, not a `ref.null`. The three roots are `forInElemKind`'s `.values()` sub-ladder (missing the three arms its LIST sibling already had), `forInLoopVarUnionName` answering from a first-match-**by-name** AST scan (now pinned per slot, retiring a 60-line scan), and a nullable numeric litunion being **one type with two reps**. 988 cells over 3 grids: **+52 forward, 0 backward, 0 into either silent class**; check-clean invalid wasm **10 → 0** and **8 → 0**. Two down-moves recorded rather than shipped, one of them a counterfactual built and reverted because the call-result classifier is a **third** name-keyed home. I verified all four claims independently, and found that my own first same-named-loop probe used the **wrong spelling** (two union iterables — that one already passed; the defect needs the first loop over a NON-union iterable) |
 | **B1** checker-side parse census | #1354 | **CLOSED, measured negative** — 17,832 of 17,834 are tree walks |
 | **B1a** `is` triple resolution | — | **SHIPPED** — the mint-free half is exactly the bare-NAME half, so it is separable; 12,931 of 12,931 taken on the compiler's own source, arena unmoved on 1,777 files |
 | **B2** TRANSP residue | #1373 | shipped; found a THIRD down-cell the filing lacked |
@@ -246,6 +253,7 @@ WASI, std math/trig, in-language GC knobs, SIMD (not requested), branch hinting.
 | **D1b** | **`string` receiver tested against a litunion** — `function f(s: string) { if s is A … }` | same section | **CLOSED.** The filing was a third of it: a 233-cell grid found **82 silently-wrong cells, not 16** — the plain `string` receiver (const FALSE, every origin and every test form), the un-annotated monomorphized param, AND a value-union BOX whose one string-repped arm is not the tested type (`string \| i32`, const **TRUE** — the opposite sign, unfiled). One membership ladder shared with the bare-literal spelling (`emitLitMemberEq`) took **82 → 0**: 77 correct, 5 to the loud non-place floor. Fixture `is-litunion-over-string-receiver.vl` scores 15 wrong lines without it | **CLOSED** | — | — |
 | ~~**D1c**~~ | ~~**RAW `string \| null` receiver tested against a litunion** — `function f(s: string \| null) { if s is A … }`~~ | `overlapping-arm-defects.md` "D1c is CLOSED"; `wasmEmit.vl emitNulStrLitEq` / `litMemberRecvIsNulString` | **SHIPPED — the OWNER RULED (a null receiver answers FALSE), and the filed 16 was 52.** Re-gridded as its own population, **104 cells** (5 receiver types × 4 tested-against spellings × 6 test forms × 9 receiver origins, each at a MEMBER, a NON-MEMBER **and a NULL** input): correct **31 → 83, 0 regress**. Two halves, failing two ways: the BARE LITERAL (22 cells) **traps 11 → 0** at a param/local/field/global — where the read recovers with `ref.as_non_null` — and `vl check`-clean **INVALID WASM 3 → 0** at a call result / map read / list element, where nothing recovers and a `(ref null $array)` reached `__str_eq__`; the MEMBERSHIP ladder (82 cells) was a loud emit-reject, **47 → 9**, and its refusal was CORRECT while the compare it delegates to still trapped. **ONE home**: the guard is `emitNulStrLitEq` inside `emitLitMemberEq`, the per-member compare both spellings share — `br_on_null` over ONE raw read (`m["k"]` types `string \| null` and is not a place; a re-read would re-probe), and `litMembershipRecvOk` now asks the same `litMemberRecvIsNulString` predicate rather than carrying its own answer. Silently-wrong **0 → 0** on both halves. A second, smaller fix fell out: the `string \| null` `??` arm declared a non-null block type unconditionally, so `(p ?? q) is "m"` and `(p ?? q) != null` were wrong for a NULLABLE default (the latter answered **TRUE for two nulls**). Soundness both directions: the THEN branch narrows non-null, the ELSE branch and a negated then-branch do NOT and a value use there is still a type error. **All 1838 pre-existing corpus modules build BYTE-IDENTICAL to the branch point** — reject parity 0 of 300 error-directive cases. The two spellings' emitted opcode sequence is identical (type indices normalized). Residue 21, all LOUD and at parity with a non-nullable receiver: 5 call/`??` receivers keep the multi-member re-readable-receiver floor, 2 are the atom-repped `K \| null` element/call, 12 are the checker's newtype-brand reject. **Measured, filed, NOT fixed**: a `for x in xs` loop var over `(string \| null)[]` still traps on a null element in both spellings, unchanged — the checker types `x` as `string?` but banks no nullable node type for the reference, so the guard's narrowing signal false-positives; the narrowed oracle for that shape does not compile either. A nullable string CAPTURED by a nested function is a pre-existing loud emit-reject, unmoved. `literal-unions/is-nullable-string-receiver.vl` (reddens on master), `error-is-nullable-string-else-not-narrowed.vl` (boundary pin — passes on master too) | **CLOSED** | — | — |
 | **D2** | **Numeric literal unions** — `tyIsLitUnion` requires every member `litKind == "str"` | `typecheck.vl:18621`, `:19019` | the litunion machinery is **string-only by construction** while VL models str/flt/int literals | OPEN — **do NOT bundle with D1** | M | med |
+| **D2a** | **A NUMERIC litunion under `\| null`, tested with `is`** — `type N = 1 \| 2`; `let p: N \| null = 1`; `if p is N` | in flight | **I had this filed as "12 cells, LOUD". That was WRONG** — re-measured on the tip today, its primary verdict is **check-clean INVALID WASM** (`vl check` says "no errors", then `type mismatch: expected i32, found (ref $type)`), which puts it in the silent class and raises its priority. Six measured shapes, all `vl check` rc 0: the named `let` → **invalid wasm** (offset 238); the inline single-literal `is 1` → **invalid wasm** (offset 206), so it is not about the alias name; the **PARAM** position → **LOUD** (``emitProgram: `is` names a type that is not a union variant``), so the verdict is position-dependent and there are two decision sites. **Three controls constrain it from three directions**: the *string* litunion's `is` under `\| null` is CORRECT (rep axis), the *`!= null`* test on the same numeric type is CORRECT (test-form axis — and it is #1439 that made it so, via `nulNumLitUnionBaseName`), and `i32 \| null` is a BOX, so the mismatch signature is a box reference reaching an unboxed-scalar slot — the same signature #1439 fixed at `w.f != null`. Hypothesis handed to the agent: the `is` path is a **third consumer** never wired to `nulNumLitUnionBaseName` | IN FLIGHT | — | — |
 | **D3** | **ROOT A** — `emitIs` compares ONE tag | `wasmEmit.vl:1877`, `:1832` | **49 of 64 cells**, but **not re-derived since #1343/#1341** — treat as an upper bound | OPEN | L | med-high |
 | **D4** | **Generic alias application as a union member** — `type U = Box<Box<i32>> \| i32; const u: U = { v: 5 }` is ACCEPTED | suspect `typecheck.vl:9054` | three controls localise it exactly; **defect confirmed, mechanism NOT** | OPEN, mechanism blocked on W9 | M–L | med |
 | **D5** | **Struct arms differing only in a shared STORAGE code** — `{a:i32} \| {a:boolean}` | `emit_collect.vl:4498 variantFieldCodesEq` | `boolean`/`i32` share a storage code, so the pair is treated as the layout-equal twin the exemption exists for | OPEN, pinpointed | S | low-med |
@@ -496,3 +504,30 @@ patch — so what was worth keeping is recorded here and the branches are gone.
 | 17 squash-merged branches | PR state MERGED; the squash is why `--no-merged` listed them |
 
 **The lesson for this board:** #313 and #369 were both closed *with a reason worth keeping*, and in both cases the reason lived only in a PR body. A closed PR whose rationale points at future work should leave a row here, or the successor is lost with the branch.
+
+## Retired by re-derivation on the tip, without spending an agent
+
+The standing rule — **re-verify on the current tip and find the reaching shape with a working
+control before briefing** — has now retired six queued rows for free. Each was filed with a real
+cell count that a later PR closed as a side effect, so briefing it would have bought a report
+saying "already works".
+
+| filed row | filed as | retired by | what the tip actually does |
+|---|---|---|---|
+| the box for-in loop-var narrow defect | 8 cells, #1436 located the root | **#1437** (narrowing consolidation) | prints `1 / -1 / 2` correctly |
+| `1 \| 2 \| null` with `if p != null` | 41 cells, #1438 measured `if p != null` alone failing on master | **#1439** (`nulNumLitUnionBaseName`) | `let p: 1\|2\|null = 2; if p != null` prints `2 / -1`; the NAMED `type N = 1\|2` spelling works too |
+| `.map`/`.filter` over `i32[] \| null` | part of #1436's filed 140 | — | runs |
+| `.map`/`.filter` over `boolean \| null` | part of the same 140 | — | runs |
+| `.map`/`.filter` over `f64 \| null` | part of the same 140 | — | runs |
+| a gap in #1438's `??` consumer positions | I raised it myself | **nothing — my probe was wrong** | the default I used was not a MEMBER of the litunion, which `coalesceLitUnionFits` correctly declines. With a member default all three consumer positions work |
+
+The last row is the one worth keeping: **an ill-formed probe reads exactly like a defect.** The
+recurring forms in this repo are `main` not being auto-invoked, `as` being numeric-only, `match`
+arms needing `=>`, `{}` not being a map, and — the subtle one — a `??` default outside the
+literal union's member set.
+
+The inverse also happened today and is the reason the rule says *find the reaching shape*: my
+first probe for the same-named-loop-var defect used **two union iterables of different unions**,
+which already passes on master. The defect needs the **first** loop over a NON-union iterable.
+A probe that fails to reproduce is not evidence the claim is wrong — it is evidence the shape
+has not been found yet.
