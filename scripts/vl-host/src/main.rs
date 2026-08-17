@@ -316,33 +316,60 @@ fn embedded_seed() -> Option<&'static [u8]> {
     }
 }
 
+/// A short stable token naming the ENGINE CONFIGURATION a compiled module belongs to.
+///
+/// A serialized module only deserializes into an engine whose config matches the one
+/// that compiled it, and this host builds SEVERAL from the same seed: the one-shot
+/// compile paths (`build`, `run`) use `Collector::Null` while the CLI pump (`check`,
+/// `fmt`, `test`) uses a collecting one, and the collector is part of the compiled
+/// code (it decides the GC barriers Cranelift emits). Every cache path is therefore
+/// keyed on this token, so each configuration gets its OWN entry and all of them stay
+/// warm — one shared path instead has alternating commands overwrite each other and
+/// pay a full Cranelift recompile of the seed per alternation, a fixed cost that
+/// dwarfs the work of a small program.
+///
+/// wasmtime's own compatibility hash is the authority on which engines can share a
+/// compiled artifact ("if this Hash matches, binaries from one are guaranteed to
+/// deserialize in the other"), so the token tracks exactly what deserialization
+/// checks — including the wasmtime version and target — rather than a hand-listed
+/// subset that would drift. It is only a cache KEY: a collision or a hash that shifts
+/// between builds costs one recompile, never correctness.
+fn engine_cache_tag(engine: &Engine) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Where the EMBEDDED seed's compilation cache lives — the sidecar's counterpart for
 /// bytes that have no path of their own. A distributed `vl` has no `build/` next to
 /// it, so without this every invocation re-runs Cranelift over the whole ~1 MB seed
 /// (seconds, not milliseconds); with it, that cost is paid once per machine.
 ///
-/// The file is CONTENT-KEYED on `$VL_SEED_KEY` (baked by `build.rs`), so two `vl`
-/// binaries carrying different seeds never collide and an upgraded binary simply
-/// misses instead of loading something stale.
+/// The file is CONTENT-KEYED on `$VL_SEED_KEY` (baked by `build.rs`) and on `tag` (the
+/// engine configuration), so two `vl` binaries carrying different seeds never collide,
+/// an upgraded binary simply misses instead of loading something stale, and the
+/// engine configurations do not evict each other.
 ///
 /// Directory, first hit wins: `$VL_CACHE_DIR` · `$XDG_CACHE_HOME/vl` ·
 /// `$HOME/.cache/vl` · `%LOCALAPPDATA%\vl`. `None` (no home, no XDG) means "run
 /// uncached" — correct, just slow, which is the right failure for a cache.
-fn seed_cache_path() -> Option<std::path::PathBuf> {
+fn seed_cache_path(tag: &str) -> Option<std::path::PathBuf> {
     #[cfg(not(feature = "embed-seed"))]
     {
         // No baked seed, so no `$VL_SEED_KEY` to name a cache with. The on-disk
-        // seed's own `.cwasm` sidecar covers this build.
+        // seed's own `.cwasm` sidecar covers this build, and carries `tag` itself.
+        let _ = tag;
         None
     }
     #[cfg(feature = "embed-seed")]
     {
-        seed_cache_path_impl()
+        seed_cache_path_impl(tag)
     }
 }
 
 #[cfg(feature = "embed-seed")]
-fn seed_cache_path_impl() -> Option<std::path::PathBuf> {
+fn seed_cache_path_impl(tag: &str) -> Option<std::path::PathBuf> {
     let dir = if let Some(d) = std::env::var_os("VL_CACHE_DIR") {
         std::path::PathBuf::from(d)
     } else if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
@@ -355,41 +382,71 @@ fn seed_cache_path_impl() -> Option<std::path::PathBuf> {
         return None;
     };
     std::fs::create_dir_all(&dir).ok()?;
-    let ours = dir.join(format!("seed-{}.cwasm", env!("VL_SEED_KEY")));
+    let ours = dir.join(format!("seed-{}-{tag}.cwasm", env!("VL_SEED_KEY")));
     prune_seed_cache(&dir, &ours);
     Some(ours)
 }
 
+/// The SEED a cache file belongs to, read out of a `seed-<seed key>-<engine tag>.cwasm`
+/// name. One seed owns one entry per engine configuration, and they are worth exactly
+/// as long as the seed is, so pruning treats them as a unit. A name carrying no tag is
+/// its own group.
+#[cfg(feature = "embed-seed")]
+fn seed_group_key(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let stem = name.strip_prefix("seed-")?.strip_suffix(".cwasm")?;
+    Some(stem.rsplit_once('-').map_or(stem, |(key, _tag)| key).to_string())
+}
+
 /// Keep the seed cache bounded. Entries are content-keyed, so every `vl` carrying a
-/// new seed adds one (~9 MB) and nothing retires the old ones — an upgrade treadmill
-/// would grow the user's cache dir without limit.
+/// new seed adds a group (~9 MB per engine configuration in it) and nothing retires
+/// the old ones — an upgrade treadmill would grow the user's cache dir without limit.
 ///
-/// Policy: keep the `KEEP` most-recently-written `seed-*.cwasm` plus our own, delete
-/// the rest. A COUNT rather than an age, because an entry in daily use is only ever
-/// READ — its mtime stays as old as the day it was written, so any age rule would
-/// evict exactly the entries that are working. `KEEP > 1` so a dev checkout and a
-/// released `vl` sharing a cache dir do not evict each other on alternate runs.
+/// Policy: keep the `KEEP` most-recently-written SEEDS plus our own, delete the rest.
+/// Seeds rather than files, because one seed legitimately owns several files (one per
+/// engine configuration) and a file count would let a two-configuration workload evict
+/// a live seed on every other run — reinstating the recompile the per-configuration
+/// keying exists to remove. A COUNT rather than an age, because an entry in daily use
+/// is only ever READ — its mtime stays as old as the day it was written, so any age
+/// rule would evict exactly the entries that are working. `KEEP > 1` so a dev checkout
+/// and a released `vl` sharing a cache dir do not evict each other on alternate runs.
 /// Evicting a live entry is survivable regardless — the next run recompiles and
 /// republishes it — which is why every step here is best-effort and silent.
 #[cfg(feature = "embed-seed")]
 fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path) {
     const KEEP: usize = 3;
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut seeds: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
-        .flatten()
-        .filter(|e| {
-            let n = e.file_name();
-            let n = n.to_string_lossy();
-            n.starts_with("seed-") && n.ends_with(".cwasm")
-        })
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
+    // Per seed: its newest mtime, and every file in it.
+    let mut seeds: Vec<(String, std::time::SystemTime, Vec<std::path::PathBuf>)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let (Some(key), Some(mtime)) = (
+            seed_group_key(&path),
+            entry.metadata().ok().and_then(|m| m.modified().ok()),
+        ) else {
+            continue;
+        };
+        match seeds.iter_mut().find(|(k, _, _)| *k == key) {
+            Some((_, newest, files)) => {
+                *newest = (*newest).max(mtime);
+                files.push(path);
+            }
+            None => seeds.push((key, mtime, vec![path])),
+        }
+    }
     if seeds.len() <= KEEP {
         return;
     }
-    seeds.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
-    for (_, path) in seeds.into_iter().skip(KEEP) {
-        if path != ours {
+    // Our own seed survives whatever its mtime says: `ours` has not been written yet
+    // (this runs on the way to publishing it), and the sibling entries are the other
+    // engine configurations of the very seed this process is about to use.
+    let ours_key = seed_group_key(ours);
+    seeds.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+    for (key, _, files) in seeds.into_iter().skip(KEEP) {
+        if Some(&key) == ours_key.as_ref() {
+            continue;
+        }
+        for path in files {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -425,10 +482,11 @@ fn resolve_compiler(explicit: Option<String>) -> CompilerSource {
 /// the error (positioned `source_path:line:col: message` lines where known).
 /// Load + instantiate the self-hosted compiler module, reusing a `.cwasm` SIDECAR
 /// that caches the Cranelift compilation (the dominant fixed cost of every
-/// invocation), keyed by freshness (rebuilt whenever the `.wasm` is newer). Shared
-/// by every subcommand that drives the seed (`compile_vl`, `fmt`). `deserialize_file`
-/// is unsafe because a corrupt/forged artifact is UB — we only ever load a sidecar
-/// this same binary wrote next to the module it was derived from.
+/// invocation), keyed by freshness (rebuilt whenever the `.wasm` is newer) and by
+/// engine configuration (a separate sidecar per one). Shared by every subcommand that
+/// drives the seed (`compile_vl`, `fmt`). `deserialize_file` is unsafe because a
+/// corrupt/forged artifact is UB — we only ever load a sidecar this same binary wrote
+/// next to the module it was derived from.
 fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>, Instance)> {
     let module = load_compiler_module(engine, source)?;
     let mut store = Store::new(engine, ());
@@ -442,6 +500,9 @@ fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>,
 /// instantiate it freshly per case (a fresh Store per case keeps cases isolated;
 /// the Module — the expensive half — is engine-level and shareable).
 fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Module> {
+    // Both cache paths carry the engine configuration, since a module compiled under
+    // one only deserializes under a matching one (see `engine_cache_tag`).
+    let tag = engine_cache_tag(engine);
     let module = match source {
         // Embedded seed (a `--features embed-seed` release binary). Its cache lives in
         // the user cache dir rather than beside the module, since a distributed `vl`
@@ -449,7 +510,7 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
         // freshness question to ask (different bytes ⇒ different file).
         CompilerSource::Embedded(bytes) => cached_module(
             engine,
-            seed_cache_path().as_deref(),
+            seed_cache_path(&tag).as_deref(),
             true,
             || {
                 Module::from_binary(engine, bytes)
@@ -459,7 +520,7 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
         // On-disk seed: the sidecar sits next to it and is keyed by FRESHNESS —
         // rebuilt whenever the `.wasm` is newer than its `.cwasm`.
         CompilerSource::Path(compiler_path) => {
-            let sidecar = std::path::PathBuf::from(format!("{compiler_path}.cwasm"));
+            let sidecar = std::path::PathBuf::from(format!("{compiler_path}.{tag}.cwasm"));
             let fresh = match (
                 std::fs::metadata(&sidecar),
                 std::fs::metadata(compiler_path),
@@ -490,10 +551,13 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
 /// every call compiles, correct but slow.
 ///
 /// Publishing is best-effort in every direction: a read-only or full cache dir is
-/// non-fatal, and a cache entry that fails to deserialize (a different wasmtime
-/// version or engine config — e.g. a CI cache restoring a sidecar with its mtime
-/// intact, or a changed `$VL_GC`) falls through to a recompile that REWRITES it, so
-/// the miss costs one invocation instead of every later one.
+/// non-fatal, and a cache entry that fails to deserialize falls through to a recompile
+/// that REWRITES it, so the miss costs one invocation instead of every later one. That
+/// fall-through is the LAST line of defence, not the routine one — the path itself
+/// carries the engine configuration and the wasmtime build (`engine_cache_tag`), so an
+/// incompatible artifact normally lands at a different path rather than colliding
+/// here. What still reaches it is a file at our path that is truncated, foreign, or
+/// otherwise unreadable.
 ///
 /// `deserialize_file` is unsafe because a corrupt or forged artifact is UB — we only
 /// ever read a file this same binary wrote for this same module.

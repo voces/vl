@@ -154,15 +154,20 @@ if [ "$SHIP" = "$SEED" ]; then
   [ "$SEED" = "$OUT" ] || cp "$SEED" "$OUT"
 else
   mv "$SHIP" "$OUT"
-  # The sanity run (and any ladder rung that compiled WITH $SHIP) left a fresh
-  # `.cwasm` sidecar beside it — the host's cached wasmtime compilation. Move it
-  # along so the next `vl` invocation deserializes instead of re-JITing; without
-  # a fresh one, drop any stale sidecar (the host would detect + rebuild it
-  # anyway; removing it just keeps the pair coherent on disk).
-  if [ -f "$SHIP.cwasm" ]; then
-    mv "$SHIP.cwasm" "$OUT.cwasm"
-  else
-    rm -f "$OUT.cwasm"
-  fi
+  # The sanity run (and any ladder rung that compiled WITH $SHIP) left fresh `.cwasm`
+  # sidecars beside it — the host's cached wasmtime compilations, ONE PER ENGINE
+  # CONFIGURATION (`$OUT.<engine tag>.cwasm`: `vl build`/`vl run` compile the seed
+  # under a different collector than `vl check`/`fmt`/`test`, so each keeps its own
+  # file and neither evicts the other). Move them all along so the next `vl`
+  # invocation deserializes instead of re-JITing, after clearing whatever sat beside
+  # $OUT — a sidecar the move does not replace is stale, and the host would detect +
+  # rebuild it anyway; removing it just keeps the set coherent on disk.
+  rm -f "$OUT".cwasm "$OUT".*.cwasm
+  # An unmatched glob stays literal, so every iteration re-tests for a real file.
+  for side in "$SHIP".*.cwasm; do
+    if [ -f "$side" ]; then
+      mv "$side" "$OUT.${side#"$SHIP".}"
+    fi
+  done
 fi
 echo "refreshed $OUT ($(wc -c < "$OUT") bytes) from current compiler/*.vl"
