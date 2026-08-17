@@ -347,6 +347,7 @@ import {
   fbIf,
   fbLocalGet,
   fbLocalSet,
+  fbLocalTee,
   fbLoop,
   fbRefAsNonNull,
   fbRefCast,
@@ -5022,7 +5023,9 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
 //   +6  keysBk : (ref $mkArrIdx)    — grown keys backing (compact: new keys backing)
 //   +7  valsBk : (ref $aTypeIdx)    — grown vals backing (compact: new vals backing)
 //   +8  chr    : i32                — inner char cursor (key compare / hash); compact `i`
-//   +9  hcur   : i32                — FNV hash accumulator; compact write cursor `j`
+//   +9  hcur   : i32                — the current op's key HASH, live from `emitMapProbe`
+//                                     through an appending set's `hashes[]` store (and
+//                                     the i32 mix's accumulator); compact write cursor `j`
 //   +10 idxBk  : (ref $aTypeIdx)    — fresh `index` backing (resize); compact new live
 //   +11 rslot  : i32                — inner probe slot (resize); compact target cap
 //   +12 liveBk : (ref $aTypeIdx)    — grown `live` backing (keys-grow lockstep)
@@ -5175,13 +5178,23 @@ function pushMapHashes(body: i32[]) {
 // the stored `hashes` array and `__map_resize__`.
 function emitMapHashOf(_body: i32[]) {
   if cmKeyI32() {
-    // Scratch slot +9 (`hcur`, the old inline FNV accumulator) is dead across the mix.
+    // Scratch slot +9 (`hcur`) is the mix's own accumulator — dead across it.
     fbI32HashMix(cmKeyLocal(), mapScratchBase + 9)
     return 0
   }
   fbLocalGet(cmKeyLocal())
   fbCall(gHelpStrHash)
   0
+}
+
+// The hash of the current op's key at a site that runs AFTER `emitMapProbe` — the
+// `hashes[]` store on an appending `m[k] = v`. A STRING key's hash is the one the probe
+// was handed, still in slot +9, so the key is walked once per insert instead of twice;
+// an i32 key's is re-mixed, because `__map_probe_i32__` computes its own internally (see
+// that helper's header for why the two differ here).
+function pushMapProbedHash(body: i32[]) {
+  if cmKeyI32() { return emitMapHashOf(body) }
+  pushMapScr(body, 9)
 }
 
 // PROBE: with `mapRef` (slot 0) and the target `keyRef` (slot 1) set, hash the key
@@ -5196,7 +5209,24 @@ function emitMapHashOf(_body: i32[]) {
 // GATES the (string) key comparison: run `keyEq` only when the hash matches AND the entry is
 // live. With `live` all-1s (delete-free programs) that is behavior-preserving — the live
 // check is always true and the hash always matches for the matching key (same FNV, same key).
-function emitMapProbe(body: i32[]) {
+//
+// A STRING key is hashed HERE and the hash handed to the helper, rather than walked
+// inside it, which is what lets an appending set reuse it (`pushMapProbedHash`) instead
+// of walking the same key a second time. Two placement rules make that free for every op
+// that does NOT append:
+//   · the hash is `__map_probe__`'s FIRST operand, so it is emitted on an empty operand
+//     stack. Hashing in last position would leave the four backing `struct.get` results
+//     live across the `__str_hash__` call, which the engine spills and reloads per probe
+//     — measured at ~5% of `collections/word-freq`, whose upsert probes twice per token.
+//   · `keepHash` (an appending set, the only reader) is what parks it in scratch slot +9,
+//     and it does so with a `local.tee` — ONE instruction, not a set/get pair. Nothing
+//     between here and that read writes +9; the only other writer is `emitMapCompact`'s
+//     `j` cursor, which belongs to delete.
+function emitMapProbe(body: i32[], keepHash: boolean) {
+  if !cmKeyI32() {
+    emitMapHashOf(body)
+    if keepHash { fbLocalTee(mapScratchBase + 9) }
+  }
   // Push the probe's shape-agnostic components (the map struct type differs per
   // value shape, but `index`/`hashes`/`live`/`keys` are identically typed across
   // shapes — only these `struct.get`s stay at the call site) and call the shared
@@ -5207,7 +5237,7 @@ function emitMapProbe(body: i32[]) {
   pushMapKeysBacking(body)
   fbLocalGet(cmKeyLocal()) // the target key (a string ref, or a raw i32)
   if cmKeyI32() { fbCall(gHelpMapProbeI32) } else { fbCall(gHelpMapProbe) }
-  setMapScr(body, 3)       // slot
+  setMapScr(body, 3) // slot
   // entry = index[slot]  (0 = miss; else entry-position + 1)
   pushMapIndex(body)
   pushMapScr(body, 3)
@@ -5361,7 +5391,7 @@ function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // Pop the stacked pair into the frame only now — user code is done running.
   fbLocalSet(cmKeyLocal()) // the target key
   setMapRef(body)          // mapRef (the shared mono slot, or this mv/i32 frame's)
-  emitMapProbe(body)
+  emitMapProbe(body, false)
 }
 
 // Emit the `??` DEFAULT `d` for a REF-valued map slot (`cmSlot >= 0`) onto `body`, in the
@@ -6490,7 +6520,7 @@ function emitMapSetV(
   cmSlot = mslot           // re-pin: inner map ops in the value expr clobber it
   fbLocalSet(cmKeyLocal()) // the target key (popped off the stack)
   setMapRef(body)          // mapRef
-  emitMapProbe(body)
+  emitMapProbe(body, true)
   pushMapScr(body, 5)      // entry
   fbIf(64)                 // if (entry != 0 → overwrite), void
   // OVERWRITE: vals.backing[entry-1] = stash
@@ -6628,13 +6658,11 @@ function emitMapPushKey(body: i32[]) {
   fbArraySet(aTypeIdx) // array.set
   // hashes[keys.len] = hash(keyRef)  — cache the key's FNV hash parallel to the entry
   // so resize/compact re-place it without re-hashing (mirrors the host's `mapSetFn`
-  // append, which stores `m.call(hash, [key()])`). `emitMapHashOf` uses slots 8/9
-  // (free here) internally and leaves the masked hash on the stack.
+  // append, which stores `m.call(hash, [key()])`). `pushMapProbedHash` leaves the masked
+  // hash on the stack, reusing the probe's own for a string key.
   pushMapHashes(body)
   pushMapKeysLen(body) // entry index (== count, pre-append)
-  if emitMapHashOf(body) < 0 {
-    return -1 // hash(key), masked, on the stack
-  }
+  pushMapProbedHash(body)
   fbArraySet(aTypeIdx) // array.set
   // keys.backing[keys.len] = key
   pushMapKeysBacking(body)
