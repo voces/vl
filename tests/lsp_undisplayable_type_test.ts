@@ -342,7 +342,17 @@ Deno.test({
   // with no error diagnostic. The hint it loses was itself unspellable (VL spells
   // that type `null`), so dropping it is the fix, not a regression. Pinned by
   // NAME so a second such file fails this test instead of hiding in a count.
-  const KNOWN_CLEAN_DROPS = new Set(["types/infer-null-unconstrained.vl"]);
+  // Second measured exception: an un-annotated `const fu = () => { return [] }`
+  // renders `() -> <none>[]`. The empty literal's element type is never
+  // constrained, so the array has no element type to name — and VL has no
+  // spelling for one, exactly as it has none for the `<none>?` above. The
+  // program is legal (that is what A-compiler-trap fixed; it used to kill the
+  // compiler outright), so the file is diagnostic-free and the hint is dropped
+  // on a clean file. Dropping an unspellable hint is the filter working.
+  const KNOWN_CLEAN_DROPS = new Set([
+    "types/infer-null-unconstrained.vl",
+    "arrays/lambda-empty-array-literal-return.vl",
+  ]);
 
   const files: string[] = [];
   for await (const dir of Deno.readDir(root)) {
@@ -385,7 +395,7 @@ Deno.test({
   assertEquals(unexpected, [], "hints removed from diagnostic-free files");
   // Assert the sweep actually SAW the behaviour it is guarding, so a harness that
   // silently stops finding drops fails instead of passing vacuously.
-  assertEquals(dropsOnClean, 1, "exactly the one known clean drop");
+  assertEquals(dropsOnClean, KNOWN_CLEAN_DROPS.size, "exactly the known clean drops");
   if (dropsOnErrored < 1) {
     throw new Error("the filter dropped nothing on any errored file — harness bug");
   }
