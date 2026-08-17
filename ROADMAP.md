@@ -418,12 +418,24 @@ which is why they closed in order rather than in parallel.
   `scale-view` at `-O3` reads the same as a hand-hoisted bare-intrinsic kernel (0.444 vs 0.428 ns).
   **The check is not what costs; the DESCRIPTOR FIELD RELOAD is, and it is a whole-program
   property.** The two-view kernel reloads `base`/`length` **7× per element**; the one-view kernels
-  reload **0**, because with a single live view of a width GUFA folds both fields. So adding a second
-  column of the same width to a module turns a free check into a 3.5× one **with no source change**.
-  Measured by attribution, not inferred: six hand-written compares over hoisted base/extent cost
-  0.140 ns, the seven reloads 1.095 ns — the fence is **11%** of the excess, the reload **89%**. That
-  corrects §L4's "attributed, not proven" residual by **4×** (0.27 → 1.2 ns) and makes this
-  ROADMAP B6b's backing-pointer LICM, now priced.
+  reload **0**. Measured by attribution, not inferred: six hand-written compares over hoisted
+  base/extent cost 0.140 ns, the seven reloads 1.095 ns — the fence is **11%** of the excess, the
+  reload **89%**. (Re-derived on three byte-identical-but-for-one-axis modules: 90.3% / 9.7%.) That
+  corrects §L4's "attributed, not proven" residual by **4×** (0.27 → 1.2 ns).
+  **The follow-on filed here as B6b's "backing-pointer LICM" is REFUTED as an emitter item, and the
+  mechanism first written down was wrong.** It is not GUFA folding a single live view's fields: the
+  fast kernels collapse to TWO functions and ONE `struct.new` because `f32view` gets inlined and
+  Heap2Local melts the descriptor outright, while `axpy` keeps four functions and two allocations.
+  The axis is the INLINING BUDGET, not the view count — `scale-seedtwice` (one view, one column, the
+  same kernel, an idempotent helper called twice) runs **3.05×** slower at `-O3`, and two descriptors
+  that AGREE on both fields stay fast. Nor can the emitter hoist: six of the seven reads live inside
+  `std:buffer`'s `getF32`/`setF32` and only enter the loop when binaryen inlines them, and binaryen's
+  own `licm` moves only TOP-LEVEL loop-body statements (proved by a two-function probe where `--licm`
+  hoists 3/3 from the top-level spelling and 0/3 from the nested one), so hoisting the single
+  user-written read is worth **2.9%**. What works is `--always-inline-max-function-size=60` — 0
+  reads, 0 allocations, 1.736 → 0.636 ns/elem — at **+82% module size and +127% `wasm-opt` time on
+  the 1.16 MB compiler**, which routes the question to the optimization-defaults row rather than
+  here. Pinned by `tests/vl_view_descriptor_melt_test.ts`.
   **The stated fast pattern needs no rung**: hoist `byteAddrF32(0)` and `.length`, then bare
   `__load_f32__`/`__store_f32__` — 0.296–0.500 ns on all four shapes at all three rungs. And the
   fence is **not** a trade: hoisting base/extent while keeping `if i < 0 || i >= n { __trap__() }`
@@ -1068,7 +1080,11 @@ in-language GC knobs.
   - **Std-over-primitives** — write the collection (and opportunistically `print`) as `.vl` std, not
     compiler-privileged types (ties to H3 / H0 phase 2 `std:` scheme).
   - **Indexing perf** (DECIDED resolutions; sub-choices open) — native-indexing flag (drops B13
-    indirect call), backing-pointer hoisting (LICM), bounds-narrowing.
+    indirect call), ~~backing-pointer hoisting (LICM)~~ **REFUTED for the typed-view descriptor,
+    measured — see P1.4 above and `buffer-design.md` §M4**: the emitter can reach only 1 of the 7
+    per-element reads (worth 2.9%) and binaryen's `licm` moves only top-level loop-body statements,
+    so the repair is an inline-threshold question priced at +82% compiler module size, not a pass;
+    bounds-narrowing.
   - **Representation inference** (DECIDED direction; open compiler work) — infer fixed-array vs
     growable rep from usage; interprocedural + alias-unioned; co-design with variance (A9).
   - **Naming & forcing surface — UNCOMMITTED** — `T[]` + inference is the committed surface; names

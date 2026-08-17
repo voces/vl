@@ -45,6 +45,13 @@ call per access, and only one of them checks. `view` additionally pays the
 bracket's forwarding hop (`"[]"` calls `getF32`), which both wasm-opt rungs
 inline away.
 
+`scale-seedtwice` is a fifth spelling on `scale` and the control that names the
+axis: byte-identical to `scale-view` except that the idempotent seed helper is
+called TWICE. One buffer, one view, one column, the same kernel — and 3.05x
+slower at `-O3`, because the second call site stops the module collapsing into
+its driver, so `f32view` is no longer inlined and Heap2Local no longer melts the
+descriptor. See "The melt axis" below.
+
 ## Method
 
 - **Prebuilt modules.** `vl run <src>` carries ~300 ms of compile time; only
@@ -106,6 +113,29 @@ Six compares cost 0.140 ns/element; seven field reloads cost 1.095. **A fully
 fenced hot loop is available at 1.35x the raw kernel at every rung** — the fence
 and the speed are not a trade.
 
+### The melt axis
+
+`scale-seedtwice` is `scale-view` with the idempotent seed helper called twice
+and no other difference. Its own interleaved run against `scale-view`, CPU-time
+median of 5 reps with the R=0 control subtracted (`scripts/p7-time.sh`, which
+reports user+sys rather than wall because this box swings ~2.5x under
+contention — the numbers below were taken at loadavg 5-27 and moved <3% across
+reps):
+
+| `scale` spelling | views | columns | (none) | `-O` | `-O3` |
+|---|---|---|---|---|---|
+| `view` | 1 | 1 | 2.842 | 1.664 | **0.447** |
+| `seedtwice` | 1 | 1 | 2.869 | 1.812 | **1.363** |
+
+The two rows are within 1% at `(none)` and 9% at `-O`, and **3.05x apart at
+`-O3`** — the rung where `scale-view` collapses to two functions and one
+`struct.new` (the Buffer's) and the descriptor stops existing. So the cost is
+not "two views of one width": it is whether binaryen's inlining budget lets
+Heap2Local melt the descriptor, which an edit anywhere in the file can decide.
+`docs/internals/buffer-design.md` §M4 carries the disassembly and two further
+controls (two descriptors that AGREE on both fields stay fast; a second column
+the hot loop never touches goes slow).
+
 **Noise floor:** a full independent re-run moved these by 1-14%, worst on the
 smallest numbers (`rows-view` `-O3` 0.508 -> 0.581). Do not read anything inside
 15% off this table; the conclusions in §M are all drawn from 3x gaps or from
@@ -119,8 +149,10 @@ Four readings, in the order they matter:
 2. **What costs at `-O3` is the view descriptor's own `base`/`length` being
    reloaded per access.** That is the `axpy` row (3.5x over hoisted, seven
    `struct.get`s per element in the disassembly) and it does NOT happen on the
-   other three, because with one view of a width live GUFA folds both fields.
-   The fenced spelling's cost is therefore a whole-program property.
+   other three, because those modules collapse into their driver, `f32view` is
+   inlined, and Heap2Local melts the descriptor away entirely. The fenced
+   spelling's cost is therefore a whole-program property — of the INLINING
+   BUDGET, not of how many views are live (see "The melt axis").
 3. **`-O` is a third of `-O3`.** The release profile is where the wrapper calls
    disappear.
 4. **The hoisted spelling is 0.30-0.50 ns at every rung**, never varying by more
@@ -134,3 +166,10 @@ and counts the `unreachable` / `call` / `struct.get` instructions inside loops
 against exact goldens, plus three contract assertions (the fence survives `-O3`,
 the unfenced twin has no check, the fast pattern is bare). Those numbers are what
 make the table above mean something rather than merely be true on one machine.
+
+`tests/vl_view_descriptor_melt_test.ts` pins the mechanism behind the `sget`
+column: that binaryen's `licm` reaches only the loop's top level and so cannot
+move the reads the emitter produces, that `scale-view` and `scale-seedtwice`
+differ in whether the descriptor is melted at all, and that forcing the
+constructor inline removes every per-element read (the route around, whose price
+on a real module is in §M4).
