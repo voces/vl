@@ -837,17 +837,16 @@ in-language GC knobs.
   `(lt, op, rt)` constraint that every generic call site re-validates under the substituted
   argument types (`binOpDefinedFor`) — arithmetic, string concat, relational and equality all fall
   out of that one rule, so `add(1, "x")` and `cmp(1, "x")` reject exactly as their annotated twins
-  do. REMAINING: the *stored-closure* operator case (`vec + vec` via a `"+"` field) still hits the
-  WasmGC width wall (B13). Also REMAINING — the rule does not cover a MIXED hole/concrete ORDERING
-  comparison, and the miss is a FALSE REJECT: `function f(a, b: string) { a < b }` called
-  `f("a","b")` errors *"comparison expects numeric operands, got any and string"*, while the fully
-  un-annotated twin accepts and prints `true`. The string-ordering fast path
-  (`typecheck.vl:20493`) needs `isStringTy` on BOTH sides, so a hole on either side falls to
-  `isNumeric` and is refused instead of deferring the constraint to the call site. Measured **8 of
-  28 cells**: `<` `<=` `>` `>=` × the two half-annotated spellings; `==`, `!=`, `+` are clean in
-  all four spellings. Annotating MORE must never lose a program. NOTE the direction: fixing this
-  LOOSENS the checker, so it carries reject-parity work rather than riding along on a soundness
-  fix. Workboard E6; the `any` rendering it exposes is E7.
+  do. A MIXED hole/concrete ORDERING now defers through the same rule (workboard E6, **24 cells**:
+  `<` `<=` `>` `>=` × the two half-annotated directions × `string` / a string literal type / a
+  string literal union), so `function f(a, b: string) { a < b }` is writable and every non-string
+  binding of the hole still rejects at the call that pins it. REMAINING: the *stored-closure*
+  operator case (`vec + vec` via a `"+"` field) still hits the WasmGC width wall (B13). Also
+  REMAINING — `+` never applies `softenLitTy`, so a string LITERAL type cannot be concatenated in
+  any ANNOTATED spelling (`function f(a: "a", b: "a") { a + b }` errors *"operator '+' is not
+  defined for string and string"*) while the bare spelling accepts; 6 cells, unfiled direction —
+  unlike E6 the fully-annotated twin rejects too, so it needs its own ruling. The `any` rendering
+  these diagnostics use is E7.
 - 🟡 **A14. Named/opaque types.** Zero-cost nominal NEWTYPES ship: `type EntityId = new i32` /
   `type F32View = new { base: i32, length: i32 }`. Distinct in the checker in every position,
   ERASED before the emitter (no emitter file changed), literals brand-polymorphic, `as` for both
